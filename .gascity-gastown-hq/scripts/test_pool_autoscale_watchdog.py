@@ -31,6 +31,15 @@ SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 MOD_PATH = os.path.join(SCRIPTS, "pool-autoscale-watchdog.py")
 POOL = "gastown.dog"
 
+# The work-order lib the watchdog checks (ga-9t9acg.15), at the path the engine derives
+# from GC_CITY_PATH. Spelled out here, not read from the module, so a wrong constant in
+# the module is caught by these tests instead of being copied into them.
+LIB_REL = "packs/town-deltas/assets/scripts/work-order.sh"
+REAL_LIB = os.path.normpath(os.path.join(SCRIPTS, "..", LIB_REL))
+# Captured before any test patches subprocess.run: FakeCLI hands the work-order check to
+# the real bash, so what is exercised is the real lib and not a script of its answers.
+_REAL_RUN = subprocess.run
+
 NOW = int(time.time())
 PAST = NOW - 3600       # an epoch an hour ago: a Pilot hold whose time box ran out
 FUTURE = NOW + 3600     # a hold that is still running
@@ -106,10 +115,23 @@ class FakeCLI:
         # `config_script` holds one-off answers consumed in order, one per call.
         self.config = (0, config_show(mayor=1, dog=6, witness=1), "")
         self.config_script = []
+        # The work-order check runs the REAL bash on the REAL lib. `wo_script` holds one-off
+        # answers consumed in order, one per call: a (rc, stdout, stderr) tuple or an
+        # exception to raise; None (or an empty script) runs bash.
+        self.wo_script = []
+        self.wo_calls = []                    # [(argv, kwargs)]
         self.calls = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
+        if argv[:2] == ["bash", "-c"] and "work_order_sort" in argv[2]:
+            self.wo_calls.append((list(argv), dict(kwargs)))
+            answer = self.wo_script.pop(0) if self.wo_script else None
+            if isinstance(answer, BaseException):
+                raise answer
+            if answer is not None:
+                return _done(argv, *answer)
+            return _REAL_RUN(argv, **kwargs)
         if argv[:3] == ["gc", "config", "show"]:
             answer = self.config_script.pop(0) if self.config_script else self.config
             if isinstance(answer, BaseException):
@@ -191,6 +213,9 @@ def fake(wd, monkeypatch):
     monkeypatch.setattr(wd.subprocess, "run", cli)
     monkeypatch.setattr(wd.time, "sleep", lambda s: None)
     monkeypatch.setattr(wd, "_paw_ledger", lambda *a, **k: None)
+    # The host's own lib path must never decide a test (ga-9t9acg.15): point the check at
+    # the lib in this checkout. The work-order tests below name their own.
+    monkeypatch.setenv("WORK_ORDER_LIB", REAL_LIB)
     return cli
 
 
@@ -810,6 +835,355 @@ def test_scaled_up_line_says_when_the_cap_it_reports_is_a_stand_in(wd, fake, cap
     scaled = [l for l in capsys.readouterr().out.splitlines() if "[SCALED-UP]" in l]
     assert len(scaled) == 1, scaled
     assert "/3 (cap: the hardcoded fallback" in scaled[0]
+
+
+# ---------------------------------------------------------------------------
+# Work-order lib: does the Ordem unica still reach the pool? (ga-9t9acg.15)
+# ---------------------------------------------------------------------------
+# The engine's wo_pick (ga-9t9acg.7) orders the pool probe through work-order.sh and,
+# when the lib is absent, unreadable or "cannot tell", falls back to the PREVIOUS order
+# with a WARN on stderr that the hook runner drops on success: the rule stops applying
+# and nobody sees it. The watchdog asks the question the engine asks -- same lookup, same
+# child bash, same trust test -- and says so, once per episode.
+
+BROKEN_TAG = "[WORK-ORDER-LIB-BROKEN]"
+RECOVERED_TAG = "[WORK-ORDER-LIB-RECOVERED]"
+UNCHECKED_TAG = "[WORK-ORDER-LIB-UNCHECKED]"
+ENGINE_CHILD = ["bash", "-c", '. "$1" && work_order_sort --age reclaim', "wo"]
+
+
+class City:
+    """A test city holding a COPY of the real lib at the path the engine derives from
+    GC_CITY_PATH, so a test can take the copy apart without touching the real one."""
+
+    def __init__(self, root):
+        self.root = str(root)
+        self.lib = os.path.join(self.root, LIB_REL)
+        os.makedirs(os.path.dirname(self.lib))
+        self.heal()
+
+    def heal(self):
+        if os.path.isdir(self.lib):
+            shutil.rmtree(self.lib)
+        shutil.copy(REAL_LIB, self.lib)
+        os.chmod(self.lib, 0o644)
+
+    def append(self, shell):
+        with open(self.lib, "a") as f:
+            f.write("\n" + shell + "\n")
+
+    def rename_away(self):
+        os.rename(self.lib, self.lib + ".away")
+
+    def restore(self):
+        os.rename(self.lib + ".away", self.lib)
+
+
+@pytest.fixture()
+def city(tmp_path, monkeypatch, fake):
+    c = City(tmp_path / "city")
+    monkeypatch.delenv("WORK_ORDER_LIB", raising=False)     # `fake` points it at the real lib
+    monkeypatch.delenv("GC_CITY", raising=False)
+    monkeypatch.setenv("GC_CITY_PATH", c.root)
+    return c
+
+
+def _wo_lines(capsys):
+    """The [WORK-ORDER-LIB-*] lines printed since the last call."""
+    return [l for l in capsys.readouterr().out.splitlines() if "[WORK-ORDER-LIB-" in l]
+
+
+def _pushes(fake):
+    return [c for c in fake.calls if c[0].endswith("/notify")]
+
+
+def test_a_healthy_lib_is_asked_every_cycle_and_says_nothing(wd, fake, city, capsys):
+    """Break caught: the check must not make a healthy daemon noisy (silence = healthy),
+    and must not remember an old answer instead of asking again."""
+    for _ in range(3):
+        assert wd.watch_work_order_lib() == "ok"
+    assert _wo_lines(capsys) == [] and _pushes(fake) == []
+    assert len(fake.wo_calls) == 3
+
+
+def test_a_lib_taken_away_is_reported_in_one_cycle_once_and_after_it_is_back_it_stops(
+        wd, fake, city, capsys):
+    """The bead's acceptance test. Break caught: wo_pick falls back to the previous order
+    when work-order.sh is gone and the only trace is a stderr line the hook runner drops --
+    the Ordem unica stops applying and nobody hears of it. One alert, not one per cycle."""
+    city.rename_away()
+    assert wd.watch_work_order_lib() == "broken"
+    lines = _wo_lines(capsys)
+    assert len(lines) == 1 and BROKEN_TAG in lines[0] and city.lib in lines[0], lines
+    assert len(_pushes(fake)) == 1
+    for _ in range(3):                                       # still gone: nobody hears it again
+        assert wd.watch_work_order_lib() == "broken"
+    assert _wo_lines(capsys) == [] and len(_pushes(fake)) == 1
+
+    city.restore()
+    assert wd.watch_work_order_lib() == "ok"
+    lines = _wo_lines(capsys)
+    assert len(lines) == 1 and RECOVERED_TAG in lines[0], lines
+    assert wd.watch_work_order_lib() == "ok"
+    assert _wo_lines(capsys) == []
+
+    city.rename_away()                                       # a new episode is a new alert
+    assert wd.watch_work_order_lib() == "broken"
+    assert len(_wo_lines(capsys)) == 1 and len(_pushes(fake)) == 2
+
+
+def _unreadable(c):
+    if os.geteuid() == 0:
+        pytest.skip("root reads every file")
+    os.chmod(c.lib, 0)
+
+
+def _a_directory(c):
+    os.remove(c.lib)
+    os.mkdir(c.lib)
+
+
+def _empty_file(c):
+    open(c.lib, "w").close()
+
+
+# (id, how to break the copy, a fragment the alert must carry). Every row is a lib the
+# engine's wo_pick would not trust, so it would fall back to the previous order.
+BROKEN_LIBS = [
+    pytest.param(lambda c: c.rename_away(), "not readable", id="missing"),
+    pytest.param(_unreadable, "not readable", id="unreadable"),
+    pytest.param(_a_directory, "exit 1", id="a-directory-where-the-file-should-be"),
+    pytest.param(_empty_file, "exit 127", id="empty-file-so-no-work_order_sort"),
+    pytest.param(lambda c: c.append("if then fi ("), "exit", id="syntax-error-in-a-bad-edit"),
+    pytest.param(lambda c: c.append(
+        'work_order_sort() { cat >/dev/null; echo "work-order ERROR: simulated; cannot tell" >&2; return 2; }'),
+        "simulated", id="sort-says-cannot-tell"),
+    pytest.param(lambda c: c.append('echo "motd while sourced"'),
+                 "not one JSON array", id="banner-printed-while-sourced"),
+    pytest.param(lambda c: c.append("work_order_sort() { cat >/dev/null; echo '[]'; }"),
+                 "not one JSON array", id="answers-a-shorter-array"),
+    pytest.param(lambda c: c.append(
+        "work_order_sort() { local x; x=\"$(cat)\"; printf '%s\\n%s\\n' \"$x\" \"$x\"; }"),
+        "not one JSON array", id="answers-two-documents"),
+    pytest.param(lambda c: c.append("work_order_sort() { cat >/dev/null; echo '{}'; }"),
+                 "not one JSON array", id="answers-an-object"),
+    pytest.param(lambda c: c.append("work_order_sort() { cat >/dev/null; }"),
+                 "not one JSON array", id="answers-nothing-with-exit-0"),
+    pytest.param(lambda c: c.append("work_order_sort() { cat >/dev/null; echo 'not json'; }"),
+                 "not one JSON array", id="answers-garbage"),
+]
+
+
+@pytest.mark.parametrize("break_it,fragment", BROKEN_LIBS)
+def test_a_lib_the_engine_would_not_trust_is_reported(wd, fake, city, capsys, break_it, fragment):
+    """Break caught: a weaker check than the engine's (file exists, or stdout non-empty)
+    calls these healthy while wo_pick quietly serves the previous order."""
+    break_it(city)
+    assert wd.watch_work_order_lib() == "broken"
+    lines = _wo_lines(capsys)
+    assert len(lines) == 1 and BROKEN_TAG in lines[0] and fragment in lines[0], lines
+
+
+def test_the_reason_in_the_alert_is_one_short_line(wd, fake, city, capsys):
+    """Break caught: a lib that dumps a page of text must not put a page in the push."""
+    city.append('work_order_sort() { cat >/dev/null; echo first >&2; printf "boom %.0s" $(seq 1 3000) >&2; echo >&2; return 2; }')
+    assert wd.watch_work_order_lib() == "broken"
+    out = capsys.readouterr().out
+    assert len([l for l in out.splitlines() if BROKEN_TAG in l]) == 1
+    assert len(out) < 1200, len(out)
+    assert max(len(c[-1]) for c in _pushes(fake)) < 1200
+
+
+PATH_CASES = [
+    pytest.param({"WORK_ORDER_LIB": "/x/own.sh", "GC_CITY_PATH": "/c", "GC_CITY": "/d"},
+                 "/x/own.sh", "WORK_ORDER_LIB", id="own-lib-wins"),
+    pytest.param({"WORK_ORDER_LIB": "", "GC_CITY_PATH": "/c"},
+                 "/c/" + LIB_REL, "GC_CITY_PATH", id="an-empty-own-lib-counts-as-unset"),
+    pytest.param({"GC_CITY_PATH": "/c", "GC_CITY": "/d"},
+                 "/c/" + LIB_REL, "GC_CITY_PATH", id="city-path-before-city"),
+    pytest.param({"GC_CITY_PATH": "", "GC_CITY": "/d"},
+                 "/d/" + LIB_REL, "GC_CITY", id="an-empty-city-path-falls-to-city"),
+]
+
+
+@pytest.mark.parametrize("env,path,source", PATH_CASES)
+def test_the_lib_is_looked_up_where_the_engine_looks(wd, env, path, source):
+    """Break caught: the watchdog vouching for a file the engine never opens."""
+    assert wd.work_order_lib_path(env) == (path, source)
+
+
+def test_with_no_city_in_the_environment_the_default_city_is_used_and_named(wd):
+    """Break caught: a guess that reads like a fact. The engine would find nothing here;
+    the watchdog keeps checking the real city and says it is the default."""
+    path, source = wd.work_order_lib_path({})
+    assert path == os.path.join(wd.DEFAULT_CITY_PATH, LIB_REL)
+    assert "default" in source
+
+
+def test_an_unusable_own_lib_does_not_fall_through_to_the_city_lib(
+        wd, fake, city, monkeypatch, tmp_path, capsys):
+    """Break caught: the engine takes the first one set -- no cascade -- so a typo in
+    WORK_ORDER_LIB is a broken lib even while the city's own copy is fine."""
+    monkeypatch.setenv("WORK_ORDER_LIB", str(tmp_path / "no-such.sh"))
+    assert wd.watch_work_order_lib() == "broken"
+    lines = _wo_lines(capsys)
+    assert len(lines) == 1 and "WORK_ORDER_LIB" in lines[0] and "no-such.sh" in lines[0], lines
+
+
+def test_the_check_runs_the_engines_child_bash_with_a_deadline(wd, fake, city):
+    """Break caught: a check unlike the engine's (another entry point, no deadline) either
+    vouches for a path the engine does not take or hangs the poll loop with a wedged lib."""
+    wd.watch_work_order_lib()
+    argv, kwargs = fake.wo_calls[0]
+    assert argv == ENGINE_CHILD + [city.lib]
+    assert 0 < kwargs["timeout"] <= 60
+    sample = json.loads(kwargs["input"])
+    assert isinstance(sample, list) and len(sample) >= 2
+
+
+def test_the_sample_is_clean_input_for_the_real_lib(wd):
+    """Break caught: a sample the lib complains about would pass through the lib's
+    tolerant path, and keep passing for a lib that cannot read an ordinary bead. It must
+    also reach the code the engine uses (--age reclaim reads pilot:reclaim-count) and the
+    shape bd really emits (no `labels` key for a bead without labels)."""
+    run = _REAL_RUN(ENGINE_CHILD + [REAL_LIB], input=json.dumps(wd.WORK_ORDER_SAMPLE),
+                    capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0 and run.stderr == "", run.stderr
+    out = json.loads(run.stdout)
+    assert sorted(b["id"] for b in out) == sorted(b["id"] for b in wd.WORK_ORDER_SAMPLE)
+    assert any(any(l.startswith("pilot:reclaim-count:") for l in b.get("labels", []))
+               for b in wd.WORK_ORDER_SAMPLE)
+    assert any("labels" not in b for b in wd.WORK_ORDER_SAMPLE)
+
+
+@pytest.mark.parametrize("answer", [
+    pytest.param(OSError("bash: not found"), id="bash-cannot-be-started"),
+    pytest.param(subprocess.TimeoutExpired("bash", 30), id="no-answer-in-time"),
+    pytest.param(RuntimeError("surprise"), id="anything-unexpected"),
+])
+def test_a_check_that_cannot_run_is_not_a_broken_lib(wd, fake, city, capsys, answer):
+    """Break caught: three states, never two. A bash that could not be asked says nothing
+    about the lib, and a loaded machine (load 56+ on 10 cores) must not page anyone about
+    a lib that is fine. It is said once, without a push, so it cannot pass for healthy."""
+    fake.wo_script = [answer, answer]
+    assert wd.watch_work_order_lib() == "unknown"
+    assert wd.watch_work_order_lib() == "unknown"
+    lines = _wo_lines(capsys)
+    assert len(lines) == 1 and UNCHECKED_TAG in lines[0] and BROKEN_TAG not in lines[0], lines
+    assert _pushes(fake) == []
+
+
+def test_not_being_able_to_tell_does_not_end_a_broken_episode(wd, fake, city, capsys):
+    """Break caught: broken -> (one failed reading) -> fine would announce a recovery that
+    nobody checked, and the next reading would raise a second alert for the same fault."""
+    city.append("work_order_sort() { cat >/dev/null; }")        # answers nothing: broken
+    assert wd.watch_work_order_lib() == "broken"
+    fake.wo_script = [subprocess.TimeoutExpired("bash", 30)]
+    assert wd.watch_work_order_lib() == "unknown"
+    assert wd.watch_work_order_lib() == "broken"                 # same fault, same episode
+    city.heal()
+    assert wd.watch_work_order_lib() == "ok"
+    tags = [t for l in _wo_lines(capsys) for t in (BROKEN_TAG, UNCHECKED_TAG, RECOVERED_TAG) if t in l]
+    assert tags == [BROKEN_TAG, UNCHECKED_TAG, RECOVERED_TAG]
+    assert len(_pushes(fake)) == 1
+
+
+def test_being_able_to_tell_again_after_a_failed_reading_is_not_a_recovery(wd, fake, city, capsys):
+    """Break caught: a RECOVERED line for something that was never reported broken."""
+    fake.wo_script = [OSError("bash: not found")]
+    assert wd.watch_work_order_lib() == "unknown"
+    assert wd.watch_work_order_lib() == "ok"
+    lines = _wo_lines(capsys)
+    assert len(lines) == 1 and UNCHECKED_TAG in lines[0], lines
+
+
+def test_a_bug_in_the_check_is_one_more_way_of_not_being_able_to_tell(wd, fake, city, monkeypatch, capsys):
+    """Break caught: the check runs in a daemon that launchd restarts into the same bug."""
+    def boom():
+        raise RuntimeError("parser broke")
+    monkeypatch.setattr(wd, "check_work_order_lib", boom)
+    assert wd.watch_work_order_lib() == "unknown"
+    lines = _wo_lines(capsys)
+    assert len(lines) == 1 and UNCHECKED_TAG in lines[0] and "RuntimeError" in lines[0], lines
+
+
+@pytest.mark.parametrize("break_it,verdict", [
+    pytest.param(lambda c: None, "ok", id="healthy"),
+    pytest.param(lambda c: c.rename_away(), "broken", id="broken"),
+])
+def test_startup_line_says_what_the_lib_check_found(wd, fake, city, monkeypatch, tmp_path, capsys,
+                                                     break_it, verdict):
+    """Break caught: the restart chore proves the new code by the STARTUP line; a daemon
+    that checks the lib but does not say so cannot be told from the old one."""
+    monkeypatch.chdir(tmp_path)
+    break_it(city)
+    _run_main_for(wd, monkeypatch, cycles=1)
+    startup = [l for l in capsys.readouterr().out.splitlines() if "[STARTUP] managed_pools=" in l]
+    assert len(startup) == 1 and "work_order_lib=%s" % verdict in startup[0], startup
+
+
+def test_main_reports_a_broken_lib_once_across_cycles(wd, fake, city, monkeypatch, tmp_path, capsys):
+    """Break caught (through main()): a check wired into the loop that alerts on every
+    pass puts one push on the phone every two minutes for as long as the lib is down."""
+    monkeypatch.chdir(tmp_path)
+    city.rename_away()
+    _run_main_for(wd, monkeypatch, cycles=3)
+    assert capsys.readouterr().out.count(BROKEN_TAG) == 1
+    assert len(_pushes(fake)) == 1
+    assert len(fake.wo_calls) == 0          # the file is gone: nothing to run
+
+
+def test_main_notices_the_lib_going_away_while_it_runs(wd, fake, city, monkeypatch, tmp_path, capsys):
+    """Break caught: a check done once at start-up. The failure the bead describes is a
+    file deleted or broken on the shared tree long after the daemon came up."""
+    monkeypatch.chdir(tmp_path)
+    real_sleep_hook = {}
+
+    def sleep(seconds):
+        if seconds != wd.POLL_SEC:
+            return
+        real_sleep_hook["n"] = real_sleep_hook.get("n", 0) + 1
+        if real_sleep_hook["n"] == 1:
+            city.rename_away()              # between cycle 1 and cycle 2
+        if real_sleep_hook["n"] >= 3:
+            raise _StopLoop
+    monkeypatch.setattr(wd.time, "sleep", sleep)
+    with pytest.raises(_StopLoop):
+        wd.main()
+    out = capsys.readouterr().out
+    assert out.count(BROKEN_TAG) == 1
+    assert "work_order_lib=ok" in out
+
+
+def test_a_broken_lib_does_not_stop_the_scaling(wd, fake, city, monkeypatch, tmp_path, capsys):
+    """Break caught: the two jobs share a loop. A lib that is down must not cost the pool
+    the dogs it was woken for, nor the other way round."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(wd, "SCALE_UP_AFTER", 0)
+    city.rename_away()
+    fake.beads = [bead("ga-open", labels=["ctx:ready"])]
+    fake.sessions = [_active_dog(0), _asleep_dog()]
+    _run_main_for(wd, monkeypatch, cycles=1)
+    out = capsys.readouterr().out
+    assert ["gc", "session", "wake", "ga-s1"] in fake.calls, out
+    assert BROKEN_TAG in out
+
+
+def test_a_check_that_raises_cannot_end_the_daemon_or_skip_the_scaling(
+        wd, fake, city, monkeypatch, tmp_path, capsys):
+    """Break caught: an exception out of the check inside main()'s loop."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(wd, "SCALE_UP_AFTER", 0)
+
+    def boom():
+        raise RuntimeError("parser broke")
+    monkeypatch.setattr(wd, "check_work_order_lib", boom)
+    fake.beads = [bead("ga-open", labels=["ctx:ready"])]
+    fake.sessions = [_active_dog(0), _asleep_dog()]
+    _run_main_for(wd, monkeypatch, cycles=2)
+    out = capsys.readouterr().out
+    assert ["gc", "session", "wake", "ga-s1"] in fake.calls, out
+    assert out.count(UNCHECKED_TAG) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,12 @@ Poll loop (~60s). Silence = healthy (only emits on actions).
                                      the last good number (else a hardcoded one) stands in
   [POOL-AUTOSCALE] [CAP-RECOVERED]   `gc config show` answers again after a CAP-FALLBACK
   [POOL-AUTOSCALE] [CAP-CHANGED]     the configured max_active_sessions changed
+  [POOL-AUTOSCALE] [WORK-ORDER-LIB-BROKEN]    work-order.sh is missing, unreadable or answers
+                                     in a way the engine's wo_pick would not trust, so the pool
+                                     probe is on the PREVIOUS order (push; once per episode)
+  [POOL-AUTOSCALE] [WORK-ORDER-LIB-RECOVERED] the lib answers again after a BROKEN
+  [POOL-AUTOSCALE] [WORK-ORDER-LIB-UNCHECKED] the lib could not be checked (log only; says
+                                     nothing about the lib, and does not end a BROKEN)
 
 Demand (ga-uv4on5) is the beads a pool worker's own probe would hand out, not
 every ready bead routed to the pool: held, vetoed, parked, epic and in-flight
@@ -660,6 +666,146 @@ def do_unpin(session_id):
 
 
 # ---------------------------------------------------------------------------
+# Work-order lib: does the Ordem unica still reach the pool? (ga-9t9acg.15)
+# ---------------------------------------------------------------------------
+# Once engine patch ga-9t9acg.7 is swapped in, the pool probe orders what it hands out
+# through work-order.sh (`wo_pick`). When the lib is absent, unreadable or "cannot tell"
+# it serves the PREVIOUS order instead, which is safe for the content and wrong for the
+# rule -- and the only trace is a WARN on stderr that the engine's hook runner keeps
+# in a buffer and shows only when the command fails. A deleted file, a wrong path or a
+# broken edit on the shared tree therefore switches the rule off with no sign. Until the
+# swap this is a pre-flight: it says whether the lib is fit to be relied on.
+#
+# This asks the question wo_pick asks, the way it asks it: the same lookup
+# (work_order_lib_path), the same child bash, and the same test before the answer is
+# trusted -- exit 0 AND stdout exactly one JSON array as long as the input. It does NOT
+# check the order itself: that is work-order.selftest.sh's job, and a copy of the rule
+# here would raise a false alarm the day the rule changes.
+#
+# Three answers, never conflated:
+#   ok       the engine would trust the lib's answer
+#   broken   it would not, so it would fall back: said once per episode (push + log)
+#   unknown  the question could not be asked (bash would not start, no answer in time):
+#            says nothing about the lib; said once in the log, no push, and it does not
+#            end a broken episode
+
+# The city the lib is looked up in when neither GC_CITY_PATH nor GC_CITY is set. The
+# engine would find nothing then; this daemon keeps checking the real city, and says so.
+DEFAULT_CITY_PATH = "/Users/athos/gt/.gascity-gastown-hq"
+WORK_ORDER_LIB_REL = os.path.join("packs", "town-deltas", "assets", "scripts", "work-order.sh")
+
+# What wo_pick runs: the lib is sourced in a child bash, never in the query's sh.
+WORK_ORDER_CHILD = ["bash", "-c", '. "$1" && work_order_sort --age reclaim', "wo"]
+WORK_ORDER_CHECK_TIMEOUT = 30   # a sample of three beads: seconds even on a loaded machine
+WORK_ORDER_REASON_MAX = 160     # one short line in the log and in the push
+
+# Input for the check, shaped like `bd ready --json`: a bead that the `reclaim` age
+# reads (pilot:reclaim-count -> updated_at), one that bd emits without a `labels` key,
+# and distinct priorities and types. Clean on purpose: the lib has nothing to WARN about,
+# so a lib that cannot read an ordinary bead cannot pass through its tolerant path.
+WORK_ORDER_SAMPLE = [
+    {"id": "wo-sample-1", "priority": 2, "issue_type": "task",
+     "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+     "labels": []},
+    {"id": "wo-sample-2", "priority": 0, "issue_type": "feature",
+     "created_at": "2026-01-02T00:00:00Z", "updated_at": "2026-01-03T00:00:00Z",
+     "labels": ["pilot:reclaim-count:1"]},
+    {"id": "wo-sample-3", "priority": 0, "issue_type": "bug",
+     "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z"},
+]
+
+# Reason the open BROKEN episode was raised with, None while there is none. It is only
+# ever cleared by an "ok" reading: an "unknown" one proves nothing. Held in memory like
+# _reported: a restart in the middle of an episode says it once more, which is the
+# reminder a restart should give.
+_wo_lib_state = {"broken_why": None}
+
+
+def _one_line(text, limit=WORK_ORDER_REASON_MAX):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def work_order_lib_path(environ=None):
+    """Where the engine's wo_pick looks for the lib, as (path, source): $WORK_ORDER_LIB,
+    else $GC_CITY_PATH, else $GC_CITY (+ packs/town-deltas/assets/scripts/work-order.sh).
+    The first one that is set and non-empty is THE lib; an unusable one does not cascade
+    to the next. With none set the default city stands in, and `source` says so."""
+    env = os.environ if environ is None else environ
+    own = env.get("WORK_ORDER_LIB") or ""
+    if own:
+        return own, "WORK_ORDER_LIB"
+    for name in ("GC_CITY_PATH", "GC_CITY"):
+        root = env.get(name) or ""
+        if root:
+            return os.path.join(root, WORK_ORDER_LIB_REL), name
+    return (os.path.join(DEFAULT_CITY_PATH, WORK_ORDER_LIB_REL),
+            "default city: GC_CITY_PATH and GC_CITY unset")
+
+
+def check_work_order_lib():
+    """Ask the lib what wo_pick asks it. Returns (verdict, why, lib) with verdict
+    "ok" | "broken" | "unknown" (see the section comment); `lib` is the path and where it
+    came from, for the log. What it cannot run is "unknown", not an exception; a bug in
+    here is still caught one level up, by watch_work_order_lib()."""
+    path, source = work_order_lib_path()
+    lib = "%s (%s)" % (path, source)
+    if not os.access(path, os.R_OK):
+        return "broken", "not readable (missing, or no permission)", lib
+    try:
+        run = subprocess.run(WORK_ORDER_CHILD + [path], input=json.dumps(WORK_ORDER_SAMPLE),
+                             capture_output=True, text=True, timeout=WORK_ORDER_CHECK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "unknown", "no answer in %ds" % WORK_ORDER_CHECK_TIMEOUT, lib
+    except Exception as exc:
+        return "unknown", _one_line("%s: %s" % (type(exc).__name__, exc)), lib
+    if run.returncode != 0:
+        errors = [l.strip() for l in (run.stderr or "").splitlines() if l.strip()]
+        return ("broken", "work_order_sort exit %d" % run.returncode
+                + (": " + _one_line(errors[-1]) if errors else ""), lib)
+    try:
+        body = json.loads(run.stdout)
+    except ValueError:
+        body = None
+    if not (isinstance(body, list) and len(body) == len(WORK_ORDER_SAMPLE)):
+        return ("broken", "work_order_sort exit 0 but its stdout is not one JSON array of %d "
+                "beads (got %r)" % (len(WORK_ORDER_SAMPLE), _one_line(run.stdout, 60)), lib)
+    return "ok", "", lib
+
+
+def watch_work_order_lib():
+    """One reading of the lib, and a line only when the answer CHANGES the story:
+    BROKEN (push + log) when an episode opens, RECOVERED when an "ok" closes it,
+    UNCHECKED (log only) when the question could not be asked. A fault that persists is
+    not repeated every cycle. Returns the verdict. Does not raise."""
+    try:
+        verdict, why, lib = check_work_order_lib()
+    except Exception as exc:
+        verdict, lib = "unknown", "?"
+        why = _one_line("the check itself raised %s: %s" % (type(exc).__name__, exc))
+    if verdict == "unknown":
+        _report_once("wo-lib-unchecked", "city",
+                     "[POOL-AUTOSCALE] [WORK-ORDER-LIB-UNCHECKED] lib=%s could not be "
+                     "checked (%s); whether the Ordem unica reaches the pool is not known "
+                     "until it can" % (lib, why))
+        return verdict
+    _report_once("wo-lib-unchecked", "city", "")      # a reading was made: that episode is over
+    was = _wo_lib_state["broken_why"]
+    if verdict == "broken" and was is None:
+        _wo_lib_state["broken_why"] = why
+        emit("[POOL-AUTOSCALE] [WORK-ORDER-LIB-BROKEN] lib=%s: %s. Whatever falls back when "
+             "this lib fails (the pool probe's wo_pick, ga-9t9acg.7) serves the PREVIOUS "
+             "order and says so only on a stderr the hook runner drops: the Ordem unica does "
+             "not get through. Restore or fix the file, then run "
+             "packs/town-deltas/assets/scripts/work-order.selftest.sh" % (lib, why))
+    elif verdict == "ok" and was is not None:
+        _wo_lib_state["broken_why"] = None
+        print("[POOL-AUTOSCALE] [WORK-ORDER-LIB-RECOVERED] lib=%s answers again "
+              "(was: %s)" % (lib, was), flush=True)
+    return verdict
+
+
+# ---------------------------------------------------------------------------
 # Main poll cycle
 # ---------------------------------------------------------------------------
 
@@ -798,9 +944,13 @@ def main():
     # `caps=` alone reads the same whether the config said 3 or nothing could be
     # read; cap_source says which (config | last-good | fallback).
     cap_source = {pt: _cap_in_use[pt][1] for pt in pool_caps}
+    # ga-9t9acg.15: the first reading of the work-order lib; `work_order_lib=` says what
+    # it found (ok | broken | unknown), so a restart proves the new code by this line.
+    work_order_lib = watch_work_order_lib()
     print(
         f"[POOL-AUTOSCALE] [STARTUP] managed_pools={MANAGED_POOLS} "
-        f"caps={pool_caps} cap_source={cap_source} scale_up_after={SCALE_UP_AFTER}s "
+        f"caps={pool_caps} cap_source={cap_source} work_order_lib={work_order_lib} "
+        f"scale_up_after={SCALE_UP_AFTER}s "
         f"scale_down_after={SCALE_DOWN_AFTER}s poll={POLL_SEC}s",
         flush=True
     )
@@ -828,6 +978,12 @@ def main():
             save_state(state)
         except Exception as exc:
             print(f"[POOL-AUTOSCALE] cycle exception: {exc}", flush=True)
+        # Its own step, outside the scaling try: a lib that is down must not cost the pool
+        # its dogs, and a bug in the scaling must not hide a lib that is down.
+        try:
+            watch_work_order_lib()
+        except Exception as exc:
+            print(f"[POOL-AUTOSCALE] work-order lib check exception: {exc}", flush=True)
         time.sleep(POLL_SEC)
         # Read the ceilings again for the next cycle (ga-d1q1kn): the config can
         # change, and the start-up read can miss -- right after a boot the first
