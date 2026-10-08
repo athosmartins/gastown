@@ -18,6 +18,10 @@
 # on a change? Run the smaller pilot-*.selftest.sh siblings and leave the full file
 # for the gate. Knobs: heavy-selftest-guard.sh.
 #
+# No scenario may depend on how long the run took (ga-ipk1oz): a fixture that embeds the clock is stamped where it is USED,
+# never held over from an earlier scenario. PILOT_SELFTEST_FAKE_AGE=<secs per assertion> (15 = the incident's ~3h between
+# Scenario 18e and ga-2n7xw) runs the whole file on a simulated slow clock to prove it — see "Simulated wall time" below.
+#
 # pilot-dispatcher.selftest.sh — Regression harness for the Pilot dispatcher.
 #
 # Covers:
@@ -73,8 +77,8 @@ DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
 
 PASS=0
 FAIL=0
-ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
-bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
+ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); _st_tick; }
+bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); _st_tick; }
 
 if [ ! -f "$DISPATCHER" ]; then
   echo "FATAL: dispatcher not found at $DISPATCHER" >&2
@@ -119,6 +123,74 @@ SHIMBIN="$WORK/bin"
 FIXCITY="$WORK/city"
 STATE="$WORK/state"
 mkdir -p "$SHIMBIN" "$FIXCITY/.gc/logs" "$STATE"
+
+# ── Simulated wall time (ga-ipk1oz) ───────────────────────────────────────────
+# A run is ~140s on an idle box and 3h30 on a saturated one (07-08/10), and a timestamp taken ONCE and reused scenarios
+# later ages by that much: the dispatcher drops an in-flight bead untouched for >2h as stale (batista-ps stops counting as
+# busy, so the hold branch of ga-2n7xw never fires), a "fresh" claim stops being fresh, and so on. Such a failure reads
+# as a regression in the author's diff and is not one. RULE: stamp a fixture where it is USED (a function or a fresh
+# `$(date ...)` next to the run_* call); never hold a clock-derived value across scenarios.
+# To PROVE that without waiting hours the clock itself is simulated: a `date` shim in every shim dir (the dispatcher runs
+# with PATH="<shimdir>:/usr/bin:..." and resolves `date` there) plus a `date` function for this file's own calls shift every
+# "current time" form by the seconds in $_ST_SKEW_FILE; the explicit-time forms (-r/-d/-j/-f) pass through, so
+# `date -u -r $(( $(date +%s) - N ))` stays N seconds before the simulated now. Skew 0 execs the real date.
+#   _st_clock_add <secs>            move the simulated clock <secs> forward (negative = back; never below 0)
+#   PILOT_SELFTEST_FAKE_AGE=<secs>  every assertion moves the clock <secs> forward, so a whole run behaves as if each
+#                                   assertion took that long. 15 => the 635 assertions between Scenario 18e and ga-ipk1oz
+#                                   are ~2.6h apart (> the 2h stale bound). Unset/0 (default) = real time, except the one
+#                                   fixed 3h jump in ga-ipk1oz-a..ga-2n7xw-b, which installs the shim for that block only.
+_ST_SKEW_FILE="$WORK/clock-skew"
+_st_install_date_shim() { # $1 = a shim dir
+  [ -d "$1" ] || return 0
+  {
+    printf '#!/bin/bash\n_SKEW_FILE=%q\n' "$_ST_SKEW_FILE"
+    cat <<'EOF'
+_skew="$(cat "$_SKEW_FILE" 2>/dev/null)"
+case "$_skew" in ''|*[!0-9]*) exec /bin/date "$@" ;; esac
+[ "$_skew" -eq 0 ] && exec /bin/date "$@"
+for _a in "$@"; do case "$_a" in -r|-d|-j|-f) exec /bin/date "$@" ;; esac; done
+exec /bin/date -v+"${_skew}"S "$@"
+EOF
+  } > "$1/date"
+  chmod +x "$1/date"
+}
+# Shim dirs created AFTER the clock is enabled need the shim too; call this right after their mkdir.
+_st_shimdir_ready() { [ -n "${_ST_CLOCK_ON:-}" ] && _st_install_date_shim "$1"; return 0; }
+_st_clock_enable() {
+  [ -n "${_ST_CLOCK_ON:-}" ] && return 0
+  [ -d "${SHIMBIN:-}" ] || return 1
+  _ST_CLOCK_ON=1
+  echo 0 > "$_ST_SKEW_FILE"
+  local _d
+  for _d in "$SHIMBIN" "${RMG_SHIMBIN:-}" "${CAPQ_SHIMBIN:-}" "${PS_SHIMBIN:-}" "${LX_SHIMBIN:-}"; do
+    [ -n "$_d" ] && _st_install_date_shim "$_d"
+  done
+  date() { "$SHIMBIN/date" "$@"; }
+}
+_st_clock_add() { # $1 = seconds (may be negative)
+  _st_clock_enable || return 1
+  local _cur _new
+  _cur="$(cat "$_ST_SKEW_FILE" 2>/dev/null)"; _cur="${_cur:-0}"
+  _new=$(( _cur + $1 )); [ "$_new" -lt 0 ] && _new=0
+  echo "$_new" > "$_ST_SKEW_FILE"
+}
+# Back to the plain `date` once a targeted jump is done, so the rest of a default run does not pay a shim spawn per call.
+# A whole-run PILOT_SELFTEST_FAKE_AGE keeps the clock for the entire run.
+_st_clock_disable() {
+  [ -n "${_ST_CLOCK_ON:-}" ] || return 0
+  [ "${PILOT_SELFTEST_FAKE_AGE:-0}" -gt 0 ] 2>/dev/null && return 0
+  local _d
+  for _d in "$SHIMBIN" "${RMG_SHIMBIN:-}" "${CAPQ_SHIMBIN:-}" "${PS_SHIMBIN:-}" "${LX_SHIMBIN:-}"; do
+    [ -n "$_d" ] && rm -f "$_d/date"
+  done
+  unset -f date
+  _ST_CLOCK_ON=
+}
+_st_tick() {
+  [ "${PILOT_SELFTEST_FAKE_AGE:-0}" -gt 0 ] 2>/dev/null || return 0
+  _st_clock_add "$PILOT_SELFTEST_FAKE_AGE"
+  return 0
+}
 
 # ── Fake bd ───────────────────────────────────────────────────────────────────
 # Stateful shim. Dispatches on argv; tracks label state under $PILOT_TEST_STATE
@@ -2445,7 +2517,7 @@ fi
 # can be asserted (the base shim swallows label ops). The genuine-none run is the
 # control: it must reach the escalation, or "no label written" below proves nothing.
 RMG_SHIMBIN="$WORK/x7m5rg-bin"
-mkdir -p "$RMG_SHIMBIN"
+mkdir -p "$RMG_SHIMBIN"; _st_shimdir_ready "$RMG_SHIMBIN"
 cat > "$RMG_SHIMBIN/bd" <<RMG_BD_EOF
 #!/usr/bin/env bash
 echo "\$*" >> "\${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}/bd-calls.log"
@@ -4027,8 +4099,13 @@ fi
 echo "Scenario 18e: domain build DEFERS (no dog) when the owning crew is BUSY this sweep"
 # batista-ps already holds live in-flight work → busy set → the domain build must
 # DEFER (leave queued), never fall back to a dog. Correct backpressure.
-NOW_ISO18="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-INFLIGHT18E="[{\"id\":\"if-ps\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO18\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-ps\"}}]"
+# ga-ipk1oz: a FUNCTION, not a captured value — Scenario ga-2n7xw reuses this exact fixture ~4000 lines (hours, on a
+# saturated box) later, where a stamp taken here is >2h old and the dispatcher no longer counts batista-ps as busy.
+# Every consumer calls it where it USES it, so the stamp is "now" at that point.
+_inflight18e_json() {
+  printf '[{"id":"if-ps","labels":["story:in-flight","lane:small"],"updated_at":"%s","metadata":{"pilot.sling_bead":"tt-sling-ps"}}]' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+INFLIGHT18E="$(_inflight18e_json)"
 SESSIONS18E='{"sessions":[{"session_name":"batista-ps","closed":false}]}'
 SLINGMAP18E='{"tt-sling-ps":"batista-ps"}'
 LOG18E="$(run_capacity 10 "$INFLIGHT18E" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18E" "$SLINGMAP18E")"
@@ -6932,7 +7009,7 @@ CAPQ_WA_RIG_DIR="$WORK/capq-fake-wa-rig"
 CAPQ_PS_RIG_DIR="$WORK/capq-fake-ps-rig"
 mkdir -p "$CAPQ_WA_RIG_DIR" "$CAPQ_PS_RIG_DIR"
 CAPQ_SHIMBIN="$WORK/capq-bin"
-mkdir -p "$CAPQ_SHIMBIN"
+mkdir -p "$CAPQ_SHIMBIN"; _st_shimdir_ready "$CAPQ_SHIMBIN"
 
 # gc: both product rigs registered as NON-HQ (hq:false) so STORY_BEAD_CITY != GC_CITY → rig-native arm.
 cat > "$CAPQ_SHIMBIN/gc" <<CAPQ_GC_EOF
@@ -8187,7 +8264,7 @@ else
 fi
 
 # 16u: recent — crew assignee live, no branch, fresh (<45min dispatch) → KEEP.
-NS_FRESH_DISP="$((NS_NOW - 600))"   # 10 min ago — within the 45min phantom window
+NS_FRESH_DISP="$(( $(date +%s) - 600 ))"   # 10 min ago — within the 45min phantom window (ga-ipk1oz: from NOW, not from NS_NOW captured ~5000 lines earlier)
 NS_PHANTOM_FR='[{"id":"tt-ns-phantom-fr","description":"fixture body — context for veto test","status":"open","labels":["story:in-flight","pilot:dispatched"],"metadata":{"pilot.dispatched_at":"'"$NS_FRESH_DISP"'"}}]'
 echo "Scenario 16u: phantom-guard — recent crew-owned bead (no branch, <45min) is kept"
 # PILOT_TEST_PHANTOM_STALE_BEADS is empty → the guard uses the timestamp path;
@@ -8258,7 +8335,7 @@ has "$DISPATCHER" '_ns_label_blocks_release "\$_sling_labels" && continue' \
 PS_FAKE_RIG_DIR="$WORK/fake-ps-rig"
 mkdir -p "$PS_FAKE_RIG_DIR"
 PS_SHIMBIN="$WORK/ps-bin"
-mkdir -p "$PS_SHIMBIN"
+mkdir -p "$PS_SHIMBIN"; _st_shimdir_ready "$PS_SHIMBIN"
 
 # Custom gc shim: returns property_scrapers rig at PS_FAKE_RIG_DIR (makes _IS_RIG_NATIVE=1).
 cat > "$PS_SHIMBIN/gc" <<PS_GC_EOF
@@ -8346,7 +8423,7 @@ has "$DISPATCHER" 'session new ps-worker --no-attach' "spawn arm uses gc session
 LX_FAKE_RIG_DIR="$WORK/fake-lx-rig"
 mkdir -p "$LX_FAKE_RIG_DIR"
 LX_SHIMBIN="$WORK/lx-bin"
-mkdir -p "$LX_SHIMBIN"
+mkdir -p "$LX_SHIMBIN"; _st_shimdir_ready "$LX_SHIMBIN"
 cat > "$LX_SHIMBIN/gc" <<LX_GC_EOF
 #!/usr/bin/env bash
 case "\$*" in
@@ -8985,6 +9062,22 @@ has "$DISPATCHER" 'area-infra-label'      "area-infra-label exemption reason is 
 # mutation-content and drift-guard checks) lives in the sibling file
 # pilot-hold-escalate.selftest.sh — kept separate so this already-huge file
 # (~140s) doesn't grow a second, slower way to test the same function.
+#
+# ga-ipk1oz: these scenarios reuse the Scenario-18e busy-crew fixture ~4000 lines (hours, on a saturated box) after it was
+# built. They run here on a clock moved 3h forward — the incident's elapsed time, made deterministic — so the result no
+# longer depends on how long the run took. Control first: a fixture stamped BEFORE the jump must be dropped as stale, or
+# the simulated clock is not reaching the dispatcher and the two scenarios below would pass for the wrong reason.
+echo "Scenario ga-ipk1oz-a: control — an in-flight fixture stamped before a 3h clock jump is dropped as stale (the simulated clock reaches the dispatcher)"
+INFLIGHT_IPK1OZ_OLD="$(_inflight18e_json)"
+_st_clock_add 10800
+LOG_IPK1OZ_A="$(run_capacity 10 "$INFLIGHT_IPK1OZ_OLD" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18E" "$SLINGMAP18E")"
+if echo "$LOG_IPK1OZ_A" | grep -E 'In-flight: live=0 \(raw=1 stale=1 age=1' >/dev/null \
+   && echo "$LOG_IPK1OZ_A" | grep -F 'Stale ids: if-ps' >/dev/null; then
+  ok "ga-ipk1oz: a fixture 3h old on the simulated clock is counted as stale (raw=1 stale=1 age=1), so a held-over fixture WOULD break ga-2n7xw"
+else
+  bad "ga-ipk1oz: the clock jump did not age the fixture — the simulated clock is not reaching the dispatcher (log: $LOG_IPK1OZ_A)"
+fi
+INFLIGHT18E="$(_inflight18e_json)"   # re-stamped on the jumped clock = fresh where it is used
 echo "Scenario ga-2n7xw-a: ga-lfvs6 domain-build hold #1 (busy crew, fresh bead) → held, NOT escalated"
 LOG_2N7XW_A="$(run_capacity 10 "$INFLIGHT18E" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18E" "$SLINGMAP18E")"
 if echo "$LOG_2N7XW_A" | grep -F "WOULD stamp pilot:held-count:ga-lfvs6:1 on ga-wgtest (hold 1/3)" >/dev/null; then
@@ -9000,6 +9093,7 @@ fi
 
 echo "Scenario ga-2n7xw-b: ga-lfvs6 domain-build hold #3 (prior count=2 already on the bead) → ESCALATES, not another hold"
 PS_DOMAIN_SMALL_HELD2='[{"id":"ga-wgtest","title":"Mapeamento automatico de falecimento de proprietarios idosos (scraper RFB semanal)","priority":3,"issue_type":"feature","description":"fixture body — context for veto test","status":"open","labels":["lane:small","story:approved","pilot:held-count:ga-lfvs6:2"],"assignee":null,"created_at":"2026-06-12T00:00:01Z","metadata":{"story.o_que_e":"scraper semanal que verifica na Receita Federal o CPF dos proprietarios dos imoveis de interesse"}}]'
+INFLIGHT18E="$(_inflight18e_json)"
 LOG_2N7XW_B="$(run_capacity 10 "$INFLIGHT18E" 1 "$PS_DOMAIN_SMALL_HELD2" "$SESSIONS18E" "$SLINGMAP18E")"
 if echo "$LOG_2N7XW_B" | grep -F "WOULD ESCALATE ga-wgtest (ga-lfvs6, hold 3/3) to Mayor" >/dev/null; then
   ok "ga-lfvs6 3rd consecutive hold ESCALATES (by the ga-lfvs6-slug counter, not a generic side effect)"
@@ -9011,6 +9105,8 @@ if echo "$LOG_2N7XW_B" | grep -F "WOULD stamp pilot:held-count:ga-lfvs6:3" >/dev
 else
   ok "ga-lfvs6 3rd hold did not fall back to a plain hold"
 fi
+_st_clock_add -10800   # ga-ipk1oz: give the 3h back; later scenarios run on the real clock again
+_st_clock_disable
 
 echo "Scenario ga-2n7xw-c: ga-jazy9 lane:big hold #1 (generic, no domain match, no live owner) → held, leaves a trace (was: NONE at all pre-fix)"
 GENERIC_BIG_NOOWNER='[{"id":"ga-jazytest","title":"generic subsystem refactor","priority":2,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["lane:big"],"assignee":null,"created_at":"2026-07-01T00:00:01Z","metadata":{}}]'
@@ -10649,6 +10745,10 @@ fi
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
+# ga-ipk1oz: say how far the simulated clock actually moved. A run with PILOT_SELFTEST_FAKE_AGE set whose clock never engaged
+# would otherwise "pass" having aged nothing, and look identical to one that did.
+[ "${PILOT_SELFTEST_FAKE_AGE:-0}" -gt 0 ] 2>/dev/null \
+  && echo "Simulated clock at end of run: +$(cat "$_ST_SKEW_FILE" 2>/dev/null || echo "?")s (PILOT_SELFTEST_FAKE_AGE=$PILOT_SELFTEST_FAKE_AGE per assertion)"
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] && { echo "SELFTEST PASS"; exit 0; }
 echo "SELFTEST FAIL"
