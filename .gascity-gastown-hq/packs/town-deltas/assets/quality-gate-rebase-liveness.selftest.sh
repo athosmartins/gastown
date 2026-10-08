@@ -1036,9 +1036,9 @@ _tz0op_run() {
         comment) printf '%s :: %s\n' "$2" "$3" >> "$_T13G/comments.log" ;;
         show)
           [ "${SHOW_FAIL:-0}" = "1" ] && return 1
-          jq -n --rawfile a "$_T13G/assignee" --rawfile r "$_T13G/routed_to" \
+          jq -n --rawfile a "$_T13G/assignee" --rawfile r "$_T13G/routed_to" --rawfile c "$_T13G/comments.log" \
             --arg l "$(cat "$_T13G/labels")" \
-            '[{id:"wa-gqkpz", status:"in_progress", assignee:$a, labels:($l|split("\n")|map(select(length>0))), metadata:{"gc.routed_to":$r}}]' ;;
+            '[{id:"wa-gqkpz", status:"in_progress", assignee:$a, labels:($l|split("\n")|map(select(length>0))), comments:($c|split("\n")|map(select(startswith("wa-gqkpz :: "))|{text:.[12:]})), metadata:{"gc.routed_to":$r}}]' ;;
       esac
       return 0
     }
@@ -1077,8 +1077,12 @@ else
 
   echo "── 13g-1. the incident shape: dead pool author, assignee clears, gate:queued + gate:reviewing present ──"
   _tz0op_run
-  if grep -qxF "gate:needs-rebase" "$_T13G/labels" && ! grep -qxF "story:in-flight" "$_T13G/labels"; then
-    ok "13g-1: the block still does what it always did (gate:needs-rebase added, story:in-flight removed) — the harness ran the real block"
+  # ga-iqd7k1: the pool-return no longer ENDS on gate:needs-rebase — the Pilot's
+  # _filter_built drops a bead wearing it as "already built" — it hands the bead to
+  # the fix-loop (gate:needs-fix, gate:needs-rebase swapped out). Still a rebase,
+  # never a fix attempt: no gate:fix-attempt:* label may appear.
+  if grep -qxF "gate:needs-fix" "$_T13G/labels" && ! grep -qxF "gate:needs-rebase" "$_T13G/labels" && ! grep -qxF "story:in-flight" "$_T13G/labels" && ! grep -q '^gate:fix-attempt' "$_T13G/labels"; then
+    ok "13g-1: the block still does what it always did (story:in-flight removed, bead returned to the pool) and now ends on the Pilot's fix-loop state (gate:needs-fix, gate:needs-rebase swapped out, no gate:fix-attempt:*, ga-iqd7k1) — the harness ran the real block"
   else
     bad "13g-1: the extracted block did not run to its normal effect (labels: $(tr '\n' ' ' < "$_T13G/labels")) — harness is not exercising the real block"
   fi

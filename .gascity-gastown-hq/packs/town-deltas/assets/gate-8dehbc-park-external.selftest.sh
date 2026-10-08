@@ -47,7 +47,7 @@ DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
-has() { printf '%s' "$1" | grep -qF -- "$2"; }   # has <haystack> <needle>
+has() { case "$1" in *"$2"*) return 0 ;; esac; return 1; }   # has <haystack> <needle> — no pipe: with pipefail, grep -q exiting early SIGPIPE'd printf on a big haystack and failed the check at random (ga-iqd7k1)
 
 echo "== gate-8dehbc-park-external.selftest =="
 [ -f "$DISPATCHER" ] || { echo "FATAL: dispatcher not found at $DISPATCHER" >&2; exit 2; }
@@ -218,7 +218,7 @@ trap 'rm -f "$SHOW_LOG" "${ENSURE_LOG:-}"' EXIT
 
 BEAD_LABELS0="story:in-flight gate:queued"; BEAD_ASSIGNEE0="worker-x"; BEAD_ROUTE0="wa-worker"
 new_case() { # <marker-labels> [status] [raw-show-output | __FAIL__]
-  BD_LOG=""; WARN_LOG=""; STATUS_LOG=""; MC_LOG=""; BC_LOG=""; GC_LOG=""
+  BD_LOG=""; WARN_LOG=""; STATUS_LOG=""; MC_LOG=""; BC_LOG=""; GC_LOG=""; BEAD_CMTS=""
   : > "$SHOW_LOG"
   MARK_LABELS="$1"; MARK_STATUS="${2:-open}"; SHOW_RAW="${3:-}"
   MARKER_SET_RC=0
@@ -227,7 +227,7 @@ new_case() { # <marker-labels> [status] [raw-show-output | __FAIL__]
 }
 labs_json() { local l first=1 out=""; for l in $1; do [ "$first" = 1 ] || out="$out,"; first=0; out="$out\"$l\""; done; printf '%s' "$out"; }
 marker_json() { printf '[{"id":"%s","status":"%s","labels":[%s]}]' "$MARKER_ID" "$MARK_STATUS" "$(labs_json "$MARK_LABELS")"; }
-bead_json()   { printf '[{"id":"%s","status":"open","assignee":"%s","labels":[%s],"metadata":{"gc.routed_to":"%s"}}]' "$BEAD_ID" "$BEAD_ASSIGNEE" "$(labs_json "$BEAD_LABELS")" "$BEAD_ROUTE"; }
+bead_json()   { printf '[{"id":"%s","status":"open","assignee":"%s","labels":[%s],"metadata":{"gc.routed_to":"%s"},"comments":%s}]' "$BEAD_ID" "$BEAD_ASSIGNEE" "$(labs_json "$BEAD_LABELS")" "$BEAD_ROUTE" "$(printf '%s' "$BEAD_CMTS" | jq -Rs '[split("\n")[] | select(length>0) | {text: .}]')"; }
 strip_gate_status() {
   local out="" l
   for l in $MARK_LABELS; do case "$l" in gate-status:*) ;; *) out="$out $l" ;; esac; done
@@ -268,7 +268,7 @@ bd() {
       fi
       return 0 ;;
     comment)
-      if [ "${4:-}" = "$MARKER_ID" ]; then MC_LOG="$MC_LOG|$(flat "${5:-}")"; else BC_LOG="$BC_LOG|$(flat "${5:-}")"; fi
+      if [ "${4:-}" = "$MARKER_ID" ]; then MC_LOG="$MC_LOG|$(flat "${5:-}")"; else BC_LOG="$BC_LOG|$(flat "${5:-}")"; BEAD_CMTS="$BEAD_CMTS"$'\n'"$(flat "${5:-}")"; fi
       return 0 ;;
   esac
   return 0
@@ -315,8 +315,12 @@ run_site() { # run_site <site> — under `set -e` like the live dispatcher; no "
   OUT=$( set -e; $fn; echo "RC=$?"; dump_state ) 2>&1
 }
 # site_conf <site> → S_MK (marker comment when parked), S_EVENT (event on a normal park),
-# S_GC (a substring the author/Mayor notice must contain on a normal park; "" = none)
+# S_GC (a substring the author/Mayor notice must contain on a normal park; "" = none),
+# S_BL (the gate label the SOURCE bead must end up wearing: the pool-author return hands the bead to the Pilot's
+# fix-loop as gate:needs-fix — gate:needs-rebase would make the Pilot drop it as "already built", ga-iqd7k1 —
+# every other site parks it at gate:needs-rebase)
 site_conf() {
+  S_BL="gate:needs-rebase"; [ "$1" = "pool-author" ] && S_BL="gate:needs-fix"
   case "$1" in
     pool-author)    S_MK="Gate BLOCKED (ga-tz0op)";            S_EVENT="dispatcher_needs_rebase_pool_author";                     S_GC="" ;;
     behind-bounce)  S_MK="Gate BLOCKED (ga-6dp9)";             S_EVENT="dispatcher_needs_rebase_behind_envelope";                  S_GC="session nudge crew-author" ;;
@@ -347,9 +351,9 @@ for S in $SITES; do
   else
     bad "$S: normal case must park: GS='$(getl GS)' RESP='$(getl RESP)' out=[$OUT]"
   fi
-  if has "$(getl MC)" "$S_MK" && [[ "$(getl BL)" == *"gate:needs-rebase"* ]] \
+  if has "$(getl MC)" "$S_MK" && [[ "$(getl BL)" == *"$S_BL"* ]] \
      && [ "$(getl EVENT)" = "$S_EVENT" ] && has "$(getl VERDICT)" "NEEDS_REBASE"; then
-    ok "$S: normal case keeps the original park effects — marker comment, source-bead gate:needs-rebase, event and verdict"
+    ok "$S: normal case keeps the original park effects — marker comment, source-bead $S_BL, event and verdict"
   else
     bad "$S: normal-path park effects changed: EVENT='$(getl EVENT)' VERDICT='$(getl VERDICT)' $(effects_summary)"
   fi
@@ -363,6 +367,14 @@ for S in $SITES; do
       ok "$S: normal case still returns the bead to the pool (unassigned, re-routed to gastown.dog, story:in-flight dropped)"
     else
       bad "$S: pool return changed: $(effects_summary)"
+    fi
+    # ga-iqd7k1: the returned bead must be re-dispatchable by the Pilot (needs-fix + a GATE-FEEDBACK comment), not parked at needs-rebase
+    if [[ "$(getl BL)" == *"gate:needs-fix"* ]] && [[ "$(getl BL)" != *"gate:needs-rebase"* ]] \
+       && has "$(getl BC)" "|GATE-FEEDBACK (rebase-handoff, ga-iqd7k1; branch=$BRANCH): " \
+       && has "$(getl BC)" "gate:needs-fix=present; gate:needs-rebase=removed"; then
+      ok "$S: normal case hands the bead to the Pilot's fix-loop — GATE-FEEDBACK comment, gate:needs-fix on, gate:needs-rebase off, and the verified-write comment says so (ga-iqd7k1)"
+    else
+      bad "$S: rebase hand-off missing or unverified: $(effects_summary)"
     fi
   fi
 
@@ -402,7 +414,7 @@ for S in $SITES; do
   for pre in "gate-status:dispatching gate-status:needs-rebase" "gate-status:needs-rebase"; do
     new_case "type:quality-gate-marker $pre"
     run_site "$S"
-    if [ "$(getl GS)" = "gate-status:needs-rebase" ] && has "$(getl MC)" "$S_MK" && [[ "$(getl BL)" == *"gate:needs-rebase"* ]] \
+    if [ "$(getl GS)" = "gate-status:needs-rebase" ] && has "$(getl MC)" "$S_MK" && [[ "$(getl BL)" == *"$S_BL"* ]] \
        && [ -z "$(getl RESP)" ] && has "$OUT" "RC=0"; then
       ok "$S: needs-rebase ALREADY on the marker (labels: $pre) is not 'foreign' — the park still runs in full (source bead needs its label/re-route)"
     else

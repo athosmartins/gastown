@@ -3140,6 +3140,94 @@ rebase_author_is_pool() {
   printf '0'
 }
 
+# gate_pool_return_rebase_handoff <bead_city> <bead_id> <branch> <default_branch> <main_sha> <conflict_files>
+# ga-iqd7k1 (wa-ev549x, 07/10). A source bead the gate returns to the pool because
+# its branch needs a REBASE used to be left wearing gate:needs-rebase, and the Pilot
+# never re-dispatches it: _filter_built drops a bead carrying a gate:* lifecycle
+# label such as gate:needs-rebase, and only gate:needs-fix / gate:fix-attempt:N make a
+# built bead re-dispatchable. The ephemeral author was gone and the Pilot called the
+# bead "already built" — nobody rebased. Both pool-return arms (ga-tz0op
+# pre-review, ga-39l9z2 merge-time) call this to hand the bead to the Pilot's
+# fix-loop instead:
+#   1. comment "GATE-FEEDBACK (rebase-handoff …)" on the source bead FIRST — the Pilot
+#      injects the latest ^GATE-FEEDBACK comment into the builder prompt and refuses
+#      to dispatch a gate:needs-fix bead that has none (ga-e2n96);
+#   2. only if (1) succeeded add gate:needs-fix, and only if THAT succeeded drop
+#      gate:needs-rebase. A failed write leaves gate:needs-rebase exactly as it was
+#      (the inert, pre-fix state): never needs-fix after a failed comment write, never
+#      neither label;
+#   3. read the bead back and report what it really shows, in three states
+#      (done / not done / could not tell).
+# Never touches gate:fix-attempt:* — the code was not rejected, so this is NOT a fix attempt.
+# Result is the global GATE_HANDOFF_OBS (one line for the caller's verified-write
+# comment), not stdout: do not call this inside $(...), the bd writes would land in a
+# subshell. Always returns 0, so it is safe under the dispatcher's `set -e`.
+gate_pool_return_rebase_handoff() {
+  local _city="${1:-}" _bead="${2:-}" _branch="${3:-}" _dbranch="${4:-main}" _main_sha="${5:-}" _files="${6:-}"
+  local _files_txt _main_txt _rc=0 _json="" _read_ok=1
+  local _fb_n _fix_present _rebase_present _fb_obs _fix_obs _rebase_obs
+  GATE_HANDOFF_OBS=""
+  case "$_files" in
+    ""|"merge conflict (files unavailable)")
+      _files_txt="The gate captured no conflicting-file list, so rebase and see what conflicts." ;;
+    *)
+      _files_txt="Conflicting files (the gate's merge-tree check): $_files." ;;
+  esac
+  _main_txt="origin/$_dbranch"
+  [ -n "$_main_sha" ] && _main_txt="origin/$_dbranch (at $_main_sha)"
+
+  bd -C "$_city" comment "$_bead" "GATE-FEEDBACK (rebase-handoff, ga-iqd7k1; branch=$_branch): this code was NOT rejected — the gate could not merge it because the branch is out of date with $_main_txt. It needs a REBASE, not a rewrite, and this is NOT counted as a gate:fix-attempt. Rebase $_branch onto current $_main_txt, resolve any conflicts keeping the behaviour as written, push, then run /gate-done to re-gate. $_files_txt" 2>/dev/null || _rc=$?
+  if [ "$_rc" != "0" ]; then
+    GATE_HANDOFF_OBS="rebase hand-off NOT applied (writing the GATE-FEEDBACK comment failed, rc=$_rc) — gate:needs-rebase left as it was, so the Pilot will not re-dispatch this bead (needs investigation)"
+    return 0
+  fi
+  _rc=0
+  bd -C "$_city" label add "$_bead" "gate:needs-fix" -q 2>/dev/null || _rc=$?
+  if [ "$_rc" != "0" ]; then
+    GATE_HANDOFF_OBS="rebase hand-off PARTIAL (GATE-FEEDBACK comment written, adding gate:needs-fix failed, rc=$_rc) — gate:needs-rebase left as it was, so the Pilot will not re-dispatch this bead (needs investigation)"
+    return 0
+  fi
+  bd -C "$_city" label remove "$_bead" "gate:needs-rebase" -q 2>/dev/null || true
+
+  # vazio → _json="" so _read_ok=0 and the hand-off is reported UNVERIFIED (labels stay as written, no claim either way); falhou (bd error) → the same UNVERIFIED, never "swap failed" and never "swap done"; ilegível (non-JSON output) → passes this guard and is caught by the jq reads below, also UNVERIFIED.
+  _json=$(bd -C "$_city" show "$_bead" --json --include-comments 2>/dev/null) || _read_ok=0
+  [ -n "$_json" ] || _read_ok=0
+  if [ "$_read_ok" = "0" ]; then
+    GATE_HANDOFF_OBS="rebase hand-off UNVERIFIED (post-write read failed — state unknown, NOT a claim the swap failed; GATE-FEEDBACK comment written, gate:needs-fix added)"
+    return 0
+  fi
+  # vazio → "?" (counted as unreadable, see the guard below); falhou/ilegível (jq error, non-numeric) → "?" too, never 0 — "no comment found" and "could not read comments" stay different states.
+  _fb_n=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[0] else . end | [(.comments // [])[]? | (.text // .body // "") | select(test("^GATE-FEEDBACK \\(rebase-handoff"))] | length' 2>/dev/null || echo "?")
+  case "$_fb_n" in ''|*[!0-9]*) _fb_n="?" ;; esac
+  # vazio → "?" (unreadable, see the guard below); falhou/ilegível (jq error, not yes/no) → "?" too, never "no" — an unreadable label list must not read as "label absent".
+  _fix_present=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[0] else . end | if ((.labels // []) | index("gate:needs-fix")) != null then "yes" else "no" end' 2>/dev/null || echo "?")
+  case "$_fix_present" in yes|no) ;; *) _fix_present="?" ;; esac
+  # vazio → "?" (unreadable, see the guard below); falhou/ilegível (jq error, not yes/no) → "?" too, never "no" — an unreadable label list must not read as "needs-rebase gone".
+  _rebase_present=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[0] else . end | if ((.labels // []) | index("gate:needs-rebase")) != null then "yes" else "no" end' 2>/dev/null || echo "?")
+  case "$_rebase_present" in yes|no) ;; *) _rebase_present="?" ;; esac
+  if [ "$_fb_n" = "?" ] || [ "$_fix_present" = "?" ] || [ "$_rebase_present" = "?" ]; then
+    GATE_HANDOFF_OBS="rebase hand-off UNVERIFIED (post-write JSON unreadable — state unknown, NOT a claim the swap failed; GATE-FEEDBACK comment written, gate:needs-fix added, gate:needs-rebase removal attempted)"
+    return 0
+  fi
+  if [ "$_fb_n" -ge 1 ]; then
+    _fb_obs="GATE-FEEDBACK comment=present"
+  else
+    _fb_obs="GATE-FEEDBACK comment=NOT VISIBLE on read-back — the Pilot will read this bead as zero-feedback (ga-e2n96) (needs investigation)"
+  fi
+  if [ "$_fix_present" = "yes" ]; then
+    _fix_obs="gate:needs-fix=present"
+  else
+    _fix_obs="gate:needs-fix=MISSING after add — did not stick (needs investigation)"
+  fi
+  if [ "$_rebase_present" = "no" ]; then
+    _rebase_obs="gate:needs-rebase=removed"
+  else
+    _rebase_obs="gate:needs-rebase=STILL PRESENT after remove (needs investigation)"
+  fi
+  GATE_HANDOFF_OBS="rebase hand-off to the Pilot's fix-loop, verified post-write on the raw bead: $_fb_obs; $_fix_obs; $_rebase_obs; not counted as a gate:fix-attempt (ga-iqd7k1)"
+  return 0
+}
+
 # author_is_alive <author> — canonical liveness check for a gate marker's
 # AUTHOR. Echoes 1 if AUTHOR matches session_name, name, alias, id, or
 # agent_name of a live (non-closed) `gc session list` entry; 0 otherwise
@@ -9939,6 +10027,13 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       # gate:needs-rebase instead of gate:needs-fix, mirroring the existing
       # pre-review pool-return convention (ga-tz0op, same file, search
       # "REBASE_AUTHOR_IS_POOL") rather than inventing a new one.
+      # ga-iqd7k1: gate:needs-rebase stays only where an author is NUDGED (the
+      # live-crew 'keep' arm below). When the bead goes back to the pool the
+      # label is swapped for gate:needs-fix + a GATE-FEEDBACK comment by
+      # gate_pool_return_rebase_handoff (when that hand-off succeeds; otherwise
+      # the label stays, the inert pre-fix state) — the Pilot's _filter_built drops a
+      # bead wearing gate:needs-rebase as "already built", so with the label
+      # left on, nobody rebased it (wa-ev549x). Still never a fix attempt.
       log "Marking $BEAD_ID gate:needs-rebase (merge-mechanical failure after ALL-PASS, ga-39l9z2) — NOT counted as a fix attempt."
       bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"    -q 2>/dev/null || true  # wa-qq33j: clear in-review state
@@ -9994,6 +10089,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
           "Gate merge-conflict for $BEAD_ID (branch $BRANCH) — your reviewed code is fine, but it needs a rebase onto current main. Your assignee was kept; rebase and re-run /gate-done." \
           "Gate needs-rebase live-crew nudge for $BEAD_ID (branch $BRANCH)" || true
       else
+        # SELFTEST-EXTRACT ga-iqd7k1-nr-pool-return: BEGIN
         bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight" -q 2>/dev/null || true
         _NR_CLEAR_RC=0
         gate_clear_assignee_if_holder "$BEAD_ID" "$BEAD_CITY" || _NR_CLEAR_RC=$?
@@ -10052,9 +10148,21 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
             _NR_QUEUED_OBS="gate:queued=left untouched (clear unverified)"
           fi
         fi
+        # ga-iqd7k1: the pool has no fixed author to wait for, and the Pilot's
+        # _filter_built drops a bead wearing gate:needs-rebase as "already built"
+        # (the gate:needs-rebase label above is only right for the live-author
+        # 'keep' arm, whose author is nudged). Hand the bead to the Pilot's
+        # fix-loop instead — GATE-FEEDBACK first, then gate:needs-fix, then drop
+        # gate:needs-rebase. Last, after the pool-visibility writes above, so the
+        # bead is already unassigned and un-queued by the time the Pilot can see it
+        # (if one of those writes failed, it is not re-checked here). A failed
+        # hand-off leaves gate:needs-rebase in place — the inert, pre-fix state.
+        # No conflict-file list exists at this site (only a yes/no verdict).
+        gate_pool_return_rebase_handoff "$BEAD_CITY" "$BEAD_ID" "$BRANCH" "${DEFAULT_BRANCH:-main}" "" ""
         _NR_ROUTE_UNKNOWN_NOTE=""
         [ "$_NR_ROUTE_UNKNOWN" = "1" ] && _NR_ROUTE_UNKNOWN_NOTE=" NOTE: bead_city='$BEAD_CITY' did not reverse-resolve to any registered rig — route defaulted to gastown.dog rather than guessed (ga-u679x2)."
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content (GATE_SHA_FAIL_CLASS=$GATE_SHA_FAIL_CLASS). story:in-flight + gate:reviewing cleared. gc.routed_to restored to $_NR_ROUTE (from the bead's own home store, ga-u679x2) so pool workers can self-serve this bead — verified post-write, not assumed: $_NR_ROUTE_OBS; $_NR_ASSIGNEE_OBS; $_NR_STATUS_OBS; $_NR_QUEUED_OBS.$_NR_ROUTE_UNKNOWN_NOTE Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — NOT counted as a gate:fix-attempt, since the reviewers already approved this content (GATE_SHA_FAIL_CLASS=$GATE_SHA_FAIL_CLASS). story:in-flight + gate:reviewing cleared. gc.routed_to restored to $_NR_ROUTE (from the bead's own home store, ga-u679x2) so pool workers can self-serve this bead — verified post-write, not assumed: $_NR_ROUTE_OBS; $_NR_ASSIGNEE_OBS; $_NR_STATUS_OBS; $_NR_QUEUED_OBS. ${GATE_HANDOFF_OBS:-rebase hand-off status unknown (helper reported nothing)}.$_NR_ROUTE_UNKNOWN_NOTE Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
+        # SELFTEST-EXTRACT ga-iqd7k1-nr-pool-return: END
       fi
     elif [ "$GATE_SHA_STALE_ACTION" = "stale" ]; then
       # (d) STALE REVIEW (ga-l7mvtw) — the branch has moved past the commit
@@ -15753,6 +15861,7 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       if [ "$_RQ_RC" = "0" ]; then
         bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (virtual slot label, bare template, or a recycled pool instance) — structurally never a fixed session to wait for or notify (NOT the same as a dead named author; NOT the same as a live one to bounce to). Source bead $BEAD_ID returned to the $_TZ0OP_ROUTE pool for a fresh worker to rebase and resubmit." 2>/dev/null || true
         if [ -n "$BEAD_ID" ]; then
+          # ga-iqd7k1: this label is the fallback state — gate_pool_return_rebase_handoff below swaps it for gate:needs-fix once the pool writes are done.
           bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-rebase"  -q 2>/dev/null || true
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"    -q 2>/dev/null || true
           bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                   -q 2>/dev/null || true
@@ -15867,9 +15976,17 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
               fi
             fi
           fi
+          # ga-iqd7k1: LAST, after the pool-visibility vetoes above are cleared — the
+          # moment gate:needs-fix lands the Pilot may pick the bead up, and it must
+          # find it already unassigned, un-queued and un-reviewing (a write that
+          # failed above is not re-checked here). gate:needs-rebase (added
+          # above) is swapped out here: the Pilot's _filter_built drops a bead wearing
+          # it as "already built" and nobody rebases (wa-ev549x). A failed hand-off
+          # leaves gate:needs-rebase in place — the inert, pre-fix state.
+          gate_pool_return_rebase_handoff "$BEAD_CITY" "$BEAD_ID" "$BRANCH" "${DEFAULT_BRANCH:-main}" "${MAIN_HEAD_SHA:-}" "${CONFLICT_FILES:-}"
           _TZ0OP_ROUTE_UNKNOWN_NOTE=""
           [ "$_TZ0OP_ROUTE_UNKNOWN" = "1" ] && _TZ0OP_ROUTE_UNKNOWN_NOTE=" NOTE: bead_city='$BEAD_CITY' did not reverse-resolve to any registered rig — route defaulted to gastown.dog rather than guessed (ga-u679x2)."
-          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity — no fixed session to wait for. Returned to the $_TZ0OP_ROUTE pool for a fresh worker to rebase and resubmit via /gate-done — verified post-write, not assumed: $_TZ0OP_ROUTE_OBS; $_TZ0OP_ASSIGNEE_OBS; $_TZ0OP_QUEUED_OBS; $_TZ0OP_REVIEWING_OBS (ga-i19942, ga-3bp42c).$_TZ0OP_ROUTE_UNKNOWN_NOTE" 2>/dev/null || true
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity — no fixed session to wait for. Returned to the $_TZ0OP_ROUTE pool for a fresh worker to rebase and resubmit via /gate-done — verified post-write, not assumed: $_TZ0OP_ROUTE_OBS; $_TZ0OP_ASSIGNEE_OBS; $_TZ0OP_QUEUED_OBS; $_TZ0OP_REVIEWING_OBS (ga-i19942, ga-3bp42c). ${GATE_HANDOFF_OBS:-rebase hand-off status unknown (helper reported nothing)}.$_TZ0OP_ROUTE_UNKNOWN_NOTE" 2>/dev/null || true
         fi
         REBASE_EVENT="dispatcher_needs_rebase_pool_author"
         REBASE_VERDICT="NEEDS_REBASE (pool/ephemeral author '$REBASE_AUTHOR' — returned to pool, ga-tz0op)"
