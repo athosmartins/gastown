@@ -3475,10 +3475,23 @@ _filter_candidates() {
   # lines that set the globals, would otherwise pass literal empty strings to
   # --argjson, which is invalid JSON and makes the WHOLE jq call error out —
   # collapsing _cf_out to "[]" for every bead, not just assignee-holding ones.
-  # Mirrors this function's own existing "$([ -z "$_cf_out" ] && ...)" fallback
-  # philosophy: never let a missing dependency silently zero out the output.
+  # Same philosophy as the jq-failure handling below (ga-fesw8n): never let a missing
+  # dependency zero out the output SILENTLY — the defaults here keep the jq working, and if
+  # it fails anyway the rc != 0 branch below says so on stderr.
   local _cf_roster_ok="${_ROSTER_OK_FOR_FILTER:-0}"
   local _cf_active_owner_ids_json="${_ACTIVE_OWNER_IDS_JSON:-[]}"
+  # ga-fesw8n: vazio (entrada em branco ou "[]") → "[]" sem alarme; falhou/ilegível → "[]" inerte +
+  # WARN em stderr, NUNCA o mesmo "[]" mudo de uma fila vazia. Dois níveis:
+  #   (1) UM bead que derruba o predicado (labels em texto, metadata em texto, labels=[5], description
+  #       numérica, elemento que nem é objeto) é isolado DENTRO do jq, por elemento (try/catch abaixo):
+  #       sai da lista com uma linha WARN que cita o id, e os vizinhos seguem pelo MESMO predicado —
+  #       antes ele derrubava o jq inteiro e a lista inteira virava "[]", sem uma palavra.
+  #   (2) o jq inteiro falhar (entrada que nem é JSON, null ou texto — nao há o que iterar —,
+  #       --argjson invalido) é o rc != 0 tratado logo depois do jq. Um objeto-envelope
+  #       ({"error":...}) NAO cai aqui: cada valor dele vira um elemento "que nao é objeto", nível (1).
+  #       Sem 2>/dev/null: a mensagem do próprio jq e as linhas WARN do nível (1) saem em stderr. Nos sweeps principais isso cai em $LOG (exec >> $LOG 2>&1); os pipelines de
+  #       top-up ainda chamam este estágio com 2>/dev/null, entao la só o isolamento vale, nao o aviso.
+  local _cf_rc=0
   _cf_out=$(printf '%s' "$_cf_in" | jq --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
      --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --arg now_iso "$_now_iso" \
      --arg engine_rebuild_re "$_cf_engine_rebuild_re" \
@@ -3486,7 +3499,7 @@ _filter_candidates() {
      --arg diagnostic_only_re "$_cf_diagnostic_only_re" \
      --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" \
      --argjson framework_markers "$_FILTER_FRAMEWORK_MARKER_LABELS" \
-    '[.[] | select(
+    '[.[] | . as $cf_el | try (if ($cf_el | type) == "object" then select(
         .id != $self
         # ga-46wq5: an assignee alone is no longer an unconditional veto. It
         # still is when the roster is untrustworthy ($roster_ok != 1 — jq
@@ -3875,9 +3888,15 @@ _filter_candidates() {
         # NOTE: no literal apostrophes anywhere in this comment block —
         # same reason as the DECISAO comment above (single-quoted jq arg).
         and (((.defer_until) // "") as $defer_until | ($defer_until == "" or $defer_until <= $now_iso))
-     )]' \
-    2>/dev/null)
-  [ -z "$_cf_out" ] && _cf_out="[]"
+     ) else error("elemento nao e objeto") end)
+       catch ("[\(now | localtime | strftime("%Y-%m-%d %H:%M:%S"))] [pilot-dispatcher] WARN: _filter_candidates: bead id=\(($cf_el | .id?) // "?" | tojson) derrubou o jq (\(tostring)) — fora desta lista; as demais seguem (ga-fesw8n)\n" | stderr | empty)
+    ]') || _cf_rc=$?
+  if [ "$_cf_rc" -ne 0 ]; then
+    log "WARN: _filter_candidates: o jq falhou (rc=$_cf_rc) — nada despachado desta lista neste sweep (nao consegui filtrar, nao e fila vazia; ga-fesw8n). Entrada: $(printf '%s' "$_cf_in" | head -c 80 | tr '\n' ' ')" >&2
+    _cf_out="[]"
+  elif [ -z "$_cf_out" ]; then
+    _cf_out="[]"
+  fi
 
   _cf_kept=$(printf '%s' "$_cf_out" | jq -c '[.[].id]' 2>/dev/null); [ -z "$_cf_kept" ] && _cf_kept="[]"
 
@@ -3897,6 +3916,10 @@ _filter_candidates() {
   # NEVER influences $_cf_out — it independently mirrors each clause above, read-only,
   # restricted (via $kept) to ids already known to be dropped. A bug in this mirror
   # can only under-report a reason, never change what actually gets dispatched.
+  # ga-fesw8n: per-element try/catch (head and tail of the program below). The bead that crashed
+  # the main pass above can crash this mirror too, and an uncaught error ends the whole stream —
+  # every bead AFTER it would lose its EXCLUÍDO line. The odd bead itself was already announced by
+  # the main pass's WARN, so here it just contributes no row.
   printf '%s' "$_cf_in" | jq -r --arg self "$SELF_BEAD_ID" --argjson preapproval "$_FILTER_PREAPPROVAL_LABELS" \
       --argjson now_ts "$_now_ts" --argjson reclaim_cap "$_FILTER_RECLAIM_CAP" --argjson kept "$_cf_kept" \
       --arg now_iso "$_now_iso" \
@@ -3905,7 +3928,7 @@ _filter_candidates() {
       --arg diagnostic_only_re "$_cf_diagnostic_only_re" \
       --argjson roster_ok "$_cf_roster_ok" --argjson active_owner_ids "$_cf_active_owner_ids_json" \
       --argjson framework_markers "$_FILTER_FRAMEWORK_MARKER_LABELS" '
-      .[] | . as $b | ($b.id // "") as $id | ($b.labels // []) as $L
+      .[] | . as $b | try (($b.id // "") as $id | ($b.labels // []) as $L
       | select($id != "" and (($kept | index($id)) | not))
       | [
           (if $id == $self then "self-bead" else empty end),
@@ -4025,8 +4048,8 @@ _filter_candidates() {
            then "defer_until:\($b.defer_until)(future)" else empty end)
         ] as $reasons
       | select(($reasons | length) > 0)
-      | [$id, ($reasons | join(";"))] | @tsv
-    ' 2>/dev/null | _log_exclusions "_filter_candidates"
+      | [$id, ($reasons | join(";"))] | @tsv) catch empty
+    ' 2>/dev/null | _log_exclusions "_filter_candidates" || true   # ga-fesw8n: o trace nunca derruba o estágio (set -e + pipefail com entrada ilegível)
 
   # ga-kqa08j: GATE FOCUS MODE — while the gate is the bottleneck (gate-focus-mode.sh
   # (Athos 07/10, 2nd decision: an auto-healer bead (origem:auto-healer-notify) and a live-damage
@@ -4211,7 +4234,11 @@ _filter_explicit_deps() {
 # AC3). Crews SKIP such beads; dispatching them is wasted capacity + a stuck
 # pilot:dispatching claim. exec:auto and unlabelled beads pass through unchanged
 # (conservative default: absent exec: label → dispatch is fine, never suppress).
-# Pure read (no side effects); fail-open → pass through unchanged on jq error.
+# Pure read (no side effects). ga-fesw8n: "never suppress" is about a bead WITHOUT the label;
+# it is not a licence to hand an UNFILTERED list on when the final jq check fails — that sent
+# exec:manual beads downstream exactly when the list was unreadable. If that last jq fails the
+# stage now returns the inert "[]" and says so with a WARN on stderr (see the tail of the
+# function). A really empty input stays a quiet "[]".
 #
 # ga-10co2 (derive() swap slice 1/6, per docs/pilot-dispatcher-derive-swap-
 # decisions.md): this was the cleanest candidate to bridge to
@@ -4234,7 +4261,7 @@ _filter_explicit_deps() {
 # running this script) and PILOT_CITY_OVERRIDE (the selftest's fixture-city
 # seam) doesn't point at a real scripts/ dir at all.
 _filter_exec_manual() {
-  local _em_in _em_out
+  local _em_in _em_out _em_rc=0
   _em_in=$(cat)
 
   local _em_bsp _em_sd
@@ -4287,22 +4314,37 @@ print(str(b.get("id", "")) + "\t" + st["state"])
             (((.labels // []) | index("exec:manual")) == null)
             and (($st[.id] // "") as $s
               | ($s != "manual_assigned" and $s != "manual_unrouted"))) ]
-      ' 2>/dev/null)
+      ' 2>/dev/null) || _em_out=""   # ga-fesw8n: falhou → cai no check de label abaixo (por desenho), sem abortar sob set -e
     fi
   fi
 
+  # ga-fesw8n: vazio (entrada em branco) → "[]" sem alarme; falhou/ilegível (jq rc != 0) → "[]"
+  # inerte + WARN em stderr. Antes este último jq levava 2>/dev/null e a ENTRADA voltava sem
+  # filtrar: um exec:manual seguia adiante só porque a lista estava ilegível. Sem 2>/dev/null
+  # agora: a mensagem do próprio jq sai em stderr, logo acima do WARN. Este estágio roda ANTES de
+  # _filter_candidates em todo pipeline: um elemento que nem é objeto é isolado aqui mesmo
+  # (try/catch por elemento, mesma linha WARN de _filter_candidates) para não derrubar a lista.
   if [ -z "$_em_out" ]; then
-    _em_out=$(printf '%s' "$_em_in" | jq '[ .[] | select(((.labels // []) | index("exec:manual")) == null) ]' 2>/dev/null)
+    _em_out=$(printf '%s' "$_em_in" | jq '[ .[] | . as $b | try (if ($b | type) == "object" then select(((.labels // []) | index("exec:manual")) == null) else error("elemento nao e objeto") end)
+        catch ("[\(now | localtime | strftime("%Y-%m-%d %H:%M:%S"))] [pilot-dispatcher] WARN: _filter_exec_manual: bead id=\(($b | .id?) // "?" | tojson) derrubou o jq (\(tostring)) — fora desta lista; as demais seguem (ga-fesw8n)\n" | stderr | empty) ]') || _em_rc=$?
+  fi
+  if [ "$_em_rc" -ne 0 ]; then
+    log "WARN: _filter_exec_manual: o jq falhou (rc=$_em_rc) — nada despachado desta lista neste sweep (nao consegui filtrar, nao e fila vazia; antes a entrada voltava sem filtro e exec:manual seguia adiante; ga-fesw8n). Entrada: $(printf '%s' "$_em_in" | head -c 80 | tr '\n' ' ')" >&2
+    printf '[]'
+    return 0
   fi
   if [ -z "$_em_out" ]; then
-    printf '%s' "$_em_in"
-    return
+    printf '[]'
+    return 0
   fi
   # ga-yolmi PASSO 1: single-clause filter, so every dropped id shares one reason.
+  # ga-fesw8n: try/catch por elemento — um elemento que nem é objeto (já anunciado pelo WARN do
+  # filtro acima) ia abortar este stream e apagar a linha EXCLUÍDO de todo bead depois dele; e ele
+  # nunca recebe a razão "label:exec:manual", que seria falsa para ele.
   printf '%s' "$_em_in" | jq -r --argjson kept "$(printf '%s' "$_em_out" | jq -c '[.[].id]' 2>/dev/null || echo '[]')" '
-      .[] | . as $b | ($b.id // "") as $id
+      .[] | . as $b | try (($b.id // "") as $id
       | select($id != "" and (($kept | index($id)) | not))
-      | [$id, "label:exec:manual"] | @tsv
+      | [$id, "label:exec:manual"] | @tsv) catch empty
     ' 2>/dev/null | _log_exclusions "_filter_exec_manual"
   printf '%s' "$_em_out"
 }
@@ -4354,12 +4396,21 @@ _filter_dispatch_gates() {
         or (((.description) // "") | length) >= $floor )
       and ((((.title) // "") + " " + ((.description) // "")) | ascii_downcase | test("design[ -]?first") | not)
     )]'
-  local _dg_input _dg_out _dg_reasons
+  local _dg_input _dg_out _dg_reasons _dg_rc=0
   _dg_input=$(cat)
-  _dg_out=$(printf '%s' "$_dg_input" | jq --argjson floor "$floor" "$_gate_filter" 2>/dev/null)
+  # ga-fesw8n: vazio (entrada em branco) → "[]" sem alarme; falhou/ilegível (jq rc != 0) → "[]"
+  # inerte + WARN em stderr. Antes o jq levava 2>/dev/null e a ENTRADA voltava sem filtrar —
+  # e como _filter_label_vetoes só roda DEPOIS deste filtro (pipe no fim da função), os vetos de
+  # label também deixavam de valer. Sem 2>/dev/null agora: a mensagem do próprio jq sai em stderr.
+  _dg_out=$(printf '%s' "$_dg_input" | jq --argjson floor "$floor" "$_gate_filter") || _dg_rc=$?
+  if [ "$_dg_rc" -ne 0 ]; then
+    log "WARN: _filter_dispatch_gates: o jq falhou (rc=$_dg_rc) — nada despachado desta lista neste sweep (nao consegui filtrar, nao e fila vazia; antes a entrada voltava sem filtro e os vetos de label nao rodavam; ga-fesw8n). Entrada: $(printf '%s' "$_dg_input" | head -c 80 | tr '\n' ' ')" >&2
+    printf '[]'
+    return 0
+  fi
   if [ -z "$_dg_out" ]; then
-    printf '%s' "$_dg_input"
-    return
+    printf '[]'
+    return 0
   fi
 
   # ── ga-yolmi PASSO 1 (supersedes the old PILOT_DISPATCH_GATES_DEBUG-only trace,
@@ -4419,12 +4470,21 @@ _filter_label_vetoes() {
             or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))
           )) | length) == 0)
     )]'
-  local _lv_input _lv_out _lv_reasons
+  local _lv_input _lv_out _lv_reasons _lv_rc=0
   _lv_input=$(cat)
-  _lv_out=$(printf '%s' "$_lv_input" | jq "$_lv_filter" 2>/dev/null)
+  # ga-fesw8n: vazio (entrada em branco) → "[]" sem alarme; falhou/ilegível (jq rc != 0) → "[]"
+  # inerte + WARN em stderr. Antes o jq levava 2>/dev/null e a ENTRADA voltava sem filtrar
+  # (fail-open): um blocked-on:/waiting-on:/next-action: passava pelo veto só porque o jq tinha
+  # caído por outro motivo. Sem 2>/dev/null agora: a mensagem do próprio jq sai em stderr.
+  _lv_out=$(printf '%s' "$_lv_input" | jq "$_lv_filter") || _lv_rc=$?
+  if [ "$_lv_rc" -ne 0 ]; then
+    log "WARN: _filter_label_vetoes: o jq falhou (rc=$_lv_rc) — nada despachado desta lista neste sweep (nao consegui filtrar, nao e fila vazia; antes a entrada voltava sem filtro e os vetos nao valiam; ga-fesw8n). Entrada: $(printf '%s' "$_lv_input" | head -c 80 | tr '\n' ' ')" >&2
+    printf '[]'
+    return 0
+  fi
   if [ -z "$_lv_out" ]; then
-    printf '%s' "$_lv_input"
-    return
+    printf '[]'
+    return 0
   fi
 
   _lv_reasons=$(printf '%s' "$_lv_input" | jq -r '
@@ -4473,13 +4533,20 @@ _filter_label_vetoes() {
 # to Tier-1 HQ, via _filter_label_vetoes chained after this function at each
 # of the 4 call sites below — only gate (b)'s spec floor stays HQ-Tier-1-exempt.
 _filter_terminal_status() {
-  local _fts_in _fts_out
+  local _fts_in _fts_out _fts_rc=0
   _fts_in=$(cat)
+  # ga-fesw8n: vazio (entrada em branco) → "[]" sem alarme; falhou/ilegível (jq rc != 0) → "[]"
+  # inerte + WARN em stderr. Antes o jq levava 2>/dev/null e a ENTRADA voltava sem filtrar: uma
+  # lista ilegível seguia adiante como se já estivesse filtrada, e ninguém via. Sem 2>/dev/null
+  # agora: a mensagem do próprio jq sai em stderr, logo acima do WARN.
   _fts_out=$(printf '%s' "$_fts_in" | jq '[.[] | select(
       ((.status) // "open") as $s | ($s != "blocked" and $s != "closed" and $s != "deferred")
-    )]' 2>/dev/null)
-  if [ -z "$_fts_out" ] || [ "$_fts_out" = "null" ]; then
-    printf '%s' "$_fts_in"
+    )]') || _fts_rc=$?
+  if [ "$_fts_rc" -ne 0 ] || [ "$_fts_out" = "null" ]; then
+    log "WARN: _filter_terminal_status: o jq falhou (rc=$_fts_rc) — nada despachado desta lista neste sweep (nao consegui filtrar, nao e fila vazia; antes a entrada voltava sem filtro; ga-fesw8n). Entrada: $(printf '%s' "$_fts_in" | head -c 80 | tr '\n' ' ')" >&2
+    printf '[]'
+  elif [ -z "$_fts_out" ]; then
+    printf '[]'
   else
     printf '%s' "$_fts_out"
   fi
