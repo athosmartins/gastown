@@ -422,8 +422,10 @@ _offline_backup_sync() {
 
   local rc=0 sync_rc=0
   if [ "$seeded" -eq 1 ] || [ -n "${OFFLINE_SYNC_MIN_FREE_KB:-}" ]; then
-    # falhou on the guard (rc 97: the floor was crossed or could not be read) is a failed sync like any other:
-    # nothing is moved onto <dest>, and the log line above says why.
+    # falhou on the guard (rc 97: the floor was crossed or could not be read) is a failed sync like any other;
+    # the "STOPPING the sync" line the guard logged says why. Seeded: the work dir goes with $clone_parent and
+    # nothing is moved onto <dest>. Unseeded: sync-url wrote into <dest> itself, so what it wrote before it was
+    # stopped stays there, exactly as after a timeout — the caller's failed-night flow owns that residue.
     _offline_sync_run_guarded "$sync_timeout" "${OFFLINE_SYNC_MIN_FREE_KB:-3145728}" \
       "$dolt_bin" --data-dir "$clone" backup sync-url "file://$sync_dest"; sync_rc=$?
   else

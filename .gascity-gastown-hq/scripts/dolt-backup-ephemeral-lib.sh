@@ -14,6 +14,11 @@
 # MEASURED 2026-10-01: hq live 9.6 GB, .dolt-backup/hq 9.5 GB, free 7.4 GB. Without the staging
 # the same disk has 16.9 GB free — above the nightly's gate with room to spare.
 #
+# MEASURED 2026-10-08 (ga-a0woau): the staging was gone, the gate still refused 8 nights of 9
+# (30/09..08/10), e.g. 08/10 04:03: livre=11595MB precisa=16843MB vivo=11229MB. A staging built
+# "from scratch" is a full copy of the store, written to a disk that does not have room for one.
+# The fix is a smaller build, not a looser gate: see "THE STAGING IS SEEDED" below.
+#
 # ═══ WHAT "EPHEMERAL" MEANS ═══
 #
 # For a db listed here (default: hq) the staging dir is a SCRATCH area, not a store:
@@ -29,7 +34,23 @@
 # GB, dies on "table file not found" and leaves a manifest-less residue (ga-yct7r1, ga-ypxbxm:
 # 6.4 GB of it on 2026-09-29). Dolt 2.3.1 still has no plain `s3://` backup scheme ("unknown url
 # scheme: 's3'", re-checked for this bead), so a local staging for the DURATION of one backup
-# cannot be avoided — only its permanence can.
+# cannot be avoided — only its permanence can, and (ga-a0woau) the disk it really costs.
+#
+# ═══ THE STAGING IS SEEDED (ga-a0woau) ═══
+#
+# `dolt backup sync-url` into an EMPTY dest rewrites every chunk of the store (11 GB for hq, as
+# new files). The nightly therefore seeds the dest first (dolt-offline-backup-sync.sh, "SEEDED
+# MODE"): clonefile copies (`cp -c`, APFS copy-on-write, ~0 real disk) of the snapshot's
+# .dolt/noms/oldgen tables plus a manifest naming them under a placeholder root. sync-url sees a
+# non-empty backup, keeps those files byte for byte and writes only what oldgen does not hold
+# (hq: ~0.7 GB of the live store lie outside oldgen; measured 2026-10-08 on the real store, the
+# sync took 30-37 s, left 100 of 100 seeded files untouched and used ~240 MB of disk). The
+# nightly's disk gate counts that credit (and only that) and REQUIRES the seed when it did: a seed
+# that cannot be built is a refused night with a reason, never a fall-back to the full build the
+# gate did not reserve.
+# The seed is held by the staging, so while the staging exists its clonefile copies pin the
+# oldgen blocks: a `dolt gc` of the live store frees nothing that the staging still shares. The
+# nightly releases the staging as soon as S3 is proven (below), which ends that.
 #
 # ═══ WHO DELETES, AND WHY THAT IS NOT AN AGENT'S rm -rf ═══
 #
@@ -42,10 +63,12 @@
 #
 # ═══ KNOWN CONSEQUENCES (stated, not hidden) ═══
 #
-#   - The nightly's own disk gate (150% of live) still applies, and now has to be met for a
-#     FULL backup instead of an incremental one. It is met far more often than before (the gate
-#     was refusing for the space the staging itself held), but a night below it still leaves
-#     S3 unrefreshed — the nightly says so loudly (notify + streak escalation), as it does today.
+#   - The nightly's own disk gate still applies. For an ephemeral db whose staging is EMPTY and
+#     whose oldgen can be cloned it is the floor (3 GB) + 150% of what the seed does NOT cover
+#     (hq: ~3.3 GB, not 16.8 GB); for anything else — a staging that already holds content, a
+#     store that was never GC'd, a different volume, an unreadable oldgen — it is the legacy
+#     150% of live for a FULL backup. A night below it still leaves S3 unrefreshed — the
+#     nightly says so loudly (notify + streak escalation), as it does today.
 #   - dolt-gc-maintenance.sh's prune/flatten "backup is fresh" gate reads the LOCAL staging and
 #     so stays closed for an ephemeral db. Both are off (PRUNE_ENABLED=0, FLATTEN default off);
 #     whoever turns them on for hq must teach that gate to read S3 first.

@@ -578,10 +578,11 @@ _sync_disk_preflight() {
 # not need the full store: the oldgen part is clonefile copies of the live files, ~0 real disk. The
 # requirement is then SYNC_DISK_FLOOR_GB (what must stay free once the sync is done — the same number the
 # sync's watchdog enforces) plus margin% of what the sync really writes, the live store minus the oldgen
-# (hq: 11.5GB live, 11.3GB oldgen → ~3.4GB instead of 16.8GB; the 8 refusals of 30/09..08/10 on a disk with
-# 6-12GB free). A pass that counted on the seed sets _SYNC_SEED_CREDITED=1 so the
-# sync REQUIRES the seed (it refuses, never falls back to the full build); its log lines still read
-# "sync preflight OK/REFUSED" and add ", semeado do oldgen: NMB". Without a seed this is the old gate.
+# (hq, measured 2026-10-08: the 04:03 night asked precisa=16843MB for vivo=11229MB; with ~11049MB of the store in
+# the oldgen the same gate asks ~3.3GB — it refused 8 nights of 9, 30/09..08/10, on a disk with 6-14GB free).
+# A pass that counted on the seed sets _SYNC_SEED_CREDITED=1, so the sync REQUIRES the seed (it refuses, never
+# falls back to the full build); its log lines still read "sync preflight OK/REFUSED" and add
+# ", semeado do oldgen: NMB". Without a seed this is the old gate.
 _sync_disk_preflight_credit() {
   local db="$1" credit_kb="${2:-0}"
   local live_kb free_kb need_kb floor_kb tag="" seed_kb=0 seed_note=""

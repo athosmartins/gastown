@@ -3029,8 +3029,8 @@ else bad "e2e EK: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|') 
 
 
 # ═══ ga-a0woau: the SEED-AWARE disk gate and its wiring ═══════════════════════════════════════════════
-# MEASURED 2026-10-08: hq live 11.5GB (oldgen 11.3GB of it), free 6.0-6.2GB. The gate wanted 150% of live
-# (17.6GB) to build a local staging that is a full copy of the store, and refused 8 nights of 9 (30/09..08/10).
+# MEASURED 2026-10-08: hq live 11229MB (04:03 night; the probe later saw 11752MB, ~11049MB of it oldgen), free 6-14GB.
+# The gate wanted 150% of live (16843MB at 04:03) to build a local staging that is a full copy of the store, and refused 8 nights of 9 (30/09..08/10).
 # With the staging seeded from the oldgen (clonefile copies, ~0 real disk) the sync writes only the ~0.7GB
 # the oldgen does not hold: the gate must count that, and ONLY that, and only when the seed will really be used.
 echo "── seed-aware disk gate (ga-a0woau) — hq numbers of 2026-10-08, unit level ──"
@@ -3053,7 +3053,7 @@ _run_sg() { # <db> <live_kb> <free_kb> [switch 1|0] — the REAL gate; sets SG_R
     _sync_disk_preflight_credit "$1" "${SG_CREDIT-0}"; SG_RC=$?
 }
 
-# G1 — THE night: 6.2GB free, hq 11.5GB live with an 11.3GB oldgen. Needs floor 3GB + 150% of the 0.7GB that is
+# G1 — THE night: 6084MB free, hq 11752MB live with 11049MB of oldgen. Needs floor 3GB + 150% of the 703MB that is
 # not oldgen = 4127MB (not 17629MB): passes, says why in the same "sync preflight OK" line, and flags the seed as counted on.
 _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
 if [ "$SG_RC" -eq 0 ] && grep -qF 'hq: sync preflight OK (livre=6084MB >= precisa=4127MB, vivo=11752MB, semeado do oldgen: 11049MB' "$SG_LOG" \
@@ -3174,7 +3174,7 @@ done
 # Real dolt-s3-backup.sh and the real offline-sync lib (real cp -c clone, real seed build, real watchdog); only
 # dolt/aws/df/du/ps are stubs, and the stub sync-url behaves like the real one measured on 2.3.1 (keeps the seeded
 # tables, adds ONE table, commits a real root). The city is a throwaway; S3 is a directory.
-echo "── end-to-end: a seeded hq night (ga-a0woau) — real subprocess, 08/10 numbers (12.0GB live, 11.3GB oldgen, 6.2GB free) ──"
+echo "── end-to-end: a seeded hq night (ga-a0woau) — real subprocess, 08/10 probe numbers (11752MB live, 11049MB oldgen, 6084MB free) ──"
 SE_LIVE=12035000; SE_OG=11314756; SE_FREE=6230068
 
 # ES1 — THE fix: at 6.2GB free the night that was refused 8 of 9 times now builds the staging from the oldgen,
