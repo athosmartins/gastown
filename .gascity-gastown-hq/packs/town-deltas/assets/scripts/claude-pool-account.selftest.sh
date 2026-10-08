@@ -1232,7 +1232,7 @@ else
     || bad "C9 the doc's item name '$dhash' is not sha256 of the path it names ('$dpath')"
 fi
 
-# C10-C17 the guard's plist (ga-8hcnvb.3.1): same rules, its own job
+# C10-C17 the guard's plist (ga-8hcnvb.3): same rules, its own job
 GPLIST="${CLAUDE_POOL_GUARD_PLIST:-$SELF_DIR/../claude-pool-guard.plist}"
 if [ ! -f "$GPLIST" ]; then bad "C10 guard plist not found at $GPLIST"
 else
