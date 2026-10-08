@@ -9112,7 +9112,7 @@ has "$DISPATCHER" 'digest-label'          "digest-label exemption reason is wire
 # pool in Step 2c, once, before the lanes, and ONE ordered pool is walked — so the HQ-vetoed-but-rig-has-work case
 # (the 4h stall) is covered by the same loop, and a rig P0 feature beats an HQ P2. The scenarios below keep the
 # ga-y1m40 outcomes (a rig bead IS dispatched when every HQ candidate is vetoed and slots are free; the empty-pool log
-# line is unchanged) and assert the new mechanism; U1-U3 pin the union order, U4-U8 the ways the join can be skipped or fail.
+# line is unchanged) and assert the new mechanism; U1-U3 pin the union order, U4-U10 the ways the join can be skipped or fail.
 
 # run_y1m40: real end-to-end DRY_RUN sweep for the ga-y1m40 fix.
 #   $1 = FAKE_BUGS_JSON               (HQ Tier1 bug/debt fixture; "[]" = HQ empty)
@@ -9127,6 +9127,13 @@ has "$DISPATCHER" 'digest-label'          "digest-label exemption reason is wire
 #                            (ga-9t9acg.2-U5/U6); every other jq call passes through to the real jq;
 #        "rig-list-fails"  → `gc rig list` fails AND PILOT_RIG_FALLBACK_OVERRIDE is not set, so the REAL rig scan runs
 #                            and cannot look (ga-9t9acg.2-U7); $3 is ignored.
+#        "rig-ok" | "rig-ghost" | "rig-bd-bug" | "rig-bd-debt" | "rig-bd-feat"
+#                          → the REAL rig scan again (override unset, $3 ignored) over ONE fake non-HQ rig:
+#                            rig-ok      its directory exists and every `bd list` answers (the control);
+#                            rig-ghost   its directory does NOT exist;
+#                            rig-bd-*    its directory exists but the `bd list` of ONE tier fails (bug / tech-debt /
+#                                        story:approved) — each of the scan's three handlers has its own mode
+#                            (ga-9t9acg.2-U9/U10, gate round 2).
 #
 # ga-9t9acg.2: the rig JOIN is gated on the live session count being readable (ga-5je3zv), and the count probe runs
 # `timeout N gc session list --json`. These fixtures run on PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin", and a host
@@ -9161,6 +9168,32 @@ case "\$*" in *"rig list"*) exit 1 ;; esac
 exec "$SHIMBIN/gc" "\$@"
 SHIM
 chmod +x "$Y1M40_JQ_BAD/jq" "$Y1M40_GC_BAD/gc"
+# The "rig-*" modes: a PATH-prefix dir per mode holding a `gc` that reports ONE non-HQ rig (and otherwise is the base
+# shim) and, for rig-bd-*, a `bd` that fails only the `list` of the tier named by its token in that rig's directory.
+Y1M40_RIG_REAL="$WORK/y1m40-rig-real-dir"; Y1M40_RIG_GHOST_DIR="$WORK/y1m40-rig-dir-never-created"
+mkdir -p "$Y1M40_RIG_REAL"
+_y1m40_mk_rig_shims() {  # $1 = mode  $2 = path the fake `gc rig list` reports  $3 = token of the `bd list` that fails ("" = none)
+  local _d="$WORK/y1m40-$1"
+  mkdir -p "$_d"
+  cat > "$_d/gc" <<SHIM
+#!/usr/bin/env bash
+case "\$*" in *"rig list"*) printf '{"rigs":[{"name":"y1m40rig","path":"$2","hq":false}]}'; exit 0 ;; esac
+exec "$SHIMBIN/gc" "\$@"
+SHIM
+  chmod +x "$_d/gc"
+  [ -n "$3" ] || return 0
+  cat > "$_d/bd" <<SHIM
+#!/usr/bin/env bash
+case "\$*" in *"-C $2 list"*"$3"*) exit 1 ;; esac
+exec "$SHIMBIN/bd" "\$@"
+SHIM
+  chmod +x "$_d/bd"
+}
+_y1m40_mk_rig_shims rig-ok      "$Y1M40_RIG_REAL"      ""
+_y1m40_mk_rig_shims rig-ghost   "$Y1M40_RIG_GHOST_DIR" ""
+_y1m40_mk_rig_shims rig-bd-bug  "$Y1M40_RIG_REAL"      "-t bug"
+_y1m40_mk_rig_shims rig-bd-debt "$Y1M40_RIG_REAL"      "-l tech-debt"
+_y1m40_mk_rig_shims rig-bd-feat "$Y1M40_RIG_REAL"      "-l story:approved"
 run_y1m40() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -9170,11 +9203,14 @@ run_y1m40() {
     broken-timeout) _y_pre="$Y1M40_TO_BAD:" ;;
     jq-fail-union)  _y_pre="$Y1M40_JQ_BAD:" ;;
     rig-list-fails) _y_pre="$Y1M40_GC_BAD:" ;;
+    rig-ok|rig-ghost|rig-bd-bug|rig-bd-debt|rig-bd-feat) _y_pre="$WORK/y1m40-$4:" ;;
   esac
-  # The rig override is passed as a one-element array so "rig-list-fails" can leave the variable UNSET (the dispatcher
+  # The rig override is passed as a one-element array so the real-scan modes can leave the variable UNSET (the dispatcher
   # tests ${VAR+x}: "" would still mean "override present"). ${arr[@]+...} keeps an empty array safe on bash 3.2 + -u.
   local _y_rig=(PILOT_RIG_FALLBACK_OVERRIDE="${3:-[]}")
-  [ "${4:-}" = "rig-list-fails" ] && _y_rig=()
+  case "${4:-}" in
+    rig-list-fails|rig-ok|rig-ghost|rig-bd-bug|rig-bd-debt|rig-bd-feat) _y_rig=() ;;
+  esac
   env -i \
     DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$_y_pre$SHIMBIN:/usr/bin:/bin:/usr/local/bin:$Y1M40_TO_OK" \
@@ -9498,6 +9534,62 @@ if echo "$LOG_U7B" | grep "UNKNOWN whether a rig bead is waiting, not 'none'" >/
 else
   bad "ga-9t9acg.2-U7b: empty HQ + unreadable rig scan left no UNKNOWN/WARN trail — $(echo "$LOG_U7B" | tail -3 | tr '\n' '|' | cut -c1-240)"
 fi
+# Gate round 2: the UNKNOWN trail above was followed by the unconditional empty-queue sentence — which imparavel-check.py
+# reads as an explicit ZERO. The sweep's last word must be the UNKNOWN one, and the empty-queue sentence must not exist.
+if echo "$LOG_U7B" | grep "No dispatchable candidates" >/dev/null; then
+  bad "ga-9t9acg.2-U7b: the sweep ended with 'No dispatchable candidates' although the rig scan could not look — an unknown read as an empty queue"
+else
+  ok "ga-9t9acg.2-U7b: the empty-queue sentence is NOT written after a scan that could not look"
+fi
+if echo "$LOG_U7B" | grep "Candidates UNKNOWN: the HQ pool is empty and the rig DB scan could not read everything (gc rig list failed)" >/dev/null; then
+  ok "ga-9t9acg.2-U7b: the exit says 'Candidates UNKNOWN' and names the reason"
+else
+  bad "ga-9t9acg.2-U7b: no 'Candidates UNKNOWN: ... (gc rig list failed)' exit line — $(echo "$LOG_U7B" | tail -2 | tr '\n' '|' | cut -c1-240)"
+fi
+
+echo "Scenario ga-9t9acg.2-U7c (control): HQ EMPTY and the rig scan READS (real rig dir, every bd list answers) and finds nothing -> 'No dispatchable candidates' IS the right line"
+LOG_U7C="$(run_y1m40 "[]" "" "" "rig-ok")"
+if echo "$LOG_U7C" | grep "No dispatchable candidates (Tier 1 or Tier 2). Exiting." >/dev/null; then
+  ok "ga-9t9acg.2-U7c: a scan that really read everything and found nothing ends as an empty queue"
+else
+  bad "ga-9t9acg.2-U7c: a readable, empty scan did not end as 'No dispatchable candidates' — the scenarios below prove nothing (or the sweep never ran): $(echo "$LOG_U7C" | tail -3 | tr '\n' '|' | cut -c1-240)"
+fi
+if echo "$LOG_U7C" | grep -e "Candidates UNKNOWN" -e "could NOT read everything" >/dev/null; then
+  bad "ga-9t9acg.2-U7c: a readable scan printed the UNKNOWN / 'could not read' lines — the unreadable signal fires unconditionally"
+else
+  ok "ga-9t9acg.2-U7c: a readable scan printed no UNKNOWN / 'could not read' line"
+fi
+
+# U9/U10: every OTHER way the scan itself can fail to look — a registered rig whose directory is gone, and each of the
+# three per-rig `bd list` calls — must reach the same UNKNOWN exit. Each fault is armed alone, over the same fixtures as
+# the U7c control (which differ only in that nothing fails).
+_u_unknown_exit() {  # $1 = scenario tag  $2 = mode  $3 = the reason the log must name
+  local _tag="$1" _log
+  _log="$(run_y1m40 "[]" "" "" "$2")"
+  if echo "$_log" | grep "the rig DB scan could NOT read everything ($3" >/dev/null; then
+    ok "$_tag: the scan that could not look says so in a WARN, naming the reason ($3)"
+  else
+    bad "$_tag: no 'could NOT read everything ($3' WARN — $(echo "$_log" | grep -i 'rig' | tail -2 | tr '\n' '|' | cut -c1-240)"
+  fi
+  if echo "$_log" | grep "Candidates UNKNOWN: the HQ pool is empty and the rig DB scan could not read everything ($3" >/dev/null; then
+    ok "$_tag: the exit says 'Candidates UNKNOWN' and names the reason"
+  else
+    bad "$_tag: no 'Candidates UNKNOWN: ... ($3' exit line — $(echo "$_log" | tail -2 | tr '\n' '|' | cut -c1-240)"
+  fi
+  if echo "$_log" | grep "No dispatchable candidates" >/dev/null; then
+    bad "$_tag: the sweep ended with 'No dispatchable candidates' although the scan could not look at everything"
+  else
+    ok "$_tag: the empty-queue sentence is NOT written"
+  fi
+}
+echo "Scenario ga-9t9acg.2-U9: a registered rig whose DIRECTORY IS GONE -> UNKNOWN, not 'found none' (was a silent skip)"
+_u_unknown_exit "ga-9t9acg.2-U9" "rig-ghost" "rig path is not a directory: $Y1M40_RIG_GHOST_DIR"
+echo "Scenario ga-9t9acg.2-U10a: the rig's BUG list fails -> UNKNOWN"
+_u_unknown_exit "ga-9t9acg.2-U10a" "rig-bd-bug" "bd list failed in $Y1M40_RIG_REAL"
+echo "Scenario ga-9t9acg.2-U10b: the rig's TECH-DEBT list fails -> UNKNOWN"
+_u_unknown_exit "ga-9t9acg.2-U10b" "rig-bd-debt" "bd list failed in $Y1M40_RIG_REAL"
+echo "Scenario ga-9t9acg.2-U10c: the rig's story:approved (feature) list fails -> UNKNOWN"
+_u_unknown_exit "ga-9t9acg.2-U10c" "rig-bd-feat" "bd list failed in $Y1M40_RIG_REAL"
 
 echo "Scenario ga-9t9acg.2-U8 (control): the rig scan READS and finds nothing -> 'found no candidate' IS the right line, and no UNKNOWN/WARN"
 LOG_U8="$(run_y1m40 "$U_HQ_P2" "" "[]")"

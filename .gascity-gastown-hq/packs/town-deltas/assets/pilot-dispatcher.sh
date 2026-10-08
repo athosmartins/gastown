@@ -10113,7 +10113,7 @@ _scan_rig_fallback_pool() {
   # RIG_SCAN_UNREADABLE (ga-9t9acg.2, gate round 1): non-empty = "the scan could not LOOK at every rig DB" (the reason
   # is the value). RIG_MERGED_COUNT=0 then means UNKNOWN, not "no rig candidate" — the caller (Step 2c) must say so
   # and must never read it as an empty queue. Set only for the failures the scan itself can observe: gc rig list,
-  # each rig's bd list, and its own jq merges.
+  # a registered rig path that is not a directory, each rig's bd list, and its own jq merges.
   RIG_SCAN_UNREADABLE=""
   if [ -n "${PILOT_RIG_FALLBACK_OVERRIDE+x}" ]; then
     local _rfp_filtered
@@ -10144,7 +10144,13 @@ _scan_rig_fallback_pool() {
   ALL_RIG_TIER1="[]"
   ALL_RIG_TIER2="[]"
   while IFS= read -r rig_path; do
-    [ -z "$rig_path" ] || [ ! -d "$rig_path" ] && continue
+    # An empty line is no rig (the loop also runs once over an empty list). A registered rig whose directory is gone is
+    # a rig the scan could not look at: UNKNOWN for its beads, not "none" (gate round 2).
+    [ -n "$rig_path" ] || continue
+    if [ ! -d "$rig_path" ]; then
+      RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-rig path is not a directory: $rig_path}"
+      continue
+    fi
 
     # Tier 1: bugs from rig DB
     RIG_BUGS=$(bd -C "$rig_path" list --json -t bug \
@@ -10205,10 +10211,11 @@ _scan_rig_fallback_pool() {
 # A sweep that cannot read the live session count stops DISPATCHING (ga-5je3zv): the lane loops break at their first
 # iteration, and the rig scan — then Step 4b — was skipped with them rather than paid on the box that just could not
 # answer `session list`. The JOIN keeps that: it is not paid when this sweep already found the count unreadable
-# (_PLSC_UNREADABLE, sticky, set by the first failed probe — the top-up gate probes before this point) or halted
-# (_PILOT_HALT). It can only see a failure that has ALREADY happened: a count that first fails inside the lanes
-# has had its scan (the price of joining before the lanes instead of after them). The empty-HQ scan is unchanged:
-# it ran ungated before this slice too.
+# (_PLSC_UNREADABLE, sticky, set by the first failed probe — the top-up gate probes before this point). _PILOT_HALT
+# is checked too, but it is only set once the dispatch phase runs, so at this point that leg is a guard against a
+# later reordering, not a live signal. The gate can only see a failure that has ALREADY happened: a count that first
+# fails inside the lanes has had its scan (the price of joining before the lanes instead of after them). The
+# empty-HQ scan is unchanged: it ran ungated before this slice too.
 _RIG_JOIN_HALTED=""
 if [ -n "${_PILOT_HALT:-}" ] || [ -n "${_PLSC_UNREADABLE:-}" ]; then _RIG_JOIN_HALTED=1; fi
 if [ -z "$ALL_CANDIDATES_TIER" ] || { [ -z "$_RIG_JOIN_HALTED" ] && { [ "${SMALL_SLOTS:-0}" -gt "0" ] || [ "${BIG_SLOTS:-0}" -gt "0" ]; }; }; then
@@ -10277,7 +10284,14 @@ fi
 ALL_CANDIDATES_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
 
 if [ "$ALL_CANDIDATES_COUNT" = "0" ]; then
-  log "No dispatchable candidates (Tier 1 or Tier 2). Exiting."
+  if [ -n "${RIG_SCAN_UNREADABLE:-}" ]; then
+    # Gate round 2: an empty HQ pool plus a rig scan that could not read everything is "UNKNOWN", not an empty queue.
+    # The empty-queue sentence is deliberately NOT written: imparavel-check.py reads it as an explicit zero, and
+    # a missing sentence reads as unknown (fail-open) — which is what this is.
+    log "Candidates UNKNOWN: the HQ pool is empty and the rig DB scan could not read everything (${RIG_SCAN_UNREADABLE}) — nothing to dispatch from what was readable, but a rig bead may be waiting. Exiting."
+  else
+    log "No dispatchable candidates (Tier 1 or Tier 2). Exiting."
+  fi
   exit 0
 fi
 
