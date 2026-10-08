@@ -38,6 +38,10 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
 - Linha do `security -i` > 4000 bytes é recusada (medido 07/10: o `security -i` corta a linha em 4096 e executa o resto como 2º comando).
 - Estado corrompido/ilegível: log WARN + `state_reset` no estado (arquivo ausente = 1ª rodada, normal).
 - Fonte que não pôde ser lida ("não sei") encerra a busca daquela conta: não cai para uma cópia velha da reserva.
+- Se a conta que o POOL quer é a que não pôde ser lida, as crews **ficam onde estão** — mesmo com a conta atual esgotada
+  (nada de fallback em cima de leitura que falhou) — e sai o alerta `unreadable:<conta>` (re-tentado a cada rodada; o texto
+  não manda ninguém "refazer login", porque o login pode existir). Candidato de fallback ilegível é pulado (vale o próximo
+  com login completo), mas o alerta `stuck` o nomeia em vez de dizer que ninguém tem login.
 - A decisão do pool NÃO tem gate de idade: `updated` só muda quando o pool troca de conta (não é heartbeat).
 
 ## Liga/desliga
@@ -66,7 +70,7 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
 - A conta terrenos não tem login completo guardado: precisa de re-login humano (ga-xknkke); NÃO logar sozinho.
 - 2ª etapa (reinício em momento ocioso se o RC cair) fora de escopo.
 
-Testes: `scripts/test_claude_crew_account.py` (56 testes, shim de `security`, servidor de perfil em loopback). O harness é
+Testes: `scripts/test_claude_crew_account.py` (59 testes, shim de `security`, servidor de perfil em loopback). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).

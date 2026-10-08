@@ -26,7 +26,8 @@ What it does, every run (launchd StartInterval, single instance via flock):
   3. FOLLOW: if the decision names another account, write ITS full-scope login into the default item. A setup-token (no
      refresh token / no sessions scope) is never written there: it kills Remote Control (Athos 05/10). If the wanted
      account has no usable full login, the crews STAY where they are and a named alert says exactly which login is missing;
-     only when the account they are on is itself exhausted do they fall to the next account that has one.
+     only when the account they are on is itself exhausted do they fall to the next account that has one. A login that
+     COULD NOT BE READ is "cannot tell", not "has none": the crews stay (exhausted or not) and `unreadable:<account>` says so.
      WHOSE login is being written is asked of the profile when it can answer. A stored copy's access token is expired for
      a day or more, so in production it usually cannot: the switch then goes ahead (fail-open, by decision - the
      alternative is crews that never move) but it is LOGGED as "owner unverified", COUNTED, remembered as unverified (the
@@ -428,16 +429,17 @@ def exhausted(dec: dict, email: str, t: float) -> bool:
     return isinstance(r, (int, float)) and r > t
 
 
-def load_source(email: str, t: float, st: Optional[dict] = None) -> Tuple[Optional[Tuple[str, str, dict]], List[str]]:
-    """The first usable full login of `email`: ((service, acct, blob), []) or (None, [why-not per place]).
-    'Could not read' ends the search: falling through to a later place would hand out whatever stale copy lives there."""
+def load_source(email: str, t: float, st: Optional[dict] = None) -> Tuple[Optional[Tuple[str, str, dict]], List[str], bool]:
+    """The first usable full login of `email`: ((service, acct, blob), [], False) or (None, [why-not per place], unreadable).
+    'Could not read' ends the search (falling through to a later place would hand out whatever stale copy lives there) and
+    sets `unreadable`: that is "cannot tell if it has a login", which no caller may treat as "it has none"."""
     why = []
     bad = (st or {}).get("bad_sources") or {}
     for svc in source_services(email):
         s, acct, blob = kc_read(svc)
         if s == "unknown":
             why.append(f"{svc}: could not be read")
-            return None, why
+            return None, why, True
         if s != "ok":
             why.append(f"{svc}: {s}")
             continue
@@ -447,9 +449,9 @@ def load_source(email: str, t: float, st: Optional[dict] = None) -> Tuple[Option
             continue
         ok, reason = full_login(blob, t)
         if ok:
-            return (svc, acct, blob), []      # type: ignore[return-value]
+            return (svc, acct, blob), [], False      # type: ignore[return-value]
         why.append(f"{svc}: {reason}")
-    return None, why
+    return None, why, False
 
 
 def sync_back(st: dict, ident: str, cur: dict, t: float, dry: bool) -> Tuple[str, str]:
@@ -512,21 +514,29 @@ def choose(st: dict, dec: dict, ident: str, t: float) -> Choice:
     want = str(dec.get("current") or "").strip().lower()
     if want == ident or not want:
         return None, None, "in sync", None
-    src, why = load_source(want, t, st)
+    src, why, unread = load_source(want, t, st)
     if src:
         return want, src, "follow the pool decision", None
+    if unread:           # could not READ it = cannot tell it has none: never fall back on that, exhausted or not (retried every run)
+        alert(st, f"unreadable:{want}", f"the pool is on {want} but its login could not be read ({'; '.join(why)}) - the crews "
+                                        f"stay on {ident}, nothing is changed", t)
+        return None, None, "wanted account could not be read", None
     msg = f"the pool is on {want} but there is no usable full login for it ({'; '.join(why)}) - the crews stay on {ident}"
     if not exhausted(dec, ident, t):
         alert(st, f"no-login:{want}", msg + ". Fix: log {0} in (claude auth login with its CLAUDE_CONFIG_DIR) - a human step".format(want), t)
         return None, None, "wanted account has no full login; current one still has balance", None
+    unread_others = []
     for other in accounts():
         if other in (ident, want) or exhausted(dec, other, t):
             continue
-        src, _ = load_source(other, t, st)
+        src, _, u = load_source(other, t, st)
         if src:
             return other, src, "fallback", (f"fallback:{other}", f"{ident} is exhausted and the pool's {want} has no full "
                                                                  f"login: crews fall to {other}")
-    alert(st, "stuck", msg + " and no other account has a usable full login: the crews are STUCK", t)
+        if u:
+            unread_others.append(other)
+    alert(st, "stuck", msg + " and no other account has a usable full login"
+          + (f" (could not be read: {', '.join(unread_others)})" if unread_others else "") + ": the crews are STUCK", t)
     return None, None, "stuck", None
 
 
@@ -538,10 +548,10 @@ def heal_choice(st: dict, dec: dict, ident: Optional[str], want: str, t: float) 
         if cand in tried or (cand != want and exhausted(dec, cand, t)):
             continue
         tried.add(cand)
-        src, why = load_source(cand, t, st)
+        src, why, _ = load_source(cand, t, st)
         if src:
             note = None if cand == want else (f"heal-fallback:{cand}", f"the default item was healed from {cand} because the "
-                                              f"pool's {want} has no usable full login ({'; '.join(whys[:1]) or 'none'})")
+                                              f"pool's {want} was not usable ({'; '.join(whys[:1]) or 'none'})")
             return cand, src, "heal" if cand == want else "heal-fallback", note
         whys.append(f"{cand}: {'; '.join(why)}")
     alert(st, "heal-no-source", f"cannot heal the default item: no account has a usable full login ({' | '.join(whys)}). "

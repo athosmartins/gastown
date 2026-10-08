@@ -848,6 +848,50 @@ def test_a_source_that_could_not_be_read_stops_the_search_instead_of_falling_to_
     assert crew.DEFAULT_SERVICE not in w.writes()
 
 
+# ── gate round 4 (ga-03ody6): a wanted login that COULD NOT BE READ is not "the wanted account has none" ──────────────
+# Fails if choose() goes back to dropping load_source's "unreadable" answer when the current account is exhausted: the
+# crews would be moved to the fallback on a failed read, with a push saying the wanted account "has no full login".
+def _unreadable_wanted(w, exhausted):
+    w.default("crypto", blob("crypto"))
+    w.account("crypto", blob("crypto"))
+    w.account("amb", blob("amb"))                                  # a full login IS stored for amb...
+    w.account("b85", blob("b85"))                                  # ...and one to fall to if amb really had none
+    w.decide("amb", exhausted=exhausted)
+    w.mp.setenv("FAKE_SEC_FAIL", _own(w, "amb"))                   # ...but amb's item cannot be read (exit 1 = unknown, not 44)
+
+
+def test_an_exhausted_account_is_not_left_for_a_fallback_on_a_wanted_login_that_could_not_be_read(w):
+    _unreadable_wanted(w, exhausted=["crypto"])
+    w.run()
+    assert crew.DEFAULT_SERVICE not in w.writes() and "SWITCH" not in w.log()      # the crews did not move
+    assert w.state()["current"] == EMAIL["crypto"]
+    said = " ".join(w.notified())
+    assert "could not be read" in said                                             # the push names what happened...
+    assert "has no full login" not in said and "fall to" not in said              # ...and does not claim the opposite
+    w.mp.delenv("FAKE_SEC_FAIL")                                                   # the read clears: the pool's pick is followed
+    w.run()
+    assert w.state()["current"] == EMAIL["amb"] and w.state()["last_switch"]["reason"] == "follow the pool decision"
+
+
+def test_an_unreadable_wanted_login_is_not_reported_as_a_login_to_redo_by_hand(w):
+    _unreadable_wanted(w, exhausted=[])                            # crypto still has balance: the old branch
+    w.run()
+    said = " ".join(w.notified())
+    assert crew.DEFAULT_SERVICE not in w.writes() and "could not be read" in said
+    assert "human step" not in said and "log " + EMAIL["amb"] + " in" not in said   # nobody is told to redo a login that exists
+
+
+def test_the_stuck_push_does_not_claim_there_is_no_login_when_a_candidate_could_not_be_read(w):
+    w.default("crypto", blob("crypto"))
+    w.account("amb", blob("amb"))                                  # nobody else has a usable login that could be READ
+    w.decide("terr", exhausted=["crypto"])
+    w.mp.setenv("FAKE_SEC_FAIL", _own(w, "amb"))
+    w.run()
+    stuck = [n for n in w.notified() if "STUCK" in n]
+    assert crew.DEFAULT_SERVICE not in w.writes() and stuck
+    assert EMAIL["amb"] in stuck[0] and "could not be read" in stuck[0]            # the unknown is named, not folded into "none"
+
+
 # ── state ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 def test_a_corrupt_state_file_is_logged_not_silently_reset(w):
     (w.d / "crew_state.json").write_text("{not json")
