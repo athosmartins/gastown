@@ -26,18 +26,31 @@
 # on a disk with 7-12GB free: 8 of 9 nights refused, 30/09..08/10). But the dest is an NBS store, and so is
 # the live store's `.dolt/noms/oldgen/` — its own `manifest` plus content-addressed table files, i.e. what
 # GC already compacted (hq: 11.3GB of the 11.5GB). Pre-loading the dest with CLONEFILE copies of exactly
-# that (manifest + tables, ~0 real disk) makes the dest "already have" those chunks: sync-url then writes
-# ONLY the new table holding what is not in oldgen (measured: 17MB real disk vs 62MB unseeded on a scratch
-# repo; the restored copy matched the live row count). Layout and format of the dest are unchanged, so the
-# S3 upload, the manifest-closure proof, the restore and the status readers do not change.
+# that (tables ~0 real disk) makes the dest "already have" those chunks: sync-url then writes ONLY the new
+# table holding what is not in oldgen. Layout and format of the dest are unchanged, so the S3 upload, the
+# manifest-closure proof, the restore and the status readers do not change.
+#   - the seed's manifest is the oldgen manifest with its ROOT field replaced by a non-zero placeholder
+#     (_OFFLINE_SYNC_SEED_ROOT). This is load-bearing, measured on 2.3.1 (3 tables x 8.9MB, 1000-row delta):
+#     with the oldgen manifest as-is (root 0) sync-url treats the sink as brand new and REWRITES every
+#     seeded table (new inode, same name and size: the clonefile sharing is lost and the disk fills with the
+#     whole store); with a non-zero root it keeps all of them byte-for-byte (same inode) and adds one new
+#     table of ~120KB. A real backup dest behaves the same way on an incremental sync. The real root replaces
+#     the placeholder when sync-url commits; a manifest that still names the placeholder or a zero root after
+#     the sync is a FAILURE (it would close, pass a closure proof and restore empty).
 #   - the seeded store is built under the same tmp root as the clone and only RENAMED onto <dest> after
 #     sync-url succeeded: a crash or a failed sync never leaves a dest whose manifest closes (all its
-#     tables are present) but names a zero root — that would pass a closure proof and then restore EMPTY.
+#     tables are present) but names a placeholder root.
 #   - the seed is verified against its own manifest (every table the oldgen manifest names is in the
 #     seed) before sync-url runs; a seed that does not close is not used.
+#   - a seeded sync-url runs under a free-space watchdog (OFFLINE_SYNC_MIN_FREE_KB, default 3GB): the seed
+#     relies on how sync-url treats an already-populated sink, not on a documented contract, so if a Dolt
+#     upgrade ever makes it rewrite the seeded tables again the sync is stopped (only OUR sync-url child,
+#     never the Dolt server) and reported FAILED, instead of filling the disk (ga-odtd3f).
 #   - OFFLINE_SYNC_REQUIRE_SEED=1 (set by a caller whose disk gate counted on the seed) turns "cannot seed"
 #     into a REFUSAL: falling back to the full build would write the GBs the gate never reserved
 #     (ga-odtd3f: that took the live Dolt down for 5h20).
+#   - the clonefiles pin the oldgen blocks until the dest is released: a `dolt gc` of the live store while a
+#     seeded dest exists frees nothing until the dest is removed (the nightly releases its staging).
 #
 # SAFETY (every guard below fails CLOSED — "can't verify" always means
 # refuse, never proceed):
@@ -135,6 +148,69 @@ _offline_sync_oldgen_names() {
   return 0
 }
 
+# The placeholder root a seeded manifest carries until sync-url commits the real one (see SEEDED MODE in the
+# header). 32 chars of the base32 alphabet Dolt hashes use (0-9a-v); not the zero hash and not the all-"v"
+# journal address.
+_OFFLINE_SYNC_SEED_ROOT="seedseedseedseedseedseedseedseed"
+_OFFLINE_SYNC_ZERO_ROOT="00000000000000000000000000000000"
+
+# _offline_sync_manifest_root <manifest> — prints the root hash field (4th) of an NBS manifest.
+# vazio/falhou: unreadable file, not a manifest line, or an empty root field → prints nothing and returns 1;
+# the callers treat that as "not a usable root", never as a root.
+_offline_sync_manifest_root() {
+  local f="$1" line root
+  [ -f "$f" ] && [ -r "$f" ] || return 1
+  line="$(head -n 1 "$f" 2>/dev/null)" || return 1
+  case "$line" in [0-9]*:__DOLT__:*) ;; *) return 1 ;; esac
+  root="$(printf '%s\n' "$line" | awk -F: '{print $4}')"
+  [ -n "$root" ] || return 1
+  printf '%s' "$root"
+}
+
+# _offline_sync_free_kb — free KB on the data volume, same query as the preflight in dolt-s3-backup.sh
+# (`df -k /System/Volumes/Data`, never `df /`: on APFS that is the read-only system snapshot).
+# vazio/falhou: df failed or printed a non-number → prints nothing and returns 1. A caller that guards a
+# disk floor must read that as "cannot verify" (stop), never as "plenty free".
+_offline_sync_free_kb() {
+  local kb
+  kb="$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $4}')"
+  case "${kb:-}" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$kb"
+}
+
+# _offline_sync_run_guarded <timeout_s> <min_free_kb> <cmd...> — runs <cmd> (output appended to the offline-sync
+# log) under `timeout`, polling the free space every OFFLINE_SYNC_WATCH_SECS (default 1). When the free space is
+# below <min_free_kb> — or cannot be read — the command is stopped and 97 is returned. Only the child THIS function
+# started (and its own children) is ever signalled; never a pid it did not start, never the Dolt server.
+# Returns <cmd>'s own status otherwise (124 on timeout), so the caller keeps one failure path.
+_offline_sync_run_guarded() {
+  local tmo="$1" min_kb="$2"; shift 2
+  local poll="${OFFLINE_SYNC_WATCH_SECS:-1}" pid free_kb aborted=0 rc i kids
+  timeout "$tmo" "$@" >>"${OFFLINE_SYNC_LOG:-/dev/stderr}" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    # falhou (unreadable) → empty → stop: a floor we cannot check is not a floor that holds.
+    free_kb="$(_offline_sync_free_kb)" || free_kb=""
+    if [ -z "$free_kb" ] || [ "$free_kb" -lt "$min_kb" ]; then
+      aborted=1
+      _offline_sync_log "offline-sync: STOPPING the sync — free space ${free_kb:-unreadable}KB is below the floor ${min_kb}KB (the live Dolt shares this disk; ga-odtd3f)"
+      kill -TERM "$pid" 2>/dev/null
+      for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+      if kill -0 "$pid" 2>/dev/null; then
+        kids="$(pgrep -P "$pid" 2>/dev/null)"
+        # shellcheck disable=SC2086
+        [ -n "$kids" ] && kill -KILL $kids 2>/dev/null
+        kill -KILL "$pid" 2>/dev/null
+      fi
+      break
+    fi
+    sleep "$poll"
+  done
+  wait "$pid" 2>/dev/null; rc=$?
+  [ "$aborted" -eq 1 ] && return 97
+  return "$rc"
+}
+
 # _offline_sync_seed_state <db> <dest> — can tonight's sync of <db> into <dest> be SEEDED from the live
 # store's oldgen? ONE line on stdout, rc always 0 (callers test the word, never the exit code):
 #   ok <oldgen_kb>       seedable; <oldgen_kb> is the disk the seed saves (oldgen's size on disk)
@@ -180,9 +256,9 @@ _offline_sync_seed_state() {
   return 0
 }
 
-# _offline_sync_seed_build <oldgen_dir> <seed_dir> — builds <seed_dir> (must not exist) as clonefile copies
-# of <oldgen_dir>'s `manifest` and of every table file that manifest names, then checks the seed against
-# its own manifest. Returns 0 only for a seed that closes; on ANY failure it removes <seed_dir> (a path the
+# _offline_sync_seed_build <oldgen_dir> <seed_dir> — builds <seed_dir> (must not exist): a `manifest` that is
+# <oldgen_dir>'s with the placeholder root, plus clonefile copies of every table file that manifest names, then
+# checks the seed against its own manifest. Returns 0 only for a seed that closes; on ANY failure it removes <seed_dir> (a path the
 # caller made inside its own mktemp tree) and returns 1, logging why via _offline_sync_log. Table files are
 # named by what their manifest says, never by a glob over the directory: a stray file in oldgen is not
 # uploaded to S3 as if it were part of the backup.
@@ -195,8 +271,18 @@ _offline_sync_seed_build() {
     _offline_sync_log "offline-sync: seed: $og/manifest lists no table or could not be read — not seeding"
     rm -rf "${seed:?}" 2>/dev/null; return 1
   fi
-  cp_err="$(timeout 120 cp -c "$og/manifest" "$seed/manifest" 2>&1)" \
-    || { _offline_sync_log "offline-sync: seed: manifest clone FAILED: $cp_err"; rm -rf "${seed:?}" 2>/dev/null; return 1; }
+  # The seed's manifest = the oldgen manifest with its ROOT replaced by the placeholder (header: a zero root
+  # makes sync-url rewrite every seeded table). Written without a trailing newline, like Dolt's own.
+  # vazio/falhou (no first line, awk failed, the result does not read back with the same table list and the
+  # placeholder root) → no seed at all.
+  local mline
+  mline="$(head -n 1 "$og/manifest" 2>/dev/null | awk -F: -v OFS=: -v r="$_OFFLINE_SYNC_SEED_ROOT" '{ $4 = r; print }')"
+  printf '%s' "$mline" > "$seed/manifest" 2>/dev/null
+  if [ "$(_offline_sync_manifest_root "$seed/manifest")" != "$_OFFLINE_SYNC_SEED_ROOT" ] \
+     || [ "$(_offline_sync_oldgen_names "$seed/manifest")" != "$names" ]; then
+    _offline_sync_log "offline-sync: seed: could not write the seed manifest from $og/manifest — not seeding"
+    rm -rf "${seed:?}" 2>/dev/null; return 1
+  fi
   for n in $names; do
     if [ -f "$og/$n" ]; then src="$og/$n"; elif [ -f "$og/$n.darc" ]; then src="$og/$n.darc"; else
       _offline_sync_log "offline-sync: seed: oldgen manifest names $n but the table file is not in $og — not seeding"
@@ -321,11 +407,55 @@ _offline_backup_sync() {
       ;;
   esac
 
-  local rc=0
-  if ! timeout "$sync_timeout" "$dolt_bin" --data-dir "$clone" backup sync-url "file://$sync_dest" >>"${OFFLINE_SYNC_LOG:-/dev/stderr}" 2>&1; then
-    _offline_sync_log "$db: offline-sync: dolt backup sync-url FAILED (or timed out after ${sync_timeout}s)"
+  # What the seed holds before sync-url runs, to tell afterwards whether sync-url really left it alone.
+  # vazio (nothing recorded) → "0 files": the kept-count below then reports 0/0 and proves nothing — it is
+  # only a log line, the floor watchdog is what protects the disk.
+  local seed_inos="" f
+  if [ "$seeded" -eq 1 ]; then
+    for f in "$sync_dest"/*; do
+      [ "$(basename "$f")" = "manifest" ] && continue
+      [ -f "$f" ] || continue
+      seed_inos="$seed_inos$(stat -f '%i' "$f" 2>/dev/null) $(basename "$f")
+"
+    done
+  fi
+
+  local rc=0 sync_rc=0
+  if [ "$seeded" -eq 1 ] || [ -n "${OFFLINE_SYNC_MIN_FREE_KB:-}" ]; then
+    # falhou on the guard (rc 97: the floor was crossed or could not be read) is a failed sync like any other:
+    # nothing is moved onto <dest>, and the log line above says why.
+    _offline_sync_run_guarded "$sync_timeout" "${OFFLINE_SYNC_MIN_FREE_KB:-3145728}" \
+      "$dolt_bin" --data-dir "$clone" backup sync-url "file://$sync_dest"; sync_rc=$?
+  else
+    timeout "$sync_timeout" "$dolt_bin" --data-dir "$clone" backup sync-url "file://$sync_dest" >>"${OFFLINE_SYNC_LOG:-/dev/stderr}" 2>&1; sync_rc=$?
+  fi
+  if [ "$sync_rc" -ne 0 ]; then
+    if [ "$sync_rc" -eq 97 ]; then
+      _offline_sync_log "$db: offline-sync: dolt backup sync-url STOPPED by the free-space floor — FAILED"
+    else
+      _offline_sync_log "$db: offline-sync: dolt backup sync-url FAILED (or timed out after ${sync_timeout}s)"
+    fi
     rc=1
   elif [ "$seeded" -eq 1 ]; then
+    # The sync is only good if its manifest names a REAL root: the placeholder or a zero root would close
+    # (every table present) and then restore an empty database.
+    local new_root kept=0 total=0 ino2 ino1 name
+    new_root="$(_offline_sync_manifest_root "$sync_dest/manifest")" || new_root=""
+    if [ -z "$new_root" ] || [ "$new_root" = "$_OFFLINE_SYNC_SEED_ROOT" ] || [ "$new_root" = "$_OFFLINE_SYNC_ZERO_ROOT" ]; then
+      _offline_sync_log "$db: offline-sync: seeded sync-url returned success but its manifest root is '${new_root:-unreadable}' (placeholder, zero or unreadable) — FAILED, not moving it onto $dest"
+      rm -rf "${clone_parent:?}" 2>/dev/null
+      return 1
+    fi
+    # informational: how many seeded files sync-url left alone (same inode). Fewer than all means this Dolt
+    # rewrote part of the seed — the copy is still valid, but the disk saving did not happen.
+    while read -r ino1 name; do
+      [ -n "$name" ] || continue
+      total=$((total+1))
+      ino2="$(stat -f '%i' "$sync_dest/$name" 2>/dev/null)"
+      [ -n "$ino2" ] && [ "$ino2" = "$ino1" ] && kept=$((kept+1))
+    done <<< "$seed_inos"
+    _offline_sync_log "$db: offline-sync: seeded files left untouched by sync-url: $kept/$total"
+    [ "$kept" -eq "$total" ] || _offline_sync_log "$db: offline-sync: WARNING — sync-url rewrote $((total-kept)) of $total seeded files; the copy is valid but the disk saving was only partial"
     # The rename is the commit point: <dest> was absent or an empty directory when the seed was decided;
     # it must STILL be, or the sync is reported failed and nothing is moved (never merge into a dest that
     # filled up meanwhile). rmdir succeeds only on an empty real directory.

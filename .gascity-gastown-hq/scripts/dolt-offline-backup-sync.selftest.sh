@@ -259,6 +259,9 @@ _bytes_outside_oldgen() {
   echo "$tot"
 }
 
+# The seeded sync runs under a free-space floor (default 3GB). These scenarios are about WHAT the sync writes,
+# not about the machine's disk: a 1MB floor keeps them hermetic; the floor itself is tested in scenario R/S.
+export OFFLINE_SYNC_MIN_FREE_KB=1024
 _mk_gcd_repo seedhq
 OG_H="$DATA_DIR/seedhq/.dolt/noms/oldgen"
 if [ -f "$OG_H/manifest" ]; then ok "fixture: the GC'd repo has an oldgen with its own manifest"; else bad "fixture: no oldgen/manifest after dolt gc — the seeded scenarios cannot run"; fi
@@ -312,6 +315,17 @@ while read -r ino name; do
   [ "$post_ino" = "$ino" ] || REWRITTEN=$((REWRITTEN+1))
 done < "$WORK/rec-h.pre"
 [ "$REWRITTEN" -eq 0 ] && ok "H: sync-url left every seeded table file untouched (same inode before/after)" || bad "H: sync-url replaced $REWRITTEN seeded table file(s)"
+# (b2) the dest's manifest names the REAL root — the live store's — not the seed's placeholder or a zero root
+# (such a manifest closes, passes a closure proof and restores empty).
+ROOT_H="$(_offline_sync_manifest_root "$DEST_H/manifest")"; ROOT_LIVE_H="$(_offline_sync_manifest_root "$DATA_DIR/seedhq/.dolt/noms/manifest")"
+if [ -n "$ROOT_H" ] && [ "$ROOT_H" = "$ROOT_LIVE_H" ] && [ "$ROOT_H" != "$_OFFLINE_SYNC_SEED_ROOT" ] && [ "$ROOT_H" != "$_OFFLINE_SYNC_ZERO_ROOT" ]; then
+  ok "H: the dest manifest's root is the live store's root ($ROOT_H), not the placeholder or zero"
+else
+  bad "H: dest manifest root='$ROOT_H' live root='$ROOT_LIVE_H' (placeholder=$_OFFLINE_SYNC_SEED_ROOT)"
+fi
+N_SEEDED_H="$(_offline_sync_oldgen_names "$OG_H/manifest" | wc -l | tr -d ' ')"
+grep -qE "seedhq: offline-sync: seeded files left untouched by sync-url: ${N_SEEDED_H}/${N_SEEDED_H}\$" "$OFFLINE_SYNC_LOG" \
+  && ok "H: the log reports ${N_SEEDED_H}/${N_SEEDED_H} seeded files left untouched" || bad "H: missing the 'seeded files left untouched ${N_SEEDED_H}/${N_SEEDED_H}' line"
 # (c) …the seeded files are copies, not the live files themselves (a hardlink would let a later rm of the
 # staging, or Dolt's GC, reach into the live store)…
 LIVE_INO_SHARED=0
@@ -421,6 +435,89 @@ cp "$OG_H/manifest" "$WORK/og-short/manifest"
 if _offline_sync_seed_build "$WORK/og-short" "$WORK/seed-o" 2>/dev/null; then bad "O: a seed whose manifest names tables that are absent must not build"; else ok "O: seed_build refuses an oldgen whose tables are missing"; fi
 [ ! -e "$WORK/seed-o" ] && ok "O: the half-built seed dir was removed" || bad "O: the half-built seed dir was left behind"
 
+# P: the seed's manifest = the oldgen manifest with ONLY the root replaced by the placeholder, same table list.
+SEED_P="$WORK/seed-p"
+if _offline_sync_seed_build "$OG_H" "$SEED_P"; then ok "P: seed_build builds a seed from the GC'd store's oldgen"; else bad "P: seed_build failed on a healthy oldgen"; fi
+[ "$(_offline_sync_manifest_root "$SEED_P/manifest")" = "$_OFFLINE_SYNC_SEED_ROOT" ] \
+  && ok "P: the seed manifest carries the placeholder root" || bad "P: seed manifest root='$(_offline_sync_manifest_root "$SEED_P/manifest")'"
+[ "$(_offline_sync_oldgen_names "$SEED_P/manifest")" = "$(_offline_sync_oldgen_names "$OG_H/manifest")" ] \
+  && ok "P: the seed manifest lists exactly the oldgen's tables" || bad "P: the seed manifest's table list differs from the oldgen's"
+[ "$(_offline_sync_manifest_root "$OG_H/manifest")" = "$_OFFLINE_SYNC_ZERO_ROOT" ] \
+  && ok "P: (premise) the live oldgen manifest itself names a zero root — what sync-url would treat as a brand-new sink" \
+  || bad "P: the oldgen manifest root is '$(_offline_sync_manifest_root "$OG_H/manifest")' — the placeholder premise changed"
+[ -z "$(tail -c 1 "$SEED_P/manifest" | tr -d '0-9a-v')" ] && ok "P: the seed manifest has no trailing newline (Dolt parses the last count as a number)" || bad "P: the seed manifest ends with a non-base32 byte (newline?)"
+# _offline_sync_manifest_root: failed != empty
+_offline_sync_manifest_root "$WORK/no-such-manifest" >/dev/null && bad "P: a missing manifest must not yield a root" || ok "P: a missing manifest -> no root (rc 1)"
+echo "not a manifest" > "$WORK/junk-manifest"
+_offline_sync_manifest_root "$WORK/junk-manifest" >/dev/null && bad "P: a junk file must not yield a root" || ok "P: a non-manifest file -> no root (rc 1)"
+
+# Q: sync-url "succeeds" but leaves the placeholder root (it did nothing) -> FAILED, nothing moved onto dest.
+NOOPBIN="$WORK/dolt-noopsync"
+cat > "$NOOPBIN" <<'EOS'
+#!/bin/bash
+case "$*" in *"backup sync-url"*) exit 0 ;; esac
+exec dolt "$@"
+EOS
+chmod +x "$NOOPBIN"
+DEST_Q="$WORK/dest-q"
+if OFFLINE_SYNC_DOLT_BIN="$NOOPBIN" OFFLINE_SYNC_SEED_OLDGEN=1 _offline_backup_sync "seedhq" "$DEST_Q"; then
+  bad "Q: a sync-url that left the placeholder root must not be reported as success"
+else
+  ok "Q: sync-url rc 0 but the manifest still names the placeholder root -> FAILED"
+fi
+[ ! -e "$DEST_Q" ] && ok "Q: nothing was moved onto dest (a closing manifest with a fake root would restore empty)" || bad "Q: dest exists after the placeholder-root sync"
+grep -qF "its manifest root is 'seedseedseedseedseedseedseedseed'" "$OFFLINE_SYNC_LOG" \
+  && ok "Q: the log names the offending root" || bad "Q: missing the log line naming the placeholder root"
+
+# R: the free-space guard, unit level (fake df: the guard calls `df -k /System/Volumes/Data`).
+export OFFLINE_SYNC_WATCH_SECS=0.2
+R_FREE=""
+df() { if [ "$2" = "/System/Volumes/Data" ]; then
+  printf 'Filesystem 1024-blocks Used Available Capacity iused ifree %%iused Mounted\n/dev/x 1 1 %s 1%% 1 1 1%% /System/Volumes/Data\n' "$R_FREE"
+else command df "$@"; fi; }
+sleep 40 & BYSTANDER=$!
+R_FREE=500
+t0=$(date +%s); _offline_sync_run_guarded 60 1000 sleep 30; rc=$?; t1=$(date +%s)
+[ "$rc" -eq 97 ] && [ $((t1-t0)) -lt 15 ] && ok "R: free space below the floor -> the command is stopped (rc 97) within seconds, not after its own 30s" || bad "R: below-floor rc=$rc after $((t1-t0))s (want 97, fast)"
+kill -0 "$BYSTANDER" 2>/dev/null && ok "R: an unrelated process was not touched by the abort (only the guard's own child is signalled)" || bad "R: the bystander process was killed"
+kill "$BYSTANDER" 2>/dev/null; wait "$BYSTANDER" 2>/dev/null
+R_FREE=""
+_offline_sync_run_guarded 60 1000 sleep 30; rc=$?
+[ "$rc" -eq 97 ] && ok "R: free space UNREADABLE -> stopped too (a floor that cannot be checked is not a floor that holds)" || bad "R: unreadable df rc=$rc, want 97"
+R_FREE=99999999
+_offline_sync_run_guarded 60 1000 true; rc=$?; [ "$rc" -eq 0 ] && ok "R: plenty of space -> the command's own success (0) is returned" || bad "R: healthy run rc=$rc, want 0"
+_offline_sync_run_guarded 60 1000 false; rc=$?; [ "$rc" -eq 1 ] && ok "R: plenty of space -> the command's own failure (1) is returned unchanged" || bad "R: failing command rc=$rc, want 1"
+_offline_sync_run_guarded 1 1000 sleep 30; rc=$?; [ "$rc" -eq 124 ] && ok "R: plenty of space, command too slow -> timeout's 124, not mistaken for a floor stop" || bad "R: timeout rc=$rc, want 124"
+[ "$(grep -c 'STOPPING the sync' "$OFFLINE_SYNC_LOG")" -ge 2 ] && ok "R: every floor stop logged its reason" || bad "R: the floor stops were not logged"
+
+# S: the same guard end to end — a slow seeded sync-url under a floor the disk is below: the sync is stopped,
+# _offline_backup_sync reports FAILED with a reason, no dest, no stray process, no leftover clone.
+SLOWBIN="$WORK/dolt-slowsync"
+cat > "$SLOWBIN" <<'EOS'
+#!/bin/bash
+case "$*" in *"backup sync-url"*) echo $$ > "$SLOW_PID_FILE"; exec sleep 60 ;; esac
+exec dolt "$@"
+EOS
+chmod +x "$SLOWBIN"
+R_FREE=500
+DEST_S="$WORK/dest-s"
+if SLOW_PID_FILE="$WORK/slow.pid" OFFLINE_SYNC_MIN_FREE_KB=1000 OFFLINE_SYNC_DOLT_BIN="$SLOWBIN" OFFLINE_SYNC_SEED_OLDGEN=1 _offline_backup_sync "seedhq" "$DEST_S"; then
+  bad "S: a seeded sync stopped by the free-space floor must report failure"
+else
+  ok "S: seeded sync stopped by the floor -> FAILED"
+fi
+[ ! -e "$DEST_S" ] && ok "S: no dest left behind" || bad "S: dest exists after the floor stop"
+grep -qF "seedhq: offline-sync: dolt backup sync-url STOPPED by the free-space floor — FAILED" "$OFFLINE_SYNC_LOG" \
+  && ok "S: the log says it was the free-space floor" || bad "S: missing the 'STOPPED by the free-space floor' line"
+SLOW_PID="$(cat "$WORK/slow.pid" 2>/dev/null)"
+if [ -n "$SLOW_PID" ] && ! kill -0 "$SLOW_PID" 2>/dev/null; then ok "S: the sync-url process is gone"; else bad "S: sync-url process '$SLOW_PID' still alive (or never started)"; fi
+# the same floor with plenty of space lets the same seeded sync finish (the guard does not break healthy runs)
+R_FREE=99999999
+DEST_S2="$WORK/dest-s2"
+if OFFLINE_SYNC_MIN_FREE_KB=1000 OFFLINE_SYNC_SEED_OLDGEN=1 _offline_backup_sync "seedhq" "$DEST_S2"; then ok "S: with space above the floor the seeded sync completes"; else bad "S: seeded sync failed with plenty of space"; fi
+unset -f df
+unset OFFLINE_SYNC_WATCH_SECS
+
 # No leftover clone directories: every scenario above must clean up after itself.
 LEFTOVER="$(find "$WORK" -mindepth 1 -maxdepth 1 -name 'offline-sync-*' 2>/dev/null | wc -l | tr -d ' ')"
 [ "$LEFTOVER" = "0" ] \
@@ -441,6 +538,12 @@ if grep -qF 'timeout "$sync_timeout" "$dolt_bin" --data-dir "$clone" backup sync
   ok "the sync-url step is wrapped in a timeout"
 else
   bad "the sync-url step is not timeout-wrapped"
+fi
+if grep -qF '_offline_sync_run_guarded "$sync_timeout" "${OFFLINE_SYNC_MIN_FREE_KB:-3145728}"' "$LIB" \
+   && grep -qF 'timeout "$tmo" "$@"' "$LIB"; then
+  ok "the seeded sync-url runs under the free-space guard (default floor 3GB), which is itself timeout-bounded"
+else
+  bad "the seeded sync-url is not wired through _offline_sync_run_guarded with the 3GB default floor"
 fi
 if grep -qF 'sync_timeout="${OFFLINE_SYNC_TIMEOUT:-1800}"' "$LIB"; then
   ok "sync timeout is caller-overridable via OFFLINE_SYNC_TIMEOUT (default 1800, matching the old reseed budget)"
