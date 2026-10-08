@@ -224,6 +224,203 @@ else
 fi
 [ ! -e "$DEST_F" ] && ok "scenario F: dest was never created" || bad "scenario F: dest '$DEST_F' exists despite the refusal"
 
+# ── ga-a0woau: SEEDED mode — a fresh dest is pre-loaded with clonefile copies of the live store's
+# oldgen so sync-url writes only the delta. The scenarios use a real dolt repo big enough that "wrote
+# everything" and "wrote the delta" are an order of magnitude apart, and measure the BYTES the sync put
+# in the dest that the live oldgen does not already hold (not just the exit code).
+echo "── seeded mode (ga-a0woau) — real dolt, GC'd repo ──"
+
+# _mk_gcd_repo <name> — a repo with a committed ~3MB table, GC'd (so it has an oldgen), plus a small
+# delta written AFTER the GC (lands in the journal/newgen, not in oldgen).
+_mk_gcd_repo() {
+  local name="$1"
+  mkdir -p "$DATA_DIR/$name"
+  ( cd "$DATA_DIR/$name" && dolt init >/dev/null 2>&1 \
+    && dolt sql -q "CREATE TABLE big (id int primary key, pad varchar(200));" >/dev/null 2>&1 \
+    && awk 'BEGIN{srand(7); print "id,pad"; for(i=1;i<=30000;i++){s=""; for(j=0;j<12;j++) s=s sprintf("%08x",int(rand()*4294967295)); print i "," s}}' > "$WORK/$name.csv" \
+    && dolt table import -u big "$WORK/$name.csv" >/dev/null 2>&1 \
+    && dolt add -A >/dev/null 2>&1 && dolt commit -m "bulk" >/dev/null 2>&1 \
+    && dolt gc >/dev/null 2>&1 \
+    && dolt sql -q "INSERT INTO big VALUES (100001,'delta-a'),(100002,'delta-b'),(100003,'delta-c');" >/dev/null 2>&1 )
+}
+# _bytes_outside_oldgen <dest> <oldgen_dir> — bytes of the dest's table files whose names the live oldgen
+# manifest does NOT list: what the sync really wrote. vazio (no such file) prints 0 for an empty dest, but
+# an unreadable manifest prints "?" so a broken measurement can never read as "wrote nothing".
+_bytes_outside_oldgen() {
+  local dest="$1" og="$2" names f base n tot=0 skip
+  names="$(_offline_sync_oldgen_names "$og/manifest")" || { echo "?"; return 0; }
+  for f in "$dest"/*; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"; base="${base%.darc}"
+    case "$base" in manifest|LOCK) continue ;; esac
+    skip=0; for n in $names; do [ "$n" = "$base" ] && skip=1; done
+    [ "$skip" -eq 1 ] || tot=$((tot + $(stat -f '%z' "$f")))
+  done
+  echo "$tot"
+}
+
+_mk_gcd_repo seedhq
+OG_H="$DATA_DIR/seedhq/.dolt/noms/oldgen"
+if [ -f "$OG_H/manifest" ]; then ok "fixture: the GC'd repo has an oldgen with its own manifest"; else bad "fixture: no oldgen/manifest after dolt gc — the seeded scenarios cannot run"; fi
+OG_BYTES="$(du -sk "$OG_H" 2>/dev/null | awk '{print $1*1024}')"
+LIVE_COUNT_H="$(cd "$DATA_DIR/seedhq" && dolt sql -q "SELECT COUNT(*) FROM big" --result-format csv 2>/dev/null | tail -1)"
+[ "$LIVE_COUNT_H" = "30003" ] && ok "fixture: live count is 30003 (30000 GC'd + 3 after)" || bad "fixture: live count='$LIVE_COUNT_H', expected 30003"
+
+# A recording wrapper around the real dolt: at the moment `backup sync-url` starts it logs what the
+# destination already holds (name + inode), then runs the real sync-url. That is the evidence of WHAT
+# the seed did — on this repo an unseeded sync-url also ends with the oldgen table names in the dest
+# (Dolt copies a table file verbatim when it can), so "the names are there afterwards" proves nothing;
+# "they were there BEFORE sync-url ran and it left them alone" does.
+RECBIN="$WORK/dolt-rec"
+cat > "$RECBIN" <<'EOS'
+#!/bin/bash
+for a in "$@"; do case "$a" in file://*) d="${a#file://}" ;; esac; done
+case "$*" in
+  *"backup sync-url"*) ls -i "$d" 2>/dev/null | sed 's/^ *//' | sort -k2 > "$REC_OUT.pre" ;;
+esac
+dolt "$@"; rc=$?
+case "$*" in
+  *"backup sync-url"*) ls -i "$d" 2>/dev/null | sed 's/^ *//' | sort -k2 > "$REC_OUT.post" ;;
+esac
+exit $rc
+EOS
+chmod +x "$RECBIN"
+
+# H0 (negative control): the same sync WITHOUT the seed — the recorder must show an empty dest at start.
+DEST_H0="$WORK/dest-h0"
+REC_OUT="$WORK/rec-h0" OFFLINE_SYNC_DOLT_BIN="$RECBIN" _offline_backup_sync "seedhq" "$DEST_H0" >/dev/null 2>&1 \
+  && ok "H0: unseeded sync of the GC'd repo succeeds (the baseline)" || bad "H0: unseeded sync failed"
+[ -f "$WORK/rec-h0.pre" ] && [ ! -s "$WORK/rec-h0.pre" ] \
+  && ok "H0: unseeded — the dest was EMPTY when sync-url started (so the recorder can tell seeded from unseeded)" \
+  || bad "H0: the unseeded dest was not empty at sync-url start (recorder cannot discriminate)"
+
+# H: seeded.
+DEST_H="$WORK/dest-h"
+if REC_OUT="$WORK/rec-h" OFFLINE_SYNC_DOLT_BIN="$RECBIN" OFFLINE_SYNC_SEED_OLDGEN=1 _offline_backup_sync "seedhq" "$DEST_H"; then ok "H: seeded sync succeeds"; else bad "H: seeded sync failed"; fi
+grep -qF "seedhq: offline-sync: OK ($DATA_DIR/seedhq -> $DEST_H, server-free, seeded from oldgen)" "$OFFLINE_SYNC_LOG" \
+  && ok "H: the OK line says the copy was seeded from oldgen" || bad "H: missing the 'seeded from oldgen' OK line"
+# (a) at sync-url start the (still private) seed already held manifest + every oldgen table…
+SEED_MISSING=0
+for n in $(_offline_sync_oldgen_names "$OG_H/manifest"); do grep -qE " $n(\.darc)?$" "$WORK/rec-h.pre" || SEED_MISSING=$((SEED_MISSING+1)); done
+grep -qE ' manifest$' "$WORK/rec-h.pre" || SEED_MISSING=$((SEED_MISSING+1))
+[ "$SEED_MISSING" -eq 0 ] && ok "H: when sync-url started, the dest already held the manifest and every oldgen table (seeded, not built)" || bad "H: $SEED_MISSING seed file(s) missing when sync-url started"
+# (b) …and sync-url left those files alone (same inode before and after: not rewritten, not replaced)…
+REWRITTEN=0
+while read -r ino name; do
+  case "$name" in manifest|LOCK) continue ;; esac
+  post_ino="$(awk -v n="$name" '$2==n{print $1}' "$WORK/rec-h.post")"
+  [ "$post_ino" = "$ino" ] || REWRITTEN=$((REWRITTEN+1))
+done < "$WORK/rec-h.pre"
+[ "$REWRITTEN" -eq 0 ] && ok "H: sync-url left every seeded table file untouched (same inode before/after)" || bad "H: sync-url replaced $REWRITTEN seeded table file(s)"
+# (c) …the seeded files are copies, not the live files themselves (a hardlink would let a later rm of the
+# staging, or Dolt's GC, reach into the live store)…
+LIVE_INO_SHARED=0
+for f in "$DEST_H"/*.darc "$DEST_H"/[0-9a-v]*; do
+  [ -f "$f" ] || continue
+  [ -f "$OG_H/$(basename "$f")" ] && [ "$(stat -f '%i' "$f")" = "$(stat -f '%i' "$OG_H/$(basename "$f")")" ] && LIVE_INO_SHARED=$((LIVE_INO_SHARED+1))
+done
+[ "$LIVE_INO_SHARED" -eq 0 ] && ok "H: no seeded file shares an inode with the live store (clones, not hardlinks)" || bad "H: $LIVE_INO_SHARED seeded file(s) are hardlinks into the live store"
+# …and cmp says they hold exactly the live bytes.
+CMP_BAD=0
+for n in $(_offline_sync_oldgen_names "$OG_H/manifest"); do
+  for ext in "" ".darc"; do [ -f "$OG_H/$n$ext" ] && { cmp -s "$OG_H/$n$ext" "$DEST_H/$n$ext" || CMP_BAD=$((CMP_BAD+1)); }; done
+done
+[ "$CMP_BAD" -eq 0 ] && ok "H: every seeded table is byte-identical to the live oldgen file" || bad "H: $CMP_BAD seeded table(s) differ from the live oldgen"
+# (d) no consolidated rewrite next to the seeded files (what a seed that sync-url ignored looks like).
+B_SEEDED="$(_bytes_outside_oldgen "$DEST_H" "$OG_H")"
+case "$B_SEEDED" in \?|'') bad "H: could not measure the bytes outside oldgen" ;;
+  *) [ "$B_SEEDED" -lt $((OG_BYTES / 5)) ] \
+       && ok "H: only ${B_SEEDED}B of new table data next to ${OG_BYTES}B of seeded oldgen — the delta, not a second copy of the store" \
+       || bad "H: ${B_SEEDED}B of new table data vs ${OG_BYTES}B oldgen — a full rewrite sits next to the seed" ;;
+esac
+SEEDED_OK=1
+for n in $(_offline_sync_oldgen_names "$OG_H/manifest"); do
+  grep -q "$n" "$DEST_H/manifest" || SEEDED_OK=0
+done
+[ "$SEEDED_OK" = 1 ] && ok "H: the dest's manifest still lists every oldgen table (they are referenced, not rewritten)" || bad "H: the dest manifest lost an oldgen table"
+VERIFY_H="$WORK/verify-h"; mkdir -p "$VERIFY_H"
+( cd "$VERIFY_H" && dolt backup restore "file://$DEST_H" "restored" >/dev/null 2>&1 )
+REST_H="$(cd "$VERIFY_H/restored" 2>/dev/null && dolt sql -q "SELECT COUNT(*) FROM big" --result-format csv 2>/dev/null | tail -1)"
+[ "$REST_H" = "$LIVE_COUNT_H" ] \
+  && ok "H: restaurado=$REST_H vs vivo=$LIVE_COUNT_H — the seeded copy restores to the live row count (the actual proof)" \
+  || bad "H: restaurado='$REST_H' vs vivo='$LIVE_COUNT_H'"
+# the restored delta rows are really there (not just the GC'd bulk)
+DELTA_H="$(cd "$VERIFY_H/restored" 2>/dev/null && dolt sql -q "SELECT COUNT(*) FROM big WHERE id > 100000" --result-format csv 2>/dev/null | tail -1)"
+[ "$DELTA_H" = "3" ] && ok "H: the 3 rows written after the GC are in the restored copy" || bad "H: delta rows in the restored copy='$DELTA_H', expected 3"
+
+# I: the caller REQUIRES the seed (its disk gate counted on it) but the store was never GC'd -> REFUSE, and
+# leave no dest (the full build would write GBs nobody reserved).
+mkdir -p "$DATA_DIR/seednogc" && ( cd "$DATA_DIR/seednogc" && dolt init >/dev/null 2>&1 )
+DEST_I="$WORK/dest-i"
+if OFFLINE_SYNC_SEED_OLDGEN=1 OFFLINE_SYNC_REQUIRE_SEED=1 _offline_backup_sync "seednogc" "$DEST_I"; then
+  bad "I: REQUIRE_SEED with nothing to seed from must refuse, not do the full build"
+else
+  ok "I: REQUIRE_SEED with no oldgen -> refuses"
+fi
+[ ! -e "$DEST_I" ] && ok "I: no dest was created by the refusal" || bad "I: dest exists after the refusal"
+grep -qF "seednogc: offline-sync: REFUSING — the caller's disk gate counted on the oldgen seed but the seed is not available (no:no-oldgen)" "$OFFLINE_SYNC_LOG" \
+  && ok "I: the log says why (no:no-oldgen) — a reason, not a silent skip" || bad "I: missing the REFUSING line with its reason"
+
+# J: seeding is wanted but not required and there is nothing to seed from -> the legacy full sync, and it works.
+DEST_J="$WORK/dest-j"
+if OFFLINE_SYNC_SEED_OLDGEN=1 _offline_backup_sync "seednogc" "$DEST_J"; then ok "J: no oldgen, seed not required -> falls back to the plain sync"; else bad "J: the plain fallback failed"; fi
+[ -s "$DEST_J/manifest" ] && ok "J: the fallback dest has a manifest" || bad "J: the fallback dest has no manifest"
+
+# K: the seeded sync-url FAILS -> rc 1 and NO dest is left behind (a seeded dir whose manifest names a
+# zero root would pass a closure proof and restore empty).
+FAILBIN="$WORK/dolt-failsync"
+cat > "$FAILBIN" <<'EOS'
+#!/bin/bash
+case "$*" in *"backup sync-url"*) echo "simulated sync-url failure" >&2; exit 1 ;; esac
+exec dolt "$@"
+EOS
+chmod +x "$FAILBIN"
+DEST_K="$WORK/dest-k"
+if OFFLINE_SYNC_DOLT_BIN="$FAILBIN" OFFLINE_SYNC_SEED_OLDGEN=1 _offline_backup_sync "seedhq" "$DEST_K"; then
+  bad "K: a failing sync-url must make the seeded sync fail"
+else
+  ok "K: seeded sync-url failure -> reports failure"
+fi
+[ ! -e "$DEST_K" ] && ok "K: no dest left behind after the failed seeded sync (no closing-but-zero-root manifest)" || bad "K: dest '$DEST_K' exists after a failed seeded sync"
+
+# L: dest already holds a copy (the incremental night) -> never seeded; REQUIRE_SEED refuses.
+DEST_L="$WORK/dest-l"
+OFFLINE_SYNC_SEED_OLDGEN=1 _offline_backup_sync "seedhq" "$DEST_L" >/dev/null 2>&1
+LM_BEFORE="$(cksum < "$DEST_L/manifest" 2>/dev/null)"
+if OFFLINE_SYNC_SEED_OLDGEN=1 _offline_backup_sync "seedhq" "$DEST_L"; then ok "L: a dest that already holds a copy syncs incrementally"; else bad "L: incremental sync into an existing copy failed"; fi
+grep -qF "not seeding (no:dest-has-content)" "$OFFLINE_SYNC_LOG" && ok "L: the incremental night says why it did not seed" || bad "L: missing 'not seeding (no:dest-has-content)'"
+if OFFLINE_SYNC_SEED_OLDGEN=1 OFFLINE_SYNC_REQUIRE_SEED=1 _offline_backup_sync "seedhq" "$DEST_L"; then bad "L: REQUIRE_SEED into a dest with content must refuse"; else ok "L: REQUIRE_SEED into a dest with content -> refuses"; fi
+[ -s "$DEST_L/manifest" ] && [ -n "$LM_BEFORE" ] && ok "L: the existing copy was left in place" || bad "L: the existing copy's manifest vanished"
+
+# M: _offline_sync_seed_state — each word, and failed != empty.
+DEST_M="$WORK/dest-m-absent"
+[ "$(_offline_sync_seed_state seedhq "$DEST_M")" = "no:disabled" ] && ok "M: mode off -> no:disabled" || bad "M: mode off should say no:disabled"
+export OFFLINE_SYNC_SEED_OLDGEN=1
+case "$(_offline_sync_seed_state seedhq "$DEST_M")" in "ok "[1-9]*) ok "M: GC'd store, absent dest -> ok <kb>" ;; *) bad "M: GC'd store, absent dest should be 'ok <kb>' (got '$(_offline_sync_seed_state seedhq "$DEST_M")')" ;; esac
+mkdir -p "$WORK/dest-m-empty"
+case "$(_offline_sync_seed_state seedhq "$WORK/dest-m-empty")" in "ok "[1-9]*) ok "M: an EMPTY existing dest dir is still seedable" ;; *) bad "M: an empty dest dir should be seedable" ;; esac
+[ "$(_offline_sync_seed_state seedhq "$DEST_H")" = "no:dest-has-content" ] && ok "M: a dest with a copy -> no:dest-has-content" || bad "M: dest with content should say no:dest-has-content"
+[ "$(_offline_sync_seed_state seednogc "$DEST_M")" = "no:no-oldgen" ] && ok "M: a never-GC'd store -> no:no-oldgen (empty by nature)" || bad "M: never-GC'd store should say no:no-oldgen"
+[ "$(OFFLINE_SYNC_TMP_ROOT="/definitely/does/not/exist/$$" _offline_sync_seed_state seedhq "$DEST_M")" = "no:volume" ] && ok "M: a tmp root whose volume cannot be established -> no:volume" || bad "M: unresolvable tmp root should say no:volume"
+[ "$(OFFLINE_SYNC_DOLT_CFG="$MISSING_CFG" _offline_sync_seed_state seedhq "$DEST_M")" = "no:no-data-dir" ] && ok "M: no data_dir in the config -> no:no-data-dir" || bad "M: config without data_dir should say no:no-data-dir"
+# failed != empty: an oldgen whose manifest names a table that is not there is "unreadable", NOT "no-oldgen".
+cp -R "$DATA_DIR/seedhq" "$DATA_DIR/seedbroken"
+BROKEN_FILE="$(ls "$DATA_DIR/seedbroken/.dolt/noms/oldgen" | grep -v -E '^(manifest|LOCK)$' | head -1)"
+rm -f "$DATA_DIR/seedbroken/.dolt/noms/oldgen/$BROKEN_FILE"
+[ "$(_offline_sync_seed_state seedbroken "$DEST_M")" = "no:unreadable" ] && ok "M: an oldgen missing a table its manifest names -> no:unreadable (failed is not 'empty')" || bad "M: broken oldgen should say no:unreadable, got '$(_offline_sync_seed_state seedbroken "$DEST_M")'"
+unset OFFLINE_SYNC_SEED_OLDGEN
+
+# N: REQUIRE_SEED against that broken oldgen refuses and leaves nothing.
+DEST_N="$WORK/dest-n"
+if OFFLINE_SYNC_SEED_OLDGEN=1 OFFLINE_SYNC_REQUIRE_SEED=1 _offline_backup_sync "seedbroken" "$DEST_N"; then bad "N: a broken oldgen under REQUIRE_SEED must refuse"; else ok "N: broken oldgen under REQUIRE_SEED -> refuses"; fi
+[ ! -e "$DEST_N" ] && ok "N: no dest was created" || bad "N: dest exists"
+
+# O: _offline_sync_seed_build — a seed that does not close is removed, not used.
+mkdir -p "$WORK/og-short"
+cp "$OG_H/manifest" "$WORK/og-short/manifest"
+if _offline_sync_seed_build "$WORK/og-short" "$WORK/seed-o" 2>/dev/null; then bad "O: a seed whose manifest names tables that are absent must not build"; else ok "O: seed_build refuses an oldgen whose tables are missing"; fi
+[ ! -e "$WORK/seed-o" ] && ok "O: the half-built seed dir was removed" || bad "O: the half-built seed dir was left behind"
+
 # No leftover clone directories: every scenario above must clean up after itself.
 LEFTOVER="$(find "$WORK" -mindepth 1 -maxdepth 1 -name 'offline-sync-*' 2>/dev/null | wc -l | tr -d ' ')"
 [ "$LEFTOVER" = "0" ] \
