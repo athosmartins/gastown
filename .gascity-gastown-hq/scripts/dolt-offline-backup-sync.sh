@@ -25,7 +25,7 @@
 # (measured on 2.3.1: the dest ends up as one consolidated table as big as the whole store — 11GB for hq,
 # on a disk with 7-12GB free: 8 of 9 nights refused, 30/09..08/10). But the dest is an NBS store, and so is
 # the live store's `.dolt/noms/oldgen/` — its own `manifest` plus content-addressed table files, i.e. what
-# GC already compacted (hq: 11.3GB of the 11.5GB). Pre-loading the dest with CLONEFILE copies of exactly
+# GC already compacted (hq on 2026-10-08: ~11049MB of a 11229-11752MB store). Pre-loading the dest with CLONEFILE copies of exactly
 # that (tables ~0 real disk) makes the dest "already have" those chunks: sync-url then writes ONLY the new
 # table holding what is not in oldgen. Layout and format of the dest are unchanged, so the S3 upload, the
 # manifest-closure proof, the restore and the status readers do not change.
