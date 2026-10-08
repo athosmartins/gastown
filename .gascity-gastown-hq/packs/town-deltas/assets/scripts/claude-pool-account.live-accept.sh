@@ -21,11 +21,18 @@
 #       ambient login (AC: a pool session without the credential starts normally).
 #   P3  one LIVE interactive session, one pid, no restart: OK -> daemon failover -> EXH (limit error, ~40 s) ->
 #       daemon failback -> OK, and the conversation is still there ("what was the first thing I asked?" -> ALPHA).
+#   P4  (ga-8hcnvb.3) the guard on the real claude: the per-version test passes on the installed version and is queryable; a divergence
+#       (rule says EXH, item holds OK) gives ONE alert naming both accounts by e-mail + fingerprint and stops once fixed; the drill that
+#       makes claude 'lose' the credential fails the test, writes the degraded marker, a launch answers on the ambient login, and the
+#       next passing test lifts the marker; then the real leak scan (all 5 vault keys, control first) over this run's files and ps.
+#       The phone is never used: pushes go to a recorder. The guard's scratch item is its own throwaway ("claude-pool-guard-scratch").
 set -u
 umask 077   # whatever this script writes under $HOME is for this user only (the scratch dir is 0700 already; the files in it too)
 SD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON="${DAEMON:-$SD/claude-pool-account.py}"
 LOWPRIO="$SD/claude-lowprio.sh"
+GUARD="${GUARD:-$SD/claude-pool-guard.py}"
+LEAKSCAN="${LEAKSCAN:-$SD/claude-pool-leakscan.py}"
 PY=/usr/bin/python3
 EMAIL_OK="${EMAIL_OK:-terrenos.incorporacoes@gmail.com}"
 EMAIL_EXH="${EMAIL_EXH:-athosb85@gmail.com}"
@@ -170,6 +177,90 @@ ask "Reply with exactly: CHARLIE"
 pane 8 | grep -q "CHARLIE" && ok "P3.5 same session answers again on the OK account (CHARLIE)" || { bad "P3.5 no CHARLIE"; pane 12; }
 ask "What was the first thing I asked you to reply with? One word." 18
 pane 8 | grep -q "ALPHA" && ok "P3.6 conversation continuity: the session still remembers its first question (ALPHA)" || { bad "P3.6 continuity lost"; pane 12; }
+
+# ── P4: the guard (ga-8hcnvb.3) on the REAL claude, the REAL Keychain (scratch items only) and the REAL vault ───────────────────────
+echo; echo "== P4  claude-pool-guard: per-version test on the real claude, divergence alert, degrade + recover, key-leak scan"
+tmux -L "$SOCK" kill-server >/dev/null 2>&1                              # P3's session is done; P4 does not need it
+GSCR="$W/claude-pool-guard-scratch"                                      # the guard refuses a scratch dir not named for itself
+: > "$W/notify.rec"
+cat > "$W/notify-rec.sh" <<'EOF2'
+#!/bin/bash
+# the PHONE IS NOT USED by this harness: a recorder with notify's argv shape (-t title -p prio message), one CALL line per push
+printf 'CALL %s\n' "$*" >> "$REC_FILE"
+exit 0
+EOF2
+chmod +x "$W/notify-rec.sh"
+pushes() { grep -c "^CALL .* -p ${1:-4} " "$W/notify.rec" 2>/dev/null || true; }
+stamp_hb() { # the daemon's own write_heartbeat() at <clock-epoch>: what the real daemon leaves every minute. P1-P3 ran the daemon on a SIMULATED
+  # clock (RESET+60, 2 h ahead), so its last stamp is in the guard's future - which the guard rightly reads as 'cannot tell', not as a live daemon.
+  env HOME="$HOME" USER="$USER" GC_CITY_PATH="$W/city" CLAUDE_POOL_NOW="$1" "$PY" -c 'import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m); m.write_heartbeat()' "$DAEMON" >/dev/null 2>&1
+}
+guard() { # guard <clock-epoch> <command...>   (GX="A=b C=d" adds env; the clock is the guard's own seam, the claude is the real one)
+  local now="$1"; shift
+  stamp_hb "$now"
+  env HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin" GC_CITY_PATH="$W/city" \
+      CLAUDE_POOL_STATE="$W/state.json" CLAUDE_POOL_CRED_DIR="$POOL_DIR" CLAUDE_POOL_GUARD_STATE="$W/guard.json" \
+      CLAUDE_POOL_GUARD_SCRATCH="$GSCR" CLAUDE_POOL_NOTIFY_CMD="$W/notify-rec.sh" REC_FILE="$W/notify.rec" \
+      CLAUDE_POOL_GUARD_RETRY_WAIT_S=2 CLAUDE_POOL_NOW="$now" ${GX:-} "$PY" "$GUARD" "$@"
+}
+gjson() { "$PY" -c 'import json,sys; d=json.load(open(sys.argv[1])); 
+for k in sys.argv[2].split("/"): d = d.get(k, "") if isinstance(d, dict) else ""
+print(d)' "$W/guard.json" "$1" 2>/dev/null; }
+REAL_VER="$(claude --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*' | head -1)"
+echo "   claude under test: ${REAL_VER:-?}"
+T0=$(date +%s)
+
+# P4a-b  the per-version test, on the real claude: scratch item, fake credential, `claude auth status --json`
+guard "$T0" run-once >/dev/null 2>&1
+[ "$(gjson "versions/$REAL_VER/result")" = pass ] && ok "P4a the real claude $REAL_VER PASSES the per-version test (logged in with the scratch credential, not without it)" \
+  || bad "P4a result for $REAL_VER: '$(gjson "versions/$REAL_VER/result")' ($(gjson "versions/$REAL_VER/detail"))"
+guard "$T0" status --json 2>/dev/null | grep -q "\"$REAL_VER\"" && ok "P4b the result is queryable: status --json names the version and its verdict" || bad "P4b status --json does not show $REAL_VER"
+[ ! -e "$W/city/.gc/pool-account-degraded" ] && [ ! -d "$GSCR" ] && ok "P4b2 no degraded marker, and the scratch dir is gone" || bad "P4b2 marker or scratch left behind"
+
+# P4c  divergence: the rule says EXH, the pool item holds OK. Debounced 120 s, then ONE alert; fixed -> it stops
+"$PY" - "$W/state.json" "$EMAIL_EXH" "$(fp "$TOK_EXH")" <<'EOF2'
+import json, sys
+f, email, fp = sys.argv[1:4]
+d = json.load(open(f)); d["current"], d["fingerprint"] = email, fp; json.dump(d, open(f, "w"))
+EOF2
+T1=$((T0 + 100)); guard "$T1" run-once >/dev/null 2>&1; guard $((T1 + 60)) run-once >/dev/null 2>&1
+[ "$(pushes 4)" = 0 ] && ok "P4c the divergence is not alerted before the debounce (60 s in)" || bad "P4c alerted too early: $(pushes 4) pushes"
+guard $((T1 + 180)) run-once >/dev/null 2>&1; guard $((T1 + 240)) run-once >/dev/null 2>&1; guard $((T1 + 300)) run-once >/dev/null 2>&1
+alert="$(grep "^CALL .* -p 4 " "$W/notify.rec" | head -1)"
+[ "$(pushes 4)" = 1 ] && ok "P4d ONE phone alert (priority 4) for the episode, 3 min after the first sighting, not repeated on the next ticks" || bad "P4d pushes=$(pushes 4)"
+if printf '%s' "$alert" | grep -q "$EMAIL_EXH" && printf '%s' "$alert" | grep -q "$EMAIL_OK" && printf '%s' "$alert" | grep -q "$(fp "$TOK_EXH")" && printf '%s' "$alert" | grep -q "$(fp "$TOK_OK")"; then
+  ok "P4e the alert names the expected AND the in-use account, each by e-mail + fingerprint"
+else bad "P4e the alert misses an account name: $(printf '%s' "$alert" | head -c 300)"; fi
+"$PY" - "$W/state.json" "$EMAIL_OK" "$(fp "$TOK_OK")" <<'EOF2'
+import json, sys
+f, email, fp = sys.argv[1:4]
+d = json.load(open(f)); d["current"], d["fingerprint"] = email, fp; json.dump(d, open(f, "w"))
+EOF2
+before="$(pushes 4)"; guard $((T1 + 360)) run-once >/dev/null 2>&1; guard $((T1 + 3600)) run-once >/dev/null 2>&1; guard $((T1 + 7200)) run-once >/dev/null 2>&1
+[ "$(pushes 4)" = "$before" ] && ok "P4f the account fixed -> the alert does not repeat (even an hour and two hours later)" || bad "P4f pushes went $before -> $(pushes 4): $(grep '^CALL' "$W/notify.rec" | cut -c1-110 | tr '\n' '|')"
+
+# P4g-i  the real claude 'changes its internals': the drill makes the test see the credential removed -> degrade, answer on the ambient login, recover
+GX="CLAUDE_POOL_GUARD_FAULT=remove" guard $((T1 + 400)) selftest >/dev/null 2>&1
+[ "$(gjson "versions/$REAL_VER/result")" = fail ] && [ -e "$W/city/.gc/pool-account-degraded" ] && ok "P4g with the credential 'removed' the per-version test FAILS on the real claude and the degraded marker is written" \
+  || bad "P4g result='$(gjson "versions/$REAL_VER/result")' marker=$([ -e "$W/city/.gc/pool-account-degraded" ] && echo yes || echo no)"
+grep "^CALL .* -p 4 " "$W/notify.rec" | grep -qi "DESLIGADA" && ok "P4h an alert says automatic switching is OFF" || bad "P4h no 'DESLIGADA' push: $(tail -2 "$W/notify.rec" | head -c 300)"
+n0="$(grep -c "POOL-ACCT SET" "$W/city/.gc/logs/claude-pool-account.log")"
+out="$(env GC_CITY_PATH="$W/city" GC_POOL_CRED_DIR="$POOL_DIR" GC_LOWPRIO=0 "$LOWPRIO" "${ASK[@]}" 2>&1 | tail -3)"
+if printf '%s' "$out" | grep -q "WRAPOK" && [ "$(grep -c "POOL-ACCT SET" "$W/city/.gc/logs/claude-pool-account.log")" = "$n0" ] && grep -q "POOL-ACCT SKIP disabled by .*pool-account-degraded" "$W/city/.gc/logs/claude-pool-account.log"; then
+  ok "P4i an agent started while degraded answers normally on the current login (the wrapper skipped the pool item and said why)"
+else bad "P4i degraded launch: $(printf '%s' "$out" | head -c 200)"; fi
+guard $((T1 + 500)) selftest >/dev/null 2>&1
+[ "$(gjson "versions/$REAL_VER/result")" = pass ] && [ ! -e "$W/city/.gc/pool-account-degraded" ] && ok "P4j the next passing test removes the marker by itself" || bad "P4j result='$(gjson "versions/$REAL_VER/result")' marker still there?"
+
+# P4k-m  zero occurrences of ANY of the 5 keys (the vault's, via --keys-vault) where it must not be; the control runs first and a failed control is exit 3
+out="$("$PY" "$LEAKSCAN" --keys-vault --ps --path "$W" 2>&1)"; rc=$?
+printf '%s\n' "$out" | grep "^SUMMARY" | sed -e 's/^/   /'
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q "control=ok" && ok "P4k scan of this run's files (logs, state, decision, guard state, recorded pushes) + ps argv/env: no key anywhere, control saw its plant" || { bad "P4k leakscan rc=$rc"; printf '%s\n' "$out" | head -6 | cut -c1-200; }
+plant="sk-ant-oat01-LIVEPLANT$(date +%s)abcdefghij"; printf '%s\n' "$plant" > "$W/planted.txt"
+printf '{"plant@control.test":"%s"}' "$plant" | "$PY" "$LEAKSCAN" --keys-stdin --path "$W/planted.txt" >/dev/null 2>&1; rc=$?
+[ "$rc" = 1 ] && ok "P4l control: the same scan finds a key planted on purpose (exit 1)" || bad "P4l the planted key was not found (rc=$rc)"
+rm -f "$W/planted.txt"; unset plant
 
 echo; echo "== daemon log (no tokens):"; sed -e 's/^/   /' "$W/city/.gc/logs/claude-pool-account.log" | tail -14
 echo; echo "RESULT: $PASS passed, $FAIL failed"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-pool-guard.selftest.sh — ga-8hcnvb.3.2: the safety net under the pool's account switch (slice 2 of 3: the per-version test and the degradation).
+# claude-pool-guard.selftest.sh — ga-8hcnvb.3: the safety net under the pool's account switch.
 #
 #   G1-G4  DIVERGENCE: the account the pool really uses vs the account the rule dictates -> one phone alert in < 5 min naming both by
 #          e-mail + 8-hex fingerprint, never the key; it stops repeating when fixed; 'could not tell' never alerts as a divergence.
@@ -11,6 +11,10 @@
 #          the wrapper stand down, an agent started in that state answers on the current login, nothing is deleted or interrupted.
 #   G6     the daemon's heartbeat (a daemon that stopped completing runs); G6i: a heartbeat that cannot be read in ANY way (not UTF-8,
 #          a 400-digit epoch, an epoch that is not a time) is 'could not tell', never a crash and never a verdict.
+#   G7     NO KEY LEAKS (AC4): a full account switch, a degradation and a set of forced errors run under a background process sampler;
+#          then claude-pool-leakscan.py searches argv, env, logs, the decision file, error output and sent notifications for the 5
+#          keys (zero findings), finds a key planted on purpose (the control), and FAILS on a deliberately leaky daemon and a leaky guard.
+#          (G7 runs last: it is the slowest.)
 #   G8     the self-test's scratch item: never the pool's, never trusted if left behind.
 #   G9     `status`: 'not tested yet' is not 'cannot tell'; 'auto-switch: on' is not what a shell with no city answers.
 #   G10    the daemon's silence is judged only over time the guard was LOOKING: a stand-down (marker, operator switches) or the guard's
@@ -21,23 +25,29 @@
 #   G12    the self-test failed and the marker cannot be written: said out loud, pool still ON, not recorded as a degradation.
 #   G13    a pass while a marker the guard did not write is still up: no 'religada' until the marker is really gone.
 #   G14    `selftest` says what it did: rc 0 pass / 3 fail / 4 inconclusive / 1 NOT run (lock held, kill switch, no claude).
+#   G15    leakscan and symlinks: a link to a file is read through, a link to a directory is covered by another --path or BLIND,
+#          a dangling one is BLIND - never skipped in silence.
 #   G16    the quiet 'troca automática religada' notice: notify's router files it in the digest (rc 12) and that counts as delivered (sent
 #          once, the episode closes); a FORCED push that meets the cap (rc 12) is retried until it goes out; a notice notify keeps
 #          refusing is given up on after 30 min, said in the log; a blind record of a superseded claude version is dropped.
+#   G17    leakscan exit 1 means 'a key was found' and nothing else: the --watch-max deadline, an unreadable directory or path, a FIFO,
+#          an error nobody planned for are BLIND (3); a bad --interval is a usage error (2); a stop file in time is a clean end (0);
+#          a stranger straddling two chunks is still fingerprinted.
 #
 # HERMETIC: fake `security` (items in a temp dir), fake `claude` (several behaviours), fake `secret` vault, fake `notify` (it models the
-# router and the push cap: a quiet send gets rc 12 like the real one), and a clock the test moves (CLAUDE_POOL_NOW). Nothing here touches
-# the real Keychain, vault, network or phone.
-# The product under test can be swapped for an older copy: CLAUDE_POOL_GUARD / _DAEMON / _WRAPPER (see 'previous HEAD' in the doc).
+# router and the push cap: a quiet send gets rc 12 like the real one), a mock probe
+# API, and a clock the test moves (CLAUDE_POOL_NOW). Nothing here touches the real Keychain, vault, network or phone.
+# The product under test can be swapped for an older copy: CLAUDE_POOL_GUARD / _DAEMON / _WRAPPER / _LEAKSCAN (see 'previous HEAD' in the doc).
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARD="${CLAUDE_POOL_GUARD:-$SELF_DIR/claude-pool-guard.py}"
 DAEMON="${CLAUDE_POOL_DAEMON:-$SELF_DIR/claude-pool-account.py}"
 WRAPPER="${CLAUDE_POOL_WRAPPER:-$SELF_DIR/claude-lowprio.sh}"
+LEAKSCAN="${CLAUDE_POOL_LEAKSCAN:-$SELF_DIR/claude-pool-leakscan.py}"
 ACCT_LIB="${CLAUDE_POOL_ACCOUNTS_LIB:-/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py}"
 PY3="${CLAUDE_POOL_PY:-/usr/bin/python3}"; [ -x "$PY3" ] || PY3="$(command -v python3)"   # the interpreter launchd runs (3.9)
-ONLY="${GUARD_SELFTEST_ONLY:-}"   # e.g. G1 or G5,G10: run only these groups
+ONLY="${GUARD_SELFTEST_ONLY:-}"   # e.g. G1 or G5,G7: run only these groups
 
 PASS=0
 FAIL=0
@@ -51,10 +61,10 @@ bad() {
 }
 want() { [ -z "$ONLY" ] || case ",$ONLY," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
-for f in "$GUARD" "$DAEMON" "$WRAPPER" "$ACCT_LIB"; do [ -f "$f" ] || { echo "FATAL: not found: $f"; exit 1; }; done
+for f in "$GUARD" "$DAEMON" "$WRAPPER" "$LEAKSCAN" "$ACCT_LIB"; do [ -f "$f" ] || { echo "FATAL: not found: $f"; exit 1; }; done
 
 _t="${TMPDIR:-/tmp}"; W="$(mktemp -d "${_t%/}/claude-pool-guard-selftest.XXXXXX")"   # no "//" in it: the product hashes paths it normalised, the fakes hash the string they were given
-cleanup() { for p in ${BG_PIDS:-}; do kill "$p" 2>/dev/null; done; chmod -R u+w "$W" 2>/dev/null; rm -rf "$W"; }
+cleanup() { [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null; for p in ${BG_PIDS:-}; do kill "$p" 2>/dev/null; done; chmod -R u+w "$W" 2>/dev/null; rm -rf "$W"; }
 trap cleanup EXIT
 BG_PIDS=""
 
@@ -163,8 +173,29 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$BB/security" "$BB/secret" "$BB/notify"
+cat > "$W/mock_api.py" <<'EOF'
+import http.server, json, sys
+STATE, LOG, PORTF = sys.argv[1:4]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self): self.do_POST()
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length") or 0))
+        tok = (self.headers.get("authorization") or "").replace("Bearer ", "")
+        beh = json.load(open(STATE)).get(tok) or {"status": 401, "h": {}}
+        with open(LOG, "a") as f: f.write("probe\n")      # the token is NOT logged here: the mock is not a channel under test
+        self.send_response(beh["status"])
+        for k, v in beh.get("h", {}).items(): self.send_header(k, v)
+        body = b"{}"; self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+open(PORTF, "w").write(str(srv.server_address[1])); srv.serve_forever()
+EOF
 
-NOW=$NOW_BASE; HB_AUTO=1; GRC=0; N_RUN=0
+HDR_OK='{"anthropic-ratelimit-unified-status":"allowed","anthropic-ratelimit-unified-5h-status":"allowed","anthropic-ratelimit-unified-7d-status":"allowed","anthropic-ratelimit-unified-5h-reset":"1900000000","anthropic-ratelimit-unified-7d-reset":"1900500000"}'
+HDR_REJ='{"anthropic-ratelimit-unified-status":"rejected","anthropic-ratelimit-unified-5h-status":"rejected","anthropic-ratelimit-unified-5h-reset":"1999003600","anthropic-ratelimit-unified-representative-claim":"five_hour","retry-after":"600"}'
+
+NOW=$NOW_BASE; HB_AUTO=1; GRC=0; N_RUN=0; SRV_PID=""
 blob_of() { printf '{"claudeAiOauth":{"accessToken":"%s","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":null}}' "$1"; }
 put_item() { blob_of "$1" | xxd -p | tr -d '\n' > "$INFRA/kc/items/$SVC"; }            # builtin printf: the key is never in an argv
 put_decision() { printf '{"current":"%s","fingerprint":"%s","since":"2033-05-18T03:00:00Z","reason":"selftest","previous":null,"exhausted":{},"schema":1,"updated":"2033-05-18T03:00:00Z"}\n' "$1" "$2" > "$STATE"; }
@@ -192,6 +223,7 @@ EOF
 }
 
 new_w() {
+  [ -n "$SRV_PID" ] && { kill "$SRV_PID" 2>/dev/null; SRV_PID=""; }
   chmod -R u+w "$WW" 2>/dev/null; rm -rf "$WW"
   mkdir -p "$CITY/.gc/logs" "$DATA" "$INFRA/kc/items" "$INFRA/vault" "$INFRA/home" "$SINKS" "$CAP" "$INFRA/home/.gastown"
   : > "$SINKS/kc-argv.log"; : > "$SINKS/kc-ops.log"
@@ -206,7 +238,7 @@ BASE_ENV() {
     "CLAUDE_USAGE_STORE=$INFRA/usage.json" "CLAUDE_POOL_STATE=$STATE" "CLAUDE_POOL_CRED_DIR=$POOL_DIR" "GC_POOL_CRED_DIR=$POOL_DIR" "CLAUDE_POOL_ACCOUNTS_LIB=$ACCT_LIB" \
     "CLAUDE_POOL_NOW=$NOW" "CLAUDE_POOL_DAEMON=$DAEMON" "CLAUDE_POOL_GUARD_STATE=$GSTATE" "CLAUDE_POOL_NOTIFY_CMD=$BB/notify" \
     "CLAUDE_POOL_GUARD_SCRATCH=$INFRA/claude-pool-guard-scratch" "CLAUDE_POOL_GUARD_RETRY_WAIT_S=0" "CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=20" \
-    "GC_LOWPRIO_CLAUDE_BIN=$FAKEBIN/claude"
+    "GC_LOWPRIO_CLAUDE_BIN=$FAKEBIN/claude" "CLAUDE_POOL_PROBE_URL=http://127.0.0.1:$(cat "$INFRA/port" 2>/dev/null || echo 9)/v1/messages"
 }
 run_guard() { # run_guard [VAR=val ...] -- <guard args>; output in $LAST, status in $GRC
   local envs=() base=()
@@ -243,6 +275,7 @@ gwalk() { # gwalk <seconds> [VAR=val ...]: the same stretch of time as ONE tick 
   for ((i = 0; i < n; i++)); do gtick 60 "$@"; done
 }
 div3() { gtick 60; gtick 130; gtick 130; }      # a divergence that has lasted long enough to be alerted (2 min of persistence + the tick that sees it)
+scan() { keys_json | "$PY3" "$LEAKSCAN" --keys-stdin "$@" > "$SINKS/scan2.out" 2>&1; S_RC=$?; }
 ndelivered() { [ -f "$SINKS/notify.delivered" ] && wc -l < "$SINKS/notify.delivered" | tr -d ' ' || echo 0; }   # pushes that reached the phone (needs notify.titledup to differ from ncalls)
 gl() { cat "$CITY/.gc/logs/claude-pool-guard.log" 2>/dev/null; }
 active_world() { # item = a's key, decision = a, a clean heartbeat: the pool as the daemon leaves it
@@ -758,6 +791,36 @@ run_guard GC_LOWPRIO_CLAUDE_BIN=no-such-claude-binary-xyz -- selftest
 { [ "$GRC" = 1 ] && grep -q "NOT run" "$LAST"; } && ok "G14g no claude to ask -> 'NOT run', rc 1" || bad "G14g rc=$GRC out='$(head -c 300 "$LAST")'"
 fi
 
+# ═══ G15. the leak scanner does not walk past a link ════════════════════════════════════════════════
+if want G15; then
+echo "G15. leakscan: a symlink is read through, provably covered, or reported - never skipped in silence"
+new_w; LK="$W/lk"; rm -rf "$LK"; mkdir -p "$LK/tree/sub" "$LK/outside/dir"
+printf 'clean\n' > "$LK/tree/a.txt"; printf 'x %s y\n' "$KEY_c" > "$LK/outside/secret.txt"; printf 'x %s y\n' "$KEY_d" > "$LK/outside/dir/inner.txt"
+scan --path "$LK/tree"; [ "$S_RC" = 0 ] && grep -q "control=ok" "$SINKS/scan2.out" && ok "G15 baseline: the tree is clean (control ok)" || bad "G15 baseline rc=$S_RC: $(head -c 300 "$SINKS/scan2.out")"
+ln -s "$LK/outside/secret.txt" "$LK/tree/sub/log-link"
+scan --path "$LK/tree"
+{ [ "$S_RC" = 1 ] && grep -q "location=$LK/tree/sub/log-link account=c@t.test" "$SINKS/scan2.out"; } && ok "G15a a symlink INSIDE the scanned tree to a file with a key in it -> found, under the link's name (exit 1), not 'clean'" || bad "G15a rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$LK/tree/sub/log-link"; ln -s "$LK/outside/dir" "$LK/tree/dir-link"
+scan --path "$LK/tree"
+{ [ "$S_RC" = 3 ] && grep -q "BLIND $LK/tree/dir-link: is a symlink to a directory that is not scanned" "$SINKS/scan2.out"; } && ok "G15b a symlink to a directory that is NOT among the scanned paths -> BLIND (exit 3), naming it and what to add" || bad "G15b rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+scan --path "$LK/tree" --path "$LK/outside"
+{ [ "$S_RC" = 1 ] && grep -q "dir/inner.txt account=d@t.test" "$SINKS/scan2.out" && ! grep -q "^BLIND" "$SINKS/scan2.out"; } && ok "G15c ...and naming that directory as well covers the link: not blind, and what is in it is found" || bad "G15c rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$LK/tree/dir-link"; ln -s "$LK/tree" "$LK/tree/self"
+scan --path "$LK/tree"
+{ [ "$S_RC" = 0 ] && ! grep -q "^BLIND" "$SINKS/scan2.out"; } && ok "G15d a link back to the scanned tree itself (the real shared/data/data -> shared/data) is covered, not blind and not followed into a loop" || bad "G15d rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$LK/tree/self"; ln -s "$LK/does-not-exist" "$LK/tree/dangling"
+scan --path "$LK/tree"
+{ [ "$S_RC" = 3 ] && grep -q "BLIND $LK/tree/dangling: " "$SINKS/scan2.out"; } && ok "G15e a dangling symlink -> BLIND (exit 3): it cannot be looked at" || bad "G15e rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$LK/tree/dangling"; ln -s "$LK/outside/secret.txt" "$LK/top-link"
+scan --path "$LK/top-link"
+{ [ "$S_RC" = 1 ] && grep -q "account=c@t.test" "$SINKS/scan2.out"; } && ok "G15f a top-level --path that is a symlink to a file is read through the same way" || bad "G15f rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+# --watch-ps samples the process list only. A --path given with it used to be dropped without a word while the file control still ran: a key
+# planted in that file came back as 'clean', the same green as a file that was read.
+: > "$W/stop-now"
+scan --watch-ps "$W/stop-now" --path "$LK/outside/secret.txt"
+{ [ "$S_RC" = 2 ] && grep -q -- "--watch-ps" "$SINKS/scan2.out" && ! grep -q "^SUMMARY" "$SINKS/scan2.out"; } && ok "G15g --watch-ps with --path is refused (exit 2, says why), not answered 'clean' for files it never read" || bad "G15g rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+fi
+
 # ═══ G16. the quiet notice follows notify's router; a record of a superseded version goes ═══════════
 if want G16; then
 echo "G16. 'religada' is accepted where notify's router sends it (digest, 12) and not retried for ever; a forced push the router did not take IS retried; a blind record of a version that is gone is dropped"
@@ -794,6 +857,180 @@ def exists(self):
 pathlib.Path.exists = exists
 gs = {}; print(g.apply_result(gs, g.D.now(), "1.0.3", "pass", ""), sorted(gs.get("blind", {})), gs.get("degraded"))' "$GUARD" > "$SINKS/inproc.out" 2>&1
 { [ "$(cat "$SINKS/inproc.out")" = "unchanged ['degraded-marker'] None" ] && [ "$(ncalls)" = 0 ]; } && ok "G16e a marker whose presence cannot be told: nothing changed, nothing announced ('religada' needs a marker known to be gone), the guard records that it is blind" || bad "G16e: $(head -c 300 "$SINKS/inproc.out")"
+fi
+
+# ═══ G17. leakscan: 'could not look' is exit 3 ═══════════════════════════════════════════════════════
+if want G17; then
+echo "G17. leakscan: what could not be looked at ends BLIND (3) - never as 'a key was found' (1), never as a clean end (0), never hangs"
+new_w; LK="$W/lk17"; rm -rf "$LK"; mkdir -p "$LK/tree/sub"; printf 'clean\n' > "$LK/tree/a.txt"
+# B2a: the sampling window ended by --watch-max, not by the stop file: the scenario may have run past it
+rm -f "$W/never-stop"
+scan --watch-ps "$W/never-stop" --interval 0.1 --watch-max 1
+{ [ "$S_RC" = 3 ] && grep -q "^BLIND .*--watch-max" "$SINKS/scan2.out" && grep -q "^SUMMARY .*blind=1" "$SINKS/scan2.out"; } && ok "G17 B2a: --watch-ps that ran out at --watch-max without the stop file is BLIND (exit 3, says so), not a clean end" || bad "G17 B2a rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$W/stop-late"; ( sleep 1; : > "$W/stop-late" ) & BG_PIDS="$BG_PIDS $!"
+scan --watch-ps "$W/stop-late" --interval 0.1 --watch-max 30
+{ [ "$S_RC" = 0 ] && ! grep -q "^BLIND" "$SINKS/scan2.out"; } && ok "G17a ...a stop file that appears in time still ends it clean (exit 0)" || bad "G17a rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+: > "$W/stop-now"; scan --watch-ps "$W/stop-now" --interval 0.1 --watch-max 1
+{ [ "$S_RC" = 0 ] && ! grep -q "^BLIND" "$SINKS/scan2.out"; } && ok "G17b ...and so does one that was there from the start" || bad "G17b rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+# B2b: a stat that fails (Python 3.9's Path.is_dir/is_symlink raise PermissionError) was a traceback and exit 1 - the code for 'a key was found'
+if [ "$(id -u)" != 0 ]; then
+  mkdir -p "$LK/tree/noexec" "$LK/locked"; printf 'x\n' > "$LK/tree/noexec/f.txt"; printf 'x\n' > "$LK/locked/f.txt"
+  chmod 644 "$LK/tree/noexec"; scan --path "$LK/tree"; rc1=$S_RC; out1="$(cat "$SINKS/scan2.out")"
+  { [ "$rc1" = 3 ] && [[ "$out1" == *"BLIND $LK/tree/noexec/f.txt"* ]] && [[ "$out1" != *Traceback* ]]; } && ok "G17c B2b: a directory that lists but cannot be entered -> BLIND naming the file (exit 3), no traceback, not 'a key was found'" || bad "G17c rc=$rc1: $(printf '%s' "$out1" | head -c 400)"
+  printf 'x %s y\n' "$KEY_c" > "$LK/tree/sub/leak.txt"; scan --path "$LK/tree"; rc1=$S_RC; out1="$(cat "$SINKS/scan2.out")"; chmod 755 "$LK/tree/noexec"; rm -f "$LK/tree/sub/leak.txt"
+  { [ "$rc1" = 1 ] && [[ "$out1" == *"location=$LK/tree/sub/leak.txt account=c@t.test"* ]] && [[ "$out1" == *"BLIND $LK/tree/noexec/f.txt"* ]]; } && ok "G17c2 ...and what could not be entered does not stop the rest of the tree from being read: a key elsewhere is still found (exit 1 wins over 3)" || bad "G17c2 rc=$rc1: $(printf '%s' "$out1" | head -c 400)"
+  chmod 000 "$LK/locked"; scan --path "$LK/locked/f.txt"; rc2=$S_RC; out2="$(cat "$SINKS/scan2.out")"; chmod 755 "$LK/locked"
+  { [ "$rc2" = 3 ] && [[ "$out2" == *"BLIND $LK/locked/f.txt"* ]] && [[ "$out2" != *Traceback* ]]; } && ok "G17d B2b: a --path that cannot be reached -> BLIND (exit 3), no traceback" || bad "G17d rc=$rc2: $(printf '%s' "$out2" | head -c 400)"
+else
+  ok "G17c-d skipped (root can read anywhere)"
+fi
+# a FIFO in the tree: opening it for reading would wait for a writer for ever
+TMO="$(command -v timeout || command -v gtimeout || true)"
+if [ -z "$TMO" ]; then ok "G17e-f skipped (no timeout(1) to stop a scan that hangs)"; else
+mkfifo "$LK/tree/sub/pipe"
+keys_json | "$TMO" 20 "$PY3" "$LEAKSCAN" --keys-stdin --path "$LK/tree" > "$SINKS/scan2.out" 2>&1; S_RC=$?
+{ [ "$S_RC" = 3 ] && grep -q "BLIND $LK/tree/sub/pipe: is not a regular file" "$SINKS/scan2.out"; } && ok "G17e a FIFO in the scanned tree -> BLIND (exit 3) naming it, and the scan does not hang" || bad "G17e rc=$S_RC (124 = hung): $(head -c 400 "$SINKS/scan2.out")"
+keys_json | "$TMO" 20 "$PY3" "$LEAKSCAN" --keys-stdin --path "$LK/tree/sub/pipe" > "$SINKS/scan2.out" 2>&1; S_RC=$?
+{ [ "$S_RC" = 3 ] && grep -q "BLIND $LK/tree/sub/pipe: is not a regular file" "$SINKS/scan2.out"; } && ok "G17f ...also as a top-level --path (and it is not called 'does not exist')" || bad "G17f rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$LK/tree/sub/pipe"
+fi
+# whatever else goes wrong inside the scan: exit 3 and a BLIND line, never a traceback with exit 1
+keys_json | "$PY3" -I -c '
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("ls", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+def boom(*a, **k): raise RuntimeError("selftest: an error nobody planned for")
+m.scan_paths = boom
+sys.exit(m.run(["x", "--keys-stdin", "--path", sys.argv[2]]))' "$LEAKSCAN" "$LK/tree" > "$SINKS/scan2.out" 2>&1; S_RC=$?
+{ [ "$S_RC" = 3 ] && grep -q "^BLIND .*RuntimeError" "$SINKS/scan2.out" && ! grep -q Traceback "$SINKS/scan2.out"; } && ok "G17g an unexpected error inside the scan -> BLIND naming its type, exit 3 (exit 1 is only ever 'a key was found')" || bad "G17g rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+# a key-shaped stranger cut by a read boundary is reported by the fingerprint of the WHOLE text (the first read only saw the beginning of it)
+stranger="sk-ant-oat01-STRANGERabcdefghij0123456789ABCD"; fp_s="$(printf '%s' "$stranger" | shasum -a 256 | cut -c1-8)"
+printf '%040d%s\n' 0 "$stranger" > "$LK/straddle.txt"
+scan --path "$LK/straddle.txt" --chunk 64
+{ [ "$S_RC" = 1 ] && grep -q "form=shape:$fp_s " "$SINKS/scan2.out"; } && ok "G17i a stranger that straddles a read boundary carries its own fingerprint ($fp_s), not the one of the half the first read saw" || bad "G17i rc=$S_RC want shape:$fp_s: $(head -c 300 "$SINKS/scan2.out")"
+scan --watch-ps "$W/stop-now" --interval -1
+{ [ "$S_RC" = 2 ]; } && ok "G17h a negative --interval is a usage error (exit 2), not a crash in the sampler" || bad "G17h rc=$S_RC: $(head -c 300 "$SINKS/scan2.out")"
+fi
+
+# ═══ G7. AC4: no key leaks, proven with a scanner that is proven to see ═════════════════════════════
+e2e() { # e2e <label> <daemon> <guard>: a switch, a divergence, forced errors, a degradation; then the scan. Sets E_RC, E_OUT, E_WATCH_RC, E_WATCH_OUT
+  local label="$1" dmn="$2" grd="$3" DAEMON_SAVE="$DAEMON" GUARD_SAVE="$GUARD"
+  DAEMON="$dmn"; GUARD="$grd"
+  new_w
+  "$PY3" "$W/mock_api.py" "$INFRA/srv.json" "$SINKS/probes.log" "$INFRA/port" & SRV_PID=$!
+  keys_json | "$PY3" -c '
+import json, sys
+keys = json.load(sys.stdin); ok = json.loads(sys.argv[3]); rej = json.loads(sys.argv[4])
+allowed = {t: {"status": 200, "h": ok} for t in keys.values()}
+a_rej = dict(allowed); a_rej[keys["a@t.test"]] = {"status": 429, "h": rej}
+b_rej = dict(allowed); b_rej[keys["b@t.test"]] = {"status": 429, "h": rej}
+for name, d in (("srv.json", allowed), ("srv.ok.json", allowed), ("srv.a-rej.json", a_rej), ("srv.b-rej.json", b_rej)):
+    json.dump(d, open(sys.argv[1] + "/" + name, "w"))' "$INFRA" "-" "$HDR_OK" "$HDR_REJ"
+  local n=0; while [ ! -s "$INFRA/port" ] && [ $n -lt 100 ]; do sleep 0.1; n=$((n+1)); done
+  rm -f "$W/stop" "$W/ready"
+  # the sampler: every process's argv and environment, every 0.1 s, from before the first run to after the last; only hits are kept
+  keys_json | "$PY3" "$LEAKSCAN" --keys-stdin --watch-ps "$W/stop" --ready-file "$W/ready" --interval 0.1 --watch-max 900 > "$SINKS/watch.out" 2>&1 &
+  WATCH_PID=$!; BG_PIDS="$BG_PIDS $WATCH_PID"
+  n=0; while [ ! -e "$W/ready" ] && [ $n -lt 300 ]; do sleep 0.1; n=$((n+1)); done
+  # 1. a complete account switch through the real daemon: seed a, then a is rejected -> the pool moves to b
+  run_d -- run-once
+  NOW=$((NOW + 600)); cp "$INFRA/srv.a-rej.json" "$INFRA/srv.json"; run_d -- run-once
+  # 2. a pool session launched through the wrapper (its whole environment is recorded)
+  run_wrapper -- -p hello
+  # 3. the guard: healthy pass, then a divergence that gets alerted (the item is tampered to c's key), then fixed
+  hb_touch; gtick 0
+  cp "$INFRA/kc/items/$SVC" "$W/item.b"; put_item "$KEY_c"; gtick 60; gtick 130; gtick 130
+  cp "$W/item.b" "$INFRA/kc/items/$SVC"; gtick 60
+  # 4. forced errors, every path that prints something about a credential
+  cp "$INFRA/srv.b-rej.json" "$INFRA/srv.json"
+  touch "$INFRA/kc/refuse-writes"; NOW=$((NOW + 600)); run_d -- run-once; rm -f "$INFRA/kc/refuse-writes"
+  touch "$INFRA/kc/write-lands-other"; NOW=$((NOW + 600)); run_d -- run-once; rm -f "$INFRA/kc/write-lands-other"
+  : > "$INFRA/vault/.broken"; NOW=$((NOW + 600)); run_d -- run-once; gtick 60; rm -f "$INFRA/vault/.broken"
+  : > "$INFRA/kc/locked"; NOW=$((NOW + 600)); run_d -- run-once; gtick 60; run_wrapper -- -p hello; rm -f "$INFRA/kc/locked"
+  cp "$STATE" "$W/state.good"; printf '{"current": ' > "$STATE"; NOW=$((NOW + 600)); run_d -- run-once; gtick 60; cp "$W/state.good" "$STATE"
+  chmod 555 "$DATA"; NOW=$((NOW + 600)); run_d -- run-once; chmod 755 "$DATA"
+  NOW=$((NOW + 600)); run_d CLAUDE_POOL_ACCOUNTS_LIB="$W/no-such-lib.py" -- run-once
+  printf 1 > "$SINKS/notify.rc"; put_item "$KEY_c"; gtick 60; gtick 130; gtick 130; gtick 400 CLAUDE_POOL_NOTIFY_CMD="$W/no-such-notify"; rm -f "$SINKS/notify.rc"; cp "$W/item.b" "$INFRA/kc/items/$SVC"
+  printf 'garbage' > "$GSTATE"; gtick 60
+  set_mode garbage; set_ver 1.0.1; gtick 60; gtick 2000 CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=1; set_mode ok
+  # 5. a degradation (a claude release that changed the internals), then the daemon and a launch under it
+  set_ver 1.0.2; set_mode renamed; gtick 60
+  NOW=$((NOW + 600)); run_d -- run-once; run_wrapper -- -p hello
+  gtick 60 CLAUDE_POOL_GUARD_FAULT=rename
+  # 6. the end of the sampling window; the scan of everything the product wrote
+  touch "$W/stop"; wait "$WATCH_PID"; E_WATCH_RC=$?; E_WATCH_OUT="$SINKS/watch.out"
+  [ -n "$SRV_PID" ] && { kill "$SRV_PID" 2>/dev/null; SRV_PID=""; }
+  DAEMON="$DAEMON_SAVE"; GUARD="$GUARD_SAVE"
+  E_OUT="$SINKS/scan.out"
+  keys_json | "$PY3" "$LEAKSCAN" --keys-stdin --ps --path "$PROD" --path "$SINKS" > "$E_OUT" 2>&1; E_RC=$?
+}
+
+if want G7; then
+echo "G7. AC4: after a full switch, a degradation and forced errors, no key is anywhere it must not be"
+e2e real "$DAEMON" "$GUARD"
+# the scenario really happened (a scan of a world where nothing ran proves nothing)
+{ [ "$(gj "$STATE" current)" = "b@t.test" ] || [ "$(gj "$STATE" previous)" = "a@t.test" ] || [ "$(gj "$STATE" current)" != "a@t.test" ]; } && ok "G7 the account really switched (decision: $(gj "$STATE" current), previous: $(gj "$STATE" previous))" || bad "G7 the pool never left a: nothing to scan"
+{ [ -s "$marker" ] && [ "$(ncalls)" -ge 3 ] && grep -q "DESLIGADA" "$SINKS/notify.log" && grep -q "diverge" "$SINKS/notify.log"; } && ok "G7a the guard degraded and alerted about a divergence ($(ncalls) notifications were sent)" || bad "G7a marker=$([ -s "$marker" ] && echo yes || echo no) notifications=$(ncalls)"
+{ grep -q "ERROR" "$CITY/.gc/logs/claude-pool-account.log" && ls "$DATA"/current.json.corrupt.* >/dev/null 2>&1 && grep -q "answer\|ARGV" "$SINKS/claude-launch.log"; } && ok "G7b the forced errors happened (daemon ERRORs logged, a corrupt state moved aside, agents launched)" || bad "G7b the error paths did not run: $(grep -c ERROR "$CITY/.gc/logs/claude-pool-account.log" 2>/dev/null) errors"
+if [ "$E_RC" = 0 ] && grep -q "keys=5 " "$E_OUT" && grep -q "control=ok" "$E_OUT"; then ok "G7c ZERO occurrences of any of the 5 keys in argv, env, logs, the decision file, error output, notifications (control ok, 5 keys searched): $(tail -1 "$E_OUT")"; else bad "G7c scan rc=$E_RC: $(head -c 800 "$E_OUT")"; fi
+{ [ "$E_WATCH_RC" = 0 ] && grep -q "control=ok" "$E_WATCH_OUT" && ! grep -q "samples=0" "$E_WATCH_OUT"; } && ok "G7d the process sampler ran during the whole scenario and saw no key in any argv/env: $(tail -1 "$E_WATCH_OUT")" || bad "G7d sampler rc=$E_WATCH_RC: $(head -c 600 "$E_WATCH_OUT")"
+for ch in "$SINKS/notify.log" "$SINKS/kc-argv.log" "$SINKS/claude-env.log" "$CITY/.gc/logs/claude-pool-account.log" "$CITY/.gc/logs/claude-pool-guard.log" "$STATE" "$GSTATE"; do [ -s "$ch" ] || bad "G7e channel is empty, so scanning it proves nothing: ${ch#$W/}"; done; ok "G7e every channel the scan covers had content (nothing was clean because it was empty)"
+
+# the control: the same scan, a key planted on purpose in each kind of place
+echo "G7f. the control: the same scan finds a key planted on purpose"
+cp "$CITY/.gc/logs/claude-pool-account.log" "$W/log.orig"; printf 'planted %s\n' "$KEY_e" >> "$CITY/.gc/logs/claude-pool-account.log"
+scan --ps --path "$PROD" --path "$SINKS"
+{ [ "$S_RC" = 1 ] && grep -q "channel=file location=$CITY/.gc/logs/claude-pool-account.log account=e@t.test (fp $(fp_of "$KEY_e")) form=raw" "$SINKS/scan2.out"; } && ok "G7f a key planted in the daemon log -> exit 1, naming the file, the account (e-mail + fingerprint) and the form" || bad "G7f rc=$S_RC: $(head -c 500 "$SINKS/scan2.out")"
+contains "$SINKS/scan2.out" KEY_e && bad "G7f2 the scanner printed the key it found" || ok "G7f2 ...and its report does not contain the key"
+cp "$W/log.orig" "$CITY/.gc/logs/claude-pool-account.log"
+printf '%s' "$KEY_d" | xxd -p | tr -d '\n' > "$DATA/current.json.corrupt.1"
+scan --path "$PROD"; { [ "$S_RC" = 1 ] && grep -q "account=d@t.test .* form=hex" "$SINKS/scan2.out"; } && ok "G7g the hex of a key left in a leftover state file -> found (form=hex)" || bad "G7g rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$DATA/current.json.corrupt.1"
+cp "$SINKS/notify.log" "$W/notify.orig"; printf 'x%s' "$KEY_c" | base64 >> "$SINKS/notify.log"
+scan --path "$SINKS"; { [ "$S_RC" = 1 ] && grep -q "account=c@t.test .* form=b64" "$SINKS/scan2.out"; } && ok "G7h a key base64-encoded into a sent notification -> found (form=b64)" || bad "G7h rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+cp "$W/notify.orig" "$SINKS/notify.log"
+LEAK_PLANT="$KEY_a" "$PY3" -c 'import time; time.sleep(60)' & P1=$!
+"$PY3" -c 'import time; time.sleep(60)' "$KEY_b" & P2=$!; BG_PIDS="$BG_PIDS $P1 $P2"; sleep 1
+scan --ps; { [ "$S_RC" = 1 ] && grep -q "channel=ps-env location=pid $P1 .* var=LEAK_PLANT account=a@t.test" "$SINKS/scan2.out" && grep -q "channel=ps-argv location=pid $P2 .* account=b@t.test" "$SINKS/scan2.out"; } && ok "G7i a key in a live process's environment and in another's argv -> both found, by pid (and the variable's NAME for the environment one)" || bad "G7i rc=$S_RC: $(head -c 600 "$SINKS/scan2.out")"
+contains "$SINKS/scan2.out" KEY_a || contains "$SINKS/scan2.out" KEY_b && bad "G7i2 the scanner printed a key" || ok "G7i2 ...and printed no key doing it"
+kill "$P1" "$P2" 2>/dev/null; wait "$P1" "$P2" 2>/dev/null
+LEAK_PLANT_X="$KEY_x" "$PY3" -c 'import time; time.sleep(60)' & P3=$!; BG_PIDS="$BG_PIDS $P3"; sleep 1
+scan --ps; { [ "$S_RC" = 0 ] && grep -q "^NOTE channel=ps-env location=pid $P3 .* var=LEAK_PLANT_X form=shape:$FP_x" "$SINKS/scan2.out"; } && ok "G7i3 key-shaped text that is NOT one of the 5 keys, in a process (another service's API key, say) -> a NOTE, not a failed scan" || bad "G7i3 rc=$S_RC: $(head -c 500 "$SINKS/scan2.out")"
+kill "$P3" 2>/dev/null; wait "$P3" 2>/dev/null
+printf 'x %s y\n' "$KEY_x" > "$SINKS/stranger.txt"; scan --path "$SINKS/stranger.txt"
+{ [ "$S_RC" = 1 ] && grep -q "form=shape:$FP_x" "$SINKS/scan2.out"; } && ok "G7i4 the same stranger in a FILE the product wrote -> a finding (exit 1)" || bad "G7i4 rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$SINKS/stranger.txt"
+scan --ps --path "$PROD" --path "$SINKS"; [ "$S_RC" = 0 ] && ok "G7j with the plants removed the same scan is clean again (the findings were the plants)" || bad "G7j rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+# a scanner that cannot see is not a green scan
+echo "G7k. a scan that cannot look is reported as blind, not clean"
+scan --path "$W/does-not-exist"; { [ "$S_RC" = 3 ] && grep -q "BLIND" "$SINKS/scan2.out"; } && ok "G7k a path that does not exist -> exit 3 (blind), not 0" || bad "G7k rc=$S_RC"
+printf '{"a@t.test":"short"}' | "$PY3" "$LEAKSCAN" --keys-stdin --path "$PROD" > "$SINKS/scan2.out" 2>&1; S_RC=$?
+[ "$S_RC" = 3 ] && ok "G7l a key too short to search for -> exit 3, not a clean result" || bad "G7l rc=$S_RC"
+
+# the mutations: a daemon that leaks, and a guard that leaks, must FAIL the same scenario
+echo "G7m. mutations: a daemon and a guard that deliberately leak a key must fail the scan"
+mkdir -p "$W/mut"
+"$PY3" - "$DAEMON" "$W/mut/claude-pool-account.py" "$GUARD" "$W/mut/claude-pool-guard.py" <<'EOF'
+import sys
+src = open(sys.argv[1]).read()
+anchor = "def write_item(user: str, token: str) -> bool:\n"
+assert anchor in src, "mutation anchor missing in the daemon"
+src = src.replace(anchor, anchor + '    subprocess.run(["security", "find-generic-password", "-a", user, "-s", item_service(), "-j", token], capture_output=True)   # MUTATION: key in argv\n', 1)
+open(sys.argv[2], "w").write(src)
+g = open(sys.argv[3]).read()
+anchor = "    for text in (title, msg):\n"
+assert anchor in g, "mutation anchor missing in the guard"
+leak = ('    try:\n'
+        '        msg = msg + " " + subprocess.run(["security", "find-generic-password", "-a", "athos", "-s", D.item_service(), "-w"], capture_output=True, text=True).stdout.strip()   # MUTATION: the pool credential in the notification\n'
+        '    except Exception:\n        pass\n'
+        '    for text in ():   # MUTATION: and the refusal switched off\n')
+g = g.replace(anchor, leak, 1)
+open(sys.argv[4], "w").write(g)
+EOF
+cp "$DAEMON" "$W/mut/real-daemon.py"
+e2e leaky-daemon "$W/mut/claude-pool-account.py" "$GUARD"
+{ [ "$E_RC" = 1 ] && grep -q "kc-argv.log" "$E_OUT"; } && ok "G7m a daemon that puts the key in security's argv -> the scan FAILS (exit 1), naming kc-argv.log" || bad "G7m leaky daemon not caught: rc=$E_RC $(head -c 400 "$E_OUT")"
+e2e leaky-guard "$DAEMON" "$W/mut/claude-pool-guard.py"
+{ [ "$E_RC" = 1 ] && grep -q "notify.log" "$E_OUT"; } && ok "G7n a guard that puts the key in the push notification -> the scan FAILS (exit 1), naming notify.log" || bad "G7n leaky guard not caught: rc=$E_RC $(head -c 400 "$E_OUT")"
 fi
 
 echo

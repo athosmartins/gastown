@@ -57,12 +57,11 @@ Mayor 04/10 (comment on the bead) overrides the original wording: **no utilizati
 the limit is actually hit) and **no confirmation probe on failback** (go back at the stored reset time; if it has not
 really renewed, its 429 sends the pool to the next account again).
 
-## The guard — divergence alert, per-version test and the daemon's liveness (ga-8hcnvb.3)
+## The guard — divergence alert, per-version test, the daemon's liveness and no key leaks (ga-8hcnvb.3)
 
 `claude-pool-guard.py` (launchd, every 60 s, single instance, its own plist) is what makes the silent failures of the switch loud.
 It writes **none** of the pool's credentials and corrects nothing; it looks, records, alerts, and — for one case — turns the
-mechanism off. (Delivered in slices: the divergence alert and the liveness watch are ga-8hcnvb.3.1, the per-version test and the
-degradation are ga-8hcnvb.3.2; the proof that no key leaks is the last one.)
+mechanism off.
 
 ```
  claude-pool-guard.py run-once
@@ -156,6 +155,28 @@ State: `/Users/athos/shared/data/claude_pool_guard.json` (`versions`, `divergenc
 Only the guard writes it and only the guard removes it, and only if `by` says so: a marker someone else put there is left alone (the log
 says so). To turn the mechanism off by hand use `no-pool-account` (below), not this file.
 
+**No key leaks, and the proof.** `claude-pool-leakscan.py` takes the 5 keys (from the vault, or on stdin) and searches for each of them —
+raw, hex, base64 — in process argv and environment (`ps -Eaxww`), in logs, the decision file, the guard's state, error output and sent
+notifications. It reports a finding as channel + location + account (e-mail + fingerprint) + form, never the surrounding text and never the
+key. Its **control** runs first, always: it plants a random fake key on every channel it is about to scan (a file, one straddling a read
+boundary, a process argv, a process environment) and refuses to call anything clean if it cannot see it (exit 3, "blind"). The selftest
+`claude-pool-guard.selftest.sh` (G7) drives a full account switch, a divergence, a degradation and a dozen forced errors under a ps sampler
+(10 Hz), then scans everything and finds zero; it finds a key planted on purpose in each kind of place (the control); and it makes
+a daemon that puts the key in `security`'s argv and a guard that puts it in the push **fail** the same scenario (the mutations).
+Run it against the real thing (keys read from the vault into memory only, nothing printed):
+`claude-pool-leakscan.py --keys-vault --ps --path <city>/.gc/logs --path /Users/athos/shared/data`.
+
+A scan never skips a symlink in silence (G15): a link to a **file** is read through (a finding carries the link's name); a link to a
+**directory** is not followed - it is *covered* when that directory lies inside another `--path` (the real `shared/data/data ->
+shared/data` is covered by `shared/data` itself, and cannot loop) and is **BLIND** (exit 3, naming the link and the `--path` to add) when
+it does not; a dangling link is BLIND. A `--path` that is itself a link is read through the same way.
+
+Nothing else is skipped in silence either (G17). Anything that cannot be stat'ed or opened is **BLIND** on its own line (the rest of the
+tree is still read, and a key found elsewhere still wins: exit 1); so is a FIFO, socket or device (opening a FIFO waits for a writer for
+ever) - none of the real scan roots holds one. A `--watch-ps` window that ends at `--watch-max` instead of at the stop file is BLIND (the
+scenario may have run past it); one that the stop file ended is clean. Whatever else goes wrong inside the scan ends `BLIND ... (<ErrorType>)`,
+exit 3: exit 1 means "a key was found" and nothing else.
+
 ## Activation — merged is not live
 
 The script path in the plist only exists after the merge. After the gate merges, **someone loads the plist**:
@@ -207,10 +228,11 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-lowprio.sh` | wrapper: points a pool launch at the item (fail-open) |
 | `packs/town-deltas/assets/claude-pool-account.plist` | launchd job, not loaded by the merge |
 | `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API, real accounts lib); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from; it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`) |
-| `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session |
+| `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session (+ the guard's real-claude self-test and the leakscan control) |
 | `packs/town-deltas/assets/scripts/claude-pool-guard.py` | the guard (`run-once` / `status [--json]` / `selftest`) |
 | `packs/town-deltas/assets/claude-pool-guard.plist` | the guard's launchd job, not loaded by the merge |
-| `packs/town-deltas/assets/scripts/claude-pool-guard.selftest.sh` | hermetic tests of the guard (G1–G14, G16: divergence, per-version test, scratch item, liveness, `status`, stand-down vs. death, one title per condition, marker that cannot be written / is not the guard's, `selftest` output, the quiet notice vs. notify's router) |
+| `packs/town-deltas/assets/scripts/claude-pool-guard.selftest.sh` | hermetic tests of the guard (G1–G17: divergence, per-version test, scratch item, liveness, `status`, stand-down vs. death, one title per condition, marker that cannot be written / is not the guard's, `selftest` output, the quiet notice vs. notify's router, leakscan symlinks / unreadable paths / FIFOs / the watch deadline, and the no-leak proof with control and mutations) |
+| `packs/town-deltas/assets/scripts/claude-pool-leakscan.py` | the key-leak scanner (with its control); also usable by hand |
 | `/Users/athos/shared/data/claude_pool_guard.json` | the guard's state: per-version results, open episodes |
 | `.gc/claude-pool-account.heartbeat`, `.gc/pool-account-degraded` | the daemon's last clean run; the guard's "auto-switch is off" marker |
 | `.gc/logs/claude-pool-guard.log` | guard events (`SELFTEST claude=… result=…`, `DEGRADED`, `divergence seen/over`, `alert sent`) |
