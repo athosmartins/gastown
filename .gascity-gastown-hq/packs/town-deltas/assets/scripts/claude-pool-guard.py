@@ -43,6 +43,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import secrets
@@ -63,6 +64,7 @@ HEARTBEAT_STALE_S = 600          # the daemon runs every 60 s: 10 min without a 
 LIVENESS_GAP_S = 300             # two looks at the daemon further apart than this: the guard was not looking in between (asleep, unloaded, off, stood down)
 SELFTEST_RETRY_S = 1800          # while degraded: try the self-test again this often
 INCONCLUSIVE_RETRY_S = 300       # an inconclusive self-test is repeated this often
+NOTICE_GIVEUP_S = 1800           # the quiet 'auto-switch is back ON' notice is retried for this long if notify keeps refusing it, then dropped
 FP_RE = re.compile(r"[0-9a-f]{8}")
 VERSION_RE = re.compile(r"\d+\.\d+\.\d+[0-9A-Za-z.+-]*")
 SCRATCH_NAME = "claude-pool-guard-scratch"
@@ -150,7 +152,9 @@ def _dict(gs: dict, key: str) -> dict:
 
 
 def _num(v) -> Optional[float]:
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    """A time or a duration read from a file. Missing, not a number, NaN or +-infinity (json.loads accepts NaN and Infinity; the arithmetic on
+    them raises or never compares true) -> None, which every caller reads as 'no usable value' (never as 0, never as a time)."""
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
 
 
 # ── alerts ─────────────────────────────────────────────────────────────────────────────────────────
@@ -167,7 +171,11 @@ def send_alert(title: str, msg: str, prio: int = 4, force: bool = True, secrets_
     leaves the episode un-alerted and the next tick tries again. The text is refused if anything token-shaped (or a credential the
     guard holds) is in it.
     rc 11 means notify dropped it because a push with the same TITLE went out in the last 30 min (whatever the body says): it is counted
-    as delivered here, so two different conditions must never share a title - what makes a condition different goes IN the title."""
+    as delivered here, so two different conditions must never share a title - what makes a condition different goes IN the title.
+    rc 12 is notify's digest route (a row goes to its history, nothing to the phone). For a quiet notice (force=False) the digest is where
+    it is meant to go, so 12 is delivered; for a FORCED alert it is not: notify's router and its policy pass a forced push straight through
+    (classify_route_detail -> "push forced", athos_policy_wa_hlyupm leaves it alone), so the digest legs are never reached and the only
+    12 left is the per-source / global rate cap - nothing reached the phone: not delivered, retried."""
     for text in (title, msg):
         if "sk-ant-" in text or any(s and s in text for s in secrets_in_memory):
             glog("ERROR", "alert REFUSED: it contained token-shaped text (a bug); nothing was sent")
@@ -182,8 +190,8 @@ def send_alert(title: str, msg: str, prio: int = 4, force: bool = True, secrets_
     except (OSError, subprocess.SubprocessError) as e:
         glog("ERROR", f"notify could not run ({type(e).__name__}): alert '{title}' NOT sent, will retry")
         return False
-    if r.returncode in (0, 10, 11):
-        glog("INFO", f"alert sent: {title} (notify rc={r.returncode})")
+    if r.returncode in (0, 10, 11) or (r.returncode == 12 and not force):
+        glog("INFO", f"alert sent: {title} (notify rc={r.returncode})" + (" - filed in the digest, as a quiet notice is meant to be" if r.returncode == 12 else ""))
         return True
     glog("ERROR", f"notify rc={r.returncode}: alert '{title}' NOT delivered, will retry")
     return False
@@ -461,7 +469,7 @@ def selftest_once(binary: str, user: str) -> Tuple[str, str]:
     """('pass'|'fail'|'inconclusive', detail). Scratch item only: the pool item, the plain login item, ~/.claude are never read or written."""
     scratch = scratch_dir()
     home = Path.home()
-    if not scratch.name.startswith(SCRATCH_NAME) or scratch.is_symlink() or scratch in (Path("/"), home) or not scratch.is_absolute():
+    if not scratch.name.startswith(SCRATCH_NAME) or _probe(Path.is_symlink, scratch) is not False or scratch in (Path("/"), home) or not scratch.is_absolute():
         return "inconclusive", "refusing a scratch directory that is not a dedicated one"
     secdir = str(scratch / "cred")
     svc = scratch_svc(secdir)
@@ -506,8 +514,8 @@ def selftest_once(binary: str, user: str) -> Tuple[str, str]:
     finally:
         if not kc_del(user, svc):
             glog("WARN", f"the scratch item {svc} could not be removed after the self-test (it holds a fake credential; the next run clears it)")
-        if scratch.name.startswith(SCRATCH_NAME) and not scratch.is_symlink() and scratch not in (Path("/"), home):
-            shutil.rmtree(str(scratch), ignore_errors=True)
+        if scratch.name.startswith(SCRATCH_NAME) and _probe(Path.is_symlink, scratch) is False and scratch not in (Path("/"), home):
+            shutil.rmtree(str(scratch), ignore_errors=True)      # a link, or a path that cannot be told, is not removed
 
 
 def run_selftest(binary: str, user: str) -> Tuple[str, str, int]:
@@ -535,13 +543,22 @@ def marker_path() -> Optional[Path]:
 def marker_is_ours(p: Path) -> bool:
     try:
         return json.loads(p.read_text()).get("by") == "claude-pool-guard"
-    except (OSError, ValueError, AttributeError):
-        return False
+    except (OSError, ValueError, AttributeError, RecursionError):
+        return False         # cannot be read -> not ours: it is left alone, never removed
+
+
+def _probe(f, p: Path) -> Optional[bool]:
+    """f(p) for a Path predicate (is_dir, is_symlink, exists), or None when it cannot be told: on Python 3.9 they raise PermissionError for
+    anything but 'not there', and a traceback is no answer. Callers choose what 'cannot tell' means - always the side that changes nothing."""
+    try:
+        return bool(f(p))
+    except OSError:
+        return None
 
 
 def write_marker(version: str, detail: str, t: float) -> bool:
     p = marker_path()
-    if p is None or not p.parent.is_dir():
+    if p is None or _probe(Path.is_dir, p.parent) is not True:
         glog("ERROR", "no <city>/.gc to hold the degraded marker - cannot degrade (the pool keeps following the item)")
         return False
     tmp = p.with_name(p.name + f".tmp.{os.getpid()}")
@@ -565,6 +582,10 @@ def check_selftest(gs: dict, t: float, user: str, force: bool = False) -> dict:
         blind(gs, t, "claude-version", "`claude --version` gave no version")
         return {"ran": False, "why": "`claude --version` gave no version"}
     unblind(gs, "claude-version")
+    b = gs.get("blind")
+    for what in [w for w in (b if isinstance(b, dict) else {}) if w.startswith("self-test of claude ") and w != f"self-test of claude {ver}"]:
+        b.pop(what, None)        # the installed claude moved on: nobody will ever answer for that version, and the record would stay for ever
+        glog("INFO", f"{what}: claude is {ver} now - that 'cannot verify' record is dropped")
     gs["claude"] = {"version": ver, "binary": binary}
     versions = _dict(gs, "versions")
     rec = versions.get(ver) if isinstance(versions.get(ver), dict) else None
@@ -592,7 +613,11 @@ def apply_result(gs: dict, t: float, ver: str, res: str, detail: str) -> str:
     'off' (the marker was written now) | 'still-off' (the marker was already there) | 'unwritten' (the test failed and the marker CANNOT be written:
     auto-switch is still ON) | 'foreign' (the test passed but a marker this guard did not write keeps it OFF) | 'lift-failed' | 'unchanged' (inconclusive)."""
     m = marker_path()
-    present = bool(m and m.exists())
+    present = _probe(Path.exists, m) if m else False      # vazio → no marker; falhou/ilegível → None: whether auto-switch is OFF cannot be told
+    if present is None:
+        blind(gs, t, "degraded-marker", "the marker's presence cannot be told (stat failed)")
+        return "unchanged"
+    unblind(gs, "degraded-marker")
     deg = gs.get("degraded") if isinstance(gs.get("degraded"), dict) else None
     if res in ("pass", "fail"):
         unblind(gs, f"self-test of claude {ver}")
@@ -639,11 +664,22 @@ def apply_result(gs: dict, t: float, ver: str, res: str, detail: str) -> str:
         elif present:
             # Someone else's marker keeps the mechanism off: it is not the guard's to lift and it is not "back on" - so nothing is announced
             # and the record of the degradation stays until the marker is really gone.
-            glog("WARN", f"the degraded marker {m} was not written by this guard (or cannot be read to tell) - left alone (auto-switch stays OFF)")
+            if not gs.get("foreign_marker_noted"):      # said once per stretch, not on every tick of it
+                gs["foreign_marker_noted"] = True
+                glog("WARN", f"the degraded marker {m} was not written by this guard (or cannot be read to tell) - left alone (auto-switch stays OFF)")
             return "foreign"
+        gs.pop("foreign_marker_noted", None)
         if deg:
+            # A quiet notice (priority 2, not forced): notify files it in the digest (exit 12), which send_alert counts as delivered. If notify
+            # refuses it any other way it is tried again, for NOTICE_GIVEUP_S at most - an episode that cannot close would repeat it every minute.
+            since = _num(deg.get("notice_since"))
+            if since is None:
+                since = deg["notice_since"] = t
             if send_alert(f"Pool Claude: troca automática religada (claude {ver})",
                           f"O teste do claude {ver} passou de novo: agentes novos voltam a seguir a conta do pool.", 2, False):
+                gs["degraded"] = None
+            elif t - since >= NOTICE_GIVEUP_S:
+                glog("WARN", f"gave up announcing that auto-switch is back ON (claude {ver}): notify refused the notice for {int((t - since) // 60)} min. The degraded marker is gone")
                 gs["degraded"] = None
         return effect
     if res == "inconclusive":
@@ -731,6 +767,7 @@ SELFTEST_EFFECT = {
     "unwritten": "auto-switch is NOT off: the test failed but the degraded marker could not be written (see the guard log); it is still ON",
     "foreign": "auto-switch stays OFF: a degraded marker this guard did not write is up, and it is left alone",
     "lift-failed": "auto-switch stays OFF: the degraded marker could not be removed (see the guard log)",
+    "unchanged": "nothing was changed: whether the degraded marker is up cannot be told (see the guard log)",
 }
 
 
@@ -758,7 +795,7 @@ def run_once(force_selftest: bool = False) -> int:
     if off:
         return not_run(f"disabled by {off} - nothing done", 0)
     c = D.city()
-    lp = c / ".gc" / "claude-pool-guard.lock" if c and (c / ".gc").is_dir() else None
+    lp = c / ".gc" / "claude-pool-guard.lock" if c and _probe(Path.is_dir, c / ".gc") else None
     if lp is None:
         return not_run("no usable GC_CITY_PATH/.gc - cannot take the single-instance lock, refusing to run unlocked", 1)
     try:

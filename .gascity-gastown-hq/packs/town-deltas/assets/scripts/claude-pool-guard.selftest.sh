@@ -23,8 +23,15 @@
 #   G14    `selftest` says what it did: rc 0 pass / 3 fail / 4 inconclusive / 1 NOT run (lock held, kill switch, no claude).
 #   G15    leakscan and symlinks: a link to a file is read through, a link to a directory is covered by another --path or BLIND,
 #          a dangling one is BLIND - never skipped in silence.
+#   G16    the quiet 'troca automática religada' notice: notify's router files it in the digest (rc 12) and that counts as delivered (sent
+#          once, the episode closes); a FORCED push that meets the cap (rc 12) is retried until it goes out; a notice notify keeps
+#          refusing is given up on after 30 min, said in the log; a blind record of a superseded claude version is dropped.
+#   G17    leakscan exit 1 means 'a key was found' and nothing else: the --watch-max deadline, an unreadable directory or path, a FIFO,
+#          an error nobody planned for are BLIND (3); a bad --interval is a usage error (2); a stop file in time is a clean end (0);
+#          a stranger straddling two chunks is still fingerprinted.
 #
-# HERMETIC: fake `security` (items in a temp dir), fake `claude` (several behaviours), fake `secret` vault, fake `notify`, a mock probe
+# HERMETIC: fake `security` (items in a temp dir), fake `claude` (several behaviours), fake `secret` vault, fake `notify` (it models the
+# router and the push cap: a quiet send gets rc 12 like the real one), a mock probe
 # API, and a clock the test moves (CLAUDE_POOL_NOW). Nothing here touches the real Keychain, vault, network or phone.
 # The product under test can be swapped for an older copy: CLAUDE_POOL_GUARD / _DAEMON / _WRAPPER / _LEAKSCAN (see 'previous HEAD' in the doc).
 set -uo pipefail
@@ -116,6 +123,11 @@ cat > "$BB/notify" <<'EOF'
 #!/bin/bash
 { printf 'CALL force=%s strict=%s argv:' "${NOTIFY_FORCE_PUSH:-}" "${NOTIFY_STRICT_EXIT:-}"; for a in "$@"; do printf ' [%s]' "$a"; done; echo; } >> "$FAKE_SINKS/notify.log"
 [ -f "$FAKE_SINKS/notify.rc" ] && exit "$(cat "$FAKE_SINKS/notify.rc")"
+# The router, as the real notify has it under NOTIFY_STRICT_EXIT=1 (gate ga-rtps35: this fake used to answer 0 to everything, so a quiet notice
+# that the real notify sends to the digest - exit 12 - looked delivered): a call that is NOT forced (NOTIFY_FORCE_PUSH=1) from a source that is
+# not on its allowlist goes to the muted digest: exit 12, a row in its history, nothing on the phone. notify.cap switches on the rate cap, which
+# answers 12 to a FORCED push too (nothing on the phone either).
+if [ "${NOTIFY_STRICT_EXIT:-}" = 1 ] && { [ "${NOTIFY_FORCE_PUSH:-}" != 1 ] || [ -e "$FAKE_SINKS/notify.cap" ]; }; then exit 12; fi
 # notify.titledup switches on what the real notify does (title_pushed_recently): a push whose TITLE went out in the last 30 min is dropped,
 # whatever its body - exit 11, nothing reaches the phone. The clock is the test's (the guard hands notify its CLAUDE_POOL_NOW).
 if [ -e "$FAKE_SINKS/notify.titledup" ]; then
@@ -402,6 +414,9 @@ cp "$STATE" "$W/state.before"; run_d -- run-once
 set_ver 1.0.3; set_mode ok; gtick 60
 { [ "$(gv 1.0.3 result)" = pass ] && [ ! -e "$marker" ] && [ "$(ncalls)" = 2 ]; } && ok "G5q a claude that passes again -> marker removed, auto-switch back ON" || bad "G5q result='$(gv 1.0.3 result)' marker=$([ -e "$marker" ] && echo yes || echo no) calls=$(ncalls)"
 c="$(call_n 2)"; { [[ "$c" == *"religada"* ]] && [[ "$c" == *"[-p] [2]"* ]] && [[ "$c" != "CALL force=1 "* ]]; } && ok "G5r ...announced quietly (priority 2, not forced)" || bad "G5r: $c"
+# the real notify answers a quiet notice with 12 (the digest): that is where it was meant to go, so the episode closes and the notice is not sent again
+n_q=$(ncalls); gtick 60; gtick 60; gtick 60
+{ [ "$(gj "$GSTATE" degraded)" = "<none>" ] && [ "$(ncalls)" = "$n_q" ] && [ "$(ndelivered)" = 1 ]; } && ok "G5r2 ...notify's router sends it to the digest (exit 12): the episode is closed, it is not repeated every minute, and only the forced 'OFF' push reached the phone" || bad "G5r2 degraded=$(gj "$GSTATE" degraded) calls $n_q -> $(ncalls) delivered=$(ndelivered)"
 run_wrapper -- -p hello; [ "$(cat "$LAST")" = "answer: ok (pool item)" ] && ok "G5s ...and a new launch follows the pool item again" || bad "G5s: $(cat "$LAST")"
 kill "$SESSION_PID" 2>/dev/null
 # same version, fixed later: retried every 30 min
@@ -486,6 +501,10 @@ hb_case no-epoch     'printf "{\"updated\": \"x\", \"pid\": 1}" > "$hbf"'
 hb_case non-object   'printf "[1, 2, 3]" > "$hbf"'
 hb_case future       'printf "{\"epoch\": %s, \"updated\": \"stuck clock\", \"pid\": 1}" "$((NOW + 100000))" > "$hbf"'
 hb_case a-directory  'mkdir "$hbf"'
+# a time that is not a finite number is not a time (json.loads takes NaN and Infinity; the day-count arithmetic on them raises)
+hb_case nan          'printf "{\"epoch\": NaN, \"pid\": 1}" > "$hbf"'
+hb_case minus-inf    'printf "{\"epoch\": -Infinity, \"pid\": 1}" > "$hbf"'
+hb_case plus-inf     'printf "{\"epoch\": Infinity, \"pid\": 1}" > "$hbf"'
 # ...and when it can be read again the blindness ends by itself, and a real silence is judged on the real time
 new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; printf 'garbage' > "$CITY/.gc/claude-pool-account.heartbeat"; gtick 60
 grep -q "cannot verify daemon-heartbeat" "$CITY/.gc/logs/claude-pool-guard.log" && [ "$(gj "$GSTATE" blind/daemon-heartbeat/why | grep -c 'cannot be read')" = 1 ] && ok "G6j the guard records that it cannot read the heartbeat (state + log)" || bad "G6j nothing recorded: $(gl | tail -3)"
@@ -637,6 +656,7 @@ set_ver 1.0.3; set_mode ok; gtick 60
 { [ -s "$marker" ] && [ "$(ncalls)" = 1 ] && [ "$(gj "$GSTATE" degraded/version)" = "1.0.2" ]; } && ok "G13 the test passes, the foreign marker stays, and NO 'religada' goes out (calls=$(ncalls)); the guard still knows it had degraded" || bad "G13 marker=$([ -s "$marker" ] && echo yes || echo no) calls=$(ncalls) degraded=$(gj "$GSTATE" degraded/version): $(call_n 2 | cut -c1-160)"
 gl | grep -q "not written by this guard" && ok "G13a ...and the log says why" || bad "G13a no explanation in the log"
 gtick 60; gtick 60; [ "$(ncalls)" = 1 ] && ok "G13b the next ticks do not announce it either" || bad "G13b calls=$(ncalls)"
+[ "$(gl | grep -c "not written by this guard")" = 1 ] && ok "G13b2 ...and 'left alone' is said once, not on every tick of the next hours" || bad "G13b2 said $(gl | grep -c "not written by this guard") times"
 rm -f "$marker"; gtick 60
 { [ "$(ncalls)" = 2 ] && [[ "$(call_n 2)" == *"religada"* ]] && [ "$(gj "$GSTATE" degraded)" = "<none>" ]; } && ok "G13c when the foreign marker is gone, THEN 'religada' goes out and the record closes" || bad "G13c calls=$(ncalls) degraded=$(gj "$GSTATE" degraded): $(call_n 2 | cut -c1-160)"
 fi
@@ -695,6 +715,96 @@ scan --path "$LK/top-link"
 : > "$W/stop-now"
 scan --watch-ps "$W/stop-now" --path "$LK/outside/secret.txt"
 { [ "$S_RC" = 2 ] && grep -q -- "--watch-ps" "$SINKS/scan2.out" && ! grep -q "^SUMMARY" "$SINKS/scan2.out"; } && ok "G15g --watch-ps with --path is refused (exit 2, says why), not answered 'clean' for files it never read" || bad "G15g rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+fi
+
+# ═══ G16. the quiet notice follows notify's router; a record of a superseded version goes ═══════════
+if want G16; then
+echo "G16. 'religada' is accepted where notify's router sends it (digest, 12) and not retried for ever; a forced push the router did not take IS retried; a blind record of a version that is gone is dropped"
+# gate ga-rtps35 B1: the real notify answers the unforced notice with 12. The episode used to stay open and the notice went out every minute for ever.
+new_w; active_world; set_ver 1.0.2; set_mode renamed; gtick 60
+set_ver 1.0.3; set_mode ok; gtick 60; n1=$(ncalls)
+for _i in 1 2 3 4 5 6 7 8 9 10; do gtick 60; done
+{ [ "$n1" = 2 ] && [ "$(ncalls)" = 2 ] && [ "$(gj "$GSTATE" degraded)" = "<none>" ] && [[ "$(call_n 2)" == *"religada"* ]] && [[ "$(call_n 2)" == *"strict=1"* ]]; } && ok "G16 B1: the notice is sent ONCE (exit 12 = the digest, where a quiet notice is meant to go), the episode closes, 10 ticks later no repeat" || bad "G16 calls $n1 -> $(ncalls) degraded=$(gj "$GSTATE" degraded)"
+# the same exit 12 on a FORCED push is the rate cap: nothing reached the phone, so it is NOT delivered and is tried again
+new_w; active_world; : > "$SINKS/notify.cap"; set_ver 1.0.2; set_mode renamed; gtick 60; gtick 60; gtick 60; n_cap=$(ncalls)
+rm -f "$SINKS/notify.cap"; gtick 60; n_after=$(ncalls); gtick 60; gtick 60
+{ [ "$n_cap" = 3 ] && [ "$n_after" = 4 ] && [ "$(ncalls)" = 4 ] && [ "$(ndelivered)" = 1 ] && [[ "$(call_n 4)" == *"DESLIGADA"* ]]; } && ok "G16a a FORCED 'auto-switch OFF' that meets the rate cap (12) is retried every tick until it goes out, then not again" || bad "G16a calls under the cap=$n_cap, after=$n_after, end=$(ncalls), delivered=$(ndelivered)"
+# a notice notify will not take (any other exit): tried for a while, then given up with a line in the log - never for ever
+new_w; active_world; set_ver 1.0.2; set_mode renamed; gtick 60
+set_ver 1.0.3; set_mode ok; printf 14 > "$SINKS/notify.rc"; gtick 60; gtick 600; n_a=$(ncalls); d_a=$(gj "$GSTATE" degraded)
+gtick 600; gtick 600; gtick 600; n_b=$(ncalls); d_b=$(gj "$GSTATE" degraded); gtick 600; gtick 600; n_c=$(ncalls)
+{ [ "$n_a" = 3 ] && [ "$d_a" != "<none>" ] && [ "$d_b" = "<none>" ] && [ "$n_c" = "$n_b" ]; } && ok "G16b a notice notify keeps refusing: retried for 30 min, then the record is closed and it stops (calls $n_a -> $n_b -> $n_c)" || bad "G16b calls $n_a/$n_b/$n_c degraded $d_a / $d_b"
+gl | grep -q "gave up announcing" && ok "G16c ...and the log says it gave up" || bad "G16c no 'gave up' line: $(gl | tail -3)"
+# B-low: the blind record of a self-test of a claude that is no longer the installed one is dropped, not kept for ever
+new_w; active_world; set_ver 1.0.0; set_mode hang
+for _i in 1 2 3 4 5 6 7; do gtick 300 CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=1; done
+b_before="$(gj "$GSTATE" "blind/self-test of claude 1.0.0")"
+set_ver 1.0.1; set_mode ok; gtick 60
+{ [ "$b_before" != "<none>" ] && [ "$(gj "$GSTATE" "blind/self-test of claude 1.0.0")" = "<none>" ] && [ "$(gv 1.0.1 result)" = pass ]; } && ok "G16d a claude update drops the 'cannot verify' record of the old version (it would otherwise stay in the state and in 'status' for ever)" || bad "G16d before=$b_before after=$(gj "$GSTATE" blind) 1.0.1=$(gv 1.0.1 result)"
+# whether the marker is up cannot be told (on Python 3.9 Path.exists raises PermissionError): a traceback is no answer, and neither is 'no marker'
+new_w; active_world; base=(); while IFS= read -r l; do base+=("$l"); done < <(BASE_ENV)
+env -i "${base[@]}" "$PY3" -I -c '
+import importlib.util, pathlib, sys
+sp = importlib.util.spec_from_file_location("g", sys.argv[1]); g = importlib.util.module_from_spec(sp); sp.loader.exec_module(g)
+g.D = g.load_daemon(); real = pathlib.Path.exists
+def exists(self):
+    if self.name == g.D.DEGRADED_MARKER: raise PermissionError(13, "selftest")
+    return real(self)
+pathlib.Path.exists = exists
+gs = {}; print(g.apply_result(gs, g.D.now(), "1.0.3", "pass", ""), sorted(gs.get("blind", {})), gs.get("degraded"))' "$GUARD" > "$SINKS/inproc.out" 2>&1
+{ [ "$(cat "$SINKS/inproc.out")" = "unchanged ['degraded-marker'] None" ] && [ "$(ncalls)" = 0 ]; } && ok "G16e a marker whose presence cannot be told: nothing changed, nothing announced ('religada' needs a marker known to be gone), the guard records that it is blind" || bad "G16e: $(head -c 300 "$SINKS/inproc.out")"
+fi
+
+# ═══ G17. leakscan: 'could not look' is exit 3 ═══════════════════════════════════════════════════════
+if want G17; then
+echo "G17. leakscan: what could not be looked at ends BLIND (3) - never as 'a key was found' (1), never as a clean end (0), never hangs"
+new_w; LK="$W/lk17"; rm -rf "$LK"; mkdir -p "$LK/tree/sub"; printf 'clean\n' > "$LK/tree/a.txt"
+# B2a: the sampling window ended by --watch-max, not by the stop file: the scenario may have run past it
+rm -f "$W/never-stop"
+scan --watch-ps "$W/never-stop" --interval 0.1 --watch-max 1
+{ [ "$S_RC" = 3 ] && grep -q "^BLIND .*--watch-max" "$SINKS/scan2.out" && grep -q "^SUMMARY .*blind=1" "$SINKS/scan2.out"; } && ok "G17 B2a: --watch-ps that ran out at --watch-max without the stop file is BLIND (exit 3, says so), not a clean end" || bad "G17 B2a rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$W/stop-late"; ( sleep 1; : > "$W/stop-late" ) & BG_PIDS="$BG_PIDS $!"
+scan --watch-ps "$W/stop-late" --interval 0.1 --watch-max 30
+{ [ "$S_RC" = 0 ] && ! grep -q "^BLIND" "$SINKS/scan2.out"; } && ok "G17a ...a stop file that appears in time still ends it clean (exit 0)" || bad "G17a rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+: > "$W/stop-now"; scan --watch-ps "$W/stop-now" --interval 0.1 --watch-max 1
+{ [ "$S_RC" = 0 ] && ! grep -q "^BLIND" "$SINKS/scan2.out"; } && ok "G17b ...and so does one that was there from the start" || bad "G17b rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+# B2b: a stat that fails (Python 3.9's Path.is_dir/is_symlink raise PermissionError) was a traceback and exit 1 - the code for 'a key was found'
+if [ "$(id -u)" != 0 ]; then
+  mkdir -p "$LK/tree/noexec" "$LK/locked"; printf 'x\n' > "$LK/tree/noexec/f.txt"; printf 'x\n' > "$LK/locked/f.txt"
+  chmod 644 "$LK/tree/noexec"; scan --path "$LK/tree"; rc1=$S_RC; out1="$(cat "$SINKS/scan2.out")"
+  { [ "$rc1" = 3 ] && [[ "$out1" == *"BLIND $LK/tree/noexec/f.txt"* ]] && [[ "$out1" != *Traceback* ]]; } && ok "G17c B2b: a directory that lists but cannot be entered -> BLIND naming the file (exit 3), no traceback, not 'a key was found'" || bad "G17c rc=$rc1: $(printf '%s' "$out1" | head -c 400)"
+  printf 'x %s y\n' "$KEY_c" > "$LK/tree/sub/leak.txt"; scan --path "$LK/tree"; rc1=$S_RC; out1="$(cat "$SINKS/scan2.out")"; chmod 755 "$LK/tree/noexec"; rm -f "$LK/tree/sub/leak.txt"
+  { [ "$rc1" = 1 ] && [[ "$out1" == *"location=$LK/tree/sub/leak.txt account=c@t.test"* ]] && [[ "$out1" == *"BLIND $LK/tree/noexec/f.txt"* ]]; } && ok "G17c2 ...and what could not be entered does not stop the rest of the tree from being read: a key elsewhere is still found (exit 1 wins over 3)" || bad "G17c2 rc=$rc1: $(printf '%s' "$out1" | head -c 400)"
+  chmod 000 "$LK/locked"; scan --path "$LK/locked/f.txt"; rc2=$S_RC; out2="$(cat "$SINKS/scan2.out")"; chmod 755 "$LK/locked"
+  { [ "$rc2" = 3 ] && [[ "$out2" == *"BLIND $LK/locked/f.txt"* ]] && [[ "$out2" != *Traceback* ]]; } && ok "G17d B2b: a --path that cannot be reached -> BLIND (exit 3), no traceback" || bad "G17d rc=$rc2: $(printf '%s' "$out2" | head -c 400)"
+else
+  ok "G17c-d skipped (root can read anywhere)"
+fi
+# a FIFO in the tree: opening it for reading would wait for a writer for ever
+TMO="$(command -v timeout || command -v gtimeout || true)"
+if [ -z "$TMO" ]; then ok "G17e-f skipped (no timeout(1) to stop a scan that hangs)"; else
+mkfifo "$LK/tree/sub/pipe"
+keys_json | "$TMO" 20 "$PY3" "$LEAKSCAN" --keys-stdin --path "$LK/tree" > "$SINKS/scan2.out" 2>&1; S_RC=$?
+{ [ "$S_RC" = 3 ] && grep -q "BLIND $LK/tree/sub/pipe: is not a regular file" "$SINKS/scan2.out"; } && ok "G17e a FIFO in the scanned tree -> BLIND (exit 3) naming it, and the scan does not hang" || bad "G17e rc=$S_RC (124 = hung): $(head -c 400 "$SINKS/scan2.out")"
+keys_json | "$TMO" 20 "$PY3" "$LEAKSCAN" --keys-stdin --path "$LK/tree/sub/pipe" > "$SINKS/scan2.out" 2>&1; S_RC=$?
+{ [ "$S_RC" = 3 ] && grep -q "BLIND $LK/tree/sub/pipe: is not a regular file" "$SINKS/scan2.out"; } && ok "G17f ...also as a top-level --path (and it is not called 'does not exist')" || bad "G17f rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$LK/tree/sub/pipe"
+fi
+# whatever else goes wrong inside the scan: exit 3 and a BLIND line, never a traceback with exit 1
+keys_json | "$PY3" -I -c '
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("ls", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+def boom(*a, **k): raise RuntimeError("selftest: an error nobody planned for")
+m.scan_paths = boom
+sys.exit(m.run(["x", "--keys-stdin", "--path", sys.argv[2]]))' "$LEAKSCAN" "$LK/tree" > "$SINKS/scan2.out" 2>&1; S_RC=$?
+{ [ "$S_RC" = 3 ] && grep -q "^BLIND .*RuntimeError" "$SINKS/scan2.out" && ! grep -q Traceback "$SINKS/scan2.out"; } && ok "G17g an unexpected error inside the scan -> BLIND naming its type, exit 3 (exit 1 is only ever 'a key was found')" || bad "G17g rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+# a key-shaped stranger cut by a read boundary is reported by the fingerprint of the WHOLE text (the first read only saw the beginning of it)
+stranger="sk-ant-oat01-STRANGERabcdefghij0123456789ABCD"; fp_s="$(printf '%s' "$stranger" | shasum -a 256 | cut -c1-8)"
+printf '%040d%s\n' 0 "$stranger" > "$LK/straddle.txt"
+scan --path "$LK/straddle.txt" --chunk 64
+{ [ "$S_RC" = 1 ] && grep -q "form=shape:$fp_s " "$SINKS/scan2.out"; } && ok "G17i a stranger that straddles a read boundary carries its own fingerprint ($fp_s), not the one of the half the first read saw" || bad "G17i rc=$S_RC want shape:$fp_s: $(head -c 300 "$SINKS/scan2.out")"
+scan --watch-ps "$W/stop-now" --interval -1
+{ [ "$S_RC" = 2 ]; } && ok "G17h a negative --interval is a usage error (exit 2), not a crash in the sampler" || bad "G17h rc=$S_RC: $(head -c 300 "$SINKS/scan2.out")"
 fi
 
 # ═══ G7. AC4: no key leaks, proven with a scanner that is proven to see ═════════════════════════════

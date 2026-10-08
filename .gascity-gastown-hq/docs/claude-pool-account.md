@@ -90,9 +90,13 @@ mechanism off.
                     -> PASS after a FAIL: the marker is removed and a quiet notice (priority 2, not forced) "troca automática religada"
                        says it is back on. If the marker is NOT the guard's (`by` says so) it is left alone and nothing is announced:
                        it is still off, and "religada" goes out only once the marker is really gone.
+                       The notice is quiet, so `notify`'s router files it in the digest (exit 12): that is where it is meant to go and it
+                       counts as delivered (what reaches the phone are the forced alerts: divergence, "DESLIGADA", "guarda sem enxergar", the daemon's silence). If `notify` refuses it any other way it
+                       is retried every tick for 30 min, then dropped with a `gave up announcing` line in the log - never for ever.
+                       The same exit 12 on a FORCED push is a rate cap: nothing reached the phone, so it is not delivered and is retried.
                     -> INCONCLUSIVE (claude hangs, Keychain locked, output that is not JSON): changes nothing; after 30 min of it, one
                        "Pool Claude: guarda sem enxergar (self-test of claude <version>)" says the guard cannot verify. It never
-                       degrades on "could not tell".
+                       degrades on "could not tell". A claude update drops the "cannot verify" record of the version that is gone.
    3 LIVENESS     no clean daemon run (heartbeat) for 10 min -> one push "Pool Claude: o daemon de troca não está fechando rodadas
                   (última: <stamp>)" (not while the mechanism is off or degraded; not for a pool that was never activated).
                   The silence is judged only over time the guard was LOOKING: a stamp that went stale while the guard was not there
@@ -152,6 +156,12 @@ A scan never skips a symlink in silence (G15): a link to a **file** is read thro
 shared/data` is covered by `shared/data` itself, and cannot loop) and is **BLIND** (exit 3, naming the link and the `--path` to add) when
 it does not; a dangling link is BLIND. A `--path` that is itself a link is read through the same way.
 
+Nothing else is skipped in silence either (G17). Anything that cannot be stat'ed or opened is **BLIND** on its own line (the rest of the
+tree is still read, and a key found elsewhere still wins: exit 1); so is a FIFO, socket or device (opening a FIFO waits for a writer for
+ever) - none of the real scan roots holds one. A `--watch-ps` window that ends at `--watch-max` instead of at the stop file is BLIND (the
+scenario may have run past it); one that the stop file ended is clean. Whatever else goes wrong inside the scan ends `BLIND ... (<ErrorType>)`,
+exit 3: exit 1 means "a key was found" and nothing else.
+
 ## Activation — merged is not live
 
 The script path in the plist only exists after the merge. After the gate merges, **someone loads the plist**:
@@ -206,7 +216,7 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session (+ the guard's real-claude self-test and the leakscan control) |
 | `packs/town-deltas/assets/scripts/claude-pool-guard.py` | the guard (`run-once` / `status [--json]` / `selftest`) |
 | `packs/town-deltas/assets/claude-pool-guard.plist` | the guard's launchd job, not loaded by the merge |
-| `packs/town-deltas/assets/scripts/claude-pool-guard.selftest.sh` | hermetic tests of the guard (G1–G15: divergence, per-version test, scratch item, liveness, `status`, stand-down vs. death, one title per condition, marker that cannot be written / is not the guard's, `selftest` output, leakscan symlinks, and the no-leak proof with control and mutations) |
+| `packs/town-deltas/assets/scripts/claude-pool-guard.selftest.sh` | hermetic tests of the guard (G1–G17: divergence, per-version test, scratch item, liveness, `status`, stand-down vs. death, one title per condition, marker that cannot be written / is not the guard's, `selftest` output, the quiet notice vs. notify's router, leakscan symlinks / unreadable paths / FIFOs / the watch deadline, and the no-leak proof with control and mutations) |
 | `packs/town-deltas/assets/scripts/claude-pool-leakscan.py` | the key-leak scanner (with its control); also usable by hand |
 | `/Users/athos/shared/data/claude_pool_guard.json` | the guard's state: per-version results, open episodes |
 | `.gc/claude-pool-account.heartbeat`, `.gc/pool-account-degraded` | the daemon's last clean run; the guard's "auto-switch is off" marker |

@@ -25,12 +25,15 @@ purpose proves nothing about the real thing, so a failed control means exit 3 - 
 
 NOTHING IS SKIPPED in silence: a file that is not looked at is a blind spot, not a clean one. A symlink to a file is read through; one to a
 directory is covered when that directory lies inside another --path and is reported as BLIND (with the --path to add) when it does not; a
-dangling one is BLIND.
+dangling one is BLIND. So is anything that cannot be stat'ed or opened, and anything that is not a regular file (a FIFO, a socket, a
+device: reading a FIFO waits for a writer for ever). A --watch-ps window that ends at --watch-max instead of at the stop file is BLIND too:
+the scenario may have run past it.
 
 EXIT  0 = nothing found and the control saw what it planted.  1 = a key was found (key-shaped text that is none of ours counts too, in a
 file; in the process list - the whole machine's - it is only a NOTE line).  3 = the scan is BLIND: the control failed, or a path
-could not be read, or a key is too short to search for, or the keys could not all be loaded. 2 = usage.
-(Exit 1 wins over 3: a hit is a hit even when something else could not be looked at.)
+could not be read, or a key is too short to search for, or the keys could not all be loaded, or the sampling window was cut short, or
+the scan itself stopped on an error nobody planned for. 2 = usage.
+(Exit 1 wins over 3: a hit is a hit even when something else could not be looked at. Exit 1 is NEVER what an error looks like.)
 """
 from __future__ import annotations
 
@@ -41,6 +44,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -102,7 +106,7 @@ def scan_buffer_stream(read, nd: Needles, chunk: int) -> Dict[Tuple[str, str], S
     {("", "shape:<fp8>"): {offsets}} for key-shaped text that is not one of ours. Offsets de-duplicate what the overlap sees twice."""
     hits: Dict[Tuple[str, str], Set[int]] = {}
     raw_pos: Set[int] = set()
-    shape: Dict[int, str] = {}
+    shape: Dict[int, Tuple[int, str]] = {}      # offset -> (length seen, fp8): a stranger cut by a read boundary is seen again from the overlap, and the longer view wins (whole, if it is no longer than the overlap)
     carry, base = b"", 0
     while True:
         data = read(chunk)
@@ -115,22 +119,43 @@ def scan_buffer_stream(read, nd: Needles, chunk: int) -> Dict[Tuple[str, str], S
                     raw_pos.add(base + i)
                 i = buf.find(n, i + 1)
         for m in SHAPE_RE.finditer(buf):
-            shape.setdefault(base + m.start(), fp8(m.group(0)))
+            at = base + m.start()
+            if at not in shape or len(m.group(0)) > shape[at][0]:
+                shape[at] = (len(m.group(0)), fp8(m.group(0)))
         if not data:
             break
         keep = min(len(buf), nd.maxlen - 1)
         base += len(buf) - keep
         carry = buf[len(buf) - keep:]
-    for pos, fp in shape.items():
+    for pos, (_n, fp) in shape.items():
         if pos not in raw_pos:
             hits.setdefault(("", f"shape:{fp}"), set()).add(pos)
     return hits
 
 
-def scan_file(path: Path, nd: Needles, chunk: int) -> Tuple[List[Tuple[str, str, int]], Optional[str]]:
-    """([(account, form, count)], error or None). A file that cannot be read completely is an error, not a clean file."""
+NOT_REGULAR = "is not a regular file (a FIFO, socket or device): not read"
+MISSING = "missing"
+
+
+def _mode(path: Path, follow: bool) -> Tuple[Optional[int], str]:
+    """(st_mode, "") | (None, MISSING) when nothing is at that path | (None, "<ErrorName>") when it could not be told. Path.is_dir/is_symlink/exists
+    are not used: on Python 3.9 they raise PermissionError, and a traceback exits 1 - the code for 'a key was found'."""
     try:
-        with open(path, "rb") as f:
+        st = os.stat(path) if follow else os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None, MISSING
+    except OSError as e:
+        return None, type(e).__name__
+    return st.st_mode, ""
+
+
+def scan_file(path: Path, nd: Needles, chunk: int) -> Tuple[List[Tuple[str, str, int]], Optional[str]]:
+    """([(account, form, count)], error or None). A file that cannot be read completely is an error, not a clean file - and so is one
+    that is not a regular file by the time it is opened (a FIFO put there after the walk): O_NONBLOCK so the open itself cannot wait."""
+    try:
+        with os.fdopen(os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)), "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return [], NOT_REGULAR
             hits = scan_buffer_stream(f.read, nd, chunk)
     except OSError as e:
         return [], f"{type(e).__name__}"
@@ -142,10 +167,11 @@ def _inside(target: Path, roots: List[Path]) -> bool:
 
 
 def walk(paths: Iterable[Path]) -> Tuple[List[Path], List[Tuple[Path, str]]]:
-    """Every file under `paths`, and what could not be looked at. A symlink is never skipped in silence: one to a FILE is read through (a finding
-    carries the link's name), one to a directory is covered when that directory lies inside another scanned path and is a blind spot (exit 3,
-    naming what to add) when it does not, a dangling one is a blind spot. Directories are walked without following links, so a link back
-    into the tree (shared/data/data -> shared/data) cannot loop."""
+    """Every regular file under `paths`, and what could not be looked at. A symlink is never skipped in silence: one to a FILE is read through
+    (a finding carries the link's name), one to a directory is covered when that directory lies inside another scanned path and is a blind spot
+    (exit 3, naming what to add) when it does not, a dangling one is a blind spot. So is a FIFO, a socket or a device, and so is any entry that
+    cannot be stat'ed: it is reported on its own, and the rest of the tree is still read. Directories are walked without following links, so
+    a link back into the tree (shared/data/data -> shared/data) cannot loop."""
     paths = list(paths)
     files: List[Path] = []
     errors: List[Tuple[Path, str]] = []
@@ -155,8 +181,9 @@ def walk(paths: Iterable[Path]) -> Tuple[List[Path], List[Tuple[Path, str]]]:
             r = Path(os.path.realpath(p))
         except OSError:
             continue
-        if r.is_dir():
-            roots.append(r)         # a --path that is a link to a directory is the operator naming that directory
+        m, _ = _mode(r, True)
+        if m is not None and stat.S_ISDIR(m):
+            roots.append(r)         # a --path that is a link to a directory is the operator naming that directory; one that cannot be told names nothing
 
     def link(q: Path) -> None:
         try:
@@ -164,38 +191,50 @@ def walk(paths: Iterable[Path]) -> Tuple[List[Path], List[Tuple[Path, str]]]:
         except OSError as e:
             errors.append((q, f"is a symlink that cannot be resolved ({type(e).__name__})"))
             return
-        if target.is_file():
+        m, why = _mode(target, True)
+        if m is None:
+            errors.append((q, "is a dangling symlink" if why == MISSING else f"is a symlink whose target cannot be looked at ({why})"))
+        elif stat.S_ISREG(m):
             files.append(q)
-        elif target.is_dir():
+        elif stat.S_ISDIR(m):
             if not _inside(target, roots):
                 errors.append((q, f"is a symlink to a directory that is not scanned (not followed): add {target} with --path"))
-        elif not target.exists():
-            errors.append((q, "is a dangling symlink"))
         else:
             errors.append((q, "is a symlink to something that is neither a file nor a directory"))
 
+    def entry(q: Path, is_name: bool) -> None:
+        m, why = _mode(q, False)
+        if m is None:
+            errors.append((q, f"cannot be looked at ({why})"))
+        elif stat.S_ISLNK(m):
+            link(q)
+        elif is_name:
+            if stat.S_ISREG(m):
+                files.append(q)
+            else:
+                errors.append((q, NOT_REGULAR))
+
     for p in paths:
-        if p.is_dir():              # also a link to a directory: os.walk reads the top through it
+        m, why = _mode(p, False)
+        if m is None:
+            errors.append((p, "does not exist" if why == MISSING else f"cannot be looked at ({why})"))
+            continue
+        tm = _mode(p, True)[0] if stat.S_ISLNK(m) else m
+        if tm is not None and stat.S_ISDIR(tm):     # also a link to a directory: os.walk reads the top through it
             try:
                 for root, dirs, names in os.walk(p, followlinks=False, onerror=lambda e: errors.append((Path(str(e.filename)), type(e).__name__))):
                     for n in sorted(dirs):
-                        q = Path(root) / n
-                        if q.is_symlink():
-                            link(q)
+                        entry(Path(root) / n, False)
                     for n in sorted(names):
-                        q = Path(root) / n
-                        if q.is_symlink():
-                            link(q)
-                        else:
-                            files.append(q)
+                        entry(Path(root) / n, True)
             except OSError as e:
                 errors.append((p, type(e).__name__))
-        elif p.is_symlink():
+        elif stat.S_ISLNK(m):
             link(p)
-        elif p.is_file():
+        elif stat.S_ISREG(m):
             files.append(p)
         else:
-            errors.append((p, "does not exist"))
+            errors.append((p, NOT_REGULAR))
     return files, errors
 
 
@@ -257,13 +296,16 @@ def scan_ps_snapshot(snap: List[Tuple[str, int, str, bytes]], nd: Needles) -> Di
     return counts
 
 
-def watch_ps(stopfile: Path, nd: Needles, interval: float, max_s: float, ready: Optional[Path] = None) -> Tuple[Dict[Finding, int], int]:
-    """Samples ps until `stopfile` exists (then once more) and returns (findings, samples). Only hits are kept: the samples are not.
-    `ready` is created after the first sample: whoever starts the scenario waits for it, so the sampling window really contains it."""
+def watch_ps(stopfile: Path, nd: Needles, interval: float, max_s: float, ready: Optional[Path] = None) -> Tuple[Dict[Finding, int], int, Optional[str]]:
+    """Samples ps until `stopfile` exists (then once more) and returns (findings, samples, problem). Only hits are kept: the samples are not.
+    `ready` is created after the first sample: whoever starts the scenario waits for it, so the sampling window really contains it.
+    problem is None when the stop file ended the window; otherwise why that cannot be vouched for (the window ran out at max_s, so the scenario
+    may have run past it; or the stop file could not be looked at - stopfile: vazio → not there yet, keep sampling; ilegível → keep sampling and say so)."""
     counts: Dict[Finding, int] = {}
     samples = 0
     deadline = time.time() + max_s
     last = False
+    unreadable = ""
     while True:
         snap = ps_snapshot()
         if snap is not None:
@@ -275,13 +317,17 @@ def watch_ps(stopfile: Path, nd: Needles, interval: float, max_s: float, ready: 
                     pass
             for k, v in scan_ps_snapshot(snap, nd).items():
                 counts[k] = counts.get(k, 0) + v
-        if last or time.time() > deadline:
-            break
-        if stopfile.exists():
+        if last:
+            return counts, samples, None
+        m, why = _mode(stopfile, True)
+        if m is not None:
             last = True
             continue
+        if why != MISSING:
+            unreadable = f" (the stop file could not be looked at: {why})"
+        if time.time() > deadline:
+            return counts, samples, f"the sampling window ended at --watch-max ({max_s:g} s), not at the stop file: the scenario may have run past it{unreadable}"
         time.sleep(interval)
-    return counts, samples
 
 
 # ── the control ────────────────────────────────────────────────────────────────────────────────────
@@ -457,7 +503,7 @@ def main(argv: List[str]) -> int:
         print("claude-pool-leakscan: --watch-ps samples the process list only and would leave every --path unread: scan the files in a "
               "separate run (--path without --watch-ps)", file=sys.stderr)
         return 2
-    if src is None or (watch is None and not paths and not use_ps) or chunk < 64:
+    if src is None or (watch is None and not paths and not use_ps) or chunk < 64 or interval < 0 or watch_max <= 0 or interval != interval or watch_max != watch_max:
         print(__doc__.split("\n\n")[0] + "\n\nusage: claude-pool-leakscan.py (--keys-stdin|--keys-vault) [--ps] [--path P ...] [--watch-ps STOPFILE [--ready-file F]] [--json]",
               file=sys.stderr)
         return 2
@@ -474,10 +520,12 @@ def main(argv: List[str]) -> int:
     samples = 0
     if not fails:
         if watch is not None:
-            c, samples = watch_ps(watch, nd, interval, watch_max, ready)
+            c, samples, problem = watch_ps(watch, nd, interval, watch_max, ready)
             counts.update(c)
             if samples == 0:
                 blind.append("ps could not be sampled")
+            if problem:
+                blind.append(problem)
         else:
             if use_ps:
                 snap = ps_snapshot()
@@ -511,5 +559,15 @@ def main(argv: List[str]) -> int:
     return 3 if blind else 0
 
 
+def run(argv: List[str]) -> int:
+    """main(), with a net under it: whatever raises that nobody planned for is BLIND (3) and says its type - a traceback would exit 1, which
+    means 'a key was found'. Nothing of the error's text is printed: it could hold a path or a line of what was being read."""
+    try:
+        return main(argv)
+    except Exception as e:  # noqa: BLE001
+        print(f"BLIND the scan stopped on an error nobody planned for ({type(e).__name__}): nothing it did not reach is vouched for")
+        return 3
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(run(sys.argv))
