@@ -251,6 +251,12 @@ pool_off=""
 if [ -z "$pool_off" ] && [ -n "$city" ] && [ -e "$city/.gc/no-pool-account" ]; then
   pool_off="$city/.gc/no-pool-account"
 fi
+# ga-8hcnvb.3: claude-pool-guard.py writes this marker when its per-version self-test says the installed claude no longer reads
+# the pool item (a claude release that changed the item's name or the variable). A session pointed at an item claude does not
+# read is "not logged in", so while the marker is there NO launch is pointed at it: the session starts on the ambient login.
+if [ -z "$pool_off" ] && [ -n "$city" ] && [ -e "$city/.gc/pool-account-degraded" ]; then
+  pool_off="$city/.gc/pool-account-degraded (claude-pool-guard: the per-version self-test failed)"
+fi
 if [ -n "$pool_off" ]; then
   pool_note "POOL-ACCT SKIP disabled by $pool_off"
 elif [ -n "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}" ]; then

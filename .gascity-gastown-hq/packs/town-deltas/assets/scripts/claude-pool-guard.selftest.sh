@@ -1,27 +1,42 @@
 #!/usr/bin/env bash
-# claude-pool-guard.selftest.sh — ga-8hcnvb.3.1: the safety net under the pool's account switch (slice 1 of 3: divergence + the daemon's liveness).
+# claude-pool-guard.selftest.sh — ga-8hcnvb.3.2: the safety net under the pool's account switch (slice 2 of 3: the per-version test and the degradation).
 #
 #   G1-G4  DIVERGENCE: the account the pool really uses vs the account the rule dictates -> one phone alert in < 5 min naming both by
 #          e-mail + 8-hex fingerprint, never the key; it stops repeating when fixed; 'could not tell' never alerts as a divergence.
 #   G4g    the guard's OWN record (episode start, 'already alerted' stamp, the daemon watch) can be unusable - a 400-digit integer, NaN,
 #          a string, a time in the future: that clock restarts; the check neither crashes nor goes silent.
+#   G5     PER-VERSION TEST: claude is asked (on a scratch item) whether it still reads the credential the pool writes. Pass/fail is
+#          recorded per claude version, queryable, and redone when the version changes. A fail -> alert 'auto-switch OFF', the daemon and
+#          the wrapper stand down, an agent started in that state answers on the current login, nothing is deleted or interrupted.
 #   G6     the daemon's heartbeat (a daemon that stopped completing runs); G6i: a heartbeat that cannot be read in ANY way (not UTF-8,
 #          a 400-digit epoch, an epoch that is not a time) is 'could not tell', never a crash and never a verdict.
-#   G10    the daemon's silence is judged only over time the guard was LOOKING: a stand-down (the operator's switches) or the guard's
+#   G8     the self-test's scratch item: never the pool's, never trusted if left behind.
+#   G9     `status`: 'not tested yet' is not 'cannot tell'; 'auto-switch: on' is not what a shell with no city answers.
+#   G10    the daemon's silence is judged only over time the guard was LOOKING: a stand-down (marker, operator switches) or the guard's
 #          own absence (reboot, sleep) is not a daemon death; a daemon that really stays silent is still told on time. The harness's
 #          HB_AUTO=0 is the real daemon (no stamp while stood down); HB_AUTO=1 re-stamps every tick and hid this.
+#   G11    one title per condition: the fake notify drops a repeated TITLE within 30 min like the real one (rc 11), so two different
+#          conditions that shared a title would lose the second push.
+#   G12    the self-test failed and the marker cannot be written: said out loud, pool still ON, not recorded as a degradation.
+#   G13    a pass while a marker the guard did not write is still up: no 'religada' until the marker is really gone.
+#   G14    `selftest` says what it did: rc 0 pass / 3 fail / 4 inconclusive / 1 NOT run (lock held, kill switch, no claude).
+#   G16    the quiet 'troca automática religada' notice: notify's router files it in the digest (rc 12) and that counts as delivered (sent
+#          once, the episode closes); a FORCED push that meets the cap (rc 12) is retried until it goes out; a notice notify keeps
+#          refusing is given up on after 30 min, said in the log; a blind record of a superseded claude version is dropped.
 #
-# HERMETIC: fake `security` (items in a temp dir), fake `secret` vault, fake `notify` (it models the router and the push cap: a quiet send
-# gets rc 12 like the real one), and a clock the test moves (CLAUDE_POOL_NOW). Nothing here touches the real Keychain, vault, network or phone.
-# The product under test can be swapped for an older copy: CLAUDE_POOL_GUARD / _DAEMON (see 'previous HEAD' in the doc).
+# HERMETIC: fake `security` (items in a temp dir), fake `claude` (several behaviours), fake `secret` vault, fake `notify` (it models the
+# router and the push cap: a quiet send gets rc 12 like the real one), and a clock the test moves (CLAUDE_POOL_NOW). Nothing here touches
+# the real Keychain, vault, network or phone.
+# The product under test can be swapped for an older copy: CLAUDE_POOL_GUARD / _DAEMON / _WRAPPER (see 'previous HEAD' in the doc).
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARD="${CLAUDE_POOL_GUARD:-$SELF_DIR/claude-pool-guard.py}"
 DAEMON="${CLAUDE_POOL_DAEMON:-$SELF_DIR/claude-pool-account.py}"
+WRAPPER="${CLAUDE_POOL_WRAPPER:-$SELF_DIR/claude-lowprio.sh}"
 ACCT_LIB="${CLAUDE_POOL_ACCOUNTS_LIB:-/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py}"
 PY3="${CLAUDE_POOL_PY:-/usr/bin/python3}"; [ -x "$PY3" ] || PY3="$(command -v python3)"   # the interpreter launchd runs (3.9)
-ONLY="${GUARD_SELFTEST_ONLY:-}"   # e.g. G1 or G5,G7: run only these groups
+ONLY="${GUARD_SELFTEST_ONLY:-}"   # e.g. G1 or G5,G10: run only these groups
 
 PASS=0
 FAIL=0
@@ -35,7 +50,7 @@ bad() {
 }
 want() { [ -z "$ONLY" ] || case ",$ONLY," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
-for f in "$GUARD" "$DAEMON" "$ACCT_LIB"; do [ -f "$f" ] || { echo "FATAL: not found: $f"; exit 1; }; done
+for f in "$GUARD" "$DAEMON" "$WRAPPER" "$ACCT_LIB"; do [ -f "$f" ] || { echo "FATAL: not found: $f"; exit 1; }; done
 
 _t="${TMPDIR:-/tmp}"; W="$(mktemp -d "${_t%/}/claude-pool-guard-selftest.XXXXXX")"   # no "//" in it: the product hashes paths it normalised, the fakes hash the string they were given
 cleanup() { for p in ${BG_PIDS:-}; do kill "$p" 2>/dev/null; done; chmod -R u+w "$W" 2>/dev/null; rm -rf "$W"; }
@@ -44,12 +59,14 @@ BG_PIDS=""
 
 # ── the world ──────────────────────────────────────────────────────────────────────────────────────
 WW="$W/w"; PROD="$WW/product"; CITY="$PROD/city"; DATA="$PROD/data"; STATE="$DATA/current.json"; GSTATE="$DATA/guard.json"
-INFRA="$WW/infra"; SINKS="$WW/sinks"; CAP="$SINKS/cap"; BB="$W/bb"
+INFRA="$WW/infra"; SINKS="$WW/sinks"; CAP="$SINKS/cap"; FAKEBIN="$W/fakebin"; BB="$W/bb"
 POOL_DIR="$W/pool-cred"
+SCR="$INFRA/claude-pool-guard-scratch"     # the guard's scratch directory (CLAUDE_POOL_GUARD_SCRATCH)
 SVC="Claude Code-credentials-$(printf '%s' "$POOL_DIR" | shasum -a 256 | cut -c1-8)"
+PLAIN="Claude Code-credentials"
 NOW_BASE=1999000000
 EMAILS=(a@t.test b@t.test c@t.test d@t.test e@t.test)
-mkdir -p "$BB"
+mkdir -p "$BB" "$FAKEBIN"
 
 rnd() { "$PY3" -c 'import secrets; print("sk-ant-oat01-TEST" + secrets.token_hex(20))'; }
 KEY_a="$(rnd)"; KEY_b="$(rnd)"; KEY_c="$(rnd)"; KEY_d="$(rnd)"; KEY_e="$(rnd)"; KEY_x="$(rnd)"     # shell variables only: never exported, never in argv
@@ -114,6 +131,36 @@ fi
 printf '%s\n' "$2" >> "$FAKE_SINKS/notify.delivered"      # the titles that really reached the phone
 exit 0
 EOF
+# fake claude (the binary baked with the world's paths: the guard hands claude a clean environment, so the mode lives in files)
+cat > "$W/claude.tmpl" <<'EOF'
+#!/bin/bash
+IN="@INFRA@"; SK="@SINKS@"
+MODE="$(cat "$IN/claude.mode" 2>/dev/null || echo ok)"; VER="$(cat "$IN/claude.version" 2>/dev/null || echo 1.0.0)"
+echo "$*" >> "$SK/claude-calls.log"
+case "${1:-}" in
+  --version) echo "$VER (Claude Code)"; exit 0 ;;
+  auth)
+    [ "${2:-}" = "status" ] || exit 2
+    case "$MODE" in
+      hang) exec sleep 60 ;;
+      garbage) echo "something that is not json"; exit 0 ;;
+    esac
+    dir="${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}"
+    if [ -z "$dir" ]; then svc="Claude Code-credentials"
+    elif [ "$MODE" = renamed ]; then svc="Claude Code-credentials-$(printf '%s' "$dir/v2" | shasum -a 256 | cut -c1-8)"   # a release that derives the name differently
+    else svc="Claude Code-credentials-$(printf '%s' "$dir" | shasum -a 256 | cut -c1-8)"; fi
+    present=0; [ -e "$IN/kc/items/$svc" ] && present=1
+    [ "$MODE" = ignores ] && present=1                                                                                    # a release that stopped looking at the item
+    if [ -e "$IN/flaky.once" ] && [ "$present" = 1 ]; then rm -f "$IN/flaky.once"; present=0; fi
+    if [ "$present" = 1 ]; then echo '{"loggedIn":true,"authMethod":"claude.ai"}'; exit 0; fi
+    echo '{"loggedIn":false,"authMethod":"none"}'; exit 1 ;;
+  *)
+    { echo "ARGV: $*"; echo "SECDIR=${CLAUDE_SECURESTORAGE_CONFIG_DIR:-<unset>}"; echo "USER=${USER:-<unset>}"; } >> "$SK/claude-launch.log"
+    env | sort >> "$SK/claude-env.log"
+    if [ -n "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}" ]; then echo "answer: ok (pool item)"; else echo "answer: ok (ambient login)"; fi
+    exit 0 ;;
+esac
+EOF
 chmod +x "$BB/security" "$BB/secret" "$BB/notify"
 
 NOW=$NOW_BASE; HB_AUTO=1; GRC=0; N_RUN=0
@@ -121,8 +168,12 @@ blob_of() { printf '{"claudeAiOauth":{"accessToken":"%s","expiresAt":41024448000
 put_item() { blob_of "$1" | xxd -p | tr -d '\n' > "$INFRA/kc/items/$SVC"; }            # builtin printf: the key is never in an argv
 put_decision() { printf '{"current":"%s","fingerprint":"%s","since":"2033-05-18T03:00:00Z","reason":"selftest","previous":null,"exhausted":{},"schema":1,"updated":"2033-05-18T03:00:00Z"}\n' "$1" "$2" > "$STATE"; }
 hb_touch() { printf '{"epoch": %s, "updated": "selftest", "pid": 1}\n' "$NOW" > "$CITY/.gc/claude-pool-account.heartbeat"; }
+set_mode() { printf '%s' "$1" > "$INFRA/claude.mode"; }
+set_ver() { printf '%s' "$1" > "$INFRA/claude.version"; }
 ncalls() { [ -f "$SINKS/notify.log" ] && wc -l < "$SINKS/notify.log" | tr -d ' ' || echo 0; }
 call_n() { sed -n "${1}p" "$SINKS/notify.log"; }
+claude_auth_calls() { [ -f "$SINKS/claude-calls.log" ] && grep -c '^auth status' "$SINKS/claude-calls.log" || echo 0; }
+gv() { "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("versions",{}).get(sys.argv[2],{}).get(sys.argv[3],""))' "$GSTATE" "$1" "$2" 2>/dev/null; }
 gj() { "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1]))
 for k in sys.argv[2].split("/"): d=d.get(k) if isinstance(d,dict) else None
 print("<none>" if d is None else d)' "$1" "$2" 2>/dev/null; }
@@ -143,14 +194,18 @@ new_w() {
   chmod -R u+w "$WW" 2>/dev/null; rm -rf "$WW"
   mkdir -p "$CITY/.gc/logs" "$DATA" "$INFRA/kc/items" "$INFRA/vault" "$INFRA/home" "$SINKS" "$CAP" "$INFRA/home/.gastown"
   : > "$SINKS/kc-argv.log"; : > "$SINKS/kc-ops.log"
+  sed "s|@INFRA@|$INFRA|g; s|@SINKS@|$SINKS|g" "$W/claude.tmpl" > "$FAKEBIN/claude"; chmod +x "$FAKEBIN/claude"
+  set_mode ok; set_ver 1.0.0
   local e; for e in "${EMAILS[@]}"; do key_of "$e" > "$INFRA/vault/$e"; done
   NOW=$NOW_BASE; HB_AUTO=1; N_RUN=0
   stamp_usage
 }
 BASE_ENV() {
-  printf '%s\n' "HOME=$INFRA/home" "USER=athos" "PATH=$BB:/usr/bin:/bin" "GC_CITY_PATH=$CITY" "FAKE_KC=$INFRA/kc" "FAKE_SINKS=$SINKS" "VAULT=$INFRA/vault" \
+  printf '%s\n' "HOME=$INFRA/home" "USER=athos" "PATH=$BB:$FAKEBIN:/usr/bin:/bin" "GC_CITY_PATH=$CITY" "FAKE_KC=$INFRA/kc" "FAKE_SINKS=$SINKS" "VAULT=$INFRA/vault" \
     "CLAUDE_USAGE_STORE=$INFRA/usage.json" "CLAUDE_POOL_STATE=$STATE" "CLAUDE_POOL_CRED_DIR=$POOL_DIR" "GC_POOL_CRED_DIR=$POOL_DIR" "CLAUDE_POOL_ACCOUNTS_LIB=$ACCT_LIB" \
-    "CLAUDE_POOL_NOW=$NOW" "CLAUDE_POOL_DAEMON=$DAEMON" "CLAUDE_POOL_GUARD_STATE=$GSTATE" "CLAUDE_POOL_NOTIFY_CMD=$BB/notify"
+    "CLAUDE_POOL_NOW=$NOW" "CLAUDE_POOL_DAEMON=$DAEMON" "CLAUDE_POOL_GUARD_STATE=$GSTATE" "CLAUDE_POOL_NOTIFY_CMD=$BB/notify" \
+    "CLAUDE_POOL_GUARD_SCRATCH=$INFRA/claude-pool-guard-scratch" "CLAUDE_POOL_GUARD_RETRY_WAIT_S=0" "CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=20" \
+    "GC_LOWPRIO_CLAUDE_BIN=$FAKEBIN/claude"
 }
 run_guard() { # run_guard [VAR=val ...] -- <guard args>; output in $LAST, status in $GRC
   local envs=() base=()
@@ -160,7 +215,23 @@ run_guard() { # run_guard [VAR=val ...] -- <guard args>; output in $LAST, status
   N_RUN=$((N_RUN+1)); LAST="$CAP/guard-$N_RUN.txt"
   env -i "${base[@]}" "${envs[@]}" "$PY3" "$GUARD" "$@" > "$LAST" 2>&1; GRC=$?
 }
-
+run_d() { # run_d [VAR=val ...] -- <daemon args>
+  local envs=() base=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  while IFS= read -r l; do base+=("$l"); done < <(BASE_ENV)
+  N_RUN=$((N_RUN+1)); LAST="$CAP/daemon-$N_RUN.txt"
+  stamp_usage "$NOW"
+  env -i "${base[@]}" "${envs[@]}" "$PY3" "$DAEMON" "$@" > "$LAST" 2>&1; GRC=$?
+}
+run_wrapper() { # run_wrapper [VAR=val ...] -- <claude args>
+  local envs=() base=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  while IFS= read -r l; do base+=("$l"); done < <(BASE_ENV)
+  N_RUN=$((N_RUN+1)); LAST="$CAP/wrapper-$N_RUN.txt"
+  env -i "${base[@]}" GC_LOWPRIO=0 "${envs[@]}" "$WRAPPER" "$@" > "$LAST" 2>&1; GRC=$?
+}
 gtick() { # gtick <advance-seconds> [VAR=val ...]: move the clock, stamp the daemon's heartbeat (unless HB_AUTO=0), run one guard pass
   NOW=$((NOW + $1)); shift
   [ "$HB_AUTO" = 1 ] && hb_touch
@@ -171,6 +242,7 @@ gwalk() { # gwalk <seconds> [VAR=val ...]: the same stretch of time as ONE tick 
   for ((i = 0; i < n; i++)); do gtick 60 "$@"; done
 }
 div3() { gtick 60; gtick 130; gtick 130; }      # a divergence that has lasted long enough to be alerted (2 min of persistence + the tick that sees it)
+ndelivered() { [ -f "$SINKS/notify.delivered" ] && wc -l < "$SINKS/notify.delivered" | tr -d ' ' || echo 0; }   # pushes that reached the phone (needs notify.titledup to differ from ncalls)
 gl() { cat "$CITY/.gc/logs/claude-pool-guard.log" 2>/dev/null; }
 active_world() { # item = a's key, decision = a, a clean heartbeat: the pool as the daemon leaves it
   put_item "$KEY_a"; put_decision a@t.test "$FP_a"; hb_touch
@@ -190,6 +262,7 @@ o[ks[-1]] = json.loads(lit)
 open(p, "w").write(json.dumps(d))
 EOF
 }
+marker="$CITY/.gc/pool-account-degraded"
 
 # ═══ G1. AC1: a divergence is alerted within 5 min, then stops ═════════════════════════════════════
 if want G1; then
@@ -288,14 +361,110 @@ gtick 60; gtick 130; gtick 130; gtick 130
 [ "$(ncalls)" = 0 ] && ok "G4 Keychain locked (cannot read the item) -> no divergence alert, however long" || bad "G4 alerted while blind (calls=$(ncalls))"
 gtick 1500; gtick 300
 { [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"guarda sem enxergar"* ]]; } && ok "G4a ...but after 30 min of not being able to tell, ONE 'guard blind' alert says so" || bad "G4a calls=$(ncalls): $(call_n 1)"
+[ ! -e "$marker" ] && ok "G4b ...and a locked Keychain during the self-test is inconclusive, never a degradation" || bad "G4b degraded because the Keychain was locked"
 new_w; active_world; gtick 0; printf '{"current": ' > "$STATE"; put_item "$KEY_b"; gtick 60; gtick 130; gtick 130; gtick 130
 [ "$(ncalls)" = 0 ] && [ -s "$STATE" ] && ok "G4c unreadable decision file -> no alert, and the guard does not rewrite or move it (it is the daemon's)" || bad "G4c calls=$(ncalls)"
 new_w; active_world; put_item "$KEY_b"; for _i in 1 2 3 4 5; do gtick 60 GC_POOL_ACCOUNT=0; done
-{ [ "$(ncalls)" = 0 ] && [ ! -e "$GSTATE" ]; } && ok "G4d GC_POOL_ACCOUNT=0 (operator switched the mechanism off) -> the guard does nothing at all (no state, no alert)" || bad "G4d acted under the kill switch (calls=$(ncalls) state=$([ -e "$GSTATE" ] && echo yes || echo no))"
+{ [ "$(ncalls)" = 0 ] && [ ! -e "$GSTATE" ] && [ "$(claude_auth_calls)" = 0 ] && [ ! -e "$marker" ]; } && ok "G4d GC_POOL_ACCOUNT=0 (operator switched the mechanism off) -> the guard does nothing at all (no state, no claude run, no alert)" || bad "G4d acted under the kill switch (calls=$(ncalls) state=$([ -e "$GSTATE" ] && echo yes || echo no) claude=$(claude_auth_calls))"
 new_w; active_world; touch "$CITY/.gc/no-pool-account"; put_item "$KEY_b"; for _i in 1 2 3 4 5; do gtick 60; done
 [ "$(ncalls)" = 0 ] && ok "G4e <city>/.gc/no-pool-account -> the guard does nothing" || bad "G4e acted under no-pool-account"
 new_w; for _i in 1 2 3 4 5 6 7 8; do gtick 1200; done
 [ "$(ncalls)" = 0 ] && [ "$(gj "$GSTATE" divergence)" = "<none>" ] && ok "G4f never activated (no decision, no item): hours of ticks, nothing said" || bad "G4f alerted on an inactive pool (calls=$(ncalls))"
+new_w; active_world; set_mode renamed; gtick 0; put_item "$KEY_b"; for _i in 1 2 3 4 5; do gtick 60; done
+{ [ -s "$marker" ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"DESLIGADA"* ]] && [ "$(gj "$GSTATE" divergence)" = "<none>" ]; } && ok "G4g while auto-switch is OFF (failed self-test, marker) the item is not expected to follow the decision -> no divergence alert, no open episode; the only push is the one that says it is off" || bad "G4g under the degraded marker: calls=$(ncalls) episode=$(gj "$GSTATE" divergence)"
+set_mode ok; gtick 1900
+{ [ ! -e "$marker" ] && [ "$(ncalls)" = 2 ] && [[ "$(call_n 2)" == *"religada"* ]]; } && ok "G4h ...and when it comes back the stale divergence does NOT alert at once (only the 'back on' notice went out)" || bad "G4h calls=$(ncalls) marker=$([ -e "$marker" ] && echo yes || echo no)"
+gtick 60; gtick 60; gtick 60
+{ [ "$(ncalls)" = 3 ] && [[ "$(call_n 3)" == *"diverge"* ]]; } && ok "G4i ...it does alert if the item is STILL wrong 2+ min after auto-switch came back (a new episode)" || bad "G4i calls=$(ncalls) $(call_n 3)"
+fi
+
+# ═══ G5. the per-version test ══════════════════════════════════════════════════════════════════════
+if want G5; then
+echo "G5. per-version test: recorded, queryable, redone on a new version; a fail turns auto-switch off, safely"
+new_w; active_world
+cat "$INFRA/kc/items/$SVC" > "$W/item.before"
+gtick 0
+{ [ "$(gv 1.0.0 result)" = pass ] && [ ! -e "$marker" ] && [ "$(ncalls)" = 0 ]; } && ok "G5 first tick: claude 1.0.0 is tested -> pass, recorded; no marker, no alert" || bad "G5 result='$(gv 1.0.0 result)' marker=$([ -e "$marker" ] && echo yes || echo no) calls=$(ncalls) :: $(gl | tail -3)"
+{ [ "$(ls "$INFRA/kc/items" | tr '\n' ' ')" = "$SVC " ] && [ ! -e "$SCR" ]; } && ok "G5a the scratch item and directory are gone afterwards; the pool item is the only item left" || bad "G5a leftovers: $(ls "$INFRA/kc/items") / scratch=$([ -e "$SCR" ] && echo yes || echo no)"
+if grep -E "^OP (add|delete)-generic-password ($SVC|$PLAIN)$" "$SINKS/kc-ops.log" >/dev/null; then bad "G5b the self-test wrote or deleted the pool item or the plain login item"; else ok "G5b the self-test never wrote or deleted the pool item or Mayor's/crews' plain item (only its own scratch item)"; fi
+cmp -s "$INFRA/kc/items/$SVC" "$W/item.before" && ok "G5c the pool item is byte-for-byte what it was" || bad "G5c the pool item changed"
+contains "$CITY/.gc/logs/claude-pool-guard.log" KEY_a; grep -rq "GUARDSELFTEST" "$SINKS/kc-argv.log" "$CITY/.gc/logs" "$GSTATE" 2>/dev/null && bad "G5d the self-test's fake credential reached argv/log/state" || ok "G5d the self-test's credential went to the Keychain on stdin only: not in security's argv, the log or the state"
+run_guard -- status --json
+{ [ "$(gj "$LAST" installed_claude)" = "1.0.0" ] && [ "$(gj "$LAST" installed_result)" = pass ] && [ "$(gj "$LAST" versions/1.0.0/result)" = pass ]; } && ok "G5e AC3 queryable: status --json says installed claude 1.0.0 -> pass, with when it was checked" || bad "G5e status: $(head -c 300 "$LAST")"
+[ -n "$(gj "$LAST" versions/1.0.0/checked_at | grep -E '^[0-9]{4}-')" ] && ok "G5f ...with a timestamp" || bad "G5f no checked_at"
+run_guard -- status; grep -q "PASS" "$LAST" && grep -q "1.0.0" "$LAST" && ok "G5g the human-readable status shows the same" || bad "G5g status text: $(head -c 300 "$LAST")"
+c0=$(claude_auth_calls); gtick 60; gtick 60; gtick 60
+[ "$(claude_auth_calls)" = "$c0" ] && ok "G5h same claude version -> the test is NOT run again" || bad "G5h re-ran the test on an unchanged version ($c0 -> $(claude_auth_calls))"
+set_ver 1.0.1; gtick 60
+{ [ "$(gv 1.0.1 result)" = pass ] && [ "$(gv 1.0.0 result)" = pass ] && [ "$(claude_auth_calls)" -gt "$c0" ]; } && ok "G5i AC3: claude updated to 1.0.1 -> the test re-ran by itself on the next tick; both versions are on record" || bad "G5i 1.0.1='$(gv 1.0.1 result)' calls $c0 -> $(claude_auth_calls)"
+# the release that changed the internals
+( sleep 600 ) & SESSION_PID=$!; BG_PIDS="$BG_PIDS $SESSION_PID"     # stands for a live session: nothing may signal it
+set_ver 1.0.2; set_mode renamed; gtick 60
+{ [ "$(gv 1.0.2 result)" = fail ] && [ "$(gv 1.0.2 attempts)" = 2 ] && [ -s "$marker" ]; } && ok "G5j AC2: a claude that derives the item name differently -> FAIL (twice), degraded marker written" || bad "G5j result='$(gv 1.0.2 result)' attempts='$(gv 1.0.2 attempts)' marker=$([ -s "$marker" ] && echo yes || echo no) :: $(gl | tail -3)"
+[ "$(ncalls)" = 1 ] && c="$(call_n 1)" || c=""
+{ [[ "$c" == *"DESLIGADA"* ]] && [[ "$c" == *"1.0.2"* ]] && [[ "$c" == *"[-p] [4]"* ]] && [[ "$c" == "CALL force=1 "* ]]; } && ok "G5k ...ONE push, priority 4, forced: 'troca automática DESLIGADA', naming the claude version" || bad "G5k alert: calls=$(ncalls) $c"
+"$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["by"]=="claude-pool-guard" and d["claude"]=="1.0.2"' "$marker" 2>/dev/null && ok "G5l the marker says who wrote it and for which version (so only the guard lifts it)" || bad "G5l marker: $(cat "$marker")"
+gtick 60; gtick 60; gtick 60
+[ "$(ncalls)" = 1 ] && ok "G5m the next ticks do not repeat the alert" || bad "G5m calls=$(ncalls)"
+cmp -s "$INFRA/kc/items/$SVC" "$W/item.before" && kill -0 "$SESSION_PID" 2>/dev/null && ok "G5n NOTHING was deleted or interrupted: the pool item is untouched and the 'live session' is still running" || bad "G5n the item changed or the session is gone"
+# the daemon stands down
+cp "$STATE" "$W/state.before"; run_d -- run-once
+{ cmp -s "$STATE" "$W/state.before" && cmp -s "$INFRA/kc/items/$SVC" "$W/item.before" && grep -q "disabled by .*pool-account-degraded" "$CITY/.gc/logs/claude-pool-account.log"; } && ok "G5o the daemon stands down under the marker (no switch, says why in its log)" || bad "G5o daemon under marker: $(tail -2 "$CITY/.gc/logs/claude-pool-account.log" 2>/dev/null)"
+# an agent started in that state answers normally
+: > "$SINKS/claude-launch.log"; run_wrapper -- -p hello
+{ [ "$GRC" = 0 ] && [ "$(cat "$LAST")" = "answer: ok (ambient login)" ] && grep -q "^SECDIR=<unset>$" "$SINKS/claude-launch.log"; } && ok "G5p AC2: an agent started in that state answers normally, on the current login (rc 0, no pool item pointed at)" || bad "G5p rc=$GRC out='$(head -c 200 "$LAST")'"
+# it comes back by itself
+set_ver 1.0.3; set_mode ok; gtick 60
+{ [ "$(gv 1.0.3 result)" = pass ] && [ ! -e "$marker" ] && [ "$(ncalls)" = 2 ]; } && ok "G5q a claude that passes again -> marker removed, auto-switch back ON" || bad "G5q result='$(gv 1.0.3 result)' marker=$([ -e "$marker" ] && echo yes || echo no) calls=$(ncalls)"
+c="$(call_n 2)"; { [[ "$c" == *"religada"* ]] && [[ "$c" == *"[-p] [2]"* ]] && [[ "$c" != "CALL force=1 "* ]]; } && ok "G5r ...announced quietly (priority 2, not forced)" || bad "G5r: $c"
+# the real notify answers a quiet notice with 12 (the digest): that is where it was meant to go, so the episode closes and the notice is not sent again
+n_q=$(ncalls); gtick 60; gtick 60; gtick 60
+{ [ "$(gj "$GSTATE" degraded)" = "<none>" ] && [ "$(ncalls)" = "$n_q" ] && [ "$(ndelivered)" = 1 ]; } && ok "G5r2 ...notify's router sends it to the digest (exit 12): the episode is closed, it is not repeated every minute, and only the forced 'OFF' push reached the phone" || bad "G5r2 degraded=$(gj "$GSTATE" degraded) calls $n_q -> $(ncalls) delivered=$(ndelivered)"
+run_wrapper -- -p hello; [ "$(cat "$LAST")" = "answer: ok (pool item)" ] && ok "G5s ...and a new launch follows the pool item again" || bad "G5s: $(cat "$LAST")"
+kill "$SESSION_PID" 2>/dev/null
+# same version, fixed later: retried every 30 min
+set_ver 1.0.4; set_mode renamed; gtick 60; c1=$(claude_auth_calls); set_mode ok; gtick 600
+{ [ -s "$marker" ] && [ "$(claude_auth_calls)" = "$c1" ]; } && ok "G5t degraded, then claude is fixed in place: 10 min later it is NOT yet retested" || bad "G5t marker=$([ -s "$marker" ] && echo yes || echo no) calls $c1 -> $(claude_auth_calls)"
+gtick 1300
+{ [ "$(gv 1.0.4 result)" = pass ] && [ ! -e "$marker" ]; } && ok "G5u ...30 min after the failure it is retested, passes, and the marker goes" || bad "G5u result='$(gv 1.0.4 result)' marker=$([ -e "$marker" ] && echo yes || echo no)"
+# a marker the guard did not write is not the guard's to remove
+set_ver 1.0.5; printf '{"by":"someone-else"}\n' > "$marker"; gtick 60
+{ [ -s "$marker" ] && gl | grep -q "not written by this guard"; } && ok "G5v a marker written by someone else is left alone (and the log says so)" || bad "G5v foreign marker removed or unexplained"
+rm -f "$marker"
+
+# a flaky first answer is not a failure
+new_w; active_world; : > "$INFRA/flaky.once"; gtick 0
+{ [ "$(gv 1.0.0 result)" = pass ] && [ "$(gv 1.0.0 attempts)" = 2 ] && [ ! -e "$marker" ] && [ "$(ncalls)" = 0 ]; } && ok "G5w one wrong answer, right on the retry -> pass (attempts=2), nothing degraded, nothing sent" || bad "G5w result='$(gv 1.0.0 result)' attempts='$(gv 1.0.0 attempts)'"
+# a claude that stopped looking at the item: still logged in with it gone
+new_w; active_world; set_mode ignores; gtick 0
+{ [ "$(gv 1.0.0 result)" = fail ] && [ -s "$marker" ]; } && ok "G5x a claude that is logged in whether or not the item exists is a FAIL too (it is not reading the pool item)" || bad "G5x result='$(gv 1.0.0 result)'"
+# the drills: the pool credential removed / renamed as claude sees it
+for f in remove rename; do
+  new_w; active_world; gtick 0 CLAUDE_POOL_GUARD_FAULT=$f
+  { [ "$(gv 1.0.0 result)" = fail ] && [ -s "$marker" ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"DESLIGADA"* ]]; } && ok "G5y AC2 drill: credential $f -> the per-version test fails, an alert says auto-switch is OFF" || bad "G5y drill $f: result='$(gv 1.0.0 result)' calls=$(ncalls)"
+  cmp -s <(blob_of "$KEY_a" | xxd -p | tr -d '\n') "$INFRA/kc/items/$SVC" && ok "G5y2 ...the real pool item is untouched by the drill ($f)" || bad "G5y2 drill $f changed the pool item"
+done
+# inconclusive is not a failure
+new_w; active_world; set_mode hang; gtick 0 CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=1
+{ [ "$(gv 1.0.0 result)" = inconclusive ] && [ ! -e "$marker" ] && [ "$(ncalls)" = 0 ]; } && ok "G5z a claude that hangs -> inconclusive: no degradation, no alert (yet)" || bad "G5z result='$(gv 1.0.0 result)' calls=$(ncalls)"
+for _i in 1 2 3 4 5 6 7; do gtick 300 CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=1; done
+{ [ ! -e "$marker" ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"guarda sem enxergar"* ]]; } && ok "G5z2 ...still inconclusive after 30 min -> ONE 'cannot verify' alert, and STILL no degradation" || bad "G5z2 marker=$([ -e "$marker" ] && echo yes || echo no) calls=$(ncalls) $(call_n 1)"
+new_w; active_world; set_mode garbage; gtick 0
+{ [ "$(gv 1.0.0 result)" = inconclusive ] && [ ! -e "$marker" ]; } && ok "G5z3 a claude that prints something that is not JSON -> inconclusive, not a failure" || bad "G5z3 result='$(gv 1.0.0 result)'"
+fi
+
+# ═══ G8. the scratch item ═══════════════════════════════════════════════════════════════════════════
+if want G8; then
+echo "G8. the self-test's scratch item: never the pool's, never trusted if left behind"
+# the scratch item can never be the pool's
+new_w; active_world; gtick 0 CLAUDE_POOL_CRED_DIR="$SCR/cred" GC_POOL_CRED_DIR="$SCR/cred"
+{ [ "$(gv 1.0.0 result)" = inconclusive ] && ! grep -q "^OP delete-generic-password" "$SINKS/kc-ops.log"; } && ok "G8 a scratch item that would BE the pool item is refused (inconclusive; nothing deleted or written)" || bad "G8 result='$(gv 1.0.0 result)' ops: $(grep -c '^OP' "$SINKS/kc-ops.log")"
+# a leftover scratch item from a killed run is cleared, not trusted
+new_w; active_world; LEFT="Claude Code-credentials-$(printf '%s' "$SCR/cred" | shasum -a 256 | cut -c1-8)"; printf 'aa' > "$INFRA/kc/items/$LEFT"; gtick 0
+{ [ ! -e "$INFRA/kc/items/$LEFT" ] && [ "$(gv 1.0.0 result)" = pass ]; } && ok "G8a a scratch item left by a killed run is cleared before the test, and gone after it" || bad "G8a leftover=$([ -e "$INFRA/kc/items/$LEFT" ] && echo yes || echo no) result='$(gv 1.0.0 result)'"
+# its own state file
+new_w; active_world; gtick 0; printf 'not json at all' > "$GSTATE"; gtick 60
+{ [ "$GRC" = 0 ] && [ "$(gv 1.0.0 result)" = pass ] && ls "$DATA"/guard.json.corrupt.* >/dev/null 2>&1; } && ok "G8b a corrupt guard state is moved aside and rebuilt (no crash, the self-test is redone)" || bad "G8b rc=$GRC $(ls "$DATA")"
 fi
 
 # ═══ G4g. the guard's OWN record can be wrong too ═════════════════════════════════════════════════
@@ -354,6 +523,8 @@ hb_touch; gtick 1; gwalk 650
 [ "$(wc -l < "$SINKS/notify.delivered" | tr -d ' ')" = 2 ] && ok "G6f2 ...and the second alert really reached the phone (not dropped as a duplicate title: calls=$(ncalls) delivered=2)" || bad "G6f2 delivered=$(wc -l < "$SINKS/notify.delivered" | tr -d ' ') of $(ncalls)"
 new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; for _i in 1 2 3 4 5 6; do gtick 600 GC_POOL_ACCOUNT=0; done
 [ "$(ncalls)" = 0 ] && ok "G6g an operator who switched the mechanism off is not told the daemon stopped" || bad "G6g alerted under the kill switch"
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; set_mode renamed; for _i in 1 2 3 4 5 6; do gtick 600; done
+{ [ -s "$marker" ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"DESLIGADA"* ]]; } && ok "G6h degraded (marker): the daemon is stood down on purpose, so it is not 'dead' (the only push is the one that says auto-switch is off)" || bad "G6h under the marker: calls=$(ncalls) $(call_n 2)"
 # a heartbeat that cannot be READ (garbled, no time in it, stamped in the future, not a file) says nothing about the daemon: no 'dead' verdict, and after 30 min the guard says it is blind
 hb_case() { # hb_case <label> <how to spoil the heartbeat: a shell snippet using $hbf>; the pool is activated and the daemon never stamps again
   new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; local hbf="$CITY/.gc/claude-pool-account.heartbeat"; eval "$2"
@@ -390,10 +561,62 @@ else ok "G6l Keychain locked + no heartbeat + no decision -> no 'daemon is dead'
 rm -f "$INFRA/kc/locked"
 fi
 
+# ═══ G9. `status` is a way to ask, so it must not turn "I could not look" into an answer ═════════════
+if want G9; then
+echo "G9. status: 'not tested yet' is not 'cannot tell'"
+new_w; run_guard -- status
+{ [ "$GRC" = 0 ] && grep -q "per-version self-test: not tested yet" "$LAST"; } && ok "G9 no state file yet -> 'not tested yet' (that one IS the true answer), rc 0" || bad "G9 rc=$GRC: $(head -c 300 "$LAST")"
+new_w; printf 'not json at all' > "$GSTATE"; run_guard -- status
+{ [ "$GRC" = 1 ] && grep -q "unknown (the guard's state file is corrupt)" "$LAST" && ! grep -q "not tested yet" "$LAST"; } && ok "G9a a corrupt state file -> 'unknown (... corrupt)', rc 1 - not 'not tested yet'" || bad "G9a rc=$GRC: $(head -c 300 "$LAST")"
+{ [ -f "$GSTATE" ] && [ "$(cat "$GSTATE")" = "not json at all" ] && ! ls "$DATA"/guard.json.corrupt.* >/dev/null 2>&1; } && ok "G9b ...and asking did not move or change the file (status only looks)" || bad "G9b the state file was touched: $(ls "$DATA")"
+run_guard -- status --json
+{ [ "$GRC" = 1 ] && [ "$(gj "$LAST" state_file)" = corrupt ] && [[ "$(gj "$LAST" installed_result)" == "unknown (the guard's state file is corrupt)" ]]; } && ok "G9c status --json says the same (state_file=corrupt, installed_result unknown)" || bad "G9c rc=$GRC: $(head -c 300 "$LAST")"
+if [ "$(id -u)" != 0 ]; then
+  new_w; echo '{}' > "$GSTATE"; chmod 000 "$GSTATE"; run_guard -- status; chmod 600 "$GSTATE"
+  { [ "$GRC" = 1 ] && grep -q "unknown (the guard's state file is unreadable)" "$LAST"; } && ok "G9d a state file that cannot be read -> 'unknown (... unreadable)', rc 1" || bad "G9d rc=$GRC: $(head -c 300 "$LAST")"
+fi
+new_w; active_world; gtick 0
+run_guard GC_LOWPRIO_CLAUDE_BIN=no-such-claude-binary-xyz -- status
+{ [ "$GRC" = 0 ] && grep -q "unknown (the installed claude version could not be read)" "$LAST" && ! grep -q "self-test: pass" "$LAST" && ! grep -q "not tested yet" "$LAST"; } && ok "G9e claude cannot be run -> the installed version's result is 'unknown', never the last recorded one or 'not tested yet'" || bad "G9e rc=$GRC: $(head -c 400 "$LAST")"
+run_guard GC_LOWPRIO_CLAUDE_BIN=no-such-claude-binary-xyz -- status --json
+{ [[ "$(gj "$LAST" installed_result)" == "unknown (the installed claude version could not be read)" ]] && [ "$(gj "$LAST" versions/1.0.0/result)" = pass ]; } && ok "G9f ...while the recorded history is still shown (status --json: versions/1.0.0 = pass)" || bad "G9f: $(head -c 400 "$LAST")"
+run_guard -- status
+grep -q "per-version self-test: pass" "$LAST" && ok "G9g and with claude readable and tested, the answer is the recorded result" || bad "G9g: $(head -c 300 "$LAST")"
+# the marker is looked for under GC_CITY_PATH (only the plist and agent sessions export it: a plain shell does not). No city to look in is
+# not "no marker": the documented way to ask 'is auto-switch OFF?' must not answer 'on' exactly when it cannot look.
+new_w; active_world; gtick 0; run_guard -- status
+{ [ "$GRC" = 0 ] && grep -q "^auto-switch      : on$" "$LAST"; } && ok "G9h city readable, no marker -> 'auto-switch: on', rc 0" || bad "G9h rc=$GRC: $(head -c 300 "$LAST")"
+printf '{"by":"claude-pool-guard"}\n' > "$marker"; run_guard -- status
+{ [ "$GRC" = 0 ] && grep -q "^auto-switch      : OFF (degraded marker present)$" "$LAST"; } && ok "G9i city readable, marker there -> OFF" || bad "G9i rc=$GRC: $(head -c 300 "$LAST")"
+run_guard GC_CITY_PATH= -- status
+{ [ "$GRC" = 1 ] && grep -q "^auto-switch      : unknown (GC_CITY_PATH is not set" "$LAST" && ! grep -q "auto-switch      : on" "$LAST"; } && ok "G9j the SAME marker, no GC_CITY_PATH -> 'unknown (GC_CITY_PATH is not set ...)', rc 1 - not 'on'" || bad "G9j rc=$GRC: $(head -c 300 "$LAST")"
+run_guard GC_CITY_PATH= -- status --json
+{ [ "$GRC" = 1 ] && [ "$(gj "$LAST" degraded)" = "<none>" ] && [[ "$(gj "$LAST" auto_switch)" == "unknown (GC_CITY_PATH is not set"* ]]; } && ok "G9k status --json: degraded is null (not false) and auto_switch says 'unknown (...)', rc 1" || bad "G9k rc=$GRC: $(head -c 300 "$LAST")"
+run_guard -- status --json
+{ [ "$GRC" = 0 ] && [ "$(gj "$LAST" degraded)" = "True" ] && [ "$(gj "$LAST" auto_switch)" = OFF ]; } && ok "G9l ...and with the city, --json says degraded=true / auto_switch=OFF" || bad "G9l rc=$GRC: $(head -c 300 "$LAST")"
+rm -f "$marker"
+if [ "$(id -u)" != 0 ]; then
+  chmod 000 "$CITY/.gc"; run_guard -- status; chmod 755 "$CITY/.gc"
+  { [ "$GRC" = 1 ] && grep -q "^auto-switch      : unknown (" "$LAST" && ! grep -q "auto-switch      : on" "$LAST"; } && ok "G9m a city whose .gc cannot be looked into -> 'unknown (...)', rc 1 (not a crash, not 'on')" || bad "G9m rc=$GRC: $(head -c 400 "$LAST")"
+fi
+new_w; active_world; gtick 0; rm -rf "$CITY/.gc"; run_guard -- status
+{ [ "$GRC" = 1 ] && grep -q "^auto-switch      : unknown (" "$LAST"; } && ok "G9n a GC_CITY_PATH with no .gc in it (a mistyped path) -> unknown, not 'on'" || bad "G9n rc=$GRC: $(head -c 300 "$LAST")"
+fi
+
 # ═══ G10. a stand-down is not a daemon death ═══════════════════════════════════════════════════════
 if want G10; then
 echo "G10. the guard judges the daemon's silence only over time it was LOOKING: not over a stand-down, not over its own absence"
-# While the mechanism is OFF the REAL daemon stamps no heartbeat (HB_AUTO=0 is that daemon; HB_AUTO=1 re-stamps every tick, stand-down included, and hid this).
+# While auto-switch is OFF the REAL daemon stamps no heartbeat (HB_AUTO=0 is that daemon; HB_AUTO=1 re-stamps every tick, stand-down included, and hid this).
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; hb_touch
+set_ver 1.0.2; set_mode renamed; gtick 60
+{ [ -s "$marker" ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"DESLIGADA"* ]]; } && ok "G10 degraded at +60 s (the daemon last stamped before that and, stood down, stamps no more)" || bad "G10 marker=$([ -s "$marker" ] && echo yes || echo no) calls=$(ncalls)"
+set_ver 1.0.3; set_mode ok; gtick 1900
+{ [ ! -e "$marker" ] && [[ "$(call_n 2)" == *"religada"* ]]; } && ok "G10a 31 min on the retest passes and the marker is lifted ('religada' went out)" || bad "G10a marker=$([ -e "$marker" ] && echo yes || echo no) calls=$(ncalls)"
+if grep -q "não está fechando rodadas" "$SINKS/notify.log"; then bad "G10b the daemon was called dead the moment it was switched back on (its last stamp was 32 min old: it had been stood down, not dead): $(sed -n 3p "$SINKS/notify.log" | cut -c1-200)"
+else ok "G10b ...and nobody is told the daemon 'is not closing rounds' at the moment of the lift (calls=$(ncalls): DESLIGADA, religada)"; fi
+gwalk 540; n1=$(ncalls)
+gwalk 120; n2=$(ncalls)
+{ [ "$n1" = 2 ] && [ "$n2" = 3 ] && [[ "$(call_n 3)" == *"não está fechando rodadas"* ]]; } && ok "G10c a daemon that is STILL silent 10 min after the lift is told (calls at 9 min/11 min after the lift: $n1/$n2) - the grace is 10 minutes, not forever" || bad "G10c calls=$n1/$n2: $(call_n 3 | cut -c1-200)"
 # the same for the operator's switches: the daemon (and the guard) do nothing while they are on
 g10_off() { # g10_off <file|env>: the mechanism is switched off for 30 min by <city>/.gc/no-pool-account or by GC_POOL_ACCOUNT=0, then back on
   local kind="$1"
@@ -419,6 +642,130 @@ hb_touch; gtick 60; gwalk 300
 # a guard that has been watching all along still alerts on the real silence, on time (the old behaviour, unchanged)
 new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; hb_touch; gwalk 540; n1=$(ncalls); gwalk 120; n2=$(ncalls)
 { [ "$n1" = 0 ] && [ "$n2" = 1 ]; } && ok "G10h a guard that was watching: a stamp 10 min old is alerted at 10 min, not later (calls at 9/11 min: $n1/$n2)" || bad "G10h calls=$n1/$n2"
+# 'could not tell' counters do not run through a stand-down either
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; printf 'garbage' > "$CITY/.gc/claude-pool-account.heartbeat"; gtick 60
+set_ver 1.0.2; set_mode renamed; gtick 60                                    # degraded: the liveness and divergence checks are not asked any more
+[ "$(gj "$GSTATE" blind/daemon-heartbeat)" = "<none>" ] && ok "G10i under the marker the 'cannot read the heartbeat' record is dropped (the check was not asked, its 30 minutes must not run on)" || bad "G10i blind record kept under the marker: $(gj "$GSTATE" blind)"
+fi
+
+# ═══ G11. every condition gets its own push ═════════════════════════════════════════════════════════
+if want G11; then
+echo "G11. notify drops a push whose TITLE went out in the last 30 min (exit 11, whatever the body): two different conditions must not share one"
+new_w; active_world; : > "$SINKS/notify.titledup"; gtick 0
+put_item "$KEY_b"; div3                                                       # a is the rule, the pool is on b
+put_item "$KEY_a"; gtick 60                                                   # fixed: the episode closes
+put_item "$KEY_c"; div3                                                       # NEW episode, 6 min later: the pool is on c
+{ [ "$(ncalls)" = 2 ] && [ "$(ndelivered)" = 2 ]; } && ok "G11 two divergences 6 min apart, a->b then a->c: BOTH reached the phone (they carry different fingerprints in the title)" || bad "G11 asked notify $(ncalls)x, delivered $(ndelivered): $(cat "$SINKS/notify.delivered" 2>/dev/null | cut -c1-120 | tr '\n' '|')"
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; hb_touch; : > "$SINKS/notify.titledup"
+printf 'garbage' > "$CITY/.gc/claude-pool-account.heartbeat"; : > "$INFRA/kc/locked"          # three things the guard cannot see, one cause
+gtick 0; for _i in 1 2 3 4 5 6 7; do gtick 300; done
+{ [ "$(ncalls)" = 3 ] && [ "$(ndelivered)" = 3 ]; } && ok "G11a three 'guard is blind' alerts at 30 min (divergence, daemon-heartbeat, the self-test): all THREE reached the phone" || bad "G11a asked notify $(ncalls)x, delivered $(ndelivered): $(cat "$SINKS/notify.delivered" 2>/dev/null | cut -c1-100 | tr '\n' '|')"
+miss=""; for w in "divergence" "daemon-heartbeat" "self-test of claude 1.0.0"; do grep -qF "guarda sem enxergar ($w)" "$SINKS/notify.delivered" 2>/dev/null || miss="$miss [$w]"; done
+[ -z "$miss" ] && ok "G11b ...each title says WHAT the guard cannot see" || bad "G11b the title does not say what the guard cannot see:$miss"
+rm -f "$INFRA/kc/locked"
+new_w; active_world; : > "$SINKS/notify.titledup"; set_ver 1.0.2; set_mode renamed; gtick 60; set_ver 1.0.3; gtick 60
+{ [ "$(ncalls)" = 2 ] && [ "$(ndelivered)" = 2 ]; } && ok "G11c claude 1.0.2 fails and a minute later 1.0.3 fails too: both 'auto-switch OFF' pushes reached the phone (the version is in the title)" || bad "G11c asked $(ncalls)x, delivered $(ndelivered): $(cat "$SINKS/notify.delivered" 2>/dev/null | cut -c1-100 | tr '\n' '|')"
+# an identical repeat is still ONE push (that is what rc 11 is for)
+new_w; active_world; : > "$SINKS/notify.titledup"; gtick 0; put_item "$KEY_b"; div3; put_item "$KEY_a"; gtick 60; put_item "$KEY_b"; div3
+{ [ "$(ncalls)" = 2 ] && [ "$(ndelivered)" = 1 ]; } && ok "G11d the SAME divergence again within 30 min -> the phone gets it once (notify's dedup is respected, and counted as 'already pushed')" || bad "G11d asked $(ncalls)x, delivered $(ndelivered)"
+fi
+
+# ═══ G12. a failed test the guard cannot act on is said out loud ════════════════════════════════════
+if want G12; then
+echo "G12. the self-test failed but the marker cannot be written: that is the worst state, so it is told, not just logged"
+if [ "$(id -u)" != 0 ]; then
+  new_w; active_world; gtick 0                                                 # the lock file exists now
+  chmod 555 "$CITY/.gc"; set_ver 1.0.2; set_mode renamed; gtick 60; gtick 60; gtick 60
+  { [ ! -e "$marker" ] && [ "$(gv 1.0.2 result)" = fail ] && [ "$(ncalls)" = 1 ]; } && ok "G12 .gc not writable: the test FAILS, no marker can be written, and ONE push says so (3 ticks)" || bad "G12 marker=$([ -e "$marker" ] && echo yes || echo no) result='$(gv 1.0.2 result)' calls=$(ncalls)"
+  c="$(call_n 1)"
+  { [[ "$c" == *"NÃO foi desligada"* ]] && [[ "$c" == *"1.0.2"* ]] && [[ "$c" == *"[-p] [4]"* ]] && [[ "$c" != *"DESLIGADA"* ]]; } && ok "G12a ...it says the switch is still ON (not 'OFF'), names the version, priority 4" || bad "G12a: $c"
+  [ "$(gj "$GSTATE" degraded)" = "<none>" ] && ok "G12b ...and the guard does not record a degradation it never made" || bad "G12b degraded recorded: $(gj "$GSTATE" degraded)"
+  gtick 60; gtick 60
+  { [ "$(ncalls)" = 1 ] && [ ! -e "$marker" ]; } && ok "G12c still unwritable 2 ticks later: the push is not repeated every minute" || bad "G12c calls=$(ncalls)"
+  chmod 755 "$CITY/.gc"; gtick 60
+  { [ -s "$marker" ] && [ "$(ncalls)" = 2 ] && [[ "$(call_n 2)" == *"DESLIGADA"* ]]; } && ok "G12d once .gc is writable again the marker is written on the next tick and the normal 'auto-switch OFF' push goes out" || bad "G12d marker=$([ -s "$marker" ] && echo yes || echo no) calls=$(ncalls)"
+  [ "$(gj "$GSTATE" marker_failed)" = "<none>" ] && ok "G12e ...and the 'could not write' record is closed" || bad "G12e record kept: $(gj "$GSTATE" marker_failed)"
+else
+  ok "G12 skipped (root can write anywhere)"
+fi
+fi
+
+# ═══ G13. a marker that is not the guard's ══════════════════════════════════════════════════════════
+if want G13; then
+echo "G13. a self-test that passes while someone else's marker is still up does not announce that auto-switch is back"
+new_w; active_world; set_ver 1.0.2; set_mode renamed; gtick 60                 # degraded by the guard: DESLIGADA
+printf '{"by":"someone-else"}\n' > "$marker"                                   # ...and the marker is replaced by one the guard did not write
+set_ver 1.0.3; set_mode ok; gtick 60
+{ [ -s "$marker" ] && [ "$(ncalls)" = 1 ] && [ "$(gj "$GSTATE" degraded/version)" = "1.0.2" ]; } && ok "G13 the test passes, the foreign marker stays, and NO 'religada' goes out (calls=$(ncalls)); the guard still knows it had degraded" || bad "G13 marker=$([ -s "$marker" ] && echo yes || echo no) calls=$(ncalls) degraded=$(gj "$GSTATE" degraded/version): $(call_n 2 | cut -c1-160)"
+gl | grep -q "not written by this guard" && ok "G13a ...and the log says why" || bad "G13a no explanation in the log"
+gtick 60; gtick 60; [ "$(ncalls)" = 1 ] && ok "G13b the next ticks do not announce it either" || bad "G13b calls=$(ncalls)"
+[ "$(gl | grep -c "not written by this guard")" = 1 ] && ok "G13b2 ...and 'left alone' is said once, not on every tick of the next hours" || bad "G13b2 said $(gl | grep -c "not written by this guard") times"
+rm -f "$marker"; gtick 60
+{ [ "$(ncalls)" = 2 ] && [[ "$(call_n 2)" == *"religada"* ]] && [ "$(gj "$GSTATE" degraded)" = "<none>" ]; } && ok "G13c when the foreign marker is gone, THEN 'religada' goes out and the record closes" || bad "G13c calls=$(ncalls) degraded=$(gj "$GSTATE" degraded): $(call_n 2 | cut -c1-160)"
+fi
+
+# ═══ G14. `selftest` says what it did ═══════════════════════════════════════════════════════════════
+if want G14; then
+echo "G14. claude-pool-guard.py selftest: the operator can tell 'it ran, and this is the verdict' from 'it did nothing'"
+new_w; active_world
+run_guard -- selftest
+{ [ "$GRC" = 0 ] && grep -q "claude 1.0.0: pass" "$LAST"; } && ok "G14 a passing claude -> says 'claude 1.0.0: pass', rc 0" || bad "G14 rc=$GRC out='$(head -c 300 "$LAST")'"
+set_ver 1.0.2; set_mode renamed; run_guard -- selftest
+{ [ "$GRC" = 3 ] && grep -q "claude 1.0.2: fail" "$LAST" && grep -q "auto-switch is now OFF" "$LAST" && [ -s "$marker" ]; } && ok "G14a a failing claude -> says 'fail' and that auto-switch is OFF, rc 3, marker written" || bad "G14a rc=$GRC out='$(head -c 400 "$LAST")'"
+set_mode ok; run_guard -- selftest
+{ [ "$GRC" = 0 ] && grep -q "claude 1.0.2: pass" "$LAST" && grep -q "auto-switch is now on" "$LAST" && [ ! -e "$marker" ]; } && ok "G14b it passes again -> says so, 'auto-switch is now on', rc 0, marker lifted" || bad "G14b rc=$GRC out='$(head -c 400 "$LAST")'"
+set_mode hang; run_guard CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=1 -- selftest
+{ [ "$GRC" = 4 ] && grep -q "inconclusive" "$LAST"; } && ok "G14c a claude that hangs -> 'inconclusive', rc 4 (neither pass nor fail)" || bad "G14c rc=$GRC out='$(head -c 300 "$LAST")'"
+set_mode ok
+# the launchd tick holds the single-instance lock: the operator must not be told nothing
+"$PY3" -c 'import fcntl, sys, time; f = open(sys.argv[1], "w"); fcntl.flock(f, fcntl.LOCK_EX); print("held", flush=True); time.sleep(40)' "$CITY/.gc/claude-pool-guard.lock" > "$W/held.out" &
+HOLD_PID=$!; BG_PIDS="$BG_PIDS $HOLD_PID"; n=0; while [ ! -s "$W/held.out" ] && [ $n -lt 50 ]; do sleep 0.1; n=$((n+1)); done
+c0=$(claude_auth_calls); run_guard -- selftest
+{ [ "$GRC" = 1 ] && grep -q "NOT run" "$LAST" && grep -q "another guard run" "$LAST" && [ "$(claude_auth_calls)" = "$c0" ]; } && ok "G14d the lock is held -> 'the self-test was NOT run (another guard run holds the lock)', rc 1, claude not asked" || bad "G14d rc=$GRC out='$(head -c 300 "$LAST")'"
+run_guard -- run-once; [ "$GRC" = 0 ] && ok "G14e ...while the launchd tick (run-once) keeps its quiet rc 0 under the same contention" || bad "G14e run-once rc=$GRC"
+kill "$HOLD_PID" 2>/dev/null; wait "$HOLD_PID" 2>/dev/null
+run_guard GC_POOL_ACCOUNT=0 -- selftest
+{ [ "$GRC" = 1 ] && grep -q "NOT run" "$LAST" && grep -q "GC_POOL_ACCOUNT=0" "$LAST"; } && ok "G14f the operator's kill switch is on -> 'NOT run: disabled by GC_POOL_ACCOUNT=0', rc 1" || bad "G14f rc=$GRC out='$(head -c 300 "$LAST")'"
+run_guard GC_LOWPRIO_CLAUDE_BIN=no-such-claude-binary-xyz -- selftest
+{ [ "$GRC" = 1 ] && grep -q "NOT run" "$LAST"; } && ok "G14g no claude to ask -> 'NOT run', rc 1" || bad "G14g rc=$GRC out='$(head -c 300 "$LAST")'"
+fi
+
+# ═══ G16. the quiet notice follows notify's router; a record of a superseded version goes ═══════════
+if want G16; then
+echo "G16. 'religada' is accepted where notify's router sends it (digest, 12) and not retried for ever; a forced push the router did not take IS retried; a blind record of a version that is gone is dropped"
+# gate ga-rtps35 B1: the real notify answers the unforced notice with 12. The episode used to stay open and the notice went out every minute for ever.
+new_w; active_world; set_ver 1.0.2; set_mode renamed; gtick 60
+set_ver 1.0.3; set_mode ok; gtick 60; n1=$(ncalls)
+for _i in 1 2 3 4 5 6 7 8 9 10; do gtick 60; done
+{ [ "$n1" = 2 ] && [ "$(ncalls)" = 2 ] && [ "$(gj "$GSTATE" degraded)" = "<none>" ] && [[ "$(call_n 2)" == *"religada"* ]] && [[ "$(call_n 2)" == *"strict=1"* ]]; } && ok "G16 B1: the notice is sent ONCE (exit 12 = the digest, where a quiet notice is meant to go), the episode closes, 10 ticks later no repeat" || bad "G16 calls $n1 -> $(ncalls) degraded=$(gj "$GSTATE" degraded)"
+# the same exit 12 on a FORCED push is the rate cap: nothing reached the phone, so it is NOT delivered and is tried again
+new_w; active_world; : > "$SINKS/notify.cap"; set_ver 1.0.2; set_mode renamed; gtick 60; gtick 60; gtick 60; n_cap=$(ncalls)
+rm -f "$SINKS/notify.cap"; gtick 60; n_after=$(ncalls); gtick 60; gtick 60
+{ [ "$n_cap" = 3 ] && [ "$n_after" = 4 ] && [ "$(ncalls)" = 4 ] && [ "$(ndelivered)" = 1 ] && [[ "$(call_n 4)" == *"DESLIGADA"* ]]; } && ok "G16a a FORCED 'auto-switch OFF' that meets the rate cap (12) is retried every tick until it goes out, then not again" || bad "G16a calls under the cap=$n_cap, after=$n_after, end=$(ncalls), delivered=$(ndelivered)"
+# a notice notify will not take (any other exit): tried for a while, then given up with a line in the log - never for ever
+new_w; active_world; set_ver 1.0.2; set_mode renamed; gtick 60
+set_ver 1.0.3; set_mode ok; printf 14 > "$SINKS/notify.rc"; gtick 60; gtick 600; n_a=$(ncalls); d_a=$(gj "$GSTATE" degraded)
+gtick 600; gtick 600; gtick 600; n_b=$(ncalls); d_b=$(gj "$GSTATE" degraded); gtick 600; gtick 600; n_c=$(ncalls)
+{ [ "$n_a" = 3 ] && [ "$d_a" != "<none>" ] && [ "$d_b" = "<none>" ] && [ "$n_c" = "$n_b" ]; } && ok "G16b a notice notify keeps refusing: retried for 30 min, then the record is closed and it stops (calls $n_a -> $n_b -> $n_c)" || bad "G16b calls $n_a/$n_b/$n_c degraded $d_a / $d_b"
+gl | grep -q "gave up announcing" && ok "G16c ...and the log says it gave up" || bad "G16c no 'gave up' line: $(gl | tail -3)"
+# B-low: the blind record of a self-test of a claude that is no longer the installed one is dropped, not kept for ever
+new_w; active_world; set_ver 1.0.0; set_mode hang
+for _i in 1 2 3 4 5 6 7; do gtick 300 CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=1; done
+b_before="$(gj "$GSTATE" "blind/self-test of claude 1.0.0")"
+set_ver 1.0.1; set_mode ok; gtick 60
+{ [ "$b_before" != "<none>" ] && [ "$(gj "$GSTATE" "blind/self-test of claude 1.0.0")" = "<none>" ] && [ "$(gv 1.0.1 result)" = pass ]; } && ok "G16d a claude update drops the 'cannot verify' record of the old version (it would otherwise stay in the state and in 'status' for ever)" || bad "G16d before=$b_before after=$(gj "$GSTATE" blind) 1.0.1=$(gv 1.0.1 result)"
+# whether the marker is up cannot be told (on Python 3.9 Path.exists raises PermissionError): a traceback is no answer, and neither is 'no marker'
+new_w; active_world; base=(); while IFS= read -r l; do base+=("$l"); done < <(BASE_ENV)
+env -i "${base[@]}" "$PY3" -I -c '
+import importlib.util, pathlib, sys
+sp = importlib.util.spec_from_file_location("g", sys.argv[1]); g = importlib.util.module_from_spec(sp); sp.loader.exec_module(g)
+g.D = g.load_daemon(); real = pathlib.Path.exists
+def exists(self):
+    if self.name == g.D.DEGRADED_MARKER: raise PermissionError(13, "selftest")
+    return real(self)
+pathlib.Path.exists = exists
+gs = {}; print(g.apply_result(gs, g.D.now(), "1.0.3", "pass", ""), sorted(gs.get("blind", {})), gs.get("degraded"))' "$GUARD" > "$SINKS/inproc.out" 2>&1
+{ [ "$(cat "$SINKS/inproc.out")" = "unchanged ['degraded-marker'] None" ] && [ "$(ncalls)" = 0 ]; } && ok "G16e a marker whose presence cannot be told: nothing changed, nothing announced ('religada' needs a marker known to be gone), the guard records that it is blind" || bad "G16e: $(head -c 300 "$SINKS/inproc.out")"
 fi
 
 echo

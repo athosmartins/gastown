@@ -8,32 +8,49 @@ The 1a daemon moves the pool between accounts by rewriting ONE Keychain item tha
      (claude_pool_current_account.json: `current` + `fingerprint`). Persisting for DEBOUNCE_S (120 s: the daemon writes the item and
      then the file, so a short disagreement is normal) -> ONE push to Athos naming both accounts by e-mail + 8-hex fingerprint, repeated
      every 6 h while it lasts, nothing when it is fixed. The guard never corrects it: that is the daemon's job.
-  2. THE DAEMON'S LIVENESS: a run that gets to the end without logging an ERROR stamps <city>/.gc/claude-pool-account.heartbeat. No such run
-     for 10 min -> one push. (The exit status cannot say it: a run that found no accounts library exits 0 too.)
+  2. A CLAUDE RELEASE THAT CHANGED THE INTERNALS. Whenever `claude --version` differs from the last version tested, a per-version
+     self-test runs: claude is pointed at a scratch item (fake credential, scratch directory - never the pool item) and asked
+     `claude auth status --json` (local: no inference, no network). It must be logged in while the item is there and NOT logged in once the
+     item is gone. If it is not -> the mechanism does not work on this version -> the guard writes <city>/.gc/pool-account-degraded.
+     The daemon then does nothing and claude-lowprio.sh stops pointing new pool launches at the item: they start on the ambient login.
+     Nothing is deleted and no session is interrupted (a live session keeps the last account written, a valid login). One push says
+     "auto-switch is OFF". The self-test is repeated every 30 min while degraded and on every new version; when it passes the marker is
+     removed (the log says so) and, if an alert had said auto-switch was OFF, a quiet notice says it is back.
+  + the daemon's liveness: a run that gets to the end without logging an ERROR stamps <city>/.gc/claude-pool-account.heartbeat. No such run
+    for 10 min -> one push. (The exit status cannot say it: a run that found no accounts library exits 0 too.)
 
 THREE ANSWERS, never two. Every check says yes / no / could not tell, and "could not tell" never acts: a locked Keychain, an unreadable
-file, a vault that does not answer is not a divergence and not a dead daemon. It is reported (as "guard blind" after 30 min) and changes nothing.
+file, a claude that timed out is not a divergence and not a failure. It is reported (as "guard blind" after 30 min) and changes nothing.
+The test result is pass / fail / inconclusive; only a fail - twice in a row - degrades.
 
 Tokens: the guard holds the pool item's credential in memory only to take its sha256[:8]. It never puts a credential in argv, env, a log,
-its state file, an alert or an error message.
+its state file, an alert or an error message; the fake credential of the self-test goes to the Keychain on `security -i`'s STDIN.
 Alerts carry e-mails and 8-hex fingerprints only, and are refused if they contain anything token-shaped.
 
 Usage:  claude-pool-guard.py run-once            one pass (launchd, every 60 s, single instance)
+        claude-pool-guard.py status [--json]     the per-version results + open episodes (reads the state file; no side effect)
+        claude-pool-guard.py selftest            run the per-version self-test now, whatever was recorded, and act on the result
 KNOBS: GC_POOL_ACCOUNT=0 or <city>/.gc/no-pool-account -> the guard does nothing (the operator turned the mechanism off).
-SEAMS (tests): CLAUDE_POOL_GUARD_STATE, CLAUDE_POOL_NOTIFY_CMD, CLAUDE_POOL_GUARD_DEBOUNCE_S (<= 240), and the daemon's own:
-CLAUDE_POOL_STATE, CLAUDE_POOL_CRED_DIR, CLAUDE_POOL_ACCOUNTS_LIB, CLAUDE_POOL_NOW, CLAUDE_POOL_DAEMON.
+SEAMS (tests): CLAUDE_POOL_GUARD_STATE, CLAUDE_POOL_GUARD_SCRATCH, CLAUDE_POOL_NOTIFY_CMD, CLAUDE_POOL_GUARD_DEBOUNCE_S (<= 240),
+CLAUDE_POOL_GUARD_RETRY_WAIT_S, CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S, CLAUDE_POOL_GUARD_FAULT (remove|rename: a drill that makes the self-test see the credential removed or
+renamed from claude's side), GC_LOWPRIO_CLAUDE_BIN (the claude the pool runs), and the daemon's own: CLAUDE_POOL_STATE,
+CLAUDE_POOL_CRED_DIR, CLAUDE_POOL_ACCOUNTS_LIB, CLAUDE_POOL_NOW, CLAUDE_POOL_DAEMON.
 """
 from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import importlib.util
 import json
 import math
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -45,7 +62,13 @@ REMIND_S = 6 * 3600              # an open episode is repeated this often, never
 BLIND_S = 1800                   # 'could not tell' for this long is itself reported (once)
 HEARTBEAT_STALE_S = 600          # the daemon runs every 60 s: 10 min without a clean run is not a slow run
 LIVENESS_GAP_S = 300             # two looks at the daemon further apart than this: the guard was not looking in between (asleep, unloaded, off, stood down)
+SELFTEST_RETRY_S = 1800          # while degraded: try the self-test again this often
+INCONCLUSIVE_RETRY_S = 300       # an inconclusive self-test is repeated this often
+NOTICE_GIVEUP_S = 1800           # the quiet 'auto-switch is back ON' notice is retried for this long if notify keeps refusing it, then dropped
 FP_RE = re.compile(r"[0-9a-f]{8}")
+VERSION_RE = re.compile(r"\d+\.\d+\.\d+[0-9A-Za-z.+-]*")
+SCRATCH_NAME = "claude-pool-guard-scratch"
+PLAIN_ITEM = "Claude Code-credentials"   # Mayor's and the crews' login item: never touched, never even named in a command here
 FP_MAP_MAX = 20
 
 D = None   # the daemon module (claude-pool-account.py), loaded by main(): ONE definition of how the pool item is named and read
@@ -56,8 +79,9 @@ def load_daemon():
     spec = importlib.util.spec_from_file_location("claude_pool_account_ext", str(p))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    for need in ("disabled", "HEARTBEAT_FILE", "read_item_token", "fingerprint", "login_name", "valid_user", "city", "now", "_iso",
-                 "state_path", "CLOCK_SKEW_S", "_sane_epoch"):
+    for need in ("operator_off", "degraded_marker", "DEGRADED_MARKER", "HEARTBEAT_FILE", "read_item_token", "item_service",
+                 "fingerprint", "login_name", "valid_user", "city", "now", "_iso", "POOL_ITEM_RE", "EXPIRES_AT_MS", "state_path", "CLOCK_SKEW_S",
+                 "_sane_epoch"):
         if not hasattr(mod, need):
             raise ImportError(f"{p.name} lacks {need} (the guard needs the ga-8hcnvb.3 version of the daemon)")
     return mod
@@ -384,7 +408,313 @@ def _probe(f, p: Path) -> Optional[bool]:
         return None
 
 
-# ── 2. the daemon's liveness ───────────────────────────────────────────────────────────────────────
+# ── 2. the per-version self-test ───────────────────────────────────────────────────────────────────
+def claude_binary() -> Optional[str]:
+    return shutil.which(os.environ.get("GC_LOWPRIO_CLAUDE_BIN") or "claude")   # the binary the pool's wrapper execs
+
+
+def claude_version(binary: str) -> Optional[str]:
+    try:
+        r = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=20, check=False,
+                           env={"HOME": os.environ.get("HOME", ""), "PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = VERSION_RE.search(r.stdout or "") if r.returncode == 0 else None
+    return m.group(0) if m else None
+
+
+def scratch_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_POOL_GUARD_SCRATCH") or (Path.home() / ".gastown" / SCRATCH_NAME))
+
+
+def scratch_svc(secdir: str) -> str:
+    return "Claude Code-credentials-" + hashlib.sha256(secdir.encode()).hexdigest()[:8]
+
+
+def svc_is_scratch(svc: str) -> bool:
+    """The only items the self-test may write or delete: a hashed name that is neither the pool's nor the plain login item."""
+    return bool(D.POOL_ITEM_RE.fullmatch(svc)) and svc != D.item_service() and svc != PLAIN_ITEM
+
+
+def kc_put(user: str, svc: str, token: str) -> bool:
+    if not (svc_is_scratch(svc) and D.valid_user(user)):
+        return False
+    blob = {"claudeAiOauth": {"accessToken": token, "expiresAt": D.EXPIRES_AT_MS, "scopes": ["user:inference"], "subscriptionType": None}}
+    cmd = f'add-generic-password -U -a "{user}" -s "{svc}" -X {json.dumps(blob).encode().hex()}\n'   # the credential rides STDIN, not argv
+    try:
+        r = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def kc_get(user: str, svc: str) -> Tuple[str, Optional[str]]:
+    """('ok', credential) | ('missing', None) | ('unknown', None) for a SCRATCH item."""
+    if not (svc_is_scratch(svc) and D.valid_user(user)):
+        return "unknown", None
+    try:
+        r = subprocess.run(["security", "find-generic-password", "-a", user, "-s", svc, "-w"], capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown", None
+    if r.returncode == 44:
+        return "missing", None
+    if r.returncode != 0:
+        return "unknown", None
+    try:
+        tok = json.loads(r.stdout.strip())["claudeAiOauth"]["accessToken"]
+    except (ValueError, KeyError, TypeError):
+        return "unknown", None
+    return ("ok", tok) if isinstance(tok, str) else ("unknown", None)
+
+
+def kc_del(user: str, svc: str) -> bool:
+    """True = it is gone (deleted, or never there)."""
+    if not (svc_is_scratch(svc) and D.valid_user(user)):
+        return False
+    try:
+        r = subprocess.run(["security", "delete-generic-password", "-a", user, "-s", svc], capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode in (0, 44)
+
+
+def claude_timeout_s() -> float:
+    try:
+        return max(1.0, min(float(os.environ.get("CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S", "40")), 120.0))
+    except ValueError:
+        return 40.0
+
+
+def logged_in(binary: str, env: dict, cwd: str) -> Tuple[str, str]:
+    """('yes'|'no'|'unknown', detail): `claude auth status --json` reads the credential store and nothing else (measured: ~3 s, no inference)."""
+    try:
+        r = subprocess.run([binary, "auth", "status", "--json"], env=env, cwd=cwd, capture_output=True, text=True, timeout=claude_timeout_s(), check=False)
+    except subprocess.TimeoutExpired:
+        return "unknown", "claude auth status timed out"
+    except OSError as e:
+        return "unknown", f"claude could not run ({type(e).__name__})"
+    try:
+        v = json.loads(r.stdout)["loggedIn"]
+    except (ValueError, KeyError, TypeError):
+        return "unknown", f"claude auth status gave no loggedIn (rc={r.returncode})"
+    return ("yes", "loggedIn=true") if v is True else ("no", "loggedIn=false") if v is False else ("unknown", "loggedIn is not a boolean")
+
+
+def selftest_once(binary: str, user: str) -> Tuple[str, str]:
+    """('pass'|'fail'|'inconclusive', detail). Scratch item only: the pool item, the plain login item, ~/.claude are never read or written."""
+    scratch = scratch_dir()
+    home = Path.home()
+    if not scratch.name.startswith(SCRATCH_NAME) or _probe(Path.is_symlink, scratch) is not False or scratch in (Path("/"), home) or not scratch.is_absolute():
+        return "inconclusive", "refusing a scratch directory that is not a dedicated one"
+    secdir = str(scratch / "cred")
+    svc = scratch_svc(secdir)
+    if not svc_is_scratch(svc):
+        return "inconclusive", "refusing: the scratch item would be the pool's or the plain login item"
+    cfg = scratch / "cfg"
+    token = "sk-ant-oat01-GUARDSELFTEST" + secrets.token_hex(12)
+    fault = os.environ.get("CLAUDE_POOL_GUARD_FAULT", "")
+    try:
+        cfg.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(scratch), 0o700)
+        env = {"HOME": os.environ.get("HOME", str(home)), "USER": user, "LOGNAME": user, "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "CLAUDE_CONFIG_DIR": str(cfg), "CLAUDE_SECURESTORAGE_CONFIG_DIR": secdir}
+        if not kc_del(user, svc):                         # a leftover of a killed run: start from 'absent'
+            return "inconclusive", "could not clear the scratch item before the test"
+        if not kc_put(user, svc, token):
+            return "inconclusive", "could not write the scratch item"
+        st, back = kc_get(user, svc)
+        if st != "ok" or back != token:
+            return "inconclusive", "the scratch item did not read back through security"
+        # --- the drill: what claude would see if the credential were removed / renamed (after the harness proved it provisioned it)
+        env1 = dict(env)
+        if fault == "remove":
+            kc_del(user, svc)
+        elif fault == "rename":
+            env1["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = secdir + "-renamed"
+        a, da = logged_in(binary, env1, str(scratch))
+        if a == "unknown":
+            return "inconclusive", f"with the credential present: {da}"
+        if a == "no":
+            return "fail", "claude does not read the credential in the item named by CLAUDE_SECURESTORAGE_CONFIG_DIR (loggedIn=false with it present)"
+        if not kc_del(user, svc) or kc_get(user, svc)[0] != "missing":
+            return "inconclusive", "could not remove the scratch item for the second half of the test"
+        b, db = logged_in(binary, env, str(scratch))
+        if b == "unknown":
+            return "inconclusive", f"with the credential removed: {db}"
+        if b == "yes":
+            return "fail", "claude is still logged in with the credential removed: it is not reading the item named by CLAUDE_SECURESTORAGE_CONFIG_DIR"
+        return "pass", "logged in with the scratch credential present, not logged in with it removed"
+    except OSError as e:
+        return "inconclusive", f"scratch setup failed ({type(e).__name__})"
+    finally:
+        if not kc_del(user, svc):
+            glog("WARN", f"the scratch item {svc} could not be removed after the self-test (it holds a fake credential; the next run clears it)")
+        if scratch.name.startswith(SCRATCH_NAME) and _probe(Path.is_symlink, scratch) is False and scratch not in (Path("/"), home):
+            shutil.rmtree(str(scratch), ignore_errors=True)      # a link, or a path that cannot be told, is not removed
+
+
+def run_selftest(binary: str, user: str) -> Tuple[str, str, int]:
+    """A fail is repeated once after a pause before anyone acts on it: ('pass'|'fail'|'inconclusive', detail, attempts)."""
+    res, detail = selftest_once(binary, user)
+    if res != "fail":
+        return res, detail, 1
+    try:
+        wait = max(0.0, min(float(os.environ.get("CLAUDE_POOL_GUARD_RETRY_WAIT_S", "5")), 60.0))
+    except ValueError:
+        wait = 5.0
+    time.sleep(wait)
+    res2, detail2 = selftest_once(binary, user)
+    if res2 == "pass":
+        glog("WARN", f"self-test failed once and passed on the retry (first: {detail}) - treated as pass")
+        return "pass", f"passed on the retry (the first attempt: {detail})", 2
+    return res2, detail2, 2
+
+
+def marker_path() -> Optional[Path]:
+    c = D.city()
+    return c / ".gc" / D.DEGRADED_MARKER if c else None
+
+
+def marker_is_ours(p: Path) -> bool:
+    try:
+        return json.loads(p.read_text()).get("by") == "claude-pool-guard"
+    except (OSError, ValueError, AttributeError, RecursionError):
+        return False         # cannot be read -> not ours: it is left alone, never removed
+
+
+def write_marker(version: str, detail: str, t: float) -> bool:
+    p = marker_path()
+    if p is None or _probe(Path.is_dir, p.parent) is not True:
+        glog("ERROR", "no <city>/.gc to hold the degraded marker - cannot degrade (the pool keeps following the item)")
+        return False
+    tmp = p.with_name(p.name + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps({"by": "claude-pool-guard", "claude": version, "since": D._iso(t), "reason": detail}) + "\n")
+        os.replace(tmp, p)
+    except OSError as e:
+        glog("ERROR", f"could not write the degraded marker ({type(e).__name__})")
+        return False
+    return True
+
+
+def check_selftest(gs: dict, t: float, user: str, force: bool = False) -> dict:
+    """What was done, for `selftest` to say: {"ran": False, "why"} or {"ran": True, "ver", "res", "detail", "effect"} (effect: see apply_result)."""
+    binary = claude_binary()
+    if not binary:
+        blind(gs, t, "claude-version", "claude is not on this PATH")
+        return {"ran": False, "why": "claude is not on this PATH"}
+    ver = claude_version(binary)
+    if not ver:
+        blind(gs, t, "claude-version", "`claude --version` gave no version")
+        return {"ran": False, "why": "`claude --version` gave no version"}
+    unblind(gs, "claude-version")
+    b = gs.get("blind")
+    for what in [w for w in (b if isinstance(b, dict) else {}) if w.startswith("self-test of claude ") and w != f"self-test of claude {ver}"]:
+        b.pop(what, None)        # the installed claude moved on: nobody will ever answer for that version, and the record would stay for ever
+        glog("INFO", f"{what}: claude is {ver} now - that 'cannot verify' record is dropped")
+    gs["claude"] = {"version": ver, "binary": binary}
+    versions = _dict(gs, "versions")
+    rec = versions.get(ver) if isinstance(versions.get(ver), dict) else None
+    last = _num(rec.get("checked_epoch")) if rec else None
+    res = rec.get("result") if rec else None
+    due = (force or rec is None or last is None
+           or (res == "fail" and t - last >= SELFTEST_RETRY_S)
+           or (res == "inconclusive" and t - last >= INCONCLUSIVE_RETRY_S)
+           or res not in ("pass", "fail", "inconclusive"))
+    if due:
+        result, detail, attempts = run_selftest(binary, user)
+        now_rec = {"result": result, "detail": detail, "attempts": attempts, "checked_epoch": t, "checked_at": D._iso(t),
+                   "first_checked_at": (rec or {}).get("first_checked_at") or D._iso(t)}
+        if result == "inconclusive":
+            now_rec["inconclusive_since"] = (rec or {}).get("inconclusive_since") if res == "inconclusive" else t
+        versions[ver] = now_rec
+        rec, res = now_rec, result
+        glog("INFO" if result == "pass" else "WARN", f"SELFTEST claude={ver} result={result} attempts={attempts} detail={detail}")
+    detail = (rec or {}).get("detail", "")
+    return {"ran": True, "ver": ver, "res": res or "", "detail": detail, "effect": apply_result(gs, t, ver, res or "", detail)}
+
+
+def apply_result(gs: dict, t: float, ver: str, res: str, detail: str) -> str:
+    """Act on the recorded result. Returns what became of auto-switch, for `selftest` to say: 'on' (stays on) | 'lifted' (the marker was removed now) |
+    'off' (the marker was written now) | 'still-off' (the marker was already there) | 'unwritten' (the test failed and the marker CANNOT be written:
+    auto-switch is still ON) | 'foreign' (the test passed but a marker this guard did not write keeps it OFF) | 'lift-failed' | 'unchanged' (inconclusive)."""
+    m = marker_path()
+    present = _probe(Path.exists, m) if m else False      # vazio → no marker; falhou/ilegível → None: whether auto-switch is OFF cannot be told
+    if present is None:
+        blind(gs, t, "degraded-marker", "the marker's presence cannot be told (stat failed)")
+        return "unchanged"
+    unblind(gs, "degraded-marker")
+    deg = gs.get("degraded") if isinstance(gs.get("degraded"), dict) else None
+    if res in ("pass", "fail"):
+        unblind(gs, f"self-test of claude {ver}")
+    if res == "fail":
+        if not present and not write_marker(ver, detail, t):
+            # The worst state: the test says the pool is broken and the guard cannot switch it off. Said out loud (its own title: notify drops a
+            # repeat of one within 30 min), not recorded as a degradation that did not happen, and tried again on every tick.
+            mf = gs.get("marker_failed") if isinstance(gs.get("marker_failed"), dict) else None
+            if not mf or mf.get("version") != ver:
+                mf = {"since": t, "version": ver, "alerted_at": None}
+                gs["marker_failed"] = mf
+            last = _num(mf.get("alerted_at"))
+            if last is None or t - last >= REMIND_S:
+                where = str(m.parent) if m else "<city>/.gc (GC_CITY_PATH is not set)"
+                msg = (f"O teste do claude {ver} falhou ({detail}), mas o guarda NÃO conseguiu gravar o marcador em {where}: "
+                       f"a troca automática continua ligada e agentes novos seguem apontando para o item do pool. Tenta de novo a cada minuto; "
+                       f"o motivo está em claude-pool-guard.log.")
+                if send_alert(f"Pool Claude: troca automática NÃO foi desligada (claude {ver})", msg, 4, True):
+                    mf["alerted_at"] = t
+            return "unwritten"
+        gs.pop("marker_failed", None)
+        if not deg or deg.get("version") != ver:
+            deg = {"since": t, "version": ver, "alerted_at": None}
+            gs["degraded"] = deg
+            glog("WARN", f"DEGRADED: claude {ver} does not read the pool item ({detail}) - marker written, new pool launches use the ambient login")
+        last = _num(deg.get("alerted_at"))
+        if last is None or t - last >= REMIND_S:
+            msg = (f"O teste do claude {ver} falhou: {detail}. Agentes novos usam o login atual e nenhuma sessão foi interrompida. "
+                   f"A troca automática religa sozinha quando o teste voltar a passar (refeito a cada 30 min e a cada versão nova).")
+            if send_alert(f"Pool Claude: troca automática DESLIGADA (claude {ver})", msg, 4, True):
+                deg["alerted_at"] = t
+        return "still-off" if present else "off"
+    if res == "pass":
+        gs.pop("marker_failed", None)
+        effect = "on"
+        if present and m is not None and marker_is_ours(m):
+            try:
+                m.unlink()
+                glog("INFO", f"claude {ver} passes the self-test again - degraded marker removed, auto-switch is back ON")
+                effect = "lifted"
+            except OSError as e:
+                glog("ERROR", f"could not remove the degraded marker ({type(e).__name__}) - auto-switch stays OFF")
+                return "lift-failed"
+        elif present:
+            # Someone else's marker keeps the mechanism off: it is not the guard's to lift and it is not "back on" - so nothing is announced
+            # and the record of the degradation stays until the marker is really gone.
+            if not gs.get("foreign_marker_noted"):      # said once per stretch, not on every tick of it
+                gs["foreign_marker_noted"] = True
+                glog("WARN", f"the degraded marker {m} was not written by this guard (or cannot be read to tell) - left alone (auto-switch stays OFF)")
+            return "foreign"
+        gs.pop("foreign_marker_noted", None)
+        if deg:
+            # A quiet notice (priority 2, not forced): notify files it in the digest (exit 12), which send_alert counts as delivered. If notify
+            # refuses it any other way it is tried again, for NOTICE_GIVEUP_S at most - an episode that cannot close would repeat it every minute.
+            since = _num(deg.get("notice_since"))
+            if since is None:
+                since = deg["notice_since"] = t
+            if send_alert(f"Pool Claude: troca automática religada (claude {ver})",
+                          f"O teste do claude {ver} passou de novo: agentes novos voltam a seguir a conta do pool.", 2, False):
+                gs["degraded"] = None
+            elif t - since >= NOTICE_GIVEUP_S:
+                glog("WARN", f"gave up announcing that auto-switch is back ON (claude {ver}): notify refused the notice for {int((t - since) // 60)} min. The degraded marker is gone")
+                gs["degraded"] = None
+        return effect
+    if res == "inconclusive":
+        rec = _dict(gs, "versions").get(ver) or {}
+        blind(gs, t, f"self-test of claude {ver}", detail, since=_num(rec.get("inconclusive_since")) or t)
+    return "unchanged"
+
+
+# ── 3. the daemon's liveness ───────────────────────────────────────────────────────────────────────
 def read_heartbeat(t: float) -> Tuple[str, Optional[float]]:
     """('absent'|'ok'|'unreadable', epoch). Only a file that is NOT THERE means 'no clean run on record'. One that cannot be read, has no
     usable epoch (not text, not JSON, not an object, no number in it, a number that cannot be a time) or is stamped in the future (a stuck
@@ -409,7 +739,7 @@ def read_heartbeat(t: float) -> Tuple[str, Optional[float]]:
 
 def check_daemon_alive(gs: dict, t: float, user: str) -> None:
     """The daemon's silence is judged only over time the guard was LOOKING. A stamp that went stale while the guard was not looking (its own
-    absence: a reboot, a sleep, launchd unloaded) or while the daemon was stood down on purpose (the operator's switches: the real
+    absence: a reboot, a sleep, launchd unloaded) or while the daemon was stood down on purpose (the marker, the operator's switches: the real
     daemon stamps nothing then) is not evidence of a death. So: `watch_since` is when this unbroken stretch of looking began (reset whenever
     two looks are more than LIVENESS_GAP_S apart) and the silence is counted from max(last stamp, watch_since)."""
     hstat, last = read_heartbeat(t)
@@ -457,12 +787,39 @@ def check_daemon_alive(gs: dict, t: float, user: str) -> None:
 
 
 # ── one pass ───────────────────────────────────────────────────────────────────────────────────────
-def run_once() -> int:
-    """The launchd tick: quiet (it logs), rc 0 when it has nothing to do."""
+SELFTEST_EFFECT = {
+    "on": "auto-switch is on",
+    "lifted": "auto-switch is now on (the degraded marker was removed)",
+    "off": "auto-switch is now OFF (the degraded marker was written: new pool launches use the current login)",
+    "still-off": "auto-switch stays OFF (the degraded marker was already there)",
+    "unwritten": "auto-switch is NOT off: the test failed but the degraded marker could not be written (see the guard log); it is still ON",
+    "foreign": "auto-switch stays OFF: a degraded marker this guard did not write is up, and it is left alone",
+    "lift-failed": "auto-switch stays OFF: the degraded marker could not be removed (see the guard log)",
+    "unchanged": "nothing was changed: whether the degraded marker is up cannot be told (see the guard log)",
+}
+
+
+def report_selftest(out: dict) -> int:
+    """`selftest` is asked by a person: it says what it did. rc 0 = pass, 3 = fail, 4 = inconclusive (1 = the test was NOT run, said by run_once)."""
+    ver, res, detail, effect = out["ver"], out["res"], out["detail"], out["effect"]
+    print(f"claude {ver}: {res}" + (f" ({detail})" if detail else ""))
+    if res == "inconclusive":
+        print("the test could not tell: nothing was changed")
+        return 4
+    print(SELFTEST_EFFECT.get(effect, effect))
+    return 0 if res == "pass" else 3
+
+
+def run_once(force_selftest: bool = False) -> int:
+    """The launchd tick (quiet: it logs, rc 0 when it has nothing to do) and `selftest` (a person is asking: it prints what it did and returns
+    0 pass / 3 fail / 4 inconclusive / 1 NOT run, so 'it did nothing' cannot look like 'it passed')."""
     def not_run(why: str, quiet_rc: int) -> int:
         glog("INFO" if quiet_rc == 0 else "ERROR", why)
+        if force_selftest:
+            print(f"claude-pool-guard selftest: the self-test was NOT run: {why}")
+            return 1
         return quiet_rc
-    off = D.disabled()
+    off = D.operator_off()
     if off:
         return not_run(f"disabled by {off} - nothing done", 0)
     c = D.city()
@@ -486,10 +843,25 @@ def run_once() -> int:
     if gs is None:
         return not_run("the guard's state file could not be loaded (see the guard log)", 1)
     t = D.now()
-    steps = [("divergence", lambda: check_divergence(gs, t, user)), ("liveness", lambda: check_daemon_alive(gs, t, user))]
+    outcome: dict = {}
+    steps = [("self-test", lambda: outcome.update(check_selftest(gs, t, user, force_selftest)))]
+    if not force_selftest:
+        steps += [("divergence", lambda: check_divergence(gs, t, user)), ("liveness", lambda: check_daemon_alive(gs, t, user))]
     rc = 0
     for name, fn in steps:
         try:
+            # While degraded the daemon is stood down by design: it does not switch and (the real one) does not stamp its heartbeat, and the
+            # alert that says so already went out, so the divergence and liveness checks have nothing to add. Asked per step, AFTER the
+            # self-test (which is what writes and lifts the marker). What is dropped: the divergence episode (when auto-switch comes back,
+            # whatever is still wrong is a NEW episode with its own debounce), the 'could not tell' records (their 30 minutes must not run
+            # on through a stand-down) and the daemon's record, re-based on this tick - so the daemon's silence is judged from the moment
+            # the guard looks at it again, never over the stand-down (see check_daemon_alive).
+            if name != "self-test" and D.degraded_marker():
+                gs["divergence"] = None
+                gs["daemon"] = {"checked_at": t, "watch_since": t}
+                unblind(gs, "divergence")
+                unblind(gs, "daemon-heartbeat")
+                continue
             fn()
         except Exception as e:  # noqa: BLE001 - one failing check must not take the others down; the TYPE only, never a message
             glog("ERROR", f"unhandled {type(e).__name__} in {name}")
@@ -499,6 +871,83 @@ def run_once() -> int:
     except Exception as e:  # noqa: BLE001
         glog("ERROR", f"guard state NOT saved ({type(e).__name__}): the next run may repeat an alert")
         rc = 1
+    if force_selftest:
+        if not outcome:
+            return not_run("the self-test step failed unexpectedly (see the guard log)", 1)
+        if not outcome.get("ran"):
+            return not_run(outcome.get("why") or "see the guard log", 1)
+        return report_selftest(outcome) or rc
+    return rc
+
+
+# ── status ─────────────────────────────────────────────────────────────────────────────────────────
+def peek_gstate() -> Tuple[str, dict]:
+    """('absent'|'ok'|'corrupt'|'unreadable', state). Read-only: load_gstate moves a corrupt file aside, and `status` has no side effect."""
+    p = gstate_path()
+    try:
+        raw = p.read_bytes()
+    except FileNotFoundError:
+        return "absent", {}
+    except OSError:
+        return "unreadable", {}
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return "corrupt", {}
+    return ("ok", d) if isinstance(d, dict) else ("corrupt", {})
+
+
+def marker_state() -> Tuple[str, str]:
+    """('on'|'off'|'unknown', why). D.degraded_marker() answers 'no marker' for "there is no city to look in" too, and `status` is how one asks
+    'is auto-switch OFF?': a question that cannot be answered says so instead of answering 'on'."""
+    c = D.city()
+    if not c:
+        return "unknown", "GC_CITY_PATH is not set: there is no city to look for the marker in - run it where the agents do, or export GC_CITY_PATH"
+    gc = c / ".gc"
+    try:
+        if not gc.is_dir():
+            return "unknown", f"{gc} is not a directory - is GC_CITY_PATH right?"
+        (gc / D.DEGRADED_MARKER).lstat()
+    except FileNotFoundError:
+        return "on", ""
+    except OSError as e:
+        return "unknown", f"cannot look in {gc} ({type(e).__name__})"
+    return "off", ""
+
+
+def status(as_json: bool) -> int:
+    """Exit 0 = it could say what the state file says (including 'nothing recorded yet') and whether auto-switch is on; 1 = it could not read
+    the state file, or could not look for the degraded marker."""
+    sstat, gs = peek_gstate()
+    binary = claude_binary()
+    installed = claude_version(binary) if binary else None
+    versions = gs.get("versions") if isinstance(gs.get("versions"), dict) else {}
+    mstate, mwhy = marker_state()
+    out = {"state_file": sstat, "installed_claude": installed, "versions": versions,
+           "degraded": {"on": False, "off": True}.get(mstate),   # null = could not look
+           "auto_switch": {"on": "on", "off": "OFF"}.get(mstate, f"unknown ({mwhy})"),
+           "divergence": gs.get("divergence"), "blind": gs.get("blind", {}),
+           "daemon": gs.get("daemon"), "last_run": gs.get("updated")}
+    cur = versions.get(installed) if installed else None
+    if sstat in ("corrupt", "unreadable"):
+        out["installed_result"] = f"unknown (the guard's state file is {sstat})"
+    elif not installed:
+        out["installed_result"] = "unknown (the installed claude version could not be read)"
+    else:
+        out["installed_result"] = cur.get("result") if isinstance(cur, dict) and cur.get("result") else "not tested yet"
+    rc = 1 if sstat in ("corrupt", "unreadable") or mstate == "unknown" else 0
+    if as_json:
+        print(json.dumps(out, indent=1, sort_keys=True))
+        return rc
+    print(f"installed claude : {installed or '?'}  -> per-version self-test: {out['installed_result']}")
+    print(f"auto-switch      : {'OFF (degraded marker present)' if mstate == 'off' else out['auto_switch']}")
+    for v, r in sorted(versions.items()):
+        if isinstance(r, dict):
+            print(f"  claude {v:<12} {str(r.get('result')).upper():<12} {r.get('checked_at', '?')}  {r.get('detail', '')}")
+    dv = gs.get("divergence") if isinstance(gs.get("divergence"), dict) else None
+    since = _num(dv.get("since")) if dv else None
+    print(f"divergence       : {('OPEN since ' + D._iso(since)) if since is not None else ('OPEN (since unknown)' if dv else 'none')}")
+    print(f"guard last run   : {out['last_run']}")
     return rc
 
 
@@ -512,13 +961,15 @@ def main(argv: List[str]) -> int:
         return 1
     if cmd == "_whois" and len(argv) == 3 and FP_RE.fullmatch(argv[2]):
         return whois(argv[2])
-    if cmd == "run-once":
+    if cmd in ("run-once", "selftest"):
         try:
-            return run_once()
+            return run_once(force_selftest=(cmd == "selftest"))
         except Exception as e:  # noqa: BLE001 - last resort: the TYPE only
             glog("ERROR", f"unhandled {type(e).__name__} in {cmd}")
             return 1
-    print("usage: claude-pool-guard.py run-once", file=sys.stderr)
+    if cmd == "status":
+        return status("--json" in argv[2:])
+    print("usage: claude-pool-guard.py run-once | status [--json] | selftest", file=sys.stderr)
     return 2
 
 

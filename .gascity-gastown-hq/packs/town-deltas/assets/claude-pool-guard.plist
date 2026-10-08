@@ -9,9 +9,14 @@
        1. DIVERGENCE: the account whose key sits in the pool's Keychain item vs the account the decision file says the pool should use.
           Still different 2 minutes later -> ONE phone alert (priority 4, forced push) naming both accounts by e-mail + 8-hex
           fingerprint, never a key. Repeated only after 6 h if nobody fixed it; nothing is sent about it once it is fixed.
-       2. LIVENESS: no clean daemon run for 10 min -> one alert.
+       2. PER-VERSION TEST: whenever the installed claude version has not been tested (and every 30 min while it is failing), ask claude
+          — on a scratch item, never the pool's — whether it still reads the credential the way the pool writes it. The result per version
+          is recorded (`claude-pool-guard.py status [--json]`). A FAIL writes <city>/.gc/pool-account-degraded: the daemon stops switching,
+          the wrapper stops pointing new launches at the pool item (they answer on the current login), ONE alert says "troca automática
+          DESLIGADA". Nothing is deleted, no running session is touched. A later PASS removes the marker by itself.
+       3. LIVENESS: no clean daemon run for 10 min -> one alert.
 
-       A check that cannot tell (Keychain locked, vault down) changes nothing and, after 30 min, says it is blind.
+       A check that cannot tell (Keychain locked, claude hangs, vault down) changes nothing and, after 30 min, says it is blind.
        The guard writes none of the pool's credentials; it never prints, logs or sends a key.
 
        KILL SWITCH (no reload needed): touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-pool-account (or GC_POOL_ACCOUNT=0) — the
@@ -31,7 +36,8 @@
   <key>WorkingDirectory</key>
   <string>/Users/athos/gt/.gascity-gastown-hq</string>
 
-  <!-- 60 s > a normal run (a few file reads and one `security` call): the script holds a flock, so a slow run is never doubled, only the next tick skipped. -->
+  <!-- 60 s > a normal run (a few file reads and one `security` call). The slow case is the self-test (two `claude auth status`, ~3 s
+       each; up to ~40 s each if claude hangs): the script holds a flock, so a slow run is never doubled, only the next tick skipped. -->
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><false/>
 
@@ -40,7 +46,7 @@
 
   <key>EnvironmentVariables</key>
   <dict>
-    <!-- ~/.local/bin: `secret` (the vault) and `notify` (the phone). /usr/bin: `security`. -->
+    <!-- ~/.local/bin: `secret` (the vault) and `notify` (the phone). /usr/bin: `security`. claude's own directory: the binary under test. -->
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/.local/bin</string>
     <key>HOME</key>
