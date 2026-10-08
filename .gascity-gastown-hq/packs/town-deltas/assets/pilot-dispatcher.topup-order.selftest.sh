@@ -182,7 +182,12 @@ need() { # need <fn>... — echoes the sources; records (does not abort on) a mi
 prelude_for() { # sets PRELUDE and TOPUP_VARS from $DISP
   MISSING=""
   PRELUDE="$(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_exclude_braked \
-                  _topup_validate_input _topup_pick_first _topup_rig_pending _pilot_pool_topup)"
+                  _topup_validate_input _topup_pick_first _topup_rig_pending _pilot_pool_topup)
+# ga-vp2zr0: the HQ query is gated by _topup_hq_serves_pool (does this pool read the HQ store?), and wa-worker / ps-worker
+# do NOT, which is the fix. This selftest is about the ORDER of the candidates the HQ query returns (the pick, the window,
+# the epic filter), so its sandbox pools are given HQ-reading workers. The gate itself, real, with the pool -> rig -> store
+# resolution, is pilot-dispatcher.hq-pool-store-blind.selftest.sh.
+_topup_hq_serves_pool() { return 0; }"
   TOPUP_VARS="$(awk '/^_TOPUP_WORKER_EXCLUDE_LABELS=\(/{f=1} f{print} f&&/^\)$/{exit}' "$DISP")
 $(grep -m1 '^_TOPUP_EPIC_TITLE_RE=' "$DISP")"
 }
@@ -910,7 +915,7 @@ c10_warns() { # c10_warns <bd|rig|seam|seam-ps> -> how many such WARNs that plac
   grep -c 'not a JSON array' "$WORK/run.err" || true
 }
 eq "G[entry] control: on the unmutated dispatcher each of the four places writes exactly one such WARN" "$(c10_warns bd)/$(c10_warns rig)/$(c10_warns seam)/$(c10_warns seam-ps)" "1/1/1/1"
-if mutate entry-hq $'\n        | _topup_validate_input \\' ''; then
+if mutate entry-hq $'\n          | _topup_validate_input \\' ''; then
   DISP="$WORK/mut/entry-hq.sh"; _w="$(c10_warns bd)"; DISP="$DISPATCHER"
   killed entry-hq "the HQ query no longer validates bd's answer first (the filters swallow it again)" "$_w" "1"
 fi

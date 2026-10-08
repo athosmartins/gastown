@@ -75,8 +75,12 @@ need() { # need <fn>... — echoes the extracted sources; records (does not abor
 }
 
 # Everything the guard needs, defined together so a sandbox can never silently lack one.
+# ga-vp2zr0: the guard is now a thin wrapper over _pilot_pool_store_verdict (the one place that answers "does this pool read
+# this store?"), which warns through _pilot_psv_warn_once and is fed _pilot_bead_home_store's answer.
 GUARD_PRELUDE="$(need gc_json_or_unknown rig_root_path rig_to_builders wa_worker_template \
-                      _pilot_rig_builds_pool _pilot_pool_rig _pilot_same_dir _pilot_pool_store_blind_guard)"
+                      _pilot_rig_builds_pool _pilot_pool_rig _pilot_same_dir _pilot_bead_home_store \
+                      _pilot_pool_store_verdict _pilot_psv_warn_once _pilot_pool_store_blind_guard)
+_PSV_WARNED=\"\"; _PSV_VERDICT=\"\"; _PSV_POOL_RIG=\"\""
 # ga-9t9acg.4: the top-up pick goes through _topup_pick_first, which orders with scripts/work-order.sh. Both are part of
 # the preludes: without the lib the helper runs its fallback (the previous pick + a WARN), and a prelude that lacks the
 # helper itself fails with "command not found" — either way this selftest would stop testing the store scoping.
@@ -86,7 +90,8 @@ TOPUP_PRELUDE="$WO_LIB_PRELUDE
 $(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_exclude_braked _topup_validate_input _topup_pick_first _topup_rig_pending)"
 LOOP_PRELUDE="$WO_LIB_PRELUDE
 $(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_rig_pending \
-                     _topup_exclude_braked _topup_validate_input _topup_pick_first _topup_pending_store _topup_note_spawn _topup_worker_probe_migrated _pilot_pool_topup)"
+                     _topup_exclude_braked _topup_validate_input _topup_pick_first _topup_pending_store _topup_note_spawn _topup_worker_probe_migrated _topup_hq_serves_pool \
+                     gc_json_or_unknown rig_root_path _pilot_pool_rig _pilot_same_dir _pilot_pool_store_verdict _pilot_psv_warn_once _pilot_pool_topup)"
 MIGRATE_PRELUDE="$(need gc_json_or_unknown rig_root_path rig_to_builders rig_to_builder wa_worker_template \
                         _pilot_text_names_rig_path _pilot_story_already_migrated _pilot_dog_store_blind_guard \
                         _pilot_dog_store_blind_migrate_dest _pilot_is_bead_id _pilot_migration_copy_retract \
@@ -230,7 +235,7 @@ mkbead() {
 echo ""
 echo "=== Part A: _pilot_pool_store_blind_guard / _pilot_pool_rig (hole 1 — the dispatch decision) ==="
 
-run_guard() { # run_guard <sling_target> <bead_city> -> prints the guard's exit status (0=REFUSE, 1=PROCEED, 127=missing)
+run_guard() { # run_guard <sling_target> <bead_city> -> prints the guard's exit status (0=REFUSE, 1=PROCEED, 2=UNKNOWN, 127=missing)
   (
     set -euo pipefail
     PATH="$SANDBOX_PATH"; GC_CITY="$WORK/city"; PILOT_RIG_PATHS_JSON=""
@@ -260,14 +265,15 @@ expect_guard 0 "wa-worker + bead in the lexbh store -> REFUSE"                  
 expect_guard 0 "wa-worker + bead in the property_scrapers store -> REFUSE"                                     wa-worker "$WORK/rigs/property_scrapers"
 expect_guard 1 "gastown.dog + lexbh store -> PROCEED (the dog has its OWN guard, ga-cszxcf; not this one's business)" gastown.dog "$WORK/rigs/lexbh"
 expect_guard 1 "mila-wa (named crew) + lexbh store -> PROCEED (guard is scoped to the ephemeral rig pools)"     mila-wa "$WORK/rigs/lexbh"
-expect_guard 1 "ps-worker + EMPTY bead store -> PROCEED (cannot tell is never a refusal)"                       ps-worker ""
+expect_guard 2 "ps-worker + EMPTY bead store -> UNKNOWN (ga-vp2zr0: cannot tell is neither a refusal nor a proceed — nothing is dispatched on it)" ps-worker ""
 
-# Three states, not two: "the rig list could not be read" must not read as "different store".
+# Three states, not two: "the rig list could not be read" must not read as "different store" — and, since ga-vp2zr0, must
+# not read as "same store" either: UNKNOWN (rc 2) is the inert answer (the call site releases the claim, dispatches nothing).
 : > "$WORK/gc_fail"
-expect_guard 1 "ps-worker + lexbh store but 'gc rig list' FAILS -> PROCEED (cannot tell -> keep the old behaviour, never a guess)" ps-worker "$WORK/rigs/lexbh"
+expect_guard 2 "ps-worker + lexbh store but 'gc rig list' FAILS -> UNKNOWN (cannot tell -> never a guess, and never a proceed)" ps-worker "$WORK/rigs/lexbh"
 rm -f "$WORK/gc_fail"
 jq '.rigs |= map(select(.name != "property_scrapers"))' "$WORK/rigs.json" > "$WORK/rigs.json.new" && mv "$WORK/rigs.json.new" "$WORK/rigs.json"
-expect_guard 1 "ps-worker + lexbh store but property_scrapers is not a registered rig -> PROCEED (pool's own store unknown)" ps-worker "$WORK/rigs/lexbh"
+expect_guard 2 "ps-worker + lexbh store but property_scrapers is not a registered rig -> UNKNOWN (pool's own store unknown)" ps-worker "$WORK/rigs/lexbh"
 write_rigs
 
 run_pool_rig() { # run_pool_rig <pool> -> the rig name (empty when unknown)

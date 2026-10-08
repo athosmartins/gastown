@@ -7547,37 +7547,110 @@ _pilot_same_dir() {
   [ -n "$_ra" ] && [ "$_ra" = "$_rb" ]
 }
 
-# _pilot_pool_store_blind_guard <sling_target> <bead_city> — exit 0 (REFUSE) iff <sling_target> is a wa-worker /
-# ps-worker pool, the store that pool reads is KNOWN, and <bead_city> (the store the bead lives in) is a
-# different one. Exit 1 (PROCEED) in every other case, deliberately including every "cannot tell":
-#   - not a rig pool (gastown.dog has its own guard above; named crews read their own rig);
-#   - no <bead_city>;
-#   - the rig list could not be read, or the pool maps to no/several rigs, or the pool's rig path is not a
-#     directory on disk.
-# Three states, not two: "I could not find out" must not read as "different store". A refusal here writes to
-# beads (migrate or park), so under doubt the inert answer is to leave dispatch exactly as it was; the top-up
-# scan (_topup_rig_pending) and its brake (_topup_note_spawn) bound the cost of whatever slips through.
+# ── ga-vp2zr0: an HQ bead routed to a pool that cannot read HQ ─────────────────────────────────────
+# ga-653ilw (above) closed this for beads that live in a RIG store. The same strand exists for beads in the HQ
+# store: wa-worker / ps-worker read ONE rig clone, so an HQ bead carrying gc.routed_to=wa-worker|ps-worker is
+# invisible to every worker of that pool. Measured 2026-10-07: HQ P0 beads ga-9t9acg.11/.12, routed=wa-worker,
+# sat in Aprovadas while P1 beads of the WA store were built — the pre-claim cap skip queued them behind the
+# wa-worker cap for ever, and the HQ top-up counted them as demand and opened wa-worker sessions "for" them.
+# Four places had to learn the same question — "does this pool read the store this bead lives in?" — and they
+# all ask it here: _pilot_bead_home_store (where the bead lives) and _pilot_pool_store_verdict (does the pool
+# read it), each with a third state for "cannot tell" that every caller lands in the inert branch.
+
+# _pilot_bead_home_store <bead_id> — print the absolute directory of the store <bead_id> LIVES in, from the
+# authoritative prefix -> store map $GC_CITY/.beads/routes.jsonl (ga -> HQ, wa -> whatsapp_automation, ...). A
+# relative path is relative to $GC_CITY, the directory holding .beads. `bd -C <rig> show <ga-id>` does not route
+# by prefix, and story.rig names the rig a bead is ABOUT, not the one it is stored in — only the id is reliable.
+# vazio → the bead's store is unknown to the caller (no id, no routes file, prefix not listed, directory missing):
+# the verdict becomes "unknown" and nothing is dispatched or queued on it; falhou/ilegível → the same: a routes
+# file jq cannot parse prints nothing, never a guessed store. Always exit 0.
+_pilot_bead_home_store() {
+  local _id="${1:-}" _prefix _rel _dir
+  _prefix="${_id%%-*}"
+  [ -n "$_id" ] && [ -n "$_prefix" ] && [ "$_prefix" != "$_id" ] || return 0
+  [ -r "$GC_CITY/.beads/routes.jsonl" ] || return 0
+  _rel=$(jq -rn --arg p "$_prefix" 'first(inputs | select(.prefix == $p) | .path) // empty' "$GC_CITY/.beads/routes.jsonl" 2>/dev/null) || _rel=""
+  [ -n "$_rel" ] || return 0
+  case "$_rel" in /*) _dir="$_rel" ;; *) _dir="$GC_CITY/$_rel" ;; esac
+  [ -d "$_dir" ] || return 0
+  (cd -P "$_dir" 2>/dev/null && pwd -P) || true
+  return 0
+}
+
+# _pilot_pool_store_verdict <pool> <store_dir> — sets the globals _PSV_VERDICT and _PSV_POOL_RIG (globals, not
+# stdout, so the rig-list memo it warms stays warm in the CALLER's shell); always exit 0.
+#   _PSV_VERDICT=serves   <pool> is not a wa-worker/ps-worker pool (this predicate does not apply to it), or its
+#                         rig clone IS <store_dir>: its workers can see a bead stored there;
+#   _PSV_VERDICT=blind    the pool maps to exactly one rig, that rig's directory exists, and it is not <store_dir>:
+#                         no worker of the pool will ever find a bead stored there;
+#   _PSV_VERDICT=unknown  anything else — empty <store_dir>, the rig list unreadable, the pool mapping to no or
+#                         several rigs, or the pool's rig path missing on disk. NEVER read as "serves".
+# vazio → unknown; falhou/ilegível → unknown (and one warn per pool per sweep): every caller treats unknown as
+# "do not dispatch, do not queue, do not spawn" — the inert state — and the next sweep asks again.
+_pilot_pool_store_verdict() {
+  local _pool="${1:-}" _store="${2:-}" _pool_path _kind
+  _PSV_VERDICT="unknown"
+  _PSV_POOL_RIG=""
+  case "$_pool" in
+    wa-worker*) _kind="wa-worker" ;;
+    ps-worker*) _kind="ps-worker" ;;
+    *) _PSV_VERDICT="serves"; return 0 ;;
+  esac
+  [ -n "$_store" ] || return 0
+  [ -n "${PILOT_RIG_PATHS_JSON:-}" ] || rig_root_path "gascity" >/dev/null 2>&1 || true
+  _PSV_POOL_RIG=$(_pilot_pool_rig "$_pool") || _PSV_POOL_RIG=""
+  if [ -z "$_PSV_POOL_RIG" ]; then
+    _pilot_psv_warn_once "$_kind" "ga-653ilw: cannot tell which store pool $_pool reads (rig list unreadable, or the pool maps to no or several rigs) — treating every bead's store as UNKNOWN to it this sweep (nothing dispatched, queued or spawned on that doubt)."
+    return 0
+  fi
+  _pool_path=$(rig_root_path "$_PSV_POOL_RIG")
+  if [ -z "$_pool_path" ] || [ ! -d "$_pool_path" ]; then
+    _pilot_psv_warn_once "$_kind" "ga-653ilw: pool $_pool's rig '$_PSV_POOL_RIG' has no usable path on disk ('${_pool_path:-<none>}') — treating every bead's store as UNKNOWN to it this sweep (nothing dispatched, queued or spawned on that doubt)."
+    return 0
+  fi
+  if _pilot_same_dir "$_store" "$_pool_path"; then
+    _PSV_VERDICT="serves"
+  else
+    _PSV_VERDICT="blind"
+  fi
+  return 0
+}
+
+# _pilot_psv_warn_once <key> <message> — warn once per <key> per sweep. The verdict is asked once per candidate,
+# and the cause of "unknown" (a rig list that failed) is the same for all of them.
+_PSV_WARNED=""
+_pilot_psv_warn_once() {
+  case " $_PSV_WARNED " in
+    *" $1 "*) return 0 ;;
+  esac
+  _PSV_WARNED="${_PSV_WARNED:+$_PSV_WARNED }$1"
+  warn "$2"
+  return 0
+}
+
+# _pilot_pool_store_blind_guard <sling_target> <bead_city> — three exits, so "cannot tell" never reads as "fine":
+#   0  REFUSE   <sling_target> is a wa-worker / ps-worker pool and <bead_city> (the store the bead lives in) is
+#               not the store that pool reads;
+#   1  PROCEED  not a rig pool (gastown.dog has its own guard above; named crews read their own rig), or the pool
+#               reads <bead_city>;
+#   2  UNKNOWN  empty <bead_city>, the rig list could not be read, the pool maps to no/several rigs, or the pool's
+#               rig path is not a directory (_pilot_pool_store_verdict).
+# ga-vp2zr0: exit 2 used to be exit 1 (PROCEED). A bead routed to a pool whose store we cannot identify is the
+# strand this guard exists for; under doubt the inert answer is to not dispatch it (the call site releases the
+# claim and says so), and the next sweep asks again.
 # Must be called from the caller's own shell (not inside `$(...)`): it warms the rig-list memo there.
 _pilot_pool_store_blind_guard() {
-  local _target="${1:-}" _bead_city="${2:-}" _rig _pool_path
+  local _target="${1:-}" _bead_city="${2:-}"
   case "$_target" in
     wa-worker*|ps-worker*) ;;
     *) return 1 ;;
   esac
-  [ -n "$_bead_city" ] || return 1
-  [ -n "${PILOT_RIG_PATHS_JSON:-}" ] || rig_root_path "gascity" >/dev/null 2>&1 || true
-  _rig=$(_pilot_pool_rig "$_target") || _rig=""
-  if [ -z "$_rig" ]; then
-    warn "ga-653ilw: cannot tell which store pool $_target reads (rig list unreadable, or the pool maps to no or several rigs) — NOT applying the pool-store guard to this dispatch."
-    return 1
-  fi
-  _pool_path=$(rig_root_path "$_rig")
-  if [ -z "$_pool_path" ] || [ ! -d "$_pool_path" ]; then
-    warn "ga-653ilw: pool $_target's rig '$_rig' has no usable path on disk ('${_pool_path:-<none>}') — NOT applying the pool-store guard to this dispatch."
-    return 1
-  fi
-  _pilot_same_dir "$_bead_city" "$_pool_path" && return 1
-  return 0
+  _pilot_pool_store_verdict "$_target" "$_bead_city"
+  case "$_PSV_VERDICT" in
+    blind)  return 0 ;;
+    serves) return 1 ;;
+    *)      return 2 ;;
+  esac
 }
 
 # _pilot_text_names_rig_path <text> <rig> — ga-6u64fm: exit 0 iff <text> holds a
@@ -8930,6 +9003,20 @@ _topup_rig_serves_pool() {
   _pilot_rig_builds_pool "$_name" "$_pool"
 }
 
+# _topup_hq_serves_pool <pool> — ga-vp2zr0: the HQ half of the question _topup_rig_serves_pool answers for a rig
+# store. Exit 0 iff the HQ store ($GC_CITY) is one <pool>'s workers can read (_pilot_pool_store_verdict: serves).
+# Exit 1 otherwise — "blind" (wa-worker and ps-worker each read their own rig clone, never HQ) AND "cannot tell".
+# Before this, the HQ query below ran for every pool: an HQ bead routed to wa-worker counted as demand and
+# opened a wa-worker session whose probe could only ever see the WA store (the 2026-10-07 P0 strand).
+# vazio → the pool reads no store we can name: HQ is skipped; falhou/ilegível → skipped too (the verdict's own
+# warn says why), so a spawn is never opened on a doubt and the next sweep asks again.
+_topup_hq_serves_pool() {
+  local _pool="${1:-}"
+  [ -n "$_pool" ] || return 1
+  _pilot_pool_store_verdict "$_pool" "$GC_CITY"
+  [ "$_PSV_VERDICT" = "serves" ]
+}
+
 # _topup_exclude_braked — stdin: a JSON array of candidate beads; stdout: the same array minus every bead
 # labelled pilot:topup-braked (see _topup_note_spawn). The LABEL is the single source of truth for "braked": it
 # is durable, visible on the bead, and removing it is the release. Dropping the bead from the candidate list
@@ -9456,13 +9543,29 @@ _pilot_pool_topup() {
       # `--limit 0` fetches all of it and _topup_pick_first (block above _topup_rig_pending) picks by the shared rule.
       # _topup_validate_input comes FIRST, before the filters (they swallow a jq failure as `[]`), and neither it nor the
       # last stage carries a `2>/dev/null`: their WARN lines (and the library's) are the only signal.
-      _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
-        --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
-        "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0 2>/dev/null \
-        | _topup_validate_input \
-        | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
-        | _topup_exclude_braked 2>/dev/null \
-        | _topup_pick_first || echo "")
+      # ga-vp2zr0: ...and the HQ query only runs for a pool whose workers can READ the HQ store. A pool that cannot
+      # (wa-worker / ps-worker read their own rig clone) never claims what that query returns, so a spawn "for" it
+      # is a ~188k-WTE session that finds nothing — and its P0 queues behind the P1s the session does find.
+      # Skipping HQ is not skipping the pool: the rig stores below are still scanned, and an HQ bead carrying a
+      # blind route is re-routed to gastown.dog by _pilot_heal_hq_blind_routes before this step runs.
+      _pending=""
+      if _topup_hq_serves_pool "$_pool"; then
+        _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
+          --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
+          "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0 2>/dev/null \
+          | _topup_validate_input \
+          | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
+          | _topup_exclude_braked 2>/dev/null \
+          | _topup_pick_first || echo "")
+      else
+        # (Worded "top-up gate", not "pool top-up", for the same reason as the ga-oa004t line above: this reports
+        # that nothing was scanned, and scenarios read the bare substring "pool top-up" as "a spawn was attempted".)
+        case " ${_TOPUP_HQ_SKIP_NOTED:-} " in
+          *" $_pool "*) : ;;
+          *) _TOPUP_HQ_SKIP_NOTED="${_TOPUP_HQ_SKIP_NOTED:+$_TOPUP_HQ_SKIP_NOTED }$_pool"
+             log "  ga-vp2zr0: top-up gate — the HQ store is not one $_pool's workers read (store verdict: ${_PSV_VERDICT:-unknown}) — NOT scanning HQ beads for it; only the rig store it reads counts as demand (an HQ bead routed to $_pool is invisible to its workers)." ;;
+        esac
+      fi
       if [ -z "$_pending" ]; then
         # ga-q0ewpu: HQ has nothing — fall through to each non-HQ rig store
         # before giving up (own test seam, same set-even-to-empty convention
@@ -9504,6 +9607,64 @@ _pilot_pool_topup() {
     fi
   done
 }
+# _pilot_heal_hq_blind_routes — ga-vp2zr0 (a): an HQ-store bead never KEEPS the gc.routed_to of a pool that does not
+# read HQ. wa-worker and ps-worker each read their own rig clone, so such a bead is invisible to every worker of
+# the pool it is routed to and waits there for ever (the 2026-10-07 P0 strand: ga-9t9acg.11/.12). Whoever stamped it
+# — a creator, the missing-route watchdog, a gate route-restore — the stamp is repaired here, once per sweep, to
+# the pool that DOES read HQ: gastown.dog, where the Mayor moved those two by hand. Only the beads the top-up would
+# have counted as demand for the pool are touched — the very query and eligibility filters of _pilot_pool_topup (open,
+# unassigned, ready, not an epic, not gate:needs-human / needs:engine-window, not vetoed): a bead that is not
+# dispatchable today (an epic, a human gate, a blocked one) is invisible to everyone now and must not turn into work
+# a dog picks up just because its route changed. At most PILOT_HQ_BLIND_ROUTE_HEAL_MAX (default 20) per sweep so a
+# flood cannot become a Dolt write storm. PILOT_HQ_BLIND_ROUTE_HEAL=0 disables it.
+# vazio → no HQ bead carries a blind route: nothing is written; falhou/ilegível → the query could not be read
+# (bd failed, timed out, or printed something that is not a JSON array): warn and heal nothing this sweep — never
+# write on a guess; a failed write leaves the bead exactly as it was, still safe behind the top-up and pre-claim
+# store gates, and the next sweep retries it.
+_pilot_heal_hq_blind_routes() {
+  [ "${PILOT_HQ_BLIND_ROUTE_HEAL:-1}" = "1" ] || return 0
+  local _pool _json _rc _ids _id _healed=0 _max="${PILOT_HQ_BLIND_ROUTE_HEAL_MAX:-20}"
+  case "$_max" in ''|*[!0-9]*) _max=20 ;; esac
+  # Spawning is not the only Dolt load: the heal is a write, so it backs off with the rest of the sweep.
+  if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]; then return 0; fi
+  for _pool in wa-worker ps-worker; do
+    _pilot_pool_store_verdict "$_pool" "$GC_CITY"
+    [ "$_PSV_VERDICT" = "blind" ] || continue
+    _rc=0
+    _json=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
+      --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
+      "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --limit 0 --json 2>/dev/null) || _rc=$?
+    if [ "$_rc" -ne 0 ] || ! printf '%s' "$_json" | jq -es 'length == 1 and (.[0] | type) == "array"' >/dev/null 2>&1; then
+      warn "ga-vp2zr0: could not read the HQ beads routed to $_pool (bd ready rc=$_rc, or not a JSON array) — NOT healing blind routes for it this sweep; the next sweep retries."
+      continue
+    fi
+    _ids=$(printf '%s' "$_json" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
+      | jq -r '.[]? | .id // empty' 2>/dev/null) || _ids=""
+    while IFS= read -r _id; do
+      [ -n "$_id" ] || continue
+      if [ "$_healed" -ge "$_max" ]; then
+        log "  ga-vp2zr0: blind-route heal reached its per-sweep cap ($_max) — the rest wait for the next sweep."
+        return 0
+      fi
+      if [ "$DRY_RUN" = "1" ]; then
+        log "  ga-vp2zr0: DRY_RUN=1 — WOULD re-route HQ bead $_id from $_pool to gastown.dog (HQ is not a store $_pool's workers read)."
+        _healed=$((_healed + 1))
+        continue
+      fi
+      if bd -C "$GC_CITY" update "$_id" --set-metadata "gc.routed_to=gastown.dog" -q >/dev/null 2>&1; then
+        bd -C "$GC_CITY" comment "$_id" "ga-vp2zr0: gc.routed_to=$_pool re-roteado para gastown.dog — este bead vive no HQ, e os workers de $_pool só leem o clone do seu próprio rig (nunca o HQ), então nenhum deles acharia este bead; o pool gastown.dog lê o HQ." >/dev/null 2>&1 || true
+        log "  ga-vp2zr0: HQ bead $_id re-routed $_pool -> gastown.dog (HQ is not a store $_pool's workers read)."
+        _healed=$((_healed + 1))
+      else
+        warn "ga-vp2zr0: could not re-route HQ bead $_id from $_pool to gastown.dog (bd update failed) — left as it was; the top-up and pre-claim store gates keep it inert, and the next sweep retries."
+      fi
+    done <<EOF_HEAL
+$_ids
+EOF_HEAL
+  done
+  return 0
+}
+
 # ga-q0ewpu: computed ONCE here (not inside _pilot_pool_topup/_topup_rig_pending)
 # so both pool calls below share a single `gc rig list` invocation. Same
 # fail-open convention as ga-07rb3 above (_scan_rig_fallback_pool,
@@ -9515,6 +9676,7 @@ if ! _TOPUP_RIG_PATHS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --
 fi
 _TOPUP_RIG_PATHS=$(printf '%s' "$_TOPUP_RIG_PATHS_JSON" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
 
+_pilot_heal_hq_blind_routes
 _pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
 _pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
 
@@ -10632,6 +10794,20 @@ _pilot_pool_cap_full_for() {
     *) return 1 ;;
   esac
   case "$_max" in ''|*[!0-9]*) return 1 ;; esac
+  # ga-vp2zr0 (b)/(c): "queued behind the pool cap" is only true of a bead the pool's workers can SEE. A bead
+  # stored where they cannot (an HQ bead routed to wa-worker) never leaves the queue however many slots free up —
+  # that was the 2026-10-07 P0 strand: ga-9t9acg.11/.12 sat here, cap-full for ever, behind P1s of the WA store.
+  # So a bead whose store the pool does NOT read is not a capacity queue: return 1 and let the claim run, where
+  # dispatch_one()'s store guard names the real problem (a blind route is stripped and held, an unknown one is
+  # released and alerted). The same goes for a store we cannot identify — "queued" would be a guess.
+  # vazio → the bead's id yields no store (no id, no routes entry): verdict unknown, not queued, claim runs;
+  # falhou/ilegível → same (routes.jsonl unreadable or the rig list failed): not queued, claim runs, and the guard
+  # there refuses without dispatching. Both land in "do not wait silently behind a cap".
+  local _id _home
+  _id=$(printf '%s' "$_story" | jq -r '.id // ""' 2>/dev/null) || _id=""
+  _home=$(_pilot_bead_home_store "$_id")
+  _pilot_pool_store_verdict "$_pool" "$_home"
+  if [ "$_PSV_VERDICT" != "serves" ]; then return 1; fi
   # Return 1 either way ("not full: proceed to the claim") — but ga-5je3zv: a count that could not be READ for
   # a bead committed to a spawn-enabled pool means dispatch_one() WILL fail at its own fail-closed count gate
   # (the sticky _PLSC_UNREADABLE), after a claim + prompt assembly it then has to undo. dispatch_lane() reads
@@ -12344,9 +12520,47 @@ TASK
   # either), and only when that is not possible PARK it visibly (pilot:no-auto-dispatch + next-action:mayor + a
   # comment) instead of dispatching into a store the worker cannot see. Kill switches (both default on):
   # PILOT_POOL_STORE_GUARD=0 disables the whole guard, PILOT_POOL_STORE_AUTOMIGRATE=0 skips just the migration.
-  # "Cannot tell" (rig list unreadable, pool's rig unknown) is a PROCEED — see _pilot_pool_store_blind_guard.
-  if [ "$_IS_RIG_NATIVE" = "1" ] && [ "${PILOT_POOL_STORE_GUARD:-1}" = "1" ] \
-     && _pilot_pool_store_blind_guard "$_SLING_TARGET" "$STORY_BEAD_CITY"; then
+  #
+  # ga-vp2zr0 (c): the guard no longer stops at rig-native beads, and "cannot tell" no longer PROCEEDS.
+  #   * HQ bead (not rig-native), blind pool — the domain fallback (ga-wnojmm) or a stale route can still hand an
+  #     HQ ga- bead to ps-worker/wa-worker, whose workers read their own rig clone, never HQ. Nothing is slung or
+  #     copied: the blind route is stripped, the claim released, and the bead goes through the shared
+  #     hold/escalate counter so the Mayor sees it after 3 sweeps instead of it stranding quietly.
+  #   * store unknown (rig list unreadable, pool's rig unknown, no store for the bead) — released and refused with
+  #     a loud warn; the next sweep asks again. Dispatching on a doubt is exactly the strand the guard is for.
+  local _PSB_RC=1
+  if [ "${PILOT_POOL_STORE_GUARD:-1}" = "1" ]; then
+    _PSB_RC=0
+    _pilot_pool_store_blind_guard "$_SLING_TARGET" "$STORY_BEAD_CITY" || _PSB_RC=$?
+  fi
+  if [ "$_PSB_RC" = "2" ]; then
+    warn "ga-vp2zr0: cannot tell whether $_SLING_TARGET reads the store $STORY_ID lives in ($STORY_BEAD_CITY) — NOT dispatching it on a doubt (an unidentified store is the strand this guard exists for). Releasing the claim; the next sweep asks again."
+    if [ "$DRY_RUN" != "1" ]; then
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      unmark_pool_builder "$BUILDER_TARGET"
+    fi
+    DISPATCH_RESULT="pool_store_unknown"
+    return 1
+  fi
+  if [ "$_PSB_RC" = "0" ] && [ "$_IS_RIG_NATIVE" != "1" ]; then
+    warn "ga-vp2zr0: REFUSING dispatch of HQ bead $STORY_ID to $_SLING_TARGET — the HQ store is not one that pool's workers read (they read only the ${_PSV_POOL_RIG:-?} clone), so they would never find it. Stripping any blind gc.routed_to, releasing the claim, holding/escalating."
+    if [ "$DRY_RUN" != "1" ]; then
+      case "$(echo "$STORY" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null)" in
+        wa-worker|ps-worker) bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata gc.routed_to -q 2>/dev/null || true ;;
+      esac
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      unmark_pool_builder "$BUILDER_TARGET"
+    fi
+    _pilot_hold_or_escalate "$STORY_BEAD_CITY" "$STORY_ID" "ga-vp2zr0-hq-pool-blind" \
+      "$STORY_ID is an HQ bead that Pilot's builder choice sent to $_SLING_TARGET, whose workers read only the ${_PSV_POOL_RIG:-?} clone and never the HQ store — dispatching it would strand it" \
+      "route $STORY_ID to gastown.dog (gc.routed_to), or move it into the ${_PSV_POOL_RIG:-?} store" \
+      "$(echo "$STORY" | jq -c '.labels // []' 2>/dev/null || echo '[]')"
+    DISPATCH_RESULT="hq_pool_store_blind"
+    return 1
+  fi
+  if [ "$_IS_RIG_NATIVE" = "1" ] && [ "$_PSB_RC" = "0" ]; then
     local _PSB_POOL_RIG _PSB_SRC_RIG _PSB_MIGRATED_ID=""
     _PSB_POOL_RIG=$(_pilot_pool_rig "$_SLING_TARGET")
     _PSB_SRC_RIG=$(_pilot_rig_name_for_path "$STORY_BEAD_CITY")
@@ -13347,16 +13561,19 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       The same pair exists for the rig pools (ga-653ilw): rig_native_pool_store_migrated (the bead
 #                       was moved into the store the wa-worker/ps-worker reads) and rig_native_pool_store_blind
 #                       (could not be moved, parked) — a bead the pool could never have found, refused, not a fault.
+#                       hq_pool_store_blind (ga-vp2zr0) is the HQ-store sibling: an HQ bead the builder choice sent to
+#                       a pool whose workers never read HQ — refused, the blind route stripped, held/escalated.
 #                       Also rig_native_spawn_deferred_slow (ga-6hr8p7): the spawn was DEFERRED because an
 #                       earlier spawn this sweep was slow — a deliberate deferral, not a fault; it is still
 #                       counted in NONQUEUE_FAILS so the Step 5 stall streak sees a sweep that spawned nothing.
 #   failed_other        any other NAMED failure (assign / sling / in-flight / rig_native_pool_count_unreadable —
 #                       the session count could not be read, so the spawn was NOT attempted, ga-oa004t — and
 #                       remerge_branch_lookup_unknown, ga-x7m5rg: the gate:needs-remerge branch lookup could
-#                       not READ, so the bead was left untouched and retried next sweep) and any name not
-#                       classified here. Both "could not read" names are in this bucket ON PURPOSE: it is the
-#                       only place a permanent unknown stays visible — a guard bucket would call it a policy
-#                       refusal and hide a broken lookup.
+#                       not READ, so the bead was left untouched and retried next sweep; pool_store_unknown,
+#                       ga-vp2zr0: which store the bead lives in / the pool reads could not be told, so it was NOT
+#                       dispatched on a doubt) and any name not classified here. Every "could not read" name is in
+#                       this bucket ON PURPOSE: it is the only place a permanent unknown stays visible — a guard
+#                       bucket would call it a policy refusal and hide a broken lookup.
 #   unclassified        dispatch_one() returned non-zero WITHOUT naming a result (its early guards, a lost
 #                       claim, a hold): counted so the accounting closes — never read as a success
 #   pool_saturated      the ga-in9ebr predicate (_pool_saturated_sweep); consumers must not re-derive it
@@ -13405,7 +13622,7 @@ _pilot_sweep_emit() {
       elif $o.r == "rig_native_pool_session_cap_queued" then "queued_pool_cap"
       elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
-      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow"]
+      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow"]
            | any(.[]; . == $o.r) then "refused_by_guard"
       elif $o.r == "" then "unclassified"
       else "failed_other" end;

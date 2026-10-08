@@ -137,6 +137,13 @@ run_lanes() {
     _bead_tier() { echo tier1; }
     _pilot_slow_spawn_deferred_for() { return 1; }
     _dolt_saturated() { return 1; }
+    # ga-vp2zr0: _pilot_pool_cap_full_for first asks whether the pool reads the store the bead lives in (a bead stored where
+    # the pool cannot see it is never "queued behind the cap"). This selftest is about the session-count halt, and its
+    # sandbox has neither a routes.jsonl nor a rig list — the real answer here would be "unknown" for every bead, and the
+    # cap path under test would never run. So the pool is given the store. The REAL verdict (serves / blind / unknown) and
+    # the cap skip that follows from it are pilot-dispatcher.hq-pool-store-blind.selftest.sh, Part F.
+    _pilot_bead_home_store() { printf '%s' "$WORK"; }
+    _pilot_pool_store_verdict() { _PSV_VERDICT="serves"; _PSV_POOL_RIG=""; return 0; }
     dispatch_one() {
       DISPATCH_RESULT=""
       printf '%s' "$1" | jq -r '.id' >> "$WORK/attempts"
