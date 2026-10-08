@@ -10,7 +10,7 @@
 #
 # Runs every ~10 min via launchd (com.gascity.context-check-dispatcher.plist).
 #
-#   open bug/chore/task/debt (+ feature w/o story:*)        ← THIS DAEMON's INPUT
+#   open bug/chore/task (+ feature w/o story:*)             ← THIS DAEMON's INPUT
 #     │  no ctx:* label yet; not plumbing; not in-flight/done/gate-stuck
 #     ▼  judge: does a GENERIC agent have enough to build it WITHOUT a human?
 #   ┌──────────────────────────────────────────────────────────────────────┐
@@ -1160,8 +1160,10 @@ elif [ "$(_quiet_hours_unreadable)" = "1" ]; then
 fi
 
 # ── Step 1: Gather candidates ──────────────────────────────────────────────────
-# Actionable work types: bug / chore / task / debt + feature (feature is filtered
-# to those WITHOUT a story:* label by the pure classifier). bd has no
+# Actionable work types FETCHED: bug / chore / task + feature (feature is filtered
+# to those WITHOUT a story:* label by the pure classifier). `debt` is NOT fetched: it is not an issue type of bd
+# (`bd list --type debt` exits 1: invalid issue type — measured on the 6 stores, 2026-10-08, gate run ga-igrhkx); the pure
+# classifier keeps accepting the string, which is harmless. bd has no
 # missing-label filter, so we exclude ctx:* at the query AND re-assert every rule
 # in the pure classifier (defense in depth). One union over ALL stores, then ONE
 # order (ga-9t9acg.10, below) — priority > type > age, the cap applied after it.
@@ -1210,11 +1212,14 @@ fi
 # per-store oldest-first is not reproduced on purpose — a second copy of an ordering idiom is what the registry lint forbids.
 # `[ -r ]` before `source`: under this file's `set -e` a missing target kills the process (see ga-q4sadt above).
 _GC_WO_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/work-order.sh"
-if [ -r "$_GC_WO_SIBLING" ]; then
+# `bash -n` before `source`: a lib that is there but does not parse would make `source` exit the whole sweep (set -e) after
+# "sweep start" was logged — the same "cannot tell" as a missing one, so it takes the same path. (A lib that parses, but whose
+# work_order_sort fails or prints no array when CALLED, is covered further down.)
+if [ -r "$_GC_WO_SIBLING" ] && "${BASH:-bash}" -n "$_GC_WO_SIBLING" 2>/dev/null; then
   # shellcheck source=scripts/work-order.sh
   source "$_GC_WO_SIBLING"
 else
-  warn "ga-9t9acg.10: work-order.sh missing/unreadable ($_GC_WO_SIBLING) — the sweep cannot apply the order rule and keeps the GATHERED order (stores as listed, by id inside a store) until it is restored. Not an empty queue."
+  warn "ga-9t9acg.10: work-order.sh missing/unreadable/unparseable ($_GC_WO_SIBLING) — the sweep cannot apply the order rule and keeps the GATHERED order (stores as listed, by id inside a store) until it is restored. Not an empty queue."
 fi
 unset _GC_WO_SIBLING
 
@@ -1222,16 +1227,24 @@ _fetch_type() {
   # --limit 0 = the WHOLE population. The order below is applied to it; a window taken here would cut the list BEFORE the
   # P0 features were seen (ga-g7yt: window + post-filter hides real work). bd failing, or printing nothing, is logged and
   # becomes [] so the sweep goes on with what it has — but it is never read as "this store has no beads of this type".
-  local _out
-  if _out=$(bd_ list --type "$1" --status open --limit 0 \
+  # Call it ONLY with a type bd knows (bug|chore|task|feature here): for any other string bd exits 1 on EVERY call, and this
+  # WARN would fire for every store on every sweep (that was `debt`, gate run ga-igrhkx) until a real failure hid among them.
+  # bd's stderr goes to a file so the WARN can quote its FIRST line — the one line that says why (the old 2>/dev/null dropped it).
+  # mktemp failing leaves the stderr on /dev/null: the WARN then has no reason text, the fetch itself is unaffected.
+  local _out _err _rc=0 _why=""
+  _err="$(mktemp 2>/dev/null)" || _err=""
+  _out=$(bd_ list --type "$1" --status open --limit 0 \
       --exclude-label ctx:ready \
       --exclude-label ctx:thin \
-      --json 2>/dev/null) && [ -n "$_out" ]; then
+      --json 2>"${_err:-/dev/null}") || _rc=$?
+  if [ "$_rc" -eq 0 ] && [ -n "$_out" ]; then
     printf '%s\n' "$_out"
   else
-    warn "ga-9t9acg.10: bd list --type $1 failed or printed nothing in ${CC_STORE:-$GC_CITY} — its beads are NOT in this sweep (not 'no beads of this type'); retried next sweep." >&2
+    if [ -n "$_err" ]; then _why="$(head -n 1 "$_err" 2>/dev/null | cut -c1-300)"; fi
+    warn "ga-9t9acg.10: bd list --type $1 failed (exit $_rc) or printed nothing in ${CC_STORE:-$GC_CITY}${_why:+ — bd said: $_why} — its beads are NOT in this sweep (not 'no beads of this type'); retried next sweep." >&2
     echo "[]"
   fi
+  if [ -n "$_err" ]; then rm -f "$_err"; fi
 }
 
 # Per-store exclusion sets, for the store in $CC_STORE: sets CC_BUILT_IDS and CC_BLOCKED_IDS. Computed the first time a bead
@@ -1258,10 +1271,20 @@ _cc_load_store_sets() {
   # O(1) membership in the loop. FAIL-OPEN (git fails → empty set → no exclusion). The Pilot already
   # filters these from dispatch (_filter_built); this keeps the CLASSIFIER from re-labelling them.
   # Test seam CONTEXT_CHECK_TEST_BUILT_IDS; kill-switch CONTEXT_CHECK_EXCLUDE_BUILT=0. (2026-06-22)
-  # || true: a non-repo CC_STORE (git -C fails) or zero crew/* refs (grep finds
-  # no matches) both legitimately yield an empty set under pipefail — neither
-  # should abort the script before any bead is classified (ga-6qpna).
-  CC_BUILT_IDS="${CONTEXT_CHECK_TEST_BUILT_IDS-$(git -C "$CC_STORE" for-each-ref --format='%(refname)' 2>/dev/null | grep -oE 'crew/[^/]+/[^/]+$' | sed -E 's@crew/[^/]+/@@' | sort -u || true)}"
+  # || true: zero crew/* refs (grep finds no matches) yields an empty set under pipefail — it
+  # should not abort the script before any bead is classified (ga-6qpna).
+  # ga-9t9acg.10: `git -C` failing (not a repo, repo unreadable) used to land in that same `|| true`, so "git failed" was
+  # indistinguishable from "no crew branches" and a coded bead could be re-labelled ctx:ready with no trace. The ref list is
+  # now read inside an `if` (exempt from set -e): vazio → no crew branch, nothing excluded, silent; falhou → nothing excluded
+  # too (fail-open, as before) but the log says so, for this sweep only (the next sweep asks again).
+  if [ "${CONTEXT_CHECK_TEST_BUILT_IDS+set}" = "set" ]; then
+    CC_BUILT_IDS="$CONTEXT_CHECK_TEST_BUILT_IDS"
+  elif _cc_refs=$(git -C "$CC_STORE" for-each-ref --format='%(refname)' 2>/dev/null); then
+    CC_BUILT_IDS=$(printf '%s\n' "$_cc_refs" | grep -oE 'crew/[^/]+/[^/]+$' | sed -E 's@crew/[^/]+/@@' | sort -u || true)
+  else
+    CC_BUILT_IDS=""
+    warn "ga-9t9acg.10: git for-each-ref failed in $CC_STORE — no built-bead exclusion for this store this sweep (fail-open, not 'no crew branches'); a bead that already has a crew branch may be marked ctx:ready until the next sweep."
+  fi
 
   # Dep-BLOCKED bead-ids in this store (wa-9t2ty fix): a bead with an active
   # blocking dependency is NOT ready-to-code — it must not (re)enter ctx:ready.
@@ -1313,19 +1336,18 @@ for CC_STORE in $CONTEXT_CHECK_STORES; do
   BUG_JSON=$(_fetch_type bug)
   CHORE_JSON=$(_fetch_type chore)
   TASK_JSON=$(_fetch_type task)
-  DEBT_JSON=$(_fetch_type debt)
   FEATURE_JSON=$(_fetch_type feature)
   # Every bead is tagged with its store (_store): the row carries it through the order, and the loop below sets CC_STORE
   # from it before any bd_ call, so a label/comment is written to the store the bead came from.
   if ! CANDIDATES=$(jq -c -s --arg s "$CC_STORE" 'add | unique_by(.id) | map(. + {_store: $s})' \
       <(echo "$BUG_JSON") <(echo "$CHORE_JSON") <(echo "$TASK_JSON") \
-      <(echo "$DEBT_JSON") <(echo "$FEATURE_JSON") 2>/dev/null); then
+      <(echo "$FEATURE_JSON") 2>/dev/null); then
     warn "ga-9t9acg.10: could not merge the bd output of $CC_STORE — its beads are NOT in this sweep (not 'no beads'); retried next sweep."
     CANDIDATES="[]"
   fi
   CCOUNT=$(echo "$CANDIDATES" | jq 'length' 2>/dev/null || echo 0)
   if [ "$CCOUNT" -eq 0 ] 2>/dev/null; then
-    log "  no open actionable beads in this store."
+    log "  no open actionable beads fetched from this store (a fetch that failed is a WARN above, not an empty store)."
     continue
   fi
   log "  $CCOUNT open actionable bead(s) fetched (pre-classification)."
@@ -1350,6 +1372,10 @@ if [ "$CC_TOTAL" -gt 0 ] 2>/dev/null; then
     _wo_why="the work-order library is not loaded"
   elif ! _wo_out=$(printf '%s' "$ALL_CANDIDATES" | work_order_sort --age created 2>"${_wo_err:-/dev/null}") || [ -z "$_wo_out" ]; then
     _wo_why="work_order_sort could not order the candidates (exit != 0 or empty output; its own line above says why)"
+  elif ! printf '%s' "$_wo_out" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    # exit 0 and text, but not a JSON array: the judge loop below reads it with `jq -c '.[]'`, which prints nothing for it —
+    # the sweep would judge NOTHING and look like an empty queue.
+    _wo_why="work_order_sort printed something that is not a JSON array"
   fi
   # The library's WARN lines (a bead whose priority/type/age it could not read stays at the END of its class) and its ERROR
   # line are the only signal it gives: they go to the log, never to /dev/null.
@@ -1366,9 +1392,13 @@ if [ "$CC_TOTAL" -gt 0 ] 2>/dev/null; then
     warn "ga-9t9acg.10: $_wo_why — cannot tell the order, so the sweep keeps the GATHERED order (stores as listed, by id inside a store). This is NOT an empty queue: the $CC_TOTAL candidate(s) are still judged."
   fi
 fi
-CC_HEAD=$(echo "$CC_ORDERED" | jq -r --argjson n "$CONTEXT_CHECK_MAX_PER_SWEEP" \
-  '.[0:$n] | map("\((._store // "?") | split("/") | last):\(.id // "?")/P\(.priority // "?")") | join(" ")' 2>/dev/null || true)
-log "Order: $CC_TOTAL candidate(s) from all stores, $CC_ORDER_NOTE; the per-sweep cap ($CONTEXT_CHECK_MAX_PER_SWEEP) applies after it. First in line: ${CC_HEAD:-<none>}"
+# vazio → "<none>" (nothing in line); falhou/ilegível (jq cannot read the ordered list) → "<unreadable>": the two must not read alike.
+CC_HEAD="<unreadable>"
+if _cc_head=$(echo "$CC_ORDERED" | jq -r --argjson n "$CONTEXT_CHECK_MAX_PER_SWEEP" \
+    '.[0:$n] | map("\((._store // "?") | split("/") | last):\(.id // "?")/P\(.priority // "?")") | join(" ")' 2>/dev/null); then
+  CC_HEAD="${_cc_head:-<none>}"
+fi
+log "Order: $CC_TOTAL candidate(s) from all stores, $CC_ORDER_NOTE; the per-sweep cap ($CONTEXT_CHECK_MAX_PER_SWEEP) applies after it. First in line: $CC_HEAD"
 
 # Judge in that order. The per-sweep cap is checked HERE, per judged bead — after the order, not per store.
 while IFS= read -r row; do

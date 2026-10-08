@@ -1119,6 +1119,10 @@ cat > "$_c14/sb/bin/bd" <<'STUB'
 # Two-store bd stub. `-C <store>` picks the fixture set by the store's basename (hq | wa); `list --type T` serves
 # $C14_FIX/<store>.<T>.json (else []) and is recorded in $C14_CALLS; every WRITE lands in $C14_LEDGER as
 # "<store> <cmd> <args>", so the test can see WHICH store a verdict was written to.
+# It is as strict as the REAL bd about `--type`: a type outside bd's own list exits 1 with bd's own message and prints
+# nothing (verified against the real bd, 2026-10-08: `bd list --type debt` -> that line, exit 1). A stub that answered []
+# for any type is what let the dispatcher fetch `debt` on every sweep without a single test noticing (gate run ga-igrhkx).
+# C14_LIST_FAIL="<store>:<type>" makes that one list call fail like a Dolt hiccup (exit 1, a line on stderr).
 store=""
 if [ "${1:-}" = "-C" ]; then store="$(basename "$2")"; shift 2; fi
 cmd="${1:-}"; shift || true
@@ -1127,6 +1131,13 @@ case "$cmd" in
     echo "$store list $*" >> "$C14_CALLS"
     want=""
     while [ $# -gt 0 ]; do case "$1" in --type) want="$2"; shift 2 ;; *) shift ;; esac; done
+    if [ -n "$want" ]; then
+      case " bug feature task epic chore decision agent convergence convoy event gate merge-request message molecule rig role session spec step " in
+        *" $want "*) ;;
+        *) echo "Error: invalid issue type \"$want\" (valid: bug, feature, task, epic, chore, decision, agent, convergence, convoy, event, gate, merge-request, message, molecule, rig, role, session, spec, step)" >&2; exit 1 ;;
+      esac
+    fi
+    if [ "${C14_LIST_FAIL:-}" = "$store:$want" ]; then echo "Error: connection refused (dolt server unreachable)" >&2; exit 1; fi
     if [ -f "$C14_FIX/$store.$want.json" ]; then cat "$C14_FIX/$store.$want.json"; else echo "[]"; fi
     exit 0 ;;
   comments) echo "[]"; exit 0 ;;
@@ -1144,13 +1155,15 @@ export C14_FIX C14_CALLS C14_LEDGER
 _c14_log="$_c14/hq/.gc/logs/context-check-dispatcher.log"
 # _c14_run <dispatcher> — one sweep over the two stores with a cap of 3. Writes land in $C14_LEDGER, list calls in
 # $C14_CALLS. Exec-class off: the only writes are the verdicts. The blocked-ids test seam is set (to empty) unless
-# C14_BLOCKED_SEAM=off: then the dispatcher really runs `bd blocked` through the stub (14k/14l).
+# C14_BLOCKED_SEAM=off: then the dispatcher really runs `bd blocked` through the stub (14k/14l). The built-ids seam works
+# the same way (C14_BUILT_SEAM=off: it really runs `git -C <store> for-each-ref`, 14s-14u).
 _c14_run() {
   : > "$C14_LEDGER"; : > "$C14_CALLS"; rm -f "$_c14_log"
   local -a _c14_env=(CONTEXT_CHECK_CITY_OVERRIDE="$_c14/hq" CONTEXT_CHECK_STORES="$_c14/hq $_c14/wa"
-    CONTEXT_CHECK_TEST_BUILT_IDS="" CONTEXT_CHECK_MAX_PER_SWEEP=3 CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0
+    CONTEXT_CHECK_MAX_PER_SWEEP=3 CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0
     CONTEXT_CHECK_EXEC_CLASS=0 PATH="$SANDBOX_PATH")
   [ "${C14_BLOCKED_SEAM:-on}" = "on" ] && _c14_env+=(CONTEXT_CHECK_TEST_BLOCKED_IDS="")
+  [ "${C14_BUILT_SEAM:-on}" = "on" ] && _c14_env+=(CONTEXT_CHECK_TEST_BUILT_IDS="")
   env "${_c14_env[@]}" timeout 120 bash "$1" >/dev/null 2>&1 || true
 }
 # _c14_judged — the ids that got a verdict, in the order the verdicts were written, space-separated.
@@ -1158,7 +1171,9 @@ _c14_judged() { awk '$2=="label" && $3=="add" && ($5=="ctx:ready" || $5=="ctx:th
 # _c14_count <words> — how many words (ids) in the string.
 _c14_count() { printf '%s' "$1" | wc -w | tr -d ' '; }
 # _c14_copy <dir> <real|none|broken> — a copy of the dispatcher beside symlinks to every sibling. `real` keeps
-# scripts/ (the lib); `none` has no scripts/ at all; `broken` has a scripts/work-order.sh whose work_order_sort cannot tell.
+# scripts/ (the lib); `none` has no scripts/ at all; `broken` has a scripts/work-order.sh whose work_order_sort cannot tell;
+# `unparseable` has one that does not parse (`source` of it would exit the sweep); `garbage` has one whose work_order_sort
+# exits 0 and prints text that is not a JSON array.
 _c14_copy() {
   local d="$1" mode="$2" e b
   for e in "$SELF_DIR"/*; do
@@ -1168,10 +1183,14 @@ _c14_copy() {
     ln -s "$e" "$d/$b"
   done
   cp "$DISPATCHER" "$d/context-check-dispatcher.sh"
-  if [ "$mode" = "broken" ]; then
-    mkdir -p "$d/scripts"
-    printf '%s\n' 'work_order_sort() { echo "work-order ERROR: stub: cannot tell" >&2; return 2; }' > "$d/scripts/work-order.sh"
-  fi
+  case "$mode" in
+    broken)      mkdir -p "$d/scripts"
+                 printf '%s\n' 'work_order_sort() { echo "work-order ERROR: stub: cannot tell" >&2; return 2; }' > "$d/scripts/work-order.sh" ;;
+    unparseable) mkdir -p "$d/scripts"
+                 printf '%s\n' 'work_order_sort() { echo "never closed"' > "$d/scripts/work-order.sh" ;;
+    garbage)     mkdir -p "$d/scripts"
+                 printf '%s\n' 'work_order_sort() { cat >/dev/null; echo "this is not json"; }' > "$d/scripts/work-order.sh" ;;
+  esac
 }
 
 # 14a-14d — the shipped dispatcher.
@@ -1198,10 +1217,20 @@ else
 fi
 _c14_nlist=$(grep -c ' list ' "$C14_CALLS" || true)
 _c14_nolim=$(grep ' list ' "$C14_CALLS" | grep -vc -- '--limit 0' || true)
-if [ "$_c14_nlist" = "10" ] && [ "$_c14_nolim" = "0" ]; then
-  ok "14d: all 5 types of BOTH stores were fetched, every list with --limit 0 (the whole population before the order)"
+_c14_ndebt=$(grep -c -- '--type debt' "$C14_CALLS" || true)
+if [ "$_c14_nlist" = "8" ] && [ "$_c14_nolim" = "0" ] && [ "$_c14_ndebt" = "0" ]; then
+  ok "14d: the 4 issue types bd has (bug chore task feature) of BOTH stores were fetched, every list with --limit 0 (the whole population before the order); no 'debt', which bd rejects"
 else
-  bad "14d: list calls=$_c14_nlist (want 10 = 5 types x 2 stores), without --limit 0=$_c14_nolim (want 0)"
+  bad "14d: list calls=$_c14_nlist (want 8 = 4 types x 2 stores), without --limit 0=$_c14_nolim (want 0), '--type debt' calls=$_c14_ndebt (want 0)"
+fi
+# 14o — a HEALTHY sweep says nothing about ga-9t9acg.10. The WARNs this slice adds (a failed fetch, a failed `bd blocked`, an
+# unreadable store...) are only worth reading if a good sweep never writes one: fetching `debt` made 6 of them per sweep, for
+# ever, because real bd rejects the type — the stub above now rejects it too, and this is the assertion that sees it.
+_c14_nwarn=$(grep -E 'WARN.*ga-9t9acg\.10' "$_c14_log" 2>/dev/null | wc -l | tr -d ' ' || true)   # the lib-only `. "$DISPATCHER"` at the top leaves set -e + pipefail on: grep finding nothing must not end the run
+if grep -q 'Order: ' "$_c14_log" 2>/dev/null && [ "$_c14_nwarn" = "0" ]; then
+  ok "14o: a healthy two-store sweep logs no WARN naming ga-9t9acg.10 (the new signals stay rare enough to be read)"
+else
+  bad "14o: a healthy sweep logged $_c14_nwarn WARN line(s) naming ga-9t9acg.10 (or never reached the order step): $(grep -E 'WARN.*ga-9t9acg\.10' "$_c14_log" 2>/dev/null | head -2 | tr '\n' ';')"
 fi
 
 # 14e — mutation control: put the rule of today back (priority-blind, oldest first) and the order assertion must FAIL.
@@ -1296,6 +1325,106 @@ else
 fi
 C14_BLOCKED_SEAM=on; C14_BLOCKED_FAIL=0; export C14_BLOCKED_FAIL
 
+# 14p — a REAL failure of a valid fetch is loud, names why, and does not read as "no beads": hq's bug list fails (a Dolt hiccup).
+# The sweep goes on with what it has — hq-p0-bug-old is not in it and the log says so — instead of judging a silently thinner city.
+C14_LIST_FAIL="hq:bug"; export C14_LIST_FAIL
+_c14_run "$DISPATCHER"
+_c14_gotp="$(_c14_judged)"
+C14_LIST_FAIL=""; export C14_LIST_FAIL
+if grep -E "WARN.*ga-9t9acg\.10: bd list --type bug failed \(exit 1\).* in .*/hq — bd said: Error: connection refused.*NOT in this sweep" "$_c14_log" >/dev/null 2>&1 \
+   && [ "$(grep -cE 'WARN.*ga-9t9acg\.10: bd list --type' "$_c14_log" 2>/dev/null)" = "1" ]; then
+  ok "14p: a failing 'bd list --type bug' is ONE WARN with the store, the exit code and bd's own first stderr line"
+else
+  bad "14p: the failed fetch is not reported as expected (log WARNs: $(grep -E 'WARN.*ga-9t9acg\.10' "$_c14_log" 2>/dev/null | head -3 | tr '\n' ';'))"
+fi
+if [ "$_c14_gotp" = "wa-p0-feat-new wa-p1-task hq-p2-old" ]; then
+  ok "14p2: and the sweep survives it — the beads it could read are judged in the city order ($_c14_gotp)"
+else
+  bad "14p2: the sweep did not go on in the city order after the failed fetch (got: ${_c14_gotp:-<nothing judged>})"
+fi
+
+# 14q — mutation control for 14o: fetch `debt` again and a healthy sweep must NOT be quiet, and the WARN carries the line that
+# makes it self-diagnosing (bd's own "invalid issue type"). Without that, 14o could pass for the wrong reason.
+_c14d="$(mktemp -d)"
+_c14_copy "$_c14d" real
+sed 's/^  FEATURE_JSON=\$(_fetch_type feature)$/  FEATURE_JSON=$(_fetch_type feature); DEBT_JSON=$(_fetch_type debt)/' "$DISPATCHER" > "$_c14d/context-check-dispatcher.sh"
+if cmp -s "$DISPATCHER" "$_c14d/context-check-dispatcher.sh"; then
+  bad "14q: the mutation did not apply (no 'FEATURE_JSON=\$(_fetch_type feature)' line in the dispatcher) — the control proves nothing"
+else
+  _c14_run "$_c14d/context-check-dispatcher.sh"
+  if grep -E 'WARN.*ga-9t9acg\.10: bd list --type debt failed.*bd said: Error: invalid issue type' "$_c14_log" >/dev/null 2>&1; then
+    ok "14q: mutation control — fetching 'debt' again puts a ga-9t9acg.10 WARN in a healthy sweep, quoting bd's 'invalid issue type', so 14o catches a revert"
+  else
+    bad "14q: mutation control failed — with 'debt' fetched again the log has no such WARN, so 14o cannot catch a revert"
+  fi
+fi
+
+# 14s-14u — `git for-each-ref` failing must not read as "no crew branches". Built-ids seam OFF, so the dispatcher really asks
+# git. hq is NOT a repo (git fails: WARN, nothing excluded); wa is a repo with ONE crew branch named after wa-p1-task (the
+# found half: that bead is skipped as already built, WITHOUT a WARN and without using up the cap). A repo with no crew
+# branch at all takes the same `if` branch with an empty list (the "vazio" half) and is not driven here.
+if git -C "$_c14/hq" rev-parse --git-dir >/dev/null 2>&1; then
+  bad "14s: fixture precondition — $_c14/hq sits inside a git repo, so git cannot fail there; the test proves nothing"
+else
+  if ! { git init -q "$_c14/wa" \
+      && git -C "$_c14/wa" -c user.name=selftest -c user.email=selftest@invalid commit -q --allow-empty -m fixture \
+      && git -C "$_c14/wa" branch crew/tester/wa-p1-task; }; then
+    bad "14s: fixture — could not build the wa repo with its crew branch; the git-path tests below prove nothing"
+  fi
+  C14_BUILT_SEAM=off
+  _c14_run "$DISPATCHER"
+  _c14_gots="$(_c14_judged)"
+  C14_BUILT_SEAM=on
+  if [ "$_c14_gots" = "wa-p0-feat-new hq-p0-bug-old hq-p2-old" ]; then
+    ok "14s: with the real git path, the bead that has a crew branch (wa-p1-task) is skipped as built and the cap goes to the next ($_c14_gots)"
+  else
+    bad "14s: wrong judging order on the real git path (want: wa-p0-feat-new hq-p0-bug-old hq-p2-old | got: ${_c14_gots:-<nothing judged>})"
+  fi
+  if grep -E 'WARN.*ga-9t9acg\.10: git for-each-ref failed in .*/hq .*not .no crew branches.' "$_c14_log" >/dev/null 2>&1 \
+     && ! grep -E 'WARN.*git for-each-ref failed in .*/wa' "$_c14_log" >/dev/null 2>&1; then
+    ok "14t: git failing in a non-repo store is a WARN naming that store; a repo that has a crew branch logs nothing"
+  else
+    bad "14t: git failure not reported as expected (log WARNs: $(grep -E 'WARN' "$_c14_log" 2>/dev/null | head -3 | tr '\n' ';'))"
+  fi
+  # 14u — mutation control: drop the WARN (keep the fail-open) and 14t must fail.
+  _c14g="$(mktemp -d)"
+  _c14_copy "$_c14g" real
+  sed 's/^    warn "ga-9t9acg.10: git for-each-ref failed/    : "ga-9t9acg.10: git for-each-ref failed/' "$DISPATCHER" > "$_c14g/context-check-dispatcher.sh"
+  if cmp -s "$DISPATCHER" "$_c14g/context-check-dispatcher.sh"; then
+    bad "14u: the mutation did not apply (no 'warn \"ga-9t9acg.10: git for-each-ref failed' line in the dispatcher) — the control proves nothing"
+  else
+    C14_BUILT_SEAM=off
+    _c14_run "$_c14g/context-check-dispatcher.sh"
+    C14_BUILT_SEAM=on
+    if grep -E 'git for-each-ref failed' "$_c14_log" >/dev/null 2>&1; then
+      bad "14u: mutation control failed — with the WARN removed the log still names the git failure, so 14t proves nothing"
+    else
+      ok "14u: mutation control — with the WARN removed a failing git is silent again, so 14t catches that regression"
+    fi
+  fi
+  rm -rf "$_c14g"
+fi
+
+# 14v/14w — the library is there but cannot be used. A lib that does not PARSE would exit the whole sweep at `source` (set -e),
+# after "sweep start" and before any bead; one whose work_order_sort exits 0 with text that is no JSON array would make the
+# judge loop read NOTHING — an empty queue by accident. Both are "cannot tell": gathered order, a WARN, every bead still judged.
+_c14x="$(mktemp -d)"; _c14_copy "$_c14x" unparseable
+_c14_run "$_c14x/context-check-dispatcher.sh"
+_c14_gotx="$(_c14_judged)"
+if [ "$(_c14_count "$_c14_gotx")" = "3" ] && grep -E 'WARN.*ga-9t9acg\.10.*work-order\.sh missing/unreadable/unparseable' "$_c14_log" >/dev/null 2>&1; then
+  ok "14v: a work-order.sh that does not parse → the sweep still judges (3 beads) in the gathered order and logs a WARN; it does not die at 'source'"
+else
+  bad "14v: unparseable lib mishandled (judged: '${_c14_gotx:-<nothing>}'; log: $([ -f "$_c14_log" ] && grep -c . "$_c14_log" || echo '<missing>') lines)"
+fi
+_c14y="$(mktemp -d)"; _c14_copy "$_c14y" garbage
+_c14_run "$_c14y/context-check-dispatcher.sh"
+_c14_goty="$(_c14_judged)"
+if [ "$(_c14_count "$_c14_goty")" = "3" ] && grep -E 'WARN.*ga-9t9acg\.10: work_order_sort printed something that is not a JSON array' "$_c14_log" >/dev/null 2>&1; then
+  ok "14w: work_order_sort exit 0 but not a JSON array → gathered order, a WARN, the sweep still judges (3 beads); not an empty queue"
+else
+  bad "14w: non-array lib output mishandled (judged: '${_c14_goty:-<nothing>}'; log: $([ -f "$_c14_log" ] && grep -c . "$_c14_log" || echo '<missing>') lines)"
+fi
+
 # 14h-14j — drift guards on the shipped file and on the registry.
 _c14_code="$(grep -vE '^[[:space:]]*#' "$DISPATCHER")"
 if echo "$_c14_code" | grep -F 'scripts/work-order.sh' >/dev/null && echo "$_c14_code" | grep -F 'work_order_sort --age created' >/dev/null; then
@@ -1313,7 +1442,7 @@ if grep -E '^consumer[[:space:]]+packs/town-deltas/assets/context-check-dispatch
 else
   ok "14j: the context-check-dispatcher.sh consumer row is gone from work-order.registry.tsv"
 fi
-rm -rf "$_c14" "$_c14m" "$_c14n" "$_c14b" "$_c14k" "$_c14w"
+rm -rf "$_c14" "$_c14m" "$_c14n" "$_c14b" "$_c14k" "$_c14w" "$_c14d" "$_c14x" "$_c14y"
 
 echo ""
 echo "context-check-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
