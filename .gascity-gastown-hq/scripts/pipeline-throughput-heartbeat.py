@@ -154,14 +154,19 @@ GATE_QUEUED_RE = re.compile(r"Found (\d+) queued marker\(s\)")
 # `echo`/`printf` sites for it anywhere in quality-gate-dispatcher.sh, only a comment
 # describing a past incident). The dispatcher's real in-flight-poll line is
 # PHASE_C_INFLIGHT_RE below, which is what _fresh_review_in_progress() now relies on alone.
-# "Phase C: gate-run <id> (branch=<b>) still in flight (G/N verdicts, ELAPSEDs/TIMEOUTs) —
-# leaving for a future sweep." (quality-gate-dispatcher.sh, gate_run "still in flight" log
-# line). TIMEOUT here is the run's OWN already diff-scaled verdict timeout in seconds
-# (ga-ltr3c scales it up to a 50min cap by default) — self-contained per-run signal, no
+# "Phase C: gate-run <id> (branch=<b>) still in flight (G/N verdicts, ELAPSEDs/TIMEOUTs
+# [, anchor=<src>[+Ns]]) — leaving for a future sweep." (quality-gate-dispatcher.sh, gate_run
+# "still in flight" log line). TIMEOUT here is the run's OWN already diff-scaled verdict timeout
+# in seconds (ga-ltr3c scales it up to a 50min cap by default) — self-contained per-run signal, no
 # separate pairing with the "scaled verdict timeout" announcement line needed. ga-z0xx1:
 # this is the fix for the fixed-REVIEW_FRESH_SEC-vs-escalated-cap false positive — compare
 # a run's elapsed against ITS OWN reported timeout instead of a global 45min constant.
-PHASE_C_INFLIGHT_RE = re.compile(r"still in flight \(\d+/\d+ verdicts, (\d+)s/(\d+)s\)")
+# ga-49l8kr: the pattern ENDS at the word boundary after TIMEOUTs, not at `)` — ga-ufskhy appended
+# ", anchor=..." inside the parens and a `s\)` ending went dead on 07/10 16:43 (false "Pipeline
+# parado (gate-merge)"). `\b` reads both shapes and does not name the suffix, so the next field
+# added to the line cannot break this again; gate-inflight-line-contract.selftest.sh renders the
+# producer's real line against this regex.
+PHASE_C_INFLIGHT_RE = re.compile(r"still in flight \(\d+/\d+ verdicts, (\d+)s/(\d+)s\b")
 GATE_MERGING = "proceeding to merge branch"
 # ga-cw4pm headroom decision (gate's own throttle self-assessment, one per sweep):
 #   "Headroom DEFER: gate em N runs (...) — dolt-hot; ceiling=0 reviewers, leaving M

@@ -594,7 +594,12 @@ def last_pass_epoch():
 # ~7671). Unlike the sibling's PHASE_C_INFLIGHT_RE (which only needs ELAPSED/TIMEOUT), this
 # detector's "got == 0" check needs the verdict-received count too, so it gets its own
 # pattern rather than reusing that one.
-STUCK_INFLIGHT_RE = re.compile(r"still in flight \((\d+)/\d+ verdicts, (\d+)s/\d+s\)")
+# ga-49l8kr: the pattern ENDS at the word boundary after TIMEOUTs, not at `)` — ga-ufskhy appended
+# ", anchor=<src>[+Ns]" inside the parens and a `s\)` ending went dead on 07/10 16:43, silently
+# disabling this arm a second time. `\b` reads both shapes and does not name the suffix, so the
+# next field added to the line cannot break it again; gate-inflight-line-contract.selftest.sh
+# renders the producer's real line against this regex.
+STUCK_INFLIGHT_RE = re.compile(r"still in flight \((\d+)/\d+ verdicts, (\d+)s/\d+s\b")
 # ga-rzd08j: the run id the in-flight line above is FOR. Kept as its own regex (rather
 # than folded into STUCK_INFLIGHT_RE) so a future format change to the id/branch prefix
 # can never break the got/elapsed match the rest of this detector depends on — this

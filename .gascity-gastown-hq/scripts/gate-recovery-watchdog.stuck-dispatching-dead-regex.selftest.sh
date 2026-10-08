@@ -76,8 +76,10 @@ def ts(secs_ago):
     return time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - secs_ago))
 
 def inflight_line(got, total, elapsed_s, timeout_s, run_id="ga-testrun", branch="crew/x/wa-1"):
+    # The REAL shape (ga-ufskhy added the ", anchor=..." suffix inside the parens) — see
+    # gate-inflight-line-contract.selftest.sh, which renders the producer's own line (ga-49l8kr).
     return ("%s [quality-gate-dispatcher] Phase C: gate-run %s (branch=%s) still in "
-            "flight (%d/%d verdicts, %ds/%ds) — leaving for a future sweep.\n"
+            "flight (%d/%d verdicts, %ds/%ds, anchor=task-sent+52s) — leaving for a future sweep.\n"
             % (ts(30), run_id, branch, got, total, elapsed_s, timeout_s))
 
 def sweep_complete_line(secs_ago=10):

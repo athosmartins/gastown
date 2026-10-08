@@ -72,7 +72,7 @@ NOISE_MID = [
     L("10:54:29", "Gate-run size: gate_run=ga-3cv5wm bead=wa-umpwj files=5 lines=829"),
     "✓ Comment added to ga-jumir9 — reviewer-verdict: %s (reviewer 1/1)" % BR,
 ]
-P_FLIGHT = L("10:57:58", "Phase C: gate-run ga-3cv5wm (branch=%s) still in flight (0/1 verdicts, 207s/2100s) — leaving for a future sweep." % BR)
+P_FLIGHT = L("10:57:58", "Phase C: gate-run ga-3cv5wm (branch=%s) still in flight (0/1 verdicts, 207s/2100s, anchor=task-sent+52s) — leaving for a future sweep." % BR)
 P_DONE = L("11:06:27", "Phase C: gate-run ga-3cv5wm (branch=%s) complete — 1/1 verdicts, overall=PASS (elapsed 723s). Finalizing." % BR)
 P_PASSED = L("11:07:05", "Gate PASSED: branch=%s tier=CODE merge_sha=4bcd0eaea35bff0d09c841ac606c89e148f5a641 elapsed=726s" % BR)
 P_RUNDONE = L("11:07:07", "=== Gate run complete: gate_run=ga-3cv5wm branch=%s verdict=PASS elapsed=726s ===" % BR)
@@ -131,7 +131,7 @@ check(m._scan_headofline([Q1, Q2, RUN_FAIL]) == (None, None, 0),
 # ── 3. Other branches' lines end nothing ────────────────────────────────────
 print("Scenario 3: progress lines for OTHER branches, and mere 'branch=' noise, do not end the run")
 def prog(b):
-    return [L("10:50:00", "Phase C: gate-run ga-other (branch=%s) still in flight (0/1 verdicts, 10s/2100s) — leaving for a future sweep." % b),
+    return [L("10:50:00", "Phase C: gate-run ga-other (branch=%s) still in flight (0/1 verdicts, 10s/2100s, anchor=task-sent+52s) — leaving for a future sweep." % b),
             L("10:50:05", "Gate PASSED: branch=%s tier=CODE merge_sha=abc elapsed=9s" % b),
             L("10:50:06", "=== Gate run complete: gate_run=ga-other branch=%s verdict=PASS elapsed=9s ===" % b)]
 check(m._scan_headofline([Q1, Q2] + prog(OTHER)) == (CONFLICT, BR, 2),

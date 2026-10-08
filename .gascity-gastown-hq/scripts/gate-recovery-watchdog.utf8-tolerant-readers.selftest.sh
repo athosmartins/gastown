@@ -130,7 +130,7 @@ with Patch(DISPATCH_LOG=p):
 check(n_to == 2 and last_to is not None and abs(last_to - (NOW - 300)) < 2,
       "recent_timeouts() counts the 2 timeouts inside the window (got %r, %r; strict read gave (0, None))" % (n_to, last_to))
 
-p = mklog("d-stuck.log", real_shape([dl(NOW - 30, "Phase C: gate-run ga-gc2ba8 (branch=fix/ga-x) still in flight (0/1 verdicts, 900s/1560s) — leaving for a future sweep.")]))
+p = mklog("d-stuck.log", real_shape([dl(NOW - 30, "Phase C: gate-run ga-gc2ba8 (branch=fix/ga-x) still in flight (0/1 verdicts, 900s/1560s, anchor=task-sent+52s) — leaving for a future sweep.")]))
 with Patch(DISPATCH_LOG=p, sh=fake_sh('{"sessions": []}')):
     stuck = m.stuck_dispatching()
 check(stuck is True, "stuck_dispatching() sees the 0/1-verdicts poll at 900s with no active reviewer (got %r; strict read gave False)" % (stuck,))

@@ -70,8 +70,11 @@ def marker_line(secs_ago=30, n=1):
     return "%s [quality-gate-dispatcher] Found %d queued marker(s)\n" % (ts(secs_ago), n)
 
 def inflight_line(secs_ago, elapsed_s, timeout_s, run_id="ga-testrun", branch="crew/x/wa-1"):
+    # The REAL shape (ga-ufskhy added the ", anchor=..." suffix inside the parens). Fixtures that
+    # kept the pre-suffix shape are why this suite stayed green while the reader was dead (ga-49l8kr);
+    # gate-inflight-line-contract.selftest.sh renders the producer's own line and is the guard.
     return ("%s [quality-gate-dispatcher] Phase C: gate-run %s (branch=%s) still in "
-            "flight (0/1 verdicts, %ds/%ds) — leaving for a future sweep.\n"
+            "flight (0/1 verdicts, %ds/%ds, anchor=task-sent+52s) — leaving for a future sweep.\n"
             % (ts(secs_ago), run_id, branch, elapsed_s, timeout_s))
 
 def run(lines):
