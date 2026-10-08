@@ -244,7 +244,7 @@ run_sort created "$FD3"
 eq "a bead without a readable string id is kept, not dropped" "$(printf '%s' "$SORT_OUT" | jq 'length')" "4"
 # (compared per line: warns() sorts, and how punctuation sorts depends on the locale)
 for w in 'work-order WARN: ?: id?' 'work-order WARN: 7: id?' 'work-order WARN: : id?'; do
-  if printf '%s\n' "$SORT_ERR" | grep -qxF -- "$w"; then ok "id? WARN: $w"; else bad "id? WARN missing: [$w] in [$SORT_ERR]"; fi
+  if printf '%s\n' "$SORT_ERR" | grep -xF -- "$w" >/dev/null; then ok "id? WARN: $w"; else bad "id? WARN missing: [$w] in [$SORT_ERR]"; fi
 done
 eq "and no other bead is WARNed" "$(printf '%s\n' "$SORT_ERR" | grep -c .)" "3"
 # The SHAPE of the original string is what is judged, anchored at both ends; only afterwards is the fraction of the
@@ -784,7 +784,7 @@ unseen() { # <label> <the file content> <phrase LINT NOT SEEN must contain>
   printf '%s\n' "$2" > "$T7/scripts/s.py"
   lint_run "$T7" "$TMP/empty.tsv"
   if [ "$LINT_RC" -ne 0 ]; then bad "blind spot is now SEEN ($1): move its fixture to flagged and fix LINT_NOT_SEEN :: $2"
-  elif printf '%s\n' "$LINT_OUT" | grep '^LINT NOT SEEN: ' | grep -qF -- "$3"; then ok "blind spot is documented in LINT NOT SEEN: $1"
+  elif printf '%s\n' "$LINT_OUT" | grep '^LINT NOT SEEN: ' | grep -F -- "$3" >/dev/null; then ok "blind spot is documented in LINT NOT SEEN: $1"
   else bad "blind spot is NOT documented ('$3' missing from LINT NOT SEEN): $1"; fi
 }
 shape flagged "M1 sort_by"                         "jq 'sort_by(.created_at) | .[0]'"
@@ -835,7 +835,7 @@ unseen "a window assembled from pieces"            'LIM="--lim"; bd list ${LIM}i
 unseen "a window on another line than its flag"    $'_sh(["bd", "list", "--limit",\n"20"])'       'different line from its flag'
 printf '%s\n' "jq 'sort_by(.created_at)'" > "$T7/docs/x.sh"; : > "$T7/scripts/s.py"
 lint_run "$T7" "$TMP/empty.tsv"
-if [ "$LINT_RC" -eq 0 ] && printf '%s\n' "$LINT_OUT" | grep '^LINT NOT SEEN: ' | grep -qF 'docs/'; then ok "a file in docs/ is out of scope, and LINT NOT SEEN says so"
+if [ "$LINT_RC" -eq 0 ] && printf '%s\n' "$LINT_OUT" | grep '^LINT NOT SEEN: ' | grep -F 'docs/' >/dev/null; then ok "a file in docs/ is out of scope, and LINT NOT SEEN says so"
 else bad "docs/ is not documented as out of scope (rc=$LINT_RC)"; fi
 
 T3="$TMP/lt3"; mk_tree "$T3"
@@ -860,7 +860,7 @@ lint_run "$T4" "$TMP/r4.tsv"; eq "an ext row is not scanned; an UNASSIGNED consu
 case "$LINT_OUT" in *"unassigned=1"*"ext=1"*) ok "unassigned=1 ext=1 reported" ;; *) bad "$LINT_OUT" ;; esac
 bad_row() { # <label> <registry text>
   printf '%s' "$2" > "$TMP/badrow.tsv"; lint_run "$T4" "$TMP/badrow.tsv"
-  if [ "$LINT_RC" -eq 1 ] && printf '%s\n' "$LINT_OUT" | grep -q 'LINT FAIL'; then ok "$1 -> fail"; else bad "$1: rc=$LINT_RC out=[$LINT_OUT]"; fi
+  if [ "$LINT_RC" -eq 1 ] && printf '%s\n' "$LINT_OUT" | grep 'LINT FAIL' >/dev/null; then ok "$1 -> fail"; else bad "$1: rc=$LINT_RC out=[$LINT_OUT]"; fi
 }
 bad_row "a row with four columns" "$(printf 'consumer\tscripts/g.py\tfor-each-ref\tga-9t9acg.2\n')
 "
