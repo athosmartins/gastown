@@ -931,10 +931,31 @@ fi
 # Not a re-implementation: bash "$DISPATCHER" itself, so the exit code asserted
 # here is the exit code launchd/the watchdog would read.
 _ow_run() {   # _ow_run <spawn: fail|ok> <create: ok|fail> <streak seed | -> [streak path]
-  local spawn="$1" create="$2" seed="$3" spath="${4:-}" _to=""
+  # ga-9t9acg.9 knobs (all optional, set by the B9 block, unset otherwise): OW_QUEUE_OVERRIDE = the JSON the queue list
+  # returns; OW_DISPATCHER_OVERRIDE = run THAT file (a mutant) instead of the shipped script; OW_LIB_MODE = run a COPY of
+  # the dispatcher next to a degraded scripts/work-order.sh: missing | failing | empty | badhead (or reallib: the real one).
+  local spawn="$1" create="$2" seed="$3" spath="${4:-}" _to="" _q="" _disp="${OW_DISPATCHER_OVERRIDE:-$DISPATCHER}"
   OW_SB=$(mktemp -d)
   mkdir -p "$OW_SB/city/.gc" "$OW_SB/home"
   _sb_init "$OW_SB/sb" || exit 2   # shims live in $OW_SB/sb/bin, first on SANDBOX_PATH; no real gc/bd/notify behind them
+  case "${OW_LIB_MODE:-real}" in
+    real) ;;
+    missing|failing|empty|badhead|reallib)
+      mkdir -p "$OW_SB/disp/scripts"
+      cp "$_disp" "$OW_SB/disp/refino-gate-dispatcher.sh" || exit 2
+      [ ! -r "$SELF_DIR/quiet-hours-check.sh" ] || cp "$SELF_DIR/quiet-hours-check.sh" "$OW_SB/disp/" || exit 2
+      # Each degraded lib is the REAL one with work_order_sort replaced, so work_order_head is still defined and the branch
+      # under test is the one that runs (a stub without it would only ever reach the "library not loaded" guard).
+      case "$OW_LIB_MODE" in
+        failing) printf '%s\n' ". \"$SELF_DIR/scripts/work-order.sh\"" 'work_order_sort() { cat >/dev/null; echo "work-order ERROR: work_order_sort: fixture cannot tell" >&2; return 2; }' > "$OW_SB/disp/scripts/work-order.sh" ;;
+        empty)   printf '%s\n' ". \"$SELF_DIR/scripts/work-order.sh\"" 'work_order_sort() { cat >/dev/null; return 0; }' > "$OW_SB/disp/scripts/work-order.sh" ;;
+        badhead) printf '%s\n' ". \"$SELF_DIR/scripts/work-order.sh\"" 'work_order_sort() { cat >/dev/null; echo "this is not json"; }' > "$OW_SB/disp/scripts/work-order.sh" ;;
+        missing) ;;   # no scripts/work-order.sh at all
+        reallib) cp "$SELF_DIR/scripts/work-order.sh" "$OW_SB/disp/scripts/work-order.sh" || exit 2 ;;   # for a MUTANT dispatcher, run beside the real lib
+      esac
+      _disp="$OW_SB/disp/refino-gate-dispatcher.sh" ;;
+    *) echo "FATAL: _ow_run: unknown OW_LIB_MODE=$OW_LIB_MODE" >&2; exit 2 ;;
+  esac
   [ -n "$spath" ] || spath="$OW_SB/streak"
   [ "$seed" = "-" ] || printf '%s\n' "$seed" > "$OW_SB/streak"
   OW_STREAK_PATH="$spath"
@@ -977,13 +998,15 @@ SHIM
   # NB: sourcing the dispatcher at the top of this file turned on `set -e` in THIS
   # shell, so a non-zero exit from the script under test must be captured with
   # `|| OW_RC=$?` — a bare `OW_RC=$?` on the next line is never reached.
+  _q="${OW_QUEUE_OVERRIDE:-}"
+  [ -n "$_q" ] || _q='[{"id":"zz-fx1","title":"Fixture story","created_at":"2026-09-19T00:00:00Z","assignee":"","created_by":"auto-refino","issue_type":"feature","metadata":{},"labels":["story:refino-review"]}]'
   OW_RC=0
   ( cd / && $_to env -i HOME="$OW_SB/home" PATH="$SANDBOX_PATH" \
       REFINO_CITY_OVERRIDE="$OW_SB/city" REFINO_GATE_STORES="$OW_SB/city" QUIET_HOURS_OVERRIDE=OPEN DRAIN_WINDOW_OVERRIDE=OPEN \
       REFINO_START_FAIL_STREAK_FILE="$spath" \
       OW_CALLS="$OW_SB/calls" OW_SPAWN="$spawn" OW_CREATE="$create" \
-      OW_QUEUE_JSON='[{"id":"zz-fx1","title":"Fixture story","created_at":"2026-09-19T00:00:00Z","assignee":"","created_by":"auto-refino","issue_type":"feature","metadata":{},"labels":["story:refino-review"]}]' \
-      /bin/bash "$DISPATCHER" ) > "$OW_SB/out" 2> "$OW_SB/err" || OW_RC=$?
+      OW_QUEUE_JSON="$_q" \
+      /bin/bash "$_disp" ) > "$OW_SB/out" 2> "$OW_SB/err" || OW_RC=$?
   OW_LOG=$(cat "$OW_SB/city/.gc/logs/refino-gate-dispatcher.log" 2>/dev/null || echo "")
   OW_CALLS_TXT=$(cat "$OW_SB/calls" 2>/dev/null || echo "")
   OW_AUDIT=$(cat "$OW_SB/city/.gc/refino-gate.jsonl" 2>/dev/null || echo "")
@@ -1054,7 +1077,167 @@ _ow_run fail ok - "/nonexistent-dir-ga-owlmfj/streak"
 [ "$OW_RC" -eq 1 ] && ok "unwritable streak file → exit 1 (cannot prove the failure is transient)" || bad "unwritable streak must fail loud (exit 1), got rc=$OW_RC"
 printf '%s\n' "$OW_LOG" | grep -i 'cannot prove\|unwritable' >/dev/null && ok "log explains why it stayed loud" || bad "no explanation logged for the loud fallback"
 _ow_done
-unset -f _ow_run _ow_done 2>/dev/null || true
+
+# ── (B9) ga-9t9acg.9: the refino-review queue is picked by the shared work order (priority > type > age), not by FIFO ──
+# Before: `sort_by(.created_at // .id) | .[0]` — a NEW P0 story waited behind every older P2 one. The rule is scripts/work-order.sh
+# (Athos, 2026-10-06): priority P0..P4, then type (feature first), then age (oldest first). Every item below is a feature (the
+# queue list is `--type feature`), so priority and age are what separates them. The OLD item is always listed FIRST: the gathered
+# order and the FIFO order both name it, so only the work order can name the other one.
+# Not a re-implementation: the real script runs end to end on fixture bd/gc and the log/bd-call record says what it picked.
+_ow_item() {   # _ow_item <id> <priority | -> <created_at>   ("-" = the bead carries no priority at all)
+  local _p=""
+  [ "$2" = "-" ] || _p="\"priority\":$2,"
+  printf '{"id":"%s","title":"Fixture %s","created_at":"%s",%s"assignee":"","created_by":"auto-refino","issue_type":"feature","metadata":{},"labels":["story:refino-review"]}' "$1" "$1" "$3" "$_p"
+}
+_ow_sel() { { printf '%s\n' "$OW_LOG" | grep -o 'Selected story for review: [^ ]*' || true; } | head -n 1 | sed 's/.*: //'; }   # no match = empty, never a pipefail abort
+_ow_pick() {   # _ow_pick <expected id> <what>
+  local _got; _got=$(_ow_sel)
+  if [ "$_got" = "$1" ]; then ok "$2 → reviews $1"; else bad "$2: expected $1 to be reviewed first, the sweep picked [${_got:-nothing}]"; fi
+}
+B9_P2_OLD=$(_ow_item zz-p2-old 2 2026-08-01T00:00:00Z)
+B9_P0_NEW=$(_ow_item zz-p0-new 0 2026-10-06T00:00:00Z)
+
+echo "ga-9t9acg.9 (B9a): a NEW P0 story is reviewed before an OLD P2 one"
+OW_QUEUE_OVERRIDE="[$B9_P2_OLD,$B9_P0_NEW]"
+_ow_run fail ok -
+[ "$OW_RC" -eq 0 ] && ok "the sweep ends cleanly (exit 0)" || bad "the order fixture did not run cleanly (rc=$OW_RC); log: $(printf '%s' "$OW_LOG" | tail -n 2 | tr '\n' '|' | cut -c1-220)"
+_ow_pick zz-p0-new "P0 created today vs P2 created in August"
+printf '%s\n' "$OW_CALLS_TXT" | grep 'label add zz-p0-new refino-gate:reviewing' >/dev/null && ok "the review claim lands on the P0 story" || bad "no review claim on zz-p0-new"
+printf '%s\n' "$OW_CALLS_TXT" | grep 'label add zz-p2-old' >/dev/null && bad "the old P2 story was claimed while a P0 waited" || ok "the old P2 story is left in the queue for a later sweep"
+_ow_done
+
+echo "ga-9t9acg.9 (B9b): two P0 stories → the OLDER one (age is the tie-break, as before)"
+OW_QUEUE_OVERRIDE="[$(_ow_item zz-p0-newer 0 2026-10-06T00:00:00Z),$(_ow_item zz-p0-older 0 2026-09-01T00:00:00Z)]"
+_ow_run fail ok -
+_ow_pick zz-p0-older "P0 of September vs P0 of October"
+_ow_done
+
+echo "ga-9t9acg.9 (B9c): a story whose priority cannot be read is kept — at the END of its class, with a WARN"
+OW_QUEUE_OVERRIDE="[$(_ow_item zz-nop - 2026-07-01T00:00:00Z),$(_ow_item zz-p3 3 2026-10-01T00:00:00Z)]"
+_ow_run fail ok -
+_ow_pick zz-p3 "P3 vs a much older story with no priority field"
+printf '%s\n' "$OW_LOG" | grep 'work-order WARN: zz-nop: prio?' >/dev/null && ok "the lib's WARN for the unreadable bead reaches the dispatcher log (stderr is kept, not sent to /dev/null)" || bad "no 'work-order WARN: zz-nop: prio?' in the log — the lib's stderr is being dropped"
+OW_QUEUE_OVERRIDE="[$(_ow_item zz-nop - 2026-07-01T00:00:00Z)]"
+_ow_run fail ok -
+_ow_pick zz-nop "a queue of ONE story whose priority is unreadable"
+_ow_done
+
+echo "ga-9t9acg.9 (B9d): the queue is fetched WHOLE (--limit 0), with the same filters as before"
+OW_QUEUE_OVERRIDE="[$B9_P2_OLD,$B9_P0_NEW]"
+_ow_run fail ok -
+B9_QLINE=$({ printf '%s\n' "$OW_CALLS_TXT" | grep -F -e '--exclude-label story:approved' || true; } | head -n 1)
+[ -n "$B9_QLINE" ] && ok "found the queue list call" || bad "no queue list call in the bd log (fixture drift?)"
+printf '%s\n' "$B9_QLINE" | grep -E -e '--limit 0( |$)' >/dev/null && ok "the queue list passes --limit 0: the order is applied to ALL stories, not to a window bd cut before it" || bad "the queue list has no --limit 0 (bd list returns 50 by default — a P0 story could fall outside that window): $B9_QLINE"
+printf '%s\n' "$B9_QLINE" | grep -E -e '--limit[= ]*[1-9]' >/dev/null && bad "the queue list carries a positive --limit: $B9_QLINE" || ok "no positive --limit before the order"
+for _f in '--label story:refino-review' '--type feature' '--status open' '--exclude-label refino-gate:reviewing' '--exclude-label story:needs-approval' '--exclude-label story:approved'; do
+  printf '%s\n' "$B9_QLINE" | grep -F -e "$_f" >/dev/null && ok "filter kept: $_f" || bad "filter lost from the queue list: $_f"
+done
+_ow_done
+
+echo "ga-9t9acg.9 (B9e): when the lib cannot tell, the queue is NOT read as empty — gathered order + a visible WARN"
+for B9_MODE in missing failing empty badhead; do
+  case "$B9_MODE" in   # which guard of the dispatcher is expected to answer — the modes must not be conflated
+    missing) B9_WHY='is not loaded' ;;
+    failing|empty) B9_WHY='work_order_sort could not order the queue' ;;
+    badhead) B9_WHY='work_order_head could not take the first story' ;;
+  esac
+  OW_LIB_MODE="$B9_MODE"
+  OW_QUEUE_OVERRIDE="[$B9_P2_OLD,$B9_P0_NEW]"
+  _ow_run fail ok -
+  [ "$OW_RC" -eq 0 ] && ok "[$B9_MODE] the sweep ends cleanly" || bad "[$B9_MODE] rc=$OW_RC; log: $(printf '%s' "$OW_LOG" | tail -n 2 | tr '\n' '|' | cut -c1-220)"
+  printf '%s\n' "$OW_LOG" | grep 'No stories awaiting' >/dev/null && bad "[$B9_MODE] an unreadable order was treated as an EMPTY queue" || ok "[$B9_MODE] not treated as an empty queue"
+  _ow_pick zz-p2-old "[$B9_MODE] keeps the GATHERED order (stores as listed, as bd returned them)"
+  printf '%s\n' "$OW_LOG" | grep -E 'WARN: .*ga-9t9acg\.9.*cannot tell' >/dev/null && ok "[$B9_MODE] a WARN says the order could not be told" || bad "[$B9_MODE] no 'WARN: … ga-9t9acg.9 … cannot tell' in the log"
+  printf '%s\n' "$OW_LOG" | grep -F -e "$B9_WHY" >/dev/null && ok "[$B9_MODE] …and names the guard that answered ($B9_WHY)" || bad "[$B9_MODE] the WARN does not say '$B9_WHY' — a different guard answered: $(printf '%s' "$OW_LOG" | grep 'ga-9t9acg.9' | head -n 1 | cut -c1-200)"
+  _ow_done
+done
+OW_LIB_MODE=failing
+OW_QUEUE_OVERRIDE="[$B9_P2_OLD,$B9_P0_NEW]"
+_ow_run fail ok -
+printf '%s\n' "$OW_LOG" | grep 'work-order ERROR: work_order_sort: fixture cannot tell' >/dev/null && ok "[failing] the lib's own ERROR line (the WHY) reaches the log" || bad "[failing] the lib's ERROR line is not in the log — the reason would be lost"
+_ow_done
+unset OW_LIB_MODE
+
+echo "ga-9t9acg.9 (B9f): a genuinely empty queue is still an empty queue (no WARN, nothing reviewed)"
+OW_QUEUE_OVERRIDE='[]'
+_ow_run fail ok -
+[ "$OW_RC" -eq 0 ] && ok "empty queue → exit 0" || bad "empty queue rc=$OW_RC"
+printf '%s\n' "$OW_LOG" | grep 'No stories awaiting refino-gate' >/dev/null && ok "logged as an empty queue" || bad "an empty queue is no longer reported as one"
+printf '%s\n' "$OW_LOG" | grep 'ga-9t9acg.9' >/dev/null && bad "an empty queue raised a work-order warning" || ok "no work-order warning for an empty queue"
+[ -z "$(_ow_sel)" ] && ok "nothing was selected" || bad "a story was selected from an empty queue"
+_ow_done
+
+echo "ga-9t9acg.9 (B9g): mutation controls — each mutant reverts ONE property of the new pick, and the check that guards it must notice"
+# A check that cannot fail proves nothing. Each mutant is the shipped dispatcher with exactly one edit (the target must occur
+# exactly once, so a renamed line fails loudly here instead of silently weakening the control). Property P is "true" on the
+# shipped script (B9a-B9e above); on the mutant it must be FALSE. A mutant that survives means the guard does not guard.
+_b9_mutant() {   # _b9_mutant <dest> <OLD> <NEW>
+  python3 -I -c '
+import sys
+src, dest, old, new = sys.argv[1:5]
+t = open(src, encoding="utf-8").read()
+if t.count(old) != 1:
+    sys.stderr.write("mutation target occurs %d times (want 1): %r\n" % (t.count(old), old)); sys.exit(3)
+open(dest, "w", encoding="utf-8").write(t.replace(old, new))
+' "$DISPATCHER" "$1" "$2" "$3"
+}
+_b9_prop_p0_first() {   # a new P0 is reviewed before an old P2
+  OW_QUEUE_OVERRIDE="[$B9_P2_OLD,$B9_P0_NEW]"; _ow_run fail ok -
+  local _r=1; [ "$(_ow_sel)" = "zz-p0-new" ] && _r=0
+  _ow_done; return $_r
+}
+_b9_prop_older_p0() {   # between two P0s the older goes first
+  OW_QUEUE_OVERRIDE="[$(_ow_item zz-p0-newer 0 2026-10-06T00:00:00Z),$(_ow_item zz-p0-older 0 2026-09-01T00:00:00Z)]"; _ow_run fail ok -
+  local _r=1; [ "$(_ow_sel)" = "zz-p0-older" ] && _r=0
+  _ow_done; return $_r
+}
+_b9_prop_limit0() {   # the queue list asks for the whole queue
+  OW_QUEUE_OVERRIDE="[$B9_P2_OLD,$B9_P0_NEW]"; _ow_run fail ok -
+  local _l _r=1
+  _l=$({ printf '%s\n' "$OW_CALLS_TXT" | grep -F -e '--exclude-label story:approved' || true; } | head -n 1)
+  printf '%s\n' "$_l" | grep -E -e '--limit 0( |$)' >/dev/null && _r=0
+  _ow_done; return $_r
+}
+_b9_prop_warn_kept() {   # the lib's stderr WARN for an unreadable bead reaches the log
+  OW_QUEUE_OVERRIDE="[$(_ow_item zz-nop - 2026-07-01T00:00:00Z),$(_ow_item zz-p3 3 2026-10-01T00:00:00Z)]"; _ow_run fail ok -
+  local _r=1; printf '%s\n' "$OW_LOG" | grep 'work-order WARN: zz-nop: prio?' >/dev/null && _r=0
+  _ow_done; return $_r
+}
+_b9_prop_not_empty() {   # a lib that cannot tell does not turn the queue into "nothing to review"
+  OW_LIB_MODE=failing; OW_QUEUE_OVERRIDE="[$B9_P2_OLD,$B9_P0_NEW]"; _ow_run fail ok -
+  local _r=1
+  [ "$(_ow_sel)" = "zz-p2-old" ] && ! printf '%s\n' "$OW_LOG" | grep 'No stories awaiting' >/dev/null && _r=0
+  _ow_done; unset OW_LIB_MODE; return $_r
+}
+_b9_control() {   # _b9_control <name> <property fn> <OLD> <NEW>
+  local _name="$1" _prop="$2" _mf="$B9_MUT/$1.sh" _held=0
+  if ! command -v python3 >/dev/null 2>&1; then bad "[$_name] cannot build the mutant: no python3 on this box"; return; fi
+  if ! _b9_mutant "$_mf" "$3" "$4" 2>"$B9_MUT/err"; then bad "[$_name] the mutant could not be built (did the dispatcher line move?): $(cat "$B9_MUT/err")"; return; fi
+  cmp -s "$DISPATCHER" "$_mf" && { bad "[$_name] the mutant is identical to the shipped script — the control is vacuous"; return; }
+  if "$_prop"; then ok "[$_name] sanity: $_prop holds on the shipped script"; else bad "[$_name] $_prop FAILS on the shipped script — see B9a-B9e above"; return; fi
+  OW_DISPATCHER_OVERRIDE="$_mf"
+  # the mutant runs from a copy: beside the real lib (the degraded-lib property sets its own OW_LIB_MODE=failing, which also copies it)
+  OW_LIB_MODE=reallib
+  "$_prop" && _held=1
+  # Three outcomes, not two: the property false because the edit flipped it (caught), still true (survived), or false because
+  # the mutant could not even finish its sweep. Every property above runs ONE sweep and every mutant is built to end with
+  # exit 0, so a non-zero OW_RC here (a syntax error, a crash) would read as "caught" for the wrong reason.
+  if [ "$OW_RC" -ne 0 ]; then bad "[$_name] the mutant's sweep exited rc=$OW_RC — a crash is not a catch; the control proves nothing"
+  elif [ "$_held" -eq 1 ]; then bad "[$_name] MUTANT SURVIVED: $_prop still holds after the edit — nothing guards this property"
+  else ok "[$_name] mutant caught: $_prop no longer holds (the mutant's sweep ended cleanly, rc=0)"; fi
+  unset OW_DISPATCHER_OVERRIDE OW_LIB_MODE
+}
+B9_MUT=$(mktemp -d)
+B9_SORT='work_order_sort --age created 2>>"$LOG"'
+_b9_control fifo-revert      _b9_prop_p0_first   "$B9_SORT" "jq -c 'sort_by(.created_at // .id)' 2>>\"\$LOG\""
+_b9_control age-rule-lost    _b9_prop_older_p0   "$B9_SORT" 'work_order_sort --age field 2>>"$LOG"'
+_b9_control stderr-dropped    _b9_prop_warn_kept  "$B9_SORT" 'work_order_sort --age created 2>/dev/null'
+_b9_control window-back       _b9_prop_limit0     $'    --limit 0 \\\n' ''
+_b9_control cannot-tell-empty _b9_prop_not_empty  $'  STORY=$(echo "$QUEUE_JSON" | jq -c \'.[0]\')\nfi\n' $'  log "No stories awaiting refino-gate. Sweep done."; exit 0\nfi\n'
+[ -z "$B9_MUT" ] || rm -rf "$B9_MUT"
+unset B9_MUT B9_SORT
+unset OW_QUEUE_OVERRIDE
+unset -f _ow_run _ow_done _ow_item _ow_sel _ow_pick _b9_mutant _b9_control _b9_prop_p0_first _b9_prop_older_p0 _b9_prop_limit0 _b9_prop_warn_kept _b9_prop_not_empty 2>/dev/null || true
 
 echo ""
 echo "refino-gate-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"

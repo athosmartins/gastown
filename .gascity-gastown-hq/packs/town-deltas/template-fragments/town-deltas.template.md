@@ -259,6 +259,65 @@ conselhos: cada uma tem um caso que a produziu.
    senão herda o mesmo ponto cego. Prefira **detection-only**: um guard que repara
    sem conseguir distinguir "perdido" de "em transição legítima" quebra coisa boa.
 
+{{/* td:core:dano-ao-vivo */ -}}
+### Dano ao vivo — como marcar um bug que fura a fila (ga-emgkvn)
+
+A ordem do gate é **prioridade > feature > idade** (todas as P0 feature, depois as
+P0 que não são feature, depois P1...). Há **uma única exceção**, decisão do Athos em
+06/10 (resposta "Bug com dano ao vivo primeiro" ao AskUserQuestion do Mayor, citada no
+comentário do Mayor em ga-9t9acg, 2026-10-06T22:29:01Z): um **bug P0 com o label
+`impacto:dano-ao-vivo`** passa na frente das P0 feature. A exceção vive em **dois**
+lugares, com a mesma regra: o gate (`quality-gate-dispatcher.sh`, ga-emgkvn) e a lib
+única de ordenação (`work-order.sh`, ga-9t9acg.14 — chave `[prioridade, dano, tipo,
+idade, id]`). Todo estágio que ordena pela lib já a aplica; o que ainda ordena por
+conta própria **não** (a lista está nas linhas `consumer` de `work-order.registry.tsv`:
+cada linha some quando o estágio migra).
+
+**Quem detecta dano ao cliente EM CURSO (agora, não "pode acontecer") faz duas coisas
+no bead-fonte:** `bd label add <id> impacto:dano-ao-vivo` **e um comentário com a
+EVIDÊNCIA** que um terceiro confere sem acreditar em você — o que está quebrado, quem
+está sendo afetado, desde quando, e o comando/log/id que mostra. **O gate NÃO lê o
+comentário: o label sozinho já promove.** Por isso a evidência é o que deixa um humano
+auditar depois; quem vir o label sem ela deve tirá-lo e dizer por quê. A mudança chega
+à ordem em até ~1-2 sweeps do gate (a leitura do bead-fonte tem cache de 60 s).
+
+O label só conta num **bug P0** (`issue_type=bug`, `priority=0`). Em P1 ou abaixo, ou
+em feature/task, ele é **ignorado** (o gate registra a linha `NOTE: label
+impacto:dano-ao-vivo IGNORED`) — se o dano é real, o bead precisa ser P0 **e** bug.
+Se as labels do bead-fonte não puderem ser lidas, vale **sem** o label (nunca
+promove) e o gate dá `WARN`; a lib faz o mesmo e diz `work-order WARN: <id>: labels?`
+no stderr (só para bug P0 — o único caso em que a leitura mudaria a posição; em
+qualquer outro bead o label não mexe na ordem e a lib fica calada). Bead sem a chave
+`labels` (o `bd` a omite quando não há nenhum) é "não tem", não "ilegível". Não use
+pra "urgente" em geral: o que não é dano a cliente agora segue a ordem normal.
+
+{{/* td:core:gate-focus */ -}}
+### Modo foco no gate — quando o gargalo é a revisão, ninguém constrói bead nova (ga-kqa08j)
+
+Decisão do Athos em 07/10 (AskUserQuestion na sessão do Mayor, confirmação final "Isso,
+pode seguir", citada na ga-kqa08j). `scripts/gate-focus-mode.sh` (launchd, a cada 5 min)
+conta a fila do gate e grava `.gc/gate-focus.state`: **liga com mais de 15 itens na fila,
+desliga com menos de 8** (entre os dois, fica como estava). Uma notificação ao ligar e
+uma ao desligar; uma escalação se ficar ligado mais de 24 h.
+
+**Ligado, os workers genéricos (dog, wa-worker, ps-worker) não pegam bead NOVA.** Só
+pegam conserto: do que o gate já reprovou (`gate:needs-fix` ou `gate:fix-attempt:N`), de
+falha de produção aberta pelo autoconserto (`origem:auto-healer-notify`) e de bug com
+`impacto:dano-ao-vivo` (decisão do Athos 07/10: quebra em produção não é "trabalho novo"),
+com no máximo 2 sessões por pool. Isso vale no Pilot, na sonda de cada worker e no teto de
+dogs. Se a sua sonda voltar `[]` com o modo ligado, não procure bead nova por outro
+caminho: drene. **Nenhuma crew é suspensa pelo automático** (quem decide crew é o Athos), mas o Pilot
+também só manda conserto pra crew enquanto o modo estiver ligado (Athos 07/10: "Não, só conserto").
+Desligar à mão: `touch .gc/gate-focus.off` (apague o arquivo para devolver ao automático).
+
+**Regra permanente do modo foco (decisão do Athos):** com o modo ligado, o **Mayor** pode
+pôr no ar, sem passar pelo gate, bead **P0 de infraestrutura interna** — nada que toque
+lead, cliente ou mensagem pra fora. Ao fazer isso: label `gate:bypassed-focus` +
+`audit:pending` no bead, comentário dizendo o que entrou e por quê, e uma **revisão
+adversarial depois** do merge, registrada no bead. Reprovou na revisão → o Mayor decide
+caso a caso (reverter ou consertar em cima) e conta ao Athos. Nenhum outro agente usa
+este atalho.
+
 {{/* td:core:models */ -}}
 ### Modelos atuais (Opus 5.5 / Sonnet 5) — o que o guia oficial muda no seu trabalho (ga-ttwzqd)
 

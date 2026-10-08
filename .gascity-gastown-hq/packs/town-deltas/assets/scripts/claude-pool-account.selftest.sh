@@ -24,10 +24,38 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 [ -f "$WRAPPER" ] || { echo "FATAL: wrapper not found at $WRAPPER"; exit 1; }
 
 W="$(mktemp -d "${TMPDIR:-/tmp}/claude-pool-account-selftest.XXXXXX")"
+# No scratch directory is not a scratch directory called "": every fake below is built under $W, and without them `security` on PATH is the
+# REAL one (ga-xknkke: a fixture token, sk-ant-oat01-ALLOWED, was found in the real Keychain). Stop before anything runs.
+if [ -z "$W" ] || [ ! -d "$W" ] || [ ! -w "$W" ]; then echo "FATAL: no scratch directory (mktemp -d failed under TMPDIR='${TMPDIR:-/tmp}'): nothing was run"; exit 2; fi
 cleanup() { chmod -R u+w "$W" 2>/dev/null; rm -rf "$W"; }   # B50 makes a directory read-only: undo it if the run is interrupted there
 trap cleanup EXIT
 
 field() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
+
+# ── hermetic ENVIRONMENT (ga-xknkke) ───────────────────────────────────────────────────────────────
+# "Nothing here touches the real X" has to cover what this shell INHERITED, not only what it builds. The in-process snippets below
+# (B18, B24, B35, B44 ...) import the daemon in THIS process, and its log() appends to $GC_CITY_PATH/.gc/logs/claude-pool-account.log:
+# run from an agent (GC_CITY_PATH = the live city) the selftest wrote `x@t.test rejected ... until 2033`, `far@t`, `junk@t` into the
+# PRODUCTION log - where they read as real accounts being exhausted, in the one file read when a pool switch is investigated.
+#   CALLER_*  what the run inherited (a stand-in city is planted when it inherited none, so the check at the end always has a log to
+#             watch and this file proves the guard in any shell, not only inside an agent).
+#   the guard every path the daemon takes from the environment - or falls back to LIVE when it is unset (DEFAULT_STATE,
+#             DEFAULT_ACCOUNTS_LIB, ~/.gastown/claude-pool-cred) - points at scratch, once, for the whole file. Unsetting would be worse.
+ACCT_LIB="${CLAUDE_POOL_ACCOUNTS_LIB:-/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py}"   # an input of THIS file (the lib under test), read before the guard overwrites the variable
+CALLER_CITY="${GC_CITY_PATH-}"
+if [ -z "$CALLER_CITY" ]; then
+  CALLER_CITY="$W/caller-city"; mkdir -p "$CALLER_CITY/.gc/logs"; : > "$CALLER_CITY/.gc/logs/claude-pool-account.log"
+  export GC_CITY_PATH="$CALLER_CITY"
+fi
+CALLER_LOG="$CALLER_CITY/.gc/logs/claude-pool-account.log"
+caller_log_size() { if [ -f "$CALLER_LOG" ]; then wc -c < "$CALLER_LOG" | tr -d ' '; else echo absent; fi; }
+CALLER_LOG_SIZE_BEFORE="$(caller_log_size)"
+
+AMBIENT="$W/ambient"; mkdir -p "$AMBIENT/city/.gc/logs" "$AMBIENT/home/.gastown"
+export GC_CITY_PATH="$AMBIENT/city" HOME="$AMBIENT/home" CLAUDE_POOL_STATE="$AMBIENT/state.json" \
+       CLAUDE_POOL_CRED_DIR="$AMBIENT/home/.gastown/claude-pool-cred" CLAUDE_POOL_ACCOUNTS_LIB="$AMBIENT/no-accounts-lib.py"
+# the rest are switches/overrides a pool session or an operator may have set: not inputs of this file (each test names its own)
+unset GC_POOL_CRED_DIR CLAUDE_POOL_NOW CLAUDE_POOL_PROBE_URL GC_POOL_ACCOUNT CLAUDE_SECURESTORAGE_CONFIG_DIR
 
 # ── A. wrapper ─────────────────────────────────────────────────────────────────────────────────────
 echo "A. wrapper (claude-lowprio.sh)"
@@ -175,7 +203,7 @@ echo
 echo "B. daemon (claude-pool-account.py)"
 
 PY3="${CLAUDE_POOL_PY:-/usr/bin/python3}"; [ -x "$PY3" ] || PY3="$(command -v python3)"   # the interpreter launchd runs (3.9), not whichever is first on PATH
-ACCT_LIB="${CLAUDE_POOL_ACCOUNTS_LIB:-/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py}"
+# ACCT_LIB: read above, before the environment guard repoints CLAUDE_POOL_ACCOUNTS_LIB (this file's input AND the daemon's seam)
 BB="$W/bbin"; mkdir -p "$BB"
 
 # fake `security`: the subset the daemon uses. `-i` reads commands from stdin (so no secret is ever in argv);
@@ -195,7 +223,11 @@ run_cmd() {
                           printf '%s' "$hex" > "$KC/items/$svc"; echo "WRITE $svc" >> "$KC/writes.log" ;;
     find-generic-password) [ -e "$KC/locked" ] && { echo "security: User interaction is not allowed." >&2; return 36; }
                            [ -e "$KC/items/$svc" ] || { echo "security: The specified item could not be found in the keychain." >&2; return 44; }
-                           if [ "$w" = 1 ]; then xxd -r -p "$KC/items/$svc"; echo; fi ;;
+                           if [ "$w" = 1 ]; then xxd -r -p "$KC/items/$svc"; echo
+                           else # attributes only, as the real one prints them without -w/-g; mdat (UTC, 14 digits) only when the scenario sets one
+                             echo 'keychain: "/fake/login.keychain-db"'; echo 'attributes:'; echo '    "acct"<blob>="athos"'
+                             [ -s "$KC/mdat" ] && printf '    "mdat"<timedate>=0x%s00  "%sZ\\000"\n' "$(printf '%sZ' "$(cat "$KC/mdat")" | xxd -p | tr -d '\n')" "$(cat "$KC/mdat")"
+                           fi ;;
     *) return 1 ;;
   esac
 }
@@ -213,7 +245,21 @@ if [ -e "$VAULT/.broken" ]; then echo "secret: bw serve unreachable (selftest)" 
 if [ -s "$VAULT/$e" ]; then cat "$VAULT/$e"; exit 0; fi
 echo "secret: Not found." >&2; exit 4
 EOF
-chmod +x "$BB/security" "$BB/secret"
+# fake `ps` (the daemon lists young claude processes when it finds a foreign credential): $FAKE_KC/ps.out is the listing, ps-broken fails it
+cat > "$BB/ps" <<'EOF'
+#!/bin/bash
+[ -e "$FAKE_KC/ps-broken" ] && { echo "ps: operation not permitted (selftest)" >&2; exit 1; }
+cat "$FAKE_KC/ps.out" 2>/dev/null; exit 0
+EOF
+chmod +x "$BB/security" "$BB/secret" "$BB/ps"
+# Everything below reaches the Keychain as `security` on PATH="$BB:/usr/bin:/bin" (run_d, the in-process snippets, B49b). If that does not
+# resolve to the fake - it was not written, or is not executable - the REAL /usr/bin/security answers, and B49b writes a fixture token into
+# the real Keychain (ga-xknkke: 'Claude Code-credentials-0123abcd' holding sk-ant-oat01-ALLOWED). A run that cannot prove it is talking to
+# the fake does not go on.
+sec_seen="$(env -i PATH="$BB:/usr/bin:/bin" /bin/bash -c 'command -v security' 2>/dev/null)"
+if [ "$sec_seen" != "$BB/security" ] || [ ! -x "$BB/security" ]; then
+  echo "FATAL: 'security' on the daemon tests' PATH is '${sec_seen:-<none>}', not the fake $BB/security: stopped before anything could reach the real Keychain"; exit 2
+fi
 
 # mock Anthropic: behaviour per Bearer token from $W/srv.json = {token: {status, h:{header:value}}}; every request token logged
 cat > "$W/mock_api.py" <<'EOF'
@@ -483,6 +529,66 @@ EOF
   [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$((w0 + 1))" ] && ok "B14 item holds another account than the decision -> rewritten to the decision" || bad "B14 item=$(item_token | cut -c1-24) writes $w0 -> $(writes)"
   seeded; rm -f "$D/kc/items/$SVC"; run_d -- run-once
   [ "$(item_token)" = "$TOKEN_a" ] && ok "B14b item deleted -> recreated for the decision" || bad "B14b item=$(item_token | cut -c1-24)"
+
+  # B14c..e (ga-xknkke) a FOREIGN credential in the pool item is rewritten - and the rewrite first says what it looks like, because
+  # the item cannot say who wrote it: its SHAPE can (a refresh token and a near expiry are a `claude` login; this daemon writes
+  # neither), the item's mtime places the write in time, and the young `claude` processes are the candidates. No secret in any of it.
+  claude_login_blob() { "$PY3" - "$D/kc/items/$SVC" "$1" <<'EOF'   # what a `claude` login leaves: refresh token, a near expiry, more scopes
+import json, sys
+b = {"claudeAiOauth": {"accessToken": sys.argv[2], "refreshToken": "REFRESH-SECRET-VALUE-zzz", "expiresAt": 1999030000000,
+                       "scopes": ["user:profile", "user:inference"], "subscriptionType": "max", "organizationUuid": "ORG-SECRET-UUID"}}
+open(sys.argv[1], "w").write(json.dumps(b).encode().hex())
+EOF
+  }
+  seeded; claude_login_blob "$TOKEN_b"
+  printf '20261005234156' > "$D/kc/mdat"
+  printf '%s\n' ' 4242       02:03 ttys007  claude' ' 4243       20:00 ttys008  claude' ' 4244       00:05 ??       node' \
+    ' 4245 1-02:03:04 ttys001  claude' ' 4246       00:09 ttys002  /opt/x/claude' > "$D/kc/ps.out"
+  w0=$(writes); run_d -- run-once; FL="$D/city/.gc/logs/claude-pool-account.log"; fl="$(grep 'foreign write to the pool item' "$FL" | head -1)"
+  [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$((w0 + 1))" ] && [ -n "$fl" ] \
+    && ok "B14c a foreign credential is still rewritten to the decision, with ONE 'foreign write' line before it" || bad "B14c item=$(item_token | cut -c1-24) writes $w0 -> $(writes) line='$fl'"
+  case "$fl" in *"(fp=$(fp_of "$TOKEN_b"))"*"refreshToken=yes expiresAt=2033-"*"scopes=['user:inference', 'user:profile']"*"subscriptionType=max"*) \
+      ok "B14d the line names the foreign blob's shape (refresh token yes, scopes, expiry, tier) - read BEFORE the rewrite" ;; *) bad "B14d shape: $fl" ;; esac
+  case "$fl" in *"item modified 2026-10-05T23:41:56Z"*"pid=4246 age=00:09 tty=ttys002"*"pid=4242 age=02:03 tty=ttys007"*) \
+      ok "B14e ...when the item changed, and the young claude processes (youngest first; comm 'claude' by basename)" ;; *) bad "B14e when/who: $fl" ;; esac
+  case "$fl" in *4243*|*4244*|*4245*) bad "B14f an old process or a non-claude one was listed: $fl" ;; *) ok "B14f ...and neither an old claude (20 min, 1 day) nor a non-claude process" ;; esac
+  if grep -qE 'REFRESH-SECRET-VALUE|ORG-SECRET-UUID' "$FL" || grep -qF "$TOKEN_b" "$FL"; then bad "B14g a secret value reached the log"; else ok "B14g no token, refresh token or other field VALUE in the log (key names only)"; fi
+  # the other two states: mtime and process list that cannot be read are said, not guessed; a MISSING item has no foreign writer to describe
+  seeded; claude_login_blob "$TOKEN_b"; rm -f "$D/kc/mdat"; : > "$D/kc/ps-broken"; w0=$(writes); run_d -- run-once
+  fl="$(grep 'foreign write to the pool item' "$D/city/.gc/logs/claude-pool-account.log" | head -1)"
+  case "$fl" in *"item mtime unreadable"*"process list unreadable"*) [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$((w0 + 1))" ] \
+      && ok "B14h no mtime / a failed ps -> 'unreadable' for each (not 'none'), and the rewrite still happens" || bad "B14h item=$(item_token | cut -c1-24) writes $w0 -> $(writes)" ;; *) bad "B14h: $fl" ;; esac
+  seeded; rm -f "$D/kc/items/$SVC"; run_d -- run-once
+  nf="$(grep -c 'foreign write' "$D/city/.gc/logs/claude-pool-account.log")"
+  [ "${nf:-x}" = "0" ] && [ "$(item_token)" = "$TOKEN_a" ] && ok "B14i item MISSING -> recreated, no 'foreign write' line (nobody wrote anything)" || bad "B14i foreign lines=$nf item=$(item_token | cut -c1-24)"
+
+  # B14j a field the foreign blob does not have is said to be absent: 'subscriptionType=None' would read like a tier that is called None
+  seeded; "$PY3" - "$D/kc/items/$SVC" "$TOKEN_b" <<'EOF'
+import json, sys
+open(sys.argv[1], "w").write(json.dumps({"claudeAiOauth": {"accessToken": sys.argv[2], "scopes": ["user:inference"]}}).encode().hex())
+EOF
+  w0=$(writes); run_d -- run-once; fl="$(grep 'foreign write to the pool item' "$D/city/.gc/logs/claude-pool-account.log" | head -1)"
+  case "$fl" in *"refreshToken=no expiresAt=unreadable scopes=['user:inference'] subscriptionType=absent"*) [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$((w0 + 1))" ] \
+      && ok "B14j a blob without expiry / tier -> 'expiresAt=unreadable', 'subscriptionType=absent' (no None that reads like a value), still rewritten" || bad "B14j item=$(item_token | cut -c1-24) writes $w0 -> $(writes)" ;; *) bad "B14j: $fl" ;; esac
+
+  # B14k ...and a JSON null is a third thing, `null` (this daemon's own blob carries one: it must not read as a tier called None either)
+  seeded; "$PY3" - "$D/kc/items/$SVC" "$TOKEN_b" <<'EOF'
+import json, sys
+open(sys.argv[1], "w").write(json.dumps({"claudeAiOauth": {"accessToken": sys.argv[2], "scopes": ["user:inference"], "subscriptionType": None}}).encode().hex())
+EOF
+  run_d -- run-once; fl="$(grep 'foreign write to the pool item' "$D/city/.gc/logs/claude-pool-account.log" | head -1)"
+  case "$fl" in *"subscriptionType=null"*) ok "B14k subscriptionType: null in the foreign blob -> 'null' (not 'None', not 'absent')" ;; *) bad "B14k: $fl" ;; esac
+
+  # B14l a line that has to be cut is cut VISIBLY: a foreign blob with hundreds of keys would otherwise push the mtime and the process
+  # list off the end of the line with nothing to say they were there
+  seeded; "$PY3" - "$D/kc/items/$SVC" "$TOKEN_b" <<'EOF'
+import json, sys
+b = {"claudeAiOauth": {"accessToken": sys.argv[2], "scopes": ["user:inference"]}}
+b["claudeAiOauth"].update({"k%03d" % i: 1 for i in range(300)})
+open(sys.argv[1], "w").write(json.dumps(b).encode().hex())
+EOF
+  run_d -- run-once; fl="$(grep 'foreign write to the pool item' "$D/city/.gc/logs/claude-pool-account.log" | head -1)"; body="${fl#*: }"
+  case "$fl" in *" ...[truncated]") [ "${#body}" -le 900 ] && ok "B14l a 300-key foreign blob -> the line is cut to <= 900 chars and ends '...[truncated]'" || bad "B14l too long: ${#body}" ;; *) bad "B14l not marked as cut: $(printf '%s' "$fl" | tail -c 80)" ;; esac
 
   # B15 steady state is quiet: no rewrite, 'since' does not move
   seeded; s0="$(jget "$STATE" since)"; w0=$(writes); run_d -- run-once; run_d -- run-once
@@ -1140,6 +1246,31 @@ else
   [ "$(gpl RunAtLoad)" = "false" ] && ok "C15 guard RunAtLoad=false (loading it is the human step)" || bad "C15 guard RunAtLoad '$(gpl RunAtLoad)'"
   { [ -n "$(gpl EnvironmentVariables:USER)" ] && [ -n "$(gpl EnvironmentVariables:GC_CITY_PATH)" ]; } && ok "C16 guard has USER and GC_CITY_PATH for launchd" || bad "C16 guard launchd env incomplete"
   case "$(gpl EnvironmentVariables:PATH)" in */.local/bin*) ok "C17 guard PATH reaches ~/.local/bin (secret, notify, claude live there)" ;; *) bad "C17 guard PATH lacks ~/.local/bin: '$(gpl EnvironmentVariables:PATH)'" ;; esac
+fi
+
+# ── D. hermetic environment (ga-xknkke) ────────────────────────────────────────────────────────────
+# D1 nothing this run did reached the log of the city it was LAUNCHED from. Fixture accounts are `<x>@t` / `<x>@t.test`: no real account
+# looks like that, so a line that does is ours - and the live daemon appending its own lines during a long run cannot fail this.
+# Three states: a log we could not read is not a pass (it is nao-medido), a log that shrank was rotated (read it whole), an absent
+# log has nothing to leak into.
+echo
+echo "D. hermetic environment"
+after="$(caller_log_size)"
+if [ "$after" = "absent" ]; then
+  [ "$CALLER_LOG_SIZE_BEFORE" = "absent" ] && ok "D1 the launching city has no daemon log: nothing for a fixture line to land in" \
+    || bad "D1 nao-medido: the launching city's log was there at the start and is gone now ($CALLER_LOG)"
+elif [ ! -r "$CALLER_LOG" ]; then
+  bad "D1 nao-medido: the launching city's log exists but cannot be read ($CALLER_LOG)"
+else
+  start=0   # a log that shrank was rotated: it is all new, read it whole
+  [ "$CALLER_LOG_SIZE_BEFORE" != "absent" ] && [ "$after" -ge "$CALLER_LOG_SIZE_BEFORE" ] && start="$CALLER_LOG_SIZE_BEFORE"
+  newlog="$(tail -c +"$((start + 1))" "$CALLER_LOG")"; tail_rc=$?
+  leaked="$(printf '%s\n' "$newlog" | grep -E '[A-Za-z0-9]@t(\.test)?([^A-Za-z0-9.]|$)')"; grep_rc=$?   # grep: 0 = a line, 1 = none, 2+ = could not scan
+  if [ "$tail_rc" -ne 0 ] || [ "$grep_rc" -gt 1 ]; then
+    bad "D1 nao-medido: the launching city's log could not be scanned (tail rc=$tail_rc, grep rc=$grep_rc) - $CALLER_LOG"
+  elif [ -z "$leaked" ]; then ok "D1 no fixture line reached the log of the city this run was launched from"
+  else bad "D1 the selftest wrote into $CALLER_LOG: $(printf '%s' "$leaked" | head -n 2 | cut -c1-120 | tr '\n' '|')"
+  fi
 fi
 
 echo

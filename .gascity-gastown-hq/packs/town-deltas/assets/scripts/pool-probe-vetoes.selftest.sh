@@ -42,8 +42,10 @@ t = open(sys.argv[1], encoding="utf-8").read()
 exact = sorted(set(re.findall(r'--exclude-label\s+"([^"]+)"', t)))
 # startswith("x") families that are VETOES. pilot:held* is the expiring hold (code, pool_held) and
 # pilot:reclaim-count: is a SORT key in these probes — neither belongs in the veto prefix list.
+# gate:fix-attempt: is the gate focus mode's KEEP filter (ga-kqa08j: in focus mode only fixes
+# survive) — a positive selector, the opposite of a veto.
 pref = sorted(p for p in set(re.findall(r'startswith\("([^"]+)"\)', t))
-              if p not in ("pilot:held", "pilot:held-until:", "pilot:reclaim-count:"))
+              if p not in ("pilot:held", "pilot:held-until:", "pilot:reclaim-count:", "gate:fix-attempt:"))
 na = 'test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not)' in t
 print(json.dumps(exact)); print(json.dumps(pref)); print("true" if na else "false")
 PY

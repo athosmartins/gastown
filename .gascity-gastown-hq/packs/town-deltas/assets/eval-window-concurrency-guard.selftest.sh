@@ -49,6 +49,9 @@ esac
 # the rest of this script, not just for the duration of the source call.
 export GC_CITY_PATH="$SANDBOX"
 export EVAL_WINDOW_GUARD_LIB_ONLY=1
+# ga-kqa08j: the guard now reads the gate focus mode. Pin it OFF so the sandbox never
+# reads the real city state file; section 8b drives it explicitly.
+export GATE_FOCUS_ACTIVE_OVERRIDE=0
 # The guard's "normal" dog target comes from DOG_MAX_NORMAL (its plist sets it in
 # production). Pin it to the committed value so apply_profile(normal) in section 8
 # restores the committed city.toml byte for byte; section 9 checks that the plist
@@ -165,6 +168,19 @@ eq "restored state is byte-identical to the original committed files" "$SUM_REST
 # selftest may run from a worktree checkout, but the plist correctly hardcodes
 # the canonical PRODUCTION path (mirrors crew-hang-detector.plist's own
 # convention), so an absolute-path comparison would false-fail under a worktree.
+echo "── 8b. gate focus mode (ga-kqa08j): ON clamps the dog cap, UNKNOWN never moves it ──"
+GATE_FOCUS_ACTIVE_OVERRIDE=1 apply_profile "normal" >/dev/null 2>&1
+eq "focus ON + normal profile -> dog cap clamped to GATE_FOCUS_DOG_MAX" "$(get_dog_max)" "2"
+GATE_FOCUS_ACTIVE_OVERRIDE=1 apply_profile "throttled" >/dev/null 2>&1
+eq "focus ON + throttled profile -> the lower throttled cap wins" "$(get_dog_max)" "1"
+GATE_FOCUS_ACTIVE_OVERRIDE=unknown apply_profile "normal" >/dev/null 2>&1
+eq "focus UNKNOWN -> dog cap left exactly as it was (no flip, no reload)" "$(get_dog_max)" "1"
+GATE_FOCUS_ACTIVE_OVERRIDE=1 apply_profile "normal" >/dev/null 2>&1
+GATE_FOCUS_ACTIVE_OVERRIDE=unknown apply_profile "throttled" >/dev/null 2>&1
+eq "focus UNKNOWN + throttled profile -> the throttle can still LOWER the cap (2 -> 1)" "$(get_dog_max)" "1"
+GATE_FOCUS_ACTIVE_OVERRIDE=0 apply_profile "normal" >/dev/null 2>&1
+eq "focus OFF -> back to the committed normal cap" "$(get_dog_max)" "$COMMITTED_DOG_MAX"
+
 echo "── 9. drift-guard: plist wiring ──"
 PLIST="$SELF_DIR/eval-window-concurrency-guard.plist"
 CANONICAL_SUFFIX="packs/town-deltas/assets/scripts/eval-window-concurrency-guard.sh"

@@ -92,9 +92,26 @@
 # an ephemeral-origin session's FIRST real routed-pool result comes from
 # the priority-aware probe, not the LRU-only Go path.
 #
+# ga-9t9acg.5 + ga-9t9acg.6 (2026-10-07): a worker's ORDER moves out of the probe's jq into the shared library
+# (scripts/work-order.sh: priority > feature-before-the-rest > oldest first, age = `reclaim`), so the cases
+# 1-6b above are no longer run on an extracted jq program for a worker that has moved: the ps-worker (.6)
+# and the wa-worker (.5) — both are in, so run_case has no caller (kept for a worker that has not
+# migrated). They are run END TO END
+# (run_case_lib): the whole Step 1b2 block is extracted from the tracked prompt and executed against a fake
+# `bd`, together with the cases the new rule adds — a newer P0 feature beats an older P0 bug; a bead reclaimed
+# twice sinks behind a newer feature of its class (and does NOT sink without the label); the oldest P0 feature
+# at position 25 of the pool is the one chosen (the old `--limit=20` window cut it off); the fetch is
+# `--limit 0`; ages compare as epoch, not as text; an unreadable field is kept at the end with its WARN on
+# stderr; a missing or "cannot tell" library falls back to the PREVIOUS order with a visible WARN (never `[]`);
+# an empty pool prints `[]` and a failed query does not. Six textual MUTANTS of the block must each be caught by
+# the scenario named for them.
+#
 # Exit 0 iff every scenario, for both files, behaves as expected.
 
 set -uo pipefail
+# ga-kqa08j: the worker probes read the gate focus mode; pin it OFF so a run inside the
+# live city (or a gate reviewer whose env names it) never inherits the real state.
+export GATE_FOCUS_ACTIVE_OVERRIDE=0
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CITY_ROOT="$(cd "$SELF_DIR/../../.." && pwd)"
@@ -315,6 +332,16 @@ run_case() {
     '[{"id":"just-reclaimed-again","priority":1,"updated_at":"2026-09-17T01:40:55Z","labels":["pilot:reclaim-count:1"]},{"id":"reclaimed-earlier-idle-since","priority":1,"updated_at":"2026-09-16T20:00:00Z","labels":["pilot:reclaim-count:1"]}]' \
     "reclaimed-earlier-idle-since"
 
+  run_step1b3_and_structure_cases "$label" "$tpl"
+}
+
+# run_step1b3_and_structure_cases <label> <template> — the Step 1b3 post-filter cases (7-9) and the file-order
+# check. Split out of run_case by ga-9t9acg.5 UNCHANGED, so a worker whose ORDER is tested end to end
+# (run_case_lib below: the ps-worker and the wa-worker) still gets exactly these two checks;
+# a worker still on run_case gets them through it.
+run_step1b3_and_structure_cases() {
+  local label="$1" tpl="$2"
+
   # 7-9. (ga-0pg2o gate-fix round 2) Step 1b3's fallback post-filter must
   # apply the SAME reclaim-cap exclusion as Step 1b2 — GATE-FEEDBACK on
   # round 1 named the reopened gap: a capped bead that is the sole occupant
@@ -351,13 +378,263 @@ run_case() {
   assert_probe_before_fallback "$label" "$tpl"
 }
 
+# ── ga-9t9acg.5/.6: a worker probe (wa-worker, ps-worker) runs the SHARED order library, so its order is tested END TO END ──
+# Until its slice the order lived INSIDE the single jq program of the probe line, so run_case could pull the program
+# out and feed it a fixture. Now the order comes from scripts/work-order.sh (work_order_sort --age reclaim) and the
+# line only filters; testing the extracted program would test nothing about the order. So the whole Step 1b2 BLOCK is
+# extracted from the tracked prompt exactly as a worker pastes it, and RUN, with a fake `bd` on PATH that behaves like
+# `bd ready --json` (default priority order, cut to --limit, 0 = everything) over a fixture. That exercises what ships:
+# the filters and vetoes, the fetch window, the library, the stderr, and the fallback when the library is missing or
+# cannot tell — and it makes the new cases below fail on the pre-change prompt (a --limit=20 window, no feature tier,
+# no WARN) instead of passing on a technicality.
+# Each scenario is a function returning 0/1 (WHY says what was seen) so the SAME scenarios also run against textual
+# mutants of the block: a mutant the scenarios do not catch means the scenario proves nothing.
+
+WORK=""
+cleanup_work() { if [ -n "$WORK" ] && command -v safe-clean >/dev/null 2>&1 && safe-clean --check "$WORK" >/dev/null 2>&1; then safe-clean "$WORK" >/dev/null 2>&1; fi; }
+
+# extract_step1b2_block <template> — the CODE of Step 1b2: from the first non-comment line after the "# Step 1b2"
+# header comment up to (not including) the "# If it returns a bead" claim note. Keyed on those two anchors, not on a
+# line number, so it reads the pre-change prompt (one line) and the post-change one (a block) alike.
+extract_step1b2_block() {
+  awk '
+    /^# Step 1b2/ { seen = 1; next }
+    seen && /^# If it returns a bead/ { exit }
+    seen && !started && (/^#/ || /^$/) { next }
+    seen { started = 1; print }
+  ' "$1"
+}
+
+# The fake bd. `bd ready ... --json [--limit N | --limit=N | -n N]`: $WA_FIXTURE (a JSON array) in bd's default order
+# (priority ascending, stable), cut to N (default 100, like bd; 0 = the whole population). Its argv goes to
+# $FAKE_BD_ARGV so a scenario can assert the window; FAKE_BD_FAIL=1 makes it fail like a down store.
+make_fake_bd() {
+  cat > "$1/bd" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FAKE_BD_ARGV:-/dev/null}"
+if [ -n "${FAKE_BD_FAIL:-}" ]; then echo "bd: simulated failure" >&2; exit 1; fi
+lim=100
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --limit=*) lim="${1#--limit=}" ;;
+    --limit|-n) shift; lim="${1:-100}" ;;
+  esac
+  shift
+done
+jq -c --argjson n "$lim" 'sort_by(.priority // 99) | if $n == 0 then . else .[:$n] end' "$WA_FIXTURE"
+SH
+  chmod +x "$1/bd"
+}
+
+# mk <id> <priority-json> <type> <created_at> <updated_at> [label...] — one bead the way bd prints it.
+mk() { jq -cn --arg id "$1" --argjson p "$2" --arg t "$3" --arg c "$4" --arg u "$5" \
+  '$ARGS.positional as $l | {id: $id, priority: $p, issue_type: $t, created_at: $c, updated_at: $u, labels: $l}' --args "${@:6}"; }
+arr() { printf '%s\n' "$@" | jq -cs '.'; }
+
+# run_block <block-file> <fixture-json> [city-dir] [fail] — runs the block like a worker would. Sets OUT, ERR, ARGV.
+run_block() {
+  local blk="$1" fx="$2" city="${3:-$CITY_ROOT}" fail="${4:-}"
+  printf '%s' "$fx" > "$WORK/fixture.json"
+  : > "$WORK/argv"
+  OUT="$(PATH="$WORK/bin:$PATH" WA_FIXTURE="$WORK/fixture.json" FAKE_BD_ARGV="$WORK/argv" FAKE_BD_FAIL="$fail" \
+         GC_CITY_PATH="$city" GC_CITY="$city" bash "$blk" 2>"$WORK/err")"
+  ERR="$(cat "$WORK/err")"
+  ARGV="$(cat "$WORK/argv")"
+}
+WHY=""
+want_winner() { # <id> — the first bead printed is <id>
+  local got
+  got="$(printf '%s' "$OUT" | jq -r '.[0].id // "EMPTY"' 2>/dev/null)"
+  if [ "$got" = "$1" ]; then return 0; fi
+  WHY="expected winner $1, got '${got:-<nothing>}' (stdout: ${OUT:0:160})"
+  return 1
+}
+want_err() { # <fixed string> — stderr carries it (the WARN lines are the only signal: they must reach the worker)
+  case "$ERR" in *"$1"*) return 0 ;; esac
+  WHY="stderr lacks '$1' (stderr: ${ERR:0:300})"
+  return 1
+}
+
+# The scenarios. $1 = the block file under test.
+sc_priority_dominates() {
+  run_block "$1" "$(arr "$(mk p0-old-touch 0 task 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z)" "$(mk p1-new-touch 1 task 2026-09-01T00:00:00Z 2026-09-10T22:00:00Z)")"
+  want_winner p0-old-touch
+}
+sc_reclaim_sinks_within_priority() { # ga-w4k2z: the bead reclaimed again just now loses to an untouched sibling
+  run_block "$1" "$(arr "$(mk just-reclaimed 1 task 2026-01-01T00:00:00Z 2026-09-10T22:00:00Z pilot:reclaim-count:1)" "$(mk never-touched 1 task 2026-02-01T00:00:00Z 2026-02-01T00:00:00Z)")"
+  want_winner never-touched
+}
+sc_literal_repro() { # wa-j4bzx (P2, older) vs wa-qjjj6 (P1, newer): the P1 wins
+  run_block "$1" "$(arr "$(mk wa-j4bzx-like 2 task 2026-09-10T17:35:12Z 2026-09-10T17:35:12Z)" "$(mk wa-qjjj6-like 1 task 2026-09-10T19:49:21Z 2026-09-10T19:49:21Z)")"
+  want_winner wa-qjjj6-like
+}
+sc_reclaim_cap_excludes() { # ga-0pg2o: a P0 at pilot:reclaim-count:3 is not offered, even alone in its tier
+  run_block "$1" "$(arr "$(mk poisoned-p0-at-cap 0 task 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z pilot:reclaim-count:3)" "$(mk clean-p1 1 task 2026-09-01T00:00:00Z 2026-09-10T22:00:00Z)")"
+  want_winner clean-p1
+}
+sc_below_cap_still_wins() { # the cap is exactly >= 3
+  run_block "$1" "$(arr "$(mk reclaimed-p0-below-cap 0 task 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z pilot:reclaim-count:2)" "$(mk clean-p1 1 task 2026-09-01T00:00:00Z 2026-09-10T22:00:00Z)")"
+  want_winner reclaimed-p0-below-cap
+}
+sc_first_dispatch_not_penalized() { # ga-oc6knj: the Pilot's own dispatch write (updated_at) must not sink a never-reclaimed bead
+  run_block "$1" "$(arr "$(mk older-just-dispatched 2 task 2026-09-16T23:38:41Z 2026-09-17T01:40:55Z)" "$(mk newer-waiting 2 task 2026-09-17T00:00:00Z 2026-09-16T23:38:41Z)")"
+  want_winner older-just-dispatched
+}
+sc_real_reclaim_anti_poison() { # ga-oc6knj/ga-w4k2z with REAL reclaim labels on both
+  run_block "$1" "$(arr "$(mk just-reclaimed-again 1 task 2026-09-01T00:00:00Z 2026-09-17T01:40:55Z pilot:reclaim-count:1)" "$(mk reclaimed-earlier-idle-since 1 task 2026-09-01T00:00:00Z 2026-09-16T20:00:00Z pilot:reclaim-count:1)")"
+  want_winner reclaimed-earlier-idle-since
+}
+sc_feature_beats_older_bug() { # the Athos rule: inside a priority, feature first — a NEWER P0 feature beats an OLDER P0 bug
+  run_block "$1" "$(arr "$(mk old-p0-bug 0 bug 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z)" "$(mk new-p0-feature 0 feature 2026-09-01T00:00:00Z 2026-09-01T00:00:00Z)")"
+  want_winner new-p0-feature
+}
+sc_reclaimed_x2_sinks_behind_newer_feature() { # the inherited anti-starvation, inside one class: reclaimed twice -> aged by updated_at
+  run_block "$1" "$(arr "$(mk reclaimed-feature 0 feature 2026-01-01T00:00:00Z 2026-09-20T00:00:00Z pilot:reclaim-count:2)" "$(mk fresh-feature 0 feature 2026-09-01T00:00:00Z 2026-09-01T00:00:00Z)")"
+  want_winner fresh-feature
+}
+sc_older_feature_wins_without_the_label() { # the control of the one above: the LABEL is what sinks it, not the dates
+  run_block "$1" "$(arr "$(mk reclaimed-feature 0 feature 2026-01-01T00:00:00Z 2026-09-20T00:00:00Z)" "$(mk fresh-feature 0 feature 2026-09-01T00:00:00Z 2026-09-01T00:00:00Z)")"
+  want_winner reclaimed-feature
+}
+sc_whole_pool_oldest_p0_feature_at_25() { # ga-g7yt: 24 newer P0 features come first in bd's order; the OLDEST is the 25th — outside a window of 20
+  run_block "$1" "$(jq -cn '[range(1; 25) as $i | ("0" + ($i | tostring))[-2:] as $d
+      | {id: ("f" + $d), priority: 0, issue_type: "feature", created_at: ("2026-03-" + $d + "T00:00:00Z"), updated_at: ("2026-03-" + $d + "T00:00:00Z"), labels: []}]
+      + [{id: "oldest-p0-feature", priority: 0, issue_type: "feature", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", labels: []}]')"
+  want_winner oldest-p0-feature
+}
+sc_fetch_is_the_whole_pool() { # the query asks for everything: --limit 0, never --limit=N before the order is applied
+  run_block "$1" "$(arr "$(mk only 1 task 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z)")"
+  case "$ARGV" in *"--limit 0"*) ;; *) WHY="bd was not asked for --limit 0 (argv: ${ARGV:0:200})"; return 1 ;; esac
+  case "$ARGV" in *"--limit="*) WHY="bd was asked for a --limit=N window (argv: ${ARGV:0:200})"; return 1 ;; esac
+  return 0
+}
+sc_age_is_epoch_not_string() { # same second, two spellings: "…:05.123Z" and "…:05+00:00" tie by epoch, so the id decides (a-frac); as text '+' < '.' would put b-plus first
+  run_block "$1" "$(arr "$(mk b-plus 1 task 2026-01-01T00:00:05+00:00 2026-01-01T00:00:05+00:00)" "$(mk a-frac 1 task 2026-01-01T00:00:05.123Z 2026-01-01T00:00:05.123Z)")"
+  want_winner a-frac
+}
+sc_illegible_is_kept_at_the_end_with_a_warn() { # the three states: a bead with an unreadable priority is NOT promoted, NOT dropped, and the library's WARN reaches the worker
+  run_block "$1" "$(arr "$(mk bad-prio '"high"' task 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z)" "$(mk ok-p3 3 task 2026-09-01T00:00:00Z 2026-09-01T00:00:00Z)")"
+  want_winner ok-p3 || return 1
+  want_err "work-order WARN: bad-prio" || return 1
+  run_block "$1" "$(arr "$(mk bad-prio '"high"' task 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z)")"
+  want_winner bad-prio
+}
+# The two fallbacks. The pool is chosen so the OLD order (priority, then age; no feature tier) and the library's order
+# DISAGREE: the old order serves old-p0-bug, the library new-p0-feature. So "which one came back" says which path ran.
+FALLBACK_POOL_BUG="old-p0-bug"
+sc_lib_missing_falls_back_and_warns() {
+  mkdir -p "$WORK/nolib-city"
+  run_block "$1" "$(arr "$(mk old-p0-bug 0 bug 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z)" "$(mk new-p0-feature 0 feature 2026-09-01T00:00:00Z 2026-09-01T00:00:00Z)")" "$WORK/nolib-city"
+  want_winner "$FALLBACK_POOL_BUG" || return 1       # a bead came back — never [] / nothing — and it is the pre-migration order's
+  want_err "WARN Step 1b2" || return 1               # ... and the worker was told which path it was on
+}
+sc_lib_cannot_tell_falls_back_and_shows_why() {
+  mkdir -p "$WORK/stub-city/packs/town-deltas/assets/scripts"
+  printf '%s\n' 'work_order_sort() { cat >/dev/null; echo "work-order ERROR: stub: cannot tell" >&2; return 2; }' > "$WORK/stub-city/packs/town-deltas/assets/scripts/work-order.sh"
+  run_block "$1" "$(arr "$(mk old-p0-bug 0 bug 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z)" "$(mk new-p0-feature 0 feature 2026-09-01T00:00:00Z 2026-09-01T00:00:00Z)")" "$WORK/stub-city"
+  want_winner "$FALLBACK_POOL_BUG" || return 1
+  want_err "WARN Step 1b2" || return 1
+  want_err "work-order ERROR: stub: cannot tell" || return 1   # the library's own line is kept, not swallowed
+}
+sc_an_empty_pool_is_an_empty_list() { # genuinely nothing to do: [] and NO warning (the WARN must mean something)
+  run_block "$1" "[]"
+  if [ "$OUT" != "[]" ]; then WHY="an empty pool should print [], got '${OUT:0:120}'"; return 1; fi
+  case "$ERR" in *"WARN Step 1b2"*) WHY="an empty pool must not WARN (stderr: ${ERR:0:200})"; return 1 ;; esac
+  return 0
+}
+sc_a_failed_query_is_not_an_empty_list() { # bd down: NOT [] (a worker that reads [] drains) and a WARN that says so
+  run_block "$1" "[]" "$CITY_ROOT" 1
+  if [ "$OUT" = "[]" ]; then WHY="a failed bd query printed [] — it reads as 'no work'"; return 1; fi
+  want_err "WARN Step 1b2" || return 1
+  want_err "NOT 'queue empty'" || return 1
+}
+sc_probe_agrees_with_the_library_head() { # one order for the whole city: the probe's pick IS what the top-up (R4) takes off the same pool
+  # The pool: a P0 bug that is the OLDEST, a P0 feature reclaimed twice (aged by updated_at), a P0 feature that is simply
+  # newer than the old bug, a P1 feature, and a P0 feature at the reclaim cap (the probe's veto drops it: the top-up's
+  # own query drops it too, so it is NOT in the population the two are compared on).
+  local old_bug rec_feat new_feat p1_feat capped pool lib_head lib_dir="${CITY_ROOT}/packs/town-deltas/assets/scripts"
+  old_bug="$(mk old-p0-bug 0 bug 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z)"
+  rec_feat="$(mk reclaimed-p0-feature 0 feature 2026-02-01T00:00:00Z 2026-09-20T00:00:00Z pilot:reclaim-count:2)"
+  new_feat="$(mk new-p0-feature 0 feature 2026-09-01T00:00:00Z 2026-09-01T00:00:00Z)"
+  p1_feat="$(mk old-p1-feature 1 feature 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z)"
+  capped="$(mk capped-p0-feature 0 feature 2025-12-01T00:00:00Z 2025-12-01T00:00:00Z pilot:reclaim-count:3)"
+  run_block "$1" "$(arr "$old_bug" "$rec_feat" "$new_feat" "$p1_feat" "$capped")"
+  pool="$(arr "$old_bug" "$rec_feat" "$new_feat" "$p1_feat")"
+  # The top-up's view: the library applied to that population, taking the head — exactly how R4 picks its bead.
+  lib_head="$( . "$lib_dir/work-order.sh" && printf '%s' "$pool" | work_order_sort --age reclaim 2>/dev/null | work_order_head 2>/dev/null | jq -r '.id // "EMPTY"' )"
+  if [ "$lib_head" != "new-p0-feature" ]; then WHY="the library's own head over the pool is '$lib_head', not new-p0-feature — the fixture no longer says what this scenario thinks it says"; return 1; fi
+  want_winner "$lib_head" || { WHY="probe and top-up disagree: the library's head is $lib_head; $WHY"; return 1; }
+}
+WA_SCENARIOS="priority_dominates reclaim_sinks_within_priority literal_repro reclaim_cap_excludes below_cap_still_wins
+  first_dispatch_not_penalized real_reclaim_anti_poison feature_beats_older_bug reclaimed_x2_sinks_behind_newer_feature
+  older_feature_wins_without_the_label whole_pool_oldest_p0_feature_at_25 fetch_is_the_whole_pool age_is_epoch_not_string
+  illegible_is_kept_at_the_end_with_a_warn lib_missing_falls_back_and_warns lib_cannot_tell_falls_back_and_shows_why
+  an_empty_pool_is_an_empty_list a_failed_query_is_not_an_empty_list probe_agrees_with_the_library_head"
+
+# mutate_block <block-in> <block-out> <old> <new> — an EXACT-ONCE textual mutation; a target that is not there exactly
+# once is an error (rc 3), never a silent no-op that would "pass" a mutation control.
+mutate_block() {
+  python3 -I - "$1" "$2" "$3" "$4" <<'PY'
+import sys
+src, dst, old, new = sys.argv[1:5]
+text = open(src, encoding="utf-8").read()
+if text.count(old) != 1:
+    sys.stderr.write("mutation target occurs %d times (want 1): %r\n" % (text.count(old), old)); sys.exit(3)
+open(dst, "w", encoding="utf-8").write(text.replace(old, new))
+PY
+}
+
+# run_case_lib <label> <template> [prefix] — a worker's probe, end to end (the ps-worker and the wa-worker). <prefix> is the shell-variable prefix the template's Step 1b2 block uses (WA_ for wa-worker, PS_ for
+# ps-worker; default WA): only the two mutants that rewrite the block's own variable names need it.
+run_case_lib() {
+  local label="$1" tpl="$2" pfx="${3:-WA}" name blk
+  if [ ! -f "$tpl" ]; then bad "$label: template not found at $tpl"; return; fi
+  if [ ! -r "$CITY_ROOT/packs/town-deltas/assets/scripts/work-order.sh" ]; then bad "$label: the shared library is not at $CITY_ROOT/packs/town-deltas/assets/scripts/work-order.sh"; return; fi
+  blk="$WORK/$(basename "$(dirname "$tpl")").block.sh"
+  extract_step1b2_block "$tpl" > "$blk"
+  if [ ! -s "$blk" ]; then bad "$label: could not extract the Step 1b2 block from $tpl (header/claim-note anchors changed?)"; return; fi
+  if ! bash -n "$blk" 2>"$WORK/syntax"; then bad "$label: the Step 1b2 block does not parse: $(cat "$WORK/syntax")"; return; fi
+  # the sibling selftests (next-action, delivery-pending-restart, text-veto, pilot-dispatched, vetoes) read the filter
+  # program off the probe LINE: if that line shape goes, they go silently blind — so it is asserted here, once.
+  if extract_priority_probe_jq "$tpl" >/dev/null; then ok "$label: the probe line the sibling selftests extract is still there"; else bad "$label: the probe line shape the sibling selftests extract is gone"; fi
+  for name in $WA_SCENARIOS; do
+    WHY=""
+    if "sc_$name" "$blk"; then ok "$label $name"; else bad "$label $name: $WHY"; fi
+  done
+  run_step1b3_and_structure_cases "$label" "$tpl"
+
+  # Mutation controls: each mutant of the block must be CAUGHT by the scenario named for it (the scenario fails on it).
+  local mut_n=0
+  mutation_control() { # <name> <caught-by scenario> <old> <new>
+    local mname="$1" scen="$2" old="$3" new="$4" mblk
+    mut_n=$((mut_n + 1))
+    mblk="$WORK/mutant.$mut_n.sh"
+    if ! mutate_block "$blk" "$mblk" "$old" "$new" 2>"$WORK/mut-err"; then bad "$label mutant $mname: could not be built: $(cat "$WORK/mut-err")"; return; fi
+    if ! bash -n "$mblk" 2>/dev/null; then bad "$label mutant $mname: does not parse (a syntax error would 'catch' anything)"; return; fi
+    WHY=""
+    if "sc_$scen" "$mblk"; then bad "$label mutant $mname SURVIVED $scen — that scenario does not guard what it claims"; else ok "$label mutant $mname is caught by $scen"; fi
+  }
+  mutation_control "age-created (drops the reclaim age)"            reclaimed_x2_sinks_behind_newer_feature 'work_order_sort --age reclaim' 'work_order_sort --age created'
+  mutation_control "window of 20 comes back"                        whole_pool_oldest_p0_feature_at_25      '--limit 0' '--limit=20'
+  mutation_control "probe ages by created, the top-up by reclaim"   probe_agrees_with_the_library_head     'work_order_sort --age reclaim' 'work_order_sort --age created'
+  mutation_control "no sort at all (bd's own order)"                feature_beats_older_bug                 'work_order_sort --age reclaim' 'cat'
+  mutation_control "the library's stderr is swallowed"              illegible_is_kept_at_the_end_with_a_warn 'work_order_sort --age reclaim )' 'work_order_sort --age reclaim 2>/dev/null )'
+  mutation_control "no fallback: a missing library answers nothing" lib_missing_falls_back_and_warns        "if [ -z \"\$${pfx}_PICK\" ]; then" 'if false; then'
+  mutation_control "a silent fallback (no WARN)"                    lib_missing_falls_back_and_warns        "WARN Step 1b2: \$${pfx}_LIB is missing" "note: \$${pfx}_LIB is missing"
+}
+
 if ! command -v jq >/dev/null 2>&1; then
   echo "SKIP: jq not available"
   exit 0
 fi
 
-run_case "wa-worker Step 1b2" "$CITY_ROOT/agents/wa-worker/prompt.template.md"
-run_case "ps-worker Step 1b2" "$CITY_ROOT/agents/ps-worker/prompt.template.md"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/pool-probe-priority-sort.XXXXXX")" || { echo "FATAL: mktemp"; exit 1; }
+trap cleanup_work EXIT
+mkdir -p "$WORK/bin"
+make_fake_bd "$WORK/bin"
+
+run_case_lib "wa-worker Step 1b2" "$CITY_ROOT/agents/wa-worker/prompt.template.md" WA
+run_case_lib "ps-worker Step 1b2" "$CITY_ROOT/agents/ps-worker/prompt.template.md" PS
 
 echo ""
 echo "PASS=$PASS FAIL=$FAIL"

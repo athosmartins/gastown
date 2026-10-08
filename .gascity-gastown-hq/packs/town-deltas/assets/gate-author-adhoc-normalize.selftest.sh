@@ -16,7 +16,7 @@
 #   echo "digo-wa-adhoc-e2510107f6" | /usr/bin/grep -E "-adhoc-[0-9a-f]+"
 #   -> "grep: unknown --directories option", rc=2
 #
-# Strategy mirrors gate-author-priority.selftest.sh: extract the LIVE block via
+# Strategy mirrors gate-q8tj7p-queue-order.selftest.sh: extract the LIVE block via
 # its sentinels (never a hand-copied re-implementation) and run it under a
 # clean `bash -c` (no interactive-shell grep shadowing) with AUTHOR set.
 #

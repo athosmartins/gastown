@@ -58,12 +58,21 @@ GATE_E5_EST_COST_USD="${GATE_E5_EST_COST_USD:-0.60}"
 GATE_E5_DAILY_CAP_USD="${GATE_E5_DAILY_CAP_USD:-30}"
 
 # ── the flag ──────────────────────────────────────────────────────────────────
-# gate_e5_enabled — prints 1 or 0. Anything unreadable/unrecognised is 0 (inert).
+# gate_e5_enabled — prints 1 or 0. An unreadable/unrecognised SWITCH is 0 (inert); an unreadable FOCUS state
+# is "no suspension" (the switch decides) — a signal nobody could read never flips E5 off.
 gate_e5_enabled() {
   case "${GATE_E5_ENABLED:-}" in
     1) printf '1'; return 0 ;;
     0) printf '0'; return 0 ;;
   esac
+  # ga-kqa08j / Athos 07/10/2026 ("Desligar no foco"): while GATE FOCUS MODE is ON, E5 is OFF — the 2nd
+  # reviewer takes 2 of the 3 review slots and costs ~23 pts of first-attempt approval (A/B measured
+  # 02-07/10) exactly when the queue is the bottleneck. Comes back on its own when focus ends.
+  # unknown/off focus state -> no suspension. The env override above still wins (selftests).
+  local _gfl; _gfl="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/gate-focus-lib.sh"
+  if [ -r "$_gfl" ] && . "$_gfl" 2>/dev/null && [ "$(gate_focus_active)" = "1" ]; then
+    printf '0'; return 0
+  fi
   local _f="${GATE_E5_FLAG_FILE:-${GC_CITY:-}/.gc/gate-e5-second-reviewer.on}"
   if [ -n "${GC_CITY:-}${GATE_E5_FLAG_FILE:-}" ] && [ -r "$_f" ]; then
     printf '1'
@@ -779,7 +788,13 @@ gate_e5_phase_c_hook() {
     case "${PC_ELAPSED:-}" in ''|*[!0-9]*) : ;; *)
       [ -n "$_age" ] && { _offset=$((PC_ELAPSED - _age)); [ "$_offset" -ge 0 ] || _offset=0; _window=$(gate_e5_extra_window_secs "$_offset"); } ;;
     esac
-    [ "${PC_ELAPSED:-0}" -gt "${PC_TIMEOUT_SECS:-0}" ] 2>/dev/null && _run_past=1
+    # ga-ufskhy E13: the run is "past" only beyond budget + the E13 grace the dispatcher computed for it
+    # (PC_GRACE_SECS, 0 when E13 is off/absent) — otherwise the extra was retired at a budget the run
+    # itself outlives, losing a paid review for nothing.
+    local _e13_grace="${PC_GRACE_SECS:-}"
+    if [ -z "$_e13_grace" ] && declare -F gate_e13_grace_secs >/dev/null 2>&1; then _e13_grace=$(gate_e13_grace_secs "${PC_TIMEOUT_SECS:-0}" 2>/dev/null) || _e13_grace=0; fi
+    case "$_e13_grace" in ''|*[!0-9]*) _e13_grace=0 ;; esac
+    [ "${PC_ELAPSED:-0}" -gt $(( ${PC_TIMEOUT_SECS:-0} + _e13_grace )) ] 2>/dev/null && _run_past=1
     # "Everyone else has delivered": the required count includes the extra, which is pending — so one short of it.
     case "${VERDICTS_RECEIVED:-}${REQUIRED_REVIEWERS:-}" in ''|*[!0-9]*) : ;; *)
       [ $((VERDICTS_RECEIVED + 1)) -eq "$REQUIRED_REVIEWERS" ] && _others_done=1 ;;

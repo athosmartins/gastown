@@ -128,9 +128,10 @@ error envelope instead of data. For each one you find:
    SILENT fail-open is not — the correct shape is visible and counted ("N
    unverified"), never quiet.
 3. Does every comment or log line in this diff describe what the code beside
-   it ACTUALLY does? ("labels cleared" when nothing was cleared, or a claim
-   that exists only in the comment and not the code next to it, is how two of
-   today's six rejections happened.)
+   it ACTUALLY does? Since 2026-10-07 a comment that misdescribes CORRECT code
+   is a non-blocking finding, not a rejection — fix it anyway. A LOG that
+   reports success, a count or "nothing to do" when the operation failed is
+   still a rejection: that is behavior, not wording.
 
 This is a judgment sweep, not a lint — nothing here can grade it for you but
 you. You'll record a one-line result of it in Step 3 below, so the sweep

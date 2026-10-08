@@ -1936,6 +1936,157 @@ reviewer_session_alive() {
 }
 # SELFTEST-EXTRACT reviewer-session-alive-fn: END
 
+# gate_iso_to_epoch <timestamp> — epoch seconds for an ISO-8601 timestamp the way
+# the session roster and beads print them ("2026-10-07T16:55:49Z",
+# "2026-10-07T14:01:27-03:00", optional fractional seconds), or "" when the value
+# cannot be read as a time. Go's zero time ("0001-01-01T00:00:00Z" — what the
+# roster prints for a session that never reported activity) is "" too: it is not
+# a moment, it is the absence of one. BSD date first (-u, see ga-35zp1), GNU next.
+# SELFTEST-EXTRACT gate-iso-to-epoch-fn: BEGIN
+gate_iso_to_epoch() {
+  local raw="${1:-}" s ep
+  case "$raw" in ''|0001-01-01T*) printf ''; return 0 ;; esac
+  s=$(printf '%s' "$raw" | sed -E 's/\.[0-9]+//; s/Z$/+0000/; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/')
+  ep=$(date -j -u -f '%Y-%m-%dT%H:%M:%S%z' "$s" '+%s' 2>/dev/null \
+    || date -u -d "$raw" '+%s' 2>/dev/null || printf '')
+  case "$ep" in ''|*[!0-9]*) printf ''; return 0 ;; esac
+  printf '%s' "$ep"
+}
+# SELFTEST-EXTRACT gate-iso-to-epoch-fn: END
+
+# reviewer_session_busy <assignee> <sessions_json> [<now_epoch>] [<max_idle_secs>]
+# Pure. 1 iff a non-closed roster entry matching <assignee> (the same name fields
+# reviewer_session_alive matches) has state "active" AND a last_active within
+# <max_idle_secs> (default 900) of <now_epoch> (default: now). Everything else is
+# 0: asleep, closed, absent, a stale or zero-value last_active, a roster or a
+# timestamp that cannot be read.
+# WHAT THIS MEASURES (verified 07/10 against the tmux socket): last_active is the
+# pane's last OUTPUT (tmux window_activity). A Claude mid-turn repaints its spinner
+# every second, so "busy" separates MID-TURN from IDLE-AT-THE-PROMPT / FROZEN; it
+# does NOT separate a reviewer about to deliver from one looping or stuck on a hung
+# tool call. That is why the caller bounds the grace it buys with this (ceiling)
+# and why 0 means "not shown busy", never "confirmed stuck".
+# (ga-ufskhy E13, 2026-10-07: 6/6 timeouts that day killed a mid-turn reviewer;
+# two transcripts show a verdict minutes away; the marker was re-queued and
+# reviewed again from zero.)
+# SELFTEST-EXTRACT reviewer-session-busy-fn: BEGIN
+reviewer_session_busy() {
+  local assignee="${1:-}" sessions_json="${2:-}" now="${3:-}" max_idle="${4:-900}" la ep
+  [ -z "$assignee" ] && { echo 0; return 0; }
+  case "$now" in ''|*[!0-9]*) now=$(date +%s) ;; esac
+  case "$max_idle" in ''|*[!0-9]*) max_idle=900 ;; esac
+  la=$(printf '%s' "$sessions_json" | jq -r --arg a "$assignee" '
+        [(if type=="array" then . else (.sessions // []) end)[]
+         | select(.closed != true)
+         | select((.state // "") == "active")
+         | select(([.session_name, .name, .alias, .id, .agent_name] | map(select(. != null and . != "")) | index($a)) != null)
+         | (.last_active // "")] | .[0] // ""' 2>/dev/null) || la=""
+  [ -z "$la" ] && { echo 0; return 0; }
+  ep=$(gate_iso_to_epoch "$la")
+  case "$ep" in ''|*[!0-9]*) echo 0; return 0 ;; esac
+  if [ $(( now - ep )) -le "$max_idle" ]; then echo 1; else echo 0; fi
+}
+# SELFTEST-EXTRACT reviewer-session-busy-fn: END
+
+# gate_e13_grace_secs <budget_secs> [<spent_before_secs>] — how long past its verdict budget Phase C keeps
+# (<spent_before_secs> = time between run creation and the budget anchor, see gate_phase_c_anchor: the
+# ceiling is measured from run CREATION because that is what the guard ages the run by) —
+# waiting for a reviewer that is still busy: min(budget, GATE_E13_GRACE_MAX_SECS
+# [1800]), CLAMPED so budget+grace never passes the run ceiling: min(
+# GATE_E13_CEILING_SECS [4800], (GATE_RUN_TTL_MINUTES-10)*60 when that TTL is a
+# number) — the guard aborts any gate-run older than GATE_RUN_TTL_MINUTES (90) with
+# no liveness check (abort:age), and E5 already stops at 4800s for the same reason.
+# 0 when the operator switched E13 off (GATE_E13_GRACE=0, or the file
+# $GC_CITY/.gc/gate-e13-grace.off exists) or when the budget alone already reaches
+# the ceiling. Only a literal 0 is "off": junk in the env is not off (the caller
+# logs it; this stays pure).
+# SELFTEST-EXTRACT gate-e13-grace-secs-fn: BEGIN
+gate_e13_grace_secs() {
+  local budget="${1:-0}" spent="${2:-0}" maxg="${GATE_E13_GRACE_MAX_SECS:-1800}" ceil="${GATE_E13_CEILING_SECS:-4800}" ttl="${GATE_RUN_TTL_MINUTES:-}" g room
+  case "$budget" in ''|*[!0-9]*) budget=0 ;; esac
+  case "$spent" in ''|*[!0-9]*) spent=0 ;; esac   # seconds already spent before the budget clock started (task-sent anchor offset)
+  case "$maxg" in ''|*[!0-9]*) maxg=1800 ;; esac
+  case "$ceil" in ''|*[!0-9]*) ceil=4800 ;; esac
+  if [ "${GATE_E13_GRACE:-}" = "0" ] || [ -e "${GATE_E13_OFF_FILE:-${GC_CITY:-}/.gc/gate-e13-grace.off}" ]; then echo 0; return 0; fi
+  case "$ttl" in ''|*[!0-9]*) ;; *) [ $(( (ttl - 10) * 60 )) -lt "$ceil" ] && ceil=$(( (ttl - 10) * 60 )) ;; esac
+  g="$budget"; [ "$g" -gt "$maxg" ] && g="$maxg"
+  room=$(( ceil - budget - spent )); [ "$room" -lt 0 ] && room=0
+  [ "$g" -gt "$room" ] && g="$room"
+  echo "$g"
+}
+# SELFTEST-EXTRACT gate-e13-grace-secs-fn: END
+
+# gate_phase_c_anchor <start_epoch> <task_sent_epoch> <now_epoch> — where the verdict budget clock starts.
+# Pure. Prints "<anchor_epoch> <offset_secs> <source>": the task-sent moment when it is a number between
+# start and now ("task-sent"), else the run creation ("created", offset 0). Measured 05–07/10: run created →
+# task sent median 153 s, p90 350 s, 42/268 runs over 300 s (one 6 min of spawn retries) — all of it used
+# to count against the reviewer. Garbage/missing task-sent → created: today's behavior, named.
+# SELFTEST-EXTRACT gate-phase-c-anchor-fn: BEGIN
+gate_phase_c_anchor() {
+  local start="${1:-}" sent="${2:-}" now="${3:-}"
+  case "$start" in ''|*[!0-9]*) start=0 ;; esac
+  case "$now" in ''|*[!0-9]*) now=$(date +%s) ;; esac
+  case "$sent" in ''|*[!0-9]*) printf '%s 0 created\n' "$start"; return 0 ;; esac
+  if [ "$sent" -ge "$start" ] && [ "$sent" -le "$now" ]; then
+    printf '%s %s task-sent\n' "$sent" $(( sent - start ))
+  else
+    printf '%s 0 created\n' "$start"
+  fi
+}
+# SELFTEST-EXTRACT gate-phase-c-anchor-fn: END
+
+# gate_extract_nonblocking_findings <comments_json> — pure. From the LAST comment that carries a
+# standalone "VERDICT: PASS|FAIL" line (the reviewer's verdict; the task text pasted earlier quotes
+# the template inside a command line and never has that standalone line), prints the lines after
+# its LAST "Non-blocking findings:" (content on the same line counts), trimmed; nothing when there
+# are none or the only content is a form of "none"; unreadable JSON prints nothing (the caller
+# logs that it could not read, it never invents findings). (audit of 72dc10768, finding 4)
+# SELFTEST-EXTRACT gate-extract-nonblocking-findings-fn: BEGIN
+gate_extract_nonblocking_findings() {
+  local json="${1:-}" txt
+  txt=$(printf '%s' "$json" | jq -r '
+      (if type=="array" then . else (.comments // []) end)
+      | map((.text // .body // "") | tostring)
+      | map(select(split("\n") | any(test("^[[:space:]]*VERDICT: (PASS|FAIL)[[:space:]]*$"))))
+      | last // ""' 2>/dev/null) || txt=""
+  [ -n "$txt" ] || return 0
+  printf '%s\n' "$txt" | awk '
+      match($0, /Non-blocking findings:/) { buf=""; on=1; rest=substr($0, RSTART+RLENGTH); if (rest ~ /[^ \t]/) buf=rest "\n"; next }
+      on { buf = buf $0 "\n" }
+      END { printf "%s", buf }' \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$' \
+    | grep -vixE -- '-? *\(?none\)?[.]?' || true
+}
+# SELFTEST-EXTRACT gate-extract-nonblocking-findings-fn: END
+
+# gate_nbf_prepare — sets _GATE_NBF_BLOCK to the "Non-blocking findings" of every verdict bead of the
+# current run (VERDICT_BEAD_IDS), formatted for the PASS comment on the source bead, and labels the
+# source bead gate:nonblocking-findings when there are any (so a sweep can list the debt the relaxed
+# bar let through). Empty when there are none; a verdict bead whose comments cannot be read is
+# LOGGED and skipped, never read as "no findings".
+gate_nbf_prepare() {
+  _GATE_NBF_BLOCK=""
+  local vb one json
+  [ -n "${VERDICT_BEAD_IDS+x}" ] || return 0
+  for vb in "${VERDICT_BEAD_IDS[@]}"; do
+    [ -n "$vb" ] || continue
+    if ! json=$(bd -C "$GC_CITY" comments "$vb" --json 2>/dev/null); then
+      log "non-blocking findings: comments of verdict bead $vb unreadable — not carried into the PASS comment (said here, not invented)"
+      continue
+    fi
+    one=$(gate_extract_nonblocking_findings "$json")
+    [ -n "$one" ] || continue
+    _GATE_NBF_BLOCK="${_GATE_NBF_BLOCK}
+
+Non-blocking findings carried from the review (verdict $vb) — fix them in the next change on these files; they cost no re-review (bar of 2026-10-07):
+$one"
+  done
+  if [ -n "$_GATE_NBF_BLOCK" ] && [ -n "${BEAD_ID:-}" ]; then
+    bd -C "${BEAD_CITY:-$GC_CITY}" label add "$BEAD_ID" gate:nonblocking-findings 2>/dev/null || true
+  fi
+  return 0
+}
+
 # bead_owner_session_state <bead_show_json> <sessions_json>
 # Pure, THREE-state read of "does this bead's assignee still own it through a
 # session?" — echoes exactly one of:
@@ -3055,6 +3206,8 @@ gate_base_test_sandbox_profile() {
     esac
   fi
   printf '(version 1)\n(allow default)\n(deny network*)\n(deny file-write*)\n'
+  # ga-ufskhy 07/10 (E14 review, finding 7): tests must not (re)start or kill the city's daemons from inside the gate.
+  printf '(deny process-exec (literal "/bin/launchctl") (literal "/usr/bin/osascript"))\n'
   printf '(allow file-write* (subpath "%s") (literal "/dev/null") (literal "/dev/dtracehelper") (regex #"^/dev/tty"))\n' "$scratch"
   if [ -n "$home" ]; then
     for d in Desktop Documents Downloads Pictures Movies Music "Library/CloudStorage" "Library/Mobile Documents"; do
@@ -4275,6 +4428,16 @@ gate_e11_switch_state() {
 # gate_e11_enabled — prints 1 or 0: 1 only when gate_e11_switch_state is `on`. Anything unreadable or unrecognised is 0.
 gate_e11_enabled() {
   if [ "$(gate_e11_switch_state)" = "on" ]; then printf '1'; else printf '0'; fi
+}
+
+# gate_e11_force_all — prints 1 iff the operator asked for the cap on EVERY bead (Athos, 07/10/2026,
+# diagnóstico do gate: "Ligar hoje, 100%"): env GATE_E11_ALL=1 (0 = off; wins, used by the selftests) or the
+# flag file $GC_CITY/.gc/gate-e11-diff-cap.all. Only consulted when E11 itself is ON; an arm-A bead is then
+# treated as arm B (the log still shows arm=B, so the record says what was applied). Anything else -> 0.
+gate_e11_force_all() {
+  case "${GATE_E11_ALL:-}" in 1) printf '1'; return 0 ;; 0) printf '0'; return 0 ;; '') ;; *) printf '0'; return 0 ;; esac   # junk env = off, never on
+  local _f="${GATE_E11_ALL_FLAG_FILE:-${GC_CITY:-}/.gc/gate-e11-diff-cap.all}"
+  if [ -n "${GC_CITY:-}${GATE_E11_ALL_FLAG_FILE:-}" ] && [ -r "$_f" ]; then printf '1'; else printf '0'; fi
 }
 
 # gate_e11_arm_for_bead <bead_id> — prints A or B: B <=> the first 32 bits of SHA-256("e11-diff-cap:<bead-id>") are
@@ -7231,6 +7394,19 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
   _E11_ARM_RC=0
   _E11_ARM=$(gate_e11_arm_for_bead "$BEAD_ID") || _E11_ARM_RC=$?
   case "$_E11_ARM" in A|B) ;; *) _E11_ARM="?" ;; esac
+  # 100% mode (Athos 07/10): an identified arm-A bead gets the cap too; an unidentifiable bead ("?") stays out.
+  # forced=1 in the record keeps the A/B assignment readable (a hash-A bead treated as B is not a B bead).
+  _E11_FORCED=0
+  _E11_ALL_FILE="${GATE_E11_ALL_FLAG_FILE:-${GC_CITY:-}/.gc/gate-e11-diff-cap.all}"
+  if [ -e "$_E11_ALL_FILE" ] && [ ! -r "$_E11_ALL_FILE" ]; then
+    if [ -z "${GATE_E11_ALL:-}" ]; then
+      log "E11-DIFF-CAP all-switch=ilegivel file=$_E11_ALL_FILE — 100% mode NOT applied (a switch nobody could read is off, and says so)"
+    else
+      log "E11-DIFF-CAP all-switch=ilegivel file=$_E11_ALL_FILE — ignored: the env GATE_E11_ALL=${GATE_E11_ALL} decides"
+    fi
+  fi
+  case "${GATE_E11_ALL:-}" in ''|0|1) ;; *) log "E11-DIFF-CAP all-switch=env-invalido GATE_E11_ALL=${GATE_E11_ALL} — 100% mode NOT applied" ;; esac
+  if [ "$_E11_ARM" = "A" ] && [ "$(gate_e11_force_all)" = "1" ]; then _E11_ARM="B"; _E11_FORCED=1; fi
   _E11_CAP=$(gate_e11_cap_lines)
   _E11_CAP_ST=$(gate_e11_cap_state)
   _E11_COUNT="-"
@@ -7304,17 +7480,68 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
     fi
   fi
   _E11_VERDICT=$(gate_e11_verdict "$_E11_ARM" "$_E11_VCOUNT" "$_E11_EXEMPT" "$_E11_CAP")
-  log "E11-DIFF-CAP bead=${BEAD_ID:-<EMPTY>} arm=$_E11_ARM verdict=$_E11_VERDICT production_lines=$_E11_COUNT cap=$_E11_CAP exempt=$_E11_EXEMPT why=$_E11_WHY branch=${BRANCH:-<EMPTY>} marker=$MARKER_ID"
+  log "E11-DIFF-CAP bead=${BEAD_ID:-<EMPTY>} arm=$_E11_ARM verdict=$_E11_VERDICT production_lines=$_E11_COUNT cap=$_E11_CAP exempt=$_E11_EXEMPT why=$_E11_WHY branch=${BRANCH:-<EMPTY>} marker=$MARKER_ID forced=${_E11_FORCED:-0}"
   if [ "$_E11_VERDICT" = "recusa" ]; then
-    err "  diff-size cap (ga-lzidpo/E11): $_E11_COUNT production lines on $BRANCH vs origin/main exceed the cap of $_E11_CAP (arm B). Refusing at submission."
-    set_gate_status "$MARKER_ID" "error"
-    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: diff-size cap (ga-lzidpo / E11).
+    # Four things, in this order, each of which somebody can ACT on (audit of 72dc10768, finding 1: before this the
+    # marker alone was labeled and left in error, nothing reached the source bead or the author, the bead kept
+    # gate:queued with no open marker and nobody could re-dispatch it — a silent strand):
+    #   1. the refusal label on the marker, READ BACK (label writes have failed silently in this city — ga-ehbw5,
+    #      ga-kgtiw); it is what gate-recovery-watchdog.py keys close:guard-refused on if the close below fails;
+    #   2. the SOURCE bead: gate:queued off, gate:needs-fix on (the Pilot and the focus-mode keep-filter route
+    #      fix-class beads to a builder), the reason as a VERDICT: FAIL comment (what a fix sling carries), a
+    #      refusal counter; the 3rd refusal of the same bead ends in gate:needs-human + mail to the mayor;
+    #   3. a mail to the author when the branch names a crew (/gate-done promised one); best-effort — the bead
+    #      labels are the durable path, a pool author has already exited and the Pilot re-dispatches the fix;
+    #   4. the marker CLOSED here, VERIFIED (ga-o2dlg8 shape); gate-status:error only when the close itself fails,
+    #      and then the log says so and the watchdog's close:guard-refused (keyed on 1.) is the backstop.
+    _E11_LBL_OK=0
+    for _e11_try in 1 2; do
+      bd -C "$GC_CITY" label add "$MARKER_ID" gate-guard:refused-e11 2>/dev/null || true
+      if bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
+         | jq -e 'if type=="array" then .[0] else . end | (.labels // []) | index("gate-guard:refused-e11") != null' >/dev/null 2>&1; then
+        _E11_LBL_OK=1; break
+      fi
+    done
+    [ "$_E11_LBL_OK" = "1" ] || warn "E11-DIFF-CAP: refusal label gate-guard:refused-e11 NOT persisted on $MARKER_ID after 2 attempts — the verified close below is the primary mechanism; if that fails too the watchdog will requeue this marker after its error grace (ga-h3cje3 shape). Said here, not hidden."
+    err "  diff-size cap (ga-lzidpo/E11): $_E11_COUNT production lines on $BRANCH vs origin/main exceed the cap of $_E11_CAP (arm B${_E11_FORCED:+, forced by the 100% switch}). Refusing at submission."
+    _E11_SRC_SHOW=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _E11_SRC_SHOW=""
+    _E11_REFUSALS=$(printf '%s' "$_E11_SRC_SHOW" | jq -r 'if type=="array" then .[0] else . end | [(.labels // [])[] | select(startswith("gate:e11-refusals:")) | sub("^gate:e11-refusals:";"") | tonumber?] | max // 0' 2>/dev/null) || _E11_REFUSALS=0
+    case "$_E11_REFUSALS" in ''|*[!0-9]*) _E11_REFUSALS=0 ;; esac
+    _E11_REFUSALS=$((_E11_REFUSALS + 1))
+    _E11_REASON="VERDICT: FAIL (gate guard, diff-size cap E11 — refusal $_E11_REFUSALS of 3 for this bead; no reviewer was spawned)
 O diff de $BRANCH contra origin/main tem $_E11_COUNT linhas de codigo de PRODUCAO (testes, fixtures, arquivos gerados, lockfiles e .md nao contam); o teto por submissao e $_E11_CAP.
 Diff grande reprova na primeira tentativa bem mais (13% de aprovacao acima de 1500 linhas, contra 55-80% abaixo de 500): o revisor nao cobre tudo numa passada.
-Divida em fatias, cada uma com o seu proprio marker (/gate-done): uma branch por fatia, cada uma abaixo do teto e citando o bead da fatia nos commits.
-Se o diff e grande por natureza (renome ou migracao mecanica), ponha o label gate:size-exempt no bead ($BEAD_ID) e comente o MOTIVO: um comentario que COMECE com gate:size-exempt: seguido do motivo (15+ caracteres). Depois rode /gate-done de novo.
-Marker set to gate-status:error (fixable + re-submittable, not lost)." 2>/dev/null || true
-    log "SUPPRESSED PUSH (wa-uthi non-terminal): diff-size cap (E11) refused $MARKER_ID (gate-status:error)."
+O QUE FAZER: dividir em fatias, cada uma com o seu proprio marker (/gate-done): uma branch por fatia, cada uma abaixo do teto, citando o bead da fatia nos commits. Nao reenvie a mesma branch inteira.
+Se o diff e grande por natureza (renome ou migracao mecanica), ponha o label gate:size-exempt no bead $BEAD_ID e comente o MOTIVO (um comentario que COMECE com gate:size-exempt: seguido do motivo), depois reenvie.
+Marker $MARKER_ID fechado (recusado na submissao). Este bead ficou com gate:needs-fix e sem gate:queued: o Pilot despacha o conserto."
+    bd -C "$BEAD_CITY" label remove "$BEAD_ID" gate:queued 2>/dev/null || true
+    bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-fix,gate:e11-refusals:$_E11_REFUSALS" 2>/dev/null || true
+    bd -C "$BEAD_CITY" comment "$BEAD_ID" "$_E11_REASON" 2>/dev/null || true
+    if [ "$_E11_REFUSALS" -ge 3 ]; then
+      bd -C "$BEAD_CITY" label add "$BEAD_ID" gate:needs-human 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" gate:needs-fix 2>/dev/null || true
+      gc --city "$GC_CITY" mail send mayor -s "Gate E11: $BEAD_ID recusado 3x por tamanho — precisa de humano" \
+        -m "$BEAD_ID (branch $BRANCH) foi recusado na submissao pela 3a vez: $_E11_COUNT linhas de producao > teto $_E11_CAP. Ficou com gate:needs-human (gate:needs-fix removido); o Pilot nao redespacha. Decida: fatiar voce mesmo, ou gate:size-exempt com motivo no bead." 2>/dev/null \
+        || warn "E11-DIFF-CAP: could not mail the mayor about the 3rd refusal of $BEAD_ID — the bead carries gate:needs-human"
+    fi
+    _E11_AUTHOR=$(printf '%s' "$BRANCH" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')
+    if [ -n "$_E11_AUTHOR" ]; then
+      _E11_MAILED=0
+      for _e11_to in "$_E11_AUTHOR" "${_E11_AUTHOR}-${BEAD_ID%%-*}"; do
+        if gc --city "$GC_CITY" mail send "$_e11_to" -s "Gate recusou $BEAD_ID na submissao: $_E11_COUNT linhas de producao > teto $_E11_CAP (E11)" -m "$_E11_REASON" >/dev/null 2>&1; then _E11_MAILED=1; break; fi
+      done
+      [ "$_E11_MAILED" = "1" ] || log "E11-DIFF-CAP: no author mail delivered for $BEAD_ID (candidates: $_E11_AUTHOR, ${_E11_AUTHOR}-${BEAD_ID%%-*}) — the bead carries gate:needs-fix and the reason; the Pilot routes it"
+    fi
+    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: diff-size cap (ga-lzidpo / E11). $_E11_COUNT production lines on $BRANCH vs origin/main > cap $_E11_CAP. Marker closed; the reason and gate:needs-fix are on the source bead $BEAD_ID (refusal $_E11_REFUSALS of 3)." 2>/dev/null || true
+    if bd -C "$GC_CITY" close "$MARKER_ID" -r "refused at submission by the gate guard: diff-size cap E11 ($_E11_COUNT > $_E11_CAP production lines); source bead $BEAD_ID carries gate:needs-fix and the reason" >/dev/null 2>&1 \
+       && [ "$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null)" = "closed" ]; then
+      set_gate_status "$MARKER_ID" "failed"
+      log "E11-DIFF-CAP refused: marker $MARKER_ID CLOSED (verified, gate-status:failed); source $BEAD_ID -> gate:needs-fix (refusal $_E11_REFUSALS/3); refusal label persisted=$_E11_LBL_OK"
+    else
+      set_gate_status "$MARKER_ID" "error"
+      warn "E11-DIFF-CAP refused: marker $MARKER_ID close NOT verified — left in gate-status:error; gate-recovery-watchdog closes it (close:guard-refused) after its error grace if the refusal label stuck (persisted=$_E11_LBL_OK), else it will requeue it — a human should look"
+    fi
+    log "SUPPRESSED PUSH (wa-uthi non-terminal): diff-size cap (E11) refused $MARKER_ID."
     exit 1
   fi
 else

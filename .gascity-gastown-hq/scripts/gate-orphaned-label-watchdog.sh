@@ -298,7 +298,11 @@ GOLW_STORES="${GOLW_STORES:-$HQ /Users/athos/gt/whatsapp_automation /Users/athos
 # closing beads and pruning branches, 2026-08-08 04:50). Checked before
 # removing the signal, because a detector deleted on the assumption that
 # something else covers it is how a gap opens silently.
-GOLW_EXCLUDE_LABEL_PREFIXES="${GOLW_EXCLUDE_LABEL_PREFIXES:-gate:prod-deploy: gate:passed}"
+# ga-ufskhy (2026-10-07): + gate:nonblocking-findings — stamped by the dispatcher at PASS when the
+# reviewers left non-blocking findings (carried into the PASS comment). Like gate:passed it is a
+# terminal-success state in which having no active marker is CORRECT; without this entry every
+# PASS-with-findings bead would alert here until it closes.
+GOLW_EXCLUDE_LABEL_PREFIXES="${GOLW_EXCLUDE_LABEL_PREFIXES:-gate:prod-deploy: gate:passed gate:nonblocking-findings}"
 
 LOG="${GOLW_LOG:-$HQ/.gc/logs/gate-orphaned-label-watchdog.log}"
 NOTIFY_BIN="${GOLW_NOTIFY_BIN:-/Users/athos/.local/bin/notify}"

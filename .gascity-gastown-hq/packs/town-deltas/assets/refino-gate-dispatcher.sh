@@ -644,7 +644,10 @@ fi
 
 # ── Step 1: Find queued stories (refined, awaiting refino-gate) ───────────────
 # Eligible = story:refino-review, NOT already being reviewed, NOT escalated, and
-# NOT already promoted. FIFO by creation: oldest refined story first.
+# NOT already promoted. WHICH of them is reviewed first is decided below, by the
+# town's work order (ga-9t9acg.9), not here.
+# --limit 0 = the WHOLE queue: the order is applied to it, and a window bd cut
+# first (bd list returns 50 by default) could leave a new P0 story out of the list.
 QUEUE_JSON="[]"
 for _s in $REFINO_GATE_STORES; do
   [ -d "$_s" ] || continue
@@ -652,6 +655,7 @@ for _s in $REFINO_GATE_STORES; do
     --exclude-label refino-gate:reviewing \
     --exclude-label story:needs-approval \
     --exclude-label story:approved \
+    --limit 0 \
     --json 2>/dev/null || echo "[]")
   QUEUE_JSON=$(printf '%s\n%s' "$QUEUE_JSON" "$_q" | jq -s 'add // []' 2>/dev/null || echo "$QUEUE_JSON")
 done
@@ -663,9 +667,43 @@ if [ "$QCOUNT" -eq 0 ] 2>/dev/null; then
 fi
 log "$QCOUNT story(ies) awaiting refino-gate."
 
-# Oldest-first (FIFO). One story per sweep keeps Dolt load gentle and mirrors the
-# code gate's one-marker-per-sweep cadence; the launchd interval drains the rest.
-STORY=$(echo "$QUEUE_JSON" | jq -c 'sort_by(.created_at // .id) | .[0]')
+# Which story first (ga-9t9acg.9, epic ga-9t9acg): the town's ONE work order — priority
+# P0..P4, then type (feature first), then age (oldest first) — from scripts/work-order.sh,
+# the library every pick-point shares (Athos, 2026-10-06). It replaces plain FIFO by
+# created_at, under which a P0 story refined today waited behind every older P2 one.
+# AGE = created_at (--age created). Nothing records when a story entered this stage (the
+# refiner adds story:refino-review and stamps no date), so the age in the stage is not
+# available and created_at is the only age there is. A stage marker (--age field) would
+# need auto-refino-dispatcher.sh (R9) to stamp it where it adds the label: not this slice.
+# The stores were UNIONED above and are SORTED once here; only then is one story taken.
+# CANNOT TELL is not "empty queue": library missing/unreadable, work_order_sort exit != 0 or
+# empty output, or work_order_head refusing what it was given. The sweep then keeps the
+# GATHERED order (stores as listed, as bd returned them) with a WARN, and still reviews the
+# first story: an order that could not be computed never reads as "nothing to review". The
+# library's own stderr (a WARN per story whose priority/type/age it cannot read — kept at
+# the end of its class, never dropped — and an ERROR that says why it cannot tell) goes to
+# this log, never to /dev/null: those lines are the only signal.
+# One story per sweep keeps Dolt load gentle and mirrors the code gate's one-marker-per-
+# sweep cadence; the launchd interval drains the rest.
+_REFINO_WO_SIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/work-order.sh"
+if [ -r "$_REFINO_WO_SIB" ]; then
+  source "$_REFINO_WO_SIB" || warn "ga-9t9acg.9: $_REFINO_WO_SIB failed to load"
+fi
+unset _REFINO_WO_SIB
+_wo_why=""
+_wo_sorted=""
+STORY=""
+if ! type work_order_sort >/dev/null 2>&1 || ! type work_order_head >/dev/null 2>&1; then
+  _wo_why="the work-order library (scripts/work-order.sh next to this script) is not loaded"
+elif ! _wo_sorted=$(printf '%s' "$QUEUE_JSON" | work_order_sort --age created 2>>"$LOG") || [ -z "$_wo_sorted" ]; then
+  _wo_why="work_order_sort could not order the queue (exit != 0 or empty output; its own line in this log says why)"
+elif ! STORY=$(printf '%s' "$_wo_sorted" | work_order_head 2>>"$LOG") || [ -z "$STORY" ] || [ "$STORY" = "null" ]; then
+  _wo_why="work_order_head could not take the first story of the ordered queue"
+fi
+if [ -n "$_wo_why" ]; then
+  warn "ga-9t9acg.9: $_wo_why — cannot tell the order, so this sweep keeps the GATHERED order (stores as listed, as bd returned them). This is NOT an empty queue: the $QCOUNT story(ies) awaiting review are still reviewed, one per sweep."
+  STORY=$(echo "$QUEUE_JSON" | jq -c '.[0]')
+fi
 STORY_ID=$(echo "$STORY" | jq -r '.id')
 STORY_TITLE=$(echo "$STORY" | jq -r '.title // ""')
 log "Selected story for review: $STORY_ID — $STORY_TITLE"

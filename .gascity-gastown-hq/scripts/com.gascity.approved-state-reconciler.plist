@@ -19,6 +19,8 @@
        ROUTING SIGNALS (LABELS ONLY — review fix 95726bf9b; keywords NEVER auto-route):
          • needs-device: label story:needs-device
          • needs-human:  label gate:needs-human* (prefix) or story:needs-human
+                         (lands on story:needs-human only for gate:needs-human:product;
+                          any other gate variant → next-action:mayor — ga-gm5rv5)
          • blocked:      label blocked / story:blocked
          • post-build:   gate:passed present → remove story:approved only (delivery owns it)
        Title/body KEYWORDS (warming, aquecimento, celular, on-device, etc.) do NOT route —

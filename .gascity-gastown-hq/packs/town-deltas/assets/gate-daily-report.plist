@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.gascity.gate-daily-report</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/gate-daily-report.py</string>
+		<string>--post</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>GC_CITY_PATH</key>
+		<string>/Users/athos/gt/.gascity-gastown-hq</string>
+		<key>HOME</key>
+		<string>/Users/athos</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>9</integer>
+		<key>Minute</key>
+		<integer>3</integer>
+	</dict>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardOutPath</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-daily-report-launchd.out</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/gate-daily-report-launchd.err</string>
+</dict>
+</plist>

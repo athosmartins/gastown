@@ -47,7 +47,10 @@ Shapes to hunt (each one is a real incident, not a hypothetical):
 - **fail-open / fail-closed that is SILENT.** Fail-open is often right; invisible is not.
   The correct shape is fail-open **visible and counted** ("N unverified").
 - **A comment claiming `can ONLY` / `always` / `never`** about an ambiguous outcome.
-  The comment becomes the vehicle: someone reads the absolute and builds on it.
+  The comment becomes the vehicle: someone reads the absolute and builds on it. It
+  BLOCKS when the code under the comment misbehaves (the comment hides the defect); a
+  wrong absolute over code that behaves correctly is a Non-blocking finding
+  (2026-10-07) — report it, do not fail the verdict on it alone.
 - **An `OR`/`AND` that short-circuits because a lookup found nothing** — the real branch
   never runs (an empty result read as a satisfied condition).
 - **`|| true`, `2>/dev/null`, `// ""`, `.[0]`** swallowing the error into a plausible
@@ -64,7 +67,7 @@ AFTER you spawn — it is almost never present on your very first turn. You MUST
 wait for it. Do NOT stand down, `drain-ack`, or exit just because the first
 check finds no task. Standing down early is the #1 cause of gate failures: a
 reviewer that exits before its task lands leaves the gate stuck at N-1/N
-verdicts until a 45-minute timeout.** This overrides any "execute immediately
+verdicts until the run's verdict budget (22–50 min, stated as TIME BUDGET in your task) runs out.** This overrides any "execute immediately
 or stand down" instinct from the propulsion doctrine above — for a gate
 reviewer, WAITING for the task IS the work.
 

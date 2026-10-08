@@ -327,11 +327,40 @@ unset _PILOT_QHC_SIB
 # IFF:
 #     (gate is CONGESTED: gate-status:queued markers > 0 OR gate-runs in review > 0)
 #   AND
-#     (resources are CONTENDED: Claude quota limited OR Dolt hot)
-# Resources ABUNDANT (quota OK AND Dolt calm) → never defer (dispatch even with a
-# busy gate). Gate empty → never defer. This conditionality is the anti-starvation
-# guarantee: the moment Dolt calms or the quota frees, the Pilot dispatches again,
-# so it can never be starved indefinitely.
+#     (resources are CONTENDED: Claude quota limited OR Dolt hot OR machine memory tight)
+# Resources ABUNDANT (quota OK AND Dolt calm AND memory not tight) → never defer
+# (dispatch even with a busy gate). Gate empty → never defer. This conditionality is
+# the anti-starvation guarantee: the moment Dolt calms or the quota frees, the Pilot
+# dispatches again. The memory arm is weaker on its own: swap USED is sticky on macOS
+# (it does not fall when the pressure eases), so that arm can keep reading tight for a
+# long while — what keeps the Pilot from being starved indefinitely is the Gate-has-work
+# conjunct (the Gate's reviewers do not wait for the Pilot, so the queue drains unless the
+# Gate's OWN brakes — pressure 4, swap that cannot grow — hold it; an empty Gate releases
+# the Pilot at once) plus the PILOT_MEMORY_TIGHT_ENABLED=0 kill switch, NOT the memory
+# easing.
+#
+# ga-9e446u — the third arm, MACHINE memory. Quota and Dolt both bound the stages' own
+# load; neither says whether the MACHINE has room for one more live Claude session
+# (the Gate's reviewers and the Pilot's wa-workers are all sessions on the same RAM).
+# With Dolt calm and the Gate backed up behind 8.2 GB of swap, "resources tight" read
+# false, the Pilot kept opening workers and the Gate starved — the Mayor faked the
+# signal with PILOT_DOLT_CPU_MAX=120 in the plist. The arm is tight iff ANY of:
+#   - kernel memory pressure is 4 (critical)            — the gate's own block signal
+#   - free swap < PILOT_SWAP_FREE_FLOOR_MB AND disk free < PILOT_SWAP_GROW_DISK_MIN_MB
+#                                                       — the gate's own block signal
+#                                                         (swap that cannot grow, ga-q4fkxa)
+#   - swap USED > PILOT_SWAP_USED_MAX_MB                — the Pilot-side ceiling
+# Level 2 and a low free-swap reading ALONE never count: macOS grows swapfiles on demand
+# and level 2 cleared by itself in the 25/09 incident (ga-q4fkxa). The used-swap ceiling
+# is the one signal the Gate does not block on; it sits between the measured healthy
+# level (4.9 GB) and the measured starving one (8.2 GB), is cheap to re-tune
+# (PILOT_SWAP_USED_MAX_MB) and cannot starve the Pilot indefinitely: it only bites while
+# the Gate has work, and a Gate that drains releases it (see the note above on why the
+# memory easing itself is NOT what releases it). Every probe is FAIL-OPEN (an unreadable
+# reading is no signal, never a block) but never SILENT: a sweep whose probe was blind
+# logs one "Memory signal UNREADABLE" line naming the readings it could not take, so
+# "mem_tight=0" cannot be mistaken for "the machine is fine". PILOT_MEMORY_TIGHT_ENABLED=0
+# takes the arm out of the predicate entirely (and logs nothing: off is not blind).
 #
 # Gated behind CROSS_STAGE_PRIORITY_ENABLED (default 1; =0 → EXACT current
 # behavior, the gate never even probes). FAIL-OPEN: any error / indeterminate
@@ -342,6 +371,20 @@ unset _PILOT_QHC_SIB
 # real bead store. Never set in prod.
 CROSS_STAGE_PRIORITY_ENABLED="${CROSS_STAGE_PRIORITY_ENABLED:-1}"
 PILOT_GATE_CONGESTED_OVERRIDE="${PILOT_GATE_CONGESTED_OVERRIDE:-}"
+# ga-9e446u: the machine-memory arm of the resource-tight predicate (see header above).
+# The four *_OVERRIDE* values are TEST-ONLY seams (no live sysctl/df), mirroring the
+# gate's GATE_SWAP_FREE_OVERRIDE_MB family. Never set in prod.
+PILOT_MEMORY_TIGHT_ENABLED="${PILOT_MEMORY_TIGHT_ENABLED:-1}"
+PILOT_SWAP_USED_MAX_MB="${PILOT_SWAP_USED_MAX_MB:-7168}"
+PILOT_SWAP_FREE_FLOOR_MB="${PILOT_SWAP_FREE_FLOOR_MB:-512}"
+PILOT_SWAP_GROW_DISK_MIN_MB="${PILOT_SWAP_GROW_DISK_MIN_MB:-4096}"
+case "$PILOT_SWAP_USED_MAX_MB"      in ''|*[!0-9]*) PILOT_SWAP_USED_MAX_MB=7168 ;; esac
+case "$PILOT_SWAP_FREE_FLOOR_MB"    in ''|*[!0-9]*) PILOT_SWAP_FREE_FLOOR_MB=512 ;; esac
+case "$PILOT_SWAP_GROW_DISK_MIN_MB" in ''|*[!0-9]*) PILOT_SWAP_GROW_DISK_MIN_MB=4096 ;; esac
+PILOT_SWAP_USED_OVERRIDE_MB="${PILOT_SWAP_USED_OVERRIDE_MB:-}"
+PILOT_SWAP_FREE_OVERRIDE_MB="${PILOT_SWAP_FREE_OVERRIDE_MB:-}"
+PILOT_DISK_FREE_OVERRIDE_MB="${PILOT_DISK_FREE_OVERRIDE_MB:-}"
+PILOT_KERN_PRESSURE_OVERRIDE="${PILOT_KERN_PRESSURE_OVERRIDE:-}"
 
 # ── Stale in-flight slot correction (ga-rk5va adversarial constraint c) ────────
 # A story:in-flight bead normally occupies a builder slot. But a session can hang
@@ -2300,6 +2343,75 @@ _pilot_gate_congested() {
   printf '0'; return 0
 }
 
+# ── ga-9e446u: machine-memory arm of the cross-stage resource-tight predicate ──
+# _pilot_swap_field <used|free> → integer MB from `sysctl vm.swapusage`, or "" when
+# unreadable. macOS-only host fleet, so no cross-platform fallback. Duplicated from the
+# gate's gate_swap_free_mb (+ the "used" half) rather than shared, per this file's
+# convention for the pilot/gate readers. Fail-soft: a missing sysctl, a failed pipeline
+# or an unparseable line is "" — never a wrong number (`|| _v=""` because of set -e/pipefail).
+_pilot_swap_field() {
+  local _v=""
+  _v=$(sysctl -n vm.swapusage 2>/dev/null | sed -n "s/.*$1 *= *\\([0-9.]*\\)M.*/\\1/p") || _v=""
+  [ -n "$_v" ] || { printf ''; return 0; }
+  awk -v v="$_v" 'BEGIN{printf "%d", v}' 2>/dev/null || printf ''
+  return 0
+}
+
+# _pilot_memory_tight — return 0 (tight) / 1 (not tight). Sets PILOT_MEM_TIGHT_REASON
+# ("" | "pressure-4" | "swap-used" | "swap-exhausted", joined with "+" when several fire),
+# PILOT_MEM_TIGHT_DETAIL (the readings, for the log line) and PILOT_MEM_TIGHT_BLIND (the
+# readings it could NOT take, comma-joined from swap_used,swap_free,pressure; "" = all taken).
+# Called DIRECTLY, never in $(...), so the globals survive — the same shape as
+# _dolt_saturated/DOLT_SAT_REASON.
+# FAIL-OPEN: every reading that is empty or non-numeric is no signal, so a blind probe
+# can never wedge the Pilot (the opposite of _dolt_saturated on purpose: an unreadable
+# sysctl says nothing about the machine, where a blind Dolt probe usually means Dolt IS
+# the problem). Fail-open is NOT silent, though: a "not tight" returned from a blind probe
+# means UNKNOWN, not "fine", and PILOT_MEM_TIGHT_BLIND is how the caller tells the two apart
+# (ga-9e446u gate round 1 — without it a macOS sysctl-format change would turn the whole arm
+# into a no-op with no trace). PILOT_MEMORY_TIGHT_ENABLED=0 → never tight, nothing probed,
+# blind list empty (off is not blind). The thresholds and why level 2 / low free swap alone
+# never count are in the cross-stage header above.
+_pilot_memory_tight() {
+  PILOT_MEM_TIGHT_REASON=""
+  PILOT_MEM_TIGHT_DETAIL=""
+  PILOT_MEM_TIGHT_BLIND=""
+  [ "$PILOT_MEMORY_TIGHT_ENABLED" = "1" ] || return 1
+  local _used _free _lvl _disk="" _reason=""
+  _used="$PILOT_SWAP_USED_OVERRIDE_MB"; [ -n "$_used" ] || _used="$(_pilot_swap_field used)"
+  _free="$PILOT_SWAP_FREE_OVERRIDE_MB"; [ -n "$_free" ] || _free="$(_pilot_swap_field free)"
+  _lvl="$PILOT_KERN_PRESSURE_OVERRIDE"
+  if [ -z "$_lvl" ]; then _lvl=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) || _lvl=""; fi
+  case "$_used" in ''|*[!0-9]*) _used="" ;; esac
+  case "$_free" in ''|*[!0-9]*) _free="" ;; esac
+  case "$_lvl" in 1|2|4) ;; *) _lvl="" ;; esac
+  # vazio/ilegível (a reading that is empty, non-numeric or not a kernel level, normalised to "" above)
+  # → it is named in PILOT_MEM_TIGHT_BLIND and contributes no signal (fail-open); a readable value —
+  # including 0 — is a reading and is never named. disk_free is not listed: it is read only when free
+  # swap is already low, so "n/a" there is by design, not blindness.
+  [ -n "$_used" ] || PILOT_MEM_TIGHT_BLIND="swap_used"
+  [ -n "$_free" ] || PILOT_MEM_TIGHT_BLIND="${PILOT_MEM_TIGHT_BLIND:+$PILOT_MEM_TIGHT_BLIND,}swap_free"
+  [ -n "$_lvl" ]  || PILOT_MEM_TIGHT_BLIND="${PILOT_MEM_TIGHT_BLIND:+$PILOT_MEM_TIGHT_BLIND,}pressure"
+  if [ "$_lvl" = "4" ]; then _reason="pressure-4"; fi
+  if [ -n "$_used" ] && [ "$_used" -gt "$PILOT_SWAP_USED_MAX_MB" ]; then
+    _reason="${_reason:+$_reason+}swap-used"
+  fi
+  # Free swap only means "no room" when the swapfiles also cannot grow (disk full). The
+  # disk is read only when free swap is already low — df is the one probe worth skipping.
+  if [ -n "$_free" ] && [ "$_free" -lt "$PILOT_SWAP_FREE_FLOOR_MB" ]; then
+    _disk="$PILOT_DISK_FREE_OVERRIDE_MB"
+    if [ -z "$_disk" ]; then _disk=$(df -Pm /private/var/vm 2>/dev/null | awk 'NR==2 {print $4}') || _disk=""; fi
+    case "$_disk" in ''|*[!0-9]*) _disk="" ;; esac
+    if [ -n "$_disk" ] && [ "$_disk" -lt "$PILOT_SWAP_GROW_DISK_MIN_MB" ]; then
+      _reason="${_reason:+$_reason+}swap-exhausted"
+    fi
+  fi
+  PILOT_MEM_TIGHT_DETAIL="swap_used=${_used:-?}MB swap_free=${_free:-?}MB disk_free=${_disk:-n/a}MB pressure=${_lvl:-?}"
+  PILOT_MEM_TIGHT_REASON="$_reason"
+  [ -n "$_reason" ] && return 0
+  return 1
+}
+
 # ── wa-u5r1: candidate-filter helpers + dispatchable-queue emit (relocated up) ─
 # These pure helper/emit definitions were moved ABOVE the early-exit gates (quota
 # pause, cross-stage defer, both-lanes-full) so the dispatchable-queue emit can run
@@ -3911,6 +4023,27 @@ _filter_candidates() {
       | [$id, ($reasons | join(";"))] | @tsv
     ' 2>/dev/null | _log_exclusions "_filter_candidates"
 
+  # ga-kqa08j: GATE FOCUS MODE — while the gate is the bottleneck (gate-focus-mode.sh
+  # (Athos 07/10, 2nd decision: an auto-healer bead (origem:auto-healer-notify) and a live-damage
+  # bug (impacto:dano-ao-vivo) also count as fixes — a production breakage is not "new work".)
+  # decided it, read once per sweep into PILOT_GATE_FOCUS), only a FIX of something the
+  # gate already rejected may be dispatched: gate:needs-fix, or gate:fix-attempt:N (five
+  # gate paths remove needs-fix but keep fix-attempt, ga-ltjdx). A new build waits until
+  # the queue drains. Applied here because every tier/top-up list passes through this
+  # function; the painel emit ran before PILOT_GATE_FOCUS was set, so it still shows the
+  # real queue.
+  if [ "${PILOT_GATE_FOCUS:-0}" = "1" ]; then
+    local _cf_focus
+    if _cf_focus=$(printf '%s' "$_cf_out" | jq -c '[.[] | select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo"))]' 2>/dev/null); then
+      _cf_out="$_cf_focus"
+    else
+      # Could not apply the filter: dispatch nothing from this list rather than let new
+      # builds through a mode that exists to stop them.
+      _cf_out="[]"
+      log "WARN: gate focus filter could not be applied to this candidate list — dispatching nothing from it this sweep (could-not-filter, not 'no fixes'; ga-kqa08j)" >&2
+    fi
+  fi
+
   printf '%s' "$_cf_out"
 }
 # ── parking-label pre-filter (upstream of dispatch, additive to ga-zzrts) ─────
@@ -4798,6 +4931,13 @@ _filter_built() {
 # Written EVEN WHEN ZERO ({...,"count":0,"items":[]}) so the painel can tell
 # "empty queue" (system correctly out of work) from "file stale/missing" (don't
 # trust it). Written ATOMICALLY (tmp + mv) so a reader never sees a partial file.
+# ORDER (ga-9t9acg.3): items[] is in the shared work-order rule's order — priority, then feature before
+# the rest, then oldest first (scripts/work-order.sh) — so index 0 is the bead that rule serves first.
+# That is what the painel and approved-state-reconciler.py (_pilot_queue_position) print as "position".
+# It equals what the dispatcher actually serves only once ga-9t9acg.2 moves _top_candidate onto the same
+# rule; until then the dispatcher still picks bug-first/newest-first (_PILOT_SORT_JQ). If the library
+# cannot order the queue the file is NOT rewritten (see _pilot_emit_dispatchable): an old file, never a
+# wrongly-ordered fresh one.
 #
 # Env-gated PILOT_EMIT_DISPATCHABLE (default 1). FAIL-OPEN by construction: the
 # whole body is wrapped so ANY error logs a warning and returns 0 — a failed emit
@@ -4868,6 +5008,31 @@ _pilot_write_sweep_pause_state() {
 }
 # SELFTEST-EXTRACT pilot-write-sweep-pause-state: END
 
+# ga-9t9acg.3: the ORDER of the queue emitted below is the ONE shared rule (priority > type, feature
+# first > age, oldest first; Athos 2026-10-06, programa ga-9t9acg), implemented once in
+# scripts/work-order.sh — this file carries no sort of its own for it (the registry lint,
+# scripts/work_order.py lint, flags a one-line sort_by/--sort/--limit of the shapes it knows if one comes
+# back; it does NOT see one hidden behind a helper or a variable — see its header). Sourced like the other siblings: next to THIS
+# script (BASH_SOURCE), never a static path; stderr of the source itself is NOT silenced (a corrupt
+# sibling is a deploy fault, so it should be loud). A missing/unreadable library is not fatal: the emit
+# below then answers "cannot tell" (work_order_sort undefined -> empty output) and keeps the PREVIOUS
+# file, so the damage is one WARN per sweep, never a silently wrong order.
+# Age = created_at. The emitted queue has no stage marker of its own (it is every approved bead of
+# every store, not "time in a stage"), and the Pilot's answer to a bead reclaimed again and again is the
+# reclaim cap in _filter_candidates, which takes it OUT of the pool rather than re-ranking it — so the
+# "reclaim" age of the lib is not needed here. ga-9t9acg.2 (_top_candidate) must pass this SAME constant
+# to the lib: the position the painel shows is only true if the dispatcher serves the same order.
+# SELFTEST-EXTRACT work-order-source: BEGIN
+_PILOT_WORK_ORDER_AGE="created"
+_GC_WO_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/work-order.sh"
+if [ -r "$_GC_WO_SIBLING" ]; then
+  source "$_GC_WO_SIBLING"
+else
+  warn "ga-9t9acg.3: work-order.sh missing/unreadable ($_GC_WO_SIBLING) — the dispatchable-queue emit cannot order the queue and keeps its PREVIOUS file untouched (stale after PILOT_DISPATCHABLE_TTL) until it is restored."
+fi
+unset _GC_WO_SIBLING
+# SELFTEST-EXTRACT work-order-source: END
+
 # _emit_query_one <db_dir> <store_label> — print the fully-filtered eligible
 # candidate array for ONE store, with a "store" field stamped on each item.
 # Mirrors the Tier-1 (bug + tech-debt), Tier-2 (story:approved) and optional
@@ -4931,7 +5096,7 @@ _pilot_emit_dispatchable() {
   PILOT_EMITTED_DONE=1
   # Everything below is best-effort; a failure must never break the sweep.
   {
-    local _all _rig_paths _rp _items _count _now _tmp _dir _rig_json
+    local _all _rig_paths _rp _items _count _now _tmp _dir _rig_json _ordered _wo_err _wo_ok _wo_line
     _all=$(_emit_query_one "$GC_CITY" "hq" 2>/dev/null || echo "[]")
     # Union every non-HQ rig store too (the eligible queue spans all stores).
     # ga-07rb3: best-effort telemetry emission (see the block's own header) —
@@ -4951,10 +5116,39 @@ _pilot_emit_dispatchable() {
       _all=$(echo "$_all $_r" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$_all")
     done <<< "$_rig_paths"
 
-    # Project to the painel contract shape + stable order (priority, created_at, id).
-    _items=$(echo "$_all" | jq '
-        sort_by([ (.priority // 99), (.created_at // ""), (.id // "") ])
-        | [ .[] | {
+    # Order by the ONE shared rule, then project to the painel contract shape. (ga-9t9acg.3: this was
+    # `sort_by([priority, created_at, id])` — oldest-first with NO type tier — while _top_candidate served
+    # bug-first/newest-first, so the "position" the painel and approved-state-reconciler.py print was the
+    # order of nothing. Age: see _PILOT_WORK_ORDER_AGE. The projection below only picks fields.)
+    # THREE states (work-order.sh header): ordered (exit 0; `[]` stays `[]`); an illegible field (the bead
+    # STAYS, at the end of its class, one `work-order WARN:` line on stderr); cannot tell (empty stdout,
+    # exit != 0). This whole body runs under `2>/dev/null`, which would swallow exactly those lines — the
+    # library's ONLY signal for an illegible field — so the call's stderr goes to a file of its own and is
+    # re-logged through warn() (stdout), where the log keeps it.
+    # Cannot tell -> write NOTHING: the previous file keeps the order it was written with and goes stale
+    # after PILOT_DISPATCHABLE_TTL, which approved-state-reconciler.py, imparavel-check.py and pool-ceiling.sh
+    # already read as "do not trust" (the painel contract above says the same). A fresh `count 0` or a fresh
+    # unordered list would be a lie with a current timestamp: "I do not know" is not "empty".
+    _dir=$(dirname "$PILOT_DISPATCHABLE_FILE")
+    mkdir -p "$_dir" 2>/dev/null || true
+    _wo_err="${PILOT_DISPATCHABLE_FILE}.order-err.$$"
+    _ordered=""
+    _wo_ok=1
+    if ! _ordered=$(printf '%s' "$_all" | work_order_sort --age "$_PILOT_WORK_ORDER_AGE" 2>"$_wo_err") || [ -z "$_ordered" ]; then
+      _wo_ok=0
+    fi
+    if [ -r "$_wo_err" ]; then
+      while IFS= read -r _wo_line; do
+        if [ -n "$_wo_line" ]; then warn "ga-9t9acg.3: $_wo_line"; fi
+      done < "$_wo_err"
+    fi
+    rm -f "$_wo_err" 2>/dev/null || true
+    if [ "$_wo_ok" != "1" ]; then
+      warn "ga-9t9acg.3: work_order_sort could not order the dispatchable queue (library missing, exit != 0 or empty output; reason above if it said one) — NOT writing $PILOT_DISPATCHABLE_FILE: the previous file keeps its order and goes stale after ${PILOT_DISPATCHABLE_TTL}s, because \"cannot tell\" is not \"empty queue\"."
+      return 0
+    fi
+    _items=$(printf '%s' "$_ordered" | jq '
+        [ .[] | {
             id:         .id,
             title:      (.title // .description // "(sem título)"),
             type:       ((.issue_type // .type // "task")),
@@ -4963,13 +5157,14 @@ _pilot_emit_dispatchable() {
             created_at: (.created_at // ""),
             assignee:   ((.assignee // "") | tostring),
             store:      (._emit_store // "hq")
-          } ]' 2>/dev/null || echo "[]")
-    [ -z "$_items" ] && _items="[]"
+          } ]' 2>/dev/null) || _items=""
+    if [ -z "$_items" ]; then
+      warn "ga-9t9acg.3: could not project the ordered dispatchable queue to the painel contract (jq failed) — NOT writing $PILOT_DISPATCHABLE_FILE; the previous file stays (wa-u5r1, fail-open)."
+      return 0
+    fi
     _count=$(echo "$_items" | jq 'length' 2>/dev/null || echo "0")
     _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-    _dir=$(dirname "$PILOT_DISPATCHABLE_FILE")
-    mkdir -p "$_dir" 2>/dev/null || true
     _tmp="${PILOT_DISPATCHABLE_FILE}.tmp.$$"
     if jq -n --arg gen "$_now" --argjson ttl "$PILOT_DISPATCHABLE_TTL" \
          --argjson count "$_count" --argjson items "$_items" \
@@ -5091,7 +5286,7 @@ fi
 # freely (parallel — the pools differ). DEFER this sweep (dispatch nothing, mutate
 # no marker — identical shape to the quota PAUSE above) IFF:
 #       gate is CONGESTED  (queued markers > 0 OR runs in review > 0)
-#   AND resources CONTENDED (Claude quota limited OR Dolt hot)
+#   AND resources CONTENDED (Claude quota limited OR Dolt hot OR machine memory tight — ga-9e446u)
 #
 # Note on the quota arm: the quota PAUSE above already exited the sweep when the
 # 5h window is exhausted, so reaching HERE means quota is OK. The resource-contended
@@ -5102,15 +5297,27 @@ fi
 #
 # Anti-starvation: the defer is CONDITIONAL on (gate-has-work AND resource-tight).
 # It NEVER fires when resources are abundant, so the moment Dolt calms (or the
-# quota frees) the Pilot dispatches — it can never be starved indefinitely. Gate
-# empty → never defer. FAIL-OPEN: _pilot_gate_congested returns "0" on any error.
+# quota frees) the Pilot dispatches. The memory arm does not release that fast (swap
+# USED is sticky on macOS): there the release is the Gate emptying, which it does on its
+# own, or the PILOT_MEMORY_TIGHT_ENABLED=0 kill switch. Gate empty → never defer.
+# FAIL-OPEN: _pilot_gate_congested returns "0" on any error.
 # Gated behind CROSS_STAGE_PRIORITY_ENABLED (=0 → this whole block is skipped =
 # exact pre-ga-d0hz3 behavior).
 if [ "$CROSS_STAGE_PRIORITY_ENABLED" = "1" ]; then
   _xstage_quota_limited="$(_pilot_quota_limited)"          # "1"/"0" (fail-open "0")
   _xstage_dolt_hot="${PILOT_DOLT_SATURATED_AT_START:-0}"   # "1"/"0" (fail-safe "1")
+  # ga-9e446u: the machine-memory arm. Dolt calm + quota OK says nothing about whether the
+  # box has RAM for another session; 8.2 GB of swap with the Gate backed up starved it.
+  _xstage_mem_tight=0
+  if _pilot_memory_tight; then _xstage_mem_tight=1; fi
+  # A blind memory probe fails OPEN (mem_tight stays 0, dispatch proceeds) but must not look like
+  # "confirmed fine": this line is what tells them apart in the log. Same shape as the RAM-pressure /
+  # drain-window / quiet-hours UNREADABLE lines above (ga-m2gqb / ga-a2v0bz / ga-dxyvxr).
+  if [ -n "${PILOT_MEM_TIGHT_BLIND:-}" ]; then
+    log "Memory signal UNREADABLE (${PILOT_MEM_TIGHT_BLIND}) — fail-open: the memory arm decided on the readings it COULD take (mem_tight=${_xstage_mem_tight}); a 0 here means UNKNOWN for the rest, not 'the machine is fine' (ga-9e446u)."
+  fi
   _xstage_resource_tight=0
-  { [ "$_xstage_quota_limited" = "1" ] || [ "$_xstage_dolt_hot" = "1" ]; } \
+  { [ "$_xstage_quota_limited" = "1" ] || [ "$_xstage_dolt_hot" = "1" ] || [ "$_xstage_mem_tight" = "1" ]; } \
     && _xstage_resource_tight=1
   # Only pay for the gate-congestion bead query when resources are actually tight —
   # when resources are abundant we dispatch regardless, so the probe is pointless
@@ -5118,13 +5325,13 @@ if [ "$CROSS_STAGE_PRIORITY_ENABLED" = "1" ]; then
   if [ "$_xstage_resource_tight" = "1" ]; then
     _xstage_gate_congested="$(_pilot_gate_congested)"      # "1"/"0" (fail-open "0")
     if [ "$_xstage_gate_congested" = "1" ]; then
-      warn "Cross-stage YIELD (ga-d0hz3): Gate is CONGESTED and resources are CONTENDED (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}) — DEFERRING new builds this sweep so the more-advanced Gate stage can drain first. Approved stories stay queued; auto-resumes when Dolt calms / quota frees. Most-advanced-first."
-      notify -t "⏸️ Pilot cede ao Gate" -p 2 "Pilot adiou despachar builds novos — Gate congestionado + recurso contido (dolt_hot=${_xstage_dolt_hot}, quota_limited=${_xstage_quota_limited}). Retoma quando o recurso aliviar (ga-d0hz3)." 2>/dev/null || true
-      _pilot_write_sweep_pause_state 1 "cross-stage-yield" "gate_congested=1 quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}"
+      warn "Cross-stage YIELD (ga-d0hz3): Gate is CONGESTED and resources are CONTENDED (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}${PILOT_MEM_TIGHT_REASON:+ [$PILOT_MEM_TIGHT_REASON]}; ${PILOT_MEM_TIGHT_DETAIL}) — DEFERRING new builds this sweep so the more-advanced Gate stage can drain first. Approved stories stay queued; auto-resumes when Dolt calms / quota frees / the Gate drains (swap used is sticky, so memory alone may stay tight until it does). Most-advanced-first."
+      notify -t "⏸️ Pilot cede ao Gate" -p 2 "Pilot adiou despachar builds novos — Gate congestionado + recurso contido (dolt_hot=${_xstage_dolt_hot}, quota_limited=${_xstage_quota_limited}, mem_tight=${_xstage_mem_tight}). Retoma quando o recurso aliviar (ga-d0hz3, ga-9e446u)." 2>/dev/null || true
+      _pilot_write_sweep_pause_state 1 "cross-stage-yield" "gate_congested=1 quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}"
       log "=== Pilot sweep complete: dispatched=0 (deferred: cross-stage gate-congested + resource-contended, ga-d0hz3) ==="
       exit 0
     fi
-    log "Cross-stage check (ga-d0hz3): resources contended (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}) but Gate NOT congested — dispatching normally."
+    log "Cross-stage check (ga-d0hz3): resources contended (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}) but Gate NOT congested — dispatching normally."
   fi
 fi
 # ga-nq0jo: reaching here means neither whole-sweep pause fired this cycle —
@@ -5418,6 +5625,34 @@ _pilot_apply_dynamic_pool_ceilings() {
 }
 # SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings: END
 _pilot_apply_dynamic_pool_ceilings
+
+# ── ga-kqa08j: GATE FOCUS MODE (Athos 07/10) ────────────────────────────────────
+# gate-focus-mode.sh (launchd, 5 min) is the only owner of the mode; here we only read
+# it. ON: the builder pools stop taking NEW beads — _filter_candidates keeps only fixes
+# of gate-rejected beads (PILOT_GATE_FOCUS=1) — and each worker pool opens at most
+# GATE_FOCUS_FIX_MAX (2) sessions. Crews are not touched. The dog cap is applied by
+# eval-window-concurrency-guard.sh (its single writer). UNKNOWN (no/corrupt/stale
+# state): normal dispatch, logged — same fail-open contract as every pause above.
+# Placed AFTER the dynamic ceilings so they cannot overwrite the clamp.
+PILOT_GATE_FOCUS=0
+GATE_FOCUS_FIX_MAX="${GATE_FOCUS_FIX_MAX:-2}"
+case "$GATE_FOCUS_FIX_MAX" in ''|*[!0-9]*) GATE_FOCUS_FIX_MAX=2 ;; esac
+_gf_lib="${GATE_FOCUS_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/gate-focus-lib.sh}"
+if [ -r "$_gf_lib" ] && . "$_gf_lib" 2>/dev/null; then
+  case "$(gate_focus_active)" in
+    1)
+      PILOT_GATE_FOCUS=1
+      [ "${PILOT_WA_WORKER_MAX:-0}" -gt "$GATE_FOCUS_FIX_MAX" ] 2>/dev/null && PILOT_WA_WORKER_MAX="$GATE_FOCUS_FIX_MAX"
+      [ "${PILOT_PS_WORKER_MAX:-0}" -gt "$GATE_FOCUS_FIX_MAX" ] 2>/dev/null && PILOT_PS_WORKER_MAX="$GATE_FOCUS_FIX_MAX"
+      log "Gate focus mode ON (gate queue=$(gate_focus_depth)) — only fixes of gate-rejected beads are dispatched; wa-worker max=${PILOT_WA_WORKER_MAX} ps-worker max=${PILOT_PS_WORKER_MAX} (ga-kqa08j)"
+      ;;
+    0) : ;;
+    *) log "Gate focus state UNKNOWN (missing/corrupt/stale $GATE_FOCUS_STATE_FILE) — dispatching normally this sweep (ga-kqa08j)" ;;
+  esac
+else
+  log "Gate focus lib unreadable ($_gf_lib) — dispatching normally this sweep (ga-kqa08j)"
+fi
+export PILOT_GATE_FOCUS
 
 # _session_is_live <identifier> — exit 0 iff <identifier> is a non-closed session.
 _session_is_live() {
@@ -7016,7 +7251,34 @@ _ownership_guard_should_refuse() {
           fi
           ;;
         "$SELF_BEAD_ID") : ;;
-        *) printf 'external-claim:%s@in_progress' "$_asg"; return 0 ;;
+        *)
+          # ga-nqjgf0: a named-crew assignee is an external claim only while that
+          # crew is a CONFIRMED-ACTIVE owner — the SAME predicate _filter_candidates
+          # (ga-46wq5) uses to decide the bead is still owned. This arm used to
+          # refuse on the assignee string alone, so a bead whose in_progress
+          # assignee had NO live session (wa-3fx45f → batista-wa, a crew with no
+          # session at all) was re-admitted by 46wq5 ("não é dono ativo") and
+          # refused right back here ("already owned") on every sweep, forever: one
+          # variable, two opposite verdicts. Three states, not two: an active
+          # owner → refuse; an untrustworthy roster (_DEADWORKER_OK!=1) → refuse
+          # too, because "no session found" on a failed `session list` read is not
+          # evidence of "no owner" and a doubt must never release a bead; only a
+          # TRUSTED roster that says "not an active owner" lets it fall through to
+          # (b) below (which agrees and allows) and on to the reclaim paths.
+          # Not carved out for non-crew assignees: 46wq5's filter has no such
+          # exemption either (the two must agree). Measured 06/10 on the in_progress
+          # beads of HQ and the WA rig: every assignee was an agent identity (crew
+          # session, gastown.mayor, pool worker, dog, gate-reviewer) or empty — none
+          # was a human. gastown.mayor goes through the same predicate as the rest
+          # (its coordinator immunity falls back to the roster grep, see
+          # _session_is_active_owner), so a Mayor claim is still honoured while the
+          # Mayor is on the roster as active.
+          if [ "${_DEADWORKER_OK:-0}" = "1" ] && ! _session_is_active_owner "$_asg"; then
+            :
+          else
+            printf 'external-claim:%s@in_progress' "$_asg"; return 0
+          fi
+          ;;
       esac
     fi
   fi
@@ -8599,6 +8861,156 @@ _topup_exclude_braked() {
   jq -c 'if type == "array" then [ .[] | select(((.labels // []) | index("pilot:topup-braked")) == null) ] else . end'
 }
 
+# ── ga-9t9acg.4 (programa ga-9t9acg, rule: priority > type > age, scripts/work-order.sh): WHICH pending bead top-up
+# spawns for. Until now both queries below asked bd for `--limit=20` with no --sort and took `.[0].id`: bd's default
+# order is priority and then NEWEST first (measured: 23 routed beads, a P0 feature 24th), so a window of 20 cut the
+# oldest P0 feature off before anything was ordered (ga-g7yt: a window plus a post-filter hides real work) and the
+# survivor of the window was the newest bead, not the one the rule serves first.
+#
+# WHAT RUNS NOW. The queries fetch the WHOLE population (`--limit 0`), the existing filter chain narrows it (exec:manual,
+# _filter_candidates, _filter_label_vetoes, the pilot:topup-braked brake — unchanged), and _topup_pick_first orders what
+# is left with work_order_sort and takes the first. Filters and vetoes stay HERE: the library only orders.
+#
+# AGE RULE: `reclaim` (work-order.sh header). A bead the Pilot has reclaimed (label pilot:reclaim-count:N, N >= 1)
+# is aged by updated_at, any other by created_at — the anti-starvation of ga-w4k2z/ga-oc6knj/ga-x80j1 that the worker
+# probe has had since before the rule existed. It is inherited, not part of the Athos rule; without it a bead reclaimed
+# again and again would keep position 0 on its ancient created_at and top-up would spawn for it every sweep.
+#
+# TOP-UP AND THE WORKER MUST PICK THE SAME BEAD. Top-up exists to put a session in front of the bead the pool's worker
+# will take; the worker takes whatever its own probe returns first (agents/{wa-worker,ps-worker}/prompt.template.md,
+# Step 1b2). If the two disagree, top-up spends a pool slot "for" bead A and the session claims bead B — the same
+# invariant ga-oc6knj (c) names for the eligibility filters, now for the ORDER. The probe is slice ga-9t9acg.5/.6
+# (out of scope here: R5/R6); until it migrates it still windows at 20 and has no type tier, so the two can differ
+# on a P0 non-feature that is older than a P0 feature, or on a population larger than the probe's window.
+# pilot-dispatcher.topup-order.selftest.sh (part D) is the test that checks they agree, on its fixtures: it runs the
+# probe's own Step 1b2 block, taken live out of each template, against the same populations as top-up. Priority + age
+# (D1/D1b) must agree TODAY and fail otherwise; the type tier and the window (D2/D3) are reported by name as KNOWN
+# divergence while a template still carries the old probe, and must agree — or fail — the moment it is migrated.
+# THE BRAKE DEPENDS ON THIS AGREEMENT: ga-653ilw's respawn brake reads "spawned for A and A not claimed" as "A is stuck".
+# With a disagreeing worker that reading is wrong, so _pilot_pool_topup counts a spawn toward the brake only while the
+# worker's template carries the migrated probe (_topup_worker_probe_migrated). Until slices .5/.6 land the brake is
+# therefore OFF for the pool — a trade-off, announced with a WARN on every top-up spawn, that ends by itself.
+#
+# THREE STATES (the library's contract; "cannot tell" is never "empty queue"):
+#   * ordered        -> the id of the first bead.
+#   * an illegible field (priority/type/age/id) -> the bead STAYS in the list at the end of its class and the library
+#                       writes one `work-order WARN:` line per bead on STDERR — its only signal. This helper therefore
+#                       never puts 2>/dev/null on the library call, and it must not be called with one either.
+#   * cannot tell (library missing, exit != 0, empty output, a head without an id) -> keep the PREVIOUS behaviour (the
+#                       first bead in the order bd returned it) and say so with a WARN; when even that first bead has no
+#                       id nothing can be named, and the WARN says THAT. NOT "nothing pending": that would silently stop
+#                       top-up for the pool, and NOT a silent unordered pick either.
+#   * the INPUT itself (before the filters and the library) -> _topup_validate_input, the FIRST stage of every chain, right
+#                       after `bd … --json`: a JSON array; elements that are not objects are dropped and counted in a WARN,
+#                       and a title of any type is read as text (one odd bead cannot hide its neighbours). Non-blank input
+#                       that is not exactly one array (bd's error text, an error envelope, `null`) spawns nothing for that
+#                       store, with a WARN. BLANK input is the one silent case: the `| timeout … bd` pipe swallows bd's exit
+#                       status, so it cannot be told from an empty queue. WHY AT THE ENTRY and not inside _topup_pick_first
+#                       (where the first submission put it): every filter between bd and the helper swallows its own jq
+#                       failure — _filter_candidates ends its jq in `2>/dev/null` and falls back to `[]` — so a guard placed
+#                       after them only ever sees the answer they already collapsed to "empty queue" (gate round 3 measured
+#                       it: six malformed shapes, no WARN, a valid neighbour lost). Part C10 of the selftest runs those six
+#                       through the REAL filters at every place the chain runs.
+#                       NOT COVERED, and said so: an element that IS an object but carries a field of the wrong type
+#                       (`labels` or `metadata` as text, a non-text label, a numeric `description` — all measured) still
+#                       makes _filter_candidates' jq fail, and it still answers `[]` for the whole store without a word.
+#                       bd does not print such beads and the entry stage cannot know every field the filters read; the
+#                       silent `[]` of _filter_candidates is its own bug, ga-fesw8n.
+# Output channel: this runs inside $(...), where log()/warn() (both write to STDOUT) would be captured into the bead id,
+# so every message here goes to stderr (>&2). The sweep's `exec >> "$LOG" 2>&1` lands it in the log.
+#
+# CROSS-STORE (known limit, reported on ga-9t9acg.4, not decided here): the HQ store is asked first and the rig stores
+# only when HQ yields nothing, so the order is "the rule inside one store". The library header says to union the stores
+# and sort once; that needs the rig fallback seams (…_TOPUP_RIG_PENDING, an id) reshaped and is its own change.
+#
+# SELFTEST-EXTRACT work-order-topup-source: BEGIN
+_GC_WO_TOPUP_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/work-order.sh"
+if [ -r "$_GC_WO_TOPUP_SIBLING" ]; then
+  # shellcheck source=scripts/work-order.sh
+  source "$_GC_WO_TOPUP_SIBLING"
+else
+  warn "ga-9t9acg.4: work-order.sh missing/unreadable ($_GC_WO_TOPUP_SIBLING) — pool top-up cannot apply the order rule and keeps the PREVIOUS pick (first bead in bd's order) until it is restored."
+fi
+unset _GC_WO_TOPUP_SIBLING
+# SELFTEST-EXTRACT work-order-topup-source: END
+
+# _topup_validate_input — stdin: what `bd … --json` printed (or the test seam's JSON); stdout: ALWAYS a JSON array of
+# objects, `[]` when there is nothing usable; stderr: one WARN per thing wrong. Always exits 0. The first stage of every
+# top-up chain (the HQ query, the rig fallback, both test seams) — see the THREE STATES block above for why it is first.
+#   * blank                          -> `[]`, silent (cannot be told from an empty queue, see above).
+#   * not exactly ONE JSON array     -> `[]` + WARN "NOT 'nothing pending'" (error text, an error envelope, `null`, a scalar,
+#                                       invalid JSON, two concatenated documents: "cannot tell" is never "empty queue").
+#   * an array                       -> only its objects, a title of any type as text; the elements dropped are COUNTED in a WARN.
+# Messages go to stderr (>&2): this runs inside $(...) where log()/warn() would be captured into the bead id.
+_topup_validate_input() {
+  local _in _arr _skipped
+  _in=$(cat)
+  case "$_in" in
+    *[![:space:]]*) ;;
+    *) printf '[]'; return 0 ;;
+  esac
+  # `-s` + length == 1: a plain `jq -e 'type == "array"'` judges only the LAST document, so two arrays would pass it.
+  if ! printf '%s' "$_in" | jq -es 'length == 1 and (.[0] | type == "array")' >/dev/null 2>&1; then
+    echo "WARN ga-9t9acg.4: pool top-up got something that is not a JSON array from bd (error text? an error envelope?) — nothing is spawned for this store this sweep. This is NOT 'nothing pending'. It starts with: $(printf '%s' "$_in" | head -c 120 | tr '\n\r' '  ')" >&2
+    printf '[]'
+    return 0
+  fi
+  # Only objects can be beads: any other element is dropped and COUNTED below (never a jq failure that takes the whole array
+  # down with it). A title of any type is read as text, so a bead with an odd title cannot hide its neighbours.
+  _arr=$(printf '%s' "$_in" | jq -c '[.[] | select(type == "object") | if ((.title | type) == "string" or (.title | type) == "null") then . else .title |= tostring end]' 2>/dev/null) || _arr=""
+  if [ -z "$_arr" ]; then
+    echo "WARN ga-9t9acg.4: pool top-up could not read bd's candidate array (jq failed on it) — nothing is spawned for this store this sweep. This is NOT 'nothing pending'." >&2
+    printf '[]'
+    return 0
+  fi
+  _skipped=$(printf '%s' "$_in" | jq '[.[] | select(type != "object")] | length' 2>/dev/null) || _skipped="an unknown number of"
+  [ "$_skipped" = "0" ] || echo "WARN ga-9t9acg.4: pool top-up ignored $_skipped element(s) of bd's array that are not beads." >&2
+  printf '%s' "$_arr"
+}
+
+# _topup_pick_first — stdin: the JSON array of candidates that survived every filter above (the whole population);
+# stdout: the id of the bead the rule serves first, or nothing when there is none; stderr: the library's WARN lines and
+# this helper's own (see the block above). Always exits 0. The EPIC-title defence in depth (the worker probe's jq has the
+# same regex) lives here so the real queries and both test seams share ONE copy of it.
+_topup_pick_first() {
+  local _age="reclaim" _in _eligible _n _ordered _head _id _why="" _prev
+  # The input is validated here TOO, with the very function the chain runs first: in production that is a no-op (it is
+  # idempotent — an array of objects with text titles comes out unchanged and says nothing), and it keeps this helper safe
+  # when something calls it on its own (the selftest's pick_direct does).
+  _in=$(cat | _topup_validate_input)
+  _eligible=$(printf '%s' "$_in" | jq -c --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
+    '[.[] | select(((.title // "") | test($epic_re; "i")) | not)]' 2>/dev/null) || _eligible=""
+  if [ -z "$_eligible" ]; then
+    echo "WARN ga-9t9acg.4: pool top-up could not filter bd's candidate array (jq failed on it) — nothing is spawned for this store this sweep. This is NOT 'nothing pending'." >&2
+    return 0
+  fi
+  _n=$(printf '%s' "$_eligible" | jq 'length' 2>/dev/null) || _n=""
+  [ "$_n" != "0" ] || return 0
+  if ! type work_order_sort >/dev/null 2>&1 || ! type work_order_head >/dev/null 2>&1; then
+    _why="the library functions are not loaded"
+  elif ! _ordered=$(printf '%s' "$_eligible" | work_order_sort --age "$_age") || [ -z "$_ordered" ]; then
+    _why="work_order_sort could not order the candidates (exit != 0 or empty output; its own line above says why)"
+  elif ! _head=$(printf '%s' "$_ordered" | work_order_head) || [ -z "$_head" ]; then
+    _why="work_order_head could not read the first bead (exit != 0 or empty output)"
+  else
+    _id=$(printf '%s' "$_head" | jq -r '.id // empty' 2>/dev/null) || _id=""
+    [ -n "$_id" ] || _why="the first bead of the order has no readable id"
+  fi
+  if [ -z "$_why" ]; then
+    printf '%s' "$_id"
+    return 0
+  fi
+  # The WARN may only promise a pick that exists: the previous behaviour was `.[0].id`, and that can be empty too.
+  _prev=$(printf '%s' "$_eligible" | jq -r '.[0].id // empty' 2>/dev/null) || _prev=""
+  if [ -n "$_prev" ]; then
+    echo "WARN ga-9t9acg.4: pool top-up cannot apply the order rule ($_why) — keeping the PREVIOUS pick: the first of $_n candidate(s) in bd's own order. This is NOT 'nothing pending'." >&2
+    printf '%s' "$_prev"
+  else
+    echo "WARN ga-9t9acg.4: pool top-up cannot apply the order rule ($_why), and the first of $_n candidate(s) in bd's own order has no readable id either — nothing is spawned for this store this sweep. This is NOT 'nothing pending'." >&2
+  fi
+  return 0
+}
+
 _topup_rig_pending() {
   local _pool="$1" _rp _rig_pending
   while IFS= read -r _rp; do
@@ -8607,13 +9019,16 @@ _topup_rig_pending() {
     # ga-653ilw: scan ONLY the store(s) this pool's worker reads. Every other rig's `gc.routed_to=<pool>` bead is
     # invisible to the worker's probe, so spawning "for" it just burns a session that finds nothing.
     _topup_rig_serves_pool "$_rp" "$_pool" || continue
+    # ga-9t9acg.4: the WHOLE population (`--limit 0`), ordered by the shared rule in _topup_pick_first (see the block
+    # above it). _topup_validate_input comes FIRST, before the filters (they swallow a jq failure as `[]`), and neither it
+    # nor the last stage carries a `2>/dev/null`: their WARN lines (and the library's) are the only signal.
     _rig_pending=$(timeout 15 bd -C "$_rp" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
       --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
-      "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
+      "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0 2>/dev/null \
+      | _topup_validate_input \
       | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
       | _topup_exclude_braked 2>/dev/null \
-      | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
-        '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      | _topup_pick_first || echo "")
     if [ -n "$_rig_pending" ]; then
       printf '%s' "$_rig_pending"
       return 0
@@ -8868,9 +9283,26 @@ _topup_note_spawn() {
   return 0
 }
 
+# _topup_worker_probe_migrated <pool> — ga-9t9acg.4: does the pool worker's Step 1b2 probe order by the shared rule?
+# The respawn brake (_topup_note_spawn) assumes "a bead the worker claims leaves the unassigned set", i.e. that the bead
+# top-up spawned FOR is the bead the session then takes. That holds only while top-up and the probe agree on the order.
+# A worker still on the pre-migration probe (window of 20, no type tier) takes ITS first bead, not the rule's; counting
+# those spawns would brake the rule's #1 bead after 5 sweeps although nothing is wrong with it, and the next one after
+# that, and so on down the queue. Reads the template the pool's sessions are actually started from:
+# $GC_CITY/agents/<pool>/prompt.template.md. The migrated shape (slices ga-9t9acg.5/.6) is a code line, not a comment:
+#   <X>_SORTED="$( . "$<X>_LIB" && printf '%s' "$<X>_CAND" | work_order_sort --age reclaim )" …
+# Three states, as everywhere: rc 0 migrated, rc 1 NOT migrated (template readable, no such line), rc 2 cannot tell
+# (template missing or unreadable). The caller counts a spawn toward the brake only on 0.
+_topup_worker_probe_migrated() {
+  local _tpl="${GC_CITY:-}/agents/${1:-}/prompt.template.md" _rc=0
+  [ -n "${GC_CITY:-}" ] && [ -n "${1:-}" ] && [ -r "$_tpl" ] || return 2
+  grep -Eq '^[[:space:]]*[A-Z_]+_SORTED="\$\(.*work_order_sort --age reclaim' "$_tpl" 2>/dev/null || _rc=$?
+  case "$_rc" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+}
+
 _pilot_pool_topup() {
   local _pool="$1" _max="$2"
-  local _live _global _pending
+  local _live _global _pending _mig
 
   # ga-swnsg3: skip entirely when Dolt was saturated at sweep start —
   # spawning a session is itself Dolt load (session-state writes), so
@@ -8930,9 +9362,9 @@ _pilot_pool_topup() {
     # convention (${...+x}), same reason (this harness's PATH has no
     # `timeout`, so the live bd call below would silently 127 either way).
     elif [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _topup_validate_input | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | _topup_pick_first || echo "")
     elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _topup_validate_input | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | _topup_pick_first || echo "")
     else
       # Same `|| echo` reasoning as the _live probe above.
       # ga-oc6knj: widened --limit=1 -> --limit=20 and piped through
@@ -8941,13 +9373,17 @@ _pilot_pool_topup() {
       # ineligible bead at --limit=1 used to make top-up correctly find
       # "nothing", masking every OTHER eligible routed-unassigned bead
       # sitting right behind it in the same query.
+      # ga-9t9acg.4: the --limit=20 window of that fix is gone too — it cut the population BEFORE it was ordered.
+      # `--limit 0` fetches all of it and _topup_pick_first (block above _topup_rig_pending) picks by the shared rule.
+      # _topup_validate_input comes FIRST, before the filters (they swallow a jq failure as `[]`), and neither it nor the
+      # last stage carries a `2>/dev/null`: their WARN lines (and the library's) are the only signal.
       _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
         --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
-        "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
+        "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0 2>/dev/null \
+        | _topup_validate_input \
         | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
         | _topup_exclude_braked 2>/dev/null \
-        | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
-          '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+        | _topup_pick_first || echo "")
       if [ -z "$_pending" ]; then
         # ga-q0ewpu: HQ has nothing — fall through to each non-HQ rig store
         # before giving up (own test seam, same set-even-to-empty convention
@@ -8971,7 +9407,17 @@ _pilot_pool_topup() {
       log "  ga-93yxc: pool top-up — $_pool session spawned for $_pending. [ga-oa004t path=pool-topup pool_live=$((_live + 1))/$_max global=$((_global + 1))/$GC_VARIABLE_SESSION_MAX]"
       # ga-653ilw: count this spawn toward the per-bead brake — AFTER a successful spawn only, so a failed one never
       # burns the budget. Fail-open and always exit 0 (see _topup_note_spawn); `|| true` keeps `set -e` out of it.
-      _topup_note_spawn "$_pool" "$_pending" || true
+      # ga-9t9acg.4: ...and only when the pool worker's probe picks by the same rule as _topup_pick_first (see
+      # _topup_worker_probe_migrated): otherwise the session may take another bead, and a bead it never claimed because
+      # it was never ITS pick would be braked for nothing. TRADE-OFF, disclosed on the bead: until slices ga-9t9acg.5/.6
+      # land, the brake is OFF for the pool (a bead nobody claims is re-spawned for every sweep, as before ga-653ilw);
+      # it re-arms by itself the moment the template carries the migrated probe. Said out loud each time, never silent.
+      _mig=0; _topup_worker_probe_migrated "$_pool" || _mig=$?
+      case "$_mig" in
+        0) _topup_note_spawn "$_pool" "$_pending" || true ;;
+        1) warn "ga-9t9acg.4: respawn brake OFF for $_pool — its worker's Step 1b2 probe (agents/$_pool/prompt.template.md) is not on the shared order yet (slice ga-9t9acg.5/.6), so it may take another bead than $_pending and this spawn is NOT counted toward ga-653ilw's brake. Re-arms by itself once the probe is migrated." ;;
+        *) warn "ga-9t9acg.4: cannot read $GC_CITY/agents/$_pool/prompt.template.md to tell whether the $_pool worker's probe is on the shared order — this spawn for $_pending is NOT counted toward ga-653ilw's brake (fail-open; the next spawn re-checks)." ;;
+      esac
       _live=$((_live + 1))
       _global=$((_global + 1))
     else
@@ -10559,10 +11005,35 @@ LIVESEC
     # If the owner is busy/suspended/at-cap/human-engaged, fall through to the
     # normal pool rotation below UNCHANGED (same as any other domain) — this
     # never blocks dispatch, it only redirects it when the owner is available.
-    local _OWNER_SUSPENDED=0
+    local _OWNER_SUSPENDED=0 _OWNER_NOSESSION=0 _OWNER_ROSTER_UNKNOWN=0
     if [ -n "$_PREFER" ] && rig_domain_requires_persistent_owner "$STORY_RIG" "$_DOMAIN"; then
       local _OWNER_BUSY=0
       _crew_session_human_engaged "$_PREFER" && _OWNER_BUSY=1
+      # ga-nqjgf0: the owner must EXIST right now. Every probe above and below asks
+      # "is the owner busy / suspended / at-cap / human-engaged" — none asks "does
+      # it have a session at all", so a crew that was never started (wa-3fx45f →
+      # batista-wa, 06/10: no session of any kind, `Could not nudge batista-wa`)
+      # was picked as the "idle" owner and the bead looped between ga-46wq5 and
+      # ga-htjni. Three states, like every roster probe in this file:
+      #   live    — a non-closed session exists (active OR asleep: the REUSE path
+      #             wakes an asleep crew, gt-4st3n) → dispatch as before;
+      #   none    — TRUSTED roster, no non-closed session for the owner → defer, and
+      #             the defer branch below stamps the shared VISIBLE hold;
+      #   unknown — roster unreadable/empty (_DEADWORKER_OK!=1) → defer, but NO hold:
+      #             "não consegui saber" must never choose the crew, and must not
+      #             escalate to the Mayor on a transient read either.
+      # Scoped to hex like ga-wnojmm's visible hold: warming's pick is deliberately
+      # untouched (Regra No 4 — it drives a real device; no change without an
+      # explicit Athos citation).
+      if [ "$_DOMAIN" = "hex" ]; then
+        if [ "${_DEADWORKER_OK:-0}" != "1" ]; then
+          _OWNER_BUSY=1
+          _OWNER_ROSTER_UNKNOWN=1
+        elif ! _session_is_live "$_PREFER"; then
+          _OWNER_BUSY=1
+          _OWNER_NOSESSION=1
+        fi
+      fi
       # ga-wnojmm: SUSPENDED is tracked separately from the generic busy flag —
       # busy/at-cap/human-engaged are TRANSIENT (will resolve on their own next
       # sweep, so a silent retry is correct); suspended is STRUCTURAL (this
@@ -10610,6 +11081,23 @@ LIVESEC
           "$STORY_RIG/$_DOMAIN domain build requires persistent owner $_PREFER, which is SUSPENDED — this domain is structurally pool-incompatible (Hex-notebook-native work produces no git diff, ga-pp00f) so it cannot fall back to $_POOL either" \
           "unsuspend $_PREFER, or set a live explicit assignee on $STORY_ID" \
           "$(echo "$STORY" | jq -c '.labels // []' 2>/dev/null || echo '[]')"
+      elif [ "$_OWNER_NOSESSION" = "1" ] && [ "$_DOMAIN" = "hex" ]; then
+        # ga-nqjgf0: same structural dead end as the suspended owner above (no pool
+        # fallback for hex, so the defer repeats every sweep), reached by a different
+        # road — the owner is not suspended, it simply has NO session. A SUSPENDED
+        # owner is reported by the branch above, which is the more actionable
+        # instruction; this one only runs for an owner that is not suspended.
+        warn "ga-nqjgf0: $STORY_RIG/$_DOMAIN domain build requires persistent owner $_PREFER, which has NO live session in a trusted roster, and the pool is domain-excluded for it (ga-pp00f/ga-ppx8h) — would defer silently forever otherwise. Routing through the shared hold/escalate counter instead."
+        _pilot_hold_or_escalate "$STORY_BEAD_CITY" "$STORY_ID" "ga-wnojmm-hex" \
+          "$STORY_RIG/$_DOMAIN domain build requires persistent owner $_PREFER, which has NO live session — this domain is structurally pool-incompatible (Hex-notebook-native work produces no git diff, ga-pp00f) so it cannot fall back to $_POOL either" \
+          "start a session for $_PREFER, or set a live explicit assignee on $STORY_ID" \
+          "$(echo "$STORY" | jq -c '.labels // []' 2>/dev/null || echo '[]')"
+      elif [ "$_OWNER_ROSTER_UNKNOWN" = "1" ] && [ "$_DOMAIN" = "hex" ]; then
+        # ga-nqjgf0: the roster could not be read, so whether the owner is alive is
+        # UNKNOWN. Defer (never pick the crew on a doubt) but deliberately do NOT
+        # touch the hold/escalate counter: a transient read failure must not walk a
+        # bead toward a Mayor escalation. The next sweep re-reads the roster.
+        warn "ga-nqjgf0: $STORY_ID ($STORY_RIG/$_DOMAIN) deferred — roster unreadable, cannot tell whether owner $_PREFER has a live session; not picking the owner on a doubt, no hold stamped (transient, retried next sweep)."
       fi
       return 1
     fi

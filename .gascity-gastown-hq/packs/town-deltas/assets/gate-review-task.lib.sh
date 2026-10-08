@@ -212,11 +212,25 @@ actually verify in the diff? This refutation pass asks only one question —
 does the defect exist in the code? — and is never a filter on how severe or
 how certain the issue feels.
 
-WHAT BLOCKS (verdict FAIL): any defect you can ground in specific changed
-lines that could cause incorrect behavior, a failing test, data loss, or a
-misleading result/log/comment.
-WHAT DOES NOT BLOCK: pure style or naming preferences with no behavioral
-effect — report these too, just do not fail the verdict on them alone.
+WHAT BLOCKS (verdict FAIL): a defect you can ground in specific changed
+lines that changes BEHAVIOR: incorrect output or state, a failing test (new or
+existing, that this diff made fail — one already red on the base for the same test
+id is pre-existing and non-blocking), data loss, a crash, a security hole. The third-state family BLOCKS
+too, always: a log, status or return value that reports success when the
+operation failed; a silent fallback or swallowed error that hides a failure; a
+read that could not be made ("unknown") turned into a yes or a no; a test that
+passes without exercising the path it claims to test.
+WHAT DOES NOT BLOCK (report it under "Non-blocking findings", at its real
+severity — never drop it): a comment or docstring that misdescribes code which
+itself behaves correctly; a log line whose wording is wrong but that does NOT
+report success, a count, an empty result or "nothing to do" on a failure; an
+edge case the code could not tell apart from the normal case anyway AND whose
+outcome is identical for the caller (an error made to look like a normal or
+empty result is the third-state family above and BLOCKS); style or naming.
+The builder gets these in the
+verdict comment and fixes them in the next change on that file; they do not
+cost a re-review round (decision of the owner, 2026-10-07: approval must stop
+failing on form while behavior is correct).
 LOW CONFIDENCE: if you are not sure whether something is really a defect,
 RE-READ the surrounding code until you can decide either way — never silence
 or drop a finding just because you are unsure.
@@ -229,6 +243,20 @@ false-positive FAIL is expensive — it forces a full re-dispatch + re-work cycl
 on correct code. Be adversarial about whether the CODE actually has the
 defect, never about whether a real finding deserves to be reported: verify
 each issue is real, then report everything real you find, at its true severity.${GATE_E5_COV_RULES:-}
+TIME BUDGET: the verdict budget of this run is ${GATE_REVIEW_BUDGET_MINUTES:-unknown} minutes, counted
+from the moment your task was sent to you. Past it the run gets a short grace only while you
+are visibly mid-turn, and past that it is thrown away and reviewed again from zero by someone
+else — your work is lost. Plan to deliver with margin: when about 8 minutes remain, stop
+starting test runs, deliver the verdict you can defend from what you verified, and say in the
+Summary which checks you did not get to run (that is honest coverage, not a FAIL).
+RUNNING TESTS: a foreground shell command is capped at 600 s, so never wrap a suite in a
+timeout you expect it to hit — a run killed by your own cap while it was passing is a run
+paid for nothing. Long runs: start them in the background (run_in_background or nohup),
+poll, and split per file; never restart a run your own cap killed; never run the whole
+tests/ directory. A test that is already red on the reviewed base for the SAME test id is
+pre-existing: report it as non-blocking — a failing test blocks only when this diff made it
+fail. Mutation and reproduction probes you write yourself are not covered by any of this:
+run them, they are the best defence the gate has.
 TASK
 }
 

@@ -895,6 +895,13 @@ run_lanefull() {
 #                                       saturation — NOT quota — keeps the sweep from
 #                                       short-circuiting at the earlier quota-pause.)
 #   $6 = FAKE_INFLIGHT_JSON            (occupy lane slots to exercise the cap)
+#   $7 = PILOT_SWAP_USED_OVERRIDE_MB   (ga-9e446u: machine swap in use, MB; "" = no
+#                                       reading — and the sandbox PATH has no sysctl,
+#                                       so the real probe is blind too = fail-open)
+#   $8 = PILOT_MEMORY_TIGHT_ENABLED    (default 1; 0 = the ga-9e446u kill switch)
+#   $9 = PILOT_KERN_PRESSURE_OVERRIDE  (ga-9e446u: kernel memory-pressure level 1/2/4)
+#  $10 = PILOT_SWAP_FREE_OVERRIDE_MB   (ga-9e446u: free swap, MB; "" = no reading. With $7
+#                                       and $9 also set, NO memory reading is blind)
 run_ctxready() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -915,6 +922,10 @@ run_ctxready() {
     FAKE_CTXREADY_JSON="${1:-[]}" \
     FAKE_BUGS_JSON="${2:-}" \
     PILOT_GATE_CONGESTED_OVERRIDE="${4:-}" \
+    PILOT_SWAP_USED_OVERRIDE_MB="${7:-}" \
+    PILOT_MEMORY_TIGHT_ENABLED="${8:-1}" \
+    PILOT_KERN_PRESSURE_OVERRIDE="${9:-}" \
+    PILOT_SWAP_FREE_OVERRIDE_MB="${10:-}" \
     FAKE_INFLIGHT_JSON="${6:-[]}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
@@ -1600,25 +1611,85 @@ _OG_FN="$(awk '/^_ownership_guard_should_refuse\(\)/{f=1} /^_beadid_matched_crew
 # gate artifact → allow), so signal (d) is inert there and (a)/(b)/(c) behave exactly
 # as before. The (d1)-(d5) cases DEFINE the seam to exercise (d) hermetically.
 _GATE_FN="$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+# ga-nqjgf0: OG_ACTIVE / OG_ROSTER_OK drive the two inputs signal (c) now reads — whether the
+# assignee is a CONFIRMED-ACTIVE owner (_session_is_active_owner, the SAME predicate 46wq5's
+# _filter_candidates and signal (b) use) and whether the roster can be trusted at all.
+OG_ACTIVE=0; OG_ROSTER_OK=1
 _og() { (
     eval "$_OG_FN"; eval "$_GATE_FN"
-    SELF_BEAD_ID=""; _DEADWORKER_OK=1
+    SELF_BEAD_ID=""; _DEADWORKER_OK="$OG_ROSTER_OK"
     bd() { case "$*" in *" show "*) printf '%s' "${OG_BEAD_JSON:-}" ;; *) : ;; esac; }
     _beadid_has_crew_branch() { return 1; }   # no crew branch → signal (a) does not fire
     _beadid_branch_signal()   { return 1; }   # ga-8jxe1: signal (a)'s real entry point now — see below
     _session_is_live()        { return 1; }   # never a live session → isolate (c) from (b)
-    _session_is_active_owner() { return 1; }   # ga-46wq5: signal (b) now calls this, not _session_is_live — keep the isolation matched
+    _session_is_active_owner() { [ "$OG_ACTIVE" = "1" ]; }   # ga-46wq5: signal (b) now calls this, not _session_is_live — keep the isolation matched (ga-nqjgf0: signal (c) calls it too; OG_ACTIVE=1 makes the assignee a live owner)
     _beadid_mentioned_in_attached_session() { return 1; }   # isolate from (e) — has its own dedicated scenario below
     _ownership_guard_should_refuse "$1" "$2" "ignored-db"
 ); }
 
-# (1) EXTERNAL CLAIM — in_progress + session-suffixed crew assignee, NO pilot fingerprint → REFUSE.
+# (1) EXTERNAL CLAIM — in_progress + session-suffixed crew assignee that IS a confirmed-active
+# owner, NO pilot fingerprint → REFUSE. (ga-nqjgf0: the owner must be LIVE for (c) to refuse —
+# see (1b)/(1c); this is the case the clause exists for, a crew actually working the bead.)
 OG_BEAD_JSON='[{"id":"wa-ext","status":"in_progress","assignee":"thies-wa-awispr9ofspp","labels":[],"metadata":{}}]'
+OG_ACTIVE=1
 _OG_R1="$(_og "wa-ext" '{"id":"wa-ext","assignee":"","status":"open","labels":[]}')"
+OG_ACTIVE=0
 case "$_OG_R1" in
   external-claim:thies-wa-awispr9ofspp@in_progress) ok "OWN-GUARD(1): external in_progress crew self-claim REFUSED (reason: $_OG_R1)" ;;
   *) bad "OWN-GUARD(1): external in_progress self-claim NOT refused (got: '$_OG_R1') — the double-dispatch bug is back" ;;
 esac
+
+# (1b) ga-nqjgf0 — the 46wq5 × htjni loop. 46wq5's _filter_candidates re-admits a bead whose
+# in_progress assignee is NOT an active owner ("não é dono ativo"); signal (c) used to refuse the
+# very same bead with external-claim:<that assignee>@in_progress because, for a named-crew
+# assignee, it never asked whether that crew was alive (wa-3fx45f → batista-wa, a crew with NO
+# session: readmitted every sweep, refused every sweep, forever). Same variable, opposite
+# decisions. With a trustworthy roster that says "not an active owner", (c) must NOT refuse.
+OG_BEAD_JSON='[{"id":"wa-ghost","status":"in_progress","assignee":"batista-wa","labels":[],"metadata":{}}]'
+OG_ACTIVE=0; OG_ROSTER_OK=1
+_OG_R1B="$(_og "wa-ghost" '{"id":"wa-ghost","assignee":"","status":"open","labels":[]}')"
+[ -z "$_OG_R1B" ] && ok "OWN-GUARD(1b): in_progress claim by a crew that is NOT an active owner (trusted roster) is allowed — 46wq5 and htjni now agree (ga-nqjgf0)"                   || bad "OWN-GUARD(1b): claim by a non-active assignee still refused (got: '$_OG_R1B') — the 46wq5×htjni loop is back (readmitted by one, refused by the other)"
+
+# (1c) the other side of the three-state: when the roster itself can't be trusted (unreadable /
+# empty read), "no session found" is NOT evidence of "no owner" — keep the old, protective refusal.
+OG_ACTIVE=0; OG_ROSTER_OK=0
+_OG_R1C="$(_og "wa-ghost" '{"id":"wa-ghost","assignee":"","status":"open","labels":[]}')"
+OG_ROSTER_OK=1
+[ "$_OG_R1C" = "external-claim:batista-wa@in_progress" ] \
+  && ok "OWN-GUARD(1c): untrustworthy roster → (c) keeps refusing an external in_progress claim (can't-know never releases a bead)" \
+  || bad "OWN-GUARD(1c): with an unreadable roster the claim was NOT refused (got: '$_OG_R1C') — 'não consegui saber' must stay on the protective side"
+
+# (1d) ga-nqjgf0 — same decision, REAL predicate (no stub): the guard must give the verdict
+# _session_is_active_owner gives, on a real roster shape. A crew with a live active session
+# (mila-wa) is refused; a crew absent from the roster (batista-wa — the wa-3fx45f case) and a
+# crew that is only asleep (thies-wa) are not "active owners", so they must not be refused.
+_SAO_FN="$(awk '/^_session_is_active_owner\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_og_real() { (
+    eval "$_OG_FN"; eval "$_GATE_FN"; eval "$_SAO_FN"
+    SELF_BEAD_ID=""; _DEADWORKER_OK=1
+    PILOT_BEAD_STATE_PY_OVERRIDE="$(cd "$(dirname "$DISPATCHER")" && pwd)/../../../scripts/bead_state.py"
+    _SESSION_META_JSON='{"mila-wa":{"state":"active","idle_minutes":2},"thies-wa":{"state":"asleep","idle_minutes":null}}'
+    _ACTIVE_OWNER_IDS="mila-wa"
+    bd() { case "$*" in *" show "*) printf '%s' "${OG_BEAD_JSON:-}" ;; *) : ;; esac; }
+    _beadid_branch_signal()   { return 1; }
+    _session_is_live()        { return 1; }
+    _beadid_mentioned_in_attached_session() { return 1; }
+    _ownership_guard_should_refuse "$1" "$2" "ignored-db"
+); }
+for _who in mila-wa batista-wa thies-wa; do
+  OG_BEAD_JSON="[{\"id\":\"wa-real\",\"status\":\"in_progress\",\"assignee\":\"$_who\",\"labels\":[],\"metadata\":{}}]"
+  _OG_R1D="$(_og_real "wa-real" '{"id":"wa-real","assignee":"","status":"open","labels":[]}')"
+  case "$_who" in
+    mila-wa)
+      [ "$_OG_R1D" = "external-claim:mila-wa@in_progress" ] \
+        && ok "OWN-GUARD(1d): real predicate — live active crew (mila-wa) refused" \
+        || bad "OWN-GUARD(1d): live active crew mila-wa NOT refused (got: '$_OG_R1D')" ;;
+    *)
+      [ -z "$_OG_R1D" ] \
+        && ok "OWN-GUARD(1d): real predicate — $_who (not an active owner) allowed, same verdict as 46wq5's filter" \
+        || bad "OWN-GUARD(1d): $_who is not an active owner yet the guard refused (got: '$_OG_R1D') — 46wq5×htjni disagree" ;;
+  esac
+done
 
 # (2) MAYOR ROUTING — assignee set but status=OPEN (imp20) → must NOT be refused by (c).
 OG_BEAD_JSON='[{"id":"wa-may","status":"open","assignee":"batista-ps","labels":[],"metadata":{}}]'
@@ -5097,6 +5168,131 @@ else
   ok "dispatched NO ctx:ready work during the cross-stage yield (no Gate flood)"
 fi
 
+# ── Scenarios 20d-mem-*: ga-9e446u — the cross-stage yield also reads MACHINE memory ──
+# 06/10 18:2x-21:2x (-03): the machine sat on 8.2 GB of swap with the Gate backed up (20 markers
+# queued). The yield only looked at quota + Dolt, so "resources tight" was false, the Pilot
+# kept opening builders, and the Gate starved for RAM. The Mayor ran PILOT_DOLT_CPU_MAX=120
+# as a palliative to fake the signal. Dolt is CALM in every case
+# below (cpu 10 → the Dolt arm and the quota arm cannot be what trips the yield), so a yield
+# can ONLY come from the memory arm — and a dispatch can only mean the memory arm stayed quiet.
+#                         ctxJSON  bugs gate gateCong cpu inflight swapUsedMB
+echo "Scenario 20d-mem-a: Gate congested + Dolt CALM + swap 8.4 GB used → the Pilot YIELDS (ga-9e446u)"
+LOG20DMA="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" 8400)"
+if echo "$LOG20DMA" | grep "Cross-stage YIELD (ga-d0hz3)" >/dev/null; then
+  ok "yielded to the congested Gate on machine memory pressure alone (Dolt calm, quota OK)"
+else
+  bad "did NOT yield with the Gate congested and swap at 8.4 GB — the machine-starvation bug (ga-9e446u)"
+fi
+if echo "$LOG20DMA" | grep "mem_tight=1" >/dev/null; then
+  ok "the YIELD line says it was memory (mem_tight=1) — an operator can tell it from a Dolt/quota yield"
+else
+  bad "the YIELD line does not name the memory signal (mem_tight=1)"
+fi
+if echo "$LOG20DMA" | grep "Lane picks — small: tt-cx" >/dev/null; then
+  bad "REGRESSION: dispatched ctx:ready work while the Gate was congested and the machine was swapping"
+else
+  ok "dispatched NO new build while the Gate was congested and the machine was swapping"
+fi
+
+echo "Scenario 20d-mem-b: swap 4.9 GB used (the measured healthy level) → NOT tight, the Pilot dispatches"
+LOG20DMB="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" 4900)"
+if echo "$LOG20DMB" | grep "Cross-stage YIELD" >/dev/null; then
+  bad "OVER-BLOCK: yielded at 4.9 GB of swap — the ceiling must sit above the healthy level"
+else
+  ok "no yield at 4.9 GB of swap"
+fi
+if echo "$LOG20DMB" | grep "Lane picks — small: tt-cx" >/dev/null; then
+  ok "dispatched normally with the Gate congested but the machine healthy and Dolt calm"
+else
+  bad "did not dispatch at 4.9 GB of swap with Dolt calm (anti-starvation broken)"
+fi
+
+echo "Scenario 20d-mem-c: swap 8.4 GB used but the Gate is EMPTY → the Pilot dispatches (anti-starvation)"
+LOG20DMC="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" 8400)"
+if echo "$LOG20DMC" | grep "Cross-stage YIELD" >/dev/null; then
+  bad "yielded to an EMPTY Gate on memory pressure — nothing to yield to"
+else
+  ok "no yield when the Gate has nothing queued, whatever the swap says"
+fi
+if echo "$LOG20DMC" | grep "Lane picks — small: tt-cx" >/dev/null; then
+  ok "dispatched with an empty Gate despite 8.4 GB of swap"
+else
+  bad "did not dispatch with an empty Gate"
+fi
+
+echo "Scenario 20d-mem-d: PILOT_MEMORY_TIGHT_ENABLED=0 → exact pre-ga-9e446u behaviour (kill switch)"
+LOG20DMD="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" 8400 0)"
+if echo "$LOG20DMD" | grep "Cross-stage YIELD" >/dev/null; then
+  bad "kill switch ignored — still yielded on memory with PILOT_MEMORY_TIGHT_ENABLED=0"
+else
+  ok "kill switch off → the memory arm is out of the predicate"
+fi
+if echo "$LOG20DMD" | grep "Memory signal UNREADABLE" >/dev/null; then
+  bad "kill switch off still logged a blind memory probe — OFF is not blind, nothing was probed"
+else
+  ok "kill switch off → no 'Memory signal UNREADABLE' line (off is not blind)"
+fi
+
+echo "Scenario 20d-mem-e: no memory reading at all → fail-OPEN (the Pilot dispatches) but NOT SILENT"
+LOG20DME="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" "")"
+if echo "$LOG20DME" | grep "Cross-stage YIELD" >/dev/null; then
+  bad "yielded with NO memory reading — an unreadable probe must never wedge the Pilot"
+else
+  ok "unreadable memory probe → no yield (fail-open)"
+fi
+# Round 1 of the gate asserted the SILENCE here as the desired outcome. Fail-open is right; invisible is the
+# defect: with every reading blind, "mem_tight=0" and "the machine is fine" were the same log.
+if echo "$LOG20DME" | grep "Memory signal UNREADABLE (swap_used,swap_free,pressure)" >/dev/null; then
+  ok "a fully blind memory probe is on the record, naming every reading it could not take"
+else
+  bad "a fully blind memory probe left no 'Memory signal UNREADABLE (swap_used,swap_free,pressure)' line — blind and fine look the same"
+fi
+if echo "$LOG20DME" | grep "Lane picks — small: tt-cx" >/dev/null; then
+  ok "…and it still dispatched: the visibility line is not a block"
+else
+  bad "a blind memory probe stopped the dispatch — it must fail OPEN"
+fi
+
+echo "Scenario 20d-mem-e2: every memory reading taken (4.9 GB used, 3 GB free, pressure 1) → quiet, no UNREADABLE line"
+LOG20DME2="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" 4900 1 1 3000)"
+if echo "$LOG20DME2" | grep "Memory signal UNREADABLE" >/dev/null; then
+  bad "logged a blind probe although all three memory readings were taken (log spam hides the real signal)"
+else
+  ok "all readings taken → no 'Memory signal UNREADABLE' line"
+fi
+if echo "$LOG20DME2" | grep "Lane picks — small: tt-cx" >/dev/null; then
+  ok "healthy machine + fully readable probe → dispatched"
+else
+  bad "did not dispatch on a healthy, fully readable machine"
+fi
+
+echo "Scenario 20d-mem-e3: tight on one reading (8.4 GB used) while two are blind → YIELDS, and says what it could not see"
+LOG20DME3="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" 8400)"
+if echo "$LOG20DME3" | grep "Cross-stage YIELD (ga-d0hz3)" >/dev/null; then
+  ok "a partly blind probe that CAN see swap pressure still yields"
+else
+  bad "a partly blind probe ignored the readable 8.4 GB of swap"
+fi
+if echo "$LOG20DME3" | grep "Memory signal UNREADABLE (swap_free,pressure)" >/dev/null; then
+  ok "…and names exactly the two readings it could not take"
+else
+  bad "the partly blind sweep did not name (swap_free,pressure) as unreadable"
+fi
+
+echo "Scenario 20d-mem-f: kernel pressure level 4 (critical) → YIELD; level 2 (warn) alone → dispatch"
+LOG20DMF4="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" "" 1 4)"
+if echo "$LOG20DMF4" | grep "Cross-stage YIELD (ga-d0hz3)" >/dev/null; then
+  ok "kernel pressure 4 + congested Gate → yielded"
+else
+  bad "kernel pressure level 4 did not arm the yield"
+fi
+LOG20DMF2="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" "" 1 2)"
+if echo "$LOG20DMF2" | grep "Cross-stage YIELD" >/dev/null; then
+  bad "OVER-BLOCK: yielded on pressure level 2 alone (it cleared on its own in ga-q4fkxa)"
+else
+  ok "pressure level 2 alone does not yield"
+fi
+
 # ── Scenario 20e: drift-guard — ctx:ready default flipped to 1 and stays env-gated
 echo "Scenario 20e: drift-guard — PILOT_CTX_READY_QUERIES defaults to 1 and is env-gated"
 has "$DISPATCHER" 'PILOT_CTX_READY_QUERIES="\$\{PILOT_CTX_READY_QUERIES:-1\}"' \
@@ -7783,21 +7979,35 @@ else
 fi
 
 echo "Scenario TOPUP-ELIGIBILITY-3: structural — real HQ + rig-fallback queries carry the full worker-probe --exclude-label set, chain _filter_exec_manual before _filter_candidates, and apply the EPIC-title regex (gate_run=ga-8pv70k follow-up)"
-# The first pattern is query-specific (--json/--limit=20 only exist on the
+# The first pattern is query-specific (--json/--limit only exist on the
 # REAL bd ready call), so it's byte-identical TEXT at exactly the 2 real
 # call sites (_topup_rig_pending + _pilot_pool_topup's HQ branch) — same
 # "prove both call sites, not just one" logic the original TOPUP-
-# ELIGIBILITY-3 used. The other three patterns are the FILTER CHAIN
-# (_filter_exec_manual | _filter_candidates | the EPIC-title jq), which
-# ALSO appears at the 2 PILOT_TEST_*_TOPUP_CANDIDATES_JSON seam branches
-# (deliberately — the seam exists specifically to exercise this chain
-# against injected fixtures, see the ga-oc6knj comment above those
-# branches), so those expect 4, not 2.
+# ELIGIBILITY-3 used. ga-9t9acg.4: the fetch is now the WHOLE population
+# (`--limit 0`, never a window — the order rule needs to see every
+# candidate to put the right one first), so the pattern says `--limit 0`;
+# a positive window coming back (`--limit=20` / `--limit 20`) is caught by
+# pilot-dispatcher.topup-order.selftest.sh (A1b/A4b/F[window]), which runs the real query.
+# The next pattern is the FILTER CHAIN (_filter_exec_manual |
+# _filter_candidates), which ALSO appears at the 2
+# PILOT_TEST_*_TOPUP_CANDIDATES_JSON seam branches (deliberately — the seam
+# exists specifically to exercise this chain against injected fixtures, see
+# the ga-oc6knj comment above those branches), so it expects 4, not 2.
+# ga-9t9acg.4: the pick (the EPIC-title skip + the order rule + the
+# "previous pick" fallback) is ONE helper, _topup_pick_first, so the 4
+# pipelines cannot drift apart: each must END in it (4), and the EPIC-title
+# jq now lives exactly once, inside the helper (1) instead of being copied
+# into every pipeline. The last pin follows the filter's text: a title of ANY type
+# is read as text by _topup_validate_input (the FIRST stage of every chain, `.title
+# |= tostring`), so the EPIC test here never meets a non-string title and one bead
+# with such a title cannot make jq fail on the whole candidate array (topup-order
+# selftest C7 and, through the real filters, C10).
 for _tue3_pat_want in \
-  '"${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20|2' \
+  '"${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0|2' \
   '| _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null|4' \
-  '--arg epic_re "$_TOPUP_EPIC_TITLE_RE"|4' \
-  '"") | test($epic_re; "i")) | not)] | .[0].id // empty|4'; do
+  '| _topup_pick_first |||4' \
+  '--arg epic_re "$_TOPUP_EPIC_TITLE_RE"|1' \
+  '"") | test($epic_re; "i")) | not)]|1'; do
   _tue3_pat="${_tue3_pat_want%|*}"
   _tue3_want="${_tue3_pat_want##*|}"
   _tue3_count="$(grep -cF -- "$_tue3_pat" "$DISPATCHER" || true)"
@@ -9317,8 +9527,21 @@ fi
 # out of scope for this lane:small change).
 HEX_BUG='[{"id":"tt-wahex","title":"celula Hex dedup: normaliza data sem format=mixed","priority":1,"issue_type":"bug","description":"a celula de notebook Hex que decide qual proprietario fica usa pd.to_datetime(errors=coerce) sem format=mixed","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 
+# ga-nqjgf0: the structural-owner pick now needs POSITIVE evidence that the owner has a live
+# session (it used to dispatch to a crew with no session at all — wa-3fx45f → batista-wa, with
+# the roster never consulted). "Idle owner" below therefore means an owner that is IN the roster.
+# Rosters mirror `gc session list --json` (named crew: name == alias == agent_name, suffixed session_name).
+_bwa_sess() { # $1=state  $2=closed(true|false)
+  printf '{"id":"ga-wisp-bwa1","name":"batista-wa","alias":"batista-wa","session_name":"batista-wa-gawispbwa1","agent_name":"batista-wa","template":"batista-wa","state":"%s","closed":%s}' "$1" "$2"
+}
+_other_sess='{"id":"ga-wisp-t1","name":"thies-wa","alias":"thies-wa","session_name":"thies-wa-gawispt1","agent_name":"thies-wa","template":"thies-wa","state":"active","closed":false}'
+SESS_BWA_ACTIVE="{\"sessions\":[$(_bwa_sess active false),$_other_sess]}"
+SESS_BWA_ASLEEP="{\"sessions\":[$(_bwa_sess asleep false),$_other_sess]}"
+SESS_BWA_CLOSED="{\"sessions\":[$(_bwa_sess asleep true),$_other_sess]}"
+SESS_NO_BWA="{\"sessions\":[$_other_sess]}"
+
 echo "Scenario ga-pp00f-a: hex-native WA bug dispatches DIRECTLY to batista-wa (idle owner), bypassing the wa-worker pool"
-LOG_PP00F_A="$(run_capacity 10 "[]" 1 "$HEX_BUG")"
+LOG_PP00F_A="$(run_capacity 10 "[]" 1 "$HEX_BUG" "$SESS_BWA_ACTIVE")"
 HEX_BUILDER_A="$(builder_for_domain "$LOG_PP00F_A" hex)"
 if [ "$HEX_BUILDER_A" = "batista-wa" ]; then
   ok "hex-native bug dispatched DIRECTLY to batista-wa (structural owner, ga-pp00f fix)"
@@ -9470,6 +9693,82 @@ if echo "$LOG_WNOJMM_WARM_CTL" | grep -F "pilot:held-count:ga-wnojmm-hex" >/dev/
 else
   ok "warming correctly did NOT receive the new visible-hold treatment (scoped to hex only, per Regra No 4 — warming stays exactly as it was)"
 fi
+
+# ── Scenario ga-nqjgf0: the structural-owner pick requires a LIVE owner session ────────────
+# 2026-10-06 wa-3fx45f (hex) was dispatched to batista-wa — a crew with NO session at all
+# (suspended / never started) — and then looped: 46wq5 re-admitted it ("assignee não é dono
+# ativo"), htjni refused it (external-claim:batista-wa@in_progress), the nudge never landed
+# ("Could not nudge batista-wa"). ga-uvfs6's pick tested "suspended / busy / at-cap / human-engaged"
+# but never "does the owner exist right now". Three states, like every other probe in here:
+#   live (active or asleep — the REUSE path wakes an asleep crew, gt-4st3n)  → dispatch;
+#   none (trusted roster, no non-closed session for the owner)               → defer + VISIBLE hold;
+#   unknown (roster unreadable/empty)                                        → defer, NO hold stamp
+#       ("não consegui saber" never picks the crew, but never escalates on a flaky read either).
+# Scoped to domain=hex like ga-wnojmm's visible hold (Regra No 4: warming is not touched here).
+echo "Scenario ga-nqjgf0-a: hex bug, owner batista-wa has NO session (trusted roster) → NOT dispatched, NOT leaked to the pool, VISIBLY held"
+LOG_NQJ_A="$(run_capacity 10 "[]" 1 "$HEX_BUG" "$SESS_NO_BWA")"
+NQJ_A_BUILDER="$(builders_of "$LOG_NQJ_A")"
+if [ "$NQJ_A_BUILDER" = "batista-wa" ]; then
+  bad "ga-nqjgf0 REGRESSION: hex bug dispatched to batista-wa although the roster has no session for it — the wa-3fx45f loop is back"
+elif echo "$NQJ_A_BUILDER" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
+  bad "ga-nqjgf0: hex bug leaked into the wa-worker pool ($NQJ_A_BUILDER) — pool is structurally incompatible with hex (ga-pp00f)"
+elif [ -n "$NQJ_A_BUILDER" ]; then
+  bad "ga-nqjgf0: hex bug routed unexpectedly with no owner session (got: '$NQJ_A_BUILDER')"
+else
+  ok "ga-nqjgf0: owner with no live session is not picked — hex bug deferred (no dispatch, no pool leak)"
+fi
+if echo "$LOG_NQJ_A" | grep -F "WOULD stamp pilot:held-count:ga-wnojmm-hex:1 on tt-wahex (hold 1/3)" >/dev/null; then
+  ok "ga-nqjgf0: the no-session defer stamps the shared VISIBLE hold counter (never a mute retry-forever)"
+else
+  bad "ga-nqjgf0: no-session defer left no visible hold on the bead (log: $(echo "$LOG_NQJ_A" | grep -iE 'tt-wahex|batista' | tr '\n' '|' | cut -c1-500))"
+fi
+if echo "$LOG_NQJ_A" | grep -F "has NO live session" >/dev/null; then
+  ok "ga-nqjgf0: the log names the reason (owner has no live session)"
+else
+  bad "ga-nqjgf0: the defer does not say WHY (owner has no live session) — indistinguishable from a busy-owner defer"
+fi
+
+echo "Scenario ga-nqjgf0-b: owner session ASLEEP → counts as live (REUSE wakes it, gt-4st3n) → dispatches to batista-wa"
+LOG_NQJ_B="$(run_capacity 10 "[]" 1 "$HEX_BUG" "$SESS_BWA_ASLEEP")"
+NQJ_B_BUILDER="$(builders_of "$LOG_NQJ_B")"
+[ "$NQJ_B_BUILDER" = "batista-wa" ] \
+  && ok "ga-nqjgf0: asleep (wakeable) owner session is live — hex bug dispatched to batista-wa" \
+  || bad "ga-nqjgf0: asleep owner session wrongly treated as no session (got: '${NQJ_B_BUILDER:-none}') — a quiet crew would never get hex work"
+
+echo "Scenario ga-nqjgf0-c: only a CLOSED owner session in the roster → same as no session → deferred + held"
+LOG_NQJ_C="$(run_capacity 10 "[]" 1 "$HEX_BUG" "$SESS_BWA_CLOSED")"
+NQJ_C_BUILDER="$(builders_of "$LOG_NQJ_C")"
+if [ -z "$NQJ_C_BUILDER" ] && echo "$LOG_NQJ_C" | grep -F "WOULD stamp pilot:held-count:ga-wnojmm-hex:1 on tt-wahex" >/dev/null; then
+  ok "ga-nqjgf0: a closed session is not a live owner — deferred and visibly held"
+else
+  bad "ga-nqjgf0: closed owner session treated as live (builder: '${NQJ_C_BUILDER:-none}')"
+fi
+
+echo "Scenario ga-nqjgf0-d: roster UNREADABLE (empty read) → 'não consegui saber' never picks the crew, and does NOT stamp a hold"
+LOG_NQJ_D="$(run_capacity 10 "[]" 1 "$HEX_BUG")"
+NQJ_D_BUILDER="$(builders_of "$LOG_NQJ_D")"
+if [ -n "$NQJ_D_BUILDER" ]; then
+  bad "ga-nqjgf0: hex bug picked a crew ('$NQJ_D_BUILDER') on a roster that could not be read — can't-know must not choose the owner"
+else
+  ok "ga-nqjgf0: unreadable roster → owner not picked, bug not dispatched anywhere"
+fi
+if echo "$LOG_NQJ_D" | grep -F "pilot:held-count:ga-wnojmm-hex" >/dev/null; then
+  bad "ga-nqjgf0: a flaky roster read stamped the visible hold/escalation counter — would escalate to the Mayor on a transient"
+else
+  ok "ga-nqjgf0: unreadable roster does not feed the hold/escalate counter (transient, retried next sweep)"
+fi
+if echo "$LOG_NQJ_D" | grep -F "tt-wahex" | grep -F "roster unreadable" >/dev/null; then
+  ok "ga-nqjgf0: the unreadable-roster defer is logged with its reason"
+else
+  bad "ga-nqjgf0: the unreadable-roster defer is silent (log: $(echo "$LOG_NQJ_D" | grep -iE 'tt-wahex|batista' | tr '\n' '|' | cut -c1-400))"
+fi
+
+echo "Scenario ga-nqjgf0-e (control, Regra No 4): warming's owner pick is NOT changed by this fix — oracle-wa with no roster entry still dispatches exactly as before"
+LOG_NQJ_E="$(run_capacity 10 "[]" 1 "$WARM_BUG" "$SESS_NO_BWA")"
+NQJ_E_BUILDER="$(builders_of "$LOG_NQJ_E")"
+[ "$NQJ_E_BUILDER" = "oracle-wa" ] \
+  && ok "ga-nqjgf0 control: warming still dispatches to oracle-wa regardless of roster (behaviour unchanged; any warming change needs an explicit Athos decision)" \
+  || bad "ga-nqjgf0 control: warming routing changed (got: '${NQJ_E_BUILDER:-none}') — Regra No 4: no behaviour change there without an explicit Athos citation"
 
 # ── Scenario 26: ga-m2gqb RAM-pressure back-off (deferred remainder of ga-7xne1) ──
 # The mini froze 2026-07-27 (13 jetsam kills) when heavy evals + agent-pool load

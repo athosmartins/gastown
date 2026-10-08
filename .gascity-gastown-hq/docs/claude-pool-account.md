@@ -212,7 +212,7 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-pool-account.py` | the daemon (`run-once`) |
 | `packs/town-deltas/assets/scripts/claude-lowprio.sh` | wrapper: points a pool launch at the item (fail-open) |
 | `packs/town-deltas/assets/claude-pool-account.plist` | launchd job, not loaded by the merge |
-| `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API, real accounts lib) |
+| `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API, real accounts lib); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from; it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`) |
 | `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session (+ the guard's real-claude self-test and the leakscan control) |
 | `packs/town-deltas/assets/scripts/claude-pool-guard.py` | the guard (`run-once` / `status [--json]` / `selftest`) |
 | `packs/town-deltas/assets/claude-pool-guard.plist` | the guard's launchd job, not loaded by the merge |
@@ -223,6 +223,27 @@ first, delete last, and only when restarting the pool is acceptable.
 | `.gc/logs/claude-pool-guard.log` | guard events (`SELFTEST claude=… result=…`, `DEGRADED`, `divergence seen/over`, `alert sent`) |
 | `whatsapp_automation/lib/claude_account_pool.py` | services read `claude_pool_current_account.json` first |
 | `.gc/logs/claude-pool-account.log` | daemon + wrapper events (`POOL-ACCT SET/SKIP/KEEP`, `SWITCH a -> b`) |
+
+## The item holds a credential the daemon did not write (ga-xknkke)
+
+The daemon is the only script that writes the item, but it is not the only thing that CAN: a `claude` session whose
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` points at the item (every pool session does) writes there on a `/login` or a token
+refresh. When that happens the daemon sees a different `accessToken`, logs `pool item holds fp=<x> but the decision is
+<email> fp=<y> - rewriting`, and puts the decision back. Since ga-xknkke the line is followed — **before** the rewrite
+erases the evidence — by
+
+```
+foreign write to the pool item (fp=<x>): blob keys=[...] top=[...] refreshToken=yes|no expiresAt=<iso> scopes=[...]
+  subscriptionType=<t>; item modified <UTC>; young claude processes: pid=<n> age=<mm:ss> tty=<t>; ...
+```
+
+How to read it: the daemon's own blob has **no** refresh token, scope `['user:inference']` and an expiry in 2100; a `claude`
+login or refresh leaves a refresh token, more scopes and an expiry hours away. `item modified` is the Keychain's own
+mtime (UTC), and the processes are the `claude` ones younger than 15 minutes (pid / age / tty only — never argv). Key
+NAMES and those few scalars are all that is logged: no token, no refresh token, no value of any other field. Each part
+that could not be read says `unreadable`; it never says `none` for something it could not tell, and a field the blob simply lacks
+says `absent` (a JSON null says `null`, as this daemon's own blob has for the tier). A missing item gets no
+such line (nobody wrote anything). The daemon still rewrites in every case: one decision file is what the services read.
 
 ## Known limits
 

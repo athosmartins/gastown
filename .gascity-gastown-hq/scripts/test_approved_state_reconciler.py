@@ -692,3 +692,210 @@ def test_a_hold_does_not_override_a_bead_something_else_already_parked(hold, par
     retry': once something else parked it, the normal post-build handling applies."""
     route, _signal = asr._classify({"id": "ga-x", "labels": _HELD + [hold, parked]})
     assert route == "post-build"
+
+
+# ── ga-gm5rv5: whose queue does a needs-human route land in? ──────────────────
+# The reconciler wrote story:needs-human for EVERY gate:needs-human* variant. Only
+# :product is Athos's (bead_state.ATHOS_GATE_HUMAN_SUFFIXES — "rodar o máximo sem
+# mim", ga-aprov); :technical/bare/routing/on-device are the Mayor's or the crew's.
+# A technical park therefore carried a marker that reads as "waiting on a human"
+# but named nobody, and wa-2362s2.2/.5 read as the Athos's on a card (06/10).
+# Decision of the Mayor (06/10): story:needs-human ONLY for :product; a technical
+# park gets next-action:mayor + a "Pergunta:" comment (the convention
+# next-action-coordinator-alert.sh keys on), and the assignee is never touched.
+import bead_state  # noqa: E402  (scripts/ is on sys.path via the module under test)
+
+
+class _Writes:
+    """What _route_bead did to the bead, observed through the module's own bd seams."""
+
+    def __init__(self):
+        self.adds, self.removes, self.comments, self.ledger = [], [], [], []
+        self.notes = []
+        self.fail_adds = set()
+        self.fail_comment_prefixes = ()
+
+
+@pytest.fixture
+def writes(monkeypatch):
+    w = _Writes()
+
+    def _add(_root, bead_id, label):
+        w.adds.append((bead_id, label))
+        return label not in w.fail_adds
+
+    monkeypatch.setattr(asr, "DRY_RUN", False)
+    monkeypatch.setattr(asr, "_bd_label_add", _add)
+    monkeypatch.setattr(asr, "_bd_label_remove",
+                        lambda _r, b, label: w.removes.append((b, label)) or True)
+    def _comment(_root, bead_id, text):
+        if text.startswith(w.fail_comment_prefixes):
+            return False
+        w.comments.append((bead_id, text))
+        return True
+
+    monkeypatch.setattr(asr, "_bd_comment", _comment)
+    monkeypatch.setattr(asr, "_do_notify", lambda msg, _prio: w.notes.append(msg))
+    # hermetic: never append fixture rows to the production ledgers
+    monkeypatch.setattr(asr, "_arc_ledger",
+                        lambda name, data, **_kw: w.ledger.append((name, data)))
+    return w
+
+
+def _route(bead, writes):
+    """classify + route exactly the way run_cycle does; returns (route_to, state)."""
+    route_to, signal = asr._classify(bead)
+    assert route_to == "needs-human", (route_to, signal)
+    state = {}
+    assert asr._route_bead("/rig", bead, route_to, signal, 1_000_000.0, state) is True
+    return route_to, state
+
+
+def _labels_after(bead, writes):
+    labels = set(bead["labels"]) - {l for _b, l in writes.removes}
+    return labels | {l for _b, l in writes.adds}
+
+
+_TECH = ["story:approved", "gate:needs-human", "gate:needs-human:technical", "lane:small"]
+
+
+def test_technical_park_is_never_stamped_story_needs_human(writes):
+    _route({"id": "wa-2362s2.2", "assignee": None, "labels": list(_TECH)}, writes)
+    assert ("wa-2362s2.2", "story:needs-human") not in writes.adds, writes.adds
+
+
+def test_technical_park_names_the_mayor_with_next_action_and_a_pergunta(writes):
+    _route({"id": "wa-2362s2.2", "assignee": None, "labels": list(_TECH)}, writes)
+    assert ("wa-2362s2.2", "next-action:mayor") in writes.adds, writes.adds
+    texts = [t for b, t in writes.comments if b == "wa-2362s2.2"]
+    # next-action-coordinator-alert.sh picks the question by comment text startswith
+    # "Pergunta:" — a Pergunta buried inside the audit comment is invisible to it.
+    assert any(t.startswith("Pergunta:") for t in texts), texts
+
+
+def test_technical_park_still_leaves_story_approved_and_keeps_the_gate_label(writes):
+    """The vetoes of the Pilot / pool probes key on gate:needs-human* — the route must
+    take story:approved off the bead and leave the gate label exactly where it is."""
+    bead = {"id": "wa-2362s2.5", "assignee": None, "labels": list(_TECH)}
+    _route(bead, writes)
+    assert ("wa-2362s2.5", "story:approved") in writes.removes
+    assert not [r for r in writes.removes if r[1].startswith("gate:needs-human")], writes.removes
+
+
+def test_the_operator_notification_names_the_label_that_was_actually_written(writes):
+    """The notify is the operator's only live view of a route: for a technical park it
+    must not claim story:needs-human (the Athos's marker) when next-action:mayor is
+    what landed on the bead."""
+    _route({"id": "wa-2362s2.2", "assignee": None, "labels": list(_TECH)}, writes)
+    assert len(writes.notes) == 1, writes.notes
+    assert "next-action:mayor" in writes.notes[0], writes.notes
+    assert "story:needs-human" not in writes.notes[0], writes.notes
+
+
+def test_a_product_park_notification_still_names_story_needs_human(writes):
+    bead = {"id": "wa-9", "assignee": None,
+            "labels": ["story:approved", "gate:needs-human", "gate:needs-human:product"]}
+    _route(bead, writes)
+    assert len(writes.notes) == 1 and "story:needs-human" in writes.notes[0], writes.notes
+
+
+def test_technical_park_is_never_the_athos_turn_by_any_label_it_writes(writes):
+    bead = {"id": "wa-2362s2.2", "assignee": None, "labels": list(_TECH)}
+    _route(bead, writes)
+    after = _labels_after(bead, writes)
+    assert "next-action:athos" not in after and not any(
+        l.startswith("next-action:athos") for l in after), after
+    derived = bead_state.derive({"id": bead["id"], "status": "open", "assignee": None,
+                                 "labels": sorted(after)})
+    assert derived["turn"] == "mayor", derived
+    assert derived["state"] == "parked", derived
+
+
+def test_a_live_crew_assignee_is_neither_cleared_nor_replaced(writes, monkeypatch):
+    """"assignee do autor se for crew viva": the reconciler has no liveness probe, so it
+    must never decide to clear (or set) an assignee — whoever holds the bead keeps it."""
+    calls = []
+    monkeypatch.setattr(asr, "_sh", lambda cmd, **_kw: calls.append(cmd))
+    _route({"id": "wa-2362s2.2", "assignee": "wa/crew/digo", "labels": list(_TECH)}, writes)
+    assert ("wa-2362s2.2", "next-action:mayor") in writes.adds
+    assert not [c for c in calls if "assign" in " ".join(map(str, c))
+                or "--assignee" in " ".join(map(str, c))], calls
+
+
+@pytest.mark.parametrize("variant", [
+    "gate:needs-human:routing", "gate:needs-human:mayor-fixing",
+    "gate:needs-human:on-device", "gate:needs-human:refused",
+    "gate:needs-human:partial-delivery",
+])
+def test_every_non_product_gate_variant_is_the_mayors_not_the_athos(writes, variant):
+    """bead_state decides who owns a variant; the reconciler must not keep its own
+    shorter list of what is the Athos's."""
+    assert variant.rsplit(":", 1)[1] not in bead_state.ATHOS_GATE_HUMAN_SUFFIXES
+    _route({"id": "ga-v1", "labels": ["story:approved", "gate:needs-human", variant]}, writes)
+    assert ("ga-v1", "story:needs-human") not in writes.adds, writes.adds
+    assert ("ga-v1", "next-action:mayor") in writes.adds, writes.adds
+
+
+def test_bare_gate_needs_human_is_not_a_product_decision(writes):
+    _route({"id": "ga-v2", "labels": ["story:approved", "gate:needs-human"]}, writes)
+    assert ("ga-v2", "story:needs-human") not in writes.adds
+    assert ("ga-v2", "next-action:mayor") in writes.adds
+
+
+def test_a_product_decision_still_reaches_the_athos_queue(writes):
+    bead = {"id": "ga-p1", "labels": ["story:approved", "gate:needs-human:product"]}
+    _route(bead, writes)
+    assert ("ga-p1", "story:needs-human") in writes.adds, writes.adds
+    assert ("ga-p1", "next-action:mayor") not in writes.adds, writes.adds
+    assert ("ga-p1", "story:approved") in writes.removes
+
+
+def test_product_plus_technical_is_still_a_product_decision(writes):
+    """A product call must never be hidden from the Athos by a technical label that
+    happens to sit beside it — the conservative reading wins."""
+    _route({"id": "ga-p2", "labels": ["story:approved", "gate:needs-human",
+                                      "gate:needs-human:technical",
+                                      "gate:needs-human:product"]}, writes)
+    assert ("ga-p2", "story:needs-human") in writes.adds
+    assert ("ga-p2", "next-action:mayor") not in writes.adds
+
+
+@pytest.mark.parametrize("labels", [["story:approved", "needs-human"],
+                                    ["story:approved", "story:needs-human"]])
+def test_a_marker_with_no_gate_variant_keeps_todays_route(writes, labels):
+    """Nothing says whose it is → no new claim either way (can't-know is not 'mayor'):
+    the legacy stamp stays exactly as before (scenarios c2/c3 of the selftest)."""
+    _route({"id": "ga-u1", "labels": list(labels)}, writes)
+    assert ("ga-u1", "story:needs-human") in writes.adds
+    assert ("ga-u1", "next-action:mayor") not in writes.adds
+
+
+def test_the_mayor_label_is_added_before_story_approved_is_removed(writes):
+    """add-before-remove (IMPORTANT 3): a failed write must not leave the bead with no
+    lifecycle label and no owner — and must not start the cooldown."""
+    writes.fail_adds.add("next-action:mayor")
+    bead = {"id": "wa-2362s2.2", "assignee": None, "labels": list(_TECH)}
+    route_to, signal = asr._classify(bead)
+    state = {}
+    assert asr._route_bead("/rig", bead, route_to, signal, 1_000_000.0, state) is False
+    assert ("wa-2362s2.2", "story:approved") not in writes.removes
+    assert "wa-2362s2.2" not in state.get("routed", {})
+
+
+def test_a_failed_pergunta_write_is_visible_in_the_notification_not_swallowed(writes):
+    """The route itself landed (label added, story:approved removed, cooldown set) but
+    the Mayor's question did not: the bead sits on next-action:mayor with no 'Pergunta:'.
+    The reconciler cannot retry it (cooldown), so the failure has to be said out loud
+    — a notify that reads like a clean route would hide a half-written one."""
+    writes.fail_comment_prefixes = ("Pergunta:",)
+    _route({"id": "wa-2362s2.2", "assignee": None, "labels": list(_TECH)}, writes)
+    assert ("wa-2362s2.2", "next-action:mayor") in writes.adds
+    assert not any(t.startswith("Pergunta:") for _b, t in writes.comments)
+    assert len(writes.notes) == 1, writes.notes
+    assert "Pergunta" in writes.notes[0] and "FAILED" in writes.notes[0], writes.notes
+
+
+def test_a_written_pergunta_leaves_the_notification_clean(writes):
+    _route({"id": "wa-2362s2.2", "assignee": None, "labels": list(_TECH)}, writes)
+    assert any(t.startswith("Pergunta:") for _b, t in writes.comments)
+    assert "FAILED" not in writes.notes[0], writes.notes
