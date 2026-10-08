@@ -13289,7 +13289,15 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
     # unchanged; only a failure can no longer be mistaken for a successful
     # read that merely omitted these fields.
     HR_H=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc dolt health --json) || true
-    HR_LAT=$(printf '%s' "$HR_H" | jq -r '.server.latency_ms // empty' 2>/dev/null || echo "")
+    # ga-epf9hn: latency is only believed from a payload with server.reachable == true. `gc dolt
+    # health --json` starts latency_ms at 0 and overwrites it only after its SELECT 1 answers, so a
+    # down/wedged Dolt prints 0 — which would log as lat=0ms, reach pool_ceiling_dolt_class as "ok"
+    # (the dynamic ceiling growing with Dolt down) and gate_headroom_decision as a measured "calm".
+    # Blank is "?" / "unknown" / no-signal instead. Under the default fail-open that admits at the
+    # same ceiling as before (only the logged reason changes, dolt-calm -> no-signal-failopen); with
+    # GATE_HEADROOM_FAILOPEN=0 it now defers, as a no-signal reading should. The pid is left as read:
+    # a live process's CPU is a real measurement and can still defer.
+    HR_LAT=$(printf '%s' "$HR_H" | jq -r 'if .server.reachable == true then (.server.latency_ms // empty) else empty end' 2>/dev/null || echo "")
     HR_PID=$(printf '%s' "$HR_H" | jq -r '.server.pid // empty' 2>/dev/null || echo "")
   fi
   # ga-bgvc0: judge the plane by its AMBIENT load (sampled at sweep start, before

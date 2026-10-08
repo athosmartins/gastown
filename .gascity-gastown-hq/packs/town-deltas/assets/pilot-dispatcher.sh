@@ -2258,8 +2258,15 @@ _dolt_probe() {
   # fix is that a failure can no longer be mistaken for a *successful* health
   # read that merely omitted these fields.
   _h=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc dolt health --json) || true
-  DOLT_LATENCY_MS=$(printf '%s' "$_h" | jq -r '.server.latency_ms // empty' 2>/dev/null || echo "")
-  DOLT_PID=$(printf '%s' "$_h" | jq -r '.server.pid // empty' 2>/dev/null || echo "")
+  # ga-epf9hn: latency and pid are only believed from a payload with server.reachable == true.
+  # `gc dolt health --json` ALWAYS exits 0 and starts latency_ms at 0 / reachable at false,
+  # overwriting them only after its bounded SELECT 1 answers — so a down Dolt, or one whose TCP is
+  # up while SQL is wedged, prints latency_ms:0, which _dolt_saturated would take as the
+  # AUTHORITATIVE "healthy" reading. Not reachable (false, missing, or not the boolean true) leaves
+  # BOTH blank: the pid too, else _dolt_cpu reads a live-but-wedged process and its low CPU says
+  # "healthy" through the fallback. Both blank is the "unreadable" fail-safe below.
+  DOLT_LATENCY_MS=$(printf '%s' "$_h" | jq -r 'if .server.reachable == true then (.server.latency_ms // empty) else empty end' 2>/dev/null || echo "")
+  DOLT_PID=$(printf '%s' "$_h" | jq -r 'if .server.reachable == true then (.server.pid // empty) else empty end' 2>/dev/null || echo "")
 }
 
 # _dolt_cpu — echo integer CPU% of the live dolt-server pid (cheap). Honors seam.

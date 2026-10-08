@@ -114,7 +114,7 @@ cat > "$SHIMBIN/gc" <<'SHIM'
 #!/usr/bin/env bash
 case "$*" in
   *"rig list"*) printf '{"rigs":[]}' ;;
-  *"dolt health"*) printf '{"server":{"latency_ms":5,"pid":12345}}' ;;
+  *"dolt health"*) printf '{"server":{"reachable":true,"latency_ms":5,"pid":12345}}' ;;
   *"session list"*) printf '{"sessions":[]}' ;;
   *) : ;;
 esac
