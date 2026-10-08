@@ -805,8 +805,11 @@ def _lstart(pid):
 def test_an_unreadable_sessions_dir_before_the_switch_is_not_reported_as_all_bridges_up(w):
     os.rename(w.d / "sessions", w.d / "sessions.gone")
     _switch_crypto_to_amb(w)
+    assert w.state()["pending_verify"]["blind"] is True
+    os.rename(w.d / "sessions.gone", w.d / "sessions")            # readable again at the check: this runs the BLIND branch, not the retry one
     w.run(at=w.now + 90)
-    assert "all 0" not in w.log() and "NOT verified" in w.log()
+    assert w.state()["rc_unjudged"]["blind"] is True and "pending_verify" not in w.state()
+    assert "no list of bridges to compare" in w.log() and "all 0" not in w.log() and not w.notified()
 
 
 def test_an_unreadable_sessions_dir_at_check_time_is_neither_success_nor_a_false_alarm_and_is_retried(w):
@@ -899,6 +902,116 @@ def test_the_bridge_check_also_runs_when_the_owner_cannot_be_told(w):
     w.decide("crypto")
     w.run()
     assert any("lost Remote Control" in n for n in w.notified())
+
+
+# ══ gate fix (ga-llvuo4, verdict on 654892dc): "could not read" and "lost" are different verdicts ═══════════════════
+def _lost_pushes(w):
+    return [n for n in w.notified() if "lost Remote Control" in n]
+
+
+def test_a_live_session_whose_file_cannot_be_read_at_check_time_is_unverified_not_lost(w):
+    me = os.getpid()
+    _session(w, me, "cse_a")
+    _switch_crypto_to_amb(w)
+    (w.d / "sessions" / f"{me}.json").write_text("{torn write")   # still running, but its file cannot be read right now
+    w.run(at=w.now + 90)
+    assert _lost_pushes(w) == [] and "rc_lost" not in w.state() and "pending_verify" not in w.state()
+    assert w.state()["rc_unjudged"]["unverified"] == [me]         # its own counter, with the pid named
+    log = w.log()
+    assert f"[{me}]" in log and "Remote Control NOT verified" in log and "still up" not in log
+
+
+def test_an_unreadable_file_that_cannot_be_tied_to_a_pid_leaves_every_missing_session_unverified(w):
+    me = os.getpid()
+    _session(w, me, "cse_a")
+    _switch_crypto_to_amb(w)
+    (w.d / "sessions" / f"{me}.json").unlink()                    # its own file is gone ...
+    (w.d / "sessions" / "not-a-pid.json").write_text("{torn")     # ... and a file we cannot read might be where its bridge went
+    w.run(at=w.now + 90)
+    assert _lost_pushes(w) == [] and w.state()["rc_unjudged"]["unverified"] == [me]
+
+
+def test_unreadable_and_lost_are_told_apart_in_the_same_check(w):
+    me, parent = os.getpid(), os.getppid()
+    _session(w, me, "cse_a")
+    _session(w, parent, "cse_b")
+    _switch_crypto_to_amb(w)
+    (w.d / "sessions" / f"{me}.json").write_text("{torn write")   # cannot tell
+    _session(w, parent, None)                                     # certainly lost
+    w.run(at=w.now + 90)
+    assert w.state()["rc_lost"]["pids"] == [parent] and w.state()["rc_unjudged"]["unverified"] == [me]
+    assert len(_lost_pushes(w)) == 1 and f"the sessions [{parent}] lost Remote Control" in _lost_pushes(w)[0]   # exactly the lost one
+
+
+# ══ gate fix (ga-llvuo4): a second switch must not silently drop the check the first one promised ═════════════════
+def _flip_back_to_crypto(w, at):
+    w.decide("crypto")
+    return w.run(at=at)
+
+
+def test_a_second_switch_before_the_first_check_is_judged_carries_the_first_check(w):
+    me = os.getpid()
+    _session(w, me, "cse_a")
+    _switch_crypto_to_amb(w)
+    _session(w, me, None)                                         # the first switch cost this session its bridge
+    _flip_back_to_crypto(w, w.now + 30)                           # the pool flips back before the 60 s check
+    assert w.log().count("SWITCH crews") == 2                     # a second switch really happened
+    assert str(me) in w.state()["pending_verify"]["pids"]         # the first check's session is still on the list
+    assert "still pending" in w.log() and "carried" in w.log()
+    w.run(at=w.now + 130)
+    assert w.state()["rc_lost"]["pids"] == [me] and len(_lost_pushes(w)) == 1
+    assert "no Remote Control bridge existed" not in w.log()      # not the plausible-but-false empty
+
+
+def test_a_second_switch_after_a_blind_first_one_stays_blind(w):
+    os.rename(w.d / "sessions", w.d / "sessions.gone")
+    _switch_crypto_to_amb(w)                                      # blind: the first switch could not list the bridges
+    os.rename(w.d / "sessions.gone", w.d / "sessions")
+    _session(w, os.getpid(), "cse_a")
+    _flip_back_to_crypto(w, w.now + 30)                           # the second one can, but not what the first one cost
+    assert w.state()["pending_verify"]["blind"] is True
+    w.run(at=w.now + 130)
+    assert w.state()["rc_unjudged"]["blind"] is True and "still up" not in w.log() and _lost_pushes(w) == []
+
+
+def test_a_pending_check_that_is_not_a_dict_does_not_break_the_next_switch(w):
+    _session(w, os.getpid(), "cse_a")
+    (w.d / "crew_state.json").write_text(json.dumps({"pending_verify": "garbage"}))
+    _switch_crypto_to_amb(w)
+    assert str(os.getpid()) in w.state()["pending_verify"]["pids"]
+
+
+# ══ gate fix (ga-llvuo4): the rc-lost push promises a retry; it must be reachable ═════════════════════════════════
+def test_an_undelivered_rc_lost_push_is_retried_and_then_told_once(w):
+    me = os.getpid()
+    _session(w, me, "cse_a")
+    _switch_crypto_to_amb(w)
+    _session(w, me, None)
+    w.mp.setenv("FAKE_NOTIFY_FAIL", "1")                          # the notify binary is down
+    w.run(at=w.now + 90)
+    assert len(_lost_pushes(w)) == 1 and w.state()["rc_lost"]["push_pending"] is True
+    w.run(at=w.now + 120)                                         # inside ALERT_RETRY_S: not hammered
+    assert len(_lost_pushes(w)) == 1
+    w.mp.delenv("FAKE_NOTIFY_FAIL")
+    w.run(at=w.now + 90 + crew.ALERT_RETRY_S + 10)                # after it: tried again, and now it gets through
+    assert len(_lost_pushes(w)) == 2 and w.state()["rc_lost"]["push_pending"] is False
+    w.run(at=w.now + 90 + 3 * crew.ALERT_RETRY_S)                 # told is told: no nagging until the next switch
+    assert len(_lost_pushes(w)) == 2
+
+
+# ══ gate fix (ga-llvuo4): `ps` that complains is "could not ask", not "no such process" ════════════════════════════
+def test_a_ps_that_complains_is_could_not_ask_not_no_such_process(w):
+    real = subprocess.run
+
+    def fake(argv, **kw):
+        if "lstart=" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "ps: something is wrong\n")
+        return real(argv, **kw)
+    w.mp.setattr(crew.subprocess, "run", fake)
+    assert crew.proc_start(os.getpid()) is None                   # not '' (= it does not exist)
+    assert crew.alive(os.getpid(), "Mon Jan  1 00:00:00 2001") is True    # so the kill(0) fallback answers, and the pid is alive
+    w.mp.setattr(crew.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", ""))
+    assert crew.proc_start(os.getpid()) == ""                     # a plain rc=1 with nothing on stderr IS "no such process"
 
 
 # ── only the OAuth part of a blob moves ────────────────────────────────────────────────────────────────────────────
