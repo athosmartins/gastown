@@ -152,6 +152,10 @@ check(len(epochs) == 2 and fresh is True and BR in text,
 # and — since ga-yprwyk — a WIDE read for the claim history), so a blind reader also blinds it. Both variants below use a
 # log with invalid UTF-8 inside the window, and a head far past the dispatcher's overdue ceiling (patched to the default
 # 5400s here: deriving it from the live launchd job is covered by gate-recovery-watchdog.orphan-proof-tiered.selftest.sh).
+# The overdue-tier premise is pinned True for the same reason (ga-ges6uf): since ga-q8tj7p the REAL dispatcher has no
+# priority-blind overdue tier, so orphaned_queued_marker() returns before it ever reads the claim history — and an
+# unpinned run turned this section into a test of the live dispatcher source, not of the tolerant reader. What the
+# watchdog does against the real dispatcher (loud, rate-limited "order-changed" note) is Group E of the tiered selftest.
 HARD = 5400
 HEAD_CREATED = NOW - (HARD + m.ORPHAN_PROOF_MARGIN_SEC + 7200)
 def orphan_log(name, claimed_marker):
@@ -162,6 +166,7 @@ def orphan_log(name, claimed_marker):
 def run_orphan(p, created):
     try:
         with Patch(DISPATCH_LOG=p, _dispatcher_hard_age=lambda now=None: HARD,
+                   _dispatcher_has_overdue_tier=lambda now=None: True,
                    _marker_created_epoch=lambda mid: created.get(mid),
                    _queued_markers=lambda: [("ga-head", "crew/x/head", HEAD_CREATED, ("gate-status:queued",))]):
             return m.orphaned_queued_marker()
