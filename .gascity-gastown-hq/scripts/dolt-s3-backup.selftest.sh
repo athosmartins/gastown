@@ -13,6 +13,11 @@ SCRIPT="$HERE/dolt-s3-backup.sh"
 export DOLT_S3_BACKUP_LIB=1
 # shellcheck disable=SC1090
 . "$SCRIPT"
+# ga-a0woau: the oldgen-seeded staging is on by default, and its gate (_sync_seed_saving_kb) reads the
+# machine's real Dolt config and live store. Every test written before it is a statement about the LEGACY
+# gate, so none of them may depend on what this host's hq looks like: pin the switch off for the whole
+# file, and let the ga-a0woau blocks below turn it on explicitly, against fixtures.
+SYNC_SEED_OLDGEN=0
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -2638,6 +2643,7 @@ e2e29_write_stubs() { # <bin dir>
 if [ "$1" = "-sk" ]; then
   case "$2" in
     */.beads/dolt/hq) printf '%s\t%s\n' "$E29_LIVE_KB" "$2"; exit 0 ;;
+    */.beads/dolt/hq/.dolt/noms/oldgen) [ -n "${E29_OLDGEN_KB:-}" ] && { printf '%s\t%s\n' "$E29_OLDGEN_KB" "$2"; exit 0; } ;;
     */.dolt-backup/hq) if [ -e "$2/residue.bin" ]; then printf '%s\t%s\n' "$E29_RESIDUE_KB" "$2"; exit 0; fi ;;
   esac
 fi
@@ -2647,6 +2653,7 @@ STUB
 #!/bin/bash
 avail="$E29_FREE_KB"
 if [ ! -e "$E29_STAGING/residue.bin" ] && [ "${E29_RECLAIM:-yes}" = yes ]; then avail=$((avail + E29_RESIDUE_KB)); fi
+[ -e "$E29_STATE/disk_full" ] && avail=1000000     # ga-a0woau: a sync-url that is eating the disk (E29_SYNC_URL_HOG)
 printf 'Filesystem 1024-blocks Used Available Capacity iused ifree %%iused Mounted\n/dev/fake 99999999 1 %s 1%% 1 1 1%% /System/Volumes/Data\n' "$avail"
 STUB
   cat > "$b/dolt" <<'STUB'
@@ -2660,8 +2667,27 @@ case "$args" in
     dest=""; for a in "$@"; do case "$a" in file://*) dest="${a#file://}" ;; esac; done
     # E29_SYNC_URL_STALE=1: a staging that already holds a manifest is the ga-b5h83 stale-manifest case
     [ "${E29_SYNC_URL_STALE:-0}" = 1 ] && [ -e "$dest/manifest" ] && { echo "error: table file not found: $dest/$(printf '%032d' 7)"; exit 1; }
+    # ga-a0woau: a sync-url into the SEEDED dest (its manifest names the placeholder root) behaves like the
+    # real one measured on Dolt 2.3.1: it keeps every seeded table untouched, adds ONE new table and commits
+    # the real root. E29_SYNC_URL_HOG=1 is the failure the watchdog exists for: it starts eating the disk
+    # (df drops below the floor) and would keep going. The seed state it saw is logged for the assertions.
+    if [ -f "$dest/manifest" ] && [ "$(awk -F: '{print $4}' "$dest/manifest")" = seedseedseedseedseedseedseedseed ]; then
+      echo "sync-url-seeded dest=$dest root=seedseedseedseedseedseedseedseed tables=$(awk -F: '{print (NF-5)/2}' "$dest/manifest")" >> "$E29_CALLS"
+      if [ "${E29_SYNC_URL_HOG:-0}" = 1 ]; then : > "$E29_STATE/disk_full"; exec /bin/sleep 37; fi
+      newtid="$(printf '%032d' 50)"
+      printf '%s' "$(awk -F: -v OFS=: -v r=0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -v t="$newtid" '{ $4 = r; print $0 OFS t OFS 3 }' "$dest/manifest")" > "$dest/manifest.tmp" \
+        && mv "$dest/manifest.tmp" "$dest/manifest" && printf 'newtable' > "$dest/$newtid.darc"
+      exit 0
+    fi
     mkdir -p "$dest" && cp -R "$E29_STATE/fresh_backup/." "$dest/"; exit 0 ;;
-  *"SELECT @@port"*) printf '@@port\n43999\n'; exit 0 ;;
+  *"SELECT @@port"*)
+    # ga-a0woau: E29_BREAK_CLONE=1 — the snapshot the lib just cloned loses an oldgen table the manifest names,
+    # i.e. the seed that the disk gate counted on cannot be built any more by the time the sync needs it.
+    if [ "${E29_BREAK_CLONE:-0}" = 1 ]; then
+      dd=""; prev=""; for a in "$@"; do [ "$prev" = "--data-dir" ] && dd="$a"; prev="$a"; done
+      rm -f "$dd/.dolt/noms/oldgen/$(printf '%032d' 2).darc"
+    fi
+    printf '@@port\n43999\n'; exit 0 ;;
 esac
 case "$q" in
   "SHOW DATABASES") printf 'Database\nhq\ninformation_schema\n' ;;
@@ -2797,6 +2823,15 @@ e2eE_case() {
   printf '#!/bin/bash\nprintf "%%s\\n" "${E2EE_PS_OUT-bash /x/scripts/dolt-s3-backup.sh}"\n' > "$E/bin/ps"; chmod +x "$E/bin/ps"
   printf 'listener:\n  port: 43210\ndata_dir: "%s"\n' "$E/city/.beads/dolt" > "$E/city/.gc/runtime/packs/dolt/dolt-config.yaml"
   echo live > "$E/city/.beads/dolt/hq/blob"
+  # ga-a0woau: E2EE_OLDGEN=<n> gives the live hq an oldgen of n tables whose manifest has a ZERO root, like
+  # the real one (the placeholder root exists because of exactly that); the stub du reports E2EE_OLDGEN_KB for it.
+  if [ "${E2EE_OLDGEN:-0}" -gt 0 ]; then
+    local og="$E/city/.beads/dolt/hq/.dolt/noms/oldgen" gi
+    mkdir -p "$og"; for gi in $(seq 1 "$E2EE_OLDGEN"); do printf 'oldgen-table%s' "$gi" > "$og/$(e2e_tid "$gi").darc"; done
+    e2e_mkmanifest "$og/manifest" "$E2EE_OLDGEN"
+    printf '%s' "$(awk -F: -v OFS=: -v r=00000000000000000000000000000000 '{ $4 = r; print }' "$og/manifest")" > "$og/manifest.tmp" && mv "$og/manifest.tmp" "$og/manifest"
+    [ "${E2EE_OLDGEN_BREAK:-0}" = 1 ] && rm -f "$og/$(e2e_tid 2).darc"     # the manifest names a table the oldgen no longer has
+  fi
   st="$E/city/.dolt-backup/hq"; mkdir -p "$E/city/.dolt-backup"
   case "$kind" in
     closed)  e2e_mkbackup "$st" 3 ;;                                    # a valid staging from an earlier night
@@ -2815,8 +2850,10 @@ e2eE_case() {
     RESEED_AFTER_UPLOAD=0 FB="$E/bucket" CALLS="$E/aws.calls" OFFLINE_SYNC_TMP_ROOT="$E/tmp" \
     DOLT_BACKUP_EPHEMERAL_DBS="${E2EE_EPH_DBS-hq}" E2EE_PS_OUT="${E2EE_PS_OUT-bash /x/scripts/dolt-s3-backup.sh}" \
     E2E_AWS_NOOP="${E2EE_AWS_NOOP:-0}" E29_SYNC_URL_FAIL="${E2EE_SYNC_FAIL:-0}" E29_SYNC_URL_STALE="${E2EE_SYNC_STALE:-0}" \
+    SYNC_SEED_OLDGEN="${E2EE_SEED_SWITCH:-1}" E29_BREAK_CLONE="${E2EE_BREAK_CLONE:-0}" \
     E2E_NOTIFY_CALLS="$E/notify.calls" E2E_CALLS="$E/gc.calls" \
-    E29_LIVE_KB=9265152 E29_RESIDUE_KB=6384952 E29_FREE_KB="$free_kb" E29_RECLAIM=no \
+    E29_LIVE_KB="${E2EE_LIVE_KB:-9265152}" E29_OLDGEN_KB="${E2EE_OLDGEN_KB:-}" E29_SYNC_URL_HOG="${E2EE_SYNC_HOG:-0}" \
+    E29_RESIDUE_KB=6384952 E29_FREE_KB="$free_kb" E29_RECLAIM=no \
     E29_STAGING="$st" E29_STATE="$E/state" E29_CALLS="$E/dolt.calls" \
     timeout 120 /bin/bash "$SCRIPT" > "$E/run.out" 2>&1
   E2E_RC=$?
@@ -2989,6 +3026,216 @@ if [ "$E2E_RC" -eq 0 ] && grep -q 'hq(sync)' "$E2E_DIR/notify.calls" && [ -f "$E
    && ! grep -qF 'auto-reinit' "$E2E_LOG" && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 1 ]; then
   ok "e2e EK: a plain sync failure is a FAILED night (hq(sync)) and the retained staging is NOT wiped (only a stale manifest justifies that)"
 else bad "e2e EK: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+
+
+# ═══ ga-a0woau: the SEED-AWARE disk gate and its wiring ═══════════════════════════════════════════════
+# MEASURED 2026-10-08: hq live 11.5GB (oldgen 11.3GB of it), free 6.0-6.2GB. The gate wanted 150% of live
+# (17.6GB) to build a local staging that is a full copy of the store, and refused 8 nights of 9 (30/09..08/10).
+# With the staging seeded from the oldgen (clonefile copies, ~0 real disk) the sync writes only the ~0.7GB
+# the oldgen does not hold: the gate must count that, and ONLY that, and only when the seed will really be used.
+echo "── seed-aware disk gate (ga-a0woau) — hq numbers of 2026-10-08, unit level ──"
+SG_CITY="$(mktemp -d)"; SG_LOG="$(mktemp)"; SG_CALLS="$(mktemp)"
+mkdir -p "$SG_CITY/.beads/dolt/hq" "$SG_CITY/.beads/dolt/testdb"
+du() { case "$2" in "$SG_CITY/.beads/dolt/hq"|"$SG_CITY/.beads/dolt/testdb") printf '%s\t%s\n' "${SG_LIVE_KB-0}" "$2" ;; *) command du "$@" ;; esac; }
+df() { if [ "$2" = "/System/Volumes/Data" ]; then
+  printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted\n/dev/x 1 1 %s 1%% 1 1 1%% /System/Volumes/Data\n' "${SG_FREE_KB-0}"
+  else command df "$@"; fi; }
+# The lib's seed state is stubbed here: this block is about the gate's arithmetic and wiring. The state function
+# itself (dest content, volume, oldgen readable...) is tested against a real store in dolt-offline-backup-sync.selftest.sh.
+SG_ORIG_SEED_STATE="$(declare -f _offline_sync_seed_state)"
+_offline_sync_seed_state() { printf '%s %s\n' "$1" "$2" >> "$SG_CALLS"; printf '%s\n' "${SG_SEED_STATE-ok 11314756}"; }
+SG_HQ_LIVE_KB=12035000; SG_HQ_OLDGEN_KB=11314756; SG_HQ_FREE_KB=6230068
+_run_sg() { # <db> <live_kb> <free_kb> [switch 1|0] — the REAL gate; sets SG_RC
+  : > "$SG_LOG"; : > "$SG_CALLS"
+  SG_LIVE_KB="$2" SG_FREE_KB="$3" CITY="$SG_CITY" LOG="$SG_LOG" BACKUP_ROOT="$SG_CITY/.dolt-backup" \
+    SYNC_DISK_MARGIN_PCT=150 SYNC_DISK_FLOOR_GB=3 SYNC_SEED_OLDGEN="${4:-1}" \
+    DOLT_BACKUP_EPHEMERAL_CONF="$SG_CITY/none.env" DOLT_BACKUP_EPHEMERAL_DBS="${SG_EPH-hq}" \
+    _sync_disk_preflight_credit "$1" "${SG_CREDIT-0}"; SG_RC=$?
+}
+
+# G1 — THE night: 6.2GB free, hq 11.5GB live with an 11.3GB oldgen. Needs floor 3GB + 150% of the 0.7GB that is
+# not oldgen = 4127MB (not 17629MB): passes, says why in the same "sync preflight OK" line, and flags the seed as counted on.
+_run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
+if [ "$SG_RC" -eq 0 ] && grep -qF 'hq: sync preflight OK (livre=6084MB >= precisa=4127MB, vivo=11752MB, semeado do oldgen: 11049MB' "$SG_LOG" \
+   && [ "$_SYNC_SEED_CREDITED" = 1 ]; then
+  ok "G1: hq at 6.2GB free passes on the seed (precisa=4127MB, not 17629MB) and the pass is flagged _SYNC_SEED_CREDITED=1"
+else bad "G1: rc=$SG_RC credited=$_SYNC_SEED_CREDITED log='$(cat "$SG_LOG")'"; fi
+grep -qF "hq $SG_CITY/.dolt-backup/hq" "$SG_CALLS" \
+  && ok "G1: the seed state was asked about the REAL staging path (\$BACKUP_ROOT/hq)" || bad "G1: wrong seed-state arguments: $(cat "$SG_CALLS")"
+
+# G2 — the kill switch: the same numbers refuse exactly as before this bead, and the seed state is never even asked.
+_run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB 0
+if [ "$SG_RC" -eq 1 ] && grep -qF 'hq: sync preflight REFUSED — disco insuficiente (livre=6084MB precisa=17629MB, vivo=11752MB, margem=150%' "$SG_LOG" \
+   && ! grep -qF semeado "$SG_LOG" && [ ! -s "$SG_CALLS" ] && [ "$_SYNC_SEED_CREDITED" = 0 ]; then
+  ok "G2: SYNC_SEED_OLDGEN=0 → the legacy gate, byte for byte (REFUSED, precisa=17629MB), the seed state not consulted, flag 0"
+else bad "G2: rc=$SG_RC calls='$(cat "$SG_CALLS")' credited=$_SYNC_SEED_CREDITED log='$(cat "$SG_LOG")'"; fi
+
+# G3 — every way the seed can be "not there" (or unreadable, or garbage) is the legacy requirement: failed ≠ empty ≠ ok.
+for SG_W in "no:dest-has-content" "no:no-oldgen" "no:volume" "no:unreadable" "no:no-data-dir" "no:disabled" "" "garbage" "ok" "ok abc" "ok -5" "ok 0"; do
+  SG_SEED_STATE="$SG_W" _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
+  if [ "$SG_RC" -eq 1 ] && grep -qF 'precisa=17629MB' "$SG_LOG" && ! grep -qF semeado "$SG_LOG" && [ "$_SYNC_SEED_CREDITED" = 0 ]; then
+    ok "G3: seed state '${SG_W:-<empty>}' → no credit: the gate still wants 17629MB and refuses"
+  else bad "G3: seed state '${SG_W:-<empty>}' was credited or mis-read: rc=$SG_RC credited=$_SYNC_SEED_CREDITED log='$(cat "$SG_LOG")'"; fi
+done
+# the lib function that is missing altogether (version skew) is also "no seed"
+unset -f _offline_sync_seed_state
+_run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
+if [ "$SG_RC" -eq 1 ] && grep -qF 'precisa=17629MB' "$SG_LOG" && [ "$_SYNC_SEED_CREDITED" = 0 ]; then ok "G3: no _offline_sync_seed_state at all → legacy requirement, refuses"
+else bad "G3: a missing seed-state function was credited: rc=$SG_RC log='$(cat "$SG_LOG")'"; fi
+_offline_sync_seed_state() { printf '%s %s\n' "$1" "$2" >> "$SG_CALLS"; printf '%s\n' "${SG_SEED_STATE-ok 11314756}"; }
+
+# G4 — the seed is a credit, not a free pass: below floor + 150% of the non-oldgen part it still refuses, and says what it counted.
+_run_sg hq $SG_HQ_LIVE_KB 3670016
+if [ "$SG_RC" -eq 1 ] && grep -qF 'hq: sync preflight REFUSED — disco insuficiente (livre=3584MB precisa=4127MB, vivo=11752MB, semeado do oldgen: 11049MB' "$SG_LOG" \
+   && [ "$_SYNC_SEED_CREDITED" = 0 ]; then ok "G4: 3.5GB free with a seed still refuses (precisa=4127MB), the line shows the counted seed, flag 0"
+else bad "G4: rc=$SG_RC credited=$_SYNC_SEED_CREDITED log='$(cat "$SG_LOG")'"; fi
+
+# G5 — boundary: need is 4226094 KB (3145728 + 720244*150/100). Exactly that passes (>=), one KB less refuses.
+_run_sg hq $SG_HQ_LIVE_KB 4226094; [ "$SG_RC" -eq 0 ] && ok "G5: free == need exactly → proceeds" || bad "G5: free == need must proceed (rc=$SG_RC)"
+_run_sg hq $SG_HQ_LIVE_KB 4226093; [ "$SG_RC" -eq 1 ] && ok "G5: one KB under → refuses" || bad "G5: one KB under must refuse (rc=$SG_RC)"
+
+# G6/G7 — only an EPHEMERAL db is ever credited (its staging is released after the night; a kept one is not); a db that
+# is not on the list, or an empty list, is the legacy gate and never asks the seed state.
+_run_sg testdb $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
+if [ "$SG_RC" -eq 1 ] && grep -qF 'precisa=17629MB' "$SG_LOG" && [ ! -s "$SG_CALLS" ] && [ "$_SYNC_SEED_CREDITED" = 0 ]; then ok "G6: a non-ephemeral db gets the legacy gate and no seed lookup"
+else bad "G6: rc=$SG_RC calls='$(cat "$SG_CALLS")' log='$(cat "$SG_LOG")'"; fi
+SG_EPH="" _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
+if [ "$SG_RC" -eq 1 ] && [ ! -s "$SG_CALLS" ] && ! grep -qF semeado "$SG_LOG"; then ok "G7: ephemeral mode off (empty list) → hq gets the legacy gate and no seed lookup"
+else bad "G7: rc=$SG_RC calls='$(cat "$SG_CALLS")' log='$(cat "$SG_LOG")'"; fi
+
+# G8 — the hypothetical "if the residue were deleted" question (credit > 0) never takes the seed credit: a staging
+# that holds a residue is not an empty dest, and the answer to a hypothetical must not set the real gate's flag.
+SG_CREDIT=500000 _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
+if [ "$SG_RC" -eq 1 ] && ! grep -qF semeado "$SG_LOG" && grep -qF 'ainda RECUSARIA' "$SG_LOG" && [ ! -s "$SG_CALLS" ] && [ "$_SYNC_SEED_CREDITED" = 0 ]; then
+  ok "G8: a residue credit > 0 keeps the legacy requirement, never consults the seed, flag 0"
+else bad "G8: rc=$SG_RC calls='$(cat "$SG_CALLS")' credited=$_SYNC_SEED_CREDITED log='$(cat "$SG_LOG")'"; fi
+
+# G9 — the flag never outlives its gate: a credited pass followed by ANY other gate call (refusal, residue question,
+# switch off) leaves it at 0.
+_run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB; [ "$_SYNC_SEED_CREDITED" = 1 ] || bad "G9: setup — the credited pass did not set the flag"
+_run_sg hq $SG_HQ_LIVE_KB 100000;          [ "$_SYNC_SEED_CREDITED" = 0 ] && ok "G9: a refusal after a credited pass resets the flag" || bad "G9: stale flag after a refusal"
+_run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB;  SG_CREDIT=1 _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
+[ "$_SYNC_SEED_CREDITED" = 0 ] && ok "G9: a residue question after a credited pass resets the flag" || bad "G9: stale flag after the residue question"
+_run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB;  _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB 0
+[ "$_SYNC_SEED_CREDITED" = 0 ] && ok "G9: the switch off after a credited pass resets the flag" || bad "G9: stale flag after the switch went off"
+
+# G10 — a saving bigger than the live size (the two were measured a moment apart) is clamped: need is the floor, never negative.
+SG_SEED_STATE="ok 2097152" _run_sg hq 1048576 4194304
+if [ "$SG_RC" -eq 0 ] && grep -qF 'precisa=3072MB' "$SG_LOG" && grep -qF 'semeado do oldgen: 1024MB' "$SG_LOG"; then ok "G10: oldgen bigger than the live size → clamped to it, need = the floor (3072MB)"
+else bad "G10: rc=$SG_RC log='$(cat "$SG_LOG")'"; fi
+
+# G11 — unreadable live size / free space stay fail-closed with the seed on (the seed is never a reason to guess).
+_run_sg hq "" $SG_HQ_FREE_KB
+[ "$SG_RC" -eq 1 ] && grep -qF 'could not measure live db size' "$SG_LOG" && ok "G11: unreadable live size → refuses, seed or not" || bad "G11: rc=$SG_RC log='$(cat "$SG_LOG")'"
+_run_sg hq $SG_HQ_LIVE_KB ""
+[ "$SG_RC" -eq 1 ] && grep -qF 'could not measure free disk space' "$SG_LOG" && ok "G11: unreadable free space → refuses, seed or not" || bad "G11: rc=$SG_RC log='$(cat "$SG_LOG")'"
+
+eval "$SG_ORIG_SEED_STATE"
+unset -f du df
+rm -rf "$SG_CITY" 2>/dev/null || true; rm -f "$SG_LOG" "$SG_CALLS" 2>/dev/null || true
+
+echo "── the sync is armed from the gate's verdict (ga-a0woau) — _offline_seed_env_set / _clear ──"
+_run_arm() { # <db> <credited 0|1> <switch 0|1> — what _offline_seed_env_set arms for the sync that follows the gate
+  unset OFFLINE_SYNC_SEED_OLDGEN OFFLINE_SYNC_REQUIRE_SEED OFFLINE_SYNC_MIN_FREE_KB
+  _SYNC_SEED_CREDITED="$2"
+  SYNC_SEED_OLDGEN="$3" SYNC_DISK_FLOOR_GB=3 DOLT_BACKUP_EPHEMERAL_CONF=/nonexistent/none.env DOLT_BACKUP_EPHEMERAL_DBS=hq _offline_seed_env_set "$1"
+}
+_run_arm hq 1 1
+if [ "${OFFLINE_SYNC_SEED_OLDGEN-}" = 1 ] && [ "${OFFLINE_SYNC_REQUIRE_SEED-}" = 1 ] && [ "${OFFLINE_SYNC_MIN_FREE_KB-}" = 3145728 ]; then
+  ok "A1: ephemeral hq, gate credited the seed → seeded mode + REQUIRE_SEED=1 + the watchdog floor = the gate's floor (3145728 KB)"
+else bad "A1: seed=${OFFLINE_SYNC_SEED_OLDGEN-<unset>} require=${OFFLINE_SYNC_REQUIRE_SEED-<unset>} floor=${OFFLINE_SYNC_MIN_FREE_KB-<unset>}"; fi
+_run_arm hq 0 1
+if [ "${OFFLINE_SYNC_SEED_OLDGEN-}" = 1 ] && [ "${OFFLINE_SYNC_REQUIRE_SEED-}" = 0 ] && [ "${OFFLINE_SYNC_MIN_FREE_KB-}" = 3145728 ]; then
+  ok "A2: ephemeral hq, gate did NOT count on the seed → opportunistic seed (REQUIRE_SEED=0), the floor watchdog still armed"
+else bad "A2: seed=${OFFLINE_SYNC_SEED_OLDGEN-<unset>} require=${OFFLINE_SYNC_REQUIRE_SEED-<unset>} floor=${OFFLINE_SYNC_MIN_FREE_KB-<unset>}"; fi
+_run_arm testdb 1 1
+[ -z "${OFFLINE_SYNC_SEED_OLDGEN+x}${OFFLINE_SYNC_REQUIRE_SEED+x}${OFFLINE_SYNC_MIN_FREE_KB+x}" ] \
+  && ok "A3: a non-ephemeral db arms NOTHING (its sync is the legacy one) even with a stale flag of 1" || bad "A3: a non-ephemeral db was armed"
+_run_arm hq 1 0
+[ -z "${OFFLINE_SYNC_SEED_OLDGEN+x}${OFFLINE_SYNC_REQUIRE_SEED+x}${OFFLINE_SYNC_MIN_FREE_KB+x}" ] \
+  && ok "A4: the kill switch off arms nothing" || bad "A4: armed with the switch off"
+_run_arm hq 1 1; _offline_seed_env_clear
+[ -z "${OFFLINE_SYNC_SEED_OLDGEN+x}${OFFLINE_SYNC_REQUIRE_SEED+x}${OFFLINE_SYNC_MIN_FREE_KB+x}" ] \
+  && ok "A5: _offline_seed_env_clear disarms all three (no other db's sync sees them)" || bad "A5: still armed after clear"
+_SYNC_SEED_CREDITED=0
+
+echo "── drift-guard: both ephemeral sync sites arm the seed around the sync and disarm it after (ga-a0woau) ──"
+for SG_FN in _sync_ephemeral _sync_with_stale_manifest_recovery; do
+  SG_BODY="$(awk -v f="^${SG_FN}\\\\(\\\\)" '$0 ~ f {p=1} p {print} p && /^}/ {exit}' "$SCRIPT")"
+  SG_SET="$(printf '%s\n' "$SG_BODY" | grep -n '_offline_seed_env_set "\$db"' | head -1 | cut -d: -f1)"
+  SG_SYNC="$(printf '%s\n' "$SG_BODY" | grep -n '_offline_backup_sync "\$db" "\$dest"' | head -1 | cut -d: -f1)"
+  SG_CLR="$(printf '%s\n' "$SG_BODY" | grep -n '_offline_seed_env_clear' | head -1 | cut -d: -f1)"
+  if [ -n "$SG_SET" ] && [ -n "$SG_SYNC" ] && [ -n "$SG_CLR" ] && [ "$SG_SET" -lt "$SG_SYNC" ] && [ "$SG_SYNC" -lt "$SG_CLR" ]; then
+    ok "$SG_FN: _offline_seed_env_set → _offline_backup_sync → _offline_seed_env_clear, in that order"
+  else bad "$SG_FN: the seed arming is not wired around the sync (set@${SG_SET:-none} sync@${SG_SYNC:-none} clear@${SG_CLR:-none})"; fi
+done
+
+# ═══ ga-a0woau: the whole nightly, a real subprocess, a seeded hq ═════════════════════════════════════
+# Real dolt-s3-backup.sh and the real offline-sync lib (real cp -c clone, real seed build, real watchdog); only
+# dolt/aws/df/du/ps are stubs, and the stub sync-url behaves like the real one measured on 2.3.1 (keeps the seeded
+# tables, adds ONE table, commits a real root). The city is a throwaway; S3 is a directory.
+echo "── end-to-end: a seeded hq night (ga-a0woau) — real subprocess, 08/10 numbers (12.0GB live, 11.3GB oldgen, 6.2GB free) ──"
+SE_LIVE=12035000; SE_OG=11314756; SE_FREE=6230068
+
+# ES1 — THE fix: at 6.2GB free the night that was refused 8 of 9 times now builds the staging from the oldgen,
+# uploads, proves S3 and releases the staging.
+E2EE_OLDGEN=3 E2EE_OLDGEN_KB=$SE_OG E2EE_LIVE_KB=$SE_LIVE e2eE_case es1-seeded none $SE_FREE
+ES_MAN="$E2E_DIR/bucket/hq/manifest"
+ES_ROOT="$(head -n 1 "$ES_MAN" 2>/dev/null | awk -F: '{print $4}')"
+ES_NT="$(head -n 1 "$ES_MAN" 2>/dev/null | awk -F: '{print (NF-5)/2}')"
+if [ "$E2E_RC" -eq 0 ] && grep -qF 'hq: sync preflight OK (livre=6084MB >= precisa=4127MB' "$E2E_LOG" && grep -qF 'semeado do oldgen' "$E2E_LOG" \
+   && grep -qF "dest seeded from the snapshot's oldgen" "$E2E_LOG" && grep -qF 'seeded files left untouched by sync-url: 3/3' "$E2E_LOG" \
+   && grep -qF 'hq: OK (issues=5' "$E2E_LOG" && [ ! -s "$E2E_DIR/notify.calls" ]; then
+  ok "ES1: hq at 6.2GB free → gate passes on the seed, staging seeded, sync-url keeps 3/3 seeded tables, night OK, no alert"
+else bad "ES1: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -8 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+if [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 1 ] && grep -qE 'sync-url-seeded dest=.*/seeded root=seedseedseedseedseedseedseedseed tables=3' "$E2E_DIR/dolt.calls"; then
+  ok "ES1: exactly one sync-url, into the SEEDED dest (3 oldgen tables, placeholder root) — never the full build"
+else bad "ES1: wrong sync-url calls: $(grep -E 'sync-url' "$E2E_DIR/dolt.calls" | tr '\n' '|')"; fi
+if [ "$ES_ROOT" = 0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ] && [ "$ES_NT" = 4 ] \
+   && [ ! "$(head -n 1 "$ES_MAN" | awk -F: '{print $4}')" = seedseedseedseedseedseedseedseed ] \
+   && cmp -s "$E2E_DIR/bucket/hq/$(e2e_tid 1).darc" "$E2E_DIR/city/.beads/dolt/hq/.dolt/noms/oldgen/$(e2e_tid 1).darc" \
+   && cmp -s "$E2E_DIR/bucket/hq/$(e2e_tid 3).darc" "$E2E_DIR/city/.beads/dolt/hq/.dolt/noms/oldgen/$(e2e_tid 3).darc" \
+   && [ -f "$E2E_DIR/bucket/hq/$(e2e_tid 50).darc" ]; then
+  ok "ES1: S3 holds the REAL root (not the placeholder), 3 oldgen tables byte-identical to the live ones + the 1 new table"
+else bad "ES1: S3 content wrong: root=$ES_ROOT tables=$ES_NT files=$(ls "$E2E_DIR/bucket/hq" | tr '\n' ' ')"; fi
+[ ! -e "$E2E_DIR/city/.dolt-backup/hq" ] && grep -qF 'ephemeral staging: released' "$E2E_LOG" \
+  && ok "ES1: S3 proven, then the staging (the clonefile copies that pin the oldgen blocks) is released" || bad "ES1: the staging is still there or was not released: $(ls "$E2E_DIR/city/.dolt-backup" 2>&1 | tr '\n' ' ')"
+[ "$(cat "$E2E_DIR/city/.beads/dolt/hq/.dolt/noms/oldgen/$(e2e_tid 2).darc")" = "oldgen-table2" ] \
+  && ok "ES1: the LIVE oldgen is untouched (read-only against the live store)" || bad "ES1: the live oldgen changed"
+
+# ES2 — the seed cannot be established at the gate (the oldgen manifest names a table that is not there): the gate is
+# the LEGACY one, so at 6.2GB it refuses — nothing is written, the night says hq(disco). A seed that cannot be shown
+# never lowers the bar.
+E2EE_OLDGEN=3 E2EE_OLDGEN_BREAK=1 E2EE_OLDGEN_KB=$SE_OG E2EE_LIVE_KB=$SE_LIVE e2eE_case es2-seed-broken none $SE_FREE
+if grep -qF 'hq: sync preflight REFUSED — disco insuficiente (livre=6084MB precisa=17629MB' "$E2E_LOG" && ! grep -qF semeado "$E2E_LOG" \
+   && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 0 ] && grep -q 'hq(disco' "$E2E_DIR/notify.calls" && ! grep -qF 'hq: OK' "$E2E_LOG"; then
+  ok "ES2: an unreadable oldgen is not credited → legacy gate REFUSES at 6.2GB, no sync-url ran, the alert says hq(disco)"
+else bad "ES2: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+
+# ES3 — the kill switch in the nightly's own environment: SYNC_SEED_OLDGEN=0 is the pre-ga-a0woau gate.
+E2EE_SEED_SWITCH=0 E2EE_OLDGEN=3 E2EE_OLDGEN_KB=$SE_OG E2EE_LIVE_KB=$SE_LIVE e2eE_case es3-switch-off none $SE_FREE
+if grep -qF 'precisa=17629MB' "$E2E_LOG" && ! grep -qF semeado "$E2E_LOG" && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 0 ] && grep -q 'hq(disco' "$E2E_DIR/notify.calls"; then
+  ok "ES3: SYNC_SEED_OLDGEN=0 → the legacy 150% gate (17629MB) refuses; nothing seeded, nothing synced"
+else bad "ES3: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|')"; fi
+
+# ES4 — the gate counted on the seed, and by the time the sync needs it the seed cannot be built (the snapshot lost a
+# table): the sync REFUSES instead of falling back to the full 11GB build the gate never reserved (ga-odtd3f). The night
+# is FAILED with the reason, S3 keeps its older copy, no staging is left.
+E2EE_BREAK_CLONE=1 E2EE_OLDGEN=3 E2EE_OLDGEN_KB=$SE_OG E2EE_LIVE_KB=$SE_LIVE e2eE_case es4-seed-lost-after-gate none $SE_FREE
+if grep -qF 'sync preflight OK' "$E2E_LOG" && grep -qF "REFUSING — the caller's disk gate counted on the oldgen seed" "$E2E_LOG" \
+   && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 0 ] && grep -q 'hq(sync)' "$E2E_DIR/notify.calls" \
+   && ! grep -qF 'hq: OK' "$E2E_LOG" && [ ! -e "$E2E_DIR/city/.dolt-backup/hq" ] && [ "$(ls "$E2E_DIR/bucket/hq" | wc -l | tr -d ' ')" = 3 ]; then
+  ok "ES4: seed lost between the gate and the sync → REFUSED (no full build), the night FAILED hq(sync) with the reason, S3 and disk untouched"
+else bad "ES4: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -8 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+
+# ES5 — a sync-url that starts eating the disk (a future Dolt that rewrites the seeded tables): the watchdog armed from
+# SYNC_DISK_FLOOR_GB stops it, the night FAILS with the reason, S3 is untouched, no staging, no stray process.
+E2EE_SYNC_HOG=1 E2EE_OLDGEN=3 E2EE_OLDGEN_KB=$SE_OG E2EE_LIVE_KB=$SE_LIVE e2eE_case es5-sync-eats-disk none $SE_FREE
+if grep -qF 'STOPPING' "$E2E_LOG" && grep -qF 'STOPPED by the free-space floor' "$E2E_LOG" && grep -q 'hq(sync)' "$E2E_DIR/notify.calls" \
+   && ! grep -qF 'hq: OK' "$E2E_LOG" && [ ! -e "$E2E_DIR/city/.dolt-backup/hq" ] && [ "$(ls "$E2E_DIR/bucket/hq" | wc -l | tr -d ' ')" = 3 ] \
+   && ! pgrep -f 'sleep 37' >/dev/null 2>&1; then
+  ok "ES5: sync-url eating the disk is STOPPED at the floor, the night FAILED hq(sync) with the reason, nothing uploaded, nothing left running"
+else bad "ES5: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -8 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

@@ -503,6 +503,56 @@ _backup_escalate_if_needed() {
 # rule for its margin).
 SYNC_DISK_MARGIN_PCT="${SYNC_DISK_MARGIN_PCT:-150}"  # % of live db size required free
 SYNC_DISK_FLOOR_GB="${SYNC_DISK_FLOOR_GB:-3}"         # absolute backstop for small dbs
+# ga-a0woau: kill switch for the oldgen-seeded staging of an EPHEMERAL db (dolt-offline-backup-sync.sh,
+# SEEDED MODE). 1 = on: the staging starts as clonefile copies of the live store's oldgen, so building it
+# writes only what oldgen does not hold (hq: ~0.2GB instead of ~11GB) and the disk gate below counts that.
+# 0 = the legacy full build and the full 150%-of-live requirement, exactly as before this bead.
+SYNC_SEED_OLDGEN="${SYNC_SEED_OLDGEN:-1}"
+# Set by every _sync_disk_preflight_credit call: 1 only when that call PASSED counting on the seed. The sync
+# that follows the gate reads it (_offline_seed_env_set) and then REFUSES instead of falling back to the full
+# build if the seed turns out not to be available — a gate that reserved ~3GB must never be followed by a
+# write of 11GB (ga-odtd3f). Reset to 0 at the start of every gate call, so a stale 1 never outlives its gate.
+_SYNC_SEED_CREDITED=0
+
+# _sync_seed_saving_kb <db> — KB of local disk the oldgen seed saves tonight's staging of <db>, or 0.
+# Only an ephemeral db with the seed switched on, whose staging (BACKUP_ROOT/<db>) is absent or empty and
+# whose live store has a readable oldgen on the same volume, saves anything (_offline_sync_seed_state says
+# "ok <kb>"). vazio (no oldgen: the store was never GC'd) → 0, nothing to credit. falhou/ilegível (the lib
+# is missing, any "no:*" word — dest has content, volume or oldgen unreadable, data_dir unknown — or a
+# non-number) → also 0: a saving that cannot be established is never counted, so the gate falls back to the
+# full legacy requirement (the stricter side).
+_sync_seed_saving_kb() {
+  local db="$1" st
+  [ "$SYNC_SEED_OLDGEN" = "1" ] || { echo 0; return 0; }
+  _eph_is_ephemeral "$db" || { echo 0; return 0; }
+  type _offline_sync_seed_state >/dev/null 2>&1 || { echo 0; return 0; }
+  st="$(OFFLINE_SYNC_SEED_OLDGEN=1 _offline_sync_seed_state "$db" "$BACKUP_ROOT/$db" 2>/dev/null)"
+  case "$st" in
+    "ok "[0-9]*) echo "${st#ok }" ;;
+    *) echo 0 ;;
+  esac
+}
+
+# _offline_seed_env_set <db> / _offline_seed_env_clear — arm the offline sync lib's seeded mode around ONE
+# _offline_backup_sync call for an ephemeral db, then disarm it so no other db's sync (a non-ephemeral
+# db's connection-timeout fallback, the reseed child) ever sees it. The caller's gate decided what is
+# required: REQUIRE_SEED is _SYNC_SEED_CREDITED, i.e. 1 exactly when the gate that just passed counted on
+# the seed. The watchdog floor is the gate's own floor (SYNC_DISK_FLOOR_GB): the sync is stopped, and the
+# night recorded FAILED with the reason, if the free space ever drops below the space the gate promised to
+# leave. Not ephemeral, or the switch off → nothing is armed and the sync is the legacy one.
+_offline_seed_env_set() {
+  local db="$1"
+  [ "$SYNC_SEED_OLDGEN" = "1" ] && _eph_is_ephemeral "$db" || return 0
+  # shellcheck disable=SC2034  # read by dolt-offline-backup-sync.sh, sourced into this shell
+  OFFLINE_SYNC_SEED_OLDGEN=1
+  # shellcheck disable=SC2034
+  OFFLINE_SYNC_REQUIRE_SEED="$_SYNC_SEED_CREDITED"
+  # shellcheck disable=SC2034
+  OFFLINE_SYNC_MIN_FREE_KB=$(( SYNC_DISK_FLOOR_GB * 1024 * 1024 ))
+}
+_offline_seed_env_clear() {
+  unset OFFLINE_SYNC_SEED_OLDGEN OFFLINE_SYNC_REQUIRE_SEED OFFLINE_SYNC_MIN_FREE_KB
+}
 
 # _sync_disk_preflight <db> — 0 (proceed) if free space on
 # /System/Volumes/Data covers SYNC_DISK_MARGIN_PCT% of <db>'s current live
@@ -522,9 +572,20 @@ _sync_disk_preflight() {
 # amount that cannot be read must never make a refusal easier to pass. With credit 0 this is
 # byte-for-byte the old gate, log lines included (the e2e cases count them); with a credit
 # its lines say so, and never contain "sync preflight REFUSED"/"sync preflight OK".
+#
+# ga-a0woau — the seed. For an ephemeral db whose staging will be SEEDED from the live oldgen
+# (_sync_seed_saving_kb > 0; only with credit 0, i.e. the real gate in front of a write) the staging does
+# not need the full store: the oldgen part is clonefile copies of the live files, ~0 real disk. The
+# requirement is then SYNC_DISK_FLOOR_GB (what must stay free once the sync is done — the same number the
+# sync's watchdog enforces) plus margin% of what the sync really writes, the live store minus the oldgen
+# (hq: 11.5GB live, 11.3GB oldgen → ~3.4GB instead of 16.8GB; the 8 refusals of 30/09..08/10 on a disk with
+# 6-12GB free). A pass that counted on the seed sets _SYNC_SEED_CREDITED=1 so the
+# sync REQUIRES the seed (it refuses, never falls back to the full build); its log lines still read
+# "sync preflight OK/REFUSED" and add ", semeado do oldgen: NMB". Without a seed this is the old gate.
 _sync_disk_preflight_credit() {
   local db="$1" credit_kb="${2:-0}"
-  local live_kb free_kb need_kb floor_kb tag=""
+  local live_kb free_kb need_kb floor_kb tag="" seed_kb=0 seed_note=""
+  _SYNC_SEED_CREDITED=0
   case "$credit_kb" in ''|*[!0-9]*) credit_kb=0 ;; esac
   [ "$credit_kb" -gt 0 ] && tag=" com crédito de $((credit_kb/1024))MB do resíduo sem manifesto"
   live_kb="$(du -sk "$CITY/.beads/dolt/$db" 2>/dev/null | awk '{print $1}')"
@@ -542,21 +603,33 @@ _sync_disk_preflight_credit() {
       ;;
   esac
   free_kb=$(( free_kb + credit_kb ))
-  need_kb=$(( live_kb * SYNC_DISK_MARGIN_PCT / 100 ))
+  if [ "$credit_kb" -eq 0 ]; then
+    seed_kb="$(_sync_seed_saving_kb "$db")"
+    case "${seed_kb:-}" in ''|*[!0-9]*) seed_kb=0 ;; esac
+  fi
+  if [ "$seed_kb" -gt 0 ]; then
+    # the saving is part of the live size; a bigger number is a measurement race, not a negative need
+    [ "$seed_kb" -gt "$live_kb" ] && seed_kb="$live_kb"
+    need_kb=$(( (live_kb - seed_kb) * SYNC_DISK_MARGIN_PCT / 100 + SYNC_DISK_FLOOR_GB * 1024 * 1024 ))
+    seed_note=", semeado do oldgen: $((seed_kb/1024))MB já em disco (clonefile)"
+  else
+    need_kb=$(( live_kb * SYNC_DISK_MARGIN_PCT / 100 ))
+  fi
   floor_kb=$(( SYNC_DISK_FLOOR_GB * 1024 * 1024 ))
   [ "$need_kb" -lt "$floor_kb" ] && need_kb="$floor_kb"
   if [ "$free_kb" -lt "$need_kb" ]; then
     if [ "$credit_kb" -gt 0 ]; then
       log "$db: sync preflight${tag} ainda RECUSARIA — livre=$((free_kb/1024))MB precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB, margem=${SYNC_DISK_MARGIN_PCT}%, piso=${SYNC_DISK_FLOOR_GB}GB"
     else
-      log "$db: sync preflight REFUSED — disco insuficiente (livre=$((free_kb/1024))MB precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB, margem=${SYNC_DISK_MARGIN_PCT}%, piso=${SYNC_DISK_FLOOR_GB}GB) — não vou escrever até o Dolt morrer (precedente: ga-odtd3f, 2026-09-21, outage de ~5h20)"
+      log "$db: sync preflight REFUSED — disco insuficiente (livre=$((free_kb/1024))MB precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB${seed_note}, margem=${SYNC_DISK_MARGIN_PCT}%, piso=${SYNC_DISK_FLOOR_GB}GB) — não vou escrever até o Dolt morrer (precedente: ga-odtd3f, 2026-09-21, outage de ~5h20)"
     fi
     return 1
   fi
   if [ "$credit_kb" -gt 0 ]; then
     log "$db: sync preflight${tag} passaria (livre=$((free_kb/1024))MB >= precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB)"
   else
-    log "$db: sync preflight OK (livre=$((free_kb/1024))MB >= precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB)"
+    log "$db: sync preflight OK (livre=$((free_kb/1024))MB >= precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB${seed_note})"
+    [ "$seed_kb" -gt 0 ] && _SYNC_SEED_CREDITED=1
   fi
   return 0
 }
@@ -835,7 +908,14 @@ _sync_with_stale_manifest_recovery() {
     log "$db: DOLT_BACKUP sync FAILED (disk preflight refused after stale-manifest reinit)"
     return 1
   fi
-  if _offline_backup_sync "$db" "$dest"; then
+  # ga-a0woau: for an ephemeral db the gate above just ran on the freshly emptied dest, so it may have
+  # counted on the oldgen seed; the sync then requires exactly what the gate counted on (see
+  # _offline_seed_env_set). Any other db: nothing armed, the legacy sync.
+  local sync_rc
+  _offline_seed_env_set "$db"
+  _offline_backup_sync "$db" "$dest"; sync_rc=$?
+  _offline_seed_env_clear
+  if [ "$sync_rc" -eq 0 ]; then
     log "$db: offline-sync fallback OK"
     return 0
   fi
@@ -858,10 +938,17 @@ _sync_ephemeral() {
     _sync_with_stale_manifest_recovery "$db" "$dest" "ephemeral staging holds a manifest-less residue"
     return $?
   fi
-  local off new_out
+  local off new_out sync_rc
   off="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
   case "$off" in ''|*[!0-9]*) off=0 ;; esac
-  if OFFLINE_SYNC_TIMEOUT="$EPH_SYNC_TIMEOUT" _offline_backup_sync "$db" "$dest"; then
+  # ga-a0woau: the disk gate that let this night through (main loop, right before this call) may have
+  # counted on the oldgen seed — _SYNC_SEED_CREDITED says so — and then the sync must either use the seed
+  # or refuse, never build the full copy the gate did not reserve. A refusal lands in the FAILED branch
+  # below with its reason in the log; it is never a stale-manifest signature, so it does not reinitialise.
+  _offline_seed_env_set "$db"
+  OFFLINE_SYNC_TIMEOUT="$EPH_SYNC_TIMEOUT" _offline_backup_sync "$db" "$dest"; sync_rc=$?
+  _offline_seed_env_clear
+  if [ "$sync_rc" -eq 0 ]; then
     log "$db: ephemeral staging: offline sync OK (server-free, budget ${EPH_SYNC_TIMEOUT}s)"
     return 0
   fi
