@@ -11,7 +11,8 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
 
 ```
  claude-pool-account.py  (launchd, every 60 s, single instance)
-   probe the ACTIVE account (1-token haiku call, anthropic-ratelimit-unified-* headers)
+   probe the ACTIVE account (1-token call on the model the pool runs, with the Claude Code system prompt;
+                             anthropic-ratelimit-unified-* headers)
      rejected / 429  -> failover: next account of ordem_das_contas() that answers a probe; store the reset time
      answers         -> stay; failback ONLY to an account we saw exhausted, whose stored reset time has passed,
                         whose usage reading in the usage store was taken AFTER that reset, and which that reading
@@ -26,6 +27,8 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
                              Control, so write_item refuses any service name that is not "...-<8 hex>")
                              (first 8 hex of sha256("/Users/athos/.gastown/claude-pool-cred") — the ABSOLUTE path, as
                               exported in CLAUDE_SECURESTORAGE_CONFIG_DIR; claude never sees a "~")
+   writes the SAME credential to the file beside it, <pool dir>/.credentials.json (ga-6gat1o): the place a session
+                             reads when it cannot read the Keychain item. See "The credentials file beside the item".
    publishes the decision    /Users/athos/shared/data/claude_pool_current_account.json  {"current": "<email>", ...}
    stamps a heartbeat        <city>/.gc/claude-pool-account.heartbeat — ONLY at the end of a run that logged no ERROR
                              (a clean run that had nothing to decide counts; a refused Keychain write, a read-back that
@@ -39,6 +42,8 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
    kill switch or the degraded marker present -> exports nothing either (log: POOL-ACCT SKIP disabled by ...)
 
  claude (live pool session) re-reads the item every ~30 s  =>  a rewritten item moves it to the other account
+   (a session that cannot read the item reads the file: a NEW session is on the file's account; whether a session
+    already running re-reads the file the way it re-reads the item was not measured)
 
  whatsapp_automation lib/claude_account_pool.py: contas_utilizaveis() puts conta_decidida() first
 ```
@@ -227,7 +232,7 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-pool-account.py` | the daemon (`run-once`) |
 | `packs/town-deltas/assets/scripts/claude-lowprio.sh` | wrapper: points a pool launch at the item (fail-open) |
 | `packs/town-deltas/assets/claude-pool-account.plist` | launchd job, not loaded by the merge |
-| `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API, real accounts lib); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from; it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`) |
+| `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API, real accounts lib); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from, D2 if the live pool credentials file changed during the run (metadata only: the file is never opened); it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`) |
 | `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session (+ the guard's real-claude self-test and the leakscan control) |
 | `packs/town-deltas/assets/scripts/claude-pool-guard.py` | the guard (`run-once` / `status [--json]` / `selftest`) |
 | `packs/town-deltas/assets/claude-pool-guard.plist` | the guard's launchd job, not loaded by the merge |
@@ -260,6 +265,47 @@ that could not be read says `unreadable`; it never says `none` for something it 
 says `absent` (a JSON null says `null`, as this daemon's own blob has for the tier). A missing item gets no
 such line (nobody wrote anything). The daemon still rewrites in every case: one decision file is what the services read.
 
+## The credentials file beside the item (ga-6gat1o)
+
+`claude` reads the Keychain item first, and **where it cannot** — a Keychain that is locked in the context of a session —
+it reads `<pool dir>/.credentials.json` (`~/.gastown/claude-pool-cred/.credentials.json`). Until ga-6gat1o the daemon
+wrote only the item: a pool session that could not read it ran on whatever that file held, and what it held was a stale
+full login of an account whose weekly limit was spent. The daemon's decision never reached those sessions.
+
+What the daemon does now, with the item's rigour (the daemon is still the single writer of both):
+
+- **Switch** (seed, failover, failback): item first, read back; then the file, read back. A file that cannot be written,
+  or that does not read back as the decision's credential, refuses the switch (`credentials file not switched to <email> -
+  decision NOT changed`, an `ERROR`): the decision stays where it was and the next run looks again. The item may already
+  hold the new account at that point — the same state a failed publish leaves (ga-aozw8x) — and the next run settles it.
+- **Heal** (every run, next to the item's heal, **also when the item is unreadable** — that is the locked-Keychain case):
+  - file holds the decision's credential → nothing is written, nothing is logged;
+  - file missing or empty → written (`pool credentials file missing but the decision is <email> ... - rewriting`);
+  - file holds a login of another account → `pool credentials file holds fp=<x> but the decision is <email> fp=<y> -
+    rewriting`, then, **before** the rewrite erases the evidence, `foreign login in the pool credentials file (fp=<x>):
+    blob keys=[...] refreshToken=yes|no expiresAt=<iso> scopes=[...] subscriptionType=<t>; file modified <UTC>; young
+    claude processes: ...` — the item's `foreign write` line (above), for the file. Shape only, no value of any field;
+  - file that cannot be read **as a credential** (garbage, another JSON shape, an empty token, a directory in its
+    place, a permission error) → an `ERROR` (`pool credentials file cannot be read as a credential ... not touched`)
+    and nothing written: it could be a login this does not understand, and the pool may be running on it. The `ERROR`
+    withholds the clean-run heartbeat, so the guard's liveness alert fires after 10 minutes instead of the state
+    staying quiet. Fix or move the file by hand; the next run heals it. (This is the heal. A **switch** is a deliberate
+    move of the whole pool and writes the file whatever it held, as it writes the item.)
+- **The file is written atomically and never wider than 0600**: a temp file beside it, created `0600` with `O_EXCL |
+  O_NOFOLLOW`, fsynced, renamed over the file. Its blob is the item's: inference-only, **no refresh token**, so a session
+  cannot refresh it into another account. The token is not in argv, the environment or any log line.
+- **Where it will not write**: the pool dir must be an absolute path that is neither the home directory, `~/.claude`,
+  `CLAUDE_CONFIG_DIR`, nor a symlink to one of them (the real path counts) — those hold Mayor's and the crews' own
+  logins, and a setup-token over them kills their Remote Control (the reason `write_item` refuses the plain item name). A
+  path that cannot be resolved is refused too. The refusal is an `ERROR` (`refusing to write the credentials file: ...`).
+
+The probe changed with it: it asks for the model the pool runs (`PROBE_MODEL`) with the Claude Code system prompt
+(`PROBE_SYSTEM`), no longer a Haiku 4.5 call — a Haiku verdict says nothing about a Sonnet limit.
+
+Live check, after the deploy (not part of the merge): start a new pool session after a switch and watch the
+`anthropic-ratelimit-unified-7d-utilization` headers rise on the NEW account and not on the old one; and
+`claude-pool-account.live-accept.sh` prints whether the file's fingerprint equals the decision's.
+
 ## Known limits
 
 - `CLAUDE_SECURESTORAGE_CONFIG_DIR` is an undocumented claude variable: a claude release can rename the item. The
@@ -268,10 +314,16 @@ such line (nobody wrote anything). The daemon still rewrites in every case: one 
 - Only turn boundaries were measured; a switch in the middle of a long tool call is not guaranteed.
 - A limit modal already open in a live TUI does not notice the restored credential by itself (needs Esc);
   unsticking such sessions is ga-8hcnvb.2.
-- The verdict comes from a 1-token **haiku** call, while the pool runs mostly on Sonnet. If a window exists that limits
-  Sonnet but not haiku, the probe says "allowed" while the pool's sessions are blocked, and no failover happens. Whether
-  such a per-model window shows up in the `anthropic-ratelimit-unified-*` headers was not measured here; the live
-  harness (`claude-pool-account.live-accept.sh`) is where to check it.
+- The verdict comes from a 1-token call on `PROBE_MODEL`, the model the pool runs. Whether a window that limits only
+  some models shows up in the `anthropic-ratelimit-unified-*` headers was not measured here. `PROBE_MODEL` is a model ID
+  and goes stale like one: a retired or misspelled ID answers HTTP 404, which is "cannot tell" — **no failover, for as
+  long as it stays wrong** (inert, not harmful, but the pool then waits for the limit instead of leaving it). The ID in
+  the code was not checked against the live API when it was written (ga-6gat1o); the post-deploy check above is the
+  check, and `claude-pool-account.live-accept.sh` probes with the same constants.
+- The guard's divergence alert (decision vs. item) does not read the credentials file: a file that disagrees with the
+  decision while the item agrees is healed and logged by the daemon (`WARN`), but raises no alert of its own.
+- A session that is **already running** when the file changes is not known to re-read it (only the item's ~30 s re-read
+  was measured). New sessions use the file.
 - A key the API **refuses** (401/403) is registered for an hour like a limit, but at that time it is **not** failed back
   to: the failback does not probe, and a key that is still refused would be written into the item and break every pool
   session until the next run — once an hour for as long as the key stays bad. It is dropped from the registry (with a

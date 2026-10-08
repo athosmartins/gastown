@@ -1,22 +1,26 @@
 #!/bin/bash
 # claude-pool-account.live-accept.sh — ga-8hcnvb.1 acceptance against the REAL Claude API, the REAL Keychain and a
 # REAL interactive `claude` session. Adapted from docs/research/ga-2yyitx-account-switch-spike/e1_live.sh.
-# NOT part of the hermetic selftest (claude-pool-account.selftest.sh): it spends a few haiku tokens and needs two
-# vault keys. Run it by hand after a change to the wrapper or the daemon.
+# NOT part of the hermetic selftest (claude-pool-account.selftest.sh): it spends a few haiku tokens (the sessions) and 1-token
+# probes on the model the pool runs (the daemon's PROBE_MODEL: P1 is where a wrong model ID shows up), and needs two vault keys.
+# Run it by hand after a change to the wrapper or the daemon.
 #
 # SAFE BY CONSTRUCTION: every Keychain item is a throwaway named for a scratch dir ("Claude Code-credentials-<h>",
 # refused unless it is neither the production login item nor the production pool item); production state, the
 # production pool item and ~/.claude are never written. Tokens never reach argv, ps, a log, a file or the screen: this script
 # holds them only in shell variables (read from the vault, hashed with the `printf` builtin), the daemon reads them from the
-# vault itself and writes them to the scratch Keychain item, and the mock API is keyed by the 8-hex fingerprint, so the real
-# tokens are not in mock.json either.
+# vault itself and writes them to the scratch Keychain item - and, since ga-6gat1o, to the credentials file beside it in the
+# scratch pool dir (0600, inside the 0700 scratch dir; P1e looks at its fingerprint only and it is removed before the P4k
+# scan, because it is the one place a key belongs) - and the mock API is keyed by the 8-hex fingerprint, so the real tokens are
+# not in mock.json either.
 #
 # IDENTITY ORACLE: OK  = terrenos.incorporacoes@ (0% used, answers).
 #                  EXH = athosb85@ (weekly limit hit until 2026-10-07 ~22:00Z; can only answer with the limit
 #                        error, and a rejected call costs nothing). After 2026-10-07 22:00Z pick another exhausted
 #                        account, or this harness's step 2 cannot tell the accounts apart.
 #
-#   P1  real probes through the daemon: EXH is rejected (real 429 + real headers parsed), OK is picked.
+#   P1  real probes through the daemon: EXH is rejected (real 429 + real headers parsed), OK is picked, and the pool dir's
+#       credentials file holds the OK key (fingerprint equal to the decision's).
 #   P2  the pool wrapper path: claude-lowprio.sh -> claude uses the pool item; with no item it falls back to the
 #       ambient login (AC: a pool session without the credential starts normally).
 #   P3  one LIVE interactive session, one pid, no restart: OK -> daemon failover -> EXH (limit error, ~40 s) ->
@@ -95,6 +99,13 @@ r="$(exh_reset "$EMAIL_EXH")"
   && ok "P1b EXH's real reset time was parsed from the API headers: $(date -u -r "${r%.*}" +%Y-%m-%dT%H:%M:%SZ)" || bad "P1b EXH reset_epoch='$r' (header names/format differ from the assumption?)"
 [ "$(jget fingerprint)" = "$(fp "$TOK_OK")" ] && ok "P1c state fingerprint matches the OK key" || bad "P1c fingerprint '$(jget fingerprint)'"
 security find-generic-password -a "$USER" -s "$SVC" >/dev/null 2>&1 && ok "P1d the pool item exists (created by the daemon)" || bad "P1d no pool item"
+# P1e (ga-6gat1o) the credentials file a session reads when it cannot read the item. Only the fingerprint leaves python. An empty answer
+# (no file, unreadable, another shape) is "could not tell" and FAILS - it never counts as equal to the decision's fingerprint.
+cf_fp() { "$PY" -c 'import json,hashlib,sys; print(hashlib.sha256(json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"].encode()).hexdigest()[:8])' "$POOL_DIR/.credentials.json" 2>/dev/null; }
+cf_mode="$(stat -f '%Lp' "$POOL_DIR/.credentials.json" 2>/dev/null || stat -c '%a' "$POOL_DIR/.credentials.json" 2>/dev/null)"
+[ -n "$(cf_fp)" ] && [ "$(cf_fp)" = "$(jget fingerprint)" ] && [ "$cf_mode" = 600 ] \
+  && ok "P1e the pool credentials file holds the decision's credential (fp=$(cf_fp)), mode 0600" \
+  || bad "P1e credentials file fp='$(cf_fp)' mode='$cf_mode' vs the decision's fp '$(jget fingerprint)' (missing, unreadable, or another account)"
 
 # ── P2: the wrapper path ───────────────────────────────────────────────────────────────────────────
 echo; echo "== P2  wrapper -> claude (the path a real pool session takes)"
@@ -254,6 +265,10 @@ guard $((T1 + 500)) selftest >/dev/null 2>&1
 [ "$(gjson "versions/$REAL_VER/result")" = pass ] && [ ! -e "$W/city/.gc/pool-account-degraded" ] && ok "P4j the next passing test removes the marker by itself" || bad "P4j result='$(gjson "versions/$REAL_VER/result")' marker still there?"
 
 # P4k-m  zero occurrences of ANY of the 5 keys (the vault's, via --keys-vault) where it must not be; the control runs first and a failed control is exit 3
+# The scratch pool dir's credentials file is where the daemon puts the OK key on purpose (the item's twin, ga-6gat1o; P1e looked at it): the scan walks
+# all of $W, so the file is removed first - what it checks is every OTHER place. (vazio -> already gone: nothing to remove; falhou -> the scan below
+# finds the key in it and FAILS: a failed removal is never a pass.)
+rm -f "$POOL_DIR/.credentials.json"
 out="$("$PY" "$LEAKSCAN" --keys-vault --ps --path "$W" 2>&1)"; rc=$?
 printf '%s\n' "$out" | grep "^SUMMARY" | sed -e 's/^/   /'
 [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "control=ok" && ok "P4k scan of this run's files (logs, state, decision, guard state, recorded pushes) + ps argv/env: no key anywhere, control saw its plant" || { bad "P4k leakscan rc=$rc"; printf '%s\n' "$out" | head -6 | cut -c1-200; }

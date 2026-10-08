@@ -4,8 +4,15 @@
 The pool (dog, wa-worker, ps-worker, gate-reviewer, boot, deacon, auto-refiner) is launched through
 claude-lowprio.sh, which points each session at a Keychain item (CLAUDE_SECURESTORAGE_CONFIG_DIR). claude
 re-reads that item every ~30 s, so rewriting it moves every LIVE pool session to another account with no restart
-and no lost conversation (measured, ga-2yyitx). This script is the SINGLE WRITER of that item and of the decision
-the WhatsApp services read (`current` in CLAUDE_POOL_STATE).
+and no lost conversation (measured, ga-2yyitx). This script is the SINGLE WRITER of that item, of the credentials file beside it
+(next paragraph) and of the decision the WhatsApp services read (`current` in CLAUDE_POOL_STATE).
+
+The item is not the only thing a session can read (ga-6gat1o). When claude cannot read the Keychain item - the Keychain is locked in the
+context the session runs in - it falls back to the plaintext <CLAUDE_SECURESTORAGE_CONFIG_DIR>/.credentials.json, and whatever login THAT
+file holds is the account the session runs on, whatever the item says. So the decision is written to both, in the same step: a switch that
+reaches only the item moves nothing for such a session (08/10: the whole pool sat 2h20 on an account whose weekly limit was spent, while
+the item held another one). heal_item looks at both on every run; a file that holds another credential than the decision's - a login
+someone did in the pool dir, a stale copy - is logged (WARN, with what it looks like) and rewritten.
 
 One run (launchd StartInterval, single instance via flock):
   * no usable decision yet            -> seed with the first account of the order that answers a probe.
@@ -30,8 +37,8 @@ account AFTER it ("not known" is not "does not outrank"). So an expired entry is
     of the active one, otherwise drop the entry - with a log line saying why.
 Every removal of an entry from the registry has a log line with its reason; nothing leaves it silently.
 
-The switch path never starts `claude` (it may be the thing that is exhausted): the probe is one tiny haiku HTTP
-call, and the answer is read from the anthropic-ratelimit-unified-* headers. The probe never follows a redirect (the
+The switch path never starts `claude` (it may be the thing that is exhausted): the probe is one tiny HTTP call (1 token, on the
+model the pool runs, as Claude Code would ask for it), and the answer is read from the anthropic-ratelimit-unified-* headers. The probe never follows a redirect (the
 Bearer would travel with it): a 30x is "could not tell".
 
 Tokens: read from the vault by lib/claude_account_pool.token_da_conta, held in memory, sent only as the Bearer of
@@ -73,8 +80,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 PROBE_URL = "https://api.anthropic.com/v1/messages"
-PROBE_MODEL = "claude-haiku-4-5-20251001"
+PROBE_MODEL = "claude-sonnet-5-5"   # what the pool runs (--model sonnet): a limit that applies to Sonnet and not to haiku must show up in the probe (ga-6gat1o)
+PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."   # the first system block Claude Code sends: an OAuth credential is issued for its requests
 PROBE_TIMEOUT_S = 10
+CRED_FILE_NAME = ".credentials.json"   # in the pool dir: what claude falls back to when it cannot read the Keychain item (ga-6gat1o)
 DEFAULT_COOLDOWN_S = 900          # rejected with no usable reset header
 INVALID_KEY_COOLDOWN_S = 3600     # 401/403: the key itself is refused
 EXPIRES_AT_MS = 4102444800000     # 2100-01-01: the blob carries no refresh token, so it never rotates
@@ -300,7 +309,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def probe(token: str) -> Probe:
-    body = json.dumps({"model": PROBE_MODEL, "max_tokens": 1, "messages": [{"role": "user", "content": "."}]}).encode()
+    body = json.dumps({"model": PROBE_MODEL, "max_tokens": 1, "system": [{"type": "text", "text": PROBE_SYSTEM}],
+                       "messages": [{"role": "user", "content": "."}]}).encode()
     req = urllib.request.Request(probe_url(), data=body, method="POST", headers={
         "Authorization": "Bearer " + token, "anthropic-version": "2023-06-01",
         "anthropic-beta": "oauth-2025-04-20", "content-type": "application/json",
@@ -317,6 +327,12 @@ def probe(token: str) -> Probe:
 
 
 # ── the Keychain item ──────────────────────────────────────────────────────────────────────────────
+def _blob(token: str) -> dict:
+    """The credential as claude stores it - in the Keychain item and in the credentials file alike: inference-only, no refresh token."""
+    return {"claudeAiOauth": {"accessToken": token, "expiresAt": EXPIRES_AT_MS,
+                              "scopes": ["user:inference"], "subscriptionType": None}}
+
+
 def write_item(user: str, token: str) -> bool:
     """Rewrite the pool item. The secret travels only on `security -i`'s STDIN (hex data): never in argv."""
     if not valid_user(user):   # run_once checks this first; here too because this is where the command line is built
@@ -325,9 +341,7 @@ def write_item(user: str, token: str) -> bool:
     if not POOL_ITEM_RE.fullmatch(item_service()):   # the writer is where a wrong item would do damage: never Mayor's/crews' default one
         log("ERROR", "refusing to write a Keychain item that is not the pool's hashed one")
         return False
-    blob ={"claudeAiOauth": {"accessToken": token, "expiresAt": EXPIRES_AT_MS,
-                              "scopes": ["user:inference"], "subscriptionType": None}}
-    hexdata = json.dumps(blob).encode().hex()
+    hexdata = json.dumps(_blob(token)).encode().hex()
     cmd = f'add-generic-password -U -a "{user}" -s "{item_service()}" -X {hexdata}\n'
     try:
         r = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True, timeout=20, check=False)
@@ -357,6 +371,125 @@ def read_item_token(user: str) -> Tuple[str, Optional[str]]:
     except (ValueError, KeyError, TypeError):
         return "unknown", None   # something else lives there: do not guess, the next run will look again
     return ("ok", tok) if isinstance(tok, str) else ("unknown", None)
+
+
+# ── the credentials file (ga-6gat1o) ───────────────────────────────────────────────────────────────
+# claude reads the Keychain item first; where it cannot (a Keychain locked in the context of the session) it reads THIS file. A switch that
+# reached only the item moved nothing for such a session, so the file is written and healed with the same rigour as the item.
+def cred_file() -> Path:
+    return Path(cred_dir()) / CRED_FILE_NAME
+
+
+def _cred_dir_refusal() -> Optional[str]:
+    """Why the credentials file must NOT be written in cred_dir() (None = it may). The writer is where a wrong file does damage, and the
+    wrong file is Mayor's or a crew's own login (a setup-token over it kills their Remote Control - see item_service): so the pool dir
+    has to be an absolute path that is neither the home directory nor a claude config directory (~/.claude, or CLAUDE_CONFIG_DIR)."""
+    d = Path(cred_dir())
+    if not d.is_absolute():
+        return "the pool dir is not an absolute path"
+    # vazio → no CLAUDE_CONFIG_DIR: only the home directory and ~/.claude are ruled out; falhou/ilegível → no home directory to compare with, or a
+    # path the OS refuses to resolve, is "could not tell where the pool dir points": refused, never "safe"
+    try:
+        home = Path.home()
+        ruled_out = {home, home / ".claude"}
+        if os.environ.get("CLAUDE_CONFIG_DIR"):
+            ruled_out.add(Path(os.environ["CLAUDE_CONFIG_DIR"]))
+        if os.path.realpath(d) in {os.path.realpath(p) for p in ruled_out}:
+            return "the pool dir is the home directory or a claude config directory, where the Mayor's/crews' own login lives"
+    except (OSError, RuntimeError, ValueError):
+        return "could not tell where the pool dir points"
+    return None
+
+
+def read_cred_file() -> Tuple[str, Optional[str]]:
+    """('ok', token) | ('missing', None) | ('unknown', None) - read_item_token's three answers for the file. Only "there is no such file" and
+    "the file is empty" are 'missing' (writing then destroys nothing). A file that cannot be read, or that holds something this cannot make a
+    credential of, is 'unknown': the heal does not overwrite what cannot be read (it could be a login this does not understand). A switch is a
+    deliberate move of the whole pool and writes the file either way, as it writes the item."""
+    p = cred_file()
+    # vazio → a file of zero (or only blank) bytes is 'missing': nothing there to lose; falhou/ilegível → only FileNotFoundError is 'missing', any
+    # other OSError (permissions, I/O, a directory in its place, a parent that is a file) is 'unknown': "could not look" never triggers a rewrite
+    try:
+        raw = p.read_bytes()
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "unknown", None
+    if not raw.strip():
+        return "missing", None
+    # vazio → no accessToken (or an empty one) is 'unknown', not 'missing': there IS something in the file; falhou/ilegível → not UTF-8, not JSON,
+    # nested past the parser or another shape is 'unknown' too: not guessed at, the next run looks again
+    try:
+        tok = json.loads(raw.decode("utf-8"))["claudeAiOauth"]["accessToken"]
+    except (ValueError, KeyError, TypeError, RecursionError):
+        return "unknown", None
+    return ("ok", tok) if isinstance(tok, str) and tok else ("unknown", None)
+
+
+def write_cred_file(token: str) -> bool:
+    """Put the credential in the pool dir's credentials file. Atomic: a temp file beside it, created 0600 (never wider, not even for a moment),
+    fsynced, renamed over it - a session reads the old file or the new one, never half of one. The token is in the file and in this process's
+    memory only: not in argv, not in a log line."""
+    why = _cred_dir_refusal()
+    if why:
+        log("ERROR", f"refusing to write the credentials file: {why}")
+        return False
+    p = cred_file()
+    tmp = p.with_name(p.name + f".tmp.{os.getpid()}")
+    try:
+        p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            tmp.unlink()   # a leftover of a crashed run that had this pid: O_EXCL below would refuse to reuse it
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.fchmod(fd, 0o600)   # exactly 0600 whatever the umask is
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(_blob(token)))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    except OSError as e:
+        log("ERROR", f"credentials file not written ({type(e).__name__})")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def put_cred_file(token: str) -> bool:
+    """write_cred_file, then LOOK: the file has to read back as this credential. It is a local file, so a read that does not say so is a
+    failure - not 'unverified', which is what a locked Keychain earns."""
+    if not write_cred_file(token):
+        return False
+    # vazio → 'missing' after a write that reported success: the credential is not there, False; falhou/ilegível → 'unknown' is False too: the
+    # caller keeps the decision where it was and the next run looks again
+    kind, back = read_cred_file()
+    if kind == "ok" and back == token:
+        return True
+    log("ERROR", f"credentials file written but it does not read back as the decision's credential "
+                 f"({'fp=' + fingerprint(back) if kind == 'ok' and back else 'no credential in it'})")
+    return False
+
+
+def heal_cred_file(token: str, email: str) -> bool:
+    """The credentials file must hold the decision's credential, as the item must (heal_item). True = it does: it did, or it was put back."""
+    # vazio → 'missing': the file is written (a pool dir that never had one is how every first run starts); falhou/ilegível → 'unknown': ERROR and
+    # nothing written - the pool may be running on whatever that file holds, and that stays visible (no clean-run heartbeat) until it can be read
+    kind, held = read_cred_file()
+    if kind == "unknown":
+        log("ERROR", "pool credentials file cannot be read as a credential (permissions, I/O, or something else in it) - not touched; a session "
+                     "that cannot read the Keychain item runs on whatever it holds")
+        return False
+    if kind == "ok" and held == token:
+        return True
+    log("WARN", f"pool credentials file {'missing' if kind == 'missing' else 'holds fp=' + fingerprint(held or '')} but the decision is "
+                f"{email} fp={fingerprint(token)} - rewriting")
+    if kind == "ok":   # a login somebody else did in the pool dir: say what it looks like BEFORE the rewrite erases the evidence (as heal_item does for the item)
+        log("WARN", f"foreign login in the pool credentials file (fp={fingerprint(held or '')}): {describe_foreign_file()}")
+    return put_cred_file(token)
 
 
 MDAT_RE = re.compile(r'"mdat"<timedate>=(?:0x[0-9A-Fa-f]+\s+)?"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z')
@@ -393,17 +526,7 @@ def describe_foreign_item(user: str) -> str:
         r = subprocess.run(["security", "find-generic-password", "-a", user, "-s", item_service(), "-w"],
                            capture_output=True, text=True, timeout=20, check=False)
         top = json.loads(r.stdout.strip()) if r.returncode == 0 else None
-        oauth = top.get("claudeAiOauth") if isinstance(top, dict) else None
-        if isinstance(oauth, dict):
-            exp = _epoch(str(oauth.get("expiresAt")))   # _epoch wants text; an int (ms) or None is what a real blob holds
-            scopes = oauth.get("scopes")
-            parts.append(f"blob keys={sorted(str(k) for k in oauth)} top={sorted(str(k) for k in top)} "
-                         f"refreshToken={'yes' if oauth.get('refreshToken') else 'no'} "
-                         f"expiresAt={_iso(exp) if exp is not None else 'unreadable'} "
-                         f"scopes={sorted(str(s) for s in scopes) if isinstance(scopes, list) else 'unreadable'} "
-                         f"subscriptionType={_tier(oauth)}")
-        else:
-            parts.append("blob shape unreadable")
+        parts.append(_blob_shape(top))
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError, TypeError):
         parts.append("blob shape unreadable")
     try:
@@ -414,6 +537,46 @@ def describe_foreign_item(user: str) -> str:
                      else "item mtime unreadable")
     except (OSError, subprocess.SubprocessError):
         parts.append("item mtime unreadable")
+    parts.append(_young_claude_note())
+    return _cap_line(parts)
+
+
+def describe_foreign_file() -> str:
+    """describe_foreign_item for the credentials file: what the login in it looks like (shape only), when the file was last written, and which
+    young `claude` processes could have written it. Best effort, nothing here raises: it annotates a rewrite, it must never stop one."""
+    parts: List[str] = []
+    # vazio → a file with nothing in it has no shape: "blob shape unreadable" (as is any non-JSON/other-shape content); falhou/ilegível → the same
+    # words, from the OSError: the line says it could not look, it never invents a shape
+    try:
+        parts.append(_blob_shape(json.loads(cred_file().read_bytes().decode("utf-8"))))
+    except (OSError, ValueError, AttributeError, TypeError, RecursionError):
+        parts.append("blob shape unreadable")
+    # vazio → no such answer: a stat gives a time or raises; falhou/ilegível → "file mtime unreadable" (the file went away, or cannot be stat'ed)
+    try:
+        parts.append(f"file modified {_iso(cred_file().stat().st_mtime)}")
+    except OSError:
+        parts.append("file mtime unreadable")
+    parts.append(_young_claude_note())
+    return _cap_line(parts)
+
+
+def _blob_shape(top) -> str:
+    """A credential blob by its key NAMES and a few non-secret scalars - never the token, the refresh token or any other field's value."""
+    oauth = top.get("claudeAiOauth") if isinstance(top, dict) else None
+    if not isinstance(oauth, dict):
+        return "blob shape unreadable"
+    exp = _epoch(str(oauth.get("expiresAt")))   # _epoch wants text; an int (ms) or None is what a real blob holds
+    scopes = oauth.get("scopes")
+    return (f"blob keys={sorted(str(k) for k in oauth)} top={sorted(str(k) for k in top)} "
+            f"refreshToken={'yes' if oauth.get('refreshToken') else 'no'} "
+            f"expiresAt={_iso(exp) if exp is not None else 'unreadable'} "
+            f"scopes={sorted(str(s) for s in scopes) if isinstance(scopes, list) else 'unreadable'} "
+            f"subscriptionType={_tier(oauth)}")
+
+
+def _young_claude_note() -> str:
+    """Which `claude` processes are young enough to have written a credential just now (pid/age/tty, never argv)."""
+    # vazio → "none" (ps ran and no claude is that young); falhou/ilegível → "process list unreadable": 'ps failed' is not 'no young claude'
     try:
         r = subprocess.run(["ps", "-axo", "pid=,etime=,tty=,comm="], capture_output=True, text=True, timeout=10, check=False)
         if r.returncode != 0:
@@ -425,10 +588,13 @@ def describe_foreign_item(user: str) -> str:
             if age is not None and age <= RECENT_CLAUDE_S and os.path.basename(f[3].strip()) == "claude":
                 young.append((age, f[0], f[1], f[2]))
         young.sort()
-        parts.append("young claude processes: " + ("; ".join(f"pid={p} age={e} tty={t}" for _, p, e, t in young[:RECENT_CLAUDE_MAX])
-                                                    if young else "none") + (f" (+{len(young) - RECENT_CLAUDE_MAX} more)" if len(young) > RECENT_CLAUDE_MAX else ""))
+        return ("young claude processes: " + ("; ".join(f"pid={p} age={e} tty={t}" for _, p, e, t in young[:RECENT_CLAUDE_MAX])
+                                              if young else "none") + (f" (+{len(young) - RECENT_CLAUDE_MAX} more)" if len(young) > RECENT_CLAUDE_MAX else ""))
     except (OSError, subprocess.SubprocessError):
-        parts.append("process list unreadable")
+        return "process list unreadable"
+
+
+def _cap_line(parts: List[str]) -> str:
     line, cap, mark = "; ".join(parts), 900, " ...[truncated]"   # a cut line says it was cut: the parts at its tail are the ones that go first
     return line if len(line) <= cap else line[:cap - len(mark)] + mark
 
@@ -638,6 +804,11 @@ def switch_to(st: dict, user: str, email: str, token: str, reason: str, t: float
         # security reported success but the Keychain cannot be read back (locked?). Not a mismatch: the decision follows
         # the write, and the next run's heal_item looks again and rewrites if the item does not hold the decision.
         log("WARN", f"item written for {email} (security reported success) but the read-back was unreadable - switch unverified")
+    # The same credential on the path a session takes when it cannot read the item (ga-6gat1o). A switch that reaches only the item moves
+    # nothing for such a session, so it is not a switch: the decision stays where it was, and the next run heals the item and tries again.
+    if not put_cred_file(token):
+        log("ERROR", f"credentials file not switched to {email} - decision NOT changed")
+        return False
     prev = st.get("current")
     st.update(current=email, fingerprint=fingerprint(token), since=t, reason=reason, previous=prev)
     log("INFO", f"SWITCH {prev or '-'} -> {email} fp={fingerprint(token)}: {reason}")
@@ -670,18 +841,22 @@ def pick_next(st: dict, order: List[str], keys: Keys, skip: set, t: float) -> Op
 
 
 def heal_item(st: dict, user: str, token: str, email: str) -> None:
-    """The daemon is the single writer: if the item is gone or holds another account than the decision, put it back."""
+    """The daemon is the single writer: if the item or the credentials file is gone or holds another account than the decision, put it back."""
     kind, held = read_item_token(user)
+    item_ok = True
     if kind == "unknown":
         log("WARN", "pool item unreadable (locked keychain?) - not touched")
-        return
-    if not (kind == "ok" and held == token):
+        item_ok = False
+    elif not (kind == "ok" and held == token):
         log("WARN", f"pool item {'missing' if kind == 'missing' else 'holds fp=' + fingerprint(held or '')} but the decision is "
                     f"{email} fp={fingerprint(token)} - rewriting")
         if kind == "ok":   # a credential somebody else wrote: say what it looks like BEFORE the rewrite erases the evidence (ga-xknkke)
             log("WARN", f"foreign write to the pool item (fp={fingerprint(held or '')}): {describe_foreign_item(user)}")
-        if not write_item(user, token):
-            return
+        item_ok = write_item(user, token)
+    # The file is looked at whatever became of the item: an item that cannot be read (locked Keychain) is the very case in which a session reads the file.
+    heal_cred_file(token, email)
+    if not item_ok:
+        return
     # The decision names the credential the item holds. If the vault's key for this account changed (rotated), the
     # fingerprint follows - it is the second witness current_credential() relies on when the vault gives nothing back.
     if st.get("fingerprint") != fingerprint(token):
@@ -813,7 +988,10 @@ def decide(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[Opt
         failback(st, keys, order, readings, user, cur, t)
     now_cur = st.get("current")
     if kind == "item" and now_cur == cur:
-        return   # the key of the decision never came from the vault and the item IS that key: nothing to heal against
+        # the key of the decision never came from the vault and the item IS that key: nothing to heal the ITEM against - but that key is the
+        # decision's credential (the fingerprint says so), and the credentials file is healed against it
+        heal_cred_file(tok, cur)
+        return
     key = keys.token(now_cur) if now_cur else None
     if key:
         heal_item(st, user, key, now_cur)

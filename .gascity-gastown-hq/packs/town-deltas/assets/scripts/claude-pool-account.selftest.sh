@@ -50,6 +50,15 @@ fi
 CALLER_LOG="$CALLER_CITY/.gc/logs/claude-pool-account.log"
 caller_log_size() { if [ -f "$CALLER_LOG" ]; then wc -c < "$CALLER_LOG" | tr -d ' '; else echo absent; fi; }
 CALLER_LOG_SIZE_BEFORE="$(caller_log_size)"
+# The same question for the credentials file the daemon now writes (ga-6gat1o). The real one is where the daemon points when nothing seals it:
+# CLAUDE_POOL_CRED_DIR, else GC_POOL_CRED_DIR, else $HOME/.gastown/claude-pool-cred - the daemon's own precedence, read BEFORE the guard below
+# repoints all three. Only its METADATA is ever looked at (inode:size:mtime): the secret in it is never opened by this file.
+REAL_CRED="${CLAUDE_POOL_CRED_DIR:-${GC_POOL_CRED_DIR:-${HOME-}/.gastown/claude-pool-cred}}/.credentials.json"
+cred_sig() { # cred_sig <path>  ->  inode:size:mtime | absent | nao-medido (a file that is there and whose metadata could not be read)
+  if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo absent; return; fi
+  stat -f '%i:%z:%m' "$1" 2>/dev/null || stat -c '%i:%s:%Y' "$1" 2>/dev/null || echo nao-medido
+}
+REAL_CRED_SIG_BEFORE="$(cred_sig "$REAL_CRED")"
 
 AMBIENT="$W/ambient"; mkdir -p "$AMBIENT/city/.gc/logs" "$AMBIENT/home/.gastown"
 export GC_CITY_PATH="$AMBIENT/city" HOME="$AMBIENT/home" CLAUDE_POOL_STATE="$AMBIENT/state.json" \
@@ -268,10 +277,15 @@ STATE, LOG, PORTF = sys.argv[1:4]
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self): self.do_POST()   # a redirect followed by urllib arrives as a GET: log its Bearer too
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("content-length") or 0))
+        raw = self.rfile.read(int(self.headers.get("content-length") or 0))
         tok = (self.headers.get("authorization") or "").replace("Bearer ", "")
         beh = json.load(open(STATE)).get(tok) or {"status": 401, "h": {}}
         with open(LOG, "a") as f: f.write(tok + "\n")
+        # what the probe ASKED for (ga-6gat1o): model and system prompt, one JSON line per request, beside the token log. A body that is not
+        # JSON (or a GET) is recorded as {"unparsed": true} - never as an empty request that would pass for "no model asked for".
+        try: b = json.loads(raw.decode("utf-8")); rec = {"model": b.get("model"), "system": b.get("system")}
+        except Exception: rec = {"unparsed": True}
+        with open(LOG + ".bodies", "a") as f: f.write(json.dumps(rec) + "\n")
         self.send_response(beh["status"])
         for k, v in beh.get("h", {}).items(): self.send_header(k, v)
         body = b"{}"; self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body)))
@@ -311,6 +325,9 @@ EOF
 new_d() { # fresh daemon world with all three accounts allowed
   [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
   rm -rf "$D"; mkdir -p "$D/kc/items" "$D/vault" "$D/city/.gc/logs" "$D/home"
+  # $POOL_DIR lives under $W, not $D: the credentials file the daemon keeps there (ga-6gat1o) survives a new_d unless it is cleared here
+  # (a directory put in its place by B53 included, and a temp file a failed write may have left)
+  rm -rf "$POOL_DIR/.credentials.json" "$POOL_DIR"/.credentials.json.tmp.*
   : > "$D/probes.log"; echo '{}' > "$D/srv.json"
   local i=0 e
   for e in "${EMAILS[@]}"; do printf '%s' "$(tok_of "$e")" > "$D/vault/$e"; set_srv "$e" 200 "$HDR_OK"; done
@@ -1200,6 +1217,134 @@ sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.uti
 print(m.probe_url())' "$DAEMON" 2>/dev/null)"
   [ "$got" = "https://api.anthropic.com/v1/messages" ] && ok "B18 a non-loopback CLAUDE_POOL_PROBE_URL is ignored" || bad "B18 probe_url() -> '$got'"
 
+  # ── ga-6gat1o: the pool CREDENTIALS FILE ─────────────────────────────────────────────────────────
+  # A pool session whose Keychain is locked cannot read the item the daemon switches; it reads $POOL_DIR/.credentials.json instead. The
+  # decision used to reach the item only, so those sessions ran on whatever the file held - in the incident, a stale full login of an
+  # account whose weekly limit was spent. B51..B58: the daemon writes and heals that file too, with the item's rigour, and it refuses to
+  # write where a wrong file would be somebody's own login. $POOL_DIR is shared by every scenario (it lives under $W): new_d clears the file.
+  CF="$POOL_DIR/.credentials.json"
+  TOKEN_STALE="sk-ant-oat01-TESTSTALEdddddddddddddddddddd"
+  cf_token() { # the accessToken in the pool credentials file: <no-file> | <unreadable> | the token
+    [ -e "$CF" ] || { echo "<no-file>"; return; }
+    "$PY3" -c 'import json,sys
+try: print(json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"])
+except Exception: print("<unreadable>")' "$CF"
+  }
+  cf_mode() { stat -f '%Lp' "$CF" 2>/dev/null || stat -c '%a' "$CF" 2>/dev/null || echo "<no-file>"; }
+  cf_sig() { stat -f '%i:%m' "$CF" 2>/dev/null || stat -c '%i:%Y' "$CF" 2>/dev/null || echo "<no-file>"; }   # inode:mtime - a rename over the file changes the inode
+  cf_tmp_left() { ls -A "$POOL_DIR" 2>/dev/null | grep -c '^\.credentials\.json\.tmp\.' || true; }
+  cf_login() { # cf_login <token>: what a `claude` login leaves in the pool dir (refresh token, a near expiry, more scopes) - the stale file of the incident
+    mkdir -p "$POOL_DIR"; "$PY3" - "$CF" "$1" <<'EOF'
+import json, sys
+open(sys.argv[1], "w").write(json.dumps({"claudeAiOauth": {"accessToken": sys.argv[2], "refreshToken": "REFRESH-SECRET-VALUE-zzz", "expiresAt": 1999030000000,
+                       "scopes": ["user:profile", "user:inference"], "subscriptionType": "max", "organizationUuid": "ORG-SECRET-UUID"}}))
+EOF
+  }
+  cf_leaks() { # fingerprints of the secrets found where none belongs (argv, log, state, output); the credentials file is the one place a token goes
+    local l="" t
+    for t in "$TOKEN_a" "$TOKEN_b" "$TOKEN_c" "$TOKEN_STALE" "REFRESH-SECRET-VALUE" "ORG-SECRET-UUID"; do
+      grep -rqF "$t" "$D/kc/argv.log" "$D/city/.gc/logs" "$STATE" "$D/out.txt" 2>/dev/null && l="$l $(fp_of "$t")"
+    done; echo "$l"
+  }
+
+  # B51 the seed writes the file as well as the item: the same credential, inference-only like the item's blob, 0600, the decision's fingerprint
+  new_d; run_d -- run-once
+  [ "$(item_token)" = "$TOKEN_a" ] && [ "$(cf_token)" = "$TOKEN_a" ] && [ "$(cf_mode)" = "600" ] && [ "$(cf_tmp_left)" = "0" ] && [ "$(jget "$STATE" fingerprint)" = "$(fp_of "$(cf_token)")" ] \
+    && ok "B51 seed -> the item AND the pool credentials file hold account a (0600, no temp file left, the decision's fingerprint)" \
+    || bad "B51 item=$(item_token | cut -c1-24) file=$(cf_token | cut -c1-24) mode=$(cf_mode) tmp-left=$(cf_tmp_left) fp='$(jget "$STATE" fingerprint)'"
+  blob="$("$PY3" -c 'import json,sys; b=json.load(open(sys.argv[1]))["claudeAiOauth"]; print(sorted(b.keys()), b["scopes"], b.get("refreshToken","<none>"))' "$CF" 2>/dev/null)"
+  [ "$blob" = "['accessToken', 'expiresAt', 'scopes', 'subscriptionType'] ['user:inference'] <none>" ] && ok "B51b the file's blob is inference-only: no refresh token (a session cannot refresh it into another account)" || bad "B51b file blob shape: $blob"
+  # B51c a failover moves the file with the item
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(cf_token)" = "$TOKEN_b" ] && [ "$(jget "$STATE" fingerprint)" = "$(fp_of "$TOKEN_b")" ] \
+    && ok "B51c failover a -> b: the item, the file and the decision all move to b together" \
+    || bad "B51c current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) file=$(cf_token | cut -c1-24)"
+
+  # B52 THE INCIDENT: item and decision agree on a, the file holds a stale full login of another account. The file is rewritten, the line
+  # before the rewrite says what the login looked like (shape only), and the item is not touched (it was right).
+  seeded; cf_login "$TOKEN_STALE"; TZ=UTC touch -t 202610052341.56 "$CF"; w0=$(writes)
+  printf '%s\n' ' 4246       00:09 ttys002  claude' > "$D/kc/ps.out"
+  run_d -- run-once; fl="$(grep 'foreign login in the pool credentials file' "$LOG" | head -1)"
+  [ "$(cf_token)" = "$TOKEN_a" ] && [ "$(cf_mode)" = "600" ] && [ "$(writes)" = "$w0" ] \
+    && ok "B52 a stale login in the pool credentials file -> the file is rewritten to the decision's credential; the item (already right) is not written" \
+    || bad "B52 file=$(cf_token | cut -c1-24) mode=$(cf_mode) item writes $w0 -> $(writes)"
+  grep -qF "pool credentials file holds fp=$(fp_of "$TOKEN_STALE") but the decision is a@t.test fp=$(fp_of "$TOKEN_a") - rewriting" "$LOG" \
+    && ok "B52b a WARN names the fingerprints (file vs decision) - the detector" || bad "B52b no WARN: $(grep -i 'credentials file' "$LOG" | tail -n 3 | tr '\n' '|')"
+  case "$fl" in *"(fp=$(fp_of "$TOKEN_STALE"))"*"refreshToken=yes expiresAt=2033-"*"scopes=['user:inference', 'user:profile']"*"subscriptionType=max"*"file modified 2026-10-05T23:41:56Z"*"pid=4246 age=00:09 tty=ttys002"*) \
+      ok "B52c ...and one 'foreign login' line first: the login's shape (refresh token yes, scopes, expiry, tier), when the file changed, the young claude processes" ;; *) bad "B52c line: '$fl'" ;; esac
+  [ -z "$(cf_leaks)" ] && ok "B52d no token, refresh token or other field VALUE in argv/log/state/output (key names and non-secret scalars only)" || bad "B52d secrets leaked (fingerprints:$(cf_leaks))"
+  # a file that already holds the decision's credential is left alone: no write, no WARN (the sweep every run is not a rewrite every run)
+  m0="$(cf_sig)"; : > "$LOG"; run_d -- run-once
+  [ "$(cf_token)" = "$TOKEN_a" ] && [ "$(cf_sig)" = "$m0" ] && ! grep -qi 'credentials file' "$LOG" \
+    && ok "B52e a file that already holds the decision's credential is not rewritten and not mentioned" || bad "B52e file=$(cf_token | cut -c1-24) log: $(grep -i 'credentials file' "$LOG" | tail -n 2 | tr '\n' '|')"
+
+  # B52f the same stale file with the Keychain LOCKED - the incident's real condition: the daemon cannot read the item either, and the file
+  # is still put right (the item is "could not tell": not touched; the file is a different place with its own reading)
+  seeded; cf_login "$TOKEN_STALE"; touch "$D/kc/locked"; w0=$(writes); run_d -- run-once; rm -f "$D/kc/locked"
+  [ "$(cf_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$w0" ] && grep -q "pool item unreadable" "$LOG" \
+    && ok "B52f locked Keychain + stale file -> the item is left alone (unreadable), the file is rewritten to the decision" || bad "B52f file=$(cf_token | cut -c1-24) writes $w0 -> $(writes)"
+
+  # B53 a MISSING file and an EMPTY one are both 'nothing there to lose': written
+  seeded; rm -f "$CF"; run_d -- run-once
+  [ "$(cf_token)" = "$TOKEN_a" ] && [ "$(cf_mode)" = "600" ] && grep -q "pool credentials file missing but the decision is a@t.test" "$LOG" \
+    && ok "B53 file missing -> recreated for the decision (WARN says missing)" || bad "B53 file=$(cf_token | cut -c1-24) mode=$(cf_mode)"
+  seeded; : > "$CF"; run_d -- run-once
+  [ "$(cf_token)" = "$TOKEN_a" ] && ok "B53b file empty (0 bytes) -> rewritten for the decision" || bad "B53b file=$(cf_token | cut -c1-24)"
+
+  # B54 a file that CANNOT BE READ AS A CREDENTIAL is not overwritten: it could be a login this does not understand, and what the pool runs
+  # on stays visible - an ERROR in the log, and no clean-run heartbeat (the guard's liveness alert fires on a missing one). Garbage, other
+  # JSON shapes, an empty token and a directory in the file's place are all that one state.
+  b54=""
+  for content in 'not json at all {' '{"foo": 1}' '[]' 'null' '{"claudeAiOauth": {"accessToken": ""}}' '{"claudeAiOauth": []}'; do
+    seeded; printf '%s' "$content" > "$CF"; cp "$CF" "$D/cf.before"; rm -f "$HB"; run_d -- run-once
+    cmp -s "$CF" "$D/cf.before" && grep -q "ERROR.*pool credentials file cannot be read as a credential" "$LOG" && hb_none || b54="$b54 [$content]"
+  done
+  [ -z "$b54" ] && ok "B54 unreadable-as-a-credential file (garbage, other shapes, empty token) -> ERROR, file untouched, no clean-run heartbeat" || bad "B54 wrong handling for:$b54"
+  seeded; rm -f "$CF" "$HB"; mkdir "$CF"; run_d -- run-once
+  [ -d "$CF" ] && grep -q "ERROR.*pool credentials file cannot be read as a credential" "$LOG" && hb_none \
+    && ok "B54b a directory where the file belongs (OSError on read) -> ERROR, left alone, no clean-run heartbeat" || bad "B54b dir=$([ -d "$CF" ] && echo yes || echo no) log: $(grep -i 'credentials file' "$LOG" | tail -n 2 | tr '\n' '|')"
+
+  # B55 the file cannot be WRITTEN during a switch (here: a directory sits in its place, so the rename onto it fails - works as root too) ->
+  # the switch is refused, the decision stays where it was, ERROR, no temp file left. The item may already hold b (B50's case); the next
+  # run's heal and probe settle it.
+  seeded; rm -f "$CF" "$HB"; mkdir "$CF"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(cf_tmp_left)" = "0" ] && grep -q "ERROR.*credentials file not switched to b@t.test - decision NOT changed" "$LOG" && hb_none \
+    && ok "B55 the file cannot be written -> the switch to b is refused ('decision NOT changed'), no temp file left, no clean-run heartbeat" \
+    || bad "B55 current='$(jget "$STATE" current)' tmp-left=$(cf_tmp_left) log: $(grep -E 'ERROR' "$LOG" | tail -n 3 | tr '\n' '|')"
+  rmdir "$CF" 2>/dev/null
+
+  # B56 the writer refuses a pool dir that is somebody's own login: the home directory, ~/.claude, CLAUDE_CONFIG_DIR, a symlink to one of
+  # them (the real path is what counts), and a relative path (its meaning depends on where the daemon was started). Nothing is written there.
+  b56=""
+  for pd in home home/.claude cfg poollink; do
+    new_d; mkdir -p "$D/home/.claude" "$D/cfg"; ln -s "$D/home/.claude" "$D/poollink"
+    run_d "CLAUDE_POOL_CRED_DIR=$D/$pd" "CLAUDE_CONFIG_DIR=$D/cfg" -- run-once
+    [ -z "$(find "$D/home" "$D/cfg" -name '.credentials.json*' 2>/dev/null)" ] && grep -q "ERROR.*refusing to write the credentials file: the pool dir is the home directory or a claude config directory" "$LOG" && hb_none || b56="$b56 $pd"
+  done
+  [ -z "$b56" ] && ok "B56 pool dir = home / ~/.claude / CLAUDE_CONFIG_DIR / a symlink to one -> refused with an ERROR, nothing written" || bad "B56 not refused (or something written) for:$b56"
+  new_d; ( cd "$D/home" && run_d CLAUDE_POOL_CRED_DIR=rel/pooldir -- run-once )
+  [ -z "$(find "$D" -name '.credentials.json*' 2>/dev/null)" ] && grep -q "ERROR.*refusing to write the credentials file: the pool dir is not an absolute path" "$LOG" \
+    && ok "B56b a relative pool dir -> refused, nothing written under the daemon's cwd" || bad "B56b found: $(find "$D" -name '.credentials.json*' 2>/dev/null | tr '\n' ' ') log: $(grep -i 'refusing' "$LOG" | tail -n 1)"
+
+  # B57 the decision names an account whose key the vault does not give this run, and the item holds the decision's credential: the daemon
+  # keeps the decision (current_credential's second witness) and still heals the FILE against that credential
+  seeded; hide_key a@t.test; cf_login "$TOKEN_STALE"; run_d -- run-once; show_key a@t.test
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(cf_token)" = "$TOKEN_a" ] && [ -z "$(cf_leaks)" ] \
+    && ok "B57 key not from the vault, item corroborates the decision -> the stale file is healed from the item's credential, no secret leaked" \
+    || bad "B57 current='$(jget "$STATE" current)' file=$(cf_token | cut -c1-24) leaks:$(cf_leaks)"
+
+  # B58 the PROBE asks the way the pool does (ga-6gat1o): a model the pool runs - a Haiku verdict says nothing about a Sonnet limit - with
+  # the Claude Code system prompt; and every request it made says so (none unparsed, none on another model).
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
+  bodies="$D/probes.log.bodies"
+  n="$(wc -l < "$bodies" 2>/dev/null | tr -d ' ')"; models="$("$PY3" -c 'import json,sys; print(" ".join(sorted({"unparsed" if json.loads(l).get("unparsed") else str(json.loads(l).get("model")) for l in open(sys.argv[1])})))' "$bodies" 2>/dev/null)"
+  sysok="$("$PY3" -c 'import json,sys
+rows = [json.loads(l) for l in open(sys.argv[1])]
+print(bool(rows) and all(isinstance(r.get("system"), list) and r["system"] and str(r["system"][0].get("text")).startswith("You are Claude Code") for r in rows))' "$bodies" 2>/dev/null)"
+  case "$models" in *haiku*|*unparsed*|"") bad "B58 probe model(s): '$models' (n=$n)" ;; *sonnet*) ok "B58 the probe asks for a Sonnet model, not Haiku ($models; $n requests)" ;; *) bad "B58 probe model(s): '$models'" ;; esac
+  [ "$sysok" = "True" ] && ok "B58b every probe carries the Claude Code system prompt" || bad "B58b system prompt: $sysok"
+  [ -z "$(cf_leaks)" ] && ok "B58c no secret in argv/log/state/output after a failover run that wrote the file" || bad "B58c leaked (fingerprints:$(cf_leaks))"
+
 [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
 
 # ── C. wiring ──────────────────────────────────────────────────────────────────────────────────────
@@ -1271,6 +1416,19 @@ else
   elif [ -z "$leaked" ]; then ok "D1 no fixture line reached the log of the city this run was launched from"
   else bad "D1 the selftest wrote into $CALLER_LOG: $(printf '%s' "$leaked" | head -n 2 | cut -c1-120 | tr '\n' '|')"
   fi
+fi
+
+# D2 (ga-6gat1o) the live pool credentials file is where a session lands when it cannot read the Keychain item: a fixture token in it
+# would put the whole pool on an account that does not exist. Same three states as D1: a signature we could not take is nao-medido, not a
+# pass. A change is reported as a change - the live daemon heals that file too, so the message names both suspects instead of blaming the
+# selftest alone (a run that is repeated and changes it again is the selftest).
+after_sig="$(cred_sig "$REAL_CRED")"
+if [ "$REAL_CRED_SIG_BEFORE" = "nao-medido" ] || [ "$after_sig" = "nao-medido" ]; then
+  bad "D2 nao-medido: the metadata of the live pool credentials file could not be read ($REAL_CRED)"
+elif [ "$REAL_CRED_SIG_BEFORE" = "$after_sig" ]; then
+  ok "D2 the live pool credentials file ($([ "$after_sig" = absent ] && echo "absent" || echo "present")) was not touched by this run"
+else
+  bad "D2 the live pool credentials file changed during the run ($REAL_CRED_SIG_BEFORE -> $after_sig): this selftest wrote it, or the live daemon healed it meanwhile - run again to tell"
 fi
 
 echo
