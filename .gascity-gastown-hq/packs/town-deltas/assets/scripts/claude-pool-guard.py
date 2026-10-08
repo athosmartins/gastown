@@ -57,7 +57,7 @@ def load_daemon():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     for need in ("disabled", "HEARTBEAT_FILE", "read_item_token", "fingerprint", "login_name", "valid_user", "city", "now", "_iso",
-                 "state_path", "CLOCK_SKEW_S"):
+                 "state_path", "CLOCK_SKEW_S", "_sane_epoch"):
         if not hasattr(mod, need):
             raise ImportError(f"{p.name} lacks {need} (the guard needs the ga-8hcnvb.3 version of the daemon)")
     return mod
@@ -129,9 +129,31 @@ def _dict(gs: dict, key: str) -> dict:
 
 
 def _num(v) -> Optional[float]:
-    """A time or a duration read from a file. Missing, not a number, NaN or +-infinity (json.loads accepts NaN and Infinity; the arithmetic on
-    them raises or never compares true) -> None, which every caller reads as 'no usable value' (never as 0, never as a time)."""
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+    """A time (epoch seconds) read from a file, or None = 'no usable value', which every caller reads as exactly that (never as 0, never as a
+    time). The daemon's own judge of what can be a time (D._sane_epoch), so the two cannot disagree: missing, a bool, a string, NaN or +-infinity
+    (json.loads accepts NaN and Infinity), an integer too big for a float (a 400-digit one: float() and math.isfinite() raise OverflowError on
+    it) and a number outside what can be an epoch at all are all None. It never raises."""
+    return D._sane_epoch(v)
+
+
+def _past(v, t: float) -> Optional[float]:
+    """_num, and not ahead of the clock `t` by more than the daemon allows for skew. A time that has not happened yet is no time to count from:
+    kept, it would hold an alert back until the clock caught up (a clock that stepped back, or a hand edit, with no end in sight)."""
+    f = _num(v)
+    return f if f is not None and f <= t + D.CLOCK_SKEW_S else None
+
+
+def _since(rec: dict, what: str, t: float) -> float:
+    """rec["since"] as the start of an episode - or, when it cannot be used (missing, not a time, in the future), `t`, WRITTEN BACK. The
+    clock of that episode restarts; it is not read as 'now' again on every tick, because a start that is always now is never 120 s old and the
+    alert would never come. (Alerting at once would be the other wrong answer: a start nobody can read proves nothing about how long it lasted.)"""
+    f = _past(rec.get("since"), t)
+    if f is None:
+        if rec.get("since") is not None:
+            glog("WARN", f"the start of the {what} episode in the guard's state is not a usable time - its clock restarts now")
+        rec["since"] = t
+        return t
+    return f
 
 
 # ── alerts ─────────────────────────────────────────────────────────────────────────────────────────
@@ -139,6 +161,8 @@ def debounce_s() -> float:
     try:
         v = float(os.environ.get("CLAUDE_POOL_GUARD_DEBOUNCE_S", ""))
     except ValueError:
+        return float(DEBOUNCE_S)
+    if math.isnan(v):                # float("nan") parses; min()/max() on it would answer 0, an alert on the first look
         return float(DEBOUNCE_S)
     return max(0.0, min(v, float(MAX_DEBOUNCE_S)))
 
@@ -290,7 +314,8 @@ def check_divergence(gs: dict, t: float, user: str) -> None:
     unblind(gs, "divergence")
     if verdict in ("same", "inactive"):
         if ep:
-            glog("INFO", f"divergence over after {int(t - (_num(ep.get('since')) or t))}s: the pool item matches the decision again - no further alerts")
+            glog("INFO", f"divergence over after {int(t - (_num(ep.get('since')) or t))}s: "
+                         + ("the pool item matches the decision again" if verdict == "same" else "the pool is not active any more (no decision, no item)") + " - no further alerts")
         gs["divergence"] = None
         if verdict == "same":
             learn(gs, f["exp_email"], f["exp_fp"])
@@ -301,8 +326,8 @@ def check_divergence(gs: dict, t: float, user: str) -> None:
         gs["divergence"] = ep
         glog("WARN", f"divergence seen: expected fp={f['exp_fp']} item fp={f['in_fp']} ({f['why']}); alert if it lasts {int(debounce_s())}s")
     ep.update({"exp_email": f["exp_email"], "exp_fp": f["exp_fp"], "in_fp": f["in_fp"], "why": f["why"], "last_seen": t})
-    since = _num(ep.get("since")) or t
-    last = _num(ep.get("alerted_at"))
+    since = _since(ep, "divergence", t)
+    last = _past(ep.get("alerted_at"), t)     # unusable = never alerted: the alert is said (once more), never withheld
     if t - since < debounce_s():
         return
     if last is not None and t - last < REMIND_S:
@@ -335,8 +360,8 @@ def blind(gs: dict, t: float, what: str, why: str, since: Optional[float] = None
         b[what] = e
         glog("WARN", f"cannot verify {what}: {why} - nothing changed")
     e["why"] = why
-    since = _num(e.get("since")) or t
-    last = _num(e.get("alerted_at"))
+    since = _since(e, f"'{what}' could-not-tell", t)
+    last = _past(e.get("alerted_at"), t)
     if t - since < BLIND_S or (last is not None and t - last < REMIND_S):
         return
     if send_alert(f"Pool Claude: guarda sem enxergar ({what})",
@@ -362,18 +387,19 @@ def _probe(f, p: Path) -> Optional[bool]:
 # ── 2. the daemon's liveness ───────────────────────────────────────────────────────────────────────
 def read_heartbeat(t: float) -> Tuple[str, Optional[float]]:
     """('absent'|'ok'|'unreadable', epoch). Only a file that is NOT THERE means 'no clean run on record'. One that cannot be read, has no
-    usable epoch or is stamped in the future (a stuck clock would hide a dead daemon for as long as it lasts) is 'cannot tell'."""
+    usable epoch (not text, not JSON, not an object, no number in it, a number that cannot be a time) or is stamped in the future (a stuck
+    clock would hide a dead daemon for as long as it lasts) is 'cannot tell'."""
     c = D.city()
     if not c:
         return "unreadable", None
     try:
-        raw = (c / ".gc" / D.HEARTBEAT_FILE).read_text()
+        raw = (c / ".gc" / D.HEARTBEAT_FILE).read_bytes()
     except FileNotFoundError:
         return "absent", None
     except OSError:
         return "unreadable", None
     try:
-        epoch = _num(json.loads(raw).get("epoch"))
+        epoch = _num(json.loads(raw.decode("utf-8")).get("epoch"))    # ValueError covers a file that is not UTF-8 and one that is not JSON
     except (ValueError, AttributeError, RecursionError):
         return "unreadable", None
     if epoch is None or epoch > t + D.CLOCK_SKEW_S:
@@ -399,9 +425,10 @@ def check_daemon_alive(gs: dict, t: float, user: str) -> None:
     if last is None and dstat != "ok" and istat != "ok":
         return                   # no heartbeat, and whether the daemon was ever switched on cannot be told (Keychain locked / decision unreadable): no verdict
     d = _dict(gs, "daemon")
-    prev, watch = _num(d.get("checked_at")), _num(d.get("watch_since"))
-    if prev is not None and not (0 <= t - prev <= LIVENESS_GAP_S):
-        watch = t                # the guard was not looking in between: what went stale meanwhile proves nothing
+    prev, watch = _past(d.get("checked_at"), t), _past(d.get("watch_since"), t)
+    spoiled = (prev is None and d.get("checked_at") is not None) or (watch is None and d.get("watch_since") is not None)
+    if spoiled or (prev is not None and not (0 <= t - prev <= LIVENESS_GAP_S)):
+        watch = t                # the guard was not looking in between (or its record of looking cannot be read): what went stale meanwhile proves nothing
     elif watch is None or prev is None:
         watch = t if last is None else last   # the first look ever: with a stamp on record its age is the evidence, with none the count starts now
     d["watch_since"] = watch
@@ -420,7 +447,7 @@ def check_daemon_alive(gs: dict, t: float, user: str) -> None:
     if d.get("stale_since") is None:
         d["stale_since"] = t
         glog("WARN", f"the daemon has not completed a clean run in the {mins} min the guard has been looking (last: {when or 'never'}); see claude-pool-account.log")
-    a = _num(d.get("alerted_at"))
+    a = _past(d.get("alerted_at"), t)
     if a is None or t - a >= REMIND_S:
         # the last stamp is in the title: a daemon that recovers and stops again is a new episode, and notify drops a repeated title within 30 min
         if send_alert(f"Pool Claude: o daemon de troca não está fechando rodadas (última: {when[:16] + 'Z' if when else 'nunca'})",

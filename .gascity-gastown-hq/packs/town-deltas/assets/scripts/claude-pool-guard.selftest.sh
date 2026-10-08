@@ -3,7 +3,10 @@
 #
 #   G1-G4  DIVERGENCE: the account the pool really uses vs the account the rule dictates -> one phone alert in < 5 min naming both by
 #          e-mail + 8-hex fingerprint, never the key; it stops repeating when fixed; 'could not tell' never alerts as a divergence.
-#   G6     the daemon's heartbeat (a daemon that stopped completing runs).
+#   G4g    the guard's OWN record (episode start, 'already alerted' stamp, the daemon watch) can be unusable - a 400-digit integer, NaN,
+#          a string, a time in the future: that clock restarts; the check neither crashes nor goes silent.
+#   G6     the daemon's heartbeat (a daemon that stopped completing runs); G6i: a heartbeat that cannot be read in ANY way (not UTF-8,
+#          a 400-digit epoch, an epoch that is not a time) is 'could not tell', never a crash and never a verdict.
 #   G10    the daemon's silence is judged only over time the guard was LOOKING: a stand-down (the operator's switches) or the guard's
 #          own absence (reboot, sleep) is not a daemon death; a daemon that really stays silent is still told on time. The harness's
 #          HB_AUTO=0 is the real daemon (no stamp while stood down); HB_AUTO=1 re-stamps every tick and hid this.
@@ -172,6 +175,21 @@ gl() { cat "$CITY/.gc/logs/claude-pool-guard.log" 2>/dev/null; }
 active_world() { # item = a's key, decision = a, a clean heartbeat: the pool as the daemon leaves it
   put_item "$KEY_a"; put_decision a@t.test "$FP_a"; hb_touch
 }
+title_n() { call_n "$1" | sed -E 's/^.*argv: \[-t\] \[([^]]*)\].*$/\1/'; }   # the TITLE of the Nth notify call (the body is a different argument)
+utc_min() { "$PY3" -c 'import sys; from datetime import datetime, timezone; print(datetime.fromtimestamp(int(sys.argv[1]), timezone.utc).strftime("%Y-%m-%dT%H:%M"))' "$1"; }
+BIG="$("$PY3" -c 'print("1" + "0" * 400)')"      # a 400-digit integer: float() and math.isfinite() raise OverflowError on it (json.loads takes it happily)
+spoil_gs() { # spoil_gs <a/b/c: where in the guard's own state file> <JSON literal>: the record as a hand edit, a bad disk or a stepped-back clock would leave it
+  "$PY3" - "$GSTATE" "$1" "$2" <<'EOF'
+import json, sys
+p, path, lit = sys.argv[1:4]
+d = json.load(open(p))
+o, ks = d, path.split("/")
+for k in ks[:-1]:
+    o = o[k]
+o[ks[-1]] = json.loads(lit)
+open(p, "w").write(json.dumps(d))
+EOF
+}
 
 # ═══ G1. AC1: a divergence is alerted within 5 min, then stops ═════════════════════════════════════
 if want G1; then
@@ -202,6 +220,14 @@ put_item "$KEY_b"; gtick 60; gtick 130; gtick 130; n=$(ncalls)
 gtick 21000; n_a=$(ncalls); gtick 700; n_b=$(ncalls)
 { [ "$n" = 2 ] && [ "$n_a" = 2 ] && [ "$n_b" = 3 ]; } && ok "G1j a NEW episode alerts again; unfixed, it is repeated after 6 h (not before)" || bad "G1j calls after new episode/5h50/6h01: $n/$n_a/$n_b"
 [[ "$(call_n 3)" == *"Lembrete"* ]] && ok "G1k ...and the repeat says it is a reminder" || bad "G1k: $(call_n 3)"
+# notify drops a push whose TITLE went out in the last 30 min (exit 11, which the guard counts as delivered): what tells two divergences apart has to be IN the title
+t1="$(title_n 1)"
+{ [[ "$t1" == *"$FP_a"* ]] && [[ "$t1" == *"$FP_b"* ]]; } && ok "G1l the TITLE (not only the body) carries both fingerprints" || bad "G1l title: $t1"
+new_w; active_world; : > "$SINKS/notify.titledup"; gtick 0; put_item "$KEY_b"; div3; put_item "$KEY_a"; gtick 60; put_item "$KEY_c"; div3
+{ [ "$(ncalls)" = 2 ] && [ "$(wc -l < "$SINKS/notify.delivered" | tr -d ' ')" = 2 ]; } && ok "G1m a DIFFERENT divergence within 30 min of the last one still reaches the phone (its title differs), not dropped as a duplicate" || bad "G1m calls=$(ncalls) delivered=$(wc -l < "$SINKS/notify.delivered" 2>/dev/null | tr -d ' ')"
+# CLAUDE_POOL_GUARD_DEBOUNCE_S=nan parses; min()/max() on a NaN answer 0 s, so a typo in the seam would alert on the first look
+new_w; active_world; gtick 0; put_item "$KEY_b"; gtick 60 CLAUDE_POOL_GUARD_DEBOUNCE_S=nan; gtick 60 CLAUDE_POOL_GUARD_DEBOUNCE_S=nan
+[ "$(ncalls)" = 0 ] && ok "G1n a NaN debounce seam is not a zero debounce (the default 120 s holds: no alert after 1 min of disagreement)" || bad "G1n alerted at once with CLAUDE_POOL_GUARD_DEBOUNCE_S=nan (calls=$(ncalls))"
 fi
 
 # ═══ G2. who is the in-use account? ════════════════════════════════════════════════════════════════
@@ -242,6 +268,16 @@ new_w; active_world; gtick 0; put_item "$KEY_b"; printf 10 > "$SINKS/notify.rc";
 [ "$(ncalls)" = 1 ] && ok "G3b notify says 'held until 07:00' (rc 10) -> counted as sent, not hammered every minute" || bad "G3b calls=$(ncalls)"
 new_w; active_world; gtick 0; put_item "$KEY_b"; gtick 60 CLAUDE_POOL_NOTIFY_CMD="$W/no-such-notify"; gtick 60 CLAUDE_POOL_NOTIFY_CMD="$W/no-such-notify"; gtick 60 CLAUDE_POOL_NOTIFY_CMD="$W/no-such-notify"
 { [ "$GRC" = 0 ] && [ "$(gj "$GSTATE" divergence/alerted_at)" = "<none>" ]; } && ok "G3c no notify command at all -> no crash, the episode stays un-alerted (retried when notify is back)" || bad "G3c rc=$GRC alerted_at=$(gj "$GSTATE" divergence/alerted_at)"
+# what notify answers when NOTHING reached the phone, other than a plain failure: the cap (12 on a FORCED push - the digest legs are not reached by a forced one) and the codes after 12
+retry_case() { # retry_case <label> <how notify refuses: a shell snippet using $SINKS>
+  new_w; active_world; gtick 0; put_item "$KEY_b"; eval "$2"
+  gtick 60; gtick 60; gtick 60; gtick 60; n_fail=$(ncalls)
+  rm -f "$SINKS/notify.rc" "$SINKS/notify.cap"; gtick 60; n_ok=$(ncalls); gtick 60; gtick 60; n_end=$(ncalls)
+  { [ "$n_fail" = 2 ] && [ "$n_ok" = 3 ] && [ "$n_end" = 3 ] && [ "$(gj "$GSTATE" divergence/alerted_at)" != "<none>" ]; } && ok "G3d/$1 nothing reached the phone -> the alert is retried every tick until it is accepted, then never again" || bad "G3d/$1 calls: refused=$n_fail accepted=$n_ok later=$n_end"
+}
+retry_case rate-cap 'touch "$SINKS/notify.cap"'
+retry_case rc13     'printf 13 > "$SINKS/notify.rc"'
+retry_case rc14     'printf 14 > "$SINKS/notify.rc"'
 fi
 
 # ═══ G4. 'could not tell' never acts ══════════════════════════════════════════════════════════════
@@ -262,6 +298,37 @@ new_w; for _i in 1 2 3 4 5 6 7 8; do gtick 1200; done
 [ "$(ncalls)" = 0 ] && [ "$(gj "$GSTATE" divergence)" = "<none>" ] && ok "G4f never activated (no decision, no item): hours of ticks, nothing said" || bad "G4f alerted on an inactive pool (calls=$(ncalls))"
 fi
 
+# ═══ G4g. the guard's OWN record can be wrong too ═════════════════════════════════════════════════
+if want G4g; then
+echo "G4g. a time in the guard's own state that cannot be used (a hand edit, a bad disk, a clock that stepped back) restarts that clock: it neither crashes the check nor silences the alert"
+gs_case() { # gs_case <label> <JSON literal for the open episode's start>
+  new_w; active_world; gtick 0; put_item "$KEY_b"; gtick 60; spoil_gs divergence/since "$2"
+  gtick 60; rc1=$GRC; n_mid=$(ncalls); gtick 130; rc2=$GRC
+  if gl | grep -q "unhandled"; then bad "G4g/$1 a spoiled start of the episode crashed the check ($(gl | grep unhandled | head -1 | cut -c1-110))"
+  elif [ "$rc1" = 0 ] && [ "$rc2" = 0 ] && [ "$n_mid" = 0 ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"conta em uso diverge"* ]]; then ok "G4g/$1 spoiled 'since' -> the episode's clock restarts (no alert on the repairing tick, ONE alert 2 min later; rc $rc1/$rc2)"
+  else bad "G4g/$1 rc=$rc1/$rc2 calls=$n_mid/$(ncalls) since=$(gj "$GSTATE" divergence/since | cut -c1-30)"; fi
+}
+gs_case 400-digits "$BIG"
+gs_case nan        'NaN'
+gs_case string     '"soon"'
+gs_case bool       'true'
+gs_case negative   '-5'
+gs_case future     "$((NOW + 5000000))"      # a real time, just one that has not happened yet: it would hold the alert back until the clock caught up
+# the same for the 30-min 'could not tell' notice, the daemon's watch and the 'already alerted' stamp
+new_w; active_world; gtick 0; put_item "$KEY_b"; : > "$INFRA/kc/locked"; gtick 60; spoil_gs blind/divergence/since "$BIG"
+gtick 60; rc1=$GRC; gtick 1500; n1=$(ncalls); gtick 400; n2=$(ncalls)
+{ ! gl | grep -q "unhandled" && [ "$rc1" = 0 ] && [ "$n1" = 0 ] && [ "$n2" = 1 ] && [[ "$(title_n 1)" == *"guarda sem enxergar (divergence)"* ]]; } && ok "G4h spoiled start of a 'could not tell' episode -> its 30 min restart; ONE 'guard blind' notice after that (calls at 25/32 min: $n1/$n2)" || bad "G4h rc=$rc1 calls=$n1/$n2 $(gl | grep unhandled | head -1 | cut -c1-110)"
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; hb_touch; gtick 60; gtick 60; spoil_gs daemon/checked_at "$BIG"
+gtick 60; rc1=$GRC; gwalk 540; n1=$(ncalls); gwalk 120; n2=$(ncalls)
+{ ! gl | grep -q "unhandled" && [ "$rc1" = 0 ] && [ "$n1" = 0 ] && [ "$n2" = 1 ] && [[ "$(call_n 1)" == *"não está fechando rodadas"* ]]; } && ok "G4i spoiled 'checked_at' -> the guard cannot tell it was looking: the 10 min restart, and a daemon that stays silent is still told (calls at 9/11 min: $n1/$n2)" || bad "G4i rc=$rc1 calls=$n1/$n2 $(gl | grep unhandled | head -1 | cut -c1-110)"
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; hb_touch; gtick 60; gtick 60; spoil_gs daemon/watch_since '"x"'
+gtick 60; rc1=$GRC; gwalk 540; n1=$(ncalls); gwalk 120; n2=$(ncalls)
+{ ! gl | grep -q "unhandled" && [ "$rc1" = 0 ] && [ "$n1" = 0 ] && [ "$n2" = 1 ]; } && ok "G4j spoiled 'watch_since' -> the same (calls at 9/11 min: $n1/$n2)" || bad "G4j rc=$rc1 calls=$n1/$n2"
+new_w; active_world; gtick 0; put_item "$KEY_b"; div3; spoil_gs divergence/alerted_at "$BIG"
+gtick 60; rc1=$GRC; gtick 60; gtick 60
+{ ! gl | grep -q "unhandled" && [ "$rc1" = 0 ] && [ "$(ncalls)" = 2 ] && [ "$(gj "$GSTATE" divergence/alerted_at)" != "<none>" ] && [ "$(gj "$GSTATE" divergence/alerted_at)" != "$BIG" ]; } && ok "G4k spoiled 'alerted_at' reads as 'never alerted': the alert is said once more and the stamp is rewritten (calls=$(ncalls))" || bad "G4k rc=$rc1 calls=$(ncalls) alerted_at=$(gj "$GSTATE" divergence/alerted_at | cut -c1-30)"
+fi
+
 # ═══ G6. is the daemon doing its job? ══════════════════════════════════════════════════════════════
 if want G6; then
 echo "G6. the daemon's heartbeat"
@@ -273,15 +340,18 @@ gtick 0; gwalk 540; n1=$(ncalls); gwalk 120; n2=$(ncalls); gwalk 1200; n3=$(ncal
 { [ "$n1" = 0 ] && [ "$n2" = 1 ] && [ "$n3" = 1 ]; } && ok "G6a activated pool, the daemon never stamps: ONE alert once 10 min have passed (not before, not again)" || bad "G6a calls at 9min/11min/31min: $n1/$n2/$n3"
 { [[ "$(call_n 1)" == *"não está fechando rodadas"* ]] && [[ "$(call_n 1)" == *"nunca"* ]]; } && ok "G6b ...and it says the daemon has never completed a run" || bad "G6b: $(call_n 1)"
 # the REAL daemon's stamp is what the guard reads (one contract, both sides)
-new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; : > "$SINKS/notify.titledup"
 env -i HOME="$INFRA/home" PATH="/usr/bin:/bin" GC_CITY_PATH="$CITY" CLAUDE_POOL_NOW="$NOW" "$PY3" -c '
 import importlib.util, sys
 sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m); m.write_heartbeat()' "$DAEMON"
 [ -s "$CITY/.gc/claude-pool-account.heartbeat" ] && ok "G6c the daemon's write_heartbeat() leaves the file the guard reads" || bad "G6c no heartbeat file from the daemon's own function"
 gtick 300; gtick 290; [ "$(ncalls)" = 0 ] && ok "G6d a stamp 9.9 min old is a live daemon" || bad "G6d alerted on a fresh heartbeat"
 gtick 20; [ "$(ncalls)" = 1 ] && ok "G6e ...and one 10.2 min old is not" || bad "G6e calls=$(ncalls)"
+[[ "$(title_n 1)" == *"(última: $(utc_min "$NOW_BASE")Z)"* ]] && ok "G6e2 the TITLE (not only the body) carries the last stamp" || bad "G6e2 title: $(title_n 1)"
 hb_touch; gtick 1; gwalk 650
 [ "$(ncalls)" = 2 ] && ok "G6f a daemon that comes back and stops again is a NEW episode (alerted again)" || bad "G6f calls=$(ncalls)"
+# notify drops a repeated TITLE within 30 min (exit 11, which counts as delivered): the second episode reached the phone only because its title has a different stamp
+[ "$(wc -l < "$SINKS/notify.delivered" | tr -d ' ')" = 2 ] && ok "G6f2 ...and the second alert really reached the phone (not dropped as a duplicate title: calls=$(ncalls) delivered=2)" || bad "G6f2 delivered=$(wc -l < "$SINKS/notify.delivered" | tr -d ' ') of $(ncalls)"
 new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; for _i in 1 2 3 4 5 6; do gtick 600 GC_POOL_ACCOUNT=0; done
 [ "$(ncalls)" = 0 ] && ok "G6g an operator who switched the mechanism off is not told the daemon stopped" || bad "G6g alerted under the kill switch"
 # a heartbeat that cannot be READ (garbled, no time in it, stamped in the future, not a file) says nothing about the daemon: no 'dead' verdict, and after 30 min the guard says it is blind
@@ -301,6 +371,12 @@ hb_case a-directory  'mkdir "$hbf"'
 hb_case nan          'printf "{\"epoch\": NaN, \"pid\": 1}" > "$hbf"'
 hb_case minus-inf    'printf "{\"epoch\": -Infinity, \"pid\": 1}" > "$hbf"'
 hb_case plus-inf     'printf "{\"epoch\": Infinity, \"pid\": 1}" > "$hbf"'
+# ...nor is a file that is not text at all, an integer too big for a float (float() and math.isfinite() raise OverflowError), or a number that cannot be a time
+hb_case not-utf8     'printf "\377\376\200{\"epoch\": 1}" > "$hbf"'
+hb_case 400-digits   'printf "{\"epoch\": %s, \"pid\": 1}" "$BIG" > "$hbf"'
+hb_case epoch-zero   'printf "{\"epoch\": 0, \"pid\": 1}" > "$hbf"'
+hb_case epoch-one    'printf "{\"epoch\": 1, \"pid\": 1}" > "$hbf"'
+hb_case a-bool       'printf "{\"epoch\": true, \"pid\": 1}" > "$hbf"'
 # ...and when it can be read again the blindness ends by itself, and a real silence is judged on the real time
 new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; printf 'garbage' > "$CITY/.gc/claude-pool-account.heartbeat"; gtick 60
 grep -q "cannot verify daemon-heartbeat" "$CITY/.gc/logs/claude-pool-guard.log" && [ "$(gj "$GSTATE" blind/daemon-heartbeat/why | grep -c 'cannot be read')" = 1 ] && ok "G6j the guard records that it cannot read the heartbeat (state + log)" || bad "G6j nothing recorded: $(gl | tail -3)"

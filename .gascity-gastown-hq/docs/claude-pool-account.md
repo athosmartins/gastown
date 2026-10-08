@@ -78,9 +78,10 @@ divergence alert and the liveness watch - ga-8hcnvb.3.1; the per-version test an
                   (reboot, sleep, launchd unloaded: two looks more than 5 min apart) or while the daemon was stood down on purpose
                   (`no-pool-account`, GC_POOL_ACCOUNT=0 - the real daemon stamps nothing then) is no evidence of a
                   death: after any of those the 10 minutes start again from the first look. A daemon that really stays silent is still
-                  told 10 minutes after that. A heartbeat that cannot be read (garbled, no time in it, stamped in the future, not a
-                  file) or a pool whose activation cannot be told (Keychain locked, no decision) is "could not tell": no verdict, and
-                  the 30-minute "guarda sem enxergar (<what>)" notice instead.
+                  told 10 minutes after that. A heartbeat that cannot be read (not text, not JSON, no time in it or a number that cannot
+                  be a time - NaN, a 400-digit integer, 0 -, stamped in the future, not a file) or a pool whose activation cannot be
+                  told (Keychain locked, no decision) is "could not tell": no verdict, and the 30-minute
+                  "guarda sem enxergar (<what>)" notice instead.
 ```
 
 Every push carries what makes its condition different IN THE TITLE (the two fingerprints of a divergence, what the guard cannot see, the
@@ -88,6 +89,17 @@ last heartbeat): `notify` drops a push whose title already went out in the last 
 counts that as delivered - so two conditions sharing a title would lose the second one.
 
 Three answers, never two: every check is yes / no / could not tell, and "could not tell" never acts.
+
+The guard's OWN state file gets the same treatment. A time in it that cannot be used (not a number, a number too big for a float, outside
+what can be an epoch, or in the future) is not a crash and not a silence: the start of an episode (`divergence`, a `blind` entry) or the
+daemon watch (`checked_at`, `watch_since`) is counted again from this look, and the log says so; an `alerted_at` that cannot be used reads as
+"never alerted", so the alert is said once more and the stamp is rewritten. What counts as a time is the daemon's own `_sane_epoch`, one
+definition for both.
+
+One divergence is ONE episode. If the key in use changes to another wrong one while it lasts, nothing new is sent before the 6 h reminder (which
+names whatever is in use then); a new push for a new condition needs the episode to close first. And an open episode is not restarted by the
+guard's own absence the way the daemon watch is: after a long gap, a disagreement already there on the first look is judged on the first look,
+without the 2 min of persistence. Both are deliberate limits of this slice, not oversights.
 
 State: `/Users/athos/shared/data/claude_pool_guard.json` (`divergence`, `blind`, `daemon`). Log: `<city>/.gc/logs/claude-pool-guard.log`.
 
@@ -220,6 +232,11 @@ such line (nobody wrote anything). The daemon still rewrites in every case: one 
   next candidate is still tried.
 - The daemon depends on `whatsapp_automation/lib/claude_account_pool.py` for the order and the vault read
   (`CLAUDE_POOL_ACCOUNTS_LIB` overrides the path). If it is missing or fails to import the daemon does nothing.
+- The guard names the account in use by hashing the keys of the accounts `lib.ordem_das_contas()` lists - the usage store's accounts,
+  not the vault's. A vault account the usage store does not know yet is therefore reported as "não é nenhuma das chaves do cofre" (a
+  stranger) when it is in fact ours. The message is the only thing that is wrong (the guard changes nothing either way); the push
+  carries the fingerprint, so the operator can check it. The same `None` below makes ONE keyless account turn every unknown key into
+  "o cofre não respondeu".
 - That library's `token_da_conta()` returns `None` both for "no key in the vault" and for "vault unreadable just
   now" (it logs the second). The daemon therefore never reads a `None` for the CURRENT account as "its key is gone":
   it reads the Keychain item it wrote, and if the item holds a credential whose sha256[:8] equals the `fingerprint` of
