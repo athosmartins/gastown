@@ -463,6 +463,22 @@ EOF
   new_d; run_d GC_POOL_ACCOUNT=0 -- run-once
   [ ! -e "$D/kc/items/$SVC" ] && [ ! -s "$D/probes.log" ] && ok "B12b GC_POOL_ACCOUNT=0 -> the run does nothing" || bad "B12b env kill switch ignored"
 
+  # B12f..i ga-8hcnvb.3.1: the heartbeat a clean run leaves for claude-pool-guard.py
+  HB="$D/city/.gc/claude-pool-account.heartbeat"
+  new_d; run_d -- run-once; [ -s "$HB" ] && "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["epoch"]==float(sys.argv[2]) and d["pid"]>0' "$HB" "$NOW_BASE" 2>/dev/null \
+    && ok "B12f a clean run stamps the heartbeat with the run's clock" || bad "B12f heartbeat: $(cat "$HB" 2>/dev/null)"
+  # a run that did NOT finish its job must not look alive: lib missing / operator off / a Keychain write that is refused
+  hb_none() { [ ! -e "$HB" ] && ! ls "$D/city/.gc"/claude-pool-account.heartbeat.tmp.* >/dev/null 2>&1; }
+  new_d; run_d CLAUDE_POOL_ACCOUNTS_LIB="$D/no-such-lib.py" -- run-once;       hb_none && h1=ok || h1=BAD
+  new_d; run_d GC_POOL_ACCOUNT=0 -- run-once;                                   hb_none && h2=ok || h2=BAD
+  new_d; touch "$D/kc/refuse-writes"; run_d -- run-once;                        hb_none && h4=ok || h4=BAD
+  new_d; touch "$D/kc/write-lands-other"; run_d -- run-once;                    hb_none && h5=ok || h5=BAD
+  [ "$h1$h2$h4$h5" = "okokokok" ] && ok "B12g no heartbeat from a run that did not do its job (lib missing, operator off, Keychain write refused, write that landed another credential)" || bad "B12g heartbeat written anyway: lib=$h1 off=$h2 refused=$h4 other=$h5"
+  grep -q "ERROR" "$D/city/.gc/logs/claude-pool-account.log" && ok "B12h ...the refused-write run says why in its log (the reason a heartbeat is missing is findable)" || bad "B12h no ERROR line in the log of the run that wrote no heartbeat"
+  # nothing to decide is not a fault: a run over an EMPTY vault finishes clean, so the guard does not call the daemon dead for it
+  new_d; rm -f "$D/vault"/*; run_d -- run-once
+  [ -s "$HB" ] && [ ! -e "$D/kc/items/$SVC" ] && ok "B12i empty vault -> nothing created, and the run still stamps the heartbeat (alive, nothing to decide)" || bad "B12i empty vault: heartbeat=$([ -s "$HB" ] && echo yes || echo no) item=$([ -e "$D/kc/items/$SVC" ] && echo yes || echo no)"
+
   # B13 single instance
   # The holder signals AFTER it owns the lock and keeps it until killed: a fixed sleep(8)+sleep(1) made B13 depend on
   # how fast python starts, and under load (~70) the lock was not held yet, or already gone, when the run began.
@@ -1189,6 +1205,22 @@ else
   [ -n "$dhash" ] && [ -n "$dpath" ] && [ "$(printf '%s' "$dpath" | shasum -a 256 | cut -c1-8)" = "$dhash" ] \
     && ok "C9 the doc's item name ($dhash) is the hash of the absolute path it names" \
     || bad "C9 the doc's item name '$dhash' is not sha256 of the path it names ('$dpath')"
+fi
+
+# C10-C17 the guard's plist (ga-8hcnvb.3.1): same rules, its own job
+GPLIST="${CLAUDE_POOL_GUARD_PLIST:-$SELF_DIR/../claude-pool-guard.plist}"
+if [ ! -f "$GPLIST" ]; then bad "C10 guard plist not found at $GPLIST"
+else
+  plutil -lint "$GPLIST" >/dev/null 2>&1 && ok "C10 guard plist is valid" || bad "C10 plutil -lint failed on the guard plist"
+  gpl() { /usr/libexec/PlistBuddy -c "Print :$1" "$GPLIST" 2>/dev/null; }
+  [ "$(gpl Label)" = "com.gascity.claude-pool-guard" ] && [ "$(gpl Label)" != "$(pl Label)" ] && ok "C11 the guard's label is its own (it cannot replace the daemon's job)" || bad "C11 guard label '$(gpl Label)'"
+  [ "$(gpl ProgramArguments:0)" = "/usr/bin/python3" ] && [ "$(gpl ProgramArguments:2)" = "run-once" ] && ok "C12 guard runs /usr/bin/python3 ... run-once" || bad "C12 guard args '$(gpl ProgramArguments:0) $(gpl ProgramArguments:2)'"
+  gscript="$(gpl ProgramArguments:1)"
+  case "$gscript" in */packs/town-deltas/assets/scripts/claude-pool-guard.py) [ -f "$SELF_DIR/claude-pool-guard.py" ] && ok "C13 guard plist points at the guard's repo path (and the script is in this tree)" || bad "C13 the guard script is not next to this selftest" ;; *) bad "C13 guard script path '$gscript'" ;; esac
+  giv="$(gpl StartInterval)"; [ -n "$giv" ] && [ "$giv" -ge 30 ] && [ "$giv" -le 120 ] && ok "C14 guard StartInterval=${giv}s (a 2-min debounce + this tick is inside the 5-min alert budget)" || bad "C14 guard StartInterval='$giv'"
+  [ "$(gpl RunAtLoad)" = "false" ] && ok "C15 guard RunAtLoad=false (loading it is the human step)" || bad "C15 guard RunAtLoad '$(gpl RunAtLoad)'"
+  { [ -n "$(gpl EnvironmentVariables:USER)" ] && [ -n "$(gpl EnvironmentVariables:GC_CITY_PATH)" ]; } && ok "C16 guard has USER and GC_CITY_PATH for launchd" || bad "C16 guard launchd env incomplete"
+  case "$(gpl EnvironmentVariables:PATH)" in */.local/bin*) ok "C17 guard PATH reaches ~/.local/bin (secret and notify live there)" ;; *) bad "C17 guard PATH lacks ~/.local/bin: '$(gpl EnvironmentVariables:PATH)'" ;; esac
 fi
 
 # ── D. hermetic environment (ga-xknkke) ────────────────────────────────────────────────────────────

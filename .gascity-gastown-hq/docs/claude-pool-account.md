@@ -1,4 +1,4 @@
-# Pool Claude account as data (ga-8hcnvb.1)
+# Pool Claude account as data (ga-8hcnvb.1) and its guard (ga-8hcnvb.3)
 
 The headless pool (dog, wa-worker, ps-worker, gate-reviewer, boot, deacon, auto-refiner — ~90% of the spend)
 changes Claude account by itself when the one in use hits its limit, and goes back to the account it left once that
@@ -27,6 +27,10 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
                              (first 8 hex of sha256("/Users/athos/.gastown/claude-pool-cred") — the ABSOLUTE path, as
                               exported in CLAUDE_SECURESTORAGE_CONFIG_DIR; claude never sees a "~")
    publishes the decision    /Users/athos/shared/data/claude_pool_current_account.json  {"current": "<email>", ...}
+   stamps a heartbeat        <city>/.gc/claude-pool-account.heartbeat — ONLY at the end of a run that logged no ERROR
+                             (a clean run that had nothing to decide counts; a refused Keychain write, a read-back that
+                              does not match or an unpublished decision does not). The guard reads it: see "The guard".
+                             A run the operator's switches stood down stamps NO heartbeat (the guard knows: see LIVENESS).
 
  claude-lowprio.sh  (last hop of providers.claude-headless)
    item exists -> exports CLAUDE_SECURESTORAGE_CONFIG_DIR=~/.gastown/claude-pool-cred and USER, then exec claude
@@ -51,6 +55,42 @@ Mayor 04/10 (comment on the bead) overrides the original wording: **no utilizati
 the limit is actually hit) and **no confirmation probe on failback** (go back at the stored reset time; if it has not
 really renewed, its 429 sends the pool to the next account again).
 
+## The guard — divergence alert and the daemon's liveness (ga-8hcnvb.3)
+
+`claude-pool-guard.py` (launchd, every 60 s, single instance, its own plist) is what makes the silent failures of the switch loud.
+It writes **none** of the pool's credentials and corrects nothing; it looks, records and alerts. (Delivered in slices: this one is the
+divergence alert and the liveness watch - ga-8hcnvb.3.1; the per-version test and the proof that no key leaks are the next two.)
+
+```
+ claude-pool-guard.py run-once
+   1 DIVERGENCE   the account whose key is in the pool item   vs   the decision file's current + fingerprint
+                  different for 2 min (the daemon writes the item and THEN the file: a shorter disagreement is normal)
+                    -> ONE push, priority 4, forced:  "Pool Claude: conta em uso diverge da regra (regra xxxxxxxx, em uso yyyyyyyy)"
+                       expected: <email> (fp xxxxxxxx)   in use: <email> (fp yyyyyyyy)   — names and 8-hex fingerprints, never a key
+                    -> repeated only every 6 h while nobody fixes it ("Lembrete: ..."); nothing when it is fixed (the episode
+                       closes in the state file and the log says "divergence over")
+                  the in-use account is named from the item's fingerprint: the vault is asked (keys in the memory of a child
+                  process only); if the vault does not answer, from what the guard saw match earlier; if neither, the message says
+                  exactly that ("o cofre não respondeu" / "não é nenhuma das chaves" / "item ausente" / "sem decisão") — no guess
+   2 LIVENESS     no clean daemon run (heartbeat) for 10 min -> one push "Pool Claude: o daemon de troca não está fechando rodadas
+                  (última: <stamp>)" (not while the mechanism is off; not for a pool that was never activated).
+                  The silence is judged only over time the guard was LOOKING: a stamp that went stale while the guard was not there
+                  (reboot, sleep, launchd unloaded: two looks more than 5 min apart) or while the daemon was stood down on purpose
+                  (`no-pool-account`, GC_POOL_ACCOUNT=0 - the real daemon stamps nothing then) is no evidence of a
+                  death: after any of those the 10 minutes start again from the first look. A daemon that really stays silent is still
+                  told 10 minutes after that. A heartbeat that cannot be read (garbled, no time in it, stamped in the future, not a
+                  file) or a pool whose activation cannot be told (Keychain locked, no decision) is "could not tell": no verdict, and
+                  the 30-minute "guarda sem enxergar (<what>)" notice instead.
+```
+
+Every push carries what makes its condition different IN THE TITLE (the two fingerprints of a divergence, what the guard cannot see, the
+last heartbeat): `notify` drops a push whose title already went out in the last 30 minutes, whatever the body says (exit 11), and the guard
+counts that as delivered - so two conditions sharing a title would lose the second one.
+
+Three answers, never two: every check is yes / no / could not tell, and "could not tell" never acts.
+
+State: `/Users/athos/shared/data/claude_pool_guard.json` (`divergence`, `blind`, `daemon`). Log: `<city>/.gc/logs/claude-pool-guard.log`.
+
 ## Activation — merged is not live
 
 The script path in the plist only exists after the merge. After the gate merges, **someone loads the plist**:
@@ -67,13 +107,25 @@ their ambient login (the variable is fixed at birth); every pool session born af
 Check it is live (not just merged): `launchctl list | grep claude-pool-account` and
 `jq . /Users/athos/shared/data/claude_pool_current_account.json` (current / since / reason / exhausted).
 
+**The guard is a second plist, a second human step, and nothing in this merge loads either.** Load the daemon's first (the guard
+watches that daemon: with no daemon and no item the guard stays silent, by design — a pool that was never activated is not "dead"):
+
+```bash
+cp /Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/claude-pool-guard.plist ~/Library/LaunchAgents/com.gascity.claude-pool-guard.plist
+launchctl load ~/Library/LaunchAgents/com.gascity.claude-pool-guard.plist     # first run <= 60 s later
+tail -f /Users/athos/gt/.gascity-gastown-hq/.gc/logs/claude-pool-guard.log
+```
+
+Until it is loaded there is no divergence alert and no liveness alert: the daemon works the same, unwatched.
+
 ## Kill switches (no config reload)
 
 | Want | Do |
 |---|---|
 | Stop the daemon acting AND new pool launches pointing at the item | `touch $GC_CITY_PATH/.gc/no-pool-account` (remove the file to resume) |
 | One launch only | `GC_POOL_ACCOUNT=0` in that launch's environment |
-| Remove the mechanism completely | `launchctl unload ~/Library/LaunchAgents/com.gascity.claude-pool-account.plist`, then `security delete-generic-password -a "$USER" -s "Claude Code-credentials-50adeaf1"` — new sessions fall back to the ambient login by themselves |
+| Stop the guard too | the same two (`no-pool-account` / `GC_POOL_ACCOUNT=0`): the guard then does nothing — no alert, no state written |
+| Remove the mechanism completely | `launchctl unload` both `~/Library/LaunchAgents/com.gascity.claude-pool-guard.plist` and `~/Library/LaunchAgents/com.gascity.claude-pool-account.plist`, then `security delete-generic-password -a "$USER" -s "Claude Code-credentials-50adeaf1"` — new sessions fall back to the ambient login by themselves |
 
 Live sessions that already follow the item keep the **last written** account when the daemon stops; that is a valid
 login, not a broken state. What a LIVE session does when its item is deleted underneath it was not measured (a
@@ -89,6 +141,12 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/claude-pool-account.plist` | launchd job, not loaded by the merge |
 | `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API, real accounts lib); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from; it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`) |
 | `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session |
+| `packs/town-deltas/assets/scripts/claude-pool-guard.py` | the guard (`run-once`) |
+| `packs/town-deltas/assets/claude-pool-guard.plist` | the guard's launchd job, not loaded by the merge |
+| `packs/town-deltas/assets/scripts/claude-pool-guard.selftest.sh` | hermetic tests of the guard (G1-G4 divergence, G6 liveness, G10 stand-down vs. death) |
+| `/Users/athos/shared/data/claude_pool_guard.json` | the guard's state: open episodes |
+| `.gc/claude-pool-account.heartbeat` | the daemon's last clean run |
+| `.gc/logs/claude-pool-guard.log` | guard events (`divergence seen/over`, `alert sent`) |
 | `whatsapp_automation/lib/claude_account_pool.py` | services read `claude_pool_current_account.json` first |
 | `.gc/logs/claude-pool-account.log` | daemon + wrapper events (`POOL-ACCT SET/SKIP/KEEP`, `SWITCH a -> b`) |
 
@@ -116,8 +174,8 @@ such line (nobody wrote anything). The daemon still rewrites in every case: one 
 ## Known limits
 
 - `CLAUDE_SECURESTORAGE_CONFIG_DIR` is an undocumented claude variable: a claude release can rename the item. The
-  live harness is the check to re-run after upgrading claude (a mismatch shows as P2a failing); the per-version
-  self-test and the divergence alert are ga-8hcnvb.3.
+  live harness is the check to re-run after upgrading claude (a mismatch shows as P2a failing); a per-version
+  self-test is the next slice of the guard (ga-8hcnvb.3.2), the divergence alert is already in (ga-8hcnvb.3.1).
 - Only turn boundaries were measured; a switch in the middle of a long tool call is not guaranteed.
 - A limit modal already open in a live TUI does not notice the restored credential by itself (needs Esc);
   unsticking such sessions is ga-8hcnvb.2.
@@ -151,7 +209,7 @@ such line (nobody wrote anything). The daemon still rewrites in every case: one 
   An account whose collection keeps failing is therefore never gone back to (and its entry sits in the registry, one
   log line per run) until the collector reads it again; it is still probed the normal way if a failover reaches it. A
   collector that stopped altogether leaves every expired entry waiting, and nothing here alerts on it: the only trace is
-  that log line (the divergence alert of ga-8hcnvb.3 is about the account in use, not about the collector). The library's `_faixa` ignores the session
+  that log line (the guard's divergence alert is about the account in use, not about the collector). The library's `_faixa` ignores the session
   window's own `resets_at` (that is where a stale "esgotada" comes from); it is not changed here, the daemon just does
   not rely on the order for what the order cannot know.
 - **Nothing leaves the registry in silence.** Every removal of an exhausted entry has a `dropped:` line with the reason
@@ -179,13 +237,24 @@ such line (nobody wrote anything). The daemon still rewrites in every case: one 
 - The failback target's key is read only when a failback is due; if the vault does not return it that run, the
   failback is not done and the account stays registered as exhausted, so a later run that has its key completes it.
 
+- **What the guard's "in use" means.** The account in use is the credential in the pool **item** — what every new pool session and every
+  live one (they re-read it every ~30 s) will use. It is not the account a given running session holds this second, and a session born
+  before the item existed (ambient login) is invisible to it. A divergence is the item against the decision file.
+- **Quiet hours.** `notify` holds every push from 22:00 to 07:00 (BRT) and delivers them at 07:00 in one push. The guard counts that as
+  delivered (notify's exit 10) and does not resend. So "alert within 5 minutes" holds outside quiet hours; at night the alert is
+  recorded and reaches the phone at 07:00. An alert that must wake someone at night needs `NOTIFY_NO_QUIET=1` on that call — a
+  decision for Athos, not made here.
+- **Nothing here is live until the plists are loaded** — the daemon's and the guard's (see Activation). A merged guard that is not loaded
+  alerts nobody.
+
 ## Exit codes (`launchctl list` → last exit status)
 
 `0` = ran (or was legitimately idle: kill switch on, another run holds the lock, the usage store gave no order of use).
 **Also `0`, and not idle in any good sense:** the accounts library is missing or does not import. That run logs one `WARN`
 (`accounts library not found …` / `failed to import …`) and exits 0 having decided nothing, so `launchctl list` shows the
-same `0` as for a healthy run. Only the log tells them apart; a liveness signal that does not depend on reading it is
-ga-8hcnvb.3.
+same `0` as for a healthy run. The log tells them apart, and so does the heartbeat: that run does not stamp
+`.gc/claude-pool-account.heartbeat` (only a run that reaches its end without an ERROR does), and once the guard is loaded 10 minutes
+without a stamp is a push ("o daemon de troca não está fechando rodadas").
 `1` = **refused or failed**. Two different things share this code, and the log tells them apart:
 
 - *Refused* before the run started any work: no usable `GC_CITY_PATH/.gc` so the single-instance lock cannot be taken,
