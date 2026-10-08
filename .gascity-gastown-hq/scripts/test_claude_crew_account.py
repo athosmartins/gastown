@@ -7,10 +7,13 @@ The harness PROVES that last sentence instead of trusting it (the Mayor's findin
 production - `CLAUDE_CREW_NOTIFY` falls back to `shutil.which('notify')` and the log follows the caller's `GC_CITY_PATH`):
   * `_pin_env` (autouse, every test) points notify / security / the city / the state at sentinels and tmp paths, so even a test
     that forgets to build a `World` cannot reach the real ones;
-  * `_nothing_real_was_touched` (autouse, once per session) snapshots the real log / state / lock and asserts at the end that
-    they are unchanged and that no sentinel was ever executed;
+  * `_nothing_real_was_touched` (autouse, once per session) records every WRITE this process makes to the real log / state / lock
+    (an audit hook, so it names the test) and asserts at the end that there was none and that no sentinel was ever executed.
+    It does not diff the files: the launchd job rewrites the real state file every 60 s (ga-615cgc). The hook does not see a CHILD
+    process: the one test that spawns the script (the env -i one) proves only that the pinned paths were used, not that nothing else was;
   * `test_the_real_script_run_from_an_empty_environment...` runs the script as launchd would (env -i) under both interpreters.
 """
+import contextlib
 import copy
 import fcntl
 import http.server
@@ -101,22 +104,68 @@ def _sentinel(path: Path, hits: Path) -> None:
 
 
 def _real_files():
+    # The pool's decision file (crew.DEFAULT_DECISION) is the pool daemon's and is not watched. The state file is the script's own,
+    # and the launchd job rewrites it - and logs, and takes the lock - on its own schedule, so these are watched for writes made
+    # BY THIS PROCESS (see _watching), never compared before/after.
     cities = {c for c in (_REAL_ENV.get("GC_CITY_PATH"), str(Path.home() / "gt" / ".gascity-gastown-hq")) if c}
-    out = [Path(crew.DEFAULT_STATE)]          # the pool's decision file is written by the live pool daemon: not ours to watch
+    out = [Path(crew.DEFAULT_STATE)]
     for c in sorted(cities):
         out += [Path(c) / ".gc" / "logs" / "claude-crew-account.log", Path(c) / ".gc" / "claude-crew-account.lock"]
     return out
 
 
-def _snap():
-    r = {}
-    for p in _real_files():
-        try:
-            st = p.stat()
-            r[str(p)] = (st.st_size, st.st_mtime_ns)
-        except OSError:
-            r[str(p)] = None
-    return r
+# ga-615cgc: the guard used to snapshot (size, mtime) of the real files and compare at the end of the session. The live job is a
+# separate process that rewrites the real state file every 60 s, so every run longer than one tick failed at teardown (pytest
+# exit 1 with every test green), and the log changes whenever the job acts: "the file changed" was read as "a test touched it".
+# An audit hook answers the question that was actually asked - did THIS process write it - and cannot be tripped by another process.
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
+_WATCH: dict = {"paths": frozenset(), "hits": None}
+
+
+def _canon(p):
+    try:
+        return os.path.realpath(os.fsdecode(p))
+    except (TypeError, ValueError):
+        return None                                   # an fd, or anything that is not a path: not ours to judge
+
+
+def _is_write(mode, flags):
+    if isinstance(flags, int):
+        return bool(flags & _WRITE_FLAGS)
+    return not isinstance(mode, str) or any(c in mode for c in "wax+")      # told nothing usable: assume the worst, never "a read"
+
+
+def _audit(event, args):
+    hits = _WATCH["hits"]
+    if hits is None:
+        return
+    if event == "open":
+        if not _is_write(args[1], args[2]):
+            return                                    # reading a real file is not touching it
+        paths = (args[0],)
+    elif event == "os.rename":
+        paths = args[:2]
+    elif event in ("os.remove", "os.truncate"):
+        paths = args[:1]
+    else:
+        return
+    for p in paths:
+        if _canon(p) in _WATCH["paths"]:
+            hits.append(f"{event} {os.fsdecode(p)}  [during {os.environ.get('PYTEST_CURRENT_TEST', 'collection or a fixture')}]")
+
+
+sys.addaudithook(_audit)                              # a hook cannot be removed: it does nothing unless _watching is active
+
+
+@contextlib.contextmanager
+def _watching(paths):
+    """Yield the list that collects every write this process makes to `paths` while the block runs."""
+    before, hits = dict(_WATCH), []
+    _WATCH.update(paths=frozenset(c for c in map(_canon, paths) if c), hits=hits)
+    try:
+        yield hits
+    finally:
+        _WATCH.update(before)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -129,10 +178,10 @@ def _nothing_real_was_touched(tmp_path_factory):
     _sentinel(guard / "bin" / "notify", hits)
     _sentinel(guard / "bin" / "security", hits)
     _GUARD.update(dir=guard, hits=hits)
-    before = _snap()
-    yield
+    with _watching(_real_files()) as touched:
+        yield
     assert not hits.exists(), "a test reached the REAL notify/security (sentinel executed):\n" + hits.read_text()
-    assert _snap() == before, "a test touched the REAL claude-crew-account log/state/lock"
+    assert not touched, "a test touched the REAL claude-crew-account log/state/lock:\n" + "\n".join(touched)
 
 
 @pytest.fixture(autouse=True)
@@ -144,6 +193,90 @@ def _pin_env(monkeypatch, tmp_path):
                  "CLAUDE_CREW_ACCOUNTS_DIR": tmp_path / "pinned-accts", "HOME": tmp_path / "pinned-home"}.items():
         monkeypatch.setenv(k, str(v))
     monkeypatch.setenv("PATH", f"{g / 'bin'}:/usr/bin:/bin")        # `which notify` / bare `security` find a sentinel, never the real one
+
+
+LIVE_TICK = ("import os, sys, pathlib\n"              # what publish_state() does, from ANOTHER process: tmp file, then os.replace over the state
+             "p = pathlib.Path(sys.argv[1]); t = p.with_name(p.name + '.tmp.1')\n"
+             "t.write_text('{\"updated\": \"2026-10-08T09:22:08Z\"}\\n'); os.replace(t, p)\n")
+
+
+def test_a_rewrite_by_the_live_job_is_not_a_test_touching_the_real_files(tmp_path):
+    live = tmp_path / "claude_crew_current_account.json"
+    live.write_text('{"updated": "2026-10-08T09:21:08Z"}\n')
+    with _watching([live]) as touched:
+        subprocess.run([sys.executable, "-c", LIVE_TICK, str(live)], check=True)
+        subprocess.run([sys.executable, "-c", LIVE_TICK, str(live)], check=True)
+    assert "09:22:08Z" in live.read_text()                  # the live job really did rewrite it: the empty verdict below is not vacuous
+    assert touched == []
+
+
+def _w_text(p, other):
+    p.write_text("x")
+
+
+def _w_append(p, other):
+    with open(p, "a") as f:
+        f.write("x")
+
+
+def _w_read_write(p, other):
+    with open(p, "r+") as f:
+        f.write("x")
+
+
+def _w_os_open(p, other):
+    os.close(os.open(p, os.O_WRONLY))
+
+
+def _w_replace_over(p, other):
+    os.replace(other, p)
+
+
+def _w_rename_away(p, other):
+    os.rename(p, other)
+
+
+def _w_remove(p, other):
+    os.remove(p)
+
+
+def _w_truncate(p, other):
+    os.truncate(p, 0)
+
+
+def _w_through_a_symlink(p, other):
+    other.symlink_to(p)
+    other.write_text("x")
+
+
+@pytest.mark.parametrize("write", [_w_text, _w_append, _w_read_write, _w_os_open, _w_replace_over, _w_rename_away, _w_remove, _w_truncate,
+                                   _w_through_a_symlink], ids=lambda f: f.__name__[3:])
+def test_a_write_by_a_test_to_a_real_file_is_caught_and_names_the_test(tmp_path, write):
+    live, other = tmp_path / "state.json", tmp_path / "other"
+    live.write_text("{}")
+    if write is _w_replace_over:
+        other.write_text("{}")
+    with _watching([live]) as touched:
+        write(live, other)
+    assert len(touched) == 1 and "test_a_write_by_a_test_to_a_real_file_is_caught_and_names_the_test" in touched[0], touched
+
+
+@pytest.mark.parametrize("mode, flags, is_write", [
+    ("rb", os.O_RDONLY | os.O_CLOEXEC, False), ("wb", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, True), (None, os.O_RDWR, True),
+    (None, os.O_RDONLY, False), ("ab", os.O_WRONLY | os.O_APPEND, True),
+    ("r+", None, True), ("a", None, True), ("x", None, True), ("rb", None, False),          # no flags: the mode decides
+    (None, None, True),                                                                      # nothing to go by: a write, never a read
+])
+def test_what_counts_as_a_write_to_a_real_file(mode, flags, is_write):
+    assert _is_write(mode, flags) is is_write
+
+
+def test_reading_a_real_file_is_not_touching_it(tmp_path):
+    live = tmp_path / "state.json"
+    live.write_text("{}")
+    with _watching([live]) as touched:
+        live.read_text(), live.read_bytes(), live.stat(), open(live, "rb").close()
+    assert touched == []
 
 
 class World:
