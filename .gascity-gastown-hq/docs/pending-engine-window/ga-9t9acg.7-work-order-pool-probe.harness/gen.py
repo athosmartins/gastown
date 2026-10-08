@@ -5,8 +5,9 @@ Baseline  = the real commands printed by the live gc (`gc prime gastown.dog`), s
             engine-window-20260926 (only the label-filter jq differs between 0919 and 0926; the patch does
             not touch it).
 Patched   = the baseline with the SAME textual edits the Go patch makes, where every new fragment is read
-            out of the patched config.go (the raw-string literals of workOrderPickFunctionScript and the
-            body of workOrderHeadStage), never retyped here. The edits are asserted to hit the number of
+            out of the patched config.go (the raw-string literals of workOrderPickFunctionScript (with its
+            whole-line // comments dropped and the workOrderPickTrustsLib const spliced in) and the body of
+            workOrderHeadStage), never retyped here. The edits are asserted to hit the number of
             sites the Go diff has, so a drift between this script and the Go fails loudly.
 """
 import re, shlex, sys
@@ -21,14 +22,32 @@ def go_func_body(src, name):
     return m.group(1)
 
 
-def go_raw_literals(body):
-    """Concatenate, in order, every backtick literal of a Go function made only of raw strings and '+'."""
-    lits = re.findall(r"`([^`]*)`", body)
-    # reject anything that is not a plain literal concatenation (a call, an if, a variable)
-    stripped = re.sub(r"`[^`]*`", "", body)
-    stripped = re.sub(r"return|\+|\s", "", stripped)
-    assert stripped == "", "not a pure raw-literal function: %r" % stripped
-    return "".join(lits)
+def go_const(src, name):
+    m = re.search(r"const " + re.escape(name) + r" = `([^`]*)`", src)
+    assert m, name
+    return m.group(1)
+
+
+def go_raw_literals(body, consts=None):
+    """Concatenate, in order, every backtick literal of a Go function made only of raw strings, '+', whole-line
+    // comments and the named raw-string consts in `consts` (workOrderPickTrustsLib). Anything else (a call, an if,
+    an unknown identifier) fails the assertion, so a drift between this script and the Go is loud."""
+    consts = consts or {}
+    body = "\n".join(ln for ln in body.split("\n") if not ln.lstrip().startswith("//"))
+    parts, pos = [], 0
+    for m in re.finditer(r"`([^`]*)`|([A-Za-z_]\w*)", body):
+        gap = body[pos:m.start()]
+        assert re.fullmatch(r"[\s+]*", gap), "not a pure raw-literal function: %r" % gap
+        pos = m.end()
+        if m.group(1) is not None:
+            parts.append(m.group(1))
+        elif m.group(2) == "return":
+            continue
+        else:
+            assert m.group(2) in consts, "unknown identifier in the function: %r" % m.group(2)
+            parts.append(consts[m.group(2)])
+    assert re.fullmatch(r"[\s+]*", body[pos:]), "not a pure raw-literal function: %r" % body[pos:]
+    return "".join(parts)
 
 
 def load(prompt_path, go_path):
@@ -43,7 +62,9 @@ def load(prompt_path, go_path):
         assert argv[:2] == ["sh", "-c"], (key, argv[:2])
         base[key] = argv  # ['sh','-c',script,('--',target)]
     src = open(go_path).read()
-    wo_def = go_raw_literals(go_func_body(src, "workOrderPickFunctionScript"))
+    trust = go_const(src, "workOrderPickTrustsLib")
+    wo_def = go_raw_literals(go_func_body(src, "workOrderPickFunctionScript"), {"workOrderPickTrustsLib": trust})
+    assert trust in wo_def
     # workOrderHeadStage: stage := `wo_pick`; if fallback != "" { stage += ` '` + fb + `'` }; return stage + `<tail>`
     hs = go_func_body(src, "workOrderHeadStage")
     tail = re.search(r"return stage \+ `([^`]*)`", hs).group(1)

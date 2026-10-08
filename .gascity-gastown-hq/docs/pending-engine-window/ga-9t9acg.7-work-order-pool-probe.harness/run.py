@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """ga-9t9acg.7 no-compile harness: run the generated work-query shell (old baseline vs patched) through a
-fake `bd` on fixtures, with the real work-order.sh, a missing lib and erroring libs.
+fake `bd` on fixtures, with the real work-order.sh, a missing lib and erroring / noisy / wrong-answer libs.
 
 usage: run.py PROMPT_TXT CONFIG_GO CITY_PATH SHELL        (SHELL = sh | /bin/dash | ...)
 """
@@ -9,7 +9,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import gen
 
 PROMPT, GO, CITY, SH = sys.argv[1:5]
-base, WO_DEF, TAIL, LRU, _ = gen.load(PROMPT, GO)
+base, WO_DEF, TAIL, LRU, SRC = gen.load(PROMPT, GO)
+TRUST = gen.go_const(SRC, "workOrderPickTrustsLib")
 SCRIPTS = {k: gen.patch_script(k, v[2], TAIL, LRU) for k, v in base.items()}
 OLD = {k: v[2] for k, v in base.items()}
 
@@ -47,6 +48,12 @@ if MUTATE:
         _mut('printf "%s" "$wo_in" | jq -c "${1:-.}" 2>/dev/null; ', ':; ')
     elif MUTATE == "swallow-warn":  # the city's habit: 2>/dev/null on the lib call
         _mut("work_order_sort --age reclaim' wo \"$wo_lib\")", "work_order_sort --age reclaim' wo \"$wo_lib\" 2>/dev/null)")
+    elif MUTATE == "trust-nonempty":  # the check this fix replaced: any non-empty stdout is "the answer"
+        _mut(TRUST, '[ -n "$wo_out" ]')
+    elif MUTATE == "ignore-exit-status":  # the array check without the exit status
+        _mut('[ "$wo_rc" -eq 0 ] && ', '')
+    elif MUTATE == "ignore-length":  # exit 0 + one array, but not as long as the input (a lib that drops beads)
+        _mut(' and length == $n)', ')')
     else:
         raise SystemExit("unknown mutation " + MUTATE)
 
@@ -188,25 +195,51 @@ check("4 absent lib: same head as the old command, rc 0", ids(r_abs.stdout) == i
 check("4 absent lib: one WARN on stderr", "work-order WARN" in r_abs.stderr and "work-order WARN" in r_abs2.stderr)
 check("4 absent lib via WORK_ORDER_LIB: same head, rc 0", ids(r_abs2.stdout) == ids(r_old.stdout) and r_abs2.returncode == 0)
 
-# 5. lib erroring
+# 5. lib erroring / noisy / answering something the next stage cannot act on -> the previous order, WARN, never empty.
+#    The first five are the "cannot tell" family; the rest are the ones a non-empty-stdout check let through (gate
+#    fix 2/3): a banner at source time, non-JSON before exit 2, a valid-JSON banner, two documents, an empty or a
+#    shorter array for a non-empty input, a right-looking array with exit 1.
 tmp = tempfile.mkdtemp(prefix="wo-libs-")
+REV = "work_order_sort() { jq -c 'reverse'; }\n"  # the head differs from the fallback's: a trusted answer is visible
 libs = {
     "cannot-tell": 'work_order_sort() { cat >/dev/null; echo "work-order ERROR: stub: cannot tell" >&2; return 2; }\n',
     "syntax-error": "work_order_sort() { if then fi\n",
     "exit-at-source": "exit 3\n",
     "empty-lib": "",
     "no-function": "x=1\n",
+    "banner-at-source": 'echo "== work-order.sh v2 (local edit) =="\n' + REV,
+    "nonjson-exit2": 'work_order_sort() { cat >/dev/null; echo "cannot sort: no such field"; return 2; }\n',
+    "json-banner-then-array": "work_order_sort() { echo 42; jq -c 'reverse'; }\n",
+    "two-arrays": "work_order_sort() { jq -c 'reverse'; jq -c 'reverse' <<<'[]'; }\n",
+    "empty-array": "work_order_sort() { cat >/dev/null; echo '[]'; }\n",
+    "shorter-array": "work_order_sort() { jq -c 'reverse | .[0:1]'; }\n",
+    "right-array-exit1": "work_order_sort() { jq -c 'reverse'; return 1; }\n",
 }
 for name, body in libs.items():
     open(os.path.join(tmp, name + ".sh"), "w").write(body)
 open(os.path.join(tmp, "unreadable.sh"), "w").write("true\n"); os.chmod(os.path.join(tmp, "unreadable.sh"), 0)
-print("-- 5. lib erroring / broken / unreadable -> old order, WARN, never empty")
+open(os.path.join(tmp, "good-reverse.sh"), "w").write(REV)
+open(os.path.join(tmp, "bash-env-banner.sh"), "w").write('echo "banner from BASH_ENV"\n')
+print("-- 5. lib erroring / noisy / answering with something that is not one array as long as the input -> old order, WARN, never empty")
 r_old, _ = run("routed", "old", FIX1, {}, "none")
+r_good, _ = run("routed", "new", FIX1, {}, os.path.join(tmp, "good-reverse.sh"))
+show("good-ctl", r_good)
+check("5 control: a well-behaved stand-in lib IS trusted (its head is not the fallback's)", ids(r_good.stdout) != ids(r_old.stdout) and "work-order WARN" not in r_good.stderr and r_good.returncode == 0)
 for name in list(libs) + ["unreadable"]:
     r, _ = run("routed", "new", FIX1, {}, os.path.join(tmp, name + ".sh"))
     show(name[:12], r)
     check("5 %s: old head, rc 0, WARN, not empty" % name, ids(r.stdout) == ids(r_old.stdout) and r.returncode == 0 and "work-order WARN" in r.stderr and r.stdout.strip() != "")
 os.chmod(os.path.join(tmp, "unreadable.sh"), 0o644)
+# a BASH_ENV that echoes a banner pollutes the child bash's stdout whatever the lib is, even the real one
+r, _ = run("routed", "new", FIX1, {"BASH_ENV": os.path.join(tmp, "bash-env-banner.sh")}, "real")
+show("BASH_ENV", r)
+check("5 BASH_ENV banner + the REAL lib: old head, rc 0, WARN, not empty", ids(r.stdout) == ids(r_old.stdout) and r.returncode == 0 and "work-order WARN: wo_pick" in r.stderr and r.stdout.strip() != "")
+r, _ = run("routed", "new", FIX1, {}, "real")
+check("5 control: the same call without BASH_ENV is ordered by the lib (P0 feature first)", ids(r.stdout) == ["feature-p0-newer"] and "work-order WARN" not in r.stderr)
+# the same through the assigned tiers (those have no LRU fallback: the previous order is bd's own)
+r, _ = run("ready", "new", {"ready_assigned": [bead("rdy-p2-bug", 2, "bug", "2026-10-01T10:00:00Z"), bead("rdy-p0-feature", 0, "feature", "2026-10-03T10:00:00Z")]}, {"GC_SESSION_ID": "worker-bead"}, os.path.join(tmp, "banner-at-source.sh"))
+show("assigned", r)
+check("5 banner-at-source on the assigned-ready tier: bd's order (rdy-p2-bug), not empty", ids(r.stdout) == ["rdy-p2-bug"] and "work-order WARN" in r.stderr)
 
 # 6. empty population: the idle poll never touches the lib
 marker = os.path.join(tmp, "lib-was-called")

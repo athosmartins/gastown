@@ -1,4 +1,4 @@
-=== OLD: 28/114 checks pass
+=== OLD: 28/204 checks pass
 FAIL order/pool tier 1 (work query)/P0 feature newer than P0 bug  head=['p0-bug-older']
 FAIL order/pool tier 1 (work query)/25 beads, P0 feature last by age  head=['p2-bug-00']
 FAIL order/pool tier 1 (work query)/touched but never reclaimed keeps its place  head=['p1-bug-newer']
@@ -81,8 +81,98 @@ FAIL erroring[exit on source]/work query -> assigned in-progress  head=['p0-bug-
 FAIL erroring[exit on source]/work query -> assigned ready  head=['p0-bug-older'] warn=False
 FAIL erroring[exit on source]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
 FAIL erroring[exit on source]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[banner printed while sourced]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[banner printed while sourced]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[banner printed while sourced]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[banner printed while sourced]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[banner printed while sourced]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[banner printed while sourced]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[banner printed while sourced]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[banner printed while sourced]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[banner printed while sourced]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[banner printed while sourced]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[banner that is valid JSON]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[banner that is valid JSON]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[banner that is valid JSON]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[banner that is valid JSON]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[banner that is valid JSON]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[banner that is valid JSON]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[banner that is valid JSON]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[banner that is valid JSON]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[banner that is valid JSON]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[banner that is valid JSON]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[BASH_ENV file prints a banner]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[BASH_ENV file prints a banner]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[BASH_ENV file prints a banner]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[BASH_ENV file prints a banner]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[BASH_ENV file prints a banner]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[BASH_ENV file prints a banner]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[BASH_ENV file prints a banner]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[BASH_ENV file prints a banner]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[BASH_ENV file prints a banner]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[BASH_ENV file prints a banner]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 2]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 2]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 2]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 2]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 2]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 2]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 2]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 2]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 2]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 2]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 0]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 0]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 0]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 0]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 0]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 0]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 0]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 0]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 0]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[non-JSON on stdout, exit 0]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[right array, exit 1]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[right array, exit 1]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[right array, exit 1]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[right array, exit 1]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[right array, exit 1]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[right array, exit 1]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[right array, exit 1]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[right array, exit 1]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[right array, exit 1]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[right array, exit 1]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[two arrays on stdout]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[two arrays on stdout]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[two arrays on stdout]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[two arrays on stdout]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[two arrays on stdout]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[two arrays on stdout]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[two arrays on stdout]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[two arrays on stdout]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[two arrays on stdout]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[two arrays on stdout]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[empty array for a non-empty input]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[empty array for a non-empty input]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[empty array for a non-empty input]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[empty array for a non-empty input]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[empty array for a non-empty input]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[empty array for a non-empty input]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[empty array for a non-empty input]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[empty array for a non-empty input]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[empty array for a non-empty input]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[empty array for a non-empty input]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[array of another length]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[array of another length]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[array of another length]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[array of another length]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[array of another length]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[array of another length]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[array of another length]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[array of another length]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[array of another length]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[array of another length]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
 FAIL lookup/GC_CITY_PATH  head=['p0-bug-older'] err=
 FAIL lookup/GC_CITY  head=['p0-bug-older'] err=
 FAIL lookup/WORK_ORDER_LIB wins, no cascade  head=['p0-bug-older'] err=
 FAIL lookup/nothing set  head=['p0-bug-older'] err=
-=== NEW: 128/128 checks pass
+=== NEW: 230/230 checks pass

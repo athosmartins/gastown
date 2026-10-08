@@ -1,0 +1,97 @@
+# run.py under sh with ONE mutation of the patched command at a time (MUTATE=<name>): each must make >=1 check FAIL.
+# The unmutated run is out-sh.txt (44 checks, ALL PASS). Mutants 7-9 are the gate-fix-2 ones (the lib's answer trusted on weaker evidence).
+
+== MUTATE=age-created: 1 of 44 checks FAIL
+FAIL 3 reclaimed x2 yields the head to the untouched one (anti-starvation kept)
+
+== MUTATE=window-20: 4 of 44 checks FAIL
+FAIL 1 new fetched with --limit 0 and no --limit=N  calls: eviewing --json --sort oldest --limit=20
+FAIL 2 new reaches the 25th and puts it first
+FAIL 9a new asked bd for the whole population  -status in_progress --assignee=worker-bead --json --limit=20
+FAIL 9c new reaches the 25th
+
+== MUTATE=no-sort: 24 of 44 checks FAIL
+FAIL 1 new head is the P0 feature
+FAIL 2 new reaches the 25th and puts it first
+FAIL 3 reclaimed x2 yields the head to the untouched one (anti-starvation kept)
+FAIL 5 control: a well-behaved stand-in lib IS trusted (its head is not the fallback's)
+FAIL 5 cannot-tell: old head, rc 0, WARN, not empty
+FAIL 5 empty-lib: old head, rc 0, WARN, not empty
+FAIL 5 no-function: old head, rc 0, WARN, not empty
+FAIL 5 nonjson-exit2: old head, rc 0, WARN, not empty
+FAIL 5 json-banner-then-array: old head, rc 0, WARN, not empty
+FAIL 5 two-arrays: old head, rc 0, WARN, not empty
+FAIL 5 empty-array: old head, rc 0, WARN, not empty
+FAIL 5 shorter-array: old head, rc 0, WARN, not empty
+FAIL 5 right-array-exit1: old head, rc 0, WARN, not empty
+FAIL 5 control: the same call without BASH_ENV is ordered by the lib (P0 feature first)
+FAIL 8a old head = P1 bug, new head = P0 feature
+FAIL 8b old head = P2 bug, new head = P0 feature
+FAIL 8c new reaches the 25th
+FAIL 9a old head = bd order (P1), new head = P0 bug
+FAIL 9b old head = P2, new head = P0 feature
+FAIL 9c new reaches the 25th
+FAIL 10a assigned-ready beats routed, ordered by the rule
+FAIL 10b nothing assigned: routed head is the P0 feature (lib found through GC_CITY)
+FAIL 12 head is the P0 feature, not the unreadable bead
+FAIL 12 the lib's own WARN line reached stderr (not swallowed)
+
+== MUTATE=dot-in-sh: 18 of 44 checks FAIL
+FAIL 4 absent lib: same head as the old command, rc 0
+FAIL 4 absent lib: one WARN on stderr
+FAIL 4 absent lib via WORK_ORDER_LIB: same head, rc 0
+FAIL 5 cannot-tell: old head, rc 0, WARN, not empty
+FAIL 5 syntax-error: old head, rc 0, WARN, not empty
+FAIL 5 exit-at-source: old head, rc 0, WARN, not empty
+FAIL 5 empty-lib: old head, rc 0, WARN, not empty
+FAIL 5 no-function: old head, rc 0, WARN, not empty
+FAIL 5 banner-at-source: old head, rc 0, WARN, not empty
+FAIL 5 nonjson-exit2: old head, rc 0, WARN, not empty
+FAIL 5 json-banner-then-array: old head, rc 0, WARN, not empty
+FAIL 5 two-arrays: old head, rc 0, WARN, not empty
+FAIL 5 empty-array: old head, rc 0, WARN, not empty
+FAIL 5 shorter-array: old head, rc 0, WARN, not empty
+FAIL 5 right-array-exit1: old head, rc 0, WARN, not empty
+FAIL 5 unreadable: old head, rc 0, WARN, not empty
+FAIL 5 BASH_ENV banner + the REAL lib: old head, rc 0, WARN, not empty
+FAIL 5 banner-at-source on the assigned-ready tier: bd's order (rdy-p2-bug), not empty
+
+== MUTATE=no-fallback: 17 of 44 checks FAIL
+FAIL 4 absent lib: same head as the old command, rc 0
+FAIL 4 absent lib via WORK_ORDER_LIB: same head, rc 0
+FAIL 5 cannot-tell: old head, rc 0, WARN, not empty
+FAIL 5 syntax-error: old head, rc 0, WARN, not empty
+FAIL 5 exit-at-source: old head, rc 0, WARN, not empty
+FAIL 5 empty-lib: old head, rc 0, WARN, not empty
+FAIL 5 no-function: old head, rc 0, WARN, not empty
+FAIL 5 banner-at-source: old head, rc 0, WARN, not empty
+FAIL 5 nonjson-exit2: old head, rc 0, WARN, not empty
+FAIL 5 json-banner-then-array: old head, rc 0, WARN, not empty
+FAIL 5 two-arrays: old head, rc 0, WARN, not empty
+FAIL 5 empty-array: old head, rc 0, WARN, not empty
+FAIL 5 shorter-array: old head, rc 0, WARN, not empty
+FAIL 5 right-array-exit1: old head, rc 0, WARN, not empty
+FAIL 5 unreadable: old head, rc 0, WARN, not empty
+FAIL 5 BASH_ENV banner + the REAL lib: old head, rc 0, WARN, not empty
+FAIL 5 banner-at-source on the assigned-ready tier: bd's order (rdy-p2-bug), not empty
+
+== MUTATE=swallow-warn: 1 of 44 checks FAIL
+FAIL 12 the lib's own WARN line reached stderr (not swallowed)
+
+== MUTATE=trust-nonempty: 9 of 44 checks FAIL
+FAIL 5 banner-at-source: old head, rc 0, WARN, not empty
+FAIL 5 nonjson-exit2: old head, rc 0, WARN, not empty
+FAIL 5 json-banner-then-array: old head, rc 0, WARN, not empty
+FAIL 5 two-arrays: old head, rc 0, WARN, not empty
+FAIL 5 empty-array: old head, rc 0, WARN, not empty
+FAIL 5 shorter-array: old head, rc 0, WARN, not empty
+FAIL 5 right-array-exit1: old head, rc 0, WARN, not empty
+FAIL 5 BASH_ENV banner + the REAL lib: old head, rc 0, WARN, not empty
+FAIL 5 banner-at-source on the assigned-ready tier: bd's order (rdy-p2-bug), not empty
+
+== MUTATE=ignore-exit-status: 1 of 44 checks FAIL
+FAIL 5 right-array-exit1: old head, rc 0, WARN, not empty
+
+== MUTATE=ignore-length: 2 of 44 checks FAIL
+FAIL 5 empty-array: old head, rc 0, WARN, not empty
+FAIL 5 shorter-array: old head, rc 0, WARN, not empty

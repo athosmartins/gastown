@@ -1,4 +1,4 @@
-== shell under test: sh ; lib: /Users/athos/gt/.gascity-gastown-hq/.gc-worktrees/feat-ga-9t9acg-7-work-order-pool-probe/.gascity-gastown-hq/packs/town-deltas/assets/scripts/work-order.sh
+== shell under test: sh ; lib: /Users/athos/gt/.gc-worktrees/ga-9t9acg7-dog3/.gascity-gastown-hq/packs/town-deltas/assets/scripts/work-order.sh
 -- 1. routed tier: P0 feature (newer) vs P0 bug (older)
      old  rc=0 head=['bug-p0-older'] stderr=-
      new  rc=0 head=['feature-p0-newer'] stderr=-
@@ -22,10 +22,12 @@ PASS 3 control: same bead WITHOUT the reclaim label keeps its place by created_a
 PASS 4 absent lib: same head as the old command, rc 0
 PASS 4 absent lib: one WARN on stderr
 PASS 4 absent lib via WORK_ORDER_LIB: same head, rc 0
--- 5. lib erroring / broken / unreadable -> old order, WARN, never empty
+-- 5. lib erroring / noisy / answering with something that is not one array as long as the input -> old order, WARN, never empty
+     good-ctl rc=0 head=['feature-p0-newer'] stderr=-
+PASS 5 control: a well-behaved stand-in lib IS trusted (its head is not the fallback's)
      cannot-tell rc=0 head=['bug-p0-older'] stderr=work-order ERROR: stub: cannot tell (+1)
 PASS 5 cannot-tell: old head, rc 0, WARN, not empty
-     syntax-error rc=0 head=['bug-p0-older'] stderr=/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-libs-xnvb0vrz/syntax-error.sh: line 1: syntax error near u (+2)
+     syntax-error rc=0 head=['bug-p0-older'] stderr=/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-libs-oeouo4mj/syntax-error.sh: line 1: syntax error near u (+2)
 PASS 5 syntax-error: old head, rc 0, WARN, not empty
      exit-at-sour rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-
 PASS 5 exit-at-source: old head, rc 0, WARN, not empty
@@ -33,8 +35,27 @@ PASS 5 exit-at-source: old head, rc 0, WARN, not empty
 PASS 5 empty-lib: old head, rc 0, WARN, not empty
      no-function rc=0 head=['bug-p0-older'] stderr=wo: work_order_sort: command not found (+1)
 PASS 5 no-function: old head, rc 0, WARN, not empty
+     banner-at-so rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-
+PASS 5 banner-at-source: old head, rc 0, WARN, not empty
+     nonjson-exit rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-
+PASS 5 nonjson-exit2: old head, rc 0, WARN, not empty
+     json-banner- rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-
+PASS 5 json-banner-then-array: old head, rc 0, WARN, not empty
+     two-arrays rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-
+PASS 5 two-arrays: old head, rc 0, WARN, not empty
+     empty-array rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-
+PASS 5 empty-array: old head, rc 0, WARN, not empty
+     shorter-arra rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-
+PASS 5 shorter-array: old head, rc 0, WARN, not empty
+     right-array- rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-
+PASS 5 right-array-exit1: old head, rc 0, WARN, not empty
      unreadable rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work-order.sh not readable (WORK_ORDER_LIB, else GC_CITY_PATH/GC_CITY + packs/town-d
 PASS 5 unreadable: old head, rc 0, WARN, not empty
+     BASH_ENV rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/Users/athos/gt/.gc-worktrees/ga-9t9acg7-dog3/.gasci
+PASS 5 BASH_ENV banner + the REAL lib: old head, rc 0, WARN, not empty
+PASS 5 control: the same call without BASH_ENV is ordered by the lib (P0 feature first)
+     assigned rc=0 head=['rdy-p2-bug'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-
+PASS 5 banner-at-source on the assigned-ready tier: bd's order (rdy-p2-bug), not empty
 -- 6. idle poll (nothing routed): no lib call, still `[]`
      new  rc=0 head=[] stderr=-
 PASS 6 `[]` out, lib not invoked
@@ -82,6 +103,6 @@ PASS 12 head is the P0 feature, not the unreadable bead
 PASS 12 the lib's own WARN line reached stderr (not swallowed)  work-order WARN: no-prio: prio?
 PASS 12 stdout is exactly one JSON array
 PASS 12b a lone unreadable bead is still served (never dropped, never empty)
--- 13. wall time per routed-tier run on 25 beads (10 runs each, loaded machine, includes harness setup): old 428 ms, new 657 ms
+-- 13. wall time per routed-tier run on 25 beads (10 runs each, loaded machine, includes harness setup): old 4053 ms, new 5690 ms
 
 RESULT under sh: ALL PASS

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import gen
 
 PROMPT, GO, TESTGO, SH = sys.argv[1:5]
-base, WO_DEF, TAIL, LRU, _ = gen.load(PROMPT, GO)
+base, WO_DEF, TAIL, LRU, GO_SRC = gen.load(PROMPT, GO)
 SCRIPTS = {k: gen.patch_script(k, v[2], TAIL, LRU) for k, v in base.items()}
 OLD = {k: v[2] for k, v in base.items()}
 T = open(TESTGO).read()
@@ -31,7 +31,32 @@ def go_str(name):
 
 
 STUB, FAKE_BD = go_raw("woStubLib"), go_raw("woFakeBd")
-ERRING, BROKEN, EXITING = go_str("woErroringLib"), go_str("woSyntaxBrokenLib"), go_str("woExitingLib")
+
+
+def go_expr(name, known):
+    """Value of `name = <expr>` for the one-line string expressions of work_order_pick_test.go: interpreted
+    strings, raw strings, previously extracted identifiers, joined by +. Anything else fails loudly."""
+    m = re.search(r"\b" + name + r"\s*= ([^\n]*)", T)
+    assert m, name
+    rhs, pos, out = m.group(1).split(" //")[0].strip(), 0, ""
+    for tok in re.finditer(r"\s*(\"(?:[^\"\\]|\\.)*\"|`[^`]*`|[A-Za-z_]\w*|\+)", rhs):
+        assert tok.start() == pos, (name, rhs, pos)
+        pos, t = tok.end(), tok.group(1)
+        if t == "+":
+            continue
+        out += ast.literal_eval(t) if t[0] == '"' else t[1:-1] if t[0] == "`" else known[t]
+    assert pos == len(rhs), (name, rhs)
+    return out
+
+
+KNOWN = {"woStubLib": STUB}
+LIBS = {n: go_expr(n, KNOWN) for n in (
+    "woErroringLib", "woSyntaxBrokenLib", "woExitingLib", "woBannerLib", "woJSONBannerLib", "woNonJSONExit2Lib",
+    "woNonJSONExit0Lib", "woRightArrayExit1Lib", "woTwoArraysLib", "woEmptyArrayLib", "woInventedBeadLib")}
+TRUST = gen.go_const(GO_SRC, "workOrderPickTrustsLib")
+BASH_ENV_BODY = re.search(r'WriteFile\(bashEnv, \[\]byte\(("(?:[^"\\]|\\.)*")\)', T)
+assert BASH_ENV_BODY
+BASH_ENV_BODY = ast.literal_eval(BASH_ENV_BODY.group(1))
 BEAD_FMT = re.search(r"fmt\.Sprintf\(`(\{\"id\".*?)`,\n", T).group(1)
 
 
@@ -177,10 +202,30 @@ def check(which, name, ok, detail=""):
 work = tempfile.mkdtemp(prefix="wo-sim-libs-")
 stub = os.environ.get("GC_WORK_ORDER_LIB_REAL") or lib_file(work, STUB)  # real lib: same scenarios, same expectations
 missing = os.path.join(work, "no-such-dir", "work-order.sh")
+bash_env = os.path.join(work, "bash_env")
+open(bash_env, "w").write(BASH_ENV_BODY)
+# the rows of TestWorkOrderPickFallsBackWhenLibErrors, in the Go file's order: (name, lib body, extra env)
+ERR_ROWS = [
+    ("exit 2", LIBS["woErroringLib"], None),
+    ("syntax error", LIBS["woSyntaxBrokenLib"], None),
+    ("exit on source", LIBS["woExitingLib"], None),
+    ("banner printed while sourced", LIBS["woBannerLib"], None),
+    ("banner that is valid JSON", LIBS["woJSONBannerLib"], None),
+    ("BASH_ENV file prints a banner", STUB, {"BASH_ENV": bash_env}),
+    ("non-JSON on stdout, exit 2", LIBS["woNonJSONExit2Lib"], None),
+    ("non-JSON on stdout, exit 0", LIBS["woNonJSONExit0Lib"], None),
+    ("right array, exit 1", LIBS["woRightArrayExit1Lib"], None),
+    ("two arrays on stdout", LIBS["woTwoArraysLib"], None),
+    ("empty array for a non-empty input", LIBS["woEmptyArrayLib"], None),
+    ("array of another length", LIBS["woInventedBeadLib"], None),
+]
+# the Go file must list exactly these rows (a row added there and not here fails loudly)
+go_rows = re.findall(r'\{"([^"]+)", (?:wo\w+|woStubLib), (?:nil|map\[string\]string\{[^}]*\})\}', T)
+assert go_rows == [r[0] for r in ERR_ROWS], (go_rows, [r[0] for r in ERR_ROWS])
 erring = {}
-for nm, body in (("exit 2", ERRING), ("syntax error", BROKEN), ("exit on source", EXITING)):
-    d = os.path.join(work, nm.replace(" ", "_")); os.makedirs(d)
-    erring[nm] = lib_file(d, body)
+for nm, body, env in ERR_ROWS:
+    d = os.path.join(work, nm.replace(" ", "_").replace(",", "")); os.makedirs(d)
+    erring[nm] = (lib_file(d, body), env)
 
 for which in ("old", "new"):
     # 1. ordering at every site
@@ -202,9 +247,9 @@ for which in ("old", "new"):
               ids == ["p0-bug-older"] and "work-order WARN: wo_pick: work-order.sh not readable" in err,
               "head=%s warn=%s" % (ids, "WARN" in err))
     # 4. lib erroring
-    for nm, path in erring.items():
+    for nm, (path, env) in erring.items():
         for site in SITES:
-            ids, out, err, _, _ = run(which, site, sc_pair(site), path)
+            ids, out, err, _, _ = run(which, site, sc_pair(site), path, env_extra=env)
             check(which, "erroring[%s]/%s" % (nm, site[0]),
                   ids == ["p0-bug-older"] and "work-order WARN: wo_pick: work_order_sort could not tell" in err,
                   "head=%s warn=%s" % (ids, "could not tell" in err))
@@ -219,7 +264,7 @@ for which in ("old", "new"):
         ("WORK_ORDER_LIB wins, no cascade", {"GC_CITY_PATH": cityroot}, ["p0-bug-older"], "could not tell"),
         ("nothing set", {}, ["p0-bug-older"], "work-order.sh not readable"),
     ):
-        lib = erring["exit 2"] if nm.startswith("WORK_ORDER_LIB wins") else None
+        lib = erring["exit 2"][0] if nm.startswith("WORK_ORDER_LIB wins") else None
         ids, out, err, _, _ = run(which, s0, sc_pair(s0), lib, env_extra=extra)
         check(which, "lookup/" + nm, ids == want and (warn is None or warn in err), "head=%s err=%s" % (ids, err[:60]))
     # 6. mutation control (NEW only is meaningful; old has no wo_pick so mutants "change nothing")
@@ -232,11 +277,16 @@ for which in ("old", "new"):
             ("age = created_at only", everywhere, lambda c: c.replace("--age reclaim", "--age created"), 2, "p1-bug-untouched", stub),
             ("age = updated_at only", everywhere, lambda c: c.replace("--age reclaim", "--age field"), 3, "p1-bug-commented", stub),
             ("WARN swallowed", everywhere, lambda c: c.replace(">&2", ">/dev/null"), None, None, missing),
+            # gate round 2: the lib's answer was trusted when stdout was merely non-empty; the property is the head
+            ("lib trusted when stdout is non-empty (the round-1 check)", everywhere, lambda c: c.replace(TRUST, '[ -n "$wo_out" ]'), "pair", "p0-bug-older", erring["banner printed while sourced"][0]),
+            ("lib exit status ignored", everywhere, lambda c: c.replace('[ "$wo_rc" -eq 0 ] && ', ""), "pair", "p0-bug-older", erring["right array, exit 1"][0]),
+            ("lib answer's length not compared with the input's", everywhere, lambda c: c.replace(" and length == $n", ""), "pair", "p0-bug-older", erring["empty array for a non-empty input"][0]),
+            ("more than one document on the lib's stdout accepted", everywhere, lambda c: c.replace("length == 1 and ", ""), "pair", "p0-bug-older", erring["two arrays on stdout"][0]),
         ]
         for mname, sites, fn, scen, want, lib in MUT:
             for sn in sites:
                 site = SITE[sn]
-                beads = SCEN[scen][1](site) if scen is not None else sc_pair(site)
+                beads = SCEN[scen][1](site) if isinstance(scen, int) else sc_pair(site)
 
                 def holds(mutate):
                     ids, out, err, _, cmd = run("new", site, beads, lib, mutate=mutate)
