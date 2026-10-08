@@ -254,6 +254,8 @@ fi
 # ga-8hcnvb.3: claude-pool-guard.py writes this marker when its per-version self-test says the installed claude no longer reads
 # the pool item (a claude release that changed the item's name or the variable). A session pointed at an item claude does not
 # read is "not logged in", so while the marker is there NO launch is pointed at it: the session starts on the ambient login.
+# vazio → no marker: the launch follows the pool as before; falhou/ilegível → `[ -e ]` cannot tell "not there" from "cannot stat" (no-pool-account
+# above has the same shape) and answers "no marker": the same, the launch follows the pool. This check never blocks the launch itself.
 if [ -z "$pool_off" ] && [ -n "$city" ] && [ -e "$city/.gc/pool-account-degraded" ]; then
   pool_off="$city/.gc/pool-account-degraded (claude-pool-guard: the per-version self-test failed)"
 fi

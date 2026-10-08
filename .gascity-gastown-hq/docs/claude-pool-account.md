@@ -119,7 +119,10 @@ Three answers, never two: every check is yes / no / could not tell, and "could n
 The guard's OWN state file gets the same treatment. A time in it that cannot be used (not a number, a number too big for a float, outside
 what can be an epoch, or in the future) is not a crash and not a silence: the start of an episode (`divergence`, a `blind` entry) or the
 daemon watch (`checked_at`, `watch_since`) is counted again from this look, and the log says so; an `alerted_at` that cannot be used reads as
-"never alerted", so the alert is said once more and the stamp is rewritten. What counts as a time is the daemon's own `_sane_epoch`, one
+"never alerted", so the alert is said once more and the stamp is rewritten. The per-version self-test's stamps follow the same rule: a failed
+version's `checked_epoch` that cannot be used reads as "never checked" (the test runs again at once and rewrites it, instead of waiting for
+a clock that may be months away); the `alerted_at` of `degraded` and of `marker_failed` reads as "never alerted"; a `notice_since` that
+cannot be used restarts the 30 minutes in which the "back ON" notice is retried. What counts as a time is the daemon's own `_sane_epoch`, one
 definition for both.
 
 One divergence is ONE episode. If the key in use changes to another wrong one while it lasts, nothing new is sent before the 6 h reminder (which

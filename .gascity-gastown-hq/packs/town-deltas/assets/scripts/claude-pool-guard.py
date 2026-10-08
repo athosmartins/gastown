@@ -615,7 +615,9 @@ def check_selftest(gs: dict, t: float, user: str, force: bool = False) -> dict:
     gs["claude"] = {"version": ver, "binary": binary}
     versions = _dict(gs, "versions")
     rec = versions.get(ver) if isinstance(versions.get(ver), dict) else None
-    last = _num(rec.get("checked_epoch")) if rec else None
+    # vazio → no record: the test runs; falhou/ilegível → a stamp that is not a usable time (not a number, in the future) reads as 'never checked': the test runs
+    # again and the stamp is rewritten (kept, a future one would hold the retest of a failed version back until the clock caught up)
+    last = _past(rec.get("checked_epoch"), t) if rec else None
     res = rec.get("result") if rec else None
     due = (force or rec is None or last is None
            or (res == "fail" and t - last >= SELFTEST_RETRY_S)
@@ -655,7 +657,7 @@ def apply_result(gs: dict, t: float, ver: str, res: str, detail: str) -> str:
             if not mf or mf.get("version") != ver:
                 mf = {"since": t, "version": ver, "alerted_at": None}
                 gs["marker_failed"] = mf
-            last = _num(mf.get("alerted_at"))
+            last = _past(mf.get("alerted_at"), t)       # vazio → never alerted: it is said; falhou/ilegível (not a time, in the future) → the same: said, never withheld
             if last is None or t - last >= REMIND_S:
                 where = str(m.parent) if m else "<city>/.gc (GC_CITY_PATH is not set)"
                 msg = (f"O teste do claude {ver} falhou ({detail}), mas o guarda NÃO conseguiu gravar o marcador em {where}: "
@@ -669,7 +671,7 @@ def apply_result(gs: dict, t: float, ver: str, res: str, detail: str) -> str:
             deg = {"since": t, "version": ver, "alerted_at": None}
             gs["degraded"] = deg
             glog("WARN", f"DEGRADED: claude {ver} does not read the pool item ({detail}) - marker written, new pool launches use the ambient login")
-        last = _num(deg.get("alerted_at"))
+        last = _past(deg.get("alerted_at"), t)       # vazio → never alerted: it is said; falhou/ilegível (not a time, in the future) → the same: said, never withheld
         if last is None or t - last >= REMIND_S:
             msg = (f"O teste do claude {ver} falhou: {detail}. Agentes novos usam o login atual e nenhuma sessão foi interrompida. "
                    f"A troca automática religa sozinha quando o teste voltar a passar (refeito a cada 30 min e a cada versão nova).")
@@ -698,7 +700,9 @@ def apply_result(gs: dict, t: float, ver: str, res: str, detail: str) -> str:
         if deg:
             # A quiet notice (priority 2, not forced): notify files it in the digest (exit 12), which send_alert counts as delivered. If notify
             # refuses it any other way it is tried again, for NOTICE_GIVEUP_S at most - an episode that cannot close would repeat it every minute.
-            since = _num(deg.get("notice_since"))
+            # vazio → the notice's clock starts now; falhou/ilegível (not a time, in the future) → the same, WRITTEN BACK: a start that is
+            # ahead of the clock would never be 30 min old, and the notice would be retried every minute for as long as that lasts
+            since = _past(deg.get("notice_since"), t)
             if since is None:
                 since = deg["notice_since"] = t
             if send_alert(f"Pool Claude: troca automática religada (claude {ver})",
@@ -709,8 +713,10 @@ def apply_result(gs: dict, t: float, ver: str, res: str, detail: str) -> str:
                 gs["degraded"] = None
         return effect
     if res == "inconclusive":
-        rec = _dict(gs, "versions").get(ver) or {}
-        blind(gs, t, f"self-test of claude {ver}", detail, since=_num(rec.get("inconclusive_since")) or t)
+        rec = _dict(gs, "versions").get(ver)
+        # vazio → no start recorded: blind() starts the episode now; falhou/ilegível (not a time, in the future) → the same. Only seeds a NEW
+        # 'cannot verify' record: one that exists keeps (and repairs, in blind()) its own start
+        blind(gs, t, f"self-test of claude {ver}", detail, since=_past(rec.get("inconclusive_since"), t) if isinstance(rec, dict) else None)
     return "unchanged"
 
 
@@ -856,6 +862,8 @@ def run_once(force_selftest: bool = False) -> int:
             # whatever is still wrong is a NEW episode with its own debounce), the 'could not tell' records (their 30 minutes must not run
             # on through a stand-down) and the daemon's record, re-based on this tick - so the daemon's silence is judged from the moment
             # the guard looks at it again, never over the stand-down (see check_daemon_alive).
+            # vazio → no marker: the step runs; falhou/ilegível → degraded_marker() raises (Path.exists on Python 3.9): the except below logs it
+            # and the step is skipped (rc 1) - nothing is acted on (apply_result() keeps the same blindness as the 'degraded-marker' record)
             if name != "self-test" and D.degraded_marker():
                 gs["divergence"] = None
                 gs["daemon"] = {"checked_at": t, "watch_since": t}
@@ -904,6 +912,7 @@ def marker_state() -> Tuple[str, str]:
     if not c:
         return "unknown", "GC_CITY_PATH is not set: there is no city to look for the marker in - run it where the agents do, or export GC_CITY_PATH"
     gc = c / ".gc"
+    # vazio → "on" (the marker is not there); falhou/ilegível → "unknown" (said as such, rc 1 in `status`), never "on"
     try:
         if not gc.is_dir():
             return "unknown", f"{gc} is not a directory - is GC_CITY_PATH right?"

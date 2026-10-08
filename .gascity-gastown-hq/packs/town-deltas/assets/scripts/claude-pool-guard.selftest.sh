@@ -4,7 +4,8 @@
 #   G1-G4  DIVERGENCE: the account the pool really uses vs the account the rule dictates -> one phone alert in < 5 min naming both by
 #          e-mail + 8-hex fingerprint, never the key; it stops repeating when fixed; 'could not tell' never alerts as a divergence.
 #   G4g    the guard's OWN record (episode start, 'already alerted' stamp, the daemon watch) can be unusable - a 400-digit integer, NaN,
-#          a string, a time in the future: that clock restarts; the check neither crashes nor goes silent.
+#          a string, a time in the future: that clock restarts; the check neither crashes nor goes silent. G4l-G4o: the same for slice 2's
+#          stamps (a failed version's 'checked_epoch', the 'alerted_at' of the degradation and of 'marker not writable', 'notice_since').
 #   G5     PER-VERSION TEST: claude is asked (on a scratch item) whether it still reads the credential the pool writes. Pass/fail is
 #          recorded per claude version, queryable, and redone when the version changes. A fail -> alert 'auto-switch OFF', the daemon and
 #          the wrapper stand down, an agent started in that state answers on the current login, nothing is deleted or interrupted.
@@ -496,6 +497,33 @@ gtick 60; rc1=$GRC; gwalk 540; n1=$(ncalls); gwalk 120; n2=$(ncalls)
 new_w; active_world; gtick 0; put_item "$KEY_b"; div3; spoil_gs divergence/alerted_at "$BIG"
 gtick 60; rc1=$GRC; gtick 60; gtick 60
 { ! gl | grep -q "unhandled" && [ "$rc1" = 0 ] && [ "$(ncalls)" = 2 ] && [ "$(gj "$GSTATE" divergence/alerted_at)" != "<none>" ] && [ "$(gj "$GSTATE" divergence/alerted_at)" != "$BIG" ]; } && ok "G4k spoiled 'alerted_at' reads as 'never alerted': the alert is said once more and the stamp is rewritten (calls=$(ncalls))" || bad "G4k rc=$rc1 calls=$(ncalls) alerted_at=$(gj "$GSTATE" divergence/alerted_at | cut -c1-30)"
+# slice 2's own stamps. The one that used to pass for a good time is the time that has not happened yet: it held back the retest of a failed
+# version, the 'auto-switch OFF' pushes and the end of the 'back ON' notice's retries until the clock caught up (months, with a hand edit)
+fut=$((NOW + 5000000))
+chk_case() { # chk_case <label> <JSON literal for the failed version's 'checked_epoch'>
+  new_w; active_world; set_ver 1.0.2; set_mode renamed; gtick 60; spoil_gs versions/1.0.2/checked_epoch "$2"
+  set_mode ok; gtick 60
+  if gl | grep -q "unhandled"; then bad "G4l/$1 a spoiled 'checked_epoch' crashed the check ($(gl | grep unhandled | head -1 | cut -c1-110))"
+  elif [ "$(gv 1.0.2 result)" = pass ] && [ ! -e "$marker" ] && [ "$(ncalls)" = 2 ] && [[ "$(call_n 2)" == *"religada"* ]]; then ok "G4l/$1 spoiled 'checked_epoch' of a failed version reads as 'never checked': it is tested again at once, passes, the marker is lifted, 'religada' goes out"
+  else bad "G4l/$1 result='$(gv 1.0.2 result)' marker=$([ -e "$marker" ] && echo yes || echo no) calls=$(ncalls)"; fi
+}
+chk_case future "$fut"
+chk_case 400-digits "$BIG"
+chk_case string '"later"'
+if [ "$(id -u)" != 0 ]; then
+  new_w; active_world; gtick 0; chmod 555 "$CITY/.gc"; set_ver 1.0.2; set_mode renamed; gtick 60; spoil_gs marker_failed/alerted_at "$fut"
+  gtick 60; chmod 755 "$CITY/.gc"
+  { ! gl | grep -q "unhandled" && [ "$(ncalls)" = 2 ] && [[ "$(call_n 2)" == *"NÃO foi desligada"* ]] && [ "$(gj "$GSTATE" marker_failed/alerted_at)" != "$fut" ]; } && ok "G4m spoiled 'alerted_at' of 'could not write the marker' (in the future) reads as 'never alerted': the worst state is said again, not withheld, and the stamp is rewritten (calls=$(ncalls))" || bad "G4m calls=$(ncalls) alerted_at=$(gj "$GSTATE" marker_failed/alerted_at | cut -c1-30)"
+else
+  ok "G4m skipped (root can write anywhere)"
+fi
+new_w; active_world; set_ver 1.0.2; set_mode renamed; gtick 60; spoil_gs degraded/alerted_at "$fut"
+gtick 60
+{ ! gl | grep -q "unhandled" && [ "$(ncalls)" = 2 ] && [[ "$(call_n 2)" == *"DESLIGADA"* ]] && [ "$(gj "$GSTATE" degraded/alerted_at)" != "$fut" ]; } && ok "G4n spoiled 'alerted_at' of the degradation reads as 'never alerted': 'auto-switch OFF' is said again and the stamp is rewritten (calls=$(ncalls))" || bad "G4n calls=$(ncalls) alerted_at=$(gj "$GSTATE" degraded/alerted_at | cut -c1-30)"
+new_w; active_world; set_ver 1.0.2; set_mode renamed; gtick 60
+set_ver 1.0.3; set_mode ok; printf 14 > "$SINKS/notify.rc"; gtick 60; spoil_gs degraded/notice_since "$fut"
+gtick 600; gtick 600; gtick 600; gtick 600; n_g=$(ncalls); d_g=$(gj "$GSTATE" degraded); gtick 600; gtick 600
+{ ! gl | grep -q "unhandled" && [ "$d_g" = "<none>" ] && [ "$(ncalls)" = "$n_g" ] && gl | grep -q "gave up announcing"; } && ok "G4o spoiled 'notice_since' (in the future) restarts the notice's 30 min: a notice notify keeps refusing is still given up on, once (calls=$n_g, stable after)" || bad "G4o degraded=$d_g calls=$n_g/$(ncalls) notice_since=$(gj "$GSTATE" degraded/notice_since | cut -c1-30)"
 fi
 
 # ═══ G6. is the daemon doing its job? ══════════════════════════════════════════════════════════════

@@ -510,6 +510,8 @@ def degraded_marker() -> Optional[Path]:
     installed claude no longer reads the pool item. While it is there the daemon changes nothing and the wrapper (claude-lowprio.sh)
     launches pool sessions on the ambient login. The guard removes it when the self-test passes again."""
     c = city()
+    # vazio → None (no marker: the run goes on); falhou/ilegível → Path.exists() raises PermissionError (Python 3.9: anything but "not there"):
+    # run_once() calls this before the lock and before any action and main() logs it (ERROR, rc 1), so the run does nothing - never "no marker"
     p = c / ".gc" / DEGRADED_MARKER if c else None
     return p if p is not None and p.exists() else None
 
