@@ -464,17 +464,25 @@ def bridges() -> Optional[Dict[int, dict]]:
     except OSError:
         return None
     out: Dict[int, dict] = {}
+    unread: List[str] = []
     for n in names:
         if not n.endswith(".json"):
             continue
         data = load_json(d / n)
-        if not data or not data.get("bridgeSessionId"):
+        if data is None:
+            if (d / n).exists():                           # it is there but cannot be read: not the same as "no bridge"
+                unread.append(n)
+            continue                                       # (a file that vanished is a session that ended: not a problem)
+        if not data.get("bridgeSessionId"):
             continue
         pid = _int(data.get("pid") or n[:-5])
         start = data.get("procStart") if isinstance(data.get("procStart"), str) else ""
         if pid is None or not alive(pid, start):
             continue
         out[pid] = {"bridge": str(data["bridgeSessionId"]), "start": start}
+    if unread:
+        log("WARN", f"{len(unread)} session file(s) could not be read ({', '.join(unread[:5])}"
+                    f"{', ...' if len(unread) > 5 else ''}) - a Remote Control bridge in them is NOT counted")
     return out
 
 

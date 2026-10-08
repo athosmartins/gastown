@@ -822,6 +822,19 @@ def test_an_unreadable_sessions_dir_at_check_time_is_neither_success_nor_a_false
     assert "all 1 Remote Control bridges are still up" in w.log() and "pending_verify" not in w.state()
 
 
+def test_a_session_file_that_cannot_be_read_is_said_not_counted_as_a_session_without_a_bridge(w):
+    _session(w, os.getpid(), "cse_a")
+    (w.d / "sessions" / "4242.json").write_text("{torn write")           # exists, but is not JSON: "don't know", not "no bridge"
+    (w.d / "sessions" / "4343.json").write_text("[1, 2]")                # valid JSON that is not a session object
+    (w.d / "sessions" / "4444.json").write_text(json.dumps({"pid": 4444}))   # readable, says it has no bridge: fine, silent
+    assert set(crew.bridges()) == {os.getpid()}
+    log = w.log()
+    assert "2 session file(s) could not be read (4242.json, 4343.json)" in log and "4444.json" not in log
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    assert "session file(s) could not be read" in w.log()                # the switch run says it too, before it counts "1 bridge"
+
+
 def test_no_bridge_at_all_says_there_was_nothing_to_verify(w):
     _switch_crypto_to_amb(w)
     w.run(at=w.now + 90)

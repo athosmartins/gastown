@@ -70,7 +70,7 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
 - A conta terrenos não tem login completo guardado: precisa de re-login humano (ga-xknkke); NÃO logar sozinho.
 - 2ª etapa (reinício em momento ocioso se o RC cair) fora de escopo.
 
-Testes: `scripts/test_claude_crew_account.py` (70 testes, shim de `security`, servidor de perfil em loopback). O harness é
+Testes: `scripts/test_claude_crew_account.py` (71 testes, shim de `security`, servidor de perfil em loopback). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).
