@@ -53,11 +53,23 @@ case "$*" in
       strtrue)  printf '{"server":{"running":true,"reachable":"true","pid":%s,"port":52756,"latency_ms":120}}' "$FAKE_PID" ;;
       junk)     printf 'not json at all' ;;
       refused)  echo "dial tcp 127.0.0.1:52756: connect: connection refused" >&2; exit 1 ;;
+      *)        echo "shim: unknown FAKE_HEALTH='${FAKE_HEALTH:-}'" >&2; exit 97 ;;
     esac ;;
 esac
 exit 0
 SHIMEOF
 chmod +x "$SHIM/gc"
+
+# Shim self-check: a blank/unreadable expectation below must come from the CODE UNDER TEST, never from a typo'd payload
+# name or a broken shim (both would also read as "blank"). Every JSON payload parses and names a server; junk does not
+# parse; refused fails with the connection error; an unknown name fails with the shim's own exit code (97).
+for _n in up hot down hung hungnolat nofield strtrue; do
+  FAKE_HEALTH="$_n" FAKE_PID="$LIVE_PID" "$SHIM/gc" dolt health --json 2>/dev/null | jq -e '.server | type == "object"' >/dev/null 2>&1 \
+    || { echo "FATAL: shim payload '$_n' is not a JSON object with a server — the test would be vacuous"; exit 1; }
+done
+FAKE_HEALTH=junk "$SHIM/gc" dolt health --json 2>/dev/null | jq -e . >/dev/null 2>&1 && { echo "FATAL: shim payload 'junk' parses as JSON"; exit 1; }
+FAKE_HEALTH=refused "$SHIM/gc" dolt health --json >/dev/null 2>&1; [ "$?" -eq 1 ] || { echo "FATAL: shim payload 'refused' does not exit 1"; exit 1; }
+FAKE_HEALTH=no-such-payload "$SHIM/gc" dolt health --json >/dev/null 2>&1; [ "$?" -eq 97 ] || { echo "FATAL: shim does not reject an unknown payload name"; exit 1; }
 
 # extract <file> <function-name> — the live function body, top-level definition to its closing brace.
 extract() { awk -v n="$2" '$0 ~ "^"n"\\(\\) \\{" {c=1} c{print} c&&/^}$/{exit}' "$1"; }
@@ -132,8 +144,18 @@ eq "(g14) reachable slow Dolt: unchanged — hot floor of one run with nothing i
 echo "No mock of the health payload in the old shape (server{...latency_ms} without reachable)"
 # Filter on the line's CONTENT, never on grep's "path:line:" prefix — the path itself can contain the word
 # "reachable" (this very worktree's name does), which silently emptied the first version of this check.
-OLD_SHAPE="$(awk '/"server" *: *[{][^}]*latency_ms/ && !/reachable/ && !/nofield/ && FILENAME !~ /dolt-health-unreachable[.]selftest[.]sh$/ { print FILENAME ":" FNR ": " $0 }' \
-  "$SELF_DIR"/*.selftest.sh "$SELF_DIR"/../../../scripts/*.selftest.sh 2>/dev/null || true)"
+SCAN_FILES=("$SELF_DIR"/*.selftest.sh "$SELF_DIR"/../../../scripts/*.selftest.sh)
+OLD_SHAPE="$(awk '/"server" *: *[{][^}]*latency_ms/ && !/reachable/ && !/nofield/ && FILENAME !~ /dolt-health-unreachable[.]selftest[.]sh$/ { print FILENAME ":" FNR ": " $0 }' "${SCAN_FILES[@]}" 2>/dev/null)"
+# "Found none" must not be confusable with "could not look": a scan that read nothing would also find nothing.
+# Positive control — the scan has to SEE the mocks it is meant to vouch for (the shapes with reachable, e.g. in
+# gate-spawn-transient-retry.selftest.sh), over a sane number of files.
+SEEN_MOCKS="$(awk '/"server" *: *[{][^}]*latency_ms/ && FILENAME !~ /dolt-health-unreachable[.]selftest[.]sh$/ { n++ } END { print n+0 }' "${SCAN_FILES[@]}" 2>/dev/null)"
+case "$SEEN_MOCKS" in ''|*[!0-9]*) SEEN_MOCKS=0 ;; esac
+if [ "${#SCAN_FILES[@]}" -lt 20 ] || [ "$SEEN_MOCKS" -lt 3 ]; then
+  bad "(c0) the scan could not see what it is meant to check: ${#SCAN_FILES[@]} files, $SEEN_MOCKS health-payload mocks (expected >=20 files, >=3 mocks) — (c1) below proves nothing"
+else
+  ok "(c0) the scan saw $SEEN_MOCKS health-payload mocks across ${#SCAN_FILES[@]} selftest files"
+fi
 if [ -z "$OLD_SHAPE" ]; then ok "(c1) every health-payload mock carries reachable (the deliberate 'nofield' negative case aside)"
 else bad "(c1) mocks in the old shape — a reader that now requires reachable would read them as unreadable:"; echo "$OLD_SHAPE" | sed 's/^/      /'; fi
 
