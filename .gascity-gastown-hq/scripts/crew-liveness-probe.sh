@@ -53,6 +53,9 @@
 # agent.toml, via `git show`, never `git checkout`) and skips them. The
 # 2026-09-10 incident's own signature was the opposite of that — suspended=
 # true with NO commit at all — which is precisely what this still lets through.
+# "Live" excludes DORMANT sessions (asleep, drained, ...; see _live_sessions,
+# ga-u9ro2j): a suspended crew whose session is merely asleep has nothing
+# running, so it is not this shape either.
 #
 # ROOT CAUSE NOTE (ga-ld0ch): `_live_sessions()` used to do `jq -r '.[].name'`
 # against `gc session list --json`. The CLI's real output is an envelope object
@@ -122,8 +125,8 @@ notify_info() { "$CLP_NOTIFY" -t "Crew Liveness Probe" "$*" 2>/dev/null || true;
 # for the same reason as ga-3xfndz — this file's own --selftest exercises the
 # detect/nudge/heal logic in-process and must not shell out to a real `gc rig
 # list` on every hermetic run.
-# NOTE for Scenario 35's structural detector: this "$GC ... --json" call lives
-# in the sourced lib/rig-stores.sh, not inline here, so it's outside that
+# NOTE for Scenario 35's structural detector: the JSON-producing gc call behind
+# this lives in the sourced lib/rig-stores.sh, not inline here, so it's outside that
 # scenario's grep — deliberately: rig_stores_tsv has its own equivalent guard
 # (timeout-bounded, parse-or-fail, never a truncated "success"), independently
 # selftested in lib/rig-stores.sh itself, so routing it through this script's
@@ -354,8 +357,42 @@ _load_agent_list_json() {
   fi
 }
 
+# CLP_DORMANT_STATES — session states that PROVE there is no running process.
+# Mirror of bead_state.DEAD_SESSION_STATES (scripts/bead_state.py, the list the
+# reclaim-guard already acts on); selftest Scenario 41e fails if the two drift.
+CLP_DORMANT_STATES="asleep drained closed archived quarantined failed-create"
+
+# _live_sessions — names of sessions that may have a running process.
+# `gc session list --json` also returns DORMANT sessions (measured 2026-10-08:
+# 13 active, 6 asleep, 1 draining, 2 start-pending), and counting them as live
+# was wrong for both callers (ga-u9ro2j): run_suspend_watchdog paged "suspended
+# with a LIVE session" every hour for a crew suspended on purpose whose session
+# was merely asleep, pointing the operator at `gc agent resume` — the gesture
+# that wakes a session nobody asked for; and run_probe only acts on "wedged, not
+# dead", which an asleep session cannot be (`gc session nudge` also needs a
+# running session). Three states, read from `.state`:
+#   in CLP_DORMANT_STATES            → dormant: NOT listed. run_probe takes its
+#                                      "not live" skip; the watchdog does not page.
+#   anything else readable (active,  → live: listed. draining / start-pending are
+#   draining, start-pending, ...)      deliberately NOT dormant — a session being
+#                                      created or torn down has, or is about to
+#                                      have, a process; inflight-reclaim-guard.py
+#                                      likewise treats a state outside its dead and
+#                                      live sets as alive.
+#   .state absent / null / non-string → unknown: listed, i.e. exactly the behaviour
+#                                      before ga-u9ro2j. The CLI sets .state on
+#                                      every session today, so this only shows up on
+#                                      a schema change — and then a detector must
+#                                      not read "can't tell" as "asleep" and go blind.
+# vazio → no names (the watchdog pages nothing, run_probe takes its "not live" skip);
+# falhou/ilegível → the same empty output via `|| true`, so nothing acts on a
+# half-read list; run_suspend_watchdog also refuses to run unless _sessions_json_ok=1.
 _live_sessions() {
-  printf '%s' "$_sessions_json_cache" | jq -r '.sessions[]?.name // empty' 2>/dev/null || true
+  printf '%s' "$_sessions_json_cache" | jq -r --arg dormant "$CLP_DORMANT_STATES" \
+    '($dormant | split(" ")) as $d
+     | .sessions[]?
+     | select(((.state // "") | IN($d[])) | not)
+     | .name // empty' 2>/dev/null || true
 }
 
 # _session_identity crew-name — "<id>|<created_at>" for its current live
@@ -752,6 +789,9 @@ run_suspend_watchdog() {
 if [ "${1:-}" = "--selftest" ]; then
   PASS=0; FAIL=0; ok(){ PASS=$((PASS+1)); echo "  ✓ $1"; }; bad(){ FAIL=$((FAIL+1)); echo "  ✗ $1"; }
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+  # Absolute, resolved BEFORE any scenario can change the cwd: a relative
+  # dirname of ${BASH_SOURCE[0]} stops pointing at scripts/ the moment one does.
+  SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   NOW_ST=$(date +%s)
   NUDGE_LOG="$TMP/nudges"
   HEAL_LOG="$TMP/heals"
@@ -856,8 +896,16 @@ case "\$*" in
     # \$TMP/session_list_missing_key — shape 4 (Scenario 29): exit 0, valid
     # JSON object, ok:true, but the required "sessions" key is simply absent.
     [ -f "${TMP}/session_list_missing_key" ] && { echo '{"filters":{},"ok":true,"schema_version":"1"}'; exit 0; }
+    # \$TMP/extra_session_state / \$TMP/mila_wa_state — ga-u9ro2j (Scenario 41):
+    # give that session a .state ("asleep", "active", ...). Absent file = the
+    # session carries no .state key at all, which is the "unknown" third state
+    # and what every scenario before 41 has always seen.
+    EXTRA_STATE=""
+    [ -f "${TMP}/extra_session_state" ] && EXTRA_STATE=',"state":"'"\$(cat "${TMP}/extra_session_state")"'"'
+    MILA_STATE=""
+    [ -f "${TMP}/mila_wa_state" ] && MILA_STATE=',"state":"'"\$(cat "${TMP}/mila_wa_state")"'"'
     EXTRA_SESSION=""
-    [ -f "${TMP}/extra_session_name" ] && EXTRA_SESSION=',{"name":"'"\$(cat "${TMP}/extra_session_name")"'","id":"sess-extra","created_at":"2026-01-01T00:00:00Z"}'
+    [ -f "${TMP}/extra_session_name" ] && EXTRA_SESSION=',{"name":"'"\$(cat "${TMP}/extra_session_name")"'","id":"sess-extra","created_at":"2026-01-01T00:00:00Z"'"\$EXTRA_STATE"'}'
     if [ -f "${TMP}/mila_wa_no_session" ]; then
       # ga-lkbw82 defect #4 fixture: mila-wa has NO live session at all right
       # now (distinct from "a new session" — this is the empty-identity shape).
@@ -865,7 +913,7 @@ case "\$*" in
     else
       ATTACHED=false
       [ -f "${TMP}/mila_wa_attached" ] && ATTACHED=true
-      echo '{"filters":{},"ok":true,"schema_version":"1","sessions":[{"name":"mila-wa","id":"'"\$SID"'","created_at":"2026-01-01T00:00:00Z","attached":'"\$ATTACHED"'}'"\$EXTRA_SESSION"']}'
+      echo '{"filters":{},"ok":true,"schema_version":"1","sessions":[{"name":"mila-wa","id":"'"\$SID"'","created_at":"2026-01-01T00:00:00Z","attached":'"\$ATTACHED""\$MILA_STATE"'}'"\$EXTRA_SESSION"']}'
     fi
     ;;
   *"nudge"*) echo "\$*" >> "${NUDGE_LOG}" ;;
@@ -1375,6 +1423,76 @@ GCSHIM
   rm -f "$TMP/show_garbage_json"
   grep -qi "parcial\|partial" "$NOTIFY_LOG" && ok "40: heal notified an explicit failure when the verify read-back was unparseable" || bad "40: an unparseable verify response was silently treated as success"
   grep -qi "could not parse\|partial" "$COMMENT_LOG" && ok "40: heal's bead comment reports the unparseable verification, not a blanket success claim" || bad "40: heal's bead comment did not report the unparseable verification"
+
+  echo ""
+  echo "=== Scenario 41 (ga-u9ro2j): a DORMANT session (asleep, drained, ...) is not 'live' for the WATCHDOG or for run_probe; draining / start-pending / no .state stay live ==="
+  : > "$NUDGE_LOG"; : > "$NOTIFY_LOG"; : > "$TMP/suspended_state"
+  rm -f "$CLP_STATE_DIR"/mila-wa.suspended-by-probe "$CLP_STATE_DIR"/night-crew.suspended-by-probe 2>/dev/null
+  CLP_ENABLED=1; CLP_HEAL_ENABLED=0; CLP_DRY_RUN=0
+  # night-crew: suspended=true (on purpose, no probe marker) with a same-named
+  # session whose .state each loop below varies.
+  echo "night-crew" > "$TMP/extra_agent_name"
+  echo "night-crew" > "$TMP/extra_session_name"
+  for st in $CLP_DORMANT_STATES; do
+    : > "$NOTIFY_LOG"; rm -f "$CLP_STATE_DIR"/night-crew.watchdog-notified 2>/dev/null
+    echo "$st" > "$TMP/extra_session_state"
+    run_suspend_watchdog
+    grep -q "night-crew" "$NOTIFY_LOG" \
+      && bad "41a: watchdog paged 'suspended with a LIVE session' for a session in dormant state '$st' (no process is running)" \
+      || ok "41a: watchdog stays silent for a suspended agent whose session is '$st'"
+  done
+  # Positive paths — prove 41a is not silence-by-breakage: a session that is, or is
+  # about to be, running still pages, and so does one whose .state is missing.
+  for st in active draining start-pending; do
+    : > "$NOTIFY_LOG"; rm -f "$CLP_STATE_DIR"/night-crew.watchdog-notified 2>/dev/null
+    echo "$st" > "$TMP/extra_session_state"
+    run_suspend_watchdog
+    grep -q "night-crew" "$NOTIFY_LOG" \
+      && ok "41b: watchdog still pages a suspended agent whose session is '$st'" \
+      || bad "41b: watchdog went blind to a suspended agent whose session is '$st' (not dormant — must still page)"
+  done
+  : > "$NOTIFY_LOG"; rm -f "$CLP_STATE_DIR"/night-crew.watchdog-notified "$TMP/extra_session_state" 2>/dev/null
+  run_suspend_watchdog
+  grep -q "night-crew" "$NOTIFY_LOG" \
+    && ok "41c: watchdog still pages when the session carries no .state at all (unknown ≠ asleep)" \
+    || bad "41c: a session with no .state was read as dormant — the detector went blind on a schema change"
+  rm -f "$TMP/extra_agent_name" "$TMP/extra_session_name" "$TMP/extra_session_state" 2>/dev/null
+
+  # The filter itself, against .state shapes the CLI shim cannot produce.
+  _sessions_json_cache='{"sessions":[{"name":"s-missing"},{"name":"s-null","state":null},{"name":"s-num","state":5},{"name":"s-empty","state":""},{"name":"s-asleep","state":"asleep"},{"name":"s-active","state":"active"}]}'
+  GOT41=$(_live_sessions | tr '\n' ' ')
+  [ "$GOT41" = "s-missing s-null s-num s-empty s-active " ] \
+    && ok "41d: _live_sessions drops only the dormant session; absent / null / non-string / empty .state stay listed" \
+    || bad "41d: _live_sessions returned '$GOT41' (expected everything except s-asleep)"
+  _load_sessions_json
+
+  # run_probe: an asleep assignee is "dead, not wedged" — skipped, not nudged.
+  : > "$NUDGE_LOG"; rm -f "$CLP_STATE_DIR"/wa-stale__mila-wa.nudged 2>/dev/null
+  echo "asleep" > "$TMP/mila_wa_state"
+  run_probe
+  grep -q 'wa-stale' "$NUDGE_LOG" \
+    && bad "41f: run_probe nudged a stale bead whose assignee session is ASLEEP (there is no running session to nudge)" \
+    || ok "41f: run_probe skips a stale bead whose assignee session is asleep"
+  : > "$NUDGE_LOG"; rm -f "$CLP_STATE_DIR"/wa-stale__mila-wa.nudged 2>/dev/null
+  echo "active" > "$TMP/mila_wa_state"
+  run_probe
+  grep -q 'wa-stale' "$NUDGE_LOG" \
+    && ok "41g: run_probe still nudges the same bead once the assignee session is active" \
+    || bad "41g: run_probe stopped nudging an ACTIVE assignee session (the asleep filter is too broad)"
+  rm -f "$TMP/mila_wa_state" "$CLP_STATE_DIR"/wa-stale__mila-wa.nudged 2>/dev/null
+
+  # Drift guard: CLP_DORMANT_STATES must stay equal to the canonical list.
+  # vazio → FAIL (cannot prove sync); falhou/ilegível → FAIL (same) — neither
+  # reads as "in sync".
+  CANON41=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import bead_state; print(" ".join(sorted(bead_state.DEAD_SESSION_STATES)))' "$SELF_DIR" 2>/dev/null)
+  MINE41=$(printf '%s\n' $CLP_DORMANT_STATES | sort | tr '\n' ' ' | sed 's/ $//')
+  if [ -z "$CANON41" ]; then
+    bad "41e: could not read bead_state.DEAD_SESSION_STATES (python3 or scripts/bead_state.py unavailable) — cannot prove CLP_DORMANT_STATES is in sync"
+  elif [ "$CANON41" = "$MINE41" ]; then
+    ok "41e: CLP_DORMANT_STATES matches bead_state.DEAD_SESSION_STATES"
+  else
+    bad "41e: CLP_DORMANT_STATES drifted from bead_state.DEAD_SESSION_STATES — mine='$MINE41' canonical='$CANON41'"
+  fi
 
   echo ""
   echo "crew-liveness-probe selftest: PASS=$PASS FAIL=$FAIL"
