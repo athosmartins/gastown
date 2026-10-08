@@ -135,7 +135,7 @@ extract_bead_from_branch() {
       seg=${branch#crew/*/}
       # ga-pkvfc: optional dotted sub-bead suffix (ps-8iuu.4), plus an
       # identity check — see the deployed source for the full rationale.
-      bead=$(printf '%s\n' "$seg" | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?' | head -1 2>/dev/null || echo "")
+      bead=$(printf '%s\n' "$seg" | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}' | head -1 2>/dev/null || echo "")
       if [ -n "$bead" ]; then
         case "$seg" in
           "$bead"|"$bead"-*) : ;;
@@ -150,8 +150,8 @@ extract_bead_from_branch() {
       # for the full rationale.
       # ga-stmh8: optional dotted sub-bead suffix, mirroring the crew/*/*
       # arm's ga-pkvfc fix — see the deployed source for the full rationale.
-      bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?(-|$)' \
-        | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?' 2>/dev/null || echo "")
+      bead=$(echo "$branch" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}(-|$)' \
+        | grep -oE '[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}' 2>/dev/null || echo "")
       ;;
   esac
   printf '%s' "$bead"
@@ -671,7 +671,7 @@ B=$(extract_bead_from_branch "crew/thies/demand-mobile-phase2")
 #    dotted suffix and performs the identity check, not just existence.
 if [ -f "$GATE_DONE" ]; then
   src=$(cat "$GATE_DONE")
-  printf '%s' "$src" | grep -F '(\.[0-9]+)?' >/dev/null \
+  printf '%s' "$src" | grep -F '(\.[0-9]{1,4}){0,3}' >/dev/null \
     && ok "(L1) gate-done.md crew regex captures the optional dotted sub-bead suffix" \
     || bad "(L1) gate-done.md missing the dotted sub-bead suffix capture group (ga-pkvfc regression)"
   printf '%s' "$src" | grep -F '"$BEAD_ID"|"$BEAD_ID"-*' >/dev/null \
@@ -1721,7 +1721,7 @@ if [ -f "$GATE_DONE" ]; then
   printf '%s' "$src" | grep -F 'ga-stmh8' >/dev/null \
     && ok "(Z7a) gate-done.md references the ga-stmh8 fix" \
     || bad "(Z7a) gate-done.md missing the ga-stmh8 fix marker (regression)"
-  printf '%s' "$src" | grep -F '[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?(-|$)' >/dev/null \
+  printf '%s' "$src" | grep -F '[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}(-|$)' >/dev/null \
     && ok "(Z7b) gate-done.md's generic-case regex captures the optional dotted sub-bead suffix" \
     || bad "(Z7b) gate-done.md's generic-case regex missing the dotted sub-bead capture group (ga-stmh8 regression)"
 else

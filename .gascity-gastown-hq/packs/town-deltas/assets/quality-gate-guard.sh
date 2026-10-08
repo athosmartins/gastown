@@ -4640,6 +4640,40 @@ gate_e11_verdict() {
   esac
 }
 
+# ── Input validation (pure): branch + bead id ────────────────────────────────
+# Defined HERE, above the lib-only cutoff just below (ga-ovz0up), so the selftest
+# exercises these exact functions. The call sites are in Step 4 of the live sweep.
+
+# Validate branch: lowercase alphanumeric, hyphens, underscores, slashes, dots.
+# Uppercase is excluded to avoid case-insensitive filesystem collisions.
+# Bug 4 fix: '+' and other unsafe chars (as used in "worktree-fix+wa-..." branches)
+# are rejected here, producing gate-status:error with a clear diagnostic.
+# Dots are allowed (sub-bead branches like feat/ga-qw3p.1-desc) but consecutive
+# dots (..) are blocked to prevent remote-tracking ref confusion (origin/main..HEAD).
+validate_branch() {
+  local val="$1"
+  if [[ "$val" =~ ^[a-z0-9/_.-]{1,200}$ ]] && ! [[ "$val" =~ \.\. ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Validate bead ID: e.g. "gt-abc123", "wa-xyz", "ga-qw3p.1" (sub-beads),
+# "wa-d3ys32.2.1" (a sub-bead of a sub-bead — E11 slicing makes these).
+# ga-ovz0up: up to 3 dotted levels of 1-4 digits. This is a SECURITY check (the id
+# reaches bd/labels/branch names), so the ceiling stays bounded: no unbounded
+# repeat, no empty level, no non-digit level, same 16-char suffix cap. The id shape
+# in commands/gate-done.md Step 2 must stay identical — a one-sided change makes
+# /gate-done build a marker this function rejects (gate-status:error), or the
+# reverse; gate-done-dotted-bead-id.selftest.sh checks both sides together.
+validate_bead_id() {
+  local val="$1"
+  if [[ "$val" =~ ^[a-z]{1,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}$ ]]; then
+    return 0
+  fi
+  return 1
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -4678,29 +4712,8 @@ if [ -f "$LAUNCHD_ERR" ]; then
 fi
 
 # ── Input validation helpers ──────────────────────────────────────────────────
-
-# Validate branch: lowercase alphanumeric, hyphens, underscores, slashes, dots.
-# Uppercase is excluded to avoid case-insensitive filesystem collisions.
-# Bug 4 fix: '+' and other unsafe chars (as used in "worktree-fix+wa-..." branches)
-# are rejected here, producing gate-status:error with a clear diagnostic.
-# Dots are allowed (sub-bead branches like feat/ga-qw3p.1-desc) but consecutive
-# dots (..) are blocked to prevent remote-tracking ref confusion (origin/main..HEAD).
-validate_branch() {
-  local val="$1"
-  if [[ "$val" =~ ^[a-z0-9/_.-]{1,200}$ ]] && ! [[ "$val" =~ \.\. ]]; then
-    return 0
-  fi
-  return 1
-}
-
-# Validate bead ID: e.g. "gt-abc123", "wa-xyz", "ga-qw3p.1" (sub-beads).
-validate_bead_id() {
-  local val="$1"
-  if [[ "$val" =~ ^[a-z]{1,8}-[a-z0-9]{2,16}(\.[0-9]{1,4})?$ ]]; then
-    return 0
-  fi
-  return 1
-}
+# validate_branch / validate_bead_id are pure and live ABOVE the lib-only cutoff
+# (ga-ovz0up) so a selftest can call the real functions instead of a regex copy.
 
 # Validate rig name against the known registered rigs.
 validate_rig() {

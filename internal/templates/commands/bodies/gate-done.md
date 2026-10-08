@@ -128,9 +128,10 @@ error envelope instead of data. For each one you find:
    SILENT fail-open is not — the correct shape is visible and counted ("N
    unverified"), never quiet.
 3. Does every comment or log line in this diff describe what the code beside
-   it ACTUALLY does? ("labels cleared" when nothing was cleared, or a claim
-   that exists only in the comment and not the code next to it, is how two of
-   today's six rejections happened.)
+   it ACTUALLY does? Since 2026-10-07 a comment that misdescribes CORRECT code
+   is a non-blocking finding, not a rejection — fix it anyway. A LOG that
+   reports success, a count or "nothing to do" when the operation failed is
+   still a rejection: that is behavior, not wording.
 
 This is a judgment sweep, not a lint — nothing here can grade it for you but
 you. You'll record a one-line result of it in Step 3 below, so the sweep
@@ -242,8 +243,18 @@ case "$BRANCH" in
     # ga-pkvfc: capture an optional dotted sub-bead suffix (ps-8iuu.4) — the
     # char class alone has no '.', so a dotted sub-bead id used to truncate at
     # the dot (ps-8iuu.4 -> ps-8iuu, the PARENT epic).
+    # ga-ovz0up: the id shape here MUST equal the guard's validate_bead_id
+    # (quality-gate-guard.sh) — suffix up to 16 chars, up to 3 dotted levels of
+    # 1-4 digits (wa-d3ys32.2.1 is a child of a child; E11 slicing makes them).
+    # With one level only, a two-level id matched its PARENT and the identity
+    # pre-filter below discarded it; a looser digit count here would hand the
+    # marker an id the guard then rejects (gate-status:error). Same bounds both
+    # sides — gate-done-dotted-bead-id.selftest.sh checks the contract.
+    # vazio → BEAD_ID empty: SECONDARY lookup runs, and FAIL CLOSED (exit 1) if it
+    # finds nothing either; falhou → a grep error is the same empty, so no marker
+    # is ever built from a failed read.
     BEAD_ID=$(printf '%s\n' "$_CREW_SEG" \
-      | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?' | head -1 2>/dev/null || echo "")
+      | grep -oE '^[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}' | head -1 2>/dev/null || echo "")
     # ga-pkvfc: existence-check below is not identity-check — a truncated
     # match can coincidentally BE a real bead (a dotted sub-bead's truncated
     # prefix is its parent epic, which really exists), so existence alone
@@ -280,8 +291,15 @@ case "$BRANCH" in
     # which is neither '-' nor end-of-string: the WHOLE match used to fail
     # here (unlike the crew arm, which truncated at the dot instead), and
     # BEAD_ID came back empty.
-    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?(-|$)' \
-      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,8}(\.[0-9]+)?' 2>/dev/null || echo "")
+    # ga-ovz0up: same id shape as the crew/*/* arm above and the guard's
+    # validate_bead_id (suffix up to 16, up to 3 dotted levels of 1-4 digits) —
+    # see the note there. A shape past that ceiling (4 levels, 5-digit sub-id)
+    # matches nothing here, so BEAD_ID stays empty and goes to the SECONDARY
+    # lookup / FAIL CLOSED block instead of shipping a truncated parent id.
+    # vazio → BEAD_ID empty (same SECONDARY-then-FAIL-CLOSED path as above);
+    # falhou → same.
+    BEAD_ID=$(echo "$BRANCH" | grep -oE '^[^/]+/[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}(-|$)' \
+      | grep -oE '[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}' 2>/dev/null || echo "")
     ;;
   *)
     BEAD_ID=""
