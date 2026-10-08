@@ -629,11 +629,12 @@ fi
 # Measured on the live log: of 15 reviewer spawns that needed a retry, 8 still aborted after all
 # 3 retries (3s/6s/12s = 21s of backoff) because the Dolt-connection windows behind them last
 # ~4 minutes — each abort burned a fully-paid-for run and bumped gate-spawn-abort-count (3 in a
-# row pages the Mayor as a systemic outage). gate_spawn_wait_dolt_ready asks `gc dolt health`
-# between the backoff and the retry, bounded, and the retry happens anyway when the budget is
-# spent. Every scenario below runs the REAL extracted loop + the REAL extracted wait functions in
-# a child bash with mocked gc / timeout / sleep / warn; counts go through files (the real code
-# calls gc inside $(...), a subshell — the same lesson as CALL_LOG above).
+# row pages the Mayor as a systemic outage). gate_spawn_wait_dolt_ready asks Dolt (ga-gs3bj3: a
+# direct bounded `dolt sql -q 'SELECT 1'`, no longer `gc dolt health`) between the backoff and
+# the retry, bounded, and the retry happens anyway when the budget is spent. Every scenario below
+# runs the REAL extracted loop + the REAL extracted wait functions in a child bash with mocked
+# gc / dolt / date / timeout / sleep / warn; counts go through files (the real code calls them
+# inside $(...), a subshell — the same lesson as CALL_LOG above).
 echo "── 4c. spawn retry waits for Dolt readiness (ga-9e446u) ──"
 WAIT_BLOCK="$(sed -n '/# SELFTEST-EXTRACT gate-spawn-dolt-wait: BEGIN/,/# SELFTEST-EXTRACT gate-spawn-dolt-wait: END/p' "$DISPATCHER")"
 if [ -z "$WAIT_BLOCK" ]; then
@@ -645,50 +646,84 @@ export -f gc_json_or_unknown
 
 WAIT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/gate-spawn-dolt-wait-selftest.XXXXXX")"
 trap 'rm -rf "$WAIT_TMP"' EXIT
-# The child's mocks. PROBE_SEQ is a space-separated list of what the Nth `gc dolt health` answers
-# (the last word repeats): ok = reachable, latency 120ms | hot = reachable, latency 9000ms | edge =
-# reachable, latency $EDGE_MS | down = the REAL down payload (exit 0, running:false reachable:false
-# latency_ms:0) | hung = TCP up but SQL wedged (running:true reachable:false latency_ms:0) | nofield =
-# a payload with no `reachable` key at all | junk = exit 0 with non-JSON | refused = the command itself
-# exits 1. SPAWN_OK_AT = the Nth `gc session new` that succeeds (unset =
+# The pack's runtime state file (.gc/runtime/packs/dolt/dolt-state.json), as the verdict reads it.
+printf '{"running":true,"pid":1,"port":52756,"data_dir":"/x","started_at":"2026-10-08T02:44:43Z"}' > "$WAIT_TMP/state.ok.json"
+printf '{"running":false,"pid":0,"port":52756}' > "$WAIT_TMP/state.stopped.json"
+printf '{"pid":1,"port":52756}' > "$WAIT_TMP/state.norunning.json"
+printf '{"running":true,"pid":1}' > "$WAIT_TMP/state.noport.json"
+printf '{"running":true,"pid":1,"port":"52756; touch /tmp/pwned"}' > "$WAIT_TMP/state.hostileport.json"
+printf 'not json at all' > "$WAIT_TMP/state.junk.json"
+# The child's mocks. PROBE_SEQ is a space-separated list of what the Nth direct `dolt ... sql -q
+# 'SELECT 1'` probe does (the last word repeats): ok = answers, takes 120ms | hot = answers, takes
+# 9000ms | edge = answers, takes $EDGE_MS | down = connection refused, exit 1 (the server is gone; the
+# state file still says running:true — the realistic crash shape) | hung = TCP up but SQL wedged: the
+# probe runs into `timeout 5` and exits 124 | nofield = exit 0 but prints no `1` row | junk = exit 0
+# with a non-table | refused = the probe command itself cannot run (exit 127). Time is VIRTUAL: the
+# `dolt` mock advances a ms clock file and `date +%s%N` reads it, so latency is exact and nothing
+# really waits. `gc dolt health` is mocked as the loaded-Dolt reality (it hangs to the 15s timeout,
+# exit 124) and every call is COUNTED in $W/healths — the new verdict must never make one. A
+# `gc dolt sql` mock answers a perfect `| 1 |` table with exit 0 even for a dead Dolt (the real
+# embedded fallback, packs/dolt/commands/sql/run.sh) and counts in $W/gcsql — the verdict must never
+# ask it either. SPAWN_OK_AT = the Nth `gc session new` that succeeds (unset =
 # never). SLEEP_ADVANCE = make each mocked sleep advance $SECONDS by N x its argument, to model
-# real time passing (a stalled probe) without really sleeping.
+# real time passing (a stalled probe) without really sleeping. STATE_FILE = which pack state
+# file the verdict reads (default: running:true, port 52756). NOCLOCK=1 = no ms clock anywhere.
 cat > "$WAIT_TMP/prelude.sh" <<'PRELUDE'
 W="${SC_WORK:?}"
-PROBES="$W/probes"; SPAWNS="$W/spawns"; SLEEPS="$W/sleeps"; WARNS="$W/warns"
-: > "$PROBES"; : > "$SPAWNS"; : > "$SLEEPS"; : > "$WARNS"
+PROBES="$W/probes"; SPAWNS="$W/spawns"; SLEEPS="$W/sleeps"; WARNS="$W/warns"; HEALTHS="$W/healths"; GCSQL="$W/gcsql"
+: > "$PROBES"; : > "$SPAWNS"; : > "$SLEEPS"; : > "$WARNS"; : > "$HEALTHS"; : > "$GCSQL"
+echo 1700000000000 > "$W/clock"
+GATE_DOLT_STATE_FILE="${STATE_FILE:-$W/state.ok.json}"
+_tick() { echo $(( $(cat "$W/clock") + $1 )) > "$W/clock"; }
+date() {
+  case "$*" in
+    *%s%N*) if [ -n "${NOCLOCK:-}" ]; then printf '%sN' "$(cat "$W/clock" | cut -c1-10)"; else printf '%s000000' "$(cat "$W/clock")"; fi ;;
+    *) command date "$@" ;;
+  esac
+}
+gdate() { return 1; }
+perl() { [ -z "${NOCLOCK:-}" ] || return 1; printf '%s' "$(cat "$W/clock")"; }
 _nth() { local _s="$1" _n="$2" _w; set -- $_s; if [ "$_n" -le "$#" ]; then eval "_w=\${$_n}"; else eval "_w=\${$#}"; fi; printf '%s' "$_w"; }
-T0=$SECONDS
 # DOWN_FOR=N (with SLEEP_ADVANCE=1) models a Dolt outage on a VIRTUAL clock: Dolt is down until N
-# mocked-sleep seconds have passed, and BOTH the health probe and `session new` follow it — so a
-# retry that lands too early really fails, and only waiting out the outage recovers.
-_dolt_up() { [ -n "${DOWN_FOR:-}" ] && [ $((SECONDS - T0)) -ge "$DOWN_FOR" ]; }
+# mocked-sleep seconds have passed, and BOTH the readiness probe and `session new` follow it — so a
+# retry that lands too early really fails, and only waiting out the outage recovers. The virtual
+# time is the SUM OF THE MOCKED SLEEPS (x SLEEP_ADVANCE), never $SECONDS: $SECONDS also counts the
+# REAL time the probe's forks take (~1s a round at load 60), which moved the recovery a poll early.
+_dolt_up() {
+  [ -n "${DOWN_FOR:-}" ] || return 1
+  [ $(( $(awk '{ s += $1 } END { printf "%d", s }' "$SLEEPS") * ${SLEEP_ADVANCE:-1} )) -ge "$DOWN_FOR" ]
+}
+# The probe the verdict runs: `timeout 5 dolt --host 127.0.0.1 --port N --user root --no-tls sql -q 'SELECT 1'`
+# (`timeout` is mocked below to just run its command). One `dolt` call = one readiness probe.
+dolt() {
+  echo p >> "$PROBES"
+  _pn=$(wc -l < "$PROBES" | tr -d '[:space:]')
+  if [ -n "${DOWN_FOR:-}" ]; then
+    if _dolt_up; then _pw=ok; else _pw=down; fi
+  else
+    _pw="$(_nth "$PROBE_SEQ" "$_pn")"
+  fi
+  case "$_pw" in
+    ok)      _tick 120; printf '+---+\n| 1 |\n+---+\n| 1 |\n+---+\n' ;;
+    hot)     _tick 9000; printf '+---+\n| 1 |\n+---+\n| 1 |\n+---+\n' ;;
+    edge)    _tick "${EDGE_MS:-2500}"; printf '+---+\n| 1 |\n+---+\n| 1 |\n+---+\n' ;;
+    down)    _tick 50; echo "dial tcp 127.0.0.1:52756: connect: connection refused" >&2; return 1 ;;
+    hung)    _tick 5000; return 124 ;;
+    nofield) printf 'Query OK, 0 rows affected\n' ;;
+    junk)    printf 'not a table at all' ;;
+    *)       return 127 ;;   # refused = the probe command itself cannot run
+  esac
+}
 gc() {
   case "$*" in
     *"dolt health"*)
-      echo p >> "$PROBES"
-      _pn=$(wc -l < "$PROBES" | tr -d '[:space:]')
-      if [ -n "${DOWN_FOR:-}" ]; then
-        if _dolt_up; then _pw=ok; else _pw=down; fi
-      else
-        _pw="$(_nth "$PROBE_SEQ" "$_pn")"
-      fi
-      # Every shape below is what `gc dolt health --json` REALLY prints (packs/dolt/commands/health/run.sh:
-      # server_latency starts at 0 and server_reachable at false, both overwritten only after the bounded
-      # SELECT 1 succeeds; JSON mode exits 0 unconditionally, L663-664). So a DOWN Dolt is exit 0 +
-      # reachable:false + latency_ms:0 — NOT a failing command (ga-9e446u gate round 1: the first mock
-      # modelled "down" as exit 1 + "connection refused", a shape --json never emits, and 87 checks
-      # passed against code that read a down Dolt as "ready").
-      case "$_pw" in
-        ok)      printf '{"server":{"running":true,"reachable":true,"pid":1,"port":52756,"latency_ms":120}}' ;;
-        hot)     printf '{"server":{"running":true,"reachable":true,"pid":1,"port":52756,"latency_ms":9000}}' ;;
-        edge)    printf '{"server":{"running":true,"reachable":true,"pid":1,"port":52756,"latency_ms":%s}}' "${EDGE_MS:-2500}" ;;
-        down)    printf '{"server":{"running":false,"reachable":false,"pid":0,"port":52756,"latency_ms":0}}' ;;
-        hung)    printf '{"server":{"running":true,"reachable":false,"pid":1,"port":52756,"latency_ms":0}}' ;;
-        nofield) printf '{"server":{"running":true,"pid":1,"port":52756,"latency_ms":120}}' ;;
-        junk)    printf 'not json at all' ;;
-        *)       echo "dial tcp 127.0.0.1:52756: connect: connection refused" >&2; return 1 ;;   # refused = the COMMAND itself fails
-      esac ;;
+      # what `gc dolt health --json` REALLY does on a loaded-but-healthy Dolt (ga-gs3bj3, load 60): it scans
+      # every database after its SELECT 1 and runs past the old 15s timeout. The verdict must not wait for it.
+      echo h >> "$HEALTHS"; _tick 15000; return 124 ;;
+    *"dolt sql"*)
+      # the EMBEDDED fallback: with no server reachable `gc dolt sql` opens the data dir itself and prints this
+      # same table with exit 0 — so it can never be the source of a "ready".
+      echo q >> "$GCSQL"; printf '+---+\n| 1 |\n+---+\n| 1 |\n+---+\n'; return 0 ;;
     *"session new"*)
       echo s >> "$SPAWNS"
       _sn=$(wc -l < "$SPAWNS" | tr -d '[:space:]')
@@ -726,25 +761,53 @@ run_wait() {
   { cat "$WAIT_TMP/prelude.sh"; printf '%s\n' "$WAIT_BLOCK"; printf '%s\n' "$RETRY_BLOCK"; cat "$WAIT_TMP/tail.sh"; } > "$WAIT_TMP/child.sh"
   env SC_WORK="$WAIT_TMP" PROBE_SEQ="$_seq" "$@" bash "$WAIT_TMP/child.sh" 2>/dev/null || true   # a killed (runaway) child = empty summary = a failed check, not a dead selftest
 }
-# run_verdict <probe_word> → what the REAL gate_dolt_ready_verdict prints for ONE `gc dolt health`
-# answer of that shape. The pointed check: when this fails the defect is in the verdict, not in the loop.
+# run_verdict <probe_word> [VAR=value ...] → what the REAL gate_dolt_ready_verdict prints for ONE direct
+# SELECT 1 probe of that shape. The pointed check: when this fails the defect is in the verdict, not in the loop.
 run_verdict() {
   { cat "$WAIT_TMP/prelude.sh"; printf '%s\n' "$WAIT_BLOCK"; printf '%s\n' 'gate_dolt_ready_verdict'; } > "$WAIT_TMP/verdict.sh"
   env SC_WORK="$WAIT_TMP" PROBE_SEQ="$1" "${@:2}" bash "$WAIT_TMP/verdict.sh" 2>/dev/null || true
 }
 
-# (v) THE VERDICT, shape by shape. The variable the verdict DECIDES on must be the variable that says Dolt
-# ANSWERED (server.reachable), not only the number that is 0 when it did not (latency_ms). ga-9e446u gate
-# round 1: a down Dolt printed "ready" here, so the whole wait was a no-op in the outage it exists for.
-eq "(v1) reachable, 120ms → ready" "$(run_verdict ok)" "ready"
-eq "(v2) reachable, 9000ms → hot" "$(run_verdict hot)" "hot"
-eq "(v3) the REAL down payload (running:false reachable:false latency_ms:0) → down, NOT ready" "$(run_verdict down)" "down"
-eq "(v4) TCP up but SQL wedged (running:true reachable:false latency_ms:0) → down, NOT ready" "$(run_verdict hung)" "down"
-eq "(v5) a payload with no reachable key can't say Dolt answered → unreadable, NOT ready" "$(run_verdict nofield)" "unreadable"
-eq "(v6) non-JSON → unreadable" "$(run_verdict junk)" "unreadable"
-eq "(v7) the command itself fails (exit 1) → unreadable" "$(run_verdict refused)" "unreadable"
-eq "(v8) reachable, exactly the ceiling → ready" "$(run_verdict edge EDGE_MS=2500)" "ready"
-eq "(v9) reachable, one over the ceiling → hot" "$(run_verdict edge EDGE_MS=2501)" "hot"
+# (v) THE VERDICT, shape by shape. The variable the verdict DECIDES on must say Dolt ANSWERED `SELECT 1`
+# (exit 0 AND the `1` row), not a number that is 0 when it did not. ga-9e446u gate round 1: a down Dolt
+# printed "ready" here, so the whole wait was a no-op in the outage it exists for.
+eq "(v1) the probe answers in 120ms → ready" "$(run_verdict ok)" "ready"
+eq "(v2) the probe answers in 9000ms → hot" "$(run_verdict hot)" "hot"
+eq "(v3) the server is gone (probe refused, exit 1; state file still running:true) → down, NOT ready" "$(run_verdict down)" "down"
+eq "(v4) TCP up but SQL wedged (the probe runs into timeout 5, exit 124) → down, NOT ready" "$(run_verdict hung)" "down"
+eq "(v5) exit 0 but no \`1\` row can't say Dolt answered → unreadable, NOT ready" "$(run_verdict nofield)" "unreadable"
+eq "(v6) exit 0 with a non-table → unreadable" "$(run_verdict junk)" "unreadable"
+eq "(v7) the probe command itself cannot run (exit 127) → unreadable" "$(run_verdict refused)" "unreadable"
+eq "(v8) answers, exactly the ceiling → ready" "$(run_verdict edge EDGE_MS=2500)" "ready"
+eq "(v9) answers, one over the ceiling → hot" "$(run_verdict edge EDGE_MS=2501)" "hot"
+
+# (v10-v14) the pack's state file is the only place the port comes from. tem / não-tem / não-consegui-saber:
+# running:false is a clear NO (down, and no probe is made); a missing/garbled/portless file is "can't say".
+eq "(v10) state says running:false → down, without probing" "$(run_verdict ok STATE_FILE="$WAIT_TMP/state.stopped.json")" "down"
+eq "(v10b) ... and the probe was NOT made (it would have said ready)" "$(wc -l < "$WAIT_TMP/probes" | tr -d '[:space:]')" "0"
+eq "(v11) no state file at all → unreadable, NOT ready" "$(run_verdict ok STATE_FILE="$WAIT_TMP/nope.json")" "unreadable"
+eq "(v12) garbled state file → unreadable" "$(run_verdict ok STATE_FILE="$WAIT_TMP/state.junk.json")" "unreadable"
+eq "(v12b) state without a boolean .running → unreadable" "$(run_verdict ok STATE_FILE="$WAIT_TMP/state.norunning.json")" "unreadable"
+eq "(v13) state without a port → unreadable (the probe is not guessed at some default port)" "$(run_verdict ok STATE_FILE="$WAIT_TMP/state.noport.json")" "unreadable"
+eq "(v14) a non-numeric port never reaches the dolt command line → unreadable" "$(run_verdict ok STATE_FILE="$WAIT_TMP/state.hostileport.json")" "unreadable"
+eq "(v14b) ... and no probe ran for it" "$(wc -l < "$WAIT_TMP/probes" | tr -d '[:space:]')" "0"
+
+# (v15) ga-gs3bj3 ACCEPTANCE (a): a HEALTHY but LOADED Dolt. `gc dolt health --json` runs past its 15s timeout
+# (measured 13-40s at load 60) while the SELECT 1 answers at once. On the pre-ga-gs3bj3 verdict this is
+# "unreadable" (it waited on health), so this check FAILS there — the pointed regression test for the bead.
+eq "(v15) Dolt healthy+loaded: \`gc dolt health\` would hang, the SELECT 1 answers in 120ms → ready" "$(run_verdict ok)" "ready"
+eq "(v15b) ... and the verdict never asked \`gc dolt health\`" "$(wc -l < "$WAIT_TMP/healths" | tr -d '[:space:]')" "0"
+
+# (v16) THE TRAP the obvious swap falls into: `gc dolt sql -q 'SELECT 1'` with no server reachable opens the
+# data dir EMBEDDED and prints the same table with exit 0. With the mock answering exactly that, a verdict
+# built on it would say "ready" for a dead Dolt. Ours probes the server directly: refused → down.
+eq "(v16) dead Dolt while \`gc dolt sql\` would answer from the embedded fallback → down, NOT ready" "$(run_verdict down)" "down"
+eq "(v16b) ... and \`gc dolt sql\` was never asked" "$(wc -l < "$WAIT_TMP/gcsql" | tr -d '[:space:]')" "0"
+
+# (v17-v18) the latency is only a measurement if the clock is: no ms clock → can't say; a clock that stepped
+# back mid-probe (negative latency) → can't say. Neither may read as "ready" (nor as a fast 0ms).
+eq "(v17) no ms clock anywhere (date prints a literal N, no gdate, no perl) → unreadable, NOT ready" "$(run_verdict ok NOCLOCK=1)" "unreadable"
+eq "(v18) the clock stepped back during the probe (-5ms) → unreadable, NOT a 0ms ready" "$(run_verdict edge EDGE_MS=-5)" "unreadable"
 
 # (g) THE FIX: Dolt is down for the first two probes, then answers. The retry must WAIT (two 10s
 # polls after the 3s backoff) and then spawn once, successfully — on HEAD~ the loop retried straight
@@ -781,7 +844,7 @@ OUT=$(run_wait "" DOWN_FOR=100 SLEEP_ADVANCE=1 KNOB_WAIT=0)
 eq "(g3d) the same 100s outage, wait OFF: the old ladder never recovers" "$OUT" "SESSION_ID= SPAWNS=3 PROBES=0 SLEEPS=3,6,12"
 
 # (h) Dolt answering but SLOW (latency over the hot ceiling) is not ready either; unreadable is not
-# ready (a `gc dolt health` that cannot answer right after a connection error IS the outage).
+# ready (a probe that cannot answer right after a connection error IS the outage).
 OUT=$(run_wait "hot hot ok" SPAWN_OK_AT=1)
 eq "(h) latency 9000ms is not ready: waits until it drops to 120ms" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
 OUT=$(run_wait "junk junk ok" SPAWN_OK_AT=1)
@@ -794,11 +857,11 @@ case "$OUT" in
   *) bad "(h4) expected 2 probes (hot, then give up and retry), got: $OUT" ;;
 esac
 OUT=$(run_wait "hung hung ok" SPAWN_OK_AT=1)
-eq "(h5) TCP up but SQL wedged (reachable:false, latency 0) is not ready: waits until it answers" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
+eq "(h5) TCP up but SQL wedged (the probe times out, exit 124) is not ready: waits until it answers" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
 OUT=$(run_wait "refused refused ok" SPAWN_OK_AT=1)
-eq "(h6) a \`gc dolt health\` that exits 1 is not ready either (the command-fails shape)" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
+eq "(h6) a probe command that cannot run (exit 127) is not ready either (the command-fails shape)" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
 OUT=$(run_wait "nofield nofield ok" SPAWN_OK_AT=1)
-eq "(h7) a payload without server.reachable is not ready even with latency 120: waits" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
+eq "(h7) an exit-0 probe that printed no \`1\` row is not ready: waits" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
 # (h8) the wait's LOG must say Dolt was DOWN. Round 1 left no line at all when the wait was skipped, so the
 # log read "Dolt was fine, the spawn failed anyway" — the opposite of what happened.
 run_wait "down down ok" SPAWN_OK_AT=1 >/dev/null
@@ -832,7 +895,7 @@ case "$OUT" in
   *) bad "(k) expected SPAWNS=3 PROBES=6 under a clock that outruns the poll count, got: $OUT" ;;
 esac
 
-# (l) KILL SWITCH: GATE_SPAWN_DOLT_WAIT_SECS=0 → `gc dolt health` is never asked; the exact old loop.
+# (l) KILL SWITCH: GATE_SPAWN_DOLT_WAIT_SECS=0 → Dolt is never asked; the exact old loop.
 OUT=$(run_wait "ok" KNOB_WAIT=0)
 eq "(l) GATE_SPAWN_DOLT_WAIT_SECS=0: zero probes, backoff ladder only (exact pre-ga-9e446u behaviour)" \
   "$OUT" "SESSION_ID= SPAWNS=3 PROBES=0 SLEEPS=3,6,12"
@@ -868,6 +931,24 @@ grep -qF '_spawn_backoff_secs=$((GATE_SPAWN_RETRY_BACKOFF_SECS * (1 << (_spawn_r
   || bad "ga-3jn3a: doubling backoff formula not found — did the retry loop get refactored?"
 has "$DISPATCHER" '# SELFTEST-EXTRACT spawn-retry-loop: BEGIN' "spawn-retry-loop extraction sentinel present"
 has "$DISPATCHER" '# SELFTEST-EXTRACT gate-spawn-dolt-wait: BEGIN' "gate-spawn-dolt-wait extraction sentinel present (ga-9e446u)"
+# ga-gs3bj3 drift-guards on the verdict's SOURCE of truth. Comments are stripped first: the block explains
+# WHY it is not `gc dolt health` / `gc dolt sql`, and that prose must not trip the guard.
+WAIT_CODE="$(printf '%s\n' "$WAIT_BLOCK" | grep -v '^[[:space:]]*#' | sed 's/[[:space:]]#.*$//')"
+# grep -c, not grep -q: this file runs under pipefail, and a -q that exits on its first match SIGPIPEs the
+# printf — the pipeline then reads as "no match" and a guard that should FAIL passes (seen on the first run).
+HITS_BAD=$(printf '%s\n' "$WAIT_CODE" | grep -Ec 'gc[[:space:]]+dolt[[:space:]]+(health|sql)') || HITS_BAD=0
+if [ "$HITS_BAD" -gt 0 ]; then
+  bad "ga-gs3bj3: the readiness verdict calls \`gc dolt health\` or \`gc dolt sql\` again (health is 13-40s under load; sql falls back to EMBEDDED mode and reads a dead Dolt as ready)"
+else
+  ok "ga-gs3bj3: the readiness verdict calls neither \`gc dolt health\` nor \`gc dolt sql\`"
+fi
+HITS_GOOD=$(printf '%s\n' "$WAIT_CODE" | grep -Ec 'timeout 5 dolt --host 127\.0\.0\.1 --port "\$_port" .*--no-tls sql -q .SELECT 1.') || HITS_GOOD=0
+if [ "$HITS_GOOD" -ge 1 ]; then
+  ok "ga-gs3bj3: the verdict probes the server directly (bounded 5s, explicit host/port, --no-tls — never the embedded path)"
+else
+  bad "ga-gs3bj3: the direct 'timeout 5 dolt --host 127.0.0.1 --port \$_port ... --no-tls sql -q SELECT 1' probe is gone from the verdict"
+fi
+has "$DISPATCHER" 'dolt-state\.json' "ga-gs3bj3: the port is read from the pack's runtime state file, not from an env var or a doc"
 # the real call site: the wait sits INSIDE the retry loop block, between the backoff sleep and the re-spawn
 if printf '%s\n' "$RETRY_BLOCK" | awk '/sleep "\$_spawn_backoff_secs"/{s=1} s&&/gate_spawn_wait_dolt_ready "\$i"/{w=1} w&&/session new gate-reviewer/{ok=1} END{exit !ok}'; then
   ok "ga-9e446u: the retry loop calls gate_spawn_wait_dolt_ready after the backoff sleep and before re-spawning"
@@ -918,7 +999,7 @@ eq "standalone dispatching-removal inside the ga-mzc3h abort block correctly rem
   "$DISPATCHING_REMOVE_IN_ABORT_BLOCK" "0"
 
 CUTOFF_LN=$(grep -n 'if \[ -n "\${GATE_DISPATCHER_LIB_ONLY:-}" \]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
-for fn in is_transient_spawn_error read_spawn_fail_count gate_spawn_failure_requeue_or_error gate_dolt_ready_verdict gate_spawn_wait_dolt_ready; do
+for fn in is_transient_spawn_error read_spawn_fail_count gate_spawn_failure_requeue_or_error gate_now_ms gate_dolt_ready_verdict gate_spawn_wait_dolt_ready; do
   DEF_LN=$(grep -n "^${fn}() {" "$DISPATCHER" | head -1 | cut -d: -f1)
   if [ -n "$DEF_LN" ] && [ -n "$CUTOFF_LN" ] && [ "$DEF_LN" -lt "$CUTOFF_LN" ]; then
     ok "$fn (line $DEF_LN) defined before the lib-only cutoff (line $CUTOFF_LN)"

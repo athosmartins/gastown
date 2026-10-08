@@ -4472,13 +4472,13 @@ GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS="${GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS:-3}" # cr
 # fixed backoff to "3x 20s" would still sit inside the window; asking Dolt whether it is back
 # is the signal the retry actually needs.
 #   GATE_SPAWN_DOLT_WAIT_SECS   per-retry budget of the wait (default 60; 0 = off, the exact
-#                               pre-ga-9e446u loop: backoff only, `gc dolt health` never asked)
+#                               pre-ga-9e446u loop: backoff only, Dolt never asked)
 #   GATE_SPAWN_DOLT_POLL_SECS   pause between two readiness probes (default 10)
 # BOUNDED twice over: by a poll count (budget / poll interval) AND by the wall clock ($SECONDS),
-# so a probe that stalls to its 15s timeout eats into the budget instead of stretching it. When
+# so a probe that stalls to its 5s timeout eats into the budget instead of stretching it. When
 # the budget runs out the retry happens ANYWAY — the wait only ever delays an attempt, it never
 # replaces one or adds one. Worst case on top of the existing loop: GATE_SPAWN_RETRY_MAX x
-# (budget + one sleep + one probe timeout) = ~3 x 85s, far inside GATE_LOCK_MAX_AGE (1800s) —
+# (budget + one sleep + one probe timeout) = ~3 x 75s, far inside GATE_LOCK_MAX_AGE (1800s) —
 # and every poll logs a line, which re-stamps the sweep heartbeat.
 GATE_SPAWN_DOLT_WAIT_SECS="${GATE_SPAWN_DOLT_WAIT_SECS:-60}"
 GATE_SPAWN_DOLT_POLL_SECS="${GATE_SPAWN_DOLT_POLL_SECS:-10}"
@@ -4486,40 +4486,82 @@ case "$GATE_SPAWN_DOLT_WAIT_SECS" in ''|*[!0-9]*) GATE_SPAWN_DOLT_WAIT_SECS=60 ;
 case "$GATE_SPAWN_DOLT_POLL_SECS" in ''|*[!0-9]*) GATE_SPAWN_DOLT_POLL_SECS=10 ;; esac
 [ "$GATE_SPAWN_DOLT_POLL_SECS" -ge 1 ] || GATE_SPAWN_DOLT_POLL_SECS=1   # 0 would divide by zero in the poll-count bound
 # SELFTEST-EXTRACT gate-spawn-dolt-wait: BEGIN
+# gate_now_ms → the wall clock in ms, or "" when no ms clock answered. BSD date(1) may print a literal
+# 'N' for %N (exit 0, e.g. "1776740122N"), so the output is feature-tested, not trusted; then gdate, then
+# perl (always on macOS). Never falls back to whole seconds: a latency of 0/1000/2000 would pass for a
+# measurement. Same chain, same reason as packs/dolt/commands/health/run.sh now_ms().
+gate_now_ms() {
+  local _r=""
+  _r=$(date +%s%N 2>/dev/null) || _r=""
+  case "$_r" in ''|*[!0-9]*) ;; *) printf '%s' "$_r" | cut -c1-13; return 0 ;; esac
+  _r=$(gdate +%s%N 2>/dev/null) || _r=""
+  case "$_r" in ''|*[!0-9]*) ;; *) printf '%s' "$_r" | cut -c1-13; return 0 ;; esac
+  _r=$(perl -MTime::HiRes=time -e 'printf "%d", time() * 1000' 2>/dev/null) || _r=""
+  case "$_r" in ''|*[!0-9]*) ;; *) printf '%s' "$_r"; return 0 ;; esac
+  printf ''
+  return 0
+}
 # gate_dolt_ready_verdict → "ready" | "hot" | "down" | "unreadable". Only "ready" ends the wait.
-#   ready      `gc dolt health --json` says server.reachable == true (its bounded SELECT 1 got an answer)
-#              AND a numeric server.latency_ms at or under GATE_DOLT_LATENCY_HOT_MS (the same ceiling the
-#              headroom gate uses)
-#   hot        reachable, but slower than that ceiling
-#   down       server.reachable == false: the server is gone, or TCP is up and SQL is wedged (the very
-#              "invalid connection" window this wait exists for)
-#   unreadable the command failed / printed junk / the payload has no boolean server.reachable — we cannot
-#              say Dolt answered
-# WHY reachable and not latency alone: in JSON mode `gc dolt health` ALWAYS exits 0 and starts
-# server_latency at 0, overwriting it only after the SELECT 1 succeeds (packs/dolt/commands/health/
-# run.sh L115-116, L161-165, L663-664) — so a dead or wedged Dolt prints latency_ms:0, which is <= the
-# ceiling. A verdict that decides on latency_ms alone reads the outage as "ready" (ga-9e446u gate round 1).
+#   ready      a direct `dolt sql -q 'SELECT 1'` against the managed server's port printed its `1` row, in at
+#              most GATE_DOLT_LATENCY_HOT_MS (the same ceiling the headroom gate uses)
+#   hot        it answered, but slower than that ceiling
+#   down       the pack's state file says running:false, OR the probe got no answer: connection refused (the
+#              server is gone) or no answer within 5s (TCP up and SQL wedged — the very "invalid connection"
+#              window this wait exists for; `timeout` exits 124)
+#   unreadable we cannot say: no/garbled state file or port, the dolt client itself cannot run (126/127), the
+#              probe exited 0 but did not print the `1` row, or no ms clock — never "ready"
+# WHY this and not `gc dolt health --json` (ga-gs3bj3, measured 07/10 at load 60): health scans every
+# database after its SELECT 1 and took 13s to over 40s against a HEALTHY Dolt, so the old 15s timeout read the recovery
+# as "unreadable" and spent the whole wait budget. WHY NOT `gc dolt sql -q 'SELECT 1'` either, though it is
+# the obvious swap: (1) with no server reachable it silently falls back to EMBEDDED mode over the data dir and
+# prints the same `| 1 |` table with exit 0 (packs/dolt/commands/sql/run.sh) — a DEAD Dolt would read "ready",
+# the very mistake ga-9e446u gate round 1 failed on; (2) the gc wrapper alone cost 7-8s at load 60 vs 0.5-1.8s
+# for the client, so a 5s timeout read a healthy loaded Dolt as down and the latency compared to the ceiling
+# was gc's startup, not Dolt's. So the probe is the same call health makes internally (run.sh L150-165): the
+# dolt client, --host/--port/--no-tls, bounded to 5s — never the embedded path. The port comes from the pack's
+# own runtime state (.gc/runtime/packs/dolt/dolt-state.json: running + pid + port, stamped with started_at when
+# the server starts), not from an env var or a doc. A stale file is safe: a dead port is refused → down. Managed local server only
+# (127.0.0.1), as the city runs it; GATE_DOLT_STATE_FILE overrides the path (selftest).
 # Called in $(...): prints the verdict only, never logs. Unlike the headroom probe, an unanswered probe is
 # NOT "no signal, proceed" here: this runs only right after a spawn failed on a Dolt connection error,
-# where a `gc dolt health` that cannot answer is the same outage, and the wait it buys is capped (see
-# above). `gc dolt health` takes the city via the GC_CITY env var, not --city.
+# where a probe that cannot get an answer is the same outage, and the wait it buys is capped (see above).
 gate_dolt_ready_verdict() {
-  local _h="" _reach="" _lat=""
-  # vazio → _h="" and the case below says unreadable; falhou/ilegível (timeout, exit!=0, ok:false envelope,
-  # junk) → the same _h="" → unreadable. Neither can ever read as "ready".
-  _h=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc dolt health --json) || _h=""
-  # vazio (no boolean .server.reachable) → _reach="" → unreadable; falhou/ilegível (jq error) → _reach=""
-  # → unreadable. NOT `.server.reachable // empty`: jq's // treats `false` as missing, which would turn the
-  # down case into the unreadable case and lose the distinction the log line below depends on.
-  _reach=$(printf '%s' "$_h" | jq -r 'if (.server.reachable | type) == "boolean" then (.server.reachable | tostring) else empty end' 2>/dev/null) || _reach=""
-  case "$_reach" in
+  local _state="${GATE_DOLT_STATE_FILE:-${GC_CITY:-}/.gc/runtime/packs/dolt/dolt-state.json}"
+  local _running="" _port="" _t0="" _t1="" _out="" _rc=0 _lat="" _hits=0
+  # vazio (no boolean .running) → unreadable; falhou/ilegível (file missing, jq error) → the same "" →
+  # unreadable. NOT `.running // empty`: jq's // treats `false` as missing, which would turn the stopped
+  # case into the unreadable case and lose the distinction the log line depends on.
+  _running=$(jq -r 'if (.running | type) == "boolean" then (.running | tostring) else empty end' "$_state" 2>/dev/null) || _running=""
+  case "$_running" in
     true) ;;
     false) printf 'down'; return 0 ;;
     *) printf 'unreadable'; return 0 ;;
   esac
-  # vazio (reachable but no latency) → _lat="" → unreadable; falhou/ilegível → _lat="" → unreadable.
-  _lat=$(printf '%s' "$_h" | jq -r '.server.latency_ms // empty' 2>/dev/null) || _lat=""
-  case "$_lat" in ''|*[!0-9]*) printf 'unreadable'; return 0 ;; esac
+  # vazio / non-numeric port → unreadable; falhou/ilegível → the same "" → unreadable.
+  _port=$(jq -r '.port // empty' "$_state" 2>/dev/null) || _port=""
+  case "$_port" in ''|*[!0-9]*) printf 'unreadable'; return 0 ;; esac
+  _t0=$(gate_now_ms)
+  # DOLT_CLI_PASSWORD exported even when empty: without it `dolt --user` prompts on stdin and fails with
+  # "inappropriate ioctl for device" in a session with no tty (the same reason health/run.sh exports it).
+  _out=$(DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" timeout 5 dolt --host 127.0.0.1 --port "$_port" --user "${GC_DOLT_USER:-root}" --no-tls sql -q 'SELECT 1' 2>/dev/null) || _rc=$?
+  _t1=$(gate_now_ms)
+  # 126/127 = the client could not even run (not found / not executable): that says nothing about Dolt.
+  # Any other non-zero (1 = refused/auth/SQL error, 124 = timed out) is "no answer" = down, same as health's
+  # reachable:false for a failed bounded SELECT 1.
+  case "$_rc" in
+    0) ;;
+    126|127) printf 'unreadable'; return 0 ;;
+    *) printf 'down'; return 0 ;;
+  esac
+  # exit 0 but no `| 1 |` row (empty, junk, a different table) → we cannot say Dolt answered SELECT 1.
+  # grep -c (reads all input), not grep -q: under this file's pipefail a -q that exits on the first match can
+  # SIGPIPE the printf and turn "found" into a failed pipeline.
+  _hits=$(printf '%s\n' "$_out" | grep -Ec '^\|[[:space:]]*1[[:space:]]*\|[[:space:]]*$') || _hits=0
+  [ "$_hits" -ge 1 ] 2>/dev/null || { printf 'unreadable'; return 0; }
+  case "$_t0" in ''|*[!0-9]*) printf 'unreadable'; return 0 ;; esac
+  case "$_t1" in ''|*[!0-9]*) printf 'unreadable'; return 0 ;; esac
+  _lat=$((_t1 - _t0))
+  [ "$_lat" -ge 0 ] || { printf 'unreadable'; return 0; }   # clock stepped back mid-probe: not a measurement
   if [ "$_lat" -le "${GATE_DOLT_LATENCY_HOT_MS:-2500}" ]; then printf 'ready'; else printf 'hot'; fi
   return 0
 }
