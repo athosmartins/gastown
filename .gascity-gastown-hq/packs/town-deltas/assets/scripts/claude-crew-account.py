@@ -449,6 +449,8 @@ def proc_start(pid: int) -> Optional[str]:
 def alive(pid: int, start: Optional[str] = None) -> bool:
     """Is `pid` still THE session that was recorded? A bare kill(pid, 0) says yes to a pid the OS has since handed to a
     stranger; the start time recorded in the session file tells them apart."""
+    if pid <= 0:
+        return False                                       # kill(0, 0) / kill(-1, 0) signal a whole group and "succeed": not a process
     if start:
         ps = proc_start(pid)
         if ps is not None:

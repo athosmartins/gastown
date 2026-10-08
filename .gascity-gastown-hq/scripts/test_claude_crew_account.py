@@ -1014,6 +1014,13 @@ def test_a_ps_that_complains_is_could_not_ask_not_no_such_process(w):
     assert crew.proc_start(os.getpid()) == ""                     # a plain rc=1 with nothing on stderr IS "no such process"
 
 
+def test_a_pid_that_is_not_a_process_is_never_alive(w):
+    for pid in (0, -1):                                           # kill(0, 0) / kill(-1, 0) signal a whole group and "succeed"
+        assert crew.alive(pid) is False and crew.alive(pid, "Mon Jan  1 00:00:00 2001") is False
+    (w.d / "sessions" / "0.json").write_text(json.dumps({"pid": 0, "bridgeSessionId": "cse_zero"}))
+    assert crew.bridges() == {}                                   # a bogus session file is not a live bridge
+
+
 # ── only the OAuth part of a blob moves ────────────────────────────────────────────────────────────────────────────
 def test_only_the_oauth_part_moves_never_the_rest_of_the_blob(w):
     cur = blob("crypto", rt="crypto-rotated")
