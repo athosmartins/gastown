@@ -145,7 +145,7 @@ def _audit(event, args):
         paths = (args[0],)
     elif event == "os.rename":
         paths = args[:2]
-    elif event in ("os.remove", "os.truncate"):
+    elif event in ("os.remove", "os.truncate", "os.utime"):          # utime: the old mtime guard saw a test faking a tick, so this one must
         paths = args[:1]
     else:
         return
@@ -160,8 +160,11 @@ sys.addaudithook(_audit)                              # a hook cannot be removed
 @contextlib.contextmanager
 def _watching(paths):
     """Yield the list that collects every write this process makes to `paths` while the block runs."""
+    canon = [_canon(p) for p in paths]
+    if not canon or not all(canon):
+        raise ValueError(f"cannot watch {list(paths)!r}: a path that cannot be resolved would be silently left unwatched")
     before, hits = dict(_WATCH), []
-    _WATCH.update(paths=frozenset(c for c in map(_canon, paths) if c), hits=hits)
+    _WATCH.update(paths=frozenset(canon), hits=hits)
     try:
         yield hits
     finally:
@@ -244,12 +247,16 @@ def _w_truncate(p, other):
     os.truncate(p, 0)
 
 
+def _w_utime(p, other):
+    os.utime(p, (0, 0))
+
+
 def _w_through_a_symlink(p, other):
     other.symlink_to(p)
     other.write_text("x")
 
 
-@pytest.mark.parametrize("write", [_w_text, _w_append, _w_read_write, _w_os_open, _w_replace_over, _w_rename_away, _w_remove, _w_truncate,
+@pytest.mark.parametrize("write", [_w_text, _w_append, _w_read_write, _w_os_open, _w_replace_over, _w_rename_away, _w_remove, _w_truncate, _w_utime,
                                    _w_through_a_symlink], ids=lambda f: f.__name__[3:])
 def test_a_write_by_a_test_to_a_real_file_is_caught_and_names_the_test(tmp_path, write):
     live, other = tmp_path / "state.json", tmp_path / "other"
@@ -277,6 +284,15 @@ def test_reading_a_real_file_is_not_touching_it(tmp_path):
     with _watching([live]) as touched:
         live.read_text(), live.read_bytes(), live.stat(), open(live, "rb").close()
     assert touched == []
+
+
+@pytest.mark.parametrize("paths", [[], [3], ["a-path", 3]], ids=["nothing", "an-fd", "one-good-one-unresolvable"])
+def test_watching_nothing_or_something_unresolvable_is_refused_not_left_silently_empty(paths):
+    active = dict(_WATCH)                                 # the session guard is live around this test: a refusal must not disturb it
+    with pytest.raises(ValueError):
+        with _watching(paths):
+            pass
+    assert _WATCH == active
 
 
 class World:
