@@ -298,6 +298,12 @@ eq "B3 wa-worker + its OWN store -> serves"                                     
 eq "B4 ps-worker + the lexbh store -> blind"                                       "$(run_verdict ps-worker "$WORK/rigs/lexbh")"              "blind|property_scrapers"
 eq "B5 gastown.dog is not a rig pool: the predicate does not apply -> serves"      "$(run_verdict gastown.dog "$WORK/rigs/lexbh")"            "serves|"
 eq "B6 an EMPTY store -> unknown (no store is not a store the pool reads)"         "$(run_verdict wa-worker "")"                              "unknown|"
+eq "B6b a store path that is not a directory -> unknown, NOT blind (nothing was compared; 'could not read' is not 'a different store')" "$(run_verdict wa-worker "$WORK/city/does-not-exist")" "unknown|"
+if [ "$(id -u)" != "0" ]; then # root can enter any directory, so there is no "exists but cannot be entered" to build
+  mkdir -p "$WORK/noenter" && chmod 000 "$WORK/noenter"
+  eq "B6c a store directory that exists but cannot be entered -> unknown, NOT blind (cd fails, same as a missing one)" "$(run_verdict wa-worker "$WORK/noenter")" "unknown|"
+  chmod 755 "$WORK/noenter"
+fi
 : > "$WORK/gc_fail"
 eq "B7 'gc rig list' FAILS -> unknown, never serves" "$(run_verdict wa-worker "$WORK/city")" "unknown|"
 rm -f "$WORK/gc_fail"

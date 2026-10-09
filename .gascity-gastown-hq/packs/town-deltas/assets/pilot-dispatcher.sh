@@ -7583,8 +7583,10 @@ _pilot_bead_home_store() {
 #                         rig clone IS <store_dir>: its workers can see a bead stored there;
 #   _PSV_VERDICT=blind    the pool maps to exactly one rig, that rig's directory exists, and it is not <store_dir>:
 #                         no worker of the pool will ever find a bead stored there;
-#   _PSV_VERDICT=unknown  anything else — empty <store_dir>, the rig list unreadable, the pool mapping to no or
-#                         several rigs, or the pool's rig path missing on disk. NEVER read as "serves".
+#   _PSV_VERDICT=unknown  anything else — empty <store_dir> or one that is not an enterable directory, the rig list
+#                         unreadable, the pool mapping to no or several rigs, or the pool's rig path missing on
+#                         disk. NEVER read as "serves", and never as "blind" either: blind is only said after the
+#                         two directories were actually compared.
 # vazio → unknown; falhou/ilegível → unknown (and one warn per pool per sweep): every caller treats unknown as
 # "do not dispatch, do not queue, do not spawn" — the inert state — and the next sweep asks again.
 _pilot_pool_store_verdict() {
@@ -7597,6 +7599,13 @@ _pilot_pool_store_verdict() {
     *) _PSV_VERDICT="serves"; return 0 ;;
   esac
   [ -n "$_store" ] || return 0
+  # _pilot_same_dir answers 1 for "different" AND for "a path I could not enter", so a store that is not an enterable
+  # directory (missing, not a directory, or no search permission) would come out as "blind" — and blind WRITES (the heal re-routes the bead, the guard strips its route
+  # and releases the claim). Nothing would have been compared: that is "unknown".
+  if [ ! -d "$_store" ] || [ ! -x "$_store" ]; then
+    _pilot_psv_warn_once "$_kind:store" "ga-vp2zr0: store '$_store' is not an enterable directory — verdict UNKNOWN for pool $_pool (never 'blind': the two stores were not compared)."
+    return 0
+  fi
   [ -n "${PILOT_RIG_PATHS_JSON:-}" ] || rig_root_path "gascity" >/dev/null 2>&1 || true
   _PSV_POOL_RIG=$(_pilot_pool_rig "$_pool") || _PSV_POOL_RIG=""
   if [ -z "$_PSV_POOL_RIG" ]; then
