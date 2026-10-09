@@ -14,7 +14,9 @@
 #      sanctioned source — a second one would make "single source of truth" a lie);
 #   3. if city.toml includes the fragment the file EXISTS (an absent included fragment is a config LOAD ERROR) and is exactly
 #      what the engine writes: allowlisted pools only, integers in [1, 8], and ps-worker / gate-reviewer never ABOVE agent.toml
-#      (only wa-worker may be raised: "the others only go down");
+#      (only wa-worker may be raised: "the others only go down"). "Includes" is read from the PARSED `include` array (entries
+#      resolved to real paths), never matched as text; a fragment with entries that city.toml does not include is a FAIL (the
+#      controller applies none of it), and so is one whose include cannot be told (needs python3 >= 3.11: unknown is not "in force");
 #   4. PILOT_WA_WORKER_MAX in the Pilot's plist is never HIGHER than the effective wa-worker ceiling;
 #   5. the sum of the effective ceilings of the three variable pools (wa-worker + ps-worker + gate-reviewer) stays within
 #      GC_VARIABLE_SESSION_MAX (read from the Pilot's plist).
@@ -36,11 +38,15 @@ log()  { echo "[prod-test:gascity ga-o3o09z] $*"; }
 fail() { echo "[prod-test:gascity ga-o3o09z] FAIL: $*" >&2; exit 1; }
 
 # ── 1. agent.toml is the committed source of truth: an integer max_active_sessions >= 1 ──
-agent_cap() { sed -n 's/^max_active_sessions[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*\(#.*\)\{0,1\}$/\1/p' "$1" 2>/dev/null | head -1; }
+# A number this script compares or sums must be a canonical decimal integer: "0", or no leading zero. "09" is not a TOML integer (gc
+# rejects it at load) and bash arithmetic reads it as a bad octal, erroring quietly inside [[ -gt ]] and $(( )) — so it never
+# enters as if it were 9. Every number read from outside (agent.toml, the fragment, the Pilot plist) is checked against INT_RE.
+INT_RE='^(0|[1-9][0-9]*)$'
+agent_cap() { local v; v=$(sed -n 's/^max_active_sessions[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*\(#.*\)\{0,1\}$/\1/p' "$1" 2>/dev/null | head -1); [[ "$v" =~ $INT_RE ]] && printf '%s' "$v"; return 0; }
 CFG="$CITY/agents/wa-worker/agent.toml"
 [[ -f "$CFG" ]] || fail "agent config missing: $CFG"
 WA_BASE=$(agent_cap "$CFG")
-if ! [[ "$WA_BASE" =~ ^[0-9]+$ ]] || [[ "$WA_BASE" -lt 1 ]]; then
+if ! [[ "$WA_BASE" =~ $INT_RE ]] || [[ "$WA_BASE" -lt 1 ]]; then
     fail "wa-worker: no integer max_active_sessions >= 1 in $CFG (got: $(grep '^max_active_sessions' "$CFG" || echo '<missing>'))"
 fi
 log "wa-worker: max_active_sessions = $WA_BASE in $CFG ✓"
@@ -101,10 +107,44 @@ fi
 # Strict parse of the only shape pool-ceiling-engine.sh renders: blocks of [[patches.agent]] / dir = "" / name = "x" /
 # max_active_sessions = N, plus comments and blanks. Anything else is FOREIGN: the effective ceiling would be unknowable.
 FRAGMENT="${POOL_CEILING_ENGINE_FRAGMENT:-$CITY/.gc/pool-ceiling-engine.toml}"
-INCLUDED=0
-CITY_LIVE=$(grep -v '^[[:space:]]*#' "$CITY_TOML" 2>/dev/null); LIVE_RC=$?   # rc 1 = no live lines (all comments), rc >= 2 = could not read
-[[ "$LIVE_RC" -le 1 ]] || fail "cannot read $CITY_TOML to look for the include (grep rc $LIVE_RC)"
-case "$CITY_LIVE" in *"$(basename "$FRAGMENT")"*) INCLUDED=1 ;; esac
+# Does city.toml INCLUDE the fragment? Three answers, never two: 1 yes, 0 no, ? cannot tell. It is read from the PARSED city.toml —
+# the `include` array, each entry resolved against city.toml's directory and compared with the fragment's real path — and not
+# matched as text: a trailing `# was ".gc/pool-ceiling-engine.toml"`, a `.toml.bak`, or the same file name in another directory
+# is not an include, and a text match read all three as one while the controller loaded nothing (gate rounds 1-2 of ga-m9x0lb.2.1).
+# The verdict is the token python prints, never its exit status: a crash exits 1 as well, and that must not read as "not included".
+INCLUDED="?"; INCLUDE_WHY=""
+if command -v python3 >/dev/null 2>&1; then
+    INCLUDE_OUT=$(python3 - "$CITY_TOML" "$FRAGMENT" <<'PY' 2>&1
+import os, sys
+try:
+    import tomllib
+except ImportError:
+    print(f"python3 {sys.version.split()[0]} has no tomllib (needs >= 3.11)")
+    sys.exit(2)
+city_toml, fragment = sys.argv[1], sys.argv[2]
+try:
+    with open(city_toml, "rb") as f:
+        cfg = tomllib.load(f)
+except Exception as e:
+    print(f"cannot read/parse {city_toml}: {e}")
+    sys.exit(2)
+inc = cfg.get("include", [])
+if not isinstance(inc, list) or not all(isinstance(e, str) for e in inc):
+    print(f"'include' in {city_toml} is not an array of strings")
+    sys.exit(2)
+base = os.path.dirname(os.path.abspath(city_toml))
+want = os.path.realpath(fragment)
+print("included" if any(os.path.realpath(os.path.join(base, e)) == want for e in inc) else "not-included")
+PY
+    )
+    case "${INCLUDE_OUT##*$'\n'}" in
+        included)     INCLUDED=1 ;;
+        not-included) INCLUDED=0 ;;
+        *)            INCLUDE_WHY="${INCLUDE_OUT:-no verdict}" ;;
+    esac
+else
+    INCLUDE_WHY="python3 unavailable"
+fi
 FRAG_ENTRIES=""
 if [[ -e "$FRAGMENT" ]]; then
     FRAG_ENTRIES=$(awk '
@@ -114,20 +154,31 @@ if [[ -e "$FRAGMENT" ]]; then
         /^\[\[patches\.agent\]\][[:space:]]*$/ { fin(); inblk = 1; hd = 0; hn = 0; hm = 0; nm = ""; next }
         /^dir[[:space:]]*=[[:space:]]*""[[:space:]]*$/ { if (!inblk || hd) bad = 1; hd = 1; next }
         /^name[[:space:]]*=[[:space:]]*"[a-z0-9._-]+"[[:space:]]*$/ { if (!inblk || hn) bad = 1; hn = 1; s = $0; sub(/^name[[:space:]]*=[[:space:]]*"/, "", s); sub(/"[[:space:]]*$/, "", s); nm = s; if (nm in seen) bad = 1; seen[nm] = 1; next }
-        /^max_active_sessions[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$/ { if (!inblk || hm || !hn) bad = 1; hm = 1; s = $0; sub(/^[^=]*=[[:space:]]*/, "", s); sub(/[[:space:]]*$/, "", s); out[++n] = nm "=" (s + 0); next }
+        /^max_active_sessions[[:space:]]*=[[:space:]]*(0|[1-9][0-9]*)[[:space:]]*$/ { if (!inblk || hm || !hn) bad = 1; hm = 1; s = $0; sub(/^[^=]*=[[:space:]]*/, "", s); sub(/[[:space:]]*$/, "", s); out[++n] = nm "=" (s + 0); next }
         { bad = 1 }
         END { fin(); if (bad) exit 1; for (i = 1; i <= n; i++) print out[i]; exit 0 }
     ' "$FRAGMENT") || fail "$FRAGMENT has FOREIGN content (not what pool-ceiling-engine.sh writes): the effective ceilings are unknowable"
     FRAG_ENTRIES=$(printf '%s' "$FRAG_ENTRIES" | tr '\n' ' ')
     log "fragment $FRAGMENT well-formed (entries: ${FRAG_ENTRIES:-none}) ✓"
     # A file the controller never loads is not in force: reading its entries as the effective ceiling is the ga-o3o09z drift itself.
-    if [[ -n "${FRAG_ENTRIES// /}" && "$INCLUDED" != 1 ]]; then
-        fail "$FRAGMENT has entries (${FRAG_ENTRIES}) but city.toml does not include it: the controller applies none of them"
+    # And "cannot tell whether it is loaded" is not "it is loaded": a populated fragment with an unknown include is a FAIL.
+    if [[ -n "${FRAG_ENTRIES// /}" ]]; then
+        case "$INCLUDED" in
+            1) ;;
+            0) fail "$FRAGMENT has entries (${FRAG_ENTRIES}) but city.toml does not include it: the controller applies none of them" ;;
+            *) fail "$FRAGMENT has entries (${FRAG_ENTRIES}) and whether city.toml includes it cannot be told (${INCLUDE_WHY}): the effective ceiling is unknowable, and unknown is not 'in force'" ;;
+        esac
+    elif [[ "$INCLUDED" == "?" ]]; then
+        log "city.toml include check: cannot determine (${INCLUDE_WHY}) — soft skip; an empty fragment sets no ceiling whether or not it is loaded"
+        SKIPPED="$SKIPPED city.toml-include-check"
     fi
 elif [[ "$INCLUDED" == 1 ]]; then
     fail "city.toml includes $(basename "$FRAGMENT") but $FRAGMENT is ABSENT — gc config load error (the kill switch EMPTIES the fragment, it never deletes it)"
-else
+elif [[ "$INCLUDED" == 0 ]]; then
     log "no pool-ceiling fragment and city.toml does not include one (engine not installed) — effective ceilings = agent.toml ✓"
+else
+    log "no pool-ceiling fragment; whether city.toml includes one cannot be determined (${INCLUDE_WHY}) — soft skip (an include of the absent file would be a gc config load error); effective ceilings = agent.toml"
+    SKIPPED="$SKIPPED city.toml-include-check"
 fi
 frag_level() { local e; for e in $FRAG_ENTRIES; do case "$e" in "$1="*) printf '%s' "${e#*=}"; return 0 ;; esac; done; return 0; }
 for e in $FRAG_ENTRIES; do
@@ -139,7 +190,7 @@ for e in $FRAG_ENTRIES; do
     { [[ "$lvl" -ge 1 ]] && [[ "$lvl" -le 8 ]]; } || fail "fragment entry $pool=$lvl: outside [1, 8]"
     if [[ "$pool" != "wa-worker" ]]; then
         base=$(agent_cap "$CITY/agents/$pool/agent.toml")
-        [[ "$base" =~ ^[0-9]+$ ]] || fail "fragment entry $pool=$lvl but $CITY/agents/$pool/agent.toml has no readable max_active_sessions to compare with"
+        [[ "$base" =~ $INT_RE ]] || fail "fragment entry $pool=$lvl but $CITY/agents/$pool/agent.toml has no readable max_active_sessions to compare with"
         [[ "$lvl" -le "$base" ]] || fail "fragment entry $pool=$lvl is ABOVE agent.toml's $base — only wa-worker may be raised (the others only go down)"
     fi
 done
@@ -156,7 +207,7 @@ if [[ -f "$PILOT_PLIST" ]]; then
     if [[ -z "$PLIST_MAX" ]]; then
         log "PILOT_WA_WORKER_MAX not set in $PILOT_PLIST — nothing to cross-check, skipping (soft skip)"
         SKIPPED="$SKIPPED pilot-ceiling-crosscheck"
-    elif ! [[ "$PLIST_MAX" =~ ^[0-9]+$ ]]; then
+    elif ! [[ "$PLIST_MAX" =~ $INT_RE ]]; then
         fail "PILOT_WA_WORKER_MAX in $PILOT_PLIST is not a plain integer: '$PLIST_MAX'"
     elif [[ "$PLIST_MAX" -gt "$WA_EFF" ]]; then
         fail "PILOT_WA_WORKER_MAX=$PLIST_MAX > the effective engine ceiling $WA_EFF — Pilot would believe it can dispatch past the controller's real ceiling"
@@ -173,7 +224,7 @@ fi
 # fit it by construction (wa-worker + ps-worker + gate-reviewer: the three elastic pools the bound covers).
 BUDGET=""
 [[ -f "$PILOT_PLIST" ]] && BUDGET=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:GC_VARIABLE_SESSION_MAX" "$PILOT_PLIST" 2>/dev/null || true)
-if ! [[ "$BUDGET" =~ ^[0-9]+$ ]]; then
+if ! [[ "$BUDGET" =~ $INT_RE ]]; then
     log "GC_VARIABLE_SESSION_MAX not readable from $PILOT_PLIST — skipping the sum check (soft skip)"
     SKIPPED="$SKIPPED sum-vs-GC_VARIABLE_SESSION_MAX"
 else
@@ -181,7 +232,7 @@ else
     for pool in wa-worker ps-worker gate-reviewer; do
         eff=$(frag_level "$pool")
         [[ -n "$eff" ]] || eff=$(agent_cap "$CITY/agents/$pool/agent.toml")
-        [[ "$eff" =~ ^[0-9]+$ ]] || fail "effective ceiling of $pool unreadable ($CITY/agents/$pool/agent.toml has no integer max_active_sessions): the sum cannot be checked, and unknown is not 'fits'"
+        [[ "$eff" =~ $INT_RE ]] || fail "effective ceiling of $pool unreadable ($CITY/agents/$pool/agent.toml has no integer max_active_sessions): the sum cannot be checked, and unknown is not 'fits'"
         SUM=$((SUM + eff))
     done
     if [[ "$SUM" -gt "$BUDGET" ]]; then

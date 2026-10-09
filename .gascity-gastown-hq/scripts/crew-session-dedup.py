@@ -65,9 +65,11 @@ BAD_STATE_SIGNALS = [
 # the config has never answered.
 # ---------------------------------------------------------------------------
 
-# wa-worker / ps-worker (ga-m9x0lb.2): the pool-ceiling engine moves these pools' max_active_sessions (wa-worker 2<->3; ps-worker
-# only if a later slice lets it rise). A pool that sits at max=1 for a while is still a POOL, not a singleton crew: without them
-# here ps-worker enters and leaves the singleton set as its max oscillates, and dedup would drain a legitimate second worker.
+# wa-worker / ps-worker (ga-m9x0lb.2): pools whose ceiling the pool-ceiling engine will move once slice 3 installs it, listed AHEAD
+# of the engine so a moment at max=1 never makes dedup drain a legitimate second worker of a POOL. wa-worker: committed max 2, the
+# engine may lower it to 1, and a ceiling of 1 would otherwise make it a singleton. ps-worker: forward-looking, and a TRADE-OFF —
+# its committed max is 1 TODAY and the engine only ever lowers it, so until agent.toml raises it, listing it here means dedup no
+# longer detects or drains a stale creating/asleep ps-worker session sitting beside a live one (from the next daemon start).
 KNOWN_NON_SINGLETONS = {"dog", "gate-reviewer", "wa-worker", "ps-worker"}  # dog/gate-reviewer: empirically confirmed >1
 
 # What to act on until `gc config show` has ever answered (empirical run on
