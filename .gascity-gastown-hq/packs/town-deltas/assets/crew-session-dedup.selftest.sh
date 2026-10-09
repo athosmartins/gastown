@@ -27,7 +27,8 @@ run_test() {
   local code="$2"
   local expected="$3"  # substring expected in output
 
-  result=$(python3 -c "$code" 2>&1)
+  # `|| true`: under set -e a failing assertion used to kill the script before any FAIL line was printed
+  result=$(python3 -c "$code" 2>&1) || true
   if echo "$result" | grep -F "$expected" >/dev/null; then
     echo "PASS: $name"
     ((PASS++)) || true
@@ -226,6 +227,39 @@ else
   echo "FAIL: adhoc exclusion missing — cap-exempt parallel workers could be drained"
   ((FAIL++)) || true
 fi
+
+# ---------------------------------------------------------------------------
+# wa-worker / ps-worker are POOLS whose max the pool-ceiling engine moves (ga-m9x0lb.2): they must never be read as singleton
+# crews, or dedup drains a legitimate second worker whenever the max sits at 1. Runs the REAL _read_config_singletons() (extracted
+# with ast: importing the module would block on gc config show and the main loop) against a fake `gc config show` in which EVERY
+# agent has max_active_sessions = 1, so only the exclusion list decides.
+# ---------------------------------------------------------------------------
+run_test "pool agents (dog, gate-reviewer, wa-worker, ps-worker) are never singleton crews; a real crew still is" "
+import ast, re
+src = open('$DEDUP_SCRIPT').read()
+parts = []
+for node in ast.parse(src).body:
+    if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'KNOWN_NON_SINGLETONS' for t in node.targets):
+        parts.append(node)
+    elif isinstance(node, ast.FunctionDef) and node.name == '_read_config_singletons':
+        parts.append(node)
+assert len(parts) == 2, 'KNOWN_NON_SINGLETONS / _read_config_singletons not found'
+names = ['mila-wa', 'dog', 'gate-reviewer', 'wa-worker', 'ps-worker']
+class R:
+    returncode = 0
+    stderr = ''
+    stdout = ''.join('[[agent]]\\nname = \"%s\"\\nmax_active_sessions = 1\\n' % n for n in names)
+class FakeSub:
+    @staticmethod
+    def run(*a, **k):
+        return R()
+ns = {'re': re, 'subprocess': FakeSub}
+exec(compile(ast.Module(body=parts, type_ignores=[]), 'dedup-extract', 'exec'), ns)
+singletons, why = ns['_read_config_singletons']()
+assert why == '', why
+assert singletons == frozenset({'mila-wa'}), sorted(singletons)
+print('OK')
+" "OK"
 
 # Summary
 # ---------------------------------------------------------------------------

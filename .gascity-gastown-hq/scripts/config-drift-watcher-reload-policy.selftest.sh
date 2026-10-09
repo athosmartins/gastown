@@ -1299,6 +1299,22 @@ has "life 3: the change is requested as a file-change reload straight after the 
 has "life 3: …and accepted" "reload[file-change] OK, took" "$E2E_LOG"
 hasnt "life 3: no heartbeat in the way" "reload[heartbeat] requested" "$E2E_LOG"
 
+# ── I. the pool-ceiling engine's fragment is part of the hash (ga-m9x0lb.2) ──
+echo "== I. .gc/pool-ceiling-engine.toml is watched: neither this watcher nor the controller's fsnotify sees .gc/ (ga-m9x0lb.1)"
+HASH_MODE=real
+mkdir -p "$CITY/.gc/pool-ceiling-engine" "$CITY/.gc/logs"
+hi0=$(compute_hash)
+echo "x" > "$CITY/.gc/logs/unrelated.log"; echo "x" > "$CITY/.gc/pool-ceiling-engine/wa-worker.state"; : > "$CITY/.gc/pool-ceiling-engine.on"
+eq "I1 the rest of .gc/ (logs, engine state, the .on switch) does NOT change the hash: no reload storm" "$hi0" "$(compute_hash)"
+printf '# GENERATED\n' > "$CITY/.gc/pool-ceiling-engine.toml"; hi1=$(compute_hash)
+if [ "$hi0" != "$hi1" ]; then ok "I2 creating the fragment changes the hash"; else bad "I2 creating the fragment does not change the hash"; fi
+printf '# GENERATED\n[[patches.agent]]\ndir = ""\nname = "wa-worker"\nmax_active_sessions = 3\n' > "$CITY/.gc/pool-ceiling-engine.toml"; hi2=$(compute_hash)
+if [ "$hi1" != "$hi2" ]; then ok "I3 raising a ceiling (the file grows) changes the hash: the watcher will request gc reload --soft within seconds"; else bad "I3 raising a ceiling does not change the hash"; fi
+printf '# GENERATED\n' > "$CITY/.gc/pool-ceiling-engine.toml"; hi3=$(compute_hash)
+if [ "$hi2" != "$hi3" ]; then ok "I4 emptying it (the kill switch) changes the hash too"; else bad "I4 emptying the fragment does not change the hash"; fi
+rm -f "$CITY/.gc/pool-ceiling-engine.toml"
+eq "I5 with no fragment the hash is the original one again" "$hi0" "$(compute_hash)"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 selftest_summary_reached

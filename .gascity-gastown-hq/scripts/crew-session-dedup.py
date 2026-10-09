@@ -65,7 +65,10 @@ BAD_STATE_SIGNALS = [
 # the config has never answered.
 # ---------------------------------------------------------------------------
 
-KNOWN_NON_SINGLETONS = {"dog", "gate-reviewer"}  # empirically confirmed >1
+# wa-worker / ps-worker (ga-m9x0lb.2): the pool-ceiling engine moves these pools' max_active_sessions (wa-worker 2<->3; ps-worker
+# only if a later slice lets it rise). A pool that sits at max=1 for a while is still a POOL, not a singleton crew: without them
+# here ps-worker enters and leaves the singleton set as its max oscillates, and dedup would drain a legitimate second worker.
+KNOWN_NON_SINGLETONS = {"dog", "gate-reviewer", "wa-worker", "ps-worker"}  # dog/gate-reviewer: empirically confirmed >1
 
 # What to act on until `gc config show` has ever answered (empirical run on
 # 2026-06-06). Never re-entered once a real read has succeeded even once --
