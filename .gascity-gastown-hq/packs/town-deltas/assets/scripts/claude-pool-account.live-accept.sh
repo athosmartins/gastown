@@ -15,9 +15,9 @@
 # not in mock.json either.
 #
 # IDENTITY ORACLE: OK  = terrenos.incorporacoes@ (0% used, answers).
-#                  EXH = athosb85@ (weekly limit hit until 2026-10-07 ~22:00Z; can only answer with the limit
-#                        error, and a rejected call costs nothing). After 2026-10-07 22:00Z pick another exhausted
-#                        account, or this harness's step 2 cannot tell the accounts apart.
+#                  EXH = an account whose limit is hit NOW (it can only answer with the limit error, and a rejected call costs
+#                        nothing). The default, athosb85@, had its weekly limit until 2026-10-07 ~22:00Z: after that it is not known to be
+#                        exhausted, and if it answers P1a / P3.2 fail ("cannot tell the accounts apart") - name an exhausted one in EMAIL_EXH.
 #
 #   P1  real probes through the daemon: EXH is rejected (real 429 + real headers parsed), OK is picked, and the pool dir's
 #       credentials file holds the OK key (fingerprint equal to the decision's).
@@ -30,6 +30,13 @@
 #       makes claude 'lose' the credential fails the test, writes the degraded marker, a launch answers on the ambient login, and the
 #       next passing test lifts the marker; then the real leak scan (all 5 vault keys, control first) over this run's files and ps.
 #       The phone is never used: pushes go to a recorder. The guard's scratch item is its own throwaway ("claude-pool-guard-scratch").
+#   (ga-8hcnvb.2.2) the cost and the "script only" claims, counted and not left to prose: P1f / P1g (the daemon spawns no `claude` - by its
+#       source, and by a `claude` on its PATH that writes down every start - and a made-up key gets a REAL 401 that it calls 'invalid'),
+#       P3.1b (a warning at 99% moves nothing), P3.2b / P3.4b (the mock API logs every request the daemon makes: a steady run is 1, a
+#       failover is 2 - the rejected account and the one that answers -, a failback is 1 and NONE to the account it returns to, and
+#       nothing is ever sent to an endpoint but POST /v1/messages), P3.7 (the shim's count at the end: zero, beside the SWITCH lines in the
+#       log, and the live session's pid never changed). The ledger it prints says what the probes cost: one 1-token call to the account in
+#       use per run (a refused one is free), one more to the account a failover lands on, and none for a failback.
 set -u
 umask 077   # whatever this script writes under $HOME is for this user only (the scratch dir is 0700 already; the files in it too)
 SD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -81,8 +88,18 @@ accts = [{"email": e, "ok": True, "stale": False, "collected_at": iso, "last_ok_
 json.dump({"updated_at": iso, "accounts": accts}, open(f, "w"))
 EOF
 }
+# A `claude` that writes down every start and does nothing else, first on the DAEMON's PATH (not on the live session's, nor the wrapper's):
+# the daemon is a script and starts no claude on any path - the count at the end of P3 is how that is shown, not claimed.
+mkdir -p "$W/shim"
+cat > "$W/shim/claude" <<'EOF'
+#!/bin/bash
+echo "claude $*" >> "$SHIM_LOG"
+exit 99
+EOF
+chmod +x "$W/shim/claude"; : > "$W/shim.calls"
+shim_calls() { wc -l < "$W/shim.calls" | tr -d ' '; }
 daemon() { # daemon [ENV=val...]   (state/item are the scratch ones; probe URL only if MOCK_URL is exported)
-  env HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin" GC_CITY_PATH="$W/city" \
+  env HOME="$HOME" USER="$USER" SHIM_LOG="$W/shim.calls" PATH="$W/shim:/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin" GC_CITY_PATH="$W/city" \
       CLAUDE_USAGE_STORE="$W/usage.json" CLAUDE_POOL_STATE="$W/state.json" CLAUDE_POOL_CRED_DIR="$POOL_DIR" \
       ${MOCK_URL:+CLAUDE_POOL_PROBE_URL="$MOCK_URL"} "$@" "$PY" "$DAEMON" run-once
 }
@@ -106,6 +123,32 @@ cf_mode="$(stat -f '%Lp' "$POOL_DIR/.credentials.json" 2>/dev/null || stat -c '%
 [ -n "$(cf_fp)" ] && [ "$(cf_fp)" = "$(jget fingerprint)" ] && [ "$cf_mode" = 600 ] \
   && ok "P1e the pool credentials file holds the decision's credential (fp=$(cf_fp)), mode 0600" \
   || bad "P1e credentials file fp='$(cf_fp)' mode='$cf_mode' vs the decision's fp '$(jget fingerprint)' (missing, unreadable, or another account)"
+# P1f  the daemon starts no claude: by its source (every process it can spawn is named there) and by the shim's count after the real run above
+spawn_set() { # every program the daemon's source can start: the first word of each subprocess / os spawn call (a variable is shown as <name>)
+  "$PY" - "$DAEMON" <<'EOF'
+import ast, sys
+t = ast.parse(open(sys.argv[1]).read())
+out = set()
+for n in ast.walk(t):
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id in ("subprocess", "os") \
+       and n.func.attr in ("run", "Popen", "call", "check_call", "check_output", "system", "popen", "execv", "execvp", "execl", "spawnv"):
+        a = n.args[0] if n.args else None
+        while isinstance(a, ast.BinOp):   # [b, "-L", sock] + args: the program is in the list on the left
+            a = a.left
+        f = a.elts[0] if isinstance(a, ast.List) and a.elts else a
+        out.add(f.value if isinstance(f, ast.Constant) else "<" + (ast.unparse(f) if f is not None else "?") + ">")
+print(" ".join(sorted(out)))
+EOF
+}
+spawns="$(spawn_set)"
+[ "$spawns" = "<b> ps security" ] && [ "$(shim_calls)" = "0" ] \
+  && ok "P1f the daemon's source spawns only: $spawns (<b> = the tmux / ps binary it resolves; never claude), and the claude on its PATH was started $(shim_calls) times by the real run" \
+  || bad "P1f spawns='$spawns' shim starts=$(shim_calls) (want '<b> ps security' and 0)"
+# P1g  a REAL 401: a made-up key through the daemon's own probe(), on the real API. A refused call costs nothing; "invalid" is what the pool acts on.
+kind="$(env HOME="$HOME" LIVE_BOGUS="sk-ant-oat01-LIVEBOGUS$(date +%s)-not-a-key" "$PY" -c 'import importlib.util, os, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+p = m.probe(os.environ["LIVE_BOGUS"]); print(p.verdict, p.detail)' "$DAEMON" 2>&1 | tail -1)"
+case "$kind" in invalid*) ok "P1g a made-up key gets a real refusal from the real API and the daemon reads it as: $kind" ;; *) bad "P1g a made-up key was read as '$kind' (want invalid: the real API's answer to a bad key is not what the daemon expects)" ;; esac
 
 # ── P2: the wrapper path ───────────────────────────────────────────────────────────────────────────
 echo; echo "== P2  wrapper -> claude (the path a real pool session takes)"
@@ -123,11 +166,18 @@ cat > "$W/mock.py" <<'EOF'
 import hashlib, http.server, json, sys
 STATE, PORTF = sys.argv[1:3]
 class H(http.server.BaseHTTPRequestHandler):
+    def note(self, fp, status):   # one line per request, whatever it was: method, path, answer, the account's fingerprint (never the token)
+        open(STATE + ".reqs", "a").write("%s %s %s %s\n" % (self.command, self.path.split("?")[0], status, fp))
+    def other(self):              # anything but the probe: logged, refused
+        self.note("-", 404); self.send_response(404); self.send_header("content-length", "0"); self.end_headers()
+    do_GET = do_PUT = do_DELETE = do_PATCH = do_HEAD = other
     def do_POST(self):
         self.rfile.read(int(self.headers.get("content-length") or 0))
         tok = (self.headers.get("authorization") or "").replace("Bearer ", "")
         # the table is keyed by the token's 8-hex fingerprint (the same one this script prints), never by the token itself
-        beh = json.load(open(STATE)).get(hashlib.sha256(tok.encode()).hexdigest()[:8]) or {"status": 401, "h": {}}
+        fp = hashlib.sha256(tok.encode()).hexdigest()[:8]
+        beh = json.load(open(STATE)).get(fp) or {"status": 401, "h": {}}
+        self.note(fp, beh["status"])
         self.send_response(beh["status"])
         for k, v in beh.get("h", {}).items(): self.send_header(k, v)
         self.send_header("content-length", "2"); self.end_headers(); self.wfile.write(b"{}")
@@ -152,6 +202,16 @@ usage_fixture "$W/usage.json" "$EMAIL_OK" "$EMAIL_EXH"
 timeout 10 security delete-generic-password -a "$USER" -s "$SVC" >/dev/null 2>&1; rm -f "$W/state.json"
 daemon >/dev/null 2>&1
 [ "$(jget current)" = "$EMAIL_OK" ] && ok "P3.0 daemon seeded the item with the OK account" || bad "P3.0 current='$(jget current)'"
+# What the daemon sent to the (mock) API, one line each: "METHOD PATH STATUS FINGERPRINT" - the fingerprint names the account the call was made AS.
+reqs_n() { if [ -f "$W/mock.json.reqs" ]; then wc -l < "$W/mock.json.reqs" | tr -d ' '; else echo 0; fi; }
+req_lines() { tail -n +"$(( $1 + 1 ))" "$W/mock.json.reqs" 2>/dev/null; }          # req_lines <n0>: every request after the first n0
+switches() { grep -c "SWITCH " "$W/city/.gc/logs/claude-pool-account.log" 2>/dev/null || true; }
+SW0="$(switches)"
+n0="$(reqs_n)"; daemon >/dev/null 2>&1
+r="$(req_lines "$n0")"
+[ "$r" = "POST /v1/messages 200 $(fp "$TOK_OK")" ] && [ "$(jget current)" = "$EMAIL_OK" ] && [ "$(switches)" = "$SW0" ] \
+  && ok "P3.0b a steady run: ONE request, a POST /v1/messages as the account in use (answered 200), no switch" \
+  || bad "P3.0b a steady run sent: $(printf '%s' "$r" | tr '\n' '|') (want exactly one POST /v1/messages 200 as the OK account); switches $SW0 -> $(switches)"
 
 printf '{"hasCompletedOnboarding":true,"theme":"dark","projects":{"%s":{"hasTrustDialogAccepted":true,"allowedTools":[]}}}\n' "$W/work" > "$W/cfg/.claude.json"
 cat > "$W/launch.sh" <<EOF
@@ -166,13 +226,30 @@ tmux -L "$SOCK" new-session -d -s s1 -x 170 -y 40 "$W/launch.sh" || { echo "tmux
 pane() { tmux -L "$SOCK" capture-pane -p -t s1 | sed -e 's/[[:space:]]*$//' | grep -v '^$' | tail -"${1:-8}"; }
 ask() { tmux -L "$SOCK" send-keys -t s1 "$1"; sleep 1; tmux -L "$SOCK" send-keys -t s1 Enter; sleep "${2:-16}"; }
 sleep 14
+PANE_PID0="$(tmux -L "$SOCK" display-message -p -t s1 '#{pane_pid}' 2>/dev/null)"      # launch.sh exec's into claude: this IS the claude's pid
 ask "Reply with exactly: ALPHA"
 pane 8 | grep -q "ALPHA" && ok "P3.1 live session answers on the OK account (ALPHA)" || { bad "P3.1 no ALPHA"; pane 10; }
 
+# P3.1b  nothing short of the limit moves the pool: the OK account answers 200 but the API says "warning" at 99% on both windows
+H_WARN='{"anthropic-ratelimit-unified-status":"allowed_warning","anthropic-ratelimit-unified-5h-status":"allowed_warning","anthropic-ratelimit-unified-5h-utilization":"0.99","anthropic-ratelimit-unified-7d-status":"allowed_warning","anthropic-ratelimit-unified-7d-utilization":"0.99"}'
+mock_set 200 "$H_WARN" 200 "$H_ALLOW"; n0="$(reqs_n)"; sw1="$(switches)"
+daemon >/dev/null 2>&1; daemon >/dev/null 2>&1; daemon >/dev/null 2>&1
+r="$(req_lines "$n0")"
+if [ "$(jget current)" = "$EMAIL_OK" ] && [ "$(switches)" = "$sw1" ] && [ "$(req_lines "$n0" | grep -c .)" = 3 ] && [ -z "$(printf '%s\n' "$r" | grep -v "^POST /v1/messages 200 $(fp "$TOK_OK")$")" ]; then
+  ok "P3.1b a WARNING at 99% (5h and 7d) on the account in use moves nothing over 3 runs: still the OK account, no SWITCH, one request per run, none to EXH"
+else bad "P3.1b current='$(jget current)' switches $sw1 -> $(switches); requests: $(printf '%s' "$r" | tr '\n' '|')"; fi
+mock_set 200 "$H_ALLOW" 200 "$H_ALLOW"
+
 echo "   >>> OK account 'exhausted' (simulated); EXH reports allowed. Running the daemon -> failover"
 mock_set 429 "$H_REJ" 200 "$H_ALLOW"
+n0="$(reqs_n)"
 daemon >/dev/null 2>&1
 [ "$(jget current)" = "$EMAIL_EXH" ] && ok "P3.2 daemon failed over to the EXH account (current=$EMAIL_EXH)" || bad "P3.2 current='$(jget current)'"
+r="$(req_lines "$n0")"
+[ "$r" = "POST /v1/messages 429 $(fp "$TOK_OK")
+POST /v1/messages 200 $(fp "$TOK_EXH")" ] \
+  && ok "P3.2b the failover is TWO requests: the account in use (rejected, 429 - costs nothing) and the one it lands on (answered - a 1-token call); no usage / balance endpoint, no claude" \
+  || bad "P3.2b the failover sent: $(printf '%s' "$r" | tr '\n' '|')"
 echo "   waiting 40 s (claude re-reads the item every ~30 s)"; sleep 40
 ask "Reply with exactly: BRAVO"
 if pane 14 | grep -qiE "limit|usage"; then ok "P3.3 the SAME live session now hits the EXH account's limit error — switched with no restart"
@@ -180,14 +257,29 @@ else bad "P3.3 no limit message after the switch"; pane 12; fi
 
 echo "   >>> stored reset time passes, the collector reads the usage again 30 s after it; daemon failback (no probe of the recovered account)"
 usage_fixture "$W/usage.json" "$EMAIL_OK" "$EMAIL_EXH" $((RESET + 30))
+n0="$(reqs_n)"
 daemon CLAUDE_POOL_NOW=$((RESET + 60)) >/dev/null 2>&1
 [ "$(jget current)" = "$EMAIL_OK" ] && ok "P3.4 daemon failed back to the OK account" || bad "P3.4 current='$(jget current)'"
+r="$(req_lines "$n0")"
+[ "$r" = "POST /v1/messages 200 $(fp "$TOK_EXH")" ] \
+  && ok "P3.4b the failback is ONE request - the probe of the account in use (EXH, answered) - and NOTHING as the OK account it returned to (the mock still has OK at 429: a probe would have kept the pool away)" \
+  || bad "P3.4b the failback sent: $(printf '%s' "$r" | tr '\n' '|') (want one POST as EXH and none as OK)"
 echo "   waiting 40 s"; sleep 40
 tmux -L "$SOCK" send-keys -t s1 Escape; sleep 3          # the open limit modal does not notice the restored credential by itself
 ask "Reply with exactly: CHARLIE"
 pane 8 | grep -q "CHARLIE" && ok "P3.5 same session answers again on the OK account (CHARLIE)" || { bad "P3.5 no CHARLIE"; pane 12; }
 ask "What was the first thing I asked you to reply with? One word." 18
 pane 8 | grep -q "ALPHA" && ok "P3.6 conversation continuity: the session still remembers its first question (ALPHA)" || { bad "P3.6 continuity lost"; pane 12; }
+PANE_PID1="$(tmux -L "$SOCK" display-message -p -t s1 '#{pane_pid}' 2>/dev/null)"
+{ [ -n "$PANE_PID0" ] && [ "$PANE_PID0" = "$PANE_PID1" ] && kill -0 "$PANE_PID0" 2>/dev/null; } \
+  && ok "P3.6b one process the whole way: the session's pid is $PANE_PID0 before the first switch and after the last, and it is alive (no restart)" \
+  || bad "P3.6b the session's pid went '$PANE_PID0' -> '$PANE_PID1' (or it is gone)"
+# P3.7  the switch path never started a claude: the shim saw no start across P1 and P3 - the failover, the failback and every steady run - beside the SWITCH lines it logged
+[ "$(shim_calls)" = "0" ] && [ "$(( $(switches) - SW0 ))" = 2 ] \
+  && ok "P3.7 $(( $(switches) - SW0 )) SWITCH lines (failover, failback) and the claude on the daemon's PATH was started $(shim_calls) times by any daemon run in this harness - the switch is a script, no claude, no LLM" \
+  || bad "P3.7 shim starts=$(shim_calls) (want 0), SWITCH lines since the seed=$(( $(switches) - SW0 )) (want 2): $(head -3 "$W/shim.calls" 2>/dev/null | tr '\n' '|')"
+echo "   cost ledger, P3 (the mock logged every request the daemon made): $(reqs_n) requests = $(grep -c ' 429 ' "$W/mock.json.reqs") rejected (a refused call costs nothing) + $(grep -c ' 200 ' "$W/mock.json.reqs") answered (a 1-token call each: max_tokens=1)"
+echo "   a daemon run = one call as the account in use; a failover = one more as the account it lands on; a failback = none as the account it returns to. P1's real calls: 1 rejected + 1 answered, by the decision (not metered here)."
 
 # ── P4: the guard (ga-8hcnvb.3) on the REAL claude, the REAL Keychain (scratch items only) and the REAL vault ───────────────────────
 echo; echo "== P4  claude-pool-guard: per-version test on the real claude, divergence alert, degrade + recover, key-leak scan"
