@@ -205,8 +205,11 @@ daemon >/dev/null 2>&1
 # What the daemon sent to the (mock) API, one line each: "METHOD PATH STATUS FINGERPRINT" - the fingerprint names the account the call was made AS.
 reqs_n() { if [ -f "$W/mock.json.reqs" ]; then wc -l < "$W/mock.json.reqs" | tr -d ' '; else echo 0; fi; }
 req_lines() { tail -n +"$(( $1 + 1 ))" "$W/mock.json.reqs" 2>/dev/null; }          # req_lines <n0>: every request after the first n0
-switches() { # how many SWITCH lines the daemon has logged; NA when the log cannot be read (never an empty answer that two reads would agree on)
-  if [ -r "$W/city/.gc/logs/claude-pool-account.log" ]; then grep -c "SWITCH " "$W/city/.gc/logs/claude-pool-account.log" 2>/dev/null || true; else echo NA; fi
+switches() { # how many SWITCH lines the daemon has logged; NA when the log cannot be read or grep could not count (never an empty answer that two reads would agree on)
+  local n
+  [ -r "$W/city/.gc/logs/claude-pool-account.log" ] || { echo NA; return; }
+  n="$(grep -c "SWITCH " "$W/city/.gc/logs/claude-pool-account.log" 2>/dev/null)"   # grep -c prints 0 for "none" (rc 1); it prints nothing when it could not read
+  case "$n" in ''|*[!0-9]*) echo NA ;; *) echo "$n" ;; esac
 }
 SW0="$(switches)"
 case "$SW0" in ''|*[!0-9]*) bad "P3.0a the daemon's log cannot be read ('$SW0'): the no-SWITCH checks (P3.0b, P3.1b) and the SWITCH count (P3.7) below cannot tell" ;; *) ok "P3.0a the daemon's log is readable ($SW0 SWITCH line(s) logged before the P3 runs)" ;; esac
@@ -278,9 +281,11 @@ PANE_PID1="$(tmux -L "$SOCK" display-message -p -t s1 '#{pane_pid}' 2>/dev/null)
   && ok "P3.6b one process the whole way: the session's pid is $PANE_PID0 before the first switch and after the last, and it is alive (no restart)" \
   || bad "P3.6b the session's pid went '$PANE_PID0' -> '$PANE_PID1' (or it is gone)"
 # P3.7  the switch path never started a claude: the shim saw no start across P1 and P3 - the failover, the failback and every steady run - beside the SWITCH lines it logged
-[ "$(shim_calls)" = "0" ] && [ "$(( $(switches) - SW0 ))" = 2 ] \
-  && ok "P3.7 $(( $(switches) - SW0 )) SWITCH lines (failover, failback) and the claude on the daemon's PATH was started $(shim_calls) times by any daemon run in this harness - the switch is a script, no claude, no LLM" \
-  || bad "P3.7 shim starts=$(shim_calls) (want 0), SWITCH lines since the seed=$(( $(switches) - SW0 )) (want 2): $(head -3 "$W/shim.calls" 2>/dev/null | tr '\n' '|')"
+SW_END="$(switches)"; SW_DELTA=NA      # a log that cannot be read now (or could not at P3.0a) is NA, not an arithmetic error that aborts the harness and not a count of 0
+case "$SW0" in ''|*[!0-9]*) ;; *) case "$SW_END" in ''|*[!0-9]*) ;; *) SW_DELTA=$(( SW_END - SW0 )) ;; esac ;; esac
+[ "$(shim_calls)" = "0" ] && [ "$SW_DELTA" = 2 ] \
+  && ok "P3.7 $SW_DELTA SWITCH lines (failover, failback) and the claude on the daemon's PATH was started $(shim_calls) times by any daemon run in this harness - the switch is a script, no claude, no LLM" \
+  || bad "P3.7 shim starts=$(shim_calls) (want 0), SWITCH lines since the seed=$SW_DELTA (want 2; NA = the log could not be read): $(head -3 "$W/shim.calls" 2>/dev/null | tr '\n' '|')"
 echo "   cost ledger, P3 (the mock logged every request the daemon made): $(reqs_n) requests = $(grep -c ' 429 ' "$W/mock.json.reqs") rejected (a refused call costs nothing) + $(grep -c ' 200 ' "$W/mock.json.reqs") answered (a 1-token call each: max_tokens=1)"
 echo "   a daemon run = one call as the account in use; a failover = one more as the account it lands on; a failback = none as the account it returns to. P1's real calls: 1 rejected + 1 answered, by the decision (not metered here)."
 

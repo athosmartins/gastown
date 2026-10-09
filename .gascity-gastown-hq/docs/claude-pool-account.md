@@ -67,8 +67,10 @@ The probe never follows a redirect (urllib would re-send the Bearer to wherever 
 
 Why the daemon never starts `claude`: the account that is exhausted is the one `claude` would run on. The probe is
 plain HTTP; the switch is `security -i` with the new blob on **stdin** (hex), so no token is ever in argv, the
-environment, a log, the state file or a notification. Accounts appear as e-mail + sha256[:8] fingerprint. The only programs the daemon's
-source can start are `security`, `ps` and `tmux` (B74, and live-accept P1f reads that off the source).
+environment, a log, the state file or a notification. Accounts appear as e-mail + sha256[:8] fingerprint. The only programs
+`claude-pool-account.py` itself starts are `security`, `ps` and `tmux` (live-accept P1f reads that off the file with an AST scan of its
+`subprocess.*`/`os.*` calls; the accounts library the daemon loads at run time for the vault read is not in that scan, so for it the evidence
+is B74/B74b: a `claude` on the daemon's PATH records any start, and none is recorded across seed, failover, Escape and failback).
 
 Mayor 04/10 (comment on the bead) overrides the original wording: **no utilization threshold** (fail over only when
 the limit is actually hit) and **no confirmation probe on failback** (go back at the stored reset time; if it has not
@@ -100,7 +102,9 @@ What it never does, each with the test that fails if it did:
 - leave an account that answers because of a warning, a utilization (95%, 99%, 100% without `rejected`) or the usage store's numbers, which only
   *order* the candidates once the pool has to move and *gate* the way back (B73, B78a–c; live P3.1b) — the single exception is the failback;
 - call a refused key a "cannot tell" (B76, B78g), or a status it does not understand a limit (B77, B78h);
-- send a key to a pane that is not a pool pane sitting on the limit modal (B76 also checks that a prompt-only pane gets none).
+- send a key to a pane that is not a pool pane sitting on the limit modal (the pane filters are B60–B72; B76/B78i run a pane on the modal and a pane
+  on its prompt through the same 401/403 failover and look 60 s later — the first has its one Escape, the second none — and B78i makes the
+  daemon read every screen as the modal to show that this check fails when a prompt pane is pressed).
 
 ## The guard — divergence alert, per-version test, the daemon's liveness and no key leaks (ga-8hcnvb.3)
 

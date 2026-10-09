@@ -1946,18 +1946,25 @@ EOF
   [ "${n:-0}" -gt 0 ] && "$PY3" -c 'import json,sys; sys.exit(0 if all(json.loads(l).get("max_tokens") == 1 for l in open(sys.argv[1])) else 1)' "$D/probes.log.bodies" 2>/dev/null \
     && ok "B75b every one of those $n probes asks for max_tokens=1 (the doc says '1-token', and this is what it rests on)" || bad "B75b a probe did not ask for max_tokens=1 ($n requests)"
 
-  # (a) a refused key on the ACTIVE account is a failover by itself: no limit screen, no pane, nothing but the probe's own 401/403
+  # (a) a refused key on the ACTIVE account is a failover by itself: no limit screen has to show, the probe's own 401/403 is enough. Two panes
+  # ride along (one on the modal, one on its prompt) to show what the Escape does after such a failover: the first is pressed, the second never.
   scn_refused() {
-    local code r
+    local code r MP PP pk
     for code in 401 403; do
       seeded; world_ok || { WHY="world: the seed failed"; return; }
-      pane_add gastown.dog-1 "$SCR_PROMPT" > /dev/null        # a pool pane that is on its prompt, not on any limit screen
+      pane_add gastown.dog-1 "$SCR_MODAL" > /dev/null; MP=$PANE_LAST      # the control: a pool pane on the limit modal of the credential about to be replaced - it MUST get its key
+      pane_add wa-worker-2 "$SCR_PROMPT" > /dev/null; PP=$PANE_LAST       # a pool pane that is on its prompt, not on any limit screen - it must NOT
       set_srv a@t.test "$code" '{}'; run_d -- run-once
       if ! on_b; then WHY="$WHY [$code on the active a: the pool stayed on '$(jget "$STATE" current)'];"; continue; fi
       [ "$(jex a@t.test why)" = "invalid" ] || WHY="$WHY [$code: a is registered as '$(jex a@t.test why)', want invalid];"
       r="$(jex a@t.test reset_epoch)"
       case "$r" in $((NOW_BASE + 3600))|$((NOW_BASE + 3600)).0) ;; *) WHY="$WHY [$code: a's cooldown ends at '$r', want now+3600];" ;; esac
-      [ "$(keys_sent)" = "0" ] || WHY="$WHY [$code: a key was sent to a pane that is not on a limit screen];"
+      # The run that switches presses nothing for ANY pane (claude has not re-read the item yet: SETTLE_S), so a key count taken right there is 0
+      # for a pane on the modal too and proves nothing. Count 60 s later, when the pane that must be pressed IS pressed.
+      later 60
+      [ "$(keys_to "$MP")" = "1" ] || { WHY="world: at +60 s the control pane on the limit modal got '$(keys_to "$MP")' key(s), want 1 (the Escape path was not exercised)"; return; }
+      pk="$(keys_to "$PP")"
+      { [ "${pk:-0}" = "0" ] && [ "$(keys_sent)" = "1" ]; } || WHY="$WHY [$code: a key was sent to a pane that is not on a limit screen (keys to it: ${pk:-0}, in all: $(keys_sent), want 0 and 1)];"
     done
     # a candidate whose key is refused is skipped and remembered as refused
     seeded; world_ok || { WHY="world: the seed failed"; return; }
@@ -1965,7 +1972,7 @@ EOF
     { [ "$(item_token)" = "$TOKEN_c" ] && [ "$(jex b@t.test why)" = "invalid" ]; } || WHY="$WHY [candidate b refused (403): item=$(item_token | cut -c1-24) b is registered as '$(jex b@t.test why)', want c and invalid];"
   }
   WHY=""; scn_refused
-  [ -z "$WHY" ] && ok "B76 a key refused (401, 403) on the ACTIVE account -> failover on its own, registered 'invalid' with a one-hour cooldown, beside a pane on its prompt that gets no key; a candidate with a refused key is skipped and remembered" || bad "B76$WHY"
+  [ -z "$WHY" ] && ok "B76 a key refused (401, 403) on the ACTIVE account -> failover on its own, registered 'invalid' with a one-hour cooldown; 60 s later the pool pane on the limit modal gets its one Escape and a pool pane on its prompt gets none; a candidate with a refused key is skipped and remembered" || bad "B76$WHY"
 
   # (e) can't tell is inert: an answer that is neither "yes it answers" nor "it is rejected / the key is refused" moves nothing and registers nothing
   scn_unknown() {
@@ -2016,6 +2023,8 @@ EOF
   caught B78f "a confirmation probe of the account a failback returns to" scn_requests "$(mutant fbprobe '        key = keys.token(e)' "        key = keys.token(e)${NL}        probe(key) if key else None")" "the failback probed the account it returns to"
   caught B78g "a refused key (401/403) read as 'cannot tell'"      scn_refused "$(mutant nokey '    if status in (401, 403):' '    if False:')" "[401 on the active a: the pool stayed on 'a@t.test']"
   caught B78h "an unexpected HTTP status read as a limit"          scn_unknown "$(mutant unk '    return Probe("unknown", None, "", f"http={status}")' '    return Probe("rejected", t + DEFAULT_COOLDOWN_S, "", f"http={status}")')" "[http-500: left a"
+  MS='def modal_stuck(text: str) -> bool:'     # the real body stays under another name, so the copy still compiles and only the answer changes
+  caught B78i "every screen read as the limit modal (a pane on its prompt is pressed)" scn_refused "$(mutant modal "$MS" "def modal_stuck(text: str) -> bool:${NL}    return True${NL}${NL}${NL}def _modal_stuck_unused(text: str) -> bool:")" "a key was sent to a pane that is not on a limit screen"
   # what `caught` left in DAEMON is what the rest of the file runs on: it must be the real daemon, byte for byte (not a path we just set by hand)
   [ "$DAEMON" = "$REAL_D" ] && [ -n "$REAL_SUM" ] && [ "$(shasum -a 256 < "$DAEMON" 2>/dev/null | cut -d' ' -f1)" = "$REAL_SUM" ] \
     && ok "B78z the daemon under test is the real one again after the broken copies (same path, same sha256 as before them: the rest of the file ran on it)" \
