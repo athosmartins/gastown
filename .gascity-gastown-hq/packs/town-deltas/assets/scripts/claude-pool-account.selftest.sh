@@ -345,6 +345,15 @@ echo call >> "$D/ps.calls"
 cat "$D/ps.table" 2>/dev/null; exit 0
 EOF
 chmod +x "$BB/tmux" "$BB/pspool"
+# A `claude` on the daemon's PATH that only writes down that it was started (ga-8hcnvb.2.2): the switch is a Keychain write, and the account
+# that is exhausted is the one `claude` would run on - so a daemon that starts it, for any reason, is a daemon that spends the credit it
+# is there to protect (Athos 04/10: no claude / no LLM in the path). B73 runs every kind of switch with it on PATH and wants the log empty.
+cat > "$BB/claude" <<'EOF'
+#!/bin/bash
+[ -n "${FAKE_KC:-}" ] && echo "claude $*" >> "$FAKE_KC/claude.calls"
+exit 99
+EOF
+chmod +x "$BB/claude"
 # The screens. SCR_MODAL is claude's limit modal as measured on 2.1.291; the others are what must NOT be pressed.
 NL=$'\n'
 SCR_MODAL="● Done: the refactor is in.${NL}${NL}  What do you want to do?${NL}  ❯ 1. Stop and wait for limit to reset${NL}    2. Wait here, then continue automatically at Oct 7 at 7pm${NL}    3. Upgrade your plan${NL}${NL}  Enter to confirm · Esc to cancel"
@@ -375,9 +384,12 @@ class H(http.server.BaseHTTPRequestHandler):
         with open(LOG, "a") as f: f.write(tok + "\n")
         # what the probe ASKED for (ga-6gat1o): model and system prompt, one JSON line per request, beside the token log. A body that is not
         # JSON (or a GET) is recorded as {"unparsed": true} - never as an empty request that would pass for "no model asked for".
-        try: b = json.loads(raw.decode("utf-8")); rec = {"model": b.get("model"), "system": b.get("system")}
+        try: b = json.loads(raw.decode("utf-8")); rec = {"model": b.get("model"), "system": b.get("system"), "max_tokens": b.get("max_tokens")}
         except Exception: rec = {"unparsed": True}
         with open(LOG + ".bodies", "a") as f: f.write(json.dumps(rec) + "\n")
+        # ga-8hcnvb.2.2: WHAT was asked and WHAT it was answered, one line per request ("<method> <path> <status> <token>"): the daemon may
+        # only ever POST the probe, and a probe that was ANSWERED (2xx) is a call that was served - the only kind that costs anything.
+        with open(LOG + ".reqs", "a") as f: f.write("%s %s %d %s\n" % (self.command, self.path.split("?")[0], beh["status"], tok))
         self.send_response(beh["status"])
         for k, v in beh.get("h", {}).items(): self.send_header(k, v)
         body = b"{}"; self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body)))
@@ -1826,6 +1838,186 @@ EOF
     && ok "B72f every account rejected (no switch to make, the active one registered exhausted): an Escape would only land on the next 429 -> no key" || bad "B72f keys=$(keys_sent) log: $(grep -E 'exhausted' "$LOG" | tail -n 1 | cut -c1-160)"
   for e in a@t.test b@t.test c@t.test; do set_srv "$e" 200 "$HDR_OK"; done; later 120
   [ "$(keys_to "$P")" = "1" ] && ok "B72g ...and once the account answers again the pane is pressed (non-vacuous)" || bad "B72g keys=$(keys_sent)"
+
+  # ══ B73+ (ga-8hcnvb.2.2) the pool leaves an account at its limit and only there, by a script that starts no claude ═════════════════════
+  # Athos 04/10: switch accounts ONLY at 100%, by a SCRIPT, with no claude / LLM in the path. The daemon already does that (failover on a
+  # probe the API REJECTS, failback at the stored reset with no probe of the account it returns to); what was missing is a proof that can
+  # FAIL. So each property has a scenario, and the scenario is run twice: on the real daemon (it must hold), and on a copy of the daemon
+  # with that one property broken on purpose (it must NOT hold - B78). A scenario that passes on the broken copy proves nothing, and one
+  # whose broken copy does not even run its world (`world:` in WHY) is reported as vacuous, not as caught.
+  REAL_D="$DAEMON"
+  n_reqs()       { [ -s "$D/probes.log.reqs" ] && wc -l < "$D/probes.log.reqs" | tr -d ' ' || echo 0; }
+  n_served()     { awk '$3 >= 200 && $3 < 300' "$D/probes.log.reqs" 2>/dev/null | wc -l | tr -d ' '; }      # answered with a 2xx: the calls that cost something
+  n_not_probe()  { awk '!($1 == "POST" && $2 == "/v1/messages")' "$D/probes.log.reqs" 2>/dev/null | wc -l | tr -d ' '; }
+  claude_calls() { [ -s "$D/kc/claude.calls" ] && wc -l < "$D/kc/claude.calls" | tr -d ' ' || echo 0; }
+  hdr_use() { # hdr_use <status of the call> <5h utilization> <7d utilization>: the headers of a call that was SERVED, with the use the API reports
+    printf '{"anthropic-ratelimit-unified-status":"%s","anthropic-ratelimit-unified-5h-status":"%s","anthropic-ratelimit-unified-7d-status":"%s","anthropic-ratelimit-unified-5h-utilization":"%s","anthropic-ratelimit-unified-7d-utilization":"%s","anthropic-ratelimit-unified-5h-reset":"1900000000","anthropic-ratelimit-unified-7d-reset":"1900500000","anthropic-ratelimit-unified-representative-claim":"seven_day"}' "$1" "$1" "$1" "$2" "$3"
+  }
+  store_use() { # store_use <a's weekly %> <a's session %>: the default usage store with a at that use and b, c at 0 (the store is what ORDERS accounts)
+    "$PY3" - "$D/usage.json" "$1" "$2" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for a in d["accounts"]:
+    on = a["email"] == "a@t.test"
+    a["weekly_all"]["percent"] = float(sys.argv[2]) if on else 0
+    a["session"]["percent"] = float(sys.argv[3]) if on else 0
+json.dump(d, open(sys.argv[1], "w"))
+EOF
+  }
+  world_ok() { [ "$(item_token)" = "$TOKEN_a" ] && [ "$(jget "$STATE" current)" = "a@t.test" ]; }   # the seed worked: a copy that cannot even seed has "caught" nothing
+  WHY=""
+  still_a() { # still_a <label> <item writes before the runs>: adds to WHY whatever moved, was registered, was probed, or was started
+    local why=""
+    { [ "$(item_token)" = "$TOKEN_a" ] && [ "$(jget "$STATE" current)" = "a@t.test" ]; } || why="$why left a (current='$(jget "$STATE" current)');"
+    [ "$(writes)" = "$2" ] || why="$why item written $2 -> $(writes);"
+    case "$(jget "$STATE" exhausted)" in ""|"{}") ;; *) why="$why registered an account as exhausted;" ;; esac
+    { [ "$(probes_of b@t.test)" = "0" ] && [ "$(probes_of c@t.test)" = "0" ]; } || why="$why probed a candidate (b=$(probes_of b@t.test) c=$(probes_of c@t.test));"
+    [ "$(claude_calls)" = "0" ] || why="$why started claude;"
+    [ -z "$why" ] || WHY="$WHY [$1:$why]"
+  }
+
+  # (c) NO switch before the limit is hit. The only thing that sends the pool away from an account that ANSWERS is the API saying
+  # "rejected" (a 429, or a rejected status in the unified headers). Not a utilization, not a warning, not the usage store's ranking.
+  scn_no_early_switch() {
+    local spec label st u5 u7 uw us w0
+    for spec in "use-50|allowed|0.50|0.50" "warning-95|allowed_warning|0.95|0.60" "warning-99|allowed_warning|0.60|0.99" "use-100-but-not-rejected|allowed|1.0|1.0"; do
+      IFS='|' read -r label st u5 u7 <<< "$spec"
+      seeded; world_ok || { WHY="world: the seed failed"; return; }
+      w0=$(writes); set_srv a@t.test 200 "$(hdr_use "$st" "$u5" "$u7")"
+      run_d -- run-once; run_d -- run-once; run_d -- run-once
+      still_a "$label" "$w0"
+    done
+    for spec in "store-99|99|99" "store-100-and-the-API-answers|100|100" "store-weekly-100|100|0" "store-session-100|0|100"; do
+      IFS='|' read -r label uw us <<< "$spec"
+      seeded; world_ok || { WHY="world: the seed failed"; return; }
+      w0=$(writes); store_use "$uw" "$us"
+      run_d -- run-once; run_d -- run-once; run_d -- run-once
+      still_a "$label" "$w0"
+    done
+  }
+  WHY=""; scn_no_early_switch
+  [ -z "$WHY" ] && ok "B73 no switch before the limit: a answers 200 at 50% / warning at 95% and 99% / 100% but not rejected, and the usage store has a at 99% / 100% (weekly or session) - 3 runs each: stays on a, no item write, nothing registered, no candidate probed, no claude" \
+    || bad "B73 the pool moved (or probed, or started claude) with nothing rejected:$WHY"
+  # B73b the control: the same worlds CAN switch - the API rejecting is what does it (else B73 is a world in which nothing ever moves)
+  seeded; world_ok && set_srv a@t.test 200 "$(hdr_use allowed_warning 0.99 0.99)" && run_d -- run-once && [ "$(jget "$STATE" current)" = "a@t.test" ] \
+    && set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)" && run_d -- run-once && on_b \
+    && ok "B73b control: the same world, a warning at 99% changed nothing and the next run - the API REJECTING a - moved the pool to b" || bad "B73b the control world did not switch on a rejection: current='$(jget "$STATE" current)'"
+
+  # (b) the switch path starts no claude. Seed, failover, the Escape for a pane on the limit modal, and failback, all with a `claude` on the
+  # daemon's PATH that writes down that it was started.
+  scn_no_claude() {
+    local P
+    seeded; world_ok || { WHY="world: the seed failed"; return; }
+    pane_add gastown.dog-1 "$SCR_MODAL" > /dev/null; P=$PANE_LAST
+    fail_a; on_b || { WHY="world: the failover did not happen"; return; }
+    later 60
+    [ "$(keys_to "$P")" = "1" ] || { WHY="world: the Escape was not exercised"; return; }
+    later 120
+    NOW_OVERRIDE=2000000100 run_d -- run-once
+    [ "$(item_token)" = "$TOKEN_a" ] || { WHY="world: the failback did not happen"; return; }
+    [ "$(claude_calls)" = "0" ] || WHY="$WHY [claude was started $(claude_calls) time(s): $(head -n 1 "$D/kc/claude.calls")];"
+  }
+  new_d; env -i PATH="$BB:/usr/bin:/bin" FAKE_KC="$D/kc" claude --version > /dev/null 2>&1
+  [ "$(claude_calls)" = "1" ] && ok "B74 control: the \`claude\` on the daemon's PATH writes down that it was started (the instrument sees)" || bad "B74 the claude shim did not record a start: calls=$(claude_calls)"
+  WHY=""; scn_no_claude
+  [ -z "$WHY" ] && ok "B74b seed, failover, the Escape into a stuck pane and failback: 3 SWITCH lines, one Escape, and claude never started" || bad "B74b$WHY"
+  [ "$(grep -c ' SWITCH ' "$LOG")" = "3" ] && ok "B74c ...and the log shows the three switches that B74b ran through (seed, failover, failback), so its silence is not a run that did nothing" || bad "B74c SWITCH lines: $(grep -c ' SWITCH ' "$LOG")"
+
+  # (d) what the switch path asks of the API: only the 1-token probe; a failback asks nothing of the account it returns to
+  scn_requests() {
+    local r0 s0 pa0
+    seeded; world_ok || { WHY="world: the seed failed"; return; }
+    r0=$(n_reqs); run_d -- run-once
+    [ "$(( $(n_reqs) - r0 ))" = "1" ] || WHY="$WHY [a steady run made $(( $(n_reqs) - r0 )) requests, want 1];"
+    set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"
+    r0=$(n_reqs); s0=$(n_served); run_d -- run-once
+    [ "$(jget "$STATE" current)" = "b@t.test" ] || { WHY="world: the failover did not happen"; return; }
+    { [ "$(( $(n_reqs) - r0 ))" = "2" ] && [ "$(( $(n_served) - s0 ))" = "1" ]; } || WHY="$WHY [the failover made $(( $(n_reqs) - r0 )) requests, $(( $(n_served) - s0 )) answered; want 2 and 1 (a refused, b answered)];"
+    pa0=$(probes_of a@t.test); r0=$(n_reqs)
+    NOW_OVERRIDE=2000000100 run_d -- run-once
+    [ "$(jget "$STATE" current)" = "a@t.test" ] || { WHY="world: the failback did not happen"; return; }
+    [ "$(probes_of a@t.test)" = "$pa0" ] || WHY="$WHY [the failback probed the account it returns to];"
+    [ "$(( $(n_reqs) - r0 ))" = "1" ] || WHY="$WHY [the failback run made $(( $(n_reqs) - r0 )) requests, want 1 (b's own probe)];"
+    [ "$(n_not_probe)" = "0" ] || WHY="$WHY [$(n_not_probe) request(s) that are not POST /v1/messages];"
+  }
+  WHY=""; scn_requests
+  [ -z "$WHY" ] && ok "B75 requests: a steady run = 1 probe; a failover = 2 (the rejected a, the answered b); a failback = 1 (the account in use) and NONE to the account it returns to; never anything but POST /v1/messages" || bad "B75$WHY"
+  n="$(wc -l < "$D/probes.log.bodies" 2>/dev/null | tr -d ' ')"
+  [ "${n:-0}" -gt 0 ] && "$PY3" -c 'import json,sys; sys.exit(0 if all(json.loads(l).get("max_tokens") == 1 for l in open(sys.argv[1])) else 1)' "$D/probes.log.bodies" 2>/dev/null \
+    && ok "B75b every one of those $n probes asks for max_tokens=1 (the doc says '1-token', and this is what it rests on)" || bad "B75b a probe did not ask for max_tokens=1 ($n requests)"
+
+  # (a) a refused key on the ACTIVE account is a failover by itself: no limit screen, no pane, nothing but the probe's own 401/403
+  scn_refused() {
+    local code r
+    for code in 401 403; do
+      seeded; world_ok || { WHY="world: the seed failed"; return; }
+      pane_add gastown.dog-1 "$SCR_PROMPT" > /dev/null        # a pool pane that is on its prompt, not on any limit screen
+      set_srv a@t.test "$code" '{}'; run_d -- run-once
+      if ! on_b; then WHY="$WHY [$code on the active a: the pool stayed on '$(jget "$STATE" current)'];"; continue; fi
+      [ "$(jex a@t.test why)" = "invalid" ] || WHY="$WHY [$code: a is registered as '$(jex a@t.test why)', want invalid];"
+      r="$(jex a@t.test reset_epoch)"
+      case "$r" in $((NOW_BASE + 3600))|$((NOW_BASE + 3600)).0) ;; *) WHY="$WHY [$code: a's cooldown ends at '$r', want now+3600];" ;; esac
+      [ "$(keys_sent)" = "0" ] || WHY="$WHY [$code: a key was sent to a pane that is not on a limit screen];"
+    done
+    # a candidate whose key is refused is skipped and remembered as refused
+    seeded; world_ok || { WHY="world: the seed failed"; return; }
+    set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; set_srv b@t.test 403 '{}'; run_d -- run-once
+    { [ "$(item_token)" = "$TOKEN_c" ] && [ "$(jex b@t.test why)" = "invalid" ]; } || WHY="$WHY [candidate b refused (403): item=$(item_token | cut -c1-24) b is registered as '$(jex b@t.test why)', want c and invalid];"
+  }
+  WHY=""; scn_refused
+  [ -z "$WHY" ] && ok "B76 a key refused (401, 403) on the ACTIVE account -> failover on its own, registered 'invalid' with a one-hour cooldown, beside a pane on its prompt that gets no key; a candidate with a refused key is skipped and remembered" || bad "B76$WHY"
+
+  # (e) can't tell is inert: an answer that is neither "yes it answers" nor "it is rejected / the key is refused" moves nothing and registers nothing
+  scn_unknown() {
+    local code w0
+    for code in 400 404 408 500 502 503 529; do
+      seeded; world_ok || { WHY="world: the seed failed"; return; }
+      w0=$(writes); set_srv a@t.test "$code" '{}'; run_d -- run-once; run_d -- run-once
+      still_a "http-$code" "$w0"
+    done
+    seeded; world_ok || { WHY="world: the seed failed"; return; }
+    set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; set_srv b@t.test 500 '{}'; run_d -- run-once
+    { [ "$(item_token)" = "$TOKEN_c" ] && [ -z "$(jex b@t.test reset_epoch)" ]; } || WHY="$WHY [candidate b answered 500: item=$(item_token | cut -c1-24) b registered until '$(jex b@t.test reset_epoch)'; want c, and b NOT registered];"
+  }
+  WHY=""; scn_unknown
+  [ -z "$WHY" ] && ok "B77 can't tell is inert: HTTP 400 / 404 / 408 / 500 / 502 / 503 / 529 on the active account change nothing and register nothing; a candidate that answers 500 is skipped without being marked exhausted" || bad "B77$WHY"
+
+  # B78 the same scenarios on a daemon with ONE property broken each: every one must be caught
+  mutant() { # mutant <name> <old text> <new text>: a copy of the daemon with exactly one occurrence of <old> replaced (prints its path; nothing if <old> is not there exactly once or the copy does not compile)
+    local out="$W/mut/$1/claude-pool-account.py"; mkdir -p "$W/mut/$1"
+    "$PY3" - "$REAL_D" "$out" "$2" "$3" <<'EOF' && printf '%s' "$out"
+import sys
+src, dst, old, new = sys.argv[1:5]
+t = open(src).read()
+if t.count(old) != 1: sys.exit(1)
+t = t.replace(old, new)
+compile(t, dst, "exec")
+open(dst, "w").write(t)
+EOF
+  }
+  caught() { # caught <id> <what is broken> <scenario> <mutant path> <what WHY must say: caught for the right reason, not just failed somewhere>
+    local id="$1" what="$2" fn="$3" m="$4" needle="$5"
+    if [ -z "$m" ]; then bad "$id vacuous: could not build a daemon with $what (the line to change is not there exactly once)"; return; fi
+    WHY=""; DAEMON="$m"; "$fn"; DAEMON="$REAL_D"
+    case "$WHY" in
+      "")       bad "$id NOT CAUGHT: with $what the scenario still passes" ;;
+      world:*)  bad "$id vacuous: the daemon with $what does not run the scenario's world ($WHY)" ;;
+      *"$needle"*) ok "$id caught - a daemon with $what: '$needle'" ;;
+      *)        bad "$id the scenario failed on a daemon with $what, but not for that reason (wanted '$needle'): $(printf '%s' "$WHY" | cut -c1-200)" ;;
+    esac
+  }
+  SW='def switch_to(st: dict, user: str, email: str, token: str, reason: str, t: float) -> bool:'
+  CL='rejected = status == 429 or overall == "rejected" or any(v == "rejected" for v in windows.values())'
+  caught B78a "a warning (allowed_warning) read as a limit"      scn_no_early_switch "$(mutant warn "$CL" "$CL or overall == \"allowed_warning\" or any(v == \"allowed_warning\" for v in windows.values())")" "[warning-95: left a"
+  caught B78b "a utilization of 95% read as a limit"              scn_no_early_switch "$(mutant util "$CL" "$CL or any(float(h.get(f\"{pre}{w}-utilization\", \"0\") or 0) >= 0.95 for w in (\"5h\", \"7d\"))")" "[warning-95: left a"
+  caught B78c "a switch to a better-ranked account while the active one answers" scn_no_early_switch "$(mutant rank '        # active account answers. What it just answered beats anything stored about it.' "        # active account answers. What it just answered beats anything stored about it.${NL}        _g = pick_next(st, order, keys, {cur}, t)${NL}        if _g and cur in order and order.index(_g[0]) < order.index(cur):${NL}            switch_to(st, user, _g[0], _g[1], 'mutant: ranked ahead', t)${NL}            return")" "[store-100-and-the-API-answers: left a"
+  caught B78d "claude started inside switch_to"                   scn_no_claude "$(mutant spawn "$SW" "$SW${NL}    subprocess.run(['claude', '--version'], capture_output=True, timeout=5, check=False)")" "[claude was started"
+  caught B78e "a call to a usage / balance endpoint inside switch_to" scn_requests "$(mutant balance "$SW" "$SW${NL}    try:${NL}        urllib.request.urlopen(urllib.request.Request(probe_url().replace('/v1/messages', '/api/oauth/usage'), headers={'authorization': 'Bearer ' + token}), timeout=5).read()${NL}    except Exception:${NL}        pass")" "request(s) that are not POST /v1/messages"
+  caught B78f "a confirmation probe of the account a failback returns to" scn_requests "$(mutant fbprobe '        key = keys.token(e)' "        key = keys.token(e)${NL}        probe(key) if key else None")" "the failback probed the account it returns to"
+  caught B78g "a refused key (401/403) read as 'cannot tell'"      scn_refused "$(mutant nokey '    if status in (401, 403):' '    if False:')" "[401 on the active a: the pool stayed on 'a@t.test']"
+  caught B78h "an unexpected HTTP status read as a limit"          scn_unknown "$(mutant unk '    return Probe("unknown", None, "", f"http={status}")' '    return Probe("rejected", t + DEFAULT_COOLDOWN_S, "", f"http={status}")')" "[http-500: left a"
+  DAEMON="$REAL_D"
+  [ "$DAEMON" = "$REAL_D" ] && ! grep -q 'mutant' "$DAEMON" && ok "B78z the daemon under test is the real one again after the broken copies (the rest of the file ran on it)" || bad "B78z DAEMON was left pointing at a broken copy ($DAEMON)"
 
 [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
 
