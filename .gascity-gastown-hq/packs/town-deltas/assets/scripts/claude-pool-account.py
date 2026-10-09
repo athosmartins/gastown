@@ -971,7 +971,17 @@ def unstick(st: dict, user: str, t: float) -> None:
     tracked = st.get("panes")
     if not scan.ok or not isinstance(tracked, dict) or not tracked:
         return
-    todo = [p for p in scan.panes if p.stuck and p.key in tracked and stale_modal(st, p, tracked[p.key]) and tracked[p.key]["tries"] < MAX_ESC_TRIES]
+    on_modal = [(p, stale_modal(st, p, tracked[p.key])) for p in scan.panes if p.stuck and p.key in tracked]
+    # Two more reasons NOT to press, and a reason that leaves no line is indistinguishable from a daemon that did not look. A modal that is not
+    # about the replaced credential reads the same whether it arrived late or the daemon was blind in the window after the switch: say it.
+    fresh = [p for p, stale in on_modal if not stale and pool_agent(p.agent)]
+    spent = [p for p, stale in on_modal if stale and pool_agent(p.agent) and tracked[p.key]["tries"] >= MAX_ESC_TRIES]
+    if fresh:
+        log("INFO", f"{len(fresh)} pool pane(s) on the limit modal that is not about the replaced credential (started after the rewrite, or first seen "
+                    f"more than {STALE_WINDOW_S} s after it) - no Escape")
+    if spent:
+        log("INFO", f"{len(spent)} pool pane(s) still on the limit modal after {MAX_ESC_TRIES} Escapes - no more keys for them this cycle")
+    todo = [p for p, stale in on_modal if stale and tracked[p.key]["tries"] < MAX_ESC_TRIES]
     nameless = [p for p in todo if not pool_agent(p.agent)]   # the wrapper could not log who this is ("?"): not told apart from Mayor or a crew
     if nameless:
         log("INFO", f"{len(nameless)} pane(s) on the limit modal of a replaced credential have no pool agent name - not told apart from Mayor/crew, no Escape for them")

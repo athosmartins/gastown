@@ -1608,12 +1608,15 @@ print(v[0] if v else "<none>")' "$STATE" "$1" "$2" 2>/dev/null
   f="$(pane_entry "$P" first)"
   [ "$(keys_to "$Q")" = "1" ] && [ "$(keys_to "$P")" = "0" ] && [ "${f%.0}" = "$((NOW_BASE + 100))" ] \
     && ok "B63c a modal FIRST seen 100 s after the switch (window 90 s) is the new account's own limit: not pressed (the control, seen at the switch, was)" || bad "B63c keys: control $(keys_to "$Q"), late pane $(keys_to "$P"), its first='$f'"
+  grep -q "not about the replaced credential" "$LOG" && ok "B63c2 ...and the log SAYS the late modal was judged not about the replaced credential (a late modal and a blind daemon no longer read the same: silence)" \
+    || bad "B63c2 no 'not about the replaced credential' line: $(grep -E 'INFO|WARN' "$LOG" | tail -n 3 | cut -c1-200 | tr '\n' '|')"
 
   seeded; pane_add wa-worker-1 "$SCR_MODAL"; Q=$PANE_LAST
   fail_a; pane_add gastown.dog-1 "$SCR_MODAL" 20; P=$PANE_LAST     # started 20 s AFTER the rewrite: it never had the replaced credential
   later 60; later 150
   [ "$(keys_to "$Q")" = "1" ] && [ "$(keys_to "$P")" = "0" ] && [ "$(addressed "$P")" -ge 1 ] \
     && ok "B63d a session launched after the rewrite is on the modal of its OWN credential: read, not pressed (the one launched before was)" || bad "B63d keys: control $(keys_to "$Q"), late launch $(keys_to "$P"), addressed $(addressed "$P")"
+  grep -q "not about the replaced credential" "$LOG" && ok "B63d2 ...and the log says so for the session launched after the rewrite too" || bad "B63d2 no 'not about the replaced credential' line"
 
   seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; foreign_item; later 700
   on_b; [ "$(item_token)" = "$TOKEN_a" ] && grep -q "rewriting" "$LOG" && [ "$(keys_sent)" = "0" ] && [ "$(tmux_calls)" = "0" ] \
@@ -1748,6 +1751,7 @@ print("OK" if not bad else "BAD: " + "; ".join(bad))' "$DAEMON" 2>&1 | tail -n 3
   seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a
   edit_state 'k = list(st["panes"])[0]; st["panes"][k]["tries"] = "0"'; later 60
   [ "$(keys_sent)" = "0" ] && [ "$(pane_entry "$P" tries)" = "3" ] && ok "B67 tries='0' (a string) in the state reads as 'all tries spent': no key" || bad "B67 keys=$(keys_sent) tries=$(pane_entry "$P" tries)"
+  grep -q "after 3 Escapes" "$LOG" && ok "B67a ...and the log says the pane is still on the modal after its 3 Escapes (no silent give-up)" || bad "B67a no 'after 3 Escapes' line: $(grep -E 'INFO|WARN' "$LOG" | tail -n 3 | cut -c1-200 | tr '\n' '|')"
   edit_state 'k = list(st["panes"])[0]; st["panes"][k]["tries"] = 2'; later 120
   [ "$(keys_to "$P")" = "1" ] && [ "$(pane_entry "$P" tries)" = "3" ] && ok "B67b tries=2 -> one more Escape, and it is counted before it is sent" || bad "B67b keys=$(keys_sent) tries=$(pane_entry "$P" tries)"
 
@@ -1803,6 +1807,9 @@ EOF
   seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a
   DAEMON="$W/break_unstick.py"; later 60 REAL_DAEMON="$REAL_DAEMON_FILE" BREAK=send_escape; DAEMON="$REAL_DAEMON_FILE"
   on_b && [ "$(keys_sent)" = "0" ] && grep -q "unstick failed (RuntimeError)" "$LOG" && ok "B71b send_escape() raising at the key: no key, the decision stands, the failure is logged" || bad "B71b keys=$(keys_sent) log: $(tail -n 2 "$LOG" | cut -c1-160 | tr '\n' '|')"
+  hbe() { "$PY3" -c 'import json,sys; print(json.load(open(sys.argv[1]))["epoch"])' "$D/city/.gc/claude-pool-account.heartbeat" 2>/dev/null || echo "<none>"; }
+  [ "$(hbe)" = "$NOW_BASE.0" ] || [ "$(hbe)" = "$NOW_BASE" ] && ok "B71c a run whose unstick failed does NOT stamp the heartbeat (it still holds the clean run before it)" || bad "B71c heartbeat epoch after the failed run: $(hbe), expected $NOW_BASE"
+  later 120; [ "$(hbe)" = "$((NOW_BASE + 120)).0" ] || [ "$(hbe)" = "$((NOW_BASE + 120))" ] && ok "B71d ...and the next run that finishes clean stamps it again (so B71c was not a heartbeat that never moves)" || bad "B71d heartbeat epoch after a clean run: $(hbe), expected $((NOW_BASE + 120))"
 
   # B72 the item must still be the decision's, readable, and the account usable, when the key is sent
   seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a; touch "$D/kc/locked"; later 60

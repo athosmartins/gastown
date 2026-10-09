@@ -366,7 +366,10 @@ once the cycle (10 min) is over, whatever the pane shows.
 screen cannot be captured, a state whose `item_at` is junk or absent (a state from before this existed), a Keychain that is locked,
 a `tries` that is not a number (read as *all tries spent*, never as a fresh one): no key. The run logs what it could not do, keeps what it
 had seen, and the next run that can look decides. An exception anywhere inside the unstick is caught at the `run_once` level
-(`unstick failed (<Type>) - no further key sent this run`): the switch, the decision and the heartbeat are already done and are not lost.
+(`unstick failed (<Type>) - no further key sent this run`, at `ERROR`): the switch and the published decision are already done and are not lost. The
+heartbeat is **not** stamped by that run — like any run that logs an `ERROR` (see LIVENESS above) — so an unstick that keeps failing is caught by the
+guard's 10-minute liveness push, whose text ("O pool não troca de conta sozinho enquanto isso") then overstates it: the switching itself is fine, only the Escape is down.
+That is deliberate (a feature that silently cannot run is a fault worth a push); the log line above is what tells the two apart.
 
 **Switches.**
 
@@ -382,8 +385,15 @@ had seen, and the next run that can look decides. An exception anywhere inside t
 - `waiting 45 s for claude to re-read it before sending Escape` / `20 Escapes sent this run - the rest wait for the next one`;
 - `unstick disabled by ... - no key sent`; `... is registered as exhausted - no Escape into it`; `the pool item could not be read | does not hold the
   credential of the decision - no Escape sent`;
-- at the key: `is not the process it was a moment ago - nothing sent`, `no longer shows the limit modal - nothing sent`, `tmux send-keys failed (exit=N)`;
-- can't tell: `N pool pane(s) could not be read this run`, `tmux could not be run - no pane looked at this run`, `ps unreadable - ...`,
+- at the key: `is not the process it was a moment ago - nothing sent`, `no longer shows the limit modal - nothing sent`, and — each its own line, because
+  a failing tmux is not "a different process" or "no modal" — `tmux display-message failed (exit=N)`, `tmux capture-pane failed (exit=N)`,
+  `tmux send-keys failed (exit=N)`;
+- a pane on the modal that gets no key, said once per run (a run per minute, for the 10 minutes of the cycle): `N pool pane(s) on the limit modal that is not
+  about the replaced credential (started after the rewrite, or first seen more than 90 s after it) - no Escape` (a late modal and a daemon that was blind in
+  the window after the switch look the same from here — this line only makes the first visible), and `N pool pane(s) still on the limit modal after 3 Escapes -
+  no more keys for them this cycle`;
+- can't tell: `N pool pane(s) could not be read this run`, `tmux could not be run - no pane looked at this run`, `tmux list-panes failed (exit=N) - no pane
+  looked at this run` (tmux ran and failed: no server on the socket, a wrong `CLAUDE_POOL_TMUX_SOCKET`, a restarted server), `ps unreadable - ...`,
   `the wrapper's log could not be read - ...`;
 - `pane scan: N live process(es) on the pool item with an agent name that is no pool role` — said once every 10 minutes (clock minute
   divisible by 10): a pool role missing from `POOL_AGENT_RE` shows up here instead of being a session that is never unstuck, silently.
