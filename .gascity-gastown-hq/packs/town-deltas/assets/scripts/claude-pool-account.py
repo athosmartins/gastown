@@ -111,6 +111,8 @@ SETTLE_S = 45                     # claude re-reads the pool item every ~30 s: n
 STALE_WINDOW_S = 90               # a limit modal first SEEN this soon after a rewrite belongs to the credential that was replaced
 MAX_ESC_TRIES = 3                 # per pane: an Escape that does not take is not repeated for ever
 MAX_ESC_PER_RUN = 20              # and never an unbounded burst of keys
+UNSTICK_HORIZON_S = 600           # a switch is "this cycle" for this long: after it no pane is looked at (tmux is not even asked) and none is remembered
+ITEM_WRITTEN_AT: Optional[float] = None   # when THIS process last wrote the pool item (a switch or a heal): claude has not seen that write yet either
 SILENT_DROP_LOG_EVERY_MIN = 10    # what a run leaves out without acting (processes that are no pool role, panes/ps rows it could not use) says
                                   # so on clock minutes that are a multiple of this: a signal where there was silence, not a line a minute
 LAUNCH_TAIL_BYTES = 1 << 20       # how much of the end of the wrapper's log is read to find pool launches
@@ -386,6 +388,8 @@ def write_item(user: str, token: str) -> bool:
     if r.returncode != 0:
         log("ERROR", f"security -i exit={r.returncode}")
         return False
+    global ITEM_WRITTEN_AT
+    ITEM_WRITTEN_AT = now()
     return True
 
 
@@ -634,6 +638,370 @@ def _cap_line(parts: List[str]) -> str:
     return line if len(line) <= cap else line[:cap - len(mark)] + mark
 
 
+# ── the Escape that unsticks a pool session (ga-8hcnvb.2.1) ───────────────────────────────────────
+# The limit modal waits for a key and does not notice a new credential (ga-2yyitx). Measured on claude 2.1.291 with a really exhausted
+# account, the screen is, at the bottom of the pane and in place of the prompt:
+#
+#     What do you want to do?
+#     ❯ 1. Stop and wait for limit to reset
+#       2. Wait here, then continue automatically at Oct 7 at 7pm
+#       3. Upgrade your plan
+#     Enter to confirm · Esc to cancel
+#
+# Everything here is a reason NOT to press, and every read has three outcomes - yes, no, can't tell - where can't-tell is inert: it
+# presses nothing and it forgets nothing. The one key is sent by send_escape; the checklist is in unstick(); the doctrine is in
+# docs/claude-pool-account.md ("The Escape exception").
+def pool_agent(name: str) -> bool:
+    """Is this agent name (as `gc session list` prints it, and as the wrapper logs it) a pool role? An ALLOW-list: see POOL_AGENT_RE."""
+    return POOL_AGENT_RE.fullmatch(name) is not None
+
+
+class PanePeek:
+    def __init__(self, pane_id: str, pane_pid: int, proof_pid: int, agent: str, stuck: bool, launched: float):
+        self.pane_id, self.pane_pid, self.proof_pid, self.agent, self.stuck = pane_id, pane_pid, proof_pid, agent, stuck
+        self.launched = launched   # when the wrapper started the claude in it (the POOL-ACCT SET line): a session started after a rewrite never had the old credential
+        self.key = f"{pane_id}:{proof_pid}"   # a recycled pane id with another process is another key
+
+
+class Scan:
+    """`ok` False = could not look (no tmux, no ps, no log): nothing is concluded from it, and the bookkeeping about panes is left as it was.
+    `unlooked` = keys of proven pool panes whose screen could not be read in an otherwise good scan: they are neither on the modal nor
+    off it, so nothing is concluded about them and what is known about them is kept (see track_panes)."""
+
+    def __init__(self, ok: bool, panes: Optional[List[PanePeek]] = None, unlooked: Optional[List[str]] = None):
+        self.ok, self.panes, self.unlooked = ok, panes or [], set(unlooked or [])
+        self.by_key = {p.key: p for p in self.panes}
+
+
+def modal_stuck(text: str) -> bool:
+    """True iff the screen's LAST lines are claude's limit modal. The footer must be the last line on screen and the question and the
+    option must precede it, in that order: while the modal is open it replaces the prompt box, so nothing follows it. An agent that
+    merely QUOTES these words in its transcript (this very bead does) has the prompt box under the quote, and is not matched -
+    sending Escape to a working session interrupts it."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines or not ("Enter to confirm" in lines[-1] and "Esc to cancel" in lines[-1]):
+        return False
+    tail = lines[-10:-1]
+    ask = [i for i, ln in enumerate(tail) if "What do you want to do?" in ln]
+    opt = [i for i, ln in enumerate(tail) if re.search(r"\b1\.\s*Stop and wait for limit to reset", ln)]
+    return bool(ask and opt and ask[-1] < opt[-1])
+
+
+def tmux_bin() -> Optional[str]:
+    p = os.environ.get("CLAUDE_POOL_TMUX")
+    if p:
+        return p if os.access(p, os.X_OK) else None
+    return shutil.which("tmux") or next((c for c in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux") if os.access(c, os.X_OK)), None)
+
+
+def tmux_socket() -> str:
+    s = os.environ.get("CLAUDE_POOL_TMUX_SOCKET") or DEFAULT_TMUX_SOCKET
+    return s if SOCKET_RE.fullmatch(s) and s not in (".", "..") else DEFAULT_TMUX_SOCKET
+
+
+def tmux(args: List[str]) -> Tuple[Optional[int], str]:
+    """(exit code, stdout); (None, "") when tmux could not be run at all."""
+    b = tmux_bin()
+    if not b:
+        return None, ""
+    try:
+        r = subprocess.run([b, "-L", tmux_socket()] + args, capture_output=True, text=True, errors="replace", timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    return r.returncode, r.stdout
+
+
+def ps_bin() -> Optional[str]:
+    p = os.environ.get("CLAUDE_POOL_PS")
+    if p:
+        return p if os.access(p, os.X_OK) else None
+    return "/bin/ps"
+
+
+def process_table() -> Optional[Tuple[Dict[int, Tuple[int, float]], int]]:
+    """(pid -> (ppid, start time as epoch), number of ps rows that could not be understood). One `ps` for the whole table; None when
+    it could not be read. A row that is dropped is counted, not hidden: a pid missing from the table reads as 'not running'."""
+    b = ps_bin()
+    if not b:
+        return None
+    try:
+        r = subprocess.run([b, "-axo", "pid=,ppid=,lstart="], env={"LC_ALL": "C", "PATH": "/bin:/usr/bin"},
+                           capture_output=True, text=True, errors="replace", timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    table: Dict[int, Tuple[int, float]] = {}
+    dropped = 0
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        m = PS_RE.match(line)
+        if not m:
+            dropped += 1
+            continue
+        try:
+            table[int(m.group(1))] = (int(m.group(2)), time.mktime(time.strptime(" ".join(m.group(3).split()), "%a %b %d %H:%M:%S %Y")))
+        except (ValueError, OverflowError):
+            dropped += 1
+    return table, dropped
+
+
+def pool_launches(off: Optional[Dict[int, Tuple[float, str]]] = None) -> Optional[Dict[int, Tuple[float, str]]]:
+    """pid -> (epoch of the line, agent) for every launch the WRAPPER logged as following THIS pool item ("POOL-ACCT SET"), read from
+    the end of the wrapper's log. A session launched while there was no item (SKIP) or with the variable already set (KEEP) is
+    not in it: it does not follow the item, so neither a switch nor an Escape is any business of ours. A line whose agent is not a
+    pool role (pool_agent) is not in it either; if `off` is given those land there instead (pid -> (epoch, the name as logged)), so the
+    caller can say what it left out.
+    {} = nothing follows the item; None = the log could not be READ (a log that is not there, or an unset city, is read as {} - but
+    SAID, on a due minute: 'nobody follows the item' and 'there is nowhere to look' are not the same statement)."""
+    c = city()
+    if not c:
+        note_no_launch_log("no city is set")
+        return {}
+    p = c / ".gc" / "logs" / "claude-pool-account.log"
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - LAUNCH_TAIL_BYTES))
+            raw = f.read()
+    except FileNotFoundError:
+        note_no_launch_log("the wrapper's log is not there yet")
+        return {}
+    except OSError:
+        return None
+    want = item_service()
+    out: Dict[int, Tuple[float, str]] = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        m = SET_RE.fullmatch(line.strip())
+        if not m or m.group(4) != want:
+            continue
+        try:
+            at = calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ"))
+        except (ValueError, OverflowError):
+            continue
+        if not pool_agent(m.group(3)):   # judged on what the line SAYS, before it is tidied: a name that is no pool role is no way in, and
+            if off is not None:          # one that would not pass AGENT_RE cannot turn into the nameless "?" below
+                off[int(m.group(2))] = (float(at), m.group(3))
+            continue
+        agent = m.group(3) if AGENT_RE.fullmatch(m.group(3)) else "?"
+        out[int(m.group(2))] = (float(at), agent)
+    return out
+
+
+def note_no_launch_log(why: str) -> None:
+    """A launch log that is not there reads as 'nothing follows the item' - which is also what a wrong GC_CITY_PATH, or a log rotated away
+    under live sessions, would read as. Said on a due minute, so the daemon being deaf is a line in the log (or on stderr), not silence."""
+    if int(now() // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:
+        log("WARN", f"no pool launch read: {why} - read as 'no session follows the pool item'; sessions launched before it was lost are not seen")
+
+
+def note_off_list(off: Dict[int, Tuple[float, str]], table: Dict[int, Tuple[int, float]]) -> None:
+    """Live processes the wrapper put on the pool item whose agent is no pool role (pool_agent): not looked at, not pressed, and not
+    silent - a pool role that is missing from POOL_AGENT_RE shows up here, on a due minute, instead of being a session that is never
+    unstuck. Only live processes count: a SET line from last week for a process that is gone is not a gap."""
+    live = [name for pid, (at, name) in off.items()
+            if pid in table and table[pid][1] <= at + START_SLACK_S and at - table[pid][1] <= START_MAX_AGE_S]
+    if live and int(now() // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:
+        names = sorted(set(live))
+        shown = ", ".join(re.sub(r"[^A-Za-z0-9._@:-]", "?", n)[:40] for n in names[:5])
+        log("WARN", f"pane scan: {len(live)} live process(es) on the pool item with an agent name that is no pool role ({shown}"
+                    f"{', ...' if len(names) > 5 else ''}) - not looked at, no Escape; a new pool role belongs in POOL_AGENT_RE")
+
+
+def note_scan_drops(nopane: int, ps_dropped: int, looked: int) -> None:
+    """What a scan leaves out without concluding anything, said now and then (SILENT_DROP_LOG_EVERY_MIN) so that 'no pane' can be
+    told from 'could not use what there was': live pool processes that sit in no tmux pane, and `ps` rows that could not be parsed."""
+    if (nopane or ps_dropped) and int(now() // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:
+        log("INFO", f"pane scan: {nopane} live pool process(es) in no tmux pane (nothing to look at), {ps_dropped} ps row(s) not understood "
+                    f"(a pid missing from that table reads as not running); {looked} pane(s) looked at")
+
+
+def scan_panes() -> Scan:
+    """The pool panes, and which of them show the limit modal right now. A pane counts only if a process that the wrapper launched onto the
+    pool item is alive in it (the pane's own process or a descendant): the pid in the SET line is the claude pid (the wrapper exec's),
+    and a pid can be recycled, so the process must also have STARTED when the line says it did."""
+    off: Dict[int, Tuple[float, str]] = {}
+    launches = pool_launches(off)
+    if launches is None:
+        log("WARN", "the wrapper's log could not be read - no pane looked at this run")
+        return Scan(False)
+    if not launches:
+        if off and int(now() // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:   # only to SAY what was left out: ps is read on a due minute only
+            ptab = process_table()
+            if ptab is not None:
+                note_off_list(off, ptab[0])
+        return Scan(True)   # nothing follows the item: no pane to look at, so tmux is not even asked
+    ptab = process_table()
+    if ptab is None:
+        log("WARN", "ps unreadable - no pane looked at this run")
+        return Scan(False)
+    table, ps_dropped = ptab
+    note_off_list(off, table)
+    proven: Dict[int, Tuple[str, float]] = {}
+    for pid, (at, agent) in launches.items():
+        row = table.get(pid)
+        if not pool_agent(agent):   # a second fence, on the tidied name ("?" fails it): nothing reaches a pane that is no pool role
+            continue
+        if row is not None and row[1] <= at + START_SLACK_S and at - row[1] <= START_MAX_AGE_S:
+            proven[pid] = (agent, at)
+    if not proven:
+        note_scan_drops(0, ps_dropped, 0)   # a launched pool pid whose ps row was not understood is missing from `table`: it reads as 'not running'
+        return Scan(True)
+    rc, out = tmux(["list-panes", "-a", "-F", "#{pane_id} #{pane_pid} #{pane_dead}"])
+    if rc is None:
+        log("WARN", "tmux could not be run - no pane looked at this run")
+        return Scan(False)
+    if rc != 0:
+        return Scan(False)   # no server / a failure: nothing can be concluded, and nothing is dropped from what was seen before
+    pane_of: Dict[int, Tuple[str, int]] = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 3 and PANE_ID_RE.fullmatch(f[0]) and f[1].isdigit() and f[2] == "0":
+            pane_of[int(f[1])] = (f[0], int(f[1]))
+    panes: List[PanePeek] = []
+    unlooked: List[str] = []
+    nopane = 0   # proven pool processes found in no live tmux pane: they follow the item but there is no screen to look at
+    for pid, (agent, launched) in sorted(proven.items()):
+        cur, hops = pid, 0
+        while cur in table and hops < 8 and cur not in pane_of:   # the pane's process is the claude itself, or an ancestor of it
+            cur, hops = table[cur][0], hops + 1
+        if cur not in pane_of:
+            nopane += 1
+            continue
+        pane_id, pane_pid = pane_of[cur]
+        rc, text = tmux(["capture-pane", "-p", "-J", "-t", pane_id])
+        if rc != 0:   # a pane that is there and whose screen cannot be read is not "a pane that is not on the modal"
+            unlooked.append(f"{pane_id}:{pid}")
+            continue
+        panes.append(PanePeek(pane_id, pane_pid, pid, agent, modal_stuck(text), launched))
+    if unlooked:
+        log("WARN", f"{len(unlooked)} pool pane(s) could not be read this run - nothing concluded about them, what is known about them is kept")
+    note_scan_drops(nopane, ps_dropped, len(panes))
+    return Scan(True, panes, unlooked)
+
+
+def safe_scan() -> Scan:
+    try:
+        return scan_panes()
+    except Exception as e:  # noqa: BLE001 - could not look is a state of its own, and it concludes nothing
+        log("WARN", f"pane scan failed ({type(e).__name__}) - no pane looked at this run")
+        return Scan(False)
+
+
+def unstick_disabled() -> Optional[str]:
+    if os.environ.get("GC_POOL_UNSTICK") == "0":
+        return "GC_POOL_UNSTICK=0"
+    c = city()
+    if c and (c / ".gc" / "no-pool-unstick").exists():
+        return str(c / ".gc" / "no-pool-unstick")
+    return None
+
+
+def send_escape(p: PanePeek) -> bool:
+    """The ONE key this daemon ever sends, to a pane it has proven to be a pool session on the limit modal. The scan is some
+    seconds old, so look again right before: same process in the pane, and the modal still the last thing on its screen."""
+    rc, out = tmux(["display-message", "-p", "-t", p.pane_id, "#{pane_pid}"])
+    if rc != 0 or out.strip() != str(p.pane_pid):
+        log("INFO", f"pane {p.pane_id} ({p.agent}) is not the process it was a moment ago - nothing sent")
+        return False
+    rc, text = tmux(["capture-pane", "-p", "-J", "-t", p.pane_id])
+    if rc != 0 or not modal_stuck(text):
+        log("INFO", f"pane {p.pane_id} ({p.agent}) no longer shows the limit modal - nothing sent")
+        return False
+    rc, _ = tmux(["send-keys", "-t", p.pane_id, "Escape"])
+    if rc != 0:
+        log("WARN", f"pane {p.pane_id} ({p.agent}): tmux send-keys failed (exit={rc})")
+        return False
+    return True
+
+
+def track_panes(st: dict, scan: Scan, t: float) -> None:
+    """st["panes"] = {pane key: {"first": when this modal was first seen, "tries": Escapes spent on it}} for the panes that are on the
+    modal NOW. A pane that is not on it (any more), or not in the scan at all, is forgotten. A scan that could not look changes
+    nothing: 'could not tell' is not 'nobody is stuck any more' - and neither is a pane whose screen could not be read in a scan that
+    otherwise could (scan.unlooked): forgetting it would hand it a new `first` (a stale modal would then look fresh and never be
+    unstuck) and a new set of tries."""
+    if not scan.ok:
+        return
+    tracked = st.setdefault("panes", {})
+    for k in list(tracked):
+        if k in scan.unlooked:
+            continue
+        p = scan.by_key.get(k)
+        if p is None or not p.stuck:
+            del tracked[k]
+    for p in scan.panes:
+        if p.stuck and p.key not in tracked:
+            tracked[p.key] = {"first": t, "tries": 0}
+    if not tracked:
+        del st["panes"]
+
+
+def stale_modal(st: dict, p: PanePeek, entry: dict) -> bool:
+    """Is this limit modal about a credential that has since been REPLACED? True when the pool item was rewritten by a switch and the
+    session was started before the rewrite AND was first seen on the modal no later than STALE_WINDOW_S after it (claude re-reads the
+    item only every ~30 s, so a hit that lands just after the rewrite is still the old credential's). A session started AFTER the
+    rewrite never had the old credential, and one first seen on the modal later than the window is on the new one: that modal is
+    the new account's own limit, and Escape cannot cure it. No usable rewrite time = no switch to point to = nothing is stale."""
+    at = _sane_epoch(st.get("item_at"))
+    if at is None:
+        return False
+    return p.launched <= at and entry["first"] <= at + STALE_WINDOW_S
+
+
+def unstick(st: dict, user: str, t: float) -> None:
+    """THE one key this daemon sends: Escape, to a pool pane that is sitting on the limit modal of a credential that was REPLACED by a switch
+    of this cycle. Escape returns the session to its prompt, and the conversation goes on with the account the item holds now. The caller
+    has already run decide(), so the item is in its final state for this run. Every check below is a reason NOT to press."""
+    at, cur = _sane_epoch(st.get("item_at")), st.get("current")
+    if at is None or not cur or t - at > UNSTICK_HORIZON_S:
+        st.pop("panes", None)   # no switch of this cycle: no pane is looked at (tmux is not even asked), and nothing is remembered
+        return
+    scan = safe_scan()
+    track_panes(st, scan, t)
+    tracked = st.get("panes")
+    if not scan.ok or not isinstance(tracked, dict) or not tracked:
+        return
+    todo = [p for p in scan.panes if p.stuck and p.key in tracked and stale_modal(st, p, tracked[p.key]) and tracked[p.key]["tries"] < MAX_ESC_TRIES]
+    nameless = [p for p in todo if not pool_agent(p.agent)]   # the wrapper could not log who this is ("?"): not told apart from Mayor or a crew
+    if nameless:
+        log("INFO", f"{len(nameless)} pane(s) on the limit modal of a replaced credential have no pool agent name - not told apart from Mayor/crew, no Escape for them")
+        todo = [p for p in todo if pool_agent(p.agent)]
+    if not todo:
+        return
+    off = unstick_disabled()
+    if off:
+        log("INFO", f"{len(todo)} pool pane(s) still on the limit modal of a replaced credential; unstick disabled by {off} - no key sent")
+        return
+    written = ITEM_WRITTEN_AT if ITEM_WRITTEN_AT is not None else at   # a heal in THIS run restarts the wait too: claude has not seen that write either
+    waited = t - max(at, written)
+    if waited < SETTLE_S:
+        log("INFO", f"{len(todo)} pool pane(s) on the limit modal of the replaced credential; the item was rewritten {int(max(waited, 0))} s ago, "
+                    f"waiting {SETTLE_S} s for claude to re-read it before sending Escape")
+        return
+    ex = st.get("exhausted", {}).get(cur)
+    if isinstance(ex, dict) and ex.get("reset_epoch", math.inf) > t:
+        log("INFO", f"{cur} is registered as exhausted - no Escape into it")
+        return
+    kind, held = read_item_token(user)
+    fp = st.get("fingerprint")
+    if not (kind == "ok" and held and isinstance(fp, str) and fingerprint(held) == fp):
+        log("WARN", f"the pool item {'could not be read' if kind == 'unknown' else 'does not hold the credential of the decision'} - no Escape sent")
+        return
+    sent = 0
+    for p in todo:
+        if sent >= MAX_ESC_PER_RUN:
+            log("INFO", f"{MAX_ESC_PER_RUN} Escapes sent this run - the rest wait for the next one")
+            break
+        tracked[p.key]["tries"] += 1   # counted BEFORE the attempt: one that fails halfway is still an attempt
+        if send_escape(p):
+            sent += 1
+            log("INFO", f"UNSTICK: Escape sent to pane {p.pane_id} ({p.agent}): it was on the limit modal of the credential replaced at "
+                        f"{_iso(at)}; the item holds {cur} fp={fp}")
+
+
 # ── state ──────────────────────────────────────────────────────────────────────────────────────────
 def load_state() -> Optional[dict]:
     """{} = no decision yet (absent, or corrupt and moved aside). None = the file is there but cannot be READ now
@@ -670,9 +1038,29 @@ def sanitize_state(st: dict, t: float) -> None:
     if "current" in st and not (isinstance(st["current"], str) and st["current"].strip()):
         log("WARN", "state: `current` is not an account name - ignored")
         st.pop("current")
-    if "item_at" in st and _sane_epoch(st["item_at"]) is None:
-        log("WARN", "state: `item_at` is not a time - dropped (no Escape without a switch to point to)")
-        del st["item_at"]
+    # ga-8hcnvb.2.1 bookkeeping. Dropping it is always the cautious answer: a pane forgotten is a pane that is looked at as a new sighting
+    # (and a new sighting after the switch's window is no reason to press), and a switch forgotten is a cycle with nothing to unstick. The
+    # one reading that must not be generous is `tries`: junk there reads as 'already tried', so that junk can never buy a fresh Escape.
+    if "panes" in st:
+        pn = st["panes"]
+        if not isinstance(pn, dict):
+            log("WARN", "state: `panes` is not an object - dropped")
+            del st["panes"]
+        else:
+            for k in list(pn):
+                e = pn[k]
+                first = _sane_epoch(e.get("first")) if isinstance(e, dict) else None
+                if first is None or first > t + CLOCK_SKEW_S:   # not a time, or a sighting that has not happened yet
+                    del pn[k]
+                    continue
+                tr = e.get("tries")
+                if isinstance(tr, bool) or not isinstance(tr, int) or tr < 0:
+                    e["tries"] = MAX_ESC_TRIES
+    if "item_at" in st:
+        at = _sane_epoch(st["item_at"])
+        if at is None or at > t + CLOCK_SKEW_S:   # a rewrite that has not happened yet is no rewrite (the clock went back, or junk)
+            log("WARN", "state: `item_at` is not a past time - dropped (no switch to point to, so nothing is unstuck until the next one)")
+            del st["item_at"]
     if "exhausted" not in st:
         return
     ex = st["exhausted"]   # present-but-null is NOT absent: `.get()` cannot tell them apart, and null is not an object either
@@ -1079,6 +1467,10 @@ def run_once() -> int:
     before = json.dumps(st, sort_keys=True)
     moved_from = (st.get("current"), st.get("fingerprint"))
     decide(st, Keys(lib), order, readings, user, now())
+    try:
+        unstick(st, user, now())
+    except Exception as e:  # noqa: BLE001 - the decision above may already have moved the item: it must still be published
+        log("ERROR", f"unstick failed ({type(e).__name__}) - no further key sent this run")
     if json.dumps(st, sort_keys=True) != before:
         try:
             publish_state(st)
