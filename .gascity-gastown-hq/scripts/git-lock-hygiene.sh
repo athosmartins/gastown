@@ -97,7 +97,10 @@
 #   tmp_unmeasured in the summary: unknown is never a quiet zero.
 #   size-garbage is git's whole "garbage" class, wider than what is removed above: a pack-*.pack with no .idx is garbage to git too
 #   (measured 2026-10-09: 3.3 GB left by a repack that failed), and it is NOT touched here, because it can be the only copy of
-#   what a repack was merging. So the alarm can outlive the sweep; when it does, a person has to look.
+#   what a repack was merging (`git index-pack` rebuilt its index and saved the repo's whole history). So the alarm can outlive the
+#   sweep; when it does, a person has to look. The alarm therefore NAMES such packs apart (idxless_packs / idxless_kib in the event,
+#   a "SEM .idx ... NAO e lixo apagavel" text in the notify) and never words them as leftovers; a pack directory it cannot list is
+#   "could not check" (idxless_packs null, said in words), never "none".
 #
 # PART 2 — Per-repo git mutation mutex (lib, source with GIT_LOCK_HYGIENE_LIB=1)
 #   POSIX-atomic mkdir-based locking that serializes git mutations per repository.
@@ -841,10 +844,33 @@ _glh_tmp_keep() {
   return 0
 }
 
+# Packs in <gd>/objects/pack with no .idx beside them. Prints "<count> <kib>" ("<count> null" when a size could not be read) or
+# "unknown" when the directory cannot be listed. This is NOT a temp file: a repack that failed can leave the only copy of the objects
+# it was merging in a pack-*.pack whose index was never written, and `git index-pack` makes it usable again (2026-10-09: that saved a
+# repo's whole history). git counts it as garbage, so it is inside the alarm's number; the alarm names it apart and never calls it
+# deletable. Nothing here deletes anything.
+_glh_tmp_idxless_packs() {
+  local gd="$1" out f n=0 bytes=0 sz size_known=1
+  # vazio (listing ok, no pack-*.pack) → "0 0"; falhou/cortado → "unknown": the alarm says it could not check, never "there are none"
+  out=$(_glh_bounded "$GIT_LOCK_TMP_LIST_TIMEOUT_SEC" find "$gd/objects/pack" -maxdepth 1 -type f -name 'pack-*.pack' -print 2>/dev/null) || { printf 'unknown'; return 0; }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    # ilegível → an .idx that cannot be stat'ed reads as "no .idx": the louder warning, never a deletion
+    [ -e "${f%.pack}.idx" ] && continue
+    n=$(( n + 1 ))
+    # ilegível → size unknown for the whole count (printed as null), never added as 0
+    sz=$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f" 2>/dev/null || true)
+    case "$sz" in ''|*[!0-9]*) size_known=0 ;; *) bytes=$(( bytes + sz )) ;; esac
+  done <<EOF
+$out
+EOF
+  if [ "$size_known" -eq 1 ]; then printf '%s %s' "$n" "$(( (bytes + 1023) / 1024 ))"; else printf '%s null' "$n"; fi
+}
+
 # What git says is left in <repo>'s object store, and the alarm. Sets _GLH_TMP_GFILES / _GLH_TMP_GKIB ("null" when unknown).
 _GLH_TMP_GFILES="null"; _GLH_TMP_GKIB="null"
 _glh_tmp_garbage_check() {
-  local repo="$1" gd="$2" out rc gfiles gkib key marker _dry _nrc mib
+  local repo="$1" gd="$2" out rc gfiles gkib key marker _dry _nrc mib idx idx_n idx_kib idx_size advice
   _GLH_TMP_GFILES="null"; _GLH_TMP_GKIB="null"
   _dry="${GIT_LOCK_DRY_RUN:-${DRY_RUN:-0}}"
   # falhou/cortado/ilegível → "unmeasured": logged and counted, no alarm and no all-clear; vazio ("garbage: 0") → healthy
@@ -868,8 +894,17 @@ _glh_tmp_garbage_check() {
     return 0
   fi
   mib=$(( gkib / 1024 ))
-  echo "[git-lock-hygiene] GARBAGE ALARM: ${repo} holds ${gfiles} garbage file(s), ${mib} MiB (limit $(( GIT_LOCK_TMP_ALARM_KIB / 1024 )) MiB)" >&2
-  _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_garbage_alarm\",\"repo\":\"${repo}\",\"garbage_files\":${gfiles},\"garbage_kib\":${gkib},\"limit_kib\":${GIT_LOCK_TMP_ALARM_KIB},\"dry_run\":\"${_dry}\"}"
+  # How much of that garbage is a pack with no .idx — NOT deletable junk. vazio → 0 (none lack an index); falhou/cortado → null
+  # ("could not check"), which the message says in words and never reads as 0.
+  idx=$(_glh_tmp_idxless_packs "$gd")
+  case "$idx" in
+    unknown) idx_n="null"; idx_kib="null" ;;
+    *)       idx_n="${idx%% *}"; idx_kib="${idx#* }" ;;
+  esac
+  case "$idx_n" in ''|*[!0-9]*) idx_n="null"; idx_kib="null" ;; esac
+  case "$idx_kib" in ''|*[!0-9]*) idx_kib="null" ;; esac
+  echo "[git-lock-hygiene] GARBAGE ALARM: ${repo} holds ${gfiles} garbage file(s), ${mib} MiB (limit $(( GIT_LOCK_TMP_ALARM_KIB / 1024 )) MiB); packs without .idx: ${idx_n} (${idx_kib} KiB) — those are NOT deletable" >&2
+  _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_garbage_alarm\",\"repo\":\"${repo}\",\"garbage_files\":${gfiles},\"garbage_kib\":${gkib},\"idxless_packs\":${idx_n},\"idxless_kib\":${idx_kib},\"limit_kib\":${GIT_LOCK_TMP_ALARM_KIB},\"dry_run\":\"${_dry}\"}"
   _glh_count tmp_over
   [ "$_dry" = "1" ] && return 0            # same rule as the rest of the sweep: no notify under dry run
   if [ ! -x "$NOTIFY_BIN" ]; then
@@ -883,9 +918,18 @@ _glh_tmp_garbage_check() {
   if [ -f "$marker" ] && [ "$(_path_age "$marker")" -lt "$GIT_LOCK_TMP_RENOTIFY_SEC" ]; then
     return 0
   fi
+  # The wording follows what was found: no pack lacks its index → leftovers of a killed write; some do → NOT junk, do not delete;
+  # could not check → say so and still warn. The janitor removes only tmp_* in every case, so each text says that and no more.
+  idx_size=""
+  [ "$idx_kib" != "null" ] && idx_size=" (${idx_kib} KiB)"
+  case "$idx_n" in
+    null) advice="Nao deu para checar se ha pack sem .idx neste repo. Se houver, NAO e lixo apagavel: pode ser a UNICA copia dos objetos de um repack que falhou. Ninguem apaga antes de olhar. O janitor remove sozinho so os arquivos tmp_* de objects/ com mais de $(( GIT_LOCK_TMP_AGE_SEC / 3600 ))h e sem processo git. Ver ${LOG} (eventos tmp_*)." ;;
+    0)    advice="Sao restos de um git que morreu no meio de uma escrita. O janitor remove sozinho so os arquivos tmp_* de objects/ com mais de $(( GIT_LOCK_TMP_AGE_SEC / 3600 ))h e sem processo git; o que sobrar fica ate alguem olhar e NAO deve ser apagado as cegas. Se este aviso repetir, ver ${LOG} (eventos tmp_*). Nada a fazer pelo Athos." ;;
+    *)    advice="ATENCAO: ${idx_n} pack(s) SEM .idx${idx_size}. Isso NAO e lixo apagavel: e o que sobrou de um repack que falhou e pode ser a UNICA copia desses objetos - nao apague. O janitor nao mexe nisso (remove so os arquivos tmp_* de objects/ com mais de $(( GIT_LOCK_TMP_AGE_SEC / 3600 ))h e sem processo git). git index-pack <arquivo.pack> gera o .idx e recupera. Quem decide e o dono do compactador. Ver ${LOG} (eventos tmp_*)." ;;
+  esac
   _nrc=0
   _glh_notify_send -t "Git-lock hygiene" -p 3 \
-       "Lixo de git enchendo disco em ${repo}: ${gfiles} arquivo(s) de lixo, ${mib} MiB (limite $(( GIT_LOCK_TMP_ALARM_KIB / 1024 )) MiB). Sao restos de um git que morreu no meio de uma escrita. O janitor remove sozinho so os tmp_pack_*/tmp_obj_* com mais de $(( GIT_LOCK_TMP_AGE_SEC / 3600 ))h e sem processo git; outro tipo de lixo (ex.: pack sem .idx) fica ate alguem olhar e NAO deve ser apagado as cegas. Se este aviso repetir, ver ${LOG} (eventos tmp_*). Nada a fazer pelo Athos." \
+       "Garbage de git em ${repo}: ${gfiles} arquivo(s), ${mib} MiB (limite $(( GIT_LOCK_TMP_ALARM_KIB / 1024 )) MiB). ${advice}" \
        >/dev/null 2>&1 || _nrc=$?
   if [ "$_nrc" -eq 0 ]; then
     _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_alarm_notify\",\"repo\":\"${repo}\",\"outcome\":\"handed_to_notify\"}"
@@ -2519,6 +2563,53 @@ FAKE
   { [ "$count" = "2" ] && [ "$count2" = "1" ] && [ "$(tm_left)" = "0" ]; } \
     && ok "TM15: sweeps 2 and 3 removed 2 + 1 — nothing is left behind for good" || bad "TM15: sweeps 2/3 counts '${count}' '${count2}' left=$(tm_left)"
 
+  echo "TM16: a pack with no .idx is in the alarm's number but is NOT junk — it is named apart, said not deletable, and never touched"
+  TR16="$TMP/tm16"; rm -rf "$TR16"; git init -q "$TR16" 2>/dev/null
+  dd if=/dev/zero of="$TR16/.git/objects/pack/pack-aaaa.pack" bs=1024 count=600 2>/dev/null; tm_ago 7 "$TR16/.git/objects/pack/pack-aaaa.pack"
+  # vazio/falhou → G16 is not a positive number: the fixture is wrong and the test says so, it does not pass on "0 alarms"
+  G16="$(git --git-dir="$TR16/.git" count-objects -v 2>/dev/null | sed -n 's/^size-garbage: *//p')"
+  case "$G16" in ''|*[!0-9]*|0) bad "TM16: fixture garbage is not measurable ('${G16}')"; G16=0 ;; esac
+  if [ "$G16" -gt 0 ]; then
+    tm_reset; count=$(GIT_LOCK_TMP_ALARM_KIB=$(( G16 - 1 )) _scan_tmp_objects "$TR16" 2>/dev/null)
+    { [ "$count" = "0" ] && [ -f "$TR16/.git/objects/pack/pack-aaaa.pack" ]; } \
+      && ok "TM16: the idx-less pack (7 h old, over the line) is still there, nothing removed" || bad "TM16: count='${count}' or the idx-less pack is gone"
+    { grep -F '"event":"tmp_garbage_alarm"' "$LOG" | grep -q '"idxless_packs":1,"idxless_kib":600,'; } \
+      && ok "TM16: the alarm event names it (idxless_packs=1, 600 KiB)" || bad "TM16: alarm event lacks the idx-less count: $(grep -F '"event":"tmp_garbage_alarm"' "$LOG" | head -1)"
+    { [ "$(_lines "$NOTIFY_CALLS")" = "1" ] && grep -q 'SEM .idx' "$NOTIFY_CALLS" && grep -q 'NAO e lixo apagavel' "$NOTIFY_CALLS" && grep -q 'UNICA copia' "$NOTIFY_CALLS" && ! grep -q 'Sao restos de um git' "$NOTIFY_CALLS"; } \
+      && ok "TM16: the notify says SEM .idx / NAO e lixo apagavel / UNICA copia, not 'leftovers of a killed write'" || bad "TM16: notify wording wrong: $(head -c 400 "$NOTIFY_CALLS")"
+
+    echo "TM16b: a pack directory that cannot be listed is 'could not check' — not 'none', and no claim that a pack lacks its index"
+    tm_reset; count=$(PATH="$TMP/fakefind:$PATH" GIT_LOCK_TMP_ALARM_KIB=$(( G16 - 1 )) _scan_tmp_objects "$TR16" 2>/dev/null)
+    { grep -F '"event":"tmp_garbage_alarm"' "$LOG" | grep -q '"idxless_packs":null,"idxless_kib":null,'; } \
+      && ok "TM16b: idxless_packs=null in the alarm event" || bad "TM16b: event: $(grep -F '"event":"tmp_garbage_alarm"' "$LOG" | head -1)"
+    { [ "$(_lines "$NOTIFY_CALLS")" = "1" ] && grep -q 'Nao deu para checar' "$NOTIFY_CALLS" && ! grep -q 'Sao restos de um git' "$NOTIFY_CALLS" && ! grep -q 'SEM .idx' "$NOTIFY_CALLS" && [ -f "$TR16/.git/objects/pack/pack-aaaa.pack" ]; } \
+      && ok "TM16b: the notify says it could not check (still warns), the pack is untouched" || bad "TM16b: notify wording wrong: $(head -c 400 "$NOTIFY_CALLS")"
+  fi
+
+  if [ "$G16" -gt 0 ]; then
+    echo "TM16c: an idx-less pack whose size cannot be read is counted, with the size as null — never as 0 KiB"
+    mkdir -p "$TMP/fakestat"; printf '#!/bin/sh\nexit 1\n' > "$TMP/fakestat/stat"; chmod +x "$TMP/fakestat/stat"
+    tm_reset; count=$(PATH="$TMP/fakestat:$PATH" GIT_LOCK_TMP_ALARM_KIB=$(( G16 - 1 )) _scan_tmp_objects "$TR16" 2>/dev/null)
+    { grep -F '"event":"tmp_garbage_alarm"' "$LOG" | grep -q '"idxless_packs":1,"idxless_kib":null,'; } \
+      && ok "TM16c: idxless_packs=1, idxless_kib=null" || bad "TM16c: event: $(grep -F '"event":"tmp_garbage_alarm"' "$LOG" | head -1)"
+  fi
+
+  echo "TM17: control — garbage with every pack indexed keeps the 'leftovers' wording and idxless_packs=0"
+  TR17="$TMP/tm17"; rm -rf "$TR17"; git init -q "$TR17" 2>/dev/null
+  git -C "$TR17" -c user.email=t@t -c user.name=t commit -q --allow-empty -m x 2>/dev/null; git -C "$TR17" repack -q -a -d 2>/dev/null
+  dd if=/dev/zero of="$TR17/.git/objects/pack/tmp_pack_YOUNG" bs=1024 count=600 2>/dev/null; tm_ago 1 "$TR17/.git/objects/pack/tmp_pack_YOUNG"
+  # vazio/falhou → no real pack+idx pair, or no measurable garbage: the fixture is wrong and the test says so
+  G17="$(git --git-dir="$TR17/.git" count-objects -v 2>/dev/null | sed -n 's/^size-garbage: *//p')"
+  case "$G17" in ''|*[!0-9]*|0) bad "TM17: fixture garbage is not measurable ('${G17}')"; G17=0 ;; esac
+  ls "$TR17"/.git/objects/pack/pack-*.idx >/dev/null 2>&1 || { bad "TM17: fixture has no indexed pack"; G17=0; }
+  if [ "$G17" -gt 0 ]; then
+    tm_reset; count=$(GIT_LOCK_TMP_ALARM_KIB=$(( G17 - 1 )) _scan_tmp_objects "$TR17" 2>/dev/null)
+    { grep -F '"event":"tmp_garbage_alarm"' "$LOG" | grep -q '"idxless_packs":0,"idxless_kib":0,'; } \
+      && ok "TM17: an indexed pack is not counted as idx-less (idxless_packs=0)" || bad "TM17: event: $(grep -F '"event":"tmp_garbage_alarm"' "$LOG" | head -1)"
+    { [ "$(_lines "$NOTIFY_CALLS")" = "1" ] && grep -q 'Sao restos de um git' "$NOTIFY_CALLS" && ! grep -q 'SEM .idx' "$NOTIFY_CALLS"; } \
+      && ok "TM17: the notify keeps the 'leftovers of a killed write' wording" || bad "TM17: notify wording wrong: $(head -c 400 "$NOTIFY_CALLS")"
+  fi
+
   echo ""
   echo "────────────────────────────────────────────"
   echo "PASS=$PASS  FAIL=$FAIL"
@@ -2548,7 +2639,7 @@ done
 # PART 1b (ga-jvxr24): orphan tmp_* files + the garbage alarm, over the rig roots AND the nested archive repos that sit
 # outside them. Counted apart from the locks (tmp_removed in the summary), not added to total_removed: that number drives the
 # "Removed N stale git lock file(s)" notify below. A path listed twice (same canonical dir) is swept once.
-tmp_repos=0; tmp_removed_total=0; tmp_seen=""; _nl=$'\n'
+tmp_repos=0; tmp_seen=""; _nl=$'\n'
 if [ "$GIT_LOCK_TMP_ENABLED" = "1" ]; then
   while IFS= read -r tmp_root; do
     tmp_root="${tmp_root%/}"
@@ -2557,9 +2648,9 @@ if [ "$GIT_LOCK_TMP_ENABLED" = "1" ]; then
     case "$_nl$tmp_seen$_nl" in *"$_nl$tmp_canon$_nl"*) continue ;; esac
     tmp_seen="${tmp_seen}${_nl}${tmp_canon}"
     tmp_repos=$(( tmp_repos + 1 ))
-    n=$(_scan_tmp_objects "$tmp_root")
-    case "$n" in ''|*[!0-9]*) n=0 ;; esac
-    tmp_removed_total=$(( tmp_removed_total + n ))
+    # The number it prints is for its direct callers (the selftest). The sweep summary reads the tally the function fills itself
+    # (tmp_removed, tmp_kept, ...), so the printed number is dropped here instead of being parsed into a total nobody reads.
+    _scan_tmp_objects "$tmp_root" >/dev/null
   done <<EOF
 $(printf '%s\n' "${ROOTS[@]}"; _glh_tmp_extra_repos)
 EOF
