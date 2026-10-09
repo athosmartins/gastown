@@ -42,6 +42,8 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
    kill switch or the degraded marker present -> exports nothing either (log: POOL-ACCT SKIP disabled by ...)
 
  claude (live pool session) re-reads the item every ~30 s  =>  a rewritten item moves it to the other account
+   (a session already sitting on the limit modal waits for a key instead: the daemon sends it ONE Escape, only to a pool pane it
+    can prove is on that modal, in the cycle of the switch - see "The Escape exception")
    (a session that cannot read the item reads the file: a NEW session is on the file's account; whether a session
     already running re-reads the file the way it re-reads the item was not measured)
 
@@ -232,7 +234,7 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-pool-account.py` | the daemon (`run-once`) |
 | `packs/town-deltas/assets/scripts/claude-lowprio.sh` | wrapper: points a pool launch at the item (fail-open) |
 | `packs/town-deltas/assets/claude-pool-account.plist` | launchd job, not loaded by the merge |
-| `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API, real accounts lib); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from, D2 if the live pool credentials file changed during the run (metadata only: the file is never opened); it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`) |
+| `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API / tmux / ps, real accounts lib; no real pane or process is ever looked at or pressed; runs under macOS bash 3.2); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from, D2 if the live pool credentials file changed during the run (metadata only: the file is never opened); it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`) |
 | `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session (+ the guard's real-claude self-test and the leakscan control) |
 | `packs/town-deltas/assets/scripts/claude-pool-guard.py` | the guard (`run-once` / `status [--json]` / `selftest`) |
 | `packs/town-deltas/assets/claude-pool-guard.plist` | the guard's launchd job, not loaded by the merge |
@@ -242,7 +244,7 @@ first, delete last, and only when restarting the pool is acceptable.
 | `.gc/claude-pool-account.heartbeat`, `.gc/pool-account-degraded` | the daemon's last clean run; the guard's "auto-switch is off" marker |
 | `.gc/logs/claude-pool-guard.log` | guard events (`SELFTEST claude=… result=…`, `DEGRADED`, `divergence seen/over`, `alert sent`) |
 | `whatsapp_automation/lib/claude_account_pool.py` | services read `claude_pool_current_account.json` first |
-| `.gc/logs/claude-pool-account.log` | daemon + wrapper events (`POOL-ACCT SET/SKIP/KEEP`, `SWITCH a -> b`) |
+| `.gc/logs/claude-pool-account.log` | daemon + wrapper events (`POOL-ACCT SET/SKIP/KEEP`, `SWITCH a -> b`, `UNSTICK: Escape sent to pane %N (<agent>)`). The wrapper's `SET` line (pid, `GC_AGENT`, item) is also how the daemon finds the pool's panes - the selftest's A9c reads the real wrapper's line with the daemon's own parser |
 
 ## The item holds a credential the daemon did not write (ga-xknkke)
 
@@ -306,14 +308,103 @@ Live check, after the deploy (not part of the merge): start a new pool session a
 `anthropic-ratelimit-unified-7d-utilization` headers rise on the NEW account and not on the old one; and
 `claude-pool-account.live-accept.sh` prints whether the file's fingerprint equals the decision's.
 
+## The Escape exception — unsticking a pool session on the limit screen (ga-8hcnvb.2.1)
+
+A pool session that was **already on claude's limit screen** when the pool item was rewritten does not notice the new credential: the
+modal waits for a key.
+
+```
+  What do you want to do?
+  ❯ 1. Stop and wait for limit to reset
+    2. Wait here, then continue automatically at Oct 7 at 7pm
+    3. Upgrade your plan
+
+  Enter to confirm · Esc to cancel
+```
+
+The daemon sends that session **one key, Escape**, after the switch. The decision to switch is still the script's alone (Athos 04/10:
+only at 100%, no credit, no `claude`/LLM in the path); this only finishes the switch for the sessions that cannot finish it themselves.
+
+**This is a scoped exception to the send-keys doctrine** (agents do not type into other agents' panes). It stands on the conditions
+below, all of which must hold, and on one rule: every read it makes has three outcomes — yes / no / **can't tell** — and *can't tell*
+presses nothing and forgets nothing.
+
+```
+ claude-pool-account.py run-once, after decide()
+   0 a switch happened in the last 10 min (UNSTICK_HORIZON_S) - else no pane is looked at, tmux and ps are not even asked
+   1 the pool sessions: the wrapper's own log lines   <iso Z> pid=<claude pid> agent=<GC_AGENT> wrapper POOL-ACCT SET item=<the pool item>
+                         (the wrapper exec's claude, so the pid is claude's) -> ps (pid, ppid, start time) -> the ppid chain
+                         (<= 8 hops) up to a tmux pane of `tmux -L gascity`
+   2 ALLOW-LIST          the agent name must be a pool role, matched whole (POOL_AGENT_RE): gastown.dog | wa-worker | ps-worker |
+                         gate-reviewer | refino-gate-reviewer | context-check-reviewer | auto-refiner, optionally "-<slot or adhoc id>".
+                         The three shapes `gc session list` prints:  gastown.dog-1   wa-worker-1   wa-worker-adhoc-4f91013dd9
+                         Never Mayor, never a crew (oracle-wa, mila-wa, thies-wa ...), never a session with no name ("?" / empty:
+                         the wrapper had no GC_AGENT, so it cannot be told from Mayor).
+   3 the process         is the one that wrote the SET line: it started at most 2 s after it (START_SLACK_S) and at most 120 s before
+                         it (START_MAX_AGE_S) - a recycled pid is not it - and its pane is alive
+   4 the screen          `tmux capture-pane`: the limit modal is the LAST thing on it - question, option 1, footer "Enter to confirm ·
+                         Esc to cancel", in that order, with nothing after. An agent QUOTING the modal has its prompt box under the quote;
+                         a permission dialog has the same footer and another question; another dialog may ask the same question without
+                         the "Stop and wait for limit to reset" option. None of them is pressed.
+   5 THIS cycle         the modal is of the credential that was REPLACED (stale_modal): the session was launched before the rewrite
+                         (state `item_at`, stamped by every switch: seed, failover, failback) AND the modal was first seen no later
+                         than 90 s after it (STALE_WINDOW_S). A session born after the rewrite, or a modal first seen later, is
+                         on the limit of its OWN credential - an Escape would only close a modal that is true.
+   6 SETTLE              45 s (SETTLE_S) after the item was last written (a heal counts), so claude has had its ~30 s re-read.
+                         The run that switches therefore presses nothing; the one a minute later does.
+   7 the item            is read once more and holds the decision's credential; the current account is not registered exhausted
+                         (an Escape into an account that is rejected would only land on the next 429).
+   8 send_escape         counts the try BEFORE the key (MAX_ESC_TRIES = 3 per pane), asks tmux which process owns the pane and
+                         captures the screen once more; a changed pane gets nothing. Then `send-keys -t %N Escape`. At most 20 per run
+                         (MAX_ESC_PER_RUN); the rest wait for the next one.
+```
+
+An Escape that took leaves the pane on its prompt: the next run finds no modal and forgets the sighting. A sighting is also forgotten
+once the cycle (10 min) is over, whatever the pane shows.
+
+**What "can't tell" does.** A tmux that cannot be run or has no server, a `ps` that fails, a wrapper log that cannot be read, a pane whose
+screen cannot be captured, a state whose `item_at` is junk or absent (a state from before this existed), a Keychain that is locked,
+a `tries` that is not a number (read as *all tries spent*, never as a fresh one): no key. The run logs what it could not do, keeps what it
+had seen, and the next run that can look decides. An exception anywhere inside the unstick is caught at the `run_once` level
+(`unstick failed (<Type>) - no further key sent this run`): the switch, the decision and the heartbeat are already done and are not lost.
+
+**Switches.**
+
+| Want | Do |
+|---|---|
+| No key to any pane (the daemon still decides and switches) | `touch $GC_CITY_PATH/.gc/no-pool-unstick` (remove it to resume), or `GC_POOL_UNSTICK=0` in the daemon's environment. The log says `unstick disabled by ...`; no try is spent, the sighting is kept |
+| The whole daemon off | `no-pool-account` / `GC_POOL_ACCOUNT=0` (above): nothing, keys included |
+| Test seams (the selftest sets all three, so a test run cannot press a key in a real session) | `CLAUDE_POOL_TMUX` (the tmux binary), `CLAUDE_POOL_TMUX_SOCKET` (the server, default `gascity`; anything that is not a plain name falls back to it), `CLAUDE_POOL_PS` (the ps binary) |
+
+**Log** (`<city>/.gc/logs/claude-pool-account.log`):
+
+- `UNSTICK: Escape sent to pane %N (<agent>)` — the only line that means a key left;
+- `waiting 45 s for claude to re-read it before sending Escape` / `20 Escapes sent this run - the rest wait for the next one`;
+- `unstick disabled by ... - no key sent`; `... is registered as exhausted - no Escape into it`; `the pool item could not be read | does not hold the
+  credential of the decision - no Escape sent`;
+- at the key: `is not the process it was a moment ago - nothing sent`, `no longer shows the limit modal - nothing sent`, `tmux send-keys failed (exit=N)`;
+- can't tell: `N pool pane(s) could not be read this run`, `tmux could not be run - no pane looked at this run`, `ps unreadable - ...`,
+  `the wrapper's log could not be read - ...`;
+- `pane scan: N live process(es) on the pool item with an agent name that is no pool role` — said once every 10 minutes (clock minute
+  divisible by 10): a pool role missing from `POOL_AGENT_RE` shows up here instead of being a session that is never unstuck, silently.
+
+**A new pool role** (a new `exec:auto` routed template) must be added to `POOL_AGENT_RE` in `claude-pool-account.py`, in the selftest's
+`B60l`, and here; until then its sessions are *not pressed* (the safe side) and the line above names them.
+
+**Live check** (after the deploy, not part of the merge): with a pool session sitting on the limit modal, force a switch and watch the log:
+`SWITCH a -> b`, `waiting 45 s ...`, then `UNSTICK: Escape sent to pane %N (...)` a minute later and the pane back on its prompt. Nothing
+in the selftest ever touches a real pane.
+
 ## Known limits
 
 - `CLAUDE_SECURESTORAGE_CONFIG_DIR` is an undocumented claude variable: a claude release can rename the item. The
   live harness is the check to re-run after upgrading claude (a mismatch shows as P2a failing); the guard re-checks it by
   itself on every new claude version ("The guard", item 2) and turns auto-switch off, with an alert, if it fails.
 - Only turn boundaries were measured; a switch in the middle of a long tool call is not guaranteed.
-- A limit modal already open in a live TUI does not notice the restored credential by itself (needs Esc);
-  unsticking such sessions is ga-8hcnvb.2.
+- A limit modal already open in a live TUI does not notice the restored credential by itself (needs Esc): the daemon sends that
+  Escape to pool sessions only, in the cycle of a switch - see "The Escape exception". Mayor and crew sessions on the modal are never
+  pressed (they are not on the pool item), and neither is a pool session the daemon cannot prove (can't tell = no key).
+  Only the account **switch** is cured this way: a session whose own account is still exhausted just meets the modal again.
 - The verdict comes from a 1-token call on `PROBE_MODEL`, the model the pool runs. Whether a window that limits only
   some models shows up in the `anthropic-ratelimit-unified-*` headers was not measured here. `PROBE_MODEL` is a model ID
   and goes stale like one: a retired or misspelled ID answers HTTP 404, which is "cannot tell" — **no failover, for as
