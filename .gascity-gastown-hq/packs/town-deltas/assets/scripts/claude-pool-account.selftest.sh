@@ -65,6 +65,9 @@ export GC_CITY_PATH="$AMBIENT/city" HOME="$AMBIENT/home" CLAUDE_POOL_STATE="$AMB
        CLAUDE_POOL_CRED_DIR="$AMBIENT/home/.gastown/claude-pool-cred" CLAUDE_POOL_ACCOUNTS_LIB="$AMBIENT/no-accounts-lib.py"
 # the rest are switches/overrides a pool session or an operator may have set: not inputs of this file (each test names its own)
 unset GC_POOL_CRED_DIR CLAUDE_POOL_NOW CLAUDE_POOL_PROBE_URL GC_POOL_ACCOUNT CLAUDE_SECURESTORAGE_CONFIG_DIR
+# ga-8hcnvb.2.1: the Escape reads tmux and ps and has its own kill switch. A caller that has any of these set would point the daemon at its
+# real sessions (or switch the feature off under test): each test names what it needs.
+unset GC_POOL_UNSTICK CLAUDE_POOL_TMUX CLAUDE_POOL_TMUX_SOCKET CLAUDE_POOL_PS
 
 # ── A. wrapper ─────────────────────────────────────────────────────────────────────────────────────
 echo "A. wrapper (claude-lowprio.sh)"
@@ -164,6 +167,42 @@ grep -q "POOL-ACCT SET" "$W/city/.gc/logs/claude-pool-account.log" && ok "A9 one
 [ "$(grep -c "POOL-ACCT" "$W/city/.gc/logs/claude-lowprio.log" 2>/dev/null || true)" = "0" ] && ok "A9a the lowprio log keeps its one-line-per-launch contract (no POOL-ACCT lines)" || bad "A9a POOL-ACCT lines leaked into claude-lowprio.log"
 grep -q "sk-ant-" "$W/city/.gc/logs/claude-pool-account.log" && bad "A9b log carries a token shape" || ok "A9b log carries no token shape"
 
+# A9c the CONTRACT between the two halves (ga-8hcnvb.2.1): the daemon finds the pool sessions it may press Escape in by the wrapper's SET
+# line - pid, agent, item - and a line the wrapper writes but the daemon cannot read is a session that is never unstuck, in silence. So
+# the line is produced by the REAL wrapper (a fake claude that says its own pid: the wrapper exec's it, so that pid is the one logged) and
+# read by the daemon's own SET_RE / pool_agent / item_service - not by a fixture written to look like it.
+cat > "$BIN/fake-claude-pid" <<'EOF'
+#!/bin/bash
+echo "mypid=$$"
+EOF
+chmod +x "$BIN/fake-claude-pid"
+contract() { # contract <the SET line> <the pid claude says it has>  ->  "<pid matches> <agent> <item matches> <pool role?> match" | "no-match"
+  env -i GC_CITY_PATH="$W/city" CLAUDE_POOL_CRED_DIR="$POOL_DIR" "$PY3" -c '
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+mt = m.SET_RE.fullmatch(sys.argv[2].strip())
+if not mt: print("no-match"); sys.exit(0)
+print(int(mt.group(2)) == int(sys.argv[3]), mt.group(3), mt.group(4) == m.item_service(), m.pool_agent(mt.group(3)), "match")' "$DAEMON" "$1" "$2" 2>&1 | tail -n 1
+}
+if [ -f "$DAEMON" ]; then
+  new_kc; touch "$FAKE_KC/items/$SVC"
+  out="$(run_wrapper USER=athos GC_AGENT=gastown.dog-9 GC_LOWPRIO_CLAUDE_BIN="$BIN/fake-claude-pid" -- x)"
+  mypid="$(field mypid "$out")"; line="$(grep 'POOL-ACCT SET' "$W/city/.gc/logs/claude-pool-account.log" | tail -n 1)"
+  got="$(contract "$line" "$mypid")"
+  [ -n "$mypid" ] && [ "$got" = "True gastown.dog-9 True True match" ] \
+    && ok "A9c the real wrapper's SET line is read back by the daemon: claude's own pid, GC_AGENT, the pool item - and the agent is a pool role" \
+    || bad "A9c pid=$mypid line='$line' daemon read: $got"
+  new_kc; touch "$FAKE_KC/items/$SVC"
+  out="$(run_wrapper USER=athos GC_LOWPRIO_CLAUDE_BIN="$BIN/fake-claude-pid" -- x)"
+  mypid="$(field mypid "$out")"; line="$(grep 'POOL-ACCT SET' "$W/city/.gc/logs/claude-pool-account.log" | tail -n 1)"
+  got="$(contract "$line" "$mypid")"
+  [ -n "$mypid" ] && [ "$got" = "True ? True False match" ] \
+    && ok "A9d a session with no GC_AGENT logs agent=? - still a line the daemon reads, but no pool role: it is never pressed" \
+    || bad "A9d pid=$mypid line='$line' daemon read: $got"
+else
+  bad "A9c daemon not found at $DAEMON"
+fi
+
 new_kc; touch "$FAKE_KC/items/$SVC"
 mkdir -p "$W/hang"; cat > "$W/hang/security" <<'EOF'
 #!/bin/bash
@@ -261,6 +300,59 @@ cat > "$BB/ps" <<'EOF'
 cat "$FAKE_KC/ps.out" 2>/dev/null; exit 0
 EOF
 chmod +x "$BB/security" "$BB/secret" "$BB/ps"
+
+# ── fake tmux and fake ps for the Escape (ga-8hcnvb.2.1) ─────────────────────────────────────────
+# No real process and no real pane exists in this file: a pane is a few lines in $TMUXD, a pid is a number. The daemon reaches both through
+# seams (CLAUDE_POOL_TMUX, CLAUDE_POOL_PS), and run_d always sets them: a test run can never press a key in a real session.
+#   $TMUXD/panes.txt   what `tmux list-panes -a -F '#{pane_id} #{pane_pid} #{pane_dead}'` prints
+#   $TMUXD/screen.<n>  what capture-pane prints for %<n>; NO file = a pane whose screen cannot be read
+#   $TMUXD/ps.table    what `ps -axo pid=,ppid=,lstart=` prints
+#   $TMUXD/keys.log    every send-keys ("%<n> <keys>"); $TMUXD/calls.log every tmux call ("<socket> <args>"); $TMUXD/ps.calls every ps call
+# Knobs (files): down (tmux fails as with no server) | send-fails | ps-broken | esc-ignored (an Escape that does not take: by default it
+# leaves the pane on after-esc.txt, the prompt) | screen2.<n> (what the 2nd capture of a run on shows: the pane changed between the scan
+# and the key) | pid2.<n> (display-message names another process: the pane is not the one the scan saw).
+TMUXD="$W/tmuxd"
+{ echo '#!/bin/bash'; echo "D='$TMUXD'"; cat <<'EOF'; } > "$BB/tmux"
+sock=""
+[ "${1:-}" = "-L" ] && { sock="$2"; shift 2; }
+echo "$sock $*" >> "$D/calls.log"
+[ -e "$D/down" ] && { echo "no server running on /private/tmp/tmux-501/$sock (selftest)" >&2; exit 1; }
+cmd="${1:-}"; shift
+tgt=""; rest=()
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-t" ]; then tgt="${2:-}"; shift 2; continue; fi
+  rest+=("$1"); shift
+done
+n="${tgt#%}"
+case "$cmd" in
+  list-panes) cat "$D/panes.txt" 2>/dev/null ;;
+  capture-pane)
+    [ -f "$D/screen.$n" ] || { echo "can't find pane: $tgt" >&2; exit 1; }
+    c=$(( $(cat "$D/cap.$n" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$D/cap.$n"
+    if [ "$c" -ge 2 ] && [ -f "$D/screen2.$n" ]; then cat "$D/screen2.$n"; else cat "$D/screen.$n"; fi ;;
+  display-message)
+    if [ -f "$D/pid2.$n" ]; then cat "$D/pid2.$n"; else awk -v id="$tgt" '$1 == id { print $2 }' "$D/panes.txt"; fi ;;
+  send-keys)
+    [ -e "$D/send-fails" ] && { echo "send-keys failed (selftest)" >&2; exit 1; }
+    echo "$tgt ${rest[*]}" >> "$D/keys.log"
+    [ -e "$D/esc-ignored" ] || cp "$D/after-esc.txt" "$D/screen.$n" ;;
+  *) echo "unexpected tmux command: $cmd" >&2; exit 2 ;;
+esac
+EOF
+{ echo '#!/bin/bash'; echo "D='$TMUXD'"; cat <<'EOF'; } > "$BB/pspool"
+echo call >> "$D/ps.calls"
+[ -e "$D/ps-broken" ] && { echo "ps: operation not permitted (selftest)" >&2; exit 1; }
+cat "$D/ps.table" 2>/dev/null; exit 0
+EOF
+chmod +x "$BB/tmux" "$BB/pspool"
+# The screens. SCR_MODAL is claude's limit modal as measured on 2.1.291; the others are what must NOT be pressed.
+NL=$'\n'
+SCR_MODAL="● Done: the refactor is in.${NL}${NL}  What do you want to do?${NL}  ❯ 1. Stop and wait for limit to reset${NL}    2. Wait here, then continue automatically at Oct 7 at 7pm${NL}    3. Upgrade your plan${NL}${NL}  Enter to confirm · Esc to cancel"
+SCR_PROMPT="● Done: the refactor is in.${NL}${NL}────────────────────${NL}❯ ${NL}────────────────────${NL}  ? for shortcuts"
+SCR_QUOTED="● The limit screen reads:${NL}    What do you want to do?${NL}    ❯ 1. Stop and wait for limit to reset${NL}    Enter to confirm · Esc to cancel${NL}${NL}────────────────────${NL}❯ ${NL}────────────────────${NL}  ? for shortcuts"
+SCR_WORKING="● Reading the file${NL}${NL}✻ Thinking… (esc to interrupt)${NL}────────────────────${NL}❯ ${NL}────────────────────"
+SCR_PERMISSION="Do you want to proceed?${NL}❯ 1. Yes${NL}  2. No, and tell Claude what to do differently${NL}${NL}Enter to confirm · Esc to cancel"
+SCR_OTHERMODAL="What do you want to do?${NL}❯ 1. Run it${NL}  2. Skip it${NL}${NL}Enter to confirm · Esc to cancel"
 # Everything below reaches the Keychain as `security` on PATH="$BB:/usr/bin:/bin" (run_d, the in-process snippets, B49b). If that does not
 # resolve to the fake - it was not written, or is not executable - the REAL /usr/bin/security answers, and B49b writes a fixture token into
 # the real Keychain (ga-xknkke: 'Claude Code-credentials-0123abcd' holding sk-ant-oat01-ALLOWED). A run that cannot prove it is talking to
@@ -322,9 +414,16 @@ d[tok] = {"status": int(status), "h": json.loads(hdr)}
 json.dump(d, open(p, "w"))
 EOF
 }
+# tx_reset: no panes, no processes, nothing sent. The fake tmux's "an Escape takes" default leaves the pane on the prompt.
+PANE_N=0
+tx_reset() {
+  rm -rf "$TMUXD"; mkdir -p "$TMUXD"; : > "$TMUXD/panes.txt"; : > "$TMUXD/ps.table"; : > "$TMUXD/keys.log"; : > "$TMUXD/calls.log"
+  printf '%s\n' "$SCR_PROMPT" > "$TMUXD/after-esc.txt"; PANE_N=0
+}
 new_d() { # fresh daemon world with all three accounts allowed
   [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
   rm -rf "$D"; mkdir -p "$D/kc/items" "$D/vault" "$D/city/.gc/logs" "$D/home"
+  tx_reset
   # $POOL_DIR lives under $W, not $D: the credentials file the daemon keeps there (ga-6gat1o) survives a new_d unless it is cleared here
   # (a directory put in its place by B53 included, and a temp file a failed write may have left)
   rm -rf "$POOL_DIR/.credentials.json" "$POOL_DIR"/.credentials.json.tmp.*
@@ -370,9 +469,11 @@ run_d() { # run_d [env assignments...] -- <daemon args>   (always a clean enviro
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   restamp_store "${NOW_OVERRIDE-$NOW_BASE}"
+  rm -f "$TMUXD"/cap.*   # the fake tmux counts captures per run (screen2)
   env -i HOME="$D/home" USER=athos PATH="$BB:/usr/bin:/bin" GC_CITY_PATH="$D/city" FAKE_KC="$D/kc" VAULT="$D/vault" \
       CLAUDE_USAGE_STORE="$D/usage.json" CLAUDE_POOL_STATE="$STATE" CLAUDE_POOL_CRED_DIR="$POOL_DIR" \
       CLAUDE_POOL_ACCOUNTS_LIB="$ACCT_LIB" CLAUDE_POOL_PROBE_URL="http://127.0.0.1:$(cat "$D/port")/v1/messages" \
+      CLAUDE_POOL_TMUX="$BB/tmux" CLAUDE_POOL_PS="$BB/pspool" \
       CLAUDE_POOL_NOW="${NOW_OVERRIDE-$NOW_BASE}" ${envs[@]+"${envs[@]}"} "$PY3" "$DAEMON" "$@" >"$D/out.txt" 2>&1
 }
 jget() { "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); 
@@ -1344,6 +1445,380 @@ print(bool(rows) and all(isinstance(r.get("system"), list) and r["system"] and s
   case "$models" in *haiku*|*unparsed*|"") bad "B58 probe model(s): '$models' (n=$n)" ;; *sonnet*) ok "B58 the probe asks for a Sonnet model, not Haiku ($models; $n requests)" ;; *) bad "B58 probe model(s): '$models'" ;; esac
   [ "$sysok" = "True" ] && ok "B58b every probe carries the Claude Code system prompt" || bad "B58b system prompt: $sysok"
   [ -z "$(cf_leaks)" ] && ok "B58c no secret in argv/log/state/output after a failover run that wrote the file" || bad "B58c leaked (fingerprints:$(cf_leaks))"
+
+
+  # ══ B60+ (ga-8hcnvb.2.1) the Escape that unsticks a pool session sitting on claude's limit modal after the account was switched ═════════
+  # After the daemon rewrites the pool item, claude picks the new credential up within ~30 s - but a session that was already on the limit
+  # modal ("What do you want to do? ... Stop and wait for limit to reset") waits for a key and never notices. The daemon sends that one
+  # key, Escape, and only to a session it can PROVE is a pool session, on the modal of the credential it replaced, in the cycle of the
+  # switch. Every read it makes has three outcomes - yes / no / can't tell - and can't tell presses nothing and forgets nothing. So the
+  # scenarios below are mostly the negative cases, each one next to a control pane that DOES get its key (a "no key" that a world with no
+  # working Escape would also produce proves nothing): this file fails on a daemon that cannot send the Escape at all.
+  #
+  # Clock: the switch happens in the run at NOW_BASE ("t0"); `later <s>` is a run s seconds after it. A session that was launched before the
+  # switch has a POOL-ACCT SET line (the wrapper's own) 10 s before t0 and a process that started 1 s before that line.
+  iso_z()     { env -u TZ "$PY3" -c 'import sys,time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(sys.argv[1]))))' "$1"; }
+  lstart_of() { env -u TZ "$PY3" -c 'import sys,time; print(time.strftime("%a %b %e %H:%M:%S %Y", time.localtime(int(sys.argv[1]))))' "$1"; }
+  set_line()  { printf '%s pid=%s agent=%s wrapper POOL-ACCT SET item=%s\n' "$(iso_z "$1")" "$2" "$3" "$SVC" >> "$LOG"; }   # set_line <epoch> <pid> <agent as logged>
+  pane_add() { # pane_add <agent as the wrapper logged it> <screen> [launched: s from t0, default -10] [claude's ps start: s from that line, default -1; or 'gone']
+    # tmux pane %N whose shell (pid 5000+N) runs the claude (pid 7000+N). PANE_DEAD=1 / PANE_NOTMUX=1 in front: a dead pane / a claude in no pane.
+    local agent="$1" screen="$2" off="${3:--10}" psd="${4:--1}"
+    PANE_N=$((PANE_N + 1))
+    local n=$PANE_N pp=$((5000 + PANE_N)) cp=$((7000 + PANE_N)) at=$((NOW_BASE + ${3:--10}))
+    [ -n "${PANE_NOTMUX:-}" ] || echo "%$n $pp ${PANE_DEAD:-0}" >> "$TMUXD/panes.txt"
+    printf '%s\n' "$screen" > "$TMUXD/screen.$n"
+    set_line "$at" "$cp" "$agent"
+    echo "$pp 1 $(lstart_of $((at - 3600)))" >> "$TMUXD/ps.table"
+    [ "$psd" = gone ] || echo "$cp $pp $(lstart_of $((at + psd)))" >> "$TMUXD/ps.table"
+    PANE_LAST="%$n"
+  }
+  fail_a() { set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; NOW_OVERRIDE=$NOW_BASE run_d -- run-once; }   # a is rejected: the run at t0 switches the pool to b
+  later()  { local s="$1"; shift; NOW_OVERRIDE=$((NOW_BASE + s)) run_d "$@" -- run-once; }          # later <s> [env assignments...]: a run s seconds after t0
+  keys_sent()  { [ -s "$TMUXD/keys.log" ] && wc -l < "$TMUXD/keys.log" | tr -d ' ' || echo 0; }
+  keys_to()    { grep -c "^$1 Escape\$" "$TMUXD/keys.log" 2>/dev/null || true; }                  # keys_to <%N>
+  addressed()  { grep -Ec -- "-t $1( |\$)" "$TMUXD/calls.log" 2>/dev/null || true; }              # addressed <%N>: tmux calls that named this pane
+  tmux_calls() { [ -s "$TMUXD/calls.log" ] && wc -l < "$TMUXD/calls.log" | tr -d ' ' || echo 0; }
+  ps_calls()   { [ -s "$TMUXD/ps.calls" ] && wc -l < "$TMUXD/ps.calls" | tr -d ' ' || echo 0; }
+  pane_entry() { # pane_entry <%N> <first|tries>  ->  what the state remembers about that pane, or <none>
+    "$PY3" -c '
+import json, sys
+try: p = json.load(open(sys.argv[1])).get("panes") or {}
+except Exception: p = {}
+v = [e.get(sys.argv[3]) for k, e in p.items() if k.split(":")[0] == sys.argv[2]]
+print(v[0] if v else "<none>")' "$STATE" "$1" "$2" 2>/dev/null
+  }
+  foreign_item() { printf '%s' '{"claudeAiOauth":{"accessToken":"selftest-foreign-credential"}}' | xxd -p | tr -d '\n' > "$D/kc/items/$SVC"; }
+  on_b() { [ "$(item_token)" = "$TOKEN_b" ] && [ "$(jget "$STATE" current)" = "b@t.test" ]; }   # the switch to b really happened (else a "no key" is vacuous)
+
+  # B60 the positive control: a pool session on the limit modal, the pool switched under it -> ONE Escape, once claude has had time to re-read the item
+  seeded
+  [ "$(tmux_calls)" = "0" ] && [ "$(ps_calls)" = "0" ] && ok "B60 an ordinary run (the seed) asks neither tmux nor ps anything" || bad "B60 tmux calls=$(tmux_calls) ps calls=$(ps_calls)"
+  pane_add gastown.dog-1 "$SCR_MODAL"; P1=$PANE_LAST
+  fail_a; w1=$(writes)
+  on_b && ok "B60 precondition: a was rejected and the pool item moved to b" || bad "B60 precondition: current='$(jget "$STATE" current)'"
+  [ "$(keys_sent)" = "0" ] && grep -q "waiting 45 s" "$LOG" && ok "B60a the run that SWITCHES presses nothing: claude has not re-read the item yet (it waits 45 s, and says so)" \
+    || bad "B60a keys=$(keys_sent) log: $(grep -E 'waiting|UNSTICK' "$LOG" | tail -n 2 | tr '\n' '|')"
+  later 30
+  [ "$(keys_sent)" = "0" ] && ok "B60b ...nor does the run 30 s later" || bad "B60b keys=$(keys_sent)"
+  later 60
+  [ "$(keys_to "$P1")" = "1" ] && [ "$(keys_sent)" = "1" ] && ok "B60c 60 s after the switch the pool pane on the limit modal gets exactly ONE Escape" \
+    || bad "B60c keys to $P1: $(keys_to "$P1"), total $(keys_sent)  log: $(grep -E 'UNSTICK|WARN|ERROR' "$LOG" | tail -n 3 | tr '\n' '|')"
+  grep -q "UNSTICK: Escape sent to pane $P1 (gastown.dog-1)" "$LOG" && ok "B60d the Escape is a line in the log: pane, agent, the credential it was about" || bad "B60d no UNSTICK line: $(tail -n 3 "$LOG" | tr '\n' '|')"
+  [ "$(writes)" = "$w1" ] && on_b && ok "B60e the Escape rewrote nothing: the item and the decision are the switch's" || bad "B60e item writes $w1 -> $(writes)"
+  later 120
+  [ "$(keys_sent)" = "1" ] && [ -z "$(jget "$STATE" panes)" ] && ok "B60f the pane is back on its prompt: no second key, and the sighting is forgotten" || bad "B60f keys=$(keys_sent) panes='$(jget "$STATE" panes)'"
+  bad_calls="$(awk '{print $2}' "$TMUXD/calls.log" | sort -u | grep -Ev '^(list-panes|capture-pane|display-message|send-keys)$' | tr '\n' ' ')"
+  not_esc="$(awk '$2 == "send-keys"' "$TMUXD/calls.log" | grep -vc ' Escape$' || true)"
+  [ -z "$bad_calls" ] && [ "$not_esc" = "0" ] && ok "B60g tmux was only ever asked to list, capture, display-message and send-keys - and the only key is Escape" || bad "B60g other tmux calls: '$bad_calls', send-keys that were not Escape: $not_esc"
+  [ "$(awk '{print $1}' "$TMUXD/calls.log" | sort -u | tr '\n' ' ')" = "gascity " ] && ok "B60h every tmux call goes to the city's server (-L gascity)" || bad "B60h sockets: $(awk '{print $1}' "$TMUXD/calls.log" | sort -u | tr '\n' ' ')"
+
+  # B60j the socket seam on a pane that IS stuck (the switch run's own calls cleared first), and a socket name that is no name falls back to the city's server
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; fail_a; : > "$TMUXD/calls.log"; later 60 CLAUDE_POOL_TMUX_SOCKET=citytest
+  [ "$(awk '{print $1}' "$TMUXD/calls.log" | sort -u | tr '\n' ' ')" = "citytest " ] && [ "$(keys_sent)" = "1" ] && ok "B60j CLAUDE_POOL_TMUX_SOCKET=citytest: every call (the key too) goes to that server" || bad "B60j sockets: $(awk '{print $1}' "$TMUXD/calls.log" | sort -u | tr '\n' ' ') keys=$(keys_sent)"
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; fail_a; : > "$TMUXD/calls.log"; later 60 CLAUDE_POOL_TMUX_SOCKET='../x y'
+  [ "$(awk '{print $1}' "$TMUXD/calls.log" | sort -u | tr '\n' ' ')" = "gascity " ] && [ "$(keys_sent)" = "1" ] && ok "B60k a socket name that is not a name ('../x y') is not used: the city's server answers" || bad "B60k sockets: $(awk '{print $1}' "$TMUXD/calls.log" | sort -u | tr '\n' ' ')"
+
+  # B60l the three real shapes of a pool agent name, as `gc session list` prints them and the wrapper logs them (GC_AGENT), and every role of the list
+  seeded
+  names=(gastown.dog-1 wa-worker-1 wa-worker-adhoc-4f91013dd9 ps-worker-2 refino-gate-reviewer-3 gate-reviewer-1 context-check-reviewer-adhoc-ab12 auto-refiner)
+  ids=(); for nm in "${names[@]}"; do pane_add "$nm" "$SCR_MODAL"; ids+=("$PANE_LAST"); done
+  fail_a; later 60
+  miss=""; for i in "${ids[@]}"; do [ "$(keys_to "$i")" = "1" ] || miss="$miss $i"; done
+  [ -z "$miss" ] && [ "$(keys_sent)" = "${#names[@]}" ] && ok "B60l gastown.dog-1 | wa-worker-1 | wa-worker-adhoc-<id> and the ps-worker / reviewer / auto-refiner roles: each pane gets exactly one Escape" \
+    || bad "B60l no key for:$miss (total $(keys_sent) of ${#names[@]})"
+
+  # B61 NOT a pool session -> not looked at, not pressed. Mayor and the crews share no word with "crew" (oracle-wa, mila-wa ...), so the list is an
+  # ALLOW-list: only a name that IS a pool role (optionally "-<slot or adhoc id>") passes. A session with no name is not told apart from Mayor or a crew.
+  seeded
+  pane_add gastown.dog-1 "$SCR_MODAL"; CTL=$PANE_LAST
+  offs=(gastown.mayor mayor oracle-wa mila-wa thies-wa gastown.witness gastown.deacon control-dispatcher "?" "" gastown.dogs-1 gastown.dogfood wa-worker1 crew-wa-worker-1 "gastown.dog-1;rm" "wa-worker-1/../mayor")
+  oids=(); for nm in "${offs[@]}"; do pane_add "$nm" "$SCR_MODAL"; oids+=("$PANE_LAST"); done
+  fail_a; later 60
+  on_b && [ "$(keys_to "$CTL")" = "1" ] && [ "$(keys_sent)" = "1" ] && ok "B61 Mayor, crews, witnesses, a nameless session ('?' and empty) and look-alikes sit on the modal beside a pool pane: only the pool pane gets its key" \
+    || bad "B61 keys=$(keys_sent) to the control: $(keys_to "$CTL")  log: $(grep -E 'UNSTICK' "$LOG" | tail -n 3 | tr '\n' '|')"
+  touched=""; for i in "${oids[@]}"; do [ "$(addressed "$i")" = "0" ] || touched="$touched $i"; done
+  [ -z "$touched" ] && ok "B61b ...and tmux was never even asked about them (not captured, not addressed)" || bad "B61b tmux was asked about:$touched"
+  later 200
+  grep -Eq "pane scan: 16 live process\(es\) on the pool item with an agent name that is no pool role" "$LOG" \
+    && ok "B61c a live process on the pool item whose name is no pool role is SAID (on a due minute), so a new pool role missing from the list is a visible gap" \
+    || bad "B61c no off-list line: $(grep 'pane scan' "$LOG" | tail -n 2 | cut -c1-200 | tr '\n' '|')"
+
+  # B62 can't tell != no. Each world has a pane that was seen on the modal of the replaced credential (first sighting = t0) and has not been pressed
+  # yet; a run that cannot LOOK presses nothing and must not forget that sighting - a forgotten sighting that is seen again after the window
+  # (t0 + 90 s) is read as the NEW account's own limit, and never pressed. The run that can look again presses, once.
+  kept_world() { seeded; pane_add gastown.dog-1 "$SCR_MODAL"; KP=$PANE_LAST; fail_a; }
+  blind_ok() { # blind_ok <label> <what could not be done>
+    local first; first="$(pane_entry "$KP" first)"
+    [ "$(keys_sent)" = "0" ] && [ "${first%.0}" = "$NOW_BASE" ] && ok "$1 $2 -> no key, and the first sighting is kept: can't tell is not 'gone'" || bad "$1 $2: keys=$(keys_sent) first='$first'"
+  }
+  recovered() { [ "$(keys_to "$KP")" = "1" ] && [ "$(keys_sent)" = "1" ] && ok "$1 ...and the next run that can look presses once (the sighting was kept)" || bad "$1 after recovery keys to $KP: $(keys_to "$KP"), total $(keys_sent)"; }
+
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; U1=$PANE_LAST; pane_add wa-worker-1 "$SCR_MODAL"; U2=$PANE_LAST
+  fail_a; rm -f "$TMUXD/screen.${U2#%}"; later 20
+  f2="$(pane_entry "$U2" first)"
+  [ "$(keys_sent)" = "0" ] && [ "${f2%.0}" = "$NOW_BASE" ] && grep -q "could not be read this run" "$LOG" \
+    && ok "B62a a pool pane whose screen cannot be read: no key, a line in the log, and its sighting is kept" || bad "B62a keys=$(keys_sent) first='$f2'"
+  printf '%s\n' "$SCR_MODAL" > "$TMUXD/screen.${U2#%}"; later 100
+  [ "$(keys_to "$U1")" = "1" ] && [ "$(keys_to "$U2")" = "1" ] && ok "B62b ...and once it can be read, both panes get their key (the unreadable one on its kept sighting)" || bad "B62b keys: $U1=$(keys_to "$U1") $U2=$(keys_to "$U2")"
+
+  kept_world; touch "$TMUXD/down"; later 20
+  blind_ok B62c "tmux has no server"; rm -f "$TMUXD/down"; later 100; recovered B62c
+  kept_world; later 20 CLAUDE_POOL_TMUX="$TMUXD/no-such-tmux"
+  blind_ok B62d "no tmux binary"; grep -q "tmux could not be run" "$LOG" && ok "B62d ...and the log says so" || bad "B62d no 'tmux could not be run' line"; later 100; recovered B62d
+  kept_world; touch "$TMUXD/ps-broken"; later 20
+  blind_ok B62e "ps fails"; grep -q "ps unreadable" "$LOG" && ok "B62e ...and the log says so" || bad "B62e no 'ps unreadable' line"; rm -f "$TMUXD/ps-broken"
+  later 40 CLAUDE_POOL_PS="$TMUXD/no-such-ps"; blind_ok B62f "no ps binary"; later 100; recovered B62f
+  kept_world; mv "$LOG" "$LOG.keep"; mkdir "$LOG"; later 20
+  blind_ok B62g "the wrapper's log cannot be read (a directory is in its place; this works as root too)"
+  grep -q "wrapper's log could not be read" "$D/out.txt" && ok "B62g ...and the run says so (on stderr: the log itself is the thing that is broken)" || bad "B62g out: $(head -c 300 "$D/out.txt")"
+  rmdir "$LOG"; mv "$LOG.keep" "$LOG"; later 100; recovered B62g
+
+  # B62h what is on the screen / what is provable. Beside a control pane on the modal: screens that are not the limit modal (each pane IS read -
+  # its tmux calls prove it, so the "no key" is a decision and not a pane that was never reached) and panes whose claude cannot be proven.
+  seeded
+  pane_add gastown.dog-1 "$SCR_MODAL"; CT=$PANE_LAST
+  pane_add wa-worker-1 "$SCR_QUOTED"; L1=$PANE_LAST       # an agent that QUOTES the modal (this very bead does): the prompt box is under the quote
+  pane_add wa-worker-2 "$SCR_PROMPT"; L2=$PANE_LAST
+  pane_add wa-worker-3 "$SCR_WORKING"; L3=$PANE_LAST
+  pane_add ps-worker-1 "$SCR_PERMISSION"; L4=$PANE_LAST    # a permission dialog has the same footer
+  pane_add ps-worker-2 "$SCR_OTHERMODAL"; L5=$PANE_LAST    # another dialog that asks the same question
+  pane_add auto-refiner-1 ""; L6=$PANE_LAST                # an empty screen
+  PANE_DEAD=1 pane_add wa-worker-4 "$SCR_MODAL"; N1=$PANE_LAST            # a dead pane
+  pane_add wa-worker-5 "$SCR_MODAL" -10 gone; N2=$PANE_LAST               # the SET line is there, the process is gone
+  pane_add wa-worker-6 "$SCR_MODAL" -10 30; N3=$PANE_LAST                 # the pid was recycled: this process started AFTER the line
+  pane_add wa-worker-7 "$SCR_MODAL" -10 -400; N4=$PANE_LAST               # ...or long BEFORE it, so it cannot be the wrapper that exec'd into claude then
+  PANE_NOTMUX=1 pane_add wa-worker-8 "$SCR_MODAL"; N5=$PANE_LAST          # alive, in no tmux pane
+  fail_a; later 60
+  on_b && [ "$(keys_to "$CT")" = "1" ] && [ "$(keys_sent)" = "1" ] && ok "B62h next to a pool pane on the modal: quoted modal, prompt, working, permission dialog, another dialog, empty screen, dead pane, process gone/recycled/too old, no pane - one key, to the control" \
+    || bad "B62h keys=$(keys_sent), to the control $(keys_to "$CT")  log: $(grep -E 'UNSTICK' "$LOG" | tail -n 3 | tr '\n' '|')"
+  unread=""; for i in "$L1" "$L2" "$L3" "$L4" "$L5" "$L6"; do [ "$(addressed "$i")" -ge 1 ] || unread="$unread $i"; done
+  never=""; for i in "$N1" "$N2" "$N3" "$N4" "$N5"; do [ "$(addressed "$i")" = "0" ] || never="$never $i"; done
+  [ -z "$unread" ] && [ -z "$never" ] && ok "B62i the screens were read (and judged), the unprovable panes were never touched" || bad "B62i not read:$unread  touched though unprovable:$never"
+
+  # B63 no switch in this cycle -> no key (and tmux is not even asked)
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST
+  later 700
+  [ "$(keys_sent)" = "0" ] && [ "$(tmux_calls)" = "0" ] && [ "$(ps_calls)" = "0" ] && ok "B63a a pool pane on the modal, but the last switch was 700 s ago (cycle = 600 s): no key, and neither tmux nor ps was asked" \
+    || bad "B63a keys=$(keys_sent) tmux calls=$(tmux_calls) ps calls=$(ps_calls)"
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a
+  [ "$(pane_entry "$P" first)" != "<none>" ] && later 700 && [ "$(pane_entry "$P" first)" = "<none>" ] && ok "B63b a sighting does not outlive the cycle: after it, nothing is remembered about the pane" || bad "B63b first=$(pane_entry "$P" first)"
+
+  seeded; pane_add gastown.dog-1 "$SCR_PROMPT"; P=$PANE_LAST; pane_add wa-worker-1 "$SCR_MODAL"; Q=$PANE_LAST
+  fail_a; printf '%s\n' "$SCR_MODAL" > "$TMUXD/screen.${P#%}"; later 100; later 160
+  f="$(pane_entry "$P" first)"
+  [ "$(keys_to "$Q")" = "1" ] && [ "$(keys_to "$P")" = "0" ] && [ "${f%.0}" = "$((NOW_BASE + 100))" ] \
+    && ok "B63c a modal FIRST seen 100 s after the switch (window 90 s) is the new account's own limit: not pressed (the control, seen at the switch, was)" || bad "B63c keys: control $(keys_to "$Q"), late pane $(keys_to "$P"), its first='$f'"
+
+  seeded; pane_add wa-worker-1 "$SCR_MODAL"; Q=$PANE_LAST
+  fail_a; pane_add gastown.dog-1 "$SCR_MODAL" 20; P=$PANE_LAST     # started 20 s AFTER the rewrite: it never had the replaced credential
+  later 60; later 150
+  [ "$(keys_to "$Q")" = "1" ] && [ "$(keys_to "$P")" = "0" ] && [ "$(addressed "$P")" -ge 1 ] \
+    && ok "B63d a session launched after the rewrite is on the modal of its OWN credential: read, not pressed (the one launched before was)" || bad "B63d keys: control $(keys_to "$Q"), late launch $(keys_to "$P"), addressed $(addressed "$P")"
+
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; foreign_item; later 700
+  on_b; [ "$(item_token)" = "$TOKEN_a" ] && grep -q "rewriting" "$LOG" && [ "$(keys_sent)" = "0" ] && [ "$(tmux_calls)" = "0" ] \
+    && ok "B63e a HEAL rewrites the item but is not a switch: with the last switch long ago there is no scan and no key" || bad "B63e item=$(item_token | cut -c1-24) keys=$(keys_sent) tmux calls=$(tmux_calls)"
+
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a; later 30; foreign_item; later 60
+  [ "$(keys_sent)" = "0" ] && grep -q "rewritten 0 s ago" "$LOG" && ok "B63f the item healed THIS run restarts the wait (60 s after the switch, but 0 s after the heal): no key" || bad "B63f keys=$(keys_sent) log: $(grep -E 'waiting|rewriting' "$LOG" | tail -n 2 | tr '\n' '|')"
+  later 110
+  [ "$(keys_to "$P")" = "1" ] && ok "B63g ...and the next run presses" || bad "B63g keys=$(keys_sent)"
+
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST
+  junk_bad=""
+  for junk in '"soon"' '1999099999' 'True' 'None' '0' '-5' '[1]' 'float("nan")'; do
+    edit_state "st['item_at'] = $junk"; later 60
+    { [ "$(keys_sent)" = "0" ] && [ "$(tmux_calls)" = "0" ] && [ -z "$(jget "$STATE" item_at)" ]; } || junk_bad="$junk_bad $junk(keys=$(keys_sent),tmux=$(tmux_calls),item_at='$(jget "$STATE" item_at)')"
+  done
+  edit_state "st.pop('item_at', None)"; later 60
+  { [ "$(keys_sent)" = "0" ] && [ "$(tmux_calls)" = "0" ]; } || junk_bad="$junk_bad absent"
+  [ -z "$junk_bad" ] && ok "B63h a state whose item_at is junk, in the future or absent (a state from before this existed) has no switch to point to: no scan, no key, and the junk is dropped" || bad "B63h:$junk_bad"
+  edit_state "st['item_at'] = $NOW_BASE"; later 60
+  [ "$(keys_to "$P")" = "1" ] && ok "B63i ...and with a real item_at the same world presses (so the cases above were not vacuous)" || bad "B63i keys=$(keys_sent)"
+
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST
+  touch "$D/kc/refuse-writes"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; later 3600
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ -n "$(jex a@t.test reset_epoch)" ] && [ "$(keys_sent)" = "0" ] && [ "$(tmux_calls)" = "0" ] \
+    && ok "B63j a switch that FAILED (the Keychain refused the write) is not a switch: the pool stays on a, no scan, no key" || bad "B63j current='$(jget "$STATE" current)' keys=$(keys_sent) tmux calls=$(tmux_calls)"
+
+  # B64 stale_modal: is this modal about a credential that was REPLACED? (in-process: the exact edges)
+  got="$(env -i GC_CITY_PATH="$D/city" CLAUDE_POOL_TMUX="$BB/tmux" CLAUDE_POOL_PS="$BB/pspool" "$PY3" -c '
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+AT = 1999000000
+def stale(st, launched, first): return m.stale_modal(st, m.PanePeek("%1", 11, 21, "gastown.dog-1", True, launched), {"first": first, "tries": 0})
+cases = [
+    ({"item_at": AT}, AT - 10, AT, True, "launched before, seen at the rewrite"),
+    ({"item_at": AT}, AT, AT, True, "launched in the very second of the rewrite"),
+    ({"item_at": AT}, AT + 1, AT, False, "launched 1 s after the rewrite"),
+    ({"item_at": AT}, AT - 10, AT + 90, True, "first seen 90 s after: the edge of the window"),
+    ({"item_at": AT}, AT - 10, AT + 91, False, "first seen 91 s after"),
+    ({}, AT - 10, AT, False, "no item_at"),
+    ({"item_at": None}, AT - 10, AT, False, "item_at None"),
+    ({"item_at": "x"}, AT - 10, AT, False, "item_at a string"),
+    ({"item_at": True}, AT - 10, AT, False, "item_at a bool"),
+    ({"item_at": float("nan")}, AT - 10, AT, False, "item_at NaN"),
+    ({"item_at": 0}, AT - 10, AT, False, "item_at 0"),
+]
+bad = [why for st, l, f, want, why in cases if stale(st, l, f) is not want]
+print("OK" if not bad else "BAD: " + "; ".join(bad))' "$DAEMON" 2>&1 | tail -n 3)"
+  [ "$got" = "OK" ] && ok "B64 stale_modal: launched <= the rewrite AND first seen <= 90 s after it; no usable item_at = nothing is stale" || bad "B64 $got"
+
+  # B65 modal_stuck: the limit modal must be the LAST thing on the screen, question above option above the footer
+  got="$(env -i GC_CITY_PATH="$D/city" CLAUDE_POOL_TMUX="$BB/tmux" CLAUDE_POOL_PS="$BB/pspool" "$PY3" -c '
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+M = "What do you want to do?\n❯ 1. Stop and wait for limit to reset\n  2. Wait here, then continue automatically at Oct 7 at 7pm\n  3. Upgrade your plan\n\nEnter to confirm · Esc to cancel"
+cases = [
+    (M, True, "the modal"),
+    ("some transcript\n" * 40 + M, True, "the modal under a long transcript"),
+    (M + "\n\n\n", True, "blank lines after it"),
+    (M.replace("\n", "   \n") + "   ", True, "trailing spaces"),
+    ("", False, "empty screen"),
+    ("Enter to confirm · Esc to cancel", False, "the footer alone"),
+    ("What do you want to do?\n1. Stop and wait for limit to reset", False, "no footer"),
+    (M + "\n❯ \n────────\n  ? for shortcuts", False, "quoted: the prompt box is under it"),
+    (M.replace("Enter to confirm · Esc to cancel", "? for shortcuts"), False, "another footer"),
+    (M.replace("Esc to cancel", "Esc to go back"), False, "a footer without Esc to cancel"),
+    ("Do you want to proceed?\n❯ 1. Yes\n  2. No\n\nEnter to confirm · Esc to cancel", False, "a permission dialog"),
+    ("What do you want to do?\n❯ 1. Run it\n  2. Skip it\n\nEnter to confirm · Esc to cancel", False, "another dialog with the same question"),
+    ("❯ 1. Stop and wait for limit to reset\nWhat do you want to do?\n  2. Wait here\nEnter to confirm · Esc to cancel", False, "option above the question"),
+    ("What do you want to do?\n" + "x\n" * 12 + "❯ 1. Stop and wait for limit to reset\nEnter to confirm · Esc to cancel", False, "question far above the option"),
+]
+bad = [why for text, want, why in cases if m.modal_stuck(text) is not want]
+print("OK" if not bad else "BAD: " + "; ".join(bad))' "$DAEMON" 2>&1 | tail -n 3)"
+  [ "$got" = "OK" ] && ok "B65 modal_stuck: only the limit modal as the last thing on screen (a quote of it, a permission dialog, another dialog, a bare footer are not)" || bad "B65 $got"
+
+  # B66 sanitize_state for the bookkeeping this adds: junk is dropped, and junk in `tries` reads as 'already tried' - never as a fresh Escape
+  got="$(env -i GC_CITY_PATH="$D/city" CLAUDE_POOL_TMUX="$BB/tmux" CLAUDE_POOL_PS="$BB/pspool" "$PY3" -c '
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+T = 1999000100.0
+def san(st): m.sanitize_state(st, T); return st
+bad = []
+def chk(cond, why):
+    if not cond: bad.append(why)
+chk("panes" not in san({"panes": []}), "panes a list")
+chk("panes" not in san({"panes": "x"}), "panes a string")
+for label, e in [("a string", "x"), ("first a string", {"first": "x", "tries": 0}), ("first in the future", {"first": T + 99999, "tries": 0}),
+                 ("first a bool", {"first": True, "tries": 0}), ("first None", {"first": None, "tries": 0}), ("no first", {"tries": 0})]:
+    chk(san({"panes": {"%1:2": e}})["panes"] == {}, "entry dropped: " + label)
+for label, tr in [("a string", "0"), ("a bool", True), ("negative", -1), ("a float", 2.0), ("None", None)]:
+    chk(san({"panes": {"%1:2": {"first": 1999000000, "tries": tr}}})["panes"]["%1:2"]["tries"] == m.MAX_ESC_TRIES, "tries " + label + " reads as all spent")
+e = san({"panes": {"%1:2": {"first": 1999000000}}})["panes"]["%1:2"]
+chk(e["tries"] == m.MAX_ESC_TRIES, "tries missing reads as all spent")
+for tr in (0, 1, 2):
+    chk(san({"panes": {"%1:2": {"first": 1999000000, "tries": tr}}})["panes"]["%1:2"]["tries"] == tr, "tries %d kept" % tr)
+for label, v, kept in [("a string", "soon", False), ("in the future", T + 99999, False), ("None", None, False), ("a bool", True, False),
+                       ("slightly ahead (clock skew)", T + 10, True), ("a real past time", 1999000000, True)]:
+    chk(("item_at" in san({"item_at": v})) is kept, "item_at " + label)
+print("OK" if not bad else "BAD: " + "; ".join(bad))' "$DAEMON" 2>&1 | tail -n 3)"
+  [ "$got" = "OK" ] && ok "B66 sanitize_state: junk panes/item_at are dropped; junk or missing tries counts as spent (never a fresh Escape)" || bad "B66 $got"
+
+  # B64b the fences stand on their own, not only behind each other: a nameless / non-pool pane that reaches unstick() or scan_panes() anyway is not pressed
+  got="$(env -i GC_CITY_PATH="$D/city" CLAUDE_POOL_TMUX="$BB/tmux" CLAUDE_POOL_PS="$BB/pspool" "$PY3" -c '
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+T = 1999000100.0
+bad = []
+pressed = []
+m.send_escape = lambda p: (pressed.append(p.agent), True)[1]
+m.read_item_token = lambda user: ("ok", "tok")
+m.ITEM_WRITTEN_AT = None
+peeks = [m.PanePeek("%%%d" % i, 10 + i, 20 + i, a, True, T - 100) for i, a in enumerate(["?", "gastown.mayor", "oracle-wa", "", "wa-worker-1"], 1)]
+m.safe_scan = lambda: m.Scan(True, peeks)
+st = {"current": "b@t.test", "fingerprint": m.fingerprint("tok"), "item_at": T - 100}
+m.unstick(st, "athos", T)                    # first sighting recorded (waited 100 s, window ok) ...
+st["panes"] = {p.key: {"first": T - 100, "tries": 0} for p in peeks}
+m.unstick(st, "athos", T)
+if pressed != ["wa-worker-1"]: bad.append("unstick pressed %r" % (pressed,))
+# scan_panes: launches whose agent is no pool role never get as far as a tmux call
+m.pool_launches = lambda off=None: {7001: (T - 10, "?"), 7002: (T - 10, "gastown.mayor"), 7003: (T - 10, "")}
+m.process_table = lambda: ({7001: (1, T - 11), 7002: (1, T - 11), 7003: (1, T - 11)}, 0)
+def boom(args): raise AssertionError("tmux was asked: %r" % (args,))
+m.tmux = boom
+try:
+    s = m.scan_panes()
+    if not (s.ok and s.panes == []): bad.append("scan_panes returned panes for non-pool launches")
+except AssertionError as e: bad.append(str(e))
+print("OK" if not bad else "BAD: " + "; ".join(bad))' "$DAEMON" 2>&1 | tail -n 3)"
+  [ "$got" = "OK" ] && ok "B64b unstick() and scan_panes() each refuse a nameless / non-pool pane by themselves (the control in the same scan is pressed)" || bad "B64b $got"
+
+  # B67 junk in `tries` is never a fresh Escape; a real count is counted
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a
+  edit_state 'k = list(st["panes"])[0]; st["panes"][k]["tries"] = "0"'; later 60
+  [ "$(keys_sent)" = "0" ] && [ "$(pane_entry "$P" tries)" = "3" ] && ok "B67 tries='0' (a string) in the state reads as 'all tries spent': no key" || bad "B67 keys=$(keys_sent) tries=$(pane_entry "$P" tries)"
+  edit_state 'k = list(st["panes"])[0]; st["panes"][k]["tries"] = 2'; later 120
+  [ "$(keys_to "$P")" = "1" ] && [ "$(pane_entry "$P" tries)" = "3" ] && ok "B67b tries=2 -> one more Escape, and it is counted before it is sent" || bad "B67b keys=$(keys_sent) tries=$(pane_entry "$P" tries)"
+
+  # B68 the kill switches: the daemon still decides and switches, and still looks (the sighting is kept, no try is spent), but presses nothing
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a; later 60 GC_POOL_UNSTICK=0
+  on_b && [ "$(keys_sent)" = "0" ] && [ "$(pane_entry "$P" tries)" = "0" ] && grep -q "unstick disabled by GC_POOL_UNSTICK=0 - no key sent" "$LOG" \
+    && ok "B68 GC_POOL_UNSTICK=0 -> the switch stands, no key, no try spent, and the log says why" || bad "B68 keys=$(keys_sent) tries=$(pane_entry "$P" tries) log: $(grep disabled "$LOG" | tail -n 1)"
+  later 120; [ "$(keys_to "$P")" = "1" ] && ok "B68b ...and with the switch off the next run presses (the pane was not forgotten)" || bad "B68b keys=$(keys_sent)"
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a; touch "$D/city/.gc/no-pool-unstick"; later 60
+  on_b && [ "$(keys_sent)" = "0" ] && [ "$(pane_entry "$P" tries)" = "0" ] && grep -q "unstick disabled by .*no-pool-unstick - no key sent" "$LOG" \
+    && ok "B68c <city>/.gc/no-pool-unstick -> no key, no try spent, and the log names the file" || bad "B68c keys=$(keys_sent) tries=$(pane_entry "$P" tries)"
+  rm -f "$D/city/.gc/no-pool-unstick"; later 120; [ "$(keys_to "$P")" = "1" ] && ok "B68d ...and removing the file lets the next run press" || bad "B68d keys=$(keys_sent)"
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a; later 60 GC_POOL_ACCOUNT=0
+  [ "$(keys_sent)" = "0" ] && ok "B68e GC_POOL_ACCOUNT=0 (the daemon's own kill switch) -> nothing at all, no key either" || bad "B68e keys=$(keys_sent)"
+
+  # B69 the limits: an Escape that does not take is not repeated for ever, and one run never sends a burst
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; touch "$TMUXD/esc-ignored"; fail_a
+  for s in 60 120 180 240 300; do later "$s"; done
+  [ "$(keys_to "$P")" = "3" ] && [ "$(pane_entry "$P" tries)" = "3" ] && ok "B69 an Escape that does not take is tried 3 times in all, then left alone" || bad "B69 keys=$(keys_sent) tries=$(pane_entry "$P" tries)"
+  seeded; for i in $(seq 1 25); do pane_add wa-worker-$i "$SCR_MODAL" > /dev/null; done
+  fail_a; later 60
+  [ "$(keys_sent)" = "20" ] && grep -q "20 Escapes sent this run" "$LOG" && ok "B69b 25 panes on the modal: 20 Escapes in one run, and the log says the rest wait" || bad "B69b keys=$(keys_sent)"
+  later 120
+  [ "$(keys_sent)" = "25" ] && [ -z "$(sort "$TMUXD/keys.log" | uniq -d)" ] && ok "B69c ...the next run presses the other 5, and no pane got two" || bad "B69c keys=$(keys_sent) twice: $(sort "$TMUXD/keys.log" | uniq -d | tr '\n' ' ')"
+
+  # B70 the key is the last thing checked, right before it is sent: the pane may have changed since the scan
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; C0=$PANE_LAST; pane_add wa-worker-1 "$SCR_MODAL"; R=$PANE_LAST; pane_add wa-worker-2 "$SCR_MODAL"; S=$PANE_LAST
+  printf '%s\n' "$SCR_PROMPT" > "$TMUXD/screen2.${R#%}"     # the modal is gone by the time the key would be sent
+  echo 9999 > "$TMUXD/pid2.${S#%}"                          # ...and another process owns this pane now
+  fail_a; later 60
+  [ "$(keys_to "$C0")" = "1" ] && [ "$(keys_sent)" = "1" ] && grep -q "no longer shows the limit modal - nothing sent" "$LOG" && grep -q "is not the process it was a moment ago - nothing sent" "$LOG" \
+    && ok "B70 a pane whose modal went away, and one that another process took over, between the scan and the key: nothing sent to them" || bad "B70 keys=$(keys_sent) log: $(grep -E 'nothing sent' "$LOG" | tail -n 2 | tr '\n' '|')"
+  [ "$(pane_entry "$R" tries)" = "1" ] && ok "B70b ...and the attempt is counted (before it is made)" || bad "B70b tries=$(pane_entry "$R" tries)"
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; touch "$TMUXD/send-fails"; fail_a; later 60
+  [ "$(keys_sent)" = "0" ] && [ "$(pane_entry "$P" tries)" = "1" ] && grep -q "tmux send-keys failed (exit=1)" "$LOG" && ok "B70c send-keys fails -> no key, a WARN, the try is spent" || bad "B70c keys=$(keys_sent) tries=$(pane_entry "$P" tries)"
+  rm -f "$TMUXD/send-fails"; later 120
+  [ "$(keys_to "$P")" = "1" ] && ok "B70d ...and the next run sends it" || bad "B70d keys=$(keys_sent)"
+
+  # B71 an exception inside the Escape never costs the decision: the item moved, the decision is published, and the run says what happened
+  cat > "$W/break_unstick.py" <<'EOF'
+import importlib.util, os, sys
+sp = importlib.util.spec_from_file_location("d", os.environ["REAL_DAEMON"]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+what = os.environ["BREAK"]
+def boom(*a, **k): raise RuntimeError("selftest: " + what)
+setattr(m, what, boom)
+sys.exit(m.main(["x", "run-once"]))
+EOF
+  REAL_DAEMON_FILE="$DAEMON"
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST
+  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; DAEMON="$W/break_unstick.py"; NOW_OVERRIDE=$NOW_BASE run_d REAL_DAEMON="$REAL_DAEMON_FILE" BREAK=unstick -- run-once; DAEMON="$REAL_DAEMON_FILE"
+  on_b && [ "$(jget "$STATE" fingerprint)" = "$(fp_of "$TOKEN_b")" ] && grep -q "unstick failed (RuntimeError)" "$LOG" \
+    && ok "B71 unstick() raising in the run that switches: the item is on b, the decision is published (current, fingerprint), and an ERROR says unstick failed" || bad "B71 current='$(jget "$STATE" current)' log: $(tail -n 3 "$LOG" | cut -c1-160 | tr '\n' '|')"
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a
+  DAEMON="$W/break_unstick.py"; later 60 REAL_DAEMON="$REAL_DAEMON_FILE" BREAK=send_escape; DAEMON="$REAL_DAEMON_FILE"
+  on_b && [ "$(keys_sent)" = "0" ] && grep -q "unstick failed (RuntimeError)" "$LOG" && ok "B71b send_escape() raising at the key: no key, the decision stands, the failure is logged" || bad "B71b keys=$(keys_sent) log: $(tail -n 2 "$LOG" | cut -c1-160 | tr '\n' '|')"
+
+  # B72 the item must still be the decision's, readable, and the account usable, when the key is sent
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a; touch "$D/kc/locked"; later 60
+  [ "$(keys_sent)" = "0" ] && grep -q "pool item could not be read - no Escape sent" "$LOG" && ok "B72a a Keychain that cannot be read (locked) -> no key: can't tell what the item holds" || bad "B72a keys=$(keys_sent) log: $(grep -E 'Escape' "$LOG" | tail -n 1)"
+  rm -f "$D/kc/locked"; later 120; [ "$(keys_to "$P")" = "1" ] && ok "B72b ...and unlocked, the next run presses" || bad "B72b keys=$(keys_sent)"
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a; foreign_item; touch "$D/kc/refuse-writes"; later 60
+  [ "$(keys_sent)" = "0" ] && grep -q "does not hold the credential of the decision - no Escape sent" "$LOG" && ok "B72c the item holds another credential and cannot be put right -> no key" || bad "B72c keys=$(keys_sent) log: $(grep -E 'Escape' "$LOG" | tail -n 1)"
+  rm -f "$D/kc/refuse-writes"; later 120
+  [ "$(keys_sent)" = "0" ] && ok "B72d ...healed in this run, the item is new again: the wait restarts, still no key" || bad "B72d keys=$(keys_sent)"
+  later 180; [ "$(keys_to "$P")" = "1" ] && ok "B72e ...and the run after that presses" || bad "B72e keys=$(keys_sent)"
+  seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST
+  for e in a@t.test b@t.test c@t.test; do set_srv "$e" 429 "$(hdr_rejected seven_day 2000000000)"; done; later 60
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(keys_sent)" = "0" ] && grep -q "a@t.test is registered as exhausted - no Escape into it" "$LOG" \
+    && ok "B72f every account rejected (no switch to make, the active one registered exhausted): an Escape would only land on the next 429 -> no key" || bad "B72f keys=$(keys_sent) log: $(grep -E 'exhausted' "$LOG" | tail -n 1 | cut -c1-160)"
+  for e in a@t.test b@t.test c@t.test; do set_srv "$e" 200 "$HDR_OK"; done; later 120
+  [ "$(keys_to "$P")" = "1" ] && ok "B72g ...and once the account answers again the pane is pressed (non-vacuous)" || bad "B72g keys=$(keys_sent)"
 
 [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
 
