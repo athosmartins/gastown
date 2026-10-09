@@ -1751,7 +1751,7 @@ print("OK" if not bad else "BAD: " + "; ".join(bad))' "$DAEMON" 2>&1 | tail -n 3
   seeded; pane_add gastown.dog-1 "$SCR_MODAL"; P=$PANE_LAST; fail_a
   edit_state 'k = list(st["panes"])[0]; st["panes"][k]["tries"] = "0"'; later 60
   [ "$(keys_sent)" = "0" ] && [ "$(pane_entry "$P" tries)" = "3" ] && ok "B67 tries='0' (a string) in the state reads as 'all tries spent': no key" || bad "B67 keys=$(keys_sent) tries=$(pane_entry "$P" tries)"
-  grep -q "after 3 Escapes" "$LOG" && ok "B67a ...and the log says the pane is still on the modal after its 3 Escapes (no silent give-up)" || bad "B67a no 'after 3 Escapes' line: $(grep -E 'INFO|WARN' "$LOG" | tail -n 3 | cut -c1-200 | tr '\n' '|')"
+  grep -q "with all 3 tries spent" "$LOG" && ok "B67a ...and the log says the pane is still on the modal with all its 3 tries spent (no silent give-up; 'tries', not 'Escapes': junk in the state reads as spent with none sent)" || bad "B67a no 'with all 3 tries spent' line: $(grep -E 'INFO|WARN' "$LOG" | tail -n 3 | cut -c1-200 | tr '\n' '|')"
   edit_state 'k = list(st["panes"])[0]; st["panes"][k]["tries"] = 2'; later 120
   [ "$(keys_to "$P")" = "1" ] && [ "$(pane_entry "$P" tries)" = "3" ] && ok "B67b tries=2 -> one more Escape, and it is counted before it is sent" || bad "B67b keys=$(keys_sent) tries=$(pane_entry "$P" tries)"
 

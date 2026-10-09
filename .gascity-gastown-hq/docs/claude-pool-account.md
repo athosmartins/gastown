@@ -390,8 +390,8 @@ That is deliberate (a feature that silently cannot run is a fault worth a push);
   `tmux send-keys failed (exit=N)`;
 - a pane on the modal that gets no key, said once per run (a run per minute, for the 10 minutes of the cycle): `N pool pane(s) on the limit modal that is not
   about the replaced credential (started after the rewrite, or first seen more than 90 s after it) - no Escape` (a late modal and a daemon that was blind in
-  the window after the switch look the same from here — this line only makes the first visible), and `N pool pane(s) still on the limit modal after 3 Escapes -
-  no more keys for them this cycle`;
+  the window after the switch look the same from here — this line only makes the first visible), and `N pool pane(s) still on the limit modal with all 3 tries spent -
+  no more keys for them this cycle` ("tries", not "Escapes": a `tries` that is junk in the state reads as spent with none sent);
 - can't tell: `N pool pane(s) could not be read this run`, `tmux could not be run - no pane looked at this run`, `tmux list-panes failed (exit=N) - no pane
   looked at this run` (tmux ran and failed: no server on the socket, a wrong `CLAUDE_POOL_TMUX_SOCKET`, a restarted server), `ps unreadable - ...`,
   `the wrapper's log could not be read - ...`;

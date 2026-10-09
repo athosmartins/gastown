@@ -980,7 +980,7 @@ def unstick(st: dict, user: str, t: float) -> None:
         log("INFO", f"{len(fresh)} pool pane(s) on the limit modal that is not about the replaced credential (started after the rewrite, or first seen "
                     f"more than {STALE_WINDOW_S} s after it) - no Escape")
     if spent:
-        log("INFO", f"{len(spent)} pool pane(s) still on the limit modal after {MAX_ESC_TRIES} Escapes - no more keys for them this cycle")
+        log("INFO", f"{len(spent)} pool pane(s) still on the limit modal with all {MAX_ESC_TRIES} tries spent - no more keys for them this cycle")
     todo = [p for p, stale in on_modal if stale and tracked[p.key]["tries"] < MAX_ESC_TRIES]
     nameless = [p for p in todo if not pool_agent(p.agent)]   # the wrapper could not log who this is ("?"): not told apart from Mayor or a crew
     if nameless:
