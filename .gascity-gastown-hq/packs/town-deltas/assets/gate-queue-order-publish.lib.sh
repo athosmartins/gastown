@@ -29,9 +29,10 @@
 #     publication go stale and says "cannot prove", never "orphan".
 #   - It never fails the sweep. A failed write returns non-zero and warns; the reader then sees a
 #     stale or short history, which is the inert answer.
-#   - A history that cannot be read back (corrupt, wrong version, clock stepped back) is DROPPED and
-#     restarted from this sweep alone — a short history makes the reader abstain, a merged-over-garbage
-#     one could make it assert.
+#   - A history that cannot be read back (corrupt, wrong version) is DROPPED and restarted from this
+#     sweep alone — a short history makes the reader abstain, a merged-over-garbage one could make it
+#     assert. A readable one keeps its past sweeps; only entries from the FUTURE (clock stepped back)
+#     are dropped, so `at` stays strictly increasing.
 #
 # bash 3.2 (launchd's /bin/bash): no associative arrays, no mapfile, no ${var,,}.
 
