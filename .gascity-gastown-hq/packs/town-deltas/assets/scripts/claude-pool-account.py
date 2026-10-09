@@ -37,6 +37,12 @@ account AFTER it ("not known" is not "does not outrank"). So an expired entry is
     of the active one, otherwise drop the entry - with a log line saying why.
 Every removal of an entry from the registry has a log line with its reason; nothing leaves it silently.
 
+A session that was SITTING on claude's limit modal ("What do you want to do? / 1. Stop and wait for limit to reset") when the account was
+switched does not notice the new credential: the modal waits for a key (ga-8hcnvb.2.1). After a switch, once the item has been in place long
+enough for claude to re-read it, the run sends that pane ONE Escape - and nothing else, to nobody else. This is a scoped exception to the
+send-keys doctrine; every guard on it (pool panes only, the modal still the last thing on screen, a switch of THIS cycle, the item holding the
+decision, a cap of tries) is a reason NOT to press, and a read that cannot tell is a no. See docs/claude-pool-account.md ("The Escape exception").
+
 The switch path never starts `claude` (it may be the thing that is exhausted): the probe is one tiny HTTP call (1 token, on the
 model the pool runs, as Claude Code would ask for it), and the answer is read from the anthropic-ratelimit-unified-* headers. The probe never follows a redirect (the
 Bearer would travel with it): a 30x is "could not tell".
@@ -54,12 +60,14 @@ probe THAT token; item cannot be read -> change nothing; item missing or holding
 KNOBS: GC_POOL_ACCOUNT=0 or <city>/.gc/no-pool-account -> the run does nothing at all. So does <city>/.gc/pool-account-degraded,
 which is not a knob: claude-pool-guard.py (ga-8hcnvb.3) writes it when the per-version self-test says the installed claude no
 longer reads the pool item, and removes it when the test passes again.
+GC_POOL_UNSTICK=0 or <city>/.gc/no-pool-unstick -> the run still decides and switches, but never sends a key to a pane.
 SEAMS (tests): CLAUDE_POOL_STATE, CLAUDE_POOL_CRED_DIR (GC_POOL_CRED_DIR, the wrapper's name for it, is honoured too),
-CLAUDE_POOL_ACCOUNTS_LIB, CLAUDE_POOL_NOW,
+CLAUDE_POOL_ACCOUNTS_LIB, CLAUDE_POOL_NOW, CLAUDE_POOL_TMUX (the tmux binary), CLAUDE_POOL_TMUX_SOCKET (default "gascity"), CLAUDE_POOL_PS (the ps binary),
 CLAUDE_POOL_PROBE_URL (honoured ONLY for a loopback host — an env var must not be able to aim a token elsewhere).
 """
 from __future__ import annotations
 
+import calendar
 import errno
 import fcntl
 import hashlib
@@ -69,6 +77,7 @@ import math
 import os
 import pwd
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -96,6 +105,32 @@ DEFAULT_ACCOUNTS_LIB = "/Users/athos/gt/whatsapp_automation/lib/claude_account_p
 DEFAULT_STATE = "/Users/athos/shared/data/claude_pool_current_account.json"
 DEGRADED_MARKER = "pool-account-degraded"          # in <city>/.gc: written/removed by claude-pool-guard.py only
 HEARTBEAT_FILE = "claude-pool-account.heartbeat"   # in <city>/.gc: written by a run that finished cleanly
+# ga-8hcnvb.2.1 - the Escape that unsticks a pool session sitting on claude's limit modal after the account was switched
+DEFAULT_TMUX_SOCKET = "gascity"   # the city's tmux server (`tmux -L gascity`): every gc session, pool or not, lives in it
+SETTLE_S = 45                     # claude re-reads the pool item every ~30 s: no Escape until the item has been this long in place
+STALE_WINDOW_S = 90               # a limit modal first SEEN this soon after a rewrite belongs to the credential that was replaced
+MAX_ESC_TRIES = 3                 # per pane: an Escape that does not take is not repeated for ever
+MAX_ESC_PER_RUN = 20              # and never an unbounded burst of keys
+SILENT_DROP_LOG_EVERY_MIN = 10    # what a run leaves out without acting (processes that are no pool role, panes/ps rows it could not use) says
+                                  # so on clock minutes that are a multiple of this: a signal where there was silence, not a line a minute
+LAUNCH_TAIL_BYTES = 1 << 20       # how much of the end of the wrapper's log is read to find pool launches
+START_SLACK_S = 2                 # a process started at most this much AFTER its POOL-ACCT SET line is not the process that wrote it
+START_MAX_AGE_S = 120             # ... and one that started much BEFORE it cannot be the wrapper that exec'd into claude then
+SET_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) pid=(\d+) agent=(\S*) wrapper POOL-ACCT SET item=(Claude Code-credentials-[0-9a-f]{8})")
+PS_RE = re.compile(r"\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s*$")
+PANE_ID_RE = re.compile(r"%\d+")
+SOCKET_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+AGENT_RE = re.compile(r"[A-Za-z0-9._@:-]{1,80}")
+# WHICH SESSIONS MAY BE LOOKED AT AND PRESSED (Athos 05/10: Mayor's and the crews' Remote Control is never disturbed). This is an ALLOW-list,
+# not a deny-list on "mayor|crew": the crews (oracle-wa, mila-wa, thies-wa ...) share no stem with the word "crew", which is why a deny-list
+# never held. A name is a pool role only if it IS one of the roles below, optionally followed by "-<slot or adhoc id>". It is matched against
+# the name as `gc session list` prints it (the TARGET column) - which is also what the wrapper logs as agent= (GC_AGENT) - in its three real
+# shapes:  gastown.dog-1  |  wa-worker-1  |  wa-worker-adhoc-4f91013dd9  (the same for ps-worker, gate-reviewer, refino-gate-reviewer,
+# context-check-reviewer, auto-refiner). Everything else is dropped: gastown.mayor, the crews, the witnesses, a role nobody listed yet, a name
+# that is no name - and the wrapper's own "?", which it logs when GC_AGENT is unset: a nameless session cannot be told from Mayor or a crew.
+# The drop is counted and logged for live processes (note_off_list), so a new pool role is a visible gap in this list, not a silent one.
+POOL_AGENT_RE = re.compile(r"(gastown\.dog|wa-worker|ps-worker|gate-reviewer|refino-gate-reviewer|context-check-reviewer|auto-refiner)"
+                           r"(-[A-Za-z0-9._@:-]{1,64})?")
 
 
 # ── config ─────────────────────────────────────────────────────────────────────────────────────────
@@ -635,6 +670,9 @@ def sanitize_state(st: dict, t: float) -> None:
     if "current" in st and not (isinstance(st["current"], str) and st["current"].strip()):
         log("WARN", "state: `current` is not an account name - ignored")
         st.pop("current")
+    if "item_at" in st and _sane_epoch(st["item_at"]) is None:
+        log("WARN", "state: `item_at` is not a time - dropped (no Escape without a switch to point to)")
+        del st["item_at"]
     if "exhausted" not in st:
         return
     ex = st["exhausted"]   # present-but-null is NOT absent: `.get()` cannot tell them apart, and null is not an object either
@@ -810,7 +848,9 @@ def switch_to(st: dict, user: str, email: str, token: str, reason: str, t: float
         log("ERROR", f"credentials file not switched to {email} - decision NOT changed")
         return False
     prev = st.get("current")
-    st.update(current=email, fingerprint=fingerprint(token), since=t, reason=reason, previous=prev)
+    # item_at: when the pool item was last rewritten to a different decision. It is the "cycle" of the Escape (unstick): a limit modal is
+    # judged against THIS moment, and a state with no usable item_at has had no switch to unstick anyone from.
+    st.update(current=email, fingerprint=fingerprint(token), since=t, reason=reason, previous=prev, item_at=t)
     log("INFO", f"SWITCH {prev or '-'} -> {email} fp={fingerprint(token)}: {reason}")
     if st.get("exhausted", {}).pop(email, None) is not None:
         log("INFO", f"exhausted entry for {email} dropped: it is the pool's account now")
