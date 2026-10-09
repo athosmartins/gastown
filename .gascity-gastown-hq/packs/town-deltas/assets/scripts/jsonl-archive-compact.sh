@@ -80,7 +80,10 @@
 #      file, and a garbage file that was already there growing is somebody else's live writer.
 #   3. Not covered, on purpose: a run SIGKILLed as a whole (the order's own 900s timeout, the OOM killer, a reboot) cannot reclaim anything — its leak is garbage already
 #      on disk at the next run's start, visible in `garbage=` and pruned by git after two weeks; the script's own 780s deadline is what keeps that case rare. Older
-#      garbage is never touched: it is not known to be this script's.
+#      garbage is never touched BY THIS SCRIPT: it is not known to be this script's. The same goes for a leak kept under doubt (rule 1: lsof cut, failed or silent) —
+#      measured 09/10 (ga-jvxr24): a gc cut at its 600s cap left a 1.7GB tmp_pack, the lsof look could not answer, the file was kept, and nothing came back for it.
+#      The backstop lives elsewhere: scripts/git-lock-hygiene.sh PART 1b removes tmp_* files older than 6h when no git runs on the repo and nothing has them open, and
+#      alarms when a repo's size-garbage passes 500MiB. It does not change anything above: this script still removes only what its own killed step left.
 #
 # THREE STATES, NEVER TWO: a repo whose objects cannot be measured is `unmeasured` (failure),
 # not "0 loose". git is always called with --git-dir=<repo>/.git: without it a broken .git

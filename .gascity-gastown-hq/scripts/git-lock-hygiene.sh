@@ -75,6 +75,30 @@
 #   repo being used any other way. Someone has to abort it, which the notification asks for.
 #   NOT touched: ORIG_HEAD, FETCH_HEAD, HEAD — valid post-op artifacts.
 #
+# PART 1b — Orphan git temp files in the object store (ga-jvxr24)
+#   A pack-objects / repack / gc KILLED mid-write (a timeout, a reboot, the OOM killer, a full disk) leaves the temp file it
+#   was writing: objects/pack/tmp_pack_* (and tmp_idx_*), objects/??/tmp_obj_*. Git's own prune removes them only after two
+#   weeks. Measured 09/10: a gc cut at its 600 s cap left a 1.7 GB tmp_pack in packs/maintenance/jsonl-archive; the compactor
+#   could not prove nobody had it open and kept it (right, under doubt), and nothing ever came back for it. When the disk alarm
+#   fired (boot disk at 2.6 GB free) the repo held 33 garbage files, 2.27 GB (4 tmp_pack + 29 tmp_obj). Those archive repos live under .gc/runtime/packs/*/*, outside
+#   GIT_LOCK_RIG_ROOTS, so no sweep looked at them. Now every sweep looks at the rig roots AND at those nested repos, and removes
+#   a tmp_* file only when ALL of these hold:
+#     (a) its mtime is READABLE and older than GIT_LOCK_TMP_AGE_SEC (def 21600 = 6 h). A live writer keeps touching its file, so
+#         six quiet hours is dead, not slow. An mtime that cannot be read keeps the file (never aged by invention);
+#     (b) no live git process works on THIS repo — the exact check the locks use, "cannot tell" keeps it;
+#     (c) lsof says no process has any candidate open: exit 1 with NO output is the only "nobody". A hit, a cap, a failure or
+#         any answer that is not lsof's own field lines keeps ALL of them;
+#     (d) re-read right before the delete: still there, same mtime.
+#   Three states, never two — nothing to sweep / swept / could not find out. The third keeps the files, is logged, and is
+#   counted in the sweep summary (tmp_kept, tmp_undetermined). A repo whose temp files cannot even be listed removes nothing.
+#   ALARM: after the sweep, `git count-objects -v` size-garbage is read; above GIT_LOCK_TMP_ALARM_KIB (def 512000 = 500 MiB) ONE
+#   notify goes out per repo per GIT_LOCK_TMP_RENOTIFY_SEC (def 6 h), the marker written only after notify accepted it. It judges
+#   what is LEFT — the removals above are already out of the number. A count git cannot give is event tmp_garbage_unmeasured and
+#   tmp_unmeasured in the summary: unknown is never a quiet zero.
+#   size-garbage is git's whole "garbage" class, wider than what is removed above: a pack-*.pack with no .idx is garbage to git too
+#   (measured 2026-10-09: 3.3 GB left by a repack that failed), and it is NOT touched here, because it can be the only copy of
+#   what a repack was merging. So the alarm can outlive the sweep; when it does, a person has to look.
+#
 # PART 2 — Per-repo git mutation mutex (lib, source with GIT_LOCK_HYGIENE_LIB=1)
 #   POSIX-atomic mkdir-based locking that serializes git mutations per repository.
 #   The gate dispatcher's auto-rebase uses this so concurrent callers never collide.
@@ -115,6 +139,13 @@
 #   GIT_REPO_MUTEX_ENABLED     0 = mutex is a no-op (def 1)
 #   GIT_REPO_MUTEX_MAX_AGE     age (s) before a held mutex is reclaimed as stale (def 600)
 #   GIT_LOCK_PROCESS_CHECK_FN  fn override for process-liveness check (tests only)
+#   GIT_LOCK_TMP_ENABLED       0 = skip PART 1b (the temp-file sweep and its alarm), def 1
+#   GIT_LOCK_TMP_AGE_SEC       min age (s) of a tmp_* file before it may be removed (def 21600 = 6 h)
+#   GIT_LOCK_TMP_ALARM_KIB     size-garbage (KiB) above which a repo raises the alarm (def 512000 = 500 MiB)
+#   GIT_LOCK_TMP_RENOTIFY_SEC  one alarm per repo per this window (def 21600 = 6 h)
+#   GIT_LOCK_TMP_REPOS         colon-separated EXTRA repos for PART 1b. Unset = every <runtime>/packs/*/* that has a .git, <runtime> being
+#                              $GC_CITY_RUNTIME_DIR or $CITY/.gc/runtime; set to EMPTY = none (what --selftest pins)
+#   GIT_LOCK_TMP_STATE_DIR     where the alarm markers live (def $CITY/.gc/state/git-lock-hygiene-tmp-alarmed)
 
 set -uo pipefail
 
@@ -130,6 +161,15 @@ GIT_LOCK_NOTIFY_TIMEOUT_SEC="${GIT_LOCK_NOTIFY_TIMEOUT_SEC:-30}"
 GIT_REPO_MUTEX_ENABLED="${GIT_REPO_MUTEX_ENABLED:-1}"
 GIT_REPO_MUTEX_MAX_AGE="${GIT_REPO_MUTEX_MAX_AGE:-600}"
 GIT_REPO_MUTEX_BASE="${GIT_REPO_MUTEX_BASE:-/tmp/gc-git-repo-mutex}"
+GIT_LOCK_TMP_ENABLED="${GIT_LOCK_TMP_ENABLED:-1}"
+GIT_LOCK_TMP_AGE_SEC="${GIT_LOCK_TMP_AGE_SEC:-21600}"
+GIT_LOCK_TMP_ALARM_KIB="${GIT_LOCK_TMP_ALARM_KIB:-512000}"
+GIT_LOCK_TMP_RENOTIFY_SEC="${GIT_LOCK_TMP_RENOTIFY_SEC:-21600}"
+GIT_LOCK_TMP_STATE_DIR="${GIT_LOCK_TMP_STATE_DIR:-${CITY}/.gc/state/git-lock-hygiene-tmp-alarmed}"
+GIT_LOCK_TMP_LIST_TIMEOUT_SEC="${GIT_LOCK_TMP_LIST_TIMEOUT_SEC:-30}"   # find over objects/ (2 levels)
+GIT_LOCK_TMP_LSOF_TIMEOUT_SEC="${GIT_LOCK_TMP_LSOF_TIMEOUT_SEC:-20}"   # one lsof over every candidate (2-3.5 s measured at load 50)
+GIT_LOCK_TMP_COUNT_TIMEOUT_SEC="${GIT_LOCK_TMP_COUNT_TIMEOUT_SEC:-30}" # git count-objects -v (0.01-0.09 s idle)
+GIT_LOCK_TMP_MAX_PER_SWEEP="${GIT_LOCK_TMP_MAX_PER_SWEEP:-200}"        # candidates per repo per sweep: keeps the lsof argv small, the rest wait
 
 # Rig roots — colon-separated list of git repo roots to scan.
 # The town root /Users/athos/gt covers HQ (.gascity-gastown-hq) and gastown subrepo.
@@ -718,6 +758,231 @@ _scan_repo() {
   echo "$removed"
 }
 
+# ── PART 1b: orphan git temp files in the object store (ga-jvxr24) ─────────────────────────
+# What it removes and which gates it needs: the header. Output contract (same as _scan_repo): STDOUT carries ONE number — the
+# count removed (would-remove under dry run) — because the sweep captures it with $(...); everything else goes to stderr, $LOG
+# and NOTIFY_BIN, whose own stdout is discarded (the real notify prints "Logged for digest ..." and that leaked into a capture
+# once, ga-kimlod). Arrays are only expanded when non-empty: launchd runs this under /bin/bash 3.2, where "${a[@]}" on an
+# empty array is an unbound-variable error under `set -u`.
+
+# The git dir of <repo>: <repo>/.git, or what a gitlink .git FILE points at (the two shapes _scan_repo reads). Fails when
+# there is none, which the caller reads as "not a repo - nothing to sweep".
+_glh_git_dir() {
+  local repo="$1" gd link
+  gd="${repo}/.git"
+  if [ -f "$gd" ]; then
+    # vazio → no git dir (return 1, nothing is swept); falhou/ilegível → the same inert answer
+    link=$(sed -n 's/^gitdir: *//p' "$gd" 2>/dev/null | head -1)
+    case "$link" in
+      /*) gd="$link" ;;
+      "") return 1 ;;
+      *)  gd="${repo}/${link}" ;;
+    esac
+  fi
+  [ -d "$gd" ] || return 1
+  printf '%s' "$gd"
+}
+
+# The repos PART 1b sweeps besides the rig roots, one per line: GIT_LOCK_TMP_REPOS when the caller set it (even to empty = none),
+# else every <runtime>/packs/*/* that carries its own .git (today the two jsonl-archive repos, which sit outside the rig roots).
+_glh_tmp_extra_repos() {
+  local d runtime="${GC_CITY_RUNTIME_DIR:-${CITY}/.gc/runtime}"
+  if [ -n "${GIT_LOCK_TMP_REPOS+x}" ]; then
+    # vazio → no extra repos; a value is taken as given
+    printf '%s\n' "$GIT_LOCK_TMP_REPOS" | tr ':' '\n' | sed '/^$/d'
+    return 0
+  fi
+  for d in "$runtime"/packs/*/*; do
+    [ -e "$d/.git" ] && printf '%s\n' "$d"
+  done
+  return 0
+}
+
+# Does some process have any of <file...> open? 0 = nobody — a TRUSTED answer, only "lsof exit 1 and not a byte of output" (lsof
+# exits 1 both for 'none open' and for 'only some of the named files are', so the answer is read from what it prints too);
+# 1 = at least one is open (the hit is not matched back to a file — /tmp vs /private/tmp is one symlink from "not the same file"
+# = "not open" — so ALL are kept); 2 = cannot tell: no lsof, cut at its cap, an exit status above 1, exit 0 with no hit, or output
+# that is not lsof's own field lines (a message).
+_glh_tmp_open() {
+  local out rc line hit=0
+  # vazio (rc 1, nenhuma saída) → ninguém tem aberto; falhou/cortado/mensagem estranha → 2 "não sei", nunca "ninguém"
+  out=$(_glh_bounded "$GIT_LOCK_TMP_LSOF_TIMEOUT_SEC" lsof -w -F n -- "$@" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -le 1 ] || return 2
+  if [ -z "$out" ]; then
+    [ "$rc" -eq 1 ] && return 0
+    return 2
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      "") ;;
+      p*|f*) ;;
+      n*) hit=1 ;;
+      *) return 2 ;;
+    esac
+  done <<EOF
+$out
+EOF
+  [ "$hit" -eq 1 ] && return 1
+  return 2
+}
+
+# Aged files left alone: say so once for the repo, and tally one per file so the sweep summary can count them.
+# $2 = how many, $3 = why (live | open | unknown | age_unknown | changed), $4 = plain words (spliced into JSON).
+_glh_tmp_keep() {
+  local repo="$1" n="$2" why="$3" reason="$4" i=0
+  echo "[git-lock-hygiene] KEPT ${n} aged temp file(s) in ${repo}: ${why} (${reason})" >&2
+  _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_skipped\",\"repo\":\"${repo}\",\"files\":${n},\"why\":\"${why}\",\"reason\":\"${reason}\"}"
+  while [ "$i" -lt "$n" ]; do _glh_count tmp_kept; i=$(( i + 1 )); done
+  case "$why" in
+    live)    [ "$_GLH_LIVE_UNKNOWN" = 1 ] && _glh_count tmp_undetermined ;;
+    open|changed) ;;                                   # found out: a live writer
+    *)       _glh_count tmp_undetermined ;;            # unknown / age_unknown: could not find out
+  esac
+  return 0
+}
+
+# What git says is left in <repo>'s object store, and the alarm. Sets _GLH_TMP_GFILES / _GLH_TMP_GKIB ("null" when unknown).
+_GLH_TMP_GFILES="null"; _GLH_TMP_GKIB="null"
+_glh_tmp_garbage_check() {
+  local repo="$1" gd="$2" out rc gfiles gkib key marker _dry _nrc mib
+  _GLH_TMP_GFILES="null"; _GLH_TMP_GKIB="null"
+  _dry="${GIT_LOCK_DRY_RUN:-${DRY_RUN:-0}}"
+  # falhou/cortado/ilegível → "unmeasured": logged and counted, no alarm and no all-clear; vazio ("garbage: 0") → healthy
+  out=$(_glh_bounded "$GIT_LOCK_TMP_COUNT_TIMEOUT_SEC" git --git-dir="$gd" count-objects -v 2>/dev/null) && rc=0 || rc=$?
+  gfiles=$(printf '%s\n' "$out" | sed -n 's/^garbage: *//p' | head -1)
+  gkib=$(printf '%s\n' "$out" | sed -n 's/^size-garbage: *//p' | head -1)
+  case "$gfiles" in ''|*[!0-9]*) rc=1 ;; esac
+  case "$gkib" in ''|*[!0-9]*) rc=1 ;; esac
+  if [ "$rc" -ne 0 ]; then
+    echo "[git-lock-hygiene] cannot measure the garbage of ${repo} (git count-objects rc=${rc}) — no alarm and no all-clear" >&2
+    _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_garbage_unmeasured\",\"repo\":\"${repo}\",\"rc\":${rc}}"
+    _glh_count tmp_unmeasured
+    return 0
+  fi
+  _GLH_TMP_GFILES="$gfiles"; _GLH_TMP_GKIB="$gkib"
+  key=$(printf '%s' "$repo" | tr '/ :' '___')
+  marker="${GIT_LOCK_TMP_STATE_DIR}/${key}"
+  if [ "$gkib" -le "$GIT_LOCK_TMP_ALARM_KIB" ]; then
+    # back under the line: the NEXT crossing must alarm at once, so the marker of the last one is dropped
+    [ -f "$marker" ] && rm -f "$marker" 2>/dev/null
+    return 0
+  fi
+  mib=$(( gkib / 1024 ))
+  echo "[git-lock-hygiene] GARBAGE ALARM: ${repo} holds ${gfiles} garbage file(s), ${mib} MiB (limit $(( GIT_LOCK_TMP_ALARM_KIB / 1024 )) MiB)" >&2
+  _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_garbage_alarm\",\"repo\":\"${repo}\",\"garbage_files\":${gfiles},\"garbage_kib\":${gkib},\"limit_kib\":${GIT_LOCK_TMP_ALARM_KIB},\"dry_run\":\"${_dry}\"}"
+  _glh_count tmp_over
+  [ "$_dry" = "1" ] && return 0            # same rule as the rest of the sweep: no notify under dry run
+  if [ ! -x "$NOTIFY_BIN" ]; then
+    echo "[git-lock-hygiene] NOT sent to notify — NOTIFY_BIN is not executable (${NOTIFY_BIN}); the alarm above is only in ${LOG}" >&2
+    _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_alarm_notify\",\"repo\":\"${repo}\",\"outcome\":\"no_notifier\"}"
+    _glh_count unannounced
+    return 0
+  fi
+  # One alarm per repo per window. The marker is written only AFTER notify accepted the message: a failed notify is retried next
+  # sweep, never recorded as sent. A marker that cannot be read as fresh does not mute the alarm.
+  if [ -f "$marker" ] && [ "$(_path_age "$marker")" -lt "$GIT_LOCK_TMP_RENOTIFY_SEC" ]; then
+    return 0
+  fi
+  _nrc=0
+  _glh_notify_send -t "Git-lock hygiene" -p 3 \
+       "Lixo de git enchendo disco em ${repo}: ${gfiles} arquivo(s) de lixo, ${mib} MiB (limite $(( GIT_LOCK_TMP_ALARM_KIB / 1024 )) MiB). Sao restos de um git que morreu no meio de uma escrita. O janitor remove sozinho so os tmp_pack_*/tmp_obj_* com mais de $(( GIT_LOCK_TMP_AGE_SEC / 3600 ))h e sem processo git; outro tipo de lixo (ex.: pack sem .idx) fica ate alguem olhar e NAO deve ser apagado as cegas. Se este aviso repetir, ver ${LOG} (eventos tmp_*). Nada a fazer pelo Athos." \
+       >/dev/null 2>&1 || _nrc=$?
+  if [ "$_nrc" -eq 0 ]; then
+    _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_alarm_notify\",\"repo\":\"${repo}\",\"outcome\":\"handed_to_notify\"}"
+    if ! { mkdir -p "$GIT_LOCK_TMP_STATE_DIR" 2>/dev/null && printf '%s\n' "$gkib" > "$marker" 2>/dev/null; }; then
+      echo "[git-lock-hygiene] could not record that the garbage alarm for ${repo} was sent (state dir ${GIT_LOCK_TMP_STATE_DIR} not writable) — it will be sent again on the next sweep" >&2
+    fi
+  else
+    echo "[git-lock-hygiene] notify FAILED (rc=${_nrc}) for the garbage alarm of ${repo} — not recorded as sent, retried next sweep" >&2
+    _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_alarm_notify\",\"repo\":\"${repo}\",\"outcome\":\"notify_failed\",\"rc\":${_nrc}}"
+    _glh_count unannounced
+  fi
+  return 0
+}
+
+# Sweep one repo's object store for orphan tmp_* files, then measure and alarm. Prints the count removed.
+_scan_tmp_objects() {
+  local repo="$1" gd dry now out f mt age sz i
+  local n_young=0 n_unk=0 n_def=0 n_aged=0 removed=0 bytes=0 lrc
+  local -a old=() old_mt=()
+  if [ "$GIT_LOCK_TMP_ENABLED" != "1" ]; then echo 0; return 0; fi
+  gd=$(_glh_git_dir "$repo") || { echo 0; return 0; }       # not a repo: nothing to sweep, same stance as _scan_repo
+  dry="${GIT_LOCK_DRY_RUN:-${DRY_RUN:-0}}"
+  now=$(date +%s)
+  if [ -d "$gd/objects" ]; then
+    # vazio (rc 0, no lines) → nothing to sweep; falhou/cortado (rc != 0) → the list is UNKNOWN: nothing is removed, it is counted
+    if out=$(_glh_bounded "$GIT_LOCK_TMP_LIST_TIMEOUT_SEC" find "$gd/objects" -maxdepth 2 -type f -name 'tmp_*' -print 2>/dev/null); then
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        # ilegível → mtime empty: the age is UNKNOWN and the file stays (_path_age answers 999999999 for "cannot stat", which would age it by invention)
+        mt=$(_path_mtime "$f")
+        case "$mt" in ''|*[!0-9]*) n_unk=$(( n_unk + 1 )); continue ;; esac
+        age=$(( now - mt ))
+        if [ "$age" -lt "$GIT_LOCK_TMP_AGE_SEC" ]; then n_young=$(( n_young + 1 )); continue; fi
+        n_aged=$(( n_aged + 1 ))
+        if [ "${#old[@]}" -ge "$GIT_LOCK_TMP_MAX_PER_SWEEP" ]; then n_def=$(( n_def + 1 )); continue; fi
+        old+=("$f"); old_mt+=("$mt")
+      done <<EOF
+$out
+EOF
+    else
+      echo "[git-lock-hygiene] cannot list the temp files of ${repo} — nothing removed there this sweep" >&2
+      _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_list_failed\",\"repo\":\"${repo}\"}"
+      _glh_count tmp_undetermined
+    fi
+  fi
+  [ "$n_unk" -gt 0 ] && _glh_tmp_keep "$repo" "$n_unk" age_unknown "mtime not readable"
+  if [ "${#old[@]}" -gt 0 ]; then
+    if _git_repo_has_live_process "$repo"; then
+      _glh_tmp_keep "$repo" "${#old[@]}" live "${_GLH_LIVE_REASON:-live git process}"
+      old=(); old_mt=()
+    else
+      lrc=0
+      _glh_tmp_open "${old[@]}" || lrc=$?
+      case "$lrc" in
+        0) ;;
+        1) _glh_tmp_keep "$repo" "${#old[@]}" open "a process has one of them open (lsof)"; old=(); old_mt=() ;;
+        *) _glh_tmp_keep "$repo" "${#old[@]}" unknown "lsof cannot tell: no lsof, cut at its cap, failed, or not lsof output"; old=(); old_mt=() ;;
+      esac
+    fi
+  fi
+  i=0
+  while [ "$i" -lt "${#old[@]}" ]; do
+    f="${old[$i]}"; mt="${old_mt[$i]}"; i=$(( i + 1 ))
+    # (d) re-read right before the delete. Gone → nothing to do. A different mtime → somebody wrote it after our look: alive, NOT ours.
+    [ -f "$f" ] || continue
+    if [ "$(_path_mtime "$f")" != "$mt" ]; then
+      _glh_tmp_keep "$repo" 1 changed "mtime moved after the listing"
+      continue
+    fi
+    age=$(( $(date +%s) - mt ))
+    # ilegível → size empty: logged as null, never as 0
+    sz=$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f" 2>/dev/null || true)
+    case "$sz" in ''|*[!0-9]*) sz="" ;; esac
+    if [ "$dry" = "1" ]; then
+      echo "[git-lock-hygiene] DRY_RUN: would remove orphan temp file (age=${age}s): ${f}" >&2
+      _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_would_remove\",\"path\":\"${f}\",\"repo\":\"${repo}\",\"age_sec\":${age},\"bytes\":${sz:-null}}"
+      removed=$(( removed + 1 )); bytes=$(( bytes + ${sz:-0} ))     # under dry run "removed"/"bytes" read as would-remove
+      continue
+    fi
+    if rm -f -- "$f" 2>/dev/null; then
+      removed=$(( removed + 1 )); bytes=$(( bytes + ${sz:-0} ))
+      echo "[git-lock-hygiene] REMOVED orphan temp file (age=${age}s, ${sz:-?} bytes): ${f}" >&2
+      _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_removed\",\"path\":\"${f}\",\"repo\":\"${repo}\",\"age_sec\":${age},\"bytes\":${sz:-null}}"
+      _glh_count tmp_removed
+    else
+      echo "[git-lock-hygiene] WARN: could not remove orphan temp file: ${f}" >&2
+      _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_remove_failed\",\"path\":\"${f}\",\"repo\":\"${repo}\",\"age_sec\":${age}}"
+      _glh_count tmp_kept; _glh_count tmp_undetermined
+    fi
+  done
+  _glh_tmp_garbage_check "$repo" "$gd"
+  if [ $(( n_aged + n_young + n_unk )) -gt 0 ] || [ "$_GLH_TMP_GFILES" != "0" ]; then
+    _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_sweep\",\"repo\":\"${repo}\",\"aged\":${n_aged},\"removed\":${removed},\"bytes\":${bytes},\"young\":${n_young},\"age_unknown\":${n_unk},\"deferred\":${n_def},\"garbage_files\":${_GLH_TMP_GFILES},\"garbage_kib\":${_GLH_TMP_GKIB},\"dry_run\":\"${dry}\"}"
+  fi
+  echo "$removed"
+}
+
 # ── PART 2: Per-repo git mutation mutex ───────────────────────────────────────
 # Lock directory: $GIT_REPO_MUTEX_BASE/<slug>/
 # Heartbeat file: $GIT_REPO_MUTEX_BASE/<slug>/heartbeat (contains $$:RANDOM token)
@@ -852,6 +1117,13 @@ if [ "${1:-}" = "--selftest" ]; then
   # than one caller runs this block (scripts/git-lock-hygiene.selftest.sh,
   # gate-git-lock-hygiene.selftest.sh, a bare `--selftest`); the wrapper pins it.
   LOG="$TMP/git-lock-hygiene.jsonl"
+
+  # ga-jvxr24: and for the repos PART 1b sweeps. Its default is every <runtime>/packs/*/*, <runtime> being $GC_CITY_RUNTIME_DIR, which a
+  # gc session exports as the REAL one. The end-to-end sweeps below (T46, T55) run non-dry, so without this line a selftest sweeps the
+  # real jsonl-archive repos, and a broken gate deletes real files (2026-10-09: a deliberately broken copy of PART 1b emptied the object
+  # store of town-deltas/jsonl-archive that way). A list set to EMPTY means "no extra repos"; the tests that need repos set their own.
+  export GIT_LOCK_TMP_REPOS=""
+  unset GC_CITY_RUNTIME_DIR
 
   # ga-892qy1: the same hermeticity for the two new side channels. A stale MERGE_HEAD /
   # rebase-* fixture now fires a REAL notify (ntfy to the Athos topic) and writes a dedupe
@@ -2037,6 +2309,216 @@ print(n)
   [ ! -d "$(_mutex_dir "$M_REPO3")" ] && ok "T14: lock released after cmd" \
     || bad "T14: lock still held after cmd (should be released)"
 
+  # ── PART 1b (ga-jvxr24): orphan tmp_* files + the garbage alarm ─────────────────────────────────────────
+  # Fixtures are REAL git repos (the alarm reads `git count-objects -v`). Every test resets $LOG, the tally file and the notify
+  # calls, so an event count is that test's own. The alarm markers are pinned to scratch for the same reason as GIT_LOCK_STATE_DIR.
+  GIT_LOCK_TMP_STATE_DIR="$TMP/tmp-alarmed"
+  tm_ago() {   # tm_ago <hours> <file...> — set the mtime to <hours> ago
+    local h="$1" stamp; shift
+    stamp="$(date -v-"${h}"H +%Y%m%d%H%M.%S 2>/dev/null || date -d "${h} hours ago" +%Y%m%d%H%M.%S)"
+    touch -t "$stamp" "$@"
+  }
+  tm_new() {   # tm_new <dir> — a real repo with what a killed gc leaves: OLD (7 h) tmp_pack + tmp_obj, a YOUNG (1 h) tmp_pack, and files that must survive
+    rm -rf "$1"; git init -q "$1" 2>/dev/null
+    mkdir -p "$1/.git/objects/ab"
+    dd if=/dev/zero of="$1/.git/objects/pack/tmp_pack_OLD" bs=1024 count=1024 2>/dev/null
+    dd if=/dev/zero of="$1/.git/objects/ab/tmp_obj_OLD" bs=1024 count=64 2>/dev/null
+    dd if=/dev/zero of="$1/.git/objects/pack/tmp_pack_YOUNG" bs=1024 count=64 2>/dev/null
+    printf 'keep' > "$1/.git/objects/pack/pack-keep.pack"; printf 'keep' > "$1/.git/objects/ab/cdef0123456789"
+    tm_ago 7 "$1/.git/objects/pack/tmp_pack_OLD" "$1/.git/objects/ab/tmp_obj_OLD" "$1/.git/objects/pack/pack-keep.pack" "$1/.git/objects/ab/cdef0123456789"
+    tm_ago 1 "$1/.git/objects/pack/tmp_pack_YOUNG"
+  }
+  tm_reset() { : > "$LOG"; : > "$NOTIFY_CALLS"; _GLH_COUNT_FILE="$TMP/tm-counts"; : > "$_GLH_COUNT_FILE"; rm -rf "$GIT_LOCK_TMP_STATE_DIR"; }
+  tm_tally() { local n; n="$(grep -c "^$1\$" "$_GLH_COUNT_FILE" 2>/dev/null || true)"; echo "${n:-0}"; }
+  TM_BIG=999999999    # an alarm line no fixture reaches: the tests that are not about the alarm must not fire it
+  export GIT_LOCK_PROCESS_CHECK_FN="_no_git_process"
+
+  echo "TM0: a runtime dir exported by the caller (the REAL one, in a gc session) is not followed by a sweep run from the selftest"
+  # The decoy is what the real archive repos are to production: a repo under <runtime>/packs/*/ holding an aged tmp_pack. A sweep that
+  # follows the exported runtime dir removes it, so the test fails when the pin at the top of the selftest is gone.
+  # vazio → no sweep line / no tmp_repos field: the pattern does not match and the test FAILS, never "quiet = fine"
+  RT0="$TMP/tm0-rt"; tm_new "$RT0/packs/decoy/jsonl-archive"; make_repo "$TMP/tm0-root"
+  T0LOG="$TMP/tm0.jsonl"; : > "$T0LOG"
+  env -u GIT_LOCK_PROCESS_CHECK_FN GC_CITY_RUNTIME_DIR="$RT0" GIT_LOCK_LOG="$T0LOG" GIT_LOCK_RIG_ROOTS="$TMP/tm0-root" GIT_LOCK_ENABLED=1 \
+      GIT_LOCK_DRY_RUN=0 NOTIFY_BIN=/nonexistent GIT_LOCK_STATE_DIR="$TMP/tm0-state" GIT_LOCK_TMP_STATE_DIR="$TMP/tm0-tmpstate" \
+      GC_CITY_PATH="$TMP/tm0-city" bash "$_GLH_SELF" >/dev/null 2>&1
+  sweep_line="$(grep -F '"event":"sweep"' "$T0LOG" | tail -1)"
+  { [ -f "$RT0/packs/decoy/jsonl-archive/.git/objects/pack/tmp_pack_OLD" ] && printf '%s' "$sweep_line" | grep -q '"tmp_repos":1,'; } \
+    && ok "TM0: the decoy repo under the exported runtime dir was not swept (tmp_repos=1: the root only)" \
+    || bad "TM0: a sweep followed the exported runtime dir: ${sweep_line:-<no sweep event>}"
+
+  echo "TM1: aged tmp_* removed; young + non-tmp untouched; STDOUT is only the count"
+  TR1="$TMP/tm1"; tm_new "$TR1"; tm_reset
+  count=$(GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR1" 2>/dev/null)
+  [ "$count" = "2" ] && ok "TM1: count is exactly 2" || bad "TM1: count is '${count}', want 2"
+  { [ ! -e "$TR1/.git/objects/pack/tmp_pack_OLD" ] && [ ! -e "$TR1/.git/objects/ab/tmp_obj_OLD" ]; } \
+    && ok "TM1: both aged tmp files removed" || bad "TM1: an aged tmp file is still there"
+  [ -e "$TR1/.git/objects/pack/tmp_pack_YOUNG" ] && ok "TM1: the young tmp file stays" || bad "TM1: the YOUNG tmp file was removed"
+  { [ -e "$TR1/.git/objects/pack/pack-keep.pack" ] && [ -e "$TR1/.git/objects/ab/cdef0123456789" ]; } \
+    && ok "TM1: non-tmp files untouched" || bad "TM1: a non-tmp file was removed"
+  [ "$(_events tmp_removed)" = "2" ] && [ "$(tm_tally tmp_removed)" = "2" ] \
+    && ok "TM1: 2 tmp_removed events and tallies" || bad "TM1: events=$(_events tmp_removed) tally=$(tm_tally tmp_removed), want 2/2"
+
+  echo "TM2: a live git process on the repo keeps everything"
+  TR2="$TMP/tm2"; tm_new "$TR2"; tm_reset
+  count=$(GIT_LOCK_PROCESS_CHECK_FN="_yes_git_process" GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR2" 2>/dev/null)
+  { [ "$count" = "0" ] && [ -e "$TR2/.git/objects/pack/tmp_pack_OLD" ] && [ -e "$TR2/.git/objects/ab/tmp_obj_OLD" ]; } \
+    && ok "TM2: nothing removed while git is live" || bad "TM2: count='${count}' or an aged file was removed"
+  { [ "$(_events tmp_skipped)" = "1" ] && grep -q '"why":"live"' "$LOG" && [ "$(tm_tally tmp_kept)" = "2" ]; } \
+    && ok "TM2: logged why=live, 2 kept" || bad "TM2: skip not logged/tallied (events=$(_events tmp_skipped) kept=$(tm_tally tmp_kept))"
+
+  echo "TM3: a tmp file some process holds open keeps ALL of them (real lsof)"
+  TR3="$TMP/tm3"; tm_new "$TR3"; tm_reset
+  sleep 30 7<"$TR3/.git/objects/pack/tmp_pack_OLD" & TM_HOLD=$!
+  sleep 1
+  count=$(GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR3" 2>/dev/null)
+  kill "$TM_HOLD" 2>/dev/null; wait "$TM_HOLD" 2>/dev/null
+  { [ "$count" = "0" ] && [ -e "$TR3/.git/objects/pack/tmp_pack_OLD" ] && [ -e "$TR3/.git/objects/ab/tmp_obj_OLD" ]; } \
+    && ok "TM3: an open hit keeps every candidate" || bad "TM3: count='${count}' or a candidate was removed while one was open"
+  grep -q '"why":"open"' "$LOG" && ok "TM3: logged why=open" || bad "TM3: why=open not logged"
+
+  echo "TM4: lsof that cannot answer keeps everything; only 'exit 1, no output' means nobody"
+  mkdir -p "$TMP/fakebin"
+  cat > "$TMP/fakebin/lsof" <<'FAKE'
+#!/bin/sh
+case "$FAKE_LSOF_MODE" in
+  rc3)     exit 3 ;;
+  message) echo "lsof: WARNING: cannot stat something"; exit 1 ;;
+  rc0none) exit 0 ;;
+  nobody)  exit 1 ;;
+esac
+FAKE
+  chmod +x "$TMP/fakebin/lsof"
+  for tm_mode in rc3 message rc0none; do
+    TR4="$TMP/tm4-$tm_mode"; tm_new "$TR4"; tm_reset
+    count=$(PATH="$TMP/fakebin:$PATH" FAKE_LSOF_MODE="$tm_mode" GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR4" 2>/dev/null)
+    { [ "$count" = "0" ] && [ -e "$TR4/.git/objects/pack/tmp_pack_OLD" ] && grep -q '"why":"unknown"' "$LOG" && [ "$(tm_tally tmp_undetermined)" = "1" ]; } \
+      && ok "TM4: lsof '${tm_mode}' -> kept, why=unknown, counted undetermined" \
+      || bad "TM4: lsof '${tm_mode}': count='${count}' kept=$([ -e "$TR4/.git/objects/pack/tmp_pack_OLD" ] && echo y || echo n) undet=$(tm_tally tmp_undetermined)"
+  done
+  TR4="$TMP/tm4-nobody"; tm_new "$TR4"; tm_reset
+  count=$(PATH="$TMP/fakebin:$PATH" FAKE_LSOF_MODE=nobody GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR4" 2>/dev/null)
+  [ "$count" = "2" ] && ok "TM4: lsof exit 1 and no output = nobody -> removed" || bad "TM4: nobody-answer removed '${count}', want 2"
+
+  echo "TM5: an unreadable mtime is an unknown age, not an old one"
+  TR5="$TMP/tm5"; tm_new "$TR5"; tm_reset
+  count=$( _path_mtime() { :; }; GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR5" 2>/dev/null )
+  { [ "$count" = "0" ] && [ -e "$TR5/.git/objects/pack/tmp_pack_OLD" ] && [ -e "$TR5/.git/objects/pack/tmp_pack_YOUNG" ] && grep -q '"why":"age_unknown"' "$LOG"; } \
+    && ok "TM5: nothing removed, why=age_unknown" || bad "TM5: count='${count}' or a file with an unreadable mtime was removed"
+
+  echo "TM6: dry run removes nothing, counts would-remove, never notifies"
+  TR6="$TMP/tm6"; tm_new "$TR6"; tm_reset
+  count=$(GIT_LOCK_DRY_RUN=1 GIT_LOCK_TMP_ALARM_KIB=100 _scan_tmp_objects "$TR6" 2>/dev/null)
+  { [ "$count" = "2" ] && [ -e "$TR6/.git/objects/pack/tmp_pack_OLD" ] && [ "$(_events tmp_would_remove)" = "2" ] && [ "$(_events tmp_removed)" = "0" ]; } \
+    && ok "TM6: 2 would-remove, 0 removed, files intact" || bad "TM6: count='${count}' would=$(_events tmp_would_remove) removed=$(_events tmp_removed)"
+  grep '"event":"tmp_sweep"' "$LOG" | grep -q '"bytes":[1-9]' && ok "TM6: tmp_sweep reports the would-remove bytes" || bad "TM6: tmp_sweep bytes is 0/absent under dry run"
+  [ "$(_lines "$NOTIFY_CALLS")" = "0" ] && ok "TM6: no notify under dry run" || bad "TM6: notify fired under dry run"
+
+  echo "TM7: re-read before the delete — a file whose mtime moved after the listing is alive"
+  TR7="$TMP/tm7"; tm_new "$TR7"; tm_reset
+  count=$( _glh_tmp_open() { touch "$TR7/.git/objects/pack/tmp_pack_OLD"; return 0; }; GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR7" 2>/dev/null )
+  { [ "$count" = "1" ] && [ -e "$TR7/.git/objects/pack/tmp_pack_OLD" ] && [ ! -e "$TR7/.git/objects/ab/tmp_obj_OLD" ] && grep -q '"why":"changed"' "$LOG"; } \
+    && ok "TM7: the touched file kept (why=changed), the other removed" || bad "TM7: count='${count}' or the re-read did not protect the touched file"
+
+  echo "TM8: a listing that fails removes nothing and is counted, not read as 'no files'"
+  mkdir -p "$TMP/fakefind"; printf '#!/bin/sh\nexit 1\n' > "$TMP/fakefind/find"; chmod +x "$TMP/fakefind/find"
+  TR8="$TMP/tm8"; tm_new "$TR8"; tm_reset
+  count=$(PATH="$TMP/fakefind:$PATH" GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR8" 2>/dev/null)
+  { [ "$count" = "0" ] && [ -e "$TR8/.git/objects/pack/tmp_pack_OLD" ] && [ "$(_events tmp_list_failed)" = "1" ] && [ "$(tm_tally tmp_undetermined)" -ge 1 ]; } \
+    && ok "TM8: nothing removed, tmp_list_failed logged, counted undetermined" || bad "TM8: count='${count}' list_failed=$(_events tmp_list_failed) undet=$(tm_tally tmp_undetermined)"
+
+  echo "TM9: the garbage alarm — over the line once per window, re-armed when back under, retried when notify fails, silent when unmeasurable"
+  TR9="$TMP/tm9"; tm_new "$TR9"; tm_ago 1 "$TR9/.git/objects/pack/tmp_pack_OLD" "$TR9/.git/objects/ab/tmp_obj_OLD"; tm_reset   # all young: nothing is swept, ~1.1 MiB stays
+  GIT_LOCK_TMP_ALARM_KIB=100 _scan_tmp_objects "$TR9" >/dev/null 2>&1
+  { [ "$(_events tmp_garbage_alarm)" = "1" ] && [ "$(_lines "$NOTIFY_CALLS")" = "1" ] && grep -q "$TR9" "$NOTIFY_CALLS"; } \
+    && ok "TM9: over the line -> 1 alarm, 1 notify naming the repo" || bad "TM9: alarm=$(_events tmp_garbage_alarm) notify=$(_lines "$NOTIFY_CALLS")"
+  GIT_LOCK_TMP_ALARM_KIB=100 _scan_tmp_objects "$TR9" >/dev/null 2>&1
+  { [ "$(_events tmp_garbage_alarm)" = "2" ] && [ "$(_lines "$NOTIFY_CALLS")" = "1" ]; } \
+    && ok "TM9: the second sweep logs the alarm but does NOT notify again" || bad "TM9: dedupe broken (alarm=$(_events tmp_garbage_alarm) notify=$(_lines "$NOTIFY_CALLS"))"
+  rm -f "$TR9/.git/objects/pack/tmp_pack_OLD" "$TR9/.git/objects/ab/tmp_obj_OLD" "$TR9/.git/objects/pack/tmp_pack_YOUNG" "$TR9/.git/objects/pack/pack-keep.pack"
+  GIT_LOCK_TMP_ALARM_KIB=100 _scan_tmp_objects "$TR9" >/dev/null 2>&1
+  [ -z "$(ls -A "$GIT_LOCK_TMP_STATE_DIR" 2>/dev/null)" ] && ok "TM9: back under the line -> the marker is dropped" || bad "TM9: marker survived a clean sweep"
+  dd if=/dev/zero of="$TR9/.git/objects/pack/tmp_pack_NEW" bs=1024 count=1024 2>/dev/null
+  GIT_LOCK_TMP_ALARM_KIB=100 _scan_tmp_objects "$TR9" >/dev/null 2>&1
+  [ "$(_lines "$NOTIFY_CALLS")" = "2" ] && ok "TM9: the next crossing alarms at once" || bad "TM9: re-arm failed (notify=$(_lines "$NOTIFY_CALLS"))"
+  printf '#!/bin/sh\nexit 1\n' > "$TMP/fake-notify-fail"; chmod +x "$TMP/fake-notify-fail"
+  tm_reset
+  NOTIFY_BIN="$TMP/fake-notify-fail" GIT_LOCK_TMP_ALARM_KIB=100 _scan_tmp_objects "$TR9" >/dev/null 2>&1
+  { [ ! -e "$GIT_LOCK_TMP_STATE_DIR" ] || [ -z "$(ls -A "$GIT_LOCK_TMP_STATE_DIR" 2>/dev/null)" ]; } && grep -q '"outcome":"notify_failed"' "$LOG" \
+    && ok "TM9: a notify that failed leaves NO marker (retried next sweep)" || bad "TM9: marker written for a notify that failed"
+  GIT_LOCK_TMP_ALARM_KIB=100 _scan_tmp_objects "$TR9" >/dev/null 2>&1
+  [ "$(_lines "$NOTIFY_CALLS")" = "1" ] && ok "TM9: the retry with a working notify goes out" || bad "TM9: no retry (notify=$(_lines "$NOTIFY_CALLS"))"
+  TRU="$TMP/tm9-unmeasured"; make_repo "$TRU"; tm_reset
+  count=$(GIT_LOCK_TMP_ALARM_KIB=100 _scan_tmp_objects "$TRU" 2>/dev/null)
+  { [ "$count" = "0" ] && [ "$(_events tmp_garbage_unmeasured)" = "1" ] && [ "$(tm_tally tmp_unmeasured)" = "1" ] && [ "$(_events tmp_garbage_alarm)" = "0" ] && [ "$(_lines "$NOTIFY_CALLS")" = "0" ]; } \
+    && ok "TM9: a repo git cannot count -> unmeasured (logged + tallied), no alarm, no all-clear" || bad "TM9: unmeasured repo: count='${count}' unmeasured=$(_events tmp_garbage_unmeasured)"
+
+  echo "TM10: nested repos are discovered under <runtime>/packs/*/*"
+  RT="$TMP/rt"; mkdir -p "$RT/packs/a/x/.git" "$RT/packs/b/y/.git" "$RT/packs/a/plain"
+  got="$(unset GIT_LOCK_TMP_REPOS; GC_CITY_RUNTIME_DIR="$RT" _glh_tmp_extra_repos | sort | tr '\n' ' ')"   # the selftest pins the list to empty; this asks for the default
+  [ "$got" = "$RT/packs/a/x $RT/packs/b/y " ] && ok "TM10: exactly the two dirs that carry a .git" || bad "TM10: got '${got}'"
+  [ -z "$(GIT_LOCK_TMP_REPOS= _glh_tmp_extra_repos)" ] && ok "TM10: GIT_LOCK_TMP_REPOS set to empty = no extra repos" || bad "TM10: empty override still listed repos"
+  got="$(GIT_LOCK_TMP_REPOS=/p:/q _glh_tmp_extra_repos | tr '\n' ' ')"
+  [ "$got" = "/p /q " ] && ok "TM10: an explicit list is taken as given" || bad "TM10: explicit list gave '${got}'"
+
+  echo "TM11: a gitlink repo (.git FILE -> separate git dir) is swept in its real object store"
+  TR11="$TMP/tm11"; rm -rf "$TR11" "$TMP/tm11-gitdir"; git init -q --separate-git-dir "$TMP/tm11-gitdir" "$TR11" 2>/dev/null
+  dd if=/dev/zero of="$TMP/tm11-gitdir/objects/pack/tmp_pack_OLD" bs=1024 count=64 2>/dev/null; tm_ago 7 "$TMP/tm11-gitdir/objects/pack/tmp_pack_OLD"; tm_reset
+  count=$(GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR11" 2>/dev/null)
+  { [ -f "$TR11/.git" ] && [ "$count" = "1" ] && [ ! -e "$TMP/tm11-gitdir/objects/pack/tmp_pack_OLD" ]; } \
+    && ok "TM11: gitlink resolved, aged tmp file removed" || bad "TM11: count='${count}' (gitlink not resolved?)"
+
+  echo "TM12: under macOS /bin/bash 3.2 + set -u — zero candidates and some candidates both run clean"
+  if [ -x /bin/bash ]; then
+    TR12="$TMP/tm12-empty"; rm -rf "$TR12"; git init -q "$TR12" 2>/dev/null
+    TR12B="$TMP/tm12-full"; tm_new "$TR12B"; tm_reset
+    for tm_repo in "$TR12:0" "$TR12B:2"; do
+      out=$(GIT_LOCK_LOG="$LOG" GIT_LOCK_TMP_ALARM_KIB=$TM_BIG /bin/bash -c 'set -u; GIT_LOCK_HYGIENE_LIB=1 . "$1"; _np() { return 1; }; GIT_LOCK_PROCESS_CHECK_FN=_np; _scan_tmp_objects "$2"' _ "$_GLH_SELF" "${tm_repo%:*}" 2>"$TMP/tm12.err"); rc=$?
+      { [ "$rc" = "0" ] && [ "$out" = "${tm_repo#*:}" ]; } \
+        && ok "TM12: /bin/bash $(/bin/bash --version | head -1 | sed 's/.*version //;s/(.*//') — ${tm_repo##*/} -> '${out}'" || bad "TM12: ${tm_repo%:*} rc=${rc} out='${out}', want '${tm_repo#*:}'; stderr: $(head -c 300 "$TMP/tm12.err")"
+    done
+  else
+    ok "TM12: skipped (no /bin/bash)"
+  fi
+
+  echo "TM13: end to end — the real sweep covers roots AND nested repos once each, and the summary carries the tmp counters"
+  TC="$TMP/tm13-city"; mkdir -p "$TC/.gc/logs" "$TC/.gc/state"; TR13="$TMP/tm13"; TR13B="$TMP/tm13b"; tm_new "$TR13"; tm_new "$TR13B"
+  env -u GIT_LOCK_LOG -u GIT_LOCK_PROCESS_CHECK_FN GC_CITY_PATH="$TC" GIT_LOCK_RIG_ROOTS="$TR13" GIT_LOCK_TMP_REPOS="$TR13:$TR13B:$TR13B" \
+      NOTIFY_BIN="$NOTIFY_BIN" GIT_LOCK_TMP_ALARM_KIB=$TM_BIG GIT_LOCK_TMP_STATE_DIR="$TMP/tm13-state" bash "$_GLH_SELF" >/dev/null 2>&1
+  sweep_line="$(grep '"event":"sweep"' "$TC/.gc/logs/git-lock-hygiene.jsonl" 2>/dev/null | tail -1)"
+  { printf '%s' "$sweep_line" | grep -q '"tmp_repos":2,' && printf '%s' "$sweep_line" | grep -q '"tmp_removed":4,'; } \
+    && ok "TM13: 2 repos (the duplicates swept once), 4 files removed, in the summary" || bad "TM13: summary was: ${sweep_line:-<none>}"
+  printf '%s' "$sweep_line" | grep -q '"removed":0,' && ok "TM13: tmp removals are NOT counted as lock removals" || bad "TM13: removed != 0 in the summary"
+
+  echo "TM14: the alarm is for garbage ABOVE the limit — garbage exactly at the limit is quiet, garbage one KiB over it fires"
+  TR14="$TMP/tm14"; rm -rf "$TR14"; git init -q "$TR14" 2>/dev/null
+  dd if=/dev/zero of="$TR14/.git/objects/pack/tmp_pack_YOUNG" bs=1024 count=600 2>/dev/null; tm_ago 1 "$TR14/.git/objects/pack/tmp_pack_YOUNG"
+  # vazio/falhou → G14 is not a positive number: the fixture is wrong and the test says so, it does not pass on "0 alarms"
+  G14="$(git --git-dir="$TR14/.git" count-objects -v 2>/dev/null | sed -n 's/^size-garbage: *//p')"
+  case "$G14" in ''|*[!0-9]*|0) bad "TM14: fixture garbage is not measurable ('${G14}')"; G14=0 ;; esac
+  if [ "$G14" -gt 0 ]; then
+    tm_reset; count=$(GIT_LOCK_TMP_ALARM_KIB=$G14 _scan_tmp_objects "$TR14" 2>/dev/null)
+    { [ "$(_events tmp_garbage_alarm)" = "0" ] && [ "$(_lines "$NOTIFY_CALLS")" = "0" ]; } \
+      && ok "TM14: garbage == limit (${G14} KiB) -> no alarm, no notify" || bad "TM14: alarm at exactly the limit (alarms=$(_events tmp_garbage_alarm) notify=$(_lines "$NOTIFY_CALLS"))"
+    tm_reset; count=$(GIT_LOCK_TMP_ALARM_KIB=$(( G14 - 1 )) _scan_tmp_objects "$TR14" 2>/dev/null)
+    { [ "$(_events tmp_garbage_alarm)" = "1" ] && [ "$(_lines "$NOTIFY_CALLS")" = "1" ]; } \
+      && ok "TM14: garbage = limit + 1 KiB -> one alarm, one notify" || bad "TM14: no alarm one KiB over the limit (alarms=$(_events tmp_garbage_alarm) notify=$(_lines "$NOTIFY_CALLS"))"
+  fi
+
+  echo "TM15: one sweep removes at most GIT_LOCK_TMP_MAX_PER_SWEEP aged files; the rest are counted as deferred and go on the next sweeps"
+  TR15="$TMP/tm15"; rm -rf "$TR15"; git init -q "$TR15" 2>/dev/null
+  for tm_i in 1 2 3 4 5; do dd if=/dev/zero of="$TR15/.git/objects/pack/tmp_pack_OLD${tm_i}" bs=1024 count=4 2>/dev/null; done
+  tm_ago 7 "$TR15"/.git/objects/pack/tmp_pack_OLD*
+  # vazio → "0" (wc), never an empty string; falhou (find cannot list) → also "0", which only the last check could take for "all gone", so sweep 1 must see 3 first
+  tm_left() { find "$TR15/.git/objects/pack" -type f -name 'tmp_pack_*' | wc -l | tr -d ' '; }
+  tm_reset; count=$(GIT_LOCK_TMP_MAX_PER_SWEEP=2 GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR15" 2>/dev/null)
+  { [ "$count" = "2" ] && [ "$(tm_left)" = "3" ] && grep -F '"event":"tmp_sweep"' "$LOG" | grep -q '"deferred":3,'; } \
+    && ok "TM15: sweep 1 removed 2, left 3, logged deferred=3" || bad "TM15: sweep 1 count='${count}' left=$(tm_left)"
+  count=$(GIT_LOCK_TMP_MAX_PER_SWEEP=2 GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR15" 2>/dev/null)
+  count2=$(GIT_LOCK_TMP_MAX_PER_SWEEP=2 GIT_LOCK_TMP_ALARM_KIB=$TM_BIG _scan_tmp_objects "$TR15" 2>/dev/null)
+  { [ "$count" = "2" ] && [ "$count2" = "1" ] && [ "$(tm_left)" = "0" ]; } \
+    && ok "TM15: sweeps 2 and 3 removed 2 + 1 — nothing is left behind for good" || bad "TM15: sweeps 2/3 counts '${count}' '${count2}' left=$(tm_left)"
+
   echo ""
   echo "────────────────────────────────────────────"
   echo "PASS=$PASS  FAIL=$FAIL"
@@ -2063,12 +2545,36 @@ for root in "${ROOTS[@]}"; do
   total_removed=$(( total_removed + n ))
 done
 
+# PART 1b (ga-jvxr24): orphan tmp_* files + the garbage alarm, over the rig roots AND the nested archive repos that sit
+# outside them. Counted apart from the locks (tmp_removed in the summary), not added to total_removed: that number drives the
+# "Removed N stale git lock file(s)" notify below. A path listed twice (same canonical dir) is swept once.
+tmp_repos=0; tmp_removed_total=0; tmp_seen=""; _nl=$'\n'
+if [ "$GIT_LOCK_TMP_ENABLED" = "1" ]; then
+  while IFS= read -r tmp_root; do
+    tmp_root="${tmp_root%/}"
+    [ -n "$tmp_root" ] && [ -d "$tmp_root" ] || continue
+    tmp_canon=$(_glh_canon_dir "$tmp_root") || tmp_canon="$tmp_root"
+    case "$_nl$tmp_seen$_nl" in *"$_nl$tmp_canon$_nl"*) continue ;; esac
+    tmp_seen="${tmp_seen}${_nl}${tmp_canon}"
+    tmp_repos=$(( tmp_repos + 1 ))
+    n=$(_scan_tmp_objects "$tmp_root")
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    tmp_removed_total=$(( tmp_removed_total + n ))
+  done <<EOF
+$(printf '%s\n' "${ROOTS[@]}"; _glh_tmp_extra_repos)
+EOF
+fi
+
 # How many aged items were left alone, and why: "skipped_live" = a live git / held lock / could not
 # tell; "undetermined" = the could-not-tell subset (a broken ps/lsof/timeout keeps EVERY aged lock, so
 # this is the number to watch); "stale_state" = operation state reported but not removed;
 # "unannounced" = of those, the ones whose hand-off to notify did not happen or failed (no notifier,
-# non-zero exit, deadline) — so "someone may have been told" is never read off a silent log. null =
+# non-zero exit, deadline) — so "someone may have been told" is never read off a silent log. It also
+# counts a garbage alarm (PART 1b) that was not handed over. null =
 # the tally file could not be made, i.e. unknown — never 0.
+# PART 1b has its own counters: "tmp_removed" = orphan tmp_* files removed (would-remove is only in the log under dry run);
+# "tmp_kept" = aged ones left alone; "tmp_undetermined" = the could-not-tell subset (the number to watch: a broken lsof or ps
+# keeps EVERY aged temp file); "tmp_unmeasured" = repos whose garbage git could not count; "tmp_over" = repos over the alarm line.
 _glh_tally() {
   if [ -n "$_GLH_COUNT_FILE" ] && [ -e "$_GLH_COUNT_FILE" ]; then
     awk -v k="$1" '$0 == k { n++ } END { print n + 0 }' "$_GLH_COUNT_FILE" 2>/dev/null || echo null
@@ -2076,7 +2582,7 @@ _glh_tally() {
     echo null
   fi
 }
-_log_json "{\"ts\":\"$(ts)\",\"event\":\"sweep\",\"repos_scanned\":${repos_scanned},\"removed\":${total_removed},\"skipped_live\":$(_glh_tally skipped_live),\"undetermined\":$(_glh_tally undetermined),\"stale_state\":$(_glh_tally stale_state),\"unannounced\":$(_glh_tally unannounced),\"dry_run\":\"${DRY_RUN}\",\"stale_age_sec\":${STALE_AGE}}"
+_log_json "{\"ts\":\"$(ts)\",\"event\":\"sweep\",\"repos_scanned\":${repos_scanned},\"removed\":${total_removed},\"skipped_live\":$(_glh_tally skipped_live),\"undetermined\":$(_glh_tally undetermined),\"stale_state\":$(_glh_tally stale_state),\"unannounced\":$(_glh_tally unannounced),\"tmp_repos\":${tmp_repos},\"tmp_removed\":$(_glh_tally tmp_removed),\"tmp_kept\":$(_glh_tally tmp_kept),\"tmp_undetermined\":$(_glh_tally tmp_undetermined),\"tmp_unmeasured\":$(_glh_tally tmp_unmeasured),\"tmp_over\":$(_glh_tally tmp_over),\"dry_run\":\"${DRY_RUN}\",\"stale_age_sec\":${STALE_AGE}}"
 [ -n "$_GLH_COUNT_FILE" ] && rm -f "$_GLH_COUNT_FILE"
 
 # Notify only when locks were actually removed (signals a real heal event)

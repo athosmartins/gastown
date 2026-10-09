@@ -20,7 +20,9 @@ trap 'rm -rf "$SBX_CITY" "${LIB_SBX:-}"' EXIT
 mkdir -p "$SBX_CITY/.gc/logs"   # _log_json's append fails silently when this is missing
 
 rc=0
-env -u GIT_LOCK_LOG GC_CITY_PATH="$SBX_CITY" bash "$SCRIPT_DIR/git-lock-hygiene.sh" --selftest "$@" || rc=$?
+# ga-jvxr24: GC_CITY_RUNTIME_DIR / GIT_LOCK_TMP_REPOS are also unset: a gc session exports the REAL runtime dir, and PART 1b sweeps every
+# repo under <runtime>/packs/*/ (the real jsonl-archive repos). The script pins this itself; the wrapper does not rely on that.
+env -u GIT_LOCK_LOG -u GC_CITY_RUNTIME_DIR -u GIT_LOCK_TMP_REPOS GC_CITY_PATH="$SBX_CITY" bash "$SCRIPT_DIR/git-lock-hygiene.sh" --selftest "$@" || rc=$?
 
 city_log="$SBX_CITY/.gc/logs/git-lock-hygiene.jsonl"
 if [ -s "$city_log" ]; then
