@@ -98,7 +98,7 @@ run_wrapper() { # run_wrapper [env assignments...] -- args...
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   env -i HOME="$W/home" PATH="$BIN:/usr/bin:/bin" GC_CITY_PATH="$W/city" GC_LOWPRIO=0 \
-      GC_LOWPRIO_CLAUDE_BIN="$BIN/fake-claude" GC_POOL_CRED_DIR="$POOL_DIR" FAKE_KC="${FAKE_KC:-}" "${envs[@]}" \
+      GC_LOWPRIO_CLAUDE_BIN="$BIN/fake-claude" GC_POOL_CRED_DIR="$POOL_DIR" FAKE_KC="${FAKE_KC:-}" ${envs[@]+"${envs[@]}"} \
       "$WRAPPER" "$@" 2>/dev/null
 }
 
@@ -373,7 +373,7 @@ run_d() { # run_d [env assignments...] -- <daemon args>   (always a clean enviro
   env -i HOME="$D/home" USER=athos PATH="$BB:/usr/bin:/bin" GC_CITY_PATH="$D/city" FAKE_KC="$D/kc" VAULT="$D/vault" \
       CLAUDE_USAGE_STORE="$D/usage.json" CLAUDE_POOL_STATE="$STATE" CLAUDE_POOL_CRED_DIR="$POOL_DIR" \
       CLAUDE_POOL_ACCOUNTS_LIB="$ACCT_LIB" CLAUDE_POOL_PROBE_URL="http://127.0.0.1:$(cat "$D/port")/v1/messages" \
-      CLAUDE_POOL_NOW="${NOW_OVERRIDE-$NOW_BASE}" "${envs[@]}" "$PY3" "$DAEMON" "$@" >"$D/out.txt" 2>&1
+      CLAUDE_POOL_NOW="${NOW_OVERRIDE-$NOW_BASE}" ${envs[@]+"${envs[@]}"} "$PY3" "$DAEMON" "$@" >"$D/out.txt" 2>&1
 }
 jget() { "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); 
 for k in sys.argv[2].split("."): d=d.get(k) if isinstance(d,dict) else None
