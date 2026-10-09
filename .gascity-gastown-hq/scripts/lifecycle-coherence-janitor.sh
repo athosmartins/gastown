@@ -184,8 +184,11 @@ _strip() {  # store id label
 }
 _strip_checked() {  # store id label — like _strip, but RETURNS bd's verdict (ga-a05uwz)
   # _strip swallows bd errors (`|| true`), so a caller can never tell a strip that landed from
-  # one Dolt rejected. R5 now logs "stripped" only when it was, and stops a batch when bd keeps
-  # failing (a swallowed failure would log a strip that never happened and retry it silently).
+  # one Dolt rejected. R5's ga-a05uwz strip path (_r5_strip_ctx_ready: the closed+story:done
+  # and no-merge-proof arms) uses this one, so ITS "stripped" log line is only written when bd
+  # accepted the strip and a run of bd failures can stop the batch. Scope, stated plainly: the
+  # verified-merged arm and the cancelled arm still use plain _strip and log unconditionally
+  # (pre-existing, unchanged here); a rejected strip there is simply retried next sweep.
   [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would strip $3 from $2"; return 0; }
   "$BD" -C "$1" label remove "$2" "$3" -q >/dev/null 2>&1
 }
@@ -475,19 +478,34 @@ _bead_id_regex() {  # bead-id → grep -E safe: escapes literal dots (e.g. wa-8y
   printf '%s' "$1" | sed -e 's/\./\\./g'
 }
 _resolve_bead_branches() {  # store bead-id → candidate branch short-names (origin/ stripped, deduped, one per line)
-  local store="$1" bid="$2" bre
+  # rc 0 = git answered (an EMPTY list is then a real answer: no such branch); rc 2 = git could not
+  # list refs at all, which says NOTHING about whether a branch exists (ga-a05uwz gate round 1,
+  # error-vs-empty). The ref listing is captured on its own on purpose: inside one pipeline a failing
+  # for-each-ref is hidden behind sed/grep/sort and "git is broken" reads as "no branches".
+  local store="$1" bid="$2" bre refs cand rc
   bre=$(_bead_id_regex "$bid")
-  "$LCJ_GIT" -C "$store" for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin 2>/dev/null \
-    | sed 's#^origin/##' \
-    | grep -E "(^|/|-)${bre}(-|/|\$)" 2>/dev/null \
-    | sort -u
+  refs=$("$LCJ_GIT" -C "$store" for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin 2>/dev/null) || return 2
+  cand=$(printf '%s\n' "$refs" | sed 's#^origin/##' | grep -E "(^|/|-)${bre}(-|/|\$)" 2>/dev/null)
+  rc=$?   # pipefail is on, so this is the pipeline's rc: 0 matched, 1 none matched (a real answer), >1 grep failed (no answer). A sed failure is not told apart (constant s### on in-memory text; it cannot realistically fail)
+  [ "$rc" -le 1 ] || return 2
+  [ -n "$cand" ] && printf '%s\n' "$cand" | sort -u
+  return 0
 }
 _branch_merged_state() {  # store branch → merged|unmerged|missing|unknown (mirrors gate-recovery-watchdog.py:1487-1510)
   # NOTE: does NOT fetch — caller (R5, once per store) is responsible. See comment above.
+  # missing  = git ANSWERED "no such ref" (rev-parse --verify -q rc 1).
+  # unknown  = git did NOT answer (rc >1: repo broken, lock, OOM... — verified: a non-repo gives 128).
+  # The two used to be one: any non-zero rev-parse meant "missing", so a broken git looked like a
+  # branch that was never there.
   local store="$1" branch="$2" rc
   [ -z "$branch" ] && { echo "unknown"; return; }
   "$LCJ_GIT" -C "$store" rev-parse --verify -q "origin/${branch}^{commit}" >/dev/null 2>&1
-  if [ $? -ne 0 ]; then echo "missing"; return; fi
+  rc=$?
+  case "$rc" in
+    0) ;;
+    1) echo "missing"; return ;;
+    *) echo "unknown"; return ;;
+  esac
   "$LCJ_GIT" -C "$store" merge-base --is-ancestor "origin/${branch}" origin/main 2>/dev/null
   rc=$?
   case "$rc" in
@@ -496,16 +514,25 @@ _branch_merged_state() {  # store branch → merged|unmerged|missing|unknown (mi
     *) echo "unknown" ;;
   esac
 }
-# _r5_merge_verdict store bead-id → merged|stranded|unresolved
-#   merged     — at least one candidate branch is a positive ancestor of origin/main:
-#                safe to stamp story:done.
-#   stranded   — EVERY candidate branch resolved definitively (none missing/unknown)
-#                and at least one is confirmed unmerged: the wa-g1b58 false-close
-#                shape. Never touch; rare + actionable, so escalate loudly (see
-#                _r5_stranded_notify_once below).
-#   unresolved — no candidate branch found at all, OR at least one candidate could
-#                not be resolved (missing/unknown) with no "merged" verdict found
-#                elsewhere: can't confirm either way. Never touch; log only.
+# _r5_merge_verdict store bead-id → merged|stranded|unresolved|unverifiable
+#   merged       — at least one candidate branch is a positive ancestor of origin/main:
+#                  safe to stamp story:done.
+#   stranded     — EVERY candidate branch resolved definitively (none missing/unknown)
+#                  and at least one is confirmed unmerged: the wa-g1b58 false-close
+#                  shape. Never touch; rare + actionable, so escalate loudly (see
+#                  _r5_stranded_notify_once below).
+#   unresolved   — git ANSWERED, and there is no merge proof: no candidate branch exists at
+#                  all, OR candidates exist but at least one is absent from origin (missing)
+#                  with no "merged" verdict found elsewhere. The caller may drop the
+#                  vestigial ctx:ready (the only thing R5 may do without proof).
+#   unverifiable — git did NOT answer: the ref listing failed, or a candidate came back
+#                  "unknown" (rev-parse/merge-base errored). Absence of an answer is not an
+#                  answer: it may be the merged branch, it may be the stranded one. The
+#                  caller MUST leave the bead exactly as it is (ctx:ready kept, so it is
+#                  re-checked next sweep) — stripping is irreversible, a deferral is not.
+#   (Three-state doctrine: has / doesn't have / couldn't find out. Under doubt, the default is
+#   the INERT state. "merged" found among the candidates still wins over an "unknown" sibling —
+#   ancestry only grows, so a positive proof stands whatever else git failed to say.)
 #
 # WHY a mixed missing+unmerged set is "unresolved", not "stranded" (found live
 # while verifying this fix, not a hypothetical): a bead can have MULTIPLE
@@ -521,8 +548,8 @@ _branch_merged_state() {  # store branch → merged|unmerged|missing|unknown (mi
 # prevent, just relocated. Only trust "stranded" when every candidate could be
 # checked and NONE came back merged.
 _r5_merge_verdict() {
-  local store="$1" bid="$2" branches b state any_unmerged=0 any_inconclusive=0 verdict="unresolved"
-  branches=$(_resolve_bead_branches "$store" "$bid")
+  local store="$1" bid="$2" branches b state any_unmerged=0 any_missing=0 any_unknown=0 verdict="unresolved"
+  branches=$(_resolve_bead_branches "$store" "$bid") || { echo "unverifiable"; return; }
   [ -z "$branches" ] && { echo "unresolved"; return; }
   while IFS= read -r b; do
     [ -z "$b" ] && continue
@@ -530,11 +557,14 @@ _r5_merge_verdict() {
     case "$state" in
       merged)   verdict="merged"; break ;;
       unmerged) any_unmerged=1 ;;
-      *)        any_inconclusive=1 ;;  # missing or unknown — resolves nothing either way
+      missing)  any_missing=1 ;;   # git answered: not on origin
+      *)        any_unknown=1 ;;   # git did not answer
     esac
   done <<< "$branches"
   if [ "$verdict" != "merged" ]; then
-    if [ "$any_unmerged" -eq 1 ] && [ "$any_inconclusive" -eq 0 ]; then
+    if [ "$any_unknown" -eq 1 ]; then
+      verdict="unverifiable"       # an unjudged candidate could be the merged one OR the stranded one
+    elif [ "$any_unmerged" -eq 1 ] && [ "$any_missing" -eq 0 ]; then
       verdict="stranded"
     else
       verdict="unresolved"
@@ -583,6 +613,25 @@ _r5_stranded_notify_once() {  # bead-id message → notify_fail at most once per
 # thing R5 may do without proof — so they leave the list after ONE visit. The initial drain of
 # a backlog that size is bounded per store per sweep (R5_BATCH_MAX, default 100) and paced
 # (R5_STRIP_PACE_SEC between mutations, default 0.5s) instead of ~1.4k calls in a burst.
+#
+# That strip is IRREVERSIBLE (the bead leaves R5's list and is never re-verified), so it is only
+# ever applied on a verdict meaning "git answered, and there is nothing to find" — never on "git
+# could not tell me" (the `unverifiable` verdict, a failed fetch's stale refs, a missing origin/main,
+# a failed `bd list`). Those beads stay exactly as they are and are counted loudly in ONE
+# `R5 unverifiable` line per store per sweep. They do not count against the batch cap: counting
+# them would let a few permanently-unjudgeable beads at the head of the list starve everything
+# behind them. A store-wide git outage is caught by ONE origin/main probe per store, not a failing
+# call per candidate. Accepted residuals (documented, not fixed):
+#   * the cap is checked BEFORE verification (verifying is the expensive part this bead cuts), so
+#     during the one-time initial drain (~backlog/cap sweeps) a stranded bead can wait for its turn
+#     before its alert fires; steady state has no backlog, so no delay.
+#   * TOCTOU: a bead's labels are a snapshot from the sweep's `bd list`; a paced strip can land up
+#     to a few minutes later. The only label R5 strips without proof is the vestigial ctx:ready of
+#     a CLOSED bead (nothing is dispatched from it), so a stale snapshot cannot cause a wrong
+#     mutation: at worst the label is already gone and bd answers a no-op or a rejection, both of
+#     which the failure policy above already handles.
+#   * a bead whose strip bd rejects EVERY time is retried every sweep (3 consecutive failures stop
+#     the batch, so it costs 3 calls, not a storm) and is logged `R5 strip-failed` each time.
 _r5_pace() {  # breathing room between backlog mutations; never in DRY_RUN
   [ "$LCJ_DRY_RUN" = "1" ] && return 0
   case "${R5_STRIP_PACE_SEC:-0.5}" in 0|0.0) return 0 ;; esac
@@ -863,8 +912,16 @@ run_sweep() {
     # visits except the stranded ones (unmerged branch: kept visible for manual recovery) and
     # the gate-failed ones (parked on purpose, handled below). A candidate therefore costs one
     # visit, not one per sweep; see the "R5 backlog economics" block above for the live numbers.
+    # A FAILED list is not an EMPTY one: "" reads exactly like "backlog drained" (zero R5 work — the
+    # very metric ga-a05uwz is measured by). Rc and shape are both checked; on failure R5 skips this
+    # store for the sweep and says so. (The other rules' lists share the weakness — out of scope here.)
     local _r5_list; _r5_list=$("$BD" -C "$store" list -l ctx:ready --status closed --json -n 0 2>/dev/null)
+    if [ $? -ne 0 ] || ! printf '%s' "$_r5_list" | jq -e 'type == "array"' >/dev/null 2>&1; then
+      log "R5 list-failed (ga-a05uwz): $(basename "$store") — bd list errored or returned non-JSON; skipping R5 for this store this sweep (a failed list is not 'backlog drained')"
+      _r5_list="[]"
+    fi
     local _r5_cap="${R5_BATCH_MAX:-100}" _r5_acted=0 _r5_deferred=0 _r5_failrun=0 _r5_abort=0 _r5_fetched=0
+    local _r5_fresh=1 _r5_mainok=1 _r5_v _r5_unv=0 _r5_unv_main=0 _r5_unv_stale=0 _r5_unv_err=0
     # (a) already story:done: only the leftover ctx:ready zombie remains. No git, no bd show —
     # the labels are in the list JSON we already hold. (Before ga-a05uwz these hit a silent
     # `continue` and cost a `bd show` per bead per sweep forever: 845 of WA's 1,429.)
@@ -891,8 +948,25 @@ run_sweep() {
       # against content that no longer represents anything real on the remote, instead of
       # correctly reporting "missing" (which _r5_merge_verdict's mixed-signal handling
       # above depends on to avoid a false "stranded").
-      [ "$_r5_fetched" = 1 ] || { "$LCJ_GIT" -C "$store" fetch origin --prune --quiet 2>/dev/null; _r5_fetched=1; }
-      case "$(_r5_merge_verdict "$store" "$id")" in
+      # The fetch's RESULT matters: after a failed fetch every ref is as of the last good one. Ancestry
+      # only grows, so a positive "merged" still stands; but "no branch" / "unmerged" off stale refs
+      # may just mean "pushed since" — those beads are left alone (see _r5_v below). Same probe step:
+      # origin/main is the reference every verdict is judged against; if it does not resolve (rig
+      # topology inconsistent, repo broken) NOTHING can be judged, so one probe per store replaces a
+      # failing git call per candidate.
+      if [ "$_r5_fetched" != 1 ]; then
+        _r5_fetched=1
+        if ! "$LCJ_GIT" -C "$store" fetch origin --prune --quiet 2>/dev/null; then
+          _r5_fresh=0
+          log "R5 fetch-failed (ga-a05uwz): $(basename "$store") — git fetch origin --prune failed; refs may be stale, so only a positive 'merged' proof is trusted this sweep"
+        fi
+        "$LCJ_GIT" -C "$store" rev-parse --verify -q "origin/main^{commit}" >/dev/null 2>&1 || _r5_mainok=0
+      fi
+      if [ "$_r5_mainok" = 1 ]; then _r5_v=$(_r5_merge_verdict "$store" "$id"); else _r5_v="no-origin-main"; fi
+      if [ "$_r5_fresh" = 0 ]; then
+        case "$_r5_v" in stranded|unresolved) _r5_v="stale-refs" ;; esac
+      fi
+      case "$_r5_v" in
         merged)
           _r5_acted=$((_r5_acted+1))
           _strip "$store" "$id" ctx:ready; _strip "$store" "$id" pilot:dispatched; _add "$store" "$id" story:done
@@ -907,10 +981,24 @@ run_sweep() {
           ;;
         unresolved)
           # ga-a05uwz: NO story:done (no proof), but the ctx:ready goes — see the block comment.
-          _r5_strip_ctx_ready "$store" "$id" unverified-stripped "closed+ctx:ready but no merge proof (no branch matching the bead-id naming conventions); stripped ONLY ctx:ready, NOT stamping story:done (ga-to242 AC3). Logged once: the bead leaves R5's sweep"
+          # Reached ONLY when git ANSWERED and found nothing (fresh refs, origin/main resolves, the
+          # ref listing and every candidate check succeeded) — never on "git could not tell me".
+          _r5_strip_ctx_ready "$store" "$id" unverified-stripped "closed+ctx:ready, git answered but there is no merge proof (no branch matching the bead-id naming conventions, or none still on origin); stripped ONLY ctx:ready, NOT stamping story:done (ga-to242 AC3). Logged once: the bead leaves R5's sweep"
+          ;;
+        *)
+          # unverifiable | stale-refs | no-origin-main — git gave no trustworthy answer. INERT: no
+          # strip, no story:done, no stranded alert. ctx:ready stays so the bead is re-checked next
+          # sweep, once git is healthy. Counted (not cap-charged) and reported once, below.
+          _r5_unv=$((_r5_unv+1))
+          case "$_r5_v" in
+            no-origin-main) _r5_unv_main=$((_r5_unv_main+1)) ;;
+            stale-refs)     _r5_unv_stale=$((_r5_unv_stale+1)) ;;
+            *)              _r5_unv_err=$((_r5_unv_err+1)) ;;
+          esac
           ;;
       esac
     done
+    [ "$_r5_unv" -gt 0 ] && log "R5 unverifiable (ga-a05uwz): $(basename "$store") — $_r5_unv candidate(s) left untouched (ctx:ready kept, re-checked next sweep) because git gave no trustworthy answer [origin/main unresolved: $_r5_unv_main, stale refs after failed fetch: $_r5_unv_stale, git read error / unjudgeable branch: $_r5_unv_err]"
     [ "$_r5_deferred" -gt 0 ] && log "R5 batch-cap (ga-a05uwz): $(basename "$store") — settled $_r5_acted candidate(s) this sweep, $_r5_deferred deferred to the next (R5_BATCH_MAX=$_r5_cap, paced ${R5_STRIP_PACE_SEC:-0.5}s)"
     # ga-6plfv (AC3, partial/zero-git-risk subset — full merge-ancestry
     # verification deferred, see file header): a closed+ctx:ready bead that
@@ -1502,8 +1590,11 @@ case "\$a" in
     echo "origin/fix/r5mb-attempt2"
     echo "origin/fix/r5mm-attempt1"
     echo "origin/fix/r5mm-attempt2"
+    echo "origin/fix/gfs-stranded"
     ;;
   *"fetch"*) exit 0 ;;
+  *"origin/main^{commit}"*) exit 0 ;;   # the reference ref R5 checks before judging any merge (ga-a05uwz gate-fix)
+  *"fix/gfs-stranded^{commit}"*)  exit 0 ;;   # unmerged by the generic is-ancestor default below
   *"fix/r5-legacy-fix^{commit}"*) exit 0 ;;
   *"fix/r5m-some-fix^{commit}"*)  exit 0 ;;
   *"fix/r5s-some-fix^{commit}"*)  exit 0 ;;
@@ -1767,6 +1858,7 @@ GITSHIM
 a="$*"
 case "$a" in
   *"list -l ctx:ready --status closed"*)
+    [ "${LCJ_TEST_R5_LIST_FAIL:-0}" = "1" ] && exit 1
     jq -c --rawfile s "$R5T_DIR/r5-stripped" '($s | split("\n")) as $x | map(select(.id as $i | ($x | index($i)) | not))' "$R5T_DIR/r5-cands.json" ;;
   *" show "*) echo "$a" >> "$R5T_DIR/r5-show-calls"; echo '[]' ;;
   *"label remove"*)
@@ -1782,6 +1874,19 @@ R5SHIM
   cat > "$TMP/git-r5" <<'R5GIT'
 #!/usr/bin/env bash
 echo "$*" >> "$R5T_DIR/git-calls"
+# LCJ_TEST_GIT_FAIL injects the third state — "git could not tell me" (rc 128: broken repo, ref
+# lock, no origin) — into ONE family of calls and leaves the rest healthy. rc 128 is deliberately
+# NOT rc 1: for rev-parse --verify -q, 1 is a real answer ("no such ref"); 128 is no answer.
+#   foreachref  the ref listing fails          mergebase  merge-base --is-ancestor fails
+#   revparse    a candidate's rev-parse fails  nomain     origin/main does not resolve
+#   fetch       git fetch fails (refs are stale)
+case "${LCJ_TEST_GIT_FAIL:-}" in
+  foreachref) case "$*" in *for-each-ref*) exit 128 ;; esac ;;
+  mergebase)  case "$*" in *is-ancestor*) exit 128 ;; esac ;;
+  revparse)   case "$*" in *rev-parse*"fix/"*) exit 128 ;; esac ;;
+  nomain)     case "$*" in *rev-parse*"origin/main"*) exit 1 ;; *is-ancestor*) exit 128 ;; esac ;;
+  fetch)      case "$*" in *" fetch "*) exit 1 ;; esac ;;
+esac
 exec "$R5T_DIR/git" "$@"
 R5GIT
   chmod +x "$TMP/git-r5"
@@ -1840,7 +1945,80 @@ R5GIT
   : > "$ACT"; run_sweep
   [ "$(_r5t_count 'label remove capf-' "$ACT")" = "6" ] && ok "R5 failure (ga-a05uwz): next sweep retries and strips all 6 (nothing was lost)" || bad "R5 failure (ga-a05uwz): recovery sweep stripped $(_r5t_count 'label remove capf-' "$ACT") of 6"
 
-  BD="$BD_MAIN"; LCJ_GIT="$GIT_MAIN"; unset R5_BATCH_MAX R5T_DIR R5T_ACT
+  # Scenario 4 — "git could not tell me" is not "there is nothing to find" (gate round 1,
+  # root-class:error-vs-empty). Stripping ctx:ready on `unresolved` is an IRREVERSIBLE exit from R5's
+  # sweep, and `unresolved` used to be ALSO what a failed git read produced (the for-each-ref pipeline
+  # turned an error into an empty list; merge-base rc>1 became "unknown" → inconclusive). Strip on that
+  # and the bead is never re-verified, so once git recovers the stranded alert — the only breadcrumb of
+  # a false-close — can never fire for it. Three beads: gf-none (no branch anywhere), gfs-stranded (a
+  # real UNMERGED branch), r5m (a merged one). Each mode breaks ONE family of git calls for one sweep.
+  _r5t_newlog() { tail -n +"$(( $1 + 1 ))" "$LOG"; }
+  _r5t_gitfail() {  # mode → one sweep over the three beads with that git call family failing
+    _r5t_reset; : > "$NOTIFY_LOG"; _lg0=$(wc -l < "$LOG")
+    echo '[{"id":"gf-none","labels":["ctx:ready"]},{"id":"gfs-stranded","labels":["ctx:ready"]},{"id":"r5m","labels":["ctx:ready"]}]' > "$TMP/r5-cands.json"
+    export LCJ_TEST_GIT_FAIL="$1"; run_sweep; export LCJ_TEST_GIT_FAIL=""
+  }
+  _r5t_unverifiable_logged() {  # the third state must be LOUD: one summary line for the sweep, not silence
+    [ "$(_r5t_newlog "$_lg0" | grep -c 'R5 unverifiable')" = "1" ]
+  }
+
+  # 4a: the ref listing fails (rc 128) → NOTHING can be concluded about any of the three.
+  _r5t_gitfail foreachref
+  [ ! -s "$ACT" ] && ok "R5 git-fail (ga-a05uwz): a failed ref listing mutates NOTHING — it is not an empty list" || bad "R5 git-fail (ga-a05uwz): a sweep whose git for-each-ref FAILED still mutated beads: $(tr '\n' ';' < "$ACT")"
+  _r5t_unverifiable_logged && ok "R5 git-fail (ga-a05uwz): the failed ref listing is reported (one 'R5 unverifiable' line), not silent" || bad "R5 git-fail (ga-a05uwz): no single 'R5 unverifiable' line for a failed ref listing"
+  _r5t_newlog "$_lg0" | grep -q 'no branch matching' && bad "R5 git-fail (ga-a05uwz): logged 'no branch matching' though git never answered — the log lies about WHY" || ok "R5 git-fail (ga-a05uwz): no false 'no branch matching' reason logged"
+  grep -q 'gfs-stranded' "$NOTIFY_LOG" && bad "R5 git-fail (ga-a05uwz): stranded alert fired off a failed git read" || ok "R5 git-fail (ga-a05uwz): no stranded alert off a failed git read"
+  # 4b/4c: the listing works but a verdict call fails (merge-base rc 128 / candidate rev-parse rc 128):
+  # the bead with NO candidate is genuinely branchless (strip is right); every bead that HAS a
+  # candidate git could not judge stays untouched — it might be the merged one, or the stranded one.
+  for _m in mergebase revparse; do
+    _r5t_gitfail "$_m"
+    grep -q 'label remove gf-none ctx:ready' "$ACT" && ok "R5 git-fail/$_m (ga-a05uwz): a bead with no candidate branch at all is still stripped (listing worked, so 'none' is a real answer)" || bad "R5 git-fail/$_m (ga-a05uwz): gf-none (no branch) not stripped"
+    grep -qE 'gfs-stranded|r5m' "$ACT" && bad "R5 git-fail/$_m (ga-a05uwz): mutated a bead whose branch git could not judge: $(tr '\n' ';' < "$ACT")" || ok "R5 git-fail/$_m (ga-a05uwz): beads with an unjudgeable candidate branch left untouched"
+    _r5t_unverifiable_logged && ok "R5 git-fail/$_m (ga-a05uwz): one 'R5 unverifiable' line" || bad "R5 git-fail/$_m (ga-a05uwz): expected exactly one 'R5 unverifiable' line"
+    grep -q 'gfs-stranded' "$NOTIFY_LOG" && bad "R5 git-fail/$_m (ga-a05uwz): stranded alert off an unjudgeable branch" || ok "R5 git-fail/$_m (ga-a05uwz): no stranded alert off an unjudgeable branch"
+  done
+
+  # 4d: origin/main does not resolve (rig topology is inconsistent — the file header says so):
+  # nothing can be judged against a missing reference, including "no branch" and "missing".
+  _r5t_gitfail nomain
+  [ ! -s "$ACT" ] && ok "R5 git-fail/nomain (ga-a05uwz): no origin/main → nothing mutated" || bad "R5 git-fail/nomain (ga-a05uwz): mutated beads with no origin/main to judge against: $(tr '\n' ';' < "$ACT")"
+  _r5t_unverifiable_logged && ok "R5 git-fail/nomain (ga-a05uwz): one 'R5 unverifiable' line" || bad "R5 git-fail/nomain (ga-a05uwz): expected exactly one 'R5 unverifiable' line"
+
+  # 4e: the fetch fails → refs are STALE. A merge that was already on origin/main stays merged
+  # (ancestry only grows), so positive proof is still trusted; but "no branch" / "unmerged" off stale
+  # refs may just mean "pushed since the last fetch", so those beads stay untouched.
+  _r5t_gitfail fetch
+  grep -q 'label add r5m story:done' "$ACT" && ok "R5 git-fail/fetch (ga-a05uwz): positive merge proof is still trusted on stale refs" || bad "R5 git-fail/fetch (ga-a05uwz): r5m (merged) not stamped — a fetch failure froze even positive proof"
+  grep -qE 'gf-none|gfs-stranded' "$ACT" && bad "R5 git-fail/fetch (ga-a05uwz): acted on a 'no branch'/'unmerged' conclusion drawn from stale refs: $(tr '\n' ';' < "$ACT")" || ok "R5 git-fail/fetch (ga-a05uwz): no-branch / unmerged conclusions off stale refs left untouched"
+  _r5t_newlog "$_lg0" | grep -q 'R5 fetch-failed' && ok "R5 git-fail/fetch (ga-a05uwz): the failed fetch is logged" || bad "R5 git-fail/fetch (ga-a05uwz): no 'R5 fetch-failed' line"
+  _r5t_unverifiable_logged && ok "R5 git-fail/fetch (ga-a05uwz): one 'R5 unverifiable' line" || bad "R5 git-fail/fetch (ga-a05uwz): expected exactly one 'R5 unverifiable' line"
+  grep -q 'gfs-stranded' "$NOTIFY_LOG" && bad "R5 git-fail/fetch (ga-a05uwz): stranded alert off stale refs" || ok "R5 git-fail/fetch (ga-a05uwz): no stranded alert off stale refs"
+
+  # 4f: outage → recovery, with the bd shim's REAL persistence: a bead whose ctx:ready was stripped
+  # leaves R5's list for good ($TMP/r5-stripped is deliberately NOT reset between the two sweeps).
+  # That is the harm itself — strip during the outage and the recovery sweep never sees the bead, so
+  # r5m never gets story:done and gfs-stranded's alert (the only breadcrumb of a false-close) never fires.
+  # Runs LAST on purpose: the recovery sweep plants the stranded-notify cooldown marker for gfs-stranded,
+  # which would make every "no stranded alert" assertion above vacuous if it ran earlier.
+  _r5t_gitfail foreachref
+  : > "$ACT"; : > "$NOTIFY_LOG"; run_sweep
+  grep -q 'label remove gf-none ctx:ready' "$ACT" && ok "R5 git-fail (ga-a05uwz): after recovery the genuinely branchless bead is stripped (the outage left it in R5's list)" || bad "R5 git-fail (ga-a05uwz): gf-none was lost from R5's list while git was down"
+  grep -q 'label add r5m story:done' "$ACT" && ok "R5 git-fail (ga-a05uwz): after recovery the merged bead still gets story:done" || bad "R5 git-fail (ga-a05uwz): r5m lost its story:done stamp across a git outage"
+  grep -q 'gfs-stranded' "$ACT" && bad "R5 git-fail (ga-a05uwz): touched the stranded bead after recovery" || ok "R5 git-fail (ga-a05uwz): stranded bead left alone after recovery"
+  grep -q 'gfs-stranded' "$NOTIFY_LOG" && ok "R5 git-fail (ga-a05uwz): after recovery the stranded alert fires — the false-close breadcrumb survived the outage" || bad "R5 git-fail (ga-a05uwz): the stranded alert for gfs-stranded never fired after git recovered — the strip destroyed its only breadcrumb"
+
+  # Scenario 5 — a FAILED `bd list` is not "the backlog is drained" (same family, on the sweep's own
+  # input: an empty string reads exactly like zero R5 work, which is the metric this bead is measured by).
+  _r5t_reset; _lg0=$(wc -l < "$LOG")
+  echo '[{"id":"ls-1","labels":["ctx:ready"]}]' > "$TMP/r5-cands.json"
+  export LCJ_TEST_R5_LIST_FAIL=1; run_sweep; export LCJ_TEST_R5_LIST_FAIL=0
+  _r5t_newlog "$_lg0" | grep -q 'R5 list-failed' && ok "R5 list-fail (ga-a05uwz): a failed bd list is reported, not read as 'nothing to do'" || bad "R5 list-fail (ga-a05uwz): a failed bd list was silent — it reads as 'backlog drained'"
+  grep -q 'ls-1' "$ACT" && bad "R5 list-fail (ga-a05uwz): acted on a bead off a failed list" || ok "R5 list-fail (ga-a05uwz): nothing acted on off a failed list"
+  : > "$ACT"; run_sweep
+  grep -q 'label remove ls-1 ctx:ready' "$ACT" && ok "R5 list-fail (ga-a05uwz): the next healthy sweep settles it (nothing was lost)" || bad "R5 list-fail (ga-a05uwz): ls-1 not settled after bd recovered"
+
+  BD="$BD_MAIN"; LCJ_GIT="$GIT_MAIN"; unset R5_BATCH_MAX R5T_DIR R5T_ACT LCJ_TEST_GIT_FAIL LCJ_TEST_R5_LIST_FAIL
 
   # ── Bootstrap coverage for the LCJ_STORES derivation (ga-3xfndz) ───────────
   # Every assertion above ran run_sweep() in-process with GC/BD/LCJ_NOTIFY
