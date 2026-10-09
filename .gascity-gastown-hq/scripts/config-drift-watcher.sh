@@ -136,7 +136,16 @@ compute_hash() {
         find "$CITY/skills" -type f 2>/dev/null
         find "$CITY/.claude/skills" -type f 2>/dev/null
         # Crew skill copies (follow symlinks to detect changes in targets too)
-        find "$WA/crew" -path "*/.claude/skills/*" -type f 2>/dev/null
+        # Only each crew's own .claude/skills — never a walk of the whole crew tree.
+        # $WA/crew holds ~40 full repo worktrees (one per pool bead); the old
+        # `find "$WA/crew" -path "*/.claude/skills/*"` walked every file of every
+        # one of them each POLL_INTERVAL (3 s), each walk taking 12 s+ under load:
+        # a never-ending full-disk scan that held load at 90+ on 09/10 (Mayor).
+        # Same matches as before for crew/<name>/.claude/skills; -P (find's
+        # default) keeps the old symlink behaviour.
+        for _skills in "$WA"/crew/*/.claude/skills; do
+            [[ -d "$_skills" ]] && find "$_skills" -type f 2>/dev/null
+        done
         find "$WA/city-local/skills" -type f 2>/dev/null
         # City config files
         [[ -f "$CITY/city.toml" ]] && echo "$CITY/city.toml"
