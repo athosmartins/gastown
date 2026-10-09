@@ -1,11 +1,16 @@
 # Pool Claude account as data (ga-8hcnvb.1) and its guard (ga-8hcnvb.3)
 
 The headless pool (dog, wa-worker, ps-worker, gate-reviewer, boot, deacon, auto-refiner — ~90% of the spend)
-changes Claude account by itself when the one in use hits its limit, and goes back to the account it left once that
-account has renewed **and a usage collection taken after the renewal confirms it ranks ahead** — so up to about one
-collector period (30 min) after the renewal, not at the instant of it (see "The way back waits for a fresh collection").
-No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens are already in the vault as
-`claude-oauth-token-<email>`). Mayor and crews are **not** touched (phase 2).
+follows ONE Claude account, which a script chooses. The script moves the pool away from the account in use only when that account
+**says the limit is hit** (an HTTP 429, or a `rejected` status in the `anthropic-ratelimit-unified-*` headers) or **refuses its key**
+(401/403) — never on a utilization, a warning or the usage store's ranking ("What it costs, and what it never does"). It goes back to the
+account it left once that account has renewed **and a usage collection taken after the renewal confirms it ranks ahead** — so up to about
+one collector period (30 min) after the renewal, not at the instant of it (see "The way back waits for a fresh collection"). That return is
+the one move the pool makes away from an account that still answers, and it is by design.
+No restart and no login asked of Athos (the 5 setup-tokens are already in the vault as `claude-oauth-token-<email>`): a live session keeps
+its process and its conversation across a switch (measured at turn boundaries only — see Known limits). A session already sitting on
+claude's limit modal needs one Escape to notice the switch, and gets it only when the daemon can prove the pane is a pool one ("The Escape
+exception"; boot and deacon follow the item like the rest but are not on that list). Mayor and crews are **not** touched (phase 2).
 
 ## How it works
 
@@ -14,12 +19,16 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
    probe the ACTIVE account (1-token call on the model the pool runs, with the Claude Code system prompt;
                              anthropic-ratelimit-unified-* headers)
      rejected / 429  -> failover: next account of ordem_das_contas() that answers a probe; store the reset time
-     answers         -> stay; failback ONLY to an account we saw exhausted, whose stored reset time has passed,
+     key refused     -> the same failover, on its own (401/403 from the ACTIVE account, not only behind a limit screen); the account
+                        is registered for an hour as "invalid" (not "rejected": it is never failed back to)
+     answers         -> stay (whatever its utilization or a "warning" status says); failback ONLY to an account we saw exhausted, whose stored reset time has passed,
                         whose usage reading in the usage store was taken AFTER that reset, and which that reading
                         ranks ahead of the active one — no probe of it on the way back
                         (not to one whose KEY was refused, 401/403: see Known limits)
                         a reading from BEFORE the reset is no evidence: the entry is kept and the log says it waits
-     cannot tell     -> change nothing (network, 5xx, a redirect: error is not exhaustion)
+     cannot tell     -> change nothing: every answer that is not a 2xx, a 429 / `rejected`, or a 401/403 — network, 5xx, a 404 from a
+                        retired model ID, any other 4xx, a redirect: error is not exhaustion. For a failover CANDIDATE it means
+                        "skip it, do not register it"
    vault (Bitwarden) read lazily: the ACTIVE account's key every run, the other accounts' only when the pool moves
    a key the vault does not return for the active account is NOT "its key is gone": the item is the second witness
    writes ONE Keychain item  "Claude Code-credentials-50adeaf1"   (the POOL's item only — never the plain
@@ -58,11 +67,40 @@ The probe never follows a redirect (urllib would re-send the Bearer to wherever 
 
 Why the daemon never starts `claude`: the account that is exhausted is the one `claude` would run on. The probe is
 plain HTTP; the switch is `security -i` with the new blob on **stdin** (hex), so no token is ever in argv, the
-environment, a log, the state file or a notification. Accounts appear as e-mail + sha256[:8] fingerprint.
+environment, a log, the state file or a notification. Accounts appear as e-mail + sha256[:8] fingerprint. The only programs the daemon's
+source can start are `security`, `ps` and `tmux` (B74, and live-accept P1f reads that off the source).
 
 Mayor 04/10 (comment on the bead) overrides the original wording: **no utilization threshold** (fail over only when
 the limit is actually hit) and **no confirmation probe on failback** (go back at the stored reset time; if it has not
-really renewed, its 429 sends the pool to the next account again).
+really renewed, its 429 sends the pool to the next account again). Both are pinned by tests that fail when they are broken: B73 (nothing
+short of a rejection moves the pool) and B75 (a failback sends no call as the account it returns to), each run again on a copy of the daemon
+with that one property broken (B78a–c, B78f).
+
+## What it costs, and what it never does (ga-8hcnvb.2.2)
+
+Athos 04/10: switch only at 100%, by a script, with no credit and no `claude`/LLM in the path. Here is what that comes to, in the numbers the
+selftest (B73–B78) and the live harness (P1f, P1g, P3.0b–P3.7) count — "100%" is *the API says the limit is hit*, not a utilization:
+
+| Event | Calls to the API | Cost |
+|---|---|---|
+| a steady run (every 60 s, about 1440 a day) | 1: `POST /v1/messages` with `max_tokens=1`, as the account in use | an account that answers serves it (its short prompt in, one token out); a refused call (429, 401/403) costs nothing |
+| a failover | the call above (refused) + one per candidate tried, in order, until one answers | the candidate that answers serves one more such call; refused candidates cost nothing; a candidate that cannot be told (5xx, network) is skipped and not registered |
+| a failback | the call as the account in use, and **none** as the account it returns to | nothing more: it trusts the stored reset time and a usage reading taken after it; if the account has not really renewed, its 429 sends the pool on at the next run |
+| the Escape | none (a tmux `send-keys` to a pane) | nothing |
+
+So "no credit" is exact about what it excludes and not about the probe: no balance, usage or quota endpoint is called, no `claude` runs, no model
+is asked for anything but that 1-token probe; and the probe of an account that **answers** is a served call (the pool pays it about 1440 times a day, plus the candidate that
+a failover lands on). Making the daemon spend literally nothing would mean replacing that probe with a call that generates nothing; whether such a
+call carries the `anthropic-ratelimit-unified-*` headers the verdict reads was not measured here, so it is a decision for Athos, not a default.
+
+What it never does, each with the test that fails if it did:
+
+- start a `claude` on the switch path — failover, Escape and failback (B74b, B78d; live P1f, P3.7);
+- call anything but `POST /v1/messages` (B75, B78e; live P3.2b, P3.4b);
+- leave an account that answers because of a warning, a utilization (95%, 99%, 100% without `rejected`) or the usage store's numbers, which only
+  *order* the candidates once the pool has to move and *gate* the way back (B73, B78a–c; live P3.1b) — the single exception is the failback;
+- call a refused key a "cannot tell" (B76, B78g), or a status it does not understand a limit (B77, B78h);
+- send a key to a pane that is not a pool pane sitting on the limit modal (B76 also checks that a prompt-only pane gets none).
 
 ## The guard — divergence alert, per-version test, the daemon's liveness and no key leaks (ga-8hcnvb.3)
 
@@ -234,8 +272,8 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-pool-account.py` | the daemon (`run-once`) |
 | `packs/town-deltas/assets/scripts/claude-lowprio.sh` | wrapper: points a pool launch at the item (fail-open) |
 | `packs/town-deltas/assets/claude-pool-account.plist` | launchd job, not loaded by the merge |
-| `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API / tmux / ps, real accounts lib; no real pane or process is ever looked at or pressed; runs under macOS bash 3.2); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from, D2 if the live pool credentials file changed during the run (metadata only: the file is never opened); it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`) |
-| `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session (+ the guard's real-claude self-test and the leakscan control) |
+| `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API / tmux / ps, real accounts lib; no real pane or process is ever looked at or pressed; runs under macOS bash 3.2); it also repoints every path it inherits (`GC_CITY_PATH`, `HOME`, the state / cred-dir / accounts-lib seams) at scratch, and D1 fails if a fixture line reached the log of the city it was launched from, D2 if the live pool credentials file changed during the run (metadata only: the file is never opened); it refuses to start (exit 2) without a scratch directory, or when `security` on its PATH is not the fake - otherwise B49b writes a fixture token into the REAL Keychain (found there 06/10: `Claude Code-credentials-0123abcd` holding `sk-ant-oat01-ALLOWED`). B73–B78 (ga-8hcnvb.2.2): no switch before the limit, no `claude` on the switch path, the request count of a steady run / failover / failback, a refused key on the active account, "cannot tell" is inert - and B78a–h run the same scenarios on a copy of the daemon with ONE property broken each, which must fail for the stated reason |
+| `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session (+ the guard's real-claude self-test and the leakscan control); counts the daemon's requests and `claude` starts (P1f, P1g, P3.0b–P3.7). Needs an EXH account that is exhausted *now*: the default's weekly limit ran until 2026-10-07 ~22:00Z, so it is no longer known to be one |
 | `packs/town-deltas/assets/scripts/claude-pool-guard.py` | the guard (`run-once` / `status [--json]` / `selftest`) |
 | `packs/town-deltas/assets/claude-pool-guard.plist` | the guard's launchd job, not loaded by the merge |
 | `packs/town-deltas/assets/scripts/claude-pool-guard.selftest.sh` | hermetic tests of the guard (G1–G17: divergence, per-version test, scratch item, liveness, `status`, stand-down vs. death, one title per condition, marker that cannot be written / is not the guard's, `selftest` output, the quiet notice vs. notify's router, leakscan symlinks / unreadable paths / FIFOs / the watch deadline, and the no-leak proof with control and mutations) |
@@ -323,7 +361,8 @@ modal waits for a key.
 ```
 
 The daemon sends that session **one key, Escape**, after the switch. The decision to switch is still the script's alone (Athos 04/10:
-only at 100%, no credit, no `claude`/LLM in the path); this only finishes the switch for the sessions that cannot finish it themselves.
+only when the limit is hit, by a script, no `claude`/LLM in the path — what it costs is in "What it costs, and what it never does"); this only
+finishes the switch for the sessions that cannot finish it themselves.
 
 **This is a scoped exception to the send-keys doctrine** (agents do not type into other agents' panes). It stands on the conditions
 below, all of which must hold, and on one rule: every read it makes has three outcomes — yes / no / **can't tell** — and *can't tell*
@@ -358,6 +397,13 @@ presses nothing and forgets nothing.
                          captures the screen once more; a changed pane gets nothing. Then `send-keys -t %N Escape`. At most 20 per run
                          (MAX_ESC_PER_RUN); the rest wait for the next one.
 ```
+
+**The allow-list against the real log.** The `SET` lines the wrapper wrote in `<city>/.gc/logs/claude-pool-account.log` from 2026-10-06 to
+2026-10-09 name five roles, all of them matched by `POOL_AGENT_RE`: gate-reviewer (409 lines), gastown.dog (233), wa-worker (229), auto-refiner
+(4) and refino-gate-reviewer (3), counted on 2026-10-09 07:43Z — the suffix is a slot (`-1`), an adhoc id (`-adhoc-4f91013dd9`) or a bare id (`wa-worker-gaoz37hw`). ps-worker
+and context-check-reviewer are in the list with no `SET` line in that window (so no measurement either way). boot and deacon are **not** in the
+list and left no `SET` line there: whatever their sessions do, they are not pressed. What to watch is a pool role missing from the list; the
+`pane scan` line below is how it shows.
 
 An Escape that took leaves the pane on its prompt: the next run finds no modal and forgets the sighting. A sighting is also forgotten
 once the cycle (10 min) is over, whatever the pane shows.
@@ -411,6 +457,8 @@ in the selftest ever touches a real pane.
   live harness is the check to re-run after upgrading claude (a mismatch shows as P2a failing); the guard re-checks it by
   itself on every new claude version ("The guard", item 2) and turns auto-switch off, with an alert, if it fails.
 - Only turn boundaries were measured; a switch in the middle of a long tool call is not guaranteed.
+- **The probe is not free.** An account that answers serves the daemon's 1-token call every run (see "What it costs, and what it never does");
+  only the refused calls are free. "No credit" in the Athos decision holds for what the switch itself does, not for this.
 - A limit modal already open in a live TUI does not notice the restored credential by itself (needs Esc): the daemon sends that
   Escape to pool sessions only, in the cycle of a switch - see "The Escape exception". Mayor and crew sessions on the modal are never
   pressed (they are not on the pool item), and neither is a pool session the daemon cannot prove (can't tell = no key).
