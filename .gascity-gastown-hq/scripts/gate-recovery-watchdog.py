@@ -56,43 +56,30 @@ DETECTS (orphaned queued marker — the gt-mqkwj signature, 2026-06-12):
     not 'dispatching' (stuck_dispatching blind), no TIMEOUT (recent_timeouts
     blind), and not head-of-line (the queue drains for OTHER branches, so
     headofline_stall sees verdicts advancing for those).
-  Signature (orphaned_queued_marker, ga-yprwyk — keyed on the MARKER ID and on the
-    dispatcher's own tier order, NOT on branch-name mentions): the HEAD queued marker
-    H — the first of the gate's order (priority > feature > age, via the work_order lib,
-    ga-9t9acg.13; the oldest before it) — is an orphan only when ALL of these hold:
-      (a) H is past the dispatcher's overdue ceiling (GATE_MARKER_HARD_AGE_SECONDS —
-          READ from the dispatcher source + its launchd env, never a copied number);
-      (b) the dispatcher log, read back to BEFORE H was created, holds no
-          'Attempting to claim marker <H>' line (zero dispatch attempts, ever);
-      (c) the dispatcher DID claim a marker created AFTER H, at an instant when H was
-          already past the ceiling — the witness;
-      (d) H carries no gate:rebase-* / gate:exiled-* label and no live
-          gate:retry-cooldown-until label — the states that legitimately sink a
-          marker to the back of the queue;
-      (e) the dispatcher is actively draining (newest 'sweep complete' is fresh).
-    Why (c) is a PROOF and not a guess: tier 1 of the dispatcher's marker-select is
-    priority-blind, oldest-first over every overdue healthy marker, so a newer marker
-    cannot be selected while an older healthy overdue one is queued and visible. A
-    YOUNG head is never an orphan — below the ceiling the dispatcher legitimately
-    serves a newer marker first (priority / smallest-diff / one freshest 'reserve'
-    marker), so no claim order can prove a skip. The pre-ga-yprwyk proof ("H's branch
-    is unmentioned while a newer marker's branch IS") assumed one marker per sweep,
-    oldest-first; it flagged ga-b9pz7q 3min before the dispatcher claimed it, and a
-    branch substring also matches an EARLIER attempt of the same branch.
-
-  RETIRED BY THE DISPATCHER (ga-q8tj7p, 2026-10-06): the proof above rests on tier 1 being
-    priority-blind. The dispatcher's order is now priority > feature > age with NO overdue
-    tier, so a newer P0 legitimately beats an older P3 forever and "a newer marker was
-    claimed" proves nothing. orphaned_queued_marker() therefore reads the dispatcher
-    source, and while the marker-select block no longer defines `is_overdue` it reports
-    NO orphan and says so once an hour ("order-changed") — silent would read as "no
-    orphan". Not deleted: if an overdue tier ever returns the proof resumes by itself, and
-    rebuilding it for the new order (the dispatcher can publish the order it computed; a
-    queued marker ABSENT from it for K sweeps is invisible whatever its class) is ga-dtecvq.
-    The head that proof examines is already the head of THAT order (ga-9t9acg.13): _orphan_head asks the
-    work_order lib, fed the source bead's priority/type and the marker's created_at — the watchdog keeps no
-    ordering of its own. It stays dormant, and the repair stays OFF, until the gate's order is entirely in
-    the lib (the `dano-ao-vivo` exception, exile/rebase-fail placement: see _orphan_head).
+  Signature (orphaned_queued_marker, ga-dtecvq — keyed on what the dispatcher SAW, published by the
+    dispatcher itself, NOT on which marker it claimed): every sweep that computes the queue order, the
+    dispatcher writes {at, order[{id,class}], set_aside[id]} to .gc/runtime/gate-queue-order.json
+    (gate-queue-order-publish.lib.sh; the last 6 sweeps are kept, so the history lives in the file, not in
+    this daemon's memory). A queued marker M is an orphan only when ALL of these hold:
+      (a) M is queued and at least ORPHAN_MIN_AGE_SEC old;
+      (b) the published file is readable, holds >= ORPHAN_ORDER_SWEEPS (3) publications with strictly
+          increasing times, the newest no further ahead of now than a clock-skew margin (ORPHAN_ORDER_MARGIN_SEC),
+          and the newest is fresh (ORPHAN_DRAIN_FRESH_SEC);
+      (c) M has been untouched since BEFORE the oldest of those publications (its updated_at, less a
+          margin) — a marker re-queued inside the window was never in a position to be seen in it;
+      (d) M is in NONE of those publications, neither in `order` nor in `set_aside`.
+    Why this is a PROOF and not a guess: the selection excludes nothing but a retry cooldown, and a cooldown
+    marker is published as set_aside. So a queued marker in neither list was not in the dispatcher's input — a
+    fact about what it could see, true whatever the order is. A P3 marker that sits in `order` behind a stream
+    of newer P0s is working as designed (priority > feature > age, ga-q8tj7p): it is IN the order, so it is
+    never an orphan, however old. The previous proof read the CLAIM order ("a newer marker was claimed while
+    an older one was overdue") and rested on a priority-blind overdue tier that no longer exists.
+    Three states, never two: every input the file cannot establish — missing, not JSON, a different version, a
+    malformed publication, fewer than 3 sweeps (right after a deploy), a stale newest publication (the
+    dispatcher is not running, or exits before computing an order — quiet hours, headroom gate), a clock that
+    steps backwards, a marker whose updated_at is unknown — is "cannot prove": said once an hour for as long
+    as a candidate exists ("orphan-proof unavailable (<reason>)"), never "orphan". A dispatcher that has not
+    been restarted onto the publishing code therefore shows up as "order-unreadable", not as silence.
 
 ON DETECT:
   1. snapshot diagnostics to /tmp/gate-watchdog-diag-<ts>.txt
@@ -142,37 +129,30 @@ HEADOFLINE_LOG_FRESH_SEC = 600 # ignore if dispatcher log is staler than this (t
 # ordinary transient retries on one branch do not trip it.
 HEADOFLINE_NONREPAIR_MIN_SWEEPS = int(os.environ.get("GRW_HOL_NONREPAIR_MIN_SWEEPS", "5"))
 HEADOFLINE_NONREPAIR_LOG_EVERY_SEC = int(os.environ.get("GRW_HOL_NONREPAIR_LOG_EVERY_SEC", "1800"))
-ORPHAN_LOG_FRESH_SEC = 600     # dispatcher log must be live (process still writing) — else ENGINE-STALL's job
-ORPHAN_DRAIN_FRESH_SEC = 1200  # newest COMPLETED sweep within 20min = dispatcher actively draining (not wedged on one run)
-ORPHAN_MIN_AGE_SEC = 1800      # cheap pre-filter ONLY (ga-yprwyk): a head younger than this skips the wide log read. NOT the bar for calling a marker skipped — the proof needs age > the dispatcher's overdue ceiling + ORPHAN_PROOF_MARGIN_SEC (~92min by default; see _orphan_verdict)
+ORPHAN_DRAIN_FRESH_SEC = 1200  # the dispatcher's newest PUBLISHED queue order must be this fresh (20min ~ 6 sweeps at its ~3min cadence): older, and the file describes a dispatcher that is not running or not publishing — 'absent from it' then means nothing
+ORPHAN_MIN_AGE_SEC = 1800      # a queued marker younger than this is not even a candidate (ga-yprwyk's floor, kept): the real bar is the published-order window below
 # ga-b1iulk: orphaned_queued_marker() was BLIND from 15/09 (strict UTF-8 read of the dispatcher log), so its
 # proof was never exercised against today's dispatcher. The first live read after the reader fix flagged
-# ga-b9pz7q (age 3.5h) as orphaned; the dispatcher claimed that very marker ~3min later, in a strict
-# created_at order. The proof — "the head's branch is unmentioned while a NEWER marker's branch is" — assumes
-# the dispatcher works the queue oldest-first one marker per sweep. It does not: it is tiered (quality-gate-
-# dispatcher.sh marker-select: overdue oldest-first → ONE freshest 'reserve' marker → priority authors
-# [aged, then smallest-diff-first] → everyone else [aged, then smallest-diff-first] → rebase-fail — and
-# since ga-q8tj7p it is priority > feature > age with no overdue tier, see _dispatcher_has_overdue_tier), and the
-# branch-name substring also matches an EARLIER attempt of the same branch. On a
-# deep queue every head marker would trip it, and each false positive would hold the single repair-dog slot
-# (MAX_ACTIVE_REPAIR_DOGS) a real gate outage needs. So the repair path is OFF unless explicitly enabled;
+# ga-b9pz7q (age 3.5h) as orphaned; the dispatcher claimed that very marker ~3min later. That proof — "the head's
+# branch is unmentioned while a NEWER marker's branch is" — assumed the dispatcher works the queue oldest-first;
+# it is tiered (and since ga-q8tj7p it is priority > feature > age, so a newer P0 legitimately beats an older P3
+# for as long as P0s keep arriving). Any proof built on CLAIM ORDER is therefore unsound; the proof now rests on
+# the dispatcher's PUBLISHED queue order instead (ga-dtecvq, see the module docstring), which says what the
+# dispatcher SAW, not which marker won. Each false positive would hold the single repair-dog slot
+# (MAX_ACTIVE_REPAIR_DOGS) a real gate outage needs, so the repair path is still OFF unless explicitly enabled;
 # the signal is still logged (once per marker per ORPHAN_LOGONLY_EVERY_SEC).
-# ga-yprwyk: the proof is now marker-id + tier aware (see the module docstring), but the default STAYS 0.
-# ga-9t9acg.13: the head it examines is now the head of the gate's order (the work_order lib), not the FIFO-oldest
-# marker — which is one more reason the default stays 0 until that order is entirely in the lib (see _orphan_head).
 # The acceptance bar for flipping it is an observation, not a unit test: run this detector against the LIVE
-# log through >= 1 complete drain of a deep queue and see ZERO false positives, then flip the default.
+# published order through >= 1 complete drain of a deep queue and see ZERO false positives, then flip the default.
 GRW_ORPHAN_REPAIR_ENABLED = os.environ.get("GRW_ORPHAN_REPAIR_ENABLED", "0") == "1"
 ORPHAN_LOGONLY_EVERY_SEC = int(os.environ.get("GRW_ORPHAN_LOGONLY_EVERY_SEC", "1800"))
-# ga-yprwyk knobs. All are safety margins / read windows for the proof, never a copy of a dispatcher number
-# (the overdue ceiling itself comes from _dispatcher_hard_age()).
-ORPHAN_PROOF_MARGIN_SEC = 120      # a witness claim must land this far PAST the ceiling: the claim line is stamped a hair after the dispatcher's own 'now', at 1s resolution
-ORPHAN_CLAIM_TAIL_LINES = int(os.environ.get("GRW_ORPHAN_CLAIM_TAIL_LINES", "40000"))  # how far back the claim history is read (~1 day at 25/09's ~1.4k lines/h; the 3000-line tail covered only ~1.7h — a 3.5h-old head was never covered)
-ORPHAN_WITNESS_LOOKUPS = 25        # max `bd show` calls per poll to learn a claimed marker's created_at (results are cached: a marker's created_at never changes)
-ORPHAN_TUNABLES_TTL_SEC = 300      # re-derive the dispatcher's overdue ceiling this often
+# ga-dtecvq knobs: the file the dispatcher publishes its queue order to, and how much of it a verdict needs.
+ORPHAN_ORDER_FILE = os.environ.get("GATE_QUEUE_ORDER_FILE") or os.path.join(CITY, ".gc/runtime/gate-queue-order.json")
+try:
+    ORPHAN_ORDER_SWEEPS = max(2, int(os.environ.get("GRW_ORPHAN_ORDER_SWEEPS", "3")))  # consecutive published sweeps a marker must be absent from; one is a snapshot, not a pattern, so never below 2
+except ValueError:
+    ORPHAN_ORDER_SWEEPS = 3
+ORPHAN_ORDER_MARGIN_SEC = 60       # slack between the dispatcher's sweep clock and bd's updated_at (1s resolution each, set by different processes); a marker must have been untouched this long BEFORE the window's first publication
 ORPHAN_NOTE_EVERY_SEC = 3600       # a "cannot prove" note (proof unavailable) is printed at most this often per reason
-DISPATCHER_SRC = os.path.join(CITY, "packs/town-deltas/assets/quality-gate-dispatcher.sh")   # the file launchd runs (`ps` shows this exact path)
-DISPATCHER_LAUNCHD_LABEL = "com.gascity.quality-gate-dispatcher"
 WAKE_COOLDOWN_SEC = int(os.environ.get("WAKE_COOLDOWN_SEC", "1200"))   # base: don't dispatch a new repair for the SAME condition more than once per 20min
 ESCALATE_AFTER_WAKES = int(os.environ.get("ESCALATE_AFTER_WAKES", "2"))  # after N unresolved repair-cycles for one condition, page Athos 🚨
 
@@ -844,7 +824,7 @@ def _read_log_last_lines(path, n_lines):
     on 15/09) used to raise UnicodeDecodeError out of readlines(), which each caller's
     `except Exception` turned into its neutral answer: last_pass_epoch() == 0 ('never passed', with
     13 'Gate PASSED' inside the 4000 lines it reads — 769 in the file, 25/09), recent_timeouts() == (0, None), stuck_dispatching()/gate_infra_throttled()
-    == False, _dispatcher_log_state() == ([], "", False) ('log not fresh').
+    == False.
 
     Built on _read_log_tail_lines(), which drops the partial first line of a tail read; the byte
     window is grown x4 until it yields >= n_lines whole lines or covers the whole file. Lines come
@@ -1062,25 +1042,16 @@ def frozen_reviewer_run_verdict(pending_names, killed_identities):
     return "supersede"
 
 
-def _queued_markers():
-    """[(id, branch, created_epoch, labels, src_ref), ...] for every OPEN gate-status:queued
-    marker (labels: a tuple of the marker's label strings, ga-yprwyk; src_ref: (source bead id, rig) or None,
-    ga-9t9acg.13). --all is required to surface the normally-hidden gate-marker type,
-    but it also lifts bd's default closed-issue hiding — so a marker closed via
-    the ad-hoc withdrawal path (e.g. "WITHDRAWN as duplicate") that kept its
-    gate-status:queued label would otherwise be indistinguishable from a
-    genuinely stuck open one. Filtered at both the query (--status) and parse
-    (status check) layers, since a future query refactor could silently drop
-    the CLI flag (ga-huke4). Returns [] on any error (fail-safe: no markers →
-    no orphan fire). A caller that must tell 'could not read' from 'none queued'
-    uses _queued_markers_read() instead — this wrapper deliberately collapses them."""
-    return _queued_markers_read() or []
-
-
 def _queued_markers_read():
-    """_queued_markers()'s rows, or None when the marker list could NOT be read (bd failed, timed out, or
-    returned something that is not JSON). [] means the read succeeded and no open marker is queued — a
-    different fact from None, which says nothing about the queue (ga-clexh7)."""
+    """[(id, branch, created_epoch, labels, updated_epoch), ...] for every OPEN gate-status:queued marker (labels: a
+    tuple of the marker's label strings; updated_epoch: None when updated_at is missing/unparseable), or None when the
+    marker list could NOT be read (bd failed, timed out, or returned something that is not JSON). [] means the read
+    succeeded and no open marker is queued — a different fact from None, which says nothing about the queue (ga-clexh7).
+    --all is required to surface the normally-hidden gate-marker type, but it also lifts bd's default closed-issue
+    hiding — so a marker closed via the ad-hoc withdrawal path (e.g. "WITHDRAWN as duplicate") that kept its
+    gate-status:queued label would otherwise be indistinguishable from a genuinely stuck open one. Filtered at both the
+    query (--status) and parse (status check) layers, since a future query refactor could silently drop the CLI flag
+    (ga-huke4)."""
     # --include-infra é OBRIGATÓRIO (Mayor, 07/08): o bd 1.1.0 classifica bead
     # `--ephemeral` como INFRA e o OMITE de `bd list` por padrão. Markers de gate
     # nasciam ephemeral, então ESTE watchdog — cujo trabalho é justamente detectar
@@ -1109,512 +1080,184 @@ def _queued_markers_read():
             if m:
                 branch = m.group(1)
                 break
-        # ga-yprwyk: the labels ride along — the orphan proof must know whether a rebase-fail / exile /
-        # retry-cooldown label legitimately sinks this marker in the dispatcher's tier order.
-        # ga-9t9acg.13: so does the SOURCE BEAD the marker names (id, rig) — the gate orders by that bead's priority
-        # and type, never by the marker's own (always P2/chore), so the queue head cannot be told without it.
+        # ga-dtecvq: updated_at rides along — the orphan proof only counts a marker as unseen for a window of sweeps
+        # it was already queued, unchanged, at the start of (a re-queue inside the window restarts the clock).
         out.append((row.get("id"), branch, _iso_epoch(row.get("created_at")), tuple(row.get("labels") or ()),
-                    _marker_src_ref(row)))
+                    _iso_epoch(row.get("updated_at"))))
     return out
 
 
-def _dispatcher_log_state(tail=3000):
-    """(sweep_complete_epochs, log_text, log_fresh) for the dispatcher log.
-
-    sweep_complete_epochs: every 'sweep complete' timestamp in the tail (used to
-      judge whether the dispatcher is actively DRAINING vs wedged on one run).
-    log_text: the joined tail (scanned for branch mentions — substring match).
-    log_fresh: the log file was written within ORPHAN_LOG_FRESH_SEC (process alive)."""
-    try:
-        fresh = time.time() - os.path.getmtime(DISPATCH_LOG) <= ORPHAN_LOG_FRESH_SEC
-        lines = _read_log_last_lines(DISPATCH_LOG, tail)    # ga-b1iulk: strict read gave ([], "", False) on a live log
-    except Exception:
-        return ([], "", False)
-    epochs = []
-    for l in lines:
-        if "sweep complete" in l:
-            e = log_ts_epoch(l)
-            if e:
-                epochs.append(e)
-    # _read_log_last_lines() strips each line's newline; put it back so two adjacent lines can
-    # never fuse into one substring (a branch name straddling the join would be a false 'mentioned').
-    return (epochs, "".join(l + "\n" for l in lines), fresh)
-
-
-# ---- ga-yprwyk: orphan proof keyed on the MARKER ID and on the dispatcher's tier order -----------------------
-# quality-gate-dispatcher.sh logs exactly one 'Attempting to claim marker <id> ...' line per selection, right
-# after its marker-select block. The id is unique per marker (a fresh /gate-done mints a NEW id), so — unlike the
-# branch-name substring the ga-b1iulk detector used — it cannot match an EARLIER attempt of the same branch.
-DISPATCH_CLAIM_RE = re.compile(
-    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[quality-gate-dispatcher\] Attempting to claim marker (\S+) \.\.\.\s*$")
-DISPATCH_LINE_TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[")
-# Labels that legitimately sink a marker in the dispatcher's tier order. Broader than the dispatcher's own
-# has_rebase_fail regex on purpose (rebase-attempt | exiled-tier5, plus their companions rebase-fail-count /
-# exiled-since): on doubt, a marker that looks explained is NOT called an orphan.
-ORPHAN_SINK_LABEL_RE = re.compile(r"^gate:(rebase-|exiled-)")
-ORPHAN_COOLDOWN_LABEL_RE = re.compile(r"^gate:retry-cooldown-until:(\d+)$")
-# The two lines of the dispatcher's marker-select preamble the overdue ceiling is derived from.
-_DISPATCHER_PROMOTE_RE = re.compile(
-    r'^GATE_MARKER_AGE_PROMOTE_SECONDS="\$\{GATE_MARKER_AGE_PROMOTE_SECONDS:-(\d+)\}"', re.M)
-_DISPATCHER_HARD_MULT_RE = re.compile(
-    r'^GATE_MARKER_HARD_AGE_SECONDS="\$\{GATE_MARKER_HARD_AGE_SECONDS:-\$\(\(GATE_MARKER_AGE_PROMOTE_SECONDS \* (\d+)\)\)\}"', re.M)
-_LAUNCHD_TUNABLE_RE = re.compile(
-    r"^\s*(GATE_MARKER_AGE_PROMOTE_SECONDS|GATE_MARKER_HARD_AGE_SECONDS) => (.*?)\s*$", re.M)
-
-# ga-q8tj7p: the ONE fact the orphan proof rests on — a priority-blind, oldest-first overdue tier in the
-# dispatcher's marker-select (its jq `def is_overdue:`). The proof is only valid while that tier exists.
-_DISPATCHER_OVERDUE_TIER_RE = re.compile(r"^\s*def is_overdue:", re.M)
-_ORDER_PREMISE_CACHE = {"at": 0.0, "value": None}
-
-_HARD_AGE_CACHE = {"at": 0.0, "value": None}
-# ga-9t9acg.13: a source bead id as the dispatcher accepts it (quality-gate-dispatcher.sh `src_bead`): the id goes onto a
-# `bd show` command line and a marker's text is worker-written, so anything else (e.g. "--all") is "no source bead".
-_SRC_BEAD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-_MARKER_CREATED_CACHE = {}    # marker id -> created epoch; a marker's created_at never changes, so this never goes stale
+# ---- ga-dtecvq: orphan proof keyed on the dispatcher's PUBLISHED queue order --------------------------------
+# quality-gate-dispatcher.sh publishes, for every sweep that computes an order, what it computed
+# (packs/town-deltas/assets/gate-queue-order-publish.lib.sh):
+#   {"v":1,"pubs":[{"at":<epoch>,"order":[{"id":..,"class":..},..],"set_aside":[<id>,..]}, ..]}     oldest first
+# `order` is the queue as ordered (priority > feature > age since ga-q8tj7p); `set_aside` is what the selection excluded
+# (retry cooldown). A queued marker in NEITHER, sweep after sweep, is not "low priority" — the dispatcher never saw it.
+# That is a fact about the dispatcher's INPUT, so it holds whatever the order is, and it is the only thing proven here:
+# a marker that IS in the order and keeps losing to newer ones is a priority outcome, never an orphan.
 _ORPHAN_NOTED = {}            # reason -> last time its "cannot prove" note was printed
 _ORPHAN_EVIDENCE = {}         # marker id -> why the last detection called it an orphan (read by main()'s log line)
 
 
-def _dispatcher_claims(lines):
-    """Every dispatcher claim in `lines` as [(epoch, marker_id), ...], in log order.
-
-    Anchored to the dispatcher's own '[timestamp] [quality-gate-dispatcher]' prefix: the log also carries
-    multi-line reviewer output, and a quoted 'Attempting to claim marker ...' inside it is not a claim."""
-    out = []
-    for l in lines:
-        mm = DISPATCH_CLAIM_RE.match(l)
-        if not mm:
-            continue
-        e = log_ts_epoch(l)
-        if e:
-            out.append((e, mm.group(2)))
-    return out
-
-
-def _log_first_epoch(lines):
-    """Epoch of the first well-formed dispatcher-log line in `lines` — how far back the read really reaches
-    (None when no line carries a timestamp: the reach is then UNKNOWN, never assumed)."""
-    for l in lines:
-        if DISPATCH_LINE_TS_RE.match(l):
-            e = log_ts_epoch(l)
-            if e:
-                return e
-    return None
-
-
-def _dispatcher_hard_age_from(src_text, launchd_text):
-    """The dispatcher's overdue ceiling in seconds, from its source + its launchd environment; None if either
-    cannot be read or the source no longer has the shape this parses (an UNKNOWN ceiling must never become a guess).
-
-    Mirrors the preamble of quality-gate-dispatcher.sh's marker-select block:
-      GATE_MARKER_AGE_PROMOTE_SECONDS=${...:-1800}      (non-numeric / empty  -> the default)
-      GATE_MARKER_HARD_AGE_SECONDS=${...:-PROMOTE * 3}  (non-numeric / empty  -> PROMOTE * 3)
-    `launchctl print` lists inherited, default and job environment in that order, so the LAST occurrence of a
-    key is the one the job runs with."""
-    if not src_text or launchd_text is None:
-        return None
-    pm = _DISPATCHER_PROMOTE_RE.search(src_text)
-    hm = _DISPATCHER_HARD_MULT_RE.search(src_text)
-    if not pm or not hm:
-        return None
-    promote, mult = int(pm.group(1)), int(hm.group(1))
-    env = {}
-    for key, val in _LAUNCHD_TUNABLE_RE.findall(launchd_text):
-        env[key] = val
-    def _numeric(v):
-        return v is not None and re.fullmatch(r"[0-9]+", v) is not None
-    if _numeric(env.get("GATE_MARKER_AGE_PROMOTE_SECONDS")):
-        promote = int(env["GATE_MARKER_AGE_PROMOTE_SECONDS"])
-    if _numeric(env.get("GATE_MARKER_HARD_AGE_SECONDS")):
-        return int(env["GATE_MARKER_HARD_AGE_SECONDS"])
-    return promote * mult
-
-
-def _dispatcher_has_overdue_tier_from(src_text):
-    """THREE states, never two: True = the dispatcher's marker-select block still defines the priority-blind
-    overdue tier (`def is_overdue:`) the orphan proof rests on; False = the source was read, the block is there,
-    and the tier is not; None = it could not be established (empty source, or the sentinel-delimited block has
-    moved/been renamed). None must not read as "gone" (that would switch a working detector off on a hiccup) nor
-    as "present" (that would trust a premise nobody checked) — the caller keeps its pre-ga-q8tj7p behaviour."""
-    if not src_text:
-        return None
-    b = src_text.find("# SELFTEST-EXTRACT marker-select: BEGIN")
-    e = src_text.find("# SELFTEST-EXTRACT marker-select: END")
-    if b < 0 or e < b:
-        return None
-    return _DISPATCHER_OVERDUE_TIER_RE.search(src_text, b, e) is not None
-
-
-def _dispatcher_has_overdue_tier(now=None):
-    """Cached _dispatcher_has_overdue_tier_from() over the live dispatcher source. Only a definite answer is cached;
-    an unreadable source is re-tried on the next poll."""
-    now = time.time() if now is None else now
-    if _ORDER_PREMISE_CACHE["value"] is not None and now - _ORDER_PREMISE_CACHE["at"] < ORPHAN_TUNABLES_TTL_SEC:
-        return _ORDER_PREMISE_CACHE["value"]
-    try:
-        with open(DISPATCHER_SRC, encoding="utf-8", errors="replace") as f:
-            src = f.read()
-    except Exception:
-        src = ""
-    val = _dispatcher_has_overdue_tier_from(src)
-    if val is not None:
-        _ORDER_PREMISE_CACHE["at"], _ORDER_PREMISE_CACHE["value"] = now, val
-    return val
-
-
-def _dispatcher_hard_age(now=None):
-    """Cached _dispatcher_hard_age_from() over the live dispatcher source + `launchctl print` of its job."""
-    now = time.time() if now is None else now
-    if _HARD_AGE_CACHE["value"] is not None and now - _HARD_AGE_CACHE["at"] < ORPHAN_TUNABLES_TTL_SEC:
-        return _HARD_AGE_CACHE["value"]
-    try:
-        with open(DISPATCHER_SRC, encoding="utf-8", errors="replace") as f:
-            src = f.read()
-    except Exception:
-        src = ""
-    r = sh(["launchctl", "print", "gui/%d/%s" % (os.getuid(), DISPATCHER_LAUNCHD_LABEL)], timeout=10)
-    launchd = r.stdout if (r is not None and r.returncode == 0) else None
-    val = _dispatcher_hard_age_from(src, launchd)
-    if val is not None:
-        _HARD_AGE_CACHE["at"], _HARD_AGE_CACHE["value"] = now, val
-    return val
-
-
-def _marker_created_epoch(mid):
-    """created_at epoch of marker `mid` (any status, closed included) via the cached bd read shim, or None when it
-    cannot be learned. Only successes are cached: a failed read is retried on the next poll."""
-    if mid in _MARKER_CREATED_CACHE:
-        return _MARKER_CREATED_CACHE[mid]
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "show", mid, "--json"], timeout=25)
-    if not r or r.returncode != 0:
-        return None
-    try:
-        rows = json.loads(r.stdout)
-    except Exception:
-        return None
-    row = rows[0] if isinstance(rows, list) and rows else (rows if isinstance(rows, dict) else None)
-    if not isinstance(row, dict) or row.get("id") != mid:
-        return None
-    e = _iso_epoch(row.get("created_at"))
-    if e is not None:
-        if len(_MARKER_CREATED_CACHE) >= 4096:
-            _MARKER_CREATED_CACHE.clear()
-        _MARKER_CREATED_CACHE[mid] = e
-    return e
-
-
-def _orphan_note(reason, msg, now=None, kind="orphan-proof unavailable"):
+def _orphan_note(reason, msg, now=None):
     """Print a 'the proof is unavailable' note, at most once per ORPHAN_NOTE_EVERY_SEC per reason. A detector
-    that goes quiet because it CANNOT decide must say so — silence would read as 'no orphan' (ga-b1iulk).
-    `kind` names the state when it is not 'unavailable' (ga-9t9acg.13: a queue whose order was told but with some
-    source classes unreadable is degraded, not unavailable — and still must not be silent)."""
+    that goes quiet because it CANNOT decide must say so — silence would read as 'no orphan' (ga-b1iulk)."""
     now = time.time() if now is None else now
     if now - _ORPHAN_NOTED.get(reason, 0) >= ORPHAN_NOTE_EVERY_SEC:
-        print("[watchdog] %s (%s): %s" % (kind, reason, msg), flush=True)
+        print("[watchdog] orphan-proof unavailable (%s): %s" % (reason, msg), flush=True)
         _ORPHAN_NOTED[reason] = now
 
 
-def _marker_fields(m):
-    """(id, branch, created_epoch, labels) from a queued-marker tuple; labels is None when the tuple carries none
-    (an old-shape 3-tuple) — the proof then cannot rule the sink labels out, so it stays silent."""
-    labels = tuple(m[3]) if len(m) > 3 and m[3] is not None else None
-    return (m[0], m[1], m[2], labels)
-
-
-def _marker_src_ref(row):
-    """(source bead id, rig name) of a queued-marker row — read the way the dispatcher reads it (description line
-    first, label second; quality-gate-dispatcher.sh `_GATE_SRC_JQ_DEFS`) — or None when the marker names no valid
-    source bead. rig is '' when none is named ('unknown' in the description counts as none). ga-9t9acg.13.
-    Never raises: _queued_markers_read() also serves the live head-of-line check, and a row this cannot read is
-    simply a marker with no readable source (the 'unreadable' state of _marker_source_classes), not a crash."""
-    try:
-        desc = row.get("description")
-        desc = desc if isinstance(desc, str) else ""
-        labels = [lb for lb in (row.get("labels") or []) if isinstance(lb, str)]
-
-        def field(key):
-            mm = re.search(r"(?:^|\n)" + key + r":[ ]*([^\n]*)", desc)
-            return mm.group(1).strip() if mm else ""
-        bead = field("bead_id") or next((lb[len("source-bead:"):] for lb in labels if lb.startswith("source-bead:")), "")
-        if not _SRC_BEAD_ID_RE.fullmatch(bead):
+def _published_sweep(p):
+    """One publication as {"at", "ids", "n_order", "n_aside"}, or None when it is not the documented shape. `ids` is
+    every marker the dispatcher SAW that sweep (ordered or set aside)."""
+    if not isinstance(p, dict):
+        return None
+    at, order, aside = p.get("at"), p.get("order"), p.get("set_aside")
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not (0 < at < 1e11):   # NaN/inf fail the chain
+        return None
+    if not isinstance(order, list) or not isinstance(aside, list):
+        return None
+    ids = set()
+    for e in order:
+        if not isinstance(e, dict) or not isinstance(e.get("id"), str) or not e["id"]:
             return None
-        rig = field("bead_rig")
-        if not rig or rig == "unknown":
-            rig = next((lb[len("bead-rig:"):] for lb in labels if lb.startswith("bead-rig:")), "")
-        return (bead, rig)
-    except Exception:
-        return None
+        ids.add(e["id"])
+    for i in aside:
+        if not isinstance(i, str) or not i:
+            return None
+        ids.add(i)
+    return {"at": float(at), "ids": frozenset(ids), "n_order": len(order), "n_aside": len(aside)}
 
 
-def _marker_source_classes(markers):
-    """{marker id: {"priority": p, "type": t}} for every queued marker whose SOURCE bead could be READ — the two
-    fields the gate orders by (quality-gate-dispatcher.sh Step 0b-1, ga-q8tj7p). The marker's own priority/type say
-    nothing: a live marker is P2/chore whatever it carries (26 of 26, 2026-10-07).
-
-    A marker ABSENT from the answer is UNREADABLE — no valid source bead named, the bead is in none of its candidate
-    stores, or every read of them failed. That is a third state, not 'no priority': the ordering library keeps such a
-    marker at the END of the order and warns (as the gate does) — never P0, never dropped. An empty dict therefore
-    means 'nothing could be read', not 'nobody has a priority'. Priority 0 is kept as 0: `.get`, never `or`.
-
-    Candidate stores, in the dispatcher's order: the bead's rig, the rig its id prefix names, the city; one `bd show`
-    per store per pass (three passes), a partial miss is asked of the next store. Reads go through BD_LIST_CACHED, the
-    same read-cache shim the queue read uses (it publishes only successful answers)."""
-    ref_of = {}
-    for mk in markers:
-        ref = mk[4] if len(mk) > 4 else None
-        if mk[0] and ref:
-            ref_of[mk[0]] = ref
-    if not ref_of:
-        return {}
-    cands = {}
-    for bead, rig in ref_of.values():
-        if bead not in cands:
-            stores = []
-            # the rig registry is the file's own (_rig_paths, ~10 min cache; {} when `gc rig list` fails — the city is
-            # still asked). The dispatcher matches a rig by name OR prefix, so the named rig is tried as both.
-            for st in ((_rig_paths().get(rig) or _rig_path_by_prefix(rig)) if rig else None,
-                       _rig_path_by_prefix(_bead_id_prefix(bead)), CITY):
-                if st and st not in stores:
-                    stores.append(st)
-            cands[bead] = stores
-    classes = {}
-    for p in range(3):
-        by_store = {}
-        for bead, stores in cands.items():
-            if bead not in classes and p < len(stores):
-                by_store.setdefault(stores[p], []).append(bead)
-        for store, ids in by_store.items():
-            r = sh(["bash", BD_LIST_CACHED, "-C", store, "show"] + ids + ["--json"], timeout=25)
-            if not r or r.returncode != 0:
-                continue
-            try:
-                rows = json.loads(r.stdout)
-            except Exception:
-                continue
-            if not isinstance(rows, list):
-                continue
-            for row in rows:
-                if isinstance(row, dict) and row.get("id") in ids:
-                    classes[row["id"]] = {"priority": row.get("priority"), "type": row.get("issue_type")}
-    return dict((mid, classes[bead]) for mid, (bead, _rig) in ref_of.items() if bead in classes)
-
-
-def _orphan_pool(markers, sweep_epochs, now, min_age):
-    """The cheap gates of the head test, run BEFORE any source bead is read: [(id, branch, created_epoch, labels)] for
-    every queued marker that has an id, a branch and a creation time — iff the dispatcher is actively draining AND at
-    least one of them is `min_age` old (the head cannot be older than the oldest marker, so none old enough means no
-    candidate) — else None."""
-    if not sweep_epochs:
-        return None
-    if now - max(sweep_epochs) > ORPHAN_DRAIN_FRESH_SEC:
-        return None  # newest completed sweep is stale: the dispatcher is wedged on its CURRENT run — a different failure mode
-    valid = []
-    for mk in markers:
-        mid, branch, created, labels = _marker_fields(mk)
-        if mid and branch and created:
-            valid.append((mid, branch, created, labels))
-    if not valid or not any(now - v[2] >= min_age for v in valid):
-        return None
-    return valid
-
-
-def _gate_order_head(valid, src_class):
-    """The first of `valid` in the town's ONE ordering — priority > feature > age, the work_order library — or None
-    when that order cannot be told. The consumer does not sort: it hands the library the gate's own fields (the
-    source bead's priority/type from `src_class`, ga-q8tj7p; the marker's created_at as the age of the SUBMISSION to
-    the gate, `--age field`, which is what the gate's `created_key` is) and takes its first (ga-9t9acg.13).
-
-    THREE states, never two. (1) Ordered: its first. (2) Ordered, with a source class unreadable: the library keeps
-    that marker at the END and warns — the gate does the same — and the warning is printed (rate-limited), because a
-    queue ordered by age alone would otherwise look like a queue ordered by the rule. (3) The library cannot tell
-    (missing, failed, bad answer): the head is UNKNOWN -> None with a note. NOT a fall back to the oldest marker:
-    that is the very order this replaces, and a detector that cannot tell the head must not name one."""
-    beads = []
-    for mid, _branch, created, _labels in valid:
-        b = {"id": mid, "_wo_age": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created))}
-        cls = (src_class or {}).get(mid)
-        if isinstance(cls, dict):
-            b["priority"], b["issue_type"] = cls.get("priority"), cls.get("type")
-        beads.append(b)
+def _read_published_orders(path=None):
+    """(pubs, why): the dispatcher's published sweeps, oldest first, or (None, why) when the file cannot be read
+    AS the documented format. Missing, unreadable, not JSON, a different version or a malformed publication are all
+    None — a file that cannot be understood says nothing about the queue, and None must never read as 'no marker
+    was seen' (an empty `pubs` list is a different fact: a readable file with no sweep in it)."""
+    path = path or ORPHAN_ORDER_FILE
     try:
-        import work_order      # lazily: a missing module is 'cannot tell' (state 3), not a watchdog that no longer starts
-        ordered, warns = work_order.sort_beads(beads, age="field")
-    except Exception as e:
-        ordered, warns = None, ["work_order unavailable: %r" % (e,)]
-    by_id = dict((v[0], v) for v in valid)
-    if not ordered or not isinstance(ordered[0], dict) or ordered[0].get("id") not in by_id:
-        _orphan_note("order-unknown", "the ordering library could not tell the order of the %d queued marker(s) (%s) — the "
-                     "queue head is UNKNOWN, so no marker can be called skipped this poll (it is never read as the oldest one)"
-                     % (len(valid), (warns[0] if warns else "no reason given")[:300]))
-        return None
-    if warns:
-        shown = "; ".join(w.replace("work-order WARN: ", "", 1) for w in warns[:8]) + (" (+%d more)" % (len(warns) - 8) if len(warns) > 8 else "")
-        _orphan_note("order-warn", "the queue was ordered, but the library reported: %s — a marker whose source bead could not "
-                     "be read sorts after every readable one, as in the gate" % shown, kind="gate-order degraded")
-    return by_id[ordered[0]["id"]]
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return (None, "no queue-order file at %s — the dispatcher has not published one" % path)
+    except OSError as e:
+        return (None, "cannot read %s: %r" % (path, e))
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except ValueError:                                       # includes UnicodeDecodeError
+        return (None, "%s is not valid JSON" % path)
+    if not isinstance(doc, dict) or doc.get("v") != 1 or not isinstance(doc.get("pubs"), list):
+        return (None, "%s is not a version-1 queue-order document" % path)
+    pubs = []
+    for i, p in enumerate(doc["pubs"]):
+        s = _published_sweep(p)
+        if s is None:
+            return (None, "publication #%d in %s is malformed" % (i, path))
+        pubs.append(s)
+    return (pubs, "")
 
 
-def _orphan_head(markers, sweep_epochs, now, min_age, src_class=None):
-    """The head of the gate's queue — the marker the town's ordering (priority > feature > age) puts first, see
-    _gate_order_head — iff the dispatcher is actively draining and that marker is at least `min_age` old; else None.
-    Only the head is ever a candidate: everything behind it is blocked by it, not skipped (wa-68su / ga-te7es: the
-    recurring 'a #2 marker flagged while the older head was being gated' false positive). `src_class` is
-    {marker id: {"priority", "type"}} from _marker_source_classes(); a marker missing from it is unreadable.
-
-    WHAT THIS IS NOT (ga-9t9acg.13): the gate's whole cascade. The library has no `impacto:dano-ao-vivo` exception (a P0
-    bug before the P0 features, ga-emgkvn; porting it is ga-9t9acg.14), no 'exile overdue first / rebase-fail last /
-    cooldown excluded' placement, and it reads a bead without a usable priority as unreadable where the gate reads P2.
-    The watchdog does NOT reimplement those — one ordering rule, not two — so on a queue that exercises them this head
-    can differ from the gate's. That is safe here for two reasons: _orphan_verdict applies its own veto to a head that
-    carries a sink label (the states that move a marker in the gate's order), and the orphan repair stays OFF
-    (GRW_ORPHAN_REPAIR_ENABLED defaults 0; orphaned_queued_marker() returns before this while the dispatcher has no
-    overdue tier). The decision of this slice is: leave it OFF until the gate's order is entirely in the library
-    (ga-dtecvq rebuilds the proof on that order). Were an overdue tier to return, the old proof stays sound with this
-    head — a claim of a marker created AFTER an overdue, healthy, queued one contradicts a priority-blind oldest-first
-    tier whichever marker is called the head — it only looks at fewer markers (a young head hides an older overdue one)."""
-    valid = _orphan_pool(markers, sweep_epochs, now, min_age)
-    if valid is None:
-        return None
-    head = _gate_order_head(valid, src_class)
-    if head is None or now - head[2] < min_age:
-        return None
-    return head
+def _orphan_candidates(markers, now, min_age):
+    """[(id, branch, created_epoch, updated_epoch)] for the queued markers old enough to be worth a proof. `updated`
+    is None when the marker row carries none (an old-shape tuple, or an unparseable updated_at)."""
+    out = []
+    for m in markers:
+        mid, branch, created = m[0], m[1], m[2]
+        updated = m[4] if len(m) > 4 else None
+        if mid and branch and created and now - created >= min_age:
+            out.append((mid, branch, created, updated))
+    return out
 
 
-def _cooldown_covers(labels, t):
-    """True iff a gate:retry-cooldown-until:<epoch> label with epoch > t is present — the dispatcher excludes a marker
-    from EVERY tier while `$now < retry_cooldown_until` (its `in_retry_cooldown`), so a claim at t proves nothing."""
-    for lb in labels:
-        mm = ORPHAN_COOLDOWN_LABEL_RE.match(lb)
-        if mm and int(mm.group(1)) > t:
-            return True
-    return False
+def _orphan_verdict(markers, pubs, why, now, sweeps=None, min_age=None, fresh_sec=None, margin=None):
+    """Decide whether a queued marker is INVISIBLE to the dispatcher. Returns (orphan, reason, detail): orphan is
+    (id, branch, age_sec) or None; reason is a short code for the outcome (the caller notes only the 'cannot prove'
+    ones); detail is the evidence for 'orphan' and the explanation for a 'cannot prove'.
 
-
-def _orphan_verdict(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now, src_class=None):
-    """Decide whether the HEAD queued marker (see _orphan_head) was SKIPPED by the dispatcher. Returns (orphan, reason, evidence):
-    orphan is (id, branch, age_sec) or None; reason is a short code for the outcome (the caller notes only the
-    'cannot prove' ones); evidence says WHY it is an orphan.
-
-    A skip is provable only for an OVERDUE head, because tier 1 of the dispatcher's marker-select — priority-blind,
-    oldest-first over every overdue healthy marker — guarantees it would be picked before any newer marker. See the
-    module docstring for the full signature and for why a young head can never be proven skipped.
-
-      claims          [(epoch, marker_id), ...] every dispatcher claim in the log read (any order)
-      log_first_epoch how far back that read reaches — the proof needs the head's WHOLE life, so it must reach
-                      back to before the head was created (else an earlier claim could sit outside the window:
-                      a marker claimed, then re-queued, is not an orphan)
-      hard_age        the dispatcher's overdue ceiling in seconds (None = unknown -> no proof)
-      created_of      marker_id -> created epoch or None (a claimed marker is usually no longer queued)"""
-    if hard_age is None:
-        return (None, "tunables", "")
-    head = _orphan_head(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC, src_class=src_class)
-    if head is None:
+    A marker is an orphan only when ALL hold:
+      - it is queued and old enough (min_age) — a marker younger than that has not had a sweep to be seen in;
+      - the published order is readable, holds >= `sweeps` publications with strictly increasing times, the newest no
+        further ahead of now than `margin` (clock skew between two processes is tolerated, a clock that stepped back
+        is not), and the newest is fresh (else the file describes a dispatcher that is not running or not publishing,
+        and 'absent from it' means nothing);
+      - the marker has been untouched since BEFORE the oldest of those `sweeps` publications (its updated_at, less a
+        margin) — a marker that was re-queued after the window began was never in a position to be seen in it;
+      - it is in NONE of those publications, ordered or set aside.
+    Every other case is a non-verdict. The ones where the proof itself is unavailable carry a reason other than
+    'no-orphan' (the caller says so); a candidate touched inside the window, or one the dispatcher saw, is 'no-orphan'."""
+    sweeps = ORPHAN_ORDER_SWEEPS if sweeps is None else sweeps
+    min_age = ORPHAN_MIN_AGE_SEC if min_age is None else min_age
+    fresh_sec = ORPHAN_DRAIN_FRESH_SEC if fresh_sec is None else fresh_sec
+    margin = ORPHAN_ORDER_MARGIN_SEC if margin is None else margin
+    cands = _orphan_candidates(markers, now, min_age)
+    if not cands:
         return (None, "no-candidate", "")
-    mid, branch, created, labels = head
-    threshold = created + hard_age + ORPHAN_PROOF_MARGIN_SEC
-    if now <= threshold:
-        return (None, "young", "")
-    if labels is None:
-        return (None, "labels-unknown", "")
-    if any(ORPHAN_SINK_LABEL_RE.match(lb) for lb in labels):
-        return (None, "sunk-by-label", "")
-    if log_first_epoch is None or log_first_epoch > created:
-        return (None, "log-coverage", "")
-    if any(xid == mid for (_t, xid) in claims):
-        return (None, "claimed", "")
-    for (t, xid) in sorted(claims, reverse=True):     # newest first: a real orphan is skipped on EVERY sweep
-        if t <= threshold:
-            break                                      # older claims cannot witness: the head was not yet provably overdue
-        if xid == mid or _cooldown_covers(labels, t):
-            continue
-        xc = created_of(xid)
-        if xc is not None and xc > created:
-            evidence = ("never claimed in the dispatcher log since it was created (log read back to %s); at %s the "
-                        "dispatcher claimed %s (created %s) — AFTER this marker — while it was already past the %ds "
-                        "overdue ceiling (tier 1 is oldest-first over every overdue healthy marker, so a newer one "
-                        "cannot win while an older one is eligible)"
-                        % (time.strftime("%m-%d %H:%M", time.localtime(log_first_epoch)),
-                           time.strftime("%m-%d %H:%M:%S", time.localtime(t)), xid,
-                           time.strftime("%m-%d %H:%M:%S", time.localtime(xc)), hard_age))
-            return ((mid, branch, int(now - created)), "orphan", evidence)
-    return (None, "no-witness", "")
+    if pubs is None:
+        return (None, "order-unreadable", why)
+    if len(pubs) < sweeps:
+        return (None, "short-history", "%d publication(s) on file, %d consecutive sweeps needed" % (len(pubs), sweeps))
+    win = pubs[-sweeps:]
+    ats = [p["at"] for p in win]
+    if any(b <= a for a, b in zip(ats, ats[1:])) or ats[-1] > now + margin:
+        return (None, "clock", "the last %d publication times are not strictly increasing, or the newest is more than %ds ahead of now" % (sweeps, margin))
+    if now - ats[-1] > fresh_sec:
+        return (None, "stale", "the newest publication is %dmin old (limit %dmin)" % ((now - ats[-1]) // 60, fresh_sec // 60))
+    found = []
+    for (mid, branch, created, updated) in cands:
+        if updated is None or updated + margin > ats[0]:
+            continue                                         # unknown, or touched since the window began
+        if any(mid in p["ids"] for p in win):
+            continue                                         # the dispatcher saw it: its place in the order is a priority outcome
+        found.append((created, mid, branch, updated))
+    if not found:
+        if any(c[3] is None for c in cands):
+            return (None, "updated-unknown", "a queued marker's updated_at could not be read, so it cannot be shown untouched since the window began")
+        return (None, "no-orphan", "")
+    found.sort()
+    created, mid, branch, updated = found[0]
+    fmt = lambda t: time.strftime("%m-%d %H:%M:%S", time.localtime(t))
+    detail = ("absent from the dispatcher's published queue order (ordered or set aside) in each of its last %d sweeps "
+              "(%s .. %s; they ordered %s marker(s) and set aside %s) although it has been queued and untouched since %s "
+              "(age %dmin) — the dispatcher never saw it, whatever its priority%s"
+              % (sweeps, fmt(ats[0]), fmt(ats[-1]), "/".join(str(p["n_order"]) for p in win),
+                 "/".join(str(p["n_aside"]) for p in win), fmt(updated), (now - created) // 60,
+                 "" if len(found) == 1 else "; %d more queued marker(s) are invisible the same way" % (len(found) - 1)))
+    return ((mid, branch, int(now - created)), "orphan", detail)
 
 
-def _detect_orphan_markers(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now, evidence=None, src_class=None):
-    """Pure core of orphaned_queued_marker() (separated for the selftest): [(id, branch, age_sec)] — the queue-head
-    marker when the dispatcher provably skipped it, else []. If `evidence` is a dict it receives {id: why}.
-    See _orphan_verdict() for the proof and the module docstring for the signature."""
-    orphan, _reason, why = _orphan_verdict(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now, src_class=src_class)
-    if orphan is None:
-        return []
-    if evidence is not None:
-        evidence[orphan[0]] = why
-    return [orphan]
+_ORPHAN_NOTES = {
+    "order-unreadable": "the dispatcher's published queue order cannot be read",
+    "short-history": "too few published sweeps to prove a marker invisible",
+    "clock": "the published sweep times cannot be trusted",
+    "stale": "the dispatcher is not publishing its queue order",
+    "updated-unknown": "a queued marker's age since its last change is unknown",
+}
 
 
 def orphaned_queued_marker():
-    """Detect the head gate-status:queued marker the dispatcher provably SKIPPED (gt-mqkwj; proof rebuilt in
-    ga-yprwyk; head = the first of the gate's order since ga-9t9acg.13). Returns (marker_id, branch, age_sec), else (None, None, 0). The evidence for a hit is left in
-    _ORPHAN_EVIDENCE[marker_id]. Fail-safe: any gather error, or any input that cannot be established, returns no
-    orphan (never wakes spuriously) — and the 'cannot prove' cases that would otherwise be invisible are noted."""
-    sweep_epochs, _log_text, log_fresh = _dispatcher_log_state()
-    if not log_fresh or not sweep_epochs:
-        return (None, None, 0)  # log not live → dead engine, ENGINE-STALL's job
+    """Detect a gate-status:queued marker the dispatcher provably never SAW (gt-mqkwj; proof rebuilt on the published
+    order in ga-dtecvq — see _orphan_verdict). Returns (marker_id, branch, age_sec), else (None, None, 0). The evidence for
+    a hit is left in _ORPHAN_EVIDENCE[marker_id]. Three states, never two: a marker the dispatcher saw is no orphan, a
+    marker it provably did not see is, and everything the proof cannot establish (the order file missing, unreadable,
+    stale, too short or clock-stepped; a queued marker whose updated_at is unknown; the queued-marker list itself
+    unreadable) is 'cannot prove' — said at most once an hour per reason, never 'orphan'. A candidate that was touched
+    inside the window is not 'cannot prove' and is not said: it is simply not judged yet, and a later window will."""
     now = time.time()
-    # ga-q8tj7p: the proof needs the dispatcher's priority-blind overdue tier. When the dispatcher provably no longer
-    # has it, say so (rate-limited) and return BEFORE the queue read and the log read — nothing below can prove a skip.
-    if _dispatcher_has_overdue_tier(now) is False:
-        _orphan_note("order-changed", "the dispatcher's marker-select no longer has a priority-blind overdue tier (its order is "
-                     "priority > feature > age since ga-q8tj7p), so 'a newer marker was claimed ahead of an older queued one' "
-                     "proves nothing — orphan detection is OFF until it is rebuilt for that order (ga-dtecvq)", now)
+    rows = _queued_markers_read()
+    if rows is None:
+        _orphan_note("queue-unreadable", "cannot read the queued-marker list (bd) — nothing can be proven about it", now)
         return (None, None, 0)
-    markers = _queued_markers()
-    # Cheap gates first: the source-bead reads, the wide log read and the launchctl/source read below happen only for a
-    # REAL candidate (ga-9t9acg.13: a queue with no marker old enough to be a head reads no source bead at all).
-    if _orphan_pool(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC) is None:
-        return (None, None, 0)
-    src_class = _marker_source_classes(markers)
-    if _orphan_head(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC, src_class=src_class) is None:
-        return (None, None, 0)
-    hard_age = _dispatcher_hard_age(now)
-    try:
-        lines = _read_log_last_lines(DISPATCH_LOG, ORPHAN_CLAIM_TAIL_LINES)
-    except Exception as e:
-        _orphan_note("log-read", "cannot read the dispatcher log for the claim history: %r" % (e,), now)
-        return (None, None, 0)
-    known = dict((m[0], m[2]) for m in markers if m[0] and m[2])
-    budget = [ORPHAN_WITNESS_LOOKUPS]
-    failed = [0]     # `bd show` lookups that returned nothing: 'could not learn' must not read as 'not newer'
-
-    def created_of(xid):
-        if xid in known:
-            return known[xid]
-        if xid in _MARKER_CREATED_CACHE:
-            return _MARKER_CREATED_CACHE[xid]
-        if budget[0] <= 0:
-            return None
-        budget[0] -= 1
-        e = _marker_created_epoch(xid)
-        if e is None:
-            failed[0] += 1
-        return e
-
-    orphan, reason, why = _orphan_verdict(markers, sweep_epochs, _dispatcher_claims(lines), _log_first_epoch(lines),
-                                          hard_age, created_of, now, src_class=src_class)
-    if reason == "tunables":
-        _orphan_note("tunables", "cannot derive the dispatcher's overdue ceiling from %s + `launchctl print %s` — "
-                     "no marker can be proven skipped until that is readable" % (DISPATCHER_SRC, DISPATCHER_LAUNCHD_LABEL), now)
-    elif reason == "no-witness" and failed[0]:
-        _orphan_note("witness-lookup", "could not learn created_at of %d claimed marker(s) via `bd show` — a skip witnessed only "
-                     "by those markers cannot be seen while that keeps failing" % failed[0], now)
-    elif reason == "log-coverage":
-        _orphan_note("log-coverage", "the dispatcher-log read (last %d lines) does not reach back to when the queue "
-                     "head was created, so 'never claimed' cannot be established" % ORPHAN_CLAIM_TAIL_LINES, now)
+    if not _orphan_candidates(rows, now, ORPHAN_MIN_AGE_SEC):
+        return (None, None, 0)       # nothing queued long enough to need a proof: the order file is not even read
+    pubs, why = _read_published_orders()
+    orphan, reason, detail = _orphan_verdict(rows, pubs, why, now)
+    if reason in _ORPHAN_NOTES:
+        _orphan_note(reason, "%s — %s" % (_ORPHAN_NOTES[reason], detail), now)
     if orphan is None:
         return (None, None, 0)
     _ORPHAN_EVIDENCE.clear()
-    _ORPHAN_EVIDENCE[orphan[0]] = why
+    _ORPHAN_EVIDENCE[orphan[0]] = detail
     return orphan
 
 
@@ -1930,8 +1573,8 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
         return (
             "Um marker gate-status:queued ÓRFÃO foi detectado: branch %s (marker %s). "
             "O gate_run dele foi DERRUBADO durante uma janela de outage do dispatcher (um buraco "
-            "sem linhas 'sweep complete' no log), então na recuperação o dispatcher PULA esse marker "
-            "antigo e despacha os mais novos — ele nunca roda, o bead de origem fica in_progress pra "
+            "sem linhas 'sweep complete' no log), então na recuperação o dispatcher NÃO ENXERGA mais esse marker "
+            "(ele fica fora da fila que o dispatcher ordena) e despacha os outros — ele nunca roda, o bead de origem fica in_progress pra "
             "SEMPRE, e o reconciler re-spawna worker em cima de trabalho já feito ~6x (incidente gt-mqkwj, "
             "irmão de [[ga-hl0gq-gate-stall-detection-fix]]).\n\n"
             "DIAGNÓSTICO (confirme que É órfão antes de agir):\n"
@@ -1940,8 +1583,11 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
             "2. Confirme ZERO tentativas de claim DESTE marker no log (pelo ID do marker — o branch também casa "
             "uma tentativa ANTERIOR do mesmo branch, e isso já enganou este detector): "
             "`grep -c 'Attempting to claim marker %s ' .gc/logs/quality-gate-dispatcher.log` → se 0, o dispatcher "
-            "nunca tentou despachá-lo. (O watchdog já provou que um marker MAIS NOVO foi claimado com este já "
-            "vencido — veja a linha 'orphan' no diagnóstico; o dispatcher escolhe overdue mais velho primeiro.)\n"
+            "nunca tentou despachá-lo. (O watchdog já provou que o dispatcher NUNCA VIU este marker: ele está AUSENTE da "
+            "ordem publicada em .gc/runtime/gate-queue-order.json — nem em `order` nem em `set_aside` — nas últimas "
+            "varreduras, estando parado na fila sem alteração desde antes delas; veja a linha 'orphan' no diagnóstico. "
+            "Ficar ATRÁS de markers mais novos NÃO é isso: a ordem é prioridade > feature > idade, e um marker que "
+            "aparece na ordem só está esperando a vez.)\n"
             "3. Confirme que o dispatcher está DRENANDO outros branches (há 'sweep complete' recente p/ branches "
             "DIFERENTES) — senão NÃO é órfão, é o run atual travado (outro modo de falha; não mexa).\n\n"
             "CONSERTO — DECIDA pelo estado do branch:\n"
@@ -5548,9 +5194,10 @@ def main():
         # --- ORPHANED queued marker (closes the gt-mqkwj blind spot: a marker
         #     whose gate_run was dropped in an outage is leapfrogged forever →
         #     bead stuck in_progress → reconciler re-spawns a worker ~6x). The
-        #     tier-aware skip proof (module docstring, ga-yprwyk) + queue-head guard
-        #     keep a normal backlog / head-of-line block / deep healthy queue from
-        #     false-firing (the 6x-same-marker driver). ---
+        #     published-order proof (module docstring, ga-dtecvq) only flags a marker the
+        #     dispatcher provably never saw, so a normal backlog / head-of-line block /
+        #     deep healthy queue — however long a low-priority marker waits in it — cannot
+        #     false-fire (the 6x-same-marker driver). ---
         orphan_id, orphan_branch, orphan_age = orphaned_queued_marker()
         if saw_orphan and lp and lp > last_orphan_spawn:
             print("[watchdog] orphaned marker cleared (Gate PASSED after repair dispatch) — resetting", flush=True)
