@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.pool-ceiling-engine</string>
+
+  <!-- TEMPLATE — NOT INSTALLED (ga-m9x0lb.2). Installing it is slice 3 (Mayor, supervised), together with the one-line
+       `include = [".gc/pool-ceiling-engine.toml"]` in city.toml, the first `touch .gc/pool-ceiling-engine.on` and the
+       kill-switch drill. Order matters: create the EMPTY fragment BEFORE adding the include (an absent included fragment is
+       a config load error), and only then bootstrap this job.
+
+       What it does every ~5 minutes: one sweep of pool-ceiling-engine.sh (see its header). It acts ONLY while
+       $GC_CITY/.gc/pool-ceiling-engine.on exists; without it the run is silent and touches nothing. Kill switch:
+       touch .gc/pool-ceiling-engine.off (the fragment is EMPTIED, never deleted).
+
+       Why its own job, outside both dispatchers: the Pilot leaves its sweep early on quota / RAM / quiet hours, the gate only
+       runs the ceiling step with a marker in the queue, and the Pilot sweeps every ~20 min. A ceiling that has to come DOWN
+       under swap pressure cannot depend on either of them being awake.
+
+       StartInterval 300 is far above the duration of one run (seconds), and the engine takes a single-instance lock with a
+       TTL, so runs cannot pile up (ga-y0g5x: four overlapping guard instances once took bd down for the whole city).
+       RunAtLoad is false: a bootstrap or relog must not trigger an extra sweep.
+
+       GC_VARIABLE_SESSION_MAX is deliberately NOT set here: the engine reads the live value from the Pilot's plist
+       (com.gascity.pilot.plist) so there is a single source of truth. If that plist is unreadable it falls back to 6, the
+       dispatchers' own default — the direction that blocks raises. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/pool-ceiling-engine.sh</string>
+    <string>run</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><false/>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/pool-ceiling-engine-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/pool-ceiling-engine-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>

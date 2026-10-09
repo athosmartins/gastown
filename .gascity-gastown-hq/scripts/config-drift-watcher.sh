@@ -150,6 +150,11 @@ compute_hash() {
         # City config files
         [[ -f "$CITY/city.toml" ]] && echo "$CITY/city.toml"
         [[ -f "$CITY/pack.toml" ]] && echo "$CITY/pack.toml"
+        # The pool-ceiling engine's generated fragment (ga-m9x0lb.2): city.toml includes it, so a change
+        # there is a config change — but it lives under .gc/, which neither this watcher nor the
+        # controller's own fsnotify watches (measured ga-m9x0lb.1: otherwise a new ceiling waits for the
+        # 30-60 min heartbeat reload). Only this ONE file: the rest of .gc/ (logs, state) must not reload.
+        [[ -f "$CITY/.gc/pool-ceiling-engine.toml" ]] && echo "$CITY/.gc/pool-ceiling-engine.toml"
         # Agent templates — adding/editing a template changes the effective config hash
         # for all sessions; catching this here requests gc reload --soft before the
         # controller's own watcher can queue drains (immediate vs heartbeat fallback).
