@@ -72,7 +72,10 @@ case "$OUT_REAL" in
 esac
 # The installer is not the only reader of assets/*.plist: daemon-presence-watchdog, production-drift-guard, stale-persistent-daemon-guard
 # and daemon-refresh Step 1b (VERDICT=JOB_NOT_INSTALLED) all treat one as a job that must be loaded. The name keeps the template out of all of them.
-eq "$(grep -l -F "<string>$LABEL_T</string>" "$SELF_DIR"/*.plist 2>/dev/null | wc -l | tr -d ' ')" "0" "no *.plist under assets/ declares $LABEL_T"
+# Counting with grep -l ... | wc -l reads a grep that FAILED (no file matched the glob) as "0 declare it", so the count is first proved able to see one.
+declaring() { grep -l -F "<string>$LABEL_T</string>" "$1"/*.plist 2>/dev/null | wc -l | tr -d ' '; }
+eq "$(declaring "$TMPROOT/oldname")" "1" "control: the count sees the template when it is named *.plist"
+eq "$(declaring "$SELF_DIR")" "0" "no *.plist under assets/ declares $LABEL_T"
 
 # ── 2. the prod-test v2 ───────────────────────────────────────────────────────
 section "2. story-ga-o3o09z.sh v2: the Pilot ceiling is bounded by the EFFECTIVE ceiling, never by a literal 2"
