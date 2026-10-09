@@ -9,6 +9,16 @@
        kill-switch drill. Order matters: create the EMPTY fragment BEFORE adding the include (an absent included fragment is
        a config load error), and only then bootstrap this job.
 
+       The file is named *.plist.template ON PURPOSE, and the name is what keeps it uninstalled, not this comment. The deploy
+       step (skill-integrity-install.sh scan_and_install_new_plists, run by the gascity rig's deploy_cmd on every merge)
+       installs AND kickstarts every not-yet-loaded com.gascity.* file matching *.plist directly under this directory. Others
+       read a *.plist name as "a job that must be loaded": daemon-refresh Step 1b (changed paths ending in .plist, verdict
+       JOB_NOT_INSTALLED), the presence watchdog, the drift guard and the stale-daemon guard (the *.plist glob of this directory).
+       pool-ceiling-wiring.selftest.sh section 1b runs the installer's own scan and fails if this label is selected. Slice 3
+       puts it in service by copying it to ~/Library/LaunchAgents/com.gascity.pool-ceiling-engine.plist by hand; renaming it
+       to *.plist in this directory would make the NEXT deploy install and kickstart it, so do that only once
+       pool-ceiling-engine.sh exists and honours the .on gate below.
+
        What it does every ~5 minutes: one sweep of pool-ceiling-engine.sh (see its header). It acts ONLY while
        $GC_CITY/.gc/pool-ceiling-engine.on exists; without it the run is silent and touches nothing. Kill switch:
        touch .gc/pool-ceiling-engine.off (the fragment is EMPTIED, never deleted).
@@ -19,7 +29,9 @@
 
        StartInterval 300 is far above the duration of one run (seconds), and the engine takes a single-instance lock with a
        TTL, so runs cannot pile up (ga-y0g5x: four overlapping guard instances once took bd down for the whole city).
-       RunAtLoad is false: a bootstrap or relog must not trigger an extra sweep.
+       RunAtLoad is false, so a bootstrap or a relog does not start a sweep by itself. It does NOT stop a `launchctl kickstart`,
+       and this repo's install_plist kickstarts after every bootstrap: the first run can happen at install time, and it is
+       harmless only because of the .on gate above (the engine's contract, implemented and tested in slice B).
 
        GC_VARIABLE_SESSION_MAX is deliberately NOT set here: the engine reads the live value from the Pilot's plist
        (com.gascity.pilot.plist) so there is a single source of truth. If that plist is unreadable it falls back to 6, the

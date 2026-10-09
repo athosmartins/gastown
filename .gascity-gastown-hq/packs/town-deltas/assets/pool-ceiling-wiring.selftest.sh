@@ -2,7 +2,7 @@
 # pool-ceiling-wiring.selftest.sh (ga-m9x0lb.2.1)
 #
 # Proves the pieces the pool-ceiling ENGINE relies on OUTSIDE itself (ga-m9x0lb.2, slice A). None of them needs the engine to exist:
-#   - the launchd job TEMPLATE pool-ceiling-engine.plist (valid, every 5 min, no run at load, runs `run`, a model only);
+#   - the launchd job TEMPLATE pool-ceiling-engine.plist.template (valid, every 5 min, no run at load, runs `run`, a model only);
 #   - the prod-test v2 (prod-tests/gascity/story-ga-o3o09z.sh): the Pilot's ceiling is bounded by the EFFECTIVE ceiling
 #     (agent.toml, or the generated fragment's entry), the fragment is validated strictly, the sum fits GC_VARIABLE_SESSION_MAX.
 # The watcher's hash and the dedup set are proved by their own selftests (config-drift-watcher-reload-policy.selftest.sh section I,
@@ -16,7 +16,7 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROD="$SELF_DIR/prod-tests/gascity/story-ga-o3o09z.sh"
-PLIST_T="$SELF_DIR/pool-ceiling-engine.plist"
+PLIST_T="$SELF_DIR/pool-ceiling-engine.plist.template"   # NOT *.plist: the deploy step installs every *.plist under this dir (section 1b)
 
 PASS=0; FAIL=0; SKIP=0
 ok()  { PASS=$((PASS+1)); echo "  ✓ $*"; }
@@ -29,7 +29,7 @@ TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
 # ── 1. the launchd job template ───────────────────────────────────────────────
-section "1. pool-ceiling-engine.plist: a valid TEMPLATE for a 5-minute job that does not run at load"
+section "1. pool-ceiling-engine.plist.template: a valid TEMPLATE for a 5-minute job that does not run at load"
 plutil -lint "$PLIST_T" >/dev/null 2>&1; eq "$?" "0" "it is a valid plist"
 pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$PLIST_T" 2>/dev/null; }
 eq "$(pb Label)" "com.gascity.pool-ceiling-engine" "its own label (not the Pilot's, not the gate's)"
@@ -39,6 +39,40 @@ eq "$(pb ProgramArguments:2)" "run" "with the 'run' subcommand"
 eq "$(pb ProgramArguments:1 | sed 's|.*/packs/||')" "town-deltas/assets/pool-ceiling-engine.sh" "and the script it names is pool-ceiling-engine.sh in this pack"
 pb EnvironmentVariables:GC_VARIABLE_SESSION_MAX >/dev/null; eq "$?" "1" "GC_VARIABLE_SESSION_MAX is NOT set here: the engine reads the Pilot's plist, one source of truth"
 has "$(sed -n '/<!--/,/-->/p' "$PLIST_T")" "NOT INSTALLED" "the file says out loud that it is a template, not an installed job"
+
+# ── 1b. the template is invisible to the deploy pipeline ──────────────────────
+# A "NOT INSTALLED" comment is a claim, and the deploy step does not read comments. skill-integrity-install.sh (the gascity rig's
+# deploy_cmd) installs AND kickstarts every not-yet-loaded com.gascity.* *.plist directly under this directory, so the file's NAME,
+# not its comment, decides whether merging it installs the job (gate round 3, ga-5aqe0t). These checks run the installer's OWN scan.
+section "1b. the template is NOT something the deploy pipeline picks up: merging it must not install (or kickstart) the job"
+INSTALLER="$SELF_DIR/../../../scripts/skill-integrity-install.sh"
+LABEL_T="com.gascity.pool-ceiling-engine"
+# The labels scan_and_install_new_plists would install from <dir> if NOTHING were loaded yet. launchd and the copy are stubbed; the
+# glob, the label parser and the filter are the installer's own. SCAN-DONE comes last: a source or a scan that died must not read as
+# "nothing selected" (an error and an empty answer are different answers).
+would_install() { # <dir>
+  ( SKILL_INTEGRITY_LIB_ONLY=1 SKILL_INTEGRITY_NO_LAUNCHD=true
+    # shellcheck disable=SC1090
+    source "$INSTALLER" || exit 97
+    _is_loaded() { return 1; }
+    install_plist() { echo "INSTALL $2"; }
+    scan_and_install_new_plists "$1" || exit 98
+    echo "SCAN-DONE" ) 2>&1 | grep -E '^(INSTALL |SCAN-DONE)'
+}
+# Control (the mutant): the template under a *.plist name IS selected, so the check on the real directory below is able to fail.
+mkdir -p "$TMPROOT/oldname"; cp "$PLIST_T" "$TMPROOT/oldname/pool-ceiling-engine.plist"
+OUT_OLD="$(would_install "$TMPROOT/oldname")"
+has "$OUT_OLD" "SCAN-DONE" "control: the scan ran to the end over a dir holding the template as a *.plist"
+has "$OUT_OLD" "INSTALL $LABEL_T" "control: under a *.plist name the installer DOES select it (this is what the check below must not see)"
+OUT_REAL="$(would_install "$SELF_DIR")"
+has "$OUT_REAL" "SCAN-DONE" "the scan over the real assets dir ran to the end"
+case "$OUT_REAL" in
+  *"INSTALL $LABEL_T"*) bad "the deploy step would bootstrap + kickstart $LABEL_T from this directory (pool-ceiling-engine.sh does not exist yet)" ;;
+  *) ok "the deploy step does not select $LABEL_T from the real assets dir" ;;
+esac
+# The installer is not the only reader of assets/*.plist: daemon-presence-watchdog, production-drift-guard, stale-persistent-daemon-guard
+# and daemon-refresh Step 1b (VERDICT=JOB_NOT_INSTALLED) all treat one as a job that must be loaded. The name keeps the template out of all of them.
+eq "$(grep -l -F "<string>$LABEL_T</string>" "$SELF_DIR"/*.plist 2>/dev/null | wc -l | tr -d ' ')" "0" "no *.plist under assets/ declares $LABEL_T"
 
 # ── 2. the prod-test v2 ───────────────────────────────────────────────────────
 section "2. story-ga-o3o09z.sh v2: the Pilot ceiling is bounded by the EFFECTIVE ceiling, never by a literal 2"
@@ -70,40 +104,66 @@ prod() { env -u POOL_CEILING_ENGINE_FRAGMENT CITY="$C" PILOT_PLIST="$PP" bash "$
 # Pilot and sum checks to RUN must see neither in its verdict line, or it passed vacuously.
 ran_pilot_and_sum() { lacks "$(cat "$TMPROOT/prod.out")" "pilot-ceiling-crosscheck" "$1: the Pilot cross-check ran (not soft-skipped)"; lacks "$(cat "$TMPROOT/prod.out")" "sum-vs-GC_VARIABLE_SESSION_MAX" "$1: the sum check ran (not soft-skipped)"; }
 python3 -c 'import tomllib' 2>/dev/null && HAVE_TOML=1 || HAVE_TOML=0   # the include and override rules read the PARSED city.toml: they need python3 >= 3.11
+# Without tomllib the prod-test cannot tell whether city.toml includes the fragment, and by design it then FAILS any populated fragment
+# ("cannot be told": unknown is not "in force"). So every scenario whose expected verdict depends on READING the include (any populated
+# fragment, or the ABSENT-but-included case) says nothing on such a host: run it only where it can mean something, and name it in ONE
+# SKIPPED line at the end of the section. Gating only some of them left a dozen checks failing on python 3.9 and one (p14c) passing for the
+# wrong reason (rc 1 from "cannot be told", not from "a comment is not an include").
+TOML_SKIPPED=""
+need_toml() { # <scenario> — 0 when the parsed city.toml can be read here; otherwise records the scenario once and returns 1
+  [ "$HAVE_TOML" = 1 ] && return 0
+  TOML_SKIPPED="$TOML_SKIPPED $1"; return 1
+}
 
 mk_city p1; mkplist 2 9
 eq "$(prod)" "0" "baseline (empty fragment, Pilot 2, agent.toml 2, sum 2+1+3 = 6 <= 9) passes"
 has "$(cat "$TMPROOT/prod.out")" "effective engine ceiling = 2" "and says what it checked"
 ran_pilot_and_sum "baseline"
 mk_city p2; mkplist 3 9; frag "wa-worker=3"
-eq "$(prod)" "0" "fragment raises wa-worker to 3, Pilot 3: passes (the Pilot may match the EFFECTIVE ceiling; v1 failed it)"
-ran_pilot_and_sum "fragment raised"
+if need_toml p2; then
+  eq "$(prod)" "0" "fragment raises wa-worker to 3, Pilot 3: passes (the Pilot may match the EFFECTIVE ceiling; v1 failed it)"
+  ran_pilot_and_sum "fragment raised"
+fi
 mk_city p3; mkplist 4 9; frag "wa-worker=3"
-eq "$(prod)" "1" "Pilot 4 above the effective 3: FAILS"
-has "$(cat "$TMPROOT/prod.out")" "effective engine ceiling 3" "naming the effective ceiling"
+if need_toml p3; then
+  eq "$(prod)" "1" "Pilot 4 above the effective 3: FAILS"
+  has "$(cat "$TMPROOT/prod.out")" "effective engine ceiling 3" "naming the effective ceiling"
+fi
 mk_city p4; mkplist 3 9
 eq "$(prod)" "1" "empty fragment, Pilot 3 above agent.toml's 2: still FAILS (the original invariant is kept)"
 mk_city p5; mkplist 3 6; frag "wa-worker=3"
-eq "$(prod)" "1" "sum 3+1+3 = 7 over GC_VARIABLE_SESSION_MAX 6: FAILS"
-has "$(cat "$TMPROOT/prod.out")" "GC_VARIABLE_SESSION_MAX=6" "naming the budget"
+if need_toml p5; then
+  eq "$(prod)" "1" "sum 3+1+3 = 7 over GC_VARIABLE_SESSION_MAX 6: FAILS"
+  has "$(cat "$TMPROOT/prod.out")" "GC_VARIABLE_SESSION_MAX=6" "naming the budget"
+fi
 mk_city p6; mkplist 2 9; rm -f "$C/.gc/pool-ceiling-engine.toml"
-eq "$(prod)" "1" "city.toml includes the fragment but it is ABSENT (a config load error): FAILS"
-has "$(cat "$TMPROOT/prod.out")" "ABSENT" "and says why"
+if need_toml p6; then
+  eq "$(prod)" "1" "city.toml includes the fragment but it is ABSENT (a config load error): FAILS"
+  has "$(cat "$TMPROOT/prod.out")" "ABSENT" "and says why"
+fi
 mk_city p7; mkplist 2 9; printf '[[patches.agent]]\ndir = ""\nname = "wa-worker"\nmax_active_session = 3\n' > "$C/.gc/pool-ceiling-engine.toml"
 eq "$(prod)" "1" "a fragment that is not what the engine renders (typo'd key): FAILS (the effective ceiling is unknowable)"
 has "$(cat "$TMPROOT/prod.out")" "FOREIGN content" "because it is FOREIGN, not for some other reason"
 mk_city p8; mkplist 2 9; frag "gate-reviewer=4"
-eq "$(prod)" "1" "gate-reviewer ABOVE its agent.toml (3): FAILS ('the others only go down')"
-has "$(cat "$TMPROOT/prod.out")" "ABOVE agent.toml's 3" "because it is above the committed value"
+if need_toml p8; then
+  eq "$(prod)" "1" "gate-reviewer ABOVE its agent.toml (3): FAILS ('the others only go down')"
+  has "$(cat "$TMPROOT/prod.out")" "ABOVE agent.toml's 3" "because it is above the committed value"
+fi
 mk_city p9; mkplist 2 9; frag "mila-wa=1"
-eq "$(prod)" "1" "an entry for mila-wa (it HAS an agent.toml, 1; level within it, outside the allowlist): FAILS"
-has "$(cat "$TMPROOT/prod.out")" "outside the engine's allowlist" "because of the allowlist: the agent.toml compare would have let it through"
+if need_toml p9; then
+  eq "$(prod)" "1" "an entry for mila-wa (it HAS an agent.toml, 1; level within it, outside the allowlist): FAILS"
+  has "$(cat "$TMPROOT/prod.out")" "outside the engine's allowlist" "because of the allowlist: the agent.toml compare would have let it through"
+fi
 mk_city p9b; mkplist 2 9; frag "gastown.dog=4"
-eq "$(prod)" "1" "an entry for gastown.dog (outside the allowlist, no agent.toml here): FAILS"
-has "$(cat "$TMPROOT/prod.out")" "outside the engine's allowlist" "and says the allowlist, not 'no readable agent.toml'"
+if need_toml p9b; then
+  eq "$(prod)" "1" "an entry for gastown.dog (outside the allowlist, no agent.toml here): FAILS"
+  has "$(cat "$TMPROOT/prod.out")" "outside the engine's allowlist" "and says the allowlist, not 'no readable agent.toml'"
+fi
 mk_city p10; mkplist 2 9; frag "gate-reviewer=2"
-eq "$(prod)" "0" "gate-reviewer lowered to 2 is fine"
-ran_pilot_and_sum "gate-reviewer lowered"
+if need_toml p10; then
+  eq "$(prod)" "0" "gate-reviewer lowered to 2 is fine"
+  ran_pilot_and_sum "gate-reviewer lowered"
+fi
 mk_city p11; mkplist 2 9; rm -f "$C/.gc/pool-ceiling-engine.toml"; printf 'include = []\n\n[workspace]\nname = "selftest"\n' > "$C/city.toml"
 eq "$(prod)" "0" "engine not installed (no include, no fragment): passes on agent.toml alone"
 ran_pilot_and_sum "engine not installed"
@@ -122,13 +182,17 @@ else
 fi
 chmod 644 "$C/city.toml"
 mk_city p14; mkplist 3 9; frag "wa-worker=3"; printf 'include = []\n\n[workspace]\nname = "selftest"\n' > "$C/city.toml"
-eq "$(prod)" "1" "a POPULATED fragment that city.toml does not include (partial rollback; Pilot 3 vs the controller's real 2): FAILS"
-has "$(cat "$TMPROOT/prod.out")" "does not include it" "saying the controller applies none of it"
+if need_toml p14; then
+  eq "$(prod)" "1" "a POPULATED fragment that city.toml does not include (partial rollback; Pilot 3 vs the controller's real 2): FAILS"
+  has "$(cat "$TMPROOT/prod.out")" "does not include it" "saying the controller applies none of it"
+fi
 mk_city p14b; mkplist 2 9; printf 'include = []\n\n[workspace]\nname = "selftest"\n' > "$C/city.toml"
 eq "$(prod)" "0" "an EMPTY fragment that city.toml does not include yet (slice 3 step 1 creates it first): passes"
 ran_pilot_and_sum "empty fragment, not included"
 mk_city p14c; mkplist 2 9; { printf '# the include is only mentioned: pool-ceiling-engine.toml\n'; printf 'include = []\n\n[workspace]\nname = "selftest"\n'; } > "$C/city.toml"; frag "wa-worker=3"
-eq "$(prod)" "1" "a COMMENT that names the fragment is not an include: FAILS the same way"
+if need_toml p14c; then
+  eq "$(prod)" "1" "a COMMENT that names the fragment is not an include: FAILS the same way"
+fi
 # The include is read from the PARSED city.toml, so these need python3 >= 3.11 like p12/p19. Each pairs a misread-as-included form with
 # a populated fragment (Pilot 3 vs the controller's real 2: the drift must FAIL) — and p14f/p14g are the positive controls, so the
 # fix cannot pass by simply never finding an include.
@@ -157,11 +221,15 @@ else
   skip "p14d-p14j (the include is read from the parsed city.toml) need python3 >= 3.11 (tomllib); $(command -v python3 || echo 'no python3') cannot run them"
 fi
 mk_city p15; mkplist 2 9; frag "wa-worker=9"
-eq "$(prod)" "1" "wa-worker=9 (above the engine's hard max 8): FAILS"
-has "$(cat "$TMPROOT/prod.out")" "outside [1, 8]" "on the bound"
+if need_toml p15; then
+  eq "$(prod)" "1" "wa-worker=9 (above the engine's hard max 8): FAILS"
+  has "$(cat "$TMPROOT/prod.out")" "outside [1, 8]" "on the bound"
+fi
 mk_city p16; mkplist 2 9; frag "wa-worker=0"
-eq "$(prod)" "1" "wa-worker=0 (a pause is the operator's, never the engine's): FAILS"
-has "$(cat "$TMPROOT/prod.out")" "outside [1, 8]" "on the bound"
+if need_toml p16; then
+  eq "$(prod)" "1" "wa-worker=0 (a pause is the operator's, never the engine's): FAILS"
+  has "$(cat "$TMPROOT/prod.out")" "outside [1, 8]" "on the bound"
+fi
 mk_city p17; mkplist 2 9; frag "wa-worker=3 wa-worker=3"
 eq "$(prod)" "1" "the same pool twice: FAILS (which entry wins is unknowable)"
 has "$(cat "$TMPROOT/prod.out")" "FOREIGN content" "as foreign"
@@ -213,6 +281,8 @@ if [ -n "$REAL_PY" ]; then
 else
   skip "p23-p23d (the include probe cannot be staged) need a python3 on PATH to shim"
 fi
+
+[ -z "$TOML_SKIPPED" ] || skip "scenarios whose verdict depends on READING the parsed city.toml (python3 >= 3.11, tomllib):$TOML_SKIPPED -- $(command -v python3 || echo 'no python3') cannot run them"
 
 # ── leading zeros: "09" is not a TOML integer (gc rejects it at load); bash reads it as a bad octal and errors QUIETLY inside
 # [[ -gt ]] and $(( )), which printed PASS with the check never run. Every number the script compares or sums is canonical or refused.
