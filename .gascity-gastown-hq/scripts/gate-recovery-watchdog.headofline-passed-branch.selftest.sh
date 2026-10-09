@@ -236,8 +236,8 @@ if have_api:
     rd = with_sh(R(0, json.dumps([marker_row("ga-4pdlt8"), marker_row("ga-closed", status="closed")])), m._queued_markers_read)
     check(rd is not None and [r[0] for r in rd] == ["ga-4pdlt8"] and rd[0][1] == BR,
           "a valid list parses as before (closed marker with a stale queued label still filtered, branch label extracted)")
-    check(with_sh(R(1, ""), m._queued_markers) == [] and with_sh(None, m._queued_markers) == [],
-          "_queued_markers() keeps its old contract: [] on any error (the orphan detector's callers are unchanged)")
+    check(not hasattr(m, "_queued_markers"),
+          "the collapsing _queued_markers() wrapper is gone (ga-dtecvq): no caller may read an unreadable queue as an empty one")
     check(with_sh(R(0, json.dumps([marker_row("ga-4pdlt8")])), lambda: m.hol_branch_queue_state(BR)) == m.HOL_QUEUE_QUEUED,
           "end to end: an open queued marker for the branch → queued")
     check(with_sh(R(0, "[]"), lambda: m.hol_branch_queue_state(BR)) == m.HOL_QUEUE_NOT_QUEUED,

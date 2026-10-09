@@ -8,12 +8,14 @@
 # 'FAIL forensics reviewer' lines carry reviewer output cut mid-multibyte-character), so on the live
 # system last_pass_epoch() returned 0 ('never passed') with 13 'Gate PASSED' in the 4000 lines it reads
 # (769 in the whole file, 25/09), and
-# _dispatcher_log_state() returned ([], "", False) ('log not fresh') on a log written seconds ago.
+# _dispatcher_log_state() (the orphan detector's input; deleted by ga-dtecvq) returned ([], "", False) ('log not
+# fresh') on a log written seconds ago.
 # Error and empty produced the same value — the detector was blind, not quiet.
 #
 # THE SITES (one case each below; every one FAILS on the code before ga-b1iulk):
 #   last_pass_epoch()        recent_timeouts()        stuck_dispatching()      gate_infra_throttled()
-#   _dispatcher_log_state()  (via orphaned_queued_marker() end to end)
+# (a fifth, _dispatcher_log_state() via orphaned_queued_marker(), went with the log-fed orphan proof: since ga-dtecvq
+# the proof reads the dispatcher's published queue order — a file — and no orphan case touches this log.)
 # plus two LATENT twins in the same file that read a different log the same strict way:
 #   pilot_jammed()  (pilot log)        dolt_instability()  (supervisor log, text-mode seek to a byte offset)
 #
@@ -25,8 +27,9 @@
 # Also pinned: the helper keeps every site's window at N LINES (never widened to N bytes) and equals the
 # old readlines()[-N:] on a clean log; and orphaned_queued_marker()'s repair path is OFF by default
 # (see GRW_ORPHAN_REPAIR_ENABLED — the detector's leapfrog proof was contradicted by the dispatcher's own
-# tiered selection, found by running the fixed reader against the live queue). ga-yprwyk rebuilt the proof on the
-# marker id + the dispatcher's tier order; the end-to-end case below now drives THAT proof through the tolerant reader.
+# tiered selection, found by running the fixed reader against the live queue). The proof itself (ga-dtecvq: the
+# dispatcher's PUBLISHED queue order) is covered by gate-recovery-watchdog.selftest.sh and
+# gate-recovery-watchdog.orphan-proof-order.selftest.sh.
 #
 # Run: bash scripts/gate-recovery-watchdog.utf8-tolerant-readers.selftest.sh
 #      WD_OVERRIDE=<other copy of the watchdog> bash ...   (prove it fails on older code)
@@ -112,7 +115,7 @@ class Patch(object):
 def fake_sh(stdout):
     return lambda args, timeout=20, stdin=None: subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
 
-# ── 1. The five dispatcher-log sites, each on a log of the REAL shape ───────
+# ── 1. The four dispatcher-log sites, each on a log of the REAL shape ───────
 print("Scenario 1: dispatcher-log detectors read a log that contains invalid UTF-8")
 
 p = mklog("d-pass.log", real_shape([dl(NOW - 120, "Gate PASSED: branch=fix/ga-wlhd07 tier=CODE merge_sha=ea08e4ad55efb886a5605788a9304fa79f38d40e elapsed=716s"),
@@ -139,48 +142,6 @@ p = mklog("d-throttle.log", real_shape([dl(NOW - 30, "Headroom DEFER: gate em 0 
 with Patch(DISPATCH_LOG=p):
     thr = m.gate_infra_throttled()
 check(thr is True, "gate_infra_throttled() sees the newest decision is a quota DEFER (got %r; strict read gave False = repair dogs NOT suppressed)" % (thr,))
-
-BR = "crew/wa-worker/wa-newer"
-p = mklog("d-state.log", real_shape([dl(NOW - 400, "=== Dispatcher sweep complete: branch=crew/oracle/wa-old verdict=YIELDED (live sibling ga-4jau8q, pre-rebase) ==="),
-                                     dl(NOW - 100, "=== Dispatcher sweep complete: branch=%s verdict=QUEUED (retry 1/3, dead author) ===" % BR)]))
-with Patch(DISPATCH_LOG=p):
-    epochs, text, fresh = m._dispatcher_log_state()
-check(len(epochs) == 2 and fresh is True and BR in text,
-      "_dispatcher_log_state() returns both sweeps, fresh=True and the tail text (got %d epochs, fresh=%r; strict read gave ([], '', False))" % (len(epochs), fresh))
-
-# End to end: the orphan detector is fed by the same tolerant reader (twice: the 3000-line state for the sweep epochs,
-# and — since ga-yprwyk — a WIDE read for the claim history), so a blind reader also blinds it. Both variants below use a
-# log with invalid UTF-8 inside the window, and a head far past the dispatcher's overdue ceiling (patched to the default
-# 5400s here: deriving it from the live launchd job is covered by gate-recovery-watchdog.orphan-proof-tiered.selftest.sh).
-# The overdue-tier premise is pinned True for the same reason (ga-ges6uf): since ga-q8tj7p the REAL dispatcher has no
-# priority-blind overdue tier, so orphaned_queued_marker() returns before it ever reads the claim history — and an
-# unpinned run turned this section into a test of the live dispatcher source, not of the tolerant reader. What the
-# watchdog does against the real dispatcher (loud, rate-limited "order-changed" note) is Group E of the tiered selftest.
-HARD = 5400
-HEAD_CREATED = NOW - (HARD + m.ORPHAN_PROOF_MARGIN_SEC + 7200)
-def orphan_log(name, claimed_marker):
-    # an early well-formed line so the read provably reaches back to before the head was created, then the real shape
-    return mklog(name, [dl(NOW - 30000, "Found 20 queued marker(s)")] + real_shape(
-        [dl(NOW - 600, "Attempting to claim marker %s ..." % claimed_marker),
-         dl(NOW - 100, "=== Dispatcher sweep complete: branch=%s verdict=QUEUED (retry 1/3, dead author) ===" % BR)]))
-def run_orphan(p, created):
-    try:
-        with Patch(DISPATCH_LOG=p, _dispatcher_hard_age=lambda now=None: HARD,
-                   _dispatcher_has_overdue_tier=lambda now=None: True,
-                   _marker_created_epoch=lambda mid: created.get(mid),
-                   _queued_markers=lambda: [("ga-head", "crew/x/head", HEAD_CREATED, ("gate-status:queued",))]):
-            return m.orphaned_queued_marker()
-    except Exception as e:                # an older watchdog copy (WD_OVERRIDE) has a different shape: report, don't crash
-        return ("EXC", repr(e), 0)
-
-# (1) the dispatcher claimed a marker created AFTER the head, while the head was overdue → the head was skipped
-orphan = run_orphan(orphan_log("d-orphan.log", "ga-new"), {"ga-new": HEAD_CREATED + 1800})
-check(orphan[0] == "ga-head" and orphan[1] == "crew/x/head" and "ga-new" in m._ORPHAN_EVIDENCE.get("ga-head", ""),
-      "orphaned_queued_marker() gets a live log and proves the skip from the claim history (got %r; strict read gave (None, None, 0) for every input)" % (orphan,))
-# (2) the same log, but the claim is of an OLDER marker: the queue is draining oldest-first, nothing was skipped
-orphan = run_orphan(orphan_log("d-fifo.log", "ga-older"), {"ga-older": HEAD_CREATED - 1800})
-check(orphan == (None, None, 0),
-      "a deep healthy queue (claims only of OLDER markers) is NOT flagged — the ga-b9pz7q false positive (got %r)" % (orphan,))
 
 # ── 2. Latent twins: pilot log + supervisor log ─────────────────────────────
 print("Scenario 2: the same strict read on the pilot log and the supervisor log")
@@ -274,24 +235,12 @@ if need_helper("the helper's unit tests"):
 missing = os.path.join(TMP, "does-not-exist.log")
 with Patch(DISPATCH_LOG=missing, PILOT_LOG=missing, SUPERVISOR_LOG=missing, daemon_deliberately_stopped=lambda label: False):
     neutral = (m.last_pass_epoch(), m.recent_timeouts(), m.stuck_dispatching(), m.gate_infra_throttled(),
-               m._dispatcher_log_state(), m.pilot_jammed(), m.dolt_instability())
-check(neutral == (0, (0, None), False, False, ([], "", False), (False, ""), 0),
+               m.pilot_jammed(), m.dolt_instability())
+check(neutral == (0, (0, None), False, False, (False, ""), 0),
       "a MISSING log still yields each detector's neutral value and never an exception")
 
-# ── 4. _dispatcher_log_state re-joins lines: no fused text ──────────────────
-print("Scenario 4: the re-joined log text keeps line boundaries (no false 'branch mentioned')")
-if need_helper("the separator check"):
-    # Line A ends with 'crew/x/wa-' and line B starts with 'yzump': joined WITHOUT a separator the text would contain
-    # 'crew/x/wa-yzump' — a branch that is mentioned on NO line. (readlines() kept each '\n'; the helper strips it.)
-    p = mklog("d-fuse.log", [dl(NOW - 100, "=== Dispatcher sweep complete: branch=crew/oracle/wa-old verdict=YIELDED ==="),
-                             b"trailing text crew/x/wa-", b"yzump more text"])
-    with Patch(DISPATCH_LOG=p):
-        _e, text, _f = m._dispatcher_log_state()
-    check("crew/oracle/wa-old" in text and "crew/x/wa-yzump" not in text and text.endswith("\n"),
-          "adjacent lines are separated by a newline in log_text (branch substring matching cannot straddle a join)")
-
-# ── 5. Design pins ──────────────────────────────────────────────────────────
-print("Scenario 5: orphan repair is OFF by default and log-only; no strict read of the three logs remains")
+# ── 4. Design pins ──────────────────────────────────────────────────────────
+print("Scenario 4: orphan repair is OFF by default and log-only; no strict read of the three logs remains")
 check(getattr(m, "GRW_ORPHAN_REPAIR_ENABLED", "missing") is False,
       "GRW_ORPHAN_REPAIR_ENABLED defaults to False (found live: the fixed reader flagged a marker the dispatcher claimed ~3min later)")
 os.environ["GRW_ORPHAN_REPAIR_ENABLED"] = "1"
