@@ -50,6 +50,7 @@ log "wa-worker: max_active_sessions = $WA_BASE in $CFG ✓"
 # them may set max_active_sessions (that would make agent.toml a second-place
 # value, not the single source of truth this story requires).
 CITY_TOML="$CITY/city.toml"
+SKIPPED=""   # every soft skip below lands here, so the final PASS line says what it did NOT check
 [[ -f "$CITY_TOML" && -r "$CITY_TOML" ]] || fail "city.toml missing or unreadable: $CITY_TOML"   # unreadable must not read as "no include" in section 3
 if command -v python3 >/dev/null 2>&1; then
     PY_OUT=$(python3 - "$CITY_TOML" <<'PY' 2>&1
@@ -67,16 +68,16 @@ except Exception as e:
     sys.exit(2)
 patches = cfg.get("patches", {})
 agent_patches = patches.get("agent", []) if isinstance(patches, dict) else []
-bad = [p for p in agent_patches if isinstance(p, dict) and p.get("name") == "wa-worker" and "max_active_sessions" in p]
+bad = [p for p in agent_patches if isinstance(p, dict) and p.get("name") in ("wa-worker", "ps-worker", "gate-reviewer") and "max_active_sessions" in p]
 if bad:
-    print(f"found max_active_sessions override(s) for wa-worker in [[patches.agent]]: {bad}", file=sys.stderr)
+    print(f"found max_active_sessions override(s) for the engine's pools in [[patches.agent]]: {bad}", file=sys.stderr)
     sys.exit(1)
 PY
     )
     PY_RC=$?
     case "$PY_RC" in
         0)
-            log "city.toml: no [[patches.agent]] override of wa-worker max_active_sessions ✓"
+            log "city.toml: no [[patches.agent]] override of max_active_sessions for wa-worker, ps-worker or gate-reviewer ✓"
             ;;
         2)
             # "Cannot determine" (missing tomllib, unreadable/unparseable file) is a
@@ -85,13 +86,15 @@ PY
             # <3.11 interpreter (e.g. this host's own /usr/bin/python3 is 3.9.6),
             # even though no override exists and the real cause is tooling, not drift.
             log "city.toml override check: cannot determine ($PY_OUT) — soft skip, not a failure"
+            SKIPPED="$SKIPPED city.toml-override-check"
             ;;
         *)
-            fail "city.toml [[patches.agent]] for wa-worker sets max_active_sessions — agent.toml is no longer the single source ($PY_OUT)"
+            fail "city.toml [[patches.agent]] for wa-worker/ps-worker/gate-reviewer sets max_active_sessions — agent.toml (+ the fragment) is no longer the only source ($PY_OUT)"
             ;;
     esac
 else
     log "python3 unavailable — skipping city.toml override check (soft skip, not a failure)"
+    SKIPPED="$SKIPPED city.toml-override-check"
 fi
 
 # ── 3. The generated pool-ceiling fragment (ga-m9x0lb.2): present when included, exactly what the engine writes ──
@@ -99,7 +102,9 @@ fi
 # max_active_sessions = N, plus comments and blanks. Anything else is FOREIGN: the effective ceiling would be unknowable.
 FRAGMENT="${POOL_CEILING_ENGINE_FRAGMENT:-$CITY/.gc/pool-ceiling-engine.toml}"
 INCLUDED=0
-if grep -v '^[[:space:]]*#' "$CITY_TOML" 2>/dev/null | grep -qF "$(basename "$FRAGMENT")"; then INCLUDED=1; fi
+CITY_LIVE=$(grep -v '^[[:space:]]*#' "$CITY_TOML" 2>/dev/null); LIVE_RC=$?   # rc 1 = no live lines (all comments), rc >= 2 = could not read
+[[ "$LIVE_RC" -le 1 ]] || fail "cannot read $CITY_TOML to look for the include (grep rc $LIVE_RC)"
+case "$CITY_LIVE" in *"$(basename "$FRAGMENT")"*) INCLUDED=1 ;; esac
 FRAG_ENTRIES=""
 if [[ -e "$FRAGMENT" ]]; then
     FRAG_ENTRIES=$(awk '
@@ -115,6 +120,10 @@ if [[ -e "$FRAGMENT" ]]; then
     ' "$FRAGMENT") || fail "$FRAGMENT has FOREIGN content (not what pool-ceiling-engine.sh writes): the effective ceilings are unknowable"
     FRAG_ENTRIES=$(printf '%s' "$FRAG_ENTRIES" | tr '\n' ' ')
     log "fragment $FRAGMENT well-formed (entries: ${FRAG_ENTRIES:-none}) ✓"
+    # A file the controller never loads is not in force: reading its entries as the effective ceiling is the ga-o3o09z drift itself.
+    if [[ -n "${FRAG_ENTRIES// /}" && "$INCLUDED" != 1 ]]; then
+        fail "$FRAGMENT has entries (${FRAG_ENTRIES}) but city.toml does not include it: the controller applies none of them"
+    fi
 elif [[ "$INCLUDED" == 1 ]]; then
     fail "city.toml includes $(basename "$FRAGMENT") but $FRAGMENT is ABSENT — gc config load error (the kill switch EMPTIES the fragment, it never deletes it)"
 else
@@ -146,6 +155,7 @@ if [[ -f "$PILOT_PLIST" ]]; then
     PLIST_MAX=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:PILOT_WA_WORKER_MAX" "$PILOT_PLIST" 2>/dev/null || true)
     if [[ -z "$PLIST_MAX" ]]; then
         log "PILOT_WA_WORKER_MAX not set in $PILOT_PLIST — nothing to cross-check, skipping (soft skip)"
+        SKIPPED="$SKIPPED pilot-ceiling-crosscheck"
     elif ! [[ "$PLIST_MAX" =~ ^[0-9]+$ ]]; then
         fail "PILOT_WA_WORKER_MAX in $PILOT_PLIST is not a plain integer: '$PLIST_MAX'"
     elif [[ "$PLIST_MAX" -gt "$WA_EFF" ]]; then
@@ -155,6 +165,7 @@ if [[ -f "$PILOT_PLIST" ]]; then
     fi
 else
     log "$PILOT_PLIST not found on this host — skipping Pilot plist cross-check (soft skip, not a failure)"
+    SKIPPED="$SKIPPED pilot-ceiling-crosscheck"
 fi
 
 # ── 5. The sum of the effective ceilings fits GC_VARIABLE_SESSION_MAX ─────────
@@ -164,21 +175,21 @@ BUDGET=""
 [[ -f "$PILOT_PLIST" ]] && BUDGET=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:GC_VARIABLE_SESSION_MAX" "$PILOT_PLIST" 2>/dev/null || true)
 if ! [[ "$BUDGET" =~ ^[0-9]+$ ]]; then
     log "GC_VARIABLE_SESSION_MAX not readable from $PILOT_PLIST — skipping the sum check (soft skip)"
+    SKIPPED="$SKIPPED sum-vs-GC_VARIABLE_SESSION_MAX"
 else
-    SUM=0; UNREADABLE=""
+    SUM=0
     for pool in wa-worker ps-worker gate-reviewer; do
         eff=$(frag_level "$pool")
         [[ -n "$eff" ]] || eff=$(agent_cap "$CITY/agents/$pool/agent.toml")
-        if [[ "$eff" =~ ^[0-9]+$ ]]; then SUM=$((SUM + eff)); else UNREADABLE="$UNREADABLE $pool"; fi
+        [[ "$eff" =~ ^[0-9]+$ ]] || fail "effective ceiling of $pool unreadable ($CITY/agents/$pool/agent.toml has no integer max_active_sessions): the sum cannot be checked, and unknown is not 'fits'"
+        SUM=$((SUM + eff))
     done
-    if [[ -n "$UNREADABLE" ]]; then
-        log "effective ceiling unreadable for:${UNREADABLE} — skipping the sum check (soft skip)"
-    elif [[ "$SUM" -gt "$BUDGET" ]]; then
+    if [[ "$SUM" -gt "$BUDGET" ]]; then
         fail "sum of the effective ceilings (wa-worker+ps-worker+gate-reviewer) = $SUM > GC_VARIABLE_SESSION_MAX=$BUDGET"
     else
         log "sum of the effective ceilings = $SUM <= GC_VARIABLE_SESSION_MAX=$BUDGET ✓"
     fi
 fi
 
-log "PASS — agents/wa-worker/agent.toml (+ the engine's generated fragment, the only other sanctioned source) defines the controller's wa-worker ceiling ($WA_EFF), and the Pilot's own ceiling does not disagree"
+log "PASS — agents/wa-worker/agent.toml (+ the engine's generated fragment, the only other sanctioned source) defines the controller's wa-worker ceiling ($WA_EFF), and the Pilot's own ceiling does not disagree${SKIPPED:+ (NOT CHECKED, soft-skipped:$SKIPPED)}"
 exit 0
