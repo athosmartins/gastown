@@ -1845,8 +1845,8 @@ EOF
   # FAIL. So each property has a scenario, and the scenario is run twice: on the real daemon (it must hold), and on a copy of the daemon
   # with that one property broken on purpose (it must NOT hold - B78). A scenario that passes on the broken copy proves nothing, and one
   # whose broken copy does not even run its world (`world:` in WHY) is reported as vacuous, not as caught.
-  REAL_D="$DAEMON"
-  n_reqs()       { [ -s "$D/probes.log.reqs" ] && wc -l < "$D/probes.log.reqs" | tr -d ' ' || echo 0; }
+  REAL_D="$DAEMON"; REAL_SUM="$(shasum -a 256 < "$REAL_D" 2>/dev/null | cut -d' ' -f1)"      # B78z compares against this: empty = could not read it = the check fails
+  n_reqs()      { [ -s "$D/probes.log.reqs" ] && wc -l < "$D/probes.log.reqs" | tr -d ' ' || echo 0; }
   n_served()     { awk '$3 >= 200 && $3 < 300' "$D/probes.log.reqs" 2>/dev/null | wc -l | tr -d ' '; }      # answered with a 2xx: the calls that cost something
   n_not_probe()  { awk '!($1 == "POST" && $2 == "/v1/messages")' "$D/probes.log.reqs" 2>/dev/null | wc -l | tr -d ' '; }
   claude_calls() { [ -s "$D/kc/claude.calls" ] && wc -l < "$D/kc/claude.calls" | tr -d ' ' || echo 0; }
@@ -2016,8 +2016,10 @@ EOF
   caught B78f "a confirmation probe of the account a failback returns to" scn_requests "$(mutant fbprobe '        key = keys.token(e)' "        key = keys.token(e)${NL}        probe(key) if key else None")" "the failback probed the account it returns to"
   caught B78g "a refused key (401/403) read as 'cannot tell'"      scn_refused "$(mutant nokey '    if status in (401, 403):' '    if False:')" "[401 on the active a: the pool stayed on 'a@t.test']"
   caught B78h "an unexpected HTTP status read as a limit"          scn_unknown "$(mutant unk '    return Probe("unknown", None, "", f"http={status}")' '    return Probe("rejected", t + DEFAULT_COOLDOWN_S, "", f"http={status}")')" "[http-500: left a"
-  DAEMON="$REAL_D"
-  [ "$DAEMON" = "$REAL_D" ] && ! grep -q 'mutant' "$DAEMON" && ok "B78z the daemon under test is the real one again after the broken copies (the rest of the file ran on it)" || bad "B78z DAEMON was left pointing at a broken copy ($DAEMON)"
+  # what `caught` left in DAEMON is what the rest of the file runs on: it must be the real daemon, byte for byte (not a path we just set by hand)
+  [ "$DAEMON" = "$REAL_D" ] && [ -n "$REAL_SUM" ] && [ "$(shasum -a 256 < "$DAEMON" 2>/dev/null | cut -d' ' -f1)" = "$REAL_SUM" ] \
+    && ok "B78z the daemon under test is the real one again after the broken copies (same path, same sha256 as before them: the rest of the file ran on it)" \
+    || bad "B78z DAEMON is '$DAEMON' with sha256 '$(shasum -a 256 < "$DAEMON" 2>/dev/null | cut -c1-12)', want '$REAL_D' with '$(printf '%s' "$REAL_SUM" | cut -c1-12)' (or the daemon could not be read)"
 
 [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
 

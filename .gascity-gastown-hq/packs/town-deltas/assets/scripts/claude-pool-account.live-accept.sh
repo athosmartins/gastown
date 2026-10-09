@@ -205,8 +205,11 @@ daemon >/dev/null 2>&1
 # What the daemon sent to the (mock) API, one line each: "METHOD PATH STATUS FINGERPRINT" - the fingerprint names the account the call was made AS.
 reqs_n() { if [ -f "$W/mock.json.reqs" ]; then wc -l < "$W/mock.json.reqs" | tr -d ' '; else echo 0; fi; }
 req_lines() { tail -n +"$(( $1 + 1 ))" "$W/mock.json.reqs" 2>/dev/null; }          # req_lines <n0>: every request after the first n0
-switches() { grep -c "SWITCH " "$W/city/.gc/logs/claude-pool-account.log" 2>/dev/null || true; }
+switches() { # how many SWITCH lines the daemon has logged; NA when the log cannot be read (never an empty answer that two reads would agree on)
+  if [ -r "$W/city/.gc/logs/claude-pool-account.log" ]; then grep -c "SWITCH " "$W/city/.gc/logs/claude-pool-account.log" 2>/dev/null || true; else echo NA; fi
+}
 SW0="$(switches)"
+case "$SW0" in ''|*[!0-9]*) bad "P3.0a the daemon's log cannot be read ('$SW0'): the no-SWITCH checks (P3.0b, P3.1b) and the SWITCH count (P3.7) below cannot tell" ;; *) ok "P3.0a the daemon's log is readable ($SW0 SWITCH line(s) logged before the P3 runs)" ;; esac
 n0="$(reqs_n)"; daemon >/dev/null 2>&1
 r="$(req_lines "$n0")"
 [ "$r" = "POST /v1/messages 200 $(fp "$TOK_OK")" ] && [ "$(jget current)" = "$EMAIL_OK" ] && [ "$(switches)" = "$SW0" ] \
