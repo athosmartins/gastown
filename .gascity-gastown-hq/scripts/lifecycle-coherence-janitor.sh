@@ -182,6 +182,13 @@ _strip() {  # store id label
   [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would strip $3 from $2"; return 0; }
   "$BD" -C "$1" label remove "$2" "$3" -q >/dev/null 2>&1 || true
 }
+_strip_checked() {  # store id label — like _strip, but RETURNS bd's verdict (ga-a05uwz)
+  # _strip swallows bd errors (`|| true`), so a caller can never tell a strip that landed from
+  # one Dolt rejected. R5 now logs "stripped" only when it was, and stops a batch when bd keeps
+  # failing (a swallowed failure would log a strip that never happened and retry it silently).
+  [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would strip $3 from $2"; return 0; }
+  "$BD" -C "$1" label remove "$2" "$3" -q >/dev/null 2>&1
+}
 _open() {   # store id
   [ "$LCJ_DRY_RUN" = "1" ] && { log "  DRY: would set $2 status=open"; return 0; }
   "$BD" -C "$1" update "$2" --status open -q >/dev/null 2>&1 || true
@@ -567,6 +574,50 @@ _r5_stranded_notify_once() {  # bead-id message → notify_fail at most once per
   notify_fail "$msg"
 }
 
+# ── R5 backlog economics (ga-a05uwz) ────────────────────────────────────────
+# Live 2026-10-09: ~1,429 closed beads carried ctx:ready that R5 could never settle, so every
+# sweep re-ran `bd show` + a per-bead `git for-each-ref` over the same set (a 10-minute sweep
+# took 72 min to 2h24 and kept git/bd busy on an already overloaded box). Two classes never left
+# R5's list: "unresolved" (no merge proof → the bead was left untouched) and closed+story:done
+# (hit a silent `continue`, ctx:ready never stripped). Both now shed their ctx:ready — the only
+# thing R5 may do without proof — so they leave the list after ONE visit. The initial drain of
+# a backlog that size is bounded per store per sweep (R5_BATCH_MAX, default 100) and paced
+# (R5_STRIP_PACE_SEC between mutations, default 0.5s) instead of ~1.4k calls in a burst.
+_r5_pace() {  # breathing room between backlog mutations; never in DRY_RUN
+  [ "$LCJ_DRY_RUN" = "1" ] && return 0
+  case "${R5_STRIP_PACE_SEC:-0.5}" in 0|0.0) return 0 ;; esac
+  sleep "${R5_STRIP_PACE_SEC:-0.5}" 2>/dev/null || true
+}
+_r5_candidate_ids() {  # list-json done(true|false) → R5 candidates (not cancelled / cancel-reason / gate-failed) split by story:done
+  printf '%s' "$1" | jq -r --arg re "$LCJ_CANCEL_RE" --argjson done "$2" \
+    '.[] | select(([.labels[]?]|index("story:cancelled"))|not)
+         | select(((.close_reason // "") | test($re; "i")) | not)
+         | select(([.labels[]?]|any(test("^gate:failed(:.*)?$|^gate:needs-fix(:.*)?$")))|not)
+         | select(([.labels[]?]|index("story:done") != null) == $done)
+         | .id' 2>/dev/null
+}
+# The ONLY mutation R5 applies without merge proof: drop the leftover ctx:ready of a CLOSED bead
+# (no story:done — nothing proves delivery; nothing is dispatched — the bead is closed). Runs
+# inside run_sweep and updates ITS locals ($n, $_r5_acted, $_r5_failrun, $_r5_abort) by bash
+# dynamic scoping, so the done-class and unresolved paths share one failure policy: log
+# "stripped" only if bd accepted it, and 3 consecutive rejections abort the store's batch.
+_r5_strip_ctx_ready() {  # store id log-tag reason
+  local store="$1" id="$2" tag="$3" why="$4"
+  _r5_acted=$((_r5_acted+1))
+  if _strip_checked "$store" "$id" ctx:ready; then
+    _r5_failrun=0; n=$((n+1))
+    log "R5 $tag (ga-a05uwz): $id ($(basename "$store")) — $why"
+    _r5_pace
+  else
+    _r5_failrun=$((_r5_failrun+1))
+    log "R5 strip-failed (ga-a05uwz): $id ($(basename "$store")) — bd label remove ctx:ready was rejected; still in R5's list, retried next sweep"
+    if [ "$_r5_failrun" -ge 3 ]; then
+      _r5_abort=1
+      log "R5 abort (ga-a05uwz): $(basename "$store") — $_r5_failrun consecutive strip failures (bd/Dolt unhealthy); stopping this store's R5 batch until the next sweep instead of hammering it"
+    fi
+  fi
+}
+
 run_sweep() {
   if [ "$LCJ_ENABLED" != "1" ]; then log "disabled (LCJ_ENABLED!=1)"; return 0; fi
   # imp10: sweep-level mutual exclusion — only one janitor sweep at a time.
@@ -807,45 +858,60 @@ run_sweep() {
     # ga-to242 AC3: "closed" is NOT proof of "merged" — the ga-6plfv partial fix only
     # caught beads still carrying gate:failed/needs-fix at sweep time. Require positive
     # git-ancestry evidence (see _r5_merge_verdict above) before stamping story:done.
+    # ga-a05uwz: a closed bead's ctx:ready is vestigial whatever the merge verdict — stripping
+    # it dispatches nothing and leaves delivery state alone — so R5 settles EVERY candidate it
+    # visits except the stranded ones (unmerged branch: kept visible for manual recovery) and
+    # the gate-failed ones (parked on purpose, handled below). A candidate therefore costs one
+    # visit, not one per sweep; see the "R5 backlog economics" block above for the live numbers.
     local _r5_list; _r5_list=$("$BD" -C "$store" list -l ctx:ready --status closed --json -n 0 2>/dev/null)
-    # Fetch ONCE per store, only if there's at least one candidate — not once per bead/
-    # branch inside _branch_merged_state (see comment on that function for why: a live
-    # backlog of ~148 candidates in one store was observed while verifying this fix).
-    # --prune: without it, a branch deleted on origin after merging (confirmed live —
-    # not every rig keeps merged branches around the way gascity/HQ's fix/* convention
-    # does) leaves a STALE local refs/remotes/origin/* entry behind; rev-parse would
-    # then "successfully" resolve that stale tip and merge-base would ancestor-check
-    # against content that no longer represents anything real on the remote, instead of
-    # correctly reporting "missing" (which _r5_merge_verdict's mixed-signal handling
-    # above depends on to avoid a false "stranded").
-    if [ -n "$(printf '%s' "$_r5_list" | jq -r '.[0].id // empty' 2>/dev/null)" ]; then
-      "$LCJ_GIT" -C "$store" fetch origin --prune --quiet 2>/dev/null
-    fi
-    for id in $(printf '%s' "$_r5_list" | jq -r --arg re "$LCJ_CANCEL_RE" \
-                '.[] | select(([.labels[]?]|index("story:cancelled"))|not)
-                     | select(((.close_reason // "") | test($re; "i")) | not)
-                     | select(([.labels[]?]|any(test("^gate:failed(:.*)?$|^gate:needs-fix(:.*)?$")))|not)
-                     | .id' 2>/dev/null); do
+    local _r5_cap="${R5_BATCH_MAX:-100}" _r5_acted=0 _r5_deferred=0 _r5_failrun=0 _r5_abort=0 _r5_fetched=0
+    # (a) already story:done: only the leftover ctx:ready zombie remains. No git, no bd show —
+    # the labels are in the list JSON we already hold. (Before ga-a05uwz these hit a silent
+    # `continue` and cost a `bd show` per bead per sweep forever: 845 of WA's 1,429.)
+    for id in $(_r5_candidate_ids "$_r5_list" true); do
       [ -n "$id" ] || continue
+      [ "$_r5_abort" = 1 ] && break
       _bead_locked "$id" && { log "R5 skip-locked (imp10): $id — advisory lock active"; continue; }
-      # Skip if already has story:done (idempotent safety)
-      if "$BD" -C "$store" show "$id" --json 2>/dev/null \
-          | jq -e 'if type=="array" then .[0] else . end | (.labels // []) | any(. == "story:done")' \
-          >/dev/null 2>&1; then continue; fi
+      [ "$_r5_acted" -ge "$_r5_cap" ] && { _r5_deferred=$((_r5_deferred+1)); continue; }
+      _r5_strip_ctx_ready "$store" "$id" ctx-ready-vestigial-done "closed+story:done, stripped the leftover ctx:ready (delivery state untouched)"
+    done
+    # (b) no story:done yet: needs merge proof before story:done may be stamped.
+    for id in $(_r5_candidate_ids "$_r5_list" false); do
+      [ -n "$id" ] || continue
+      [ "$_r5_abort" = 1 ] && break
+      _bead_locked "$id" && { log "R5 skip-locked (imp10): $id — advisory lock active"; continue; }
+      [ "$_r5_acted" -ge "$_r5_cap" ] && { _r5_deferred=$((_r5_deferred+1)); continue; }
+      # Fetch ONCE per store, lazily on the first bead that really needs verifying — not once
+      # per bead/branch inside _branch_merged_state (see comment on that function for why: a
+      # live backlog of ~148 candidates in one store was observed while verifying this fix).
+      # --prune: without it, a branch deleted on origin after merging (confirmed live —
+      # not every rig keeps merged branches around the way gascity/HQ's fix/* convention
+      # does) leaves a STALE local refs/remotes/origin/* entry behind; rev-parse would
+      # then "successfully" resolve that stale tip and merge-base would ancestor-check
+      # against content that no longer represents anything real on the remote, instead of
+      # correctly reporting "missing" (which _r5_merge_verdict's mixed-signal handling
+      # above depends on to avoid a false "stranded").
+      [ "$_r5_fetched" = 1 ] || { "$LCJ_GIT" -C "$store" fetch origin --prune --quiet 2>/dev/null; _r5_fetched=1; }
       case "$(_r5_merge_verdict "$store" "$id")" in
         merged)
+          _r5_acted=$((_r5_acted+1))
           _strip "$store" "$id" ctx:ready; _strip "$store" "$id" pilot:dispatched; _add "$store" "$id" story:done
           log "R5 ctx-ready-vestigial: $id ($(basename "$store")) — verified merged, stripped ctx:ready, set story:done"; n=$((n+1))
+          _r5_pace
           ;;
         stranded)
+          # Deliberately NOT settled (and not counted against the cap): the unmerged branch is
+          # the only breadcrumb a human has for a false-close, and notify-once keeps it quiet.
           log "R5 skip-stranded (ga-to242 AC3): $id ($(basename "$store")) — closed+ctx:ready but its candidate branch exists on origin and is NOT merged into origin/main; NOT stamping story:done (wa-g1b58 false-close shape)"
           _r5_stranded_notify_once "$id" "lifecycle-coherence-janitor: $id ($(basename "$store")) closed+ctx:ready but its branch is UNMERGED — possible false-close, needs manual recovery (ga-to242 AC3)"
           ;;
         unresolved)
-          log "R5 skip-unverified (ga-to242 AC3): $id ($(basename "$store")) — closed+ctx:ready but no branch found matching bead-id naming conventions; cannot confirm merge, NOT stamping story:done"
+          # ga-a05uwz: NO story:done (no proof), but the ctx:ready goes — see the block comment.
+          _r5_strip_ctx_ready "$store" "$id" unverified-stripped "closed+ctx:ready but no merge proof (no branch matching the bead-id naming conventions); stripped ONLY ctx:ready, NOT stamping story:done (ga-to242 AC3). Logged once: the bead leaves R5's sweep"
           ;;
       esac
     done
+    [ "$_r5_deferred" -gt 0 ] && log "R5 batch-cap (ga-a05uwz): $(basename "$store") — settled $_r5_acted candidate(s) this sweep, $_r5_deferred deferred to the next (R5_BATCH_MAX=$_r5_cap, paced ${R5_STRIP_PACE_SEC:-0.5}s)"
     # ga-6plfv (AC3, partial/zero-git-risk subset — full merge-ancestry
     # verification deferred, see file header): a closed+ctx:ready bead that
     # STILL carries gate:failed/gate:needs-fix is definitely not "done" — R5's
@@ -1237,7 +1303,11 @@ if [ "${1:-}" = "--selftest" ]; then
   # r5m: candidate branch fix/r5m-some-fix IS an ancestor of origin/main → story:done (merged path)
   # r5s: candidate branch fix/r5s-some-fix EXISTS on origin but is NOT an ancestor → left alone,
   #      logged "skip-stranded", notified once (the wa-g1b58 false-close shape)
-  # r5u: NO branch matches any naming convention → left alone, logged "skip-unverified", no notify
+  # r5u: NO branch matches any naming convention → ga-a05uwz: ONLY ctx:ready is stripped (no
+  #      story:done — nothing proves it merged; the bead is closed, so the strip dispatches nothing),
+  #      logged once, no notify. The old "left alone" behaviour re-verified it every sweep forever.
+  # r5-donevest: closed + ctx:ready + story:done (ga-a05uwz) — already done, only the leftover
+  #      ctx:ready zombie remains → stripped with NO git verification and nothing else touched.
   # r9dot.1: dot-escaping regression (mirrors R7's wa-8yw4i.1/sling-8yw4iX1 pair) — its REAL
   #      branch fix/r9dot.1-real is UNMERGED (stranded); a DECOY branch fix/r9dotX1-decoy
   #      (literal X where r9dot.1 has a literal dot) IS merged. If the dot were treated as
@@ -1285,7 +1355,7 @@ case "\$a" in
   *"list --status in_progress"*)                echo '[{"id":"ip-noasg","assignee":"","updated_at":"2020-01-01T00:00:00Z"},{"id":"ip-fresh","assignee":"","updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"},{"id":"ip-asg","assignee":"mila-wa"},{"id":"ip-gate-active","assignee":"","updated_at":"2020-01-01T00:00:00Z"}]' ;;
   *"list -l story:approved --status open"*)     echo '[{"id":"r4-asg","assignee":"mila-wa","labels":["story:approved"],"updated_at":"2020-01-01T00:00:00Z"},{"id":"r4-human","assignee":"mila-wa","labels":["story:approved","gate:needs-human:foo"]},{"id":"r4-human-bare","assignee":"mila-wa","labels":["story:approved","gate:needs-human"]},{"id":"r4-live","assignee":"crew-live","labels":["story:approved"]},{"id":"r4-ambiguous","assignee":"crew-ambiguous","labels":["story:approved"]},{"id":"r4-deacon","assignee":"deacon","labels":["story:approved"]},{"id":"r4-canon-blocked","assignee":"mila-wa","labels":["story:approved","blocked:needs-oracle-approval"],"updated_at":"2020-01-01T00:00:00Z"},{"id":"r4-recent-dead","assignee":"mila-wa","labels":["story:approved"],"updated_at":"'"$(date -u '+%Y-%m-%dT%H:%M:%SZ')"'"}]' ;;
   *"list -l ctx:ready --status open"*)          echo '[]' ;;
-  *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]},{"id":"r5-byreason","labels":["ctx:ready"],"close_reason":"discontinued: replaced by wa-xyz redesign"},{"id":"r5-gate-failed","labels":["ctx:ready","gate:failed","gate:needs-fix"]},{"id":"r5m","labels":["ctx:ready"]},{"id":"r5s","labels":["ctx:ready"]},{"id":"r5u","labels":["ctx:ready"]},{"id":"r9dot.1","labels":["ctx:ready"]},{"id":"r5mb","labels":["ctx:ready"]},{"id":"r5mm","labels":["ctx:ready"]}]' ;;
+  *"list -l ctx:ready --status closed"*)        echo '[{"id":"r5","labels":["ctx:ready"]},{"id":"r5-locked","labels":["ctx:ready"]},{"id":"r5-cancel","labels":["ctx:ready","story:cancelled"]},{"id":"r5-byreason","labels":["ctx:ready"],"close_reason":"discontinued: replaced by wa-xyz redesign"},{"id":"r5-gate-failed","labels":["ctx:ready","gate:failed","gate:needs-fix"]},{"id":"r5m","labels":["ctx:ready"]},{"id":"r5s","labels":["ctx:ready"]},{"id":"r5u","labels":["ctx:ready"]},{"id":"r9dot.1","labels":["ctx:ready"]},{"id":"r5mb","labels":["ctx:ready"]},{"id":"r5mm","labels":["ctx:ready"]},{"id":"r5-donevest","labels":["ctx:ready","story:done"]}]' ;;
   *"show r5 "*|*"show r5-locked "*)             echo '[{"id":"r5","labels":["ctx:ready"]}]' ;;
   *"show r5m"*)                                 echo '[{"id":"r5m","labels":["ctx:ready"]}]' ;;
   *"show r5s"*)                                 echo '[{"id":"r5s","labels":["ctx:ready"]}]' ;;
@@ -1463,6 +1533,11 @@ esac
 GITSHIM
   chmod +x "$TMP/git"
   # Reassign script vars DIRECTLY (top-level reads happen at LOAD, before this block).
+  R5_STRIP_PACE_SEC=0  # ga-a05uwz: no real sleeps between shimmed mutations
+  # The advisory-lock TTL (30 s) is wall-clock: on the overloaded box a full sweep outlasts it, the
+  # planted r8-locked/r9pd-locked locks expire before R8/R9 run, and those two "skipped the locked
+  # bead" assertions fail on an untouched HEAD (observed 2026-10-09, load ~76, 211 s selftest).
+  LIFECYCLE_LOCK_TTL=3600
   BD="$TMP/bd"; GC="$TMP/gc"; LCJ_STORES="$TMP"; LOG="$TMP/log"; LCJ_DRY_RUN=0; LCJ_ENABLED=1
   LCJ_NOTIFY="$TMP/notify"; LCJ_GIT="$TMP/git"
   LCJ_GATE_CITY="$TMP"  # ga-ibz0: route _gate_active_beads() through the same shim
@@ -1527,11 +1602,20 @@ GITSHIM
   grep -q 'label remove r5m ctx:ready'        "$ACT" && ok "R5 AC3: r5m ctx:ready stripped on the merged path" || bad "R5 AC3: r5m ctx:ready not stripped"
   grep -q 'r5s'                               "$ACT" && bad "R5 AC3: TOUCHED r5s (branch exists but UNMERGED — must never stamp story:done, wa-g1b58 false-close shape)" || ok "R5 AC3: left r5s alone (stranded — branch found but not merged)"
   grep -q 'r5s' "$NOTIFY_LOG" 2>/dev/null     && ok "R5 AC3: stranded finding (r5s) was escalated via notify_fail" || bad "R5 AC3: stranded finding (r5s) was NOT notified — silent false-close risk"
-  grep -q 'r5u'                               "$ACT" && bad "R5 AC3: TOUCHED r5u (no branch found at all — must never stamp story:done)" || ok "R5 AC3: left r5u alone (unresolved — no branch found)"
+  # ga-a05uwz: "unresolved" used to leave the bead untouched, so every sweep re-verified the
+  # same ~1,4k closed beads forever (a 10-min sweep took 2h24). Now the leftover ctx:ready is
+  # stripped (it is vestigial on a closed bead, and stripping it dispatches nothing) but
+  # story:done is NEVER stamped without merge proof.
+  grep -q 'label remove r5u ctx:ready'        "$ACT" && ok "R5 (ga-a05uwz): unverified (no branch found) → ctx:ready stripped, the bead leaves R5's sweep" || bad "R5 (ga-a05uwz): r5u (no branch found) kept its ctx:ready — it would be re-verified every sweep forever"
+  grep -q 'label add r5u '                    "$ACT" && bad "R5 AC3: stamped a label on r5u (no branch found at all — must never stamp story:done without merge proof)" || ok "R5 AC3: r5u got no story:done (unresolved — no merge proof)"
+  grep -q 'r5-donevest'                       "$ACT" && ok "R5 (ga-a05uwz): closed+ctx:ready+story:done → touched" || bad "R5 (ga-a05uwz): r5-donevest (already story:done) was never touched — its leftover ctx:ready costs a lookup every sweep forever"
+  grep -q 'label remove r5-donevest ctx:ready' "$ACT" && ok "R5 (ga-a05uwz): closed+ctx:ready+story:done → leftover ctx:ready stripped" || bad "R5 (ga-a05uwz): r5-donevest kept its leftover ctx:ready"
+  grep -q 'label add r5-donevest'             "$ACT" && bad "R5 (ga-a05uwz): relabelled an already-story:done bead (r5-donevest) — only ctx:ready may go" || ok "R5 (ga-a05uwz): r5-donevest's lifecycle labels untouched (strip-only)"
   grep -q 'r5u' "$NOTIFY_LOG" 2>/dev/null     && bad "R5 AC3: notified for r5u (unresolved/no-branch is the expected common case, not push-worthy — only 'stranded' should notify)" || ok "R5 AC3: did not notify for r5u (unresolved stays log-only, avoiding notification spam)"
   grep -q 'r9dot.1'                           "$ACT" && bad "R5 AC3 dot-escaping regression: r9dot.1 got touched via its UNMERGED real branch leaking a match from the MERGED decoy (fix/r9dotX1-decoy) — dot was treated as ERE any-char instead of literal" || ok "R5 AC3: dot-escaping correct — r9dot.1 (unmerged real branch) did not pick up the merged decoy's verdict"
   grep -q 'label add r5mb story:done'         "$ACT" && ok "R5 AC3 multi-branch (real shape: ga-26df had 3 attempt branches): an UNMERGED first candidate does not short-circuit — a LATER merged candidate still stamps story:done" || bad "R5 AC3 multi-branch: r5mb (2 candidates, 2nd merged) did NOT get story:done — early-unmerged wrongly won"
-  grep -q 'r5mm'                               "$ACT" && bad "R5 AC3 mixed-signal false-positive (real shape: wa-1t8x9/wa-tkvwb — the winning branch was deleted after merge, an unrelated abandoned attempt lingers): r5mm was TOUCHED — a missing+unmerged mix must never be confident enough for 'stranded'" || ok "R5 AC3 mixed-signal: r5mm (1 missing candidate + 1 unmerged candidate) left alone — correctly downgraded to unresolved, not falsely 'stranded'"
+  grep -q 'label add r5mm '                    "$ACT" && bad "R5 AC3 mixed-signal false-positive (real shape: wa-1t8x9/wa-tkvwb — the winning branch was deleted after merge, an unrelated abandoned attempt lingers): r5mm got a label stamped — a missing+unmerged mix must never be confident enough for story:done" || ok "R5 AC3 mixed-signal: r5mm (1 missing candidate + 1 unmerged candidate) got no story:done — correctly downgraded to unresolved, not falsely 'stranded'"
+  grep -q 'label remove r5mm ctx:ready'        "$ACT" && ok "R5 (ga-a05uwz): r5mm (unresolved) → ctx:ready stripped like r5u" || bad "R5 (ga-a05uwz): r5mm (unresolved) kept its ctx:ready"
   grep -q 'r5mm' "$NOTIFY_LOG" 2>/dev/null     && bad "R5 AC3 mixed-signal: notified for r5mm — 'unresolved' must stay log-only like r5u, not escalate on an inconclusive mix" || ok "R5 AC3 mixed-signal: did not notify for r5mm (correctly treated as unresolved, not stranded)"
 
   grep -q 'r5-locked'                         "$ACT" && bad "imp10: touched a lifecycle-locked bead (must be skipped)" || ok "imp10: skipped the advisory-locked bead (r5-locked)"
@@ -1666,6 +1750,97 @@ GITSHIM
   # the ledger bookkeeping still advances/clears as if it had acted,
   # exactly the false-pass this reset prevents.
   LCJ_DRY_RUN=0
+
+  # ── R5 backlog drain, across sweeps (ga-a05uwz) ────────────────────────────
+  # Live 2026-10-09: ~1,429 closed beads carried ctx:ready that R5 could never verify
+  # ("unresolved" never mutated the bead, and the already-story:done ones hit a silent
+  # `continue`), so EVERY sweep re-ran `bd show` + a per-bead `git for-each-ref` over the same
+  # set — a 10-minute sweep took 72 min to 2h24. The main-flow shim above is STATELESS (fixed
+  # JSON), so it can show what ONE sweep does to a bead but never what the NEXT sweep does
+  # about it — which is the whole bug. This shim is stateful: a bead whose ctx:ready was
+  # stripped disappears from the next `list -l ctx:ready --status closed`, exactly as in bd.
+  # It also records every `bd show` and (via the git wrapper) every git call, so "the 2nd
+  # sweep doesn't even look at it" is measured as zero lookups, not inferred from a label.
+  export R5T_DIR="$TMP" R5T_ACT="$ACT"
+  cat > "$TMP/bd-r5" <<'R5SHIM'
+#!/usr/bin/env bash
+a="$*"
+case "$a" in
+  *"list -l ctx:ready --status closed"*)
+    jq -c --rawfile s "$R5T_DIR/r5-stripped" '($s | split("\n")) as $x | map(select(.id as $i | ($x | index($i)) | not))' "$R5T_DIR/r5-cands.json" ;;
+  *" show "*) echo "$a" >> "$R5T_DIR/r5-show-calls"; echo '[]' ;;
+  *"label remove"*)
+    echo "$a" >> "$R5T_DIR/r5-attempts"
+    [ "${LCJ_TEST_R5_STRIP_FAIL:-0}" = "1" ] && exit 1
+    echo "$a" >> "$R5T_ACT"
+    printf '%s\n' "$a" | awk '{for(i=1;i<=NF;i++) if ($i=="remove" && $(i+2)=="ctx:ready") print $(i+1)}' >> "$R5T_DIR/r5-stripped" ;;
+  *"label add"*|*"update"*|*"dolt commit"*|*"undefer"*) echo "$a" >> "$R5T_ACT" ;;
+  *) echo '[]' ;;
+esac
+R5SHIM
+  chmod +x "$TMP/bd-r5"
+  cat > "$TMP/git-r5" <<'R5GIT'
+#!/usr/bin/env bash
+echo "$*" >> "$R5T_DIR/git-calls"
+exec "$R5T_DIR/git" "$@"
+R5GIT
+  chmod +x "$TMP/git-r5"
+  _r5t_reset() { : > "$TMP/r5-stripped"; : > "$TMP/r5-show-calls"; : > "$TMP/r5-attempts"; : > "$TMP/git-calls"; : > "$ACT"; }
+  _r5t_count() { local c; c=$(grep -c -- "$1" "$2" 2>/dev/null) || true; echo "${c:-0}"; }
+  BD_MAIN="$BD"; GIT_MAIN="$LCJ_GIT"; BD="$TMP/bd-r5"; LCJ_GIT="$TMP/git-r5"
+  R5_BATCH_MAX=100
+
+  # Scenario 1 — the bead's own acceptance test: closed+ctx:ready with no branch → the 1st sweep
+  # strips ctx:ready, the 2nd doesn't even look at it. Controls: an already-story:done bead
+  # (strip only, no git), a merged one (still stamped story:done), a stranded one (still alone).
+  _r5t_reset
+  echo '[{"id":"s2-unv","labels":["ctx:ready"]},{"id":"s2-done","labels":["ctx:ready","story:done"]},{"id":"r5m","labels":["ctx:ready"]},{"id":"r5s","labels":["ctx:ready"]}]' > "$TMP/r5-cands.json"
+  run_sweep
+  grep -q 'label remove s2-unv ctx:ready' "$ACT" && ok "R5 2-sweep (ga-a05uwz): sweep 1 strips ctx:ready from the unverifiable bead" || bad "R5 2-sweep (ga-a05uwz): sweep 1 did not strip ctx:ready from s2-unv"
+  grep -q 'label add s2-unv' "$ACT" && bad "R5 2-sweep (ga-a05uwz): stamped a label on s2-unv without merge proof — the mutant 'R5 stamps story:done unproven' (ga-to242)" || ok "R5 2-sweep (ga-a05uwz): s2-unv got NO story:done (no merge proof)"
+  grep -q 'label remove s2-done ctx:ready' "$ACT" && ok "R5 2-sweep (ga-a05uwz): sweep 1 strips the leftover ctx:ready of an already-story:done bead" || bad "R5 2-sweep (ga-a05uwz): s2-done (story:done) kept its leftover ctx:ready"
+  grep -q 'label add s2-done' "$ACT" && bad "R5 2-sweep (ga-a05uwz): relabelled s2-done" || ok "R5 2-sweep (ga-a05uwz): s2-done's lifecycle labels untouched"
+  grep -q 'label add r5m story:done' "$ACT" && ok "R5 2-sweep (ga-a05uwz): a MERGED bead still gets story:done (merge-proof path intact)" || bad "R5 2-sweep (ga-a05uwz): merged r5m lost its story:done stamp"
+  grep -q 'r5s' "$ACT" && bad "R5 2-sweep (ga-a05uwz): touched the STRANDED bead r5s (unmerged branch — must stay as-is for manual recovery)" || ok "R5 2-sweep (ga-a05uwz): stranded r5s left alone"
+  [ ! -s "$TMP/r5-show-calls" ] && ok "R5 2-sweep (ga-a05uwz): no per-bead 'bd show' — labels come from the list JSON already in hand" || bad "R5 2-sweep (ga-a05uwz): R5 still issues a 'bd show' per candidate ($(wc -l < "$TMP/r5-show-calls") calls) — a Dolt round-trip per bead per sweep"
+  [ "$(_r5t_count for-each-ref "$TMP/git-calls")" = "3" ] && ok "R5 2-sweep (ga-a05uwz): git verification ran for exactly the 3 beads that need it (s2-done needs none)" || bad "R5 2-sweep (ga-a05uwz): expected 3 for-each-ref (s2-unv, r5m, r5s), got $(_r5t_count for-each-ref "$TMP/git-calls")"
+  [ "$(_r5t_count 's2-unv' "$LOG")" = "1" ] && ok "R5 2-sweep (ga-a05uwz): the unverified bead is logged once" || bad "R5 2-sweep (ga-a05uwz): s2-unv logged $(_r5t_count 's2-unv' "$LOG") times in sweep 1 (want 1)"
+  : > "$ACT"; : > "$TMP/git-calls"
+  run_sweep
+  grep -qE 's2-unv|s2-done|r5m' "$ACT" && bad "R5 2-sweep (ga-a05uwz): sweep 2 touched a bead sweep 1 already settled" || ok "R5 2-sweep (ga-a05uwz): sweep 2 mutates nothing it already settled"
+  [ "$(_r5t_count for-each-ref "$TMP/git-calls")" = "1" ] && ok "R5 2-sweep (ga-a05uwz): sweep 2 verifies ONLY the one bead still pending (stranded r5s) — the settled ones cost nothing" || bad "R5 2-sweep (ga-a05uwz): sweep 2 ran $(_r5t_count for-each-ref "$TMP/git-calls") for-each-ref, want 1 — settled beads are still being re-verified"
+  [ ! -s "$TMP/r5-show-calls" ] && ok "R5 2-sweep (ga-a05uwz): sweep 2 issued no 'bd show' either" || bad "R5 2-sweep (ga-a05uwz): sweep 2 issued 'bd show' calls"
+  [ "$(_r5t_count 's2-unv' "$LOG")" = "1" ] && ok "R5 2-sweep (ga-a05uwz): still ONE log line for s2-unv after sweep 2 (log once, not every sweep)" || bad "R5 2-sweep (ga-a05uwz): s2-unv logged $(_r5t_count 's2-unv' "$LOG") times after 2 sweeps (want 1)"
+
+  # Scenario 2 — the initial cleanup runs in paced batches, never ~1,4k mutations in one burst.
+  # 7 unverifiable beads, cap 3 per sweep → 3 + 3 + 1, then silence.
+  _r5t_reset
+  jq -nc '[range(0;7) | {id: "capu-\(.)", labels: ["ctx:ready"]}]' > "$TMP/r5-cands.json"
+  R5_BATCH_MAX=3; _cap0=$(_r5t_count 'R5 batch-cap' "$LOG")
+  run_sweep
+  [ "$(_r5t_count 'label remove capu-' "$ACT")" = "3" ] && ok "R5 batch (ga-a05uwz): sweep 1 strips exactly R5_BATCH_MAX (3) of 7" || bad "R5 batch (ga-a05uwz): sweep 1 stripped $(_r5t_count 'label remove capu-' "$ACT") of 7 (cap 3)"
+  [ "$(_r5t_count for-each-ref "$TMP/git-calls")" = "3" ] && ok "R5 batch (ga-a05uwz): verification is capped too (3 git lookups, not 7)" || bad "R5 batch (ga-a05uwz): $(_r5t_count for-each-ref "$TMP/git-calls") git lookups in a capped sweep (want 3)"
+  [ "$(( $(_r5t_count 'R5 batch-cap' "$LOG") - _cap0 ))" = "1" ] && ok "R5 batch (ga-a05uwz): one 'batch-cap' line says how many were deferred" || bad "R5 batch (ga-a05uwz): expected exactly one batch-cap log line after sweep 1"
+  : > "$ACT"; run_sweep
+  [ "$(_r5t_count 'label remove capu-' "$ACT")" = "3" ] && ok "R5 batch (ga-a05uwz): sweep 2 drains the next 3" || bad "R5 batch (ga-a05uwz): sweep 2 stripped $(_r5t_count 'label remove capu-' "$ACT") (want 3)"
+  : > "$ACT"; run_sweep
+  [ "$(_r5t_count 'label remove capu-' "$ACT")" = "1" ] && ok "R5 batch (ga-a05uwz): sweep 3 drains the last 1" || bad "R5 batch (ga-a05uwz): sweep 3 stripped $(_r5t_count 'label remove capu-' "$ACT") (want 1)"
+  [ "$(( $(_r5t_count 'R5 batch-cap' "$LOG") - _cap0 ))" = "2" ] && ok "R5 batch (ga-a05uwz): no batch-cap line once nothing is deferred (2 total across 3 sweeps)" || bad "R5 batch (ga-a05uwz): batch-cap line count off after sweep 3"
+  : > "$ACT"; : > "$TMP/git-calls"; run_sweep
+  [ "$(_r5t_count 'label remove capu-' "$ACT")" = "0" ] && [ "$(_r5t_count for-each-ref "$TMP/git-calls")" = "0" ] && ok "R5 batch (ga-a05uwz): backlog drained — sweep 4 does zero R5 work" || bad "R5 batch (ga-a05uwz): sweep 4 still doing R5 work after the backlog drained"
+
+  # Scenario 3 — Dolt unhappy: a strip that bd REJECTED must not be logged as done, and a run of
+  # failures must stop the batch instead of hammering a struggling Dolt with the whole backlog.
+  _r5t_reset
+  jq -nc '[range(0;6) | {id: "capf-\(.)", labels: ["ctx:ready"]}]' > "$TMP/r5-cands.json"
+  R5_BATCH_MAX=100
+  export LCJ_TEST_R5_STRIP_FAIL=1; run_sweep; export LCJ_TEST_R5_STRIP_FAIL=0
+  [ "$(_r5t_count 'label remove' "$TMP/r5-attempts")" = "3" ] && ok "R5 failure (ga-a05uwz): 3 consecutive bd failures abort the batch (3 attempts, not 6)" || bad "R5 failure (ga-a05uwz): $(_r5t_count 'label remove' "$TMP/r5-attempts") strip attempts against a failing bd (want 3)"
+  grep -q 'unverified-stripped.*capf-' "$LOG" && bad "R5 failure (ga-a05uwz): logged a strip as done though bd rejected it — a lie in the log" || ok "R5 failure (ga-a05uwz): nothing logged as stripped when bd failed"
+  : > "$ACT"; run_sweep
+  [ "$(_r5t_count 'label remove capf-' "$ACT")" = "6" ] && ok "R5 failure (ga-a05uwz): next sweep retries and strips all 6 (nothing was lost)" || bad "R5 failure (ga-a05uwz): recovery sweep stripped $(_r5t_count 'label remove capf-' "$ACT") of 6"
+
+  BD="$BD_MAIN"; LCJ_GIT="$GIT_MAIN"; unset R5_BATCH_MAX R5T_DIR R5T_ACT
 
   # ── Bootstrap coverage for the LCJ_STORES derivation (ga-3xfndz) ───────────
   # Every assertion above ran run_sweep() in-process with GC/BD/LCJ_NOTIFY
