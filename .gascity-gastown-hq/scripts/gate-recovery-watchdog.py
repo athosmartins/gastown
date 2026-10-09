@@ -1184,7 +1184,8 @@ def _orphan_verdict(markers, pubs, why, now, sweeps=None, min_age=None, fresh_se
       - the marker has been untouched since BEFORE the oldest of those `sweeps` publications (its updated_at, less a
         margin) — a marker that was re-queued after the window began was never in a position to be seen in it;
       - it is in NONE of those publications, ordered or set aside.
-    Every other case is a non-verdict, and the ones that hide a candidate from the proof say so (reason != 'no-orphan')."""
+    Every other case is a non-verdict. The ones where the proof itself is unavailable carry a reason other than
+    'no-orphan' (the caller says so); a candidate touched inside the window, or one the dispatcher saw, is 'no-orphan'."""
     sweeps = ORPHAN_ORDER_SWEEPS if sweeps is None else sweeps
     min_age = ORPHAN_MIN_AGE_SEC if min_age is None else min_age
     fresh_sec = ORPHAN_DRAIN_FRESH_SEC if fresh_sec is None else fresh_sec
@@ -1238,8 +1239,10 @@ def orphaned_queued_marker():
     """Detect a gate-status:queued marker the dispatcher provably never SAW (gt-mqkwj; proof rebuilt on the published
     order in ga-dtecvq — see _orphan_verdict). Returns (marker_id, branch, age_sec), else (None, None, 0). The evidence for
     a hit is left in _ORPHAN_EVIDENCE[marker_id]. Three states, never two: a marker the dispatcher saw is no orphan, a
-    marker it provably did not see is, and everything the file cannot establish (missing, unreadable, stale, too short,
-    a marker touched inside the window) is 'cannot prove' — said once an hour while a candidate exists, never 'orphan'."""
+    marker it provably did not see is, and everything the proof cannot establish (the order file missing, unreadable,
+    stale, too short or clock-stepped; a queued marker whose updated_at is unknown; the queued-marker list itself
+    unreadable) is 'cannot prove' — said at most once an hour per reason, never 'orphan'. A candidate that was touched
+    inside the window is not 'cannot prove' and is not said: it is simply not judged yet, and a later window will."""
     now = time.time()
     rows = _queued_markers_read()
     if rows is None:

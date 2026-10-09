@@ -9,8 +9,10 @@
 # older P3 for as long as P0s keep arriving, and no claim order proves anything.
 #
 # What the dispatcher can say instead is the thing it actually computed: for every sweep, the
-# markers it ORDERED (with the class that placed each) and the ones it SET ASIDE (retry cooldown —
-# the only thing the selection excludes). A queued marker that is in neither, sweep after sweep,
+# markers it ORDERED (with the class that placed each) and the ones it SET ASIDE: every marker of the
+# queue the order was computed from that is not in the order (today only a retry cooldown does that;
+# if the selection ever excludes more, those are published too — the reader then sees them as seen,
+# the inert direction). A queued marker that is in neither, sweep after sweep,
 # is not "low priority" — the dispatcher never saw it. That is a fact about the input, so it holds
 # whatever the order is, and it is the only thing the watchdog proves from this file.
 #
