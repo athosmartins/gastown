@@ -240,13 +240,15 @@ BASE_ENV() {
     "CLAUDE_POOL_GUARD_SCRATCH=$INFRA/claude-pool-guard-scratch" "CLAUDE_POOL_GUARD_RETRY_WAIT_S=0" "CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=20" \
     "GC_LOWPRIO_CLAUDE_BIN=$FAKEBIN/claude" "CLAUDE_POOL_PROBE_URL=http://127.0.0.1:$(cat "$INFRA/port" 2>/dev/null || echo 9)/v1/messages"
 }
+# run_guard / run_d / run_wrapper expand ${envs[@]+"${envs[@]}"}, not "${envs[@]}": with no VAR=val before '--' the array is empty, and macOS's
+# /bin/bash 3.2 calls an empty array "unbound variable" under set -u (bash 5 does not). The '+' form expands to nothing there, and to each element intact otherwise.
 run_guard() { # run_guard [VAR=val ...] -- <guard args>; output in $LAST, status in $GRC
   local envs=() base=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   while IFS= read -r l; do base+=("$l"); done < <(BASE_ENV)
   N_RUN=$((N_RUN+1)); LAST="$CAP/guard-$N_RUN.txt"
-  env -i "${base[@]}" "${envs[@]}" "$PY3" "$GUARD" "$@" > "$LAST" 2>&1; GRC=$?
+  env -i "${base[@]}" ${envs[@]+"${envs[@]}"} "$PY3" "$GUARD" "$@" > "$LAST" 2>&1; GRC=$?
 }
 run_d() { # run_d [VAR=val ...] -- <daemon args>
   local envs=() base=()
@@ -255,7 +257,7 @@ run_d() { # run_d [VAR=val ...] -- <daemon args>
   while IFS= read -r l; do base+=("$l"); done < <(BASE_ENV)
   N_RUN=$((N_RUN+1)); LAST="$CAP/daemon-$N_RUN.txt"
   stamp_usage "$NOW"
-  env -i "${base[@]}" "${envs[@]}" "$PY3" "$DAEMON" "$@" > "$LAST" 2>&1; GRC=$?
+  env -i "${base[@]}" ${envs[@]+"${envs[@]}"} "$PY3" "$DAEMON" "$@" > "$LAST" 2>&1; GRC=$?
 }
 run_wrapper() { # run_wrapper [VAR=val ...] -- <claude args>
   local envs=() base=()
@@ -263,7 +265,7 @@ run_wrapper() { # run_wrapper [VAR=val ...] -- <claude args>
   [ "${1:-}" = "--" ] && shift
   while IFS= read -r l; do base+=("$l"); done < <(BASE_ENV)
   N_RUN=$((N_RUN+1)); LAST="$CAP/wrapper-$N_RUN.txt"
-  env -i "${base[@]}" GC_LOWPRIO=0 "${envs[@]}" "$WRAPPER" "$@" > "$LAST" 2>&1; GRC=$?
+  env -i "${base[@]}" GC_LOWPRIO=0 ${envs[@]+"${envs[@]}"} "$WRAPPER" "$@" > "$LAST" 2>&1; GRC=$?
 }
 gtick() { # gtick <advance-seconds> [VAR=val ...]: move the clock, stamp the daemon's heartbeat (unless HB_AUTO=0), run one guard pass
   NOW=$((NOW + $1)); shift
