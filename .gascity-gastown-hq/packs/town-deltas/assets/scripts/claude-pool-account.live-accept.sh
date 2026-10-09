@@ -211,11 +211,12 @@ switches() { # how many SWITCH lines the daemon has logged; NA when the log cann
   n="$(grep -c "SWITCH " "$W/city/.gc/logs/claude-pool-account.log" 2>/dev/null)"   # grep -c prints 0 for "none" (rc 1); it prints nothing when it could not read
   case "$n" in ''|*[!0-9]*) echo NA ;; *) echo "$n" ;; esac
 }
+isnum() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }      # a count that was READ: NA / empty / junk is not a count, and two of them are not "the same count"
 SW0="$(switches)"
 case "$SW0" in ''|*[!0-9]*) bad "P3.0a the daemon's log cannot be read ('$SW0'): the no-SWITCH checks (P3.0b, P3.1b) and the SWITCH count (P3.7) below cannot tell" ;; *) ok "P3.0a the daemon's log is readable ($SW0 SWITCH line(s) logged before the P3 runs)" ;; esac
 n0="$(reqs_n)"; daemon >/dev/null 2>&1
 r="$(req_lines "$n0")"
-[ "$r" = "POST /v1/messages 200 $(fp "$TOK_OK")" ] && [ "$(jget current)" = "$EMAIL_OK" ] && [ "$(switches)" = "$SW0" ] \
+[ "$r" = "POST /v1/messages 200 $(fp "$TOK_OK")" ] && [ "$(jget current)" = "$EMAIL_OK" ] && isnum "$SW0" && [ "$(switches)" = "$SW0" ] \
   && ok "P3.0b a steady run: ONE request, a POST /v1/messages as the account in use (answered 200), no switch" \
   || bad "P3.0b a steady run sent: $(printf '%s' "$r" | tr '\n' '|') (want exactly one POST /v1/messages 200 as the OK account); switches $SW0 -> $(switches)"
 
@@ -241,9 +242,9 @@ H_WARN='{"anthropic-ratelimit-unified-status":"allowed_warning","anthropic-ratel
 mock_set 200 "$H_WARN" 200 "$H_ALLOW"; n0="$(reqs_n)"; sw1="$(switches)"
 daemon >/dev/null 2>&1; daemon >/dev/null 2>&1; daemon >/dev/null 2>&1
 r="$(req_lines "$n0")"
-if [ "$(jget current)" = "$EMAIL_OK" ] && [ "$(switches)" = "$sw1" ] && [ "$(req_lines "$n0" | grep -c .)" = 3 ] && [ -z "$(printf '%s\n' "$r" | grep -v "^POST /v1/messages 200 $(fp "$TOK_OK")$")" ]; then
+if [ "$(jget current)" = "$EMAIL_OK" ] && isnum "$sw1" && [ "$(switches)" = "$sw1" ] && [ "$(req_lines "$n0" | grep -c .)" = 3 ] && [ -z "$(printf '%s\n' "$r" | grep -v "^POST /v1/messages 200 $(fp "$TOK_OK")$")" ]; then
   ok "P3.1b a WARNING at 99% (5h and 7d) on the account in use moves nothing over 3 runs: still the OK account, no SWITCH, one request per run, none to EXH"
-else bad "P3.1b current='$(jget current)' switches $sw1 -> $(switches); requests: $(printf '%s' "$r" | tr '\n' '|')"; fi
+else bad "P3.1b current='$(jget current)' switches $sw1 -> $(switches) (NA = the log could not be read: no SWITCH cannot be concluded); requests: $(printf '%s' "$r" | tr '\n' '|')"; fi
 mock_set 200 "$H_ALLOW" 200 "$H_ALLOW"
 
 echo "   >>> OK account 'exhausted' (simulated); EXH reports allowed. Running the daemon -> failover"
