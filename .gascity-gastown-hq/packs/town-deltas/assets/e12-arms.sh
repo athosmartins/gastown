@@ -271,12 +271,16 @@ e12_cmd_assign() {
 # ── the block ─────────────────────────────────────────────────────────────────────────────────────────────────
 # Short (the spec: <= 10 lines), no shouting, with the why: the guide for the current models says a clear reason generalises better than
 # capital letters. The header line is what the Pilot checks before it appends the text to a dispatch.
+# The named crews read this SAME text, not a copy typed by hand: e12-crew-doctrine.sh writes it between the e12-doctrine:begin/end marker
+# comments of their six prompt templates (agents/{thies,oracle,digo,mila,peter,batista}-wa/prompt.template.md, ga-0nz1wi). After editing
+# the text below, run `bash e12-crew-doctrine.sh write`; e12-crew-doctrine.selftest.sh fails for as long as a prompt differs from it.
 e12_block_text() {
   cat <<'E12BLOCK'
 ## Write-time doctrine — experiment E12 (ga-4q2zo5)
 - Why: in last week's gate reviews, 38% of the blocking findings were one mistake — a read that can come back empty or fail was handled as if both meant the same thing.
 - Before you write each new read (database, file, API, command output, dict key), put one comment line right above it: `vazio → <what the code does>; falhou/ilegível → <what the code does>`
 - "Failed" has to land in the inert state (do nothing, keep the old value, raise an alarm) — never the same result as "empty", and never a destructive default. If you cannot fill in both halves, decide first, then write the read.
+- A read that has not answered yet is a third state too (it showed up twice in UI slices this week): while it is pending, draw "Carregando…" — never the empty verdict ("Nada por aqui ainda.") — and put a timeout on the request that lands in the error state, so a read that never answers cannot leave "nobody" on the screen for good.
 - Before /gate-done, re-read every comment in your own diff and ask "does the code next to it do exactly this?" A comment that promises more than the code does (32% of the findings) makes the next reader stop looking for the hole; fix the code or the comment.
 E12BLOCK
 }
