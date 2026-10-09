@@ -71,6 +71,7 @@ unset GC_POOL_UNSTICK CLAUDE_POOL_TMUX CLAUDE_POOL_TMUX_SOCKET CLAUDE_POOL_PS
 
 # ── A. wrapper ─────────────────────────────────────────────────────────────────────────────────────
 echo "A. wrapper (claude-lowprio.sh)"
+PY3="${CLAUDE_POOL_PY:-/usr/bin/python3}"; [ -x "$PY3" ] || PY3="$(command -v python3)"   # the interpreter launchd runs (3.9), not whichever is first on PATH
 
 BIN="$W/bin"; mkdir -p "$BIN" "$W/city/.gc/logs"
 # fake claude: reports the two variables the wrapper may export, plus argv, one fact per line
@@ -250,7 +251,6 @@ out="$(run_wrapper USER=athos -- x)"
 echo
 echo "B. daemon (claude-pool-account.py)"
 
-PY3="${CLAUDE_POOL_PY:-/usr/bin/python3}"; [ -x "$PY3" ] || PY3="$(command -v python3)"   # the interpreter launchd runs (3.9), not whichever is first on PATH
 # ACCT_LIB: read above, before the environment guard repoints CLAUDE_POOL_ACCOUNTS_LIB (this file's input AND the daemon's seam)
 BB="$W/bbin"; mkdir -p "$BB"
 
