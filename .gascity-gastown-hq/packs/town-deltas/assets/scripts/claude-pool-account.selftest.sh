@@ -1562,7 +1562,7 @@ print(v[0] if v else "<none>")' "$STATE" "$1" "$2" 2>/dev/null
   [ "$(keys_to "$U1")" = "1" ] && [ "$(keys_to "$U2")" = "1" ] && ok "B62b ...and once it can be read, both panes get their key (the unreadable one on its kept sighting)" || bad "B62b keys: $U1=$(keys_to "$U1") $U2=$(keys_to "$U2")"
 
   kept_world; touch "$TMUXD/down"; later 20
-  blind_ok B62c "tmux has no server"; rm -f "$TMUXD/down"; later 100; recovered B62c
+  blind_ok B62c "tmux has no server"; grep -q "tmux list-panes failed (exit=1)" "$LOG" && ok "B62c ...and the log says so" || bad "B62c no 'tmux list-panes failed' line: $(grep -E 'WARN|ERROR' "$LOG" | tail -n 2 | cut -c1-160 | tr '\n' '|')"; rm -f "$TMUXD/down"; later 100; recovered B62c
   kept_world; later 20 CLAUDE_POOL_TMUX="$TMUXD/no-such-tmux"
   blind_ok B62d "no tmux binary"; grep -q "tmux could not be run" "$LOG" && ok "B62d ...and the log says so" || bad "B62d no 'tmux could not be run' line"; later 100; recovered B62d
   kept_world; touch "$TMUXD/ps-broken"; later 20

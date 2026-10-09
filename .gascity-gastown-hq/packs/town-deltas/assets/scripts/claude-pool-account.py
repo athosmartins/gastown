@@ -853,8 +853,9 @@ def scan_panes() -> Scan:
     if rc is None:
         log("WARN", "tmux could not be run - no pane looked at this run")
         return Scan(False)
-    if rc != 0:
-        return Scan(False)   # no server / a failure: nothing can be concluded, and nothing is dropped from what was seen before
+    if rc != 0:   # no server on the socket / a wrong socket / a restarted server: nothing can be concluded - and the log must not look like "no stuck pane"
+        log("WARN", f"tmux list-panes failed (exit={rc}) - no pane looked at this run")
+        return Scan(False)   # nothing is dropped from what was seen before
     pane_of: Dict[int, Tuple[str, int]] = {}
     for line in out.splitlines():
         f = line.split()
@@ -903,11 +904,17 @@ def send_escape(p: PanePeek) -> bool:
     """The ONE key this daemon ever sends, to a pane it has proven to be a pool session on the limit modal. The scan is some
     seconds old, so look again right before: same process in the pane, and the modal still the last thing on its screen."""
     rc, out = tmux(["display-message", "-p", "-t", p.pane_id, "#{pane_pid}"])
-    if rc != 0 or out.strip() != str(p.pane_pid):
+    if rc != 0:
+        log("WARN", f"pane {p.pane_id} ({p.agent}): tmux display-message failed (exit={rc}) - could not tell which process owns it, nothing sent")
+        return False
+    if out.strip() != str(p.pane_pid):
         log("INFO", f"pane {p.pane_id} ({p.agent}) is not the process it was a moment ago - nothing sent")
         return False
     rc, text = tmux(["capture-pane", "-p", "-J", "-t", p.pane_id])
-    if rc != 0 or not modal_stuck(text):
+    if rc != 0:
+        log("WARN", f"pane {p.pane_id} ({p.agent}): tmux capture-pane failed (exit={rc}) - could not look at the screen again, nothing sent")
+        return False
+    if not modal_stuck(text):
         log("INFO", f"pane {p.pane_id} ({p.agent}) no longer shows the limit modal - nothing sent")
         return False
     rc, _ = tmux(["send-keys", "-t", p.pane_id, "Escape"])
