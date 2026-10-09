@@ -1219,6 +1219,8 @@ def _read_assignee(rig_root, bead_id):
     Only a payload that IS this bead (.id matches) is allowed to speak for it."""
     if _bd_read_assignee is not None:
         return _bd_read_assignee(rig_root, bead_id)
+    # vazio → "" (nobody holds it); falhou/ilegível/payload de outra bead → None (before the
+    # write: nothing is written; after it: reported as unconfirmed)
     r = _sh([BD_BIN, "-C", rig_root, "show", bead_id, "--json"], timeout=BD_TIMEOUT)
     if r is None or r.returncode != 0:
         return None
@@ -1871,6 +1873,8 @@ def _live_session_identifiers():
     asked/parsed (never an empty set for a failed ask)."""
     if _gc_live_sessions is not None:
         return _gc_live_sessions()
+    # vazio ({"sessions": []}) → empty frozenset, the author is not live so nothing is assigned;
+    # falhou/ilegível → None, nothing is touched
     proc = _sh([GC_BIN, "session", "list", "--json"], timeout=15)
     if proc is None or proc.returncode != 0:
         return None
@@ -1883,6 +1887,8 @@ def _park_author(bead):
     gate.submitted_by lives on the marker, and the source beads measured (wa-2362s2.*) have
     no metadata at all. For those slices created_by IS the session that did the work
     (digo-wa-gawispvrmmmf, still live)."""
+    # vazio/"null"/"none"/chave ausente → "" (no author: _park_holder leaves the bead unassigned);
+    # falhou/ilegível: n/a — a dict read from the sweep's own fetch, there is no read to fail
     who = str(bead.get("created_by") or "").strip()
     return "" if who.lower() in ("null", "none") else who
 
@@ -1906,6 +1912,8 @@ def _park_holder(bead):
     new session id) therefore stays unassigned; the gate derives a successor from the
     gate.submitted_by_agent it recorded at submit time, never by regex at dispatch time
     (ga-pyzo) — and a source bead has no such record, so nothing here guesses one."""
+    # vazio/chave ausente → no assignee yet, the author is looked up (the sweep's copy is minutes
+    # old, so _settle_park_holder re-reads it fresh before any write); falhou/ilegível: n/a here
     held = str(bead.get("assignee") or "").strip()
     if held:
         return "keep", held, "assignee atual (%s) mantido" % held
