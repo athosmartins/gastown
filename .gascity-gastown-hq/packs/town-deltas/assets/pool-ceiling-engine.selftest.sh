@@ -323,6 +323,11 @@ eq "$(levels)" "" "a CORRUPT state file is not 'never written': at T0+600 the st
 eq "$(nevents state-corrupt)" "1" "and the corruption is logged once, not silently absorbed"
 eng_quiet $((T0 + 900)) 4000 11264
 eq "$(levels)" "wa-worker=3" "the file was rewritten healthy and 10 min after the corruption the raise lands"
+# a state write that FAILS (disk full is the very pressure this engine reacts to) is logged, never silent
+SWF=$( ( PCE_DRY=0; PCE_NOW="$T0"; PCE_STATE="$TMPROOT/s10f-no-such-dir/state"; PCE_LOG="$TMPROOT/s10f.log"
+         pce_state_put wa-worker 1 0 "$T0" "$T0"; pce_trip daily "x"; cat "$PCE_LOG" ) 2>&1 )
+has "$SWF" "what=wa-worker.state" "a per-pool state that cannot be written is logged (the streaks and the rate limit restart)"
+has "$SWF" "what=trip" "a trip that cannot be written is logged"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -773,6 +778,8 @@ M = [
  ("kill-switch-clears-dedup-every-sweep", "16", 'if pce_restore "kill-switch"; then', 'if pce_restore "kill-switch"; then pce_clear_condition'),
  ("corrupt-daily-counter-reads-as-zero", "15", 'if [ -z "$d" ] || ! _pce_int "$w"; then printf \'%s\' "$PCE_DAILY_MAX"; return 0; fi', 'if [ -z "$d" ] || ! _pce_int "$w"; then printf \'0\'; return 0; fi'),
  ("corrupt-state-reads-as-never-written", "10", 'cs=0; us=0; lw="$PCE_NOW"', ':'),
+ ("state-write-failure-is-silent", "10", ' || pce_log "event=state-write-failed" "what=$1.state" "effect=the streaks and the rate limit of $1 restart as if its file were absent"', ''),
+ ("trip-write-failure-is-silent", "10", ' || pce_log "event=state-write-failed" "what=trip" "effect=the trip may not hold; the callers empty the fragment regardless"', ''),
  ("no-lock", "17", 'pce_lock_acquire || return 0', 'pce_lock_acquire || true'),
  ("heartbeat-less-lock-never-reclaimed", "17", 'else age=$(_pce_lock_age "$PCE_LOCK_DIR"); fi', 'else age=0; fi'),
  ("lock-age-unreadable-reads-as-ancient", "17", 'the lock is respected"; echo 0; return 0; }', 'the lock is respected"; echo 999999999; return 0; }'),

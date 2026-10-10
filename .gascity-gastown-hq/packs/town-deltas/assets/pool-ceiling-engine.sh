@@ -410,7 +410,7 @@ pce_state_put() { # <pool> <clear_streak> <unknown_streak> <last_sweep_at> <last
   _pce_atomic_put "$PCE_STATE/$1.state" "clear_streak=$2
 unknown_streak=$3
 last_sweep_at=$4
-last_write_at=$5"
+last_write_at=$5" || pce_log "event=state-write-failed" "what=$1.state" "effect=the streaks and the rate limit of $1 restart as if its file were absent"
 }
 pce_daily_writes() { # writes counted today: 0 on a new day or when there is no file YET; the LIMIT when the file exists but cannot be read
   local d w
@@ -430,7 +430,7 @@ pce_trip() { # <daily|manual> <reason>
   [ "$PCE_DRY" = "1" ] && return 0
   _pce_atomic_put "$PCE_STATE/tripped" "kind=$1
 date=$(_pce_date_of "$PCE_NOW")
-reason=$2"
+reason=$2" || pce_log "event=state-write-failed" "what=trip" "effect=the trip may not hold; the callers empty the fragment regardless"
 }
 
 # ── writing the fragment ──────────────────────────────────────────────────────
