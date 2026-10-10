@@ -1,0 +1,25 @@
+# ga-4ytmas (item 3): on 10/10 (~14:06-14:40) the supervisor went blind under load (its Darwin `ps` snapshot was
+# killed at the 3 s fetch timeout every ~3 s) and oracle-wa — an [[agent]] with min_active_sessions = 1 — lost
+# its session for ~20 min. The replacements it tried were `deferred_by_wake_budget` and rolled back after 10 min
+# ("lease expired and no live runtime"); the Mayor recreated the crew by hand. The reconciler logged all of it
+# and nothing told a human: crew-hang-detector only looks at LIVE crew, agent-stuck-escalation at stale
+# in_progress beads, pool-stuck-prompt-alarm at bead-less POOL sessions.
+#
+# DETECTION ONLY. This order mails the Mayor, once per episode, when a crew the resolved config says must
+# always be up (`gc config show`: [[agent]] with min_active_sessions >= 1, not suspended, rig not suspended)
+# has no session in state `active` in `gc session list --json` for 10 min on this script's own clock. It never
+# starts, wakes, nudges, closes or kills anything (selftest K). "Could not tell" (either read failed, timed out
+# or did not parse) is UNKNOWN: no clock moves and nothing is mailed. A gc order (fresh exec each tick,
+# flock'd), never a raw plist.
+#
+# Cost, MEASURED 10/10 at load 50-80: `gc session list --json` 22-37 s, `gc config show` 5-13 s; a pass is those
+# two reads and at most one mail. interval 5m (threshold 10 min => mailed 10-15 min into an outage);
+# timeout 600s leaves room for two reads at the script's 120 s cap plus the 45 s mail (selftest W fails if it
+# drops under 2 x 120 + 45 + 60). A run the timeout cuts short is harmless: the "alarmed" mark is written
+# BEFORE the mail is sent, and the script's flock keeps the next tick from stacking on a straggler.
+[order]
+description = "Mail the Mayor when a crew with min_active_sessions >= 1 has had no live (active) session for >= 10 min (detection only)"
+trigger = "cooldown"
+interval = "5m"
+timeout = "600s"
+exec = "$PACK_DIR/assets/scripts/crew-no-session-alarm.sh"
