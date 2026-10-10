@@ -388,8 +388,8 @@ fi
 # $wt must be a REAL, non-bare checkout for this (unlike Teste 6's bare
 # .repo.git): --check reads $wt's on-disk files, exactly as the live
 # dispatcher's $TMP_REBASE_WT already is post-commit, pre-push.
-mkrepo_ddj() {  # <dir> [with_other:0|1] [with_feature:0|1] [gen_mode:canon|slow|degraded|selfattest|crash|killed|exit2|none] [main_n:5]
-  local R="$1" with_other="${2:-0}" with_feature="${3:-0}" gen_mode="${4:-canon}" main_n="${5:-5}" pre=''
+mkrepo_ddj() {  # <dir> [with_other:0|1] [with_feature:0|1] [gen_mode:canon|slow|degraded|selfattest|crash|killed|exit2|none] [main_n:5] [lint_mode:none|inherit|selfattest|slow|crash|fallback]
+  local R="$1" with_other="${2:-0}" with_feature="${3:-0}" gen_mode="${4:-canon}" main_n="${5:-5}" lint_mode="${6:-none}" pre='' lpre=''
   mkdir -p "$R/daemons" "$R/scripts"
   git -C "$R" init -q
   git -C "$R" config user.email t@t; git -C "$R" config user.name T
@@ -425,6 +425,46 @@ if "--check" in sys.argv[1:]:
 sys.exit(0)
 PYEOF
   fi
+  # ga-dwywwd: fixture stand-in for the rig's scripts/lint_daemon_deps.py (wa-wos7r), the
+  # second opinion asked ONLY when --check exits 4. It models the real one's three exits:
+  # 0 = nothing beyond what --against-ref already has, 1 + the "DESATUALIZADO" line = new
+  # drift, 1 WITHOUT it = an uncaught exception (the real lint also exits 1 for those).
+  # Findings model: `n` is how many daemons the table lists and 2 is what the generator
+  # builds, so the findings of N are the symmetric difference of {1..N} and {1,2} (N=5 =>
+  # {3,4,5}; N=4 => {3,4}; N=2 => none). "Inherited" = the tip's findings are a subset of
+  # the ref's. It refuses anything but a 40-hex --against-ref, so a dispatcher that handed
+  # over a symbolic name instead of the resolved sha reads as "could not verify".
+  case "$lint_mode" in
+    slow)     lpre='import time; time.sleep(30)' ;;
+    crash)    lpre='raise RuntimeError("lint blew up before reaching a verdict")' ;;
+    fallback) lpre='sys.stderr.write("AVISO: nao consegui comparar contra " + sys.argv[-1] + " (git archive falhou) - caindo pro modo antigo\ndeploy_deps.json DESATUALIZADO - rode: gen_daemon_deps.py\n"); sys.exit(1)' ;;
+  esac
+  if [ "$lint_mode" != "none" ]; then
+    cat > "$R/scripts/lint_daemon_deps.py" <<PYEOF
+#!/usr/bin/env python3
+import os, re, subprocess, sys
+if os.environ.get("LINT_MARK"):
+    open(os.environ["LINT_MARK"], "a").write("asked\n")
+$lpre
+args = sys.argv[1:]
+if "--against-ref" not in args:
+    sys.exit(3)
+ref = args[args.index("--against-ref") + 1]
+if len(ref) != 40 or any(c not in "0123456789abcdef" for c in ref):
+    sys.exit(3)
+def findings(txt):
+    n = int(re.search(r'"n":\s*(\d+)', txt).group(1))
+    return set(range(1, n + 1)) ^ {1, 2}
+tip = findings(open("daemons/deploy_deps.json").read())
+main = findings(subprocess.run(["git", "show", ref + ":daemons/deploy_deps.json"],
+                               capture_output=True, text=True, check=True).stdout)
+if tip <= main:
+    sys.stderr.write("AVISO herdado: %d achado(s) ja existem em %s agora\n" % (len(tip), ref))
+    sys.exit(0)
+sys.stderr.write("deploy_deps.json DESATUALIZADO - rode: gen_daemon_deps.py\n")
+sys.exit(1)
+PYEOF
+  fi
   printf '{"n": 0}\n' > "$R/daemons/deploy_deps.json"
   [ "$with_other" = "1" ] && printf 'base\n' > "$R/other.txt"
   git -C "$R" add -A; git -C "$R" commit -qm base
@@ -441,6 +481,8 @@ PYEOF
   # BOTH the ground-truth merge tree and the rebase tip — invisible to the tree
   # comparison, which is exactly why 8h needs its own requirement.
   [ "$gen_mode" = "selfattest" ] && printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$R/scripts/gen_daemon_deps.py"
+  # Same trick for the lint (ga-dwywwd): the branch's own commit makes it approve anything.
+  [ "$lint_mode" = "selfattest" ] && printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$R/scripts/lint_daemon_deps.py"
   git -C "$R" add -A; git -C "$R" commit -qm "branch regenerates deploy_deps.json"
   git -C "$R" checkout -q ddjmain
   # main_n=5 (default): main and the branch changed the same line to DIFFERENT
@@ -784,6 +826,165 @@ echo "── Teste 9h — drift-guard: the clean-text branch is still wired to t
 grep -q 'rebase_deploy_deps_verdict "\$wt" "\$gd" "\$main_ref" "\$new_tip" "\$out" clean' "$DISPATCHER" \
   && ok "rebase_content_verdict still delegates its clean-but-different branch to rebase_deploy_deps_verdict (clean mode)" \
   || bad "the ga-ub5hkz delegation is gone from rebase_content_verdict"
+
+# Teste 10 (ga-dwywwd) — --check exits 4 for drift that MAIN ALREADY HAS.
+#
+# INCIDENTE (gate-loop de crew/wa-worker/wa-5lzi3s.6, marker ga-kot07z, 10/10): --check
+# compares the committed deploy_deps.json against THIS MACHINE (plists + code on disk),
+# not against main. main was stale on its own — d4ef42d32 dropped daemons/terreno_publico.py
+# from the table on purpose while the daemon and its plist kept existing — so --check listed
+# exactly that one item on a branch that added nothing, exit 4 became
+# unknown:deploy-deps-check-drift and EVERY branch that needed a rebase was refused, by the
+# fault of a third party. The rig's lint already answers "what does this tree add on top of
+# main?" (wa-wos7r, --against-ref); the dispatcher now asks it, ONLY on the exit-4 path.
+#
+# Findings model of the fixture lint (see mkrepo_ddj): N=5 => {3,4,5}, N=4 => {3,4},
+# N=2 => none (what the generator builds). main_n=5 is a main that is stale on its own.
+ddj_tip() {  # <dir> <n> — commit a rebase tip whose deploy_deps.json says {"n": <n>}; prints its sha
+  printf '{"n": %s}\n' "$2" > "$1/daemons/deploy_deps.json"
+  git -C "$1" commit -qam "rebase tip: deploy_deps.json n=$2"
+  git -C "$1" rev-parse HEAD
+}
+
+# Teste 10a — THE FIX: the tip carries exactly main's own drift {3,4,5} (--check says 4, the
+# premise below proves it) => the lint says nothing beyond main's => yes, and the log says why.
+RI1="$TMP/repo-inh-main-stale"; ddj_setup "$RI1" 0 1 canon 5 inherit
+I1_MAIN="$DDJ_MAIN"; I1_BRANCH="$DDJ_BRANCH"
+I1_TIP=$(ddj_tip "$RI1" 5)
+( cd "$RI1" && python3 scripts/gen_daemon_deps.py --check >/dev/null 2>&1 ); I1_CHK=$?
+[ "$I1_CHK" -eq 4 ] && ok "premissa: --check do gerador sai 4 (drift) no tip que carrega o drift proprio de main" \
+                    || bad "premissa quebrada: esperava --check exit 4 no tip da 10a, deu $I1_CHK — 10a passaria por acidente"
+V10A=$( . "$TMP/block.sh"; log() { echo "[t] $*"; }; rebase_content_verdict "$RI1" "$I1_MAIN" "$I1_BRANCH" "$I1_TIP" 2>"$TMP/10a.err" )
+{ [ "$V10A" = "yes" ] && grep -q 'accepted as inherited' "$TMP/10a.err" && grep -q "against-ref $I1_MAIN" "$TMP/10a.err"; } \
+  && ok "10a: --check exit 4, mas todo achado ja esta em main => yes (o loop do ga-dwywwd), e o log diz que foi herdado e contra qual sha" \
+  || bad "10a: esperava yes + 'accepted as inherited' no stderr, deu '$V10A' / stderr: $(tr '\n' '|' < "$TMP/10a.err" 2>/dev/null)"
+
+# Teste 10b — o tip tem MENOS achados que main ({3,4} dentro de {3,4,5}): ainda herdado.
+RI2="$TMP/repo-inh-subset"; ddj_setup "$RI2" 0 1 canon 5 inherit
+I2_MAIN="$DDJ_MAIN"; I2_BRANCH="$DDJ_BRANCH"; I2_TIP=$(ddj_tip "$RI2" 4)
+V10B=$(run_verdict_at "$RI2" "$I2_MAIN" "$I2_BRANCH" "$I2_TIP")
+[ "$V10B" = "yes" ] && ok "10b: os achados do tip sao um subconjunto dos de main => yes" \
+                    || bad "10b: esperava yes para um subconjunto dos achados de main, deu '$V10B'"
+
+# Teste 10c — CONTROLE (o que o fix NAO pode afrouxar): UM achado a mais do que main ({3,4,5,6})
+# e o veredito continua o de antes. No modo conflito nenhum sufixo vira "no" — sai como estava.
+RI3="$TMP/repo-inh-newdrift"; ddj_setup "$RI3" 0 1 canon 5 inherit
+I3_MAIN="$DDJ_MAIN"; I3_BRANCH="$DDJ_BRANCH"; I3_TIP=$(ddj_tip "$RI3" 6)
+V10C=$(run_verdict_at "$RI3" "$I3_MAIN" "$I3_BRANCH" "$I3_TIP")
+[ "$V10C" = "unknown:deploy-deps-check-drift" ] && ok "10c: um achado que main NAO tem => segue unknown:deploy-deps-check-drift (a branch responde pelo que ela introduz)" \
+                                              || bad "10c: esperava unknown:deploy-deps-check-drift para drift novo, deu '$V10C' (drift da branch foi perdoado)"
+
+# Teste 10d — idem no modo texto-limpo (ga-ub5hkz): drift novo continua "no", deterministico —
+# nao vira unknown (retry transitorio ressoaria, ga-10uqmi) nem yes.
+RI4="$TMP/repo-inh-newdrift-clean"; ddj_setup "$RI4" 0 1 canon 1 inherit
+I4_MAIN="$DDJ_MAIN"; I4_BRANCH="$DDJ_BRANCH"; I4_TIP=$(ddj_tip "$RI4" 999)
+V10D=$(run_verdict_at "$RI4" "$I4_MAIN" "$I4_BRANCH" "$I4_TIP")
+[ "$V10D" = "no" ] && ok "10d: texto limpo + drift novo (lint presente) => no, como antes" \
+                   || bad "10d: esperava no para drift novo no modo texto-limpo, deu '$V10D'"
+
+# Teste 10e — "o lint nao respondeu a tempo" NAO e "drift novo" nem "herdado": unknown (retry
+# transitorio), limitado pelo timeout, e no modo texto-limpo tambem NAO vira "no".
+RI5="$TMP/repo-inh-slow"; ddj_setup "$RI5" 0 1 canon 5 slow
+I5_MAIN="$DDJ_MAIN"; I5_BRANCH="$DDJ_BRANCH"; I5_TIP=$(ddj_tip "$RI5" 5)
+T0=$(date +%s)
+V10E=$( export GATE_DEPLOY_DEPS_INHERITED_TIMEOUT=1; run_verdict_at "$RI5" "$I5_MAIN" "$I5_BRANCH" "$I5_TIP" )
+T1=$(date +%s)
+{ [ "$V10E" = "unknown:deploy-deps-inherited-timeout" ] && [ $((T1 - T0)) -lt 20 ]; } \
+  && ok "10e: lint alem de GATE_DEPLOY_DEPS_INHERITED_TIMEOUT => unknown:deploy-deps-inherited-timeout em $((T1 - T0))s (nao consegui saber != drift novo)" \
+  || bad "10e: esperava unknown:deploy-deps-inherited-timeout em <20s, deu '$V10E' apos $((T1 - T0))s"
+RI5C="$TMP/repo-inh-slow-clean"; ddj_setup "$RI5C" 0 1 canon 1 slow
+I5C_MAIN="$DDJ_MAIN"; I5C_BRANCH="$DDJ_BRANCH"; I5C_TIP=$(ddj_tip "$RI5C" 999)
+V10EC=$( export GATE_DEPLOY_DEPS_INHERITED_TIMEOUT=1; run_verdict_at "$RI5C" "$I5C_MAIN" "$I5C_BRANCH" "$I5C_TIP" )
+[ "$V10EC" = "unknown:deploy-deps-inherited-timeout" ] && ok "10e-clean: o mesmo timeout no modo texto-limpo continua unknown (nunca no: carga da maquina nao queima GATE_FIX_CAP)" \
+                                                     || bad "10e-clean: esperava unknown:deploy-deps-inherited-timeout, deu '$V10EC'"
+
+# Testes 10f / 10g — o lint saiu 1 SEM dizer "DESATUALIZADO" (excecao — o lint real tambem sai 1
+# pra isso), ou caiu no modo antigo por nao conseguir comparar com main: sem veredito => unknown.
+for c in "10f:crash:o lint levanta excecao (exit 1, sem veredito)" \
+         "10g:fallback:o lint nao conseguiu comparar contra main e caiu no modo antigo"; do
+  c_id="${c%%:*}"; c_rest="${c#*:}"; c_mode="${c_rest%%:*}"; c_what="${c_rest#*:}"
+  CR="$TMP/repo-inh-$c_mode"; ddj_setup "$CR" 0 1 canon 5 "$c_mode"
+  CR_MAIN="$DDJ_MAIN"; CR_BRANCH="$DDJ_BRANCH"; CR_TIP=$(ddj_tip "$CR" 5)
+  VCR=$(run_verdict_at "$CR" "$CR_MAIN" "$CR_BRANCH" "$CR_TIP")
+  [ "$VCR" = "unknown:deploy-deps-inherited-unverified" ] \
+    && ok "$c_id: $c_what => unknown:deploy-deps-inherited-unverified (nem herdado nem drift novo)" \
+    || bad "$c_id: $c_what — esperava unknown:deploy-deps-inherited-unverified, deu '$VCR'"
+done
+
+# Teste 10h — SEGURANCA: a branch reescreveu o PROPRIO lint pra aprovar tudo, e o deploy_deps.json
+# do tip esta ERRADO ({"n": 999}). Lint diferente do de main => nao ha quem abone => segue drift.
+RI8="$TMP/repo-inh-selfattest"; ddj_setup "$RI8" 0 1 canon 5 selfattest
+I8_MAIN="$DDJ_MAIN"; I8_BRANCH="$DDJ_BRANCH"; I8_TIP=$(ddj_tip "$RI8" 999)
+V10H=$(run_verdict_at "$RI8" "$I8_MAIN" "$I8_BRANCH" "$I8_TIP")
+[ "$V10H" = "unknown:deploy-deps-check-drift" ] && ok "10h: o lint do tip difere do de main => segue unknown:deploy-deps-check-drift (a branch nao atesta a propria saida)" \
+                                              || bad "10h: esperava unknown:deploy-deps-check-drift quando a branch reescreveu o lint, deu '$V10H'"
+sed 's/ || \[ "\$main_lint" != "\$tip_lint" \]//' "$TMP/block.sh" > "$TMP/block_mut10h.sh"
+if cmp -s "$TMP/block.sh" "$TMP/block_mut10h.sh"; then
+  bad "10h-mut: mutacao nao aplicou — 10h nao esta provando nada"
+else
+  V10HM=$( . "$TMP/block_mut10h.sh"; rebase_content_verdict "$RI8" "$I8_MAIN" "$I8_BRANCH" "$I8_TIP" )
+  [ "$V10HM" = "yes" ] && ok "10h-mut: sem o requisito 'lint e o de main' a branch auto-atestada vira yes => e esse requisito que a segura" \
+                       || bad "10h-mut: o codigo mutado deveria dar yes pra branch auto-atestada, deu '$V10HM'"
+fi
+
+# Teste 10i — main sem lint nenhum: nao ha segunda opiniao, entao um tip com cara de herdado
+# NAO e promovido — fica o veredito de antes.
+RI9="$TMP/repo-inh-nolint"; ddj_setup "$RI9" 0 1 canon 5 none
+I9_MAIN="$DDJ_MAIN"; I9_BRANCH="$DDJ_BRANCH"; I9_TIP=$(ddj_tip "$RI9" 5)
+V10I=$(run_verdict_at "$RI9" "$I9_MAIN" "$I9_BRANCH" "$I9_TIP")
+[ "$V10I" = "unknown:deploy-deps-check-drift" ] && ok "10i: main sem scripts/lint_daemon_deps.py => segue unknown:deploy-deps-check-drift (sem segunda opiniao nao ha upgrade)" \
+                                              || bad "10i: esperava unknown:deploy-deps-check-drift sem lint em main, deu '$V10I'"
+
+# Teste 10j — main_ref SIMBOLICO (um nome de branch): o dispatcher entrega ao lint o SHA resolvido
+# (o stub recusa qualquer coisa que nao seja 40 hex) — o baseline e o main deste veredito, nao o
+# que o nome apontar minutos depois sob carga.
+V10J=$(run_verdict_at "$RI1" "ddjmain" "$I1_BRANCH" "$I1_TIP")
+[ "$V10J" = "yes" ] && ok "10j: main_ref simbolico (ddjmain) => o lint recebeu o sha resolvido e o veredito e yes" \
+                    || bad "10j: esperava yes com main_ref simbolico, deu '$V10J' (o lint recebeu o nome em vez do sha?)"
+
+# Teste 10k — MUTACAO: so o exit 0 do lint promove. Trocar "exit 1 + DESATUALIZADO => drift" por
+# "=> inherited" tem de transformar o drift novo da 10c em yes — senao a 10c nao prova nada.
+sed 's/\(\*"deploy_deps.json DESATUALIZADO"\*) echo\) "drift" ;;/\1 "inherited" ;;/' "$TMP/block.sh" > "$TMP/block_mut10k.sh"
+if cmp -s "$TMP/block.sh" "$TMP/block_mut10k.sh"; then
+  bad "10k-mut: mutacao nao aplicou — 10c nao esta provando nada"
+else
+  V10K=$( . "$TMP/block_mut10k.sh"; rebase_content_verdict "$RI3" "$I3_MAIN" "$I3_BRANCH" "$I3_TIP" )
+  [ "$V10K" = "yes" ] && ok "10k-mut: se o veredito do lint nao segurasse, o drift novo da 10c viraria yes => e ele que o segura" \
+                      || bad "10k-mut: o codigo mutado deveria dar yes pro drift novo, deu '$V10K'"
+fi
+
+# Teste 10l — CUSTO: um --check VERDE nunca consulta o lint (o lint builda duas vezes; so o
+# caminho do exit 4, que antes terminava em recusa, paga por ele).
+RI10="$TMP/repo-inh-green"; ddj_setup "$RI10" 0 1 canon 5 inherit
+I10_MAIN="$DDJ_MAIN"; I10_BRANCH="$DDJ_BRANCH"; I10_TIP=$(ddj_tip "$RI10" 2)
+rm -f "$TMP/lint-asked.mark"
+V10L=$( export LINT_MARK="$TMP/lint-asked.mark"; run_verdict_at "$RI10" "$I10_MAIN" "$I10_BRANCH" "$I10_TIP" )
+{ [ "$V10L" = "yes" ] && [ ! -e "$TMP/lint-asked.mark" ]; } \
+  && ok "10l: --check verde (exit 0) => yes sem nunca rodar o lint" \
+  || bad "10l: esperava yes sem consultar o lint, deu '$V10L' (marca do lint: $([ -e "$TMP/lint-asked.mark" ] && echo presente || echo ausente))"
+# ...e o oposto: no exit 4 o lint E consultado (sem isto a 10l passaria com o lint desligado).
+rm -f "$TMP/lint-asked.mark"
+( export LINT_MARK="$TMP/lint-asked.mark"; run_verdict_at "$RI1" "$I1_MAIN" "$I1_BRANCH" "$I1_TIP" >/dev/null )
+[ -e "$TMP/lint-asked.mark" ] && ok "10l-controle: no exit 4 o lint e de fato consultado" \
+                              || bad "10l-controle: no exit 4 o lint deveria ter sido consultado e nao foi"
+
+# Teste 10n — "nao consegui LER o repositorio" NAO e "main nao tem lint": a mesma leitura que na
+# 10i volta vazia (exit 1) aqui falha (exit 128, git-dir que nao e um repositorio) e tem de sair
+# como unknown, nao como drift — senao um erro de leitura teria o mesmo resultado que o vazio.
+V10N=$( . "$TMP/block.sh"; rebase_deploy_deps_inherited_drift "$RI1" "$TMP/nao-e-um-repo.git" "$I1_MAIN" "$I1_TIP" 5 )
+[ "$V10N" = "unknown:deploy-deps-inherited-unverified" ] && ok "10n: git-dir ilegivel => unknown:deploy-deps-inherited-unverified (leitura que falha != leitura que volta vazia)" \
+                                                        || bad "10n: esperava unknown:deploy-deps-inherited-unverified com git-dir invalido, deu '$V10N'"
+V10N2=$( . "$TMP/block.sh"; rebase_deploy_deps_inherited_drift "$RI9" "$(git -C "$RI9" rev-parse --absolute-git-dir)" "$I9_MAIN" "$I9_TIP" 5 )
+[ "$V10N2" = "drift" ] && ok "10n-controle: a leitura que volta VAZIA (main sem lint) continua drift" \
+                       || bad "10n-controle: esperava drift para main sem lint, deu '$V10N2'"
+
+echo "── Teste 10m — drift-guard: the exit-4 path is still wired to the inherited-drift check ──"
+grep -q 'rebase_deploy_deps_inherited_drift "\$wt" "\$gd" "\$main_ref" "\$new_tip"' "$DISPATCHER" \
+  && ok "rebase_deploy_deps_verdict still asks rebase_deploy_deps_inherited_drift on --check's exit 4" \
+  || bad "the ga-dwywwd call is gone from rebase_deploy_deps_verdict"
+grep -q 'lint_daemon_deps.py --against-ref' "$DISPATCHER" \
+  && ok "dispatcher still invokes the rig's lint with --against-ref as the second opinion" \
+  || bad "the lint --against-ref invocation is gone from the dispatcher"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

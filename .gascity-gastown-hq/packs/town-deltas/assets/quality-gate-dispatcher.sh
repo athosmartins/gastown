@@ -5140,6 +5140,94 @@ rebase_git_attributes_file() {
   printf '%s' "$tmp"
 }
 
+# rebase_deploy_deps_inherited_drift <wt> <gd> <main_ref> <new_tip> <timeout_s>   (ga-dwywwd)
+#
+# Called ONLY by rebase_deploy_deps_verdict(), and ONLY after the generator's own --check has
+# exited 4 ("deploy_deps.json DESATUALIZADO"). Prints exactly one line:
+#   inherited   the rig's lint (scripts/lint_daemon_deps.py --against-ref <main sha>, wa-wos7r) ran to
+#               the end and found NO finding that main does not already have: all of the drift --check
+#               saw is main's own, none of it was introduced by this branch or this rebase.
+#   drift       today's verdict stands (--check's exit 4): the lint ran and found drift beyond main's,
+#               OR the second opinion cannot be trusted here (main has no lint, or the tip's lint is
+#               not main's own).
+#   unknown:deploy-deps-inherited-timeout | unknown:deploy-deps-inherited-unverified
+#               the second opinion never reached an answer (killed by the bound, crashed, could not
+#               compare against main, or a git read it needs failed). That is "could not tell" —
+#               never "drift", never "inherited".
+#
+# WHY: --check compares the committed table against THIS MACHINE (plists in ~/Library/LaunchAgents
+# and the code on disk), not against main. When main itself is already stale, every branch that has
+# to be rebased reproduces main's own finding and is refused, whoever's fault it is (ga-dwywwd:
+# d4ef42d32 dropped daemons/terreno_publico.py from the table on purpose while the daemon and its
+# plist kept existing, so --check listed exactly that one item on a branch that added nothing). The
+# rig's own lint already answers "what does this tree add on top of main?" (wa-wos7r), so this asks
+# it instead of re-deriving a second diff that could drift from it.
+#
+# Why the answer can be trusted: (a) the lint at the tip must be byte-identical (blob) to the one at
+# main — the same rule as the generator in requirement 3 of rebase_deploy_deps_verdict(), so a
+# branch cannot bring a lint that approves itself (it imports gen_daemon_deps from its own directory,
+# which requirement 3 already pins); (b) the baseline is the RESOLVED SHA of main_ref, the very main
+# this verdict was computed against, not whatever origin/main points to minutes later under load;
+# (c) only an exit 0 upgrades — the lint exits 1 for "new drift" but ALSO for an uncaught exception
+# or a missing committed file, so exit 1 counts as drift only when it printed its own verdict line
+# and did not fall back to its old no-baseline mode ("comparar contra" = it could not reach main).
+# The lint builds twice (the tip and main's snapshot), so its default bound is twice --check's
+# (override GATE_DEPLOY_DEPS_INHERITED_TIMEOUT); it only runs on the exit-4 path, which used to end
+# in a refusal anyway, so a green --check pays nothing for it.
+rebase_deploy_deps_inherited_drift() {
+  local wt="$1" gd="$2" main_ref="$3" new_tip="$4" lint_timeout="$5"
+  local main_sha main_lint tip_lint main_sha_rc main_lint_rc tip_lint_rc lint_err lint_rc
+  # `rev-parse --verify --quiet` says "no such object/path" with exit 1 and "I could not read the
+  # repository" with anything else (128), and prints nothing in both cases — so the exit code, not
+  # the empty output, is what tells ABSENT (a legitimate "no second opinion here" => drift) from
+  # FAILED (could not tell => unknown). The three reads below keep them apart.
+  # vazio (main_ref não resolve) → unknown:unverified; falhou/ilegível → unknown:unverified. Sem o
+  # commit exato de main não há baseline contra o qual comparar.
+  main_sha=$(git --git-dir="$gd" rev-parse --verify --quiet "${main_ref}^{commit}" 2>/dev/null); main_sha_rc=$?
+  if [ "$main_sha_rc" -ne 0 ]; then echo "unknown:deploy-deps-inherited-unverified"; return 0; fi
+  case "$main_sha" in
+    *[!0-9a-f]*|"") echo "unknown:deploy-deps-inherited-unverified"; return 0 ;;
+  esac
+  if [ "${#main_sha}" -ne 40 ]; then echo "unknown:deploy-deps-inherited-unverified"; return 0; fi
+  # vazio (exit 1: main não tem lint) → drift, não há segunda opinião nesta main; falhou/ilegível
+  # (exit ≠ 0,1) → unknown:unverified
+  main_lint=$(git --git-dir="$gd" rev-parse --verify --quiet "${main_sha}:scripts/lint_daemon_deps.py" 2>/dev/null); main_lint_rc=$?
+  # vazio (exit 1: o tip apagou o lint) → drift; falhou/ilegível (exit ≠ 0,1) → unknown:unverified
+  tip_lint=$(git --git-dir="$gd" rev-parse --verify --quiet "${new_tip}:scripts/lint_daemon_deps.py" 2>/dev/null); tip_lint_rc=$?
+  case "$main_lint_rc:$tip_lint_rc" in
+    0:0) : ;;
+    0:1|1:0|1:1) echo "drift"; return 0 ;;
+    *) echo "unknown:deploy-deps-inherited-unverified"; return 0 ;;
+  esac
+  case "$main_lint$tip_lint" in
+    *[!0-9a-f]*|"") echo "unknown:deploy-deps-inherited-unverified"; return 0 ;;
+  esac
+  # both blobs exist: a different one means the branch brought its own lint — it cannot attest itself
+  if [ "${#main_lint}" -ne 40 ] || [ "${#tip_lint}" -ne 40 ] || [ "$main_lint" != "$tip_lint" ]; then echo "drift"; return 0; fi
+  case "$lint_timeout" in ''|*[!0-9]*) lint_timeout=360 ;; esac
+  if [ "$lint_timeout" -le 0 ]; then lint_timeout=360; fi
+  if [ "$(type -t log 2>/dev/null)" = "function" ]; then
+    log "rebase_content_verdict: --check found drift; asking lint_daemon_deps.py --against-ref ${main_sha} whether main already has all of it (timeout ${lint_timeout}s, ga-dwywwd)" >&2
+  fi
+  # vazio (exit 0, nada no stderr) → inherited; falhou (timeout/crash/sem python) → unknown:*, nunca inherited
+  lint_err=$( cd "$wt" && timeout "$lint_timeout" python3 scripts/lint_daemon_deps.py --against-ref "$main_sha" 2>&1 >/dev/null ); lint_rc=$?
+  case "$lint_rc" in
+    0)
+      if [ "$(type -t log 2>/dev/null)" = "function" ]; then
+        log "rebase_content_verdict: lint_daemon_deps.py --against-ref ${main_sha}: nothing beyond main's own drift — accepted as inherited (ga-dwywwd): $(printf '%s' "$lint_err" | head -8 | tr '\n' '|')" >&2
+      fi
+      echo "inherited" ;;
+    124) echo "unknown:deploy-deps-inherited-timeout" ;;
+    1)
+      case "$lint_err" in
+        *"comparar contra"*) echo "unknown:deploy-deps-inherited-unverified" ;;
+        *"deploy_deps.json DESATUALIZADO"*) echo "drift" ;;
+        *) echo "unknown:deploy-deps-inherited-unverified" ;;
+      esac ;;
+    *) echo "unknown:deploy-deps-inherited-unverified" ;;
+  esac
+}
+
 # rebase_deploy_deps_verdict <wt> <gd> <main_ref> <new_tip> <mt_out> [mode]   (ga-r5dsgp, ga-ub5hkz)
 #
 # Called ONLY by rebase_content_verdict(), and ONLY for a ground-truth
@@ -5196,7 +5284,11 @@ rebase_git_attributes_file() {
 #      something the branch under review brought along to attest itself;
 #   4. that generator's own --check (wa-9lxa7: fresh build vs committed file)
 #      exits 0 against $wt, a real checkout at new_tip with no tracked
-#      modifications, within GATE_DEPLOY_DEPS_CHECK_TIMEOUT seconds.
+#      modifications, within GATE_DEPLOY_DEPS_CHECK_TIMEOUT seconds — or exits 4
+#      and the rig's lint proves EVERY finding is one main_ref already has
+#      (rebase_deploy_deps_inherited_drift(), ga-dwywwd): --check measures the
+#      table against this machine, not against main, so a main that is stale on
+#      its own would otherwise refuse every branch that has to be rebased.
 # --check costs ~26s of CPU (measured 25/09) but minutes of wall time on a
 # loaded host (280s+ at load 77 on 10 cores, still unfinished), and it blocks
 # this single-threaded sweep while it runs — hence the bound (default 180s,
@@ -5206,7 +5298,7 @@ rebase_git_attributes_file() {
 rebase_deploy_deps_verdict() {
   local wt="$1" gd="$2" main_ref="$3" new_tip="$4" mt_out="$5" mode="${6:-conflict}"
   local paths expected actual diffout diff_rc tip_sha wt_head wt_dirty wt_rc
-  local main_gen tip_gen chk_err chk_rc chk_timeout why
+  local main_gen tip_gen chk_err chk_rc chk_timeout why inh
   case "$mode" in
     conflict|clean) : ;;
     *) echo "unknown:deploy-deps-bad-mode"; return 0 ;;
@@ -5283,11 +5375,21 @@ rebase_deploy_deps_verdict() {
   # argparse usage error, and >=128 is death by signal (SIGKILL/OOM under the
   # load this file's comments cite). Those all stay under check-failed, i.e.
   # "could not verify", so a caller can tell "rejected" from "never finished".
+  # Exit 4 says the committed file differs from what THIS MACHINE builds — not that the branch is to
+  # blame: main can be stale on its own (ga-dwywwd). Only when the rig's lint proves every finding is
+  # one main already has does it count as green; a lint that ran and found more, or that could not
+  # be used, leaves the verdict exactly where it was.
   case "$chk_rc" in
     0) : ;;
     124) echo "unknown:deploy-deps-check-timeout"; return 0 ;;
     127) echo "unknown:deploy-deps-check-unavailable"; return 0 ;;
-    4) echo "unknown:deploy-deps-check-drift"; return 0 ;;
+    4)
+      inh=$(rebase_deploy_deps_inherited_drift "$wt" "$gd" "$main_ref" "$new_tip" "${GATE_DEPLOY_DEPS_INHERITED_TIMEOUT:-$((chk_timeout * 2))}")
+      case "$inh" in
+        inherited) : ;;
+        unknown:deploy-deps-inherited-timeout|unknown:deploy-deps-inherited-unverified) echo "$inh"; return 0 ;;
+        *) echo "unknown:deploy-deps-check-drift"; return 0 ;;
+      esac ;;
     *) echo "unknown:deploy-deps-check-failed"; return 0 ;;
   esac
   # --check exits 0 even when its plist scan was degraded (it demotes the
@@ -5520,7 +5622,16 @@ rebase_union_paths_verdict() {
 #                                                         GATE_DEPLOY_DEPS_CHECK_TIMEOUT
 #                     :deploy-deps-check-unavailable   — python3/timeout ausente (127)
 #                     :deploy-deps-check-drift         — --check rodou ate o fim e disse
-#                                                         DESATUALIZADO (exit 4)
+#                                                         DESATUALIZADO (exit 4) E o
+#                                                         lint nao provou que main ja
+#                                                         tem todos os achados (ga-dwywwd:
+#                                                         se provou, o resultado e "yes")
+#                     :deploy-deps-inherited-timeout   — o lint (segunda opiniao do exit 4)
+#                                                         estourou o limite — nao se sabe
+#                                                         se o drift e de main (ga-dwywwd)
+#                     :deploy-deps-inherited-unverified — o lint nao chegou a um veredito:
+#                                                         excecao, sem python, ou nao
+#                                                         conseguiu comparar contra main
 #                     :deploy-deps-check-failed        — --check saiu != 0 SEM veredito:
 #                                                         excecao/arquivo ausente (1),
 #                                                         selftest ou uso (2), --assert
@@ -5536,6 +5647,7 @@ rebase_union_paths_verdict() {
 #                     sufixo novo):
 #                     :deploy-deps-wt-not-at-tip / :deploy-deps-check-timeout /
 #                     :deploy-deps-check-unavailable / :deploy-deps-check-failed /
+#                     :deploy-deps-inherited-timeout / :deploy-deps-inherited-unverified /
 #                     :deploy-deps-diff-error / :deploy-deps-bad-mode /
 #                     :deploy-deps-no-verdict
 #                   No modo conflito (ga-r5dsgp) NENHUM sufixo vira "no": a linha
