@@ -1,0 +1,390 @@
+diff --git a/cmd/gc/assigned_work_mail.go b/cmd/gc/assigned_work_mail.go
+new file mode 100644
+index 000000000..b394fc12c
+--- /dev/null
++++ b/cmd/gc/assigned_work_mail.go
+@@ -0,0 +1,26 @@
++package main
++
++import (
++	"github.com/gastownhall/gascity/internal/beads"
++	"github.com/gastownhall/gascity/internal/mail/beadmail"
++	sessionpkg "github.com/gastownhall/gascity/internal/session"
++)
++
++// isReadMailBead reports whether b is mail the recipient has positively
++// already read. Read state is beadmail.IsRead's single definition, so "unknown"
++// is never read: mail whose state cannot be established still counts as work.
++func isReadMailBead(b beads.Bead) bool {
++	return b.Type == "message" && beadmail.IsRead(b)
++}
++
++// countsAsAssignedWork reports whether a bead assigned to a session is work
++// that keeps the session alive or awake. Session beads never are. Mail the
++// recipient has already read never is either (ga-h9xpwb): it stays status=open
++// until somebody archives it, and counting it made a drained pool session
++// unable to close, so the reconciler woke it again about every 3.5 minutes
++// (99 wake/drain cycles in 3 days on one wa-worker). UNREAD mail still counts —
++// mail is meant to wake a session (see appendWorkUnique) — and reading it is
++// what lets the session go.
++func countsAsAssignedWork(b beads.Bead) bool {
++	return !sessionpkg.IsSessionBeadOrRepairable(b) && !isReadMailBead(b)
++}
+diff --git a/cmd/gc/assigned_work_read_mail_test.go b/cmd/gc/assigned_work_read_mail_test.go
+new file mode 100644
+index 000000000..9cafa724a
+--- /dev/null
++++ b/cmd/gc/assigned_work_read_mail_test.go
+@@ -0,0 +1,208 @@
++package main
++
++import (
++	"testing"
++
++	"github.com/gastownhall/gascity/internal/beads"
++	"github.com/gastownhall/gascity/internal/config"
++	"github.com/gastownhall/gascity/internal/events"
++	sessionpkg "github.com/gastownhall/gascity/internal/session"
++)
++
++// ga-h9xpwb: mail the recipient has already READ is not assigned work. It keeps
++// status=open until somebody archives it, and every "does this session still
++// have assigned work?" check used to count it, so a drained pool session could
++// not close and was woken again about every 3.5 minutes (99 wake/drain cycles in
++// 3 days on one wa-worker). UNREAD mail still counts — mail is meant to wake a
++// session — and so does mail whose read state cannot be established: only a
++// positive "read" lets the session go.
++
++func createMailBead(t *testing.T, store beads.Store, assignee string, metadata map[string]string, labels ...string) beads.Bead {
++	t.Helper()
++	b, err := store.Create(beads.Bead{
++		Title:    "you have mail",
++		Type:     "message",
++		Status:   "open",
++		Assignee: assignee,
++		Metadata: metadata,
++		Labels:   labels,
++	})
++	if err != nil {
++		t.Fatalf("create mail bead: %v", err)
++	}
++	return b
++}
++
++func TestHasNonSessionAssignedWork_ReadMailIsNotWork(t *testing.T) {
++	t.Parallel()
++	task := beads.Bead{ID: "t-1", Type: "task", Status: "open", Assignee: "worker-1"}
++	tests := []struct {
++		name  string
++		items []beads.Bead
++		want  bool
++	}{
++		{"read mail (metadata)", []beads.Bead{{ID: "m-1", Type: "message", Metadata: map[string]string{"mail.read": "true"}}}, false},
++		{"read mail (legacy read label)", []beads.Bead{{ID: "m-2", Type: "message", Labels: []string{"read"}}}, false},
++		{"unread mail (metadata false)", []beads.Bead{{ID: "m-3", Type: "message", Metadata: map[string]string{"mail.read": "false"}}}, true},
++		{"metadata false beats a stale read label", []beads.Bead{{ID: "m-4", Type: "message", Labels: []string{"read"}, Metadata: map[string]string{"mail.read": "false"}}}, true},
++		{"mail with no read state at all cannot be proven read", []beads.Bead{{ID: "m-5", Type: "message"}}, true},
++		{"mail with an unrecognised read value cannot be proven read", []beads.Bead{{ID: "m-6", Type: "message", Metadata: map[string]string{"mail.read": "maybe"}}}, true},
++		{"read mail next to real work", []beads.Bead{{ID: "m-7", Type: "message", Metadata: map[string]string{"mail.read": "true"}}, task}, true},
++		{"only mail is exempt: a task carrying mail.read stays work", []beads.Bead{{ID: "t-2", Type: "task", Metadata: map[string]string{"mail.read": "true"}}}, true},
++		{"session beads are still never work", []beads.Bead{{ID: "s-1", Type: sessionBeadType, Labels: []string{sessionBeadLabel}}}, false},
++	}
++	for _, tt := range tests {
++		tt := tt
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++			if got := hasNonSessionAssignedWork(tt.items); got != tt.want {
++				t.Fatalf("hasNonSessionAssignedWork() = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestSessionAssignedWorkProbes_ReadMailIsNotWork(t *testing.T) {
++	t.Parallel()
++	store := beads.NewMemStore()
++	createMailBead(t, store, "worker-read", map[string]string{"mail.read": "true"})
++	createMailBead(t, store, "worker-unread", map[string]string{"mail.read": "false"})
++	createMailBead(t, store, "worker-unknown", nil)
++
++	for _, tt := range []struct {
++		assignee string
++		want     bool
++	}{
++		{"worker-read", false},
++		{"worker-unread", true},
++		{"worker-unknown", true},
++	} {
++		has, err := sessionHasOpenAssignedWorkInStoreByIdentifiers(store, []string{tt.assignee})
++		if err != nil {
++			t.Fatalf("sessionHasOpenAssignedWorkInStoreByIdentifiers(%s): %v", tt.assignee, err)
++		}
++		if has != tt.want {
++			t.Errorf("sessionHasOpenAssignedWorkInStoreByIdentifiers(%s) = %v, want %v", tt.assignee, has, tt.want)
++		}
++		first, found, err := firstOpenAssignedWorkBeadInStoreByIdentifiers(store, []string{tt.assignee})
++		if err != nil {
++			t.Fatalf("firstOpenAssignedWorkBeadInStoreByIdentifiers(%s): %v", tt.assignee, err)
++		}
++		if found != tt.want {
++			t.Errorf("firstOpenAssignedWorkBeadInStoreByIdentifiers(%s) found = %v (bead %q), want %v", tt.assignee, found, first.ID, tt.want)
++		}
++	}
++
++	// Control: real work next to the read mail is still found.
++	if _, err := store.Create(beads.Bead{Title: "do the thing", Type: "task", Status: "in_progress", Assignee: "worker-read"}); err != nil {
++		t.Fatalf("create task: %v", err)
++	}
++	has, err := sessionHasOpenAssignedWorkInStoreByIdentifiers(store, []string{"worker-read"})
++	if err != nil || !has {
++		t.Fatalf("with a task assigned too: has=%v err=%v, want true", has, err)
++	}
++	first, found, err := firstOpenAssignedWorkBeadInStoreByIdentifiers(store, []string{"worker-read"})
++	if err != nil || !found || first.Type != "task" {
++		t.Fatalf("with a task assigned too: first=%+v found=%v err=%v, want the task", first, found, err)
++	}
++}
++
++func TestFinalizeDrainAckStoppedSession_ReadMailDoesNotHoldTheSession(t *testing.T) {
++	for _, tt := range []struct {
++		name       string
++		metadata   map[string]string
++		wantClosed bool
++		wantEvents int
++	}{
++		{"read mail lets the drained session close", map[string]string{"mail.read": "true"}, true, 0},
++		{"unread mail still keeps it (mail is meant to wake a session)", map[string]string{"mail.read": "false"}, false, 1},
++		{"mail with no read state keeps it (cannot prove it was read)", nil, false, 1},
++	} {
++		tt := tt
++		t.Run(tt.name, func(t *testing.T) {
++			env := newReconcilerTestEnv()
++			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
++			fake := events.NewFake()
++			env.rec = fake
++
++			session := env.createSessionBead("worker", "worker")
++			patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
++			if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
++				t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
++			}
++			session.Metadata = patch.Apply(session.Metadata)
++			createMailBead(t, env.store, session.ID, tt.metadata)
++
++			finalizeDrainAckStoppedSession(
++				"", env.cfg, env.store, nil, &session, "worker", true,
++				newFakeDrainOps(), env.dt, env.clk, env.rec, &env.stderr,
++			)
++
++			got, err := env.store.Get(session.ID)
++			if err != nil {
++				t.Fatalf("Get(%s): %v", session.ID, err)
++			}
++			if closed := got.Status == "closed"; closed != tt.wantClosed {
++				t.Fatalf("session closed = %v, want %v (metadata=%v)", closed, tt.wantClosed, got.Metadata)
++			}
++			matches := 0
++			for _, ev := range fake.Events {
++				if ev.Type == events.SessionDrainAckedWithAssignedWork {
++					matches++
++				}
++			}
++			if matches != tt.wantEvents {
++				t.Fatalf("%s events = %d, want %d", events.SessionDrainAckedWithAssignedWork, matches, tt.wantEvents)
++			}
++		})
++	}
++}
++
++func TestCollectSessionAssignedWork_SkipsReadMail(t *testing.T) {
++	env := newReconcilerTestEnv()
++	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
++	session := env.createSessionBead("worker", "worker")
++	createMailBead(t, env.store, session.ID, map[string]string{"mail.read": "true"})
++	unread := createMailBead(t, env.store, session.ID, map[string]string{"mail.read": "false"})
++	task, err := env.store.Create(beads.Bead{Title: "stranded", Type: "task", Status: "in_progress", Assignee: session.ID})
++	if err != nil {
++		t.Fatalf("create task: %v", err)
++	}
++
++	got, err := collectSessionAssignedWork("", env.cfg, env.store, nil, session)
++	if err != nil {
++		t.Fatalf("collectSessionAssignedWork: %v", err)
++	}
++	ids := make(map[string]bool, len(got))
++	for _, w := range got {
++		ids[w.bead.ID] = true
++	}
++	if len(got) != 2 || !ids[task.ID] || !ids[unread.ID] {
++		t.Fatalf("collectSessionAssignedWork = %v, want exactly the task %s and the unread mail %s (the read mail is not work)", ids, task.ID, unread.ID)
++	}
++}
++
++func TestAppendAssignedUnique_SkipsReadMail(t *testing.T) {
++	t.Parallel()
++	store := beads.NewMemStore()
++	read := createMailBead(t, store, "worker-1", map[string]string{"mail.read": "true"})
++	unread := createMailBead(t, store, "worker-1", map[string]string{"mail.read": "false"})
++	task, err := store.Create(beads.Bead{Title: "do the thing", Type: "task", Status: "in_progress", Assignee: "worker-1"})
++	if err != nil {
++		t.Fatalf("create task: %v", err)
++	}
++
++	var dst []beads.Bead
++	var stores []beads.Store
++	var refs []string
++	appendAssignedUnique(&dst, &stores, &refs, []beads.Bead{read, unread, task}, map[string]struct{}{}, store, "")
++
++	got := make(map[string]bool, len(dst))
++	for _, b := range dst {
++		got[b.ID] = true
++	}
++	if got[read.ID] || !got[unread.ID] || !got[task.ID] || len(dst) != len(stores) || len(dst) != len(refs) {
++		t.Fatalf("snapshot = %v (stores=%d refs=%d), want the unread mail %s and the task %s but not the read mail %s",
++			got, len(stores), len(refs), unread.ID, task.ID, read.ID)
++	}
++}
+diff --git a/cmd/gc/build_desired_state.go b/cmd/gc/build_desired_state.go
+index a7b534432..3f41fce7b 100644
+--- a/cmd/gc/build_desired_state.go
++++ b/cmd/gc/build_desired_state.go
+@@ -1839,11 +1839,13 @@ func appendWorkUnique(dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[]str
+ 	// Invariant: dst, stores, and storeRefs are kept index-aligned by this
+ 	// shared growth path and the shared seen guard.
+ 	// Session beads are not actionable work — filter them at the source
+-	// so all consumers see only real tasks. Message beads are NOT filtered
+-	// here because they represent mail that should wake/materialize sessions;
+-	// idle nudge filters messages locally since mail nudging is handled
+-	// separately by the mail system.
+-	if b.Type == sessionBeadType {
++	// so all consumers see only real tasks. UNREAD message beads are NOT
++	// filtered here because they represent mail that should wake/materialize
++	// sessions; idle nudge filters messages locally since mail nudging is
++	// handled separately by the mail system. Mail the recipient has already
++	// READ is filtered: it stays status=open until archived and must not keep
++	// a session awake (ga-h9xpwb).
++	if b.Type == sessionBeadType || isReadMailBead(b) {
+ 		return
+ 	}
+ 	if _, ok := seen[b.ID]; ok {
+diff --git a/cmd/gc/session_reconciler.go b/cmd/gc/session_reconciler.go
+index 34990f34d..7b58ab355 100644
+--- a/cmd/gc/session_reconciler.go
++++ b/cmd/gc/session_reconciler.go
+@@ -2877,7 +2877,7 @@ func firstOpenAssignedWorkBeadInStoreByIdentifiers(store beads.Store, identifier
+ 				return beads.Bead{}, false, err
+ 			}
+ 			for _, item := range items {
+-				if sessionpkg.IsSessionBeadOrRepairable(item) {
++				if !countsAsAssignedWork(item) {
+ 					continue
+ 				}
+ 				return item, true, nil
+@@ -3042,7 +3042,7 @@ func collectSessionAssignedWork(cityPath string, cfg *config.City, store beads.S
+ 					return err
+ 				}
+ 				for _, item := range items {
+-					if sessionpkg.IsSessionBeadOrRepairable(item) {
++					if !countsAsAssignedWork(item) {
+ 						continue
+ 					}
+ 					if _, dup := seen[item.ID]; dup {
+@@ -3223,7 +3223,7 @@ func sessionHasOpenAssignedWorkForTier(store beads.Store, assignee, status strin
+ 
+ func hasNonSessionAssignedWork(items []beads.Bead) bool {
+ 	for _, item := range items {
+-		if sessionpkg.IsSessionBeadOrRepairable(item) {
++		if !countsAsAssignedWork(item) {
+ 			continue
+ 		}
+ 		return true
+diff --git a/internal/mail/beadmail/beadmail.go b/internal/mail/beadmail/beadmail.go
+index 7bd85216d..9e041c3cd 100644
+--- a/internal/mail/beadmail/beadmail.go
++++ b/internal/mail/beadmail/beadmail.go
+@@ -883,6 +883,22 @@ func (p *Provider) messageCandidatesAll(routes []string) ([]beads.Bead, error) {
+ 	return out, nil
+ }
+ 
++// IsRead reports whether the recipient has read the mail bead b. The
++// mail.read metadata is authoritative when it holds "true" or "false";
++// otherwise the legacy "read" label decides. A bead that carries neither is
++// NOT read: unknown never counts as read. This is the one definition — the
++// inbox (beadToMessage) and the reconciler's assigned-work checks in cmd/gc
++// (a read-but-unarchived message is not work, ga-h9xpwb) both use it.
++func IsRead(b beads.Bead) bool {
++	switch b.Metadata["mail.read"] {
++	case "true":
++		return true
++	case "false":
++		return false
++	}
++	return hasLabel(b.Labels, "read")
++}
++
+ // beadToMessage converts a bead to a mail.Message.
+ func beadToMessage(b beads.Bead) mail.Message {
+ 	from := b.From
+@@ -893,13 +909,7 @@ func beadToMessage(b beads.Bead) mail.Message {
+ 	if display := strings.TrimSpace(b.Metadata[toDisplayMetadataKey]); display != "" {
+ 		to = display
+ 	}
+-	read := hasLabel(b.Labels, "read")
+-	switch b.Metadata["mail.read"] {
+-	case "true":
+-		read = true
+-	case "false":
+-		read = false
+-	}
++	read := IsRead(b)
+ 	return mail.Message{
+ 		ID:        b.ID,
+ 		From:      from,
+diff --git a/internal/mail/beadmail/isread_test.go b/internal/mail/beadmail/isread_test.go
+new file mode 100644
+index 000000000..418c5abbf
+--- /dev/null
++++ b/internal/mail/beadmail/isread_test.go
+@@ -0,0 +1,42 @@
++package beadmail
++
++import (
++	"testing"
++
++	"github.com/gastownhall/gascity/internal/beads"
++)
++
++// ga-h9xpwb: IsRead is the ONE definition of "the recipient has read this mail
++// bead". The reconciler's assigned-work checks (cmd/gc) use it to let a drained
++// pool session go once its mail is read, so it must agree with what the inbox
++// shows (beadToMessage.Read) in every case.
++func TestIsRead(t *testing.T) {
++	t.Parallel()
++	tests := []struct {
++		name string
++		bead beads.Bead
++		want bool
++	}{
++		{"metadata true", beads.Bead{Metadata: map[string]string{"mail.read": "true"}}, true},
++		{"metadata true beats no label", beads.Bead{Labels: []string{"thread:x"}, Metadata: map[string]string{"mail.read": "true"}}, true},
++		{"metadata false", beads.Bead{Metadata: map[string]string{"mail.read": "false"}}, false},
++		{"metadata false beats a stale read label", beads.Bead{Labels: []string{"read"}, Metadata: map[string]string{"mail.read": "false"}}, false},
++		{"legacy read label, no metadata", beads.Bead{Labels: []string{"read"}}, true},
++		{"neither: read state unknown is not read", beads.Bead{}, false},
++		{"nil metadata, unrelated labels", beads.Bead{Labels: []string{"thread:x", "reply-to:y"}}, false},
++		{"unrecognised metadata value falls back to the label", beads.Bead{Labels: []string{"read"}, Metadata: map[string]string{"mail.read": "maybe"}}, true},
++		{"unrecognised metadata value, no label", beads.Bead{Metadata: map[string]string{"mail.read": "maybe"}}, false},
++	}
++	for _, tt := range tests {
++		tt := tt
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++			if got := IsRead(tt.bead); got != tt.want {
++				t.Fatalf("IsRead() = %v, want %v", got, tt.want)
++			}
++			if got := beadToMessage(tt.bead).Read; got != tt.want {
++				t.Fatalf("beadToMessage().Read = %v, want %v (the inbox and IsRead must agree)", got, tt.want)
++			}
++		})
++	}
++}
