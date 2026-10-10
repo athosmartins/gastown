@@ -1,0 +1,32 @@
+# ga-yq5pe3 (item 3 of ga-witezg): on 10/10 (00:56-03:05) gastown.dog-1 and dog-3 sat for ~2 h with 3 P0 beads
+# routed to them. The Claude Code safety check had denied the long Step-1c probe and the panes ended on "Next
+# step is up to you". Nothing alarmed: agent-stuck-escalation is keyed on a stale in_progress BEAD (these
+# sessions held none), and pool-idle-nobead-guard — the one watcher that does look at bead-less sessions —
+# never listed gastown.dog and, by design, nudges/closes instead of telling anyone (a nudge cannot clear an
+# open permission dialog either).
+#
+# DETECTION ONLY. This order mails the Mayor, once per episode, when ALL hold: a live unattached pool session
+# (gastown.dog / wa-worker / ps-worker), no bead in the city or its rig DB, a pane that is not running a turn
+# and ENDS in a human-wait shape (open permission dialog / safety-check denial / a question or hand-off to the
+# human), and that pane's text unchanged for 20 min on this script's own pane-hash clock. It never nudges,
+# closes or kills a session (selftest K). "Could not tell" (peek timeout, bd unreadable) is UNKNOWN and never
+# an alarm. The mail carries the pane tail, fenced as captured DATA. A gc order (fresh exec each tick,
+# flock'd), never a raw plist.
+#
+# Cost, MEASURED 10/10 (DRY_RUN, 4 pool sessions, load ~80): `gc session list` 22 s, then every `gc session
+# peek` hit its timeout — 179 s wall for 4.6 s of CPU; one uncapped peek at load 61 took 19 s. The time is gc
+# waiting on a loaded machine. A normal pass is one peek per session, the 7-call bead check runs only for a
+# session that already looks stuck. Hence: interval 10m (> the measured duration; an alarm whose threshold is
+# 20 min gains nothing from a tighter tick), peek timeout 60 s, pass budget 420 s.
+#
+# timeout 900s: the script stops STARTING work after the 420 s budget, but the session in flight can still
+# make one bounded peek, one bead check (rig list + 6 bd calls, each capped at 40 s) and one mail (45 s); the
+# timeout is declared with that room above the budget, and selftest W fails if it drops under budget + 300 s.
+# A run the timeout cuts short is harmless: the "alarmed" mark is written BEFORE the mail is sent, and the
+# script's flock keeps the next tick from stacking on a straggler.
+[order]
+description = "Mail the Mayor when a live pool session holds no bead and its pane has stood still >= 20 min on an open question, permission dialog or safety-check denial (detection only)"
+trigger = "cooldown"
+interval = "10m"
+timeout = "900s"
+exec = "$PACK_DIR/assets/scripts/pool-stuck-prompt-alarm.sh"
