@@ -644,6 +644,51 @@ eq "$(levels)" "" "an entry for a pool OUTSIDE the allowlist (gastown.dog belong
 mk_city s16h; rm -f "$C/.gc/pool-ceiling-engine.toml"
 eng_quiet "$T0" 4000 11264
 eq "$(ENG_CMD=check eng "$T0" 4000 11264)" "ok: include present, fragment present and well-formed" ".on + include + fragment ABSENT: the sweep re-creates it"
+
+# A repair that FAILS is not "nothing to do" (gate ga-x50l0h): the fragment is absent, city.toml includes it (or may), and the create fails (the .gc
+# directory is read-only): the next reload cannot load the config. The engine must SAY so - once per failure (not once per 5-minute sweep), and
+# again if it fails again after the file was there (re-created by the engine, or put back by a human).
+blk() { mkdir -p "$C/.gc/logs" "$C/.gc/pool-ceiling-engine"; chmod 555 "$C/.gc"; }   # the next create of the fragment fails; the log and the state dir (below .gc) stay writable
+unblk() { chmod 755 "$C/.gc"; }
+nrepairfail() { grep -c 'could NOT re-create' "$TMPROOT/notify.log" | tr -d ' '; }
+mk_city s16j; rm -f "$C/.gc/pool-ceiling-engine.on" "$C/.gc/pool-ceiling-engine.toml"; RF="$C/.gc/pool-ceiling-engine/repair-failed"
+blk; eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 300)) 4000 11264; unblk
+eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo ABSENT)" "ABSENT" "disabled + include present + fragment absent + .gc read-only: the create really failed (the setup)"
+has "$(events repair)" "result=FAILED" "the failed repair is LOGGED (it used to read as 'nothing to do')"
+has "$(events repair)" "include=1" "with the include verdict it acted on"
+eq "$(nrepairfail)" "1" "and NOTIFIED"
+eq "$(nevents repair)" "1" "once, not once per sweep (2 sweeps, the same failure)"
+eng_quiet $((T0 + 600)) 4000 11264
+eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo ABSENT)" "created" ".gc writable again: the next sweep re-creates it EMPTY"
+eq "$([ -e "$RF" ] && echo marker || echo clear)" "clear" "and the failure marker is gone with it"
+rm -f "$C/.gc/pool-ceiling-engine.toml"; blk; eng_quiet $((T0 + 900)) 4000 11264; unblk
+eq "$(nrepairfail)" "2" "it fails AGAIN after the engine had recovered: reported again (a recovery re-arms the report)"
+printf '# put back by a human\n' > "$C/.gc/pool-ceiling-engine.toml"; eng_quiet $((T0 + 1200)) 4000 11264
+eq "$([ -e "$RF" ] && echo marker || echo clear)" "clear" "a human put the file back: the sweep sees it present and clears the marker (a past failure is over)"
+rm -f "$C/.gc/pool-ceiling-engine.toml"; blk; eng_quiet $((T0 + 1500)) 4000 11264; unblk
+eq "$(nrepairfail)" "3" "and a failure after THAT is reported too"
+mk_city s16n; rm -f "$C/.gc/pool-ceiling-engine.on" "$C/.gc/pool-ceiling-engine.toml"; ln -s "$TMPROOT/no-such-dir/x" "$C/.gc/pool-ceiling-engine.toml"   # a dangling symlink: .gc stays writable, the create fails, there is no state dir yet
+eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 300)) 4000 11264
+eq "$(nrepairfail)/$(nevents repair)" "1/1" "disabled, no state dir yet, the create fails for a reason other than .gc's mode: reported once"
+eq "$([ -e "$C/.gc/pool-ceiling-engine/repair-failed" ] && echo marker || echo none)" "marker" "the failure created the state dir for its marker (that is what dedups the report)"
+rm -f "$C/.gc/pool-ceiling-engine.toml"
+mk_city s16o; rm -f "$C/.gc/pool-ceiling-engine.on" "$C/.gc/pool-ceiling-engine.toml"; chmod 555 "$C/.gc"   # no state dir, no logs dir, .gc read-only: not even the marker can be written
+eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 300)) 4000 11264; unblk
+eq "$(nrepairfail)" "2" "when not even the failure marker can be written the report REPEATS every sweep: loud, never silent"
+mk_city s16k; sed -i '' 's|^include = .*|include = ".gc/pool-ceiling-engine.toml"|' "$C/city.toml"; rm -f "$C/.gc/pool-ceiling-engine.toml"; RF="$C/.gc/pool-ceiling-engine/repair-failed"
+blk; eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 300)) 4000 11264; eng_quiet $((T0 + 600)) 4000 11264; unblk
+has "$(events repair)" "include=?" "ENABLED + include 'cannot tell' + fragment absent + create fails: logged with the undecidable verdict"
+eq "$(nrepairfail)" "1" "notified ONCE over 3 sweeps (step 3's own 'cannot tell' line must not re-arm it every sweep)"
+eq "$(nevents repair)" "1" "logged once"
+has "$(events skip)" "cannot tell whether" "and the sweep still says why it wrote nothing"
+mk_city s16l; rm -f "$C/.gc/pool-ceiling-engine.toml"
+blk; eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 300)) 4000 11264; eng_quiet $((T0 + 600)) 4000 11264; unblk
+eq "$(nrepairfail)" "1" "ENABLED + include=1 + fragment absent + create fails: the repair is reported once over 3 sweeps"
+eq "$(grep -c 'could not write' "$TMPROOT/notify.log" | tr -d ' ')" "1" "and the write that fails for the same reason is its own single report (neither re-arms the other)"
+mkdir -p "$TMPROOT/nodate16"; printf '#!/bin/sh\ncase "${1:-}" in -r|-d) exit 1 ;; esac\nexec /bin/date "$@"\n' > "$TMPROOT/nodate16/date"; chmod +x "$TMPROOT/nodate16/date"   # the calendar date cannot be computed (the epoch still can)
+mk_city s16m; rm -f "$C/.gc/pool-ceiling-engine.toml"
+eng_quiet "$T0" 4000 11264 "PATH=$TMPROOT/nodate16:$PATH"
+eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo ABSENT)" "created" "ENABLED + include=1 + fragment absent + the calendar date unreadable (the sweep ends early): the fragment is re-created EMPTY first, never left absent"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -699,6 +744,20 @@ mk_city s18b; rm -f "$C/.gc/pool-ceiling-engine.toml"
 out="$(ENG_CMD=plan eng "$T0" 4000 11264)"
 has "$out" "why=fragment-absent" "plan says when the only thing it would do is create the missing fragment"
 eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo untouched)" "untouched" "and does not create it"
+# plan previews what the sweep WOULD do: where the include gate would refuse the write, it must not preview one
+mk_city s18c; sed -i '' '/^include/d' "$C/city.toml"; before="$(tree_sig)"
+out="$(ENG_CMD=plan eng $((T0 + 900)) 7000 11264)"
+hasnt "$out" "event=would-write" "plan: city.toml does not include the fragment -> no write is previewed (the sweep would write nothing)"
+has "$out" "does not include" "and it says why"
+eq "$(tree_sig)" "$before" "and still writes nothing"
+mk_city s18d; { printf 'include = ".gc/pool-ceiling-engine.toml"\n'; sed '1d' "$C/city.toml"; } > "$TMPROOT/ct.new" && mv "$TMPROOT/ct.new" "$C/city.toml"; rm -f "$C/.gc/pool-ceiling-engine.toml"; before="$(tree_sig)"
+out="$(ENG_CMD=plan eng $((T0 + 900)) 7000 11264)"
+hasnt "$out" "event=would-write" "plan: include 'cannot tell' -> no write is previewed either"
+has "$out" "result=would-create-empty" "but the repair it WOULD do (the fragment is absent) is previewed"
+eq "$(tree_sig)" "$before" "and plan created nothing"
+mk_city s18e; mkdir -p "$C/.gc/pool-ceiling-engine"; : > "$C/.gc/pool-ceiling-engine/repair-failed"; before="$(tree_sig)"
+ENG_CMD=plan eng_quiet $((T0 + 900)) 4000 11264
+eq "$(tree_sig)" "$before" "plan does not clear a repair-failure marker (a dry run touches nothing, not even to say a failure is over)"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -720,6 +779,8 @@ has "$(events skip)" "pool=no-such-pool" "a pool with no agent.toml at HEAD is s
 eq "$(levels)" "" "and while its ceiling is unknown nothing is RAISED (the budget cannot be checked: an unknown is not a zero)"
 eng_quiet $((T0 + 700)) 7000 11264 "POOL_CEILING_ENGINE_POOLS=wa-worker ps-worker gate-reviewer no-such-pool"
 eq "$(levels)" "gate-reviewer=2" "but the pressure lowering carries on for the pools that are known"
+has "$(events skip | grep 'pool=no-such-pool' | tail -1)" "nothing-to-hold" "a pool with no entry and no readable ceiling: the log says there is NOTHING to hold"
+hasnt "$(events skip | grep 'pool=no-such-pool' | tail -1)" "hold-entry" "and does not claim to have held an entry that is not there"
 # A ceiling that cannot be read must not undo what the pressure already did (gate ga-9j2yjo): dropping a pool's entry hands it back to
 # the committed value - a RAISE for a pool the engine had lowered, while the pressure that lowered it is still there. The entry that is
 # there is HELD: neither raised nor lowered, because the engine does not know what it would be moving from or to.
@@ -733,6 +794,7 @@ eq "$(resolved gate-reviewer)" "2" "and the controller still resolves 2: what gc
 eq "$(nevents write)" "1" "no second write for a pool nobody can say anything new about (a drop would be a write, and one more of the day's 10)"
 has "$(events skip | tail -1)" "pool=gate-reviewer" "the log still names the pool whose committed value could not be read"
 has "$(events skip | tail -1)" "hold-entry" "and says its entry was HELD (not dropped)"
+hasnt "$(events skip | tail -1)" "nothing-to-hold" "(there WAS an entry to hold)"
 mk_city s19e   # the whole read fails at once (git cannot run for one sweep): every pool unreadable, nothing may move
 eng_quiet "$T0" 7000 11264
 for p in wa-worker ps-worker gate-reviewer; do printf '# no max_active_sessions line here\n' > "$C/agents/$p/agent.toml"; done; cm all-unreadable
@@ -865,13 +927,13 @@ M = [
  ("no-daily-breaker", "15", '"$(pce_daily_writes)" -ge "$PCE_DAILY_MAX"', '"$(pce_daily_writes)" -ge 99999'),
  ("unreadable-date-reads-as-a-new-day", "15", '[ -n "$(_pce_date_of "$PCE_NOW")" ] || { pce_log_change "date-unreadable"', 'true || { pce_log_change "date-unreadable"'),
  ("kill-switch-deletes-the-fragment", "16", 'if pce_write_fragment "$empty"; then', 'if rm -f "$PCE_FRAGMENT"; then'),
- ("writes-without-the-include", "16", 'if [ "$include" != "1" ] && [ "$PCE_DRY" != "1" ]; then', 'if false; then'),
- ("cannot-tell-reads-as-included", "16", 'if [ "$include" != "1" ] && [ "$PCE_DRY" != "1" ]; then', 'if [ "$include" = "0" ] && [ "$PCE_DRY" != "1" ]; then'),
+ ("writes-without-the-include", "16", 'if [ "$include" != "1" ]; then   # (a dry run too', 'if false; then   # (a dry run too'),
+ ("cannot-tell-reads-as-included", "16", 'if [ "$include" != "1" ]; then   # (a dry run too', 'if [ "$include" = "0" ]; then   # (a dry run too'),
  ("cannot-tell-reads-as-not-included", "16", 'case "$v" in 0|1) echo "$v" ;; *) echo \'?\' ;; esac', 'case "$v" in 1) echo 1 ;; *) echo 0 ;; esac'),
  ("unknown-include-not-repaired", "16", '[ "$st" != "0" ] || return 0', '[ "$st" = "1" ] || return 0'),
  ("parse-accepts-level-0-and-03", "6", '/^max_active_sessions[[:space:]]*=[[:space:]]*[1-9][0-9]*[[:space:]]*$/ {', '/^max_active_sessions[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$/ {'),
  ("int-accepts-leading-zero", "6", "''|*[!0-9]*|0?*) return 1 ;; esac; return 0; }", "''|*[!0-9]*) return 1 ;; esac; return 0; }"),
- ("missing-fragment-not-repaired", "16", '[ -e "$PCE_FRAGMENT" ] && return 0', 'return 0'),
+ ("missing-fragment-not-repaired", "16", '  [ -e "$PCE_FRAGMENT" ] && { [ "$PCE_DRY" = "1" ] || rm -f "$PCE_STATE/repair-failed" 2>/dev/null; return 0; }', '  return 0'),
  ("trip-restores-on-every-sweep", "14", 'pce_fragment_is_empty || pce_restore "tripped:$tr" >/dev/null', 'pce_restore "tripped:$tr" >/dev/null'),
  ("kill-switch-clears-dedup-every-sweep", "16", 'if pce_restore "kill-switch"; then', 'if pce_restore "kill-switch"; then pce_clear_condition'),
  ("corrupt-daily-counter-reads-as-zero", "15", 'if [ -z "$d" ] || ! _pce_int "$w"; then printf \'%s\' "$PCE_DAILY_MAX"; return 0; fi', 'if [ -z "$d" ] || ! _pce_int "$w"; then printf \'0\'; return 0; fi'),
@@ -895,7 +957,7 @@ M = [
  ("reset-exits-0-on-failure", "14", 'reset) pce_reset; exit $? ;;', 'reset) pce_reset; exit 0 ;;'),
  ("trip-with-unreadable-date-expires", "14", '[[ "$td" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && ', ''),
  ("clear-streak-survives-any-gap", "7", 'if [ "$lsw" -ne 0 ] && [ $((PCE_NOW - lsw)) -gt "$PCE_STREAK_EXPIRE_SECS" ]; then cs=0; fi', ':'),
- ("enabled-unknown-include-not-repaired", "16", 'pce_repair_missing_fragment   # a definite 0', ':   # a definite 0'),
+ ("enabled-absent-fragment-not-repaired", "16", 'pce_repair_missing_fragment; [ -n "$(_pce_date_of', ': ; [ -n "$(_pce_date_of'),
  ("preflight-notifies-every-sweep", "14", '&& [ "$pfrc" -eq 1 ] && pce_notify', '; [ "$pfrc" -eq 1 ] && pce_notify'),
  ("write-failed-notifies-every-sweep", "14", '&& pce_notify "pool-ceiling-engine: could not write', '; pce_notify "pool-ceiling-engine: could not write'),
  ("daily-counter-write-failure-is-silent", "10", ' || pce_log "event=state-write-failed" "what=daily-counter" "effect=the breaker may undercount today\'s writes"', ''),
@@ -903,6 +965,15 @@ M = [
  ("unreadable-ceiling-entry-not-remembered", "19", '_pce_int "$L" && held=$(_pce_map_set "$held" "$pool" "$L")', ':'),
  ("held-entry-not-rendered", "19", '_pce_int "$new" && dev=$(_pce_map_set "$dev" "$pool" "$new"); continue; }', 'continue; }'),
  ("paused-pool-entry-is-held", "19", 'if [ "$C" = "0" ]; then pce_log "event=skip"', 'if [ "$C" = "0" ]; then held=$(_pce_map_set "$held" "$pool" "$(_pce_map_get "$cur_map" "$pool")"); pce_log "event=skip"'),
+ # the defect of gate round ga-x50l0h: a repair that FAILED read as "nothing to do", and the class around it
+ ("repair-failure-is-silent", "16", 'elif [ ! -e "$PCE_FRAGMENT" ]; then', 'elif false; then'),
+ ("repair-failure-reported-every-sweep", "16", '[ -e "$PCE_STATE/repair-failed" ] || {', '{'),
+ ("repair-success-keeps-the-failure-marker", "16", 'rm -f "$PCE_STATE/repair-failed" 2>/dev/null; pce_log "event=repair" "result=created-empty"', 'pce_log "event=repair" "result=created-empty"'),
+ ("present-fragment-keeps-the-failure-marker", "16", '[ "$PCE_DRY" = "1" ] || rm -f "$PCE_STATE/repair-failed" 2>/dev/null; return 0; }', ':; return 0; }'),
+ ("repair-failure-marker-needs-an-existing-state-dir", "16", 'mkdir -p "$PCE_STATE" 2>/dev/null; [ -e "$PCE_STATE/repair-failed" ] || {', '[ -e "$PCE_STATE/repair-failed" ] || {'),
+ ("dry-run-clears-the-failure-marker", "18", '[ "$PCE_DRY" = "1" ] || rm -f "$PCE_STATE/repair-failed" 2>/dev/null; return 0; }', 'rm -f "$PCE_STATE/repair-failed" 2>/dev/null; return 0; }'),
+ ("plan-ignores-the-include-gate", "18", 'if [ "$include" != "1" ]; then   # (a dry run too', 'if [ "$include" != "1" ] && [ "$PCE_DRY" != "1" ]; then   # (a dry run too'),
+ ("hold-log-claims-an-entry-that-is-not-there", "19", '"action=$(_pce_int "$L" && echo hold-entry || echo nothing-to-hold),no-raise-while-unknown"', '"action=hold-entry,no-raise-while-unknown"'),
 ]
 names = []
 for name, secs, old, new in M:

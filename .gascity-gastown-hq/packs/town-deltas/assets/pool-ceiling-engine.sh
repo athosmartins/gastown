@@ -39,8 +39,8 @@
 #               empties the fragment and trips until tomorrow. A read-back MISMATCH trips until a human runs `reset`.
 #   lock        one instance at a time (mkdir + heartbeat + TTL); a second run exits silently.
 #   include     read from city.toml's PARSED include array (1/0/?). With .on but not a definite 1 no level is written (it could not
-#               apply). With the include 1 or ? and the fragment ABSENT (clean clone / DR) the engine re-creates it - EMPTY when disabled or
-#               include "?"; enabled + include 1 the sweep writes it from the model (empty unless a level deviates). Absent = the next reload breaks.
+#               apply). With the include 1 or ? and the fragment ABSENT (clean clone / DR) the engine re-creates it EMPTY, first thing in EVERY
+#               sweep (disabled or not; a create that FAILS is logged + notified once, never "nothing to do"). Absent = the next reload breaks.
 #
 # SWITCHES (files under $GC_CITY/.gc, all instant, none needs a plist edit):
 #   pool-ceiling-engine.on    the engine acts ONLY with this file. Without it: silent, no level written (bar the repair above) - and the
@@ -503,18 +503,20 @@ pce_restore() {
 
 # ── the sweep ─────────────────────────────────────────────────────────────────
 
-# pce_repair_missing_fragment — include present + fragment absent = the next reload fails to load. Create it EMPTY (noclobber:
-# never replaces a file that appeared meanwhile). Safe by construction: empty is config-identical to "no engine".
+# pce_repair_missing_fragment — include present (or undecidable) + fragment absent = the next reload fails to load. Create it EMPTY (noclobber: never replaces a
+# file that appeared meanwhile). Safe by construction: empty is config-identical to "no engine". A create that FAILS is reported once per failure ($PCE_STATE/repair-failed).
 pce_repair_missing_fragment() {
-  [ -e "$PCE_FRAGMENT" ] && return 0
+  [ -e "$PCE_FRAGMENT" ] && { [ "$PCE_DRY" = "1" ] || rm -f "$PCE_STATE/repair-failed" 2>/dev/null; return 0; }   # present: an earlier failure is over, the next one is reported again (a dry run touches nothing)
   local st empty; st=$(pce_include_state)
   [ "$st" != "0" ] || return 0   # only a definite "not included" skips; "?" repairs too (an EMPTY file is config-identical to no engine)
-  empty=$(pce_fragment_render "") || return 0
+  empty=$(pce_fragment_render "")
   if [ "$PCE_DRY" = "1" ]; then pce_log "event=repair" "result=would-create-empty"; return 0; fi
   mkdir -p "$(dirname "$PCE_FRAGMENT")" 2>/dev/null
   if ( set -C; printf '%s\n' "$empty" > "$PCE_FRAGMENT" ) 2>/dev/null; then
-    pce_log "event=repair" "result=created-empty" "include=$st" "why=the file was absent and city.toml includes the fragment (include=1) or may (include=?)"
+    rm -f "$PCE_STATE/repair-failed" 2>/dev/null; pce_log "event=repair" "result=created-empty" "include=$st" "why=the file was absent and city.toml includes the fragment (include=1) or may (include=?)"
     pce_notify "pool-ceiling-engine: $PCE_FRAGMENT was ABSENT while city.toml includes it (include=$st, ?=cannot tell; next reload would fail) - re-created EMPTY"
+  elif [ ! -e "$PCE_FRAGMENT" ]; then   # the create FAILED (not "it appeared meanwhile"): never "nothing to do"; reported once per failure, by its own marker (the shared last-condition key flaps with step 3's)
+    mkdir -p "$PCE_STATE" 2>/dev/null; [ -e "$PCE_STATE/repair-failed" ] || { : > "$PCE_STATE/repair-failed" 2>/dev/null; pce_log "event=repair" "result=FAILED" "include=$st" "why=$PCE_FRAGMENT is absent and could not be created: if city.toml includes it (include=1; ?=cannot tell) the next reload fails to load the config"; pce_notify "pool-ceiling-engine: could NOT re-create $PCE_FRAGMENT (ABSENT, include=$st, ?=cannot tell; if it is included the next reload fails to load the config) - check the .gc directory"; }
   fi
   return 0
 }
@@ -558,8 +560,8 @@ _pce_sweep_locked() {
     return 0
   fi
 
-  # 1b. the calendar date dates the daily counter and the trip: where it cannot be computed both would read as "a new day" (breaker off, trip expired)
-  [ -n "$(_pce_date_of "$PCE_NOW")" ] || { pce_log_change "date-unreadable" "event=skip" "reason=cannot compute the calendar date of $PCE_NOW: the daily breaker and the trip cannot be dated - nothing written"; return 0; }
+  # 1b. an ABSENT fragment that city.toml includes (or may) breaks the next reload: repaired (EMPTY) before anything can end this sweep. Then the date, which dates the daily counter and the trip (unreadable, both would read as "a new day")
+  pce_repair_missing_fragment; [ -n "$(_pce_date_of "$PCE_NOW")" ] || { pce_log_change "date-unreadable" "event=skip" "reason=cannot compute the calendar date of $PCE_NOW: the daily breaker and the trip cannot be dated - nothing written"; return 0; }
 
   # 2. tripped?
   if [ -e "$PCE_STATE/tripped" ]; then
@@ -577,8 +579,7 @@ _pce_sweep_locked() {
   fi
 
   # 3. nothing to apply without the include; "cannot tell" is not "included" (a fragment the controller never loads is not in force)
-  if [ "$include" != "1" ] && [ "$PCE_DRY" != "1" ]; then
-    pce_repair_missing_fragment   # a definite 0 repairs nothing; "?" must not leave an ABSENT fragment (a load error if it IS included) unrepaired
+  if [ "$include" != "1" ]; then   # (a dry run too: plan must not preview a write that the include gate would refuse)
     if [ ! -r "$PCE_CITY_TOML" ]; then
       pce_log_change "city-toml-unreadable" "event=skip" "reason=city.toml is UNREADABLE ($PCE_CITY_TOML): cannot tell whether it includes the fragment - nothing written"
     elif [ "$include" = "0" ]; then
@@ -612,7 +613,7 @@ _pce_sweep_locked() {
     if [ "$C" = "0" ]; then pce_log "event=skip" "pool=$pool" "reason=committed-0-paused" "action=entry-dropped"; continue; fi
     if ! _pce_int "$C"; then
       skipped="$skipped $pool"; L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" && held=$(_pce_map_set "$held" "$pool" "$L")   # its entry stays as it is (step 8)
-      pce_log "event=skip" "pool=$pool" "reason=committed-unreadable" "action=hold-entry,no-raise-while-unknown"
+      pce_log "event=skip" "pool=$pool" "reason=committed-unreadable" "action=$(_pce_int "$L" && echo hold-entry || echo nothing-to-hold),no-raise-while-unknown"
       continue
     fi
     L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" || L="$C"
