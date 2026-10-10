@@ -870,7 +870,7 @@ EOF
 # What git says is left in <repo>'s object store, and the alarm. Sets _GLH_TMP_GFILES / _GLH_TMP_GKIB ("null" when unknown).
 _GLH_TMP_GFILES="null"; _GLH_TMP_GKIB="null"
 _glh_tmp_garbage_check() {
-  local repo="$1" gd="$2" out rc gfiles gkib key marker _dry _nrc mib idx idx_n idx_kib idx_size advice
+  local repo="$1" gd="$2" out rc gfiles gkib key marker _dry _nrc mib idx idx_n idx_kib idx_size idx_line advice
   _GLH_TMP_GFILES="null"; _GLH_TMP_GKIB="null"
   _dry="${GIT_LOCK_DRY_RUN:-${DRY_RUN:-0}}"
   # falhou/cortado/ilegível → "unmeasured": logged and counted, no alarm and no all-clear; vazio ("garbage: 0") → healthy
@@ -903,7 +903,15 @@ _glh_tmp_garbage_check() {
   esac
   case "$idx_n" in ''|*[!0-9]*) idx_n="null"; idx_kib="null" ;; esac
   case "$idx_kib" in ''|*[!0-9]*) idx_kib="null" ;; esac
-  echo "[git-lock-hygiene] GARBAGE ALARM: ${repo} holds ${gfiles} garbage file(s), ${mib} MiB (limit $(( GIT_LOCK_TMP_ALARM_KIB / 1024 )) MiB); packs without .idx: ${idx_n} (${idx_kib} KiB) — those are NOT deletable" >&2
+  # The log line says the same three things the notify below does. vazio (idx_n=0) → "none"; falhou/ilegível (idx_n=null) → "could not
+  # check", with no claim that such a pack exists; a pack whose size could not be read → "size unreadable", never "0 KiB" and never "null".
+  case "$idx_n" in
+    null) idx_line="packs without .idx: could not check (if any exist, they are NOT deletable)" ;;
+    0)    idx_line="packs without .idx: none" ;;
+    *)    if [ "$idx_kib" = "null" ]; then idx_line="packs without .idx: ${idx_n} (size unreadable) — NOT deletable"
+          else idx_line="packs without .idx: ${idx_n} (${idx_kib} KiB) — NOT deletable"; fi ;;
+  esac
+  echo "[git-lock-hygiene] GARBAGE ALARM: ${repo} holds ${gfiles} garbage file(s), ${mib} MiB (limit $(( GIT_LOCK_TMP_ALARM_KIB / 1024 )) MiB); ${idx_line}" >&2
   _log_json "{\"ts\":\"$(ts)\",\"event\":\"tmp_garbage_alarm\",\"repo\":\"${repo}\",\"garbage_files\":${gfiles},\"garbage_kib\":${gkib},\"idxless_packs\":${idx_n},\"idxless_kib\":${idx_kib},\"limit_kib\":${GIT_LOCK_TMP_ALARM_KIB},\"dry_run\":\"${_dry}\"}"
   _glh_count tmp_over
   [ "$_dry" = "1" ] && return 0            # same rule as the rest of the sweep: no notify under dry run
@@ -2373,6 +2381,10 @@ print(n)
     tm_ago 1 "$1/.git/objects/pack/tmp_pack_YOUNG"
   }
   tm_reset() { : > "$LOG"; : > "$NOTIFY_CALLS"; _GLH_COUNT_FILE="$TMP/tm-counts"; : > "$_GLH_COUNT_FILE"; rm -rf "$GIT_LOCK_TMP_STATE_DIR"; }
+  # The stderr of a scan goes to this file (the tests that read it redirect there); tm_alarm_line prints the one GARBAGE ALARM line in it.
+  # vazio (no such line) → the empty string, which every assertion below treats as a failure, never as a pass.
+  TM_ERR="$TMP/tm.stderr"
+  tm_alarm_line() { grep -F 'GARBAGE ALARM' "$TM_ERR" 2>/dev/null | head -1; }
   tm_tally() { local n; n="$(grep -c "^$1\$" "$_GLH_COUNT_FILE" 2>/dev/null || true)"; echo "${n:-0}"; }
   TM_BIG=999999999    # an alarm line no fixture reaches: the tests that are not about the alarm must not fire it
   export GIT_LOCK_PROCESS_CHECK_FN="_no_git_process"
@@ -2570,16 +2582,25 @@ FAKE
   G16="$(git --git-dir="$TR16/.git" count-objects -v 2>/dev/null | sed -n 's/^size-garbage: *//p')"
   case "$G16" in ''|*[!0-9]*|0) bad "TM16: fixture garbage is not measurable ('${G16}')"; G16=0 ;; esac
   if [ "$G16" -gt 0 ]; then
-    tm_reset; count=$(GIT_LOCK_TMP_ALARM_KIB=$(( G16 - 1 )) _scan_tmp_objects "$TR16" 2>/dev/null)
+    tm_reset; count=$(GIT_LOCK_TMP_ALARM_KIB=$(( G16 - 1 )) _scan_tmp_objects "$TR16" 2>"$TM_ERR")
     { [ "$count" = "0" ] && [ -f "$TR16/.git/objects/pack/pack-aaaa.pack" ]; } \
       && ok "TM16: the idx-less pack (7 h old, over the line) is still there, nothing removed" || bad "TM16: count='${count}' or the idx-less pack is gone"
+    case "$(tm_alarm_line)" in
+      *'packs without .idx: 1 (600 KiB)'*'NOT deletable'*) ok "TM16: the log line names it (1 pack, 600 KiB) and says NOT deletable" ;;
+      *) bad "TM16: log line wrong: '$(tm_alarm_line)'" ;;
+    esac
     { grep -F '"event":"tmp_garbage_alarm"' "$LOG" | grep -q '"idxless_packs":1,"idxless_kib":600,'; } \
       && ok "TM16: the alarm event names it (idxless_packs=1, 600 KiB)" || bad "TM16: alarm event lacks the idx-less count: $(grep -F '"event":"tmp_garbage_alarm"' "$LOG" | head -1)"
     { [ "$(_lines "$NOTIFY_CALLS")" = "1" ] && grep -q 'SEM .idx' "$NOTIFY_CALLS" && grep -q 'NAO e lixo apagavel' "$NOTIFY_CALLS" && grep -q 'UNICA copia' "$NOTIFY_CALLS" && ! grep -q 'Sao restos de um git' "$NOTIFY_CALLS"; } \
       && ok "TM16: the notify says SEM .idx / NAO e lixo apagavel / UNICA copia, not 'leftovers of a killed write'" || bad "TM16: notify wording wrong: $(head -c 400 "$NOTIFY_CALLS")"
 
     echo "TM16b: a pack directory that cannot be listed is 'could not check' — not 'none', and no claim that a pack lacks its index"
-    tm_reset; count=$(PATH="$TMP/fakefind:$PATH" GIT_LOCK_TMP_ALARM_KIB=$(( G16 - 1 )) _scan_tmp_objects "$TR16" 2>/dev/null)
+    tm_reset; count=$(PATH="$TMP/fakefind:$PATH" GIT_LOCK_TMP_ALARM_KIB=$(( G16 - 1 )) _scan_tmp_objects "$TR16" 2>"$TM_ERR")
+    case "$(tm_alarm_line)" in
+      *'packs without .idx: none'*|*'without .idx: null'*|*'without .idx: 0'*|*'null'*) bad "TM16b: log line reads 'could not check' as none/0/null: '$(tm_alarm_line)'" ;;
+      *'packs without .idx: could not check'*) ok "TM16b: the log line says it could not check — not none, not null" ;;
+      *) bad "TM16b: log line wrong: '$(tm_alarm_line)'" ;;
+    esac
     { grep -F '"event":"tmp_garbage_alarm"' "$LOG" | grep -q '"idxless_packs":null,"idxless_kib":null,'; } \
       && ok "TM16b: idxless_packs=null in the alarm event" || bad "TM16b: event: $(grep -F '"event":"tmp_garbage_alarm"' "$LOG" | head -1)"
     { [ "$(_lines "$NOTIFY_CALLS")" = "1" ] && grep -q 'Nao deu para checar' "$NOTIFY_CALLS" && ! grep -q 'Sao restos de um git' "$NOTIFY_CALLS" && ! grep -q 'SEM .idx' "$NOTIFY_CALLS" && [ -f "$TR16/.git/objects/pack/pack-aaaa.pack" ]; } \
@@ -2589,9 +2610,14 @@ FAKE
   if [ "$G16" -gt 0 ]; then
     echo "TM16c: an idx-less pack whose size cannot be read is counted, with the size as null — never as 0 KiB"
     mkdir -p "$TMP/fakestat"; printf '#!/bin/sh\nexit 1\n' > "$TMP/fakestat/stat"; chmod +x "$TMP/fakestat/stat"
-    tm_reset; count=$(PATH="$TMP/fakestat:$PATH" GIT_LOCK_TMP_ALARM_KIB=$(( G16 - 1 )) _scan_tmp_objects "$TR16" 2>/dev/null)
+    tm_reset; count=$(PATH="$TMP/fakestat:$PATH" GIT_LOCK_TMP_ALARM_KIB=$(( G16 - 1 )) _scan_tmp_objects "$TR16" 2>"$TM_ERR")
     { grep -F '"event":"tmp_garbage_alarm"' "$LOG" | grep -q '"idxless_packs":1,"idxless_kib":null,'; } \
       && ok "TM16c: idxless_packs=1, idxless_kib=null" || bad "TM16c: event: $(grep -F '"event":"tmp_garbage_alarm"' "$LOG" | head -1)"
+    case "$(tm_alarm_line)" in
+      *'null'*|*'(0 KiB)'*) bad "TM16c: log line prints an unreadable size as null/0: '$(tm_alarm_line)'" ;;
+      *'packs without .idx: 1 (size unreadable)'*'NOT deletable'*) ok "TM16c: the log line counts the pack and says its size is unreadable" ;;
+      *) bad "TM16c: log line wrong: '$(tm_alarm_line)'" ;;
+    esac
   fi
 
   echo "TM17: control — garbage with every pack indexed keeps the 'leftovers' wording and idxless_packs=0"
@@ -2603,9 +2629,14 @@ FAKE
   case "$G17" in ''|*[!0-9]*|0) bad "TM17: fixture garbage is not measurable ('${G17}')"; G17=0 ;; esac
   ls "$TR17"/.git/objects/pack/pack-*.idx >/dev/null 2>&1 || { bad "TM17: fixture has no indexed pack"; G17=0; }
   if [ "$G17" -gt 0 ]; then
-    tm_reset; count=$(GIT_LOCK_TMP_ALARM_KIB=$(( G17 - 1 )) _scan_tmp_objects "$TR17" 2>/dev/null)
+    tm_reset; count=$(GIT_LOCK_TMP_ALARM_KIB=$(( G17 - 1 )) _scan_tmp_objects "$TR17" 2>"$TM_ERR")
     { grep -F '"event":"tmp_garbage_alarm"' "$LOG" | grep -q '"idxless_packs":0,"idxless_kib":0,'; } \
       && ok "TM17: an indexed pack is not counted as idx-less (idxless_packs=0)" || bad "TM17: event: $(grep -F '"event":"tmp_garbage_alarm"' "$LOG" | head -1)"
+    case "$(tm_alarm_line)" in
+      *'NOT deletable'*) bad "TM17: log line calls indexed-pack garbage NOT deletable: '$(tm_alarm_line)'" ;;
+      *'packs without .idx: none'*) ok "TM17: the log line says no pack lacks its index" ;;
+      *) bad "TM17: log line wrong: '$(tm_alarm_line)'" ;;
+    esac
     { [ "$(_lines "$NOTIFY_CALLS")" = "1" ] && grep -q 'Sao restos de um git' "$NOTIFY_CALLS" && ! grep -q 'SEM .idx' "$NOTIFY_CALLS"; } \
       && ok "TM17: the notify keeps the 'leftovers of a killed write' wording" || bad "TM17: notify wording wrong: $(head -c 400 "$NOTIFY_CALLS")"
   fi
