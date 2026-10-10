@@ -1400,25 +1400,51 @@ gap2_marker_for_bead() {
 }
 
 # gap2_refused_token <sling_labels> <parent_labels> <sling_close_reason> — pure
-# text scan (ga-eu75w). A worker refusing pool-ineligible work (e.g. a fix that
-# needs an engine rebuild) stamps pool:refused[:<reason-slug>] somewhere before
-# the sling terminates — but WHERE varies by observed precedent, not a single
-# documented contract: the ps-worker/wa-worker refusal protocol labels the
-# SLING itself and leaves it for inflight-reclaim-guard.py to close; a
-# dog-pool refusal observed live (ga-1ztxb / its sling ga-0hela) instead
-# labeled the PARENT directly and closed the sling itself, with the marker
-# surfacing on the sling only in its own close_reason text — confirmed live:
-# ga-0hela's own labels are just ["ctx:ready","exec:auto"], no pool:refused
-# anywhere on the sling itself. Checking any ONE location would have missed
-# that real incident, so this checks all three, in priority order (the
-# sling's own label first — the documented/most-authoritative source), and
-# returns the FIRST literal pool:refused[:<reason>] token found, or "" if
-# none. A bare "pool:refused" (no reason suffix) is a valid, complete match.
+# text scan (ga-eu75w; third tier narrowed by ga-zuhlzr). A worker refusing
+# pool-ineligible work (e.g. a fix that needs an engine rebuild) stamps
+# pool:refused[:<reason-slug>] somewhere before the sling terminates — but
+# WHERE varies by observed precedent, not a single documented contract: the
+# ps-worker/wa-worker refusal protocol labels the SLING itself and leaves it
+# for inflight-reclaim-guard.py to close; a dog-pool refusal observed live
+# (ga-1ztxb / its sling ga-0hela) instead closed the sling itself with a
+# close_reason that BEGINS with the token ("pool:refused:engine-rebuild-
+# required — Needs Go source change in ~/gt/internal/doltserver ...", the
+# Mayor's trace on ga-1ztxb, 07/08) — ga-0hela's own labels were just
+# ["ctx:ready","exec:auto"], no pool:refused anywhere on the sling. Checking
+# any ONE location would have missed that real incident, so this checks
+# three, in priority order: the sling's own label (the documented/most
+# authoritative source), the parent's label, then the START of the
+# close_reason. Returns the FIRST pool:refused[:<reason>] token found, or ""
+# if none. A bare "pool:refused" (no reason suffix) is a valid, complete match.
+#
+# The close_reason tier is ANCHORED (ga-zuhlzr), not a substring scan: a
+# close_reason is prose a worker writes to a human, so a MENTION of the token
+# is not a refusal. Live 2026-10-10 (ga-j96y0n / duplicate sling ga-da85q1):
+# dog-4 closed a duplicate sling WITHOUT refusing and, explaining why, wrote
+# "pool:refused on ga-j96y0n would make inflight-reclaim-guard take it away
+# from dog-3" — the old grep read that as a refusal and the reconciler stamped
+# pool:refused on a bead that was in_progress with a live builder, which is
+# exactly the label inflight-reclaim-guard acts on. A close_reason counts only
+# when its FIRST line opens with the token (leading whitespace aside) and the
+# token is followed by a separator (an em/en dash, a colon, a spaced hyphen) or
+# ends the line — never prose. A refusal written some other way (e.g. "refused
+# (pool:refused:x): ...") is not claimed here; a worker that wants GAP-2 to see
+# it puts the LABEL on the sling, which tiers 1-2 read as the signal.
 gap2_refused_token() {
   local sling_labels="$1" parent_labels="$2" sling_close_reason="$3" tok=""
   tok=$(printf '%s' "$sling_labels" | grep -oE 'pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
   [ -z "$tok" ] && tok=$(printf '%s' "$parent_labels" | grep -oE 'pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
-  [ -z "$tok" ] && tok=$(printf '%s' "$sling_close_reason" | grep -oE 'pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
+  # vazio → "" (no refusal: GAP-2 carries on to the pass/no-changes arms);
+  # falhou/ilegível → "" too — here that IS the inert state, because a token
+  # that cannot be read stamps nothing, whereas a guessed one stamps
+  # pool:refused on a bead and hands it to inflight-reclaim-guard. Literal
+  # alternation for the dashes (no [—–] bracket class): a bracket class
+  # mis-sizes a multibyte char under the C locale, and launchd's minimal
+  # environment cannot be assumed to carry a UTF-8 one — see
+  # gap2_no_changes_token (ga-hr44j).
+  [ -z "$tok" ] && tok=$(printf '%s' "$sling_close_reason" | head -1 \
+    | sed -nE 's/^[[:space:]]*(pool:refused(:[A-Za-z0-9_-]+)?)(—|–|:|[[:space:]]+(—|–|-)|[[:space:]]*$).*/\1/p' \
+    | head -1 || echo "")
   printf '%s' "$tok"
 }
 

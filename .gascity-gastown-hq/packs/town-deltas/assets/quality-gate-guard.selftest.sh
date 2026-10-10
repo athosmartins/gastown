@@ -169,6 +169,35 @@ r=$(gap2_refused_token "pool:refused" "" ""); [ "$r" = "pool:refused" ] && ok "b
 r=$(gap2_refused_token "pool:refused:sling-reason" "pool:refused:parent-reason" ""); [ "$r" = "pool:refused:sling-reason" ] && ok "sling label wins over parent label when both present (documented source takes priority)" || bad "priority-order got '$r'"
 r=$(gap2_refused_token "gate:needs-fix" "story:in-flight pilot:dispatched" "gate-failed, see review comments"); [ "$r" = "" ] && ok "no pool:refused anywhere → empty (this is the pass/fail-stranded case, not refused)" || bad "no-match got '$r'"
 r=$(gap2_refused_token "" "" ""); [ "$r" = "" ] && ok "all-empty inputs → empty, no crash" || bad "all-empty got '$r'"
+
+# ── ga-zuhlzr: the close_reason tier reads a refusal WRITTEN AS ONE, not a mention ─
+# THE BUG (live 2026-10-10, ga-j96y0n / duplicate sling ga-da85q1): the third
+# tier grepped the token ANYWHERE in the free-text close_reason. dog-4 closed a
+# duplicate sling WITHOUT refusing and, explaining why it was not refusing,
+# wrote "pool:refused on ga-j96y0n would make inflight-reclaim-guard take it
+# away from dog-3". The reconciler read the sentence as a refusal and stamped
+# pool:refused on a bead that was in_progress with a live builder — the very
+# label inflight-reclaim-guard acts on. close_reason is prose a worker writes
+# to a human; it is data, not a signal, unless the worker wrote it AS the signal.
+# The one real shape that needs this tier (the ga-0hela trace, Mayor, 07/08):
+# the close_reason BEGINS with the token. Only that counts.
+echo "gap2_refused_token: close_reason is data — only a refusal written at the START counts (ga-zuhlzr)"
+FP_ZUHLZR='Duplicate dispatch, no work done by dog-4. Source bug ga-j96y0n is already in flight under dog-ga5lav4l (gastown.dog-3, session ga-5lav4l, live and active when checked 2026-10-10T16:19Z) with a 20-min-old worktree .gc-worktrees/fix-ga-j96y0n-nudge-dead-prune on branch fix/ga-j96y0n-nudge-dead-prune (staged edits to nudge-queue-hygiene.{py,sh,selftest.sh} + orders/nudge-queue-hygiene.toml, selftest running). This sling was minted at 16:07Z, ~14 min after the first dispatch, apparently because the source bead lease showed expired (heartbeat 15 min stale) while its builder was alive. Building in parallel would collide on the branch name fix/ga-j96y0n and double the /gate-done. Source bead labels left untouched on purpose: pool:refused on ga-j96y0n would make inflight-reclaim-guard take it away from dog-3.'
+r=$(gap2_refused_token "" "story:in-flight pilot:dispatched" "$FP_ZUHLZR"); [ "$r" = "" ] && ok "REGRESSION: verbatim ga-da85q1 close_reason (token mentioned mid-prose, no label anywhere) → empty, NOT a refusal" || bad "ga-zuhlzr: prose mention read as refusal, got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused on ga-j96y0n would make inflight-reclaim-guard take it away from dog-3."); [ "$r" = "" ] && ok "the false-positive sentence even as the FIRST words → empty (token must be followed by a separator, not prose)" || bad "sentence-initial prose got '$r'"
+r=$(gap2_refused_token "" "" "Closed duplicate; already marked pool:refused:duplicate-dispatch-live-session-owns-target by a prior dog"); [ "$r" = "" ] && ok "real ga-p22jt shape: slug-bearing token mid-prose, no label → empty" || bad "mid-prose slug got '$r'"
+r=$(gap2_refused_token "pool:refused:duplicate-dispatch-live-session-owns-target" "" "Closed duplicate; already marked pool:refused:duplicate-dispatch-live-session-owns-target by a prior dog"); [ "$r" = "pool:refused:duplicate-dispatch-live-session-owns-target" ] && ok "same prose, but the SLING carries the label → label tier still finds it (labels are the signal)" || bad "label-with-prose got '$r'"
+r=$(gap2_refused_token "ctx:ready exec:auto" "framework:observability" "pool:refused:engine-rebuild-required — Needs Go source change in ~/gt/internal/doltserver (engine module, not this town)"); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "real ga-0hela close_reason (verbatim from the Mayor's trace, 07/08) → still found: the anchored shape is kept" || bad "ga-0hela shape got '$r'"
+r=$(gap2_refused_token "" "" "   pool:refused:foo-bar — leading spaces are tolerated"); [ "$r" = "pool:refused:foo-bar" ] && ok "leading whitespace before the token is tolerated" || bad "leading-space got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused"); [ "$r" = "pool:refused" ] && ok "close_reason that is only the bare token → found" || bad "bare-only got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused — out of scope for a pool dog"); [ "$r" = "pool:refused" ] && ok "bare token + dash separator → found" || bad "bare-dash got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused: out of scope for a pool dog"); [ "$r" = "pool:refused" ] && ok "bare token + colon separator → found (trailing colon is not part of the slug)" || bad "bare-colon got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused:engine-rebuild-required: needs go build + swap"); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "slug token + colon separator → full slug found" || bad "slug-colon got '$r'"
+r=$(gap2_refused_token "" "" $'pool:refused:engine-rebuild-required\nNeeds a Go source change.'); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "token alone on the first line, explanation on the next → found" || bad "token-then-newline got '$r'"
+r=$(gap2_refused_token "" "" $'Duplicate, nothing done.\npool:refused:engine-rebuild-required — quoted from another bead'); [ "$r" = "" ] && ok "token at the start of a LATER line is not the start of the close_reason → empty" || bad "later-line got '$r'"
+r=$(gap2_refused_token "" "" "pool:refusedfoo — not a token boundary"); [ "$r" = "" ] && ok "token glued to more letters is not a token → empty" || bad "glued got '$r'"
+r=$(gap2_refused_token "" "" "xpool:refused:foo — prefixed by another word"); [ "$r" = "" ] && ok "token preceded by other characters is not at the start → empty" || bad "prefixed got '$r'"
+r=$(gap2_refused_token "" "" "refused (pool:refused:mayor-owned-mission): coordination mission the Mayor runs"); [ "$r" = "" ] && ok "real ga-p7ubvf shape (token inside parentheses, label lives on the sling) → close_reason tier does not claim it" || bad "parenthesised got '$r'"
 # ga-hr44j REGRESSION PROOF (root cause): the real ga-zxfvh close_reason that
 # actually false-closed ga-i9q44 (2026-09-05 22:51Z) carries no pool:refused
 # token anywhere — gap2_refused_token correctly (per its own contract) finds
