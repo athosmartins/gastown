@@ -27,7 +27,9 @@
 #
 # THREE STATES, everywhere (not-found != found-and-zero != could-not-find-out): a swap/disk reading that cannot be taken NEVER
 # reads as "clear"; a committed value that cannot be read is NOT 0 (that pool's entry is HELD, never dropped: a drop hands the pool back to
-# the committed value = a RAISE - and nothing is raised while it is unknown); a config that cannot be read back is a failed write. Doubt
+# the committed value = a RAISE - and nothing is raised while it is unknown); a config that cannot be read back is a failed write; a FRAGMENT whose
+# levels cannot be read (foreign content, or a file that exists and cannot be opened) has UNKNOWN levels, not "none": gc may still apply it, so the rewrite starts
+# every pool from its FLOOR (never above what the engine could have written) and writes nothing at all if a committed ceiling is unreadable too. Doubt
 # never RAISES: a passing doubt (include unknown, preflight or date unreadable, < 3 blind sweeps) HOLDS the file as it is; one that persists
 # or proves wrong (blind for 3 sweeps while raised, a failed read-back, a trip, the breaker) goes back to the EMPTY fragment, the inert state.
 #
@@ -467,11 +469,17 @@ pce_readback() {
 
 # pce_preflight <entries> — BEFORE writing a non-empty fragment: does `gc config show --json` list every pool we are about to
 # patch as exactly one agent? A patch for an agent that does not exist is a config LOAD ERROR (ga-m9x0lb.1), so a renamed or
-# removed pool must be caught here, not by the read-back after the damage. rc 0 ok | 1 a pool is missing | 2 could not read.
+# removed pool must be caught here, not by the read-back after the damage. rc 0 ok | 1 a pool is missing | 2 could not read |
+# 3 gc ANSWERED that the config does not load (exit 1 + {"ok": false} on stdout - measured on the real gc, selftest section 20: a malformed or
+# unknown-agent fragment, an absent included file). 2 is no answer (timeout 124, gc not found 127, a crash, output that is not JSON): only 3 is evidence.
 pce_preflight() {
   local out rc e pool got miss=""
   out=$(_pce_bounded "$PCE_READBACK_SECS" "$PCE_GC" config show --city "$PCE_CITY" --json 2>/dev/null); rc=$?
-  if [ "$rc" -ne 0 ]; then echo "gc config show rc=$rc"; return 2; fi
+  if [ "$rc" -ne 0 ]; then
+    # vazio (no stdout) → rc 2, no evidence; falhou/ilegível (not JSON, jq failing) → rc 2 as well: only exit 1 WITH {"ok": false} is gc saying "does not load" (rc 3)
+    if [ "$rc" -eq 1 ] && printf '%s' "$out" | jq -e '.ok == false' >/dev/null 2>&1; then echo "gc config show: the config does not load"; return 3; fi
+    echo "gc config show rc=$rc"; return 2
+  fi
   if ! printf '%s' "$out" | jq -e '.ok == true' >/dev/null 2>&1; then echo "gc config show: not JSON or ok != true"; return 2; fi
   for e in $1; do
     pool="${e%%=*}"
@@ -524,7 +532,7 @@ pce_repair_missing_fragment() {
 pce_sweep() {
   local rc=0
   PCE_NOW=$(_pce_now)
-  [ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST: no early exit below (clock, state dir, lock, date, trip, disabled) may leave an ABSENT fragment unrepaired; .off has its own, loud, restore (step 1)
+  [ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST: no early exit below (clock, state dir, lock, date, trip, disabled) may leave an ABSENT fragment unrepaired - except with .off: its own, loud restore is step 1, behind the clock / state-dir / lock gates, so .off + one of those failing + an ABSENT fragment stays absent (a log line only)
   if [ -z "$PCE_NOW" ]; then PCE_NOW="?"; pce_log "event=skip" "reason=clock-unreadable"; return 0; fi
 
   local has_on=0 has_off=0 include
@@ -596,13 +604,31 @@ _pce_sweep_locked() {
   pressure=$(pce_pressure "$swap" "$disk")
   budget=$(pce_budget)
 
-  # 5. the fragment as it is NOW (the file is the truth about the current levels, not our state files)
-  local cur_txt cur_map="" prc
+  # 5. the fragment as it is NOW (the file is the truth about the current levels, not our state files). THREE answers, never two (gate round ga-marmt9: "could not
+  #    read the levels" was acted on as "there are none", and the rewrite handed a pool the pressure had LOWERED back to its committed value - a raise):
+  #      read (rc 0)        the levels in the file, possibly none                          -> cur_map
+  #      absent (rc 2)      no file, so no levels (the repair above re-creates it EMPTY, or says it could not)  -> none
+  #      UNKNOWN            FOREIGN content (rc 1), or a file that EXISTS and cannot be read   -> unk=1. gc may well still apply it (a trailing "# note" on a value
+  #                         line is valid TOML and keeps its level), so "no entries" is not a reading. Every pool restarts from its FLOOR (step 6): a rewrite is then
+  #                         never above what the engine could have written, and a pool climbs back by the normal rule (2 clear sweeps, the rate limit, the budget).
+  local cur_txt cur_map="" prc unk=0 foreign_note="$PCE_STATE/foreign-notified"
   cur_txt=$(pce_fragment_parse); prc=$?
+  # vazio (rc 0, no entries) → every pool at its committed value; falhou/ilegível (rc 1, or rc 2 on a file that exists) → levels UNKNOWN (unk=1), never "none"
+  if [ "$prc" = "1" ] || { [ "$prc" = "2" ] && [ -e "$PCE_FRAGMENT" ]; }; then unk=1; fi
   case "$prc" in
-    0) cur_map=$(printf '%s' "$cur_txt" | tr '\n' ' '); cur_map="${cur_map% }" ;;
-    1) pce_log "event=fragment-foreign" "action=rewrite-from-model" ;;
-    *) [ "$include" = "1" ] && pce_log "event=fragment-absent" "action=write-from-model" ;;
+    0) cur_map=$(printf '%s' "$cur_txt" | tr '\n' ' '); cur_map="${cur_map% }"
+       [ "$PCE_DRY" = "1" ] || rm -f "$foreign_note" 2>/dev/null ;;   # a file the engine can read again ends the episode: the next foreign one is reported again
+    *) if [ "$unk" != "1" ]; then
+         pce_log "event=fragment-absent" "action=write-from-model"
+       elif [ "$PCE_DRY" = "1" ]; then
+         pce_log "event=fragment-foreign" "prc=$prc" "levels=unknown" "action=rewrite-from-model-with-every-pool-at-its-floor"
+       # vazio (no marker) → a NEW episode: logged and notified once; falhou/ilegível (state dir unreadable, or the marker cannot be created) → reported again, noisy but never silent
+       elif [ ! -e "$foreign_note" ]; then
+         : > "$foreign_note" 2>/dev/null
+         pce_log "event=fragment-foreign" "prc=$prc" "levels=unknown" "action=rewrite-from-model-with-every-pool-at-its-floor"
+         if [ "$prc" = "1" ]; then pce_notify "pool-ceiling-engine: $PCE_FRAGMENT is not what the engine wrote (hand edit or an old version) - its levels are UNKNOWN, so it is rewritten from the model with every pool at its floor; they climb back by the normal rule"
+         else pce_notify "pool-ceiling-engine: $PCE_FRAGMENT exists but cannot be READ (permissions?) - its levels are UNKNOWN, so it is rewritten from the model with every pool at its floor; they climb back by the normal rule"; fi
+       fi ;;
   esac
 
   # 6. one decision per pool
@@ -616,8 +642,9 @@ _pce_sweep_locked() {
       pce_log "event=skip" "pool=$pool" "reason=committed-unreadable" "action=$(_pce_int "$L" && echo hold-entry || echo nothing-to-hold),no-raise-while-unknown"
       continue
     fi
-    L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" || L="$C"
     floor=$(pce_floor "$pool" "$C"); ceil=$(pce_ceil "$pool" "$C")
+    # vazio (a READ file has no entry for the pool) → its committed value; falhou/ilegível (the file's levels are UNKNOWN) → its FLOOR, never committed: the rewrite cannot be above what was in force
+    if [ "$unk" = "1" ]; then L="$floor"; else L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" || L="$C"; fi
     [ "$L" -le "$ceil" ] || L="$ceil"     # clamp DOWN only: a clamp must never be a raise that skipped the sweeps
     cs=$(pce_state_get "$pool" clear_streak); us=$(pce_state_get "$pool" unknown_streak)
     lsw=$(pce_state_get "$pool" last_sweep_at); lw=$(pce_state_get "$pool" last_write_at)
@@ -649,6 +676,13 @@ _pce_sweep_locked() {
     sum=$((sum + new))
     pce_log "event=sweep" "pool=$pool" "committed=$C" "worktree_cap=${wt:-?}" "cur=$L" "new=$new" "reason=$reason" "pressure=$pressure" "swap_used_mb=${swap:-?}" "disk_free_mb=${disk:-?}" "clear_streak=$cs" "unknown_streak=$us" "counted=$counted"
   done
+
+  # 6b. levels UNKNOWN (step 5) and a pool whose committed ceiling is ALSO unreadable: nothing can be held for it (there is no entry to carry, step 8) and an entry
+  #     could only be guessed; leaving it out hands the pool back to a committed value nobody could read = a raise. So nothing is rewritten: the file stays as it is.
+  if [ "$unk" = "1" ] && [ -n "$skipped" ]; then
+    pce_log_change "foreign-unknown-ceiling:${skipped# }" "event=skip" "reason=the fragment's levels are UNKNOWN and the committed ceiling unreadable for${skipped}: an entry for it could only be guessed, and a dropped one is a raise - nothing written, the fragment stays as it is"
+    return 0
+  fi
 
   # 7. budget: a RAISE may not push the sum of the ceilings past GC_VARIABLE_SESSION_MAX (cancel raises until it fits; the status quo
   #    is never lowered because of it). While any pool's ceiling is UNKNOWN (skipped, unreadable) the sum cannot be shown to fit: no raise.
@@ -704,19 +738,37 @@ _pce_sweep_locked() {
     pce_restore "daily-breaker"
     return 0
   fi
+  local from_txt="${cur_map:-<committed>}"; [ "$unk" = "1" ] && from_txt="<unknown>"   # the log must not say "<committed>" for levels it could not read
   if [ "$PCE_DRY" = "1" ]; then
     local why="levels-change"
-    [ "$prc" = "1" ] && why="fragment-foreign(rewritten from the model)"
+    [ "$prc" = "1" ] && why="fragment-foreign(levels unknown: rewritten from the model, every pool from its floor)"
     [ "$prc" = "2" ] && why="fragment-absent(would be created, empty if no level changes)"
-    pce_log "event=would-write" "from=${cur_map:-<committed>}" "to=${dev:-<committed>}" "changed=${changed# }" "why=$why"
+    [ "$prc" = "2" ] && [ "$unk" = "1" ] && why="fragment-unreadable(levels unknown: rewritten from the model, every pool from its floor)"
+    pce_log "event=would-write" "from=$from_txt" "to=${dev:-<committed>}" "changed=${changed# }" "why=$why"
     return 0
   fi
   if [ -n "$dev" ]; then
-    local pf pfrc
+    local pf pfrc exp_note=""
     pf=$(pce_preflight "$dev"); pfrc=$?
+    # A fragment of UNKNOWN levels may be what BREAKS THE CONFIG LOAD (gc answered rc 3): gc config show cannot preflight anything because of that very file. That is a SUSPECT,
+    # not a proof (the config could be broken somewhere else), so emptying it is an EXPERIMENT: the file is moved aside (a rename: no read permission needed) and the empty
+    # fragment put in its place; if the config then loads (rc 0, or rc 1 = a pool missing) the file WAS the cause and stays gone - the model is written next, in this same sweep -
+    # and otherwise the original comes back byte for byte. Only gc's own answer starts it: no gc, a timeout or unreadable output (rc 2) is no evidence, the file is left alone.
+    if [ "$pfrc" -eq 3 ] && [ "$unk" = "1" ]; then
+      local aside="$PCE_FRAGMENT.foreign.$$" emptied=0
+      if mv -f "$PCE_FRAGMENT" "$aside" 2>/dev/null; then
+        if pce_restore "foreign-fragment-load-error"; then emptied=1; pf=$(pce_preflight "$dev"); pfrc=$?; fi
+        case "$pfrc" in
+          0|1) rm -f "$aside" 2>/dev/null ;;
+          *) mv -f "$aside" "$PCE_FRAGMENT" 2>/dev/null
+             pce_log "event=restore-undone" "reason=foreign-fragment-load-error" "emptied=$emptied" "detail=$pf" "result=the original file is back, byte for byte"
+             [ "$pfrc" -eq 3 ] && [ "$emptied" = "1" ] && exp_note="; emptying the foreign fragment did not change that (it was put back), so it is not the cause" ;;
+        esac
+      fi
+    fi
     if [ "$pfrc" -ne 0 ]; then
       pce_log_change "preflight:$pfrc:$dev" "event=preflight-failed" "rc=$pfrc" "detail=$pf" "wanted=$dev" "action=nothing-written" \
-        && [ "$pfrc" -eq 1 ] && pce_notify "pool-ceiling-engine: not writing '$dev' - $pf (a patch for a missing agent breaks the config load)"
+        && { [ "$pfrc" -eq 1 ] && pce_notify "pool-ceiling-engine: not writing '$dev' - $pf (a patch for a missing agent breaks the config load)"; [ "$pfrc" -eq 3 ] && pce_notify "pool-ceiling-engine: not writing '$dev' - $pf$exp_note - needs a human"; }
       return 0
     fi
   fi
@@ -746,7 +798,7 @@ _pce_sweep_locked() {
     pce_state_put "$pool" "$cs" "$(_pce_map_get "$us_map" "$pool")" "$(_pce_map_get "$lsw_map" "$pool")" "$lw"
   done
   pce_clear_condition
-  pce_log "event=write" "from=${cur_map:-<committed>}" "to=${dev:-<committed>}" "changed=${changed# }" "budget=$budget" "sum=$sum" "readback=ok"
+  pce_log "event=write" "from=$from_txt" "to=${dev:-<committed>}" "changed=${changed# }" "budget=$budget" "sum=$sum" "readback=ok"
   return 0
 }
 

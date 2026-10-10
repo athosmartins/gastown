@@ -56,16 +56,18 @@ mkdir -p "$TMPROOT/bin"
 # the behaviours measured on the real binary in ga-m9x0lb.1 (parity-checked in section 17):
 #   include present + fragment absent => exit 1 | malformed TOML, a string max, an unknown agent => exit 1
 #   a typo'd key (max_active_session) => exit 0, ceiling unchanged | max_active_sessions = -1 => accepted (-1 = unlimited)
-# FAKE_GC_MODE=fail|notjson, FAKE_GC_IGNORE=1 (never applies the fragment), FAKE_GC_FAIL_NTH=<n> (the n-th call exits 1).
+# FAKE_GC_MODE=fail|notjson|loaderr (loaderr = the config does not load WHATEVER the fragment says), FAKE_GC_IGNORE=1 (never applies the fragment), FAKE_GC_FAIL_NTH=<n> (the n-th call exits 1).
 cat > "$TMPROOT/bin/gc" <<'FAKEGC'
 #!/usr/bin/env bash
 [ "$1 $2" = "config show" ] || exit 2
+# a LOAD ERROR is exit 1 with {"ok":false,...} on stdout (measured on the real gc, section 20); FAKE_GC_MODE=fail / FAIL_NTH exit 1 with NO such answer
+loaderr() { echo "fake gc: $1" >&2; printf '{"schema_version":"1","ok":false,"error":{"code":"command_failed","message":"command failed; see stderr for diagnostics","exit_code":1}}\n'; exit 1; }
 city=""; while [ $# -gt 0 ]; do case "$1" in --city) city="$2"; shift ;; esac; shift; done
 if [ -n "${FAKE_GC_COUNT_FILE:-}" ]; then
   n=$(cat "$FAKE_GC_COUNT_FILE" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_GC_COUNT_FILE"
   [ -n "${FAKE_GC_FAIL_NTH:-}" ] && [ "$n" = "$FAKE_GC_FAIL_NTH" ] && { echo "fake gc: forced failure on call $n" >&2; exit 1; }
 fi
-case "${FAKE_GC_MODE:-ok}" in fail) echo "fake gc: boom" >&2; exit 1 ;; notjson) echo 'this is not json'; exit 0 ;; esac
+case "${FAKE_GC_MODE:-ok}" in fail) echo "fake gc: boom" >&2; exit 1 ;; notjson) echo 'this is not json'; exit 0 ;; loaderr) loaderr "the config does not load, whatever the fragment says" ;; esac
 frag="$city/.gc/pool-ceiling-engine.toml"
 agents=$(awk '
   function flush() { if (inag && n != "" && m != "") print n "=" m; n = ""; m = "" }
@@ -74,20 +76,20 @@ agents=$(awk '
   /^max_active_sessions[ \t]*=/ { s = $0; sub(/^[^=]*=[ \t]*/, "", s); sub(/[ \t]*(#.*)?$/, "", s); m = s; next }
   END { flush() }' "$city/city.toml")
 if grep -v '^[[:space:]]*#' "$city/city.toml" | grep -qF "pool-ceiling-engine.toml"; then
-  [ -e "$frag" ] || { echo "fake gc: loading fragment: no such file or directory" >&2; exit 1; }
+  [ -e "$frag" ] || loaderr "loading fragment: no such file or directory"
   if [ "${FAKE_GC_IGNORE:-0}" != "1" ]; then
     patched=$(awk '
       /^[ \t]*(#.*)?$/ { next }
       /^\[\[patches\.agent\]\][ \t]*$/ { inb = 1; next }
       /^dir[ \t]*=[ \t]*""[ \t]*$/ { next }
       /^name[ \t]*=[ \t]*"[^"]*"[ \t]*$/ { s = $0; sub(/^name[ \t]*=[ \t]*"/, "", s); sub(/".*$/, "", s); nm = s; next }
-      /^max_active_sessions[ \t]*=[ \t]*-?[0-9]+[ \t]*$/ { s = $0; sub(/^[^=]*=[ \t]*/, "", s); print nm "=" s; next }
+      /^max_active_sessions[ \t]*=[ \t]*-?[0-9]+[ \t]*(#.*)?$/ { s = $0; sub(/^[^=]*=[ \t]*/, "", s); sub(/[ \t]*(#.*)?$/, "", s); print nm "=" s; next }
       /^max_active_session[ \t]*=/ { next }               # a typo: gc only WARNS
-      { print "MALFORMED"; exit }' "$frag") || exit 1
-    case "$patched" in *MALFORMED*) echo "fake gc: parsing fragment" >&2; exit 1 ;; esac
+      { print "MALFORMED"; exit }' "$frag") || loaderr "reading fragment"
+    case "$patched" in *MALFORMED*) loaderr "parsing fragment" ;; esac
     for e in $patched; do
       nm="${e%%=*}"; v="${e#*=}"
-      case " $(echo "$agents" | sed 's/=[^ ]*//g' | tr '\n' ' ')" in *" $nm "*) ;; *) echo "fake gc: agent \"$nm\" not found in merged config" >&2; exit 1 ;; esac
+      case " $(echo "$agents" | sed 's/=[^ ]*//g' | tr '\n' ' ')" in *" $nm "*) ;; *) loaderr "agent \"$nm\" not found in merged config" ;; esac
       agents=$(echo "$agents" | awk -F= -v nm="$nm" -v v="$v" '$1 == nm { print nm "=" v; next } { print }')
     done
   fi
@@ -634,22 +636,95 @@ eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo untouched
 mk_city s16f
 printf '[[patches.agent]]\ndir = ""\nname = "wa-worker"\nmax_active_session = 3\n' > "$C/.gc/pool-ceiling-engine.toml"
 eng_quiet "$T0" 4000 11264
-eq "$(levels)" "" "a fragment with a typo'd key (a hand edit or an old version) is FOREIGN: rewritten from the model"
+eq "$(levels)" "gate-reviewer=2" "a fragment with a typo'd key (a hand edit or an old version) is FOREIGN: rewritten from the model, its levels UNKNOWN so every pool restarts from its floor (the block below)"
 eq "$(ENG_CMD=check eng "$T0" 4000 11264)" "ok: include present, fragment present and well-formed" "and well-formed afterwards"
 has "$(events fragment-foreign)" "rewrite" "logged"
 mk_city s16g
 printf '[[patches.agent]]\ndir = ""\nname = "gastown.dog"\nmax_active_sessions = 4\n' > "$C/.gc/pool-ceiling-engine.toml"
 eng_quiet "$T0" 4000 11264
-eq "$(levels)" "" "an entry for a pool OUTSIDE the allowlist (gastown.dog belongs to eval-window-concurrency-guard) is dropped"
+eq "$(grep -c 'gastown.dog' "$C/.gc/pool-ceiling-engine.toml")/$(levels)" "0/" "an entry for a pool OUTSIDE the allowlist (gastown.dog belongs to eval-window-concurrency-guard) is dropped; the file is WELL-FORMED, so its levels for the managed pools are known (none) and nothing is lowered"
 mk_city s16h; rm -f "$C/.gc/pool-ceiling-engine.toml"
 eng_quiet "$T0" 4000 11264
 eq "$(ENG_CMD=check eng "$T0" 4000 11264)" "ok: include present, fragment present and well-formed" ".on + include + fragment ABSENT: the sweep re-creates it"
 
+# A fragment the engine cannot READ has UNKNOWN levels, which is not "no entries" (gate round ga-marmt9: the unknown was read as none and the rewrite handed a pool the
+# pressure had LOWERED back to its committed value - a raise the 2-sweep rule never allowed - and a file that breaks the config load was never repaired). Every pool
+# restarts from its FLOOR, so the rewrite is never above what could be in force, and it climbs back by the normal rule. The setup lowers gate-reviewer 3 -> 2, then
+# changes the fragment's FORM without changing what gc applies: a trailing comment on a value line is valid TOML (gc still resolves 2) and FOREIGN to the strict parser.
+blk() { mkdir -p "$C/.gc/logs" "$C/.gc/pool-ceiling-engine"; chmod 555 "$C/.gc"; }   # the next create of the fragment fails; the log and the state dir (below .gc) stay writable
+unblk() { chmod 755 "$C/.gc"; }
+foreignize() { sed -i '' 's/^max_active_sessions = 2$/max_active_sessions = 2  # hand note/' "$C/.gc/pool-ceiling-engine.toml"; }
+lowered_foreign() { # <name> <swap> <disk> - gate-reviewer lowered by pressure at T0, the fragment then edited by hand, one more sweep at the readings given
+  mk_city "$1"; eng_quiet "$T0" 7000 11264; foreignize; eng_quiet $((T0 + 300)) "$2" "$3"
+}
+nforeign() { grep -c 'is not what the engine wrote' "$TMPROOT/notify.log" | tr -d ' '; }
+mk_city s16s0; eng_quiet "$T0" 7000 11264; foreignize
+eq "$(ENG_CMD=check eng "$T0" 4000 11264)" "VIOLATION: fragment has FOREIGN content (hand edit / old version)" "setup: the hand-noted fragment is foreign to the engine..."
+eq "$(resolved gate-reviewer)" "2" "...while gc still applies the lowered 2"
+lowered_foreign s16s1 "" ""
+eq "$(resolved gate-reviewer)/$(levels)" "2/gate-reviewer=2" "a LOWERED pool under a fragment the engine cannot read, signals UNREADABLE: still 2 (the unknown was read as 'no entries' and the rewrite RAISED it to 3)"
+has "$(events fragment-foreign)" "levels=unknown" "the log says the levels were unknown and what was done about it"
+eq "$(nforeign)" "1" "and the Mayor is told, once"
+lowered_foreign s16s2 4000 7000
+eq "$(resolved gate-reviewer)/$(levels)" "2/gate-reviewer=2" "the same in the hysteresis band (disk 7000 MB): the band never raises, and neither does a rewrite"
+lowered_foreign s16s3 4000 11264
+eq "$(resolved gate-reviewer)/$(levels)" "2/gate-reviewer=2" "the same with a clear streak of 1/2: the 2-sweep rule is not skipped by a rewrite"
+csw 8 $((T0 + 600))
+eq "$(resolved gate-reviewer)/$(levels)" "3/wa-worker=3" "and it is not stuck at the floor: after the normal rule's sweeps gate-reviewer is back on its committed 3 (entry gone) and wa-worker is raised"
+mk_city s16s4; eng_quiet "$T0" 7000 11264; chmod 000 "$C/.gc/pool-ceiling-engine.toml"
+eng_quiet $((T0 + 300)) 4000 7000; chmod 644 "$C/.gc/pool-ceiling-engine.toml"
+eq "$(resolved gate-reviewer)/$(levels)" "2/gate-reviewer=2" "a fragment that EXISTS but cannot be read is not an ABSENT one: its levels are unknown too, the pool stays at 2"
+has "$(events fragment-foreign)" "prc=2" "and the log names it (read failed, not foreign content)"
+# a file that BREAKS THE CONFIG LOAD cannot be preflighted (gc config show fails because of that very file): it is the suspect, emptied first, then the model is written
+brk() { printf '[[patches.agent\nname = "wa-worker"\n' > "$C/.gc/pool-ceiling-engine.toml"; }
+mk_city s16s5; brk; eng_quiet "$T0" 7000 11264
+eq "$(resolved gate-reviewer)/$(levels)/$([ -e "$C/.gc/pool-ceiling-engine/tripped" ] && echo trip || echo none)" "2/gate-reviewer=2/none" "a LOAD-BREAKING foreign file under HIGH pressure: emptied, then the pressure lowering is written - in ONE sweep, no trip"
+has "$(events restore)" "reason=foreign-fragment-load-error" "the emptying is logged with its reason"
+for lb in 'band|4000|7000' 'unreadable||' 'clear|4000|11264'; do
+  IFS='|' read -r lbn lbs lbd <<< "$lb"; mk_city "s16u$lbn"; brk; eng_quiet "$T0" "$lbs" "$lbd"
+  eq "$(ENG_CMD=check eng "$T0" 4000 11264)/$(resolved gate-reviewer)" "ok: include present, fragment present and well-formed/2" "a load-breaking foreign file, reading '$lbn': repaired in one sweep, the pool carried at its floor 2 (never the committed 3)"
+done
+mk_city s16s6; brk; cp "$C/.gc/pool-ceiling-engine.toml" "$TMPROOT/s16s6.before"
+eng_quiet "$T0" 7000 11264 POOL_CEILING_ENGINE_GC="$TMPROOT/no-such-gc"
+eq "$(cmp -s "$C/.gc/pool-ceiling-engine.toml" "$TMPROOT/s16s6.before" && echo same || echo CHANGED)" "same" "gc cannot even RUN (not found: not 'the config does not load'): the unreadable file is left exactly as it is - no evidence it is the cause, nothing emptied"
+has "$(events preflight-failed)" "rc=2" "and the log says the preflight could not read the config"
+eq "$(nevents restore)/$(nevents restore-undone)/$(sed -n 's/^writes=//p' "$C/.gc/pool-ceiling-engine/daily" 2>/dev/null)" "0/0/" "and no experiment was even started (rc 2 is no answer): the file was never moved aside nor emptied - no restore event, no write counted"
+# the emptying is an EXPERIMENT, not a verdict: the config can be broken somewhere else, and then the foreign file was never the cause (and emptying it would hand a pool the
+# pressure had lowered back to its committed value). If the config still does not load afterwards, or gc stops answering, the original comes back byte for byte.
+mk_city s16s10; brk; cp "$C/.gc/pool-ceiling-engine.toml" "$TMPROOT/s16s10.before"
+eng_quiet "$T0" 7000 11264 FAKE_GC_MODE=loaderr; eng_quiet $((T0 + 300)) 7000 11264 FAKE_GC_MODE=loaderr
+eq "$(cmp -s "$C/.gc/pool-ceiling-engine.toml" "$TMPROOT/s16s10.before" && echo same || echo CHANGED)/$(ls "$C/.gc" | grep -c 'foreign\.')" "same/0" "gc answers ok:false whatever the fragment says: emptying it did not help, so the foreign file is back byte for byte and no aside copy is left"
+has "$(events restore-undone)" "result=the original file is back" "and the undo is logged"
+eq "$(grep -c 'not the cause' "$TMPROOT/notify.log")" "1" "one notification over 2 sweeps: the config does not load and the foreign fragment is not the cause"
+mk_city s16s11; brk; cp "$C/.gc/pool-ceiling-engine.toml" "$TMPROOT/s16s11.before"
+eng_quiet "$T0" 7000 11264 FAKE_GC_COUNT_FILE="$TMPROOT/cnt-s16s11" FAKE_GC_FAIL_NTH=2
+eq "$(cmp -s "$C/.gc/pool-ceiling-engine.toml" "$TMPROOT/s16s11.before" && echo same || echo CHANGED)" "same" "gc answers 'does not load', is emptied, then gc stops answering (call 2 fails): no evidence either way, the original is back byte for byte"
+has "$(events restore-undone)" "emptied=1" "the undo says the emptying had happened"
+eq "$(grep -c 'not the cause' "$TMPROOT/notify.log")" "0" "and nothing claims the fragment was cleared of blame (no answer is not an answer)"
+# unknown x unknown: the file cannot be read AND a pool's committed ceiling cannot be read - no entry for that pool can be shown not to be a raise
+mk_city s16s7; eng_quiet "$T0" 7000 11264; foreignize
+printf '# no max_active_sessions line here\n' > "$C/agents/gate-reviewer/agent.toml"; cm unreadable
+cp "$C/.gc/pool-ceiling-engine.toml" "$TMPROOT/s16s7.before"; eng_quiet $((T0 + 300)) 7000 11264; eng_quiet $((T0 + 600)) 7000 11264
+eq "$(cmp -s "$C/.gc/pool-ceiling-engine.toml" "$TMPROOT/s16s7.before" && echo same || echo CHANGED)" "same" "fragment unreadable AND gate-reviewer's committed ceiling unreadable: the file is left as it is (a rewrite could only guess, and a drop is a raise)"
+eq "$(resolved gate-reviewer)" "2" "and gc still resolves the lowered 2"
+eq "$(events skip | grep -c 'committed ceiling unreadable')" "1" "logged once, not every sweep"
+# the notification is one per EPISODE: the same foreign file over sweeps that cannot rewrite it is one message, and a NEW episode after a good rewrite is another
+mk_city s16s8; eng_quiet "$T0" 7000 11264; foreignize; blk
+eng_quiet $((T0 + 300)) 7000 11264; eng_quiet $((T0 + 600)) 7000 11264; eng_quiet $((T0 + 900)) 7000 11264; unblk
+eq "$(nforeign)" "1" "the same foreign file over 3 sweeps whose rewrite fails (.gc read-only): ONE notification"
+eng_quiet $((T0 + 1200)) 7000 11264; eng_quiet $((T0 + 1500)) 7000 11264
+eq "$(ENG_CMD=check eng "$T0" 4000 11264)/$(nforeign)" "ok: include present, fragment present and well-formed/1" "rewritten once .gc is writable again; still the one notification"
+foreignize; eng_quiet $((T0 + 1800)) 7000 11264
+eq "$(nforeign)" "2" "a NEW foreign episode after the file was well-formed again is reported again"
+mk_city s16s9; eng_quiet "$T0" 7000 11264; foreignize; before="$(tree_sig)"
+out="$(ENG_CMD=plan eng $((T0 + 300)) 4000 7000)"
+has "$out" "to=gate-reviewer=2" "plan over a foreign fragment previews the rewrite at the floor, not a raise"
+has "$out" "fragment-foreign" "and says why"
+eq "$(tree_sig)/$(nforeign)" "$before/0" "and writes nothing: no file, no notification marker, no notification"
+
 # A repair that FAILS is not "nothing to do" (gate ga-x50l0h): the fragment is absent, city.toml includes it (or may), and the create fails (the .gc
 # directory is read-only): the next reload cannot load the config. The engine must SAY so - once per failure (not once per 5-minute sweep), and
 # again if it fails again after the file was there (re-created by the engine, or put back by a human).
-blk() { mkdir -p "$C/.gc/logs" "$C/.gc/pool-ceiling-engine"; chmod 555 "$C/.gc"; }   # the next create of the fragment fails; the log and the state dir (below .gc) stay writable
-unblk() { chmod 755 "$C/.gc"; }
 nrepairfail() { grep -c 'could NOT re-create' "$TMPROOT/notify.log" | tr -d ' '; }
 mk_city s16j; rm -f "$C/.gc/pool-ceiling-engine.on" "$C/.gc/pool-ceiling-engine.toml"; RF="$C/.gc/pool-ceiling-engine/repair-failed"
 blk; eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 300)) 4000 11264; unblk
@@ -831,9 +906,9 @@ if [ -n "$REALGC" ] && "$REALGC" config show --city "$C" --json 2>/dev/null | jq
 if [ "$usable" != "1" ]; then
   echo "  - SKIPPED: no usable real gc on PATH — the fake gc is NOT proven in this run"
 else
-  view() { # <gc binary> -> "rc=0 <pool=max ...>" or "rc=err" (what the three pools resolve to)
+  view() { # <gc binary> -> "rc=0 <pool=max ...>" or "rc=err rc=<n> ok=<json ok>" (what the three pools resolve to, or HOW the load failed)
     local out rc; out=$("$1" config show --city "$C" --json 2>/dev/null); rc=$?
-    if [ "$rc" -ne 0 ]; then echo "rc=err"; return 0; fi
+    if [ "$rc" -ne 0 ]; then echo "rc=err rc=$rc ok=$(printf '%s' "$out" | jq -r '.ok' 2>/dev/null)"; return 0; fi   # the engine's preflight tells "gc answered: does not load" (exit 1 + ok:false) from "no answer"
     printf '%s' "$out" | jq -r '"rc=0 " + ([.config.Agents[] | select(.Name == "wa-worker" or .Name == "ps-worker" or .Name == "gate-reviewer") | "\(.Name)=\(.MaxActiveSessions)"] | sort | join(" "))'
   }
   parity() { printf '%b' "$2" > "$C/.gc/pool-ceiling-engine.toml"; local f r; f=$(view "$GCBIN"); r=$(view "$REALGC"); eq "$f" "$r" "parity: $1 (real gc: $r)"; }
@@ -848,6 +923,7 @@ else
   parity "max_active_sessions = 0 (accepted by gc)" "${H}name = \"wa-worker\"\nmax_active_sessions = 0\n"
   parity "a quoted value (load error)" "${H}name = \"wa-worker\"\nmax_active_sessions = \"3\"\n"
   parity "a malformed header (load error)" '[[patches.agent\nname = "wa-worker"\n'
+  parity "a trailing comment on a value line (valid TOML: the level applies; the engine's strict parser calls the file FOREIGN)" "${H}name = \"wa-worker\"\nmax_active_sessions = 3  # note\n"
   rm -f "$C/.gc/pool-ceiling-engine.toml"
   eq "$(view "$GCBIN")" "$(view "$REALGC")" "parity: fragment ABSENT while city.toml includes it (load error: why the kill switch empties and never deletes)"
   mk_city s20b
@@ -857,6 +933,11 @@ else
   eq "$(view "$REALGC")" "rc=0 gate-reviewer=3 ps-worker=1 wa-worker=3" "the REAL config now resolves wa-worker=3, the others as committed"
   : > "$C/.gc/pool-ceiling-engine.off"; eng_quiet $((T0 + 700)) 4000 11264 POOL_CEILING_ENGINE_GC="$REALGC"
   eq "$(view "$REALGC")" "rc=0 gate-reviewer=3 ps-worker=1 wa-worker=2" "kill switch on the real gc: the config still LOADS and wa-worker is back to 2"
+  mk_city s20c; printf '[[patches.agent\nname = "wa-worker"\n' > "$C/.gc/pool-ceiling-engine.toml"
+  eq "$(view "$REALGC")" "rc=err rc=1 ok=false" "setup: the REAL gc says exit 1 + ok:false for a fragment with a malformed header (the answer the engine's preflight keys on)"
+  eng_quiet "$T0" 7000 11264 POOL_CEILING_ENGINE_GC="$REALGC"
+  eq "$(view "$REALGC")" "rc=0 gate-reviewer=2 ps-worker=1 wa-worker=2" "real gc: a load-breaking FOREIGN fragment under HIGH pressure is emptied, then the model (levels unknown: every pool at its floor) is written, in one sweep"
+  has "$(events restore)" "reason=foreign-fragment-load-error" "and the emptying is logged with its reason"
 fi
 fi
 
@@ -935,7 +1016,7 @@ M = [
  ("budget-takes-the-larger-source", "12", 'if [ "$a" -le "$b" ]; then echo "$a"; else echo "$b"; fi', 'if [ "$a" -ge "$b" ]; then echo "$a"; else echo "$b"; fi'),
  ("no-readback", "14", 'rb=$(pce_readback "$dev"); rbrc=$?', 'rb=""; rbrc=0'),
  ("readback-compares-nothing", "14", 'if [ "$got" != "$want" ]; then mism=1;', 'if false; then mism=1;'),
- ("no-preflight", "14", 'pf=$(pce_preflight "$dev"); pfrc=$?', 'pf=""; pfrc=0'),
+ ("no-preflight", "14", '\n    pf=$(pce_preflight "$dev"); pfrc=$?', '\n    pf=""; pfrc=0'),
  ("trip-ignored", "14 15", 'if [ -e "$PCE_STATE/tripped" ]; then', 'if [ -e "$PCE_STATE/tripped-never" ]; then'),
  ("no-daily-breaker", "15", '"$(pce_daily_writes)" -ge "$PCE_DAILY_MAX"', '"$(pce_daily_writes)" -ge 99999'),
  ("unreadable-date-reads-as-a-new-day", "15", '[ -n "$(_pce_date_of "$PCE_NOW")" ] || { pce_log_change "date-unreadable"', 'true || { pce_log_change "date-unreadable"'),
@@ -975,7 +1056,7 @@ M = [
  ("repair-after-the-clock-check", "16", '[ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST:', '[ -e "$PCE_OFF_FILE" ] || [ -z "$PCE_NOW" ] || pce_repair_missing_fragment   # FIRST:'),
  ("repair-after-the-state-dir-and-lock", "16", '[ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST:', '[ -e "$PCE_OFF_FILE" ] || { mkdir -p "$PCE_STATE" 2>/dev/null && [ -w "$PCE_STATE" ] && pce_repair_missing_fragment; }   # FIRST:'),
  ("repair-never-runs-for-an-enabled-engine", "16", '[ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST:', '[ -e "$PCE_OFF_FILE" ] || [ -e "$PCE_ON_FILE" ] || pce_repair_missing_fragment   # FIRST:'),
- ("preflight-notifies-every-sweep", "14", '&& [ "$pfrc" -eq 1 ] && pce_notify', '; [ "$pfrc" -eq 1 ] && pce_notify'),
+ ("preflight-notifies-every-sweep", "14", '&& { [ "$pfrc" -eq 1 ] && pce_notify', '; { [ "$pfrc" -eq 1 ] && pce_notify'),
  ("write-failed-notifies-every-sweep", "14", '&& pce_notify "pool-ceiling-engine: could not write', '; pce_notify "pool-ceiling-engine: could not write'),
  ("daily-counter-write-failure-is-silent", "10", ' || pce_log "event=state-write-failed" "what=daily-counter" "effect=the breaker may undercount today\'s writes"', ''),
  # the defect of gate round ga-9j2yjo: an unreadable committed ceiling DROPPED the pool's entry, re-raising a pool the pressure had lowered
@@ -991,6 +1072,19 @@ M = [
  ("dry-run-clears-the-failure-marker", "18", '[ "$PCE_DRY" = "1" ] || rm -f "$PCE_STATE/repair-failed" 2>/dev/null; return 0; }', 'rm -f "$PCE_STATE/repair-failed" 2>/dev/null; return 0; }'),
  ("plan-ignores-the-include-gate", "18", 'if [ "$include" != "1" ]; then   # (a dry run too', 'if [ "$include" != "1" ] && [ "$PCE_DRY" != "1" ]; then   # (a dry run too'),
  ("hold-log-claims-an-entry-that-is-not-there", "19", '"action=$(_pce_int "$L" && echo hold-entry || echo nothing-to-hold),no-raise-while-unknown"', '"action=hold-entry,no-raise-while-unknown"'),
+ # the defect of gate round ga-marmt9: a fragment whose levels could not be READ was acted on as "no entries" (a raise), and one that breaks the load was never repaired
+ ("foreign-levels-read-as-none", "16", 'if [ "$unk" = "1" ]; then L="$floor"; else L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" || L="$C"; fi', 'L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" || L="$C"'),
+ ("foreign-restarts-from-committed-not-floor", "16", 'then L="$floor"; else L=$(_pce_map_get', 'then L="$C"; else L=$(_pce_map_get'),
+ ("unreadable-file-read-as-absent", "16", 'if [ "$prc" = "1" ] || { [ "$prc" = "2" ] && [ -e "$PCE_FRAGMENT" ]; }; then unk=1; fi', 'if [ "$prc" = "1" ]; then unk=1; fi'),
+ ("foreign-and-unknown-ceiling-rewritten", "16", 'if [ "$unk" = "1" ] && [ -n "$skipped" ]; then', 'if false; then'),
+ ("foreign-notifies-every-sweep", "16", 'elif [ ! -e "$foreign_note" ]; then', 'elif true; then'),
+ ("foreign-episode-never-ends", "16", '[ "$PCE_DRY" = "1" ] || rm -f "$foreign_note" 2>/dev/null ;;', ': ;;'),
+ ("plan-writes-the-foreign-marker", "16", 'elif [ "$PCE_DRY" = "1" ]; then\n         pce_log "event=fragment-foreign"', 'elif false; then\n         pce_log "event=fragment-foreign"'),
+ ("load-breaking-foreign-file-not-emptied", "16", 'if [ "$pfrc" -eq 3 ] && [ "$unk" = "1" ]; then', 'if false; then'),
+ ("emptied-without-gc-answering", "16", 'if [ "$pfrc" -eq 3 ] && [ "$unk" = "1" ]; then', 'if [ "$pfrc" -ne 0 ] && [ "$pfrc" -ne 1 ] && [ "$unk" = "1" ]; then'),
+ ("emptying-is-not-undone", "16", '*) mv -f "$aside" "$PCE_FRAGMENT" 2>/dev/null', '*) :'),
+ ("emptying-kept-without-evidence", "16", '0|1) rm -f "$aside" 2>/dev/null ;;', '0|1|2|3) rm -f "$aside" 2>/dev/null ;;'),
+ ("no-answer-reads-as-does-not-load", "16", r'''if [ "$rc" -eq 1 ] && printf '%s' "$out" | jq -e '.ok == false' >/dev/null 2>&1; then echo "gc config show: the config does not load"; return 3; fi''', r'''if [ "$rc" -ne 0 ]; then echo "gc config show: the config does not load"; return 3; fi'''),
 ]
 names = []
 for name, secs, old, new in M:
