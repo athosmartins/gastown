@@ -52,8 +52,10 @@
 # THE ALARM, once per episode: `gc mail send mayor` (durable — if the Mayor restarts the question must still be
 # there) with the session, how long it has stood still, the cause, and the pane tail. The "alarmed" mark is
 # written BEFORE the mail is sent and only a verified write lets the mail go (an unrecorded alarm would be
-# re-mailed every pass); a failed send clears the mark so the next pass retries. A pane that is STILL the same
-# after REALARM_SEC is mailed again; any change to the pane starts a new episode.
+# re-mailed every pass); a send that FAILED (gc exited non-zero) clears the mark so the next pass retries, but one
+# that TIMED OUT is UNKNOWN — it may have gone out — so the mark stays (no duplicate Dolt commit) and the line
+# is logged as such. A pane that is STILL the same after REALARM_SEC is mailed again; any change to the pane
+# starts a new episode.
 #
 # STATE: one file per session ($SESS_STATE/<name>__<id>.state): "<hash> <first-seen> <alarmed-at|0>
 # <bead-holder-until|0>". Keyed on name AND id because a dog name (gastown.dog-1) is reused by later
@@ -316,7 +318,7 @@ cause_label() {
   esac
 }
 
-# send_alarm <name> <sid> <tmpl> <wdir> <shape> <stuck-sec> <first-seen> <pane> -> 0 if gc accepted the mail
+# send_alarm <name> <sid> <tmpl> <wdir> <shape> <stuck-sec> <first-seen> <pane> -> exit status of `gc mail send`: 0 = accepted, 124 = timeout killed it (outcome UNKNOWN), else failed
 send_alarm() {
   local name="$1" sid="$2" tmpl="$3" wdir="$4" shape="$5" stuck="$6" first="$7" pane="$8"
   local mins since excerpt subject body
@@ -352,7 +354,7 @@ EOF
 }
 
 # ---- main loop ----------------------------------------------------------------------------------------------
-N_PEEKED=0; N_BUSY=0; N_UNKNOWN=0; N_YOUNG=0; N_QUIET=0; N_DONE=0; N_HOLD=0; N_BUNK=0; N_MAILED=0; N_MAILFAIL=0; MAILS=0; SEEN=""
+N_PEEKED=0; N_BUSY=0; N_UNKNOWN=0; N_YOUNG=0; N_QUIET=0; N_DONE=0; N_HOLD=0; N_BUNK=0; N_MAILED=0; N_MAILFAIL=0; N_MAILUNK=0; MAILS=0; SEEN=""
 PASS_START="$(date +%s)"   # real clock on purpose (NOW is overridable): the budget bounds wall time
 while IFS='|' read -r name sid alias sname tmpl wdir; do
   [ -z "$name" ] && continue
@@ -414,14 +416,21 @@ while IFS='|' read -r name sid alias sname tmpl wdir; do
     state_err "$name ($tmpl): cannot record the alarm mark in $SESS_STATE — NOT mailing (an unrecorded alarm would repeat every pass)"
     continue
   fi
-  if send_alarm "$name" "$sid" "$tmpl" "$wdir" "$shape" "$stuck" "$ST_FIRST" "$pane"; then
-    N_MAILED=$((N_MAILED + 1))
-    log "$name ($tmpl): ALARM mailed to $MAYOR_ADDR — $shape, pane unchanged ${stuck}s, no bead"
-  else
-    N_MAILFAIL=$((N_MAILFAIL + 1))
-    log "$name ($tmpl): WARN gc mail send to $MAYOR_ADDR FAILED (or timed out — it may still have gone out) — clearing the alarm mark so the next pass retries"
-    write_state "$stf" "$hash $ST_FIRST 0 0" || state_err "$name: could not clear the alarm mark — the retry is held until REALARM_SEC (${REALARM_SEC}s)"
-  fi
+  send_alarm "$name" "$sid" "$tmpl" "$wdir" "$shape" "$stuck" "$ST_FIRST" "$pane"; src=$?
+  case "$src" in
+    0)
+      N_MAILED=$((N_MAILED + 1))
+      log "$name ($tmpl): ALARM mailed to $MAYOR_ADDR — $shape, pane unchanged ${stuck}s, no bead" ;;
+    124)
+      # timeout killed gc mail send: whether the mail was written is UNKNOWN. Every mail is a permanent Dolt
+      # commit, so the inert answer is to keep the mark (no resend); REALARM_SEC is the safety net if it was lost.
+      N_MAILUNK=$((N_MAILUNK + 1))
+      log "$name ($tmpl): WARN gc mail send to $MAYOR_ADDR TIMED OUT — UNKNOWN whether the alarm was delivered; NOT re-sending this episode (check the Mayor's inbox); the same still pane is mailed again after REALARM_SEC (${REALARM_SEC}s)" ;;
+    *)
+      N_MAILFAIL=$((N_MAILFAIL + 1))
+      log "$name ($tmpl): WARN gc mail send to $MAYOR_ADDR FAILED (exit $src) — clearing the alarm mark so the next pass retries"
+      write_state "$stf" "$hash $ST_FIRST 0 0" || state_err "$name: could not clear the alarm mark — the retry is held until REALARM_SEC (${REALARM_SEC}s)" ;;
+  esac
 done < "$CAND_FILE"
 
 # forget state for sessions that are gone / no longer candidates
@@ -434,5 +443,5 @@ done
 if [ "$N_PEEKED" -gt 0 ] && [ "$N_UNKNOWN" -eq "$N_PEEKED" ]; then
   log "WARN: BLIND pass — all $N_PEEKED pane(s) read UNKNOWN (peek timeouts under load, or an unrecognised pane layout); no session was assessed, so silence from this alarm means nothing for this pass"
 fi
-log "=== pass end (candidates=$NCAND peeked=$N_PEEKED busy=$N_BUSY unknown=$N_UNKNOWN young=$N_YOUNG quiet_static=$N_QUIET already_alarmed=$N_DONE bead_holders=$N_HOLD bead_unknown=$N_BUNK mails_sent=$N_MAILED mails_failed=$N_MAILFAIL state_errors=$STATE_ERRORS skipped_unknown=$NSKIP) ==="
+log "=== pass end (candidates=$NCAND peeked=$N_PEEKED busy=$N_BUSY unknown=$N_UNKNOWN young=$N_YOUNG quiet_static=$N_QUIET already_alarmed=$N_DONE bead_holders=$N_HOLD bead_unknown=$N_BUNK mails_sent=$N_MAILED mails_failed=$N_MAILFAIL mails_unknown=$N_MAILUNK state_errors=$STATE_ERRORS skipped_unknown=$NSKIP) ==="
 exit 0

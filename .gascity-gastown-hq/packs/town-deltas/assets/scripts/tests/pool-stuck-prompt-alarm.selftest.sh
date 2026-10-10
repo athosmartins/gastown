@@ -52,6 +52,7 @@ case "$1 $2" in
                   [ -f "$FAKE_DIR/pane.$3" ] && cat "$FAKE_DIR/pane.$3"; exit 0 ;;
   "mail send")    echo "mailtry $3" >> "$FAKE_CALLS"
                   [ -n "${FAKE_MAIL_FAIL:-}" ] && exit 1
+                  [ -n "${FAKE_MAIL_TIMEOUT:-}" ] && exit 124      # timeout(1) killed it: it may or may not have been written
                   n="$(ls "$FAKE_DIR"/mail.*.to 2>/dev/null | wc -l | tr -d ' ')"; i=$((n + 1))
                   echo "mail $3" >> "$FAKE_CALLS"
                   printf '%s' "$3" > "$FAKE_DIR/mail.$i.to"; printf '%s' "$5" > "$FAKE_DIR/mail.$i.subject"; printf '%s' "$7" > "$FAKE_DIR/mail.$i.body"
@@ -227,6 +228,8 @@ sc_bd_unknown() { baseline; pass1; pass2 FAKE_BD_FAIL=1; [ "$(mails)" = 0 ]; }
 sc_dedupe()     { baseline; episode; run_at "$((NOW0 + 1400))"; run_at "$((NOW0 + 2000))"; [ "$(mails)" = 1 ]; }
 sc_realarm()    { baseline; episode POOL_STUCK_REALARM_SEC=3600; run_at "$((NOW0 + 1300 + 3700))" POOL_STUCK_REALARM_SEC=3600; [ "$(mails)" = 2 ]; }
 sc_mail_retry() { baseline; pass1; pass2 FAKE_MAIL_FAIL=1; [ "$(mails)" = 0 ] || return 1; run_at "$((NOW0 + 1400))"; [ "$(mails)" = 1 ]; }
+sc_mail_timeout() { baseline; pass1; pass2 FAKE_MAIL_TIMEOUT=1; run_at "$((NOW0 + 1400))"; run_at "$((NOW0 + 2000))"
+                  [ "$(calls_n mailtry)" = 1 ] && [ "$(mails)" = 0 ]; }       # one try, never re-sent: its outcome is UNKNOWN
 sc_pane_moves() { baseline; pass1; pane gastown.dog-1 "${DENIED_PANE}"$'\n⏺ one more line'; pass2; [ "$(mails)" = 0 ]; }
 sc_digits()     { baseline; pass1; pane gastown.dog-1 "${DENIED_PANE//12.0%/12.4%}"; pass2; [ "$(mails)" = 1 ]; }
 sc_quiet()      { baseline; pane gastown.dog-1 "$QUIET_PANE"; episode; [ "$(mails)" = 0 ] && [ "$(calls_n bd)" = 0 ]; }
@@ -321,6 +324,9 @@ check "mailed once; passes 2 and 3 more minutes later do not mail again"        
 check "the same still pane is mailed AGAIN after REALARM_SEC"                            sc_realarm
 check "a failed 'gc mail send' clears the mark: the next pass retries and delivers"      sc_mail_retry
 said "...and the failure was logged" 'FAILED'
+check "a 'gc mail send' that TIMES OUT is UNKNOWN: tried once, never re-sent (it may have gone out)" sc_mail_timeout
+said "...and logged as UNKNOWN delivery, with the counter" 'UNKNOWN whether the alarm was delivered'
+said "...counted in the pass line" 'mails_unknown=1'
 baseline; episode; run_at "$((NOW0 + 1400))"; pane gastown.dog-1 "${DENIED_PANE}"$'\n⏺ a human answered'; run_at "$((NOW0 + 1500))"; run_at "$((NOW0 + 1500 + 1300))"
                                                                                         expect "a pane that CHANGES after the alarm starts a new episode (and mails again once still)" 2
 check "a 'holds a bead' answer is remembered: bd not asked again within HAS_RECHECK, asked after" sc_holder_memo
@@ -403,6 +409,9 @@ mutant busy_not_checked '  if is_active_work "$pane"; then echo BUSY; return; fi
 mutant no_dedupe 'if [ "$ST_ALARMED" -gt 0 ] && [ $((NOW - ST_ALARMED)) -lt "$REALARM_SEC" ]; then N_DONE=$((N_DONE + 1)); continue; fi' ':' sc_dedupe "no once-per-episode mark (a mail every pass)"
 mutant no_realarm 'lt "$REALARM_SEC" ]; then N_DONE' 'lt 99999999 ]; then N_DONE' sc_realarm "a still pane never re-alarmed"
 mutant mail_fail_keeps_mark 'write_state "$stf" "$hash $ST_FIRST 0 0" || state_err "$name: could not clear' ': || state_err "$name: could not clear' sc_mail_retry "a failed send leaves the alarmed mark (the alarm is lost)"
+mutant mail_timeout_is_failure '    124)
+' '    9999)
+' sc_mail_timeout "a timed-out send read as a plain failure (mark cleared, the mail may be sent twice)"
 mutant hash_constant '| cksum | awk '"'"'{print $1 "-" $2}'"'"'' '| cksum | awk '"'"'{print "7-7"}'"'"'' sc_pane_moves "pane clock ignores what the pane says"
 mutant digits_not_normalised "-e 's/[0-9][0-9]*/N/g' " '' sc_digits "a ticking counter keeps resetting the clock"
 mutant quiet_gate_removed 'if [ "$shape" = "QUIET" ]; then' 'if false; then' sc_quiet "a pane with no human-wait shape is mailed (and bd is asked)"
