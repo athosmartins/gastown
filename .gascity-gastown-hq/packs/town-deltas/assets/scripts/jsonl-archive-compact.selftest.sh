@@ -20,7 +20,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 skip() { SKIP=$((SKIP+1)); echo "  SKIP: $1"; }     # a check that did NOT run (host too loaded for a timing fixture, a file not in this tree): counted apart, printed in RESULT — never a PASS
 
 WORK="$(mktemp -d /tmp/jsonl-archive-compact-selftest.XXXXXX)"
-trap 'chmod -R u+rwx "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT      # fixtures below chmod directories read-only: give them back first, or the cleanup cannot remove them
+trap 'type fg_stop_all >/dev/null 2>&1 && fg_stop_all; chmod -R u+rwx "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT      # S35 starts long-lived stand-in processes: stop them first. Fixtures below chmod directories read-only: give them back first, or the cleanup cannot remove them
 
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null   # a developer's ~/.gitconfig must not change what is tested
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
@@ -127,7 +127,7 @@ run_jac() {
   JAC_GIT="${T_GIT:-git}" JAC_GIT_TIMEOUT_S="${T_GIT_TIMEOUT:-300}" JAC_MAX_BATCHES="${T_MAX_BATCHES:-0}" JAC_DEADLINE_S="${T_DEADLINE:-780}" \
   JAC_MIN_BATCH_S="${T_MIN_BATCH:-}" JAC_GC_TIMEOUT_S="${T_GC_TIMEOUT:-}" JAC_MIN_GC_BUDGET_S="${T_MIN_GC:-}" \
   JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" JAC_MAIL_TIMEOUT_S="${T_MAIL_TIMEOUT:-}" \
-  JAC_LSOF="${T_LSOF:-}" JAC_RECLAIM_WAIT_S="${T_RECLAIM_WAIT:-}" \
+  JAC_LSOF="${T_LSOF:-}" JAC_RECLAIM_WAIT_S="${T_RECLAIM_WAIT:-}" JAC_PS="${T_PS:-}" JAC_PS_TIMEOUT_S="${T_PS_TIMEOUT:-}" \
   "$SCRIPT" "$@" 2>&1     # executed, not `bash $SCRIPT`: production runs the shebang (/bin/bash 3.2 on macOS), not whatever bash is first in PATH
 }
 last_status() { grep -o 'status=[a-z-]*' "$WORK/log" | tail -1 | cut -d= -f2; }
@@ -1309,6 +1309,128 @@ mo="$(printf '%s\n' "$MS" | grep -c '^OUTSIDE|')"; ms="$(printf '%s\n' "$MS" | g
   || bad "lint did not catch the mutant (outside=$mo want 2; steps=$ms want $((bs + 1)); bare=[$mb] want [count-objects,repack,])"
 
 echo ""
+echo "=== S35: ONE REPACKER AT A TIME — the consolidating gc is not started while another git process is repacking the repo (ga-8z0hy7) ==="
+# The incident: two gc runs (08/10 13:32Z, 09/10 22:11Z) died with "fatal: could not find pack 'loose-<sha>.pack'" / "failed to run repack", rc=128. Reproduced on a scratch
+# repo: a gc names the packs it will consume, spends minutes on the main pack, and its cruft pass then asks for them by name — while the background repack that every `git commit`
+# spawns (`git maintenance run --auto --detach` -> `repack -d -l --geometric=2 --write-midx`, 19+ minutes on this host, with no lock file) has merged and deleted the loose-*.pack
+# batch packs. So before the gc, other_repacker looks for such a process: ps for git processes of a repacking kind, then lsof for the working directory of each.
+# The stand-in below is a script NAMED `git` whose command line reads `.../git repack ...` and whose working directory is the repo — real ps and real lsof see a real process, no fake
+# listing. Its sleeping child is stopped with it.
+FGBIN="$WORK/fg-bin"; mkdir -p "$FGBIN"
+printf '#!/bin/bash\nsleep 120\n' > "$FGBIN/git"; chmod +x "$FGBIN/git"
+FG_PIDS=""; FG_PID=""
+fg_start() {  # fg_start <cwd> <git args...> — sets FG_PID once ps shows the stand-in under its final command line
+  local d="$1" i; shift
+  ( cd "$d" && exec "$FGBIN/git" "$@" ) >/dev/null 2>&1 &
+  FG_PID=$!; FG_PIDS="$FG_PIDS $FG_PID"
+  for i in $(seq 1 50); do ps -p "$FG_PID" -o command= 2>/dev/null | grep -q 'fg-bin/git' && return 0; sleep 0.1; done
+  return 1
+}
+fg_stop_all() { local p; for p in $FG_PIDS; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; done; FG_PIDS=""; FG_PID=""; return 0; }
+mkpacks() { mkrepo "$1" 1; local i; for i in 2 3 4 5 6; do addpack "$1" "$i"; done; }
+
+# A. another repacker whose working directory is this repo → the gc is not started: busy, nothing consolidated, nothing touched, the log names the process
+A="$WORK/fg-a"; mkpacks "$A"; PCA="$(pack_count "$A")"; HA="$(history "$A")"; rm -f "$WORK/state.json"
+fg_start "$A" repack -d -l --geometric=2 --quiet --write-midx || bad "test setup: the stand-in repacker did not show up in ps"
+out="$(T_PACKS=4 run_jac "$A")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "busy" ] && [ "$(pack_count "$A")" = "$PCA" ]; } \
+  && ok "a repacker with its cwd in the repo → gc NOT started: status busy, exit 0, packs unchanged ($PCA)" \
+  || bad "foreign repacker in the repo: rc=$rc status=$(last_status) packs $PCA -> $(pack_count "$A"): $out"
+printf '%s' "$out" | grep -q "gc not started: pid $FG_PID: .*git repack" && printf '%s' "$out" | grep -q 'ga-8z0hy7' \
+  && ok "the log names the process (pid, command line) and the bead" || bad "log does not name the foreign repacker (pid $FG_PID): $out"
+{ [ "$(history "$A")" = "$HA" ] && git --git-dir="$A/.git" fsck --strict >/dev/null 2>&1; } && ok "history identical and fsck clean — nothing was written" || bad "the repo changed although the gc was not started"
+fg_stop_all
+out="$(T_PACKS=4 run_jac "$A")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$A")" -le 2 ]; } \
+  && ok "the next run, with that process gone, consolidates (deferred is retried, never abandoned): packs $PCA -> $(pack_count "$A")" \
+  || bad "after the repacker ended the gc did not run: rc=$rc status=$(last_status) packs=$(pack_count "$A"): $out"
+
+# B. the same repack in ANOTHER repo (its cwd is not this one) → no reason to wait
+B="$WORK/fg-b"; mkpacks "$B"; rm -f "$WORK/state.json"
+fg_start "$WORK" repack -d -l --geometric=2 || bad "test setup: the stand-in did not show up in ps"
+out="$(T_PACKS=4 run_jac "$B")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ]; } \
+  && ok "a repacker working in another directory does not hold this repo's gc back" || bad "a repacker elsewhere blocked the gc: rc=$rc status=$(last_status): $out"
+fg_stop_all
+
+# C. a git process in the repo that does not repack (an exporter's own commit) is not a reason to wait either
+C="$WORK/fg-c"; mkpacks "$C"; rm -f "$WORK/state.json"
+fg_start "$C" commit -q -m exporter || bad "test setup: the stand-in did not show up in ps"
+out="$(T_PACKS=4 run_jac "$C")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ]; } \
+  && ok "a git commit in the repo is not a repacker: the gc runs" || bad "a git commit in the repo blocked the gc: rc=$rc status=$(last_status): $out"
+fg_stop_all
+
+# D. a failed tier 1 stays failed: a gc that was not started did NOTHING, so it cannot turn it into a green busy
+D="$WORK/fg-d"; mkfailrepo "$D"; rm -f "$WORK/state.json"
+fg_start "$D" maintenance run --auto --quiet --detach || bad "test setup: the stand-in did not show up in ps"
+out="$(FM_RC=1 T_GIT="$WORK/git-failmaint" T_PACKS=3 run_jac "$D")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && printf '%s' "$out" | grep -q 'gc not started'; } \
+  && ok "batches failed + a foreign repacker (gc not started) → status stays failed, exit 1 (it does not launder a failure)" \
+  || bad "failed tier 1 + foreign repacker judged wrong: rc=$rc status=$(last_status): $out"
+fg_stop_all
+
+# E. the repo reached through a symlink: lsof prints the resolved directory, the comparison uses the repo's physical path
+E="$WORK/fg-e"; mkpacks "$E"; ln -s "$E" "$WORK/fg-e-link"; rm -f "$WORK/state.json"
+fg_start "$E" gc --auto || bad "test setup: the stand-in did not show up in ps"
+out="$(T_PACKS=4 run_jac "$WORK/fg-e-link")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "busy" ] && printf '%s' "$out" | grep -q "gc not started: pid $FG_PID"; } \
+  && ok "repo given as a symlink path: the process is still found (physical path compared)" || bad "symlinked repo path missed the foreign repacker: rc=$rc status=$(last_status): $out"
+fg_stop_all
+
+# F. CANNOT TELL is not "none": every way the look can fail leaves the gc unstarted, says so, and is never green over a failed tier 1
+printf '#!/bin/bash\nexit 1\n' > "$WORK/ps-fail"; printf '#!/bin/bash\nexit 0\n' > "$WORK/ps-empty"; chmod +x "$WORK/ps-fail" "$WORK/ps-empty"
+cantell() {  # cantell <label> <repo> <env assignments...> — run with an unanswerable look; busy + "cannot tell" + packs untouched
+  local label="$1" repo="$2" pc o r; shift 2
+  pc="$(pack_count "$repo")"; rm -f "$WORK/state.json"
+  o="$( export "$@"; T_PACKS=4 run_jac "$repo" )"; r=$?      # a subshell with the look's faults exported (run_jac is a function: env cannot run it)
+  { [ "$r" -eq 0 ] && [ "$(last_status)" = "busy" ] && [ "$(pack_count "$repo")" = "$pc" ] && printf '%s' "$o" | grep -q 'cannot tell whether another git process is repacking'; } \
+    && ok "$label → gc not started, status busy, log says it cannot tell" || bad "$label: rc=$r status=$(last_status) packs $pc -> $(pack_count "$repo"): $o"
+}
+F1="$WORK/fg-f1"; mkpacks "$F1"; cantell "ps fails" "$F1" T_PS="$WORK/ps-fail"
+F2="$WORK/fg-f2"; mkpacks "$F2"; cantell "ps prints nothing (it always lists itself — an empty list is a ps that did not work)" "$F2" T_PS="$WORK/ps-empty"
+F3="$WORK/fg-f3"; mkpacks "$F3"; fg_start "$F3" repack -d || bad "test setup: the stand-in did not show up in ps"
+cantell "lsof is missing while a candidate repacker is alive" "$F3" T_LSOF="$WORK/no-such-lsof"
+F4="$WORK/fg-f4"; mkpacks "$F4"
+cantell "lsof answers nothing for a candidate that is alive (not readable)" "$F4" T_LSOF="$WORK/lsof-none"
+fg_stop_all
+printf '#!/bin/bash\nsleep 30\n' > "$WORK/lsof-slow"; chmod +x "$WORK/lsof-slow"
+F5="$WORK/fg-f5"; mkpacks "$F5"; fg_start "$F5" repack -d || bad "test setup: the stand-in did not show up in ps"
+cantell "lsof cut at its cap (2s) while a candidate is alive" "$F5" T_LSOF="$WORK/lsof-slow" JAC_LSOF_TIMEOUT_S=2
+fg_stop_all
+# an lsof answer that is not a directory: its own words for one it could not read are not "somewhere else", and a pid line with no directory line under it answers nothing.
+# Each stub answers EVERY pid it is asked about, in the same unusable way — so no candidate is left unanswered for another reason, and only the handling of that answer decides.
+cat > "$WORK/lsof-notpath" <<'EOF'
+#!/bin/bash
+for last; do :; done
+for p in $(printf '%s' "$last" | tr ',' ' '); do printf 'p%s\nfcwd\nn(cannot read: permission denied)\n' "$p"; done
+EOF
+cat > "$WORK/lsof-nodir" <<'EOF'
+#!/bin/bash
+for last; do :; done
+for p in $(printf '%s' "$last" | tr ',' ' '); do printf 'p%s\nfcwd\n' "$p"; done
+EOF
+chmod +x "$WORK/lsof-notpath" "$WORK/lsof-nodir"
+F7="$WORK/fg-f7"; mkpacks "$F7"; fg_start "$F7" repack -d || bad "test setup: the stand-in did not show up in ps"
+cantell "lsof's directory line is not a path (a directory it could not read)" "$F7" T_LSOF="$WORK/lsof-notpath"
+F8="$WORK/fg-f8"; mkpacks "$F8"
+cantell "lsof prints a pid line with no directory line under it" "$F8" T_LSOF="$WORK/lsof-nodir"
+fg_stop_all
+F6="$WORK/fg-f6"; mkfailrepo "$F6"; rm -f "$WORK/state.json"
+out="$(FM_RC=1 T_GIT="$WORK/git-failmaint" T_PS="$WORK/ps-fail" T_PACKS=3 run_jac "$F6")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ]; } \
+  && ok "batches failed + a look that cannot tell → status stays failed, exit 1" || bad "failed tier 1 + unanswerable look judged wrong: rc=$rc status=$(last_status): $out"
+
+# G. a candidate that is already gone by the time lsof looks (it exited since ps) is not a repacker and is not "cannot tell"
+G="$WORK/fg-g"; mkpacks "$G"; rm -f "$WORK/state.json"
+DEADG="$(sh -c 'echo $$')"; kill -0 "$DEADG" 2>/dev/null && DEADG=999999
+printf '#!/bin/bash\necho "  1 /sbin/launchd"\necho "%s /usr/bin/git repack -d -l --geometric=2"\n' "$DEADG" > "$WORK/ps-dead"; chmod +x "$WORK/ps-dead"
+out="$(T_PS="$WORK/ps-dead" T_PACKS=4 run_jac "$G")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ]; } \
+  && ok "a listed repacker that has exited since ps ran is neither found nor 'cannot tell': the gc runs" || bad "a vanished candidate blocked the gc: rc=$rc status=$(last_status): $out"
+
+echo ""
+
 echo "=== S11: what actually runs in production ==="
 cfg="$("$SCRIPT" --print-config)"
 printf '%s' "$cfg" | grep -q 'packs/maintenance/jsonl-archive' && printf '%s' "$cfg" | grep -q 'packs/town-deltas/jsonl-archive' \

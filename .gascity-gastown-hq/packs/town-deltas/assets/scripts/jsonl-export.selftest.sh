@@ -446,5 +446,69 @@ case "$OUT" in
 esac
 unverified_seen "unverified, plain no-changes exit (300, source ERR)"
 
+# ga-8z0hy7 — a commit that lands while jsonl-archive-compact.sh runs must not start git's background maintenance.
+# `git commit` runs `git maintenance run --auto --quiet --detach`; on git 2.54 that is a geometric repack which merges and deletes the loose-*.pack batch
+# packs, for 19+ minutes and with no lock file, and a compactor gc that is running meanwhile dies with "could not find pack 'loose-....pack'". trace2 logs the
+# spawn as a child_start event of the committing process itself, synchronously (the detached process logs later), so that is what is counted — not a process listing.
+echo "=== ga-8z0hy7: a commit during a compaction run starts no background maintenance; outside one it still does ==="
+maint_spawns() {  # maint_spawns <trace2 file> — how many times that run's git commit started `git maintenance run --auto`
+  local n; n="$(grep -c '"maintenance","run","--auto"' "$1" 2>/dev/null)"; echo "${n:-0}"
+}
+maint_case() {  # maint_case <name> — one fresh archive, one export (its first commit), trace2 into $E2E/t2-<name>.json; JAC_LOCK is whatever the caller exported
+  fresh_archive "maint-$1"
+  : > "$E2E/t2-$1.json"
+  GIT_TRACE2_EVENT="$E2E/t2-$1.json" run_export 300 300
+}
+DEAD_PID="$(sh -c 'echo $$')"      # a pid that was alive a moment ago and is gone now
+kill -0 "$DEAD_PID" 2>/dev/null && DEAD_PID=999999
+
+export JAC_LOCK="$E2E/lock-absent"
+maint_case nolock
+[ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-nolock.json")" -ge 1 ] \
+  && ok "no compaction lock: the commit starts git's background maintenance as before (consolidation is not switched off)" \
+  || bad "no lock: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-nolock.json") — want 1 commit and a maintenance run started: $OUT"
+
+export JAC_LOCK="$E2E/lock-live"; mkdir -p "$JAC_LOCK"; echo "$$" > "$JAC_LOCK/pid"
+maint_case live
+[ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-live.json")" -eq 0 ] \
+  && ok "a live compactor holds its lock: the commit is made and starts NO background maintenance" \
+  || bad "live lock: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-live.json") — want 1 commit and 0 maintenance runs started: $OUT"
+case "$OUT" in *"compaction run is in flight"*) ok "the run says why (a compaction run is in flight)" ;; *) bad "no 'compaction run is in flight' line in the output: $OUT" ;; esac
+
+export JAC_LOCK="$E2E/lock-dead"; mkdir -p "$JAC_LOCK"; echo "$DEAD_PID" > "$JAC_LOCK/pid"
+maint_case dead
+[ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-dead.json")" -ge 1 ] \
+  && ok "a lock whose owner is dead (a run killed by the order's timeout) does not hold git's consolidation off — the commit starts it" \
+  || bad "dead-owner lock: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-dead.json") — want 1 commit and a maintenance run started: $OUT"
+
+export JAC_LOCK="$E2E/lock-nopid"; mkdir -p "$JAC_LOCK"
+maint_case nopid
+[ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-nopid.json")" -eq 0 ] \
+  && ok "a lock directory with no pid file (its mkdir, not yet its pid write; or unreadable) counts as in flight — under doubt, no background run" \
+  || bad "no-pid lock: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-nopid.json") — want 1 commit and 0 maintenance runs started: $OUT"
+
+export JAC_LOCK="$E2E/lock-junk"; mkdir -p "$JAC_LOCK"; echo "not-a-pid" > "$JAC_LOCK/pid"
+maint_case junk
+[ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-junk.json")" -eq 0 ] \
+  && ok "a pid file that holds no number counts as in flight as well" \
+  || bad "junk-pid lock: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-junk.json") — want 1 commit and 0 maintenance runs started: $OUT"
+unset JAC_LOCK
+
+# The cases above point BOTH scripts at one directory with JAC_LOCK, so nothing in them would notice the two DEFAULTS drifting apart — and then the exporter would look for a lock the
+# compactor never takes, and every commit would start the background repack again with all of the above still green. So: the same environment, the default path each one derives.
+# (--print-config prints the compactor's effective `lock=`; the exporter's is the one assignment, evaluated here with the city and runtime variables it reads.)
+echo "=== ga-8z0hy7: the exporter looks for the compaction lock where the compactor takes it (default paths) ==="
+CMP_SCRIPT="$HERE/jsonl-archive-compact.sh"
+EXP_LOCK_LINE="$(grep -E '^COMPACT_LOCK=' "$SCRIPT")"
+lock_paths_agree() {  # lock_paths_agree <label> <city dir> <runtime dir or ""> — the runtime variable is exported only when given
+  local label="$1" city="$2" rt="$3" exp_path cmp_path
+  exp_path="$( unset JAC_LOCK GC_CITY_RUNTIME_DIR; [ -n "$rt" ] && export GC_CITY_RUNTIME_DIR="$rt"; CITY="$city"; eval "$EXP_LOCK_LINE"; printf '%s' "${COMPACT_LOCK:-}" )"
+  cmp_path="$( unset JAC_LOCK JAC_STATE JAC_LOG GC_CITY_RUNTIME_DIR; [ -n "$rt" ] && export GC_CITY_RUNTIME_DIR="$rt"; GC_CITY_PATH="$city" "$CMP_SCRIPT" --print-config 2>/dev/null | sed -n 's/.* lock=//p' )"
+  if [ -n "$exp_path" ] && [ "$exp_path" = "$cmp_path" ]; then ok "$label: both resolve to $exp_path"
+  else bad "$label: the exporter looks at [$exp_path], the compactor takes [$cmp_path] — a commit would never see the compaction lock"; fi
+}
+lock_paths_agree "runtime dir given (GC_CITY_RUNTIME_DIR, as the supervisor sets it)" "$E2E/city-x" "$E2E/runtime-x"
+lock_paths_agree "no runtime dir given (derived from the city)" "$E2E/city-y" ""
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

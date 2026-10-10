@@ -85,6 +85,27 @@
 #      The backstop lives elsewhere: scripts/git-lock-hygiene.sh PART 1b removes tmp_* files older than 6h when no git runs on the repo and nothing has them open, and
 #      alarms when a repo's size-garbage passes 500MiB. It does not change anything above: this script still removes only what its own killed step left.
 #
+# ONE REPACKER AT A TIME (ga-8z0hy7): the consolidating gc failed twice (08/10 13:32Z, 09/10 22:11Z) with `fatal: could not find pack 'loose-<sha>.pack'` / `failed to run repack`
+# (rc=128), 387-562s in. Reproduced on a scratch repo with this host's git 2.54 (a gc whose main pack-objects is slow, plus the background run below): gc's repack names the
+# packs it will consume, writes the main pack for minutes, and only then asks for them again by name (the cruft pack-objects, `--stdin-packs`) — and the loose-*.pack batch
+# packs this script made are gone. Who removed them is git itself: every `git commit` in an archive repo (the exporter's, every 15 minutes) runs `git maintenance run --auto
+# --quiet --detach`, and on 2.54 that runs `git repack -d -l --geometric=2 --write-midx`, which merges the small packs and deletes them. Measured in production 10/10: such a
+# run lasts 19+ minutes under this host's load (one was alive for 19:00 when it was looked at, another started 30 minutes later), and while it runs there is NO
+# objects/maintenance.lock: git's lock file belongs to the process that forks the detached child, and goes with it when that parent exits (reproduced on a scratch repo too) —
+# so neither `maintenance run` nor `git gc` (gc.pid only) is kept out by it. That run is also the consolidation that actually works here (this gc timed out at its 600s cap 17
+# times in the log, on a 4GiB repo), so it must not be switched off (maintenance.auto=false would leave a gc that cannot finish as the only consolidator). The rule instead:
+# never two repackers at once, from both sides.
+#   1. This script, before it starts the consolidating gc, looks for another git process repacking the repo (other_repacker: ps for this user's git maintenance/repack/gc/
+#      pack-objects/... processes, then lsof for the working directory of each — a detached run keeps the directory of the commit that spawned it). Found = the gc is NOT started: status `busy`
+#      (a failed/stalled/timed-out/unmeasured/skipped state is never replaced by it, same rule as a busy gc.pid), the log names the process. Cannot tell (no ps/lsof, either cut at
+#      its cap, a candidate lsof gave no answer for) = the gc is not started either — under doubt the inert state — and the log says so. The END state still judges the run: a
+#      repo that stays over the pack alarm is BAD whatever the status, so a gc that is deferred forever is not silent.
+#   2. The exporter, whose commits are what spawn that run, commits with maintenance.auto=false while this script's lock is held (jsonl-export.sh, commit_archive_snapshot): no
+#      new background repack can start during a compaction run. It resumes the moment the run ends, so git's consolidation is only delayed, never removed.
+# Together they leave one window: a commit that spawned a run in the instant before this script took its lock. If that run is still going when other_repacker looks (the gc
+# starts after the batches, minutes into the run) it is seen; if it has finished it can no longer delete anything. Not covered, on purpose: a git run with --git-dir from another
+# working directory (no cwd in the repo), and one of another user — nothing in this city does either to an archive but this script.
+#
 # THREE STATES, NEVER TWO: a repo whose objects cannot be measured is `unmeasured` (failure),
 # not "0 loose". git is always called with --git-dir=<repo>/.git: without it a broken .git
 # makes git walk UP and act on the enclosing repo (these archives live inside the city's own
@@ -186,6 +207,8 @@ LIST_TIMEOUT_S="${JAC_LIST_TIMEOUT_S:-4}"            # one listing of the object
 LSOF_TIMEOUT_S="${JAC_LSOF_TIMEOUT_S:-6}"            # one lsof look (measured 2-3.5s on this host under load 50)
 RECLAIM_WAIT_S="${JAC_RECLAIM_WAIT_S:-1}"            # between the two looks: the writer may be a step that is still dying
 LSOF="${JAC_LSOF:-}"                                 # test seam; empty = the first lsof on PATH, else /usr/sbin/lsof
+PS="${JAC_PS:-}"                                     # test seam; empty = the first ps on PATH
+PS_TIMEOUT_S="${JAC_PS_TIMEOUT_S:-4}"                # one process listing (ms in practice); other_repacker adds it to one lsof look (above), both before the gc's own budget is computed
 HEADROOM_KIB="${JAC_HEADROOM_KIB:-524288}"           # free space that must remain after the estimate
 ALERT_AFTER="${JAC_ALERT_AFTER:-3}"
 ALERT_EVERY_S="${JAC_ALERT_EVERY_S:-21600}"
@@ -213,7 +236,7 @@ repos=$REPOS
 loose_limit_kib=$LOOSE_LIMIT_KIB loose_alarm_kib=$LOOSE_ALARM_KIB
 packs_limit=$PACKS_LIMIT packs_alarm=$PACKS_ALARM batch_objects=$BATCH_OBJECTS batch_max=$BATCH_MAX max_batches=$MAX_BATCHES
 git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S prune_timeout_s=$PRUNE_TIMEOUT_S prune_min_s=$PRUNE_MIN_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
-list_timeout_s=$LIST_TIMEOUT_S lsof_timeout_s=$LSOF_TIMEOUT_S reclaim_wait_s=$RECLAIM_WAIT_S
+list_timeout_s=$LIST_TIMEOUT_S lsof_timeout_s=$LSOF_TIMEOUT_S reclaim_wait_s=$RECLAIM_WAIT_S ps_timeout_s=$PS_TIMEOUT_S
 alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S check_fresh_s=$CHECK_FRESH_S
 state=$STATE log=$LOG lock=$LOCK
 EOF
@@ -342,6 +365,63 @@ $out
 EOF
   if [ "$hit" -eq 1 ]; then return 1; fi
   return 2
+}
+
+# other_repacker <repo> — is a git process of this user's, other than this script, repacking <repo> right now? (ONE REPACKER AT A TIME, header.) 0 = none, a TRUSTED answer (ps listed the
+# processes and either no git process of a repacking kind exists, or each one that does has its working directory elsewhere / is gone); 1 = found (OTHER_WHO = "pid N: command");
+# 2 = cannot tell. Cannot tell is every answer that is not one of those two: no ps, ps cut at its cap or empty (it always lists itself — an empty list is a ps that did not work, not a
+# quiet machine), no lsof, lsof cut / failed / printing something that is not field lines, a directory line that is not a path, and a candidate that is still alive but that
+# lsof gave no directory line for (not readable).
+# The caller treats 2 like 1: the gc is not started. A detached `git maintenance run --auto` keeps the working directory of the commit that spawned it (measured on a live one
+# 10/10), and so do the repack and pack-objects it starts, so the directory is what says which repo a process is working on — a git process in another repo, or none in this
+# one, is not a reason to wait. Compared against the repo's PHYSICAL path (pwd -P): lsof prints the resolved one, and /tmp is a symlink to /private/tmp on this host.
+other_repacker() {
+  local repo="$1" real psbin lsbin pslist cands pids out rc line pid="" cwd seen=" " found=0 unknown=0 p
+  OTHER_WHO=""
+  real="$(cd "$repo" 2>/dev/null && pwd -P)" || return 2
+  psbin="$PS"; [ -n "$psbin" ] || psbin="$(command -v ps 2>/dev/null)"
+  [ -n "$psbin" ] && [ -x "$psbin" ] || return 2
+  pslist="$(_bounded "$PS_TIMEOUT_S" "$psbin" -U "$(id -u)" -o pid=,command= 2>/dev/null)" || return 2      # this user's processes, tty-less ones (the detached run) included; only they can be repacking an archive this user owns, and for them `kill -0` below is exact
+  [ -n "$pslist" ] || return 2
+  # candidates: a `git` (bare or by path) followed, later on its command line, by a subcommand that repacks or writes packs; this script's own pid is not one
+  cands="$(printf '%s\n' "$pslist" | awk -v me="$$" '
+    $1 == me { next }
+    { g = 0
+      for (i = 2; i <= NF; i++) {
+        if (!g) { if ($i ~ /(^|\/)git$/) g = 1; continue }
+        if ($i ~ /^(maintenance|repack|gc|pack-objects|multi-pack-index|index-pack|prune|prune-packed|commit-graph)$/) { print $1; break }
+      }
+    }')"
+  if [ -z "$cands" ]; then return 0; fi
+  pids="$(printf '%s\n' "$cands" | tr '\n' ',' | sed 's/,$//')"
+  lsbin="$LSOF"; [ -n "$lsbin" ] || lsbin="$(command -v lsof 2>/dev/null)"
+  [ -n "$lsbin" ] || { [ -x /usr/sbin/lsof ] && lsbin=/usr/sbin/lsof; }
+  [ -n "$lsbin" ] && [ -x "$lsbin" ] || return 2
+  out="$(_bounded "$LSOF_TIMEOUT_S" "$lsbin" -w -a -d cwd -F pn -p "$pids" 2>&1)"; rc=$?
+  [ "$rc" -le 1 ] || return 2      # lsof exits 1 when ANY listed pid has no match (one that exited since ps), so 0 and 1 are both answers; the output says which
+  while IFS= read -r line; do
+    case "$line" in
+      "") ;;
+      p*) pid="${line#p}" ;;
+      f*) ;;
+      n*) cwd="${line#n}"; seen="$seen$pid "      # a pid is answered only by its directory line: a `p` line with none leaves it unanswered (checked below)
+          case "$cwd" in
+            "$real"|"$real"/*) found=1; [ -n "$OTHER_WHO" ] || OTHER_WHO="pid $pid: $(printf '%s\n' "$pslist" | awk -v p="$pid" '$1 == p { $1 = ""; sub(/^ +/, ""); print substr($0, 1, 120); exit }')" ;;
+            /*) ;;                  # an absolute path somewhere else: this repo is not what that process is working on
+            *) unknown=1 ;;         # not a path (lsof's own words for a directory it could not read): that is not "somewhere else"
+          esac ;;
+      *) return 2 ;;      # not lsof's field lines: a message, an error text
+    esac
+  done <<EOF
+$out
+EOF
+  if [ "$found" -eq 1 ]; then return 1; fi
+  for p in $(printf '%s\n' "$cands"); do
+    case "$seen" in *" $p "*) continue ;; esac
+    if kill -0 "$p" 2>/dev/null; then unknown=1; fi      # alive, yet lsof gave no directory for it: it may be a repacker of this repo that cannot be read — not "none"
+  done
+  if [ "$unknown" -eq 1 ]; then return 2; fi
+  return 0
 }
 
 # reclaim_leak <before-list-failed 0|1> <before-list> <what> — after a step that did NOT end 0 (STEP_RC): remove the temp files that APPEARED during it, if nobody has them open.
@@ -719,21 +799,33 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
       STATUS="skipped-low-disk"
       log "repo=$repo status=skipped-low-disk (gc) free=$(fmt "$(free_kib "$repo")") need~$(fmt "$need") packs=$M_PACKS"
     else
-      # the same rule as a batch: a kill at gc's OWN cap says the repo is too big for one gc; a kill at the end of the RUN's budget
-      # says nothing about gc (the run that crosses PACKS_LIMIT is one whose tier 1 just spent part of the budget)
-      budget_for "$GC_TIMEOUT_S"
-      run_step "$t_left" -c gc.autoDetach=false gc --quiet; out="$STEP_OUT"; rc="$STEP_RC"
-      if [ "$rc" -eq 0 ]; then STATUS="consolidated"
-      elif [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
-        # it did NOTHING useful (a killed gc keeps no packed work — and leaves a tmp_pack, which run_step has just reclaimed or the garbage measurement will report): it cannot turn a failed / stalled / timed-out / skipped tier 1 green
-        bad_status "$STATUS" || STATUS="deferred"
-        log "  gc was cut by the run deadline after ${t_left}s — the budget ended, not evidence the repo is too big for one gc (retried next run)"
-      elif [ "$rc" -eq 124 ]; then STATUS="timeout"; log "  gc timed out after ${t_left}s (its own cap)"
-      elif printf '%s' "$out" | grep -q 'already running'; then
-        # it did NOTHING: it cannot turn a failed / stalled / timed-out / unmeasured / skipped tier 1 into a green "busy"
+      # ONE REPACKER AT A TIME (header): another git process repacking this repo — the background run an exporter commit spawned — deletes the loose-*.pack batch packs under a
+      # running gc, which then dies at its cruft pass with "could not find pack". Found, or cannot tell: the gc is not started. Like a busy gc.pid it did NOTHING, so it cannot turn a
+      # failed / stalled / timed-out / unmeasured / skipped tier 1 into a green "busy"; the end state (pack alarm below) still judges the run.
+      other_repacker "$repo"; orc=$?
+      if [ "$orc" -eq 1 ]; then
         bad_status "$STATUS" || STATUS="busy"
-        log "  gc already running elsewhere — leaving it to finish"
-      else STATUS="failed"; log "  gc failed rc=$rc: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"; fi
+        log "  gc not started: $OTHER_WHO is repacking $repo — two repackers at once make the gc fail with 'could not find pack' (ga-8z0hy7); retried next run"
+      elif [ "$orc" -ne 0 ]; then
+        bad_status "$STATUS" || STATUS="busy"
+        log "  gc not started: cannot tell whether another git process is repacking $repo (no ps or lsof, one cut at its cap or failed, or a candidate lsof gave no directory for) — under doubt the gc waits; retried next run"
+      else
+        # the same rule as a batch: a kill at gc's OWN cap says the repo is too big for one gc; a kill at the end of the RUN's budget
+        # says nothing about gc (the run that crosses PACKS_LIMIT is one whose tier 1 just spent part of the budget)
+        budget_for "$GC_TIMEOUT_S"
+        run_step "$t_left" -c gc.autoDetach=false gc --quiet; out="$STEP_OUT"; rc="$STEP_RC"
+        if [ "$rc" -eq 0 ]; then STATUS="consolidated"
+        elif [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
+          # it did NOTHING useful (a killed gc keeps no packed work — and leaves a tmp_pack, which run_step has just reclaimed or the garbage measurement will report): it cannot turn a failed / stalled / timed-out / skipped tier 1 green
+          bad_status "$STATUS" || STATUS="deferred"
+          log "  gc was cut by the run deadline after ${t_left}s — the budget ended, not evidence the repo is too big for one gc (retried next run)"
+        elif [ "$rc" -eq 124 ]; then STATUS="timeout"; log "  gc timed out after ${t_left}s (its own cap)"
+        elif printf '%s' "$out" | grep -q 'already running'; then
+          # it did NOTHING: it cannot turn a failed / stalled / timed-out / unmeasured / skipped tier 1 into a green "busy"
+          bad_status "$STATUS" || STATUS="busy"
+          log "  gc already running elsewhere — leaving it to finish"
+        else STATUS="failed"; log "  gc failed rc=$rc: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"; fi
+      fi
     fi
   fi
 

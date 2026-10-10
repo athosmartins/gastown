@@ -81,6 +81,9 @@ SCRUB="${GC_JSONL_SCRUB:-true}"
 # scripts/dolt-gc-maintenance.sh archives pruned rows into (when enabled). The
 # state file stays per pack.
 ARCHIVE_REPO="${GC_JSONL_ARCHIVE_REPO:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/packs/maintenance/jsonl-archive}"
+# The single-flight lock of jsonl-archive-compact.sh (same default path as its LOCK; JAC_LOCK is its test seam, honoured here so one fixture can point both at one
+# directory). commit_archive_snapshot reads it: while a compaction run is in flight, a commit here must not start git's own background maintenance (ga-8z0hy7).
+COMPACT_LOCK="${JAC_LOCK:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/jsonl-archive-compact.lock}"
 # Re-log the archive mode at least this often (seconds) even without a mode
 # transition, so operators who missed the first line still see the current
 # configuration. Default one week.
@@ -697,11 +700,44 @@ ESCALATION
     return 0
 }
 
+# compaction_in_flight — 0 when jsonl-archive-compact.sh is running right now, 1 when it is not. Every `git commit` runs `git maintenance run --auto --quiet --detach`, and on
+# git 2.54 that is a geometric repack that merges and DELETES the loose-*.pack batch packs the compactor made — 19+ minutes of it under this host's load, with no lock file
+# (git's goes with the forking parent). Started while the compactor's consolidating gc runs, it makes the gc die with "could not find pack 'loose-....pack'" (ga-8z0hy7;
+# header of jsonl-archive-compact.sh, ONE REPACKER AT A TIME). So a commit that lands during a compaction run commits with maintenance.auto=false, and the next commit after
+# the run starts git's consolidation as before — it is delayed, never switched off. The lock is the compactor's own: a directory holding its owner's pid. No directory = not in
+# flight. A directory whose owner is dead (a run SIGKILLed by the order's timeout; the compactor itself reclaims it on its next run) is not in flight either — otherwise a
+# compactor that never runs again would keep git's consolidation off for good. (`kill -0` fails the same way for a live process of ANOTHER user; both orders run as one user here,
+# so a failure means dead.) A directory with no readable pid (the instant between its mkdir and its pid write, or a pid file
+# that cannot be read) counts as in flight: under doubt a commit that starts no background run is the harmless side.
+compaction_in_flight() {
+    local owner
+    [ -d "$COMPACT_LOCK" ] || return 1
+    owner="$(cat "$COMPACT_LOCK/pid" 2>/dev/null)" || return 0
+    case "$owner" in ''|*[!0-9]*) return 0 ;; esac
+    kill -0 "$owner" 2>/dev/null
+}
+
 commit_archive_snapshot() {
     local message="$1"
     local context="$2"
+    local maint="on"
 
-    if ! GIT_AUTHOR_NAME="Gas Town Daemon" \
+    if compaction_in_flight; then
+        maint="off"
+        echo "jsonl-export: a compaction run is in flight — $context commit starts no background maintenance (ga-8z0hy7)"
+    fi
+
+    # Two spellings, not one with an optional -c: an empty argument array is an unbound variable under `set -u` on /bin/bash 3.2.
+    if [ "$maint" = off ]; then
+        if ! GIT_AUTHOR_NAME="Gas Town Daemon" \
+            GIT_AUTHOR_EMAIL="daemon@gastown.local" \
+            GIT_COMMITTER_NAME="Gas Town Daemon" \
+            GIT_COMMITTER_EMAIL="daemon@gastown.local" \
+            git -c maintenance.auto=false commit -q -m "$message"; then
+            echo "jsonl-export: $context commit failed" >&2
+            return 1
+        fi
+    elif ! GIT_AUTHOR_NAME="Gas Town Daemon" \
         GIT_AUTHOR_EMAIL="daemon@gastown.local" \
         GIT_COMMITTER_NAME="Gas Town Daemon" \
         GIT_COMMITTER_EMAIL="daemon@gastown.local" \
