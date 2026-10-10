@@ -355,7 +355,7 @@ pce_notify() {
 # ── lock: mkdir-atomic + heartbeat mtime + PID:RANDOM token + single-winner stale reclaim ──
 # Same shape as quality-gate-dispatcher.sh's GATE_LOCK (ga-y0g5x: "the same pattern, do not invent another"), except that
 # the lock dir is emptied with rm -f + rmdir, never rm -rf: it only ever holds the heartbeat file.
-_pce_lock_age() { local mt; mt=$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo ""); [ -n "$mt" ] || { echo 999999999; return 0; }; echo $(( $(date +%s) - mt )); }
+_pce_lock_age() { local mt; mt=$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo ""); [ -n "$mt" ] || { pce_log "event=lock-age-unreadable" "path=$1" "effect=read as fresh: the lock is respected"; echo 0; return 0; }; echo $(( $(date +%s) - mt )); }
 _pce_lock_dead() { local pid; pid=$(head -n1 "$PCE_LOCK_HB" 2>/dev/null | cut -d: -f1 || true); case "$pid" in ''|*[!0-9]*) return 1 ;; esac; kill -0 "$pid" 2>/dev/null && return 1; return 0; }
 _pce_lock_hb() { printf '%s\n' "$PCE_LOCK_TOKEN" > "$PCE_LOCK_HB" 2>/dev/null || true; }
 pce_lock_release() {
@@ -757,7 +757,7 @@ pce_check() {
 }
 
 pce_status() {
-  PCE_NOW=$(_pce_now); PCE_NOW="${PCE_NOW:-0}"
+  PCE_NOW=$(_pce_now); PCE_NOW="${PCE_NOW:-?}"
   echo "ligado: $([ -e "$PCE_ON_FILE" ] && echo SIM || echo nao)  kill-switch: $([ -e "$PCE_OFF_FILE" ] && echo PRESENTE || echo ausente)  include no city.toml: $(case "$(pce_include_state)" in 1) echo sim ;; 0) echo NAO ;; *) echo DESCONHECIDO ;; esac)"
   echo "fragmento: $PCE_FRAGMENT  ($(pce_check | head -1))"
   local lv rc; lv=$(pce_fragment_parse); rc=$?
@@ -766,7 +766,7 @@ pce_status() {
   elif [ -z "$lv" ]; then echo "  niveis no fragmento: (vazio: tudo no commitado)"
   else echo "  niveis no fragmento: $(printf '%s' "$lv" | tr '\n' ' ')"; fi
   [ -e "$PCE_STATE/tripped" ] && echo "DISJUNTOR ARMADO: $(tr '\n' ' ' < "$PCE_STATE/tripped")  (reset: pool-ceiling-engine.sh reset)"
-  echo "escritas hoje: $(pce_daily_writes)/$PCE_DAILY_MAX  orcamento (GC_VARIABLE_SESSION_MAX): $(pce_budget)"
+  echo "escritas hoje: $([ -n "$(_pce_date_of "$PCE_NOW")" ] && pce_daily_writes || echo '?')/$PCE_DAILY_MAX  orcamento (GC_VARIABLE_SESSION_MAX): $(pce_budget)"
   local pool C
   for pool in $PCE_POOLS; do
     C=$(pce_committed "$pool")

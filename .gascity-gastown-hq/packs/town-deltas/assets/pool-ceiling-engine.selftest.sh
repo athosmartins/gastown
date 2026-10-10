@@ -451,6 +451,11 @@ mk_city s15d
 eng_quiet "$T0" 4000 11264 $K1; eng_quiet $((T0 + 1)) 4000 11264 $K1; : > "$C/.gc/pool-ceiling-engine.off"
 eng_quiet $((T0 + 2)) 4000 11264 $K1 "$NODATE"
 eq "$(levels)" "" "the kill switch does not wait for the calendar date: the fragment is emptied all the same"
+mkdir -p "$TMPROOT/noclock"; printf '#!/bin/sh\ncase "$*" in "+%%s") exit 1 ;; esac\nexec /bin/date "$@"\n' > "$TMPROOT/noclock/date"; chmod +x "$TMPROOT/noclock/date"
+mk_city s15e
+eng_quiet "$T0" 4000 11264 $K1; eng_quiet $((T0 + 1)) 4000 11264 $K1
+has "$(ENG_CMD=status eng $((T0 + 2)) 4000 11264 $K1)" "escritas hoje: 1/" "status: with the clock readable, today's writes are counted"
+has "$(ENG_CMD=status eng x 4000 11264 $K1 "PATH=$TMPROOT/noclock:$PATH")" "escritas hoje: ?/" "status: with the clock unreadable, today's writes are '?', never a 0 dated 1970"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -590,6 +595,14 @@ rm -f "$C/.gc/logs/pool-ceiling-engine.log"
 mkdir -p "$LD"
 eng_quiet $((T0 + 900)) 4000 11264
 eq "$(nevents sweep)" "0" "a FRESH lock dir with no heartbeat yet is a holder mid-start: back off"
+rm -f "$LD/heartbeat" 2>/dev/null; rmdir "$LD" 2>/dev/null
+mkdir -p "$TMPROOT/nostat"; printf '#!/bin/sh\nexit 1\n' > "$TMPROOT/nostat/stat"; chmod +x "$TMPROOT/nostat/stat"
+rm -f "$C/.gc/logs/pool-ceiling-engine.log"
+mkdir -p "$LD"; echo "$$:old" > "$LD/heartbeat"; touch -t 202001010000 "$LD/heartbeat"
+eng_quiet $((T0 + 1200)) 4000 11264 "PATH=$TMPROOT/nostat:$PATH"
+eq "$(nevents sweep)" "0" "a heartbeat whose age CANNOT be read (no usable stat) is not 'ancient': the live holder is respected"
+eq "$([ -d "$LD" ] && echo held || echo taken)" "held" "and its lock is left alone"
+eq "$(events lock-age-unreadable | grep -c 'path=')" "1" "and the unreadable age is logged, never silent"
 rm -f "$LD/heartbeat" 2>/dev/null; rmdir "$LD" 2>/dev/null
 fi
 
@@ -762,6 +775,9 @@ M = [
  ("corrupt-state-reads-as-never-written", "10", 'cs=0; us=0; lw="$PCE_NOW"', ':'),
  ("no-lock", "17", 'pce_lock_acquire || return 0', 'pce_lock_acquire || true'),
  ("heartbeat-less-lock-never-reclaimed", "17", 'else age=$(_pce_lock_age "$PCE_LOCK_DIR"); fi', 'else age=0; fi'),
+ ("lock-age-unreadable-reads-as-ancient", "17", 'the lock is respected"; echo 0; return 0; }', 'the lock is respected"; echo 999999999; return 0; }'),
+ ("status-clock-unreadable-reads-as-epoch-zero", "15", 'PCE_NOW=$(_pce_now); PCE_NOW="${PCE_NOW:-?}"', 'PCE_NOW=$(_pce_now); PCE_NOW="${PCE_NOW:-0}"'),
+ ("status-writes-today-without-a-date", "15", '[ -n "$(_pce_date_of "$PCE_NOW")" ] && pce_daily_writes || echo', 'true && pce_daily_writes || echo'),
  ("dry-run-writes", "18", '  if [ "$PCE_DRY" = "1" ]; then\n    local why="levels-change"', '  if false; then\n    local why="levels-change"'),
  ("baseline-from-the-working-tree", "19", 'txt=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "$PCE_CITY" show "HEAD:./agents/$pool/agent.toml" 2>/dev/null) || return 0', 'txt=$(cat "$PCE_CITY/agents/$pool/agent.toml" 2>/dev/null) || return 0'),
  ("render-accepts-any-pool", "5", '    case " $PCE_POOLS " in *" $p "*) ;; *) return 1 ;; esac', '    :'),
