@@ -689,6 +689,19 @@ mkdir -p "$TMPROOT/nodate16"; printf '#!/bin/sh\ncase "${1:-}" in -r|-d) exit 1 
 mk_city s16m; rm -f "$C/.gc/pool-ceiling-engine.toml"
 eng_quiet "$T0" 4000 11264 "PATH=$TMPROOT/nodate16:$PATH"
 eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo ABSENT)" "created" "ENABLED + include=1 + fragment absent + the calendar date unreadable (the sweep ends early): the fragment is re-created EMPTY first, never left absent"
+# the other exits that come before the locked sweep (the lock, the state dir, the clock) must not leave an absent fragment either: the repair is the FIRST thing a sweep does
+mk_city s16p; rm -f "$C/.gc/pool-ceiling-engine.toml"; mkdir -p "$C/.gc/pool-ceiling-engine"; chmod 555 "$C/.gc/pool-ceiling-engine"   # the state dir cannot be written: the lock cannot be taken
+eng_quiet "$T0" 4000 11264; chmod 755 "$C/.gc/pool-ceiling-engine"
+eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo ABSENT)" "created" "ENABLED + include=1 + fragment absent + the state dir read-only (no lock, the sweep ends at once): the fragment is still re-created EMPTY"
+mk_city s16q; rm -f "$C/.gc/pool-ceiling-engine.toml"; : > "$C/.gc/pool-ceiling-engine"   # a FILE where the state dir should be: mkdir -p fails, the sweep ends before it can lock
+eng_quiet "$T0" 4000 11264
+eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo ABSENT)" "created" "ENABLED + include=1 + fragment absent + no state dir can be made: the fragment is still re-created EMPTY"
+has "$(events skip)" "state-dir-unwritable" "and the sweep still says why it stopped"
+mkdir -p "$TMPROOT/noclock16"; printf '#!/bin/sh\nexit 1\n' > "$TMPROOT/noclock16/date"; chmod +x "$TMPROOT/noclock16/date"   # not even the epoch can be read
+mk_city s16r; rm -f "$C/.gc/pool-ceiling-engine.toml"
+eng_quiet "" 4000 11264 "PATH=$TMPROOT/noclock16:$PATH"
+eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo ABSENT)" "created" "ENABLED + include=1 + fragment absent + the CLOCK unreadable: the fragment is still re-created EMPTY"
+has "$(events skip)" "clock-unreadable" "and the sweep still says why it stopped"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -957,7 +970,11 @@ M = [
  ("reset-exits-0-on-failure", "14", 'reset) pce_reset; exit $? ;;', 'reset) pce_reset; exit 0 ;;'),
  ("trip-with-unreadable-date-expires", "14", '[[ "$td" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && ', ''),
  ("clear-streak-survives-any-gap", "7", 'if [ "$lsw" -ne 0 ] && [ $((PCE_NOW - lsw)) -gt "$PCE_STREAK_EXPIRE_SECS" ]; then cs=0; fi', ':'),
- ("enabled-absent-fragment-not-repaired", "16", 'pce_repair_missing_fragment; [ -n "$(_pce_date_of', ': ; [ -n "$(_pce_date_of'),
+ # the repair is the FIRST thing a sweep does: one mutant per exit that used to come before it (the date, the clock, the lock / state dir)
+ ("repair-after-the-date-check", "16", '[ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST:', '[ -e "$PCE_OFF_FILE" ] || [ -z "$(_pce_date_of "$PCE_NOW")" ] || pce_repair_missing_fragment   # FIRST:'),
+ ("repair-after-the-clock-check", "16", '[ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST:', '[ -e "$PCE_OFF_FILE" ] || [ -z "$PCE_NOW" ] || pce_repair_missing_fragment   # FIRST:'),
+ ("repair-after-the-state-dir-and-lock", "16", '[ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST:', '[ -e "$PCE_OFF_FILE" ] || { mkdir -p "$PCE_STATE" 2>/dev/null && [ -w "$PCE_STATE" ] && pce_repair_missing_fragment; }   # FIRST:'),
+ ("repair-never-runs-for-an-enabled-engine", "16", '[ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST:', '[ -e "$PCE_OFF_FILE" ] || [ -e "$PCE_ON_FILE" ] || pce_repair_missing_fragment   # FIRST:'),
  ("preflight-notifies-every-sweep", "14", '&& [ "$pfrc" -eq 1 ] && pce_notify', '; [ "$pfrc" -eq 1 ] && pce_notify'),
  ("write-failed-notifies-every-sweep", "14", '&& pce_notify "pool-ceiling-engine: could not write', '; pce_notify "pool-ceiling-engine: could not write'),
  ("daily-counter-write-failure-is-silent", "10", ' || pce_log "event=state-write-failed" "what=daily-counter" "effect=the breaker may undercount today\'s writes"', ''),

@@ -39,8 +39,8 @@
 #               empties the fragment and trips until tomorrow. A read-back MISMATCH trips until a human runs `reset`.
 #   lock        one instance at a time (mkdir + heartbeat + TTL); a second run exits silently.
 #   include     read from city.toml's PARSED include array (1/0/?). With .on but not a definite 1 no level is written (it could not
-#               apply). With the include 1 or ? and the fragment ABSENT (clean clone / DR) the engine re-creates it EMPTY, first thing in EVERY
-#               sweep (disabled or not; a create that FAILS is logged + notified once, never "nothing to do"). Absent = the next reload breaks.
+#               apply). With the include 1 or ? and the fragment ABSENT (clean clone / DR) the engine re-creates it EMPTY, before ANYTHING else in
+#               a sweep (clock, state dir, lock, date, trip; .off's restore does it itself). A create that FAILS is logged + notified once, never "nothing to do".
 #
 # SWITCHES (files under $GC_CITY/.gc, all instant, none needs a plist edit):
 #   pool-ceiling-engine.on    the engine acts ONLY with this file. Without it: silent, no level written (bar the repair above) - and the
@@ -524,15 +524,15 @@ pce_repair_missing_fragment() {
 pce_sweep() {
   local rc=0
   PCE_NOW=$(_pce_now)
+  [ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST: no early exit below (clock, state dir, lock, date, trip, disabled) may leave an ABSENT fragment unrepaired; .off has its own, loud, restore (step 1)
   if [ -z "$PCE_NOW" ]; then PCE_NOW="?"; pce_log "event=skip" "reason=clock-unreadable"; return 0; fi
 
   local has_on=0 has_off=0 include
   [ -e "$PCE_ON_FILE" ] && has_on=1; [ -e "$PCE_OFF_FILE" ] && has_off=1
   include=$(pce_include_state)
 
-  # Disabled: silent and inert — except the one repair that cannot make anything worse.
+  # Disabled: silent and inert (the repair above is the one thing that cannot make anything worse).
   if [ "$has_on" = "0" ] && [ "$has_off" = "0" ] && [ "$PCE_DRY" != "1" ]; then
-    pce_repair_missing_fragment
     return 0
   fi
 
@@ -560,8 +560,8 @@ _pce_sweep_locked() {
     return 0
   fi
 
-  # 1b. an ABSENT fragment that city.toml includes (or may) breaks the next reload: repaired (EMPTY) before anything can end this sweep. Then the date, which dates the daily counter and the trip (unreadable, both would read as "a new day")
-  pce_repair_missing_fragment; [ -n "$(_pce_date_of "$PCE_NOW")" ] || { pce_log_change "date-unreadable" "event=skip" "reason=cannot compute the calendar date of $PCE_NOW: the daily breaker and the trip cannot be dated - nothing written"; return 0; }
+  # 1b. the calendar date dates the daily counter and the trip: where it cannot be computed both would read as "a new day" (breaker off, trip expired)
+  [ -n "$(_pce_date_of "$PCE_NOW")" ] || { pce_log_change "date-unreadable" "event=skip" "reason=cannot compute the calendar date of $PCE_NOW: the daily breaker and the trip cannot be dated - nothing written"; return 0; }
 
   # 2. tripped?
   if [ -e "$PCE_STATE/tripped" ]; then
