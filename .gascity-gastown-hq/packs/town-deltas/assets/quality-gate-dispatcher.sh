@@ -368,6 +368,110 @@ gate_nudge() {
   return 0
 }
 
+# ── ga-g3m45n: o nudge carrega um PONTEIRO, não a tarefa inteira ──────────────
+# MEDIDO 10/10: a tarefa de revisão tem até 527 KB (o diff vai dentro), e o engine reescreve o
+# `.gc/nudges/state.json` INTEIRO a cada operação (flock + parse + MarshalIndent) — 3 `gc nudge
+# poll` a cada 2 s mais os drains de cada sessão. 4,4 MB dos 5,2 MB do arquivo eram tarefas de
+# revisão pendentes (as que abrem com o cabeçalho do prompt): uma por revisor no envio inicial, outra
+# a cada retry de ACK, outra a cada re-convocação. O MESMO texto já vai na verdict bead (canal durável, ga-67hae), e
+# o prompt do gate-reviewer já trata essa bead como o canal PRIMÁRIO — o nudge é só o atalho.
+#
+# Regra: o ponteiro só substitui a tarefa quando a tarefa está COMPROVADAMENTE na bead. Não é o
+# exit code do `bd comment` que prova isso (o call site engole a falha de propósito, ACEITE #3 do
+# ga-590nx, e um comentário de 500 KB pode ser rejeitado/truncado pelo store): é reler a bead.
+# Um ponteiro para uma bead vazia deixa o revisor sem tarefa — a pior resposta possível.
+
+# gate_review_task_embedded <verdict_bead> <task> — a tarefa está legível, inteira, num comentário
+# da verdict bead?
+#   0 = sim (o comentário abre com a 1ª linha da tarefa E contém a última — o final carrega os
+#       comandos `bd` do veredito, o que um truncamento perderia primeiro)
+#   1 = li os comentários e a tarefa NÃO está lá (ou está truncada)
+#   2 = não consegui saber (bd falhou, saída ilegível, sem linha-sonda para comparar)
+# Quem chama trata 1 e 2 igual — "não embutida" → o nudge leva a tarefa inteira (o comportamento
+# de antes, sem perda) — mas os dois ficam separados aqui para o log dizer qual foi.
+# A sonda é por LINHA (1ª e última não-vazia), não por N caracteres: cortar no meio de um caractere
+# multibyte (o "—" do cabeçalho) num locale C daria um falso "ausente".
+gate_review_task_embedded() {
+  local _vb="${1:-}" _task="${2:-}" _first _last _json _rc=0
+  [ -n "$_vb" ] || return 2
+  _first=$(printf '%s\n' "$_task" | awk 'NF{print; exit}')
+  _last=$(printf '%s\n' "$_task" | awk 'NF{l=$0} END{print l}')
+  [ -n "$_first" ] && [ -n "$_last" ] || return 2
+  # falhou → 2 (não sei), nunca "vazio": bd fora do ar não pode virar "a tarefa não está lá" nem "está".
+  _json=$(bd -C "$GC_CITY" comments "$_vb" --json 2>/dev/null) || return 2
+  printf '%s' "$_json" | jq -e 'type == "array"' >/dev/null 2>&1 || return 2
+  printf '%s' "$_json" | jq -e --arg f "$_first" --arg l "$_last" \
+    'any(.[]; (.text // "") as $t | ($t | startswith($f)) and ($t | contains($l)))' >/dev/null 2>&1 || _rc=$?
+  case "$_rc" in
+    0) return 0 ;;
+    1) return 1 ;;   # jq -e: o resultado foi false/null — li tudo e a tarefa não está lá
+    *) return 2 ;;   # erro de execução do jq — não sei
+  esac
+}
+
+# gate_review_nudge_message <pointer_ok> <task> <reviewer_idx> <required> <branch> <sha> <verdict_bead>
+# → imprime o texto que vai no nudge/submit. PURA (sem I/O): o call site decide pointer_ok.
+#   pointer_ok = 1  → ponteiro curto (~0,5 KB: o texto fixo mais o branch, cortado em 200 caracteres, a sha e o id
+#                     da bead — este último não é cortado de propósito, um id truncado apontaria para outra bead).
+#   qualquer outra coisa (0, vazio, lixo) → a tarefa inteira, como antes. Na dúvida entrega-se a
+#   tarefa: custa banda no queue, mas nunca deixa o revisor sem ela.
+# A ASSINATURA do ponteiro (o cabeçalho que o prompt do gate-reviewer procura no nudge, para não ler
+# o ponteiro como "ainda sem tarefa") é TIRADA DA PRÓPRIA TAREFA — o trecho antes do primeiro " — " da
+# 1ª linha. Este arquivo não pode carregar o texto do prompt (gnr3tw: um prompt só, na lib de tarefa;
+# pre-gate-review.selftest.sh trava isso), e derivar dela também garante que o ponteiro acompanha o
+# cabeçalho se alguém o renomear. Cabeçalho irreconhecível → a tarefa inteira (o estado inerte).
+gate_review_nudge_message() {
+  local _ok="${1:-0}" _task="${2:-}" _idx="${3:-?}" _req="${4:-?}" _br="${5:-}" _sha="${6:-}" _vb="${7:-}" _sig
+  if [ "$_ok" = "1" ] && [ -n "$_vb" ]; then
+    _sig=$(printf '%s\n' "$_task" | awk 'NF{print; exit}')
+    case "$_sig" in
+      *" — "*) _sig="${_sig%% — *}" ;;
+      *)       _sig="" ;;
+    esac
+    if [ -n "$_sig" ]; then
+      printf '%s — POINTER (ga-g3m45n). You are reviewer %s of %s for branch %s @ %s. Your FULL task (your lens, the diff, and the EXACT bd commands to submit your verdict) is embedded on verdict bead %s — this nudge carries no diff on purpose. Run: gc bd show %s — read its embedded comment and follow it exactly. Use ONLY that verdict bead.' \
+        "$(printf '%s' "$_sig" | cut -c1-80)" "$_idx" "$_req" "$(printf '%s' "$_br" | cut -c1-200)" "$(printf '%s' "$_sha" | cut -c1-40)" "$_vb" "$_vb"
+      return 0
+    fi
+  fi
+  printf '%s' "$_task"
+}
+
+# gate_deliver_review_task <slot0> <session_id> <task> <reviewer_idx> <verdict_bead> <mode: send|retry>
+# O ÚNICO caminho que põe a tarefa de um revisor na fila de nudges (envio inicial, re-convocação e
+# retry de ACK passam todos por aqui) — assim a regra "ponteiro ou tarefa inteira, e nunca empilhar"
+# vive num lugar só e um teste exerce o código real.
+#   mode=send   entrega (nudge --delivery queue; se a fila recusar, `session submit`).
+#   mode=retry  igual, MAS não faz nada se a fila já ACEITOU um nudge desta tarefa para esta sessão
+#               (REVIEWER_NUDGE_SENT[slot]=1): "ainda sem ACK" quer dizer que a sessão não o consumiu
+#               (subindo ou travada), e uma 2ª cópia não muda isso — só engorda o state.json (ga-g3m45n).
+# Retorna: 0 = enfileirado por nudge · 2 = entregue por submit · 10 = retry dispensado (já enfileirado)
+#          · 1 = NÃO entregue (REVIEWER_NUDGE_SENT fica como estava: 0 deixa o próximo retry tentar).
+# Seta GATE_LAST_NUDGE_CHARS (tamanho do que foi enviado) para o log do chamador.
+# REVIEWER_NUDGE_SENT só vira 1 numa aceitação — "enviei" e "tentei enviar" não são o mesmo estado.
+GATE_LAST_NUDGE_CHARS=0
+gate_deliver_review_task() {
+  local _slot="${1:-0}" _sid="${2:-}" _task="${3:-}" _idx="${4:-?}" _vb="${5:-}" _mode="${6:-send}" _msg
+  if [ "$_mode" = "retry" ] && [ "${REVIEWER_NUDGE_SENT[$_slot]:-0}" = "1" ]; then
+    return 10
+  fi
+  # vazio → n/a (a função devolve sempre texto); falhou → a tarefa inteira, nunca uma mensagem vazia
+  _msg=$(gate_review_nudge_message "${REVIEWER_POINTER_OK[$_slot]:-0}" "$_task" "$_idx" "${REQUIRED_REVIEWERS:-?}" "${BRANCH:-}" "${BRANCH_SHA:-}" "$_vb") \
+    || _msg="$_task"
+  GATE_LAST_NUDGE_CHARS=${#_msg}
+  if gate_nudge "$_sid" "$_msg" --delivery queue 2>/dev/null; then
+    REVIEWER_NUDGE_SENT[$_slot]=1
+    return 0
+  fi
+  # O `submit` é só para a ida inicial/re-convocação: um retry que a fila recusou (sessão sumida) não
+  # tem o que `submit` consertar, e o log do chamador já diz que a re-fila não foi entregue.
+  if [ "$_mode" != "retry" ] && $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session submit "$_sid" "$_msg" 2>/dev/null; then
+    REVIEWER_NUDGE_SENT[$_slot]=1
+    return 2
+  fi
+  return 1
+}
+
 # ga-fe5at: cascade extracted from ga-z3i2p's Step 5a fix (quality-gate-guard.sh)
 # — the SAME undeliverable-bare-name defect existed at 4 more mail(NOTIFY_AUTHOR)
 # sites in THIS file, each copy-pasting a bare `gc mail send "$NOTIFY_AUTHOR"`
@@ -1083,7 +1187,7 @@ respawn_reviewer_slot() {
   local _idx="$1"
   local _rev=$(( _idx + 1 ))
   local _err_file="/tmp/gate-reviewer-respawn-err-$$.${_idx}"
-  local _json _new_sid
+  local _json _new_sid _rs_rc _rs_emb_rc
   _json=$(gc --city "$GC_CITY" session new gate-reviewer \
     --no-attach \
     --title "gate-reviewer-${_rev} (re-convened): $BRANCH" \
@@ -1096,6 +1200,11 @@ respawn_reviewer_slot() {
     return 1
   fi
   SESSION_IDS[$_idx]="$_new_sid"
+  # ga-g3m45n: a NEW session has had no nudge yet, and its pointer eligibility is decided below from THIS
+  # re-assignment — nothing carries over from the dead session. (A stale NUDGE_SENT=1 would not stop the
+  # `send` below, but it WOULD make a later ACK retry believe this session already holds a copy.)
+  REVIEWER_NUDGE_SENT[$_idx]=0
+  REVIEWER_POINTER_OK[$_idx]=0
   # ── ga-vdurb (PRIMARY FIX): re-point the DURABLE PULL channel at the NEW
   # session. The initial-spawn block (~Step 7/8) assigned this slot's verdict bead
   # VERDICT_BEAD_IDS[_idx] to the FIRST session's NAME; that session is now dead,
@@ -1124,6 +1233,18 @@ respawn_reviewer_slot() {
     else
       warn "  Re-convene: verdict bead ${VERDICT_BEAD_IDS[$_idx]} re-assignment to ${_new_sname} DID NOT VERIFY after retries — comment embedded as a last-resort channel, but neither --assignee nor metadata.gc.session_name confirmed (bead labeled verdict:assignee-degraded, ga-mo7q/ga-qqtoo). Re-convened reviewer may not find this via its poll; outer timeout is the backstop (ga-590nx)."
     fi
+    # ga-g3m45n: pointer only if the NEW session's assignment verified AND the task is provably on the
+    # bead. A slot whose task was read back at spawn is still there (comments are not removed); one that
+    # was not is read again now — the re-embed just above may have landed what the first write lost.
+    # 0 = found, 1 = absent/truncated, 2 = unreadable: only 0 counts, the rest keep the full task.
+    if [ "${REVIEWER_TASK_EMBEDDED[$_idx]:-0}" != "1" ]; then
+      _rs_emb_rc=0
+      gate_review_task_embedded "${VERDICT_BEAD_IDS[$_idx]}" "${REVIEW_TASKS[$_idx]}" || _rs_emb_rc=$?
+      if [ "$_rs_emb_rc" = "0" ]; then REVIEWER_TASK_EMBEDDED[$_idx]=1; fi
+    fi
+    if [ "$_vb_reassign_verified" = "1" ] && [ "${REVIEWER_TASK_EMBEDDED[$_idx]:-0}" = "1" ]; then
+      REVIEWER_POINTER_OK[$_idx]=1
+    fi
   else
     warn "  Re-convene: spawn JSON had no session_name for slot ${_idx} — durable channel NOT re-pointed (verdict-poll + outer timeout backstop)."
   fi
@@ -1151,13 +1272,15 @@ respawn_reviewer_slot() {
   # sessão não existe — medido 07/08), mas imune a esse exit code regredir. Aqui
   # o fallback importa: numa re-convocação a sessão nova pode não ter subido, e
   # um `if` que nunca falha logaria "re-queued" sem nada entregue.
-  if gate_nudge "$_new_sid" "${REVIEW_TASKS[$_idx]}" --delivery queue 2>/dev/null; then
-    log "  Re-convene: review task re-queued to fresh session ${_new_sid} (slot ${_idx}, verdict bead ${VERDICT_BEAD_IDS[$_idx]} reused)."
-  elif $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session submit "$_new_sid" "${REVIEW_TASKS[$_idx]}" 2>/dev/null; then
-    log "  Re-convene: review task re-submitted to fresh session ${_new_sid} (slot ${_idx})."
-  else
-    warn "  Re-convene: queue/submit to fresh session ${_new_sid} failed (slot ${_idx}) — verdict-poll + outer timeout backstop."
-  fi
+  # ga-g3m45n: pointer or full task by the same rule as the initial send; NUDGE_SENT only on acceptance
+  # (both live in gate_deliver_review_task — this slot's NUDGE_SENT/POINTER_OK were reset above for the NEW session).
+  _rs_rc=0
+  gate_deliver_review_task "$_idx" "$_new_sid" "${REVIEW_TASKS[$_idx]}" "$_rev" "${VERDICT_BEAD_IDS[$_idx]}" send || _rs_rc=$?
+  case "$_rs_rc" in
+    0) log "  Re-convene: review task re-queued to fresh session ${_new_sid} (slot ${_idx}, verdict bead ${VERDICT_BEAD_IDS[$_idx]} reused, ${GATE_LAST_NUDGE_CHARS} chars)." ;;
+    2) log "  Re-convene: review task re-submitted to fresh session ${_new_sid} (slot ${_idx})." ;;
+    *) warn "  Re-convene: queue/submit to fresh session ${_new_sid} failed (slot ${_idx}) — verdict-poll + outer timeout backstop." ;;
+  esac
   return 0
 }
 
@@ -17362,6 +17485,18 @@ SESSION_IDS=()
 REVIEW_TASKS=()
 REVIEWER_PEEK_BASELINE=()
 REVIEWER_ACKED=()
+# ga-g3m45n: three more per-slot arrays, written BY INDEX (slot = reviewer index - 1). A slot nobody
+# filled reads as 0 everywhere via ${…[$k]:-0}, i.e. exactly the behaviour before the fix: the full task
+# in the nudge, retries not suppressed. The spawn loop below fills slots 0..N-1; the E5 extra slot is
+# filled by gate_e5_step7_extra (gate-e5-second-reviewer.lib.sh).
+#   REVIEWER_TASK_EMBEDDED[k] 1 = the full task was READ BACK from slot k's verdict bead (gate_review_task_embedded).
+#   REVIEWER_POINTER_OK[k]    1 = slot k's CURRENT session may be nudged with a pointer: its verdict bead is
+#                                 verified-assigned to that session AND the task is embedded on it.
+#   REVIEWER_NUDGE_SENT[k]    1 = a nudge/submit carrying the task (or its pointer) was ACCEPTED for slot k's
+#                                 CURRENT session. Step 7b reads it to not stack a second copy in the queue.
+REVIEWER_TASK_EMBEDDED=()
+REVIEWER_POINTER_OK=()
+REVIEWER_NUDGE_SENT=()
 
 # ── ga-zl277: guaranteed reviewer-session cleanup on EVERY exit path ───────────
 # cleanup_reviewer_sessions() itself is now hoisted (before Phase C, ga-eqjo) so
@@ -17598,6 +17733,11 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
   # is the reliable fallback that survives nudge-injection races. All guarded
   # with || true (set -euo pipefail safe).
   SESSION_NAME=$(echo "$SESSION_JSON" | jq -r '.session_name // empty')
+  # ga-g3m45n: inert default. The nudge carries a POINTER only if the block below PROVES the durable
+  # channel (assignment verified AND the task read back from the bead); no session_name, a lost
+  # assignment, a lost/truncated comment or an unreadable bead all leave these at 0 = full task in the nudge.
+  _task_emb=0
+  _ptr_ok=0
   if [ -n "$SESSION_NAME" ]; then
     # ga-vdurb (SECONDARY FIX): the assign used to be a bare `|| true`-swallowed
     # write, so an intermittent lost write under load left the bead assignee=None
@@ -17630,6 +17770,21 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
     else
       warn "  Verdict bead $VERDICT_BEAD_ID durable-pull assignment to $SESSION_NAME DID NOT VERIFY after retries — task comment embedded as a last-resort channel, but neither --assignee nor metadata.gc.session_name confirmed (bead labeled verdict:assignee-degraded, ga-mo7q/ga-qqtoo). Reviewer may not find this via its poll; outer timeout is the backstop (ga-590nx)."
     fi
+    # ga-g3m45n: the `bd comment` above is best-effort (|| true, ACEITE #3), so "embedded" is NOT known
+    # yet — read the bead back. Three answers, none collapsed into another: 0 = the task is there,
+    # 1 = comments read and it is not (lost or truncated write), 2 = could not tell. Only 0 + a verified
+    # assignment lets the nudge shrink to a pointer; 1 and 2 keep the full task in the nudge.
+    _emb_rc=0
+    gate_review_task_embedded "$VERDICT_BEAD_ID" "$REVIEW_TASK" || _emb_rc=$?
+    if [ "$_emb_rc" = "0" ]; then
+      _task_emb=1
+      if [ "$_vb_assign_verified" = "1" ]; then _ptr_ok=1; fi
+    fi
+    if [ "$_ptr_ok" = "1" ]; then
+      log "  Verdict bead $VERDICT_BEAD_ID: task read back OK + assignment verified — pointer-eligible (the ${#REVIEW_TASK}-char task stays on the bead; the delivery line below says how many chars the nudge really carried, ga-g3m45n)"
+    else
+      warn "  Verdict bead $VERDICT_BEAD_ID: durable channel NOT proven (assign_verified=$_vb_assign_verified, task read-back rc=$_emb_rc: 0=found 1=absent/truncated 2=unreadable) — the nudge carries the FULL task (ga-g3m45n)"
+    fi
   else
     warn "  Initial slot $i: spawn JSON had no session_name — durable pull channel NOT wired (verdict-poll + outer timeout backstop)."
   fi
@@ -17646,6 +17801,11 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
   fi
   REVIEWER_PEEK_BASELINE+=("$_peek_base")
   REVIEWER_ACKED+=(0)
+  # ga-g3m45n: by index (slot = i-1, the same alignment as the four arrays above), so a slot nobody
+  # fills still reads 0. The message is built ONCE per slot; the submit fallback below sends the same.
+  REVIEWER_TASK_EMBEDDED[$((i-1))]="$_task_emb"
+  REVIEWER_POINTER_OK[$((i-1))]="$_ptr_ok"
+  REVIEWER_NUDGE_SENT[$((i-1))]=0
 
   # Deliver the review task via `queue` (enqueue-and-return). ga-noxbv root cause:
   # `--delivery immediate` typed the task into a freshly-spawned headless session
@@ -17660,13 +17820,16 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
   # onde um falso sucesso custa mais caro (gate-run que não faz nada, descoberto
   # só no timeout). Hoje o exit code do gc é honesto; o helper garante que o
   # `elif`/`else` continue alcançável mesmo se deixar de ser.
-  if gate_nudge "$SESSION_ID" "$REVIEW_TASK" --delivery queue 2>/dev/null; then
-    log "  Review task QUEUED to session $SESSION_ID (reviewer $i) — ACK pending (Step 7b)"
-  elif $GATE_NUDGE_TIMEOUT gc --city "$GC_CITY" session submit "$SESSION_ID" "$REVIEW_TASK" 2>/dev/null; then
-    log "  Review task SUBMITTED to session $SESSION_ID (reviewer $i) — ACK pending (Step 7b)"
-  else
-    warn "  Initial queue/submit to session $SESSION_ID failed — Step 7b will retry (reviewer $i)"
-  fi
+  # ga-g3m45n: gate_deliver_review_task builds the payload (pointer when this slot's durable channel is
+  # proven, the full task otherwise) and sets REVIEWER_NUDGE_SENT ONLY on an accepted queue/submit — a
+  # failed delivery leaves it 0, which is exactly what lets Step 7b retry.
+  _dl_rc=0
+  gate_deliver_review_task "$((i-1))" "$SESSION_ID" "$REVIEW_TASK" "$i" "$VERDICT_BEAD_ID" send || _dl_rc=$?
+  case "$_dl_rc" in
+    0) log "  Review task QUEUED to session $SESSION_ID (reviewer $i, ${GATE_LAST_NUDGE_CHARS} chars) — ACK pending (Step 7b)" ;;
+    2) log "  Review task SUBMITTED to session $SESSION_ID (reviewer $i, ${GATE_LAST_NUDGE_CHARS} chars) — ACK pending (Step 7b)" ;;
+    *) warn "  Initial queue/submit to session $SESSION_ID failed — Step 7b will retry (reviewer $i)" ;;
+  esac
   # ga-ufskhy 07/10: the verdict budget clock starts when the FIRST reviewer has its task, not when the
   # run bead was created (median 153 s, p90 350 s earlier). Phase C reads this label; missing → created.
   if [ "$i" = "1" ]; then
@@ -17841,18 +18004,35 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
       if [ "$(session_peek_reports_dead "$_ack_peek_stderr")" = "1" ] && [ "$_ack_booting" != "1" ] && [ "$_ack_spawn_age" -ge "$RECONVENE_GRACE_SECS" ]; then
         warn "  ACK skip (ga-aknox): reviewer $((k+1)) session=$_sid drained during startup (stale_async_start race) — nudge skipped, re-convene will re-spawn"
       else
-        if [ "$_ack_booting" = "1" ]; then
+        # ga-g3m45n: gate_deliver_review_task in retry mode does NOTHING (rc 10) when the queue already
+        # ACCEPTED a nudge carrying this slot's task for THIS session (REVIEWER_NUDGE_SENT is set only on an
+        # accepted queue/submit and reset when the slot is re-spawned). "No ACK yet" then means the session
+        # has not consumed it — still booting, or wedged — and a second copy changes neither: a wedged
+        # session is caught by the run's outer verdict timeout and gate-recovery-watchdog (the in-poll
+        # re-convene was retired by ga-eqjo), a booting one gets the first copy when it is input-ready.
+        # What a second copy DOES do is grow .gc/nudges/state.json, which the engine re-reads and re-writes
+        # whole every 2 s (measured 10/10: 4.4 MB of pending review tasks, 527 KB each). The durable pull
+        # (assigned verdict bead) stays the backstop, so nothing is lost by not re-queuing.
+        # Otherwise (the first copy was refused) it re-sends — a pointer when the slot's durable channel is
+        # proven, the full task when not; an unset slot (e.g. the E5 extra) reads 0 = full task, as before.
+        if [ "${REVIEWER_NUDGE_SENT[$k]:-0}" = "1" ]; then
+          warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — its task nudge is already queued for session=$_sid; NOT stacking another copy (ga-g3m45n)"
+        elif [ "$_ack_booting" = "1" ]; then
           warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — session still booting (state=creating, spawn_age=${_ack_spawn_age}s, ga-xwdl) — re-queuing task session=$_sid"
         else
           warn "  No ACK from reviewer $((k+1)) (attempt $_ack_attempt/$ACK_MAX_RETRIES) — re-queuing task session=$_sid"
         fi
-        # warn no lugar de `|| true` (ga-vne2): a re-fila é best-effort de
+        # O `case` abaixo faz o papel do antigo `|| warn` (ga-vne2): a re-fila é best-effort de
         # propósito (o laço de ACK continua), mas engolir o DIAGNÓSTICO junto não
         # é. Se a sessão sumiu, insistir nela é inútil e o log precisa dizer isso
         # — senão o operador vê N tentativas idênticas sem nenhuma pista de que o
         # destino não existe mais.
-        gate_nudge "$_sid" "${REVIEW_TASKS[$k]}" --delivery queue 2>/dev/null \
-          || warn "  Re-fila para $_sid NÃO entregue (sessão inexistente ou nudge falhou) — reviewer $((k+1))"
+        _rq_rc=0
+        gate_deliver_review_task "$k" "$_sid" "${REVIEW_TASKS[$k]}" "$((k+1))" "$_vb" retry || _rq_rc=$?
+        case "$_rq_rc" in
+          0|10) : ;;   # 0 = re-queued now; 10 = already queued (the warn above said so)
+          *) warn "  Re-fila para $_sid NÃO entregue (sessão inexistente ou nudge falhou) — reviewer $((k+1))" ;;
+        esac
       fi
     fi
   done

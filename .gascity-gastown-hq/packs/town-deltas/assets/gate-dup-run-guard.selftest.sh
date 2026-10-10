@@ -199,7 +199,8 @@ echo "── 4. drift guard: reviewer task-delivery bounded by \$GATE_NUDGE_TIME
 has "$DISPATCHER" 'GATE_NUDGE_TIMEOUT="\$\{GATE_NUDGE_TIMEOUT:-timeout \$GATE_NUDGE_TIMEOUT_SECS\}"' "GATE_NUDGE_TIMEOUT prefix defined (timeout N)"
 # Every reviewer task-delivery nudge/submit must carry the prefix. There are
 # exactly THREE delivery sites: initial spawn (queue+submit), ACK re-queue, and
-# re-convene (queue+submit) = 5 calls total.
+# re-convene (queue+submit) = 5 calls total — until ga-g3m45n, which put all three behind
+# gate_deliver_review_task (see the counts below).
 # ga-vne2 (2026-08-08) centralized the 3 `nudge` sites (initial-spawn-queue,
 # ACK-re-queue, re-convene-queue) behind a single gate_nudge() wrapper that
 # applies the prefix once, internally — so a flat grep of the raw inline
@@ -220,7 +221,16 @@ fi
 RAW_SUBMIT_SITES=$(grep -cE '\$GATE_NUDGE_TIMEOUT gc --city "\$GC_CITY" session submit' "$DISPATCHER")
 GATE_NUDGE_CALLSITES=$(grep -cE '\bgate_nudge "' "$DISPATCHER")
 DELIVERY_PREFIXED=$((RAW_SUBMIT_SITES + GATE_NUDGE_CALLSITES))
-eq "all 5 reviewer delivery sites are timeout-bounded (raw submit + gate_nudge call sites)" "$DELIVERY_PREFIXED" "5"
+# ga-g3m45n: the 3 delivery SITES (initial spawn, ACK re-queue, re-convene) no longer each carry their own
+# gate_nudge/submit pair — they all call ONE function, gate_deliver_review_task, which holds the only
+# gate_nudge call (queue) and the only raw submit (fallback, send mode only). So the primitives to count
+# are 2 (each timeout-bound: the wrapper internally, the submit by its prefix), and the thing that has to
+# stay at 3 is the number of sites routed through that function — a 4th delivery path that bypasses it
+# (and therefore the timeout, the pointer rule and the no-stacking rule) would show up as a lower count here
+# plus an un-prefixed hit in UNGUARDED below.
+eq "reviewer delivery primitives are timeout-bounded (1 gate_nudge call + 1 raw submit, both inside gate_deliver_review_task)" "$DELIVERY_PREFIXED" "2"
+DELIVER_FN_CALLSITES=$(grep -cE '\bgate_deliver_review_task "' "$DISPATCHER")
+eq "all 3 reviewer delivery sites (initial spawn, ACK re-queue, re-convene) go through gate_deliver_review_task" "$DELIVER_FN_CALLSITES" "3"
 # No reviewer task-delivery nudge/submit may call gc WITHOUT the prefix. (Author
 # notifications use --delivery wait-idle and are intentionally excluded.)
 UNGUARDED=$(grep -nE 'gc --city "\$GC_CITY" session (nudge|submit) "\$(SESSION_ID|_new_sid|_sid)"' "$DISPATCHER" \

@@ -420,6 +420,8 @@ gate_e5_admit_decision() {
 # create is therefore read back (gate_e5_find_extra_bead): found -> the bead exists, use it; not found -> there really is none; could not
 # read -> unknown, declined under its own reason so the apuração does not file it with the clean "no bead" case.
 GATE_E5_EXTRA_VB=""; GATE_E5_EXTRA_SID=""; GATE_E5_EXTRA_SNAME=""; GATE_E5_EXTRA_TASK=""; GATE_E5_EXTRA_PEEK=""
+# ga-g3m45n: what the extra slot needs to join the dispatcher's per-slot nudge state (REVIEWER_TASK_EMBEDDED / _POINTER_OK / _NUDGE_SENT).
+GATE_E5_EXTRA_EMB=0; GATE_E5_EXTRA_PTR_OK=0; GATE_E5_EXTRA_NUDGE_SENT=0
 GATE_E5_EXTRA_WINDOW_SECS=""   # set by the first-fail hook just before it spawns; logged on e5_extra_spawn
 GATE_E5_DECLINE_REASON=""
 gate_e5_decline() {
@@ -439,8 +441,9 @@ gate_e5_find_extra_bead() {
 }
 gate_e5_spawn_extra() {
   local _run="$1" _vb1="$2" _task1="$3" _e5_trig="$4"
-  local _cap _errf _err _sjson _sid _sname _skey _vb2 _task2 _peek _peek_out _vassign=0 _n _meta _metaargs=() _found _frc
+  local _cap _errf _err _sjson _sid _sname _skey _vb2 _task2 _peek _peek_out _vassign=0 _n _meta _metaargs=() _found _frc _emb_rc _nmsg
   GATE_E5_EXTRA_VB=""; GATE_E5_EXTRA_SID=""; GATE_E5_EXTRA_SNAME=""; GATE_E5_EXTRA_TASK=""; GATE_E5_EXTRA_PEEK=""
+  GATE_E5_EXTRA_EMB=0; GATE_E5_EXTRA_PTR_OK=0; GATE_E5_EXTRA_NUDGE_SENT=0
   GATE_E5_DECLINE_REASON=""
 
   [ -n "$_task1" ] || { gate_e5_decline "reviewer-1-task-unavailable"; return 1; }
@@ -527,6 +530,17 @@ Best-effort by design: if this reviewer does not deliver, the run is decided by 
     if type assign_verdict_bead_verified >/dev/null 2>&1 && assign_verdict_bead_verified "$_vb2" "$_sname" "E5 extra slot"; then _vassign=1; fi
     bd -C "$GC_CITY" comment "$_vb2" "$_task2" 2>/dev/null \
       || warn "  E5: could not embed the task on verdict bead $_vb2 — the durable pull has nothing to read; the queued nudge is the only channel (a reviewer that never starts is retired by the timeout)."
+    # ga-g3m45n: the comment above can fail OR be truncated without saying so (a big-diff task is the one most likely to be) —
+    # read it back. 0 = found, 1 = comments read and it is not there, 2 = could not tell; only 0 + a verified assignment
+    # lets the nudge be a pointer, everything else keeps the full task in it (the extra slot carries the biggest tasks of all).
+    if type gate_review_task_embedded >/dev/null 2>&1; then
+      _emb_rc=0
+      gate_review_task_embedded "$_vb2" "$_task2" || _emb_rc=$?
+      if [ "$_emb_rc" = "0" ]; then
+        GATE_E5_EXTRA_EMB=1
+        if [ "$_vassign" = "1" ]; then GATE_E5_EXTRA_PTR_OK=1; fi
+      fi
+    fi
   else
     warn "  E5: extra reviewer spawn JSON had no session_name — durable pull channel NOT wired (nudge + timeout are the only channels)."
   fi
@@ -537,11 +551,19 @@ Best-effort by design: if this reviewer does not deliver, the run is decided by 
   if _peek_out=$(gc --city "$GC_CITY" session peek "$_sid" --lines 40 2>/dev/null); then
     _peek=$(printf '%s' "$_peek_out" | cksum 2>/dev/null | awk '{print $1}')
   fi
+  # ga-g3m45n: pointer or full task by the dispatcher's rule (gate_review_nudge_message); no such function (a lib-only caller) = the task.
+  _nmsg="$_task2"
+  if type gate_review_nudge_message >/dev/null 2>&1; then
+    _nmsg=$(gate_review_nudge_message "$GATE_E5_EXTRA_PTR_OK" "$_task2" 2 2 "${BRANCH:-}" "${BRANCH_SHA:-}" "$_vb2") || _nmsg="$_task2"
+  fi
   if type gate_nudge >/dev/null 2>&1; then
-    gate_nudge "$_sid" "$_task2" --delivery queue 2>/dev/null \
-      || warn "  E5: initial queue of the extra reviewer's task failed (session $_sid) — the ACK pass / durable pull will retry"
+    if gate_nudge "$_sid" "$_nmsg" --delivery queue 2>/dev/null; then
+      GATE_E5_EXTRA_NUDGE_SENT=1
+    else
+      warn "  E5: initial queue of the extra reviewer's task failed (session $_sid) — the ACK pass / durable pull will retry"
+    fi
   else
-    gc --city "$GC_CITY" session nudge "$_sid" "$_task2" --delivery queue 2>/dev/null || true
+    gc --city "$GC_CITY" session nudge "$_sid" "$_nmsg" --delivery queue 2>/dev/null || true
   fi
 
   _n=$(gate_e5_spend_record)
@@ -588,6 +610,10 @@ gate_e5_step7_extra() {
     REVIEW_TASKS+=("$GATE_E5_EXTRA_TASK")
     REVIEWER_PEEK_BASELINE+=("$GATE_E5_EXTRA_PEEK")
     REVIEWER_ACKED+=(0)
+    # ga-g3m45n: the slot index is the one just appended; written by index like the dispatcher's own slots.
+    REVIEWER_TASK_EMBEDDED[$(( ${#VERDICT_BEAD_IDS[@]} - 1 ))]="$GATE_E5_EXTRA_EMB"
+    REVIEWER_POINTER_OK[$(( ${#VERDICT_BEAD_IDS[@]} - 1 ))]="$GATE_E5_EXTRA_PTR_OK"
+    REVIEWER_NUDGE_SENT[$(( ${#VERDICT_BEAD_IDS[@]} - 1 ))]="$GATE_E5_EXTRA_NUDGE_SENT"
     REQUIRED_REVIEWERS=2
   fi
   return 0

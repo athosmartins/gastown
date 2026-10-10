@@ -88,6 +88,12 @@ reviewer, WAITING for the task IS the work.
      so the assignee gap stays visible).
    - **(fast-path) a nudge message** containing `QUALITY GATE REVIEW` with the same
      content. Either source is sufficient; whichever you see first, act on it.
+     The nudge may be only a **pointer** (it opens `QUALITY GATE REVIEW — POINTER`, is
+     under 1 KB, and names a verdict bead): the full task is then the embedded comment
+     of that bead, so run `gc bd show <that id>` and proceed exactly as in the primary
+     case. The pointer does not replace your own poll: if the bead it names is not the
+     one your `--assignee` / metadata query returns, trust your poll and ignore the
+     pointer's id (a bead that is not yours is never yours — see the last rule below).
 2. **If none is present yet, run `sleep 15` (as a real Bash tool call) and
    check ALL THREE again. Repeat this poll up to 8 times (~2 minutes total).** The
    task almost always arrives within the first 30–45s. Do NOT exit during this

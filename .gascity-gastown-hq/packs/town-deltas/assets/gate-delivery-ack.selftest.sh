@@ -45,8 +45,14 @@ if bash -n "$GATE" 2>/dev/null; then ok "dispatcher: bash -n clean"; else bad "d
 if /usr/bin/python3 -m py_compile "$MON" 2>/dev/null; then ok "monitor: py_compile clean"; else bad "monitor: py_compile FAILED"; fi
 
 echo "── 2. DISPATCHER: queue delivery replaces the immediate-keystroke race ──"
-has    "$GATE" 'nudge "\$SESSION_ID" "\$REVIEW_TASK" --delivery queue' "reviewer task delivered via --delivery queue"
-hasnot "$GATE" 'nudge "\$SESSION_ID" "\$REVIEW_TASK" --delivery immediate' "no --delivery immediate on the reviewer task"
+# ga-g3m45n: the three delivery sites (initial spawn, ACK re-queue, re-convene) all go through ONE
+# function, gate_deliver_review_task, which builds the payload (pointer, or the full task when the durable
+# channel is not proven) and does the delivery. What this section guards is the DELIVERY MODE, now in that function.
+has    "$GATE" 'gate_nudge "\$_sid" "\$_msg" --delivery queue' "reviewer task delivered via --delivery queue (inside gate_deliver_review_task)"
+hasnot "$GATE" 'nudge "\$_sid" "\$_msg" --delivery immediate' "no --delivery immediate on the reviewer task"
+hasnot "$GATE" 'nudge "\$SESSION_ID" "\$REVIEW_TASK" --delivery' "no site hands the raw REVIEW_TASK to the nudge queue any more (ga-g3m45n: pointer-or-task goes through gate_deliver_review_task)"
+has    "$GATE" 'gate_deliver_review_task "\$\(\(i-1\)\)" "\$SESSION_ID" "\$REVIEW_TASK" "\$i" "\$VERDICT_BEAD_ID" send' "initial spawn delivers through gate_deliver_review_task (send)"
+has    "$GATE" 'gate_deliver_review_task "\$_idx" "\$_new_sid" "\$\{REVIEW_TASKS\[\$_idx\]\}" "\$_rev" "\$\{VERDICT_BEAD_IDS\[\$_idx\]\}" send' "re-convene delivers through gate_deliver_review_task (send)"
 hasnot "$GATE" '^[[:space:]]*sleep 3[[:space:]]*$'                       "magic 'sleep 3' before reviewer nudge removed"
 hasnot "$GATE" 'Review task delivered to session'                       "unconditional 'delivered' log removed"
 
@@ -56,27 +62,29 @@ has "$GATE" 'REVIEWER_ACKED'                           "per-reviewer ACK state t
 has "$GATE" 'REVIEWER_PEEK_BASELINE'                   "pre-delivery peek baseline captured"
 has "$GATE" 'verdict:pending'                          "strong ACK keys off verdict:pending progression"
 has "$GATE" 'session peek .* --lines'                  "soft ACK samples session output"
-has "$GATE" 'nudge "\$_sid" "\$\{REVIEW_TASKS\[\$k\]\}" --delivery queue' "idle session re-queued with its exact task"
-# set -euo pipefail discipline: the re-queue nudge must be guarded so a failed
-# re-queue can't kill the ACK loop under set -e. ga-vne2 (2026-08-08) changed
-# the guard from a bare `|| true` to `|| warn "..."` on purpose: swallowing
-# the failure alongside the diagnostic hid WHY a re-queue didn't land (dead
-# session vs a real nudge failure) — see the dispatcher's own comment at the
-# call site. The call now also goes through the gate_nudge() wrapper (still
-# matched above by substring), and its `2>/dev/null \` + `|| warn ...` guard
-# spans two physical lines (backslash continuation), so join lines before
-# grepping instead of freezing one single-line literal that the wrapper/warn
-# refactor already broke twice.
+has "$GATE" 'gate_deliver_review_task "\$k" "\$_sid" "\$\{REVIEW_TASKS\[\$k\]\}" "\$\(\(k\+1\)\)" "\$_vb" retry' "idle session re-queued through gate_deliver_review_task in retry mode (its task: pointer or full, ga-g3m45n)"
+# set -euo pipefail discipline: the re-queue must be guarded so a failed re-queue can't kill the ACK loop
+# under set -e, AND its failure must not be swallowed. ga-vne2 (2026-08-08) moved the guard from a bare
+# `|| true` to `|| warn "..."` on purpose: swallowing the failure alongside the diagnostic hid WHY a
+# re-queue didn't land (dead session vs a real nudge failure). ga-g3m45n moved the call into
+# gate_deliver_review_task, whose return code (0 queued / 10 already queued / 1 not delivered) the call site
+# reads with `|| _rq_rc=$?` and a `case` — same guarantee, so the checks below pin the new shape: the call is
+# guarded by `|| _rq_rc=$?` (set -e safe), the not-delivered arm still warns, and nothing swallows with `|| true`.
 GATE_JOINED=$(awk '{ if (sub(/\\$/, "")) { printf "%s ", $0; next } else { print } }' "$GATE")
-if echo "$GATE_JOINED" | grep -E 'REVIEW_TASKS\[\$k\]\}" --delivery queue 2>/dev/null[[:space:]]*\|\| warn' >/dev/null; then
-  ok "re-queue nudge failure is diagnosed via warn, not silently swallowed (ga-vne2)"
+if echo "$GATE_JOINED" | grep -E 'gate_deliver_review_task "\$k" .* retry \|\| _rq_rc=\$\?' >/dev/null; then
+  ok "re-queue call is guarded with || _rq_rc=\$? (set -e safe) (ga-g3m45n)"
 else
-  bad "re-queue nudge failure is diagnosed via warn, not silently swallowed (ga-vne2) — pattern not found"
+  bad "re-queue call is guarded with || _rq_rc=\$? (set -e safe) — pattern not found"
 fi
-if echo "$GATE_JOINED" | grep -E 'REVIEW_TASKS\[\$k\]\}" --delivery queue 2>/dev/null[[:space:]]*\|\| true([[:space:]]|$)' >/dev/null; then
-  bad "re-queue nudge does not silently swallow failure — forbidden pattern present: || true"
+if awk '/_rq_rc=0/ {f=1} f && /\*\) warn "  Re-fila para \$_sid N/ {print "yes"; exit}' "$GATE" | grep -q yes; then
+  ok "re-queue not-delivered arm is diagnosed via warn, not silently swallowed (ga-vne2)"
 else
-  ok "re-queue nudge does not silently swallow failure with a bare || true"
+  bad "re-queue not-delivered arm is diagnosed via warn (ga-vne2) — not found"
+fi
+if echo "$GATE_JOINED" | grep -E 'gate_deliver_review_task "\$k" .* retry \|\| true([[:space:]]|$)' >/dev/null; then
+  bad "re-queue does not silently swallow failure — forbidden pattern present: || true"
+else
+  ok "re-queue does not silently swallow failure with a bare || true"
 fi
 
 echo "── 4. MONITOR: idle-reviewer watchdog closes the :dispatching blind spot ──"
