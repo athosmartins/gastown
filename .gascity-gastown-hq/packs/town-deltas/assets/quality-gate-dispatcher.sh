@@ -834,15 +834,99 @@ session_is_booting() {
 # reap slow-but-alive reviewers mid-review → false-FAILs); peek reports a
 # slow-alive reviewer as alive and a drained one as gone, so it is the safe
 # discriminator. Defensive on junk: any non-numeric arg folds to 0.
+# ga-rze6ge: an optional 4th arg, <finished>, is the count of sessions whose
+# own VERDICT BEAD is closed (reviewer_session_finished_by_artifact) — a review
+# that is over is not a live reviewer whatever `gc session list` still says.
+# It is a separate count from <drained> because the evidence differs (a closed
+# bead, not a peek answer): the peek can HANG on exactly the sessions the
+# list keeps showing as asleep, and a hung peek never confirms anything.
+# Omitted → 0, so every 3-arg caller reads exactly as before.
 headroom_live_reviewers() {
-  local count="${1:-0}" reaped="${2:-0}" drained="${3:-0}" live
-  case "$count"   in ''|*[!0-9]*) count=0 ;; esac
-  case "$reaped"  in ''|*[!0-9]*) reaped=0 ;; esac
-  case "$drained" in ''|*[!0-9]*) drained=0 ;; esac
-  live=$(( count - reaped - drained ))
+  local count="${1:-0}" reaped="${2:-0}" drained="${3:-0}" finished="${4:-0}" live
+  case "$count"    in ''|*[!0-9]*) count=0 ;; esac
+  case "$reaped"   in ''|*[!0-9]*) reaped=0 ;; esac
+  case "$drained"  in ''|*[!0-9]*) drained=0 ;; esac
+  case "$finished" in ''|*[!0-9]*) finished=0 ;; esac
+  live=$(( count - reaped - drained - finished ))
   [ "$live" -lt 0 ] && live=0
   echo "$live"
 }
+
+# ga-rze6ge: a reviewer whose review is OVER is not a live reviewer — judged by
+# the ARTIFACT (its verdict bead), not by the session list or a peek.
+#
+# MEASURED 10/10 13:43-14:08 (Mayor): gate-run ga-8257kf ended superseded and
+# the cleanup logged "Reviewer sessions closed (cleanup)", yet `gc session list`
+# kept showing gate-reviewer-adhoc-12d22287ac as asleep, and `gc session peek`
+# on it HUNG (>3 min). The gt-bewtm drained-exclusion above only discounts a
+# session when peek CONFIRMS it gone; a hung peek confirms nothing, so the
+# ghost kept counting, LIVE_REVIEWERS read 3 = the cap, and the gate DEFERred
+# ("dolt-calm-cap-reached") for several sweeps with 2 markers queued and only
+# 2 real reviewers. The run's verdict bead (ga-jyiuk9) was CLOSED the whole time
+# — closing it is the last thing a finished run does, and it is a durable fact.
+#
+# THREE states, never collapsed (error ≠ empty):
+#   done     ≥1 verdict bead names this session AND every one is closed
+#   pending  ≥1 verdict bead names it that is NOT closed (the review is open)
+#   none     no verdict bead in the list names it (can't tell — NOT "finished")
+#   unknown  the list is missing / unreadable / not an array (can't tell either)
+# Only `done` discounts. A bead with no readable status counts as NOT closed.
+# A closed bead keeps the reviewer's name in metadata gc.session_name and (in
+# ~90% of closed beads, measured) in .assignee; it is matched on either.
+# Pure: a name and the JSON array of recent verdict beads in, one word out.
+# SELFTEST-EXTRACT reviewer-verdict-artifact-state-fn: BEGIN
+reviewer_verdict_artifact_state() {
+  local name="${1:-}" vbs="${2:-}" out
+  { [ -z "$name" ] || [ -z "$vbs" ]; } && { echo unknown; return 0; }
+  out=$(printf '%s' "$vbs" | jq -r --arg n "$name" '
+    if type != "array" then "unknown"
+    else
+      [ .[] | select(type == "object")
+        | select(((.assignee // "") == $n)
+                 or (((.metadata // {}) | if type == "object" then (.["gc.session_name"] // "") else "" end) == $n)) ] as $m
+      | if ($m | length) == 0 then "none"
+        elif ([ $m[] | select((.status // "") != "closed") ] | length) > 0 then "pending"
+        else "done" end
+    end' 2>/dev/null) || out=""
+  case "$out" in
+    done|pending|none|unknown) echo "$out" ;;
+    *) echo unknown ;;
+  esac
+}
+
+# reviewer_session_finished_by_artifact <state> <attached> <artifact_state> →
+# 1 (this listed session is a FINISHED reviewer: do not count it live, close it)
+# | 0. Pure. Only a `done` artifact qualifies, and never a session that is
+# attached, active or still booting — those keep the existing, peek-based path.
+# An active session with a closed verdict bead is a run that ended with its
+# reviewer still working: it does occupy real budget until the cleanup closes it.
+reviewer_session_finished_by_artifact() {
+  local state="${1:-}" attached="${2:-}" art="${3:-}"
+  [ "$art" = "done" ] || { echo 0; return 0; }
+  [ "$attached" = "true" ] && { echo 0; return 0; }
+  case "$state" in active|creating) echo 0; return 0 ;; esac
+  echo 1
+}
+
+# reviewer_verdict_beads_recent → stdout: JSON array of the verdict beads created
+# in the last <hours> (default: the reviewer TTL + 3h margin — a kept session is
+# younger than the TTL and its verdict bead was created at or before its spawn),
+# exit 0; or nothing and exit 1 when the read failed / is not an array.
+# ONE bulk read per sweep, never a `bd show` per session: a closed bead is the
+# FACT being looked for, so closed ones are included (--all), and the window
+# (not the whole history, ~50k beads) keeps it cheap. Bounded by `timeout` — the
+# very failure being fixed is an external call that hangs.
+reviewer_verdict_beads_recent() {
+  local hours since out
+  hours=$(( ${REVIEWER_SESSION_TTL_MINUTES:-70} / 60 + 3 ))
+  since=$(date -u -v-"${hours}"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "-${hours} hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || return 1
+  [ -n "$since" ] || return 1
+  out=$(timeout -k 5 30 bd -C "$GC_CITY" list --json --all --include-infra --limit 0 \
+          -l type:quality-gate-verdict --created-after "$since" 2>/dev/null) || return 1
+  printf '%s' "$out" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+  printf '%s' "$out"
+}
+# SELFTEST-EXTRACT reviewer-verdict-artifact-state-fn: END
 
 # _ts_to_epoch <rfc3339> → unix epoch seconds (stdout) | "" on failure.
 # Handles BOTH a trailing Z (UTC) and a numeric ±HH:MM offset — the two forms
@@ -12777,6 +12861,7 @@ reviewer_session_should_reap() {
 # zero, so this failure mode stays fail-open, matching the headroom gate's
 # own Dolt-outage handling below — but it must be LOGGED so a real,
 # recurring gc outage isn't invisible.
+# SELFTEST-EXTRACT reviewer-janitor-0a2: BEGIN
 REVIEWER_SESSIONS_RAW=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
 if [ -z "$REVIEWER_SESSIONS_RAW" ]; then
   warn "  gc session list unreadable this sweep — skipping gate-reviewer orphan-reap (ga-zl277) and reading REVIEWER_SESSION_COUNT=0 for headroom this sweep only (ga-07509, self-heals next sweep)."
@@ -12790,6 +12875,13 @@ if [ "$REVIEWER_SESSION_COUNT" -gt 0 ]; then
   NOW_EPOCH_R=$(date +%s)
   REAPED_REVIEWERS=0
   DRAINED_REVIEWERS=0
+  # ga-rze6ge: reviewers whose own verdict bead is closed — their review is over.
+  FINISHED_REVIEWERS=0
+  # ga-rze6ge: one bound for the two `gc session` calls below that can HANG on a wedged session (peek, close).
+  _R_GC_TMO="${REVIEWER_GC_CALL_TIMEOUT_SECS:-20}"
+  case "$_R_GC_TMO" in ''|*[!0-9]*) _R_GC_TMO=20 ;; esac
+  REVIEWER_VB_READ=0     # lazy: the bulk verdict-bead read happens at most once, and only if a session needs it
+  REVIEWER_VB_JSON=""
   for ri in $(seq 0 $((REVIEWER_SESSION_COUNT - 1))); do
     R_SESSION=$(echo "$REVIEWER_SESSIONS_JSON" | jq -c ".[$ri]" 2>/dev/null || echo "{}")
     R_ID=$(echo "$R_SESSION" | jq -r '.id // empty' 2>/dev/null || echo "")
@@ -12841,7 +12933,50 @@ if [ "$REVIEWER_SESSION_COUNT" -gt 0 ]; then
       # life, since nothing else ever reconsiders an excluded-but-alive
       # session (observed live: reviewer drained from headroom at age=0m,
       # still idle 15+ minutes and several sweeps later).
-      _R_PEEK_ERR=$(gc --city "$GC_CITY" session peek "$R_ID" --lines 1 2>&1 >/dev/null || true)
+      #
+      # ga-rze6ge: BEFORE the peek, ask the ARTIFACT. A reviewer whose own verdict
+      # bead is closed has finished its review (the run closes the bead last), so
+      # it is not live — whatever the list says and whether or not peek answers.
+      # That peek can HANG on exactly such a session (measured 10/10: >3 min), and
+      # a hung peek never "confirms" a drain, which left the ghost counted live and
+      # the gate DEFERring at the cap with 2 real reviewers. Only a `done` artifact
+      # discounts: no matching bead / unreadable list / an open bead all fall
+      # through to the peek below, unchanged. Attached, active and booting
+      # sessions never take this path (reviewer_session_finished_by_artifact).
+      # ga-rze6ge-artifact-check: BEGIN
+      R_NAME=$(echo "$R_SESSION" | jq -r '.session_name // .name // .agent_name // empty' 2>/dev/null || echo "")
+      # (the first call, with "done", is the eligibility pre-check: "would this
+      # session qualify if its artifact said done?" — it keeps the bulk read lazy)
+      if [ -n "$R_NAME" ] && [ "$(reviewer_session_finished_by_artifact "$R_STATE" "$R_ATTACHED" "done")" = "1" ]; then
+        if [ "$REVIEWER_VB_READ" != "1" ]; then
+          REVIEWER_VB_READ=1
+          REVIEWER_VB_JSON=$(reviewer_verdict_beads_recent) || REVIEWER_VB_JSON=""
+          if [ -z "$REVIEWER_VB_JSON" ]; then
+            warn "  verdict beads unreadable this sweep — no artifact-based finished-reviewer exclusion (peek path only; ga-rze6ge, self-heals next sweep)."
+          fi
+        fi
+        _R_ART=$(reviewer_verdict_artifact_state "$R_NAME" "$REVIEWER_VB_JSON")
+        if [ "$(reviewer_session_finished_by_artifact "$R_STATE" "$R_ATTACHED" "$_R_ART")" = "1" ]; then
+          # Bounded: a close on a wedged session can hang like the peek does. The
+          # exclusion does not depend on the close landing — the closed bead is the
+          # fact, so a close that fails is simply retried next sweep. The log says
+          # which happened; it never reports a close that did not.
+          if timeout -k 5 "$_R_GC_TMO" gc --city "$GC_CITY" session close "$R_ID" >/dev/null 2>&1; then
+            _R_CLOSE_RES="session closed"
+          else
+            _R_CLOSE_RES="session close FAILED or timed out after ${_R_GC_TMO}s — retried next sweep"
+          fi
+          log "Finished gate-reviewer session $R_ID ($R_NAME state=$R_STATE age=${R_AGE_MINUTES}m): its verdict bead is closed — excluded from headroom LIVE_REVIEWERS; $_R_CLOSE_RES (ga-rze6ge)."
+          FINISHED_REVIEWERS=$((FINISHED_REVIEWERS + 1))
+          continue
+        fi
+      fi
+      # ga-rze6ge-artifact-check: END
+      # ga-rze6ge: bounded like every other external call here — an unbounded peek
+      # that hangs would stall the whole sweep; a timeout leaves stderr without
+      # "session not found", which reads ALIVE (the conservative answer), exactly
+      # as any other non-not-found result already does.
+      _R_PEEK_ERR=$(timeout -k 5 "$_R_GC_TMO" gc --city "$GC_CITY" session peek "$R_ID" --lines 1 2>&1 >/dev/null || true)
       R_AGE_SECONDS=$(( NOW_EPOCH_R - R_EPOCH ))
       R_BOOTING=$(session_is_booting "$R_STATE")
       if [ "$(session_peek_reports_dead "$_R_PEEK_ERR")" = "1" ]; then
@@ -12865,7 +13000,11 @@ if [ "$REVIEWER_SESSION_COUNT" -gt 0 ]; then
   if [ "$DRAINED_REVIEWERS" -gt 0 ]; then
     log "Excluded $DRAINED_REVIEWERS drained gate-reviewer session(s) from headroom LIVE_REVIEWERS this sweep (gt-bewtm)."
   fi
+  if [ "$FINISHED_REVIEWERS" -gt 0 ]; then
+    log "Excluded $FINISHED_REVIEWERS finished gate-reviewer session(s) (verdict bead closed) from headroom LIVE_REVIEWERS this sweep (ga-rze6ge)."
+  fi
 fi
+# SELFTEST-EXTRACT reviewer-janitor-0a2: END
 
 # ── Step 0a-3 (ga-rstw5): reconcile container-rig bare mains to origin ─────────
 # Container rigs (.repo.git) keep a LOCAL refs/heads/<main> that a push to origin
@@ -13058,7 +13197,11 @@ fi
 # phantoms inflated the denominator and the headroom gate hit a false
 # "dolt-calm-cap-reached" ceiling, DEFERring every sweep with Dolt calm + queue
 # full (the 2026-06-12 town-wide deadlock).
-LIVE_REVIEWERS=$(headroom_live_reviewers "${REVIEWER_SESSION_COUNT:-0}" "${REAPED_REVIEWERS:-0}" "${DRAINED_REVIEWERS:-0}")
+# ga-rze6ge: also subtract FINISHED_REVIEWERS — listed sessions whose own verdict
+# bead is closed (the review is over), which the drained-exclusion above cannot
+# catch when `gc session peek` hangs on them instead of answering "not found".
+# Like the other two it is set only inside the janitor's >0 branch (default 0).
+LIVE_REVIEWERS=$(headroom_live_reviewers "${REVIEWER_SESSION_COUNT:-0}" "${REAPED_REVIEWERS:-0}" "${DRAINED_REVIEWERS:-0}" "${FINISHED_REVIEWERS:-0}")
 
 # ── ga-309v3/ga-pqbn0: burst-aware correction — RETIRED (superseded by ga-wcd86) ──
 # HISTORY: Step 0a-2's drained-exclusion used to call session_peek_reports_dead
