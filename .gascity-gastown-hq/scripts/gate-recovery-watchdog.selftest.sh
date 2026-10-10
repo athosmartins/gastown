@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WD="${WD_OVERRIDE:-$SCRIPT_DIR/gate-recovery-watchdog.py}"   # WD_OVERRIDE=<other copy>: prove the selftest fails on older code
 
 /usr/bin/python3 - "$WD" <<'PY'
-import sys, importlib.util, datetime, time, tempfile, os
+import sys, importlib.util, datetime, time, tempfile, os, io, contextlib
 
 wd_path = sys.argv[1]
 spec = importlib.util.spec_from_file_location("gate_recovery_watchdog", wd_path)
@@ -48,11 +48,9 @@ K = m.ORPHAN_ORDER_SWEEPS
 GAP = 180           # the dispatcher's sweep cadence (~3min)
 
 # ── shared fixtures for the ga-dtecvq (published-order) proof ─────────────────────────────────────────────
-def mk(mid, branch, age_sec, untouched_for=None, labels=()):
-    """queued-marker row (id, branch, created, labels, updated): created `age_sec` ago, last changed
-    `untouched_for` ago (default: not since it was created)."""
-    untouched_for = age_sec if untouched_for is None else untouched_for
-    return (mid, branch, NOW - age_sec, tuple(labels), NOW - untouched_for)
+def mk(mid, branch, age_sec, labels=()):
+    """queued-marker row (id, branch, created, labels): created `age_sec` ago."""
+    return (mid, branch, NOW - age_sec, tuple(labels))
 
 def sweep(ago, order=(), aside=()):
     """one published sweep `ago` seconds back, in the file's real shape, parsed by the real validator."""
@@ -66,11 +64,14 @@ def last(n, order=(), aside=(), newest_ago=60):
     and setting aside `aside`."""
     return [sweep(newest_ago + GAP * (n - 1 - i), order, aside) for i in range(n)]
 
-def verdict(markers, pubs, why=""):
-    return m._orphan_verdict(markers, pubs, why, NOW)
+def verdict(markers, pubs, why="", queued_for=None, watching_for=86400):
+    """`queued_for`: how long the WATCHDOG has seen every marker queued without a break (default: since it was created,
+    long before any window); `watching_for`: how long its polls have been unbroken (default: a day)."""
+    since = dict((r[0], r[2] if queued_for is None else NOW - queued_for) for r in markers)
+    return m._orphan_verdict(markers, pubs, why, NOW, since, NOW - watching_for)
 
-# ── Scenario 1: a TRUE orphan is detected (old, untouched, in NONE of the last K published sweeps) ──
-print("Scenario 1: genuine orphan detected (queued and untouched, absent from the last %d published sweeps)" % K)
+# ── Scenario 1: a TRUE orphan is detected (old, watched queued all along, in NONE of the last K published sweeps) ──
+print("Scenario 1: genuine orphan detected (queued and watched since before the window, absent from the last %d published sweeps)" % K)
 head_age = 2 * 3600
 markers = [mk("ga-wisp-orphan", "crew/wa/wa-uzai", head_age), mk("ga-wisp-seen", "crew/wa/wa-seen", head_age - 600)]
 orphan, reason, detail = verdict(markers, last(K, order=["ga-wisp-seen", "ga-wisp-p0a", "ga-wisp-p0b"]))
@@ -115,27 +116,158 @@ if orphan is None and reason == "no-orphan":
 else:
     bad("expected (None, 'no-orphan'), got %r %r" % (orphan, reason))
 
-# ── Scenario 5: young / re-queued markers are never proven invisible ────────────────────────
-print("Scenario 5: young marker, and a marker re-queued INSIDE the window → no verdict")
+# ── Scenario 5: young / re-queued / unwatched markers are never proven invisible ──────────────────────────
+# bd's updated_at is NOT evidence of a re-queue: `bd label add/remove` — what the dispatcher and the watchdog use to move a
+# marker between gate-status:* — never bumps it (ga-bt12x0). So "queued continuously since before the window" is the
+# WATCHDOG's own observation (its polls of the queued list), handed to the verdict as `since` / `watch0`.
+print("Scenario 5: young marker, a marker first seen queued INSIDE the window, a watch that began inside it → no verdict")
 orphan, reason, _d = verdict([mk("ga-wisp-young", "crew/wa/wa-young", MIN_AGE - 60)], last(K, order=["ga-x"]))
 if orphan is None and reason == "no-candidate":
     ok("a marker younger than ORPHAN_MIN_AGE_SEC is not even a candidate")
 else:
     bad("expected (None, 'no-candidate'), got %r %r" % (orphan, reason))
 window_start = 60 + GAP * (K - 1)             # seconds before NOW that the oldest sweep of last(K) was published
-edge = window_start + MARGIN                   # untouched at least this long (margin included) = was queued before the window began
+edge = window_start + MARGIN                   # watched at least this long (margin included) = was queued before the window began
 pubs = last(K, order=["ga-x"])
-o_in, r_in, _ = verdict([mk("ga-wisp-rq", "crew/wa/wa-rq", 5 * 3600, untouched_for=edge)], pubs)
-o_out, r_out, _ = verdict([mk("ga-wisp-rq", "crew/wa/wa-rq", 5 * 3600, untouched_for=edge - 1)], pubs)
-if o_in is not None and o_out is None and r_out == "no-orphan":
-    ok("untouched since before the window (margin included) → orphan; changed 1s later → not (a re-queue restarts the clock)")
+rq = [mk("ga-wisp-rq", "crew/wa/wa-rq", 5 * 3600)]
+o_in, r_in, _ = verdict(rq, pubs, queued_for=edge, watching_for=edge)
+o_out, r_out, _ = verdict(rq, pubs, queued_for=edge - 1)
+if o_in is not None and o_out is None and r_out == "no-orphan" and r_out not in m._ORPHAN_NOTES:
+    ok("queued (as the watchdog saw it) since before the window → orphan; first seen 1s later → silent: it may have been re-queued, so it was never in a position to be seen")
 else:
-    bad("boundary: untouched=%r changed-1s-later=%r %r" % (o_in, o_out, r_out))
-o_unk, r_unk, d_unk = verdict([("ga-wisp-nu", "crew/wa/wa-nu", NOW - 5 * 3600, (), None)], pubs)
-if o_unk is None and r_unk == "updated-unknown" and r_unk in m._ORPHAN_NOTES:
-    ok("an unknown updated_at cannot show 'untouched since the window began' → 'updated-unknown', said")
+    bad("boundary: continuous=%r first-seen-1s-later=%r %r" % (o_in, o_out, r_out))
+o_w, r_w, d_w = verdict(rq, pubs, watching_for=edge - 1)
+o_w2, r_w2, _d = verdict(rq, pubs, watching_for=edge)
+if o_w is None and r_w == "unwatched" and r_w in m._ORPHAN_NOTES and "watch" in d_w and o_w2 is not None:
+    ok("the watchdog's polls began 1s inside the window (a restart) → 'unwatched', said; 1s earlier → judged")
 else:
-    bad("expected (None, 'updated-unknown'), got %r %r" % (o_unk, r_unk))
+    bad("watch boundary: %r %r %r / %r" % (o_w, r_w, d_w, o_w2))
+o_unk, r_unk, _d = m._orphan_verdict(rq, pubs, "", NOW, {}, NOW - 86400)
+if o_unk is None and r_unk == "no-orphan":
+    ok("a marker the tracker has no first sighting for is not judged (the inert answer, never an orphan)")
+else:
+    bad("expected (None, 'no-orphan') for an untracked marker, got %r %r" % (o_unk, r_unk))
+
+# ── Scenario 5b: the continuity is the watchdog's own, kept across polls — through the REAL _queued_markers_read ──
+# The failure this pins (ga-dtecvq.2 gate round 1): a marker re-queued by a LABEL write (parked -> queued) keeps its old
+# bd updated_at, so a proof read from updated_at called a healthy, just-re-queued marker an orphan. Every row below
+# carries the updated_at bd really leaves behind (the creation time, frozen), and the re-queue is a poll that did not
+# list the marker.
+print("Scenario 5b: continuity across polls — a label-only re-queue (updated_at frozen) is silent; an unbroken watch is judged")
+# bd's answer for `bd list ... --json`, as sh() returns it
+def _fake_sh_rows(rows):
+    class _R:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = m.json.dumps(rows)
+    def _inner(args, timeout=25, stdin=None):
+        return _R()
+    return _inner
+
+class _Clock(object):
+    """stands in for the `time` module inside one watchdog copy: time() is the poll's instant, the rest is the real module."""
+    def __init__(self, t): self.t = t
+    def time(self): return self.t
+    def __getattr__(self, k): return getattr(time, k)
+
+class Watch(object):
+    """A watchdog process that has just started (a fresh copy of the module: no polling state carries over)."""
+    def __init__(self):
+        self.m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.m)
+    def poll(self, ago, rows, pubs=None):
+        """One poll `ago` seconds before NOW. bd lists `rows` (None: bd fails); the order file holds `pubs` (None: no file yet)."""
+        w = self.m
+        w.time = _Clock(NOW - ago)
+        w.sh = _fake_sh_rows(rows) if rows is not None else (lambda args, timeout=25, stdin=None: None)
+        w._read_published_orders = lambda path=None: (pubs, "") if pubs is not None else (None, "no queue-order file")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = w.orphaned_queued_marker()
+        return res, buf.getvalue()
+
+def iso(t): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+def bd_row(mid, br, age):
+    """a queued marker as bd prints it: updated_at is still the creation time — a label write never moves it."""
+    return {"id": mid, "status": "open", "labels": ["type:quality-gate-marker", "gate-status:queued", "branch:" + br],
+            "created_at": iso(NOW - age), "updated_at": iso(NOW - age)}
+
+QUIET = (None, None, 0)
+head = bd_row("ga-wisp-rq", "crew/wa/wa-rq", 5 * 3600)
+pubs = last(K, order=["ga-x"])                  # the window is NOW-420 .. NOW-60; the marker is in none of its sweeps
+
+w = Watch()
+for ago, rows in ((600, [head]), (480, []), (360, [head]), (240, [head]), (120, [head])):
+    w.poll(ago, rows)
+res, out = w.poll(0, [head], pubs)
+if res == QUIET and "orphan" not in out and "unwatched" not in out:
+    ok("re-queued by a label write inside the window (absent from one poll, updated_at frozen) → silent: no orphan, no note")
+else:
+    bad("REGRESSION: a healthy re-queued marker was judged: %r, output %r" % (res, out))
+
+w = Watch()
+for ago in (600, 480, 360, 240, 120):
+    w.poll(ago, [head])
+res, out = w.poll(0, [head], pubs)
+if res[0] == "ga-wisp-rq" and res[1] == "crew/wa/wa-rq" and "queued and watched since" in w.m._ORPHAN_EVIDENCE.get("ga-wisp-rq", ""):
+    ok("queued at every poll since before the window, absent from all its sweeps → orphan, and the evidence says it was WATCHED (not 'untouched')")
+else:
+    bad("an unbroken watch was not judged: %r %r" % (res, w.m._ORPHAN_EVIDENCE))
+
+w = Watch()
+aging = bd_row("ga-wisp-aging", "crew/wa/wa-aging", MIN_AGE + 100)          # reaches ORPHAN_MIN_AGE_SEC only 100s before the last poll
+for ago in (600, 480, 360, 240, 120):
+    w.poll(ago, [aging])                                                    # not a candidate yet, and no order file: still being watched
+res, out = w.poll(0, [aging], pubs)
+if res[0] == "ga-wisp-aging":
+    ok("the watch does not wait for a marker to be old enough or for a proof to be possible: it is kept at every poll")
+else:
+    bad("a marker watched since before it was a candidate was not judged: %r %r" % (res, out))
+
+w = Watch()
+w.poll(600, [head]); w.poll(480, None)
+for ago in (360, 240, 120):
+    w.poll(ago, [head])
+res, out = w.poll(0, [head], pubs)
+if res == QUIET and "orphan-proof unavailable (unwatched)" in out:
+    ok("bd failing for one poll breaks the watch: nothing is proven about a queue that was not read — 'unwatched', said, never an orphan")
+else:
+    bad("an unreadable poll did not reset the watch: %r %r" % (res, out))
+
+w = Watch()
+w.poll(900, [head])
+res, out = w.poll(0, [head], pubs)
+if res == QUIET and "orphan-proof unavailable (unwatched)" in out:
+    ok("15 minutes without a poll (the loop was stuck or crashed) → the marker could have left the queue and come back unseen: 'unwatched'")
+else:
+    bad("a long gap between polls kept the watch: %r %r" % (res, out))
+w = Watch()
+for ago in (600, 360, 120):
+    w.poll(ago, [head])
+res, out = w.poll(0, [head], pubs)
+if res[0] == "ga-wisp-rq":
+    ok("...but a poll or two skipped (one slow loop) does not break it")
+else:
+    bad("a skipped poll broke the watch: %r %r" % (res, out))
+
+w = Watch()
+w.poll(120, [head])
+res, out = w.poll(0, [head], pubs)
+if res == QUIET and "orphan-proof unavailable (unwatched)" in out:
+    ok("a watchdog that just (re)started has not watched the window: 'unwatched', said — not silence, which would read as 'no orphan'")
+else:
+    bad("a freshly started watchdog judged a marker: %r %r" % (res, out))
+
+older = bd_row("ga-wisp-older", "crew/wa/wa-older", 6 * 3600)
+w = Watch()
+for ago, rows in ((600, [older, head]), (480, [head]), (360, [older, head]), (240, [older, head]), (120, [older, head])):
+    w.poll(ago, rows)
+res, out = w.poll(0, [older, head], pubs)
+if res[0] == "ga-wisp-rq" and "more queued marker" not in w.m._ORPHAN_EVIDENCE.get("ga-wisp-rq", ""):
+    ok("the watch is per marker: the one re-queued is silent, the one watched all along (and younger) is the verdict")
+else:
+    bad("a re-queued marker was reported with the unbroken one: %r %r" % (res, w.m._ORPHAN_EVIDENCE))
 
 # ── Scenario 6: the published order cannot be established → cannot prove, never orphan ──────
 print("Scenario 6: unreadable / short / untrustworthy publications → 'cannot prove', never 'orphan'")
@@ -224,14 +356,6 @@ else:
 # the gate-marker type at all) must not let that stale label make a dead marker
 # look like a live one to the orphan proof.)
 print("Scenario 9b: _queued_markers_read() filters out a closed marker with a stale gate-status:queued label")
-def _fake_sh_rows(rows):
-    class _R:
-        def __init__(self):
-            self.returncode = 0
-            self.stdout = m.json.dumps(rows)
-    def _inner(args, timeout=25, stdin=None):
-        return _R()
-    return _inner
 _real_sh_qm = m.sh
 m.sh = _fake_sh_rows([
     {"id": "ga-wisp-open", "status": "open",
@@ -248,21 +372,13 @@ if qm_ids == ["ga-wisp-open"]:
     ok("closed marker excluded even though it still carries the gate-status:queued label")
 else:
     bad("expected only ['ga-wisp-open'], got %r — closed/withdrawn marker leaked through" % (qm_ids,))
-# The labels ride along, and (ga-dtecvq) so does updated_at: the proof needs it to show a marker was already queued,
-# unchanged, when the window of published sweeps began. A tuple that dropped it would make every re-queue look old.
-if (qm and len(qm[0]) == 5 and "gate-status:queued" in qm[0][3] and "branch:crew/wa/wa-open" in qm[0][3]
-        and qm[0][4] == m._iso_epoch("2026-07-16T01:30:00Z")):
-    ok("_queued_markers_read() returns (id, branch, created, labels, updated) with the marker's real labels and updated_at")
+# The labels ride along. updated_at does NOT (ga-dtecvq.2): bd never moves it on a label write, so a proof that read it would
+# call a re-queued marker "untouched" — the row stays a 4-tuple and the continuity the proof needs is the watchdog's own.
+if (qm and len(qm[0]) == 4 and "gate-status:queued" in qm[0][3] and "branch:crew/wa/wa-open" in qm[0][3]
+        and qm[0][2] == m._iso_epoch("2026-07-16T00:00:00Z")):
+    ok("_queued_markers_read() returns (id, branch, created, labels) with the marker's real labels — and nothing of updated_at")
 else:
-    bad("expected a 5-tuple carrying the labels and updated_at, got %r" % (qm,))
-m.sh = _fake_sh_rows([{"id": "ga-wisp-nou", "status": "open", "labels": ["gate-status:queued", "branch:crew/wa/wa-nou"],
-                       "created_at": "2026-07-16T00:00:00Z"}])
-qn = m._queued_markers_read()
-m.sh = _real_sh_qm
-if qn and qn[0][4] is None:
-    ok("a marker row with no updated_at yields updated=None (unknown, never 0)")
-else:
-    bad("expected updated=None for a row without updated_at, got %r" % (qn,))
+    bad("expected a 4-tuple (id, branch, created, labels), got %r" % (qm,))
 
 # ── Drift guard: the live script actually wires the detector in ──────────────
 print("Scenario 10: drift-guard — detector defined and wired into main()")
@@ -271,6 +387,8 @@ for needle, desc in [
     ("def orphaned_queued_marker(", "public orphaned_queued_marker() is defined"),
     ("def _orphan_verdict(", "pure _orphan_verdict() is defined"),
     ("def _read_published_orders(", "the published-order reader is defined"),
+    ("def _orphan_track(", "the watchdog's own continuity tracker is defined"),
+    ("_orphan_track(rows, now)", "orphaned_queued_marker() tracks EVERY poll's queue, before any early return"),
     ("def _iso_epoch(", "_iso_epoch() helper is defined"),
     ("orphan_id, orphan_branch, orphan_age = orphaned_queued_marker()", "main() calls the detector each loop"),
     ('"gate-orphan", orphan_branch', "gate-orphan repair is dispatched"),  # ga: needle updated to the governed_spawn refactor (was stale kind="gate-orphan")
@@ -298,6 +416,17 @@ for needle, desc in [
         ok(desc)
     else:
         bad("MISSING: %s (needle %r)" % (desc, needle))
+
+# The proof must not lean on bd's modification time again: a label write (how a marker is re-queued) never moves it. Comment
+# lines are stripped — the WHY lives there — so only code and docstrings are searched.
+import inspect
+for fn in ("_queued_markers_read", "_orphan_candidates", "_orphan_verdict", "_orphan_track", "orphaned_queued_marker"):
+    body = "\n".join(l for l in inspect.getsource(getattr(m, fn)).splitlines() if not l.lstrip().startswith("#"))
+    if "updated" in body:
+        bad("%s() reads or mentions bd's updated_at: a label-only re-queue never moves it, it cannot prove a marker 'untouched'" % fn)
+        break
+else:
+    ok("none of the proof's functions reads bd's updated_at (label writes never move it)")
 
 # ═══ DIRECT SELF-HEAL — the two toils the Mayor fixed by hand (pure decisions) ═══
 HANG = m.REVIEW_HANG_MINUTES * 60

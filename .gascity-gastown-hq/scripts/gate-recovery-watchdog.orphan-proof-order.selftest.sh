@@ -22,6 +22,7 @@
 #        (a) an old P3 head waiting behind a stream of P0s            -> silence
 #        (b) a head absent from the published order K sweeps in a row -> flagged, with the evidence
 #        (c) published order unreadable/absent/short/stale            -> 'cannot prove', never 'orphan'
+#        (d) a marker re-queued by a LABEL write (bd's updated_at frozen) -> silent; a watchdog that just started -> 'unwatched'
 #   C. drift pins: the legacy claim-order machinery is gone from the watchdog; the new proof reads only the published file
 #   D. the pins ga-9t9acg.13 left behind, kept: the watchdog picks no head by its own FIFO key, no registry consumer row
 #      is left for that slice, and the work-order registry lint is clean over the real tree
@@ -181,20 +182,43 @@ def chain(name, queues, step=120, newest_ago=60):
         run_select(q, int(NOW) - newest_ago - step * (n - 1 - i), path)
     return path
 
-def head_row(updated=None):
-    return (HEAD, HEAD_BR, OLD, ("gate-status:queued",), OLD if updated is None else updated)
+def head_row():
+    return (HEAD, HEAD_BR, OLD, ("gate-status:queued",))
 
 def p0(i):
     return qm("ga-p0-%d" % i, NOW - 90 - 10 * i, prio=0, typ="feature")
 
-def verdict(path, rows):
-    m._ORPHAN_NOTED.clear(); m._ORPHAN_EVIDENCE.clear()
-    buf = io.StringIO()
+class Clock(object):
+    """stands in for the `time` module inside one watchdog copy: time() is the poll's instant, the rest is the real module."""
+    def __init__(self, t): self.t = t
+    def time(self): return self.t
+    def __getattr__(self, k): return getattr(time, k)
+
+W = [None]                                    # the watchdog copy the last verdict() ran in (its evidence is read from it)
+
+def verdict(path, rows, history=None):
+    """The poll at NOW of a REAL watchdog copy (fresh: no state carries between cases) that has been watching the queue —
+    by default every 2min for the last 15min; `history` = [(secs_ago, rows)] says otherwise. Those earlier polls found no order
+    file yet and their notes are not what is asserted. A bd that lists `rows` is what `_queued_markers_read` answers (the
+    parse of bd's own output is pinned in gate-recovery-watchdog.selftest.sh)."""
+    w = W[0] = load()
+    polls = history if history is not None else [(ago, rows) for ago in range(900, 0, -120)]
     try:
-        with Patch(ORPHAN_ORDER_FILE=path, _queued_markers_read=lambda: rows), contextlib.redirect_stdout(buf):
-            res = m.orphaned_queued_marker()
+        w.ORPHAN_ORDER_FILE = os.path.join(TMP, "not-yet-written.json")
+        for ago, r in polls:
+            w.time = Clock(NOW - ago)
+            w._queued_markers_read = lambda r=r: r
+            with contextlib.redirect_stdout(io.StringIO()):
+                w.orphaned_queued_marker()
+        w._ORPHAN_NOTED.clear(); w._ORPHAN_EVIDENCE.clear()
+        w.ORPHAN_ORDER_FILE = path
+        w.time = Clock(NOW)
+        w._queued_markers_read = lambda: rows
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = w.orphaned_queued_marker()
     except Exception as e:                    # an older watchdog copy (WD_OVERRIDE) has a different shape: report, don't crash
-        res = ("EXC", repr(e), 0)
+        return ("EXC", repr(e), 0), ""
     return res, buf.getvalue()
 
 QUIET = (None, None, 0)
@@ -204,17 +228,17 @@ pa = chain("a", [[qm(HEAD, OLD, prio=3), p0(i)] for i in range(5)])
 da = doc_of(pa)
 check(da and len(da["pubs"]) == 5 and all([e["id"] for e in p["order"]][-1] == HEAD and p["order"][-1]["class"] == "P3/other" for p in da["pubs"]),
       "precondition: in every one of 5 real sweeps the dispatcher ordered the P3 head LAST, behind the P0 that arrived that sweep")
-res, out = verdict(pa, [head_row(), (p0(4)["id"], "crew/wa-worker/x", NOW - 130, ("gate-status:queued",), NOW - 130)])
+res, out = verdict(pa, [head_row(), (p0(4)["id"], "crew/wa-worker/x", NOW - 130, ("gate-status:queued",))])
 check(res == QUIET and out == "",
       "(a) the old P3 head behind P0s -> silence: no orphan and no 'cannot prove' note either (got %r, output %r)" % (res, out))
 
 # (b) a head the dispatcher never saw
 pb = chain("b", [[p0(i)] for i in range(5)])
 res, out = verdict(pb, [head_row()])
-ev = m._ORPHAN_EVIDENCE.get(HEAD, "") if hasattr(m, "_ORPHAN_EVIDENCE") else ""
+ev = W[0]._ORPHAN_EVIDENCE.get(HEAD, "") if hasattr(W[0], "_ORPHAN_EVIDENCE") else ""
 check(res[0] == HEAD and res[1] == HEAD_BR and abs(res[2] - 7200) < 300,          # NOW was read when the file started; the chains above take a while
       "(b) a head absent from the published order in the last 3 consecutive sweeps -> flagged (got %r)" % (res,))
-check("absent from the dispatcher's published queue order" in ev and "last 3 sweeps" in ev and "never saw it" in ev,
+check("absent from the dispatcher's published queue order" in ev and "last 3 sweeps" in ev and "never saw it" in ev and "watched" in ev,
       "(b) ...and the evidence says what was proven, over how many sweeps (%r)" % (ev,))
 check(out == "", "(b) ...with no 'cannot prove' note: the proof was available (output %r)" % (out,))
 
@@ -228,9 +252,21 @@ pb3 = chain("b-mid", [[p0(0)], [p0(1)], [p0(2)], [qm(HEAD, OLD, prio=3), p0(3)],
 res, out = verdict(pb3, [head_row()])
 check(res == QUIET, "(b) seen in ONE of the last 3 sweeps (the middle one) -> silence (got %r)" % (res,))
 
-res, out = verdict(pb, [head_row(updated=NOW - 300)])
+# A re-queue is a LABEL write (parked -> queued): bd's updated_at does not move, so nothing in the marker row says it happened.
+# What shows it is a poll of the watchdog that did not list the marker. The window of pb is NOW-300 .. NOW-60.
+rows = [head_row()]
+res, out = verdict(pb, rows, history=[(900, rows), (780, rows), (660, rows), (540, rows), (420, []), (300, rows), (180, rows), (60, rows)])
 check(res == QUIET and out == "",
-      "(b) the marker was re-queued INSIDE the window (updated_at after the oldest of the 3 sweeps) -> silence: it was never in a position to be seen (got %r)" % (res,))
+      "(b) the marker was re-queued INSIDE the window (absent from the watchdog's poll 7min ago, back since, updated_at frozen) -> silence: it was never in a position to be seen (got %r, output %r)" % (res, out))
+res, out = verdict(pb, rows, history=[(900, rows), (780, rows), (660, rows), (540, rows), (420, []), (300, []), (180, []), (60, rows)])
+check(res == QUIET and out == "",
+      "(b) ...and one back only for the newest poll is silent too (got %r, output %r)" % (res, out))
+res, out = verdict(pb, rows, history=[(900, rows), (780, rows), (660, rows), (540, []), (420, rows), (360, rows), (180, rows), (60, rows)])
+check(res[0] == HEAD,
+      "(b) ...while one re-queued BEFORE the window began (back at the poll 7min ago; the window starts 5min ago) was queued through all of it -> flagged (got %r)" % (res,))
+res, out = verdict(pb, rows, history=[(60, rows)])
+check(res == QUIET and "orphan-proof unavailable (unwatched)" in out,
+      "(b) a watchdog that started 1min ago has not watched the window -> 'cannot prove' (unwatched), said: silence would read as 'no orphan' (got %r, output %r)" % (res, out.strip()))
 
 pcd = chain("cooldown", [[qm(HEAD, OLD, prio=3, labels=["gate:retry-cooldown-until:%d" % (int(NOW) + 3600)])]] * 5)
 res, out = verdict(pcd, [head_row()])
@@ -265,7 +301,7 @@ with Patch(ORPHAN_ORDER_FILE=os.path.join(TMP, "never-written.json"), _queued_ma
         m.orphaned_queued_marker()
 check(buf.getvalue().count("orphan-proof unavailable") == 1,
       "(c) five polls against the same unreadable file print the note ONCE, not five times (got %d)" % buf.getvalue().count("orphan-proof unavailable"))
-res, out = verdict(os.path.join(TMP, "never-written.json"), [(HEAD, HEAD_BR, NOW - 600, ("gate-status:queued",), NOW - 600)])
+res, out = verdict(os.path.join(TMP, "never-written.json"), [(HEAD, HEAD_BR, NOW - 600, ("gate-status:queued",))])
 check(res == QUIET and out == "", "(c) ...and a marker too young to need a proof does not even read the file or print a note (got %r, output %r)" % (res, out))
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -279,13 +315,15 @@ LEGACY = ["_dispatcher_claims", "_dispatcher_hard_age", "_dispatcher_hard_age_fr
 left = [n for n in LEGACY if hasattr(m, n)]
 check(not left, "the claim-order machinery is gone from the watchdog (still defined: %r)" % (left,))
 parts = {}
-for n in ("_orphan_candidates", "_orphan_verdict", "_read_published_orders", "_published_sweep", "orphaned_queued_marker"):
+for n in ("_orphan_candidates", "_orphan_verdict", "_orphan_track", "_read_published_orders", "_published_sweep", "orphaned_queued_marker"):
     fn = getattr(m, n, None)
     parts[n] = inspect.getsource(fn) if fn is not None else ""
 check(all(parts.values()), "the new proof's functions exist: %s" % ", ".join(sorted(parts)))
 body = "\n".join("\n".join(l for l in s.splitlines() if not l.lstrip().startswith("#")) for s in parts.values())
 check(bool(body) and not re.search(r"DISPATCH_LOG|_read_log_last_lines|Attempting to claim|\bsh\(", body),
       "the proof reads only the published file and the queued-marker list: no dispatcher log, no claim lines, no bd call of its own")
+check(bool(body) and "updated" not in body,
+      "...and never bd's updated_at: a label write (how a marker is re-queued) does not move it, so it cannot show a marker untouched")
 
 print("Group D: the head-picking this proof replaced is not back, and the shared-order registry is clean (ga-9t9acg.13 pins, kept)")
 city = os.path.normpath(os.path.join(scripts_dir, os.pardir))

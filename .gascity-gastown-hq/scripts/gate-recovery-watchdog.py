@@ -65,8 +65,10 @@ DETECTS (orphaned queued marker — the gt-mqkwj signature, 2026-06-12):
       (b) the published file is readable, holds >= ORPHAN_ORDER_SWEEPS (3) publications with strictly
           increasing times, the newest no further ahead of now than a clock-skew margin (ORPHAN_ORDER_MARGIN_SEC),
           and the newest is fresh (ORPHAN_DRAIN_FRESH_SEC);
-      (c) M has been untouched since BEFORE the oldest of those publications (its updated_at, less a
-          margin) — a marker re-queued inside the window was never in a position to be seen in it;
+      (c) this watchdog has seen M queued at EVERY poll since before the oldest of those publications (less a
+          margin) — a marker that left the queue and came back inside the window was never in a position to
+          be seen in it. That is the watchdog's own record (_orphan_track), not bd's: a re-queue is a label
+          write, and bd's modification time does not move on one;
       (d) M is in NONE of those publications, neither in `order` nor in `set_aside`.
     Why this is a PROOF and not a guess: the selection excludes nothing but a retry cooldown, and a cooldown
     marker is published as set_aside. So a queued marker in neither list was not in the dispatcher's input — a
@@ -77,7 +79,8 @@ DETECTS (orphaned queued marker — the gt-mqkwj signature, 2026-06-12):
     Three states, never two: every input the file cannot establish — missing, not JSON, a different version, a
     malformed publication, fewer than 3 sweeps (right after a deploy), a stale newest publication (the
     dispatcher is not running, or exits before computing an order — quiet hours, headroom gate), a clock that
-    steps backwards, a marker whose updated_at is unknown — is "cannot prove": said once an hour for as long
+    steps backwards, a watchdog that has not been polling the queue since before the window (it just
+    started, or a poll failed or was skipped for minutes) — is "cannot prove": said once an hour for as long
     as a candidate exists ("orphan-proof unavailable (<reason>)"), never "orphan". A dispatcher that has not
     been restarted onto the publishing code therefore shows up as "order-unreadable", not as silence.
 
@@ -151,7 +154,8 @@ try:
     ORPHAN_ORDER_SWEEPS = max(2, int(os.environ.get("GRW_ORPHAN_ORDER_SWEEPS", "3")))  # consecutive published sweeps a marker must be absent from; one is a snapshot, not a pattern, so never below 2
 except ValueError:
     ORPHAN_ORDER_SWEEPS = 3
-ORPHAN_ORDER_MARGIN_SEC = 60       # slack between the dispatcher's sweep clock and bd's updated_at (1s resolution each, set by different processes); a marker must have been untouched this long BEFORE the window's first publication
+ORPHAN_ORDER_MARGIN_SEC = 60       # slack between the dispatcher's sweep clock and this watchdog's poll clock (1s resolution, two processes); a marker must have been watched queued this long BEFORE the window's first publication
+ORPHAN_WATCH_GAP_SEC = 3 * POLL_SEC  # two polls further apart than this are not one watch: a marker may have left the queue and come back between them (a poll or two skipped by a slow loop is tolerated)
 ORPHAN_NOTE_EVERY_SEC = 3600       # a "cannot prove" note (proof unavailable) is printed at most this often per reason
 WAKE_COOLDOWN_SEC = int(os.environ.get("WAKE_COOLDOWN_SEC", "1200"))   # base: don't dispatch a new repair for the SAME condition more than once per 20min
 ESCALATE_AFTER_WAKES = int(os.environ.get("ESCALATE_AFTER_WAKES", "2"))  # after N unresolved repair-cycles for one condition, page Athos 🚨
@@ -1043,9 +1047,8 @@ def frozen_reviewer_run_verdict(pending_names, killed_identities):
 
 
 def _queued_markers_read():
-    """[(id, branch, created_epoch, labels, updated_epoch), ...] for every OPEN gate-status:queued marker (labels: a
-    tuple of the marker's label strings; updated_epoch: None when updated_at is missing/unparseable), or None when the
-    marker list could NOT be read (bd failed, timed out, or returned something that is not JSON). [] means the read
+    """[(id, branch, created_epoch, labels), ...] for every OPEN gate-status:queued marker (labels: a tuple of the
+    marker's label strings), or None when the marker list could NOT be read (bd failed, timed out, or returned something that is not JSON). [] means the read
     succeeded and no open marker is queued — a different fact from None, which says nothing about the queue (ga-clexh7).
     --all is required to surface the normally-hidden gate-marker type, but it also lifts bd's default closed-issue
     hiding — so a marker closed via the ad-hoc withdrawal path (e.g. "WITHDRAWN as duplicate") that kept its
@@ -1080,10 +1083,7 @@ def _queued_markers_read():
             if m:
                 branch = m.group(1)
                 break
-        # ga-dtecvq: updated_at rides along — the orphan proof only counts a marker as unseen for a window of sweeps
-        # it was already queued, unchanged, at the start of (a re-queue inside the window restarts the clock).
-        out.append((row.get("id"), branch, _iso_epoch(row.get("created_at")), tuple(row.get("labels") or ()),
-                    _iso_epoch(row.get("updated_at"))))
+        out.append((row.get("id"), branch, _iso_epoch(row.get("created_at")), tuple(row.get("labels") or ())))
     return out
 
 
@@ -1097,6 +1097,8 @@ def _queued_markers_read():
 # a marker that IS in the order and keeps losing to newer ones is a priority outcome, never an orphan.
 _ORPHAN_NOTED = {}            # reason -> last time its "cannot prove" note was printed
 _ORPHAN_EVIDENCE = {}         # marker id -> why the last detection called it an orphan (read by main()'s log line)
+_ORPHAN_QSINCE = {}           # marker id -> the poll that first listed it queued; kept only while EVERY poll since has listed it (_orphan_track)
+_ORPHAN_WATCH = {"since": None, "last": None}   # the first and the newest poll of the current unbroken watch of the queued list
 
 
 def _orphan_note(reason, msg, now=None):
@@ -1158,34 +1160,45 @@ def _read_published_orders(path=None):
     return (pubs, "")
 
 
+def _orphan_track(rows, now):
+    """Record this poll of the queued-marker list (None: unreadable). A marker's `since` is the first poll of an unbroken run
+    of polls that listed it queued: one poll that did not ends its run; an unreadable list, or a pause longer than
+    ORPHAN_WATCH_GAP_SEC, ends every run and the watch itself — nothing is known about a queue nobody looked at. bd cannot
+    give this continuity: a re-queue is a label write, and bd's modification time does not move on one."""
+    w = _ORPHAN_WATCH
+    if rows is None or (w["last"] is not None and now - w["last"] > ORPHAN_WATCH_GAP_SEC):
+        _ORPHAN_QSINCE.clear()
+        w["since"] = w["last"] = None
+    if rows is None:
+        return
+    kept = dict((r[0], _ORPHAN_QSINCE.get(r[0], now)) for r in rows)    # listed before in this run: keep its first poll; not listed now: dropped
+    _ORPHAN_QSINCE.clear()
+    _ORPHAN_QSINCE.update(kept)
+    w["since"] = w["since"] or now
+    w["last"] = now
+
+
 def _orphan_candidates(markers, now, min_age):
-    """[(id, branch, created_epoch, updated_epoch)] for the queued markers old enough to be worth a proof. `updated`
-    is None when the marker row carries none (an old-shape tuple, or an unparseable updated_at)."""
-    out = []
-    for m in markers:
-        mid, branch, created = m[0], m[1], m[2]
-        updated = m[4] if len(m) > 4 else None
-        if mid and branch and created and now - created >= min_age:
-            out.append((mid, branch, created, updated))
-    return out
+    """[(id, branch, created_epoch)] for the queued markers old enough to be worth a proof."""
+    return [(m[0], m[1], m[2]) for m in markers if m[0] and m[1] and m[2] and now - m[2] >= min_age]
 
 
-def _orphan_verdict(markers, pubs, why, now, sweeps=None, min_age=None, fresh_sec=None, margin=None):
+def _orphan_verdict(markers, pubs, why, now, since, watch0, sweeps=None, min_age=None, fresh_sec=None, margin=None):
     """Decide whether a queued marker is INVISIBLE to the dispatcher. Returns (orphan, reason, detail): orphan is
-    (id, branch, age_sec) or None; reason is a short code for the outcome (the caller notes only the 'cannot prove'
-    ones); detail is the evidence for 'orphan' and the explanation for a 'cannot prove'.
+    (id, branch, age_sec) or None; reason is a short code (the caller notes only the 'cannot prove' ones); detail is the
+    evidence for 'orphan' and the explanation for a 'cannot prove'. `since` (marker id -> first poll of its unbroken run
+    of polls that listed it queued) and `watch0` (first poll of the unbroken watch) come from _orphan_track.
 
     A marker is an orphan only when ALL hold:
-      - it is queued and old enough (min_age) — a marker younger than that has not had a sweep to be seen in;
+      - it is queued and old enough (min_age): a younger one has not had a sweep to be seen in;
       - the published order is readable, holds >= `sweeps` publications with strictly increasing times, the newest no
-        further ahead of now than `margin` (clock skew between two processes is tolerated, a clock that stepped back
-        is not), and the newest is fresh (else the file describes a dispatcher that is not running or not publishing,
-        and 'absent from it' means nothing);
-      - the marker has been untouched since BEFORE the oldest of those `sweeps` publications (its updated_at, less a
-        margin) — a marker that was re-queued after the window began was never in a position to be seen in it;
+        further ahead of now than `margin` (skew between two processes is tolerated, a clock stepped back is not) and
+        fresh (else the file describes a dispatcher that is not publishing, and 'absent from it' means nothing);
+      - this watchdog has polled the queue without a break since `margin` before the oldest of those publications (else
+        it cannot tell a marker queued all along from one that came back inside the window), and listed the marker
+        queued at every poll since (a marker first seen later was perhaps re-queued in the window, so it was not there to be seen);
       - it is in NONE of those publications, ordered or set aside.
-    Every other case is a non-verdict. The ones where the proof itself is unavailable carry a reason other than
-    'no-orphan' (the caller says so); a candidate touched inside the window, or one the dispatcher saw, is 'no-orphan'."""
+    Every other case is a non-verdict; those where the proof itself is unavailable carry a reason other than 'no-orphan'."""
     sweeps = ORPHAN_ORDER_SWEEPS if sweeps is None else sweeps
     min_age = ORPHAN_MIN_AGE_SEC if min_age is None else min_age
     fresh_sec = ORPHAN_DRAIN_FRESH_SEC if fresh_sec is None else fresh_sec
@@ -1203,25 +1216,26 @@ def _orphan_verdict(markers, pubs, why, now, sweeps=None, min_age=None, fresh_se
         return (None, "clock", "the last %d publication times are not strictly increasing, or the newest is more than %ds ahead of now" % (sweeps, margin))
     if now - ats[-1] > fresh_sec:
         return (None, "stale", "the newest publication is %dmin old (limit %dmin)" % ((now - ats[-1]) // 60, fresh_sec // 60))
+    fmt = lambda t: time.strftime("%m-%d %H:%M:%S", time.localtime(t))
+    if watch0 is None or watch0 + margin > ats[0]:
+        return (None, "unwatched", "this watchdog's polls of the queue began %s, after the window began (%s)" % ("never" if watch0 is None else fmt(watch0), fmt(ats[0])))
     found = []
-    for (mid, branch, created, updated) in cands:
-        if updated is None or updated + margin > ats[0]:
-            continue                                         # unknown, or touched since the window began
+    for (mid, branch, created) in cands:
+        seen = since.get(mid)
+        if seen is None or seen + margin > ats[0]:
+            continue                                         # first seen queued inside the window (or never): perhaps re-queued in it
         if any(mid in p["ids"] for p in win):
             continue                                         # the dispatcher saw it: its place in the order is a priority outcome
-        found.append((created, mid, branch, updated))
+        found.append((created, mid, branch, seen))
     if not found:
-        if any(c[3] is None for c in cands):
-            return (None, "updated-unknown", "a queued marker's updated_at could not be read, so it cannot be shown untouched since the window began")
         return (None, "no-orphan", "")
     found.sort()
-    created, mid, branch, updated = found[0]
-    fmt = lambda t: time.strftime("%m-%d %H:%M:%S", time.localtime(t))
+    created, mid, branch, seen = found[0]
     detail = ("absent from the dispatcher's published queue order (ordered or set aside) in each of its last %d sweeps "
-              "(%s .. %s; they ordered %s marker(s) and set aside %s) although it has been queued and untouched since %s "
+              "(%s .. %s; they ordered %s marker(s) and set aside %s) although it has been queued and watched since %s "
               "(age %dmin) — the dispatcher never saw it, whatever its priority%s"
               % (sweeps, fmt(ats[0]), fmt(ats[-1]), "/".join(str(p["n_order"]) for p in win),
-                 "/".join(str(p["n_aside"]) for p in win), fmt(updated), (now - created) // 60,
+                 "/".join(str(p["n_aside"]) for p in win), fmt(seen), (now - created) // 60,
                  "" if len(found) == 1 else "; %d more queued marker(s) are invisible the same way" % (len(found) - 1)))
     return ((mid, branch, int(now - created)), "orphan", detail)
 
@@ -1231,7 +1245,7 @@ _ORPHAN_NOTES = {
     "short-history": "too few published sweeps to prove a marker invisible",
     "clock": "the published sweep times cannot be trusted",
     "stale": "the dispatcher is not publishing its queue order",
-    "updated-unknown": "a queued marker's age since its last change is unknown",
+    "unwatched": "the queue has not been watched since before those sweeps (this watchdog just started, or a poll failed or was skipped for minutes)",
 }
 
 
@@ -1240,18 +1254,20 @@ def orphaned_queued_marker():
     order in ga-dtecvq — see _orphan_verdict). Returns (marker_id, branch, age_sec), else (None, None, 0). The evidence for
     a hit is left in _ORPHAN_EVIDENCE[marker_id]. Three states, never two: a marker the dispatcher saw is no orphan, a
     marker it provably did not see is, and everything the proof cannot establish (the order file missing, unreadable,
-    stale, too short or clock-stepped; a queued marker whose updated_at is unknown; the queued-marker list itself
-    unreadable) is 'cannot prove' — said at most once an hour per reason, never 'orphan'. A candidate that was touched
-    inside the window is not 'cannot prove' and is not said: it is simply not judged yet, and a later window will."""
+    stale, too short or clock-stepped; this watchdog not having polled the queue since before the window; the
+    queued-marker list itself unreadable) is 'cannot prove' — said at most once an hour per reason, never 'orphan'. A
+    candidate first seen queued inside the window is not 'cannot prove' and is not said: it may just have been
+    re-queued, so it is not judged yet, and a later window will."""
     now = time.time()
     rows = _queued_markers_read()
+    _orphan_track(rows, now)         # every poll, whatever the rest can prove: the unbroken watch is built here, before any early return
     if rows is None:
         _orphan_note("queue-unreadable", "cannot read the queued-marker list (bd) — nothing can be proven about it", now)
         return (None, None, 0)
     if not _orphan_candidates(rows, now, ORPHAN_MIN_AGE_SEC):
         return (None, None, 0)       # nothing queued long enough to need a proof: the order file is not even read
     pubs, why = _read_published_orders()
-    orphan, reason, detail = _orphan_verdict(rows, pubs, why, now)
+    orphan, reason, detail = _orphan_verdict(rows, pubs, why, now, _ORPHAN_QSINCE, _ORPHAN_WATCH["since"])
     if reason in _ORPHAN_NOTES:
         _orphan_note(reason, "%s — %s" % (_ORPHAN_NOTES[reason], detail), now)
     if orphan is None:
@@ -1585,7 +1601,7 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
             "`grep -c 'Attempting to claim marker %s ' .gc/logs/quality-gate-dispatcher.log` → se 0, o dispatcher "
             "nunca tentou despachá-lo. (O watchdog já provou que o dispatcher NUNCA VIU este marker: ele está AUSENTE da "
             "ordem publicada em .gc/runtime/gate-queue-order.json — nem em `order` nem em `set_aside` — nas últimas "
-            "varreduras, estando parado na fila sem alteração desde antes delas; veja a linha 'orphan' no diagnóstico. "
+            "varreduras, e o watchdog o viu gate-status:queued em TODA leitura desde antes delas (não foi re-enfileirado nesse intervalo); veja a linha 'orphan' no diagnóstico. "
             "Ficar ATRÁS de markers mais novos NÃO é isso: a ordem é prioridade > feature > idade, e um marker que "
             "aparece na ordem só está esperando a vez.)\n"
             "3. Confirme que o dispatcher está DRENANDO outros branches (há 'sweep complete' recente p/ branches "
@@ -5223,7 +5239,7 @@ def main():
                 last_orphan_spawn = now; saw_orphan = True
         if not orphan_id:
             # nothing flagged this sweep → the next candidate logs immediately. orphaned_queued_marker() also
-            # answers (None, None, 0) for an unreadable log; the worst that costs here is one repeated log line.
+            # answers (None, None, 0) when it cannot prove (unreadable list, unwatched window); the worst that costs here is one repeated log line.
             orphan_logged.clear()
     except Exception as e:
         print("[watchdog] loop error (continuing): %r" % e, flush=True)
