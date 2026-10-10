@@ -720,6 +720,32 @@ has "$(events skip)" "pool=no-such-pool" "a pool with no agent.toml at HEAD is s
 eq "$(levels)" "" "and while its ceiling is unknown nothing is RAISED (the budget cannot be checked: an unknown is not a zero)"
 eng_quiet $((T0 + 700)) 7000 11264 "POOL_CEILING_ENGINE_POOLS=wa-worker ps-worker gate-reviewer no-such-pool"
 eq "$(levels)" "gate-reviewer=2" "but the pressure lowering carries on for the pools that are known"
+# A ceiling that cannot be read must not undo what the pressure already did (gate ga-9j2yjo): dropping a pool's entry hands it back to
+# the committed value - a RAISE for a pool the engine had lowered, while the pressure that lowered it is still there. The entry that is
+# there is HELD: neither raised nor lowered, because the engine does not know what it would be moving from or to.
+mk_city s19d
+eng_quiet "$T0" 7000 11264
+eq "$(levels)" "gate-reviewer=2" "swap 7000 MB lowers gate-reviewer 3 -> 2 (the setup: a pool BELOW its committed value)"
+printf '# no max_active_sessions line here\n' > "$C/agents/gate-reviewer/agent.toml"; cm unreadable
+eng_quiet $((T0 + 700)) 7000 11264; eng_quiet $((T0 + 1400)) 7000 11264
+eq "$(levels)" "gate-reviewer=2" "gate-reviewer's committed ceiling becomes UNREADABLE, pressure unchanged: its entry is HELD, not dropped (dropping it re-raises 2 -> 3)"
+eq "$(resolved gate-reviewer)" "2" "and the controller still resolves 2: what gc loads is what the engine meant"
+eq "$(nevents write)" "1" "no second write for a pool nobody can say anything new about (a drop would be a write, and one more of the day's 10)"
+has "$(events skip | tail -1)" "pool=gate-reviewer" "the log still names the pool whose committed value could not be read"
+has "$(events skip | tail -1)" "hold-entry" "and says its entry was HELD (not dropped)"
+mk_city s19e   # the whole read fails at once (git cannot run for one sweep): every pool unreadable, nothing may move
+eng_quiet "$T0" 7000 11264
+for p in wa-worker ps-worker gate-reviewer; do printf '# no max_active_sessions line here\n' > "$C/agents/$p/agent.toml"; done; cm all-unreadable
+eng_quiet $((T0 + 700)) 7000 11264; eng_quiet $((T0 + 1400)) 7000 11264
+eq "$(levels)" "gate-reviewer=2" "every committed ceiling unreadable for the sweep: the fragment is NOT emptied under pressure"
+eq "$(nevents write)" "1" "and no flapping: the three blind sweeps wrote nothing (a flaky git must not eat the daily breaker)"
+mk_city s19f   # the over-correction guard: a KNOWN 0 is the operator's pause and wins - holding its old entry would un-pause the pool
+eng_quiet "$T0" 7000 11264
+printf 'max_active_sessions = 0\n' > "$C/agents/gate-reviewer/agent.toml"; cm pause
+sed -i '' '/name = "gate-reviewer"/{n;s/max_active_sessions = 3/max_active_sessions = 0/;}' "$C/city.toml"   # the fake gc takes its base from city.toml: pause it there too
+eng_quiet $((T0 + 700)) 7000 11264
+eq "$(levels)" "" "gate-reviewer lowered to 2, then PAUSED (committed 0): its entry is dropped, the pause stands (an entry of 2 would override it)"
+eq "$(resolved gate-reviewer)" "0" "and the controller resolves the pause"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -873,6 +899,10 @@ M = [
  ("preflight-notifies-every-sweep", "14", '&& [ "$pfrc" -eq 1 ] && pce_notify', '; [ "$pfrc" -eq 1 ] && pce_notify'),
  ("write-failed-notifies-every-sweep", "14", '&& pce_notify "pool-ceiling-engine: could not write', '; pce_notify "pool-ceiling-engine: could not write'),
  ("daily-counter-write-failure-is-silent", "10", ' || pce_log "event=state-write-failed" "what=daily-counter" "effect=the breaker may undercount today\'s writes"', ''),
+ # the defect of gate round ga-9j2yjo: an unreadable committed ceiling DROPPED the pool's entry, re-raising a pool the pressure had lowered
+ ("unreadable-ceiling-entry-not-remembered", "19", '_pce_int "$L" && held=$(_pce_map_set "$held" "$pool" "$L")', ':'),
+ ("held-entry-not-rendered", "19", '_pce_int "$new" && dev=$(_pce_map_set "$dev" "$pool" "$new"); continue; }', 'continue; }'),
+ ("paused-pool-entry-is-held", "19", 'if [ "$C" = "0" ]; then pce_log "event=skip"', 'if [ "$C" = "0" ]; then held=$(_pce_map_set "$held" "$pool" "$(_pce_map_get "$cur_map" "$pool")"); pce_log "event=skip"'),
 ]
 names = []
 for name, secs, old, new in M:

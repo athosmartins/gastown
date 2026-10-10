@@ -26,10 +26,10 @@
 #   that bound to LIVE sessions only; the controller never does).
 #
 # THREE STATES, everywhere (not-found != found-and-zero != could-not-find-out): a swap/disk reading that cannot be taken NEVER
-# reads as "clear"; a committed value that cannot be read is NOT 0 (that pool's entry is dropped and nothing is raised while it is
-# unknown); a config that cannot be read back after a write is a failed write. Doubt never RAISES: a passing doubt (include unknown,
-# preflight or date unreadable, < 3 blind sweeps) HOLDS the file as it is; one that persists or proves wrong (blind for 3 sweeps while
-# raised, a failed read-back, a trip, the breaker) goes back to the EMPTY fragment, the inert state.
+# reads as "clear"; a committed value that cannot be read is NOT 0 (that pool's entry is HELD, never dropped: a drop hands the pool back to
+# the committed value = a RAISE - and nothing is raised while it is unknown); a config that cannot be read back is a failed write. Doubt
+# never RAISES: a passing doubt (include unknown, preflight or date unreadable, < 3 blind sweeps) HOLDS the file as it is; one that persists
+# or proves wrong (blind for 3 sweeps while raised, a failed read-back, a trip, the breaker) goes back to the EMPTY fragment, the inert state.
 #
 # SAFETY NETS (each one proven by a mutant in pool-ceiling-engine.selftest.sh):
 #   read-back   after EVERY write: gc config show --json, each entry must resolve to the intended value. A typo'd key is
@@ -606,13 +606,13 @@ _pce_sweep_locked() {
 
   # 6. one decision per pool
   local pool C L floor ceil cs us lsw lw counted rate_ok d new reason wt
-  local proposed="" dev="" cs_map="" us_map="" lw_map="" lsw_map="" c_map="" l_map="" sum=0 skipped=""
+  local proposed="" dev="" cs_map="" us_map="" lw_map="" lsw_map="" c_map="" l_map="" sum=0 skipped="" held=""
   for pool in $PCE_POOLS; do
     C=$(pce_committed "$pool")
     if [ "$C" = "0" ]; then pce_log "event=skip" "pool=$pool" "reason=committed-0-paused" "action=entry-dropped"; continue; fi
     if ! _pce_int "$C"; then
-      skipped="$skipped $pool"
-      pce_log "event=skip" "pool=$pool" "reason=committed-unreadable" "action=entry-dropped,no-raise-while-unknown"
+      skipped="$skipped $pool"; L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" && held=$(_pce_map_set "$held" "$pool" "$L")   # its entry stays as it is (step 8)
+      pce_log "event=skip" "pool=$pool" "reason=committed-unreadable" "action=hold-entry,no-raise-while-unknown"
       continue
     fi
     L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" || L="$C"
@@ -661,10 +661,10 @@ _pce_sweep_locked() {
     fi
   done
 
-  # 8. the model of the fragment: only DEVIATIONS from committed, in pool order
+  # 8. the model of the fragment: only DEVIATIONS from committed, in pool order; a pool with an unreadable committed ceiling KEEPS its entry (dropping it = a raise)
   for pool in $PCE_POOLS; do
     new=$(_pce_map_get "$proposed" "$pool"); C=$(_pce_map_get "$c_map" "$pool")
-    _pce_int "$new" || continue
+    _pce_int "$new" || { new=$(_pce_map_get "$held" "$pool"); _pce_int "$new" && dev=$(_pce_map_set "$dev" "$pool" "$new"); continue; }
     [ "$new" -eq "$C" ] || dev=$(_pce_map_set "$dev" "$pool" "$new")
   done
   local content

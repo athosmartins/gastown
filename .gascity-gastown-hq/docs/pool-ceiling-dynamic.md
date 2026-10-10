@@ -177,8 +177,12 @@ o Pilot sai do passo em quota/RAM/quiet-hours e o gate só roda o teto com marke
   no máximo **1 escrita por 10 min por pool**. A faixa 6–9 GB de disco não sobe nem desce (histerese).
 - **Terceiro estado em tudo:** swap/disco que não pôde ser lido **nunca** conta como "claro" (pressão `unknown`: não sobe; cego por ≥ 3 varreduras
   enquanto acima do commitado → volta ao commitado). Valor commitado `0` (a pausa do operador) é um **zero de verdade**: o pool é pulado, a entrada some e isso
-  **não** trava os aumentos dos outros. Valor commitado **ilegível** não é `0`: a entrada some também, mas enquanto ele for desconhecido **nada sobe** em pool nenhum
-  (a soma dos tetos não se pode mostrar dentro do orçamento; o log diz `reason=committed-unreadable` e `unknown=<pool>`). Baixar continua valendo — com dúvida o motor nunca LEVANTA.
+  **não** trava os aumentos dos outros (e o `0` conhecido vence: manter a entrada antiga tiraria o pool da pausa). Valor commitado **ilegível** não é `0` e **não apaga a
+  entrada**: apagá-la devolveria o pool ao valor commitado, isto é, SUBIRIA um pool que a pressão tinha baixado (gate ga-9j2yjo). A entrada que o pool já tem fica **como está**
+  (nem sobe nem desce: o motor não sabe de onde nem para onde a moveria; sem entrada, nenhuma é criada) e, enquanto ele for desconhecido, **nada sobe** em pool nenhum
+  (a soma dos tetos não se pode mostrar dentro do orçamento; o log diz `reason=committed-unreadable action=hold-entry` e `unknown=<pool>`). Baixar continua valendo para os pools
+  conhecidos — com dúvida o motor nunca LEVANTA. Se a leitura falhar para TODOS os pools numa varredura (um `git` que não roda), o fragmento fica como está: não esvazia e não gasta
+  escrita do disjuntor. A dúvida que persiste congela os níveis atuais até o commitado voltar a ser legível ou até o `.off` (que esvazia).
 - **Orçamento:** um aumento nunca faz a **soma** dos tetos (wa-worker + ps-worker + gate-reviewer) passar de `GC_VARIABLE_SESSION_MAX` (o menor entre o env e o plist
   vivo do Pilot; ilegível → 6, o padrão dos dispatchers). Os dispatchers só aplicam esse limite a sessões **vivas**; o controller nunca.
 - **Só varreduras consecutivas valem:** a contagem de varreduras claras **expira** se a última varredura contada foi há mais de 1200 s
@@ -226,7 +230,7 @@ fragmento: o freio dos dispatchers segue limitado ao valor commitado. (c) Os out
 ## Verificação
 
 `bash packs/town-deltas/assets/pool-ceiling-engine.selftest.sh` prova o motor (seção acima): cada cenário roda num repositório git descartável, o `gc` falso é provado contra o `gc` REAL (mesmos fragmentos, mesmas respostas)
-e depois **52 regras são quebradas, uma por vez**, numa cópia do motor — cada mutante tem de deixar a suíte vermelha (`PCE_ST_NO_MUTANTS=1` pula essa parte numa rodada rápida; `PCE_ST_MUTANT_FILTER="nome1 nome2"` roda só alguns).
+e depois **55 regras são quebradas, uma por vez**, numa cópia do motor — cada mutante tem de deixar a suíte vermelha (`PCE_ST_NO_MUTANTS=1` pula essa parte numa rodada rápida; `PCE_ST_MUTANT_FILTER="nome1 nome2"` roda só alguns).
 
 `bash packs/town-deltas/assets/pool-ceiling.selftest.sh` (292 asserts; passa em `/bin/bash` 3.2 e bash 5) — reprova sem a lib
 e sem a fiação nos dois dispatchers; inclui a função de cola REAL do Pilot e o bloco REAL do teto do gate
