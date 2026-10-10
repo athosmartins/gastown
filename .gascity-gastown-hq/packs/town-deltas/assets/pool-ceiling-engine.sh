@@ -39,8 +39,8 @@
 #               empties the fragment and trips until tomorrow. A read-back MISMATCH trips until a human runs `reset`.
 #   lock        one instance at a time (mkdir + heartbeat + TTL); a second run exits silently.
 #   include     read from city.toml's PARSED include array (1/0/?). With .on but not a definite 1 no level is written (it could not
-#               apply). With the include 1 or ? and the fragment ABSENT (clean clone / DR) the engine re-creates it EMPTY, enabled or
-#               not: that is the one state that would break the next reload, and empty is config-identical to "no engine".
+#               apply). With the include 1 or ? and the fragment ABSENT (clean clone / DR) the engine re-creates it - EMPTY when disabled or
+#               include "?"; enabled + include 1 the sweep writes it from the model (empty unless a level deviates). Absent = the next reload breaks.
 #
 # SWITCHES (files under $GC_CITY/.gc, all instant, none needs a plist edit):
 #   pool-ceiling-engine.on    the engine acts ONLY with this file. Without it: silent, no level written (bar the repair above) - and the
