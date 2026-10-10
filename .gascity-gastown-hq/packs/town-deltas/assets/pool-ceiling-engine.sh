@@ -2,12 +2,11 @@
 # pool-ceiling-engine.sh (ga-m9x0lb.2) — makes the CONTROLLER's pool ceiling (agents/<pool>/agent.toml:
 # max_active_sessions) follow the Athos rule, WITHOUT rewriting any tracked file.
 #
-# WHY. pool-ceiling.sh (ga-uywvsc) only brakes inside the engine's cap. The case that started it all —
-# wa-worker pinned at 2 with 69 beads ready — needs the cap itself to move, and the controller enforces
-# agent.toml on its own (ga-o3o09z). Rewriting agent.toml / city.toml is the wrong tool (ga-m9x0lb): the
-# town-root-reconciler treats a dirty tracked file as a conflict, and `gc agent suspend/resume` re-encodes
-# the whole file (ga-gdjav). Mayor's decision 09/10 (ga-m9x0lb): ONE generated, UNTRACKED fragment under .gc/
-# with [[patches.agent]] blocks, included once by city.toml.
+# WHY. pool-ceiling.sh (ga-uywvsc) only brakes inside the engine's cap. The case that started it all — wa-worker pinned at 2
+# with 69 beads ready — needs the cap itself to move, and the controller enforces agent.toml on its own (ga-o3o09z). Rewriting
+# agent.toml / city.toml is the wrong tool (ga-m9x0lb): the town-root-reconciler treats a dirty tracked file as a conflict, and
+# `gc agent suspend/resume` re-encodes the whole file (ga-gdjav). Mayor's decision 09/10 (ga-m9x0lb): ONE generated, UNTRACKED
+# fragment under .gc/ with [[patches.agent]] blocks, included once by city.toml.
 #
 # THE FRAGMENT: $GC_CITY/.gc/pool-ceiling-engine.toml. This script is its ONLY writer.
 #   - written atomically (tmp + mv), only [[patches.agent]] dir/name/max_active_sessions, only allowlisted pools;
@@ -26,9 +25,11 @@
 #   10 min per pool. A raise never makes the sum of the ceilings exceed GC_VARIABLE_SESSION_MAX (the dispatchers apply
 #   that bound to LIVE sessions only; the controller never does).
 #
-# THREE STATES, everywhere (not-found != found-and-zero != could-not-find-out): a swap/disk reading that cannot be
-# taken NEVER reads as "clear"; a committed value that cannot be read drops that pool's entry; a config that cannot be
-# read back after a write is a failed write. Under doubt the state is the INERT one: the fragment empty.
+# THREE STATES, everywhere (not-found != found-and-zero != could-not-find-out): a swap/disk reading that cannot be taken NEVER
+# reads as "clear"; a committed value that cannot be read is NOT 0 (that pool's entry is dropped and nothing is raised while it is
+# unknown); a config that cannot be read back after a write is a failed write. Doubt never RAISES: a passing doubt (include unknown,
+# preflight or date unreadable, < 3 blind sweeps) HOLDS the file as it is; one that persists or proves wrong (blind for 3 sweeps while
+# raised, a failed read-back, a trip, the breaker) goes back to the EMPTY fragment, the inert state.
 #
 # SAFETY NETS (each one proven by a mutant in pool-ceiling-engine.selftest.sh):
 #   read-back   after EVERY write: gc config show --json, each entry must resolve to the intended value. A typo'd key is
@@ -37,12 +38,13 @@
 #   breaker     at most POOL_CEILING_ENGINE_DAILY_MAX (10) writes per local day; the next non-empty write instead
 #               empties the fragment and trips until tomorrow. A read-back MISMATCH trips until a human runs `reset`.
 #   lock        one instance at a time (mkdir + heartbeat + TTL); a second run exits silently.
-#   include     read from city.toml's PARSED include array (1/0/?). With .on but not a definite 1 nothing is written (it could not
-#               apply). With the include 1 or ? and the fragment ABSENT (clean clone / DR) the engine re-creates it EMPTY, even when disabled: that is the
-#               one state that would break the next reload, and empty is config-identical to "no engine".
+#   include     read from city.toml's PARSED include array (1/0/?). With .on but not a definite 1 no level is written (it could not
+#               apply). With the include 1 or ? and the fragment ABSENT (clean clone / DR) the engine re-creates it EMPTY, enabled or
+#               not: that is the one state that would break the next reload, and empty is config-identical to "no engine".
 #
 # SWITCHES (files under $GC_CITY/.gc, all instant, none needs a plist edit):
-#   pool-ceiling-engine.on    the engine acts ONLY with this file. Without it: silent, nothing read, nothing written.
+#   pool-ceiling-engine.on    the engine acts ONLY with this file. Without it: silent, no level written (bar the repair above) - and the
+#                             fragment KEEPS its current levels: to stand down use .off, never just remove .on.
 #   pool-ceiling-engine.off   KILL SWITCH: empties the fragment, resets the per-pool state, wins over .on.
 #   pool-ceiling-engine.sh plan     evaluate one sweep and PRINT it (no write of any kind; works without .on)
 #   pool-ceiling-engine.sh status   switches, include, fragment levels, per-pool state, breaker, budget, signals now
@@ -52,8 +54,7 @@
 # NOT here (slice 3, Mayor, supervised): the one-line `include` in city.toml, installing the launchd job, the first .on
 # and the kill-switch drill. This file only DECIDES and WRITES the fragment; the drift watcher (compute_hash now covers
 # the fragment) applies it with `gc reload --soft`. gastown.dog stays out: eval-window-concurrency-guard owns its
-# max_active_sessions in city.toml and the fragment would override it (ga-m9x0lb.1). refino-gate-reviewer and
-# auto-refiner stay out while their agents are suspended.
+# max_active_sessions in city.toml and the fragment would override it (ga-m9x0lb.1); so do refino-gate-reviewer and auto-refiner.
 #
 # Sourceable (functions only, no side effects, never `exit`s). Executable for the subcommands above (no arg = run).
 # bash 3.2 compatible (macOS /bin/bash): no associative arrays, no ${x,,}, no mapfile.
@@ -109,6 +110,7 @@ pce_init() {
   PCE_CLEAR_SWEEPS=$(_pce_knob POOL_CEILING_ENGINE_CLEAR_SWEEPS 2 1)
   PCE_SWEEP_GAP_SECS=$(_pce_knob POOL_CEILING_ENGINE_SWEEP_GAP_SECS 240 0)
   PCE_RATE_SECS=$(_pce_knob POOL_CEILING_ENGINE_RATE_SECS 600 0)
+  PCE_STREAK_EXPIRE_SECS=$(_pce_knob POOL_CEILING_ENGINE_STREAK_EXPIRE_SECS 1200 1)   # a clear streak older than this is not "consecutive" any more
   PCE_DAILY_MAX=$(_pce_knob POOL_CEILING_ENGINE_DAILY_MAX 10 1)
   PCE_UNKNOWN_RESTORE=$(_pce_knob POOL_CEILING_ENGINE_UNKNOWN_RESTORE_SWEEPS 3 1)
   PCE_LOCK_TTL=$(_pce_knob POOL_CEILING_ENGINE_LOCK_TTL 300 1)
@@ -261,14 +263,14 @@ _pce_load_lib() { # the signal readers of pool-ceiling.sh; absent/broken lib => 
 pce_read_swap_used_mb() { _pce_load_lib || return 0; pool_ceiling_read_swap_used_mb; return 0; }
 pce_read_disk_free_mb() { _pce_load_lib || return 0; pool_ceiling_read_disk_free_mb; return 0; }
 
-# pce_committed <pool> — the max_active_sessions COMMITTED at HEAD (integer >= 1), or nothing. Never the working tree:
-# a dirty agent.toml is somebody's experiment, not the baseline the engine restores to. 0 (the operator's pause) and
-# unreadable both read as "nothing" => that pool is not touched.
+# pce_committed <pool> — the max_active_sessions COMMITTED at HEAD: an integer >= 1, "0" (the operator's pause: a KNOWN zero), or NOTHING
+# when it cannot be read (no file at HEAD, no such line, git failing). Never the working tree: a dirty agent.toml is somebody's
+# experiment, not the baseline the engine restores to. The caller must not read "nothing" as 0.
 pce_committed() {
   local pool="$1" txt v
   txt=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "$PCE_CITY" show "HEAD:./agents/$pool/agent.toml" 2>/dev/null) || return 0
   v=$(printf '%s\n' "$txt" | sed -n 's/^max_active_sessions[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*\(#.*\)\{0,1\}$/\1/p' | head -1)
-  if _pce_int "$v" && [ "$v" -ge 1 ]; then printf '%s' "$v"; fi
+  if _pce_int "$v"; then printf '%s' "$v"; fi
   return 0
 }
 
@@ -329,11 +331,11 @@ pce_log() {
   printf '%s\n' "$line" >> "$PCE_LOG" 2>/dev/null || true
   return 0
 }
-# pce_log_change <key> <k=v ...> — a steady-state condition (no include, tripped...) is logged when it APPEARS, not every sweep.
+# pce_log_change <key> <k=v ...> — a steady-state condition (no include, tripped...) is logged when it APPEARS, not every sweep (rc 0 = it was).
 pce_log_change() {
   local key="$1"; shift
   if [ "$PCE_DRY" = "1" ]; then pce_log "$@"; return 0; fi
-  [ "$(cat "$PCE_STATE/last-condition" 2>/dev/null)" = "$key" ] && return 0
+  [ "$(cat "$PCE_STATE/last-condition" 2>/dev/null)" = "$key" ] && return 1   # rc 1 = already logged: callers notify only on rc 0
   pce_log "$@"
   printf '%s\n' "$key" > "$PCE_STATE/last-condition.tmp.$$" 2>/dev/null && mv -f "$PCE_STATE/last-condition.tmp.$$" "$PCE_STATE/last-condition" 2>/dev/null
   return 0
@@ -369,8 +371,7 @@ pce_lock_acquire() { # 0 = ours; 1 = a LIVE run holds it (back off, silently)
     [ -s "$PCE_LOCK_HB" ] || { rm -f "$PCE_LOCK_HB" 2>/dev/null; rmdir "$PCE_LOCK_DIR" 2>/dev/null; return 1; }
     return 0
   fi
-  # The holder's age is its heartbeat's; a dir with NO heartbeat (a crash between mkdir and the first write) ages by the dir
-  # itself — otherwise it would read as "mid-race, live" for ever and the engine would stay stuck at whatever it last wrote.
+  # The holder's age is its heartbeat's; with NO heartbeat (a crash between mkdir and the first write) it is the dir's own, else it reads "mid-race, live" for ever.
   local age
   if [ -e "$PCE_LOCK_HB" ]; then age=$(_pce_lock_age "$PCE_LOCK_HB"); else age=$(_pce_lock_age "$PCE_LOCK_DIR"); fi
   if [ "$age" -lt "$PCE_LOCK_TTL" ] && ! _pce_lock_dead; then return 1; fi
@@ -524,8 +525,7 @@ pce_sweep() {
   if [ -z "$PCE_NOW" ]; then PCE_NOW="?"; pce_log "event=skip" "reason=clock-unreadable"; return 0; fi
 
   local has_on=0 has_off=0 include
-  [ -e "$PCE_ON_FILE" ] && has_on=1
-  [ -e "$PCE_OFF_FILE" ] && has_off=1
+  [ -e "$PCE_ON_FILE" ] && has_on=1; [ -e "$PCE_OFF_FILE" ] && has_off=1
   include=$(pce_include_state)
 
   # Disabled: silent and inert — except the one repair that cannot make anything worse.
@@ -565,12 +565,11 @@ _pce_sweep_locked() {
   if [ -e "$PCE_STATE/tripped" ]; then
     local tk td tr
     tk=$(_pce_kv "$PCE_STATE/tripped" kind); td=$(_pce_kv "$PCE_STATE/tripped" date); tr=$(_pce_kv "$PCE_STATE/tripped" reason)
-    if [ "$tk" = "daily" ] && [ "$td" != "$(_pce_date_of "$PCE_NOW")" ]; then
+    if [ "$tk" = "daily" ] && [[ "$td" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [ "$td" != "$(_pce_date_of "$PCE_NOW")" ]; then   # an unreadable stored date is not "another day"
       [ "$PCE_DRY" = "1" ] || rm -f "$PCE_STATE/tripped" 2>/dev/null
       pce_log "event=trip-expired" "was=$tr" "date=$td"
     else
-      # restore only when there is something to restore: a no-op restore logs under its own dedup key, which would alternate
-      # with the "tripped" key below and log both lines on every sweep
+      # restore only when there is something to restore: a no-op restore logs under its own dedup key, which would alternate with the "tripped" key below
       pce_fragment_is_empty || pce_restore "tripped:$tr" >/dev/null
       pce_log_change "tripped:$tk:$td:$tr" "event=tripped" "kind=$tk" "date=$td" "reason=$tr" "action=stay-empty (reset: pool-ceiling-engine.sh reset)"
       return 0
@@ -579,6 +578,7 @@ _pce_sweep_locked() {
 
   # 3. nothing to apply without the include; "cannot tell" is not "included" (a fragment the controller never loads is not in force)
   if [ "$include" != "1" ] && [ "$PCE_DRY" != "1" ]; then
+    pce_repair_missing_fragment   # a definite 0 repairs nothing; "?" must not leave an ABSENT fragment (a load error if it IS included) unrepaired
     if [ ! -r "$PCE_CITY_TOML" ]; then
       pce_log_change "city-toml-unreadable" "event=skip" "reason=city.toml is UNREADABLE ($PCE_CITY_TOML): cannot tell whether it includes the fragment - nothing written"
     elif [ "$include" = "0" ]; then
@@ -606,12 +606,13 @@ _pce_sweep_locked() {
 
   # 6. one decision per pool
   local pool C L floor ceil cs us lsw lw counted rate_ok d new reason wt
-  local proposed="" dev="" cs_map="" us_map="" lw_map="" lsw_map="" reason_map="" c_map="" l_map="" sum=0 skipped=""
+  local proposed="" dev="" cs_map="" us_map="" lw_map="" lsw_map="" c_map="" l_map="" sum=0 skipped=""
   for pool in $PCE_POOLS; do
     C=$(pce_committed "$pool")
+    if [ "$C" = "0" ]; then pce_log "event=skip" "pool=$pool" "reason=committed-0-paused" "action=entry-dropped"; continue; fi
     if ! _pce_int "$C"; then
       skipped="$skipped $pool"
-      pce_log "event=skip" "pool=$pool" "reason=committed-unreadable-or-paused" "action=entry-dropped"
+      pce_log "event=skip" "pool=$pool" "reason=committed-unreadable" "action=entry-dropped,no-raise-while-unknown"
       continue
     fi
     L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" || L="$C"
@@ -620,6 +621,9 @@ _pce_sweep_locked() {
     cs=$(pce_state_get "$pool" clear_streak); us=$(pce_state_get "$pool" unknown_streak)
     lsw=$(pce_state_get "$pool" last_sweep_at); lw=$(pce_state_get "$pool" last_write_at)
     [ "$lsw" -le "$PCE_NOW" ] || lsw=0; [ "$lw" -le "$PCE_NOW" ] || lw=0      # a stamp in the future (clock jump) is not a permanent limit
+    # "2 counted sweeps" = 2 CONSECUTIVE ones: after a long silence (trip, .on removed, asleep) the clear streak restarts. Only cs: expiring the
+    # unknown streak would delay the restore to committed, the less inert direction.
+    if [ "$lsw" -ne 0 ] && [ $((PCE_NOW - lsw)) -gt "$PCE_STREAK_EXPIRE_SECS" ]; then cs=0; fi
     if ! pce_state_ok "$pool"; then
       pce_log_change "state-corrupt:$pool" "event=state-corrupt" "pool=$pool" "action=treated as just written: no raise for ${PCE_RATE_SECS}s, streaks restart (the file is rewritten this sweep)"
       cs=0; us=0; lw="$PCE_NOW"
@@ -640,22 +644,20 @@ _pce_sweep_locked() {
     cs_map=$(_pce_map_set "$cs_map" "$pool" "$cs"); us_map=$(_pce_map_set "$us_map" "$pool" "$us")
     lw_map=$(_pce_map_set "$lw_map" "$pool" "$lw")
     if [ "$counted" = "1" ]; then lsw_map=$(_pce_map_set "$lsw_map" "$pool" "$PCE_NOW"); else lsw_map=$(_pce_map_set "$lsw_map" "$pool" "$lsw"); fi
-    reason_map=$(_pce_map_set "$reason_map" "$pool" "$reason")
     wt=$(pce_worktree_cap "$pool")
     sum=$((sum + new))
     pce_log "event=sweep" "pool=$pool" "committed=$C" "worktree_cap=${wt:-?}" "cur=$L" "new=$new" "reason=$reason" "pressure=$pressure" "swap_used_mb=${swap:-?}" "disk_free_mb=${disk:-?}" "clear_streak=$cs" "unknown_streak=$us" "counted=$counted"
   done
 
-  # 7. budget: a RAISE may not push the sum of the ceilings past GC_VARIABLE_SESSION_MAX (cancel raises until it fits; the
-  #    status quo is never lowered because of the budget)
+  # 7. budget: a RAISE may not push the sum of the ceilings past GC_VARIABLE_SESSION_MAX (cancel raises until it fits; the status quo
+  #    is never lowered because of it). While any pool's ceiling is UNKNOWN (skipped, unreadable) the sum cannot be shown to fit: no raise.
   for pool in $PCE_POOLS; do
     new=$(_pce_map_get "$proposed" "$pool"); L=$(_pce_map_get "$l_map" "$pool")
     _pce_int "$new" || continue
-    if [ "$new" -gt "$L" ] && [ "$sum" -gt "$budget" ]; then
+    if [ "$new" -gt "$L" ] && { [ "$sum" -gt "$budget" ] || [ -n "$skipped" ]; }; then
       sum=$((sum - (new - L)))
       proposed=$(_pce_map_set "$proposed" "$pool" "$L")
-      reason_map=$(_pce_map_set "$reason_map" "$pool" "hold:budget")
-      pce_log "event=budget" "pool=$pool" "cancelled-raise=$L->$new" "budget=$budget" "sum_if_raised=$((sum + new - L))"
+      pce_log "event=budget" "pool=$pool" "cancelled-raise=$L->$new" "budget=$budget" "sum_if_raised=$((sum + new - L))" "unknown=${skipped# }"
     fi
   done
 
@@ -712,14 +714,13 @@ _pce_sweep_locked() {
     local pf pfrc
     pf=$(pce_preflight "$dev"); pfrc=$?
     if [ "$pfrc" -ne 0 ]; then
-      pce_log_change "preflight:$pfrc:$dev" "event=preflight-failed" "rc=$pfrc" "detail=$pf" "wanted=$dev" "action=nothing-written"
-      [ "$pfrc" -ne 1 ] || pce_notify "pool-ceiling-engine: not writing '$dev' - $pf (a patch for a missing agent breaks the config load)"
+      pce_log_change "preflight:$pfrc:$dev" "event=preflight-failed" "rc=$pfrc" "detail=$pf" "wanted=$dev" "action=nothing-written" \
+        && [ "$pfrc" -eq 1 ] && pce_notify "pool-ceiling-engine: not writing '$dev' - $pf (a patch for a missing agent breaks the config load)"
       return 0
     fi
   fi
   if ! pce_write_fragment "$content"; then
-    pce_log "event=write-failed" "to=${dev:-<committed>}"
-    pce_notify "pool-ceiling-engine: could not write $PCE_FRAGMENT"
+    pce_log_change "write-failed:$dev" "event=write-failed" "to=${dev:-<committed>}" && pce_notify "pool-ceiling-engine: could not write $PCE_FRAGMENT"
     return 0
   fi
   pce_daily_bump
@@ -756,9 +757,10 @@ pce_check() {
   pce_fragment_parse >/dev/null; case $? in 0) echo "ok: include present, fragment present and well-formed"; return 0 ;; 1) echo "VIOLATION: fragment has FOREIGN content (hand edit / old version)"; return 1 ;; *) echo "VIOLATION: fragment unreadable"; return 1 ;; esac
 }
 
+_pce_include_word() { case "$(pce_include_state)" in 1) echo sim ;; 0) echo NAO ;; *) echo DESCONHECIDO ;; esac; }   # a function: bash 3.2 cannot parse a case inside "$( )" in a quoted string
 pce_status() {
   PCE_NOW=$(_pce_now); PCE_NOW="${PCE_NOW:-?}"
-  echo "ligado: $([ -e "$PCE_ON_FILE" ] && echo SIM || echo nao)  kill-switch: $([ -e "$PCE_OFF_FILE" ] && echo PRESENTE || echo ausente)  include no city.toml: $(case "$(pce_include_state)" in 1) echo sim ;; 0) echo NAO ;; *) echo DESCONHECIDO ;; esac)"
+  echo "ligado: $([ -e "$PCE_ON_FILE" ] && echo SIM || echo nao)  kill-switch: $([ -e "$PCE_OFF_FILE" ] && echo PRESENTE || echo ausente)  include no city.toml: $(_pce_include_word)"
   echo "fragmento: $PCE_FRAGMENT  ($(pce_check | head -1))"
   local lv rc; lv=$(pce_fragment_parse); rc=$?
   if [ "$rc" -eq 2 ]; then echo "  niveis no fragmento: (arquivo AUSENTE ou ilegivel)"
@@ -770,18 +772,17 @@ pce_status() {
   local pool C
   for pool in $PCE_POOLS; do
     C=$(pce_committed "$pool")
-    echo "  $pool: commitado=${C:-?} piso=$(_pce_int "$C" && pce_floor "$pool" "$C" || echo ?) teto=$(_pce_int "$C" && pce_ceil "$pool" "$C" || echo ?) streak-clear=$(pce_state_get "$pool" clear_streak) streak-ilegivel=$(pce_state_get "$pool" unknown_streak) ultima-escrita=$(pce_state_get "$pool" last_write_at)"
+    echo "  $pool: commitado=${C:-?} piso=$([ "${C:-0}" -ge 1 ] && pce_floor "$pool" "$C" || echo ?) teto=$([ "${C:-0}" -ge 1 ] && pce_ceil "$pool" "$C" || echo ?) streak-clear=$(pce_state_get "$pool" clear_streak) streak-ilegivel=$(pce_state_get "$pool" unknown_streak) ultima-escrita=$(pce_state_get "$pool" last_write_at)"
   done
   local s d; s=$(pce_read_swap_used_mb); d=$(pce_read_disk_free_mb)
   echo "sinais agora: swap usado=${s:-?}MB disco livre=${d:-?}MB -> pressao: $(pce_pressure "$s" "$d")"
 }
 
-pce_reset() {
-  mkdir -p "$PCE_STATE" 2>/dev/null
-  rm -f "$PCE_STATE/tripped" "$PCE_STATE/daily" "$PCE_STATE/last-condition" 2>/dev/null
-  local p; for p in $PCE_POOLS; do rm -f "$PCE_STATE/$p.state" 2>/dev/null; done
-  PCE_NOW=$(_pce_now); pce_log "event=reset" "by=manual"
-  echo "reset: disjuntor, contador diario e estado por pool zerados (o fragmento nao foi tocado)"
+pce_reset() {   # claims success only for files that are really gone (rm -f is silent about a read-only dir)
+  local f left=""; mkdir -p "$PCE_STATE" 2>/dev/null; PCE_NOW=$(_pce_now)
+  for f in tripped daily last-condition $(printf '%s.state ' $PCE_POOLS); do rm -f "$PCE_STATE/$f" 2>/dev/null && [ ! -e "$PCE_STATE/$f" ] || left="$left $f"; done
+  if [ -n "$left" ]; then pce_log "event=reset-failed" "left=${left# }"; echo "reset: FALHOU - nao removido:$left (sem permissao em $PCE_STATE?) - o disjuntor e os contadores continuam como estavam"; return 1; fi
+  pce_log "event=reset" "by=manual"; echo "reset: disjuntor, contador diario e estado por pool zerados (o fragmento nao foi tocado)"
 }
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
@@ -791,7 +792,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     run) pce_sweep ;;
     plan) PCE_DRY=1; pce_sweep ;;
     status) pce_status ;;
-    reset) pce_reset ;;
+    reset) pce_reset; exit $? ;;
     check) pce_check; exit $? ;;
     *) echo "uso: pool-ceiling-engine.sh [run|plan|status|reset|check]" >&2; exit 2 ;;
   esac

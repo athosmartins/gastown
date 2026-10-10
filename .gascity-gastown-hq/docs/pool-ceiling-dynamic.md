@@ -176,21 +176,27 @@ o Pilot sai do passo em quota/RAM/quiet-hours e o gate só roda o teto com marke
 - Baixar é **imediato** (1 passo por execução). Subir é 1 passo, só após 2 varreduras **contadas** (duas execuções com < 4 min de intervalo valem 1) e
   no máximo **1 escrita por 10 min por pool**. A faixa 6–9 GB de disco não sobe nem desce (histerese).
 - **Terceiro estado em tudo:** swap/disco que não pôde ser lido **nunca** conta como "claro" (pressão `unknown`: não sobe; cego por ≥ 3 varreduras
-  enquanto acima do commitado → volta ao commitado). Valor commitado ilegível ou `0` (a pausa do operador) → o pool é pulado e a entrada some.
+  enquanto acima do commitado → volta ao commitado). Valor commitado `0` (a pausa do operador) é um **zero de verdade**: o pool é pulado, a entrada some e isso
+  **não** trava os aumentos dos outros. Valor commitado **ilegível** não é `0`: a entrada some também, mas enquanto ele for desconhecido **nada sobe** em pool nenhum
+  (a soma dos tetos não se pode mostrar dentro do orçamento; o log diz `reason=committed-unreadable` e `unknown=<pool>`). Baixar continua valendo — com dúvida o motor nunca LEVANTA.
 - **Orçamento:** um aumento nunca faz a **soma** dos tetos (wa-worker + ps-worker + gate-reviewer) passar de `GC_VARIABLE_SESSION_MAX` (o menor entre o env e o plist
   vivo do Pilot; ilegível → 6, o padrão dos dispatchers). Os dispatchers só aplicam esse limite a sessões **vivas**; o controller nunca.
+- **Só varreduras consecutivas valem:** a contagem de varreduras claras **expira** se a última varredura contada foi há mais de 1200 s
+  (`POOL_CEILING_ENGINE_STREAK_EXPIRE_SECS`): depois de um trip, de um `.on` removido ou de uma noite de máquina parada, "2 varreduras" recomeçam do zero em vez de
+  somar com uma de horas atrás. Só a contagem de claras expira; a de "não sei" não (expirá-la atrasaria a volta ao commitado).
+- **O 3 do wa-worker (e o piso 2) são constantes da regra**, não derivados do valor commitado; os outros pools têm o commitado como teto.
 
 **Salvaguardas** (cada uma tem um mutante no selftest que reprova sem ela):
 
 | Salvaguarda | O que faz |
 |---|---|
-| **Kill switch = ESVAZIAR, nunca apagar** | `touch .gc/pool-ceiling-engine.off` esvazia o fragmento (só comentário = sem override, medido exit 0). **Apagar quebra a cidade**: com o include no `city.toml`, fragmento ausente é erro de *load* (`gc config show` exit 1). O texto original da fatia dizia "apaga o fragmento" — está errado (spike .1). |
+| **Kill switch = ESVAZIAR, nunca apagar** | `touch .gc/pool-ceiling-engine.off` esvazia o fragmento (só comentário = sem override, medido exit 0). **Apagar quebra a cidade**: com o include no `city.toml`, fragmento ausente é erro de *load* (`gc config show` exit 1). O texto original da fatia dizia "apaga o fragmento" — está errado (spike .1). **Só remover o `.on` NÃO esvazia**: o motor fica inerte, mas o fragmento **mantém os níveis que já tinha** — para sair de cena use `.off`. |
 | Leitura de volta | depois de **toda** escrita: `gc config show --json` e conferir que cada entrada resolveu para o valor pretendido. Chave com typo é só um *warning* no gc (exit 0, o teto não mexe): só isto pega. Divergência ou ilegível → esvazia na hora e dispara o disjuntor |
-| Pré-checagem | antes de gravar entrada, o agente tem de existir na config (entrada para agente inexistente = erro de load) |
+| Pré-checagem | antes de gravar entrada, o agente tem de existir na config (entrada para agente inexistente = erro de load). Config **ilegível** (rc 2) também não grava — **inclusive uma redução**: sem ler a config não se prova que o patch carrega; o fragmento fica como está (`preflight-failed`, `nothing-written`). Só o agente ausente (rc 1) avisa (notify) e **uma vez por causa** — a mesma causa durante horas não reenvia a cada 5 min |
 | Disjuntor diário | no máx. 10 escritas por dia local; a próxima vira "esvaziar" e o motor fica inerte até amanhã. Divergência da leitura de volta arma o disjuntor até `pool-ceiling-engine.sh reset` |
 | Lock | uma instância por vez (mkdir + heartbeat + TTL 300 s); lock sem heartbeat envelhece pelo próprio diretório (nunca fica preso); uma idade de lock que **não se lê** (sem `stat` utilizável) vale "fresco", não "antigo": o lock de quem pode estar vivo é respeitado e o fato é logado (`lock-age-unreadable`) |
-| Include | lido do array `include` **parseado** do `city.toml` (python3 + `tomllib`), em 3 estados: 1 / 0 / **não sei** (ilegível, não parseável, forma estranha, python sem `tomllib`). Com `.on` e o include **não confirmado** (0 *ou* "não sei") nada é gravado — "não sei" nunca vale "incluído". Com o include 1 **ou "não sei"** e o fragmento **ausente** (clone limpo/DR) o motor o recria **vazio**, mesmo desligado (um arquivo vazio não muda nada; um ausente quebra o próximo reload) |
-| Estado ilegível | contador diário ou estado por pool que EXISTE mas não se lê **não** vale "zero": o contador vira "no limite" (dispara o disjuntor) e o estado do pool vira "acabou de escrever" (sem subir por 10 min); ambos são logados. Arquivo ausente é primeira execução, não corrupção. Uma gravação de estado que **falha** (contador, estado do pool, disjuntor) também é logada (`state-write-failed`), nunca calada. Idem a **data do calendário**: se não se calcula (o contador e o disjuntor são datados com ela), ler como "dia novo" desligaria o disjuntor e expiraria o trip — a varredura **não grava nada** e loga o motivo (o kill switch continua valendo). O `status` com relógio ou data ilegíveis mostra `escritas hoje: ?`, nunca um `0` datado de 1970 |
+| Include | lido do array `include` **parseado** do `city.toml` (python3 + `tomllib`), em 3 estados: 1 / 0 / **não sei** (ilegível, não parseável, forma estranha, python sem `tomllib`). Com `.on` e o include **não confirmado** (0 *ou* "não sei") nada é gravado — "não sei" nunca vale "incluído". Com o include 1 **ou "não sei"** e o fragmento **ausente** (clone limpo/DR) o motor o recria **vazio**, ligado ou não (um arquivo vazio não muda nada; um ausente quebra o próximo reload) |
+| Estado ilegível | contador diário ou estado por pool que EXISTE mas não se lê **não** vale "zero": o contador vira "no limite" (dispara o disjuntor) e o estado do pool vira "acabou de escrever" (sem subir por 10 min); ambos são logados. Arquivo ausente é primeira execução, não corrupção. Uma gravação de estado que **falha** (contador, estado do pool, disjuntor) também é logada (`state-write-failed`), nunca calada. Idem a **data do calendário**: se não se calcula (o contador e o disjuntor são datados com ela), ler como "dia novo" desligaria o disjuntor e expiraria o trip — a varredura **não grava nada** e loga o motivo (o kill switch continua valendo). Idem a **data guardada no trip**: só um `AAAA-MM-DD` diferente de hoje conta como "outro dia"; uma data ausente ou ilegível **mantém o trip armado** (o caminho é `reset`, por um humano). O `status` com relógio ou data ilegíveis mostra `escritas hoje: ?`, nunca um `0` datado de 1970 |
 | Fragmento estranho | o que não é exatamente o que o motor renderiza (edição à mão, versão antiga, agente fora da allowlist) é reescrito do modelo, nunca confiado |
 
 **Allowlist:** `wa-worker`, `ps-worker`, `gate-reviewer`. **Fora, de propósito:** `gastown.dog` (o `eval-window-concurrency-guard` é o dono do max dele no `city.toml` e o fragmento
@@ -200,8 +206,9 @@ o sobreporia — o guard mudou o dog 6→1→6 em 09/10); `refino-gate-reviewer`
 reload de heartbeat, 30–60 min depois. O `compute_hash` do watcher agora inclui **só esse arquivo** (1 linha); o resto de `.gc/` continua fora (sem tempestade de reload).
 
 **Operação** (`bash packs/town-deltas/assets/pool-ceiling-engine.sh <cmd>`): `plan` (avalia uma varredura e IMPRIME, não escreve nada, funciona sem `.on`),
-`status`, `reset` (zera disjuntor/contador), `check` (só leitura: include presente ⇒ fragmento tem de existir e ser bem-formado). Log TSV: `$GC_CITY/.gc/logs/pool-ceiling-engine.log`;
-estado por pool: `$GC_CITY/.gc/pool-ceiling-engine/`. Avisos (notify) só para anormal: disjuntor, leitura de volta falhou, kill switch esvaziando algo, fragmento recriado.
+`status`, `reset` (zera disjuntor, contador diário e estado por pool; **só diz que zerou o que de fato sumiu**: se algum arquivo não pôde ser removido, imprime `FALHOU - nao removido: …`, loga `reset-failed` e sai com código 1 — o fragmento nunca é tocado), `check` (só leitura: include presente ⇒ fragmento tem de existir e ser bem-formado). Log TSV: `$GC_CITY/.gc/logs/pool-ceiling-engine.log`;
+estado por pool: `$GC_CITY/.gc/pool-ceiling-engine/`. Avisos (notify) só para anormal: disjuntor, leitura de volta falhou, kill switch esvaziando algo, fragmento recriado, agente ausente, gravação que falhou — os dois últimos **uma vez por causa** (a mesma chave do log deduplicado), não a cada varredura.
+O `status` roda no `/bin/bash` 3.2 do plist (o selftest usa o mesmo interpretador para o motor; um erro de sintaxe que só o 3.2 vê reprova a suíte).
 
 **Checklist da fatia 3 (Mayor, supervisionada) — a ORDEM importa:**
 1. criar o fragmento **vazio** (`pool-ceiling-engine.sh` o recria sozinho se faltar e houver include; ou `touch`) — **antes** do include;
@@ -219,7 +226,7 @@ fragmento: o freio dos dispatchers segue limitado ao valor commitado. (c) Os out
 ## Verificação
 
 `bash packs/town-deltas/assets/pool-ceiling-engine.selftest.sh` prova o motor (seção acima): cada cenário roda num repositório git descartável, o `gc` falso é provado contra o `gc` REAL (mesmos fragmentos, mesmas respostas)
-e depois **41 regras são quebradas, uma por vez**, numa cópia do motor — cada mutante tem de deixar a suíte vermelha (`PCE_ST_NO_MUTANTS=1` pula essa parte numa rodada rápida; `PCE_ST_MUTANT_FILTER="nome1 nome2"` roda só alguns).
+e depois **52 regras são quebradas, uma por vez**, numa cópia do motor — cada mutante tem de deixar a suíte vermelha (`PCE_ST_NO_MUTANTS=1` pula essa parte numa rodada rápida; `PCE_ST_MUTANT_FILTER="nome1 nome2"` roda só alguns).
 
 `bash packs/town-deltas/assets/pool-ceiling.selftest.sh` (292 asserts; passa em `/bin/bash` 3.2 e bash 5) — reprova sem a lib
 e sem a fiação nos dois dispatchers; inclui a função de cola REAL do Pilot e o bloco REAL do teto do gate

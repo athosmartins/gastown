@@ -105,6 +105,10 @@ PYTL=""; for p in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do "
 [ -n "$PYTL" ] || { echo "FAIL: no python3 >= 3.11 (tomllib) on this host: the engine cannot read city.toml's include array (pce_include_state)"; exit 1; }
 printf '#!/bin/sh\nexit 1\n' > "$TMPROOT/bin/py-crash"; printf '#!/bin/sh\necho yes\n' > "$TMPROOT/bin/py-junk"; printf '#!/bin/sh\necho 1\nexit 1\n' > "$TMPROOT/bin/py-late-crash"
 chmod +x "$TMPROOT/bin/py-crash" "$TMPROOT/bin/py-junk" "$TMPROOT/bin/py-late-crash"
+# The engine runs under the interpreter the launchd model names (/bin/bash: 3.2 on macOS), never under whichever bash is first on PATH: a
+# "bash 3.2 compatible" claim exercised only under bash 5 is not exercised (gate ga-a7bsxr: a parse error in `status` went unseen for that reason).
+ENGBASH="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$SELF_DIR/pool-ceiling-engine.plist.template" 2>/dev/null)"
+[ -x "$ENGBASH" ] || { echo "FAIL: cannot read the plist model's interpreter (ProgramArguments:0 of pool-ceiling-engine.plist.template): '$ENGBASH'"; exit 1; }
 
 # ── fixture city: a throwaway git repo ────────────────────────────────────────
 T0=1790000000          # a real-looking epoch (2026-09-21): the engine dates its daily counter with it
@@ -143,8 +147,9 @@ eng() {
   local now="$1" swap="$2" disk="$3"; shift 3
   env POOL_CEILING_ENGINE_CITY="$C" POOL_CEILING_ENGINE_NOW="$now" POOL_CEILING_T_SWAP_USED_MB="$swap" POOL_CEILING_T_DISK_FREE_MB="$disk" \
       POOL_CEILING_ENGINE_GC="$GCBIN" POOL_CEILING_ENGINE_NOTIFY="$NOTIFY" POOL_CEILING_ENGINE_PILOT_PLIST="$TMPROOT/no-such.plist" POOL_CEILING_ENGINE_PYTHON="$PYTL" \
-      POOL_CEILING_ENGINE_LIB="$LIB" GC_VARIABLE_SESSION_MAX="${BUDGET:-9}" "$@" bash "$ENGINE" "${ENG_CMD:-run}" 2>&1
+      POOL_CEILING_ENGINE_LIB="$LIB" GC_VARIABLE_SESSION_MAX="${BUDGET:-9}" "$@" "$ENGBASH" "$ENGINE" "${ENG_CMD:-run}" 2>&1
 }
+cm() { ( cd "$C" && git add agents && git -c user.email=t@t -c user.name=t commit -q -m "${1:-edit}" ) >/dev/null 2>&1; }   # commit the agents/ edits made to the fixture city
 eng_quiet() { eng "$@" >/dev/null 2>&1; }
 # levels — the fragment's "pool=level ..." read by an INDEPENDENT awk (not the engine's own parser)
 levels() { awk '/^name[ \t]*=/ { s = $0; sub(/^name[ \t]*=[ \t]*"/, "", s); sub(/".*$/, "", s); n = s } /^max_active_sessions[ \t]*=/ { s = $0; sub(/^[^=]*=[ \t]*/, "", s); printf "%s%s=%s", (c++ ? " " : ""), n, s }' "$C/.gc/pool-ceiling-engine.toml" 2>/dev/null; }
@@ -163,6 +168,7 @@ pce_init
 # ═════════════════════════════════════════════════════════════════════════════
 section "1. sourcing the engine has no side effect; knobs with garbage fall back"
 eq "$(ls -A "$TMPROOT/pure/city")" "" "sourcing + pce_init created nothing under the city"
+eq "$("$ENGBASH" -c 'echo "${BASH_VERSINFO[0]}"')" "3" "the engine runs under the plist model's interpreter ($ENGBASH), bash 3.x: 'bash 3.2 compatible' is exercised, not assumed"
 eq "$(POOL_CEILING_ENGINE_CLEAR_SWEEPS=abc _pce_knob POOL_CEILING_ENGINE_CLEAR_SWEEPS 2 1)" "2" "garbage knob -> default"
 eq "$(POOL_CEILING_ENGINE_CLEAR_SWEEPS=0 _pce_knob POOL_CEILING_ENGINE_CLEAR_SWEEPS 2 1)" "2" "knob below its minimum -> default (0 sweeps would mean 'raise without waiting')"
 eq "$(POOL_CEILING_ENGINE_CLEAR_SWEEPS=3 _pce_knob POOL_CEILING_ENGINE_CLEAR_SWEEPS 2 1)" "3" "valid knob honoured"
@@ -267,6 +273,15 @@ eq "$(nevents write)" "1" "exactly one write"
 has "$(events write)" "readback=ok" "the write was read back through gc config show"
 eq "$(resolved wa-worker)" "3" "the config the controller loads now says 3"
 eq "$(resolved ps-worker)/$(resolved gate-reviewer)" "1/3" "ps-worker and gate-reviewer untouched"
+# "2 counted sweeps" means 2 CONSECUTIVE ones: a clear streak does not survive a long silence (a breaker trip, .on removed and re-added, the Mac asleep)
+mk_city s7b
+eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 5000)) 4000 11264
+eq "$(levels)" "" "1 clear sweep, then 5000 s of silence: the streak does NOT carry over, 1 more clear sweep is not 2"
+eng_quiet $((T0 + 5300)) 4000 11264
+eq "$(levels)" "wa-worker=3" "the next one is the 2nd consecutive sweep: raised"
+mk_city s7c
+eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 900)) 4000 11264
+eq "$(levels)" "wa-worker=3" "a 15 min gap (a couple of missed runs) is still consecutive: the expiry is 20 min, not the 4-min sweep gap"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -328,6 +343,8 @@ SWF=$( ( PCE_DRY=0; PCE_NOW="$T0"; PCE_STATE="$TMPROOT/s10f-no-such-dir/state"; 
          pce_state_put wa-worker 1 0 "$T0" "$T0"; pce_trip daily "x"; cat "$PCE_LOG" ) 2>&1 )
 has "$SWF" "what=wa-worker.state" "a per-pool state that cannot be written is logged (the streaks and the rate limit restart)"
 has "$SWF" "what=trip" "a trip that cannot be written is logged"
+SWD=$( ( PCE_DRY=0; PCE_NOW="$T0"; PCE_STATE="$TMPROOT/s10f-no-such-dir/state"; PCE_LOG="$TMPROOT/s10g.log"; pce_daily_bump; cat "$PCE_LOG" ) 2>&1 )
+has "$SWD" "what=daily-counter" "a daily counter that cannot be written is logged (the breaker may undercount)"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -361,6 +378,22 @@ eq "$(b POOL_CEILING_ENGINE_PILOT_PLIST="$PLIST")" "6" "budget from the plist al
 eq "$(b GC_VARIABLE_SESSION_MAX=4 POOL_CEILING_ENGINE_PILOT_PLIST="$PLIST")" "4" "env 4 < plist 6 -> 4"
 eq "$(b POOL_CEILING_ENGINE_PILOT_PLIST=/nonexistent)" "6" "neither readable -> the dispatchers' own default 6 (the inert direction)"
 eq "$(b GC_VARIABLE_SESSION_MAX=abc POOL_CEILING_ENGINE_PILOT_PLIST=/nonexistent)" "6" "garbage env -> default, not 0 and not unlimited"
+# A ceiling that cannot be READ is not a ceiling of 0 (it would under-count the sum and let a raise through, gate ga-a7bsxr): while any pool is
+# unknown nothing is raised. The operator's pause (committed 0) is the only legitimate zero, and lowering never waits for the budget.
+mk_city s12d
+printf '# no max_active_sessions line here\n' > "$C/agents/ps-worker/agent.toml"; cm unreadable
+BUDGET=6 csw 4 "$T0"
+eq "$(levels)" "" "ps-worker's committed ceiling UNREADABLE, budget 6: wa-worker 3 + ps-worker ? + gate-reviewer 3 cannot be shown <= 6 - no raise, however many sweeps"
+has "$(events budget)" "unknown=ps-worker" "the log says the budget stopped it and names the pool whose ceiling is unknown"
+eq "$(nevents write)" "0" "no write at all"
+mk_city s12e
+printf 'max_active_sessions = 0\n' > "$C/agents/ps-worker/agent.toml"; cm pause
+BUDGET=6 csw 2 "$T0"
+eq "$(levels)" "wa-worker=3" "ps-worker PAUSED (committed 0, a KNOWN zero): 3 + 0 + 3 = 6 <= 6, the raise lands - a pause is not 'unknown'"
+mk_city s12f
+printf '# no max_active_sessions line here\n' > "$C/agents/ps-worker/agent.toml"; cm unreadable
+csw 2 "$T0"; eng_quiet $((T0 + 700)) 7000 11264
+eq "$(levels)" "gate-reviewer=2" "an unknown ceiling blocks only RAISES: under pressure the known pools are still lowered"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -413,6 +446,33 @@ G="POOL_CEILING_ENGINE_POOLS=wa-worker ps-worker gate-reviewer ghost-worker"
 BUDGET=12 eng_quiet "$T0" 4000 11264 "$G" POOL_CEILING_ENGINE_GHOST_WORKER_CEIL=3; BUDGET=12 eng_quiet $((T0 + 300)) 4000 11264 "$G" POOL_CEILING_ENGINE_GHOST_WORKER_CEIL=3
 eq "$(levels)" "" "an allowlisted pool that is NOT in the config: nothing written (it would be a config LOAD ERROR), not even the legitimate raise"
 has "$(events preflight-failed)" "ghost-worker" "the log names the missing agent"
+BUDGET=12 eng_quiet $((T0 + 600)) 4000 11264 "$G" POOL_CEILING_ENGINE_GHOST_WORKER_CEIL=3; BUDGET=12 eng_quiet $((T0 + 900)) 4000 11264 "$G" POOL_CEILING_ENGINE_GHOST_WORKER_CEIL=3
+eq "$(grep -c 'not writing' "$TMPROOT/notify.log")" "1" "the same missing agent over 4 sweeps notifies ONCE (the log line was deduplicated, the notification was not)"
+mk_city s14g
+eng_quiet "$T0" 4000 11264; chmod 555 "$C/.gc"
+eng_quiet $((T0 + 300)) 4000 11264; eng_quiet $((T0 + 600)) 4000 11264; eng_quiet $((T0 + 900)) 4000 11264
+chmod 755 "$C/.gc"
+eq "$(nevents write-failed)" "1" "a fragment that cannot be written (the .gc dir is read-only) is logged once, not on every 5-minute sweep"
+eq "$(grep -c 'could not write' "$TMPROOT/notify.log")" "1" "and notified once"
+# `reset` says it cleared the trip only when the files are really gone (an unwritable state dir used to print the same success line, rc 0)
+mk_city s14e; SD="$C/.gc/pool-ceiling-engine"; mkdir -p "$SD"; printf 'kind=manual\ndate=2026-09-21\nreason=readback-mismatch\n' > "$SD/tripped"
+chmod 555 "$SD"; out="$(ENG_CMD=reset eng "$T0" 4000 11264)"; rc=$?; chmod 755 "$SD"
+eq "$rc" "1" "reset with an UNWRITABLE state dir: exit 1, not 0"
+has "$out" "FALHOU" "and it says it FAILED"
+hasnt "$out" "zerados" "and never claims the trip was cleared"
+eq "$([ -e "$SD/tripped" ] && echo tripped || echo free)" "tripped" "(the trip really is still armed)"
+has "$(events reset-failed)" "tripped" "the failure is logged, with what was left"
+out="$(ENG_CMD=reset eng "$T0" 4000 11264)"; rc=$?
+eq "$rc/$([ -e "$SD/tripped" ] && echo tripped || echo free)" "0/free" "reset with a writable state dir: exit 0 and the trip is gone"
+has "$out" "zerados" "and it says so"
+# a daily trip is expired only by a DIFFERENT, readable date: where the stored date cannot be read it is not 'another day' (the engine always writes it; a
+# hand-edited or foreign file may not) - step 1b guards the CURRENT date for the same collapse, this is its sibling
+n=0
+for tc in 'no date line|reason=daily-breaker' 'empty date|date=\nreason=daily-breaker' 'garbage date|date=not-a-date\nreason=daily-breaker'; do
+  n=$((n + 1)); mk_city "s14f$n"; SD="$C/.gc/pool-ceiling-engine"; mkdir -p "$SD"; printf 'kind=daily\n%b\n' "${tc#*|}" > "$SD/tripped"
+  csw 3 "$T0"
+  eq "$(levels)/$(nevents trip-expired)/$([ -e "$SD/tripped" ] && echo tripped || echo free)" "/0/tripped" "a daily trip with ${tc%%|*}: NOT expired, still tripped, nothing written"
+done
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -560,6 +620,16 @@ eq "$(ENG_CMD=check eng "$T0" 4000 11264)" "ok: city.toml does not include the f
 has "$(ENG_CMD=status eng "$T0" 4000 11264)" "include no city.toml: NAO" "status: NAO for a definite 0"
 incw i16 'include = ".gc/pool-ceiling-engine.toml"'
 has "$(ENG_CMD=status eng "$T0" 4000 11264)" "include no city.toml: DESCONHECIDO" "status: DESCONHECIDO when it cannot tell (never NAO)"
+hasnt "$(ENG_CMD=status eng "$T0" 4000 11264)" "syntax error" "status prints no shell syntax error under the plist's bash 3.2 (a case inside \$( ) inside a quoted string does not parse there)"
+# .on + include 'cannot tell' + fragment ABSENT: the same repair as when disabled (the header and the doc promise it for include 1 OR ?)
+mk_city i17; { printf 'include = ".gc/pool-ceiling-engine.toml"\n'; sed '1d' "$C/city.toml"; } > "$TMPROOT/ct.new" && mv "$TMPROOT/ct.new" "$C/city.toml"; rm -f "$C/.gc/pool-ceiling-engine.toml"
+eng_quiet "$T0" 4000 11264
+eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo ABSENT)" "created" "ENABLED + include 'cannot tell' + fragment ABSENT: re-created EMPTY (the state the safety net exists for), as when disabled"
+out="$(pce_fragment_parse "$C/.gc/pool-ceiling-engine.toml")"; eq "$?/$out" "0/" "and it is a well-formed fragment with NO entries: no level was written on a guess"
+has "$(events repair)" "include=?" "the repair log says the include was undecidable"
+mk_city i18; sed -i '' '/^include/d' "$C/city.toml"; rm -f "$C/.gc/pool-ceiling-engine.toml"
+eng_quiet "$T0" 4000 11264
+eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo untouched)" "untouched" "ENABLED + a definite 'no include' + fragment absent: nothing is created (control)"
 
 mk_city s16f
 printf '[[patches.agent]]\ndir = ""\nname = "wa-worker"\nmax_active_session = 3\n' > "$C/.gc/pool-ceiling-engine.toml"
@@ -647,7 +717,9 @@ eq "$(levels)" "wa-worker=3" "and the others carry on"
 mk_city s19c
 csw 2 "$T0" "POOL_CEILING_ENGINE_POOLS=wa-worker ps-worker gate-reviewer no-such-pool"
 has "$(events skip)" "pool=no-such-pool" "a pool with no agent.toml at HEAD is skipped, not guessed"
-eq "$(levels)" "wa-worker=3" "and the others carry on"
+eq "$(levels)" "" "and while its ceiling is unknown nothing is RAISED (the budget cannot be checked: an unknown is not a zero)"
+eng_quiet $((T0 + 700)) 7000 11264 "POOL_CEILING_ENGINE_POOLS=wa-worker ps-worker gate-reviewer no-such-pool"
+eq "$(levels)" "gate-reviewer=2" "but the pressure lowering carries on for the pools that are known"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -758,7 +830,7 @@ M = [
  ("lowering-obeys-the-rate-limit", "9", 'if [ "$L" -gt "$floor" ]; then echo "$((L - 1))|lower:pressure"', 'if [ "$L" -gt "$floor" ] && [ "$rate_ok" = "1" ]; then echo "$((L - 1))|lower:pressure"'),
  ("no-rate-limit-on-raise", "9", 'rate_ok=0; if [ "$lw" -eq 0 ] || [ $((PCE_NOW - lw)) -ge "$PCE_RATE_SECS" ]; then rate_ok=1; fi', 'rate_ok=1'),
  ("other-pools-go-above-committed", "11", '*:ceil) echo "$3" ;;', '*:ceil) echo "$(( $3 + 1 ))" ;;'),
- ("budget-ignored", "12", 'if [ "$new" -gt "$L" ] && [ "$sum" -gt "$budget" ]; then', 'if [ "$new" -gt "$L" ] && [ "$sum" -gt 9999 ]; then'),
+ ("budget-ignored", "12", '[ "$sum" -gt "$budget" ] ||', '[ "$sum" -gt 9999 ] ||'),
  ("budget-takes-the-larger-source", "12", 'if [ "$a" -le "$b" ]; then echo "$a"; else echo "$b"; fi', 'if [ "$a" -ge "$b" ]; then echo "$a"; else echo "$b"; fi'),
  ("no-readback", "14", 'rb=$(pce_readback "$dev"); rbrc=$?', 'rb=""; rbrc=0'),
  ("readback-compares-nothing", "14", 'if [ "$got" != "$want" ]; then mism=1;', 'if false; then mism=1;'),
@@ -789,6 +861,18 @@ M = [
  ("baseline-from-the-working-tree", "19", 'txt=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "$PCE_CITY" show "HEAD:./agents/$pool/agent.toml" 2>/dev/null) || return 0', 'txt=$(cat "$PCE_CITY/agents/$pool/agent.toml" 2>/dev/null) || return 0'),
  ("render-accepts-any-pool", "5", '    case " $PCE_POOLS " in *" $p "*) ;; *) return 1 ;; esac', '    :'),
  ("render-accepts-zero", "5", '_pce_int "$v" && [ "$v" -ge 1 ] && [ "$v" -le "$PCE_HARD_MAX" ] || return 1', '_pce_int "$v" && [ "$v" -le "$PCE_HARD_MAX" ] || return 1'),
+ # the defects of gate round ga-a7bsxr, and the class around each
+ ("status-parses-only-under-bash-5", "16", 'include no city.toml: $(_pce_include_word)"', 'include no city.toml: $(case "$(pce_include_state)" in 1) echo sim ;; 0) echo NAO ;; *) echo DESCONHECIDO ;; esac)"'),
+ ("unknown-ceiling-reads-as-zero", "12", 'skipped="$skipped $pool"', ':'),
+ ("paused-pool-reads-as-unknown", "12", 'if [ "$C" = "0" ]; then pce_log "event=skip"', 'if [ "$C" = "0" ]; then skipped="$skipped $pool"; pce_log "event=skip"'),
+ ("reset-claims-success-unchecked", "14", 'rm -f "$PCE_STATE/$f" 2>/dev/null && [ ! -e "$PCE_STATE/$f" ] || left="$left $f"', 'rm -f "$PCE_STATE/$f" 2>/dev/null'),
+ ("reset-exits-0-on-failure", "14", 'reset) pce_reset; exit $? ;;', 'reset) pce_reset; exit 0 ;;'),
+ ("trip-with-unreadable-date-expires", "14", '[[ "$td" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && ', ''),
+ ("clear-streak-survives-any-gap", "7", 'if [ "$lsw" -ne 0 ] && [ $((PCE_NOW - lsw)) -gt "$PCE_STREAK_EXPIRE_SECS" ]; then cs=0; fi', ':'),
+ ("enabled-unknown-include-not-repaired", "16", 'pce_repair_missing_fragment   # a definite 0', ':   # a definite 0'),
+ ("preflight-notifies-every-sweep", "14", '&& [ "$pfrc" -eq 1 ] && pce_notify', '; [ "$pfrc" -eq 1 ] && pce_notify'),
+ ("write-failed-notifies-every-sweep", "14", '&& pce_notify "pool-ceiling-engine: could not write', '; pce_notify "pool-ceiling-engine: could not write'),
+ ("daily-counter-write-failure-is-silent", "10", ' || pce_log "event=state-write-failed" "what=daily-counter" "effect=the breaker may undercount today\'s writes"', ''),
 ]
 names = []
 for name, secs, old, new in M:
