@@ -1,65 +1,33 @@
 #!/usr/bin/env bash
-# pool-ceiling-engine.sh (ga-m9x0lb.2) — makes the CONTROLLER's pool ceiling (agents/<pool>/agent.toml:
-# max_active_sessions) follow the Athos rule, WITHOUT rewriting any tracked file.
+# pool-ceiling-engine.sh (ga-m9x0lb.2) — makes the CONTROLLER's pool ceiling (agents/<pool>/agent.toml: max_active_sessions) follow the
+# Athos rule WITHOUT rewriting any tracked file (Mayor's decision 09/10, ga-m9x0lb). Rationale, the rule table, every safeguard and the operation
+# guide: docs/pool-ceiling-dynamic.md, section "O motor do teto do controller (ga-m9x0lb.2)".
 #
-# WHY. pool-ceiling.sh (ga-uywvsc) only brakes inside the engine's cap. The case that started it all — wa-worker pinned at 2
-# with 69 beads ready — needs the cap itself to move, and the controller enforces agent.toml on its own (ga-o3o09z). Rewriting
-# agent.toml / city.toml is the wrong tool (ga-m9x0lb): the town-root-reconciler treats a dirty tracked file as a conflict, and
-# `gc agent suspend/resume` re-encodes the whole file (ga-gdjav). Mayor's decision 09/10 (ga-m9x0lb): ONE generated, UNTRACKED
-# fragment under .gc/ with [[patches.agent]] blocks, included once by city.toml.
+# THE FRAGMENT: $GC_CITY/.gc/pool-ceiling-engine.toml — generated, untracked, included once by city.toml. This script is its ONLY writer.
+#   - written atomically (tmp + mv); only [[patches.agent]] dir/name/max_active_sessions, only allowlisted pools;
+#   - it must ALWAYS EXIST once city.toml includes it (absent = config LOAD ERROR, ga-m9x0lb.1): the kill switch EMPTIES it
+#     (comment-only = no override) and nothing here ever deletes it;
+#   - the "fixed" value of every pool is `git show HEAD:agents/<pool>/agent.toml`, never the working tree nor a dispatcher's state.
 #
-# THE FRAGMENT: $GC_CITY/.gc/pool-ceiling-engine.toml. This script is its ONLY writer.
-#   - written atomically (tmp + mv), only [[patches.agent]] dir/name/max_active_sessions, only allowlisted pools;
-#   - it must ALWAYS EXIST once city.toml includes it: an absent fragment is a config LOAD ERROR (ga-m9x0lb.1,
-#     measured: gc config show exit 1). So the kill switch EMPTIES it (comment-only = no override, measured
-#     exit 0, config identical to baseline) and nothing here ever deletes it;
-#   - the "fixed" value of every pool is `git show HEAD:agents/<pool>/agent.toml`, never the working tree and never
-#     a dispatcher's state: deleting the entries restores the committed behaviour completely.
+# THE RULE (Athos 03/10): wa-worker 3 by default, 2 when swap used > 6 GB OR free disk < 6 GB, back to 3 only after 2 SWEEPS with swap <= 6 GB
+# AND disk >= 9 GB (6..9 GB: hold). ps-worker / gate-reviewer only go DOWN from the committed value, on the same pressure, and come back the
+# same way - never above it. Lowering is immediate (one step per run); raising is 1 step, after 2 counted sweeps, at most 1 write per 10 min
+# per pool, and never makes the sum of the ceilings exceed GC_VARIABLE_SESSION_MAX.
 #
-# THE RULE (Athos 03/10, relayed by the Mayor 09/10 in ga-m9x0lb):
-#   wa-worker  3 by default; 2 when swap used > 6 GB OR free disk < 6 GB; back to 3 only after 2 SWEEPS with
-#              swap used <= 6 GB AND free disk >= 9 GB (hysteresis band 6..9 GB: hold).
-#   the others (ps-worker, gate-reviewer) only go DOWN from the committed value, on the same pressure, and come back
-#              on the same 2-sweep condition. They never go above what is committed.
-#   Lowering is immediate (one step per run); raising is 1 step, after 2 counted sweeps, and at most 1 write per
-#   10 min per pool. A raise never makes the sum of the ceilings exceed GC_VARIABLE_SESSION_MAX (the dispatchers apply
-#   that bound to LIVE sessions only; the controller never does).
+# THREE STATES, everywhere (not-found != found-and-zero != could-not-find-out): a reading that cannot be taken NEVER reads as "clear", "none" or 0.
+# An unreadable committed value HOLDS that pool's entry (dropping it = a RAISE); a fragment whose levels cannot be read has UNKNOWN levels (every
+# pool restarts from its FLOOR); a config that cannot be read back is a failed write. Doubt never RAISES: a passing doubt HOLDS the file as it is;
+# one that persists or proves wrong goes back to the EMPTY fragment, the inert state.
 #
-# THREE STATES, everywhere (not-found != found-and-zero != could-not-find-out): a swap/disk reading that cannot be taken NEVER
-# reads as "clear"; a committed value that cannot be read is NOT 0 (that pool's entry is HELD, never dropped: a drop hands the pool back to
-# the committed value = a RAISE - and nothing is raised while it is unknown); a config that cannot be read back is a failed write; a FRAGMENT whose
-# levels cannot be read (foreign content, or a file that exists and cannot be opened) has UNKNOWN levels, not "none": gc may still apply it, so the rewrite starts
-# every pool from its FLOOR (never above what the engine could have written) and writes nothing at all if a committed ceiling is unreadable too. Doubt
-# never RAISES: a passing doubt (include unknown, preflight or date unreadable, < 3 blind sweeps) HOLDS the file as it is; one that persists
-# or proves wrong (blind for 3 sweeps while raised, a failed read-back, a trip, the breaker) goes back to the EMPTY fragment, the inert state.
+# SAFETY NETS (each proven by a mutant in pool-ceiling-engine.selftest.sh): read-back after EVERY write (a typo'd key is only a gc WARNING);
+# daily write breaker (POOL_CEILING_ENGINE_DAILY_MAX); mkdir lock; include state 1/0/? (.on without a definite 1 writes no level; fragment ABSENT
+# + include 1 or ? = re-created EMPTY FIRST in a sweep, ahead of every early exit - except under .off, whose own restore sits behind the clock / state-dir / lock gates).
+# SWITCHES (.gc/): pool-ceiling-engine.on — the engine acts ONLY with it (removing it does NOT empty the fragment); .off — KILL SWITCH, empties, wins over .on.
+# Subcommands: (none) = run | plan (print one sweep, write nothing) | status | reset (clear a trip + the daily counter) | check (read-only).
 #
-# SAFETY NETS (each one proven by a mutant in pool-ceiling-engine.selftest.sh):
-#   read-back   after EVERY write: gc config show --json, each entry must resolve to the intended value. A typo'd key is
-#               only a WARNING in gc (exit 0, the ceiling silently does not move) — only the read-back catches it.
-#               Mismatch/unreadable => the fragment is emptied at once and the engine trips.
-#   breaker     at most POOL_CEILING_ENGINE_DAILY_MAX (10) writes per local day; the next non-empty write instead
-#               empties the fragment and trips until tomorrow. A read-back MISMATCH trips until a human runs `reset`.
-#   lock        one instance at a time (mkdir + heartbeat + TTL); a second run exits silently.
-#   include     read from city.toml's PARSED include array (1/0/?). With .on but not a definite 1 no level is written (it could not
-#               apply). With the include 1 or ? and the fragment ABSENT (clean clone / DR) the engine re-creates it EMPTY, before ANYTHING else in
-#               a sweep (clock, state dir, lock, date, trip; .off's restore does it itself). A create that FAILS is logged + notified once, never "nothing to do".
-#
-# SWITCHES (files under $GC_CITY/.gc, all instant, none needs a plist edit):
-#   pool-ceiling-engine.on    the engine acts ONLY with this file. Without it: silent, no level written (bar the repair above) - and the
-#                             fragment KEEPS its current levels: to stand down use .off, never just remove .on.
-#   pool-ceiling-engine.off   KILL SWITCH: empties the fragment, resets the per-pool state, wins over .on.
-#   pool-ceiling-engine.sh plan     evaluate one sweep and PRINT it (no write of any kind; works without .on)
-#   pool-ceiling-engine.sh status   switches, include, fragment levels, per-pool state, breaker, budget, signals now
-#   pool-ceiling-engine.sh reset    clear a trip + the daily counter (does not touch the fragment)
-#   pool-ceiling-engine.sh check    read-only: include present => fragment must exist and be well-formed (exit 1 if not)
-#
-# NOT here (slice 3, Mayor, supervised): the one-line `include` in city.toml, installing the launchd job, the first .on
-# and the kill-switch drill. This file only DECIDES and WRITES the fragment; the drift watcher (compute_hash now covers
-# the fragment) applies it with `gc reload --soft`. gastown.dog stays out: eval-window-concurrency-guard owns its
-# max_active_sessions in city.toml and the fragment would override it (ga-m9x0lb.1); so do refino-gate-reviewer and auto-refiner.
-#
-# Sourceable (functions only, no side effects, never `exit`s). Executable for the subcommands above (no arg = run).
-# bash 3.2 compatible (macOS /bin/bash): no associative arrays, no ${x,,}, no mapfile.
+# NOT here (slice 3, Mayor, supervised): the city.toml include, the launchd job, the first .on, the kill-switch drill. gastown.dog stays out
+# (eval-window-concurrency-guard owns its max, ga-m9x0lb.1); so do refino-gate-reviewer and auto-refiner.
+# Sourceable (functions only, no side effects, never `exit`s). bash 3.2 compatible (macOS /bin/bash): no associative arrays, no ${x,,}, no mapfile.
 
 PCE_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 
@@ -126,8 +94,6 @@ pce_init() {
   return 0
 }
 
-# ── pure decision ─────────────────────────────────────────────────────────────
-
 # pce_pressure <swap_used_mb> <disk_free_mb> — high | clear | band | unknown.
 # high    swap used > 6 GB OR free disk < 6 GB. ONE positive reading is enough (an unreadable other signal cannot undo it).
 # clear   BOTH readable, swap <= 6 GB and disk >= 9 GB.
@@ -167,9 +133,8 @@ pce_decide() {
   return 0
 }
 
-# per-pool bounds around the committed value C. wa-worker may go ABOVE C (the Athos default 3); every other pool's ceiling
-# is C itself (they only go down). Floors: wa-worker 2, ps-worker 1, gate-reviewer 2 (one gate run needs 2 reviewers).
-# POOL_CEILING_ENGINE_<POOL>_FLOOR / _CEIL override; a floor is never above C, a ceiling never below C, nothing below 1.
+# per-pool bounds around the committed value C: wa-worker may go ABOVE C (the Athos default 3), every other pool's ceiling is C itself (they only go down).
+# Floors: wa-worker 2, ps-worker 1, gate-reviewer 2 (one gate run needs 2 reviewers). POOL_CEILING_ENGINE_<POOL>_FLOOR / _CEIL override; floor <= C <= ceiling, nothing below 1.
 _pce_pool_default() { # <pool> <floor|ceil> <C>
   case "$1:$2" in
     wa-worker:ceil) echo 3 ;;
@@ -195,11 +160,8 @@ pce_ceil() {
   echo "$v"
 }
 
-# ── the fragment: render / parse ──────────────────────────────────────────────
-
-# pce_fragment_render <entries "pool=level ..."> — the full file body on stdout, or rc 1 + nothing on stdout when any
-# entry is not safe to emit: a pool outside the allowlist (gc turns an unknown agent into a LOAD ERROR), a level that is
-# not an integer in [1, hard max] (the engine accepts 0 and -1 = UNLIMITED), or a duplicate pool. The last line of defence.
+# pce_fragment_render <entries "pool=level ..."> — the full file body on stdout, or rc 1 + nothing when any entry is not safe to emit: a pool outside the
+# allowlist (gc turns an unknown agent into a LOAD ERROR), a level not an integer in [1, hard max] (the engine accepts 0 and -1 = UNLIMITED), a duplicate. Last line of defence.
 pce_fragment_render() {
   local e p v seen=" " body=""
   for e in $1; do
@@ -220,9 +182,8 @@ max_active_sessions = $v
   return 0
 }
 
-# pce_fragment_parse [file] — prints "pool=level" per entry. rc 0 = exactly what pce_fragment_render emits (comments,
-# blanks, well-formed blocks); rc 1 = FOREIGN content (anything else: a hand edit, an old version, a duplicate pool) — the
-# generated file is rewritten from the model, never trusted; rc 2 = absent or unreadable.
+# pce_fragment_parse [file] — prints "pool=level" per entry. rc 0 = exactly what pce_fragment_render emits (comments, blanks, well-formed blocks);
+# rc 1 = FOREIGN content (a hand edit, an old version, a duplicate pool): rewritten from the model, never trusted; rc 2 = absent or unreadable.
 pce_fragment_parse() {
   local f="${1:-$PCE_FRAGMENT}"
   [ -r "$f" ] || return 2
@@ -246,8 +207,6 @@ pce_fragment_parse() {
   ' "$f"
 }
 
-# ── environment readers ───────────────────────────────────────────────────────
-
 _pce_bounded() { # <secs> cmd... — runs under timeout/gtimeout; rc 127 when neither exists (callers treat that as unreadable)
   local s="$1"; shift
   if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"
@@ -265,9 +224,8 @@ _pce_load_lib() { # the signal readers of pool-ceiling.sh; absent/broken lib => 
 pce_read_swap_used_mb() { _pce_load_lib || return 0; pool_ceiling_read_swap_used_mb; return 0; }
 pce_read_disk_free_mb() { _pce_load_lib || return 0; pool_ceiling_read_disk_free_mb; return 0; }
 
-# pce_committed <pool> — the max_active_sessions COMMITTED at HEAD: an integer >= 1, "0" (the operator's pause: a KNOWN zero), or NOTHING
-# when it cannot be read (no file at HEAD, no such line, git failing). Never the working tree: a dirty agent.toml is somebody's
-# experiment, not the baseline the engine restores to. The caller must not read "nothing" as 0.
+# pce_committed <pool> — the max_active_sessions COMMITTED at HEAD: an integer >= 1, "0" (the operator's pause: a KNOWN zero), or NOTHING when it
+# cannot be read (no file at HEAD, no such line, git failing). Never the working tree (a dirty agent.toml is an experiment). The caller must not read "nothing" as 0.
 pce_committed() {
   local pool="$1" txt v
   txt=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "$PCE_CITY" show "HEAD:./agents/$pool/agent.toml" 2>/dev/null) || return 0
@@ -301,9 +259,8 @@ pce_budget() {
   return 0
 }
 
-# pce_include_state — 1 | 0 | ?  from the PARSED `include` array of city.toml, each entry resolved against its directory and compared with
-# the fragment's real path. A text match read a trailing comment, a .bak or the same name elsewhere as "included". ? = cannot tell
-# (unreadable, unparseable, odd shape, python3 without tomllib, a crash): only a printed 0/1 from a CLEAN exit counts.
+# pce_include_state — 1 | 0 | ?  from the PARSED `include` array of city.toml (each entry resolved against its directory, compared with the fragment's real
+# path; a text match read a trailing comment or a .bak as "included"). ? = cannot tell (unreadable, unparseable, odd shape, no tomllib, a crash): only a CLEAN 0/1 counts.
 pce_include_state() {
   local v; [ -r "$PCE_CITY_TOML" ] || { echo '?'; return 0; }
   v=$("$PCE_PY" -c 'import os,sys,tomllib
@@ -320,8 +277,6 @@ _pce_now() {
   return 0
 }
 _pce_date_of() { date -r "$1" +%Y-%m-%d 2>/dev/null || date -d "@$1" +%Y-%m-%d 2>/dev/null; }
-
-# ── log / notify ──────────────────────────────────────────────────────────────
 
 # pce_log <k=v ...> — one TSV line. Dry run: printed, never appended. Rotated at ~5 MB (one generation), best-effort.
 pce_log() {
@@ -391,8 +346,6 @@ pce_lock_acquire() { # 0 = ours; 1 = a LIVE run holds it (back off, silently)
   return 0
 }
 
-# ── per-pool state, daily counter, trip ───────────────────────────────────────
-
 _pce_kv() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
 _pce_atomic_put() { # <file> <content> — tmp + mv; rc 1 if it did not land
   local tmp="$1.tmp.$$"
@@ -436,8 +389,6 @@ date=$(_pce_date_of "$PCE_NOW")
 reason=$2" || pce_log "event=state-write-failed" "what=trip" "effect=the trip may not hold; the callers empty the fragment regardless"
 }
 
-# ── writing the fragment ──────────────────────────────────────────────────────
-
 pce_fragment_is() { printf '%s\n' "$1" | cmp -s - "$PCE_FRAGMENT" 2>/dev/null; }   # file == content, byte for byte (absent => no)
 # pce_fragment_is_empty — well-formed and with NO entries (zero bytes, comment-only, our own header all count). Absent or foreign: no.
 pce_fragment_is_empty() { local o; o=$(pce_fragment_parse 2>/dev/null) || return 1; [ -z "$o" ]; }
@@ -449,10 +400,9 @@ pce_write_fragment() { # <content> — atomic: tmp in the same dir + mv. rc 0 on
   pce_fragment_is "$1"
 }
 
-# pce_readback <entries> — after a write: does `gc config show --json` resolve every entry to the intended value?
+# pce_readback <entries> — after a write: does `gc config show --json` resolve every entry to the intended value? stdout: the detail.
 # rc 0 ok | 1 MISMATCH (definitive: the config loads, the ceiling did not move as written — the typo'd-key class)
-#        | 2 could not read (gc absent / timeout / not JSON / ok:false — possibly the fragment itself broke the load).
-# stdout: the detail. With NO entries (an empty fragment) it asserts only that the config loads.
+#        | 2 could not read (gc absent / timeout / not JSON / ok:false — possibly the fragment itself broke the load). NO entries: asserts only that the config loads.
 pce_readback() {
   local out rc e pool want got mism=0 detail=""
   out=$(_pce_bounded "$PCE_READBACK_SECS" "$PCE_GC" config show --city "$PCE_CITY" --json 2>/dev/null); rc=$?
@@ -467,11 +417,10 @@ pce_readback() {
   return 0
 }
 
-# pce_preflight <entries> — BEFORE writing a non-empty fragment: does `gc config show --json` list every pool we are about to
-# patch as exactly one agent? A patch for an agent that does not exist is a config LOAD ERROR (ga-m9x0lb.1), so a renamed or
-# removed pool must be caught here, not by the read-back after the damage. rc 0 ok | 1 a pool is missing | 2 could not read |
-# 3 gc ANSWERED that the config does not load (exit 1 + {"ok": false} on stdout - measured on the real gc, selftest section 20: a malformed or
-# unknown-agent fragment, an absent included file). 2 is no answer (timeout 124, gc not found 127, a crash, output that is not JSON): only 3 is evidence.
+# pce_preflight <entries> — BEFORE writing a non-empty fragment: does `gc config show --json` list every pool we are about to patch as exactly one
+# agent? A patch for a missing agent is a config LOAD ERROR (ga-m9x0lb.1): catch it here, not in the read-back after the damage. rc 0 ok | 1 a pool is
+# missing | 2 could not read | 3 gc ANSWERED that the config does not load (exit 1 + {"ok": false}; measured on the real gc, selftest section 20).
+# 2 is no answer (timeout 124, gc not found 127, a crash, output that is not JSON): only 3 is evidence.
 pce_preflight() {
   local out rc e pool got miss=""
   out=$(_pce_bounded "$PCE_READBACK_SECS" "$PCE_GC" config show --city "$PCE_CITY" --json 2>/dev/null); rc=$?
@@ -508,8 +457,6 @@ pce_restore() {
   pce_notify "pool-ceiling-engine: could NOT empty $PCE_FRAGMENT ($reason) - check the .gc directory"
   return 1
 }
-
-# ── the sweep ─────────────────────────────────────────────────────────────────
 
 # pce_repair_missing_fragment — include present (or undecidable) + fragment absent = the next reload fails to load. Create it EMPTY (noclobber: never replaces a
 # file that appeared meanwhile). Safe by construction: empty is config-identical to "no engine". A create that FAILS is reported once per failure ($PCE_STATE/repair-failed).
@@ -604,13 +551,10 @@ _pce_sweep_locked() {
   pressure=$(pce_pressure "$swap" "$disk")
   budget=$(pce_budget)
 
-  # 5. the fragment as it is NOW (the file is the truth about the current levels, not our state files). THREE answers, never two (gate round ga-marmt9: "could not
-  #    read the levels" was acted on as "there are none", and the rewrite handed a pool the pressure had LOWERED back to its committed value - a raise):
-  #      read (rc 0)        the levels in the file, possibly none                          -> cur_map
-  #      absent (rc 2)      no file, so no levels (the repair above re-creates it EMPTY, or says it could not)  -> none
-  #      UNKNOWN            FOREIGN content (rc 1), or a file that EXISTS and cannot be read   -> unk=1. gc may well still apply it (a trailing "# note" on a value
-  #                         line is valid TOML and keeps its level), so "no entries" is not a reading. Every pool restarts from its FLOOR (step 6): a rewrite is then
-  #                         never above what the engine could have written, and a pool climbs back by the normal rule (2 clear sweeps, the rate limit, the budget).
+  # 5. the fragment as it is NOW (the file, not our state files, is the truth about the levels). THREE answers, never two (gate ga-marmt9: "could not read
+  #    the levels" was acted on as "there are none" = a pool the pressure had LOWERED went back to committed): read (rc 0) -> cur_map, possibly none;
+  #    absent (rc 2) -> none (the repair above re-creates it EMPTY); UNKNOWN = FOREIGN (rc 1) or a file that EXISTS and cannot be read -> unk=1: gc may still
+  #    apply it (a trailing "# note" is valid TOML and keeps the level), so "no entries" is not a reading. Every pool restarts from its FLOOR (step 6).
   local cur_txt cur_map="" prc unk=0 foreign_note="$PCE_STATE/foreign-notified"
   cur_txt=$(pce_fragment_parse); prc=$?
   # vazio (rc 0, no entries) → every pool at its committed value; falhou/ilegível (rc 1, or rc 2 on a file that exists) → levels UNKNOWN (unk=1), never "none"
@@ -801,8 +745,6 @@ _pce_sweep_locked() {
   pce_log "event=write" "from=$from_txt" "to=${dev:-<committed>}" "changed=${changed# }" "budget=$budget" "sum=$sum" "readback=ok"
   return 0
 }
-
-# ── subcommands ───────────────────────────────────────────────────────────────
 
 pce_check() {
   case "$(pce_include_state)" in 1) ;; 0) echo "ok: city.toml does not include the fragment (nothing to check)"; return 0 ;; *) echo "UNKNOWN: cannot tell whether city.toml includes the fragment (unreadable, unparseable, or python3 without tomllib) - not verified"; return 2 ;; esac

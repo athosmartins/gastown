@@ -162,7 +162,8 @@ fragmento** — nada disto está vivo. Ativar é a fatia 3 (Mayor, supervisionad
 fragmento **gerado, não rastreado** (`.gc/` é gitignored) com blocos `[[patches.agent]] dir="" name=… max_active_sessions=N`, incluído **uma
 vez** pelo `city.toml` (`include = [".gc/pool-ceiling-engine.toml"]`, 1ª linha, antes de `[workspace]`). O patch do fragmento sobrepõe o
 `agent.toml` (medido no spike ga-m9x0lb.1). Escrita atômica (tmp+mv); ninguém reescreve arquivo rastreado, então a árvore fica limpa e o
-`town-root-reconciler` não vê conflito. Roda num **job launchd próprio** a cada 5 min (`pool-ceiling-engine.plist.template`, modelo, **não instalado**):
+`town-root-reconciler` não vê conflito (reescrever `agent.toml`/`city.toml` foi descartado: o reconciler trata arquivo rastreado sujo como conflito e
+`gc agent suspend/resume` re-codifica o arquivo inteiro, ga-gdjav). Roda num **job launchd próprio** a cada 5 min (`pool-ceiling-engine.plist.template`, modelo, **não instalado**):
 o Pilot sai do passo em quota/RAM/quiet-hours e o gate só roda o teto com marker na fila — um teto que precisa DESCER sob swap não pode depender dos dois.
 
 **A regra** (Athos 03/10, repassada pelo Mayor 09/10). O valor "fixo" de cada pool é o `max_active_sessions` de
