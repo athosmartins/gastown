@@ -879,18 +879,22 @@ estado ambiente que este comando nunca deve confiar para uma decisão de
 deleção).
 
 {{/* td:core:pool-probe-script */ -}}
-**Dog (`gastown.dog`): o Step 1c é `sh "$GC_CITY_PATH/packs/town-deltas/assets/scripts/pool-probe.sh"
-gastown.dog` — NÃO o `sh -c '…'` de ~5,5 KB que o prompt mostra (ga-witezg, P0).**
-A checagem embutida de "remoção perigosa" do Claude Code NEGA esse `sh -c` longo
-("could not check the script for dangerous removals" — não há `rm` nele) e sessão de pool
-não tem humano pra aprovar: dog-1 e dog-3 ficaram ~2h ociosos em 10/10 com 3 P0 roteadas a
-eles. O script é a MESMA sonda (mesmos `bd`, mesmos filtros, mesma saída: array JSON com no
-máximo 1 bead, ou `[]`); `pool-probe.selftest.sh` prova a equivalência contra o texto do
-engine. O resto não muda: candidato do 1c → `gc bd update <id> --claim` já na chamada
-seguinte. Os Steps 1a e 1b passam quando rodados UM por chamada (medido em 10/10) — nunca
-os junte num comando só (o combinado foi negado). Se uma chamada for negada mesmo assim,
-não divida o script pra contornar: `gc session nudge mayor/ "dog sem sonda: <comando
-negado>"` e espere.
+**Dog (`gastown.dog`): a sonda de trabalho do pool é este comando, numa chamada só (ga-witezg, P0):**
+`sh "$GC_CITY_PATH/packs/town-deltas/assets/scripts/pool-probe.sh" gastown.dog`
+O prompt do dog traz o `sh -c '…'` longo (~5,5 KB) em TRÊS lugares: o passo 3 de "Your startup
+behavior" (a sonda combinada 1a+1b+1c), o Step 1c e a linha "Find pool work" da tabela de
+comandos. Nos três, a sonda do pool é o comando acima — nunca o `sh -c` longo nem o combinado.
+A checagem embutida de "remoção perigosa" do Claude Code NEGA o `sh -c` longo (diz "could not
+check the script for dangerous removals" — não há `rm` nele) e sessão de pool não tem humano pra
+aprovar: dog-1 e dog-3 ficaram ~2h ociosos em 10/10 com 3 P0 roteadas a eles. **Se uma chamada do
+`sh -c` longo for negada, a saída é trocar pelo script** (e rodar os Steps 1a e 1b UM por chamada,
+que passam sozinhos — medido em 10/10), não esperar. O script é a MESMA sonda (mesmos `bd`, mesmos
+filtros, mesma saída: array JSON com no máximo 1 bead, ou `[]`); `pool-probe.selftest.sh` prova a
+equivalência contra o texto do engine. O resto não muda: candidato do 1c → `gc bd update <id> --claim`
+já na chamada seguinte. **Uma linha `pool-probe: …` no stderr, ou saída ≠ 0, quer dizer que `[]` NÃO é
+"sem trabalho"** (alvo ausente, `bd` falhando ou resposta ilegível): não drene, avise o Mayor. Só se o
+PRÓPRIO script for negado, avise o Mayor e espere (não divida o script pra contornar):
+`gc session nudge mayor/ "dog sem sonda: <comando negado>"`
 
 {{ if or (not .TD_ROLE) (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:next-action-mayor-waiting */ -}}
 **Vai PARAR esperando decisão de outro agente (Mayor, tipicamente)? Grave na

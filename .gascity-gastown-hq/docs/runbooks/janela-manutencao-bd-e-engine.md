@@ -158,6 +158,11 @@ reinicie a cidade inteira** para forçar (memória: `mayor-city-restart-keepaliv
 # cidade de pé?
 gc dolt health
 bash ~/gt/.gascity-gastown-hq/scripts/gate-queue-composition.sh
+
+# sonda do dog (ga-witezg): o texto que o engine novo renderiza no Step 1c ainda é o do golden?
+# Vermelho = a sonda mudou e os dogs rodam uma cópia velha: atualize pool-probe.golden-1c.txt
+# E pool-probe.sh juntos (nunca um só) e rode de novo.
+bash ~/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/pool-probe.selftest.sh --live
 ```
 
 **Depois, reabrir os 23 represados:** eles estão `deferred` ou com

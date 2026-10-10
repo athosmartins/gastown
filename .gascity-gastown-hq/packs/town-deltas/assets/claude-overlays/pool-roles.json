@@ -426,7 +426,7 @@
    "home-scan-tcc": "Varrer ou medir o `$HOME` dispara o prompt de permissão do macOS",
    "dano-ao-vivo": "Dano ao vivo — como marcar um bug que fura a fila",
    "gate-focus": "Modo foco no gate — quando o gargalo é a revisão, ninguém constrói bead nova",
-   "pool-probe-script": "o Step 1c é `sh \"$GC_CITY_PATH/packs/town-deltas/assets/scripts/pool-probe.sh\""
+   "pool-probe-script": "`sh \"$GC_CITY_PATH/packs/town-deltas/assets/scripts/pool-probe.sh\" gastown.dog`"
   },
   "carryover_exempt_roles": {
    "reviewer": "revisor não faz deploy/restart, login Google, reclaim de bead nem limpa Dolt; o prompt dele traz os próprios critérios de revisão. Se isso mudar, tire daqui e adicione o papel em guarded.claudemd-carryover.roles."

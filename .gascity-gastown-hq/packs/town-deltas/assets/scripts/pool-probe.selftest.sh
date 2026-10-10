@@ -6,6 +6,9 @@
 # `gc prime`) and the script are run against the same fixtures behind a fake `bd`, and for every scenario
 # BOTH the stdout AND the argv of every bd call (flags and order) must be identical. Each scenario also
 # pins WHAT the golden answers, so "both printed []" cannot pass a check that was meant to select a bead.
+# The exit code and stderr are compared too (ga-iu0ms2): equal to the engine's and EMPTY, except in the few
+# scenarios where the script deliberately says more than the engine's probe — "could not tell" must not
+# read as "no work" — and there the expected exit code and stderr are pinned explicitly (WANT_RC/WANT_ERR).
 # Needs bash, jq, python3, sh. Exit 0 iff every check holds.
 #   --live   also compares the golden with what `gc prime` renders NOW (drift check; run after an engine
 #            window). Not in the default run: it needs a live gc and a dog-shaped environment. A gc that
@@ -46,6 +49,9 @@ body="$(printf '%s' "$body" | sed "s/'\\\\''/'/g")"            # the shell's own
 cat > "$FAKE/bd" <<'EOF'
 #!/bin/sh
 { for a in "$@"; do printf '%s\037' "$a"; done; printf '\n'; } >> "$BD_LOG"
+# The real bd talks on stderr even when it works (e.g. "Warning: .../.beads has permissions 0755"). If the
+# script ever lets that reach the dog, a clean run would look like a failing one — so the fake does it too.
+echo "Warning: fake bd noise on stderr (the script must keep this away from the dog)" >&2
 case "$1 $2 $3" in
   "ready --metadata-field gc.routed_to="*)   key=tier1 ;;
   "ready --metadata-field gc.run_target="*)  key=legacy ;;
@@ -63,13 +69,18 @@ chmod +x "$FAKE/bd"
 reset_fix() { rm -f "$FIX"/*; }
 
 # run_both <name> <expected-ids-or-"-"> [target...]   (ORIGIN env var picks GC_SESSION_ORIGIN)
+# Unless told otherwise the script must exit like the engine's probe and print nothing on stderr. A scenario
+# where it deliberately says more sets, for that one call: WANT_RC = the script's exit code, WANT_ERR = an
+# extended regex its stderr must match (both are consumed by the call).
 ORIGIN=ephemeral
+WANT_RC=""; WANT_ERR=""
 run_both() {
   local name="$1" want="$2"; shift 2
+  local want_rc="$WANT_RC" want_err="$WANT_ERR"; WANT_RC=""; WANT_ERR=""
   : > "$TMP/gold.log"; : > "$TMP/mine.log"
-  local g m
-  g="$(BD_LOG="$TMP/gold.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN="$ORIGIN" sh -c "$body" -- "$@" 2>/dev/null)"
-  m="$(BD_LOG="$TMP/mine.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN="$ORIGIN" sh "$PROBE" "$@" 2>/dev/null)"
+  local g m g_rc m_rc
+  g="$(BD_LOG="$TMP/gold.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN="$ORIGIN" sh -c "$body" -- "$@" 2>"$TMP/gold.err")"; g_rc=$?
+  m="$(BD_LOG="$TMP/mine.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN="$ORIGIN" sh "$PROBE" "$@" 2>"$TMP/mine.err")"; m_rc=$?
   local gids
   gids="$(printf '%s' "$g" | jq -r 'if type == "array" then map(.id) | join(",") else "?" end' 2>/dev/null)"
   [ -z "$g" ] && gids="(no output)"
@@ -78,6 +89,16 @@ run_both() {
   if [ "$g" = "$m" ]; then ok "$name: stdout identical"; else bad "$name: stdout differs — engine [$g] vs script [$m]"; fi
   if cmp -s "$TMP/gold.log" "$TMP/mine.log"; then ok "$name: bd calls identical ($(wc -l < "$TMP/gold.log" | tr -d ' ') call(s), same flags, same order)"
   else bad "$name: bd calls differ"; diff <(tr '\037' ' ' < "$TMP/gold.log") <(tr '\037' ' ' < "$TMP/mine.log") | sed 's/^/      /' | head -12; fi
+  if [ -z "$want_rc" ]; then
+    if [ "$g_rc" = "$m_rc" ]; then ok "$name: exit code identical (=$m_rc)"; else bad "$name: exit code differs — engine $g_rc vs script $m_rc"; fi
+  else
+    eq "$name: the script's exit code (deliberately not the engine's $g_rc)" "$m_rc" "$want_rc"
+  fi
+  if [ -z "$want_err" ]; then
+    if [ ! -s "$TMP/mine.err" ]; then ok "$name: nothing on stderr"; else bad "$name: unexpected stderr: $(head -c 300 "$TMP/mine.err")"; fi
+  else
+    if grep -Eq "$want_err" "$TMP/mine.err"; then ok "$name: stderr says it (/$want_err/)"; else bad "$name: stderr lacks /$want_err/ — got: $(head -c 300 "$TMP/mine.err")"; fi
+  fi
 }
 
 FUT=4102444800   # 2100-01-01
@@ -125,11 +146,11 @@ echo '[{"id":"child"}]' > "$FIX/children-M1.json"
 echo '[]' > "$FIX/children-M2.json"
 printf 'Error: dolt unreachable' > "$FIX/children-M3.raw"
 printf '[oops' > "$FIX/children-M4.raw"
-run_both "molecule: live child dropped, empty kept" "m-empty" gastown.dog
+WANT_ERR='unreadable answer for the children of molecule M3' run_both "molecule: live child dropped, empty kept" "m-empty" gastown.dog
 echo '[{"id":"child"}]' > "$FIX/children-M2.json"
-run_both "molecule: unreadable answer is kept" "m-garbage" gastown.dog
+WANT_ERR='unreadable answer for the children of molecule M3' run_both "molecule: unreadable answer is kept" "m-garbage" gastown.dog
 printf '[{"id":"child"}]' > "$FIX/children-M3.json"; rm -f "$FIX/children-M3.raw"
-run_both "molecule: '[...]' with a live child dropped; '[oops' kept" "m-bracket" gastown.dog
+WANT_ERR='unreadable answer for the children of molecule M4' run_both "molecule: '[...]' with a live child dropped; '[oops' kept" "m-bracket" gastown.dog
 printf '[{"id":"child"}]' > "$FIX/children-M4.json"; rm -f "$FIX/children-M4.raw"
 run_both "molecule: no molecule_id is always kept" "m-none" gastown.dog
 reset_fix
@@ -204,16 +225,25 @@ ORIGIN=crew     run_both "GC_SESSION_ORIGIN=crew prints nothing and calls nothin
 ORIGIN=ephemeral
 ORIGIN=         run_both "empty GC_SESSION_ORIGIN is treated like ephemeral" "would-match" gastown.dog
 ORIGIN=ephemeral
-run_both "no target -> [] and no bd call" "-"
+WANT_RC=2 WANT_ERR='no <target> given' run_both "no target -> [] on stdout, a line on stderr, exit 2, no bd call" "-"
 if [ ! -s "$TMP/mine.log" ]; then ok "no target: the script made no bd call"; else bad "no target: the script called bd"; fi
 touch "$FIX/tier1.fail"
-run_both "bd ready failing -> falls through to []" "-" gastown.dog
+WANT_RC=3 WANT_ERR='tier\(s\) 1 unreadable' run_both "bd ready failing -> [] but SAYS tier 1 was unreadable (exit 3)" "-" gastown.dog
 reset_fix; printf 'not json at all' > "$FIX/tier1.raw"
-run_both "tier 1 answer is not JSON -> []" "-" gastown.dog
+WANT_RC=3 WANT_ERR='tier\(s\) 1 unreadable' run_both "tier 1 answer is not JSON -> [] but says so (exit 3)" "-" gastown.dog
 reset_fix; touch "$FIX/ephemeral.fail"
-run_both "bd query failing -> []" "-" gastown.dog
+WANT_RC=3 WANT_ERR='tier\(s\) 3 unreadable' run_both "bd query failing -> [] but says tier 3 was unreadable (exit 3)" "-" gastown.dog
 reset_fix; printf 'garbage' > "$FIX/ephemeral.raw"
-run_both "bd query answer is not JSON -> []" "-" gastown.dog
+WANT_RC=3 WANT_ERR='tier\(s\) 3 unreadable' run_both "bd query answer is not JSON -> [] but says so (exit 3)" "-" gastown.dog
+reset_fix
+echo '[{"id":"m-fail","updated_at":"2026-01-01T00:00:00Z","metadata":{"molecule_id":"M5"},"labels":[]}]' > "$FIX/tier1.json"
+touch "$FIX/children-M5.fail"
+WANT_ERR='could not read the children of molecule M5 \(bd exit 1\)' run_both "molecule lookup failing keeps the bead (as the engine does) and says so" "m-fail" gastown.dog
+reset_fix; touch "$FIX/tier1.fail"
+echo '[{"id":"lg-late","metadata":{"gc.run_target":"gastown.dog","gc.kind":"workflow"},"labels":[]}]' > "$FIX/legacy.json"
+run_both "a later tier still answers when tier 1 is unreadable (work was found: nothing to warn about)" "lg-late" gastown.dog
+reset_fix; touch "$FIX/tier1.fail" "$FIX/legacy.fail" "$FIX/ephemeral.fail"
+WANT_RC=3 WANT_ERR='tier\(s\) 1 2 3 unreadable' run_both "every tier unreadable names all three (exit 3)" "-" gastown.dog
 
 echo "== 8. every long jq/bd literal in the script is verbatim in the engine's probe (typos in a clause no fixture reaches)"
 if python3 -I - "$PROBE" "$body" <<'PY'
