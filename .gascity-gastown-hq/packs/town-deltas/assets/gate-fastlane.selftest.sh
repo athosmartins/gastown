@@ -55,7 +55,24 @@ done
 # ignored). A caller whose TMPDIR holds such a run (the gate's reviewer reproduced it with …/506252929262/…: five assertions went red) would turn the
 # selftest red for a reason that has nothing to do with the lane — and prod-tests/gascity/story-ga-atsahv.sh runs this file under whatever TMPDIR the
 # deploy has. So the fixture base dir is checked against the scanner's OWN rule and moved to /tmp when it would trip it.
-has_long_number() { python3 -c 'import re,sys; sys.exit(0 if re.search(r"\d(?:[\W_]*\d){7,}", sys.argv[1]) else 1)' "$1"; }
+# It asks the scanner's OWN regex (imported, not copied: a copy drifts). 0 = carries a run, 1 = does not; python failing to run is neither, so it stops the
+# selftest instead of reading as "no run" (a traceback exits 1 too).
+has_long_number() {
+  python3 - "$SCAN" "$1" <<'PYHLN'
+import importlib.util, sys
+try:
+    spec = importlib.util.spec_from_file_location("gate_fastlane_scan", sys.argv[1])
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    found = mod._LONG_NUMBER.search(sys.argv[2]) is not None
+except Exception as e:
+    print(f"has_long_number: cannot load the scanner's regex: {e!r}", file=sys.stderr)
+    sys.exit(3)
+sys.exit(0 if found else 1)
+PYHLN
+  local r=$?
+  case "$r" in 0|1) return "$r" ;; *) echo "FATAL: has_long_number could not run (rc=$r)"; exit 2 ;; esac
+}
 T="$(mktemp -d "${TMPDIR:-/tmp}/gate-fastlane.XXXXXX")" || { echo "mktemp failed"; exit 2; }
 trap 'rm -rf "$T"' EXIT
 if has_long_number "$T"; then
@@ -87,10 +104,50 @@ scan_case "WhatsApp-style id"           '+jid 5531999998888@s.whatsapp.net'     
 scan_case "AWS key"                     '+AKIAIOSFODNN7EXAMPLE'                                  1
 scan_case "private key header"          '+-----BEGIN RSA PRIVATE KEY-----'                       1
 scan_case "secret assignment"           '+API_TOKEN = "a1b2c3d4e5f6g7h8i9j0k1l2"'                1
-scan_case "placeholder assignment"      '+API_TOKEN = "<your-token-here-0123>"'                  0
+# a value that opens with < $ or * is not in _ASSIGN's value class, so it is clean BY CONSTRUCTION — not because of _PLACEHOLDER (gate round ga-edhzgb:
+# the one row that stood here, `<your-token-here-0123>`, never reached the placeholder skip, so a scanner without it passed the whole selftest)
+scan_case "template value <...> (clean by construction)"   '+API_TOKEN = "<your-token-here-0123>"'    0
+scan_case "template value \${...} (clean by construction)" '+TOKEN=${MY_SECRET_TOKEN_FROM_ENV_VAR1}'    0
+scan_case "masked value ***** (clean by construction)"     '+token: ************************'         0
 scan_case "word-like value"             '+token_refresh_policy = some_descriptive_name_value'    0
 scan_case "credentials in a URL"        '+mysql://root:hunter2pass@db.local/x'                   1
 scan_case "bead id / short sha"         '+commit f8fa11ee6 fix(ga-gnr3tw) bd ga-atsahv'          0
+# 1a2. the placeholder skip. Each value below MATCHES _ASSIGN (20+ token characters, letters AND digits, under 8 digits in a row) and is a placeholder, so
+# it is clean only because _PLACEHOLDER says so. The mutant scanner (_PLACEHOLDER replaced by a regex that never matches) must flip every one of them to a
+# finding — that is the proof the rows exercise the skip (gate round ga-edhzgb, blocking issue 1: the previous row passed with the skip removed).
+PLACEHOLDERS=('API_TOKEN = "xxxxxxxxxxxxxxxxxxxxxxxx1"' 'api_key = "example123abcdefghijklmnop"' 'password = "changeme123abcdefghijklmnop"'
+              'secret = "your_secret_key_123abcdefghij"' 'token: "your-token-here-123abcdefgh"' 'token = "dummy1234abcdefghijklmnopqrs"'
+              'token = "redacted1abcdefghijklmnopqrstu"' 'token = "placeholder12abcdefghijklmnopq"' 'token = "a1b2c3d4....................."')
+MUT="$T/scan-no-placeholder.py"
+sed 's/^_PLACEHOLDER = .*/_PLACEHOLDER = re.compile(r"(?!x)x")   # mutant: the placeholder skip can never fire/' "$SCAN" > "$MUT"
+if grep -qF '_PLACEHOLDER = re.compile(r"(?!x)x")' "$MUT" && ! cmp -s "$SCAN" "$MUT"; then ok "mutant scanner built (the placeholder skip can never fire)"; else bad "mutant scanner was not built — the placeholder rows below prove nothing"; fi
+for v in "${PLACEHOLDERS[@]}"; do
+  scan_case "placeholder skip: ${v%%[=:]*}… ${v#*[=:] }" "+$v" 0
+  mrc=0; mkdiff "+$v" | python3 "$MUT" >/dev/null 2>&1 || mrc=$?
+  if [ "$mrc" = "1" ]; then ok "…and the mutant (no placeholder skip) reports it → the row exercises the skip"; else bad "…the mutant scanner answers rc=$mrc for $v, want 1 — the row passes WITHOUT the placeholder skip"; fi
+done
+# 1a3. `name = value` where the NAME is quoted, backticked or a table cell (gate round ga-edhzgb, blocking issue 2: the closing quote between the key and
+# the separator defeated the rule, and JSON / a dict / a table is how a credential usually shows up in a runbook). V is 26 letters+digits, no 8-digit run.
+V='a1b2c3d4e5f6g7h8i9j0k1l2m3'
+scan_case 'quoted key, JSON'                  "+\"api_key\": \"$V\""                     1
+scan_case 'quoted key, no space'              "+\"token\":\"$V\""                        1
+scan_case 'quoted key, single quotes'         "+'password': '$V'"                        1
+scan_case 'quoted key inside braces'          "+{\"secret\": \"$V\"}"                    1
+scan_case 'quoted compound key'               "+\"client_secret\": \"$V\""               1
+scan_case 'backticked key'                    "+\`token\`: $V"                           1
+scan_case 'backticked value'                  "+token: \`$V\`"                           1
+scan_case 'markdown table row'                "+| api_key | $V |"                       1
+scan_case 'hash-rocket'                       "+api_key => \"$V\""                       1
+scan_case 'key, space, quote, colon'          "+\"token\" : \"$V\""                      1
+for k in 'api_key = "V"' 'API_KEY=V' 'export TOKEN=V' 'password: V' 'apiKey: "V"'; do   # what the rule caught before: still caught
+  scan_case "unchanged: ${k//V/…}" "+${k//V/$V}" 1
+done
+scan_case 'quoted key, placeholder value (skip still applies)'  '+"token": "xxxxxxxxxxxxxxxxxxxxxxxx1"'  0
+scan_case 'quoted key, word-like value'                         '+"token": "some_descriptive_name_value"' 0
+scan_case 'quoted key, short value'                             '+"token": "abc123"'                      0
+scan_case 'quoted key, number-only value'                       '+"token_budget": 4096'                   0
+scan_case 'table row, template value'                           '+| token | <your-token-here-0123> |'  0
+scan_case 'JWT (three dotted segments)'  '+jwt eyJhbGciOiJIUzI1NiIsInR5cCI.eyJzdWIiOiJhYmNkZWZnaGlqIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r' 1
 OUT=$(mkdiff '+cliente 529.982.247-25 ligou' | python3 "$SCAN" 2>&1)
 case "$OUT" in *529.982*|*52998224725*) bad "scan output echoes the matched value: $OUT" ;; *) ok "scan output carries label/path/line, never the value ($OUT)" ;; esac
 printf 'diff --git a/x.png b/x.png\nBinary files a/x.png and b/x.png differ\n' | python3 "$SCAN" >/dev/null 2>&1; rc=$?
@@ -188,14 +245,67 @@ import sys
 n = 1_500_000
 hdr = "diff --git a/docs/x.md b/docs/x.md\n--- a/docs/x.md\n+++ b/docs/x.md\n"
 with open(sys.argv[1], "w") as f:
-    # the last three stress the long-number rule: a digit followed by a huge separator run, seven-digit near misses by the
+    # bodies 5-7 stress the long-number rule: a digit followed by a huge separator run, seven-digit near misses by the
     # million, and seven digits joined by 1000-long separator runs (the worst case for a regex that backtracks over them)
     for i, body in enumerate(("a" * n, "token" * (n // 5), "ab12." * (n // 5), "x" * 1000 + "://" + "u" * n,
-                              "1" + "-" * n + "x", "1234567a" * (n // 8), (("1" + "-" * 1000) * 7 + "x") * (n // 8000)), 1):
+                              "1" + "-" * n + "x", "1234567a" * (n // 8), (("1" + "-" * 1000) * 7 + "x") * (n // 8000),
+                              # a start token that repeats inside its own run: the jwt pattern walked the rest of the run from EVERY `eyJ`
+                              # (quadratic: 48 KB took 1 s of CPU, 192 KB took 17 s — gate round ga-edhzgb); and the quote / table-pipe / whitespace
+                              # the key-value rule now allows between a keyword and its separator
+                              "eyJ" * (n // 3), "eyJ." * (n // 4), 'token"' * (n // 6), "token|" * (n // 6), "token" + " " * n + "x"), 1):
         f.write(hdr.replace("x.md", f"x{i}.md") + "@@ -0,0 +1 @@\n+" + body + "\n")
 PYGEN
-SECONDS=0; rc=0; timeout 90 python3 "$SCAN" --max-bytes 20000000 < "$LONG" >/dev/null 2>&1 || rc=$?
-{ [ "$rc" = "0" ] && [ "$SECONDS" -lt 60 ]; } && ok "seven 1.5 MB single-line adds (word run, repeated keyword, dotted run, scheme run, separator run, 7-digit near misses, 7 digits over 1000-long separator runs) scan clean in ${SECONDS}s — no quadratic regex" || bad "long-line scan: rc=$rc after ${SECONDS}s (124 = hung; this was 18 s per 32 KB before)"
+# CPU seconds, not wall-clock: the gate runs on a machine shared with dozens of agents, where this scan took 64 s of wall time for 8 s of CPU. A quadratic
+# regex burns minutes to hours of CPU on these inputs (the jwt pattern on repeated `eyJ` was past 90 s), so 40 CPU s still separates "linear" from "hung"; the
+# 300 s wall limit only stops a scanner that is stuck. A python that cannot report leaves rc/cpu empty, which is a red row, never a green one.
+LONG_RC=""; LONG_CPU=""
+read -r LONG_RC LONG_CPU < <(python3 - "$SCAN" "$LONG" <<'PYCPU'
+import resource, subprocess, sys
+try:
+    rc = subprocess.run([sys.executable, sys.argv[1], "--max-bytes", "20000000"], stdin=open(sys.argv[2]),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300).returncode
+except subprocess.TimeoutExpired:
+    rc = 124
+ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+print(rc, int(ru.ru_utime + ru.ru_stime))
+PYCPU
+)
+{ [ "$LONG_RC" = "0" ] && [ -n "$LONG_CPU" ] && [ "$LONG_CPU" -lt 40 ]; } && ok "twelve 1.5 MB single-line adds (word run, repeated keyword, dotted run, scheme run, separator run, 7-digit near misses, 7 digits over 1000-long separator runs, repeated eyJ, repeated eyJ., repeated key+quote, repeated key+pipe, key+whitespace run) scan clean in ${LONG_CPU}s of CPU — no quadratic regex" || bad "long-line scan: rc=${LONG_RC:-<none>} after ${LONG_CPU:-<none>} CPU s (rc 124 = hung past 300 s wall; this was 18 s per 32 KB before)"
+
+# (h) the history mode against REAL git (gate round ga-edhzgb: nothing in this slice ran it). The story's reason for it: a value pasted in one commit and
+# removed in the next is not in the NET diff, but the fast-forward publishes every commit. Commit 2 pastes a JSON credential, commit 3 removes it (and adds a
+# harmless line) with a message whose phone number wraps across two lines. The git output goes to a FILE first: a git that died would feed the scanner an
+# empty stdin, which it answers with "clean" — so the producer's status and a non-empty text are asserted before any scanner verdict is believed.
+GR="$T/hist-repo"
+gitq() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_DATE="2026-10-11T10:56:00+0000" GIT_COMMITTER_DATE="2026-10-11T10:56:00+0000" \
+         git -C "$GR" -c user.name=T -c user.email=t@example.invalid -c commit.gpgsign=false "$@"; }
+if mkdir -p "$GR/docs" && gitq init -q . 2>/dev/null; then
+  printf 'prosa\n' > "$GR/docs/a.md"; gitq add docs/a.md && gitq commit -q -m 'docs: inicio'
+  H_BASE=$(gitq rev-parse HEAD)
+  printf 'prosa\n{"api_key": "a1b2c3d4e5f6g7h8i9j0k1l2m3"}\n' > "$GR/docs/a.md"; gitq commit -q -a -m 'docs: exemplo de configuracao'
+  H_PASTE=$(gitq rev-parse HEAD)
+  printf 'prosa\nmais prosa\n' > "$GR/docs/a.md"; gitq commit -q -a -m $'docs: contato\n\nligar (31) 99999-\n8888 amanha'
+  H_FIX=$(gitq rev-parse HEAD)
+  gitq diff -U0 --no-color --no-renames "$H_BASE...$H_FIX" > "$T/net.diff" 2>/dev/null; net_rc=$?
+  gitq log -p -U0 --no-merges --pretty=medium --no-decorate --no-abbrev-commit --no-color --no-renames "$H_BASE..$H_FIX" > "$T/hist.diff" 2>/dev/null; hist_rc=$?
+  if [ "$net_rc" = "0" ] && [ "$hist_rc" = "0" ] && [ -s "$T/net.diff" ] && [ -s "$T/hist.diff" ] && [ -n "$H_BASE" ] && [ -n "$H_PASTE" ] && [ -n "$H_FIX" ]; then
+    ok "real git: the net diff and the history were produced (rc 0, non-empty)"
+    raw_scan "real git, NET diff of base...head: the pasted credential is gone, so the net pass is clean" 0 < "$T/net.diff"
+    raw_scan "real git, HISTORY of base..head: the credential pasted in commit 2 and the wrapped phone in commit 3's message are both found" 1 < "$T/hist.diff"
+    want=$(printf 'numero-longo\t%s:commit-message\t3\nsecret-assignment\t%s:docs/a.md\t2\n' "${H_FIX:0:9}" "${H_PASTE:0:9}" | sort)
+    [ "$(printf '%s\n' "$SCAN_OUT" | sort)" = "$want" ] && ok "…as <sha9>:docs/a.md:2 and <sha9>:commit-message:3 — the commit to look at, never the value (the Author/Date header is not scanned)" || bad "history findings wrong: $(printf '%s' "$SCAN_OUT" | cat -vte)"
+    case "$SCAN_OUT" in *a1b2c3d4*|*99999*) bad "the history finding published the value: $SCAN_OUT" ;; *) ok "…and the history output carries no matched text" ;; esac
+  else
+    bad "real git could not produce the net diff / history (net rc=$net_rc, history rc=$hist_rc) — the history rows below prove nothing"
+  fi
+else
+  bad "could not create the temp git repo — the real-git history rows did not run"
+fi
+FAKE_SHA=0123456789abcdef0123456789abcdef01234567
+raw_scan "a commit header line that is not Author:/Date:" 2 < <(printf "commit $FAKE_SHA\nAuthor: T <t@example.invalid>\nbogus header line\n\n    msg\n")
+raw_scan "a stream that ends inside a commit header (truncated)" 2 < <(printf "commit $FAKE_SHA\nAuthor: T <t@example.invalid>\nDate:   Sun Oct 11 10:56:00 2026 +0000\n")
+raw_scan "a commit whose message holds a phone, no diff" 1 < <(printf "commit $FAKE_SHA\nAuthor: T <t@example.invalid>\nDate:   Sun Oct 11 10:56:00 2026 +0000\n\n    fone 31 99999 8888\n")
+raw_scan "a clean commit message; the Date header's digits are not content" 0 < <(printf "commit $FAKE_SHA\nAuthor: T <t@example.invalid>\nDate:   Sun Oct 11 10:56:00 2026 +0000\n\n    docs: so prosa\n")
 
 # ── 2. path classes ───────────────────────────────────────────────────────────────────────────────────────────
 echo "── 2. path classes (the story's DOC / TEST / PROMPT / CODE) ──"

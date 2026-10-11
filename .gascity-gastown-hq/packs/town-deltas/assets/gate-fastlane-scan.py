@@ -28,6 +28,10 @@ exit 2  could not scan (binary file in the diff, input over --max-bytes, unreada
         every line it may meet and consumes exactly the line counts each `@@` header declares; a line it cannot
         classify, or a hunk that ends early, is exit 2 — never "adds nothing".
 
+EMPTY INPUT is exit 0: "clean" is a statement about the TEXT this script was given, and no text adds nothing. It cannot tell a quiet range
+from a git that died upstream of the pipe, so the CALLER must check the producer's own exit status and must read "no text for a range that
+has files" as "could not scan". (The lib that calls this, slice 3 of ga-atsahv, does both; nothing calls it before that slice.)
+
 WHAT IT COVERS, AND WHAT IT DOES NOT. Where a choice exists it errs toward a finding (a false positive costs one
 ordinary review; a false negative publishes data), but it is a net for the ACCIDENTAL paste of a lead's number or
 a token into a document, not proof that a document is clean.
@@ -41,7 +45,8 @@ a token into a document, not proof that a document is clean.
       costs one ordinary review, which is the status quo.
     * credentials — the shapes in _SECRET_SHAPES (private-key header, AWS / GitHub / Slack / Google / sk- keys, JWT,
       bearer token, credentials inside a URL) and `name = value` where the name says secret and the value is 20+
-      token characters mixing letters and digits.
+      token characters mixing letters and digits. The key may be quoted or backticked and the separator may be `:` `=` `=>`
+      or a table pipe (`"api_key": "V"`, `{"secret": "V"}`, `| token | V |`), so the usual JSON / dict / table forms are found.
   NOT covered
     * an e-mail address; a name; an address; any personal data that carries no long number
     * a password that is letters-only or digits-only, or whose symbols end the value run (`Hunter2!Hunter2!Hunter2!`)
@@ -51,6 +56,7 @@ a token into a document, not proof that a document is clean.
       commits added next to each other; the per-commit pass does not, and does not need to)
     * the author name / e-mail of a commit (identity, not pasted content)
     * a secret in a shape _SECRET_SHAPES does not list
+    * a credential passed as a call argument (`get("token", "V")`) or a JWT glued to a word character right before its `eyJ`
 The patterns are defined here, once. (The story cites "the same patterns as publicar-estudo"; no copy of that
 skill is reachable from the gate, so this is an independent set — keep it as the single place to unify them.)
 """
@@ -78,7 +84,9 @@ _SECRET_SHAPES = [
     ("slack-webhook", re.compile(r"hooks\.slack\.com/services/[A-Za-z0-9/]{20,}")),
     ("api-key", re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}")),
     ("google-key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
-    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}")),
+    # the lookbehind lets a token start only at the beginning of a run, like url-credentials below: without it every `eyJ` of a run of
+    # repeated `eyJ` is a fresh start and each walks the rest of the run before failing on the missing `.` (quadratic: 48 KB took 1 s, 192 KB took 17 s)
+    ("jwt", re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}")),
     ("bearer", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{24,}")),
     # the lookbehind lets a scheme start only at the beginning of a run: without it every position of a long
     # alphanumeric line is a fresh start and the match is quadratic (64 000 chars took 3.6 s)
@@ -88,11 +96,18 @@ _SECRET_SHAPES = [
 # No leading `[\w.-]*` (finditer already finds the keyword anywhere) and the trailing run is capped: both made the
 # match quadratic on a long line of word characters (32 000 chars took 18 s; "token" x 400 000 never finished) —
 # a scan that holds the citywide gate lock must not hang. No credential NAME runs 64 characters past its keyword.
+# Between the key and its separator: one closing quote or backtick (`"api_key": "V"`, `'password': 'V'`, `token`: V) and spaces; the
+# separator is `:`, `=`, `=>` or a table pipe (`| api_key | V |`). The value may be quoted or backticked. Each piece is bounded or a
+# single run of whitespace, and none of them overlaps the run before it, so the match stays linear (selftest §1f: `token"` and `token|`
+# by the 250 000, a keyword followed by a 1.5 MB whitespace run).
 _ASSIGN = re.compile(
     r"(?i)(?:api[_-]?key|secret|token|passw(?:or)?d|pwd|credential|private[_-]?key)[\w.-]{0,64}"
-    r"\s*[:=]\s*[\"']?([A-Za-z0-9/+_=.-]{20,})[\"']?"
+    r"[\"'`]?\s*(?:[:=]>?|\|)\s*[\"'`]?([A-Za-z0-9/+_=.-]{20,})[\"'`]?"
 )
-_PLACEHOLDER = re.compile(r"(?i)x{4,}|\*{3,}|<[^>]*>|\$\{|\$\(|^\$|example|placeholder|your[_-]|changeme|dummy|redacted|\.\.\.")
+# What a placeholder value looks like. Only values that CAN match _ASSIGN's value class are listed: one that opens with `<`, `$` or `*`
+# (`<your-token>`, `${TOKEN}`, `$(cmd)`, `*****`) is not in that class, so _ASSIGN never matches it and it is clean by construction — it
+# is not skipped here (the five alternatives that said so could never fire; selftest §1 keeps those shapes as rows).
+_PLACEHOLDER = re.compile(r"(?i)x{4,}|example|placeholder|your[_-]|changeme|dummy|redacted|\.\.\.")
 
 
 def scan_text(text: str, numbers: bool = True):
