@@ -192,6 +192,18 @@ LOG_TAIL = int(os.environ.get("ARC_LOG_TAIL", "2000"))
 PILOT_SWEEP_HISTORY_TAIL = int(os.environ.get("ARC_PILOT_SWEEP_HISTORY_TAIL", "20000"))
 PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN = int(
     os.environ.get("ARC_PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN", "1440"))
+# PAUSE_COMMON_* (ga-5bzrzu): when ≥ PAUSE_COMMON_MIN_PCT % of the Pilot's sweeps in a bead's
+# own wait window (and at least PAUSE_COMMON_MIN_SWEEPS of them — a handful of sweeps is not
+# evidence) were whole-sweep pauses, the pause is the COMMON cause of that bead's wait and the
+# bead goes into ONE per-cause note instead of its own "dispatch failing" mail (11/10: 20+ mails
+# for one RAM-pressure cause). 25 is measured, not guessed: over 3h windows of the real
+# pilot-dispatcher.log (2026-09-10..10-11, 420 windows) the paused share is median 0%, p75 10%,
+# p90 20% — while the incident ran at 17/56 = 30%. 25% sits above the normal tail and below the
+# incident; both are env-overridable.
+PAUSE_COMMON_MIN_PCT = int(os.environ.get("ARC_PAUSE_COMMON_MIN_PCT", "25"))
+PAUSE_COMMON_MIN_SWEEPS = int(os.environ.get("ARC_PAUSE_COMMON_MIN_SWEEPS", "10"))
+PAUSE_NOTE_OLDEST_N = 5   # beads named in the cause note (the count covers all of them)
+PAUSE_CAUSE_KEY = "pilot-pause"   # ONE bucket: a flip of the dominant reason is not a new incident
 FLOW_AUTHORITY_TTL_SEC = int(os.environ.get("ARC_FLOW_AUTHORITY_TTL_SEC", "3600"))
 # Marker label stamped on a bead after its first Step 1b keyword-flag comment. Idempotency
 # gate (ga-1iz2e/AC1): a bead that already carries this label is skipped — comment once,
@@ -456,11 +468,13 @@ def _load_state():
                 d.setdefault("reclaim_exhausted", {})
                 d.setdefault("branch_stranded", {})
                 d.setdefault("capacity_wait", {})
+                d.setdefault("pause_cause", {})
                 return d
     except Exception:
         pass
     return {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {},
-            "reclaim_exhausted": {}, "branch_stranded": {}, "capacity_wait": {}}
+            "reclaim_exhausted": {}, "branch_stranded": {}, "capacity_wait": {},
+            "pause_cause": {}}
 
 
 def _save_state(state):
@@ -491,7 +505,7 @@ def _prune_state(state, now):
     """
     cutoff = now - 7 * 24 * 3600
     for key in ("routed", "alarmed", "first_seen_approved", "flagged", "reclaim_exhausted",
-                "branch_stranded", "capacity_wait"):
+                "branch_stranded", "capacity_wait", "pause_cause"):
         bucket = state.get(key, {})
         if not isinstance(bucket, dict):
             _log("WARN: state[%r] is a %s, not a mapping — reset to empty" % (
@@ -1028,37 +1042,93 @@ def _pilot_sweep_pause_history(now, age_min):
     correctly by earlier cycles. Reading "dispatch path failing" against the
     bead's full age as if it were 100% unexplained overstates the problem.
     """
-    window_min = min(age_min, PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN)
+    records = _pilot_sweep_pause_read()
+    if records is None:
+        return None, None
+    paused, total, _by_reason = _pilot_sweep_pause_window(records, now, age_min)
+    return paused, total
+
+
+def _pilot_sweep_pause_read():
+    """Read the Pilot log ONCE and reduce it to (oldest_epoch, sweeps) — `oldest_epoch` is the
+    oldest timestamp on ANY line (the completeness check needs the tail's own reach, not just
+    the sweep lines'), `sweeps` is [(epoch, pause_reason_or_None)] for every datable sweep-
+    complete line. None if the log is missing/unreadable/empty.
+
+    Split out of _pilot_sweep_pause_history (ga-5bzrzu) so one cycle can answer the window
+    question for MANY beads from one read of a ~20000-line tail, instead of re-scanning it per
+    bead; _pilot_sweep_pause_window() below holds the window semantics, in one place."""
     if _read_pilot_log_lines is not None:
         lines = _read_pilot_log_lines()   # test seam (shared with _is_pilot_alive)
     else:
         lines = _tail(PILOT_LOG, PILOT_SWEEP_HISTORY_TAIL)
     if not lines:
-        return None, None
-
-    cutoff = now - window_min * 60
-    total = 0
-    paused = 0
+        return None
     oldest_epoch = None
+    sweeps = []
     for line in lines:
         epoch = _ts_epoch(line)
         if epoch is None:
             continue
         if oldest_epoch is None or epoch < oldest_epoch:
             oldest_epoch = epoch
-        if epoch < cutoff:
-            continue
         if not _PILOT_SWEEP_RE.search(line):
             continue
-        total += 1
-        if _PILOT_SWEEP_PAUSED_RE.search(line):
-            paused += 1
+        sweeps.append((epoch, _pilot_pause_reason(line)
+                       if _PILOT_SWEEP_PAUSED_RE.search(line) else None))
+    return oldest_epoch, sweeps
 
+
+def _pilot_sweep_pause_window(records, now, age_min):
+    """(paused, total, {reason: n}) over the sweeps inside this bead's wait window
+    (min(age_min, PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN) minutes back from `now`), or
+    (None, None, None) if unmeasurable — the tail does not reach back the whole window, or no
+    sweep falls inside it (see _pilot_sweep_pause_history for why those are NOT zero)."""
+    oldest_epoch, sweeps = records
+    cutoff = now - min(age_min, PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN) * 60
     if oldest_epoch is None or oldest_epoch > cutoff:
-        return None, None  # tail doesn't reach back the full window — unmeasurable
+        return None, None, None   # tail doesn't reach back the full window — unmeasurable
+    total = paused = 0
+    by_reason = {}
+    for epoch, reason in sweeps:
+        if epoch < cutoff:
+            continue
+        total += 1
+        if reason is not None:
+            paused += 1
+            by_reason[reason] = by_reason.get(reason, 0) + 1
     if total == 0:
-        return None, None
-    return paused, total
+        return None, None, None
+    return paused, total, by_reason
+
+
+# What a whole-sweep pause says about itself, right after "dispatched=0 (" — the 5 real shapes
+# are logged by pilot-dispatcher.sh next to each _pilot_write_sweep_pause_state(1, ...) call
+# ("paused: pressão de RAM <level>", "paused: cota 5h limitada, resets ...", "paused: drain
+# window", "paused: quiet hours", "deferred: cross-stage gate-congested + resource-contended").
+_PILOT_PAUSE_TEXT_RE = re.compile(r"dispatched=0 \((?:paused|deferred): ([^)]*)")
+_PILOT_PAUSE_REASONS = (
+    ("pressão de RAM", re.compile(r"\bram\b", re.I)),
+    ("cota 5h", re.compile(r"\b(?:cota|quota)\b", re.I)),
+    ("quiet hours", re.compile(r"quiet[ -]hours", re.I)),
+    ("drain window", re.compile(r"drain[ -]window", re.I)),
+    ("yield cross-stage", re.compile(r"cross-stage", re.I)),
+)
+
+
+def _pilot_pause_reason(line):
+    """Short, STABLE name for why a paused/deferred sweep-complete line paused. The RAM level
+    (EMERGENCY/WARN) and the quota reset time are deliberately dropped — they flip from sweep
+    to sweep and are not a different reason. A reason this table does not know keeps its own
+    (truncated) text rather than being filed under a known one."""
+    m = _PILOT_PAUSE_TEXT_RE.search(line)
+    if not m:
+        return "motivo não lido"
+    text = m.group(1).strip()
+    for name, rx in _PILOT_PAUSE_REASONS:
+        if rx.search(text):
+            return name
+    return text[:40] or "motivo não lido"
 
 
 def _pilot_sweep_pause_body_line(paused, total):
@@ -2534,6 +2604,170 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
     bucket[pool] = {"last": now, "count": ordinal, "fp": fp}
 
 
+# ── "Pilot pausado" common-cause note (ga-5bzrzu) ─────────────────────────────
+class _PauseAggregator(object):
+    """Folds every starving bead whose wait the Pilot's whole-sweep pauses explain IN COMMON
+    into ONE note per cycle, instead of one "dispatch failing" mail per bead.
+
+    WHY (ga-5bzrzu, measured 11/10 09:2x-10:1x): 20+ mails "buildable bead <id> starving —
+    dispatch failing (Pilot pausado 17/56 sweeps recentes)", one per bead, ONE cause — the Pilot
+    paused for RAM pressure in ~30% of its sweeps. The other common cause, a pool at its session
+    cap, already coalesces into one note per pool (_alarm_capacity_wait, ga-9ekn2l); this is the
+    same fix for the pause. A cause that is specific to one bead keeps its own _alarm_starving.
+
+    A bead is folded in only on MEASURED evidence: inside its own wait window (the window
+    _pilot_sweep_pause_history uses) at least PAUSE_COMMON_MIN_SWEEPS sweeps were logged and at
+    least PAUSE_COMMON_MIN_PCT % of them were whole-sweep pauses. Anything unmeasurable (log
+    unreadable, tail too short for the window, too few sweeps) or below that bar is NOT a common
+    cause and falls through to _alarm_starving unchanged — a broken log can never silence an
+    alarm (root-class:error-vs-empty, same direction as every sibling check in this file).
+
+    ONE bucket (PAUSE_CAUSE_KEY), not one per reason: with a mix like 8 RAM + 7 cross-stage
+    neither reason alone reaches the bar, and a bucket per dominant reason would re-fire every
+    time the dominant one flipped — the same flood, one level up (the capacity-wait fingerprint
+    has the same hazard, see the comment in _alarm_capacity_wait). The reasons are listed in the
+    note instead.
+
+    One aggregator per run_cycle(), shared across rigs, so the count is the whole city's and a
+    later rig cannot send a second note; _process_store() makes its own when called alone.
+
+    Deliberately NOT done, same reasons as _alarm_capacity_wait: no _write_flow_authority() (that
+    tells the stall watchdogs to defer THEIR Mayor mail, and a pause note is not an escalation of
+    a flow stall — a pause that never ends is precisely what they exist to catch), no phone push
+    and no human-touch ledger row (nothing here asks a human to act).
+    """
+
+    def __init__(self, now):
+        self.now = now
+        self._records = None
+        self._read = False
+        self.items = {}
+
+    def attribute(self, age_min):
+        """(paused, total, {reason: n}) if the pause is the common cause of a bead that has
+        waited `age_min`, else None (unmeasurable, too few sweeps, or below the bar)."""
+        if not self._read:
+            self._records = _pilot_sweep_pause_read()
+            self._read = True
+        if self._records is None:
+            return None
+        paused, total, by_reason = _pilot_sweep_pause_window(self._records, self.now, age_min)
+        if paused is None or paused <= 0 or total < PAUSE_COMMON_MIN_SWEEPS:
+            return None
+        if paused * 100 < PAUSE_COMMON_MIN_PCT * total:   # integer math: 14/56 is exactly 25%
+            return None
+        return paused, total, by_reason
+
+    def add(self, bead, age_min, attribution):
+        bead_id = bead.get("id") or bead.get("issue_id") or ""
+        if not bead_id or bead_id in self.items:   # same id from two rig stores counts once
+            return
+        paused, total, by_reason = attribution
+        self.items[bead_id] = {
+            "id": bead_id, "age_min": age_min, "paused": paused, "total": total,
+            "by_reason": by_reason, "title": (bead.get("title") or bead.get("name") or "?")[:70]}
+
+    def flush(self, state):
+        """Send the one note for this cycle's folded beads, if the backoff allows it."""
+        if not self.items:
+            return
+        now = self.now
+        beads = sorted(self.items.values(), key=lambda b: (-b["age_min"], b["id"]))
+        self.items = {}
+        head = beads[0]   # widest wait window → the headline numbers come from it
+
+        bucket = state.setdefault("pause_cause", {})
+        raw = bucket.get(PAUSE_CAUSE_KEY)
+        last, count = 0.0, 0
+        if isinstance(raw, dict):
+            try:
+                last, count = float(raw.get("last", 0.0)), int(raw.get("count", 0))
+            except (TypeError, ValueError):
+                # Corrupt record: "no prior note" — a visible note beats an exception that
+                # aborts the cycle (same rule as _alarm_capacity_wait).
+                last, count = 0.0, 0
+
+        if (now - last) < _alarm_backoff_sec(count):
+            _log("  pause-cause backoff active (count=%d, last %.0fmin ago, next in >=%.0fmin) "
+                 "— %d bead(s) folded, no note" % (
+                 count, (now - last) / 60.0,
+                 (_alarm_backoff_sec(count) - (now - last)) / 60.0, len(beads)))
+            return
+
+        ordinal = count + 1
+        reasons = ", ".join("%s %d" % (r, n) for r, n in sorted(
+            head["by_reason"].items(), key=lambda kv: (-kv[1], kv[0])))
+        _log("PAUSE-CAUSE (common cause, not a per-bead dispatch failure): %d bead(s) | oldest "
+             "%s %.0fmin | %d/%d sweeps paused (%s) | ordinal=%d" % (
+             len(beads), head["id"], head["age_min"], head["paused"], head["total"],
+             reasons, ordinal))
+
+        if DRY_RUN:
+            _log("DRY_RUN: would send the pause-cause note for %d bead(s) (ordinal=%d)" % (
+                 len(beads), ordinal))
+            return  # no state update, no mutations
+
+        subject = ("Reconciler: Pilot pausado em %d/%d sweeps (%s) — %d bead(s) esperando "
+                   "(mais antiga %s, %dmin) — causa comum atribuída, 1 nota por causa%s" % (
+                   head["paused"], head["total"], reasons, len(beads), head["id"],
+                   int(head["age_min"]), "" if ordinal == 1 else " (repeat #%d)" % ordinal))
+        lines = [
+            "APPROVED-STATE-RECONCILER: Pilot PAUSADO — causa comum de %d bead(s) esperando" % len(beads),
+            "(uma nota por CAUSA, não uma por bead)",
+            "",
+            "Causa: o Pilot pausou o sweep inteiro de propósito em %d dos últimos %d sweeps "
+            "logados (%d%%) durante a espera da bead mais antiga (%s, %dmin). Motivos: %s." % (
+                head["paused"], head["total"], 100 * head["paused"] // head["total"],
+                head["id"], int(head["age_min"]), reasons),
+            "Beads: %d, cada uma medida na PRÓPRIA janela de espera (só entra quem teve ≥%d%% dos "
+            "sweeps pausados, com no mínimo %d sweeps logados). As %d mais antigas:" % (
+                len(beads), PAUSE_COMMON_MIN_PCT, PAUSE_COMMON_MIN_SWEEPS, PAUSE_NOTE_OLDEST_N),
+        ]
+        for i, b in enumerate(beads[:PAUSE_NOTE_OLDEST_N], 1):
+            lines.append("  %d. %s — %dmin — pausado %d/%d — %s" % (
+                i, b["id"], int(b["age_min"]), b["paused"], b["total"], b["title"]))
+        if len(beads) > PAUSE_NOTE_OLDEST_N:
+            lines.append("  (+%d outra(s) com a mesma causa)" % (len(beads) - PAUSE_NOTE_OLDEST_N))
+        lines += [
+            "",
+            "Nota #%d para esta causa." % ordinal,
+            "",
+            "O QUE É: sweep pausado é um ciclo em que o Pilot não despacha NADA (pressão de RAM, "
+            "cota 5h, quiet hours, drain window ou yield cross-stage). Estas beads passaram por "
+            "todos os filtros de supressão do reconciliador e seguem sem despachar (a idade de "
+            "cada uma está na lista); antes desta nota cada uma mandava o próprio alarme "
+            "'dispatch failing' com a MESMA causa. Backoff desta nota: 1h/4h/12h.",
+            "LIMITE: o Pilot também rodou sweeps normais nesta janela — a pausa explica PARTE da "
+            "espera, não prova que nenhuma bead tenha, além dela, uma falha de despacho própria. "
+            "Se a pausa cair abaixo de %d%% dos sweeps, cada bead que seguir parada volta a "
+            "alarmar sozinha ('dispatch failing')." % PAUSE_COMMON_MIN_PCT,
+            "",
+            "CONFERIR (só se a espera parecer longa demais):",
+            "1. cat %s — a pausa está ativa agora? qual motivo?" % PILOT_SWEEP_PAUSE_STATE_FILE,
+            "2. grep 'Pilot sweep complete' .gc/logs/pilot-dispatcher.log | tail -60 — a "
+            "distribuição dos motivos.",
+            "3. RAM, cota 5h e quiet hours passam sozinhas; yield cross-stage é fila do gate "
+            "(gate_queue_backlog), não do despacho.",
+            "Fonte: linhas 'Pilot sweep complete: dispatched=0 (paused|deferred: ...)' de "
+            ".gc/logs/pilot-dispatcher.log.",
+        ]
+        body = "\n".join(lines) + "\n"
+
+        if _do_mail_mayor is not None:
+            sent = bool(_do_mail_mayor(subject, body))
+        else:
+            proc = _sh([GC_BIN, "mail", "send", MAYOR_ADDR, "-s", subject, "-m", body, "--notify"],
+                       timeout=45)
+            sent = proc is not None and getattr(proc, "returncode", 1) == 0
+        if not sent:
+            # State is recorded either way (a dead mail path is not retried every cycle), but
+            # never SILENTLY: the reader of this log must be able to see the note did not go out.
+            _log("WARN: pause-cause mail to %s FAILED for %d bead(s) — state still recorded, "
+                 "so the next note is due only after the backoff" % (MAYOR_ADDR, len(beads)))
+
+        bucket[PAUSE_CAUSE_KEY] = {"last": now, "count": ordinal}
+
+
 # ── reclaim-exhausted note (ga-ag16) ──────────────────────────────────────────
 def _alarm_reclaim_exhausted(rig_root, bead, reclaim_count, now, state):
     """Emit a ONE-TIME 'reclaim-exhausted' note for a bead at/above RECLAIM_CAP.
@@ -3409,7 +3643,7 @@ def _branch_stranded_reason(bead_id):
 # ── process one store ─────────────────────────────────────────────────────────
 def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                     gate_depth=None, gate_throughput=None, dispatchable=None,
-                    sweep_pause_state=None, cap_evidence=None):
+                    sweep_pause_state=None, cap_evidence=None, pause_agg=None):
     """Scan story:approved open beads in rig_root; classify and act on each one.
 
     built_ids: set of bead ids with a live BUILT marker (from _gate_marker_source_beads(),
@@ -3442,9 +3676,19 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
     .walked_all: whether the newest sweep walked EVERY candidate, i.e. whether a
     bead's absence from the map is a measured "not held" or just unmeasured.
 
+    pause_agg (ga-5bzrzu): the _PauseAggregator shared by every rig of one run_cycle(), which
+    flushes it ONCE after the last rig. A bead whose wait the Pilot's whole-sweep pauses explain
+    in common is folded into it instead of getting its own "dispatch failing" mail — and is NOT
+    counted in `alarmed`, same as a capacity wait. None (a direct call) → this function makes
+    its own and flushes it before returning, so the feature never depends on the caller opting in.
+
     Returns (processed, routed, alarmed) int counts.
     On query error: logs + returns (0, 0, 0) — fail-open; other stores are unaffected.
     """
+    own_pause_agg = pause_agg is None
+    if own_pause_agg:
+        pause_agg = _PauseAggregator(now)
+
     # Query story:approved open beads.
     #
     # IMPORTANT: story:approved is NOT a pipeline stage — it is a durable ELIGIBILITY
@@ -3894,11 +4138,28 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
                  bead_id, starve_age_min, gate_suppress_reason))
             continue
 
+        # COMMON CAUSE (ga-5bzrzu): everything above is per-bead and found nothing that
+        # explains this wait, but the Pilot's own history may — if it paused the whole sweep in
+        # >= PAUSE_COMMON_MIN_PCT % of the sweeps of THIS bead's wait window, the pause is the
+        # cause it shares with every other bead in the same spot (11/10: 20+ mails, one cause).
+        # Fold it into the per-cause note instead of mailing it alone. Unmeasurable or below the
+        # bar → None → the per-bead alarm below, exactly as before. Not counted in `alarmed`
+        # and no per-bead alarm state: this is deliberately not an alarm about a failure.
+        pause_attr = pause_agg.attribute(starve_age_min)
+        if pause_attr is not None:
+            _log("  %s: daemon-age=%.0fmin, the Pilot paused %d of the last %d sweeps of this "
+                 "wait — common cause, folded into the pause-cause note (no per-bead alarm)" % (
+                 bead_id, starve_age_min, pause_attr[0], pause_attr[1]))
+            pause_agg.add(bead, starve_age_min, pause_attr)
+            continue
+
         # ALARM: buildable bead starving, pilot alive, pool has capacity, dispatch failing.
         _alarm_starving(rig_root, bead, starve_age_min, now, state, gate_depth, gate_throughput,
                          dispatchable, cap_evidence)
         alarmed += 1
 
+    if own_pause_agg:
+        pause_agg.flush(state)
     return processed, routed, alarmed
 
 
@@ -3983,6 +4244,7 @@ def run_cycle(now, state):
              "UNMEASURED (%s)" % (getattr(cap_evidence, "why", "") or _CapEvidence.why)))
 
     total_p = total_r = total_a = 0
+    pause_agg = _PauseAggregator(now)   # ga-5bzrzu: one per cycle, shared by every rig
 
     for rig_root in RIG_ROOTS:
         rig_root = rig_root.strip()
@@ -4003,12 +4265,18 @@ def run_cycle(now, state):
         try:
             p, r, a = _process_store(rig_root, now, state, pilot_alive, built_ids,
                                       blocked_ids, gate_depth, gate_throughput,
-                                      dispatchable, sweep_pause_state, cap_evidence)
+                                      dispatchable, sweep_pause_state, cap_evidence,
+                                      pause_agg)
             total_p += p
             total_r += r
             total_a += a
         except Exception as e:
             _log("  [%s] UNEXPECTED ERROR (fail-open): %r" % (rig_root, e))
+
+    try:
+        pause_agg.flush(state)
+    except Exception as e:
+        _log("  pause-cause note UNEXPECTED ERROR (fail-open): %r" % (e,))
 
     _log("cycle done: %d processed, %d routed, %d alarmed" % (total_p, total_r, total_a))
     return total_p, total_r, total_a
@@ -4313,6 +4581,16 @@ def _selftest():
                 16:37/16:52/17:07 sweeps, verbatim — wa-c8s2w stays explained
                 across the dispatching sweep, ONE note naming the pool's newest
                 cap although the kept lines mix caps 4 and 2
+      (ga-5bzrzu-a..l) one note per COMMON CAUSE for the "Pilot pausado" starving
+                mails — a: replay of the 11/10 flood (12 beads x 3 rigs → 1 note,
+                count + 5 oldest, no push/ledger/flow-authority); b: a bead whose OWN
+                window shows no pause keeps its own mail; c: 1h/4h backoff; d: an
+                unreadable window is UNMEASURED, never a cause; e: the >=25% boundary
+                (14/56 in, 13/56 out); f: the 10-sweep floor; g: mixed reasons share
+                ONE bucket (a flip of the dominant reason does not re-fire); h: DRY_RUN;
+                i: a failed send is logged; j: prune + corrupt record; k: a direct
+                _process_store() call aggregates too; l: the reason classifier on the
+                REAL log shapes
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
@@ -4490,6 +4768,13 @@ def _selftest():
     # testing the queue-position feature relies on. Scenarios below that DO
     # test it override this directly, same convention as _read_gate_log_lines.
     _read_pilot_dispatchable_file = lambda: None
+    # Same hermetic default for the whole-sweep pause state (ga-nq0jo): unstubbed, the suite
+    # read the LIVE ~/.gc/pilot-sweep-pause-state.json, and whenever the real Pilot happened to
+    # be paused (measured 2026-10-11 10:40, ram-pressure WARN) 29 unrelated scenarios failed
+    # with "mail_calls=[]" — the file's `at` is "in the future" next to this suite's fixed NOW,
+    # so it always reads as fresh. None → "cannot confirm pause state" → never suppresses, the
+    # same alarm-preserving default as the dispatchable read above.
+    _read_pilot_sweep_pause_state_file = lambda: None
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _make_bead(bid, labels=None, title="Test story", assignee="",
@@ -6659,7 +6944,9 @@ def _selftest():
         _bad("(ga-nq0jo-d)", "fresh_result=%r stale_result=%r missing_result=%r" % (
              fresh_result, stale_result, missing_result))
 
-    _read_pilot_sweep_pause_state_file = None   # leave the seam clean for any test after this one
+    # Leave the seam hermetic for any test after this one: None here would be the REAL reader
+    # again, i.e. the live ~/.gc/pilot-sweep-pause-state.json (see the default set up top).
+    _read_pilot_sweep_pause_state_file = lambda: None
 
     print("\nScenario (ga-ndh7jm): the SHIPPED DEFAULT PILOT_SWEEP_PAUSE_TTL_SEC "
           "must comfortably exceed the measured real sweep-to-sweep intervals, "
@@ -8149,6 +8436,312 @@ def _selftest():
         _bad("(ga-9ekn2l-q)", "log=%r state=%r" % (
              [l for l in _q_buf.getvalue().splitlines() if "capacity" in l][:3],
              st.get("capacity_wait")))
+
+    # ── ga-5bzrzu: ONE note per COMMON CAUSE for the "Pilot pausado" starving mails ──
+    # Measured 11/10 09:2x-10:1x: 20+ "buildable bead <id> starving — dispatch failing (Pilot
+    # pausado 17/56 sweeps recentes)" mails, one per bead, ONE cause (the Pilot paused for RAM
+    # pressure in ~30% of its sweeps). The pool-cap branch already coalesced into one note per
+    # pool (ga-9ekn2l); this branch still mailed once per bead. The fixtures below use the REAL
+    # pause-line shapes of pilot-dispatcher.log (the older ga-tma6wc fixtures use invented ones).
+    _PC_SHAPES = {
+        "ram": "paused: pressão de RAM EMERGENCY",
+        "ram-warn": "paused: pressão de RAM WARN",
+        "quota": "paused: cota 5h limitada, resets 3:00pm (in 45min)",
+        "drain": "paused: drain window",
+        "quiet": "paused: quiet hours",
+        "xstage": "deferred: cross-stage gate-congested + resource-contended, ga-d0hz3",
+    }
+
+    def _pc_line(epoch, shape=None):
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(epoch))
+        if shape is None:
+            return ("%s [pilot-dispatcher] === Pilot sweep complete: dispatched=3 "
+                    "(small_slots=2 big_slots=1 dolt_saturated_at_start=0) ===" % ts)
+        return ("%s [pilot-dispatcher] === Pilot sweep complete: dispatched=0 (%s) ===" % (
+                ts, _PC_SHAPES[shape]))
+
+    def _pc_log(t, old_total, old_paused, shapes=("ram",), recent_normal=0):
+        """A Pilot log as read at epoch `t`. One normal ANCHOR sweep 1500min back (outside every
+        window, proves the tail reaches back), then `old_total` sweeps spread over the 24h window
+        of which EXACTLY `old_paused` are whole-sweep pauses (cycling through `shapes`), then
+        `recent_normal` normal sweeps inside the last 65min. The last line is always within the
+        pilot-alive window."""
+        lines = [_pc_line(t - 1500 * 60)]
+        start = t - 1400 * 60
+        end = t - (80 * 60 if recent_normal else 100)
+        used = 0
+        for i in range(old_total):
+            e = start + (end - start) * i / max(old_total - 1, 1)
+            if (i * old_paused) // old_total != ((i + 1) * old_paused) // old_total:
+                lines.append(_pc_line(e, shapes[used % len(shapes)]))
+                used += 1
+            else:
+                lines.append(_pc_line(e))
+        for j in range(recent_normal):
+            lines.append(_pc_line((t - 65 * 60) + (65 * 60 - 100) * j / max(recent_normal - 1, 1)))
+        return lines
+
+    def _pc_mails():
+        return [(s, b) for s, b in mail_calls if "causa comum" in s and "Pilot pausado" in s]
+
+    _PC_AGES = [8016, 7376, 6985, 5268, 3455, 2779, 2367, 2305, 1700, 1600, 1550, 1500]
+    _pc_ids = ["ga-5bzrzu-b%02d" % i for i in range(len(_PC_AGES))]
+    _pc_age = dict(zip(_pc_ids, _PC_AGES))
+
+    def _pc_setup(ids, ages=None):
+        """Stub the approved store (the SAME list in every rig, like the other multi-bead
+        scenarios) and return a fresh state with each bead first seen `age` minutes ago."""
+        global _bd_approved, _read_pilot_dispatchable_file
+        _bd_approved = lambda root: [_make_bead(b, labels=["story:approved"], title="Title of %s" % b)
+                                     for b in ids]
+        _read_pilot_dispatchable_file = lambda: None
+        s = _reset()
+        for b in ids:
+            s["first_seen_approved"][b] = NOW - (ages or _pc_age)[b] * 60
+        return s
+
+    print("\nScenario (ga-5bzrzu-a): END-TO-END replay of the 11/10 flood — 12 starving beads "
+          "(the same list in each of the 3 rigs), ONE cause (the Pilot paused for RAM in 17 of "
+          "56 sweeps) → ONE note carrying the count and the 5 OLDEST, zero per-bead "
+          "'dispatch failing' mails, and no phone push / ledger row / flow authority "
+          "(nothing here asks a human to act)")
+    _read_pilot_sweep_pause_state_file = _pause_off
+    st = _pc_setup(_pc_ids)
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 56, 17)
+    run_cycle(NOW, st)
+    _pca = _pc_mails()
+    _pca_subj, _pca_body = (_pca[0] if _pca else ("", ""))
+    _pca_problems = []
+    if len(_pca) != 1:
+        _pca_problems.append("want 1 cause note, got %d (subjects=%r)" % (
+            len(_pca), [s for s, _ in mail_calls]))
+    if _df_mails():
+        _pca_problems.append("%d per-bead 'dispatch failing' mails still went out" % len(_df_mails()))
+    for _need in ("17/56", "12 bead(s)", _pc_ids[0], "8016min"):
+        if _need not in _pca_subj:
+            _pca_problems.append("subject lacks %r: %r" % (_need, _pca_subj))
+    for _id in _pc_ids[:5]:
+        if _id not in _pca_body:
+            _pca_problems.append("oldest-5 bead %s missing from the body" % _id)
+    for _id in _pc_ids[5:]:
+        if _id in _pca_body:
+            _pca_problems.append("bead %s is NOT among the 5 oldest but is listed" % _id)
+    if "pressão de RAM" not in _pca_body:
+        _pca_problems.append("body does not name the cause (pressão de RAM)")
+    if notify_calls or ledger_calls or flow_authority_calls:
+        _pca_problems.append("a cause note must not push/ledger/claim flow authority: "
+                             "notify=%r ledger=%r flow=%r" % (
+                                 notify_calls, ledger_calls, flow_authority_calls))
+    if st.get("alarmed"):
+        _pca_problems.append("per-bead alarm state was written for aggregated beads: %r" % (
+            list(st["alarmed"]),))
+    if st.get("pause_cause", {}).get("pilot-pause", {}).get("count") != 1:
+        _pca_problems.append("pause_cause state wrong: %r" % (st.get("pause_cause"),))
+    if _pca_problems:
+        _bad("(ga-5bzrzu-a)", "; ".join(_pca_problems))
+    else:
+        _ok("(ga-5bzrzu-a): 12 beads x 3 rigs → 1 note (count 12 — not 36 — plus the 5 oldest), "
+            "0 'dispatch failing' mails, cause named, no push/ledger/flow-authority")
+
+    print("\nScenario (ga-5bzrzu-b): FALSIFICATION — a bead whose OWN wait window shows no "
+          "pause (70min, 12 sweeps, 0 paused) keeps its own mail while the old beads whose "
+          "24h window is 17/60 paused go into the cause note; the note does not list it")
+    _pc_b_old = ["ga-5bzrzu-bo0", "ga-5bzrzu-bo1", "ga-5bzrzu-bo2"]
+    _pc_b_young = "ga-5bzrzu-by"
+    _pc_b_ages = {"ga-5bzrzu-bo0": 5000, "ga-5bzrzu-bo1": 4000, "ga-5bzrzu-bo2": 3000,
+                  _pc_b_young: 70}
+    st = _pc_setup(_pc_b_old + [_pc_b_young], _pc_b_ages)
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 48, 17, recent_normal=12)
+    run_cycle(NOW, st)
+    _pcb_cause = _pc_mails()
+    _pcb_df = _df_mails()
+    _pcb_problems = []
+    if len(_pcb_cause) != 1 or "3 bead(s)" not in _pcb_cause[0][0]:
+        _pcb_problems.append("want 1 cause note for 3 beads, got %r" % ([s for s, _ in _pcb_cause],))
+    elif _pc_b_young in _pcb_cause[0][1] or _pc_b_young in _pcb_cause[0][0]:
+        _pcb_problems.append("the bead with its OWN cause leaked into the cause note")
+    if len(_pcb_df) != 1 or _pc_b_young not in _pcb_df[0][0]:
+        _pcb_problems.append("want exactly 1 per-bead mail for %s, got %r" % (
+            _pc_b_young, [s for s, _ in _pcb_df]))
+    if _pcb_problems:
+        _bad("(ga-5bzrzu-b)", "; ".join(_pcb_problems))
+    else:
+        _ok("(ga-5bzrzu-b): 3 old beads → 1 cause note; the young bead with no pause in its own "
+            "window → its own 'dispatch failing' mail")
+
+    print("\nScenario (ga-5bzrzu-c): backoff — the cause note repeats on the SAME 1h/4h/12h "
+          "tiers as the per-bead alarm and the pool note: nothing at +10min, 'repeat #2' at "
+          "+1h, nothing again inside the next window, 'repeat #3' only after 4h")
+    st = _pc_setup(_pc_ids)
+    _pcc = []
+    for _dt in (0, 600, 3700, 3700 + 600, 3700 + 14400 + 60):
+        _reset_captures()
+        _t = NOW + _dt
+        _read_pilot_log_lines = lambda: _pc_log(_t, 56, 17)
+        run_cycle(_t, st)
+        _pcc.append([s for s, _ in _pc_mails()])
+    if (len(_pcc[0]) == 1 and _pcc[1] == [] and len(_pcc[2]) == 1 and "repeat #2" in _pcc[2][0]
+            and _pcc[3] == [] and len(_pcc[4]) == 1 and "repeat #3" in _pcc[4][0]):
+        _ok("(ga-5bzrzu-c): 1 / 0 / repeat #2 at +1h / 0 / repeat #3 after 4h more")
+    else:
+        _bad("(ga-5bzrzu-c)", "per-cycle cause subjects: %r" % (_pcc,))
+
+    print("\nScenario (ga-5bzrzu-d): root-class:error-vs-empty — a Pilot log whose tail does NOT "
+          "reach back the bead's window is UNMEASURED, never 'a common cause': the per-bead "
+          "alarm (with its own 'NÃO MEDIDO') is kept, so a broken log cannot silence anything")
+    _pc_d = ["ga-5bzrzu-d0", "ga-5bzrzu-d1", "ga-5bzrzu-d2"]
+    st = _pc_setup(_pc_d, {b: 1700 for b in _pc_d})
+    _read_pilot_log_lines = lambda: [_pc_line(NOW - (100 - 8 * i) * 60, "ram" if i % 2 else None)
+                                     for i in range(12)]   # 12 sweeps in the last 100min, newest 12min back
+    run_cycle(NOW, st)
+    if (not _pc_mails() and len(_df_mails()) == 3
+            and all("NÃO MEDIDO" in b for _, b in _df_mails())):
+        _ok("(ga-5bzrzu-d): unreadable window → 3 per-bead mails, each says NÃO MEDIDO, 0 cause notes")
+    else:
+        _bad("(ga-5bzrzu-d)", "cause=%r df=%r" % ([s for s, _ in _pc_mails()],
+                                                  [s for s, _ in _df_mails()]))
+
+    print("\nScenario (ga-5bzrzu-e): the threshold is ≥25% (integer math, no float): 14/56 = "
+          "25.0% → aggregated; 13/56 = 23.2% → each bead still mails on its own")
+    _pc_e = ["ga-5bzrzu-e0", "ga-5bzrzu-e1", "ga-5bzrzu-e2"]
+    _pc_e_ages = {b: 1700 for b in _pc_e}
+    st = _pc_setup(_pc_e, _pc_e_ages)
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 56, 14)
+    run_cycle(NOW, st)
+    _pce_at, _pce_at_df = len(_pc_mails()), len(_df_mails())
+    _reset_captures()
+    st = _pc_setup(_pc_e, _pc_e_ages)
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 56, 13)
+    run_cycle(NOW, st)
+    _pce_below, _pce_below_df = len(_pc_mails()), _df_mails()
+    if (_pce_at == 1 and _pce_at_df == 0 and _pce_below == 0 and len(_pce_below_df) == 3
+            and all("Pilot pausado 13/56 sweeps recentes" in s for s, _ in _pce_below_df)):
+        _ok("(ga-5bzrzu-e): 14/56 → 1 note, 0 per-bead; 13/56 → 0 notes, 3 per-bead mails "
+            "that still carry the '13/56' suffix")
+    else:
+        _bad("(ga-5bzrzu-e)", "at: cause=%d df=%d; below: cause=%d df=%r" % (
+             _pce_at, _pce_at_df, _pce_below, [s for s, _ in _pce_below_df]))
+
+    print("\nScenario (ga-5bzrzu-f): a window with too few sweeps is not evidence of a common "
+          "cause — 8 of 8 paused (100%) is below the 10-sweep floor, so each bead keeps its "
+          "own mail; at 10 of 10 the floor is met and the cause note replaces them")
+    _pc_f = ["ga-5bzrzu-f0", "ga-5bzrzu-f1"]
+    st = _pc_setup(_pc_f, {b: 1700 for b in _pc_f})
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 8, 8)
+    run_cycle(NOW, st)
+    _pcf_small = (len(_pc_mails()), len(_df_mails()))
+    _reset_captures()
+    st = _pc_setup(_pc_f, {b: 1700 for b in _pc_f})
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 10, 10)
+    run_cycle(NOW, st)
+    _pcf_floor = (len(_pc_mails()), len(_df_mails()))
+    if _pcf_small == (0, 2) and _pcf_floor == (1, 0):
+        _ok("(ga-5bzrzu-f): 8/8 → 2 per-bead mails; 10/10 → 1 cause note")
+    else:
+        _bad("(ga-5bzrzu-f)", "8/8 (cause, per-bead)=%r  10/10=%r" % (_pcf_small, _pcf_floor))
+
+    print("\nScenario (ga-5bzrzu-g): MIXED reasons share ONE bucket — 15/56 paused (8 RAM + 7 "
+          "cross-stage; neither alone reaches 25%) → one note naming both; when the dominant "
+          "reason flips next cycle it is still the same incident, not a new immediate note")
+    st = _pc_setup(_pc_ids)
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 56, 15, shapes=("ram", "xstage"))
+    run_cycle(NOW, st)
+    _pcg1 = _pc_mails()
+    _reset_captures()
+    _t = NOW + 600
+    _read_pilot_log_lines = lambda: _pc_log(_t, 56, 15, shapes=("xstage", "ram", "xstage"))
+    run_cycle(_t, st)
+    _pcg2 = _pc_mails()
+    if (len(_pcg1) == 1 and "pressão de RAM" in _pcg1[0][1] and "yield cross-stage" in _pcg1[0][1]
+            and "15/56" in _pcg1[0][0] and _pcg2 == []):
+        _ok("(ga-5bzrzu-g): one note naming RAM + cross-stage (15/56); the flip of the dominant "
+            "reason did not re-fire")
+    else:
+        _bad("(ga-5bzrzu-g)", "first=%r second=%r" % ([(s, b[:300]) for s, b in _pcg1], _pcg2))
+
+    print("\nScenario (ga-5bzrzu-h): DRY_RUN — the cause note is NOT sent and records no state")
+    globals()["DRY_RUN"] = True
+    st = _pc_setup(_pc_ids)
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 56, 17)
+    run_cycle(NOW, st)
+    globals()["DRY_RUN"] = False
+    if not mail_calls and not st.get("pause_cause"):
+        _ok("(ga-5bzrzu-h): DRY_RUN sent nothing and recorded nothing")
+    else:
+        _bad("(ga-5bzrzu-h)", "mail=%r state=%r" % (mail_calls, st.get("pause_cause")))
+
+    print("\nScenario (ga-5bzrzu-i): a FAILED mail send is logged (never silent); state is "
+          "still recorded so a dead mail path is not retried once per cycle")
+    import io as _io5, contextlib as _ctx5
+    _do_mail_mayor = lambda subject, body: False
+    st = _pc_setup(_pc_ids)
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 56, 17)
+    _pci_buf = _io5.StringIO()
+    with _ctx5.redirect_stdout(_pci_buf):
+        run_cycle(NOW, st)
+    _do_mail_mayor = _stub_mail
+    if ("pause-cause mail" in _pci_buf.getvalue() and "FAILED" in _pci_buf.getvalue()
+            and st.get("pause_cause", {}).get("pilot-pause", {}).get("count") == 1):
+        _ok("(ga-5bzrzu-i): failed send logged WARN; state recorded")
+    else:
+        _bad("(ga-5bzrzu-i)", "log=%r state=%r" % (
+             [l for l in _pci_buf.getvalue().splitlines() if "pause" in l][:3],
+             st.get("pause_cause")))
+
+    print("\nScenario (ga-5bzrzu-j): _prune_state expires a stale pause_cause entry (>7d), keeps "
+          "a fresh one; and a CORRUPT record (non-numeric count) does not abort the cycle — the "
+          "note still goes out and the record is rewritten clean")
+    st = _reset()
+    st["pause_cause"] = {"old-cause": {"last": NOW - 8 * 86400, "count": 2},
+                         "pilot-pause": {"last": NOW - 3600, "count": 1}}
+    _prune_state(st, NOW)
+    _pcj_prune_ok = "old-cause" not in st["pause_cause"] and "pilot-pause" in st["pause_cause"]
+    st = _pc_setup(_pc_ids)
+    st["pause_cause"] = {"pilot-pause": {"last": NOW - 60, "count": "x"}}
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 56, 17)
+    _pcj_exc = None
+    try:
+        run_cycle(NOW, st)
+    except Exception as _e:
+        _pcj_exc = _e
+    if (_pcj_prune_ok and _pcj_exc is None and len(_pc_mails()) == 1
+            and st["pause_cause"]["pilot-pause"]["count"] == 1):
+        _ok("(ga-5bzrzu-j): stale pruned/fresh kept; corrupt record treated as 'no prior note'")
+    else:
+        _bad("(ga-5bzrzu-j)", "prune_ok=%r exc=%r mails=%d state=%r" % (
+             _pcj_prune_ok, _pcj_exc, len(_pc_mails()), st.get("pause_cause")))
+
+    print("\nScenario (ga-5bzrzu-k): _process_store() called on its own (no shared aggregator "
+          "from run_cycle) still aggregates — the feature does not depend on the caller "
+          "remembering to opt in")
+    st = _pc_setup(_pc_ids)
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 56, 17)
+    _process_store(RIG_ROOTS[0], NOW, st, True, set(), set())
+    if len(_pc_mails()) == 1 and not _df_mails() and "12 bead(s)" in _pc_mails()[0][0]:
+        _ok("(ga-5bzrzu-k): direct _process_store → 1 note for 12 beads, 0 per-bead")
+    else:
+        _bad("(ga-5bzrzu-k)", "cause=%r df=%d" % ([s for s, _ in _pc_mails()], len(_df_mails())))
+
+    print("\nScenario (ga-5bzrzu-l): _pilot_pause_reason() classifies the REAL log shapes (and "
+          "the invented ga-tma6wc fixture ones), and an unknown reason keeps its own text "
+          "instead of being swallowed as a known one")
+    try:
+        _pcl = {k: _pilot_pause_reason(_pc_line(NOW, k)) for k in _PC_SHAPES}
+        _pcl_unknown = _pilot_pause_reason(
+            "[2026-10-11 07:57:33] [pilot-dispatcher] === Pilot sweep complete: dispatched=0 "
+            "(paused: janela de manutenção XYZ) ===")
+        _pcl_old = [_pilot_pause_reason(_sweep_log_line(NOW, r))
+                    for r in ("ram-pressure", "quota-limited", "quiet-hours")]
+        if (_pcl["ram"] == _pcl["ram-warn"] == "pressão de RAM"
+                and _pcl["quota"] == "cota 5h" and _pcl["drain"] == "drain window"
+                and _pcl["quiet"] == "quiet hours" and _pcl["xstage"] == "yield cross-stage"
+                and "manutenção XYZ" in _pcl_unknown
+                and _pcl_old == ["pressão de RAM", "cota 5h", "quiet hours"]):
+            _ok("(ga-5bzrzu-l): 6 real shapes + 3 fixture shapes classified; unknown keeps its text")
+        else:
+            _bad("(ga-5bzrzu-l)", "real=%r unknown=%r fixtures=%r" % (_pcl, _pcl_unknown, _pcl_old))
+    except NameError as _e:
+        _bad("(ga-5bzrzu-l)", "missing: %s" % _e)
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
