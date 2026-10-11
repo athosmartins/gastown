@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # gate-fastlane.lib.sh — ga-atsahv: the quality gate's DOC/TEST fast lane (no LLM reviewer).
-# SLICE NOTE (ga-atsahv.1 of 3 — removed by ga-atsahv.3): the gate's 800-line production cap (E11) made this lane arrive in three slices. This
-# one holds ONLY the classification (gate_fastlane_path_class / _test_runner / _classify_raw); the scan, the tests, the history check, the
-# decision and the push-time confirmation arrive with ga-atsahv.2, and the dispatcher wiring, the record and the weekly tally with
-# ga-atsahv.3. Nothing sources this file before .3, so merging this slice changes no behaviour. The text below describes the finished lane.
+# SLICE NOTE (ga-atsahv.2 of 3 — removed by ga-atsahv.3): the gate's 800-line production cap (E11) made this lane arrive in three slices. Slices 1
+# and 2 together hold everything through the push-time confirmation (classification, scan, tests, history check, decision, confirm); the dispatcher
+# wiring, gate_fastlane_record and the weekly tally arrive with ga-atsahv.3. Nothing sources this file before .3, so merging this slice changes no
+# behaviour. The text below describes the finished lane.
 #
 #
 # WHY. Athos, 2026-09-30, verbatim: "O gate só é necessário quando a gente vai colocar código novo em
@@ -263,6 +263,592 @@ EOF
   # here with nothing classified, and the decision would read the empty BLOCKERS/UNRUNNABLE as "nothing stands in the way".
   if [ "$GATE_FL_STATE" = "ok" ] && [ -z "$GATE_FL_ALLFILES" ]; then
     GATE_FL_STATE="unclassifiable"; GATE_FL_WHY="the diff list was not empty but no record in it was classified — nothing was read"
+  fi
+  return 0
+}
+
+# ── helpers for the outputs ─────────────────────────────────────────────────────────────────────────────────
+
+# _gate_fastlane_cap_lines <max> — stdin -> at most <max> lines, then "... (+N more)".
+_gate_fastlane_cap_lines() {
+  local max="$1" n=0 line out="" extra=0
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    if [ "$n" -lt "$max" ]; then out="${out}${line}"$'\n'; n=$((n + 1)); else extra=$((extra + 1)); fi
+  done
+  [ "$extra" -gt 0 ] && out="${out}... (+${extra} more)"$'\n'
+  printf '%s' "$out"
+  return 0
+}
+
+# gate_fastlane_files_oneline — GATE_LANE_FILES as one metadata-safe line ("CLASS:path; CLASS:path; ..."), <= 480 chars.
+gate_fastlane_files_oneline() {
+  local s
+  s=$(printf '%s' "${GATE_LANE_FILES:-}" | tr '\t' ':' | tr '\n' ';' | sed 's/;/; /g') || s=""
+  # a rendering that failed must not read as "no file decided this lane": the line is non-empty exactly when the list is
+  if [ -z "$s" ] && [ -n "${GATE_LANE_FILES:-}" ]; then s="(the list of files that decided could not be rendered)"; fi
+  if [ "${#s}" -gt 480 ]; then s="$(printf '%s' "$s" | cut -c1-470)…" || s="${s:0:470}…"; fi
+  printf '%s' "$s"
+  return 0
+}
+
+# _gate_fastlane_normal <code> <reason> [files] — the inert outcome. Always returns 0.
+_gate_fastlane_normal() {
+  GATE_LANE="normal"
+  GATE_LANE_REASON_CODE="$1"
+  GATE_LANE_REASON="$2"
+  GATE_LANE_FILES="${3:-}"
+  return 0
+}
+
+# ── the mechanical checks ───────────────────────────────────────────────────────────────────────────────────
+
+# _gate_fastlane_digest_file <git_fn> <diff-file> — prints the fingerprint of a `git diff -U0` / `git log -p -U0` text, or returns 1.
+# The text with the lines that legitimately change under a rebase taken out — hunk headers (line numbers shift when main
+# edits above), the blob ids on `index` lines (they follow main's version of the file) and, in a `git log -p` stream, the
+# `commit <sha>` / `Author:` / `Date:` lines (a rebase rewrites the sha; the other two are not content and are not scanned).
+# Everything else is IN, byte for byte: the file names, the modes (the mode stays on the `index` line: a regular file turned
+# into a symlink with the same bytes differs only there), every added and removed line, every commit message. So a pure rebase
+# keeps the fingerprint, and a changed line — a whitespace change inside a test included, which `git patch-id` would call equal
+# — does not. (None of the three extra patterns can match a line of a plain diff: content lines start with + - or a space, the
+# rest with `diff `, `index `, `---`, `+++`, `@@`, a mode word or a backslash; a message line starts with four spaces.)
+_gate_fastlane_digest_file() {
+  local git_fn="$1" f="$2" out
+  # pipefail INSIDE the substitution, not inherited from the caller: a `sed` that failed would otherwise hand `hash-object` an
+  # empty stream, and the pipeline's status is the LAST command's — so "could not read the diff" would come back as a perfectly
+  # valid digest (of nothing), and a later confirm could "match" it. Whoever sources this lib, the digest is either of the text
+  # or absent.
+  out=$(set -o pipefail; sed -e '/^@@/d' -e '/^commit [0-9a-f]\{40\}/d' -e '/^Author: /d' -e '/^Date:   /d' -e 's/^index [0-9a-f]*\.\.[0-9a-f]*/index/' "$f" | "$git_fn" hash-object --stdin 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+  return 0
+}
+
+# _gate_fastlane_is_finding_list <text> — 0 iff <text> is a scanner's list of findings: at least one line, EVERY line of the
+# shape `label<TAB>path<TAB>line-number`. Anything else — empty, a traceback, a stray message — is not a list of findings. Reads
+# nothing that can fail (awk over a here-string), so a doubt is "no".
+_gate_fastlane_is_finding_list() {
+  printf '%s\n' "$1" | awk -F'\t' '
+    { n++; if (NF != 3 || $1 !~ /^[a-z][a-z0-9-]*$/ || $3 !~ /^[0-9]+$/) bad = 1 }
+    END { exit ((n > 0 && !bad) ? 0 : 1) }'
+}
+
+# _gate_fastlane_scan_range <git_fn> <net|history> <range> — ONE pass of the content scan: runs git for the range, hands the text to the
+# scanner, believes the answer only in the shape its exit code promises. Sets GATE_FL_R_RC (0 clean | 1 findings | other = could not
+# scan), GATE_FL_R_OUT (label/path/line lines, no values — or the reason it could not scan) and GATE_FL_R_DIGEST (the fingerprint of
+# the very text handed to the scanner; "" when it could not be read).
+#   net      `git diff -U0 base...head` — what the TIP adds (the diff the classifier and the tests also read)
+#   history  `git log -p -U0 --no-merges base..head` — what EACH COMMIT adds, messages included: this is what the fast-forward PUBLISHES
+#            (gate round ga-aa8n6z: a value pasted in one commit and removed in the next was invisible to the net pass, and sat in
+#            main's history all the same). The format is pinned (--pretty=medium, no decoration/notes/signature/abbrev, UTF-8, no color/textconv/
+#            external diff/renames) so that the usual git config knobs cannot change what the scanner is handed. A knob this list does
+#            not name is expected to change only how something is SPELLED (a path prefix, a date format) or to give a shape the
+#            scanner refuses (rc 2, the normal gate); a git that cannot take one of these flags fails (rc 2 as well). Not proven for every
+#            knob git has — the selftest pins the shapes it refuses (§4h'').
+# `-c core.quotepath=off` on both, like the two `--raw` reads: the classifier and the scanner must spell a file name the same way
+# (gate round ga-aa8n6z, blocking issue 2: with the default, `migração.md` reached the scanner as `migra\303\247\303\243o.md`, whose
+# escapes read as twelve digits — a 'numero-longo' finding that is not in the name).
+_gate_fastlane_scan_range() {
+  local git_fn="$1" kind="$2" range="$3" tmp errf="" diff_rc=0 scan_rc=0 out_s="" err_s=""
+  GATE_FL_R_RC=2; GATE_FL_R_OUT=""; GATE_FL_R_DIGEST=""
+  tmp=$(mktemp "${GATE_FS_TMPDIR:-/tmp}/gc-gate-fl-diff-XXXXXX" 2>/dev/null) || { GATE_FL_R_OUT="could not create a temp file for the ${kind} text"; return 0; }
+  case "$kind" in
+    net)     "$git_fn" -c core.quotepath=off diff -U0 --no-color --no-ext-diff --no-textconv --no-renames "$range" > "$tmp" 2>/dev/null || diff_rc=$? ;;
+    history) "$git_fn" -c core.quotepath=off log --no-merges --topo-order --reverse --no-decorate --no-notes --no-show-signature --no-abbrev-commit \
+               --pretty=medium --encoding=UTF-8 -p -U0 --no-color --no-ext-diff --no-textconv --no-renames "$range" > "$tmp" 2>/dev/null || diff_rc=$? ;;
+    *)       diff_rc=97 ;;
+  esac
+  if [ "$diff_rc" != "0" ]; then
+    GATE_FL_R_OUT="git failed to produce the ${kind} text (rc=$diff_rc)"
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  fi
+  # gate_fastlane_decide gets here only after `diff --raw` listed files, and gate_fastlane_confirm only with a fast decision on record (which listed
+  # files); a real `git diff -U0` prints a `diff --git` header for every listed file, and a real `git log -p` prints a `commit` line for every commit it
+  # lists. No text at all means nothing was read — not that there was nothing to flag — so it stays the inert "could not scan" (RC 2, no fingerprint).
+  # The scanner itself still answers empty input with clean: that is its contract as a pure function; the lib knows a file list exists, the scanner does not.
+  [ -s "$tmp" ] || { GATE_FL_R_OUT="git returned no ${kind} text for a range whose file list is not empty — nothing was read"; rm -f "$tmp" 2>/dev/null || true; return 0; }
+  GATE_FL_R_DIGEST=$(_gate_fastlane_digest_file "$git_fn" "$tmp") || GATE_FL_R_DIGEST=""
+  # the scanner's stderr goes to its own file (named so the dispatcher's gc-gate-fl-diff-* reaper sweeps a leak); with no file it is
+  # discarded, and the reason below then says "no stderr" — the exit code and the shape check do not depend on it
+  errf=$(mktemp "${GATE_FS_TMPDIR:-/tmp}/gc-gate-fl-diff-err-XXXXXX" 2>/dev/null) || errf=""
+  out_s=$(python3 "$GATE_FASTLANE_DIR/gate-fastlane-scan.py" --max-bytes "${GATE_FASTLANE_SCAN_MAX_BYTES:-2097152}" < "$tmp" 2>"${errf:-/dev/null}") || scan_rc=$?
+  # the LAST stderr line, capped: for a traceback it is the exception ("RuntimeError: ..."), not the file paths above it
+  if [ -n "$errf" ]; then err_s=$(tail -n 1 "$errf" 2>/dev/null | cut -c1-160) || err_s=""; fi
+  rm -f "$tmp" "$errf" 2>/dev/null || true
+  case "$scan_rc" in
+    0) if [ -n "$out_s" ]; then
+         scan_rc=2; GATE_FL_R_OUT="scanner exited 0 but printed output — not a clean answer (stderr: ${err_s:-none})"
+       fi ;;
+    1) if ! _gate_fastlane_is_finding_list "$out_s"; then
+         scan_rc=2; GATE_FL_R_OUT="scanner exited 1 with no label/path/line findings — it crashed, it found nothing (stderr: ${err_s:-none})"
+       fi ;;
+  esac
+  if [ "$scan_rc" = "0" ] || [ "$scan_rc" = "1" ]; then
+    GATE_FL_R_OUT="$out_s"
+  elif [ -z "$GATE_FL_R_OUT" ]; then
+    GATE_FL_R_OUT="${err_s:-scanner exited rc=$scan_rc with no message}"
+  fi
+  GATE_FL_R_RC="$scan_rc"
+  return 0
+}
+
+# gate_fastlane_scan <git_fn> <base_ref> <head_ref> — runs the content scan over what the merge would put in main, in TWO passes: the
+# NET diff (base...head) and the HISTORY (every non-merge commit of base..head, messages included) — see _gate_fastlane_scan_range for
+# why both. The net pass is not redundant: a number wrapped across two lines that DIFFERENT commits added side by side is one number
+# only in the net diff; the history pass is not redundant either: a value added and removed again never appears in the net diff.
+# Sets GATE_FL_SCAN_RC (0 clean | 1 findings | other = could not scan), GATE_FL_SCAN_OUT (label/path/line, no values) and
+# GATE_FL_DIFF_DIGEST ("<net digest>:<history digest>" — the fingerprint of the very texts that were handed to the scanner; "" when
+# either could not be read). A finding from EITHER pass is rc 1 even when the other pass could not run (the finding is true whatever
+# the other pass would have said; both end in the normal gate, and the tally books a real finding as a finding); clean needs BOTH clean.
+# The net pass runs first, and a finding there ends the scan: the history pass would only report the same line again as `<sha>:<path>`.
+#
+# The scanner's exit code is a contract (0 clean / 1 findings / 2 could not scan), and python breaks it: an uncaught exception
+# exits 1, and anything that dies at IMPORT time (a syntax error, a module-level exception, a regex that does not compile) never
+# reaches the scanner's own "any bug here must read as could not scan" guard, which wraps only main(). So a dead scanner used to
+# read as "found personal data" — every doc diff bounced, the weekly tally blamed data hygiene, and the traceback (absolute
+# paths) went into the marker metadata. Two rules close it: stdout and stderr are KEPT APART (a traceback is never the findings),
+# and an answer is believed only when it has the shape its exit code promises — rc 1 needs a list of
+# `label<TAB>path<TAB>line` lines (an empty one is not a list), rc 0 needs no output. A scanner that does not answer in its own
+# contract is rc 2 with a reason that says so ("it crashed, it did not find anything"), which decide() books as scan-failed, not
+# scan-findings.
+gate_fastlane_scan() {
+  local git_fn="$1" base="$2" head="$3" net_rc net_out net_dig hist_rc hist_out hist_dig
+  GATE_FL_SCAN_RC=2; GATE_FL_SCAN_OUT=""; GATE_FL_DIFF_DIGEST=""
+  if [ ! -r "${GATE_FASTLANE_DIR:-}/gate-fastlane-scan.py" ]; then
+    GATE_FL_SCAN_OUT="scanner gate-fastlane-scan.py is missing or unreadable"
+    return 0
+  fi
+  _gate_fastlane_scan_range "$git_fn" net "$base...$head"
+  net_rc="$GATE_FL_R_RC"; net_out="$GATE_FL_R_OUT"; net_dig="$GATE_FL_R_DIGEST"
+  if [ "$net_rc" = "1" ]; then
+    # a finding in the tip is a finding; the history pass would only repeat it under another path spelling (`<sha>:<path>`)
+    GATE_FL_SCAN_RC=1; GATE_FL_SCAN_OUT="$net_out"
+    return 0
+  fi
+  _gate_fastlane_scan_range "$git_fn" history "$base..$head"
+  hist_rc="$GATE_FL_R_RC"; hist_out="$GATE_FL_R_OUT"; hist_dig="$GATE_FL_R_DIGEST"
+  if [ "$hist_rc" = "1" ]; then
+    GATE_FL_SCAN_RC=1; GATE_FL_SCAN_OUT="$hist_out"
+    return 0
+  fi
+  if [ "$net_rc" != "0" ]; then
+    GATE_FL_SCAN_OUT="net diff: ${net_out}"
+    return 0
+  fi
+  if [ "$hist_rc" != "0" ]; then
+    GATE_FL_SCAN_OUT="commit history: ${hist_out}"
+    return 0
+  fi
+  GATE_FL_SCAN_RC=0
+  if [ -n "$net_dig" ] && [ -n "$hist_dig" ]; then GATE_FL_DIFF_DIGEST="${net_dig}:${hist_dig}"; fi
+  return 0
+}
+
+# _gate_fastlane_test_path — PATH for the tests: the caller's PATH minus every entry under $HOME. The tests need
+# git/jq/python3/bash (system + Homebrew). This drops the tools installed under $HOME — on this host `secret` and
+# `notify` (~/.local/bin) — so a test no reviewer has read does not find them by name. It is NOT what keeps
+# credentials away, and it does NOT cut the test off from the city: bd, gc, dolt, gh, aws, gcloud and bw live in
+# /opt/homebrew/bin and stay on this PATH (measured under the exact env the lane builds: `bd -C <city> list` returns
+# the live city's beads, `gc --city <city>` runs). The credential shield is the throwaway HOME that
+# gate_fastlane_run_tests sets: `bw` finds no vault there and `gh` is logged out. A test that needs a dropped tool
+# usually fails, and a failing test sends the diff to the normal gate — the inert outcome. Not always: a test that guards
+# itself (`command -v secret >/dev/null || { echo "SKIP: ..."; exit 0; }`, an idiom this repo already uses) exits 0 without
+# running anything, and the lane reads only the exit code, so it counts that as passed. The reason text therefore says
+# "exited 0", not "ran green". What bounds it: the diff is doc/test-only, and the fast lane still goes through
+# gate_finalize_run, whose full-suite check (ga-3wgx8) runs at the merge in a rig that has opted in with a .gate-full-suite.sh.
+# With HOME unset the filter has no way to tell which entries are "under $HOME", and passing every entry through would read
+# that as "none of them is". It falls back to the system and Homebrew directories alone: a test that needs a tool outside
+# them usually fails (and a failing test sends the diff to the normal gate, the inert outcome), unless it skips itself as above.
+_gate_fastlane_test_path() {
+  local out="" entry IFS=:
+  if [ -z "${HOME:-}" ]; then printf '%s' "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"; return 0; fi
+  for entry in $PATH; do
+    [ -z "$entry" ] && continue
+    case "$entry" in "$HOME"|"$HOME"/*) continue ;; esac
+    out="${out:+$out:}$entry"
+  done
+  printf '%s' "${out:-/usr/bin:/bin}"
+  return 0
+}
+
+# _gate_fastlane_now — the clock, as epoch seconds, or return 1 when it cannot be read (no output then). The test budget is
+# measured against it; an unreadable clock must not read as "no time has passed", so callers treat 1 as "budget gone".
+_gate_fastlane_now() {
+  local n
+  n=$(date +%s 2>/dev/null) || return 1
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$n"
+  return 0
+}
+
+# gate_fastlane_run_tests <git_fn> <head_sha> <paths_nl> — runs each new/changed test entry in a throwaway
+# detached worktree, env scrubbed (HOME inside the worktree, no inherited credentials, no user bin dirs on
+# PATH), each under `timeout`, the whole under one budget: this runs while the dispatcher holds the citywide
+# gate lock. NOT a sandbox: the control plane (bd, gc, dolt) is reachable from PATH, and nothing stops a test from
+# using the network or writing outside the worktree. NOT the same as the full-suite check either:
+# .gate-full-suite.sh also runs branch code, but only after reviewers have read it, whereas here nobody has. What
+# bounds the exposure is that the branch author already runs this same code, as the same user, in its own session —
+# the gate's threat model is a worker's mistake, not a hostile worker — plus the throwaway HOME (the credential
+# shield; see _gate_fastlane_test_path for what PATH does and does not do), the timeouts and the budget. A
+# stricter boundary (sandbox-exec denying network and writes outside the worktree, or a PATH allowlist without
+# bd/gc/dolt/bw/gh/aws/gcloud) is a possible hardening, not present here. Sets GATE_FL_TEST_RC (0 all green | 1 a
+# test failed | 2 could not run) and GATE_FL_TEST_OUT.
+gate_fastlane_run_tests() {
+  local git_fn="$1" sha="$2" paths="$3" tmp wt log f runner rc t0 now spent n=0 max budget per_file ok_n=0 tpath
+  GATE_FL_TEST_RC=2; GATE_FL_TEST_OUT=""
+  max="${GATE_FASTLANE_TEST_MAX_FILES:-6}"; budget="${GATE_FASTLANE_TEST_BUDGET_SECS:-150}"; per_file="${GATE_FASTLANE_TEST_TIMEOUT_SECS:-60}"
+  case "$max" in ''|*[!0-9]*) max=6 ;; esac
+  case "$budget" in ''|*[!0-9]*) budget=150 ;; esac
+  case "$per_file" in ''|*[!0-9]*) per_file=60 ;; esac
+
+  # `[ -z ]` has no failure mode. The count was `grep -c . || n=0`, which turned a grep that FAILED into "no test entry
+  # to run" -> rc 0 -> the lane granted without running the changed tests (an error read as empty). The count below is a
+  # shell loop over the same list, with no command that can fail. An empty list is a real "nothing to run" ONLY because
+  # classify_raw files every changed test it could not place under UNRUNNABLE or unclassifiable (its runner `case` has an inert
+  # default), never under "empty" — that is the invariant this early return leans on.
+  if [ -z "$paths" ]; then GATE_FL_TEST_RC=0; GATE_FL_TEST_OUT="no test entry to run"; return 0; fi
+  n=0
+  while IFS= read -r f; do
+    if [ -n "$f" ]; then n=$((n + 1)); fi
+  done <<EOF
+$paths
+EOF
+  if [ "$n" -gt "$max" ]; then
+    GATE_FL_TEST_OUT="$n test files to run exceeds the fast-lane cap of $max"
+    return 0
+  fi
+  if [ "${GATE_FASTLANE_RUN_TESTS:-1}" != "1" ]; then
+    GATE_FL_TEST_OUT="running tests is disabled (GATE_FASTLANE_RUN_TESTS=0) but $n test file(s) changed"
+    return 0
+  fi
+  # an earlier interrupted sweep may have leaked a worktree of this family (the reaper also matches gc-gate-fs-fastlane-*)
+  if declare -F gate_full_suite_reap_stale >/dev/null 2>&1; then gate_full_suite_reap_stale || true; fi
+
+  # the two reads the run cannot go on without — the PATH the tests get and the clock the budget is measured on — come BEFORE the
+  # worktree exists, so a failure of either leaves nothing to clean up
+  tpath=$(_gate_fastlane_test_path) || tpath=""
+  if [ -z "$tpath" ]; then GATE_FL_TEST_OUT="could not build a PATH for the tests"; return 0; fi
+  t0=$(_gate_fastlane_now) || t0=""
+  if [ -z "$t0" ]; then GATE_FL_TEST_OUT="could not read the clock — the test budget cannot be enforced"; return 0; fi
+
+  tmp="${GATE_FS_TMPDIR:-/tmp}"
+  wt="$tmp/gc-gate-fs-fastlane-$$"
+  log=$(mktemp "$tmp/gc-gate-fs-fastlane-log-XXXXXX" 2>/dev/null) || { GATE_FL_TEST_OUT="could not create a temp log"; return 0; }
+  if ! "$git_fn" worktree add --detach "$wt" "$sha" >/dev/null 2>&1; then
+    GATE_FL_TEST_OUT="could not create a worktree for $sha"
+    rm -f "$log" 2>/dev/null || true
+    return 0
+  fi
+
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    # a clock that cannot be read mid-run reads as the budget being spent (spent = budget), never as "no time has passed"
+    now=$(_gate_fastlane_now) || now=$((t0 + budget)); spent=$((now - t0))
+    if [ "$spent" -ge "$budget" ]; then
+      GATE_FL_TEST_OUT="test budget of ${budget}s exhausted after $ok_n of $n test file(s)"
+      GATE_FL_TEST_RC=2
+      "$git_fn" worktree remove --force "$wt" >/dev/null 2>&1 || true
+      rm -f "$log" 2>/dev/null || true
+      return 0
+    fi
+    runner=$(gate_fastlane_test_runner "$f") || runner=""
+    rc=0
+    # </dev/null: this loop reads its own file list from a heredoc, and a test that reads stdin would eat it.
+    case "$runner" in
+      bash)
+        ( cd "$wt" && env -i HOME="$wt" PATH="$tpath" LC_ALL=C TMPDIR="$wt" timeout "$per_file" bash "$f" ) </dev/null >"$log" 2>&1 || rc=$? ;;
+      pytest)
+        ( cd "$wt" && env -i HOME="$wt" PATH="$tpath" LC_ALL=C TMPDIR="$wt" timeout "$per_file" python3 -m pytest -q -x -p no:cacheprovider "$f" ) </dev/null >"$log" 2>&1 || rc=$? ;;
+      *) rc=99 ;;   # no runner for it (the lookup answered anything but bash/pytest, an empty answer included): not a pass
+    esac
+    if [ "$rc" != "0" ]; then
+      # rc 124 = timeout; 99 = no runner for it; 1 = a real failure OR a missing dependency in the scrubbed env. The fast
+      # lane cannot tell which, and it does not need to: either way the diff goes to the normal gate, never to a FAIL.
+      GATE_FL_TEST_RC=1
+      # `|| true`: a substitution inside an assignment is an errexit trigger, and this one only decorates the message
+      GATE_FL_TEST_OUT="test $f exited rc=$rc (124 = timed out after ${per_file}s, 99 = no runner) — tail: $(tail -3 "$log" 2>/dev/null | tr '\n' ' ' | cut -c1-240)" || true
+      "$git_fn" worktree remove --force "$wt" >/dev/null 2>&1 || true
+      rm -f "$log" 2>/dev/null || true
+      return 0
+    fi
+    ok_n=$((ok_n + 1))
+  done <<EOF
+$paths
+EOF
+  GATE_FL_TEST_RC=0
+  GATE_FL_TEST_OUT="$ok_n test file(s) exited 0"   # exit 0 is all the lane can see: a test that skips itself exits 0 too
+  "$git_fn" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  rm -f "$log" 2>/dev/null || true
+  return 0
+}
+
+# ── the history the push would publish ──────────────────────────────────────────────────────────────────────────
+
+# gate_fastlane_history <git_fn> <base_sha> <head_sha> — the merge is a FAST-FORWARD: it publishes EVERY commit of base..head, not the net
+# diff that the classifier and the tests read. A production-code file added in one commit and deleted in the next, or a CPF pasted and
+# removed again, leaves no trace in the net diff and stays in main's history for good (gate round ga-aa8n6z: the variable the lane
+# DECIDED on was not the variable the push ACTED on). So every commit the push would send is asked the same two questions as the tip:
+# are its files DOC/TEST only (here), and does it add anything the scan rejects (gate_fastlane_scan's history pass, messages included).
+# Sets (read by decide/confirm; classify_raw's own GATE_FL_* are clobbered here, so callers read their own list AFTER this):
+#   GATE_FL_HIST_STATE     ok | blocked (a commit touches CODE/PROMPT/POLICY) | unreadable (anything that could not be established)
+#   GATE_FL_HIST_WHY       one line, never a matched value
+#   GATE_FL_HIST_N         the number of commits in the range (merge commits included)
+#   GATE_FL_HIST_BLOCKERS  "CLASS<TAB>path" lines when blocked
+# Three states, the last one inert: no commit listed, a git error, more commits than GATE_FASTLANE_COMMIT_MAX (a branch that long is a
+# job for a reviewer), a merge commit that carries changes of its own (a conflict resolution is content nobody scanned), a record this
+# lane cannot classify — all `unreadable`, and all end in the normal gate. A MERGE commit with nothing of its own (`git show --cc`
+# prints nothing: the gate's own "Merge origin/main into <branch>" fallback is exactly this) adds no content; what its parents brought
+# is in the commits listed here, or already in main.
+gate_fastlane_history() {
+  local git_fn="$1" base="$2" head="$3" max ids id n=0 merges m cc raw raw_rc=0
+  GATE_FL_HIST_STATE="unreadable"; GATE_FL_HIST_WHY="not evaluated"; GATE_FL_HIST_N=0; GATE_FL_HIST_BLOCKERS=""
+  max="${GATE_FASTLANE_COMMIT_MAX:-30}"
+  case "$max" in ''|*[!0-9]*) max=30 ;; esac
+
+  ids=$("$git_fn" rev-list "$base..$head" 2>/dev/null) || { GATE_FL_HIST_WHY="git could not list the commits the push would publish"; return 0; }
+  while IFS= read -r id; do
+    if [ -n "$id" ]; then n=$((n + 1)); fi
+  done <<EOF
+$ids
+EOF
+  GATE_FL_HIST_N="$n"
+  if [ "$n" -eq 0 ]; then
+    GATE_FL_HIST_WHY="no commit lies between the base and the head although the diff lists files — cannot establish what would be published"; return 0
+  fi
+  if [ "$n" -gt "$max" ]; then
+    GATE_FL_HIST_WHY="$n commits would be published, over the fast-lane cap of $max — a branch that long is read by a reviewer"; return 0
+  fi
+
+  merges=$("$git_fn" rev-list --merges "$base..$head" 2>/dev/null) || { GATE_FL_HIST_WHY="git could not list the merge commits among the ones the push would publish"; return 0; }
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    cc=$("$git_fn" show --cc --format= --no-color --no-ext-diff --no-textconv "$m" 2>/dev/null) || { GATE_FL_HIST_WHY="git could not show a merge commit among the ones the push would publish"; return 0; }
+    if [ -n "$cc" ]; then
+      GATE_FL_HIST_WHY="a merge commit among the ones the push would publish carries changes of its own (a conflict resolution nobody scanned)"; return 0
+    fi
+  done <<EOF
+$merges
+EOF
+
+  raw=$("$git_fn" -c core.quotepath=off log --no-merges --raw --no-renames --format= "$base..$head" 2>/dev/null) || raw_rc=$?
+  if [ "$raw_rc" != "0" ]; then
+    GATE_FL_HIST_WHY="git log --raw of the commits the push would publish failed (rc=$raw_rc)"; return 0
+  fi
+  gate_fastlane_classify_raw "$raw"
+  if [ "$GATE_FL_STATE" != "ok" ]; then
+    GATE_FL_HIST_WHY="the files the commits touch cannot be classified: ${GATE_FL_WHY}"; return 0
+  fi
+  if [ -n "$GATE_FL_BLOCKERS" ]; then
+    GATE_FL_HIST_STATE="blocked"; GATE_FL_HIST_BLOCKERS="$GATE_FL_BLOCKERS"
+    GATE_FL_HIST_WHY="$((GATE_FL_N_CODE + GATE_FL_N_PROMPT + GATE_FL_N_POLICY)) file change(s) across the $n commit(s) the push would publish are production code, prompt/doctrine or the gate's own policy (code=${GATE_FL_N_CODE} prompt=${GATE_FL_N_PROMPT} policy=${GATE_FL_N_POLICY}) — even if a later commit undoes them, they stay in main's history"
+    return 0
+  fi
+  GATE_FL_HIST_STATE="ok"; GATE_FL_HIST_WHY="$n commit(s), every file change in them DOC or TEST"
+  return 0
+}
+
+# ── the decision ────────────────────────────────────────────────────────────────────────────────────────────
+
+# gate_fastlane_decide <git_fn> <base_ref> <head_sha> <policy_files>
+#   git_fn        the dispatcher's git runner (git_rig — knows container rigs)
+#   base_ref      e.g. origin/main            head_sha  the commit the RUN CLAIMED. Not assumed to be what lands: the merge
+#                 pushes whatever the branch is at push time, so gate_fastlane_confirm asks again about that commit.
+#                 Both refs are resolved to a commit ONCE, here, and every later git call (the raw list, the scan, the
+#                 test worktree) uses those shas — a symbolic origin/main could move between two of them.
+#   policy_files  non-empty when the diff touches the gate's own policy/classifier (the dispatcher computes it
+#                 once for its own self-protection; the fast lane honors the SAME answer)
+gate_fastlane_decide() {
+  local git_fn="$1" base="$2" head="$3" policy="${4:-}" raw raw_rc=0 blockers uncls base_sha head_sha
+  GATE_LANE="normal"; GATE_LANE_REASON="not evaluated"; GATE_LANE_REASON_CODE="not-evaluated"; GATE_LANE_FILES=""; GATE_LANE_COUNTS=""
+  GATE_LANE_DIGEST=""
+
+  if _gate_fastlane_is_off; then
+    # (two literal calls, not one with a variable: the tally selftest finds the codes a producer emits by grepping for them)
+    case "$GATE_FL_OFF_CODE" in
+      flag-file)         _gate_fastlane_normal "flag-file" "$GATE_FL_OFF_WHY" ;;
+      switch-unreadable) _gate_fastlane_normal "switch-unreadable" "$GATE_FL_OFF_WHY" ;;
+      *)                 _gate_fastlane_normal "disabled" "$GATE_FL_OFF_WHY" ;;
+    esac
+    return 0
+  fi
+  if [ -z "$git_fn" ] || [ -z "$base" ] || [ -z "$head" ]; then
+    _gate_fastlane_normal "no-input" "fast lane could not decide: missing git runner / base / head"; return 0
+  fi
+  if [ -n "$policy" ]; then
+    _gate_fastlane_normal "policy" "the diff touches the gate's own policy/classifier — self-protection keeps it in the normal gate" "$(printf '%s\n' "$policy" | sed 's/^/POLICY\t/')"
+    return 0
+  fi
+
+  base_sha=$("$git_fn" rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null) || base_sha=""
+  head_sha=$("$git_fn" rev-parse --verify --quiet "${head}^{commit}" 2>/dev/null) || head_sha=""
+  if [ -z "$base_sha" ] || [ -z "$head_sha" ]; then
+    _gate_fastlane_normal "diff-raw-failed" "git rev-parse failed to resolve the base or head to a commit — cannot classify, normal gate"; return 0
+  fi
+
+  # the history first: it reuses classify_raw, which the tip's own classification below must be the LAST to write
+  gate_fastlane_history "$git_fn" "$base_sha" "$head_sha"
+
+  raw=$("$git_fn" -c core.quotepath=off diff --raw --no-renames "$base_sha...$head_sha" 2>/dev/null) || raw_rc=$?
+  if [ "$raw_rc" != "0" ]; then
+    _gate_fastlane_normal "diff-raw-failed" "git diff --raw failed (rc=$raw_rc) — cannot classify, normal gate"; return 0
+  fi
+
+  gate_fastlane_classify_raw "$raw"
+  GATE_LANE_COUNTS="doc=${GATE_FL_N_DOC} test=${GATE_FL_N_TEST} prompt=${GATE_FL_N_PROMPT} code=${GATE_FL_N_CODE} policy=${GATE_FL_N_POLICY}"
+  if [ "$GATE_FL_STATE" != "ok" ]; then
+    _gate_fastlane_normal "unclassifiable" "unclassifiable diff: ${GATE_FL_WHY}"; return 0
+  fi
+  # (the two list renderings below only DECORATE the outcome — whether the lane stays normal is decided by GATE_FL_BLOCKERS /
+  # GATE_FL_UNRUNNABLE themselves, never by their rendering — so a rendering that fails just leaves the file list empty)
+  blockers=$(printf '%s' "$GATE_FL_BLOCKERS" | _gate_fastlane_cap_lines "${GATE_FASTLANE_LIST_MAX:-30}") || blockers=""
+  if [ -n "$GATE_FL_BLOCKERS" ]; then
+    _gate_fastlane_normal "code-or-prompt" "$((GATE_FL_N_CODE + GATE_FL_N_PROMPT + GATE_FL_N_POLICY)) file(s) are production code, prompt/doctrine or the gate's own policy (code=${GATE_FL_N_CODE} prompt=${GATE_FL_N_PROMPT} policy=${GATE_FL_N_POLICY}) — normal gate" "$blockers"
+    return 0
+  fi
+  uncls=$(printf '%s' "$GATE_FL_UNRUNNABLE" | _gate_fastlane_cap_lines 10) || uncls=""
+  if [ -n "$GATE_FL_UNRUNNABLE" ]; then
+    _gate_fastlane_normal "test-unrunnable" "changed test(s) the fast lane cannot run (a language with no runner, a helper script, a file type not on its data list) — normal gate" "$(printf '%s' "$uncls" | sed 's/^/TEST-UNRUNNABLE\t/')"
+    return 0
+  fi
+
+  # The tip is DOC/TEST only. What the push publishes is every commit on the way to it (gate_fastlane_history): a commit that touched code
+  # or prompt text and was undone by a later one is gone from the tip and still in main's history — a production change no reviewer read.
+  case "$GATE_FL_HIST_STATE" in
+    ok) ;;
+    blocked) _gate_fastlane_normal "history-code" "the tip is DOC/TEST only, but ${GATE_FL_HIST_WHY} — normal gate" "$(printf '%s' "$GATE_FL_HIST_BLOCKERS" | _gate_fastlane_cap_lines "${GATE_FASTLANE_LIST_MAX:-30}" | sed 's/^/HISTORY\t/')"
+             return 0 ;;
+    *) _gate_fastlane_normal "history-unverified" "the commits the push would publish could not be verified: ${GATE_FL_HIST_WHY:-no detail} — unverified is not clean, normal gate"
+       return 0 ;;
+  esac
+
+  gate_fastlane_scan "$git_fn" "$base_sha" "$head_sha"
+  case "$GATE_FL_SCAN_RC" in
+    0) # clean — but a lane that cannot LATER prove the diff is unchanged (gate_fastlane_confirm) must not be granted
+       if [ -z "$GATE_FL_DIFF_DIGEST" ]; then
+         _gate_fastlane_normal "scan-failed" "content scan ran but the diff it read could not be fingerprinted — unverified is not clean, normal gate"
+         return 0
+       fi ;;
+    1) _gate_fastlane_normal "scan-findings" "content scan found personal data / a credential on added lines ($(printf '%s' "$GATE_FL_SCAN_OUT" | cut -f1 | sort | uniq -c | awk '{printf "%s%s×%s", (NR>1?", ":""), $2, $1}')) — normal gate" "$(printf '%s\n' "$GATE_FL_SCAN_OUT" | head -10 | awk -F'\t' '{printf "SCAN\t%s %s:%s\n", $1, $2, $3}')"
+       return 0 ;;
+    *) _gate_fastlane_normal "scan-failed" "content scan could not run (rc=${GATE_FL_SCAN_RC}: $(printf '%s' "$GATE_FL_SCAN_OUT" | head -1 | cut -c1-160)) — unverified is not clean, normal gate"
+       return 0 ;;
+  esac
+
+  gate_fastlane_run_tests "$git_fn" "$head_sha" "$GATE_FL_RUN"
+  if [ "$GATE_FL_TEST_RC" != "0" ]; then
+    _gate_fastlane_normal "test-failed" "fast-lane test check did not pass: ${GATE_FL_TEST_OUT} — normal gate decides" "$(printf '%s' "$GATE_FL_RUN" | _gate_fastlane_cap_lines 10 | sed 's/^/TEST\t/')"
+    return 0
+  fi
+
+  # The only success path. Everything above returned. Unlike the two renderings above, THIS list is part of the grant: it is the
+  # record of the files that decided it. A list that cannot be produced — or is empty although files were classified — is not a
+  # grant with the record missing; it is a lane that could not account for itself, and stays normal.
+  GATE_LANE_FILES=$(printf '%s' "$GATE_FL_ALLFILES" | _gate_fastlane_cap_lines "${GATE_FASTLANE_LIST_MAX:-30}") || GATE_LANE_FILES=""
+  if [ -z "$GATE_LANE_FILES" ]; then
+    _gate_fastlane_normal "unclassifiable" "could not render the list of files that decided the lane — a grant that cannot name its files is not a grant, normal gate"
+    return 0
+  fi
+  GATE_LANE_REASON="every file is DOC or TEST (${GATE_LANE_COUNTS}), in all ${GATE_FL_HIST_N} commit(s) the push publishes too; content scan of the tip, of each commit and of the messages clean; ${GATE_FL_TEST_OUT} — merged without an LLM reviewer"
+  GATE_LANE_REASON_CODE="fast"
+  GATE_LANE_DIGEST="$GATE_FL_DIFF_DIGEST"
+  GATE_LANE="fast"
+  return 0
+}
+
+# ── the push-time confirmation ──────────────────────────────────────────────────────────────────────────────────
+
+# _gate_fastlane_is_off — 0 (with GATE_FL_OFF_CODE / GATE_FL_OFF_WHY set) when an operator has switched the lane off, 1
+# when it is on. An operator can stop the lane instantly with `touch <city>/.gc/gate-fastlane.off` (and re-enable it by
+# removing the file): the dispatcher is a fresh process every sweep, so a flag file needs no launchd reload, unlike an env
+# var. Asked at the decision AND again at the push, so that "off" also stops a run that was granted a minute ago.
+# Three states, like everything here: the switch is ON, OFF, or its location is UNKNOWN. Neither GATE_FASTLANE_OFF_FILE nor GC_CITY
+# set used to read as a path under a made-up city that never exists — i.e. "the switch is not thrown" — so a process that could
+# not even find the switch ran the lane as if the operator had left it on. That is the one reading that must not be the default
+# for a control whose whole job is to stop the lane: the unknown location answers "off" (code switch-unreadable). The dispatcher
+# always has GC_CITY (it sets it at the top), so this only ever fires for a lib sourced somewhere that does not.
+# What it does NOT cover: `[ -e ]` is false both for "absent" and for "cannot stat" (a permission error on the city's own .gc/),
+# so an unreadable directory still reads as "not thrown".
+_gate_fastlane_is_off() {
+  local flag
+  GATE_FL_OFF_CODE=""; GATE_FL_OFF_WHY=""
+  if [ "${GATE_FASTLANE_ENABLED:-1}" != "1" ]; then
+    GATE_FL_OFF_CODE="disabled"; GATE_FL_OFF_WHY="fast lane disabled (GATE_FASTLANE_ENABLED=0)"; return 0
+  fi
+  flag="${GATE_FASTLANE_OFF_FILE:-}"
+  if [ -z "$flag" ] && [ -n "${GC_CITY:-}" ]; then flag="$GC_CITY/.gc/gate-fastlane.off"; fi
+  if [ -z "$flag" ]; then
+    GATE_FL_OFF_CODE="switch-unreadable"; GATE_FL_OFF_WHY="fast lane cannot find its kill switch (GC_CITY and GATE_FASTLANE_OFF_FILE are both unset) — a switch that cannot be read is not a switch that is off, normal gate"; return 0
+  fi
+  if [ -e "$flag" ]; then
+    GATE_FL_OFF_CODE="flag-file"; GATE_FL_OFF_WHY="fast lane switched off by the flag file (.gc/gate-fastlane.off) — normal gate"; return 0
+  fi
+  return 1
+}
+
+# _gate_fastlane_revoke <code> <why> — the inert outcome of a failed confirmation: the lane is "normal" afterwards and no
+# fingerprint is left behind for a later call to trust. Always returns 0 (the caller returns 1).
+_gate_fastlane_revoke() {
+  GATE_LANE="normal"; GATE_LANE_DIGEST=""
+  GATE_LANE_CONFIRM_CODE="$1"
+  GATE_LANE_CONFIRM_WHY="$2"
+  return 0
+}
+
+# gate_fastlane_confirm <git_fn> <base_sha> <head_sha> — asked IMMEDIATELY before the push, with the very commit that is
+# about to be pushed and the main it fast-forwards from. Returns 0 only for a clean yes: the lane is still on, and the
+# diff that would land is, byte for byte (see _gate_fastlane_digest_file), the diff the decision scanned and ran the tests
+# on — or the same change rebased/merged onto a newer main. Everything else returns 1 with GATE_LANE=normal: the tip moved,
+# the content changed, the operator switched the lane off, or it could not be read (three states: yes / no / could not
+# tell, and the last two are the inert one). The caller does NOT turn a no into a FAIL — it re-queues the marker so the
+# normal gate decides; the lane only ever grants.
+# Not repeated here: the tests. They ran on the decided diff, and a digest that matches means the changed test files are the
+# same bytes (the full-suite check still runs after a rebase).
+gate_fastlane_confirm() {
+  local git_fn="$1" base="$2" head="$3" decided raw raw_rc=0
+  GATE_LANE_CONFIRM_CODE=""; GATE_LANE_CONFIRM_WHY=""
+  decided="${GATE_LANE_DIGEST:-}"
+  if [ "${GATE_LANE:-normal}" != "fast" ] || [ -z "$decided" ]; then
+    _gate_fastlane_revoke "cannot-confirm" "no fast-lane decision with a diff fingerprint is on record in this run"; return 1
+  fi
+  if [ -z "$git_fn" ] || [ -z "$base" ] || [ -z "$head" ]; then
+    _gate_fastlane_revoke "cannot-confirm" "missing git runner / base / head for the push-time confirmation"; return 1
+  fi
+  if _gate_fastlane_is_off; then
+    _gate_fastlane_revoke "switched-off" "the fast lane was switched off after it was granted: ${GATE_FL_OFF_WHY}"; return 1
+  fi
+
+  gate_fastlane_scan "$git_fn" "$base" "$head"
+  if [ "$GATE_FL_SCAN_RC" = "1" ]; then
+    # a finding ends the scan before a fingerprint exists (see gate_fastlane_scan), but a finding is an answer, not a failure to read: what would
+    # land is not what was checked — the decision was a CLEAN scan. (Labels only, never the matched text: this reason goes to bead comments.)
+    _gate_fastlane_revoke "diff-changed" "the diff that would land is not the diff the lane checked (the branch tip moved, or its content changed, after the decision) — and the content scan now rejects it ($(printf '%s' "$GATE_FL_SCAN_OUT" | cut -f1 | sort | uniq -c | awk '{printf "%s%s×%s", (NR>1?", ":""), $2, $1}'))"; return 1
+  fi
+  if [ -z "$GATE_FL_DIFF_DIGEST" ]; then
+    _gate_fastlane_revoke "cannot-confirm" "the diff that would land could not be read (${GATE_FL_SCAN_OUT:-no detail})"; return 1
+  fi
+  if [ "$GATE_FL_DIFF_DIGEST" != "$decided" ]; then
+    _gate_fastlane_revoke "diff-changed" "the diff that would land is not the diff the lane checked (the branch tip moved, or its content changed, after the decision) — no scan or test ever ran on it"; return 1
+  fi
+
+  # The same bytes mean the same files, added lines and tests. These two do not lean on that inference: they ask the
+  # commit that lands, again, directly — the tip's files AND the files of every commit the push would publish.
+  gate_fastlane_history "$git_fn" "$base" "$head"
+  case "$GATE_FL_HIST_STATE" in
+    ok) ;;
+    blocked) _gate_fastlane_revoke "no-longer-fast" "the commits that would land are not DOC/TEST-only any more: ${GATE_FL_HIST_WHY}"; return 1 ;;
+    *) _gate_fastlane_revoke "cannot-confirm" "the commits that would land could not be verified: ${GATE_FL_HIST_WHY:-no detail}"; return 1 ;;
+  esac
+  raw=$("$git_fn" -c core.quotepath=off diff --raw --no-renames "$base...$head" 2>/dev/null) || raw_rc=$?
+  if [ "$raw_rc" != "0" ]; then
+    _gate_fastlane_revoke "cannot-confirm" "git diff --raw of the commit that would land failed (rc=$raw_rc)"; return 1
+  fi
+  gate_fastlane_classify_raw "$raw"
+  if [ "$GATE_FL_STATE" != "ok" ] || [ -n "$GATE_FL_BLOCKERS" ] || [ -n "$GATE_FL_UNRUNNABLE" ]; then
+    _gate_fastlane_revoke "no-longer-fast" "the commit that would land is not classifiable as DOC/TEST-only any more"; return 1
+  fi
+  if [ "$GATE_FL_SCAN_RC" != "0" ]; then
+    _gate_fastlane_revoke "no-longer-fast" "the content scan of the commit that would land is not clean (rc=${GATE_FL_SCAN_RC})"; return 1
   fi
   return 0
 }
