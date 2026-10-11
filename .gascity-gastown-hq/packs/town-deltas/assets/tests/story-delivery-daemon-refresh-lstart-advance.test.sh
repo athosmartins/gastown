@@ -40,6 +40,14 @@
 #        FRESH_FAIL / wrong verdict / dry run / locked but not cosmetic / git broken.
 # M1-M2  the marker goes to the OLDEST proof and never backwards; a proof older than a
 #        recorded entry does not pull the entry back.
+# D1-D5  (gate fix 1) a start time proves something only for a daemon that runs the
+#        checkout whose reflog is read. D1/D1b: a stuck label the helper did NOT examine this
+#        cycle (absent from ALL_LABELS) is not "clean" just because it is not guarded now —
+#        its flag survives and its own proof still bounds the marker. D2/D3: a label the
+#        helper lists in LSTART_UNPINNED (another clone / a launch whose clone cannot be
+#        told) is never "proven" — it blocks the marker and keeps its frozen entry, even if
+#        a start epoch is given for it, and the log says why. D4/D5: a missing
+#        LSTART_UNPINNED line is "no proof" (not "all pinned"); an empty present one works.
 
 set -u
 
@@ -89,9 +97,9 @@ build_repo() {
 }
 
 # run_block — parameters (all optional) come from the environment:
-#   VERDICT (NEEDS_GUARDED_RESTART)  ALL  GUARDED  FRESHFAIL  LSTART  COSMETIC
+#   VERDICT (NEEDS_GUARDED_RESTART)  ALL  GUARDED  FRESHFAIL  LSTART  UNPINNED  COSMETIC
 #   SEED (per-daemon file; tokens @B@ @M@ @S@ @X@)  MARKER (rig marker seed, same tokens; default @B@)
-#   STUB_OMIT_LSTART=1 / STUB_OMIT_COSMETIC=1  (the helper printed no such line at all)
+#   STUB_OMIT_LSTART=1 / STUB_OMIT_COSMETIC=1 / STUB_OMIT_UNPINNED=1  (the helper printed no such line at all)
 #   WANT_MID WANT_SIDE DRY_RUN_FLAG ERREXIT BREAK_GIT
 # Sets: RUN_RC PERDAEMON_AFTER RIGMARKER_AFTER LOG_AFTER SHA_B SHA_M SHA_S SHA_X
 run_block() {
@@ -123,6 +131,7 @@ run_block() {
     echo "echo \"FRESH_FAIL=${FRESHFAIL:-}\""
     [ "${STUB_OMIT_COSMETIC:-0}" = "1" ] || echo "echo \"GUARDED_LOCKED_COSMETIC=${COSMETIC:-}\""
     [ "${STUB_OMIT_LSTART:-0}" = "1" ] || echo "echo \"LSTART_EPOCHS=${LSTART:-}\""
+    [ "${STUB_OMIT_UNPINNED:-0}" = "1" ] || echo "echo \"LSTART_UNPINNED=${UNPINNED:-}\""
     echo 'echo "REASON=stub"'
     echo 'exit 0'
   } > "$GC_CITY/packs/town-deltas/assets/daemon-refresh.sh"
@@ -347,6 +356,72 @@ WANT_MID=1 ALL="com.t.a" GUARDED="com.t.a" LSTART="com.t.a=1500" SEED="com.t.a @
 has_line "$PERDAEMON_AFTER" "com.t.a $SHA_M stuck" \
   && ok "M2 a proof (B) older than the recorded entry (M) leaves the entry on M" \
   || nok "M2 monotone" "perdaemon=[$PERDAEMON_AFTER]"
+
+# ── D1: a stuck label the helper did not examine this cycle is not "clean" ───
+# a is examined (ALL) and proven at S. u is flagged stuck, NOT in ALL_LABELS, not guarded,
+# has a live pid (start 2500 -> HEAD was M). Absent from GUARDED is not "examined and clean":
+# u keeps its flag, and the marker may only go as far as u's own proof (M), not to S.
+WANT_MID=1 ALL="com.t.a" GUARDED="com.t.a" LSTART="com.t.a=3500 com.t.u=2500" \
+SEED="com.t.a @B@ stuck
+com.t.u @B@ stuck" run_block
+has_line "$PERDAEMON_AFTER" "com.t.u $SHA_M stuck" \
+  && ok "D1 a stuck label the helper did not examine keeps its flag (entry moves to its own proof M)" \
+  || nok "D1 u entry/flag" "perdaemon=[$PERDAEMON_AFTER]"
+[ "$RIGMARKER_AFTER" = "$SHA_M" ] \
+  && ok "D1 the marker stops at the unexamined daemon's proof (M) — 'every other daemon was clean' would be untrue" \
+  || nok "D1 marker must be M" "marker=[$RIGMARKER_AFTER] want=$SHA_M log=[$LOG_AFTER]"
+has_line "$PERDAEMON_AFTER" "com.t.a $SHA_S stuck" && ok "D1 the examined, proven neighbour still advances its own entry" || nok "D1 a entry" "perdaemon=[$PERDAEMON_AFTER]"
+
+# D1b: the positive control — a label the helper DID examine (in ALL), no longer guarded,
+# proven: its flag goes away (A2 a), and the rest of the file is untouched.
+WANT_MID=1 ALL="com.t.a com.t.u" GUARDED="com.t.a" LSTART="com.t.a=3500 com.t.u=2500" \
+SEED="com.t.a @B@ stuck
+com.t.u @B@ stuck" run_block
+has_line "$PERDAEMON_AFTER" "com.t.u $SHA_S" \
+  && ok "D1b an EXAMINED, no-longer-guarded label is current at POST and loses its stuck flag (the flag is gated on being examined, not removed everywhere)" \
+  || nok "D1b u flag must go" "perdaemon=[$PERDAEMON_AFTER]"
+
+# ── D2: a label that runs code outside the runtime checkout is never proven ──
+# p is GUARDED and lstart-less (the helper left it out: UNPINNED). Blocks the marker, keeps
+# its entry, and the log gives the reason a reader needs.
+ALL="com.t.a com.t.p" GUARDED="com.t.a com.t.p" LSTART="com.t.a=3500" UNPINNED="com.t.p" \
+SEED="com.t.a @B@ stuck
+com.t.p @B@ stuck" run_block
+[ "$RIGMARKER_AFTER" = "$SHA_B" ] && has_line "$PERDAEMON_AFTER" "com.t.p $SHA_B stuck" \
+  && ok "D2 an unpinned GUARDED label (another clone) stays a blocker: marker and its entry do not move" \
+  || nok "D2 marker/entry" "marker=[$RIGMARKER_AFTER] perdaemon=[$PERDAEMON_AFTER]"
+echo "$LOG_AFTER" | grep -q "run code outside the whatsapp_automation runtime checkout" \
+  && ok "D2 the log says WHY (it runs code outside the rig's runtime checkout; a start time read against that checkout proves nothing)" \
+  || nok "D2 log reason" "$LOG_AFTER"
+echo "$LOG_AFTER" | grep -q "com.t.p" && ok "D2 the log names the label" || nok "D2 log label" "$LOG_AFTER"
+
+# D3: defence in depth — even if an epoch for p slips through next to its UNPINNED entry
+# (a helper bug, a mixed-version pair), the consumer does not take it as proof.
+ALL="com.t.a com.t.p" GUARDED="com.t.a com.t.p" LSTART="com.t.a=3500 com.t.p=3500" UNPINNED="com.t.p" \
+SEED="com.t.a @B@ stuck
+com.t.p @B@ stuck" run_block
+[ "$RIGMARKER_AFTER" = "$SHA_B" ] && has_line "$PERDAEMON_AFTER" "com.t.p $SHA_B stuck" \
+  && ok "D3 a start epoch given for a label that is also UNPINNED is ignored: UNPINNED wins" \
+  || nok "D3 unpinned must win" "marker=[$RIGMARKER_AFTER] perdaemon=[$PERDAEMON_AFTER] log=[$LOG_AFTER]"
+
+# D4: no UNPINNED line at all — epochs printed by a helper that never asked "which clone
+# does each daemon run?" (a mixed-version pair, a crash mid-print). A missing line is not an
+# empty one: no process proof is taken, nothing moves, and the log says why.
+STUB_OMIT_UNPINNED=1 ALL="com.t.a com.t.b" GUARDED="com.t.a com.t.b" LSTART="com.t.a=3500 com.t.b=3500" \
+SEED="com.t.a @B@ stuck
+com.t.b @B@ stuck" run_block
+[ "$RIGMARKER_AFTER" = "$SHA_B" ] && has_line "$PERDAEMON_AFTER" "com.t.a $SHA_B stuck" && has_line "$PERDAEMON_AFTER" "com.t.b $SHA_B stuck" \
+  && ok "D4 epochs without an LSTART_UNPINNED line prove nothing: marker and both entries stay where they were" \
+  || nok "D4 no-line must be no-proof" "marker=[$RIGMARKER_AFTER] perdaemon=[$PERDAEMON_AFTER]"
+echo "$LOG_AFTER" | grep -q "LSTART_UNPINNED" && ok "D4 the log names the missing line" || nok "D4 log" "$LOG_AFTER"
+
+# D5: the positive control for D4 — the same input WITH an empty LSTART_UNPINNED line is a
+# helper that asked and found every label pinned: the proof works (A1 again, through the
+# new field), so D4 fails for the missing line and nothing else.
+ALL="com.t.a com.t.b" GUARDED="com.t.a com.t.b" LSTART="com.t.a=3500 com.t.b=3500" UNPINNED="" \
+SEED="com.t.a @B@ stuck
+com.t.b @B@ stuck" run_block
+[ "$RIGMARKER_AFTER" = "$SHA_S" ] && ok "D5 an empty (present) LSTART_UNPINNED line: the process proof works" || nok "D5" "marker=[$RIGMARKER_AFTER] log=[$LOG_AFTER]"
 
 echo ""
 echo "story-delivery daemon-refresh lstart-advance (ga-8hfols) tests: $PASS passed, $FAIL failed"

@@ -4078,6 +4078,9 @@ echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" \
 field_is_empty LSTART_EPOCHS "$OUT" \
   && ok "T124 an unreadable start time is omitted (the line is present and empty) — never 0, never fresh" \
   || nok "T124 unreadable lstart must be omitted" "got [$(field LSTART_EPOCHS "$OUT")]"
+field_is_empty LSTART_UNPINNED "$OUT" \
+  && ok "T124 ...and it is NOT blamed on another clone: a daemon pinned to the runtime checkout whose start time cannot be read is just unreadable" \
+  || nok "T124 LSTART_UNPINNED must be present and empty here" "got [$(field LSTART_UNPINNED "$OUT")] out=[$OUT]"
 
 # T125: a label recorded 'stuck' in DAEMON_BASELINE_OVERRIDES is reported even though
 # THIS run's diff does not guard it — that is the reboot case (restarted long ago, the
@@ -4106,7 +4109,167 @@ OUT=$(run_helper docs/readme.md)
 field_is_empty LSTART_EPOCHS "$OUT" \
   && ok "T126 no daemon in question: LSTART_EPOCHS= is present and empty" \
   || nok "T126 line must be present-and-empty" "out=[$OUT]"
+field_is_empty LSTART_UNPINNED "$OUT" \
+  && ok "T126 no daemon in question: LSTART_UNPINNED= is present and empty" \
+  || nok "T126 LSTART_UNPINNED must be present-and-empty" "out=[$OUT]"
 SENSITIVE_DAEMONS=""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# T127-T130 (ga-8hfols, gate fix 1): a start time proves "this daemon runs the code
+# that was at HEAD at epoch E" ONLY when that daemon runs code from $RUNTIME_DIR —
+# the checkout whose HEAD reflog the consumer reads. A daemon launched from another
+# clone (EXTRA_RUNTIME_ROOTS — painel-prod, hand-synced 5 min behind) must NOT get a
+# LSTART_EPOCHS entry: it goes to LSTART_UNPINNED, which the consumer treats as
+# "not proven". Same for any launch whose clone cannot be told (wrapper with a
+# computed/unassigned base dir, `-m module`, a symlink out, a PYTHONPATH/env/cwd that
+# points at another clone). A start-time claim must be positively pinned, never assumed.
+# ════════════════════════════════════════════════════════════════════════════
+t127_has() {  # t127_has "<space-separated list>" <word>  — exact word membership
+  case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac
+}
+t127_second_clone() {  # builds $SECOND_CLONE with the T17 painel daemon; same relpath under $RUNTIME
+  SECOND_CLONE="$CASE_DIR/second_clone"
+  mkdir -p "$SECOND_CLONE/daemons" "$SECOND_CLONE/venv/bin"
+  cat > "$SECOND_CLONE/daemons/painel_visibilidade.py" <<<'print("painel")'
+  cat > "$RUNTIME/daemons/painel_visibilidade.py" <<<'print("painel")'
+  make_plist "$AGENTS" com.test.painel-visibilidade "$SECOND_CLONE/venv/bin/python3" "$SECOND_CLONE/daemons/painel_visibilidade.py"
+}
+
+# T127: the reviewer's case. A GUARDED daemon running from a second clone sits next to a
+# GUARDED daemon running from the runtime checkout: only the latter gets an epoch.
+SENSITIVE_DAEMONS="painel-visibilidade central-sender"
+new_case t127
+t123_app
+t127_second_clone
+seed_running com.test.central-sender 7101 "$STALE_LSTART"
+seed_running com.test.painel-visibilidade 7102 "$STALE_LSTART"
+EXTRA_RUNTIME_ROOTS="$SECOND_CLONE"
+OUT=$(run_helper daemons/central_sender.py daemons/painel_visibilidade.py)
+unset EXTRA_RUNTIME_ROOTS
+G="$(field GUARDED "$OUT")"
+{ t127_has "$G" com.test.central-sender && t127_has "$G" com.test.painel-visibilidade; } \
+  && ok "T127 fixture: both the runtime-checkout daemon and the second-clone daemon are GUARDED" \
+  || nok "T127 fixture" "GUARDED=[$G] out=[$OUT]"
+[ "$(field LSTART_EPOCHS "$OUT")" = "com.test.central-sender=$(( DEPLOY_EPOCH - 3600 ))" ] \
+  && ok "T127 only the daemon that runs the runtime checkout gets a start epoch (second-clone daemon is OUT)" \
+  || nok "T127 LSTART_EPOCHS" "got [$(field LSTART_EPOCHS "$OUT")] want com.test.central-sender=$(( DEPLOY_EPOCH - 3600 )) only"
+[ "$(field LSTART_UNPINNED "$OUT")" = "com.test.painel-visibilidade" ] \
+  && ok "T127 the second-clone daemon is named in LSTART_UNPINNED (the consumer must not treat it as proven)" \
+  || nok "T127 LSTART_UNPINNED" "got [$(field LSTART_UNPINNED "$OUT")] out=[$OUT]"
+SENSITIVE_DAEMONS=""
+
+# T128: with NO extra root configured the second-clone daemon is still not pinned — a
+# daemon whose entrypoint is outside $RUNTIME_DIR is never "proven" by that checkout,
+# whatever the configuration says. (Real data: painel-visibilidade, 237 s behind.)
+SENSITIVE_DAEMONS="painel-visibilidade"
+new_case t128
+t127_second_clone
+seed_running com.test.painel-visibilidade 7103 "$STALE_LSTART"
+OUT=$(DAEMON_BASELINE_OVERRIDES="com.test.painel-visibilidade deadbeefdeadbeefdeadbeefdeadbeefdeadbeef stuck" run_helper docs/readme.md)
+field_is_empty LSTART_EPOCHS "$OUT" \
+  && ok "T128 outside-runtime daemon (no EXTRA_RUNTIME_ROOTS) has no start epoch" \
+  || nok "T128 LSTART_EPOCHS" "got [$(field LSTART_EPOCHS "$OUT")] out=[$OUT]"
+[ "$(field LSTART_UNPINNED "$OUT")" = "com.test.painel-visibilidade" ] \
+  && ok "T128 ...and is named in LSTART_UNPINNED" \
+  || nok "T128 LSTART_UNPINNED" "got [$(field LSTART_UNPINNED "$OUT")] out=[$OUT]"
+SENSITIVE_DAEMONS=""
+
+# T129: the class — every way a launch can fail to be positively tied to $RUNTIME_DIR.
+# All labels are recorded 'stuck' (the reboot case), all running, all readable; only the
+# two that are provably the runtime checkout may appear in LSTART_EPOCHS.
+new_case t129
+t127_second_clone
+T129_WRAP="$RUNTIME/launchd"
+t129_wrapper() {  # t129_wrapper <file-stem> <BASEDIR-assignment-or-empty> <py-relpath>
+  { echo '#!/usr/bin/env bash'
+    [ -n "$2" ] && echo "$2"
+    echo "exec \"\$BASEDIR/venv/bin/python3\" \"\$BASEDIR/$3\""
+  } > "$T129_WRAP/$1.sh"
+}
+for n in pin_abs pin_wrap unp_unassigned unp_computed unp_other unp_module unp_env unp_symlink unp_second; do
+  cat > "$RUNTIME/daemons/$n.py" <<<'print("x")'
+done
+mkdir -p "$SECOND_CLONE/daemons"
+cat > "$SECOND_CLONE/daemons/unp_symlink.py" <<<'print("x")'
+cat > "$SECOND_CLONE/daemons/unp_other.py" <<<'print("x")'
+cat > "$SECOND_CLONE/daemons/unp_second.py" <<<'print("x")'
+rm "$RUNTIME/daemons/unp_symlink.py" && ln -s "$SECOND_CLONE/daemons/unp_symlink.py" "$RUNTIME/daemons/unp_symlink.py"
+# pinned: absolute .py under the runtime checkout
+make_plist "$AGENTS" com.test.pin-abs "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/pin_abs.py"
+# pinned: wrapper that assigns its base dir ONCE, to a literal absolute path = the runtime checkout
+t129_wrapper pin-wrap "BASEDIR=\"$RUNTIME\"" daemons/pin_wrap.py
+make_plist "$AGENTS" com.test.pin-wrap /bin/bash "$T129_WRAP/pin-wrap.sh"
+# unpinned: wrapper whose base dir is never assigned (could come from the plist env / the shell)
+t129_wrapper unp-unassigned "" daemons/unp_unassigned.py
+make_plist "$AGENTS" com.test.unp-unassigned /bin/bash "$T129_WRAP/unp-unassigned.sh"
+# unpinned: wrapper whose base dir is computed at run time
+t129_wrapper unp-computed 'BASEDIR="$(cd "$(dirname "$0")/.." && pwd)"' daemons/unp_computed.py
+make_plist "$AGENTS" com.test.unp-computed /bin/bash "$T129_WRAP/unp-computed.sh"
+# unpinned: wrapper whose literal base dir is ANOTHER clone
+t129_wrapper unp-other "BASEDIR=\"$SECOND_CLONE\"" daemons/unp_other.py
+make_plist "$AGENTS" com.test.unp-other /bin/bash "$T129_WRAP/unp-other.sh"
+# unpinned: `-m module` — the interpreter resolves the module from cwd/sys.path, not from a path we can see
+make_plist "$AGENTS" com.test.unp-module "$RUNTIME/venv/bin/python3" -m daemons.unp_module
+# unpinned: entrypoint under the runtime checkout, but PYTHONPATH points at another clone
+cat > "$AGENTS/com.test.unp-env.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.test.unp-env</string>
+  <key>ProgramArguments</key>
+  <array>
+      <string>$RUNTIME/venv/bin/python3</string>
+      <string>$RUNTIME/daemons/unp_env.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PYTHONPATH</key><string>$SECOND_CLONE</string></dict>
+</dict>
+</plist>
+EOF
+# unpinned: the path under the runtime checkout is a symlink into another clone
+make_plist "$AGENTS" com.test.unp-symlink "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/unp_symlink.py"
+# unpinned: absolute path inside the other clone
+make_plist "$AGENTS" com.test.unp-second "$SECOND_CLONE/venv/bin/python3" "$SECOND_CLONE/daemons/unp_second.py"
+T129_ALL="pin-abs pin-wrap unp-unassigned unp-computed unp-other unp-module unp-env unp-symlink unp-second"
+T129_OVR=""; T129_PID=7200
+for n in $T129_ALL; do
+  T129_PID=$((T129_PID+1))
+  seed_running "com.test.$n" "$T129_PID" "$(lstart_of $(( DEPLOY_EPOCH - 120 )) )"
+  T129_OVR="${T129_OVR}com.test.$n deadbeefdeadbeefdeadbeefdeadbeefdeadbeef stuck
+"
+done
+EXTRA_RUNTIME_ROOTS="$SECOND_CLONE"
+OUT=$(DAEMON_BASELINE_OVERRIDES="$T129_OVR" run_helper docs/readme.md)
+unset EXTRA_RUNTIME_ROOTS
+E="$(field LSTART_EPOCHS "$OUT")"; U="$(field LSTART_UNPINNED "$OUT")"
+for n in pin-abs pin-wrap; do
+  t127_has "$E" "com.test.$n=$(( DEPLOY_EPOCH - 120 ))" \
+    && ok "T129 $n: positively pinned to the runtime checkout -> real start epoch" \
+    || nok "T129 $n must be in LSTART_EPOCHS" "LSTART_EPOCHS=[$E] UNPINNED=[$U]"
+  t127_has "$U" "com.test.$n" \
+    && nok "T129 $n must NOT be in LSTART_UNPINNED" "UNPINNED=[$U]" \
+    || ok "T129 $n is not blamed on another clone"
+done
+for n in unp-unassigned unp-computed unp-other unp-module unp-env unp-symlink unp-second; do
+  case "$E" in *"com.test.$n="*) nok "T129 $n must have NO start epoch (cannot be tied to the runtime checkout)" "LSTART_EPOCHS=[$E]" ;; *) ok "T129 $n has no start epoch" ;; esac
+  t127_has "$U" "com.test.$n" \
+    && ok "T129 $n is named in LSTART_UNPINNED" \
+    || nok "T129 $n must be in LSTART_UNPINNED" "UNPINNED=[$U] out=[$OUT]"
+done
+
+# T130: a recorded-stuck, running daemon whose plist cannot be found at all: nothing says which
+# clone it runs, so it is unpinned — never given a start epoch (the fail-closed default).
+new_case t130
+seed_running com.test.no-plist 7301 "$(lstart_of $(( DEPLOY_EPOCH - 120 )) )"
+OUT=$(DAEMON_BASELINE_OVERRIDES="com.test.no-plist deadbeefdeadbeefdeadbeefdeadbeefdeadbeef stuck" run_helper docs/readme.md)
+field_is_empty LSTART_EPOCHS "$OUT" \
+  && ok "T130 a daemon with no plist has no start epoch" \
+  || nok "T130 LSTART_EPOCHS" "got [$(field LSTART_EPOCHS "$OUT")] out=[$OUT]"
+[ "$(field LSTART_UNPINNED "$OUT")" = "com.test.no-plist" ] \
+  && ok "T130 ...and is named in LSTART_UNPINNED (cannot be tied to the runtime checkout)" \
+  || nok "T130 LSTART_UNPINNED" "got [$(field LSTART_UNPINNED "$OUT")] out=[$OUT]"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

@@ -2746,6 +2746,14 @@ else
   # line is "no proof" / "no cosmetic evidence" — never an empty-but-confirmed one,
   # which is why the cosmetic line's PRESENCE is recorded separately from its value.
   REFRESH_LSTART=$(echo "$REFRESH_OUT" | grep '^LSTART_EPOCHS=' | head -1 | sed 's/^LSTART_EPOCHS=//' || true)
+  # LSTART_UNPINNED: the questioned labels whose start time is NO proof, because the
+  # helper cannot show they run the checkout whose reflog is read here (another clone
+  # in extra_runtime_roots, or a launch whose clone cannot be told). Its PRESENCE is
+  # recorded separately from its value, exactly like the cosmetic line: a start epoch
+  # without this line is a helper that never asked "which clone?", and that is "não
+  # sei", not "the runtime checkout".
+  REFRESH_LSTART_UNPINNED_LINE=$(echo "$REFRESH_OUT" | grep '^LSTART_UNPINNED=' | head -1 || true)
+  REFRESH_LSTART_UNPINNED=$(echo "$REFRESH_LSTART_UNPINNED_LINE" | sed 's/^LSTART_UNPINNED=//')
   REFRESH_LOCKED_COSMETIC_LINE=$(echo "$REFRESH_OUT" | grep '^GUARDED_LOCKED_COSMETIC=' | head -1 || true)
   REFRESH_LOCKED_COSMETIC=$(echo "$REFRESH_LOCKED_COSMETIC_LINE" | sed 's/^GUARDED_LOCKED_COSMETIC=//')
   # ga-vmq1i: PROOF disambiguates a positive restart+fresh confirmation from a
@@ -2814,6 +2822,7 @@ else
   # <sha>. PERDAEMON_NEW is read again below by the rig-wide advance, on paths where
   # the block that builds it was skipped, so both start defined (set -u).
   PD_PROVEN=" "
+  PD_PROOF_WHY=""
   PERDAEMON_NEW=""
   for pd_label in $REFRESH_GUARDED $REFRESH_FRESHFAIL; do
     case "$PD_STUCK" in *" $pd_label "*) ;; *) PD_STUCK="${PD_STUCK}${pd_label} " ;; esac
@@ -2965,11 +2974,24 @@ else
     # clock step in the log). The last two leave the entry exactly as it was: "could
     # not read it" is never "fresh". The helper omits a daemon it could not read, so
     # an absent label here IS the unknown state.
-    if [ -n "${REFRESH_LSTART// /}" ] && type runtime_head_at_epoch >/dev/null 2>&1; then
+    #
+    # A fourth question comes BEFORE any of those, and it is which checkout the daemon
+    # runs: the reflog read here is $RUNTIME_DIR's, so a start time proves something
+    # only for a daemon whose code is that checkout. A daemon in another clone
+    # (extra_runtime_roots — painel-prod is hand-synced minutes behind) can start
+    # inside the window where HEAD already moved while its clone has not, and would be
+    # "proven" fresher than the code it imports. The helper says which labels it cannot
+    # pin (LSTART_UNPINNED); those are never proven, whatever epoch sits next to them,
+    # and a helper that printed epochs without that line never asked the question.
+    if [ -n "${REFRESH_LSTART// /}" ] && [ -z "$REFRESH_LSTART_UNPINNED_LINE" ]; then
+      PD_PROOF_WHY="the helper printed LSTART_EPOCHS without LSTART_UNPINNED, so it cannot be told which checkout each daemon runs"
+      log "Daemon refresh: no process proof taken for $RIG (ga-8hfols): $PD_PROOF_WHY."
+    elif [ -n "${REFRESH_LSTART// /}" ] && type runtime_head_at_epoch >/dev/null 2>&1; then
       PD_HEAD_MEMO=" "
       for pd_pair in $REFRESH_LSTART; do
         pd_label="${pd_pair%%=*}"; pd_ep="${pd_pair#*=}"
         [ -n "$pd_label" ] && [[ "$pd_ep" =~ ^[0-9]+$ ]] || continue
+        case " $REFRESH_LSTART_UNPINNED " in *" $pd_label "*) continue ;; esac
         case "$PD_HEAD_MEMO" in
           *" $pd_ep:"*) pd_h="${PD_HEAD_MEMO##* $pd_ep:}"; pd_h="${pd_h%% *}" ;;
           *)
@@ -2997,19 +3019,24 @@ else
         if [ "$pd_flag" = "stuck" ] && [ -n "$pd_h" ] && [ "$pd_h" != "$pd_sha" ] \
            && [ "$(pd_commit_state "$pd_sha")" = "ok" ] \
            && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$pd_sha" "$pd_h" >/dev/null 2>&1; then
-          # The flag survives in two cases, because it is what keeps a label visible
+          # The flag survives in three cases, because it is what keeps a label visible
           # (ga-n2jnsa re-examines every 'stuck' entry) once the rig marker moves past
           # the entry: (1) the label is GUARDED/FRESH_FAIL this very cycle — it is
           # still stale for something after H, and an unflagged entry would let a
           # later marker advance (the unattributed release) drop it unseen; (2) H
           # starts BEFORE this cycle's wide window, so the stretch H..PRE was looked
-          # at by nobody and "not flagged" would mean "not looked at". Otherwise the
-          # process proof plus this cycle's examination cover everything: flag off.
+          # at by nobody and "not flagged" would mean "not looked at"; (3) the helper did
+          # not examine the label this cycle at all (absent from ALL_LABELS — a plist
+          # that stopped resolving while the process kept running): "not guarded" is
+          # then silence, not a clean bill, and the proof alone only covers up to H.
+          # Otherwise the process proof plus this cycle's examination cover everything:
+          # flag off.
           pd_flag_out="stuck"
           case "$PD_STUCK" in
             *" $pd_label "*) ;;
             *)
               if [ -n "$DAEMON_REFRESH_PRE_SHA" ] \
+                 && case " $REFRESH_ALL_LABELS " in *" $pd_label "*) true ;; *) false ;; esac \
                  && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$DAEMON_REFRESH_PRE_SHA" "$pd_h" >/dev/null 2>&1; then
                 pd_flag_out=""
               fi
@@ -3066,7 +3093,7 @@ else
     elif [ "$PD_WROTE" != "1" ]; then RIG_PROOF_WHY="the per-daemon baseline was not persisted this cycle (${PD_SKIP_WHY:-nothing was written})"
     elif [ -z "$DAEMON_REFRESH_PRE_SHA" ]; then RIG_PROOF_WHY="the marker being replaced is unknown"
     else
-      rp_blockers=""; rp_proven=""; rp_excused=""; rp_oldest=""; rp_oldest_by=""; rp_bad_order=0
+      rp_blockers=""; rp_unpinned=""; rp_proven=""; rp_excused=""; rp_oldest=""; rp_oldest_by=""; rp_bad_order=0
       rp_flagged="$(printf '%s\n' "$PERDAEMON_NEW" | awk '$3=="stuck"{printf "%s ", $1}')"
       rp_seen=" "
       for rp_label in $PD_STUCK $rp_flagged; do
@@ -3084,12 +3111,17 @@ else
           fi
         elif [ -n "$REFRESH_LOCKED_COSMETIC_LINE" ] && case " $REFRESH_LOCKED_COSMETIC " in *" $rp_label "*) true ;; *) false ;; esac; then
           rp_excused="${rp_excused}${rp_label} "
+        elif case " $REFRESH_LSTART_UNPINNED " in *" $rp_label "*) true ;; *) false ;; esac; then
+          rp_unpinned="${rp_unpinned}${rp_label} "
         else
           rp_blockers="${rp_blockers}${rp_label} "
         fi
       done
-      if [ -n "$rp_blockers" ]; then
-        RIG_PROOF_WHY="[${rp_blockers% }] neither proven by process start time nor locked-cosmetic this cycle (unknown counts as not fresh)"
+      if [ -n "$rp_unpinned" ] || [ -n "$rp_blockers" ]; then
+        RIG_PROOF_WHY=""
+        [ -z "$rp_unpinned" ] || RIG_PROOF_WHY="[${rp_unpinned% }] run code outside the $RIG runtime checkout ($RUNTIME_DIR) or the helper could not tell which clone they run, so a start time read against that checkout's reflog proves nothing about them (they stay blockers; not locked-cosmetic either)"
+        [ -z "$rp_blockers" ] || RIG_PROOF_WHY="${RIG_PROOF_WHY:+$RIG_PROOF_WHY; }[${rp_blockers% }] neither proven by process start time nor locked-cosmetic this cycle (unknown counts as not fresh)"
+        [ -z "$PD_PROOF_WHY" ] || RIG_PROOF_WHY="$RIG_PROOF_WHY; $PD_PROOF_WHY"
       elif [ "$rp_bad_order" = "1" ]; then
         RIG_PROOF_WHY="the proofs do not lie on one line of history"
       else

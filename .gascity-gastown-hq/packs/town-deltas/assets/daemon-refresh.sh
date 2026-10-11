@@ -710,13 +710,20 @@
 #      "guarded" on every later delivery, because a notify_only_locked daemon nobody
 #      may restart held the whole rig back. What was missing is the PROCESS proof:
 #      the OS says when each daemon started, the checkout's reflog says what HEAD was
-#      then, and a process that started while HEAD was H runs code at or after H.
-#      This helper only REPORTS the first half, raw: LSTART_EPOCHS (output below) is
-#      the start epoch of every daemon whose baseline is in question (GUARDED,
-#      FRESH_FAIL, or recorded 'stuck' in DAEMON_BASELINE_OVERRIDES). It decides
-#      nothing and changes no verdict; story-delivery.sh joins it with the reflog.
-#      A label the OS could not answer for (no live pid, ps/date unreadable) is left
-#      OUT of the line, never written as 0 or as "fresh": absent means "não sei".
+#      then, and a process that started while HEAD was H runs code at or after H —
+#      PROVIDED it runs $RUNTIME_DIR's checkout, the one reflog the consumer reads. For
+#      a daemon whose code lives in another clone (EXTRA_RUNTIME_ROOTS: painel-prod is
+#      hand-synced minutes behind HEAD) the same start time proves nothing, so the
+#      helper also reports WHICH labels it cannot tie to $RUNTIME_DIR.
+#      This helper only REPORTS, raw: LSTART_EPOCHS (output below) is the start epoch
+#      of every daemon whose baseline is in question (GUARDED, FRESH_FAIL, or recorded
+#      'stuck' in DAEMON_BASELINE_OVERRIDES) AND positively pinned to $RUNTIME_DIR;
+#      LSTART_UNPINNED names the questioned ones that are not. It decides nothing and
+#      changes no verdict; story-delivery.sh joins it with the reflog. Three states per
+#      label, never collapsed: a number (pinned, readable), UNPINNED (the clone it runs
+#      is another one or cannot be told: no epoch is printed for it at all), or neither
+#      (pinned but no live pid / ps or date unreadable). Nothing is ever written as 0 or
+#      as "fresh": absent means "não sei".
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -794,9 +801,21 @@
 #     present, even empty. The start time (unix epoch, from `ps -o lstart=` of the
 #     label's live pid) of every daemon this run was asked about: GUARDED and
 #     FRESH_FAIL labels, plus every label DAEMON_BASELINE_OVERRIDES records as
-#     'stuck'. Raw fact only — VERDICT/GUARDED never change. A label with no live
+#     'stuck' — and that is positively pinned to $RUNTIME_DIR (see LSTART_UNPINNED).
+#     Raw fact only — VERDICT/GUARDED never change. A label with no live
 #     pid or an unreadable start time is simply not listed, and an empty line is
 #     "nothing could be read", never "everything is fresh".)
+#   LSTART_UNPINNED=<labels>   (ga-8hfols gate fix 1, header point 24: always
+#     present, even empty, and ALWAYS printed together with LSTART_EPOCHS. The
+#     questioned labels whose start time is NO proof because their plist does not
+#     positively tie the code to $RUNTIME_DIR: a path under an EXTRA_RUNTIME_ROOT
+#     (interpreter, entrypoint, WorkingDirectory, PYTHONPATH), a symlink that leaves
+#     the checkout, a `-m` launch outside it, a wrapper whose base directory is not one
+#     literal path, a plist that is missing or cannot be read. They get no epoch.
+#     A consumer that sees LSTART_EPOCHS without this line must take NO process proof:
+#     a missing line is "não sei which clone", not "all pinned". Not modelled: a wrapper
+#     that `source`s a file reassigning its base variable, an editable install in the
+#     interpreter's venv, a third clone nobody listed in EXTRA_RUNTIME_ROOTS.)
 #   RIG_DETECTOR_USED=0|1   AFFECTED_RIG_DETECTOR=<labels>
 #     GUARDED_RIG_DETECTOR=<labels>   (ga-abofl6, header point 20: always
 #     present. RIG_DETECTOR_USED is rig-level — 1 only when $RUNTIME_DIR/
@@ -1093,22 +1112,297 @@ daemon_pid() {  # daemon_pid <label>
     | awk -F'=' '/"PID"/ {gsub(/[^0-9]/,"",$2); print $2; exit}'
 }
 
-# lstart_epochs_line (ga-8hfols, header point 24): "<label>=<epoch> ..." for every
-# daemon whose baseline is in question. Reads only — no restart, no state. A label
-# the OS cannot answer for is omitted (three states: a number, or nothing — never a
-# guessed 0 that a consumer could mistake for "started long ago" or "fresh").
+# lstart_pin_classify (ga-8hfols, gate fix 1): for each label named, one line
+# "<label><TAB>pinned|unpinned<TAB><why>". "pinned" = the plist POSITIVELY ties the
+# daemon's code to $RUNTIME_DIR — the one checkout whose HEAD reflog the consumer
+# reads. A start time only proves "this process runs the code that was at HEAD at
+# epoch E" for such a daemon; for one that runs another clone (EXTRA_RUNTIME_ROOTS —
+# painel-prod, hand-synced minutes behind) the same number proves nothing about that
+# code, and a launch whose clone cannot be told is "não sei", never "the runtime
+# checkout". Everything below fails toward unpinned:
+#   - the plist is missing/unparseable, or ties nothing to the checkout at all;
+#   - an entrypoint, the interpreter, the WorkingDirectory or a PYTHONPATH entry
+#     lives in an EXTRA_RUNTIME_ROOT, or an entrypoint under the checkout is a
+#     symlink that leaves it (judged by realpath, not by the spelling);
+#   - a `-m` launch whose WorkingDirectory is not the checkout (the module comes
+#     from cwd/sys.path, not from a path anyone can see);
+#   - a wrapper script under the checkout that execs "$VAR/....py" where VAR is not
+#     assigned EXACTLY ONCE, to a literal absolute path (other $VARs and $HOME may
+#     appear inside it): unassigned, computed ($(...), dirname), ${X:-default}
+#     (overridable), assigned twice, or touched by eval/read/for/printf -v.
+# Not modelled (documented limit): a wrapper that `source`s a file which reassigns
+# the variable, an editable install in the interpreter's venv, a third clone nobody
+# listed in EXTRA_RUNTIME_ROOTS. One python3 call for all labels (no per-label fork).
+lstart_pin_classify() {  # lstart_pin_classify <label>...
+  python3 - "${RUNTIME_DIR:-}" "${EXTRA_RUNTIME_ROOTS:-}" "$LAUNCH_AGENTS_DIR" "$@" <<'PY' 2>/dev/null
+import sys, os, re, plistlib, pwd
+
+runtime, extras_s, agents_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+labels = sys.argv[4:]
+extras = [e for e in extras_s.split() if e]
+NEVER = object()   # stmt_assign: the name is never assigned (a different answer from "cannot tell")
+
+
+def real(p):
+    return os.path.realpath(p)
+
+
+def inside(p, root):
+    rp, rr = real(p), real(root).rstrip('/')
+    return rp == rr or rp.startswith(rr + '/')
+
+
+def cls(p):
+    """'extra' / 'rt' / 'other' by where the path REALLY lives (symlinks followed)."""
+    for e in extras:
+        if inside(p, e):
+            return 'extra'
+    if inside(p, runtime):
+        return 'rt'
+    return 'other'
+
+
+def lit_inside(p, root):
+    n, r = os.path.normpath(p), os.path.normpath(root).rstrip('/')
+    return n == r or n.startswith(r + '/')
+
+
+def literal_under_a_checkout(p):
+    return lit_inside(p, runtime) or any(lit_inside(p, e) for e in extras)
+
+
+def stmt_assign(text, name):
+    """The right-hand side of the ONE statement-level assignment of <name>; NEVER when it
+    is not assigned at all; None for anything a literal read cannot vouch for (assigned
+    more than once, inline `NAME=x cmd`, ${NAME:=...}, read/for/printf -v, eval)."""
+    body = '\n'.join(l for l in text.split('\n') if not l.lstrip().startswith('#'))
+    if re.search(r'(^|[^\w])eval\s', body):
+        return None
+    n = re.escape(name)
+    hits = re.findall(r'(?<![\w$])' + n + r'\+?=', body)
+    hits += re.findall(r'\$\{' + n + r':?=', body)
+    hits += re.findall(r'\b(?:for|select)\s+' + n + r'\s+in\b', body)
+    hits += re.findall(r'\bread\b[^\n;|&]*\b' + n + r'\b', body)
+    hits += re.findall(r'\bprintf\s+-v\s+' + n + r'\b', body)
+    hits += re.findall(r'\bgetopts\s+\S+\s+' + n + r'\b', body)
+    hits += re.findall(r'\bunset\s+[^\n;]*\b' + n + r'\b', body)
+    if not hits:
+        return NEVER
+    if len(hits) != 1:
+        return None
+    m = re.findall(r'^[ \t]*(?:export[ \t]+|readonly[ \t]+)?' + n + r'=(.*)$', body, re.M)
+    return m[0] if len(m) == 1 else None
+
+
+def literal_value(rhs):
+    """RHS -> [('lit', text) | ('var', name)], or None unless it is a plain quoted or bare
+    string (command substitution, backticks, ${x:-default}, tilde, escapes -> None)."""
+    rhs = rhs.strip()
+    m = re.match(r'^"([^"\\`]*)"\s*(#.*)?$', rhs)
+    if m:
+        body = m.group(1)
+    else:
+        m = re.match(r"^'([^']*)'\s*(#.*)?$", rhs)
+        if m:
+            return [('lit', m.group(1))]
+        m = re.match(r'^([^\s;&|<>()`"\'\\~$]+)\s*(#.*)?$', rhs)
+        if not m:
+            return None
+        body = m.group(1)
+    if '$(' in body:
+        return None
+    parts, pos = [], 0
+    for r in re.finditer(r'\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)|\$', body):
+        if r.group(1) is None and r.group(2) is None:
+            return None
+        if r.start() > pos:
+            parts.append(('lit', body[pos:r.start()]))
+        parts.append(('var', r.group(1) or r.group(2)))
+        pos = r.end()
+    if pos < len(body):
+        parts.append(('lit', body[pos:]))
+    if any('${' in t for k, t in parts if k == 'lit'):
+        return None
+    return parts
+
+
+def eval_var(text, name, known, depth=0, seen=()):
+    """The literal absolute path <name> holds in the script, or None (= cannot tell)."""
+    if depth > 6 or name in seen:
+        return None
+    rhs = stmt_assign(text, name)
+    if rhs is NEVER:
+        return known.get(name)   # never assigned: only what launchd itself defines is known
+    if rhs is None:
+        return None
+    parts = literal_value(rhs)
+    if parts is None:
+        return None
+    out = ''
+    for k, t in parts:
+        if k == 'lit':
+            out += t
+        else:
+            v = eval_var(text, t, known, depth + 1, seen + (name,))
+            if v is None:
+                return None
+            out += v
+    return out if out.startswith('/') else None
+
+
+def classify(label):
+    try:
+        with open(os.path.join(agents_dir, label + '.plist'), 'rb') as fh:
+            d = plistlib.load(fh)
+    except Exception:
+        return False, 'plist missing or unparseable'
+    if not runtime:
+        return False, 'no runtime checkout configured'
+    args = [a for a in (d.get('ProgramArguments') or []) if isinstance(a, str)]
+    env = d.get('EnvironmentVariables')
+    env = env if isinstance(env, dict) else {}
+    wd = d.get('WorkingDirectory') or ''
+    wd = wd if isinstance(wd, str) else ''
+    bad, ok = [], 0
+    known = {}   # HOME is the one variable launchd itself defines for a user agent
+    if isinstance(env.get('HOME'), str) and env['HOME'].startswith('/'):
+        known['HOME'] = env['HOME']
+    elif 'HOME' not in env:
+        try:
+            pw = pwd.getpwuid(os.getuid())
+            if d.get('UserName') in (None, '', pw.pw_name):
+                known['HOME'] = pw.pw_dir
+        except Exception:
+            pass
+    if args and cls(args[0]) == 'extra':
+        bad.append('the interpreter lives in another checkout')
+    wdc = cls(wd) if wd else None
+    if wdc == 'extra':
+        bad.append('WorkingDirectory is another checkout')
+    pp = env.get('PYTHONPATH')
+    if isinstance(pp, str) and any(c and cls(c) == 'extra' for c in pp.split(':')):
+        bad.append('PYTHONPATH names another checkout')
+    wrappers = []
+    for a in args:
+        if not a.endswith(('.py', '.sh')):
+            continue
+        if os.path.isabs(a):
+            p = a
+        elif '$' in a:   # launchd never expands it: no checkout can be read from it
+            rel = re.sub(r'^.*\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/', '', a)
+            if rel != a and os.path.isfile(os.path.join(runtime, rel)):
+                bad.append('%s: a variable path in a plist cannot be tied to a checkout' % a)
+            continue
+        elif wd:
+            p = os.path.join(wd, a)
+        else:
+            if os.path.isfile(os.path.join(runtime, a)):
+                bad.append('%s: relative path with no WorkingDirectory' % a)
+            continue
+        c = cls(p)
+        if c == 'rt':
+            if literal_under_a_checkout(p) and not lit_inside(p, runtime):
+                bad.append('%s: reaches the runtime checkout only through a symlink' % a)
+            else:
+                ok += 1
+                if a.endswith('.sh'):
+                    wrappers.append(real(p))
+        elif c == 'extra':
+            bad.append('%s: lives in another checkout' % a)
+        elif literal_under_a_checkout(p):
+            bad.append('%s: a symlink that leaves the checkout' % a)
+        # 'other' and not under any checkout by name: not rig code (discovery ignores it too)
+    for w in wrappers:
+        try:
+            with open(w, 'r', errors='replace') as fh:
+                text = fh.read()
+        except Exception:
+            bad.append('%s: wrapper unreadable' % w)
+            continue
+        for tok in sorted(set(re.findall(r'[^"\s]+\.py', text))):
+            m = re.match(r'^.*\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/(.*)$', tok)
+            if m:
+                base = eval_var(text, m.group(1), known)
+                in_checkout = os.path.isfile(os.path.join(runtime, m.group(2)))
+                if base is None:
+                    if in_checkout:
+                        bad.append('%s: base directory $%s is not one literal absolute path' % (tok, m.group(1)))
+                    continue
+                full = os.path.join(base, m.group(2))
+            elif os.path.isabs(tok):
+                full, in_checkout = tok, False
+            else:
+                continue
+            c = cls(full)
+            if c == 'rt':
+                if literal_under_a_checkout(full) and not lit_inside(full, runtime):
+                    bad.append('%s: reaches the runtime checkout only through a symlink' % tok)
+                else:
+                    ok += 1
+            elif c == 'extra' or literal_under_a_checkout(full):
+                bad.append('%s: lives in another checkout' % tok)
+            elif in_checkout:
+                bad.append('%s: resolves outside the checkout although the checkout has that file' % tok)
+    if '-m' in args:   # the module comes from cwd/sys.path
+        if wdc == 'rt':
+            ok += 1
+        else:
+            bad.append('a -m module launch whose WorkingDirectory is not the checkout')
+    if not bad and ok == 0:
+        if wdc == 'rt':
+            ok += 1
+        else:
+            bad.append('nothing ties this launch to the checkout')
+    return (not bad), '; '.join(bad)
+
+
+for l in labels:
+    try:
+        good, why = classify(l)
+    except Exception as ex:
+        good, why = False, 'classifier error: %s' % ex
+    print('%s\t%s\t%s' % (l, 'pinned' if good else 'unpinned', why))
+PY
+}
+
+# lstart_epochs_line (ga-8hfols, header point 24): sets LSTART_EPOCHS_OUT to
+# "<label>=<epoch> ..." for every daemon whose baseline is in question AND that is
+# positively pinned to $RUNTIME_DIR, and LSTART_UNPINNED_OUT to the questioned labels
+# that are not (lstart_pin_classify). Reads only — no restart, no state. Three states:
+# a number (pinned, readable), "unpinned" (a start time says nothing about the checkout
+# the consumer reads), or neither list (pinned but the OS cannot answer — never a
+# guessed 0 that a consumer could mistake for "started long ago" or "fresh"). An
+# unpinned label gets no epoch at all, so no consumer can use one by mistake.
 lstart_epochs_line() {
-  local labels="" seen=" " l pid ep out=""
+  local qlabels="" seen=" " l pid ep pins=" " kind why cls_out unp_why=""
+  LSTART_EPOCHS_OUT=""
+  LSTART_UNPINNED_OUT=""
   for l in ${GUARDED:-} ${FRESH_FAIL:-} $(printf '%s\n' "${DAEMON_BASELINE_OVERRIDES:-}" | awk '$3=="stuck"{print $1}'); do
     case "$seen" in *" $l "*) continue ;; esac
     seen="${seen}${l} "
+    qlabels="${qlabels}${l} "
+  done
+  [ -n "$qlabels" ] || return 0
+  # a classifier that cannot run leaves pins empty: every label is then unpinned
+  cls_out="$(lstart_pin_classify $qlabels)" || cls_out=""
+  while IFS=$'\t' read -r l kind why; do
+    [ "$kind" = "pinned" ] && pins="${pins}${l} "
+    [ "$kind" = "unpinned" ] && unp_why="${unp_why}${l}${why:+ ($why)}; "
+  done <<< "$cls_out"
+  for l in $qlabels; do
+    case "$pins" in
+      *" $l "*) ;;
+      *) LSTART_UNPINNED_OUT="${LSTART_UNPINNED_OUT}${LSTART_UNPINNED_OUT:+ }${l}"; continue ;;
+    esac
     pid="$(daemon_pid "$l")"
     [ -n "$pid" ] || continue
     ep="$(pid_start_epoch "$pid")" || continue
     case "$ep" in ''|*[!0-9]*) continue ;; esac
-    out="${out}${out:+ }${l}=${ep}"
+    LSTART_EPOCHS_OUT="${LSTART_EPOCHS_OUT}${LSTART_EPOCHS_OUT:+ }${l}=${ep}"
   done
-  printf '%s' "$out"
+  if [ -n "$LSTART_UNPINNED_OUT" ]; then
+    log "start time is not proof for [$LSTART_UNPINNED_OUT]: not positively pinned to the runtime checkout $RUNTIME_DIR (LSTART_UNPINNED): ${unp_why%; }"
+  fi
 }
 
 # ── emit result + exit ────────────────────────────────────────────────────────
@@ -1193,7 +1487,14 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # ga-8hfols (header point 24): always present, even empty — the raw start epochs
   # of the daemons whose baseline is in question. An absent line is an older
   # helper; a consumer treats absent and empty the same: no proof, not "fresh".
-  echo "LSTART_EPOCHS=$(lstart_epochs_line)"
+  lstart_epochs_line
+  echo "LSTART_EPOCHS=$LSTART_EPOCHS_OUT"
+  # ga-8hfols gate fix 1 (header point 24): always present, even empty, and ALWAYS
+  # emitted together with LSTART_EPOCHS — the labels in question whose start time is
+  # no proof because they are not positively pinned to the runtime checkout. A
+  # consumer that sees LSTART_EPOCHS but no LSTART_UNPINNED cannot tell which clone
+  # each daemon runs and takes no process proof at all.
+  echo "LSTART_UNPINNED=$LSTART_UNPINNED_OUT"
   # ga-abofl6 (header point 20): always present, even empty — same convention
   # as every other field above. RIG_DETECTOR_USED distinguishes "consulted,
   # confirmed nothing" (AFFECTED_RIG_DETECTOR/GUARDED_RIG_DETECTOR empty, USED=1)
