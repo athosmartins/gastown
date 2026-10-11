@@ -47,6 +47,8 @@ REASON_CODES = {
     "code-or-prompt":   ("tem arquivo de código ou prompt/doutrina", False),
     "scan-findings":    ("só doc/teste, barrado pelo scan (dado pessoal/segredo)", True),
     "scan-failed":      ("só doc/teste, scan não rodou", True),
+    "history-code":     ("só doc/teste no resultado final, mas um commit do histórico mexe em código/prompt (e um commit posterior desfez)", True),
+    "history-unverified": ("só doc/teste, mas o histórico de commits não pôde ser verificado (commits demais, merge com conteúdo, git falhou)", True),
     "test-failed":      ("só doc/teste, teste novo não passou/não rodou", True),
     "test-unrunnable":  ("só doc/teste, teste sem runner (js/ts/go...)", True),
     "unclassifiable":   ("diff inclassificável (symlink, caminho com aspas, vazio...)", False),

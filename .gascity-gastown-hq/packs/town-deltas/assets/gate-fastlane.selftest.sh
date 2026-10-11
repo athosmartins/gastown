@@ -499,7 +499,7 @@ e2e_case "no head to decide on"                               no-input        ""
 e2e_probe "$(head_of s-mdpy)" ""
 [ "$E_BUCKET" != "$(label_of policy)" ] && [ "$E_BUCKET" = "$(label_of code-or-prompt)" ] && ok "a diff that went to the gate because of a .py file is bucketed as code/prompt — not as the gate's own policy" || bad "the cited misbucketing is back: '$E_BUCKET'"
 # and every code the lib can set is one the harness above exercised or the tally lists (no producer/consumer drift)
-EXERCISED="fast code-or-prompt scan-findings scan-failed test-failed test-unrunnable unclassifiable policy disabled flag-file switch-unreadable diff-raw-failed no-input"
+EXERCISED="fast code-or-prompt scan-findings scan-failed test-failed test-unrunnable unclassifiable policy disabled flag-file switch-unreadable diff-raw-failed no-input history-code history-unverified"
 for c in $(grep -o '_gate_fastlane_normal "[a-z-]*"' "$LIB" | sed 's/.*"\(.*\)"/\1/' | sort -u); do
   case " $EXERCISED " in *" $c "*) ok "lib code '$c' is exercised end to end above" ;; *) bad "lib emits code '$c' that §4e never ran through the tally" ;; esac
 done
@@ -679,10 +679,9 @@ runner_case none    tests/fixtures/data.json tests/fixtures/a.YML tests/golden/o
 runner_case unknown web/app.test.ts tests/test_widget.lua tests/helpers/setup.sh tests/conftest.py tests/run.pl tests/fixtures/NOEXT tests/Makefile tests/foo.test.R tests/e2e.spec.zsh
 S_LUA=$(mkbr s-g6-lua 'tests/test_widget.lua=print(1)\n');           sd_case "a changed test in a language nobody listed (lua) is not 'none': it goes to the gate, unrun" "$S_LUA" '' normal test-unrunnable "cannot run"
 S_HLP=$(mkbr s-g6-helper 'tests/helpers/setup.sh=echo hi\n');       sd_case "a helper script under tests/ is not an inert fixture" "$S_HLP" '' normal test-unrunnable "cannot run"
-RS="$T/runner-state"; rm -f "$RS"
-# classify asks once and run_tests asks again, for the same file: an answer that vanishes the second time must not be a pass (pins run_tests' own default arm)
-sd_case "runner lookup answers in classify and then NOTHING in run_tests: rc=99, not a pass" "$S_TO" "gate_fastlane_test_runner() { if [ -e '$RS' ]; then return 0; fi; : > '$RS'; echo bash; }" normal test-failed "rc=99"
-rm -f "$RS"
+# classify asks (for the history's files and for the tip's) and run_tests asks again, for the same file: an answer that vanishes in run_tests must not be a pass (pins run_tests' own default arm).
+# The stub tells run_tests from classify by the CALL STACK, not by counting calls — how many times classify asks is not what this case is about.
+sd_case "runner lookup answers in classify and then NOTHING in run_tests: rc=99, not a pass" "$S_TO" 'gate_fastlane_test_runner() { local f; for f in "${FUNCNAME[@]}"; do if [ "$f" = gate_fastlane_run_tests ]; then return 0; fi; done; echo bash; }' normal test-failed "rc=99"
 # (b) the class lookup — the sibling two lines above it, which the reviewer called correct: it defaulted to CODE, i.e. to normal, but silently
 sd_case "classifier answers NOTHING"     "$S_D" 'gate_fastlane_path_class() { :; }'         normal unclassifiable "could not classify"
 sd_case "classifier answers GARBAGE"     "$S_D" 'gate_fastlane_path_class() { echo MAYBE; }' normal unclassifiable "'MAYBE'"
@@ -748,6 +747,192 @@ decide "$S_D2" "" GATE_FASTLANE_OFF_FILE= GC_CITY="$T/city-ok";  chk_code "contr
 decide "$S_D2" "" GATE_FASTLANE_OFF_FILE= GC_CITY="$T/city-ok";  chk_code "control: GC_CITY set and the flag file there → off, as before" normal flag-file
 rm -f "$T/city-ok/.gc/gate-fastlane.off"
 e2e_case "kill switch whose location is unknown" switch-unreadable "$S_D2" "" GATE_FASTLANE_OFF_FILE=
+
+# ── 4h. the lane decides on what the push PUBLISHES: every commit, messages included (gate round ga-aa8n6z; Mayor re-scope 11/10) ──────────
+# The scan used to read the NET diff (base...head) and the classifier the net file list, while the merge is a fast-forward that publishes EVERY commit
+# of base..head. So a CPF pasted in one commit and deleted in the next, or a production file added and removed again, was invisible to the lane and sat
+# in main's history with zero reviewers (the reviewer reproduced it with a CPF + phone, 2 commits, net diff = one harmless line). Every case below is a
+# REAL branch of several commits, a REAL decision, and — where it matters — the REAL record and tally; each "was fast" case is also run against a mutant
+# lib/scanner that lacks the new check (§8t-8x), so the claim is "this goes red without the fix", not "this passes with it".
+echo "── 4h. history: the lane reads every commit the push publishes (the net diff is not what lands) ──"
+mkseq_on() { # mkseq_on <base-ref> <branch> <spec>... — one commit per group; spec as mkbr, plus MSG:<message> (for the commit being built) and `--` (ends a commit)
+  local base="$1" br="$2" s p c msg="$2" n=1; shift 2
+  git -C "$REPO" checkout -q -b "$br" "$base" || return 1
+  for s in "$@"; do
+    case "$s" in
+      --)     git -C "$REPO" commit -q -m "$msg" || return 1; n=$((n + 1)); msg="$br c$n" ;;
+      MSG:*)  msg="${s#MSG:}" ;;
+      -*)     git -C "$REPO" rm -q -- "${s#-}" ;;
+      *=*)    p="${s%%=*}"; c="${s#*=}"; mkdir -p "$REPO/$(dirname "$p")"; printf '%b' "$c" > "$REPO/$p"; git -C "$REPO" add -- "$p" ;;
+    esac
+  done
+  git -C "$REPO" commit -q -m "$msg" || return 1
+  git -C "$REPO" rev-parse HEAD
+  git -C "$REPO" checkout -q main
+}
+mkseq() { mkseq_on main "$@"; }
+
+# (a) the reviewer's own reproduction: commit 1 pastes a CPF + a phone into docs/a.md, commit 2 deletes the line. The NET diff is one harmless added line.
+S_H1=$(mkseq h-cpf 'docs/a.md=base\nlead: Maria CPF 123.456.789-09 tel (31) 99999-8888\n' -- 'docs/a.md=base\nok line\n')
+[ "$(git -C "$REPO" diff -U0 main...h-cpf | grep -c -E '^\+[^+]')" = "1" ] && ok "premise: the NET diff of the reproduction adds exactly one line (the harmless one)" || bad "premise broken: the net diff of h-cpf is not one added line"
+[ "$(git -C "$REPO" log -p main..h-cpf | grep -c '123.456.789-09')" -ge "2" ] && ok "premise: the CPF IS in the history the push would publish (git log -p shows it)" || bad "premise broken: the CPF is not in the branch's history"
+decide "$S_H1" "";  chk_code "a CPF + phone added in commit 1 and removed in commit 2 (net diff harmless) is a FINDING, not 'fast'" normal scan-findings "numero-longo"
+case "$D_FILES" in *":docs/a.md:"*) ok "…and the finding names the COMMIT and the file (<sha9>:docs/a.md), so the author knows where to look" ;; *) bad "the finding does not name the commit: $D_FILES" ;; esac
+case "$D_REASON $D_FILES" in *123.456*|*12345678909*|*99999-8888*) bad "the history finding published the CPF/phone: $D_REASON | $D_FILES" ;; *) ok "…and never carries the value" ;; esac
+S_H1B=$(mkseq h-cpf-ok 'docs/a.md=base\nok line\n' -- 'docs/a.md=base\nok line\nsecond line\n');  decide "$S_H1B" "";  check "control: the same two-commit shape with nothing to hide is fast" fast "2 commit(s)"
+# (b) a production file added in commit 1 and deleted in commit 2, next to a doc: the tip is DOC-only, the history is not
+S_H2=$(mkseq h-code 'app/tmp.py=print(2)\n' -- '-app/tmp.py' 'docs/new.md=hello\n')
+decide "$S_H2" "";  chk_code "a .py added in commit 1 and removed in commit 2 (tip: one doc) stays in the gate" normal history-code "stay in main's history"
+case "$D_FILES" in *"app/tmp.py"*) ok "…and the files that decided name it (HISTORY:CODE:app/tmp.py)" ;; *) bad "history-code does not name the file: $D_FILES" ;; esac
+S_H2B=$(mkseq h-code2 'app/main.py=print(99)\n' -- 'app/main.py=print(1)\n' 'docs/new2.md=hello\n')
+decide "$S_H2B" "";  chk_code "an existing .py edited in commit 1 and restored in commit 2 (net: nothing for that file) stays in the gate" normal history-code
+S_H2C=$(mkseq h-prompt 'skills/x/SKILL.md=changed\n' -- 'skills/x/SKILL.md=skill\n' 'docs/new3.md=hello\n')
+decide "$S_H2C" "";  chk_code "a SKILL.md changed in commit 1 and restored in commit 2 stays in the gate (prompt text is production)" normal history-code
+# the Mayor's own wording: 2 commits, the 2nd undoes the 1st — the net diff is EMPTY, which was already the normal gate (unclassifiable), and must stay so
+S_H2D=$(mkseq h-undo 'app/tmp.py=print(2)\n' -- '-app/tmp.py')
+decide "$S_H2D" "";  chk_code "the Mayor's case, literally: commit 2 undoes commit 1 (code) → net diff empty → not fast" normal unclassifiable "no files"
+# (c) the MESSAGES are published too
+S_H3=$(mkseq h-msg 'MSG:docs: ligar para (31) 99999-8888' 'docs/n.md=hello\n')
+decide "$S_H3" "";  chk_code "a phone number in a commit MESSAGE is a finding" normal scan-findings "numero-longo"
+case "$D_FILES" in *"commit-message"*) ok "…reported as <sha9>:commit-message" ;; *) bad "message finding not named: $D_FILES" ;; esac
+S_H3B=$(mkseq h-msg2 $'MSG:docs: nota\n\nligar (31) 99999-\n8888 amanha' 'docs/n.md=hello\n')
+decide "$S_H3B" "";  chk_code "…also when the number is wrapped across two message lines" normal scan-findings "numero-longo"
+S_H3C=$(mkseq h-msg3 $'MSG:docs: nota\n\nitem 31 9999\n\nitem 8888 fim' 'docs/n.md=hello\n')
+decide "$S_H3C" "";  chk_code "control: two short numbers separated by a blank message line are not one number" fast fast
+S_H3D=$(mkseq h-msg4 'MSG:docs(ga-atsahv): explain the lane — see f7f733c40 and bd ga-xnw2o3' 'docs/n.md=hello\n')
+decide "$S_H3D" "";  chk_code "control: a message with a bead id and a short sha is clean" fast fast
+S_H3E=$(mkseq h-msg5 'MSG:docs: runbook of the 2026-10-11 reboot' 'docs/n.md=hello\n')
+decide "$S_H3E" "";  chk_code "accepted false positive (the same price as a dated file name): a date in a commit message goes to the ordinary gate" normal scan-findings "numero-longo"
+S_H3F=$(mkseq h-msg6 'MSG:docs: aws key AKIAIOSFODNN7EXAMPLE pasted' 'docs/n.md=hello\n')
+decide "$S_H3F" "";  chk_code "a credential in a commit message is a finding" normal scan-findings "aws-key"
+# (d) a number split over two lines that DIFFERENT commits added side by side is one number only in the net diff — the net pass stays
+S_H4=$(mkseq h-split 'docs/n.md=ligar (31) 9999\n' -- 'docs/n.md=ligar (31) 9999\n8888 amanha\n')
+decide "$S_H4" "";  chk_code "a phone whose halves were added by two different commits (adjacent lines) is a finding" normal scan-findings "numero-longo"
+# (e) controls: the shapes that are legitimately fast must stay fast, with the commit count in the reason
+S_H5=$(mkseq h-ok3 'docs/a1.md=one\n' -- 'docs/a2.md=two\n' -- 'docs/a3.md=three\n');  decide "$S_H5" "";  check "control: three docs-only commits are fast" fast "3 commit(s)"
+S_H5B=$(mkseq h-ok-t 'docs/a4.md=one\n' -- 'tests/ok4.selftest.sh=exit 0\n');            decide "$S_H5B" "";  check "control: a doc commit then a green-test commit is fast" fast "2 commit(s)"
+S_H5C=$(mkseq h-ok-del 'docs/a5.md=x\n' -- '-docs/a5.md' 'docs/a6.md=y\n');               decide "$S_H5C" "";  check "control: a doc added and removed again (harmless text) is still fast" fast
+# (f) the cap: a branch of N commits above GATE_FASTLANE_COMMIT_MAX is a job for a reviewer
+decide "$S_H5" "" GATE_FASTLANE_COMMIT_MAX=2;  chk_code "3 commits over a cap of 2 stay in the gate" normal history-unverified "cap of 2"
+decide "$S_H5" "" GATE_FASTLANE_COMMIT_MAX=3;  chk_code "…and exactly at the cap it is fast again" fast fast
+decide "$S_H5" "" GATE_FASTLANE_COMMIT_MAX=banana;  chk_code "a cap that is not a number falls back to the default (30), not to 0 or to 'no cap'" fast fast
+# (g) names with adjacent non-ASCII letters (gate round ga-aa8n6z, blocking issue 2): git's default quoting turned `ção` into twelve digits
+S_H6=$(mkseq h-cao 'docs/migração.md=ok\n' 'docs/integração-ões.md=ok\n' 'docs/relatório.md=ok\n')
+decide "$S_H6" "";  check "a docs-only branch named with ção/ões/ório is fast (was: 'numero-longo' for a name that holds no number)" fast "DOC or TEST"
+S_H6B=$(mkseq h-cao-num 'docs/relatório-52998224725.md=ok\n')
+decide "$S_H6B" "";  chk_code "…and an accented name that REALLY carries a CPF is still a finding (its digits are plain ASCII)" normal scan-findings "numero-longo"
+# (h) the third state, at every read the history makes. (stub_decide defines its gfn AFTER the stub, so a stub of gfn needs this own helper)
+S_HG=$(head_of h-ok3)
+hist_stub() { # <name> <head> <stub-body-run-after-gfn-defined> <want_code> <needle>
+  local out lane code reason
+  out=$(fl_env GATE_FS_TMPDIR="$T/tmp" FL_LIB="$LIB" FL_REPO="$REPO" FL_HEAD="$2" FL_STUB="$3" "$B32" -c '
+    set -euo pipefail
+    source "$FL_LIB"
+    gfn() { git -C "$FL_REPO" "$@"; }
+    eval "$FL_STUB"
+    gate_fastlane_decide gfn main "$FL_HEAD" ""
+    printf "%s|%s|%s\n" "$GATE_LANE" "$GATE_LANE_REASON_CODE" "$GATE_LANE_REASON"
+  ' 2>&1 | tail -1) || out="ABORTED|aborted|$out"
+  lane="${out%%|*}"; reason="${out#*|}"; code="${reason%%|*}"; reason="${reason#*|}"
+  if [ "$lane" = "normal" ] && [ "$code" = "$4" ]; then ok "$1 → normal/$4"; else bad "$1 → lane=$lane code=$code, want normal/$4 — $reason"; fi
+  case "$reason" in *"$5"*) ok "$1: the reason says '$5'" ;; *) bad "$1: expected '$5' in: $reason" ;; esac
+}
+hist_stub "git cannot list the commits (rev-list fails)" "$S_HG" 'gfn() { case " $* " in *" rev-list "*) return 5 ;; esac; git -C "$FL_REPO" "$@"; }' history-unverified "could not list the commits"
+hist_stub "git lists NO commit although the diff lists files" "$S_HG" 'gfn() { case " $* " in *" rev-list "*) return 0 ;; esac; git -C "$FL_REPO" "$@"; }' history-unverified "no commit lies"
+hist_stub "git log --raw fails for the history" "$S_HG" 'gfn() { case " $* " in *" log "*"--raw"*) return 3 ;; esac; git -C "$FL_REPO" "$@"; }' history-unverified "git log --raw"
+hist_stub "git log --raw answers success with NO records (the history's files were not read)" "$S_HG" 'gfn() { case " $* " in *" log "*"--raw"*) return 0 ;; esac; git -C "$FL_REPO" "$@"; }' history-unverified "cannot be classified"
+hist_stub "git log -p answers success with NO text (the history was not read ≠ history clean)" "$S_HG" 'gfn() { case " $* " in *" log "*" -p "*) return 0 ;; esac; git -C "$FL_REPO" "$@"; }' scan-failed "nothing was read"
+hist_stub "git log -p FAILS" "$S_HG" 'gfn() { case " $* " in *" log "*" -p "*) return 9 ;; esac; git -C "$FL_REPO" "$@"; }' scan-failed "git failed to produce the history text"
+# (h2) the same class, other shapes of "in an intermediate commit and gone from the tip": a BINARY file (nothing the scanner can read), a SYMLINK (what it
+# points at is not in the diff). The net diff of either shows nothing of them; the history does, and a doubt is the normal gate.
+S_HB=$(mkseq h-bin 'docs/bin.md=a\0b\n' -- '-docs/bin.md' 'docs/okb.md=x\n')
+decide "$S_HB" "";  chk_code "a binary file added in commit 1 and removed in commit 2 (net diff: one clean doc) cannot be scanned → not fast" normal scan-failed "binary"
+git -C "$REPO" checkout -q -b h-link main; ln -s ../app/main.py "$REPO/docs/lnk.md"; git -C "$REPO" add docs/lnk.md; git -C "$REPO" commit -q -m 'link'
+git -C "$REPO" rm -q docs/lnk.md; printf 'x\n' > "$REPO/docs/okl.md"; git -C "$REPO" add docs/okl.md; git -C "$REPO" commit -q -m 'unlink'
+S_HL=$(git -C "$REPO" rev-parse HEAD); git -C "$REPO" checkout -q main
+decide "$S_HL" "";  chk_code "a symlink added in commit 1 and removed in commit 2 is not vouched for (history-unverified)" normal history-unverified "symlink"
+# (i) merge commits: a clean one (the gate's own "merge main into the branch" fallback) adds nothing; one with a conflict resolution carries content nobody scanned
+REPO_H="$REPO"; REPO="$T/repo2"
+decide "$FA_MG" "";  chk_code "a branch with a CLEAN merge of main in it (the gate's ga-qukyp fallback shape; \`git show --cc\` is empty) is still fast" fast fast
+git -C "$REPO" checkout -q -b cf-main "$M0_R2"; printf 'l1\nl2\nl3\nl4\nMAIN-SIDE\nl6\nl7\nl8\n' > "$REPO/docs/a.md"; git -C "$REPO" commit -q -am 'cf main side'
+git -C "$REPO" checkout -q -b cf-br "$M0_R2";   printf 'l1\nl2\nl3\nl4\nBRANCH-SIDE\nl6\nl7\nl8\n' > "$REPO/docs/a.md"; git -C "$REPO" commit -q -am 'cf branch side'
+git -C "$REPO" merge -q --no-edit cf-main >/dev/null 2>&1 || true
+printf 'l1\nl2\nl3\nl4\nRESOLVED-BY-HAND\nl6\nl7\nl8\n' > "$REPO/docs/a.md"; git -C "$REPO" add docs/a.md; git -C "$REPO" commit -q -m 'merge cf-main (resolved by hand)'
+CF_MG=$(git -C "$REPO" rev-parse HEAD); git -C "$REPO" checkout -q main
+[ "$(git -C "$REPO" rev-list --parents -n1 "$CF_MG" | wc -w | tr -d ' ')" = "3" ] && ok "premise: the conflict-resolution branch tip is a merge commit (two parents)" || bad "premise broken: cf-mg is not a merge"
+FL_BASE=cf-main decide "$CF_MG" "";  chk_code "a merge commit that carries its own conflict resolution stays in the gate (content nobody scanned)" normal history-unverified "conflict resolution"
+REPO="$REPO_H"
+# (j) one more producer/consumer check: the two new codes go through the REAL record and the REAL tally into the bucket their code names
+e2e_case "a code file added then removed (history)"           history-code       "$S_H2"  ""
+e2e_case "more commits than the cap"                           history-unverified "$S_H5"  "" GATE_FASTLANE_COMMIT_MAX=2
+e2e_case "a CPF added then removed (history scan)"            scan-findings      "$S_H1"  ""
+e2e_case "a docs-only branch named with ção/ões (was: scan-findings)" fast       "$S_H6"  ""
+
+# ── 4h'. confirm(): the same property at the push — what lands is what was decided, history included ────────────────────────────────────────────
+echo "── 4h'. gate_fastlane_confirm on a multi-commit branch ──"
+REPO_H="$REPO"; REPO="$T/repo2"
+MC=$(mkseq_on "$M0_R2" mc 'docs/m1.md=one\n' -- 'docs/m2.md=two\n')                         # the branch the lane decides on: two doc commits
+MC_UNDO=$(mkseq_on "$MC" mc-undo 'app/y.py=print(3)\n' -- '-app/y.py')                      # …then a commit adds code and the next removes it: the TIP is identical to MC's
+MC_CPF=$(mkseq_on "$MC" mc-cpf 'docs/m3.md=cpf 529.982.247-25\n' -- '-docs/m3.md')           # …or a CPF is pasted and removed
+git -C "$REPO" checkout -q -b mc-rb "$MC" && git -C "$REPO" rebase -q main && MC_RB=$(git -C "$REPO" rev-parse HEAD) && git -C "$REPO" checkout -q main
+[ "$(git -C "$REPO" diff main...mc-undo --stat | tail -1)" = "$(git -C "$REPO" diff main...mc --stat | tail -1)" ] && ok "premise: mc-undo has the SAME tip diff as mc (the extra commits cancel out)" || bad "premise broken: mc-undo's tip differs from mc's"
+[ -n "${MC_RB:-}" ] && [ "$MC_RB" != "$MC" ] && ok "premise: mc was rebased onto the moved main (new shas, same commits)" || bad "premise broken: mc-rb"
+dconf "$MC" main "$MC";          conf_check "two doc commits, tip did not move (the common case)" 0 ""
+[ "$C_L0" = "fast" ] && [ "$C_DIG0" = "set" ] && ok "premise: the decision on the two-commit docs branch is fast and records the fingerprint of tip AND history" || bad "premise: decide → lane=$C_L0 digest=$C_DIG0 ($C_WHY)"
+dconf "$MC" "$MAIN2" "$MC_RB";   conf_check "…a pure REBASE of the two commits onto the moved main (every sha new) is the same change" 0 ""
+dconf "$MC" main "$MC_UNDO";     conf_check "the same TIP, but two more commits on the way (code added, then removed) — the history differs" 1 diff-changed
+dconf "$MC" main "$MC_CPF";      conf_check "the same TIP, but a CPF pasted and removed in two more commits" 1 diff-changed
+case "$C_WHY" in *529.982*|*52998224725*) bad "the revocation reason published the CPF: $C_WHY" ;; *) ok "…and the revocation reason never carries the value" ;; esac
+# the history check at the push is asked directly too, not only inferred from the fingerprint: take away the digest comparison and the
+# history classification alone must still refuse (mutant lib: the confirm's digest test never fires)
+sed 's/^  if \[ "\$GATE_FL_DIFF_DIGEST" != "\$decided" \]; then$/  if false; then/' "$LIB" > "$T/mut-nodigest.lib.sh"; cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-nodigest.lib.sh"; then bad "mutation (no digest compare) did not change the lib (sed pattern drifted)"; else
+  FL_LIB_OVERRIDE="$T/mut-nodigest.lib.sh" dconf "$MC" main "$MC_UNDO"
+  [ "$C_RC" = "1" ] && [ "$C_CODE" = "no-longer-fast" ] && ok "without the fingerprint test, the push-time history classification ALONE still refuses the code-then-removed branch (no-longer-fast)" || bad "history classification at the push is not independent of the digest: rc=$C_RC code=$C_CODE ($C_WHY)"
+fi
+REPO="$REPO_H"
+
+# ── 4h''. the scanner on a `git log -p` stream (hand-built, so each shape is pinned) ───────────────────────────────────────────────────────────
+echo "── 4h''. scanner: git log -p streams ──"
+SHA1=1111111111111111111111111111111111111111; SHA2=2222222222222222222222222222222222222222
+LOGHDR() { printf 'commit %s\nAuthor: t <t@example.invalid>\nDate:   Sun Oct 11 07:08:02 2026 -0300\n\n' "$1"; }
+FILEHDR='diff --git a/docs/x.md b/docs/x.md\n--- a/docs/x.md\n+++ b/docs/x.md\n'
+log_case() { # name want_rc <stdin: the stream>
+  local rc=0; SCAN_OUT=$(python3 "$SCAN" 2>&1) || rc=$?
+  if [ "$rc" = "$2" ]; then ok "log stream: $1 → rc=$2"; else bad "log stream: $1 → rc=$rc, want $2 ($SCAN_OUT)"; fi
+}
+log_case "a clean commit (the Date: line's digits are not content)" 0 < <({ LOGHDR $SHA1; printf '    docs: explain\n\n'; printf "${FILEHDR}@@ -0,0 +1 @@\n+prose only\n"; })
+log_case "a CPF in the message" 1 < <({ LOGHDR $SHA1; printf '    cliente 529.982.247-25 ligou\n\n'; printf "${FILEHDR}@@ -0,0 +1 @@\n+prose only\n"; })
+[ "$SCAN_OUT" = "$(printf 'numero-longo\t111111111:commit-message\t1')" ] && ok "…named <sha9>:commit-message, line 1, no value" || bad "message finding wrong: $(printf '%s' "$SCAN_OUT" | cat -vte)"
+log_case "a phone wrapped across two message lines" 1 < <({ LOGHDR $SHA1; printf '    ligar (31) 99999-\n    8888 amanha\n'; })
+[ "$SCAN_OUT" = "$(printf 'numero-longo\t111111111:commit-message\t1')" ] && ok "…reported on the line it starts on (1), once" || bad "wrapped message finding wrong: $SCAN_OUT"
+log_case "two short numbers around an EMPTY message line (four spaces) are not one number" 0 < <({ LOGHDR $SHA1; printf '    item 31 9999\n    \n    item 8888 fim\n'; })
+log_case "a secret in the message" 1 < <({ LOGHDR $SHA1; printf '    key AKIAIOSFODNN7EXAMPLE\n'; })
+log_case "a message line shaped like a diff header is message text, never a header" 0 < <({ LOGHDR $SHA1; printf '    diff --git a/x b/x\n    +++ b/x\n    @@ -1 +1 @@\n\n'; printf "${FILEHDR}@@ -0,0 +1 @@\n+prose only\n"; })
+log_case "…and a secret on such a line is still found" 1 < <({ LOGHDR $SHA1; printf '    +++ b/x AKIAIOSFODNN7EXAMPLE\n'; })
+log_case "a finding in the SECOND commit's file carries the second sha" 1 < <({ LOGHDR $SHA1; printf '    one\n\n'; printf "${FILEHDR}@@ -0,0 +1 @@\n+ok\n\n"; LOGHDR $SHA2; printf '    two\n\n'; printf "${FILEHDR}@@ -0,0 +1 @@\n+key AKIAIOSFODNN7EXAMPLE\n"; })
+[ "$SCAN_OUT" = "$(printf 'aws-key\t222222222:docs/x.md\t1')" ] && ok "…222222222:docs/x.md:1" || bad "second-commit finding wrong: $SCAN_OUT"
+log_case "an empty commit (header + message, no diff) followed by a real one" 0 < <({ LOGHDR $SHA1; printf '    empty\n\n'; LOGHDR $SHA2; printf '    real\n\n'; printf "${FILEHDR}@@ -0,0 +1 @@\n+prose\n"; })
+log_case "a trailing 'No newline' marker after a commit's last hunk still understood" 0 < <({ LOGHDR $SHA1; printf '    m\n\n'; printf "${FILEHDR}@@ -0,0 +1 @@\n+prose\n\\\\ No newline at end of file\n"; })
+log_case "a commit with a path holding a space (git's TAB on the +++ line) keeps its 3-field finding" 1 < <({ LOGHDR $SHA1; printf '    m\n\n'; printf 'diff --git a/docs/a b.md b/docs/a b.md\nnew file mode 100644\nindex 0000000..e69de29\n--- /dev/null\n+++ b/docs/a b.md\t\n@@ -0,0 +1 @@\n+chave AKIAIOSFODNN7EXAMPLE\n'; })
+[ "$SCAN_OUT" = "$(printf 'aws-key\t111111111:docs/a b.md\t1')" ] && ok "…111111111:docs/a b.md:1, 3 fields" || bad "spaced path in a log stream: $(printf '%s' "$SCAN_OUT" | cat -vte)"
+# the shapes that are NOT git log --pretty=medium are refused, never read as clean
+log_case "a decorated commit line (git log --decorate)" 2 < <(printf 'commit %s (HEAD -> main)\nAuthor: t <t@x>\nDate:   Sun Oct 11 07:08:02 2026 -0300\n\n    m\n' $SHA1)
+log_case "a 'Merge:' header (a merge commit must not reach the scan: the caller passes --no-merges)" 2 < <(printf 'commit %s\nMerge: aaaaaaa bbbbbbb\nAuthor: t <t@x>\nDate:   x\n\n    m\n' $SHA1)
+log_case "a header line that is neither Author nor Date" 2 < <(printf 'commit %s\nCommit: t\nDate:   x\n\n    m\n' $SHA1)
+log_case "a commit header that ends the input (truncated stream)" 2 < <(printf 'commit %s\nAuthor: t <t@x>\n' $SHA1)
+log_case "an unindented line inside a message that is not a diff or commit line" 2 < <({ LOGHDR $SHA1; printf '    m\nGARBAGE\n'; })
+log_case "a 'commit' line that is not a full sha" 2 < <(printf 'commit abc123\nAuthor: t\n\n    m\n')
+log_case "a stray 'commit <sha>' line in a plain diff (no header after it)" 2 < <(printf "commit %s\n${FILEHDR}@@ -0,0 +1 @@\n+x\n" $SHA1)
+log_case "a plain diff with no commit lines is read exactly as before" 0 < <(printf "${FILEHDR}@@ -0,0 +1 @@\n+prose\n")
+log_case "a blank line at the top level of a PLAIN diff is still refused (only a log stream has them)" 2 < <(printf "${FILEHDR}@@ -0,0 +1 @@\n+prose\n\n")
+# git's C-quoting (core.quotepath on, the default): the escapes are not the name (gate round ga-aa8n6z, blocking issue 2)
+QN='diff --git "a/docs/migra\\303\\247\\303\\243o.md" "b/docs/migra\\303\\247\\303\\243o.md"\nnew file mode 100644\nindex 0000000..e69de29\n--- /dev/null\n+++ "b/docs/migra\\303\\247\\303\\243o.md"\n@@ -0,0 +1 @@\n+so prosa\n'
+raw_scan "a git-quoted name with two adjacent non-ASCII letters (octal escapes only) is NOT a long number" 0 < <(printf "$QN")
+raw_scan "…a quoted name whose accented letters sit inside a real CPF is still a finding" 1 < <(printf 'diff --git "a/docs/relat\\303\\263rio-52998224725.md" "b/docs/relat\\303\\263rio-52998224725.md"\nnew file mode 100644\nindex 0000000..e69de29\n')
+case "$SCAN_OUT" in *52998224725*) bad "the quoted-name finding published the CPF: $SCAN_OUT" ;; *) ok "…and still withholds the name" ;; esac
+raw_scan "an octal escape beyond 255 is not something git writes: cannot read it, rc=2" 2 < <(printf 'diff --git "a/docs/x\\777.md" "b/docs/x\\777.md"\nnew file mode 100644\nindex 0000000..e69de29\n')
+
 
 # ── 5. the dispatcher's live blocks, under bash 3.2 + set -euo pipefail ───────────────────────────────────────
 echo "── 5. dispatcher wiring (extracted, executed under $B32 + set -euo pipefail) ──"
@@ -1280,7 +1465,7 @@ M8M=$( export GATE_FASTLANE_ENABLED=0; decide "$(head_of s-docs)" ""; printf '%s
 eval "$FL_ENV_DEF"
 [ "$M8M" = "normal" ] && ok "an fl_env that does not pin WOULD let the caller's GATE_FASTLANE_ENABLED=0 through (lane=normal) — the pin is what keeps the cases hermetic" || bad "mutant fl_env without the pin still read lane='$M8M' — §5f is not load-bearing"
 # 8n. a lib without the "no diff text = nothing read" guard (gate round 3, low finding) must turn §4e' red: the unread diff would be granted fast
-sed '/^  \[ -s "\$tmp" \] || { GATE_FL_SCAN_OUT=/d' "$LIB" > "$T/mut-nonull.lib.sh"
+sed '/^  \[ -s "\$tmp" \] || { GATE_FL_R_OUT=/d' "$LIB" > "$T/mut-nonull.lib.sh"
 cp "$SCAN" "$T/"
 if cmp -s "$LIB" "$T/mut-nonull.lib.sh"; then bad "mutation 8n did not change the lib (sed pattern drifted)"; else
   M8N=$(null_scan "$(head_of s-docs)" "$T/mut-nonull.lib.sh")
@@ -1298,6 +1483,38 @@ if cmp -s "$LIB" "$T/mut-noshape.lib.sh" || ! "$B32" -n "$T/mut-noshape.lib.sh" 
   mkdir -p "$T/mut-noshape"; cp "$T/mut-noshape.lib.sh" "$T/mut-noshape/gate-fastlane.lib.sh"; cp "$T/scanlib-import-raise/gate-fastlane-scan.py" "$T/mut-noshape/"
   FL_LIB_OVERRIDE="$T/mut-noshape/gate-fastlane.lib.sh" decide "$S_D" ""
   [ "$D_CODE" = "scan-findings" ] && ok "without the shape check a scanner that crashed at import WOULD be booked as scan-findings ('found personal data') — the shape check is what tells a crash from a finding" || bad "mutant lib without the shape check still read code '$D_CODE' — §4g (e) is not load-bearing"
+fi
+# 8t. a lib whose scan lacks the HISTORY pass (the shape of the lib the gate rejected in round ga-aa8n6z) grants the reproduction fast
+sed 's/^  _gate_fastlane_scan_range "\$git_fn" history "\$base..\$head"$/  GATE_FL_R_RC=0; GATE_FL_R_OUT=""; GATE_FL_R_DIGEST="skipped"/' "$LIB" > "$T/mut-nohist-scan.lib.sh"; cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-nohist-scan.lib.sh"; then bad "mutation 8t did not change the lib (sed pattern drifted)"; else
+  FL_LIB_OVERRIDE="$T/mut-nohist-scan.lib.sh" decide "$S_H1" ""
+  [ "$D_LANE" = "fast" ] && ok "without the history pass, a CPF added in one commit and removed in the next WOULD be granted fast — the pass is what holds it" || bad "mutant without the history scan still read $D_LANE ($D_CODE) — §4h (a) is not load-bearing"
+fi
+# 8u. a lib that never asks about the commits' FILES lets production code through when a later commit removes it
+sed 's/^  gate_fastlane_history "\$git_fn" "\$base_sha" "\$head_sha"$/  GATE_FL_HIST_STATE=ok; GATE_FL_HIST_N=1; GATE_FL_HIST_WHY=x; GATE_FL_HIST_BLOCKERS=""/' "$LIB" > "$T/mut-nohist-class.lib.sh"; cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-nohist-class.lib.sh"; then bad "mutation 8u did not change the lib (sed pattern drifted)"; else
+  FL_LIB_OVERRIDE="$T/mut-nohist-class.lib.sh" decide "$S_H2" ""
+  [ "$D_LANE" = "fast" ] && ok "without the history classification, a .py added and removed again WOULD be granted fast — the check is what holds it" || bad "mutant without the history classification still read $D_LANE ($D_CODE) — §4h (b) is not load-bearing"
+fi
+# 8v. a lib without the NET pass misses a number whose halves two different commits added side by side
+sed 's/^  _gate_fastlane_scan_range "\$git_fn" net "\$base...\$head"$/  GATE_FL_R_RC=0; GATE_FL_R_OUT=""; GATE_FL_R_DIGEST="skipped"/' "$LIB" > "$T/mut-nonet-scan.lib.sh"; cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-nonet-scan.lib.sh"; then bad "mutation 8v did not change the lib (sed pattern drifted)"; else
+  FL_LIB_OVERRIDE="$T/mut-nonet-scan.lib.sh" decide "$S_H4" ""
+  [ "$D_LANE" = "fast" ] && ok "without the net pass, a phone split over two commits' adjacent lines WOULD be granted fast — the net pass is not redundant with the history pass" || bad "mutant without the net scan still read $D_LANE ($D_CODE) — §4h (d) is not load-bearing"
+fi
+# 8w. a scanner that does not read commit MESSAGES lets a phone in a message through
+mkdir -p "$T/mut-nomsg"; cp "$LIB" "$T/mut-nomsg/gate-fastlane.lib.sh"
+sed -e 's/for label in scan_text(text, numbers=False):/for label in []:/' -e 's/msg_run.append((msg_no, text))/pass/' "$SCAN" > "$T/mut-nomsg/gate-fastlane-scan.py"
+if cmp -s "$SCAN" "$T/mut-nomsg/gate-fastlane-scan.py" || ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$T/mut-nomsg/gate-fastlane-scan.py" 2>/dev/null; then bad "mutation 8w did not produce a valid, different scanner (sed pattern drifted)"; else
+  FL_LIB_OVERRIDE="$T/mut-nomsg/gate-fastlane.lib.sh" decide "$S_H3" ""
+  [ "$D_LANE" = "fast" ] && ok "a scanner that skips commit messages WOULD let a phone number in a message be granted fast — reading the messages is what holds it" || bad "mutant scanner that skips messages still read $D_LANE ($D_CODE) — §4h (c) is not load-bearing"
+fi
+# 8x. a scanner that reads git's escape text as the name reads `ção` + `ões` as twelve digits
+sed 's/scan_text(_plain_name(text))/scan_text(text)/' "$SCAN" > "$T/mut-noplain.py"
+if cmp -s "$SCAN" "$T/mut-noplain.py" || ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$T/mut-noplain.py" 2>/dev/null; then bad "mutation 8x did not produce a valid, different scanner (sed pattern drifted)"; else
+  real=0; printf "$QN" | python3 "$SCAN" >/dev/null 2>&1 || real=$?
+  mut=0;  printf "$QN" | python3 "$T/mut-noplain.py" >/dev/null 2>&1 || mut=$?
+  if [ "$real" = "0" ] && [ "$mut" = "1" ]; then ok "a scanner that reads the escape text as the name flags 'migração' as a long number (rc=1) — decoding the escapes is what clears it (rc=0)"; else bad "mutant 8x: real rc=$real, mutant rc=$mut — the quoted-name assertion is not load-bearing"; fi
 fi
 # 8o-8q. the SCANNER's single rule is load-bearing (gate round 4): a scanner that backs off any one of its three decisions must read the reviewer's formats as clean
 mut_scan() { # name sed-expr diff-printf-format want-mutant-rc — runs the real rule's diff through a scanner mutated by the sed expression

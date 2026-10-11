@@ -3,9 +3,19 @@
 
 The fast lane merges a docs/tests-only diff WITHOUT an LLM reviewer. What the reviewer would have caught in
 such a diff is a person's data or a credential pasted into a document, so this scans exactly that, on the
-ADDED lines only (a line the diff does not add cannot be what this branch publishes).
+ADDED lines only.
 
-    git diff -U0 --no-color --no-renames <base>...<head> | gate-fastlane-scan.py [--max-bytes N]
+Two inputs, both a unified diff with -U0, and the caller feeds BOTH because the merge publishes more than one view of the
+same branch (ga-atsahv, gate round ga-aa8n6z: the scan read the NET diff, the fast-forward publishes EVERY commit, so a
+value pasted in one commit and removed in the next sat in main's history unseen):
+
+    git diff -U0 --no-color --no-renames <base>...<head>                      | gate-fastlane-scan.py   # what the tip adds
+    git log -p -U0 --no-merges --pretty=medium ... <base>..<head>              | gate-fastlane-scan.py   # what each commit adds
+
+The second is `git log -p` text: a `commit <sha>` line, the Author/Date header, the message (indented four spaces), then that
+commit's diff. The MESSAGES are published too, so they are scanned by the same rules (a run of adjacent message lines is one
+text, like a run of added lines); the Author/Date header is not content and is skipped. A finding in a commit's file or message
+is reported as `<first 9 of the sha>:<path>` / `<sha9>:commit-message`, so the author knows which commit to look at.
 
 stdout: one finding per line, `LABEL<TAB>path<TAB>line` — NEVER the matched text. The caller writes this into
 bead comments and the dispatcher log; echoing the value would publish the very secret the scan exists to stop.
@@ -37,7 +47,9 @@ a token into a document, not proof that a document is clean.
     * a password that is letters-only or digits-only, or whose symbols end the value run (`Hunter2!Hunter2!Hunter2!`)
     * a number a LETTER interrupts (`31x99999x8888`) or one written in words
     * a number wrapped across lines that are not adjacent in the new file (separate hunks, or an unchanged line
-      between them) — only a run of consecutive ADDED lines is joined
+      between them) — only a run of consecutive ADDED lines is joined (the net-diff pass joins lines that two different
+      commits added next to each other; the per-commit pass does not, and does not need to)
+    * the author name / e-mail of a commit (identity, not pasted content)
     * a secret in a shape _SECRET_SHAPES does not list
 The patterns are defined here, once. (The story cites "the same patterns as publicar-estudo"; no copy of that
 skill is reachable from the gate, so this is an independent set — keep it as the single place to unify them.)
@@ -105,25 +117,60 @@ def scan_text(text: str, numbers: bool = True):
 
 
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?")
+# `git log` (medium): `commit <full sha>` (40 hex, or 64 for sha-256); the caller passes --no-decorate, so nothing follows the sha
+_COMMIT = re.compile(r"commit ([0-9a-f]{40}(?:[0-9a-f]{24})?)")
+# git C-quotes a name that holds a non-ASCII byte (core.quotepath on), a control character, a quote or a backslash
+_GIT_ESCAPES = re.compile(r"(?:\\[0-7]{3})+|\\.")
 # the extended-header lines git prints between `diff --git` and the first hunk; none of them adds content
 _FILE_HEADERS = ("index ", "--- ", "new file mode ", "deleted file mode ", "old mode ", "new mode ",
                  "similarity index ", "dissimilarity index ", "rename from ", "rename to ", "copy from ", "copy to ")
 _NO_NEWLINE = "\\ "   # "\ No newline at end of file" (any wording): a content line starts with + - or a space, never "\"
 
 
+def _plain_name(text):
+    """A file name as the text it stands for. git writes `ç` as the escape `\\303\\247` when it quotes a name, and an escape is
+    not the name: its digits are not in the file. Read as written, two adjacent non-ASCII letters (the Portuguese `ção`, `ões`)
+    are twelve digits and any such name is a 'numero-longo' finding that is not in the name (gate round ga-aa8n6z, blocking
+    issue 2). The caller already asks git for unquoted names; this keeps a quoted one honest too."""
+    def sub(m):
+        s = m.group(0)
+        if s[1] in "01234567":
+            raw = bytes(int(s[i + 1:i + 4], 8) for i in range(0, len(s), 4))   # ValueError (> 255) -> rc 2: git never writes it
+            return raw.decode("utf-8", errors="replace")
+        return {"t": "\t", "n": "\n", "r": "\r", '"': '"', "\\": "\\"}.get(s[1], " ")
+    return _GIT_ESCAPES.sub(sub, text)
+
+
+def _number_findings(run, where):
+    """The long-number rule over one run of ADJACENT lines (consecutive lines of the new file, or of one commit message),
+    joined with a line break — a number wrapped across the break is one number. One finding per line a number starts on."""
+    joined = "\n".join(t for _, t in run)
+    starts, pos = [], 0
+    for _, t in run:
+        starts.append(pos)
+        pos += len(t) + 1
+    seen = set()
+    for m in _LONG_NUMBER.finditer(joined):
+        ln = run[bisect.bisect_right(starts, m.start()) - 1][0]
+        if ln not in seen:
+            seen.add(ln)
+            yield ("numero-longo", where, ln)
+
+
 def scan_diff(lines):
-    """Yield (label, path, lineno) for every ADDED line of a unified diff. `lines` are split on "\\n" ONLY (never
-    str.splitlines(): U+2028, U+0085, form feed... are routine in pasted text and would cut an added line in two,
-    leaving a tail that no longer starts with "+").
+    """Yield (label, path, lineno) for every ADDED line of a unified diff, and for every message line of a `git log -p`
+    stream. `lines` are split on "\\n" ONLY (never str.splitlines(): U+2028, U+0085, form feed... are routine in pasted
+    text and would cut an added line in two, leaving a tail that no longer starts with "+").
 
     Raises ValueError on a diff it cannot trust: a binary file, an added line before any file header, a line that is
-    none of the shapes git emits, a hunk whose lines do not match the counts its `@@` header declares, or a diff
-    that ends inside a hunk. The parser tracks those counts so that what counts as CONTENT is decided by the hunk
-    header, never by what the line looks like — an added line whose text starts with "++ " is a `+++ ` line on
-    the wire, and is still content.
+    none of the shapes git emits, a hunk whose lines do not match the counts its `@@` header declares, a diff
+    that ends inside a hunk, a commit header or message line in a shape `git log --pretty=medium` does not write. The parser
+    tracks those counts so that what counts as CONTENT is decided by the hunk header, never by what the line looks like — an
+    added line whose text starts with "++ " is a `+++ ` line on the wire, and is still content.
 
     A path that itself carries a CPF/phone/credential is never yielded as a path (the caller prints it): it is
-    reported as <redacted-name#N>, N being the file's position in the diff."""
+    reported as <redacted-name#N>, N being the file's position in the diff. In a `git log -p` stream every path (and
+    the word `commit-message`) is prefixed with the first nine characters of its commit's sha."""
     path = None          # the b-side path of the current file (None for /dev/null)
     shown = None         # what a finding may call that file
     nfile = 0
@@ -132,27 +179,17 @@ def scan_diff(lines):
     lineno = 0
     last_was_body = False
     run = []             # (lineno, text) of the added lines seen since the last line that is not an added one
+    commit = None        # first 9 characters of the sha whose section we are in; None for a plain diff (no `commit` line seen)
+    pre = ""             # "<commit>:" in a log stream
+    mode = "diff"        # "header" (between the `commit` line and its blank line) | "message" | "diff"
+    msg_run = []         # (message line no, text) of the adjacent non-blank message lines seen so far
+    msg_no = 0
 
     def name_findings(text):
-        for label in scan_text(text):
+        for label in scan_text(_plain_name(text)):
             if label not in name_seen:
                 name_seen.add(label)
-                yield (label, f"<redacted-name#{nfile}>", 0)
-
-    def number_findings():
-        """The long-number rule over one run of ADJACENT added lines (consecutive lines of the new file), joined with
-        a line break — a number wrapped across the break is one number. One finding per line a number starts on."""
-        joined = "\n".join(t for _, t in run)
-        starts, pos = [], 0
-        for _, t in run:
-            starts.append(pos)
-            pos += len(t) + 1
-        seen = set()
-        for m in _LONG_NUMBER.finditer(joined):
-            ln = run[bisect.bisect_right(starts, m.start()) - 1][0]
-            if ln not in seen:
-                seen.add(ln)
-                yield ("numero-longo", shown, ln)
+                yield (label, f"{pre}<redacted-name#{nfile}>", 0)
 
     for line in lines:
         in_hunk = old_left > 0 or new_left > 0
@@ -168,7 +205,7 @@ def scan_diff(lines):
                 lineno += 1
             else:
                 if run:   # the run of adjacent added lines ends here
-                    yield from number_findings()
+                    yield from _number_findings(run, shown)
                     run = []
                 if c == "-":
                     if old_left <= 0:
@@ -186,7 +223,7 @@ def scan_diff(lines):
                     raise ValueError("unrecognized line inside a hunk — cannot be classified")
             last_was_body = c in ("+", "-", " ")
             if run and old_left <= 0 and new_left <= 0:   # the hunk's last line was an added one
-                yield from number_findings()
+                yield from _number_findings(run, shown)
                 run = []
             continue
 
@@ -194,6 +231,45 @@ def scan_diff(lines):
             last_was_body = False
             continue
         last_was_body = False
+
+        if mode == "header":
+            # `git log --pretty=medium`: `Author: ...` and `Date:   ...` (identity and a timestamp, not pasted content — the
+            # timestamp would trip the number rule on every commit), then ONE blank line, then the message
+            if line == "":
+                mode = "message"
+                msg_no = 0
+                continue
+            if line.startswith(("Author: ", "Date:   ")):
+                continue
+            raise ValueError("unrecognized line in a commit header — cannot be classified")
+        if mode == "message":
+            # every message line is indented four spaces, an empty one included; the first line that is not ends the message
+            if line.startswith("    "):
+                msg_no += 1
+                text = line[4:]
+                if text:
+                    for label in scan_text(text, numbers=False):
+                        yield (label, f"{commit}:commit-message", msg_no)
+                    msg_run.append((msg_no, text))
+                elif msg_run:   # an empty message line is not adjacent to what is on either side of it
+                    yield from _number_findings(msg_run, f"{commit}:commit-message")
+                    msg_run = []
+                continue
+            if msg_run:
+                yield from _number_findings(msg_run, f"{commit}:commit-message")
+                msg_run = []
+            mode = "diff"   # …and this very line is read below as what follows the message
+        if commit is not None and line == "":   # git's blank line between a commit's diff and the next `commit` line
+            continue
+
+        m = _COMMIT.fullmatch(line)
+        if m:
+            commit = m.group(1)[:9]
+            pre = f"{commit}:"
+            path = shown = None
+            name_seen = set()
+            mode = "header"
+            continue
         if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
             raise ValueError("binary content in the diff — cannot be scanned")
         if line.startswith("diff --git "):
@@ -213,7 +289,7 @@ def scan_diff(lines):
                 path = shown = None
             else:
                 yield from name_findings(path)
-                shown = f"<redacted-name#{nfile}>" if name_seen else path
+                shown = f"{pre}<redacted-name#{nfile}>" if name_seen else f"{pre}{path}"
             continue
         if line.startswith(_FILE_HEADERS):
             continue
@@ -226,6 +302,10 @@ def scan_diff(lines):
             lineno = int(m.group(3))
             continue
         raise ValueError("unrecognized diff line — cannot be classified")
+    if mode == "message" and msg_run:
+        yield from _number_findings(msg_run, f"{commit}:commit-message")
+    if mode == "header":
+        raise ValueError("input ends inside a commit header — truncated, cannot be scanned in full")
     if old_left > 0 or new_left > 0:
         raise ValueError("diff ends inside a hunk — truncated, cannot be scanned in full")
 
