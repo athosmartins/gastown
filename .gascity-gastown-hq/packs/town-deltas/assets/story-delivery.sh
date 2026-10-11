@@ -697,6 +697,33 @@ runtime_arrival_epoch() {  # runtime_arrival_epoch <runtime_dir> <sha> [<cap>]
   printf '%s' "$arrival"
 }
 
+# ga-8hfols: the converse question — what was the runtime checkout's HEAD WHEN a
+# process started? A daemon that started at epoch T while HEAD was H runs code at or
+# after H (the tree only moves forward from there; imports happen after the start),
+# which is a fact about the PROCESS that no diff-based verdict can give. Read from
+# HEAD's reflog, newest first: the first entry stamped STRICTLY before <epoch> is
+# the answer. Strictly, because a pull stamped in the very second the process
+# started may or may not have landed first — the older entry is the weaker claim,
+# never the stronger. Never guesses: prints NOTHING (unknown) when <epoch> is not a
+# number, the runtime is not a git checkout, a timestamp does not parse, the reflog
+# is not in time order (a clock step), the cap is hit, or the reflog ends without an
+# entry old enough (the process predates what the log remembers).
+runtime_head_at_epoch() {  # runtime_head_at_epoch <runtime_dir> <epoch> [<cap>]
+  local rt="$1" at="$2" cap="${3:-2000}" n=0 prev="" ent when
+  [ -n "$rt" ] && [[ "$at" =~ ^[0-9]+$ ]] || return 0
+  while IFS=' ' read -r ent when; do
+    [ -n "$ent" ] || continue
+    n=$((n + 1))
+    [ "$n" -le "$cap" ] || return 0
+    when="${when//[^0-9]/}"   # HEAD@{1789875106} -> 1789875106 (no braces: bash 3.2)
+    [ -n "$when" ] || return 0
+    if [ -n "$prev" ] && [ "$when" -gt "$prev" ]; then return 0; fi
+    prev="$when"
+    if [ "$when" -lt "$at" ]; then printf '%s' "$ent"; return 0; fi
+  done < <(git -C "$rt" reflog show --date=unix --format='%H %gd' HEAD 2>/dev/null)
+  return 0
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ga-2kaan2: the dialer VM (jambonz-dialer) runs the voicebot, and Step 4's pull
 # never reaches it — scripts/voicebot_vm_sync.py (rig WA, wa-y0su67) is what
@@ -2713,6 +2740,14 @@ else
   # the whole sweep otherwise. Empty is the safe fallback either way — the
   # write-back block further below simply does nothing without it.
   REFRESH_ALL_LABELS=$(echo "$REFRESH_OUT" | grep '^ALL_LABELS=' | head -1 | sed 's/^ALL_LABELS=//' || true)
+  # ga-8hfols: the process facts the baseline write-back below turns into proof
+  # (daemon-refresh.sh header point 24). Both may be genuinely absent (an older
+  # helper), hence `|| true` for the pipefail reason spelled out above; an absent
+  # line is "no proof" / "no cosmetic evidence" — never an empty-but-confirmed one,
+  # which is why the cosmetic line's PRESENCE is recorded separately from its value.
+  REFRESH_LSTART=$(echo "$REFRESH_OUT" | grep '^LSTART_EPOCHS=' | head -1 | sed 's/^LSTART_EPOCHS=//' || true)
+  REFRESH_LOCKED_COSMETIC_LINE=$(echo "$REFRESH_OUT" | grep '^GUARDED_LOCKED_COSMETIC=' | head -1 || true)
+  REFRESH_LOCKED_COSMETIC=$(echo "$REFRESH_LOCKED_COSMETIC_LINE" | sed 's/^GUARDED_LOCKED_COSMETIC=//')
   # ga-vmq1i: PROOF disambiguates a positive restart+fresh confirmation from a
   # VERDICT=OK/SKIPPED that never actually confirmed anything live — fail
   # closed to not_verified if the helper's output predates this field or is
@@ -2774,6 +2809,12 @@ else
   PD_RECORDED=" "
   PD_WROTE=0
   PD_STUCK=" "
+  # ga-8hfols: PD_PROVEN = " <label>:<sha> ..." — the daemons whose live process is
+  # PROVEN, by its start time against the checkout's reflog, to run code at or after
+  # <sha>. PERDAEMON_NEW is read again below by the rig-wide advance, on paths where
+  # the block that builds it was skipped, so both start defined (set -u).
+  PD_PROVEN=" "
+  PERDAEMON_NEW=""
   for pd_label in $REFRESH_GUARDED $REFRESH_FRESHFAIL; do
     case "$PD_STUCK" in *" $pd_label "*) ;; *) PD_STUCK="${PD_STUCK}${pd_label} " ;; esac
   done
@@ -2905,11 +2946,167 @@ else
       esac
       PERDAEMON_NEW="${PERDAEMON_NEW}${pd_label} ${POST_DEPLOY_SHA}"$'\n'
     done
+    # ga-8hfols — the PROCESS proof path. Everything above decides from the DIFF
+    # (which commits touch a daemon's closure, did the verdict come back OK); none
+    # of it can see that a daemon was restarted. After the 10/10 reboot every WA
+    # daemon had lstart 23:41:51, yet 53 labels stayed 'stuck' for days and the rig
+    # marker stayed on e078b5686 (09/10): the reboot proved nothing to a baseline that
+    # only moves on verdicts. The helper reports each questioned daemon's start epoch
+    # (LSTART_EPOCHS); the checkout's reflog says what HEAD was at that second; a
+    # process that started while HEAD was H runs code at or after H. That is
+    # independent of the verdict, and it applies to a reboot, a Mayor kickstart and a
+    # crew restart alike — all that matters is when the process began.
+    #
+    # Three states, and only the first moves anything: PROVEN (a start epoch, a
+    # reflog entry strictly before it, and that commit a real ancestor of
+    # POST_DEPLOY_SHA); NOT PROVEN (the daemon started before what the reflog
+    # remembers, or is simply older than the entry); UNKNOWN (no start epoch — no
+    # live pid, ps/date unreadable, an older helper — no reflog, git failing, a
+    # clock step in the log). The last two leave the entry exactly as it was: "could
+    # not read it" is never "fresh". The helper omits a daemon it could not read, so
+    # an absent label here IS the unknown state.
+    if [ -n "${REFRESH_LSTART// /}" ] && type runtime_head_at_epoch >/dev/null 2>&1; then
+      PD_HEAD_MEMO=" "
+      for pd_pair in $REFRESH_LSTART; do
+        pd_label="${pd_pair%%=*}"; pd_ep="${pd_pair#*=}"
+        [ -n "$pd_label" ] && [[ "$pd_ep" =~ ^[0-9]+$ ]] || continue
+        case "$PD_HEAD_MEMO" in
+          *" $pd_ep:"*) pd_h="${PD_HEAD_MEMO##* $pd_ep:}"; pd_h="${pd_h%% *}" ;;
+          *)
+            pd_h="$(runtime_head_at_epoch "$RUNTIME_DIR" "$pd_ep" || true)"
+            # a reflog entry that is not a commit reachable from POST_DEPLOY_SHA
+            # (a reset, another branch, a pruned object) proves nothing about this window
+            if [ -z "$pd_h" ] || [ "$(pd_commit_state "$pd_h")" != "ok" ]; then pd_h="-"; fi
+            PD_HEAD_MEMO="${PD_HEAD_MEMO}${pd_ep}:${pd_h} "
+            ;;
+        esac
+        [ "$pd_h" = "-" ] || PD_PROVEN="${PD_PROVEN}${pd_label}:${pd_h} "
+      done
+    fi
+    if [ "$PD_PROVEN" != " " ]; then
+      PD_NEW_PROVED=""
+      PD_ADVANCED=""
+      while IFS=' ' read -r pd_label pd_sha pd_flag; do
+        [ -n "$pd_label" ] || continue
+        pd_h=""
+        case "$PD_PROVEN" in *" $pd_label:"*) pd_h="${PD_PROVEN##* $pd_label:}"; pd_h="${pd_h%% *}" ;; esac
+        # only a recorded 'stuck' entry the proof is NEWER than moves: an unflagged
+        # entry is already resolved as of POST_DEPLOY_SHA, and a proof that is not
+        # strictly after the entry (equal, older, git unable to say) adds nothing —
+        # monotone, so a proof can never pull a baseline back.
+        if [ "$pd_flag" = "stuck" ] && [ -n "$pd_h" ] && [ "$pd_h" != "$pd_sha" ] \
+           && [ "$(pd_commit_state "$pd_sha")" = "ok" ] \
+           && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$pd_sha" "$pd_h" >/dev/null 2>&1; then
+          # The flag survives in two cases, because it is what keeps a label visible
+          # (ga-n2jnsa re-examines every 'stuck' entry) once the rig marker moves past
+          # the entry: (1) the label is GUARDED/FRESH_FAIL this very cycle — it is
+          # still stale for something after H, and an unflagged entry would let a
+          # later marker advance (the unattributed release) drop it unseen; (2) H
+          # starts BEFORE this cycle's wide window, so the stretch H..PRE was looked
+          # at by nobody and "not flagged" would mean "not looked at". Otherwise the
+          # process proof plus this cycle's examination cover everything: flag off.
+          pd_flag_out="stuck"
+          case "$PD_STUCK" in
+            *" $pd_label "*) ;;
+            *)
+              if [ -n "$DAEMON_REFRESH_PRE_SHA" ] \
+                 && git -C "$RUNTIME_DIR" merge-base --is-ancestor "$DAEMON_REFRESH_PRE_SHA" "$pd_h" >/dev/null 2>&1; then
+                pd_flag_out=""
+              fi
+              ;;
+          esac
+          PD_NEW_PROVED="${PD_NEW_PROVED}${pd_label} ${pd_h}${pd_flag_out:+ $pd_flag_out}"$'\n'
+          PD_ADVANCED="${PD_ADVANCED}${pd_label}(${pd_sha:0:9}->${pd_h:0:9}${pd_flag_out:+,stuck}) "
+        else
+          PD_NEW_PROVED="${PD_NEW_PROVED}${pd_label}${pd_sha:+ $pd_sha}${pd_flag:+ $pd_flag}"$'\n'
+        fi
+      done <<< "$PERDAEMON_NEW"
+      PERDAEMON_NEW="$PD_NEW_PROVED"
+      [ -z "$PD_ADVANCED" ] || log "Daemon refresh: per-daemon baseline advanced by process proof (start time vs. checkout reflog, ga-8hfols): ${PD_ADVANCED% }"
+    fi
     if printf '%s' "$PERDAEMON_NEW" > "$DAEMON_REFRESH_PERDAEMON_FILE" 2>/dev/null; then
       PD_WROTE=1
     else
       warn "could not persist per-daemon baseline for rig $RIG at $DAEMON_REFRESH_PERDAEMON_FILE (non-fatal; next sweep falls back to the rig-wide marker for every label)"
     fi
+  fi
+  # ga-8hfols — the rig-wide marker, advanced by PROCESS proof. The OK|SKIPPED arm
+  # below is the only writer that needs no unattributed release, and it never fires
+  # while even one daemon stays guarded: the marker sat on e078b5686 (09/10) through
+  # a reboot that restarted every KeepAlive daemon, because two notify_only_locked
+  # dashboards no automation may ever restart read "older than the merge" by TIME
+  # on every cycle (this is the 7th bead of that class; the six before it all fixed
+  # diff/verdict paths). A non-OK cycle may still move the marker when EVERY label
+  # that is not clean is accounted for by one of two facts:
+  #   proven   — its live process started after HEAD was at some commit H (the
+  #              per-daemon proof above). The marker may then go as far as H and
+  #              no further: past H its closure is still unexamined for that label.
+  #   locked-cosmetic — the helper (this very cycle, positive membership in
+  #              GUARDED_LOCKED_COSMETIC) found it notify_only_locked AND with no
+  #              call-graph path to any symbol this window changed (ga-j3lh6p).
+  #              Evidence, not proof — the same caveat the per-story release carries
+  #              — but it is what stops a daemon nobody may restart from holding the
+  #              rig for ever. It does not constrain how far the marker goes.
+  # The marker goes to the OLDEST proof (or to POST_DEPLOY_SHA when nothing needed a
+  # proof), and only when that is a strict descendant of the marker it replaces —
+  # never sideways, never back. Everything else leaves it alone, and says why:
+  #   unknown — a stuck label with no readable start time, no reflog entry old
+  #             enough, a git failure, or proofs that are not on one line of history.
+  #             "Could not read it" blocks; it never counts as fresh.
+  #   a FRESH_FAIL label (restarted-but-unstable, import smoke failed, never fresh)
+  #   is a failure to investigate, not a staleness to excuse — it blocks too, and so
+  #   does any verdict other than NEEDS_GUARDED_RESTART (VERIFY_FAILED, JOB_NOT_INSTALLED).
+  # A stuck label that is only excused (locked-cosmetic) keeps its frozen 'stuck'
+  # entry, so ga-n2jnsa still re-examines it every cycle — the marker moving does
+  # not make it disappear.
+  RIG_PROOF_WHY=""
+  if [ "$REFRESH_VERDICT" = "NEEDS_GUARDED_RESTART" ] && [ "$DRY_RUN" != "1" ] && [ -n "$POST_DEPLOY_SHA" ]; then
+    if [ -z "${PD_STUCK// /}" ]; then RIG_PROOF_WHY="the helper listed nothing guarded to account for"
+    elif [ -n "${REFRESH_FRESHFAIL// /}" ]; then RIG_PROOF_WHY="FRESH_FAIL [$REFRESH_FRESHFAIL] is a failure to investigate, not a staleness to excuse"
+    elif [ "$PD_WROTE" != "1" ]; then RIG_PROOF_WHY="the per-daemon baseline was not persisted this cycle (${PD_SKIP_WHY:-nothing was written})"
+    elif [ -z "$DAEMON_REFRESH_PRE_SHA" ]; then RIG_PROOF_WHY="the marker being replaced is unknown"
+    else
+      rp_blockers=""; rp_proven=""; rp_excused=""; rp_oldest=""; rp_oldest_by=""; rp_bad_order=0
+      rp_flagged="$(printf '%s\n' "$PERDAEMON_NEW" | awk '$3=="stuck"{printf "%s ", $1}')"
+      rp_seen=" "
+      for rp_label in $PD_STUCK $rp_flagged; do
+        case "$rp_seen" in *" $rp_label "*) continue ;; esac
+        rp_seen="${rp_seen}${rp_label} "
+        rp_h=""
+        case "$PD_PROVEN" in *" $rp_label:"*) rp_h="${PD_PROVEN##* $rp_label:}"; rp_h="${rp_h%% *}" ;; esac
+        if [ -n "$rp_h" ]; then
+          rp_proven="${rp_proven}${rp_label} "
+          if [ -z "$rp_oldest" ]; then rp_oldest="$rp_h"; rp_oldest_by="$rp_label "
+          elif [ "$rp_h" = "$rp_oldest" ]; then rp_oldest_by="${rp_oldest_by}${rp_label} "
+          elif git -C "$RUNTIME_DIR" merge-base --is-ancestor "$rp_h" "$rp_oldest" >/dev/null 2>&1; then rp_oldest="$rp_h"; rp_oldest_by="$rp_label "
+          elif git -C "$RUNTIME_DIR" merge-base --is-ancestor "$rp_oldest" "$rp_h" >/dev/null 2>&1; then :
+          else rp_bad_order=1
+          fi
+        elif [ -n "$REFRESH_LOCKED_COSMETIC_LINE" ] && case " $REFRESH_LOCKED_COSMETIC " in *" $rp_label "*) true ;; *) false ;; esac; then
+          rp_excused="${rp_excused}${rp_label} "
+        else
+          rp_blockers="${rp_blockers}${rp_label} "
+        fi
+      done
+      if [ -n "$rp_blockers" ]; then
+        RIG_PROOF_WHY="[${rp_blockers% }] neither proven by process start time nor locked-cosmetic this cycle (unknown counts as not fresh)"
+      elif [ "$rp_bad_order" = "1" ]; then
+        RIG_PROOF_WHY="the proofs do not lie on one line of history"
+      else
+        rp_target="${rp_oldest:-$POST_DEPLOY_SHA}"
+        if [ "$(pd_commit_state "$rp_target")" != "ok" ]; then
+          RIG_PROOF_WHY="$rp_target is not a commit reachable from $POST_DEPLOY_SHA"
+        elif [ "$rp_target" = "$DAEMON_REFRESH_PRE_SHA" ] \
+             || ! git -C "$RUNTIME_DIR" merge-base --is-ancestor "$DAEMON_REFRESH_PRE_SHA" "$rp_target" >/dev/null 2>&1; then
+          RIG_PROOF_WHY="the oldest proof (${rp_target:0:9}, held by [${rp_oldest_by% }]) is not past the current marker (${DAEMON_REFRESH_PRE_SHA:0:9})"
+        elif printf '%s\n' "$rp_target" > "$DAEMON_REFRESH_BASELINE_FILE" 2>/dev/null; then
+          log "Daemon refresh: rig-wide baseline marker for $RIG advanced ${DAEMON_REFRESH_PRE_SHA:0:9} -> ${rp_target:0:9} by process proof (ga-8hfols). Proven by start time against the checkout reflog: [${rp_proven% }]; locked-cosmetic, not blocking: [${rp_excused% }]. Every other daemon was clean this cycle."
+        else
+          warn "could not persist daemon-refresh baseline for rig $RIG at $DAEMON_REFRESH_BASELINE_FILE (non-fatal; next sweep falls back to its own pre-pull HEAD)"
+        fi
+      fi
+    fi
+    [ -z "$RIG_PROOF_WHY" ] || log "Daemon refresh: rig-wide baseline marker for $RIG NOT advanced by process proof (ga-8hfols): $RIG_PROOF_WHY."
   fi
   case "$REFRESH_VERDICT" in
     OK|SKIPPED)

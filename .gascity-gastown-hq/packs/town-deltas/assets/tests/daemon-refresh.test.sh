@@ -4047,6 +4047,67 @@ field_is_empty GUARDED_OWN "$OUT" && ok "T122 the label is not guarded (restarte
 field_is_empty OWN_TEMPLATE_BY_NAME "$OUT" \
   && ok "T122 OWN_TEMPLATE_BY_NAME is trimmed to the final GUARDED_OWN" || nok "T122 own_template_by_name not trimmed" "[$(field OWN_TEMPLATE_BY_NAME "$OUT")]"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T123-T126 (ga-8hfols, header point 24): LSTART_EPOCHS — the raw start epoch of every
+# daemon whose baseline is in question (GUARDED, FRESH_FAIL, or recorded 'stuck').
+# Three states per label: a number, or the label is left OUT. Never 0, never guessed.
+# ════════════════════════════════════════════════════════════════════════════
+t123_app() {  # the T4 fixture: one sensitive daemon, stale, so it is GUARDED
+  cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+  make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+}
+SENSITIVE_DAEMONS="central-sender"
+new_case t123
+t123_app
+seed_running com.test.central-sender 7001 "$STALE_LSTART"
+OUT=$(run_helper daemons/central_sender.py)
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" \
+  && ok "T123 fixture: the stale sensitive daemon is GUARDED" || nok "T123 fixture" "GUARDED=[$(field GUARDED "$OUT")]"
+[ "$(field LSTART_EPOCHS "$OUT")" = "com.test.central-sender=$(( DEPLOY_EPOCH - 3600 ))" ] \
+  && ok "T123 LSTART_EPOCHS carries the GUARDED daemon's real start epoch (ps lstart parsed, not guessed)" \
+  || nok "T123 LSTART_EPOCHS" "got [$(field LSTART_EPOCHS "$OUT")] want com.test.central-sender=$(( DEPLOY_EPOCH - 3600 ))"
+echo "$OUT" | grep -q '^LSTART_EPOCHS=' && ok "T123 the line is always present" || nok "T123 line missing" "$OUT"
+
+# T124: a GUARDED daemon whose start time cannot be read is LEFT OUT — "não sei", never 0.
+new_case t124
+t123_app
+echo 7002 > "$MOCK/pid.com.test.central-sender"        # a live pid, but ps has nothing for it
+OUT=$(run_helper daemons/central_sender.py)
+echo "$(field GUARDED "$OUT")" | grep -q "com.test.central-sender" \
+  && ok "T124 fixture: guarded with a pid whose start time is unreadable" || nok "T124 fixture" "GUARDED=[$(field GUARDED "$OUT")] out=[$OUT]"
+field_is_empty LSTART_EPOCHS "$OUT" \
+  && ok "T124 an unreadable start time is omitted (the line is present and empty) — never 0, never fresh" \
+  || nok "T124 unreadable lstart must be omitted" "got [$(field LSTART_EPOCHS "$OUT")]"
+
+# T125: a label recorded 'stuck' in DAEMON_BASELINE_OVERRIDES is reported even though
+# THIS run's diff does not guard it — that is the reboot case (restarted long ago, the
+# record still says stuck). A label recorded WITHOUT the flag is not asked about.
+new_case t125
+t123_app
+make_plist "$AGENTS" com.test.sidecar "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/sidecar.py"
+make_plist "$AGENTS" com.test.plain "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/plain.py"
+cat > "$RUNTIME/daemons/sidecar.py" <<<'print("sidecar")'
+cat > "$RUNTIME/daemons/plain.py" <<<'print("plain")'
+seed_running com.test.central-sender 7003 "$STALE_LSTART"
+seed_running com.test.sidecar 7004 "$(lstart_of $(( DEPLOY_EPOCH - 120 )) )"
+seed_running com.test.plain 7005 "$(lstart_of $(( DEPLOY_EPOCH - 90 )) )"
+OUT=$(DAEMON_BASELINE_OVERRIDES="com.test.sidecar deadbeefdeadbeefdeadbeefdeadbeefdeadbeef stuck
+com.test.plain deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" run_helper daemons/central_sender.py)
+L="$(field LSTART_EPOCHS "$OUT")"
+case " $L " in *" com.test.sidecar=$(( DEPLOY_EPOCH - 120 )) "*) ok "T125 a 'stuck'-recorded label is reported even though this diff does not guard it" ;; *) nok "T125 stuck-recorded label missing" "LSTART_EPOCHS=[$L]" ;; esac
+case " $L " in *" com.test.central-sender=$(( DEPLOY_EPOCH - 3600 )) "*) ok "T125 the GUARDED label is still reported alongside it" ;; *) nok "T125 guarded label missing" "LSTART_EPOCHS=[$L]" ;; esac
+case "$L" in *com.test.plain*) nok "T125 an UNFLAGGED recorded label must not be asked about" "LSTART_EPOCHS=[$L]" ;; *) ok "T125 an unflagged recorded label is not read (nothing about it is in question)" ;; esac
+
+# T126: nothing in question -> the line is still there, empty (an absent line means an
+# older helper; a consumer must be able to tell the two apart).
+SENSITIVE_DAEMONS=""
+new_case t126
+OUT=$(run_helper docs/readme.md)
+field_is_empty LSTART_EPOCHS "$OUT" \
+  && ok "T126 no daemon in question: LSTART_EPOCHS= is present and empty" \
+  || nok "T126 line must be present-and-empty" "out=[$OUT]"
+SENSITIVE_DAEMONS=""
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"

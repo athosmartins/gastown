@@ -701,6 +701,23 @@
 #      daemon that is up and bound but wedged, and any restart done by a path
 #      other than this script (the rig's own deploy_daemons.sh / auto-restart).
 #
+#  24. (ga-8hfols) Everything above decides a daemon's freshness from the DIFF: which
+#      commits touch its closure, and whether its process started after the newest
+#      one's COMMIT time. The rig baseline (story-delivery.sh) only ever advanced on
+#      that kind of verdict, so a reboot that restarted every KeepAlive daemon proved
+#      nothing to it. MEDIDO 11/10: reboot 10/10 23:40, every WA daemon lstart
+#      23:41:51, yet the rig marker stayed on e078b5686 (09/10) and 29 daemons read
+#      "guarded" on every later delivery, because a notify_only_locked daemon nobody
+#      may restart held the whole rig back. What was missing is the PROCESS proof:
+#      the OS says when each daemon started, the checkout's reflog says what HEAD was
+#      then, and a process that started while HEAD was H runs code at or after H.
+#      This helper only REPORTS the first half, raw: LSTART_EPOCHS (output below) is
+#      the start epoch of every daemon whose baseline is in question (GUARDED,
+#      FRESH_FAIL, or recorded 'stuck' in DAEMON_BASELINE_OVERRIDES). It decides
+#      nothing and changes no verdict; story-delivery.sh joins it with the reflog.
+#      A label the OS could not answer for (no live pid, ps/date unreadable) is left
+#      OUT of the line, never written as 0 or as "fresh": absent means "não sei".
+#
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
 #
@@ -773,6 +790,13 @@
 #     classified GUARDED_SYMBOL_NO_EVIDENCE. Annotation only — VERDICT and
 #     GUARDED never change. A consumer may stop holding a delivery for such a
 #     daemon ONLY on positive membership: every still-stale label named here.)
+#   LSTART_EPOCHS=<label>=<epoch> ...   (ga-8hfols, header point 24: always
+#     present, even empty. The start time (unix epoch, from `ps -o lstart=` of the
+#     label's live pid) of every daemon this run was asked about: GUARDED and
+#     FRESH_FAIL labels, plus every label DAEMON_BASELINE_OVERRIDES records as
+#     'stuck'. Raw fact only — VERDICT/GUARDED never change. A label with no live
+#     pid or an unreadable start time is simply not listed, and an empty line is
+#     "nothing could be read", never "everything is fresh".)
 #   RIG_DETECTOR_USED=0|1   AFFECTED_RIG_DETECTOR=<labels>
 #     GUARDED_RIG_DETECTOR=<labels>   (ga-abofl6, header point 20: always
 #     present. RIG_DETECTOR_USED is rig-level — 1 only when $RUNTIME_DIR/
@@ -1053,6 +1077,40 @@ PY
   fi
 fi
 
+# helper: epoch of a pid's start time (parses `ps -o lstart=`)
+pid_start_epoch() {  # pid_start_epoch <pid>
+  local pid="$1" ls
+  [ -n "$pid" ] || return 1
+  ls="$($PS_BIN -o lstart= -p "$pid" 2>/dev/null)"
+  ls="${ls%"${ls##*[![:space:]]}"}"   # rtrim trailing whitespace ps pads with
+  [ -n "$ls" ] || return 1
+  date -j -f "%a %b %e %T %Y" "$ls" +%s 2>/dev/null
+}
+
+# helper: current PID for a launchd label
+daemon_pid() {  # daemon_pid <label>
+  $LAUNCHCTL_BIN list "$1" 2>/dev/null \
+    | awk -F'=' '/"PID"/ {gsub(/[^0-9]/,"",$2); print $2; exit}'
+}
+
+# lstart_epochs_line (ga-8hfols, header point 24): "<label>=<epoch> ..." for every
+# daemon whose baseline is in question. Reads only — no restart, no state. A label
+# the OS cannot answer for is omitted (three states: a number, or nothing — never a
+# guessed 0 that a consumer could mistake for "started long ago" or "fresh").
+lstart_epochs_line() {
+  local labels="" seen=" " l pid ep out=""
+  for l in ${GUARDED:-} ${FRESH_FAIL:-} $(printf '%s\n' "${DAEMON_BASELINE_OVERRIDES:-}" | awk '$3=="stuck"{print $1}'); do
+    case "$seen" in *" $l "*) continue ;; esac
+    seen="${seen}${l} "
+    pid="$(daemon_pid "$l")"
+    [ -n "$pid" ] || continue
+    ep="$(pid_start_epoch "$pid")" || continue
+    case "$ep" in ''|*[!0-9]*) continue ;; esac
+    out="${out}${out:+ }${l}=${ep}"
+  done
+  printf '%s' "$out"
+}
+
 # ── emit result + exit ────────────────────────────────────────────────────────
 emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified — fail closed)
   local verdict="$1" reason="$2" proof="${3:-not_verified}" tbn="" tbn_l otbn="" otbn_l
@@ -1132,6 +1190,10 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # reads it unconditionally; an absent line means an older helper and is never
   # the same as an empty one.
   echo "GUARDED_LOCKED_COSMETIC=${GUARDED_LOCKED_COSMETIC:-}"
+  # ga-8hfols (header point 24): always present, even empty — the raw start epochs
+  # of the daemons whose baseline is in question. An absent line is an older
+  # helper; a consumer treats absent and empty the same: no proof, not "fresh".
+  echo "LSTART_EPOCHS=$(lstart_epochs_line)"
   # ga-abofl6 (header point 20): always present, even empty — same convention
   # as every other field above. RIG_DETECTOR_USED distinguishes "consulted,
   # confirmed nothing" (AFFECTED_RIG_DETECTOR/GUARDED_RIG_DETECTOR empty, USED=1)
@@ -1728,21 +1790,8 @@ fi
 log "changed python files:"; echo "$CHANGED_PY" | sed 's/^/[daemon-refresh]   /' >&2
 log "changed template files:"; echo "$CHANGED_TEMPLATES" | sed 's/^/[daemon-refresh]   /' >&2
 
-# helper: epoch of a pid's start time (parses `ps -o lstart=`)
-pid_start_epoch() {  # pid_start_epoch <pid>
-  local pid="$1" ls
-  [ -n "$pid" ] || return 1
-  ls="$($PS_BIN -o lstart= -p "$pid" 2>/dev/null)"
-  ls="${ls%"${ls##*[![:space:]]}"}"   # rtrim trailing whitespace ps pads with
-  [ -n "$ls" ] || return 1
-  date -j -f "%a %b %e %T %Y" "$ls" +%s 2>/dev/null
-}
-
-# helper: current PID for a launchd label
-daemon_pid() {  # daemon_pid <label>
-  $LAUNCHCTL_BIN list "$1" 2>/dev/null \
-    | awk -F'=' '/"PID"/ {gsub(/[^0-9]/,"",$2); print $2; exit}'
-}
+# (pid_start_epoch / daemon_pid live above emit(), ga-8hfols: emit() reads them
+# and runs on paths that exit before this point.)
 
 # helper: is a launchd label currently LOADED (registered with launchd)? (ga-tdzsh)
 # Deliberately NOT daemon_pid()-based: a job can be loaded but between runs
