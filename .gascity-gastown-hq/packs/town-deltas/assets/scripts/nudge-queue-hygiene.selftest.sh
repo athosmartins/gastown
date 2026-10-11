@@ -38,6 +38,18 @@ sessions() {
   done
   echo "$out,{\"id\":\"id-closed\",\"name\":\"closed-one\",\"state\":\"closed\",\"closed\":true}]}"
 }
+# dead_item <id> <bead_id, '' = none> <dead_at>   (ga-j96y0n: items in the engine's dead-letter bucket)
+dead_item() {
+  jq -cn --arg id "$1" --arg bead "$2" --arg da "$3" --arg z "$ZERO" \
+    '{id:$id, agent:"gone-agent", session_id:"sD", continuation_epoch:"1", source:"session",
+      message:"QUALITY GATE REVIEW — long-dead", created_at:$da, deliver_after:$da, expires_at:$da,
+      last_error:"expired", last_attempt_at:$z, claimed_at:$z, lease_until:$z, dead_at:$da}
+     + (if $bead != "" then {bead_id:$bead} else {} end)'
+}
+# BSD date, like the stat -f above: units are y m w d H M S (hours are a CAPITAL H). A failed date must stop the whole
+# selftest: an empty stamp is read by the script as "undecided" and the fixture would pass for the wrong reason.
+ago()   { date -u -v-"$1" '+%Y-%m-%dT%H:%M:%S.000000Z' || { echo "FATAL: ago $1: date failed" >&2; kill -TERM $$; }; }
+ahead() { date -u -v+"$1" '+%Y-%m-%dT%H:%M:%S.000000Z' || { echo "FATAL: ahead $1: date failed" >&2; kill -TERM $$; }; }
 # new_case <name> ; then write $Q/state.json and $SBX/<name>.sessions.json
 new_case() { Q="$SBX/$1/nudges"; mkdir -p "$Q"; : > "$Q/state.lock"; SF="$SBX/$1.sessions.json"; }
 put_state() { # stdin: pending items (json lines) ; $1: extra top-level json object to merge
@@ -305,6 +317,124 @@ case "$(cat "$SBX/c15.err")" in *"could not append"*) ok "and says so on stderr"
 ( cd "$SBX/c15" && python3 "$HYG" --queue-dir "$Q" --sessions-file "$SF" --city "$SBX" --apply --log bare-name.jsonl >/dev/null 2>"$SBX/c15b.err" ); rc=$?
 eq "a --log with a BARE file name (no dir part) is written, not a silent never-logged" "$rc:$(wc -l < "$SBX/c15/bare-name.jsonl" 2>/dev/null | tr -d ' ')" "0:1"
 eq "and says nothing on stderr" "$(cat "$SBX/c15b.err")" ""
+
+echo "== 16. dead-letter TTL (ga-j96y0n): only a BEAD-LESS dead item older than the retention is pruned"
+# The engine's pruneDeadQueuedNudges (cmd/gc/cmd_nudge.go) only ever drops a dead item that HAS a bead_id with a
+# terminal bead behind it; a bead-less one falls straight through to 'keep' and lives forever (measured 10/10: 110 of
+# the 118 dead items had no bead_id; 108 of them were 7-98 days old; 4.2 MB re-read and re-written on every poll).
+new_case c16
+sessions gastown.dog-1 > "$SF"
+{ item p1 gastown.dog-1 s1 "DISPATCH_TASK ga-1" 2026-09-25T10:00:00Z; } | put_state "$(
+  { dead_item old-nobead   ""          "$(ago 8d)"
+    dead_item fresh-nobead ""          "$(ago 6d)"
+    dead_item old-bead     ga-wisp-1   "$(ago 30d)"
+    dead_item future-nobead ""         "$(ahead 2d)"
+    dead_item bad-ts       ""          "not-a-date"
+    dead_item empty-ts     ""          ""
+    dead_item missing-ts   ""          "$(ago 40d)" | jq -c 'del(.dead_at)'
+  } | jq -sc --argjson i "$(item inflight gastown.dog-1 s1 "DISPATCH_TASK ga-2" 2026-09-25T09:00:00Z)" '{dead: ., in_flight: [$i], future_key: {x: 1}}')"
+OUT="$(hyg --apply)"
+eq "only the old bead-less item is gone" "$(pids '.dead[].id')" "bad-ts empty-ts fresh-nobead future-nobead missing-ts old-bead"
+eq "summary: pruned 1 of 7" "$(echo "$OUT" | jq -r '[.dead_before,.pruned_dead,.dead_after]|join("/")')" "7/1/6"
+eq "an OLD bead-backed item is kept (the engine owns its terminal-bead repair) and counted" "$(echo "$OUT" | jq -r '.dead_kept_bead_backed_old')" "1"
+eq "a dead_at that is missing / empty / unparseable is never judged old; counted as undecided" "$(echo "$OUT" | jq -r '.dead_kept_undecided')" "3"
+eq "pruned bytes are reported" "$(echo "$OUT" | jq -r '.pruned_dead_bytes > 0')" "true"
+eq "pending untouched" "$(pids '.pending[].id')" "p1"
+eq "in_flight untouched" "$(jq -r '.in_flight[0].id' "$Q/state.json")" "inflight"
+eq "unknown top-level keys survive the rewrite" "$(jq -r '.future_key.x' "$Q/state.json")" "1"
+eq "the rewritten file still parses" "$(jq -e . "$Q/state.json" >/dev/null 2>&1; echo $?)" "0"
+
+echo "== 17. pruning keys on dead_at, never created_at; an item dead-lettered in the SAME run is not pruned"
+new_case c17
+sessions gastown.dog-1 > "$SF"
+{ item a gastown.dog-1 s1 "$WARN" 2026-09-25T10:00:00Z     # created 15 days ago
+  item b gastown.dog-1 s1 "$WARN" 2026-09-25T11:00:00Z; } | put_state "$(dead_item old-nobead "" "$(ago 9d)" | jq -sc '{dead: .}')"
+OUT="$(hyg --apply)"
+eq "the old dead item is pruned; the freshly dead-lettered duplicate (old created_at, new dead_at) stays" "$(pids '.dead[].id')" "a"
+eq "both rules ran in one pass" "$(echo "$OUT" | jq -r '[.moved_dup,.pruned_dead]|join("/")')" "1/1"
+
+echo "== 18. a prune-only run rewrites; a run with nothing old does not"
+new_case c18
+sessions gastown.dog-1 > "$SF"
+{ item p1 gastown.dog-1 s1 "DISPATCH_TASK ga-1" 2026-09-25T10:00:00Z; } | put_state "$({ dead_item d1 "" "$(ago 1d)"; dead_item d2 "" "$(ago 2H)"; } | jq -sc '{dead: .}')"
+before="$(cksum < "$Q/state.json") $(stat -f '%i %m' "$Q/state.json")"
+OUT="$(hyg --apply)"
+eq "nothing past the retention => file byte-identical, same inode" "$(cksum < "$Q/state.json") $(stat -f '%i %m' "$Q/state.json")" "$before"
+eq "and says so: nothing pruned, both kept as RECENT (not as undecided)" "$(echo "$OUT" | jq -r '[.pruned_dead,.dead_after,.dead_kept_undecided]|join("/")')" "0/2/0"
+new_case c18b
+sessions gastown.dog-1 > "$SF"
+{ item p1 gastown.dog-1 s1 "DISPATCH_TASK ga-1" 2026-09-25T10:00:00Z; } | put_state "$(dead_item old "" "$(ago 20d)" | jq -sc '{dead: .}')"
+hyg --apply >/dev/null
+eq "a prune with NO pending move still rewrites the file" "$(jq -r '(.dead // [])|length' "$Q/state.json")" "0"
+eq "the pending bucket survives the prune-only rewrite" "$(pids '.pending[].id')" "p1"
+
+echo "== 19. a dry run reports the prune and writes nothing"
+new_case c19
+sessions gastown.dog-1 > "$SF"
+{ item p1 gastown.dog-1 s1 "DISPATCH_TASK ga-1" 2026-09-25T10:00:00Z; } | put_state "$(dead_item old "" "$(ago 20d)" | jq -sc '{dead: .}')"
+before="$(cksum < "$Q/state.json")"
+OUT="$(hyg)"
+eq "dry run: reports the prune" "$(echo "$OUT" | jq -r '[.pruned_dead,.dead_after]|join("/")')" "1/0"
+eq "dry run: file untouched" "$(cksum < "$Q/state.json")" "$before"
+
+echo "== 20. --dead-retention-days: configurable, 0 switches the prune off"
+new_case c20
+sessions gastown.dog-1 > "$SF"
+{ item p1 gastown.dog-1 s1 "DISPATCH_TASK ga-1" 2026-09-25T10:00:00Z; } | put_state "$(dead_item d8 "" "$(ago 8d)" | jq -sc '{dead: .}')"
+hyg --apply --dead-retention-days 30 >/dev/null
+eq "a 8-day-old item is inside a 30-day retention" "$(pids '.dead[].id')" "d8"
+hyg --apply --dead-retention-days 0 >/dev/null
+eq "0 = off: nothing pruned" "$(pids '.dead[].id')" "d8"
+hyg --apply --dead-retention-days 7 >/dev/null
+eq "7 prunes it" "$(jq -r '(.dead // [])|length' "$Q/state.json")" "0"
+
+echo "== 21. the prune runs under the ENGINE's flock and reads fresh under it"
+new_case c21
+sessions gastown.dog-1 > "$SF"
+{ item p1 gastown.dog-1 s1 "DISPATCH_TASK ga-1" 2026-09-25T10:00:00Z; } | put_state "$(dead_item old "" "$(ago 20d)" | jq -sc '{dead: .}')"
+NEWDEAD="$(dead_item engine-wrote "" "$(ago 1H)")"
+# Stand-in for the engine: holds LOCK_EX for 2 s and, while holding it, dead-letters one more (recent) item.
+python3 - "$Q" "$NEWDEAD" <<'PY' &
+import fcntl, json, sys, time
+q, newdead = sys.argv[1], json.loads(sys.argv[2])
+with open(q + "/state.lock", "a+") as lk:
+    fcntl.flock(lk.fileno(), fcntl.LOCK_EX)
+    time.sleep(2)
+    st = json.load(open(q + "/state.json"))
+    st["dead"].append(newdead)
+    json.dump(st, open(q + "/state.json", "w"))
+    fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
+PY
+sleep 0.5
+t0=$(date +%s)
+OUT="$(hyg --apply)"
+t1=$(date +%s)
+wait
+if [ $((t1 - t0)) -ge 1 ]; then ok "the prune waited for the engine's lock ($((t1 - t0))s)"; else bad "the prune did not wait for the lock (took $((t1 - t0))s)"; fi
+eq "it pruned the old item and kept the one the engine wrote UNDER the lock" "$(pids '.dead[].id')" "engine-wrote"
+eq "it SAW that item (2 before, 1 pruned) and judged it recent, not undecided" "$(echo "$OUT" | jq -r '[.dead_before,.pruned_dead,.dead_kept_undecided]|join("/")')" "2/1/0"
+
+echo "== 22. fail-closed: unrecognised dead shape, unreadable items, and the cap"
+new_case c22
+sessions gastown.dog-1 > "$SF"
+echo '{"dead":"x"}' > "$Q/state.json"
+hyg --apply >/dev/null 2>"$SBX/c22.err"; rc=$?
+eq "a dead that is PRESENT but not a list is rc 2 even with nothing to move" "$rc" "2"
+eq "no traceback" "$(grep -c Traceback "$SBX/c22.err")" "0"
+eq "file untouched" "$(jq -c . "$Q/state.json")" '{"dead":"x"}'
+new_case c22b
+sessions gastown.dog-1 > "$SF"
+{ item p1 gastown.dog-1 s1 "DISPATCH_TASK ga-1" 2026-09-25T10:00:00Z; } | put_state "$({ echo 5; echo '"str"'; echo null; dead_item old "" "$(ago 20d)"; } | jq -sc '{dead: .}')"
+OUT="$(hyg --apply 2>"$SBX/c22b.err")"; rc=$?
+eq "non-object dead entries do not crash the run" "$rc:$(grep -c Traceback "$SBX/c22b.err")" "0:0"
+eq "they are kept (undecided), the readable old one is pruned" "$(echo "$OUT" | jq -r '[.pruned_dead,.dead_kept_undecided]|join("/")')" "1/3"
+eq "the unreadable entries are still in the file" "$(jq -c '.dead' "$Q/state.json")" '[5,"str",null]'
+new_case c22c
+sessions gastown.dog-1 > "$SF"
+{ item p1 gastown.dog-1 s1 "DISPATCH_TASK ga-1" 2026-09-25T10:00:00Z; } | put_state "$({ dead_item o1 "" "$(ago 20d)"; dead_item o2 "" "$(ago 21d)"; } | jq -sc '{dead: .}')"
+hyg --apply --max-moves 1 >/dev/null 2>&1; rc=$?
+eq "--max-moves also caps the prune: rc 2" "$rc" "2"
+eq "and nothing was removed" "$(pids '.dead[].id')" "o1 o2"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

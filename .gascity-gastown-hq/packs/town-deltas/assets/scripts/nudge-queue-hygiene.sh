@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# nudge-queue-hygiene.sh — order entrypoint for nudge-queue-hygiene.py (ga-aijm2v.5, rule 2).
+# nudge-queue-hygiene.sh — order entrypoint for nudge-queue-hygiene.py (ga-aijm2v.5 rule 2; ga-j96y0n dead-letter TTL,
+# on by default at 7 days: this wrapper passes no --dead-retention-days).
 # Orders in this pack exec shell scripts; the queue cleanup needs fcntl.flock (macOS ships
 # no flock(1)) to take the engine's own queue lock, hence the Python body.
 set -uo pipefail

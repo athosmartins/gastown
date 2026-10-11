@@ -1,0 +1,106 @@
+diff --git a/cmd/gc/cmd_nudge.go b/cmd/gc/cmd_nudge.go
+index 55efaa354..f30a1607e 100644
+--- a/cmd/gc/cmd_nudge.go
++++ b/cmd/gc/cmd_nudge.go
+@@ -44,6 +44,11 @@ const (
+ 	defaultNudgeWaitIdleTimeout = 30 * time.Second
+ )
+ 
++// A dead-letter item with no BeadID has no bead record to carry its terminal
++// history, so the queue entry is the only record of it. It is kept this long
++// (instead of forever) so the dead bucket cannot grow without bound.
++const defaultQueuedNudgeBeadlessDeadRetention = 7 * 24 * time.Hour
++
+ var errNudgeSessionFenceMismatch = errors.New("queued nudge session fence mismatch")
+ 
+ var (
+@@ -1947,8 +1952,13 @@ func recoverExpiredInFlightNudges(state *nudgeQueueState, store beads.Store, now
+ // pruneDeadQueuedNudges removes dead-letter items older than defaultQueuedNudgeDeadRetention
+ // when a durable terminal bead record exists in the store. Items without a confirmed terminal
+ // bead are retained so terminal history is not lost if the bead store write failed.
++//
++// An item with no BeadID has no bead record at all, so the rule above can never apply to it;
++// it is removed once its DeadAt is older than defaultQueuedNudgeBeadlessDeadRetention. An item
++// whose age cannot be established (zero DeadAt) is retained.
+ func pruneDeadQueuedNudges(state *nudgeQueueState, store beads.Store, now time.Time) error {
+ 	cutoff := now.Add(-defaultQueuedNudgeDeadRetention)
++	beadlessCutoff := now.Add(-defaultQueuedNudgeBeadlessDeadRetention)
+ 	filtered := state.Dead[:0]
+ 	for _, item := range state.Dead {
+ 		if item.BeadID != "" {
+@@ -1989,6 +1999,10 @@ func pruneDeadQueuedNudges(state *nudgeQueueState, store beads.Store, now time.T
+ 				// Terminal bead confirmed in store — safe to prune once past retention.
+ 				continue
+ 			}
++		} else if !item.DeadAt.IsZero() && item.DeadAt.Before(beadlessCutoff) {
++			// No bead record exists, so there is no terminal state to confirm; past the
++			// longer bead-less retention the queue entry is dropped rather than kept forever.
++			continue
+ 		}
+ 		filtered = append(filtered, item)
+ 	}
+diff --git a/cmd/gc/cmd_nudge_test.go b/cmd/gc/cmd_nudge_test.go
+index fd1c21e57..6c3dbc5dc 100644
+--- a/cmd/gc/cmd_nudge_test.go
++++ b/cmd/gc/cmd_nudge_test.go
+@@ -3978,6 +3978,60 @@ func TestPruneDeadQueuedNudges_RetainsItemsWithoutBeadID(t *testing.T) {
+ 	}
+ }
+ 
++// A dead-letter item with no BeadID has no durable record anywhere else, so the engine keeps it for a
++// bounded window (not forever): measured 2026-10-10 on a live city, 110 of 118 dead items had no BeadID,
++// 108 of them 7-98 days old, in a queue file that WithState reads and rewrites in full.
++func TestPruneDeadQueuedNudges_PrunesBeadlessItemsPastRetention(t *testing.T) {
++	// The fixture holds a bead-backed item, so listQueuedNudges opens a bead store: without the file
++	// provider that starts a real dolt sql-server, which the package's leak guard then fails the run for.
++	t.Setenv("GC_BEADS", "file")
++	dir := t.TempDir()
++	now := time.Now()
++
++	seed := []queuedNudge{
++		{ID: "n-ancient", Agent: "worker", Source: "session", Message: "98 days dead, no bead", DeadAt: now.Add(-98 * 24 * time.Hour)},
++		{ID: "n-eight-days", Agent: "worker", Source: "session", Message: "8 days dead, no bead", DeadAt: now.Add(-8 * 24 * time.Hour)},
++		{ID: "n-six-days", Agent: "worker", Source: "session", Message: "6 days dead, no bead", DeadAt: now.Add(-6 * 24 * time.Hour)},
++		// Cannot tell how old it is: kept (same as the bead-backed rule, which also needs a DeadAt).
++		{ID: "n-no-dead-at", Agent: "worker", Source: "session", Message: "no DeadAt"},
++		// A DeadAt in the future (clock skew) is not old.
++		{ID: "n-future", Agent: "worker", Source: "session", Message: "future DeadAt", DeadAt: now.Add(48 * time.Hour)},
++		// The bead-backed path is untouched: with no store it is retained however old it is.
++		{ID: "n-bead-backed", BeadID: "ga-wisp-x", Agent: "worker", Source: "session", Message: "bead-backed, no store", DeadAt: now.Add(-30 * 24 * time.Hour)},
++	}
++	if err := withNudgeQueueState(dir, func(state *nudgeQueueState) error {
++		state.Dead = append(state.Dead, seed...)
++		return nil
++	}); err != nil {
++		t.Fatalf("seed dead items: %v", err)
++	}
++
++	if err := withNudgeQueueState(dir, func(state *nudgeQueueState) error {
++		return pruneDeadQueuedNudges(state, nil, now)
++	}); err != nil {
++		t.Fatalf("pruneDeadQueuedNudges: %v", err)
++	}
++
++	_, _, dead, err := listQueuedNudges(dir, "worker", now)
++	if err != nil {
++		t.Fatalf("listQueuedNudges: %v", err)
++	}
++	got := map[string]bool{}
++	for _, item := range dead {
++		got[item.ID] = true
++	}
++	for _, id := range []string{"n-ancient", "n-eight-days"} {
++		if got[id] {
++			t.Errorf("bead-less dead item %s older than 7 days was retained, want pruned", id)
++		}
++	}
++	for _, id := range []string{"n-six-days", "n-no-dead-at", "n-future", "n-bead-backed"} {
++		if !got[id] {
++			t.Errorf("dead item %s was pruned, want retained", id)
++		}
++	}
++}
++
+ func TestEnqueueSupersedes_SameAgentSourceReference(t *testing.T) {
+ 	t.Setenv("GC_BEADS", "file")
+ 	dir := t.TempDir()

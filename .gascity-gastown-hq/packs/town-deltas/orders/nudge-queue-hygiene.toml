@@ -12,10 +12,16 @@
 # and never touches work items (reviewer tasks, the Pilot's DISPATCH_TASK). See
 # nudge-queue-hygiene.py's header for the full safety argument.
 #
-# 30m: the queue only needs to be tidy relative to a 24 h TTL, and a run is one 8 MB
-# JSON read + (only when something moves) one atomic rewrite under the lock.
+# ga-j96y0n adds a second rule in the same pass: drop BEAD-LESS dead-letter items older than 7 days.
+# The engine's pruneDeadQueuedNudges only ever drops a dead item that has a bead_id, so a bead-less one
+# is kept forever (measured 10/10: 108 items 7-98 days old = 3.7 MB that every queue operation reads
+# and every mutation rewrites). A bead-backed dead item is never touched here. The engine patch that makes this redundant is
+# staged in docs/pending-engine-window/ga-j96y0n-nudge-dead-ttl.patch (not applied: needs the window).
+#
+# 30m: the queue only needs to be tidy relative to a 24 h TTL / 7 d dead retention, and a run is one
+# 5-8 MB JSON read + (only when something moves) one atomic rewrite under the lock.
 [order]
-description = "Dead-letter duplicate and orphaned 'check for assigned work' nudges in the engine queue (ga-aijm2v.5)"
+description = "Dead-letter duplicate and orphaned 'check for assigned work' nudges, and prune bead-less dead-letter items older than 7d, in the engine queue (ga-aijm2v.5, ga-j96y0n)"
 trigger = "cooldown"
 interval = "30m"
 exec = "$PACK_DIR/assets/scripts/nudge-queue-hygiene.sh"

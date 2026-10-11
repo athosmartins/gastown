@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""nudge-queue-hygiene — ga-aijm2v.5 (Camada 1 da portaria, regra 2).
+"""nudge-queue-hygiene — ga-aijm2v.5 (Camada 1 da portaria, regra 2) + ga-j96y0n (dead-letter TTL).
 
-Cleans the WARNING items out of the engine's nudge queue, without an engine patch.
+Cleans the engine's nudge queue without an engine patch: (1) the WARNING items, (2) the
+bead-less dead-letter items the engine never prunes (see "Dead-letter TTL" below).
 
 Measured 2026-09-25: 173 items were pending (7.7 MB state.json), 79 of them the
 warning "check for assigned work" (22 for gastown.dog-2 alone). Each pending item is
@@ -30,7 +31,9 @@ How it mutates the queue safely (no engine patch, mirrors nudgequeue.WithState):
     QueuedNudge maps it to the "superseded" state, and pruneDeadQueuedNudges
     repairs the backing wisp bead of any dead item that is not terminal yet, then
     prunes it after the dead-retention window. Deleting instead would orphan the
-    backing bead;
+    backing bead. That holds ONLY for an item that has a bead_id: pruneDeadQueuedNudges
+    keeps every bead-less dead item forever (see "Dead-letter TTL"), so a bead-less
+    warning moved here used to stay in the file for good;
   * writes NOTHING when there is nothing to move (no needless rewrite of 7 MB);
   * "cannot tell" is never "gone": if the live-session lookup fails or comes back
     empty, only the dedupe rule runs. The lookup is read BEFORE the lock (it can take
@@ -48,6 +51,26 @@ How it mutates the queue safely (no engine patch, mirrors nudgequeue.WithState):
     that is not an object, or a pending/dead key that is PRESENT but not a list.
   * every run — a failed one too — appends its summary to --log, so the before/after record has no
     holes where the errors are.
+
+Dead-letter TTL (ga-j96y0n). pruneDeadQueuedNudges (cmd/gc/cmd_nudge.go) drops a dead item only when it
+has a bead_id AND the backing bead is terminal AND dead_at is older than 1 h; an item with NO bead_id falls
+straight through to "keep" and is never dropped. Measured 2026-10-10: 110 of the 118 dead items had no
+bead_id, 108 of those were 7-98 days old (one 98 days), and they were 3.96 of the 4.23 MB of dead items
+that nudgequeue.WithState reads in full on every queue operation and rewrites in full on every
+mutation. (The 8 bead-backed ones were all <= 7 days: the engine does prune
+those.) This script drops a dead item when ALL of these hold:
+  * it is an object whose dead_at parses and is older than --dead-retention-days (default 7; 0 = off);
+  * it has no bead_id (nothing durable points at it: the dead-letter entry is the only record, and a week
+    is the time anyone has to read it). A bead-backed item is NEVER dropped here, however old: the engine
+    owns the terminal-bead repair for it. If one is still around after the retention it is counted in
+    dead_kept_bead_backed_old, so the engine failing at it shows up in the log instead of vanishing.
+Three states, not two: an item whose dead_at is missing or unparseable, or that is not an object at all,
+is "cannot tell" — kept, counted in dead_kept_undecided. (A dead_at in the FUTURE parses fine: it is simply
+not old, so it is kept without being counted.) The same holds for the file: a dead key that is PRESENT but
+not a list is rc 2, nothing written. The decision keys on dead_at, never on created_at (an item
+dead-lettered by this very run has an old created_at and a fresh dead_at).
+The engine patch that makes this redundant is staged in docs/pending-engine-window/ga-j96y0n-*.patch;
+until that window this script is the only thing bounding the file.
 
 Default is a DRY RUN; the order passes --apply.
 """
@@ -70,7 +93,8 @@ ABSENT = object()            # read_state(): queue dir exists, no state.json yet
 ZERO_LENGTH = object()       # read_state(): state.json exists with 0 bytes (an empty queue; LoadState agrees)
 
 DEAD_REASON = "superseded"   # engine terminal state for a queued nudge made moot
-MAX_MOVES_DEFAULT = 1000     # a queue this size is not a normal cleanup — stop and say so
+MAX_MOVES_DEFAULT = 1000     # a queue this size is not a normal cleanup — stop and say so (caps moves AND prunes)
+DEAD_RETENTION_DAYS_DEFAULT = 7
 
 
 def is_zero_ts(value):
@@ -170,6 +194,30 @@ def plan(pending, live, snapshot_started):
     return move, undecided
 
 
+def plan_dead_prune(dead, now, retention_days):
+    """Return (prune, stats): prune is the set of INDEXES into `dead` to drop (see "Dead-letter TTL").
+
+    Only an old item with no bead_id is dropped. Everything we cannot judge — dead_at missing / unparseable /
+    in the future, or an entry that is not an object — is kept and counted: "cannot tell" is never "old"."""
+    stats = {"dead_kept_bead_backed_old": 0, "dead_kept_undecided": 0}
+    prune = set()
+    if retention_days <= 0:
+        return prune, stats
+    horizon = now - datetime.timedelta(days=retention_days)
+    for idx, it in enumerate(dead):
+        dead_at = parse_ts(it.get("dead_at")) if isinstance(it, dict) else None
+        if dead_at is None:
+            stats["dead_kept_undecided"] += 1
+            continue
+        if dead_at >= horizon:        # recent, or stamped in the future (clock skew): not old
+            continue
+        if it.get("bead_id"):         # the engine's pruneDeadQueuedNudges owns these (!= "" there too)
+            stats["dead_kept_bead_backed_old"] += 1
+            continue
+        prune.add(idx)
+    return prune, stats
+
+
 def load_sessions(city, sessions_file):
     try:
         if sessions_file:
@@ -235,14 +283,26 @@ def run(args):
         if not isinstance(pending, list) or not all(isinstance(i, dict) and i.get("id") for i in pending):
             raise ValueError("unrecognised queue shape (pending is not a list of items with ids)")
         move, undecided = plan(pending, live, snapshot_started)
+        # `dead` is read for the TTL on every run, so its shape must be vouched for on every run — not only
+        # when a move happens to need it. Absent / null = empty (omitempty); present-but-not-a-list = rc 2.
+        dead = state.get("dead")
+        if dead is None:
+            dead = []
+        if not isinstance(dead, list):
+            raise ValueError("unrecognised queue shape (dead is not a list)")
+        prune, dead_stats = plan_dead_prune(dead, datetime.datetime.now(datetime.timezone.utc), args.dead_retention_days)
         summary.update(
             pending_before=len(pending),
             warnings_before=sum(1 for i in pending if is_warning(i)),
             moved_dup=sum(1 for v in move.values() if v == "dup"),
             moved_gone=sum(1 for v in move.values() if v == "gone"),
             kept_undecided=len(undecided),
+            dead_before=len(dead),
+            pruned_dead=len(prune),
+            pruned_dead_bytes=sum(len(json.dumps(dead[i], ensure_ascii=False)) for i in prune),
+            **dead_stats,
         )
-        return move
+        return move, prune
 
     def read_state():
         """The queue state. Three different things must never collapse into one value:
@@ -267,8 +327,9 @@ def run(args):
     def evaluate_or_empty(state):
         if state is ABSENT or state is ZERO_LENGTH:
             summary.update(queue="absent" if state is ABSENT else "zero-length", pending_before=0,
-                           warnings_before=0, moved_dup=0, moved_gone=0, kept_undecided=0)
-            return {}
+                           warnings_before=0, moved_dup=0, moved_gone=0, kept_undecided=0, dead_before=0,
+                           pruned_dead=0, pruned_dead_bytes=0, dead_kept_bead_backed_old=0, dead_kept_undecided=0)
+            return {}, set()
         return evaluate(state)
 
     def emit(code):
@@ -292,8 +353,9 @@ def run(args):
     try:
         if not args.apply:
             state = read_state()
-            move = evaluate_or_empty(state)
+            move, prune = evaluate_or_empty(state)
             summary["pending_after"] = summary["pending_before"] - len(move)
+            summary["dead_after"] = summary["dead_before"] - len(prune) + len(move)
         else:
             # The engine owns this directory. A missing one is a wrong --city/--queue-dir: fail closed
             # (rc 2) instead of creating it and then reading an "empty" queue out of thin air.
@@ -303,27 +365,32 @@ def run(args):
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
                 try:
                     state = read_state()      # fresh, UNDER the lock
-                    move = evaluate_or_empty(state)
+                    move, prune = evaluate_or_empty(state)
                     if len(move) > args.max_moves:
                         raise ValueError("refusing to move %d items (> --max-moves %d)" % (len(move), args.max_moves))
-                    if move:
-                        stamp = now_go_ts()
-                        dead = state.get("dead")
-                        if dead is None:      # absent or null = empty (omitempty); we are about to fill it
-                            dead = state["dead"] = []
-                        if not isinstance(dead, list):
-                            raise ValueError("unrecognised queue shape (dead is not a list)")
-                        keep = []
-                        for it in state["pending"]:
-                            if it["id"] in move:
-                                it["dead_at"] = stamp
-                                it["last_error"] = DEAD_REASON
-                                dead.append(it)
-                            else:
-                                keep.append(it)
-                        state["pending"] = keep
+                    if len(prune) > args.max_moves:
+                        raise ValueError("refusing to prune %d dead items (> --max-moves %d)" % (len(prune), args.max_moves))
+                    if move or prune:
+                        # evaluate() already vouched for the shape: dead is a list, or absent/null (= empty)
+                        dead = [it for i, it in enumerate(state.get("dead") or []) if i not in prune]
+                        if move:
+                            stamp = now_go_ts()
+                            keep = []
+                            for it in state["pending"]:
+                                if it["id"] in move:
+                                    it["dead_at"] = stamp
+                                    it["last_error"] = DEAD_REASON
+                                    dead.append(it)
+                                else:
+                                    keep.append(it)
+                            state["pending"] = keep
+                        if dead:
+                            state["dead"] = dead
+                        else:
+                            state.pop("dead", None)   # the engine tags dead `omitempty`: a drained bucket has no key
                         atomic_write(state_path, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
                     summary["pending_after"] = summary["pending_before"] - len(move)
+                    summary["dead_after"] = summary["dead_before"] - len(prune) + len(move)
                 finally:
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     except (OSError, ValueError) as exc:
@@ -340,7 +407,10 @@ def main(argv=None):
     ap.add_argument("--queue-dir", help="override <city>/.gc/nudges (tests)")
     ap.add_argument("--sessions-file", help="use this `gc session list --json` output instead of calling gc (tests)")
     ap.add_argument("--log", default=None, help="append the json summary here")
-    ap.add_argument("--max-moves", type=int, default=MAX_MOVES_DEFAULT)
+    ap.add_argument("--max-moves", type=int, default=MAX_MOVES_DEFAULT,
+                    help="refuse (rc 2) to move, or to prune, more items than this in one run")
+    ap.add_argument("--dead-retention-days", type=int, default=DEAD_RETENTION_DAYS_DEFAULT,
+                    help="drop bead-less dead-letter items older than this many days (0 = never)")
     return run(ap.parse_args(argv))
 
 
