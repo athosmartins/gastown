@@ -53,7 +53,7 @@ SRC="${ENGINE_WINDOW_SRC:-/Users/athos/gt/.local-patches/_src-hookfix}"
 # env, a janela nova e um argumento, nao um commit.
 #   ENGINE_WINDOW=20260906 engine-window-run.sh build
 # O default aponta para a janela CORRENTE — atualize-o ao consolidar uma nova.
-ENGINE_WINDOW="${ENGINE_WINDOW:-20260919}"
+ENGINE_WINDOW="${ENGINE_WINDOW:-20261011b}"
 BRANCH="${ENGINE_WINDOW_BRANCH:-consolidated/engine-window-$ENGINE_WINDOW}"
 WORKTREE="${ENGINE_WINDOW_WORKTREE:-/Users/athos/gt/.gc-worktrees/engine-window-${ENGINE_WINDOW#2026}}"
 LIBEXEC="${ENGINE_WINDOW_LIBEXEC:-$HOME/.local/libexec}"
