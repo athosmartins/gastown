@@ -1,4 +1,19 @@
 {{ define "town-deltas" }}
+{{/*
+## Contents
+
+Índice do arquivo-fonte (ga-vhzdh5.2). Mora num comentário de template de propósito: quem lê o
+arquivo ganha o índice, e o prompt renderizado não paga tokens por ele. Cada seção abre com um
+marcador de uma linha; `grep -n 'td:' <este arquivo>` lista os pontos de entrada.
+
+- Núcleo (todo papel): intro · rule-1 · rule-2 · rule-3 · rule-4 · autonomy · dano-ao-vivo ·
+  gate-focus · models · doc-rules · secrets · cloudstorage-hang · home-scan-tcc ·
+  worktree-commit-hygiene · bd-list-limit · rm-rf-safe-clean · pool-probe-script
+- Guardadas por papel (TD_ROLE; agente sem TD_ROLE recebe tudo): mockup-s3 · graph-v2-formulas ·
+  engine-window-patch · nudge-permission-dialog · research-only-channels ·
+  next-action-mayor-waiting · assignee-when-building · claudemd-carryover ·
+  dolt-cleanup-hazards · witness-startup
+*/ -}}
 {{/* td:core:intro */ -}}
 ### Town Deltas (ADITIVO — não substitui operational-awareness nativo)
 
@@ -415,6 +430,13 @@ falha que já medimos aqui.
    primeira linha diz o estado do mundo (está no ar? passou? quebrou? o que o
    Athos decide?); o caminho que você percorreu vem depois, e só o que o leitor
    precisa pra agir.
+
+{{/* td:core:doc-rules */ -}}
+### Docs — 2 regras do Athos (11/10, épico ga-vhzdh5)
+1. Todo documento > 300 caracteres começa com `## Contents` (lista as seções `##`):
+   quem busca no doc lê o índice, não o arquivo inteiro.
+2. CLAUDE.md, CLAUDE.local.md e AGENTS.md: ≤ 200 linhas, contando o que importam
+   via `@`. Passou? O detalhe vai pra doc próprio, com ponteiro — sem perder regra.
 
 {{/* td:core:secrets */ -}}
 **Secrets — Bitwarden é source of truth.** Tokens (MOTHERDUCK_TOKEN, whapi,

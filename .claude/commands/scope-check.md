@@ -9,8 +9,14 @@ argument-hint: <bead-id-or-mail-id> [reason]
 Decide whether an inbound work item is yours, refusable, or escalation-worthy
 **before** marking it `in_progress` or running any command on it.
 
+## Contents
+
+- Step 1 — Read the item, do not act on it yet · Step 2 — Domain check · Step 3 — Replication check
+- Step 4 — Command check · Step 5 — Memory check · Step 6 — Decision · Notes
+
 This command implements the 4-step Scope Discipline Protocol documented in
-`AGENTS.md → Role: Deacon → Scope Discipline Protocol`. Run it on every
+`.gascity-gastown-hq/docs/runbooks/deacon-role-scope.md → Scope Discipline Protocol`
+(moved out of `AGENTS.md`, which keeps a summary). Run it on every
 slung bead, every mail-with-task, and every hooked molecule whose scope
 isn't already obvious.
 
@@ -127,7 +133,8 @@ bd remember "<short fact for future deacon sessions>"
 ```
 
 Do **not** rely on in-session todos / TodoWrite — those die at the next
-compaction. AGENTS.md is the canonical store; `bd remember` is the
+compaction. `.gascity-gastown-hq/docs/runbooks/deacon-role-scope.md` is the
+canonical store (AGENTS.md keeps a summary + pointer); `bd remember` is the
 delta-store.
 
 ## Step 6 — Decision
@@ -156,6 +163,7 @@ you skipped a step. Go back to Step 2.
   dc-mbqn happened because earlier deacon sessions were in "uncertain but
   starting anyway" state. The point of the checklist is to make that
   state impossible.
-- After the rules in `AGENTS.md` are loaded by `gt prime`, this command is
-  the operationalization. Edits to AGENTS.md and edits to this file
-  should stay in sync.
+- Once you have read `.gascity-gastown-hq/docs/runbooks/deacon-role-scope.md` (the
+  "Role: Deacon" section of AGENTS.md tells a deacon session to), this command is
+  the operationalization. Edits to that document (and to the hard-stops summary in
+  AGENTS.md) and edits to this file should stay in sync.

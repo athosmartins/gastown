@@ -341,6 +341,7 @@
    "dano-ao-vivo",
    "gate-focus",
    "models",
+   "doc-rules",
    "secrets",
    "cloudstorage-hang",
    "home-scan-tcc",
@@ -426,6 +427,7 @@
    "home-scan-tcc": "Varrer ou medir o `$HOME` dispara o prompt de permissão do macOS",
    "dano-ao-vivo": "Dano ao vivo — como marcar um bug que fura a fila",
    "gate-focus": "Modo foco no gate — quando o gargalo é a revisão, ninguém constrói bead nova",
+   "doc-rules": "Docs — 2 regras do Athos (11/10, épico ga-vhzdh5)",
    "pool-probe-script": "`sh \"$GC_CITY_PATH/packs/town-deltas/assets/scripts/pool-probe.sh\" gastown.dog`"
   },
   "carryover_exempt_roles": {

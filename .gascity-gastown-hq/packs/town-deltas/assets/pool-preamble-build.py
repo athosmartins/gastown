@@ -168,7 +168,21 @@ def parse_fragment(text):
         raise ValueError("fragment: última linha deve ser {{ end }} (o gate depende disso — story-ga-1xnfx)")
     inner = lines[1:-1]
     blocks, cur = [], None
+    # ga-vhzdh5.2: UM comentário de template no cabeçalho (antes do 1º marcador) pode abrigar o `## Contents` do arquivo-fonte. Ele não
+    # renderiza nada — `*/ -}}` apara o espaço seguinte igual a um marcador —, então não entra em nenhum bloco e o texto esperado por
+    # papel (role_text) continua byte-igual ao render real. Só a forma exata `{{/*` ... `*/ -}}` passa: um `*/` em outra linha fecharia
+    # o comentário no meio, e `*/}}` sem o trim deixaria um \n sobrando no prompt de todo agente.
+    in_header_comment, header_comment_used = False, False
     for n, ln in enumerate(inner, start=2):
+        if in_header_comment:
+            if ln == "*/ -}}":
+                in_header_comment = False
+            elif "*/" in ln:
+                raise ValueError(f"fragment L{n}: comentário de cabeçalho só pode fechar numa linha exata '*/ -}}' (achei {ln[:60]!r})")
+            continue
+        if cur is None and not header_comment_used and ln == "{{/*":
+            in_header_comment = header_comment_used = True
+            continue
         mc, mb = RE_CORE.match(ln), RE_BEGIN.match(ln)
         if mc or mb:
             if cur is not None and cur["cond"] is not None and not cur.get("closed"):
@@ -183,6 +197,8 @@ def parse_fragment(text):
             if cur is None or cur.get("closed"):
                 raise ValueError(f"fragment L{n}: texto fora de qualquer bloco marcado ({ln[:60]!r})")
             cur["lines"].append(ln)
+    if in_header_comment:
+        raise ValueError("fragment: comentário de cabeçalho '{{/*' aberto e nunca fechado com '*/ -}}'")
     if cur is not None and cur["cond"] is not None and not cur.get("closed"):
         raise ValueError(f"fragment: bloco guardado '{cur['id']}' sem {{{{ end -}}}}")
     return blocks

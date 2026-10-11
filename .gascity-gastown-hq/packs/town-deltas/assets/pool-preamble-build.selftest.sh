@@ -229,6 +229,36 @@ import sys
 p=sys.argv[1]; s=open(p,encoding="utf-8").read(); s=s.replace("\n{{ end -}}\n","\n",1); open(p,"w",encoding="utf-8").write(s)
 EOF
 expect_fail "guarda sem {{ end -}} (template quebraria o prompt de TODOS os agentes)" "fragment"
+# ga-vhzdh5.2: o `## Contents` do arquivo-fonte mora num comentário de template ANTES do 1º marcador. O controle positivo (cópia intacta
+# passa) já cobre a forma boa; estes três provam que o que a torna segura não afrouxou — cada mutação asserta que aplicou (senão seria vácua).
+reset_tree; python3 - "$T/packs/town-deltas/template-fragments/town-deltas.template.md" <<'EOF'
+import sys
+p=sys.argv[1]; s=open(p,encoding="utf-8").read()
+old="\n*/ -}}\n{{/* td:core:intro */ -}}"; assert old in s, "mutação não aplicou: o cabeçalho com ## Contents não está no formato esperado"
+open(p,"w",encoding="utf-8").write(s.replace(old,"\n{{/* td:core:intro */ -}}",1))
+EOF
+expect_fail "comentário de cabeçalho sem a linha de fechamento (engoliria o fragment inteiro)" "comentário de cabeçalho só pode fechar numa linha exata"
+reset_tree; python3 - "$T/packs/town-deltas/template-fragments/town-deltas.template.md" <<'EOF'
+import sys
+p=sys.argv[1]; s=open(p,encoding="utf-8").read()
+old="\n*/ -}}\n{{/* td:core:intro */ -}}"; assert old in s, "mutação não aplicou: o cabeçalho com ## Contents não está no formato esperado"
+open(p,"w",encoding="utf-8").write(s.replace(old,"\n*/}}\n{{/* td:core:intro */ -}}",1))
+EOF
+expect_fail "comentário de cabeçalho fechado SEM o trim '-}}' (sobraria um \\n no prompt de todo agente)" "comentário de cabeçalho só pode fechar numa linha exata"
+reset_tree; python3 - "$T/packs/town-deltas/template-fragments/town-deltas.template.md" <<'EOF'
+import sys
+p=sys.argv[1]; s=open(p,encoding="utf-8").read()
+old="\n*/ -}}\n{{/* td:core:intro */ -}}"; assert old in s, "mutação não aplicou: o cabeçalho com ## Contents não está no formato esperado"
+open(p,"w",encoding="utf-8").write(s.replace(old,"\n*/ -}}\ntexto solto entre o cabeçalho e o 1º marcador\n{{/* td:core:intro */ -}}",1))
+EOF
+expect_fail "texto solto depois do comentário de cabeçalho continua reprovado (só o comentário é aceito fora de bloco)" "texto fora de qualquer bloco marcado"
+reset_tree; python3 - "$T/packs/town-deltas/template-fragments/town-deltas.template.md" <<'EOF'
+import sys
+p=sys.argv[1]; s=open(p,encoding="utf-8").read()
+old="\n*/ -}}\n{{/* td:core:intro */ -}}"; assert old in s, "mutação não aplicou: o cabeçalho com ## Contents não está no formato esperado"
+open(p,"w",encoding="utf-8").write(s.replace(old,"\n*/ -}}\n{{/*\nsegundo comentário solto\n*/ -}}\n{{/* td:core:intro */ -}}",1))
+EOF
+expect_fail "um SEGUNDO comentário de cabeçalho reprovado (a regra é um comentário só, não 'comentários à vontade')" "texto fora de qualquer bloco marcado"
 
 echo "== C. fiação: overlay_dir + TD_ROLE por papel (city.toml patches + agent.toml)"
 wiring_check() { python3 - "$1" "$2" <<'EOF'
