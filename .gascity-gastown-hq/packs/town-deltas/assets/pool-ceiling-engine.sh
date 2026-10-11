@@ -555,12 +555,12 @@ _pce_sweep_locked() {
 
   # 5. the fragment as it is NOW (the file, not our state files, is the truth about the levels). THREE answers, never two (gate ga-marmt9: "could not read
   #    the levels" was acted on as "there are none" = a pool the pressure had LOWERED went back to committed): read (rc 0) -> cur_map, possibly none;
-  #    absent (rc 2) -> none (the repair above re-creates it EMPTY); UNKNOWN = FOREIGN (rc 1) or a file that EXISTS and cannot be read -> unk=1: gc may still
+  #    absent (rc 2) -> none (the repair above re-creates it EMPTY); UNKNOWN = FOREIGN (rc 1), a file that EXISTS and cannot be read, or a parser that died (rc not 0/1/2) -> unk=1: gc may still
   #    apply it (a trailing "# note" is valid TOML and keeps the level), so "no entries" is not a reading. Every pool restarts from its FLOOR (step 6).
   local cur_txt cur_map="" prc unk=0 foreign_note="$PCE_STATE/foreign-notified"
   cur_txt=$(pce_fragment_parse); prc=$?
-  # vazio (rc 0, no entries) → every pool at its committed value; falhou/ilegível (rc 1, or rc 2 on a file that exists) → levels UNKNOWN (unk=1), never "none"
-  if [ "$prc" = "1" ] || { [ "$prc" = "2" ] && [ -e "$PCE_FRAGMENT" ]; }; then unk=1; fi
+  # vazio (rc 0, no entries) → every pool at its committed value; falhou/ilegível (rc 1, rc 2 on a file that exists, or ANY other rc: awk killed 137 / not found 127) → levels UNKNOWN (unk=1), never "none"; absent = rc 2 AND no file
+  case "$prc" in 0) ;; 2) [ -e "$PCE_FRAGMENT" ] && unk=1 ;; *) unk=1 ;; esac
   case "$prc" in
     0) cur_map=$(printf '%s' "$cur_txt" | tr '\n' ' '); cur_map="${cur_map% }"
        [ "$PCE_DRY" = "1" ] || rm -f "$foreign_note" 2>/dev/null ;;   # a file the engine can read again ends the episode: the next foreign one is reported again
@@ -573,7 +573,7 @@ _pce_sweep_locked() {
          : > "$foreign_note" 2>/dev/null
          pce_log "event=fragment-foreign" "prc=$prc" "levels=unknown" "action=rewrite-from-model-with-every-pool-at-its-floor"
          if [ "$prc" = "1" ]; then pce_notify "pool-ceiling-engine: $PCE_FRAGMENT is not what the engine wrote (hand edit or an old version) - its levels are UNKNOWN, so it is rewritten from the model with every pool at its floor; they climb back by the normal rule"
-         else pce_notify "pool-ceiling-engine: $PCE_FRAGMENT exists but cannot be READ (permissions?) - its levels are UNKNOWN, so it is rewritten from the model with every pool at its floor; they climb back by the normal rule"; fi
+         else pce_notify "pool-ceiling-engine: $PCE_FRAGMENT exists but cannot be READ (permissions, or its parser died: see prc= in the log) - its levels are UNKNOWN, so it is rewritten from the model with every pool at its floor; they climb back by the normal rule"; fi
        fi ;;
   esac
 

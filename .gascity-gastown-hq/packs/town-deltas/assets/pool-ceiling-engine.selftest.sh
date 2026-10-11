@@ -703,6 +703,21 @@ mk_city s16s4; eng_quiet "$T0" 7000 11264; chmod 000 "$C/.gc/pool-ceiling-engine
 eng_quiet $((T0 + 300)) 4000 7000; chmod 644 "$C/.gc/pool-ceiling-engine.toml"
 eq "$(resolved gate-reviewer)/$(levels)" "2/gate-reviewer=2" "a fragment that EXISTS but cannot be read is not an ABSENT one: its levels are unknown too, the pool stays at 2"
 has "$(events fragment-foreign)" "prc=2" "and the log names it (read failed, not foreign content)"
+# The parser's own exit code is a THREE-way answer as well (gate round 7): only 0 (read) and 2 with NO file (absent) are answers; 1 (foreign) and ANY other code - awk killed
+# under the very memory pressure this engine exists for (137) or not found (127) - mean the levels could not be READ. Read as "absent" it handed a lowered pool back to its
+# committed value in the band. The shim fails ONLY the parser's awk program (the only one that defines `function fin`): the fake gc and the lib's awk run for real.
+mkdir -p "$TMPROOT/awkx"; printf '#!/bin/sh\ncase "$*" in *"function fin()"*) exit "${AWK_SHIM_RC:-137}" ;; esac\nexec /usr/bin/awk "$@"\n' > "$TMPROOT/awkx/awk"; chmod +x "$TMPROOT/awkx/awk"
+for ar in 137 127; do
+  mk_city "s16a$ar"; eng_quiet "$T0" 7000 11264
+  eng_quiet $((T0 + 300)) 4000 7000 PATH="$TMPROOT/awkx:$PATH" AWK_SHIM_RC="$ar"
+  eq "$(resolved gate-reviewer)/$(levels)" "2/gate-reviewer=2" "a parser that exits $ar on an EXISTING fragment, in the band (swap 4000, disk 7000): gate-reviewer stays lowered at 2 - not rewritten empty = raised to its committed 3"
+  hasnt "$(events fragment-absent)" "fragment-absent" "and the log does not call a file that exists ABSENT"
+  has "$(events fragment-foreign)" "prc=$ar" "the log says the levels were UNKNOWN and names the parser's rc"
+  eng_quiet $((T0 + 600)) 4000 7000
+  eq "$(resolved gate-reviewer)/$(levels)" "2/gate-reviewer=2" "the parser healthy again, still in the band: still 2 (the read is a reading, not a raise)"
+done
+mk_city s16a0; eng_quiet "$T0" 7000 11264; rm -f "$C/.gc/pool-ceiling-engine.toml"; blk; eng_quiet $((T0 + 300)) 4000 7000; unblk
+has "$(events fragment-absent)" "fragment-absent" "control: a fragment that is really ABSENT (and cannot be re-created) is still read as absent - the file is the evidence, not the rc"
 # a file that BREAKS THE CONFIG LOAD cannot be preflighted (gc config show fails because of that very file): it is the suspect, emptied first, then the model is written
 brk() { printf '[[patches.agent\nname = "wa-worker"\n' > "$C/.gc/pool-ceiling-engine.toml"; }
 mk_city s16s5; brk; eng_quiet "$T0" 7000 11264
@@ -1151,7 +1166,7 @@ M = [
  # the defect of gate round ga-marmt9: a fragment whose levels could not be READ was acted on as "no entries" (a raise), and one that breaks the load was never repaired
  ("foreign-levels-read-as-none", "16", 'if [ "$unk" = "1" ]; then L="$floor"; else L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" || L="$C"; fi', 'L=$(_pce_map_get "$cur_map" "$pool"); _pce_int "$L" || L="$C"'),
  ("foreign-restarts-from-committed-not-floor", "16", 'then L="$floor"; else L=$(_pce_map_get', 'then L="$C"; else L=$(_pce_map_get'),
- ("unreadable-file-read-as-absent", "16", 'if [ "$prc" = "1" ] || { [ "$prc" = "2" ] && [ -e "$PCE_FRAGMENT" ]; }; then unk=1; fi', 'if [ "$prc" = "1" ]; then unk=1; fi'),
+ ("unreadable-file-read-as-absent", "16", 'case "$prc" in 0) ;; 2) [ -e "$PCE_FRAGMENT" ] && unk=1 ;; *) unk=1 ;; esac', 'case "$prc" in 0) ;; 2) ;; *) unk=1 ;; esac'),
  ("foreign-and-unknown-ceiling-rewritten", "16", 'if [ "$unk" = "1" ] && [ -n "$skipped" ]; then', 'if false; then'),
  ("foreign-notifies-every-sweep", "16", 'elif [ ! -e "$foreign_note" ]; then', 'elif true; then'),
  ("foreign-episode-never-ends", "16", '[ "$PCE_DRY" = "1" ] || rm -f "$foreign_note" 2>/dev/null ;;', ': ;;'),
@@ -1180,6 +1195,8 @@ M = [
  ("lock-error-episode-never-ends", "17", '0) rm -f "$PCE_STATE/lock-error" 2>/dev/null ;;', '0) ;;'),
  ("lock-error-dedup-shares-the-condition-key", "16", 'elif [ ! -e "$PCE_STATE/lock-error" ]; then : > "$PCE_STATE/lock-error" 2>/dev/null;', 'elif pce_log_change "lock-error" "event=lock-error-key"; then'),
  ("undated-emptying-writes-a-counter-with-an-empty-date", "16", '[ -n "$(_pce_date_of "$PCE_NOW")" ] || { pce_log "event=state-write-failed" "what=daily-counter"', 'true || { pce_log "event=state-write-failed" "what=daily-counter"'),
+ # gate round 7: a parser rc outside {0,1,2} (awk killed / not found) read as "fragment absent" and RAISED a lowered pool: the old two-clause test that only knew rc 1 and rc 2
+ ("parser-rc-outside-0-1-2-reads-as-absent", "16", 'case "$prc" in 0) ;; 2) [ -e "$PCE_FRAGMENT" ] && unk=1 ;; *) unk=1 ;; esac', 'if [ "$prc" = "1" ] || { [ "$prc" = "2" ] && [ -e "$PCE_FRAGMENT" ]; }; then unk=1; fi'),
 ]
 names = []
 for name, secs, old, new in M:
