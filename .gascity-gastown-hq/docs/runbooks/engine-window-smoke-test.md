@@ -84,11 +84,11 @@ surface() {  # $1 = binário gc; imprime "cmd" e "cmd sub", um por linha, ordena
 surface "$CAND" > "$OUT/cand.txt"
 if [ ! -s "$BASE" ] || [ ! -s "$OUT/cand.txt" ]; then
   echo "UNKNOWN: baseline ou candidato vazio — o binário nem rodou? NÃO trate como PASS"
-elif [ -n "$(comm -23 "$BASE" "$OUT/cand.txt")" ]; then
-  echo "FAIL — o candidato PERDEU (existia no baseline):"; comm -23 "$BASE" "$OUT/cand.txt"
+elif [ -n "$(LC_ALL=C comm -23 "$BASE" "$OUT/cand.txt")" ]; then
+  echo "FAIL — o candidato PERDEU (existia no baseline):"; LC_ALL=C comm -23 "$BASE" "$OUT/cand.txt"
 else
   echo "PASS"; echo "novos no candidato (informativo — atualize o baseline se for intencional):"
-  comm -13 "$BASE" "$OUT/cand.txt"
+  LC_ALL=C comm -13 "$BASE" "$OUT/cand.txt"
 fi
 ```
 
@@ -96,6 +96,10 @@ fi
 - `FAIL` aqui **bloqueia o swap**. O 08/09 teria saído como `FAIL — o candidato PERDEU: dolt;
   dolt cleanup; … dolt sync` (15 linhas) com o binário ainda no disco e a cidade intocada.
 - Candidato que nem executa dá `surface` vazio → `UNKNOWN`, nunca `PASS` (erro ≠ "nada a reportar").
+- O `surface` descarta o stderr, então uma chamada `--help` que estourou/falhou some igual a um
+  comando removido. Se o `FAIL` listar só os subcomandos de UM grupo, rode `"$CAND" <grupo> --help`
+  à mão antes de concluir que o grupo sumiu; se o grupo inteiro (como `dolt` em 08/09) some do
+  `--help` raiz, aí não há dúvida.
 - `gc bd` é só repasse para o binário `bd` (usa outros cabeçalhos de ajuda, não "Available
   Commands:"), então os subcomandos dele **não** entram no baseline; o `bd` é coberto no Passo B.
 - **Atualizar o baseline:** só quando a mudança de comando for INTENCIONAL (upstream renomeou,
