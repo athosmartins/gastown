@@ -1425,26 +1425,59 @@ gap2_marker_for_bead() {
 # from dog-3" — the old grep read that as a refusal and the reconciler stamped
 # pool:refused on a bead that was in_progress with a live builder, which is
 # exactly the label inflight-reclaim-guard acts on. A close_reason counts only
-# when its FIRST line opens with the token (leading whitespace aside) and the
-# token is followed by a separator (an em/en dash, a colon, a spaced hyphen) or
-# ends the line — never prose. A refusal written some other way (e.g. "refused
-# (pool:refused:x): ...") is not claimed here; a worker that wants GAP-2 to see
-# it puts the LABEL on the sling, which tiers 1-2 read as the signal.
+# when its FIRST non-blank line opens with the token (leading whitespace aside)
+# and the token is followed by a separator — an em/en dash, a colon that is
+# itself followed by whitespace or the end of the line, a spaced hyphen — or
+# ends the line (one final "." allowed), never prose. A refusal written some
+# other way (e.g. "refused (pool:refused:x): ...", "pool:refused:x needs a go
+# build", "**pool:refused:x** — ...") is not claimed here — and says so on
+# stderr, see below; a worker that wants GAP-2 to see it puts the LABEL on the
+# sling, which tiers 1-2 read as the signal.
+#
+# The token is extracted GREEDILY and on its own (slug and all), and only THEN is
+# what follows it judged. It is not one regex "token + separator + rest" because
+# that shape backtracks: gate attempt 1 of ga-zuhlzr showed a bare ":" among the
+# separator alternatives re-matching the colon that STARTS the slug once the slug
+# was followed by anything else, so "pool:refused:foo would make ..." came back
+# as the truncated bare "pool:refused" — a token that is not in the text, which
+# is both the prose false positive this tier exists to close and a real
+# "pool:refused:engine-rebuild-required." losing the slug the engine-window path
+# keys on. With the slug already consumed, the separator test cannot reach back
+# into it.
 gap2_refused_token() {
   local sling_labels="$1" parent_labels="$2" sling_close_reason="$3" tok=""
   tok=$(printf '%s' "$sling_labels" | grep -oE 'pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
   [ -z "$tok" ] && tok=$(printf '%s' "$parent_labels" | grep -oE 'pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
   # vazio → "" (no refusal: GAP-2 carries on to the pass/no-changes arms);
-  # falhou/ilegível → "" too — here that IS the inert state, because a token
-  # that cannot be read stamps nothing, whereas a guessed one stamps
-  # pool:refused on a bead and hands it to inflight-reclaim-guard. Literal
-  # alternation for the dashes (no [—–] bracket class): a bracket class
-  # mis-sizes a multibyte char under the C locale, and launchd's minimal
-  # environment cannot be assumed to carry a UTF-8 one — see
+  # falhou/ilegível → "" too, NEVER a guessed token: a guessed one stamps
+  # pool:refused on a bead and hands it to inflight-reclaim-guard. "" is not
+  # free of consequence — a REAL refusal this tier does not read falls to
+  # gap2_no_changes_token and then free:pass-stranded, which on a parent with
+  # no active marker and no merge ends in gap2_arm_needs_remerge, i.e. Pilot
+  # walks a fresh builder into the same refusal (the loop ga-eu75w exists to
+  # stop, via the pool:refused stamp). That is the deliberate trade (a live bead taken from its
+  # builder is worse), which is why the rejected-but-mentions-it case is logged
+  # rather than silent. Literal alternation for the dashes (no [—–] bracket
+  # class): a bracket class mis-sizes a multibyte char under the C locale, and
+  # launchd's minimal environment cannot be assumed to carry a UTF-8 one — see
   # gap2_no_changes_token (ga-hr44j).
-  [ -z "$tok" ] && tok=$(printf '%s' "$sling_close_reason" | head -1 \
-    | sed -nE 's/^[[:space:]]*(pool:refused(:[A-Za-z0-9_-]+)?)(—|–|:|[[:space:]]+(—|–|-)|[[:space:]]*$).*/\1/p' \
-    | head -1 || echo "")
+  if [ -z "$tok" ]; then
+    local first lead rest
+    first=$(printf '%s\n' "$sling_close_reason" | sed -n '/[^[:space:]]/{p;q;}')
+    lead=$(printf '%s' "$first" | grep -oE '^[[:space:]]*pool:refused(:[A-Za-z0-9_-]+)?' | head -1 || echo "")
+    if [ -n "$lead" ]; then
+      rest=${first#"$lead"}
+      # printf '%s\n': grep matches per LINE, so an empty $rest (the token ends
+      # the line) must still be one — with no newline it is zero lines and never matches.
+      if printf '%s\n' "$rest" | grep -qE '^(—|–|:([[:space:]]|$)|[[:space:]]+(—|–|-)|\.?[[:space:]]*$)'; then
+        tok=${lead#"${lead%%[![:space:]]*}"}
+      fi
+    fi
+    if [ -z "$tok" ] && printf '%s' "$sling_close_reason" | grep -q 'pool:refused'; then
+      printf '[%s] [quality-gate-guard] WARN: gap2_refused_token: a sling close_reason mentions pool:refused but does not OPEN with it as a refusal — not read as one (ga-zuhlzr); a refusal GAP-2 should see goes on the sling as a label\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" >&2
+    fi
+  fi
   printf '%s' "$tok"
 }
 

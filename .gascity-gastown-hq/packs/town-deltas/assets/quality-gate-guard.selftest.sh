@@ -198,6 +198,47 @@ r=$(gap2_refused_token "" "" $'Duplicate, nothing done.\npool:refused:engine-reb
 r=$(gap2_refused_token "" "" "pool:refusedfoo — not a token boundary"); [ "$r" = "" ] && ok "token glued to more letters is not a token → empty" || bad "glued got '$r'"
 r=$(gap2_refused_token "" "" "xpool:refused:foo — prefixed by another word"); [ "$r" = "" ] && ok "token preceded by other characters is not at the start → empty" || bad "prefixed got '$r'"
 r=$(gap2_refused_token "" "" "refused (pool:refused:mayor-owned-mission): coordination mission the Mayor runs"); [ "$r" = "" ] && ok "real ga-p7ubvf shape (token inside parentheses, label lives on the sling) → close_reason tier does not claim it" || bad "parenthesised got '$r'"
+# ── ga-zuhlzr gate attempt 1: a SLUG-bearing token must never come back truncated ─
+# THE BUG the first fix shipped: the separator alternation had a bare ":" among
+# its options, so when the slug was followed by anything that is not a
+# separator the regex backtracked, gave the slug up, and matched the colon that
+# STARTS the slug — returning the bare "pool:refused", a token that is not in
+# the text. Two harms: a slug-bearing PROSE sentence ("pool:refused:foo would
+# make ...") was still read as a refusal (the very bug this tier closes), and a
+# real "pool:refused:engine-rebuild-required." lost the slug that
+# engine-refusal-strip-watchdog / engine-window-queue key on. The bare-token
+# tests above could not see it: only a slug gives the regex something to give up.
+echo "gap2_refused_token: a slug-bearing token is returned whole or not at all, never truncated (ga-zuhlzr attempt 1)"
+r=$(gap2_refused_token "" "" "pool:refused:foo would make inflight-reclaim-guard take it away from dog-3" 2>/dev/null); [ "$r" = "" ] && ok "slug-bearing sentence-initial PROSE → empty (was the bare 'pool:refused': the false positive of the class)" || bad "slug-prose got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused:engine-rebuild-required." 2>/dev/null); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "slug + a single final period, nothing after → full slug (a real refusal keeps the reason the engine-window path keys on)" || bad "slug-period got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused:engine-rebuild-required needs go build" 2>/dev/null); [ "$r" = "" ] && ok "slug followed by a word → empty, not read as a refusal (same shape as the prose case; the label on the sling is how to be seen)" || bad "slug-word got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused:foo, needs a rebuild" 2>/dev/null); [ "$r" = "" ] && ok "slug followed by a comma and prose → empty" || bad "slug-comma got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused:engine-rebuild-required. Needs go build" 2>/dev/null); [ "$r" = "" ] && ok "slug + period + a second sentence → empty (the period only counts when nothing follows)" || bad "slug-period-prose got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused:foo:bar" 2>/dev/null); [ "$r" = "" ] && ok "slug followed by ':' + more slug-ish text (colon not followed by space) → empty" || bad "slug-colon-glued got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused:." 2>/dev/null); [ "$r" = "" ] && ok "'pool:refused:' + punctuation (no slug, colon not a separator here) → empty" || bad "colon-punct got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused:engine-rebuild-required —no space after the dash is still a dash" 2>/dev/null); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "slug + space + em dash glued to the next word → full slug" || bad "slug-emdash got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused:engine-rebuild-required — Needs a Go change" 2>/dev/null); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "slug + em dash + reason → full slug" || bad "slug-emdash-reason got '$r'"
+r=$(gap2_refused_token "" "" "pool:refused:engine-rebuild-required - Needs a Go change" 2>/dev/null); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "slug + spaced hyphen → full slug" || bad "slug-hyphen got '$r'"
+r=$(gap2_refused_token "" "" $'\n  \npool:refused:engine-rebuild-required — Needs a Go change' 2>/dev/null); [ "$r" = "pool:refused:engine-rebuild-required" ] && ok "blank lines BEFORE the token do not hide it (first NON-BLANK line is the start of the close_reason)" || bad "leading-blank got '$r'"
+# The property that failed, stated once over many shapes: whatever follows a
+# slug-bearing token, the answer is the whole slug-bearing token or nothing.
+# Anything else (the bare 'pool:refused') is a token that is not in the text.
+TRUNC_BAD=""; TRUNC_N=0
+for tail in '.' ',' ';' ')' ' needs go build' ' would make x take it away' ', needs a rebuild' '. Needs go build' ' — x' ' - x' ': x' ':' ':x' '!' '?' $' — x' $'\t— x' ' ... '; do
+  TRUNC_N=$((TRUNC_N+1))
+  r=$(gap2_refused_token "" "" "pool:refused:foo-bar$tail" 2>/dev/null)
+  case "$r" in ""|"pool:refused:foo-bar") ;; *) TRUNC_BAD="$TRUNC_BAD [tail='$tail' got '$r']" ;; esac
+done
+[ -z "$TRUNC_BAD" ] && ok "$TRUNC_N tails after 'pool:refused:foo-bar': every answer is the whole slug-bearing token or empty — never the truncated bare token" || bad "TRUNCATED token returned:$TRUNC_BAD"
+# The rejected-but-mentions-it case must be VISIBLE (third state, not silence):
+# a refusal this tier does not read falls to the pass arm, and a log line is the
+# only trace of why.
+w=$(gap2_refused_token "" "" "pool:refused on ga-j96y0n would make inflight-reclaim-guard take it away from dog-3." 2>&1 >/dev/null); case "$w" in *WARN*gap2_refused_token*pool:refused*) ok "close_reason that mentions the token but is not a refusal → one WARN line on stderr" ;; *) bad "no WARN for a rejected mention, stderr='$w'" ;; esac
+w=$(gap2_refused_token "" "" '**pool:refused:engine-rebuild-required** — Needs Go source change' 2>&1 >/dev/null); case "$w" in *WARN*) ok "markdown-wrapped refusal (silently dropped before) → WARN, so the miss is visible" ;; *) bad "no WARN for a markdown-wrapped refusal, stderr='$w'" ;; esac
+w=$(gap2_refused_token "" "" "pool:refused:engine-rebuild-required — Needs Go source change" 2>&1 >/dev/null); [ -z "$w" ] && ok "an accepted refusal is silent" || bad "accepted refusal wrote to stderr: '$w'"
+w=$(gap2_refused_token "" "" "gate-failed, see review comments" 2>&1 >/dev/null); [ -z "$w" ] && ok "a close_reason that never mentions the token is silent (no WARN noise for the common case)" || bad "unrelated close_reason wrote to stderr: '$w'"
+w=$(gap2_refused_token "pool:refused:x" "" "Closed; pool:refused on y would be wrong" 2>&1 >/dev/null); [ -z "$w" ] && ok "a label hit short-circuits the close_reason tier: no scan, no WARN" || bad "label hit still warned: '$w'"
+r=$(gap2_refused_token "" "" "Closed; pool:refused on y would be wrong" 2>/dev/null); [ "$r" = "" ] && ok "the WARN path still returns empty on stdout (the log line must not leak into the captured token)" || bad "WARN path leaked into stdout: '$r'"
 # ga-hr44j REGRESSION PROOF (root cause): the real ga-zxfvh close_reason that
 # actually false-closed ga-i9q44 (2026-09-05 22:51Z) carries no pool:refused
 # token anywhere — gap2_refused_token correctly (per its own contract) finds
