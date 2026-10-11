@@ -44,8 +44,10 @@ MAX_SLOTS=${MBP_MAX_SLOTS:-3}
 SLOT_MAX_AGE=${MBP_SLOT_MAX_AGE_S:-14400}
 RUN_TIMEOUT=${MBP_RUN_TIMEOUT_S:-3600}
 SSH_BIN=${MBP_SSH:-ssh}
+umask 077
+mkdir -p "$HOME/.ssh/cm" 2>/dev/null && chmod 700 "$HOME/.ssh/cm" 2>/dev/null   # sockets do ssh ficam num dir privado, nunca em /tmp (mbp-sec 11/10)
 RSYNC_BIN=${MBP_RSYNC:-rsync}
-SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=auto -o ControlPath=/tmp/mbp-cm-%C -o ControlPersist=60"
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm/%C -o ControlPersist=60"
 ME="$(hostname -s 2>/dev/null || echo mini)"
 OWNER="$ME:$$:$(date +%s)"
 
@@ -53,7 +55,11 @@ EXCLUDES=(--exclude .git --exclude venv --exclude .venv --exclude crew --exclude
   --exclude shared/data --exclude __pycache__ --exclude node_modules --exclude '*.db' --exclude '*.db-wal'
   --exclude '*.db-shm' --exclude .pytest_cache
   --exclude /.beads --exclude /.repo.git --exclude /.viewer-deploy-clone --exclude /.playwright-mcp --exclude /.gc
-  --exclude /.claude --exclude /scratchpad --exclude /logs --exclude '/shared/logs*' --exclude '/shared/*backup*')
+  --exclude /.claude --exclude /scratchpad --exclude /logs --exclude '/shared/logs*' --exclude '/shared/*backup*'
+  --exclude '.env' --exclude '.env.*' --exclude '*.pem' --exclude '*.key' --exclude '*.p12' --exclude '*.pfx' --exclude '*.crt'
+  --exclude 'id_rsa*' --exclude 'id_ed25519*' --exclude '*.kdbx' --exclude 'credentials*.json' --exclude 'client_secret*.json'
+  --exclude 'cookies*.json' --exclude 'cookies*.txt' --exclude '*.session' --exclude 'auth/' --exclude 'auth-*/' --exclude 'auth_*/'
+  --exclude 'auth.bak*/' --exclude '*.sqlite' --exclude '*.sqlite3')   # nomes de módulo (auth_gate.py, pdpj_token.py) continuam indo: só dir/arquivo de credencial fica
 
 say() { printf 'mbp-run: %s\n' "$*" >&2; }
 usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//' >&2; }
@@ -228,7 +234,7 @@ fi
 preflight || exit $?
 acquire || exit $?
 T0=$(date +%s)
-TMPOUT=$(mktemp "${TMPDIR:-/tmp}/mbp-run.XXXXXX")
+mkdir -p "$CITY/.gc/run" 2>/dev/null; TMPOUT=$(mktemp "$CITY/.gc/run/mbp-run.XXXXXX")
 RC=0
 qargs=$(printf '%q ' "$@")
 
