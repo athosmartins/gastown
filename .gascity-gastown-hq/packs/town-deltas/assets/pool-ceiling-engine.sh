@@ -20,9 +20,9 @@
 # one that persists or proves wrong goes back to the EMPTY fragment, the inert state.
 #
 # SAFETY NETS (each proven by a mutant in pool-ceiling-engine.selftest.sh): read-back after EVERY write (a typo'd key is only a gc WARNING);
-# daily write breaker (POOL_CEILING_ENGINE_DAILY_MAX); mkdir lock; include state 1/0/? (.on without a definite 1 writes no level; fragment ABSENT
-# + include 1 or ? = re-created EMPTY FIRST in a sweep, ahead of every early exit - except under .off, whose own restore sits behind the clock / state-dir / lock gates).
-# SWITCHES (.gc/): pool-ceiling-engine.on — the engine acts ONLY with it (removing it does NOT empty the fragment); .off — KILL SWITCH, empties, wins over .on.
+# daily write breaker (POOL_CEILING_ENGINE_DAILY_MAX); mkdir lock (taken / a LIVE holder backs off / ERROR is reported, never read as a holder); include state 1/0/? (.on without a definite 1 writes no level; fragment ABSENT
+# + include 1 or ? = re-created EMPTY FIRST in a sweep, ahead of every early exit - except under .off, whose own restore creates it and runs even when the clock / state-dir / lock gates fail).
+# SWITCHES (.gc/): pool-ceiling-engine.on — the engine acts ONLY with it (removing it does NOT empty the fragment); .off — KILL SWITCH, empties, wins over .on, and never waits for the clock / state dir / lock (only a LIVE lock postpones it, by one sweep).
 # Subcommands: (none) = run | plan (print one sweep, write nothing) | status | reset (clear a trip + the daily counter) | check (read-only).
 #
 # NOT here (slice 3, Mayor, supervised): the city.toml include, the launchd job, the first .on, the kill-switch drill. gastown.dog stays out
@@ -319,29 +319,28 @@ _pce_lock_dead() { local pid; pid=$(head -n1 "$PCE_LOCK_HB" 2>/dev/null | cut -d
 _pce_lock_hb() { printf '%s\n' "$PCE_LOCK_TOKEN" > "$PCE_LOCK_HB" 2>/dev/null || true; }
 pce_lock_release() {
   [ "$(head -n1 "$PCE_LOCK_HB" 2>/dev/null || true)" = "$PCE_LOCK_TOKEN" ] || return 0
-  rm -f "$PCE_LOCK_HB" 2>/dev/null; rmdir "$PCE_LOCK_DIR" 2>/dev/null
-  return 0
+  rm -f "$PCE_LOCK_HB" 2>/dev/null; rmdir "$PCE_LOCK_DIR" 2>/dev/null; return 0
 }
-pce_lock_acquire() { # 0 = ours; 1 = a LIVE run holds it (back off, silently)
+pce_lock_acquire() { # 0 = ours; 1 = a LIVE run holds it (back off, silently); 2 = ERROR: it could not be taken and nobody holds it (not "a holder": the caller reports it)
   if mkdir "$PCE_LOCK_DIR" 2>/dev/null; then
-    _pce_lock_hb
-    [ -s "$PCE_LOCK_HB" ] || { rm -f "$PCE_LOCK_HB" 2>/dev/null; rmdir "$PCE_LOCK_DIR" 2>/dev/null; return 1; }
-    return 0
+    _pce_lock_hb; [ -s "$PCE_LOCK_HB" ] && return 0
+    rm -f "$PCE_LOCK_HB" 2>/dev/null; rmdir "$PCE_LOCK_DIR" 2>/dev/null; return 2   # the heartbeat did not land (ENOSPC / read-only): not a lock we hold, and nobody else holds it either
   fi
+  [ -d "$PCE_LOCK_DIR" ] || return 2   # the mkdir failed and there is NO lock dir (EACCES, ENOSPC, ENOTDIR): nobody holds it; an age read off a dir that is not there says "fresh" = "a live holder"
   # The holder's age is its heartbeat's; with NO heartbeat (a crash between mkdir and the first write) it is the dir's own, else it reads "mid-race, live" for ever.
   local age
   if [ -e "$PCE_LOCK_HB" ]; then age=$(_pce_lock_age "$PCE_LOCK_HB"); else age=$(_pce_lock_age "$PCE_LOCK_DIR"); fi
   if [ "$age" -lt "$PCE_LOCK_TTL" ] && ! _pce_lock_dead; then return 1; fi
   local reaping="$PCE_LOCK_DIR.reaping"
   if ! mkdir "$reaping" 2>/dev/null; then
-    if [ "$(_pce_lock_age "$reaping")" -ge 10 ]; then rmdir "$reaping" 2>/dev/null || true; fi
-    mkdir "$reaping" 2>/dev/null || return 1
+    if [ -d "$reaping" ] && [ "$(_pce_lock_age "$reaping")" -ge 10 ]; then rmdir "$reaping" 2>/dev/null || true; fi
+    mkdir "$reaping" 2>/dev/null || { [ -d "$reaping" ] && return 1; return 2; }   # another reaper's marker is there: live; no marker and none could be made: error
   fi
   # single winner: re-check under the reaping marker
   if [ -e "$PCE_LOCK_HB" ] && [ "$(_pce_lock_age "$PCE_LOCK_HB")" -lt "$PCE_LOCK_TTL" ] && ! _pce_lock_dead; then rmdir "$reaping" 2>/dev/null || true; return 1; fi
   _pce_lock_hb
   rmdir "$reaping" 2>/dev/null || true
-  [ -s "$PCE_LOCK_HB" ] || return 1
+  [ "$(head -n1 "$PCE_LOCK_HB" 2>/dev/null || true)" = "$PCE_LOCK_TOKEN" ] || return 2   # vazio / falhou / ilegível -> NOT ours (error): ours only if OUR token landed - the dead holder's old heartbeat is not empty either
   pce_log "event=lock-reclaimed" "holder_age_s=$age" "ttl_s=$PCE_LOCK_TTL"
   return 0
 }
@@ -363,10 +362,7 @@ pce_state_ok() {
 pce_state_get() { local v; v=$(_pce_kv "$PCE_STATE/$1.state" "$2"); _pce_int "$v" && printf '%s' "$v" || printf '0'; }
 pce_state_put() { # <pool> <clear_streak> <unknown_streak> <last_sweep_at> <last_write_at>
   [ "$PCE_DRY" = "1" ] && return 0
-  _pce_atomic_put "$PCE_STATE/$1.state" "clear_streak=$2
-unknown_streak=$3
-last_sweep_at=$4
-last_write_at=$5" || pce_log "event=state-write-failed" "what=$1.state" "effect=the streaks and the rate limit of $1 restart as if its file were absent"
+  _pce_atomic_put "$PCE_STATE/$1.state" "clear_streak=$2"$'\n'"unknown_streak=$3"$'\n'"last_sweep_at=$4"$'\n'"last_write_at=$5" || pce_log "event=state-write-failed" "what=$1.state" "effect=the streaks and the rate limit of $1 restart as if its file were absent"
 }
 pce_daily_writes() { # writes counted today: 0 on a new day or when there is no file YET; the LIMIT when the file exists but cannot be read
   local d w
@@ -378,15 +374,13 @@ pce_daily_writes() { # writes counted today: 0 on a new day or when there is no 
 }
 pce_daily_bump() {
   [ "$PCE_DRY" = "1" ] && return 0
+  [ -n "$(_pce_date_of "$PCE_NOW")" ] || { pce_log "event=state-write-failed" "what=daily-counter" "effect=a write that cannot be dated (clock unreadable) is not counted: a counter with an empty date reads as at-the-limit for ever"; return 0; }
   local w; w=$(pce_daily_writes)
-  _pce_atomic_put "$PCE_STATE/daily" "date=$(_pce_date_of "$PCE_NOW")
-writes=$((w + 1))" || pce_log "event=state-write-failed" "what=daily-counter" "effect=the breaker may undercount today's writes"
+  _pce_atomic_put "$PCE_STATE/daily" "date=$(_pce_date_of "$PCE_NOW")"$'\n'"writes=$((w + 1))" || pce_log "event=state-write-failed" "what=daily-counter" "effect=the breaker may undercount today's writes"
 }
 pce_trip() { # <daily|manual> <reason>
   [ "$PCE_DRY" = "1" ] && return 0
-  _pce_atomic_put "$PCE_STATE/tripped" "kind=$1
-date=$(_pce_date_of "$PCE_NOW")
-reason=$2" || pce_log "event=state-write-failed" "what=trip" "effect=the trip may not hold; the callers empty the fragment regardless"
+  _pce_atomic_put "$PCE_STATE/tripped" "kind=$1"$'\n'"date=$(_pce_date_of "$PCE_NOW")"$'\n'"reason=$2" || pce_log "event=state-write-failed" "what=trip" "effect=the trip may not hold; the callers empty the fragment regardless"
 }
 
 pce_fragment_is() { printf '%s\n' "$1" | cmp -s - "$PCE_FRAGMENT" 2>/dev/null; }   # file == content, byte for byte (absent => no)
@@ -439,8 +433,8 @@ pce_preflight() {
   return 0
 }
 
-# pce_restore <reason> — the INERT state: the empty fragment. Always allowed (the breaker only blocks non-empty writes), counts
-# as a write, resets the per-pool streaks. rc 0 = the file is now the empty body.
+# pce_restore <reason> — the INERT state: the empty fragment. Always allowed (the breaker only blocks non-empty writes). When it WRITES it counts
+# as a write (if the clock can date it) and resets the per-pool streaks; already empty = nothing changes. rc 0 = the file is now the empty body.
 pce_restore() {
   local reason="$1" empty had=""
   empty=$(pce_fragment_render "") || return 1
@@ -476,24 +470,32 @@ pce_repair_missing_fragment() {
   return 0
 }
 
+# _pce_gate_failed <reason> — a gate in front of the sweep failed (clock, state dir, lock): nothing is raised or lowered, but the KILL SWITCH never waits for a gate: emptying is idempotent, so under .off it runs here,
+# lock-free (_pce_sweep_locked with has_off=1 does ONLY that). A lock that could not be TAKEN is an error, not a live holder. vazio (no lock-error marker) -> a NEW episode: logged + notified once; a taken lock clears it; falhou/ilegível (marker unwritable) -> every sweep reports.
+_pce_gate_failed() {
+  if [ "$1" != "lock-error" ]; then pce_log "event=skip" "reason=$1"
+  elif [ ! -e "$PCE_STATE/lock-error" ]; then : > "$PCE_STATE/lock-error" 2>/dev/null; pce_log "event=lock-error" "reason=no lock dir could be made, or its heartbeat could not be written, and no live run holds it: this sweep does not run"; pce_notify "pool-ceiling-engine: cannot take its lock ($PCE_LOCK_DIR) and nobody holds it - sweeps are NOT running (disk full / permissions under $PCE_STATE?)"; fi
+  [ ! -e "$PCE_OFF_FILE" ] || _pce_sweep_locked "?" 1
+  return 0
+}
+
 pce_sweep() {
-  local rc=0
+  local rc=0 lrc=0
   PCE_NOW=$(_pce_now)
-  [ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST: no early exit below (clock, state dir, lock, date, trip, disabled) may leave an ABSENT fragment unrepaired - except with .off: its own, loud restore is step 1, behind the clock / state-dir / lock gates, so .off + one of those failing + an ABSENT fragment stays absent (a log line only)
-  if [ -z "$PCE_NOW" ]; then PCE_NOW="?"; pce_log "event=skip" "reason=clock-unreadable"; return 0; fi
+  [ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST: no early exit below (clock, state dir, lock, date, trip, disabled) may leave an ABSENT fragment unrepaired - except with .off: its restore creates the file, and a failing clock / state-dir / lock gate still runs it (_pce_gate_failed)
+  if [ -z "$PCE_NOW" ]; then PCE_NOW="?"; _pce_gate_failed clock-unreadable; return 0; fi
 
   local has_on=0 has_off=0 include
   [ -e "$PCE_ON_FILE" ] && has_on=1; [ -e "$PCE_OFF_FILE" ] && has_off=1
   include=$(pce_include_state)
 
   # Disabled: silent and inert (the repair above is the one thing that cannot make anything worse).
-  if [ "$has_on" = "0" ] && [ "$has_off" = "0" ] && [ "$PCE_DRY" != "1" ]; then
-    return 0
-  fi
+  if [ "$has_on" = "0" ] && [ "$has_off" = "0" ] && [ "$PCE_DRY" != "1" ]; then return 0; fi
 
   if [ "$PCE_DRY" = "1" ]; then _pce_sweep_locked "$include" "$has_off"; return $?; fi
-  mkdir -p "$PCE_STATE" 2>/dev/null || { pce_log "event=skip" "reason=state-dir-unwritable"; return 0; }
-  pce_lock_acquire || return 0
+  mkdir -p "$PCE_STATE" 2>/dev/null || { _pce_gate_failed state-dir-unwritable; return 0; }
+  pce_lock_acquire || lrc=$?   # 1 = a LIVE run holds it: back off, silently. 2 = it could not be taken and nobody holds it: an ERROR, never "a holder"
+  case "$lrc" in 0) rm -f "$PCE_STATE/lock-error" 2>/dev/null ;; 2) _pce_gate_failed lock-error; return 0 ;; *) return 0 ;; esac
   _pce_sweep_locked "$include" "$has_off"; rc=$?
   pce_lock_release
   return "$rc"
@@ -621,6 +623,13 @@ _pce_sweep_locked() {
     pce_log "event=sweep" "pool=$pool" "committed=$C" "worktree_cap=${wt:-?}" "cur=$L" "new=$new" "reason=$reason" "pressure=$pressure" "swap_used_mb=${swap:-?}" "disk_free_mb=${disk:-?}" "clear_streak=$cs" "unknown_streak=$us" "counted=$counted"
   done
 
+  # 6a. what this sweep READ is stored NOW, before any exit below: a refused / failed / skipped write (preflight, write, 6b) must not take the readings with it - a HIGH reading that reset the clear streak
+  #     would vanish and the next clear sweep would count as the 2nd CONSECUTIVE one. A pool that moves gets its streak and last_write_at set again after the write (step 10).
+  for pool in $PCE_POOLS; do
+    _pce_int "$(_pce_map_get "$proposed" "$pool")" || continue
+    pce_state_put "$pool" "$(_pce_map_get "$cs_map" "$pool")" "$(_pce_map_get "$us_map" "$pool")" "$(_pce_map_get "$lsw_map" "$pool")" "$(_pce_map_get "$lw_map" "$pool")"
+  done
+
   # 6b. levels UNKNOWN (step 5) and a pool whose committed ceiling is ALSO unreadable: nothing can be held for it (there is no entry to carry, step 8) and an entry
   #     could only be guessed; leaving it out hands the pool back to a committed value nobody could read = a raise. So nothing is rewritten: the file stays as it is.
   if [ "$unk" = "1" ] && [ -n "$skipped" ]; then
@@ -655,7 +664,7 @@ _pce_sweep_locked() {
     return 0
   fi
 
-  # 9. persist the bookkeeping for pools whose level did not change; changed pools get last_write_at = now below
+  # 9. which pools move (the bookkeeping of every pool was stored in 6a)
   local changed=""
   for pool in $PCE_POOLS; do
     new=$(_pce_map_get "$proposed" "$pool"); _pce_int "$new" || continue
@@ -666,10 +675,6 @@ _pce_sweep_locked() {
   # Nothing to do when the file already says the same thing (same entries; the comment header is irrelevant) and no pool moved.
   if [ "$prc" = "0" ] && [ "$cur_map" = "$dev" ] && [ -z "$changed" ]; then
     [ "$PCE_DRY" != "1" ] || pce_log "event=no-change" "levels=${dev:-<committed>}" "pressure=$pressure"
-    for pool in $PCE_POOLS; do
-      _pce_int "$(_pce_map_get "$proposed" "$pool")" || continue
-      pce_state_put "$pool" "$(_pce_map_get "$cs_map" "$pool")" "$(_pce_map_get "$us_map" "$pool")" "$(_pce_map_get "$lsw_map" "$pool")" "$(_pce_map_get "$lw_map" "$pool")"
-    done
     pce_clear_condition
     return 0
   fi

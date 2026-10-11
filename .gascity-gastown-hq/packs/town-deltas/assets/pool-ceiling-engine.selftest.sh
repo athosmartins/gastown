@@ -107,6 +107,8 @@ PYTL=""; for p in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do "
 [ -n "$PYTL" ] || { echo "FAIL: no python3 >= 3.11 (tomllib) on this host: the engine cannot read city.toml's include array (pce_include_state)"; exit 1; }
 printf '#!/bin/sh\nexit 1\n' > "$TMPROOT/bin/py-crash"; printf '#!/bin/sh\necho yes\n' > "$TMPROOT/bin/py-junk"; printf '#!/bin/sh\necho 1\nexit 1\n' > "$TMPROOT/bin/py-late-crash"
 chmod +x "$TMPROOT/bin/py-crash" "$TMPROOT/bin/py-junk" "$TMPROOT/bin/py-late-crash"
+# a mkdir that creates the LOCK dir read-only: the lock can be made but its heartbeat cannot be written (the ENOSPC / read-only-fs analogue; PATH-first, only for the runs that ask for it)
+mkdir -p "$TMPROOT/rolock"; printf '#!/bin/sh\n/bin/mkdir "$@" || exit $?\ncase "$*" in *lock.d) chmod 555 "$1"; echo "$1" >> "%s/rolock.log" ;; esac\n' "$TMPROOT" > "$TMPROOT/rolock/mkdir"; chmod +x "$TMPROOT/rolock/mkdir"
 # The engine runs under the interpreter the launchd model names (/bin/bash: 3.2 on macOS), never under whichever bash is first on PATH: a
 # "bash 3.2 compatible" claim exercised only under bash 5 is not exercised (gate ga-a7bsxr: a parse error in `status` went unseen for that reason).
 ENGBASH="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$SELF_DIR/pool-ceiling-engine.plist.template" 2>/dev/null)"
@@ -475,6 +477,32 @@ for tc in 'no date line|reason=daily-breaker' 'empty date|date=\nreason=daily-br
   csw 3 "$T0"
   eq "$(levels)/$(nevents trip-expired)/$([ -e "$SD/tripped" ] && echo tripped || echo free)" "/0/tripped" "a daily trip with ${tc%%|*}: NOT expired, still tripped, nothing written"
 done
+# What a sweep READ must not vanish because the write it then wanted could not be made (gate ga-m9x0lb.2.2, round 4). A HIGH reading resets the clear streak; when the refused / failed
+# write took that reset with it, the next clear sweep counted as the 2nd CONSECUTIVE one and raised a pool one sweep after a HIGH reading. Three exits sit between the reading and the store.
+wa_last() { events sweep | grep 'pool=wa-worker' | tail -1; }   # the last decision logged for wa-worker
+mk_city s14h   # control: gc answers at the HIGH sweep, the lowering lands
+eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 300)) 7000 11264; eng_quiet $((T0 + 600)) 4000 11264
+eq "$(levels)" "gate-reviewer=2" "control: clear, HIGH, clear - the HIGH lowering of gate-reviewer landed"
+has "$(wa_last)" "reason=hold:clear-streak-1/2" "control: the clear sweep after a HIGH one is 1/2, not a raise"
+mk_city s14i   # the preflight cannot read the config at the HIGH sweep: the lowering is refused
+eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 300)) 7000 11264 FAKE_GC_MODE=fail; eng_quiet $((T0 + 600)) 4000 11264
+has "$(events preflight-failed)" "rc=2" "the lowering was refused (gc could not be read)"
+has "$(wa_last)" "reason=hold:clear-streak-1/2" "...and the HIGH reading still reset the clear streak: the next clear sweep is 1/2"
+eq "$(levels)" "" "so wa-worker was NOT raised one sweep after a HIGH reading"
+mk_city s14j   # the write itself fails at the HIGH sweep (.gc read-only), then works again
+eng_quiet "$T0" 4000 11264; chmod 555 "$C/.gc"; eng_quiet $((T0 + 300)) 7000 11264; chmod 755 "$C/.gc"; eng_quiet $((T0 + 600)) 4000 11264
+has "$(events write-failed)" "to=gate-reviewer=2" "the lowering could not be written"
+has "$(wa_last)" "reason=hold:clear-streak-1/2" "...and the HIGH reading still reset the clear streak: the next clear sweep is 1/2"
+eq "$(levels)" "" "so wa-worker was NOT raised one sweep after a HIGH reading"
+mk_city s14k   # 6b: the levels are UNKNOWN (foreign fragment) and a committed ceiling is unreadable: the sweep stops before any write
+eng_quiet "$T0" 4000 11264
+printf 'min_active_sessions = 0\n' > "$C/agents/ps-worker/agent.toml"; cm ps-unreadable; printf '# edited by hand\nfoo = 1\n' > "$C/.gc/pool-ceiling-engine.toml"
+eng_quiet $((T0 + 300)) 7000 11264
+has "$(events skip)" "levels are UNKNOWN and the committed ceiling unreadable" "the sweep stopped at 6b, nothing written"
+printf 'min_active_sessions = 0\nmax_active_sessions = 1\n' > "$C/agents/ps-worker/agent.toml"; cm ps-readable; printf '# empty\n' > "$C/.gc/pool-ceiling-engine.toml"
+eng_quiet $((T0 + 600)) 4000 11264
+has "$(wa_last)" "reason=hold:clear-streak-1/2" "...and the HIGH reading still reset the clear streak: the next clear sweep is 1/2"
+eq "$(levels)" "" "so wa-worker was NOT raised one sweep after a HIGH reading"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -777,6 +805,36 @@ mk_city s16r; rm -f "$C/.gc/pool-ceiling-engine.toml"
 eng_quiet "" 4000 11264 "PATH=$TMPROOT/noclock16:$PATH"
 eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo ABSENT)" "created" "ENABLED + include=1 + fragment absent + the CLOCK unreadable: the fragment is still re-created EMPTY"
 has "$(events skip)" "clock-unreadable" "and the sweep still says why it stopped"
+# The KILL SWITCH never waits for a gate (gate ga-m9x0lb.2.2, round 4). A clock that cannot be read, a state dir that cannot be made or written, a lock that cannot be TAKEN (an error, not a live
+# holder) used to end the sweep before the .off restore: .off + a raised fragment = the raised level stayed in force, and the operator who touched .off was told nothing.
+raised() { printf '[[patches.agent]]\ndir = ""\nname = "wa-worker"\nmax_active_sessions = 3\n' > "$C/.gc/pool-ceiling-engine.toml"; : > "$C/.gc/pool-ceiling-engine.off"; : > "$TMPROOT/notify.log"; eq "$(levels)" "wa-worker=3" "(precondition: the fragment starts RAISED, .off present)"; }
+mk_city s16t; raised; mkdir -p "$C/.gc/pool-ceiling-engine"; chmod 555 "$C/.gc/pool-ceiling-engine"   # the state dir exists but cannot be written: no lock dir can be made
+eng_quiet "$T0" 4000 11264; chmod 755 "$C/.gc/pool-ceiling-engine"
+eq "$(levels)" "" ".off + a raised fragment + a state dir that cannot be written (no lock can be made): the fragment is EMPTIED all the same"
+has "$(cat "$TMPROOT/notify.log")" "kill switch" "and the operator is told"
+has "$(events lock-error)" "event=lock-error" "and the lock failure is logged as an ERROR, not read as 'a live run holds it'"
+mk_city s16u; raised; : > "$C/.gc/pool-ceiling-engine"   # a FILE where the state dir should be: mkdir -p fails
+eng_quiet "$T0" 4000 11264
+eq "$(levels)" "" ".off + a raised fragment + no state dir can be made: EMPTIED all the same"
+has "$(events skip)" "state-dir-unwritable" "and the sweep still says why it stopped"
+mk_city s16v; raised; : > "$TMPROOT/rolock.log"
+eng_quiet "$T0" 4000 11264 "PATH=$TMPROOT/rolock:$PATH"
+eq "$(levels)" "" ".off + a raised fragment + a lock whose heartbeat cannot be written: EMPTIED all the same"
+eq "$(grep -c 'lock.d' "$TMPROOT/rolock.log")" "1" "(the run really got a lock dir whose heartbeat cannot be written - that is the failure under test)"
+has "$(events lock-error)" "event=lock-error" "and it is logged as a lock ERROR"
+eq "$([ -e "$C/.gc/pool-ceiling-engine/lock.d" ] && echo left || echo none)" "none" "and no half-made lock dir is left behind"
+mk_city s16y; : > "$C/.gc/pool-ceiling-engine.off"; mkdir -p "$C/.gc/pool-ceiling-engine"
+csw 3 "$T0" "PATH=$TMPROOT/rolock:$PATH"
+eq "$(nevents lock-error)" "1" ".off + a persistent lock error over 3 sweeps: reported ONCE (the kill switch's own 'already empty' line must not re-arm it)"
+eq "$(grep -c 'cannot take its lock' "$TMPROOT/notify.log" | tr -d ' ')" "1" "...and notified once"
+mk_city s16w; : > "$C/.gc/pool-ceiling-engine.off"; rm -f "$C/.gc/pool-ceiling-engine.toml"; mkdir -p "$C/.gc/pool-ceiling-engine"; chmod 555 "$C/.gc/pool-ceiling-engine"
+eng_quiet "$T0" 4000 11264; chmod 755 "$C/.gc/pool-ceiling-engine"
+eq "$([ -e "$C/.gc/pool-ceiling-engine.toml" ] && echo created || echo ABSENT)" "created" ".off + fragment ABSENT + the lock cannot be made: the kill switch's restore re-creates it EMPTY (it used to stay absent)"
+mk_city s16x; raised; mkdir -p "$C/.gc/pool-ceiling-engine"
+eng_quiet "" 4000 11264 "PATH=$TMPROOT/noclock16:$PATH"
+eq "$(levels)" "" ".off + a raised fragment + the CLOCK unreadable: EMPTIED all the same"
+eq "$([ -e "$C/.gc/pool-ceiling-engine/daily" ] && echo counter || echo none)" "none" "and that emptying, which cannot be dated, wrote no daily counter (an empty date would read as at-the-limit for ever)"
+has "$(events skip)" "clock-unreadable" "and the sweep still says why it stopped"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -811,6 +869,24 @@ eng_quiet $((T0 + 1200)) 4000 11264 "PATH=$TMPROOT/nostat:$PATH"
 eq "$(nevents sweep)" "0" "a heartbeat whose age CANNOT be read (no usable stat) is not 'ancient': the live holder is respected"
 eq "$([ -d "$LD" ] && echo held || echo taken)" "held" "and its lock is left alone"
 eq "$(events lock-age-unreadable | grep -c 'path=')" "1" "and the unreadable age is logged, never silent"
+rm -f "$LD/heartbeat" 2>/dev/null; rmdir "$LD" 2>/dev/null
+# A lock that cannot be TAKEN is an ERROR, never "a live holder" (gate ga-m9x0lb.2.2, round 4): a live holder backs off silently, an error is logged and notified once per episode.
+mk_city s17b; mkdir -p "$C/.gc/pool-ceiling-engine"; : > "$TMPROOT/rolock.log"
+csw 3 "$T0" "PATH=$TMPROOT/rolock:$PATH"
+eq "$(grep -c 'lock.d' "$TMPROOT/rolock.log")" "3" "(every one of the 3 runs got a lock dir whose heartbeat cannot be written - that is the failure under test)"
+eq "$(nevents sweep)" "0" "a lock whose heartbeat cannot be written is not ours, and nobody else holds it: no sweep runs"
+eq "$(nevents lock-error)" "1" "...and that is logged ONCE per episode, as an ERROR (not read as a live holder backing off silently)"
+eq "$(grep -c 'cannot take its lock' "$TMPROOT/notify.log" | tr -d ' ')" "1" "...and notified once"
+eng_quiet $((T0 + 900)) 4000 11264
+eq "$([ -e "$C/.gc/pool-ceiling-engine/lock-error" ] && echo marker || echo none)" "none" "a lock that can be taken again ENDS the episode (its marker is gone)"
+eng_quiet $((T0 + 1200)) 4000 11264 "PATH=$TMPROOT/rolock:$PATH"
+eq "$(nevents lock-error)/$(grep -c 'cannot take its lock' "$TMPROOT/notify.log" | tr -d ' ')" "2/2" "a NEW episode is reported again (log and notification)"
+mk_city s17c; LD="$C/.gc/pool-ceiling-engine/lock.d"; mkdir -p "$LD"
+sleep 0 & dp=$!; wait "$dp" 2>/dev/null; echo "$dp:gone" > "$LD/heartbeat"; touch -t 202001010000 "$LD/heartbeat"; chmod 444 "$LD/heartbeat"   # a DEAD holder whose heartbeat cannot be overwritten
+eng_quiet "$T0" 4000 11264
+chmod 644 "$LD/heartbeat"
+eq "$(nevents sweep)" "0" "a stale lock is reclaimed only when OUR heartbeat lands: the dead holder's old content is not ours - no sweep runs"
+eq "$(nevents lock-error)" "1" "...and that is an ERROR, not 'a live holder'"
 rm -f "$LD/heartbeat" 2>/dev/null; rmdir "$LD" 2>/dev/null
 fi
 
@@ -1034,7 +1110,7 @@ M = [
  ("corrupt-state-reads-as-never-written", "10", 'cs=0; us=0; lw="$PCE_NOW"', ':'),
  ("state-write-failure-is-silent", "10", ' || pce_log "event=state-write-failed" "what=$1.state" "effect=the streaks and the rate limit of $1 restart as if its file were absent"', ''),
  ("trip-write-failure-is-silent", "10", ' || pce_log "event=state-write-failed" "what=trip" "effect=the trip may not hold; the callers empty the fragment regardless"', ''),
- ("no-lock", "17", 'pce_lock_acquire || return 0', 'pce_lock_acquire || true'),
+ ("no-lock", "17", 'pce_lock_acquire || lrc=$?', 'lrc=0'),
  ("heartbeat-less-lock-never-reclaimed", "17", 'else age=$(_pce_lock_age "$PCE_LOCK_DIR"); fi', 'else age=0; fi'),
  ("lock-age-unreadable-reads-as-ancient", "17", 'the lock is respected"; echo 0; return 0; }', 'the lock is respected"; echo 999999999; return 0; }'),
  ("status-clock-unreadable-reads-as-epoch-zero", "15", 'PCE_NOW=$(_pce_now); PCE_NOW="${PCE_NOW:-?}"', 'PCE_NOW=$(_pce_now); PCE_NOW="${PCE_NOW:-0}"'),
@@ -1085,12 +1161,33 @@ M = [
  ("emptying-is-not-undone", "16", '*) mv -f "$aside" "$PCE_FRAGMENT" 2>/dev/null', '*) :'),
  ("emptying-kept-without-evidence", "16", '0|1) rm -f "$aside" 2>/dev/null ;;', '0|1|2|3) rm -f "$aside" 2>/dev/null ;;'),
  ("no-answer-reads-as-does-not-load", "16", r'''if [ "$rc" -eq 1 ] && printf '%s' "$out" | jq -e '.ok == false' >/dev/null 2>&1; then echo "gc config show: the config does not load"; return 3; fi''', r'''if [ "$rc" -ne 0 ]; then echo "gc config show: the config does not load"; return 3; fi'''),
+ # the defects of gate round ga-m9x0lb.2.2 #4: what a sweep READ vanished with a write that was refused, and a lock that could not be TAKEN was read as "a live holder" (the kill switch never ran)
+ # a list in the old/new slots = several hunks of ONE mutant, each target exactly once in the engine
+ ("readings-stored-only-when-nothing-changes", "14",
+  ['    _pce_int "$(_pce_map_get "$proposed" "$pool")" || continue\n    pce_state_put "$pool" "$(_pce_map_get "$cs_map" "$pool")"',
+   '"pressure=$pressure"\n    pce_clear_condition'],
+  ['    continue\n    pce_state_put "$pool" "$(_pce_map_get "$cs_map" "$pool")"',
+   '"pressure=$pressure"\n    for pool in $PCE_POOLS; do _pce_int "$(_pce_map_get "$proposed" "$pool")" || continue; pce_state_put "$pool" "$(_pce_map_get "$cs_map" "$pool")" "$(_pce_map_get "$us_map" "$pool")" "$(_pce_map_get "$lsw_map" "$pool")" "$(_pce_map_get "$lw_map" "$pool")"; done\n    pce_clear_condition']),
+ ("lock-error-reads-as-a-live-holder", "16 17", '[ -d "$PCE_LOCK_DIR" ] || return 2', ':'),
+ ("heartbeat-that-did-not-land-reads-as-a-live-holder", "16 17", 'rmdir "$PCE_LOCK_DIR" 2>/dev/null; return 2   # the heartbeat', 'rmdir "$PCE_LOCK_DIR" 2>/dev/null; return 1   # the heartbeat'),
+ ("dead-holders-heartbeat-reads-as-ours", "17", '[ "$(head -n1 "$PCE_LOCK_HB" 2>/dev/null || true)" = "$PCE_LOCK_TOKEN" ] || return 2   # vazio', '[ -s "$PCE_LOCK_HB" ] || return 1   # vazio'),
+ ("kill-switch-waits-for-the-gates", "16", '[ ! -e "$PCE_OFF_FILE" ] || _pce_sweep_locked "?" 1', ':'),
+ ("clock-gate-skips-the-kill-switch", "16", 'PCE_NOW="?"; _pce_gate_failed clock-unreadable; return 0', 'PCE_NOW="?"; pce_log "event=skip" "reason=clock-unreadable"; return 0'),
+ ("state-dir-gate-skips-the-kill-switch", "16", '|| { _pce_gate_failed state-dir-unwritable; return 0; }', '|| { pce_log "event=skip" "reason=state-dir-unwritable"; return 0; }'),
+ ("lock-gate-skips-the-kill-switch", "16", '2) _pce_gate_failed lock-error; return 0 ;;', '2) return 0 ;;'),
+ ("lock-error-is-logged-as-a-plain-skip", "17", 'if [ "$1" != "lock-error" ]; then pce_log "event=skip"', 'if true; then pce_log "event=skip"'),
+ ("lock-error-notifies-every-sweep", "17", 'elif [ ! -e "$PCE_STATE/lock-error" ]; then', 'elif true; then'),
+ ("lock-error-episode-never-ends", "17", '0) rm -f "$PCE_STATE/lock-error" 2>/dev/null ;;', '0) ;;'),
+ ("lock-error-dedup-shares-the-condition-key", "16", 'elif [ ! -e "$PCE_STATE/lock-error" ]; then : > "$PCE_STATE/lock-error" 2>/dev/null;', 'elif pce_log_change "lock-error" "event=lock-error-key"; then'),
+ ("undated-emptying-writes-a-counter-with-an-empty-date", "16", '[ -n "$(_pce_date_of "$PCE_NOW")" ] || { pce_log "event=state-write-failed" "what=daily-counter"', 'true || { pce_log "event=state-write-failed" "what=daily-counter"'),
 ]
 names = []
 for name, secs, old, new in M:
-    if text.count(old) != 1:
-        print("BAD %s: target matches %d times" % (name, text.count(old))); sys.exit(3)
-    mut = text.replace(old, new)
+    mut = text
+    for o, n in zip(old if isinstance(old, list) else [old], new if isinstance(new, list) else [new]):
+        if text.count(o) != 1:
+            print("BAD %s: target matches %d times" % (name, text.count(o))); sys.exit(3)
+        mut = mut.replace(o, n)
     if mut == text:
         print("BAD %s: mutation changes nothing" % name); sys.exit(3)
     open(os.path.join(outdir, name + ".sh"), "w").write(mut)
