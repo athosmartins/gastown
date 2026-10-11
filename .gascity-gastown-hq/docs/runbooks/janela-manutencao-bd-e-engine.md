@@ -163,6 +163,9 @@ bash ~/gt/.gascity-gastown-hq/scripts/gate-queue-composition.sh
 # Vermelho = a sonda mudou e os dogs rodam uma cópia velha: atualize pool-probe.golden-1c.txt
 # E pool-probe.sh juntos (nunca um só) e rode de novo.
 bash ~/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/pool-probe.selftest.sh --live
+
+# todos os subcomandos do gc ainda existem? (08/09: o grupo `gc dolt` sumiu e ninguém viu por ~3 h)
+#   Passo A ANTES do swap + Passo B depois: docs/runbooks/engine-window-smoke-test.md
 ```
 
 **Depois, reabrir os 23 represados:** eles estão `deferred` ou com

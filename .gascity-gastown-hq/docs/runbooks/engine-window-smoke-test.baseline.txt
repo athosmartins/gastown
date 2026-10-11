@@ -1,0 +1,205 @@
+agent
+agent add
+agent list
+agent resume
+agent suspend
+agent-script
+analyze
+analyze reliability
+bd
+beads
+beads city
+beads health
+beads list
+beads show
+build-image
+cities
+cities list
+completion
+completion bash
+completion fish
+completion powershell
+completion zsh
+config
+config explain
+config show
+converge
+converge approve
+converge create
+converge iterate
+converge list
+converge retry
+converge status
+converge stop
+converge test-gate
+converge test-trigger
+convoy
+convoy add
+convoy check
+convoy close
+convoy control
+convoy create
+convoy delete
+convoy delete-source
+convoy land
+convoy list
+convoy reopen-source
+convoy status
+convoy stranded
+convoy target
+dashboard
+dashboard serve
+doctor
+dolt
+dolt cleanup
+dolt compact
+dolt health
+dolt health-check
+dolt list
+dolt logs
+dolt pull
+dolt recover
+dolt restart
+dolt rollback
+dolt sql
+dolt start
+dolt status
+dolt sync
+dolt-cleanup
+event
+event emit
+events
+events rotate
+formula
+formula cook
+formula list
+formula show
+formula version-check
+gastown
+gastown status
+github
+github pr
+graph
+handoff
+help
+hook
+import
+import add
+import check
+import install
+import list
+import remove
+import upgrade
+import why
+init
+lint
+mail
+mail archive
+mail check
+mail count
+mail delete
+mail inbox
+mail mark-read
+mail mark-unread
+mail peek
+mail read
+mail reply
+mail send
+mail thread
+maintenance
+maintenance dolt-gc
+maintenance status
+mcp
+mcp list
+nudge
+nudge status
+order
+order check
+order history
+order list
+order run
+order show
+order sweep-tracking
+pack
+pack fetch
+pack list
+pack registry
+prime
+prompt
+prompt synth
+register
+reload
+restart
+resume
+rig
+rig add
+rig list
+rig remove
+rig restart
+rig resume
+rig set-endpoint
+rig status
+rig suspend
+runtime
+runtime drain
+runtime drain-ack
+runtime drain-check
+runtime request-restart
+runtime undrain
+service
+service doctor
+service list
+service restart
+session
+session attach
+session close
+session kill
+session list
+session logs
+session new
+session nudge
+session peek
+session pin
+session prune
+session rename
+session reset
+session submit
+session suspend
+session unpin
+session wait
+session wake
+shell
+shell install
+shell remove
+shell status
+skill
+skill list
+sling
+start
+status
+stop
+supervisor
+supervisor install
+supervisor logs
+supervisor reload
+supervisor run
+supervisor start
+supervisor status
+supervisor stop
+supervisor uninstall
+suspend
+trace
+trace cycle
+trace reasons
+trace show
+trace start
+trace status
+trace stop
+trace tail
+unregister
+version
+wait
+wait cancel
+wait inspect
+wait list
+wait ready
