@@ -130,7 +130,7 @@
 
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/worker"
 min_active_sessions = 0
-max_active_sessions = 2
+max_active_sessions = 3
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
@@ -144,3 +144,4 @@ provider = "claude-headless"
 # acceptable because we spawn explicitly — we do NOT rely on supervisor auto-spawn.
 # If gc sling cross-store routing is ever needed add --force; rig-native path uses
 # bd assign directly and never needs gc sling for WA beads.
+
