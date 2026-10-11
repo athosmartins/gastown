@@ -3109,10 +3109,13 @@ else
           elif git -C "$RUNTIME_DIR" merge-base --is-ancestor "$rp_oldest" "$rp_h" >/dev/null 2>&1; then :
           else rp_bad_order=1
           fi
+        elif case " $REFRESH_LSTART_UNPINNED " in *" $rp_label "*) true ;; *) false ;; esac; then
+          # asked BEFORE the cosmetic excuse: that verdict is a call-graph read against this
+          # checkout's window, and for a label whose clone is not known to BE this checkout it
+          # says nothing about the code the daemon imports. Unknown which clone: not excused.
+          rp_unpinned="${rp_unpinned}${rp_label} "
         elif [ -n "$REFRESH_LOCKED_COSMETIC_LINE" ] && case " $REFRESH_LOCKED_COSMETIC " in *" $rp_label "*) true ;; *) false ;; esac; then
           rp_excused="${rp_excused}${rp_label} "
-        elif case " $REFRESH_LSTART_UNPINNED " in *" $rp_label "*) true ;; *) false ;; esac; then
-          rp_unpinned="${rp_unpinned}${rp_label} "
         else
           rp_blockers="${rp_blockers}${rp_label} "
         fi

@@ -40,7 +40,7 @@
 #        FRESH_FAIL / wrong verdict / dry run / locked but not cosmetic / git broken.
 # M1-M2  the marker goes to the OLDEST proof and never backwards; a proof older than a
 #        recorded entry does not pull the entry back.
-# D1-D5  (gate fix 1) a start time proves something only for a daemon that runs the
+# D1-D6  (gate fix 1) a start time proves something only for a daemon that runs the
 #        checkout whose reflog is read. D1/D1b: a stuck label the helper did NOT examine this
 #        cycle (absent from ALL_LABELS) is not "clean" just because it is not guarded now —
 #        its flag survives and its own proof still bounds the marker. D2/D3: a label the
@@ -422,6 +422,26 @@ ALL="com.t.a com.t.b" GUARDED="com.t.a com.t.b" LSTART="com.t.a=3500 com.t.b=350
 SEED="com.t.a @B@ stuck
 com.t.b @B@ stuck" run_block
 [ "$RIGMARKER_AFTER" = "$SHA_S" ] && ok "D5 an empty (present) LSTART_UNPINNED line: the process proof works" || nok "D5" "marker=[$RIGMARKER_AFTER] log=[$LOG_AFTER]"
+
+# D6: a label that is BOTH locked-cosmetic and UNPINNED. The cosmetic verdict is the helper's
+# call-graph read of the label's entrypoint against THIS checkout's window; for a daemon whose
+# clone cannot be told apart from the runtime checkout it says nothing about the code that
+# daemon really imports. Not knowing which clone is not a license to excuse: it stays a blocker.
+ALL="com.t.a com.t.p" GUARDED="com.t.a com.t.p" COSMETIC="com.t.p" LSTART="com.t.a=3500" UNPINNED="com.t.p" \
+SEED="com.t.a @B@ stuck
+com.t.p @B@ stuck" run_block
+[ "$RIGMARKER_AFTER" = "$SHA_B" ] && has_line "$PERDAEMON_AFTER" "com.t.p $SHA_B stuck" \
+  && ok "D6 an UNPINNED label is not excused as locked-cosmetic: marker and its entry do not move" \
+  || nok "D6 unpinned must beat cosmetic" "marker=[$RIGMARKER_AFTER] perdaemon=[$PERDAEMON_AFTER] log=[$LOG_AFTER]"
+echo "$LOG_AFTER" | grep -q "run code outside the whatsapp_automation runtime checkout" \
+  && ok "D6 the log gives the unpinned reason" || nok "D6 log reason" "$LOG_AFTER"
+
+# D6b: the positive control — the same label, same cosmetic verdict, but the helper pinned it:
+# the existing excuse works (A2 again), so D6 holds only because of the UNPINNED entry.
+ALL="com.t.a com.t.p" GUARDED="com.t.a com.t.p" COSMETIC="com.t.p" LSTART="com.t.a=3500" UNPINNED="" \
+SEED="com.t.a @B@ stuck
+com.t.p @B@ stuck" run_block
+[ "$RIGMARKER_AFTER" = "$SHA_S" ] && ok "D6b a pinned locked-cosmetic label is still excused" || nok "D6b" "marker=[$RIGMARKER_AFTER] log=[$LOG_AFTER]"
 
 echo ""
 echo "story-delivery daemon-refresh lstart-advance (ga-8hfols) tests: $PASS passed, $FAIL failed"
