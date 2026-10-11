@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
 # gate-fastlane.selftest.sh (ga-atsahv)
-# SLICE NOTE (ga-atsahv.2 of 3 — removed by ga-atsahv.3): slices 1+2 run items 1-3 and 4 of the list above (the scanner, the path classes, classify_raw, and
-# decide / history / confirm on real git history, §4 and its sub-sections except §4e). Items 5-8 (the dispatcher blocks, record + tally, drift guards, mutation
-# checks) arrive with ga-atsahv.3; until then this file proves exactly what the slices so far contain.
-#
 #
 # Proves the gate's DOC/TEST fast lane: a diff whose EVERY file is documentation or tests (scan clean, new
 # tests green) skips the LLM reviewer; everything else — code, prompt/doctrine text, a finding, a failing test,
@@ -39,6 +35,7 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$SELF_DIR/gate-fastlane.lib.sh"
 SCAN="$SELF_DIR/gate-fastlane-scan.py"
+DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
 B32=/bin/bash   # the daemon's shell (macOS bash 3.2) — never the first `bash` on PATH
 
 PASS=0; FAIL=0
@@ -46,7 +43,7 @@ ok()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 
 echo "== gate-fastlane.selftest =="
-for f in "$LIB" "$SCAN"; do
+for f in "$LIB" "$SCAN" "$DISPATCHER"; do
   if [ -r "$f" ]; then ok "present: $(basename "$f")"; else bad "missing: $f"; fi
 done
 [ -x "$B32" ] || { echo "FATAL: $B32 not found"; exit 2; }
@@ -82,6 +79,15 @@ fi
 if has_long_number "$T"; then bad "fixture base dir $T carries an 8+ digit run — fixtures that embed it would trip the lane's own scan"; else ok "fixture base dir carries no 8+ digit run — the fixtures that embed absolute paths cannot trip the lane's own scan, whatever the caller's TMPDIR"; fi
 mkdir -p "$T/tmp" "$T/bin"
 TAB=$'\t'
+TALLY="$SELF_DIR/gate-lane-tally.py"
+# a stub `bd` for gate_fastlane_record (§4e, §7): logs its argv, answers `show` with the lane FAKE_BD_LANE
+cat > "$T/bin/bd" <<'EOF'
+#!/bin/bash
+echo "$@" >> "$FAKE_BD_LOG"
+case "$*" in *" show "*) printf '[{"metadata":{"gate.lane":"%s"}}]\n' "${FAKE_BD_LANE:-}" ;; esac
+exit 0
+EOF
+chmod +x "$T/bin/bd"
 # fl_env <ENV=VAL ...> <cmd ...> — `env` for EVERY child that runs the lib. The lane's operator controls and tuning knobs are pinned to their defaults first, so a
 # case's result never depends on the caller's environment (gate round 3, blocking issue 2: with GC_CITY exported and <city>/.gc/gate-fastlane.off present — or
 # GATE_FASTLANE_ENABLED=0 exported — 102 of 435 assertions went red). Pinned by NAME PATTERN, not by a list, so a knob added later is covered too: every
@@ -91,6 +97,10 @@ fl_env() {
   local a=() v
   for v in $(compgen -e | grep '^GATE_FASTLANE_' || true); do a[${#a[@]}]="-u"; a[${#a[@]}]="$v"; done
   env ${a[@]+"${a[@]}"} -u GC_CITY GATE_FASTLANE_ENABLED=1 GATE_FASTLANE_OFF_FILE="$T/pinned-absent.off" "$@"
+}
+
+extract_block() {
+  sed -n "/# SELFTEST-EXTRACT ${2}: BEGIN/,/# SELFTEST-EXTRACT ${2}: END/p" "$1" | sed '1d;$d'
 }
 
 # ── 1. the scanner ────────────────────────────────────────────────────────────────────────────────────────────
@@ -404,15 +414,19 @@ mkbr() { # mkbr <branch> <spec>...  spec: path=content (printf %b) | -path (dele
 
 D_LANE=""; D_REASON=""; D_FILES=""; D_CODE=""
 decide() { # decide <head> <policy> [ENV=VAL ...]  -> D_LANE / D_REASON / D_FILES / D_CODE
+  # FL_QG_LOG=<file> [FL_MARKER=<id>] also runs the REAL gate_fastlane_record on the decision (stub bd), as the dispatcher does
   local head="$1" policy="$2" out; shift 2
   out=$(fl_env GATE_FS_TMPDIR="$T/tmp" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" FL_REPO="$REPO" FL_BASE="${FL_BASE:-main}" FL_HEAD="$head" FL_POLICY="$policy" \
-            "$@" \
+            FL_BIN="$T/bin" FAKE_BD_LOG="$T/bd.log" "$@" \
         "$B32" -c '
     set -euo pipefail
     source "${FL_LIB_OVERRIDE:-$FL_LIB}"   # an override may arrive as a prefix assignment or as an env arg
     gfn() { git -C "$FL_REPO" "$@"; }
     gate_fastlane_decide gfn "$FL_BASE" "$FL_HEAD" "$FL_POLICY"
     printf "%s\n%s\n%s\n%s\n" "$GATE_LANE" "$GATE_LANE_REASON" "$(gate_fastlane_files_oneline)" "$GATE_LANE_REASON_CODE"
+    if [ -n "${FL_QG_LOG:-}" ]; then
+      PATH="$FL_BIN:$PATH" gate_fastlane_record /city "${FL_MARKER:-m-e2e}" ga-e2e feat/e2e gascity 1 "$FL_QG_LOG" >/dev/null 2>&1 || true
+    fi
   ' 2>"$T/decide.err") || { D_LANE="ABORTED"; D_REASON="decide() aborted under set -euo pipefail: $(cat "$T/decide.err")"; D_FILES=""; D_CODE=""; return; }
   D_LANE=$(printf '%s\n' "$out" | sed -n 1p); D_REASON=$(printf '%s\n' "$out" | sed -n 2p); D_FILES=$(printf '%s\n' "$out" | sed -n 3p); D_CODE=$(printf '%s\n' "$out" | sed -n 4p)
 }
@@ -541,21 +555,71 @@ decide "$S" "";                                                              che
 S=$(mkbr s-accent 'docs/relatório final.md=ok\n');                           decide "$S" "";  check "an accented file name is classified, not mistaken for 'quoted'" fast
 S=$(mkbr s-tabname $'docs/a\tb.md=ok\n');                                    decide "$S" "";  check "a file name with a real TAB (git must quote it) is not vouched for" normal "quoting"
 
+# ── 4e. every decision, run through the REAL record and the REAL tally ──────────────────────────────────────────
+# Gate round 1, blocking issue 2: the tally matched a sentence the lib never emitted, so ~96% of decisions landed in
+# the wrong bucket — and its selftest was green because its fixture was hand-written to match. Here nothing is
+# hand-written: the decision is the lib's, the event is gate_fastlane_record's, the bucket is the tally's.
+echo "── 4e. decision → gate_lane event → tally, all real ──"
+label_of() { python3 "$TALLY" --list-codes | awk -F'\t' -v c="$1" '$1==c{print $2}'; }
+E_BUCKET=""; E_FAST=""
+e2e_probe() { # <head> <policy> [ENV=VAL ...] — decides, records, tallies ONE decision -> D_CODE / E_BUCKET / E_FAST
+  local head="$1" policy="$2" log="$T/e2e-$RANDOM$RANDOM.jsonl" j; shift 2
+  decide "$head" "$policy" FL_QG_LOG="$log" FL_MARKER="m-e2e" "$@"
+  j=$(python3 "$TALLY" --log "$log" --days 1 --json 2>/dev/null) || j='{}'
+  E_FAST=$(printf '%s' "$j" | jq -r '.fast // "?"' 2>/dev/null)
+  E_BUCKET=$(printf '%s' "$j" | jq -r '(.normal_reasons // {}) | keys | if length == 1 then .[0] elif length == 0 then "none" else "MANY" end' 2>/dev/null)
+  rm -f "$log"
+}
+e2e_ok() { # <want_code> — 0 iff the last probe produced that code AND the tally put it in that code's bucket
+  local want="$1" label
+  [ "$D_CODE" = "$want" ] || return 1
+  if [ "$want" = "fast" ]; then [ "$E_FAST" = "1" ] && [ "$E_BUCKET" = "none" ]; return; fi
+  label=$(label_of "$want"); [ -n "$label" ] && [ "$E_BUCKET" = "$label" ]
+}
+e2e_case() { # <name> <want_code> <head> <policy> [ENV=VAL ...]
+  local name="$1" want="$2" head="$3" policy="$4"; shift 4
+  e2e_probe "$head" "$policy" "$@"
+  if e2e_ok "$want"; then ok "e2e: $name → code=$want, tally bucket '$(label_of "$want")'"
+  else bad "e2e: $name → code='$D_CODE' bucket='$E_BUCKET' fast=$E_FAST; want code=$want / bucket '$(label_of "$want")' (reason: $D_REASON)"; fi
+}
+head_of() { git -C "$REPO" rev-parse "$1"; }
+e2e_case "docs-only branch (the fast lane itself)"           fast             "$(head_of s-docs)"    ""
+e2e_case "a .py file (the case the gate cited: ~96% of diffs)" code-or-prompt  "$(head_of s-mdpy)"    ""
+e2e_case "a skill .md (prompt/doctrine)"                      code-or-prompt  "$(head_of s-skill)"   ""
+e2e_case "CLAUDE.md alone"                                    code-or-prompt  "$(head_of s-claude)"  ""
+e2e_case "deploy_deps.json (config is code)"                  code-or-prompt  "$(head_of s-config)"  ""
+e2e_case "a go:embed'd agent template (*-CLAUDE.md)"          code-or-prompt  "$(head_of s-tpl)"     ""
+e2e_case "an .md outside every known doc place"               code-or-prompt  "$(head_of s-unkmd)"   ""
+e2e_case "a CPF on an added line"                             scan-findings   "$(head_of s-cpf)"     ""
+e2e_case "a secret after a U+2028"                            scan-findings   "$(head_of s-u2028b)"  ""
+e2e_case "a secret in a path with a space (was: scan-failed)"  scan-findings   "$(head_of s-sp-find)"  ""
+e2e_case "scanner missing next to the lib"                    scan-failed     "$(head_of s-docs)"    "" FL_LIB_OVERRIDE="$T/libonly/gate-fastlane.lib.sh"
+e2e_case "a binary file named .md"                            scan-failed     "$(head_of s-bin)"     ""
+e2e_case "a new test that fails"                              test-failed     "$(head_of s-testbad)" ""
+e2e_case "tests changed but running them is disabled"         test-failed     "$(head_of s-notests)" "" GATE_FASTLANE_RUN_TESTS=0
+e2e_case "a changed test with no runner (ts)"                 test-unrunnable "$(head_of s-js)"      ""
+e2e_case "a symlink named .md"                                unclassifiable  "$(head_of s-link)"    ""
+e2e_case "an empty diff (head == base)"                       unclassifiable  "$BASE_SHA"            ""
+e2e_case "a gate policy file in the diff"                     policy          "$(head_of s-docs2)"   "packs/x/quality-gate-foo.sh"
+e2e_case "kill-switch env GATE_FASTLANE_ENABLED=0"            disabled        "$(head_of s-docs2)"   "" GATE_FASTLANE_ENABLED=0
+e2e_case "kill-switch flag file"                              flag-file       "$(head_of s-docs2)"   "" GATE_FASTLANE_OFF_FILE="$T/fastlane.off"
+e2e_case "git cannot diff (bad base ref)"                     diff-raw-failed "$(head_of s-docs2)"   "" FL_BASE=no-such-ref
+e2e_case "no head to decide on"                               no-input        ""                     ""
+# the cited bug, said directly: a code diff must NOT read as "touches the gate's own policy"
+e2e_probe "$(head_of s-mdpy)" ""
+[ "$E_BUCKET" != "$(label_of policy)" ] && [ "$E_BUCKET" = "$(label_of code-or-prompt)" ] && ok "a diff that went to the gate because of a .py file is bucketed as code/prompt — not as the gate's own policy" || bad "the cited misbucketing is back: '$E_BUCKET'"
+# and every code the lib can set is one the harness above exercised or the tally lists (no producer/consumer drift)
+EXERCISED="fast code-or-prompt scan-findings scan-failed test-failed test-unrunnable unclassifiable policy disabled flag-file switch-unreadable diff-raw-failed no-input history-code history-unverified"
+for c in $(grep -o '_gate_fastlane_normal "[a-z-]*"' "$LIB" | sed 's/.*"\(.*\)"/\1/' | sort -u); do
+  case " $EXERCISED " in *" $c "*) ok "lib code '$c' is exercised end to end above" ;; *) bad "lib emits code '$c' that §4e never ran through the tally" ;; esac
+done
+
 # ── 4f. confirm(): the diff that LANDS is the diff that was CHECKED ──────────────────────────────────────────────
 # Gate round 2, blocking issue 2: the lane judged $BRANCH_SHA, but the merge pushes whatever origin/$BRANCH is when the
 # push runs (do_merge_ff re-resolves it) — a commit added after the decision would have merged with zero reviewers and no
 # scan, and the old selftest line that claimed otherwise only grepped the call's argument text. gate_fastlane_confirm is
 # asked, immediately before the push, about the exact commit being pushed. Every case below takes a REAL decision first,
 # then moves the tip / rebases / merges / flips the kill-switch / swaps a file for a symlink, and asks again.
-# SLICE NOTE (ga-atsahv.2 of 3 — replaced by ga-atsahv.3): the record and the tally are not in this slice, so e2e_case below
-# checks the DECISION's code only; slice 3 brings §4e back, where the same call also runs the real record and the real tally.
-head_of() { git -C "$REPO" rev-parse "$1"; }
-e2e_case() { # <name> <want_code> <head> <policy> [ENV=VAL ...]
-  local name="$1" want="$2" head="$3" policy="$4"; shift 4
-  decide "$head" "$policy" "$@"
-  if [ "$D_CODE" = "$want" ]; then ok "e2e: $name → code=$want"
-  else bad "e2e: $name → code='$D_CODE'; want code=$want (reason: $D_REASON)"; fi
-}
 # ── 4e'. an EMPTY diff text for a non-empty file list is "read nothing", not "clean" (gate round 3, low finding) ────────
 # The scanner is a pure function and rightly calls empty input clean (§1). The lib is not: it only scans after `diff --raw` listed files, and a real
 # `git diff -U0` prints a `diff --git` header for every one of them. A runner that returns 0 with NO text for that range read nothing — and "nothing
@@ -1052,6 +1116,605 @@ raw_scan "…a quoted name whose accented letters sit inside a real CPF is still
 case "$SCAN_OUT" in *52998224725*) bad "the quoted-name finding published the CPF: $SCAN_OUT" ;; *) ok "…and still withholds the name" ;; esac
 raw_scan "an octal escape beyond 255 is not something git writes: cannot read it, rc=2" 2 < <(printf 'diff --git "a/docs/x\\777.md" "b/docs/x\\777.md"\nnew file mode 100644\nindex 0000000..e69de29\n')
 
+
+# ── 5. the dispatcher's live blocks, under bash 3.2 + set -euo pipefail ───────────────────────────────────────
+echo "── 5. dispatcher wiring (extracted, executed under $B32 + set -euo pipefail) ──"
+LOADBLK="$(extract_block "$DISPATCHER" fastlane-lib-load)"
+DECBLK="$(extract_block "$DISPATCHER" fastlane-decide)"
+BYPBLK="$(extract_block "$DISPATCHER" fastlane-bypass)"
+for n in LOADBLK DECBLK BYPBLK; do
+  if [ -n "${!n}" ]; then ok "located the dispatcher block $n ($(printf '%s\n' "${!n}" | wc -l | tr -d ' ') lines)"; else bad "dispatcher block $n not found (sentinels missing/renamed)"; fi
+done
+
+# 5a. lib load: present / missing / unreadable / syntax error — the daemon must survive all four
+load_case() { # name setup-cmd want
+  local d="$T/load-$1" out
+  mkdir -p "$d"
+  { printf 'set -euo pipefail\n'; printf '%s\n' "$LOADBLK"; printf 'if declare -F gate_fastlane_decide >/dev/null 2>&1; then echo LOADED; else echo ABSENT; fi\necho ALIVE\n'; } > "$d/disp.sh"
+  eval "$2"
+  out=$("$B32" "$d/disp.sh" 2>/dev/null | tr '\n' ' ') || out="DIED($out)"
+  case "$out" in "$3 ALIVE ") ok "lib load: $1 → $3, daemon alive" ;; *) bad "lib load: $1 → '$out', want '$3 ALIVE'" ;; esac
+}
+load_case present   'cp "$LIB" "$d/gate-fastlane.lib.sh"'                                         LOADED
+load_case missing   ':'                                                                           ABSENT
+load_case unreadable 'cp "$LIB" "$d/gate-fastlane.lib.sh"; chmod 000 "$d/gate-fastlane.lib.sh"'    ABSENT
+load_case syntaxerr 'printf "if then fi\n" > "$d/gate-fastlane.lib.sh"'                           ABSENT
+load_case truncated 'head -c 900 "$LIB" > "$d/gate-fastlane.lib.sh"; printf "gate_fastlane_x() {\n" >> "$d/gate-fastlane.lib.sh"'  ABSENT
+
+# 5b. the lane decision block
+dec_case() { # name stub want_lane want_tier want_rev
+  local out
+  { cat <<'HDR'
+set -euo pipefail
+git_rig() { :; }
+DEFAULT_BRANCH=main; BRANCH_SHA=abc123; POLICY_FILES=""; TIER="NON-CODE"; REQUIRED_REVIEWERS=1
+CHANGED_FILES="docs/a.md"
+GATE_LANE="normal"; GATE_LANE_REASON=""
+HDR
+    printf '%s\n' "$2"
+    printf '%s\n' "$DECBLK"
+    printf 'echo "RESULT lane=$GATE_LANE tier=$TIER rev=$REQUIRED_REVIEWERS"\n'
+  } > "$T/dec.sh"
+  out=$("$B32" "$T/dec.sh" 2>&1 | tail -1) || out="DIED"
+  if [ "$out" = "RESULT lane=$3 tier=$4 rev=$5" ]; then ok "decide block: $1 → $3"; else bad "decide block: $1 → '$out', want 'RESULT lane=$3 tier=$4 rev=$5'"; fi
+}
+dec_case "lib says fast"                         'gate_fastlane_decide() { GATE_LANE=fast; GATE_LANE_REASON=stub; }'                  fast   FAST-LANE 0
+dec_case "lib says normal"                       'gate_fastlane_decide() { GATE_LANE=normal; GATE_LANE_REASON=stub; }'                normal NON-CODE  1
+dec_case "lib returns garbage as the lane"       'gate_fastlane_decide() { GATE_LANE=banana; }'                                       normal NON-CODE  1
+dec_case "lib ERRORS after setting fast"         'gate_fastlane_decide() { GATE_LANE=fast; return 7; }'                               normal NON-CODE  1
+dec_case "lib not loaded at all"                 ':'                                                                                  normal NON-CODE  1
+dec_case "dispatcher's own file list EMPTY (git error) even though the lib would say fast" 'CHANGED_FILES=""; gate_fastlane_decide() { GATE_LANE=fast; GATE_LANE_REASON=stub; }' normal NON-CODE 1
+
+# 5b'. the REAL extracted block + the REAL lib + REAL git: the story's own test at the dispatcher level
+git -C "$REPO" update-ref refs/remotes/origin/main main
+real_dec() { # <head sha> -> the RESULT line the dispatcher's own Step 5 block produces
+  { cat <<'HDR'
+set -euo pipefail
+git_rig() { git -C "$FL_REPO" "$@"; }
+DEFAULT_BRANCH=main; POLICY_FILES=""; TIER="NON-CODE"; REQUIRED_REVIEWERS=1
+CHANGED_FILES="docs/a.md"
+GATE_LANE="normal"; GATE_LANE_REASON=""
+source "$FL_LIB"
+HDR
+    printf 'BRANCH_SHA=%s\n' "$1"
+    printf '%s\n' "$DECBLK"
+    printf 'echo "RESULT lane=$GATE_LANE tier=$TIER rev=$REQUIRED_REVIEWERS"\n'
+  } > "$T/realdec.sh"
+  fl_env FL_REPO="$REPO" FL_LIB="$LIB" GATE_FS_TMPDIR="$T/tmp" "$B32" "$T/realdec.sh" 2>&1 | tail -1
+}
+real_case() { # name branch want
+  local got; got=$(real_dec "$(git -C "$REPO" rev-parse "$2")")
+  if [ "$got" = "$3" ]; then ok "real Step 5 block + real lib + real git: $1 → ${3#RESULT }"; else bad "real Step 5 block: $1 → '$got', want '$3'"; fi
+}
+real_case "branch with only docs/*.md takes the fast lane (0 reviewers)"  s-docs   "RESULT lane=fast tier=FAST-LANE rev=0"
+real_case "control: a skill .md stays in the normal gate"                  s-skill  "RESULT lane=normal tier=NON-CODE rev=1"
+real_case "control: .md + one .py stays in the normal gate"                s-mdpy   "RESULT lane=normal tier=NON-CODE rev=1"
+real_case "docs with a CPF stays in the normal gate"                       s-cpf    "RESULT lane=normal tier=NON-CODE rev=1"
+
+# 5b''. the lib did not load, so there is no recorder: the dispatcher must still leave the tally ONE event for that diff
+RECBLK="$(extract_block "$DISPATCHER" fastlane-record)"
+[ -n "$RECBLK" ] && ok "located the dispatcher block RECBLK ($(printf '%s\n' "$RECBLK" | wc -l | tr -d ' ') lines)" || bad "dispatcher block fastlane-record not found (sentinels missing/renamed)"
+recfb() { # <qg_log> <would> [DRY_RUN] — the block exactly as the dispatcher runs it, lib NOT sourced
+  { cat <<'HDR'
+set -euo pipefail
+GC_CITY=/city; MARKER_ID=mk-9; BEAD_ID=ga-x; BRANCH=feat/x; RIG=gascity
+GATE_LANE=normal; GATE_LANE_REASON="fast-lane lib not loaded (gate-fastlane.lib.sh missing or unreadable) — normal gate"; GATE_LANE_REASON_CODE=lib-not-loaded
+HDR
+    printf 'QG_LOG=%q; GATE_LANE_WOULD_REVIEWERS=%q; DRY_RUN=%q\n' "$1" "$2" "${3:-0}"
+    printf '%s\n' "$RECBLK"
+    printf 'echo RECORD-DONE\n'
+  } > "$T/recfb.sh"
+  "$B32" "$T/recfb.sh" 2>&1
+}
+RFLOG="$T/rf.jsonl"; rm -f "$RFLOG"
+RFOUT=$(recfb "$RFLOG" 3)
+case "$RFOUT" in *RECORD-DONE*) ok "lib not loaded: the record block survives set -euo pipefail under bash 3.2" ;; *) bad "record block died: $RFOUT" ;; esac
+[ "$(jq -r '[.event,.lane,.reason_code,.would_have_reviewers,.dry_run,.marker]|join("|")' "$RFLOG" 2>/dev/null)" = "gate_lane|normal|lib-not-loaded|3|0|mk-9" ] && ok "lib not loaded: ONE gate_lane event is written by the dispatcher itself (code lib-not-loaded, the reviewers a normal run uses, the marker)" || bad "fallback event: $(cat "$RFLOG" 2>/dev/null)"
+[ "$(python3 "$TALLY" --log "$RFLOG" --days 1 --json | jq -r '.normal_reasons["lib da fast-lane não carregou"] // 0')" = "1" ] && ok "…and the tally buckets it as 'lib da fast-lane não carregou' (was: unreachable, the diff was simply absent)" || bad "the tally does not see the broken-lib decision"
+rm -f "$RFLOG"; recfb "$RFLOG" "not-a-number" >/dev/null
+[ "$(jq -r '.would_have_reviewers' "$RFLOG" 2>/dev/null)" = "null" ] && ok "a non-numeric reviewer count is written as null (UNKNOWN) — not as a measured 0, and not as an event lost to a jq error" || bad "non-numeric would-have-reviewers lost the event or became a number: $(cat "$RFLOG" 2>/dev/null)"
+# …and the chain: a passed fast run on such a decision is credited the assumed 1 and the report SAYS so, instead of crediting a silent 0
+jq -c -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{ts: $ts, event: "dispatcher_complete", lane: "fast", marker: "mk-9", result: "PASS", dry_run: "0"}' >> "$RFLOG"
+RFJ=$(python3 "$TALLY" --log "$RFLOG" --days 1 --json 2>/dev/null || echo '{}')
+[ "$(printf '%s' "$RFJ" | jq -r '[.reviewer_runs_saved, .saved_unmatched_assumed_1] | join("|")' 2>/dev/null)" = "1|1" ] && ok "…and the tally credits that run the assumed 1 AND counts it as assumed (saved_unmatched_assumed_1), where a written 0 would have been a quiet zero" || bad "tally on an unknown reviewer count: $RFJ"
+rm -f "$T/qg-would.jsonl"
+PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bd.log" FAKE_BD_LANE=normal "$B32" -c 'set -euo pipefail; source "$1"; GATE_LANE=normal; GATE_LANE_REASON=r; GATE_LANE_REASON_CODE=code-or-prompt; GATE_LANE_COUNTS=c; GATE_LANE_FILES=f; gate_fastlane_record /city mk-1 ga-x b gascity "x7" "$2"' _ "$LIB" "$T/qg-would.jsonl" >/dev/null 2>&1
+[ "$(jq -r '.would_have_reviewers' "$T/qg-would.jsonl" 2>/dev/null)" = "null" ] && ok "gate_fastlane_record writes an unknown reviewer count as null too (same rule as the dispatcher's fallback)" || bad "record with a non-numeric count: $(cat "$T/qg-would.jsonl" 2>/dev/null)"
+rm -f "$RFLOG"; recfb "$RFLOG" 1 1 >/dev/null
+[ "$(jq -r '.dry_run' "$RFLOG" 2>/dev/null)" = "1" ] && [ "$(python3 "$TALLY" --log "$RFLOG" --days 1 --json | jq -r '.decisions')" = "0" ] && ok "a DRY_RUN=1 sweep's event carries dry_run=1 and the tally leaves it out" || bad "dry-run event: $(cat "$RFLOG" 2>/dev/null)"
+RFOUT=$(recfb "/nonexistent-dir-$$/qg.jsonl" 1)
+case "$RFOUT" in *RECORD-DONE*) ok "an unwritable log does not kill the daemon (the line is lost, the sweep goes on)" ;; *) bad "unwritable QG_LOG killed the block: $RFOUT" ;; esac
+
+# 5c. the Step 7 bypass
+byp_case() { # name lane
+  { cat <<'HDR'
+set -euo pipefail
+BRANCH="b"; GATE_LANE_REASON="r"
+log() { echo "LOG: $*"; }
+GATE_LOCK_ENABLED=0
+_gate_lock_write_hb() { :; }
+cleanup_reviewer_sessions() { :; }
+gate_finalize_run() { echo "FINALIZE overall=$OVERALL_VERDICT quota=$QUOTA_REQUEUE verdicts=${#VERDICT_BEAD_IDS[@]} sessions=${#SESSION_IDS[@]} fail=[$FAIL_REASONS]"; }
+gc() { echo "GC-CALLED $*"; }
+bd() { echo "BD-CALLED $*"; }
+HDR
+    printf 'GATE_LANE=%s\n' "$2"
+    printf '%s\n' "${BYPBLK_USE:-$BYPBLK}"
+    printf 'echo AFTER-BLOCK\n'
+  } > "$T/byp.sh"
+  BYP_OUT=$("$B32" "$T/byp.sh" 2>&1); BYP_RC=$?
+}
+byp_case fast fast
+case "$BYP_OUT" in *"FINALIZE overall=PASS quota=0 verdicts=0 sessions=0 fail=[]"*) ok "bypass (fast): finalize runs with PASS, no quota re-queue, ZERO verdicts, ZERO sessions" ;; *) bad "bypass (fast): $BYP_OUT" ;; esac
+case "$BYP_OUT" in *GC-CALLED*) bad "bypass (fast): a gc call was made — a reviewer session may have been spawned" ;; *) ok "bypass (fast): no gc call — no reviewer session spawned" ;; esac
+case "$BYP_OUT" in *BD-CALLED*) bad "bypass (fast): a bd call was made inside the bypass itself" ;; *) ok "bypass (fast): the bypass itself creates no verdict bead" ;; esac
+case "$BYP_OUT" in *AFTER-BLOCK*) bad "bypass (fast): execution fell through to Step 7 (reviewers) after finalize" ;; *) ok "bypass (fast): ends the sweep after finalize — never reaches Step 7" ;; esac
+[ "$BYP_RC" = "0" ] && ok "bypass (fast): exit 0 under set -euo pipefail with empty reviewer arrays (bash 3.2)" || bad "bypass (fast): rc=$BYP_RC — $BYP_OUT"
+byp_case normal normal
+case "$BYP_OUT" in *FINALIZE*) bad "bypass (normal lane): finalize ran without reviewers!" ;; *AFTER-BLOCK*) ok "bypass (normal lane): skipped — the normal gate continues to Step 7" ;; *) bad "bypass (normal): $BYP_OUT" ;; esac
+byp_case '""' ""   # an empty/unset-looking lane value must not enter the bypass
+case "$BYP_OUT" in *FINALIZE*) bad "bypass (empty lane): entered the bypass" ;; *) ok "bypass (empty lane value): skipped" ;; esac
+
+# 5c'. the REAL cleanup_reviewer_sessions (Step 9 of finalize calls it) with EMPTY reviewer arrays, bash 3.2 + set -u
+CLEANFN="$(awk '/^cleanup_reviewer_sessions\(\) \{/{p=1} p{print} p && /^\}$/{exit}' "$DISPATCHER")"
+if [ -n "$CLEANFN" ]; then ok "located the real cleanup_reviewer_sessions ($(printf '%s\n' "$CLEANFN" | wc -l | tr -d ' ') lines)"; else bad "cleanup_reviewer_sessions not found in the dispatcher"; fi
+{ cat <<'HDR'
+set -euo pipefail
+log() { echo "LOG: $*"; }
+gc() { echo "GC-CALLED $*"; }
+_release_gate_lock() { echo "LOCK-RELEASED"; }
+GC_CITY=/city; GATE_RUN_ID=r1
+_gate_cleanup_done=0
+SESSION_IDS=()
+HDR
+  printf '%s\n' "$CLEANFN"
+  printf 'cleanup_reviewer_sessions\necho CLEANUP-DONE\n'
+} > "$T/clean.sh"
+CL_OUT=$("$B32" "$T/clean.sh" 2>&1); CL_RC=$?
+if [ "$CL_RC" = "0" ] && case "$CL_OUT" in *CLEANUP-DONE*LOCK*|*LOCK*CLEANUP-DONE*) true ;; *) false ;; esac; then ok "real cleanup with ZERO reviewer sessions: exits 0 under bash 3.2 set -u and releases the lock"; else bad "real cleanup with empty SESSION_IDS: rc=$CL_RC $CL_OUT"; fi
+case "$CL_OUT" in *GC-CALLED*) bad "cleanup closed a session that does not exist" ;; *) ok "…and closes no session (there is none)" ;; esac
+
+# 5c''. the bypass keeps the citywide gate lock through the WHOLE finalize (gate round 3, blocking issue 1).
+# gate_finalize_run's Step 9 calls cleanup_reviewer_sessions, which releases the lock unless GATE_SWEEP_HAS_MORE_WORK=1 (Phase C sets it for
+# exactly this reason) — and the rig's full-suite check and the merge both come AFTER Step 9. So a bypass that leaves the flag unset runs the
+# heavy check and the merge with the lock already gone, which the lock's own log line ("holds the citywide gate lock until END") says never happens.
+# Step 9 also consumes _gate_cleanup_done, so the EXIT trap's cleanup is a no-op afterwards: whoever keeps the lock must also release it.
+# First the invariant the bypass leans on, on the REAL function: with the flag set, cleanup closes its sessions but leaves the lock alone.
+{ cat <<'HDR'
+set -euo pipefail
+log() { echo "LOG: $*"; }
+gc() { echo "GC-CALLED $*"; }
+_release_gate_lock() { echo "LOCK-RELEASED"; }
+GC_CITY=/city; GATE_RUN_ID=r1
+_gate_cleanup_done=0
+SESSION_IDS=()
+GATE_SWEEP_HAS_MORE_WORK=1
+HDR
+  printf '%s\n' "$CLEANFN"
+  printf 'cleanup_reviewer_sessions\necho CLEANUP-DONE\n'
+} > "$T/clean-more.sh"
+CM_OUT=$("$B32" "$T/clean-more.sh" 2>&1); CM_RC=$?
+if [ "$CM_RC" = "0" ] && case "$CM_OUT" in *CLEANUP-DONE*) true ;; *) false ;; esac && case "$CM_OUT" in *LOCK-RELEASED*) false ;; *) true ;; esac; then ok "real cleanup with GATE_SWEEP_HAS_MORE_WORK=1 leaves the lock held (the property the bypass relies on)"; else bad "real cleanup with the flag set: rc=$CM_RC $CM_OUT"; fi
+# …then the bypass itself: the REAL cleanup as Step 9, then a finalize that reports whether the lock is still held at the full-suite and the merge.
+byp_lock_case() { # <finalize rc> -> BL_OUT / BL_RC
+  { cat <<'HDR'
+set -euo pipefail
+BRANCH="b"; GATE_LANE_REASON="r"; GC_CITY=/city; GATE_RUN_ID=r1; GATE_LOCK_ENABLED=1
+LOCK_HELD=1
+log() { :; }
+gc() { echo "GC-CALLED $*"; }
+bd() { echo "BD-CALLED $*"; }
+_gate_lock_write_hb() { echo "HB-REFRESHED"; }
+_release_gate_lock() { echo "LOCK-RELEASED"; LOCK_HELD=0; }
+HDR
+    printf '%s\n' "$CLEANFN"
+    cat <<'FIN'
+gate_finalize_run() {
+  cleanup_reviewer_sessions                                       # Step 9 — before the full-suite check and the merge, as in the dispatcher
+  if [ "$LOCK_HELD" = "1" ]; then echo "AT-FULL-SUITE lock=held"; else echo "AT-FULL-SUITE lock=RELEASED"; fi
+  if [ "$LOCK_HELD" = "1" ]; then echo "AT-MERGE lock=held"; else echo "AT-MERGE lock=RELEASED"; fi
+  return "$FIN_RC"
+}
+FIN
+    printf 'FIN_RC=%q\nGATE_LANE=fast\n' "$1"
+    printf '%s\n' "${BYPBLK_USE:-$BYPBLK}"
+    printf 'echo AFTER-BLOCK\n'
+  } > "$T/bypl.sh"
+  BL_OUT=$("$B32" "$T/bypl.sh" 2>&1); BL_RC=$?
+}
+bl_line() { printf '%s\n' "$BL_OUT" | grep -n -m1 -x -- "$1" | cut -d: -f1; }   # line number of an exact output line ("" when absent)
+bl_count() { printf '%s\n' "$BL_OUT" | grep -c -x -- "$1" || true; }
+byp_lock_case 0
+case "$BL_OUT" in *"AT-FULL-SUITE lock=held"*) ok "bypass: the citywide lock is still held when the full-suite check runs (after Step 9)" ;; *) bad "bypass: lock gone at the full-suite check — $BL_OUT" ;; esac
+case "$BL_OUT" in *"AT-MERGE lock=held"*) ok "bypass: …and still held at the merge" ;; *) bad "bypass: lock gone at the merge — $BL_OUT" ;; esac
+[ "$(bl_count LOCK-RELEASED)" = "1" ] && ok "bypass: the lock is released exactly once" || bad "bypass: LOCK-RELEASED seen $(bl_count LOCK-RELEASED) times — $BL_OUT"
+L_BM=$(bl_line "AT-MERGE lock=held"); L_BR=$(bl_line LOCK-RELEASED)
+if [ -n "$L_BM" ] && [ -n "$L_BR" ] && [ "$L_BM" -lt "$L_BR" ]; then ok "bypass: …and only AFTER the merge point (the release is the sweep's true end, not Step 9)"; else bad "bypass: release order wrong (merge line=$L_BM, release line=$L_BR) — $BL_OUT"; fi
+L_HB=$(bl_line HB-REFRESHED); L_FS=$(bl_line "AT-FULL-SUITE lock=held")
+if [ -n "$L_HB" ] && [ -n "$L_FS" ] && [ "$L_HB" -lt "$L_FS" ]; then ok "bypass: the lock heartbeat is refreshed before the heavy part, as Phase C does for each run (a held lock with a stale heartbeat is reclaimed by a second sweep)"; else bad "bypass: no heartbeat refresh before the full-suite check — $BL_OUT"; fi
+[ "$BL_RC" = "0" ] && case "$BL_OUT" in *AFTER-BLOCK*|*GC-CALLED*|*BD-CALLED*) false ;; *) true ;; esac && ok "bypass: exit 0, nothing after the block, no gc/bd call of its own" || bad "bypass: rc=$BL_RC — $BL_OUT"
+byp_lock_case 1   # finalize fails under set -e: the abort goes straight to the EXIT trap, and the lock must still be freed
+[ "$(bl_count LOCK-RELEASED)" = "1" ] && ok "bypass: a finalize that fails (set -e abort) still frees the lock, exactly once" || bad "bypass: after a failing finalize LOCK-RELEASED seen $(bl_count LOCK-RELEASED) times — $BL_OUT"
+
+# 5d. the BSD seq hazard this design routes around (informational on GNU userland)
+if [ "$(seq 1 0 | wc -l | tr -d ' ')" = "2" ]; then ok "this host's seq counts DOWN (seq 1 0 prints 2 lines) — hence an explicit branch, not REQUIRED_REVIEWERS=0"
+else ok "seq 1 0 prints nothing here (GNU) — the explicit bypass is still the contract"; fi
+
+# ── 5e. the push-time confirmation (do_merge_ff) and the revoked-run handling (gate_finalize_run) ─────────────────
+# Gate round 2, blocking issue 2, at the dispatcher level: the REAL extracted push step, the REAL lib, REAL git. "Move the
+# tip after the decision and assert no push" — the push step is a function whose last line is PUSH-REACHED; a revoked lane
+# must return before it, with MERGE_RESULT=failed_lane_revoked.
+echo "── 5e. push-time confirm + revoked-run requeue (extracted blocks, real lib, real git) ──"
+PCBLK="$(extract_block "$DISPATCHER" fastlane-push-confirm)"
+LRBLK="$(extract_block "$DISPATCHER" fastlane-lane-revoked)"
+NARRFN="$(awk '/^gate_requeue_narrate\(\) \{/{p=1} p{print} p && /^\}$/{exit}' "$DISPATCHER")"
+for n in PCBLK LRBLK NARRFN; do
+  if [ -n "${!n}" ]; then ok "located $n ($(printf '%s\n' "${!n}" | wc -l | tr -d ' ') lines)"; else bad "$n not found in the dispatcher (sentinels missing/renamed)"; fi
+done
+PC_OUT=""
+pc_case() { # <decide-head|""> <cur-main> <cur-branch> [prelude] — the decision is the lib's own; the push step is the dispatcher's own
+  { cat <<'HDR'
+set -euo pipefail
+git_rig() { git -C "$FL_REPO" "$@"; }
+err() { echo "ERR: $*"; }
+log() { echo "LOG: $*"; }
+source "$FL_LIB"
+MERGE_RESULT=""; GATE_LANE=normal; MERGE_ATTEMPT=0   # (do_merge_ff always has MERGE_ATTEMPT: the loop that calls it sets it)
+HDR
+    [ -n "$1" ] && printf 'gate_fastlane_decide git_rig main %q ""\n' "$1"
+    printf '%s\n' "${4:-:}"
+    printf 'push_step() {\n%s\n  echo PUSH-REACHED\n}\n' "${PCBLK_USE:-$PCBLK}"
+    printf 'rc=0; CUR_MAIN=%q; CUR_BRANCH=%q; push_step || rc=$?\necho "STEP rc=$rc result=${MERGE_RESULT:-none} lane=$GATE_LANE"\n' "$2" "$3"
+  } > "$T/pc.sh"
+  PC_OUT=$(fl_env FL_REPO="$T/repo2" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" GATE_FS_TMPDIR="$T/tmp" "$B32" "$T/pc.sh" 2>&1) || true
+}
+pc_reached() { case "$PC_OUT" in *PUSH-REACHED*) return 0 ;; *) return 1 ;; esac; }
+pc_case "$FA" "$M0_R2" "$FA"
+{ pc_reached && case "$PC_OUT" in *"STEP rc=0 result=none lane=fast"*) true ;; *) false ;; esac; } && ok "push step: the commit that was decided is pushed (lane stays fast)" || bad "push step, same tip: $PC_OUT"
+pc_case "$FA" "$M0_R2" "$FB_PY"
+if pc_reached; then bad "THE REPRODUCTION: a .py commit landed after the decision and the push step was REACHED — it would merge with zero reviewers: $PC_OUT"
+else case "$PC_OUT" in *"STEP rc=1 result=failed_lane_revoked lane=normal"*) ok "tip moved after the decision (a .py commit): NO push — returns 1, MERGE_RESULT=failed_lane_revoked, lane=normal" ;; *) bad "tip moved: unexpected outcome: $PC_OUT" ;; esac; fi
+case "$PC_OUT" in *"ERR: "*[Rr]evoked*) ok "…and the refusal is said out loud, with the cause" ;; *) bad "the refusal was silent: $PC_OUT" ;; esac
+pc_case "$FA" "$M0_R2" "$FB_DOC"
+pc_reached && bad "a second doc after the decision reached the push (no scan, no test ever ran on it)" || ok "a harmless-looking second doc after the decision: NO push either"
+pc_case "$FA" "$MAIN2" "$FA_RB"
+{ pc_reached && case "$PC_OUT" in *"STEP rc=0 result=none lane=fast"*) true ;; *) false ;; esac; } && ok "the merge-time rebase onto the moved main is pushed (same change, new tip)" || bad "a pure rebase was refused: $PC_OUT"
+pc_case "" "$M0_R2" "$FB_PY"
+{ pc_reached && case "$PC_OUT" in *"STEP rc=0 result=none lane=normal"*) true ;; *) false ;; esac; } && ok "control: a NORMAL-lane (reviewed) run never meets the lane check — the step is a no-op for it" || bad "normal-lane run was touched by the lane check: $PC_OUT"
+pc_case "$FA" "$M0_R2" "$FA" 'unset -f gate_fastlane_confirm'
+pc_reached && bad "confirm function missing: the push step was reached (fail OPEN)" || ok "the confirm function is missing → NO push (a lane nobody can confirm is not granted)"
+pc_case "$FA" "$M0_R2" "$FA" 'gate_fastlane_confirm() { return 7; }'
+pc_reached && bad "confirm errored (rc 7): the push step was reached" || ok "a confirm that ERRORS (rc 7) → NO push (only a clean yes is a yes)"
+pc_case "$FA" "$M0_R2" "$FB_PY" 'gate_fastlane_confirm() { return 0; }'
+pc_reached && ok "premise: a confirm that says yes DOES reach the push step, so the refusals above are the confirm's doing, not the harness's" || bad "premise broken: even a yes does not reach the push step: $PC_OUT"
+
+LR_OUT=""
+lr_case() { # <merge_result> <requeue-rc>
+  { cat <<'HDR'
+set -euo pipefail
+log() { echo "LOG: $*"; }; warn() { echo "WARN: $*"; }; err() { echo "ERR: $*"; }
+bd() { echo "BD $*"; }
+notify() { echo "NOTIFY $*"; }
+set_gate_status() { echo "SET-STATUS $*"; }
+gate_requeue_respecting_external() { echo "REQUEUE $*"; return "$RQ_RC"; }
+gate_fastlane_record() { echo "RECORD lane=$GATE_LANE code=$GATE_LANE_REASON_CODE files=[$GATE_LANE_FILES] would=$6 log=$7"; }
+GATE_REQUEUE_RESPECTED_RC=10
+GC_CITY=/city; BEAD_CITY=/bcity; MARKER_ID=mk-7; GATE_RUN_ID=run-7; BEAD_ID=ga-x; BRANCH=feat/x; RIG=gascity; QG_LOG=/qg.jsonl
+GATE_LANE=fast; GATE_LANE_WOULD_REVIEWERS=2; GATE_LANE_FILES="DOC:docs/a.md"
+GATE_LANE_CONFIRM_CODE=diff-changed; GATE_LANE_CONFIRM_WHY="the diff that would land is not the diff the lane checked"
+HDR
+    printf '%s\n' "$NARRFN"
+    printf 'MERGE_RESULT=%q; RQ_RC=%q\n' "$1" "$2"
+    printf 'fin() {\n%s\n  echo FELL-THROUGH\n}\n' "${LRBLK_USE:-$LRBLK}"
+    printf 'rc=0; fin || rc=$?; echo "FIN rc=$rc"\n'
+  } > "$T/lr.sh"
+  LR_OUT=$("$B32" "$T/lr.sh" 2>&1) || true
+}
+lr_has() { case "$LR_OUT" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+lr_case failed_lane_revoked 0
+lr_has "REQUEUE mk-7 queued dispatching" && ok "revoked run: the marker goes back to queued (from dispatching) through the external-transition-respecting helper" || bad "revoked run: no requeue — $LR_OUT"
+lr_has "BD -C /bcity label remove ga-x gate:reviewing" && ok "…the source bead's gate:reviewing is cleared (no head-of-line starvation)" || bad "gate:reviewing not cleared — $LR_OUT"
+lr_has "SET-STATUS run-7 superseded" && lr_has "BD -C /city close run-7" && ok "…the gate-run bead is superseded and closed (Phase C must not re-pick it)" || bad "gate-run bead left open — $LR_OUT"
+lr_has "RECORD lane=normal code=revoked-at-push files=[] would=2 log=/qg.jsonl" && ok "…the decision is re-recorded as NORMAL with code revoked-at-push (marker metadata + jsonl) — not left saying 'fast'" || bad "revocation not recorded — $LR_OUT"
+lr_has "FIN rc=0" && ! lr_has "FELL-THROUGH" && ok "…and the function RETURNS 0 before the FAIL block: a revoked lane is never a verdict on the author's code" || bad "revoked run fell through to the FAIL/merged handling — $LR_OUT"
+lr_has "NOTIFY" && bad "a routine revocation paged someone" || ok "…no notification (it is routine, not an alarm)"
+lr_case failed_lane_revoked 10
+lr_has "BD -C /city comment mk-7" && lr_has "another actor" && ! lr_has "re-queued for the normal gate" && ok "revoked run, but another actor moved the marker: the marker comment says WHY it was not re-queued, and never claims the requeue" || bad "a skipped requeue was narrated as a requeue (or not narrated) — $LR_OUT"
+lr_has "FIN rc=0" && ! lr_has "FELL-THROUGH" && ok "…and it still ends cleanly, never as a FAIL" || bad "skipped-requeue run fell through — $LR_OUT"
+lr_case failed_push_race 0
+lr_has "FELL-THROUGH" && ! lr_has "REQUEUE" && ok "control: any OTHER merge failure is untouched by the revoked-run block (falls through to the existing handling)" || bad "the revoked-run block swallowed a different failure — $LR_OUT"
+
+# ── 5f. hermetic: the operator's own kill switch is ambient state ──────────────────────────────────────────────
+# (gate round 3, blocking issue 2.) `touch <city>/.gc/gate-fastlane.off` and GATE_FASTLANE_ENABLED=0 are the operator controls this very story ships,
+# and GC_CITY is exported in every agent session. Every helper above that feeds the lib hands it a child environment; one that INHERITS the caller's
+# makes every case in this file read "lane switched off" the moment the switch is on — 100+ failures that look like a lane regression, on exactly the
+# day a worker's gate-done self-audit runs this file. The class is "a case's result depends on the caller's operator controls", so each of the four
+# helpers that spawn the lib (decide — and through it e2e_probe and the mutation checks —, dconf, real_dec, pc_case) is probed with each control ON.
+# The explicit per-case overrides (§4d, §4f: GATE_FASTLANE_OFF_FILE=…, GATE_FASTLANE_ENABLED=0) are the control: they must still win over the pin.
+echo "── 5f. hermetic: the operator's kill switch in the CALLER's environment must not reach a case ──"
+HC="$T/hostile-city"; mkdir -p "$HC/.gc"; : > "$HC/.gc/gate-fastlane.off"; : > "$T/hostile.off"
+hostile_decide() { # <label> ENV=VAL... — decide(), run with that setting exported in the caller's environment
+  local label="$1" got; shift
+  # two branches: docs-only (the switch controls) and docs + a new green test (the same, and the tuning knobs that only a changed test reaches)
+  got=$( export "$@"; decide "$(head_of s-docs)" ""; printf '%s' "$D_LANE"; decide "$(head_of s-testok)" ""; printf ' %s' "$D_LANE" )
+  [ "$got" = "fast fast" ] && ok "hermetic [$label]: decide() still reads the docs-only and the docs+green-test branches as fast" || bad "hermetic [$label]: decide() inherited the caller's setting — lanes='$got' (want 'fast fast')"
+}
+hostile_probe() { # <label> ENV=VAL... — each helper, run with that operator control ON in the caller's environment; each must still read the docs-only branch as fast
+  local label="$1" got; shift
+  hostile_decide "$label" "$@"
+  got=$( export "$@"; real_dec "$(head_of s-docs)" )
+  [ "$got" = "RESULT lane=fast tier=FAST-LANE rev=0" ] && ok "hermetic [$label]: the dispatcher's Step 5 block + real lib still grants fast" || bad "hermetic [$label]: real_dec inherited the switch — '$got'"
+  got=$( export "$@"; REPO="$T/repo2"; dconf "$FA" main "$FA"; printf '%s/%s' "$C_RC" "$C_L1" )
+  [ "$got" = "0/fast" ] && ok "hermetic [$label]: the push-time confirm still says yes to the unmoved tip" || bad "hermetic [$label]: dconf inherited the switch — rc/lane='$got' (want 0/fast)"
+  got=$( export "$@"; pc_case "$FA" "$M0_R2" "$FA"; printf '%s' "$PC_OUT" )
+  case "$got" in *"STEP rc=0 result=none lane=fast"*) ok "hermetic [$label]: the dispatcher's push step still pushes the decided commit" ;; *) bad "hermetic [$label]: pc_case inherited the switch — $got" ;; esac
+}
+hostile_probe "flag file under the caller's GC_CITY" GC_CITY="$HC"
+hostile_probe "caller exported GATE_FASTLANE_ENABLED=0" GATE_FASTLANE_ENABLED=0
+hostile_probe "caller exported GATE_FASTLANE_OFF_FILE pointing at an existing file" GATE_FASTLANE_OFF_FILE="$T/hostile.off"
+# a tuning knob is the same class, but only a branch that changes a test reaches it — so only decide()'s two-branch probe says anything about it
+hostile_decide "caller exported GATE_FASTLANE_RUN_TESTS=0 (a tuning knob)" GATE_FASTLANE_RUN_TESTS=0
+
+# ── 6. drift guards: facts the safety argument depends on ─────────────────────────────────────────────────────
+echo "── 6. drift guards ──"
+ln_of() { grep -n -F -- "$1" "$DISPATCHER" | head -1 | cut -d: -f1; }
+L_BYP=$(grep -n 'SELFTEST-EXTRACT fastlane-bypass: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_SEQ=$(grep -n -F 'for i in $(seq 1 $REQUIRED_REVIEWERS); do' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$L_BYP" ] && [ -n "$L_SEQ" ] && [ "$L_BYP" -lt "$L_SEQ" ]; then ok "the bypass (line $L_BYP) comes BEFORE the reviewer-spawn loop (line $L_SEQ)"; else bad "bypass/spawn-loop order: bypass=$L_BYP spawn=$L_SEQ"; fi
+L_ZERO=$(ln_of 'has ZERO verdict beads')
+L_DEC=$(grep -n 'SELFTEST-EXTRACT phase-c-verdict-decision: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$L_ZERO" ] && [ -n "$L_DEC" ] && [ "$L_ZERO" -lt "$L_DEC" ]; then ok "Phase C refuses a ZERO-verdict run (line $L_ZERO) BEFORE it asks 'all verdicts in?' (line $L_DEC) — a 0-of-0 fast-lane orphan can never be PASS-finalized"
+else bad "Phase C ordering broke: zero-verdict guard=$L_ZERO verdict-decision=$L_DEC — a crashed fast-lane run could now read as 'all passed'"; fi
+# (captured, not piped into `grep -q`: under pipefail `grep -q` exits at its first match and the writer can die of SIGPIPE — a flaky red)
+ZG=$(sed -n "${L_ZERO:-1},$((${L_ZERO:-1}+1))p" "$DISPATCHER")
+case "$ZG" in *continue*) true ;; *) false ;; esac && ok "…and that guard really does \`continue\` past the run" || bad "the zero-verdict guard no longer continues"
+L_POL=$(grep -n -E '^POLICY_FILES=' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_DECBLK=$(grep -n 'SELFTEST-EXTRACT fastlane-decide: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$L_POL" ] && [ -n "$L_DECBLK" ] && [ "$L_POL" -lt "$L_DECBLK" ]; then ok "POLICY_FILES (line $L_POL) is computed before the lane decision (line $L_DECBLK)"; else bad "POLICY_FILES is not defined before the lane decision ($L_POL / $L_DECBLK)"; fi
+POLRE=$(grep -m1 -E '^POLICY_FILES=' "$DISPATCHER" | sed -n 's/.*grep -E "(\(.*\))".*/\1/p')
+case "$POLRE" in "review-merge-policy|quality-gate") ok "the dispatcher's own policy regex is still $POLRE" ;; *) bad "the dispatcher's policy regex changed to '$POLRE' — update the lib's case list in gate_fastlane_classify_raw to match" ;; esac
+grep -q '\*review-merge-policy\*|\*quality-gate\*|\*gate-fastlane\*|\*gate-lane\*) cls="POLICY"' "$LIB" && ok "the lib's policy case list carries both of the dispatcher's alternatives plus the lane's own two" || bad "lib policy case list drifted from the dispatcher's regex"
+# a here-string, not `printf | grep -q`: the block outgrew one stdio buffer, and under pipefail the early-exiting `grep -q`
+# then made the writer die of SIGPIPE — this assertion went red on a dispatcher that was correct
+# NOTE what this does NOT prove: that \$BRANCH_SHA is the commit that lands. The merge pushes whatever origin/$BRANCH is at push time,
+# so that property is enforced — and tested behaviourally — by the push-time confirm (§4f, §5e), not by this call's argument text.
+grep -q 'gate_fastlane_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$POLICY_FILES"' <<< "$DECBLK" && ok "the decision is taken on the commit the run claimed (\$BRANCH_SHA) and honors the policy self-protection answer (that this is what lands is NOT assumed here — see §4f/§5e)" || bad "decide call no longer passes BRANCH_SHA / POLICY_FILES"
+grep -q 'fast_lane_mechanical_checks_no_llm_review' "$DISPATCHER" && grep -q 'GATE_LANE:-normal}" = "fast"' "$DISPATCHER" && ok "a fast-lane PASS never records 'quorum_0_of_0_independent_sessions'" || bad "the PASS reason is not lane-aware"
+grep -q 'reviewers: \$reviewers, dry_run: \$dry_run, lane: \$lane' "$DISPATCHER" && ok "dispatcher_complete carries a lane field (consumers can filter fast-lane runs)" || bad "dispatcher_complete lost its lane field"
+grep -q '^lane: \$GATE_LANE$' "$DISPATCHER" && ok "the gate-run bead records its lane" || bad "run bead description has no lane: line"
+# the push-time confirmation: the check and the act are ONE variable, with NOTHING between them (gate round 2, issue 2)
+L_PCB=$(grep -n 'SELFTEST-EXTRACT fastlane-push-confirm: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_PCE=$(grep -n 'SELFTEST-EXTRACT fastlane-push-confirm: END' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_PUSH=$(grep -n -F 'if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH"' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_LATE=$(grep -n 'LIVE re-check #2 — AUTHORITATIVE' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$L_PCB" ] && [ -n "$L_PCE" ] && [ -n "$L_PUSH" ] && [ -n "$L_LATE" ] && [ "$L_LATE" -lt "$L_PCB" ] && [ "$L_PCE" -lt "$L_PUSH" ]; then ok "the lane confirm (lines $L_PCB-$L_PCE) comes after the late bead re-check (line $L_LATE) and before the FF push (line $L_PUSH)"; else bad "push-confirm placement: late-recheck=$L_LATE confirm=$L_PCB-$L_PCE push=$L_PUSH"; fi
+BETWEEN=$(sed -n "$((${L_PCE:-0}+1)),$((${L_PUSH:-0}-1))p" "$DISPATCHER" | grep -v -E '^[[:space:]]*(#.*)?$' || true)
+[ -z "$BETWEEN" ] && ok "NOTHING executable sits between the confirm and the push — no window to move the tip in (only comments)" || bad "code between the confirm and the push: $BETWEEN"
+grep -q 'gate_fastlane_confirm git_rig "$CUR_MAIN" "$CUR_BRANCH"' <<< "$PCBLK" && grep -q '"${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH"' <<< "$(sed -n "${L_PUSH:-1}p" "$DISPATCHER")" && ok "the confirm is asked about \$CUR_BRANCH — the very variable the push sends (decided variable == acted-on variable)" || bad "confirm and push no longer share \$CUR_BRANCH"
+L_RETRY_B=$(grep -n 'while \[ "\$MERGE_ATTEMPT" -lt "\$MAX_MERGE_RETRIES" \]' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_RETRY_E=$(grep -n 'Stopping retry loop' "$DISPATCHER" | head -1 | cut -d: -f1)
+RETRYBODY=$(sed -n "${L_RETRY_B:-1},${L_RETRY_E:-1}p" "$DISPATCHER")
+case "$RETRYBODY" in *'"$MERGE_RESULT" = "failed_lane_revoked"'*) ok "failed_lane_revoked is a NON-retryable merge result (retrying the push would only be refused again)" ;; *) bad "failed_lane_revoked is not in the non-retryable list of the merge retry loop" ;; esac
+L_LRB=$(grep -n 'SELFTEST-EXTRACT fastlane-lane-revoked: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_GENFAIL=$(grep -n -F 'if [[ "$MERGE_RESULT" = failed* ]]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$L_LRB" ] && [ -n "$L_GENFAIL" ] && [ "$L_LRB" -lt "$L_GENFAIL" ] && [ -n "$L_RETRY_E" ] && [ "$L_RETRY_E" -lt "$L_LRB" ]; then ok "the revoked-run block (line $L_LRB) sits after the merge loop and BEFORE the generic failed_* → FAIL handling (line $L_GENFAIL)"; else bad "revoked-run block placement: loop-end=$L_RETRY_E block=$L_LRB generic-fail=$L_GENFAIL"; fi
+# the lane is decided only for a run that will actually start: after the live-sibling yield (5b) and the size park (5c), before Step 6
+L_5C=$(grep -n '^# ── Step 5c' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_S6=$(grep -n '^# ── Step 6: Create gate-run tracking bead' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_RECE=$(grep -n 'SELFTEST-EXTRACT fastlane-record: END' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$L_5C" ] && [ -n "$L_S6" ] && [ -n "$L_DECBLK" ] && [ -n "$L_RECE" ] && [ "$L_5C" -lt "$L_DECBLK" ] && [ "$L_RECE" -lt "$L_S6" ]; then ok "the lane decision + record (lines $L_DECBLK-$L_RECE) come AFTER the yield/park guards (Step 5c, line $L_5C) and before Step 6 (line $L_S6) — no test runs under the gate lock for a marker that then yields or parks, and no gate_lane event is written for a decision that never ran"; else bad "lane decision placement: 5c=$L_5C decide=$L_DECBLK record-end=$L_RECE step6=$L_S6"; fi
+for c in no-changed-files decision-errored lib-not-loaded revoked-at-push; do
+  grep -q "GATE_LANE_REASON_CODE=\"$c\"" "$DISPATCHER" && ok "the dispatcher sets reason code '$c' on its own fallback path" || bad "the dispatcher lost reason code '$c' (its fallback would read as 'sem reason_code')"
+done
+grep -q 'gc-gate-fs-fastlane-\*' "$DISPATCHER" && ok "the stale-worktree reaper covers the fast lane's test worktree" || bad "reaper does not match gc-gate-fs-fastlane-*"
+grep -q 'gc-gate-fl-diff-\*' "$DISPATCHER" && ok "the reaper also sweeps a leaked scan diff" || bad "reaper does not sweep gc-gate-fl-diff-*"
+# the recovery the bypass comment relies on is real: the guard's Vector B reconcile, run on the REAL function
+GUARD="$SELF_DIR/quality-gate-guard.sh"
+RZ="$(awk '/^reconcile_zero_verdict_run_action\(\) \{/{p=1} p{print} p && /^\}$/{exit}' "$GUARD" 2>/dev/null)"
+if [ -n "$RZ" ]; then
+  rz() { "$B32" -c "$RZ"$'\n''reconcile_zero_verdict_run_action "$@"' _ "$@"; }
+  [ "$(rz 30 10 dispatching)" = "supersede:requeue-marker" ] && ok "a crashed fast-lane run (running, 0 verdicts, marker dispatching, past grace) → guard Vector B: supersede:requeue-marker (closed + re-queued, lane redone)" || bad "guard no longer re-queues a zero-verdict run whose marker is dispatching: $(rz 30 10 dispatching)"
+  [ "$(rz 5 10 dispatching)" = "skip" ] && ok "…and inside the grace window it leaves a brand-new run alone" || bad "grace window broke: $(rz 5 10 dispatching)"
+  [ "$(rz 30 10 "")" = "skip" ] && ok "…and an unknown marker state is never guessed at (skip)" || bad "unknown marker state no longer skips: $(rz 30 10 "")"
+else
+  bad "reconcile_zero_verdict_run_action not found in quality-gate-guard.sh — the crash-recovery claim in the dispatcher bypass comment is no longer backed"
+fi
+# the fast lane's own temp names must be ones the reaper knows (no silent leak family)
+grep -q 'gc-gate-fs-fastlane-\$\$' "$LIB" && grep -q 'gc-gate-fl-diff-XXXXXX' "$LIB" && ok "the lib names its temp files exactly as the reaper expects" || bad "lib/reaper temp-name drift"
+
+# ── 7. record: marker metadata written AND read back; jsonl event; a failed write is said out loud ────────────
+echo "── 7. gate_fastlane_record ──"
+rec_case() { # lane-written lane-read-back
+  : > "$T/bd.log"; rm -f "$T/qg.jsonl"
+  REC_ERR=$(PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bd.log" FAKE_BD_LANE="$2" "$B32" -c '
+    set -euo pipefail
+    source "$1"
+    GATE_LANE="$3"; GATE_LANE_REASON="all DOC"; GATE_LANE_COUNTS="doc=2 test=0 prompt=0 code=0"; GATE_LANE_FILES=$(printf "DOC\tdocs/a.md\nDOC\tdocs/b.md\n")
+    gate_fastlane_record /city mk-1 ga-x feat/ga-x gascity 1 "$4"
+  ' _ "$LIB" "$2" "$1" "$T/qg.jsonl" 2>&1 >/dev/null) || REC_ERR="ABORTED: $REC_ERR"
+}
+rec_case fast fast
+grep -q 'gate.lane=fast' "$T/bd.log" && grep -q 'gate.lane_reason=' "$T/bd.log" && grep -q 'gate.lane_files=DOC:docs/a.md; DOC:docs/b.md -q' "$T/bd.log" && ok "marker metadata written: gate.lane / gate.lane_reason / gate.lane_files (the files that decided)" || bad "marker metadata: $(cat "$T/bd.log")"
+[ -z "$REC_ERR" ] && ok "read-back matched → no warning" || bad "unexpected stderr: $REC_ERR"
+J=$(tail -1 "$T/qg.jsonl" 2>/dev/null)
+[ "$(printf '%s' "$J" | jq -r '[.event,.lane,.would_have_reviewers,.counts]|join("|")' 2>/dev/null)" = "gate_lane|fast|1|doc=2 test=0 prompt=0 code=0" ] && ok "jsonl gate_lane event carries lane, counts and the reviewers a normal run would have used (for the weekly tally)" || bad "jsonl event: $J"
+[ "$(printf '%s' "$J" | jq -r '[.reason_code,.dry_run]|join("|")' 2>/dev/null)" = "|0" ] && ok "jsonl event carries reason_code (empty when the caller set none) and dry_run=0 by default" || bad "jsonl reason_code/dry_run: $J"
+: > "$T/bd.log"; rm -f "$T/qg-code.jsonl"
+PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bd.log" FAKE_BD_LANE=normal DRY_RUN=1 "$B32" -c 'set -euo pipefail; source "$1"; GATE_LANE=normal; GATE_LANE_REASON=r; GATE_LANE_REASON_CODE=code-or-prompt; GATE_LANE_COUNTS=c; GATE_LANE_FILES=f; gate_fastlane_record /city mk-1 ga-x b gascity 1 "$2"' _ "$LIB" "$T/qg-code.jsonl" >/dev/null 2>&1
+[ "$(jq -r '[.reason_code,.dry_run]|join("|")' "$T/qg-code.jsonl" 2>/dev/null)" = "code-or-prompt|1" ] && ok "jsonl event carries the reason_code the decision set, and dry_run=1 under DRY_RUN=1" || bad "jsonl event: $(cat "$T/qg-code.jsonl" 2>/dev/null)"
+rec_case fast normal
+case "$REC_ERR" in *"NOT confirmed"*) ok "a write the read-back does not confirm is reported, not assumed" ;; *) bad "unconfirmed write was silent: '$REC_ERR'" ;; esac
+[ -s "$T/qg.jsonl" ] && ok "…and the jsonl event is still written" || bad "jsonl event lost when the marker write was unconfirmed"
+
+# a jq that fails: the event cannot be written, and that must be SAID, not swallowed
+mkdir -p "$T/bin2"; printf '#!/bin/sh\nexit 1\n' > "$T/bin2/jq"; chmod +x "$T/bin2/jq"
+JQ_ERR=$(PATH="$T/bin2:$T/bin:$PATH" FAKE_BD_LOG="$T/bd.log" FAKE_BD_LANE=fast "$B32" -c '
+  set -euo pipefail; source "$1"
+  GATE_LANE=fast; GATE_LANE_REASON=r; GATE_LANE_COUNTS=c; GATE_LANE_FILES=f
+  gate_fastlane_record /city mk-1 ga-x b gascity 1 "$2"
+' _ "$LIB" "$T/qg-jqfail.jsonl" 2>&1 >/dev/null) || JQ_ERR="ABORTED: $JQ_ERR"
+case "$JQ_ERR" in *"could not append the gate_lane event"*) ok "a failing jq: the lost gate_lane event is reported (the tally would under-count) — not swallowed" ;; *) bad "failing jq was silent: '$JQ_ERR'" ;; esac
+
+# ── 8. mutation checks of THIS harness ─────────────────────────────────────────────────────────────────────
+echo "── 8. mutation checks: the assertions above must be load-bearing ──"
+# 8a. a bypass that never fires must be caught by the finalize assertion
+BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed 's/^if \[ "\$GATE_LANE" = "fast" \]; then/if false; then/')"
+byp_case fast fast
+case "$BYP_OUT" in *"FINALIZE overall=PASS"*) bad "mutant bypass (never fires) still passed the finalize assertion — the harness is blind" ;; *) ok "a bypass that never fires turns the fast-lane assertion RED" ;; esac
+BYPBLK_USE=""
+# 8b. a lib that loses its symlink guard would grant fast to a symlinked doc
+sed 's/120000|160000) GATE_FL_STATE="unclassifiable".*; return 0 ;;/120000|160000) ;;/' "$LIB" > "$T/mut-nosymlink.lib.sh"
+cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-nosymlink.lib.sh"; then bad "mutation 8b did not change the lib (sed pattern drifted)"; else
+  S=$(git -C "$REPO" rev-parse s-link); FL_LIB_OVERRIDE="$T/mut-nosymlink.lib.sh" decide "$S" ""
+  [ "$D_LANE" = "fast" ] && ok "without the symlink guard a symlinked 'doc' WOULD be granted fast — the real guard is what holds it back" || bad "mutant without the symlink guard still read $D_LANE — the symlink assertion is not load-bearing"
+fi
+# 8c. a lib that reads 'could not scan' as clean would grant fast to a binary .md
+perl -0pe 's/\*\) _gate_fastlane_normal "scan-failed" "content scan could not run.*?\n\s*return 0 ;;/*) ;;/s' "$LIB" > "$T/mut-scanclean.lib.sh"
+cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-scanclean.lib.sh" || ! "$B32" -n "$T/mut-scanclean.lib.sh" 2>/dev/null; then
+  # the sed mutant must still be valid bash; if my sed drifted, say so rather than pass vacuously
+  bad "mutation 8c did not produce a valid, different lib (sed pattern drifted)"
+else
+  S=$(git -C "$REPO" rev-parse s-bin); FL_LIB_OVERRIDE="$T/mut-scanclean.lib.sh" decide "$S" ""
+  [ "$D_LANE" = "fast" ] && ok "if 'could not scan' read as clean, a binary .md WOULD be granted fast — the real code refuses" || bad "mutant that reads unscannable as clean still read $D_LANE — assertion not load-bearing"
+fi
+# 8d. a lib that hands the tests the caller's full PATH would let an unreviewed test find the tools installed under $HOME (the stub 'secret')
+sed 's/PATH="\$tpath"/PATH="$PATH"/' "$LIB" > "$T/mut-fullpath.lib.sh"
+cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-fullpath.lib.sh"; then bad "mutation 8d did not change the lib (sed pattern drifted)"; else
+  S=$(git -C "$REPO" rev-parse s-nosecret)
+  FL_LIB_OVERRIDE="$T/mut-fullpath.lib.sh" decide "$S" "" HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+  [ "$D_LANE" = "normal" ] && ok "without the PATH filter the stub 'secret' (a tool under $HOME) IS reachable and the scenario goes red — the filter is what drops $HOME tools" || bad "mutant with the full PATH still read $D_LANE — the PATH assertion is not load-bearing"
+fi
+# 8e. a producer whose code the tally does not bucket — the exact shape of the gate's blocking issue 2 — must turn §4e red
+sed 's/_gate_fastlane_normal "code-or-prompt"/_gate_fastlane_normal "made-up-code"/' "$LIB" > "$T/mut-badcode.lib.sh"
+cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-badcode.lib.sh"; then bad "mutation 8e did not change the lib (sed pattern drifted)"; else
+  e2e_probe "$(head_of s-mdpy)" "" FL_LIB_OVERRIDE="$T/mut-badcode.lib.sh"
+  if e2e_ok code-or-prompt; then bad "a lib emitting a code the tally does not know still passed §4e — the end-to-end check is blind"
+  else ok "a lib emitting a code the tally does not bucket turns §4e RED (code='$D_CODE' → bucket '$E_BUCKET')"; fi
+fi
+# 8f. a producer that swaps two codes (code diffs reported as policy) must turn §4e red too — a bucket that EXISTS is not enough
+sed 's/_gate_fastlane_normal "code-or-prompt"/_gate_fastlane_normal "policy"/' "$LIB" > "$T/mut-swapcode.lib.sh"
+if cmp -s "$LIB" "$T/mut-swapcode.lib.sh"; then bad "mutation 8f did not change the lib (sed pattern drifted)"; else
+  e2e_probe "$(head_of s-mdpy)" "" FL_LIB_OVERRIDE="$T/mut-swapcode.lib.sh"
+  if e2e_ok code-or-prompt; then bad "a lib reporting code diffs as 'policy' still passed §4e"
+  else ok "a lib that reports code diffs as the gate's own policy turns §4e RED (the cited misbucketing)"; fi
+fi
+# 8g. a confirm that always says yes — the exact shape of the gate's blocking issue 2 — must turn §4f red
+sed 's/^gate_fastlane_confirm() {$/gate_fastlane_confirm() { return 0/' "$LIB" > "$T/mut-confirmyes.lib.sh"
+cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-confirmyes.lib.sh"; then bad "mutation 8g did not change the lib (sed pattern drifted)"; else
+  REPO="$T/repo2"; FL_LIB_OVERRIDE="$T/mut-confirmyes.lib.sh" dconf "$FA" main "$FB_PY"; REPO="$REPO_MAIN"
+  [ "$C_RC" = "0" ] && ok "a confirm that always says yes WOULD wave the moved tip through (rc=0) — the real confirm is what refuses it" || bad "mutant confirm that always says yes still read rc=$C_RC — §4f is not load-bearing"
+fi
+# 8h. a push step that notices the revocation but does not return must reach the push in §5e
+PCBLK_USE="$(printf '%s\n' "$PCBLK" | sed 's/return 1/:/')"
+if [ "$PCBLK_USE" = "$PCBLK" ]; then bad "mutation 8h did not change the push-confirm block (sed pattern drifted)"; else
+  pc_case "$FA" "$M0_R2" "$FB_PY"
+  pc_reached && ok "a push step that logs the revocation but forgets to return WOULD reach the push — the 'return 1' is what holds it" || bad "mutant push step without its return still did not reach the push — §5e is not load-bearing"
+fi
+PCBLK_USE=""
+# 8i. a lib whose DOC class is 'any .md' again (the round-2 blocking issue 1) must turn the class assertion red
+perl -0pe 's/(\n  echo CODE\n  return 0\n\})/\n  if [ "\$ext" = "md" ]; then echo DOC; return 0; fi$1/' "$LIB" > "$T/mut-anymd.lib.sh"
+cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-anymd.lib.sh" || ! "$B32" -n "$T/mut-anymd.lib.sh" 2>/dev/null; then bad "mutation 8i did not produce a valid, different lib (perl pattern drifted)"; else
+  S=$(git -C "$REPO" rev-parse s-unkmd); FL_LIB_OVERRIDE="$T/mut-anymd.lib.sh" decide "$S" ""
+  [ "$D_LANE" = "fast" ] && ok "if every .md were a doc again, an unlisted NOTES.md WOULD be granted fast — the positive DOC list is what keeps it in the gate" || bad "mutant with 'any .md is a doc' still read $D_LANE — the class assertion is not load-bearing"
+fi
+# 8j. a bypass that forgets the flag (gate round 3, blocking issue 1) must turn the lock assertions red: Step 9 would free the lock before the heavy part
+BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed '/^  GATE_SWEEP_HAS_MORE_WORK=1/d')"
+if [ "$BYPBLK_USE" = "$BYPBLK" ]; then bad "mutation 8j did not change the bypass block (sed pattern drifted)"; else
+  byp_lock_case 0
+  case "$BL_OUT" in *"AT-FULL-SUITE lock=RELEASED"*) ok "a bypass without GATE_SWEEP_HAS_MORE_WORK WOULD reach the full-suite check with the lock already freed — the flag is what holds it" ;; *) bad "mutant bypass without the flag still held the lock at the full-suite check — §5c'' is not load-bearing" ;; esac
+fi
+# 8k/8l. a bypass that holds the lock but cannot release it (Step 9 consumed _gate_cleanup_done; or the flag is still set when the trap runs) leaks it until GATE_LOCK_MAX_AGE
+BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed 's/ _gate_cleanup_done=0; cleanup_reviewer_sessions; }/ cleanup_reviewer_sessions; }/')"
+if [ "$BYPBLK_USE" = "$BYPBLK" ]; then bad "mutation 8k did not change the bypass block (sed pattern drifted)"; else
+  byp_lock_case 0
+  [ "$(bl_count LOCK-RELEASED)" = "0" ] && ok "an exit trap that does not re-arm the cleanup WOULD leak the lock (Step 9 consumed the dedup flag) — the re-arm is what frees it" || bad "mutant exit trap without the re-arm still released the lock — the release assertion is not load-bearing"
+fi
+BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed 's/_fastlane_exit() { GATE_SWEEP_HAS_MORE_WORK=0; /_fastlane_exit() { /')"
+if [ "$BYPBLK_USE" = "$BYPBLK" ]; then bad "mutation 8l did not change the bypass block (sed pattern drifted)"; else
+  byp_lock_case 0
+  [ "$(bl_count LOCK-RELEASED)" = "0" ] && ok "an exit trap that leaves the flag set WOULD leak the lock (the cleanup would skip its release) — clearing it is what frees it" || bad "mutant exit trap that keeps the flag still released the lock — the release assertion is not load-bearing"
+fi
+BYPBLK_USE=""
+# 8m. an fl_env that no longer pins (back to a bare `env`) must turn §5f red: the caller's switch would reach the lib again
+FL_ENV_DEF="$(declare -f fl_env)"
+fl_env() { env "$@"; }
+M8M=$( export GATE_FASTLANE_ENABLED=0; decide "$(head_of s-docs)" ""; printf '%s' "$D_LANE" )
+eval "$FL_ENV_DEF"
+[ "$M8M" = "normal" ] && ok "an fl_env that does not pin WOULD let the caller's GATE_FASTLANE_ENABLED=0 through (lane=normal) — the pin is what keeps the cases hermetic" || bad "mutant fl_env without the pin still read lane='$M8M' — §5f is not load-bearing"
+# 8n. a lib without the "no diff text = nothing read" guard (gate round 3, low finding) must turn §4e' red: the unread diff would be granted fast
+sed '/^  \[ -s "\$tmp" \] || { GATE_FL_R_OUT=/d' "$LIB" > "$T/mut-nonull.lib.sh"
+cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-nonull.lib.sh"; then bad "mutation 8n did not change the lib (sed pattern drifted)"; else
+  M8N=$(null_scan "$(head_of s-docs)" "$T/mut-nonull.lib.sh")
+  case "$M8N" in fast\|*) ok "without the guard, a diff whose text was never read WOULD be granted fast ('$M8N') — the guard is what keeps it in the gate" ;; *) bad "mutant lib without the guard still read '$M8N' — §4e' is not load-bearing" ;; esac
+fi
+# 8r. a lib without the runner lookup's inert default (gate round 6, blocking issue 1) must turn §4g red: the empty answer would be granted fast again
+sed '/could not tell how to run the changed test/d' "$LIB" > "$T/mut-norunnerdefault.lib.sh"
+if cmp -s "$LIB" "$T/mut-norunnerdefault.lib.sh" || ! "$B32" -n "$T/mut-norunnerdefault.lib.sh" 2>/dev/null; then bad "mutation 8r did not produce a valid, different lib (sed pattern drifted)"; else
+  M8R=$(FL_LIB_OVERRIDE="$T/mut-norunnerdefault.lib.sh" stub_decide "$S_T2" 'gate_fastlane_test_runner() { :; }')
+  case "$M8R" in fast\|*) ok "without the default arm an EMPTY runner answer WOULD grant the lane on tests nobody ran ('$M8R') — the default arm is what holds it back" ;; *) bad "mutant lib without the runner default still read '$M8R' — §4g (a) is not load-bearing" ;; esac
+fi
+# 8s. a lib that believes the scanner's exit code without checking its output shape (gate round 6, blocking issue 2) must read a dead scanner as findings again
+sed 's/if ! _gate_fastlane_is_finding_list "\$out_s"; then/if false; then/' "$LIB" > "$T/mut-noshape.lib.sh"
+if cmp -s "$LIB" "$T/mut-noshape.lib.sh" || ! "$B32" -n "$T/mut-noshape.lib.sh" 2>/dev/null; then bad "mutation 8s did not produce a valid, different lib (sed pattern drifted)"; else
+  mkdir -p "$T/mut-noshape"; cp "$T/mut-noshape.lib.sh" "$T/mut-noshape/gate-fastlane.lib.sh"; cp "$T/scanlib-import-raise/gate-fastlane-scan.py" "$T/mut-noshape/"
+  FL_LIB_OVERRIDE="$T/mut-noshape/gate-fastlane.lib.sh" decide "$S_D" ""
+  [ "$D_CODE" = "scan-findings" ] && ok "without the shape check a scanner that crashed at import WOULD be booked as scan-findings ('found personal data') — the shape check is what tells a crash from a finding" || bad "mutant lib without the shape check still read code '$D_CODE' — §4g (e) is not load-bearing"
+fi
+# 8t. a lib whose scan lacks the HISTORY pass (the shape of the lib the gate rejected in round ga-aa8n6z) grants the reproduction fast
+sed 's/^  _gate_fastlane_scan_range "\$git_fn" history "\$base..\$head"$/  GATE_FL_R_RC=0; GATE_FL_R_OUT=""; GATE_FL_R_DIGEST="skipped"/' "$LIB" > "$T/mut-nohist-scan.lib.sh"; cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-nohist-scan.lib.sh"; then bad "mutation 8t did not change the lib (sed pattern drifted)"; else
+  FL_LIB_OVERRIDE="$T/mut-nohist-scan.lib.sh" decide "$S_H1" ""
+  [ "$D_LANE" = "fast" ] && ok "without the history pass, a CPF added in one commit and removed in the next WOULD be granted fast — the pass is what holds it" || bad "mutant without the history scan still read $D_LANE ($D_CODE) — §4h (a) is not load-bearing"
+fi
+# 8u. a lib that never asks about the commits' FILES lets production code through when a later commit removes it
+sed 's/^  gate_fastlane_history "\$git_fn" "\$base_sha" "\$head_sha"$/  GATE_FL_HIST_STATE=ok; GATE_FL_HIST_N=1; GATE_FL_HIST_WHY=x; GATE_FL_HIST_BLOCKERS=""/' "$LIB" > "$T/mut-nohist-class.lib.sh"; cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-nohist-class.lib.sh"; then bad "mutation 8u did not change the lib (sed pattern drifted)"; else
+  FL_LIB_OVERRIDE="$T/mut-nohist-class.lib.sh" decide "$S_H2" ""
+  [ "$D_LANE" = "fast" ] && ok "without the history classification, a .py added and removed again WOULD be granted fast — the check is what holds it" || bad "mutant without the history classification still read $D_LANE ($D_CODE) — §4h (b) is not load-bearing"
+fi
+# 8v. a lib without the NET pass misses a number whose halves two different commits added side by side
+sed 's/^  _gate_fastlane_scan_range "\$git_fn" net "\$base...\$head"$/  GATE_FL_R_RC=0; GATE_FL_R_OUT=""; GATE_FL_R_DIGEST="skipped"/' "$LIB" > "$T/mut-nonet-scan.lib.sh"; cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-nonet-scan.lib.sh"; then bad "mutation 8v did not change the lib (sed pattern drifted)"; else
+  FL_LIB_OVERRIDE="$T/mut-nonet-scan.lib.sh" decide "$S_H4" ""
+  [ "$D_LANE" = "fast" ] && ok "without the net pass, a phone split over two commits' adjacent lines WOULD be granted fast — the net pass is not redundant with the history pass" || bad "mutant without the net scan still read $D_LANE ($D_CODE) — §4h (d) is not load-bearing"
+fi
+# 8w. a scanner that does not read commit MESSAGES lets a phone in a message through
+mkdir -p "$T/mut-nomsg"; cp "$LIB" "$T/mut-nomsg/gate-fastlane.lib.sh"
+sed -e 's/for label in scan_text(text, numbers=False):/for label in []:/' -e 's/msg_run.append((msg_no, text))/pass/' "$SCAN" > "$T/mut-nomsg/gate-fastlane-scan.py"
+if cmp -s "$SCAN" "$T/mut-nomsg/gate-fastlane-scan.py" || ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$T/mut-nomsg/gate-fastlane-scan.py" 2>/dev/null; then bad "mutation 8w did not produce a valid, different scanner (sed pattern drifted)"; else
+  FL_LIB_OVERRIDE="$T/mut-nomsg/gate-fastlane.lib.sh" decide "$S_H3" ""
+  [ "$D_LANE" = "fast" ] && ok "a scanner that skips commit messages WOULD let a phone number in a message be granted fast — reading the messages is what holds it" || bad "mutant scanner that skips messages still read $D_LANE ($D_CODE) — §4h (c) is not load-bearing"
+fi
+# 8x. a scanner that reads git's escape text as the name reads `ção` + `ões` as twelve digits
+sed 's/scan_text(_plain_name(text))/scan_text(text)/' "$SCAN" > "$T/mut-noplain.py"
+if cmp -s "$SCAN" "$T/mut-noplain.py" || ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$T/mut-noplain.py" 2>/dev/null; then bad "mutation 8x did not produce a valid, different scanner (sed pattern drifted)"; else
+  real=0; printf "$QN" | python3 "$SCAN" >/dev/null 2>&1 || real=$?
+  mut=0;  printf "$QN" | python3 "$T/mut-noplain.py" >/dev/null 2>&1 || mut=$?
+  if [ "$real" = "0" ] && [ "$mut" = "1" ]; then ok "a scanner that reads the escape text as the name flags 'migração' as a long number (rc=1) — decoding the escapes is what clears it (rc=0)"; else bad "mutant 8x: real rc=$real, mutant rc=$mut — the quoted-name assertion is not load-bearing"; fi
+fi
+# 8o-8q. the SCANNER's single rule is load-bearing (gate round 4): a scanner that backs off any one of its three decisions must read the reviewer's formats as clean
+mut_scan() { # name sed-expr diff-printf-format want-mutant-rc — runs the real rule's diff through a scanner mutated by the sed expression
+  local f="$T/mut-scan-$1.py" real mut
+  sed "$2" "$SCAN" > "$f"
+  if cmp -s "$SCAN" "$f" || ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$f" 2>/dev/null; then bad "mutation $1 did not produce a valid, different scanner (sed pattern drifted)"; return; fi
+  real=0; printf "$3" | python3 "$SCAN" >/dev/null 2>&1 || real=$?
+  mut=0;  printf "$3" | python3 "$f"    >/dev/null 2>&1 || mut=$?
+  if [ "$real" = "1" ] && [ "$mut" = "0" ]; then ok "mutant '$1': the real scanner flags the case (rc=1) and the mutant reads it clean (rc=0) — the decision is what holds it"
+  else bad "mutant '$1': real rc=$real, mutant rc=$mut — the assertion is not load-bearing"; fi
+}
+# 8o. a threshold one digit too high (9+): the 8-digit landline '3333-4444' goes through
+mut_scan threshold 's/{7,}")/{8,}")/' "${H1}@@ -0,0 +1 @@\n+fixo 3333-4444\n"
+# 8p. the separator class back to a LIST (space . - / ( ) +): markdown emphasis between groups that are each under 8 digits goes through
+mut_scan separators 's/\[\\W_\]\*/[\\s.()\/+-]*/' "${H1}@@ -0,0 +1 @@\n+fone (**31**) **9999**-**8888**\n"
+# 8q. no adjacent-line join (each added line replaces the run): a phone wrapped across two lines goes through
+mut_scan crossline 's/run.append((lineno, line\[1:\]))/run = [(lineno, line[1:])]/' "${H1}@@ -0,0 +1,2 @@\n+ligar (31) 99999-\n+8888 amanha\n"
 echo
 echo "== gate-fastlane.selftest: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

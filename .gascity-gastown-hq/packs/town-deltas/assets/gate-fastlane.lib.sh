@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
 # gate-fastlane.lib.sh — ga-atsahv: the quality gate's DOC/TEST fast lane (no LLM reviewer).
-# SLICE NOTE (ga-atsahv.2 of 3 — removed by ga-atsahv.3): the gate's 800-line production cap (E11) made this lane arrive in three slices. Slices 1
-# and 2 together hold everything through the push-time confirmation (classification, scan, tests, history check, decision, confirm); the dispatcher
-# wiring, gate_fastlane_record and the weekly tally arrive with ga-atsahv.3. Nothing sources this file before .3, so merging this slice changes no
-# behaviour. The text below describes the finished lane.
-#
 #
 # WHY. Athos, 2026-09-30, verbatim: "O gate só é necessário quando a gente vai colocar código novo em
 # produção." Measured by the Mayor over 584 rounds since 16/09: ~96% of diffs touch production code, 2.6% are
@@ -892,6 +887,46 @@ gate_fastlane_confirm() {
   fi
   if [ "$GATE_FL_SCAN_RC" != "0" ]; then
     _gate_fastlane_revoke "no-longer-fast" "the content scan of the commit that would land is not clean (rc=${GATE_FL_SCAN_RC})"; return 1
+  fi
+  return 0
+}
+
+# ── recording (marker + jsonl) ──────────────────────────────────────────────────────────────────────────────
+
+# gate_fastlane_record <city> <marker_id> <bead> <branch> <rig> <would_have_reviewers> <qg_log>
+# Writes the lane and the files that decided it on the MARKER (metadata gate.lane / gate.lane_reason /
+# gate.lane_files) and appends a `gate_lane` event (with reason_code, and dry_run so the tally can leave a DRY_RUN=1
+# sweep out of its counts) to the jsonl the weekly tally reads. Observability only: a
+# failed write is logged and never changes the lane. The marker write is READ BACK, because "the command ran" is
+# not "the field is there".
+gate_fastlane_record() {
+  local city="$1" marker="$2" bead="$3" branch="$4" rig="$5" would="$6" qg_log="$7" back=""
+  # a reviewer count that is not a number is UNKNOWN, and is written as JSON null: the tally credits a passed fast run whose
+  # decision carries no integer with an assumed 1 and says so in its report (saved_unmatched_assumed_1). Written as 0 it would
+  # read as "this run saved no reviewer" — a measured zero where nothing was measured.
+  case "$would" in ''|*[!0-9]*) would=null ;; esac
+  if [ -n "$marker" ]; then
+    bd -C "$city" update "$marker" --set-metadata "gate.lane=${GATE_LANE}" -q >/dev/null 2>&1 || true
+    bd -C "$city" update "$marker" --set-metadata "gate.lane_reason=$(printf '%s' "$GATE_LANE_REASON" | cut -c1-300)" -q >/dev/null 2>&1 || true
+    bd -C "$city" update "$marker" --set-metadata "gate.lane_files=$(gate_fastlane_files_oneline)" -q >/dev/null 2>&1 || true
+    back=$(bd -C "$city" show "$marker" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .metadata["gate.lane"] // ""' 2>/dev/null) || back=""
+    if [ "$back" != "$GATE_LANE" ]; then
+      echo "[gate-fastlane] WARN: lane '${GATE_LANE}' NOT confirmed on marker $marker after write (read back: '${back:-unreadable}') — the jsonl event below is still written" >&2
+    fi
+  fi
+  if [ -n "$qg_log" ]; then
+    mkdir -p "$(dirname "$qg_log")" 2>/dev/null || true
+    jq -c -n \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg branch "$branch" --arg bead "$bead" --arg rig "${rig:-unknown}" --arg marker "$marker" \
+      --arg lane "$GATE_LANE" --arg reason "$GATE_LANE_REASON" --arg code "${GATE_LANE_REASON_CODE:-}" \
+      --arg counts "$GATE_LANE_COUNTS" --arg dry_run "${DRY_RUN:-0}" \
+      --arg files "$(gate_fastlane_files_oneline)" --argjson would "$would" \
+      '{ts: $ts, event: "gate_lane", lane: $lane, branch: $branch, bead: $bead, rig: $rig, marker: $marker,
+        counts: $counts, reason: $reason, reason_code: $code, files: $files, would_have_reviewers: $would,
+        dry_run: $dry_run}' \
+      >> "$qg_log" 2>/dev/null \
+      || echo "[gate-fastlane] WARN: could not append the gate_lane event to $qg_log — the weekly tally will under-count this decision" >&2
   fi
   return 0
 }
