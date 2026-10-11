@@ -48,6 +48,10 @@
 #        told) is never "proven" — it blocks the marker and keeps its frozen entry, even if
 #        a start epoch is given for it, and the log says why. D4/D5: a missing
 #        LSTART_UNPINNED line is "no proof" (not "all pinned"); an empty present one works.
+# D7-D9  (gate attempt 2) the same missing line must also withdraw the locked-cosmetic
+#        excuse, whether or not epochs were printed (D7 both LSTART lines absent, D8 epochs
+#        without UNPINNED; D7b is the positive control). D9: a cosmetic-only advance is logged
+#        as such — "process proof" is only claimed when some daemon was proven by start time.
 
 set -u
 
@@ -442,6 +446,46 @@ ALL="com.t.a com.t.p" GUARDED="com.t.a com.t.p" COSMETIC="com.t.p" LSTART="com.t
 SEED="com.t.a @B@ stuck
 com.t.p @B@ stuck" run_block
 [ "$RIGMARKER_AFTER" = "$SHA_S" ] && ok "D6b a pinned locked-cosmetic label is still excused" || nok "D6b" "marker=[$RIGMARKER_AFTER] log=[$LOG_AFTER]"
+
+# D7 (gate attempt 2): BOTH LSTART_EPOCHS and LSTART_UNPINNED absent — a helper that predates
+# them, or one cut short between GUARDED_LOCKED_COSMETIC and the LSTART lines (lstart_epochs_line
+# forks launchctl/ps/date per questioned label, ~10 s for 53 labels). D4 only covered "epochs
+# without UNPINNED". With both absent nothing says which clone the daemon runs, so the cosmetic
+# verdict — a call-graph read against THIS checkout's window — is an excuse for code nobody
+# located. It was applied anyway: the marker moved on a label with "Proven by start time: []".
+STUB_OMIT_LSTART=1 STUB_OMIT_UNPINNED=1 ALL="com.t.z" GUARDED="com.t.z" COSMETIC="com.t.z" \
+SEED="com.t.z @B@ stuck" run_block
+[ "$RIGMARKER_AFTER" = "$SHA_B" ] && has_line "$PERDAEMON_AFTER" "com.t.z $SHA_B stuck" \
+  && ok "D7 no LSTART lines at all: a locked-cosmetic label is NOT excused (marker and entry stay)" \
+  || nok "D7 absent LSTART_UNPINNED must not excuse" "marker=[$RIGMARKER_AFTER] perdaemon=[$PERDAEMON_AFTER] log=[$LOG_AFTER]"
+echo "$LOG_AFTER" | grep -q "NOT advanced by process proof" && echo "$LOG_AFTER" | grep -q "LSTART_UNPINNED" \
+  && ok "D7 the log says the marker was not advanced and names the missing line" \
+  || nok "D7 log reason" "$LOG_AFTER"
+
+# D7b: the positive control — the same label, same cosmetic verdict, the helper's LSTART lines
+# present and empty (it asked "which clone?" and every label is pinned): the excuse works,
+# so D7 holds only because the LSTART_UNPINNED line is missing.
+ALL="com.t.z" GUARDED="com.t.z" COSMETIC="com.t.z" LSTART="" UNPINNED="" \
+SEED="com.t.z @B@ stuck" run_block
+[ "$RIGMARKER_AFTER" = "$SHA_S" ] && ok "D7b empty LSTART lines present: a pinned locked-cosmetic label is excused" || nok "D7b" "marker=[$RIGMARKER_AFTER] log=[$LOG_AFTER]"
+
+# D8: the sibling of D7 — epochs printed, LSTART_UNPINNED missing, and the other stuck label is
+# locked-cosmetic. Epochs for a (proof) do not make z's clone known: the marker stays.
+STUB_OMIT_UNPINNED=1 ALL="com.t.a com.t.z" GUARDED="com.t.a com.t.z" COSMETIC="com.t.z" LSTART="com.t.a=3500" \
+SEED="com.t.a @B@ stuck
+com.t.z @B@ stuck" run_block
+[ "$RIGMARKER_AFTER" = "$SHA_B" ] && has_line "$PERDAEMON_AFTER" "com.t.z $SHA_B stuck" \
+  && ok "D8 epochs without LSTART_UNPINNED: the cosmetic neighbour is not excused either" \
+  || nok "D8 epochs-without-UNPINNED + cosmetic" "marker=[$RIGMARKER_AFTER] perdaemon=[$PERDAEMON_AFTER] log=[$LOG_AFTER]"
+
+# D9: the log must say what actually moved the marker. A cosmetic-only advance (nothing proven
+# by start time) used to be logged as "advanced by process proof ... Proven by start time: []".
+ALL="com.t.z" GUARDED="com.t.z" COSMETIC="com.t.z" LSTART="" UNPINNED="" \
+SEED="com.t.z @B@ stuck" run_block
+echo "$LOG_AFTER" | grep -q "advanced .* by locked-cosmetic evidence alone" \
+  && ! echo "$LOG_AFTER" | grep -q "advanced .* by process proof" \
+  && ok "D9 a cosmetic-only advance is logged as such, not as process proof" \
+  || nok "D9 log must name the real reason" "$LOG_AFTER"
 
 echo ""
 echo "story-delivery daemon-refresh lstart-advance (ga-8hfols) tests: $PASS passed, $FAIL failed"

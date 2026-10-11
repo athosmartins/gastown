@@ -813,9 +813,12 @@
 #     the checkout, a `-m` launch outside it, a wrapper whose base directory is not one
 #     literal path, a plist that is missing or cannot be read. They get no epoch.
 #     A consumer that sees LSTART_EPOCHS without this line must take NO process proof:
-#     a missing line is "não sei which clone", not "all pinned". Not modelled: a wrapper
-#     that `source`s a file reassigning its base variable, an editable install in the
-#     interpreter's venv, a third clone nobody listed in EXTRA_RUNTIME_ROOTS.)
+#     a missing line is "não sei which clone", not "all pinned" — and that holds for the
+#     consumer's locked-cosmetic excuse too, with or without LSTART_EPOCHS beside it.
+#     Not modelled (classified pinned): a wrapper that `source`s a file reassigning its
+#     base variable, or that `cd`s / exports PYTHONPATH into another clone from inside
+#     the script, an inline `bash -c` launch, an editable install in the interpreter's
+#     venv, a third clone nobody listed in EXTRA_RUNTIME_ROOTS.)
 #   RIG_DETECTOR_USED=0|1   AFFECTED_RIG_DETECTOR=<labels>
 #     GUARDED_RIG_DETECTOR=<labels>   (ga-abofl6, header point 20: always
 #     present. RIG_DETECTOR_USED is rig-level — 1 only when $RUNTIME_DIR/
@@ -1119,7 +1122,7 @@ daemon_pid() {  # daemon_pid <label>
 # epoch E" for such a daemon; for one that runs another clone (EXTRA_RUNTIME_ROOTS —
 # painel-prod, hand-synced minutes behind) the same number proves nothing about that
 # code, and a launch whose clone cannot be told is "não sei", never "the runtime
-# checkout". Everything below fails toward unpinned:
+# checkout". What follows fails toward unpinned (the cases it does NOT catch are listed after it):
 #   - the plist is missing/unparseable, or ties nothing to the checkout at all;
 #   - an entrypoint, the interpreter, the WorkingDirectory or a PYTHONPATH entry
 #     lives in an EXTRA_RUNTIME_ROOT, or an entrypoint under the checkout is a
@@ -1130,9 +1133,17 @@ daemon_pid() {  # daemon_pid <label>
 #     assigned EXACTLY ONCE, to a literal absolute path (other $VARs and $HOME may
 #     appear inside it): unassigned, computed ($(...), dirname), ${X:-default}
 #     (overridable), assigned twice, or touched by eval/read/for/printf -v.
-# Not modelled (documented limit): a wrapper that `source`s a file which reassigns
-# the variable, an editable install in the interpreter's venv, a third clone nobody
-# listed in EXTRA_RUNTIME_ROOTS. One python3 call for all labels (no per-label fork).
+# Not modelled (documented limit) — each of these is classified PINNED although the
+# daemon may run other code: a wrapper that `source`s a file which reassigns the
+# variable, a wrapper under the checkout that `cd`s into another clone and runs a
+# relative .py or exports PYTHONPATH to another clone from inside the script, an
+# inline `bash -c` launch whose WorkingDirectory is the checkout (the script body is
+# not read), an editable install in the interpreter's venv, a third clone nobody
+# listed in EXTRA_RUNTIME_ROOTS. Measured on the 284 real WA/urblink/gastown plists
+# (gate review 2, 11/10): 0 instances; painel-visibilidade is correctly unpinned.
+# The consumer also assumes the checkout only moves FORWARD: a reset or checkout to
+# an older commit after a daemon started would leave lazily imported code older than
+# the HEAD the reflog names. One python3 call for all labels (no per-label fork).
 lstart_pin_classify() {  # lstart_pin_classify <label>...
   python3 - "${RUNTIME_DIR:-}" "${EXTRA_RUNTIME_ROOTS:-}" "$LAUNCH_AGENTS_DIR" "$@" <<'PY' 2>/dev/null
 import sys, os, re, plistlib, pwd

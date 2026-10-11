@@ -2982,10 +2982,13 @@ else
     # inside the window where HEAD already moved while its clone has not, and would be
     # "proven" fresher than the code it imports. The helper says which labels it cannot
     # pin (LSTART_UNPINNED); those are never proven, whatever epoch sits next to them,
-    # and a helper that printed epochs without that line never asked the question.
-    if [ -n "${REFRESH_LSTART// /}" ] && [ -z "$REFRESH_LSTART_UNPINNED_LINE" ]; then
-      PD_PROOF_WHY="the helper printed LSTART_EPOCHS without LSTART_UNPINNED, so it cannot be told which checkout each daemon runs"
-      log "Daemon refresh: no process proof taken for $RIG (ga-8hfols): $PD_PROOF_WHY."
+    # and a helper that never printed that line never answered the question — for
+    # EVERY label, with or without epochs beside it (an older helper, or one cut short
+    # between GUARDED_LOCKED_COSMETIC and the LSTART lines). The rig-wide block below
+    # tests the same missing line itself and withdraws the locked-cosmetic excuse too.
+    if [ -z "$REFRESH_LSTART_UNPINNED_LINE" ]; then
+      PD_PROOF_WHY="the helper printed no LSTART_UNPINNED line (an older helper, or one cut short before it), so it cannot be told which checkout each daemon runs"
+      [ -z "${REFRESH_LSTART// /}" ] || log "Daemon refresh: no process proof taken for $RIG (ga-8hfols): $PD_PROOF_WHY."
     elif [ -n "${REFRESH_LSTART// /}" ] && type runtime_head_at_epoch >/dev/null 2>&1; then
       PD_HEAD_MEMO=" "
       for pd_pair in $REFRESH_LSTART; do
@@ -3109,10 +3112,14 @@ else
           elif git -C "$RUNTIME_DIR" merge-base --is-ancestor "$rp_oldest" "$rp_h" >/dev/null 2>&1; then :
           else rp_bad_order=1
           fi
-        elif case " $REFRESH_LSTART_UNPINNED " in *" $rp_label "*) true ;; *) false ;; esac; then
+        elif [ -z "$REFRESH_LSTART_UNPINNED_LINE" ] \
+             || case " $REFRESH_LSTART_UNPINNED " in *" $rp_label "*) true ;; *) false ;; esac; then
           # asked BEFORE the cosmetic excuse: that verdict is a call-graph read against this
           # checkout's window, and for a label whose clone is not known to BE this checkout it
           # says nothing about the code the daemon imports. Unknown which clone: not excused.
+          # A helper that printed NO LSTART_UNPINNED line never said which clone any label
+          # runs — absent is "unknown for all", never the same as the empty line that says
+          # "every label is pinned" (the empty list is what makes the cosmetic excuse safe).
           rp_unpinned="${rp_unpinned}${rp_label} "
         elif [ -n "$REFRESH_LOCKED_COSMETIC_LINE" ] && case " $REFRESH_LOCKED_COSMETIC " in *" $rp_label "*) true ;; *) false ;; esac; then
           rp_excused="${rp_excused}${rp_label} "
@@ -3122,9 +3129,13 @@ else
       done
       if [ -n "$rp_unpinned" ] || [ -n "$rp_blockers" ]; then
         RIG_PROOF_WHY=""
-        [ -z "$rp_unpinned" ] || RIG_PROOF_WHY="[${rp_unpinned% }] run code outside the $RIG runtime checkout ($RUNTIME_DIR) or the helper could not tell which clone they run, so a start time read against that checkout's reflog proves nothing about them (they stay blockers; not locked-cosmetic either)"
+        if [ -z "$rp_unpinned" ]; then :
+        elif [ -z "$REFRESH_LSTART_UNPINNED_LINE" ]; then
+          RIG_PROOF_WHY="the helper printed no LSTART_UNPINNED line (an older helper, or one cut short before it), so nothing says which checkout [${rp_unpinned% }] run — neither a start time read against the $RIG reflog ($RUNTIME_DIR) nor the locked-cosmetic call-graph verdict can be applied to them (they stay blockers)"
+        else
+          RIG_PROOF_WHY="[${rp_unpinned% }] run code outside the $RIG runtime checkout ($RUNTIME_DIR) or the helper could not tell which clone they run, so a start time read against that checkout's reflog proves nothing about them (they stay blockers; not locked-cosmetic either)"
+        fi
         [ -z "$rp_blockers" ] || RIG_PROOF_WHY="${RIG_PROOF_WHY:+$RIG_PROOF_WHY; }[${rp_blockers% }] neither proven by process start time nor locked-cosmetic this cycle (unknown counts as not fresh)"
-        [ -z "$PD_PROOF_WHY" ] || RIG_PROOF_WHY="$RIG_PROOF_WHY; $PD_PROOF_WHY"
       elif [ "$rp_bad_order" = "1" ]; then
         RIG_PROOF_WHY="the proofs do not lie on one line of history"
       else
@@ -3135,7 +3146,14 @@ else
              || ! git -C "$RUNTIME_DIR" merge-base --is-ancestor "$DAEMON_REFRESH_PRE_SHA" "$rp_target" >/dev/null 2>&1; then
           RIG_PROOF_WHY="the oldest proof (${rp_target:0:9}, held by [${rp_oldest_by% }]) is not past the current marker (${DAEMON_REFRESH_PRE_SHA:0:9})"
         elif printf '%s\n' "$rp_target" > "$DAEMON_REFRESH_BASELINE_FILE" 2>/dev/null; then
-          log "Daemon refresh: rig-wide baseline marker for $RIG advanced ${DAEMON_REFRESH_PRE_SHA:0:9} -> ${rp_target:0:9} by process proof (ga-8hfols). Proven by start time against the checkout reflog: [${rp_proven% }]; locked-cosmetic, not blocking: [${rp_excused% }]. Every other daemon was clean this cycle."
+          # say what actually moved it: "process proof" only when some daemon WAS proven by
+          # start time — a marker that moved on the locked-cosmetic excuse alone is evidence
+          # (a call-graph read), not proof, and the line must not claim more than that.
+          if [ -n "${rp_proven// /}" ]; then
+            log "Daemon refresh: rig-wide baseline marker for $RIG advanced ${DAEMON_REFRESH_PRE_SHA:0:9} -> ${rp_target:0:9} by process proof (ga-8hfols). Proven by start time against the checkout reflog: [${rp_proven% }]; locked-cosmetic, not blocking: [${rp_excused% }]. Every other daemon was clean this cycle."
+          else
+            log "Daemon refresh: rig-wide baseline marker for $RIG advanced ${DAEMON_REFRESH_PRE_SHA:0:9} -> ${rp_target:0:9} by locked-cosmetic evidence alone (ga-8hfols) — no daemon was proven by start time. Locked and with no call-graph path to a symbol this window changed (evidence, not proof): [${rp_excused% }]. Every other daemon was clean this cycle."
+          fi
         else
           warn "could not persist daemon-refresh baseline for rig $RIG at $DAEMON_REFRESH_BASELINE_FILE (non-fatal; next sweep falls back to its own pre-pull HEAD)"
         fi
