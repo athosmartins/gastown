@@ -798,6 +798,11 @@ runner_case bash    tests/x.selftest.sh tests/run.test.sh tests/test_a.sh tests/
 runner_case pytest  tests/test_a.py tests/a_test.py tests/x.selftest.py
 runner_case none    tests/fixtures/data.json tests/fixtures/a.YML tests/golden/out.txt tests/x.snap tests/img/a.png tests/f.csv
 runner_case unknown web/app.test.ts tests/test_widget.lua tests/helpers/setup.sh tests/conftest.py tests/run.pl tests/fixtures/NOEXT tests/Makefile tests/foo.test.R tests/e2e.spec.zsh
+# the DIRECTORY half of `none` (security review of the pushed slice 3): a config named like a test that lives outside tests/ is TEST by its basename,
+# is loaded by whatever scans its directory, and nothing runs it — `none` there was "no reviewer, no test, loaded in production"
+runner_case unknown .github/workflows/test_deploy.yml orders/test_cleanup.toml packs/x/foo.spec.json scripts/cleanup.test.yaml docs/sample.test.json
+S_CFG=$(mkbr s-g6-cfg 'orders/test_cleanup.toml=[order]\n');                    sd_case "an order named test_* outside tests/ is not an inert fixture: it goes to the gate, unrun" "$S_CFG" '' normal test-unrunnable "cannot run"
+S_WFL=$(mkbr s-g6-wf '.github/workflows/test_deploy.yml=on: push\n');           sd_case "a CI workflow named test_* goes to the gate, unrun" "$S_WFL" '' normal test-unrunnable "cannot run"
 S_LUA=$(mkbr s-g6-lua 'tests/test_widget.lua=print(1)\n');           sd_case "a changed test in a language nobody listed (lua) is not 'none': it goes to the gate, unrun" "$S_LUA" '' normal test-unrunnable "cannot run"
 S_HLP=$(mkbr s-g6-helper 'tests/helpers/setup.sh=echo hi\n');       sd_case "a helper script under tests/ is not an inert fixture" "$S_HLP" '' normal test-unrunnable "cannot run"
 # classify asks (for the history's files and for the tip's) and run_tests asks again, for the same file: an answer that vanishes in run_tests must not be a pass (pins run_tests' own default arm).

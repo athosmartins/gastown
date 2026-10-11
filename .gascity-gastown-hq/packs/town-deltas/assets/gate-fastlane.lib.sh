@@ -156,8 +156,14 @@ gate_fastlane_test_runner() {
     *.selftest.sh|*.test.sh|test_*.sh|*_test.sh) echo bash; return 0 ;;
     test_*.py|*_test.py|*.selftest.py) echo pytest; return 0 ;;
   esac
+  # `none` also needs the DIRECTORY: a data file is an inert fixture only inside tests/ test/ __tests__/. A config named like a test
+  # but living elsewhere (.github/workflows/test_deploy.yml, orders/test_cleanup.toml, packs/x/foo.spec.json) is TEST by its basename
+  # and is loaded by whatever scans that directory — it is not inert, and nothing runs it, so it is `unknown` (the normal gate).
   case "$ext" in
-    json|yaml|yml|toml|txt|md|csv|tsv|xml|html|ini|cfg|snap|golden|expected|diff|patch|sql|svg|png|jpg|jpeg|gif) echo none; return 0 ;;
+    json|yaml|yml|toml|txt|md|csv|tsv|xml|html|ini|cfg|snap|golden|expected|diff|patch|sql|svg|png|jpg|jpeg|gif)
+      case "/$lc" in
+        */tests/*|*/test/*|*/__tests__/*) echo none; return 0 ;;
+      esac ;;
   esac
   echo unknown
   return 0
