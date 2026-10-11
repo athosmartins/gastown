@@ -6,7 +6,7 @@ packs/town-deltas/assets/scripts/work-order.sh. This module does NOT re-implemen
 that library in a subprocess, so the shell consumers and the Python consumers cannot drift apart.
 Read the header of work-order.sh for the key, the three age rules and the three-state contract.
 
-Run it isolated: `python3 -I scripts/work_order.py sort [--age created|field|reclaim] < beads.json`
+Run it isolated: `python3 -I scripts/work_order.py sort [--age created|field|reclaim] [--overdue-after SECONDS [--now EPOCH]] < beads.json`
 
   sort   stdin: ONE JSON array of bead objects (`bd list/ready --json`). stdout: the ordered array,
          exit 0. The library's `work-order WARN:` lines go to stderr unchanged.
@@ -18,6 +18,10 @@ Run it isolated: `python3 -I scripts/work_order.py sort [--age created|field|rec
          override active, that ERROR line carries the same notice (whatever the way it failed).
          Callers MUST treat empty as "I do not know" and keep their previous order with a visible
          WARN — it never means "no bead".
+         `--overdue-after SECONDS` (ga-i0uiv0, the gate's wait ceiling; needs `--age field`) puts every
+         P1..P4 bead that has waited MORE than SECONDS right after the P0s, oldest first among them; read
+         "OVERDUE" in the header of work-order.sh. `--now EPOCH` pins the clock (tests). Not given = the
+         rule is exactly what it always was.
 
   lint   `lint [--root DIR] [--registry FILE]` — the registry lint. Every line, in a file matched by
          SCOPE_GLOBS, that has a SEEN shape of "order or window beads by an idiom of your own" (the
@@ -32,7 +36,7 @@ Run it isolated: `python3 -I scripts/work_order.py sort [--age created|field|rec
          the summary counts it (empty_globs=N) and a `LINT NOTE:` line names it. It does not fail the run
          (the real-tree selftest asserts it is 0), but it is never quiet.
 
-As a module: `sort_beads(beads, age="created")` returns `(ordered_list, warnings)`, or
+As a module: `sort_beads(beads, age="created", overdue_after=None, now=None)` returns `(ordered_list, warnings)`, or
 `(None, [reason])` when it cannot tell — the caller then keeps its previous order and logs a WARN.
 `[]` returns `([], [])`: test `is None`, never falsiness. Never `--limit=N` before sorting.
 """
@@ -76,15 +80,32 @@ def _override_notice():
             % (lib, os.path.normpath(_DEFAULT_LIB)))
 
 
-def _run_lib(raw, age):
+def _opt_seconds(name, value):
+    """A seconds/epoch option as the digits the library takes. None stays None (not given).
+
+    An int that is not a bool and is >= 0. Anything else (a str "6h", a float, a negative, True) is a typo, and
+    a typo is "cannot tell", never "off": the wait ceiling quietly off is the starvation it exists to end."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise WorkOrderUnknown("%s wants a whole number of seconds >= 0, got %r" % (name, value))
+    return str(value)
+
+
+def _run_lib(raw, age, overdue_after=None, now=None):
     if age not in AGES:
         raise WorkOrderUnknown("unknown age rule %r (want one of %s)" % (age, ", ".join(AGES)))
+    extra = []
+    for flag, name, value in (("--overdue-after", "overdue_after", overdue_after), ("--now", "now", now)):
+        digits = _opt_seconds(name, value)
+        if digits is not None:
+            extra += [flag, digits]
     lib = lib_path()
     if not os.path.isfile(lib):
         raise WorkOrderUnknown("library not found: %s" % lib)
     try:
         proc = subprocess.run(
-            ["bash", "-c", '. "$1" && shift && work_order_sort "$@"', "work-order", lib, "--age", age],
+            ["bash", "-c", '. "$1" && shift && work_order_sort "$@"', "work-order", lib, "--age", age] + extra,
             input=raw, capture_output=True, timeout=_TIMEOUT_SEC, check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -92,12 +113,12 @@ def _run_lib(raw, age):
     return proc
 
 
-def sort_beads_raw(raw, age="created"):
+def sort_beads_raw(raw, age="created", overdue_after=None, now=None):
     """bytes in (one JSON array) -> (ordered array as parsed JSON, stderr text with the WARN lines)."""
     notice = _override_notice()
     tail = "; " + notice if notice else ""      # every "cannot tell" below carries it: a stale override is the likely cause
     try:
-        proc = _run_lib(raw, age)
+        proc = _run_lib(raw, age, overdue_after, now)
     except WorkOrderUnknown as exc:
         raise WorkOrderUnknown(str(exc) + tail)
     err = proc.stderr.decode("utf-8", "replace")
@@ -115,13 +136,16 @@ def sort_beads_raw(raw, age="created"):
     return out, err
 
 
-def sort_beads(beads, age="created"):
+def sort_beads(beads, age="created", overdue_after=None, now=None):
     """list of bead dicts -> (ordered list, warnings); or (None, [reason]) when the library cannot tell.
+
+    `overdue_after` (seconds, with age="field") is the gate's wait ceiling, ga-i0uiv0: see "OVERDUE" in work-order.sh.
+    `now` (epoch seconds) pins the clock for tests; None = the real one.
 
     None is "I do not know": the caller keeps its previous order and logs the reason as a visible WARN.
     It never means "no bead", and `[]` is a real answer — test `is None`, never falsiness."""
     try:
-        out, err = sort_beads_raw(json.dumps(beads).encode("utf-8"), age)
+        out, err = sort_beads_raw(json.dumps(beads).encode("utf-8"), age, overdue_after, now)
     except (WorkOrderUnknown, TypeError, ValueError) as exc:
         return None, ["work-order ERROR: sort_beads: cannot tell (%s)" % exc]
     return out, [ln for ln in err.splitlines() if ln.strip()]
@@ -328,21 +352,30 @@ def main(argv):
     if args and args[0] == "lint":
         return _main_lint(args[1:])
     if not args or args[0] != "sort":
-        sys.stderr.write("usage: work_order.py sort [--age created|field|reclaim] < beads.json\n"
+        sys.stderr.write("usage: work_order.py sort [--age created|field|reclaim] [--overdue-after SECONDS [--now EPOCH]] < beads.json\n"
                          "       work_order.py lint [--root DIR] [--registry FILE]\n")
         return 2
     age = "created"
+    overdue_after = now = None
     rest = args[1:]
     while rest:
         if rest[0] == "--age" and len(rest) >= 2:
             age, rest = rest[1], rest[2:]
         elif rest[0].startswith("--age="):
             age, rest = rest[0][len("--age="):], rest[1:]
+        elif rest[0] in ("--overdue-after", "--now") and len(rest) >= 2:
+            # Plain ASCII digits become the int the module wants; anything else stays text and is refused as "cannot tell".
+            val = int(rest[1]) if re.fullmatch(r"[0-9]{1,12}", rest[1]) else rest[1]
+            if rest[0] == "--overdue-after":
+                overdue_after = val
+            else:
+                now = val
+            rest = rest[2:]
         else:
             sys.stderr.write("work-order ERROR: work_order.py: unknown argument %r; cannot tell\n" % rest[0])
             return 2
     try:
-        out, err = sort_beads_raw(sys.stdin.buffer.read(), age)
+        out, err = sort_beads_raw(sys.stdin.buffer.read(), age, overdue_after, now)
     except WorkOrderUnknown as exc:
         sys.stderr.write("work-order ERROR: work_order.py: cannot tell (%s)\n" % exc)
         return 2

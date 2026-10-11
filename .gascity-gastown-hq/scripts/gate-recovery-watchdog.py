@@ -1602,7 +1602,7 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
             "nunca tentou despachá-lo. (O watchdog já provou que o dispatcher NUNCA VIU este marker: ele está AUSENTE da "
             "ordem publicada em .gc/runtime/gate-queue-order.json — nem em `order` nem em `set_aside` — nas últimas "
             "varreduras, e o watchdog o viu gate-status:queued em TODA leitura desde antes delas (não foi re-enfileirado nesse intervalo); veja a linha 'orphan' no diagnóstico. "
-            "Ficar ATRÁS de markers mais novos NÃO é isso: a ordem é prioridade > feature > idade, e um marker que "
+            "Ficar ATRÁS de markers mais novos NÃO é isso: a ordem é prioridade > feature > idade (e P1-P4 com mais de 6 h de espera passam à frente dos P1-P4 que não esperaram tanto), e um marker que "
             "aparece na ordem só está esperando a vez.)\n"
             "3. Confirme que o dispatcher está DRENANDO outros branches (há 'sweep complete' recente p/ branches "
             "DIFERENTES) — senão NÃO é órfão, é o run atual travado (outro modo de falha; não mexa).\n\n"

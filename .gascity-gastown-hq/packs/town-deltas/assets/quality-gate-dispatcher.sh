@@ -13978,10 +13978,19 @@ fi
 #      ga-r5dsgp). Oldest first. See the comment above for why it survives.
 #   2. every other healthy marker whose source bead was READ, by
 #      [priority 0-4, class, marker age oldest-first, id] with class
-#      dano-ao-vivo (0) < feature (1) < the rest (2). dano-ao-vivo is the ONE exception
+#      dano-ao-vivo (0) < feature (1) < the rest (2). dano-ao-vivo is the FIRST of two exceptions
 #      to "priority > feature > age" (ga-emgkvn, Athos 2026-10-06): a P0 bug whose
 #      source bead carries impacto:dano-ao-vivo. It exists inside P0 only, so P1 and
 #      below keep the plain feature-first order.
+#      ga-i0uiv0 (Athos 2026-10-11, "teto de espera de 6 h"): the SECOND exception.
+#      A P1-P4 marker that has waited in the gate for MORE than GATE_OVERDUE_AFTER_SECONDS
+#      (21600 = 6 h; age = the marker's created_at, the same clock as "marker age" above)
+#      is OVERDUE: it goes after every P0 and before every P1-P4 that is not overdue,
+#      oldest first among the overdue (priority and type do not matter between them).
+#      Without it a P2 waits for ever while new P1s keep arriving (13 h / 12 h / 7 h
+#      measured on 2026-10-11). P0 never waits behind an overdue marker. A marker whose age
+#      cannot be read is never overdue (created_key's "unknown" is not "old"), and neither
+#      is one whose source bead was not READ (tier 3 below: its priority is unknown).
 #   3. healthy markers whose source bead could NOT be read, oldest first — after
 #      every readable class (never P0, never dropped), before rebase-fail.
 #   4. rebase-fail markers (all authors), the back of the queue (ga-q3ig2).
@@ -13993,6 +14002,15 @@ GATE_MARKER_NOW_EPOCH="${GATE_MARKER_NOW_OVERRIDE_EPOCH:-$(date -u +%s)}"
 # read — under this script's `set -euo pipefail`, that aborts the entire dispatcher
 # sweep, not just this marker. Same guard convention here.
 case "$GATE_MARKER_NOW_EPOCH" in ''|*[!0-9]*) GATE_MARKER_NOW_EPOCH=$(date -u +%s) ;; esac
+# ga-i0uiv0: the wait ceiling (seconds). 6 h by decision of the Athos (2026-10-11); the panel
+# applies the same number (whatsapp_automation daemons/painel_visibilidade.py, via
+# work_order.sort_beads(overdue_after=...)), so a change here is a change there. "0" turns the
+# tier OFF on purpose (it is the documented off switch, as for GATE_EXILE_OVERDUE_SECONDS); a
+# value that is not a plain number (empty, text, implausibly long) is a typo and falls back to
+# the 6 h default, never to "off" — a typo must not silently bring the starvation back.
+GATE_OVERDUE_AFTER_SECONDS="${GATE_OVERDUE_AFTER_SECONDS:-21600}"
+case "$GATE_OVERDUE_AFTER_SECONDS" in ''|*[!0-9]*|??????????*) GATE_OVERDUE_AFTER_SECONDS=21600 ;; esac
+GATE_OVERDUE_AFTER_SECONDS=$((10#$GATE_OVERDUE_AFTER_SECONDS))
 # ga-0ye7ar (wa-ycyf8): EXILE-AGE ceiling, keyed on the EXILE's own clock
 # (gate:exiled-since, stamped by gate_exile_watchdog_sweep) rather than on the
 # marker's created_at. has_rebase_fail sinks an exiled marker to the back, and in a
@@ -14036,6 +14054,7 @@ if [ "$GATE_EXILE_RETRY_CEILING" -le 0 ]; then GATE_EXILE_RETRY_CEILING=3; fi
 MARKER_ORDER_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq -c \
   --argjson now "$GATE_MARKER_NOW_EPOCH" \
   --argjson exile_ceiling "$GATE_EXILE_OVERDUE_SECONDS" \
+  --argjson overdue_after "$GATE_OVERDUE_AFTER_SECONDS" \
   --argjson retry_ceiling "$GATE_EXILE_RETRY_CEILING" '
   # ga-gpcx: matches both the current name (gate:exiled-tier5:N) and the
   # legacy name (gate:rebase-attempt:N, used before 2026-07-17) so a marker
@@ -14090,9 +14109,21 @@ MARKER_ORDER_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq -c \
   # Age of the SUBMISSION to the gate, oldest-first. A null/malformed created_at is an
   # UNKNOWN age: it must sort LAST within its class, not first as epoch 0 would.
   def created_key: try (.created_at | fromdateiso8601) catch 99999999999;
+  # ga-i0uiv0: the wait ceiling. THREE states for the age, never collapsed: readable and old / readable
+  # and not old / cannot tell. Only the first is overdue; created_at that does not parse (or is not a
+  # string) is "cannot tell", which is NOT old — created_key sorts it LAST, this must not sort it first.
+  # Only a READ P1-P4 marker can be overdue: P0 already goes first, and an unread source bead has no
+  # priority to be ahead of anything (it keeps its place in tier 3, never promoted).
+  def created_epoch: try (.created_at | fromdateiso8601) catch null;
+  def is_overdue: ($overdue_after > 0) and src_ok and (src_priority >= 1)
+                  and (created_epoch != null) and (($now - created_epoch) > $overdue_after);
+  # The sort key of the readable tier. The overdue sit between P0 and P1 as "priority 0.5", with the
+  # type class flattened to 0: among the overdue it is the age alone, oldest first, then the id.
+  def readable_key: [(if is_overdue then 0.5 else src_priority end), (if is_overdue then 0 else order_class end), created_key, (.id | tostring)];
   def class_label:
     if has_rebase_fail then (if exile_overdue then "exile-overdue" else "rebase-fail" end)
-    elif src_ok then (if is_dano then "P0/dano-ao-vivo" else "P\(src_priority)/\(if is_feature then "feature" else "other" end)" end)
+    elif src_ok then (if is_dano then "P0/dano-ao-vivo"
+                      else (if is_overdue then "overdue/" else "" end) + "P\(src_priority)/\(if is_feature then "feature" else "other" end)" end)
     else "unreadable" end;
   # The label sits on the source bead of a healthy, readable marker but did not promote it (not a P0 bug).
   # A rebase-fail marker is left out: its position is about its branch, not about the label.
@@ -14100,7 +14131,7 @@ MARKER_ORDER_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq -c \
   # `as $live` rather than a leading pipe: the cooldown filter feeds every tier below.
   map(select(in_retry_cooldown | not)) as $live
   | ( [$live[] | select(has_rebase_fail and exile_overdue)]                  | sort_by([created_key, (.id | tostring)]) )
-  + ( [$live[] | select((has_rebase_fail | not) and src_ok)]                 | sort_by([src_priority, order_class, created_key, (.id | tostring)]) )
+  + ( [$live[] | select((has_rebase_fail | not) and src_ok)]                 | sort_by(readable_key) )
   + ( [$live[] | select((has_rebase_fail | not) and (src_ok | not))]         | sort_by([created_key, (.id | tostring)]) )
   + ( [$live[] | select(has_rebase_fail and (exile_overdue | not))]          | sort_by(.created_at) | reverse )
   | map(. + {gate_order_class: class_label, gate_dano_ignored: dano_ignored})')
@@ -14149,7 +14180,13 @@ fi
 # of the order, so the choice can be checked by hand against the live queue. This is
 # a separate line from "Attempting to claim marker" on purpose: gate-recovery-watchdog
 # parses that line's exact shape.
-log "Selected $MARKER_ID class=$MARKER_CLASS (order: priority > feature > age, except P0 bug + impacto:dano-ao-vivo first; ga-q8tj7p, ga-emgkvn) of $COUNT queued: $MARKER_ORDER_SUMMARY"
+# ga-i0uiv0: say which exceptions are live — with the tier OFF (=0) the line must not claim a ceiling.
+if [ "$GATE_OVERDUE_AFTER_SECONDS" -gt 0 ]; then
+  _GATE_ORDER_OVERDUE_NOTE=" and P1-P4 waiting > ${GATE_OVERDUE_AFTER_SECONDS}s right after P0"
+else
+  _GATE_ORDER_OVERDUE_NOTE=" (wait-ceiling tier OFF: GATE_OVERDUE_AFTER_SECONDS=0)"
+fi
+log "Selected $MARKER_ID class=$MARKER_CLASS (order: priority > feature > age, except P0 bug + impacto:dano-ao-vivo first${_GATE_ORDER_OVERDUE_NOTE}; ga-q8tj7p, ga-emgkvn, ga-i0uiv0) of $COUNT queued: $MARKER_ORDER_SUMMARY"
 if [ -n "${MARKER_DANO_IGNORED:-}" ]; then
   log "NOTE: label impacto:dano-ao-vivo IGNORED on queued marker(s) whose source bead is not a P0 bug (it only counts on a P0 bug, ga-emgkvn): $MARKER_DANO_IGNORED"
 fi

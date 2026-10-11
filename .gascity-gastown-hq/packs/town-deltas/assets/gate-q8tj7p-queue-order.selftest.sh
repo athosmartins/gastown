@@ -246,7 +246,7 @@ has   "$DISPATCHER" 'gate_src_class_enrich "\$MARKERS_JSON"'  "the sweep enriche
 echo "── A17. the dispatcher runs under set -euo pipefail: the block must survive it, with every knob unset and with garbage knobs ──"
 STRICT_FIX=$(arr "$(mk s1 500 P1:task)" "$(mk s2 100 P0:feature)")
 strict_select() { # <ENV=VAL>...
-  env -u GATE_MARKER_NOW_OVERRIDE_EPOCH -u GATE_EXILE_OVERDUE_SECONDS -u GATE_EXILE_RETRY_CEILING MARKERS_JSON="$STRICT_FIX" "$@" \
+  env -u GATE_MARKER_NOW_OVERRIDE_EPOCH -u GATE_EXILE_OVERDUE_SECONDS -u GATE_EXILE_RETRY_CEILING -u GATE_OVERDUE_AFTER_SECONDS MARKERS_JSON="$STRICT_FIX" "$@" \
     bash -c "set -euo pipefail; $SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null
   echo "rc=$?"
 }
@@ -255,6 +255,8 @@ eq "malformed GATE_MARKER_NOW_OVERRIDE_EPOCH"    "$(strict_select GATE_MARKER_NO
 eq "empty GATE_MARKER_NOW_OVERRIDE_EPOCH"        "$(strict_select GATE_MARKER_NOW_OVERRIDE_EPOCH= | tr '\n' ' ')" "s2 rc=0 "
 eq "malformed GATE_EXILE_OVERDUE_SECONDS"        "$(strict_select GATE_EXILE_OVERDUE_SECONDS=abc | tr '\n' ' ')" "s2 rc=0 "
 eq "malformed GATE_EXILE_RETRY_CEILING"          "$(strict_select GATE_EXILE_RETRY_CEILING=abc | tr '\n' ' ')" "s2 rc=0 "
+eq "malformed GATE_OVERDUE_AFTER_SECONDS (ga-i0uiv0)" "$(strict_select GATE_OVERDUE_AFTER_SECONDS=abc | tr '\n' ' ')" "s2 rc=0 "
+eq "empty GATE_OVERDUE_AFTER_SECONDS (ga-i0uiv0)"     "$(strict_select GATE_OVERDUE_AFTER_SECONDS= | tr '\n' ' ')" "s2 rc=0 "
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part A, ga-emgkvn — the "dano ao vivo" exception
@@ -332,6 +334,103 @@ eq "a rebase-fail marker is not reported as 'label ignored' (its class is not ab
 echo "── A26. under set -euo pipefail, with the exception in play, the block still selects and returns 0 ──"
 STRICT_FIX=$(arr "$(mk s1 500 P0:feature)" "$(mk s2 100 P0:bug+dano)" "$(mk s3 50 P1:bug+dano)" "$(mk s4 50 P0:bug+danox)")
 eq "dano bug selected, rc 0" "$(strict_select | tr '\n' ' ')" "s2 rc=0 "
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part A, ga-i0uiv0 — the wait ceiling ("teto de espera de 6 h", Athos 2026-10-11)
+# ═══════════════════════════════════════════════════════════════════════════
+# The measured case: a P2 waited 13 h while the gate took a new P1 every ~5 min. Rule: a P1-P4 marker whose
+# own wait (marker created_at -> now) is MORE than GATE_OVERDUE_AFTER_SECONDS (default 21600) goes after
+# every P0 and before every P1-P4 that is not overdue; among the overdue the age alone decides.
+# THREE states for the age, never collapsed: readable and old / readable and not old / cannot tell.
+echo "── A27. the acceptance pair: a P2 that waited 6h01 passes a fresh P1; at 5h59, and at exactly 6h, it does not ──"
+R=$(run_select "$(arr "$(mk p1_new 60 P1:feature)" "$(mk p2_old 21601 P2:task)")")
+order_is "6h01 beats a fresh P1" "$R" "p2_old,p1_new"
+eq "...and its class says why" "$(sel_class "$R")" "overdue/P2/other"
+R=$(run_select "$(arr "$(mk p1_new 60 P1:feature)" "$(mk p2_old 21599 P2:task)")")
+order_is "5h59 stays behind it" "$R" "p1_new,p2_old"
+R=$(run_select "$(arr "$(mk p1_new 60 P1:feature)" "$(mk p2_edge 21600 P2:task)")")
+order_is "exactly 6h is NOT overdue (more than, not at least)" "$R" "p1_new,p2_edge"
+eq "a marker that is not overdue keeps the class it always had" "$(sel_class "$R")" "P1/feature"
+
+echo "── A28. P0 is never moved by it, and never waits behind an overdue marker ──"
+R=$(run_select "$(arr "$(mk p2_old 99999 P2:feature)" "$(mk p0_new 10 P0:task)")")
+order_is "a new P0 beats an overdue P2" "$R" "p0_new,p2_old"
+R=$(run_select "$(arr "$(mk p1_old 99999 P1:feature)" "$(mk dano 10 P0:bug+dano)" "$(mk p0f 20 P0:feature)")")
+order_is "a new dano-ao-vivo P0 bug and a new P0 feature both beat an overdue P1" "$R" "dano,p0f,p1_old"
+R=$(run_select "$(arr "$(mk od 30000 P3:task)" "$(mk p0_old 90000 P0:task)")")
+order_is "an old P0 stays ahead of a younger overdue marker" "$R" "p0_old,od"
+
+echo "── A29. the whole ladder: P0 (dano, feature, rest), the overdue oldest first, P1, P2, P4, then the unreadable ──"
+# Fed in no useful order. od_p3t is the OLDEST overdue and the LOWEST priority of them, od_p2f the youngest and a
+# feature: only the age may decide between them. p2_edge (exactly 6h) is not overdue; pnone is 90000 s old but its
+# source was not read, so there is no priority for it to be ahead of.
+FIX=$(arr \
+  "$(mk pnone    90000 unreadable)" \
+  "$(mk p4_new   50    P4:task)" \
+  "$(mk p2_edge  21600 P2:feature)" \
+  "$(mk p1_new   100   P1:feature)" \
+  "$(mk od_p2f   21601 P2:feature)" \
+  "$(mk od_p2t   22000 P2:task)" \
+  "$(mk od_p1f   30000 P1:feature)" \
+  "$(mk od_p3t   40000 P3:task)" \
+  "$(mk p0f      10    P0:feature)" \
+  "$(mk p0t_old  90000 P0:task)" \
+  "$(mk p0d      30    P0:bug+dano)")
+R=$(run_select "$FIX")
+order_is "full order" "$R" "p0d,p0f,p0t_old,od_p3t,od_p1f,od_p2t,od_p2f,p1_new,p2_edge,p4_new,pnone"
+eq "summary (the first 8): the class of each says where it stands" "$(sel_summ "$R")" "p0d[P0/dano-ao-vivo] p0f[P0/feature] p0t_old[P0/other] od_p3t[overdue/P3/other] od_p1f[overdue/P1/feature] od_p2t[overdue/P2/other] od_p2f[overdue/P2/feature] p1_new[P1/feature] (+3 more)"
+R=$(run_select "$(arr "$(mk b 30000 P2:task)" "$(mk a 30000 P2:task)")")
+eq "two overdue of the same age: the id decides" "$(sel_order "$R")" "a,b"
+R=$(run_select "$(arr "$(mk p1_a 30000 P1:feature)" "$(mk p1_b 40000 P1:feature)" "$(mk p1_new 60 P1:feature)")")
+eq "two overdue of the same priority and type: the older first" "$(sel_order "$R")" "p1_b,p1_a,p1_new"
+
+echo "── A30. THREE STATES of the age: one that cannot be read is never overdue, and keeps its place at the end of its class ──"
+R=$(run_select "$(arr "$(mk p1_new 60 P1:feature)" "$(mk p2_bad BADTS P2:task)")")
+order_is "created_at that does not parse" "$R" "p1_new,p2_bad"
+R=$(run_select "$(arr "$(mk p2_ok 60 P2:task)" "$(mk p2_bad BADTS P2:task)" "$(mk p2_null 60 P2:task | jq -c '.created_at = null')" "$(mk p2_num 60 P2:task | jq -c '.created_at = 12345')" "$(mk p2_nokey 60 P2:task | jq -c 'del(.created_at)')")")
+eq "null, a number and a missing created_at are all 'cannot tell': at the end of P2, not at the front" "$(sel_order "$R" | cut -d, -f1)" "p2_ok"
+eq "...and none of them is overdue" "$(sel_summ "$R" | tr ' ' '\n' | grep -c 'overdue/')" "0"
+R=$(run_select "$(arr "$(mk p4_new 10 P4:task)" "$(mk u 90000 unreadable)" "$(mk n 90000 none)")")
+eq "a source that was not READ is never overdue, however old: it keeps tier 3 (after every readable class)" "$(sel_order "$R")" "p4_new,n,u"
+R=$(run_select "$(arr "$(mk p1_new 60 P1:feature)" "$(mk future -600 P2:task)")")
+order_is "a marker from the future is not overdue" "$R" "p1_new,future"
+
+echo "── A31. a source that WAS read with no valid priority is P2 (A9), so it can be overdue like any P2 — and a bug P1 with the label gets nothing extra ──"
+R=$(run_select "$(arr "$(mk p1_new 60 P1:feature)" "$(mk nul 21601 Pnull:task)" "$(mk str 21602 Pstr:task)")")
+eq "no valid priority = P2: overdue after 6h" "$(sel_order "$R")" "str,nul,p1_new"
+eq "...as P2" "$(sel_summ "$R")" "str[overdue/P2/other] nul[overdue/P2/other] p1_new[P1/feature]"
+R=$(run_select "$(arr "$(mk p0t 60 P0:task)" "$(mk p1b 21601 P1:bug+dano)" "$(mk p1f 70 P1:feature)")")
+order_is "an overdue P1 bug carrying the dano label is overdue, not P0: it still waits behind a P0" "$R" "p0t,p1b,p1f"
+eq "its label is still reported as ignored (it only counts on a P0 bug)" "$(sel_ignored "$R")" "p1b"
+
+echo "── A32. the other tiers still outrank the ceiling: cooldown excludes an overdue marker, a rebase-fail marker is still LAST, an overdue exile is still re-tried first ──"
+R=$(run_select "$(arr "$(mk od_cool 99999 P2:task "gate-status:queued,gate:retry-cooldown-until:$((NOW_EPOCH + 600))")" "$(mk next 60 P4:task)")")
+order_is "an overdue marker inside its retry cooldown is not eligible" "$R" "next"
+R=$(run_select "$(arr "$(mk od_broken 99999 P1:task 'gate-status:queued,gate:exiled-tier5:1')" "$(mk fine 10 P4:task)")")
+order_is "an overdue marker on a branch that cannot rebase is still LAST" "$R" "fine,od_broken"
+eq "its class is rebase-fail, not overdue" "$(sel_class "$(run_select "$(arr "$(mk od_broken 99999 P1:task 'gate-status:queued,gate:exiled-tier5:1')")")")" "rebase-fail"
+R=$(run_select "$(arr "$(mk exiled 9000 P4:task "$EX_OLD")" "$(mk od 99999 P2:task)")")
+order_is "the bounded exile-overdue admission is still ahead of the order, overdue markers included" "$R" "exiled,od"
+
+echo "── A33. the knob: 0 is OFF on purpose; anything that is not a plain number is a typo and falls back to 6 h, never to OFF ──"
+FIX=$(arr "$(mk p1_new 60 P1:feature)" "$(mk p2_old 21601 P2:task)" "$(mk p2_mid 21599 P2:task)")
+eq "default (unset): 6 h" "$(sel_order "$(run_select "$FIX")")" "p2_old,p1_new,p2_mid"
+eq "GATE_OVERDUE_AFTER_SECONDS=21600 is the same" "$(sel_order "$(run_select "$FIX" GATE_OVERDUE_AFTER_SECONDS=21600)")" "p2_old,p1_new,p2_mid"
+eq "=0 turns the tier OFF: the plain order (priority, then age)" "$(sel_order "$(run_select "$FIX" GATE_OVERDUE_AFTER_SECONDS=0)")" "p1_new,p2_old,p2_mid"
+eq "=00000000 is 0 too (leading zeros are one number, not octal)" "$(sel_order "$(run_select "$FIX" GATE_OVERDUE_AFTER_SECONDS=00000000)")" "p1_new,p2_old,p2_mid"
+eq "=021600 is 21600 (not octal)" "$(sel_order "$(run_select "$FIX" GATE_OVERDUE_AFTER_SECONDS=021600)")" "p2_old,p1_new,p2_mid"
+eq "a smaller ceiling moves the line (the knob is real): =21550 makes the 5h59 one overdue as well" "$(sel_order "$(run_select "$FIX" GATE_OVERDUE_AFTER_SECONDS=21550)")" "p2_old,p2_mid,p1_new"
+for bad in abc "" -5 1.5 21600s 0x10 " 21600" 99999999999; do
+  eq "typo '$bad' -> falls back to 6 h (never OFF)" "$(sel_order "$(run_select "$FIX" "GATE_OVERDUE_AFTER_SECONDS=$bad")")" "p2_old,p1_new,p2_mid"
+done
+has "$DISPATCHER" 'wait-ceiling tier OFF: GATE_OVERDUE_AFTER_SECONDS=0' "with the tier OFF the 'Selected' log line says so instead of claiming a ceiling"
+has "$DISPATCHER" 'P1-P4 waiting > \$\{GATE_OVERDUE_AFTER_SECONDS\}s right after P0' "with the tier ON the 'Selected' log line names the exception"
+
+echo "── A34. under set -euo pipefail, with the ceiling in play, the block still selects and returns 0 ──"
+STRICT_FIX=$(arr "$(mk s1 500 P0:feature)" "$(mk s2 99999 P3:task)" "$(mk s3 50 P1:feature)")
+eq "an overdue P3 behind the P0, rc 0" "$(strict_select GATE_MARKER_NOW_OVERRIDE_EPOCH=$NOW_EPOCH | tr '\n' ' ')" "s1 rc=0 "
+STRICT_FIX=$(arr "$(mk s2 99999 P3:task)" "$(mk s3 50 P1:feature)")
+eq "the overdue P3 is selected over the fresh P1, rc 0" "$(strict_select GATE_MARKER_NOW_OVERRIDE_EPOCH=$NOW_EPOCH | tr '\n' ' ')" "s2 rc=0 "
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part B — the enrichment (Step 0b-1): batched, cross-store, three-state

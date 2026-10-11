@@ -15,10 +15,12 @@
 # lint (work-order.registry.tsv, checked by work-order.selftest.sh) exists to catch.
 #
 # The sort key, ascending:  [ priority class, dano class, type class, age (epoch seconds), id ]
+# (with --overdue-after, one more rule for ONE consumer, the gate: see "OVERDUE" below)
 #   priority class  0..4 -> itself. Anything else (missing, null, "2", 9, 1.5) -> 5, behind P4. WARN prio?
-#   dano class      THE one exception to "priority > type > age" (Athos, 2026-10-06, "Bug com dano ao vivo
-#                   primeiro"; the gate has applied it since ga-emgkvn, this is the same rule for every other
-#                   stage, ga-9t9acg.14). 0 for a P0 BUG that carries the label `impacto:dano-ao-vivo` (a customer
+#   dano class      The FIRST of two exceptions to "priority > type > age" (the second, the gate's wait ceiling,
+#                   is the opt-in OVERDUE rule below). Athos, 2026-10-06, "Bug com dano ao vivo primeiro"; the
+#                   gate has applied it since ga-emgkvn, this is the same rule for every other stage,
+#                   ga-9t9acg.14. 0 for a P0 BUG that carries the label `impacto:dano-ao-vivo` (a customer
 #                   is being hurt right now), 1 for everything else. So inside P0 the order is: dano bugs, then the
 #                   features, then the rest, oldest first inside each — and P1 and below are untouched.
 #                   It promotes only when ALL hold; any doubt leaves the bead where the plain rule puts it:
@@ -55,6 +57,25 @@
 #   id              last tie-break, so the same beads in any input order give the same output. A bead without a
 #                   readable string id still stays in the output (id "" sorts first among exact ties) and gets
 #                   WARN `id?` — it cannot be told apart from another one, which is worth hearing about.
+#
+# OVERDUE — the wait ceiling of the GATE (ga-i0uiv0; Athos, 2026-10-11, "teto de espera de 6 h"). Opt-in, and
+#   only for the consumer that asked for it: `work_order_sort --age field --overdue-after 21600`. Every other
+#   call has no such option and keeps the rule above to the letter. The rule: a bead of priority P1..P4 whose
+#   age (the injected `_wo_age`: when the marker entered the gate) is MORE than N seconds old is OVERDUE, and
+#   an overdue bead goes after every P0 and before every P1..P4 that is not overdue. Among the overdue the
+#   age alone decides, oldest first (priority and type no longer matter between them), then the id. Without
+#   it a P2 waits for ever while new P1s keep arriving (13 h, 12 h, 7 h measured on 2026-10-11).
+#     * "more than": exactly N seconds is NOT overdue. N=0 (or no option) switches the rule off.
+#     * P0 is never moved by it, and never waits behind an overdue bead.
+#     * THREE states for the age, never collapsed: readable and old / readable and not old / cannot tell. Only the
+#       first is overdue. An unreadable age stays at the end of its class (WARN age?), as before — "unknown" is not
+#       "old" — and so does a priority that is not 0..4 (class 5): no known priority to be ahead of.
+#     * It needs `--age field`: the ceiling is about the wait in ONE stage, measured from that stage's own entry
+#       marker. With another age rule the option is refused (cannot tell), never silently ignored.
+#     * `--now EPOCH` sets the clock (tests, and a caller that wants its own sweep clock); the default is the
+#       current time at the moment work_order_cfg runs. The dispatcher's marker-select block (the gate's own
+#       cascade, quality-gate-dispatcher.sh) applies the SAME rule with GATE_OVERDUE_AFTER_SECONDS; the panel
+#       calls this library with the same number so its "position in the queue" is the gate's order.
 #
 # TWO age rules, chosen per call with --age; each consumer documents which one it uses and why:
 #   created  (default) created_at.
@@ -153,8 +174,19 @@ def wo_dano_candidate: wo_prio_class == 0 and .issue_type == "bug";
 # 0 only for a candidate whose verdict is "yes"; 1 for everything else (an unreadable verdict is NOT a promotion).
 def wo_dano_class:
   if wo_dano_candidate and wo_dano_verdict == "yes" then 0 else 1 end;
+# ga-i0uiv0: OVERDUE (see the header). Off unless the config carries overdue_after > 0; only a P1..P4 bead with a
+# READABLE age more than overdue_after seconds old. `wo_prio_class` 5 (no usable priority) and an unreadable age are
+# both "cannot tell", never overdue.
+def wo_overdue($o):
+  (($o.overdue_after // 0) > 0)
+  and (wo_prio_class >= 1 and wo_prio_class <= 4)
+  and ((wo_age($o)) as $e | $e != null and (($o.now - $e) > $o.overdue_after));
+# The overdue sit between P0 and P1 as "priority class 0.5", with the type class flattened to 0: among them it is the
+# age alone, then the id (wo_order_key, below). A bead that is not overdue gets the key it always had (wo_key).
 def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_dano_class, wo_type_class($o), ($e // 9999999999), (.id // "")];
-def wo_sort($o): sort_by(wo_key($o));
+# The key the sort uses: wo_key as it always was, except for an overdue bead (priority 0.5, dano 1, type 0, its age, id).
+def wo_order_key($o): if wo_overdue($o) then [0.5, 1, 0, wo_age($o), (.id // "")] else wo_key($o) end;
+def wo_sort($o): sort_by(wo_order_key($o));
 def wo_warn($o):
   [ .[] | . as $b
     | [ (if wo_prio_class == 5 then "prio?" else empty end),
@@ -167,12 +199,12 @@ def wo_warn($o):
 def wo_run($o): wo_sort($o) as $s | { sorted: $s, warnings: ($s | wo_warn($o)) };
 '
 
-# work_order_cfg [--age created|field|reclaim] — prints the JSON options for the wo_* defs; exit 2 and
+# work_order_cfg [--age created|field|reclaim] [--overdue-after SECONDS [--now EPOCH]] — prints the JSON options for the wo_* defs; exit 2 and
 # EMPTY stdout when it cannot (bad option, empty feature list, jq missing/failed), with one
 # `work-order ERROR:` line on stderr that says WHICH. Callers MUST treat empty as "cannot tell", never as
 # a default.
 work_order_cfg() {
-  local age="created" out msg
+  local age="created" out msg overdue="" now="" overdue_given=0 now_given=0
   if ! command -v jq >/dev/null 2>&1; then
     echo "work-order ERROR: work_order_cfg: jq is not on PATH; cannot tell" >&2
     return 2
@@ -181,14 +213,35 @@ work_order_cfg() {
     case "$1" in
       --age)   if [ $# -lt 2 ]; then echo "work-order ERROR: work_order_cfg: --age needs a value" >&2; return 2; fi; age="$2"; shift 2 ;;
       --age=*) age="${1#--age=}"; shift ;;
+      --overdue-after)   if [ $# -lt 2 ]; then echo "work-order ERROR: work_order_cfg: --overdue-after needs a value" >&2; return 2; fi; overdue="$2"; overdue_given=1; shift 2 ;;
+      --overdue-after=*) overdue="${1#--overdue-after=}"; overdue_given=1; shift ;;
+      --now)   if [ $# -lt 2 ]; then echo "work-order ERROR: work_order_cfg: --now needs a value" >&2; return 2; fi; now="$2"; now_given=1; shift 2 ;;
+      --now=*) now="${1#--now=}"; now_given=1; shift ;;
       *)       echo "work-order ERROR: work_order_cfg: unknown option: $1" >&2; return 2 ;;
     esac
   done
-  if ! out="$(jq -cn --arg age "$age" --arg ft "$WORK_ORDER_FEATURE_TYPES" '
+  # ga-i0uiv0: plain digits only (no sign, no fraction, no text, at most 10 digits). A value that is not a number is a
+  # typo, and the one safe answer to a typo here is "cannot tell" — never "off", which would bring the starvation back.
+  # (a value given but EMPTY, as from an unset variable, is a typo too: `[ -n ]` would read it as "not given" = off)
+  if [ "$overdue_given" = 1 ]; then
+    case "$overdue" in ''|*[!0-9]*|??????????*) echo "work-order ERROR: work_order_cfg: --overdue-after wants plain seconds (digits only), got '${overdue:0:40}'; cannot tell" >&2; return 2 ;; esac
+    overdue=$((10#$overdue))
+    if [ "$overdue" -gt 0 ] && [ "$age" != "field" ]; then
+      echo "work-order ERROR: work_order_cfg: --overdue-after needs --age field (the ceiling is measured from the stage's own entry marker), got --age $age; cannot tell" >&2
+      return 2
+    fi
+  fi
+  if [ "$now_given" = 1 ]; then
+    case "$now" in ''|*[!0-9]*|??????????????*) echo "work-order ERROR: work_order_cfg: --now wants an epoch in seconds (digits only), got '${now:0:40}'; cannot tell" >&2; return 2 ;; esac
+    now=$((10#$now))
+  fi
+  if [ "${overdue:-0}" -gt 0 ] && [ -z "$now" ]; then now="$(date -u +%s 2>/dev/null)"; fi
+  case "${now:-0}" in ''|*[!0-9]*) echo "work-order ERROR: work_order_cfg: could not read the clock for --overdue-after; cannot tell" >&2; return 2 ;; esac
+  if ! out="$(jq -cn --arg age "$age" --arg ft "$WORK_ORDER_FEATURE_TYPES" --argjson od "${overdue:-0}" --argjson now "${now:-0}" '
       ($ft | ascii_downcase | gsub("\\s+"; " ") | split(" ") | map(select(length > 0))) as $f
       | if ($age | IN("created", "field", "reclaim") | not) then error("age must be created, field or reclaim")
         elif ($f | length) == 0 then error("WORK_ORDER_FEATURE_TYPES is empty")
-        else { age: $age, feature_types: $f } end' 2>&1)" || [ -z "$out" ]; then
+        else { age: $age, feature_types: $f } + (if $od > 0 then { overdue_after: $od, now: $now } else {} end) end' 2>&1)" || [ -z "$out" ]; then
     msg="${out%%$'\n'*}"
     echo "work-order ERROR: work_order_cfg: ${msg:0:200}; cannot tell" >&2
     return 2
@@ -196,13 +249,13 @@ work_order_cfg() {
   printf '%s\n' "$out"
 }
 
-# work_order_sort [--age created|field|reclaim] — stdin: ONE JSON array of bead objects (what
+# work_order_sort [--age created|field|reclaim] [--overdue-after SECONDS [--now EPOCH]] — stdin: ONE JSON array of bead objects (what
 # `bd list/ready --json` prints); stdout: the same array, ordered; stderr: the WARN lines.
 # Cannot tell -> stdout EMPTY, exit 2 (see the header). Nothing is printed until everything succeeded.
 work_order_sort() {
   local cfg input res msg sorted warns
   if ! cfg="$(work_order_cfg "$@")" || [ -z "$cfg" ]; then
-    echo "work-order ERROR: work_order_sort: no usable config (see the line above; usage: work_order_sort [--age created|field|reclaim]); cannot tell" >&2
+    echo "work-order ERROR: work_order_sort: no usable config (see the line above; usage: work_order_sort [--age created|field|reclaim] [--overdue-after SECONDS [--now EPOCH]]); cannot tell" >&2
     return 2
   fi
   input="$(cat)"

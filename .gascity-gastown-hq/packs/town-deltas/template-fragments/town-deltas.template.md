@@ -263,10 +263,19 @@ conselhos: cada uma tem um caso que a produziu.
 ### Dano ao vivo — como marcar um bug que fura a fila (ga-emgkvn)
 
 A ordem do gate é **prioridade > feature > idade** (todas as P0 feature, depois as
-P0 que não são feature, depois P1...). Há **uma única exceção**, decisão do Athos em
-06/10 (resposta "Bug com dano ao vivo primeiro" ao AskUserQuestion do Mayor, citada no
+P0 que não são feature, depois P1...). Há **duas exceções**. A primeira, decisão do Athos
+em 06/10 (resposta "Bug com dano ao vivo primeiro" ao AskUserQuestion do Mayor, citada no
 comentário do Mayor em ga-9t9acg, 2026-10-06T22:29:01Z): um **bug P0 com o label
-`impacto:dano-ao-vivo`** passa na frente das P0 feature. A exceção vive em **dois**
+`impacto:dano-ao-vivo`** passa na frente das P0 feature. A segunda é o **teto de espera
+de 6 h** (decisão do Athos em 11/10, opção "Teto de espera de 6 h" do AskUserQuestion,
+citada no comentário de ga-i0uiv0): um marker **P1-P4 que espera no gate há MAIS de 6 h**
+(idade = `created_at` do marker; `GATE_OVERDUE_AFTER_SECONDS`, padrão 21600; `0` desliga)
+passa na frente de todo P1-P4 que não estourou o teto — mais antigo primeiro entre os
+que estouraram, sem olhar prioridade nem tipo — e **P0 continua sempre na frente**
+(dano-ao-vivo incluso). Marker cuja idade não dá para ler **nunca** conta como estourado
+(fica no fim da sua classe, como antes). O teto vale só no gate (o painel passa a mostrar
+a mesma ordem com a fatia wa-jbfm5g); os outros estágios seguem prioridade > tipo > idade. A exceção do dano
+vive em **dois**
 lugares, com a mesma regra: o gate (`quality-gate-dispatcher.sh`, ga-emgkvn) e a lib
 única de ordenação (`work-order.sh`, ga-9t9acg.14 — chave `[prioridade, dano, tipo,
 idade, id]`). Todo estágio que ordena pela lib já a aplica; o que ainda ordena por

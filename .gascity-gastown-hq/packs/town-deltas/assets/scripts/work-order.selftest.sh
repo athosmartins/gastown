@@ -128,6 +128,43 @@ FDANO_BAD="$TMP/dano-bad.json"
 FDANO_BAD_ORDER="q-yes,q-feat,q-null,q-string,q-nonstring,q-nokey"
 FDANO_BAD_WARNS="q-nonstring: labels?;q-null: labels?;q-string: labels?;"
 
+# ga-i0uiv0 — the gate's wait ceiling ("teto de espera de 6 h"). OB id prio type secs-ago [labels-json]: a bead whose
+# stage-entry marker (the injected `_wo_age`) is <secs-ago> seconds before ONOW; secs-ago "none" omits `_wo_age`,
+# "garbage" is text that is not a time, "null" is null. created_at is ANCIENT on purpose: under `field` it must count for nothing.
+ONOW=1782863814
+od_iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+OB() {
+  local b; b="$(B "$1" "$2" "$3" 2026-01-01T00:00:00Z 2026-01-01T00:00:00Z "${5:-[]}")"
+  case "$4" in
+    none)    printf '%s\n' "$b" ;;
+    garbage) printf '%s\n' "$b" | jq -c '._wo_age = "yesterday"' ;;
+    null)    printf '%s\n' "$b" | jq -c '._wo_age = null' ;;
+    *)       printf '%s\n' "$b" | jq -c --arg a "$(od_iso $((ONOW - $4)))" '._wo_age = $a' ;;
+  esac
+}
+OD_LIMIT=21600
+FOD="$TMP/overdue.json"
+{
+  OB pabs absent task 90000                          # no usable priority, ancient: class 5, NEVER overdue
+  OB p4-new 4 task 50
+  OB p3-null 3 feature null                          # cannot tell the age: end of P3
+  OB p2-garbage 2 task garbage                       # cannot tell the age: end of P2 tasks
+  OB p2-none 2 feature none                          # cannot tell the age: end of P2 features
+  OB p2-59 2 feature 21540                           # 5 h 59 min: NOT overdue
+  OB p2-edge 2 feature 21600                         # exactly 6 h: NOT overdue (more than, not at least)
+  OB p1-task-new 1 task 5
+  OB p1-feat-new 1 feature 100
+  OB od-p2-feat 2 feature 21601                      # 6 h 00 min 01 s: overdue
+  OB od-p2-task 2 task 22000
+  OB od-p1-feat 1 feature 30000
+  OB od-p3-task 3 task 40000                         # the oldest overdue, the lowest priority of them
+  OB p0-task-old 0 task 90000                        # P0: never behind an overdue one, however old
+  OB p0-feat-new 0 feature 10
+  OB p0-dano-new 0 bug 30 '["impacto:dano-ao-vivo"]'
+} | arr > "$FOD"
+FOD_ORDER="p0-dano-new,p0-feat-new,p0-task-old,od-p3-task,od-p1-feat,od-p2-task,od-p2-feat,p1-feat-new,p1-task-new,p2-edge,p2-59,p2-none,p2-garbage,p3-null,p4-new,pabs"
+FOD_PLAIN="p0-dano-new,p0-feat-new,p0-task-old,od-p1-feat,p1-feat-new,p1-task-new,od-p2-feat,p2-edge,p2-59,p2-none,od-p2-task,p2-garbage,p3-null,od-p3-task,p4-new,pabs"
+
 # ── (a) the rule: priority > type > age ─────────────────────────────────────────────────────────
 if want a; then
 echo "== (a) priority > type (feature first) > age (oldest first)"
@@ -469,6 +506,119 @@ eq "...and the bead stays at the end of its class" "$(sids)" "x-feat,x-str"
 run_sort created "$TMP/pair.json"
 eq "unreadable age AND labels on a P0 bug: one WARN line with both reasons" "$(warns)" "y-bug: age? labels?;"
 eq "...and it stays at the end of its class, behind the feature" "$(sids)" "y-feat,y-bug"
+fi
+
+# ── (O) the wait ceiling (ga-i0uiv0) ───────────────────────────────────────────────────────────
+if want O; then
+echo "== (O) overdue: --overdue-after N puts every P1-P4 that waited MORE than N seconds right after P0, oldest first"
+od_run() { # <file> [work_order_sort args after --age field ...] -> SORT_OUT SORT_ERR SORT_RC
+  local f="$1"; shift
+  SORT_OUT="$(work_order_sort --age field "$@" < "$f" 2>"$TMP/err")"; SORT_RC=$?; SORT_ERR="$(cat "$TMP/err")"
+}
+od_ids() { od_run "$@"; if [ "$SORT_RC" -ne 0 ]; then echo "rc=$SORT_RC:$SORT_ERR"; else sids; fi; }
+OD="--overdue-after $OD_LIMIT --now $ONOW"
+# shellcheck disable=SC2086
+eq "the whole ladder: P0 (dano, feature, rest), the overdue oldest first, P1, P2 (edge cases), P3, P4, no priority" "$(od_ids "$FOD" $OD)" "$FOD_ORDER"
+eq "without the option the order is the plain rule's, to the letter" "$(od_ids "$FOD")" "$FOD_PLAIN"
+eq "--overdue-after 0 is off: the plain rule" "$(od_ids "$FOD" --overdue-after 0 --now $ONOW)" "$FOD_PLAIN"
+eq "--overdue-after 0 without --now is off too" "$(od_ids "$FOD" --overdue-after 0)" "$FOD_PLAIN"
+eq "--now alone changes nothing" "$(od_ids "$FOD" --now $ONOW)" "$FOD_PLAIN"
+eq "the option and the equal sign spelling" "$(od_ids "$FOD" --overdue-after=$OD_LIMIT --now=$ONOW)" "$FOD_ORDER"
+eq "leading zeros are the same number" "$(od_ids "$FOD" --overdue-after 021600 --now $ONOW)" "$FOD_ORDER"
+
+# the acceptance cases of the bead, each on its own pair
+pair() { # <label> <expected csv> <bead> <bead>
+  local f="$TMP/pair.json"; { printf '%s\n' "$3"; printf '%s\n' "$4"; } | arr > "$f"
+  # shellcheck disable=SC2086
+  eq "$1" "$(od_ids "$f" $OD)" "$2"
+}
+pair "a P2 at 6 h 01 beats a fresh P1" "p2,p1" "$(OB p1 1 feature 60)" "$(OB p2 2 task 21601)"
+pair "a P2 at 5 h 59 stays behind a fresh P1" "p1,p2" "$(OB p1 1 feature 60)" "$(OB p2 2 task 21599)"
+pair "exactly 6 h is not overdue (more than, not at least)" "p1,p2" "$(OB p1 1 feature 60)" "$(OB p2 2 task 21600)"
+pair "a new P0 beats an overdue P2" "p0,p2" "$(OB p2 2 feature 99999)" "$(OB p0 0 task 1)"
+pair "a new P0 bug with dano-ao-vivo beats an overdue P1" "p0,p1" "$(OB p1 1 feature 99999)" "$(OB p0 0 bug 1 '["impacto:dano-ao-vivo"]')"
+pair "two overdue: the oldest first, even when it is the lower priority and not a feature" "p3,p1" "$(OB p1 1 feature 30000)" "$(OB p3 3 task 30001)"
+pair "two overdue of the same age: the id decides" "a,b" "$(OB b 2 task 30000)" "$(OB a 2 task 30000)"
+pair "an unreadable age is never overdue (garbage)" "p1,p2" "$(OB p1 1 feature 60)" "$(OB p2 2 task garbage)"
+pair "an unreadable age is never overdue (absent)" "p1,p2" "$(OB p1 1 feature 60)" "$(OB p2 2 task none)"
+pair "an unreadable age is never overdue (null)" "p1,p2" "$(OB p1 1 feature 60)" "$(OB p2 2 task null)"
+pair "a priority that is not 0-4 is never overdue, however old" "p4,px" "$(OB px '"high"' task 99999)" "$(OB p4 4 task 10)"
+pair "a priority outside 0-4 (9) is never overdue either" "p4,px" "$(OB px 9 task 99999)" "$(OB p4 4 task 10)"
+pair "an old created_at is not a wait: only the marker's own age counts" "p1,p2" "$(OB p1 1 feature 60)" "$(OB p2 2 task 100 | jq -c '.created_at = "2020-01-01T00:00:00Z"')"
+pair "a marker from the future is not overdue" "p1,p2" "$(OB p1 1 feature 60)" "$(OB p2 2 task -500)"
+eq "unreadable ages stay where they were and are still WARNed about" "$(od_run "$FOD" $OD; warns)" "p2-garbage: age?;p2-none: age?;p3-null: age?;pabs: prio?;"
+# a smaller ceiling moves the line (the knob is real, not decoration)
+# shellcheck disable=SC2086
+eq "a 100 s ceiling: the P1 at exactly 100 s is not overdue, the P2 at 21540 s is; no priority is never overdue" "$(od_ids "$FOD" --overdue-after 100 --now $ONOW | cut -d, -f1-13)" "p0-dano-new,p0-feat-new,p0-task-old,od-p3-task,od-p1-feat,od-p2-task,od-p2-feat,p2-edge,p2-59,p1-feat-new,p1-task-new,p2-none,p2-garbage"
+# the real clock, when --now is not given
+FOD_REAL="$TMP/overdue-real.json"
+real_now="$(date -u +%s)"
+{ OB p1 1 feature 10 | jq -c --arg a "$(od_iso $((real_now - 10)))" '._wo_age = $a'
+  OB p2 2 task 10 | jq -c --arg a "$(od_iso $((real_now - 22000)))" '._wo_age = $a'; } | arr > "$FOD_REAL"
+eq "without --now the clock is the real one (a P2 22000 s old beats a P1 10 s old)" "$(od_ids "$FOD_REAL" --overdue-after $OD_LIMIT)" "p2,p1"
+eq "and the same fixture without the option is the plain order" "$(od_ids "$FOD_REAL")" "p1,p2"
+
+# every way the option can be wrong is "cannot tell" (stdout EMPTY, exit 2), NEVER "off": off brings the starvation back
+od_cant() { # <label> [args...]
+  local label="$1"; shift
+  local out; out="$(work_order_sort "$@" < "$FOD" 2>"$TMP/err")"; local rc=$?
+  if [ "$rc" -eq 2 ] && [ -z "$out" ] && grep -q 'cannot tell' "$TMP/err"; then ok "$label -> cannot tell (stdout empty, exit 2)"
+  else bad "$label: rc=$rc stdout=[${out:0:60}] stderr=[$(head -c 160 "$TMP/err")]"; fi
+}
+od_cant "--overdue-after 6h (a typo)" --age field --overdue-after 6h --now $ONOW
+od_cant "--overdue-after -1" --age field --overdue-after -1 --now $ONOW
+od_cant "--overdue-after 1.5" --age field --overdue-after 1.5 --now $ONOW
+od_cant "--overdue-after '' (an unset variable)" --age field --overdue-after '' --now $ONOW
+od_cant "--overdue-after with an implausibly long number" --age field --overdue-after 12345678901 --now $ONOW
+od_cant "--overdue-after without a value" --age field --overdue-after
+od_cant "--now without a value" --age field --overdue-after 60 --now
+od_cant "--now that is not an epoch" --age field --overdue-after 60 --now tomorrow
+od_cant "--now '' " --age field --overdue-after 60 --now ''
+od_cant "--overdue-after with --age created (the ceiling is the stage's own marker)" --age created --overdue-after 21600 --now $ONOW
+od_cant "--overdue-after with --age reclaim" --age reclaim --overdue-after 21600 --now $ONOW
+od_cant "--overdue-after with the default age" --overdue-after 21600 --now $ONOW
+eq "--overdue-after 0 with another age is allowed (it is off, nothing to refuse)" "$(work_order_sort --age created --overdue-after 0 < "$FOD" 2>/dev/null | jq -r 'map(.id) | join(",")')" "$(work_order_sort --age created < "$FOD" 2>/dev/null | jq -r 'map(.id) | join(",")')"
+eq "work_order_cfg off: the same JSON as before the option existed" "$(work_order_cfg --age field --overdue-after 0 --now 5)" "$(work_order_cfg --age field)"
+eq "work_order_cfg on: carries the ceiling and the clock" "$(work_order_cfg --age field --overdue-after 60 --now 5)" '{"age":"field","feature_types":["feature","story"],"overdue_after":60,"now":5}'
+
+# The panel is a PYTHON consumer: it reaches the same rule through sort_beads(overdue_after=...) and `work_order.py sort
+# --overdue-after`. The shell checks above prove the rule; these prove the Python door carries it, and refuses a typo.
+echo "-- the Python entry carries the ceiling (CLI and module) and a typo there is 'cannot tell', never 'off'"
+pyids() { jq -r 'map(.id) | join(",")'; }
+eq "python CLI --overdue-after: the whole ladder" "$(python3 -I -B "$PY" sort --age field --overdue-after $OD_LIMIT --now $ONOW < "$FOD" 2>/dev/null | pyids)" "$FOD_ORDER"
+eq "python CLI without the option: the plain order, to the letter" "$(python3 -I -B "$PY" sort --age field < "$FOD" 2>/dev/null | pyids)" "$FOD_PLAIN"
+eq "python CLI --overdue-after 0 is off" "$(python3 -I -B "$PY" sort --age field --overdue-after 0 --now $ONOW < "$FOD" 2>/dev/null | pyids)" "$FOD_PLAIN"
+for pybad in 6h -1 1.5 "" 1234567890123; do
+  out="$(python3 -I -B "$PY" sort --age field --overdue-after "$pybad" --now $ONOW < "$FOD" 2>"$TMP/pyerr")"; rc=$?
+  eq "python CLI --overdue-after '$pybad' -> cannot tell (stdout empty, exit 2)" "$rc/${out:-EMPTY}" "2/EMPTY"
+done
+out="$(python3 -I -B "$PY" sort --age created --overdue-after $OD_LIMIT --now $ONOW < "$FOD" 2>"$TMP/pyerr")"; rc=$?
+eq "python CLI --overdue-after with --age created -> cannot tell" "$rc/${out:-EMPTY}" "2/EMPTY"
+PYOD="$(python3 -I -B - "$ROOT/scripts" "$FOD" "$ONOW" "$OD_LIMIT" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import work_order as wo
+beads = json.load(open(sys.argv[2])); now = int(sys.argv[3]); limit = int(sys.argv[4])
+ids = lambda out: ",".join(b["id"] for b in out)
+out, w = wo.sort_beads(beads, age="field", overdue_after=limit, now=now); print("on=" + ids(out))
+out, w = wo.sort_beads(beads, age="field"); print("plain=" + ids(out))
+out, w = wo.sort_beads(beads, age="field", overdue_after=0, now=now); print("off=" + ids(out))
+for name, val in (("str", "6h"), ("neg", -1), ("float", 1.5), ("bool", True), ("digits", "21600")):
+    out, w = wo.sort_beads(beads, age="field", overdue_after=val, now=now); print("%s=%s/%d" % (name, out is None, len(w)))
+out, w = wo.sort_beads(beads, age="field", overdue_after=limit, now="soon"); print("nowstr=%s" % (out is None))
+out, w = wo.sort_beads(beads, age="created", overdue_after=limit, now=now); print("agecreated=%s" % (out is None))
+out, w = wo.sort_beads([], age="field", overdue_after=limit, now=now); print("empty=%r/%r" % (out, w))
+PY
+)"
+eq "sort_beads(overdue_after=...): the whole ladder" "$(printf '%s\n' "$PYOD" | sed -n 's/^on=//p')" "$FOD_ORDER"
+eq "sort_beads() without it: the plain order" "$(printf '%s\n' "$PYOD" | sed -n 's/^plain=//p')" "$FOD_PLAIN"
+eq "sort_beads(overdue_after=0) is off" "$(printf '%s\n' "$PYOD" | sed -n 's/^off=//p')" "$FOD_PLAIN"
+for pyname in str neg float bool digits; do
+  eq "sort_beads(overdue_after=<$pyname>) is (None, [reason]), not an unceilinged order" "$(printf '%s\n' "$PYOD" | sed -n "s/^$pyname=//p")" "True/1"
+done
+eq "sort_beads(now=<text>) is (None, [reason])" "$(printf '%s\n' "$PYOD" | sed -n 's/^nowstr=//p')" "True"
+eq "sort_beads(age='created', overdue_after=N) is (None, [reason])" "$(printf '%s\n' "$PYOD" | sed -n 's/^agecreated=//p')" "True"
+eq "sort_beads([], overdue_after=N) is ([], []), not None" "$(printf '%s\n' "$PYOD" | sed -n 's/^empty=//p')" "[]/[]"
 fi
 
 # ── (h) three states ────────────────────────────────────────────────────────────────────────────

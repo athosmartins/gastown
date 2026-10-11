@@ -5,8 +5,8 @@
 # dispatcher?" (a marker whose gate_run was dropped in an outage, never selected again). Until
 # ga-q8tj7p it inferred that from the dispatcher's CLAIM ORDER — "a newer marker was claimed while
 # this older one was overdue" — which was only a proof while an overdue tier made the order
-# priority-blind. The order is now priority > feature > age, so a newer P0 legitimately beats an
-# older P3 for as long as P0s keep arriving, and no claim order proves anything.
+# priority-blind. The order is now priority > feature > age (plus the 6 h wait ceiling, ga-i0uiv0), so a
+# newer P0 legitimately beats an older P3 for as long as P0s keep arriving, and no claim order proves anything.
 #
 # What the dispatcher can say instead is the thing it actually computed: for every sweep, the
 # markers it ORDERED (with the class that placed each) and the ones it SET ASIDE: every marker of the
