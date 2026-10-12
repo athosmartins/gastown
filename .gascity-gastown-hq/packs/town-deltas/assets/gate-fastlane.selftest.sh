@@ -623,8 +623,8 @@ git -C "$REPO" checkout -q -b fa-mg fa  && git -C "$REPO" merge -q --no-edit mai
 MAIN2=$(git -C "$REPO" rev-parse main)
 [ -n "${FA_RB:-}" ] && [ -n "${FC_RB:-}" ] && [ -n "${FA_MG:-}" ] && ok "premise: main moved twice and the branches were rebased / merged cleanly onto it" || bad "premise broken: rebase/merge setup failed"
 
-C_L0=""; C_DIG0=""; C_RC=""; C_CODE=""; C_L1=""; C_WHY=""
-dconf() { # dconf <decide-head|""> <confirm-base> <confirm-head> [ENV=VAL ...] -> C_L0 C_DIG0 C_RC C_CODE C_L1 C_WHY
+C_L0=""; C_DIG0=""; C_RC=""; C_CODE=""; C_L1=""; C_WHY=""; C_REASON=""; C_FILES=""; C_COUNTS=""
+dconf() { # dconf <decide-head|""> <confirm-base> <confirm-head> [ENV=VAL ...] -> C_L0 C_DIG0 C_RC C_CODE C_L1 C_WHY C_REASON C_FILES C_COUNTS (the last three: what describes the grant, after the confirm)
   local dh="$1" cb="$2" ch="$3" out; shift 3
   out=$(fl_env GATE_FS_TMPDIR="$T/tmp" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" FL_REPO="$REPO" FL_DH="$dh" FL_CB="$cb" FL_CH="$ch" "$@" "$B32" -c '
     set -euo pipefail
@@ -635,9 +635,18 @@ dconf() { # dconf <decide-head|""> <confirm-base> <confirm-head> [ENV=VAL ...] -
     [ -n "${FL_TOUCH:-}" ] && : > "$FL_TOUCH"
     c_rc=0; gate_fastlane_confirm gfn "$FL_CB" "$FL_CH" || c_rc=$?
     printf "%s\n%s\n%s\n%s\n" "$c_rc" "${GATE_LANE_CONFIRM_CODE:-}" "${GATE_LANE:-}" "${GATE_LANE_CONFIRM_WHY:-}"
-  ' 2>"$T/conf.err") || { C_L0="ABORTED"; C_DIG0=""; C_RC=""; C_CODE=""; C_L1=""; C_WHY="aborted under set -euo pipefail: $(tr '\n' ' ' < "$T/conf.err")"; return; }
+    printf "%s\n%s\n%s\n" "${GATE_LANE_REASON:-}" "$(gate_fastlane_files_oneline)" "${GATE_LANE_COUNTS:-}"
+  ' 2>"$T/conf.err") || { C_L0="ABORTED"; C_DIG0=""; C_RC=""; C_CODE=""; C_L1=""; C_WHY="aborted under set -euo pipefail: $(tr '\n' ' ' < "$T/conf.err")"; C_REASON=""; C_FILES=""; C_COUNTS=""; return; }
   C_L0=$(printf '%s\n' "$out" | sed -n 1p); C_DIG0=$(printf '%s\n' "$out" | sed -n 2p); C_RC=$(printf '%s\n' "$out" | sed -n 3p)
   C_CODE=$(printf '%s\n' "$out" | sed -n 4p); C_L1=$(printf '%s\n' "$out" | sed -n 5p); C_WHY=$(printf '%s\n' "$out" | sed -n 6p)
+  C_REASON=$(printf '%s\n' "$out" | sed -n 7p); C_FILES=$(printf '%s\n' "$out" | sed -n 8p); C_COUNTS=$(printf '%s\n' "$out" | sed -n 9p)
+}
+grant_check() { # name granted|revoked — after the last dconf(): is the grant still described (reason, files, counts), or cleared with the revocation?
+  if [ "$2" = "revoked" ]; then
+    [ -z "$C_REASON" ] && [ -z "$C_FILES" ] && [ -z "$C_COUNTS" ] && ok "confirm: $1 — nothing describes the grant any more (reason, files, counts cleared with lane=normal)" || bad "confirm: $1 — lane=$C_L1 but still: reason='$C_REASON' files='$C_FILES' counts='$C_COUNTS'"
+  else
+    [ -n "$C_REASON" ] && [ -n "$C_COUNTS" ] && ok "confirm: $1 — the grant's reason and counts are kept (it is still fast)" || bad "confirm: $1 — a confirmed grant lost its reason/counts: reason='$C_REASON' counts='$C_COUNTS'"
+  fi
 }
 conf_check() { # name want_rc want_code [needle-in-why]
   if [ "$C_L0" = "ABORTED" ]; then bad "confirm: $1 — $C_WHY"; return; fi
@@ -650,7 +659,9 @@ conf_check() { # name want_rc want_code [needle-in-why]
 dconf "$FA" main "$FA";
 [ "$C_L0" = "fast" ] && [ "$C_DIG0" = "set" ] && ok "premise: the decision on the docs-only branch is fast AND records the fingerprint of the diff it checked" || bad "premise: decide → lane=$C_L0 digest=$C_DIG0 ($C_WHY)"
 conf_check "the tip did not move (the common case)" 0 ""
+grant_check "the common case" granted
 dconf "$FA" main "$FB_PY";   conf_check "the gate's reproduction: a .py commit lands on the branch after the decision" 1 diff-changed "not the diff"
+grant_check "…a revoked grant" revoked
 dconf "$FA" main "$FB_DOC";  conf_check "…a second, harmless-looking doc after the decision (no scan and no test ever ran on it)" 1 diff-changed
 dconf "$FA" main "$FB_CPF";  conf_check "…a doc carrying a CPF after the decision" 1 diff-changed
 case "$C_WHY" in *529.982*|*52998224725*) bad "the revocation reason published the CPF: $C_WHY" ;; *) ok "…and the revocation reason never carries the value" ;; esac
@@ -899,9 +910,50 @@ git -C "$REPO" checkout -q -b h-link main; ln -s ../app/main.py "$REPO/docs/lnk.
 git -C "$REPO" rm -q docs/lnk.md; printf 'x\n' > "$REPO/docs/okl.md"; git -C "$REPO" add docs/okl.md; git -C "$REPO" commit -q -m 'unlink'
 S_HL=$(git -C "$REPO" rev-parse HEAD); git -C "$REPO" checkout -q main
 decide "$S_HL" "";  chk_code "a symlink added in commit 1 and removed in commit 2 is not vouched for (history-unverified)" normal history-unverified "symlink"
-# (i) merge commits: a clean one (the gate's own "merge main into the branch" fallback) adds nothing; one with a conflict resolution carries content nobody scanned
+# (i) merge commits: a clean one (the gate's own "merge main into the branch" fallback) adds no file content (its MESSAGE is read: see (i') below); one with a conflict resolution carries content nobody scanned
 REPO_H="$REPO"; REPO="$T/repo2"
 decide "$FA_MG" "";  chk_code "a branch with a CLEAN merge of main in it (the gate's ga-qukyp fallback shape; \`git show --cc\` is empty) is still fast" fast fast
+# (i') the MESSAGE of a merge commit is published by the fast-forward like any other (gate round ga-5l2ki8, blocking issue 1). A clean merge has an empty
+#      `git show --cc`, so the history classification calls it "adds nothing", and the history scan lists --no-merges: nobody read the words. Same tree as
+#      FA_MG in every case below; only the message differs.
+mkmg() { # mkmg <new-branch> <message> — a clean merge of the moved main into fa, with this message -> prints the tip sha
+  git -C "$REPO" checkout -q -b "$1" fa && git -C "$REPO" merge -q --no-ff -m "$2" main && git -C "$REPO" rev-parse HEAD && git -C "$REPO" checkout -q main
+}
+FA_MG_SEC=$(mkmg fa-mg-sec 'Merge main for lead cpf 529.982.247-25 key AKIAIOSFODNN7EXAMPLE')
+FA_MG_CPF=$(mkmg fa-mg-cpf 'Merge main for cliente 529.982.247-25')
+FA_MG_PH=$(mkmg fa-mg-ph "$(printf 'Merge main\n\nligar (31) 99999-\n8888 amanha')")
+FA_MG_OK=$(mkmg fa-mg-ok 'Merge origin/main into fa-mg-ok (ga-qukyp fallback)')
+for _mg in "$FA_MG_SEC" "$FA_MG_CPF" "$FA_MG_PH" "$FA_MG_OK"; do
+  if [ "$(git -C "$REPO" rev-list --parents -n1 "$_mg" 2>/dev/null | wc -w | tr -d ' ')" = "3" ] && [ -z "$(git -C "$REPO" show --cc --format= "$_mg" 2>/dev/null)" ] \
+     && [ "$(git -C "$REPO" rev-parse "$_mg^{tree}")" = "$(git -C "$REPO" rev-parse "$FA_MG^{tree}")" ]; then
+    ok "premise: ${_mg:0:9} is a merge (two parents) with the SAME tree as FA_MG and an empty \`git show --cc\` — nothing but its message differs"
+  else bad "premise broken: ${_mg:-<empty>} is not a clean merge with FA_MG's tree"; fi
+done
+decide "$FA_MG_SEC" "";  chk_code "a clean merge whose MESSAGE carries a key and a CPF is a finding, not 'messages clean' (was: lane=fast)" normal scan-findings "aws-key"
+case "$D_FILES" in *commit-message*) ok "…and the files name the commit's message (<sha9>:commit-message), not a path" ;; *) bad "merge message finding not named as commit-message: $D_FILES" ;; esac
+case "$D_REASON $D_FILES" in *AKIAIOSFODNN7EXAMPLE*|*529.982*|*52998224725*) bad "the merge-message finding published the value: $D_REASON | $D_FILES" ;; *) ok "…and neither the reason nor the files carry the value" ;; esac
+decide "$FA_MG_CPF" "";  chk_code "a clean merge whose message holds only a CPF is a finding" normal scan-findings "numero-longo"
+decide "$FA_MG_PH" "";   chk_code "a clean merge whose message wraps a phone across two lines is a finding" normal scan-findings "numero-longo"
+decide "$FA_MG_OK" "";   chk_code "control: a clean merge with a plain message of its own (ga-qukyp fallback wording) is still fast; the grant says the merge commits' messages were read" fast fast "merge commits' included"
+decide "$FA_MG" "";      chk_code "control: git's default merge message is still fast" fast fast
+# the one flag the merges pass cannot do without: git abbreviates the `Merge: <parent> <parent>` line (core.abbrev) unless --no-abbrev is asked for — --no-abbrev-commit
+# only reaches the `commit` line — and the scanner reads that line in its full-sha shape only. A lib that lost the flag must be INERT on every merge, not read it as clean
+sed 's/ log --merges --no-abbrev --topo-order/ log --merges --topo-order/' "$LIB" > "$T/mut-abbrev.lib.sh"; cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-abbrev.lib.sh"; then bad "mutation (no --no-abbrev on the merges pass) did not change the lib (sed pattern drifted)"; else
+  FL_LIB_OVERRIDE="$T/mut-abbrev.lib.sh" decide "$FA_MG" "";  chk_code "mutant lib without --no-abbrev on the merges pass: the abbreviated \`Merge:\` line is refused (inert), never read as clean" normal scan-failed "merge commit messages"
+  FL_LIB_OVERRIDE="$T/mut-abbrev.lib.sh" decide "$FA_MG_SEC" "";  chk_code "…and a merge with a secret in its message is not fast under that mutant either (the lane stays inert)" normal scan-failed "merge commit messages"
+fi
+# the push-time question asked again: same tree, same file list, same fingerprint — and a message that was clean at the decision is not clean any more
+dconf "$FA_MG" main "$FA_MG";         conf_check "control: the clean merge, confirmed as decided" 0 ""
+dconf "$FA_MG_OK" main "$FA_MG_OK";   conf_check "control: the merge with its own plain message, confirmed as decided" 0 ""
+dconf "$FA_MG" main "$FA_MG_SEC";     conf_check "the same merge (same tree, same files, same fingerprint) but its MESSAGE now carries a key and a CPF (was: rc 0, fast, no scan ever read it)" 1 diff-changed "rejects it"
+case "$C_WHY" in *AKIAIOSFODNN7EXAMPLE*|*529.982*|*52998224725*) bad "the revocation reason published the merge message's value: $C_WHY" ;; *) ok "…and the revocation reason never carries the value" ;; esac
+dconf "$FA_MG_OK" main "$FA_MG_PH";   conf_check "a plain merge message decided, a wrapped phone in the message at the push" 1 diff-changed
+# the third state at the merge pass: git cannot count, answers garbage, fails, or reads nothing for a range that HAS a merge — never "no merge messages, clean"
+hist_stub "git cannot count the merge commits (rev-list --merges --count fails)" "$FA_MG" 'gfn() { case " $* " in *" rev-list "*"--count"*) return 5 ;; esac; git -C "$FL_REPO" "$@"; }' scan-failed "could not count the merge commits"
+hist_stub "git counts the merge commits with garbage" "$FA_MG" 'gfn() { case " $* " in *" rev-list "*"--count"*) echo banana; return 0 ;; esac; git -C "$FL_REPO" "$@"; }' scan-failed "could not count the merge commits"
+hist_stub "git log --merges FAILS" "$FA_MG" 'gfn() { case " $* " in *" log "*"--merges"*) return 9 ;; esac; git -C "$FL_REPO" "$@"; }' scan-failed "merge commit messages: git failed to produce the merges text"
+hist_stub "git log --merges answers success with NO text although the range has a merge (not read ≠ clean)" "$FA_MG" 'gfn() { case " $* " in *" log "*"--merges"*) return 0 ;; esac; git -C "$FL_REPO" "$@"; }' scan-failed "merge commit messages: git returned no merges text"
 git -C "$REPO" checkout -q -b cf-main "$M0_R2"; printf 'l1\nl2\nl3\nl4\nMAIN-SIDE\nl6\nl7\nl8\n' > "$REPO/docs/a.md"; git -C "$REPO" commit -q -am 'cf main side'
 git -C "$REPO" checkout -q -b cf-br "$M0_R2";   printf 'l1\nl2\nl3\nl4\nBRANCH-SIDE\nl6\nl7\nl8\n' > "$REPO/docs/a.md"; git -C "$REPO" commit -q -am 'cf branch side'
 git -C "$REPO" merge -q --no-edit cf-main >/dev/null 2>&1 || true
@@ -967,7 +1019,25 @@ log_case "a commit with a path holding a space (git's TAB on the +++ line) keeps
 [ "$SCAN_OUT" = "$(printf 'aws-key\t111111111:docs/a b.md\t1')" ] && ok "…111111111:docs/a b.md:1, 3 fields" || bad "spaced path in a log stream: $(printf '%s' "$SCAN_OUT" | cat -vte)"
 # the shapes that are NOT git log --pretty=medium are refused, never read as clean
 log_case "a decorated commit line (git log --decorate)" 2 < <(printf 'commit %s (HEAD -> main)\nAuthor: t <t@x>\nDate:   Sun Oct 11 07:08:02 2026 -0300\n\n    m\n' $SHA1)
-log_case "a 'Merge:' header (a merge commit must not reach the scan: the caller passes --no-merges)" 2 < <(printf 'commit %s\nMerge: aaaaaaa bbbbbbb\nAuthor: t <t@x>\nDate:   x\n\n    m\n' $SHA1)
+# a MERGE commit's header (gate round ga-5l2ki8, blocking issue 1): `git log --merges --pretty=medium` writes `Merge: <full sha> <full sha>` between the commit line and the
+# Author line, and the message under it is published by the fast-forward like any other — so the scanner reads it, in the one shape git writes and no other
+SHA3=3333333333333333333333333333333333333333; SHA4=4444444444444444444444444444444444444444
+MRGHDR() { printf 'commit %s\nMerge: %s %s\nAuthor: t <t@example.invalid>\nDate:   Sun Oct 11 07:08:02 2026 -0300\n\n' "$1" "$2" "$3"; }
+log_case "a clean merge commit (Merge: two full shas, a message, no diff) is read" 0 < <(MRGHDR $SHA1 $SHA3 $SHA4; printf '    Merge branch main into feat\n')
+log_case "a secret in a MERGE commit's message is a finding" 1 < <(MRGHDR $SHA1 $SHA3 $SHA4; printf '    Merge main for lead key AKIAIOSFODNN7EXAMPLE\n')
+[ "$SCAN_OUT" = "$(printf 'aws-key\t111111111:commit-message\t1')" ] && ok "…named <sha9>:commit-message, line 1, no value" || bad "merge message finding wrong: $(printf '%s' "$SCAN_OUT" | cat -vte)"
+log_case "a CPF in a merge commit's message is a finding" 1 < <(MRGHDR $SHA1 $SHA3 $SHA4; printf '    Merge main for cliente 529.982.247-25\n')
+log_case "a phone wrapped across two lines of a merge commit's message is a finding" 1 < <(MRGHDR $SHA1 $SHA3 $SHA4; printf '    Merge main\n    \n    ligar (31) 99999-\n    8888 amanha\n')
+log_case "an octopus merge (three parents) is read" 0 < <(printf 'commit %s\nMerge: %s %s %s\nAuthor: t <t@x>\nDate:   x\n\n    m\n' $SHA1 $SHA2 $SHA3 $SHA4)
+log_case "a merge between two ordinary commits: the finding in the LAST one carries the last sha" 1 < <({ LOGHDR $SHA1; printf '    one\n\n'; printf "${FILEHDR}@@ -0,0 +1 @@\n+ok\n\n"; MRGHDR $SHA2 $SHA3 $SHA4; printf '    merge\n\n'; LOGHDR $SHA3; printf '    three\n\n'; printf "${FILEHDR}@@ -0,0 +1 @@\n+key AKIAIOSFODNN7EXAMPLE\n"; })
+[ "$SCAN_OUT" = "$(printf 'aws-key\t333333333:docs/x.md\t1')" ] && ok "…333333333:docs/x.md:1" || bad "finding after a merge wrong: $SCAN_OUT"
+log_case "a 'Merge:' header with abbreviated shas (git was not told --no-abbrev: --no-abbrev-commit does not reach this line)" 2 < <(printf 'commit %s\nMerge: aaaaaaa bbbbbbb\nAuthor: t <t@x>\nDate:   x\n\n    m\n' $SHA1)
+log_case "a 'Merge:' header with ONE parent (not a merge)" 2 < <(printf 'commit %s\nMerge: %s\nAuthor: t <t@x>\nDate:   x\n\n    m\n' $SHA1 $SHA3)
+log_case "a 'Merge:' header with text after the shas" 2 < <(printf 'commit %s\nMerge: %s %s extra\nAuthor: t <t@x>\nDate:   x\n\n    m\n' $SHA1 $SHA3 $SHA4)
+log_case "a 'Merge:' header that is not hex" 2 < <(printf 'commit %s\nMerge: %s %s\nAuthor: t <t@x>\nDate:   x\n\n    m\n' $SHA1 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz $SHA4)
+log_case "two 'Merge:' headers on one commit" 2 < <(printf 'commit %s\nMerge: %s %s\nMerge: %s %s\nAuthor: t <t@x>\nDate:   x\n\n    m\n' $SHA1 $SHA3 $SHA4 $SHA3 $SHA4)
+log_case "a 'Merge:' header AFTER the Author line (git never writes that order)" 2 < <(printf 'commit %s\nAuthor: t <t@x>\nMerge: %s %s\nDate:   x\n\n    m\n' $SHA1 $SHA3 $SHA4)
+log_case "a merge commit whose header ends the input (truncated stream)" 2 < <(printf 'commit %s\nMerge: %s %s\nAuthor: t <t@x>\n' $SHA1 $SHA3 $SHA4)
 log_case "a header line that is neither Author nor Date" 2 < <(printf 'commit %s\nCommit: t\nDate:   x\n\n    m\n' $SHA1)
 log_case "a commit header that ends the input (truncated stream)" 2 < <(printf 'commit %s\nAuthor: t <t@x>\n' $SHA1)
 log_case "an unindented line inside a message that is not a diff or commit line" 2 < <({ LOGHDR $SHA1; printf '    m\nGARBAGE\n'; })

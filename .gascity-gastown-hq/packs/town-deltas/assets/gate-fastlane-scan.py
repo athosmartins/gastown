@@ -5,17 +5,20 @@ The fast lane merges a docs/tests-only diff WITHOUT an LLM reviewer. What the re
 such a diff is a person's data or a credential pasted into a document, so this scans exactly that, on the
 ADDED lines only.
 
-Two inputs, both a unified diff with -U0, and the caller feeds BOTH because the merge publishes more than one view of the
-same branch (ga-atsahv, gate round ga-aa8n6z: the scan read the NET diff, the fast-forward publishes EVERY commit, so a
-value pasted in one commit and removed in the next sat in main's history unseen):
+Three inputs, the first a unified diff with -U0, the other two `git log -p` text, and the caller feeds ALL of them because the merge
+publishes more than one view of the same branch (ga-atsahv, gate rounds ga-aa8n6z and ga-5l2ki8: the scan read the NET diff, the
+fast-forward publishes EVERY commit, so a value pasted in one commit and removed in the next sat in main's history unseen — and the
+message of a merge commit, which has no diff of its own to make anyone look, is published like any other):
 
     git diff -U0 --no-color --no-renames <base>...<head>                      | gate-fastlane-scan.py   # what the tip adds
     git log -p -U0 --no-merges --pretty=medium ... <base>..<head>              | gate-fastlane-scan.py   # what each commit adds
+    git log --merges --no-abbrev --pretty=medium ... <base>..<head>            | gate-fastlane-scan.py   # what each merge commit SAYS
 
-The second is `git log -p` text: a `commit <sha>` line, the Author/Date header, the message (indented four spaces), then that
-commit's diff. The MESSAGES are published too, so they are scanned by the same rules (a run of adjacent message lines is one
-text, like a run of added lines); the Author/Date header is not content and is skipped. A finding in a commit's file or message
-is reported as `<first 9 of the sha>:<path>` / `<sha9>:commit-message`, so the author knows which commit to look at.
+The second and third are `git log` text: a `commit <sha>` line, the header (a merge commit's `Merge: <sha> <sha>` line first, then
+Author/Date), the message (indented four spaces), then that commit's diff, which `git log -p` leaves empty for a merge.
+The MESSAGES are published too, so they are scanned by the same rules (a run of adjacent message lines is one text, like a run of
+added lines); the header is not content and is skipped, but only in the exact shape git writes it. A finding in a commit's file or
+message is reported as `<first 9 of the sha>:<path>` / `<sha9>:commit-message`, so the author knows which commit to look at.
 
 stdout: one finding per line, `LABEL<TAB>path<TAB>line` — NEVER the matched text. The caller writes this into
 bead comments and the dispatcher log; echoing the value would publish the very secret the scan exists to stop.
@@ -134,6 +137,9 @@ def scan_text(text: str, numbers: bool = True):
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?")
 # `git log` (medium): `commit <full sha>` (40 hex, or 64 for sha-256); the caller passes --no-decorate, so nothing follows the sha
 _COMMIT = re.compile(r"commit ([0-9a-f]{40}(?:[0-9a-f]{24})?)")
+# a merge commit's header line, which the caller gets with --no-abbrev (--no-abbrev-commit does not reach it): `Merge:` and two or more full shas, nothing
+# else (one parent is not a merge; an abbreviated sha means the caller did not pin the format, which is a shape this parser was not written for)
+_MERGE = re.compile(r"Merge:(?: [0-9a-f]{40}(?:[0-9a-f]{24})?){2,}")
 # git C-quotes a name that holds a non-ASCII byte (core.quotepath on), a control character, a quote or a backslash
 _GIT_ESCAPES = re.compile(r"(?:\\[0-7]{3})+|\\.")
 # the extended-header lines git prints between `diff --git` and the first hunk; none of them adds content
@@ -197,6 +203,7 @@ def scan_diff(lines):
     commit = None        # first 9 characters of the sha whose section we are in; None for a plain diff (no `commit` line seen)
     pre = ""             # "<commit>:" in a log stream
     mode = "diff"        # "header" (between the `commit` line and its blank line) | "message" | "diff"
+    id_seen = merge_seen = False   # in a commit header: an Author/Date line / the Merge: line has been read (git writes Merge: first, once)
     msg_run = []         # (message line no, text) of the adjacent non-blank message lines seen so far
     msg_no = 0
 
@@ -248,13 +255,20 @@ def scan_diff(lines):
         last_was_body = False
 
         if mode == "header":
-            # `git log --pretty=medium`: `Author: ...` and `Date:   ...` (identity and a timestamp, not pasted content — the
-            # timestamp would trip the number rule on every commit), then ONE blank line, then the message
+            # `git log --pretty=medium`: for a merge commit `Merge: <parent> <parent>...` first, then `Author: ...` and `Date:   ...`
+            # (identity and a timestamp, not pasted content — the timestamp would trip the number rule on every commit), then ONE
+            # blank line, then the message
             if line == "":
                 mode = "message"
                 msg_no = 0
                 continue
             if line.startswith(("Author: ", "Date:   ")):
+                id_seen = True
+                continue
+            if line.startswith("Merge:"):
+                if id_seen or merge_seen or not _MERGE.fullmatch(line):
+                    raise ValueError("a `Merge:` line in a shape `git log --pretty=medium --no-abbrev` does not write — cannot be classified")
+                merge_seen = True
                 continue
             raise ValueError("unrecognized line in a commit header — cannot be classified")
         if mode == "message":
@@ -284,6 +298,7 @@ def scan_diff(lines):
             path = shown = None
             name_seen = set()
             mode = "header"
+            id_seen = merge_seen = False
             continue
         if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
             raise ValueError("binary content in the diff — cannot be scanned")

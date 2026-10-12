@@ -31,10 +31,11 @@
 #
 # WHAT THE MERGE PUBLISHES, NOT WHAT THE TIP LOOKS LIKE (gate round ga-aa8n6z; Mayor re-scope 11/10). The merge is a fast-forward: it puts EVERY
 # commit of base..head into main, so the file classes and the content scan are asked about each of those commits too — their files
-# (gate_fastlane_history), the lines each added and each commit MESSAGE (the history pass of gate_fastlane_scan) — and not only about the net
-# diff of the tip, in which a value pasted in one commit and removed in the next, or a production file added and deleted again, leaves no
-# trace and sits in main's history for good. The net pass stays as well (a number split over lines that two different commits added is one
-# number only there). More commits than GATE_FASTLANE_COMMIT_MAX (30), or a merge commit with changes of its own, go to the normal gate.
+# (gate_fastlane_history), the lines each added and each commit MESSAGE (the history pass of gate_fastlane_scan), and the message of each MERGE
+# commit (its merges pass; gate round ga-5l2ki8: a merge has no diff of its own, so it was the one commit whose words nobody read) — and not only
+# about the net diff of the tip, in which a value pasted in one commit and removed in the next, or a production file added and deleted again,
+# leaves no trace and sits in main's history for good. The net pass stays as well (a number split over lines that two different commits added is
+# one number only there). More commits than GATE_FASTLANE_COMMIT_MAX (30), or a merge commit with changes of its own, go to the normal gate.
 #
 # THE ONE RULE. The fast lane is only ever GRANTED, never a verdict. Every path that is not a clean yes —
 # a code file, a prompt file, a finding, a failing test, an unreadable diff, a git error, a missing scanner, a
@@ -333,10 +334,10 @@ _gate_fastlane_is_finding_list() {
     END { exit ((n > 0 && !bad) ? 0 : 1) }'
 }
 
-# _gate_fastlane_scan_range <git_fn> <net|history> <range> — ONE pass of the content scan: runs git for the range, hands the text to the
+# _gate_fastlane_scan_range <git_fn> <net|history|merges> <range> — ONE pass of the content scan: runs git for the range, hands the text to the
 # scanner, believes the answer only in the shape its exit code promises. Sets GATE_FL_R_RC (0 clean | 1 findings | other = could not
 # scan), GATE_FL_R_OUT (label/path/line lines, no values — or the reason it could not scan) and GATE_FL_R_DIGEST (the fingerprint of
-# the very text handed to the scanner; "" when it could not be read).
+# the very text handed to the scanner; "" when it could not be read, and always "" for `merges`: see below).
 #   net      `git diff -U0 base...head` — what the TIP adds (the diff the classifier and the tests also read)
 #   history  `git log -p -U0 --no-merges base..head` — what EACH COMMIT adds, messages included: this is what the fast-forward PUBLISHES
 #            (gate round ga-aa8n6z: a value pasted in one commit and removed in the next was invisible to the net pass, and sat in
@@ -345,16 +346,38 @@ _gate_fastlane_is_finding_list() {
 #            not name is expected to change only how something is SPELLED (a path prefix, a date format) or to give a shape the
 #            scanner refuses (rc 2, the normal gate); a git that cannot take one of these flags fails (rc 2 as well). Not proven for every
 #            knob git has — the selftest pins the shapes it refuses (§4h'').
+#   merges   `git log --merges --no-abbrev base..head` — what each MERGE commit SAYS (gate round ga-5l2ki8: the history pass lists --no-merges, and
+#            a clean merge — the gate's own "Merge origin/main into <branch>" fallback — has an empty `git show --cc`, so nothing asked for its
+#            message, which the fast-forward publishes like any other). Same pinned format as `history`, plus --no-abbrev: the `Merge: <parent> <parent>`
+#            line is abbreviated (to core.abbrev, 7 by default) even under --no-abbrev-commit, which only reaches the `commit` line, and the scanner
+#            reads that line only in its full-sha shape (an abbreviated one is rc 2, the normal gate — the selftest runs the lib without the flag to
+#            show it). No diff is asked for: git prints none for a merge under `log -p` unless told -m/-c/--cc (checked on 2.54 and on Apple's
+#            2.50, `log.diffMerges` set or not — that key only picks the format of an explicit -m); a git that did would hand the scanner a shape it
+#            refuses (rc 2), never a wrong "clean". A merge that carries content of its own is not
+#            read here at all: gate_fastlane_history sends it to the normal gate. Whether the range HAS a merge is asked of git (`rev-list
+#            --merges --count`), not inferred from the log coming back empty: no merge is a clean "nothing to read" (rc 0), a count git could
+#            not give is "could not scan", and a log that is empty for a range git counted merges in is "nothing was read". Its text is NOT part
+#            of the fingerprint: the fingerprint says "the same change", and a branch that merged main in after the decision (the ga-qukyp
+#            fallback) is the same change; the push-time scan reads the merge messages again instead.
 # `-c core.quotepath=off` on both, like the two `--raw` reads: the classifier and the scanner must spell a file name the same way
 # (gate round ga-aa8n6z, blocking issue 2: with the default, `migração.md` reached the scanner as `migra\303\247\303\243o.md`, whose
 # escapes read as twelve digits — a 'numero-longo' finding that is not in the name).
 _gate_fastlane_scan_range() {
-  local git_fn="$1" kind="$2" range="$3" tmp errf="" diff_rc=0 scan_rc=0 out_s="" err_s=""
+  local git_fn="$1" kind="$2" range="$3" tmp errf="" diff_rc=0 scan_rc=0 out_s="" err_s="" n_merges="" empty_why
   GATE_FL_R_RC=2; GATE_FL_R_OUT=""; GATE_FL_R_DIGEST=""
+  if [ "$kind" = "merges" ]; then
+    n_merges=$("$git_fn" rev-list --merges --count "$range" 2>/dev/null) || n_merges=""
+    case "$n_merges" in
+      ''|*[!0-9]*) GATE_FL_R_OUT="git could not count the merge commits of the range (rev-list --merges --count gave no number)"; return 0 ;;
+    esac
+    if [ "$n_merges" -eq 0 ] 2>/dev/null; then GATE_FL_R_RC=0; return 0; fi
+  fi
   tmp=$(mktemp "${GATE_FS_TMPDIR:-/tmp}/gc-gate-fl-diff-XXXXXX" 2>/dev/null) || { GATE_FL_R_OUT="could not create a temp file for the ${kind} text"; return 0; }
   case "$kind" in
     net)     "$git_fn" -c core.quotepath=off diff -U0 --no-color --no-ext-diff --no-textconv --no-renames "$range" > "$tmp" 2>/dev/null || diff_rc=$? ;;
     history) "$git_fn" -c core.quotepath=off log --no-merges --topo-order --reverse --no-decorate --no-notes --no-show-signature --no-abbrev-commit \
+               --pretty=medium --encoding=UTF-8 -p -U0 --no-color --no-ext-diff --no-textconv --no-renames "$range" > "$tmp" 2>/dev/null || diff_rc=$? ;;
+    merges)  "$git_fn" -c core.quotepath=off log --merges --no-abbrev --topo-order --reverse --no-decorate --no-notes --no-show-signature --no-abbrev-commit \
                --pretty=medium --encoding=UTF-8 -p -U0 --no-color --no-ext-diff --no-textconv --no-renames "$range" > "$tmp" 2>/dev/null || diff_rc=$? ;;
     *)       diff_rc=97 ;;
   esac
@@ -365,10 +388,12 @@ _gate_fastlane_scan_range() {
   fi
   # gate_fastlane_decide gets here only after `diff --raw` listed files, and gate_fastlane_confirm only with a fast decision on record (which listed
   # files); a real `git diff -U0` prints a `diff --git` header for every listed file, and a real `git log -p` prints a `commit` line for every commit it
-  # lists. No text at all means nothing was read — not that there was nothing to flag — so it stays the inert "could not scan" (RC 2, no fingerprint).
+  # lists (and for `merges`, git itself has just counted the merge commits of the range). No text at all means nothing was read — not that there was
+  # nothing to flag — so it stays the inert "could not scan" (RC 2, no fingerprint).
   # The scanner itself still answers empty input with clean: that is its contract as a pure function; the lib knows a file list exists, the scanner does not.
-  [ -s "$tmp" ] || { GATE_FL_R_OUT="git returned no ${kind} text for a range whose file list is not empty — nothing was read"; rm -f "$tmp" 2>/dev/null || true; return 0; }
-  GATE_FL_R_DIGEST=$(_gate_fastlane_digest_file "$git_fn" "$tmp") || GATE_FL_R_DIGEST=""
+  empty_why="a range whose file list is not empty"; [ "$kind" != "merges" ] || empty_why="a range that has merge commits"
+  [ -s "$tmp" ] || { GATE_FL_R_OUT="git returned no ${kind} text for ${empty_why} — nothing was read"; rm -f "$tmp" 2>/dev/null || true; return 0; }
+  if [ "$kind" != "merges" ]; then GATE_FL_R_DIGEST=$(_gate_fastlane_digest_file "$git_fn" "$tmp") || GATE_FL_R_DIGEST=""; fi
   # the scanner's stderr goes to its own file (named so the dispatcher's gc-gate-fl-diff-* reaper sweeps a leak); with no file it is
   # discarded, and the reason below then says "no stderr" — the exit code and the shape check do not depend on it
   errf=$(mktemp "${GATE_FS_TMPDIR:-/tmp}/gc-gate-fl-diff-err-XXXXXX" 2>/dev/null) || errf=""
@@ -393,14 +418,16 @@ _gate_fastlane_scan_range() {
   return 0
 }
 
-# gate_fastlane_scan <git_fn> <base_ref> <head_ref> — runs the content scan over what the merge would put in main, in TWO passes: the
-# NET diff (base...head) and the HISTORY (every non-merge commit of base..head, messages included) — see _gate_fastlane_scan_range for
-# why both. The net pass is not redundant: a number wrapped across two lines that DIFFERENT commits added side by side is one number
-# only in the net diff; the history pass is not redundant either: a value added and removed again never appears in the net diff.
+# gate_fastlane_scan <git_fn> <base_ref> <head_ref> — runs the content scan over what the merge would put in main, in THREE passes: the
+# NET diff (base...head), the HISTORY (every non-merge commit of base..head, messages included) and the MERGE COMMITS' MESSAGES — see
+# _gate_fastlane_scan_range for why each. The net pass is not redundant: a number wrapped across two lines that DIFFERENT commits added side
+# by side is one number only in the net diff; the history pass is not redundant either: a value added and removed again never appears in the
+# net diff; and the merges pass reads what neither of them does: a merge commit's message (it has no diff of its own to make anyone look).
 # Sets GATE_FL_SCAN_RC (0 clean | 1 findings | other = could not scan), GATE_FL_SCAN_OUT (label/path/line, no values) and
-# GATE_FL_DIFF_DIGEST ("<net digest>:<history digest>" — the fingerprint of the very texts that were handed to the scanner; "" when
-# either could not be read). A finding from EITHER pass is rc 1 even when the other pass could not run (the finding is true whatever
-# the other pass would have said; both end in the normal gate, and the tally books a real finding as a finding); clean needs BOTH clean.
+# GATE_FL_DIFF_DIGEST ("<net digest>:<history digest>" — the fingerprint of the texts of the first two passes; "" when either could not be
+# read; the merges pass is deliberately not in it, see _gate_fastlane_scan_range). A finding from ANY pass is rc 1 even when another pass
+# could not run (the finding is true whatever the other pass would have said; both end in the normal gate, and the tally books a real finding
+# as a finding); clean needs ALL passes clean.
 # The net pass runs first, and a finding there ends the scan: the history pass would only report the same line again as `<sha>:<path>`.
 #
 # The scanner's exit code is a contract (0 clean / 1 findings / 2 could not scan), and python breaks it: an uncaught exception
@@ -413,7 +440,7 @@ _gate_fastlane_scan_range() {
 # contract is rc 2 with a reason that says so ("it crashed, it did not find anything"), which decide() books as scan-failed, not
 # scan-findings.
 gate_fastlane_scan() {
-  local git_fn="$1" base="$2" head="$3" net_rc net_out net_dig hist_rc hist_out hist_dig
+  local git_fn="$1" base="$2" head="$3" net_rc net_out net_dig hist_rc hist_out hist_dig mrg_rc mrg_out
   GATE_FL_SCAN_RC=2; GATE_FL_SCAN_OUT=""; GATE_FL_DIFF_DIGEST=""
   if [ ! -r "${GATE_FASTLANE_DIR:-}/gate-fastlane-scan.py" ]; then
     GATE_FL_SCAN_OUT="scanner gate-fastlane-scan.py is missing or unreadable"
@@ -432,12 +459,22 @@ gate_fastlane_scan() {
     GATE_FL_SCAN_RC=1; GATE_FL_SCAN_OUT="$hist_out"
     return 0
   fi
+  _gate_fastlane_scan_range "$git_fn" merges "$base..$head"
+  mrg_rc="$GATE_FL_R_RC"; mrg_out="$GATE_FL_R_OUT"
+  if [ "$mrg_rc" = "1" ]; then
+    GATE_FL_SCAN_RC=1; GATE_FL_SCAN_OUT="$mrg_out"
+    return 0
+  fi
   if [ "$net_rc" != "0" ]; then
     GATE_FL_SCAN_OUT="net diff: ${net_out}"
     return 0
   fi
   if [ "$hist_rc" != "0" ]; then
     GATE_FL_SCAN_OUT="commit history: ${hist_out}"
+    return 0
+  fi
+  if [ "$mrg_rc" != "0" ]; then
+    GATE_FL_SCAN_OUT="merge commit messages: ${mrg_out}"
     return 0
   fi
   GATE_FL_SCAN_RC=0
@@ -598,8 +635,9 @@ EOF
 # Three states, the last one inert: no commit listed, a git error, more commits than GATE_FASTLANE_COMMIT_MAX (a branch that long is a
 # job for a reviewer), a merge commit that carries changes of its own (a conflict resolution is content nobody scanned), a record this
 # lane cannot classify — all `unreadable`, and all end in the normal gate. A MERGE commit with nothing of its own (`git show --cc`
-# prints nothing: the gate's own "Merge origin/main into <branch>" fallback is exactly this) adds no content; what its parents brought
-# is in the commits listed here, or already in main.
+# prints nothing: the gate's own "Merge origin/main into <branch>" fallback is exactly this) adds no FILE content; what its parents brought
+# is in the commits listed here, or already in main. Its MESSAGE is another matter and not asked here: it is published all the same, and
+# gate_fastlane_scan's merges pass reads it.
 gate_fastlane_history() {
   local git_fn="$1" base="$2" head="$3" max ids id n=0 merges m cc raw raw_rc=0
   GATE_FL_HIST_STATE="unreadable"; GATE_FL_HIST_WHY="not evaluated"; GATE_FL_HIST_N=0; GATE_FL_HIST_BLOCKERS=""
@@ -749,7 +787,7 @@ gate_fastlane_decide() {
     _gate_fastlane_normal "unclassifiable" "could not render the list of files that decided the lane — a grant that cannot name its files is not a grant, normal gate"
     return 0
   fi
-  GATE_LANE_REASON="every file is DOC or TEST (${GATE_LANE_COUNTS}), in all ${GATE_FL_HIST_N} commit(s) the push publishes too; content scan of the tip, of each commit and of the messages clean; ${GATE_FL_TEST_OUT} — merged without an LLM reviewer"
+  GATE_LANE_REASON="every file is DOC or TEST (${GATE_LANE_COUNTS}), in all ${GATE_FL_HIST_N} commit(s) the push publishes too; content scan of the tip, of each commit and of every commit message (merge commits' included) clean; ${GATE_FL_TEST_OUT} — merged without an LLM reviewer"
   GATE_LANE_REASON_CODE="fast"
   GATE_LANE_DIGEST="$GATE_FL_DIFF_DIGEST"
   GATE_LANE="fast"
@@ -788,8 +826,13 @@ _gate_fastlane_is_off() {
 
 # _gate_fastlane_revoke <code> <why> — the inert outcome of a failed confirmation: the lane is "normal" afterwards and no
 # fingerprint is left behind for a later call to trust. Always returns 0 (the caller returns 1).
+# What described the GRANT is cleared with it — the reason text, the file list and the counts ("every file is DOC or TEST…" beside lane=normal
+# is a contradiction a reader can act on); the failure is in GATE_LANE_CONFIRM_CODE/WHY. GATE_LANE_REASON_CODE is left to the caller: the
+# vocabulary of reason codes belongs to the record and the tally, and the dispatcher (which records the revocation as a NORMAL decision)
+# sets it, with the reason text, when it books this outcome.
 _gate_fastlane_revoke() {
   GATE_LANE="normal"; GATE_LANE_DIGEST=""
+  GATE_LANE_REASON=""; GATE_LANE_FILES=""; GATE_LANE_COUNTS=""
   GATE_LANE_CONFIRM_CODE="$1"
   GATE_LANE_CONFIRM_WHY="$2"
   return 0
