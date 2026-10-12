@@ -283,14 +283,23 @@ are visibly mid-turn, and past that it is thrown away and reviewed again from ze
 else — your work is lost. Plan to deliver with margin: when about 8 minutes remain, stop
 starting test runs, deliver the verdict you can defend from what you verified, and say in the
 Summary which checks you did not get to run (that is honest coverage, not a FAIL).
-RUNNING TESTS: a foreground shell command is capped at 600 s, so never wrap a suite in a
-timeout you expect it to hit — a run killed by your own cap while it was passing is a run
-paid for nothing. Long runs: start them in the background (run_in_background or nohup),
-poll, and split per file; never restart a run your own cap killed; never run the whole
-tests/ directory. A test that is already red on the reviewed base for the SAME test id is
-pre-existing: report it as non-blocking — a failing test blocks only when this diff made it
-fail. Mutation and reproduction probes you write yourself are not covered by any of this:
-run them, they are the best defence the gate has.${_GATE_TW}
+RUNNING TESTS: this machine is shared with the whole city and the gate queue waits on every
+review, so test execution has a ceiling: everything you run in this review, test files and
+probes together, adds up to about 3 minutes of execution. Spend it where it can change the
+verdict. Run only the test files this diff changed and the tests it adds, one file at a time,
+and skip suites for code the diff does not touch. Write a mutation or reproduction probe only
+when reading the code leaves a suspected defect undecided: a probe that confirms what you
+already read costs minutes and adds no information. The ceiling limits execution, never
+scrutiny: read every changed line as closely as before, and a defect you can ground in the
+changed lines blocks exactly as it did. When the ceiling is reached with a check still open,
+stop and deliver the verdict you can defend, with every check left open named as not run in
+the Summary (honest coverage, not a FAIL).
+A foreground shell command is capped at 600 s, so do not wrap a test in a timeout you expect
+it to hit: a run killed by your own cap while it was passing is a run paid for nothing. Start
+anything longer in the background (run_in_background or nohup) and poll it; do not restart a
+run your own cap killed, and do not run the whole tests/ directory. A test that is already
+red on the reviewed base for the SAME test id is pre-existing: report it as non-blocking; a
+failing test blocks only when this diff made it fail.${_GATE_TW}
 TASK
 }
 
