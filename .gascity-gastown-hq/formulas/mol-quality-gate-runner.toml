@@ -592,6 +592,62 @@ else
 fi
 ```
 
+**2c. Doc-rules lint (ga-vhzdh5.1, Athos 11/10):**
+
+Two rules for the docs this town writes, enforced here so they stop depending
+on anyone remembering them: (a) `CLAUDE.md` / `CLAUDE.local.md` / `AGENTS.md`
+<= 200 effective lines, summing `@imports`; (b) every `.md` over 300 chars
+carries a `## Contents` section BEFORE its first other `##`, listing every
+`##` title of the doc. `scripts/doc-rules-lint.py --diff` evaluates ONLY the
+`.md` files this branch changed (a legacy doc the branch does not touch never
+fails the gate -- the backfill is another slice), skips what is not ours
+(vendor, node_modules, worktrees, the beads mirror, files that exist in
+upstream/main), and exits 0 pass / 1 violations / 2 could-not-evaluate. Like
+2b it folds into the same `TEST_EXIT`/`TEST_OUTPUT` hard-gate signal and is
+independent of `RIG_TEST_CMD` (a rig with no test command still gets it).
+Unknown is not pass: no merge base, or exit 2 from the script, fails the gate.
+Kill switch / negative control: `DOC_RULES_LINT=off` or the flag file
+`$GC_CITY_PATH/.gc/doc-rules-lint.off` makes the script a loud no-op.
+
+```bash
+# SELFTEST-EXTRACT doc-rules-lint-step2c: BEGIN
+DOC_LINT="$GC_CITY_PATH/scripts/doc-rules-lint.py"
+if [ -f "$DOC_LINT" ]; then
+  # vazio → sem merge-base (nem origin/main) = falha dura abaixo, nunca "sem diff"; falhou/ilegível → idem (TEST_EXIT=2)
+  DOC_LINT_BASE=$(git -C "$WORKTREE_PATH" merge-base HEAD origin/main 2>/dev/null || git -C "$WORKTREE_PATH" rev-parse origin/main 2>/dev/null || true)
+  if [ -z "$DOC_LINT_BASE" ]; then
+    TEST_EXIT=2
+    TEST_OUTPUT="$TEST_OUTPUT
+
+DOC-RULES LINT COULD NOT RUN (ga-vhzdh5.1): no merge base against origin/main
+in $WORKTREE_PATH. Unknown is not pass -- fix the worktree's origin/main ref
+and re-run /gate-done."
+    echo "$TEST_OUTPUT" | tail -4
+  else
+    # vazio → script sai 0 e diz "0 violation(s)"; falhou/ilegível → exit 2 (não avaliou) e cai no ramo de falha abaixo
+    DOC_LINT_OUTPUT=$(python3 "$DOC_LINT" --check --root "$WORKTREE_PATH" --diff "${DOC_LINT_BASE}...HEAD" 2>&1)
+    DOC_LINT_EXIT=$?
+    echo "$DOC_LINT_OUTPUT"
+    if [ "$DOC_LINT_EXIT" -ne 0 ]; then
+      TEST_EXIT=$DOC_LINT_EXIT
+      TEST_OUTPUT="$TEST_OUTPUT
+
+DOC-RULES LINT FAILED (ga-vhzdh5.1, exit $DOC_LINT_EXIT: 1 = violations, 2 = could
+not evaluate): a .md file changed by this branch breaks the doc rules --
+CLAUDE.md/AGENTS.md <= 200 lines incl. @imports; every .md > 300 chars needs a
+'## Contents' before its first other '##' listing all of them. Apply the
+hint below (python3 $DOC_LINT --fix-contents <file>), commit, re-run /gate-done.
+$DOC_LINT_OUTPUT"
+    fi
+  fi
+else
+  # Fail-soft, same convention as 2b: a city snapshot that predates this
+  # script's own merge must not block on a check that cannot run yet.
+  echo "NOTE: doc-rules-lint.py not found at $DOC_LINT -- skipping (pre-ga-vhzdh5.1 city snapshot?)."
+fi
+# SELFTEST-EXTRACT doc-rules-lint-step2c: END
+```
+
 **3. Handle test failure:**
 
 If `TEST_EXIT != 0`:
