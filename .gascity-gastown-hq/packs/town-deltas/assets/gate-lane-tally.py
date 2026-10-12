@@ -25,6 +25,15 @@ settled question to a bead that no longer existed. --weekly appends one line to 
 notify line, and only if the window held at least one decision OR a signal that something happened without
 one (unreadable log lines, fast runs that completed with no gate_lane event, revoked lanes — see SIGNALS).
 
+What counts as an UNREADABLE line (the number that says the tally may be under-counting): a line that claims to be
+ours — it opens with {"ts" (compact or spaced) or names gate_lane / dispatcher_complete — and cannot be read, AND sits
+inside the window. "Inside the window" is the line's own ts when it has a readable one, otherwise its place in the
+append-only log (the ts of the last dated line before it). A line that is not ours and carries no ts — a lone "{" or
+"}", a key line of a pretty-printed object, a line of prose — cannot be placed by a ts and is not damage of ours: it is
+counted apart as undatable_lines, shown as information, and is never a signal. The live log opens with 20 such lines
+(two pretty-printed guard events from before the producers wrote one object per line); counting them as damage made
+the weekly cry wolf on every run, forever, and left the damage counter unable to tell 20 from 21.
+
 A window with zero decisions has two meanings and they must not read alike: nothing happened (quiet, no
 history line, no notify) or something happened that the decisions cannot show — every gate_lane line truncated
 by a disk-full append, or the producer stopped while fast runs kept merging. The second is reported loudly.
@@ -37,6 +46,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -78,6 +88,13 @@ def _ts(s):
     return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
 
 
+# A line's own, complete timestamp: the first key of every producer here, compact ({"ts":"…") or spaced ({"ts": "…").
+_HEAD = re.compile(r'^\{\s*"ts"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)"')
+# A line that claims to be one of our records even when its ts cannot be read (cut inside the ts, or garbage there).
+_CLAIMS_OURS = re.compile(r'^\{\s*"ts"')
+_OUR_EVENTS = ('"gate_lane"', '"dispatcher_complete"')
+
+
 # Counters that say something happened (or went wrong) even when the window holds no lane decision. A tally with zero
 # decisions and all of these zero is an empty week; with any of them non-zero it is not, and must not read as one.
 SIGNALS = ("unreadable_lines", "fast_runs_completed", "lane_revoked_at_push")
@@ -98,23 +115,35 @@ def tally(log_path, days, now):
     decisions = {}       # marker -> [(ts, gate_lane event)] in time order; the LAST one is the marker's current lane
     completes = []       # (ts, dispatcher_complete event) with lane == fast
     revoked = 0          # gate_lane events whose reason_code is revoked-at-push (per event, see the docstring)
-    bad = 0
+    bad = 0              # lines that claim to be ours, cannot be read, and sit in the window: the tally may be under-counting
+    undatable = 0        # lines in the window that are not ours and carry no ts of their own: information, never damage
+    cursor_s = None      # ts of the last line that had a readable one — the log is append-only, so position is time
     with open(log_path, errors="replace") as fh:   # OSError propagates: unreadable != empty
         for line in fh:
-            # cheap pre-filter: the ts is the first key; skip old lines without parsing them
-            if line.startswith('{"ts":"') and line[7:27] < since_s:
-                continue
-            if '"gate_lane"' not in line and '"dispatcher_complete"' not in line:
-                # not one of ours — but a line that is not even shaped like a JSON object is damage, not noise
+            m = _HEAD.match(line)
+            if m:
+                cursor_s = m.group(1)
+                if cursor_s < since_s:   # old: out of the window whatever else is wrong with it (the ts is complete, so the string compare is exact)
+                    continue
+            else:
                 s = line.strip()
-                if s and not (s.startswith("{") and s.endswith("}")):
-                    bad += 1
+                if not s:
+                    continue
+                if cursor_s is None:
+                    undatable += 1   # before any dated line: it cannot be placed at all — say so, do not drop it silently
+                    continue
+                if cursor_s < since_s:
+                    continue   # no ts of its own, and it sits in a stretch before the window: out of the window
+                if _CLAIMS_OURS.match(s) or any(n in line for n in _OUR_EVENTS):
+                    bad += 1   # ours, in the window by position, and its ts is unreadable (cut short or garbage): a lost record
+                else:
+                    undatable += 1
                 continue
             try:
                 ev = json.loads(line)
                 t = _ts(ev["ts"])
             except Exception:
-                bad += 1
+                bad += 1   # it has the head of one of our records and in the window, but does not parse: cut short, or interleaved
                 continue
             if t < since:
                 continue
@@ -174,14 +203,16 @@ def tally(log_path, days, now):
         "fast_runs_completed": len(completes), "fast_pass": passed, "fast_fail": failed,
         "reviewer_runs_saved": saved, "saved_unmatched_assumed_1": unmatched,
         "doc_test_only_bounced_by_check": bounced, "normal_reasons": buckets, "lane_revoked_at_push": revoked,
-        "unreadable_lines": bad,
+        "unreadable_lines": bad, "undatable_lines": undatable,
     }
 
 
 def render(r):
     head = f"Gate fast-lane — últimos {r['days']} dias (desde {r['since']}):"
+    info = (f"  {r['undatable_lines']} linha(s) sem timestamp na janela foram ignoradas (não são registro da fast-lane; "
+            "não contam como dano)") if r["undatable_lines"] else None
     if r["decisions"] == 0 and not _signals(r):
-        return f"{head} nenhuma decisão de lane registrada na janela."
+        return f"{head} nenhuma decisão de lane registrada na janela." + (f"\n{info}" if info else "")
     out = [head]
     if r["decisions"] == 0:
         # no decision could be read, yet the log says something happened: this is NOT an empty week
@@ -210,6 +241,8 @@ def render(r):
             out.append(f"    {n:>4}  {name}")
     if r["unreadable_lines"]:
         out.append(f"  ATENÇÃO: {r['unreadable_lines']} linha(s) do log ilegíveis foram puladas — os números desta apuração podem estar subcontados.")
+    if info:
+        out.append(info)
     return "\n".join(out)
 
 

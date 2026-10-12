@@ -59,7 +59,8 @@ chk "fast FAIL (the safety signal: a fast-lane run that did not merge)" "['fast_
 chk "reviewer runs saved = Σ would_have_reviewers of the runs that PASSED (m-f1: 2) + 1 assumed for the unmatched PASS — the FAIL run (m-r) saved nothing" "['reviewer_runs_saved']" 3
 chk "the unmatched fast run is flagged, not hidden"                  "['saved_unmatched_assumed_1']" 1
 chk "doc/test-only diffs bounced by a mechanical check (test fail + no-runner)" "['doc_test_only_bounced_by_check']" 2
-chk "unreadable lines are counted, not silently dropped"             "['unreadable_lines']" 2
+chk "a gate_lane line whose ts is garbage is damage: counted, not silently dropped" "['unreadable_lines']" 1
+chk "a stray line of prose inside the window is reported as undatable, not as damage of ours" "['undatable_lines']" 1
 chk "reason bucket: code/prompt — keyed on the CODE the lib emits"   "['normal_reasons']['tem arquivo de código ou prompt/doutrina']" 2
 chk "reason bucket: a code nobody listed lands in 'outro', loudly"   "['normal_reasons']['outro (reason_code desconhecido)']" 1
 chk "reason bucket: an event with no reason_code is its own bucket"  "['normal_reasons']['sem reason_code no evento']" 1
@@ -68,7 +69,7 @@ chk "no code/prompt diff is reported as touching the gate's own policy" "['norma
 
 TXT=$(python3 "$TALLY" --log "$L" --now "$NOW")
 case "$TXT" in *"fast-lane 2 (22%)"*) ok "text report shows the share (2 of 9 = 22%)" ;; *) bad "text report: $TXT" ;; esac
-case "$TXT" in *"ATENÇÃO: 2 linha(s)"*) ok "text report warns about skipped lines" ;; *) bad "no warning about skipped lines: $TXT" ;; esac
+case "$TXT" in *"ATENÇÃO: 1 linha(s)"*) ok "text report warns about skipped lines" ;; *) bad "no warning about skipped lines: $TXT" ;; esac
 case "$TXT" in *"contados como 1 revisor"*) ok "text report discloses the assumption for the unmatched run" ;; *) bad "assumption not disclosed" ;; esac
 
 # a lane that was GRANTED and then REVOKED at the push (gate round 2, blocking issue 2) — and the two crediting rules
@@ -154,7 +155,7 @@ PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$L" --now "$NO
 [ "$rc" = "0" ] && [ "$(wc -l < "$OUT" | tr -d ' ')" = "1" ] && ok "--weekly appends exactly one history line" || bad "--weekly history: rc=$rc lines=$(wc -l < "$OUT" 2>/dev/null)"
 [ "$(wc -l < "$NL" | tr -d ' ')" = "1" ] && grep -q -- '-k info' "$NL" && ! grep -q 'gate-lane-weekly' "$NL" && grep -q '2/9 diffs na fast-lane, 3 rodada' "$NL" && ok "--weekly sends ONE notify line with the headline numbers, kind 'info' (a kind outside notify's catalog warns every week)" || bad "notify: $(cat "$NL")"
 # the notify line is the only thing a human reads (the text report goes to the order's log): what the report warns about must be in it
-grep -q 'ATENÇÃO 2 linha(s) do log ilegíveis' "$NL" && grep -q '1 run(s) fast sem decisão pareada contado(s) como 1 revisor' "$NL" && ok "…and that line carries the unreadable-lines warning and the assumed-reviewer disclosure, not only the headline" || bad "notify line hides the report's warnings: $(cat "$NL")"
+grep -q 'ATENÇÃO 1 linha(s) do log ilegíveis' "$NL" && grep -q '1 run(s) fast sem decisão pareada contado(s) como 1 revisor' "$NL" && ok "…and that line carries the unreadable-lines warning and the assumed-reviewer disclosure, not only the headline" || bad "notify line hides the report's warnings: $(cat "$NL")"
 : > "$NL"; rm -f "$OUT"
 PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$T/empty.jsonl" --now "$NOW" --weekly --out "$OUT" >/dev/null
 [ ! -s "$NL" ] && [ ! -e "$OUT" ] && ok "--weekly on an empty window: no notify, no history line (no noise)" || bad "empty window still wrote/notified"
@@ -172,6 +173,101 @@ done
 : > "$NL"; rm -f "$T/hs-q.jsonl"
 PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$LQ" --now "$NOW" --weekly --out "$T/hs-q.jsonl" >/dev/null
 [ ! -s "$NL" ] && [ ! -e "$T/hs-q.jsonl" ] && ok "--weekly on the quiet window (no decision, no signal): no notify, no history line" || bad "quiet window cried wolf: $(cat "$NL" 2>/dev/null)"
+# A line the tally cannot DATE is not damage (gate round 2 of slice 3). The live log opens with two pretty-printed objects
+# (a lone "{", one key per line, a lone "}") from before the producers wrote one compact object per line: 20 permanent
+# lines that carry no ts of their own, so no window can exclude them by it. They were counted as "unreadable" in EVERY
+# window, so the weekly reported damage on every run, forever, and the one number built to flag real damage (20 -> 21)
+# carried no information. This head is copied VERBATIM from .gc/quality-gate.jsonl (lines 1-24), not made up to fit the
+# code: the tests above build their damage by hand, which is how the bug passed them.
+LH="$T/qg-real-head.jsonl"
+cat > "$LH" <<'EOF'
+{"ts": "2026-06-04T15:52:36Z", "event": "guard_dispatched", "branch": "hotfix-sync-codigo", "bead": "ga-5nx", "rig": "property_scrapers", "marker": "ga-wisp-si89i", "gate_run": "ga-wisp-6sl6a", "target": "gastown.mayor"}
+{"ts": "2026-06-04T15:56:43Z", "event": "guard_dispatched", "branch": "hotfix-sync-codigo", "bead": "ga-5nx", "rig": "property_scrapers", "marker": "ga-wisp-si89i", "gate_run": "ga-wisp-um91c", "target": "gastown.mayor"}
+{"ts": "2026-06-04T16:03:07Z", "event": "guard_dispatched", "branch": "hotfix-sync-codigo", "bead": "ga-5nx", "rig": "property_scrapers", "marker": "ga-wisp-si89i", "gate_run": "ga-wisp-9nylm", "target": "gastown.mayor"}
+{"ts": "2026-06-04T16:12:24Z", "branch": "hotfix-sync-codigo", "bead": "ga-5nx", "rig": "property_scrapers", "tier": "CODE", "result": "PASS", "reason": "quorum_3_of_3_independent_reviewers", "gate_run": "manual-mayor-dispatch", "elapsed_s": 0, "merge_sha": "74be8502f50d22a1a2ae7fc2aa79e9193fafedca"}
+{
+  "ts": "2026-06-04T16:47:28Z",
+  "event": "guard_dispatched",
+  "branch": "hotfix-sync-codigo",
+  "bead": "ga-zal",
+  "rig": "unknown",
+  "marker": "ga-wisp-nno3z",
+  "gate_run": "ga-wisp-tcuz4",
+  "target": "gastown.mayor"
+}
+{
+  "ts": "2026-06-04T16:49:33Z",
+  "event": "guard_dispatched",
+  "branch": "hotfix-sync-codigo",
+  "bead": "ga-zal",
+  "rig": "property_scrapers",
+  "marker": "ga-wisp-8hsts",
+  "gate_run": "ga-wisp-5h3oq",
+  "target": "gastown.mayor"
+}
+EOF
+jget() { python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(str(d[k]) for k in sys.argv[1:]))" "$@"; }
+# (a) the weekly's real situation: the head is months old, the window is this week
+HNOW="2026-10-12T09:00:00Z"
+JH=$(python3 "$TALLY" --log "$LH" --now "$HNOW" --days 7 --json)
+[ "$(printf '%s' "$JH" | jget decisions unreadable_lines undatable_lines)" = "0 0 0" ] && ok "real log head, this week's window: 0 decisions, 0 unreadable, 0 undatable (the 20 lines sit in an old stretch of the append-only log)" || bad "real log head, this week: $JH"
+TH=$(python3 "$TALLY" --log "$LH" --now "$HNOW" --days 7)
+case "$TH" in *"$QUIET"*) ok "real log head, this week: the report is the quiet one" ;; *) bad "real log head woke the report: $TH" ;; esac
+case "$TH" in *ATENÇÃO*|*ilegíveis*) bad "real log head, this week: the report warns about damage that is not there: $TH" ;; *) ok "real log head, this week: no damage warning" ;; esac
+: > "$NL"; rm -f "$T/hs-h.jsonl"
+PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$LH" --now "$HNOW" --weekly --days 7 --out "$T/hs-h.jsonl" >/dev/null
+[ ! -s "$NL" ] && [ ! -e "$T/hs-h.jsonl" ] && ok "real log head, --weekly --days 7 (the order's exact flags): a quiet week sends nothing and writes nothing" || bad "real log head: the weekly cried wolf: $(cat "$NL" 2>/dev/null)"
+# (b) a window that CONTAINS the head: the fragments are still not damage — they are reported, as information
+JH2=$(python3 "$TALLY" --log "$LH" --now "2026-06-05T00:00:00Z" --days 7 --json)
+[ "$(printf '%s' "$JH2" | jget decisions unreadable_lines undatable_lines)" = "0 0 20" ] && ok "real log head, a window that contains it: 0 unreadable, the 20 fragment lines reported as undatable" || bad "real log head, window containing it: $JH2"
+TH2=$(python3 "$TALLY" --log "$LH" --now "2026-06-05T00:00:00Z" --days 7)
+case "$TH2" in *"$QUIET"*"20 linha(s) sem timestamp"*) ok "…and the report says so on a line of its own, still the quiet one" ;; *) bad "the undatable lines are not disclosed, or woke the report: $TH2" ;; esac
+case "$TH2" in *ATENÇÃO*) bad "undatable lines raised a damage warning: $TH2" ;; *) ok "…without a damage warning" ;; esac
+: > "$NL"; rm -f "$T/hs-h2.jsonl"
+PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$LH" --now "2026-06-05T00:00:00Z" --weekly --days 7 --out "$T/hs-h2.jsonl" >/dev/null
+[ ! -s "$NL" ] && [ ! -e "$T/hs-h2.jsonl" ] && ok "…and --weekly over that window still sends nothing: undatable lines are not a signal" || bad "undatable lines triggered the weekly: $(cat "$NL" 2>/dev/null)"
+# (c) real damage AFTER that head is still caught — the fix must not blind the counter it exists to protect
+LHD="$T/qg-real-head-then-damage.jsonl"
+{ cat "$LH"; printf '%s\n' '{"ts":"2026-10-11T09:00:00Z","event":"gate_li'; } > "$LHD"
+JHD=$(python3 "$TALLY" --log "$LHD" --now "$HNOW" --days 7 --json)
+[ "$(printf '%s' "$JHD" | jget decisions unreadable_lines undatable_lines)" = "0 1 0" ] && ok "real log head + one truncated line from this week: exactly 1 unreadable (the 20 old fragments add nothing)" || bad "head + damage: $JHD"
+THD=$(python3 "$TALLY" --log "$LHD" --now "$HNOW" --days 7)
+case "$THD" in *"$QUIET"*) bad "head + damage reads as a quiet week: $THD" ;; *"ATENÇÃO: 1 linha(s) do log ilegíveis"*) ok "head + damage: the report is not quiet and counts the 1 line" ;; *) bad "head + damage: unreadable-lines warning missing: $THD" ;; esac
+
+# What IS damage, and what is not — one log, every shape (window opens 2026-10-01T12:00:00Z):
+#   damage   = a line that claims to be ours (starts {"ts" — compact or spaced — or names gate_lane/dispatcher_complete) and cannot be
+#              read, AND sits in the window: by its own ts when it has one, otherwise by its place in the append-only log
+#   noise    = anything else the tally cannot date (a lone "{", a key line, prose): reported as undatable, never as damage
+#   old      = either of the above in a stretch before the window: ignored
+LD="$T/qg-shapes.jsonl"
+cat > "$LD" <<'EOF'
+{"ts":"2026-09-01T00:00:00Z","event":"something_else","x":1}
+{"ts":"2026-09-01T00:00:01Z","event":"gate_lane","lane":"fast","marker":"m-old","reaso
+  "event": "gate_lane",
+{"ts":"garbage","event":"gate_lane","lane":"fast","marker":"m-old-badts"}
+prose from some other writer, old
+{"ts":"2026-10-02T09:00:00Z","event":"somethi
+{"ts": "2026-10-03T09:00:00Z", "event": "gate_la
+{"ts":"2026-10-04T09:00:00Z","event":"something_else","x":1}
+{
+  "ts": "2026-10-04T09:30:00Z",
+  "event": "gate_lane",
+  "lane": "fast"
+}
+{"ts":"2026-10-05
+EOF
+JD=$(python3 "$TALLY" --log "$LD" --now "$NOW" --json)
+[ "$(printf '%s' "$JD" | jget decisions unreadable_lines undatable_lines)" = "0 4 4" ] && ok "shapes: 4 damaged lines (truncated compact, truncated spaced, a head-less fragment naming gate_lane, a head cut inside its ts) and 4 undatable noise lines; the old stretch contributes nothing" || bad "shapes: $JD"
+TD=$(python3 "$TALLY" --log "$LD" --now "$NOW")
+case "$TD" in *"$QUIET"*) bad "damage in the window reads as a quiet week: $TD" ;; *"ATENÇÃO: 4 linha(s) do log ilegíveis"*"4 linha(s) sem timestamp"*) ok "shapes: the report counts the 4 damaged lines AND discloses the 4 undatable ones, separately" ;; *) bad "shapes: report: $TD" ;; esac
+# a head-less line BEFORE any dated line cannot be placed in the log at all: it is disclosed as undatable, not dropped and not damage
+LF="$T/qg-first-line-cut.jsonl"
+printf '%s\n' 'ts":"2026-10-02T09:00:00Z","event":"gate_lane","lane":"fast"}' \
+              '{"ts":"2026-10-03T09:00:00Z","event":"something_else","x":1}' > "$LF"
+JF=$(python3 "$TALLY" --log "$LF" --now "$NOW" --json)
+[ "$(printf '%s' "$JF" | jget decisions unreadable_lines undatable_lines)" = "0 0 1" ] && ok "a head-less line before any dated line is reported as undatable (not dropped, not damage)" || bad "first line cut: $JF"
+
+
 # notify absent: history still written, and it SAYS so
 PATH="/usr/bin:/bin" python3 "$TALLY" --log "$L" --now "$NOW" --weekly --out "$T/h2.jsonl" >/dev/null 2>"$T/e2"; rc=$?
 [ "$rc" = "0" ] && [ -s "$T/h2.jsonl" ] && grep -q 'notify. is not on PATH' "$T/e2" && ok "notify missing: tally still recorded, and the gap is reported on stderr" || bad "notify missing: rc=$rc $(cat "$T/e2")"

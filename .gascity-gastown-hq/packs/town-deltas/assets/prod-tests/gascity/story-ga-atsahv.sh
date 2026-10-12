@@ -78,8 +78,15 @@ log "  order visible ✓"
 
 # ── 5. the tally can read the LIVE log (exit 2 would mean 'could not read', never '0 saved') ───────────────
 log "Checking the tally against the live quality-gate.jsonl (read-only)..."
-python3 "$TALLY" --days 7 >/dev/null || fail "gate-lane-tally.py could not read the live log (exit $?)"
-log "  tally reads the live log ✓"
+LIVE_JSON=$(python3 "$TALLY" --days 7 --json) || fail "gate-lane-tally.py could not read the live log (exit $?)"
+# …and what it SAYS about the live log, not only that it exits 0. The live log opens with 20 lines of two pretty-printed
+# objects that no window can exclude by a ts; counted as damage, they made the weekly warn on every run, forever
+# (gate round 2 of ga-atsahv.3). A hand-built fixture never showed it — the real log does.
+LIVE_NUMS=$(printf '%s' "$LIVE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['unreadable_lines'], d['undatable_lines'])") \
+  || fail "could not read the unreadable/undatable counts out of the tally's --json for the live log: $LIVE_JSON"
+LIVE_UNREADABLE=${LIVE_NUMS%% *}; LIVE_UNDATABLE=${LIVE_NUMS##* }
+[ "$LIVE_UNREADABLE" = "0" ] || fail "the tally counts $LIVE_UNREADABLE unreadable line(s) in the last 7 days of the live log — real damage (look at those lines) or a shape of the log the tally misreads; either way the weekly would warn on every run until it is understood"
+log "  tally reads the live log ✓ (unreadable $LIVE_UNREADABLE, undatable $LIVE_UNDATABLE in the last 7 days)"
 
 # ── 6. the selftests, end to end, against the deployed directory ───────────────────────────────────────────
 log "Running gate-fastlane.selftest.sh (classification, scan, real-git decisions, dispatcher blocks, mutation checks)..."
