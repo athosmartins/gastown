@@ -15,15 +15,19 @@
 #
 # O QUE DECIDE ONDE RODA (qualquer motivo para NÃO usar o MBP cai em "rodar aqui", exatamente o comando de hoje):
 #   chave .gc/gate-pytest.off · offload desligado (mbp-run rc 99) · MBP sem saúde (98) · configuração (97) · slots cheios (96) ·
-#   repo que não é wa/ps (ex.: gascity) · alvo que lê shared/data (assinatura no arquivo) ou casa a lista gate-pytest.force-local ·
-#   flag que depende do disco daqui (--junitxml, --basetemp, --lf, --cov-report, --rootdir...) · caminho fora do worktree.
+#   repo que não é wa/ps (ex.: gascity; o repo vem do git-common-dir, nunca do NOME do diretório do worktree) · alvo que lê shared/data
+#   (assinatura em linha de código; arquivo que não dá para ler fica aqui) ou casa a lista gate-pytest.force-local (lista ausente ou
+#   ilegível = nada vai ao MBP, com AVISO: `lista-force-local-ilegivel`) · flag que depende do disco daqui (--junitxml, --basetemp,
+#   --cov-report, --rootdir...) ou do plugin de cache (--lf --ff --nf --sw --cache-clear --cache-show --lfnf...) · caminho fora do worktree.
+#   O comando daqui é `python3 -m pytest <args do revisor>` e nada além (sem -p no:cacheprovider: o plugin de cache tem de existir para as opções acima).
 #
 # EM QUE RESULTADO O REVISOR PODE ACREDITAR: só em verde do MBP. O MBP não tem shared/data, nem .env, nem o python3 do mini, então
 #   um vermelho (ou um teste pulado) lá pode ser do AMBIENTE e não do código — dois estados que o veredito não pode confundir.
-#   • rc 0 e nada pulado  → vale o MBP. É a ÚNICA coisa aceita como veio, e tem um limite: um teste que lê dado por um caminho que o wrapper
+#   • rc 0 e nada pulado  → vale o MBP. É a ÚNICA coisa aceita como veio sem rodar nada aqui, e tem um limite: um teste que lê dado por um caminho que o wrapper
 #       não enxerga (constante numa lib, fixture; só `shared/data` literal no arquivo manda o alvo ficar aqui) pode passar VAZIO no MBP. O wrapper
 #       não tem como saber, então DIZ: a saída traz a linha `nota: verde do MBP aceito...` (fail-open visível); o remédio é a lista force-local.
-#   • rc 0 com testes pulados → os ALVOS que pularam rodam aqui de novo e o rc DAQUI vale (um skip por dado ausente não pode virar "passou").
+#   • rc 0 com testes pulados → os ALVOS que pularam rodam aqui de novo e o rc DAQUI vale (um skip por dado ausente não pode virar "passou"). Se só ALGUNS alvos
+#       pularam, os que NÃO pularam não rodaram aqui: o verde deles foi aceito como veio do MBP, e a mesma nota sai, dizendo `SÓ para os alvos que não pularam`.
 #       De quem é cada skip só se sabe pelo caminho impresso numa linha `SKIPPED [n] caminho:linha:` e ele só vale se for um alvo pedido: skip
 #       vindo de um helper (pytest.skip() dentro de um módulo de apoio sai com o caminho DO HELPER), linha que não leio ou resumo que diz mais
 #       pulados do que as linhas listam → não sei de quem é → TODOS os alvos rodam aqui (`skips-fora-dos-alvos` / `skips-nao-contados`).
@@ -84,13 +88,15 @@ dir=$(cd "$dir_arg" 2>/dev/null && pwd -P) || { say "uso: --dir '${dir_arg}' nã
 # comando roda aqui (o caminho de hoje) — nunca um palpite sobre o que o revisor quis dizer.
 takes_value() {
   case "$1" in
-    -k|-m|-p|-c|-o|-n|-W|-r|--maxfail|--timeout|--rootdir|--tb|--durations|--durations-min|--deselect|--ignore|--ignore-glob|--confcutdir|--import-mode|--basetemp|--junitxml|--junit-xml|--capture|--color|--override-ini|--log-level|--log-file|--log-cli-level|--dist|--tx|--numprocesses|--maxprocesses|--cov|--cov-report|--html|--report-log|--resultlog|--assert|--show-capture|--timeout-method|--max-worker-restart|--randomly-seed|--reruns|--reruns-delay) return 0 ;;
+    -k|-m|-p|-c|-o|-n|-W|-r|--maxfail|--timeout|--rootdir|--tb|--durations|--durations-min|--deselect|--ignore|--ignore-glob|--confcutdir|--import-mode|--basetemp|--junitxml|--junit-xml|--capture|--color|--override-ini|--log-level|--log-file|--log-cli-level|--dist|--tx|--numprocesses|--maxprocesses|--cov|--cov-report|--html|--report-log|--resultlog|--assert|--show-capture|--timeout-method|--max-worker-restart|--randomly-seed|--reruns|--reruns-delay|--lfnf|--last-failed-no-failures) return 0 ;;
   esac
   return 1
 }
 local_only_flag() {   # depende do disco/estado DESTA máquina, ou é interativa
+  # O plugin de cache inteiro (pytest 9.0.3: --lf --ff --nf --sw --sw-skip --sw-reset --cache-clear --cache-show --lfnf e os nomes longos) lê/escreve o .pytest_cache
+  # do worktree DESTA máquina; no MBP o mbp-run.sh roda com o plugin desligado e o pytest recusa essas opções (rc 4).
   case "$1" in
-    --junitxml|--junitxml=*|--junit-xml|--junit-xml=*|--basetemp|--basetemp=*|--resultlog|--resultlog=*|--html|--html=*|--report-log|--report-log=*|--cov-report|--cov-report=*|--log-file|--log-file=*|--rootdir|--rootdir=*|-c|--confcutdir|--confcutdir=*|--pyargs|--lf|--last-failed|--ff|--failed-first|--nf|--new-first|--sw|--stepwise|--cache-clear|--cache-show|--pdb|--trace|--pastebin|--pastebin=*) return 0 ;;
+    --junitxml|--junitxml=*|--junit-xml|--junit-xml=*|--basetemp|--basetemp=*|--resultlog|--resultlog=*|--html|--html=*|--report-log|--report-log=*|--cov-report|--cov-report=*|--log-file|--log-file=*|--rootdir|--rootdir=*|-c|--confcutdir|--confcutdir=*|--pyargs|--lf|--last-failed|--ff|--failed-first|--nf|--new-first|--sw|--stepwise|--sw-skip|--stepwise-skip|--sw-reset|--stepwise-reset|--cache-clear|--cache-show|--cache-show=*|--lfnf|--lfnf=*|--last-failed-no-failures|--last-failed-no-failures=*|--pdb|--trace|--pastebin|--pastebin=*) return 0 ;;
   esac
   return 1
 }
@@ -146,9 +152,10 @@ done
 
 # ---- repo: o MBP só tem espelho de wa e ps ----------------------------------------------------------------------------
 if [ -z "$repo" ]; then
-  # vazio / falhou (git não responde, o dir não é um repo) → repo desconhecido → cai em "repo-sem-espelho-no-mbp" e roda aqui.
+  # vazio / falhou (git não responde, o dir não é um repo) → repo desconhecido → cai em "repo-sem-espelho-no-mbp" e roda aqui. Só o caminho do REPO (git-common-dir)
+  # conta, nunca o nome do diretório do worktree: um worktree do gascity cujo caminho cita whatsapp_automation iria por rsync para o espelho do WA.
   gc_dir=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-  case "$gc_dir$dir" in
+  case "$gc_dir" in
     *whatsapp_automation*) repo=wa ;;
     *property_scrapers*|*property-scrapers*) repo=ps ;;
   esac
@@ -161,28 +168,47 @@ case "$repo" in wa|ps) ;; *) [ -n "$LOCAL_REASON" ] || LOCAL_REASON="repo-sem-es
 # Decidido ALVO a ALVO: um arquivo que fica aqui não arrasta os outros (reviewers rodam 3-5 arquivos de uma vez, e ~7% dos arquivos
 # de teste do WA citam shared/data — mandar tudo para cá por causa de um jogaria fora o ganho em ~1 de cada 4 execuções).
 mbp_targets=(); local_targets=(); LOCAL_NOTES=""; SPLIT=0
+
+# reads_shared_data <arquivo>: 0 = cita shared/data em linha de CÓDIGO · 1 = não cita · 2 = não consegui saber (o chamador deixa o alvo AQUI).
+# Sem pipe de propósito: `grep -v ... | grep -q` sob `set -o pipefail` morre de SIGPIPE — o `grep -q` sai no 1º acerto enquanto o `grep -v` ainda escreve, o
+# pipeline devolve 141, o `if` dá falso e "não consegui saber" lia-se como "não cita" (medido: arquivo > 64 KB com a assinatura na linha 1, 0 de 40 achados no
+# macOS; 17% dos testes do WA que citam shared/data só eram achados às vezes). Aqui o grep termina sozinho e o rc dele diz o que houve: 0/1 = leu (1 = nenhuma linha
+# de código sobrou), >= 2 = erro. O -a lê como texto: com um byte NUL o grep do macOS responde "Binary file matches" no lugar das linhas (medido).
+# Linha de COMENTÁRIO não conta: medido no WA, um arquivo que só CITA shared/data num comentário passa em 1,2 s no MBP e levava ~20 s aqui.
+reads_shared_data() {
+  local body rc
+  body=$(grep -a -v -E '^[[:space:]]*#' "$1" 2>/dev/null); rc=$?
+  [ $rc -le 1 ] || return 2
+  case "$body" in *shared/data*) return 0 ;; esac
+  return 1
+}
+
+# A lista force-local é O remédio do verde vazio (runbook): ausente, ilegível ou diretório NÃO é "lista vazia". Sem ela não dá para saber o que deveria ficar aqui,
+# então nada vai ao MBP (o inerte) e a falta é DITA. Uma lista que abre e não tem linhas é válida: nenhum glob casa.
+FORCE_LIST_OK=0; { [ -f "$FORCE_LOCAL_LIST" ] && [ -r "$FORCE_LOCAL_LIST" ]; } && FORCE_LIST_OK=1
+if [ -z "$LOCAL_REASON" ] && [ $FORCE_LIST_OK -eq 0 ]; then
+  LOCAL_REASON="lista-force-local-ilegivel"
+  say "AVISO: não consegui ler a lista force-local ($FORCE_LOCAL_LIST) — sem ela não sei que arquivos têm de ficar aqui, então nada vai ao MBP (rodando tudo aqui, como hoje)"
+fi
 if [ -z "$LOCAL_REASON" ]; then
   for t in "${targets[@]}"; do
     f="${t%%::*}"; why=""
-    # Ler a lista: vazio (arquivo sem linhas) → nenhum glob casa; falhou/ilegível (não abre) → a lista não vale e o alvo segue o
-    #   caminho normal (ela só poupa uma ida e volta; o vermelho/pulado do MBP é conferido aqui de qualquer jeito).
-    #   A lista é o remédio do verde vazio (runbook), então uma lista mal salva não pode virar letra morta em silêncio: a última linha sem
-    #   newline ainda conta (`|| [ -n "$g" ]`), e CRLF ou espaço em volta são aparados antes de comparar.
-    if [ -r "$FORCE_LOCAL_LIST" ]; then
-      while IFS= read -r g || [ -n "$g" ]; do
-        g=${g#"${g%%[![:space:]]*}"}; g=${g%"${g##*[![:space:]]}"}
-        case "$g" in ''|'#'*) continue ;; esac
-        # shellcheck disable=SC2254
-        case "$f" in $g) why="lista-local:$g"; break ;; esac
-      done < "$FORCE_LOCAL_LIST"
-    fi
-    # Ler o arquivo de teste: vazio (sem a assinatura) → não lê shared/data; falhou/ilegível (não abro o arquivo) → fica AQUI
-    #   (o inerte), nunca vai para o MBP no escuro. Linha de COMENTÁRIO não conta: medido no WA, um arquivo que só CITA shared/data
-    #   num comentário passa em 1,2 s no MBP e levava ~20 s aqui. Quem lê dado de verdade pode passar VAZIO no MBP (sem o banco, o
-    #   resultado vazio satisfaz a asserção) — é essa a classe que o MBP não pode julgar sozinho.
+    # Ler a lista: a última linha sem newline ainda conta (`|| [ -n "$g" ]`), e CRLF ou espaço em volta são aparados antes de comparar
+    #   (uma lista mal salva não pode virar letra morta em silêncio).
+    while IFS= read -r g || [ -n "$g" ]; do
+      g=${g#"${g%%[![:space:]]*}"}; g=${g%"${g##*[![:space:]]}"}
+      case "$g" in ''|'#'*) continue ;; esac
+      # shellcheck disable=SC2254
+      case "$f" in $g) why="lista-local:$g"; break ;; esac
+    done < "$FORCE_LOCAL_LIST"
+    # Ler o arquivo de teste: tem/não-tem/não-consegui-saber. Não consegui (não abro o arquivo, ou o grep deu erro) → fica AQUI (o inerte), nunca vai para o MBP
+    #   no escuro. Quem lê dado de verdade pode passar VAZIO no MBP (sem o banco, o resultado vazio satisfaz a asserção) — é essa a classe que o MBP não pode julgar sozinho.
     if [ -z "$why" ]; then
       if [ ! -r "$dir/$f" ]; then why="alvo-ilegivel:$f"
-      elif grep -v -E '^[[:space:]]*#' "$dir/$f" 2>/dev/null | grep -q 'shared/data'; then why="le-shared-data:$f"; fi
+      else
+        reads_shared_data "$dir/$f"; rd=$?
+        case $rd in 0) why="le-shared-data:$f" ;; 1) ;; *) why="alvo-ilegivel:$f" ;; esac
+      fi
     fi
     if [ -n "$why" ]; then local_targets+=("$t"); LOCAL_NOTES="${LOCAL_NOTES}${LOCAL_NOTES:+;}$why"; else mbp_targets+=("$t"); fi
   done
@@ -192,15 +218,18 @@ if [ -z "$LOCAL_REASON" ]; then
 fi
 
 # ---- execução ---------------------------------------------------------------------------------------------------------
-T_START=$(date +%s); MBP_SECS=0; LOCAL_SECS=0; RAN=local; RC=0; DETAIL=""; GREEN_MBP=0
+T_START=$(date +%s); MBP_SECS=0; LOCAL_SECS=0; RAN=local; RC=0; DETAIL=""; GREEN_MBP=0; GREEN_PARTIAL=0
 # sem arquivo temporário não dá para ler a saída do MBP (vermelho/pulado): então não vai ao MBP — roda aqui, como hoje.
 OUT=$(mktemp "${TMPDIR:-/tmp}/gate-pytest.XXXXXX") || { OUT=""; [ -n "$LOCAL_REASON" ] || LOCAL_REASON="mktemp-falhou"; }
 trap '[ -n "$OUT" ] && rm -f "$OUT"' EXIT
 
 run_local() {   # <args do pytest...>: roda como o revisor rodava, no worktree dele, com o python3 dele
+  # EXATAMENTE `python3 -m pytest <args>`, sem opção minha: o `-p no:cacheprovider` que o mbp-run.sh põe no MBP NÃO vem para cá. Com o plugin de cache desligado o pytest
+  # recusa --lf/--ff/--nf/--sw/--cache-clear... (rc 4, "unrecognized arguments", medido no 9.0.3) e quebra quem usa `config.cache` — e essas opções
+  # rodam AQUI justamente por dependerem do cache daqui. O que roda aqui tem de ser o comando de hoje, nada além.
   local t0 rc
   t0=$(date +%s)
-  ( cd "$dir" && exec "$PY" -m pytest -p no:cacheprovider "$@" )
+  ( cd "$dir" && exec "$PY" -m pytest "$@" )
   rc=$?
   LOCAL_SECS=$(( LOCAL_SECS + $(date +%s) - t0 ))
   return $rc
@@ -284,6 +313,9 @@ else
       if [ -n "$sk_note" ]; then
         [ ${#sk_targets[@]} -gt 0 ] || sk_targets=("${mbp_targets[@]}")
         RAN=mbp+local; DETAIL="$sk_note"
+        # Só ALGUNS alvos pularam (sk_targets é subconjunto estrito): os irmãos que não pularam NÃO rodaram aqui, o verde deles foi aceito como veio do MBP, e a nota
+        # de verde vazio (no fim) vale para eles. Sem isso, a falta da nota lia-se como "conferido" justo na forma mais comum (o MBP sem dado faz alguns arquivos pularem).
+        if [ ${#sk_targets[@]} -lt ${#mbp_targets[@]} ]; then GREEN_MBP=1; GREEN_PARTIAL=1; fi
         run_local ${flags[@]+"${flags[@]}"} "${sk_targets[@]}"; RC=$?
       else
         GREEN_MBP=1   # verde aceito como veio do MBP: nada foi conferido aqui (a nota de verde vazio, no fim)
@@ -355,9 +387,11 @@ fi
 SECS=$(( $(date +%s) - T_START ))
 # Verde do MBP aceito como veio: o MBP não tem shared/data nem .env, e um teste que lê dado por um caminho que eu não enxergo (constante numa lib,
 # fixture; só a assinatura `shared/data` no arquivo manda o alvo ficar aqui) pode ter passado VAZIO lá. Eu não sei qual é, então DIGO: fail-open
-# visível. Só quando um verde do MBP foi mesmo aceito (nada reconferido aqui) e o veredito final é verde; vem ANTES da linha final (o revisor copia a última).
-[ $GREEN_MBP -eq 1 ] && [ "$RC" = 0 ] \
-  && say "nota: verde do MBP aceito como veio. O MBP não tem shared/data nem .env: um teste que lê dado por um caminho que o wrapper não vê (constante numa lib, fixture) pode ter passado VAZIO lá — se o código testado lê dado, trate este verde como não verificado e rode esses arquivos aqui com python3 -m pytest direto"
+# visível. Só quando um verde do MBP foi mesmo aceito (nada reconferido aqui, ao menos para um alvo) e o veredito final é verde; vem ANTES da linha final (o revisor copia a última).
+if [ $GREEN_MBP -eq 1 ] && [ "$RC" = 0 ]; then
+  ESCOPO="."; [ $GREEN_PARTIAL -eq 1 ] && ESCOPO=" SÓ para os alvos que não pularam (os que pularam rodaram aqui)."
+  say "nota: verde do MBP aceito como veio${ESCOPO} O MBP não tem shared/data nem .env: um teste que lê dado por um caminho que o wrapper não vê (constante numa lib, fixture) pode ter passado VAZIO lá — se o código testado lê dado, trate este verde como não verificado e rode esses arquivos aqui com python3 -m pytest direto"
+fi
 # O log é o insumo do antes×depois: uma linha que não foi gravada some da contagem. O rc do revisor não depende dele (nunca falha por
 # causa do log), mas a falta é DITA na saída, não engolida — quem lê "execuções: N" sabe que pode faltar uma.
 LOG_LINE=$(printf '{"ts":"%s","session":"%s","repo":"%s","ran":"%s","rc":%s,"secs":%s,"mbp_secs":%s,"local_secs":%s,"detail":"%s","ntargets":%s}' \

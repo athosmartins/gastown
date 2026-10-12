@@ -6,7 +6,8 @@
 #   O que verifica · Por que não toca o MBP
 #
 # O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o wrapper existe, é executável e parseia sob /bin/bash 3.2; a lib do
-#   prompt parseia sob /bin/bash 3.2 e carrega gate_test_wrapper_rules; o mbp-run.sh que o wrapper chama existe; e os dois selftests
+#   prompt parseia sob /bin/bash 3.2 e carrega gate_test_wrapper_rules; o mbp-run.sh que o wrapper chama existe; a lista
+#   gate-pytest.force-local está implantada e legível (sem ela o wrapper roda tudo aqui, avisando); e os dois selftests
 #   novos (o do wrapper e o do parágrafo do prompt) mais o do invariante de apóstrofos do prompt (ga-6aj348) passam contra
 #   eles. Com a chave de verdade ligada, o parágrafo sai do prompt real; com `.gc/gate-pytest.off`, não sai — conferido na cidade viva.
 # POR QUE NÃO TOCA O MBP: o selftest do wrapper usa stubs de ssh/rsync/python; rodar o MBP de verdade aqui seria depender de uma
@@ -19,6 +20,7 @@ CITY="${CITY:-/Users/athos/gt/.gascity-gastown-hq}"
 ASSETS="$CITY/packs/town-deltas/assets"
 WRAPPER="$CITY/scripts/gate-pytest.sh"
 WRAPPER_ST="$CITY/scripts/gate-pytest.selftest.sh"
+FORCE_LIST="$CITY/scripts/gate-pytest.force-local"
 MBPRUN="$CITY/scripts/mbp-run.sh"
 TASKLIB="$ASSETS/gate-review-task.lib.sh"
 LIB_ST="$ASSETS/gate-test-wrapper-rules.selftest.sh"
@@ -29,9 +31,12 @@ log()  { echo "[prod-test:gascity ga-xm1jfl] $*"; }
 fail() { echo "[prod-test:gascity ga-xm1jfl] FAIL: $*" >&2; exit 1; }
 
 for f in "$WRAPPER" "$WRAPPER_ST" "$MBPRUN" "$TASKLIB" "$LIB_ST" "$APOS_ST"; do [[ -f "$f" ]] || fail "missing: $f"; done
+# A lista force-local é o remédio do verde vazio (runbook): sem ela legível o wrapper manda TUDO rodar aqui (e avisa), então um deploy que esqueceu a lista
+# não quebra nada, mas tira o ganho em silêncio — por isso o prod test exige a lista implantada e legível.
+[[ -r "$FORCE_LIST" ]] || fail "force-local list missing or unreadable: $FORCE_LIST (the wrapper would run every target locally and the offload would gain nothing)"
 [[ -x "$WRAPPER" ]] || fail "$WRAPPER is not executable (reviewers would get 'permission denied' instead of a test run)"
 [[ -x "$BASH32" ]]  || fail "$BASH32 not executable — cannot run the real-interpreter syntax check"
-log "Deployed wrapper, mbp-run, prompt lib and selftests found."
+log "Deployed wrapper, force-local list, mbp-run, prompt lib and selftests found."
 
 log "Syntax under $BASH32 ($("$BASH32" --version | head -n1 | sed 's/ (.*//'))..."
 "$BASH32" -n "$WRAPPER"  || fail "gate-pytest.sh does not parse under $BASH32"

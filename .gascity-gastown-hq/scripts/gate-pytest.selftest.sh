@@ -9,6 +9,10 @@
 #   ids ilegíveis / sem ids / muitos) · pulados no MBP → os arquivos que pularam rodam aqui · sem resumo + -r do revisor → roda aqui · rc estranho do MBP → roda aqui · alvo que lê shared/data, lista
 #   force-local, diretório, sem alvo, flag de disco local, repo sem espelho, caminho fora do worktree → rodam aqui sem chamar o MBP ·
 #   divisão por alvo (o que fica aqui não arrasta os outros; rc das duas partes se combinam) · caminho absoluto dentro do worktree vira relativo · valor de flag com espaço chega inteiro · rc nunca 96..99 · uso errado = 4 · log.
+#   Round 3 do gate: assinatura de shared/data achada em arquivo GRANDE (10 execuções: é uma corrida de SIGPIPE), na última linha, com byte NUL · só alguns alvos pularam → a nota de
+#   verde do MBP sai (os irmãos foram aceitos sem reconferir) · opções do plugin de cache rodam aqui e o comando daqui não leva -p no:cacheprovider (stub que recusa como o pytest;
+#   e o pytest de verdade quando existe) · lista force-local ausente/ilegível → nada vai ao MBP, com AVISO · repo vem do git-common-dir, não do nome do diretório do worktree.
+#   Controles negativos A-F: cada mutante (sem a confirmação local, sem o desvio 96..99, regra antiga do skip, sem a contenção dos ids, leitura antiga da assinatura, -p no:cacheprovider de volta) tem de ser pego.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GP="$HERE/gate-pytest.sh"
@@ -20,6 +24,14 @@ printf 'DB = "shared/data/x.db"\n' > "$T/wt/tests/test_db.py"
 printf '# so cita shared/data num comentario\n    # (idem, indentado)\ndef test_x(): pass\n' > "$T/wt/tests/test_coment.py"
 : > "$T/other/test_out.py"
 : > "$T/wt/tests/helpers.py"   # módulo de apoio que EXISTE no worktree: é de onde um pytest.skip() de helper é reportado
+# Fixtures GRANDES: a leitura `grep -v ... | grep -q` sob pipefail morria de SIGPIPE quando o arquivo passava de ~64 KB (capacidade do pipe) e "não consegui saber"
+# virava "não cita shared/data": o arquivo ia ao MBP. Um fixture de 47 bytes (o test_db acima) nunca enxerga isso. 4000 linhas ≈ 200 KB.
+pad() { awk 'BEGIN{for(i=0;i<4000;i++) printf "value_%d = %d  # padding padding padding padding\n", i, i}'; }
+{ printf 'DB = "shared/data/x.db"\n'; pad; } > "$T/wt/tests/test_big.py"                 # assinatura na LINHA 1 de um arquivo grande
+{ pad; printf 'DB = "shared/data/x.db"\n'; } > "$T/wt/tests/test_bigend.py"                # e na ÚLTIMA linha
+{ printf '# so cita shared/data num comentario\n'; pad; } > "$T/wt/tests/test_bigcoment.py"   # grande, mas a única citação é comentário: continua indo ao MBP
+printf 'DB = "shared/data/x.db"\n\000\n' > "$T/wt/tests/test_nul.py"                         # byte NUL (medido no grep do macOS): sem `grep -a` ele responde "Binary file matches" no lugar das linhas
+printf 'DB = "shared/data/x.db"\nx = "caf\351"\n' > "$T/wt/tests/test_latin.py"            # byte que não é UTF-8: o grep do macOS o lê como texto (controle: continua achando a assinatura)
 
 # stub do mbp-run: registra os argumentos (um por linha) e devolve o que o caso mandou.
 cat > "$T/bin/mbp-run" <<'EOF'
@@ -28,10 +40,20 @@ cat > "$T/bin/mbp-run" <<'EOF'
 [ -n "${STUB_MBP_OUT:-}" ] && cat "$STUB_MBP_OUT"
 exit "${STUB_MBP_RC:-0}"
 EOF
-# stub do python3: `python3 -m pytest -p no:cacheprovider <args>`; rc por chamada em STUB_LOCAL_RCS ("4 0" = 1ª chamada 4, 2ª 0).
+# stub do python3: `python3 -m pytest <args>`; rc por chamada em STUB_LOCAL_RCS ("4 0" = 1ª chamada 4, 2ª 0).
+# Como o pytest de verdade (9.0.3, medido): com `-p no:cacheprovider` as opções do plugin de cache (--lf --ff --nf --sw --cache-clear...) não
+# existem e o pytest sai com rc 4 "unrecognized arguments". O stub reproduz isso, senão ele esconde a regressão (gate round 3).
 cat > "$T/bin/py" <<'EOF'
 #!/usr/bin/env bash
 { echo "LOCAL_CALL cwd=$(pwd -P)"; for a in "$@"; do echo "  arg:$a"; done; } >> "$STUB_LOG"
+nocache=0; prev=""
+for a in "$@"; do { [ "$prev" = "-p" ] && [ "$a" = "no:cacheprovider" ]; } && nocache=1; prev="$a"; done
+if [ $nocache -eq 1 ]; then
+  for a in "$@"; do
+    case "$a" in --lf|--last-failed|--ff|--failed-first|--nf|--new-first|--sw|--stepwise|--sw-skip|--stepwise-skip|--sw-reset|--stepwise-reset|--cache-clear|--cache-show|--cache-show=*|--lfnf|--last-failed-no-failures|--lfnf=*|--last-failed-no-failures=*)
+      echo "ERROR: unrecognized arguments: $a"; exit 4 ;; esac
+  done
+fi
 n=$(cat "$STUB_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_COUNT"
 rc=$(printf '%s' "${STUB_LOCAL_RCS:-0}" | awk -v n=$n '{ if (n <= NF) print $n; else print $NF }')
 echo "stub-local-run n=$n rc=$rc"
@@ -69,7 +91,8 @@ for code in 96 97 98 99; do
 done
 reset; export STUB_MBP_RC=98; rc=$(run -- tests/test_a.py -x -q); unset STUB_MBP_RC
 expect "98 + local verde = 0 (nunca 98)" 0 "$rc"; has "98: ran=local" "$T/out" 'ran=local rc=0'
-has "98: o comando local é o de hoje (-p no:cacheprovider + os args do revisor)" "$STUB_LOG" 'arg:-p'; has "98: roda no worktree" "$STUB_LOG" "LOCAL_CALL cwd=.*wt"
+has "98: o comando local é o de hoje (os args do revisor, nada além)" "$STUB_LOG" 'arg:-x'; hasnt "98: sem -p no:cacheprovider (o revisor de hoje não o usa)" "$STUB_LOG" 'no:cacheprovider'
+has "98: roda no worktree" "$STUB_LOG" "LOCAL_CALL cwd=.*wt"
 has "98: motivo no log" "$LOG" 'mbp-rc=98'
 
 # 3 chave off: nem chama o MBP
@@ -130,6 +153,31 @@ reset; mbp_out "SKIPPED [2] tests/test_b.py:9: sem dado" "3 passed, 2 skipped in
 rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "pulados no MBP" 0 "$rc"
 count "pulados: UMA chamada local" "$STUB_LOG" 'LOCAL_CALL' 1; has_local "pulados: só o arquivo que pulou" "$STUB_LOG" 'arg:tests/test_b.py$'; sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-only.log"; hasnt "pulados: o arquivo que não pulou não volta aqui" "$T/local-only.log" 'arg:tests/test_a.py$'
 has "pulados: no log" "$LOG" 'skips-no-mbp'
+# 5-nota só ALGUNS alvos pularam: os que pularam rodam aqui, mas os IRMÃOS que não pularam foram aceitos como vieram do MBP, sem reconferir. A nota de verde
+#   vazio sai também aqui (a forma mais comum: o MBP sem dado faz alguns arquivos pularem e os outros passam). Sem a nota, a ausência dela lê como "conferido".
+has "parcial: a nota de verde do MBP sai (test_a foi aceito sem reconferir)" "$T/out" 'nota: verde do MBP.*VAZIO'
+has "parcial: a nota diz que vale SÓ para os alvos que não pularam" "$T/out" 'nota: verde do MBP aceito como veio SÓ para os alvos que não pularam'
+has "parcial: a última linha continua sendo ran=..." "$T/out" 'gate-pytest: ran=mbp\+local rc=0'; tail -1 "$T/out" > "$T/lastline"; has "parcial: a nota vem ANTES da linha final" "$T/lastline" '^gate-pytest: ran='
+# a nota completa (verde sem pulados) NÃO leva a ressalva "SÓ para os que não pularam"
+reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_a.py tests/test_b.py -q); hasnt "verde sem pulados: a nota não leva a ressalva de parcial" "$T/out" 'SÓ para os alvos'
+# TODOS os alvos pularam: nada foi aceito do MBP → sem nota (o que vale é o rc daqui)
+reset; mbp_out "SKIPPED [1] tests/test_a.py:9: x" "SKIPPED [1] tests/test_b.py:9: y" "2 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "todos os alvos pularam" 0 "$rc"; hasnt "todos pularam: sem a nota (nada foi aceito do MBP)" "$T/out" 'nota: verde do MBP'
+# skip sem dono (helper): TODOS os alvos rodam aqui → nada aceito do MBP → sem nota
+reset; mbp_out "SKIPPED [1] tests/helpers.py:3: x" "2 passed, 1 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "skip de helper, todos os alvos aqui" 0 "$rc"; hasnt "helper: sem a nota" "$T/out" 'nota: verde do MBP'
+# parcial e o rerun daqui reprova → o veredito é vermelho: sem nota
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: x" "1 passed, 1 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -q); expect "parcial e o rerun reprova" 1 "$rc"; hasnt "parcial vermelho: sem a nota" "$T/out" 'nota: verde do MBP'
+# parcial com node ids: tests/test_b.py::test_y pulou, o irmão tests/test_a.py foi aceito
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: x" "1 passed, 1 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py::test_y -q); expect "parcial com node id" 0 "$rc"; has "parcial com node id: a nota sai" "$T/out" 'nota: verde do MBP aceito como veio SÓ para os alvos que não pularam'
+# dois node ids do MESMO arquivo que pulou: nenhum irmão foi aceito → sem nota
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: x" "1 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=0 run -- tests/test_b.py::test_y tests/test_b.py::test_z -q); expect "dois ids do arquivo que pulou" 0 "$rc"; hasnt "dois ids: sem a nota" "$T/out" 'nota: verde do MBP'
+# parcial + divisão (test_db fica aqui, test_b pulou, test_a foi aceito)
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: x" "1 passed, 1 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS="0 0" run -- tests/test_a.py tests/test_b.py tests/test_db.py -q); expect "parcial + divisão" 0 "$rc"; has "parcial + divisão: a nota sai" "$T/out" 'nota: verde do MBP aceito como veio SÓ para os alvos que não pularam'
 reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado" "1 skipped in 0.1s"
 rc=$(STUB_LOCAL_RCS=1 run -- tests/test_b.py -q); expect "pulado que falha aqui devolve o rc daqui" 1 "$rc"
 # 5a o skip sai de um HELPER (pytest.skip() dentro de um módulo de apoio): o pytest reporta o caminho do HELPER, não o do teste que pulou.
@@ -220,18 +268,72 @@ hasnt "lista sem newline final: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "lista sem 
 reset; printf '# c\r\ntests/test_b.py\r\n' > "$T/force-local.txt"; rc=$(run -- tests/test_b.py -q); expect "lista: linhas CRLF" 0 "$rc"; hasnt "lista CRLF: sem MBP" "$STUB_LOG" 'MBP_CALL'
 reset; printf '   tests/test_b.py  \n' > "$T/force-local.txt"; rc=$(run -- tests/test_b.py -q); expect "lista: espaço sobrando em volta" 0 "$rc"; hasnt "lista com espaço: sem MBP" "$STUB_LOG" 'MBP_CALL'
 reset; printf 'tests/test_a.py\ntests/test_zzz.py' > "$T/force-local.txt"; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_b.py -q); expect "lista sem newline: o que não casa continua indo ao MBP" 0 "$rc"; has "lista sem newline: o outro alvo vai ao MBP" "$STUB_LOG" 'MBP_CALL'
+# a lista é O remédio do verde vazio: lista AUSENTE ou ilegível não é "lista vazia". Não dá para saber o que deveria ficar aqui → nada vai ao MBP, e a falta é DITA.
+reset; mbp_out "1 passed in 0.1s"; rc=$(GATE_PYTEST_FORCE_LOCAL_LIST="$T/nao-existe.txt" run -- tests/test_a.py -q); expect "lista force-local ausente: roda aqui" 0 "$rc"
+hasnt "lista ausente: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "lista ausente: motivo no log" "$LOG" 'lista-force-local-ilegivel'; has "lista ausente: o AVISO diz qual lista" "$T/out" 'AVISO: .*force-local.*nao-existe.txt'
+reset; mbp_out "1 passed in 0.1s"; rc=$(GATE_PYTEST_FORCE_LOCAL_LIST="$T" run -- tests/test_a.py -q); expect "lista force-local que é um diretório: roda aqui" 0 "$rc"
+hasnt "lista diretório: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "lista diretório: motivo no log" "$LOG" 'lista-force-local-ilegivel'
+if [ "$(id -u)" != 0 ]; then
+  : > "$T/force-noread.txt"; chmod 000 "$T/force-noread.txt"
+  reset; mbp_out "1 passed in 0.1s"; rc=$(GATE_PYTEST_FORCE_LOCAL_LIST="$T/force-noread.txt" run -- tests/test_a.py -q); expect "lista force-local sem permissão: roda aqui" 0 "$rc"
+  hasnt "lista sem permissão: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "lista sem permissão: motivo no log" "$LOG" 'lista-force-local-ilegivel'; chmod 644 "$T/force-noread.txt"
+fi
+# controle: lista VAZIA (legível, sem globs) é uma lista válida: o alvo vai ao MBP e nenhum aviso sai
+reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_a.py -q); expect "lista vazia é válida" 0 "$rc"; has "lista vazia: vai ao MBP" "$STUB_LOG" 'MBP_CALL'; hasnt "lista vazia: sem AVISO de lista" "$T/out" 'AVISO: .*force-local'
 reset; rc=$(run -- tests -q); expect "diretório como alvo" 0 "$rc"; hasnt "diretório: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "diretório: motivo" "$LOG" 'alvo-diretorio'
 reset; rc=$(run -- -q); expect "sem alvo" 0 "$rc"; has "sem alvo: motivo" "$LOG" 'sem-alvo-arquivo'
 reset; rc=$(run -- tests/test_a.py --junitxml=/tmp/x.xml); expect "flag de disco local" 0 "$rc"; has "junitxml: motivo" "$LOG" 'flag-local:--junitxml'
 reset; rc=$(run -- tests/test_a.py --lf); expect "--lf (cache daqui)" 0 "$rc"; hasnt "--lf: sem MBP" "$STUB_LOG" 'MBP_CALL'
+# 7d as opções do plugin de CACHE dependem do cache DESTA máquina e só existem com o plugin ligado: rodam aqui, e o comando daqui NÃO leva -p no:cacheprovider
+#    (o pytest recusa com rc 4 "unrecognized arguments"; sem o -p é o que o revisor rodava antes do wrapper). O stub rejeita a combinação como o pytest de verdade.
+for fl in --lf --last-failed --ff --failed-first --nf --new-first --sw --stepwise --sw-skip --stepwise-skip --sw-reset --stepwise-reset --cache-clear --cache-show --cache-show=x --lfnf=none --last-failed-no-failures=all; do
+  reset; rc=$(run -- tests/test_a.py "$fl" -q); expect "flag de cache $fl: roda aqui e o pytest não a recusa" 0 "$rc"
+  hasnt "flag de cache $fl: sem MBP" "$STUB_LOG" 'MBP_CALL'; hasnt "flag de cache $fl: sem -p no:cacheprovider" "$STUB_LOG" 'no:cacheprovider'; has "flag de cache $fl: motivo no log" "$LOG" 'flag-local:'
+done
+# as de valor SEPARADO (--lfnf all): o valor não pode virar alvo
+reset; rc=$(run -- tests/test_a.py --lfnf all -q); expect "--lfnf all (valor separado)" 0 "$rc"; hasnt "--lfnf all: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "--lfnf all: o motivo é a flag, não um alvo ilegível" "$LOG" 'flag-local:--lfnf'
+reset; rc=$(run -- tests/test_a.py --last-failed-no-failures none -q); expect "--last-failed-no-failures none (valor separado)" 0 "$rc"; has "--last-failed-no-failures: o motivo é a flag" "$LOG" 'flag-local:--last-failed-no-failures'
 reset; rc=$(run -- "$T/other/test_out.py" -q); expect "caminho absoluto fora do worktree" 0 "$rc"; hasnt "fora: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "fora: motivo" "$LOG" 'alvo-fora-do-worktree'
 reset; rc=$(run -- tests/nao_existe.py -q); expect "alvo inexistente" 0 "$rc"; has "inexistente: motivo" "$LOG" 'alvo-ilegivel'
 reset; rc=$("$GP" --dir "$T/wt" -- tests/test_a.py -q >"$T/out" 2>"$T/err"; echo $?); expect "repo sem espelho (nem wa nem ps)" 0 "$rc"
 has "sem espelho: motivo" "$LOG" 'repo-sem-espelho'; hasnt "sem espelho: sem MBP" "$STUB_LOG" 'MBP_CALL'
+# 7a0 o repo vem do repo do GIT (git-common-dir), nunca do NOME do diretório do worktree: um worktree do gascity cujo caminho cita "whatsapp_automation" NÃO é o WA
+#     (rsync dele para o espelho do WA seria teste contra o código errado). Worktrees REAIS, sem --repo.
+gitq() { git -c user.name=t -c user.email=t@t -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@" 2>/dev/null; }
+mkdir -p "$T/gr"
+gitq init -q "$T/gr/gascity-repo"; gitq -C "$T/gr/gascity-repo" commit -q --allow-empty -m x
+gitq -C "$T/gr/gascity-repo" worktree add -q "$T/gr/whatsapp_automation-lookalike" -b lookalike
+gitq init -q "$T/gr/whatsapp_automation"; gitq -C "$T/gr/whatsapp_automation" commit -q --allow-empty -m x
+gitq -C "$T/gr/whatsapp_automation" worktree add -q "$T/gr/wt-neutral" -b neutral
+for w in whatsapp_automation-lookalike wt-neutral; do mkdir -p "$T/gr/$w/tests"; : > "$T/gr/$w/tests/test_a.py"; done
+reset; mbp_out "1 passed in 0.1s"; rc=$("$GP" --dir "$T/gr/whatsapp_automation-lookalike" -- tests/test_a.py -q >"$T/out" 2>"$T/err"; echo $?); expect "worktree do gascity com 'whatsapp_automation' no NOME do diretório" 0 "$rc"
+has "nome enganoso: motivo repo-sem-espelho" "$LOG" 'repo-sem-espelho'; hasnt "nome enganoso: sem MBP" "$STUB_LOG" 'MBP_CALL'
+reset; mbp_out "1 passed in 0.1s"; rc=$("$GP" --dir "$T/gr/wt-neutral" -- tests/test_a.py -q >"$T/out" 2>"$T/err"; echo $?); expect "worktree do WA (git-common-dir) com nome neutro" 0 "$rc"
+has "WA detectado pelo git: chamou o MBP com --repo wa" "$STUB_LOG" 'arg:wa'; has "WA detectado pelo git: ran=mbp" "$T/out" 'ran=mbp rc=0'
 
 # 7a comentário que só cita shared/data NÃO manda o arquivo para cá (medido: falso positivo que jogava fora o ganho)
 reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_coment.py -q); expect "comentário com shared/data" 0 "$rc"
 has "comentário: vai ao MBP" "$STUB_LOG" 'MBP_CALL'; hasnt "comentário: não roda aqui" "$STUB_LOG" 'LOCAL_CALL'
+
+# 7a2 a assinatura tem de ser achada em arquivo GRANDE (> 64 KB: a leitura `grep -v | grep -q` morria de SIGPIPE sob pipefail e o arquivo ia ao MBP, onde
+#     passa VAZIO), na última linha (controle: já achava), com byte NUL (grep sem -a devolve "Binary file matches") e com byte não-UTF-8 (controle).
+#     É uma corrida, então 10 execuções: UMA que escape reprova.
+for f in test_big test_bigend test_nul test_latin; do
+  stay=0
+  for i in 1 2 3 4 5 6 7 8 9 10; do reset; mbp_out "1 passed in 0.1s"; run -- "tests/$f.py" -q >/dev/null; grep -q 'MBP_CALL' "$STUB_LOG" || stay=$((stay+1)); done
+  n=$((n+1)); if [ "$stay" = 10 ]; then echo "ok   $f cita shared/data: ficou aqui nas 10 execuções"; else echo "FAIL $f cita shared/data: só ficou aqui $stay de 10 (a leitura da assinatura perdeu a corrida de SIGPIPE, ou tomou o arquivo por binário, e o alvo foi ao MBP)"; fails=$((fails+1)); fi
+done
+reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_big.py -q); expect "arquivo grande que lê shared/data" 0 "$rc"; has "grande: o motivo diz qual arquivo" "$LOG" 'le-shared-data:tests/test_big.py'
+# controle: grande mas a única citação é comentário → continua indo ao MBP (a correção não pode mandar tudo para cá)
+reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_bigcoment.py -q); expect "arquivo grande que só cita num comentário" 0 "$rc"
+has "grande só-comentário: vai ao MBP" "$STUB_LOG" 'MBP_CALL'; hasnt "grande só-comentário: não roda aqui" "$STUB_LOG" 'LOCAL_CALL'
+# arquivo que o wrapper não consegue ler: fica AQUI (nunca vai ao MBP no escuro)
+if [ "$(id -u)" != 0 ]; then
+  : > "$T/wt/tests/test_noread.py"; chmod 000 "$T/wt/tests/test_noread.py"
+  reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_noread.py -q); expect "alvo ilegível (sem permissão)" 0 "$rc"
+  hasnt "ilegível: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "ilegível: motivo" "$LOG" 'alvo-ilegivel:tests/test_noread.py'
+  chmod 644 "$T/wt/tests/test_noread.py"
+fi
 
 # 7b divisão por alvo: o que fica aqui NÃO arrasta os outros para cá
 reset; mbp_out "2 passed in 1.0s"; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_db.py -x -q); expect "divisão: a no MBP, db aqui" 0 "$rc"
@@ -327,6 +429,30 @@ cmp -s "$GP" "$T/mutD.sh" && { n=$((n+1)); echo "FAIL controle D: o mutante é i
   STUB_LOCAL_RCS=0 "$T/mutD.sh" --repo wa --dir "$T/wt" -- tests/test_a.py tests/test_b.py -q >/dev/null 2>&1
   n=$((n+1)); if grep -q 'arg:tests/outro.py' "$STUB_LOG"; then echo "ok   controle D (mutante sem a contenção roda o id estranho isolado — o caso 4c pegaria)"; else echo "FAIL controle D: o mutante também não rodou o id estranho"; fails=$((fails+1)); fi; }
 unset STUB_MBP_RC
+
+# controle negativo E: a leitura antiga da assinatura (`grep -v | grep -q` sob pipefail) volta → o arquivo grande vai ao MBP — o caso 7a2 tem de enxergar isso
+sed 's@^  case "[$]body" in [*]shared/data[*]) return 0 ;; esac$@  if grep -v -E "^[[:space:]]*#" "$1" 2>/dev/null | grep -q shared/data; then return 0; fi@' "$GP" > "$T/mutE.sh"; chmod +x "$T/mutE.sh"
+cmp -s "$GP" "$T/mutE.sh" && { n=$((n+1)); echo "FAIL controle E: o mutante é idêntico ao original (sed não casou)"; fails=$((fails+1)); } || {
+  escaped=0; for i in 1 2 3 4 5 6 7 8 9 10; do reset; mbp_out "1 passed in 0.1s"; "$T/mutE.sh" --repo wa --dir "$T/wt" -- tests/test_big.py -q >/dev/null 2>&1; grep -q 'MBP_CALL' "$STUB_LOG" && escaped=$((escaped+1)); done
+  n=$((n+1)); if [ "$escaped" -ge 1 ]; then echo "ok   controle E (mutante com a leitura antiga mandou o arquivo grande ao MBP em $escaped de 10 — o caso 7a2 pegaria)"; else echo "FAIL controle E: o mutante com a leitura antiga também manteve o arquivo grande aqui — o caso 7a2 não enxerga a corrida"; fails=$((fails+1)); fi; }
+# controle negativo F: o -p no:cacheprovider volta ao comando daqui → as opções de cache voltam a ser recusadas (rc 4) — o caso 7d tem de enxergar isso
+sed 's|exec "[$]PY" -m pytest "[$]@"|exec "$PY" -m pytest -p no:cacheprovider "$@"|' "$GP" > "$T/mutF.sh"; chmod +x "$T/mutF.sh"
+cmp -s "$GP" "$T/mutF.sh" && { n=$((n+1)); echo "FAIL controle F: o mutante é idêntico ao original (sed não casou)"; fails=$((fails+1)); } || {
+  reset; "$T/mutF.sh" --repo wa --dir "$T/wt" -- tests/test_a.py --lf -q >/dev/null 2>&1; r=$?
+  n=$((n+1)); if [ "$r" = 4 ]; then echo "ok   controle F (mutante com -p no:cacheprovider devolve 4 em --lf — o caso 7d pegaria)"; else echo "FAIL controle F: o mutante devolveu $r"; fails=$((fails+1)); fi; }
+
+# 14 pytest DE VERDADE (quando o python3 daqui o tem): o stub não prova que o pytest aceita o que o wrapper lhe passa. O rc do wrapper tem de ser o do pytest puro.
+if python3 -c 'import pytest' 2>/dev/null; then
+  mkdir -p "$T/real/tests"; printf 'def test_one():\n    assert True\n' > "$T/real/tests/test_one.py"
+  for fl in --lf --last-failed --ff --nf --sw --sw-skip --sw-reset --cache-clear --cache-show; do
+    plain=$(cd "$T/real" && python3 -m pytest tests/test_one.py "$fl" -q >/dev/null 2>&1; echo $?)
+    reset; rc=$(GATE_PYTEST_PY=python3 "$GP" --repo wa --dir "$T/real" -- tests/test_one.py "$fl" -q >"$T/out" 2>"$T/err"; echo $?)
+    expect "pytest DE VERDADE: o wrapper devolve o rc do pytest puro em $fl (puro=$plain)" "$plain" "$rc"
+  done
+  reset; rc=$(GATE_PYTEST_PY=python3 "$GP" --repo wa --dir "$T/real" -- tests/test_one.py --lfnf all -q >"$T/out" 2>"$T/err"; echo $?); expect "pytest DE VERDADE: --lfnf all (valor separado)" 0 "$rc"
+else
+  echo "SKIP pytest de verdade: este python3 não tem pytest — nada foi medido contra o pytest real (os casos com stub acima seguem valendo)"
+fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

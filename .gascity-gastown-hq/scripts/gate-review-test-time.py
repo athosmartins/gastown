@@ -21,6 +21,8 @@ USO
   gate-review-test-time.py sessoes [--n 20] [--corte 2026-10-12T06:00:00Z]
   gate-review-test-time.py wrapper [--desde 2026-10-12T06:00:00Z]
   gate-review-test-time.py --selftest
+  Opção sem valor, desconhecida ou com valor inválido é uso errado (rc 2, com a mensagem): nunca cai no padrão em silêncio ("sem corte", "desde sempre").
+  Linha de log ou de transcrição ilegível é pulada e CONTADA no aviso do fim, nunca some.
 
 LIMITES
   "Esperando teste" é um LIMITE INFERIOR: uma espera que o comando não rotula como pytest (sleep 60; tail $S/t1.log) não entra. A
@@ -123,17 +125,25 @@ def cmd_dias(days, path=None):
 
 
 def session_stats(path):
-    """(início_epoch, minutos_totais, minutos_esperando_teste, nº de chamadas de teste, chamadas sem resultado) ou None."""
-    uses, first, last, wait, runs, unmatched = {}, None, None, 0.0, 0, 0
+    """(início_epoch, minutos_totais, minutos_esperando_teste, nº de chamadas de teste, chamadas sem resultado, linhas ilegíveis) ou None.
+    Linha que não é JSON, ou é JSON que não é um objeto (`null`, um número), é pulada e CONTADA (último campo), nunca some em silêncio nem derruba a leitura;
+    linha em branco não conta."""
+    uses, first, last, wait, runs, unmatched, bad = {}, None, None, 0.0, 0, 0, 0
     try:
         fh = open(path, encoding="utf-8", errors="replace")
     except OSError:
         return None
     with fh:
         for line in fh:
+            if not line.strip():
+                continue
             try:
                 o = json.loads(line)
             except ValueError:
+                bad += 1
+                continue
+            if not isinstance(o, dict):
+                bad += 1
                 continue
             ts = epoch(o.get("timestamp"))
             if ts is None:
@@ -156,15 +166,17 @@ def session_stats(path):
     unmatched = len(uses)
     if first is None or last is None:
         return None
-    return first, (last - first) / 60.0, wait / 60.0, runs, unmatched
+    return first, (last - first) / 60.0, wait / 60.0, runs, unmatched, bad
 
 
 def cmd_sessoes(n, corte, dirpath=None):
     dirpath = dirpath or TRANSCRIPTS
     files = sorted(glob.glob(os.path.join(dirpath, "*.jsonl")), key=os.path.getmtime, reverse=True)
-    rows = []
+    rows, badl = [], 0
     for f in files:
         st = session_stats(f)
+        if st:
+            badl += st[5]  # de TODA sessão lida, também das que saem da tabela: uma linha estragada pode estar escondendo a chamada de teste que a poria nela
         if st and st[3] > 0:  # só sessões que rodaram teste: sem teste não há o que comparar
             rows.append(st)
         if len(rows) >= n and corte is None:
@@ -191,6 +203,8 @@ def cmd_sessoes(n, corte, dirpath=None):
     un = sum(r[4] for r in rows)
     if un:
         print(f"(aviso: {un} chamada(s) de teste sem resultado casado na transcrição não entraram na soma)")
+    if badl:
+        print(f"(aviso: {badl} linha(s) de transcrição ilegíveis foram puladas)")
     print("(dica: esta tabela é só uma DICA. 'Teste/sessão' conta só chamada que cita pytest; depois do wrapper o revisor espera com nomes que ele "
           "escolhe (sleep 30; tail $S/gp.log), que não casam, e o depois pode parecer melhor do que é. A medida é revisao_media_min (dias) e "
           "os segundos que o wrapper registra (wrapper).)")
@@ -297,6 +311,9 @@ def selftest():
             ev("2026-10-12T10:08:10Z", [{"type": "tool_result", "tool_use_id": "u2", "content": "ok"}]),
             ev("2026-10-12T10:08:20Z", [{"type": "tool_use", "id": "u3", "name": "Bash", "input": {"command": "pytest -q"}}]),
             "isto não é json",
+            "null",   # JSON válido que não é um evento: ilegível, contado, não um crash (`.get` num None)
+            "7",
+            "",       # linha em branco não é linha ilegível: não entra na conta
             ev("2026-10-12T10:10:00Z", [{"type": "text", "text": "fim"}]),
         ]
         p = os.path.join(d, "s1.jsonl"); open(p, "w").write("\n".join(lines) + "\n")
@@ -304,12 +321,30 @@ def selftest():
         ok(st is not None and abs(st[1] - 10.0) < 1e-6, "sessão de 10 min")
         ok(st is not None and abs(st[2] - 2.0) < 1e-6, "esperando teste = 2 min (só a chamada com pytest; o sleep sem pytest não entra)")
         ok(st is not None and st[3] == 1 and st[4] == 1, "1 chamada casada, 1 sem resultado contada à parte")
+        ok(st is not None and st[5] == 3, f"3 linhas ilegíveis (texto, null, número) CONTADAS, a em branco não (vieram {st[5] if st else None})")
         ok(session_stats(os.path.join(t, "nao-existe.jsonl")) is None, "arquivo ausente dá None")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rcs = cmd_sessoes(5, None, d)
         ok(rcs == 0 and "dica" in buf.getvalue() and "revisao_media_min" in buf.getvalue() and "wrapper" in buf.getvalue(),
            "sessoes: diz que a tabela é só uma dica e aponta a manchete (revisao_media_min + wrapper)")
+        ok("3 linha(s) de transcrição ilegíveis" in buf.getvalue(), "sessoes: o aviso diz quantas linhas de transcrição foram puladas")
+
+        # opções: uma opção sem valor (último argumento), desconhecida, ou com valor inválido NÃO vira o padrão em silêncio ("sem corte", "desde sempre"): uso errado = rc 2
+        def run_main(*args):
+            e = io.StringIO()
+            with contextlib.redirect_stderr(e), contextlib.redirect_stdout(io.StringIO()):
+                r = main(["gate-review-test-time.py", *args])
+            return r, e.getvalue()
+        for args, frag in ((("wrapper", "--desde"), "--desde precisa de um valor"), (("sessoes", "--corte"), "--corte precisa de um valor"),
+                           (("sessoes", "--n"), "--n precisa de um valor"), (("dias", "--dias"), "--dias precisa de um valor"),
+                           (("wrapper", "--desde", "--n"), "--desde precisa de um valor"),
+                           (("dias", "--dia", "3"), "desconhecid"), (("wrapper", "--desd=2026-10-12"), "desconhecid"), (("wrapper", "solto"), "desconhecid"),
+                           (("dias", "--dias", "abc"), "--dias"), (("sessoes", "--n", "1.5"), "--n")):
+            r, msg = run_main(*args)
+            ok(r == 2 and frag in msg, f"uso errado {' '.join(args)}: rc 2 e a mensagem diz o motivo (rc={r}, '{msg.strip()[:70]}')")
+        ok(parse_opts(["--desde", "2026-10-12T00:00:00Z"], {"--desde"}) == {"--desde": "2026-10-12T00:00:00Z"} and parse_opts([], {"--desde"}) == {},
+           "opções válidas e ausentes seguem: valor lido, ausente = {} (o padrão de cada comando)")
 
         # wrapper log
         w = os.path.join(t, "w.jsonl")
@@ -350,21 +385,49 @@ def selftest():
     return 0 if not fails else 1
 
 
+class UsageError(Exception):
+    pass
+
+
+def parse_opts(args, allowed):
+    """{opção: valor} das opções `--nome valor`. Opção sem valor (último argumento, ou seguida de outra opção), desconhecida ou solta é UsageError: a falta NUNCA
+    cai no padrão em silêncio — `--desde` sem data leria o log "desde sempre" e `--corte` sem data, "sem corte", com a cara de uma medição de verdade."""
+    out, i = {}, 0
+    while i < len(args):
+        a = args[i]
+        if a not in allowed:
+            raise UsageError(f"argumento desconhecido: {a} (aceita: {', '.join(sorted(allowed)) or 'nenhum'})")
+        if i + 1 >= len(args) or args[i + 1].startswith("--"):
+            raise UsageError(f"{a} precisa de um valor")
+        out[a] = args[i + 1]
+        i += 2
+    return out
+
+
+def int_opt(opts, name, default):
+    try:
+        return int(opts[name]) if name in opts else default
+    except ValueError:
+        raise UsageError(f"{name} precisa de um número inteiro (veio '{opts[name]}')")
+
+
 def main(argv):
     if len(argv) < 2 or argv[1] in ("-h", "--help"):
         print(__doc__)
         return 0
     if argv[1] == "--selftest":
         return selftest()
-
-    def opt(name, default=None):
-        return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else default
-    if argv[1] == "dias":
-        return cmd_dias(int(opt("--dias", 7)))
-    if argv[1] == "sessoes":
-        return cmd_sessoes(int(opt("--n", 20)), opt("--corte"))
-    if argv[1] == "wrapper":
-        return cmd_wrapper(opt("--desde"))
+    try:
+        if argv[1] == "dias":
+            return cmd_dias(int_opt(parse_opts(argv[2:], {"--dias"}), "--dias", 7))
+        if argv[1] == "sessoes":
+            o = parse_opts(argv[2:], {"--n", "--corte"})
+            return cmd_sessoes(int_opt(o, "--n", 20), o.get("--corte"))
+        if argv[1] == "wrapper":
+            return cmd_wrapper(parse_opts(argv[2:], {"--desde"}).get("--desde"))
+    except UsageError as e:
+        print(f"{argv[1]}: {e}", file=sys.stderr)
+        return 2
     print(__doc__)
     return 2
 
