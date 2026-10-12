@@ -9073,7 +9073,9 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     # the branch as it is NOW, usually the normal gate. It converges: with the branch and main unchanged the decision and this
     # confirmation read the same diff, so a repeat revocation needs the branch or main to have moved again — or a read to have
     # failed this time (cannot-confirm: a transient git/mktemp/scanner error) or the switch to have been flipped off
-    # (switched-off). Neither loops: the next sweep reads again (a transient error), or finds the switch off and decides "normal".
+    # (switched-off). A switched-off lane does not loop: the next sweep finds the switch off and decides "normal". A cannot-confirm
+    # that PERSISTS does: every sweep decides "fast" again and is revoked again, with no retry cooldown on this requeue (the infra
+    # requeues above stamp one) — it shows up as a rising lane_revoked_at_push count in the weekly tally (gate-lane-tally.py).
     # The revocation is recorded as a NORMAL decision (marker metadata + a gate_lane event, reason_code revoked-at-push), so
     # neither the marker nor the weekly tally keeps saying "fast" for a run that merged nothing.
     # SELFTEST-EXTRACT fastlane-lane-revoked: BEGIN
@@ -9084,7 +9086,8 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       GATE_LANE_FILES=""
       warn "ga-atsahv: ${GATE_LANE_REASON}"
       if declare -F gate_fastlane_record >/dev/null 2>&1; then
-        gate_fastlane_record "$GC_CITY" "$MARKER_ID" "$BEAD_ID" "$BRANCH" "${RIG:-unknown}" "${GATE_LANE_WOULD_REVIEWERS:-0}" "$QG_LOG" || true
+        # an unset count is passed through EMPTY: the recorder writes that as null (unknown), where a default of 0 would be a measured zero
+        gate_fastlane_record "$GC_CITY" "$MARKER_ID" "$BEAD_ID" "$BRANCH" "${RIG:-unknown}" "${GATE_LANE_WOULD_REVIEWERS:-}" "$QG_LOG" || true
       fi
       _RQ_RC=0
       gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching" || _RQ_RC=$?

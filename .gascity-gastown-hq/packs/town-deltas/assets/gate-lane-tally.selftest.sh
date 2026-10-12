@@ -109,6 +109,40 @@ python3 "$TALLY" --log "$T/does-not-exist.jsonl" --now "$NOW" >"$T/o" 2>"$T/e"; 
 EMPTY=$(python3 "$TALLY" --log "$T/empty.jsonl" --now "$NOW"); rc=$?
 [ "$rc" = "0" ] && case "$EMPTY" in *"nenhuma decisão"*) true ;; *) false ;; esac && ok "an empty log is a valid tally that says 'nenhuma decisão'" || bad "empty log: rc=$rc '$EMPTY'"
 
+# ZERO decisions is not always an empty week (gate round 1 of slice 3): a log whose gate_lane lines are damaged, or whose
+# producer stopped while fast runs kept merging, also has zero decisions — and must NOT read as "nothing happened".
+QUIET="nenhuma decisão de lane registrada na janela"
+LA="$T/qg-truncated.jsonl"   # every gate_lane line cut short, what a disk-full partial append leaves
+printf '%s\n' '{"ts":"2026-10-02T09:00:00Z","event":"gate_lane","lane":"fast","marker":"m1","reaso' \
+              '{"ts":"2026-10-03T09:00:00Z","event":"gate_lane","lane":"nor' > "$LA"
+LB="$T/qg-silent-producer.jsonl"   # two fast runs merged with zero reviewers, and no lane decision on record for either
+cat > "$LB" <<'EOF'
+{"ts":"2026-10-02T09:01:00Z","event":"dispatcher_complete","lane":"fast","marker":"m-s1","result":"PASS","dry_run":"0"}
+{"ts":"2026-10-03T09:01:00Z","event":"dispatcher_complete","lane":"fast","marker":"m-s2","result":"PASS","dry_run":"0"}
+EOF
+TA=$(python3 "$TALLY" --log "$LA" --now "$NOW"); rc=$?
+JA=$(python3 "$TALLY" --log "$LA" --now "$NOW" --json)
+[ "$rc" = "0" ] && [ "$(printf '%s' "$JA" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['decisions'], d['unreadable_lines'])")" = "0 2" ] && ok "premise (truncated log): 0 decisions, 2 unreadable lines, exit 0" || bad "truncated-log premise: rc=$rc $JA"
+case "$TA" in *"$QUIET"*) bad "a log with every gate_lane line truncated reads as 'nothing happened': $TA" ;; *) ok "truncated log: the report does NOT say the window was empty" ;; esac
+case "$TA" in *"ATENÇÃO: 2 linha(s) do log ilegíveis"*"subcontados"*) ok "truncated log: the report says 2 lines were unreadable and that the numbers may be under-counted" ;; *) bad "truncated log: the unreadable-lines warning is missing: $TA" ;; esac
+TB=$(python3 "$TALLY" --log "$LB" --now "$NOW"); rc=$?
+JB=$(python3 "$TALLY" --log "$LB" --now "$NOW" --json)
+[ "$rc" = "0" ] && [ "$(printf '%s' "$JB" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['decisions'], d['fast_runs_completed'], d['reviewer_runs_saved'])")" = "0 2 2" ] && ok "premise (silent producer): 0 decisions, 2 fast runs completed, 2 reviewer runs saved (assumed)" || bad "silent-producer premise: rc=$rc $JB"
+case "$TB" in *"$QUIET"*) bad "fast runs merged with no decision on record, and the report says the window was empty: $TB" ;; *) ok "silent producer: the report does NOT say the window was empty" ;; esac
+case "$TB" in *"2 run(s) fast concluído(s)"*"sem nenhuma decisão de lane gravada"*) ok "silent producer: the report says 2 fast runs completed with no decision on record" ;; *) bad "silent producer: the fast runs are not in the report: $TB" ;; esac
+case "$TB" in *"contados como 1 revisor"*) ok "silent producer: the reviewer count is disclosed as an assumption" ;; *) bad "silent producer: the assumed count is not disclosed: $TB" ;; esac
+# …and the quiet window stays quiet: out-of-window damage, a normal-lane completion, a DRY_RUN fast completion and a
+# foreign event are not signals (otherwise the weekly would cry wolf every week)
+LQ="$T/qg-quiet.jsonl"
+cat > "$LQ" <<'EOF'
+{"ts":"2026-09-01T00:00:00Z","event":"gate_lane","lane":"fast","marker":"m-old","reaso
+{"ts":"2026-10-04T09:00:00Z","event":"dispatcher_complete","lane":"normal","marker":"m-n","result":"PASS","dry_run":"0"}
+{"ts":"2026-10-05T10:00:00Z","event":"dispatcher_complete","lane":"fast","marker":"m-dry","result":"PASS","dry_run":"1"}
+{"ts":"2026-10-05T10:30:00Z","event":"something_else","x":1}
+EOF
+TQ=$(python3 "$TALLY" --log "$LQ" --now "$NOW"); rc=$?
+[ "$rc" = "0" ] && case "$TQ" in *"$QUIET"*) true ;; *) false ;; esac && ok "a window with only out-of-window damage, a normal-lane completion, a dry run and a foreign event is still quiet" || bad "quiet window woke the report: rc=$rc $TQ"
+
 # --weekly: history appended + ONE notify, only when the window has decisions
 cat > "$T/bin/notify" <<'EOF'
 #!/bin/bash
@@ -119,11 +153,25 @@ OUT="$T/history.jsonl"; NL="$T/notify.log"; : > "$NL"
 PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$L" --now "$NOW" --weekly --out "$OUT" >/dev/null; rc=$?
 [ "$rc" = "0" ] && [ "$(wc -l < "$OUT" | tr -d ' ')" = "1" ] && ok "--weekly appends exactly one history line" || bad "--weekly history: rc=$rc lines=$(wc -l < "$OUT" 2>/dev/null)"
 [ "$(wc -l < "$NL" | tr -d ' ')" = "1" ] && grep -q -- '-k info' "$NL" && ! grep -q 'gate-lane-weekly' "$NL" && grep -q '2/9 diffs na fast-lane, 3 rodada' "$NL" && ok "--weekly sends ONE notify line with the headline numbers, kind 'info' (a kind outside notify's catalog warns every week)" || bad "notify: $(cat "$NL")"
+# the notify line is the only thing a human reads (the text report goes to the order's log): what the report warns about must be in it
+grep -q 'ATENÇÃO 2 linha(s) do log ilegíveis' "$NL" && grep -q '1 run(s) fast sem decisão pareada contado(s) como 1 revisor' "$NL" && ok "…and that line carries the unreadable-lines warning and the assumed-reviewer disclosure, not only the headline" || bad "notify line hides the report's warnings: $(cat "$NL")"
 : > "$NL"; rm -f "$OUT"
 PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$T/empty.jsonl" --now "$NOW" --weekly --out "$OUT" >/dev/null
 [ ! -s "$NL" ] && [ ! -e "$OUT" ] && ok "--weekly on an empty window: no notify, no history line (no noise)" || bad "empty window still wrote/notified"
 PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$L" --now "$NOW" --weekly --out "$OUT" --no-notify >/dev/null
 [ ! -s "$NL" ] && ok "--no-notify suppresses the notify" || bad "--no-notify still notified"
+# zero decisions but a SIGNAL (truncated log / silent producer): --weekly still appends the history line and still notifies, with the warning
+for c in A B; do
+  case "$c" in A) F="$LA"; WANT_HIST='"unreadable_lines": 2'; WANT_NOTIFY='ATENÇÃO 2 linha(s) do log ilegíveis' ;; B) F="$LB"; WANT_HIST='"fast_runs_completed": 2'; WANT_NOTIFY='2 run(s) fast concluído(s) sem decisão gravada' ;; esac
+  : > "$NL"; rm -f "$T/hs-$c.jsonl"
+  PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$F" --now "$NOW" --weekly --out "$T/hs-$c.jsonl" >/dev/null 2>"$T/es-$c"; rc=$?
+  [ "$rc" = "0" ] && [ "$(wc -l < "$T/hs-$c.jsonl" 2>/dev/null | tr -d ' ')" = "1" ] && grep -q -F "$WANT_HIST" "$T/hs-$c.jsonl" && ok "--weekly, zero decisions + a signal (case $c): one history line is appended, rc 0" || bad "--weekly case $c wrote no history line: rc=$rc $(cat "$T/es-$c")"
+  [ "$(wc -l < "$NL" | tr -d ' ')" = "1" ] && grep -q 'ATENÇÃO: nenhuma decisão de lane legível' "$NL" && grep -q -- "$WANT_NOTIFY" "$NL" && ok "--weekly, zero decisions + a signal (case $c): ONE notify line, with the warning (never a silent week)" || bad "--weekly case $c notify: $(cat "$NL")"
+done
+# …and the same --weekly on the quiet window still sends nothing and writes nothing
+: > "$NL"; rm -f "$T/hs-q.jsonl"
+PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$LQ" --now "$NOW" --weekly --out "$T/hs-q.jsonl" >/dev/null
+[ ! -s "$NL" ] && [ ! -e "$T/hs-q.jsonl" ] && ok "--weekly on the quiet window (no decision, no signal): no notify, no history line" || bad "quiet window cried wolf: $(cat "$NL" 2>/dev/null)"
 # notify absent: history still written, and it SAYS so
 PATH="/usr/bin:/bin" python3 "$TALLY" --log "$L" --now "$NOW" --weekly --out "$T/h2.jsonl" >/dev/null 2>"$T/e2"; rc=$?
 [ "$rc" = "0" ] && [ -s "$T/h2.jsonl" ] && grep -q 'notify. is not on PATH' "$T/e2" && ok "notify missing: tally still recorded, and the gap is reported on stderr" || bad "notify missing: rc=$rc $(cat "$T/e2")"

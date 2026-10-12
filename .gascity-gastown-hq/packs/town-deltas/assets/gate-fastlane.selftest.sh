@@ -1423,6 +1423,13 @@ lr_has "SET-STATUS run-7 superseded" && lr_has "BD -C /city close run-7" && ok "
 lr_has "RECORD lane=normal code=revoked-at-push files=[] would=2 log=/qg.jsonl" && ok "…the decision is re-recorded as NORMAL with code revoked-at-push (marker metadata + jsonl) — not left saying 'fast'" || bad "revocation not recorded — $LR_OUT"
 lr_has "FIN rc=0" && ! lr_has "FELL-THROUGH" && ok "…and the function RETURNS 0 before the FAIL block: a revoked lane is never a verdict on the author's code" || bad "revoked run fell through to the FAIL/merged handling — $LR_OUT"
 lr_has "NOTIFY" && bad "a routine revocation paged someone" || ok "…no notification (it is routine, not an alarm)"
+# a reviewer count that was never set is UNKNOWN: the handler hands the recorder an EMPTY count (which it writes as null), not a default 0
+# (a measured zero would read as "this run saved no reviewer"). Same run as above, with the one variable unset.
+lr_case failed_lane_revoked 0
+sed 's/^GATE_LANE=fast; GATE_LANE_WOULD_REVIEWERS=2;/GATE_LANE=fast; unset GATE_LANE_WOULD_REVIEWERS;/' "$T/lr.sh" > "$T/lr-unk.sh"
+grep -q 'unset GATE_LANE_WOULD_REVIEWERS' "$T/lr-unk.sh" && ok "premise: the unset-count variant of the harness was built" || bad "premise broken: the harness header drifted, the sed did not unset the count"
+LR_UNK=$("$B32" "$T/lr-unk.sh" 2>&1) || true
+case "$LR_UNK" in *"RECORD lane=normal code=revoked-at-push files=[] would= log=/qg.jsonl"*) ok "revoked run with no reviewer count: the recorder gets it EMPTY (→ null, unknown), not a measured 0" ;; *) bad "revoked run with an unset count did not hand the recorder an empty count: $LR_UNK" ;; esac
 lr_case failed_lane_revoked 10
 lr_has "BD -C /city comment mk-7" && lr_has "another actor" && ! lr_has "re-queued for the normal gate" && ok "revoked run, but another actor moved the marker: the marker comment says WHY it was not re-queued, and never claims the requeue" || bad "a skipped requeue was narrated as a requeue (or not narrated) — $LR_OUT"
 lr_has "FIN rc=0" && ! lr_has "FELL-THROUGH" && ok "…and it still ends cleanly, never as a FAIL" || bad "skipped-requeue run fell through — $LR_OUT"

@@ -22,9 +22,15 @@ Headline numbers (window = last --days):
     checks are too tight
 No bead is mailed and no bead ID is hardcoded: a previous weekly gate report was disabled for mailing a
 settled question to a bead that no longer existed. --weekly appends one line to a history file and sends ONE
-notify line, and only if the window held at least one decision.
+notify line, and only if the window held at least one decision OR a signal that something happened without
+one (unreadable log lines, fast runs that completed with no gate_lane event, revoked lanes — see SIGNALS).
 
-exit 0  tallied (a window with zero decisions is a valid tally: it says so)
+A window with zero decisions has two meanings and they must not read alike: nothing happened (quiet, no
+history line, no notify) or something happened that the decisions cannot show — every gate_lane line truncated
+by a disk-full append, or the producer stopped while fast runs kept merging. The second is reported loudly.
+
+exit 0  tallied. A window with zero decisions and no signal is a valid, quiet tally and says so; zero decisions
+        WITH a signal is tallied too, but as a warning (report, history line, notify), never as "nothing happened"
 exit 2  could not tally — log missing/unreadable. NOT "0 saved": error and empty must not look the same.
 """
 import argparse
@@ -70,6 +76,15 @@ _UNKNOWN_CODE = "outro (reason_code desconhecido)"
 
 def _ts(s):
     return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+
+
+# Counters that say something happened (or went wrong) even when the window holds no lane decision. A tally with zero
+# decisions and all of these zero is an empty week; with any of them non-zero it is not, and must not read as one.
+SIGNALS = ("unreadable_lines", "fast_runs_completed", "lane_revoked_at_push")
+
+
+def _signals(r):
+    return [k for k in SIGNALS if r.get(k)]
 
 
 def _is_dry(ev):
@@ -164,15 +179,26 @@ def tally(log_path, days, now):
 
 
 def render(r):
+    head = f"Gate fast-lane — últimos {r['days']} dias (desde {r['since']}):"
+    if r["decisions"] == 0 and not _signals(r):
+        return f"{head} nenhuma decisão de lane registrada na janela."
+    out = [head]
     if r["decisions"] == 0:
-        return f"Gate fast-lane — últimos {r['days']} dias (desde {r['since']}): nenhuma decisão de lane registrada na janela."
-    pct = round(100 * r["fast"] / r["decisions"])
-    out = [
-        f"Gate fast-lane — últimos {r['days']} dias (desde {r['since']}):",
-        f"  diffs avaliados: {r['decisions']} — fast-lane {r['fast']} ({pct}%) | gate normal {r['normal']}",
-        f"  rodadas de revisor poupadas: {r['reviewer_runs_saved']} "
-        f"(runs fast concluídos: {r['fast_runs_completed']} → PASS {r['fast_pass']}, FAIL {r['fast_fail']})",
-    ]
+        # no decision could be read, yet the log says something happened: this is NOT an empty week
+        out.append("  ATENÇÃO: nenhuma decisão de lane legível na janela, mas o log traz sinais de que algo aconteceu — "
+                   "isto NÃO é uma semana sem movimento:")
+        if r["fast_runs_completed"]:
+            out.append(f"  {r['fast_runs_completed']} run(s) fast concluído(s) (PASS {r['fast_pass']}, FAIL {r['fast_fail']}) "
+                       "sem nenhuma decisão de lane gravada na janela — o evento gate_lane não foi escrito (produtor parado) "
+                       "ou as linhas dele se perderam")
+            out.append(f"  rodadas de revisor poupadas: {r['reviewer_runs_saved']}")
+    else:
+        pct = round(100 * r["fast"] / r["decisions"])
+        out += [
+            f"  diffs avaliados: {r['decisions']} — fast-lane {r['fast']} ({pct}%) | gate normal {r['normal']}",
+            f"  rodadas de revisor poupadas: {r['reviewer_runs_saved']} "
+            f"(runs fast concluídos: {r['fast_runs_completed']} → PASS {r['fast_pass']}, FAIL {r['fast_fail']})",
+        ]
     if r["lane_revoked_at_push"]:
         out.append(f"  fast-lane concedida e revogada(s) no push: {r['lane_revoked_at_push']} "
                    "(o diff mudou ou deixou de ser elegível entre a decisão e o merge; o marker voltou ao gate normal)")
@@ -183,8 +209,27 @@ def render(r):
         for name, n in sorted(r["normal_reasons"].items(), key=lambda kv: -kv[1]):
             out.append(f"    {n:>4}  {name}")
     if r["unreadable_lines"]:
-        out.append(f"  ATENÇÃO: {r['unreadable_lines']} linha(s) do log ilegíveis foram puladas.")
+        out.append(f"  ATENÇÃO: {r['unreadable_lines']} linha(s) do log ilegíveis foram puladas — os números desta apuração podem estar subcontados.")
     return "\n".join(out)
+
+
+def notify_line(r):
+    """The ONE line the weekly sends. It is the only channel a human reads (the text report goes to the order's log),
+    so what the report warns about has to be here too — not only the headline numbers."""
+    if r["decisions"] > 0:
+        line = (f"{r['fast']}/{r['decisions']} diffs na fast-lane, {r['reviewer_runs_saved']} rodada(s) de revisor poupada(s) "
+                f"em {r['days']}d ({r['doc_test_only_bounced_by_check']} só-doc/teste barrados por checagem)")
+    else:
+        line = f"ATENÇÃO: nenhuma decisão de lane legível em {r['days']}d, mas o log tem sinais de que algo aconteceu"
+        if r["fast_runs_completed"]:
+            line += f"; {r['fast_runs_completed']} run(s) fast concluído(s) sem decisão gravada"
+    if r["lane_revoked_at_push"]:
+        line += f"; {r['lane_revoked_at_push']} lane(s) revogada(s) no push"
+    if r["saved_unmatched_assumed_1"] and r["decisions"] > 0:
+        line += f"; {r['saved_unmatched_assumed_1']} run(s) fast sem decisão pareada contado(s) como 1 revisor"
+    if r["unreadable_lines"]:
+        line += f"; ATENÇÃO {r['unreadable_lines']} linha(s) do log ilegíveis — números podem estar subcontados"
+    return line
 
 
 def main(argv):
@@ -210,7 +255,7 @@ def main(argv):
         return 2
     print(json.dumps(r, ensure_ascii=False) if a.json else render(r))
     if a.weekly:
-        if r["decisions"] > 0:
+        if r["decisions"] > 0 or _signals(r):   # only a window with neither a decision nor a signal is an empty week
             try:
                 with open(a.out, "a") as fh:
                     fh.write(json.dumps({"ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"), **r}, ensure_ascii=False) + "\n")
@@ -220,12 +265,8 @@ def main(argv):
             if not a.no_notify and not shutil.which("notify"):
                 print("gate-lane-tally: `notify` is not on PATH — tally appended to the history file only", file=sys.stderr)
             if not a.no_notify and shutil.which("notify"):
-                line = (f"{r['fast']}/{r['decisions']} diffs na fast-lane, {r['reviewer_runs_saved']} rodada(s) de revisor poupada(s) "
-                        f"em {r['days']}d ({r['doc_test_only_bounced_by_check']} só-doc/teste barrados por checagem)")
-                if r["lane_revoked_at_push"]:
-                    line += f"; {r['lane_revoked_at_push']} lane(s) revogada(s) no push"
                 try:
-                    sent = subprocess.run(["notify", "-k", "info", "-t", "Gate fast-lane (semana)", "-p", "2", line], timeout=30, check=False)
+                    sent = subprocess.run(["notify", "-k", "info", "-t", "Gate fast-lane (semana)", "-p", "2", notify_line(r)], timeout=30, check=False)
                     if sent.returncode != 0:   # a notify that ran and refused is as silent as one that is missing: say so
                         print(f"gate-lane-tally: `notify` exited {sent.returncode} — tally appended to the history file only", file=sys.stderr)
                 except Exception as e:  # a failed notification must not fail the tally
