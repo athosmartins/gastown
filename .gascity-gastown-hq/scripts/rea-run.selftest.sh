@@ -9,13 +9,22 @@
 #   disco (fronteira 10 GB) · swap (fronteira 6144 MB, unidades M/G) · df/sysctl/pgrep ILEGÍVEL = 93, nunca "pode rodar" ·
 #   outro `rea` (espera, desiste em 91, some e segue; o próprio wrapper e seus ancestrais NÃO contam) · trava de dono morto,
 #   de pid reaproveitado e sem dono é reaped; de dono vivo NÃO é · trava não criável = 93 · rc do comando · SIGTERM no meio
-#   (árvore morta, scratch e trava limpos, rc 143) · timeout (124) · scratch órfão apagado, symlink e vizinho preservados ·
+#   (árvore morta, scratch e trava limpos, rc 143, aviso no stderr e evento `signal` no log) · timeout (124) ·
+#   REMOÇÃO DA TRAVA SERIALIZADA (gate-fix 2, ga-qm9q1b): 3 chamadores escalonados contra UMA trava velha com a janela "julguei →
+#   ajo" alargada por um ps lento — nunca 2 comandos pesados ao mesmo tempo, uma única remoção; mutex de remoção ocupado/sem
+#   lockf = não remove (91), solto pelo kernel quando o segurador morre; release sem mutex deixa a trava; gravação do dono
+#   exclusiva (a trava refeita por outro nunca é tomada nem apagada, nem na falha); mkdir que falha porque a trava sumiu tenta de
+#   novo; release de trava que já não é minha não apaga; marcador de timeout privado (nada escrito dentro da trava) ·
+#   scratch órfão: só o de pid MORTO é apagado (pid vivo, nome sem pid, symlink e vizinho preservados) ·
 #   --push/--pull/--env · uso errado (94, inclusive dois --push de mesmo nome) · log sem argumentos do comando · --check ·
 #   --pull no MBP que falhou (mbp-run sai 0 e só avisa): 93, nunca "chegou" · configuração numérica com zero à esquerda, sinal ou
 #   estouro: 93 sem rodar (a aritmética do bash leria 08/010 como octal).
 # CONTROLE NEGATIVO: cada porta (marcador "# gate:<nome>" no script: disk, swap, lock, lock-live, cleanup, fallback, timeout,
-#   exit-trap, self-chain, opt-sem-valor, ilegivel-disco/swap/pgrep, pull-mbp, isnum, push-dup) é removida numa cópia e o mutante TEM que deixar de reproduzir o resultado
-#   do script real no caso que a protege — inclusive "ilegível virou pode-rodar".
+#   exit-trap, self-chain, opt-sem-valor, ilegivel-disco/swap/pgrep, pull-mbp, isnum, push-dup, e as do gate-fix 2: reap-mutex,
+#   reap-rejudge, owner-claim, owner-lost, lock-vanish, release-owner, orphan-live, timeout-private, sinal-log) é removida numa cópia e
+#   o mutante TEM que deixar de reproduzir o resultado do script real no caso que a protege — inclusive "ilegível virou pode-rodar".
+#   O teste de concorrência também tem que FALHAR no rea-run.sh anterior ao gate-fix 2 (a corrida existia de verdade): ver o
+#   comentário da seção 7b e REA_RUN_UNDER_TEST.
 # REA_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro rea-run.sh.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -82,7 +91,45 @@ for ((i = 0; i < ${#args[@]}; i++)); do
 done
 exit "${STUB_MBP_RC:-99}"
 EOF
+cat > "$T/bin/ps-slow" <<'EOF'
+#!/usr/bin/env bash
+# REA_RUN_PS: o ps de verdade, mas a leitura de `lstart` do pid STUB_PS_SLOW_PID demora STUB_PS_DELAY s. Alarga de forma DETERMINÍSTICA
+#   a janela entre "julguei a trava velha" e "ajo sobre o caminho dela" (em produção são milissegundos que nenhum teste enxerga).
+if [ -n "${STUB_PS_SLOW_PID:-}" ]; then
+  case "$*" in *lstart*"-p $STUB_PS_SLOW_PID") sleep "${STUB_PS_DELAY:-1}" ;; esac
+fi
+exec /bin/ps "$@"
+EOF
 chmod +x "$T/bin/"*
+# mv/ln que imitam o processo PARADO entre o mkdir e a gravação do dono: quando ele volta e grava (.../owner), a trava dele já foi
+# removida e REFEITA por outro, com dono VIVO (STUB_FOREIGN_PID/START). STUB_CLAIM_MODE: real = a gravação segue sobre a trava do
+# outro · fail = a gravação falha depois da troca · failclean = a gravação falha e ninguém trocou nada (erro de verdade).
+mkdir -p "$T/claim" "$T/vanish"
+cat > "$T/claim/stub" <<'EOF'
+#!/usr/bin/env bash
+base=$(basename "$0"); prev=""; last=""
+for a in "$@"; do prev=$last; last=$a; done
+if [ -n "${STUB_CLAIM_MODE:-}" ]; then
+  case "$last" in */owner)
+    [ "$STUB_CLAIM_MODE" = failclean ] && exit 1
+    lock=$(dirname "$last"); body=$(cat "$prev" 2>/dev/null)
+    rm -rf "$lock"; mkdir "$lock"
+    printf '%s\n%s\n%s\n' "$STUB_FOREIGN_PID" "$(date +%s)" "$STUB_FOREIGN_START" > "$lock/owner"
+    [ "$STUB_CLAIM_MODE" = fail ] && exit 1
+    printf '%s\n' "$body" > "$prev" ;;
+  esac
+fi
+exec "/bin/$base" "$@"
+EOF
+chmod +x "$T/claim/stub"; ln -s stub "$T/claim/mv"; ln -s stub "$T/claim/ln"
+# mkdir que falha UMA vez no caminho da trava, sem criá-la (a trava existia e o dono soltou no meio)
+cat > "$T/vanish/mkdir" <<'EOF'
+#!/usr/bin/env bash
+last=""; for a in "$@"; do last=$a; done
+if [ "${STUB_MKDIR_FAIL_ONCE:-}" = "$last" ] && [ ! -e "$STUB_MKDIR_MARK" ]; then : > "$STUB_MKDIR_MARK"; exit 1; fi
+exec /bin/mkdir "$@"
+EOF
+chmod +x "$T/vanish/mkdir"
 N=0
 reset_env() {
   N=$((N+1))
@@ -90,7 +137,7 @@ reset_env() {
   export REA_RUN_DF="$T/bin/df" REA_RUN_SYSCTL="$T/bin/sysctl" REA_RUN_PGREP="$T/bin/pgrep"
   export REA_RUN_POLL_S=0.1 REA_RUN_KILL_GRACE_S=1 REA_RUN_WAIT_S=30 REA_RUN_TIMEOUT_S=60 REA_RUN_MIN_FREE_GB=10 REA_RUN_MAX_SWAP_MB=6144
   export STUB_MBP_LOG="$T/mbp.$N.log" STUB_PGREP_FILE="$T/pgrep.$N" MARK="$T/mark.$N"
-  unset REA_RUN_LOCK_DIR STUB_PGREP_SAMPLES REA_RUN_PGREP_PATTERN STUB_DF_FAIL STUB_DF_RAW STUB_DF_KB STUB_SWAP_FAIL STUB_SWAP_RAW STUB_SWAP_USED STUB_MBP_OUT STUB_MBP_PULL STUB_MBP_PULL_SKIP STUB_MBP_PULL_MTIME REA_RUN_LOCK_ORPHAN_S REA_RUN_NICE
+  unset REA_RUN_LOCK_DIR STUB_PGREP_SAMPLES REA_RUN_PGREP_PATTERN STUB_DF_FAIL STUB_DF_RAW STUB_DF_KB STUB_SWAP_FAIL STUB_SWAP_RAW STUB_SWAP_USED STUB_MBP_OUT STUB_MBP_PULL STUB_MBP_PULL_SKIP STUB_MBP_PULL_MTIME REA_RUN_LOCK_ORPHAN_S REA_RUN_NICE REA_RUN_PS STUB_PS_SLOW_PID STUB_PS_DELAY REA_RUN_LOCKF REA_RUN_REAP_WAIT_S STUB_CLAIM_MODE STUB_FOREIGN_PID STUB_FOREIGN_START STUB_MKDIR_FAIL_ONCE STUB_MKDIR_MARK
   export STUB_MBP_RC=99
   find "$REA_RUN_CITY" "$REA_RUN_SCRATCH_ROOT" -depth -delete 2>/dev/null
   : > "$STUB_MBP_LOG"; rm -f "$STUB_PGREP_FILE" "$MARK"
@@ -264,13 +311,97 @@ run --local -- sh -c "echo x > '$MARK'"; eq "trava sem dono e velha é reaped" 0
 reset_env; : > "$T/arquivo.$N"; export REA_RUN_LOCK_DIR="$T/arquivo.$N/lock"; run --local -- sh -c "echo x > '$MARK'"
 eq "trava não criável: 93" 93 "$RC"; [ ! -e "$MARK" ]; ok "trava não criável: comando NÃO rodou" $?; has "trava não criável: motivo" 'trava-nao-criavel' "$(cat "$LOGF")"
 
+# ---- 7b. a remoção da trava é serializada e re-julgada DENTRO do mutex (gate-fix 2) ------------------------------------------
+# O reap era check-then-act: julgava UMA trava velha e depois movia o que estivesse no caminho NA HORA — a trava nova e viva que outro
+# chamador acabara de criar. Aqui o ps de `lstart` do dono morto demora (alarga julgar→agir, em produção milissegundos) e três
+# chamadores entram escalonados (0, 0,5 e 1 s) contra UMA trava velha: quem julga primeiro já refez a trava (viva) quando o seguinte age.
+conc_peak() { awk '$1=="+"{n++; if(n>m)m=n} $1=="-"{n--} END{print m+0}' "$1"; }   # pico de comandos pesados ao mesmo tempo
+probe_reap_conc() { # script → "pico=<m> rcs=<rc,rc,rc,> reaps=<k>"
+  reset_env
+  local C="$T/conc.$N" E="$T/conc-err.$N" p pids="" rcs=""
+  : > "$C"; : > "$E"; mklock 999999 "Mon Jan  1 00:00:00 2001"
+  export REA_RUN_PS="$T/bin/ps-slow" STUB_PS_SLOW_PID=999999 STUB_PS_DELAY=1.2
+  for _ in 1 2 3; do
+    "$1" --local -- sh -c "echo + >> '$C'; sleep 2; echo - >> '$C'" >/dev/null 2>>"$E" & pids="$pids $!"
+    sleep 0.5
+  done
+  BGPIDS="$BGPIDS$pids"
+  for p in $pids; do wait "$p"; rcs="$rcs$?,"; done
+  echo "pico=$(conc_peak "$C") rcs=$rcs reaps=$(grep -c 'trava órfã removida' "$E")"
+}
+OUT=$(probe_reap_conc "$RUN")
+has "reap concorrente (3 chamadores × 1 trava velha): NUNCA 2 comandos pesados ao mesmo tempo" "pico=1 " "$OUT"
+has "reap concorrente: todos terminam, rc 0 (os que perdem esperam, não falham com 93)" "rcs=0,0,0," "$OUT"
+has "reap concorrente: uma única remoção da órfã" "reaps=1" "$OUT"
+
+hold_reap_mutex() { # segura o mutex de reap num processo à parte (HOLDER); o mutex é do kernel: some quando ele morre, KILL inclusive
+  local fifo="$T/fifo.$N" held="$T/held.$N"; rm -f "$fifo" "$held"; mkfifo "$fifo"
+  bash -c 'exec 8>>"$1"; lockf -s -t 0 8 || exit 3; echo held > "$3"; exec 7<>"$2"; read -t 60 -u 7 _' _ "$LOCK.reap" "$fifo" "$held" &
+  HOLDER=$!; BGPIDS="$BGPIDS $HOLDER"
+  for _ in $(seq 1 50); do [ -s "$held" ] && break; sleep 0.1; done
+  [ -s "$held" ]
+}
+reset_env; export REA_RUN_REAP_WAIT_S=1; mklock 999999 "Mon Jan  1 00:00:00 2001"
+hold_reap_mutex; ok "mutex de reap: segurador no ar" $?
+run --local --wait-s 2 -- sh -c "echo x > '$MARK'"
+eq "órfã + mutex de reap ocupado: NÃO remove às cegas (91)" 91 "$RC"; [ ! -e "$MARK" ]; ok "mutex ocupado: comando NÃO rodou" $?
+eq "mutex ocupado: a trava velha segue lá, intocada" 999999 "$(sed -n 1p "$LOCK/owner" 2>/dev/null)"
+has "mutex ocupado: a mensagem diz por quê" "mutex de reap" "$OUT"; has "mutex ocupado: motivo" '"reason":"trava-ocupada"' "$(cat "$LOGF")"
+kill -KILL "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+run --local -- sh -c "echo x > '$MARK'"
+eq "segurador do mutex morreu (SIGKILL): o kernel soltou e a próxima execução remove a órfã" 0 "$RC"
+has "mutex solto pelo kernel: órfã removida" "trava órfã removida" "$OUT"; [ -e "$MARK" ]; ok "mutex solto: comando rodou" $?; clean_after "mutex solto"
+reset_env; mklock 999999 "Mon Jan  1 00:00:00 2001"; REA_RUN_LOCKF="$T/nao-existe/lockf" run --local --wait-s 1 -- sh -c "echo x > '$MARK'"
+eq "sem lockf: a órfã NÃO é removida (91) — 'não sei' nunca vira 'pode remover'" 91 "$RC"; [ ! -e "$MARK" ]; ok "sem lockf: comando NÃO rodou" $?
+eq "sem lockf: a trava velha segue lá" 999999 "$(sed -n 1p "$LOCK/owner" 2>/dev/null)"
+# solto o dono: sem o mutex a trava FICA (o dono morto a torna órfã) e a próxima execução a remove
+reset_env; export REA_RUN_REAP_WAIT_S=1; hold_reap_mutex; ok "release: segurador no ar" $?
+run --local -- true
+eq "release sem mutex: o rc é o do comando (0)" 0 "$RC"; has "release sem mutex: avisa" "sem o mutex de reap" "$OUT"; [ -d "$LOCK" ]; ok "release sem mutex: a trava fica (dono morto)" $?
+kill -KILL "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+run --local -- sh -c "echo x > '$MARK'"; eq "release sem mutex: a próxima execução remove a órfã e roda" 0 "$RC"; has "...e avisa" "trava órfã removida" "$OUT"; clean_after "pós release sem mutex"
+
+# gravar o dono da trava: o processo parado entre o mkdir e a gravação volta DEPOIS de a trava dele ter sido removida e refeita por
+# outro (dono vivo). O `mv` antigo sobrescrevia o dono do outro; o erro apagava a trava do outro. Agora a gravação é `ln` (exclusiva).
+sleep 60 >/dev/null 2>&1 & foreign=$!; BGPIDS="$BGPIDS $foreign"; fstart=$(pstart "$foreign")
+for mode in real fail; do
+  reset_env; export STUB_CLAIM_MODE=$mode STUB_FOREIGN_PID=$foreign STUB_FOREIGN_START="$fstart"
+  PATH="$T/claim:$PATH" run --local --wait-s 1 -- sh -c "echo x > '$MARK'"
+  eq "dono: gravação perdida ($mode) — espera como os demais (91), não toma nem apaga a trava do outro" 91 "$RC"
+  [ ! -e "$MARK" ]; ok "dono ($mode): comando NÃO rodou" $?
+  eq "dono ($mode): o dono do outro segue na trava" "$foreign" "$(sed -n 1p "$LOCK/owner" 2>/dev/null)"
+done
+reset_env; export STUB_CLAIM_MODE=failclean
+PATH="$T/claim:$PATH" run --local -- sh -c "echo x > '$MARK'"
+eq "dono: falha de verdade ao gravar (ninguém trocou nada): 93" 93 "$RC"; has "dono: falha real — motivo" '"reason":"trava-sem-dono"' "$(cat "$LOGF")"
+[ ! -e "$LOCK" ]; ok "dono: falha real não deixa trava vazia" $?; [ ! -e "$MARK" ]; ok "dono: falha real — comando NÃO rodou" $?
+# o mkdir da trava falha porque existia e o dono soltou logo depois: tenta de novo, não é "trava não criável"
+reset_env; export STUB_MKDIR_FAIL_ONCE="$LOCK" STUB_MKDIR_MARK="$T/mk.$N"; rm -f "$STUB_MKDIR_MARK"
+PATH="$T/vanish:$PATH" run --local -- sh -c "echo x > '$MARK'"
+eq "mkdir falhou e a trava já não existe (o dono soltou): tenta de novo, rc 0" 0 "$RC"; [ -e "$MARK" ]; ok "mkdir que sumiu: comando rodou" $?; clean_after "mkdir que sumiu"
+# release: a trava que já não é minha NÃO é apagada
+reset_env; takeover="printf '%s\n%s\n%s\n' $foreign 1 '$fstart' > '$LOCK/o.new' && mv -f '$LOCK/o.new' '$LOCK/owner'"
+run --local -- sh -c "$takeover"
+eq "release: rc do comando" 0 "$RC"; has "release: a trava já não é minha" "já não é minha" "$OUT"
+eq "release: a trava do outro segue lá" "$foreign" "$(sed -n 1p "$LOCK/owner" 2>/dev/null)"
+# o marcador de timeout não vai para dentro da trava (que pode já ser de outro): a trava só tem o dono
+reset_env; export REA_RUN_TIMEOUT_S=1; takeover="printf '%s\n%s\n%s\n' $foreign 1 '$fstart' > '$LOCK/o.new' && mv -f '$LOCK/o.new' '$LOCK/owner'"
+run --local -- sh -c "$takeover; ls -A '$LOCK' | tr '\n' ' ' > '$T/seen.$N'; sleep 20"
+eq "timeout com a trava trocada: rc 124 (o marcador é privado)" 124 "$RC"
+eq "timeout: nada além do dono do outro dentro da trava dele (visto de dentro do comando)" "owner" "$(sed 's/ $//' "$T/seen.$N" 2>/dev/null)"
+eq "timeout: a trava do outro segue lá depois" "$foreign" "$(sed -n 1p "$LOCK/owner" 2>/dev/null)"
+rm -rf "$LOCK"
+
 # ---- 8. sinal e timeout -----------------------------------------------------------------------------------------------
 reset_env; PIDF="$T/gpid.$N"
-"$RUN" --local -- sh -c "sleep 60 & echo \$! > '$PIDF'; wait" >/dev/null 2>&1 & w=$!; BGPIDS="$BGPIDS $w"
+"$RUN" --local -- sh -c "sleep 60 & echo \$! > '$PIDF'; wait" >/dev/null 2>"$T/sigerr.$N" & w=$!; BGPIDS="$BGPIDS $w"
 for _ in $(seq 1 50); do [ -s "$PIDF" ] && break; sleep 0.1; done
 gp=$(cat "$PIDF" 2>/dev/null); kill -0 "$gp" 2>/dev/null; ok "SIGTERM: neto vivo antes do sinal" $?
 kill -TERM "$w"; wait "$w"; rc=$?
 eq "SIGTERM: rc 143" 143 "$rc"
+has "SIGTERM: o aviso do handler chega ao stderr (não é engolido pelo wait)" "recebi SIGTERM" "$(cat "$T/sigerr.$N" 2>/dev/null)"
+has "SIGTERM: a execução cortada deixa UM evento no log" '"event":"signal","mode":"local","rc":143' "$(cat "$LOGF" 2>/dev/null)"
+has "SIGTERM: motivo no log" '"reason":"sinal-term"' "$(cat "$LOGF" 2>/dev/null)"
 sleep 0.3; kill -0 "$gp" 2>/dev/null; [ $? -ne 0 ]; ok "SIGTERM: neto morto" $?
 clean_after "SIGTERM"
 # SIGKILL no wrapper não limpa: a PRÓXIMA execução reaps a trava de dono morto e apaga o scratch órfão
@@ -291,14 +422,22 @@ eq "timeout: rc 124" 124 "$RC"; [ ! -e "$MARK" ]; ok "timeout: comando encerrado
 [ $((s1 - s0)) -lt 15 ]; ok "timeout: voltou antes do comando acabar ($((s1 - s0)) s de 20)" $?; has "timeout: aviso" "timeout de 1s" "$OUT"; clean_after "timeout"
 
 # ---- 9. scratch órfão ------------------------------------------------------------------------------------------------
-reset_env; mkdir -p "$REA_RUN_SCRATCH_ROOT/run.OLD" "$REA_RUN_SCRATCH_ROOT/keepme" "$T/victim.$N"
-echo captura > "$REA_RUN_SCRATCH_ROOT/run.OLD/cap.json"; echo v > "$T/victim.$N/arquivo"; echo k > "$REA_RUN_SCRATCH_ROOT/keepme/k"
-ln -s "$T/victim.$N" "$REA_RUN_SCRATCH_ROOT/run.LINK"; chmod -R go-rwx "$REA_RUN_SCRATCH_ROOT"
+# órfão = o nome traz o pid de quem o criou (run.<pid>.XXXXXX, tmo.<pid>) e esse pid morreu. Scratch de execução VIVA, de nome sem pid ou
+# symlink NUNCA é apagado: o varredor não pode depender de a trava ter dado exclusividade (era o que apagava o scratch vivo do outro).
+reset_env; R="$REA_RUN_SCRATCH_ROOT"
+mkdir -p "$R/run.999999.OLD" "$R/run.$foreign.LIVE" "$R/run.SEMPID" "$R/keepme" "$T/victim.$N"
+echo captura > "$R/run.999999.OLD/cap.json"; echo viva > "$R/run.$foreign.LIVE/cap.json"; echo s > "$R/run.SEMPID/s"; echo v > "$T/victim.$N/arquivo"; echo k > "$R/keepme/k"
+: > "$R/tmo.999999"; : > "$R/tmo.$foreign"
+ln -s "$T/victim.$N" "$R/run.999998.LINK"; chmod -R go-rwx "$R"
 run --local -- true
-eq "órfão: rc 0" 0 "$RC"; [ ! -e "$REA_RUN_SCRATCH_ROOT/run.OLD" ]; ok "órfão run.OLD apagado" $?
-[ -f "$T/victim.$N/arquivo" ]; ok "symlink run.LINK: alvo NÃO apagado" $?
-[ -L "$REA_RUN_SCRATCH_ROOT/run.LINK" ]; ok "symlink run.LINK: preservado e avisado" $?; has "symlink: aviso" "symlink" "$OUT"
-[ -f "$REA_RUN_SCRATCH_ROOT/keepme/k" ]; ok "vizinho fora de run.* intacto" $?
+eq "órfão: rc 0" 0 "$RC"; [ ! -e "$R/run.999999.OLD" ]; ok "órfão de pid morto (run.999999.OLD) apagado" $?
+[ -f "$R/run.$foreign.LIVE/cap.json" ]; ok "scratch de execução VIVA (pid $foreign) NÃO é apagado" $?
+[ -f "$R/run.SEMPID/s" ]; ok "nome sem pid (run.SEMPID): preservado" $?; has "nome sem pid: avisa" "não traz o pid" "$OUT"
+[ ! -e "$R/tmo.999999" ]; ok "marcador de timeout de pid morto apagado" $?; [ -e "$R/tmo.$foreign" ]; ok "marcador de timeout de pid vivo preservado" $?
+[ -f "$T/victim.$N/arquivo" ]; ok "symlink run.999998.LINK: alvo NÃO apagado" $?
+[ -L "$R/run.999998.LINK" ]; ok "symlink run.999998.LINK: preservado e avisado" $?; has "symlink: aviso" "symlink" "$OUT"
+[ -f "$R/keepme/k" ]; ok "vizinho fora de run.* intacto" $?
+kill "$foreign" 2>/dev/null
 
 # ---- 10. push / pull / env / uso -------------------------------------------------------------------------------------
 reset_env; echo conteudo > "$T/in.$N.txt"
@@ -432,7 +571,51 @@ mutant_check swap probe_swap '/# gate:swap/s/.*/  :/'
 mutant_check lock probe_lock '/# gate:lock/s/if mkdir /if mkdir -p /'
 mutant_check cleanup probe_cleanup '/# gate:cleanup/s/.*/  :/'
 mutant_check fallback probe_fallback '/# gate:fallback/s/96|97|98|99)/NUNCA)/'
-mutant_check timeout probe_timeout '/# gate:timeout/s/: > "\$LOCK_DIR\/timeout"; stop_tree "\$CHILD"/:/'
+mutant_check timeout probe_timeout '/# gate:timeout/s/echo 1 > "\$TMO"; stop_tree "\$CHILD"/:/'
+
+# ---- portas novas do gate-fix 2: reap/release sob mutex, gravação exclusiva do dono, varredor de órfãos, marcador privado ----
+probe_conc() { probe_reap_conc "$1"; }
+probe_mutex_held() { reset_env; export REA_RUN_REAP_WAIT_S=1; mklock 999999 "Mon Jan  1 00:00:00 2001"; hold_reap_mutex
+  RUN="$1" run --local --wait-s 2 -- sh -c "echo x > '$MARK'"; kill -KILL "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+  echo "$RC|$([ -e "$MARK" ] && echo rodou || echo parou)"; }
+probe_claim() { # $1 = script · $2 = modo (real|fail)
+  reset_env; sleep 60 >/dev/null 2>&1 & local f=$!; BGPIDS="$BGPIDS $f"
+  export STUB_CLAIM_MODE=$2 STUB_FOREIGN_PID=$f STUB_FOREIGN_START="$(pstart "$f")"
+  PATH="$T/claim:$PATH" RUN="$1" run --local --wait-s 1 -- sh -c "echo x > '$MARK'"
+  local own; own=$([ "$(sed -n 1p "$LOCK/owner" 2>/dev/null)" = "$f" ] && echo dono-do-outro || echo dono-trocado); kill "$f" 2>/dev/null
+  echo "$RC|$own|$([ -e "$MARK" ] && echo rodou || echo parou)"; }
+probe_claim_real() { probe_claim "$1" real; }
+probe_claim_fail() { probe_claim "$1" fail; }
+probe_vanish() { reset_env; export STUB_MKDIR_FAIL_ONCE="$LOCK" STUB_MKDIR_MARK="$T/mkv.$N"; rm -f "$STUB_MKDIR_MARK"
+  PATH="$T/vanish:$PATH" RUN="$1" run --local -- sh -c "echo x > '$MARK'"; echo "$RC|$([ -e "$MARK" ] && echo rodou || echo parou)"; }
+probe_release_takeover() { reset_env; sleep 60 >/dev/null 2>&1 & local f=$!; BGPIDS="$BGPIDS $f"; local fs; fs=$(pstart "$f")
+  RUN="$1" run --local -- sh -c "printf '%s\n%s\n%s\n' $f 1 '$fs' > '$LOCK/o.new' && mv -f '$LOCK/o.new' '$LOCK/owner'"
+  local own=ausente; [ "$(sed -n 1p "$LOCK/owner" 2>/dev/null)" = "$f" ] && own=do-outro; kill "$f" 2>/dev/null; rm -rf "$LOCK"
+  echo "$RC|trava=$own"; }
+probe_orphan_live() { reset_env; sleep 60 >/dev/null 2>&1 & local f=$!; BGPIDS="$BGPIDS $f"; local R="$REA_RUN_SCRATCH_ROOT"
+  mkdir -p "$R/run.$f.LIVE"; echo viva > "$R/run.$f.LIVE/cap.json"; chmod -R go-rwx "$R"
+  RUN="$1" run --local -- true; local v=apagado; [ -f "$R/run.$f.LIVE/cap.json" ] && v=intacto; kill "$f" 2>/dev/null
+  echo "$RC|scratch-vivo=$v"; }
+probe_timeout_private() { reset_env; export REA_RUN_TIMEOUT_S=1; sleep 60 >/dev/null 2>&1 & local f=$!; BGPIDS="$BGPIDS $f"; local fs; fs=$(pstart "$f")
+  RUN="$1" run --local -- sh -c "printf '%s\n%s\n%s\n' $f 1 '$fs' > '$LOCK/o.new' && mv -f '$LOCK/o.new' '$LOCK/owner'; ls -A '$LOCK' | tr '\n' ' ' > '$T/seen.$N'; sleep 20"
+  local ls_; ls_=$(sed 's/ $//' "$T/seen.$N" 2>/dev/null); kill "$f" 2>/dev/null; rm -rf "$LOCK"
+  echo "$RC|lock=[$ls_]"; }
+probe_sinal_log() { reset_env; local pf="$T/sl.$N"
+  "$1" --local -- sh -c "sleep 30 & echo \$! > '$pf'; wait" >/dev/null 2>&1 & local w=$!
+  for _ in $(seq 1 50); do [ -s "$pf" ] && break; sleep 0.1; done
+  kill -TERM "$w"; wait "$w" 2>/dev/null; local rc=$?; sleep 0.3
+  local gp; gp=$(cat "$pf" 2>/dev/null); kill -KILL "$gp" 2>/dev/null
+  echo "$rc|signal-no-log=$(grep -c '"event":"signal"' "$LOGF" 2>/dev/null)"; }
+mutant_check reap-mutex probe_conc '/# gate:reap-mutex/s/if "\$LOCKF_BIN" -s -t "\$REAP_WAIT_S" 8 2>\/dev\/null; then/if true; then/'
+mutant_check reap-mutex-ocupado probe_mutex_held '/# gate:reap-mutex/s/if "\$LOCKF_BIN" -s -t "\$REAP_WAIT_S" 8 2>\/dev\/null; then/if true; then/'
+mutant_check reap-rejudge probe_conc '/# gate:reap-rejudge/s/if \[ "\$(lock_state)" = stale \]; then/if true; then/'
+mutant_check owner-claim probe_claim_real '/# gate:owner-claim/s/ln "\$tmp"/mv -f "$tmp"/'
+mutant_check owner-lost probe_claim_fail '/# gate:owner-lost/s/\[ -e "\$LOCK_DIR\/owner" \] \&\& continue/false/'
+mutant_check lock-vanish probe_vanish '/# gate:lock-vanish/s/.*/      die 93 "trava-nao-criavel" "mutante"/'
+mutant_check release-owner probe_release_takeover '/# gate:release-owner/s/if \[ "\$(owner_field 1)" = "\$\$" \]; then/if true; then/'
+mutant_check orphan-live probe_orphan_live '/# gate:orphan-live/s/alive "\$opid" \&\& continue/:/'
+mutant_check timeout-private probe_timeout_private '/# gate:timeout-private/s/TMO="\$SCRATCH_ROOT\/tmo.\$\$"/TMO="$LOCK_DIR\/timeout"/'
+mutant_check sinal-log probe_sinal_log '/# gate:sinal-log/s/.*/  :/'
 
 printf '\nrea-run.selftest: %s ok, %s falha(s)\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

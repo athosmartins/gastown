@@ -3,7 +3,7 @@
 #   trava de 1 execução, folga de disco/swap e scratch apagado no fim.
 #
 # Contents
-#   Por quê · Uso · Códigos de saída · Como funciona · O que NÃO faz
+#   Por quê · Uso · Códigos de saída · Como funciona · Limites conhecidos · O que NÃO faz
 #
 # POR QUÊ (programa REA, épico ga-oe7o1p; ga-szz40p): REA abre Chrome/Ghidra/JVM e o mini vive no limite (11/10: swap alto,
 #   disco crítico). As regras do programa — 10 GB livres, swap até 6 GB, nenhum outro `rea` ao mesmo tempo, capturas em scratch
@@ -24,7 +24,8 @@
 #   com os do wrapper (no MBP, um comando que saia 96..99 pode ser lido como "rode local" e rodar de novo no mini). O "reason" do
 #   log desambigua: "-" = o comando rodou e saiu com esse código; qualquer outro valor = o wrapper.
 #   0..90   código do comando (MBP ou mini)
-#   91      esperou o orçamento (--wait-s, padrão 1800 s) e a trava ou outro `rea` continuou ocupando
+#   91      esperou o orçamento (--wait-s, padrão 1800 s) e a trava ou outro `rea` continuou ocupando (se a trava era órfã mas
+#           o mutex de remoção não abriu, a mensagem diz — ver "Limites conhecidos")
 #   92      RECUSADO: sem folga — disco livre < 10 GB ou swap usado > 6144 MB (ou, em --check, outro `rea` rodando)
 #   93      não consegui olhar ou preparar: df/sysctl/pgrep ilegível, trava ou scratch não criáveis, configuração inválida,
 #           ou o comando saiu 0 mas um --pull pedido falhou (o resultado não chegou; no MBP o mbp-run sai 0 e só avisa, então
@@ -44,18 +45,45 @@
 #        MBP) e "não mudou" vira 93/pull-falhou. Limite: pull de arquivo byte-idêntico que o rsync pulou lê como "não chegou" —
 #        apague o destino antigo antes de pedir de novo.
 #   mini: (1) checa disco/swap já de cara (não vale esperar a trava para ser recusado depois) → (2) pega a trava
-#        (mkdir atômico em $CITY/.gc/run/rea-run.lock, dono = pid + hora de início do processo; dono morto ou pid
-#        reaproveitado é reaped) e espera até --wait-s → (3) espera não haver outro `rea` rodando (rodado por fora do
+#        (mkdir atômico em $CITY/.gc/run/rea-run.lock; dono = pid + hora de início do processo, gravado por `ln`, que é
+#        criação EXCLUSIVA e nunca sobrescreve o dono de outro; dono morto ou pid reaproveitado é reaped, sob mutex — ver
+#        "Remoção da trava") e espera até --wait-s → (3) espera não haver outro `rea` rodando (rodado por fora do
 #        wrapper; só processo `node .../bin/rea` conta, não o texto "bin/rea" no argumento de outro processo) → (4) checa disco/swap DE NOVO, já sob a trava → (5) apaga scratch órfão de execução que morreu →
 #        (6) cria scratch 0700 fora de qualquer repo → (7) roda o comando com cwd = scratch, nice 10, timeout e
 #        $REA_RUN_SCRATCH → (8) --pull → (9) apaga o scratch (também em erro, timeout, INT/TERM/HUP) e solta a trava.
-#   Log: $CITY/.gc/logs/rea-run.jsonl — um evento por execução (ran), recusa/espera esgotada (refused) ou desvio para o mini
-#        (fallback), só o NOME do comando e o nº de argumentos (argumentos podem carregar URL/segredo). Uso errado (94),
-#        configuração inválida (93) e --check NÃO gravam log: só o stderr.
+#   Remoção da trava (reap de órfã e release do dono; ga-szz40p gate-fix 2, cobre ga-qm9q1b): "esta trava é velha" e "então movo
+#        o caminho" eram dois passos sobre um NOME — entre eles outro processo podia remover a MESMA trava velha e criar uma nova,
+#        VIVA, no mesmo caminho, e o `mv` levava a viva (dois comandos pesados ao mesmo tempo). Agora toda remoção roda sob um
+#        mutex do kernel (`lockf` num fd aberto em $CITY/.gc/run/rea-run.lock.reap; o kernel o solta sozinho se quem o segura
+#        morrer, SIGKILL inclusive — não há "trava da trava" que também precise de reap) e o veredito é REFEITO DENTRO do mutex:
+#        só remove se a trava que está no caminho AGORA ainda é órfã. O release do dono entra no mesmo mutex e só apaga a
+#        trava se o dono gravado nela ainda é este pid. O julgamento de fora do mutex é só palpite, para não pegá-lo à toa.
+#        Sem `lockf`, sem poder abrir o arquivo do mutex ou com ele ocupado além de REA_RUN_REAP_WAIT_S (5 s): NÃO remove — é o
+#        estado inerte; a espera segue até --wait-s e acaba em 91, com o motivo na mensagem.
+#   Scratch órfão: o nome carrega o pid de quem o criou (run.<pid>.XXXXXX; marcador de timeout tmo.<pid>, fora da trava). O passo 5
+#        só apaga o de pid MORTO: pid vivo, nome sem pid e symlink ficam. Não depende de a trava ter dado exclusividade.
+#   Log: $CITY/.gc/logs/rea-run.jsonl — um evento por execução (ran), recusa/espera esgotada (refused), desvio para o mini
+#        (fallback) ou execução cortada por sinal (signal), só o NOME do comando e o nº de argumentos (argumentos podem carregar
+#        URL/segredo). Uso errado (94), configuração inválida (93) e --check NÃO gravam log: só o stderr.
+#
+# LIMITES CONHECIDOS (o que sobra depois da correção — janelas estreitas, não fechadas):
+#   - Dono órfão com dono gravado: a remoção é exata (veredito e `mv` sob o mesmo mutex, e só quem está sob o mutex remove ou
+#     solta). Não há janela entre julgar e agir para uma trava com dono.
+#   - Trava SEM dono (quem fez o mkdir parou/morreu antes de gravar): só é julgada órfã pela idade (REA_RUN_LOCK_ORPHAN_S, 30 s).
+#     O criador que só volta a andar depois disso encontra a trava removida: se ninguém a refez, sai 93 "trava-sem-dono" (recusa
+#     espúria, nada roda); se outro a refez, a gravação por `ln` falha e ele espera como os demais — nunca toma nem apaga a trava
+#     do outro. Resta uma janela de microssegundos: o criador parado >30 s que falha a gravação faz `rmdir` fora do mutex, e
+#     um reaper que julgou essa mesma trava vazia como órfã logo antes pode levar a trava nova que outro criou no mesmo caminho.
+#   - Mutex de remoção ocupado por mais de REA_RUN_REAP_WAIT_S (quem o segura está parado, p.ex. SIGSTOP) ou `lockf` ausente:
+#     ninguém remove órfã e as execuções esperam até 91. O release do dono também desiste (avisa) e a trava fica para a próxima
+#     execução remover (dono morto).
+#   - O release cai num caminho já trocado por outro dono (a trava dele foi removida e refeita): não apaga, avisa.
+#   - pid reaproveitado: o scratch de um pid morto cujo número hoje é de outro processo fica até aquele processo sair (sobra lixo,
+#     nunca perda). SIGKILL entre o `mv` da trava velha e o `find -delete` deixa `rea-run.lock.stale.<pid>` ao lado (lixo inerte).
 #
 # O QUE NÃO FAZ: não classifica o que é "pesado" (quem chama decide); não mata Chrome que o comando deixou vivo fora da
-#   árvore dele; SIGKILL no wrapper não limpa — o scratch órfão é apagado na próxima execução (passo 5) e a trava morta
-#   é reaped pelo dono morto.
+#   árvore dele; SIGKILL no wrapper não limpa — o scratch órfão (de pid morto) é apagado na próxima execução (passo 5) e a trava
+#   morta é reaped pela próxima execução, sob o mutex.
 set -o pipefail
 set -u
 
@@ -63,6 +91,7 @@ CITY=${REA_RUN_CITY:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}
 MBP_RUN=${REA_RUN_MBP_RUN:-$CITY/scripts/mbp-run.sh}
 LOG="$CITY/.gc/logs/rea-run.jsonl"
 LOCK_DIR=${REA_RUN_LOCK_DIR:-$CITY/.gc/run/rea-run.lock}
+REAP_LOCK="$LOCK_DIR.reap"   # arquivo do mutex de remoção da trava (lockf no fd 8; o kernel solta se o dono morrer)
 SCRATCH_ROOT=${REA_RUN_SCRATCH_ROOT:-${TMPDIR:-/tmp}/rea-run-$(id -u)}
 SCRATCH_ROOT=${SCRATCH_ROOT//\/\//\/}
 DF_BIN=${REA_RUN_DF:-df}
@@ -81,10 +110,14 @@ RUN_TIMEOUT=${REA_RUN_TIMEOUT_S:-3600}
 POLL_S=${REA_RUN_POLL_S:-1}
 KILL_GRACE_S=${REA_RUN_KILL_GRACE_S:-3}
 LOCK_ORPHAN_S=${REA_RUN_LOCK_ORPHAN_S:-30}   # trava sem arquivo de dono mais velha que isto: quem a criou morreu entre o mkdir e a escrita
+REAP_WAIT_S=${REA_RUN_REAP_WAIT_S:-5}   # espera máxima pelo mutex de remoção da trava (quem o segura o faz por milissegundos)
+LOCKF_BIN=${REA_RUN_LOCKF:-lockf}
+PS_BIN=${REA_RUN_PS:-ps}   # só o proc_start passa por aqui: costura de teste (o selftest alarga a janela "julguei velha" → "ajo")
 NICE=${REA_RUN_NICE:-10}
 umask 077
 
-say() { printf 'rea-run: %s\n' "$*" >&2; }
+exec 3>&2   # o stderr de verdade: o `wait` do comando roda com o fd 2 em /dev/null (cala o "Terminated" do bash) e engolia os avisos do handler de sinal
+say() { printf 'rea-run: %s\n' "$*" >&3; }
 usage() { sed -n '2,/^[^#]/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//' >&2; }
 # inteiro decimal sem sinal, até 12 dígitos. Vazio, texto, "1.5", sinal e ZERO À ESQUERDA NÃO são número: `[ 08 -ge 0 ]` passa, mas a
 # aritmética do bash lê 08 como octal (erro) e 010 como 8 — o disco "sem folga" virava "com folga". 12 dígitos é o teto para a
@@ -127,7 +160,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-for v in MIN_FREE_GB MAX_SWAP_MB WAIT_S RUN_TIMEOUT KILL_GRACE_S LOCK_ORPHAN_S NICE; do
+for v in MIN_FREE_GB MAX_SWAP_MB WAIT_S RUN_TIMEOUT KILL_GRACE_S LOCK_ORPHAN_S REAP_WAIT_S NICE; do
   isnum "${!v}" || { say "configuração inválida: $v='${!v}' não é inteiro decimal >= 0 (sem zero à esquerda, até 12 dígitos)"; exit 93; }
 done
 printf '%s' "$POLL_S" | grep -Eq '^[0-9]+(\.[0-9]+)?$' && [ "$(printf '%s' "$POLL_S" | tr -d '0.')" != "" ] \
@@ -255,7 +288,7 @@ MODE=local
 
 # ---- caminho 2: mini -----------------------------------------------------------------------------------------------
 DEADLINE=$(( $(date +%s) + WAIT_S ))
-LOCK_HELD=0; SCR=""; CHILD=""; WD=""; SIGRC=""
+LOCK_HELD=0; SCR=""; CHILD=""; WD=""; SIGRC=""; TMO=""
 
 alive() { local s; s=$(ps -o state= -p "$1" 2>/dev/null); [ -n "$s" ] && [ "${s#Z}" = "$s" ]; }   # vivo e não-zumbi
 tree_pids() { local c; printf '%s\n' "$1"; for c in $(pgrep -P "$1" 2>/dev/null); do tree_pids "$c"; done; }
@@ -286,22 +319,56 @@ rm_scratch() { # só remove diretório run.* DENTRO da raiz de scratch, e nunca 
 }
 
 owner_field() { sed -n "${1}p" "$LOCK_DIR/owner" 2>/dev/null; }
-proc_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/  */ /g;s/^ //;s/ $//'; }
+proc_start() { "$PS_BIN" -o lstart= -p "$1" 2>/dev/null | sed 's/  */ /g;s/^ //;s/ $//'; }
+# Remoção da trava — reap de órfã e release do dono — roda SEMPRE sob um mutex do kernel e re-julga DENTRO dele. "Esta trava é velha" e
+# "então movo $LOCK_DIR" são dois passos sobre um NOME: entre eles outro processo pode ter removido a MESMA trava velha e criado uma nova,
+# VIVA, no mesmo caminho, e o `mv` levaria a viva (dois comandos pesados ao mesmo tempo). O mutex é `lockf` num fd aberto em $REAP_LOCK:
+# o kernel o solta sozinho se quem o segura morrer (sem "trava da trava" que também precisasse de reap). O veredito de fora do mutex é só
+# palpite, para não pegá-lo à toa. Sem lockf, sem o arquivo ou com o mutex ocupado além de REAP_WAIT_S: NÃO remove (é o estado inerte).
+reap_mutex_enter() { # 0 = tenho o mutex (fd 8 aberto) · 1 = não consegui (fd 8 fechado)
+  { exec 8>>"$REAP_LOCK"; } 2>/dev/null || return 1
+  if "$LOCKF_BIN" -s -t "$REAP_WAIT_S" 8 2>/dev/null; then return 0; fi                          # gate:reap-mutex
+  exec 8>&-; return 1
+}
+reap_mutex_leave() { exec 8>&-; }
+REAP_NOTE=""
+reap_stale() { # 0 = removi a trava órfã · 1 = não removi (viva, já refeita por outro, ou sem o mutex)
+  local tmp="$LOCK_DIR.stale.$$" rc=1
+  reap_mutex_enter || { REAP_NOTE=" (órfã, mas o mutex de reap não abriu em ${REAP_WAIT_S}s — não removo às cegas)"; return 1; }
+  REAP_NOTE=""
+  if [ "$(lock_state)" = stale ]; then                                                           # gate:reap-rejudge
+    if mv "$LOCK_DIR" "$tmp" 2>/dev/null; then
+      find "$tmp" -mindepth 1 -delete 2>/dev/null; rmdir "$tmp" 2>/dev/null; rc=0
+    fi
+  fi
+  reap_mutex_leave
+  return $rc
+}
 release_lock() {
   [ $LOCK_HELD -eq 1 ] || return 0
   LOCK_HELD=0
-  [ "$(owner_field 1)" = "$$" ] || { say "AVISO: a trava já não é minha — não solto"; return 0; }
-  find "$LOCK_DIR" -mindepth 1 -delete 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null \
-    || say "AVISO: trava $LOCK_DIR NÃO foi solta"
+  # Sem o mutex a trava FICA: este processo vai sair, o dono morto a torna órfã e a próxima execução a remove.
+  reap_mutex_enter || { say "AVISO: sem o mutex de reap — a trava $LOCK_DIR fica para a próxima execução remover (dono morto)"; return 0; }
+  if [ "$(owner_field 1)" = "$$" ]; then                                                         # gate:release-owner
+    find "$LOCK_DIR" -mindepth 1 -delete 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null || say "AVISO: trava $LOCK_DIR NÃO foi solta"
+  else
+    say "AVISO: a trava já não é minha — não solto"
+  fi
+  reap_mutex_leave
 }
 cleanup() {
   [ -n "$CHILD" ] && stop_tree "$CHILD"
   [ -n "$WD" ] && stop_tree "$WD"
   CHILD=""; WD=""
   if [ -n "$SCR" ]; then rm_scratch "$SCR" || log_event cleanup-failed local 0 "scratch-nao-apagado"; SCR=""; fi
+  if [ -n "$TMO" ]; then rm -f -- "$TMO"; TMO=""; fi
   release_lock
 }
-on_signal() { say "recebi SIG$1 — encerrando o comando e limpando"; SIGRC=$(( 128 + $2 )); exit "$SIGRC"; }
+on_signal() { # nome número — mensagem no stderr de verdade (fd 3) e UM evento no log: a execução cortada por sinal também deixa rastro
+  say "recebi SIG$1 — encerrando o comando e limpando"; SIGRC=$(( 128 + $2 ))
+  log_event signal "$MODE" "$SIGRC" "sinal-$(printf '%s' "$1" | tr 'A-Z' 'a-z')"                    # gate:sinal-log
+  exit "$SIGRC"
+}
 trap cleanup EXIT   # gate:exit-trap — roda também quando o bash morre por sinal; os 3 traps abaixo só dão a mensagem e o rc 128+n
 trap 'on_signal INT 2' INT
 trap 'on_signal TERM 15' TERM
@@ -320,31 +387,39 @@ lock_state() { # stale | live | unknown  — quem segura a trava agora
   kill -0 "$pid" 2>/dev/null && { echo live; return; }                                    # ps não viu mas o pid responde
   echo stale
 }
+claim_owner() { # $1 = hora de início deste processo. Grava o dono SÓ se a trava ainda não tem um: `ln` é criação exclusiva e atômica
+  local tmp="$LOCK_DIR/owner.tmp.$$" rc   # (o `mv` sobrescreveria o dono de outro — o que acontece com quem ficou parado entre o mkdir e aqui)
+  { printf '%s\n%s\n%s\n' "$$" "$(date +%s)" "$1" > "$tmp" && ln "$tmp" "$LOCK_DIR/owner"; } 2>/dev/null; rc=$?   # gate:owner-claim
+  rm -f "$tmp" 2>/dev/null
+  return $rc
+}
 acquire_lock() {
-  local last_msg=0 st now tmp me_start
+  local last_msg=0 st now me_start vanished=0
   me_start=$(proc_start $$)   # sem a hora de início não há como provar que o dono segue vivo: a trava seria reaped com a gente dentro
   [ -n "$me_start" ] || die 93 "ilegivel:ps" "não consegui ler a hora de início deste processo (ps) — não pego a trava às cegas"
   mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null || die 93 "trava-nao-criavel" "não consigo criar $(dirname "$LOCK_DIR")"
   while :; do
     if mkdir "$LOCK_DIR" 2>/dev/null; then                                                      # gate:lock
-      tmp="$LOCK_DIR/owner.tmp"
-      { printf '%s\n%s\n%s\n' "$$" "$(date +%s)" "$me_start" > "$tmp" && mv "$tmp" "$LOCK_DIR/owner"; } 2>/dev/null \
-        || { find "$LOCK_DIR" -mindepth 1 -delete 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null
-             die 93 "trava-sem-dono" "não consegui gravar o dono da trava em $LOCK_DIR"; }
-      LOCK_HELD=1; return 0
+      claim_owner "$me_start" && { LOCK_HELD=1; return 0; }
+      # Não gravei o dono. Se já há um dono nesta trava, perdi: a minha foi removida enquanto eu estava parado e outro a refez.
+      # Não apago nada que não seja meu: espero como os demais. Sem dono nenhum, a falha é real (disco cheio, permissão): rmdir
+      # (nunca recursivo — só leva um diretório vazio) e recusa.
+      [ -e "$LOCK_DIR/owner" ] && continue                                                      # gate:owner-lost
+      rmdir "$LOCK_DIR" 2>/dev/null
+      die 93 "trava-sem-dono" "não consegui gravar o dono da trava em $LOCK_DIR"
     fi
-    [ -d "$LOCK_DIR" ] || die 93 "trava-nao-criavel" "não consigo criar a trava $LOCK_DIR"
+    if [ ! -d "$LOCK_DIR" ]; then   # o mkdir falhou porque existia e sumiu logo depois (dono soltou): tenta de novo, não é erro
+      vanished=$(( vanished + 1 ))
+      [ "$vanished" -gt 20 ] && die 93 "trava-nao-criavel" "não consigo criar a trava $LOCK_DIR"   # gate:lock-vanish
+      continue
+    fi
     st=$(lock_state)
-    if [ "$st" = stale ]; then
-      tmp="$LOCK_DIR.stale.$$"
-      if mv "$LOCK_DIR" "$tmp" 2>/dev/null; then
-        find "$tmp" -mindepth 1 -delete 2>/dev/null; rmdir "$tmp" 2>/dev/null
-        say "trava órfã removida (dono morto ou pid reaproveitado)"; continue
-      fi
+    if [ "$st" = stale ] && reap_stale; then
+      say "trava órfã removida (dono morto ou pid reaproveitado)"; continue
     fi
     now=$(date +%s)
-    [ "$now" -ge "$DEADLINE" ] && die 91 "trava-ocupada" "esperei ${WAIT_S}s e a trava segue com pid $(owner_field 1) — tente depois"
-    if [ $(( now - last_msg )) -ge 60 ]; then say "aguardando a trava (dono pid $(owner_field 1), desde $(owner_field 2))"; last_msg=$now; fi
+    [ "$now" -ge "$DEADLINE" ] && die 91 "trava-ocupada" "esperei ${WAIT_S}s e a trava segue com pid $(owner_field 1)${REAP_NOTE} — tente depois"
+    if [ $(( now - last_msg )) -ge 60 ]; then say "aguardando a trava (dono pid $(owner_field 1), desde $(owner_field 2))${REAP_NOTE}"; last_msg=$now; fi
     sleep "$POLL_S"
   done
 }
@@ -371,11 +446,23 @@ wait_others
 machine_check; mrc=$?; [ $mrc -eq 0 ] || refuse_machine $mrc
 
 mkdir -p "$SCRATCH_ROOT" 2>/dev/null && chmod 700 "$SCRATCH_ROOT" 2>/dev/null || die 93 "scratch-nao-criavel" "não consigo criar $SCRATCH_ROOT"
-for old in "$SCRATCH_ROOT"/run.*; do   # sob a trava ninguém mais cria run.*: o que existe é de uma execução que morreu
+# Órfão = o nome carrega o pid de quem o criou (run.<pid>.XXXXXX, tmo.<pid>) e esse pid MORREU. A trava garante que só uma execução
+# está aqui, mas o apagamento não depende disso: scratch de execução viva nunca é apagado, nem se duas execuções se atropelarem.
+# Nome sem pid ("não sei de quem é") também fica: apagar sem saber é o lado irreversível. Custo: um pid reaproveitado por outro
+# processo mantém o scratch do morto até aquele processo sair — sobra lixo, nunca perda.
+for old in "$SCRATCH_ROOT"/run.* "$SCRATCH_ROOT"/tmo.*; do
   [ -e "$old" ] || [ -L "$old" ] || continue
-  say "scratch órfão $old — apagando"; rm_scratch "$old" || log_event cleanup-failed local 0 "orfao-nao-apagado"
+  base=${old##*/}; opid=${base#*.}; opid=${opid%%.*}
+  isnum "$opid" || { say "AVISO: $old não traz o pid de quem o criou — não apago"; continue; }
+  alive "$opid" && continue                                                                       # gate:orphan-live
+  case "$base" in
+    tmo.*) rm -f -- "$old" ;;
+    *) say "scratch órfão $old — apagando"; rm_scratch "$old" || log_event cleanup-failed local 0 "orfao-nao-apagado" ;;
+  esac
 done
-SCR=$(mktemp -d "$SCRATCH_ROOT/run.XXXXXX") || die 93 "scratch-nao-criavel" "mktemp falhou em $SCRATCH_ROOT"
+SCR=$(mktemp -d "$SCRATCH_ROOT/run.$$.XXXXXX") || die 93 "scratch-nao-criavel" "mktemp falhou em $SCRATCH_ROOT"
+# marcador de timeout fora do cwd do comando e FORA da trava: o watchdog escreve aqui, só este processo lê
+TMO="$SCRATCH_ROOT/tmo.$$"; : > "$TMO" || die 93 "scratch-nao-criavel" "não consegui criar o marcador de timeout $TMO"   # gate:timeout-private
 if [ ${#pushes[@]} -gt 0 ]; then
   mkdir "$SCR/in" || die 93 "scratch-nao-criavel" "não consegui criar $SCR/in"
   for p in "${pushes[@]}"; do cp -R -- "$p" "$SCR/in/" || die 93 "push-falhou" "push de $p falhou"; done
@@ -390,13 +477,13 @@ CHILD=$!
     left=$(( left - step ))
   done
   { alive "$CHILD" && [ "$(ps -o ppid= -p "$CHILD" 2>/dev/null | tr -d ' ')" = "$$" ]; } || exit 0   # CHILD já saiu (zumbi inclusive), ou o pid foi reaproveitado
-  : > "$LOCK_DIR/timeout"; stop_tree "$CHILD" ) &                                                 # gate:timeout
+  echo 1 > "$TMO"; stop_tree "$CHILD" ) &                                                        # gate:timeout
 WD=$!
 RC=0
 { wait "$CHILD"; RC=$?; } 2>/dev/null
 CHILD=""
 stop_tree "$WD"; { wait "$WD"; } 2>/dev/null; WD=""
-if [ -f "$LOCK_DIR/timeout" ]; then RC=124; say "timeout de ${RUN_TIMEOUT}s — comando encerrado"; fi
+if [ -s "$TMO" ]; then RC=124; say "timeout de ${RUN_TIMEOUT}s — comando encerrado"; fi
 
 PULL_FAILED=""
 for pl in "${pulls[@]+"${pulls[@]}"}"; do
