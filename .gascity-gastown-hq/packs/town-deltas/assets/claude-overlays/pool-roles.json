@@ -167,6 +167,7 @@
   "procob-recarga",
   "prompt-efficiency",
   "proposta-imovel",
+  "rea-scraper-first",
   "reaper",
   "recall",
   "refino",
@@ -252,6 +253,7 @@
      "crew-commit",
      "data-atlas",
      "gate-done",
+     "rea-scraper-first",
      "recall",
      "wa-respond",
      "wa-worker-session-protocol",
@@ -289,6 +291,7 @@
      "crew-commit",
      "data-atlas",
      "gate-done",
+     "rea-scraper-first",
      "recall"
     ]
    },

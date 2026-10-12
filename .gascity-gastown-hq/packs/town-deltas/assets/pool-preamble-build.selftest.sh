@@ -51,6 +51,39 @@ echo "== A. gerador: overlays/guardas/núcleo vs manifesto"
 if out="$(python3 "$BUILD" check 2>&1)"; then ok "pool-preamble-build.py check: $(echo "$out" | tail -1)"; else bad "check reprovou:"; echo "$out" | sed 's/^/      /'; fi
 if secs="$(python3 "$BUILD" sections 2>&1)" && echo "$secs" | grep -q '^== dog:' && echo "$secs" | grep -q '^== reviewer:'; then ok "sections lista as seções entregues por papel"; else bad "sections não listou os papéis"; fi
 
+# ga-ttl3y2: pino INDEPENDENTE do manifesto. O `check` acima só prova overlay == gerado do manifesto; se a skill sair do keep dos workers E dos
+# overlays regenerados juntos, nada reclamaria. Worker de pool LISTA a skill rea-scraper-first (sem skillOverrides para ela); dog e revisor a
+# recebem desligada (só os workers a usam); e a skill existe no HQ com o nome da pasta no frontmatter. Lê os overlays COMMITADOS, não os gerados.
+PIN_PY="$W/pin_rea_scraper_first.py"
+cat > "$PIN_PY" <<'EOF'
+import json, os, re, sys
+ov, skill = sys.argv[1], sys.argv[2]
+errs = []
+for role, overlay, want in (("wa-worker", "pool-wa-worker", None), ("ps-worker", "pool-ps-worker", None), ("dog", "pool-dog", "off"), ("reviewer", "pool-reviewer", "off")):
+    p = os.path.join(ov, overlay, ".claude", "settings.json")
+    try:
+        got = json.load(open(p, encoding="utf-8")).get("skillOverrides", {}).get("rea-scraper-first")
+    except Exception as e:
+        errs.append(f"{role}: não consegui ler {p}: {e!r}")
+        continue
+    if got != want:
+        errs.append(f"{role}: skillOverrides['rea-scraper-first']={got!r}, esperado {want!r}" + (" (todo worker de pool deve LISTAR a skill)" if want is None else " (só os workers a listam)"))
+try:
+    txt = open(skill, encoding="utf-8").read()
+except Exception as e:
+    errs.append(f"SKILL.md ilegível: {e!r}")
+    txt = ""
+m = re.match(r"---\nname: (\S+)\ndescription: (.+)\n---\n", txt)
+if not m:
+    errs.append("SKILL.md sem frontmatter name/description")
+else:
+    if m.group(1) != "rea-scraper-first": errs.append(f"name do frontmatter = {m.group(1)!r}")
+    if not m.group(2).startswith("Use when"): errs.append("description não começa com 'Use when'")
+print("\n".join(errs))
+sys.exit(1 if errs else 0)
+EOF
+if pin_out="$(python3 -I "$PIN_PY" "$SELF_DIR/claude-overlays" "$HQ/skills/rea-scraper-first/SKILL.md" 2>&1)"; then ok "skill rea-scraper-first: wa-worker/ps-worker a listam, dog/revisor a têm desligada, SKILL.md existe com frontmatter coerente"; else bad "pino da skill rea-scraper-first:"; echo "$pin_out" | sed 's/^/      /'; fi
+
 echo "== B. controles negativos (cada mutação TEM que reprovar o check)"
 # árvore descartável: a mesma estrutura packs/town-deltas/{assets/claude-overlays,template-fragments}
 T="$W/mut"; mkdir -p "$T/packs/town-deltas/assets" "$T/packs/town-deltas/template-fragments"
