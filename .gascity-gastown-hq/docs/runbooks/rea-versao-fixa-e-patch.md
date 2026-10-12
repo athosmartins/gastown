@@ -69,7 +69,7 @@ Regra: **versão nova só entra por uma bead dedicada** (rota `gastown.dog` ou c
 - `rea update` no MBP segue a mesma regra: só por bead.
 
 ## Issue upstream
-A ideia é pedir ao projeto (`morluto/rea`) que o prazo de compilação do helper Swift seja configurável (variável de ambiente ou opção, como já existe `REA_GHIDRA_STARTUP_TIMEOUT_MS`), para eliminar o patch local. O texto não deve conter dado interno: sem nomes de host, caminhos do usuário, alvos analisados nem beads. Rascunho e estado (aberta ou não) estão no comentário da bead `ga-pfc2ww`; quando a issue sair, o número entra aqui. Se ela for atendida, a bead de atualização do roteiro acima descarta o patch.
+A ideia é pedir ao projeto (`morluto/rea`) que o prazo de compilação do helper Swift seja configurável (variável de ambiente ou opção, como já existe `REA_GHIDRA_STARTUP_TIMEOUT_MS`), para eliminar o patch local. O texto não deve conter dado interno: sem nomes de host, caminhos do usuário, alvos analisados nem beads. A issue foi aberta em 12/10/2026 com autorização do Athos (comentário do Mayor na bead `ga-pfc2ww`): <https://github.com/morluto/rea/issues/2184> (o rascunho está no comentário do dog na mesma bead). Se ela for atendida, a bead de atualização do roteiro acima troca o patch pela variável de ambiente.
 
 ## Limites conhecidos e o que NÃO foi provado
 - **O estouro de 60 s não foi reproduzido nesta bead.** Uma compilação do helper medida a quente (`xcrun swiftc` dos `.swift` do 6.4.0, load ~64 neste host) levou **15,3 s**. As falhas de 11/10 (load ~50) estão registradas só em `mbp-offload.md`; o patch é uma folga contra o pior caso observado, não um conserto com causa comprovada. A compilação fria, com cache vazio, não foi medida.
