@@ -181,6 +181,16 @@ done
 for grp in -qqx -xkr -knot_r -n4 -vv; do
   reset; mbp_out "."; rc=$(run -- tests/test_a.py $grp); expect "grupo $grp (sem -r): nada pulou, não roda aqui" 0 "$rc"; hasnt "grupo $grp: sem chamada local" "$STUB_LOG" 'LOCAL_CALL'
 done
+# --no-summary (pytest 9 medido): tira as linhas SKIPPED que o meu -rs pede e, junto com -qq, tira também a linha-resumo — um skip fica invisível
+# e o rc 0 do MBP seria aceito. Sem resumo + --no-summary = não sei se pulou → aqui, como o -r do revisor.
+reset; mbp_out "."; rc=$(run -- tests/test_a.py -qq --no-summary); expect "-qq --no-summary: sem resumo e sem SKIPPED" 0 "$rc"
+has "-qq --no-summary: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "-qq --no-summary: skips-ilegiveis no log" "$LOG" 'skips-ilegiveis'; hasnt "-qq --no-summary: sem a nota de verde do MBP" "$T/out" 'nota: verde do MBP'
+# controles: --no-summary COM a linha-resumo legível (sem -qq) — o resumo diz quantos pularam, e não há linha SKIPPED para casar → todos aqui;
+# e o mesmo --no-summary com resumo "1 passed" = nada pulou, o verde do MBP vale
+reset; mbp_out "= 1 passed, 1 skipped in 0.1s ="; rc=$(run -- tests/test_a.py --no-summary); expect "--no-summary com resumo que diz 1 skipped" 0 "$rc"
+has "--no-summary + resumo skipped: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "--no-summary + resumo skipped: skips-nao-contados" "$LOG" 'skips-nao-contados'
+reset; mbp_out "= 1 passed in 0.1s ="; rc=$(run -- tests/test_a.py --no-summary); expect "--no-summary com resumo sem skip" 0 "$rc"
+hasnt "--no-summary + resumo sem skip: não roda aqui" "$STUB_LOG" 'LOCAL_CALL'
 # verde do MBP aceito: o MBP não tem shared/data nem .env — um teste que lê dado por um caminho que o wrapper não enxerga pode passar VAZIO lá.
 # O wrapper não consegue saber, então DIZ (fail-open visível), só quando um verde do MBP foi aceito.
 reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_a.py -q); expect "verde do MBP" 0 "$rc"; has "verde do MBP: a nota de verde vazio sai" "$T/out" 'nota: verde do MBP.*VAZIO'

@@ -27,6 +27,8 @@
 #       De quem é cada skip só se sabe pelo caminho impresso numa linha `SKIPPED [n] caminho:linha:` e ele só vale se for um alvo pedido: skip
 #       vindo de um helper (pytest.skip() dentro de um módulo de apoio sai com o caminho DO HELPER), linha que não leio ou resumo que diz mais
 #       pulados do que as linhas listam → não sei de quem é → TODOS os alvos rodam aqui (`skips-fora-dos-alvos` / `skips-nao-contados`).
+#       Um -r próprio do revisor ou um --no-summary que apague o relato dos pulados, sem linha-resumo para conferir (-qq), também manda TODOS
+#       os alvos para cá (`skips-ilegiveis`): sem relato não há como saber que nada pulou.
 #   • rc 1 (falhou)       → SÓ os node ids que falharam rodam aqui primeiro:
 #       reprovam aqui também → vale esse rc 1 (a linha final diz `local-confirmou`);
 #       PASSAM aqui isolados → isso NÃO prova que o vermelho era do ambiente (um -x/--maxfail parou o MBP no 1º vermelho e o resto nunca
@@ -93,12 +95,14 @@ local_only_flag() {   # depende do disco/estado DESTA máquina, ou é interativa
   return 1
 }
 
-user_r() {   # o revisor trouxe o próprio -r (vence o -rfEs que eu ponho primeiro)?
+user_r() {   # o revisor mexeu no que o pytest REPORTA (vence ou apaga o -rfEs que eu ponho primeiro)?
   # O -r também vem DENTRO de um grupo de flags curtas (-qqxrf = -q -q -x -r f): o argparse o lê, então eu também. Lê-se o grupo letra a letra
   # até a 1ª opção que consome o resto como valor (-k, -m, -p, -c, -o, -n, -W): em -xkr o r é parte do valor do -k, não um -r.
+  # --no-summary (medido no pytest 9.0.3) tira as linhas SKIPPED e, com -qq, a linha-resumo também: o skip fica invisível. O pytest não aceita
+  # abreviação de opção longa (--no-summ dá rc 4), então a igualdade basta.
   local f i c
   for f in ${flags[@]+"${flags[@]}"}; do
-    case "$f" in --*) continue ;; -?*) ;; *) continue ;; esac
+    case "$f" in --no-summary) return 0 ;; --*) continue ;; -?*) ;; *) continue ;; esac
     i=1
     while [ $i -lt ${#f} ]; do
       c=${f:$i:1}
@@ -240,7 +244,7 @@ else
       # Pular não é passar: um teste que pulou por falta de dado do MBP (shared/data, .env) é "não sei", não "passou".
       # Ler: linhas "SKIPPED [n] arq:linha:" (o -rs que eu mesmo ponho primeiro) e a linha-resumo do pytest.
       #   vazio (nenhuma das duas) → nada pulou, SE o meu -rs valeu; falhou/ilegível (o revisor trouxe o próprio -r, que
-      #   vence o meu, e não há resumo) → não sei se pulou: o comando inteiro roda aqui.
+      #   vence o meu, ou --no-summary, que o apaga, e não há resumo) → não sei se pulou: o comando inteiro roda aqui.
       summary=$(grep -E ' in [0-9.]+s' "$OUT" | tail -1)
       sk_lines=$(grep -c '^SKIPPED \[' "$OUT")
       sk_sum=$(printf '%s' "$summary" | grep -oE '[0-9]+ skipped' | head -1 | awk '{print $1}')
@@ -275,7 +279,7 @@ else
         fi
       elif [ -z "$summary" ] && user_r; then
         sk_note="skips-ilegiveis"
-        say "o MBP não imprimiu o resumo e o -r do revisor esconde os pulados — não sei se algo pulou; o comando inteiro roda aqui"
+        say "o MBP não imprimiu o resumo e o -r / --no-summary do revisor esconde os pulados — não sei se algo pulou; o comando inteiro roda aqui"
       fi
       if [ -n "$sk_note" ]; then
         [ ${#sk_targets[@]} -gt 0 ] || sk_targets=("${mbp_targets[@]}")
