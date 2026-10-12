@@ -10,9 +10,11 @@
 #   outro `rea` (espera, desiste em 91, some e segue; o próprio wrapper e seus ancestrais NÃO contam) · trava de dono morto,
 #   de pid reaproveitado e sem dono é reaped; de dono vivo NÃO é · trava não criável = 93 · rc do comando · SIGTERM no meio
 #   (árvore morta, scratch e trava limpos, rc 143) · timeout (124) · scratch órfão apagado, symlink e vizinho preservados ·
-#   --push/--pull/--env · uso errado (94) · log sem argumentos do comando · --check.
+#   --push/--pull/--env · uso errado (94, inclusive dois --push de mesmo nome) · log sem argumentos do comando · --check ·
+#   --pull no MBP que falhou (mbp-run sai 0 e só avisa): 93, nunca "chegou" · configuração numérica com zero à esquerda, sinal ou
+#   estouro: 93 sem rodar (a aritmética do bash leria 08/010 como octal).
 # CONTROLE NEGATIVO: cada porta (marcador "# gate:<nome>" no script: disk, swap, lock, lock-live, cleanup, fallback, timeout,
-#   exit-trap, self-chain, opt-sem-valor, ilegivel-disco/swap/pgrep) é removida numa cópia e o mutante TEM que deixar de reproduzir o resultado
+#   exit-trap, self-chain, opt-sem-valor, ilegivel-disco/swap/pgrep, pull-mbp, isnum, push-dup) é removida numa cópia e o mutante TEM que deixar de reproduzir o resultado
 #   do script real no caso que a protege — inclusive "ilegível virou pode-rodar".
 # REA_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro rea-run.sh.
 set -u
@@ -53,16 +55,31 @@ if [ -n "${STUB_PGREP_SAMPLES:-}" ]; then
   [ -n "$hits" ] || exit 1
   printf '%s\n' "$hits"; exit 0
 fi
-f="${STUB_PGREP_FILE:-/nonexistent}"
-[ -f "$f" ] || exit 1
-if grep -q '^ERR' "$f"; then exit 2; fi
-[ -s "$f" ] || exit 1
-cat "$f"; exit 0
+# lê o arquivo UMA vez: o teste o apaga no meio do polling, e testar-e-depois-ler dava rc 0 com saída vazia (flaky sob carga)
+out=$(cat "${STUB_PGREP_FILE:-/nonexistent}" 2>/dev/null) || exit 1
+if printf '%s\n' "$out" | grep -q '^ERR'; then exit 2; fi
+[ -n "$out" ] || exit 1
+printf '%s\n' "$out"; exit 0
 EOF
 cat > "$T/bin/mbp-run.sh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_MBP_LOG"
 [ -n "${STUB_MBP_OUT:-}" ] && echo "$STUB_MBP_OUT"
+# STUB_MBP_PULL=write imita o `rsync -a host:X/REL DEST` do mbp-run real: escreve o destino por arquivo temporário + rename
+#   (inode novo) e CARREGA o mtime do remoto (STUB_MBP_PULL_MTIME, no passado = relógio do MBP atrasado). STUB_MBP_PULL_SKIP=REL
+#   faz o pull desse REL falhar do jeito do mbp-run real: só avisa no stderr e segue — o rc continua o do comando.
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  [ "${args[$i]}" = -- ] && break
+  [ "${args[$i]}" = --pull ] || continue
+  pl=${args[$((i + 1))]}; rel=${pl%%:*}; dest=${pl#*:}
+  if [ "${STUB_MBP_PULL:-}" != write ] || [ "${STUB_MBP_PULL_SKIP:-}" = "$rel" ]; then
+    [ -n "${STUB_MBP_PULL:-}" ] && echo "pull de $rel falhou" >&2
+    continue
+  fi
+  [ -d "$dest" ] && dest="$dest/$(basename "$rel")"
+  printf 'NOVO\n' > "$dest.rsync-tmp" && touch -t "${STUB_MBP_PULL_MTIME:-200101010000}" "$dest.rsync-tmp" && mv "$dest.rsync-tmp" "$dest"
+done
 exit "${STUB_MBP_RC:-99}"
 EOF
 chmod +x "$T/bin/"*
@@ -73,7 +90,7 @@ reset_env() {
   export REA_RUN_DF="$T/bin/df" REA_RUN_SYSCTL="$T/bin/sysctl" REA_RUN_PGREP="$T/bin/pgrep"
   export REA_RUN_POLL_S=0.1 REA_RUN_KILL_GRACE_S=1 REA_RUN_WAIT_S=30 REA_RUN_TIMEOUT_S=60 REA_RUN_MIN_FREE_GB=10 REA_RUN_MAX_SWAP_MB=6144
   export STUB_MBP_LOG="$T/mbp.$N.log" STUB_PGREP_FILE="$T/pgrep.$N" MARK="$T/mark.$N"
-  unset REA_RUN_LOCK_DIR STUB_PGREP_SAMPLES REA_RUN_PGREP_PATTERN STUB_DF_FAIL STUB_DF_RAW STUB_DF_KB STUB_SWAP_FAIL STUB_SWAP_RAW STUB_SWAP_USED STUB_MBP_OUT
+  unset REA_RUN_LOCK_DIR STUB_PGREP_SAMPLES REA_RUN_PGREP_PATTERN STUB_DF_FAIL STUB_DF_RAW STUB_DF_KB STUB_SWAP_FAIL STUB_SWAP_RAW STUB_SWAP_USED STUB_MBP_OUT STUB_MBP_PULL STUB_MBP_PULL_SKIP STUB_MBP_PULL_MTIME REA_RUN_LOCK_ORPHAN_S REA_RUN_NICE
   export STUB_MBP_RC=99
   find "$REA_RUN_CITY" "$REA_RUN_SCRATCH_ROOT" -depth -delete 2>/dev/null
   : > "$STUB_MBP_LOG"; rm -f "$STUB_PGREP_FILE" "$MARK"
@@ -126,6 +143,41 @@ eq "mbp-run ausente: roda no mini" 0 "$RC"; [ -e "$MARK" ]; ok "mbp-run ausente:
 reset_env; export STUB_MBP_RC=0; echo x > "$T/in.txt"
 run --push "$T/in.txt" --pull "out.txt:$T/o.txt" --env A=1 --env B=2 -- sh -c 'true'
 has "MBP: repassa push/pull/env" "--exec --push $T/in.txt --pull out.txt:$T/o.txt --env A=1 --env B=2 -- sh -c true" "$(cat "$STUB_MBP_LOG")"
+
+# --pull no caminho do MBP: o mbp-run real só AVISA quando o pull falha e sai com o rc do comando (0). O wrapper confere se o
+# destino chegou NESTA execução; o critério é identidade (inode+ctime+tamanho), nunca mtime: o rsync -a copia o mtime do MBP.
+reset_env; export STUB_MBP_RC=0 STUB_MBP_PULL=write
+run --pull "out.json:$T/pm.$N.json" -- sh -c true
+eq "MBP pull chegou: rc 0" 0 "$RC"; eq "MBP pull chegou: conteúdo" NOVO "$(cat "$T/pm.$N.json" 2>/dev/null)"; has "MBP pull chegou: log sem motivo" '"mode":"mbp","rc":0,"secs":' "$(cat "$LOGF")"
+has "MBP pull chegou: reason '-'" '"reason":"-"' "$(cat "$LOGF")"
+reset_env; export STUB_MBP_RC=0 STUB_MBP_PULL=write STUB_MBP_PULL_MTIME=200101010000; echo VELHO > "$T/pm.$N.json"
+run --pull "out.json:$T/pm.$N.json" -- sh -c true
+eq "MBP pull com mtime do passado (relógio do MBP atrasado) sobre destino velho: rc 0" 0 "$RC"; eq "MBP pull sobre velho: conteúdo novo" NOVO "$(cat "$T/pm.$N.json" 2>/dev/null)"
+reset_env; export STUB_MBP_RC=0 STUB_MBP_PULL=skip
+run --pull "out.json:$T/pm.$N.json" -- sh -c true
+eq "MBP pull que falhou (destino não existe) com comando rc 0: 93" 93 "$RC"; [ ! -e "$T/pm.$N.json" ]; ok "MBP pull falho: nada no destino" $?
+has "MBP pull falho: mensagem" "pull de 'out.json' falhou" "$OUT"; has "MBP pull falho: log marca" '"mode":"mbp","rc":0' "$(cat "$LOGF")"; has "MBP pull falho: motivo" '"reason":"pull-falhou"' "$(cat "$LOGF")"
+reset_env; export STUB_MBP_RC=0 STUB_MBP_PULL=skip; echo VELHO > "$T/pm.$N.json"
+run --pull "out.json:$T/pm.$N.json" -- sh -c true
+eq "MBP pull que falhou com destino VELHO de uma execução anterior: 93 (não lê dado velho como novo)" 93 "$RC"; eq "MBP pull falho: o velho segue lá, intocado" VELHO "$(cat "$T/pm.$N.json")"
+reset_env; export STUB_MBP_RC=5 STUB_MBP_PULL=skip
+run --pull "out.json:$T/pm.$N.json" -- sh -c true
+eq "MBP pull falho com comando já falho: mantém o rc 5" 5 "$RC"; has "MBP pull falho + rc 5: motivo" '"reason":"pull-falhou"' "$(cat "$LOGF")"
+reset_env; export STUB_MBP_RC=0 STUB_MBP_PULL=write STUB_MBP_PULL_SKIP=b.json
+run --pull "a.json:$T/pa.$N.json" --pull "b.json:$T/pb.$N.json" -- sh -c true
+eq "MBP 2 pulls, só o 2º falhou: 93 (confere todos, não só o primeiro)" 93 "$RC"; [ -f "$T/pa.$N.json" ]; ok "MBP 2 pulls: o 1º chegou" $?
+has "MBP 2 pulls: mensagem cita o que falhou" "pull de 'b.json' falhou" "$OUT"
+reset_env; export STUB_MBP_RC=0 STUB_MBP_PULL=write; mkdir "$T/pd.$N"; echo VELHO > "$T/pd.$N/out.json"
+run --pull "out.json:$T/pd.$N" -- sh -c true
+eq "MBP pull para dentro de diretório existente (arquivo trocado por rename): rc 0" 0 "$RC"; eq "MBP pull em diretório: conteúdo novo" NOVO "$(cat "$T/pd.$N/out.json")"
+reset_env; export STUB_MBP_RC=0 STUB_MBP_PULL=skip; mkdir "$T/pd.$N"; echo VELHO > "$T/pd.$N/out.json"
+run --pull "out.json:$T/pd.$N" -- sh -c true
+eq "MBP pull para diretório que ninguém tocou: 93" 93 "$RC"
+reset_env; export STUB_MBP_RC=98 STUB_MBP_PULL=skip
+run --pull "out.json:$T/pm.$N.json" -- sh -c 'echo x > out.json'
+eq "MBP rc 98 + --pull: roda no mini e o pull local chega (rc 0)" 0 "$RC"; [ -f "$T/pm.$N.json" ]; ok "MBP rc 98 + --pull: destino veio do mini" $?
+has "MBP rc 98: o aviso diz que o comando pode já ter rodado no MBP" "pode já ter rodado" "$OUT"
+reset_env; export STUB_MBP_RC=96; run -- true; case "$OUT" in *"pode já ter rodado"*) ok "MBP rc 96: sem o aviso de 'pode já ter rodado' (recusou antes de rodar)" 1 ;; *) ok "MBP rc 96: sem o aviso de 'pode já ter rodado'" 0 ;; esac
 
 # ---- 3. serialização: a 2ª execução espera ---------------------------------------------------------------------------
 reset_env; L="$T/order.$N"; : > "$L"
@@ -270,8 +322,31 @@ reset_env; run --local --pull "../x:$T/x" -- true;       eq "uso: --pull com .. 
 reset_env; run --local --pull "a/../../x:$T/x" -- true;  eq "uso: --pull a/../.. = 94" 94 "$RC"
 reset_env; run --local --pull "semdestino" -- true;      eq "uso: --pull sem destino = 94" 94 "$RC"
 reset_env; run --local --push "$T/nao-existe" -- true;   eq "uso: --push inexistente = 94" 94 "$RC"
+reset_env; mkdir -p "$T/da.$N" "$T/db.$N"; echo 1 > "$T/da.$N/x.txt"; echo 2 > "$T/db.$N/x.txt"
+run --local --push "$T/da.$N/x.txt" --push "$T/db.$N/x.txt" -- true; eq "uso: dois --push com o mesmo nome = 94 (um sobrescreveria o outro em ./in/)" 94 "$RC"
+export STUB_MBP_RC=0; run --push "$T/da.$N/x.txt" --push "$T/db.$N/x.txt" -- true; eq "uso: mesmo nome também recusado no caminho do MBP" 94 "$RC"; eq "uso: ...e o mbp-run nem foi chamado" 0 "$(mbp_calls)"
+reset_env; mkdir -p "$T/da.$N" "$T/db.$N"; echo 1 > "$T/da.$N/x.txt"; echo 2 > "$T/db.$N/y.txt"
+run --local --push "$T/da.$N/x.txt" --push "$T/db.$N/y.txt" -- sh -c 'cat in/x.txt in/y.txt > out.txt' ; eq "uso: dois --push de nomes diferentes passam" 0 "$RC"
 reset_env; run --local --env "1BAD=x" -- true;           eq "uso: --env inválido = 94" 94 "$RC"
 reset_env; REA_RUN_MIN_FREE_GB=abc run --local -- true;  eq "config: limite não numérico = 93" 93 "$RC"
+# número com zero à esquerda: o `[ -ge ]` o aceita, mas a aritmética do bash o lê como OCTAL (08/09 estouram, 010 vale 8) e o
+# disco "sem folga" virava "com folga". Idem estouro de int64 na conta GB→KB. Tudo isso é configuração inválida = 93, sem rodar.
+for spec in REA_RUN_MIN_FREE_GB=08 REA_RUN_MIN_FREE_GB=09 REA_RUN_MIN_FREE_GB=010 REA_RUN_MIN_FREE_GB=0999 REA_RUN_MIN_FREE_GB=00 \
+            REA_RUN_MIN_FREE_GB=+5 REA_RUN_MIN_FREE_GB=99999999999999 REA_RUN_MIN_FREE_GB=9223372036854775807 REA_RUN_MAX_SWAP_MB=09 \
+            REA_RUN_WAIT_S=08 REA_RUN_TIMEOUT_S=010 REA_RUN_KILL_GRACE_S=08 REA_RUN_LOCK_ORPHAN_S=08 REA_RUN_NICE=08; do
+  reset_env; export "$spec"; run --local -- sh -c "echo x > '$MARK'"
+  eq "config: $spec = 93" 93 "$RC"; [ ! -e "$MARK" ]; ok "config $spec: comando NÃO rodou" $?; has "config $spec: mensagem" "configuração inválida" "$OUT"
+  case "$OUT" in *"value too great"*|*"unbound variable"*|*"syntax error"*) ok "config $spec: sem erro de aritmética do bash" 1 ;; *) ok "config $spec: sem erro de aritmética do bash" 0 ;; esac
+done
+reset_env; run --local --wait-s 08 -- true;              eq "config: --wait-s 08 = 93" 93 "$RC"
+reset_env; run --check --wait-s 09;                      eq "config: --check também valida (93)" 93 "$RC"
+reset_env; export REA_RUN_MIN_FREE_GB=0 STUB_DF_KB=1; run --local -- sh -c "echo x > '$MARK'"
+eq "config: MIN_FREE_GB=0 é válido (desliga o piso de disco)" 0 "$RC"; [ -e "$MARK" ]; ok "MIN_FREE_GB=0: comando rodou" $?
+reset_env; export REA_RUN_MIN_FREE_GB=999999999999 STUB_DF_KB=20971520; run --local -- sh -c "echo x > '$MARK'"
+eq "config: MIN_FREE_GB com 12 dígitos é válido e recusa (92), sem estourar a conta" 92 "$RC"; [ ! -e "$MARK" ]; ok "12 dígitos: comando NÃO rodou" $?
+reset_env; export REA_RUN_MIN_FREE_GB=9; export STUB_DF_KB=9437184; run --local -- sh -c "echo x > '$MARK'"; eq "config: MIN_FREE_GB=9 (9 GB exatos) passa" 0 "$RC"
+reset_env; export STUB_DF_RAW='Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 1 1 0123 1% /'; run --local -- true
+eq "df com 'disponível' de zero à esquerda: ilegível = 93" 93 "$RC"
 reset_env; export STUB_DF_KB=1; run --local --push "$T/nao-existe" -- true; eq "uso vence recusa de máquina" 94 "$RC"
 
 # --pull que falha: rc 0 não pode esconder "não veio"
@@ -339,6 +414,12 @@ probe_sigterm() { reset_env; local pf="$T/mgp.$N"
   local gp; gp=$(cat "$pf" 2>/dev/null); local vivo=morto; kill -0 "$gp" 2>/dev/null && { vivo=vivo; kill -KILL "$gp" 2>/dev/null; }
   echo "$rc|scratch=$(ls -A "$REA_RUN_SCRATCH_ROOT" 2>/dev/null | wc -l | tr -d ' ')|neto=$vivo"; }
 probe_opt_sem_valor() { reset_env; RUN="$1" run_limited 6 --local --push; echo "$RC"; }
+probe_pull_mbp() { reset_env; export STUB_MBP_RC=0 STUB_MBP_PULL=skip; RUN="$1" run --pull "out.json:$T/pm.$N.json" -- sh -c true; echo "$RC|$(grep -c pull-falhou "$LOGF" 2>/dev/null)"; }
+probe_isnum() { reset_env; export REA_RUN_MIN_FREE_GB=0999; RUN="$1" run --local -- sh -c "echo x > '$MARK'"; echo "$RC|$([ -e "$MARK" ] && echo rodou || echo parou)"; }
+probe_dup_push() { reset_env; mkdir -p "$T/da.$N" "$T/db.$N"; echo 1 > "$T/da.$N/x.txt"; echo 2 > "$T/db.$N/x.txt"; RUN="$1" run --local --push "$T/da.$N/x.txt" --push "$T/db.$N/x.txt" -- true; echo "$RC"; }
+mutant_check pull-mbp probe_pull_mbp '/# gate:pull-mbp/s/if \[ -n "\$pull_missing" \]/if false/'
+mutant_check isnum probe_isnum '/# gate:isnum/s/.*/isnum() { [ "$1" -ge 0 ] 2>\/dev\/null; }/'
+mutant_check push-dup probe_dup_push '/# gate:push-dup/s/exit 94/:/'
 mutant_check opt-sem-valor probe_opt_sem_valor '/# gate:opt-sem-valor/s/\[ \$# -ge 2 \] ||/true ||/'
 mutant_check ilegivel-disco probe_ilegivel_disco '/# gate:ilegivel-disco/s/.*/  isnum "$kb" || kb=99999999/'
 mutant_check ilegivel-swap probe_ilegivel_swap '/# gate:ilegivel-swap/s/.*/  isnum "$n" || n=0/'

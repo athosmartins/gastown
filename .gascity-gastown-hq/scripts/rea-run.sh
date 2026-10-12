@@ -20,29 +20,38 @@
 #   skill rea-scraper-first): no MBP esse endereço não existe. APK, Electron, nativo e Ghidra são o caso do MBP.
 #
 # CÓDIGOS DE SAÍDA — o código do comando é propagado; os abaixo são do próprio wrapper (a mensagem `rea-run:` no stderr e o
-#   campo "reason" do log dizem qual foi). Nunca emitimos 96..99: para quem chama, esses são "rode local" do mbp-run.
+#   campo "reason" do log dizem qual foi). O código do comando passa COMO VEIO: se ele mesmo sair com 91..94 ou 96..99, colide
+#   com os do wrapper (no MBP, um comando que saia 96..99 pode ser lido como "rode local" e rodar de novo no mini). O "reason" do
+#   log desambigua: "-" = o comando rodou e saiu com esse código; qualquer outro valor = o wrapper.
 #   0..90   código do comando (MBP ou mini)
 #   91      esperou o orçamento (--wait-s, padrão 1800 s) e a trava ou outro `rea` continuou ocupando
 #   92      RECUSADO: sem folga — disco livre < 10 GB ou swap usado > 6144 MB (ou, em --check, outro `rea` rodando)
 #   93      não consegui olhar ou preparar: df/sysctl/pgrep ilegível, trava ou scratch não criáveis, configuração inválida,
-#           ou o comando saiu 0 mas um --pull pedido falhou (o resultado não chegou). É o terceiro estado: "não sei" NUNCA
-#           vira "pode rodar", e "não veio" nunca vira rc 0. (Se o comando já saiu != 0, esse rc é mantido e o log marca pull-falhou.)
-#   94      uso errado (sem comando, opção desconhecida, --pull com caminho absoluto ou `..`, --push que não existe)
+#           ou o comando saiu 0 mas um --pull pedido falhou (o resultado não chegou; no MBP o mbp-run sai 0 e só avisa, então
+#           o wrapper confere o destino). É o terceiro estado: "não sei" NUNCA vira "pode rodar", e "não veio" nunca vira rc 0.
+#           (Se o comando já saiu != 0, esse rc é mantido e o log marca pull-falhou.) Número de configuração só vale decimal
+#           sem sinal, sem zero à esquerda, até 12 dígitos (08/010 seriam lidos como octal pela aritmética do bash).
+#   94      uso errado (sem comando, opção desconhecida, --pull com caminho absoluto ou `..`, --push que não existe ou dois
+#           --push com o mesmo nome)
 #   124     o comando passou de REA_RUN_TIMEOUT_S (padrão 3600 s) e foi encerrado
 #   128+n   o wrapper recebeu o sinal n; o comando e seus filhos foram encerrados e o scratch apagado
 #
 # COMO FUNCIONA
 #   MBP: `mbp-run.sh --exec ... -- cmd` (chave, saúde do MBP, slot e limpeza do scratch remoto são dele). rc 96..99 → mini.
-#        ATENÇÃO: o rc 98 também sai quando o ssh cai NO MEIO da execução; nesse caso o comando roda de novo no mini.
-#        Use só comando de leitura/recon (idempotente), que é o caso do REA.
+#        ATENÇÃO: o rc 98 também sai quando o ssh cai NO MEIO da execução; nesse caso o comando pode já ter rodado (em parte)
+#        no MBP e roda de novo no mini. Use só comando de leitura/recon (idempotente), que é o caso do REA.
+#        --pull no MBP: o destino é conferido por identidade (inode+ctime+tamanho; mtime não serve, o rsync -a copia o do
+#        MBP) e "não mudou" vira 93/pull-falhou. Limite: pull de arquivo byte-idêntico que o rsync pulou lê como "não chegou" —
+#        apague o destino antigo antes de pedir de novo.
 #   mini: (1) checa disco/swap já de cara (não vale esperar a trava para ser recusado depois) → (2) pega a trava
 #        (mkdir atômico em $CITY/.gc/run/rea-run.lock, dono = pid + hora de início do processo; dono morto ou pid
 #        reaproveitado é reaped) e espera até --wait-s → (3) espera não haver outro `rea` rodando (rodado por fora do
 #        wrapper; só processo `node .../bin/rea` conta, não o texto "bin/rea" no argumento de outro processo) → (4) checa disco/swap DE NOVO, já sob a trava → (5) apaga scratch órfão de execução que morreu →
 #        (6) cria scratch 0700 fora de qualquer repo → (7) roda o comando com cwd = scratch, nice 10, timeout e
 #        $REA_RUN_SCRATCH → (8) --pull → (9) apaga o scratch (também em erro, timeout, INT/TERM/HUP) e solta a trava.
-#   Log: $CITY/.gc/logs/rea-run.jsonl — uma linha por execução/recusa, só o NOME do comando e o nº de argumentos (argumentos
-#        podem carregar URL/segredo).
+#   Log: $CITY/.gc/logs/rea-run.jsonl — um evento por execução (ran), recusa/espera esgotada (refused) ou desvio para o mini
+#        (fallback), só o NOME do comando e o nº de argumentos (argumentos podem carregar URL/segredo). Uso errado (94),
+#        configuração inválida (93) e --check NÃO gravam log: só o stderr.
 #
 # O QUE NÃO FAZ: não classifica o que é "pesado" (quem chama decide); não mata Chrome que o comando deixou vivo fora da
 #   árvore dele; SIGKILL no wrapper não limpa — o scratch órfão é apagado na próxima execução (passo 5) e a trava morta
@@ -77,7 +86,10 @@ umask 077
 
 say() { printf 'rea-run: %s\n' "$*" >&2; }
 usage() { sed -n '2,/^[^#]/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//' >&2; }
-isnum() { [ "$1" -ge 0 ] 2>/dev/null; }   # inteiro sem sinal; vazio, texto e "1.5" NÃO são número
+# inteiro decimal sem sinal, até 12 dígitos. Vazio, texto, "1.5", sinal e ZERO À ESQUERDA NÃO são número: `[ 08 -ge 0 ]` passa, mas a
+# aritmética do bash lê 08 como octal (erro) e 010 como 8 — o disco "sem folga" virava "com folga". 12 dígitos é o teto para a
+# conta GB→KB (x 1048576) caber em int64. Na dúvida, "não é número" = o estado inerte (93, não roda).
+isnum() { [ "${#1}" -le 12 ] && case "$1" in ''|*[!0-9]*|0?*) return 1 ;; esac; }   # gate:isnum
 
 # ---- log ---------------------------------------------------------------------------------------------------------
 CMD_NAME="-"; NARGS=0; T_START=$(date +%s); M_FREE_KB=""; M_SWAP_MB=""; M_REASON=""
@@ -116,7 +128,7 @@ while [ $# -gt 0 ]; do
 done
 
 for v in MIN_FREE_GB MAX_SWAP_MB WAIT_S RUN_TIMEOUT KILL_GRACE_S LOCK_ORPHAN_S NICE; do
-  isnum "${!v}" || { say "configuração inválida: $v='${!v}' não é inteiro >= 0"; exit 93; }
+  isnum "${!v}" || { say "configuração inválida: $v='${!v}' não é inteiro decimal >= 0 (sem zero à esquerda, até 12 dígitos)"; exit 93; }
 done
 printf '%s' "$POLL_S" | grep -Eq '^[0-9]+(\.[0-9]+)?$' && [ "$(printf '%s' "$POLL_S" | tr -d '0.')" != "" ] \
   || { say "configuração inválida: REA_RUN_POLL_S='$POLL_S' (número > 0)"; exit 93; }
@@ -181,8 +193,12 @@ fi
 
 [ $# -gt 0 ] || { say "faltou o comando (use -- <comando>)"; usage; exit 94; }
 CMD_NAME=$(printf '%s' "$(basename -- "$1")" | tr -c 'A-Za-z0-9._-' '_'); NARGS=$(( $# - 1 ))
+seen_push=$'\n'
 for p in "${pushes[@]+"${pushes[@]}"}"; do
   [ -n "$p" ] && [ -e "$p" ] || { say "--push '$p' não existe"; exit 94; }
+  b=$(basename -- "$p")
+  case "$seen_push" in *$'\n'"$b"$'\n'*) say "--push '$p': outro --push já usa o nome '$b' (um sobrescreveria o outro em ./in/)"; exit 94 ;; esac   # gate:push-dup
+  seen_push="$seen_push$b"$'\n'
 done
 for pl in "${pulls[@]+"${pulls[@]}"}"; do
   rel=${pl%%:*}; dest=${pl#*:}
@@ -195,18 +211,44 @@ for kv in "${envs[@]+"${envs[@]}"}"; do
 done
 
 # ---- caminho 1: MBP ------------------------------------------------------------------------------------------------
+# O mbp-run só AVISA ("pull de X falhou") quando o rsync do pull falha e sai com o rc do comando (0): o rc dele não diz se o
+# resultado chegou. Então conferimos o destino: assinatura (inode ctime tamanho) antes e depois. NÃO é mtime: o `rsync -a`
+# copia o mtime do MBP, e relógio atrasado de lá faria pull bom parecer velho. Arquivo trocado por rename muda inode+ctime;
+# diretório com entrada trocada muda ctime. "ilegivel" = existe mas não consegui ler: sem prova de que chegou.
+pull_sig() { # "absent" | "ilegivel" | "inode ctime tamanho"
+  local s
+  if { s=$(stat -c '%i %.9Z %s' -- "$1" 2>/dev/null) || s=$(stat -f '%i %Fc %z' -- "$1" 2>/dev/null); } \
+     && printf '%s' "$s" | grep -Eq '^[0-9]+ [0-9.]+ [0-9]+$'; then printf '%s' "$s"
+  elif [ -e "$1" ] || [ -L "$1" ]; then printf 'ilegivel'
+  else printf 'absent'; fi
+}
+pull_arrived() { # antes depois — 0 = o destino mudou desde antes do mbp-run
+  case "$2" in absent|ilegivel) return 1 ;; esac
+  [ "$1" != ilegivel ] && [ "$1" != "$2" ]
+}
+
 if [ $force_local -eq 0 ] && [ ! -x "$MBP_RUN" ]; then
   say "mbp-run.sh ausente ou sem permissão de execução ($MBP_RUN) — rodando no mini"; log_event fallback mbp 0 "mbp-run-ausente"
 fi
 if [ $force_local -eq 0 ] && [ -x "$MBP_RUN" ]; then
   margs=(--exec)
   for p in "${pushes[@]+"${pushes[@]}"}"; do margs+=(--push "$p"); done
-  for pl in "${pulls[@]+"${pulls[@]}"}"; do margs+=(--pull "$pl"); done
+  pull_before=()
+  for pl in "${pulls[@]+"${pulls[@]}"}"; do margs+=(--pull "$pl"); pull_before+=("$(pull_sig "${pl#*:}")"); done
   for kv in "${envs[@]+"${envs[@]}"}"; do margs+=(--env "$kv"); done
   "$MBP_RUN" "${margs[@]}" -- "$@"; rc=$?
   case $rc in
-    96|97|98|99) say "MBP indisponível (mbp-run rc=$rc) — rodando no mini"; log_event fallback mbp "$rc" "mbp-rc-$rc" ;;   # gate:fallback
-    *) MODE=mbp; log_event ran mbp "$rc" "-"; exit $rc ;;
+    96|97|98|99) say "MBP indisponível (mbp-run rc=$rc) — rodando no mini$([ $rc -eq 98 ] && printf ' (rc 98 também sai com o ssh caindo no meio: o comando pode já ter rodado, em parte, no MBP)')"
+                 log_event fallback mbp "$rc" "mbp-rc-$rc" ;;   # gate:fallback
+    *) MODE=mbp; pull_missing=""; i=0
+       for pl in "${pulls[@]+"${pulls[@]}"}"; do
+         rel=${pl%%:*}; dest=${pl#*:}
+         pull_arrived "${pull_before[$i]}" "$(pull_sig "$dest")" \
+           || { say "pull de '$rel' falhou — não há prova de que o resultado chegou em '$dest' (destino ausente, igual ao de antes ou ilegível)"; pull_missing="$pull_missing $rel"; }
+         i=$(( i + 1 ))
+       done
+       if [ -n "$pull_missing" ]; then log_event ran mbp "$rc" "pull-falhou"; [ "$rc" -eq 0 ] && rc=93; exit $rc; fi   # gate:pull-mbp
+       log_event ran mbp "$rc" "-"; exit $rc ;;
   esac
 fi
 MODE=local
@@ -347,7 +389,7 @@ CHILD=$!
     kill -0 "$$" 2>/dev/null || exit 0   # o wrapper morreu (SIGKILL): ninguém limpa, e o pid de CHILD pode já ser de outro processo
     left=$(( left - step ))
   done
-  [ "$(ps -o ppid= -p "$CHILD" 2>/dev/null | tr -d ' ')" = "$$" ] || exit 0   # CHILD já saiu, ou o pid foi reaproveitado
+  { alive "$CHILD" && [ "$(ps -o ppid= -p "$CHILD" 2>/dev/null | tr -d ' ')" = "$$" ]; } || exit 0   # CHILD já saiu (zumbi inclusive), ou o pid foi reaproveitado
   : > "$LOCK_DIR/timeout"; stop_tree "$CHILD" ) &                                                 # gate:timeout
 WD=$!
 RC=0
