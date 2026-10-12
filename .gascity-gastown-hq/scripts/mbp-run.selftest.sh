@@ -2,7 +2,7 @@
 # mbp-run.selftest.sh — hermético: ssh/rsync são stubs no PATH; nada toca o MBP nem o live.
 #
 # Contents
-#   Casos · Preflight de saúde (ga-9e2rjh) · Controle negativo
+#   Casos · Preflight de saúde (ga-9e2rjh) · Presença do Athos (ga-77c1qg) · Controle negativo
 #
 # CASOS: off(99) · inalcançável(98) · RAM baixa(98) · bateria baixa(98) · slots cheios(96) ·
 #   slot de dono morto é reaped · rc do remoto propagado e logado · ssh 255 no meio(98) · nota de shared/data ·
@@ -17,6 +17,14 @@
 #   MBP_OFFLOAD_UNDER_TEST=<script> roda os casos da contagem contra outro mbp-offload.sh.
 # CONTROLE NEGATIVO: cada porta do preflight é removida do script (sed no marcador "# gate:<nome>") e o mutante TEM que
 #   deixar de reproduzir o (rc, motivo) do script real — prova que o teste enxerga o defeito, inclusive "ilegível virou baixo".
+# PRESENÇA DO ATHOS (ga-77c1qg): a biblioteca mbp-presence.sh roda de verdade (ioreg/plutil/pmset falsos, plist no formato REAL do
+#   ioreg): bloqueada vence input recente · 599 s não é fora e 600 s é · app segurando a tela segura o "fora" · cada leitura que falha
+#   cai em "uso", nunca em "livre" · só dá para forçar PIORAR (nunca forçar "livre"). mbp-run: teto de slots por modo (núcleos, RAM,
+#   1 em uso, total e não só números baixos), pausa (local e no MBP) rc 99 antes da saúde, seed em fundo, e a execução SUPERVISIONADA
+#   rodando de verdade sob bash com python/taskpolicy/renice falsos: prioridade na largada, rebaixamento no meio da execução quando o
+#   Athos volta ou pausa, sem atrasar o fim da execução nem deixar processo para trás. MBP_SELFTEST_ONLY=presenca roda só esta parte
+#   (a chave manual, o status e o gascity-mbp têm a suíte da fatia ga-77c1qg.2);
+#   MBP_SELFTEST_SKIP=presenca pula a presença (a suíte antiga, sozinha, cabe nos 900 s do prod test do ga-9e2rjh).
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -35,30 +43,40 @@ args="$*"
 if [ "${STUB_UNREACHABLE:-0}" = 1 ]; then exit 255; fi
 case "$args" in *"bash -s"*) s=$(cat); name=$(printf '%s' "$s" | sed -n '1s/^# MBP://p') ;; *) name="DIRECT"; s="" ;; esac
 echo "$name" >> "$STUB_LOG"
+# HOME falso: a biblioteca de presença e a listagem de tarefas leem $HOME/gt-remote (PAUSE, slots/) no "MBP"
+rexec() { printf '%s\n' "$s" | HOME="$STUB_HOME" PATH="$FAKE:$PATH" STUB_REAL_SLEEP="${1:-0}" "$STUB_REMOTE_BASH" -s -- ${2:-}; }
 case "$name" in
   PREFLIGHT)
     if [ -n "${STUB_PF_RAW:-}" ]; then printf '%b\n' "$STUB_PF_RAW"; else
       rm -f "$STUB_SWAPCNT"; sample=""
       case "$args" in *"bash -s -- "*) sample=${args##*bash -s -- } ;; esac
-      printf '%s\n' "$s" | PATH="$FAKE:$PATH" "$STUB_REMOTE_BASH" -s -- $sample
+      rexec 0 "$sample"
     fi ;;
   SLOT_ACQUIRE)
-    if [ "${STUB_SLOTS:-free}" = full ]; then
+    if [ "${STUB_SLOTS:-free}" = exec ]; then rexec 0; exit $?
+    elif [ "${STUB_SLOTS:-free}" = full ]; then
       echo "BUSY 1 otherhost:11:$(date +%s) 0"; echo "BUSY 2 otherhost:12:$(date +%s) 0"; echo "BUSY 3 otherhost:13:$(date +%s) 0"; echo FULL; exit 3
     elif [ "${STUB_SLOTS:-free}" = dead ] && [ ! -f "$STUB_REAPED" ]; then
       h=$(hostname -s); echo "BUSY 1 $h:999999:$(date +%s) 0"; echo "BUSY 2 otherhost:12:$(date +%s) 0"; echo "BUSY 3 otherhost:13:$(date +%s) 0"; echo FULL; exit 3
     else echo "SLOT=1"; fi ;;
-  SLOT_REAP) touch "$STUB_REAPED" ;;
+  SLOT_REAP) if [ "${STUB_SLOTS:-free}" = exec ]; then rexec 0; exit $?; else touch "$STUB_REAPED"; fi ;;
+  SLOT_RELEASE) if [ "${STUB_SLOTS:-free}" = exec ]; then rexec 0; exit $?; fi ;;
   MIRROR) if [ "${STUB_NOBASE:-0}" = 1 ]; then echo NOBASE; exit 97; else echo MIRROR_OK; fi ;;
-  RUN) [ "${STUB_RUN_RC:-0}" = 255 ] && exit 255; echo "${STUB_RUN_OUT:-stub-run-ok}"; exit "${STUB_RUN_RC:-0}" ;;
-  EXEC) echo "stub-exec-ok"; exit "${STUB_RUN_RC:-0}" ;;
-  DIRECT) echo "DIRECT:$args" >> "$STUB_LOG" ;;
+  RUN|EXEC)
+    printf '%s\n' "$s" > "$(dirname "$STUB_LOG")/last-script-$name.sh"
+    # STUB_RUNMODE=exec: executa o script recebido de verdade (sleep REAL: o vigia precisa esperar), com python/taskpolicy/renice falsos
+    if [ "${STUB_RUNMODE:-canned}" = exec ]; then rexec 1; exit $?
+    elif [ "$name" = RUN ]; then [ "${STUB_RUN_RC:-0}" = 255 ] && exit 255; echo "${STUB_RUN_OUT:-stub-run-ok}"; exit "${STUB_RUN_RC:-0}"
+    else echo "stub-exec-ok"; exit "${STUB_RUN_RC:-0}"; fi ;;
+  DIRECT) echo "DIRECT:$args" >> "$STUB_LOG"; [ -z "${STUB_DIRECT_OUT:-}" ] || echo "$STUB_DIRECT_OUT"; exit "${STUB_DIRECT_RC:-0}" ;;
 esac
 exit 0
 EOF
 cat > "$T/bin/rsync" <<'EOF'
 #!/usr/bin/env bash
-echo "RSYNC:$*" >> "$STUB_LOG"; exit "${STUB_RSYNC_RC:-0}"
+echo "RSYNC:$*" >> "$STUB_LOG"
+case "$*" in *gt-remote/bin*) [ "${STUB_RSYNC_FAIL_BIN:-0}" = 1 ] && exit 1 ;; esac   # só a cópia de ferramentas para ~/gt-remote/bin
+exit "${STUB_RSYNC_RC:-0}"
 EOF
 
 # ferramentas falsas do MBP (só o preflight as enxerga). Padrão saudável: 8000 MB livres, swap 1000 MB parado, pressão 1.
@@ -92,6 +110,7 @@ case "${1:-}" in
     if [ -n "$raw" ]; then printf '%s\n' "$raw"; else echo "total = 8192.00M  used = ${mb}.00M  free = 1.00M  (encrypted)"; fi ;;
   kern.memorystatus_vm_pressure_level) [ "${STUB_PRESSURE_FAIL:-0}" = 1 ] && exit 1; echo "${STUB_PRESSURE:-1}" ;;
   vm.loadavg) echo "{ 1.00 1.10 1.20 }" ;;
+  hw.ncpu) [ "${STUB_NCPU_FAIL:-0}" = 1 ] && exit 1; echo "${STUB_NCPU:-12}" ;;
   *) exit 1 ;;
 esac
 EOF
@@ -103,6 +122,12 @@ echo "System-wide memory free percentage: ${STUB_MP_PCT:-54}%"
 EOF
 cat > "$T/fake/pmset" <<'EOF'
 #!/usr/bin/env bash
+case "$*" in *assertions*)
+  [ "${STUB_ASSERT_FAIL:-0}" = 1 ] && exit 1
+  [ -n "${STUB_ASSERT_RAW:-}" ] && { printf '%s\n' "$STUB_ASSERT_RAW"; exit 0; }
+  printf 'Assertion status system-wide:\n   BackgroundTask                 0\n   PreventUserIdleDisplaySleep    %s\n   PreventSystemSleep             0\n' "${STUB_HOLD:-0}"
+  exit 0 ;;
+esac
 [ "${STUB_PMSET_FAIL:-0}" = 1 ] && exit 1
 [ -n "${STUB_PMSET_RAW:-}" ] && { printf '%s\n' "$STUB_PMSET_RAW"; exit 0; }
 if [ "${STUB_POWER:-ac}" = ac ]; then src="AC Power"; else src="Battery Power"; fi
@@ -110,18 +135,103 @@ printf "Now drawing from '%s'\n -InternalBattery-0 (id=1)\t%s%%; discharging; 3:
 EOF
 cat > "$T/fake/sleep" <<'EOF'
 #!/usr/bin/env bash
+if [ "${STUB_REAL_SLEEP:-0}" = 1 ]; then exec /bin/sleep "$@"; fi
 echo "SLEEP:$*" >> "$STUB_LOG"
 EOF
-chmod +x "$T/bin/ssh" "$T/bin/rsync" "$T/fake/"*
+# ioreg falso, no formato REAL (medido no MBP em 12/10: dict raiz com IOConsoleUsers[ {CGSSessionScreenIsLocked, kCGSSessionOnConsoleKey, ...} ];
+# a marca de bloqueio só existe com a tela bloqueada). Estado: env STUB_LOCKED/STUB_IDLE_S, ou o arquivo STUB_STATE_FILE (muda no meio da execução).
+#   STUB_LOCKED: 1 bloqueada · 0 sem a marca · false marca=false · two (2 sessões, a do console bloqueada) · notconsole (nenhuma no console)
+#                none (sem IOConsoleUsers) · garbage (não é plist) · fail (ioreg sai 1)
+#   STUB_IDLE_S: segundos (ex. "30" ou "30,9000" = duas entradas) · none (nenhuma entrada) · fail (ioreg sai 1) · qualquer texto = entrada ilegível
+cat > "$T/fake/ioreg" <<'EOF'
+#!/usr/bin/env bash
+lk=${STUB_LOCKED:-1}; idle=${STUB_IDLE_S:-5000}
+if [ -n "${STUB_STATE_FILE:-}" ] && [ -f "$STUB_STATE_FILE" ]; then . "$STUB_STATE_FILE"; lk=${locked:-$lk}; idle=${idle_s:-$idle}; fi
+sess() { # locked(true|false|absent) onconsole(true|false)
+  printf '\t\t<dict>\n'
+  [ "$1" = absent ] || printf '\t\t\t<key>CGSSessionScreenIsLocked</key>\n\t\t\t<%s/>\n' "$1"
+  printf '\t\t\t<key>kCGSSessionIDKey</key>\n\t\t\t<integer>257</integer>\n\t\t\t<key>kCGSSessionOnConsoleKey</key>\n\t\t\t<%s/>\n\t\t\t<key>kCGSSessionUserNameKey</key>\n\t\t\t<string>user</string>\n\t\t</dict>\n' "$2"
+}
+case "$*" in
+  *"-n Root"*)
+    case "$lk" in
+      fail) exit 1 ;;
+      garbage) echo "this is not a plist"; exit 0 ;;
+    esac
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n'
+    [ "$lk" = 1 ] && printf '\t<key>IOConsoleLocked</key>\n\t<true/>\n'
+    if [ "$lk" != none ]; then
+      printf '\t<key>IOConsoleUsers</key>\n\t<array>\n'
+      case "$lk" in
+        1) sess true true ;;
+        0) sess absent true ;;
+        false) sess false true ;;
+        two) sess false false; sess true true ;;
+        notconsole) sess true false ;;
+      esac
+      printf '\t</array>\n'
+    fi
+    printf '\t<key>IOKitBuildVersion</key>\n\t<string>Darwin Kernel</string>\n</dict>\n</plist>\n' ;;
+  *"-c IOHIDSystem"*)
+    case "$idle" in
+      fail) exit 1 ;;
+      none) exit 0 ;;
+    esac
+    printf '%s\n' "$idle" | tr ',' '\n' | while read -r v; do
+      case "$v" in ''|*[!0-9]*) printf '      | |   "HIDIdleTime" = %s\n' "$v" ;; *) printf '      | |   "HIDIdleTime" = %s000000000\n' "$v" ;; esac
+    done ;;
+esac
+EOF
+# taskpolicy falso: `taskpolicy -b cmd...` registra e executa cmd; `taskpolicy -b -p PID` só registra. renice falso só registra.
+cat > "$T/fake/taskpolicy" <<'EOF'
+#!/usr/bin/env bash
+echo "TP:$*" >> "$STUB_LOG"
+[ "${2:-}" = -p ] && exit 0   # `taskpolicy -b -p PID`: só registra (o `-p` do pytest, mais adiante na linha, NÃO conta)
+shift   # -b
+exec "$@"
+EOF
+# nice falso: registra o `-n N` pedido e executa o comando SEM aplicar (a árvore de processos da máquina de teste já pode estar em nice 10,
+# e nice 20 é o teto: o valor real não distinguiria os modos)
+cat > "$T/fake/nice" <<'EOF'
+#!/usr/bin/env bash
+echo "NICE:$1 $2" >> "$STUB_LOG"
+shift 2
+exec "$@"
+EOF
+cat > "$T/fake/renice" <<'EOF'
+#!/usr/bin/env bash
+echo "RENICE:$*" >> "$STUB_LOG"
+EOF
+# python falso do venv do MBP (só roda quando STUB_RUNMODE=exec): registra o nice com que nasceu e os slots que viu, dorme, sai com STUB_RUN_RC
+mkdir -p "$T/home/gt-remote/venv/bin" "$T/home/gt-remote/exec" "$T/home/gt-remote/slots"
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13; do mkdir -p "$T/home/gt-remote/mirror/wa-$i" "$T/home/gt-remote/exec/$i"; done
+cat > "$T/home/gt-remote/venv/bin/python" <<'EOF'
+#!/usr/bin/env bash
+echo "PY args=$*" >> "$STUB_LOG"
+cat "$HOME"/gt-remote/slots/*/info >> "$STUB_SEEN" 2>/dev/null
+# gatilhos de virada RELATIVOS ao início do trabalho (um temporizador do teste correria contra o preflight e o rsync, que numa máquina carregada demoram)
+if [ -n "${STUB_FLIP_STATE:-}" ]; then ( /bin/sleep 1.5; printf '%b' "$STUB_FLIP_STATE" > "$STUB_STATE_FILE" ) </dev/null >/dev/null 2>&1 & fi
+if [ -n "${STUB_FLIP_PAUSE:-}" ]; then ( /bin/sleep 1.5; echo "origem=mbp desde=agora" > "$HOME/gt-remote/PAUSE" ) </dev/null >/dev/null 2>&1 & fi
+/bin/sleep "${STUB_RUN_SLEEP:-0}"
+# espera (limitada: N voltas de 0,5 s) o vigia rebaixar a árvore, em vez de dormir um tempo fixo: numa máquina com load 90 cada ioreg/ps do vigia
+# leva segundos, e um sleep fixo faria o teste medir a carga da máquina, não o rebaixamento
+if [ -n "${STUB_WAIT_RENICE:-}" ]; then i=0; while [ "$i" -lt "$STUB_WAIT_RENICE" ] && ! grep -q '^RENICE:' "$STUB_LOG"; do /bin/sleep 0.5; i=$((i+1)); done; fi
+echo "5 passed in 0.1s"
+exit "${STUB_RUN_RC:-0}"
+EOF
+chmod +x "$T/bin/ssh" "$T/bin/rsync" "$T/fake/"* "$T/home/gt-remote/venv/bin/python"
 
 unset MBP_MAX_SWAP_MB MBP_MAX_SWAP_GROWTH_MB MBP_SWAP_SAMPLE_S MBP_MAX_PRESSURE_LEVEL MBP_MIN_AVAIL_MB MBP_MIN_BATT MBP_MAX_SLOTS MBP_SLOT_MAX_AGE_S MBP_RUN_TIMEOUT_S MBP_HOST
 export PATH="$T/bin:$PATH" MBP_CITY="$T/city" MBP_SSH="$T/bin/ssh" MBP_RSYNC="$T/bin/rsync"
-export STUB_LOG="$T/stub.log" STUB_REAPED="$T/reaped" STUB_SWAPCNT="$T/swapcnt" FAKE="$T/fake"
+export STUB_LOG="$T/stub.log" STUB_REAPED="$T/reaped" STUB_SWAPCNT="$T/swapcnt" FAKE="$T/fake" STUB_HOME="$T/home" STUB_SEEN="$T/seen-info" STUB_STATE_FILE="$T/presence.state"
 if [ -x /bin/bash ]; then export STUB_REMOTE_BASH=/bin/bash; else export STUB_REMOTE_BASH=bash; fi
 FLAG="$T/city/.gc/mbp-offload.on"
+FLAG_PAUSE="$T/city/.gc/mbp-offload.pause"
 J="$T/city/.gc/logs/mbp-run.jsonl"
 fails=0; n=0
-reset() { : > "$STUB_LOG"; rm -f "$STUB_REAPED" "$J"; unset STUB_UNREACHABLE STUB_AVAIL_MB STUB_SWAP_MB STUB_SWAP2_MB STUB_SWAP_RAW STUB_SWAP2_RAW STUB_PRESSURE STUB_PRESSURE_FAIL STUB_VM_FAIL STUB_VM_DROP STUB_PAGE_SIZE STUB_COMP_PAGES STUB_MP_FAIL STUB_MP_PCT STUB_PF_RAW STUB_POWER STUB_BATT STUB_PMSET_FAIL STUB_PMSET_RAW STUB_SLOTS STUB_NOBASE STUB_RUN_RC STUB_RUN_OUT STUB_RSYNC_RC; }
+reset() { : > "$STUB_LOG"; rm -f "$STUB_REAPED" "$J" "$STUB_STATE_FILE" "$STUB_SEEN" "$FLAG_PAUSE" "$T/home/gt-remote/PAUSE"; mkdir -p "$T/home/gt-remote/slots"; find "$T/home/gt-remote/slots" -mindepth 1 -delete 2>/dev/null
+  unset STUB_LOCKED STUB_IDLE_S STUB_HOLD STUB_ASSERT_FAIL STUB_ASSERT_RAW STUB_NCPU STUB_NCPU_FAIL STUB_RSYNC_FAIL_BIN STUB_WAIT_RENICE STUB_RUNMODE STUB_RUN_SLEEP STUB_FLIP_STATE STUB_FLIP_PAUSE STUB_DIRECT_OUT STUB_DIRECT_RC STUB_REAL_SLEEP MBP_FORCE_PRESENCE MBP_MAX_SLOTS MBP_USE_SLOTS MBP_SLOT_MEM_MB MBP_AWAY_IDLE_S MBP_WATCH_S PRESENCE_FORCE_USO PRESENCE_AWAY_S
+  unset STUB_UNREACHABLE STUB_AVAIL_MB STUB_SWAP_MB STUB_SWAP2_MB STUB_SWAP_RAW STUB_SWAP2_RAW STUB_PRESSURE STUB_PRESSURE_FAIL STUB_VM_FAIL STUB_VM_DROP STUB_PAGE_SIZE STUB_COMP_PAGES STUB_MP_FAIL STUB_MP_PCT STUB_PF_RAW STUB_POWER STUB_BATT STUB_PMSET_FAIL STUB_PMSET_RAW STUB_SLOTS STUB_NOBASE STUB_RUN_RC STUB_RUN_OUT STUB_RSYNC_RC; }
 expect() { # nome rc_esperado rc_real [grep-no-log padrão]
   n=$((n+1))
   if [ "$2" = "$3" ]; then echo "ok   $1 (rc=$3)"; else echo "FAIL $1: esperado rc=$2, veio $3"; fails=$((fails+1)); fi
@@ -145,6 +255,236 @@ outcome() {
   r=$(grep '"mode":"preflight"' "$J" 2>/dev/null | tail -1 | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   echo "$rc:${r:--}"
 }
+
+# ---- PRESENÇA DO ATHOS (ga-77c1qg) ---------------------------------------------------------------------------------
+# A biblioteca e o runner rodam DE VERDADE (sob /bin/bash 3.2 quando existe, como no MBP) com ioreg/pmset/taskpolicy/renice/python falsos;
+# o plist do ioreg falso tem o formato REAL medido no MBP. Nada toca o MBP verdadeiro.
+LIB="$HERE/mbp-presence.sh"
+LIBX=""   # biblioteca sob teste (os controles negativos apontam para uma mutante)
+libp() { HOME="$T/home" PATH="$FAKE:$PATH" "$STUB_REMOTE_BASH" -c 'PRESENCE_LIB_ONLY=1; . "$1"; presence_probe' _ "${LIBX:-$LIB}" 2>/dev/null; }
+pv() { libp | sed -n "s/^$1=//p"; }
+verdict() { local o; o=$(libp); printf '%s/%s' "$(printf '%s\n' "$o" | sed -n 's/^presence=//p')" "$(printf '%s\n' "$o" | sed -n 's/^presence_why=//p')"; }
+mkslot() { mkdir -p "$T/home/gt-remote/slots/$1"; printf '%s\n' "${2:-otherhost:1:$(date +%s)}" > "$T/home/gt-remote/slots/$1/owner"; }
+slot_names() { ls -1 "$T/home/gt-remote/slots" | sort -n | tr '\n' ' '; }
+capof() { "${1:-$RUN}" --check 2>/dev/null | sed -n 's/^slot_cap=//p'; }
+runx() { local s="$1"; shift; "$s" --repo wa --dir "$T/wt" -- "$@" >"$T/out" 2>"$T/err"; echo $?; }
+runs() { MBP_WATCH_S="${MBP_WATCH_S:-1}" run "$@"; }   # execução supervisionada com o vigia a cada 1 s (reset limpa MBP_WATCH_S)
+PF_OK='avail_mb=8000\nswap_mb=5000\nswap_delta_mb=0\npressure=1\npower=ac\nbatt=90'
+
+presenca_cases() {
+echo "--- presença do Athos (ga-77c1qg)"
+reset
+# --- a regra, na biblioteca ---
+eq "bloqueada → livre" "livre/bloqueada" "$(STUB_LOCKED=1 STUB_IDLE_S=5 verdict)"
+eq "desbloqueada + teclado há 30 s → uso" "uso/input_recente" "$(STUB_LOCKED=0 STUB_IDLE_S=30 verdict)"
+eq "599 s sem input (fronteira) → uso" "uso/input_recente" "$(STUB_LOCKED=0 STUB_IDLE_S=599 verdict)"
+eq "600 s sem input (fronteira) → livre" "livre/ocioso" "$(STUB_LOCKED=0 STUB_IDLE_S=600 verdict)"
+eq "marca de bloqueio =false → desbloqueada" "uso/input_recente" "$(STUB_LOCKED=false STUB_IDLE_S=30 verdict)"
+eq "limiar configurável (PRESENCE_AWAY_S=60): 61 s → livre" "livre/ocioso" "$(PRESENCE_AWAY_S=60 STUB_LOCKED=0 STUB_IDLE_S=61 verdict)"
+eq "limiar inválido volta a 600" "uso/input_recente" "$(PRESENCE_AWAY_S=abc STUB_LOCKED=0 STUB_IDLE_S=599 verdict)"
+eq "sem input há 5000 s mas app segura a tela (reunião) → uso" "uso/tela_em_uso" "$(STUB_LOCKED=0 STUB_IDLE_S=5000 STUB_HOLD=1 verdict)"
+eq "app segurando a tela NÃO atrapalha a tela bloqueada" "livre/bloqueada" "$(STUB_LOCKED=1 STUB_HOLD=1 verdict)"
+eq "pmset assertions falhou → ilegível, uso" "uso/ilegivel:tela" "$(STUB_LOCKED=0 STUB_IDLE_S=5000 STUB_ASSERT_FAIL=1 verdict)"
+eq "pmset assertions sem a linha → ilegível, uso" "uso/ilegivel:tela" "$(STUB_LOCKED=0 STUB_IDLE_S=5000 STUB_ASSERT_RAW='nothing here' verdict)"
+# --- leitura que falha NUNCA vira livre ---
+eq "ociosidade ilegível (ioreg HID falhou) → uso" "uso/ilegivel:ociosidade" "$(STUB_LOCKED=0 STUB_IDLE_S=fail verdict)"
+eq "nenhuma entrada HIDIdleTime → uso" "uso/ilegivel:ociosidade" "$(STUB_LOCKED=0 STUB_IDLE_S=none verdict)"
+eq "entrada HID com lixo → ilegível, uso" "uso/ilegivel:ociosidade" "$(STUB_LOCKED=0 STUB_IDLE_S=abc verdict)"
+eq "duas entradas HID: vale a de input mais recente" "uso/input_recente" "$(STUB_LOCKED=0 STUB_IDLE_S=30,9000 verdict)"
+eq "duas entradas HID, uma com lixo → ilegível" "uso/ilegivel:ociosidade" "$(STUB_LOCKED=0 STUB_IDLE_S=abc,9000 verdict)"
+eq "bloqueio ilegível (ioreg falhou) + 5000 s sem input → livre (a evidência positiva é só do input)" "livre/ocioso" "$(STUB_LOCKED=fail STUB_IDLE_S=5000 verdict)"
+eq "bloqueio ilegível + input há 10 s → uso" "uso/input_recente" "$(STUB_LOCKED=fail STUB_IDLE_S=10 verdict)"
+eq "bloqueio E ociosidade ilegíveis → uso" "uso/ilegivel:presenca" "$(STUB_LOCKED=fail STUB_IDLE_S=fail verdict)"
+eq "saída que não é plist = bloqueio ilegível" "uso/ilegivel:presenca" "$(STUB_LOCKED=garbage STUB_IDLE_S=none verdict)"
+eq "sem IOConsoleUsers (tela de login) não é 'desbloqueada'" "uso/ilegivel:presenca" "$(STUB_LOCKED=none STUB_IDLE_S=none verdict)"
+eq "nenhuma sessão no console não é 'desbloqueada'" "uso/ilegivel:presenca" "$(STUB_LOCKED=notconsole STUB_IDLE_S=none verdict)"
+eq "duas sessões: vale a do console (bloqueada)" "livre/bloqueada" "$(STUB_LOCKED=two STUB_IDLE_S=5 verdict)"
+eq "bloqueada lida do plist real: locked=1" 1 "$(STUB_LOCKED=1 pv locked)"
+eq "sem a marca (sessão do console lida): locked=0" 0 "$(STUB_LOCKED=0 pv locked)"
+eq "ociosidade lida em segundos (ns / 1e9)" 4321 "$(STUB_IDLE_S=4321 pv idle_s)"
+# --- só dá para PIORAR ---
+eq "PRESENCE_FORCE_USO=1 vence a tela bloqueada" "uso/forcado" "$(PRESENCE_FORCE_USO=1 STUB_LOCKED=1 verdict)"
+eq "não existe forçar livre (variáveis de 'forçar livre' são ignoradas)" "uso/input_recente" "$(PRESENCE_FORCE_LIVRE=1 PRESENCE_FORCE=livre STUB_LOCKED=0 STUB_IDLE_S=30 verdict)"
+# --- pausa ---
+reset; eq "sem arquivo de pausa: paused=0" 0 "$(pv paused)"
+echo "origem=mbp desde=ontem|x" > "$T/home/gt-remote/PAUSE"
+eq "com o arquivo: paused=1" 1 "$(pv paused)"; eq "pause_info: numa linha e sem '|'" "origem=mbp desde=ontemx" "$(pv pause_info)"
+# --- caminhos de entrada da biblioteca ---
+reset
+eq "executada direto imprime o veredito" "presence=livre" "$(HOME="$T/home" PATH="$FAKE:$PATH" STUB_LOCKED=1 "$STUB_REMOTE_BASH" "$LIB" 2>/dev/null | sed -n 1p)"
+eq "colada num 'bash -s' (como vai ao MBP) NÃO imprime nada" "" "$(HOME="$T/home" PATH="$FAKE:$PATH" STUB_LOCKED=1 "$STUB_REMOTE_BASH" -s < "$LIB" 2>/dev/null)"
+
+# --- mbp-run: teto de slots por modo ---
+reset; eq "livre, 12 núcleos, RAM sobrando: teto 12" 12 "$(STUB_AVAIL_MB=30000 capof)"
+eq "livre, 8 núcleos: teto 8" 8 "$(STUB_AVAIL_MB=30000 STUB_NCPU=8 capof)"
+eq "núcleos ilegíveis: teto de reserva 3 (não inventa)" 3 "$(STUB_AVAIL_MB=30000 STUB_NCPU_FAIL=1 capof)"
+eq "MBP_MAX_SLOTS=5 troca o teto de núcleos" 5 "$(MBP_MAX_SLOTS=5 STUB_AVAIL_MB=30000 capof)"
+eq "MBP_MAX_SLOTS inválido é ignorado" 12 "$(MBP_MAX_SLOTS=abc STUB_AVAIL_MB=30000 capof)"
+eq "RAM decide: 3840 MB disponíveis (3072 + 1 fatia) → 2" 2 "$(STUB_AVAIL_MB=3840 capof)"
+eq "RAM decide: 3839 MB (falta 1 MB para a 2ª fatia) → 1" 1 "$(STUB_AVAIL_MB=3839 capof)"
+eq "RAM no mínimo (3072) → 1" 1 "$(STUB_AVAIL_MB=3072 capof)"
+eq "fatia de RAM configurável (MBP_SLOT_MEM_MB=100)" 10 "$(MBP_SLOT_MEM_MB=100 STUB_AVAIL_MB=4000 capof)"
+eq "desbloqueado, teclado há 30 s (em uso): teto 1" 1 "$(STUB_LOCKED=0 STUB_IDLE_S=30 STUB_AVAIL_MB=30000 capof)"
+eq "em uso: MBP_USE_SLOTS=2 sobe o teto" 2 "$(MBP_USE_SLOTS=2 STUB_LOCKED=0 STUB_IDLE_S=30 capof)"
+eq "em uso: MBP_USE_SLOTS=0 (inválido) volta a 1" 1 "$(MBP_USE_SLOTS=0 STUB_LOCKED=0 STUB_IDLE_S=30 capof)"
+eq "MBP_FORCE_PRESENCE=uso vence a tela bloqueada" 1 "$(MBP_FORCE_PRESENCE=uso STUB_AVAIL_MB=30000 capof)"
+eq "MBP_FORCE_PRESENCE=livre é ignorado (só existe forçar uso)" 1 "$(MBP_FORCE_PRESENCE=livre STUB_LOCKED=0 STUB_IDLE_S=30 STUB_AVAIL_MB=30000 capof)"
+eq "saída do MBP sem campo de presença = em uso (teto 1)" 1 "$(STUB_PF_RAW="$PF_OK" capof)"
+eq "presença com valor fora de {livre,uso} = em uso" 1 "$(STUB_PF_RAW="$PF_OK\npresence=talvez\nncpu=12\npaused=0" capof)"
+reset; STUB_AVAIL_MB=30000 chk >/dev/null
+has "--check mostra a presença" "$T/out" '^presence=livre$'; has "--check mostra o porquê" "$T/out" '^presence_why=bloqueada$'
+has "--check mostra paused" "$T/out" '^paused=0$'; has "--check mostra paused_local" "$T/out" '^paused_local=0$'
+has "--check mostra os núcleos" "$T/out" '^ncpu=12$'
+
+# --- a presença NÃO recusa por si; a saúde continua valendo; a pausa vem antes ---
+reset; rc=$(STUB_LOCKED=0 STUB_IDLE_S=30 run -- tests/test_x.py); expect "em uso + MBP saudável: roda (rc 0)" 0 "$rc"
+has "log: em uso, não rebaixada" "$J" '"presence":"uso","demoted":0'
+reset; rc=$(run -- tests/test_x.py); expect "livre + MBP saudável: roda" 0 "$rc"; has "log: livre" "$J" '"presence":"livre","demoted":0'
+reset; eq "em uso + RAM baixa: a saúde ainda recusa" "98:ram" "$(STUB_LOCKED=0 STUB_IDLE_S=30 STUB_AVAIL_MB=1000 outcome "$RUN")"; has "recusa registra a presença" "$J" '"presence":"uso"'
+echo "origem=mbp desde=hoje" > "$T/home/gt-remote/PAUSE"
+eq "pausa no MBP: rc 99 com motivo próprio" "99:pausado_mbp" "$(outcome "$RUN")"; has "pausa no log com rc 99" "$J" '"rc":99,.*"reason":"pausado_mbp"'
+rc=$(run -- tests/test_x.py); expect "pausa no MBP: rc 99" 99 "$rc"; has "mensagem diz quem pausou" "$T/err" 'pausado pelo Athos \(origem=mbp'
+reset; echo "origem=mbp desde=hoje" > "$T/home/gt-remote/PAUSE"
+eq "pausa vem antes da saúde (RAM baixa + pausa = pausa)" "99:pausado_mbp" "$(STUB_AVAIL_MB=1000 outcome "$RUN")"
+reset; echo "origem=mbp desde=hoje" > "$T/home/gt-remote/PAUSE"; rc=$(chk); expect "--check com a pausa no MBP: rc 99" 99 "$rc"; has "--check mostra paused=1" "$T/out" '^paused=1$'
+reset; echo "origem=painel desde=hoje" > "$FLAG_PAUSE"; rc=$(run -- tests/test_x.py); expect "pausa local: rc 99" 99 "$rc"
+hasnt "pausa local não chama ssh" "$STUB_LOG" 'PREFLIGHT'; has "mensagem da pausa local" "$T/err" 'pausado pelo Athos \(origem=painel'
+reset; echo "origem=painel desde=hoje" > "$FLAG_PAUSE"; rc=$("$RUN" --seed wa >"$T/out" 2>"$T/err"; echo $?); expect "--seed com pausa local: rc 99" 99 "$rc"
+hasnt "--seed pausado não chama ssh" "$STUB_LOG" 'PREFLIGHT'
+reset; echo "origem=mbp desde=hoje" > "$T/home/gt-remote/PAUSE"; rc=$("$RUN" --seed wa >"$T/out" 2>"$T/err"; echo $?); expect "--seed com pausa no MBP: rc 99" 99 "$rc"
+reset; "$RUN" --seed wa >"$T/out" 2>"$T/err"; hasnt "--seed LIVRE: receptor do rsync em prioridade normal" "$STUB_LOG" 'rsync-path'
+reset; STUB_LOCKED=0 STUB_IDLE_S=30 "$RUN" --seed wa >"$T/out" 2>"$T/err"; has "--seed EM USO: receptor do rsync em fundo" "$STUB_LOG" 'RSYNC:.*--rsync-path=taskpolicy -b rsync'
+
+# --- slots: teto TOTAL por modo (o script de slot roda de verdade, sob a pasta falsa do MBP) ---
+reset; for i in 1 2 3 4 5; do mkslot $i; done
+rc=$(STUB_SLOTS=exec STUB_AVAIL_MB=30000 run -- tests/test_x.py); expect "livre com 5 slots ocupados e teto 12: roda" 0 "$rc"
+has "pegou o slot 6" "$J" '"slot":"6"'; eq "slots 1..5 intactos e o 6 liberado" "1 2 3 4 5 " "$(slot_names)"
+reset; for i in $(seq 1 12); do mkslot $i; done
+rc=$(STUB_SLOTS=exec STUB_AVAIL_MB=30000 run -- tests/test_x.py); expect "livre com os 12 slots ocupados: 96" 96 "$rc"; has "mensagem diz o teto e o modo" "$T/err" 'teto 12, modo livre'
+reset; mkslot 1
+eq "livre limitado pela RAM (teto 2), slot 1 ocupado: pega o 2" "0:-" "$(STUB_SLOTS=exec STUB_AVAIL_MB=3900 outcome "$RUN")"; has "no slot 2" "$J" '"slot":"2"'
+reset; mkslot 1; mkslot 2
+rc=$(STUB_SLOTS=exec STUB_AVAIL_MB=3900 run -- tests/test_x.py); expect "livre limitado pela RAM (teto 2), 2 ocupados: 96" 96 "$rc"
+reset; mkslot 2; mkslot 3
+rc=$(STUB_SLOTS=exec STUB_LOCKED=0 STUB_IDLE_S=30 run -- tests/test_x.py); expect "EM USO com os slots 2 e 3 ocupados: 96 (o teto é do TOTAL, não dos números baixos)" 96 "$rc"
+eq "o slot 1 que ele chegou a tomar foi devolvido; os alheios intactos" "2 3 " "$(slot_names)"; has "mensagem: teto 1, modo uso" "$T/err" 'teto 1, modo uso'
+reset; rc=$(STUB_SLOTS=exec STUB_LOCKED=0 STUB_IDLE_S=30 run -- tests/test_x.py); expect "EM USO sem nada ocupado: roda" 0 "$rc"; has "no slot 1" "$J" '"slot":"1"'
+reset; mkslot 1 "$(hostname -s):999999:$(date +%s)"
+rc=$(STUB_SLOTS=exec STUB_LOCKED=0 STUB_IDLE_S=30 run -- tests/test_x.py); expect "EM USO com slot de dono morto: recolhe e roda" 0 "$rc"; has "avisa do slot morto" "$T/err" 'slot 1 morto'
+reset; mkslot 1 "otherhost:1:$(( $(date +%s) - 20000 ))"
+rc=$(STUB_SLOTS=exec STUB_LOCKED=0 STUB_IDLE_S=30 run -- tests/test_x.py); expect "EM USO com slot velho (> 4 h) de outro host: recolhe e roda" 0 "$rc"
+
+# --- execução supervisionada: roda de verdade sob bash, com python/taskpolicy/renice falsos ---
+reset; rc=$(STUB_RUNMODE=exec STUB_SLOTS=exec runs -- tests/test_x.py -q); expect "supervisionada, livre: roda" 0 "$rc"
+has "livre: o python nasce com nice -n 10" "$STUB_LOG" '^NICE:-n 10$'; hasnt "livre: sem taskpolicy na largada" "$STUB_LOG" '^TP:'
+has "a saída do python chega ao chamador" "$T/out" '5 passed'; hasnt "livre sem mudança: sem aviso de rebaixamento" "$T/out" 'mbp-run:demoted'
+has "livre: log presence=livre demoted=0" "$J" '"presence":"livre","demoted":0'
+has "o slot descreve a tarefa (repo, modo, arquivo, presença)" "$STUB_SEEN" '^repo=wa mode=pytest what=test_x\.py presence=livre$'
+reset; rc=$(STUB_RUNMODE=exec STUB_RUN_RC=7 runs -- tests/test_x.py); expect "supervisionada: rc do pytest propaga" 7 "$rc"; has "log com rc 7" "$J" '"rc":7'
+reset; rc=$(STUB_RUNMODE=exec STUB_LOCKED=0 STUB_IDLE_S=30 runs -- tests/test_x.py); expect "supervisionada, em uso: roda" 0 "$rc"
+has "em uso: o python nasce com nice -n 19" "$STUB_LOG" '^NICE:-n 19$'; has "em uso: sob taskpolicy -b" "$STUB_LOG" 'TP:-b nice -n 19 '
+has "em uso: log presence=uso" "$J" '"presence":"uso","demoted":0'
+reset; rc=$(MBP_FORCE_PRESENCE=uso STUB_RUNMODE=exec runs -- tests/test_x.py); expect "forçado a uso com a tela bloqueada: roda" 0 "$rc"; has "forçado: nice -n 19" "$STUB_LOG" '^NICE:-n 19$'
+# o Athos volta NO MEIO da execução (teclado): o vigia rebaixa a árvore
+reset; rc=$(STUB_RUNMODE=exec STUB_WAIT_RENICE=60 STUB_FLIP_STATE='locked=0\nidle_s=2\n' runs -- tests/test_x.py)
+expect "volta no meio: a execução termina normalmente" 0 "$rc"
+has "avisa que o Athos voltou, com o motivo" "$T/out" '^\[mbp-run:demoted\] o Athos voltou ao MBP \(input_recente\)'
+has "renice 19 na árvore" "$STUB_LOG" '^RENICE:-n 19 -p [0-9]+'; has "taskpolicy -b -p na árvore" "$STUB_LOG" '^TP:-b -p [0-9]+'
+has "log: rebaixada no meio" "$J" '"presence":"livre","demoted":1'
+# o Athos aciona a pausa NO MEIO da execução
+reset; rc=$(STUB_RUNMODE=exec STUB_WAIT_RENICE=60 STUB_FLIP_PAUSE=1 runs -- tests/test_x.py)
+expect "pausa no meio: termina normalmente" 0 "$rc"; has "avisa que ele pausou" "$T/out" '^\[mbp-run:demoted\] o Athos pausou o Gas City'; has "log: rebaixada" "$J" '"demoted":1'
+# largou EM USO (já nasceu em fundo): o vigia continua cobrindo filhos novos, mas não anuncia "voltou" nem marca demoted
+reset; rc=$(STUB_RUNMODE=exec STUB_RUN_SLEEP=3 STUB_LOCKED=0 STUB_IDLE_S=30 runs -- tests/test_x.py); expect "largou em uso: termina" 0 "$rc"
+hasnt "largou em uso: sem aviso de 'voltou'" "$T/out" 'mbp-run:demoted'; has "largou em uso: demoted=0 no log" "$J" '"presence":"uso","demoted":0'
+# ele não volta: ninguém é rebaixado
+reset; rc=$(STUB_RUNMODE=exec STUB_RUN_SLEEP=3 runs -- tests/test_x.py); expect "sem mudança durante a execução: roda" 0 "$rc"
+hasnt "sem mudança: nenhum renice" "$STUB_LOG" '^RENICE:'; hasnt "sem mudança: nenhum taskpolicy -p" "$STUB_LOG" '^TP:'
+# o fim da execução NÃO espera o intervalo do vigia, e nada fica para trás
+reset; SECONDS=0; rc=$(MBP_WATCH_S=37 STUB_RUNMODE=exec STUB_RUN_SLEEP=1 runs -- tests/test_x.py -k gc-leftover-token); el=$SECONDS
+expect "intervalo longo do vigia: termina" 0 "$rc"; n=$((n+1)); if [ "$el" -lt 20 ]; then echo "ok   o fim da execução não espera o vigia (${el}s, intervalo 37 s)"; else echo "FAIL a execução esperou o vigia (${el}s)"; fails=$((fails+1)); fi
+n=$((n+1)); if pgrep -f 'sleep 37' >/dev/null 2>&1 || pgrep -f gc-leftover-token >/dev/null 2>&1; then echo "FAIL ficou processo para trás (vigia ou python)"; fails=$((fails+1)); else echo "ok   nenhum processo para trás (vigia nem python)"; fi
+# TERM/HUP no script remoto (ssh que cai): a árvore do trabalho morre, rc 143
+reset; STUB_RUNMODE=exec runs -- tests/test_x.py -k gc-term-token >/dev/null
+SCRIPT="$(dirname "$STUB_LOG")/last-script-RUN.sh"
+n=$((n+1)); if [ -s "$SCRIPT" ]; then echo "ok   o stub guardou o script RUN enviado ao MBP"; else echo "FAIL script RUN não guardado"; fails=$((fails+1)); fi
+HOME="$T/home" PATH="$FAKE:$PATH" STUB_REAL_SLEEP=1 STUB_RUN_SLEEP=25 "$STUB_REMOTE_BASH" -s < "$SCRIPT" >/dev/null 2>&1 &
+RP=$!; sleep 3; kill -TERM "$RP" 2>/dev/null; wait "$RP" 2>/dev/null; trc=$?
+eq "TERM no script remoto: rc 143" 143 "$trc"; sleep 1
+n=$((n+1)); if pgrep -f gc-term-token >/dev/null 2>&1; then echo "FAIL o python sobreviveu ao TERM"; fails=$((fails+1)); pkill -f gc-term-token 2>/dev/null; else echo "ok   TERM mata a árvore do trabalho"; fi
+# exec (REA/APK): mesmo caminho supervisionado, --env continua valendo
+reset; printf '#!/usr/bin/env bash\necho "FOO=$FOO"\n' > "$T/bin/fakecmd"; chmod +x "$T/bin/fakecmd"
+STUB_RUNMODE=exec STUB_LOCKED=0 STUB_IDLE_S=30 "$RUN" --exec --env FOO=bar -- "$T/bin/fakecmd" >"$T/out" 2>"$T/err"; expect "exec em uso" 0 "$?"
+has "exec: --env chega ao comando" "$T/out" 'FOO=bar'; has "exec em uso: nice -n 19" "$STUB_LOG" '^NICE:-n 19$'; has "exec em uso: sob taskpolicy -b" "$STUB_LOG" 'TP:-b nice -n 19 '
+reset; STUB_RUNMODE=exec "$RUN" --exec -- "$T/bin/fakecmd" >"$T/out" 2>"$T/err"; has "exec livre: nice -n 10" "$STUB_LOG" '^NICE:-n 10$'
+# erro de configuração dentro do MBP: sem o espelho, rc 97
+reset; rmdir "$T/home/gt-remote/mirror/wa-1"; rc=$(STUB_RUNMODE=exec runs -- tests/test_x.py); expect "espelho ausente: rc 97 (como antes)" 97 "$rc"; mkdir -p "$T/home/gt-remote/mirror/wa-1"
+
+reset
+}
+
+# ---- controles negativos da presença -------------------------------------------------------------------------------
+# Cada mutante tira UMA regra e TEM que deixar de reproduzir o resultado do script real no cenário que a regra guarda.
+mut_compare() { # rótulo esperado cenário(função) arquivo-original sed-expr destino-da-mutante
+  local label="$1" want="$2" scen="$3" src="$4" expr="$5" dst="$6" real mut
+  sed -e "$expr" "$src" > "$dst"; chmod +x "$dst"
+  cmp -s "$src" "$dst" && { n=$((n+1)); echo "FAIL controle $label: o sed não mudou nada (marcador sumiu?)"; fails=$((fails+1)); return 0; }
+  real=$($scen real); mut=$($scen mut)
+  eq "controle $label: o script real dá '$want'" "$want" "$real"
+  n=$((n+1)); if [ "$mut" != "$want" ]; then echo "ok   controle $label: a mutante sem a regra não reproduz ($mut)"; else echo "FAIL controle $label: a mutante ainda reproduz '$want'"; fails=$((fails+1)); fi
+}
+neg_presenca() {
+  echo "--- controles negativos (presença)"
+  cp "$LIB" "$T/lib.real"; cp "$LIB" "$T/mbp-presence.sh"
+  # biblioteca: cenários que chamam a lib mutante
+  sc_lib() { reset; if [ "$1" = mut ]; then LIBX="$T/lib.mut"; else LIBX=""; fi; "$2"; LIBX=""; }
+  s1() { STUB_LOCKED=0 STUB_IDLE_S=5000 STUB_ASSERT_FAIL=1 verdict; }
+  s2() { STUB_LOCKED=0 STUB_IDLE_S=600 verdict; }
+  s3() { STUB_LOCKED=0 STUB_IDLE_S=5000 STUB_HOLD=1 verdict; }
+  s4() { STUB_LOCKED=1 STUB_IDLE_S=5 verdict; }
+  s5() { STUB_LOCKED=notconsole STUB_IDLE_S=fail verdict; }
+  s6() { STUB_LOCKED=0 STUB_IDLE_S=fail verdict; }
+  s7() { PRESENCE_FORCE_USO=1 STUB_LOCKED=1 verdict; }
+  c1() { sc_lib "$1" s1; }; c2() { sc_lib "$1" s2; }; c3() { sc_lib "$1" s3; }; c4() { sc_lib "$1" s4; }; c5() { sc_lib "$1" s5; }; c6() { sc_lib "$1" s6; }; c7() { sc_lib "$1" s7; }
+  mut_compare "lib: tela ilegível virou livre" "uso/ilegivel:tela" c1 "$LIB" 's/else PR_WHY=ilegivel:tela; fi/else PR_MODE=livre; PR_WHY=ilegivel:tela; fi/' "$T/lib.mut"
+  mut_compare "lib: fronteira de 600 s (-lt virou -le)" "livre/ocioso" c2 "$LIB" 's/-lt "\$PRESENCE_AWAY_S"/-le "$PRESENCE_AWAY_S"/' "$T/lib.mut"
+  mut_compare "lib: app segurando a tela é ignorado" "uso/tela_em_uso" c3 "$LIB" 's/elif \[ "\$PR_HOLD" = 0 \]; then/elif true; then/' "$T/lib.mut"
+  mut_compare "lib: bloqueada deixa de valer" "livre/bloqueada" c4 "$LIB" 's/elif \[ "\$PR_LOCKED" = 1 \]; then PR_MODE=livre/elif false; then PR_MODE=livre/' "$T/lib.mut"
+  mut_compare "lib: bloqueio ilegível lido como desbloqueado" "uso/ilegivel:presenca" c5 "$LIB" 's/^  echo$/  echo 0/' "$T/lib.mut"
+  mut_compare "lib: ociosidade ilegível lida como 'muito tempo'" "uso/ilegivel:ociosidade" c6 "$LIB" 's/^  \[ -n "\$raw" \] || { echo; return; }/  [ -n "$raw" ] || { echo 99999; return; }/' "$T/lib.mut"
+  mut_compare "lib: PRESENCE_FORCE_USO deixa de valer" "uso/forcado" c7 "$LIB" 's/if \[ "\${PRESENCE_FORCE_USO:-0}" = 1 \]; then/if false; then/' "$T/lib.mut"
+  # mbp-run: a mutante mora em $T (junto da cópia da biblioteca)
+  sm_occ() { reset; mkslot 2; mkslot 3; local s=$RUN; [ "$1" = mut ] && s="$T/mut.sh"; STUB_SLOTS=exec STUB_LOCKED=0 STUB_IDLE_S=30 outcome "$s"; }
+  sm_cap_unknown() { reset; local s=$RUN; [ "$1" = mut ] && s="$T/mut.sh"; STUB_PF_RAW="$PF_OK" capof "$s"; }
+  sm_pause_remote() { reset; echo "origem=mbp desde=hoje" > "$T/home/gt-remote/PAUSE"; local s=$RUN; [ "$1" = mut ] && s="$T/mut.sh"; outcome "$s"; }
+  sm_pause_local() { reset; echo "origem=painel desde=hoje" > "$FLAG_PAUSE"; local s=$RUN; [ "$1" = mut ] && s="$T/mut.sh"; outcome "$s"; }
+  sm_cap_uso() { reset; local s=$RUN; [ "$1" = mut ] && s="$T/mut.sh"; STUB_LOCKED=0 STUB_IDLE_S=30 STUB_AVAIL_MB=30000 capof "$s"; }
+  sm_seed_bg() { reset; local s=$RUN; [ "$1" = mut ] && s="$T/mut.sh"; STUB_LOCKED=0 STUB_IDLE_S=30 "$s" --seed wa >/dev/null 2>&1; grep -c 'rsync-path' "$STUB_LOG"; }   # 2 = os dois rsync da semeadura (árvore-base e site-packages)
+  sm_demote() { reset; local s=$RUN; [ "$1" = mut ] && s="$T/mut.sh"
+    STUB_RUNMODE=exec STUB_WAIT_RENICE=16 MBP_WATCH_S=1 STUB_FLIP_STATE='locked=0\nidle_s=2\n' runx "$s" tests/test_x.py >/dev/null; grep -c '^RENICE:' "$STUB_LOG" | sed 's/^[1-9][0-9]*$/demoted/'; }
+  sm_start_bg() { reset; local s=$RUN; [ "$1" = mut ] && s="$T/mut.sh"; STUB_RUNMODE=exec STUB_LOCKED=0 STUB_IDLE_S=30 runx "$s" tests/test_x.py >/dev/null; sed -n 's/^NICE:-n \([0-9]*\)$/nice\1/p' "$STUB_LOG" | head -n 1; }
+  sm_cap_mem() { reset; local s=$RUN; [ "$1" = mut ] && s="$T/mut.sh"; STUB_AVAIL_MB=3840 capof "$s"; }
+  mut_compare "run: teto total (checagem de ocupação depois do mkdir)" "96:-" sm_occ "$RUN" 's/-le \$cap \]; then echo "SLOT=\\\$n"/-le 999 ]; then echo "SLOT=\\$n"/' "$T/mut.sh"
+  mut_compare "run: presença desconhecida virou livre" 1 sm_cap_unknown "$RUN" 's/\*) PRES=uso; PRES_WHY=\${PRES_WHY:-ilegivel:presenca} ;; esac/*) PRES=livre ;; esac/' "$T/mut.sh"
+  mut_compare "run: pausa no MBP deixa de valer" "99:pausado_mbp" sm_pause_remote "$RUN" 's/\[ "\$(pf_get paused)" = 1 \]/[ "$(pf_get pausedX)" = 1 ]/' "$T/mut.sh"
+  mut_compare "run: pausa local deixa de valer" "99:-" sm_pause_local "$RUN" '/pausado pelo Athos (\$(head -n 1/s/.*/true/' "$T/mut.sh"
+  mut_compare "run: teto do modo EM USO" 1 sm_cap_uso "$RUN" 's/  else echo "\$USE_SLOTS"; fi/  else echo 12; fi/' "$T/mut.sh"
+  mut_compare "run: seed em uso deixa de usar prioridade de fundo" 2 sm_seed_bg "$RUN" 's/\[ "\$PRES" = livre \] || RSYNC_PATH_OPT=(--rsync-path="taskpolicy -b rsync")/true/' "$T/mut.sh"
+  mut_compare "run: vigia deixa de rebaixar" demoted sm_demote "$RUN" 's/    if ! mbp_calm; then$/    if false; then/' "$T/mut.sh"
+  mut_compare "run: largada em uso deixa de ser em fundo" nice19 sm_start_bg "$RUN" 's/  if ! mbp_calm; then MBP_STARTED_CALM=0;/  if false; then MBP_STARTED_CALM=0;/' "$T/mut.sh"
+  mut_compare "run: teto pela RAM" 2 sm_cap_mem "$RUN" 's/\[ "\$mem" -ge "\$cpu" \] || cpu=\$mem/true/' "$T/mut.sh"
+}
+
+if [ -n "${MBP_SELFTEST_ONLY:-}" ]; then
+  date > "$FLAG"
+  case "$MBP_SELFTEST_ONLY" in
+    presenca) presenca_cases; neg_presenca ;;
+    *) echo "MBP_SELFTEST_ONLY desconhecido: $MBP_SELFTEST_ONLY" >&2; exit 2 ;;
+  esac
+  echo "---"; echo "$((n-fails))/$n ok"
+  [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
+  exit 0
+fi
 
 # 1 off
 reset; rm -f "$FLAG"; rc=$(run -- tests/test_x.py); expect "off" 99 "$rc"; hasnt "off não chama ssh" "$STUB_LOG" 'PREFLIGHT'
@@ -332,5 +672,9 @@ mutant teto           98:swap_teto            STUB_SWAP_MB=9000
 mutant ilegivel-power 98:ilegivel:power       STUB_PMSET_FAIL=1
 mutant ilegivel-batt  98:ilegivel:batt        "STUB_PMSET_RAW=Now drawing from 'Battery Power'"
 
+# MBP_SELFTEST_SKIP=presenca: pula a presença (o prod test antigo ga-9e2rjh tem o orçamento de 900 s da suíte antiga; a presença tem o seu em story-ga-77c1qg.*)
+if [ "${MBP_SELFTEST_SKIP:-}" != presenca ]; then
+  presenca_cases; neg_presenca
+fi
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

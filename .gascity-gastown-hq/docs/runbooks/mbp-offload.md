@@ -2,7 +2,7 @@
 
 ## Contents
 
-• Por quê e resultado medido (11/10/2026) · Como ligar e desligar · Como usar
+• Por quê e resultado medido (11/10/2026) · Como ligar e desligar · **Presença do Athos: o MBP é o notebook dele (ga-77c1qg)** · Como usar
 • Revisor do gate (ga-xm1jfl) · Códigos de saída · O que mora no MBP (`~/gt-remote`) · Manutenção
 • Limites conhecidos
 
@@ -27,6 +27,39 @@ scripts/mbp-offload.sh status --json   # insumo do botão do painel (bead própr
 scripts/mbp-offload.sh counts    # só a contagem de execuções e recusas por motivo das últimas 72 h (não fala com o MBP)
 ```
 Sem daemon; o único launchd é o reseed noturno (ver Manutenção), que respeita esta chave. O botão do painel só chama este script.
+
+## Presença do Athos: o MBP é o notebook dele (ga-77c1qg)
+Decisão do Athos (12/10, resposta ao Mayor, no comentário de ga-sokx7u): *"usar o MBP não é indiscriminado. O Mini é dedicado como servidor e construtor / gas city e o MBP é o que uso pra trabalhar. a) quando MBP estiver idle, queremos usar 100% de sua capacidade [...] sempre que o MBP for travado, a gente detecta como idle e joga uma carga alta pra ele; b) quando eu estiver exigindo muito do MBP, nosso framework não pode de forma alguma sobrecarregá-lo mais ainda; c) manualmente eu devo poder habilitar / cancelar o uso do MBP [...] e deve ficar claro se está sendo usado ou não, e como."* Vale para toda fatia do épico (gate, workers, REA/APK, reseed).
+
+| Modo | Quando | O que o Gas City pode | Como aparece |
+|---|---|---|---|
+| **DESLIGADO** | falta a bandeira `.gc/mbp-offload.on` | nada: tudo roda local (rc 99) | `mbp-run.sh --check`: `offload_flag=off` |
+| **PAUSADO** | existe o arquivo `.gc/mbp-offload.pause` no mini **ou** `~/gt-remote/PAUSE` no MBP (quem os escreve — `mbp-offload.sh pause`, `gascity-mbp pausar` — vem na fatia 2, ga-77c1qg.2; até lá, `echo pausa > <arquivo>`) | nada novo (rc 99, motivo `pausado_mbp` se a pausa está no MBP); o que já roda lá é rebaixado em até ~5 s | o `mbp-run.sh --check` mostra `paused=1` |
+| **LIVRE** | tela do MBP **bloqueada**, **ou** sem teclado/mouse há ≥ 10 min E nenhum app segurando a tela acesa | até um slot por núcleo (12), limitado pela RAM de agora; `nice -n 10` | `mbp-run.sh --check`: `presence=livre`, `presence_why=bloqueada` |
+| **EM USO** | todo o resto: input recente, tela acesa por app (chamada/vídeo), **ou leitura que falhou** | 1 execução NO TOTAL, só com o MBP saudável, em prioridade de fundo (`taskpolicy -b` + `nice -n 19`) | `mbp-run.sh --check`: `presence=uso`, `presence_why=input_recente` |
+
+**A regra de decisão** (`scripts/mbp-presence.sh`, roda NO MBP na mesma chamada ssh do preflight): só evidência positiva de "fora" libera carga alta. Lê `ioreg -n Root -d1 -a` (marca `CGSSessionScreenIsLocked` da sessão do console, via `plutil`), `HIDIdleTime` do `ioreg -c IOHIDSystem` (a entrada de input mais recente) e `pmset -g assertions` (`PreventUserIdleDisplaySleep`: chamada de vídeo/vídeo/apresentação seguram a tela; sem tecla há 10 min numa reunião **não** é "fora"). Bloqueada vence tudo (inclusive input recente: é ele digitando a senha). Os três estados (sei que sim / sei que não / não consegui saber) nunca se confundem: `ioreg`/`plutil`/`pmset` ausente, vazio, ilegível, plist sem a sessão do console, entrada de ociosidade com lixo → **EM USO** com motivo `ilegivel:*` (o status diz que não conseguiu ler; nunca finge "fora"). O único jeito de forçar é `MBP_FORCE_PRESENCE=uso` (só piora); não existe forçar "livre".
+
+**Teto de slots.** LIVRE = o MENOR entre os núcleos do MBP (ou `MBP_MAX_SLOTS`; 3 se os núcleos não foram legíveis) e `1 + (RAM disponível − 3072 MB) / MBP_SLOT_MEM_MB` (768). A segunda parcela existe porque o MBP ocioso só tem ~4,3 GB disponíveis (medido 12/10): sem ela, 12 execuções leem o mesmo número na checagem de RAM antes de qualquer uma ocupar memória, passam juntas e levam o notebook ao swap justo quando o Athos volta. Medido ao vivo: com 3,9 GB disponíveis o teto é 2; com `MBP_SLOT_MEM_MB=8` (RAM não limita) é 12 e 4 execuções simultâneas rodaram todas, com `nice 10` conferido por `ps` no MBP. EM USO = `MBP_USE_SLOTS` (1) e vale para o **total** de slots ocupados: depois de uma rodada de quando ele estava fora (slots 1..9), uma execução nova não pega o slot 1 livre e se soma a elas (o `mkdir` do slot é atômico e o total é contado depois dele; passou do teto, o slot é devolvido e o rc é 96).
+
+**Se ele volta com carga nossa rodando.** A execução roda dentro de `mbp_supervise`: o trabalho em segundo plano e, ao lado, um vigia que reavalia a presença a cada `MBP_WATCH_S` (5 s). Se o Athos voltou ou pausou, a árvore de processos do trabalho recebe `renice 19` + `taskpolicy -b -p` (a cada volta, para pegar filhos novos) e nunca volta a subir. A saída da execução ganha a linha `[mbp-run:demoted] ...` e o log, `"demoted":1`. O aviso viaja por arquivo, não por stdout, e o vigia roda sem stdin/stdout: um filho dele segurando o canal do ssh atrasaria o fim de toda execução (testado: com intervalo de 37 s a execução termina em segundos e nenhum processo fica para trás). `TERM`/`HUP` no script remoto (ssh que cai) mata a árvore e sai 143.
+
+**O que o `taskpolicy -b` compra (medido 12/10 com o MBP bloqueado, 4 processos Python em laço apertado por 3 s como "app em primeiro plano", mil iterações):**
+
+| Carga nossa | Primeiro plano | vs. linha de base |
+|---|---|---|
+| nenhuma (A) / de novo (E) | 264,4 e 261,0 / 263,9 e 261,0 | — (ruído ≈ ±1%) |
+| 12 execuções LIVRE, `nice 10` (B) | 237,2 e 235,7 | **−10%** |
+| 1 execução EM USO, fundo (C) — o que o teto permite | 251,8 e 259,6 | −3% |
+| 12 em fundo (D) — se o teto de 1 fosse violado | 266,8 e 267,6 | sem efeito mensurável |
+
+Ou seja: com ele fora, `nice 10` é aceitável; com ele presente, só prioridade de fundo é invisível, e é por isso que o rebaixamento no meio existe. (O `load1` do MBP nessa medida é a média de 1 minuto e carrega a fase anterior; não separa as fases, por isso a tabela usa o primeiro plano.) `ps` mostra um processo em fundo com `nice 20`, o que serve de leitura para conferir o rebaixamento.
+
+**Seed.** `--seed` respeita a pausa (rc 99). Em uso, o receptor do rsync roda em fundo (`--rsync-path="taskpolicy -b rsync"`); livre, normal. O seed não é recusado por presença: pular a noite deixaria a base envelhecer em silêncio sempre que ele trabalhasse cedo.
+
+**Registro.** Cada linha de `mbp-run.jsonl` ganhou `"presence":"livre|uso"` (o modo em que largou) e `"demoted":0|1` (rebaixada no meio); recusas ganham `presence` e a pausa no MBP é uma recusa com `"rc":99,"reason":"pausado_mbp"`. Linhas antigas, sem `presence`, entram no total do dia como "sem presença registrada".
+
+**O que NÃO foi observado ao vivo.** O MBP estava bloqueado e ocioso o tempo todo do teste (ociosidade > 2 h): o ramo "Athos fisicamente de volta" (desbloquear, mexer no mouse) foi coberto por simulação fiel ao plist real, e o rebaixamento no meio foi observado ao vivo acionando a pausa (`~/gt-remote/PAUSE`; nice 10 → 20 em < 9 s), não por input. Conferir quando ele estiver usando: `mbp-run.sh --check` deve trazer `presence=uso` em ≤ 1 min depois que ele mexe no MBP (cada `--check` lê a presença na hora).
 
 ## Como usar
 ```bash
@@ -63,8 +96,8 @@ Ficam aqui desde o começo, em dois grupos. **Por arquivo** (divisão: o que fic
 **Reconferido pelo build do wrapper (12/10, mini com load 55, ssh de verdade, não stub):** 3 arquivos / 54 testes de lot_groups: 76 s locais → 15 s pelo wrapper com o MBP quente (pytest levou 1,8 s lá) e 41 s na primeira chamada de um worktree novo (rsync frio). Vermelho de verdade: o `FAILED` real foi lido, o id rodou aqui e o wrapper devolveu rc 1 com `local-confirmou`. Teste pulado de verdade: o `SKIPPED` real foi lido, o arquivo rodou aqui, rc 0 com `skips-no-mbp:1`.
 
 ## Códigos de saída
-0..95 = rc do pytest/comando remoto (propagado) · 99 offload desligado · 98 MBP indisponível ou sem saúde (veja o critério abaixo) · 97 configuração (uso errado, base ausente → `--seed`) · 96 três slots ocupados.
-Limiares ajustáveis por ambiente: `MBP_MIN_AVAIL_MB`, `MBP_MAX_PRESSURE_LEVEL`, `MBP_MAX_SWAP_GROWTH_MB`, `MBP_SWAP_SAMPLE_S`, `MBP_MAX_SWAP_MB`, `MBP_MIN_BATT`, `MBP_MAX_SLOTS`, `MBP_RUN_TIMEOUT_S`.
+0..95 = rc do pytest/comando remoto (propagado) · 99 offload desligado **ou pausado pelo Athos** · 98 MBP indisponível ou sem saúde (veja o critério abaixo) · 97 configuração (uso errado, base ausente → `--seed`) · 96 slots ocupados (o teto depende da presença: veja acima).
+Limiares ajustáveis por ambiente: `MBP_MIN_AVAIL_MB`, `MBP_MAX_PRESSURE_LEVEL`, `MBP_MAX_SWAP_GROWTH_MB`, `MBP_SWAP_SAMPLE_S`, `MBP_MAX_SWAP_MB`, `MBP_MIN_BATT`, `MBP_RUN_TIMEOUT_S`, e, da presença (ga-77c1qg): `MBP_MAX_SLOTS` (troca o teto de núcleos do modo livre), `MBP_SLOT_MEM_MB` (768), `MBP_USE_SLOTS` (1), `MBP_AWAY_IDLE_S` (600), `MBP_WATCH_S` (5), `MBP_FORCE_PRESENCE=uso` (só piora).
 
 ### Critério de saúde do preflight (ga-9e2rjh)
 O preflight faz UMA chamada ssh e recusa (rc 98) por um destes motivos; cada recusa vira uma linha no log com o campo `reason`:
@@ -78,6 +111,9 @@ O preflight faz UMA chamada ssh e recusa (rc 98) por um destes motivos; cada rec
 | `swap_teto` | swap usado igual ou acima do teto absoluto | 8192 MB |
 | `bateria` | na bateria (sem tomada) com carga igual ou abaixo do mínimo | 40% |
 | `ilegivel:<campo>` | o MBP não deu para ler `avail`, `pressure`, `swap_delta`, `swap`, `power` (tomada ou bateria) ou, na bateria, `batt` (a carga) | — |
+| `pausado_mbp` | `~/gt-remote/PAUSE` existe no MBP (rc **99**, não 98); vem **antes** da saúde: é uma ordem do Athos, não uma medida | — |
+
+A presença (livre/em uso) **não recusa** por si: ela só decide o teto de slots e a prioridade.
 
 O swap usado, sozinho, NÃO recusa até o teto: o macOS não devolve swap depois de uma pressão, então um valor alto e parado não diz nada sobre a pressão de agora. Campo ilegível recusa com motivo próprio (`ilegivel:*`) e entra no log como `null`, nunca como 0: "não consegui ler" não se confunde com "li zero". `mem_free_pct` (`memory_pressure`) e `compressed_mb` só são reportados em `--check`; não decidem.
 
@@ -85,7 +121,8 @@ O swap usado, sozinho, NÃO recusa até o teto: o macOS não devolve swap depois
 - `whatsapp_automation/`, `property_scrapers/`: árvores-base (sem .git, venv, shared/data, *.db, logs, .beads…).
 - `mirror/<repo>-<slot>/`: um espelho por slot (clone APFS da base na 1ª vez, depois `rsync --delete` do worktree do chamador).
 - `venv/` (WA, python3.14) e `venv-ps/` (PS, python3.11): site-packages copiados do mini (um `pip install` novo falha em `Levenshtein`); hash em `.sp-hash`.
-- `slots/N`: trava por `mkdir`; dono = `host:pid:epoch`; dono morto ou idade > 4 h é liberado por quem chega.
+- `slots/N`: trava por `mkdir`; dono = `host:pid:epoch` (arquivo `owner`) e descrição `repo=… mode=… what=<arquivo de teste ou nome do comando> presence=…` (arquivo `info`; nunca argumentos de `--exec` nem `--env`); dono morto ou idade > 4 h é liberado por quem chega. N vai até o teto do modo (12 em livre).
+- `PAUSE`: a pausa do Athos (`origem=… desde=…`), lida pelo preflight e pelo vigia.
 - `exec/N`: scratch do modo `--exec`, apagado no fim (capturas de REA nunca ficam).
 - `rea/`: REA 6.4.0 instalado com Node 22 (`brew install node@22 ghidra`, ghidra/openjdk@21/node@22 fixados com `brew pin`). O Node 25 do MBP não serve ao REA (exige 22.19+, 24.11+ ou 26+).
 - Log das execuções e das recusas do preflight: `$CITY/.gc/logs/mbp-run.jsonl` (ts, repo, modo, slot, rc, segundos; a recusa tem `"mode":"preflight"`, `reason` e os números que a causaram).
