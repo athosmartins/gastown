@@ -7,7 +7,7 @@
 #
 # O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o wrapper existe, é executável e parseia sob /bin/bash 3.2; a lib do
 #   prompt parseia sob /bin/bash 3.2 e carrega gate_test_wrapper_rules; o mbp-run.sh que o wrapper chama existe; e os dois selftests
-#   novos (118 casos do wrapper, 19 do parágrafo do prompt) mais o do invariante de apóstrofos do prompt (ga-6aj348) passam contra
+#   novos (o do wrapper e o do parágrafo do prompt) mais o do invariante de apóstrofos do prompt (ga-6aj348) passam contra
 #   eles. Com a chave de verdade ligada, o parágrafo sai do prompt real; com `.gc/gate-pytest.off`, não sai — conferido na cidade viva.
 # POR QUE NÃO TOCA O MBP: o selftest do wrapper usa stubs de ssh/rsync/python; rodar o MBP de verdade aqui seria depender de uma
 #   máquina que o gate não controla para dizer que o deploy está de pé. O caminho real foi exercitado à mão (ga-xm1jfl, comentário).
