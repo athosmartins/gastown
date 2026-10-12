@@ -1598,6 +1598,40 @@ gate_bead_has_prior_sha_fail() {
   gate_labels_have_sha_fail "$labels" "$sha"
 }
 
+# ── ga-x4rbnt: what a REJECTED `git push` was rejected FOR ─────────────────────
+# do_merge_ff used to call every failed FF push "main moved during push; will retry" and threw the stderr away. A pre-push hook
+# that refuses the range (ga-vhzdh5.3: the ga-oj73m scripts/ guard, three ALL-PASS runs in a row) is not a race: it answers the
+# same on every attempt, so the retry loop and the re-submission repeated the same refusal, each one behind a full review.
+# gate_push_reject_class <git-push-stderr-text> — pure (no IO, set -e safe). Prints
+#   race     git itself says the ref moved: a `! [rejected]` line (non-fast-forward / fetch first / stale info) — retry, as before
+#   hook     a hook refused it, and nothing else in the text says "the ref moved":
+#              - `! [remote rejected] … hook declined` (a server-side pre-receive / protected-branch hook), or
+#              - the local pre-push shape: git prints the hook's own output and then `error: failed to push some refs`, with
+#                NO `! [` line at all (measured on git 2.54: the push never reaches the remote, so there is no per-ref status)
+#   unknown  anything else — an empty capture, a `fatal:` (network, auth, not a repository), a refspec error, a remote rejection
+#            that is not a hook (`failed to update ref`, a lock) — and the caller keeps today's behavior (race: retry).
+# Three states, and the last is the old behavior: this classifier can only ever TAKE a push out of the retry loop on positive
+# evidence of a hook; a text it cannot read, or one that mixes the two signals, is "unknown", never "hook".
+gate_push_reject_class() {
+  local txt="${1:-}"
+  [ -n "$txt" ] || { printf 'unknown'; return 0; }
+  case "$txt" in
+    *"! [rejected]"*)                      printf 'race'; return 0 ;;
+    *"fatal:"*|*"refspec"*)                printf 'unknown'; return 0 ;;
+    *"! [remote rejected]"*"hook declined"*) printf 'hook'; return 0 ;;
+    *"! [remote rejected]"*)               printf 'unknown'; return 0 ;;
+    *"error: failed to push some refs"*)   printf 'hook'; return 0 ;;
+  esac
+  printf 'unknown'
+}
+
+# gate_push_reject_detail <git-push-stderr-text> — pure. The part of the text a person needs to act on: the hook's own words
+# (and git's `! [remote rejected]` status line), without git's `hint:` boilerplate, the `To <url>` line or the closing `error:
+# failed to push some refs` line. Capped (12 lines, 800 bytes): it lands in a bead comment and a mail.
+gate_push_reject_detail() {
+  printf '%s\n' "${1:-}" | grep -v -E '^(hint:|To |error: failed to push some refs)' | grep -v -E '^[[:space:]]*$' | head -n 12 | cut -c1-200 | head -c 800 || true
+}
+
 # ── ga-l7mvtw: stale-reviewed-SHA fix-attempt guard ───────────────────────────
 # Production observed a marker get claimed and spend a full ~14-minute
 # reviewer run reviewing a commit an EARLIER, independent gate-run had
@@ -9167,7 +9201,12 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       # SELFTEST-EXTRACT fastlane-push-confirm: END
 
       # FF push
-      if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
+      # ga-x4rbnt: the push's stderr is KEPT (it was `2>/dev/null`) so a refusal can be told from a lost race. A capture that cannot
+      # be made (no temp file) is today's behavior: stderr to /dev/null, every failed push a race.
+      local PUSH_ERR_FILE=""
+      PUSH_ERR_FILE=$(mktemp "${GATE_FS_TMPDIR:-/tmp}/gc-gate-push-err-XXXXXX" 2>/dev/null) || PUSH_ERR_FILE=""
+      if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>"${PUSH_ERR_FILE:-/dev/null}"; then
+        [ -z "$PUSH_ERR_FILE" ] || rm -f "$PUSH_ERR_FILE" 2>/dev/null || true
         git_rig fetch origin 2>/dev/null || warn "Post-FF-push fetch failed"
         local POST_MAIN
         POST_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
@@ -9262,14 +9301,30 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           return 1
         fi
       else
-        # FF push rejected: main moved between our rebase and push (race)
-        warn "  FF push rejected (attempt $((MERGE_ATTEMPT+1))) — main moved during push; will retry"
-        MERGE_RESULT="failed_push_race"
+        # FF push rejected. Usually main moved between our rebase and push (race) — but a hook that refuses the range answers the
+        # same on every attempt (ga-x4rbnt), so it gets its own non-retryable result and its own words in the feedback.
+        # SELFTEST-EXTRACT push-reject-class: BEGIN
+        local PUSH_ERR_TXT="" PUSH_REJECT_CLASS="unknown"
+        if [ -n "$PUSH_ERR_FILE" ]; then
+          PUSH_ERR_TXT=$(head -c 8192 "$PUSH_ERR_FILE" 2>/dev/null) || PUSH_ERR_TXT=""
+          rm -f "$PUSH_ERR_FILE" 2>/dev/null || true
+        fi
+        PUSH_REJECT_CLASS=$(gate_push_reject_class "$PUSH_ERR_TXT") || PUSH_REJECT_CLASS="unknown"
+        if [ "$PUSH_REJECT_CLASS" = "hook" ]; then
+          GATE_PUSH_HOOK_DETAIL=$(gate_push_reject_detail "$PUSH_ERR_TXT") || GATE_PUSH_HOOK_DETAIL=""
+          err "  FF push REFUSED BY A HOOK (attempt $((MERGE_ATTEMPT+1))) — not a race, not retrying (ga-x4rbnt): ${GATE_PUSH_HOOK_DETAIL:-no hook output captured}"
+          MERGE_RESULT="failed_push_hook_rejected"
+        else
+          warn "  FF push rejected (attempt $((MERGE_ATTEMPT+1))) — main moved during push; will retry"
+          MERGE_RESULT="failed_push_race"
+        fi
+        # SELFTEST-EXTRACT push-reject-class: END
         return 1
       fi
     }
 
     GATE_BEAD_CLOSED_LATE=0  # ga-5w2gpw (c): set by do_merge_ff's pre-push re-check ONLY when it saw a CLOSED bead
+    GATE_PUSH_HOOK_DETAIL=""  # ga-x4rbnt: set by do_merge_ff ONLY when a hook refused the push (the hook's own words, for the feedback)
     while [ "$MERGE_ATTEMPT" -lt "$MAX_MERGE_RETRIES" ]; do
       MERGE_ATTEMPT=$((MERGE_ATTEMPT + 1))
       log "Merge attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES ..."
@@ -9287,6 +9342,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
          [ "$MERGE_RESULT" = "failed_sha_resolution" ] || \
          [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ] || \
          [ "$MERGE_RESULT" = "failed_lane_revoked" ] || \
+         [ "$MERGE_RESULT" = "failed_push_hook_rejected" ] || \
          [ "$MERGE_RESULT" = "failed_bead_blocked_late" ]; then
         log "  Non-retryable failure ($MERGE_RESULT). Stopping retry loop."
         break
@@ -9388,6 +9444,13 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         # FAIL_REASONS in this file already uses (labels/mails downstream,
         # keyed off OVERALL_VERDICT+FAIL_REASONS generically).
         FAIL_REASONS="Branch $BRANCH's own commits do not reference source bead $BEAD_ID, caught at the actual FF-push point (ga-pfgnv: do_merge_ff's direct-FF/post-rebase-fallthrough path — the branch-content-coherence gap Step 10's own check, keyed on a potentially-stale \$BRANCH_SHA, does not cover). This is the same branch-reused-by-unrelated-work signature ga-y9a1d describes. Not merging $BRANCH. A human must verify: is this bead's real fix still on some other ref (check \`git log --all -S '<known marker text>'\`), or does $BEAD_ID need a fresh submission?"
+      elif [ "$MERGE_RESULT" = "failed_push_hook_rejected" ]; then
+        # ga-x4rbnt: a hook refused the push. The code PASSED review; retrying or re-submitting the same range is refused the same way
+        # (ga-vhzdh5.3: three ALL-PASS runs, one refusal). Say WHO refused and WHAT it said, so the author fixes the cause instead of
+        # re-submitting. No gate:needs-rebase wording: a rebase does not change what the hook reads.
+        FAIL_REASONS="The push of $BRANCH to $DEFAULT_BRANCH was REFUSED BY A HOOK after an all-PASS verdict (merge result: failed_push_hook_rejected, ga-x4rbnt) — not a lost race, so it was NOT retried and re-submitting the same range will be refused the same way. The hook said:
+${GATE_PUSH_HOOK_DETAIL:-<no hook output was captured>}
+Fix what the hook objects to (or have its policy changed), then re-submit. Nothing is wrong with the reviewed code itself."
       elif [ "$MERGE_RESULT" = "failed_bead_blocked_late" ] || [ "$MERGE_RESULT" = "failed_bead_unknown" ]; then
         # ga-360a7l: the live re-check immediately before push (do_merge_ff)
         # is what actually fired — GATE_360A7L_LATE_REASON already names the
