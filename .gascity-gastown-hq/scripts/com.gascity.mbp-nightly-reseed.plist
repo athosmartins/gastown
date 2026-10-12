@@ -7,7 +7,8 @@
   <!-- Reseed noturno da arvore-base e do site-packages do MBP (ga-wuwuk7, epico ga-sokx7u):
        mbp-run.sh --seed wa e --seed ps, com veredito OK/FALHOU/PULADO no stdout e em
        .gc/logs/mbp-nightly-reseed.jsonl, e notify quando falha. Chave do offload desligada
-       (.gc/mbp-offload.on ausente) = PULADO, sem notify.
+       (.gc/mbp-offload.on ausente, com .gc acessivel) = PULADO, sem notify; o que o script nao
+       consegue olhar, criar, remover ou gravar (chave, lock, pid do dono) = FALHOU, com notify.
 
        Horario 05:50, todo dia: depois do rebuild do engine das 04:45 e do que pesa o mini
        entre 04:47 e 05:37 (restic backup 04:47, check 05:13, restore-test 05:37), antes do
