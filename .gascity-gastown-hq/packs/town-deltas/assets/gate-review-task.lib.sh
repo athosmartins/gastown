@@ -199,8 +199,11 @@ TEST WRAPPER (use it instead of running python3 -m pytest yourself): run test FI
   "$_city/scripts/gate-pytest.sh" --dir <your-worktree> -- tests/test_x.py tests/test_y.py -x -q
 It runs them on the idle MacBook Pro when that machine is healthy (heavy test files finish many times faster than on this loaded
 machine) and on this machine, exactly as before, when it is not. Only a clean pass on the MacBook is taken as it comes: a failure or a
-skipped test there is always run again here first, and when the failed tests pass alone here the whole command is run here as well.
-Either way the result from here is the one that counts. Pass test files, never a directory. Run it the way you run any long test
+skipped test there is always run again here first (every target file, when it cannot tell which test skipped), and
+when the failed tests pass alone here the whole command is run here as well. Either way the result from here is the one that counts.
+A clean pass on the MacBook can still be empty: that machine has no shared/data and no .env, so a test that reads data may pass there
+without checking anything. When the wrapper prints a note saying so and the code under test reads data, treat that pass as unverified
+and run those files here with plain python3 -m pytest. Pass test files, never a directory. Run it the way you run any long test
 (background, poll the log). Your own mutation and reproduction probes go through it too: it sends the worktree as it is at that
 moment. Its last line reads gate-pytest: ran=mbp rc=0 secs=11 ...
 - copy that line into the Summary of your verdict, so the gate can see where the test time went.

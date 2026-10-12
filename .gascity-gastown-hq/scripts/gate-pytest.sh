@@ -20,20 +20,27 @@
 #
 # EM QUE RESULTADO O REVISOR PODE ACREDITAR: só em verde do MBP. O MBP não tem shared/data, nem .env, nem o python3 do mini, então
 #   um vermelho (ou um teste pulado) lá pode ser do AMBIENTE e não do código — dois estados que o veredito não pode confundir.
-#   • rc 0 e nada pulado  → vale o MBP.
-#   • rc 0 com testes pulados → os ARQUIVOS que pularam rodam aqui de novo e o rc DAQUI vale (um skip por dado ausente não pode virar "passou").
+#   • rc 0 e nada pulado  → vale o MBP. É a ÚNICA coisa aceita como veio, e tem um limite: um teste que lê dado por um caminho que o wrapper
+#       não enxerga (constante numa lib, fixture; só `shared/data` literal no arquivo manda o alvo ficar aqui) pode passar VAZIO no MBP. O wrapper
+#       não tem como saber, então DIZ: a saída traz a linha `nota: verde do MBP aceito...` (fail-open visível); o remédio é a lista force-local.
+#   • rc 0 com testes pulados → os ALVOS que pularam rodam aqui de novo e o rc DAQUI vale (um skip por dado ausente não pode virar "passou").
+#       De quem é cada skip só se sabe pelo caminho impresso numa linha `SKIPPED [n] caminho:linha:` e ele só vale se for um alvo pedido: skip
+#       vindo de um helper (pytest.skip() dentro de um módulo de apoio sai com o caminho DO HELPER), linha que não leio ou resumo que diz mais
+#       pulados do que as linhas listam → não sei de quem é → TODOS os alvos rodam aqui (`skips-fora-dos-alvos` / `skips-nao-contados`).
 #   • rc 1 (falhou)       → SÓ os node ids que falharam rodam aqui primeiro:
 #       reprovam aqui também → vale esse rc 1 (a linha final diz `local-confirmou`);
 #       PASSAM aqui isolados → isso NÃO prova que o vermelho era do ambiente (um -x/--maxfail parou o MBP no 1º vermelho e o resto nunca
 #         rodou; falha de ordem ou flake; arquivo que pulou nessa mesma execução) → o comando inteiro roda aqui e o rc DELE vale (a linha
 #         final diz `isolado-passou;inteiro-rc=N`). Só um vermelho que some também no comando inteiro daqui termina em rc 0.
-#   • rc 1 sem ids legíveis, mais de 50 reprovados, ou ids que não se reconhecem aqui (rc 4/5) → o comando inteiro roda aqui.
+#   • rc 1 sem ids legíveis, mais de 50 reprovados, ids que não se reconhecem aqui (rc 4/5) ou id de arquivo que não é alvo pedido
+#       (`ids-fora-dos-alvos`) → o comando inteiro roda aqui.
 #   • qualquer outro rc, ou MBP caiu no meio → o comando inteiro roda aqui.
 #   • DIVISÃO: o que não pode ir ao MBP (lê shared/data em linha de código, está na lista force-local) roda aqui, SEPARADO, e o que
 #     pode vai ao MBP; os dois rc se combinam (o pior vale; 5 só se nenhuma parte coletou teste).
 #   A última linha impressa diz onde rodou e quanto levou: `gate-pytest: ran=mbp|local|mbp+local rc=N secs=N ...`.
 #
-# CÓDIGOS DE SAÍDA: o rc do pytest que VALE (0..5). Nunca 96..99: esses são do mbp-run e aqui viram "rodou aqui". 4 = uso errado.
+# CÓDIGOS DE SAÍDA: o rc que VALE — o do pytest (de 0 a 5) ou, se o processo daqui morre ou falta o python3, o do shell (137 por sinal, 126/127).
+#   Nunca 96..99: esses são do mbp-run e aqui viram "rodou aqui". 4 = uso errado.
 #
 # CHAVES E LOG: `touch $CITY/.gc/gate-pytest.off` desliga SÓ este caminho (o mbp-offload.on continua valendo para os workers);
 #   apague para religar. Cada execução acrescenta uma linha em $CITY/.gc/logs/gate-pytest.jsonl (ts, sessão, repo, ran, motivo,
@@ -87,8 +94,18 @@ local_only_flag() {   # depende do disco/estado DESTA máquina, ou é interativa
 }
 
 user_r() {   # o revisor trouxe o próprio -r (vence o -rfEs que eu ponho primeiro)?
-  local f
-  for f in ${flags[@]+"${flags[@]}"}; do case "$f" in -r|-r?*) return 0 ;; esac; done
+  # O -r também vem DENTRO de um grupo de flags curtas (-qqxrf = -q -q -x -r f): o argparse o lê, então eu também. Lê-se o grupo letra a letra
+  # até a 1ª opção que consome o resto como valor (-k, -m, -p, -c, -o, -n, -W): em -xkr o r é parte do valor do -k, não um -r.
+  local f i c
+  for f in ${flags[@]+"${flags[@]}"}; do
+    case "$f" in --*) continue ;; -?*) ;; *) continue ;; esac
+    i=1
+    while [ $i -lt ${#f} ]; do
+      c=${f:$i:1}
+      case "$c" in r) return 0 ;; k|m|p|c|o|n|W) break ;; esac
+      i=$((i+1))
+    done
+  done
   return 1
 }
 
@@ -171,7 +188,7 @@ if [ -z "$LOCAL_REASON" ]; then
 fi
 
 # ---- execução ---------------------------------------------------------------------------------------------------------
-T_START=$(date +%s); MBP_SECS=0; LOCAL_SECS=0; RAN=local; RC=0; DETAIL=""
+T_START=$(date +%s); MBP_SECS=0; LOCAL_SECS=0; RAN=local; RC=0; DETAIL=""; GREEN_MBP=0
 # sem arquivo temporário não dá para ler a saída do MBP (vermelho/pulado): então não vai ao MBP — roda aqui, como hoje.
 OUT=$(mktemp "${TMPDIR:-/tmp}/gate-pytest.XXXXXX") || { OUT=""; [ -n "$LOCAL_REASON" ] || LOCAL_REASON="mktemp-falhou"; }
 trap '[ -n "$OUT" ] && rm -f "$OUT"' EXIT
@@ -192,6 +209,14 @@ merge_rc() {    # dois rc do pytest → o que vale: qualquer coisa fora de 0/1/5
   for r in "$1" "$2"; do [ "$r" = 1 ] && { echo 1; return; }; done
   if [ "$1" = 5 ] && [ "$2" = 5 ]; then echo 5; return; fi
   echo 0
+}
+is_target_file() {   # <caminho que o pytest imprimiu>: é o ARQUIVO de um dos alvos que mandei ao MBP?
+  # O que o pytest imprime em SKIPPED/FAILED/ERROR é de onde o evento saiu, não o teste que o pediu: um pytest.skip() dentro de um módulo de apoio
+  # sai com o caminho do HELPER. Rodar "o arquivo que pulou" quando ele não é alvo não coleta nada (rc 5) ou roda outra coisa, e o teste que pulou
+  # nunca roda aqui. Só o que eu pedi, por igualdade, vale como dono; o resto é "não sei de quem é" e o comando inteiro roda aqui.
+  local t
+  for t in ${mbp_targets[@]+"${mbp_targets[@]}"}; do [ "${t%%::*}" = "$1" ] && return 0; done
+  return 1
 }
 # o comando inteiro "aqui" da parte que ia ao MBP: sem divisão é EXATAMENTE o que o revisor escreveu
 run_local_mbp_part() { if [ $SPLIT -eq 1 ]; then run_local ${flags[@]+"${flags[@]}"} "${mbp_targets[@]}"; else run_local "$@"; fi; }
@@ -221,13 +246,32 @@ else
       sk_sum=$(printf '%s' "$summary" | grep -oE '[0-9]+ skipped' | head -1 | awk '{print $1}')
       sk_targets=(); sk_note=""
       if [ "${sk_lines:-0}" -gt 0 ] || { [ -n "$sk_sum" ] && [ "$sk_sum" != 0 ]; }; then
-        sk_note="skips-no-mbp:${sk_sum:-$sk_lines}"
-        say "${sk_sum:-$sk_lines} teste(s) pularam no MBP (podem ter pulado por falta de dado de lá) — os arquivos que pularam rodam aqui"
-        skfiles=$(sed -n 's/^SKIPPED \[[0-9]*\] \([^:][^:]*\):[0-9][0-9]*:.*/\1/p' "$OUT" | sort -u)
-        if [ -n "$skfiles" ]; then
-          while IFS= read -r sf; do [ -n "$sf" ] && [ -f "$dir/$sf" ] && sk_targets+=("$sf"); done <<EOF
-$skfiles
-EOF
+        # De quem é cada skip? Só o caminho de um ALVO PEDIDO é dono (is_target_file). Se UM skip não casa — pytest.skip() num helper, linha
+        # SKIPPED que não leio, resumo que diz mais pulados do que as linhas listam —, "rodar os arquivos que
+        # pularam" deixaria aquele teste sem rodar aqui e o rc daqui valeria como se ele tivesse rodado. Então TODOS os alvos rodam aqui.
+        SK_RE='^SKIPPED \[([0-9]+)\] ([^: ]+)(:[0-9]+)?:( |$)'; SK_N_RE='^SKIPPED \[([0-9]+)\] '   # regex em variável: o bash 3.2 do dispatcher a lê igual
+        sk_listed=0; sk_bad=""; skfiles=" "
+        while IFS= read -r ln; do
+          case "$ln" in 'SKIPPED ['*) ;; *) continue ;; esac
+          if [[ "$ln" =~ $SK_RE ]]; then
+            skn=${BASH_REMATCH[1]}; skp=${BASH_REMATCH[2]}
+            sk_listed=$((sk_listed + skn))
+            if is_target_file "$skp"; then skfiles="$skfiles$skp "; else sk_bad="skips-fora-dos-alvos"; fi
+          else
+            sk_bad="skips-fora-dos-alvos"
+            if [[ "$ln" =~ $SK_N_RE ]]; then skn=${BASH_REMATCH[1]}; sk_listed=$((sk_listed + skn)); fi
+          fi
+        done < "$OUT"
+        [ -n "$sk_bad" ] || { [ "${sk_sum:-0}" -le "$sk_listed" ] || sk_bad="skips-nao-contados"; }
+        sk_note="${sk_bad:-skips-no-mbp}:${sk_sum:-$sk_listed}"
+        if [ -n "$sk_bad" ]; then
+          say "${sk_sum:-$sk_listed} teste(s) pularam no MBP e não sei de qual dos alvos cada um é (${sk_bad#skips-}) — todos os alvos rodam aqui"
+        else
+          say "${sk_sum:-$sk_listed} teste(s) pularam no MBP (podem ter pulado por falta de dado de lá) — os alvos que pularam rodam aqui"
+          # o alvo como o revisor escreveu (node id inclusive): o arquivo inteiro traria testes que ele nem pediu
+          for t in "${mbp_targets[@]}"; do
+            case "$skfiles" in *" ${t%%::*} "*) sk_targets+=("$t") ;; esac
+          done
         fi
       elif [ -z "$summary" ] && user_r; then
         sk_note="skips-ilegiveis"
@@ -237,6 +281,8 @@ EOF
         [ ${#sk_targets[@]} -gt 0 ] || sk_targets=("${mbp_targets[@]}")
         RAN=mbp+local; DETAIL="$sk_note"
         run_local ${flags[@]+"${flags[@]}"} "${sk_targets[@]}"; RC=$?
+      else
+        GREEN_MBP=1   # verde aceito como veio do MBP: nada foi conferido aqui (a nota de verde vazio, no fim)
       fi
       ;;
     1)
@@ -247,9 +293,21 @@ EOF
       nids=$(printf '%s' "$ids" | grep -c . )
       RAN=mbp+local
       conf=()
+      # Todo id tem de ser de um ALVO PEDIDO (is_target_file, a mesma regra dos skips): um id de outro arquivo (conftest/plugin que coleta mais
+      # coisa, ou uma linha que leio errado) rodado isolado aqui e "passando" não diz nada sobre o que o revisor pediu → o comando inteiro aqui.
+      ids_fora=0
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        is_target_file "${id%%::*}" || ids_fora=1
+      done <<EOF
+$ids
+EOF
       if [ "$nids" -gt 50 ]; then
         say "$nids testes reprovaram no MBP — confirmar um a um não compensa; o comando inteiro roda aqui"
         DETAIL="mbp-vermelho:$nids;muitos"; run_local_mbp_part "$@"; RC=$?
+      elif [ "$nids" -gt 0 ] && [ $ids_fora -eq 1 ]; then
+        say "o MBP reprovou teste(s) que não são de nenhum dos alvos pedidos — não sei o que confirmar isolado; o comando inteiro roda aqui"
+        DETAIL="mbp-vermelho:$nids;ids-fora-dos-alvos"; run_local_mbp_part "$@"; RC=$?
       elif [ "$nids" -gt 0 ]; then
         say "o MBP reprovou $nids teste(s) — vermelho do MBP pode ser do ambiente de lá; os node ids que falharam rodam aqui primeiro"
         while IFS= read -r id; do [ -n "$id" ] && conf+=("$id"); done <<EOF
@@ -291,6 +349,11 @@ EOF
   fi
 fi
 SECS=$(( $(date +%s) - T_START ))
+# Verde do MBP aceito como veio: o MBP não tem shared/data nem .env, e um teste que lê dado por um caminho que eu não enxergo (constante numa lib,
+# fixture; só a assinatura `shared/data` no arquivo manda o alvo ficar aqui) pode ter passado VAZIO lá. Eu não sei qual é, então DIGO: fail-open
+# visível. Só quando um verde do MBP foi mesmo aceito (nada reconferido aqui) e o veredito final é verde; vem ANTES da linha final (o revisor copia a última).
+[ $GREEN_MBP -eq 1 ] && [ "$RC" = 0 ] \
+  && say "nota: verde do MBP aceito como veio. O MBP não tem shared/data nem .env: um teste que lê dado por um caminho que o wrapper não vê (constante numa lib, fixture) pode ter passado VAZIO lá — se o código testado lê dado, trate este verde como não verificado e rode esses arquivos aqui com python3 -m pytest direto"
 # O log é o insumo do antes×depois: uma linha que não foi gravada some da contagem. O rc do revisor não depende dele (nunca falha por
 # causa do log), mas a falta é DITA na saída, não engolida — quem lê "execuções: N" sabe que pode faltar uma.
 LOG_LINE=$(printf '{"ts":"%s","session":"%s","repo":"%s","ran":"%s","rc":%s,"secs":%s,"mbp_secs":%s,"local_secs":%s,"detail":"%s","ntargets":%s}' \

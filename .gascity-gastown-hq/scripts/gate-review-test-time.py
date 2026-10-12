@@ -11,6 +11,8 @@ O QUE MEDE
   sessoes   por sessão de revisor (transcrições em ~/.claude/projects/*gate-reviewer): minutos totais e minutos ESPERANDO TESTE =
             soma da duração das chamadas Bash cujo comando cita pytest (python3 -m pytest, gate-pytest.sh, tail/sleep em log de pytest
             que o comando nomeia). --corte <ISO> parte as sessões em antes/depois do deploy do wrapper e compara as médias.
+            É uma DICA, não a medida (veja LIMITES): a medida é `dias` (revisao_media_min) e `wrapper` (os segundos que o próprio
+            wrapper registra).
   wrapper   o que o gate-pytest.sh registrou em .gc/logs/gate-pytest.jsonl: execuções por destino (mbp, local, mbp+local), segundos
             no MBP e aqui, e os motivos de rodar aqui. Só existe depois do deploy.
 
@@ -22,7 +24,10 @@ USO
 
 LIMITES
   "Esperando teste" é um LIMITE INFERIOR: uma espera que o comando não rotula como pytest (sleep 60; tail $S/t1.log) não entra. A
-  definição é a mesma antes e depois, então a comparação é justa; o número absoluto subestima. A duração de cada chamada é a
+  definição NÃO é a mesma antes e depois: antes o revisor esperava com nomes que ele mesmo escolhia, e depois o comando do wrapper
+  cita gate-pytest.sh mas o poll dele (sleep 30; tail $S/gp.log) não cita nada — então o "depois" pode parecer melhor do que é.
+  Por isso a tabela de `sessoes` é só uma dica; a manchete é revisao_media_min (`dias`) e os segundos do wrapper (`wrapper`),
+  que não dependem de como o revisor batiza o log. A duração de cada chamada é a
   diferença entre o carimbo do tool_use e o do tool_result na transcrição; chamada sem resultado casado não conta (e é contada à parte).
 """
 import contextlib
@@ -186,6 +191,9 @@ def cmd_sessoes(n, corte, dirpath=None):
     un = sum(r[4] for r in rows)
     if un:
         print(f"(aviso: {un} chamada(s) de teste sem resultado casado na transcrição não entraram na soma)")
+    print("(dica: esta tabela é só uma DICA. 'Teste/sessão' conta só chamada que cita pytest; depois do wrapper o revisor espera com nomes que ele "
+          "escolhe (sleep 30; tail $S/gp.log), que não casam, e o depois pode parecer melhor do que é. A medida é revisao_media_min (dias) e "
+          "os segundos que o wrapper registra (wrapper).)")
     return 0
 
 
@@ -297,6 +305,11 @@ def selftest():
         ok(st is not None and abs(st[2] - 2.0) < 1e-6, "esperando teste = 2 min (só a chamada com pytest; o sleep sem pytest não entra)")
         ok(st is not None and st[3] == 1 and st[4] == 1, "1 chamada casada, 1 sem resultado contada à parte")
         ok(session_stats(os.path.join(t, "nao-existe.jsonl")) is None, "arquivo ausente dá None")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rcs = cmd_sessoes(5, None, d)
+        ok(rcs == 0 and "dica" in buf.getvalue() and "revisao_media_min" in buf.getvalue() and "wrapper" in buf.getvalue(),
+           "sessoes: diz que a tabela é só uma dica e aponta a manchete (revisao_media_min + wrapper)")
 
         # wrapper log
         w = os.path.join(t, "w.jsonl")

@@ -19,6 +19,7 @@ mkdir -p "$T/bin" "$T/city/.gc/logs" "$T/wt/tests" "$T/wt/tests/sub" "$T/other"
 printf 'DB = "shared/data/x.db"\n' > "$T/wt/tests/test_db.py"
 printf '# so cita shared/data num comentario\n    # (idem, indentado)\ndef test_x(): pass\n' > "$T/wt/tests/test_coment.py"
 : > "$T/other/test_out.py"
+: > "$T/wt/tests/helpers.py"   # módulo de apoio que EXISTE no worktree: é de onde um pytest.skip() de helper é reportado
 
 # stub do mbp-run: registra os argumentos (um por linha) e devolve o que o caso mandou.
 cat > "$T/bin/mbp-run" <<'EOF'
@@ -47,6 +48,8 @@ reset() { : > "$STUB_LOG"; rm -f "$STUB_COUNT" "$T/city/.gc/logs/gate-pytest.jso
 expect() { n=$((n+1)); if [ "$2" = "$3" ]; then echo "ok   $1 (rc=$3)"; else echo "FAIL $1: esperado rc=$2, veio $3"; fails=$((fails+1)); fi; }
 has()   { n=$((n+1)); if grep -q -E -e "$3" "$2"; then echo "ok   $1"; else echo "FAIL $1: '$3' ausente em $2"; fails=$((fails+1)); fi; }
 hasnt() { n=$((n+1)); if grep -q -E -e "$3" "$2"; then echo "FAIL $1: '$3' presente em $2"; fails=$((fails+1)); else echo "ok   $1"; fi; }
+# has_local: o padrão tem de aparecer numa chamada LOCAL (o stub do MBP registra os mesmos alvos, então `has` no log inteiro passaria mesmo sem nada rodar aqui)
+has_local() { n=$((n+1)); sed -n '/^LOCAL_CALL/,$p' "$2" > "$T/has-local.log"; if grep -q -E -e "$3" "$T/has-local.log"; then echo "ok   $1"; else echo "FAIL $1: '$3' ausente na parte LOCAL de $2"; fails=$((fails+1)); fi; }
 count() { n=$((n+1)); c=$(grep -c -E -e "$3" "$2"); if [ "$c" = "$4" ]; then echo "ok   $1 ($c)"; else echo "FAIL $1: esperado $4 de '$3', vieram $c"; fails=$((fails+1)); fi; }
 run() { "$GP" --repo wa --dir "$T/wt" "$@" >"$T/out" 2>"$T/err"; echo $?; }
 mbp_out() { printf '%s\n' "$@" > "$T/mbp.out"; export STUB_MBP_OUT="$T/mbp.out"; }
@@ -76,7 +79,7 @@ hasnt "off: não chama o MBP" "$STUB_LOG" 'MBP_CALL'; has "off: roda aqui" "$STU
 # 4 vermelho do MBP: os node ids rodam aqui primeiro; vale o rc DAQUI (se eles passam isolados, o comando inteiro roda aqui)
 mbp_red() { mbp_out "FAILED tests/test_a.py::test_x - AssertionError: boom" "ERROR tests/test_b.py - ImportError: nope" "1 failed, 1 error in 0.9s"; export STUB_MBP_RC=1; }
 reset; mbp_red; STUB_LOCAL_RCS=1 rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -x -q); expect "vermelho confirmado aqui" 1 "$rc"
-has "vermelho: só os ids rodam aqui" "$STUB_LOG" 'arg:tests/test_a.py::test_x'; has "vermelho: o erro de coleta roda aqui" "$STUB_LOG" 'arg:tests/test_b.py$'
+has "vermelho: só os ids rodam aqui" "$STUB_LOG" 'arg:tests/test_a.py::test_x'; has_local "vermelho: o erro de coleta roda aqui" "$STUB_LOG" 'arg:tests/test_b.py$'
 count "vermelho: UMA chamada local" "$STUB_LOG" 'LOCAL_CALL' 1; has "vermelho: motivo local-confirmou" "$LOG" 'local-confirmou'
 has "vermelho: flags do revisor mantidas na confirmação" "$STUB_LOG" 'arg:-x'
 # Os ids que reprovaram no MBP PASSAREM isolados aqui NÃO prova que o vermelho é do ambiente: sob -x/--maxfail o MBP parou no 1º vermelho e o que
@@ -104,21 +107,93 @@ sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-part.log"; count "divisão + i
 reset; mbp_red; rc=$(STUB_LOCAL_RCS="4 1" run -- tests/test_a.py tests/test_b.py -q); expect "ids ilegíveis aqui (rc 4) → comando inteiro" 1 "$rc"
 count "ilegíveis: duas chamadas locais" "$STUB_LOG" 'LOCAL_CALL' 2; has "ilegíveis: no log" "$LOG" 'ids-ilegiveis'
 reset; mbp_out "1 failed in 0.5s"; export STUB_MBP_RC=1; rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py -q); expect "rc 1 sem linhas FAILED → comando inteiro aqui" 1 "$rc"
-has "sem ids: no log" "$LOG" 'sem-ids'; has "sem ids: o comando inteiro (arquivo de teste)" "$STUB_LOG" 'arg:tests/test_a.py'
+has "sem ids: no log" "$LOG" 'sem-ids'; has_local "sem ids: o comando inteiro (arquivo de teste)" "$STUB_LOG" 'arg:tests/test_a.py'
 reset; { for i in $(seq 1 51); do echo "FAILED tests/test_a.py::t$i - x"; done; echo "51 failed in 1s"; } > "$T/mbp.out"; export STUB_MBP_OUT="$T/mbp.out" STUB_MBP_RC=1
 rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py -q); expect "51 reprovados → comando inteiro aqui" 1 "$rc"; has "muitos: no log" "$LOG" 'muitos'; hasnt "muitos: não manda 51 ids" "$STUB_LOG" 'test_a.py::t3'
+# 4c um id que o MBP reprovou e que NÃO é de nenhum alvo pedido (conftest/plugin que coleta outro arquivo, ou leitura errada): não sei o que rodar → o comando inteiro aqui,
+#    sem rodar o id estranho isolado (rodá-lo isolado e ver passar nada prova sobre o que o revisor pediu)
+reset; mbp_out "FAILED tests/outro.py::test_x - boom" "1 failed in 0.9s"; export STUB_MBP_RC=1
+rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -q); expect "id fora dos alvos → comando inteiro aqui (rc daqui)" 1 "$rc"
+count "id fora dos alvos: UMA chamada local" "$STUB_LOG" 'LOCAL_CALL' 1; hasnt "id fora dos alvos: o id estranho não roda" "$STUB_LOG" 'arg:tests/outro.py'
+has_local "id fora dos alvos: o comando inteiro (test_a)" "$STUB_LOG" 'arg:tests/test_a.py$'; has_local "id fora dos alvos: o comando inteiro (test_b)" "$STUB_LOG" 'arg:tests/test_b.py$'; has "id fora dos alvos: no log" "$LOG" 'ids-fora-dos-alvos'
+reset; mbp_out "FAILED tests/outro.py::test_x - boom" "1 failed in 0.9s"; export STUB_MBP_RC=1
+rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "id fora dos alvos e o comando inteiro passa aqui → 0 (o rc do comando inteiro vale)" 0 "$rc"
+reset; mbp_out "FAILED tests/test_a.py::test_x - boom" "FAILED tests/outro.py::test_y - boom" "2 failed in 0.9s"; export STUB_MBP_RC=1
+rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -q); expect "um id é alvo e outro não → comando inteiro aqui" 1 "$rc"
+count "id misto: UMA chamada local (sem confirmação isolada)" "$STUB_LOG" 'LOCAL_CALL' 1; hasnt "id misto: nenhum node id vai isolado" "$STUB_LOG" 'arg:tests/test_a.py::test_x'
+# o id de um alvo dado como node id (tests/test_a.py::test_x pedido) conta como contido
+reset; mbp_out "FAILED tests/test_a.py::test_x - boom" "1 failed in 0.9s"; export STUB_MBP_RC=1
+rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py::test_x -q); expect "alvo pedido como node id: o id reprovado é contido" 1 "$rc"; has "node id pedido: confirmado aqui" "$LOG" 'local-confirmou'
 
 # 5 pulados no MBP
 reset; mbp_out "SKIPPED [2] tests/test_b.py:9: sem dado" "3 passed, 2 skipped in 1.0s"
 rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "pulados no MBP" 0 "$rc"
-count "pulados: UMA chamada local" "$STUB_LOG" 'LOCAL_CALL' 1; has "pulados: só o arquivo que pulou" "$STUB_LOG" 'arg:tests/test_b.py$'; sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-only.log"; hasnt "pulados: o arquivo que não pulou não volta aqui" "$T/local-only.log" 'arg:tests/test_a.py$'
+count "pulados: UMA chamada local" "$STUB_LOG" 'LOCAL_CALL' 1; has_local "pulados: só o arquivo que pulou" "$STUB_LOG" 'arg:tests/test_b.py$'; sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-only.log"; hasnt "pulados: o arquivo que não pulou não volta aqui" "$T/local-only.log" 'arg:tests/test_a.py$'
 has "pulados: no log" "$LOG" 'skips-no-mbp'
 reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado" "1 skipped in 0.1s"
 rc=$(STUB_LOCAL_RCS=1 run -- tests/test_b.py -q); expect "pulado que falha aqui devolve o rc daqui" 1 "$rc"
+# 5a o skip sai de um HELPER (pytest.skip() dentro de um módulo de apoio): o pytest reporta o caminho do HELPER, não o do teste que pulou.
+#    Rodar o helper não coleta nada; o teste que pulou nunca rodava aqui (falso verde medido com pytest real). Caminho que não é alvo → TODOS os alvos aqui.
+reset; mbp_out "SKIPPED [2] tests/helpers.py:3: sem dado" "2 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -q); expect "skip vindo de helper: o rc daqui vale (1)" 1 "$rc"
+count "helper: UMA chamada local" "$STUB_LOG" 'LOCAL_CALL' 1; has_local "helper: o alvo test_a roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; has_local "helper: o alvo test_b roda aqui" "$STUB_LOG" 'arg:tests/test_b.py$'
+hasnt "helper: o helper não é alvo da rerun" "$STUB_LOG" 'arg:tests/helpers.py'; has "helper: motivo no log" "$LOG" 'skips-fora-dos-alvos'
+reset; mbp_out "SKIPPED [1] tests/helpers.py:3: sem dado" "1 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py -q); expect "skip de helper, alvo único: roda o ALVO (nunca 5 por rodar o helper)" 0 "$rc"
+has_local "helper alvo único: o alvo roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; hasnt "helper alvo único: o helper não roda" "$STUB_LOG" 'arg:tests/helpers.py'
+# um skip mapeado + um de helper: o mapeado NÃO basta (o outro nunca rodou aqui) → todos os alvos, inclusive o que nem pulou
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado" "SKIPPED [1] tests/helpers.py:3: sem dado" "2 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -q); expect "skip mapeado + skip de helper → todos os alvos aqui" 1 "$rc"
+has_local "misto: test_a (que não pulou no relato) roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; has "misto: motivo no log" "$LOG" 'skips-fora-dos-alvos'
+# linha SKIPPED que não dá para ler (sem caminho): a contagem fecha só com ela contada → não sei de quem é → todos os alvos
+reset; mbp_out "SKIPPED [1] algo ilegivel sem caminho" "SKIPPED [1] tests/test_b.py:9: sem dado" "2 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -q); expect "linha SKIPPED ilegível → todos os alvos aqui" 1 "$rc"; has_local "ilegível: test_a roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'
+# skip sem número de linha (módulo inteiro pulado): o caminho ainda é lido
+reset; mbp_out "SKIPPED [1] tests/test_b.py: modulo pulado" "1 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "skip sem linha, caminho é alvo" 0 "$rc"
+sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-only.log"; has "sem linha: o arquivo que pulou roda aqui" "$T/local-only.log" 'arg:tests/test_b.py$'; hasnt "sem linha: o que não pulou não volta" "$T/local-only.log" 'arg:tests/test_a.py$'
+# o resumo diz mais pulados do que as linhas SKIPPED listam: há skip sem dono → todos os alvos
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado" "3 passed, 3 skipped in 1.0s"
+rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -q); expect "resumo diz 3 pulados, só 1 listado → todos os alvos aqui" 1 "$rc"
+has_local "resumo > lista: test_a roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; has "resumo > lista: motivo no log" "$LOG" 'skips-nao-contados'
+# controle de que o caminho preciso segue valendo: vários grupos de skip do MESMO arquivo, contagem fecha → só esse arquivo
+reset; mbp_out "SKIPPED [2] tests/test_b.py:9: a" "SKIPPED [1] tests/test_b.py:20: b" "3 skipped, 1 passed in 1.0s"
+rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "vários grupos do mesmo arquivo, contagem fecha" 0 "$rc"
+sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-only.log"; has "grupos: o arquivo que pulou roda" "$T/local-only.log" 'arg:tests/test_b.py$'; hasnt "grupos: o que não pulou não volta" "$T/local-only.log" 'arg:tests/test_a.py$'
+has "grupos: motivo preciso no log" "$LOG" 'skips-no-mbp:3'
+# alvo pedido como node id: a rerun é o node id que o revisor pediu, não o arquivo inteiro (o arquivo inteiro traria testes que ele nem pediu)
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado" "1 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py::test_y -q); expect "alvo node id que pulou" 0 "$rc"
+sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-only.log"; has "node id: roda o node id pedido" "$T/local-only.log" 'arg:tests/test_b.py::test_y$'; hasnt "node id: não roda o arquivo inteiro" "$T/local-only.log" 'arg:tests/test_b.py$'
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado" "1 skipped in 0.1s"
+rc=$(STUB_LOCAL_RCS=0 run -- tests/test_b.py::test_y tests/test_b.py::test_z -q); expect "dois node ids do mesmo arquivo que pulou" 0 "$rc"
+has_local "dois ids: o 1º roda" "$STUB_LOG" 'arg:tests/test_b.py::test_y$'; has_local "dois ids: o 2º roda" "$STUB_LOG" 'arg:tests/test_b.py::test_z$'
 # sem pulados + sem resumo (-qq) e sem -r do revisor = nada pulou
 reset; mbp_out "."; rc=$(run -- tests/test_a.py -qq); expect "sem resumo, sem -r do revisor, rc 0" 0 "$rc"; hasnt "-qq: não roda aqui" "$STUB_LOG" 'LOCAL_CALL'
 # sem resumo + -r do revisor = não sei se pulou → aqui
 reset; mbp_out "."; rc=$(run -- tests/test_a.py -qq -ra); expect "sem resumo + -ra do revisor" 0 "$rc"; has "sem resumo + -r: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "no log: skips-ilegiveis" "$LOG" 'skips-ilegiveis'
+# o -r do revisor pode vir DENTRO de um grupo de flags curtas (-qqxrf = -q -q -x -r f): argparse o lê, então o wrapper também tem de ler
+for grp in -qqxrf -xrf -qqrfE -vrs; do
+  reset; mbp_out "."; rc=$(run -- tests/test_a.py $grp); expect "grupo $grp traz um -r: sem resumo, não sei se pulou" 0 "$rc"
+  has "grupo $grp: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "grupo $grp: skips-ilegiveis no log" "$LOG" 'skips-ilegiveis'
+done
+# controles: o r que NÃO é a opção -r (valor de -k, de -n, de -p...) e grupos sem r não disparam
+for grp in -qqx -xkr -knot_r -n4 -vv; do
+  reset; mbp_out "."; rc=$(run -- tests/test_a.py $grp); expect "grupo $grp (sem -r): nada pulou, não roda aqui" 0 "$rc"; hasnt "grupo $grp: sem chamada local" "$STUB_LOG" 'LOCAL_CALL'
+done
+# verde do MBP aceito: o MBP não tem shared/data nem .env — um teste que lê dado por um caminho que o wrapper não enxerga pode passar VAZIO lá.
+# O wrapper não consegue saber, então DIZ (fail-open visível), só quando um verde do MBP foi aceito.
+reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_a.py -q); expect "verde do MBP" 0 "$rc"; has "verde do MBP: a nota de verde vazio sai" "$T/out" 'nota: verde do MBP.*VAZIO'
+reset; export STUB_MBP_RC=98; rc=$(run -- tests/test_a.py -q); unset STUB_MBP_RC; hasnt "rodou só aqui: sem a nota de verde do MBP" "$T/out" 'nota: verde do MBP'
+reset; mbp_red; rc=$(STUB_LOCAL_RCS="0 0" run -- tests/test_a.py tests/test_b.py -q); hasnt "vermelho que virou verde aqui: sem a nota (não houve verde do MBP)" "$T/out" 'nota: verde do MBP'
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado" "1 skipped in 0.1s"; rc=$(STUB_LOCAL_RCS=1 run -- tests/test_b.py -q); expect "pulou no MBP e reprova aqui" 1 "$rc"
+hasnt "pulou no MBP (o aqui decidiu): sem a nota de verde do MBP" "$T/out" 'nota: verde do MBP'
+reset; mbp_out "1 passed in 0.1s"; rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_db.py -q); expect "verde do MBP + parte local vermelha" 1 "$rc"
+hasnt "rc final 1: a nota de verde do MBP não sai (o veredito é vermelho)" "$T/out" 'nota: verde do MBP'
+reset; mbp_out "1 passed in 0.1s"; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_db.py -q); expect "verde do MBP + parte local verde" 0 "$rc"
+has "divisão verde: a nota sai (a parte do MBP foi aceita como veio)" "$T/out" 'nota: verde do MBP.*VAZIO'
+# a nota vem ANTES da linha final: o revisor copia a ÚLTIMA linha no veredito
+reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_a.py -q); tail -1 "$T/out" > "$T/lastline"; has "a última linha continua sendo ran=..." "$T/lastline" '^gate-pytest: ran=mbp rc=0'
 
 # 6 rc estranho do MBP (2, 5, 124...) → comando inteiro aqui
 for code in 2 3 4 5 124; do reset; export STUB_MBP_RC=$code; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py -q); unset STUB_MBP_RC
@@ -211,6 +286,10 @@ has "rerun com rc 3: o log diz o rc daqui" "$LOG" 'local-rc=3'; hasnt "rerun com
 
 # 13 --help mostra o cabeçalho inteiro (o corte era por número de linha e perdia as variáveis de ambiente)
 "$GP" --help > "$T/help" 2>&1; has "--help traz as variáveis de ambiente" "$T/help" 'GATE_PYTEST_CITY'; hasnt "--help não vaza o código" "$T/help" 'set -o pipefail'
+# o cabeçalho não promete o que o código não faz (ga-xm1jfl, gate round 1): rc fora de 0..5 existe (137 por sinal, 126/127 sem python3), "o resultado de lá"
+# vale só quando é verde, e o verde do MBP pode ser vazio
+hasnt "--help não promete rc só em 0..5" "$T/help" '\(0\.\.5\)'; hasnt "--help não diz que o resultado de lá vale" "$T/help" 'resultado de lá é o que vale'
+has "--help diz que o verde do MBP pode passar vazio" "$T/help" 'passar VAZIO'; has "--help diz que o skip de helper manda TODOS os alvos para cá" "$T/help" 'TODOS os alvos'
 
 # controle negativo A: sem a confirmação local, o caso "vermelho" PASSARIA pelo rc do MBP — o teste 4 tem de enxergar isso
 reset; mbp_red
@@ -223,6 +302,21 @@ reset; export STUB_MBP_RC=98
 sed 's/^    96|97|98|99)$/    96|97|98|99) exit "$MBP_RC" ;;\n    __morto__)/' "$GP" > "$T/mutB.sh"; chmod +x "$T/mutB.sh"
 "$T/mutB.sh" --repo wa --dir "$T/wt" -- tests/test_a.py -q >/dev/null 2>&1; r=$?
 n=$((n+1)); if [ "$r" = 98 ]; then echo "ok   controle B (mutante sem o desvio devolve 98 — o teste 2 pegaria)"; else echo "FAIL controle B: o mutante devolveu $r"; fails=$((fails+1)); fi
+
+# controle negativo C: com a regra do round 1 (o caminho do SKIPPED só precisa EXISTIR no worktree), o skip de helper ao lado de um skip mapeado
+# deixa o test_a sem rodar aqui — o caso 5a tem de enxergar isso
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado" "SKIPPED [1] tests/helpers.py:3: sem dado" "2 skipped in 0.1s"
+sed 's|if is_target_file "\$skp"; then|if [ -f "\$dir/\$skp" ]; then|' "$GP" > "$T/mutC.sh"; chmod +x "$T/mutC.sh"
+cmp -s "$GP" "$T/mutC.sh" && { n=$((n+1)); echo "FAIL controle C: o mutante é idêntico ao original (sed não casou)"; fails=$((fails+1)); } || {
+  STUB_LOCAL_RCS=1 "$T/mutC.sh" --repo wa --dir "$T/wt" -- tests/test_a.py tests/test_b.py -q >/dev/null 2>&1
+  n=$((n+1)); if sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" | grep -q 'arg:tests/test_a.py$'; then echo "FAIL controle C: o mutante ainda rodou o test_a aqui"; fails=$((fails+1)); else echo "ok   controle C (mutante com a regra do round 1 deixa o test_a sem rodar — o caso 5a pegaria)"; fi; }
+# controle negativo D: sem a contenção dos ids, o id de outro arquivo roda isolado aqui e "passa" — o caso 4c tem de enxergar isso
+reset; mbp_out "FAILED tests/outro.py::test_x - boom" "1 failed in 0.9s"; export STUB_MBP_RC=1
+sed 's/is_target_file "\${id%%::\*}" || ids_fora=1/:/' "$GP" > "$T/mutD.sh"; chmod +x "$T/mutD.sh"
+cmp -s "$GP" "$T/mutD.sh" && { n=$((n+1)); echo "FAIL controle D: o mutante é idêntico ao original (sed não casou)"; fails=$((fails+1)); } || {
+  STUB_LOCAL_RCS=0 "$T/mutD.sh" --repo wa --dir "$T/wt" -- tests/test_a.py tests/test_b.py -q >/dev/null 2>&1
+  n=$((n+1)); if grep -q 'arg:tests/outro.py' "$STUB_LOG"; then echo "ok   controle D (mutante sem a contenção roda o id estranho isolado — o caso 4c pegaria)"; else echo "FAIL controle D: o mutante também não rodou o id estranho"; fails=$((fails+1)); fi; }
+unset STUB_MBP_RC
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
