@@ -17722,7 +17722,7 @@ if [ -n "$_DP_KIND" ]; then
   else
     _DP_WHAT="has a diff of $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole (GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET)"
     _DP_PRINCIPLE="The gate does not review a part of a diff and merge on it"
-    _DP_TODO="WHAT TO DO: split the work into branches that each stay under those limits and send each one through /gate-done. If this change really must land as ONE piece, the Mayor decides: read it and merge by hand, or raise GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET on the dispatcher."
+    _DP_TODO="WHAT TO DO: split the work into branches that each stay under those limits and send each one through /gate-done. Slice VERTICALLY: each slice delivers one visible, testable behavior end to end, with the minimum test that proves it — not a layer (schema only, API only, infra only), whose feedback only arrives once every other layer is done. If this change really must land as ONE piece, the Mayor decides: read it and merge by hand, or raise GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET on the dispatcher."
     _DP_SUBJ="diff too large to review whole"
     _DP_EVENT="dispatcher_park_diff_too_large"
     _DP_LOGWHY="diff too large to review whole: $_DP_SIZE"

@@ -216,6 +216,7 @@ if [ -n "$BLOCK_SRC" ]; then
   if has "$CALLS" "ga-5w2gpw" && has "$CALLS" "$((LINE_DEF + 1)) lines" && has "$CALLS" "$LINE_DEF lines" && has "$CALLS" "$BYTE_DEF bytes"; then ok "3b. the bead comment names the ticket, the diff size and BOTH ceilings"; else bad "3b. bead comment lacks ticket/size/ceilings: $CALLS"; fi
   if has "$CALLS" "NH-CLAUSE[armed]"; then ok "3b. the comment carries the verified needs-human clause"; else bad "3b. the needs-human clause is missing from the comments"; fi
   if has "$CALLS" "split"; then ok "3b. the builder is told what to do (split the branch)"; else bad "3b. no instruction to split the branch"; fi
+  if has "$CALLS" "Slice VERTICALLY: each slice delivers one visible, testable behavior end to end, with the minimum test that proves it"; then ok "3b. the split advice says to slice vertically, one end-to-end behavior per slice (ga-x8mmt7)"; else bad "3b. no vertical-slice advice in the park comment"; fi
   if has "$CALLS" "mail send mayor" && has "$CALLS" "mail send crew/author"; then ok "3b. Mayor AND the author are mailed"; else bad "3b. mail missing (mayor/author): $CALLS"; fi
   if has "$QGLINE" "dispatcher_park_diff_too_large" && has "$QGLINE" "bead-1"; then ok "3b. a dispatcher_park_diff_too_large event is logged"; else bad "3b. no park event in the QG log: '$QGLINE'"; fi
   # Assert on the CALLS, not on prose (the park's own comments say "no fix attempt"); grep -c, since grep -q can SIGPIPE under pipefail.
@@ -240,6 +241,7 @@ if [ -n "$BLOCK_SRC" ]; then
   run_block 10 30 2 SC_GITFAIL=1
   if ! reached && [ "$RC" = "0" ] && has "$CALLS" "set_gate_status|m-1 error" && has "$CALLS" "gate_apply_needs_human|bead-city bead-1 gate:needs-human:technical"; then ok "3d. files listed but the diff read fails (coverage=unknown): parked at error + needs-human, no reviewer"; else bad "3d. an unreadable diff fell through to the reviewers (rc=$RC): $(printf '%s' "$OUT" | tail -3 | tr '\n' ' ')"; fi
   if has "$CALLS" "could not be read" && ! has "$CALLS" "too large" && ! has "$CALLS" "split the work" && has "$QGLINE" "dispatcher_park_diff_unreadable"; then ok "3d. it says 'could not be read' (nothing is large: no split advice, own event name)"; else bad "3d. wording/event wrong: $(printf '%s' "$CALLS" | head -2 | tr '\n' ' ') | $QGLINE"; fi
+  if ! has "$CALLS" "Slice VERTICALLY"; then ok "3d. control: an unreadable diff carries no slicing advice (vertical-slice line only on 'too large')"; else bad "3d. the vertical-slice advice leaked into the unreadable-diff park"; fi
   # 3d2. nothing listed: a branch git CONFIRMS empty still proceeds (rc 0); anything else (a diff git can see, or a git that failed) parks.
   run_block 0 30 0
   if reached && has "$OUT" "COVERAGE=unknown" && ! has "$CALLS" "set_gate_status"; then ok "3d2. nothing listed and git confirms 'no difference' (diff --quiet rc 0): falls through, unchanged"; else bad "3d2. a provably empty branch was parked: $(printf '%s' "$CALLS" | head -2 | tr '\n' ' ')"; fi

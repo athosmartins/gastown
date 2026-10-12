@@ -7784,11 +7784,15 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
       epic) _E11_PTYPE="feature" ;;
       *) _E11_PTYPE="<tipo de $BEAD_ID>" ;;
     esac
+    # ga-x8mmt7: slice VERTICALLY. An AI told to slice cuts by layer (schema, then API, then screen) and the feedback only
+    # arrives at the end; a slice that delivers one behavior end to end gets feedback at once (study ga-ugtch8). The line
+    # "Fatie na VERTICAL" sits between the typed-slice command and the minimum-test line, which it completes.
     _E11_REASON="VERDICT: FAIL (gate guard, diff-size cap E11 — refusal $_E11_REFUSALS of 3 for this bead; no reviewer was spawned)
 O diff de $BRANCH contra origin/main tem $_E11_TOTAL linhas no TOTAL (codigo + testes + docs; arquivos gerados, vendor, lockfiles e fragmentos de changelog nao contam) e $_E11_COUNT linhas de codigo de PRODUCAO (testes, fixtures, arquivos gerados, lockfiles e .md nao contam). Os tetos por submissao sao $_E11_TOTAL_CAP no total e $_E11_CAP de producao. $_E11_OVER_TXT
 Diff grande reprova na primeira tentativa bem mais (aprovacao na 1a revisao por tamanho total: 81% ate 200 linhas, 68% de 201 a 500, 50% de 501 a 800, 36% acima de 800): o revisor nao cobre tudo numa passada.
 O QUE FAZER: dividir em fatias, cada uma com o seu proprio marker (/gate-done): uma branch por fatia, cada uma abaixo dos tetos, citando o bead da fatia nos commits. Nao reenvie a mesma branch inteira.
 Crie cada fatia como bead FILHO deste e do MESMO TIPO dele: bd create '<titulo da fatia>' --parent $BEAD_ID -t $_E11_PTYPE. Sem o -t o bd cria 'task', e fatia de feature que nasce task perde a vez na fila do gate (prioridade > tipo > idade) e infla o numero de tasks no painel.
+Fatie na VERTICAL: cada fatia entrega um comportamento visivel e testavel de ponta a ponta, nao uma camada (so schema, so API ou so infra) — o feedback de uma fatia por camada so chega quando todas as outras ficam prontas.
 Em cada fatia mantenha so o teste minimo que prova o comportamento (guia: linhas de teste <= linhas de codigo): o excesso de teste e o que mais incha o diff.
 Se o diff e grande por natureza (renome ou migracao mecanica), ponha o label gate:size-exempt no bead $BEAD_ID e comente o MOTIVO (um comentario que COMECE com gate:size-exempt: seguido do motivo), depois reenvie.
 Marker $MARKER_ID fechado (recusado na submissao). Este bead ficou com gate:needs-fix e sem gate:queued: o Pilot despacha o conserto."
@@ -7799,7 +7803,7 @@ Marker $MARKER_ID fechado (recusado na submissao). Este bead ficou com gate:need
       bd -C "$BEAD_CITY" label add "$BEAD_ID" gate:needs-human 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" gate:needs-fix 2>/dev/null || true
       gc --city "$GC_CITY" mail send mayor -s "Gate E11: $BEAD_ID recusado 3x por tamanho — precisa de humano" \
-        -m "$BEAD_ID (branch $BRANCH) foi recusado na submissao pela 3a vez: $_E11_WHAT. Ficou com gate:needs-human (gate:needs-fix removido); o Pilot nao redespacha. Decida: fatiar voce mesmo (cada fatia: bd create '<titulo>' --parent $BEAD_ID -t $_E11_PTYPE — fatia de feature nasce feature), ou gate:size-exempt com motivo no bead." 2>/dev/null \
+        -m "$BEAD_ID (branch $BRANCH) foi recusado na submissao pela 3a vez: $_E11_WHAT. Ficou com gate:needs-human (gate:needs-fix removido); o Pilot nao redespacha. Decida: fatiar voce mesmo (cada fatia: bd create '<titulo>' --parent $BEAD_ID -t $_E11_PTYPE — fatia de feature nasce feature; e fatia VERTICAL: um comportamento testavel de ponta a ponta, nao uma camada so de schema/API/infra), ou gate:size-exempt com motivo no bead." 2>/dev/null \
         || warn "E11-DIFF-CAP: could not mail the mayor about the 3rd refusal of $BEAD_ID — the bead carries gate:needs-human"
     fi
     _E11_AUTHOR=$(printf '%s' "$BRANCH" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')

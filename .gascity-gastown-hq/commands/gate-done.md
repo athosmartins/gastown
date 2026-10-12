@@ -1160,7 +1160,15 @@ bd create "<slice title>" --parent <your-bead-id> -t "$PARENT_TYPE"
 Without `-t`, `bd create` makes a **task**, and a task slice of a feature loses
 its turn in the gate order (priority > type > age) and inflates "tasks" on the
 painel. (An epic's slices are features.) A sweep in the approved-state reconciler
-retypes the ones that slip through, but it is a net, not the plan. If the diff is
+retypes the ones that slip through, but it is a net, not the plan.
+
+**Slice VERTICALLY, not by layer** (ga-x8mmt7): each slice delivers one visible,
+testable behavior end to end, with the minimum test that proves that behavior.
+Cutting by layer (schema first, then API, then screen) is what an AI does by
+default, and its feedback only arrives once every layer is done; a vertical slice
+gets feedback at once. No slice that is only schema, only API or only infra.
+
+If the diff is
 large by nature (mechanical rename or migration), the exemption is the label
 `gate:size-exempt` plus a comment that STARTS with `gate:size-exempt:` and gives
 the reason, then resubmit.
