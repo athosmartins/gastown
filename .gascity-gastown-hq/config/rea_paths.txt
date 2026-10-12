@@ -1,0 +1,46 @@
+# rea_paths.txt — ga-jdzri9: the files whose change makes the gate ask for a `REA:` comment on the source bead.
+#
+# WHY A LIST. The REA rule (epic ga-oe7o1p) says: whoever touches how we read an outside source leaves one comment on the bead whose first
+# line starts with `REA:` (target, command, found or not found, why — never a token, cookie, JWT or a CPF/CNPJ). The gate's reviewers see only
+# the file list and the first 800 diff lines, never the bead's comments, so without a mechanical check the rule is prose.
+# The check is quality-gate-dispatcher.sh Step 5 + gate_finalize_run, through gate-rea-check.lib.sh. Warn-only for the first 14 days after it
+# first runs (label rea:missing + a comment on the bead), then the gate downgrades a PASS to FAIL. A change that is not a source
+# investigation satisfies it with one line: `REA: n/a - <reason>`.
+#
+# FORMAT. One entry per line: `<rig> <pattern>`, separated by blanks. `#` starts a comment. <rig> is the marker's `rig:` value
+# (whatsapp_automation, property_scrapers, gascity...). <pattern> is a bash `case` glob over the repo-relative path; `*` also crosses `/`,
+# so `scrapers/*` is the whole tree. A line that is not exactly two fields is skipped and counted in the gate log (rea_check ... skipped=N).
+# A rig with no entry is never checked.
+#
+# WHAT BELONGS. Code that reads a site or portal through an endpoint its own front-end serves openly, and the per-source files around it.
+# NOT here, on purpose: generic `*_client.py` / `*_common.py` plumbing (it would match unrelated work), and clients of paid or documented APIs
+# (Pipedrive, Whapi, Assertiva) — those have a contract, REA is for finding the endpoint that has none.
+#
+# The whatsapp_automation block is a first list, written from file names, not from a map of the rig's sources. The warn window exists to
+# correct it: a missing file shows as a scraper change that passed without the label, a file that does not belong shows as a rea:missing
+# on a bead that had nothing to investigate. Edit this file; the dispatcher re-reads it on every sweep, no restart.
+
+# --- property_scrapers: every per-source scraper, plus the source-specific helpers outside scrapers/
+property_scrapers scrapers/*
+property_scrapers refresh_blow_token.py
+property_scrapers scripts/fetch_blow_empresas.py
+property_scrapers scripts/discover_imoview_tenants.py
+property_scrapers scripts/backfill_chavesnamao.py
+property_scrapers scripts/backfill_quintoandar_slug_fields.py
+property_scrapers scripts/recover_netimoveis_history.py
+property_scrapers lib/leilao_common.py
+property_scrapers lib/vista_common.py
+
+# --- whatsapp_automation: readers of public portals (PBH, Receita Federal, CENSEC, PDPJ, MDS)
+whatsapp_automation daemons/md_usage_scraper.py
+whatsapp_automation daemons/pbh_freshness_daemon.py
+whatsapp_automation lib/pbh_ckan.py
+whatsapp_automation lib/cnpj_pbh_enricher.py
+whatsapp_automation lib/rfb_cnpj_fetcher.py
+whatsapp_automation lib/rfb_s3.py
+whatsapp_automation lib/rfb_stream.py
+whatsapp_automation lib/sucessao_censec.py
+whatsapp_automation processo_lookup/pdpj_api.py
+whatsapp_automation processo_lookup/collect.py
+whatsapp_automation processo_lookup/batch_collect.py
+whatsapp_automation processo_lookup/mds_extract.py
