@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# crew-model-effort.selftest.sh — Athos, 2026-10-05, verbatim (Mayor session): "pra todos nossos crew
-# members, o modelo default ie Sonnet e effor level high. pro mayor, opus com effor high".
-# Supersedes ga-n56ase (2026-09-28: crews on Opus 5.5 + effort medium).
+# crew-model-effort.selftest.sh — Athos, 2026-10-11 06:5x (Mayor session, AskUserQuestion): "Manter Opus"
+# — crews on Opus with effort high. Supersedes 2026-10-05 (crews on Sonnet + high), which superseded
+# ga-n56ase (2026-09-28: crews on Opus 5.5 + effort medium).
 #
 # Static check against the committed text (same convention as peter-rc-provider.selftest.sh —
 # `gc config show` needs untracked local state a clean checkout does not have):
 #   1. every named crew is on provider claude-rc-crew and sets effort = "high";
 #   2. the set of crews is non-empty (an empty set would pass 1 vacuously);
 #   3. no agent.toml is left on the Opus provider claude-rc (that one is the Mayor's, set by the pack);
-#   4. claude-rc-crew pins --model sonnet with --remote-control; claude-rc keeps --model opus;
+#   4. claude-rc-crew pins --model opus with --remote-control; claude-rc keeps --model opus;
 #   5. the Mayor's effort patch in city.toml is "high".
 # The model comes from the provider's own --model alias (latest Sonnet / latest Opus), NOT from
 # option_defaults.model — the engine's builtin "opus" choice maps to claude-opus-4-8 (a downgrade).
@@ -50,8 +50,8 @@ left="$(grep -l '^provider = "claude-rc"$' "$AGENTS_DIR"/*/agent.toml 2>/dev/nul
 
 echo "── 4. model pins live on the providers ──"
 crew_args="$(awk '$0=="[providers.claude-rc-crew]"{f=1; next} /^\[/{f=0} f' "$CITY_TOML" | grep '^args_append' || true)"
-echo "$crew_args" | grep -q '"--model", "sonnet"' \
-  && ok "claude-rc-crew pins --model sonnet" || bad "claude-rc-crew does not pin --model sonnet: ${crew_args:-<no args_append>}"
+echo "$crew_args" | grep -q '"--model", "opus"' \
+  && ok "claude-rc-crew pins --model opus" || bad "claude-rc-crew does not pin --model opus: ${crew_args:-<no args_append>}"
 echo "$crew_args" | grep -q '"--remote-control"' \
   && ok "claude-rc-crew keeps --remote-control" || bad "claude-rc-crew lost --remote-control: ${crew_args:-<no args_append>}"
 rc_args="$(awk '$0=="[providers.claude-rc]"{f=1; next} /^\[/{f=0} f' "$CITY_TOML" | grep '^args_append' || true)"

@@ -26,13 +26,13 @@ ready_delay_ms = 0
 base = "builtin:claude"
 args_append = ["--remote-control", "--model", "opus"]
 ready_delay_ms = 0
-# Athos, 2026-10-05 (Mayor session, direct instruction): "pra todos nossos crew members, o modelo
-# default é Sonnet e effort level high. pro mayor, opus com effort high". Supersedes ga-n56ase (crews on
-# Opus 5.5 + medium). claude-rc above stays Opus and is now used by the Mayor only; every named crew
-# moved to this provider (same remote-control launch, Sonnet = the CLI's "sonnet" alias, latest Sonnet).
+# Athos, 2026-10-11 06:5x (Mayor session, AskUserQuestion: "Manter Opus"): crews run on Opus with effort
+# high. Supersedes the 2026-10-05 instruction (crews on Sonnet + high). claude-rc above stays the Mayor's;
+# every named crew uses this provider (same remote-control launch, "opus" = the CLI alias, latest Opus).
+# Applied at 23:1x before the nightly reboot so the crews come back on Opus without a mid-day drain.
 [providers.claude-rc-crew]
 base = "builtin:claude"
-args_append = ["--remote-control", "--model", "sonnet"]
+args_append = ["--remote-control", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-headless]
 base = "builtin:claude"
