@@ -4,9 +4,9 @@
 # Contents
 #   Casos · Controle negativo
 #
-# CASOS: verde no MBP (não roda aqui) · MBP indisponível 96..99 → roda aqui o comando de hoje · chave off · vermelho do MBP → só os
-#   node ids rodam aqui e o rc de LÁ vale (confirmou / não confirmou / ids ilegíveis / sem ids / muitos) · pulados no MBP → os arquivos
-#   que pularam rodam aqui · sem resumo + -r do revisor → roda aqui · rc estranho do MBP → roda aqui · alvo que lê shared/data, lista
+# CASOS: verde no MBP (não roda aqui) · MBP indisponível 96..99 → roda aqui o comando de hoje · chave off · vermelho do MBP → os
+#   node ids rodam aqui primeiro e o rc DAQUI vale (confirmou / passou isolado → o comando inteiro roda aqui, com -x e com pulado /
+#   ids ilegíveis / sem ids / muitos) · pulados no MBP → os arquivos que pularam rodam aqui · sem resumo + -r do revisor → roda aqui · rc estranho do MBP → roda aqui · alvo que lê shared/data, lista
 #   force-local, diretório, sem alvo, flag de disco local, repo sem espelho, caminho fora do worktree → rodam aqui sem chamar o MBP ·
 #   divisão por alvo (o que fica aqui não arrasta os outros; rc das duas partes se combinam) · caminho absoluto dentro do worktree vira relativo · valor de flag com espaço chega inteiro · rc nunca 96..99 · uso errado = 4 · log.
 set -u
@@ -59,10 +59,10 @@ hasnt "verde: não chama o python local" "$STUB_LOG" 'LOCAL_CALL'; has "verde: c
 has "verde: linha final ran=mbp" "$T/out" 'gate-pytest: ran=mbp rc=0'; has "verde: log jsonl ran=mbp" "$LOG" '"ran":"mbp","rc":0'
 has "verde: -rfEs vai primeiro, flags do revisor depois" "$STUB_LOG" 'arg:-rfEs'
 
-# 2 MBP indisponível: 96..99 → roda aqui o MESMO comando, rc de lá
+# 2 MBP indisponível: 96..99 → roda aqui o MESMO comando, e o rc é o daqui
 for code in 96 97 98 99; do
   reset; STUB_MBP_RC=$code STUB_LOCAL_RCS=3 run -- tests/test_a.py -x -q >/dev/null; rc=$(STUB_MBP_RC=$code STUB_LOCAL_RCS=3 run -- tests/test_a.py -x -q)
-  expect "mbp rc=$code roda aqui e devolve o rc de lá" 3 "$rc"
+  expect "mbp rc=$code roda aqui e devolve o rc daqui" 3 "$rc"
 done
 reset; export STUB_MBP_RC=98; rc=$(run -- tests/test_a.py -x -q); unset STUB_MBP_RC
 expect "98 + local verde = 0 (nunca 98)" 0 "$rc"; has "98: ran=local" "$T/out" 'ran=local rc=0'
@@ -73,14 +73,34 @@ has "98: motivo no log" "$LOG" 'mbp-rc=98'
 reset; touch "$T/city/.gc/gate-pytest.off"; rc=$(run -- tests/test_a.py -q); expect "chave gate-pytest.off" 0 "$rc"
 hasnt "off: não chama o MBP" "$STUB_LOG" 'MBP_CALL'; has "off: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "off: motivo" "$LOG" 'chave-gate-pytest-off'
 
-# 4 vermelho do MBP: só os node ids rodam aqui; vale o rc de LÁ
+# 4 vermelho do MBP: os node ids rodam aqui primeiro; vale o rc DAQUI (se eles passam isolados, o comando inteiro roda aqui)
 mbp_red() { mbp_out "FAILED tests/test_a.py::test_x - AssertionError: boom" "ERROR tests/test_b.py - ImportError: nope" "1 failed, 1 error in 0.9s"; export STUB_MBP_RC=1; }
 reset; mbp_red; STUB_LOCAL_RCS=1 rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -x -q); expect "vermelho confirmado aqui" 1 "$rc"
 has "vermelho: só os ids rodam aqui" "$STUB_LOG" 'arg:tests/test_a.py::test_x'; has "vermelho: o erro de coleta roda aqui" "$STUB_LOG" 'arg:tests/test_b.py$'
 count "vermelho: UMA chamada local" "$STUB_LOG" 'LOCAL_CALL' 1; has "vermelho: motivo local-confirmou" "$LOG" 'local-confirmou'
 has "vermelho: flags do revisor mantidas na confirmação" "$STUB_LOG" 'arg:-x'
-reset; mbp_red; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "vermelho do MBP que passa aqui vale o daqui" 0 "$rc"
-has "não-confirmou: AVISO dito" "$T/out" 'AVISO: 2 teste\(s\) reprovaram no MBP e PASSARAM aqui'; has "não-confirmou: no log" "$LOG" 'local-NAO-confirmou'
+# Os ids que reprovaram no MBP PASSAREM isolados aqui NÃO prova que o vermelho é do ambiente: sob -x/--maxfail o MBP parou no 1º vermelho e o que
+# vinha depois nunca rodou em lugar nenhum; uma falha que depende de ordem ou um flake também passa isolado. "Não sei" não vira verde:
+# o comando inteiro roda aqui (o que o revisor rodava antes) e o rc DELE é o que vale.
+reset; mbp_red; rc=$(STUB_LOCAL_RCS="0 0" run -- tests/test_a.py tests/test_b.py -q); expect "ids passam isolados e o comando inteiro também → 0" 0 "$rc"
+has "isolado-passou: AVISO dito" "$T/out" 'AVISO: 2 teste\(s\) reprovaram no MBP e passaram aqui isolados'; has "isolado-passou: no log" "$LOG" 'isolado-passou;inteiro-rc=0'
+count "isolado-passou: duas chamadas locais (ids + comando inteiro)" "$STUB_LOG" 'LOCAL_CALL' 2; hasnt "isolado-passou: não afirma que a diferença é de ambiente" "$T/out" 'a diferença é de ambiente'
+# 4a o -x do revisor (o exemplo canônico do prompt): o vermelho de ambiente vem ANTES de um bug real; o bug só aparece no comando inteiro aqui
+reset; mbp_red; rc=$(STUB_LOCAL_RCS="0 1" run -- tests/test_a.py tests/test_b.py -x -q); expect "vermelho sob -x, id passa isolado, o resto reprova aqui → 1 (nunca 0)" 1 "$rc"
+count "-x: duas chamadas locais" "$STUB_LOG" 'LOCAL_CALL' 2; awk '/^LOCAL_CALL/{c++} c==2' "$STUB_LOG" > "$T/second.log"
+has "-x: a 2ª chamada é o comando inteiro (o -x do revisor)" "$T/second.log" 'arg:-x'; has "-x: a 2ª chamada traz os dois arquivos" "$T/second.log" 'arg:tests/test_b.py$'
+hasnt "-x: a 2ª chamada não é a dos ids" "$T/second.log" 'arg:tests/test_a.py::test_x'; has "-x: o log diz o rc do comando inteiro" "$LOG" 'isolado-passou;inteiro-rc=1'
+# 4b vermelho + pulado na mesma execução (no MBP faltam dado e .env: vermelho e pulado andam juntos): o arquivo que pulou também roda aqui
+reset; mbp_out "FAILED tests/test_a.py::test_x - boom" "SKIPPED [1] tests/test_b.py:9: sem dado no MBP" "1 failed, 1 skipped in 0.9s"; export STUB_MBP_RC=1
+rc=$(STUB_LOCAL_RCS="0 1" run -- tests/test_a.py tests/test_b.py -q); expect "vermelho + pulado: o id passa aqui, o arquivo que pulou reprova aqui → 1" 1 "$rc"
+awk '/^LOCAL_CALL/{c++} c==2' "$STUB_LOG" > "$T/second.log"; has "vermelho + pulado: o arquivo que pulou roda aqui" "$T/second.log" 'arg:tests/test_b.py$'
+# o comando inteiro aqui terminou com rc que não é verde (2 interrompido): vale esse rc, não vira 0
+reset; mbp_red; rc=$(STUB_LOCAL_RCS="0 2" run -- tests/test_a.py tests/test_b.py -q); expect "comando inteiro aqui com rc 2 vale" 2 "$rc"
+# com divisão: o comando inteiro da parte do MBP roda SEM o alvo que fica aqui (esse roda uma vez só, separado)
+reset; mbp_out "FAILED tests/test_a.py::test_x - boom" "1 failed in 0.9s"; export STUB_MBP_RC=1
+rc=$(STUB_LOCAL_RCS="0 1 0" run -- tests/test_a.py tests/test_db.py -q); expect "divisão + vermelho que passa isolado: o comando inteiro da parte do MBP reprova → 1" 1 "$rc"
+count "divisão + isolado-passou: três chamadas locais (ids, parte do MBP inteira, parte local)" "$STUB_LOG" 'LOCAL_CALL' 3
+sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-part.log"; count "divisão + isolado-passou: test_db roda uma vez só" "$T/local-part.log" 'arg:tests/test_db.py$' 1
 reset; mbp_red; rc=$(STUB_LOCAL_RCS="4 1" run -- tests/test_a.py tests/test_b.py -q); expect "ids ilegíveis aqui (rc 4) → comando inteiro" 1 "$rc"
 count "ilegíveis: duas chamadas locais" "$STUB_LOG" 'LOCAL_CALL' 2; has "ilegíveis: no log" "$LOG" 'ids-ilegiveis'
 reset; mbp_out "1 failed in 0.5s"; export STUB_MBP_RC=1; rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py -q); expect "rc 1 sem linhas FAILED → comando inteiro aqui" 1 "$rc"
@@ -94,7 +114,7 @@ rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "pulado
 count "pulados: UMA chamada local" "$STUB_LOG" 'LOCAL_CALL' 1; has "pulados: só o arquivo que pulou" "$STUB_LOG" 'arg:tests/test_b.py$'; sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-only.log"; hasnt "pulados: o arquivo que não pulou não volta aqui" "$T/local-only.log" 'arg:tests/test_a.py$'
 has "pulados: no log" "$LOG" 'skips-no-mbp'
 reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado" "1 skipped in 0.1s"
-rc=$(STUB_LOCAL_RCS=1 run -- tests/test_b.py -q); expect "pulado que falha aqui devolve o rc de lá" 1 "$rc"
+rc=$(STUB_LOCAL_RCS=1 run -- tests/test_b.py -q); expect "pulado que falha aqui devolve o rc daqui" 1 "$rc"
 # sem pulados + sem resumo (-qq) e sem -r do revisor = nada pulou
 reset; mbp_out "."; rc=$(run -- tests/test_a.py -qq); expect "sem resumo, sem -r do revisor, rc 0" 0 "$rc"; hasnt "-qq: não roda aqui" "$STUB_LOG" 'LOCAL_CALL'
 # sem resumo + -r do revisor = não sei se pulou → aqui
@@ -109,6 +129,12 @@ reset; rc=$(run -- tests/test_db.py -q); expect "lê shared/data" 0 "$rc"; hasnt
 reset; echo 'tests/test_b.py' > "$T/force-local.txt"; rc=$(run -- tests/test_b.py -q); expect "lista force-local" 0 "$rc"
 hasnt "lista: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "lista: motivo" "$LOG" 'lista-local:tests/test_b.py'
 reset; printf '# comentário\n\ntests/sub/*\n' > "$T/force-local.txt"; rc=$(run -- tests/sub/test_c.py -q); expect "glob da lista" 0 "$rc"; has "glob: motivo" "$LOG" 'lista-local:tests/sub/\*'
+# a lista é O remédio do verde vazio (runbook): salva sem newline no fim, com CRLF ou com espaço sobrando, ela NÃO pode virar letra morta em silêncio
+reset; printf 'tests/test_b.py' > "$T/force-local.txt"; rc=$(run -- tests/test_b.py -q); expect "lista: última linha sem newline final" 0 "$rc"
+hasnt "lista sem newline final: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "lista sem newline final: motivo" "$LOG" 'lista-local:tests/test_b.py'
+reset; printf '# c\r\ntests/test_b.py\r\n' > "$T/force-local.txt"; rc=$(run -- tests/test_b.py -q); expect "lista: linhas CRLF" 0 "$rc"; hasnt "lista CRLF: sem MBP" "$STUB_LOG" 'MBP_CALL'
+reset; printf '   tests/test_b.py  \n' > "$T/force-local.txt"; rc=$(run -- tests/test_b.py -q); expect "lista: espaço sobrando em volta" 0 "$rc"; hasnt "lista com espaço: sem MBP" "$STUB_LOG" 'MBP_CALL'
+reset; printf 'tests/test_a.py\ntests/test_zzz.py' > "$T/force-local.txt"; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_b.py -q); expect "lista sem newline: o que não casa continua indo ao MBP" 0 "$rc"; has "lista sem newline: o outro alvo vai ao MBP" "$STUB_LOG" 'MBP_CALL'
 reset; rc=$(run -- tests -q); expect "diretório como alvo" 0 "$rc"; hasnt "diretório: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "diretório: motivo" "$LOG" 'alvo-diretorio'
 reset; rc=$(run -- -q); expect "sem alvo" 0 "$rc"; has "sem alvo: motivo" "$LOG" 'sem-alvo-arquivo'
 reset; rc=$(run -- tests/test_a.py --junitxml=/tmp/x.xml); expect "flag de disco local" 0 "$rc"; has "junitxml: motivo" "$LOG" 'flag-local:--junitxml'
@@ -160,6 +186,13 @@ reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_a.py::TestX::test_y -q
 # 9 uso errado
 reset; rc=$("$GP" --dir "$T/wt" >"$T/out" 2>"$T/err"; echo $?); expect "sem argumentos do pytest" 4 "$rc"
 rc=$("$GP" --dir "$T/nao-existe" -- tests/test_a.py >"$T/out" 2>"$T/err"; echo $?); expect "--dir inexistente" 4 "$rc"
+has "--dir inexistente: a mensagem diz QUAL diretório" "$T/out" 'nao-existe'
+# --dir / --repo como ÚLTIMO argumento (sem valor): uso errado (4), não um laço sem fim que prende a chamada do revisor até o teto de 600 s
+run_bounded() { "$@" >"$T/out" 2>"$T/err" & local p=$! i=0; while kill -0 $p 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+  if kill -0 $p 2>/dev/null; then kill -9 $p 2>/dev/null; wait $p 2>/dev/null; echo 124; else wait $p; echo $?; fi; }
+rc=$(run_bounded "$GP" --dir); expect "--dir sem valor: uso errado, não trava" 4 "$rc"
+rc=$(run_bounded "$GP" --repo); expect "--repo sem valor: uso errado, não trava" 4 "$rc"
+rc=$(run_bounded "$GP" --dir "$T/wt" --repo); expect "--repo sem valor depois de um --dir bom" 4 "$rc"
 
 # 10 sessão no log
 reset; mbp_out "1 passed in 0.1s"; GC_SESSION_NAME=gate-reviewer-xyz run -- tests/test_a.py -q >/dev/null

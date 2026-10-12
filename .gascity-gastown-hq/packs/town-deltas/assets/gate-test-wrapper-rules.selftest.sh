@@ -42,6 +42,8 @@ check "cita o caminho do wrapper da cidade" "$(has "\"$C/scripts/gate-pytest.sh\
 check "pede para copiar a linha final no veredito" "$(has "gate-pytest: ran=mbp rc=0 secs=11" "$PARA")"
 check "diz para passar arquivos, nunca diretório" "$(has "never a directory" "$PARA")"
 check "diz que o resultado de aqui é o que vale" "$(has "the result from here is the one that counts" "$PARA")"
+check "diz que o vermelho que passa isolado roda o comando inteiro aqui (-x / pulado não somem)" "$(has "when the failed tests pass alone here the whole command is run here as well" "$PARA")"
+check "não promete que tudo o que o wrapper imprime é confiável" "$([ "$(has "safe to believe" "$PARA")" = 0 ] && echo 1 || echo 0)"
 APOS=$(printf '%s' "$PARA" | tr -cd "'" | wc -c | tr -d ' ')
 check "sem apóstrofo (o texto do prompt não pode ter: ga-6aj348)" "$([ "$APOS" = 0 ] && echo 1 || echo 0)"
 

@@ -21,8 +21,12 @@
 # EM QUE RESULTADO O REVISOR PODE ACREDITAR: só em verde do MBP. O MBP não tem shared/data, nem .env, nem o python3 do mini, então
 #   um vermelho (ou um teste pulado) lá pode ser do AMBIENTE e não do código — dois estados que o veredito não pode confundir.
 #   • rc 0 e nada pulado  → vale o MBP.
-#   • rc 0 com testes pulados → os ARQUIVOS que pularam rodam aqui de novo (um skip por dado ausente não pode virar "passou").
-#   • rc 1 (falhou)       → SÓ os node ids que falharam rodam aqui de novo; o resultado de lá é o que vale (e é dito).
+#   • rc 0 com testes pulados → os ARQUIVOS que pularam rodam aqui de novo e o rc DAQUI vale (um skip por dado ausente não pode virar "passou").
+#   • rc 1 (falhou)       → SÓ os node ids que falharam rodam aqui primeiro:
+#       reprovam aqui também → vale esse rc 1 (a linha final diz `local-confirmou`);
+#       PASSAM aqui isolados → isso NÃO prova que o vermelho era do ambiente (um -x/--maxfail parou o MBP no 1º vermelho e o resto nunca
+#         rodou; falha de ordem ou flake; arquivo que pulou nessa mesma execução) → o comando inteiro roda aqui e o rc DELE vale (a linha
+#         final diz `isolado-passou;inteiro-rc=N`). Só um vermelho que some também no comando inteiro daqui termina em rc 0.
 #   • rc 1 sem ids legíveis, mais de 50 reprovados, ou ids que não se reconhecem aqui (rc 4/5) → o comando inteiro roda aqui.
 #   • qualquer outro rc, ou MBP caiu no meio → o comando inteiro roda aqui.
 #   • DIVISÃO: o que não pode ir ao MBP (lê shared/data em linha de código, está na lista force-local) roda aqui, SEPARADO, e o que
@@ -54,14 +58,16 @@ usage() { sed -n '2,/^set -o pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//';
 dir="$PWD"; repo=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dir) dir="${2:-}"; shift 2 ;;
-    --repo) repo="${2:-}"; shift 2 ;;
+    # sem valor (a opção é o ÚLTIMO argumento) o `shift 2` falha e não anda: o laço girava até o teto de 600 s do revisor. Uso errado = 4.
+    --dir)  [ $# -ge 2 ] || { say "uso: --dir precisa de um valor"; exit 4; }; dir="$2"; shift 2 ;;
+    --repo) [ $# -ge 2 ] || { say "uso: --repo precisa de um valor"; exit 4; }; repo="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     *) break ;;
   esac
 done
-dir=$(cd "$dir" 2>/dev/null && pwd -P) || { say "uso: --dir '${dir}' não é um diretório"; exit 4; }
+dir_arg="$dir"   # a mensagem abaixo cita o que o revisor passou: `dir=$(...)` falhando deixa dir VAZIO antes do `||` ler
+dir=$(cd "$dir_arg" 2>/dev/null && pwd -P) || { say "uso: --dir '${dir_arg}' não é um diretório"; exit 4; }
 [ $# -gt 0 ] || { say "faltam os argumentos do pytest (use -- tests/test_x.py)"; exit 4; }
 
 # ---- separa FLAGS de ALVOS --------------------------------------------------------------------------------------------
@@ -139,8 +145,11 @@ if [ -z "$LOCAL_REASON" ]; then
     f="${t%%::*}"; why=""
     # Ler a lista: vazio (arquivo sem linhas) → nenhum glob casa; falhou/ilegível (não abre) → a lista não vale e o alvo segue o
     #   caminho normal (ela só poupa uma ida e volta; o vermelho/pulado do MBP é conferido aqui de qualquer jeito).
+    #   A lista é o remédio do verde vazio (runbook), então uma lista mal salva não pode virar letra morta em silêncio: a última linha sem
+    #   newline ainda conta (`|| [ -n "$g" ]`), e CRLF ou espaço em volta são aparados antes de comparar.
     if [ -r "$FORCE_LOCAL_LIST" ]; then
-      while IFS= read -r g; do
+      while IFS= read -r g || [ -n "$g" ]; do
+        g=${g#"${g%%[![:space:]]*}"}; g=${g%"${g##*[![:space:]]}"}
         case "$g" in ''|'#'*) continue ;; esac
         # shellcheck disable=SC2254
         case "$f" in $g) why="lista-local:$g"; break ;; esac
@@ -242,7 +251,7 @@ EOF
         say "$nids testes reprovaram no MBP — confirmar um a um não compensa; o comando inteiro roda aqui"
         DETAIL="mbp-vermelho:$nids;muitos"; run_local_mbp_part "$@"; RC=$?
       elif [ "$nids" -gt 0 ]; then
-        say "o MBP reprovou $nids teste(s) — vermelho do MBP pode ser do ambiente de lá; os node ids que falharam rodam aqui, e o resultado daqui é o que vale"
+        say "o MBP reprovou $nids teste(s) — vermelho do MBP pode ser do ambiente de lá; os node ids que falharam rodam aqui primeiro"
         while IFS= read -r id; do [ -n "$id" ] && conf+=("$id"); done <<EOF
 $ids
 EOF
@@ -250,8 +259,14 @@ EOF
         case "$RC" in
           4|5) say "os node ids do MBP não se reconhecem aqui (rc=$RC) — o comando inteiro roda aqui"
                DETAIL="mbp-vermelho:$nids;ids-ilegiveis"; run_local_mbp_part "$@"; RC=$? ;;
-          0) DETAIL="mbp-vermelho:$nids;local-NAO-confirmou"
-             say "AVISO: $nids teste(s) reprovaram no MBP e PASSARAM aqui — vale o daqui (rc=0); a diferença é de ambiente" ;;
+          # Passar isolado aqui NÃO prova que o vermelho era do ambiente, e não dá para saber qual destas foi:
+          #   • -x/--maxfail: o MBP parou no 1º vermelho, então o que vinha depois nunca rodou em lugar nenhum;
+          #   • falha que depende de ordem, ou flake: passa sozinha e reprova na execução inteira;
+          #   • teste PULADO nesta mesma execução: o vermelho e o pulado andam juntos (faltam dado e .env), e o arquivo que pulou nunca rodou aqui.
+          #   "Não sei" não vira verde: o comando inteiro roda aqui (o que o revisor rodava antes do wrapper) e o rc DELE é o que vale.
+          0) say "AVISO: $nids teste(s) reprovaram no MBP e passaram aqui isolados — isso não prova que o vermelho é do ambiente (um -x/--maxfail parou o MBP no 1º vermelho; falha de ordem; teste pulado) — o comando inteiro roda aqui, e o resultado dele é o que vale"
+             run_local_mbp_part "$@"; RC=$?
+             DETAIL="mbp-vermelho:$nids;isolado-passou;inteiro-rc=$RC" ;;
           1) DETAIL="mbp-vermelho:$nids;local-confirmou" ;;
           # 2 interrompido, 3 erro interno, 137 morto por sinal...: o rc vale (não é verde), mas o aqui NÃO confirmou o vermelho
           *) DETAIL="mbp-vermelho:$nids;local-rc=$RC" ;;

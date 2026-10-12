@@ -189,6 +189,14 @@ def cmd_sessoes(n, corte, dirpath=None):
     return 0
 
 
+def seconds(e, key):
+    """Segundos de uma linha do log: número de verdade ou ValueError. Ausente, null e booleano NÃO são 0 s (bool é int em Python)."""
+    v = e.get(key)
+    if v is None or isinstance(v, bool):
+        raise ValueError(key)
+    return int(v)
+
+
 def cmd_wrapper(desde, path=None):
     path = path or os.path.join(CITY, ".gc", "logs", "gate-pytest.jsonl")
     since = epoch(desde) if desde else None
@@ -219,8 +227,8 @@ def cmd_wrapper(desde, path=None):
                 if ts < since:
                     continue
             try:
-                secs = (int(e.get("secs") or 0), int(e.get("mbp_secs") or 0), int(e.get("local_secs") or 0))
-            except (TypeError, ValueError):  # segundos que não são número: a linha não entra na soma (e é contada), nunca vira 0
+                secs = (seconds(e, "secs"), seconds(e, "mbp_secs"), seconds(e, "local_secs"))
+            except (TypeError, ValueError, OverflowError):  # segundos ausentes, null, booleano ou que não são número: a linha não entra na soma (e é contada), nunca vira 0
                 bad += 1
                 continue
             n += 1
@@ -302,7 +310,12 @@ def selftest():
         open(w2, "w").write('{"ts":"2026-10-12T10:00:00Z","session":"s","ran":"mbp","secs":10,"mbp_secs":10,"local_secs":0,"detail":""}\n'
                             'null\n[1,2]\n7\n'
                             '{"ts":"2026-10-12T10:02:00Z","session":"s","ran":"local","secs":"muito","mbp_secs":0,"local_secs":0,"detail":""}\n'
-                            '{"session":"s","ran":"local","secs":5,"mbp_secs":0,"local_secs":5,"detail":""}\n')
+                            '{"session":"s","ran":"local","secs":5,"mbp_secs":0,"local_secs":5,"detail":""}\n'
+                            # segundos que FALTAM (null, chave ausente) ou são booleano não são 0 s: a linha é contada como ilegível, não como execução
+                            '{"ts":"2026-10-12T10:03:00Z","session":"s","ran":"local","secs":null,"mbp_secs":0,"local_secs":0,"detail":""}\n'
+                            '{"ts":"2026-10-12T10:04:00Z","session":"s","ran":"local","mbp_secs":0,"local_secs":0,"detail":""}\n'
+                            '{"ts":"2026-10-12T10:05:00Z","session":"s","ran":"local","secs":true,"mbp_secs":0,"local_secs":0,"detail":""}\n'
+                            '{"ts":"2026-10-12T10:06:00Z","session":"s","ran":"local","secs":7,"mbp_secs":null,"local_secs":7,"detail":""}\n')
 
         def run_wrapper(desde):
             buf = io.StringIO()
@@ -311,9 +324,10 @@ def selftest():
             return rc, buf.getvalue()
         rc, out = run_wrapper(None)
         ok(rc == 0 and "execuções: 2 " in out and "mbp=1" in out and "local=1" in out, "wrapper: lixo não derruba e as 2 linhas boas entram")
-        ok("4 linha(s) ilegíveis" in out, "wrapper: null, lista, número e segundos de lixo são CONTADOS (4)")
+        ok("8 linha(s) ilegíveis" in out, "wrapper: null, lista, número, segundos de lixo, null, ausente, booleano e mbp_secs null são CONTADOS (8)")
+        ok("segundos: total=15 no MBP=10 aqui=5" in out, "wrapper: segundos ilegíveis não somam 0 nem entram na soma")
         rc, out = run_wrapper("2026-10-12T00:00:00Z")
-        ok(rc == 0 and "execuções: 1 " in out and "5 linha(s) ilegíveis" in out, "wrapper --desde: linha sem data é contada, não some em silêncio")
+        ok(rc == 0 and "execuções: 1 " in out and "9 linha(s) ilegíveis" in out, "wrapper --desde: linha sem data é contada, não some em silêncio")
         # `null` e `[]` não citam dispatcher_complete: irrelevantes, nem entram na conta. As duas últimas citam e não são objeto: contadas.
         evs, bad = gate_events_from_lines(['null', '[]', '{"event":"dispatcher_complete","ts":"2026-10-10T12:00:00Z","bead":"a","result":"PASS","elapsed_s":60}',
                                            '"dispatcher_complete"', '["dispatcher_complete"]'])

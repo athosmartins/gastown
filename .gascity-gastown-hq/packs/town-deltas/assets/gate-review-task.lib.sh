@@ -198,10 +198,11 @@ gate_test_wrapper_rules() {
 TEST WRAPPER (use it instead of running python3 -m pytest yourself): run test FILES through
   "$_city/scripts/gate-pytest.sh" --dir <your-worktree> -- tests/test_x.py tests/test_y.py -x -q
 It runs them on the idle MacBook Pro when that machine is healthy (heavy test files finish many times faster than on this loaded
-machine) and on this machine, exactly as before, when it is not. What it prints is safe to believe: a pass on the MacBook counts as a
-pass, but a failure or a skipped test there is always run again here first, and the result from here is the one that counts. Pass
-test files, never a directory. Run it the way you run any long test (background, poll the log). Your own mutation and reproduction
-probes go through it too: it sends the worktree as it is at that moment. Its last line reads gate-pytest: ran=mbp rc=0 secs=11 ...
+machine) and on this machine, exactly as before, when it is not. Only a clean pass on the MacBook is taken as it comes: a failure or a
+skipped test there is always run again here first, and when the failed tests pass alone here the whole command is run here as well.
+Either way the result from here is the one that counts. Pass test files, never a directory. Run it the way you run any long test
+(background, poll the log). Your own mutation and reproduction probes go through it too: it sends the worktree as it is at that
+moment. Its last line reads gate-pytest: ran=mbp rc=0 secs=11 ...
 - copy that line into the Summary of your verdict, so the gate can see where the test time went.
 WRAP
 }
