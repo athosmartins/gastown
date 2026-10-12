@@ -39,6 +39,11 @@
 # servidor precisava sair inteiro.
 set -uo pipefail
 
+# O job pós-boot (launchd com.gascity.engine-window-postboot) roda com o PATH mínimo do launchd, sem /opt/homebrew/bin:
+# o check passava (só olhava a pasta do toolchain) e o build morria em "make: go: Command not found" (11/10 23:43,
+# ga-tp5hyj). Os dois lugares onde o go mora nesta máquina entram no PATH aqui, e o check confere o go de verdade.
+export PATH="/opt/homebrew/bin:/usr/local/go/bin:$PATH"
+
 # Os caminhos abaixo aceitam override por env (defaults INALTERADOS) so para o
 # selftest poder rodar as fases num sandbox sem tocar no symlink vivo do gc.
 SRC="${ENGINE_WINDOW_SRC:-/Users/athos/gt/.local-patches/_src-hookfix}"
@@ -163,7 +168,10 @@ phase_check() {
   local want have
   want=$(awk '/^go /{print $2; exit}' "$SRC/go.mod" 2>/dev/null)
   have=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
-  if [ -d "$HOME/go/pkg/mod/golang.org/toolchain@v0.0.1-go${want}.darwin-arm64" ]; then
+  if ! command -v go >/dev/null 2>&1 || [ -z "$have" ]; then
+    log "  toolchain .... FALHOU — nao ha 'go' executavel no PATH ($PATH); o build nao roda."
+    rc=1
+  elif [ -d "$HOME/go/pkg/mod/golang.org/toolchain@v0.0.1-go${want}.darwin-arm64" ]; then
     log "  toolchain .... OK — go.mod quer $want, ja baixado (build funciona offline)"
   elif [ "$want" = "$have" ]; then
     log "  toolchain .... OK — $have"
