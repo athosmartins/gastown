@@ -25,7 +25,7 @@ scripts/mbp-offload.sh status    # estado, saúde do MBP (RAM, pressão, swap), 
 scripts/mbp-offload.sh status --json   # insumo do botão do painel (bead própria, mockup antes)
 scripts/mbp-offload.sh counts    # só a contagem de execuções e recusas por motivo das últimas 72 h (não fala com o MBP)
 ```
-Sem daemon nem launchd. O botão do painel só chama este script.
+Sem daemon; o único launchd é o reseed noturno (ver Manutenção), que respeita esta chave. O botão do painel só chama este script.
 
 ## Como usar
 ```bash
@@ -70,12 +70,18 @@ O swap usado, sozinho, NÃO recusa até o teto: o macOS não devolve swap depois
 - Log das execuções e das recusas do preflight: `$CITY/.gc/logs/mbp-run.jsonl` (ts, repo, modo, slot, rc, segundos; a recusa tem `"mode":"preflight"`, `reason` e os números que a causaram).
 
 ## Manutenção
-- Reseed noturno com hash (bead própria): `mbp-run.sh --seed wa; mbp-run.sh --seed ps`.
+- **Reseed noturno (ga-wuwuk7):** `scripts/mbp-nightly-reseed.sh`, disparado pelo launchd `com.gascity.mbp-nightly-reseed` (`scripts/com.gascity.mbp-nightly-reseed.plist`, instalado em `~/Library/LaunchAgents/`) todo dia às **05:50**: depois do rebuild das 04:45 e do restic (04:47-05:37), antes do lotes-rebuild das 06:30, longe do reboot (23:00, dreno até ~00:30). Roda `mbp-run.sh --seed wa` e `--seed ps` (rsync da base; site-packages só recopia quando o hash dos dist-info muda). Última linha do stdout: `VEREDITO: <x>`; uma linha jsonl por execução em `$CITY/.gc/logs/mbp-nightly-reseed.jsonl`; saída do launchd em `.gc/logs/mbp-nightly-reseed-launchd.{out,err}`.
+  - `OK`: os dois repos com rc 0 (o texto diz se o site-packages "já bate" ou foi recopiado).
+  - `FALHOU`: algum repo saiu com rc != 0 ou estourou o prazo (1800 s por repo). Um `notify` prio 4 nomeia o repo, o rc e o que ele quer dizer; o outro repo roda mesmo assim; exit 1. **rc 98 (MBP sem saúde) conta como FALHOU**: a base envelheceu e alguém precisa saber.
+  - `PULADO`: nada tentado por escolha, sem notify, exit 0: chave desligada (`.gc/mbp-offload.on` ausente), dreno do reboot vivo (`~/.gastown/run/city-drain.level`, linha 4 no futuro) ou outro reseed em andamento (lock `.gc/mbp-nightly-reseed.lock`).
+  - À mão: `scripts/mbp-nightly-reseed.sh` (mesmas regras); autoteste hermético: `scripts/mbp-nightly-reseed.selftest.sh`. Ver o último veredito: `tail -n 3 $CITY/.gc/logs/mbp-nightly-reseed.jsonl`.
+  - Não reseme com teste rodando no MBP (hash novo pode trocar o site-packages debaixo do teste); às 05:50 não há.
 - `rea update` no MBP só por bead que revisa o changelog (REA roda com as permissões do usuário).
 - Segredos: o MBP usa o mesmo acesso do mini (decisão do Athos, 11/10); o comando enviado nunca carrega segredo.
 
 ## Limites conhecidos
 - **Swap do MBP (resolvido em ga-9e2rjh):** o macOS não devolve o arquivo de swap depois de uma pressão; o MBP ocioso fica em 4,9-5,2 GB "usados". O limiar fixo de 5 GB recusou, em 11/10, uma execução com 5.248 MB de swap e 3,8 GB de RAM disponível. O critério agora é RAM + pressão + crescimento do swap (tabela acima), e o limiar de swap virou só um teto absoluto, que subiu de 5 para 8 GB. Medição de aceite: recusas indevidas = 0 em 3 dias. Conferir com `scripts/mbp-offload.sh counts` (ou a linha "últimas 72 h" do `status`): recusa por `swap_teto` ou `swap_cresce` com RAM e pressão normais é o sinal de que o critério precisa de ajuste; `ilegivel:*` é o MBP respondendo lixo, não swap alto. A contagem tem três respostas que não se confundem: `sem log ainda`, `ilegível` (o log existe mas não deu para ler) e `recusas: nenhuma` (lido, e sem recusa). Linha do log que não deu para ler (truncada, sem motivo, data inválida) vem avisada no fim ("N linha(s) ilegível(is) no log"): se aparecer, a contagem não está completa, então olhe o log antes de concluir "0 recusas indevidas".
+  Efeito no reseed noturno: se o preflight recusar o MBP (rc 98), o `--seed` sai 98 e a noite vira `FALHOU` com notify. É o sinal certo (a base não foi atualizada); a correção é no critério de saúde, não silenciar o reseed.
 - Teste que lê `shared/data/*.db` falha no MBP (os bancos não são enviados): o runner imprime uma nota; rode esse teste local.
 - Cada execução paga ~6 s de ssh/rsync mais o preflight (intervalo de 2 s entre as duas leituras do swap + o tempo das leituras: ~3 s medidos de relógio); testes de menos de ~10 s não valiam o offload e agora valem menos ainda.
 - A linha "MBP SEM SAÚDE (rc=98)" do `status` mostra só os pares `chave=valor` crus; o MOTIVO (`ram`, `swap_cresce`...) só aparece para recusas de execuções reais, que vão para o log (`mbp-offload.sh counts` e as últimas linhas do `status`); o `--check` que o `status` roda não grava recusa, então para ver "por que agora?" leia os pares `chave=valor` contra a tabela acima.

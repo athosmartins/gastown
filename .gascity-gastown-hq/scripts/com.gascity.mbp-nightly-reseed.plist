@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.mbp-nightly-reseed</string>
+
+  <!-- Reseed noturno da arvore-base e do site-packages do MBP (ga-wuwuk7, epico ga-sokx7u):
+       mbp-run.sh --seed wa e --seed ps, com veredito OK/FALHOU/PULADO no stdout e em
+       .gc/logs/mbp-nightly-reseed.jsonl, e notify quando falha. Chave do offload desligada
+       (.gc/mbp-offload.on ausente) = PULADO, sem notify.
+
+       Horario 05:50, todo dia: depois do rebuild do engine das 04:45 e do que pesa o mini
+       entre 04:47 e 05:37 (restic backup 04:47, check 05:13, restore-test 05:37), antes do
+       lotes-rebuild das 06:30, e longe da janela do reboot noturno (23:00, dreno ate ~00:30).
+       RunAtLoad false: instalar ou relogar nao semeia; so o relogio dispara.
+
+       O comando e um guard, nao o script direto: o plist pode ser carregado antes do merge
+       do script (o PRESENCE-DRIFT do daemon-presence-watchdog alarma plist de scripts/ nao
+       carregado). Sem o script, o disparo avisa em vez de falhar em silencio. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>S=/Users/athos/gt/.gascity-gastown-hq/scripts/mbp-nightly-reseed.sh; if [ -f "$S" ]; then exec /bin/bash "$S"; fi; "$HOME/.local/bin/notify" -t "MBP reseed noturno: job falhou (script ausente)" -p 3 "mbp-nightly-reseed.sh nao existe em $S"; exit 2</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>5</integer>
+    <key>Minute</key><integer>50</integer>
+  </dict>
+
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/mbp-nightly-reseed-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/mbp-nightly-reseed-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>
