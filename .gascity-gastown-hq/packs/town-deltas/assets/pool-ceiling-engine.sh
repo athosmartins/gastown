@@ -5,8 +5,10 @@
 #
 # THE FRAGMENT: $GC_CITY/.gc/pool-ceiling-engine.toml — generated, untracked, included once by city.toml. This script is its ONLY writer.
 #   - written atomically (tmp + mv); only [[patches.agent]] dir/name/max_active_sessions, only allowlisted pools;
-#   - it must ALWAYS EXIST once city.toml includes it (absent = config LOAD ERROR, ga-m9x0lb.1): the kill switch EMPTIES it
-#     (comment-only = no override) and nothing here ever deletes it;
+#   - it must ALWAYS EXIST once city.toml includes it (absent = config LOAD ERROR, ga-m9x0lb.1): the kill switch EMPTIES it (comment-only = no
+#     override) and the path is never deleted - but the load-error experiment on a FOREIGN fragment (step 10) renames it aside for an instant (the EMPTY
+#     file takes its place; the aside copy is then dropped if it was the cause, else put back byte for byte); an engine killed in that instant leaves the
+#     path absent, and the next sweep re-creates it EMPTY first (pce_repair_missing_fragment);
 #   - the "fixed" value of every pool is `git show HEAD:agents/<pool>/agent.toml`, never the working tree nor a dispatcher's state.
 #
 # THE RULE (Athos 03/10): wa-worker 3 by default, 2 when swap used > 6 GB OR free disk < 6 GB, back to 3 only after 2 SWEEPS with swap <= 6 GB
@@ -209,6 +211,7 @@ pce_fragment_parse() {
 
 _pce_bounded() { # <secs> cmd... — runs under timeout/gtimeout; rc 127 when neither exists (callers treat that as unreadable)
   local s="$1"; shift
+  _pce_lock_renew
   if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"
   else return 127; fi
@@ -303,6 +306,7 @@ pce_clear_condition() { [ "$PCE_DRY" = "1" ] || rm -f "$PCE_STATE/last-condition
 pce_notify() {
   [ "$PCE_DRY" = "1" ] && return 0
   command -v "$PCE_NOTIFY" >/dev/null 2>&1 || [ -x "$PCE_NOTIFY" ] || return 0
+  _pce_lock_renew
   if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
     _pce_bounded 20 "$PCE_NOTIFY" -t 'pool-ceiling-engine' -p 4 "$1" >/dev/null 2>&1 || true
   else
@@ -317,6 +321,9 @@ pce_notify() {
 _pce_lock_age() { local mt; mt=$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo ""); [ -n "$mt" ] || { pce_log "event=lock-age-unreadable" "path=$1" "effect=read as fresh: the lock is respected"; echo 0; return 0; }; echo $(( $(date +%s) - mt )); }
 _pce_lock_dead() { local pid; pid=$(head -n1 "$PCE_LOCK_HB" 2>/dev/null | cut -d: -f1 || true); case "$pid" in ''|*[!0-9]*) return 1 ;; esac; kill -0 "$pid" 2>/dev/null && return 1; return 0; }
 _pce_lock_hb() { printf '%s\n' "$PCE_LOCK_TOKEN" > "$PCE_LOCK_HB" 2>/dev/null || true; }
+# _pce_lock_renew — re-stamp the heartbeat before every slow step (each bounded gc call, each notify): a sweep that outlives PCE_LOCK_TTL is reaped even with a live PID.
+# vazio / falhou / ilegível (the heartbeat is not ours: a dry run, the lock-free .off path, a lock reaped meanwhile) -> NOT touched: our token over another holder's would break its release.
+_pce_lock_renew() { [ "$(head -n1 "$PCE_LOCK_HB" 2>/dev/null || true)" = "$PCE_LOCK_TOKEN" ] && _pce_lock_hb; return 0; }
 pce_lock_release() {
   [ "$(head -n1 "$PCE_LOCK_HB" 2>/dev/null || true)" = "$PCE_LOCK_TOKEN" ] || return 0
   rm -f "$PCE_LOCK_HB" 2>/dev/null; rmdir "$PCE_LOCK_DIR" 2>/dev/null; return 0
@@ -470,11 +477,19 @@ pce_repair_missing_fragment() {
   return 0
 }
 
-# _pce_gate_failed <reason> — a gate in front of the sweep failed (clock, state dir, lock): nothing is raised or lowered, but the KILL SWITCH never waits for a gate: emptying is idempotent, so under .off it runs here,
-# lock-free (_pce_sweep_locked with has_off=1 does ONLY that). A lock that could not be TAKEN is an error, not a live holder. vazio (no lock-error marker) -> a NEW episode: logged + notified once; a taken lock clears it; falhou/ilegível (marker unwritable) -> every sweep reports.
+# _pce_gate_failed <reason> — a gate in front of the sweep failed (clock-unreadable, state-dir-unwritable, lock-error): nothing is raised or lowered, but the KILL SWITCH never waits for a gate: emptying is idempotent, so
+# under .off it runs here, lock-free (_pce_sweep_locked with has_off=1 does ONLY that). A lock that could not be TAKEN is an error, not a live holder. vazio (no $PCE_STATE/<reason> marker) -> a NEW episode: logged + notified once;
+# the gate passing again clears it; falhou/ilegível (the marker cannot be written - for state-dir-unwritable it is the very dir that failed) -> every sweep reports, noisy but never silent. A dry run and a DISABLED engine
+# (neither .on nor .off) only log: no marker, no notification.
 _pce_gate_failed() {
-  if [ "$1" != "lock-error" ]; then pce_log "event=skip" "reason=$1"
-  elif [ ! -e "$PCE_STATE/lock-error" ]; then : > "$PCE_STATE/lock-error" 2>/dev/null; pce_log "event=lock-error" "reason=no lock dir could be made, or its heartbeat could not be written, and no live run holds it: this sweep does not run"; pce_notify "pool-ceiling-engine: cannot take its lock ($PCE_LOCK_DIR) and nobody holds it - sweeps are NOT running (disk full / permissions under $PCE_STATE?)"; fi
+  if [ "$PCE_DRY" = "1" ] || { [ ! -e "$PCE_ON_FILE" ] && [ ! -e "$PCE_OFF_FILE" ]; }; then pce_log "event=skip" "reason=$1"
+  elif [ ! -e "$PCE_STATE/$1" ]; then
+    mkdir -p "$PCE_STATE" 2>/dev/null; : > "$PCE_STATE/$1" 2>/dev/null
+    case "$1" in
+      lock-error) pce_log "event=lock-error" "reason=no lock dir could be made, or its heartbeat could not be written, and no live run holds it: this sweep does not run"; pce_notify "pool-ceiling-engine: cannot take its lock ($PCE_LOCK_DIR) and nobody holds it - sweeps are NOT running (disk full / permissions under $PCE_STATE?)" ;;
+      *) pce_log "event=skip" "reason=$1" "effect=this sweep does not run"; pce_notify "pool-ceiling-engine: sweeps are NOT running ($1: $([ "$1" = "clock-unreadable" ] && echo "date gave no usable time" || echo "$PCE_STATE cannot be created - disk full / permissions under $PCE_CITY/.gc?"))" ;;
+    esac
+  fi
   [ ! -e "$PCE_OFF_FILE" ] || _pce_sweep_locked "?" 1
   return 0
 }
@@ -484,6 +499,7 @@ pce_sweep() {
   PCE_NOW=$(_pce_now)
   [ -e "$PCE_OFF_FILE" ] || pce_repair_missing_fragment   # FIRST: no early exit below (clock, state dir, lock, date, trip, disabled) may leave an ABSENT fragment unrepaired - except with .off: its restore creates the file, and a failing clock / state-dir / lock gate still runs it (_pce_gate_failed)
   if [ -z "$PCE_NOW" ]; then PCE_NOW="?"; _pce_gate_failed clock-unreadable; return 0; fi
+  [ "$PCE_DRY" = "1" ] || rm -f "$PCE_STATE/clock-unreadable" 2>/dev/null
 
   local has_on=0 has_off=0 include
   [ -e "$PCE_ON_FILE" ] && has_on=1; [ -e "$PCE_OFF_FILE" ] && has_off=1
@@ -494,6 +510,7 @@ pce_sweep() {
 
   if [ "$PCE_DRY" = "1" ]; then _pce_sweep_locked "$include" "$has_off"; return $?; fi
   mkdir -p "$PCE_STATE" 2>/dev/null || { _pce_gate_failed state-dir-unwritable; return 0; }
+  rm -f "$PCE_STATE/state-dir-unwritable" 2>/dev/null
   pce_lock_acquire || lrc=$?   # 1 = a LIVE run holds it: back off, silently. 2 = it could not be taken and nobody holds it: an ERROR, never "a holder"
   case "$lrc" in 0) rm -f "$PCE_STATE/lock-error" 2>/dev/null ;; 2) _pce_gate_failed lock-error; return 0 ;; *) return 0 ;; esac
   _pce_sweep_locked "$include" "$has_off"; rc=$?
@@ -690,9 +707,13 @@ _pce_sweep_locked() {
   local from_txt="${cur_map:-<committed>}"; [ "$unk" = "1" ] && from_txt="<unknown>"   # the log must not say "<committed>" for levels it could not read
   if [ "$PCE_DRY" = "1" ]; then
     local why="levels-change"
-    [ "$prc" = "1" ] && why="fragment-foreign(levels unknown: rewritten from the model, every pool from its floor)"
-    [ "$prc" = "2" ] && why="fragment-absent(would be created, empty if no level changes)"
-    [ "$prc" = "2" ] && [ "$unk" = "1" ] && why="fragment-unreadable(levels unknown: rewritten from the model, every pool from its floor)"
+    # vazio (prc 0) -> levels-change; falhou/ilegível (rc 1 foreign, rc 2 absent - or unreadable when the file exists, any other rc = the parser died) -> the reason is NAMED, never levels-change
+    case "$prc" in
+      0) ;;
+      1) why="fragment-foreign(levels unknown: rewritten from the model, every pool from its floor)" ;;
+      2) [ "$unk" = "1" ] && why="fragment-unreadable(levels unknown: rewritten from the model, every pool from its floor)" || why="fragment-absent(would be created, empty if no level changes)" ;;
+      *) why="fragment-unreadable(its parser died, rc=$prc: levels unknown: rewritten from the model, every pool from its floor)" ;;
+    esac
     pce_log "event=would-write" "from=$from_txt" "to=${dev:-<committed>}" "changed=${changed# }" "why=$why"
     return 0
   fi
@@ -717,7 +738,7 @@ _pce_sweep_locked() {
     fi
     if [ "$pfrc" -ne 0 ]; then
       pce_log_change "preflight:$pfrc:$dev" "event=preflight-failed" "rc=$pfrc" "detail=$pf" "wanted=$dev" "action=nothing-written" \
-        && { [ "$pfrc" -eq 1 ] && pce_notify "pool-ceiling-engine: not writing '$dev' - $pf (a patch for a missing agent breaks the config load)"; [ "$pfrc" -eq 3 ] && pce_notify "pool-ceiling-engine: not writing '$dev' - $pf$exp_note - needs a human"; }
+        && { [ "$pfrc" -eq 1 ] && pce_notify "pool-ceiling-engine: not writing '$dev' - $pf (a patch for a missing agent breaks the config load)"; [ "$pfrc" -eq 2 ] && pce_notify "pool-ceiling-engine: not writing '$dev' - $pf (gc config show gave no answer: timeout, or gc / jq missing) - retried every sweep, shown by 'status'"; [ "$pfrc" -eq 3 ] && pce_notify "pool-ceiling-engine: not writing '$dev' - $pf$exp_note - needs a human"; }
       return 0
     fi
   fi
@@ -768,6 +789,8 @@ pce_status() {
   elif [ -z "$lv" ]; then echo "  niveis no fragmento: (vazio: tudo no commitado)"
   else echo "  niveis no fragmento: $(printf '%s' "$lv" | tr '\n' ' ')"; fi
   [ -e "$PCE_STATE/tripped" ] && echo "DISJUNTOR ARMADO: $(tr '\n' ' ' < "$PCE_STATE/tripped")  (reset: pool-ceiling-engine.sh reset)"
+  # vazio (no last-condition file) -> nothing printed: no standing condition; falhou/ilegível (the file exists and cannot be read) -> "?" is printed, never "none". preflight:2:... = gc config show gave no answer
+  if [ -e "$PCE_STATE/last-condition" ]; then local cond; cond=$(cat "$PCE_STATE/last-condition" 2>/dev/null) || cond=""; echo "condicao em vigor (a ultima registrada no log; some quando um sweep sai limpo): ${cond:-?}"; fi
   echo "escritas hoje: $([ -n "$(_pce_date_of "$PCE_NOW")" ] && pce_daily_writes || echo '?')/$PCE_DAILY_MAX  orcamento (GC_VARIABLE_SESSION_MAX): $(pce_budget)"
   local pool C
   for pool in $PCE_POOLS; do

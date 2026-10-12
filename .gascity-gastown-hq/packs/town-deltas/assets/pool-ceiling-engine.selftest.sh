@@ -15,11 +15,13 @@
 #
 # MUTANTS: section 22 re-runs the behavioural sections against copies of the engine with ONE rule broken each (raise without the
 # 2 sweeps, raise with swap > 6 GB, budget ignored, no read-back, unreadable read as clear, kill switch that deletes, ...). Each
-# must turn the suite RED; a mutant that does not apply (the engine text drifted) is itself a failure.
+# must turn the suite RED - and on the check written for that rule: every mutant NAMES its assertion (the EXPECT table in section 22) and counts as
+# killed only if a failing check carries that text, not just because the suite exited 1; a mutant that does not apply (the engine text drifted) is itself a failure.
 #
 # Override: POOL_CEILING_ENGINE_PATH (engine under test). PCE_ST_NO_MUTANTS=1 skips section 22 (the slow part); PCE_ST_JOBS=<n> sets how
 # many mutants run at once (default 2: the box this runs on is routinely at load 50+); PCE_ST_ONLY="7 9" runs just those sections;
-# PCE_ST_MUTANT_FILTER="no-lock dry-run-writes" runs only those mutants (the table is still validated in full).
+# PCE_ST_MUTANT_FILTER="no-lock dry-run-writes" runs only those mutants (the table is still validated in full); PCE_ST_RECORD=<file> appends "mutant<TAB>first failing check"
+# for every killed mutant (to write the name of a new one) and tolerates a mutant that names none.
 
 set -uo pipefail
 
@@ -443,6 +445,21 @@ has "$(events preflight-failed)" "rc=2" "logged as could-not-read"
 eq "$([ -e "$C/.gc/pool-ceiling-engine/tripped" ] && echo trip || echo none)" "none" "a failed preflight is not a trip: nothing was written"
 eng_quiet $((T0 + 600)) 4000 11264
 eq "$(levels)" "wa-worker=3" "gc back: the pending raise lands at the next sweep"
+# A preflight that gets NO ANSWER (rc 2: gc config show timed out, jq or gc missing) used to leave a deduplicated LOG line and nothing else, while rc 1 and rc 3 notified (ga-m9x0lb.2.3, item 2):
+# a persistent rc 2 is an engine that can never write - it cannot lower under pressure - and nobody was told, and 'status' showed nothing either.
+npf2() { grep -c 'gc config show gave no answer' "$TMPROOT/notify.log" | tr -d ' '; }
+mk_city s14c2
+eng_quiet "$T0" 4000 11264; eng_quiet $((T0 + 300)) 4000 11264 FAKE_GC_MODE=fail; eng_quiet $((T0 + 600)) 4000 11264 FAKE_GC_MODE=fail; eng_quiet $((T0 + 900)) 4000 11264 FAKE_GC_MODE=fail
+eq "$(levels)/$(npf2)" "/1" "gc gives no answer to the preflight (rc 2) over 3 sweeps: nothing written and ONE notification per episode (it used to be log only)"
+has "$(grep 'gc config show gave no answer' "$TMPROOT/notify.log")" "wa-worker=3" "the notification names what was not written"
+has "$(ENG_CMD=status eng $((T0 + 950)) 4000 11264)" "preflight:2:wa-worker=3" "status shows the standing condition while it lasts (a persistent rc 2 is no longer visible only in the log)"
+eng_quiet $((T0 + 1200)) 4000 11264
+eq "$(levels)/$(npf2)" "wa-worker=3/1" "gc answers again: the raise lands, and recovery is not another notification"
+hasnt "$(ENG_CMD=status eng $((T0 + 1250)) 4000 11264)" "condicao em vigor" "a sweep that ends clean takes the condition off status again"
+# an unreadable condition file is not 'no condition': status prints '?' (three states: there is one / there is none / cannot tell)
+mkdir -p "$C/.gc/pool-ceiling-engine"; printf 'preflight:2:x\n' > "$C/.gc/pool-ceiling-engine/last-condition"; chmod 000 "$C/.gc/pool-ceiling-engine/last-condition"
+out="$(ENG_CMD=status eng $((T0 + 1300)) 4000 11264)"; chmod 644 "$C/.gc/pool-ceiling-engine/last-condition"
+has "$out" "sai limpo): ?" "a condition file that EXISTS but cannot be read: status prints '?', never silence and never 'none'"
 mk_city s14d
 mkdir -p "$C/agents/ghost-worker"; printf 'max_active_sessions = 2\n' > "$C/agents/ghost-worker/agent.toml"
 ( cd "$C" && git add agents && git -c user.email=t@t -c user.name=t commit -q -m ghost ) >/dev/null 2>&1
@@ -716,6 +733,19 @@ for ar in 137 127; do
   eng_quiet $((T0 + 600)) 4000 7000
   eq "$(resolved gate-reviewer)/$(levels)" "2/gate-reviewer=2" "the parser healthy again, still in the band: still 2 (the read is a reading, not a raise)"
 done
+# The PLAN (dry run) names the same reasons (ga-m9x0lb.2.3, item 6): a parser that died used to read "levels-change" in the plan's why= while the active mode logged fragment-foreign prc=<rc>. Only the text of the
+# dry run was wrong - the levels were already treated as UNKNOWN - but a plan is what an operator reads before the first .on.
+for ar in 137 127; do
+  mk_city "s16w$ar"; eng_quiet "$T0" 7000 11264
+  out="$(ENG_CMD=plan eng $((T0 + 300)) 4000 7000 PATH="$TMPROOT/awkx:$PATH" AWK_SHIM_RC="$ar")"
+  has "$out" "why=fragment-unreadable(its parser died, rc=$ar" "the PLAN over a fragment whose parser exits $ar names the reason (the parser died: levels unknown)"
+  hasnt "$out" "why=levels-change" "and does not call it a plain level change"
+done
+mk_city s16w2; eng_quiet "$T0" 7000 11264; chmod 000 "$C/.gc/pool-ceiling-engine.toml"
+out="$(ENG_CMD=plan eng $((T0 + 300)) 4000 7000)"; chmod 644 "$C/.gc/pool-ceiling-engine.toml"
+has "$out" "why=fragment-unreadable(levels unknown" "the PLAN over a fragment that EXISTS but cannot be read says unreadable, not absent"
+rm -f "$C/.gc/pool-ceiling-engine.toml"; out="$(ENG_CMD=plan eng $((T0 + 300)) 4000 7000)"
+has "$out" "why=fragment-absent(would be created" "and over an ABSENT one says absent"
 mk_city s16a0; eng_quiet "$T0" 7000 11264; rm -f "$C/.gc/pool-ceiling-engine.toml"; blk; eng_quiet $((T0 + 300)) 4000 7000; unblk
 has "$(events fragment-absent)" "fragment-absent" "control: a fragment that is really ABSENT (and cannot be re-created) is still read as absent - the file is the evidence, not the rc"
 # a file that BREAKS THE CONFIG LOAD cannot be preflighted (gc config show fails because of that very file): it is the suspect, emptied first, then the model is written
@@ -850,6 +880,30 @@ eng_quiet "" 4000 11264 "PATH=$TMPROOT/noclock16:$PATH"
 eq "$(levels)" "" ".off + a raised fragment + the CLOCK unreadable: EMPTIED all the same"
 eq "$([ -e "$C/.gc/pool-ceiling-engine/daily" ] && echo counter || echo none)" "none" "and that emptying, which cannot be dated, wrote no daily counter (an empty date would read as at-the-limit for ever)"
 has "$(events skip)" "clock-unreadable" "and the sweep still says why it stopped"
+# A gate that fails while the engine is ENABLED means it is NOT sweeping - it cannot lower under pressure - and the clock / state-dir gates used to leave only an event=skip line every sweep (ga-m9x0lb.2.3, item 1).
+# Same rule as lock-error: ONE notification per episode (a marker under the state dir), the gate passing again ends it; a marker that cannot be written (for the state dir it is the very dir that failed) reports
+# EVERY sweep - noisy, never silent. A plan and a DISABLED engine only log.
+ngate() { grep -c "sweeps are NOT running ($1" "$TMPROOT/notify.log" | tr -d ' '; }
+gmark() { [ -e "$C/.gc/pool-ceiling-engine/$1" ] && echo marker || echo none; }
+mk_city s16z1
+for i in 1 2 3; do eng_quiet "" 7000 11264 "PATH=$TMPROOT/noclock16:$PATH"; done
+eq "$(ngate clock-unreadable)/$(gmark clock-unreadable)" "1/marker" "an ENABLED engine whose clock cannot be read, 3 sweeps (swap 7000: it should be lowering): ONE notification and the episode marker"
+has "$(events skip)" "reason=clock-unreadable" "and the log still says why"
+eng_quiet "$T0" 7000 11264
+eq "$(gmark clock-unreadable)/$(levels)" "none/gate-reviewer=2" "the clock readable again ends the episode, and the sweep that follows works (gate-reviewer lowered)"
+eng_quiet "" 7000 11264 "PATH=$TMPROOT/noclock16:$PATH"
+eq "$(ngate clock-unreadable)" "2" "a NEW clock episode is reported again"
+mk_city s16z2; chmod 555 "$C/.gc"   # no state dir, no logs dir, and none can be made
+for i in 1 2 3; do eng_quiet $((T0 + i * 300)) 7000 11264; done; chmod 755 "$C/.gc"
+eq "$(ngate state-dir-unwritable)/$(levels)" "3/" "an ENABLED engine whose state dir cannot be made (.gc read-only, no .gc/logs), swap 7000: NOTIFIED - every sweep, because the marker has nowhere to live - and nothing written"
+mk_city s16z3; rm -f "$C/.gc/pool-ceiling-engine.on"
+eng_quiet "" 7000 11264 "PATH=$TMPROOT/noclock16:$PATH"
+eq "$(ngate clock-unreadable)/$(gmark clock-unreadable)" "0/none" "a DISABLED engine (neither .on nor .off) with a failing clock: no notification, no marker"
+has "$(events skip)" "reason=clock-unreadable" "(it still logs the skip)"
+mk_city s16z4
+out="$(ENG_CMD=plan eng "" 7000 11264 "PATH=$TMPROOT/noclock16:$PATH")"
+has "$out" "reason=clock-unreadable" "a PLAN over an unreadable clock says why"
+eq "$(ngate clock-unreadable)/$(gmark clock-unreadable)" "0/none" "and neither notifies nor leaves the episode marker"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -903,6 +957,45 @@ chmod 644 "$LD/heartbeat"
 eq "$(nevents sweep)" "0" "a stale lock is reclaimed only when OUR heartbeat lands: the dead holder's old content is not ours - no sweep runs"
 eq "$(nevents lock-error)" "1" "...and that is an ERROR, not 'a live holder'"
 rm -f "$LD/heartbeat" 2>/dev/null; rmdir "$LD" 2>/dev/null
+# A sweep's slow steps - each bounded `gc config show` (up to 60 s) and each notification (up to 20 s) - can add up to more than the lock's TTL, and a lock whose heartbeat is older than the TTL is reaped EVEN WITH A LIVE
+# PID: a second run then sweeps at the same time. The heartbeat is re-stamped before every such step (ga-m9x0lb.2.3, item 3) - and only when it is OURS: a dry run, the lock-free .off path, or a lock reaped meanwhile holds
+# somebody else's (or no) heartbeat, and writing our token over it would break that holder's release.
+hb_probe() { # <ours|foreign|none> <bounded|notify|notify-unbounded> — the heartbeat aged to 2020, then ONE slow step: was it re-stamped, and is its content still what it was?
+  # notify-unbounded = a notification on a box with no timeout / gtimeout: pce_notify then does NOT go through _pce_bounded, so its own renewal is the only one (with timeout the bounded call renews too, and hides it)
+  ( export POOL_CEILING_ENGINE_CITY="$C" POOL_CEILING_ENGINE_LIB="$LIB" POOL_CEILING_ENGINE_NOTIFY="$NOTIFY"; pce_init
+    mkdir -p "$PCE_LOCK_DIR"; want_c=""
+    case "$1" in ours) want_c="$PCE_LOCK_TOKEN" ;; foreign) want_c="99999:other" ;; esac
+    [ -z "$want_c" ] || { printf '%s\n' "$want_c" > "$PCE_LOCK_HB"; touch -t 202001010000 "$PCE_LOCK_HB"; }
+    case "$2" in bounded) _pce_bounded 5 true ;; notify) pce_notify "heartbeat probe" ;; notify-unbounded) PATH="$TMPROOT/nobound-bin" pce_notify "heartbeat probe" ;; esac
+    if [ ! -e "$PCE_LOCK_HB" ]; then echo "absent"; exit 0; fi
+    age=$(( $(date +%s) - $(stat -f %m "$PCE_LOCK_HB") )); got=$(head -n1 "$PCE_LOCK_HB")
+    echo "$([ "$age" -lt 120 ] && echo renewed || echo old)/$([ "$got" = "$want_c" ] && echo same-content || echo CONTENT-CHANGED)" )
+}
+mk_city s17h
+eq "$(hb_probe ours bounded)" "renewed/same-content" "OUR heartbeat, aged past the TTL, is re-stamped before a bounded step (a gc call)"
+eq "$(hb_probe ours notify)" "renewed/same-content" "...and before a notification"
+mkdir -p "$TMPROOT/nobound-bin"; ln -sf "$(command -v head)" "$TMPROOT/nobound-bin/head"
+eq "$(PATH="$TMPROOT/nobound-bin" command -v timeout gtimeout 2>/dev/null || true)" "" "(the probe's PATH really has neither timeout nor gtimeout - that is the condition under test)"
+eq "$(hb_probe ours notify-unbounded)" "renewed/same-content" "...and before a notification on a box with no timeout (pce_notify's own renewal: nothing bounded renews for it)"
+eq "$(hb_probe foreign bounded)/$(hb_probe foreign notify)" "old/same-content/old/same-content" "a heartbeat that is another holder's is NOT touched (not its mtime, not its content)"
+rm -f "$C/.gc/pool-ceiling-engine/lock.d/heartbeat"
+eq "$(hb_probe none bounded)/$(hb_probe none notify)" "absent/absent" "and with no heartbeat at all none is created (a renewal is never an acquire)"
+# end to end: a gc whose FIRST call ages the heartbeat to 2020 (a step that outlived the TTL) and whose SECOND call starts a peer run (a sweep with a raise pending makes exactly two: the preflight, then the read-back)
+mkdir -p "$TMPROOT/slowgc"
+cat > "$TMPROOT/slowgc/gc" <<'SLOWGC'
+#!/bin/bash
+n=$(cat "$HB_SHIM_COUNT" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$HB_SHIM_COUNT"
+[ "$n" = "1" ] && touch -t 202001010000 "$HB_SHIM_LOCK/heartbeat"
+[ "$n" = "2" ] && "$HB_SHIM_BASH" "$HB_SHIM_ENGINE" run >/dev/null 2>&1
+exec "$HB_SHIM_GC" "$@"
+SLOWGC
+chmod +x "$TMPROOT/slowgc/gc"
+mk_city s17i; : > "$TMPROOT/hb.count"
+eng_quiet "$T0" 4000 11264
+eng_quiet $((T0 + 300)) 4000 11264 POOL_CEILING_ENGINE_GC="$TMPROOT/slowgc/gc" HB_SHIM_COUNT="$TMPROOT/hb.count" HB_SHIM_LOCK="$C/.gc/pool-ceiling-engine/lock.d" HB_SHIM_BASH="$ENGBASH" HB_SHIM_ENGINE="$ENGINE" HB_SHIM_GC="$GCBIN"
+eq "$(cat "$TMPROOT/hb.count")/$(levels)" "2/wa-worker=3" "(setup: the sweep made exactly 2 gc calls and its raise landed)"
+eq "$(nevents lock-reclaimed)" "0" "a peer run that starts after a step outlived the TTL finds a FRESH heartbeat: it backs off, it does not reap a live sweep"
+eq "$(events sweep | grep -c 'pool=wa-worker')" "2" "...so the second round is ONE run's sweep (wa-worker was swept twice in all: the first round and this one), not two at once"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1190,14 +1283,148 @@ M = [
  ("clock-gate-skips-the-kill-switch", "16", 'PCE_NOW="?"; _pce_gate_failed clock-unreadable; return 0', 'PCE_NOW="?"; pce_log "event=skip" "reason=clock-unreadable"; return 0'),
  ("state-dir-gate-skips-the-kill-switch", "16", '|| { _pce_gate_failed state-dir-unwritable; return 0; }', '|| { pce_log "event=skip" "reason=state-dir-unwritable"; return 0; }'),
  ("lock-gate-skips-the-kill-switch", "16", '2) _pce_gate_failed lock-error; return 0 ;;', '2) return 0 ;;'),
- ("lock-error-is-logged-as-a-plain-skip", "17", 'if [ "$1" != "lock-error" ]; then pce_log "event=skip"', 'if true; then pce_log "event=skip"'),
- ("lock-error-notifies-every-sweep", "17", 'elif [ ! -e "$PCE_STATE/lock-error" ]; then', 'elif true; then'),
+ ("lock-error-is-logged-as-a-plain-skip", "17", '      lock-error) pce_log "event=lock-error" "reason=', '      lock-error) pce_log "event=skip" "reason='),
+ ("lock-error-notifies-every-sweep", "17", 'elif [ ! -e "$PCE_STATE/$1" ]; then', 'elif [ "$1" = "lock-error" ] || [ ! -e "$PCE_STATE/$1" ]; then'),
  ("lock-error-episode-never-ends", "17", '0) rm -f "$PCE_STATE/lock-error" 2>/dev/null ;;', '0) ;;'),
- ("lock-error-dedup-shares-the-condition-key", "16", 'elif [ ! -e "$PCE_STATE/lock-error" ]; then : > "$PCE_STATE/lock-error" 2>/dev/null;', 'elif pce_log_change "lock-error" "event=lock-error-key"; then'),
+ ("lock-error-dedup-shares-the-condition-key", "16", 'elif [ ! -e "$PCE_STATE/$1" ]; then\n    mkdir -p "$PCE_STATE" 2>/dev/null; : > "$PCE_STATE/$1" 2>/dev/null', 'elif pce_log_change "gate:$1" "event=gate-key"; then\n    :'),
+ # ga-m9x0lb.2.3 item 1: the clock / state-dir gates are an engine that is NOT sweeping - notified once per episode, like the lock error
+ ("clock-unreadable-notifies-every-sweep", "16", 'elif [ ! -e "$PCE_STATE/$1" ]; then', 'elif [ "$1" = "clock-unreadable" ] || [ ! -e "$PCE_STATE/$1" ]; then'),
+ ("gate-failure-is-never-notified", "16", '"effect=this sweep does not run"; pce_notify "pool-ceiling-engine: sweeps are NOT running (', '"effect=this sweep does not run"; : "pool-ceiling-engine: sweeps are NOT running ('),
+ ("clock-unreadable-episode-never-ends", "16", '[ "$PCE_DRY" = "1" ] || rm -f "$PCE_STATE/clock-unreadable" 2>/dev/null', ':'),
+ ("disabled-engine-notifies-a-gate-failure", "16", 'if [ "$PCE_DRY" = "1" ] || { [ ! -e "$PCE_ON_FILE" ] && [ ! -e "$PCE_OFF_FILE" ]; }; then pce_log "event=skip" "reason=$1"', 'if [ "$PCE_DRY" = "1" ]; then pce_log "event=skip" "reason=$1"'),
+ ("plan-leaves-the-gate-marker", "16", 'if [ "$PCE_DRY" = "1" ] || { [ ! -e "$PCE_ON_FILE" ] && [ ! -e "$PCE_OFF_FILE" ]; }; then pce_log "event=skip" "reason=$1"', 'if { [ ! -e "$PCE_ON_FILE" ] && [ ! -e "$PCE_OFF_FILE" ]; }; then pce_log "event=skip" "reason=$1"'),
+ # item 2: a preflight that got no answer (rc 2) is notified once per episode and stays visible in status
+ ("preflight-rc2-is-never-notified", "14", '[ "$pfrc" -eq 2 ] && pce_notify "pool-ceiling-engine: not writing', '[ "$pfrc" -eq 2 ] && : "pool-ceiling-engine: not writing'),
+ ("status-hides-the-standing-condition", "14", 'if [ -e "$PCE_STATE/last-condition" ]; then local cond;', 'if false; then local cond;'),
+ ("status-reads-an-unreadable-condition-as-none", "14", '${cond:-?}"; fi', '${cond:-nenhuma}"; fi'),
+ # item 3: the lock heartbeat is re-stamped before every slow step, and only when it is ours
+ ("bounded-step-does-not-renew-the-heartbeat", "17", 'local s="$1"; shift\n  _pce_lock_renew\n', 'local s="$1"; shift\n'),
+ ("notification-does-not-renew-the-heartbeat", "17", '|| return 0\n  _pce_lock_renew\n', '|| return 0\n'),
+ ("renewal-writes-over-a-heartbeat-that-is-not-ours", "17", '_pce_lock_renew() { [ "$(head -n1 "$PCE_LOCK_HB" 2>/dev/null || true)" = "$PCE_LOCK_TOKEN" ] && _pce_lock_hb; return 0; }', '_pce_lock_renew() { _pce_lock_hb; return 0; }'),
+ # item 6: the plan names a parser that died, instead of reading it as a plain level change
+ ("plan-parser-died-reads-as-levels-change", "16", '*) why="fragment-unreadable(its parser died', '*) why_unused="fragment-unreadable(its parser died'),
  ("undated-emptying-writes-a-counter-with-an-empty-date", "16", '[ -n "$(_pce_date_of "$PCE_NOW")" ] || { pce_log "event=state-write-failed" "what=daily-counter"', 'true || { pce_log "event=state-write-failed" "what=daily-counter"'),
  # gate round 7: a parser rc outside {0,1,2} (awk killed / not found) read as "fragment absent" and RAISED a lowered pool: the old two-clause test that only knew rc 1 and rc 2
  ("parser-rc-outside-0-1-2-reads-as-absent", "16", 'case "$prc" in 0) ;; 2) [ -e "$PCE_FRAGMENT" ] && unk=1 ;; *) unk=1 ;; esac', 'if [ "$prc" = "1" ] || { [ "$prc" = "2" ] && [ -e "$PCE_FRAGMENT" ]; }; then unk=1; fi'),
 ]
+# mutant -> text that must appear in the message of one FAILING check of its run (ga-m9x0lb.2.3, item 5). A mutant used to count as killed whenever the suite exited 1, whichever check fired: one that dies on
+# an unrelated crash, or on a check written for another rule, proves nothing about the rule it was made to break. Every mutant names its assertion; PCE_ST_RECORD=<file> lists what each one died on (to write the name).
+EXPECT = {
+ # ga-m9x0lb.2.3 item 5: the 92 mutants that predate it, named from what each one died on (PCE_ST_RECORD harvest)
+ "raise-without-2-sweeps": "1 clear sweep is not enough",
+ "sweep-gap-ignored": "a run 10 s later is NOT a new sweep (gap < 240 s): still 1/2",
+ "raise-with-swap-over-6gb": "swap 6 GB + 1 MB -> high, whatever the disk",
+ "raise-with-disk-under-6gb": "disk 6 GB - 1 MB -> high, whatever the swap",
+ "unreadable-reads-as-clear": "swap unreadable + disk fine -> unknown, NOT clear",
+ "hysteresis-band-reads-as-clear": "disk exactly 6 GB is NOT low (the rule is < 6): hysteresis band",
+ "blind-too-long-never-restores": "blind for 3 sweeps while ABOVE committed -> back to committed",
+ "lowering-obeys-the-rate-limit": "lowering ignores the rate limit ('baixar na hora')",
+ "no-rate-limit-on-raise": "2 clear sweeps but the last write was 600 s ago (< 900 s): no raise yet",
+ "other-pools-go-above-committed": "ps-worker committed 1 -> cannot move",
+ "budget-ignored": "budget 6: raising wa-worker would make 3+1+3 = 7 > 6: cancelled, however many sweeps",
+ "budget-takes-the-larger-source": "env says 9 but the live Pilot plist says 6: the SMALLER one wins",
+ "no-readback": "controller does not apply the fragment (or a typo'd key): read-back sees 2 != 3 -> fragment EMPTIED",
+ "readback-compares-nothing": "controller does not apply the fragment (or a typo'd key): read-back sees 2 != 3 -> fragment EMPTIED",
+ "no-preflight": "gc fails the READ-BACK (call 2 of the run): the write is undone",
+ "trip-ignored": "tripped: 4 healthy clear sweeps later it is still inert",
+ "no-daily-breaker": "the 3rd write would exceed 2 per day: fragment EMPTIED instead (the safe state)",
+ "unreadable-date-reads-as-a-new-day": "pressure wants a lowering, but with the calendar date unreadable the counter cannot be read as 'today': nothing is written",
+ "kill-switch-deletes-the-fragment": "the fragment is EMPTIED, never deleted (an absent included fragment breaks the config load)",
+ "writes-without-the-include": ".on but city.toml does not include the fragment: nothing would apply it, nothing is written",
+ "cannot-tell-reads-as-included": "and it is reported as unreadable, not as 'does not include the fragment'",
+ "cannot-tell-reads-as-not-included": "logged as cannot-tell",
+ "unknown-include-not-repaired": "disabled + fragment ABSENT + include 'cannot tell': re-created (an empty file cannot hurt, an absent one may break the next reload)",
+ "parse-accepts-level-0-and-03": "level 0 -> FOREIGN",
+ "int-accepts-leading-zero": "_pce_int is a canonical decimal: 09 and 00 are not (bad octal inside $(( ))), 0 and 9 are, empty is not",
+ "missing-fragment-not-repaired": "disabled + include present + fragment ABSENT: re-created EMPTY (the one state that breaks the next reload)",
+ "trip-restores-on-every-sweep": "a trip is logged ONCE when it appears, not on every 5-minute sweep",
+ "kill-switch-clears-dedup-every-sweep": "kill switch: one 'emptied' line and one 'already empty' line, not one line per sweep",
+ "corrupt-daily-counter-reads-as-zero": "a daily counter that EXISTS but cannot be read counts as AT THE LIMIT (read as 0 it would switch the breaker off for good)",
+ "corrupt-state-reads-as-never-written": "a CORRUPT state file is not 'never written': at T0+600 the streak would be 2 and, read as 0, the rate limit would let it raise - instead it is treated as just written",
+ "state-write-failure-is-silent": "a per-pool state that cannot be written is logged (the streaks and the rate limit restart)",
+ "trip-write-failure-is-silent": "a trip that cannot be written is logged",
+ "no-lock": "a LIVE holder: the run backs off silently (no sweep, no log)",
+ "heartbeat-less-lock-never-reclaimed": "an old lock dir with NO heartbeat (crash between mkdir and the first write): reclaimed by the dir's own age, never stuck",
+ "lock-age-unreadable-reads-as-ancient": "a heartbeat whose age CANNOT be read (no usable stat) is not 'ancient': the live holder is respected",
+ "status-clock-unreadable-reads-as-epoch-zero": "status: with the clock unreadable, today's writes are '?', never a 0 dated 1970",
+ "status-writes-today-without-a-date": "status: with the clock unreadable, today's writes are '?', never a 0 dated 1970",
+ "dry-run-writes": "plan prints what it WOULD write (pressure: lower)",
+ "baseline-from-the-working-tree": "working tree says 5, HEAD says 2: the engine still works from 2 (raises to 3)",
+ "render-accepts-any-pool": "REFUSES gastown.dog (eval-window-concurrency-guard owns it; the fragment would override the guard)",
+ "render-accepts-zero": "REFUSES 0 (gc accepts it and the pool would open nothing)",
+ "status-parses-only-under-bash-5": "status: NAO for a definite 0",
+ "unknown-ceiling-reads-as-zero": "ps-worker's committed ceiling UNREADABLE, budget 6: wa-worker 3 + ps-worker ? + gate-reviewer 3 cannot be shown <= 6 - no raise, however many sweeps",
+ "paused-pool-reads-as-unknown": "ps-worker PAUSED (committed 0, a KNOWN zero): 3 + 0 + 3 = 6 <= 6, the raise lands - a pause is not 'unknown'",
+ "reset-claims-success-unchecked": "reset with an UNWRITABLE state dir: exit 1, not 0",
+ "reset-exits-0-on-failure": "reset with an UNWRITABLE state dir: exit 1, not 0",
+ "trip-with-unreadable-date-expires": "a daily trip with no date line: NOT expired, still tripped, nothing written",
+ "clear-streak-survives-any-gap": "1 clear sweep, then 5000 s of silence: the streak does NOT carry over, 1 more clear sweep is not 2",
+ "repair-after-the-date-check": "ENABLED + include=1 + fragment absent + the calendar date unreadable (the sweep ends early): the fragment is re-created EMPTY first, never left absent",
+ "repair-after-the-clock-check": "ENABLED + include=1 + fragment absent + the CLOCK unreadable: the fragment is still re-created EMPTY",
+ "repair-after-the-state-dir-and-lock": "no .on, no .off: nothing read, nothing written, no state, no log (silent and inert)",
+ "repair-never-runs-for-an-enabled-engine": "ENABLED + include 'cannot tell' + fragment ABSENT: re-created EMPTY (the state the safety net exists for), as when disabled",
+ "preflight-notifies-every-sweep": "gc gives no answer to the preflight (rc 2) over 3 sweeps: nothing written and ONE notification per episode (it used to be log only)",
+ "write-failed-notifies-every-sweep": "and notified once",
+ "daily-counter-write-failure-is-silent": "a daily counter that cannot be written is logged (the breaker may undercount)",
+ "unreadable-ceiling-entry-not-remembered": "gate-reviewer's committed ceiling becomes UNREADABLE, pressure unchanged: its entry is HELD, not dropped (dropping it re-raises 2 -> 3)",
+ "held-entry-not-rendered": "gate-reviewer's committed ceiling becomes UNREADABLE, pressure unchanged: its entry is HELD, not dropped (dropping it re-raises 2 -> 3)",
+ "paused-pool-entry-is-held": "gate-reviewer lowered to 2, then PAUSED (committed 0): its entry is dropped, the pause stands (an entry of 2 would override it)",
+ "repair-failure-is-silent": "the failed repair is LOGGED (it used to read as 'nothing to do')",
+ "repair-failure-reported-every-sweep": "and NOTIFIED",
+ "repair-success-keeps-the-failure-marker": "and the failure marker is gone with it",
+ "present-fragment-keeps-the-failure-marker": "a human put the file back: the sweep sees it present and clears the marker (a past failure is over)",
+ "repair-failure-marker-needs-an-existing-state-dir": "disabled, no state dir yet, the create fails for a reason other than .gc's mode: reported once",
+ "dry-run-clears-the-failure-marker": "plan does not clear a repair-failure marker (a dry run touches nothing, not even to say a failure is over)",
+ "plan-ignores-the-include-gate": "plan: city.toml does not include the fragment -> no write is previewed (the sweep would write nothing)",
+ "hold-log-claims-an-entry-that-is-not-there": "a pool with no entry and no readable ceiling: the log says there is NOTHING to hold",
+ "foreign-levels-read-as-none": "a fragment with a typo'd key (a hand edit or an old version) is FOREIGN: rewritten from the model, its levels UNKNOWN so every pool restarts from its floor (the block below)",
+ "foreign-restarts-from-committed-not-floor": "a fragment with a typo'd key (a hand edit or an old version) is FOREIGN: rewritten from the model, its levels UNKNOWN so every pool restarts from its floor (the block below)",
+ "unreadable-file-read-as-absent": "a fragment that EXISTS but cannot be read is not an ABSENT one: its levels are unknown too, the pool stays at 2",
+ "foreign-and-unknown-ceiling-rewritten": "fragment unreadable AND gate-reviewer's committed ceiling unreadable: the file is left as it is (a rewrite could only guess, and a drop is a raise)",
+ "foreign-notifies-every-sweep": "the same foreign file over 3 sweeps whose rewrite fails (.gc read-only): ONE notification",
+ "foreign-episode-never-ends": "a NEW foreign episode after the file was well-formed again is reported again",
+ "plan-writes-the-foreign-marker": "and writes nothing: no file, no notification marker, no notification",
+ "load-breaking-foreign-file-not-emptied": "a LOAD-BREAKING foreign file under HIGH pressure: emptied, then the pressure lowering is written - in ONE sweep, no trip",
+ "emptied-without-gc-answering": "and no experiment was even started (rc 2 is no answer): the file was never moved aside nor emptied - no restore event, no write counted",
+ "emptying-is-not-undone": "gc answers ok:false whatever the fragment says: emptying it did not help, so the foreign file is back byte for byte and no aside copy is left",
+ "emptying-kept-without-evidence": "gc answers ok:false whatever the fragment says: emptying it did not help, so the foreign file is back byte for byte and no aside copy is left",
+ "no-answer-reads-as-does-not-load": "and the log says the preflight could not read the config",
+ "readings-stored-only-when-nothing-changes": "...and the HIGH reading still reset the clear streak: the next clear sweep is 1/2",
+ "lock-error-reads-as-a-live-holder": ".off + a raised fragment + a state dir that cannot be written (no lock can be made): the fragment is EMPTIED all the same",
+ "heartbeat-that-did-not-land-reads-as-a-live-holder": ".off + a raised fragment + a lock whose heartbeat cannot be written: EMPTIED all the same",
+ "dead-holders-heartbeat-reads-as-ours": "a stale lock is reclaimed only when OUR heartbeat lands: the dead holder's old content is not ours - no sweep runs",
+ "kill-switch-waits-for-the-gates": ".off + a raised fragment + a state dir that cannot be written (no lock can be made): the fragment is EMPTIED all the same",
+ "clock-gate-skips-the-kill-switch": ".off + a raised fragment + the CLOCK unreadable: EMPTIED all the same",
+ "state-dir-gate-skips-the-kill-switch": ".off + a raised fragment + no state dir can be made: EMPTIED all the same",
+ "lock-gate-skips-the-kill-switch": ".off + a raised fragment + a state dir that cannot be written (no lock can be made): the fragment is EMPTIED all the same",
+ "lock-error-is-logged-as-a-plain-skip": "...and that is logged ONCE per episode, as an ERROR (not read as a live holder backing off silently)",
+ "lock-error-notifies-every-sweep": "...and that is logged ONCE per episode, as an ERROR (not read as a live holder backing off silently)",
+ "lock-error-episode-never-ends": "a lock that can be taken again ENDS the episode (its marker is gone)",
+ "lock-error-dedup-shares-the-condition-key": ".off + a persistent lock error over 3 sweeps: reported ONCE (the kill switch's own 'already empty' line must not re-arm it)",
+ "undated-emptying-writes-a-counter-with-an-empty-date": "and that emptying, which cannot be dated, wrote no daily counter (an empty date would read as at-the-limit for ever)",
+ "parser-rc-outside-0-1-2-reads-as-absent": "a parser that exits 137 on an EXISTING fragment, in the band (swap 4000, disk 7000): gate-reviewer stays lowered at 2 - not rewritten empty = raised to its committed 3",
+ # ga-m9x0lb.2.3 (the five warnings + the plan's why=)
+ "clock-unreadable-notifies-every-sweep": "an ENABLED engine whose clock cannot be read, 3 sweeps",
+ "gate-failure-is-never-notified": "an ENABLED engine whose clock cannot be read, 3 sweeps",
+ "clock-unreadable-episode-never-ends": "the clock readable again ends the episode",
+ "disabled-engine-notifies-a-gate-failure": "a DISABLED engine (neither .on nor .off) with a failing clock",
+ "plan-leaves-the-gate-marker": "and neither notifies nor leaves the episode marker",
+ "preflight-rc2-is-never-notified": "gc gives no answer to the preflight (rc 2) over 3 sweeps",
+ "status-hides-the-standing-condition": "status shows the standing condition while it lasts",
+ "status-reads-an-unreadable-condition-as-none": "a condition file that EXISTS but cannot be read",
+ "bounded-step-does-not-renew-the-heartbeat": "OUR heartbeat, aged past the TTL, is re-stamped before a bounded step",
+ "notification-does-not-renew-the-heartbeat": "...and before a notification on a box with no timeout",
+ "renewal-writes-over-a-heartbeat-that-is-not-ours": "a heartbeat that is another holder's is NOT touched",
+ "plan-parser-died-reads-as-levels-change": "the PLAN over a fragment whose parser exits",
+}
+RECORD = bool(os.environ.get("PCE_ST_RECORD"))
+unnamed = [m[0] for m in M if m[0] not in EXPECT]
+stale = [n for n in EXPECT if n not in [m[0] for m in M]]
+if not RECORD and (unnamed or stale):
+    print("BAD: every mutant must name the assertion that kills it. No expected assertion for: %s. Named but not in the table: %s" % (" ".join(unnamed) or "-", " ".join(stale) or "-")); sys.exit(3)
+for n, t in EXPECT.items():
+    if not t.strip() or "|" in t or "\n" in t:
+        print("BAD %s: the expected assertion text must be non-empty, one line, without '|'" % n); sys.exit(3)
 names = []
 for name, secs, old, new in M:
     mut = text
@@ -1208,7 +1435,7 @@ for name, secs, old, new in M:
     if mut == text:
         print("BAD %s: mutation changes nothing" % name); sys.exit(3)
     open(os.path.join(outdir, name + ".sh"), "w").write(mut)
-    names.append("%s|%s" % (name, secs))
+    names.append("%s|%s|%s" % (name, secs, EXPECT.get(name, "")))
 open(os.path.join(outdir, "index"), "w").write("\n".join(names) + "\n")
 PYEOF
 MD="$TMPROOT/mutants"; mkdir -p "$MD"
@@ -1216,19 +1443,22 @@ if ! python3 -I "$TMPROOT/mutate.py" "$ENGINE" "$MD" > "$MD/mutate.out" 2>&1; th
   bad "the mutant table does not apply to this engine: $(cat "$MD/mutate.out")"
 else
   n=0; jobs="${PCE_ST_JOBS:-2}"; started=0
-  while IFS='|' read -r mname msecs; do
+  while IFS='|' read -r mname msecs mexpect; do
     [ -n "$mname" ] || continue
     [ -z "${PCE_ST_MUTANT_FILTER:-}" ] || case " $PCE_ST_MUTANT_FILTER " in *" $mname "*) ;; *) continue ;; esac
     ( PCE_ST_MUTANT=1 PCE_ST_ONLY="$msecs" POOL_CEILING_ENGINE_PATH="$MD/$mname.sh" bash "$SELF" > "$MD/$mname.out" 2>&1; echo $? > "$MD/$mname.rc" ) &
     started=$((started + 1)); [ $((started % jobs)) -eq 0 ] && wait
   done < "$MD/index"
   wait
-  while IFS='|' read -r mname msecs; do
+  while IFS='|' read -r mname msecs mexpect; do
     [ -n "$mname" ] || continue
     [ -z "${PCE_ST_MUTANT_FILTER:-}" ] || case " $PCE_ST_MUTANT_FILTER " in *" $mname "*) ;; *) continue ;; esac
     mrc="$(cat "$MD/$mname.rc" 2>/dev/null || echo missing)"
-    if [ "$mrc" = "1" ]; then ok "mutant KILLED: $mname — caught by: $(grep -m1 '✗' "$MD/$mname.out" | cut -c1-110)"
-    else bad "mutant SURVIVED (rc=$mrc): $mname — no section noticed the rule being broken"; fi
+    mfirst="$(grep -m1 '✗' "$MD/$mname.out" | cut -c1-200)"
+    if [ "$mrc" != "1" ]; then bad "mutant SURVIVED (rc=$mrc): $mname — no section noticed the rule being broken"
+    elif [ -z "$mexpect" ]; then ok "mutant KILLED: $mname (recording: it named no assertion) — caught by: ${mfirst:0:110}"; [ -z "${PCE_ST_RECORD:-}" ] || printf '%s\t%s\n' "$mname" "$mfirst" >> "$PCE_ST_RECORD"
+    elif grep '✗' "$MD/$mname.out" | grep -qF -- "$mexpect"; then ok "mutant KILLED: $mname — caught by: $mexpect"; [ -z "${PCE_ST_RECORD:-}" ] || printf '%s\t%s\n' "$mname" "$mfirst" >> "$PCE_ST_RECORD"
+    else bad "mutant died on the WRONG check: $mname — the suite went red, but no failing check names '$mexpect' (first failure: ${mfirst:0:140})"; fi
   done < "$MD/index"
 fi
 fi
