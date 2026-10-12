@@ -36,6 +36,7 @@ import contextlib
 import glob
 import io
 import json
+import math
 import os
 import re
 import statistics
@@ -85,12 +86,20 @@ def gate_events(path):
                 continue
             res = str(e.get("result", "")).upper()
             ts = epoch(e.get("ts"))
+            raw = e.get("elapsed_s")
             try:
-                el = float(e.get("elapsed_s") or 0)
+                el = float(raw or 0)
+                if isinstance(raw, bool) or not math.isfinite(el):  # `true` não é 1 s e NaN/Infinity não é duração
+                    el = None
             except (TypeError, ValueError):
-                el = 0.0
+                el = None  # presente e ilegível: "não sei", não "0 s"
             if e.get("event") != "dispatcher_complete" or str(e.get("dry_run")) == "1" or res not in ("PASS", "FAIL") \
-                    or ts is None or not e.get("bead") or el <= 0:
+                    or ts is None or not e.get("bead"):
+                continue
+            if el is None:  # evento que o painel contaria, mas sem duração que se leia: CONTADO, não some como se fosse elapsed 0
+                bad += 1
+                continue
+            if el <= 0:
                 continue
             out.append((ts, el / 60.0))
     return out, bad
@@ -297,6 +306,17 @@ def selftest():
         ok(bad == 1, f"linha quebrada é CONTADA, não some (bad={bad})")
         ok(abs(statistics.mean(m for _, m in evs) - 20.0) < 1e-6, "média = 20 min")
         ok(epoch("lixo") is None and epoch(None) is None, "data ilegível dá None, não 0")
+        # elapsed_s presente e ilegível, num evento que o painel contaria, é "não sei": CONTADO (bad), nunca vira "0 s" filtrado em silêncio
+        base = '{"ts":"2026-10-10T12:00:00Z","event":"dispatcher_complete","bead":"a","result":"PASS",%s}'
+        evs2, bad2 = gate_events_from_lines([base % '"elapsed_s":"abc"', base % '"elapsed_s":true', base % '"elapsed_s":NaN',
+                                             base % '"elapsed_s":Infinity', base % '"elapsed_s":[1]'])
+        ok(not evs2 and bad2 == 5, f"elapsed_s texto, booleano, NaN, Infinity e lista: 5 CONTADOS, nenhum vira duração (evs={len(evs2)} bad={bad2})")
+        evs3, bad3 = gate_events_from_lines([base % '"elapsed_s":null', base % '"x":1', base % '"elapsed_s":-5',
+                                             base.replace('"PASS"', '"ERROR"') % '"elapsed_s":"abc"',
+                                             base.replace('"result"', '"dry_run":"1","result"') % '"elapsed_s":"abc"',
+                                             base % '"elapsed_s":"90"'])
+        ok(bad3 == 0 and len(evs3) == 1 and abs(evs3[0][1] - 1.5) < 1e-6,
+           f"elapsed_s ausente/null/negativo e evento que o painel já exclui seguem filtrados sem alarme; \"90\" lê como 90 s (evs={len(evs3)} bad={bad3})")
 
         # transcrição: 1 chamada de teste de 120 s, 1 chamada sem pytest de 300 s, 1 de teste sem resultado
         d = os.path.join(t, "tr"); os.makedirs(d)
