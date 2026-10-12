@@ -20,8 +20,10 @@
 # CÓDIGOS DE SAÍDA — qualquer 96..99 significa "rode local": quem chama NUNCA trata isso como falha de teste.
 #   0..95  código do pytest/comando remoto (propagado)
 #   99  offload desligado (falta $CITY/.gc/mbp-offload.on)
-#   98  MBP indisponível/sem saúde (ssh > 5 s, RAM livre < 3 GB, swap usado >= 5 GB, bateria < 40% sem tomada,
-#       ou ssh caiu no meio da execução)
+#   98  MBP indisponível/sem saúde (ssh > 5 s, RAM disponível < 3 GB, pressão de memória acima de "normal", swap
+#       CRESCENDO > 128 MB na janela de 2 s, swap usado >= 8 GB, algum desses sinais ilegível, bateria <= 40% sem
+#       tomada, ou ssh caiu no meio da execução). Swap usado ALTO mas parado NÃO recusa (ga-9e2rjh): o macOS não
+#       devolve swap depois de uma pressão. Cada recusa vai para o log com o motivo (campo "reason").
 #   97  configuração (uso errado, árvore-base ausente no MBP -> rode --seed)
 #   96  3 slots ocupados
 #
@@ -38,7 +40,11 @@ MBP_HOST=${MBP_HOST:-athos@athoss-macbook-pro.local}
 FLAG="$CITY/.gc/mbp-offload.on"
 LOG="$CITY/.gc/logs/mbp-run.jsonl"
 MIN_AVAIL_MB=${MBP_MIN_AVAIL_MB:-3072}
-MAX_SWAP_MB=${MBP_MAX_SWAP_MB:-5120}
+MAX_SWAP_MB=${MBP_MAX_SWAP_MB:-8192}               # TETO absoluto do swap usado; sozinho não decide mais (era 5120, ga-9e2rjh)
+MAX_SWAP_GROWTH_MB=${MBP_MAX_SWAP_GROWTH_MB:-128}  # swap que CRESCE mais que isto na janela abaixo = o MBP está trocando memória agora
+SWAP_SAMPLE_S=${MBP_SWAP_SAMPLE_S:-2}
+[ "$SWAP_SAMPLE_S" -ge 1 ] 2>/dev/null || SWAP_SAMPLE_S=2   # janela em segundos: precisa ser inteiro >= 1; outra coisa volta ao padrão
+MAX_PRESSURE=${MBP_MAX_PRESSURE_LEVEL:-1}          # nível do kernel: 1 normal, 2 aviso, 4 crítico; acima disto recusa
 MIN_BATT=${MBP_MIN_BATT:-40}
 MAX_SLOTS=${MBP_MAX_SLOTS:-3}
 SLOT_MAX_AGE=${MBP_SLOT_MAX_AGE_S:-14400}
@@ -62,7 +68,7 @@ EXCLUDES=(--exclude .git --exclude venv --exclude .venv --exclude crew --exclude
   --exclude 'auth.bak*/' --exclude '*.sqlite' --exclude '*.sqlite3')   # nomes de módulo (auth_gate.py, pdpj_token.py) continuam indo: só dir/arquivo de credencial fica
 
 say() { printf 'mbp-run: %s\n' "$*" >&2; }
-usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//' >&2; }
+usage() { sed -n '2,/^[^#]/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//' >&2; }   # só o bloco de comentário do topo (o limite fixo 2,36 vazava código quando o cabeçalho mudava)
 
 repo=""; dir="$PWD"; mode=pytest; seed_repo=""
 pushes=(); pulls=(); envs=(); keep=0
@@ -89,6 +95,7 @@ local_root_of() { case "$1" in wa) echo /Users/athos/gt/whatsapp_automation ;; p
 local_venv_of() { case "$1" in wa) echo /Users/athos/gt/whatsapp_automation/venv ;; ps) echo /Users/athos/.property-scrapers/runtime/main/venv ;; esac; }
 
 rssh() { "$SSH_BIN" $SSH_OPTS "$MBP_HOST" bash -s; }
+rssh_s() { "$SSH_BIN" $SSH_OPTS "$MBP_HOST" bash -s -- "$@"; }   # idem, com argumentos posicionais para o script
 
 log_run() { # repo mode slot rc secs
   mkdir -p "$(dirname "$LOG")" 2>/dev/null
@@ -96,32 +103,85 @@ log_run() { # repo mode slot rc secs
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" "$5" "$(( $# - 5 ))" >> "$LOG" 2>/dev/null || true
 }
 
+# ---- leitura do preflight ---------------------------------------------------------------------------------------
+PF=""; REFUSAL=""
+isnum() { [ "$1" -ge 0 ] 2>/dev/null; }                 # inteiro sem sinal; vazio e texto NÃO são número
+isint() { [ "$1" -eq "$1" ] 2>/dev/null; }              # inteiro com sinal (o delta do swap pode ser negativo)
+pf_get() { printf '%s\n' "$PF" | sed -n "s/^$1=//p" | head -1; }
+refuse() { REFUSAL="$1"; say "$2 — rode local"; }       # $1 = motivo para o log, $2 = mensagem; quem chama faz `return 98`
+
+# Uma recusa do preflight vira UMA linha no log, com o motivo e os números que a causaram: sem isso "recusa indevida" não se
+# mede (antes só execuções que rodaram eram logadas). Só o caminho normal chama isto; --check e --seed não contam como recusa.
+log_refusal() { # usa REFUSAL e PF
+  local a s d p
+  # campo vazio/ilegível → grava null (não 0): "não consegui ler" nunca se confunde com "li zero" no log
+  a=$(pf_get avail_mb); s=$(pf_get swap_mb); d=$(pf_get swap_delta_mb); p=$(pf_get pressure)
+  isnum "$a" || a=null; isnum "$s" || s=null; isint "$d" || d=null; isnum "$p" || p=null
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"nargs":0,"reason":"%s","avail_mb":%s,"swap_mb":%s,"swap_delta_mb":%s,"pressure":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${REFUSAL:-desconhecido}" "$a" "$s" "$d" "$p" >> "$LOG" 2>/dev/null || true
+}
+
 # ---- preflight: UMA chamada ssh; imprime pares k=v -------------------------------------------------------------
+#
+# CRITÉRIO (ga-9e2rjh): RAM disponível (free+inactive+speculative) + pressão de memória do kernel + CRESCIMENTO do swap numa
+# janela curta; o swap usado virou só um TETO absoluto. O macOS não devolve o swap depois de uma pressão: o MBP ocioso fica em
+# ~5 GB "usados" (medido 11/10: 4,9-5,2 GB parado) e o limiar antigo de 5 GB recusou uma execução com 3,8 GB de RAM sobrando.
+# Medido ocioso em 11/10: pressão nível 1, memory_pressure 54% livre, swap parado em 5105 MB. O compressor (5,3 GB, 32% da RAM
+# mesmo ocioso) só é REPORTADO: com esse ruído de base ele não serve de porta.
 preflight() {
-  local out rc
-  out=$(rssh <<'EOF' 2>/dev/null
+  local out rc avail swap delta pressure power batt
+  REFUSAL=""
+  # Script remoto: toda leitura que vazia, falha ou vem em formato inesperado deixa o campo VAZIO (nunca 0, nunca "normal");
+  # o lado local lê campo vazio como "não consegui saber" e recusa (estado inerte). $1 = janela da amostra de swap, em segundos.
+  out=$(rssh_s "$SWAP_SAMPLE_S" <<'EOF' 2>/dev/null
 # MBP:PREFLIGHT
-ps=$(pagesize 2>/dev/null || echo 16384)
+SAMPLE_S=${1:-2}
+[ "$SAMPLE_S" -ge 1 ] 2>/dev/null || SAMPLE_S=2
+isnum() { [ "$1" -ge 0 ] 2>/dev/null; }
+# swap usado em MB inteiros. vazio/formato inesperado ("used = <n>M|G" ausente) → imprime NADA; falhou → imprime NADA
+swap_used() { sysctl -n vm.swapusage 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "used" && $(i+1) == "=") { v = $(i+2); u = substr(v, length(v)); sub(/[MG]$/, "", v); if ((u == "M" || u == "G") && v ~ /^[0-9]+(\.[0-9]+)?$/) { print int(u == "G" ? v * 1024 : v); exit } } }'; }
+s1=$(swap_used)
+# vm_stat vazio/falhou → page size e contadores vazios → avail_mb e compressed_mb saem vazios
 vm=$(vm_stat 2>/dev/null)
-g() { echo "$vm" | awk -v k="$1" '$0 ~ k {gsub(/[^0-9]/,"",$NF); print $NF; exit}'; }
-free=$(g "Pages free"); inact=$(g "Pages inactive"); spec=$(g "Pages speculative")
-echo "avail_mb=$(( (${free:-0}+${inact:-0}+${spec:-0}) * ps / 1048576 ))"
-echo "swap_mb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{gsub(/M/,"",$6); print int($6)}')"
+ps=$(printf '%s\n' "$vm" | sed -n 's/.*page size of \([0-9][0-9]*\) bytes.*/\1/p' | head -1)
+g() { printf '%s\n' "$vm" | awk -v k="$1" 'index($0, k) == 1 { gsub(/[^0-9]/, "", $NF); print $NF; exit }'; }
+free=$(g "Pages free"); inact=$(g "Pages inactive"); spec=$(g "Pages speculative"); comp=$(g "Pages occupied by compressor")
+if isnum "$ps" && isnum "$free" && isnum "$inact" && isnum "$spec"; then echo "avail_mb=$(( (free + inact + spec) * ps / 1048576 ))"; else echo "avail_mb="; fi
+if isnum "$ps" && isnum "$comp"; then echo "compressed_mb=$(( comp * ps / 1048576 ))"; else echo "compressed_mb="; fi
+# nível de pressão do kernel (1 normal, 2 aviso, 4 crítico). vazio/falhou/ilegível → pressure= vazio, NUNCA "1"
+lvl=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
+if isnum "$lvl"; then echo "pressure=$lvl"; else echo "pressure="; fi
+# memory_pressure: só informativo (não decide). vazio/falhou/ilegível → campo vazio
+mp=$(memory_pressure 2>/dev/null | sed -n 's/^System-wide memory free percentage: \([0-9][0-9]*\)%.*/\1/p' | head -1)
+echo "mem_free_pct=$mp"
 b=$(pmset -g batt 2>/dev/null)
-case "$b" in *"AC Power"*) echo "power=ac" ;; *) echo "power=battery" ;; esac
+if printf '%s\n' "$b" | grep -q 'AC Power'; then echo "power=ac"; else echo "power=battery"; fi
 echo "batt=$(echo "$b" | grep -o '[0-9]*%' | head -1 | tr -d '%')"
 echo "load=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')"
+# segunda leitura do swap, SAMPLE_S segundos depois da primeira. qualquer das duas ilegível → delta vazio (não 0)
+sleep "$SAMPLE_S"
+s2=$(swap_used)
+echo "swap_mb=$s2"
+if isnum "$s1" && isnum "$s2"; then echo "swap_delta_mb=$(( s2 - s1 ))"; else echo "swap_delta_mb="; fi
 EOF
   ); rc=$?
-  [ $rc -eq 0 ] && [ -n "$out" ] || { say "MBP inalcançável (ssh rc=$rc) — rode local"; return 98; }
+  [ $rc -eq 0 ] && [ -n "$out" ] || { REFUSAL=inalcancavel; say "MBP inalcançável (ssh rc=$rc) — rode local"; return 98; }
   PF="$out"
-  local avail swap power batt
-  avail=$(echo "$out" | sed -n 's/^avail_mb=//p'); swap=$(echo "$out" | sed -n 's/^swap_mb=//p')
-  power=$(echo "$out" | sed -n 's/^power=//p'); batt=$(echo "$out" | sed -n 's/^batt=//p')
-  [ "${avail:-0}" -ge "$MIN_AVAIL_MB" ] || { say "MBP sem RAM livre (${avail:-?} MB < $MIN_AVAIL_MB) — rode local"; return 98; }
-  [ "${swap:-99999}" -lt "$MAX_SWAP_MB" ] || { say "MBP com swap alto (${swap:-?} MB >= $MAX_SWAP_MB) — rode local"; return 98; }
+  # Lado local: campo AUSENTE ou ilegível ≠ valor baixo. Os três estados (tem / não tem / não consegui saber) NUNCA caem no
+  # mesmo resultado: ilegível recusa com motivo "ilegivel:<campo>" (distinto de ram/pressao/swap) para o log não mentir.
+  avail=$(pf_get avail_mb); swap=$(pf_get swap_mb); delta=$(pf_get swap_delta_mb); pressure=$(pf_get pressure)
+  power=$(pf_get power); batt=$(pf_get batt)
+  isnum "$avail" || { refuse ilegivel:avail "RAM disponível do MBP ilegível"; return 98; }    # gate:ilegivel-avail
+  [ "$avail" -ge "$MIN_AVAIL_MB" ] || { refuse ram "MBP sem RAM livre ($avail MB < $MIN_AVAIL_MB)"; return 98; }    # gate:ram
+  case "$pressure" in 1|2|4) ;; *) refuse ilegivel:pressure "pressão de memória do MBP ilegível (nível '${pressure:-}')"; return 98 ;; esac    # gate:ilegivel-pressao
+  [ "$pressure" -le "$MAX_PRESSURE" ] || { refuse pressao "MBP sob pressão de memória (nível $pressure > $MAX_PRESSURE; 1=normal 2=aviso 4=crítico)"; return 98; }    # gate:pressao
+  isint "$delta" || { refuse ilegivel:swap_delta "crescimento do swap do MBP ilegível"; return 98; }    # gate:ilegivel-delta
+  [ "$delta" -le "$MAX_SWAP_GROWTH_MB" ] || { refuse swap_cresce "MBP trocando memória agora (swap cresceu $delta MB em ${SWAP_SAMPLE_S}s > $MAX_SWAP_GROWTH_MB)"; return 98; }    # gate:cresce
+  isnum "$swap" || { refuse ilegivel:swap "swap usado do MBP ilegível"; return 98; }    # gate:ilegivel-swap
+  [ "$swap" -lt "$MAX_SWAP_MB" ] || { refuse swap_teto "MBP com swap acima do teto ($swap MB >= $MAX_SWAP_MB)"; return 98; }    # gate:teto
   if [ "$power" != "ac" ] && [ "${batt:-0}" -le "$MIN_BATT" ]; then
-    say "MBP na bateria (${batt:-?}% <= $MIN_BATT%) — rode local"; return 98
+    refuse bateria "MBP na bateria (${batt:-?}% <= $MIN_BATT%)"; return 98
   fi
   return 0
 }
@@ -231,7 +291,7 @@ else
   [ $# -gt 0 ] || { say "faltou o comando (use -- <comando>)"; exit 97; }
 fi
 
-preflight || exit $?
+preflight || { rc=$?; log_refusal; exit $rc; }
 acquire || exit $?
 T0=$(date +%s)
 mkdir -p "$CITY/.gc/run" 2>/dev/null; TMPOUT=$(mktemp "$CITY/.gc/run/mbp-run.XXXXXX")

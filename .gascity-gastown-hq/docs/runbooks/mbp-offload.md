@@ -19,7 +19,7 @@ A chave é o arquivo-bandeira `$CITY/.gc/mbp-offload.on` (CITY=`/Users/athos/gt/
 ```bash
 scripts/mbp-offload.sh on        # liga
 scripts/mbp-offload.sh off       # desliga: mbp-run.sh sai 99 e todo mundo roda local
-scripts/mbp-offload.sh status    # estado, saúde do MBP e últimas 5 execuções
+scripts/mbp-offload.sh status    # estado, saúde do MBP (RAM, pressão, swap), últimas 5 linhas do log e recusas das últimas 72 h por motivo
 scripts/mbp-offload.sh status --json   # insumo do botão do painel (bead própria, mockup antes)
 ```
 Sem daemon nem launchd. O botão do painel só chama este script.
@@ -39,8 +39,23 @@ Quem chama trata rc 96..99 como "rode local", nunca como teste reprovado.
 Os workers de pool (wa-worker e ps-worker) recebem essa regra no preâmbulo: seção guardada `mbp-offload-tests` do fragment `town-deltas` (ga-yvs19w), registrada em `doctrine.guarded` do `pool-roles.json` com `show_unset: false` — Mayor, crews, dog e revisores não a recebem. Com a chave desligada o `mbp-run.sh` sai 99 e o worker roda local, então a linha é segura mesmo com o offload off.
 
 ## Códigos de saída
-0..95 = rc do pytest/comando remoto (propagado) · 99 offload desligado · 98 MBP indisponível ou sem saúde (ssh > 5 s, RAM livre < 3 GB, swap usado >= 5 GB, bateria <= 40% sem tomada, ou ssh caiu no meio) · 97 configuração (uso errado, base ausente → `--seed`) · 96 três slots ocupados.
-Limiares ajustáveis por ambiente: `MBP_MIN_AVAIL_MB`, `MBP_MAX_SWAP_MB`, `MBP_MIN_BATT`, `MBP_MAX_SLOTS`, `MBP_RUN_TIMEOUT_S`.
+0..95 = rc do pytest/comando remoto (propagado) · 99 offload desligado · 98 MBP indisponível ou sem saúde (veja o critério abaixo) · 97 configuração (uso errado, base ausente → `--seed`) · 96 três slots ocupados.
+Limiares ajustáveis por ambiente: `MBP_MIN_AVAIL_MB`, `MBP_MAX_PRESSURE_LEVEL`, `MBP_MAX_SWAP_GROWTH_MB`, `MBP_SWAP_SAMPLE_S`, `MBP_MAX_SWAP_MB`, `MBP_MIN_BATT`, `MBP_MAX_SLOTS`, `MBP_RUN_TIMEOUT_S`.
+
+### Critério de saúde do preflight (ga-9e2rjh)
+O preflight faz UMA chamada ssh e recusa (rc 98) por um destes motivos; cada recusa vira uma linha no log com o campo `reason`:
+
+| `reason` | Recusa quando | Padrão |
+|---|---|---|
+| `inalcancavel` | ssh não respondeu em 5 s ou caiu | — |
+| `ram` | RAM disponível (free+inactive+speculative) abaixo do mínimo | 3072 MB |
+| `pressao` | nível de pressão de memória do kernel acima de normal (1 normal, 2 aviso, 4 crítico) | nível 1 |
+| `swap_cresce` | o swap usado CRESCEU mais que o limite entre duas leituras | 128 MB em 2 s |
+| `swap_teto` | swap usado igual ou acima do teto absoluto | 8192 MB |
+| `bateria` | na bateria (sem tomada) com carga igual ou abaixo do mínimo | 40% |
+| `ilegivel:<campo>` | o MBP não deu para ler `avail`, `pressure`, `swap_delta` ou `swap` | — |
+
+O swap usado, sozinho, NÃO recusa até o teto: o macOS não devolve swap depois de uma pressão, então um valor alto e parado não diz nada sobre a pressão de agora. Campo ilegível recusa com motivo próprio (`ilegivel:*`) e entra no log como `null`, nunca como 0: "não consegui ler" não se confunde com "li zero". `mem_free_pct` (`memory_pressure`) e `compressed_mb` só são reportados em `--check`; não decidem.
 
 ## O que mora no MBP (`~/gt-remote`)
 - `whatsapp_automation/`, `property_scrapers/`: árvores-base (sem .git, venv, shared/data, *.db, logs, .beads…).
@@ -49,7 +64,7 @@ Limiares ajustáveis por ambiente: `MBP_MIN_AVAIL_MB`, `MBP_MAX_SWAP_MB`, `MBP_M
 - `slots/N`: trava por `mkdir`; dono = `host:pid:epoch`; dono morto ou idade > 4 h é liberado por quem chega.
 - `exec/N`: scratch do modo `--exec`, apagado no fim (capturas de REA nunca ficam).
 - `rea/`: REA 6.4.0 instalado com Node 22 (`brew install node@22 ghidra`, ghidra/openjdk@21/node@22 fixados com `brew pin`). O Node 25 do MBP não serve ao REA (exige 22.19+, 24.11+ ou 26+).
-- Log das execuções: `$CITY/.gc/logs/mbp-run.jsonl` (ts, repo, modo, slot, rc, segundos).
+- Log das execuções e das recusas do preflight: `$CITY/.gc/logs/mbp-run.jsonl` (ts, repo, modo, slot, rc, segundos; a recusa tem `"mode":"preflight"`, `reason` e os números que a causaram).
 
 ## Manutenção
 - Reseed noturno com hash (bead própria): `mbp-run.sh --seed wa; mbp-run.sh --seed ps`.
@@ -57,6 +72,6 @@ Limiares ajustáveis por ambiente: `MBP_MIN_AVAIL_MB`, `MBP_MAX_SWAP_MB`, `MBP_M
 - Segredos: o MBP usa o mesmo acesso do mini (decisão do Athos, 11/10); o comando enviado nunca carrega segredo.
 
 ## Limites conhecidos
-- **Swap do MBP:** o macOS não devolve o arquivo de swap depois de uma pressão; o MBP fica em 4,9-5,2 GB "usados" mesmo ocioso, então o limiar de 5 GB bloqueia o offload parte do tempo. Medido hoje: 5.248 MB recusou uma execução com 3,8 GB de RAM disponível. Decisão pendente: trocar o critério por RAM disponível + pressão de memória.
+- **Swap do MBP (resolvido em ga-9e2rjh):** o macOS não devolve o arquivo de swap depois de uma pressão; o MBP ocioso fica em 4,9-5,2 GB "usados". O limiar fixo de 5 GB recusou, em 11/10, uma execução com 5.248 MB de swap e 3,8 GB de RAM disponível. O critério agora é RAM + pressão + crescimento do swap (tabela acima), e o limiar de swap virou só um teto absoluto, que subiu de 5 para 8 GB. Medição de aceite: recusas indevidas = 0 em 3 dias. Conferir com `scripts/mbp-offload.sh status` (linha "últimas 72 h"): recusa por `swap_teto` ou `swap_cresce` com RAM e pressão normais é o sinal de que o critério precisa de ajuste; `ilegivel:*` é o MBP respondendo lixo, não swap alto.
 - Teste que lê `shared/data/*.db` falha no MBP (os bancos não são enviados): o runner imprime uma nota; rode esse teste local.
 - Cada execução paga ~6 s de ssh/rsync; testes de menos de ~10 s não valem o offload.
