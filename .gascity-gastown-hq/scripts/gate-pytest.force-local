@@ -1,0 +1,9 @@
+# gate-pytest.force-local — arquivos de teste que o gate-pytest.sh NUNCA manda para o MBP (um glob por linha, # comenta).
+#
+# Contents
+#   Quando acrescentar uma linha
+#
+# QUANDO ACRESCENTAR: um teste que reprova no MBP e passa aqui por causa do AMBIENTE (banco, config, caminho absoluto, segredo).
+#   O wrapper já manda para cá sozinho todo arquivo que cita shared/data, e confere aqui todo vermelho/pulado do MBP — esta
+#   lista só poupa a ida e volta de um arquivo que já se sabe ambiente-dependente. O glob casa o caminho relativo ao worktree,
+#   ex.: tests/test_algo_que_le_config.py ou tests/integration/*

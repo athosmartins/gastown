@@ -21,6 +21,11 @@
 # set ONLY by gate-e5-second-reviewer.lib.sh (gate_e5_task_vars) inside the dispatcher while the E5 flag is on — a builder running
 # pre-gate-review.sh never sets them, so the builder text and the flag-off gate text are byte-identical to before.
 #
+# A THIRD optional piece (ga-xm1jfl): gate_test_wrapper_rules <gc_city> prints the TEST WRAPPER paragraph that sends the reviewer's
+# directed test runs through scripts/gate-pytest.sh (MBP when healthy, local otherwise). It prints NOTHING unless gc_city is given
+# (the gate, never the builder's text mode), the MBP offload flag is on, the wrapper is executable and .gc/gate-pytest.off is absent —
+# so with the switch off the task is byte-identical to before. It only tests files; no bd, no gc, no network.
+#
 # Editing the prompt text below changes what every reviewer is told, and what the builder rehearses against. Keep the
 # prose free of apostrophes: while this text sat inside a command substitution in the dispatcher, one stray apostrophe
 # made /bin/bash 3.2 misparse the whole file and the gate spawned no reviewer for ~3h (ga-6aj348). It no longer sits in a
@@ -178,9 +183,34 @@ ${DIFF_OMITTED_FILES}To review the FULL diff yourself: $_escape_hatch_cmd"
   return 0
 }
 
+# gate_test_wrapper_rules <gc_city> — the TEST WRAPPER paragraph, or nothing (ga-xm1jfl).
+# Empty city, offload flag off or absent, wrapper missing/not executable, or the .gc/gate-pytest.off switch present all print nothing:
+# a flag that cannot be read counts as off, the inert answer, so the reviewer is told exactly what it was told before this existed.
+# The paragraph sits at the end of the RUNNING TESTS line of the task body, which is why it starts with a blank line.
+gate_test_wrapper_rules() {
+  local _city="${1:-}"
+  [ -n "$_city" ] || return 0
+  [ -f "$_city/.gc/mbp-offload.on" ] || return 0
+  [ -f "$_city/.gc/gate-pytest.off" ] && return 0
+  [ -x "$_city/scripts/gate-pytest.sh" ] || return 0
+  cat <<WRAP
+
+TEST WRAPPER (use it instead of running python3 -m pytest yourself): run test FILES through
+  "$_city/scripts/gate-pytest.sh" --dir <your-worktree> -- tests/test_x.py tests/test_y.py -x -q
+It runs them on the idle MacBook Pro when that machine is healthy (heavy test files finish many times faster than on this loaded
+machine) and on this machine, exactly as before, when it is not. What it prints is safe to believe: a pass on the MacBook counts as a
+pass, but a failure or a skipped test there is always run again here first, and the result from here is the one that counts. Pass
+test files, never a directory. Run it the way you run any long test (background, poll the log). Your own mutation and reproduction
+probes go through it too: it sends the worktree as it is at that moment. Its last line reads gate-pytest: ran=mbp rc=0 secs=11 ...
+- copy that line into the Summary of your verdict, so the gate can see where the test time went.
+WRAP
+}
+
 # _gate_review_task_body — the judging text. Reads the caller-declared locals of gate_render_review_task
 # (dynamic scope), named exactly as the dispatcher always named them so this text is the original heredoc.
 _gate_review_task_body() {
+  local _GATE_TW=""
+  _GATE_TW=$(gate_test_wrapper_rules "${GC_CITY:-}")
   cat <<TASK
 QUALITY GATE REVIEW — You are reviewer $i of $REQUIRED_REVIEWERS for branch: $BRANCH
 Author (EXCLUDED from reviewing): $AUTHOR
@@ -256,7 +286,7 @@ poll, and split per file; never restart a run your own cap killed; never run the
 tests/ directory. A test that is already red on the reviewed base for the SAME test id is
 pre-existing: report it as non-blocking — a failing test blocks only when this diff made it
 fail. Mutation and reproduction probes you write yourself are not covered by any of this:
-run them, they are the best defence the gate has.
+run them, they are the best defence the gate has.${_GATE_TW}
 TASK
 }
 
