@@ -5164,6 +5164,39 @@ _emit_query_one() {
   echo "$_merged" | jq --arg store "$_store" '[ .[] | . + {"_emit_store": $store} ]' 2>/dev/null || echo "[]"
 }
 
+# ── ga-5fn5p3: what the cross-rig PRIORITY YIELD needs from the emit's population ───────────────────────────
+# The emit already holds, once per sweep and before every early exit, the ordered union of every approved +
+# dispatchable bead of every store — the very population the painel's "Aprovadas" shows and the pool ceiling counts.
+# The yield (see "PRIORITY ACROSS RIGS" above _pilot_pool_topup) reads two projections of it, both made HERE so the
+# yield never runs a second set of queries over the stores:
+#   _PY_P01          JSON array, in work order, of the P0/P1 beads that carry gc.routed_to = wa-worker|ps-worker:
+#                    [{id, priority, rig (the emit's store label), routed_to}]. Only a bead already committed to a
+#                    pool can be said to WAIT for it; a first-sight bead (no route yet) is learned about later in the
+#                    sweep, when its own dispatch attempt ends queued behind a cap (_pilot_priority_waiter_note).
+#   _PY_CLASS_BY_ID  JSON object id → priority class 0..5, for EVERY bead of the population (the top-up asks
+#                    "what priority is the bead I am about to open a session for?").
+# The class is the work-order library's own (wo_prio_class: 0..4 → itself, anything else → 5) — read from the lib's jq
+# definitions, never re-derived here.
+# THREE states: both projections made → _PY_EMIT_OK=1; either one failed, the lib's definitions are not loaded, or the
+# emit never ran → _PY_EMIT_OK=0 with both EMPTY. Empty is "cannot tell", never "nobody waits": the scan reads it as blind.
+# Always returns 0 (the emit is fail-open and must stay so).
+_PY_P01=""; _PY_CLASS_BY_ID=""; _PY_EMIT_OK=0
+_pilot_priority_project_emit() {
+  local _in="${1:-}" _p01 _cls
+  _PY_P01=""; _PY_CLASS_BY_ID=""; _PY_EMIT_OK=0
+  [ -n "${WORK_ORDER_JQ_DEFS:-}" ] || return 0
+  _p01=$(printf '%s' "$_in" | jq -c "$WORK_ORDER_JQ_DEFS"'
+      [ .[] | select(wo_prio_class <= 1)
+            | { id: (.id // ""), priority: .priority, rig: (._emit_store // ""),
+                routed_to: ((.metadata | if type == "object" then .["gc.routed_to"] else null end) // "") }
+            | select(.id != "" and (.routed_to == "wa-worker" or .routed_to == "ps-worker")) ]' 2>/dev/null) || _p01=""
+  _cls=$(printf '%s' "$_in" | jq -c "$WORK_ORDER_JQ_DEFS"'
+      [ .[] | select((.id | type) == "string" and .id != "") | { key: .id, value: wo_prio_class } ] | from_entries' 2>/dev/null) || _cls=""
+  [ -n "$_p01" ] && [ -n "$_cls" ] || return 0
+  _PY_P01="$_p01"; _PY_CLASS_BY_ID="$_cls"; _PY_EMIT_OK=1
+  return 0
+}
+
 # _pilot_emit_dispatchable — compute the full cross-store eligible queue and write
 # PILOT_DISPATCHABLE_FILE atomically. Idempotent per sweep (guarded by
 # PILOT_EMITTED_DONE). FAIL-OPEN: the entire body runs in a subshell-guarded
@@ -5226,6 +5259,9 @@ _pilot_emit_dispatchable() {
       warn "ga-9t9acg.3: work_order_sort could not order the dispatchable queue (library missing, exit != 0 or empty output; reason above if it said one) — NOT writing $PILOT_DISPATCHABLE_FILE: the previous file keeps its order and goes stale after ${PILOT_DISPATCHABLE_TTL}s, because \"cannot tell\" is not \"empty queue\"."
       return 0
     fi
+    # ga-5fn5p3: hand the cross-rig priority yield its projections of this same ordered population (see the block above).
+    # Placed AFTER the order check on purpose: a population the library could not order is "cannot tell" for the yield too.
+    _pilot_priority_project_emit "$_ordered"
     _items=$(printf '%s' "$_ordered" | jq '
         [ .[] | {
             id:         .id,
@@ -9623,6 +9659,219 @@ _pilot_pool_cap_full_for() {
   return 0
 }
 
+# ── ga-5fn5p3: PRIORITY ACROSS RIGS — a P2+ bead does not OPEN a pool session while a P0/P1 waits for capacity ──
+# Athos, 2026-10-12: "Por que diabos estamos entregando beads p2 e p3 (como ps-k5jl, ga-jdzri9) enquanto temos dezenas de p0 e
+# p1 pra trabalharmos?" Measured by the Mayor the same morning: WA had 38 approved P0/P1 beads queued behind a wa-worker cap of
+# 2, while ps-worker (the PS rig has only P2/P3) and the dog pool (P2 of the HQ) kept opening sessions — and the RAM those
+# sessions hold is what keeps the WA cap down. The city-wide work order (priority > type > age, scripts/work-order.sh) only ever
+# ranked beads INSIDE one pool; nothing compared a PS bead with a WA bead.
+#
+# THE RULE. While ANY P0/P1 bead is waiting behind a pool that is at its session cap, no P2/P3/P4 bead opens a NEW session in
+# ANY pool (wa-worker, ps-worker, gastown.dog) — not through dispatch (dispatch_lane/dispatch_one), not through the pool top-up.
+#   * WAITING = a dispatchable P0/P1 bead that is already committed to wa-worker|ps-worker (gc.routed_to) whose pool is POSITIVELY
+#     at its cap — the very test (_pilot_pool_cap_full_for) the pre-claim queue skip uses, so "waiting" means one thing in the
+#     file. A first-sight bead (no route yet) joins the moment its own dispatch attempt ends queued behind a cap.
+#   * Only P2..P4 (class 2..4 of the work-order library) cede. P0 and P1 never do — which is also why the one exception Athos
+#     decided on 06/10 (a P0 bug labelled impacto:dano-ao-vivo goes first) needs no code here: it is P0, it never cedes, and
+#     among the waiters the library's own order already puts it first. A priority the library cannot read (class 5) never
+#     cedes either: "I cannot tell" does not hold work back.
+#   * Persistent crews are not pools: a bead that goes to a named crew adds no session, so it is never held back here.
+#   * A ceded bead is NOT claimed and nothing is written for it (the same zero-write skip as the pool-cap queue) — except the
+#     post-claim path, which releases the claim and stamps the route of a wa/ps-worker target as the cap queue does (a dog
+#     target is not stamped), so every later sweep takes the zero-write path. It stays story:approved and is re-evaluated
+#     every sweep: the moment no P0/P1 waits, it dispatches.
+#   * FAIL-OPEN, and COUNTED: if the emit's population or a pool's session count cannot be READ, nothing is ceded on a guess
+#     (dispatch proceeds exactly as before this rule) and the sweep event carries priority_yield_blind=1. The direction of the
+#     doubt is the pre-existing behaviour — the bead's own wording: "leitura que falha → não bloqueia e conta".
+#   * Off switches: PILOT_PRIORITY_YIELD=0 (plist) or `touch $GC_CITY/.gc/priority-yield.off` (instant, no reload).
+# NOT covered, on purpose: the Mayor's manual slings to gastown.dog and the dog's own probe (they never pass through this
+# script), and what machine pressure cuts first (pool-ceiling.sh / pool-ceiling-engine.sh, same bead, see their headers).
+# SELFTEST-EXTRACT pilot-priority-yield: BEGIN
+PILOT_PRIORITY_YIELD="${PILOT_PRIORITY_YIELD:-1}"
+_PY_SCANNED=0         # 1 once _pilot_priority_waiting_scan ran this sweep
+_PY_BLIND=0           # 1 iff this sweep could not tell who waits (fail-open: nothing cedes on it; the sweep event counts it)
+_PY_WAIT_ID=""; _PY_WAIT_PRIO=""; _PY_WAIT_RIG=""; _PY_WAIT_POOL=""; _PY_WAIT_LIVE=""; _PY_WAIT_MAX=""   # the head waiter ("" = none known)
+_PY_CAND_CLASS=""     # out-param of _pilot_priority_yield_for / _for_id: the ceding bead's priority class
+PRIORITY_YIELDED=0    # beads ceded this sweep (dispatch + top-up) — read by the sweep event and the saturation predicate
+PRIORITY_YIELD_BLIND_TOPUP=0   # top-up gates that could not read the pending bead's priority (counted, never blocking)
+
+# _pilot_priority_yield_enabled — exit 0 iff the rule is on. A predicate: call it in an `if`/`||`/`&&` (the dispatcher runs under set -e).
+_pilot_priority_yield_enabled() {
+  [ "${PILOT_PRIORITY_YIELD:-1}" = "1" ] || return 1
+  [ ! -e "${PILOT_PRIORITY_YIELD_OFF_FILE:-${GC_CITY:-/nonexistent}/.gc/priority-yield.off}" ]
+}
+
+# _pilot_priority_class_of <bead-json> — print the bead's priority class 0..5 with the work-order library's own definition
+# (wo_prio_class), or NOTHING when it cannot be told (library not loaded, not an object, jq failed). Always exit 0.
+_pilot_priority_class_of() {
+  local _b="${1:-}"
+  [ -n "${WORK_ORDER_JQ_DEFS:-}" ] || return 0
+  printf '%s' "$_b" | jq -r "$WORK_ORDER_JQ_DEFS"' if type == "object" then wo_prio_class else empty end' 2>/dev/null || true
+  return 0
+}
+
+# _pilot_priority_target_is_pool <target> — exit 0 iff the dispatch target is an EPHEMERAL POOL (a new session is opened for it).
+_pilot_priority_target_is_pool() {
+  case "${1:-}" in
+    wa-worker|wa-worker-*|ps-worker|ps-worker-*|gastown.dog|gastown.dog-*) return 0 ;;
+  esac
+  return 1
+}
+
+# _pilot_priority_pool_bound_pre <bead-json> — exit 0 iff the bead is KNOWN, before any claim, to go to a pool: it already carries
+# gc.routed_to = wa-worker|ps-worker|gastown.dog, or its explicit story.rig resolves to the dog pool and that rig has no persistent
+# crew at all (rig_to_builders + rig_has_persistent_crew_capability, both pure). Anything else — a first-sight WA/PS bead (a domain
+# owner may take it for a crew), no story.rig — is decided after the claim, once the builder is chosen (dispatch_one).
+_pilot_priority_pool_bound_pre() {
+  local _b="${1:-}" _routed _rig
+  _routed=$(printf '%s' "$_b" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null) || _routed=""
+  case "$_routed" in wa-worker|ps-worker|gastown.dog) return 0 ;; esac
+  _rig=$(printf '%s' "$_b" | jq -r '.metadata["story.rig"] // ""' 2>/dev/null) || _rig=""
+  { [ -n "$_rig" ] && [ "$_rig" != "null" ]; } || return 1
+  [ "$(rig_to_builders "$_rig")" = "gastown.dog" ] || return 1
+  if rig_has_persistent_crew_capability "$_rig"; then return 1; fi
+  return 0
+}
+
+# _pilot_priority_waiting_scan — ONCE per sweep, after the dynamic ceilings and before the pool top-up: find the HEAD WAITER, the
+# best-ordered P0/P1 bead (from the emit's _PY_P01) whose pool is positively at its cap. Sets _PY_WAIT_* ("" = nobody known to
+# wait) and _PY_BLIND. A (pool, store) pair that read "not full" is not asked again for the next bead of the same pair. Always exit 0.
+_pilot_priority_waiting_scan() {
+  local _rows _id _prio _rig _pool _story _seen=" " _key
+  _PY_SCANNED=1; _PY_BLIND=0
+  _PY_WAIT_ID=""; _PY_WAIT_PRIO=""; _PY_WAIT_RIG=""; _PY_WAIT_POOL=""; _PY_WAIT_LIVE=""; _PY_WAIT_MAX=""
+  if ! _pilot_priority_yield_enabled; then
+    log "ga-5fn5p3: priority yield is OFF (PILOT_PRIORITY_YIELD=${PILOT_PRIORITY_YIELD:-1} or kill file .gc/priority-yield.off) — every pool serves its own order only, as before."
+    return 0
+  fi
+  if [ "${_PY_EMIT_OK:-0}" != "1" ]; then
+    _PY_BLIND=1
+    warn "ga-5fn5p3: CANNOT TELL which P0/P1 beads wait for capacity (the dispatchable-queue emit did not run, or its population could not be read this sweep) — no P2+ bead is ceded on a guess; dispatch proceeds as before (fail-open, counted as priority_yield_blind in the sweep event)."
+    return 0
+  fi
+  # A population that cannot be walked is "cannot tell", not "nobody waits": the empty string an unreadable list would
+  # produce must not reach the loop (error and empty would be the same value).
+  if ! _rows=$(printf '%s' "$_PY_P01" | jq -r '.[] | [.id, (.priority | tostring), .rig, .routed_to] | join("\u001f")' 2>/dev/null); then
+    _PY_BLIND=1
+    warn "ga-5fn5p3: CANNOT TELL which P0/P1 beads wait for capacity (the emit's P0/P1 list is not readable) — no P2+ bead is ceded on a guess; dispatch proceeds as before (fail-open, counted as priority_yield_blind in the sweep event)."
+    return 0
+  fi
+  while IFS=$'\037' read -r _id _prio _rig _pool; do
+    [ -n "$_id" ] || continue
+    _key="$_pool|$_rig"
+    case "$_seen" in *" $_key "*) continue ;; esac
+    _story=$(jq -cn --arg id "$_id" --arg p "$_pool" '{id: $id, metadata: {"gc.routed_to": $p}}' 2>/dev/null) || continue
+    if _pilot_pool_cap_full_for "$_story"; then
+      _PY_WAIT_ID="$_id"; _PY_WAIT_PRIO="$_prio"; _PY_WAIT_RIG="$_rig"
+      _PY_WAIT_POOL="$_PCAP_POOL"; _PY_WAIT_LIVE="$_PCAP_LIVE"; _PY_WAIT_MAX="$_PCAP_MAX"
+      break
+    fi
+    if [ -n "${_PCAP_COUNT_UNREADABLE:-}" ]; then
+      _PY_BLIND=1
+      warn "ga-5fn5p3: CANNOT TELL whether $_pool is at its cap (live session count unreadable) — $_id is not counted as waiting; no P2+ bead is ceded on a guess (fail-open, counted as priority_yield_blind in the sweep event)."
+      break
+    fi
+    _seen="$_seen$_key "
+  done <<EOF_PYSCAN
+$_rows
+EOF_PYSCAN
+  if [ -n "$_PY_WAIT_ID" ]; then
+    log "ga-5fn5p3: P$_PY_WAIT_PRIO $_PY_WAIT_ID (rig $_PY_WAIT_RIG) waits for capacity — $_PY_WAIT_POOL is at its session cap ($_PY_WAIT_LIVE/$_PY_WAIT_MAX): no P2+ bead opens a pool session this sweep (dispatch or top-up) until it has a slot."
+  elif [ "$_PY_BLIND" = "0" ]; then
+    log "ga-5fn5p3: no P0/P1 bead waits behind a full pool — the priority yield is idle this sweep."
+  fi
+  return 0
+}
+
+# _pilot_priority_waiter_note <bead-json> [pool live max] — a P0/P1 candidate just ended QUEUED behind a full pool during this
+# sweep's own dispatch (the pre-claim cap skip, or dispatch_one's cap branches): it is a waiter, whether or not the scan knew it.
+# Only the FIRST one is kept (the pool is walked in work order, so the first is the best). Always exit 0.
+_pilot_priority_waiter_note() {
+  local _b="${1:-}" _cls _id _rig
+  [ -z "${_PY_WAIT_ID:-}" ] || return 0
+  _pilot_priority_yield_enabled || return 0
+  _cls=$(_pilot_priority_class_of "$_b")
+  case "$_cls" in 0|1) ;; *) return 0 ;; esac
+  _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || _id=""
+  [ -n "$_id" ] || return 0
+  _rig=$(printf '%s' "$_b" | jq -r '.metadata["story.rig"] // ""' 2>/dev/null) || _rig=""
+  _PY_SCANNED=1
+  _PY_WAIT_ID="$_id"; _PY_WAIT_PRIO="$_cls"; _PY_WAIT_RIG="${_rig:-?}"
+  _PY_WAIT_POOL="${2:-?}"; _PY_WAIT_LIVE="${3:-?}"; _PY_WAIT_MAX="${4:-?}"
+  log "ga-5fn5p3: P$_cls $_id (rig $_PY_WAIT_RIG) was queued behind a full pool this sweep — from here on no P2+ bead opens a pool session until it has a slot."
+  return 0
+}
+
+# _pilot_priority_yield_for <bead-json> — exit 0 iff this bead must cede NOW: a head waiter is known, the rule is on, and the bead
+# is P2..P4 (class 2..4 — an unreadable class never cedes) and is not the waiter itself. Sets _PY_CAND_CLASS. Always a clean 0/1.
+_pilot_priority_yield_for() {
+  local _b="${1:-}" _cls _id
+  [ -n "${_PY_WAIT_ID:-}" ] || return 1
+  _pilot_priority_yield_enabled || return 1
+  _cls=$(_pilot_priority_class_of "$_b")
+  case "$_cls" in 2|3|4) ;; *) return 1 ;; esac
+  _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || _id=""
+  [ "$_id" != "$_PY_WAIT_ID" ] || return 1
+  _PY_CAND_CLASS="$_cls"
+  return 0
+}
+
+# _pilot_priority_yield_for_id <pool> <bead-id> — the same question for the pool TOP-UP, which holds an id, not a bead. The class
+# comes from the emit's map; a bead the emit did not carry (the top-up's filters are not the emit's chain) is read from its store.
+# A class that cannot be read at all does not cede (fail-open) and is counted in PRIORITY_YIELD_BLIND_TOPUP.
+_pilot_priority_yield_for_id() {
+  local _pool="${1:-}" _id="${2:-}" _cls="" _store _json
+  [ -n "${_PY_WAIT_ID:-}" ] || return 1
+  _pilot_priority_yield_enabled || return 1
+  [ -n "$_id" ] || return 1
+  if [ -n "${_PY_CLASS_BY_ID:-}" ]; then
+    _cls=$(printf '%s' "$_PY_CLASS_BY_ID" | jq -r --arg id "$_id" '.[$id] // empty' 2>/dev/null) || _cls=""
+  fi
+  if [ -z "$_cls" ]; then
+    if _store=$(_topup_pending_store "$_pool" "$_id") \
+       && _json=$(timeout 15 bd -C "$_store" show "$_id" --json 2>/dev/null) && [ -n "$_json" ]; then
+      _cls=$(_pilot_priority_class_of "$(printf '%s' "$_json" | jq -c 'if type == "array" then .[0] else . end' 2>/dev/null)")
+    fi
+  fi
+  case "$_cls" in
+    2|3|4) ;;
+    0|1|5) return 1 ;;
+    *)
+      PRIORITY_YIELD_BLIND_TOPUP=$((PRIORITY_YIELD_BLIND_TOPUP + 1))
+      warn "ga-5fn5p3: CANNOT TELL the priority of $_id (not in the emit's population and its store could not be read) — the $_pool top-up is not held back on a guess (fail-open, counted)."
+      return 1 ;;
+  esac
+  [ "$_id" != "$_PY_WAIT_ID" ] || return 1
+  _PY_CAND_CLASS="$_cls"
+  return 0
+}
+
+# _pilot_priority_yield_say <bead-id> <what happens> — THE log line (grep "cedida a P0/P1" answers "who yielded to whom").
+_pilot_priority_yield_say() {
+  log "ga-5fn5p3: $1 P${_PY_CAND_CLASS:-?} cedida a P0/P1 de ${_PY_WAIT_RIG:-?} (P${_PY_WAIT_PRIO:-?} ${_PY_WAIT_ID:-?} waits behind ${_PY_WAIT_POOL:-?} ${_PY_WAIT_LIVE:-?}/${_PY_WAIT_MAX:-?}) — $2"
+}
+
+# _pilot_priority_yield_release <bead-id> <bead-store> <builder-slot> <target> — dispatch_one()'s POST-claim exit for a bead that
+# cedes: the claim label and stamp go, the builder slot is given back, and for a wa-worker/ps-worker target the route is stamped
+# (the cap queue does the same BEFORE its check) so the next sweep takes dispatch_lane()'s zero-write pre-claim path instead of
+# claiming and releasing it again. A dog target is NOT stamped: gc.routed_to=gastown.dog would put the bead in front of the dog's
+# own probe — the one path this rule cannot see. DRY_RUN writes nothing. Every write is `|| true`: a failed release leaves
+# pilot:dispatching to the Step 0 TTL recovery, never a wedge. Always exit 0.
+_pilot_priority_yield_release() {
+  local _bid="$1" _city="$2" _builder="$3" _target="$4"
+  if [ "${DRY_RUN:-0}" != "1" ]; then
+    bd -C "$_city" label remove "$_bid" "pilot:dispatching" -q 2>/dev/null || true
+    bd -C "$_city" update "$_bid" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+    case "$_target" in
+      wa-worker|wa-worker-*) bd -C "$_city" update "$_bid" --set-metadata "gc.routed_to=wa-worker" -q 2>/dev/null || true ;;
+      ps-worker|ps-worker-*) bd -C "$_city" update "$_bid" --set-metadata "gc.routed_to=ps-worker" -q 2>/dev/null || true ;;
+    esac
+  fi
+  if [ -n "$_builder" ]; then unmark_pool_builder "$_builder"; fi
+  return 0
+}
+# SELFTEST-EXTRACT pilot-priority-yield: END
+
 _pilot_pool_topup() {
   local _pool="$1" _max="$2"
   local _live _global _pending _mig
@@ -9737,6 +9986,14 @@ _pilot_pool_topup() {
       fi
     fi
     [ -z "$_pending" ] && break
+    # ga-5fn5p3: the bead this session would be opened FOR is P2+ and a P0/P1 waits behind a full pool somewhere: no session.
+    # `_pending` is the pool's BEST pending bead, so if it cedes every other pending bead of the pool does too. Same inert
+    # outcome as every other top-up skip (nothing spawned, nothing written; the next sweep asks again).
+    if _pilot_priority_yield_for_id "$_pool" "$_pending"; then
+      _pilot_priority_yield_say "$_pending" "pool top-up for $_pool NOT opened (live=$_live < $_max, but a session for a P2+ bead would take the RAM the waiting P0/P1 needs); the bead stays story:approved + gc.routed_to=$_pool, no write."
+      PRIORITY_YIELDED=$((PRIORITY_YIELDED + 1))
+      break
+    fi
     if [ "$DRY_RUN" = "1" ]; then
       log "  ga-93yxc: DRY_RUN=1 — WOULD: pool top-up spawn $_pool for $_pending (live=$_live < $_max, global=$_global < $GC_VARIABLE_SESSION_MAX, no worker from a prior sweep's dispatch)"
       break
@@ -9759,6 +10016,12 @@ _pilot_pool_topup() {
       esac
       _live=$((_live + 1))
       _global=$((_global + 1))
+      # ga-5fn5p3: the dispatch lanes later in this sweep read the per-pool live count from the cache the scan above warmed
+      # (_PCAP_LIVE_*); a top-up spawn only ever raises it, so keep the cache as honest as dispatch_one()'s own spawn sites do.
+      case "$_pool" in
+        wa-worker) if [ -n "${_PCAP_LIVE_WA:-}" ]; then _PCAP_LIVE_WA=$(( _PCAP_LIVE_WA + 1 )); fi ;;
+        ps-worker) if [ -n "${_PCAP_LIVE_PS:-}" ]; then _PCAP_LIVE_PS=$(( _PCAP_LIVE_PS + 1 )); fi ;;
+      esac
     else
       break
     fi
@@ -9833,6 +10096,8 @@ if ! _TOPUP_RIG_PATHS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --
 fi
 _TOPUP_RIG_PATHS=$(printf '%s' "$_TOPUP_RIG_PATHS_JSON" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
 
+# ga-5fn5p3: who waits for capacity — asked ONCE, here, so the top-up below and the dispatch lanes later read the same answer.
+_pilot_priority_waiting_scan
 _pilot_heal_hq_blind_routes
 _pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
 _pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
@@ -12149,6 +12414,21 @@ LIVESEC
     esac
   fi
 
+  # ── ga-5fn5p3: PRIORITY ACROSS RIGS — a P2+ bead does not OPEN a pool session while a P0/P1 waits for capacity ──
+  # The builder is final here and NO prompt has been assembled yet (that is the ~1 min per candidate the ga-5je3zv incident
+  # measured), so this is the cheapest point that still knows the target. dispatch_lane() already skipped, with zero writes,
+  # every bead it could tell was pool-bound BEFORE the claim; what reaches here is the first sight of a bead (no gc.routed_to
+  # yet) or a rig whose builder only the routing above could name. Only a POOL target cedes: a named crew adds no session.
+  # See the "PRIORITY ACROSS RIGS" block above _pilot_pool_topup for the rule, the fail-open reading and the off switches.
+  local _PYS_TARGET
+  _PYS_TARGET=$(wa_worker_template "$BUILDER_TARGET")
+  if _pilot_priority_target_is_pool "$_PYS_TARGET" && _pilot_priority_yield_for "$STORY"; then
+    _pilot_priority_yield_say "$STORY_ID" "claim released before the prompt is built (target $_PYS_TARGET is a pool); stays story:approved, re-evaluated next sweep."
+    _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "$_PYS_TARGET"
+    DISPATCH_RESULT="priority_yield"
+    return 1
+  fi
+
   # ── wa-root-worktree-isolation: rig-root → worktree directive (best-effort) ───
   # Compute once; injected into either prompt below. Empty unless this build would
   # land in a rig's bare production root (see worktree_directive_for). Fail-open.
@@ -13583,9 +13863,18 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       dispatched on a doubt) and any name not classified here. Every "could not read" name is in
 #                       this bucket ON PURPOSE: it is the only place a permanent unknown stays visible — a guard
 #                       bucket would call it a policy refusal and hide a broken lookup.
+#   yielded_priority    ga-5fn5p3: a P2..P4 bead that CEDED to a P0/P1 waiting behind a full pool (the pre-claim zero-write
+#                       skip, or dispatch_one() after the builder was chosen — DISPATCH_RESULT priority_yield): deferred
+#                       by the cross-rig priority rule, not a fault and not a capacity queue. Never in NONQUEUE_FAILS;
+#                       counted on the saturation side of the predicate below. (A top-up that declined to open a session
+#                       for such a bead is not a candidate outcome — it appears in the log line "cedida a P0/P1" only.)
 #   unclassified        dispatch_one() returned non-zero WITHOUT naming a result (its early guards, a lost
 #                       claim, a hold): counted so the accounting closes — never read as a success
 #   pool_saturated      the ga-in9ebr predicate (_pool_saturated_sweep); consumers must not re-derive it
+#   priority_yield_blind  ga-5fn5p3: 1 iff this sweep could not tell which P0/P1 beads wait for capacity (the emit's
+#                       population or a pool's live session count was unreadable) — nothing was ceded on that doubt and
+#                       dispatch ran as before; 0 when it could tell; null when the scan never ran. "Could not tell"
+#                       must never read as "nobody waits": a persistently 1 here means the rule is not in force.
 #   halted              ga-5je3zv: null for a sweep that ran its dispatch phase to the end; otherwise the reason it
 #                       was cut short — "session-count-unreadable" (the live session count could not be read) or
 #                       "time-budget" (PILOT_DISPATCH_MAX_SECS spent). A sweep with halted != null has candidates
@@ -13624,6 +13913,7 @@ _pilot_sweep_emit() {
     --arg ts "$_ts" --arg dry_run "${DRY_RUN:-0}" \
     --arg saturated "${_pool_saturated_sweep:-0}" \
     --arg halted "${_PILOT_HALT:-}" \
+    --arg blind "$([ "${_PY_SCANNED:-0}" = "1" ] && printf '%s' "${_PY_BLIND:-}")" \
     --arg small "${SMALL_SLOTS:-0}" --arg big "${BIG_SLOTS:-0}" '
     def num($s): (try ($s | tonumber) catch null);
     def cls($o):
@@ -13631,6 +13921,7 @@ _pilot_sweep_emit() {
       elif $o.r == "rig_native_pool_session_cap_queued" then "queued_pool_cap"
       elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
+      elif $o.r == "priority_yield" then "yielded_priority"
       elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow"]
            | any(.[]; . == $o.r) then "refused_by_guard"
       elif $o.r == "" then "unclassified"
@@ -13646,10 +13937,12 @@ _pilot_sweep_emit() {
         queued_pool_cap: n("queued_pool_cap"),
         queued_global_cap: n("queued_global_cap"),
         spawn_failed: n("spawn_failed"),
+        yielded_priority: n("yielded_priority"),
         refused_by_guard: tally([$outs[] | select(cls(.) == "refused_by_guard") | .r]),
         failed_other: n("failed_other"),
         unclassified: n("unclassified"),
         pool_saturated: num($saturated),
+        priority_yield_blind: num($blind),
         halted: (if $halted == "" then null else $halted end),
         small_slots: num($small), big_slots: num($big),
         results: tally([$outs[] | select(.r != "") | .r]) }
@@ -13715,7 +14008,22 @@ dispatch_lane() {
     # ~5 Dolt writes per queued bead per sweep (claim → cap → release). No slot is
     # consumed and the loop simply moves to the next candidate, so a full pool never
     # blocks a candidate for a pool that has room (see dispatch_one()/_pilot_pool_cap_full_for).
+    # ── ga-5fn5p3: a P2+ bead KNOWN to go to a pool cedes to a P0/P1 that waits for capacity — BEFORE the claim ──
+    # Zero writes, same shape as the cap skip below (and for the same reason: claim → stamp → release on every sweep is
+    # exactly the churn ga-in9ebr removed). Placed first so a ceded P2 in a full pool reads "cedida", not "QUEUED".
+    # Not a fault and not a capacity queue: it feeds PRIORITY_YIELDED, which the saturation predicate below counts, and
+    # never NONQUEUE_FAILS. A bead whose pool cannot be told before the claim (a first-sight WA/PS bead) is decided in
+    # dispatch_one(), once the builder is chosen. See the "PRIORITY ACROSS RIGS" block above _pilot_pool_topup.
+    if _pilot_priority_pool_bound_pre "$pick" && _pilot_priority_yield_for "$pick"; then
+      _pilot_priority_yield_say "$pick_id" "not claimed, no writes this sweep; stays story:approved and is re-evaluated every sweep."
+      _pilot_sweep_note "$pick_id" 1 "priority_yield"
+      PRIORITY_YIELDED=$((PRIORITY_YIELDED + 1))
+      continue
+    fi
+
     if _pilot_pool_cap_full_for "$pick"; then
+      # ga-5fn5p3: a P0/P1 queued behind a full pool IS a waiter, whether or not the sweep-start scan already knew it.
+      _pilot_priority_waiter_note "$pick" "$_PCAP_POOL" "$_PCAP_LIVE" "$_PCAP_MAX"
       if _pilot_note_pool_cap_queued "$pick_id"; then
         log "ga-in9ebr: $pick_id QUEUED — routed to $_PCAP_POOL, pool at session cap ($_PCAP_LIVE active/creating >= $_PCAP_MAX max); not claimed, no writes this sweep (the ga-93yxc pool top-up opens a session once a slot frees)."
       fi
@@ -13773,8 +14081,14 @@ dispatch_lane() {
       # ga-ov3gow: record WHY it did not dispatch (DISPATCH_RESULT, "" when dispatch_one() returned from
       # one of its early guards without naming a reason) for the per-sweep `pilot_sweep` event.
       _pilot_sweep_note "$pick_id" 1 "${DISPATCH_RESULT:-}"
-      if [ "$_PCAP_CALL_QUEUED" != "1" ]; then
+      if [ "${DISPATCH_RESULT:-}" = "priority_yield" ]; then
+        # ga-5fn5p3: dispatch_one() ceded this bead after its builder was chosen — not a fault, so not a NONQUEUE_FAIL.
+        PRIORITY_YIELDED=$((PRIORITY_YIELDED + 1))
+      elif [ "$_PCAP_CALL_QUEUED" != "1" ]; then
         NONQUEUE_FAILS=$((NONQUEUE_FAILS + 1))
+      else
+        # ga-5fn5p3: a capacity queue (per-pool or global cap) of a P0/P1 makes it a waiter from here on in this sweep.
+        _pilot_priority_waiter_note "$pick"
       fi
       # ga-5je3zv: dispatch_one() reached its fail-closed count gate and could not READ the session count
       # (first-sight candidate: the pre-claim probe only covers beads already committed to a pool). The claim
@@ -13846,15 +14160,25 @@ fi
 # predicate, two consumers: the POOL-SATURATED marker below — the line other detectors read, since
 # the sweep-complete line only carries LANE slots and cannot tell a busy pool from a stall — and
 # the Step 5 stall gate.
+#
+# ga-5fn5p3: a candidate that CEDED to a P0/P1 waiting for capacity (PRIORITY_YIELDED) is the same backpressure: the sweep
+# dispatched nothing because the capacity there is, is spoken for by a higher priority — not because the Pilot stalled. It
+# counts on the same side of the predicate as a queue (and, like a queue, never in NONQUEUE_FAILS); without it a sweep that
+# only ceded would trip the Step 5 "Pilot estagnado" streak and imparavel-check's silent-stall alarm.
 _pool_saturated_sweep=0
-if [ "$DISPATCHED" -eq "0" ] && [ "${POOL_CAP_QUEUED:-0}" -gt 0 ] && [ "${NONQUEUE_FAILS:-0}" -eq 0 ]; then
+if [ "$DISPATCHED" -eq "0" ] && [ $(( ${POOL_CAP_QUEUED:-0} + ${PRIORITY_YIELDED:-0} )) -gt 0 ] && [ "${NONQUEUE_FAILS:-0}" -eq 0 ]; then
   _pool_saturated_sweep=1
 fi
 if [ "${POOL_CAP_QUEUED:-0}" -gt 0 ] 2>/dev/null; then
   log "ga-in9ebr: pool-cap queued this sweep: ${POOL_CAP_QUEUED} candidate(s) (left story:approved + gc.routed_to, NOT marked in-flight; the ga-93yxc top-up opens a session as slots free)."
 fi
+if [ "${PRIORITY_YIELDED:-0}" -gt 0 ] 2>/dev/null; then
+  log "ga-5fn5p3: priority yield: ${PRIORITY_YIELDED} P2+ candidate(s) ceded this sweep to P${_PY_WAIT_PRIO:-?} ${_PY_WAIT_ID:-?} (rig ${_PY_WAIT_RIG:-?}, ${_PY_WAIT_POOL:-?} ${_PY_WAIT_LIVE:-?}/${_PY_WAIT_MAX:-?}) — left story:approved, NOT claimed; they dispatch again the first sweep no P0/P1 waits for capacity."
+fi
 if [ "$_pool_saturated_sweep" = "1" ]; then
-  log "ga-in9ebr: POOL-SATURATED sweep — dispatched=0 only because ${POOL_CAP_QUEUED} candidate(s) are queued behind full worker capacity (backpressure, not a stall)."
+  _py_sat_note=""
+  if [ "${PRIORITY_YIELDED:-0}" -gt 0 ]; then _py_sat_note=" and ${PRIORITY_YIELDED} ceded to a P0/P1 that waits for it (ga-5fn5p3)"; fi
+  log "ga-in9ebr: POOL-SATURATED sweep — dispatched=0 only because ${POOL_CAP_QUEUED:-0} candidate(s) are queued behind full worker capacity${_py_sat_note} (backpressure, not a stall)."
 fi
 
 if [ "$DISPATCHED" -eq "0" ]; then

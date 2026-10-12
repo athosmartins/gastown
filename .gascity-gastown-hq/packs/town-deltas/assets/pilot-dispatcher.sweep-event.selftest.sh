@@ -174,8 +174,35 @@ expect '.results.rig_native_pool_session_cap_queued' '2' "A2: results is the per
 expect '.results | has("")' 'false' "A2: the nameless exit has no results key (it is only in unclassified)"
 
 # A3 — the buckets add up to candidates: nothing is dropped and nothing is counted twice.
-expect '.candidates == (.dispatched + .queued_pool_cap + .queued_global_cap + .spawn_failed + ([.refused_by_guard[]] | add // 0) + .failed_other + .unclassified)' 'true' \
+expect '.candidates == (.dispatched + .queued_pool_cap + .queued_global_cap + .spawn_failed + .yielded_priority + ([.refused_by_guard[]] | add // 0) + .failed_other + .unclassified)' 'true' \
        "A3: candidates == sum of every bucket (accounting closes)"
+
+# A3b — ga-5fn5p3: a P2..P4 bead that ceded to a waiting P0/P1 is its own bucket. It is not a fault (failed_other), not a
+# guard refusal (refused_by_guard) and not a capacity queue of ITS OWN pool (queued_pool_cap): the painel must be able to tell
+# "the Pilot held P2 work back on purpose" from all three. Accounting still closes with the new bucket in the sum.
+run_sweep 'y1 1 priority_yield
+y2 1 priority_yield
+d1 0 rig_native_ok
+q1 1 rig_native_pool_session_cap_queued
+f1 1 rig_assign_failed' >/dev/null 2>&1
+expect '.yielded_priority' '2'     "A3b: priority_yield → yielded_priority, counted per bead"
+expect '.failed_other' '1'         "A3b: …and NOT in failed_other (only the real assign failure is)"
+expect '.refused_by_guard | length' '0' "A3b: …and NOT a guard refusal"
+expect '.queued_pool_cap' '1'      "A3b: …and not a pool-cap queue (the ceding bead's own pool may have room)"
+expect '.results.priority_yield' '2' "A3b: results carries the result BY NAME, as for every other outcome"
+expect '.candidates == (.dispatched + .queued_pool_cap + .queued_global_cap + .spawn_failed + .yielded_priority + ([.refused_by_guard[]] | add // 0) + .failed_other + .unclassified)' 'true' \
+       "A3b: accounting closes with the new bucket"
+run_sweep '' >/dev/null 2>&1
+expect '.yielded_priority' '0'     "A3b: a sweep with no ceding bead has a present numeric 0 (absent vs 0 would be two states)"
+
+# A3c — priority_yield_blind: null when the yield scan never ran this sweep (not 0: 0 would claim "I looked and could tell"),
+# 1 when it ran and could not tell which P0/P1 wait, 0 when it ran and could.
+run_sweep '' >/dev/null 2>&1
+expect '.priority_yield_blind' 'null' "A3c: the scan never ran → priority_yield_blind is null, never a 0 that claims it looked"
+_PY_SCANNED=1 _PY_BLIND=1 run_sweep '' >/dev/null 2>&1
+expect '.priority_yield_blind' '1'    "A3c: the scan ran and could not tell → priority_yield_blind=1 (the painel's cannot-tell tile)"
+_PY_SCANNED=1 _PY_BLIND=0 run_sweep '' >/dev/null 2>&1
+expect '.priority_yield_blind' '0'    "A3c: the scan ran and could tell → 0"
 
 # A4 — a bead the rig fallback re-walks counts ONCE, as it ended (last outcome wins).
 run_sweep 'r1 1 sling_no_bead_id
@@ -287,7 +314,7 @@ fi
 # B4 — drift guard. A new DISPATCH_RESULT literal that is not classified would silently land in
 # failed_other: a BENIGN new state (e.g. another kind of queue) would then read as a Pilot failure on
 # the painel. Adding a result now means classifying it in _pilot_sweep_emit AND listing it here.
-KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow remerge_branch_lookup_unknown hq_pool_store_blind pool_store_unknown "
+KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow remerge_branch_lookup_unknown hq_pool_store_blind pool_store_unknown priority_yield "
 # (rig_native_pool_count_unreadable, ga-oa004t: the session count could not be READ, so the spawn was not
 #  attempted — a FAULT, deliberately left in failed_other and NOT in a *_queued bucket: a dead `session list`
 #  is not a busy pool, and filing it as saturation would hide it from the Step 5 stall gate.)
@@ -296,6 +323,9 @@ KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queue
 #  NOTHING and the sweep moved on. Same call as above, on purpose: it stays in failed_other, because that is
 #  the ONLY place a PERMANENT unknown is visible (the bead keeps its labels and is retried every sweep, with no
 #  label/comment of its own). A guard bucket would read as "a policy refused it" and hide a broken lookup.)
+# (priority_yield, ga-5fn5p3: a P2..P4 bead CEDED to a P0/P1 waiting behind a full pool. Nothing failed and nothing was
+#  refused by a guard — it is deferred BY POLICY and re-evaluated next sweep — so it has its OWN bucket, yielded_priority:
+#  in failed_other it would read as a Pilot fault, in refused_by_guard as a guard that fired.)
 unclassified_names=""
 for _lit in $(grep -oE 'DISPATCH_RESULT="[a-z_0-9]+"' "$DISPATCHER" | sed 's/.*="//; s/"$//' | sort -u); do
   case "$KNOWN_RESULTS" in *" $_lit "*) : ;; *) unclassified_names="$unclassified_names $_lit" ;; esac
