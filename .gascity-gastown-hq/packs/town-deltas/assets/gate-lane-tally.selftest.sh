@@ -127,6 +127,10 @@ PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$L" --now "$NO
 # notify absent: history still written, and it SAYS so
 PATH="/usr/bin:/bin" python3 "$TALLY" --log "$L" --now "$NOW" --weekly --out "$T/h2.jsonl" >/dev/null 2>"$T/e2"; rc=$?
 [ "$rc" = "0" ] && [ -s "$T/h2.jsonl" ] && grep -q 'notify. is not on PATH' "$T/e2" && ok "notify missing: tally still recorded, and the gap is reported on stderr" || bad "notify missing: rc=$rc $(cat "$T/e2")"
+# notify present but REFUSING (exit != 0): same promise — the tally is recorded, the run does not fail, and the stderr says the line never went out
+mkdir -p "$T/bin-refuse"; printf '#!/bin/bash\nexit 3\n' > "$T/bin-refuse/notify"; chmod +x "$T/bin-refuse/notify"
+PATH="$T/bin-refuse:/usr/bin:/bin" python3 "$TALLY" --log "$L" --now "$NOW" --weekly --out "$T/h3.jsonl" >/dev/null 2>"$T/e3"; rc=$?
+[ "$rc" = "0" ] && [ -s "$T/h3.jsonl" ] && grep -q 'notify. exited 3' "$T/e3" && ok "notify refusing (exit 3): tally still recorded, rc 0, and the failed send is reported on stderr" || bad "notify refusing: rc=$rc $(cat "$T/e3")"
 
 # the CODES are the contract with the producers: every code the lib / dispatcher can emit is bucketed, and no
 # bucket is dead. (The tally once matched the free-text reason; the lib's sentence differed, and ~96% of decisions

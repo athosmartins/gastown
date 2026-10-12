@@ -225,7 +225,9 @@ def main(argv):
                 if r["lane_revoked_at_push"]:
                     line += f"; {r['lane_revoked_at_push']} lane(s) revogada(s) no push"
                 try:
-                    subprocess.run(["notify", "-k", "info", "-t", "Gate fast-lane (semana)", "-p", "2", line], timeout=30, check=False)
+                    sent = subprocess.run(["notify", "-k", "info", "-t", "Gate fast-lane (semana)", "-p", "2", line], timeout=30, check=False)
+                    if sent.returncode != 0:   # a notify that ran and refused is as silent as one that is missing: say so
+                        print(f"gate-lane-tally: `notify` exited {sent.returncode} — tally appended to the history file only", file=sys.stderr)
                 except Exception as e:  # a failed notification must not fail the tally
                     print(f"gate-lane-tally: notify failed: {e!r}", file=sys.stderr)
     return 0
