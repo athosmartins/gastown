@@ -17,6 +17,7 @@ trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 mkdir -p "$T/bin" "$T/city/.gc/logs" "$T/wt/tests" "$T/wt/tests/sub" "$T/other"
 : > "$T/wt/tests/test_a.py"; : > "$T/wt/tests/test_b.py"; : > "$T/wt/tests/sub/test_c.py"
 printf 'DB = "shared/data/x.db"\n' > "$T/wt/tests/test_db.py"
+printf '# so cita shared/data num comentario\n    # (idem, indentado)\ndef test_x(): pass\n' > "$T/wt/tests/test_coment.py"
 : > "$T/other/test_out.py"
 
 # stub do mbp-run: registra os argumentos (um por linha) e devolve o que o caso mandou.
@@ -117,6 +118,10 @@ reset; rc=$(run -- tests/nao_existe.py -q); expect "alvo inexistente" 0 "$rc"; h
 reset; rc=$("$GP" --dir "$T/wt" -- tests/test_a.py -q >"$T/out" 2>"$T/err"; echo $?); expect "repo sem espelho (nem wa nem ps)" 0 "$rc"
 has "sem espelho: motivo" "$LOG" 'repo-sem-espelho'; hasnt "sem espelho: sem MBP" "$STUB_LOG" 'MBP_CALL'
 
+# 7a comentário que só cita shared/data NÃO manda o arquivo para cá (medido: falso positivo que jogava fora o ganho)
+reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_coment.py -q); expect "comentário com shared/data" 0 "$rc"
+has "comentário: vai ao MBP" "$STUB_LOG" 'MBP_CALL'; hasnt "comentário: não roda aqui" "$STUB_LOG" 'LOCAL_CALL'
+
 # 7b divisão por alvo: o que fica aqui NÃO arrasta os outros para cá
 reset; mbp_out "2 passed in 1.0s"; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_db.py -x -q); expect "divisão: a no MBP, db aqui" 0 "$rc"
 sed -n '/^MBP_CALL/,/^LOCAL_CALL/p' "$STUB_LOG" > "$T/mbp-part.log"; sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-part.log"
@@ -137,6 +142,14 @@ count "divisão + MBP fora: test_db roda uma vez só" "$T/local-part.log" 'arg:t
 # tudo local por lista: sem MBP e o comando é o de hoje
 reset; printf 'tests/test_a.py\ntests/test_b.py\n' > "$T/force-local.txt"; rc=$(run -- tests/test_a.py tests/test_b.py -q); expect "todos os alvos na lista" 0 "$rc"
 hasnt "todos na lista: sem MBP" "$STUB_LOG" 'MBP_CALL'; has "todos na lista: motivo" "$LOG" 'todos-ficam-aqui'; count "todos na lista: UMA chamada local" "$STUB_LOG" 'LOCAL_CALL' 1
+
+# 7c combinação dos rc na divisão: -k que não casa na parte local (rc 5) não apaga o verde do MBP; rc estranho (137) nunca vira 0
+reset; mbp_out "1 passed in 1.0s"; rc=$(STUB_LOCAL_RCS=5 run -- tests/test_a.py tests/test_db.py -q); expect "divisão: MBP verde + local rc 5 → 0" 0 "$rc"
+reset; mbp_out "1 passed in 1.0s"; rc=$(STUB_LOCAL_RCS=137 run -- tests/test_a.py tests/test_db.py -q); expect "divisão: local morto por sinal (137) NÃO vira 0" 137 "$rc"
+reset; mbp_out "1 passed in 1.0s"; rc=$(STUB_LOCAL_RCS=2 run -- tests/test_a.py tests/test_db.py -q); expect "divisão: local interrompido (2) vale" 2 "$rc"
+reset; export STUB_MBP_RC=2 STUB_LOCAL_RCS="5 5"; rc=$(run -- tests/test_a.py tests/test_db.py -q); unset STUB_MBP_RC STUB_LOCAL_RCS; expect "divisão: nenhuma parte coletou (5 e 5) → 5" 5 "$rc"
+# sem arquivo temporário não há MBP: roda aqui como hoje
+reset; rc=$(TMPDIR="$T/nao-existe" run -- tests/test_a.py -q); expect "mktemp falha → roda aqui" 0 "$rc"; hasnt "mktemp falha: não chama o MBP" "$STUB_LOG" 'MBP_CALL'; has "mktemp falha: motivo" "$LOG" 'mktemp-falhou'
 
 # 8 argumentos chegam como o revisor escreveu
 reset; mbp_out "1 passed in 0.1s"; rc=$(run -- "$T/wt/tests/test_a.py" -k "foo and bar" -q); expect "caminho absoluto dentro do worktree" 0 "$rc"

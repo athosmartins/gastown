@@ -23,7 +23,10 @@
 #   • rc 0 e nada pulado  → vale o MBP.
 #   • rc 0 com testes pulados → os ARQUIVOS que pularam rodam aqui de novo (um skip por dado ausente não pode virar "passou").
 #   • rc 1 (falhou)       → SÓ os node ids que falharam rodam aqui de novo; o resultado de lá é o que vale (e é dito).
+#   • rc 1 sem ids legíveis, mais de 50 reprovados, ou ids que não se reconhecem aqui (rc 4/5) → o comando inteiro roda aqui.
 #   • qualquer outro rc, ou MBP caiu no meio → o comando inteiro roda aqui.
+#   • DIVISÃO: o que não pode ir ao MBP (lê shared/data em linha de código, está na lista force-local) roda aqui, SEPARADO, e o que
+#     pode vai ao MBP; os dois rc se combinam (o pior vale; 5 só se nenhuma parte coletou teste).
 #   A última linha impressa diz onde rodou e quanto levou: `gate-pytest: ran=mbp|local|mbp+local rc=N secs=N ...`.
 #
 # CÓDIGOS DE SAÍDA: o rc do pytest que VALE (0..5). Nunca 96..99: esses são do mbp-run e aqui viram "rodou aqui". 4 = uso errado.
@@ -115,6 +118,7 @@ done
 
 # ---- repo: o MBP só tem espelho de wa e ps ----------------------------------------------------------------------------
 if [ -z "$repo" ]; then
+  # vazio / falhou (git não responde, o dir não é um repo) → repo desconhecido → cai em "repo-sem-espelho-no-mbp" e roda aqui.
   gc_dir=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
   case "$gc_dir$dir" in
     *whatsapp_automation*) repo=wa ;;
@@ -142,10 +146,12 @@ if [ -z "$LOCAL_REASON" ]; then
       done < "$FORCE_LOCAL_LIST"
     fi
     # Ler o arquivo de teste: vazio (sem a assinatura) → não lê shared/data; falhou/ilegível (não abro o arquivo) → fica AQUI
-    #   (o inerte), nunca vai para o MBP no escuro.
+    #   (o inerte), nunca vai para o MBP no escuro. Linha de COMENTÁRIO não conta: medido no WA, um arquivo que só CITA shared/data
+    #   num comentário passa em 1,2 s no MBP e levava ~20 s aqui. Quem lê dado de verdade pode passar VAZIO no MBP (sem o banco, o
+    #   resultado vazio satisfaz a asserção) — é essa a classe que o MBP não pode julgar sozinho.
     if [ -z "$why" ]; then
-      if grep -q -s 'shared/data' "$dir/$f" 2>/dev/null; then why="le-shared-data:$f"
-      elif [ ! -r "$dir/$f" ]; then why="alvo-ilegivel:$f"; fi
+      if [ ! -r "$dir/$f" ]; then why="alvo-ilegivel:$f"
+      elif grep -v -E '^[[:space:]]*#' "$dir/$f" 2>/dev/null | grep -q 'shared/data'; then why="le-shared-data:$f"; fi
     fi
     if [ -n "$why" ]; then local_targets+=("$t"); LOCAL_NOTES="${LOCAL_NOTES}${LOCAL_NOTES:+;}$why"; else mbp_targets+=("$t"); fi
   done
@@ -156,8 +162,9 @@ fi
 
 # ---- execução ---------------------------------------------------------------------------------------------------------
 T_START=$(date +%s); MBP_SECS=0; LOCAL_SECS=0; RAN=local; RC=0; DETAIL=""
-OUT=$(mktemp "${TMPDIR:-/tmp}/gate-pytest.XXXXXX") || { say "mktemp falhou"; exit 4; }
-trap 'rm -f "$OUT"' EXIT
+# sem arquivo temporário não dá para ler a saída do MBP (vermelho/pulado): então não vai ao MBP — roda aqui, como hoje.
+OUT=$(mktemp "${TMPDIR:-/tmp}/gate-pytest.XXXXXX") || { OUT=""; [ -n "$LOCAL_REASON" ] || LOCAL_REASON="mktemp-falhou"; }
+trap '[ -n "$OUT" ] && rm -f "$OUT"' EXIT
 
 run_local() {   # <args do pytest...>: roda como o revisor rodava, no worktree dele, com o python3 dele
   local t0 rc
@@ -167,11 +174,13 @@ run_local() {   # <args do pytest...>: roda como o revisor rodava, no worktree d
   LOCAL_SECS=$(( LOCAL_SECS + $(date +%s) - t0 ))
   return $rc
 }
-merge_rc() {    # dois rc do pytest → o pior: 2/3/4 (interrompido, interno, uso) > 1 (falhou) > 5 (nada coletado) > 0
+merge_rc() {    # dois rc do pytest → o que vale: qualquer coisa fora de 0/1/5 (2 interrompido, 3 interno, 4 uso, 137 morto por sinal...) é o pior;
+                # depois 1 (falhou); 5 (nada coletado) só vale se AS DUAS partes não coletaram nada — um -k que não casa numa das partes
+                # é normal e não apaga o que a outra rodou; e 0.
   local r
-  for r in "$1" "$2"; do case "$r" in 2|3|4) echo "$r"; return ;; esac; done
+  for r in "$1" "$2"; do case "$r" in 0|1|5) ;; *) echo "$r"; return ;; esac; done
   for r in "$1" "$2"; do [ "$r" = 1 ] && { echo 1; return; }; done
-  for r in "$1" "$2"; do [ "$r" = 5 ] && { echo 5; return; }; done
+  if [ "$1" = 5 ] && [ "$2" = 5 ]; then echo 5; return; fi
   echo 0
 }
 # o comando inteiro "aqui" da parte que ia ao MBP: sem divisão é EXATAMENTE o que o revisor escreveu

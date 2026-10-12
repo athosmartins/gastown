@@ -2,8 +2,9 @@
 
 ## Contents
 
-• Por quê e resultado medido (11/10/2026) · Como ligar e desligar · Como usar · Códigos de saída
-• O que mora no MBP (`~/gt-remote`) · Manutenção · Limites conhecidos
+• Por quê e resultado medido (11/10/2026) · Como ligar e desligar · Como usar
+• Revisor do gate (ga-xm1jfl) · Códigos de saída · O que mora no MBP (`~/gt-remote`) · Manutenção
+• Limites conhecidos
 
 ## Por quê e resultado medido (11/10/2026)
 O mini vive com load 40-60, swap alto e o Dolt único; o MacBook Pro (16 GB, 12 CPUs, ~130 GB livres) estava ocioso.
@@ -41,6 +42,23 @@ Quem chama trata rc 96..99 como "rode local", nunca como teste reprovado.
 
 Os workers de pool (wa-worker e ps-worker) recebem essa regra no preâmbulo: seção guardada `mbp-offload-tests` do fragment `town-deltas` (ga-yvs19w), registrada em `doctrine.guarded` do `pool-roles.json` com `show_unset: false` — Mayor, crews, dog e revisores não a recebem. Com a chave desligada o `mbp-run.sh` sai 99 e o worker roda local, então a linha é segura mesmo com o offload off.
 
+## Revisor do gate (ga-xm1jfl)
+O revisor do gate gastava ~9,6 de 20,5 min por sessão rodando/esperando teste no mini (ga-bk5j8u). Ele monta um worktree no scratchpad e roda `python3 -m pytest` (medido nas 40 últimas transcrições: nunca `pytest` solto — por isso um atalho no PATH não pegaria nada). A troca é um comando explícito, anunciado no prompt da tarefa (parágrafo `TEST WRAPPER`, depois de `RUNNING TESTS`):
+```bash
+scripts/gate-pytest.sh --dir <worktree> -- tests/test_x.py tests/test_y.py -x -q   # a última linha: gate-pytest: ran=mbp|local|mbp+local rc=N secs=N ...
+```
+**Em que o revisor acredita.** Só em verde do MBP. O MBP não tem `shared/data`, `.env` nem o python3 do mini, então vermelho ou teste pulado lá pode ser do ambiente:
+| Resultado no MBP | O que o wrapper faz | rc final |
+|---|---|---|
+| verde, nada pulou | vale o MBP | 0 |
+| verde com pulados | os arquivos que pularam rodam aqui | o de lá |
+| vermelho (rc 1) | só os node ids que falharam rodam aqui; o daqui vale e a linha final diz `local-confirmou` ou `local-NAO-confirmou` | o de lá |
+| 96..99 (off, sem saúde, config, slots cheios) ou qualquer rc estranho | o comando inteiro roda aqui, igual ao de hoje | o de lá |
+Ficam aqui desde o começo, **alvo a alvo** (o que fica não arrasta os outros): arquivo que cita `shared/data` em linha de código (comentário não conta — medido: um arquivo que só citava no comentário passa em 1,2 s no MBP e levava ~20 s aqui), arquivo na lista `scripts/gate-pytest.force-local` (globs, um por linha), diretório como alvo, flag que depende do disco daqui (`--junitxml`, `--basetemp`, `--lf`, `--cov-report`, `--rootdir`...), caminho fora do worktree, repo que não é wa/ps. O wrapper nunca devolve 96..99: o revisor só vê rc de pytest (0..5) e 4 = uso errado.
+**Chaves.** `touch $CITY/.gc/gate-pytest.off` desliga SÓ este caminho e tira o parágrafo do prompt na próxima tarefa gerada (apague para religar); `mbp-offload.sh off` desliga tudo, e o parágrafo some pelo mesmo motivo. Com qualquer das duas, o prompt do revisor é byte-idêntico ao de antes (selftest `gate-test-wrapper-rules.selftest.sh`).
+**Medir.** Cada execução acrescenta uma linha em `$CITY/.gc/logs/gate-pytest.jsonl`. `scripts/gate-review-test-time.py dias` dá `revisao_media_min` por dia (mesmo filtro do painel); `sessoes --n 20 --corte <ISO do deploy>` compara os minutos esperando teste por sessão antes×depois (limite inferior: só conta chamada que cita pytest); `wrapper --desde <ISO>` mostra mbp×local e os motivos de rodar aqui.
+**Medido ao vivo (12/10, WA, mini com load 88):** 4 arquivos / 122 testes de lot_groups: 75 s rodando local (hoje) → 8 s pelo wrapper (MBP quente). Com 1 arquivo que lê dado de verdade, a divisão deu 38 s (6 s MBP + 31 s aqui). Vermelho só-de-ambiente: o MBP reprova, o id roda aqui, passa, e o wrapper devolve 0 com `AVISO`; vermelho real: rc 1, `local-confirmou`.
+
 ## Códigos de saída
 0..95 = rc do pytest/comando remoto (propagado) · 99 offload desligado · 98 MBP indisponível ou sem saúde (veja o critério abaixo) · 97 configuração (uso errado, base ausente → `--seed`) · 96 três slots ocupados.
 Limiares ajustáveis por ambiente: `MBP_MIN_AVAIL_MB`, `MBP_MAX_PRESSURE_LEVEL`, `MBP_MAX_SWAP_GROWTH_MB`, `MBP_SWAP_SAMPLE_S`, `MBP_MAX_SWAP_MB`, `MBP_MIN_BATT`, `MBP_MAX_SLOTS`, `MBP_RUN_TIMEOUT_S`.
@@ -77,5 +95,6 @@ O swap usado, sozinho, NÃO recusa até o teto: o macOS não devolve swap depois
 ## Limites conhecidos
 - **Swap do MBP (resolvido em ga-9e2rjh):** o macOS não devolve o arquivo de swap depois de uma pressão; o MBP ocioso fica em 4,9-5,2 GB "usados". O limiar fixo de 5 GB recusou, em 11/10, uma execução com 5.248 MB de swap e 3,8 GB de RAM disponível. O critério agora é RAM + pressão + crescimento do swap (tabela acima), e o limiar de swap virou só um teto absoluto, que subiu de 5 para 8 GB. Medição de aceite: recusas indevidas = 0 em 3 dias. Conferir com `scripts/mbp-offload.sh counts` (ou a linha "últimas 72 h" do `status`): recusa por `swap_teto` ou `swap_cresce` com RAM e pressão normais é o sinal de que o critério precisa de ajuste; `ilegivel:*` é o MBP respondendo lixo, não swap alto. A contagem tem três respostas que não se confundem: `sem log ainda`, `ilegível` (o log existe mas não deu para ler) e `recusas: nenhuma` (lido, e sem recusa). Linha do log que não deu para ler (truncada, sem motivo, data inválida) vem avisada no fim ("N linha(s) ilegível(is) no log"): se aparecer, a contagem não está completa, então olhe o log antes de concluir "0 recusas indevidas".
 - Teste que lê `shared/data/*.db` falha no MBP (os bancos não são enviados): o runner imprime uma nota; rode esse teste local.
+- Teste que lê dado POR UM CAMINHO QUE O WRAPPER NÃO VÊ (constante numa lib, não `shared/data` literal no arquivo) pode passar VAZIO no MBP. O wrapper do revisor só confere aqui o que o MBP reprova ou pula; um verde vazio passa. Quando acontecer, acrescente o arquivo em `scripts/gate-pytest.force-local`.
 - Cada execução paga ~6 s de ssh/rsync mais o preflight (intervalo de 2 s entre as duas leituras do swap + o tempo das leituras: ~3 s medidos de relógio); testes de menos de ~10 s não valiam o offload e agora valem menos ainda.
 - A linha "MBP SEM SAÚDE (rc=98)" do `status` mostra só os pares `chave=valor` crus; o MOTIVO (`ram`, `swap_cresce`...) só aparece para recusas de execuções reais, que vão para o log (`mbp-offload.sh counts` e as últimas linhas do `status`); o `--check` que o `status` roda não grava recusa, então para ver "por que agora?" leia os pares `chave=valor` contra a tabela acima.
