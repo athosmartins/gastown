@@ -60,6 +60,32 @@
 # history copy. A configured path that doesn't exist is skipped, not an
 # error (a daemon may not have started yet, or may have been retired).
 #
+# SECOND CLASS — TAIL-CAP (ga-52drsg): the city's own daemon logs. 2026-10-12
+# the Mayor found the disk at 348MB free (swap 8GB) with SEVEN of the city's
+# own logs past 100MB, ~920MB together: .gc/runtime/control-dispatcher-trace.log
+# 205MB, ~/.gc/supervisor.log 141MB, scratchpad-reaper.log 124MB,
+# gate-merge-survival-sweep.log + -launchd.out 2x122MB, lifecycle-coherence-
+# janitor.log 107MB, production-drift-guard-launchd.err 99MB. None was in the
+# list above (which only covers the app logs of ga-dnc2m), so this reaper
+# logged "checked=6 rotated=0" every cycle while they grew — the same shape
+# as ga-dnc2m, one file class over. These get a different treatment from the
+# first class because they are the logs somebody reads to debug the city:
+# instead of a full copy to `.1` and an empty file, the LAST keep-MB stay in
+# the live file and nothing else is kept (no `.1`: the disk was the reason we
+# are here, and a second generation per file would put ~140MB back).
+#   trigger: size >= LOG_REAPER_CAP_MB (default 20)  — inclusive, same idiom.
+#   result : the last LOG_REAPER_KEEP_MB (default 10) bytes, in place.
+# The writers all open these files O_APPEND (launchd StandardOut/ErrorPath,
+# `>>` in the scripts, the engine's trace) — checked by the Mayor's own manual
+# truncate (14:46-14:49 the same day): all seven were still tiny 40 minutes later,
+# not a sparse file at its old offset. A writer that does NOT open with
+# O_APPEND would keep writing at its old offset after the truncate and turn
+# the file sparse (st_size back over the cap), so do not add a path here
+# before checking how its writer opens it.
+# Paths: LOG_REAPER_CAP_PATHS (empty value = none, which is how a test turns
+# the class off; unset = the real list below, except in library mode — a
+# sourced selftest never targets production paths it did not name).
+#
 # Kill switch: LOG_REAPER_ENABLED=0 -> no-op every cycle (logs skip reason).
 #
 # PRODUCTION SENTINEL (same ga-h565g pattern as scratchpad-reaper.sh /
@@ -92,7 +118,24 @@ LOG_REAPER_REAL_DEFAULT_PATHS="/private/tmp/appium_server.log
 /Users/athos/shared/logs/daemon_dashboard_stderr.log
 /Users/athos/shared/logs/classification_dashboard_stderr.log"
 
+# ga-52drsg tail-cap class (see header). Same newline-joined-string idiom.
+LOG_REAPER_CAP_REAL_DEFAULT_PATHS="$CITY/.gc/runtime/control-dispatcher-trace.log
+/Users/athos/.gc/supervisor.log
+$CITY/.gc/logs/scratchpad-reaper.log
+$CITY/.gc/logs/gate-merge-survival-sweep.log
+$CITY/.gc/logs/gate-merge-survival-sweep-launchd.out
+$CITY/.gc/logs/lifecycle-coherence-janitor.log
+$CITY/.gc/logs/production-drift-guard-launchd.err"
+
 LOG_REAPER_PATHS="${LOG_REAPER_PATHS:-$LOG_REAPER_REAL_DEFAULT_PATHS}"
+# No colon in `-`: an explicitly empty value means "no capped paths".
+if [ "${LOG_REAPER_LIB:-0}" = "1" ]; then
+  LOG_REAPER_CAP_PATHS="${LOG_REAPER_CAP_PATHS-}"
+else
+  LOG_REAPER_CAP_PATHS="${LOG_REAPER_CAP_PATHS-$LOG_REAPER_CAP_REAL_DEFAULT_PATHS}"
+fi
+CAP_MB="${LOG_REAPER_CAP_MB:-20}"
+KEEP_MB="${LOG_REAPER_KEEP_MB:-10}"
 LOG="${LOG_REAPER_LOG:-$CITY/.gc/logs/log-reaper.log}"
 ENABLED="${LOG_REAPER_ENABLED:-1}"
 DRY_RUN="${LOG_REAPER_DRY_RUN:-0}"
@@ -133,6 +176,27 @@ _prod_sentinel_active() {
   [ "$paths" = "$real_default" ] && [ "$prod" != "1" ]
 }
 
+# _mb_to_bytes <mb> <default_mb> → bytes. A value that is not a positive
+# integer falls back to the default: a typo in an env override must not turn
+# into a cap of 0 bytes (which would empty every capped log every cycle).
+_mb_to_bytes() {
+  local mb="$1" def="$2"
+  case "$mb" in ''|*[!0-9]*) mb="$def" ;; esac
+  [ "$mb" -gt 0 ] 2>/dev/null || mb="$def"
+  echo $(( mb * 1024 * 1024 ))
+}
+
+# _cap_keep_bytes <keep_mb> <cap_bytes> → how many trailing bytes survive a
+# tail-cap. Must be positive and STRICTLY below the cap, otherwise the file
+# would be over the cap again right after being "capped" and get rewritten
+# every cycle; an unusable value falls back to half the cap.
+_cap_keep_bytes() {
+  local keep_mb="$1" cap_bytes="$2" keep
+  keep="$(_mb_to_bytes "$keep_mb" 10)"
+  if [ "$keep" -ge "$cap_bytes" ]; then keep=$(( cap_bytes / 2 )); fi
+  echo "$keep"
+}
+
 # ════════════════════════════════════════════════════════════════════════════
 # EXECUTION (side-effecting; NOT exercised by the selftest's pure-function
 # assertions, but exercised end-to-end via main() against fixture paths)
@@ -145,6 +209,91 @@ _prod_sentinel_active() {
 # "zero bytes", via _should_rotate's non-numeric guard.
 _file_size_bytes() {
   stat -f %z "$1" 2>/dev/null
+}
+
+# _tail_cap_one <path> <keep_bytes> → 0 when the file is back under the cap.
+# Keeps the last keep_bytes IN the live file: copy the tail aside, truncate in
+# place (`: >` keeps the inode, so a writer holding the file open O_APPEND just
+# keeps going), append the tail back. Lines the writer appends between the
+# truncate and the append-back land ABOVE the kept tail (out of order by a few
+# milliseconds of log) and lines written between reading the tail and the
+# truncate are lost — the same copytruncate window the header documents, no
+# worse. The side file has a FIXED name so a run killed by the caller's
+# `timeout` leaves at most one leftover (<= keep bytes, and it holds the tail
+# that did not make it back), overwritten by the next run.
+_tail_cap_one() {
+  local path="$1" keep="$2" tmp="$1.tailcap.tmp"
+  if tail -c "$keep" "$path" > "$tmp" 2>>"$LOG" && [ -s "$tmp" ]; then
+    if ! : > "$path" 2>>"$LOG"; then
+      rm -f "$tmp"
+      return 1
+    fi
+    if ! cat "$tmp" >> "$path" 2>>"$LOG"; then
+      log "WARN: could not write the kept tail back into $path (the tail is in $tmp)"
+      return 0
+    fi
+    rm -f "$tmp"
+    return 0
+  fi
+  # No room even for the tail copy: this is the low-disk case the reaper exists
+  # for, and recovering space outranks keeping history (same rule as the cp
+  # backup in the first class).
+  rm -f "$tmp"
+  log "WARN: could not copy the tail of $path aside — truncating it fully instead"
+  : > "$path" 2>>"$LOG"
+}
+
+# Second class (ga-52drsg, see header): cap each path in LOG_REAPER_CAP_PATHS at
+# CAP_MB, keeping the last KEEP_MB. Runs after the first class, shares ENABLED /
+# DRY_RUN, and has its own production sentinel (a test that overrides only the
+# first list must still never reach the real city logs).
+_cap_pass() {
+  local cap_dry="$DRY_RUN"
+  if _prod_sentinel_active "$LOG_REAPER_CAP_PATHS" "$LOG_REAPER_CAP_REAL_DEFAULT_PATHS" "$PROD"; then
+    log "SENTINEL: capped-log list equals the real default and no production opt-in is set (LOG_REAPER_PROD=1) — forcing dry-run for the tail-cap class (ga-h565g production sentinel)"
+    cap_dry=1
+  fi
+
+  local cap_bytes keep_bytes
+  cap_bytes="$(_mb_to_bytes "$CAP_MB" 20)"
+  keep_bytes="$(_cap_keep_bytes "$KEEP_MB" "$cap_bytes")"
+  local checked=0 capped=0 skipped=0 missing=0 failed=0 freed_bytes=0
+  local path size
+
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    checked=$((checked + 1))
+
+    if [ ! -f "$path" ]; then
+      missing=$((missing + 1))
+      log "log-cap: $path does not exist — skip"
+      continue
+    fi
+
+    size="$(_file_size_bytes "$path")"
+    if ! _should_rotate "$size" "$cap_bytes"; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if [ "$cap_dry" = "1" ]; then
+      log "DRY-RUN would cap: $path (${size} bytes >= cap ${cap_bytes} bytes, would keep the last ${keep_bytes})"
+      capped=$((capped + 1))
+      freed_bytes=$((freed_bytes + size - keep_bytes))
+      continue
+    fi
+
+    if _tail_cap_one "$path" "$keep_bytes"; then
+      capped=$((capped + 1))
+      freed_bytes=$((freed_bytes + size - keep_bytes))
+      log "capped: $path (${size} bytes -> last ${keep_bytes} kept, inode preserved)"
+    else
+      failed=$((failed + 1))
+      log "FAILED to cap: $path"
+    fi
+  done <<< "$LOG_REAPER_CAP_PATHS"
+
+  log "cap cycle complete: checked=$checked capped=$capped skipped=$skipped missing=$missing failed=$failed freed_bytes=$freed_bytes cap_mb=$CAP_MB keep_mb=$KEEP_MB dry_run=$cap_dry"
 }
 
 main() {
@@ -202,6 +351,8 @@ main() {
   done <<< "$LOG_REAPER_PATHS"
 
   log "cycle complete: checked=$checked rotated=$rotated skipped=$skipped missing=$missing freed_bytes=$freed_bytes threshold_mb=$THRESHOLD_MB enabled=$ENABLED dry_run=$DRY_RUN"
+
+  _cap_pass
 }
 
 # ── run unless sourced as a library (selftest sources with LOG_REAPER_LIB=1) ──
