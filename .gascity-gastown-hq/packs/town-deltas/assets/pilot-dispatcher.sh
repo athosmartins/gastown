@@ -9475,6 +9475,154 @@ _topup_worker_probe_migrated() {
   case "$_rc" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
 }
 
+# ── ga-in9ebr: worker pool at its session cap → QUEUE the bead, never fake a dispatch ──
+# Measured 2026-09-19 (wa-h8j8d, P1): 12 dispatch→reclaim cycles in 10.5h. With the
+# wa-worker pool at its cap, dispatch_one() logged "pool at session cap — skip spawn"
+# and then FELL THROUGH into the unconditional story:in-flight + pilot:dispatched +
+# "Pilot dispatched builder" marking: a durable "em execução" that no worker was ever
+# assigned to. inflight-reclaim-guard gave the bead back ~30min later (QUEUE STARVATION,
+# pilot:starvation-count+1), the Pilot "dispatched" it again, and so on. Side effects of
+# the lie: the painel showed work nobody was doing; approved-state-reconciler never saw
+# the wait (an "in-flight" bead is not stalled); every cycle burned ~5 useless Dolt
+# writes; and the fake dispatch counted as a SUCCESS (DISPATCHED++) while its phantom
+# in-flight bead filled a Pilot LANE slot, so a saturated pool never looked like
+# "dispatched=0" to the Step 5 stall detector either.
+#
+# The honest state for a bead that cannot get a worker NOW is the same one the sibling
+# release paths already produce (global cap ga-jezvn, spawn failure ga-d20od): claim
+# released, still story:approved + gc.routed_to (so the ga-93yxc pool top-up and the
+# workers' RoutedPoolQuery keep seeing it), unassigned, NOT in-flight/dispatched.
+#
+# Two pieces, because a post-claim release alone would trade the false state for churn
+# (claim → cap → release on every queued bead, every sweep):
+#   1. _pilot_release_pool_cap_queued — dispatch_one()'s cap branches (post-claim; the
+#      first sight of a bead, before gc.routed_to exists, can only be decided there).
+#   2. _pilot_pool_cap_full_for — dispatch_lane()'s PRE-claim skip for a bead ALREADY
+#      committed (gc.routed_to) to a pool that is positively at cap: zero writes.
+# Only a positive "pool is full" reading skips. Every "cannot tell" path (probe failed,
+# non-numeric, unknown pool, kill switch) returns 1 = this function does not skip the bead, so
+# an unreadable session list never makes THIS pre-claim skip fire on a guess. A probe that
+# FAILED for a pool-committed candidate is additionally reported through _PCAP_COUNT_UNREADABLE
+# (the other "cannot tell" paths are not): dispatch_lane() halts the dispatch phase on it
+# (ga-5je3zv) instead of proceeding to the claim, because dispatch_one() would read the same
+# sticky unreadable flag and spawn NOTHING (ga-oa004t, fail-closed — unchanged), only after a
+# claim + prompt assembly it then has to undo. Nothing here lets a worker past the cap. The per-sweep
+# count cache can be stale (sweeps run ~5min apart and it is only ever bumped UP after this
+# script's own spawns), which can defer a bead by at most one sweep — never strand it.
+_PCAP_LIVE_WA=""   # per-sweep cache of the live wa-worker count ("" = not probed yet)
+_PCAP_LIVE_PS=""   # same for ps-worker
+_PCAP_N=""         # out-param of _pilot_pool_live_count
+_PCAP_POOL=""      # out-params of _pilot_pool_cap_full_for (valid only after a hit)
+_PCAP_LIVE=""
+_PCAP_MAX=""
+_PCAP_COUNT_UNREADABLE=""   # ga-5je3zv: set by THIS _pilot_pool_cap_full_for call iff a pool-committed candidate's count could not be READ
+_PCAP_CALL_QUEUED=0   # dispatch_lane() reads this after dispatch_one(): did THIS call end as a cap QUEUE?
+_PCAP_WARNED_WA=""    # "cannot read the live count" is announced once per pool per sweep (see below)
+_PCAP_WARNED_PS=""
+
+# _pilot_pool_live_count <wa-worker|ps-worker> — sets _PCAP_N, returns 0 iff the count is
+# a real integer. NEVER call via $(...): the per-sweep cache lives in the caller's shell.
+_pilot_pool_live_count() {
+  local _pool="$1" _n=""
+  case "$_pool" in
+    wa-worker)
+      _n="${_PCAP_LIVE_WA:-}"
+      if [ -z "$_n" ] && [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then _n="$PILOT_TEST_WA_WORKER_LIVE_COUNT"; fi
+      # A probe already failed for this pool this sweep: do not pay another failing (up to 10s)
+      # probe. (dispatch_lane() halts on the first failure, ga-5je3zv, so a second call here means a
+      # caller that did not — this stays as the defence in depth it was.)
+      if [ -z "$_n" ] && [ -n "${_PCAP_WARNED_WA:-}" ]; then return 1; fi ;;
+    ps-worker)
+      _n="${_PCAP_LIVE_PS:-}"
+      if [ -z "$_n" ] && [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then _n="$PILOT_TEST_PS_WORKER_LIVE_COUNT"; fi
+      if [ -z "$_n" ] && [ -n "${_PCAP_WARNED_PS:-}" ]; then return 1; fi ;;
+    *) return 1 ;;
+  esac
+  if [ -z "$_n" ]; then
+    # ga-oa004t: the ONE shared probe — _pilot_live_session_count is what dispatch_one() and
+    # _pilot_pool_topup call too, so all four spawn gates agree on what "live" means
+    # (active+creating+start-pending) and on what an UNREADABLE count is. It builds on
+    # gc_json_or_unknown (ga-07509), not `… || echo ""`: a failing gc still prints an error envelope
+    # (e.g. {"ok":false,…}) that parses as valid JSON and would count as "0 sessions" — a KNOWN zero,
+    # indistinguishable from a genuinely empty pool. It yields data or FAILURE, and a reply with no
+    # .sessions array is unknown too. (Out-param, so this runs in the caller's shell — see there.)
+    if _pilot_live_session_count "$_pool"; then _n="$_PLSC_N"; fi
+  fi
+  case "$_n" in
+    ''|*[!0-9]*)
+      # Third state — the count could not be read. Never skipping a bead on a guess is deliberate
+      # (only a POSITIVE "pool is full" may suppress a dispatch), and the caller is told through
+      # the return code: _pilot_pool_cap_full_for flags it and dispatch_lane() HALTS the dispatch
+      # phase (ga-5je3zv). It must not be SILENT either: once per pool per sweep, so a dead probe
+      # shows up here, next to the halt line, instead of as unexplained claim→cap→release churn.
+      case "$_pool" in
+        wa-worker)
+          if [ -z "${_PCAP_WARNED_WA:-}" ]; then
+            _PCAP_WARNED_WA=1
+            warn "ga-in9ebr: cannot read the wa-worker live session count (session list unreadable) — the pre-claim pool-cap skip cannot tell full from free for wa-worker this sweep, so the dispatch phase is HALTED rather than claiming beads dispatch_one() could only refuse (ga-5je3zv); nothing is spawned without the count (ga-oa004t fail-closed)."
+          fi ;;
+        ps-worker)
+          if [ -z "${_PCAP_WARNED_PS:-}" ]; then
+            _PCAP_WARNED_PS=1
+            warn "ga-in9ebr: cannot read the ps-worker live session count (session list unreadable) — the pre-claim pool-cap skip cannot tell full from free for ps-worker this sweep, so the dispatch phase is HALTED rather than claiming beads dispatch_one() could only refuse (ga-5je3zv); nothing is spawned without the count (ga-oa004t fail-closed)."
+          fi ;;
+      esac
+      return 1 ;;
+  esac
+  case "$_pool" in
+    wa-worker) _PCAP_LIVE_WA="$_n" ;;
+    ps-worker) _PCAP_LIVE_PS="$_n" ;;
+  esac
+  _PCAP_N="$_n"
+  return 0
+}
+
+# _pilot_pool_cap_full_for <story_json> — returns 0 (and sets _PCAP_POOL/_PCAP_LIVE/_PCAP_MAX)
+# iff the candidate is ALREADY committed to a worker pool (metadata gc.routed_to =
+# wa-worker|ps-worker — the same reading _pilot_routed_to_pool_guard treats as binding) and
+# that pool's live session count is POSITIVELY known and >= its per-pool cap. gc.routed_to
+# is written by ANY earlier pool-arm attempt (dispatch_one stamps it before the spawn/cap
+# checks), so it also marks beads whose earlier dispatch was reclaimed — all of them are
+# pool-committed. With PILOT_SPAWN_WA_WORKER/PILOT_SPAWN_PS_WORKER=0 (nudge-only debug mode)
+# dispatch_one() never reaches the cap check and hands the bead to a worker to claim, so the
+# skip must stay out of that mode's way.
+_pilot_pool_cap_full_for() {
+  local _story="$1" _routed _pool _max
+  _PCAP_COUNT_UNREADABLE=""   # per call: only THIS candidate's probe may tell dispatch_lane to halt
+  if [ "${PILOT_POOL_CAP_PRECLAIM_SKIP:-1}" != "1" ]; then return 1; fi
+  _routed=$(printf '%s' "$_story" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
+  case "$_routed" in
+    wa-worker) [ "${PILOT_SPAWN_WA_WORKER:-1}" = "1" ] || return 1
+               _pool="wa-worker"; _max="${PILOT_WA_WORKER_MAX:-4}" ;;
+    ps-worker) [ "${PILOT_SPAWN_PS_WORKER:-1}" = "1" ] || return 1
+               _pool="ps-worker"; _max="${PILOT_PS_WORKER_MAX:-2}" ;;
+    *) return 1 ;;
+  esac
+  case "$_max" in ''|*[!0-9]*) return 1 ;; esac
+  # ga-vp2zr0 (b)/(c): "queued behind the pool cap" is only true of a bead the pool's workers can SEE. A bead
+  # stored where they cannot (an HQ bead routed to wa-worker) never leaves the queue however many slots free up —
+  # that was the 2026-10-07 P0 strand: ga-9t9acg.11/.12 sat here, cap-full for ever, behind P1s of the WA store.
+  # So a bead whose store the pool does NOT read is not a capacity queue: return 1 and let the claim run, where
+  # dispatch_one()'s store guard names the real problem (a blind route is stripped and held, an unknown one is
+  # released and alerted). The same goes for a store we cannot identify — "queued" would be a guess.
+  # vazio → the bead's id yields no store (no id, no routes entry): verdict unknown, not queued, claim runs;
+  # falhou/ilegível → same (routes.jsonl unreadable or the rig list failed): not queued, claim runs, and the guard
+  # there refuses without dispatching. Both land in "do not wait silently behind a cap".
+  local _id _home
+  _id=$(printf '%s' "$_story" | jq -r '.id // ""' 2>/dev/null) || _id=""
+  _home=$(_pilot_bead_home_store "$_id")
+  _pilot_pool_store_verdict "$_pool" "$_home"
+  if [ "$_PSV_VERDICT" != "serves" ]; then return 1; fi
+  # Return 1 either way ("not full: proceed to the claim") — but ga-5je3zv: a count that could not be READ for
+  # a bead committed to a spawn-enabled pool means dispatch_one() WILL fail at its own fail-closed count gate
+  # (the sticky _PLSC_UNREADABLE), after a claim + prompt assembly it then has to undo. dispatch_lane() reads
+  # this flag and halts the dispatch phase instead of paying that for every candidate.
+  _pilot_pool_live_count "$_pool" || { _PCAP_COUNT_UNREADABLE=1; return 1; }
+  if [ "$_PCAP_N" -lt "$_max" ]; then return 1; fi
+  _PCAP_POOL="$_pool"; _PCAP_LIVE="$_PCAP_N"; _PCAP_MAX="$_max"
+  return 0
+}
+
 _pilot_pool_topup() {
   local _pool="$1" _max="$2"
   local _live _global _pending _mig
@@ -10678,154 +10826,6 @@ if [ -n "$_QUEUE_LINES" ]; then
   log "Dispatch queue (next up, priority order):"
   while IFS= read -r _q; do [ -n "$_q" ] && log "$_q"; done <<< "$_QUEUE_LINES"
 fi
-
-# ── ga-in9ebr: worker pool at its session cap → QUEUE the bead, never fake a dispatch ──
-# Measured 2026-09-19 (wa-h8j8d, P1): 12 dispatch→reclaim cycles in 10.5h. With the
-# wa-worker pool at its cap, dispatch_one() logged "pool at session cap — skip spawn"
-# and then FELL THROUGH into the unconditional story:in-flight + pilot:dispatched +
-# "Pilot dispatched builder" marking: a durable "em execução" that no worker was ever
-# assigned to. inflight-reclaim-guard gave the bead back ~30min later (QUEUE STARVATION,
-# pilot:starvation-count+1), the Pilot "dispatched" it again, and so on. Side effects of
-# the lie: the painel showed work nobody was doing; approved-state-reconciler never saw
-# the wait (an "in-flight" bead is not stalled); every cycle burned ~5 useless Dolt
-# writes; and the fake dispatch counted as a SUCCESS (DISPATCHED++) while its phantom
-# in-flight bead filled a Pilot LANE slot, so a saturated pool never looked like
-# "dispatched=0" to the Step 5 stall detector either.
-#
-# The honest state for a bead that cannot get a worker NOW is the same one the sibling
-# release paths already produce (global cap ga-jezvn, spawn failure ga-d20od): claim
-# released, still story:approved + gc.routed_to (so the ga-93yxc pool top-up and the
-# workers' RoutedPoolQuery keep seeing it), unassigned, NOT in-flight/dispatched.
-#
-# Two pieces, because a post-claim release alone would trade the false state for churn
-# (claim → cap → release on every queued bead, every sweep):
-#   1. _pilot_release_pool_cap_queued — dispatch_one()'s cap branches (post-claim; the
-#      first sight of a bead, before gc.routed_to exists, can only be decided there).
-#   2. _pilot_pool_cap_full_for — dispatch_lane()'s PRE-claim skip for a bead ALREADY
-#      committed (gc.routed_to) to a pool that is positively at cap: zero writes.
-# Only a positive "pool is full" reading skips. Every "cannot tell" path (probe failed,
-# non-numeric, unknown pool, kill switch) returns 1 = this function does not skip the bead, so
-# an unreadable session list never makes THIS pre-claim skip fire on a guess. A probe that
-# FAILED for a pool-committed candidate is additionally reported through _PCAP_COUNT_UNREADABLE
-# (the other "cannot tell" paths are not): dispatch_lane() halts the dispatch phase on it
-# (ga-5je3zv) instead of proceeding to the claim, because dispatch_one() would read the same
-# sticky unreadable flag and spawn NOTHING (ga-oa004t, fail-closed — unchanged), only after a
-# claim + prompt assembly it then has to undo. Nothing here lets a worker past the cap. The per-sweep
-# count cache can be stale (sweeps run ~5min apart and it is only ever bumped UP after this
-# script's own spawns), which can defer a bead by at most one sweep — never strand it.
-_PCAP_LIVE_WA=""   # per-sweep cache of the live wa-worker count ("" = not probed yet)
-_PCAP_LIVE_PS=""   # same for ps-worker
-_PCAP_N=""         # out-param of _pilot_pool_live_count
-_PCAP_POOL=""      # out-params of _pilot_pool_cap_full_for (valid only after a hit)
-_PCAP_LIVE=""
-_PCAP_MAX=""
-_PCAP_COUNT_UNREADABLE=""   # ga-5je3zv: set by THIS _pilot_pool_cap_full_for call iff a pool-committed candidate's count could not be READ
-_PCAP_CALL_QUEUED=0   # dispatch_lane() reads this after dispatch_one(): did THIS call end as a cap QUEUE?
-_PCAP_WARNED_WA=""    # "cannot read the live count" is announced once per pool per sweep (see below)
-_PCAP_WARNED_PS=""
-
-# _pilot_pool_live_count <wa-worker|ps-worker> — sets _PCAP_N, returns 0 iff the count is
-# a real integer. NEVER call via $(...): the per-sweep cache lives in the caller's shell.
-_pilot_pool_live_count() {
-  local _pool="$1" _n=""
-  case "$_pool" in
-    wa-worker)
-      _n="${_PCAP_LIVE_WA:-}"
-      if [ -z "$_n" ] && [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then _n="$PILOT_TEST_WA_WORKER_LIVE_COUNT"; fi
-      # A probe already failed for this pool this sweep: do not pay another failing (up to 10s)
-      # probe. (dispatch_lane() halts on the first failure, ga-5je3zv, so a second call here means a
-      # caller that did not — this stays as the defence in depth it was.)
-      if [ -z "$_n" ] && [ -n "${_PCAP_WARNED_WA:-}" ]; then return 1; fi ;;
-    ps-worker)
-      _n="${_PCAP_LIVE_PS:-}"
-      if [ -z "$_n" ] && [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then _n="$PILOT_TEST_PS_WORKER_LIVE_COUNT"; fi
-      if [ -z "$_n" ] && [ -n "${_PCAP_WARNED_PS:-}" ]; then return 1; fi ;;
-    *) return 1 ;;
-  esac
-  if [ -z "$_n" ]; then
-    # ga-oa004t: the ONE shared probe — _pilot_live_session_count is what dispatch_one() and
-    # _pilot_pool_topup call too, so all four spawn gates agree on what "live" means
-    # (active+creating+start-pending) and on what an UNREADABLE count is. It builds on
-    # gc_json_or_unknown (ga-07509), not `… || echo ""`: a failing gc still prints an error envelope
-    # (e.g. {"ok":false,…}) that parses as valid JSON and would count as "0 sessions" — a KNOWN zero,
-    # indistinguishable from a genuinely empty pool. It yields data or FAILURE, and a reply with no
-    # .sessions array is unknown too. (Out-param, so this runs in the caller's shell — see there.)
-    if _pilot_live_session_count "$_pool"; then _n="$_PLSC_N"; fi
-  fi
-  case "$_n" in
-    ''|*[!0-9]*)
-      # Third state — the count could not be read. Never skipping a bead on a guess is deliberate
-      # (only a POSITIVE "pool is full" may suppress a dispatch), and the caller is told through
-      # the return code: _pilot_pool_cap_full_for flags it and dispatch_lane() HALTS the dispatch
-      # phase (ga-5je3zv). It must not be SILENT either: once per pool per sweep, so a dead probe
-      # shows up here, next to the halt line, instead of as unexplained claim→cap→release churn.
-      case "$_pool" in
-        wa-worker)
-          if [ -z "${_PCAP_WARNED_WA:-}" ]; then
-            _PCAP_WARNED_WA=1
-            warn "ga-in9ebr: cannot read the wa-worker live session count (session list unreadable) — the pre-claim pool-cap skip cannot tell full from free for wa-worker this sweep, so the dispatch phase is HALTED rather than claiming beads dispatch_one() could only refuse (ga-5je3zv); nothing is spawned without the count (ga-oa004t fail-closed)."
-          fi ;;
-        ps-worker)
-          if [ -z "${_PCAP_WARNED_PS:-}" ]; then
-            _PCAP_WARNED_PS=1
-            warn "ga-in9ebr: cannot read the ps-worker live session count (session list unreadable) — the pre-claim pool-cap skip cannot tell full from free for ps-worker this sweep, so the dispatch phase is HALTED rather than claiming beads dispatch_one() could only refuse (ga-5je3zv); nothing is spawned without the count (ga-oa004t fail-closed)."
-          fi ;;
-      esac
-      return 1 ;;
-  esac
-  case "$_pool" in
-    wa-worker) _PCAP_LIVE_WA="$_n" ;;
-    ps-worker) _PCAP_LIVE_PS="$_n" ;;
-  esac
-  _PCAP_N="$_n"
-  return 0
-}
-
-# _pilot_pool_cap_full_for <story_json> — returns 0 (and sets _PCAP_POOL/_PCAP_LIVE/_PCAP_MAX)
-# iff the candidate is ALREADY committed to a worker pool (metadata gc.routed_to =
-# wa-worker|ps-worker — the same reading _pilot_routed_to_pool_guard treats as binding) and
-# that pool's live session count is POSITIVELY known and >= its per-pool cap. gc.routed_to
-# is written by ANY earlier pool-arm attempt (dispatch_one stamps it before the spawn/cap
-# checks), so it also marks beads whose earlier dispatch was reclaimed — all of them are
-# pool-committed. With PILOT_SPAWN_WA_WORKER/PILOT_SPAWN_PS_WORKER=0 (nudge-only debug mode)
-# dispatch_one() never reaches the cap check and hands the bead to a worker to claim, so the
-# skip must stay out of that mode's way.
-_pilot_pool_cap_full_for() {
-  local _story="$1" _routed _pool _max
-  _PCAP_COUNT_UNREADABLE=""   # per call: only THIS candidate's probe may tell dispatch_lane to halt
-  if [ "${PILOT_POOL_CAP_PRECLAIM_SKIP:-1}" != "1" ]; then return 1; fi
-  _routed=$(printf '%s' "$_story" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
-  case "$_routed" in
-    wa-worker) [ "${PILOT_SPAWN_WA_WORKER:-1}" = "1" ] || return 1
-               _pool="wa-worker"; _max="${PILOT_WA_WORKER_MAX:-4}" ;;
-    ps-worker) [ "${PILOT_SPAWN_PS_WORKER:-1}" = "1" ] || return 1
-               _pool="ps-worker"; _max="${PILOT_PS_WORKER_MAX:-2}" ;;
-    *) return 1 ;;
-  esac
-  case "$_max" in ''|*[!0-9]*) return 1 ;; esac
-  # ga-vp2zr0 (b)/(c): "queued behind the pool cap" is only true of a bead the pool's workers can SEE. A bead
-  # stored where they cannot (an HQ bead routed to wa-worker) never leaves the queue however many slots free up —
-  # that was the 2026-10-07 P0 strand: ga-9t9acg.11/.12 sat here, cap-full for ever, behind P1s of the WA store.
-  # So a bead whose store the pool does NOT read is not a capacity queue: return 1 and let the claim run, where
-  # dispatch_one()'s store guard names the real problem (a blind route is stripped and held, an unknown one is
-  # released and alerted). The same goes for a store we cannot identify — "queued" would be a guess.
-  # vazio → the bead's id yields no store (no id, no routes entry): verdict unknown, not queued, claim runs;
-  # falhou/ilegível → same (routes.jsonl unreadable or the rig list failed): not queued, claim runs, and the guard
-  # there refuses without dispatching. Both land in "do not wait silently behind a cap".
-  local _id _home
-  _id=$(printf '%s' "$_story" | jq -r '.id // ""' 2>/dev/null) || _id=""
-  _home=$(_pilot_bead_home_store "$_id")
-  _pilot_pool_store_verdict "$_pool" "$_home"
-  if [ "$_PSV_VERDICT" != "serves" ]; then return 1; fi
-  # Return 1 either way ("not full: proceed to the claim") — but ga-5je3zv: a count that could not be READ for
-  # a bead committed to a spawn-enabled pool means dispatch_one() WILL fail at its own fail-closed count gate
-  # (the sticky _PLSC_UNREADABLE), after a claim + prompt assembly it then has to undo. dispatch_lane() reads
-  # this flag and halts the dispatch phase instead of paying that for every candidate.
-  _pilot_pool_live_count "$_pool" || { _PCAP_COUNT_UNREADABLE=1; return 1; }
-  if [ "$_PCAP_N" -lt "$_max" ]; then return 1; fi
-  _PCAP_POOL="$_pool"; _PCAP_LIVE="$_PCAP_N"; _PCAP_MAX="$_max"
-  return 0
-}
 
 # _pilot_note_pool_cap_queued <bead_id> — count a cap-queued bead ONCE per sweep (the ga-y1m40
 # rig fallback re-walks the same beads). Returns 0 when newly noted, 1 when already known.
