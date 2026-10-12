@@ -8,10 +8,12 @@
 # WHAT. For a marker whose rig has entries in config/rea_paths.txt and whose diff touches one of them, look at the SOURCE bead's comments
 # (gate-rea-comments.py): a comment with a `REA:` line must exist, and the LATEST such comment must not have the shape of a credential or a
 # CPF/CNPJ. Verdict (GATE_REA_VERDICT):
-#   off      the switch is off              na       no changed file is on the rig's list (or the rig has none)
+#   off      the switch is off              na       the list was read whole and no changed file is on the rig's part of it (or the rig has none)
 #   pass     answered and clean             missing  touches the list, no comment answers
 #   secret   the latest REA comment has a credential / CPF / CNPJ shape
-#   unknown  could not tell (list, comments, scanner or bead id unreadable) — the inert state, same outcome as `na`, but said out loud
+#   unknown  could not tell (path list, file listing, comments, scanner or bead id unreadable) — the inert state, same outcome as `na`, but said
+#            out loud and recorded. `na` is only ever reached when nothing was skipped or unreadable: a list with no usable line, a list line
+#            that is not `<rig> <glob>` and may have been this rig's, or a file listing that failed, are `unknown`, never `na`.
 # Two moments use it. Step 5 of the dispatcher (gate_rea_step5): label + ONE comment on the bead, in both phases, so the author can fix it
 # while the reviewers work. gate_finalize_run (gate_rea_finalize_block): in the enforce phase only, a PASS becomes a FAIL of class `hold`
 # (adding a comment does not change the commit, so the same SHA may pass afterwards). It recomputes — Phase C can run in a later process.
@@ -22,7 +24,10 @@
 #
 # THE THIRD STATE. Every read has three answers. No `REA:` comment is `missing`; a comment list that could not be read, or holds an element
 # whose text cannot be read while none answers, is `unknown` — never `missing`. A secret scan that could not run is `unknown` — never `pass`.
-# Under doubt nothing is written to a bead and nothing blocks. Matched secret VALUES are never logged, only the shape names.
+# The same for the inputs: a path list with no usable line (empty, comments only, every line malformed; a CRLF save is read fine), an empty rig,
+# a file listing that git could not produce (the dispatcher's CHANGED_FILES folds that into an empty string, so the status travels beside it as
+# a flag) are `unknown` — never "nothing to check". Under doubt nothing is written to a bead and nothing blocks, and the doubt is said in the gate log and
+# recorded (rea_check, verdict unknown). Matched secret VALUES are never logged, only the shape names.
 #
 # LABELS. rea:missing / rea:secret-in-comment are a RECORD that the check fired on this bead (written once, with the comment); they are not live
 # state. Adding the REA comment does not remove them, and nothing reads them back: every verdict is recomputed from the bead's comments.
@@ -52,6 +57,7 @@ gate_rea_phase() {
   local stamp="${GATE_REA_STAMP_FILE:-${GC_CITY:-}/.gc/gate-rea-warn-since}" days="${GATE_REA_WARN_DAYS:-14}" now since=""
   GATE_REA_PHASE="warn"; GATE_REA_ENFORCE_AT=""; GATE_REA_PHASE_WHY=""
   case "$days" in ''|*[!0-9]*|?????*) GATE_REA_PHASE_WHY="GATE_REA_WARN_DAYS is not a whole number of days (up to 4 digits) - staying in warn"; return 0 ;; esac
+  days=$((10#$days))   # a leading zero is not octal: 08 is 8 days (bash would call it a bad number), 010 is 10
   now=$(date +%s 2>/dev/null) || now=""
   case "$now" in ''|*[!0-9]*) GATE_REA_PHASE_WHY="the clock could not be read - staying in warn"; return 0 ;; esac
   if [ ! -e "$stamp" ] && [ ! -L "$stamp" ]; then
@@ -66,29 +72,45 @@ gate_rea_phase() {
     since=$(head -n 1 "$stamp" 2>/dev/null | tr -d '[:space:]') || since=""
   fi
   case "$since" in ''|*[!0-9]*|???????????*) GATE_REA_PHASE_WHY="the warn-window stamp $stamp is unreadable - staying in warn"; return 0 ;; esac
+  since=$((10#$since))   # the stamp is read from a file anyone can edit: the same leading-zero rule
   GATE_REA_ENFORCE_AT=$((since + days * 86400))
   if [ "$now" -ge "$GATE_REA_ENFORCE_AT" ]; then GATE_REA_PHASE="enforce"; fi
   return 0
 }
 
-# gate_rea_paths_match <rig> <changed files, one per line> — sets GATE_REA_MATCHED_LIST (the changed files on <rig>'s list, one per line) and
-# GATE_REA_PATHS_SKIPPED (list lines that were not `<rig> <glob>`). rc 0 = the list was read (the match list may be empty: nothing matched),
-# rc 2 = the list is missing or unreadable. Called bare, never inside $(...): the globals would die with the subshell. The list is read ONCE into
-# a variable, so a loop's own last status can never be mistaken for "unreadable".
+# gate_rea_paths_match <rig> <changed files, one per line> — sets GATE_REA_MATCHED_LIST (the changed files on <rig>'s list, one per line),
+# GATE_REA_PATHS_SKIPPED (list lines that are not `<rig> <glob>`: a missing or extra field, or a rig column that is not [A-Za-z0-9_.-]+ - a
+# `rig:` colon, a BOM), GATE_REA_PATHS_USABLE (good lines, ALL rigs), GATE_REA_RIG_ENTRIES (good lines of <rig>) and, when it returns 2,
+# GATE_REA_PATHS_WHY. rc 0 = the list was read and has usable lines (the match list may still be empty: nothing matched). rc 2 = the list cannot
+# say anything about <rig>: it is missing, unreadable, holds no usable line at all (empty, comments only, every line malformed), or <rig> is empty.
+# A list the code cannot read AS a list is "could not tell", never "nothing matches" (gate round ga-0ef7cq). CRLF is read as LF.
+# Called bare, never inside $(...): the globals would die with the subshell. The list is read ONCE into a variable, so a loop's own last status
+# can never be mistaken for "unreadable".
 gate_rea_paths_match() {
-  local rig="${1:-}" files="${2:-}" list="${GATE_REA_PATHS_FILE:-${GC_CITY:-}/config/rea_paths.txt}"
+  local LC_ALL=C   # byte-safe brackets below: the BOM / any non-ASCII byte is outside [A-Za-z0-9_.-] whatever the user's locale says
+  local rig="${1:-}" files="${2:-}" list="${GATE_REA_PATHS_FILE:-${GC_CITY:-}/config/rea_paths.txt}" cr=$'\r'
   local content line lrig lpat rest pats="" f p
-  GATE_REA_MATCHED_LIST=""; GATE_REA_PATHS_SKIPPED=0
-  [ -f "$list" ] || return 2
-  content=$(cat "$list" 2>/dev/null) || return 2
+  GATE_REA_MATCHED_LIST=""; GATE_REA_PATHS_SKIPPED=0; GATE_REA_PATHS_USABLE=0; GATE_REA_RIG_ENTRIES=0; GATE_REA_PATHS_WHY=""
+  if [ ! -f "$list" ]; then GATE_REA_PATHS_WHY="the REA path list $list is missing or not a file"; return 2; fi
+  content=$(cat "$list" 2>/dev/null) || { GATE_REA_PATHS_WHY="the REA path list $list could not be read"; return 2; }
   while IFS= read -r line; do
     line="${line%%#*}"
+    line="${line//$cr/ }"
     lrig=""; lpat=""; rest=""
     IFS=$' \t' read -r lrig lpat rest <<< "$line" || true
     [ -n "$lrig" ] || continue
+    case "$lrig" in
+      *[!A-Za-z0-9_.-]*) GATE_REA_PATHS_SKIPPED=$((GATE_REA_PATHS_SKIPPED + 1)); continue ;;
+    esac
     if [ -z "$lpat" ] || [ -n "$rest" ]; then GATE_REA_PATHS_SKIPPED=$((GATE_REA_PATHS_SKIPPED + 1)); continue; fi
-    if [ "$lrig" = "$rig" ]; then pats="${pats}${lpat}"$'\n'; fi
+    GATE_REA_PATHS_USABLE=$((GATE_REA_PATHS_USABLE + 1))
+    if [ "$lrig" = "$rig" ]; then pats="${pats}${lpat}"$'\n'; GATE_REA_RIG_ENTRIES=$((GATE_REA_RIG_ENTRIES + 1)); fi
   done <<< "$content"
+  if [ "$GATE_REA_PATHS_USABLE" = "0" ]; then
+    GATE_REA_PATHS_WHY="the REA path list $list has no usable line (each must be '<rig> <glob>'; $GATE_REA_PATHS_SKIPPED line(s) skipped)"
+    return 2
+  fi
+  if [ -z "$rig" ]; then GATE_REA_PATHS_WHY="no rig name was given, so nobody can say which entries of the REA path list apply"; return 2; fi
   [ -n "$pats" ] || return 0
   while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -111,7 +133,7 @@ gate_rea_comments_state() {
   [ -r "$scan" ] || { GATE_REA_WHY="the comment scanner $scan is missing or unreadable"; return 0; }
   json=$(bd -C "$city" comments "$bead" --json 2>/dev/null) || { GATE_REA_WHY="bd comments $bead failed"; return 0; }
   [ -n "$json" ] || { GATE_REA_WHY="bd comments $bead returned nothing"; return 0; }
-  rows=$(printf '%s' "$json" | python3 "$scan" 2>/dev/null) || rc=$?
+  rows=$(printf '%s' "$json" | timeout "${GATE_REA_SCAN_TIMEOUT:-20}" python3 "$scan" 2>/dev/null) || rc=$?   # a comment that stalls the scanner is "could not read" (rc 124), not a hang
   if [ "$rc" != "0" ]; then GATE_REA_WHY="the comment list of $bead could not be read (scanner rc=$rc)"; return 0; fi
   if [ -z "$rows" ]; then GATE_REA_COMMENTS="missing"; return 0; fi
   while IFS=$'\t' read -r id shapes; do
@@ -124,12 +146,15 @@ gate_rea_comments_state() {
   return 0
 }
 
-# gate_rea_check <rig> <bead_city> <bead_id> <changed files> — the decision. Resets every output first, so a stale verdict never leaks between runs.
+# gate_rea_check <rig> <bead_city> <bead_id> <changed files> [files_ok] — the decision. Resets every output first, so a stale verdict never leaks
+# between runs. files_ok is 1 when <changed files> is a listing git really produced (an empty one then means "nothing changed") and anything else
+# when git failed (the caller's variable is then an empty string that means nothing); absent = 1, so older callers keep working.
 # Outputs: GATE_REA_VERDICT GATE_REA_PHASE GATE_REA_DETAIL GATE_REA_MATCHED GATE_REA_FIRST (+ the ones set by the helpers above).
 gate_rea_check() {
-  local rig="${1:-}" city="${2:-}" bead="${3:-}" files="${4:-}" sw rc=0
+  local rig="${1:-}" city="${2:-}" bead="${3:-}" files="${4:-}" files_ok="${5-1}" sw rc=0
   GATE_REA_VERDICT="off"; GATE_REA_DETAIL=""; GATE_REA_MATCHED=0; GATE_REA_FIRST=""; GATE_REA_PHASE="warn"; GATE_REA_ENFORCE_AT=""; GATE_REA_PHASE_WHY=""
   GATE_REA_COMMENTS=""; GATE_REA_COMMENT_ID=""; GATE_REA_SHAPES=""; GATE_REA_NOTE=""; GATE_REA_WHY=""; GATE_REA_PATHS_SKIPPED=0; GATE_REA_MATCHED_LIST=""
+  GATE_REA_PATHS_USABLE=0; GATE_REA_RIG_ENTRIES=0; GATE_REA_PATHS_WHY=""
   sw=$(gate_rea_switch_state 2>/dev/null) || sw=""
   case "$sw" in
     on) ;;
@@ -138,8 +163,25 @@ gate_rea_check() {
   esac
   gate_rea_phase
   gate_rea_paths_match "$rig" "$files" || rc=$?
-  if [ "$rc" != "0" ]; then GATE_REA_VERDICT="unknown"; GATE_REA_DETAIL="the REA path list is missing or unreadable"; return 0; fi
-  if [ -z "$GATE_REA_MATCHED_LIST" ]; then GATE_REA_VERDICT="na"; return 0; fi
+  if [ "$rc" != "0" ]; then GATE_REA_VERDICT="unknown"; GATE_REA_DETAIL="${GATE_REA_PATHS_WHY:-the REA path list is missing or unreadable}"; return 0; fi
+  # `na` means "I looked at everything that could matter and none of it is a scraper". It is never the answer to "I could not look":
+  if [ "$files_ok" != "1" ]; then
+    # git failed, so the file list is no list at all. A rig the list does not name (and a list with nothing skipped) is never checked, whatever changed.
+    if [ "$GATE_REA_RIG_ENTRIES" != "0" ] || [ "$GATE_REA_PATHS_SKIPPED" != "0" ]; then
+      GATE_REA_VERDICT="unknown"; GATE_REA_DETAIL="could not list the changed files of the branch (git failed), so the REA path list could not be applied"
+    else
+      GATE_REA_VERDICT="na"
+    fi
+    return 0
+  fi
+  if [ -z "$GATE_REA_MATCHED_LIST" ]; then
+    if [ "$GATE_REA_PATHS_SKIPPED" != "0" ]; then
+      GATE_REA_VERDICT="unknown"; GATE_REA_DETAIL="no changed file is on the REA path list, but $GATE_REA_PATHS_SKIPPED line(s) of it were skipped (not '<rig> <glob>') and may have been this rig's"
+    else
+      GATE_REA_VERDICT="na"
+    fi
+    return 0
+  fi
   GATE_REA_MATCHED=$(printf '%s' "$GATE_REA_MATCHED_LIST" | grep -c . || true)
   GATE_REA_FIRST=$(printf '%s' "$GATE_REA_MATCHED_LIST" | head -n 1 || true)
   gate_rea_comments_state "$city" "$bead"
@@ -174,6 +216,8 @@ gate_rea_text() {
 
 # gate_rea_mark <bead_city> <bead_id> <label> <comment> — ONE comment per bead and label: if the label is there, nothing; else the comment FIRST and the label
 # after it (a failed comment leaves no label, so the next sweep tries again). Prints done | already | unreadable | failed.
+# KNOWN TRADE-OFF: if the label fails AFTER the comment landed, the next sweep posts the comment again (bounded: one repeat per failed label add).
+# The other order would leave a label with no comment, which says the check fired and shows nobody why; a repeat is the cheaper mistake.
 gate_rea_mark() {
   local city="${1:-}" bead="${2:-}" label="${3:-}" text="${4:-}" json="" has=""
   [ -n "$bead" ] || { printf 'unreadable'; return 0; }
@@ -190,14 +234,15 @@ gate_rea_mark() {
   return 0
 }
 
-# gate_rea_event <branch> <marker> <where> — one record for the apuração, to $QG_LOG when it is set. The shapes, never the values.
+# gate_rea_event <branch> <marker> <where> — one record for the apuração, to $QG_LOG when it is set. The shapes, never the values. A record that
+# cannot be written is said in the gate log: the record is how an `unknown` is told from a feature that is simply off.
 gate_rea_event() {
   [ -n "${QG_LOG:-}" ] || return 0
   jq -c -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg branch "${1:-}" --arg marker "${2:-}" --arg at "${3:-}" --arg bead "${GATE_REA_BEAD:-}" \
     --arg rig "${GATE_REA_RIG:-}" --arg verdict "$GATE_REA_VERDICT" --arg phase "$GATE_REA_PHASE" --arg matched "$GATE_REA_MATCHED" \
     --arg shapes "${GATE_REA_SHAPES:-}" --arg skipped "${GATE_REA_PATHS_SKIPPED:-0}" --arg detail "${GATE_REA_DETAIL:-}" \
     '{ts:$ts,event:"rea_check",at:$at,branch:$branch,marker:$marker,bead:$bead,rig:$rig,verdict:$verdict,phase:$phase,matched:$matched,shapes:$shapes,skipped:$skipped,detail:$detail}' \
-    >> "$QG_LOG" 2>/dev/null || true
+    >> "$QG_LOG" 2>/dev/null || gate_rea_say "REA check: the rea_check record (verdict ${GATE_REA_VERDICT:-?}, bead ${GATE_REA_BEAD:-?}) could not be written to $QG_LOG."
   return 0
 }
 
@@ -207,11 +252,13 @@ gate_rea_say() {
   return 0
 }
 
-# gate_rea_step5 <rig> <bead_city> <bead_id> <changed files> <branch> <marker> — the early moment: decide, write the label + comment (once), record.
+# gate_rea_step5 <rig> <bead_city> <bead_id> <changed files> <branch> <marker> [files_ok] — the early moment: decide, write the label + comment
+# (once), record. files_ok as in gate_rea_check. `na` is the only verdict that is silent and unrecorded, and it is only reached when nothing was
+# skipped or unreadable (see the verdict list above); `unknown` is said and recorded.
 gate_rea_step5() {
   local label="" kind="" got="" text=""
   GATE_REA_BEAD="${3:-}"; GATE_REA_RIG="${1:-}"
-  gate_rea_check "$1" "$2" "$3" "$4"
+  gate_rea_check "$1" "$2" "$3" "$4" "${7-1}"
   case "$GATE_REA_VERDICT" in
     na) return 0 ;;
     off) [ -n "$GATE_REA_DETAIL" ] && gate_rea_say "REA check: $GATE_REA_DETAIL"; return 0 ;;
@@ -230,18 +277,24 @@ gate_rea_step5() {
   return 0
 }
 
-# gate_rea_finalize_block <rig> <bead_city> <bead_id> <changed files> <branch> — the late moment. Sets GATE_REA_BLOCK_REASON (empty = no block). Only the
-# enforce phase blocks, only on `missing` / `secret`; `unknown`, `na`, `pass`, `off` and the warn phase never do.
+# gate_rea_finalize_block <rig> <bead_city> <bead_id> <changed files> <branch> [files_ok] — the late moment. Sets GATE_REA_BLOCK_REASON (empty = no
+# block). Only the enforce phase blocks, only on `missing` / `secret`; `unknown`, `na`, `pass`, `off` and the warn phase never do. Phase C can run in a
+# later process than Step 5, so an `unknown` (and an `off` that is not a plain switch) is said and recorded here too.
 gate_rea_finalize_block() {
   GATE_REA_BLOCK_REASON=""
   GATE_REA_BEAD="${3:-}"; GATE_REA_RIG="${1:-}"
-  gate_rea_check "$1" "$2" "$3" "$4"
+  gate_rea_check "$1" "$2" "$3" "$4" "${6-1}"
   if [ "$GATE_REA_PHASE" = "enforce" ]; then
     case "$GATE_REA_VERDICT" in
       missing) GATE_REA_BLOCK_REASON="REA check (ga-jdzri9): branch ${5:-?} changes ${GATE_REA_MATCHED} file(s) on the REA path list (first: ${GATE_REA_FIRST}) but the source bead ${3:-?} has no comment with a line starting with REA: . Add one (target, command, found or not found, why; no token, cookie, JWT or CPF/CNPJ) or, if this change is not a source investigation, the single line REA: n/a - the reason; then run /gate-done again. This is not a code rejection: the same commit can pass once the comment exists." ;;
       secret)  GATE_REA_BLOCK_REASON="REA check (ga-jdzri9): the latest REA comment (${GATE_REA_COMMENT_ID}) on ${3:-?} has the shape of: ${GATE_REA_SHAPES}. Comments cannot be edited: add a NEW comment whose first line starts with REA: and says the same without the value, then run /gate-done again. This is not a code rejection: the same commit can pass." ;;
     esac
   fi
-  case "$GATE_REA_VERDICT" in na|off) ;; *) gate_rea_event "${5:-}" "" "finalize" ;; esac
+  case "$GATE_REA_VERDICT" in
+    na) ;;
+    off) if [ -n "$GATE_REA_DETAIL" ]; then gate_rea_say "REA check: $GATE_REA_DETAIL"; fi ;;
+    unknown) gate_rea_say "REA check: COULD NOT TELL (${GATE_REA_DETAIL:-no reason}) for ${3:-?} - nothing blocked."; gate_rea_event "${5:-}" "" "finalize" ;;
+    *) gate_rea_event "${5:-}" "" "finalize" ;;
+  esac
   return 0
 }

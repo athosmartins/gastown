@@ -9,10 +9,12 @@
 #
 # What is executed, not described:
 #   1. the lib parses (bash -n under 3.2 and the current bash) and sources under the dispatcher's flags without running anything;
-#   2. the comment scanner (gate-rea-comments.py): what answers the rule, what is a credential / CPF / CNPJ shape, what is NOT (dates, ids, prose),
-#      and the three answers of every read (rows / none / could not read);
-#   3. the switch (env wins, an unreadable override is OFF), the phase (warn -> enforce, an unreadable stamp or day count stays warn);
-#   4. the path list (per rig, globs, malformed lines counted, quoted names, the real shipped list: scrapers yes, generic *_client.py no);
+#   2. the comment scanner (gate-rea-comments.py): what answers the rule, what is a credential / CPF / CNPJ shape (numeric and alphanumeric), what is
+#      NOT (dates, ids, prose), the three answers of every read (rows / none / could not read), and that a 40 KB unbroken run costs milliseconds;
+#   3. the switch (env wins, an unreadable override is OFF), the phase (warn -> enforce, an unreadable stamp or day count stays warn; 08 is 8);
+#   4. the path list (per rig, globs, malformed lines counted, quoted names, the real shipped list: scrapers yes, generic *_client.py no) and the
+#      third state of the list itself: empty / CRLF / 3-field / 1-field / `rig:` lists and an unreadable file listing are "could not tell",
+#      said in the gate log and recorded, never "nothing to check";
 #   5. the verdicts off / na / pass / missing / secret / unknown against the fake bd, and that no verdict leaks into the next run;
 #   6. what is written to the bead: label + ONE comment, once per bead and label, comment before label, nothing on na / pass / unknown / off;
 #      and that the gate's own comment can never answer the rule;
@@ -132,6 +134,7 @@ SECRET_PEM="-----BEGIN RSA PRIV""ATE KEY-----"
 CPF_BARE="52998""224725"; CPF_FMT="529.998.224-72"
 CPF_FMT_VALID="529.982.247-25"
 CNPJ_BARE="11222""333000181"; CNPJ_FMT="11.222.333/0001-81"
+CNPJ_AN_FMT="12.ABC.345/01DE-35"; CNPJ_AN_BARE="12ABC34501DE35"            # Receita's published alphanumeric example (check digits 35)
 CLEAN_REA="REA: target=portal.example/api/v2/list, command=curl -s with the browser headers, found: 12 records, because the list endpoint is public; checked 2026-10-12 at 14:03"
 
 # ── 1. the lib parses and sources under the dispatcher's flags ─────────────────────────────────────────────────────────────
@@ -185,6 +188,46 @@ shape_case "a bare valid CPF is cpf" "REA: person $CPF_BARE" "cpf"
 shape_case "a formatted CNPJ is cnpj" "REA: company $CNPJ_FMT" "cnpj"
 shape_case "a bare valid CNPJ is cnpj" "REA: company $CNPJ_BARE" "cnpj"
 shape_case "two shapes in one comment are both named, sorted" "REA: $SECRET_KEY and $CPF_FMT_VALID" "cpf,key"
+# The alphanumeric CNPJ (issued since 2026-07): 12 chars of [0-9A-Z], then 2 numeric check digits; a letter is worth ord(c)-48 in the same mod-11 sum.
+shape_case "a formatted alphanumeric CNPJ is cnpj" "REA: company $CNPJ_AN_FMT" "cnpj"
+shape_case "a formatted alphanumeric CNPJ is cnpj even with bad check digits" "REA: company 12.ABC.345/01DE-00" "cnpj"
+shape_case "a bare alphanumeric CNPJ with valid check digits is cnpj" "REA: company $CNPJ_AN_BARE" "cnpj"
+shape_case "a bare 14-char alphanumeric id with bad check digits is clean" "REA: id 12ABC34501DE00" "-"
+shape_case "a valid alphanumeric CNPJ glued inside a longer run is not a CNPJ" "REA: id 9${CNPJ_AN_BARE}Z" "-"
+# Pieces of the patterns the linear rewrite touched must still say what they said (boundaries of the old jwt / url-credentials regexes).
+shape_case "a JWT glued to a word by an underscore is still a jwt" "REA: jwt_$SECRET_JWT" "jwt"
+shape_case "a JWT after a dot is still a jwt" "REA: session.$SECRET_JWT" "jwt"
+shape_case "a jwt-shaped string whose first part has 7 chars is clean" "REA: ${P_JW}abcdefg.xxxxxxxx.yyyy" "-"
+shape_case "...with 8 chars it is a jwt" "REA: ${P_JW}abcdefgh.xxxxxxxx.yyyy" "jwt"
+shape_case "...a third part of 3 chars is clean" "REA: ${P_JW}abcdefgh.xxxxxxxx.yyy" "-"
+shape_case "credentials in a URL whose scheme starts with a digit are url-credentials" "REA: 7z://admin:s3cr3tpass@host/x" "url-credentials"
+shape_case "an ssh URL with a user and no password is clean" "REA: git clone ssh://git@github.example/org/repo" "-"
+shape_case "a URL with an @ in the path and no password is clean" "REA: GET https://portal.example/a:b@c" "-"
+
+# A pathological comment must cost milliseconds and a real secret AFTER it must still be found: url-credentials and jwt were quadratic on a long
+# unbroken run of letters (40 KB took ~30 s - 3 min and the python3 call has no timeout). A comment is not hostile input, but one pasted blob would stall the sweep.
+scan_timed() { # scan_timed <seconds> <text file> -> "<rc>:<stdout>"; rc 124 = still running when the time was up (killed)
+  local secs="$1" tf="$2" jf="$T/timed.json" of="$T/timed.out" pid i=0 rc
+  jq -n --rawfile t "$tf" '[{id:"c1",text:$t}]' > "$jf"
+  python3 -I "$SCAN" < "$jf" > "$of" 2>/dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -gt $((secs * 10)) ]; then kill -9 "$pid" 2>/dev/null; { wait "$pid"; } 2>/dev/null; echo "124:"; return 0; fi
+    sleep 0.1
+  done
+  { wait "$pid"; } 2>/dev/null; rc=$?
+  echo "$rc:$(cat "$of")"
+}
+slow_case() { # slow_case <label> <unit> <repeat> <suffix> <expected labels>
+  python3 -I -c 'import sys; sys.stdout.write("REA: " + sys.argv[1] * int(sys.argv[2]) + sys.argv[3])' "$2" "$3" "$4" > "$T/timed.txt"
+  eq "$1" "$(scan_timed 10 "$T/timed.txt")" "0:c1${TAB}$5"
+}
+slow_case "40 KB of letters in one run: read in time, clean" "a" 40000 "" "-"
+slow_case "40 KB of 'a.' pairs: read in time, clean" "a." 20000 "" "-"
+slow_case "40 KB of repeated JWT headers with no dot: read in time, clean" "${P_JW}" 13000 "" "-"
+slow_case "40 KB of letters, then a URL with credentials: read in time AND found" "a" 40000 " $SECRET_URLCRED" "url-credentials"
+slow_case "40 KB of repeated JWT headers, then a real JWT: read in time AND found" "${P_JW}" 13000 " $SECRET_JWT" "jwt"
 out=$(scan_text "REA: used $SECRET_KEY and $SECRET_JWT and $CPF_FMT_VALID")
 hasnt "the scanner output never carries a matched value (key)" "$out" "$SECRET_KEY"
 hasnt "the scanner output never carries a matched value (jwt)" "$out" "$SECRET_JWT"
@@ -248,6 +291,22 @@ eq "a day count that is not a number: warn, even with an old stamp" "$(field PHA
 has "...and it says why" "$(field WHY)" "not a whole number"
 stamp_age_days 40; ph 'export GATE_REA_WARN_DAYS=12345'
 eq "a 5-digit day count: warn" "$(field PHASE)" "warn"
+# Leading zeros: bash reads $((08)) as a bad octal and $((010)) as 8 - a day count typed as 08 or 010 must mean 8 and 10.
+stamp_age_days 9; ph 'export GATE_REA_WARN_DAYS=08'
+eq "GATE_REA_WARN_DAYS=08 is 8 days: 9 days after the stamp -> enforce" "$(field PHASE)" "enforce"
+eq "...and nothing is reported as wrong" "$(field WHY)" ""
+hasnt "...and bash printed no arithmetic error" "$R_OUT" "value too great for base"
+stamp_age_days 9; ph 'export GATE_REA_WARN_DAYS=010'
+eq "GATE_REA_WARN_DAYS=010 is 10 days (not octal 8): 9 days after the stamp -> still warn" "$(field PHASE)" "warn"
+stamp_age_days 11; ph 'export GATE_REA_WARN_DAYS=010'
+eq "...and 11 days after the stamp -> enforce" "$(field PHASE)" "enforce"
+stamp_age_days 3; ph 'export GATE_REA_WARN_DAYS=0002'
+eq "GATE_REA_WARN_DAYS=0002 is 2 days: 3 days after the stamp -> enforce" "$(field PHASE)" "enforce"
+# The stamp is a file anyone can edit: a leading zero there is the same octal trap (0123456789 has an 8 and a 9 in it).
+printf '%s\n' "0123456789" > "$STAMP"; ph ':'
+eq "a stamp with a leading zero (0123456789) is read as decimal: long past, enforce" "$(field PHASE)" "enforce"
+eq "...and nothing is reported as wrong" "$(field WHY)" ""
+hasnt "...and bash printed no arithmetic error" "$R_OUT" "value too great for base"
 echo "garbage" > "$STAMP"; ph ':'
 eq "an unreadable stamp: warn, never enforce" "$(field PHASE)" "warn"
 has "...and it says why" "$(field WHY)" "unreadable"
@@ -297,6 +356,51 @@ mkdir -p "$T/listdir"
 r32 "export GATE_REA_PATHS_FILE='$T/listdir'; gate_rea_paths_match rigA 'scrapers/a.py' && rc=0 || rc=\$?; echo RC=\$rc"
 eq "a list that is a directory is rc 2" "$(field RC)" "2"
 
+echo "── 5c. a list that cannot be read AS a list is 'could not tell' (rc 2), never 'nothing matches' ──"
+# Gate round ga-0ef7cq: an empty, CRLF, 3-field, 1-field or `rig:` list all read as "no usable entry" and every one of them came out as `na`,
+# silently - one bad save of rea_paths.txt switched the whole check off (the enforce phase included) and left no trace.
+pw() { # pw <rig> <files> -> RC / M / SK / USABLE / RIGE / WHY
+  r32 "gate_rea_paths_match '$1' \"\$(printf '%b' '$2')\" && rc=0 || rc=\$?; echo RC=\$rc; echo M=\$(printf '%s' \"\$GATE_REA_MATCHED_LIST\" | tr '\n' '+'); echo SK=\$GATE_REA_PATHS_SKIPPED; echo USABLE=\${GATE_REA_PATHS_USABLE:-?}; echo RIGE=\${GATE_REA_RIG_ENTRIES:-?}; echo WHY=\${GATE_REA_PATHS_WHY:-}"
+}
+: > "$LIST"
+pw rigA 'scrapers/a.py'
+eq "an empty list file is rc 2, like a missing one" "$(field RC)" "2"
+has "...and it says the list has no usable line" "$(field WHY)" "no usable"
+printf '# only a comment\n\n   \n\t\n' > "$LIST"
+pw rigA 'scrapers/a.py'
+eq "a list of comments and blanks only is rc 2" "$(field RC)" "2"
+printf 'rigA scrapers/* a note without a hash\n' > "$LIST"
+pw rigA 'scrapers/a.py'
+eq "a list whose only line has 3+ fields is rc 2" "$(field RC)" "2"
+eq "...and the line is counted" "$(field SK)" "1"
+has "...and the count is in the reason" "$(field WHY)" "1 line(s) skipped"
+printf 'scrapers/*\n' > "$LIST"
+pw rigA 'scrapers/a.py'
+eq "a list whose only line dropped the rig (1 field) is rc 2" "$(field RC)" "2"
+printf 'rigA: scrapers/*\n' > "$LIST"
+pw rigA 'scrapers/a.py'
+eq "a list written as 'rig: glob' (a colon in the rig column) is rc 2" "$(field RC)" "2"
+printf '\357\273\277rigA scrapers/*\n' > "$LIST"
+pw rigA 'scrapers/a.py'
+eq "a list that starts with a UTF-8 BOM is rc 2 (the BOM makes the rig name unreadable)" "$(field RC)" "2"
+printf 'rigA scrapers/*\r\nrigB other/*\r\n' > "$LIST"
+pw rigA 'scrapers/a.py'
+eq "a list saved with CRLF is read: the glob matches" "$(field RC):$(field M)" "0:scrapers/a.py+"
+pw rigB 'other/z.py'
+eq "...for the other rig too" "$(field RC):$(field M)" "0:other/z.py+"
+eq "...and no line counts as skipped" "$(field SK)" "0"
+printf 'rigB other/*\nrigA: scrapers/*\n' > "$LIST"
+pw rigA 'scrapers/a.py'
+eq "a 'rig:' line beside a good line for another rig: rc 0, nothing matched" "$(field RC):$(field M)" "0:"
+eq "...the skipped line is counted, the good line is usable" "$(field SK):$(field USABLE)" "1:1"
+eq "...and rigA has no usable entry of its own" "$(field RIGE)" "0"
+printf 'rigA scrapers/*\nrigA tools/*\nrigB other/*\n' > "$LIST"
+pw rigA 'README.md'
+eq "usable entries are counted across all rigs, entries of this rig apart" "$(field USABLE):$(field RIGE)" "3:2"
+pw '' 'scrapers/a.py'
+eq "an empty rig is rc 2 (nobody can say which entries apply)" "$(field RC)" "2"
+has "...and it says so" "$(field WHY)" "rig"
+
 echo "── 5b. the shipped list (config/rea_paths.txt) ──"
 rpm() { r32 "export GATE_REA_PATHS_FILE='$REAL_LIST'; gate_rea_paths_match '$1' \"\$(printf '%b' '$2')\" && rc=0 || rc=\$?; echo RC=\$rc; echo M=\$(printf '%s' \"\$GATE_REA_MATCHED_LIST\" | tr '\n' '+'); echo SK=\$GATE_REA_PATHS_SKIPPED"; }
 rpm property_scrapers 'scrapers/alfenas/scraper.py'
@@ -323,9 +427,9 @@ rigA scrapers/*
 EOF
 FILES_HIT=$'scrapers/a/scraper.py\nREADME.md'
 FILES_MISS=$'README.md\ndocs/x.md'
-ck() { # ck <setup> [files] [rig] -> VERDICT / PHASE / MATCHED / FIRST / DETAIL / CID / SHAPES
-  local f="${2-$FILES_HIT}" rig="${3-rigA}"
-  r32 "$1; gate_rea_check '$rig' '$CITY' 'b-1' \"\$(printf '%s' '$f')\"; echo VERDICT=\$GATE_REA_VERDICT; echo PHASE=\$GATE_REA_PHASE; echo MATCHED=\$GATE_REA_MATCHED; echo FIRST=\$GATE_REA_FIRST; echo DETAIL=\$GATE_REA_DETAIL; echo CID=\$GATE_REA_COMMENT_ID; echo SHAPES=\$GATE_REA_SHAPES"
+ck() { # ck <setup> [files] [rig] [files_ok: 1 = the listing was read, 0 = git failed] -> VERDICT / PHASE / MATCHED / FIRST / DETAIL / CID / SHAPES
+  local f="${2-$FILES_HIT}" rig="${3-rigA}" fok="${4-1}"
+  r32 "$1; gate_rea_check '$rig' '$CITY' 'b-1' \"\$(printf '%s' '$f')\" '$fok'; echo VERDICT=\$GATE_REA_VERDICT; echo PHASE=\$GATE_REA_PHASE; echo MATCHED=\$GATE_REA_MATCHED; echo FIRST=\$GATE_REA_FIRST; echo DETAIL=\$GATE_REA_DETAIL; echo CID=\$GATE_REA_COMMENT_ID; echo SHAPES=\$GATE_REA_SHAPES"
 }
 reset_world; put_comments b-1 c1 "worked on it"
 ck 'export GATE_REA_CHECK=0'
@@ -390,6 +494,51 @@ eq "run 1 missing" "$(field V1)" "missing"
 eq "run 2 na right after a missing: the verdict does not leak" "$(field V2)" "na"
 eq "run 2: the first-matched file does not leak" "$(field F2)" ""
 eq "run 2: the matched count does not leak" "$(field M2)" "0"
+
+echo "── 6b. gate_rea_check: a list or a file listing that cannot be read is unknown, never na ──"
+list_case() { # list_case <label> <list text (printf format)> <want verdict> <detail fragment> - rigA, a diff that touches scrapers/, no REA comment
+  reset_world; put_comments b-1 c1 "worked on it"
+  # shellcheck disable=SC2059
+  printf "$2" > "$LIST"
+  ck ':'
+  eq "$1 -> $3" "$(field VERDICT)" "$3"
+  has "...detail" "$(field DETAIL)" "$4"
+}
+list_case "an empty list" '' unknown "no usable"
+list_case "a list of comments only" '# nothing yet\n' unknown "no usable"
+list_case "a list saved with CRLF" 'rigA scrapers/*\r\n' missing ""
+list_case "a list whose only line has a trailing note (3 fields)" 'rigA scrapers/* note\n' unknown "no usable"
+list_case "a list whose only line dropped the rig" 'scrapers/*\n' unknown "no usable"
+list_case "a list written as 'rig: glob'" 'rigA: scrapers/*\n' unknown "no usable"
+list_case "a 'rig:' line beside a good line for another rig" 'rigB other/*\nrigA: scrapers/*\n' unknown "skipped"
+list_case "a malformed line and a diff that matches another entry of the rig (the match decides)" 'rigA scrapers/*\nrigA broken line here\n' missing ""
+list_case "a malformed line and a diff that matches nothing (the skipped line may have been the match)" 'rigA tools/*\nrigA broken line here\n' unknown "skipped"
+reset_world; put_comments b-1 c1 "worked on it"; printf 'rigA scrapers/*\n' > "$LIST"
+ck ':' "$FILES_HIT" ''
+eq "an empty rig -> unknown (never na: the entries that apply are unknown)" "$(field VERDICT)" "unknown"
+ck ':' '' rigA 0
+eq "the file listing failed, rig has entries -> unknown (an empty list from git is not 'nothing changed')" "$(field VERDICT)" "unknown"
+has "...and the detail says the listing could not be read" "$(field DETAIL)" "could not list the changed files"
+eq "...bd was not asked anything" "$( [ -e "$FB/calls.log" ] && echo called || echo none )" "none"
+ck ':' '' rigZ 0
+eq "the file listing failed, rig has no entry -> na (a rig the list does not name is never checked)" "$(field VERDICT)" "na"
+printf 'rigB other/*\nrigA: scrapers/*\n' > "$LIST"
+ck ':' '' rigZ 0
+eq "the file listing failed, rig has no entry but a line was skipped -> unknown (the skipped line may be its)" "$(field VERDICT)" "unknown"
+printf 'rigA scrapers/*\n' > "$LIST"
+ck ':' "$FILES_HIT" rigA 1
+eq "files_ok=1 behaves as before" "$(field VERDICT)" "missing"
+
+echo "── 6c. a scanner that stalls is 'could not read' (unknown), not a hang ──"
+mkdir -p "$T/slowscan"; cp "$LIB" "$T/slowscan/"
+printf 'import time\ntime.sleep(25)\n' > "$T/slowscan/gate-rea-comments.py"
+reset_world; put_comments b-1 c1 "$CLEAN_REA"
+t0=$(date +%s)
+R_OUT=$("$B32" -c "set -euo pipefail; export GATE_REA_SCAN_TIMEOUT=1; source '$T/slowscan/gate-rea-check.lib.sh'; gate_rea_check rigA '$CITY' b-1 'scrapers/a.py'; echo V=\$GATE_REA_VERDICT; echo D=\$GATE_REA_DETAIL" 2>&1); R_RC=$?
+t1=$(date +%s)
+eq "a scanner that stalls -> unknown (never pass, never missing)" "$(field V)" "unknown"
+has "...and the detail says the comment list could not be read" "$(field D)" "could not be read"
+if [ $((t1 - t0)) -lt 15 ]; then ok "...after the timeout, not when the scanner finishes ($((t1 - t0))s, under 15s)"; else bad "...but it took $((t1 - t0))s: the scanner call has no timeout"; fi
 
 # ── 7. what is written to the bead ────────────────────────────────────────────────────────────────────────────────────────
 echo "── 7. gate_rea_text / gate_rea_mark: ONE comment per bead and label, comment before label ──"
@@ -495,10 +644,62 @@ hasnt "...and never the value" "$(cat "$QGLOG")" "$SECRET_KEY"
 reset_world; put_comments b-1 c1 "worked"
 st5 ':' "$FILES_MISS"
 eq "step5 na writes no record when QG_LOG is unset" "$( [ -e "$QGLOG" ] && echo log || echo none )" "none"
+reset_world; put_comments b-1 c1 "REA: $SECRET_KEY"
+export QG_LOG="$T"   # a directory: the append cannot work
+st5 ':'
+unset QG_LOG
+has "a record that cannot be written is said in the gate log" "$R_OUT" "could not be written to $T"
+eq "...and the caller is still fine" "$(field RC)" "0"
+eq "...and the label was still written (the record is not the check)" "$(labels_of b-1)" "rea:secret-in-comment,"
+
+echo "── 7d. 'could not tell' about the LIST or the FILE LISTING is said in the gate log and recorded, in step5 ──"
+# Gate round ga-0ef7cq: in these cases qg.log held 0 lines and the dispatcher log said nothing - the net effect of "the feature is off", with no trace.
+rec_field() { jq -r ".$1" <<< "$rec" 2>/dev/null; }
+unknown_case() { # unknown_case <label> <list text (printf format)> <skipped count the record must carry>
+  reset_world; put_comments b-1 c1 "worked on it"
+  # shellcheck disable=SC2059
+  printf "$2" > "$LIST"
+  export QG_LOG="$QGLOG"; st5 ':'; unset QG_LOG
+  has "$1: step5 says COULD NOT TELL" "$R_OUT" "COULD NOT TELL"
+  eq "$1: nothing is written to the bead" "$(writes)" "0"
+  rec=$(tail -n 1 "$QGLOG" 2>/dev/null || true)
+  eq "$1: one rea_check record is appended" "$(rec_field event)" "rea_check"
+  eq "$1: ...with verdict unknown" "$(rec_field verdict)" "unknown"
+  eq "$1: ...at step5" "$(rec_field at)" "step5"
+  eq "$1: ...carrying the skipped-line count" "$(rec_field skipped)" "$3"
+  eq "$1: ...and a reason" "$( [ -n "$(rec_field detail)" ] && echo yes || echo no )" "yes"
+}
+unknown_case "an empty list" '' 0
+unknown_case "a list written as 'rig: glob'" 'rigA: scrapers/*\n' 1
+unknown_case "a list whose only line has a trailing note" 'rigA scrapers/* note\n' 1
+unknown_case "a list whose only line dropped the rig" 'scrapers/*\n' 1
+unknown_case "a malformed line and a diff that matches nothing else" 'rigA tools/*\nrigA broken line here\n' 1
+printf 'rigA scrapers/*\n' > "$LIST"
+reset_world; put_comments b-1 c1 "worked on it"; export QG_LOG="$QGLOG"
+r32 "gate_rea_step5 rigA '$CITY' b-1 '' some/branch mk-1 0; echo RC=\$?"
+unset QG_LOG
+eq "step5 with a file listing that failed never fails the caller" "$(field RC)" "0"
+has "...it says COULD NOT TELL" "$R_OUT" "COULD NOT TELL"
+has "...and why" "$R_OUT" "could not list the changed files"
+eq "...nothing is written to the bead" "$(writes)" "0"
+eq "...bd was not asked anything" "$( [ -e "$FB/calls.log" ] && echo called || echo none )" "none"
+rec=$(tail -n 1 "$QGLOG" 2>/dev/null || true)
+eq "...one record, verdict unknown, at step5" "$(rec_field verdict):$(rec_field at)" "unknown:step5"
+reset_world; put_comments b-1 c1 "worked on it"; export QG_LOG="$QGLOG"
+r32 "gate_rea_step5 rigZ '$CITY' b-1 '' some/branch mk-1 0; echo RC=\$?"
+unset QG_LOG
+hasnt "step5 with a failed listing on a rig the list does not name says nothing" "$R_OUT" "COULD NOT TELL"
+eq "...and records nothing" "$( [ -e "$QGLOG" ] && echo log || echo none )" "none"
+reset_world; put_comments b-1 c1 "worked on it"
+r32 "gate_rea_step5 rigA '$CITY' b-1 '' some/branch mk-1; echo RC=\$?"
+hasnt "step5 called without the listing status reads the listing as good (4-6 arg callers keep working)" "$R_OUT" "COULD NOT TELL"
 
 # ── 8. the blocking half ──────────────────────────────────────────────────────────────────────────────────────────────────
 echo "── 8. gate_rea_finalize_block: enforce phase only, missing / secret only, read-only ──"
-fb() { r32 "$1; GATE_REA_BLOCK_REASON=stale; gate_rea_finalize_block rigA '$CITY' b-1 \"\$(printf '%s' '${2-$FILES_HIT}')\" some/branch; echo REASON=\$GATE_REA_BLOCK_REASON; echo V=\$GATE_REA_VERDICT; echo P=\$GATE_REA_PHASE"; }
+fb() { # fb <setup> [files] [files_ok: 1 = the listing was read, 0 = git failed]
+  local fok="${3-1}"
+  r32 "$1; GATE_REA_BLOCK_REASON=stale; gate_rea_finalize_block rigA '$CITY' b-1 \"\$(printf '%s' '${2-$FILES_HIT}')\" some/branch '$fok'; echo REASON=\$GATE_REA_BLOCK_REASON; echo V=\$GATE_REA_VERDICT; echo P=\$GATE_REA_PHASE"
+}
 reset_world; put_comments b-1 c1 "worked"; stamp_age_days 20
 fb ':'
 eq "enforce + missing -> a block reason" "$( [ -n "$(field REASON)" ] && echo block || echo none )" "block"
@@ -541,6 +742,33 @@ has "...it names the shape" "$(field REASON)" "jwt"
 hasnt "...and never the value" "$(field REASON)" "$SECRET_JWT"
 eq "finalize (secret) only reads: no write" "$(writes)" "0"
 
+echo "── 8b. finalize: the same 'could not tell' is said and recorded, and still blocks nothing ──"
+printf 'rigA scrapers/*\n' > "$LIST"
+fin_unknown() { # fin_unknown <label> <list text (printf format)> <files> <files_ok> <setup>
+  reset_world; put_comments b-1 c1 "worked"; stamp_age_days 20
+  # shellcheck disable=SC2059
+  printf "$2" > "$LIST"
+  export QG_LOG="$QGLOG"; fb "${5:-:}" "$3" "$4"; unset QG_LOG
+  eq "$1: enforce phase, no block" "$(field REASON)" ""
+  eq "$1: the verdict is unknown" "$(field V)" "unknown"
+  has "$1: finalize says COULD NOT TELL" "$R_OUT" "COULD NOT TELL"
+  rec=$(tail -n 1 "$QGLOG" 2>/dev/null || true)
+  eq "$1: one record, at finalize, verdict unknown" "$(rec_field at):$(rec_field verdict)" "finalize:unknown"
+  eq "$1: nothing was written" "$(writes)" "0"
+}
+fin_unknown "an empty list" '' "$FILES_HIT" 1
+fin_unknown "a list written as 'rig: glob'" 'rigA: scrapers/*\n' "$FILES_HIT" 1
+fin_unknown "a file listing that failed" 'rigA scrapers/*\n' '' 0
+has "...and the log names the cause" "$R_OUT" "could not list the changed files"
+reset_world; put_comments b-1 c1 "worked"; stamp_age_days 20; printf 'rigA scrapers/*\n' > "$LIST"
+fb 'export GATE_REA_CHECK=maybe'
+eq "an unreadable switch at finalize: off, no block" "$(field V):$(field REASON)" "off:"
+has "...and it is said, as step5 does" "$R_OUT" "switch could not be read"
+reset_world; put_comments b-1 c1 "worked"; stamp_age_days 20; printf 'rigA scrapers/*\n' > "$LIST"
+export QG_LOG="$QGLOG"; fb ':' "$FILES_MISS"; unset QG_LOG
+eq "a healthy list, a diff off it: na at finalize, silent" "$(field V):$(field REASON)" "na:"
+eq "...and no record" "$( [ -e "$QGLOG" ] && echo log || echo none )" "none"
+
 # ── 9. the dispatcher's live blocks ───────────────────────────────────────────────────────────────────────────────────────
 echo "── 9. dispatcher blocks, extracted by SELFTEST-EXTRACT and run under $B32 with set -euo pipefail ──"
 extract_block() { sed -n "/# SELFTEST-EXTRACT ${2}: BEGIN/,/# SELFTEST-EXTRACT ${2}: END/p" "$1" | sed '1d;$d'; }
@@ -567,8 +795,8 @@ load_run "$CITYX"
 eq "lib that returns non-zero at source time: GATE_REA_LIB_OK=0, the dispatcher goes on" "$(field LIBOK):$(field AFTER)" "0:1"
 
 # Step 5 block: needs the lib sourced + the dispatcher's variables.
-s5_run() { # s5_run <libok> <setup> <changed files>
-  R_OUT=$("$B32" -c "set -euo pipefail; source '$LIB'; GATE_REA_LIB_OK=$1; GC_CITY='$CITY'; RIG=rigA; BEAD_CITY='$CITY'; BEAD_ID=b-1; BRANCH=some/branch; MARKER_ID=mk-1; CHANGED_FILES=\"\$(printf '%s' '$3')\"; $2
+s5_run() { # s5_run <libok> <setup> <changed files> - CHANGED_FILES_OK is 1 unless <setup> says otherwise
+  R_OUT=$("$B32" -c "set -euo pipefail; source '$LIB'; warn() { echo \"WARN: \$*\"; }; GATE_REA_LIB_OK=$1; GC_CITY='$CITY'; RIG=rigA; BEAD_CITY='$CITY'; BEAD_ID=b-1; BRANCH=some/branch; MARKER_ID=mk-1; CHANGED_FILES=\"\$(printf '%s' '$3')\"; CHANGED_FILES_OK=1; $2
 $STEP5_BLOCK
 echo AFTER=1" 2>&1); R_RC=$?
 }
@@ -578,8 +806,9 @@ eq "step5 block, lib ok, missing REA -> label written, the dispatcher goes on" "
 reset_world; put_comments b-1 c1 "worked"
 s5_run 0 ':' "$FILES_HIT"
 eq "step5 block, lib NOT loaded -> nothing written, the dispatcher goes on" "$(writes):$(field AFTER)" "0:1"
+has "...and the log says the check did not run (a lib that did not load is not 'nothing to check')" "$R_OUT" "did not load"
 reset_world; put_comments b-1 c1 "worked"
-R_OUT=$("$B32" -c "set -euo pipefail; source '$LIB'; GATE_REA_LIB_OK=1; GC_CITY='$CITY'; BRANCH=b; CHANGED_FILES='scrapers/a.py'
+R_OUT=$("$B32" -c "set -euo pipefail; source '$LIB'; GATE_REA_LIB_OK=1; GC_CITY='$CITY'; BRANCH=b; CHANGED_FILES='scrapers/a.py'; CHANGED_FILES_OK=1
 $STEP5_BLOCK
 echo AFTER=1" 2>&1); R_RC=$?
 eq "step5 block with RIG / BEAD_ID / MARKER_ID / BEAD_CITY all unset does not trip set -u" "$(field AFTER)" "1"
@@ -587,6 +816,24 @@ eq "...and writes nothing" "$(writes)" "0"
 reset_world; put_comments b-1 c1 "worked"; touch "$FB/comments.down"
 s5_run 1 ':' "$FILES_HIT"
 eq "step5 block with bd down -> the dispatcher goes on, nothing written" "$(writes):$(field AFTER)" "0:1"
+# The listing: the dispatcher's CHANGED_FILES is `git diff ... || echo ""`, so a git failure is an EMPTY list. CHANGED_FILES_OK is the sidecar that
+# tells the two apart; the block must hand it to the lib instead of reading "" as "nothing changed".
+reset_world; put_comments b-1 c1 "worked"; printf 'rigA scrapers/*\n' > "$LIST"; export QG_LOG="$QGLOG"
+s5_run 1 'CHANGED_FILES_OK=0' ''
+unset QG_LOG
+eq "step5 block, git could not list the files -> the dispatcher goes on, nothing written" "$(writes):$(field AFTER)" "0:1"
+has "...the log says it could not list them and could not tell" "$R_OUT" "could not list the changed files"
+rec=$(tail -n 1 "$QGLOG" 2>/dev/null || true)
+eq "...and one record, verdict unknown, at step5" "$(rec_field verdict):$(rec_field at)" "unknown:step5"
+reset_world; put_comments b-1 c1 "worked"
+R_OUT=$("$B32" -c "set -euo pipefail; source '$LIB'; warn() { echo \"WARN: \$*\"; }; GATE_REA_LIB_OK=1; GC_CITY='$CITY'; RIG=rigA; BEAD_CITY='$CITY'; BEAD_ID=b-1; BRANCH=b; CHANGED_FILES=''
+$STEP5_BLOCK
+echo AFTER=1" 2>&1); R_RC=$?
+has "step5 block where nobody set CHANGED_FILES_OK -> could not tell (an unvouched empty list is not 'nothing changed')" "$R_OUT" "could not list the changed files"
+eq "...and the dispatcher goes on" "$(field AFTER)" "1"
+reset_world; put_comments b-1 c1 "worked"
+s5_run 1 ':' ''
+hasnt "step5 block, listing read and empty -> nothing to say" "$R_OUT" "COULD NOT TELL"
 
 # Finalize block: the dispatcher's variables + stubs for git_rig / warn.
 fin_run() { # fin_run <verdict> <libok> <bead_id> <git_mode: ok|fail> <class> -> OVERALL / CLASS / REASONS / WARN lines
@@ -611,11 +858,14 @@ eq "finalize block: warn phase -> stays PASS, class untouched" "$(field OVERALL)
 reset_world; put_comments b-1 c1 "$CLEAN_REA"; stamp_age_days 20
 fin_run PASS 1 b-1 ok code
 eq "finalize block: enforce + clean REA -> stays PASS" "$(field OVERALL):$(field CLASS)" "PASS:code"
-reset_world; put_comments b-1 c1 "worked"; stamp_age_days 20
+reset_world; put_comments b-1 c1 "worked"; stamp_age_days 20; export QG_LOG="$QGLOG"
 fin_run PASS 1 b-1 fail code
+unset QG_LOG
 eq "finalize block: git cannot list the files -> stays PASS (could not tell)" "$(field OVERALL):$(field CLASS)" "PASS:code"
 has "...and the log says it could not list them" "$R_OUT" "could not list the changed files"
 eq "...and bd was not asked anything" "$( [ -e "$FB/calls.log" ] && echo called || echo none )" "none"
+rec=$(tail -n 1 "$QGLOG" 2>/dev/null || true)
+eq "...and one record, at finalize, verdict unknown (it was said in the log and nowhere else)" "$(rec_field at):$(rec_field verdict)" "finalize:unknown"
 reset_world; put_comments b-1 c1 "worked"; stamp_age_days 20
 fin_run FAIL 1 b-1 ok code
 eq "finalize block: an already-FAIL verdict is untouched" "$(field OVERALL):$(field CLASS)" "FAIL:code"
@@ -623,6 +873,7 @@ eq "...and bd was not asked anything" "$( [ -e "$FB/calls.log" ] && echo called 
 reset_world; put_comments b-1 c1 "worked"; stamp_age_days 20
 fin_run PASS 1 '' ok code
 eq "finalize block: no source bead id -> stays PASS" "$(field OVERALL)" "PASS"
+has "...and the log says it could not tell (the block no longer skips an empty bead id in silence)" "$R_OUT" "no source bead id"
 fin_run PASS 0 b-1 ok code
 eq "finalize block: lib not loaded -> stays PASS" "$(field OVERALL)" "PASS"
 reset_world; put_comments b-1 c1 "worked"; stamp_age_days 20; touch "$FB/comments.down"
@@ -634,11 +885,12 @@ GATE_REA_LIB_OK=1; GC_CITY='$CITY'; BRANCH=b; DEFAULT_BRANCH=main; OVERALL_VERDI
 $FIN_BLOCK
 echo AFTER=\$OVERALL_VERDICT" 2>&1); R_RC=$?
 eq "finalize block with RIG / BEAD_ID / BEAD_CITY / BRANCH_SHA all unset does not trip set -u" "$(field AFTER)" "PASS"
-R_OUT=$("$B32" -c "set -euo pipefail; source '$LIB'; warn() { :; }; git_rig() { printf 'scrapers/a.py\n'; }
+R_OUT=$("$B32" -c "set -euo pipefail; source '$LIB'; warn() { echo \"WARN: \$*\"; }; git_rig() { printf 'scrapers/a.py\n'; }
 GATE_REA_LIB_OK=1; GC_CITY='$CITY'; BEAD_ID=b-1; BRANCH=b; DEFAULT_BRANCH=main; OVERALL_VERDICT=PASS; GATE_SHA_FAIL_CLASS=code; FAIL_REASONS=''
 $FIN_BLOCK
 echo AFTER=\$OVERALL_VERDICT" 2>&1); R_RC=$?
-eq "finalize block with a bead id but RIG / BEAD_CITY / BRANCH_SHA unset does not trip set -u (the rig is not checked: na)" "$(field AFTER)" "PASS"
+eq "finalize block with a bead id but RIG / BEAD_CITY / BRANCH_SHA unset does not trip set -u (an empty rig is unknown: said, inert)" "$(field AFTER)" "PASS"
+has "...and it is said: an empty rig is not 'the rig is not checked'" "$R_OUT" "COULD NOT TELL"
 
 # ── 10. drift guards ──────────────────────────────────────────────────────────────────────────────────────────────────────
 echo "── 10. drift guards: where the blocks sit in the dispatcher ──"
@@ -664,6 +916,13 @@ for bad_word in 'exit ' 'OVERALL_VERDICT' 'FAIL_REASONS'; do
 done
 case "$STEP5_BLOCK" in *'GATE_REA_LIB_OK'*) ok "the Step 5 call is guarded by GATE_REA_LIB_OK" ;; *) bad "the Step 5 call must test GATE_REA_LIB_OK" ;; esac
 case "$FIN_BLOCK" in *'GATE_REA_LIB_OK'*) ok "the finalize block is guarded by GATE_REA_LIB_OK" ;; *) bad "the finalize block must test GATE_REA_LIB_OK" ;; esac
+CFOK_LN=$(ln_of '^CHANGED_FILES_OK=1')
+if [ -n "$CFOK_LN" ] && [ -n "$S5_LN" ] && [ "$CFOK_LN" -lt "$S5_LN" ]; then ok "CHANGED_FILES_OK is initialised (line $CFOK_LN) before the Step 5 call (line $S5_LN)"; else bad "CHANGED_FILES_OK must be set before the Step 5 call (ok=$CFOK_LN step5=$S5_LN)"; fi
+if grep -qF '2>/dev/null) || CHANGED_FILES_OK=0' "$DISPATCHER"; then ok "the changed-file listing records a git failure in CHANGED_FILES_OK (and no longer folds it into an empty string)"; else bad "the CHANGED_FILES listing must set CHANGED_FILES_OK=0 when git fails"; fi
+case "$STEP5_BLOCK" in *'CHANGED_FILES_OK'*) ok "the Step 5 block hands CHANGED_FILES_OK to the lib" ;; *) bad "the Step 5 block must pass CHANGED_FILES_OK to gate_rea_step5" ;; esac
+case "$FIN_BLOCK" in *'"$_REA_FILES_OK"'*) ok "the finalize block hands its listing status to the lib" ;; *) bad "the finalize block must pass _REA_FILES_OK to gate_rea_finalize_block" ;; esac
+eq "the dispatcher names no drift-guard that does not exist (GATE_HOLD_SITE_COUNT)" "$(grep -c 'GATE_HOLD_SITE_COUNT' "$DISPATCHER" || true)" "0"
+if grep -q 'HOLD_COUNT' "$SELF_DIR/gate-sha-fail-lock.selftest.sh" 2>/dev/null; then ok "the guard the dispatcher comment points at (HOLD_COUNT in gate-sha-fail-lock.selftest.sh) exists"; else bad "gate-sha-fail-lock.selftest.sh has no HOLD_COUNT"; fi
 n_load=$(grep -c 'SELFTEST-EXTRACT rea-lib-load: BEGIN' "$DISPATCHER" || true)
 eq "exactly one rea-lib-load sentinel pair" "$n_load" "1"
 if bash -n "$DISPATCHER"; then ok "dispatcher passes bash -n"; else bad "dispatcher bash -n FAILED"; fi
@@ -707,11 +966,28 @@ PYMUT
   mutant scanner-empty-REA-answers scan 'S = S.replace("^[ \\t]*REA:[ \\t]*\\S", "^[ \\t]*REA:", 1)'
   mutant scanner-unreadable-is-empty scan 'S = S.replace("    if not rows and unreadable:\n        return 2", "    if not rows and unreadable:\n        return 0", 1)'
   mutant scanner-flags-every-long-number scan 'S = S.replace("        if len(run) == 11 and _cpf_ok(run):", "        if len(run) >= 8:", 1)'
-  mutant scanner-misses-jwt scan 'S = S.replace("    (\"jwt\", re.compile(", "    (\"jwt-off\", re.compile(", 1)'
+  mutant scanner-misses-jwt scan 'S = S.replace("    if _has_jwt(text):", "    if False:", 1)'
+  mutant scanner-misses-url-credentials scan 'S = S.replace("    if _has_url_credentials(text):", "    if False:", 1)'
   mutant scanner-echoes-values scan 'S = S.replace("            rows.append((ident, \",\".join(sorted(shapes(text))) or \"-\"))", "            rows.append((ident, \",\".join(sorted(shapes(text))) or \"-\") if not shapes(text) else (ident, text))", 1)'
   mutant finalize-forgets-hold disp 'S = S.replace("    GATE_SHA_FAIL_CLASS=\"hold\"  # ga-jdzri9:", "    : # ga-jdzri9:", 1)'
   mutant finalize-runs-on-a-fail-verdict disp 'S = S.replace("# SELFTEST-EXTRACT rea-finalize: BEGIN\nGATE_REA_BLOCK_REASON=\"\"\nif [ \"$OVERALL_VERDICT\" = \"PASS\" ]", "# SELFTEST-EXTRACT rea-finalize: BEGIN\nGATE_REA_BLOCK_REASON=\"\"\nif true", 1)'
   mutant step5-unguarded-by-lib-flag disp 'S = S.replace("if [ \"${GATE_REA_LIB_OK:-0}\" = \"1\" ]; then\n  gate_rea_step5", "if true; then\n  gate_rea_step5", 1)'
+  # ga-0ef7cq: the third state of the INPUTS (path list, file listing). Each of these is the old behaviour, reintroduced.
+  mutant unusable-list-reads-as-na lib 'S = S.replace("  if [ \"$GATE_REA_PATHS_USABLE\" = \"0\" ]; then", "  if false; then", 1)'
+  mutant na-hides-skipped lib 'S = S.replace("    if [ \"$GATE_REA_PATHS_SKIPPED\" != \"0\" ]; then\n      GATE_REA_VERDICT=\"unknown\"; GATE_REA_DETAIL=\"no changed file", "    if false; then\n      GATE_REA_VERDICT=\"unknown\"; GATE_REA_DETAIL=\"no changed file", 1)'
+  mutant failed-listing-reads-as-empty lib 'S = S.replace("  if [ \"$files_ok\" != \"1\" ]; then", "  if false; then", 1)'
+  mutant crlf-not-stripped lib 'S = S.replace("    line=\"${line//$cr/ }\"\n", "", 1)'
+  mutant rig-column-not-validated lib 'S = S.replace("      *[!A-Za-z0-9_.-]*) GATE_REA_PATHS_SKIPPED", "      __never__) GATE_REA_PATHS_SKIPPED", 1)'
+  mutant empty-rig-is-a-rig lib 'S = S.replace("  if [ -z \"$rig\" ]; then GATE_REA_PATHS_WHY=", "  if false; then GATE_REA_PATHS_WHY=", 1)'
+  mutant day-count-is-octal lib 'S = S.replace("  days=$((10#$days))", "  :", 1)'
+  mutant stamp-is-octal lib 'S = S.replace("  since=$((10#$since))", "  :", 1)'
+  mutant scanner-has-no-timeout lib 'S = S.replace("timeout \"${GATE_REA_SCAN_TIMEOUT:-20}\" python3", "python3", 1)'
+  mutant finalize-unknown-is-silent lib 'S = S.replace("    unknown) gate_rea_say \"REA check: COULD NOT TELL (${GATE_REA_DETAIL:-no reason}) for ${3:-?} - nothing blocked.\"; gate_rea_event", "    unknown) gate_rea_event", 1)'
+  mutant step5-ignores-listing-status disp 'S = S.replace("\"${MARKER_ID:-}\" \"${CHANGED_FILES_OK:-0}\" || true", "\"${MARKER_ID:-}\" || true", 1)'
+  mutant finalize-ignores-listing-status disp 'S = S.replace("\"$BRANCH\" \"$_REA_FILES_OK\" || true", "\"$BRANCH\" || true", 1)'
+  mutant listing-failure-folded-into-empty disp 'S = S.replace("2>/dev/null) || CHANGED_FILES_OK=0", "2>/dev/null) || true", 1)'
+  mutant lib-not-loaded-is-silent disp 'S = S.replace("else\n  warn \"REA check: the check library did not load - the REA check did NOT run for $BRANCH (ga-jdzri9).\"\nfi\n# SELFTEST-EXTRACT rea-step5: END", "else\n  :\nfi\n# SELFTEST-EXTRACT rea-step5: END", 1)'
+  mutant record-failure-is-silent lib 'S = S.replace("    >> \"$QG_LOG\" 2>/dev/null || gate_rea_say \"REA check: the rea_check record", "    >> \"$QG_LOG\" 2>/dev/null || : \"REA check: the rea_check record", 1)'
   wait
   for name in $MUTANT_NAMES; do
     d="$MU/$name"; rc=$(cat "$d/rc" 2>/dev/null || echo missing)

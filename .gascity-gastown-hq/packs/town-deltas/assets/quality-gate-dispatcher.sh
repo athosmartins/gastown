@@ -98,7 +98,7 @@ unset _E5_LIB
 # ga-jdzri9 (epic ga-oe7o1p): the REA rule - a diff that touches a source reader on config/rea_paths.txt needs a `REA:` comment on the source
 # bead. Same `[ -r ] && { source && OK=1; } || true` idiom as the E5 lib above, and the same limit: it survives a MISSING lib, not a parse error
 # or a failing top-level command (gate-rea-check.selftest.sh runs `bash -n` and sources the lib under these strict flags). Both call sites
-# (Step 5, gate_finalize_run) test GATE_REA_LIB_OK first, so a lib that did not load costs the REA check and nothing else.
+# (Step 5, gate_finalize_run) test GATE_REA_LIB_OK first, so a lib that did not load costs the REA check and nothing else - and each says so in the log.
 # SELFTEST-EXTRACT rea-lib-load: BEGIN
 GATE_REA_LIB_OK=0
 _REA_LIB="${GC_CITY}/packs/town-deltas/assets/gate-rea-check.lib.sh"
@@ -8167,9 +8167,10 @@ fi
 # gate_sha_fail_label's header for what each class means. This list is the
 # complete set as of ga-jdzri9 (gate-fix-attempt-1 / ga-3ipxu review plus the REA site); if a new
 # downgrade site is added below without touching GATE_SHA_FAIL_CLASS, it
-# silently defaults to "code" here — update this comment AND the
-# GATE_HOLD_SITE_COUNT drift-guard in gate-sha-fail-lock.selftest.sh when
-# adding one. Reset unconditionally on every entry to this function:
+# silently defaults to "code" here — extend this comment when adding one.
+# The guard in gate-sha-fail-lock.selftest.sh (HOLD_COUNT) only checks a
+# floor of 6 hold sites, so a new site needs no change there. Reset
+# unconditionally on every entry to this function:
 # gate_finalize_run() runs once per in-flight run bead in a sweep loop (see
 # the quota-stop comment above), so a "hold" set while finalizing a PRIOR
 # bead this sweep must never leak into THIS bead's stamp.
@@ -8422,23 +8423,25 @@ fi
 # config/rea_paths.txt becomes a FAIL when the source bead still has no `REA:` comment (or the latest one has the shape of a credential / CPF / CNPJ).
 # It is a hold, not a code rejection: adding a comment does not change the commit, so the same SHA may pass afterwards (stamp class "hold"). No
 # needs-human and no Mayor mail - the author fixes this with one `bd comments add`, and the generic FAIL path below already hands them the reason.
-# Third state: a changed-file list that cannot be read (git failed) is "could not tell" and blocks nothing; gate_rea_finalize_block makes the same
-# call for an unreadable list / comments / scanner. It recomputes the verdict: Phase C may run in a later process than Step 5.
+# Third state: a changed-file list that cannot be read (git failed) is "could not tell" and blocks nothing; the lib is told by the status flag
+# (_REA_FILES_OK) because an empty list and a failed one look alike, and it makes the same call - said in the log, recorded, blocking nothing - for an
+# unreadable path list / comments / scanner / bead id. A lib that did not load is said too: that is "the check did not run", not "nothing to check".
+# It recomputes the verdict: Phase C may run in a later process than Step 5.
 # SELFTEST-EXTRACT rea-finalize: BEGIN
 GATE_REA_BLOCK_REASON=""
-if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "${BEAD_ID:-}" ] && [ "${GATE_REA_LIB_OK:-0}" = "1" ]; then
-  _REA_FILES_OK=1
-  _REA_FILES=$(git_rig diff --name-only "origin/$DEFAULT_BRANCH...${BRANCH_SHA:-origin/$BRANCH}" 2>/dev/null) || _REA_FILES_OK=0
-  if [ "$_REA_FILES_OK" = "1" ]; then
-    gate_rea_finalize_block "${RIG:-}" "${BEAD_CITY:-$GC_CITY}" "${BEAD_ID:-}" "$_REA_FILES" "$BRANCH" || true
+if [ "$OVERALL_VERDICT" = "PASS" ]; then
+  if [ "${GATE_REA_LIB_OK:-0}" = "1" ]; then
+    _REA_FILES_OK=1
+    _REA_FILES=$(git_rig diff --name-only "origin/$DEFAULT_BRANCH...${BRANCH_SHA:-origin/$BRANCH}" 2>/dev/null) || _REA_FILES_OK=0
+    gate_rea_finalize_block "${RIG:-}" "${BEAD_CITY:-$GC_CITY}" "${BEAD_ID:-}" "$_REA_FILES" "$BRANCH" "$_REA_FILES_OK" || true
+    if [ -n "${GATE_REA_BLOCK_REASON:-}" ]; then
+      OVERALL_VERDICT="FAIL"
+      GATE_SHA_FAIL_CLASS="hold"  # ga-jdzri9: the code was judged clean; a missing comment is not a code rejection, so the same SHA must be able to re-earn its PASS
+      FAIL_REASONS="$GATE_REA_BLOCK_REASON"
+      warn "ga-jdzri9: branch $BRANCH has a reviewer PASS but source bead ${BEAD_ID:-?} fails the REA check (${GATE_REA_VERDICT:-?}, phase=${GATE_REA_PHASE:-?}) - downgrading PASS to FAIL (hold class)."
+    fi
   else
-    warn "REA check: could not list the changed files of $BRANCH - nothing blocked (ga-jdzri9)."
-  fi
-  if [ -n "${GATE_REA_BLOCK_REASON:-}" ]; then
-    OVERALL_VERDICT="FAIL"
-    GATE_SHA_FAIL_CLASS="hold"  # ga-jdzri9: the code was judged clean; a missing comment is not a code rejection, so the same SHA must be able to re-earn its PASS
-    FAIL_REASONS="$GATE_REA_BLOCK_REASON"
-    warn "ga-jdzri9: branch $BRANCH has a reviewer PASS but source bead $BEAD_ID fails the REA check (${GATE_REA_VERDICT:-?}, phase=${GATE_REA_PHASE:-?}) - downgrading PASS to FAIL (hold class)."
+    warn "REA check: the check library did not load - the REA check did NOT run for $BRANCH (ga-jdzri9)."
   fi
 fi
 # SELFTEST-EXTRACT rea-finalize: END
@@ -17269,7 +17272,11 @@ log "  Branch $BRANCH is current with $DEFAULT_BRANCH — stale-base check passe
 # When classifier is uncertain or the gate policy itself is modified → CODE tier.
 # This is the "escalate up, never down" rule from review-merge-policy.md.
 
-CHANGED_FILES=$(git_rig diff --name-only "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null || echo "")
+# ga-jdzri9: CHANGED_FILES_OK says whether the listing was really produced. The `|| echo ""` this line used to end in made a git failure an empty
+# list for everything downstream, which is right for the tier classifier (empty -> uncertain -> CODE) and wrong for the REA check ("nothing changed").
+CHANGED_FILES_OK=1
+CHANGED_FILES=$(git_rig diff --name-only "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null) || CHANGED_FILES_OK=0
+if [ "$CHANGED_FILES_OK" = "0" ]; then CHANGED_FILES=""; fi
 
 # ── ga-ir033: reject double-prefixed (mis-rooted-worktree) paths ──────────────
 # A build from a worktree created *inside* a nested city repo (e.g. gascity's
@@ -17428,9 +17435,13 @@ log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 # whose source bead has no such comment gets the label rea:missing and ONE comment (once per bead and label, so a gate-fix re-run adds
 # nothing); a REA comment that has the shape of a credential or CPF/CNPJ gets rea:secret-in-comment. This step never changes the verdict and
 # never exits: the blocking half is in gate_finalize_run, enforce phase only (gate-rea-check.lib.sh has the phases and the third state).
+# CHANGED_FILES is `git diff ... || echo ""`: a git failure and "nothing changed" are the same empty string. CHANGED_FILES_OK (set beside it) is what
+# tells them apart, and the lib turns a failed listing into "could not tell" instead of "nothing to check". A lib that did not load is said too.
 # SELFTEST-EXTRACT rea-step5: BEGIN
 if [ "${GATE_REA_LIB_OK:-0}" = "1" ]; then
-  gate_rea_step5 "${RIG:-}" "${BEAD_CITY:-$GC_CITY}" "${BEAD_ID:-}" "$CHANGED_FILES" "$BRANCH" "${MARKER_ID:-}" || true
+  gate_rea_step5 "${RIG:-}" "${BEAD_CITY:-$GC_CITY}" "${BEAD_ID:-}" "$CHANGED_FILES" "$BRANCH" "${MARKER_ID:-}" "${CHANGED_FILES_OK:-0}" || true
+else
+  warn "REA check: the check library did not load - the REA check did NOT run for $BRANCH (ga-jdzri9)."
 fi
 # SELFTEST-EXTRACT rea-step5: END
 

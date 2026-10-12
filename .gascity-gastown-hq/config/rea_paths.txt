@@ -9,8 +9,11 @@
 #
 # FORMAT. One entry per line: `<rig> <pattern>`, separated by blanks. `#` starts a comment. <rig> is the marker's `rig:` value
 # (whatsapp_automation, property_scrapers, gascity...). <pattern> is a bash `case` glob over the repo-relative path; `*` also crosses `/`,
-# so `scrapers/*` is the whole tree. A line that is not exactly two fields is skipped and counted in the gate log (rea_check ... skipped=N).
-# A rig with no entry is never checked.
+# so `scrapers/*` is the whole tree. A line that is not exactly two fields, or whose <rig> holds anything but letters, digits, `_`, `.`, `-`
+# (a `rig:` colon, a BOM), is skipped and counted in the gate log (rea_check ... skipped=N). A rig with no entry is never checked.
+# What the check does NOT do is guess: a list with no usable line at all (empty, comments only, every line malformed), and a skipped line when no
+# changed file matched (it may have been the one for this rig), are "could not tell" - the gate log says COULD NOT TELL and records it
+# (rea_check, verdict unknown, skipped=N), nothing is written to the bead and nothing is blocked. Fix the line; a file saved with CRLF is fine.
 #
 # WHAT BELONGS. Code that reads a site or portal through an endpoint its own front-end serves openly, and the per-source files around it.
 # NOT here, on purpose: generic `*_client.py` / `*_common.py` plumbing (it would match unrelated work), and clients of paid or documented APIs
