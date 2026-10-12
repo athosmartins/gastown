@@ -9,8 +9,8 @@
 # failing on Dolt i/o timeouts. Every builder that finishes only deepens the queue.
 #
 # RULE (his choices, AskUserQuestion in the Mayor session, 07/10 ~04:1x):
-#   enter  when the gate queue is ABOVE GATE_FOCUS_ENTER (15)
-#   leave  when it drops BELOW GATE_FOCUS_EXIT (8)
+#   enter  when the gate queue is ABOVE GATE_FOCUS_ENTER (10; was 15 until 12/10)
+#   leave  when it drops BELOW GATE_FOCUS_EXIT (5; was 8 until 12/10)
 #   In between the mode keeps whatever it was (hysteresis: no flapping every sweep).
 #   One notification when the mode turns on and one when it turns off — never per run.
 #   What the mode DOES is up to its readers (Pilot: no new builds, fixes with at most 2
@@ -38,8 +38,8 @@
 set -u
 
 GC_CITY="${GC_CITY_PATH:-${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}}"   # same precedence as gate-focus-lib.sh (writer and readers name the same city)
-GATE_FOCUS_ENTER="${GATE_FOCUS_ENTER:-15}"
-GATE_FOCUS_EXIT="${GATE_FOCUS_EXIT:-8}"
+GATE_FOCUS_ENTER="${GATE_FOCUS_ENTER:-10}"   # Athos 12/10: 15→10
+GATE_FOCUS_EXIT="${GATE_FOCUS_EXIT:-5}"     # Athos 12/10: 8→5
 GATE_FOCUS_MAX_S="${GATE_FOCUS_MAX_S:-86400}"   # one escalation if ON longer than this
 GATE_FOCUS_STATE_FILE="${GATE_FOCUS_STATE_FILE:-$GC_CITY/.gc/gate-focus.state}"
 GATE_FOCUS_OFF_FILE="${GATE_FOCUS_OFF_FILE:-$GC_CITY/.gc/gate-focus.off}"

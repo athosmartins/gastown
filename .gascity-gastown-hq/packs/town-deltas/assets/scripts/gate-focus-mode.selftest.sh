@@ -21,11 +21,16 @@ echo "\$*" >>"$W/notified"
 EOF
 chmod +x "$W/notify"
 export GATE_FOCUS_NOTIFY_CMD="$W/notify"
+# The cases below exercise the hysteresis LOGIC with fixed thresholds 15/8; the shipped defaults
+# (10/5 since Athos 12/10) are checked separately in T0.
+export GATE_FOCUS_ENTER=15 GATE_FOCUS_EXIT=8
 export BD="$W/no-bd-must-not-be-called"
 MODE="$HERE/gate-focus-mode.sh"
 LIB="$HERE/gate-focus-lib.sh"
 
 run() { GATE_FOCUS_DEPTH_OVERRIDE="$1" GATE_FOCUS_NOW="$2" bash "$MODE"; }
+# T0 shipped defaults (Athos 12/10: enter >10, leave <5)
+grep -q 'GATE_FOCUS_ENTER="${GATE_FOCUS_ENTER:-10}"' "$MODE" && grep -q 'GATE_FOCUS_EXIT="${GATE_FOCUS_EXIT:-5}"' "$MODE" && ok || bad "T0 defaults must be enter>10 / exit<5"
 field() { sed -n "s/^$1=//p" "$GATE_FOCUS_STATE_FILE" 2>/dev/null | head -n 1; }
 notes() { [ -f "$W/notified" ] && wc -l <"$W/notified" | tr -d ' ' || echo 0; }
 
