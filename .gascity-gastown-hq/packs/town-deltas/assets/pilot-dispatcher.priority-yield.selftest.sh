@@ -78,12 +78,13 @@ warned()   { grep -qF -- "warn	"  "$WORK/log.txt" 2>/dev/null && grep -F -- "war
 writes()   { [ -f "$WORK/bd.writes" ] && wc -l < "$WORK/bd.writes" | tr -d ' ' || echo 0; }
 cap_calls() { [ -f "$WORK/cap.calls" ] && wc -l < "$WORK/cap.calls" | tr -d ' ' || echo 0; }
 
-# bead <id> <priority|-> <routed_to|-> <store> [type] — one bead as the emit's ordered population carries it.
+# bead <id> <priority|-> <routed_to|-> <store> [type] [label,label...] — one bead as the emit's ordered population carries it.
 bead() {
   local _p="$2" _r="$3"
-  jq -cn --arg id "$1" --arg p "$_p" --arg r "$_r" --arg s "$4" --arg t "${5:-task}" '
+  jq -cn --arg id "$1" --arg p "$_p" --arg r "$_r" --arg s "$4" --arg t "${5:-task}" --arg l "${6:-}" '
     {id: $id, issue_type: $t, status: "open", created_at: "2026-10-01T00:00:00Z", _emit_store: $s,
      metadata: (if $r == "-" then {} else {"gc.routed_to": $r} end)}
+    + (if $l == "" then {} else {labels: ($l | split(","))} end)
     + (if $p == "-" then {} elif $p == "str" then {priority: "2"} else {priority: ($p | tonumber)} end)'
 }
 arr() { local _o="" _b; for _b in "$@"; do _o="${_o:+$_o,}$_b"; done; printf '[%s]' "$_o"; }
@@ -174,9 +175,9 @@ reset; cap wa-worker 2 2
 out="$(run_py "_PY_EMIT_OK=0; _pilot_priority_waiting_scan; echo \"WAIT=\${_PY_WAIT_ID:-} BLIND=\${_PY_BLIND}\"")"
 [ "$out" = "WAIT= BLIND=1" ] && ok "B6 the emit never ran → BLIND=1 (cap file says full, and it is still not trusted without a population)" || bad "B6: $out"
 reset; cap wa-worker 2 2
-out="$(run_py "PILOT_PRIORITY_YIELD=0; $(scan_with "$POP")")"
-[ "$out" = "WAIT= BLIND=0" ] && logged "priority yield is OFF" && [ "$(cap_calls)" = "0" ] \
-  && ok "B7 PILOT_PRIORITY_YIELD=0 → no waiter, not blind, the pool is not even probed" || bad "B7: $out calls=$(cap_calls)"
+out="$(run_py "PILOT_PRIORITY_YIELD=0; $(scan_with "$POP"); echo \"SCANNED=\$_PY_SCANNED\"")"
+echo "$out" | grep -qx "WAIT= BLIND=0" && echo "$out" | grep -qx "SCANNED=0" && logged "priority yield is OFF" && [ "$(cap_calls)" = "0" ] \
+  && ok "B7 PILOT_PRIORITY_YIELD=0 → no waiter, not blind, the pool is not even probed, and NOT 'scanned' (the sweep event says null, not 'looked and could tell')" || bad "B7: $out calls=$(cap_calls)"
 reset; cap wa-worker 2 2; : > "$WORK/city/.gc/priority-yield.off"
 out="$(run_py "$(scan_with "$POP")")"
 [ "$out" = "WAIT= BLIND=0" ] && ok "B8 the kill file .gc/priority-yield.off switches it off instantly (no reload)" || bad "B8: $out"
@@ -285,6 +286,50 @@ touch "$WORK/crew.hq"
 out="$(run_py "_pilot_priority_pool_bound_pre '$(bead x 2 - wa | jq -c '.metadata["story.rig"]="hq"')' && echo BOUND || echo UNKNOWN")"
 [ "$out" = "UNKNOWN" ] && ok "H the same rig WITH a persistent crew → unknown (a crew may take it; no guess)" || bad "H crew rig: $out"
 
+# ── J: a waiter is a bead THIS sweep could dispatch (gate round 1) ───────────────────────────────────────────────────
+# The emit's population is the real queue, made BEFORE the gate-focus clamp and without the top-up brake. Under focus a non-fix P0/P1
+# is never handed a session, so it must not make a gate-rejected fix (the work focus mode exists to let through) cede.
+echo "J. waiters the sweep itself could never dispatch (gate focus ON, respawn brake)"
+FIXLBL="gate:needs-fix"
+P2FIX="$(bead ps-fix 2 ps-worker ps task "$FIXLBL")"
+POPJ="$(arr "$(bead wa-new0 0 wa-worker wa task story:approved)" "$(bead ps-p1fix 1 ps-worker ps task "$FIXLBL")")"
+reset; cap wa-worker 2 2; cap ps-worker 0 1
+out="$(run_py "PILOT_GATE_FOCUS=1; $(scan_with "$(arr "$(bead wa-new0 0 wa-worker wa task story:approved)")"); _pilot_priority_yield_for '$P2FIX' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT= BLIND=0" && echo "$out" | grep -qx "DISPATCHES" && logged "NOT counted as waiting" && logged "wa-new0 (not-a-fix)" \
+  && ok "J1 focus ON + a NON-fix WA P0 behind a full wa-worker + a gate-rejected P2 fix of PS → no waiter, the fix DISPATCHES (the reviewer's repro)" || bad "J1: $out / $(cat "$WORK/log.txt")"
+for lbl in gate:needs-fix gate:fix-attempt:2 origem:auto-healer-notify impacto:dano-ao-vivo; do
+  reset; cap wa-worker 2 2; cap ps-worker 0 1
+  out="$(run_py "PILOT_GATE_FOCUS=1; $(scan_with "$(arr "$(bead wa-fix0 0 wa-worker wa task "story:approved,$lbl")")"); _pilot_priority_yield_for '$P2FIX' && echo CEDES || echo DISPATCHES")"
+  echo "$out" | grep -qx "WAIT=wa-fix0 BLIND=0" && echo "$out" | grep -qx "CEDES" \
+    && ok "J2 (control) focus ON + a WA P0 that IS a fix ($lbl) behind a full wa-worker → it waits, the P2 cedes (the rule still works under focus)" || bad "J2 $lbl: $out"
+done
+reset; cap wa-worker 2 2; cap ps-worker 0 1
+out="$(run_py "PILOT_GATE_FOCUS=0; $(scan_with "$(arr "$(bead wa-new0 0 wa-worker wa task story:approved)")"); _pilot_priority_yield_for '$P2FIX' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT=wa-new0 BLIND=0" && echo "$out" | grep -qx "CEDES" \
+  && ok "J3 (control) focus OFF + the same non-fix P0 → it waits and the P2 cedes, exactly as before" || bad "J3: $out"
+reset; cap wa-worker 2 2; cap ps-worker 0 1
+out="$(run_py "unset PILOT_GATE_FOCUS; $(scan_with "$(arr "$(bead wa-new0 0 wa-worker wa task story:approved)")")")"
+[ "$out" = "WAIT=wa-new0 BLIND=0" ] && ok "J3b (control) focus state unknown/unset (the dispatcher dispatches normally then) → a non-fix P0 waits as before" || bad "J3b: $out"
+reset; cap wa-worker 2 2; cap ps-worker 1 1
+out="$(run_py "PILOT_GATE_FOCUS=1; $(scan_with "$POPJ")")"
+[ "$out" = "WAIT=ps-p1fix BLIND=0" ] && [ "$(cap_calls)" = "1" ] \
+  && ok "J4 focus ON, [non-fix WA P0, fix PS P1] → the scan skips the first WITHOUT probing its pool and the PS fix is the head waiter" || bad "J4: $out calls=$(cap_calls)"
+reset; cap wa-worker 2 2; cap ps-worker 0 1
+out="$(run_py "$(scan_with "$(arr "$(bead wa-brk 0 wa-worker wa task story:approved,pilot:topup-braked)")"); _pilot_priority_yield_for '$(bead ps-p2 2 ps-worker ps)' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT= BLIND=0" && echo "$out" | grep -qx "DISPATCHES" && logged "wa-brk (braked)" \
+  && ok "J5 a P0 held by the top-up brake (pilot:topup-braked) is stuck, not waiting for capacity: no waiter, nothing cedes to it" || bad "J5: $out"
+reset; cap wa-worker 2 2
+out="$(run_py "_PY_EMIT_OK=1; _PY_P01='[{\"id\":\"x\",\"priority\":0,\"rig\":\"wa\",\"routed_to\":\"wa-worker\"}]'; _pilot_priority_waiting_scan; echo \"WAIT=\${_PY_WAIT_ID:-} BLIND=\${_PY_BLIND}\"")"
+[ "$out" = "WAIT= BLIND=1" ] && warned "CANNOT TELL whether 1 P0/P1" && [ "$(cap_calls)" = "0" ] \
+  && ok "J6 (third state) a row WITHOUT the focus/brake facts → BLIND=1, not a waiter, its pool not probed — unreadable is never 'waiting'" || bad "J6: $out calls=$(cap_calls)"
+reset; cap wa-worker 2 2
+out="$(run_py "_PY_EMIT_OK=1; _PY_P01='[{\"id\":\"x\",\"priority\":0,\"rig\":\"wa\",\"routed_to\":\"wa-worker\",\"focus_fix\":\"yes\",\"braked\":false},{\"id\":\"y\",\"priority\":1,\"rig\":\"wa\",\"routed_to\":\"wa-worker\",\"focus_fix\":false,\"braked\":false}]'; _pilot_priority_waiting_scan; echo \"WAIT=\${_PY_WAIT_ID:-} BLIND=\${_PY_BLIND}\"")"
+[ "$out" = "WAIT=y BLIND=0" ] && ok "J6b an unreadable row followed by a real waiter → the waiter is used and the sweep is NOT blind (the doubt changes nothing)" || bad "J6b: $out"
+# Drift guard: the projection's focus predicate must be the one _filter_candidates applies under focus (keep-in-sync pair).
+pred() { grep -o 'any((\.labels // \[\])\[\]; \. == "gate:needs-fix".*"impacto:dano-ao-vivo")' <<< "$1" | head -1; }
+P_PROJ="$(pred "$PROJECT_SRC")"; P_FILT="$(pred "$(fn_src _filter_candidates)")"
+{ [ -n "$P_PROJ" ] && [ "$P_PROJ" = "$P_FILT" ]; } && ok "J7 drift guard: the projection's focus predicate is byte-identical to _filter_candidates' focus clause" || bad "J7 predicates differ: proj=[$P_PROJ] filter=[$P_FILT]"
+
 # ── I: the wiring in the dispatcher (order assertions — the functions above are inert unless these hold) ─────────────────
 echo "I. wiring order in the dispatcher"
 ln() { grep -n -m1 -- "$1" "$DISPATCHER" | cut -d: -f1; }
@@ -303,6 +348,8 @@ L_CAPLANE="$(grep -n -m1 'if _pilot_pool_cap_full_for "\$pick"; then' "$DISPATCH
 L_YONE="$(grep -n -m1 '_pilot_priority_target_is_pool "\$_PYS_TARGET" && _pilot_priority_yield_for "\$STORY"' "$DISPATCHER" | cut -d: -f1)"
 L_PROMPT="$(grep -n -m1 'WORKTREE_DIRECTIVE=\$(worktree_directive_for' "$DISPATCHER" | cut -d: -f1)"
 { [ -n "$L_YONE" ] && [ -n "$L_PROMPT" ] && [ "$L_YONE" -lt "$L_PROMPT" ]; } && ok "I5 dispatch_one cedes BEFORE the prompt is assembled (the ~1 min per candidate of ga-5je3zv)" || bad "I5 yield=$L_YONE prompt=$L_PROMPT"
+L_FOCUS="$(grep -n -m1 '^export PILOT_GATE_FOCUS$' "$DISPATCHER" | cut -d: -f1)"
+{ [ -n "$L_FOCUS" ] && [ -n "$L_SCAN" ] && [ "$L_FOCUS" -lt "$L_SCAN" ]; } && ok "I7 PILOT_GATE_FOCUS is decided BEFORE the scan reads it (the emit runs earlier and cannot know it; the scan can)" || bad "I7 focus=$L_FOCUS scan=$L_SCAN"
 grep -q 'priority_yield_blind: num(\$blind)' "$DISPATCHER" && grep -q '"yielded_priority"' "$DISPATCHER" && ok "I6 the sweep event carries priority_yield_blind and the yielded_priority outcome" || bad "I6 sweep event fields missing"
 
 echo

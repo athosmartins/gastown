@@ -5170,9 +5170,13 @@ _emit_query_one() {
 # The yield (see "PRIORITY ACROSS RIGS" above _pilot_pool_topup) reads two projections of it, both made HERE so the
 # yield never runs a second set of queries over the stores:
 #   _PY_P01          JSON array, in work order, of the P0/P1 beads that carry gc.routed_to = wa-worker|ps-worker:
-#                    [{id, priority, rig (the emit's store label), routed_to}]. Only a bead already committed to a
-#                    pool can be said to WAIT for it; a first-sight bead (no route yet) is learned about later in the
-#                    sweep, when its own dispatch attempt ends queued behind a cap (_pilot_priority_waiter_note).
+#                    [{id, priority, rig (the emit's store label), routed_to, focus_fix, braked}]. Only a bead already
+#                    committed to a pool can be said to WAIT for it; a first-sight bead (no route yet) is learned about
+#                    later in the sweep, when its own dispatch attempt ends queued behind a cap (_pilot_priority_waiter_note).
+#                    focus_fix / braked (gate round 1): the emit's population is the REAL queue, made before the gate-focus
+#                    clamp and without the top-up brake — so these two say whether THIS sweep could hand the bead a session
+#                    at all (focus_fix = the very label predicate of _filter_candidates' focus clause, keep the two in sync;
+#                    braked = the label _topup_exclude_braked drops). The scan reads them: a waiter is a bead that could run.
 #   _PY_CLASS_BY_ID  JSON object id → priority class 0..5, for EVERY bead of the population (the top-up asks
 #                    "what priority is the bead I am about to open a session for?").
 # The class is the work-order library's own (wo_prio_class: 0..4 → itself, anything else → 5) — read from the lib's jq
@@ -5188,7 +5192,9 @@ _pilot_priority_project_emit() {
   _p01=$(printf '%s' "$_in" | jq -c "$WORK_ORDER_JQ_DEFS"'
       [ .[] | select(wo_prio_class <= 1)
             | { id: (.id // ""), priority: .priority, rig: (._emit_store // ""),
-                routed_to: ((.metadata | if type == "object" then .["gc.routed_to"] else null end) // "") }
+                routed_to: ((.metadata | if type == "object" then .["gc.routed_to"] else null end) // ""),
+                focus_fix: any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo"),
+                braked: any((.labels // [])[]; . == "pilot:topup-braked") }
             | select(.id != "" and (.routed_to == "wa-worker" or .routed_to == "ps-worker")) ]' 2>/dev/null) || _p01=""
   _cls=$(printf '%s' "$_in" | jq -c "$WORK_ORDER_JQ_DEFS"'
       [ .[] | select((.id | type) == "string" and .id != "") | { key: .id, value: wo_prio_class } ] | from_entries' 2>/dev/null) || _cls=""
@@ -9670,7 +9676,8 @@ _pilot_pool_cap_full_for() {
 # ANY pool (wa-worker, ps-worker, gastown.dog) — not through dispatch (dispatch_lane/dispatch_one), not through the pool top-up.
 #   * WAITING = a dispatchable P0/P1 bead that is already committed to wa-worker|ps-worker (gc.routed_to) whose pool is POSITIVELY
 #     at its cap — the very test (_pilot_pool_cap_full_for) the pre-claim queue skip uses, so "waiting" means one thing in the
-#     file. A first-sight bead (no route yet) joins the moment its own dispatch attempt ends queued behind a cap.
+#     file. "Dispatchable" is judged for THIS sweep: with gate focus ON only a fix counts (a non-fix would never get the slot),
+#     and a bead the top-up brake holds is stuck, not waiting. A first-sight bead (no route yet) joins the moment its own dispatch attempt ends queued behind a cap.
 #   * Only P2..P4 (class 2..4 of the work-order library) cede. P0 and P1 never do — which is also why the one exception Athos
 #     decided on 06/10 (a P0 bug labelled impacto:dano-ao-vivo goes first) needs no code here: it is P0, it never cedes, and
 #     among the waiters the library's own order already puts it first. A priority the library cannot read (class 5) never
@@ -9734,13 +9741,23 @@ _pilot_priority_pool_bound_pre() {
 }
 
 # _pilot_priority_waiting_scan — ONCE per sweep, after the dynamic ceilings and before the pool top-up: find the HEAD WAITER, the
-# best-ordered P0/P1 bead (from the emit's _PY_P01) whose pool is positively at its cap. Sets _PY_WAIT_* ("" = nobody known to
-# wait) and _PY_BLIND. A (pool, store) pair that read "not full" is not asked again for the next bead of the same pair. Always exit 0.
+# best-ordered P0/P1 bead (from the emit's _PY_P01) whose pool is positively at its cap AND that this sweep could dispatch. The
+# second half is the gate-round-1 class: a bead is only "waiting" if a slot would get it a session, so one the sweep's own filters
+# never hand a session — a non-fix under gate focus (PILOT_GATE_FOCUS=1, set AFTER the emit), or one the top-up brake holds — is
+# skipped and counted in the log; a row whose two facts cannot be read is "cannot tell" (BLIND), never "waiting". Siblings swept:
+# a store the pool cannot read is already "not full" in _pilot_pool_cap_full_for; hold/veto labels, exec:manual, blocked and
+# deferred beads never reach the emit (its chain is the dispatch chain). NOT checked, on purpose: dispatch_one's ownership guard
+# (crew branch / live gate / external claim — several git, bd and session reads per bead, only meaningful after the claim); the
+# label-level cases of it are already out of the emit, so a bead only that guard refuses can keep the yield up for a sweep.
+# Sets _PY_WAIT_* ("" = nobody known to wait) and _PY_BLIND. A (pool, store) pair that read "not full" is not asked again for the
+# next bead of the same pair. Always exit 0.
 _pilot_priority_waiting_scan() {
-  local _rows _id _prio _rig _pool _story _seen=" " _key
+  local _rows _id _prio _rig _pool _why _story _seen=" " _key _skipped=0 _skip_first="" _unread=0
   _PY_SCANNED=1; _PY_BLIND=0
   _PY_WAIT_ID=""; _PY_WAIT_PRIO=""; _PY_WAIT_RIG=""; _PY_WAIT_POOL=""; _PY_WAIT_LIVE=""; _PY_WAIT_MAX=""
   if ! _pilot_priority_yield_enabled; then
+    # OFF is not "looked and could tell": the sweep event reads _PY_SCANNED=0 as null (no scan), never as priority_yield_blind=0.
+    _PY_SCANNED=0
     log "ga-5fn5p3: priority yield is OFF (PILOT_PRIORITY_YIELD=${PILOT_PRIORITY_YIELD:-1} or kill file .gc/priority-yield.off) — every pool serves its own order only, as before."
     return 0
   fi
@@ -9751,13 +9768,20 @@ _pilot_priority_waiting_scan() {
   fi
   # A population that cannot be walked is "cannot tell", not "nobody waits": the empty string an unreadable list would
   # produce must not reach the loop (error and empty would be the same value).
-  if ! _rows=$(printf '%s' "$_PY_P01" | jq -r '.[] | [.id, (.priority | tostring), .rig, .routed_to] | join("\u001f")' 2>/dev/null); then
+  if ! _rows=$(printf '%s' "$_PY_P01" | jq -r --arg focus "${PILOT_GATE_FOCUS:-0}" '.[] | [.id, (.priority | tostring), .rig, .routed_to,
+      (if ((.focus_fix | type) != "boolean") or ((.braked | type) != "boolean") then "?"
+       elif .braked then "braked" elif ($focus == "1" and (.focus_fix | not)) then "not-a-fix" else "" end)] | join("\u001f")' 2>/dev/null); then
     _PY_BLIND=1
     warn "ga-5fn5p3: CANNOT TELL which P0/P1 beads wait for capacity (the emit's P0/P1 list is not readable) — no P2+ bead is ceded on a guess; dispatch proceeds as before (fail-open, counted as priority_yield_blind in the sweep event)."
     return 0
   fi
-  while IFS=$'\037' read -r _id _prio _rig _pool; do
+  while IFS=$'\037' read -r _id _prio _rig _pool _why; do
     [ -n "$_id" ] || continue
+    case "$_why" in
+      "") ;;
+      "?") _unread=$((_unread + 1)); continue ;;
+      *) _skipped=$((_skipped + 1)); [ -n "$_skip_first" ] || _skip_first="$_id ($_why)"; continue ;;
+    esac
     _key="$_pool|$_rig"
     case "$_seen" in *" $_key "*) continue ;; esac
     _story=$(jq -cn --arg id "$_id" --arg p "$_pool" '{id: $id, metadata: {"gc.routed_to": $p}}' 2>/dev/null) || continue
@@ -9775,6 +9799,14 @@ _pilot_priority_waiting_scan() {
   done <<EOF_PYSCAN
 $_rows
 EOF_PYSCAN
+  if [ "$_skipped" -gt 0 ]; then
+    log "ga-5fn5p3: $_skipped P0/P1 bead(s) of the emit are NOT counted as waiting — this sweep cannot hand them a session (first: $_skip_first; not-a-fix = gate focus ON and no fix label, braked = pilot:topup-braked)."
+  fi
+  # Unreadable facts only matter when no waiter was found: with one in hand the doubt changes nothing about who cedes.
+  if [ "$_unread" -gt 0 ] && [ -z "$_PY_WAIT_ID" ]; then
+    _PY_BLIND=1
+    warn "ga-5fn5p3: CANNOT TELL whether $_unread P0/P1 bead(s) of the emit could be dispatched this sweep (focus/brake facts unreadable) — not counted as waiting; no P2+ bead is ceded on a guess (fail-open, counted as priority_yield_blind in the sweep event)."
+  fi
   if [ -n "$_PY_WAIT_ID" ]; then
     log "ga-5fn5p3: P$_PY_WAIT_PRIO $_PY_WAIT_ID (rig $_PY_WAIT_RIG) waits for capacity — $_PY_WAIT_POOL is at its session cap ($_PY_WAIT_LIVE/$_PY_WAIT_MAX): no P2+ bead opens a pool session this sweep (dispatch or top-up) until it has a slot."
   elif [ "$_PY_BLIND" = "0" ]; then
@@ -13873,7 +13905,7 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #   pool_saturated      the ga-in9ebr predicate (_pool_saturated_sweep); consumers must not re-derive it
 #   priority_yield_blind  ga-5fn5p3: 1 iff this sweep could not tell which P0/P1 beads wait for capacity (the emit's
 #                       population or a pool's live session count was unreadable) — nothing was ceded on that doubt and
-#                       dispatch ran as before; 0 when it could tell; null when the scan never ran. "Could not tell"
+#                       dispatch ran as before; 0 when it could tell; null when the scan never ran or the rule is OFF. "Could not tell"
 #                       must never read as "nobody waits": a persistently 1 here means the rule is not in force.
 #   halted              ga-5je3zv: null for a sweep that ran its dispatch phase to the end; otherwise the reason it
 #                       was cut short — "session-count-unreadable" (the live session count could not be read) or
