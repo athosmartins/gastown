@@ -132,7 +132,8 @@ case "$LOG_6" in
   *) bad "expected the unqualified 'is now live' success line on a clean full apply, got: $LOG_6" ;;
 esac
 eq "gastown.dog max_active_sessions -> throttled" "$(get_dog_max)" "1"
-eq "oracle-wa min_active_sessions -> throttled" "$(get_oracle_min)" "0"
+# Mayor 12/10: the throttled floor of the oracle crew stays 1 (a 0 retired the live session on 12/10)
+eq "oracle-wa min_active_sessions stays 1 when throttled (crew never a load lever)" "$(get_oracle_min)" "1"
 eq "beads-health interval -> throttled" "$(get_order_interval "$BEADS_HEALTH_TOML")" "300s"
 eq "gate-sweep interval -> throttled" "$(get_order_interval "$GATE_SWEEP_TOML")" "150s"
 eq "order-tracking-sweep interval -> throttled" "$(get_order_interval "$ORDER_TRACKING_TOML")" "12m"

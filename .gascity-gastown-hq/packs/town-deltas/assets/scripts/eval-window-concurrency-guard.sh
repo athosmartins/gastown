@@ -119,7 +119,10 @@ QGE_BUFFER_SEC=1200      # ±20min around the predicted fire (drift + advisory-o
 DOG_MAX_NORMAL="${DOG_MAX_NORMAL:-3}"; DOG_MAX_THROTTLED=1
 GATE_FOCUS_DOG_MAX="${GATE_FOCUS_DOG_MAX:-2}"   # ga-kqa08j: dog cap while the gate is the bottleneck
 GATE_FOCUS_LIB="${GATE_FOCUS_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/gate-focus-lib.sh}"
-ORACLE_MIN_NORMAL=1;   ORACLE_MIN_THROTTLED=0
+# Mayor 12/10/2026: throttled stays 1. Dropping oracle-wa to 0 made the reconciler RETIRE the live crew
+# session on the next config soft-reload (09:12 window=whatsapp -> 09:18 "pool slot retired by reconciler"),
+# killing an in-progress conversation with Athos. Crew sessions are Athos's decision, never a load lever.
+ORACLE_MIN_NORMAL=1;   ORACLE_MIN_THROTTLED=1
 BEADS_HEALTH_NORMAL="120s";     BEADS_HEALTH_THROTTLED="300s"
 GATE_SWEEP_NORMAL="60s";        GATE_SWEEP_THROTTLED="150s"
 ORDER_TRACKING_NORMAL="5m";     ORDER_TRACKING_THROTTLED="12m"
