@@ -355,13 +355,16 @@ LOCK2="$ROOT/tmp8/quality-gate-dispatcher$(printf '%s' "$CITY2" | tr '/ ' '__').
 LOG2="$CITY2/.gc/logs/quality-gate-dispatcher.log"
 run_child() {   # run_child <token> [via-shell]: starts the real dispatcher as a Phase-C-only child of THIS shell
   # BD_CACHE_* keep the read-cache shim out of the real city's cache (a fake `[]` there would be read by a real sweep).
+  # DRAIN_WINDOW_OVERRIDE: ga-a2v0bz — a run of a dispatcher must not depend on the time of day (selftest-drain-pin-class).
   local p n=0
   if [ "${2:-}" = "via-shell" ]; then
     PATH="$ROOT/fakebin:$PATH" TMPDIR="$ROOT/tmp8" GC_CITY="$CITY2" BD_CACHE_OFF=1 BD_CACHE_DIR="$ROOT/cache8" \
+      DRAIN_WINDOW_OVERRIDE="OPEN" \
       GATE_PHASE_C_ONLY=1 GATE_PHASE_C_ONLY_RUNS="none" GATE_LOCK_BORROW_TOKEN="$1" \
       bash -c 'bash "$1"; rc=$?; exit $rc' _ "$A2/quality-gate-dispatcher.sh" >/dev/null 2>&1 &
   else
     PATH="$ROOT/fakebin:$PATH" TMPDIR="$ROOT/tmp8" GC_CITY="$CITY2" BD_CACHE_OFF=1 BD_CACHE_DIR="$ROOT/cache8" \
+      DRAIN_WINDOW_OVERRIDE="OPEN" \
       GATE_PHASE_C_ONLY=1 GATE_PHASE_C_ONLY_RUNS="none" GATE_LOCK_BORROW_TOKEN="$1" \
       bash "$A2/quality-gate-dispatcher.sh" >/dev/null 2>&1 &
   fi
