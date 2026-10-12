@@ -1,5 +1,10 @@
 # Post-mortem: Fork sync athosmartins/gastown ← steveyegge/gastown
 
+## Contents
+
+• Pre-sync state · Backups · Audit of 45 local-only commits · Conflicts · Test fixes after merge
+• Verification · Recurrence prevention
+
 **Bead:** dc-bsza
 **Operator:** crew/batista (whatsapp_automation rig)
 **Started:** 2026-05-06

@@ -1,5 +1,12 @@
 # Nightly reboot — INSTALLED AND ARMED (ga-i9q44)
 
+## Contents
+
+• Why this exists · Correction to ga-i9q44's triggering evidence
+• What's already on this machine (checked before writing anything new) · Chosen window: 01:00-01:19
+• The plist (drafted, `plutil -lint` clean, NOT installed)
+• Install commands (privileged — NOT run by this session) · What this is parked on
+
 Status (updated 2026-09-04, ga-g5bzf): **installed and live**, not just
 prepared. This doc's title/status said "PREPARED, NOT INSTALLED" as written
 2026-09-03 morning by gastown.dog-1 — true then, stale since the same

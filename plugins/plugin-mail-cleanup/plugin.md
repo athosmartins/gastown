@@ -1,3 +1,7 @@
+## Contents
+
+• Background · Action · Record Result
+
 +++
 name = "plugin-mail-cleanup"
 description = "Close stale plugin mail beads left open after dog execution"

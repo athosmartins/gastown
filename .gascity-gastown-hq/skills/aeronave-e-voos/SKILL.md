@@ -5,6 +5,11 @@ description: Use when asked to identify a Brazilian aircraft (by tail number / p
 
 # aeronave-e-voos — dono e histórico de voo de aeronave brasileira
 
+## Contents
+
+• 1. Dono / cadastro — RAB da ANAC · 2. Histórico de voo — FlightAware
+• 3. Como reportar (o que dá valor)
+
 Duas perguntas diferentes, duas fontes diferentes. Não misture:
 
 | Pergunta | Fonte | Custo |

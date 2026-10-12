@@ -1,5 +1,9 @@
 # /status — Tabela de problemas e status da sessão
 
+## Contents
+
+• Regras obrigatórias · Como invocar · Formato da tabela · Status · Para crew members
+
 Use este comando para exibir e manter a tabela de problemas reportados pelo overseer.
 
 ## Regras obrigatórias

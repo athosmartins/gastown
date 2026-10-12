@@ -1,3 +1,7 @@
+## Contents
+
+• What it does · Why run.sh (not AI-interpreted plugin.md) · Usage
+
 +++
 name = "session-hygiene"
 description = "Clean up zombie tmux sessions and orphaned dog sessions"

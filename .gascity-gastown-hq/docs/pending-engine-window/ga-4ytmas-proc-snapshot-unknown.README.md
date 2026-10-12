@@ -1,5 +1,11 @@
 # ga-4ytmas — a process snapshot that cannot be read is UNKNOWN, not "runtime-missing"
 
+## Contents
+
+• The incident (10/10, oracle-wa, ~14:06–14:40) · What the patch does
+• Tests (`state_cache_unknown_test.go`, 12 tests; fake `ps` that `kill -9`s itself)
+• Known test-suite noise (all verified, none caused by the patch) · After the window
+
 Patch: `ga-4ytmas-proc-snapshot-unknown.patch` (3 files, all under `internal/runtime/tmux/`).
 NOT applied. No build, no binary swap, no supervisor kickstart was done to produce it.
 The engine window stays Mayor-coordinated.

@@ -1,5 +1,11 @@
 # Dolt em prioridade baixa (nice ≠ 0) — detecção, cura e prevenção (ga-0k78d4)
 
+## Contents
+
+• Por que acontece · O que o detector faz — e o que NÃO faz · Não dá pra consertar com `renice`
+• Regra (doutrina) · Cura — quando o alarme disparar (Mayor/Athos, terminal nice 0)
+• Como fica no ar · Relacionado
+
 **Sintoma:** notify **"Dolt em prioridade baixa"** (ou a linha `NICE ALARM` em
 `.gc/logs/dolt-latency-alarm.log`). O `dolt sql-server` **vivo** roda com nice ≠ 0.
 Sob contenção ele perde CPU para qualquer processo nice-0: **lento por construção**, e as

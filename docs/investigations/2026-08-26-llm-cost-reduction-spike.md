@@ -1,5 +1,13 @@
 # SPIKE: como baixar o custo de IA da operação sem perder performance
 
+## Contents
+
+• TL;DR · 0. Correção de metodologia (achado não-planejado, mas necessário)
+• 1. Baseline medido (corrigido) · 2. AC1 — Existe tarifa-plana/assinatura viável?
+• 3. AC2 — Self-host compensa?
+• 4. AC3 — De onde vem o cache-read (97%), e dá pra cortar sem perder performance?
+• 5. AC4 — Teste ponta-a-ponta · 6. Recomendação final · 7. Gasto registrado · Fontes
+
 **Bead:** ga-w6vbc · **Data:** 2026-08-26 · **Executor:** dog-gacmc0q (gastown.dog-1) · **Gasto:** US$0,00 (teto US$10)
 
 Reenquadramento original (Mayor, 08/08): a ideia de trocar o motor por um modelo aberto

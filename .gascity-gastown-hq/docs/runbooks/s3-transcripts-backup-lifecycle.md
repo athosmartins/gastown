@@ -1,5 +1,9 @@
 # S3 lifecycle: `urblink-claude-history-backup` (ga-8ts9b)
 
+## Contents
+
+• What this bucket is · What was applied · Local retention (the other half of ga-8ts9b's scope)
+
 **Applied:** 2026-08-25. Part of the P0 STORAGE program (epic `ga-sfj3i`).
 
 ## What this bucket is

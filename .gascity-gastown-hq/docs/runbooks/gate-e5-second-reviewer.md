@@ -1,5 +1,11 @@
 # E5 — 2º revisor independente no gate (A/B) · runbook
 
+## Contents
+
+• Ligar / desligar / olhar · O que muda quando está ligado · A regra que segura tudo
+• A janela própria do extra (first-fail) · Teto de gasto · Apuração
+• Limites conhecidos (não escondidos) · Reverter o código
+
 Bead ga-syxaki (P0 ga-ufskhy). Motivo e números: `docs/reports/gate-e4-historico.md` §6 (Frente 6: 52,7% dos blocking issues de rodada ≥ 2 já estavam no código da rodada 1; 1 revisor, 1 passada, em 100% das runs).
 
 **Estado de fábrica: DESLIGADO.** Com a chave desligada o gate roda byte a byte como antes (nenhum revisor extra, nenhuma linha nova no prompt). O Mayor liga em **01/10/2026 ~21h -03** (fim do E2; ligar antes confunde os dois efeitos).

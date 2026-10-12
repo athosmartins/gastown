@@ -1,5 +1,9 @@
 # Como reproduzir (ga-kp9vbf)
 
+## Contents
+
+• (sem seções ##)
+
 Relatório: `../prompt-inicial-ga-kp9vbf.md`. Tudo roda daqui (`cd` para esta pasta). Nada altera a cidade: os scripts só leem transcritos, config e logs, e escrevem arquivos **nesta pasta** (`sessions.json`, `primes/`, os JSON de saída e, nos passos 4–5, `sys_D*.txt` e `probe_cwd/`). Só os passos 4–5 chamam `claude -p` (gastam tokens). `usage_scan.py` imprime em stderr o que ignorou (linha ilegível, transcrito sumido, sessão sem turno); um papel sem amostra aparece como "sem amostra", nunca como 0%.
 
 | passo | comando | o que produz |

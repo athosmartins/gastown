@@ -5,6 +5,11 @@ description: Use this when you (a crew worker in whatsapp_automation — batista
 
 # wa-worker session protocol — mockups + session end
 
+## Contents
+
+• Mockups para Athos — publicar na página Mockups do admin + 3-4 direções (OBRIGATÓRIO)
+• Notifications · Session End
+
 ## Mockups para Athos — publicar na página Mockups do admin + 3-4 direções (OBRIGATÓRIO)
 
 Mockup NÃO vai mais pro S3 (wa-cyvf1f): `publicar_mockup.py` grava na página Mockups do admin, atrás do Cloudflare Access, e imprime a URL PERMANENTE `https://admin.urblink.com.br/mockups/<slug>` — não expira, então não há chave nem link temporário pra gerar. (Links antigos de `mockups/` no bucket S3 seguem valendo até expirar; não publique mais nada novo lá.)

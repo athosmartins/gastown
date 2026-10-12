@@ -1,5 +1,9 @@
 # claude-crew-account — conta Claude do Mayor e das crews, ao vivo (ga-qdtmq2)
 
+## Contents
+
+• O que faz (a cada 60 s, sob flock) · Garantias · Liga/desliga · Riscos abertos (não medidos)
+
 Fase 2 da ga-xoe5ao. O pool headless (ga-8hcnvb.1, `claude-pool-account.py`) decide a conta; este script **segue** a decisão
 para quem usa Remote Control (Mayor + crews), reescrevendo o item DEFAULT do Keychain `Claude Code-credentials`.
 Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa intacta.

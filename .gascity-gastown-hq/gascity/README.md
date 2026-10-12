@@ -1,5 +1,9 @@
 # Isto NÃO é um checkout do engine `gc`
 
+## Contents
+
+• (sem seções ##)
+
 Este diretório é o workdir do `gc rig` chamado "gascity" (guarda só o seu
 `.beads/` local). Ele não tem `.git` próprio — qualquer comando `git`
 executado aqui dentro resolve **silenciosamente** para o repo pai

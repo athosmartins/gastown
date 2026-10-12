@@ -6,6 +6,14 @@ allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash
 
 # Gate Done — Signal Work Ready for Quality Gate
 
+## Contents
+
+• What This Does · Pre-flight Checks
+• Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
+• Step 1: Push your branch (fail-closed verification) · Step 2: Gather context
+• Step 2b: Pre-gate self-review (A/B experiment, ga-gnr3tw — half of all beads)
+• Step 3: Create the ready-for-gate marker · Step 4: Report · Common Issues
+
 Signal that your work is complete and ready to pass through the quality gate.
 This command writes a DURABLE ready-for-gate marker that the launchd guard will
 pick up within ~2 minutes.

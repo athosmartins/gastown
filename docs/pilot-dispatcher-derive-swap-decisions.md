@@ -1,5 +1,16 @@
 # pilot-dispatcher.sh → bead_state.derive(): the four decisions
 
+## Contents
+
+• Scope note: 4 decisions vs. 7 findings
+• Decision 1 — Liveness is not one predicate: several named functions over one canonical primitive, not a mode parameter
+• Decision 2 — Idle-time: caller computes it (already does, today), derive() accepts it as pre-computed per-session data
+• Decision 3 — Branch/git evidence: stays outside the pure core, enters `derive()` as a pre-resolved optional parameter (same shape as `merged`/`gate_active`)
+• Decision 4 — The third state (most important): every new optional signal is `bool | None`, `None` is the default, and every consumption site tests `is False`/`is True` explicitly, never truthiness
+• Precondition: the bash→python bridge (finding #7) has to be decided before slice 1, not during it
+• Boundary notes: what stays out of `derive()`, and why (findings #4-6) · Call-site implications
+• Implementation slices (for `ga-4oc2k`, in order) · Is the swap worth it?
+
 Design-only deliverable for `ga-5ot99` (successor of `ga-4oc2k`, itself the
 continuation of `ga-7qsxr`'s steps 1-2). **No production code changes.** This
 document closes the four decisions ga-5ot99 requires, maps each to what

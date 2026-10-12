@@ -1,5 +1,11 @@
 # Dolt Migration Playbook
 
+## Contents
+
+• When this playbook applies · Core principle · Strategy selection · Freeze mechanism
+• Mandatory pre-flight · Mandatory post-flight (within 5 minutes of completing the swap)
+• Anti-patterns observed during dc-bkp1 · Abort criteria · Cross-references
+
 Replaces the v1 swap-migration template used in bead `dc-bkp1` (2026-05-24, deacon→hq). The v1 plan succeeded mechanically but stranded 3 beads because it assumed write quiescence without enforcing it.
 
 This document is the canonical reference for any future dolt database rename, merge, or restructure across the town.

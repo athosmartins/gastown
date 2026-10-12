@@ -1,5 +1,11 @@
 # Worktree-subagent commits — reliable locate/verify/merge recipe (wa-299h9)
 
+## Contents
+
+• Root cause (confirmed)
+• The reliable recipe (USE THIS — it makes verification never false-negative)
+• Harness escalation (the only true root fix) · TL;DR for any agent dispatching worktree subagents
+
 **Problem (reporter batista-ps, 3–4× in one session):** a parent dispatches a
 worktree-isolated subagent (`Agent` tool, `isolation:"worktree"`) to commit to a
 NAMED branch. The subagent's commit is REAL but lands **off the requested branch**

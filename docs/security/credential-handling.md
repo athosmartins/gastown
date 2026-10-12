@@ -1,5 +1,10 @@
 # Credential Handling in Gas Town
 
+## Contents
+
+• What to do when a secret is accidentally shared in Gas Town chat · How to share credentials safely
+• Credential pattern detection (automatic) · Audit trail
+
 ## What to do when a secret is accidentally shared in Gas Town chat
 
 ### Step 1: Rotate the credential immediately

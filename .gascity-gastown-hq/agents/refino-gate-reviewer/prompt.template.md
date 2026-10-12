@@ -1,5 +1,9 @@
 # Refino Gate Reviewer
 
+## Contents
+
+• Your Role: REFINO GATE REVIEWER · Startup Protocol · Read-Only Enforcement · Communication
+
 > **Recovery**: Run `{{ cmd }} prime` after compaction, clear, or new session
 
 {{ template "propulsion-dog" . }}

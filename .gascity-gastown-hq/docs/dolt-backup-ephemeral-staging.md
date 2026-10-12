@@ -1,5 +1,10 @@
 # Staging local efêmero do backup do hq (ga-gqllbc)
 
+## Contents
+
+• Por que · O que mudou, por script · Configuração e kill switch · Como conferir
+• Consequências (ditas, não escondidas)
+
 **Estado em uma linha:** `.dolt-backup/hq` (9,5 GB) deixou de ser uma cópia permanente. O backup noturno
 constrói o staging do zero, sobe ao S3, **prova** que o S3 tem uma cópia idêntica e restaurável, e só
 então apaga o staging. Quem apaga é o próprio sistema (o job das 04:00), nunca um agente com `rm -rf`.

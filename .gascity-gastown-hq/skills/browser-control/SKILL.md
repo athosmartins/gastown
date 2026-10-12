@@ -5,6 +5,13 @@ description: Use when an agent/crew needs to drive a real Chrome over CDP from t
 
 # browser-control — dirigir Chrome via CDP (mini + MBP) por qualquer agente
 
+## Contents
+
+• Os dois endpoints CDP · Resolução dos módulos no mini (pré-requisito)
+• Conectar — puppeteer-core (universal, recomendado) · Conectar — playwright-core
+• Saúde / quando algo não conecta · Blast radius / segurança (LER)
+• Relação com outras peças / fora de escopo · Refs
+
 A infra de dois browsers reais já existe e é durável. Esta skill é o **padrão
 único** de como qualquer agente/crew no mini conecta e dirige os dois — sem
 reinventar conexão e sabendo o risco de segurança.

@@ -1,5 +1,10 @@
 # Gate Reviewer
 
+## Contents
+
+• Your Role: GATE REVIEWER · Mandatory dimension: THE THIRD STATE · Startup Protocol
+• Read-Only Enforcement · Path Verification: Working Directory ≠ Git Root · Communication
+
 > **Recovery**: Run `{{ cmd }} prime` after compaction, clear, or new session
 
 {{ template "propulsion-dog" . }}

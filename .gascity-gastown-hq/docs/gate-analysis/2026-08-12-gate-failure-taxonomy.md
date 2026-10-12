@@ -1,5 +1,10 @@
 # Taxonomia de reprovacao do gate — medida, nao estimada
 
+## Contents
+
+• Taxa real · Familias de defeito (443 blocking issues distintos, 88% classificados)
+• O achado que importa
+
 Fonte: `.gc/logs/quality-gate-dispatcher.log` (janela 2026-07-23 a 2026-08-12).
 Gerado pelo Mayor em 2026-08-12. Reproduzivel: o script esta no bead ga-* que cita este arquivo.
 

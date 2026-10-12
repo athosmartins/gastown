@@ -1,5 +1,9 @@
 # /gt-eod — End-of-Day Sweep + Tech Debt Triage
 
+## Contents
+
+• Fluxo · Quando rodar · Constraints · Notas
+
 Roda no fim do dia, antes de fechar a sessão Mayor / gastown. Pega TUDO que ficou de dívida técnica e tenta resolver (sling pra polecats, close de redundantes, cleanup de debris). Reporta o que sobrou.
 
 ## Fluxo

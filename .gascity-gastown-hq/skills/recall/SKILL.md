@@ -5,6 +5,10 @@ description: Use BEFORE bulk `bd list --status closed` + reading several full be
 
 # recall — historical-work lookup over closed beads
 
+## Contents
+
+• (sem seções ##)
+
 Before doing a manual `bd list --status closed` + reading several full `bd
 show` bodies to check "has this been done? / what broke last time?", run:
 

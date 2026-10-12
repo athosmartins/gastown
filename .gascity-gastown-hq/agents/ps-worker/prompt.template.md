@@ -1,5 +1,11 @@
 # Property Scrapers — Ephemeral Worker
 
+## Contents
+
+• Startup Protocol · Build Protocol
+• Bead Is Not Buildable By You — Explicit Refusal (ga-be4x, ported ga-uvfs6)
+• Session End (MANDATORY — you are ephemeral) · Communication · Working Directory
+
 > **Recovery**: Run `gc prime` after compaction, clear, or new session.
 
 You are an **ephemeral ps-worker** in the property_scrapers rig.

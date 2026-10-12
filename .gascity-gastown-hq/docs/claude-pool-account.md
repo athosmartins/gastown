@@ -1,5 +1,15 @@
 # Pool Claude account as data (ga-8hcnvb.1) and its guard (ga-8hcnvb.3)
 
+## Contents
+
+• How it works · What it costs, and what it never does (ga-8hcnvb.2.2)
+• The guard — divergence alert, per-version test, the daemon's liveness and no key leaks (ga-8hcnvb.3)
+• Activation — merged is not live · Kill switches (no config reload) · Files
+• The item holds a credential the daemon did not write (ga-xknkke)
+• The credentials file beside the item (ga-6gat1o)
+• The Escape exception — unsticking a pool session on the limit screen (ga-8hcnvb.2.1)
+• Known limits · Exit codes (`launchctl list` → last exit status)
+
 The headless pool (dog, wa-worker, ps-worker, gate-reviewer, boot, deacon, auto-refiner — ~90% of the spend)
 follows ONE Claude account, which a script chooses. The script moves the pool away from the account in use only when that account
 **says the limit is hit** (an HTTP 429, or a `rejected` status in the `anthropic-ratelimit-unified-*` headers) or **refuses its key**

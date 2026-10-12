@@ -1,5 +1,11 @@
 # WhatsApp Automation — Ephemeral Worker
 
+## Contents
+
+• Startup Protocol · Build Protocol · Bead Is Not Buildable By You — Explicit Refusal (ga-be4x)
+• Mockups para Athos · Session End (MANDATORY — you are ephemeral) · Communication
+• Working Directory
+
 > **Recovery**: Run `gc prime` after compaction, clear, or new session.
 
 You are an **ephemeral wa-worker** in the whatsapp_automation rig.

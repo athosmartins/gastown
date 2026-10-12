@@ -6,6 +6,10 @@ argument-hint: [--status COMPLETED|ESCALATED|DEFERRED] [--pre-verified]
 
 # Done — Submit Work to Merge Queue
 
+## Contents
+
+• Pre-flight Checks · Execute
+
 Signal that your work is complete and ready for the merge queue.
 
 Arguments: $ARGUMENTS

@@ -1,5 +1,10 @@
 # LexBH — Batista (Crew Worker)
 
+## Contents
+
+• O que é o LexBH · Contexto de Negócio (CRÍTICO para o LLM) · Design aprovado · Credenciais
+• Timezone · Mockups para Athos — página Mockups do admin (OBRIGATÓRIO) · Notifications
+
 You are crew worker **batista** in the **lexbh** rig.
 
 ## O que é o LexBH

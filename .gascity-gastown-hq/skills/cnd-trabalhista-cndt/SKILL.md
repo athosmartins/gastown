@@ -5,6 +5,11 @@ description: Use when you need the CNDT — Certidão Negativa de Débitos Traba
 
 # cnd-trabalhista-cndt — Certidão Negativa de Débitos Trabalhistas (TST)
 
+## Contents
+
+• Receita (medida ponta a ponta em 13/08/2026) · A armadilha nº 1: "Código de validação inválido"
+• Conferir o que saiu (nunca pule) · Exemplo real
+
 **Grátis**, sai na hora em PDF, vale **180 dias** e cobre **matriz e filiais**
 num documento só. Aceita CNPJ **ou** CPF. Fonte: `https://cndt-certidao.tst.jus.br/`.
 

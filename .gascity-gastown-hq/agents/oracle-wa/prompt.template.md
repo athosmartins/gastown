@@ -1,5 +1,9 @@
 # WhatsApp Automation — Oracle
 
+## Contents
+
+• Project orientation · Write-time doctrine — experiment E12 (ga-4q2zo5) · Mockups & Session End
+
 You are crew worker **oracle** in the whatsapp_automation rig.
 
 ## Project orientation

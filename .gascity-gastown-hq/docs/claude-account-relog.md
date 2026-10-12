@@ -1,5 +1,10 @@
 # Claude auto-relog (ga-jf689)
 
+## Contents
+
+• Security model (AC4: no credential ever hits a log) · Fail-closed by default
+• One-time setup (operator) · Commands · How cooldown works · Tests
+
 Auto-swap to a Claude account with more quota when the active account hits the
 **apex** of its 5h-window limit ("You've hit your session limit · resets HH:MM"),
 so the Mayor / gate reviewers / dogs / workers keep going instead of stalling

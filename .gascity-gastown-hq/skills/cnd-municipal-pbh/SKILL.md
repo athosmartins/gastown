@@ -5,6 +5,12 @@ description: Use when you need a municipal tax clearance certificate from Belo H
 
 # cnd-municipal-pbh — Certidão Negativa de Débito da Prefeitura de BH
 
+## Contents
+
+• Modalidades (são radios diferentes — escolha a certa)
+• Receita (medida ponta a ponta em 13/08/2026) · Armadilha: "Captcha inválido" com token bom
+• Exemplos reais (13/08/2026, ambos regulares)
+
 **Grátis**, sai na hora. Vale só para imóveis/contribuintes de **Belo Horizonte**
 (sede/imóvel em outra cidade = outro órgão).
 Fonte: `https://cnd.pbh.gov.br/CNDOnline/`.

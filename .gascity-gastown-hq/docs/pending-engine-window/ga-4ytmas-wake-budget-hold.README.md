@@ -1,5 +1,11 @@
 # ga-4ytmas (item 2) — a create the wake budget keeps deferring is waiting, not dead
 
+## Contents
+
+• What happened to oracle-wa on 10/10 (from `supervisor.log`) · What the patch does
+• Tests (`session_wake_budget_hold_test.go`, 4 tests, budget = 1)
+• Limits (read before relying on it) · After the window
+
 Patch: `ga-4ytmas-wake-budget-hold.patch` (4 files, all under `cmd/gc/`: 2 edited, 2 new).
 NOT applied. No build, no binary swap, no supervisor kickstart was done to produce it.
 The engine window stays Mayor-coordinated. Independent of `ga-4ytmas-proc-snapshot-unknown.patch`

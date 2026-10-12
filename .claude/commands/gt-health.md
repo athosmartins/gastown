@@ -1,5 +1,9 @@
 # /gt-health — Comprehensive Gas Town Health Check
 
+## Contents
+
+• Eixos verificados · Output esperado · Veredict · Notas
+
 Roda checagens cobrindo divergência de upstream (incluindo cross-fork), saúde de worktrees em TODOS os rigs, backlog crítico, e debris acumulado. Use no início da sessão (após `gtstart`), no meio do dia, ou sempre que quiser sanity check.
 
 **Rigs cobertos (descobertos dinamicamente):** todos sob `~/gt/` exceto `mayor/` e diretórios sem `.git`. Atualmente: whatsapp_automation, gastown, lexbh, marketing, property_scrapers, deacon.

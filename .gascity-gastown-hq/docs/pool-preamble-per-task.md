@@ -1,5 +1,13 @@
 # Preâmbulo por tarefa (ga-aijm2v.7, etapa 2) — SOMBRA
 
+## Contents
+
+• O que faz
+• Regras de corte (todas declaradas no manifesto, todas provadas por `pool-preamble-build.py check`)
+• O texto da tarefa é conteúdo de fora
+• Medição (o que o bloco "Preâmbulo" do relatório diz, e o que não diz)
+• O que a sombra ainda não responde · Operação
+
 **Estado:** a **sombra** está pronta no branch `feat/ga-aijm2v.7-preambulo-por-tarefa`; NADA está vivo até o gate mergear e a order `jev-preambulo` ser carregada.
 Mesmo depois disso **nenhuma sessão perde uma linha de doutrina**: todo registro sai com `aplicado: false`. A sombra só grava o que o Jev *cortaria*,
 para o Athos ver o tamanho do prêmio e o risco antes de qualquer corte real. **O A/B ao vivo (critérios de economia por sessão e de aprovação no gate por braço) NÃO está entregue** —

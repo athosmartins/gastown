@@ -1,5 +1,9 @@
 # Pipeline Resilience Implementation Plan
 
+## Contents
+
+• Global Constraints · Self-Review · Notes for the implementer
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the silent-stall gap (2026-06-27 5h outage) by adding **per-rig** stall detection and a **`[POOL-DEAD]`** Mayor alarm to existing watchdogs, with progress-based (not age-based) bounds.

@@ -1,5 +1,9 @@
 # Gate Marker Recipe (CORRECT) — for builder-agents submitting to the gate
 
+## Contents
+
+• Correct submission · `-t chore`, NOT `-t task` (this line used to be wrong)
+
 The quality-gate-dispatcher extracts fields from the marker's **DESCRIPTION**
 (via `extract()` = `grep "^field:"` on `$DESC`), NOT from labels. A marker with
 the fields only in labels → BEAD_ID/BRANCH extract EMPTY → author unresolvable →

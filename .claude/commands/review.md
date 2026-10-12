@@ -4,6 +4,10 @@ allowed-tools: Bash(git diff:*), Bash(git rev-parse:*), Bash(gh pr diff:*)
 argument-hint: [--staged | --branch | --pr <url>]
 ---
 
+## Contents
+
+• Diff Source Resolution
+
 Review code and provide a structured assessment with grading.
 
 Arguments: $ARGUMENTS

@@ -5,6 +5,11 @@ description: Use when Athos (or anyone) says an anúncio/listing is attached to 
 
 # corrigir-imovel-do-anuncio — mover um anúncio para o lote certo, de forma persistente
 
+## Contents
+
+• A armadilha nº 1 — o que é `--de` · Procedimento · O que muda, e quando · Erros comuns
+• Fora de escopo · O mapa (mapa.urblink) — semântica assimétrica
+
 O match anúncio→lote é automático e erra: muito anúncio não traz número na rua
 (`endereco = "Rua Outono"`), então cai por geocodificação (`MATCH QUALITY = GEO`) e para no
 lote vizinho. Corrigir **não** é editar o dado da fonte — é gravar um **override** que o

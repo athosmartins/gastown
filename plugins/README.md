@@ -1,5 +1,9 @@
 # Gas Town Plugins
 
+## Contents
+
+• Plugin Structure · Gate Types
+
 This directory contains town-level plugins that run during Deacon patrol cycles.
 
 ## Plugin Structure

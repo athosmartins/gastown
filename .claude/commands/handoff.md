@@ -4,6 +4,10 @@ allowed-tools: Bash(gt mail send:*),Bash(gt handoff:*)
 argument-hint: [message]
 ---
 
+## Contents
+
+• (sem seções ##)
+
 Hand off to a fresh session.
 
 User's handoff message (if any): $ARGUMENTS

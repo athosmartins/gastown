@@ -1,5 +1,11 @@
 # Story Bead Convention
 
+## Contents
+
+• Bead Type · Label Convention · Metadata Keys · Write-back Commands · Priority Convention
+• Reading / Querying Story Beads · Epic Split Convention
+• Contract Notes (for Kanban and Pilot builders)
+
 This document is the **canonical contract** between the Refino skill (writer),
 the Kanban (reader), and the Pilot (dispatcher). Any tool that creates, reads,
 or routes story beads MUST follow this convention.

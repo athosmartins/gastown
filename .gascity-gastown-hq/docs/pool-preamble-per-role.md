@@ -1,5 +1,13 @@
 # Preâmbulo por papel (ga-aijm2v.6, etapa 1)
 
+## Contents
+
+• O problema, medido (25/09, transcritos reais, papel pelo beacon `[gascity] <alias>`) · O que muda
+• Sonda, rodada 2 (correção do veredito ga-0g70nl) · Achados que custaram caro (o que NÃO repetir)
+• Revisores: `pool-reviewer` com `work_dir` próprio (incidente ga-swnkfm, 26/09; religado em ga-3d1wno)
+• Deploy e reversão · Verificar ANTES do deploy (e sempre que mexer nas listas de deny)
+• Verificar (depois do deploy) — mesmo script do "antes" · Não feito (achados, cada um vale um bead)
+
 **Estado:** código + testes prontos no branch `feat/ga-aijm2v.6-preambulo-por-papel`; NADA está vivo até o gate mergear e a cidade recarregar.
 Em sonda real (`claude -p`, Sonnet, flags reais do pool) o 1º turno cai **≈ -53k (dog), -52k (wa-worker), -52k (ps-worker), -58k (revisor)**
 tokens, fora a doutrina (mais -2 a -12k). O revisor era -68k na 1ª versão; caiu 10k quando Monitor/TaskStop/ScheduleWakeup/Skill (que ele USA) deixaram de ser negadas —

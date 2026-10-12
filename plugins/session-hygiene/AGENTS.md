@@ -1,5 +1,9 @@
 # Agent Instructions
 
+## Contents
+
+• Quick Reference · Non-Interactive Shell Commands · Beads Issue Tracker · Session Completion
+
 This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
 
 ## Quick Reference

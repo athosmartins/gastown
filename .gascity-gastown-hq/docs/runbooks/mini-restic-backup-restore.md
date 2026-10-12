@@ -1,5 +1,11 @@
 # Mini machine backup & restore (restic -> Google Drive)
 
+## Contents
+
+• What's backed up, and why · Where the secrets live
+• Cadence (all via launchd, `com.athos.mini-restic-*`)
+• Restore procedure (new machine -> operational) · Verifying this setup is still healthy
+
 Daily offsite backup of the mini's irreplaceable local config/state, per
 Athos's storage decision 2026-08-25 (bead `ga-qu9us`, epic `ga-sfj3i`,
 option C: restic -> the user's own Google Drive, R$0/month, offsite,

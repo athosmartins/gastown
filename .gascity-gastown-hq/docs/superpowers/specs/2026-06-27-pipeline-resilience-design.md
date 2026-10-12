@@ -1,5 +1,12 @@
 # Pipeline Resilience — Per-Rig Stall Detection + Pool-Dead Alarm
 
+## Contents
+
+• 1. The incident this prevents · 2. Findings that shape the design (evidence-grounded)
+• 3. The changes · 4. Self-heal + escalation (existing machinery, unchanged)
+• 5. Alternatives rejected (so this isn't re-proposed) · 6. Rollout & safety
+• 7. Out of scope (explicit)
+
 **Date:** 2026-06-27
 **Goal:** Make the Gas Town dev/build pipeline provably unstoppable 24/7 by closing the gap
 that let it sit **silently** dead for 5h on 2026-06-27 — without the blast radius of a new

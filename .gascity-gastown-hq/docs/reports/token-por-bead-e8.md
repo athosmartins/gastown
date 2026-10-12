@@ -1,5 +1,12 @@
 # E8 — tokens por bead aprovada: o medidor, o baseline de 7 dias e o que o dado diz sobre modelo e effort
 
+## Contents
+
+• 1. O que foi entregue · 2. Baseline de 7 dias (24/09–01/10) · 3. Onde o dinheiro está
+• 4. O A/B de effort: o que o volume permite, o que está pronto, o que decidir
+• 5. E2 (crews de `medium` para `high`): encerrado sem conclusão · 6. Limites e o que NÃO foi medido
+• 7. Reproduzir e verificar
+
 Bead ga-5c3msy (P0, filha de ga-ufskhy). Janela: 24/09–01/10/2026 (dias UTC inteiros), transcritos locais + arquivo permanente do S3 (`s3://urblink-claude-history-backup`), log do gate. Somente leitura sobre transcritos e gate; o que a bead entrega e o que ficou para o Mayor decidir estão nas seções 1 e 4; o encerramento do E2, na 5.
 
 **Em 8 linhas**

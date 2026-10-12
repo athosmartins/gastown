@@ -1,5 +1,13 @@
 # Janela madrugada 27/08 — engine (preparo feito em 26/08 à tarde)
 
+## Contents
+
+• A DECISÃO QUE DESTRAVOU: de qual base buildar · O QUE JÁ ESTÁ PRONTO
+• COMPOSIÇÃO MEDIDA DA FILA (26/08 14:1x, contra a base certa) · PRÉ-VOO — o portão que reprova hoje
+• A ORDEM — e o achado de 26/08 que a justifica
+• CRITÉRIO DE SUCESSO — o binário, não "voltou a subir" · PENDÊNCIAS QUE NÃO SÃO DESTA JANELA
+• COMO ACIONAR (pedido do Athos: "pronto pra, quando precisar, ser fácil acionar")
+
 > **Estado do preparo:** a parte fiddly já está feita. A janela não precisa
 > aplicar 25 patches no escuro — só fazer checkout, buildar e trocar.
 

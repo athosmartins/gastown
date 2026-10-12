@@ -1,5 +1,12 @@
 # Approved-State Reconciler — "aprovado" = "vai ser construído agora"
 
+## Contents
+
+• 1. The core guarantee · 2. The decisive insight (Oracle)
+• 3. Scope — v1 (this spec) vs v2 (follow-on) · 4. v1 design — the reconciler daemon
+• 5. Why this is the actual "imparável" fix (not the 20 prior answers) · 6. Out of scope (explicit)
+• 7. v1 acceptance
+
 **Date:** 2026-06-28
 **Goal:** Make "story:approved beads exist but 0 in execution, silently, for hours" **structurally impossible** — the recurring symptom Athos has reported 20+ times. A truly unstoppable pipeline never accumulates approved-but-idle work: every approved bead is either flowing toward build, or it is routed out of "approved" into its true state and the operator is told.
 

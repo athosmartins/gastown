@@ -1,5 +1,11 @@
 # O prompt inicial está inchado? Medição por papel, onde está o dinheiro e como cortar sem perder aderência
 
+## Contents
+
+• O estado do mundo · 1. Inventário por papel (pergunta 1) · 2. Quanto custa (pergunta 2)
+• 3. O achado de cache (alavanca 1) · 4. Qualidade (pergunta 3) · 5. Desenho proposto (pergunta 4)
+• 6. Experimento (pergunta 5) · 7. Limites
+
 Bead ga-kp9vbf (P0). Dados: `gc prime` renderizado em 30/09, transcritos retidos (23/09–01/10), 16 sondas `claude -p`, log do Pilot. Somente leitura; **nada foi aplicado em produção**. Scripts e como reproduzir: `prompt-inicial-ga-kp9vbf/README.md`. **WTE** = token-equivalente ponderado (entrada 1×, escrita de cache de 1 h 2×, leitura de cache 0,1×, saída 5×; multiplicadores são os preços públicos, não medidos aqui).
 
 ## O estado do mundo

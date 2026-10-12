@@ -16,6 +16,13 @@ version: "1.2.0"
 
 # Refino — Product Story Refinement Protocol
 
+## Contents
+
+• Invocation · Claim antes de refinar (anti-overlap — OBRIGATÓRIO)
+• Forma de condução (one-shot vs. campo-a-campo) · Mode Selection (completo vs. simplificado)
+• One-shot Proposal (caminho padrão quando há contexto) · The Fields (Definition of Refined)
+• Approval Gate · Bead Write-back (on approval) · Guard Rails · Additional Resources
+
 Refino is a RIGID interactive protocol that a crew agent wears to refine a
 feature story WITH Athos. It runs in one of two modes — **completo** (all 8
 fields) or **simplificado** (the 5 essential fields F1, F2, F6, F7, F8) — and

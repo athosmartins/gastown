@@ -1,5 +1,13 @@
 # E9 — refino como PLANEJADOR + nível de COMPLEXIDADE (ga-798p6w, filho do P0 ga-ufskhy)
 
+## Contents
+
+• 1. Onde o plano é feito — e por que NÃO só no refino
+• 2. O que existe (todos em `packs/town-deltas/assets/`, salvo indicação)
+• 3. Complexidade: campo de MEDIÇÃO primeiro; o roteamento NÃO foi construído aqui
+• 4. Critério PRÉ-REGISTRADO (a regra de veredito; decisão é do Mayor, o script nunca age)
+• 5. Operação · 6. Riscos e o que a medição vai dizer · 7. Fora deste slice
+
 **Estado em 01/10/2026: construído e INERTE.** Sem `.gc/e9-ab.conf` nada muda no fluxo de ninguém. Ligar é decisão do Mayor (§5).
 **Dependência que ainda falta:** o veredito de custo e de aprovação usa o medidor do E8 (`bead-token-meter.py`, ga-5c3msy). Hoje ele
 existe só num commit WIP (`f67779821`) numa branch não mergeada. Sem `--meter` a apuração diz "CUSTO E APROVAÇÃO — NÃO MEDIDOS" e

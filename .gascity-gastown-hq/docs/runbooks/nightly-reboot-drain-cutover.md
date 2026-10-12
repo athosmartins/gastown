@@ -1,5 +1,10 @@
 # Reboot noturno em modo DRENO — passagem para 23:00 (ga-a2v0bz)
 
+## Contents
+
+• Por que existe · O que muda · Ordem OBRIGATÓRIA · Verificar na primeira noite · Rollback
+• Soltar uma cidade drenada à mão · Limites conhecidos (não escondidos)
+
 **Estado:** código pronto e testado; falta (1) o merge pelo gate, (2) instalar a conferência
 pós-boot, (3) UM comando `sudo` que move o horário do LaunchDaemon. Enquanto o passo 3 não
 roda, o reboot segue às 01:00 e os **guards e a espera do fluxo legado são os de sempre**. Mas o

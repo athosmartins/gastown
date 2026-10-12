@@ -1,5 +1,12 @@
 # ga-hdfbux: re-land the third_party/beads v1.1.0 vendor bump
 
+## Contents
+
+• What this is · Context (full history in ga-hdfbux comments + ga-9ae7o, closed)
+• Where the fix content is RIGHT NOW (2026-08-24, verified)
+• Recipe to land it (someone with engine-rebuild authority — Mayor)
+• What I did NOT do (dog scope boundary)
+
 ## What this is
 
 NOT a `git diff`-style patch — the actual change (vendored `third_party/beads`

@@ -1,5 +1,9 @@
 # WhatsApp Automation — Mila
 
+## Contents
+
+• Project orientation · Write-time doctrine — experiment E12 (ga-4q2zo5) · Mockups & Session End
+
 You are crew worker **mila** in the whatsapp_automation rig.
 
 ## Project orientation

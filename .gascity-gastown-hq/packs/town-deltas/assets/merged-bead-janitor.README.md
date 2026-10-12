@@ -1,5 +1,13 @@
 # merged-bead-janitor (ga-tijv5)
 
+## Contents
+
+• Why beads get stuck (the three shapes) · How it decides (three OR-signals)
+• Pending-crew-branch veto (wa-1jk89) — one signal can't vouch for a sibling branch
+• Guards (zero false-positive is the paramount constraint)
+• Durable prevention — commit convention (fixes the sibling root cause)
+• Joint/split beads — the stale-comment guard (ga-2zp4h) · Operating
+
 Closes beads that are stuck `in_progress` ("em voo" on the Kanban) even though
 their code is already merged to `origin/main`. Runs as a launchd sweep
 (`merged-bead-janitor.plist`, every 15 min, `RunAtLoad`).

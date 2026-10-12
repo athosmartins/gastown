@@ -1,5 +1,9 @@
 # Artefatos do relatório E8 (ga-5c3msy)
 
+## Contents
+
+• Publicar na aba 📚 Estudos
+
 Relatório: `../token-por-bead-e8.md`. Esta pasta guarda o que o gera e o publica. Nada aqui altera a cidade: tudo lê e escreve só nesta pasta ou no arquivo de saída que você der.
 
 | arquivo | para quê |

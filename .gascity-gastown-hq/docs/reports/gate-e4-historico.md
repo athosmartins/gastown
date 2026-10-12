@@ -1,5 +1,16 @@
 # E4 — o histórico inteiro de reprovações do gate, e a Frente 6 (defeito latente)
 
+## Contents
+
+• 1. O estado do mundo em 5 números · 2. Dados e método (o suficiente para julgar os números)
+• 3. O que reprova (item 2 do pedido) · 4. Lado da história e do construtor (item 4 do pedido)
+• 5. Reincidência (item 5 do pedido)
+• 6. Frente 6 — a revisão devolve tudo de uma vez? (pedido do Athos, 30/09 09:09)
+• 7. Propostas (nada aplicado; cada uma vira bead própria se aprovada)
+• 8. O que os dados dizem para NÃO fazer
+• 9. Desenho de experimento (padrão E3: braço = hash do bead-id; sem tocar o critério do revisor)
+• 10. Limites
+
 Bead ga-26k2y1 (P0, filha de ga-ufskhy). Dados: 09/06–30/09/2026 (o primeiro veredito do dispatcher é de 09/06), os 4 bancos Dolt, somente leitura. Scripts e como reproduzir: `gate-e4-historico/README.md`.
 
 **As 5 mudanças de maior impacto — medidas aqui, nenhuma aplicada; "% dos FAILs" = vereditos de FAIL de revisor (n = 1.679), salvo onde dito.**

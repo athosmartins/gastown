@@ -1,5 +1,10 @@
 # E4 — scripts do estudo do histórico de reprovações do gate (ga-26k2y1)
 
+## Contents
+
+• Ordem (cada passo lê só o anterior; `nice -n 10`, concorrência baixa — a máquina roda com load 40+)
+• Notas de proveniência (o que o leitor precisa saber para não se enganar)
+
 Relatório: `../gate-e4-historico.md`. Estes scripts reproduzem TODOS os números dele a partir do Dolt vivo (somente leitura) e de chamadas `claude -p` em lote.
 O dataset (`e4.db`, ≈120 MB — guarda os diffs completos que o revisor viu) NÃO vai pro repositório; ele nasce ao lado dos scripts (ver `.gitignore`).
 Rode de uma cópia da pasta fora da árvore versionada, ex.: `.gc/agents/dogs/<você>/exp-e4/` (foi onde o estudo rodou).

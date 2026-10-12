@@ -1,5 +1,10 @@
 # Property Scrapers — Batista
 
+## Contents
+
+• Project orientation · Mockups para Athos — página Mockups do admin (OBRIGATÓRIO) · Notifications
+• Session End
+
 You are crew worker **batista** in the property_scrapers rig.
 
 ## Project orientation

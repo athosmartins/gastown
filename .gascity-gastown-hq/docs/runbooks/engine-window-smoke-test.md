@@ -1,5 +1,14 @@
 # Smoke-test de janela de engine (`gc`) — todos os subcomandos
 
+## Contents
+
+• O que aconteceu em 08/09, e por que o smoke-test não pegou
+• Como ler o resultado — três estados, nunca dois
+• Passo A — ANTES do swap: o candidato perdeu algum comando? (teria pego 08/09)
+• Passo B — DEPOIS do swap: cada comando responde?
+• Rollback (qualquer `FAIL` no Passo B, ou `UNKNOWN` que não limpa)
+• Limites conhecidos (o que este checklist NÃO prova) · Relacionados
+
 **Rode o Passo A ANTES de trocar o binário `gc` e o Passo B DEPOIS de cada swap.** A janela só
 termina quando o Passo B fecha sem nenhum `FAIL` e sem `UNKNOWN` esquecido. Este checklist nasceu
 do `ga-q119gk`: em 08/09 o smoke-test de uma janela cobriu `version` / `doctor` / `bd`, passou, e a

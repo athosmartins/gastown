@@ -1,5 +1,10 @@
 # Evaluation: skibidiskib/ai-codex — Worth Incorporating Into Gas City?
 
+## Contents
+
+• Executive Summary · What ai-codex is · Comparison against what Gas City already has
+• Effort vs. value · Recommendation · Sources
+
 **Wanted:** ga-z9cn5 — Athos asked whether anything in
 [github.com/skibidiskib/ai-codex](https://github.com/skibidiskib/ai-codex) is worth
 incorporating into the Gas City framework.

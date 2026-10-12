@@ -1,5 +1,11 @@
 # ga-9t9acg.7: the dog pool probe and the assigned-work queries pick by the Ordem unica
 
+## Contents
+
+• What it changes · What was verified, and what was not · Apply in the next engine window
+• `strings` dry-run on the NEW binary (before the swap) · After the swap
+• Same commit as the swap (repo changes this patch cannot carry) · Costs · Re-running the harness
+
 Patch: `docs/pending-engine-window/ga-9t9acg.7-work-order-pool-probe.patch` (parent programme `ga-9t9acg`).
 Author: dog `gastown.dog-6`, 2026-10-07; gate-fix rounds 1 and 2 by `gastown.dog-3`, 2026-10-07/08. **Not built, not installed, not swapped** (bead rule: patch-only); `go vet` and the targeted `go test` were run in a scratch worktree of the base (see "What was verified").
 

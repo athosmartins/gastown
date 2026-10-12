@@ -5,6 +5,13 @@ description: Use when a site blocks automation with a captcha (hCaptcha, reCAPTC
 
 # captcha-solve — passar por captcha em portal público
 
+## Contents
+
+• Regra nº 1 — o vencedor é POR TIPO, não absoluto
+• Regra nº 2 — descubra o TIPO pelo que a PÁGINA faz, nunca por chute · Uso
+• Como INJETAR o token (a metade que faz falhar em silêncio)
+• Armadilhas medidas (cada uma custou pelo menos uma rodada) · Saldo · Quem usa isto
+
 Temos **duas** contas pagas: `anti-captcha` e `2captcha` (chaves no Bitwarden,
 `secret anti-captcha` / `secret 2captcha`). Elas **não são intercambiáveis**.
 

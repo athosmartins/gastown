@@ -1,5 +1,9 @@
 # Flow-Daemon Inventory — imp01
 
+## Contents
+
+• 1. Daemon Inventory · 2. Authority-Election Decision
+
 > Bead: **imp01** | Epic: imparável (99%-unstoppable pipeline)
 > Purpose: ground-truth map for imp14 (consolidation into a single flow-authority)
 > Written: 2026-06-23

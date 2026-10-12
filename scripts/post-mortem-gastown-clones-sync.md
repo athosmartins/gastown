@@ -1,5 +1,10 @@
 # Post-mortem: gastown clones FF audit (dc-yxgb)
 
+## Contents
+
+• Background · Audit results · Dirty-file analysis · Backup · Verification per clone
+• Constraints met · Refs
+
 **Bead:** dc-yxgb
 **Operator:** crew/batista (whatsapp_automation rig)
 **Started:** 2026-05-07

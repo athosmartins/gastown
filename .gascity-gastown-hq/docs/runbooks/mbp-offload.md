@@ -1,7 +1,9 @@
 # MBP como nó de capacidade (offload de testes e REA/APK)
 
 ## Contents
-- Por quê e resultado medido · Como ligar e desligar · Como usar · Códigos de saída · O que mora no MBP · Manutenção · Limites conhecidos
+
+• Por quê e resultado medido (11/10/2026) · Como ligar e desligar · Como usar · Códigos de saída
+• O que mora no MBP (`~/gt-remote`) · Manutenção · Limites conhecidos
 
 ## Por quê e resultado medido (11/10/2026)
 O mini vive com load 40-60, swap alto e o Dolt único; o MacBook Pro (16 GB, 12 CPUs, ~130 GB livres) estava ocioso.

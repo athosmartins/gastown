@@ -1,5 +1,13 @@
 # Gate Priority (Increment 2) — Design Spec
 
+## Contents
+
+• 1. Context / what already shipped · 2. Core mechanism — `gate.pinned_rank`
+• 3. Invariant guards (CRITICAL — from adversarial lens A) · 4. Rank arithmetic (⚡ + ↑/↓)
+• 5. UI (kanban) — from lenses B & C · 6. Write path + security
+• 7. Agent path ("pedir a um agente") — free · 8. Data flow · 9. Error handling / edge cases
+• 10. Testing · 11. Rollout · 12. Open risks (accepted)
+
 > Status: **DRAFT — awaiting Athos's approval before implementation.**
 > Adversarial-reviewed (4 lenses, 2026-07-03). Control model chosen by Athos:
 > **⚡ Priorizar + setas ↑/↓ entre as priorizadas** (fine control, safe version).

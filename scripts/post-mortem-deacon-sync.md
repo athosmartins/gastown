@@ -1,5 +1,10 @@
 # Post-mortem: deacon rig sync (dc-w7zc)
 
+## Contents
+
+• Discovery · Pre-sync state · Backup · Working-tree handling · Execution · Verification
+• What this means for future deacon work · Refs
+
 **Bead:** dc-w7zc
 **Operator:** crew/batista (whatsapp_automation rig)
 **Started:** 2026-05-07

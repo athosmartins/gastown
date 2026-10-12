@@ -1,5 +1,12 @@
 # Flow Ledger + Stall-Episode Schema — imp04
 
+## Contents
+
+• 1. Why This Exists · 2. Ledger Location (STABLE — do not change)
+• 3. Shared Ledger Helper (imp02/imp24/imp25 import by these exact names) · 4. Line Schemas
+• 5. Stall-Episode Schema · 6. Components · 7. Episode Reconstruction Usage
+• 8. Selftest Results (as of 2026-06-23) · 9. Design Decisions
+
 > Bead: **imp04** | Epic: imparável (99%-unstoppable pipeline)
 > Purpose: append-only on-disk flow ledger + stall-episode schema — the measurement
 > backbone that MUST survive a Dolt outage.

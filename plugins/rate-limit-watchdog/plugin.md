@@ -1,3 +1,7 @@
+## Contents
+
+• How It Works · Behavior · Configuration
+
 +++
 name = "rate-limit-watchdog"
 description = "Auto-estop on API rate limit, auto-thaw when clear — no LLM needed"

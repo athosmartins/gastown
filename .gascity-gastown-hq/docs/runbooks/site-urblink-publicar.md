@@ -1,7 +1,11 @@
 # Publicar o site urblink.com.br
 
 ## Contents
-- Como o site é publicado · Quem tem acesso · Variáveis de ambiente · Antes de dar merge no main · Rollback · Fila de espera (convite) · Pontos em aberto
+
+• Como o site é publicado · Quem tem acesso
+• Variáveis de ambiente (nomes apenas; valores no Bitwarden, nunca no repositório)
+• Antes de dar merge no main · Rollback · Fila de espera (convite para a plataforma de terrenos)
+• Pontos em aberto
 
 ## Como o site é publicado
 - Código: repositório **privado** `athosmartins/v0-urb-link-website-structure` (Next.js 16 / React 19, criado no v0.app). Não é um rig da cidade; trabalhe numa cópia fora de `~/gt` (ex.: `gh repo clone athosmartins/v0-urb-link-website-structure /private/tmp/claude-501/site-urblink/repo`).

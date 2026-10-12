@@ -1,5 +1,9 @@
 # Data Storage Inventory — Mac-mini Disk Pressure
 
+## Contents
+
+• Quick Summary · Detailed Inventory · Disk Emergency Playbook · Open Questions for Athos
+
 **Created:** 2026-07-04 (triggered by near-DISK-HALT event at 97% full)
 **DO NOT DELETE ANYTHING** based on this doc alone — it is a reference. Always confirm with Athos before deleting KEEP items.
 

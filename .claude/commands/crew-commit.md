@@ -4,6 +4,12 @@ allowed-tools: Bash(git *), Bash(gt commit*), Bash(gh pr create*), Bash(gh pr vi
 argument-hint: [<type>/<description> e.g. fix/cors-headers]
 ---
 
+## Contents
+
+• ⚠️ NEVER commit directly to main · Step 1: Pre-flight checks · Step 2: Create feature branch
+• Step 3: Submodule and shared directory check · Step 4: Stage and commit
+• Step 5: Rebase onto latest target · Step 6: Push and create PR · Step 7: Post-push verification
+
 Crew commit workflow. Run all steps in order.
 
 Branch argument (if provided): $ARGUMENTS

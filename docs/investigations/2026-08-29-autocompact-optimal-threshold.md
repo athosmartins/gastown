@@ -1,5 +1,14 @@
 # Ponto ótimo de auto-compactação vs. tamanho do prompt inicial
 
+## Contents
+
+• TL;DR · 1. Contexto medido antes de escrever uma linha (evita retrabalho)
+• 2. Literatura (CITADO — fontes primárias, não memória de treino)
+• 3. Medição fresca, ao vivo, hoje (MEDIDO — não citado, não projetado)
+• 4. Ponto de vista — formula e o que mudaria minha conclusão
+• 5. Experimento executável (implementado nesta sessão)
+• 6. Achado de processo (não pedido, mas real e precisa registro) · Fontes
+
 **Bead:** ga-iwwl0 (P0, Athos) · **Data:** 2026-08-29 · **Executor:** gastown.dog-4 ·
 **Gasto:** US$0,00
 

@@ -1,5 +1,12 @@
 # Janela de manutenção: `bd` + engine `gc`
 
+## Contents
+
+• Por que fazer · O que a preparação já descobriu (e teria descarrilado a janela)
+• Passo 0 — Pré-voo (fazer ANTES de parar qualquer coisa) · Passo 1 — `bd` (o que tem perda de dado)
+• Passo 2 — engine `gc` · Passo 3 — Verificação (o que prova que funcionou) · Rollback
+• Beads relacionados
+
 **Preparado pelo Mayor em 2026-08-07 03:4x.** Athos aprovou fazer **as duas no mesmo dia**
 (a interrupção custa o mesmo: parar, subir, verificar — fazer junto paga uma vez só).
 Falta só ele escolher a hora.
