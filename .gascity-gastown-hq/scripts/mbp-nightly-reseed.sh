@@ -15,7 +15,8 @@
 #           o outro repo roda mesmo assim; exit 1. rc 98 (MBP indisponível/sem saúde) conta como FALHOU: a base envelheceu e
 #           alguém precisa saber, mesmo que a causa seja o MBP dormindo.
 #   PULADO  nada foi tentado, por escolha: chave desligada (falta $CITY/.gc/mbp-offload.on), dreno do reboot vivo, ou outro
-#           reseed em andamento. Sem notify, exit 0. PULADO nunca é dito para o que falhou.
+#           reseed em andamento. Sem notify, exit 0. PULADO nunca é dito para o que falhou. Dreno com "até" implausível e lock
+#           com mais de 2 prazos de idade não pulam: avisam (WARN) e seguem, para que um arquivo podre não vire noite perdida muda.
 #
 # QUANDO RODA: launchd (scripts/com.gascity.mbp-nightly-reseed.plist), 05:50. Depois do que pesa o mini entre 04:47 e 05:37
 #   (restic backup/check/restore-test), antes do lotes-rebuild das 06:30; longe do reboot noturno (LaunchDaemon 23:00, dreno
@@ -58,20 +59,30 @@ skip() { # motivo
 
 # dreno do reboot: arquivo de 4 linhas DRAIN|escrito|boot|até (nightly-reboot.sh). Vivo = linha 4 no futuro.
 # Ausente ou vencido = livre. Presente e ilegível = não dá para saber: segue (o dano de semear durante o dreno é pequeno,
-# e uma trava silenciosa para sempre seria pior), mas diz.
+# e uma trava silenciosa para sempre seria pior), mas diz. Idem "até" além de DRAIN_PLAUSIVEL_S (o dreno dura ~90 min):
+# um valor corrompido no futuro pularia toda noite em silêncio.
+DRAIN_PLAUSIVEL_S=21600
 if [ -e "$DRAIN_FILE" ]; then
   until_ts=$(sed -n 4p "$DRAIN_FILE" 2>/dev/null)
   case "$until_ts" in
     ''|*[!0-9]*) say "WARN: sinal de dreno $DRAIN_FILE ilegível — seguindo" ;;
-    *) [ "$until_ts" -gt "$(date +%s)" ] && skip "dreno do reboot vivo (até $(date -r "$until_ts" +%H:%M))" ;;
+    *) now=$(date +%s)
+       if [ "$until_ts" -le "$now" ]; then :
+       elif [ $(( until_ts - now )) -gt "$DRAIN_PLAUSIVEL_S" ]; then say "WARN: sinal de dreno $DRAIN_FILE vai até $(date -r "$until_ts" +%Y-%m-%dT%H:%M), além do plausível (${DRAIN_PLAUSIVEL_S}s) — seguindo"
+       else skip "dreno do reboot vivo (até $(date -r "$until_ts" +%H:%M))"; fi ;;
   esac
 fi
 
-# instância única: dois rsync --delete na mesma base se pisam. Dono morto = lock velho, toma.
+# instância única: dois rsync --delete na mesma base se pisam. Dono morto = lock velho, toma. Lock mais velho que
+# LOCK_VELHO_MIN é velho mesmo com o pid vivo (o pid pode ter sido reaproveitado por outro processo; uma rodada dura no
+# máximo ~2 x TIMEOUT_S): sem esse teto, um lock órfão pularia toda noite em silêncio.
+LOCK_VELHO_MIN=$(( (2 * TIMEOUT_S) / 60 + 30 ))
 mkdir -p "$(dirname "$LOCK")" 2>/dev/null
 if ! mkdir "$LOCK" 2>/dev/null; then
   owner=$(cat "$LOCK/pid" 2>/dev/null)
-  if { [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; } || { [ -z "$owner" ] && [ -z "$(find "$LOCK" -maxdepth 0 -mmin +1 2>/dev/null)" ]; }; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +"$LOCK_VELHO_MIN" 2>/dev/null)" ]; then
+    say "WARN: lock $LOCK com mais de ${LOCK_VELHO_MIN} min (dono pid ${owner:-?}) — tratando como velho e tomando"
+  elif { [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; } || { [ -z "$owner" ] && [ -z "$(find "$LOCK" -maxdepth 0 -mmin +1 2>/dev/null)" ]; }; then
     skip "outro reseed em andamento (pid ${owner:-?})"
   fi
   rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null; mkdir "$LOCK" 2>/dev/null || skip "não consegui tomar o lock $LOCK"

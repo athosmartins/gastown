@@ -67,11 +67,17 @@ reset; printf 'DRAIN\n%s\n123\n%s\n' "$(date +%s)" "$(( $(date +%s) + 3600 ))" >
 hasnt "dreno vivo não semeia" "$STUB_CALLS" '.'; has "diz dreno" "$T/out" 'dreno do reboot'
 reset; printf 'DRAIN\n%s\n123\n%s\n' "$(date +%s)" "$(( $(date +%s) - 60 ))" > "$T/drain.level"; rc=$(run); expect "dreno vencido" 0 "$rc"; lastline OK
 reset; printf 'lixo\n' > "$T/drain.level"; rc=$(run); expect "dreno ilegível segue" 0 "$rc"; lastline OK; has "avisa ilegível" "$T/out" 'WARN: sinal de dreno .* ilegível'
+reset; printf 'DRAIN\n%s\n123\n%s\n' "$(date +%s)" "$(( $(date +%s) + 172800 ))" > "$T/drain.level"; rc=$(run); expect "dreno com até implausível segue" 0 "$rc"; lastline OK
+has "avisa implausível" "$T/out" 'WARN: sinal de dreno .* além do plausível'; has "semeou mesmo assim" "$STUB_CALLS" '^wa$'
 # 7 lock
 reset; sleep 30 & holder=$!; mkdir "$LOCK"; echo "$holder" > "$LOCK/pid"; rc=$(run); expect "lock de dono vivo" 0 "$rc"; lastline PULADO
 hasnt "dono vivo: não semeia" "$STUB_CALLS" '.'; has "diz que há outro" "$T/out" 'outro reseed em andamento'; kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
 n=$((n+1)); if [ -d "$LOCK" ]; then echo "ok   lock do outro não foi apagado"; else echo "FAIL lock do outro sumiu"; fails=$((fails+1)); fi
 rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null
+# lock com pid vivo mas velho demais (pid reaproveitado): toma e avisa, não pula
+reset; sleep 30 & holder=$!; mkdir "$LOCK"; echo "$holder" > "$LOCK/pid"; touch -t "$(date -v-1d +%Y%m%d%H%M)" "$LOCK"
+rc=$(run); expect "lock velho com pid vivo" 0 "$rc"; lastline OK; has "avisa lock velho" "$T/out" 'WARN: lock .* com mais de [0-9]+ min'; has "semeou" "$STUB_CALLS" '^wa$'
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null
 reset; mkdir "$LOCK"; echo 999999 > "$LOCK/pid"; rc=$(run); expect "lock de dono morto" 0 "$rc"; lastline OK; has "tomou e semeou" "$STUB_CALLS" '^wa$'
 n=$((n+1)); if [ ! -d "$LOCK" ]; then echo "ok   lock liberado ao fim"; else echo "FAIL lock ficou"; fails=$((fails+1)); fi
 reset; STUB_RC_WA=98 run >/dev/null; n=$((n+1)); if [ ! -d "$LOCK" ]; then echo "ok   lock liberado também na falha"; else echo "FAIL lock ficou após falha"; fails=$((fails+1)); fi
