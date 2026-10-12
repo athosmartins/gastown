@@ -2,7 +2,7 @@
 
 ## Contents
 
-• Por quê e resultado medido (11/10/2026) · Como ligar e desligar · Como usar · Códigos de saída
+• Por quê e resultado medido (11/10/2026) · Como ligar e desligar · Como usar · REA pesado: `rea-run.sh` · Códigos de saída
 • O que mora no MBP (`~/gt-remote`) · Manutenção · Limites conhecidos
 
 ## Por quê e resultado medido (11/10/2026)
@@ -40,6 +40,14 @@ scripts/mbp-run.sh --seed wa|ps  # (re)semeia base + site-packages (com checagem
 Quem chama trata rc 96..99 como "rode local", nunca como teste reprovado.
 
 Os workers de pool (wa-worker e ps-worker) recebem essa regra no preâmbulo: seção guardada `mbp-offload-tests` do fragment `town-deltas` (ga-yvs19w), registrada em `doctrine.guarded` do `pool-roles.json` com `show_unset: false` — Mayor, crews, dog e revisores não a recebem. Com a chave desligada o `mbp-run.sh` sai 99 e o worker roda local, então a linha é segura mesmo com o offload off.
+
+## REA pesado: `rea-run.sh` (ga-szz40p)
+`scripts/rea-run.sh [--local] [--push P] [--pull REL:LOCAL] [--env K=V] -- <comando>` é a porta de entrada do REA pesado (programa REA, épico ga-oe7o1p). Sem `--local` ele chama `mbp-run.sh --exec` e só cai para o mini nos rc 96..99; no mini aplica as regras do programa em código:
+- **Trava de 1 execução pesada** (`$CITY/.gc/run/rea-run.lock`, mkdir atômico; dono = pid + hora de início, então dono morto ou pid reaproveitado é reaped e dono vivo nunca é). A 2ª execução espera até `--wait-s` (1800 s) e sai 91 se não conseguir.
+- **Folga**: recusa (92) com disco livre < 10 GB (`REA_RUN_MIN_FREE_GB`) ou swap usado > 6144 MB (`REA_RUN_MAX_SWAP_MB`); espera não haver outro processo `node …/bin/rea` rodando por fora (texto "bin/rea" em argumento alheio não conta). Checa de cara e de novo já sob a trava. `df`/`sysctl`/`pgrep` ilegível = 93, nunca "pode rodar".
+- **Scratch** em `${TMPDIR}/rea-run-<uid>/run.*` (0700, fora de qualquer repo), cwd do comando, apagado no fim, inclusive em erro, timeout (`REA_RUN_TIMEOUT_S`, 3600 s) e INT/TERM/HUP; scratch de uma execução que morreu por SIGKILL é apagado na próxima.
+- **Log** `$CITY/.gc/logs/rea-run.jsonl`: evento, modo (mbp/local), rc, motivo, disco e swap lidos; só o NOME do comando e o nº de argumentos.
+`rea-run.sh --check` mostra disco, swap e outro `rea` e sai 0/92/93 (use antes de subir o Chrome do recon web). `--local` é obrigatório quando o comando fala com algo do mini, como o Chrome descartável em 127.0.0.1:$PORT. Se o ssh cair no meio, o rc 98 do `mbp-run.sh` faz o comando rodar de novo no mini: só comando de leitura/recon. Teste: `scripts/rea-run.selftest.sh` (hermético, com controle negativo por mutação).
 
 ## Códigos de saída
 0..95 = rc do pytest/comando remoto (propagado) · 99 offload desligado · 98 MBP indisponível ou sem saúde (veja o critério abaixo) · 97 configuração (uso errado, base ausente → `--seed`) · 96 três slots ocupados.

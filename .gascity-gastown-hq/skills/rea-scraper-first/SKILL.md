@@ -35,15 +35,16 @@ Regra do Athos (11/10): todo scraper novo e todo conserto de scraper quebrado co
 
 ## Antes de começar: a máquina
 
-Os três ao mesmo tempo, senão **espere** (não pule):
+Os três ao mesmo tempo, senão **espere** (não pule): 10 GB livres ou mais em `/System/Volumes/Data`, swap usado até 6 GB e nenhum outro `rea` rodando. Quem confere isso por você é o `rea-run.sh` (ga-szz40p): `RR="$GC_CITY_PATH/scripts/rea-run.sh"`.
 
-- `df -h /System/Volumes/Data` com 10 GB livres ou mais;
-- swap usado até 6 GB (`sysctl -n vm.swapusage`);
-- nenhum outro `rea` rodando (`pgrep -fl 'bin/rea '`).
-
-Trabalho pesado (APK, Electron, nativo) vai para o MacBook Pro com `scripts/mbp-run.sh --exec` quando a chave estiver ligada (`scripts/mbp-offload.sh status`); rc 96..99 = rode local. O recon web leve desta skill não precisa disso.
+- **Antes de subir o Chrome descartável:** `"$RR" --check`. Saiu 0 → pode. Saiu 92 (sem folga: disco, swap ou outro `rea`) ou 93 (não consegui ler a máquina) → **não suba nada**; espere e tente de novo. 93 conta como "não", nunca como "tudo bem".
+- **Cada comando `rea` do recon web** (passos 2-5 abaixo) roda dentro do wrapper e **com `--local`**, porque fala com o Chrome do mini em `127.0.0.1:$PORT`, que no MBP não existe: `"$RR" --local -- rea list-browser-targets http://127.0.0.1:$PORT`. O wrapper pega a trava de 1 execução pesada (a 2ª espera, até 30 min), recusa sem folga, roda com `nice` e cwd num scratch próprio, e apaga o scratch no fim, inclusive em erro, timeout (1 h) e `kill`. Para redirecionar saída: `"$RR" --local -- sh -c 'rea ... > out.json'` (o `out.json` nasce no scratch; traga com `--pull out.json:<destino absoluto>`).
+- **Trabalho pesado que não depende do mini** (APK, Electron/asar, nativo, Ghidra): o mesmo comando **sem `--local`**. O wrapper tenta o MacBook Pro (`mbp-run.sh --exec`, quando a chave está ligada: `scripts/mbp-offload.sh status`) e só roda no mini nos rc 96..99 do `mbp-run.sh`, aí com a mesma trava, a mesma folga e a mesma limpeza. `--push <arquivo>` põe o arquivo em `./in/`; `--pull REL:LOCAL` traz `REL` de volta. Se o ssh cair no meio, o comando roda DE NOVO no mini: só mande leitura/recon.
+- **Códigos do wrapper** (os demais são do próprio comando): 91 esperou o orçamento e a trava ou outro `rea` seguiu ocupando · 92 recusado por falta de folga · 93 não consegui ler/preparar · 94 uso errado · 124 timeout. Em 91/92/93 **não há achado nem "sem achado"**: nada rodou. Espere e repita; não rode o `rea` direto para contornar. `"$RR" --help` traz a lista completa e as variáveis de ajuste.
 
 ## Passo a passo
+
+Cada `rea ...` destes passos roda como `"$RR" --local -- rea ...` (veja acima).
 
 1. **Máquina** (acima) e **navegador descartável** (abaixo) de pé numa porta sua, `$PORT`.
 2. **Listar alvos:** `rea list-browser-targets http://127.0.0.1:$PORT` e anote o `targetId` da página. (`--allowed-origins` restringe a um site; formato em `--help`.)
@@ -103,7 +104,7 @@ A pergunta é de múltipla escolha, com a sua recomendação em 1º e o tradeoff
 
 - `rea setup`, registrar o REA como MCP, ou usar a skill `captcha-solve` neste fluxo.
 - Anexar a 9222/9223, ou a qualquer Chrome que não seja o seu descartável.
-- Rodar com menos de 10 GB livres, swap acima de 6 GB, ou com outro `rea` ativo.
+- Rodar com menos de 10 GB livres, swap acima de 6 GB, ou com outro `rea` ativo — nem contornar a recusa (92/93) chamando o `rea` direto: passe sempre pelo `rea-run.sh`.
 - Interagir com o site além de ler: nada de enviar formulário, criar conta ou disparar ação; ritmo de visitante humano, sem rajada.
 - Deixar Chrome, perfil ou captura vivos depois de terminar ou de parar.
 - Fechar a bead sem a linha `REA:`.
@@ -112,4 +113,5 @@ A pergunta é de múltipla escolha, com a sua recomendação em 1º e o tradeoff
 
 - Épico do programa: `ga-oe7o1p` (decisões do Athos de 11/10). Esta skill: `ga-ttl3y2`.
 - Skill `reverse-engineer-anything` (o CLI inteiro; `references/runtime-observation.md` descreve a observação passiva de navegador).
-- Skill `browser-control` (cópia viva em HQ) e `docs/runbooks/mbp-offload.md` (MBP, `mbp-run.sh --exec`).
+- Skill `browser-control` (cópia viva em HQ) e `docs/runbooks/mbp-offload.md` (MBP, `mbp-run.sh --exec`, seção "REA pesado: `rea-run.sh`").
+- `scripts/rea-run.sh` (+ `rea-run.selftest.sh`): trava de 1 execução, folga de disco/swap, MBP primeiro, scratch apagado. Bead `ga-szz40p`.
