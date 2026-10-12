@@ -11,8 +11,10 @@
 #   como no MBP) com vm_stat/sysctl/pmset/memory_pressure falsos — o que se testa é o parsing real, não uma saída enlatada.
 #   swap ALTO mas parado passa (o defeito: 5.248 MB recusou com 3,8 GB de RAM livre) · teto absoluto do swap · swap que
 #   CRESCE recusa (fronteira 128/129) · swap encolhendo passa · pressão 2/4 recusa · pressão/swap/RAM ILEGÍVEL recusa com
-#   motivo próprio ("ilegivel:*"), nunca igual a "baixo" · "1.50G" lido como 1536 · page size vem do cabeçalho do vm_stat ·
-#   cada recusa vira UMA linha no log com motivo e números · --check/--seed não logam recusa.
+#   motivo próprio ("ilegivel:*"), nunca igual a "baixo" (inclui pmset ilegível: não vira "bateria") · "1.50G" lido como 1536 · page size vem do cabeçalho do vm_stat ·
+#   cada recusa vira UMA linha no log com motivo e números · --check/--seed não logam recusa · a contagem de 72 h do
+#   mbp-offload.sh (counts): sem log / vazio / por motivo / fora da janela, e linha ilegível AVISADA (nunca omitida).
+#   MBP_OFFLOAD_UNDER_TEST=<script> roda os casos da contagem contra outro mbp-offload.sh.
 # CONTROLE NEGATIVO: cada porta do preflight é removida do script (sed no marcador "# gate:<nome>") e o mutante TEM que
 #   deixar de reproduzir o (rc, motivo) do script real — prova que o teste enxerga o defeito, inclusive "ilegível virou baixo".
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
@@ -101,6 +103,8 @@ echo "System-wide memory free percentage: ${STUB_MP_PCT:-54}%"
 EOF
 cat > "$T/fake/pmset" <<'EOF'
 #!/usr/bin/env bash
+[ "${STUB_PMSET_FAIL:-0}" = 1 ] && exit 1
+[ -n "${STUB_PMSET_RAW:-}" ] && { printf '%s\n' "$STUB_PMSET_RAW"; exit 0; }
 if [ "${STUB_POWER:-ac}" = ac ]; then src="AC Power"; else src="Battery Power"; fi
 printf "Now drawing from '%s'\n -InternalBattery-0 (id=1)\t%s%%; discharging; 3:00 remaining present: true\n" "$src" "${STUB_BATT:-90}"
 EOF
@@ -117,7 +121,7 @@ if [ -x /bin/bash ]; then export STUB_REMOTE_BASH=/bin/bash; else export STUB_RE
 FLAG="$T/city/.gc/mbp-offload.on"
 J="$T/city/.gc/logs/mbp-run.jsonl"
 fails=0; n=0
-reset() { : > "$STUB_LOG"; rm -f "$STUB_REAPED" "$J"; unset STUB_UNREACHABLE STUB_AVAIL_MB STUB_SWAP_MB STUB_SWAP2_MB STUB_SWAP_RAW STUB_SWAP2_RAW STUB_PRESSURE STUB_PRESSURE_FAIL STUB_VM_FAIL STUB_VM_DROP STUB_PAGE_SIZE STUB_COMP_PAGES STUB_MP_FAIL STUB_MP_PCT STUB_PF_RAW STUB_POWER STUB_BATT STUB_SLOTS STUB_NOBASE STUB_RUN_RC STUB_RUN_OUT STUB_RSYNC_RC; }
+reset() { : > "$STUB_LOG"; rm -f "$STUB_REAPED" "$J"; unset STUB_UNREACHABLE STUB_AVAIL_MB STUB_SWAP_MB STUB_SWAP2_MB STUB_SWAP_RAW STUB_SWAP2_RAW STUB_PRESSURE STUB_PRESSURE_FAIL STUB_VM_FAIL STUB_VM_DROP STUB_PAGE_SIZE STUB_COMP_PAGES STUB_MP_FAIL STUB_MP_PCT STUB_PF_RAW STUB_POWER STUB_BATT STUB_PMSET_FAIL STUB_PMSET_RAW STUB_SLOTS STUB_NOBASE STUB_RUN_RC STUB_RUN_OUT STUB_RSYNC_RC; }
 expect() { # nome rc_esperado rc_real [grep-no-log padrão]
   n=$((n+1))
   if [ "$2" = "$3" ]; then echo "ok   $1 (rc=$3)"; else echo "FAIL $1: esperado rc=$2, veio $3"; fails=$((fails+1)); fi
@@ -156,6 +160,14 @@ has "RAM baixa vai ao log com motivo e número" "$J" '"reason":"ram".*"avail_mb"
 reset; rc=$(STUB_POWER=battery STUB_BATT=30 run -- tests/test_x.py); expect "bateria baixa" 98 "$rc"; has "bateria vai ao log" "$J" '"reason":"bateria"'
 # 5b bateria ok sem tomada passa
 reset; rc=$(STUB_POWER=battery STUB_BATT=80 run -- tests/test_x.py); expect "bateria 80% sem tomada passa" 0 "$rc"
+reset; eq "bateria 40% (limite) recusa" "98:bateria" "$(STUB_POWER=battery STUB_BATT=40 outcome "$RUN")"
+reset; eq "bateria 41% passa" "0:-" "$(STUB_POWER=battery STUB_BATT=41 outcome "$RUN")"
+# 5c ILEGÍVEL ≠ bateria baixa: pmset falhou / formato inesperado → "ilegivel:power" (antes virava "battery" e o log dizia "bateria");
+#    na bateria sem a carga legível → "ilegivel:batt"; na tomada a carga ilegível não decide
+reset; eq "pmset falhou" "98:ilegivel:power" "$(STUB_PMSET_FAIL=1 outcome "$RUN")"; has "fonte ilegível não vira 'bateria' no log" "$J" '"reason":"ilegivel:power"'
+reset; eq "pmset: formato inesperado" "98:ilegivel:power" "$(STUB_PMSET_RAW='something else' outcome "$RUN")"
+reset; eq "na bateria sem a carga legível" "98:ilegivel:batt" "$(STUB_PMSET_RAW="Now drawing from 'Battery Power'" outcome "$RUN")"
+reset; eq "na tomada a carga ilegível não decide" "0:-" "$(STUB_PMSET_RAW="Now drawing from 'AC Power'" outcome "$RUN")"
 # 6 slots cheios
 reset; rc=$(STUB_SLOTS=full run -- tests/test_x.py); expect "slots cheios" 96 "$rc"; hasnt "cheios não roda" "$STUB_LOG" '^RUN$'
 # 7 slot de dono morto é reaped e roda
@@ -241,6 +253,30 @@ reset; rc=$(STUB_AVAIL_MB=1000 chk); expect "--check recusa por RAM" 98 "$rc"; n
 reset; rc=$(STUB_AVAIL_MB=1000 "$RUN" --seed wa >"$T/out" 2>"$T/err"; echo $?); expect "--seed recusa por RAM" 98 "$rc"
 n=$((n+1)); if [ ! -e "$J" ]; then echo "ok   --seed não grava recusa no log"; else echo "FAIL --seed gravou no log"; fails=$((fails+1)); fi
 
+# 25 a contagem de 72 h do mbp-offload.sh (é por ela que se mede "recusa indevida"): três estados que não se confundem, e linha
+#    ilegível AVISADA, nunca omitida — senão uma recusa truncada deixava "recusas: nenhuma" mentir
+OFFLOAD="${MBP_OFFLOAD_UNDER_TEST:-$HERE/mbp-offload.sh}"
+cnt() { bash "$OFFLOAD" counts 2>&1; }
+t_now=$(date -u +%Y-%m-%dT%H:%M:%SZ); t_old=$(date -u -v-5d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '5 days ago' +%Y-%m-%dT%H:%M:%SZ)
+l_run() { printf '{"ts":"%s","repo":"wa","mode":"pytest","slot":"1","rc":0,"secs":4,"nargs":2}\n' "$t_now"; }
+l_ref() { printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"nargs":0,"reason":"%s"}\n' "${2:-$t_now}" "$1"; }
+reset; eq "contagem: sem log" "sem log ainda" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; : > "$J"; eq "contagem: log vazio é 0, não ilegível" "0 execuções; recusas: nenhuma" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; { l_run; l_run; l_ref ram; l_ref ram; l_ref swap_cresce; l_ref ram "$t_old"; } > "$J"
+eq "contagem: por motivo, e recusa de 5 dias atrás fica fora" "2 execuções; recusas: ram=2 swap_cresce=1" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; l_run > "$J"; eq "contagem: lido e sem recusa" "1 execuções; recusas: nenhuma" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; { l_run; l_ref ram; printf '{"ts":"%s","repo":"-","mode":"pref' "$t_now"; echo; } > "$J"
+eq "contagem: linha de recusa truncada é avisada e o resto conta" "1 execuções; recusas: ram=1; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; { l_run; printf '{"ts":"%s","mode":"preflight","rc":98}\n' "$t_now"; } > "$J"
+eq "contagem: recusa sem motivo não vira 'nenhuma' em silêncio" "1 execuções; recusas: nenhuma; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; { l_run; printf '{"ts":"ontem","mode":"preflight","rc":98,"reason":"ram"}\n'; } > "$J"
+eq "contagem: ts que não vira data é avisado" "1 execuções; recusas: nenhuma; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; { l_run; echo null; echo 42; } > "$J"
+eq "contagem: linha que não é objeto é avisada" "1 execuções; recusas: nenhuma; 2 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; l_run > "$J"; chmod 000 "$J"; eq "contagem: log sem permissão de leitura é 'ilegível', nunca 'nenhuma'" "ilegível" "$(cnt)"; chmod 644 "$J"
+reset; mkdir -p "$(dirname "$J")" "$T/nojq"; l_run > "$J"; ln -sf "$(command -v date)" "$T/nojq/date"; ln -sf "$(command -v dirname)" "$T/nojq/dirname"
+eq "contagem: jq ausente é 'ilegível', nunca 'nenhuma'" "ilegível" "$(PATH="$T/nojq" /bin/bash "$OFFLOAD" counts 2>&1)"
+
 # controle negativo: sem a checagem de flag o caso "off" PASSARIA a rodar — prova que o teste 1 enxerga o defeito
 reset; rm -f "$FLAG"; neg=$(sed 's/^\[ -f "\$FLAG" \] || {.*$/true/' "$RUN" > "$T/mut.sh"; chmod +x "$T/mut.sh"; "$T/mut.sh" --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>&1; echo $?)
 n=$((n+1)); if [ "$neg" != 99 ]; then echo "ok   controle negativo (mutante sem a trava não sai 99: rc=$neg)"; else echo "FAIL controle negativo: o mutante ainda saiu 99"; fails=$((fails+1)); fi
@@ -268,6 +304,8 @@ mutant ilegivel-delta 98:ilegivel:swap_delta  STUB_SWAP_RAW=garbage
 mutant cresce         98:swap_cresce          STUB_SWAP_MB=5000 STUB_SWAP2_MB=5400
 mutant ilegivel-swap  98:ilegivel:swap        "STUB_PF_RAW=avail_mb=8000\nswap_mb=\nswap_delta_mb=0\npressure=1\npower=ac\nbatt=90"
 mutant teto           98:swap_teto            STUB_SWAP_MB=9000
+mutant ilegivel-power 98:ilegivel:power       STUB_PMSET_FAIL=1
+mutant ilegivel-batt  98:ilegivel:batt        "STUB_PMSET_RAW=Now drawing from 'Battery Power'"
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

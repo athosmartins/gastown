@@ -155,8 +155,9 @@ if isnum "$lvl"; then echo "pressure=$lvl"; else echo "pressure="; fi
 # memory_pressure: só informativo (não decide). vazio/falhou/ilegível → campo vazio
 mp=$(memory_pressure 2>/dev/null | sed -n 's/^System-wide memory free percentage: \([0-9][0-9]*\)%.*/\1/p' | head -1)
 echo "mem_free_pct=$mp"
+# fonte de energia: "AC Power" → ac, "Battery Power" → battery; pmset vazio/falhou/formato inesperado → power= VAZIO (nunca "battery")
 b=$(pmset -g batt 2>/dev/null)
-if printf '%s\n' "$b" | grep -q 'AC Power'; then echo "power=ac"; else echo "power=battery"; fi
+if printf '%s\n' "$b" | grep -q 'AC Power'; then echo "power=ac"; elif printf '%s\n' "$b" | grep -q 'Battery Power'; then echo "power=battery"; else echo "power="; fi
 echo "batt=$(echo "$b" | grep -o '[0-9]*%' | head -1 | tr -d '%')"
 echo "load=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')"
 # segunda leitura do swap, SAMPLE_S segundos depois da primeira. qualquer das duas ilegível → delta vazio (não 0)
@@ -180,8 +181,11 @@ EOF
   [ "$delta" -le "$MAX_SWAP_GROWTH_MB" ] || { refuse swap_cresce "MBP trocando memória agora (swap cresceu $delta MB em ${SWAP_SAMPLE_S}s > $MAX_SWAP_GROWTH_MB)"; return 98; }    # gate:cresce
   isnum "$swap" || { refuse ilegivel:swap "swap usado do MBP ilegível"; return 98; }    # gate:ilegivel-swap
   [ "$swap" -lt "$MAX_SWAP_MB" ] || { refuse swap_teto "MBP com swap acima do teto ($swap MB >= $MAX_SWAP_MB)"; return 98; }    # gate:teto
-  if [ "$power" != "ac" ] && [ "${batt:-0}" -le "$MIN_BATT" ]; then
-    refuse bateria "MBP na bateria (${batt:-?}% <= $MIN_BATT%)"; return 98
+  # fonte de energia ilegível recusa com motivo próprio (antes caía em "battery" e virava recusa por bateria baixa no log)
+  case "$power" in ac|battery) ;; *) refuse ilegivel:power "fonte de energia do MBP ilegível ('${power:-}')"; return 98 ;; esac    # gate:ilegivel-power
+  if [ "$power" = battery ]; then
+    isnum "$batt" || { refuse ilegivel:batt "carga da bateria do MBP ilegível"; return 98; }    # gate:ilegivel-batt
+    [ "$batt" -gt "$MIN_BATT" ] || { refuse bateria "MBP na bateria ($batt% <= $MIN_BATT%)"; return 98; }
   fi
   return 0
 }

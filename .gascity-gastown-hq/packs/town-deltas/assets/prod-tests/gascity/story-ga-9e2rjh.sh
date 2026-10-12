@@ -32,11 +32,11 @@ log "mbp-run.sh, mbp-offload.sh, selftest e runbook presentes; sintaxe ok"
 # ── Estrutural: cada porta do preflight está no script implantado, uma vez só ──
 # vazio (marcador ausente) → count 0 → FAIL (a porta não foi implantada); grep falhou/ilegível → também
 # count 0 → FAIL. Nunca vira "ok": só passa com exatamente 1 linha marcada por porta.
-for gate in ram ilegivel-avail pressao ilegivel-pressao ilegivel-delta cresce ilegivel-swap teto; do
+for gate in ram ilegivel-avail pressao ilegivel-pressao ilegivel-delta cresce ilegivel-swap teto ilegivel-power ilegivel-batt; do
   n=$(grep -c "# gate:$gate\$" "$RUN" 2>/dev/null || true)
   [[ "${n:-0}" == "1" ]] || fail "porta '# gate:$gate' aparece ${n:-0}x em $RUN (esperado 1) — critério novo não implantado"
 done
-log "as 8 portas do preflight estão no script implantado ✓"
+log "as 10 portas do preflight estão no script implantado ✓"
 
 # vazio (sem a linha do teto) → FAIL; falhou/ilegível → FAIL. O teto antigo (5120) como padrão é o defeito.
 swap_default=$(sed -n 's/^MAX_SWAP_MB=\${MBP_MAX_SWAP_MB:-\([0-9]*\)}.*/\1/p' "$RUN" 2>/dev/null | head -1)
@@ -52,7 +52,10 @@ grep -q '^preflight || { rc=\$?; log_refusal; exit \$rc; }' "$RUN" \
 bash "$OFFLOAD" help 2>/dev/null | grep -q '72 h' \
   || fail "mbp-offload.sh help não menciona a contagem de recusas das últimas 72 h"
 grep -q 'recent_counts()' "$OFFLOAD" || fail "recent_counts() ausente em $OFFLOAD"
-log "recusa vai pro log com motivo; status conta por motivo (72 h) ✓"
+grep -q '^  counts) recent_counts' "$OFFLOAD" || fail "subcomando 'counts' ausente em $OFFLOAD"
+# a contagem avisa linha ilegível em vez de omitir (senão uma recusa truncada deixa "nenhuma" mentir)
+grep -q 'linha(s) ilegível(is) no log' "$OFFLOAD" || fail "recent_counts não avisa linha ilegível do log"
+log "recusa vai pro log com motivo; counts/status contam por motivo (72 h) e avisam linha ilegível ✓"
 
 # ── Runbook: descreve o critério novo e não o limiar antigo de 5 GB ──────────
 for key in swap_cresce swap_teto pressao 'ilegivel:'; do
