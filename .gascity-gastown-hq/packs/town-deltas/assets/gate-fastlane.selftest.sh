@@ -800,6 +800,8 @@ e2e_case "kill switch whose location is unknown" switch-unreadable "$S_D2" "" GA
 # in main's history with zero reviewers (the reviewer reproduced it with a CPF + phone, 2 commits, net diff = one harmless line). Every case below is a
 # REAL branch of several commits, a REAL decision, and — where it matters — the REAL record and tally; each "was fast" case is also run against a mutant
 # lib/scanner that lacks the new check (§8t-8x), so the claim is "this goes red without the fix", not "this passes with it".
+# (SLICE NOTE, ga-atsahv.2 — replaced by ga-atsahv.3: the record, the tally and the §8 mutant runs arrive with slice 3. In THIS slice the cases below prove the
+# decision and its reason code; the "run against a mutant" claim is slice 3's to make, and one mutant is already here, in §4h' — the confirm without its digest test.)
 echo "── 4h. history: the lane reads every commit the push publishes (the net diff is not what lands) ──"
 mkseq_on() { # mkseq_on <base-ref> <branch> <spec>... — one commit per group; spec as mkbr, plus MSG:<message> (for the commit being built) and `--` (ends a commit)
   local base="$1" br="$2" s p c msg="$2" n=1; shift 2
@@ -909,6 +911,7 @@ CF_MG=$(git -C "$REPO" rev-parse HEAD); git -C "$REPO" checkout -q main
 FL_BASE=cf-main decide "$CF_MG" "";  chk_code "a merge commit that carries its own conflict resolution stays in the gate (content nobody scanned)" normal history-unverified "conflict resolution"
 REPO="$REPO_H"
 # (j) one more producer/consumer check: the two new codes go through the REAL record and the REAL tally into the bucket their code names
+#     (in this slice e2e_case checks that the decision emits the code; the record and the tally that bucket it arrive with ga-atsahv.3)
 e2e_case "a code file added then removed (history)"           history-code       "$S_H2"  ""
 e2e_case "more commits than the cap"                           history-unverified "$S_H5"  "" GATE_FASTLANE_COMMIT_MAX=2
 e2e_case "a CPF added then removed (history scan)"            scan-findings      "$S_H1"  ""

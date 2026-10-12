@@ -492,8 +492,8 @@ _gate_fastlane_now() {
 # the gate's threat model is a worker's mistake, not a hostile worker — plus the throwaway HOME (the credential
 # shield; see _gate_fastlane_test_path for what PATH does and does not do), the timeouts and the budget. A
 # stricter boundary (sandbox-exec denying network and writes outside the worktree, or a PATH allowlist without
-# bd/gc/dolt/bw/gh/aws/gcloud) is a possible hardening, not present here. Sets GATE_FL_TEST_RC (0 all green | 1 a
-# test failed | 2 could not run) and GATE_FL_TEST_OUT.
+# bd/gc/dolt/bw/gh/aws/gcloud) is a possible hardening, not present here. Sets GATE_FL_TEST_RC (0 every test exited 0 — a
+# test that skips itself exits 0 too | 1 a test failed | 2 could not run) and GATE_FL_TEST_OUT.
 gate_fastlane_run_tests() {
   local git_fn="$1" sha="$2" paths="$3" tmp wt log f runner rc t0 now spent n=0 max budget per_file ok_n=0 tpath
   GATE_FL_TEST_RC=2; GATE_FL_TEST_OUT=""
@@ -664,7 +664,7 @@ gate_fastlane_decide() {
   GATE_LANE_DIGEST=""
 
   if _gate_fastlane_is_off; then
-    # (two literal calls, not one with a variable: the tally selftest finds the codes a producer emits by grepping for them)
+    # (one literal call per code, not one call with a variable: the tally selftest finds the codes a producer emits by grepping for them)
     case "$GATE_FL_OFF_CODE" in
       flag-file)         _gate_fastlane_normal "flag-file" "$GATE_FL_OFF_WHY" ;;
       switch-unreadable) _gate_fastlane_normal "switch-unreadable" "$GATE_FL_OFF_WHY" ;;
