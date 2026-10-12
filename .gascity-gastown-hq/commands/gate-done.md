@@ -1140,6 +1140,23 @@ git push origin HEAD
 Then re-run `/gate-done`. The marker is fixable + re-submittable, nothing is
 lost.
 
+**Marker refused with "diff-size cap (E11)" — your bead got `gate:needs-fix`
+and a `VERDICT: FAIL` comment** (ga-lzidpo, ga-2xdj1x): the diff has more
+production lines than the cap (800), so no reviewer was spawned. Slice the work,
+one branch and one `/gate-done` per slice, and **create each slice as a child
+bead of the same type as its parent** — a slice of a feature is a feature:
+```bash
+PARENT_TYPE=$(bd show <your-bead-id> --json | jq -r 'if type=="array" then .[0] else . end | .issue_type')
+bd create "<slice title>" --parent <your-bead-id> -t "$PARENT_TYPE"
+```
+Without `-t`, `bd create` makes a **task**, and a task slice of a feature loses
+its turn in the gate order (priority > type > age) and inflates "tasks" on the
+painel. (An epic's slices are features.) A sweep in the approved-state reconciler
+retypes the ones that slip through, but it is a net, not the plan. If the diff is
+large by nature (mechanical rename or migration), the exemption is the label
+`gate:size-exempt` plus a comment that STARTS with `gate:size-exempt:` and gives
+the reason, then resubmit.
+
 **Marker rejected with "base-commit-test-check (ga-rstae, arm B)" / gate-status:error
 saying your test file(s) pass unmodified against base**: you're in arm B of a
 running A/B experiment (arm is a deterministic hash of your bead id — you

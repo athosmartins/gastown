@@ -522,6 +522,10 @@ has "refusal: source bead loses gate:queued (nothing is queued)" "$CALLS" "BD -C
 has "refusal: source bead gets gate:needs-fix + refusal counter 1" "$CALLS" "BD -C $SRC_STORE label add $BB gate:needs-fix,gate:e11-refusals:1"
 has "refusal: the reason lands on the SOURCE bead as a VERDICT: FAIL comment (what a fix sling carries)" "$CALLS" "BD -C $SRC_STORE comment $BB VERDICT: FAIL (gate guard, diff-size cap E11 — refusal 1 of 3"
 has "refusal: the reason says what to do (split)" "$CALLS" "O QUE FAZER: dividir em fatias"
+# ga-2xdj1x: the slices must be born with the type of the source bead (bd create --parent with no -t makes a task). This fake
+# source bead carries no issue_type: bd answered, but not with the type -> the PLACEHOLDER, never a guessed -t.
+has "refusal: the reason tells how to create the slices (child of the bead, with -t)" "$CALLS" "bd create '<titulo da fatia>' --parent $BB -t "
+has "refusal: source type not in the answer -> placeholder, not a guess" "$CALLS" "--parent $BB -t <tipo de $BB>."
 has "refusal: marker closed" "$CALLS" "BD -C $MRK_STORE close m-e11"
 has "refusal: ...VERIFIED, and the status is failed (not error)" "$LOGF" "CLOSED (verified, gate-status:failed)"
 has "refusal: status set to failed" "$CALLS" "STATUS m-e11 failed"
@@ -549,6 +553,27 @@ has "3rd: gate:needs-human added" "$CALLS" "BD -C $SRC_STORE label add $BB gate:
 has "3rd: gate:needs-fix removed again (the Pilot must not redispatch)" "$CALLS" "BD -C $SRC_STORE label remove $BB gate:needs-fix"
 has "3rd: the mayor is mailed" "$CALLS" "GC --city $MRK_STORE mail send mayor -s Gate E11: $BB recusado 3x por tamanho"
 has "3rd: the comment says 'refusal 3 of 3'" "$CALLS" "refusal 3 of 3"
+has "3rd: the mail to the mayor carries the slicing command with -t (ga-2xdj1x)" "$CALLS" "bd create '<titulo>' --parent $BB -t "
+
+echo "  — ga-2xdj1x: the slices are born with the type of the source bead (a slice of a feature is a feature) —"
+# <issue_type the fake bd shows> <the -t the reason must carry>. Controls: a task stays task, a bug stays bug (the hint
+# never turns a slice into a feature on its own); an epic's slices are features (refino split convention); a type this
+# list does not know (spike) or an empty one is NOT guessed: the placeholder.
+slice_type_case() {
+  printf '[{"id":"%s","labels":%s,"issue_type":"%s"}]' "$BB" "$PLAIN" "$1" > "$SRC_STORE/show-$BB.json"
+  printf '[{"id":"m-e11","labels":%s}]' "$PLAIN" > "$MRK_STORE/show-m-e11.json"
+  rm -f "$SRC_STORE/comments-$BB.json" "$MRK_STORE/comments-m-e11.json"
+  run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+  eq "slice type [$1]: refused (rc 1)" "$RC" "1"
+  has "slice type [$1]: the reason says -t $2" "$CALLS" "bd create '<titulo da fatia>' --parent $BB -t $2."
+}
+slice_type_case feature feature
+slice_type_case task task
+slice_type_case bug bug
+slice_type_case chore chore
+slice_type_case epic feature
+slice_type_case spike "<tipo de $BB>"
+slice_type_case "" "<tipo de $BB>"
 
 echo "  — refusal label write that does not persist: said, and the close still ends it —"
 set_beads "$BB" "$PLAIN" "$PLAIN"

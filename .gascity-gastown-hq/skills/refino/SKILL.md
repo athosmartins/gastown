@@ -405,9 +405,11 @@ Quer ajustar essa divisão antes de continuar?
 
 After Athos confirms the split, document it as the `notes` of the bead and
 change the bead type to `epic`. Create child bead stubs for each sub-story
-(title only, `story:unrefined` label) using `--no-inherit-labels` so each
-child carries ONLY `story:unrefined` and does not silently inherit
-`story:epic-split` from the parent. Do NOT run full Refino on each sub-story
+(title only, `story:unrefined` label) with `--type feature` — a slice of a
+story is a story; without `-t`/`--type`, `bd create` makes a task, which loses
+its turn in the gate order and inflates "tasks" on the painel (ga-2xdj1x) — and
+`--no-inherit-labels` so each child carries ONLY `story:unrefined` and does not
+silently inherit `story:epic-split` from the parent. Do NOT run full Refino on each sub-story
 in this session — offer to refine each one in a separate session.
 Then close this Refino session.
 

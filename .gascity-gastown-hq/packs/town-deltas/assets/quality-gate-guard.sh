@@ -7580,10 +7580,22 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
     _E11_REFUSALS=$(printf '%s' "$_E11_SRC_SHOW" | jq -r 'if type=="array" then .[0] else . end | [(.labels // [])[] | select(startswith("gate:e11-refusals:")) | sub("^gate:e11-refusals:";"") | tonumber?] | max // 0' 2>/dev/null) || _E11_REFUSALS=0
     case "$_E11_REFUSALS" in ''|*[!0-9]*) _E11_REFUSALS=0 ;; esac
     _E11_REFUSALS=$((_E11_REFUSALS + 1))
+    # ga-2xdj1x: the slices of THIS bead must be born with the bead's own type. `bd create --parent` with no -t makes a
+    # task, and a slice of a feature that is a task loses its turn in the gate order (priority > type > age) and inflates
+    # 'tasks' on the painel (measured 12/10). The instruction names the real type when the source bead says it (an epic's
+    # slices are features: the refino split convention) and otherwise says "<tipo de BEAD>" — bd unreadable, or a type
+    # this list does not know, must not become a guessed -t: the placeholder is always right, a guess may not be.
+    _E11_PTYPE=$(printf '%s' "$_E11_SRC_SHOW" | jq -r 'if type=="array" then .[0] else . end | .issue_type // ""' 2>/dev/null) || _E11_PTYPE=""
+    case "$_E11_PTYPE" in
+      bug|feature|task|chore) ;;
+      epic) _E11_PTYPE="feature" ;;
+      *) _E11_PTYPE="<tipo de $BEAD_ID>" ;;
+    esac
     _E11_REASON="VERDICT: FAIL (gate guard, diff-size cap E11 — refusal $_E11_REFUSALS of 3 for this bead; no reviewer was spawned)
 O diff de $BRANCH contra origin/main tem $_E11_COUNT linhas de codigo de PRODUCAO (testes, fixtures, arquivos gerados, lockfiles e .md nao contam); o teto por submissao e $_E11_CAP.
 Diff grande reprova na primeira tentativa bem mais (13% de aprovacao acima de 1500 linhas, contra 55-80% abaixo de 500): o revisor nao cobre tudo numa passada.
 O QUE FAZER: dividir em fatias, cada uma com o seu proprio marker (/gate-done): uma branch por fatia, cada uma abaixo do teto, citando o bead da fatia nos commits. Nao reenvie a mesma branch inteira.
+Crie cada fatia como bead FILHO deste e do MESMO TIPO dele: bd create '<titulo da fatia>' --parent $BEAD_ID -t $_E11_PTYPE. Sem o -t o bd cria 'task', e fatia de feature que nasce task perde a vez na fila do gate (prioridade > tipo > idade) e infla o numero de tasks no painel.
 Se o diff e grande por natureza (renome ou migracao mecanica), ponha o label gate:size-exempt no bead $BEAD_ID e comente o MOTIVO (um comentario que COMECE com gate:size-exempt: seguido do motivo), depois reenvie.
 Marker $MARKER_ID fechado (recusado na submissao). Este bead ficou com gate:needs-fix e sem gate:queued: o Pilot despacha o conserto."
     bd -C "$BEAD_CITY" label remove "$BEAD_ID" gate:queued 2>/dev/null || true
@@ -7593,7 +7605,7 @@ Marker $MARKER_ID fechado (recusado na submissao). Este bead ficou com gate:need
       bd -C "$BEAD_CITY" label add "$BEAD_ID" gate:needs-human 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" gate:needs-fix 2>/dev/null || true
       gc --city "$GC_CITY" mail send mayor -s "Gate E11: $BEAD_ID recusado 3x por tamanho — precisa de humano" \
-        -m "$BEAD_ID (branch $BRANCH) foi recusado na submissao pela 3a vez: $_E11_COUNT linhas de producao > teto $_E11_CAP. Ficou com gate:needs-human (gate:needs-fix removido); o Pilot nao redespacha. Decida: fatiar voce mesmo, ou gate:size-exempt com motivo no bead." 2>/dev/null \
+        -m "$BEAD_ID (branch $BRANCH) foi recusado na submissao pela 3a vez: $_E11_COUNT linhas de producao > teto $_E11_CAP. Ficou com gate:needs-human (gate:needs-fix removido); o Pilot nao redespacha. Decida: fatiar voce mesmo (cada fatia: bd create '<titulo>' --parent $BEAD_ID -t $_E11_PTYPE — fatia de feature nasce feature), ou gate:size-exempt com motivo no bead." 2>/dev/null \
         || warn "E11-DIFF-CAP: could not mail the mayor about the 3rd refusal of $BEAD_ID — the bead carries gate:needs-human"
     fi
     _E11_AUTHOR=$(printf '%s' "$BRANCH" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')

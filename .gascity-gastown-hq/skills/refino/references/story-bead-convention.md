@@ -424,7 +424,8 @@ When Refino determines a story is too big:
 
 1. Change the parent bead to `type=epic` and label `story:epic-split`.
 2. Create child stubs for each sub-story with:
-   - type `feature`
+   - type `feature` — always pass it: `bd create` with no `--type` makes a
+     task, and a task slice loses its turn in the gate order (ga-2xdj1x)
    - label `story:unrefined`
    - `--parent <epic-id>`
    - title only (Fields 1-8 left blank until each sub-story is refined)

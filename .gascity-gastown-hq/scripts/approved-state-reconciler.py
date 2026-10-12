@@ -48,6 +48,10 @@ SAFETY:
   • Per-bead cooldowns on both route and alarm (~30 min) to prevent churn/spam.
   • Fail-open on pilot liveness error: assume pilot dead → no alarm.
 
+ALSO (ga-2xdj1x): once per cycle, apart from the story:approved work above, it retypes task beads that
+are slices of a feature to feature (feature_slice_type.py has the rule; own kill-switch
+ARC_FEATURE_SLICE_TYPE_ENABLED, and DRY_RUN covers it too).
+
 LAUNCHD: one-shot, StartInterval=600 — launchd controls cadence, not internal sleep.
 DPW: add com.gascity.approved-state-reconciler to DPW_CRITICAL after Mayor deploys.
 """
@@ -77,6 +81,7 @@ except ImportError:
         return None
 import park_labels
 import bead_state
+import feature_slice_type
 import gate_queue_backlog
 from gate_queue_backlog import (
     _gate_queue_depth, _gate_queue_throughput, _gate_queue_suppress_reason,
@@ -139,6 +144,15 @@ MAYOR_ADDR = os.environ.get("ARC_MAYOR_ADDR", "mayor")
 # ── knobs (all env-overridable) ───────────────────────────────────────────────
 ENABLED = os.environ.get("APPROVED_RECONCILER_ENABLED", "1") == "1"
 DRY_RUN = os.environ.get("APPROVED_RECONCILER_DRY_RUN", "0") == "1"
+# ga-2xdj1x: the step that retypes a task slice of a feature to feature (feature_slice_type.py).
+# Its own kill-switch, so it can be turned off without taking the reconciler down with it; DRY_RUN
+# above covers it too. The cap bounds how many retypes ONE cycle may attempt.
+FEATURE_SLICE_TYPE_ENABLED = os.environ.get("ARC_FEATURE_SLICE_TYPE_ENABLED", "1") == "1"
+try:
+    FEATURE_SLICE_TYPE_MAX_FIXES = int(os.environ.get(
+        "ARC_FEATURE_SLICE_TYPE_MAX_FIXES", str(feature_slice_type.DEFAULT_MAX_FIXES)))
+except ValueError:      # a typo in this env must not stop the whole reconciler at import
+    FEATURE_SLICE_TYPE_MAX_FIXES = feature_slice_type.DEFAULT_MAX_FIXES
 # STARVE_MIN: a buildable bead should dispatch within ~2 pilot sweeps (5min each) + margin.
 STARVE_MIN = int(os.environ.get("STARVE_MIN", "20"))
 # STARVE_MIN_PRI2/PRI3: lower-priority beads legitimately queue longer behind higher-
@@ -431,6 +445,8 @@ _bd_has_built_branch = None  # (bead_id) -> bool; True iff a delivery branch for
 _bd_delivery_branch_prefixes = None  # () -> list[str]|None; ga-3ebneo — the shared prefix list;
                                       # None return = "could not read it"
 _bd_branch_stranded = None  # (bead_id) -> (repo, ref, age_days)|None; ga-32u6s orphan-branch probe
+_bd_slice_run = None        # (rig_root, args) -> (rc, stdout)|None; every bd call of the
+                            # slice-type step (ga-2xdj1x) — list, show, update, comment
 # _bd_gate_queue_markers/_read_gate_log_lines moved to gate_queue_backlog.py (ga-ahn3v) —
 # selftest scenarios below stub them as gate_queue_backlog.<name>, not a local global.
 _read_pilot_dispatchable_file = None  # () -> dict|None; parsed+freshness-checked
@@ -4163,6 +4179,39 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
     return processed, routed, alarmed
 
 
+# ── slice-type step (ga-2xdj1x) ───────────────────────────────────────────────
+def _sweep_feature_slice_types(now=None, state=None):
+    """A task bead that is a slice of a feature becomes a feature (feature_slice_type.py has the
+    rule, the three answers it can give and the safety limits). Returns the counters dict, or
+    None when the step did not run (kill-switch off, or the stubbed world below).
+
+    It reads and writes through bd in EVERY store, so the ~100 hermetic scenarios of --selftest —
+    which stub `_bd_approved` and never expect a live bd — must not reach it: with `_bd_approved`
+    stubbed and no `_bd_slice_run` of its own, the step stays out (the same signal run_cycle's
+    isdir check already uses for "this is a stubbed world"). A test of this step sets
+    `_bd_slice_run`. The last counters are kept in state["slice_type_last"] so an `unreadable` that
+    does not go away can be seen across cycles; nothing reads that key yet (the log line is the
+    count today)."""
+    if not FEATURE_SLICE_TYPE_ENABLED:
+        _log("  slice-type step disabled via ARC_FEATURE_SLICE_TYPE_ENABLED=0")
+        return None
+    run = _bd_slice_run
+    roots = [r.strip() for r in RIG_ROOTS if r.strip()]
+    if run is None:
+        if _bd_approved is not None:
+            return None
+        roots = [r for r in roots if os.path.isdir(r)]
+        run = lambda root, args: feature_slice_type.real_bd(root, args, BD_BIN)
+    counters = feature_slice_type.sweep(
+        roots, run, dry_run=DRY_RUN, log=_log, max_fixes=FEATURE_SLICE_TYPE_MAX_FIXES)
+    _log("  " + feature_slice_type.summary_line(counters))
+    if isinstance(state, dict):
+        state["slice_type_last"] = {
+            k: v for k, v in counters.items() if not isinstance(v, list)}
+        state["slice_type_last"]["ts"] = now if now is not None else time.time()
+    return counters
+
+
 # ── main reconciliation cycle ─────────────────────────────────────────────────
 def run_cycle(now, state):
     """One full cycle across all rig stores. Returns (processed, routed, alarmed)."""
@@ -4278,7 +4327,14 @@ def run_cycle(now, state):
     except Exception as e:
         _log("  pause-cause note UNEXPECTED ERROR (fail-open): %r" % (e,))
 
-    _log("cycle done: %d processed, %d routed, %d alarmed" % (total_p, total_r, total_a))
+    # ga-2xdj1x: a slice of a feature is a feature — its own fail-open try, so a problem in this
+    # step can never cost the story:approved work above (or the "cycle done" line below).
+    try:
+        _sweep_feature_slice_types(now, state)
+    except Exception as e:
+        _log("  slice-type step UNEXPECTED ERROR (fail-open): %r" % (e,))
+
+    _log("cycle done:%d processed, %d routed, %d alarmed" % (total_p, total_r, total_a))
     return total_p, total_r, total_a
 
 
