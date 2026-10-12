@@ -23,7 +23,7 @@
 #
 # EM QUE RESULTADO O REVISOR PODE ACREDITAR: só em verde do MBP. O MBP não tem shared/data, nem .env, nem o python3 do mini, então
 #   um vermelho (ou um teste pulado) lá pode ser do AMBIENTE e não do código — dois estados que o veredito não pode confundir.
-#   • rc 0 e nada pulado  → vale o MBP. É a ÚNICA coisa aceita como veio sem rodar nada aqui, e tem um limite: um teste que lê dado por um caminho que o wrapper
+#   • rc 0 e nada pulado  → vale o MBP. É a ÚNICA forma de o MBP valer sem rodar nada aqui (o caso parcial abaixo aceita só os irmãos que não pularam), e tem um limite: um teste que lê dado por um caminho que o wrapper
 #       não enxerga (constante numa lib, fixture; só `shared/data` literal no arquivo manda o alvo ficar aqui) pode passar VAZIO no MBP. O wrapper
 #       não tem como saber, então DIZ: a saída traz a linha `nota: verde do MBP aceito...` (fail-open visível); o remédio é a lista force-local.
 #   • rc 0 com testes pulados → os ALVOS que pularam rodam aqui de novo e o rc DAQUI vale (um skip por dado ausente não pode virar "passou"). Se só ALGUNS alvos
@@ -33,6 +33,13 @@
 #       pulados do que as linhas listam → não sei de quem é → TODOS os alvos rodam aqui (`skips-fora-dos-alvos` / `skips-nao-contados`).
 #       Um -r próprio do revisor ou um --no-summary que apague o relato dos pulados, sem linha-resumo para conferir (-qq), também manda TODOS
 #       os alvos para cá (`skips-ilegiveis`): sem relato não há como saber que nada pulou.
+#       Se o alvo que pulou é um módulo inteiro pulado na coleta (pytest.importorskip no topo), rodá-lo sozinho não coleta nada e devolve 5: é esse 5 que vale,
+#       mesmo com os irmãos verdes no MBP (direção conservadora: nunca um falso verde, mas não é "exatamente o comando de hoje", que daria 0).
+#   • saída do MBP que NÃO se sabe ler → não sei o que ele disse, e nada dele vale: o comando inteiro roda aqui. Vale para: o `tee` que a grava falhou (disco cheio;
+#       `mbp-saida-nao-gravada`), a saída veio vazia (`mbp-saida-vazia`), um grep que a lê deu erro (`mbp-saida-ilegivel`) e, sem -qq, faltou a linha-resumo "N passed in Xs"
+#       que o pytest SEMPRE imprime (`saida-sem-resumo`: saída cortada ou lida pela metade). Só sob -qq, o modo normal em que a linha-resumo some, a falta dela é esperada;
+#       outros jeitos de apagá-la (medidos no 9.0.3: `-q --no-summary`, `-p no:terminal`) não são lidos como -qq e caem em `saida-sem-resumo` (roda aqui).
+#       Regra geral: "não consegui gravar/ler" nunca dá o mesmo resultado que "li e nada pulou".
 #   • rc 1 (falhou)       → SÓ os node ids que falharam rodam aqui primeiro:
 #       reprovam aqui também → vale esse rc 1 (a linha final diz `local-confirmou`);
 #       PASSAM aqui isolados → isso NÃO prova que o vermelho era do ambiente (um -x/--maxfail parou o MBP no 1º vermelho e o resto nunca
@@ -117,6 +124,23 @@ user_r() {   # o revisor mexeu no que o pytest REPORTA (vence ou apaga o -rfEs q
     done
   done
   return 1
+}
+
+user_qq() {   # o revisor pediu -qq (ou mais)? É o modo normal em que o pytest não imprime a linha-resumo "N passed in Xs" (medido no 9.0.3: -q imprime, -qq não; há outros jeitos de apagá-la,
+  # `-q --no-summary` e `-p no:terminal`, que aqui NÃO contam como -qq: sem resumo e sem -qq a saída é lida como ilegível e o comando roda aqui).
+  # Mesma leitura de grupo de flags curtas do user_r (-xqq = -x -q -q); o r também consome o resto do grupo como valor (-rfEs). Conta misturada com -v (-qqv) não se
+  # lê com segurança: vira "não", e a falta do resumo vale como saída ilegível (o inerte: roda aqui).
+  local f i c nq=0 nv=0
+  for f in ${flags[@]+"${flags[@]}"}; do
+    case "$f" in --quiet) nq=$((nq+1)); continue ;; --verbose) nv=$((nv+1)); continue ;; --*) continue ;; -?*) ;; *) continue ;; esac
+    i=1
+    while [ $i -lt ${#f} ]; do
+      c=${f:$i:1}
+      case "$c" in q) nq=$((nq+1)) ;; v) nv=$((nv+1)) ;; k|m|p|c|o|n|W|r) break ;; esac
+      i=$((i+1))
+    done
+  done
+  [ $nq -ge 2 ] && [ $nv -eq 0 ]
 }
 
 flags=(); targets=(); LOCAL_REASON=""
@@ -260,9 +284,22 @@ if [ -n "$LOCAL_REASON" ]; then
 else
   t0=$(date +%s)
   "$MBP_RUN" --repo "$repo" --dir "$dir" -- -rfEs ${flags[@]+"${flags[@]}"} "${mbp_targets[@]}" 2>&1 | tee "$OUT"
-  MBP_RC=${PIPESTATUS[0]}
+  PST=("${PIPESTATUS[@]}")   # numa instrução só: qualquer comando entre o pipeline e esta linha apaga o PIPESTATUS
+  MBP_RC=${PST[0]}
   MBP_SECS=$(( $(date +%s) - t0 ))
-  case "$MBP_RC" in
+  # O que o `tee` gravou em $OUT é a ÚNICA fonte de "o que pulou / o que reprovou" lá. Se o tee falhou (disco cheio, quota, arquivo apagado), $OUT está vazio ou cortado, e
+  # ler um registro cortado como se estivesse inteiro dá o mesmo resultado de "li e nada pulou": verde aceito sem conferir. Não sei o que o MBP disse → o inerte (rodar aqui).
+  # O status do tee que não se consegue ler (PST[1] ausente) também é "não sei". 96..99 ficam de fora: o MBP nem rodou, e o comando daqui já é o de hoje.
+  DISPATCH=$MBP_RC
+  if [ "${PST[1]:-x}" != 0 ]; then
+    case "$MBP_RC" in 96|97|98|99) ;; *) DISPATCH=saida-nao-gravada ;; esac
+  fi
+  case "$DISPATCH" in
+    saida-nao-gravada)
+      DETAIL="mbp-saida-nao-gravada;tee-rc=${PST[1]:-?};mbp-rc=$MBP_RC"
+      say "não consegui gravar a saída do MBP (tee rc=${PST[1]:-?}; disco cheio?) — sem ela não sei o que pulou nem o que reprovou lá; o comando inteiro roda aqui"
+      RAN=mbp+local; run_local_mbp_part "$@"; RC=$?
+      ;;
     96|97|98|99)
       DETAIL="mbp-rc=$MBP_RC: $(grep '^mbp-run:' "$OUT" | tail -1 | cut -c1-160)"
       say "o MBP não rodou (rc=$MBP_RC) — rodando aqui"
@@ -274,11 +311,30 @@ else
       # Ler: linhas "SKIPPED [n] arq:linha:" (o -rs que eu mesmo ponho primeiro) e a linha-resumo do pytest.
       #   vazio (nenhuma das duas) → nada pulou, SE o meu -rs valeu; falhou/ilegível (o revisor trouxe o próprio -r, que
       #   vence o meu, ou --no-summary, que o apaga, e não há resumo) → não sei se pulou: o comando inteiro roda aqui.
-      summary=$(grep -E ' in [0-9.]+s' "$OUT" | tail -1)
-      sk_lines=$(grep -c '^SKIPPED \[' "$OUT")
+      #   Três estados, não dois: LI e há/não há pulados · NÃO CONSEGUI LER. O segundo nunca pode dar o resultado do primeiro "não há": cada leitura abaixo tem o rc
+      #   do grep olhado (0/1 = leu, >= 2 = erro; `grep -c` que falha não imprime nada e ${x:-0} o leria como zero; `| tail` esconderia o rc do grep).
+      rec_bad=""; summary=""; sk_lines=0
+      if [ ! -s "$OUT" ]; then rec_bad="mbp-saida-vazia"   # rc 0 sem uma linha sequer: o pytest sempre imprime algo, então a saída se perdeu
+      else
+        summary=$(grep -E ' in [0-9.]+s' "$OUT"); g_sum=$?
+        sk_lines=$(grep -c '^SKIPPED \[' "$OUT"); g_cnt=$?
+        if [ $g_sum -gt 1 ] || [ $g_cnt -gt 1 ]; then rec_bad="mbp-saida-ilegivel"
+        else
+          case "$sk_lines" in ''|*[!0-9]*) rec_bad="mbp-saida-ilegivel" ;; esac
+          summary=$(printf '%s\n' "$summary" | tail -1)
+        fi
+      fi
       sk_sum=$(printf '%s' "$summary" | grep -oE '[0-9]+ skipped' | head -1 | awk '{print $1}')
       sk_targets=(); sk_note=""
-      if [ "${sk_lines:-0}" -gt 0 ] || { [ -n "$sk_sum" ] && [ "$sk_sum" != 0 ]; }; then
+      if [ -n "$rec_bad" ]; then
+        sk_note="$rec_bad"
+        say "não consegui ler a saída do MBP ($rec_bad) — sem ela não sei se algo pulou; o comando inteiro roda aqui"
+      elif [ -z "$summary" ] && ! user_qq; then
+        # Fora do -qq o pytest SEMPRE imprime "N passed in Xs": a falta dela é saída cortada ou lida pela metade, e uma lista SKIPPED parcial deixaria os irmãos do skip perdido
+        # passarem como verdes. Sem a linha-resumo também não há contagem para conferir as linhas SKIPPED.
+        sk_note="saida-sem-resumo"
+        say "o MBP não imprimiu a linha-resumo do pytest (só some com -qq) — saída cortada ou ilegível, não sei se algo pulou; o comando inteiro roda aqui"
+      elif [ "${sk_lines:-0}" -gt 0 ] || { [ -n "$sk_sum" ] && [ "$sk_sum" != 0 ]; }; then
         # De quem é cada skip? Só o caminho de um ALVO PEDIDO é dono (is_target_file). Se UM skip não casa — pytest.skip() num helper, linha
         # SKIPPED que não leio, resumo que diz mais pulados do que as linhas listam —, "rodar os arquivos que
         # pularam" deixaria aquele teste sem rodar aqui e o rc daqui valeria como se ele tivesse rodado. Então TODOS os alvos rodam aqui.

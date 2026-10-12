@@ -12,7 +12,10 @@
 #   Round 3 do gate: assinatura de shared/data achada em arquivo GRANDE (10 execuções: é uma corrida de SIGPIPE), na última linha, com byte NUL · só alguns alvos pularam → a nota de
 #   verde do MBP sai (os irmãos foram aceitos sem reconferir) · opções do plugin de cache rodam aqui e o comando daqui não leva -p no:cacheprovider (stub que recusa como o pytest;
 #   e o pytest de verdade quando existe) · lista force-local ausente/ilegível → nada vai ao MBP, com AVISO · repo vem do git-common-dir, não do nome do diretório do worktree.
-#   Controles negativos A-F: cada mutante (sem a confirmação local, sem o desvio 96..99, regra antiga do skip, sem a contenção dos ids, leitura antiga da assinatura, -p no:cacheprovider de volta) tem de ser pego.
+#   Gate round 1 do ga-xm1jfl.1 (a classe "não consegui gravar/ler lido como nada pulou"): `tee` que falha (registro vazio ou cortado; com divisão, com MBP vermelho, com MBP fora 96..99) · saída vazia ·
+#   fora de -qq sem a linha-resumo (lista SKIPPED parcial incluída) e as grafias de -qq · grep que lê a saída e falha (a contagem de SKIPPED e a linha-resumo).
+#   Controles negativos A-I: cada mutante (sem a confirmação local, sem o desvio 96..99, regra antiga do skip, sem a contenção dos ids, leitura antiga da assinatura, -p no:cacheprovider de volta,
+#   sem o status do tee, sem a exigência do resumo, leitura antiga que ignora o rc do grep) tem de ser pego.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GP="$HERE/gate-pytest.sh"
@@ -220,13 +223,14 @@ has_local "dois ids: o 1º roda" "$STUB_LOG" 'arg:tests/test_b.py::test_y$'; has
 reset; mbp_out "."; rc=$(run -- tests/test_a.py -qq); expect "sem resumo, sem -r do revisor, rc 0" 0 "$rc"; hasnt "-qq: não roda aqui" "$STUB_LOG" 'LOCAL_CALL'
 # sem resumo + -r do revisor = não sei se pulou → aqui
 reset; mbp_out "."; rc=$(run -- tests/test_a.py -qq -ra); expect "sem resumo + -ra do revisor" 0 "$rc"; has "sem resumo + -r: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "no log: skips-ilegiveis" "$LOG" 'skips-ilegiveis'
-# o -r do revisor pode vir DENTRO de um grupo de flags curtas (-qqxrf = -q -q -x -r f): argparse o lê, então o wrapper também tem de ler
-for grp in -qqxrf -xrf -qqrfE -vrs; do
+# o -r do revisor pode vir DENTRO de um grupo de flags curtas (-qqxrf = -q -q -x -r f): argparse o lê, então o wrapper também tem de ler.
+# Só sob -qq a linha-resumo some (fora dele o pytest SEMPRE a imprime, e a falta dela é saída ilegível: caso 5b), então é sob -qq que o -r do revisor decide algo.
+for grp in -qqxrf "-qq -xrf" -qqrfE; do
   reset; mbp_out "."; rc=$(run -- tests/test_a.py $grp); expect "grupo $grp traz um -r: sem resumo, não sei se pulou" 0 "$rc"
   has "grupo $grp: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "grupo $grp: skips-ilegiveis no log" "$LOG" 'skips-ilegiveis'
 done
-# controles: o r que NÃO é a opção -r (valor de -k, de -n, de -p...) e grupos sem r não disparam
-for grp in -qqx -xkr -knot_r -n4 -vv; do
+# controles: o r que NÃO é a opção -r (valor de -k, de -n, de -p...) e grupos sem r não disparam (sob -qq, a saída "." sem resumo é a legítima)
+for grp in -qqx -qqxkr -qqknot_r "-qq -n4"; do
   reset; mbp_out "."; rc=$(run -- tests/test_a.py $grp); expect "grupo $grp (sem -r): nada pulou, não roda aqui" 0 "$rc"; hasnt "grupo $grp: sem chamada local" "$STUB_LOG" 'LOCAL_CALL'
 done
 # --no-summary (pytest 9 medido): tira as linhas SKIPPED que o meu -rs pede e, junto com -qq, tira também a linha-resumo — um skip fica invisível
@@ -239,6 +243,83 @@ reset; mbp_out "= 1 passed, 1 skipped in 0.1s ="; rc=$(run -- tests/test_a.py --
 has "--no-summary + resumo skipped: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "--no-summary + resumo skipped: skips-nao-contados" "$LOG" 'skips-nao-contados'
 reset; mbp_out "= 1 passed in 0.1s ="; rc=$(run -- tests/test_a.py --no-summary); expect "--no-summary com resumo sem skip" 0 "$rc"
 hasnt "--no-summary + resumo sem skip: não roda aqui" "$STUB_LOG" 'LOCAL_CALL'
+
+# 5b SAÍDA DO MBP QUE NÃO SE SABE LER (gate round 1 do ga-xm1jfl.1: "não consegui gravar/ler" lido como "nada pulou"). São TRÊS estados: li e nada pulou · li e pulou · não consegui ler.
+#    O terceiro nunca pode dar o resultado do primeiro: o comando inteiro roda aqui, nada do MBP vale, e a nota de verde do MBP não sai.
+# 5b-1 a linha-resumo "N passed in Xs" o pytest SEMPRE imprime, exceto sob -qq. Sem ela (fora de -qq) a saída está cortada ou ilegível.
+for fl in "-q" "" "-x -q" "-v"; do
+  reset; mbp_out "."; rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py $fl); expect "sem resumo fora de -qq [$fl]: o rc daqui vale (1), não o verde do MBP" 1 "$rc"
+  has "sem resumo [$fl]: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "sem resumo [$fl]: saida-sem-resumo no log" "$LOG" 'saida-sem-resumo'; hasnt "sem resumo [$fl]: sem a nota de verde do MBP" "$T/out" 'nota: verde do MBP'
+done
+has "sem resumo: a saída diz que a linha-resumo faltou" "$T/out" 'não imprimiu a linha-resumo'
+# lista SKIPPED PARCIAL sem resumo: o skip perdido é do test_a e o relato só traz o do test_b; sem a linha-resumo não há contagem para desconfiar → TODOS os alvos rodam aqui
+reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado"
+rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -q); expect "lista SKIPPED parcial sem resumo: o rc daqui vale (1)" 1 "$rc"
+has_local "parcial sem resumo: o test_a (irmão do skip que se perdeu) roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; has_local "parcial sem resumo: o test_b roda aqui" "$STUB_LOG" 'arg:tests/test_b.py$'
+count "parcial sem resumo: UMA chamada local" "$STUB_LOG" 'LOCAL_CALL' 1; has "parcial sem resumo: no log" "$LOG" 'saida-sem-resumo'
+# 5b-2 quando a falta do resumo é NORMAL (-qq, em qualquer grafia) e quando não é
+for fl in -qq -qqq "-q -q" "--quiet --quiet" -xqq -qxq "-q --quiet"; do
+  reset; mbp_out "."; rc=$(run -- tests/test_a.py $fl); expect "-qq [$fl]: a falta do resumo é normal" 0 "$rc"; hasnt "-qq [$fl]: não roda aqui" "$STUB_LOG" 'LOCAL_CALL'
+done
+for fl in -q -qv "-qq -v" "-q -v" -kqq "-n qq" "-p qq"; do   # um só q; -qq misturado com -v não se lê com segurança; o qq é valor de -k / -n / -p
+  reset; mbp_out "."; rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py $fl); expect "sem -qq [$fl]: sem resumo é saída ilegível, o rc daqui vale (1)" 1 "$rc"; has "sem -qq [$fl]: saida-sem-resumo no log" "$LOG" 'saida-sem-resumo'
+done
+# 5b-3 rc 0 sem UMA linha de saída: a saída se perdeu (nem sob -qq o pytest imprime nada; sempre há a linha de progresso)
+reset; rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py -qq); expect "saída vazia do MBP (rc 0): o rc daqui vale (1)" 1 "$rc"
+has "saída vazia: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "saída vazia: mbp-saida-vazia no log" "$LOG" 'mbp-saida-vazia'; hasnt "saída vazia: sem a nota de verde do MBP" "$T/out" 'nota: verde do MBP'
+# 5b-4 o `tee` que grava a saída FALHA (disco cheio; o gate reproduziu com o tee de verdade e `ulimit -f`; aqui um tee de PATH que se comporta igual: repassa tudo ao stdout, grava
+#      nada (none) ou só a 1ª linha (first) no arquivo, e sai com 1). O registro fica vazio ou cortado e o pytest imprimiu um SKIPPED que se perdeu.
+mkdir -p "$T/shadow-tee" "$T/shadow-grep"
+cat > "$T/shadow-tee/tee" <<'EOF'
+#!/usr/bin/env bash
+f="$1"; : > "$f"; k=0
+while IFS= read -r l || [ -n "$l" ]; do
+  printf '%s\n' "$l"
+  if [ "${STUB_TEE_KEEP:-none}" = first ] && [ $k -eq 0 ]; then printf '%s\n' "$l" > "$f"; fi
+  k=$((k+1))
+done
+echo "tee: $f: No space left on device" >&2
+exit 1
+EOF
+# grep que falha (rc 2, sem imprimir nada) quando os argumentos citam STUB_GREP_FAIL; senão é o grep de verdade
+cat > "$T/shadow-grep/grep" <<'EOF'
+#!/usr/bin/env bash
+if [ -n "${STUB_GREP_FAIL:-}" ]; then case "$*" in *"$STUB_GREP_FAIL"*) exit 2 ;; esac; fi
+exec "$REAL_GREP" "$@"
+EOF
+chmod +x "$T/shadow-tee/tee" "$T/shadow-grep/grep"; REAL_GREP=$(command -v grep); export REAL_GREP
+tee_mbp_out() { mbp_out ".s" "=== short test summary info ===" "SKIPPED [1] tests/test_b.py:9: no data on the MBP"; }
+# registro CORTADO depois da 1ª linha (".s"): sob -qq não há linha-resumo para desconfiar, e sem o SKIPPED o verde seria aceito — o falso verde que o gate reproduziu
+reset; tee_mbp_out; rc=$(PATH="$T/shadow-tee:$PATH" STUB_TEE_KEEP=first STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -qq)
+expect "tee falhou, registro cortado (-qq): o rc daqui vale (1), nunca o verde do MBP" 1 "$rc"
+has_local "tee falhou: o test_a roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; has_local "tee falhou: o test_b (o do skip perdido) roda aqui" "$STUB_LOG" 'arg:tests/test_b.py$'
+count "tee falhou: UMA chamada local, com o comando inteiro" "$STUB_LOG" 'LOCAL_CALL' 1; has "tee falhou: mbp-saida-nao-gravada no log" "$LOG" 'mbp-saida-nao-gravada;tee-rc=1'
+has "tee falhou: a saída DIZ que não gravou" "$T/out" 'não consegui gravar a saída do MBP'; hasnt "tee falhou: sem a nota de verde do MBP (nada do MBP foi aceito)" "$T/out" 'nota: verde do MBP'
+has "tee falhou: ran=mbp+local" "$T/out" 'gate-pytest: ran=mbp\+local rc=1'
+# registro VAZIO, fora de -qq, e o rerun daqui passa: o rc 0 é o do rerun, mas o rerun aconteceu
+reset; tee_mbp_out; rc=$(PATH="$T/shadow-tee:$PATH" STUB_TEE_KEEP=none STUB_LOCAL_RCS=0 run -- tests/test_a.py -q); expect "tee falhou, registro vazio: o rerun daqui decide (0)" 0 "$rc"
+has "tee vazio: roda aqui" "$STUB_LOG" 'LOCAL_CALL'; has "tee vazio: mbp-saida-nao-gravada no log" "$LOG" 'mbp-saida-nao-gravada'; hasnt "tee vazio: sem a nota de verde do MBP" "$T/out" 'nota: verde do MBP'
+# MBP vermelho (rc 1) e o tee falhou: não há ids confiáveis para confirmar isolado → o comando inteiro roda aqui
+reset; mbp_red; rc=$(PATH="$T/shadow-tee:$PATH" STUB_TEE_KEEP=first STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -q); expect "tee falhou + MBP vermelho: o rc daqui vale (1)" 1 "$rc"
+count "tee falhou + vermelho: UMA chamada local (o comando inteiro)" "$STUB_LOG" 'LOCAL_CALL' 1; hasnt "tee falhou + vermelho: nenhum id roda isolado" "$STUB_LOG" 'arg:tests/test_a.py::test_x'; has "tee falhou + vermelho: no log" "$LOG" 'mbp-saida-nao-gravada;tee-rc=1;mbp-rc=1'
+# MBP indisponível (96..99) + tee falho: o MBP nem rodou, o comando daqui já é o de hoje — ran=local, sem alegar que o MBP rodou
+reset; export STUB_MBP_RC=98; rc=$(PATH="$T/shadow-tee:$PATH" STUB_TEE_KEEP=none STUB_LOCAL_RCS=0 run -- tests/test_a.py -q); unset STUB_MBP_RC
+expect "MBP fora (98) + tee falho" 0 "$rc"; has "98 + tee falho: ran=local" "$T/out" 'gate-pytest: ran=local rc=0'; hasnt "98 + tee falho: não alega saída não gravada" "$LOG" 'mbp-saida-nao-gravada'
+# com divisão: a parte do MBP roda aqui inteira e a parte local roda uma vez só
+reset; tee_mbp_out; rc=$(PATH="$T/shadow-tee:$PATH" STUB_TEE_KEEP=first STUB_LOCAL_RCS="0 0" run -- tests/test_a.py tests/test_db.py -qq); expect "tee falhou + divisão" 0 "$rc"
+count "tee falhou + divisão: duas chamadas locais" "$STUB_LOG" 'LOCAL_CALL' 2; sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-part.log"
+count "tee falhou + divisão: test_a roda uma vez só" "$T/local-part.log" 'arg:tests/test_a.py$' 1; count "tee falhou + divisão: test_db roda uma vez só" "$T/local-part.log" 'arg:tests/test_db.py$' 1
+# controle: com o tee BOM o mesmo MBP segue o caminho preciso (só o test_b, que pulou, volta aqui; o test_a foi aceito)
+reset; tee_mbp_out; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -qq); expect "tee bom, mesmo MBP: o caminho preciso segue valendo" 0 "$rc"
+has_local "tee bom: o test_b (pulou) roda aqui" "$STUB_LOG" 'arg:tests/test_b.py$'; sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" > "$T/local-only.log"; hasnt "tee bom: o test_a não volta" "$T/local-only.log" 'arg:tests/test_a.py$'
+hasnt "tee bom: sem mbp-saida-nao-gravada" "$LOG" 'mbp-saida-nao-gravada'
+# 5b-5 um grep que LÊ a saída falha (rc 2, sem imprimir nada): `grep -c` falho não imprime 0, imprime NADA, e ${sk_lines:-0} o leria como zero; `grep | tail` esconderia o rc do grep
+reset; mbp_out ".s" "SKIPPED [1] tests/test_b.py:9: no data on the MBP"
+rc=$(PATH="$T/shadow-grep:$PATH" STUB_GREP_FAIL='^SKIPPED' STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -qq); expect "grep -c dos SKIPPED falhou: o rc daqui vale (1), não o verde do MBP" 1 "$rc"
+has_local "grep -c falhou: o test_a roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; has "grep -c falhou: mbp-saida-ilegivel no log" "$LOG" 'mbp-saida-ilegivel'; hasnt "grep -c falhou: sem a nota de verde do MBP" "$T/out" 'nota: verde do MBP'
+reset; mbp_out ".s" "SKIPPED [1] tests/test_b.py:9: no data on the MBP"
+rc=$(PATH="$T/shadow-grep:$PATH" STUB_GREP_FAIL=' in [0-9.]+s' STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -qq); expect "grep da linha-resumo falhou: o rc daqui vale (1)" 1 "$rc"
+has_local "grep do resumo falhou: o test_a roda aqui" "$STUB_LOG" 'arg:tests/test_a.py$'; has "grep do resumo falhou: mbp-saida-ilegivel no log" "$LOG" 'mbp-saida-ilegivel'
 # verde do MBP aceito: o MBP não tem shared/data nem .env — um teste que lê dado por um caminho que o wrapper não enxerga pode passar VAZIO lá.
 # O wrapper não consegue saber, então DIZ (fail-open visível), só quando um verde do MBP foi aceito.
 reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_a.py -q); expect "verde do MBP" 0 "$rc"; has "verde do MBP: a nota de verde vazio sai" "$T/out" 'nota: verde do MBP.*VAZIO'
@@ -402,6 +483,9 @@ has "rerun com rc 3: o log diz o rc daqui" "$LOG" 'local-rc=3'; hasnt "rerun com
 # vale só quando é verde, e o verde do MBP pode ser vazio
 hasnt "--help não promete rc só em 0..5" "$T/help" '\(0\.\.5\)'; hasnt "--help não diz que o resultado de lá vale" "$T/help" 'resultado de lá é o que vale'
 has "--help diz que o verde do MBP pode passar vazio" "$T/help" 'passar VAZIO'; has "--help diz que o skip de helper manda TODOS os alvos para cá" "$T/help" 'TODOS os alvos'
+# a saída do MBP que não se sabe ler (tee que falhou, vazia, sem resumo, grep com erro) tem os 4 motivos no cabeçalho, e o cabeçalho não promete uma ÚNICA coisa aceita como veio
+for why in mbp-saida-nao-gravada mbp-saida-vazia mbp-saida-ilegivel saida-sem-resumo; do has "--help traz o motivo $why" "$T/help" "$why"; done
+hasnt "--help não chama o verde sem pulados de ÚNICA coisa aceita (o caso parcial também aceita)" "$T/help" 'ÚNICA coisa aceita'
 
 # controle negativo A: sem a confirmação local, o caso "vermelho" PASSARIA pelo rc do MBP — o teste 4 tem de enxergar isso
 reset; mbp_red
@@ -429,6 +513,22 @@ cmp -s "$GP" "$T/mutD.sh" && { n=$((n+1)); echo "FAIL controle D: o mutante é i
   STUB_LOCAL_RCS=0 "$T/mutD.sh" --repo wa --dir "$T/wt" -- tests/test_a.py tests/test_b.py -q >/dev/null 2>&1
   n=$((n+1)); if grep -q 'arg:tests/outro.py' "$STUB_LOG"; then echo "ok   controle D (mutante sem a contenção roda o id estranho isolado — o caso 4c pegaria)"; else echo "FAIL controle D: o mutante também não rodou o id estranho"; fails=$((fails+1)); fi; }
 unset STUB_MBP_RC
+# controle negativo G: sem a checagem do status do tee, o registro cortado (".s", sem o SKIPPED) é lido como "nada pulou" → falso verde: rc 0 e NADA roda aqui — o caso 5b-4 tem de enxergar isso
+sed 's|^  if \[ "\${PST\[1\]:-x}" != 0 \]; then$|  if false; then|' "$GP" > "$T/mutG.sh"; chmod +x "$T/mutG.sh"
+cmp -s "$GP" "$T/mutG.sh" && { n=$((n+1)); echo "FAIL controle G: o mutante é idêntico ao original (sed não casou)"; fails=$((fails+1)); } || {
+  reset; tee_mbp_out; PATH="$T/shadow-tee:$PATH" STUB_TEE_KEEP=first STUB_LOCAL_RCS=1 "$T/mutG.sh" --repo wa --dir "$T/wt" -- tests/test_a.py tests/test_b.py -qq >"$T/out" 2>&1; r=$?
+  n=$((n+1)); if [ "$r" = 0 ] && ! grep -q 'LOCAL_CALL' "$STUB_LOG"; then echo "ok   controle G (mutante sem o status do tee aceita o verde cortado: rc 0 e nada roda aqui — o caso 5b-4 pegaria)"; else echo "FAIL controle G: o mutante não aceitou o verde cortado (rc=$r)"; fails=$((fails+1)); fi; }
+# controle negativo H: sem a exigência da linha-resumo fora de -qq, uma lista SKIPPED parcial deixa o irmão do skip perdido (test_a) sem rodar aqui — o caso 5b-1 tem de enxergar isso
+sed 's|^      elif \[ -z "\$summary" \] && ! user_qq; then$|      elif false; then|' "$GP" > "$T/mutH.sh"; chmod +x "$T/mutH.sh"
+cmp -s "$GP" "$T/mutH.sh" && { n=$((n+1)); echo "FAIL controle H: o mutante é idêntico ao original (sed não casou)"; fails=$((fails+1)); } || {
+  reset; mbp_out "SKIPPED [1] tests/test_b.py:9: sem dado"; STUB_LOCAL_RCS=1 "$T/mutH.sh" --repo wa --dir "$T/wt" -- tests/test_a.py tests/test_b.py -q >/dev/null 2>&1
+  n=$((n+1)); if sed -n '/^LOCAL_CALL/,$p' "$STUB_LOG" | grep -q 'arg:tests/test_a.py$'; then echo "FAIL controle H: o mutante ainda rodou o test_a aqui"; fails=$((fails+1)); else echo "ok   controle H (mutante sem a exigência do resumo deixa o test_a sem rodar — o caso 5b-1 pegaria)"; fi; }
+# controle negativo I: a leitura antiga (rc do grep ignorado, contagem vazia lida como 0) → um `grep -c` que falhou vira "nada pulou": falso verde — o caso 5b-5 tem de enxergar isso
+sed -e 's/g_sum=\$?/g_sum=0/' -e 's/g_cnt=\$?/g_cnt=0/' -e 's/ rec_bad="mbp-saida-ilegivel" ;; esac$/ sk_lines=0 ;; esac/' "$GP" > "$T/mutI.sh"; chmod +x "$T/mutI.sh"
+cmp -s "$GP" "$T/mutI.sh" && { n=$((n+1)); echo "FAIL controle I: o mutante é idêntico ao original (sed não casou)"; fails=$((fails+1)); } || {
+  grep -q 'g_cnt=0' "$T/mutI.sh" && grep -q 'sk_lines=0 ;; esac' "$T/mutI.sh" || { n=$((n+1)); echo "FAIL controle I: o sed não trocou as duas leituras"; fails=$((fails+1)); }
+  reset; mbp_out ".s" "SKIPPED [1] tests/test_b.py:9: no data on the MBP"; PATH="$T/shadow-grep:$PATH" STUB_GREP_FAIL='^SKIPPED' STUB_LOCAL_RCS=1 "$T/mutI.sh" --repo wa --dir "$T/wt" -- tests/test_a.py tests/test_b.py -qq >"$T/out" 2>&1; r=$?
+  n=$((n+1)); if [ "$r" = 0 ] && ! grep -q 'LOCAL_CALL' "$STUB_LOG"; then echo "ok   controle I (mutante com a leitura antiga aceita o verde: rc 0 e nada roda aqui — o caso 5b-5 pegaria)"; else echo "FAIL controle I: o mutante não aceitou o verde (rc=$r)"; fails=$((fails+1)); fi; }
 
 # controle negativo E: a leitura antiga da assinatura (`grep -v | grep -q` sob pipefail) volta → o arquivo grande vai ao MBP — o caso 7a2 tem de enxergar isso
 sed 's@^  case "[$]body" in [*]shared/data[*]) return 0 ;; esac$@  if grep -v -E "^[[:space:]]*#" "$1" 2>/dev/null | grep -q shared/data; then return 0; fi@' "$GP" > "$T/mutE.sh"; chmod +x "$T/mutE.sh"
