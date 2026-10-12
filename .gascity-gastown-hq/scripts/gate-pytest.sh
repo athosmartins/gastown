@@ -33,7 +33,8 @@
 #
 # CHAVES E LOG: `touch $CITY/.gc/gate-pytest.off` desliga SÓ este caminho (o mbp-offload.on continua valendo para os workers);
 #   apague para religar. Cada execução acrescenta uma linha em $CITY/.gc/logs/gate-pytest.jsonl (ts, sessão, repo, ran, motivo,
-#   segundos no MBP/aqui, rc) — é o insumo do antes×depois por sessão de revisor.
+#   segundos no MBP/aqui, rc) — é o insumo do antes×depois por sessão de revisor. Se a linha não puder ser gravada, a saída traz um
+#   AVISO (o rc do revisor não muda): uma execução fora do log é dita, não some da contagem em silêncio.
 #   Ajustes por ambiente: GATE_PYTEST_MBP_TIMEOUT_S (420), GATE_PYTEST_PY (python3), GATE_PYTEST_FORCE_LOCAL_LIST,
 #   GATE_PYTEST_MBP_RUN, GATE_PYTEST_CITY.
 set -o pipefail
@@ -48,7 +49,7 @@ LOG="$CITY/.gc/logs/gate-pytest.jsonl"
 export MBP_RUN_TIMEOUT_S="${GATE_PYTEST_MBP_TIMEOUT_S:-${MBP_RUN_TIMEOUT_S:-420}}"
 
 say() { printf 'gate-pytest: %s\n' "$*"; }
-usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^set -o pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }   # até a linha anterior ao código: o cabeçalho pode crescer
 
 dir="$PWD"; repo=""
 while [ $# -gt 0 ]; do
@@ -251,7 +252,9 @@ EOF
                DETAIL="mbp-vermelho:$nids;ids-ilegiveis"; run_local_mbp_part "$@"; RC=$? ;;
           0) DETAIL="mbp-vermelho:$nids;local-NAO-confirmou"
              say "AVISO: $nids teste(s) reprovaram no MBP e PASSARAM aqui — vale o daqui (rc=0); a diferença é de ambiente" ;;
-          *) DETAIL="mbp-vermelho:$nids;local-confirmou" ;;
+          1) DETAIL="mbp-vermelho:$nids;local-confirmou" ;;
+          # 2 interrompido, 3 erro interno, 137 morto por sinal...: o rc vale (não é verde), mas o aqui NÃO confirmou o vermelho
+          *) DETAIL="mbp-vermelho:$nids;local-rc=$RC" ;;
         esac
       else
         say "o MBP reprovou mas não consegui ler quais testes — o comando inteiro roda aqui"
@@ -273,9 +276,12 @@ EOF
   fi
 fi
 SECS=$(( $(date +%s) - T_START ))
-mkdir -p "$(dirname "$LOG")" 2>/dev/null
-printf '{"ts":"%s","session":"%s","repo":"%s","ran":"%s","rc":%s,"secs":%s,"mbp_secs":%s,"local_secs":%s,"detail":"%s","ntargets":%s}\n' \
+# O log é o insumo do antes×depois: uma linha que não foi gravada some da contagem. O rc do revisor não depende dele (nunca falha por
+# causa do log), mas a falta é DITA na saída, não engolida — quem lê "execuções: N" sabe que pode faltar uma.
+LOG_LINE=$(printf '{"ts":"%s","session":"%s","repo":"%s","ran":"%s","rc":%s,"secs":%s,"mbp_secs":%s,"local_secs":%s,"detail":"%s","ntargets":%s}' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${GC_SESSION_NAME:-}" "${repo:--}" "$RAN" "$RC" "$SECS" "$MBP_SECS" "$LOCAL_SECS" \
-  "$(printf '%s' "$DETAIL" | tr -d '"\\' | tr '\n' ' ' | cut -c1-200)" "${#targets[@]}" >> "$LOG" 2>/dev/null || true
+  "$(printf '%s' "$DETAIL" | tr -d '"\\' | tr '\n' ' ' | cut -c1-200)" "${#targets[@]}")
+{ mkdir -p "$(dirname "$LOG")" && printf '%s\n' "$LOG_LINE" >> "$LOG"; } 2>/dev/null \
+  || say "AVISO: não consegui gravar $LOG — esta execução não entra no antes×depois (o resultado abaixo não muda)"
 say "ran=$RAN rc=$RC secs=$SECS mbp_secs=$MBP_SECS local_secs=$LOCAL_SECS motivo=${DETAIL:--}"
 exit $RC

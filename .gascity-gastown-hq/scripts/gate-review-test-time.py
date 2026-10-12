@@ -25,7 +25,9 @@ LIMITES
   definição é a mesma antes e depois, então a comparação é justa; o número absoluto subestima. A duração de cada chamada é a
   diferença entre o carimbo do tool_use e o do tool_result na transcrição; chamada sem resultado casado não conta (e é contada à parte).
 """
+import contextlib
 import glob
+import io
 import json
 import os
 import re
@@ -71,6 +73,9 @@ def gate_events(path):
             except ValueError:
                 bad += 1
                 continue
+            if not isinstance(e, dict):  # `null`, `[]`, um número: JSON válido que não é um evento — ilegível, contado, não um crash
+                bad += 1
+                continue
             res = str(e.get("result", "")).upper()
             ts = epoch(e.get("ts"))
             try:
@@ -82,6 +87,15 @@ def gate_events(path):
                 continue
             out.append((ts, el / 60.0))
     return out, bad
+
+
+def gate_events_from_lines(lines):
+    """Só para o selftest: o mesmo gate_events, alimentado por linhas em memória."""
+    with tempfile.TemporaryDirectory() as t:
+        p = os.path.join(t, "g.jsonl")
+        with open(p, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return gate_events(p)
 
 
 def cmd_dias(days, path=None):
@@ -194,12 +208,25 @@ def cmd_wrapper(desde, path=None):
             except ValueError:
                 bad += 1
                 continue
+            if not isinstance(e, dict):
+                bad += 1
+                continue
             ts = epoch(e.get("ts"))
-            if since is not None and (ts is None or ts < since):
+            if since is not None:
+                if ts is None:  # sem data não dá para dizer que é de depois do corte: fora da conta, mas DITO
+                    bad += 1
+                    continue
+                if ts < since:
+                    continue
+            try:
+                secs = (int(e.get("secs") or 0), int(e.get("mbp_secs") or 0), int(e.get("local_secs") or 0))
+            except (TypeError, ValueError):  # segundos que não são número: a linha não entra na soma (e é contada), nunca vira 0
+                bad += 1
                 continue
             n += 1
-            ran[e.get("ran", "?")] = ran.get(e.get("ran", "?"), 0) + 1
-            sec[0] += int(e.get("secs") or 0); sec[1] += int(e.get("mbp_secs") or 0); sec[2] += int(e.get("local_secs") or 0)
+            k = str(e.get("ran", "?"))
+            ran[k] = ran.get(k, 0) + 1
+            sec[0] += secs[0]; sec[1] += secs[1]; sec[2] += secs[2]
             if e.get("session"):
                 sess.add(e["session"])
             d = str(e.get("detail") or "-")
@@ -269,6 +296,28 @@ def selftest():
                            '{"ts":"2026-10-12T10:01:00Z","session":"s","ran":"local","secs":30,"mbp_secs":0,"local_secs":30,"detail":"mbp-rc=98: x"}\nlixo\n')
         ok(cmd_wrapper(None, w) == 0, "wrapper: lê o log")
         ok(cmd_wrapper(None, os.path.join(t, "nao.jsonl")) == 2, "wrapper: log ausente = rc 2 (não finge zero execuções)")
+
+        # linhas que são JSON válido mas não são um evento, segundos que não são número, data ilegível sob --desde: contadas, sem crash
+        w2 = os.path.join(t, "w2.jsonl")
+        open(w2, "w").write('{"ts":"2026-10-12T10:00:00Z","session":"s","ran":"mbp","secs":10,"mbp_secs":10,"local_secs":0,"detail":""}\n'
+                            'null\n[1,2]\n7\n'
+                            '{"ts":"2026-10-12T10:02:00Z","session":"s","ran":"local","secs":"muito","mbp_secs":0,"local_secs":0,"detail":""}\n'
+                            '{"session":"s","ran":"local","secs":5,"mbp_secs":0,"local_secs":5,"detail":""}\n')
+
+        def run_wrapper(desde):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cmd_wrapper(desde, w2)
+            return rc, buf.getvalue()
+        rc, out = run_wrapper(None)
+        ok(rc == 0 and "execuções: 2 " in out and "mbp=1" in out and "local=1" in out, "wrapper: lixo não derruba e as 2 linhas boas entram")
+        ok("4 linha(s) ilegíveis" in out, "wrapper: null, lista, número e segundos de lixo são CONTADOS (4)")
+        rc, out = run_wrapper("2026-10-12T00:00:00Z")
+        ok(rc == 0 and "execuções: 1 " in out and "5 linha(s) ilegíveis" in out, "wrapper --desde: linha sem data é contada, não some em silêncio")
+        # `null` e `[]` não citam dispatcher_complete: irrelevantes, nem entram na conta. As duas últimas citam e não são objeto: contadas.
+        evs, bad = gate_events_from_lines(['null', '[]', '{"event":"dispatcher_complete","ts":"2026-10-10T12:00:00Z","bead":"a","result":"PASS","elapsed_s":60}',
+                                           '"dispatcher_complete"', '["dispatcher_complete"]'])
+        ok(len(evs) == 1 and bad == 2, f"gate: JSON que cita o evento e não é objeto é contado, não derruba (evs={len(evs)} bad={bad})")
     print("---")
     print("SELFTEST OK" if not fails else f"SELFTEST FALHOU ({fails})")
     return 0 if not fails else 1

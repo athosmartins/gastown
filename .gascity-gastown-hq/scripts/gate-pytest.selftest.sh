@@ -165,6 +165,20 @@ rc=$("$GP" --dir "$T/nao-existe" -- tests/test_a.py >"$T/out" 2>"$T/err"; echo $
 reset; mbp_out "1 passed in 0.1s"; GC_SESSION_NAME=gate-reviewer-xyz run -- tests/test_a.py -q >/dev/null
 rc=$(GC_SESSION_NAME=gate-reviewer-xyz run -- tests/test_a.py -q); has "log traz a sessão do revisor" "$LOG" '"session":"gate-reviewer-xyz"'
 
+# 11 log que não dá para gravar: o rc do revisor não muda, mas a falta é DITA (uma execução fora do log some do antes×depois)
+reset; mbp_out "1 passed in 0.1s"; rc=$(run -- tests/test_a.py -q); hasnt "log gravável: nenhum AVISO de log" "$T/out" 'AVISO: não consegui gravar'
+reset; rm -rf "$T/city/.gc/logs"; : > "$T/city/.gc/logs"; mbp_out "1 passed in 0.1s"
+rc=$(run -- tests/test_a.py -q); expect "log não gravável: o rc continua o do teste" 0 "$rc"
+has "log não gravável: o AVISO diz qual log" "$T/out" 'AVISO: não consegui gravar .*gate-pytest.jsonl'; has "log não gravável: a linha final sai mesmo assim" "$T/out" 'gate-pytest: ran=mbp rc=0'
+rm -f "$T/city/.gc/logs"; mkdir -p "$T/city/.gc/logs"
+
+# 12 vermelho do MBP e o rerun daqui MORRE (rc 3): o rc vale e o log NÃO diz que o aqui confirmou
+reset; mbp_red; rc=$(STUB_LOCAL_RCS=3 run -- tests/test_a.py tests/test_b.py -q); expect "rerun daqui com rc 3 vale (não vira verde)" 3 "$rc"
+has "rerun com rc 3: o log diz o rc daqui" "$LOG" 'local-rc=3'; hasnt "rerun com rc 3: o log NÃO diz que confirmou" "$LOG" 'local-confirmou'
+
+# 13 --help mostra o cabeçalho inteiro (o corte era por número de linha e perdia as variáveis de ambiente)
+"$GP" --help > "$T/help" 2>&1; has "--help traz as variáveis de ambiente" "$T/help" 'GATE_PYTEST_CITY'; hasnt "--help não vaza o código" "$T/help" 'set -o pipefail'
+
 # controle negativo A: sem a confirmação local, o caso "vermelho" PASSARIA pelo rc do MBP — o teste 4 tem de enxergar isso
 reset; mbp_red
 sed 's|run_local ${flags\[@\]+"${flags\[@\]}"} "${conf\[@\]}"; RC=\$?|RC=1|' "$GP" > "$T/mutA.sh"; chmod +x "$T/mutA.sh"
