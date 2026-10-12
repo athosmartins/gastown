@@ -21,7 +21,7 @@
 #   0..95  código do pytest/comando remoto (propagado)
 #   99  offload desligado (falta $CITY/.gc/mbp-offload.on)
 #   98  MBP indisponível/sem saúde (ssh > 5 s, RAM disponível < 3 GB, pressão de memória acima de "normal", swap
-#       CRESCENDO > 128 MB na janela de 2 s, swap usado >= 8 GB, algum desses sinais ilegível, bateria <= 40% sem
+#       CRESCENDO > 128 MB entre duas leituras com 2 s de intervalo (~3 s de relógio), swap usado >= 8 GB, algum desses sinais ilegível, bateria <= 40% sem
 #       tomada, ou ssh caiu no meio da execução). Swap usado ALTO mas parado NÃO recusa (ga-9e2rjh): o macOS não
 #       devolve swap depois de uma pressão. Cada recusa vai para o log com o motivo (campo "reason").
 #   97  configuração (uso errado, árvore-base ausente no MBP -> rode --seed)
@@ -119,7 +119,8 @@ log_refusal() { # usa REFUSAL e PF
   isnum "$a" || a=null; isnum "$s" || s=null; isint "$d" || d=null; isnum "$p" || p=null
   mkdir -p "$(dirname "$LOG")" 2>/dev/null
   printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"nargs":0,"reason":"%s","avail_mb":%s,"swap_mb":%s,"swap_delta_mb":%s,"pressure":%s}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${REFUSAL:-desconhecido}" "$a" "$s" "$d" "$p" >> "$LOG" 2>/dev/null || true
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${REFUSAL:-desconhecido}" "$a" "$s" "$d" "$p" >> "$LOG" 2>/dev/null \
+    || say "AVISO: recusa '${REFUSAL:-desconhecido}' NÃO gravada em $LOG — a contagem de 72 h (mbp-offload.sh counts) não vai incluí-la"
 }
 
 # ---- preflight: UMA chamada ssh; imprime pares k=v -------------------------------------------------------------

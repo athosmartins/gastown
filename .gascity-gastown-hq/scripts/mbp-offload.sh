@@ -24,8 +24,8 @@ RUN="$(cd "$(dirname "$0")" && pwd)/mbp-run.sh"
 
 # Contagem das últimas 72 h: "<N> execuções; recusas: <motivo>=<n> ..." ou "...; recusas: nenhuma".
 # Três estados que NUNCA se confundem: log ausente → "sem log ainda"; jq falhou/não existe/log ilegível → "ilegível" (nunca
-# "nenhuma"); lido e sem recusa → "nenhuma". Linha que não dá para ler (não é JSON objeto, ts que não vira data, ou recusa
-# sem motivo em texto) NÃO derruba a leitura e NÃO some em silêncio: vira "; N linha(s) ilegível(is) no log (não contadas)".
+# "nenhuma"); lido e sem recusa → "nenhuma". Linha que não dá para ler (não é JSON objeto, ts que não vira data, "mode" que não é
+# texto, ou recusa sem motivo em texto) NÃO derruba a leitura e NÃO some em silêncio: vira "; N linha(s) ilegível(is) no log (não contadas)".
 # Sem isso, uma linha de recusa truncada deixava "recusas: nenhuma" mentir justo na medição de "recusa indevida". Linha
 # ilegível não tem ts confiável, então conta mesmo fora da janela de 72 h (melhor avisar a mais do que esconder).
 recent_counts() {
@@ -33,14 +33,16 @@ recent_counts() {
   [ -f "$LOG" ] || { echo "sem log ainda"; return; }
   # jq que não consegue abrir o arquivo ainda imprime a conta de uma entrada vazia ("0 execuções; recusas: nenhuma") ANTES de sair
   # com erro: por isso a saída só vale se o rc for 0 (falhou → só "ilegível", nunca o veredito de uma leitura que não houve)
+  # PRECEDÊNCIA DO JQ: "A + B as $x | ..." é "(A+B) as $x" no jq 1.8.1 mas "A + (B as $x | ...)" no 1.7.1 do /usr/bin (o que o launchd,
+  # de PATH mínimo, resolve) — por isso a soma de $bad vem entre parênteses; o selftest roda estes casos sob cada jq, por caminho.
   out=$(jq -Rrs --argjson since "$(( $(date +%s) - 259200 ))" '
     [split("\n")[] | select(length > 0)
       | (try fromjson catch null)
       | if type == "object" and ((try (.ts | fromdateiso8601) catch null) | type) == "number"
         then {l: ., t: (.ts | fromdateiso8601)} else {bad: 1} end] as $e
     | [$e[] | select(.l and .t >= $since) | .l] as $w
-    | ([$e[] | select(.bad)] | length) + ([$w[] | select(.mode == "preflight" and (.reason | type) != "string")] | length) as $bad
-    | ([$w[] | select(.mode != "preflight")] | length) as $runs
+    | (([$e[] | select(.bad)] | length) + ([$w[] | select((.mode | type) != "string" or (.mode == "preflight" and (.reason | type) != "string"))] | length)) as $bad
+    | ([$w[] | select((.mode | type) == "string" and .mode != "preflight")] | length) as $runs
     | [$w[] | select(.mode == "preflight" and (.reason | type) == "string")] as $ref
     | "\($runs) execuções; recusas: " + (if ($ref | length) == 0 then "nenhuma" else ($ref | group_by(.reason) | map("\(.[0].reason)=\(length)") | join(" ")) end)
       + (if $bad > 0 then "; \($bad) linha(s) ilegível(is) no log (não contadas)" else "" end)

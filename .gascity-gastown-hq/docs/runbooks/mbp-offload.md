@@ -51,7 +51,7 @@ O preflight faz UMA chamada ssh e recusa (rc 98) por um destes motivos; cada rec
 | `inalcancavel` | ssh não respondeu em 5 s ou caiu | — |
 | `ram` | RAM disponível (free+inactive+speculative) abaixo do mínimo | 3072 MB |
 | `pressao` | nível de pressão de memória do kernel acima de normal (1 normal, 2 aviso, 4 crítico) | nível 1 |
-| `swap_cresce` | o swap usado CRESCEU mais que o limite entre duas leituras | 128 MB em 2 s |
+| `swap_cresce` | o swap usado CRESCEU mais que o limite entre duas leituras | 128 MB entre duas leituras com 2 s de intervalo (~3 s de relógio, medido) |
 | `swap_teto` | swap usado igual ou acima do teto absoluto | 8192 MB |
 | `bateria` | na bateria (sem tomada) com carga igual ou abaixo do mínimo | 40% |
 | `ilegivel:<campo>` | o MBP não deu para ler `avail`, `pressure`, `swap_delta`, `swap`, `power` (tomada ou bateria) ou, na bateria, `batt` (a carga) | — |
@@ -75,4 +75,5 @@ O swap usado, sozinho, NÃO recusa até o teto: o macOS não devolve swap depois
 ## Limites conhecidos
 - **Swap do MBP (resolvido em ga-9e2rjh):** o macOS não devolve o arquivo de swap depois de uma pressão; o MBP ocioso fica em 4,9-5,2 GB "usados". O limiar fixo de 5 GB recusou, em 11/10, uma execução com 5.248 MB de swap e 3,8 GB de RAM disponível. O critério agora é RAM + pressão + crescimento do swap (tabela acima), e o limiar de swap virou só um teto absoluto, que subiu de 5 para 8 GB. Medição de aceite: recusas indevidas = 0 em 3 dias. Conferir com `scripts/mbp-offload.sh counts` (ou a linha "últimas 72 h" do `status`): recusa por `swap_teto` ou `swap_cresce` com RAM e pressão normais é o sinal de que o critério precisa de ajuste; `ilegivel:*` é o MBP respondendo lixo, não swap alto. A contagem tem três respostas que não se confundem: `sem log ainda`, `ilegível` (o log existe mas não deu para ler) e `recusas: nenhuma` (lido, e sem recusa). Linha do log que não deu para ler (truncada, sem motivo, data inválida) vem avisada no fim ("N linha(s) ilegível(is) no log"): se aparecer, a contagem não está completa, então olhe o log antes de concluir "0 recusas indevidas".
 - Teste que lê `shared/data/*.db` falha no MBP (os bancos não são enviados): o runner imprime uma nota; rode esse teste local.
-- Cada execução paga ~6 s de ssh/rsync; testes de menos de ~10 s não valem o offload.
+- Cada execução paga ~6 s de ssh/rsync mais o preflight (intervalo de 2 s entre as duas leituras do swap + o tempo das leituras: ~3 s medidos de relógio); testes de menos de ~10 s não valiam o offload e agora valem menos ainda.
+- A linha "MBP SEM SAÚDE (rc=98)" do `status` mostra só os pares `chave=valor` crus; o MOTIVO (`ram`, `swap_cresce`...) só aparece para recusas de execuções reais, que vão para o log (`mbp-offload.sh counts` e as últimas linhas do `status`); o `--check` que o `status` roda não grava recusa, então para ver "por que agora?" leia os pares `chave=valor` contra a tabela acima.

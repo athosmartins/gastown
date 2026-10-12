@@ -156,6 +156,11 @@ has "inalcançável vai ao log com motivo" "$J" '"reason":"inalcancavel".*"avail
 reset; rc=$(STUB_AVAIL_MB=1000 run -- tests/test_x.py); expect "RAM baixa" 98 "$rc"; has "msg RAM" "$T/err" 'sem RAM'
 hasnt "RAM baixa não pega slot" "$STUB_LOG" 'SLOT_ACQUIRE'
 has "RAM baixa vai ao log com motivo e número" "$J" '"reason":"ram".*"avail_mb":1000'
+hasnt "recusa gravada no log não emite AVISO" "$T/err" 'AVISO'
+# 3b a recusa que NÃO coube no log (aqui o caminho do log é um diretório) é AVISADA: a contagem de 72 h é a medida de aceitação,
+#    e sem o aviso "recusas: nenhuma" mentiria — o rc segue 98 (o chamador roda local do mesmo jeito)
+reset; mkdir -p "$J"; rc=$(STUB_AVAIL_MB=1000 run -- tests/test_x.py); expect "recusa com log não gravável: rc segue 98" 98 "$rc"
+has "recusa que não coube no log é avisada com o motivo" "$T/err" "AVISO: recusa 'ram' NÃO gravada"; rmdir "$J"
 # 5 bateria baixa sem tomada
 reset; rc=$(STUB_POWER=battery STUB_BATT=30 run -- tests/test_x.py); expect "bateria baixa" 98 "$rc"; has "bateria vai ao log" "$J" '"reason":"bateria"'
 # 5b bateria ok sem tomada passa
@@ -256,23 +261,43 @@ n=$((n+1)); if [ ! -e "$J" ]; then echo "ok   --seed não grava recusa no log"; 
 # 25 a contagem de 72 h do mbp-offload.sh (é por ela que se mede "recusa indevida"): três estados que não se confundem, e linha
 #    ilegível AVISADA, nunca omitida — senão uma recusa truncada deixava "recusas: nenhuma" mentir
 OFFLOAD="${MBP_OFFLOAD_UNDER_TEST:-$HERE/mbp-offload.sh}"
-cnt() { bash "$OFFLOAD" counts 2>&1; }
+# A MESMA jq NÃO lê igual em toda parte (ga-9e2rjh, gate-fix 1): "A + B as $x | ..." é "(A+B) as $x" no jq 1.8.1 (homebrew) e
+# "A + (B as $x | ...)" no 1.7.1-apple do /usr/bin — o que o launchd, de PATH mínimo, resolve. Os casos abaixo rodam portanto UMA
+# VEZ por jq conhecido, cada um FIXADO por caminho absoluto na frente do PATH (JQPIN), além do jq que o PATH do ambiente der.
+# Um jq que não existe neste host é AVISADO ("SKIP"), nunca contado como ok: cobertura que sumiu tem de aparecer.
+JQPIN=""
+cnt() { PATH="${JQPIN:+$JQPIN:}$PATH" bash "$OFFLOAD" counts 2>&1; }
 t_now=$(date -u +%Y-%m-%dT%H:%M:%SZ); t_old=$(date -u -v-5d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '5 days ago' +%Y-%m-%dT%H:%M:%SZ)
 l_run() { printf '{"ts":"%s","repo":"wa","mode":"pytest","slot":"1","rc":0,"secs":4,"nargs":2}\n' "$t_now"; }
 l_ref() { printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"nargs":0,"reason":"%s"}\n' "${2:-$t_now}" "$1"; }
-reset; eq "contagem: sem log" "sem log ainda" "$(cnt)"
-reset; mkdir -p "$(dirname "$J")"; : > "$J"; eq "contagem: log vazio é 0, não ilegível" "0 execuções; recusas: nenhuma" "$(cnt)"
+counts_cases() { # rótulo do jq sob teste (vai no nome de cada caso)
+local L="$1"
+reset; eq "contagem[$L]: sem log" "sem log ainda" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; : > "$J"; eq "contagem[$L]: log vazio é 0, não ilegível" "0 execuções; recusas: nenhuma" "$(cnt)"
 reset; mkdir -p "$(dirname "$J")"; { l_run; l_run; l_ref ram; l_ref ram; l_ref swap_cresce; l_ref ram "$t_old"; } > "$J"
-eq "contagem: por motivo, e recusa de 5 dias atrás fica fora" "2 execuções; recusas: ram=2 swap_cresce=1" "$(cnt)"
-reset; mkdir -p "$(dirname "$J")"; l_run > "$J"; eq "contagem: lido e sem recusa" "1 execuções; recusas: nenhuma" "$(cnt)"
+eq "contagem[$L]: por motivo, e recusa de 5 dias atrás fica fora" "2 execuções; recusas: ram=2 swap_cresce=1" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; l_run > "$J"; eq "contagem[$L]: lido e sem recusa" "1 execuções; recusas: nenhuma" "$(cnt)"
 reset; mkdir -p "$(dirname "$J")"; { l_run; l_ref ram; printf '{"ts":"%s","repo":"-","mode":"pref' "$t_now"; echo; } > "$J"
-eq "contagem: linha de recusa truncada é avisada e o resto conta" "1 execuções; recusas: ram=1; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+eq "contagem[$L]: linha de recusa truncada é avisada e o resto conta" "1 execuções; recusas: ram=1; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
 reset; mkdir -p "$(dirname "$J")"; { l_run; printf '{"ts":"%s","mode":"preflight","rc":98}\n' "$t_now"; } > "$J"
-eq "contagem: recusa sem motivo não vira 'nenhuma' em silêncio" "1 execuções; recusas: nenhuma; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+eq "contagem[$L]: recusa sem motivo não vira 'nenhuma' em silêncio" "1 execuções; recusas: nenhuma; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
 reset; mkdir -p "$(dirname "$J")"; { l_run; printf '{"ts":"ontem","mode":"preflight","rc":98,"reason":"ram"}\n'; } > "$J"
-eq "contagem: ts que não vira data é avisado" "1 execuções; recusas: nenhuma; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+eq "contagem[$L]: ts que não vira data é avisado" "1 execuções; recusas: nenhuma; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
 reset; mkdir -p "$(dirname "$J")"; { l_run; echo null; echo 42; } > "$J"
-eq "contagem: linha que não é objeto é avisada" "1 execuções; recusas: nenhuma; 2 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+eq "contagem[$L]: linha que não é objeto é avisada" "1 execuções; recusas: nenhuma; 2 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; { l_run; printf '{"ts":"%s","repo":"x"}\n' "$t_now"; printf '{"ts":"%s","mode":7}\n' "$t_now"; } > "$J"
+eq "contagem[$L]: linha com ts mas sem 'mode' em texto é avisada, não vira execução" "1 execuções; recusas: nenhuma; 2 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+}
+JQPIN=""; counts_cases "jq do PATH"
+for cand in /usr/bin/jq /opt/homebrew/bin/jq; do
+  if [ -x "$cand" ]; then
+    d="$T/jqpin$(printf '%s' "$cand" | tr '/' '_')"; mkdir -p "$d"; ln -sf "$cand" "$d/jq"
+    JQPIN="$d"; counts_cases "$cand $("$cand" --version 2>&1)"
+  else
+    echo "SKIP contagem sob $cand: não existe neste host (esse jq NÃO foi exercitado)"
+  fi
+done
+JQPIN=""
 reset; mkdir -p "$(dirname "$J")"; l_run > "$J"; chmod 000 "$J"; eq "contagem: log sem permissão de leitura é 'ilegível', nunca 'nenhuma'" "ilegível" "$(cnt)"; chmod 644 "$J"
 reset; mkdir -p "$(dirname "$J")" "$T/nojq"; l_run > "$J"; ln -sf "$(command -v date)" "$T/nojq/date"; ln -sf "$(command -v dirname)" "$T/nojq/dirname"
 eq "contagem: jq ausente é 'ilegível', nunca 'nenhuma'" "ilegível" "$(PATH="$T/nojq" /bin/bash "$OFFLOAD" counts 2>&1)"
