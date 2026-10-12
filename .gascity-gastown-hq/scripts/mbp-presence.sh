@@ -16,7 +16,7 @@
 #           PreventUserIdleDisplaySleep: sem tecla há 10 min numa reunião NÃO é "fora").
 #   uso     todo o resto: input recente, tela acesa por app, ou leitura que falhou (ioreg/plutil/pmset ausente, vazio, ilegível).
 #   Leitura ilegível NUNCA vira "livre": são três estados (sei que sim / sei que não / não consegui saber) e o terceiro cai em "uso".
-#   pausa   arquivo ~/gt-remote/PAUSE no MBP (criado e apagado à mão por enquanto; os comandos de pausa vêm na fatia ga-77c1qg.2): pausado é um
+#   pausa   arquivo ~/gt-remote/PAUSE no MBP (o Athos liga com `gascity-mbp pausar`, ou o painel/mini grava): pausado é um
 #           estado à parte, informado em `paused=`; quem decide o que fazer com ele é o mbp-run.sh.
 #
 # SAÍDA (pares k=v, um por linha; ver presence_probe)
@@ -24,7 +24,7 @@
 #   locked=1|0|<vazio>   idle_s=<n>|<vazio>   display_hold=1|0|<vazio>   paused=1|0   pause_info=<quem e desde quando>
 #
 # COMO É USADO: é INCLUÍDO (cat) no começo de cada script enviado ao MBP por ssh (preflight e execução) e roda LÁ, em bash 3.2
-#   com as ferramentas da Apple; e nada mais.
+#   com as ferramentas da Apple; também é instalado em ~/gt-remote/bin/ (mbp-offload.sh install-mbp) para o `gascity-mbp`.
 #   Executado direto (`bash mbp-presence.sh`), imprime o veredito. Incluído, só define funções e variáveis PRESENCE_*.
 #
 # SEGURANÇA: o único jeito de forçar um modo é PRESENCE_FORCE_USO=1 (só PIORA: vira "uso"); não existe forçar "livre". Não escreve

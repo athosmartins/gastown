@@ -22,21 +22,25 @@ A chave é o arquivo-bandeira `$CITY/.gc/mbp-offload.on` (CITY=`/Users/athos/gt/
 ```bash
 scripts/mbp-offload.sh on        # liga
 scripts/mbp-offload.sh off       # desliga: mbp-run.sh sai 99 e todo mundo roda local
-scripts/mbp-offload.sh status    # estado, saúde do MBP (RAM, pressão, swap), últimas 5 linhas do log e recusas das últimas 72 h por motivo
-scripts/mbp-offload.sh status --json   # insumo do botão do painel (bead própria, mockup antes)
+scripts/mbp-offload.sh pause     # "pausar até eu liberar": nada novo começa e o que roda no MBP cai para prioridade de fundo (alias: pausar)
+scripts/mbp-offload.sh resume    # libera a pausa nos dois lados; só apaga a daqui depois de confirmar que a do MBP saiu (alias: liberar)
+scripts/mbp-offload.sh status    # MODO agora e por quê, o que roda no MBP, total do dia, saúde (RAM, pressão, swap), últimas 5 linhas do log e recusas das últimas 72 h
+scripts/mbp-offload.sh status --json   # insumo do botão do painel (bead própria, mockup antes): mode, mode_why, presence, idle_s, slot_cap, paused{local,mbp}, tasks[], today, healthy, health, recent
 scripts/mbp-offload.sh counts    # só a contagem de execuções e recusas por motivo das últimas 72 h (não fala com o MBP)
+scripts/mbp-offload.sh today     # só o total de hoje: "N execuções, M min no MBP (livre: a, em uso: b)" (não fala com o MBP)
+scripts/mbp-offload.sh install-mbp   # copia o `gascity-mbp` e a biblioteca de presença para ~/gt-remote/bin/ no MBP (idempotente)
 ```
-Sem daemon; o único launchd é o reseed noturno (ver Manutenção), que respeita esta chave. O botão do painel só chama este script.
+Sem daemon; o único launchd é o reseed noturno (ver Manutenção), que respeita esta chave e a pausa. O botão do painel só chama este script.
 
 ## Presença do Athos: o MBP é o notebook dele (ga-77c1qg)
 Decisão do Athos (12/10, resposta ao Mayor, no comentário de ga-sokx7u): *"usar o MBP não é indiscriminado. O Mini é dedicado como servidor e construtor / gas city e o MBP é o que uso pra trabalhar. a) quando MBP estiver idle, queremos usar 100% de sua capacidade [...] sempre que o MBP for travado, a gente detecta como idle e joga uma carga alta pra ele; b) quando eu estiver exigindo muito do MBP, nosso framework não pode de forma alguma sobrecarregá-lo mais ainda; c) manualmente eu devo poder habilitar / cancelar o uso do MBP [...] e deve ficar claro se está sendo usado ou não, e como."* Vale para toda fatia do épico (gate, workers, REA/APK, reseed).
 
 | Modo | Quando | O que o Gas City pode | Como aparece |
 |---|---|---|---|
-| **DESLIGADO** | falta a bandeira `.gc/mbp-offload.on` | nada: tudo roda local (rc 99) | `mbp-run.sh --check`: `offload_flag=off` |
-| **PAUSADO** | existe o arquivo `.gc/mbp-offload.pause` no mini **ou** `~/gt-remote/PAUSE` no MBP (quem os escreve — `mbp-offload.sh pause`, `gascity-mbp pausar` — vem na fatia 2, ga-77c1qg.2; até lá, `echo pausa > <arquivo>`) | nada novo (rc 99, motivo `pausado_mbp` se a pausa está no MBP); o que já roda lá é rebaixado em até ~5 s | o `mbp-run.sh --check` mostra `paused=1` |
-| **LIVRE** | tela do MBP **bloqueada**, **ou** sem teclado/mouse há ≥ 10 min E nenhum app segurando a tela acesa | até um slot por núcleo (12), limitado pela RAM de agora; `nice -n 10` | `mbp-run.sh --check`: `presence=livre`, `presence_why=bloqueada` |
-| **EM USO** | todo o resto: input recente, tela acesa por app (chamada/vídeo), **ou leitura que falhou** | 1 execução NO TOTAL, só com o MBP saudável, em prioridade de fundo (`taskpolicy -b` + `nice -n 19`) | `mbp-run.sh --check`: `presence=uso`, `presence_why=input_recente` |
+| **DESLIGADO** | falta a bandeira `.gc/mbp-offload.on` | nada: tudo roda local (rc 99) | `status`: `Modo: DESLIGADO` |
+| **PAUSADO** | `.gc/mbp-offload.pause` no mini (painel/`pause`) **ou** `~/gt-remote/PAUSE` no MBP (`gascity-mbp pausar`) | nada novo (rc 99, motivo `pausado_mbp` se a pausa está no MBP); o que já roda lá é rebaixado em até ~5 s | `Modo: PAUSADO (origem=mbp\|painel desde=...)` |
+| **LIVRE** | tela do MBP **bloqueada**, **ou** sem teclado/mouse há ≥ 10 min E nenhum app segurando a tela acesa | até um slot por núcleo (12), limitado pela RAM de agora; `nice -n 10` | `Modo: LIVRE — Athos fora (tela bloqueada)` |
+| **EM USO** | todo o resto: input recente, tela acesa por app (chamada/vídeo), **ou leitura que falhou** | 1 execução NO TOTAL, só com o MBP saudável, em prioridade de fundo (`taskpolicy -b` + `nice -n 19`) | `Modo: EM USO — tratado como "Athos no MBP" (teclado/mouse há 42 s)` |
 
 **A regra de decisão** (`scripts/mbp-presence.sh`, roda NO MBP na mesma chamada ssh do preflight): só evidência positiva de "fora" libera carga alta. Lê `ioreg -n Root -d1 -a` (marca `CGSSessionScreenIsLocked` da sessão do console, via `plutil`), `HIDIdleTime` do `ioreg -c IOHIDSystem` (a entrada de input mais recente) e `pmset -g assertions` (`PreventUserIdleDisplaySleep`: chamada de vídeo/vídeo/apresentação seguram a tela; sem tecla há 10 min numa reunião **não** é "fora"). Bloqueada vence tudo (inclusive input recente: é ele digitando a senha). Os três estados (sei que sim / sei que não / não consegui saber) nunca se confundem: `ioreg`/`plutil`/`pmset` ausente, vazio, ilegível, plist sem a sessão do console, entrada de ociosidade com lixo → **EM USO** com motivo `ilegivel:*` (o status diz que não conseguiu ler; nunca finge "fora"). O único jeito de forçar é `MBP_FORCE_PRESENCE=uso` (só piora); não existe forçar "livre".
 
@@ -55,11 +59,15 @@ Decisão do Athos (12/10, resposta ao Mayor, no comentário de ga-sokx7u): *"usa
 
 Ou seja: com ele fora, `nice 10` é aceitável; com ele presente, só prioridade de fundo é invisível, e é por isso que o rebaixamento no meio existe. (O `load1` do MBP nessa medida é a média de 1 minuto e carrega a fase anterior; não separa as fases, por isso a tabela usa o primeiro plano.) `ps` mostra um processo em fundo com `nice 20`, o que serve de leitura para conferir o rebaixamento.
 
-**Seed.** `--seed` respeita a pausa (rc 99). Em uso, o receptor do rsync roda em fundo (`--rsync-path="taskpolicy -b rsync"`); livre, normal. O seed não é recusado por presença: pular a noite deixaria a base envelhecer em silêncio sempre que ele trabalhasse cedo.
+**Pausa: dois lugares, um interruptor.** `mbp-offload.sh pause` (painel/mini) grava `.gc/mbp-offload.pause` aqui **e** `~/gt-remote/PAUSE` no MBP; `gascity-mbp pausar` (no MBP) grava só o do MBP. O mini enxerga as duas, mostra a origem e quanto tempo faz. `resume` limpa os dois lados e só apaga o arquivo daqui **depois de confirmar** que o do MBP saiu: MBP inalcançável = continua pausado (estado inerte) com a saída `rc 1` explicando; `resume --local-only` apaga só o daqui. Não há expiração automática: pausa esquecida aparece no `status` com a data, e o reseed noturno vira `PULADO` (não `FALHOU`) enquanto ela durar.
+
+**No MBP: `~/gt-remote/bin/gascity-mbp`** (instalado por `mbp-offload.sh install-mbp`; nada fora de `~/gt-remote` é tocado, nenhum PATH/atalho/perfil de shell): `status` (modo, por quê, o que roda aqui, com slot de mais de 4 h marcado "provável órfão" e fora da contagem), `pausar`, `liberar`, `menubar`. **Barra de menu:** o plugin existe (`gascity-mbp menubar`, formato xbar/SwiftBar: `🟢 Gas City: N` livre · `🟠` em uso · `⏸ pausado`, com "Pausar"/"Liberar" no menu), mas o Gas City **não instala** o SwiftBar no notebook de trabalho dele sem ele pedir; para ligar: instalar o SwiftBar (gratuito) e criar nele um arquivo `gascity-mbp.10s.sh` com `exec "$HOME/gt-remote/bin/gascity-mbp" menubar`.
+
+**Seed e reseed noturno.** `--seed` respeita a pausa (rc 99; o reseed noturno registra `PULADO`, exit 0, sem notify). Em uso, o receptor do rsync roda em fundo (`--rsync-path="taskpolicy -b rsync"`); LIVRE, normal. O seed não é recusado por presença: pular a noite deixaria a base envelhecer em silêncio sempre que ele trabalhasse cedo.
 
 **Registro.** Cada linha de `mbp-run.jsonl` ganhou `"presence":"livre|uso"` (o modo em que largou) e `"demoted":0|1` (rebaixada no meio); recusas ganham `presence` e a pausa no MBP é uma recusa com `"rc":99,"reason":"pausado_mbp"`. Linhas antigas, sem `presence`, entram no total do dia como "sem presença registrada".
 
-**O que NÃO foi observado ao vivo.** O MBP estava bloqueado e ocioso o tempo todo do teste (ociosidade > 2 h): o ramo "Athos fisicamente de volta" (desbloquear, mexer no mouse) foi coberto por simulação fiel ao plist real, e o rebaixamento no meio foi observado ao vivo acionando a pausa (`~/gt-remote/PAUSE`; nice 10 → 20 em < 9 s), não por input. Conferir quando ele estiver usando: `mbp-run.sh --check` deve trazer `presence=uso` em ≤ 1 min depois que ele mexe no MBP (cada `--check` lê a presença na hora).
+**O que NÃO foi observado ao vivo.** O MBP estava bloqueado e ocioso o tempo todo do teste (ociosidade > 2 h): o ramo "Athos fisicamente de volta" (desbloquear, mexer no mouse) foi coberto por simulação fiel ao plist real, e o rebaixamento no meio foi observado ao vivo acionando a pausa (nice 10 → 20 em < 9 s), não por input. Conferir quando ele estiver usando: `mbp-offload.sh status` deve virar `EM USO` em ≤ 1 min depois que ele mexe no MBP (cada `status` lê a presença na hora).
 
 ## Como usar
 ```bash
@@ -122,7 +130,7 @@ O swap usado, sozinho, NÃO recusa até o teto: o macOS não devolve swap depois
 - `mirror/<repo>-<slot>/`: um espelho por slot (clone APFS da base na 1ª vez, depois `rsync --delete` do worktree do chamador).
 - `venv/` (WA, python3.14) e `venv-ps/` (PS, python3.11): site-packages copiados do mini (um `pip install` novo falha em `Levenshtein`); hash em `.sp-hash`.
 - `slots/N`: trava por `mkdir`; dono = `host:pid:epoch` (arquivo `owner`) e descrição `repo=… mode=… what=<arquivo de teste ou nome do comando> presence=…` (arquivo `info`; nunca argumentos de `--exec` nem `--env`); dono morto ou idade > 4 h é liberado por quem chega. N vai até o teto do modo (12 em livre).
-- `PAUSE`: a pausa do Athos (`origem=… desde=…`), lida pelo preflight e pelo vigia.
+- `PAUSE`: a pausa do Athos (`origem=mbp|painel desde=…`); `bin/gascity-mbp` e `bin/mbp-presence.sh`: o controle dele dentro do MBP.
 - `exec/N`: scratch do modo `--exec`, apagado no fim (capturas de REA nunca ficam).
 - `rea/`: REA 6.4.0 instalado com Node 22 (`brew install node@22 ghidra`, ghidra/openjdk@21/node@22 fixados com `brew pin`). O Node 25 do MBP não serve ao REA (exige 22.19+, 24.11+ ou 26+).
 - Log das execuções e das recusas do preflight: `$CITY/.gc/logs/mbp-run.jsonl` (ts, repo, modo, slot, rc, segundos; a recusa tem `"mode":"preflight"`, `reason` e os números que a causaram).

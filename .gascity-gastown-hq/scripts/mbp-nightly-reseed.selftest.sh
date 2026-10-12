@@ -12,6 +12,8 @@
 #   velho de pid vivo que não sai · $LOCK que é arquivo · mkdir que cria o lock mas o pid não grava · chave que não se
 #   consegue olhar · mtime do lock no futuro · lock tomado e reocupado em seguida. PULADO continua valendo com evidência
 #   positiva: dono vivo (inclusive de outro usuário, EPERM), com a pasta de cima sem permissão, ou lock sem pid recém-criado.
+#   PAUSA DO ATHOS (ga-77c1qg): arquivo .gc/mbp-offload.pause no mini -> PULADO sem semear nem avisar; rc 99 do mbp-run --seed
+#   (pausa gravada no MBP) -> PULADO, não FALHOU; só um repo pausado com o outro semeado -> OK; um 98 ao lado de um 99 ainda é FALHOU.
 # CONTROLES NEGATIVOS: mutantes do script que os casos têm de reprovar: sem a trava da chave, sem o notify, rc ignorado (M1-M3)
 #   e a volta de cada PULADO antigo no lugar do FALHOU (M4-M9: sem lock, lock que não sai, pid não gravado, chave ilegível,
 #   EPERM lido como morto, idade no futuro lida como recente). Os casos de permissão exigem usuário não-root (chmod não barra root).
@@ -95,6 +97,18 @@ reset; rc=$(STUB_RC_WA=98 STUB_NOTIFY_RC=1 run); expect "notify com erro" 1 "$rc
 reset; rc=$(STUB_RC_WA=98 MBP_RESEED_NOTIFY="$T/nao-existe" run); expect "notify ausente" 1 "$rc"; has "avisa ausente" "$T/out" 'WARN: .*ausente'
 # 9 lista sem repo nenhum (só espaço; variável vazia cai no padrão "wa ps" por causa do :-)
 reset; rc=$(MBP_RESEED_REPOS=" " run); expect "sem repos" 1 "$rc"; lastline FALHOU; has "notify diz que nada foi semeado" "$STUB_NOTIFY_LOG" 'nenhum repo'
+
+# 9b pausa do Athos (ga-77c1qg): é ordem dele, não falha. PULADO, sem notify, sem semear; só o arquivo existir é a evidência positiva.
+reset; echo "origem=painel desde=hoje" > "$T/city/.gc/mbp-offload.pause"; rc=$(run); expect "pausa local" 0 "$rc"; lastline PULADO
+hasnt "pausa local: não semeia" "$STUB_CALLS" '.'; hasnt "pausa local: não avisa" "$STUB_NOTIFY_LOG" '.'; has "pausa local: diz de quem" "$T/out" 'MBP pausado pelo Athos .*origem=painel'
+rm -f "$T/city/.gc/mbp-offload.pause"
+# pausa gravada no MBP: o mbp-run --seed responde 99 -> PULADO (não FALHOU), sem notify
+reset; rc=$(STUB_RC_WA=99 STUB_RC_PS=99 run); expect "pausa no MBP (rc 99 nos dois repos)" 0 "$rc"; lastline PULADO; hasnt "pausa no MBP: sem notify" "$STUB_NOTIFY_LOG" '.'
+has "pausa no MBP: diz o motivo" "$T/out" 'pausado pelo Athos'; has "jsonl registra PULADO:99" "$JSONL" 'wa=PULADO:99'
+# um repo semeou e o outro pegou a pausa no meio: não é falha
+reset; rc=$(STUB_RC_PS=99 run); expect "wa ok e ps pausado" 0 "$rc"; lastline OK; has "jsonl: wa OK e ps PULADO" "$JSONL" 'wa=OK:0 ps=PULADO:99'
+# 99 não esconde um 98 ao lado: o 98 continua FALHOU
+reset; rc=$(STUB_RC_WA=98 STUB_RC_PS=99 run); expect "wa 98 e ps 99: o 98 ainda falha" 1 "$rc"; lastline FALHOU
 
 # 10 terceiro estado do lock e da chave (ga-wuwuk7, gate-fix): "não consegui" nunca é "tem outro rodando" nem "desligado".
 # falhou_case <rótulo> <regex da causa no notify> [semlog]  (rc em $rc): FALHOU, 1 notify que nomeia a causa, nada semeado, nunca PULADO
@@ -195,6 +209,13 @@ fi
 # M9: mtime no futuro lido como "recém-criado" (idade negativa)
 sc_future_lock; if mutant "$T/m9.sh" 's/^  \[ "\$a" -ge 0 \] || return 1.*$/  true/'; then
   rc=$(run "$T/m9.sh"); mutant_pulou "M9 (idade negativa lida como recente volta a PULADO — o caso 'mtime no futuro' pega)"; fi
+# M10: rc 99 (pausa no MBP) tratado como falha comum
+reset; if mutant "$T/m10.sh" 's/elif \[ "\$rc" -eq 99 \]; then/elif false; then/'; then
+  rc=$(STUB_RC_WA=99 STUB_RC_PS=99 run "$T/m10.sh"); n=$((n+1)); if [ "$rc" = 1 ] && tail -n 1 "$T/out" | grep -q 'VEREDITO: FALHOU'; then echo "ok   M10 (rc 99 sem o ramo próprio vira FALHOU — o caso 'pausa no MBP' pega)"; else echo "FAIL M10: mutante não virou FALHOU (rc=$rc)"; fails=$((fails+1)); fi; fi
+# M11: sem a checagem da pausa local, o reseed semearia em cima de um MBP pausado
+reset; echo "origem=painel desde=hoje" > "$T/city/.gc/mbp-offload.pause"; if mutant "$T/m11.sh" '/^\[ -e "\$PAUSEFILE" \] && skip /s/.*/true/'; then
+  rc=$(run "$T/m11.sh"); n=$((n+1)); if [ -s "$STUB_CALLS" ]; then echo "ok   M11 (sem a checagem da pausa local semeia com o MBP pausado — o caso 'pausa local' pega)"; else echo "FAIL M11: mutante não semeou"; fails=$((fails+1)); fi; fi
+rm -f "$T/city/.gc/mbp-offload.pause"
 reset
 
 echo "---"; echo "$((n-fails))/$n ok"

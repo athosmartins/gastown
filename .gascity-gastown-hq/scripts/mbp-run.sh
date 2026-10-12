@@ -16,6 +16,8 @@
 #         `-- sh -c 'rea ... > out.json'`.)
 #   mbp-run.sh --seed wa|ps          # (re)semeia a árvore-base e o site-packages do MBP (com checagem de hash)
 #   mbp-run.sh --check               # imprime a saúde do MBP (preflight, com a presença do Athos e as tarefas em curso) e sai
+#   mbp-run.sh --remote-pause on|off # grava/remove ~/gt-remote/PAUSE no MBP (a chave "pausar até eu liberar"; quem chama é o mbp-offload.sh)
+#   mbp-run.sh --install-tools       # copia mbp-presence.sh e mbp-controle.sh (como `gascity-mbp`) para ~/gt-remote/bin/ no MBP
 #
 # CÓDIGOS DE SAÍDA — qualquer 96..99 significa "rode local": quem chama NUNCA trata isso como falha de teste.
 #   0..95  código do pytest/comando remoto (propagado)
@@ -40,7 +42,7 @@
 #   processos da execução cai para prioridade de fundo na hora; nada novo começa. Nunca volta a subir (rebaixar é o lado seguro).
 #   MBP_FORCE_PRESENCE=uso trata o MBP como "em uso" (só piora; não existe forçar "livre"). Cada linha do log traz `presence` e `demoted`.
 #
-# TOGGLE: scripts/mbp-offload.sh on|off|status (arquivo-bandeira; o botão do painel é a bead de painel).
+# TOGGLE: scripts/mbp-offload.sh on|off|pause|resume|status (arquivo-bandeira; o botão do painel é a bead de painel).
 # COMO FUNCIONA: preflight (1 ssh) -> slot (mkdir atômico em ~/gt-remote/slots/N, dono=host:pid:epoch, reaping de
 #   dono morto/idade) -> espelho por slot (~/gt-remote/mirror/<repo>-N, clone APFS da base na 1ª vez) -> rsync do
 #   worktree do chamador -> pytest no venv do MBP com nice -> stream -> libera o slot -> log jsonl.
@@ -55,6 +57,7 @@ PAUSEFILE="$CITY/.gc/mbp-offload.pause"
 LOG="$CITY/.gc/logs/mbp-run.jsonl"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PRESENCE_LIB="$HERE/mbp-presence.sh"
+CONTROLE="$HERE/mbp-controle.sh"
 MIN_AVAIL_MB=${MBP_MIN_AVAIL_MB:-3072}
 MAX_SWAP_MB=${MBP_MAX_SWAP_MB:-8192}               # TETO absoluto do swap usado; sozinho não decide mais (era 5120, ga-9e2rjh)
 MAX_SWAP_GROWTH_MB=${MBP_MAX_SWAP_GROWTH_MB:-128}  # swap que CRESCE mais que isto na janela abaixo = o MBP está trocando memória agora
@@ -98,6 +101,7 @@ say() { printf 'mbp-run: %s\n' "$*" >&2; }
 usage() { sed -n '2,/^[^#]/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//' >&2; }   # só o bloco de comentário do topo (o limite fixo 2,36 vazava código quando o cabeçalho mudava)
 
 repo=""; dir="$PWD"; mode=pytest; seed_repo=""
+pause_arg=""
 pushes=(); pulls=(); envs=(); keep=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -106,6 +110,8 @@ while [ $# -gt 0 ]; do
     --exec) mode=exec; shift ;;
     --seed) mode=seed; seed_repo="${2:-}"; shift 2 ;;
     --check) mode=check; shift ;;
+    --remote-pause) mode=remote_pause; pause_arg="${2:-}"; shift 2 ;;
+    --install-tools) mode=install_tools; shift ;;
     --push) pushes+=("${2:-}"); shift 2 ;;
     --pull) pulls+=("${2:-}"); shift 2 ;;
     --env) envs+=("${2:-}"); shift 2 ;;
@@ -444,6 +450,37 @@ if [ "$mode" = check ]; then
   exit $rc
 fi
 
+# ---- a chave "pausar até eu liberar" do lado do MBP (~/gt-remote/PAUSE); quem chama é o mbp-offload.sh ----------------
+if [ "$mode" = remote_pause ]; then
+  case "$pause_arg" in
+    on)  line="origem=${MBP_PAUSE_ORIGIN:-painel} desde=$(date +%Y-%m-%dT%H:%M:%S%z)"
+         "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "mkdir -p gt-remote && printf '%s\n' '$line' > gt-remote/PAUSE" || { say "não consegui gravar a pausa no MBP"; exit 98; }
+         say "pausa gravada no MBP ($line)"; exit 0 ;;
+    off) out=$("$SSH_BIN" $SSH_OPTS "$MBP_HOST" 'if [ -e gt-remote/PAUSE ]; then rm -f gt-remote/PAUSE; if [ -e gt-remote/PAUSE ]; then echo STILL; else echo REMOVED; fi; else echo ABSENT; fi' 2>/dev/null) || { say "MBP inalcançável: não sei se a pausa de lá foi removida"; exit 98; }
+         case "$out" in
+           REMOVED) say "pausa removida do MBP"; exit 0 ;;
+           ABSENT) say "o MBP não tinha pausa"; exit 0 ;;
+           *) say "a pausa do MBP NÃO saiu (${out:-sem resposta})"; exit 98 ;;
+         esac ;;
+    *) say "uso: --remote-pause on|off"; exit 97 ;;
+  esac
+fi
+
+# ---- instala no MBP o que o Athos usa de lá: o comando `gascity-mbp` (pausar/liberar/status/barra de menu) e a biblioteca de presença
+# Também roda ao fim de cada --seed (o reseed noturno): "mergeado ≠ vivo" — a cópia que mora no MBP acompanha o repositório em até um dia.
+install_tools() {
+  [ -r "$PRESENCE_LIB" ] && [ -r "$CONTROLE" ] || { say "faltam $PRESENCE_LIB ou $CONTROLE"; return 97; }
+  "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "mkdir -p gt-remote/bin" || { say "MBP inalcançável"; return 98; }
+  "$RSYNC_BIN" -a -e "$SSH_BIN $SSH_OPTS" "$PRESENCE_LIB" "$MBP_HOST:gt-remote/bin/mbp-presence.sh" || { say "rsync de mbp-presence.sh falhou"; return 98; }
+  "$RSYNC_BIN" -a -e "$SSH_BIN $SSH_OPTS" "$CONTROLE" "$MBP_HOST:gt-remote/bin/gascity-mbp" || { say "rsync de gascity-mbp falhou"; return 98; }
+  "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "chmod 755 gt-remote/bin/mbp-presence.sh gt-remote/bin/gascity-mbp" || { say "chmod falhou"; return 98; }
+}
+if [ "$mode" = install_tools ]; then
+  install_tools || exit $?
+  say "instalado: ~/gt-remote/bin/gascity-mbp (pausar | liberar | status | menubar) e mbp-presence.sh"; exit 0
+fi
+# fim de cada seed: atualiza as ferramentas do MBP sem nunca falhar a semeadura por causa delas (a base é o que importa à noite)
+refresh_tools() { install_tools >/dev/null 2>&1 || say "AVISO: não atualizei ~/gt-remote/bin no MBP (gascity-mbp); rode: mbp-offload.sh install-mbp"; }
 if [ "$mode" = seed ]; then
   case "$seed_repo" in wa|ps) ;; *) say "uso: --seed wa|ps"; exit 97 ;; esac
   [ -e "$PAUSEFILE" ] && { say "pausado pelo Athos ($PAUSEFILE) — não semeio"; exit 99; }
@@ -459,11 +496,16 @@ if [ "$mode" = seed ]; then
   pyver=$(echo "$sp" | sed -n 's#.*/lib/\(python3\.[0-9]*\)/site-packages#\1#p')
   hash=$(ls "$sp" | grep -E '\.dist-info$' | LC_ALL=C sort | shasum | awk '{print $1}')
   rhash=$("$SSH_BIN" $SSH_OPTS "$MBP_HOST" "cat gt-remote/$rv/.sp-hash 2>/dev/null")
-  if [ "$hash" = "$rhash" ]; then say "site-packages do MBP já bate (hash ${hash:0:12})"; exit 0; fi
+  if [ "$hash" = "$rhash" ]; then say "site-packages do MBP já bate (hash ${hash:0:12})"
+    refresh_tools
+    exit 0
+  fi
   "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "zsh -lc 'test -d gt-remote/$rv || $pyver -m venv gt-remote/$rv'" || { say "venv no MBP falhou ($pyver)"; exit 98; }
   "$RSYNC_BIN" -a --delete --exclude __pycache__ "${RSYNC_PATH_OPT[@]+"${RSYNC_PATH_OPT[@]}"}" -e "$SSH_BIN $SSH_OPTS" "$sp"/ "$MBP_HOST:gt-remote/$rv/lib/$pyver/site-packages/" || exit 98
   "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "echo $hash > gt-remote/$rv/.sp-hash"
-  say "seed $seed_repo ok (hash $hash)"; exit 0
+  say "seed $seed_repo ok (hash $hash)"
+  refresh_tools
+  exit 0
 fi
 
 # ---- caminho normal (pytest | exec) ----------------------------------------------------------------------------

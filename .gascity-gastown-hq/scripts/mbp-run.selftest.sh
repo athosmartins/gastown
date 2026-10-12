@@ -22,8 +22,8 @@
 #   cai em "uso", nunca em "livre" · só dá para forçar PIORAR (nunca forçar "livre"). mbp-run: teto de slots por modo (núcleos, RAM,
 #   1 em uso, total e não só números baixos), pausa (local e no MBP) rc 99 antes da saúde, seed em fundo, e a execução SUPERVISIONADA
 #   rodando de verdade sob bash com python/taskpolicy/renice falsos: prioridade na largada, rebaixamento no meio da execução quando o
-#   Athos volta ou pausa, sem atrasar o fim da execução nem deixar processo para trás. MBP_SELFTEST_ONLY=presenca roda só esta parte
-#   (a chave manual, o status e o gascity-mbp têm a suíte da fatia ga-77c1qg.2);
+#   Athos volta ou pausa, sem atrasar o fim da execução nem deixar processo para trás. mbp-offload: modos do status, tarefas órfãs,
+#   JSON, total do dia (sob cada jq), pause/resume. gascity-mbp (mbp-controle.sh). MBP_SELFTEST_ONLY=presenca|chave roda só essa parte;
 #   MBP_SELFTEST_SKIP=presenca pula a presença (a suíte antiga, sozinha, cabe nos 900 s do prod test do ga-9e2rjh).
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
@@ -423,6 +423,146 @@ reset; rmdir "$T/home/gt-remote/mirror/wa-1"; rc=$(STUB_RUNMODE=exec runs -- tes
 reset
 }
 
+# ---- A CHAVE MANUAL, O STATUS E O CONTROLE DENTRO DO MBP (ga-77c1qg.2) --------------------------------------------------
+CONTROLE="$HERE/mbp-controle.sh"
+OFFL="${MBP_OFFLOAD_UNDER_TEST:-$HERE/mbp-offload.sh}"
+tdy() { PATH="${JQPIN:+$JQPIN:}$PATH" MBP_CITY="$T/city" bash "$OFFL" today 2>&1; }
+t_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+t_ayer=$(date -u -v-30H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '30 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+r_line() { printf '{"ts":"%s","repo":"wa","mode":"pytest","slot":"1","rc":0,"secs":%s,"nargs":2%s}\n' "$1" "$2" "$3"; }
+chave_cases() {
+echo "--- chave manual, status e gascity-mbp (ga-77c1qg.2)"
+reset
+# --- chave de pausa do lado do MBP e instalação das ferramentas ---
+reset; STUB_DIRECT_OUT=REMOVED "$RUN" --remote-pause off >"$T/out" 2>"$T/err"; expect "--remote-pause off: removida" 0 "$?"
+reset; STUB_DIRECT_OUT=ABSENT "$RUN" --remote-pause off >"$T/out" 2>"$T/err"; expect "--remote-pause off: já não havia" 0 "$?"
+reset; "$RUN" --remote-pause off >"$T/out" 2>"$T/err"; expect "--remote-pause off sem resposta do MBP: NÃO diz que saiu (98)" 98 "$?"
+reset; STUB_DIRECT_OUT=STILL "$RUN" --remote-pause off >"$T/out" 2>"$T/err"; expect "--remote-pause off: o arquivo continuou lá (98)" 98 "$?"
+reset; STUB_UNREACHABLE=1 "$RUN" --remote-pause off >"$T/out" 2>"$T/err"; expect "--remote-pause off com MBP inalcançável (98)" 98 "$?"
+reset; "$RUN" --remote-pause on >"$T/out" 2>"$T/err"; expect "--remote-pause on" 0 "$?"; has "grava origem e data no MBP" "$STUB_LOG" "DIRECT:.*gt-remote/PAUSE"
+reset; STUB_DIRECT_RC=1 "$RUN" --remote-pause on >"$T/out" 2>"$T/err"; expect "--remote-pause on que falha (98)" 98 "$?"
+reset; "$RUN" --remote-pause talvez >"$T/out" 2>"$T/err"; expect "--remote-pause com argumento inválido (97)" 97 "$?"
+reset; "$RUN" --install-tools >"$T/out" 2>"$T/err"; expect "--install-tools" 0 "$?"
+has "instala a biblioteca" "$STUB_LOG" 'RSYNC:.*mbp-presence\.sh.*gt-remote/bin/mbp-presence\.sh'; has "instala o gascity-mbp" "$STUB_LOG" 'RSYNC:.*mbp-controle\.sh.*gt-remote/bin/gascity-mbp'
+has "dá permissão de execução" "$STUB_LOG" 'DIRECT:.*chmod 755 gt-remote/bin/mbp-presence\.sh gt-remote/bin/gascity-mbp'
+# o seed (reseed noturno) atualiza as ferramentas do MBP no fim e NUNCA falha por causa delas
+if ls -d /Users/athos/gt/whatsapp_automation/venv/lib/python3.*/site-packages >/dev/null 2>&1; then
+  reset; "$RUN" --seed wa >"$T/out" 2>"$T/err"; expect "--seed completo" 0 "$?"; has "o seed termina atualizando o gascity-mbp" "$STUB_LOG" 'RSYNC:.*mbp-controle\.sh.*gt-remote/bin/gascity-mbp'
+  reset; STUB_RSYNC_FAIL_BIN=1 "$RUN" --seed wa >"$T/out" 2>"$T/err"; expect "--seed com a atualização das ferramentas falhando: a semeadura não falha" 0 "$?"; has "avisa que não atualizou" "$T/err" 'AVISO: não atualizei ~/gt-remote/bin'
+else echo "SKIP --seed completo: venv local do WA ausente neste host (esse caminho NÃO foi exercitado)"; fi
+
+# --- mbp-offload: modos do status, tarefas órfãs, JSON, pause/resume ---
+cat > "$T/bin/fake-check" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "--check" ]; then printf '%b\n' "${STUB_CHECK_OUT:-}"; exit "${STUB_CHECK_RC:-0}"; fi
+echo "fake-run: $*" >> "$STUB_LOG"; exit "${STUB_REMOTE_RC:-0}"
+EOF
+chmod +x "$T/bin/fake-check"
+CK_LIVRE='avail_mb=8000\npressure=1\nncpu=12\npresence=livre\npresence_why=bloqueada\nlocked=1\nidle_s=8114\ndisplay_hold=0\npaused=0\npause_info=\nswap_mb=5000\nswap_delta_mb=0\noffload_flag=on\npaused_local=0\npause_local_info=\nslot_cap=12'
+st() { MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" status "$@" 2>&1; }
+reset; rm -f "$FLAG"; STUB_CHECK_OUT="$CK_LIVRE"; export STUB_CHECK_OUT
+has "status: sem a bandeira = DESLIGADO" <(st) '^Modo: DESLIGADO'
+date > "$FLAG"
+has "status: LIVRE com o porquê e o teto" <(st) '^Modo: LIVRE — Athos fora \(tela bloqueada\): até 12 tarefas ao mesmo tempo'
+export STUB_CHECK_OUT='avail_mb=8000\npresence=uso\npresence_why=input_recente\nidle_s=42\npaused=0\nslot_cap=1'
+has "status: EM USO, o porquê e 1 tarefa" <(st) '^Modo: EM USO — tratado como "Athos no MBP" \(teclado/mouse há 42 s\): no máximo 1 tarefa por vez, prioridade de fundo'
+export STUB_CHECK_OUT='presence=uso\npresence_why=tela_em_uso\nidle_s=5000\npaused=0\nslot_cap=1'
+has "status: tela segurada por app é dito" <(st) 'um app segura a tela acesa'
+export STUB_CHECK_OUT='presence=uso\npresence_why=ilegivel:presenca\nidle_s=\npaused=0\nslot_cap=1'
+has "status: presença ilegível é dita, não escondida" <(st) 'não consegui ler a presença \(presenca\): por segurança conta como em uso'
+export STUB_CHECK_OUT='presence=livre\npresence_why=bloqueada\npaused=1\npause_info=origem=mbp desde=hoje\nslot_cap=12'
+has "status: pausa no MBP = PAUSADO com a origem" <(st) '^Modo: PAUSADO \(origem=mbp desde=hoje\)'
+export STUB_CHECK_OUT='presence=livre\npresence_why=bloqueada\npaused=0\nslot_cap=12\npause_local_info=origem=painel desde=ontem'; echo "origem=painel desde=ontem" > "$FLAG_PAUSE"
+has "status: pausa local = PAUSADO com a origem" <(st) '^Modo: PAUSADO \(origem=painel desde=ontem\)'; rm -f "$FLAG_PAUSE"
+export STUB_CHECK_OUT='avail_mb=\nxx=1'; STUB_CHECK_RC=98
+has "status: MBP que não respondeu = INDEFINIDO, não 'livre' nem 'em uso'" <(st) '^Modo: INDEFINIDO — MBP inalcançável'
+hasnt "status: inalcançável não inventa tarefas" <(st) 'Rodando agora'; unset STUB_CHECK_RC
+# tarefas: viva (dono = este processo) e órfã (pid morto, mesmo host)
+HN=$(hostname -s)
+export STUB_CHECK_OUT="presence=livre\npresence_why=bloqueada\npaused=0\nslot_cap=12\ntask=1|$HN:$$:$(date +%s)|repo=wa mode=pytest what=test_x.py presence=livre|0\ntask=2|$HN:999999:$(( $(date +%s) - 120 ))|repo=wa mode=pytest what=test_y.py presence=livre|0\ntask=3|otherhost:7:$(date +%s)|repo=ps mode=exec what=rea presence=uso|0"
+st > "$T/out"
+has "status: conta só as tarefas vivas (2 de 3)" "$T/out" '^Rodando agora no MBP: 2 tarefa\(s\)'; has "status: tarefa viva descrita" "$T/out" 'slot 1: repo=wa mode=pytest what=test_x\.py'
+has "status: slot de dono morto aparece como ÓRFÃO, não como rodando" "$T/out" 'slot 2: .*test_y\.py.*\[ÓRFÃO'
+hasnt "status: a viva não é chamada de órfã" <(grep 'slot 1:' "$T/out") 'ÓRFÃO'
+# controle negativo: sem a regra do dono morto, o slot órfão contaria como tarefa rodando (3 em vez de 2)
+mutoff() { sed -e "$1" "$OFFL" > "$T/mutoff.sh"; chmod +x "$T/mutoff.sh"; cmp -s "$OFFL" "$T/mutoff.sh" && { n=$((n+1)); echo "FAIL controle $2: o sed não mudou nada"; fails=$((fails+1)); return 1; }; return 0; }
+if mutoff 's/! kill -0 "\$p" 2>\/dev\/null; then continue; fi/false; then continue; fi/' orfa; then
+  MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$T/mutoff.sh" status > "$T/outm" 2>&1; n=$((n+1))
+  if grep -q '^Rodando agora no MBP: 3 tarefa' "$T/outm"; then echo "ok   controle órfã: sem a regra o slot morto conta como rodando (3)"; else echo "FAIL controle órfã: o mutante ainda conta 2"; fails=$((fails+1)); fi; fi
+# JSON
+j=$(st --json); n=$((n+1)); if printf '%s' "$j" | jq -e . >/dev/null 2>&1; then echo "ok   status --json é JSON válido"; else echo "FAIL status --json não é JSON: $j"; fails=$((fails+1)); fi
+eq "json: modo" livre "$(printf '%s' "$j" | jq -r .mode)"; eq "json: teto" 12 "$(printf '%s' "$j" | jq -r .slot_cap)"; eq "json: 3 tarefas listadas" 3 "$(printf '%s' "$j" | jq -r '.tasks | length')"
+eq "json: chaves antigas continuam (offload, healthy, health, recent)" "true" "$(printf '%s' "$j" | jq -r 'has("offload") and has("healthy") and has("health") and has("recent")')"
+eq "json: tarefas não vazam para dentro de health" "false" "$(printf '%s' "$j" | jq -r '.health | has("task")')"
+eq "json: pausa local/MBP separadas" "false/false" "$(printf '%s' "$j" | jq -r '"\(.paused.local)/\(.paused.mbp)"')"
+export STUB_CHECK_OUT='presence=uso\npresence_why=input_recente\nidle_s=42\npaused=0\nslot_cap=1'; j=$(st --json)
+eq "json em uso: modo, ociosidade e porquê" "em_uso/42/input_recente" "$(printf '%s' "$j" | jq -r '"\(.mode)/\(.idle_s)/\(.mode_why)"')"
+mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; printf '{"ts":"%s","repo":"wa","mode":"pytest","slot":"1","rc":0,"secs":4,"nargs":2,"presen' "$t_now"; echo; } > "$J"
+j=$(st --json); n=$((n+1)); if printf '%s' "$j" | jq -e . >/dev/null 2>&1; then echo "ok   status --json continua JSON válido com linha truncada no log"; else echo "FAIL JSON quebrou com linha truncada no log"; fails=$((fails+1)); fi
+unset STUB_CHECK_OUT
+# pause / resume
+reset; unset STUB_REMOTE_RC
+MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" pause >"$T/out" 2>&1; expect "pause" 0 "$?"
+n=$((n+1)); if [ -s "$FLAG_PAUSE" ]; then echo "ok   pause grava o arquivo local ($(head -n 1 "$FLAG_PAUSE"))"; else echo "FAIL pause não gravou o arquivo"; fails=$((fails+1)); fi
+has "pause empurra a pausa para o MBP" "$STUB_LOG" 'fake-run: --remote-pause on'; hasnt "pause com MBP ok: sem aviso" "$T/out" 'AVISO'
+MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" resume >"$T/out" 2>&1; expect "resume" 0 "$?"
+n=$((n+1)); if [ ! -e "$FLAG_PAUSE" ]; then echo "ok   resume remove o arquivo local"; else echo "FAIL resume não removeu"; fails=$((fails+1)); fi
+has "resume tira a pausa do MBP" "$STUB_LOG" 'fake-run: --remote-pause off'
+reset; STUB_REMOTE_RC=98 MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" pause >"$T/out" 2>&1; expect "pause com MBP inalcançável: pausa daqui vale" 0 "$?"
+has "pause avisa que o MBP não recebeu" "$T/out" 'AVISO: o MBP não recebeu a pausa'; n=$((n+1)); if [ -s "$FLAG_PAUSE" ]; then echo "ok   a pausa local ficou"; else echo "FAIL pausa local perdida"; fails=$((fails+1)); fi
+STUB_REMOTE_RC=98 MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" resume >"$T/out" 2>&1; expect "resume sem confirmar o MBP: NÃO libera (rc 1)" 1 "$?"
+n=$((n+1)); if [ -s "$FLAG_PAUSE" ]; then echo "ok   a pausa local continua (estado inerte)"; else echo "FAIL resume apagou a pausa sem confirmar o MBP"; fails=$((fails+1)); fi
+has "resume explica o que fazer" "$T/out" 'resume --local-only'
+# controle negativo: sem confirmar que a pausa do MBP saiu, o resume apagaria a daqui (e o MBP seguiria pausado sem ninguém ver)
+if mutoff 's/elif "\$RUN" --remote-pause off >\/dev\/null 2>&1; then rm -f "\$PAUSE"/elif true; then rm -f "$PAUSE"/' resume; then
+  STUB_REMOTE_RC=98 MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$T/mutoff.sh" resume >/dev/null 2>&1; n=$((n+1))
+  if [ ! -e "$FLAG_PAUSE" ]; then echo "ok   controle resume: sem a confirmação do MBP a pausa daqui seria apagada"; else echo "FAIL controle resume: o mutante manteve a pausa"; fails=$((fails+1)); fi
+  echo "origem=painel desde=hoje" > "$FLAG_PAUSE"; fi
+: > "$STUB_LOG"; STUB_REMOTE_RC=98 MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" resume --local-only >"$T/out" 2>&1; expect "resume --local-only" 0 "$?"
+n=$((n+1)); if [ ! -e "$FLAG_PAUSE" ]; then echo "ok   --local-only remove só a daqui"; else echo "FAIL --local-only não removeu"; fails=$((fails+1)); fi
+hasnt "--local-only não tenta o MBP" "$STUB_LOG" 'fake-run: --remote-pause off'
+MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" install-mbp >/dev/null 2>&1; has "install-mbp chama o mbp-run" "$STUB_LOG" 'fake-run: --install-tools'
+MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" bogus >/dev/null 2>&1; expect "comando desconhecido: rc 2" 2 "$?"
+
+# --- gascity-mbp (mbp-controle.sh), o controle de dentro do MBP ---
+ctl() { HOME="$T/home" GASCITY_MBP_HOME="$T/home/gt-remote" PATH="$FAKE:$PATH" "$STUB_REMOTE_BASH" "$CONTROLE" "$@" 2>&1; }
+reset; ctl status > "$T/out"; has "gascity-mbp status: LIVRE" "$T/out" '^Gas City: LIVRE — você está fora \(tela bloqueada\)'
+STUB_LOCKED=0 STUB_IDLE_S=30 ctl status > "$T/out"; has "gascity-mbp status: EM USO" "$T/out" '^Gas City: EM USO — tratado como "você está no MBP" \(teclado/mouse há 30 s\)'
+ctl pausar > "$T/out"; has "pausar avisa o efeito" "$T/out" 'PAUSADO neste MBP'; has "pausar grava origem=mbp" "$T/home/gt-remote/PAUSE" '^origem=mbp desde='
+ctl status > "$T/out"; has "status depois de pausar: PAUSADO" "$T/out" '^Gas City: PAUSADO \(origem=mbp'
+eq "o mbp-run enxerga a pausa feita pelo gascity-mbp" "99:pausado_mbp" "$(outcome "$RUN")"
+ctl liberar > "$T/out"; has "liberar avisa" "$T/out" 'LIBERADO'; n=$((n+1)); if [ ! -e "$T/home/gt-remote/PAUSE" ]; then echo "ok   liberar apaga o arquivo"; else echo "FAIL liberar não apagou"; fails=$((fails+1)); fi
+reset; mkslot 1 "otherhost:1:$(date +%s)"; printf 'repo=wa mode=pytest what=test_x.py presence=livre\n' > "$T/home/gt-remote/slots/1/info"; mkslot 2 "otherhost:2:$(( $(date +%s) - 20000 ))"
+ctl status > "$T/out"; has "status: conta 1 tarefa (a velha é órfã)" "$T/out" '^Tarefas do Gas City rodando aqui: 1$'; has "status: órfã identificada" "$T/out" 'slot 2: .*provável órfão'
+ctl menubar > "$T/out"; eq "menubar livre: título" "🟢 Gas City: 1" "$(sed -n 1p "$T/out")"; has "menubar tem a ação de pausar" "$T/out" '^Pausar até eu liberar \| bash=.* param1=pausar '
+STUB_LOCKED=0 STUB_IDLE_S=30 ctl menubar > "$T/out"; eq "menubar em uso: título" "🟠 Gas City: 1" "$(sed -n 1p "$T/out")"
+echo "origem=mbp desde=x" > "$T/home/gt-remote/PAUSE"; ctl menubar > "$T/out"; eq "menubar pausado: título" "⏸ Gas City: pausado" "$(sed -n 1p "$T/out")"
+reset; GASCITY_MBP_LIB=/nonexistent ctl status > "$T/out"; rc=$?; has "sem a biblioteca: diz o que fazer" "$T/out" 'install-mbp'
+ctl bogus >/dev/null; expect "gascity-mbp comando desconhecido: rc 2" 2 "$?"
+
+# --- total do dia (sob cada jq conhecido) ---
+today_cases() { local L="$1"
+reset; eq "hoje[$L]: sem log" "sem log ainda" "$(tdy)"
+reset; mkdir -p "$(dirname "$J")"; : > "$J"; eq "hoje[$L]: log vazio é 0, não ilegível" "0 execuções, 0 min no MBP (livre: 0, em uso: 0)" "$(tdy)"
+reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre","demoted":0'; r_line "$t_now" 60 ',"presence":"uso","demoted":1'; r_line "$t_now" 30 ''
+  r_line "$t_ayer" 600 ',"presence":"livre"'; printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"nargs":0,"reason":"ram"}\n' "$t_now"; } > "$J"
+eq "hoje[$L]: separa livre/em uso/sem presença; ontem e recusa ficam fora" "3 execuções, 1 min no MBP (livre: 1, em uso: 1, sem presença registrada: 1)" "$(tdy)"
+reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; printf '{"ts":"%s","repo":"wa","mode":"pyt' "$t_now"; echo; } > "$J"
+eq "hoje[$L]: linha truncada é avisada" "1 execuções, 0 min no MBP (livre: 1, em uso: 0); 1 linha(s) ilegível(is) no log (não contadas)" "$(tdy)"
+reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; printf '{"ts":"ontem","repo":"wa","mode":"pytest","secs":1}\n'; echo null; } > "$J"
+eq "hoje[$L]: ts ilegível e linha que não é objeto são avisados" "1 execuções, 0 min no MBP (livre: 1, em uso: 0); 2 linha(s) ilegível(is) no log (não contadas)" "$(tdy)"
+}
+JQPIN=""; today_cases "jq do PATH"
+for cand in /usr/bin/jq /opt/homebrew/bin/jq; do
+  if [ -x "$cand" ]; then d="$T/jqpin$(printf '%s' "$cand" | tr '/' '_')"; mkdir -p "$d"; ln -sf "$cand" "$d/jq"; JQPIN="$d"; today_cases "$cand $("$cand" --version 2>&1)"
+  else echo "SKIP total do dia sob $cand: não existe neste host (esse jq NÃO foi exercitado)"; fi
+done
+JQPIN=""
+reset; mkdir -p "$(dirname "$J")" "$T/nojq"; r_line "$t_now" 4 '' > "$J"; ln -sf "$(command -v date)" "$T/nojq/date"; ln -sf "$(command -v dirname)" "$T/nojq/dirname"
+eq "hoje: jq ausente é 'ilegível', nunca '0 execuções'" "ilegível" "$(PATH="$T/nojq" MBP_CITY="$T/city" /bin/bash "$OFFL" today 2>&1)"
+reset
+}
+
 # ---- controles negativos da presença -------------------------------------------------------------------------------
 # Cada mutante tira UMA regra e TEM que deixar de reproduzir o resultado do script real no cenário que a regra guarda.
 mut_compare() { # rótulo esperado cenário(função) arquivo-original sed-expr destino-da-mutante
@@ -435,7 +575,7 @@ mut_compare() { # rótulo esperado cenário(função) arquivo-original sed-expr 
 }
 neg_presenca() {
   echo "--- controles negativos (presença)"
-  cp "$LIB" "$T/lib.real"; cp "$LIB" "$T/mbp-presence.sh"
+  cp "$LIB" "$T/lib.real"; cp "$LIB" "$T/mbp-presence.sh"; cp "$CONTROLE" "$T/mbp-controle.sh"
   # biblioteca: cenários que chamam a lib mutante
   sc_lib() { reset; if [ "$1" = mut ]; then LIBX="$T/lib.mut"; else LIBX=""; fi; "$2"; LIBX=""; }
   s1() { STUB_LOCKED=0 STUB_IDLE_S=5000 STUB_ASSERT_FAIL=1 verdict; }
@@ -479,6 +619,7 @@ if [ -n "${MBP_SELFTEST_ONLY:-}" ]; then
   date > "$FLAG"
   case "$MBP_SELFTEST_ONLY" in
     presenca) presenca_cases; neg_presenca ;;
+    chave) chave_cases ;;
     *) echo "MBP_SELFTEST_ONLY desconhecido: $MBP_SELFTEST_ONLY" >&2; exit 2 ;;
   esac
   echo "---"; echo "$((n-fails))/$n ok"
@@ -675,6 +816,7 @@ mutant ilegivel-batt  98:ilegivel:batt        "STUB_PMSET_RAW=Now drawing from '
 # MBP_SELFTEST_SKIP=presenca: pula a presença (o prod test antigo ga-9e2rjh tem o orçamento de 900 s da suíte antiga; a presença tem o seu em story-ga-77c1qg.*)
 if [ "${MBP_SELFTEST_SKIP:-}" != presenca ]; then
   presenca_cases; neg_presenca
+  chave_cases
 fi
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
