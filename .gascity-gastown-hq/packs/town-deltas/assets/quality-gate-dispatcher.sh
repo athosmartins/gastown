@@ -13427,6 +13427,31 @@ if [ "$RECON_RIG_COUNT" -gt 0 ]; then
         *) log "Startup reconcile: rig $RC_NAME bare $RC_BRANCH → origin ($RC_OUT)" ;;
       esac
     fi
+    # ga-7wtwvx: the reconcile above, do_merge_ff's durable landing and the survival sweep's ff_heal
+    # all move the bare main with plumbing `update-ref`, which leaves the worktree that has main
+    # checked out on its OLD index/files while its HEAD runs ahead (property_scrapers sat 121 commits
+    # behind: 105 staged "reverts" one `commit -a` from landing). main-checkout-sync.sh looks at that
+    # state every sweep — whoever moved the ref — heals a worktree that is provably a stale snapshot
+    # of main, and reports (attention:*) anything else without touching it. Independent of the
+    # reconcile result: a failed fetch above does not make a stale checkout any less stale.
+    # vazio (no output) → every worktree is in sync, nothing to log; falhou/ilegível (rc other than
+    # 0/1/2: script missing or crashed) → WARN that drift was NOT checked for this rig, sweep goes on.
+    MCS_OUT=""
+    MCS_RC=0
+    MCS_OUT=$(bash "$GC_CITY/packs/town-deltas/assets/main-checkout-sync.sh" "$RC_PATH/.repo.git" "$RC_BRANCH" 2>&1) || MCS_RC=$?
+    if [ -n "$MCS_OUT" ]; then
+      while IFS= read -r MCS_LINE; do
+        [ -n "$MCS_LINE" ] || continue
+        case "$MCS_LINE" in
+          attention:*) warn "Main-checkout sync: rig $RC_NAME: $MCS_LINE" ;;
+          *)           log  "Main-checkout sync: rig $RC_NAME: $MCS_LINE" ;;
+        esac
+      done <<< "$MCS_OUT"
+    fi
+    case "$MCS_RC" in
+      0|1|2) : ;;  # 0 in sync/healed · 2 attention (already printed) · 1 could not list worktrees (already printed)
+      *) warn "Main-checkout sync: rig $RC_NAME: script exited rc=$MCS_RC — checkout drift NOT checked this sweep (ga-7wtwvx)" ;;
+    esac
   done
 fi
 
