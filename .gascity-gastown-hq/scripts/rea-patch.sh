@@ -95,7 +95,10 @@ load_context() {
     if ! [[ "$pri" =~ $hex && "$pat" =~ $hex ]] || [ "$pri" = "$pat" ]; then
       err "UNKNOWN: manifest row for $rel has a bad or equal pristine/patched sha256"; return 2
     fi
-    [ -r "$PATCH_ROOT/$PIN/$pfile" ] || { err "UNKNOWN: patch file listed for $rel not readable: $pfile"; return 2; }
+    # An empty name would make this "$PATCH_ROOT/$PIN/" — a readable DIRECTORY — and pass; so name a plain file, no path parts.
+    if [ -z "$pfile" ] || [[ "$pfile" = */* ]] || [ ! -f "$PATCH_ROOT/$PIN/$pfile" ] || [ ! -r "$PATCH_ROOT/$PIN/$pfile" ]; then
+      err "UNKNOWN: manifest row for $rel names no readable patch file in $PATCH_ROOT/$PIN (got: '${pfile}')"; return 2
+    fi
     ROW_REL+=("$rel"); ROW_PRI+=("$pri"); ROW_PAT+=("$pat"); ROW_PATCH+=("$pfile")
   done < "$manifest"
   return 0
