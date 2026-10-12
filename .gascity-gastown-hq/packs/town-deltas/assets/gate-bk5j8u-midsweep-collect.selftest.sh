@@ -10,16 +10,22 @@
 # in lib-only mode, the real script is run as a real process in a scratch city for the child-mode checks):
 #   1. the event-log hint: only a CLOSED VERDICT bead's gate-run label is a candidate; garbage, a
 #      half-written line, other event types and non-verdict beads are not; offsets are in BYTES (a
-#      multi-byte title must not shift the next look) and a rotated file is read whole.
+#      multi-byte title must not shift the next look), a rotated file is read whole, a line the writer is
+#      still appending is left for the next look (not lost), and an unreadable file moves nothing and says so.
 #   2. the confirm step: a candidate is collected only if its run is still running, it has no non-closed
 #      verdict bead left, it is not the run this sweep is admitting, and it was not collected already.
+#      BOTH lists must be JSON arrays: an empty / null / {} / garbage list is "could not read", never "none".
 #   3. A FAKE REVIEWER THAT CLOSES THE VERDICT BEAD MID-SWEEP (a stateful fake bd + a fake child): the run is
 #      collected exactly once, a replayed event does not collect it again, a two-reviewer run is collected
 #      when the SECOND verdict closes (not lost, not early), a failed confirm read is retried at the next
-#      safe point, and the heartbeat is refreshed around the child.
+#      safe point, and the heartbeat is refreshed around the child. The confirm reads are LIVE bd reads: a bd
+#      that fails, prints nothing or prints a non-array keeps the candidate pending and starts no child — even
+#      with a warm read-cache shim holding an old "ready" answer (the REAL shim is used for that check).
 #   4. lock borrowing is proven, not assumed: a child that is not a direct child of the live holder, or whose
 #      token is not the heartbeat's, does nothing and leaves the lock alone; a valid borrower finishes without
-#      releasing the lock (its parent is still waiting); `_release_gate_lock` is a no-op for a borrower.
+#      releasing the lock (its parent is still waiting); `_release_gate_lock` is a no-op for a borrower. A
+#      refusal exits 75 (not 0) so the parent warns instead of logging a success; a child whose borrow is lost
+#      mid-pass stops before the next run and leaves the heartbeat alone; a child touches only its runs.
 #   5. the live wiring is there (safe-point calls at top level, arm before Phase C, admitting run stamped,
 #      child exit before Step 0a), and the checks have teeth: each mutation of the lock guards turns a check red.
 #
@@ -51,7 +57,7 @@ set +e   # the dispatcher turns errexit on; the harness counts failures instead
 # This FATAL is both the drift guard and the "fails on the previous HEAD" half: none of these existed before
 # ga-bk5j8u.1, so an unpatched dispatcher stops here instead of silently skipping every check below.
 for _fn in gate_event_closed_verdict_runs gate_verdict_ready_runs gate_midsweep_arm gate_midsweep_new_runs \
-           gate_midsweep_collect _gate_lock_borrow_ok _gate_run_phase_c_child; do
+           gate_midsweep_collect _gate_lock_borrow_ok _gate_run_phase_c_child _gate_midsweep_read _gate_midsweep_blind; do
   type "$_fn" >/dev/null 2>&1 || { echo "FATAL: $_fn not defined by the dispatcher (ga-bk5j8u.1 missing?)"; exit 1; }
 done
 
@@ -100,6 +106,17 @@ r5 r1" | tr '\n' ' ')" "r1 r5 "
 eq "unparseable running list → nothing is ever 'ready'" "$(gate_verdict_ready_runs "garbage" "[]" "" "r1")" ""
 eq "unparseable open list → nothing is ever 'ready'" "$(gate_verdict_ready_runs "$_RUN" "garbage" "" "r1")" ""
 eq "empty running list → nothing" "$(gate_verdict_ready_runs "[]" "[]" "" "r1")" ""
+# The THIRD state (ga-bk5j8u.1 gate attempt 1, blocking issue 1). `[]` is the legitimate "I read it: none open" and must
+# still make a run ready (control); every other shape is "I could not read it" and must not. Before the fix an empty / null /
+# {} open list came out as `[]` and r1 was READY. bd prints `[]` for none (checked live), so these are not the "none" answer.
+eq "control: open=[] (read, none open) → ready" "$(gate_verdict_ready_runs "$_RUN" "[]" "" "r1")" "r1"
+for _bad in "" "null" "{}" '"[]"' "[] []" "[1]" "true" " "; do
+  eq "open list unreadable [$_bad] → nothing is ever 'ready'" "$(gate_verdict_ready_runs "$_RUN" "$_bad" "" "r1")" ""
+done
+for _bad in "" "null" "{}" "[1]" "true"; do
+  eq "running list unreadable [$_bad] → nothing" "$(gate_verdict_ready_runs "$_bad" "[]" "" "r1")" ""
+done
+eq "no arguments at all → nothing" "$(gate_verdict_ready_runs)" ""
 
 # ── 3. gate_midsweep_new_runs: byte offsets, rotation ──────────────────────────
 echo "── 3. reading the event log: offset in BYTES, rotation, missing file ──"
@@ -118,9 +135,42 @@ ev_verdict_closed ga-a2 >> "$GATE_EVENTS_FILE"
 gate_midsweep_new_runs; eq "a later append is read from the right byte (no shift from the multi-byte line)" "$(printf '%s' "$GATE_MIDSWEEP_NEW" | tr '\n' ' ')" "ga-a2"
 ev_verdict_closed ga-a3 > "$GATE_EVENTS_FILE"       # rotation: the file is now smaller than the offset
 gate_midsweep_new_runs; eq "a rotated (shrunk) file is read whole" "$(printf '%s' "$GATE_MIDSWEEP_NEW" | tr '\n' ' ')" "ga-a3"
+# A line the writer is still in the middle of appending is NOT consumed: its second half would arrive in the next look as
+# an unparseable fragment and the event would be gone with no trace.
+ev_verdict_closed ga-b0 > "$GATE_EVENTS_FILE"
+gate_midsweep_arm
+{ ev_verdict_closed ga-b1 "revisão ✓ 日本語"; ev_verdict_closed ga-b2 | head -c 45; } >> "$GATE_EVENTS_FILE"
+gate_midsweep_new_runs; eq "complete line read, the half-written one after it is left alone" "$(printf '%s' "$GATE_MIDSWEEP_NEW" | tr '\n' ' ')" "ga-b1"
+_off_half="$GATE_MIDSWEEP_OFF"
+[ "$_off_half" -lt "$(wc -c < "$GATE_EVENTS_FILE" | tr -d ' ')" ] && ok "…and the offset stops BEFORE the unfinished line (off=$_off_half)" || bad "the offset moved past the unfinished line"
+gate_midsweep_new_runs; eq "…looking again before the writer finishes finds nothing and moves nothing" "$GATE_MIDSWEEP_NEW|$GATE_MIDSWEEP_OFF" "|$_off_half"
+ev_verdict_closed ga-b2 | tail -c +46 >> "$GATE_EVENTS_FILE"
+gate_midsweep_new_runs; eq "the writer finishes the line → the event is seen (not lost to the fragment)" "$(printf '%s' "$GATE_MIDSWEEP_NEW" | tr '\n' ' ')" "ga-b2"
+eq "…and the offset is now the file size" "$GATE_MIDSWEEP_OFF" "$(wc -c < "$GATE_EVENTS_FILE" | tr -d ' ')"
+ev_verdict_closed ga-b3 | head -c 30 >> "$GATE_EVENTS_FILE"; _off_before="$GATE_MIDSWEEP_OFF"
+gate_midsweep_new_runs; eq "new bytes with no newline at all: nothing consumed, offset unmoved" "$GATE_MIDSWEEP_NEW|$GATE_MIDSWEEP_OFF" "|$_off_before"
+ev_verdict_closed ga-b3 | tail -c +31 >> "$GATE_EVENTS_FILE"
+
+# An unreadable file (3rd state): nothing is read, the offset does not move (the bytes are read again once it is readable),
+# and the sweep says so ONCE — "feature blind" must not look like "feature on, nothing closed".
+: > "$LOGF"; GATE_MIDSWEEP_BLIND_LOGGED=0; _off_before="$GATE_MIDSWEEP_OFF"
+chmod 000 "$GATE_EVENTS_FILE"
+if [ -r "$GATE_EVENTS_FILE" ]; then
+  echo "  skip unreadable-file checks (this user can read a mode-000 file, e.g. root)"
+else
+  gate_midsweep_new_runs; eq "unreadable file: no candidates, offset unmoved" "$GATE_MIDSWEEP_NEW|$GATE_MIDSWEEP_OFF" "|$_off_before"
+  gate_midsweep_new_runs
+  eq "…the sweep logged that it is blind, exactly once" "$(grep -c 'Mid-sweep collection is blind this sweep' "$LOGF")" "1"
+  chmod 644 "$GATE_EVENTS_FILE"
+  gate_midsweep_new_runs; eq "readable again: the bytes skipped while blind are read now (nothing lost)" "$(printf '%s' "$GATE_MIDSWEEP_NEW" | tr '\n' ' ')" "ga-b3"
+fi
+chmod 644 "$GATE_EVENTS_FILE"
+
 GATE_EVENTS_FILE="$ROOT/does-not-exist.jsonl"
+: > "$LOGF"
 gate_midsweep_arm
 eq "a missing events file: arm sets no offset" "${GATE_MIDSWEEP_OFF:-unset}" "unset"
+eq "…and says so (once per sweep)" "$(grep -c 'Mid-sweep collection is blind this sweep' "$LOGF")" "1"
 gate_midsweep_new_runs; eq "a missing events file: no candidates, rc 0" "$GATE_MIDSWEEP_NEW|$?" "|0"
 GATE_EVENTS_FILE="$ROOT/events.jsonl"
 
@@ -130,17 +180,23 @@ GC_CITY="$ROOT/city"                       # gate_midsweep_collect reads $GC_CIT
 mkdir -p "$GC_CITY/scripts" "$GATE_LOCK_DIR"
 export FAKE_STATE="$ROOT/state"
 mkdir -p "$FAKE_STATE"
-cat > "$GC_CITY/scripts/bd-list-cached.sh" <<'FAKE'
-#!/bin/bash
-# stateful fake of the read-cache shim: the two queries gate_midsweep_collect makes
-echo x >> "$FAKE_STATE/reads"
-[ -f "$FAKE_STATE/fail" ] && exit 1
-case "$*" in
-  *gate-status:running*) cat "$FAKE_STATE/running.json" ;;
-  *type:quality-gate-verdict*) cat "$FAKE_STATE/open.json" ;;
-  *) echo "[]" ;;
-esac
-FAKE
+# Stateful fake of `bd` itself: the confirm step reads bd DIRECTLY (not through the read-cache shim, which serves
+# stale data when bd is down), and these are the two queries it makes. $FAKE_STATE/mode picks how bd misbehaves:
+#   (none) healthy | fail: exit 1 | empty: exit 0, no output | garbage: exit 0, not JSON | object: exit 0, a JSON object
+bd() {
+  echo x >> "$FAKE_STATE/reads"
+  case "$(cat "$FAKE_STATE/mode" 2>/dev/null)" in
+    fail) return 1 ;;
+    empty) return 0 ;;
+    garbage) echo "Error: database is locked"; return 0 ;;
+    object) echo '{}'; return 0 ;;
+  esac
+  case "$*" in
+    *gate-status:running*) cat "$FAKE_STATE/running.json" ;;
+    *type:quality-gate-verdict*) cat "$FAKE_STATE/open.json" ;;
+    *) echo "[]" ;;
+  esac
+}
 set_running() { local j="[" r; for r in "$@"; do j="$j{\"id\":\"$r\"},"; done; printf '%s\n' "${j%,}]" > "$FAKE_STATE/running.json"; }
 set_open()    { local j="[" r; for r in "$@"; do j="$j{\"id\":\"v-$r\",\"labels\":[\"type:quality-gate-verdict\",\"gate-run:$r\"]},"; done; printf '%s\n' "${j%,}]" > "$FAKE_STATE/open.json"; }
 set_running; set_open
@@ -206,10 +262,10 @@ eq "the admitting run is excluded" "$CHILD_N" "3"
 GATE_ADMITTING_RUN=""
 
 # r7: the confirming reads fail once — the candidate is kept and retried at the next safe point
-set_running r7; ev_verdict_closed r7 >> "$GATE_EVENTS_FILE"; : > "$FAKE_STATE/fail"
+set_running r7; ev_verdict_closed r7 >> "$GATE_EVENTS_FILE"; echo fail > "$FAKE_STATE/mode"
 gate_midsweep_collect "p8"
 eq "confirm read failed → no child (fail closed)" "$CHILD_N" "3"
-rm -f "$FAKE_STATE/fail"
+rm -f "$FAKE_STATE/mode"
 gate_midsweep_collect "p9"
 eq "the next safe point retries the kept candidate (no new event needed)" "${CHILD_ALL}" "[r1][r4][r5][r7]"
 
@@ -233,6 +289,25 @@ for _sw in GATE_MIDSWEEP_ENABLED GATE_LOCK_ENABLED GATE_PHASE_C_ENABLED GATE_PHA
   printf -v "$_sw" '%s' "$_save"
   eq "$_sw flipped → no child" "$CHILD_N" "5"
 done
+
+# bd ANSWERS (rc 0) but not with a JSON array: that is "could not read", never "nothing is open". The case that mattered:
+# bd exiting 0 with no output (an empty answer is not the `[]` bd prints for none).
+gate_midsweep_arm
+for _m in empty garbage object; do
+  _n0="$CHILD_N"
+  set_running "rz-$_m"; ev_verdict_closed "rz-$_m" >> "$GATE_EVENTS_FILE"; echo "$_m" > "$FAKE_STATE/mode"
+  gate_midsweep_collect "m1-$_m"
+  eq "bd answers [$_m] with rc 0 → not read as 'no open verdict': no child" "$CHILD_N" "$_n0"
+  rm -f "$FAKE_STATE/mode"
+  gate_midsweep_collect "m2-$_m"
+  eq "…the candidate was kept; the next safe point with a healthy bd collects it" "$CHILD_N" "$((_n0 + 1))"
+done
+
+# The child that did not run (rc 75: lock borrow refused / lost) is warned about by NAME; a plain failure keeps its own warning.
+CHILD_RC=75; set_running r12; ev_verdict_closed r12 >> "$GATE_EVENTS_FILE"
+gate_midsweep_collect "p12"
+case "$(cat "$LOGF")" in *"WARN Mid-sweep (p12): the Phase-C-only pass did NOT run for run(s) r12 (rc=75"*) ok "a child that refused / lost the lock (rc 75) is called out — not logged as a success" ;; *) bad "no 'did NOT run' warning for rc 75" ;; esac
+CHILD_RC=0
 
 # ── 5. the Phase-C-only child's own filter (the jq program in the live Phase C) ─
 echo "── 5. the child touches ONLY the runs its parent confirmed ──"
@@ -314,7 +389,6 @@ probe_reads() {
     set +e
     log() { :; }; warn() { :; }
     GC_CITY="$TMPDIR/city"; mkdir -p "$GC_CITY/scripts" "$GATE_LOCK_DIR"
-    cp "$ROOT/city/scripts/bd-list-cached.sh" "$GC_CITY/scripts/"
     export FAKE_STATE="$TMPDIR/st"; mkdir -p "$FAKE_STATE"; : > "$FAKE_STATE/reads"
     printf '[{"id":"r1"}]\n' > "$FAKE_STATE/running.json"; printf '[]\n' > "$FAKE_STATE/open.json"
     _gate_run_phase_c_child() { return 0; }          # leaves r1 "running": only the done-list stands between it and a re-collect
@@ -326,8 +400,59 @@ probe_reads() {
     wc -l < "$FAKE_STATE/reads" | tr -d ' ' )
 }
 eq "a verdict close costs the sweep exactly ONE pair of confirming reads, however many safe points follow" "$(probe_reads "$DISPATCHER")" "2"
-M="$(mutant offset '  GATE_MIDSWEEP_OFF=$_size')"
+M="$(mutant offset 'GATE_MIDSWEEP_OFF=$((GATE_MIDSWEEP_OFF + _got - _unfinished))')"
 eq "mutant (the offset never advances): every safe point re-reads and re-confirms — the load check goes red" "$(probe_reads "$M")" "6"
+
+mutant_sub() {   # mutant_sub <name> <from> <to> → path of a copy with exactly ONE occurrence of <from> replaced by <to>
+  local out="$ROOT/mutant-$1.sh"
+  MS_FROM="$2" MS_TO="$3" awk '{ i = index($0, ENVIRON["MS_FROM"]); if (i > 0) { $0 = substr($0, 1, i - 1) ENVIRON["MS_TO"] substr($0, i + length(ENVIRON["MS_FROM"])); n++ } print } END { exit (n == 1 ? 0 : 3) }' "$DISPATCHER" > "$out" \
+    || { echo "MUTANT-ERROR"; return 1; }
+  echo "$out"
+}
+
+# probe_stale_confirm <dispatcher> → "children|pending|control": the gate's blocking issue 2 (attempt 1). The REAL read-cache shim
+# holds a warm "r7 is running, no verdict open" answer from an earlier sweep, and bd is now DOWN. The shim, asked again, serves that
+# last-good copy and exits 0 (that is its fail-open design, shown by the control). The confirm step must not take it for fresh data.
+probe_stale_confirm() {
+  ( export TMPDIR="$ROOT/pst.$RANDOM"; mkdir -p "$TMPDIR"
+    GATE_DISPATCHER_LIB_ONLY=1 source "$1" >/dev/null 2>&1 || { echo srcfail; exit 0; }
+    set +e
+    log() { :; }; warn() { :; }
+    GC_CITY="$TMPDIR/city"; mkdir -p "$GC_CITY/scripts" "$GATE_LOCK_DIR"
+    cp "$REPO_ROOT/scripts/bd-list-cached.sh" "$GC_CITY/scripts/"          # the REAL shim, not a fake of it
+    export BD_CACHE_DIR="$TMPDIR/cache" BD_CACHE_TTL=0                      # scratch cache; TTL 0 = every read tries live first, a failure falls back to last-good
+    cat > "$TMPDIR/bd-good" <<'GOOD'
+#!/bin/bash
+case "$*" in *gate-status:running*) echo '[{"id":"r7"}]' ;; *) echo '[]' ;; esac
+GOOD
+    printf '#!/bin/bash\nexit 1\n' > "$TMPDIR/bd-down"
+    chmod +x "$TMPDIR/bd-good" "$TMPDIR/bd-down"
+    # warm the shim's cache the way an earlier sweep did: one successful read per query (same argv as the old confirm step)
+    BD_BIN="$TMPDIR/bd-good" bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 -l type:quality-gate-run -l gate-status:running >/dev/null
+    BD_BIN="$TMPDIR/bd-good" bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 -l type:quality-gate-verdict >/dev/null
+    export BD_BIN="$TMPDIR/bd-down"                                         # bd goes down: the shim's live call fails
+    bd() { return 1; }                                                      # …and so does a direct `bd`
+    _ctl="$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 -l type:quality-gate-run -l gate-status:running 2>/dev/null)"; _crc=$?
+    case "$_ctl" in *r7*) [ "$_crc" = "0" ] && _ctl="stale-served-rc0" || _ctl="stale-served-rc$_crc" ;; *) _ctl="not-served-rc$_crc" ;; esac
+    CH=0; _gate_run_phase_c_child() { CH=$((CH+1)); return 0; }
+    GATE_EVENTS_FILE="$TMPDIR/ev.jsonl"; : > "$GATE_EVENTS_FILE"
+    GATE_LOCK_ENABLED=1; GATE_MIDSWEEP_ENABLED=1; GATE_PHASE_C_ONLY=0; GATE_PHASE_C_ENABLED=1
+    gate_midsweep_arm
+    ev_verdict_closed r7 >> "$GATE_EVENTS_FILE"
+    gate_midsweep_collect probe
+    echo "$CH|$(printf '%s' "$GATE_MIDSWEEP_PENDING" | tr -d '\n')|$_ctl" )
+}
+eq "bd down + a warm read-cache shim holding an old 'ready' answer → no child, the candidate is kept (and the shim DOES serve the stale copy with rc 0: the control)" \
+  "$(probe_stale_confirm "$DISPATCHER")" "0|r7|stale-served-rc0"
+M="$(mutant_sub stale '_out=$(bd -C "$GC_CITY" list --json --include-infra --limit 0 "$@"' '_out=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 "$@"')"
+eq "mutant (confirm reads go through the shim again, the previous code): the stale answer starts a child — the check goes red" "$(probe_stale_confirm "$M")" "1||stale-served-rc0"
+
+# the array requirement is what stops an EMPTY / null / {} open list, whatever the caller did to produce it
+M="$(mutant open-array '  printf '"'"'%s'"'"' "${2-}" | jq -e '"'"'type == "array"'"'"' >/dev/null 2>&1 || return 0')"
+_probe_ready() { ( export TMPDIR="$ROOT/pq.$RANDOM"; mkdir -p "$TMPDIR"; GATE_DISPATCHER_LIB_ONLY=1 source "$1" >/dev/null 2>&1 || { echo srcfail; exit 0; }; set +e
+                   printf '%s,%s,%s' "$(gate_verdict_ready_runs '[{"id":"r1"}]' 'null' '' r1)" "$(gate_verdict_ready_runs '[{"id":"r1"}]' '{}' '' r1)" "$(gate_verdict_ready_runs '[{"id":"r1"}]' '[]' '' r1)" ); }
+eq "fixed: open=null and open={} are not ready, open=[] is" "$(_probe_ready "$DISPATCHER")" ",,r1"
+eq "mutant (no array check on the open list): null and {} come out READY — section 2 goes red" "$(_probe_ready "$M")" "r1,r1,r1"
 
 # ── 8. the child as a REAL process (scratch city; nothing of the real city is touched) ──
 echo "── 8. the Phase-C-only child as a real process ──"
@@ -353,20 +478,23 @@ printf '#!/bin/bash\nexit 0\n' > "$ROOT/fakebin/gc"
 chmod +x "$ROOT/fakebin/bd" "$ROOT/fakebin/gc"
 LOCK2="$ROOT/tmp8/quality-gate-dispatcher$(printf '%s' "$CITY2" | tr '/ ' '__').lock.d"
 LOG2="$CITY2/.gc/logs/quality-gate-dispatcher.log"
+# Env of run_child: CHILD_FAKEBIN (dir of the fake bd/gc, default fakebin), CHILD_RUNS (the runs the parent confirmed, default "none"),
+# CHILD_SCRIPT (the dispatcher copy to run, default the staged real one).
 run_child() {   # run_child <token> [via-shell]: starts the real dispatcher as a Phase-C-only child of THIS shell
   # BD_CACHE_* keep the read-cache shim out of the real city's cache (a fake `[]` there would be read by a real sweep).
   # DRAIN_WINDOW_OVERRIDE: ga-a2v0bz — a run of a dispatcher must not depend on the time of day (selftest-drain-pin-class).
-  local p n=0
+  local p n=0 _script
+  _script="${CHILD_SCRIPT:-$A2/quality-gate-dispatcher.sh}"   # own line: selftest-drain-pin-class only learns a dispatcher variable from a line that STARTS with VAR=
   if [ "${2:-}" = "via-shell" ]; then
-    PATH="$ROOT/fakebin:$PATH" TMPDIR="$ROOT/tmp8" GC_CITY="$CITY2" BD_CACHE_OFF=1 BD_CACHE_DIR="$ROOT/cache8" \
+    PATH="${CHILD_FAKEBIN:-$ROOT/fakebin}:$PATH" TMPDIR="$ROOT/tmp8" GC_CITY="$CITY2" BD_CACHE_OFF=1 BD_CACHE_DIR="$ROOT/cache8" \
       DRAIN_WINDOW_OVERRIDE="OPEN" \
-      GATE_PHASE_C_ONLY=1 GATE_PHASE_C_ONLY_RUNS="none" GATE_LOCK_BORROW_TOKEN="$1" \
-      bash -c 'bash "$1"; rc=$?; exit $rc' _ "$A2/quality-gate-dispatcher.sh" >/dev/null 2>&1 &
+      GATE_PHASE_C_ONLY=1 GATE_PHASE_C_ONLY_RUNS="${CHILD_RUNS:-none}" GATE_LOCK_BORROW_TOKEN="$1" \
+      bash -c 'bash "$1"; rc=$?; exit $rc' _ "$_script" >/dev/null 2>&1 &
   else
-    PATH="$ROOT/fakebin:$PATH" TMPDIR="$ROOT/tmp8" GC_CITY="$CITY2" BD_CACHE_OFF=1 BD_CACHE_DIR="$ROOT/cache8" \
+    PATH="${CHILD_FAKEBIN:-$ROOT/fakebin}:$PATH" TMPDIR="$ROOT/tmp8" GC_CITY="$CITY2" BD_CACHE_OFF=1 BD_CACHE_DIR="$ROOT/cache8" \
       DRAIN_WINDOW_OVERRIDE="OPEN" \
-      GATE_PHASE_C_ONLY=1 GATE_PHASE_C_ONLY_RUNS="none" GATE_LOCK_BORROW_TOKEN="$1" \
-      bash "$A2/quality-gate-dispatcher.sh" >/dev/null 2>&1 &
+      GATE_PHASE_C_ONLY=1 GATE_PHASE_C_ONLY_RUNS="${CHILD_RUNS:-none}" GATE_LOCK_BORROW_TOKEN="$1" \
+      bash "$_script" >/dev/null 2>&1 &
   fi
   p=$!
   # a watchdog instead of `timeout`: a wrapper process would BE the child's parent and the borrow would rightly be refused
@@ -376,19 +504,19 @@ run_child() {   # run_child <token> [via-shell]: starts the real dispatcher as a
 }
 : > "$LOG2"
 run_child "99999:nolock"; _rc=$?
-eq "no lock at all: a child with a made-up token exits 0" "$_rc" "0"
+eq "no lock at all: a child with a made-up token exits 75 (NOT 0: the parent must be able to tell a refusal from a collection)" "$_rc" "75"
 [ ! -e "$LOCK2" ] && ok "…and did not create a lock" || bad "a refused child created the lock dir"
 case "$(cat "$LOG2")" in *"Phase-C-only pass refused"*) ok "…and says it refused" ;; *) bad "no 'refused' line in the log" ;; esac
 case "$(cat "$LOG2")" in *"=== Dispatcher sweep start"*) bad "a refused child logged a sweep-start banner (watchdogs count it)" ;; *) ok "…and logged no sweep-start banner" ;; esac
 
 mkdir -p "$LOCK2"; printf 'other:holder\n' > "$LOCK2/heartbeat"
 run_child "$$:tok"; _rc=$?
-eq "someone else's lock: the child exits 0" "$_rc" "0"
+eq "someone else's lock: the child exits 75" "$_rc" "75"
 eq "…and leaves that lock's heartbeat alone" "$(head -n1 "$LOCK2/heartbeat")" "other:holder"
 
 printf '%s\n' "$$:tok" > "$LOCK2/heartbeat"
 run_child "$$:tok" via-shell; _rc=$?
-eq "not a DIRECT child of the holder (a shell in between), even with the right token: exit 0" "$_rc" "0"
+eq "not a DIRECT child of the holder (a shell in between), even with the right token: exit 75" "$_rc" "75"
 case "$(tail -n 5 "$LOG2")" in *"Phase-C-only pass refused"*) ok "…and it refused" ;; *) bad "the indirect child was not refused" ;; esac
 
 : > "$LOG2"
@@ -400,6 +528,72 @@ case "$(cat "$LOG2")" in *"Phase-C-only pass (mid-sweep, borrowed lock)"*) ok "�
 case "$(cat "$LOG2")" in *"Phase-C-only pass done; back to the admitting sweep"*) ok "…and left before Step 0a (the admission is the parent's)" ;; *) bad "the child did not reach its early exit" ;; esac
 case "$(cat "$LOG2")" in *"=== Dispatcher sweep start"*) bad "the child logged a sweep-start banner" ;; *) ok "…and logged no sweep-start banner" ;; esac
 case "$(cat "$LOG2")" in *"Step 0b"*|*"Attempting to claim marker"*|*"Spawning "*) bad "the child went on to admit work" ;; *) ok "…and admitted nothing" ;; esac
+
+# ── the child touches ONLY the runs its parent confirmed — through the REAL script, as a real process ──
+# Three runs are "running"; the parent confirmed only b. Their beads carry no description, so Phase C skips each with a
+# per-run line naming it ("gate-run <id> missing a required field") — which is what lets the log say which runs were reached.
+mkdir -p "$ROOT/fakebin3"
+cat > "$ROOT/fakebin3/bd" <<'FAKEBD3'
+#!/bin/bash
+case "$*" in
+  *gate-status:running*) echo '[{"id":"a"},{"id":"b"},{"id":"c"}]' ;;
+  *"--json"*) echo "[]" ;;
+esac
+exit 0
+FAKEBD3
+cp "$ROOT/fakebin/gc" "$ROOT/fakebin3/gc"; chmod +x "$ROOT/fakebin3/bd" "$ROOT/fakebin3/gc"
+# These helpers answer in the global RES and are called WITHOUT $(...): the child must be a DIRECT child of the shell whose $$ is in
+# the token, and a command-substitution subshell would sit in between (and bash 3.2, which launchd runs, has no $BASHPID).
+child_runs_reached() {   # child_runs_reached <script> → RES="rc|a|b|c" (yes/no: did the child reach that run), the parent having handed it ONLY b
+  printf '%s\n' "$$:tok" > "$LOCK2/heartbeat"; : > "$LOG2"
+  CHILD_SCRIPT="$1" CHILD_FAKEBIN="$ROOT/fakebin3" CHILD_RUNS="b" run_child "$$:tok"; local rc=$? r out=""
+  for r in a b c; do
+    case "$(cat "$LOG2")" in *"gate-run $r missing a required field"*) out="$out|yes" ;; *) out="$out|no" ;; esac
+  done
+  RES="$rc$out"
+}
+_STAGED="$A2/quality-gate-dispatcher.sh"
+stage_mutant() {   # stage_mutant <mutant-file> <name> → path of that mutant aimed at the scratch city (the real one is never run)
+  sed "s|^GC_CITY=.*|GC_CITY=\"$CITY2\"|" "$1" > "$A2/$2"
+  echo "$A2/$2"
+}
+child_runs_reached "$_STAGED"
+eq "a child handed run b, with a, b, c all running: reaches b only, exits 0" "$RES" "0|no|yes|no"
+case "$(cat "$LOG2")" in *"1 of the handed run(s) [b] were still running and swept"*) ok "…and its closing log line says how many of the handed runs it swept" ;; *) bad "the child's closing line does not report 1 of [b]" ;; esac
+
+# …and the borrow is re-proven before EACH run: a child that lost the lock mid-pass (its parent died, a peer reclaimed it) stops
+# before the next run and does not stamp its old token over the new holder's heartbeat. The fake bd flips the heartbeat the way a
+# peer's reclaim would, during the read that lists the running runs (after the child's first, passing, borrow proof).
+mkdir -p "$ROOT/fakebin4"
+cat > "$ROOT/fakebin4/bd" <<FAKEBD4
+#!/bin/bash
+case "\$*" in
+  *gate-status:running*) printf 'peer:holder\n' > "$LOCK2/heartbeat"; echo '[{"id":"a"},{"id":"b"}]' ;;
+  *"--json"*) echo "[]" ;;
+esac
+exit 0
+FAKEBD4
+cp "$ROOT/fakebin/gc" "$ROOT/fakebin4/gc"; chmod +x "$ROOT/fakebin4/bd" "$ROOT/fakebin4/gc"
+child_lost_lock() {   # child_lost_lock <script> → RES="rc|heartbeat|reached-a-run(yes/no)|said-so(yes/no)"
+  printf '%s\n' "$$:tok" > "$LOCK2/heartbeat"; : > "$LOG2"
+  CHILD_SCRIPT="$1" CHILD_FAKEBIN="$ROOT/fakebin4" CHILD_RUNS="a b" run_child "$$:tok"; local rc=$?
+  local reached=no said=no
+  case "$(cat "$LOG2")" in *"gate-run a missing"*) reached=yes ;; esac
+  case "$(cat "$LOG2")" in *"no longer provably the parent's"*) said=yes ;; esac
+  RES="$rc|$(head -n1 "$LOCK2/heartbeat")|$reached|$said"
+}
+child_lost_lock "$_STAGED"
+eq "the lock is lost mid-pass: the child exits 75, reaches no run, says so, and leaves the new holder's heartbeat alone" \
+  "$RES" "75|peer:holder|no|yes"
+
+# mutation proofs for the two checks above (each mutant is staged into the scratch city and run as a real process)
+M="$(mutant_sub runfilter 'select(.id as $i | $w | index($i))' 'select(true)')"
+M="$(stage_mutant "$M" mut-runfilter.sh)"; child_runs_reached "$M"
+eq "mutant (no run filter): the child reaches a and c too — the filter check goes red" "$RES" "0|yes|yes|yes"
+M="$(mutant_sub nocheck '! _gate_lock_borrow_ok "$PPID"; then' '! true; then')"
+M="$(stage_mutant "$M" mut-nocheck.sh)"; child_lost_lock "$M"
+eq "mutant (no per-run borrow check): the child carries on and overwrites the new holder's heartbeat — the lost-lock check goes red" \
+  "$RES" "0|$$:tok|yes|no"
 
 # ── 9. the wiring is in the live script ─────────────────────────────────────────
 echo "── 9. the live wiring ──"
@@ -423,6 +617,11 @@ _exit="$(grep -n 'Phase-C-only pass done; back to the admitting sweep' "$D" | he
 _s0a="$(grep -n '^# ── Step 0a: TTL recovery' "$D" | head -1 | cut -d: -f1)"
 if [ -n "$_exit" ] && [ -n "$_s0a" ] && [ "$_exit" -lt "$_s0a" ]; then ok "the child exits before Step 0a"; else bad "the child's early exit is not before Step 0a"; fi
 grep -q '^GATE_MIDSWEEP_ENABLED="${GATE_MIDSWEEP_ENABLED:-1}"' "$D" && ok "kill switch GATE_MIDSWEEP_ENABLED exists and defaults to on" || bad "kill switch missing"
+# the per-run borrow proof comes BEFORE the loop's (unconditional) heartbeat write, and a refusal never exits 0
+_chk="$(grep -n '! _gate_lock_borrow_ok "\$PPID"; then' "$D" | head -1 | cut -d: -f1)"
+_hbw="$(awk -v s="${_chk:-0}" 'NR > s && /if \[ "\$GATE_LOCK_ENABLED" = "1" \]; then _gate_lock_write_hb; fi/ { print NR; exit }' "$D")"
+if [ -n "$_chk" ] && [ -n "$_hbw" ] && [ "$_hbw" -gt "$_chk" ] && [ $((_hbw - _chk)) -le 25 ]; then ok "the per-run borrow check precedes the loop's heartbeat write"; else bad "the per-run borrow check is missing or not before the heartbeat write (check=$_chk write=$_hbw)"; fi
+eq "every exit of a refused / lost-lock child uses the not-run code, none exits 0" "$(grep -c 'exit "$GATE_PHASE_C_ONLY_NOTRUN_RC"' "$D")" "2"
 
 # ── 10. fewer bd round-trips on the spawn path: assign_verdict_bead_verified reads the bead ONCE per try ──
 echo "── 10. assign_verdict_bead_verified: one bd show per try ──"

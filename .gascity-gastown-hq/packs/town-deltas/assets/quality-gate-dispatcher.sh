@@ -2634,10 +2634,12 @@ _acquire_gate_lock() {
 # The hint is the city event log (.gc/events.jsonl, a bead.closed line carrying
 # the verdict bead's gate-run:<id> label): a local file read, zero Dolt load, so
 # it can be checked at every safe point without raising the cost of the sweep.
-# It is only a HINT. Before a child starts, two cached reads confirm the run is
-# still running and has no non-closed verdict bead left; and the child re-derives
-# everything from the beads like any Phase C. A missing/rotated/unreadable log
-# yields no hint, so the worst case is the old behaviour (next sweep notices).
+# It is only a HINT. Before a child starts, two LIVE bd reads (not the read-cache
+# shim: it serves stale data when bd is down) confirm the run is still running and
+# has no non-closed verdict bead left — a read that fails or is not a JSON array
+# confirms nothing; and the child re-derives everything from the beads like any
+# Phase C. A missing/unreadable log yields no hint (and one warning per sweep), so
+# the worst case is the old behaviour (next sweep notices).
 #
 # Lock borrowing is proven, not assumed: the borrower must be a DIRECT child of
 # the pid named in the token, that pid must be alive, and the heartbeat must hold
@@ -2645,6 +2647,9 @@ _acquire_gate_lock() {
 # inherited the variables, a stale env) fails closed and does nothing.
 GATE_MIDSWEEP_ENABLED="${GATE_MIDSWEEP_ENABLED:-1}"     # kill switch: 0 = old behaviour
 GATE_EVENTS_FILE="${GATE_EVENTS_FILE:-${GC_CITY:-}/.gc/events.jsonl}"
+# Exit code of a Phase-C-only child that did NOT do its job (lock borrow refused, or lost midway). Distinct from 0
+# ("collected, or nothing to collect") so the parent can warn instead of logging a refusal as a success.
+GATE_PHASE_C_ONLY_NOTRUN_RC=75
 
 # rc 0 iff THIS process is a Phase-C-only child entitled to borrow the lock.
 # Arg: the expected parent pid (the caller passes $PPID; a selftest passes a stand-in).
@@ -2682,11 +2687,19 @@ gate_event_closed_verdict_runs() {
 # Pure. $1 = JSON array of running gate-run beads, $2 = JSON array of NON-closed
 # verdict beads, $3 = space-separated run ids to skip, $4 = candidate run ids
 # (newline/space separated). Prints the candidates (each once) that are running,
-# not skipped, and have no non-closed verdict bead. Bad JSON prints nothing
-# (never "ready").
+# not skipped, and have no non-closed verdict bead.
+# THREE states per list, not two: an array (possibly empty: "I read it, here is
+# what is there"), or anything else (empty, null, an object, garbage: "I could not
+# read it"). Only the first can make a run ready — "no open verdict" is a claim
+# about the world that needs a read that succeeded, so an unreadable $2 must never
+# come out the same as `[]`. Both inputs are checked on their own: the two are not
+# symmetric once a default fills one of them in (the old `${2:-[]}` did exactly
+# that, and an empty open list read as "nothing open").
 # SELFTEST-EXTRACT gate-verdict-ready-runs-fn: BEGIN
 gate_verdict_ready_runs() {
-  jq -n -r --argjson running "${1:-[]}" --argjson open "${2:-[]}" \
+  printf '%s' "${1-}" | jq -e 'type == "array"' >/dev/null 2>&1 || return 0   # running list unreadable
+  printf '%s' "${2-}" | jq -e 'type == "array"' >/dev/null 2>&1 || return 0   # open-verdict list unreadable
+  jq -n -r --argjson running "$1" --argjson open "$2" \
     --arg skip "${3:-}" --arg cand "${4:-}" '
     ($skip | split(" ") | map(select(. != ""))) as $sk
     | ($cand | split("\n") | map(split(" ")) | add // [] | map(select(. != "")) | unique) as $cd
@@ -2704,8 +2717,22 @@ gate_midsweep_arm() {
   GATE_MIDSWEEP_DONE=""
   GATE_MIDSWEEP_PENDING=""
   GATE_ADMITTING_RUN=""
-  GATE_MIDSWEEP_OFF=$(wc -c < "$GATE_EVENTS_FILE" 2>/dev/null | tr -d ' ' || true)
-  case "${GATE_MIDSWEEP_OFF:-}" in ''|*[!0-9]*) GATE_MIDSWEEP_OFF="" ;; esac
+  GATE_MIDSWEEP_BLIND_LOGGED=0
+  GATE_MIDSWEEP_OFF=$({ wc -c < "$GATE_EVENTS_FILE"; } 2>/dev/null | tr -d ' ' || true)   # { } so a failed "<" is silenced too
+  case "${GATE_MIDSWEEP_OFF:-}" in
+    ''|*[!0-9]*) GATE_MIDSWEEP_OFF=""; _gate_midsweep_blind "the size of $GATE_EVENTS_FILE could not be read" ;;
+  esac
+  return 0
+}
+
+# Said once per sweep, from whichever read first fails: mid-sweep collection cannot
+# see the event log, so this sweep falls back to the old behaviour (verdicts are
+# collected at the top of the next sweep). Without the line, "feature off" and
+# "feature on, nothing closed" look the same in the log.
+_gate_midsweep_blind() {
+  [ "${GATE_MIDSWEEP_BLIND_LOGGED:-0}" = "1" ] && return 0
+  GATE_MIDSWEEP_BLIND_LOGGED=1
+  warn "Mid-sweep collection is blind this sweep: $1 — verdicts are collected at the top of the next sweep, as before (ga-bk5j8u.1)."
   return 0
 }
 
@@ -2714,24 +2741,53 @@ gate_midsweep_arm() {
 # separated run ids, "" when none) and NOT printed: the offset is a global, and a
 # caller that took the output with $(...) would advance it in a subshell and
 # re-read the same events at every safe point. A file that shrank was rotated:
-# read the new file whole. A line the writer was mid-append on is lost to this
-# look at worst, which only costs the old latency (the next sweep's Phase C still
-# sees the run).
+# read the new file whole.
+# The offset moves only over bytes that were READ and are COMPLETE lines: a failed
+# read leaves it where it was (the next safe point reads the same bytes again), and
+# a line the writer is still in the middle of appending is left for the next look —
+# its tail would otherwise arrive as a second, unparseable half and the event would
+# be lost with no trace.
 gate_midsweep_new_runs() {
-  local _size _len _chunk
+  local _size _len _chunk _partial _got _unfinished
   GATE_MIDSWEEP_NEW=""
   [ -n "${GATE_MIDSWEEP_OFF:-}" ] || return 0
-  _size=$(wc -c < "$GATE_EVENTS_FILE" 2>/dev/null | tr -d ' ' || true)
-  case "${_size:-}" in ''|*[!0-9]*) return 0 ;; esac
+  _size=$({ wc -c < "$GATE_EVENTS_FILE"; } 2>/dev/null | tr -d ' ' || true)
+  case "${_size:-}" in
+    ''|*[!0-9]*) _gate_midsweep_blind "the size of $GATE_EVENTS_FILE could not be read"; return 0 ;;
+  esac
   [ "$_size" -lt "$GATE_MIDSWEEP_OFF" ] && GATE_MIDSWEEP_OFF=0
   [ "$_size" -gt "$GATE_MIDSWEEP_OFF" ] || return 0
   _len=$((_size - GATE_MIDSWEEP_OFF))
-  [ "$_len" -le 67108864 ] || { GATE_MIDSWEEP_OFF=$_size; return 0; }   # 64 MB gap: not a sweep-sized one
-  _chunk=$(tail -c +"$((GATE_MIDSWEEP_OFF + 1))" "$GATE_EVENTS_FILE" 2>/dev/null | head -c "$_len" || true)
-  GATE_MIDSWEEP_OFF=$_size
+  if [ "$_len" -gt 67108864 ]; then   # 64 MB gap: not a sweep-sized one
+    GATE_MIDSWEEP_OFF=$_size
+    _gate_midsweep_blind "$_len new bytes in $GATE_EVENTS_FILE since the last look is not a sweep-sized gap; skipped"
+    return 0
+  fi
+  # `printf x` keeps the chunk's trailing newlines through $(...), so the bytes of an unfinished last line can be counted.
+  _chunk=$(tail -c +"$((GATE_MIDSWEEP_OFF + 1))" "$GATE_EVENTS_FILE" 2>/dev/null | head -c "$_len"; printf x)
+  _chunk="${_chunk%x}"
+  [ "${#_chunk}" -gt 0 ] || { _gate_midsweep_blind "$GATE_EVENTS_FILE could not be read"; return 0; }
+  _partial="${_chunk##*$'\n'}"                       # text after the last newline: "" when the chunk ends on a complete line
+  _got=$(printf '%s' "$_chunk" | wc -c | tr -d ' ')              # bytes actually read (the file may have shrunk since the size look)
+  _unfinished=$(printf '%s' "$_partial" | wc -c | tr -d ' ')
+  GATE_MIDSWEEP_OFF=$((GATE_MIDSWEEP_OFF + _got - _unfinished))
+  _chunk="${_chunk%"$_partial"}"
   [ -n "$_chunk" ] || return 0
   GATE_MIDSWEEP_NEW=$(gate_event_closed_verdict_runs "$_chunk")
   return 0
+}
+
+# One LIVE `bd list` for the confirm step — never through bd-list-cached.sh. The
+# shim serves its last-good cache (and exits 0) when the live read fails, so a bd
+# outage looked like fresh data; and with no cache file a bd that exits 0 with no
+# output comes back as an empty answer with rc 0. This step decides whether a
+# child finalizes a run, so it must either see the world now or say it could not.
+# rc 0 only for a JSON array on stdout; anything else -> rc 1 and nothing printed.
+_gate_midsweep_read() {
+  local _out
+  _out=$(bd -C "$GC_CITY" list --json --include-infra --limit 0 "$@" 2>/dev/null) || return 1
+  printf '%s' "$_out" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+  printf '%s\n' "$_out"
 }
 
 # The child launcher is its own function so a selftest can substitute it. $1 =
@@ -2758,9 +2814,13 @@ $_cand"
   GATE_MIDSWEEP_PENDING=""
   case "$_cand" in *[![:space:]]*) ;; *) return 0 ;; esac
   _skip="${GATE_ADMITTING_RUN:-} ${GATE_MIDSWEEP_DONE:-}"
-  # The two confirming reads (cached, same queries Phase C itself uses).
-  if ! _running=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 -l type:quality-gate-run -l gate-status:running 2>/dev/null) \
-     || ! _open=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 -l type:quality-gate-verdict 2>/dev/null); then
+  # The two confirming reads: live, and each must come back as a JSON array (see _gate_midsweep_read). A read that
+  # could not be made keeps the candidates for the next safe point; it is never taken for "nothing is open".
+  # (Not cached on purpose: a cache that serves its last-good copy when bd is down would let a stale "no verdict
+  # open" start a child.) A fresh, readable "not ready" drops the candidate: a run with a verdict still open gets
+  # its own close event later, and the run being admitted / one already handed to a child is not wanted again.
+  if ! _running=$(_gate_midsweep_read -l type:quality-gate-run -l gate-status:running) \
+     || ! _open=$(_gate_midsweep_read -l type:quality-gate-verdict); then
     GATE_MIDSWEEP_PENDING="$_cand"
     return 0
   fi
@@ -2772,7 +2832,14 @@ $_cand"
   log "Mid-sweep ($_where): verdict(s) closed for run(s) $_ready — collecting now with a Phase-C-only pass instead of waiting for the next sweep (ga-bk5j8u.1)."
   _gate_run_phase_c_child "$_ready" || _rc=$?
   _gate_lock_write_hb
-  [ "$_rc" = "0" ] || warn "Mid-sweep ($_where): Phase-C-only pass exited rc=$_rc — the next sweep's Phase C re-checks every run (ga-bk5j8u.1)."
+  if [ "$_rc" = "$GATE_PHASE_C_ONLY_NOTRUN_RC" ]; then
+    # The child answered "I did not collect" (it refused the lock borrow, or lost it midway). Logging this as a
+    # success would leave a systematic break — the borrow proof never passing — looking like a feature that
+    # works and finds nothing.
+    warn "Mid-sweep ($_where): the Phase-C-only pass did NOT run for run(s) $_ready (rc=$_rc: lock borrow refused or lost; the child's log line says which) — the next sweep's Phase C collects them. If this shows up every sweep, mid-sweep collection is inert (ga-bk5j8u.1)."
+  elif [ "$_rc" != "0" ]; then
+    warn "Mid-sweep ($_where): Phase-C-only pass exited rc=$_rc — the next sweep's Phase C re-checks every run (ga-bk5j8u.1)."
+  fi
   return 0
 }
 
@@ -12691,7 +12758,7 @@ if [ "$GATE_LOCK_ENABLED" = "1" ]; then
       _gate_lock_write_hb
     else
       log "Phase-C-only pass refused: not a direct child of a live lock holder with a matching heartbeat — doing nothing (ga-bk5j8u.1)."
-      exit 0
+      exit "$GATE_PHASE_C_ONLY_NOTRUN_RC"     # not 0: the parent tells "collected" from "refused" by this code
     fi
   elif [ "$GATE_ADMIT_ROUND" -gt 0 ] 2>/dev/null \
      && [ -d "$GATE_LOCK_DIR" ] \
@@ -12802,6 +12869,16 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
     # cleanup_reviewer_sessions' GATE_SWEEP_HAS_MORE_WORK handling above.
     GATE_SWEEP_HAS_MORE_WORK=1
     for PC_I in $(seq 0 $((PHASE_C_COUNT - 1))); do
+      # ga-bk5j8u.1: a Phase-C-only child re-proves its borrow before EACH run. If its parent died
+      # (SIGKILL: the child would otherwise outlive it, finalizing under a dead holder's token while a
+      # peer sweep reclaims the lock and runs Phase C on the same run) or the heartbeat is no longer
+      # the parent's, it stops here. Runs it did not reach are collected by the next sweep's Phase C.
+      # BEFORE the heartbeat write below: that write is unconditional, and a child that has lost the
+      # lock must not stamp the old holder's token over a peer's heartbeat.
+      if [ "${GATE_PHASE_C_ONLY:-0}" = "1" ] && ! _gate_lock_borrow_ok "$PPID"; then
+        warn "Phase-C-only pass: the borrowed lock is no longer provably the parent's (parent gone, or the lock was reclaimed) — stopping before gate-run #${PC_I} of ${PHASE_C_COUNT}; the next sweep's Phase C re-checks every run (ga-bk5j8u.1)."
+        exit "$GATE_PHASE_C_ONLY_NOTRUN_RC"
+      fi
       # ga-eqjo (code-review fix): refresh the single-instance lock's heartbeat
       # at the TOP of every Phase C iteration, mirroring what the old Step 8
       # poll loop did every 30s for the same reason (that loop's own comment:
@@ -13287,7 +13364,8 @@ fi
 # ga-bk5j8u.1: a Phase-C-only child ends here — admission (Step 0a onward) is the
 # parent's, which is waiting for this process. Exit WITHOUT touching the lock.
 if [ "${GATE_PHASE_C_ONLY:-0}" = "1" ]; then
-  log "--- Phase-C-only pass done; back to the admitting sweep (ga-bk5j8u.1) ---"
+  # How many of the handed runs were really swept: 0 of N says "already finalized, or the running list could not be read".
+  log "--- Phase-C-only pass done; back to the admitting sweep: ${PHASE_C_COUNT:-0} of the handed run(s) [${GATE_PHASE_C_ONLY_RUNS:-none}] were still running and swept (ga-bk5j8u.1) ---"
   exit 0
 fi
 
