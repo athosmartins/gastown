@@ -6989,6 +6989,19 @@ fi
 # SELFTEST-EXTRACT fastlane-lib-load: END
 unset _GATE_FL_LIB
 
+# ── ga-dzzqvw: the task-rapida lane (a short review for a small task) lives in ONE sibling lib (gate-taskrapida.lib.sh) ──
+# Same contract as the fast lane's lib above, and for the same reasons: its absence is NOT fatal, because the lane is only ever GRANTED.
+# Without the lib every task simply takes the normal gate (today's behavior); the decision (just before Step 6) checks
+# `declare -F gate_taskrapida_decide` before calling, so a missing, unreadable or half-written lib reads as "normal gate", never as an
+# unbound function under `set -e`, and never as a dead sweep (`bash -n` first: a SYNTAX error in a sourced file kills this daemon even behind `|| true`).
+# SELFTEST-EXTRACT taskrapida-lib-load: BEGIN
+_GATE_TR_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-taskrapida.lib.sh" || true
+if [ -r "$_GATE_TR_LIB" ] && "${BASH:-/bin/bash}" -n "$_GATE_TR_LIB" 2>/dev/null; then
+  { source "$_GATE_TR_LIB" 2>/dev/null; } || true
+fi
+# SELFTEST-EXTRACT taskrapida-lib-load: END
+unset _GATE_TR_LIB
+
 # ── ga-piscg: systemic spawn-abort escalation (consecutive-abort alert) ───────
 # The dispatcher processes exactly ONE queued marker per sweep. A broken spawn
 # mechanism (gate-reviewer template misconfig / session-cap deadlock — ga-mzc3h)
@@ -17798,6 +17811,54 @@ if [ "$GATE_LANE" = "fast" ]; then
   REQUIRED_REVIEWERS=0
 fi
 # SELFTEST-EXTRACT fastlane-decide: END
+# ── ga-dzzqvw: the task-rapida lane — a SMALL TASK gets one reviewer and a short prompt (Athos, 2026-10-12) ──
+# "Task com até 200 linhas de código e que não mexe em envio de mensagem, dinheiro ou dado de cliente: uma revisão curta, sem bateria de
+# testes, em ~5 min. O resto continua no gate normal." Asked only of a run the DOC/TEST lane did NOT take (that one has no reviewer to cut),
+# and like it the lane is only ever GRANTED: the source bead has to BE a task (bd), the diff has to count at most 200 production lines
+# (E11's own counter), and no file may match the risk list (.gc/gate-task-rapida-risco.txt). Anything unreadable, over, or merely unverified
+# leaves the run exactly as the tier step made it. Same merge, same delivery: only the reviewer count and the prompt differ.
+# The lane's own answer rides in GATE_TR_CODE / GATE_TR_LINES (never in GATE_LANE_REASON_CODE, which the fast lane's tally buckets own), so a
+# tally can say why a task was NOT granted (gate-lane-tally.py learns to in ga-dzzqvw.1; until then the fields are only recorded). A lib that
+# returns something other than a clean grant or a clean refusal is "decision-errored".
+# Nothing from an earlier round of this process (gate_continue_or_exit re-enters) may be read as this round's, hence the reset first.
+# SELFTEST-EXTRACT taskrapida-decide: BEGIN
+GATE_TR_CODE=""; GATE_TR_WHY=""; GATE_TR_LINES=""; GATE_REVIEW_PROMPT_MODE=""
+if [ "$GATE_LANE" != "normal" ]; then
+  : # the DOC/TEST lane took this run (ZERO reviewers): nothing to decide here, and no refusal to record
+elif [ -z "${CHANGED_FILES:-}" ]; then
+  GATE_TR_CODE="no-changed-files"
+  GATE_TR_WHY="the dispatcher's own changed-file list is empty (git error or empty diff) — cannot size the task, normal gate"
+elif ! declare -F gate_taskrapida_decide >/dev/null 2>&1; then
+  GATE_TR_CODE="lib-not-loaded"
+  GATE_TR_WHY="task-rapida lib not loaded (gate-taskrapida.lib.sh missing or unreadable) — normal gate"
+else
+  # the source bead lives in ITS rig's store, not always the HQ's; a failed or half-printed read is handed over as "" (the lib calls that type-unreadable)
+  _TR_JSON=$(bd -C "${BEAD_CITY:-$GC_CITY}" show "$BEAD_ID" --json 2>/dev/null) || _TR_JSON=""
+  # the lib writes the lane variables only on a grant, but a lib that errors half way must not leave its writes behind
+  _TR_SAVE_LANE="$GATE_LANE"; _TR_SAVE_REASON="${GATE_LANE_REASON:-}"; _TR_SAVE_CODE="${GATE_LANE_REASON_CODE:-}"
+  _TR_SAVE_FILES="${GATE_LANE_FILES:-}"; _TR_SAVE_COUNTS="${GATE_LANE_COUNTS:-}"
+  _TR_RC=0
+  gate_taskrapida_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$_TR_JSON" "${RIG:-}" "$POLICY_FILES" || _TR_RC=$?
+  if [ "$_TR_RC" = "0" ] && [ "${GATE_LANE:-}" = "task-rapida" ] && [ "${GATE_TR_CODE:-}" = "granted" ]; then
+    TIER="TASK-RAPIDA"
+    REQUIRED_REVIEWERS=1
+    GATE_REVIEW_PROMPT_MODE="task-rapida"
+  else
+    GATE_LANE="$_TR_SAVE_LANE"; GATE_LANE_REASON="$_TR_SAVE_REASON"; GATE_LANE_REASON_CODE="$_TR_SAVE_CODE"
+    GATE_LANE_FILES="$_TR_SAVE_FILES"; GATE_LANE_COUNTS="$_TR_SAVE_COUNTS"
+    if [ "$_TR_RC" != "1" ] || [ -z "${GATE_TR_CODE:-}" ] || [ "${GATE_TR_CODE:-}" = "granted" ]; then
+      # fail closed: a decision that errored, or that contradicts itself, is not a decision (a "granted" nobody got is no refusal reason)
+      GATE_TR_CODE="decision-errored"
+      GATE_TR_WHY="task-rapida decision errored or was contradictory (rc=$_TR_RC) — normal gate"
+      GATE_TR_LINES=""
+    fi
+  fi
+fi
+case "${GATE_TR_CODE:-}" in
+  ''|granted) ;;
+  *) log "Task-rapida lane: not granted (${GATE_TR_CODE}) — ${GATE_TR_WHY:-no reason recorded}" ;;
+esac
+# SELFTEST-EXTRACT taskrapida-decide: END
 log "Lane: $GATE_LANE — ${GATE_LANE_REASON:-no reason recorded}"
 # SELFTEST-EXTRACT fastlane-record: BEGIN
 if declare -F gate_fastlane_record >/dev/null 2>&1; then
@@ -17812,8 +17873,10 @@ else
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg branch "$BRANCH" --arg bead "${BEAD_ID:-}" --arg rig "${RIG:-unknown}" \
     --arg marker "${MARKER_ID:-}" --arg lane "$GATE_LANE" --arg reason "$GATE_LANE_REASON" --arg code "$GATE_LANE_REASON_CODE" \
     --arg dry_run "${DRY_RUN:-0}" --argjson would "$_FL_WOULD" \
+    --arg tr_code "${GATE_TR_CODE:-}" --arg tr_lines "${GATE_TR_LINES:-}" \
     '{ts: $ts, event: "gate_lane", lane: $lane, branch: $branch, bead: $bead, rig: $rig, marker: $marker,
-      counts: "", reason: $reason, reason_code: $code, files: "", would_have_reviewers: $would, dry_run: $dry_run}' \
+      counts: "", reason: $reason, reason_code: $code, files: "", would_have_reviewers: $would, dry_run: $dry_run,
+      tr_code: $tr_code, tr_lines: $tr_lines}' \
     >> "$QG_LOG" 2>/dev/null || true
 fi
 # SELFTEST-EXTRACT fastlane-record: END

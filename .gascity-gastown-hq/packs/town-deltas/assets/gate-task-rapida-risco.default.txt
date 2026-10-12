@@ -1,0 +1,45 @@
+# gate-task-rapida-risco.txt (ga-dzzqvw) — what keeps a small task OUT of the gate's "task-rapida" lane.
+#
+# Live copy: $GC_CITY/.gc/gate-task-rapida-risco.txt (this file is the shipped default; `cp` it there at go-live and edit the live one).
+# If ANY file of the diff matches ANY pattern below, the task goes to the normal gate. A list that cannot be read, or has no pattern
+# for the rig, is not "no risk": the normal gate decides.
+#
+# Format — one pattern per line, whole-line comments only (a # after a pattern is part of the pattern):
+#   word        a piece of the path, upper/lower case does not matter      (envio  matches  src/Envio_x.py, app/envio/y.py)
+#   * ? glob    when the pattern has * or ?, it is a glob over the WHOLE path  (*.db  matches  data/app.db)
+#   [rig]       a line that opens with [ starts a section: the patterns below it apply only to that rig; [*] goes back to every rig.
+#               Patterns before the first section apply to every rig.
+# Accented and unaccented spellings are separate lines on purpose (cobranca / cobrança): the match is on bytes.
+# A longer list only sends more tasks to the normal gate — add to it whenever in doubt.
+
+# --- sending messages
+whapi
+campaign
+envio
+send
+outreach
+autoreply
+notifier
+followup
+voicebot
+
+# --- money
+pagamento
+billing
+cobranca
+cobrança
+credito
+crédito
+
+# --- customer data
+pipedrive
+contato
+lead
+fila_espera
+proprietario
+proprietário
+migrations/
+*.db
+*.sqlite
+*.sqlite3
+*schema*.sql
