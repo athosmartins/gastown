@@ -31,7 +31,7 @@ Regra do Athos (11/10): todo scraper novo e todo conserto de scraper quebrado co
 - **Escopo:** achar o endpoint que o próprio site/app já serve abertamente e que o front-end dele chama.
 - **PARE** se o único caminho exigir vencer uma proteção: captcha, desafio anti-bot, login de conta paga ou do gov.br. Não use a skill `captcha-solve` aqui (ela serve a outro propósito: emitir certidões) — vá para "Quando parar e levar ao Athos".
 - **REA é CLI** (`rea --help`, `rea <comando> --help`). Nunca registre como MCP: o servidor MCP custa 278 MB por sessão.
-- **Não rode `rea update` nem `rea --update`.** A versão está fixada em 6.4.0 (e leva um patch local de prazo): atualizar troca o pacote sem revisão e apaga o patch. Update só por bead que lê o changelog; se desconfiar, `scripts/rea-patch.sh check` (rc 0 = versão e patch ok; rc ≠ 0 = pare e avise o Mayor). Detalhe: `docs/runbooks/rea-versao-fixa-e-patch.md`.
+- **Não rode `rea update` nem `rea --update`.** A versão está fixada em 6.4.0 (e leva um patch local de prazo): atualizar troca o pacote sem revisão e apaga o patch. Update só por bead que lê o changelog; se desconfiar, `$GC_CITY_PATH/scripts/rea-patch.sh check` (rc 0 = versão e patch ok; rc ≠ 0 = pare e avise o Mayor). Detalhe: `docs/runbooks/rea-versao-fixa-e-patch.md`.
 - **Não rode `rea setup`.** Nesta máquina o `rea doctor` mostra `healthy: false` (Hopper e IDA ausentes, JDK do Ghidra ausente, e os registros de cliente MCP em `config_drift`) e sugere `rea setup`, que registraria o MCP. Para web isso é ruído: o que importa é o `rea` responder e os checks `node` e `host` estarem ok.
 
 ## Antes de começar: a máquina

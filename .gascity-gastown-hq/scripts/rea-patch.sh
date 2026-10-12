@@ -16,6 +16,8 @@
 # Layout (override the root with REA_PATCH_ROOT — selftest only):
 #   rea-patches/PIN                   the pinned version, one line (e.g. 6.4.0)
 #   rea-patches/<PIN>/MANIFEST.tsv    relpath <TAB> pristine sha256 <TAB> patched sha256 <TAB> patch file
+#                                     No rows is valid ONLY with an explicit `# none` line (upstream fixed it, nothing to
+#                                     patch): an empty or comment-only file is indistinguishable from a truncated one.
 #   rea-patches/<PIN>/*.patch         unified diffs, -p1, relative to the package root
 # Package dir: $REA_PKG_DIR, else derived from the LIVE `rea` binary (readlink -f), never from a path
 # written down in a doc — the MBP keeps its own copy under ~/gt-remote/rea and can be targeted with it.
@@ -30,11 +32,14 @@
 # Exit codes — three states, so "can't tell" never reads as "fine":
 #   0  ok      version == pin and every listed file is patched (apply: nothing left to do, or done)
 #   1  drift   installed version != pin, or a file is still pristine (check); apply refuses a version mismatch
-#   2  unknown package/manifest unreadable, or a file is neither pristine nor patched. Nothing is modified.
+#   2  unknown package/manifest unreadable or malformed, or a file is neither pristine nor patched. `apply` classifies
+#              EVERY file before it installs any, so for those causes nothing is modified. A failure while installing a
+#              LATER file (patch no longer fits, disk full) can leave earlier ones patched: it says PARTIAL, `check` shows what is left.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_ROOT="${REA_PATCH_ROOT:-$HERE/rea-patches}"
+case "$PATCH_ROOT" in /*) ;; *) PATCH_ROOT="$PWD/$PATCH_ROOT" ;; esac   # `patch -d` chdirs before it opens -i, so a relative root would read as "patch file not found"
 
 say() { printf 'rea-patch: %s\n' "$*"; }
 err() { printf 'rea-patch: %s\n' "$*" >&2; }
@@ -78,7 +83,7 @@ file_state() {
 # Sets PIN PKG VERSION and the parallel arrays ROW_REL ROW_PRI ROW_PAT ROW_PATCH.
 # Returns 2 (after saying why) when anything needed to decide cannot be read or is malformed.
 load_context() {
-  local rel pri pat pfile hex='^[0-9a-f]{64}$'
+  local rel='' pri='' pat='' pfile='' hex='^[0-9a-f]{64}$' rows none=0
   ROW_REL=(); ROW_PRI=(); ROW_PAT=(); ROW_PATCH=()
 
   PIN="$(tr -d '[:space:]' 2>/dev/null < "$PATCH_ROOT/PIN")"
@@ -88,9 +93,16 @@ load_context() {
   VERSION="$(pkg_version "$PKG")" || { err "UNKNOWN: $PKG is not a readable rea-agents package (package.json)"; return 2; }
 
   local manifest="$PATCH_ROOT/$PIN/MANIFEST.tsv"
-  [ -r "$manifest" ] || { err "UNKNOWN: no patch manifest for pinned version $PIN ($manifest)"; return 2; }
+  [ -f "$manifest" ] && [ -r "$manifest" ] || { err "UNKNOWN: no readable patch manifest for pinned version $PIN ($manifest)"; return 2; }
+  # Read it whole and check THAT read: `while read ... < file` reports a file it could not read (a directory, an I/O error)
+  # as plain end-of-input, i.e. as a manifest that lists nothing — and "lists nothing" is a valid, green answer.
+  rows="$(cat -- "$manifest")" || { err "UNKNOWN: cannot read $manifest"; return 2; }
   while IFS=$'\t' read -r rel pri pat pfile || [ -n "$rel" ]; do
-    case "$rel" in ''|'#'*) continue ;; esac
+    case "$rel" in
+      '') continue ;;
+      '# none'|'# none '*|'# none:'*) none=1; continue ;;
+      '#'*) continue ;;
+    esac
     if [[ "$rel" = /* || "$rel" = *..* ]]; then err "UNKNOWN: manifest path not relative to the package: $rel"; return 2; fi
     if ! [[ "$pri" =~ $hex && "$pat" =~ $hex ]] || [ "$pri" = "$pat" ]; then
       err "UNKNOWN: manifest row for $rel has a bad or equal pristine/patched sha256"; return 2
@@ -100,7 +112,13 @@ load_context() {
       err "UNKNOWN: manifest row for $rel names no readable patch file in $PATCH_ROOT/$PIN (got: '${pfile}')"; return 2
     fi
     ROW_REL+=("$rel"); ROW_PRI+=("$pri"); ROW_PAT+=("$pat"); ROW_PATCH+=("$pfile")
-  done < "$manifest"
+  done <<< "$rows"
+  if [ "${#ROW_REL[@]}" -eq 0 ] && [ "$none" -eq 0 ]; then
+    err "UNKNOWN: $manifest has no rows and no '# none' line — truncated or emptied by mistake? (a deliberate 'nothing to patch' says so)"; return 2
+  fi
+  if [ "${#ROW_REL[@]}" -gt 0 ] && [ "$none" -eq 1 ]; then
+    err "UNKNOWN: $manifest says '# none' and also lists ${#ROW_REL[@]} row(s) — it cannot be both"; return 2
+  fi
   return 0
 }
 
@@ -149,7 +167,7 @@ apply_one() {
 }
 
 cmd_apply() {
-  local i st n todo=0
+  local i st n todo=0 installed=0
   local -a states=()
   load_context || return 2
   n=${#ROW_REL[@]}   # only after load_context filled the arrays
@@ -169,7 +187,12 @@ cmd_apply() {
   done
   for ((i = 0; i < n; i++)); do
     if [ "${states[i]}" = applied ]; then say "already   ${ROW_REL[i]}"; continue; fi
-    apply_one "${ROW_REL[i]}" "${ROW_PAT[i]}" "${ROW_PATCH[i]}" || return 2
+    if ! apply_one "${ROW_REL[i]}" "${ROW_PAT[i]}" "${ROW_PATCH[i]}"; then
+      # Classification above cannot see a patch that no longer fits or a write that fails, so an earlier file may be installed already.
+      [ "$installed" -gt 0 ] && err "PARTIAL: $installed of $todo file(s) were installed before ${ROW_REL[i]} failed; the set is half patched — run rea-patch.sh check"
+      return 2
+    fi
+    installed=$((installed + 1))
   done
   say "OK rea-agents $VERSION (pinned), $n/$n patched file(s) in place ($todo applied now) — $PKG"
 }

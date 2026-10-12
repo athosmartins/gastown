@@ -42,9 +42,9 @@ Três estados, para "não deu para saber" nunca parecer "está tudo bem":
 |---|---|---|
 | 0 | versão == pin e todo arquivo do manifesto está patched | `check` verde; `apply` sem nada a fazer ou feito |
 | 1 | desvio: versão instalada diferente do pin, ou arquivo ainda pristine | alguém rodou `rea update`; `check` antes do `apply`. O `apply` recusa (rc 1) em versão diferente |
-| 2 | desconhecido: pacote/manifesto ilegível ou malformado, ou arquivo que não é nem o pristine nem o patched. **Nada é modificado** | alguém editou o arquivo de outro jeito; `rea` fora do PATH; `package.json` de outro pacote |
+| 2 | desconhecido: pacote/manifesto ilegível ou malformado (inclui manifesto vazio ou só com comentários, sem a linha `# none`), ou arquivo que não é nem o pristine nem o patched. O `apply` não modifica nada nesses casos | alguém editou o arquivo de outro jeito; `rea` fora do PATH; `package.json` de outro pacote |
 
-O `apply` é tudo-ou-nada: se um arquivo do conjunto estiver "estranho", nenhum é tocado.
+O `apply` classifica **todos** os arquivos antes de instalar qualquer um: se um estiver "estranho", nenhum é tocado. O que a classificação não vê é um patch que deixou de encaixar, ou uma escrita que falha, num arquivo *depois do primeiro*: isso sai como `PARTIAL: …` (rc 2) e o conjunto fica pela metade; rode `check` para ver o que falta. Hoje o manifesto tem uma linha só, então o caso não existe na prática.
 
 ## O que fazer quando o `check` não dá 0
 - **rc 1, "not patched":** `scripts/rea-patch.sh apply`. É o caso de um `npm install`/`brew upgrade` que reinstalou o mesmo 6.4.0.
@@ -57,7 +57,7 @@ Regra: **versão nova só entra por uma bead dedicada** (rota `gastown.dog` ou c
 1. **Ler o changelog** entre a versão fixada e a candidata (`https://github.com/morluto/rea/releases`) e anotar na bead: o que mudou nos comandos que usamos (web: `list-browser-targets`, `observe-web-session`, `inspect-web-page`, `analyze-web-bundle`, `export-web-scripts`), mudanças de permissão/rede/coleta, e se o prazo do helper Swift ficou configurável.
 2. **Máquina:** a regra de REA pesado vale (10 GB livres, swap até 6 GB, nenhum outro `rea` ativo). Instalação pesada vai para o MBP se a chave estiver ligada.
 3. **Instalar a versão exata** (nunca `latest`): `npm install --global rea-agents@X.Y.Z`.
-4. **Patch:** pegue o arquivo pristine novo (`npm pack rea-agents@X.Y.Z` em diretório novo e vazio), veja se a linha do prazo mudou de lugar. Se o upstream já resolveu, **descarte o patch** (manifesto sem linhas é válido: `0/0`). Se não, gere o `.patch` novo com `diff -u` (cabeçalho `a/…` e `b/…`, sem timestamp), calcule os dois sha256 e escreva `scripts/rea-patches/X.Y.Z/{MANIFEST.tsv,*.patch}`.
+4. **Patch:** pegue o arquivo pristine novo (`npm pack rea-agents@X.Y.Z` em diretório novo e vazio), veja se a linha do prazo mudou de lugar. Se o upstream já resolveu, **descarte o patch** (manifesto sem linhas só vale com uma linha `# none: <motivo>`; sem ela, vazio ou só comentário é rc 2, porque um arquivo truncado seria igual; resultado: `0/0`). Se não, gere o `.patch` novo com `diff -u` (cabeçalho `a/…` e `b/…`, sem timestamp), calcule os dois sha256 e escreva `scripts/rea-patches/X.Y.Z/{MANIFEST.tsv,*.patch}`.
 5. **Trocar o pin:** editar `scripts/rea-patches/PIN`. Manter a pasta da versão antiga até a bead fechar (permite voltar).
 6. **Provar:** `scripts/rea-patch.sh apply && scripts/rea-patch.sh check` (rc 0), `scripts/rea-patch.selftest.sh` (tudo PASS), e um comando web real do `rea` respondendo (`rea doctor`: só `node` e `host` precisam estar ok; `healthy: false` é esperado aqui, não rode `rea setup`).
 7. **MBP:** repetir lá (seção abaixo) ou registrar na bead que ficou para depois.
