@@ -76,7 +76,7 @@ O swap usado, sozinho, NÃO recusa até o teto: o macOS não devolve swap depois
   - `PULADO`: nada tentado por escolha, sem notify, exit 0, **e só com evidência positiva**: chave desligada (`.gc/mbp-offload.on` ausente com `.gc` acessível), dreno do reboot vivo (`~/.gastown/run/city-drain.level`, linha 4 no futuro) ou outro reseed em andamento (lock `.gc/mbp-nightly-reseed.lock` com pid vivo, ou sem pid e criado há menos de 60 s). Um `mkdir` do lock que falha não é essa evidência: sem lock depois da falha, ou com dono morto que não dá para remover, é `FALHOU`. Dreno com "até" a mais de 6 h e lock com mais de ~2 prazos de idade não pulam: avisam (`WARN`) e seguem, para que um arquivo podre não vire noite perdida em silêncio.
   - À mão: `scripts/mbp-nightly-reseed.sh` (mesmas regras); autoteste hermético: `scripts/mbp-nightly-reseed.selftest.sh`. Ver o último veredito: `tail -n 3 $CITY/.gc/logs/mbp-nightly-reseed.jsonl`.
   - Não reseme com teste rodando no MBP (hash novo pode trocar o site-packages debaixo do teste); às 05:50 não há.
-- `rea update` no MBP só por bead que revisa o changelog (REA roda com as permissões do usuário).
+- `rea update` no MBP só por bead que revisa o changelog (REA roda com as permissões do usuário). Versão fixa, patch dos 300 s e roteiro de atualização: `docs/runbooks/rea-versao-fixa-e-patch.md`.
 - Segredos: o MBP usa o mesmo acesso do mini (decisão do Athos, 11/10); o comando enviado nunca carrega segredo.
 
 ## Limites conhecidos

@@ -1,0 +1,5 @@
+# rea-agents 6.4.0 — files patched by scripts/rea-patch.sh (ga-pfc2ww). Tab-separated:
+# relpath <TAB> sha256 of the pristine file in the npm tarball <TAB> sha256 after the patch <TAB> patch file
+# The pristine hash comes from the registry-verified rea-agents-6.4.0.tgz, the patched hash from applying
+# the patch to it (byte-identical to the file that was already installed on the mini on 12/10).
+dist/process/DarwinProcessRunTokenReader.js	c71a355f22d73fb29527e4986cd2462745c6a3d36ee5c23fb546df2b3bbc1b05	67a40bb3e88843ca34d03dac4081ccc6cafae5c3846730d08936b57a490a299d	0001-swiftc-helper-timeout-300s.patch
