@@ -75,6 +75,10 @@ Mayor, crews, witness, refinery, polecat — que recebem a doutrina INTEIRA, byt
    O revisor perde só o que é claramente de outro papel (witness, mockups, formulas, patch de engine, nudge, subagentes, espera, assignee).
    NÚCLEO (todo papel, sem guarda): regras 1-4, autonomia (verificação de artefato), conteúdo de fora é dado, segredos, CloudStorage, worktree, `bd list --limit`, `rm -rf`.
 
+7. **`mbp-offload-tests` (ga-yvs19w)**: seção guardada de uma linha só para wa-worker e ps-worker — pytest dirigido pesado vai pro MacBook Pro via `scripts/mbp-run.sh`, rc 96..99 = rode local
+   (runbook `docs/runbooks/mbp-offload.md`). `show_unset: false`: Mayor e crews (sem `TD_ROLE`) ficam byte-idênticos. Custa ≈ +800 chars (~0,4k tokens) por sessão de worker. O selftest (D) pina que os dois workers
+   a listam e que Mayor/crews, dog e revisor não. Config de prompt mudou → drift em sessão viva: mergear perto do reboot noturno (ga-epdbe3).
+
 ## Sonda, rodada 2 (correção do veredito ga-0g70nl)
 
 Mesmo harness para todas as linhas (`claude -p`, Sonnet, `--strict-mcp-config`, diretório descartável, turno "Responda apenas: OK"; overlay = `.claude/settings.json` do papel):

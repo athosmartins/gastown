@@ -399,6 +399,14 @@
    "witness-startup": {
     "roles": []
    },
+   "mbp-offload-tests": {
+    "roles": [
+     "ps-worker",
+     "wa-worker"
+    ],
+    "show_unset": false,
+    "_why": "ga-yvs19w (épico ga-sokx7u): uma linha só dizendo aos workers que pytest dirigido pesado vai pro MacBook Pro via scripts/mbp-run.sh (rc 96..99 = rode local). Só wa-worker e ps-worker: são quem roda pytest nos repos que o mbp-run.sh espelha (--repo wa|ps); dog e revisores não. show_unset=false de propósito: o mandato é NÃO mexer em prompt de crew, e agente sem TD_ROLE (Mayor, crews, witness...) recebe tudo por padrão — com show_unset=true a linha vazaria pra eles."
+   },
    "claudemd-carryover": {
     "roles": [
      "dog",
@@ -505,6 +513,7 @@
    "never_cut": {
     "claudemd-carryover": "Regras de segurança que SÓ vivem aqui depois que o overlay exclui o CLAUDE.md (dados pessoais do Athos, bd reclaim cru, restart cosmético). Valem para qualquer tarefa, independente do que o texto diz.",
     "dolt-cleanup-hazards": "O prompt nativo do dog recomenda `gc dolt cleanup --force` (= DROP DATABASE) para QUALQUER tarefa; o texto da tarefa não prevê se o agente vai alcançá-lo, e o dano é irreversível.",
+    "mbp-offload-tests": "Relevância não é função do texto: qualquer tarefa que escreva teste pode chegar a um pytest pesado, e a seção é uma linha (~0,4k tokens) — cortar economiza quase nada e deixa o worker disputando CPU no mini com o resto da cidade.",
     "research-only-channels": "Protege contra mutação irreversível pra fora (API viva de terceiros, identidade) por subagente; se a sessão vai delegar pesquisa não é função do texto da tarefa, e o estrago não desfaz.",
     "next-action-mayor-waiting": "Relevância não é função do texto: QUALQUER tarefa pode travar esperando decisão. Jev responderia ruído, e a falha (sessão invisível parada por 76 min) é a que a seção existe pra evitar."
    },

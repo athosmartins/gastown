@@ -1025,6 +1025,10 @@ sem dono = disponível pra despacho. Sem ela, esta regra vira decorativa e
 ninguém aplica.
 
 {{ end -}}
+{{ if or (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:mbp-offload-tests */ -}}
+**Teste dirigido pesado (pytest de vários arquivos, minutos no mini) → rode no MacBook Pro com `mbp-run.sh` (ga-yvs19w; runbook `docs/runbooks/mbp-offload.md`).** O mini vive com load 40-60 e os workers disputam RAM/CPU: 231 testes levaram 340 s no mini e 11 s no MBP. `"$GC_CITY_PATH/scripts/mbp-run.sh" --repo wa -- tests/test_x.py tests/test_y.py -q` (wa-worker; ps-worker usa `--repo ps`; o worktree é o diretório atual, ou `--dir <worktree>`) — só arquivos dirigidos, NUNCA a suíte inteira. **rc 96..99 = "rode local"** (offload desligado, MBP sem saúde, configuração ou slots cheios): NÃO é teste reprovado, rode o mesmo pytest no mini; rc 0..95 é o do pytest. Teste leve (< ~10 s: o ssh/rsync custa ~6 s) e teste que lê `shared/data/*.db` (os bancos não vão pro MBP) rodam local.
+
+{{ end -}}
 {{ if or (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:claudemd-carryover */ -}}
 **Regras que só viviam no CLAUDE.md do Athos/do gt — a sessão de pool não carrega mais esses arquivos (ga-aijm2v.6); continuam valendo:**
 

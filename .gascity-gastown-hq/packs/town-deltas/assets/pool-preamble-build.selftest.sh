@@ -194,6 +194,15 @@ old='(eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:mockup-s3 */
 open(p,"w",encoding="utf-8").write(s.replace(old,'(eq .TD_ROLE "wa-worker") -}}{{/* td:mockup-s3 */ -}}',1))
 EOF
 expect_fail "guarda de mockup-s3 editada (some ps-worker) sem mexer no manifesto" "diverge do manifesto"
+reset_tree; python3 - "$T/packs/town-deltas/template-fragments/town-deltas.template.md" <<'EOF'
+import sys
+p=sys.argv[1]; s=open(p,encoding="utf-8").read()
+# ga-yvs19w: a linha do mbp-run.sh é só dos workers ("não mexer em prompts de crew"). Alarga a guarda no fragment pra incluir agente SEM
+# TD_ROLE (Mayor, crews, witness) — o manifesto continua dizendo show_unset=false. Asserta que mutou (senão o controle seria vácuo).
+old='{{ if or (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:mbp-offload-tests */ -}}'; assert old in s, "mutação não aplicou: formato da guarda mudou"
+open(p,"w",encoding="utf-8").write(s.replace(old,'{{ if or (not .TD_ROLE) (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:mbp-offload-tests */ -}}',1))
+EOF
+expect_fail "linha do mbp-run.sh vaza para agente sem TD_ROLE (Mayor/crews) — a guarda do fragment diverge do manifesto" "diverge do manifesto"
 reset_tree; sed -i.bak 's/Verifique o ARTEFATO, nunca o relato/Verifique o resultado/' "$T/packs/town-deltas/template-fragments/town-deltas.template.md"
 expect_fail "núcleo perde 'verificação de artefato'" "NÚCLEO: sentinela 'verificacao-de-artefato'"
 reset_tree; python3 - "$T/packs/town-deltas/template-fragments/town-deltas.template.md" <<'EOF'
@@ -496,6 +505,7 @@ def render(root, name):
 
 make_city(work / "real", real_packs=True, with_env=True)
 errs = []
+MBP_NEEDLE = '"$GC_CITY_PATH/scripts/mbp-run.sh"'
 for name, role in cases:
     out = render(work / "real", name)
     # REFERÊNCIA: o MESMO motor renderizando o fragment já sem guardas e sem as seções escondidas deste papel (sem env)
@@ -505,6 +515,10 @@ for name, role in cases:
     if not out.startswith(f"# {name}\nBASE-BODY\n"): errs.append(f"{name}: corpo do agente mudou")
     for key, needle in m["doctrine"]["core_sentinels"].items():
         if needle not in out: errs.append(f"{name}: NÚCLEO '{key}' ausente do prompt renderizado")
+    # ga-yvs19w: pino INDEPENDENTE do manifesto (o laço abaixo deriva "deveria estar" dele; se alguém tirar a seção dos dois, nada reclamaria).
+    # Worker novo LISTA a regra do mbp-run.sh; Mayor/crews (sem TD_ROLE), dog e revisor não a recebem.
+    want_mbp = role in ("wa-worker", "ps-worker")
+    if (MBP_NEEDLE in out) != want_mbp: errs.append(f"{name}: regra do mbp-run.sh {'AUSENTE (todo worker de pool deve listá-la)' if want_mbp else 'VAZOU (só wa-worker/ps-worker a recebem)'}")
     for b in blocks:
         if b["cond"] is None: continue
         should = ppb.receives(m["doctrine"]["guarded"][b["id"]], role)

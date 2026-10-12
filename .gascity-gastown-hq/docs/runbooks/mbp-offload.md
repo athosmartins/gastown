@@ -36,6 +36,8 @@ scripts/mbp-run.sh --seed wa|ps  # (re)semeia base + site-packages (com checagem
 ```
 Quem chama trata rc 96..99 como "rode local", nunca como teste reprovado.
 
+Os workers de pool (wa-worker e ps-worker) recebem essa regra no preâmbulo: seção guardada `mbp-offload-tests` do fragment `town-deltas` (ga-yvs19w), registrada em `doctrine.guarded` do `pool-roles.json` com `show_unset: false` — Mayor, crews, dog e revisores não a recebem. Com a chave desligada o `mbp-run.sh` sai 99 e o worker roda local, então a linha é segura mesmo com o offload off.
+
 ## Códigos de saída
 0..95 = rc do pytest/comando remoto (propagado) · 99 offload desligado · 98 MBP indisponível ou sem saúde (ssh > 5 s, RAM livre < 3 GB, swap usado >= 5 GB, bateria <= 40% sem tomada, ou ssh caiu no meio) · 97 configuração (uso errado, base ausente → `--seed`) · 96 três slots ocupados.
 Limiares ajustáveis por ambiente: `MBP_MIN_AVAIL_MB`, `MBP_MAX_SWAP_MB`, `MBP_MIN_BATT`, `MBP_MAX_SLOTS`, `MBP_RUN_TIMEOUT_S`.
