@@ -215,12 +215,34 @@ EXPECT_TAIL="$CAPDIR/expect.tail"
 tail -c "$KEEP" "$F1" > "$EXPECT_TAIL"
 INODE1="$(stat -f %i "$F1")"
 _tail_cap_one "$F1" "$KEEP"
-[ "$?" = "0" ] && ok "tail_cap_one: returns 0" || bad "tail_cap_one: nonzero return"
+[ "$?" = "0" ] && ok "tail_cap_one: returns 0 (tail kept)" || bad "tail_cap_one: nonzero return"
 [ "$(_file_size_bytes "$F1")" = "$KEEP" ] && ok "tail_cap_one: file is exactly keep-bytes long" || bad "tail_cap_one: size is '$(_file_size_bytes "$F1")', expected $KEEP"
 cmp -s "$F1" "$EXPECT_TAIL" && ok "tail_cap_one: what stays is the LAST keep-bytes of the original, byte for byte" || bad "tail_cap_one: kept content is not the original tail"
 [ "$(stat -f %i "$F1")" = "$INODE1" ] && ok "tail_cap_one: inode preserved" || bad "tail_cap_one: inode changed"
 [ ! -e "$F1.tailcap.tmp" ] && ok "tail_cap_one: no side file left behind" || bad "tail_cap_one: left $F1.tailcap.tmp"
 tail -n 1 "$F1" | grep -q 'line 0050400 ' && ok "tail_cap_one: newest line is still the last line" || bad "tail_cap_one: newest line lost"
+
+echo ""
+echo "=== tail-cap class: outcomes that are NOT 'tail kept' are reported as what they are ==="
+# No room to copy the tail aside: simulated by putting a directory where the side
+# file must go. Space outranks history, so the file is emptied -- and the return
+# code and the log line must say EMPTY, never "last N kept".
+F4="$CAPDIR/noroom.log"
+mkfile "$F4" 50400
+mkdir "$F4.tailcap.tmp"
+_tail_cap_one "$F4" "$KEEP"; RC4=$?
+[ "$RC4" = "2" ] && [ "$(_file_size_bytes "$F4")" = "0" ] && ok "tail_cap_one: tail cannot be copied aside -> file emptied, rc 2" || bad "tail_cap_one: no-room case rc=$RC4 size='$(_file_size_bytes "$F4")'"
+rmdir "$F4.tailcap.tmp"
+CAP_MB=2; KEEP_MB=1; LOG_REAPER_PATHS=""; LOG_REAPER_CAP_REAL_DEFAULT_PATHS="/tmp/log-reaper-nonexistent-cap-marker-$$"; ENABLED=1; DRY_RUN=0; PROD=0
+mkfile "$F4" 60000
+mkdir "$F4.tailcap.tmp"
+LOG_REAPER_CAP_PATHS="$F4"; : > "$LOG_REAPER_LOG"
+main
+grep -q "capped: $F4 .*EMPTY: no room" "$LOG_REAPER_LOG" && ! grep -q "last .* kept" "$LOG_REAPER_LOG" && ok "main(): the no-room cut is logged as EMPTY, not as a kept tail" || bad "main(): no-room outcome mislabelled — log: $(cat "$LOG_REAPER_LOG")"
+rmdir "$F4.tailcap.tmp"
+# A path that vanished after the stat must not be re-created by the truncate.
+_tail_cap_one "$CAPDIR/vanished.log" "$KEEP"; RCV=$?
+[ "$RCV" = "1" ] && [ ! -e "$CAPDIR/vanished.log" ] && ok "tail_cap_one: a vanished file is not re-created as an empty one (rc 1)" || bad "tail_cap_one: vanished file rc=$RCV exists=$([ -e "$CAPDIR/vanished.log" ] && echo yes || echo no)"
 
 echo ""
 echo "=== tail-cap class: a writer that holds the file open (O_APPEND) keeps working ==="
@@ -277,7 +299,7 @@ main
 [ "$(cksum < "$SMALLC")" = "$SMALLC_SUM" ] && ok "main(): under-cap file untouched" || bad "main(): under-cap file changed"
 [ "$(_file_size_bytes "$EDGEC")" = "$KEEP" ] && ok "main(): a file exactly at the cap is capped (boundary inclusive)" || bad "main(): at-cap file size '$(_file_size_bytes "$EDGEC")'"
 grep -q "log-cap: $CAPDIR/gone.log does not exist" "$LOG_REAPER_LOG" && ok "main(): missing capped path logged, not a crash" || bad "main(): no 'does not exist' line for the missing capped path"
-grep -q "cap cycle complete: checked=4 capped=2 skipped=1 missing=1 failed=0 freed_bytes=$(( BIGC_SIZE - KEEP + 2 * 1024 * 1024 - KEEP )) cap_mb=2 keep_mb=1 dry_run=0" "$LOG_REAPER_LOG" && ok "main(): cap summary counts and freed bytes are right" || bad "main(): cap summary mismatch — got: $(grep 'cap cycle complete' "$LOG_REAPER_LOG")"
+grep -q "cap cycle complete: checked=4 capped=2 skipped=1 missing=1 unreadable=0 failed=0 freed_bytes=$(( BIGC_SIZE - KEEP + 2 * 1024 * 1024 - KEEP )) cap_mb=2 keep_mb=1 dry_run=0" "$LOG_REAPER_LOG" && ok "main(): cap summary counts and freed bytes are right" || bad "main(): cap summary mismatch — got: $(grep 'cap cycle complete' "$LOG_REAPER_LOG")"
 
 echo ""
 echo "=== tail-cap class: DRY_RUN, ENABLED=0 and the production sentinel never mutate ==="

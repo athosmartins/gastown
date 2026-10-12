@@ -211,7 +211,12 @@ _file_size_bytes() {
   stat -f %z "$1" 2>/dev/null
 }
 
-# _tail_cap_one <path> <keep_bytes> → 0 when the file is back under the cap.
+# _tail_cap_one <path> <keep_bytes> → how the file ended up (the caller logs
+# what ACTUALLY happened, never "tail kept" for a file that lost its tail):
+#   0 = back under the cap with its last keep_bytes still in it
+#   2 = emptied: the tail could not be copied aside (no space) so it was cut fully
+#   3 = emptied, and the tail could not be written back (it is in <path>.tailcap.tmp)
+#   1 = nothing freed: the file could not be truncated (or has vanished)
 # Keeps the last keep_bytes IN the live file: copy the tail aside, truncate in
 # place (`: >` keeps the inode, so a writer holding the file open O_APPEND just
 # keeps going), append the tail back. Lines the writer appends between the
@@ -223,14 +228,16 @@ _file_size_bytes() {
 # that did not make it back), overwritten by the next run.
 _tail_cap_one() {
   local path="$1" keep="$2" tmp="$1.tailcap.tmp"
+  # `: >` CREATES a missing file; a path that vanished since the stat must not
+  # come back as an empty file this reaper made.
+  [ -f "$path" ] || return 1
   if tail -c "$keep" "$path" > "$tmp" 2>>"$LOG" && [ -s "$tmp" ]; then
     if ! : > "$path" 2>>"$LOG"; then
       rm -f "$tmp"
       return 1
     fi
     if ! cat "$tmp" >> "$path" 2>>"$LOG"; then
-      log "WARN: could not write the kept tail back into $path (the tail is in $tmp)"
-      return 0
+      return 3
     fi
     rm -f "$tmp"
     return 0
@@ -239,8 +246,10 @@ _tail_cap_one() {
   # for, and recovering space outranks keeping history (same rule as the cp
   # backup in the first class).
   rm -f "$tmp"
-  log "WARN: could not copy the tail of $path aside — truncating it fully instead"
-  : > "$path" 2>>"$LOG"
+  if : > "$path" 2>>"$LOG"; then
+    return 2
+  fi
+  return 1
 }
 
 # Second class (ga-52drsg, see header): cap each path in LOG_REAPER_CAP_PATHS at
@@ -257,8 +266,8 @@ _cap_pass() {
   local cap_bytes keep_bytes
   cap_bytes="$(_mb_to_bytes "$CAP_MB" 20)"
   keep_bytes="$(_cap_keep_bytes "$KEEP_MB" "$cap_bytes")"
-  local checked=0 capped=0 skipped=0 missing=0 failed=0 freed_bytes=0
-  local path size
+  local checked=0 capped=0 skipped=0 missing=0 unreadable=0 failed=0 freed_bytes=0
+  local path size rc
 
   while IFS= read -r path; do
     [ -n "$path" ] || continue
@@ -271,6 +280,15 @@ _cap_pass() {
     fi
 
     size="$(_file_size_bytes "$path")"
+    case "$size" in
+      ''|*[!0-9]*)
+        # Could not tell the size: not "under the cap" and not "over" — counted
+        # and logged on its own, and the file is left alone.
+        unreadable=$((unreadable + 1))
+        log "log-cap: cannot read the size of $path — NOT capped this cycle"
+        continue
+        ;;
+    esac
     if ! _should_rotate "$size" "$cap_bytes"; then
       skipped=$((skipped + 1))
       continue
@@ -283,17 +301,32 @@ _cap_pass() {
       continue
     fi
 
-    if _tail_cap_one "$path" "$keep_bytes"; then
-      capped=$((capped + 1))
-      freed_bytes=$((freed_bytes + size - keep_bytes))
-      log "capped: $path (${size} bytes -> last ${keep_bytes} kept, inode preserved)"
-    else
-      failed=$((failed + 1))
-      log "FAILED to cap: $path"
-    fi
+    _tail_cap_one "$path" "$keep_bytes"
+    rc=$?
+    case "$rc" in
+      0)
+        capped=$((capped + 1))
+        freed_bytes=$((freed_bytes + size - keep_bytes))
+        log "capped: $path (${size} bytes -> last ${keep_bytes} kept, inode preserved)"
+        ;;
+      2)
+        capped=$((capped + 1))
+        freed_bytes=$((freed_bytes + size))
+        log "capped: $path (${size} bytes -> EMPTY: no room to copy the tail aside, so it was cut fully)"
+        ;;
+      3)
+        capped=$((capped + 1))
+        freed_bytes=$((freed_bytes + size))
+        log "capped: $path (${size} bytes -> EMPTY: the kept tail could not be written back, it is in $path.tailcap.tmp)"
+        ;;
+      *)
+        failed=$((failed + 1))
+        log "FAILED to cap: $path (nothing freed)"
+        ;;
+    esac
   done <<< "$LOG_REAPER_CAP_PATHS"
 
-  log "cap cycle complete: checked=$checked capped=$capped skipped=$skipped missing=$missing failed=$failed freed_bytes=$freed_bytes cap_mb=$CAP_MB keep_mb=$KEEP_MB dry_run=$cap_dry"
+  log "cap cycle complete: checked=$checked capped=$capped skipped=$skipped missing=$missing unreadable=$unreadable failed=$failed freed_bytes=$freed_bytes cap_mb=$CAP_MB keep_mb=$KEEP_MB dry_run=$cap_dry"
 }
 
 main() {
