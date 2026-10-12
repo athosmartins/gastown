@@ -1,0 +1,21 @@
+rea-agents 6.4.0 — local patch 0001 (ga-pfc2ww): raise the swiftc helper deadline 60 s -> 300 s.
+
+Why: on macOS, REA compiles two Swift sources (bridge/process/ProcessRunTokenReader*.swift) with
+`xcrun swiftc` the first time it needs process ownership (JavaScript/asar analysis). 6.4.0 hard-codes a
+60 s deadline for that compile and exposes no option or env var to change it. On this host (10 cores,
+load average routinely 40-60) the deadline was hit on 11/10; see docs/runbooks/rea-versao-fixa-e-patch.md.
+Applied by scripts/rea-patch.sh (hash-verified, idempotent). Generated with `diff -u` from the
+registry-verified rea-agents-6.4.0.tgz (sha512-Vj1zWfSlna5bphGoaoI/TcVBuYvze9u+OyPC3Shz8YkBqaCTqB4COnnRoX7XDwMpwI24ZlFEel2yEj0k8LTWEQ==).
+Only line 135 of the file changes; apply with: patch -p1 -F0 -d <rea-agents package dir> -i <this file>
+
+--- a/dist/process/DarwinProcessRunTokenReader.js
++++ b/dist/process/DarwinProcessRunTokenReader.js
+@@ -132,7 +132,7 @@
+             delete compilerEnvironment.CLANG_MODULE_CACHE_PATH;
+             try {
+                 await execFileOutput(options.xcrun ?? "/usr/bin/xcrun", ["swiftc", ...sourceFiles, "-o", output], {
+-                    timeout: 60_000,
++                    timeout: 300_000, // local patch (Mayor 11/10): swiftc >60s sob load alto
+                     maxBuffer: 1024 * 1024,
+                     signal,
+                     stopSignal: SWIFTC_INTERRUPT,
