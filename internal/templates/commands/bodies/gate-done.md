@@ -95,6 +95,14 @@ is recorded as "could not measure" and never refused. Write tests that do not
 depend on order, wall-clock time or the network and you will never notice the
 check exists.
 
+**Keep the minimum test that proves the behavior (ga-mzyghi).** The size cap
+counts tests and docs too: a submission over 1000 changed lines in total
+(generated files, vendor, lockfiles and changelog fragments excluded) is
+refused, as is one over 800 lines of production code. Guide: test lines <=
+code lines. If you are over, slice the bead (never drop the test that proves
+the behavior); a feature slice is born `-t feature`. Reviewers pass 81% of
+submissions up to 200 lines and 36% of those over 800.
+
 ## Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
 
 Six gate rejections in one day were the same defect class wearing different

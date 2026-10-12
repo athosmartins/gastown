@@ -13,6 +13,13 @@
 # Exemption: label gate:size-exempt WITH a reason in a comment (mechanical migration / rename). Born OFF: the flag
 # file $GC_CITY/.gc/gate-e11-diff-cap.on is the Mayor's switch.
 #
+# ga-mzyghi adds a SECOND cap on the same arm-B submission: the TOTAL of the diff (insertions + deletions over every path
+# a person wrote — code, tests, fixtures, docs; not generated/vendor/lockfiles/node_modules/dist, not changelog fragments),
+# 1000 by default (GATE_E11_TOTAL_CAP). Same third state (refused only on a MEASURED total with the exemption READ as
+# absent). Exempt by gate:size-exempt (label + reason) or by a source bead that already carries gate:fix-attempt:*. The
+# first-review pass rate falls from 81% (<=200 lines) to 36% (>800) by TOTAL size, and the average bead was above 1000
+# because 532 of its 871 lines were tests and docs, which the production cap never saw.
+#
 # THE THIRD STATE, which is what the acceptance criteria hang on: a diff that cannot be read, a count that failed,
 # a bead whose exemption cannot be read — none of those refuses. They are logged as 'nao-medido' and the submission
 # goes through exactly as today. A refusal needs POSITIVE evidence (a measured count over the cap and an exemption
@@ -35,6 +42,9 @@ bad() { echo "  FAIL $*"; FAIL=$((FAIL+1)); }
 eq()  { [ "$2" = "$3" ] && ok "$1" || bad "$1 — got '$2', want '$3'"; }
 has() { grep -F -- "$3" "$2" >/dev/null 2>&1 && ok "$1" || bad "$1 — '$3' not in: $(tr '\n' '|' < "$2" | cut -c1-300)"; }
 lacks() { grep -F -- "$3" "$2" >/dev/null 2>&1 && bad "$1 — '$3' unexpectedly in: $(tr '\n' '|' < "$2" | cut -c1-300)" || ok "$1"; }
+# five older assertions call `hasnt`, which nothing defined: "command not found" is not a failure here, so they counted for
+# nothing (found by ga-mzyghi). Same meaning as `lacks`.
+hasnt() { lacks "$@"; }
 
 [ -f "$GUARD" ] || { echo "FATAL: missing $GUARD"; exit 1; }
 
@@ -43,14 +53,16 @@ GATE_GUARD_LIB_ONLY=1 . "$GUARD"
 set +e  # sourcing the guard leaks its `set -e` into this shell (same as the siblings)
 # An operator's own cap in the environment would turn every live-block assertion below into a loud failure (gate round 3,
 # nit): the sections that need an override set it themselves, per call.
-unset GATE_E11_CAP_LINES
+unset GATE_E11_CAP_LINES GATE_E11_TOTAL_CAP
 
 # ── 0. preflight: every function the feature is made of exists ──────────────
 # Without this a negative assertion ("prints nothing", "no bd call") passes VACUOUSLY on a guard that has no E11 at
 # all — `command not found` also prints nothing. One assertion per function, so the old guard fails loudly here.
 echo "── 0. the E11 functions exist ──"
 E11_FNS="gate_e11_switch_state gate_e11_enabled gate_e11_arm_for_bead gate_e11_path_is_production gate_e11_count_production_lines
-gate_e11_cap_lines gate_e11_cap_state gate_e11_exempt_label gate_e11_exempt_reason gate_e11_exempt_state gate_e11_exempt_merge gate_e11_verdict gate_e11_force_all"
+gate_e11_cap_lines gate_e11_cap_state gate_e11_exempt_label gate_e11_exempt_reason gate_e11_exempt_state gate_e11_exempt_merge gate_e11_verdict gate_e11_force_all
+gate_e11_path_is_generated gate_e11_path_counts_for_total gate_e11_count_lines_by gate_e11_count_total_lines gate_e11_total_cap gate_e11_total_cap_state
+gate_e11_fix_attempt_label gate_e11_fix_attempt_state gate_e11_total_verdict gate_e11_combine_verdicts gate_e11_caps_exceeded gate_e11_refused_by"
 E11_MISSING=0
 for f in $E11_FNS; do
   if declare -F "$f" >/dev/null 2>&1; then ok "function $f is defined"; else bad "function $f is NOT defined in $GUARD"; E11_MISSING=1; fi
@@ -107,7 +119,10 @@ eq "100%: junk env (GATE_E11_ALL=yes) -> 0, never 'on by accident'" "$(GATE_E11_
 eq "100%: no GC_CITY and no env -> 0" "$(unset GC_CITY; GATE_E11_ALL= gate_e11_force_all)" "0"
 rm -f "$TMPD/city/.gc/gate-e11-diff-cap.all"
 # the live block honours it: the exact arm-promotion line must exist between the sentinels
-if sed -n '/# SELFTEST-EXTRACT e11-diff-cap: BEGIN/,/# SELFTEST-EXTRACT e11-diff-cap: END/p' "$GUARD" | grep -qF 'if [ "$_E11_ARM" = "A" ] && [ "$(gate_e11_force_all)" = "1" ]; then _E11_ARM="B"; _E11_FORCED=1; fi'; then ok "live block promotes arm A to B under the 100% switch (and leaves '?' alone)"; else bad "live block does not consult gate_e11_force_all"; fi
+# (the block is read into a variable first: `sed | grep -q` under pipefail fails whenever grep exits on its first match before
+# sed has finished writing — the block grew with ga-mzyghi and the assertion became flaky)
+E11_BLOCK_NOW=$(sed -n '/# SELFTEST-EXTRACT e11-diff-cap: BEGIN/,/# SELFTEST-EXTRACT e11-diff-cap: END/p' "$GUARD" || true)
+if [[ "$E11_BLOCK_NOW" == *'if [ "$_E11_ARM" = "A" ] && [ "$(gate_e11_force_all)" = "1" ]; then _E11_ARM="B"; _E11_FORCED=1; fi'* ]]; then ok "live block promotes arm A to B under the 100% switch (and leaves '?' alone)"; else bad "live block does not consult gate_e11_force_all"; fi
 eq "state: env 'off' = env-invalido (OFF, and it SAYS why)" "$(GATE_E11_ENABLED=off GC_CITY="$TMPD/city" gate_e11_switch_state)" "env-invalido"
 eq "state: env ' ' (a single space) = env-invalido" "$(GATE_E11_ENABLED=" " GC_CITY="$TMPD/city" gate_e11_switch_state)" "env-invalido"
 rm -f "$FLAG"
@@ -264,6 +279,54 @@ eq "a 10-digit count (past any real diff): unknown" "$(gate_e11_count_production
 eq "a 9-digit count is still a number" "$(gate_e11_count_production_lines "100000000${TAB}0${TAB}src/a.sh")" "100000000"
 eq "a huge count on a TEST path is not read as a number to wrap either: still unknown (the row is unreadable, whatever the path)" "$(gate_e11_count_production_lines "99999999999999999999${TAB}0${TAB}tests/t.sh")" "unknown"
 
+# ── 4b. the TOTAL: everything a person wrote (ga-mzyghi) ─────────────────────
+echo "── 4b. gate_e11_path_is_generated / gate_e11_path_counts_for_total / gate_e11_count_total_lines ──"
+gen_p() { gate_e11_path_is_generated "$1"; }
+for p in vendor/lib/a.go a/node_modules/x/index.js a/dist/bundle.js a/generated/x.go \
+         package-lock.json sub/yarn.lock sub/pnpm-lock.yaml go.sum Cargo.lock \
+         api/x.pb.go x_pb2.py x_pb2_grpc.py static/app.min.js static/app.min.css a/b.generated.ts a/b_generated.go x.gen.go; do
+  gen_p "$p"; eq "generated (no cap counts it): $p" "$?" "0"
+done
+# the shared list is ONLY what a tool wrote: tests, docs, snapshots and changelog fragments are decided by each cap itself
+for p in src/a.sh tests/x.sh docs/a.md a/b/test_x.py a/__snapshots__/x.snap a/x.golden lib/changelog.d/x.md \
+         src/distance/a.go src/vendored/a.sh src/generated_x.go src/lockfile.go; do
+  gen_p "$p"; eq "not generated: $p" "$?" "1"
+done
+tot() { gate_e11_path_counts_for_total "$1"; }
+# Code, tests, fixtures, docs: all of it is written by hand and all of it is review load.
+for p in src/a.sh tests/x.sh a/test/x.sh a/b/test_x.py x_test.go foo.selftest.sh web/a.test.ts a/conftest.py \
+         testdata/a.txt a/fixtures/b.json docs/a.md README.md notes/a.markdown notes/a.mdx \
+         .gascity-gastown-hq/packs/town-deltas/assets/prod-tests/gascity/story-ga-5lx.sh \
+         lib/changelog.d.txt src/changelog.d.go src/distance/a.go src/vendored/a.sh; do
+  tot "$p"; eq "counts toward the total: $p" "$?" "0"
+done
+# Only what a tool wrote (the shared list), the changelog fragments and the test snapshots stay out.
+for p in lib/changelog.d/20261012-x.md changelog.d/a.txt a/__snapshots__/x.snap x.snap a/x.golden \
+         vendor/lib/a.go a/node_modules/x/index.js a/dist/bundle.js a/generated/x.go \
+         package-lock.json sub/yarn.lock sub/pnpm-lock.yaml go.sum Cargo.lock \
+         api/x.pb.go x_pb2.py x_pb2_grpc.py static/app.min.js static/app.min.css a/b.generated.ts a/b_generated.go x.gen.go; do
+  tot "$p"; eq "NOT in the total: $p" "$?" "1"
+done
+# the numstat of section 4, read by the other counter: 12 (src/a.sh) + 10 (tests) + 0 (lockfile) + 0 (binary) + 8 (README) + 20
+eq "total: tests and docs count, lockfile and binary do not: 12 + 10 + 8 + 20" "$(gate_e11_count_total_lines "$NS")" "50"
+eq "...and the production count of the SAME numstat is unchanged: 32" "$(gate_e11_count_production_lines "$NS")" "32"
+eq "total: empty numstat is a MEASURED zero" "$(gate_e11_count_total_lines "")" "0"
+eq "total: a quoted path is unquoted first" "$(gate_e11_count_total_lines "4${TAB}0${TAB}\"tests/q.sh\"")" "4"
+eq "total: a quoted GENERATED path is still generated" "$(gate_e11_count_total_lines "4${TAB}0${TAB}\"vendor/q.go\"")" "0"
+eq "total: a changelog fragment does not count, the code beside it does" "$(gate_e11_count_total_lines "2000${TAB}0${TAB}lib/changelog.d/20261012-x.md
+30${TAB}0${TAB}src/a.sh")" "30"
+eq "total: added + deleted" "$(gate_e11_count_total_lines "100${TAB}40${TAB}tests/t.sh")" "140"
+eq "total: garbled row (no path): unknown, not 0" "$(gate_e11_count_total_lines "10${TAB}2")" "unknown"
+eq "total: garbled row (non-numeric count): unknown" "$(gate_e11_count_total_lines "abc${TAB}2${TAB}src/a.sh")" "unknown"
+eq "total: a garbled row on a GENERATED path still poisons the count (the row is unreadable, whatever the path)" "$(gate_e11_count_total_lines "abc${TAB}2${TAB}package-lock.json
+10${TAB}0${TAB}src/a.sh")" "unknown"
+eq "total: a 20-digit count would wrap: unknown" "$(gate_e11_count_total_lines "99999999999999999999${TAB}0${TAB}tests/t.sh")" "unknown"
+eq "total: a 10-digit count: unknown" "$(gate_e11_count_total_lines "1000000000${TAB}0${TAB}src/a.sh")" "unknown"
+eq "total: a 9-digit count is still a number" "$(gate_e11_count_total_lines "100000000${TAB}0${TAB}tests/t.sh")" "100000000"
+eq "gate round 3 replay (a7321f4a8): 694 production lines, 1017 in the total (the total cap would refuse it)" "$(gate_e11_count_total_lines "$A7321")" "1017"
+eq "count_lines_by with a predicate that is not a function: unknown, never a measured zero" "$(gate_e11_count_lines_by no_such_predicate "10${TAB}2${TAB}src/a.sh")" "unknown"
+eq "count_lines_by with no predicate at all: unknown" "$(gate_e11_count_lines_by "" "10${TAB}2${TAB}src/a.sh")" "unknown"
+
 # ── 5. the cap ───────────────────────────────────────────────────────────────
 echo "── 5. gate_e11_cap_lines ──"
 eq "default is 800" "$(unset GATE_E11_CAP_LINES; gate_e11_cap_lines)" "800"
@@ -287,6 +350,25 @@ eq "state: 999999999 (9 digits, the last readable size) = ok" "$(GATE_E11_CAP_LI
 for JC in abc "1,200" "1.5" "-5" " " "5 " "0" "00" "1000000000" "99999999999999999999"; do
   eq "state: '$JC' = invalido (an override nobody can read is not 'no override')" "$(GATE_E11_CAP_LINES="$JC" gate_e11_cap_state)" "invalido"
 done
+
+# ── 5c. the total cap (ga-mzyghi): same validation as the production cap, its own default ──
+echo "── 5c. gate_e11_total_cap / gate_e11_total_cap_state ──"
+eq "default total cap is 1000" "$(unset GATE_E11_TOTAL_CAP; gate_e11_total_cap)" "1000"
+eq "numeric override" "$(GATE_E11_TOTAL_CAP=1500 gate_e11_total_cap)" "1500"
+eq "a leading zero is still a number" "$(GATE_E11_TOTAL_CAP=01500 gate_e11_total_cap)" "1500"
+eq "junk override falls back to 1000 (not to the production 800)" "$(GATE_E11_TOTAL_CAP=abc gate_e11_total_cap)" "1000"
+eq "0 would refuse everything: falls back to 1000" "$(GATE_E11_TOTAL_CAP=0 gate_e11_total_cap)" "1000"
+eq "empty override falls back to 1000" "$(GATE_E11_TOTAL_CAP= gate_e11_total_cap)" "1000"
+eq "the production override does not move the total cap" "$(GATE_E11_CAP_LINES=500 gate_e11_total_cap)" "1000"
+eq "the total override does not move the production cap" "$(unset GATE_E11_CAP_LINES; GATE_E11_TOTAL_CAP=1500 gate_e11_cap_lines)" "800"
+eq "state: unset = ok (the documented default is a decision)" "$(unset GATE_E11_TOTAL_CAP; gate_e11_total_cap_state)" "ok"
+eq "state: empty = ok (no override)" "$(GATE_E11_TOTAL_CAP= gate_e11_total_cap_state)" "ok"
+eq "state: 1500 = ok" "$(GATE_E11_TOTAL_CAP=1500 gate_e11_total_cap_state)" "ok"
+eq "state: 999999999 (9 digits, the last readable size) = ok" "$(GATE_E11_TOTAL_CAP=999999999 gate_e11_total_cap_state)" "ok"
+for JC in abc "1,200" "1.5" "-5" " " "5 " "0" "00" "1000000000" "99999999999999999999"; do
+  eq "state: '$JC' = invalido (an override nobody can read is not 'no override')" "$(GATE_E11_TOTAL_CAP="$JC" gate_e11_total_cap_state)" "invalido"
+done
+eq "state: the production override being junk does not make the total override invalid" "$(GATE_E11_CAP_LINES=abc gate_e11_total_cap_state)" "ok"
 
 # ── 6. the exemption: label + reason, three states ───────────────────────────
 echo "── 6. gate:size-exempt needs a label AND a reason ──"
@@ -349,6 +431,85 @@ eq "B, over the cap, an exemption word nobody defined: accepts" "$(v B 801 banan
 eq "B, the cap is a parameter" "$(v B 1500 nao 2000)" "dentro-do-teto"
 eq "B, a junk cap falls back to 800" "$(v B 801 nao abc)" "recusa"
 
+# ── 7b. the total cap's own pieces: the fix-attempt exemption, the verdict, the two-cap combination ──
+echo "── 7b. gate:fix-attempt:*, gate_e11_total_verdict, gate_e11_combine_verdicts, cap_hit / refused_by ──"
+eq "fix-attempt label present (array form)" "$(gate_e11_fix_attempt_label '[{"id":"ga-x","labels":["story:approved","gate:fix-attempt:1"]}]')" "yes"
+eq "fix-attempt label present (object form)" "$(gate_e11_fix_attempt_label '{"id":"ga-x","labels":["gate:fix-attempt:3"]}')" "yes"
+eq "a :0 reset is still a bead the gate already judged (the Pilot's own predicate; a doubt goes to the exempt side)" "$(gate_e11_fix_attempt_label '[{"id":"ga-x","labels":["gate:fix-attempt:0"]}]')" "yes"
+eq "no fix-attempt label: no" "$(gate_e11_fix_attempt_label '[{"id":"ga-x","labels":["story:approved","gate:needs-fix"]}]')" "no"
+eq "no labels key at all on a real bead: no" "$(gate_e11_fix_attempt_label '[{"id":"ga-x"}]')" "no"
+eq "gate:e11-refusals:N is not a fix attempt (a refusal by THIS gate must not exempt the bead from it)" "$(gate_e11_fix_attempt_label '[{"id":"ga-x","labels":["gate:needs-fix","gate:e11-refusals:2"]}]')" "no"
+eq "a label that only CONTAINS the text is not the label" "$(gate_e11_fix_attempt_label '[{"id":"ga-x","labels":["x:gate:fix-attempt:1","gate:fix-attemptX"]}]')" "no"
+eq "empty output (bd failed): desconhecido, not 'no'" "$(gate_e11_fix_attempt_label "")" "desconhecido"
+eq "not JSON: desconhecido" "$(gate_e11_fix_attempt_label "Error: no issue found")" "desconhecido"
+eq "an error object with no id: desconhecido, not 'no'" "$(gate_e11_fix_attempt_label '{"error":"not found"}')" "desconhecido"
+eq "fix-attempt state: yes = exempt" "$(gate_e11_fix_attempt_state yes)" "exempt"
+eq "fix-attempt state: no = nao" "$(gate_e11_fix_attempt_state no)" "nao"
+eq "fix-attempt state: desconhecido = desconhecido" "$(gate_e11_fix_attempt_state desconhecido)" "desconhecido"
+eq "fix-attempt state: empty = desconhecido" "$(gate_e11_fix_attempt_state "")" "desconhecido"
+eq "fix-attempt state: a word nobody defined = desconhecido" "$(gate_e11_fix_attempt_state banana)" "desconhecido"
+exT() { gate_e11_exempt_merge "$1" "$(gate_e11_fix_attempt_state "$2")"; }   # what the live block computes for the total cap
+eq "total exemption: size-exempt absent + fix-attempt: exempt" "$(exT nao yes)" "exempt"
+eq "total exemption: label without a reason + fix-attempt: exempt" "$(exT label-sem-motivo yes)" "exempt"
+eq "total exemption: size-exempt present + no fix-attempt: exempt" "$(exT exempt no)" "exempt"
+eq "total exemption: neither: nao (a refusal may stand)" "$(exT nao no)" "nao"
+eq "total exemption: label without a reason, no fix-attempt: label-sem-motivo (a refusal may stand)" "$(exT label-sem-motivo no)" "label-sem-motivo"
+eq "total exemption: fix-attempt unreadable, size-exempt absent: desconhecido (accepts)" "$(exT nao desconhecido)" "desconhecido"
+eq "total exemption: size-exempt unreadable, no fix-attempt: desconhecido (accepts)" "$(exT desconhecido no)" "desconhecido"
+tv() { gate_e11_total_verdict "$@"; }
+eq "total: arm A, huge diff: controle" "$(tv A 5000 nao 1000)" "controle"
+eq "total: no arm: sem-braco, never refused" "$(tv '?' 5000 nao 1000)" "sem-braco"
+eq "total: B, count unknown: nao-medido (third state, accepts)" "$(tv B unknown nao-consultado 1000)" "nao-medido"
+eq "total: B, exactly at the cap: dentro-do-teto" "$(tv B 1000 nao-consultado 1000)" "dentro-do-teto"
+eq "total: B, one over, no exemption: recusa" "$(tv B 1001 nao 1000)" "recusa"
+eq "total: B, over, label without reason: recusa" "$(tv B 1001 label-sem-motivo 1000)" "recusa"
+eq "total: B, over, exempt: isento" "$(tv B 1001 exempt 1000)" "isento"
+eq "total: B, over, exemption unreadable: nao-medido-isencao (accepts)" "$(tv B 1001 desconhecido 1000)" "nao-medido-isencao"
+eq "total: B, over, exemption never consulted: accepts, never refuses" "$(tv B 1001 nao-consultado 1000)" "nao-medido-isencao"
+eq "total: no cap given: the default is 1000" "$(tv B 1001 nao)" "recusa"
+eq "total: no cap given, 1000 lines: dentro-do-teto" "$(tv B 1000 nao)" "dentro-do-teto"
+eq "total: a junk cap falls back to 1000, NOT to the production 800 (900 lines is inside)" "$(tv B 900 nao abc)" "dentro-do-teto"
+eq "total: a junk cap falls back to 1000 (1001 lines is out)" "$(tv B 1001 nao abc)" "recusa"
+eq "total: the cap is a parameter" "$(tv B 900 nao 800)" "recusa"
+cv() { gate_e11_combine_verdicts "$@"; }
+eq "combine: recusa for one cap + nao-medido for the other: recusa (positive evidence stands alone)" "$(cv recusa nao-medido)" "recusa"
+eq "combine: nao-medido-isencao + recusa: recusa" "$(cv nao-medido-isencao recusa)" "recusa"
+eq "combine: recusa + dentro-do-teto: recusa" "$(cv recusa dentro-do-teto)" "recusa"
+eq "combine: isento + recusa: recusa (an exemption for one cap is not one for the other)" "$(cv isento recusa)" "recusa"
+eq "combine: recusa + recusa: recusa" "$(cv recusa recusa)" "recusa"
+eq "combine: controle + controle: controle" "$(cv controle controle)" "controle"
+eq "combine: sem-braco + sem-braco: sem-braco" "$(cv sem-braco sem-braco)" "sem-braco"
+eq "combine: dentro-do-teto + dentro-do-teto: dentro-do-teto" "$(cv dentro-do-teto dentro-do-teto)" "dentro-do-teto"
+eq "combine: dentro-do-teto + nao-medido-isencao: the doubt stays visible" "$(cv dentro-do-teto nao-medido-isencao)" "nao-medido-isencao"
+eq "combine: nao-medido + dentro-do-teto: nao-medido" "$(cv nao-medido dentro-do-teto)" "nao-medido"
+eq "combine: isento + dentro-do-teto: isento" "$(cv isento dentro-do-teto)" "isento"
+eq "combine: nao-medido + nao-medido-isencao: nao-medido-isencao" "$(cv nao-medido nao-medido-isencao)" "nao-medido-isencao"
+eq "combine: nao-medido + isento: nao-medido" "$(cv nao-medido isento)" "nao-medido"
+eq "combine: a word nobody defined is a doubt, never a refusal" "$(cv banana dentro-do-teto)" "nao-medido"
+eq "combine: ...also next to isento" "$(cv isento banana)" "nao-medido"
+eq "combine: ...a refusal on the other cap still stands" "$(cv banana recusa)" "recusa"
+eq "combine: ...a stronger doubt on the other cap stays" "$(cv banana nao-medido-isencao)" "nao-medido-isencao"
+eq "combine: two undefined words: the doubt, never the word itself" "$(cv banana banana)" "nao-medido"
+eq "combine: empty + empty: the doubt (nothing is invented, nothing is refused)" "$(cv "" "")" "nao-medido"
+ce() { gate_e11_caps_exceeded "$@"; }
+eq "caps_exceeded: production only" "$(ce 900 800 900 1000)" "producao"
+eq "caps_exceeded: total only" "$(ce 600 800 1300 1000)" "total"
+eq "caps_exceeded: both" "$(ce 900 800 1300 1000)" "ambos"
+eq "caps_exceeded: neither" "$(ce 700 800 900 1000)" "nenhum"
+eq "caps_exceeded: exactly at both caps is not over" "$(ce 800 800 1000 1000)" "nenhum"
+eq "caps_exceeded: one over the production cap" "$(ce 801 800 1000 1000)" "producao"
+eq "caps_exceeded: one over the total cap" "$(ce 800 800 1001 1000)" "total"
+eq "caps_exceeded: counts not measured are not over anything" "$(ce unknown 800 unknown 1000)" "nenhum"
+eq "caps_exceeded: arm A / no arm ('-') is not over anything" "$(ce - 800 - 1000)" "nenhum"
+eq "caps_exceeded: one unknown, the other measured" "$(ce unknown 800 1300 1000)" "total"
+eq "caps_exceeded: junk caps fall back (800 / 1000)" "$(ce 801 abc 1001 abc)" "ambos"
+eq "caps_exceeded: junk caps fall back, 900 total is inside 1000" "$(ce 700 abc 900 abc)" "nenhum"
+rb() { gate_e11_refused_by "$@"; }
+eq "refused_by: both verdicts refuse" "$(rb recusa recusa)" "ambos"
+eq "refused_by: production refuses, the total is exempt" "$(rb recusa isento)" "producao"
+eq "refused_by: the total refuses alone" "$(rb dentro-do-teto recusa)" "total"
+eq "refused_by: nobody refuses" "$(rb isento nao-medido)" "nenhum"
+
 # ── 8. the guard block, run LIVE ─────────────────────────────────────────────
 echo "── 8. the live block in quality-gate-guard.sh ──"
 E11_FILE="$TMPD/e11-block.sh"
@@ -384,6 +545,15 @@ $GITC clone -q "$ORIGIN" "$SEED" 2>/dev/null
   mkb feat/rewrite;  gen src/mod.sh 500 new;                                                    fin feat/rewrite "feat(ga-e11): rewrite 500 lines"
   mkb feat/binary;   printf '\000\001\002\003' > src/blob.bin; gen src/ten.sh 10;               fin feat/binary "feat(ga-e11): a binary and 10 lines"
   mkb feat/pytest;   gen scripts/jev.selftest.py 910; gen lib/selftest-sandbox.lib.sh 70; gen scripts/jev.py 40; fin feat/pytest "feat(ga-e11): 40 prod + selftest.py + selftest lib"
+  # ga-mzyghi: branches whose PRODUCTION count is under 800 and whose TOTAL is around 1000
+  mkb feat/tot1300;  gen src/b.sh 600;  gen tests/b.sh 700;                                     fin feat/tot1300 "feat(ga-e11): 600 prod + 700 test = 1300 total"
+  mkb feat/tot1001;  gen src/b.sh 601;  gen tests/b.sh 400;                                     fin feat/tot1001 "feat(ga-e11): 1001 total"
+  mkb feat/tot1000;  gen src/b.sh 600;  gen tests/b.sh 400;                                     fin feat/tot1000 "feat(ga-e11): exactly the total cap"
+  mkb feat/totdocs;  gen src/b.sh 100;  gen docs/b.md 1100;                                     fin feat/totdocs "feat(ga-e11): 100 prod + 1100 docs"
+  # 400 written lines + 14.000 lines nobody wrote; -f so that no ignore rule on this machine (dist/, node_modules/) drops a file
+  mkb feat/totexcl;  gen src/b.sh 300;  gen tests/b.sh 100; gen lib/changelog.d/x.md 2000; gen vendor/v.go 2000; gen package-lock.json 2000
+                     gen node_modules/n.js 2000; gen dist/d.js 2000; gen api/x.pb.go 2000; gen tests/__snapshots__/s.snap 2000
+                     $GITC add -A -f && $GITC commit -q -m "feat(ga-e11): 400 written lines among generated/vendor/changelog/snapshot" && $GITC push -q origin feat/totexcl
 ) >/dev/null 2>&1
 $GITC clone -q "$ORIGIN" "$RIG_OK" 2>/dev/null
 
@@ -485,6 +655,11 @@ run_e11() {
   return $?
 }
 calls_n() { wc -c < "$CALLS" | tr -d ' '; }
+
+# Everything from here to "the TOTAL cap" exercises the PRODUCTION cap in isolation (ga-lzidpo). Some of its fixtures carry
+# thousands of test/doc lines on purpose — that is what "tests do not count" is about — and the total cap (ga-mzyghi)
+# would refuse them. It is lifted here; the TOTAL-cap section unsets this and runs on the real default.
+export GATE_E11_TOTAL_CAP=999999999
 
 echo "  — flag OFF: byte-for-byte today —"
 set_beads "$BB" "$PLAIN" "$PLAIN"
@@ -779,6 +954,192 @@ lacks "readable cap: not flagged as invalid" "$LOGF" "cap-invalido"
 GATE_E11_CAP_LINES=500 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "a READABLE cap of 500, 900 prod lines: still REFUSED (positive evidence, nothing weakened)" "$RC" "1"
 has "readable tight cap: the refusal names that cap" "$LOGF" "verdict=recusa production_lines=900 cap=500"
+
+# ── the TOTAL cap, live (ga-mzyghi) ──────────────────────────────────────────
+echo "  — the TOTAL cap (ga-mzyghi): code + tests + docs, 1000 by default —"
+unset GATE_E11_TOTAL_CAP   # the real default from here on
+RAWX=$($GITC -C "$RIG_OK" diff --numstat --no-renames origin/main...origin/feat/totexcl 2>/dev/null)
+eq "fixture: feat/totexcl really carries its 9 files (generated ones force-added past any ignore rule)" "$(printf '%s\\n' "$RAWX" | grep -c .)" "9"
+eq "fixture: of those, 400 lines are written by a person" "$(gate_e11_count_total_lines "$RAWX")" "400"
+
+set_beads "$BB" "$PLAIN" "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "arm B, 600 prod + 700 test = 1300 total: REFUSED (production is under 800 — only the total says no)" "$RC" "1"
+has "refusal record: both counts, both caps, the new fields at the END of the line" "$LOGF" "LOG E11-DIFF-CAP bead=$BB arm=B verdict=recusa production_lines=600 cap=800 exempt=nao why=- branch=feat/tot1300 marker=m-e11 forced=0 total_lines=1300 total_cap=1000 cap_hit=total fix_attempt=no"
+if grep -Eq ' verdict=[a-z-]+ production_lines=600 cap=800 .* total_lines=1300 total_cap=1000 cap_hit=total fix_attempt=no$' "$LOGF"; then ok "the record still parses the way gate-daily-report.py reads it (' verdict=<word> ', one word)"; else bad "the record does not match the shape gate-daily-report.py parses"; fi
+has "the err line names the total" "$LOGF" "ERR   diff-size cap (ga-lzidpo/E11): 1300 total lines (production: 600) on feat/tot1300 vs origin/main exceed the total cap of 1000"
+has "refusal: same machinery as the production refusal — the marker's refusal label" "$CALLS" "label add m-e11 gate-guard:refused-e11"
+has "refusal: source bead gets gate:needs-fix + counter 1" "$CALLS" "BD -C $SRC_STORE label add $BB gate:needs-fix,gate:e11-refusals:1"
+has "refusal: the VERDICT: FAIL comment on the source bead" "$CALLS" "BD -C $SRC_STORE comment $BB VERDICT: FAIL (gate guard, diff-size cap E11 — refusal 1 of 3"
+has "refusal text: states the TOTAL" "$CALLS" "tem 1300 linhas no TOTAL"
+has "refusal text: ...and the PRODUCTION" "$CALLS" "600 linhas de codigo de PRODUCAO"
+has "refusal text: ...and both caps, naming the one exceeded" "$CALLS" "Os tetos por submissao sao 1000 no total e 800 de producao. Estourou o teto do total."
+lacks "refusal text: does not blame the production cap" "$CALLS" "Estourou o teto de producao."
+has "refusal text: asks for slices" "$CALLS" "O QUE FAZER: dividir em fatias"
+has "refusal text: the total-cap refusal also carries the typed slicing command (ga-2xdj1x: a feature slice is born -t feature)" "$CALLS" "bd create '<titulo da fatia>' --parent $BB -t "
+has "refusal text: keep only the minimum test that proves the behavior" "$CALLS" "mantenha so o teste minimo que prova o comportamento"
+has "refusal text: the guide, test lines <= code lines" "$CALLS" "(guia: linhas de teste <= linhas de codigo)"
+has "refusal text: the exemption label is still named" "$CALLS" "gate:size-exempt"
+has "refusal: marker closed, VERIFIED, failed" "$LOGF" "CLOSED (verified, gate-status:failed)"
+has "refusal: the marker comment states the total" "$CALLS" "1300 total lines (production: 600) on feat/tot1300 vs origin/main exceed the total cap of 1000"
+
+run_e11 1 "$RIG_OK" "$BB" feat/tot1001; RC=$?
+eq "arm B, 601 prod + 400 test = 1001 total: REFUSED (the cap is 'over 1000')" "$RC" "1"
+set_beads "$BB" "$PLAIN" "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1000; RC=$?
+eq "arm B, 600 prod + 400 test = exactly 1000 total: accepted" "$RC" "0"
+has "exactly the total cap: dentro-do-teto, both counts logged" "$LOGF" "verdict=dentro-do-teto production_lines=600 cap=800 exempt=nao-consultado why=- branch=feat/tot1000 marker=m-e11 forced=0 total_lines=1000 total_cap=1000 cap_hit=nenhum fix_attempt=nao-consultado"
+eq "inside both caps: no bd call at all (the exemption is looked up only over a cap)" "$(calls_n)" "0"
+
+run_e11 1 "$RIG_OK" "$BB" feat/totdocs; RC=$?
+eq "arm B, 100 prod + 1100 lines of docs = 1200 total: REFUSED (docs count toward the total)" "$RC" "1"
+has "docs: production_lines=100, total_lines=1200" "$LOGF" "verdict=recusa production_lines=100 cap=800 exempt=nao why=- branch=feat/totdocs marker=m-e11 forced=0 total_lines=1200"
+
+set_beads "$BB" "$PLAIN" "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/totexcl; RC=$?
+eq "arm B, 400 written lines among 14.000 generated/vendor/lockfile/dist/changelog/snapshot lines: accepted" "$RC" "0"
+has "excluded paths do not count: total_lines=400 (production 300)" "$LOGF" "verdict=dentro-do-teto production_lines=300 cap=800 exempt=nao-consultado why=- branch=feat/totexcl marker=m-e11 forced=0 total_lines=400"
+eq "...and no bd call" "$(calls_n)" "0"
+
+run_e11 1 "$RIG_OK" "$BB" feat/nonprod; RC=$?
+eq "arm B, the 4050-line non-production branch (tests, fixtures, docs, selftest + 50 prod): REFUSED now — the production-only cap let it through" "$RC" "1"
+has "nonprod: production_lines=50 total_lines=4050 cap_hit=total" "$LOGF" "verdict=recusa production_lines=50 cap=800 exempt=nao why=- branch=feat/nonprod marker=m-e11 forced=0 total_lines=4050 total_cap=1000 cap_hit=total"
+
+set_beads "$BB" "$PLAIN" "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "900 prod + 100 test = 1000 total: still refused, by the PRODUCTION cap alone" "$RC" "1"
+has "production only: cap_hit=producao" "$LOGF" "total_lines=1000 total_cap=1000 cap_hit=producao fix_attempt=no"
+has "production only: the text names the production cap" "$CALLS" "Os tetos por submissao sao 1000 no total e 800 de producao. Estourou o teto de producao."
+lacks "production only: the text does not blame the total" "$CALLS" "Estourou o teto do total."
+
+echo "  — both caps over —"
+set_beads "$BB" "$PLAIN" "$PLAIN"
+GATE_E11_TOTAL_CAP=950 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "900 prod + 100 test with a total cap of 950: REFUSED" "$RC" "1"
+has "both over: cap_hit=ambos, total_cap=950" "$LOGF" "total_lines=1000 total_cap=950 cap_hit=ambos"
+has "both over: the text names both" "$CALLS" "Os tetos por submissao sao 950 no total e 800 de producao. Estourou os dois tetos."
+has "both over: err line states both" "$LOGF" "900 production lines (cap 800) and 1000 total lines (cap 950) on feat/prod900 vs origin/main exceed both caps"
+
+echo "  — the exemptions of the total cap —"
+set_beads "$BB" '["story:approved","gate:fix-attempt:1"]' "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "a bead that already has gate:fix-attempt:1, 1300 total: accepted" "$RC" "0"
+has "fix-attempt: isento, the cap was hit and the exemption is named" "$LOGF" "verdict=isento production_lines=600 cap=800 exempt=nao why=- branch=feat/tot1300 marker=m-e11 forced=0 total_lines=1300 total_cap=1000 cap_hit=total fix_attempt=yes"
+lacks "fix-attempt: nothing refused" "$CALLS" "gate-guard:refused-e11"
+lacks "fix-attempt: no gate-status written" "$CALLS" "STATUS"
+has "fix-attempt: the source bead is read from BEAD_CITY" "$CALLS" "BD -C $SRC_STORE show $BB"
+set_beads "$BB" '["story:approved","gate:fix-attempt:0"]' "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "gate:fix-attempt:0 (a manual reset) counts too: accepted" "$RC" "0"
+set_beads "$BB" '["story:approved","gate:needs-fix","gate:e11-refusals:2"]' "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "a bead refused by E11 itself (gate:e11-refusals:2) is NOT a fix-attempt bead: still REFUSED" "$RC" "1"
+set_beads "$BB" '["story:approved","gate:fix-attempt:1"]' "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "fix-attempt does NOT exempt the PRODUCTION cap (900 > 800): still REFUSED — its behavior is unchanged" "$RC" "1"
+has "fix-attempt + production over: cap_hit=producao fix_attempt=yes" "$LOGF" "cap_hit=producao fix_attempt=yes"
+set_beads "$BB" '["story:approved","gate:fix-attempt:1"]' "$PLAIN"
+GATE_E11_TOTAL_CAP=950 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "fix-attempt, both caps over: the production cap refuses alone" "$RC" "1"
+has "...and the text names only the cap that refuses" "$CALLS" "Estourou o teto de producao."
+
+set_beads "$BB" "$EXEMPT" "$PLAIN"
+printf '%s' "$RSN_OK" > "$SRC_STORE/comments-$BB.json"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "gate:size-exempt + a reason, 1300 total: accepted" "$RC" "0"
+has "size-exempt: isento, exempt=exempt" "$LOGF" "verdict=isento production_lines=600 cap=800 exempt=exempt why=- branch=feat/tot1300 marker=m-e11 forced=0 total_lines=1300 total_cap=1000 cap_hit=total fix_attempt=no"
+set_beads "$BB" "$EXEMPT" "$PLAIN"
+printf '%s' "$RSN_SHORT" > "$SRC_STORE/comments-$BB.json"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "gate:size-exempt with a token reason, 1300 total: still REFUSED" "$RC" "1"
+has "token reason: exempt=label-sem-motivo" "$LOGF" "exempt=label-sem-motivo"
+set_beads "$BB" "$PLAIN" "$EXEMPT"
+printf '%s' "$RSN_OK" > "$MRK_STORE/comments-m-e11.json"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "label + reason on the MARKER bead instead, 1300 total: accepted" "$RC" "0"
+
+echo "  — a total that cannot be read, a bead that cannot be read: accept + say so —"
+set_beads "$BB" "$PLAIN" "$PLAIN"; rm -f "$SRC_STORE/show-$BB.json"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "source bead unreadable, 1300 total: accepted, not refused" "$RC" "0"
+has "unreadable source: nao-medido-isencao, fix_attempt=desconhecido, the cause NAMED" "$LOGF" "verdict=nao-medido-isencao production_lines=600 cap=800 exempt=desconhecido why=isencao-ilegivel branch=feat/tot1300 marker=m-e11 forced=0 total_lines=1300 total_cap=1000 cap_hit=total fix_attempt=desconhecido"
+lacks "unreadable source: nothing refused" "$CALLS" "STATUS"
+set_beads "$BB" "$PLAIN" "$PLAIN"; rm -f "$MRK_STORE/show-m-e11.json"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "marker bead unreadable (source readable, no exemption), 1300 total: accepted, not refused" "$RC" "0"
+has "unreadable marker: nao-medido-isencao" "$LOGF" "verdict=nao-medido-isencao production_lines=600"
+set_beads "$BB" '["story:approved","gate:fix-attempt:2"]' "$PLAIN"; rm -f "$MRK_STORE/show-m-e11.json"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "fix-attempt read on the source, marker unreadable: accepted" "$RC" "0"
+has "the readable exemption wins over the unreadable one: isento" "$LOGF" "verdict=isento production_lines=600"
+set_beads "$BB" "$EXEMPT" "$PLAIN"      # label present, its comments cannot be read
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "size-exempt label present, comments unreadable, 1300 total: accepted" "$RC" "0"
+has "comments unreadable: nao-medido-isencao" "$LOGF" "verdict=nao-medido-isencao"
+set_beads "$BB" "$PLAIN" "$PLAIN"
+run_e11 1 "" "$BB" feat/tot1300; RC=$?
+eq "RIG_PATH empty: accepted" "$RC" "0"
+has "RIG_PATH empty: both counts unknown, the cause named, nothing hit" "$LOGF" "verdict=nao-medido production_lines=unknown cap=800 exempt=nao-consultado why=entrada-vazia branch=feat/tot1300 marker=m-e11 forced=0 total_lines=unknown total_cap=1000 cap_hit=nenhum fix_attempt=nao-consultado"
+run_e11 1 "$NOT_A_REPO" "$BB" feat/tot1300; RC=$?
+eq "git cannot answer (not a repo): accepted" "$RC" "0"
+has "not a repo: total_lines=unknown" "$LOGF" "total_lines=unknown"
+run_e11 1 "$RIG_OK" "$BB" feat/ghost; RC=$?
+eq "branch missing on origin: accepted" "$RC" "0"
+has "branch missing: total_lines=unknown" "$LOGF" "total_lines=unknown"
+run_e11 1 "$RIG_STALE" "$BB" feat/small; RC=$?
+$GITC -C "$RIG_STALE" remote set-url origin "$TMPD/origin-is-gone.git"
+run_e11 1 "$RIG_STALE" "$BB" feat/small; RC=$?
+eq "origin unreachable (stale main): accepted" "$RC" "0"
+has "stale main: total_lines=unknown, no 1010 as a measurement" "$LOGF" "why=fetch-falhou branch=feat/small marker=m-e11 forced=0 total_lines=unknown"
+lacks "stale main: no total_lines=1010" "$LOGF" "total_lines=1010"
+$GITC -C "$RIG_STALE" remote set-url origin "$ORIGIN2"
+
+echo "  — a total cap override: readable ones decide, unreadable ones accept + say so —"
+set_beads "$BB" "$PLAIN" "$PLAIN"
+GATE_E11_TOTAL_CAP=1500 run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "GATE_E11_TOTAL_CAP=1500, 1300 total: accepted" "$RC" "0"
+has "readable loose total cap: dentro-do-teto at total_cap=1500" "$LOGF" "verdict=dentro-do-teto production_lines=600 cap=800 exempt=nao-consultado why=- branch=feat/tot1300 marker=m-e11 forced=0 total_lines=1300 total_cap=1500 cap_hit=nenhum"
+GATE_E11_TOTAL_CAP=1200 run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "GATE_E11_TOTAL_CAP=1200, 1300 total: still REFUSED (positive evidence, nothing weakened)" "$RC" "1"
+has "readable tight total cap: the refusal names that cap" "$LOGF" "total_lines=1300 total_cap=1200 cap_hit=total"
+for JC in "1,000" abc 0 " " 1000000000; do
+  set_beads "$BB" "$PLAIN" "$PLAIN"
+  GATE_E11_TOTAL_CAP="$JC" run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+  eq "total cap override '$JC' (unreadable), 1300 total: ACCEPTED, not refused at a cap nobody chose" "$RC" "0"
+  has "total cap override '$JC': nao-medido, the measured counts stay in the log, the cause is NAMED" "$LOGF" "LOG E11-DIFF-CAP bead=$BB arm=B verdict=nao-medido production_lines=600 cap=800 exempt=nao-consultado why=cap-invalido"
+  lacks "total cap override '$JC': nothing refused, nothing labelled" "$CALLS" "STATUS"
+  eq "total cap override '$JC': no bd call (no exemption lookup for a refusal that cannot happen)" "$(calls_n)" "0"
+  set_beads "$BB" "$PLAIN" "$PLAIN"
+  GATE_E11_TOTAL_CAP="$JC" run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+  eq "total cap override '$JC' unreadable, but the production cap is understood: 900 prod REFUSED by it, alone" "$RC" "1"
+done
+set_beads "$BB" "$PLAIN" "$PLAIN"
+GATE_E11_CAP_LINES=abc run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "production cap unreadable, total cap understood: the total decides on its own — 1300 REFUSED" "$RC" "1"
+has "...cap_hit=total" "$LOGF" "total_lines=1300 total_cap=1000 cap_hit=total"
+
+echo "  — arm A, the 100% switch, the crew author, the 3rd refusal —"
+run_e11 1 "$RIG_OK" "$AA" feat/tot1300; RC=$?
+eq "arm A, 1300 total: accepted, today's behavior" "$RC" "0"
+has "arm A: not measured by design — total_lines=- and nothing hit" "$LOGF" "LOG E11-DIFF-CAP bead=$AA arm=A verdict=controle production_lines=- cap=800 exempt=nao-consultado why=- branch=feat/tot1300 marker=m-e11 forced=0 total_lines=- total_cap=1000 cap_hit=nenhum fix_attempt=nao-consultado"
+eq "arm A: nothing touched" "$(calls_n)" "0"
+set_beads "$AA" "$PLAIN" "$PLAIN"
+touch "$MRK_STORE/.gc/gate-e11-diff-cap.all"
+run_e11 1 "$RIG_OK" "$AA" feat/tot1300; RC=$?
+eq "100% switch: an arm-A bead gets the total cap too — 1300 REFUSED" "$RC" "1"
+has "100%: arm=B forced=1 total_lines=1300" "$LOGF" "bead=$AA arm=B verdict=recusa production_lines=600 cap=800 exempt=nao why=- branch=feat/tot1300 marker=m-e11 forced=1 total_lines=1300"
+rm -f "$MRK_STORE/.gc/gate-e11-diff-cap.all"
+
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+git -C "$RIG_OK" push -q origin origin/feat/tot1300:refs/heads/crew/oracle/wa-def456 >/dev/null 2>&1 && git -C "$RIG_OK" fetch -q origin >/dev/null 2>&1 || echo "  (could not publish the crew branch in the fake origin)"
+run_e11 1 "$RIG_OK" "$BB" crew/oracle/wa-def456; RC=$?
+eq "crew branch, 1300 total: refused" "$RC" "1"
+has "crew branch: the author mail states the total" "$CALLS" "GC --city $MRK_STORE mail send oracle -s Gate recusou $BB na submissao: 1300 linhas no total (producao: 600) > teto do total 1000 (E11)"
+set_beads "$BB" '["story:approved","gate:e11-refusals:2"]' "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
+eq "3rd refusal on the total cap still refuses" "$RC" "1"
+has "3rd: gate:needs-human" "$CALLS" "BD -C $SRC_STORE label add $BB gate:needs-human"
+has "3rd: the mayor is told what was exceeded" "$CALLS" "foi recusado na submissao pela 3a vez: 1300 linhas no total (producao: 600) > teto do total 1000. Ficou com gate:needs-human"
 
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" -eq 0 ]; then echo "  RESULT: PASS"; exit 0; fi
