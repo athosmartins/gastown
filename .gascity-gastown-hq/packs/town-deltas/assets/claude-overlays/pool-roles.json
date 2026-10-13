@@ -84,6 +84,27 @@
      ]
     }
    ]
+  },
+  "hooks_extra_defs": {
+   "_why": "ga-fl2nek (épico ga-sokx7u): o pytest dirigido dos workers vai ao MacBook Pro por um atalho no PATH (scripts/pytest-shim/, política do gate-pytest.sh). O diretório do atalho entra NA FRENTE do PATH por um hook SessionStart que escreve em CLAUDE_ENV_FILE (o Claude Code lê esse arquivo antes de cada comando Bash; verificado ao vivo com `claude -p`: `command -v pytest` devolveu o atalho). Overlay `env.PATH` não serve: é valor literal, sem `$PATH`, e trocaria o PATH inteiro da sessão (bd, gc, secret, ~/.local/bin). Só os papéis que listam `hooks_extra: [\"pytest-shim\"]` o recebem (wa-worker e ps-worker); dog e revisores ficam byte-idênticos. MATCHER próprio `^(startup|resume|clear|compact)$`: o motor mescla hooks por identidade de matcher (hookEntryKey), e o `gc prime --hook` do workdir vive noutra entrada de SessionStart — o matcher exato dele seria SUBSTITUÍDO por este. FAIL-OPEN: sem CLAUDE_ENV_FILE ou com o atalho ausente (checkout que ainda não recebeu o merge) o comando sai 0 sem escrever nada; é idempotente (grep antes de acrescentar, pois resume/compact reexecutam o hook). O diretório vem da checkout PRINCIPAL ({gt_root}), nunca de um worktree. As crews (sem overlay gerado) recebem o MESMO hook por scripts/pytest-shim-activate.sh. pool-preamble-build.py check exige o hook exatamente nos papéis que o listam e em nenhum outro.",
+   "pytest-shim": {
+    "marker": "pytest-shim",
+    "live_file": "python3",
+    "hooks": {
+     "SessionStart": [
+      {
+       "matcher": "^(startup|resume|clear|compact)$",
+       "hooks": [
+        {
+         "type": "command",
+         "command": ": pytest-shim; D='{gt_root}/.gascity-gastown-hq/scripts/pytest-shim/bin'; [ -n \"$CLAUDE_ENV_FILE\" ] && [ -x \"$D/python3\" ] || exit 0; grep -qF \"$D\" \"$CLAUDE_ENV_FILE\" 2>/dev/null || printf 'export PATH=\"%s:$PATH\"\\n' \"$D\" >> \"$CLAUDE_ENV_FILE\" 2>/dev/null; exit 0",
+         "timeout": 5
+        }
+       ]
+      }
+     ]
+    }
+   }
   }
  },
  "skills_universe": [
@@ -261,7 +282,10 @@
     ]
    },
    "plugins_off": [],
-   "auto_memory": true
+   "auto_memory": true,
+   "hooks_extra": [
+    "pytest-shim"
+   ]
   },
   "ps-worker": {
    "overlay": "pool-ps-worker",
@@ -296,7 +320,10 @@
     ]
    },
    "plugins_off": [],
-   "auto_memory": true
+   "auto_memory": true,
+   "hooks_extra": [
+    "pytest-shim"
+   ]
   },
   "reviewer": {
    "overlay": "pool-reviewer",

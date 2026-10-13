@@ -84,6 +84,9 @@ GUARD_HOOK_MARKER = "home-scan-guard"     # ga-02cqk4: todo overlay de papel TEM
 # primeiro, o cut-output-shadow media só os comandos que funcionaram; por isso o check exige os DOIS.
 CUT_OUTPUT_HOOK_MARKER = "cut-output-shadow"
 CUT_OUTPUT_EVENTS = ("PostToolUse", "PostToolUseFailure")
+# ga-fl2nek: matchers de SessionStart que o `gc prime --hook` do workdir (ou um padrão genérico) pode ocupar. Um hook de hooks_extra com um destes SUBSTITUI a
+# entrada do workdir na mescla por identidade de matcher (internal/overlay/merge.go hookEntryKey) — o `gc prime` deixaria de rodar na sessão.
+SESSION_START_SHARED_MATCHERS = {"", "startup", "resume", "clear", "compact", "*", ".*"}
 
 
 def _cmd(h):
@@ -108,6 +111,10 @@ def overlay_for(m, role):
             out[k] = base[k]
     if m["common"].get("hooks"):
         out["hooks"] = _subst_deep(m["common"]["hooks"], m["paths"])
+    # hooks que só ALGUNS papéis recebem (ga-fl2nek): common.hooks_extra_defs.<nome>.hooks = {evento: [entradas]}, ligado por roles.<papel>.hooks_extra
+    for name in r.get("hooks_extra", []):
+        for event, entries in _subst_deep(m["common"]["hooks_extra_defs"][name]["hooks"], m["paths"]).items():
+            out.setdefault("hooks", {}).setdefault(event, []).extend(entries)
     out["autoMemoryEnabled"] = bool(r.get("auto_memory", m["common"]["auto_memory"]))
     out["claudeMdExcludes"] = [_subst(p, m["paths"]) for p in m["common"]["claude_md_excludes"]]
     sk = r.get("skills")
@@ -307,6 +314,44 @@ def check_cut_output_hooks(role, cfg):
     return errs
 
 
+def check_hooks_extra(m, role, r, cfg):
+    """ga-fl2nek: um hook de `hooks_extra_defs` existe nos papéis que o listam e em NENHUM outro, com o matcher e o marcador da definição. Checagem
+    INDEPENDENTE da igualdade com o manifesto: se o hook sai do manifesto E dos overlays regenerados juntos, a igualdade passa calada e os workers
+    voltam a rodar pytest no mini sem que nada reclame; e o contrário (o hook vazando para dog/revisor) muda o PATH de quem não pediu. Um `hooks`/evento
+    que não é do tipo esperado é "não sei ler" = hook ausente, nunca uma exceção."""
+    errs = []
+    defs = m["common"].get("hooks_extra_defs", {})
+    wanted = set(r.get("hooks_extra", []))
+    for name in sorted(wanted - set(defs)):
+        errs.append(f"papel '{role}': hooks_extra cita '{name}', que não está em common.hooks_extra_defs")
+    hooks = cfg.get("hooks")
+    for name, d in defs.items():
+        if name.startswith("_") or not isinstance(d, dict):
+            continue
+        marker = d["marker"]
+        for event, want_entries in d["hooks"].items():
+            entries = hooks.get(event) if isinstance(hooks, dict) else None
+            entries = entries if isinstance(entries, list) else []
+            mine = [e for e in entries if isinstance(e, dict) and isinstance(e.get("hooks"), list)
+                    and any(marker in _cmd(h) for h in e["hooks"])]
+            if name not in wanted:
+                if mine:
+                    errs.append(f"overlay '{role}': carrega o hook {event} de '{name}' (ga-fl2nek) sem listá-lo em hooks_extra — o hook é só dos papéis que o pedem")
+                continue
+            if not mine:
+                errs.append(f"overlay '{role}': perdeu o hook {event} de '{name}' (ga-fl2nek) — sem ele o diretório do atalho não entra no PATH e o pytest do worker volta a rodar só no mini")
+                continue
+            for e in mine:
+                mt = e.get("matcher")
+                # o invariante é LITERAL, não "igual ao do manifesto": um matcher ruim escrito no manifesto passaria pela comparação com ele mesmo
+                if mt != want_entries[0]["matcher"] or (event == "SessionStart" and mt in SESSION_START_SHARED_MATCHERS):
+                    errs.append(f"overlay '{role}': hook {event} de '{name}' com matcher {mt!r}; tem que ser um matcher PRÓPRIO ({want_entries[0]['matcher']!r}) — o motor mescla por "
+                                "identidade de matcher, e o `gc prime --hook` do workdir mora noutra entrada de SessionStart (um matcher igual ao dele a SUBSTITUIRIA)")
+            if not any("CLAUDE_ENV_FILE" in _cmd(h) for e in mine for h in e["hooks"]):
+                errs.append(f"overlay '{role}': hook {event} de '{name}' não escreve em CLAUDE_ENV_FILE — é o único jeito de o PATH chegar aos comandos Bash da sessão")
+    return errs
+
+
 def check_overlays(m):
     errs = []
     with open(OVERLAYS / m["base_overlay"] / ".claude" / "settings.json", encoding="utf-8") as fh:
@@ -338,6 +383,7 @@ def check_overlays(m):
             errs.append(f"overlay '{role}': remoteControlAtStartup tem que ser false (wa-cy6we)")
         errs.extend(check_guard_hook(role, cfg))
         errs.extend(check_cut_output_hooks(role, cfg))
+        errs.extend(check_hooks_extra(m, role, r, cfg))
         if r["td_role"] in m["common"].get("mayor_memory_roles", []) and cfg.get("autoMemoryEnabled") is not False:
             errs.append(f"overlay '{role}': autoMemoryEnabled tem que ser false (o índice de memória desse papel é o do Mayor)")
         if not isinstance(cfg.get("autoMemoryEnabled"), bool):
@@ -504,6 +550,19 @@ def guard_paths(cfg):
     return out
 
 
+def hook_dirs(cfg, marker):
+    """Os diretórios `D='...'` que os comandos de hook com `marker` registram, em qualquer evento."""
+    out = []
+    hooks = cfg.get("hooks")
+    for entries in (hooks.values() if isinstance(hooks, dict) else []):
+        for e in entries if isinstance(entries, list) else []:
+            for h in (e.get("hooks") if isinstance(e, dict) and isinstance(e.get("hooks"), list) else []):
+                mm = re.search(r"D='([^']+)'", _cmd(h)) if marker in _cmd(h) else None
+                if mm:
+                    out.append(mm.group(1))
+    return out
+
+
 def cmd_live(m, gt_root=None):
     """MERGED != LIVE (ga-02cqk4). O hook de pool é `[ -f "$P" ] || exit 0`: um overlay pode registrá-lo e o guard continuar INERTE, calado, se o
     script não existe no caminho (o `check` valida o JSON, não o disco). Para cada papel: o arquivo que o hook aponta existe? Uma sessão só pega
@@ -525,6 +584,18 @@ def cmd_live(m, gt_root=None):
             live = os.path.isfile(real)
             print(f"  {'LIVE' if live else 'INERT':11s} {role}: {real}" + ("" if live else "  (o hook está registrado mas o arquivo não existe: no-op)"))
             rc = rc or (0 if live else 1)
+        # hooks_extra (ga-fl2nek): o hook de SessionStart é `[ -x "$D/python3" ] || exit 0` — registrado e INERTE se o diretório do atalho não existe
+        for name in m["roles"][role].get("hooks_extra", []):
+            df = m["common"]["hooks_extra_defs"][name]
+            dirs = hook_dirs(cfg, df["marker"])
+            if not dirs:
+                print(f"  NOT-REGISTERED {role}: o overlay não registra o hook '{name}'")
+                rc = 1
+            for path in dirs:
+                real = os.path.join(path.replace(root, gt_root, 1) if gt_root else path, df["live_file"])
+                live = os.path.isfile(real)
+                print(f"  {'LIVE' if live else 'INERT':11s} {role}: {real}" + ("" if live else f"  (o hook '{name}' está registrado mas o arquivo não existe: no-op)"))
+                rc = rc or (0 if live else 1)
     print("pool-preamble-build live: " + ("todos os papéis LIVE" if rc == 0 else "há papel NÃO guardado ou INERTE"))
     return rc
 

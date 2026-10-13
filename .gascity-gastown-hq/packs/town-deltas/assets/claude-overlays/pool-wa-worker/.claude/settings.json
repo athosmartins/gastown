@@ -64,6 +64,18 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "^(startup|resume|clear|compact)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ": pytest-shim; D='/Users/athos/gt/.gascity-gastown-hq/scripts/pytest-shim/bin'; [ -n \"$CLAUDE_ENV_FILE\" ] && [ -x \"$D/python3\" ] || exit 0; grep -qF \"$D\" \"$CLAUDE_ENV_FILE\" 2>/dev/null || printf 'export PATH=\"%s:$PATH\"\\n' \"$D\" >> \"$CLAUDE_ENV_FILE\" 2>/dev/null; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   },
   "autoMemoryEnabled": true,

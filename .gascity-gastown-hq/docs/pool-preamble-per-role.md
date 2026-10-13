@@ -86,6 +86,7 @@ Mayor, crews, witness, refinery, polecat — que recebem a doutrina INTEIRA, byt
 7. **`mbp-offload-tests` (ga-yvs19w)**: seção guardada de uma linha só para wa-worker e ps-worker — pytest dirigido pesado vai pro MacBook Pro via `scripts/mbp-run.sh`, rc 96..99 = rode local
    (runbook `docs/runbooks/mbp-offload.md`). `show_unset: false`: Mayor e crews (sem `TD_ROLE`) ficam byte-idênticos. Custa ≈ +800 chars (~0,4k tokens) por sessão de worker. O selftest (D) pina que os dois workers
    a listam e que Mayor/crews, dog e revisor não. Config de prompt mudou → drift em sessão viva: mergear perto do reboot noturno (ga-epdbe3).
+8. **`hooks_extra` (ga-fl2nek)**: hook que só ALGUNS papéis recebem — `common.hooks_extra_defs.<nome>` define o hook, `roles.<papel>.hooks_extra: ["<nome>"]` o liga. Hoje só `pytest-shim`: um `SessionStart` (matcher próprio, escreve em `CLAUDE_ENV_FILE`) que põe `scripts/pytest-shim/bin` na frente do PATH de wa-worker e ps-worker, para o pytest deles ir ao MBP (runbook `mbp-offload.md`, seção do atalho). `check` exige o hook exatamente nos papéis que o listam; `live` acusa INERT se o diretório não existe.
 
 ## Sonda, rodada 2 (correção do veredito ga-0g70nl)
 

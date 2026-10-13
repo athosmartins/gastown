@@ -175,12 +175,82 @@ json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n
 PYEOF
 expect_fail "PostToolUseFailure que não é lista: o check REPORTA (não vira exceção) e trata como hook sumido" "perdeu o hook PostToolUseFailure do cut-output-shadow"
 if run_check | grep -q Traceback; then bad "o check estoura traceback com PostToolUseFailure malformado"; else ok "PostToolUseFailure malformado não gera traceback"; fi
+# ga-fl2nek: o hook SessionStart que põe o atalho de pytest (scripts/pytest-shim/bin) na frente do PATH. Só wa-worker e ps-worker o recebem (hooks_extra);
+# dog e revisor ficam byte-idênticos. Pino INDEPENDENTE do manifesto sobre os overlays COMMITADOS: se o hook sai do manifesto E dos overlays regenerados
+# juntos, o `check` de igualdade passa calado — este pino não.
+PIN_SHIM_PY="$W/pin_pytest_shim.py"
+cat > "$PIN_SHIM_PY" <<'PYEOF'
+import json, os, sys
+ov = sys.argv[1]
+errs = []
+for role, overlay, want in (("wa-worker", "pool-wa-worker", True), ("ps-worker", "pool-ps-worker", True), ("dog", "pool-dog", False), ("reviewer", "pool-reviewer", False)):
+    p = os.path.join(ov, overlay, ".claude", "settings.json")
+    try:
+        ss = json.load(open(p, encoding="utf-8")).get("hooks", {}).get("SessionStart", [])
+    except Exception as e:
+        errs.append(f"{role}: não consegui ler {p}: {e!r}")
+        continue
+    mine = [e for e in ss if any("pytest-shim" in h.get("command", "") for h in e.get("hooks", []))]
+    if want and not (len(mine) == 1 and mine[0].get("matcher") == "^(startup|resume|clear|compact)$" and "CLAUDE_ENV_FILE" in mine[0]["hooks"][0]["command"]):
+        errs.append(f"{role}: o overlay devia ter UM hook SessionStart do pytest-shim (matcher ^(startup|resume|clear|compact)$, escreve em CLAUDE_ENV_FILE)")
+    if not want and mine:
+        errs.append(f"{role}: o overlay não devia ter o hook do pytest-shim (só os workers)")
+print("\n".join(errs))
+sys.exit(1 if errs else 0)
+PYEOF
+if pin_out="$(python3 -I "$PIN_SHIM_PY" "$SELF_DIR/claude-overlays" 2>&1)"; then ok "pytest-shim: wa-worker/ps-worker carregam o hook SessionStart (matcher próprio, CLAUDE_ENV_FILE); dog/revisor não"; else bad "pino do pytest-shim:"; echo "$pin_out" | sed 's/^/      /'; fi
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-wa-worker/.claude/settings.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); del d["hooks"]["SessionStart"]
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+expect_fail "overlay commitado do wa-worker sem o hook SessionStart do pytest-shim" "perdeu o hook SessionStart de 'pytest-shim'"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p))
+for r in ("wa-worker", "ps-worker"): del m["roles"][r]["hooks_extra"]
+del m["common"]["hooks_extra_defs"]
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+if run_check >/dev/null 2>&1; then ok "controle do controle: o hook sai do manifesto E dos overlays regenerados juntos e o check de igualdade passa calado (é por isso que existe o pino)"; else bad "esperava o check de igualdade passar calado com o hook fora de tudo"; fi
+if python3 -I "$PIN_SHIM_PY" "$T/packs/town-deltas/assets/claude-overlays" >/dev/null 2>&1; then bad "o pino NÃO pegou o hook fora do manifesto e dos overlays"; else ok "reprova (pino independente): o hook sai do manifesto E dos overlays regenerados juntos"; fi
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p))
+m["common"]["hooks_extra_defs"]["pytest-shim"]["hooks"]["SessionStart"][0]["matcher"] = "startup"
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+expect_fail "matcher do hook volta a 'startup' (o motor mescla por identidade de matcher: substituiria o gc prime --hook do workdir)" "hook SessionStart de 'pytest-shim' com matcher 'startup'"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-dog/.claude/settings.json" "$T/packs/town-deltas/assets/claude-overlays/pool-wa-worker/.claude/settings.json" <<'PYEOF'
+import json, sys
+src = json.load(open(sys.argv[2]))["hooks"]["SessionStart"]
+p = sys.argv[1]; d = json.load(open(p)); d["hooks"]["SessionStart"] = src
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+expect_fail "o hook vaza para o overlay do dog (que não o pediu)" "overlay 'dog': carrega o hook SessionStart de 'pytest-shim'"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-ps-worker/.claude/settings.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["hooks"]["SessionStart"][0]["hooks"][0]["command"] = ": pytest-shim; exit 0"
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+expect_fail "hook que não escreve em CLAUDE_ENV_FILE (o PATH nunca chegaria aos comandos Bash)" "não escreve em CLAUDE_ENV_FILE"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-reviewer/.claude/settings.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["hooks"]["SessionStart"] = "isto não é uma lista"
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+if run_check | grep -q Traceback; then bad "o check estoura traceback com SessionStart malformado"; else ok "SessionStart malformado não gera traceback"; fi
 # `live`: registrado != vivo. O hook é [ -f "$P" ] || exit 0, então um overlay correto com o script ausente é um no-op calado.
 reset_tree
 LIVEROOT="$W/liveroot"; mkdir -p "$LIVEROOT/.gascity-gastown-hq/scripts"
 if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT (o script não existe em $LIVEROOT)"; else echo "$o" | grep -q 'INERT.*dog' && ok "live: overlay registrado + script AUSENTE = INERT, rc != 0" || bad "live: sem INERT no output: $o"; fi
 : > "$LIVEROOT/.gascity-gastown-hq/scripts/home-scan-guard.sh"
-if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)" && [ "$(echo "$o" | grep -c '^  LIVE')" = "4" ]; then ok "live: script presente = os 4 papéis de pool LIVE, rc 0"; else bad "live: esperava 4 LIVE e rc 0: $o"; fi
+# ga-fl2nek: com o guard presente e o atalho de pytest AUSENTE, os workers ficam INERT (o hook é `[ -x "$D/python3" ] || exit 0`: registrado e calado)
+if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT para o atalho de pytest ausente"; else echo "$o" | grep -q 'INERT.*wa-worker.*pytest-shim' && ok "live: guard presente + atalho de pytest AUSENTE = INERT no worker, rc != 0" || bad "live: sem INERT do atalho no output: $o"; fi
+mkdir -p "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin"; : > "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
+if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)" && [ "$(echo "$o" | grep -c '^  LIVE')" = "6" ]; then ok "live: guard + atalho presentes = 4 guards e 2 atalhos de worker LIVE, rc 0"; else bad "live: esperava 6 LIVE e rc 0: $o"; fi
 reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'EOF'
 import json, sys
 p = sys.argv[1]; m = json.load(open(p)); m["common"]["hooks"]["PreToolUse"][0]["hooks"][0]["if"] = "Bash(du *)"
