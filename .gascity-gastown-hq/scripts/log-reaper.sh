@@ -86,6 +86,15 @@
 # the class off; unset = the real list below, except in library mode — a
 # sourced selftest never targets production paths it did not name).
 #
+# SIZE KNOBS (LOG_REAPER_CAP_MB, LOG_REAPER_KEEP_MB and the first class's
+# LOG_REAPER_THRESHOLD_MB) are read as plain decimal megabytes: "08" is 8 and
+# "010" is 10 (inside bash arithmetic they would be an octal error and an 8).
+# A value that is not a positive integer of at most 7 digits (so that
+# mb*1MiB cannot wrap bash's 64-bit arithmetic) is replaced by the default, and
+# the cycle logs a WARN line saying which knob was replaced. If the cap/keep pair
+# is STILL not usable the capped class touches no file that cycle: it logs why
+# and counts every configured path as failed (ga-52drsg gate-fix 1).
+#
 # Kill switch: LOG_REAPER_ENABLED=0 -> no-op every cycle (logs skip reason).
 #
 # PRODUCTION SENTINEL (same ga-h565g pattern as scratchpad-reaper.sh /
@@ -176,20 +185,45 @@ _prod_sentinel_active() {
   [ "$paths" = "$real_default" ] && [ "$prod" != "1" ]
 }
 
-# _mb_to_bytes <mb> <default_mb> → bytes. A value that is not a positive
-# integer falls back to the default: a typo in an env override must not turn
-# into a cap of 0 bytes (which would empty every capped log every cycle).
+# _mb_valid <mb> → 0 (true) iff mb is a positive decimal integer of at most 7
+# digits once leading zeros are dropped (9,999,999 MB ~ 10 TB: far past any log,
+# and small enough that mb*1024*1024 cannot wrap bash's 64-bit arithmetic into a
+# plausible-looking or negative size). Purely textual on purpose: nothing here
+# goes through $(( )), where "08" is an octal error.
+_mb_valid() {
+  local mb="$1"
+  case "$mb" in ''|*[!0-9]*) return 1 ;; esac
+  mb="${mb#"${mb%%[!0]*}"}"          # drop leading zeros: "08" -> "8", "000" -> ""
+  [ -n "$mb" ] && [ "${#mb}" -le 7 ]
+}
+
+# _mb_to_bytes <mb> <default_mb> → bytes. A value _mb_valid refuses falls back
+# to the default: a typo in an env override must not turn into a cap of 0 bytes
+# (which would empty every capped log every cycle). The caller says so in the log
+# (_mb_valid first); this function only converts. 10# makes the read decimal
+# whatever the leading zeros.
 _mb_to_bytes() {
   local mb="$1" def="$2"
-  case "$mb" in ''|*[!0-9]*) mb="$def" ;; esac
-  [ "$mb" -gt 0 ] 2>/dev/null || mb="$def"
-  echo $(( mb * 1024 * 1024 ))
+  _mb_valid "$mb" || mb="$def"
+  echo $(( 10#$mb * 1024 * 1024 ))
+}
+
+# _cap_limits_usable <cap_bytes> <keep_bytes> → 0 (true) iff both are plain
+# positive byte counts and keep is STRICTLY below the cap. The gate in front of
+# the whole capped-file loop: a pair that fails it is "cannot tell what the
+# limits are", which is neither "under the cap" nor "disk full" — nothing is cut.
+_cap_limits_usable() {
+  local cap="$1" keep="$2"
+  case "$cap" in ''|*[!0-9]*) return 1 ;; esac
+  case "$keep" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$cap" -gt 0 ] && [ "$keep" -gt 0 ] && [ "$keep" -lt "$cap" ]
 }
 
 # _cap_keep_bytes <keep_mb> <cap_bytes> → how many trailing bytes survive a
 # tail-cap. Must be positive and STRICTLY below the cap, otherwise the file
 # would be over the cap again right after being "capped" and get rewritten
-# every cycle; an unusable value falls back to half the cap.
+# every cycle. An unusable keep_mb takes the 10 MB default; a keep that is then
+# not below the cap is cut down to half the cap.
 _cap_keep_bytes() {
   local keep_mb="$1" cap_bytes="$2" keep
   keep="$(_mb_to_bytes "$keep_mb" 10)"
@@ -214,9 +248,11 @@ _file_size_bytes() {
 # _tail_cap_one <path> <keep_bytes> → how the file ended up (the caller logs
 # what ACTUALLY happened, never "tail kept" for a file that lost its tail):
 #   0 = back under the cap with its last keep_bytes still in it
-#   2 = emptied: the tail could not be copied aside (no space) so it was cut fully
+#   2 = emptied: the tail could not be copied aside (most likely no space) so it was cut fully
 #   3 = emptied, and the tail could not be written back (it is in <path>.tailcap.tmp)
 #   1 = nothing freed: the file could not be truncated (or has vanished)
+#   4 = refused: keep_bytes is not a positive byte count, so nobody knows what to
+#       keep; neither the file nor the side file was touched
 # Keeps the last keep_bytes IN the live file: copy the tail aside, truncate in
 # place (`: >` keeps the inode, so a writer holding the file open O_APPEND just
 # keeps going), append the tail back. Lines the writer appends between the
@@ -228,6 +264,12 @@ _file_size_bytes() {
 # that did not make it back), overwritten by the next run.
 _tail_cap_one() {
   local path="$1" keep="$2" tmp="$1.tailcap.tmp"
+  # keep is what stays in the file. A value that is not a positive byte count
+  # (empty, text, 0, a leading zero -- the caller computes it, so it never has
+  # one) means "do not know what to keep", NOT "keep nothing": `tail -c ""` fails
+  # exactly like a full disk, lands in the no-room branch below, and would empty
+  # the whole file under a cause nobody observed. Refused before anything is touched.
+  case "$keep" in ''|*[!0-9]*|0*) return 4 ;; esac
   # `: >` CREATES a missing file; a path that vanished since the stat must not
   # come back as an empty file this reaper made.
   [ -f "$path" ] || return 1
@@ -242,9 +284,12 @@ _tail_cap_one() {
     rm -f "$tmp"
     return 0
   fi
-  # No room even for the tail copy: this is the low-disk case the reaper exists
-  # for, and recovering space outranks keeping history (same rule as the cp
-  # backup in the first class).
+  # The tail could not be copied aside. The case this is FOR is a full disk (the
+  # low-disk case the reaper exists for), where recovering space outranks keeping
+  # history (same rule as the cp backup in the first class). The code does NOT
+  # check the cause: with a valid keep, any failure of the copy (an unwritable
+  # side-file path too) reaches this cut, which is why the caller's log line says
+  # "no room?" and not "no room".
   rm -f "$tmp"
   if : > "$path" 2>>"$LOG"; then
     return 2
@@ -263,15 +308,36 @@ _cap_pass() {
     cap_dry=1
   fi
 
-  local cap_bytes keep_bytes
+  # A knob that cannot be read as a size runs with the default (documented in the
+  # header) -- and the log says so, because the summary below echoes the RAW knob
+  # and would otherwise hide which limit really ran.
+  _mb_valid "$CAP_MB"  || log "WARN log-cap: LOG_REAPER_CAP_MB='$CAP_MB' is not a usable size — using the default 20 MB"
+  _mb_valid "$KEEP_MB" || log "WARN log-cap: LOG_REAPER_KEEP_MB='$KEEP_MB' is not a usable size — using the default 10 MB"
+
+  local cap_bytes keep_bytes limits_ok=1
   cap_bytes="$(_mb_to_bytes "$CAP_MB" 20)"
   keep_bytes="$(_cap_keep_bytes "$KEEP_MB" "$cap_bytes")"
+  # Gate in front of the loop below. A pair that is not two positive byte
+  # counts with keep < cap is "cannot tell what the limits are" -- not "under the
+  # cap" (nothing to do) and not "disk full" (cut everything): the cycle is inert.
+  if ! _cap_limits_usable "$cap_bytes" "$keep_bytes"; then
+    limits_ok=0
+    log "FAILED log-cap: the limits are not usable (cap_bytes='$cap_bytes' keep_bytes='$keep_bytes', from LOG_REAPER_CAP_MB='$CAP_MB' LOG_REAPER_KEEP_MB='$KEEP_MB') — NO capped log is touched this cycle"
+  fi
   local checked=0 capped=0 skipped=0 missing=0 unreadable=0 failed=0 freed_bytes=0
   local path size rc
 
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     checked=$((checked + 1))
+
+    # Unusable limits: the file is not even looked at. Counted as failed (the
+    # reason is the FAILED line above), never as skipped, so the summary cannot
+    # read like a healthy cycle.
+    if [ "$limits_ok" != "1" ]; then
+      failed=$((failed + 1))
+      continue
+    fi
 
     if [ ! -f "$path" ]; then
       missing=$((missing + 1))
@@ -312,12 +378,16 @@ _cap_pass() {
       2)
         capped=$((capped + 1))
         freed_bytes=$((freed_bytes + size))
-        log "capped: $path (${size} bytes -> EMPTY: no room to copy the tail aside, so it was cut fully)"
+        log "capped: $path (${size} bytes -> EMPTY: the tail could not be copied aside (no room?), so it was cut fully)"
         ;;
       3)
         capped=$((capped + 1))
         freed_bytes=$((freed_bytes + size))
         log "capped: $path (${size} bytes -> EMPTY: the kept tail could not be written back, it is in $path.tailcap.tmp)"
+        ;;
+      4)
+        failed=$((failed + 1))
+        log "FAILED to cap: $path (keep_bytes='$keep_bytes' is not a usable byte count — file NOT touched)"
         ;;
       *)
         failed=$((failed + 1))
@@ -340,7 +410,12 @@ main() {
     return 0
   fi
 
-  local threshold_bytes=$(( THRESHOLD_MB * 1024 * 1024 ))
+  # Same reader as the capped class: "08" is 8, and a knob that cannot be read as
+  # a size runs with the default (50) and says so. It was a raw $(( )), where "08"
+  # aborted this whole run before it logged anything or reached the capped class.
+  _mb_valid "$THRESHOLD_MB" || log "WARN log-reap: LOG_REAPER_THRESHOLD_MB='$THRESHOLD_MB' is not a usable size — using the default 50 MB"
+  local threshold_bytes
+  threshold_bytes="$(_mb_to_bytes "$THRESHOLD_MB" 50)"
   local checked=0 rotated=0 skipped=0 missing=0 freed_bytes=0
   local path size
 
