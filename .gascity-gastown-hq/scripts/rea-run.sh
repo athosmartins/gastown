@@ -60,6 +60,15 @@
 #        trava se o dono gravado nela ainda é este pid. O julgamento de fora do mutex é só palpite, para não pegá-lo à toa.
 #        Sem `lockf`, sem poder abrir o arquivo do mutex ou com ele ocupado além de REA_RUN_REAP_WAIT_S (5 s): NÃO remove — é o
 #        estado inerte; a espera segue até --wait-s e acaba em 91, com o motivo na mensagem.
+#   Identidade do dono (ga-szz40p gate-fix 4): o dono grava a hora de início do processo (`ps -o lstart=`) e quem chega compara a
+#        STRING. Ela muda com o TZ e o locale de quem chama o ps (o mesmo pid dá "Tue Oct 13 06:24:05 2026", "Tue Oct 13 09:24:05
+#        2026" sob TZ=UTC e "ter 13 out 06:24:05 2026" sob LC_ALL=pt_BR.UTF-8): um 2º chamador de env diferente lia "início
+#        diferente" = pid reaproveitado, removia a trava de um dono VIVO e rodava um 2º comando pesado ao mesmo tempo. O proc_start
+#        fixa LC_ALL=C TZ=UTC, então gravar e ler sempre concordam, seja qual for o env de cada um. Mesma família, mesma correção: o
+#        `sysctl vm.swapusage` também é lido com LC_ALL=C (sob pt_BR ele imprime "3015,31M" e o parser o recusava: 93 com a máquina
+#        saudável). Varredura da classe: não há outra string comparada entre processos neste script; `df -Pk`, `stat` (mtime da trava),
+#        `date +%s`, o estado/ppid do `ps` e o awk só leem inteiros, que o env não muda; o único resíduo é cosmético (a casa decimal
+#        de machine_msg, só na mensagem).
 #   Scratch órfão: o nome carrega o pid de quem o criou (run.<pid>.XXXXXX; marcador de timeout tmo.<pid>, fora da trava). O passo 5
 #        só apaga o de pid MORTO: pid vivo, nome sem pid e symlink ficam. Não depende de a trava ter dado exclusividade.
 #   Log: $CITY/.gc/logs/rea-run.jsonl — um evento por execução (ran), recusa/espera esgotada (refused), desvio para o mini
@@ -78,6 +87,8 @@
 #     ninguém remove órfã e as execuções esperam até 91. O release do dono também desiste (avisa) e a trava fica para a próxima
 #     execução remover (dono morto).
 #   - O release cai num caminho já trocado por outro dono (a trava dele foi removida e refeita): não apaga, avisa.
+#   - Troca de versão: o dono gravado por uma versão ANTERIOR a esta (hora no TZ/locale de quem a gravou) lido por esta (UTC/C) parece
+#     pid reaproveitado. Vale só para a execução que estiver viva no instante do deploy; depois dela, todo dono é gravado no formato fixo.
 #   - pid reaproveitado: o scratch de um pid morto cujo número hoje é de outro processo fica até aquele processo sair (sobra lixo,
 #     nunca perda). SIGKILL entre o `mv` da trava velha e o `find -delete` deixa `rea-run.lock.stale.<pid>` ao lado (lixo inerte).
 #
@@ -176,7 +187,7 @@ machine_check() {
   kb=$(printf '%s\n' "$out" | awk 'NR==2{print $4}')
   isnum "$kb" || { M_REASON="ilegivel:disco"; return 93; }                                    # gate:ilegivel-disco
   M_FREE_KB=$kb
-  out=$("$SYSCTL_BIN" -n vm.swapusage 2>/dev/null) || { M_REASON="ilegivel:swap"; return 93; }
+  out=$(LC_ALL=C "$SYSCTL_BIN" -n vm.swapusage 2>/dev/null) || { M_REASON="ilegivel:swap"; return 93; }   # gate:sysctl-env — sob pt_BR/de_DE ele imprime "3015,31M"
   n=$(printf '%s' "$out" | awk '{ for (i = 1; i < NF; i++) if ($i == "used" && $(i+1) == "=") v = $(i+2)
         if (v ~ /^[0-9]+(\.[0-9]+)?[KMG]$/) { u = substr(v, length(v)); x = substr(v, 1, length(v) - 1) + 0
           if (u == "G") x *= 1024; else if (u == "K") x /= 1024; printf "%d", x } }')
@@ -319,7 +330,9 @@ rm_scratch() { # só remove diretório run.* DENTRO da raiz de scratch, e nunca 
 }
 
 owner_field() { sed -n "${1}p" "$LOCK_DIR/owner" 2>/dev/null; }
-proc_start() { "$PS_BIN" -o lstart= -p "$1" 2>/dev/null | sed 's/  */ /g;s/^ //;s/ $//'; }
+# A hora de início é o que identifica o dono entre PROCESSOS: quem grava e quem lê precisam ver a MESMA string. `ps lstart` muda com o TZ e o
+# locale de quem o chama ("Tue Oct 13 06:24:05 2026" / "... 09:24:05 ..." sob TZ=UTC / "ter 13 out 06:24:05 2026" sob pt_BR); por isso o env é fixo aqui.
+proc_start() { LC_ALL=C TZ=UTC "$PS_BIN" -o lstart= -p "$1" 2>/dev/null | sed 's/  */ /g;s/^ //;s/ $//'; }   # gate:proc-start-env
 # Remoção da trava — reap de órfã e release do dono — roda SEMPRE sob um mutex do kernel e re-julga DENTRO dele. "Esta trava é velha" e
 # "então movo $LOCK_DIR" são dois passos sobre um NOME: entre eles outro processo pode ter removido a MESMA trava velha e criado uma nova,
 # VIVA, no mesmo caminho, e o `mv` levaria a viva (dois comandos pesados ao mesmo tempo). O mutex é `lockf` num fd aberto em $REAP_LOCK:

@@ -16,12 +16,16 @@
 #   exclusiva (a trava refeita por outro nunca é tomada nem apagada, nem na falha); mkdir que falha porque a trava sumiu tenta de
 #   novo; release de trava que já não é minha não apaga; marcador de timeout privado (nada escrito dentro da trava) ·
 #   scratch órfão: só o de pid MORTO é apagado (pid vivo, nome sem pid, symlink e vizinho preservados) ·
+#   O ENV DE QUEM CHAMA NÃO MUDA O VEREDITO (gate-fix 4, ga-szz40p): dono vivo lido sob TZ=UTC, TZ=Asia/Tokyo e LC_ALL=pt_BR.UTF-8
+#   (a string de `ps lstart` muda com eles) espera (91), nunca é reaped; ponta a ponta, A grava o dono num env e B chega noutro;
+#   o swap saudável/alto lido sob vírgula decimal (pt_BR) não vira 93 ·
 #   --push/--pull/--env · uso errado (94, inclusive dois --push de mesmo nome) · log sem argumentos do comando · --check ·
 #   --pull no MBP que falhou (mbp-run sai 0 e só avisa): 93, nunca "chegou" · configuração numérica com zero à esquerda, sinal ou
 #   estouro: 93 sem rodar (a aritmética do bash leria 08/010 como octal).
 # CONTROLE NEGATIVO: cada porta (marcador "# gate:<nome>" no script: disk, swap, lock, lock-live, cleanup, fallback, timeout,
 #   exit-trap, self-chain, opt-sem-valor, ilegivel-disco/swap/pgrep, pull-mbp, isnum, push-dup, e as do gate-fix 2: reap-mutex,
-#   reap-rejudge, owner-claim, owner-lost, lock-vanish, release-owner, orphan-live, timeout-private, sinal-log) é removida numa cópia e
+#   reap-rejudge, owner-claim, owner-lost, lock-vanish, release-owner, orphan-live, timeout-private, sinal-log, e as do gate-fix 4:
+#   proc-start-env (testada por metade: sem TZ=UTC e sem LC_ALL=C) e sysctl-env) é removida numa cópia e
 #   o mutante TEM que deixar de reproduzir o resultado do script real no caso que a protege — inclusive "ilegível virou pode-rodar".
 #   O teste de concorrência também tem que FALHAR no rea-run.sh anterior ao gate-fix 2 (a corrida existia de verdade): ver o
 #   comentário da seção 7b e REA_RUN_UNDER_TEST.
@@ -53,7 +57,10 @@ cat > "$T/bin/sysctl" <<'EOF'
 #!/usr/bin/env bash
 [ "${STUB_SWAP_FAIL:-0}" = 1 ] && exit 1
 [ -n "${STUB_SWAP_RAW:-}" ] && { printf '%b\n' "$STUB_SWAP_RAW"; exit 0; }
-printf 'total = 8192.00M  used = %s  free = 100.00M  (encrypted)\n' "${STUB_SWAP_USED:-1000.00M}"
+# imita o sysctl de verdade: sob LC_ALL de vírgula decimal (pt_BR, de_DE) ele imprime "3015,31M" (medido no mini, 13/10)
+sep=.; case "${LC_ALL:-}" in pt_BR*|de_DE*) sep=, ;; esac
+used=$(printf '%s' "${STUB_SWAP_USED:-1000.00M}" | tr . "$sep")
+printf 'total = 8192%s00M  used = %s  free = 100%s00M  (encrypted)\n' "$sep" "$used" "$sep"
 EOF
 cat > "$T/bin/pgrep" <<'EOF'
 #!/usr/bin/env bash
@@ -293,7 +300,8 @@ has "padrão: casa as 5 formas reais de rea (linhas 1-5) e só elas" "outro rea:
 eq "padrão: rc 92 (há outro rea)" 92 "$RC"
 
 # ---- 7. a trava -------------------------------------------------------------------------------------------------------
-pstart() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/  */ /g;s/^ //;s/ $//'; }
+# mesmo formato que o proc_start do script grava no dono: TZ=UTC e locale C (a hora de início não pode depender do env de quem lê)
+pstart() { LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | sed 's/  */ /g;s/^ //;s/ $//'; }
 mklock() { mkdir -p "$LOCK"; printf '%s\n%s\n%s\n' "$1" "$(date +%s)" "$2" > "$LOCK/owner"; }
 reset_env; mklock 999999 "Mon Jan  1 00:00:00 2001"; run --local -- sh -c "echo x > '$MARK'"
 eq "trava de dono morto é reaped" 0 "$RC"; has "trava morta: aviso" "trava órfã removida" "$OUT"; [ -e "$MARK" ]; ok "trava morta: comando rodou" $?; clean_after "trava morta"
@@ -391,6 +399,48 @@ eq "timeout com a trava trocada: rc 124 (o marcador é privado)" 124 "$RC"
 eq "timeout: nada além do dono do outro dentro da trava dele (visto de dentro do comando)" "owner" "$(sed 's/ $//' "$T/seen.$N" 2>/dev/null)"
 eq "timeout: a trava do outro segue lá depois" "$foreign" "$(sed -n 1p "$LOCK/owner" 2>/dev/null)"
 rm -rf "$LOCK"
+
+# ---- 7c. o dono da trava é identificado por um formato FIXO, não pelo env de quem lê (gate-fix 4, ga-szz40p) ----------------
+# O dono grava a hora de início do processo (ps lstart) e quem chega compara a STRING. Ela muda com TZ e locale de quem chama: o mesmo
+# pid dá "Tue Oct 13 06:24:05 2026" (TZ do mini), "Tue Oct 13 09:24:05 2026" (TZ=UTC) e "ter 13 out 06:24:05 2026" (LC_ALL=pt_BR.UTF-8).
+# Sem o env fixado, um 2º chamador de env diferente lia "início diferente" = pid reaproveitado, tomava a trava de um dono VIVO e rodava
+# um 2º comando pesado ao mesmo tempo — o que a trava existe para impedir. Aqui o env difere DE PROPÓSITO e o dono vivo tem que ser
+# respeitado (91, nada roda, trava intacta). Os testes TÊM que falhar no rea-run.sh sem o env fixado (REA_RUN_UNDER_TEST).
+ps_env() { env $1 ps -o lstart= -p "$2" 2>/dev/null | sed 's/  */ /g;s/^ //;s/ $//'; }   # $1 = "VAR=x VAR2=y" (sem aspas: vira vários argumentos)
+sleep 60 & holder=$!; BGPIDS="$BGPIDS $holder"
+SWAP_PONTO='total = 8192.00M  used = 1000.00M  free = 100.00M  (encrypted)'   # swap em formato fixo: aqui só a TRAVA está em teste (o swap tem os casos dele, abaixo)
+for e in "TZ=Asia/Tokyo" "TZ=America/New_York" "LC_ALL=pt_BR.UTF-8" "LC_ALL=pt_BR.UTF-8 TZ=Asia/Tokyo"; do
+  [ "$(ps_env "$e" "$holder")" != "$(pstart "$holder")" ]; ok "pré-condição: sob $e o ps mostra OUTRA string da hora de início (senão o caso não prova nada)" $?
+  reset_env; export STUB_SWAP_RAW="$SWAP_PONTO"; mklock "$holder" "$(pstart "$holder")"
+  OUT=$(env $e "$RUN" --local --wait-s 1 -- sh -c "echo x > '$MARK'" 2>&1); RC=$?
+  eq "dono vivo lido sob $e: espera (91), não reaps" 91 "$RC"; [ ! -e "$MARK" ]; ok "dono vivo sob $e: comando NÃO rodou" $?
+  eq "dono vivo sob $e: trava intacta" "$holder" "$(sed -n 1p "$LOCK/owner" 2>/dev/null)"; has "dono vivo sob $e: motivo" '"reason":"trava-ocupada"' "$(cat "$LOGF")"
+  case "$OUT" in *"trava órfã removida"*) ok "dono vivo sob $e: sem 'trava órfã removida'" 1 ;; *) ok "dono vivo sob $e: sem 'trava órfã removida'" 0 ;; esac
+done
+kill "$holder" 2>/dev/null
+# ponta a ponta: A é um rea-run de verdade (grava o dono com o env DELE) e B chega com outro env — o que roda em produção é cron/agente × shell
+cross_env() { # script envA envB — A segura a trava e roda; B espera 1 s e NÃO pode tomá-la
+  local s=$1 ea=$2 eb=$3 a o own
+  reset_env; export STUB_SWAP_RAW="$SWAP_PONTO"; rm -f "$MARK.a"
+  env $ea "$s" --local -- sh -c "echo a > '$MARK.a'; sleep 30" >/dev/null 2>&1 & a=$!; BGPIDS="$BGPIDS $a"
+  for _ in $(seq 1 50); do [ -s "$MARK.a" ] && break; sleep 0.1; done
+  o=$(env $eb "$s" --local --wait-s 1 -- sh -c "echo b > '$MARK'" 2>&1); local rc=$?
+  own=$(sed -n 1p "$LOCK/owner" 2>/dev/null)
+  kill -TERM "$a" 2>/dev/null; wait "$a" 2>/dev/null
+  echo "$rc|$([ -e "$MARK" ] && echo B-rodou || echo B-parou)|dono=$([ "$own" = "$a" ] && echo A || echo outro)"
+}
+for pair in "REA_RUN_X=1|TZ=UTC" "TZ=Asia/Tokyo|TZ=UTC" "LC_ALL=C|LC_ALL=pt_BR.UTF-8" "LC_ALL=pt_BR.UTF-8 TZ=Asia/Tokyo|LC_ALL=C TZ=UTC"; do
+  ea=${pair%%|*}; eb=${pair##*|}
+  [ "$(ps_env "$ea" $$)" != "$(ps_env "$eb" $$)" ]; ok "pré-condição: A[$ea] e B[$eb] veem strings DIFERENTES da mesma hora de início" $?
+  eq "A[$ea] segura, B[$eb] chega: B espera (91), não roda, o dono segue sendo A" "91|B-parou|dono=A" "$(cross_env "$RUN" "$ea" "$eb")"
+done
+# o outro lado da mesma moeda: sysctl vm.swapusage imprime "3015,31M" sob LC_ALL de vírgula decimal; o parser lia isso como ilegível (93)
+# mesmo com a máquina saudável. A leitura também não pode depender do env de quem chama.
+reset_env; case "$(LC_ALL=pt_BR.UTF-8 "$T/bin/sysctl" -n vm.swapusage)" in *,*) ok "stub do sysctl imita a vírgula decimal de pt_BR" 0 ;; *) ok "stub do sysctl imita a vírgula decimal de pt_BR" 1 ;; esac
+reset_env; export STUB_SWAP_USED=1000.50M; OUT=$(LC_ALL=pt_BR.UTF-8 "$RUN" --local -- sh -c "echo x > '$MARK'" 2>&1); RC=$?
+eq "swap saudável lido sob LC_ALL=pt_BR (vírgula): roda (0), não vira 93" 0 "$RC"; [ -e "$MARK" ]; ok "swap sob pt_BR: comando rodou" $?
+reset_env; export STUB_SWAP_USED=7000.50M; OUT=$(LC_ALL=pt_BR.UTF-8 "$RUN" --local -- sh -c "echo x > '$MARK'" 2>&1); RC=$?
+eq "swap alto lido sob LC_ALL=pt_BR: recusa pelo MOTIVO certo (92, não 93)" 92 "$RC"; [ ! -e "$MARK" ]; ok "swap alto sob pt_BR: comando NÃO rodou" $?; has "swap alto sob pt_BR: motivo" "swap-alto" "$(cat "$LOGF")"
 
 # ---- 8. sinal e timeout -----------------------------------------------------------------------------------------------
 reset_env; PIDF="$T/gpid.$N"
@@ -528,10 +578,14 @@ mutate() { # gate sed-expr
 }
 probe_disk() { reset_env; export STUB_DF_KB=1; RUN="$1" run --local -- sh -c "echo x > '$MARK'"; echo "$RC|$([ -e "$MARK" ] && echo rodou || echo parou)"; }
 probe_swap() { reset_env; export STUB_SWAP_USED=7000M; RUN="$1" run --local -- sh -c "echo x > '$MARK'"; echo "$RC|$([ -e "$MARK" ] && echo rodou || echo parou)"; }
-probe_lock() { reset_env; local L="$T/morder.$N"; : > "$L"
-  "$1" --local -- sh -c "echo A-start >> '$L'; sleep 1; echo A-end >> '$L'" >/dev/null 2>&1 & local a=$!
-  sleep 0.4; "$1" --local -- sh -c "echo B-start >> '$L'; echo B-end >> '$L'" >/dev/null 2>&1 & local b=$!
-  wait $a; wait $b; tr '\n' ' ' < "$L"; }
+# A segura a trava por 3 s; B chega (só depois de A ter a trava) com --wait-s 1. Com o mkdir exclusivo B desiste em 91 sem rodar. Sem ele (`mkdir -p`
+# sempre "consegue"), B cai no laço de gravação do dono, que não tem prazo: sai quando A solta — rodando (0) ou com 93 —, nunca em 91. O probe
+# antigo comparava a ORDEM A/B e dependia de uma corrida (o spin de B contra o release de A): o mutante saía idêntico ao real em ~1 de 4 rodadas.
+probe_lock() { reset_env; local am="$T/mlock-a.$N" r
+  "$1" --local -- sh -c "echo a > '$am'; sleep 3" >/dev/null 2>&1 & local a=$!
+  for _ in $(seq 1 50); do [ -s "$am" ] && break; sleep 0.1; done
+  RUN="$1" run --local --wait-s 1 -- sh -c "echo x > '$MARK'"
+  r="$RC|$([ -e "$MARK" ] && echo B-rodou || echo B-parou)"; wait $a 2>/dev/null; echo "$r"; }
 probe_cleanup() { reset_env; RUN="$1" run --local -- true; echo "$RC|$(ls -A "$REA_RUN_SCRATCH_ROOT" 2>/dev/null | wc -l | tr -d ' ')"; }
 probe_fallback() { reset_env; export STUB_MBP_RC=98; RUN="$1" run -- sh -c "echo x > '$MARK'"; echo "$RC|$([ -e "$MARK" ] && echo rodou || echo parou)"; }
 probe_timeout() { reset_env; export REA_RUN_TIMEOUT_S=1; RUN="$1" run --local -- sh -c "sleep 3; echo fim > '$MARK'"; echo "$RC|$([ -e "$MARK" ] && echo terminou || echo cortado)"; }
@@ -616,6 +670,16 @@ mutant_check release-owner probe_release_takeover '/# gate:release-owner/s/if \[
 mutant_check orphan-live probe_orphan_live '/# gate:orphan-live/s/alive "\$opid" \&\& continue/:/'
 mutant_check timeout-private probe_timeout_private '/# gate:timeout-private/s/TMO="\$SCRATCH_ROOT\/tmo.\$\$"/TMO="$LOCK_DIR\/timeout"/'
 mutant_check sinal-log probe_sinal_log '/# gate:sinal-log/s/.*/  :/'
+
+# ---- portas novas do gate-fix 4: a hora de início do dono e a leitura do swap não dependem do env de quem chama ----------------
+# Uma porta por metade do env fixado: tirar só TZ=UTC ou só LC_ALL=C já tem que reaparecer como trava de dono vivo tomada.
+probe_ps_tz() { cross_env "$1" "TZ=Asia/Tokyo" "TZ=UTC"; }
+probe_ps_lc() { cross_env "$1" "LC_ALL=C" "LC_ALL=pt_BR.UTF-8"; }
+probe_swap_locale() { reset_env; export STUB_SWAP_USED=1000.50M; OUT=$(LC_ALL=pt_BR.UTF-8 "$1" --local -- sh -c "echo x > '$MARK'" 2>&1); RC=$?
+  echo "$RC|$([ -e "$MARK" ] && echo rodou || echo parou)"; }
+mutant_check proc-start-tz probe_ps_tz '/# gate:proc-start-env/s/ TZ=UTC//'
+mutant_check proc-start-lc probe_ps_lc '/# gate:proc-start-env/s/LC_ALL=C //'
+mutant_check sysctl-env probe_swap_locale '/# gate:sysctl-env/s/LC_ALL=C //'
 
 printf '\nrea-run.selftest: %s ok, %s falha(s)\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
