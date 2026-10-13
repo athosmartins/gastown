@@ -28,8 +28,10 @@
 # NÓ LINUX (ga-zri39b; MBP_SELFTEST_ONLY=node roda só esta parte): a cadeia nó -> MBP -> local com os códigos 96..99 (nó fora, sem RAM, base/venv ausentes, slots cheios,
 #   ssh que cai no meio) e a bandeira própria do nó (independe do mbp-offload.on e da pausa do Athos) · o preflight do nó roda DE VERDADE contra um /proc falso
 #   (MemAvailable, SwapTotal/SwapFree e crescimento, PSI → níveis 1/2/4, disco, núcleos; ilegível ≠ baixo) · SEGURANÇA: o rsync REAL com os argumentos do mbp-run, contra uma árvore
-#   com .duckdb/.db/.csv/.env/segredo/data/shared/logs plantados (dentro e fora de tests/) — nada chega; o que uma semeadura antiga deixou é apagado; controles negativos (sem
-#   --filter, e filtro com a ordem errada sem a conferência) VAZAM e são pegos · filtro ausente, vazio ou na ordem errada = o nó NÃO é usado.
+#   com .duckdb/.db/.csv/.env/segredo/data/shared/logs e nomes de credencial (.pdpj_token.txt, .netrc, token.txt, secrets.json, *.keystore, formato desconhecido .zip) plantados
+#   (dentro e fora de tests/) — nada chega, e o código de nome parecido (pdpj_token.py, test_pdpj_token_*.py) chega; o que uma semeadura antiga deixou é apagado; controles negativos
+#   (sem --filter, filtro com a ordem errada sem a conferência, filtro só-denylist sem a conferência) VAZAM e são pegos · filtro ausente, vazio, fora de ordem, sem o `- *` final
+#   ou sem uma regra-âncora = o nó NÃO é usado.
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -714,6 +716,8 @@ lsf() { echo "$T/last-script-$1-$2.sh"; }                          # o CAMINHO d
 ok() { n=$((n+1)); echo "ok   $1"; }
 bad() { n=$((n+1)); echo "FAIL $1"; fails=$((fails+1)); }
 LEAKS="x.duckdb lib/leak.duckdb tests/fixtures/y.duckdb tests/y.db .env lib/.env.pdpj contacts_auth/client_secret.json data/a.txt viewer/data/b.py shared/logs/a.out logs/l.txt lib/x.csv tests/z.csv lib/k.pem lib/t.parquet lib/b.gz lib/c.pkl .gc/state"
+# a classe que o gate achou (14/10): credencial com nome que nenhuma denylist conhecia + formato/pasta que nenhuma lista previa
+LEAKS="$LEAKS processo_lookup/.pdpj_token.txt .netrc lib/.pgpass token.txt lib/api_token lib/access_token.json service_account.json secrets.json lib/app.keystore lib/token.pickle lib/GOOGLE_TOKEN.json lib/Secrets.YAML tests/fixtures/token.json tests/fixtures/.token tests/fixtures/secrets.yaml lib/dump.zip lib/leads.ndjson lib/notes.txt lib/shot.png run.log .runtime/s.json witness/s.json docs/mrv_artifacts/mrv_decisores.json lib.bak-1/a.py"
 
 node_cases() {
 echo "--- nó Linux de testes (ga-zri39b)"
@@ -744,7 +748,9 @@ reset; date > "$NODEFLAG"; "$RUN" --host linux --exec -- "$T/bin/fakecmd" >"$T/o
 reset; "$RUN" --host foo --repo wa --dir "$T/wt" -- tests/test_x.py >"$T/out" 2>"$T/err"; expect "--host inválido: 97" 97 "$?"
 reset; rc=$(nrun tests/test_x.py); expect "--host linux com a bandeira do nó desligada: 99" 99 "$rc"; hasnt "…sem chamar ninguém" "$STUB_LOG" 'HOSTCALL'
 reset; date > "$NODEFLAG"; rc=$(STUB_UNREACHABLE_NODE=1 nrun tests/test_x.py); expect "--host linux com o nó fora: 98, SEM cair no MBP" 98 "$rc"; hasnt "…o MBP não é chamado" "$STUB_LOG" 'HOSTCALL:mbp'
-reset; date > "$NODEFLAG"; rc=$(STUB_NOBASE_NODE=1 run -- tests/test_x.py); expect "base ausente no nó: cai no MBP" 0 "$rc"; has "motivo sem-base no host hetzner" "$J" '"reason":"sem-base".*"host":"hetzner"'; has "diz como semear o nó" "$T/err" '--host linux --seed wa'
+reset; date > "$NODEFLAG"; rc=$("$RUN" --host linux --repo ps --dir "$T/wt" -- tests/test_x.py >/dev/null 2>"$T/err"; echo $?); expect "--host linux com repo ps: 98" 98 "$rc"; has "…e diz por quê (o nó só roda o wa)" "$T/err" 'só roda o repo wa'
+for hm in "--remote-pause on" "--install-tools"; do reset; date > "$NODEFLAG"; rc=$("$RUN" --host linux $hm >/dev/null 2>"$T/err"; echo $?); expect "--host linux $hm: 97 (é do MBP)" 97 "$rc"; hasnt "…nada vai ao nó nem ao MBP" "$STUB_LOG" 'HOSTCALL'; done
+reset; date > "$NODEFLAG"; rc=$(STUB_NOBASE_NODE=1 run -- tests/test_x.py); expect "base ausente no nó: cai no MBP" 0 "$rc"; has "motivo sem-base no host hetzner" "$J" '"reason":"sem-base".*"host":"hetzner"'; has "diz que o Mayor monta a base do nó (a semeadura é a fatia 4)" "$T/err" 'fatia 4 da ga-zri39b'; hasnt "…e não manda rodar o --seed que sai com 97" "$T/err" 'host linux --seed'
 reset; date > "$NODEFLAG"; rc=$(STUB_NOVENV_NODE=1 run -- tests/test_x.py); expect "venv ausente no nó: cai no MBP" 0 "$rc"; has "motivo sem-venv" "$J" '"reason":"sem-venv".*"host":"hetzner"'
 reset; date > "$NODEFLAG"; rc=$(STUB_RUN_RC_NODE=255 run -- tests/test_x.py); expect "ssh cai NO MEIO da execução no nó: cai no MBP e roda" 0 "$rc"; has "…a queda é logada com host=hetzner rc=255" "$J" '"rc":255.*"host":"hetzner"'; has "…e o MBP rodou" "$J" '"rc":0.*"host":"mbp"'
 reset; date > "$NODEFLAG"; for i in 1 2 3 4 5 6; do mkslot $i; done; rc=$(STUB_SLOTS=exec run -- tests/test_x.py); expect "slots do nó cheios (teto 6): cai no MBP" 0 "$rc"; has "motivo slots no host hetzner" "$J" '"reason":"slots".*"host":"hetzner"'
@@ -791,11 +797,15 @@ rm -f "$NODEFLAG"
 reset; date > "$NODEFLAG"; rc=$(run -- tests/test_x.py); has "filtro de verdade (o do repositório) vale: roda no nó" "$J" '"host":"hetzner"'
 printf '%s\n' '+ /tests/***' '- .env' '- client_secret*.json' '- *.duckdb*' '- *.db' '- *.csv' '- *.parquet' '- *.gz' > "$T/unsafe-filter"
 reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/unsafe-filter" run -- tests/test_x.py); expect "filtro com + /tests/*** ANTES das regras de dado: o nó NÃO é usado, cai no MBP" 0 "$rc"
-hasnt "…nenhum rsync ao nó" "$STUB_LOG" 'RSYNC:.*hetzner-teste'; hasnt "…nenhuma chamada ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; has "…motivo no log" "$J" '"reason":"filtro-invalido".*"host":"hetzner"'; has "…mensagem explica a ordem" "$T/err" 'ordem de segurança'
+hasnt "…nenhum rsync ao nó" "$STUB_LOG" 'RSYNC:.*hetzner-teste'; hasnt "…nenhuma chamada ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; has "…motivo no log" "$J" '"reason":"filtro-invalido".*"host":"hetzner"'; has "…mensagem diz o que o filter_sane confere" "$T/err" 'forma conferida pelo filter_sane'
 reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/nao-existe" run -- tests/test_x.py); expect "filtro ausente: o nó NÃO é usado" 0 "$rc"; has "…motivo filtro-invalido" "$J" '"reason":"filtro-invalido"'; hasnt "…nenhuma chamada ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'
 : > "$T/empty-filter"; reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/empty-filter" run -- tests/test_x.py); has "filtro vazio: o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'
 grep -v -F -x -e '- *.parquet' "$HERE/hetzner-rsync-filter.wa.txt" > "$T/missing-rule-filter"; reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/missing-rule-filter" run -- tests/test_x.py); has "filtro SEM uma das regras de dado (parquet): o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'
 grep -v -F -x -e '+ /tests/***' "$HERE/hetzner-rsync-filter.wa.txt" > "$T/notests-filter"; reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/notests-filter" run -- tests/test_x.py); has "filtro sem a regra de tests/: o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'
+for mut in '- *' '- .netrc' '- .*[Tt][Oo][Kk][Ee][Nn]*' '- *[Tt][Oo][Kk][Ee][Nn]*.[jyti]*' '- *.pickle'; do   # tira UMA regra-âncora de classe, ou o `- *` final
+  grep -v -F -x -e "$mut" "$HERE/hetzner-rsync-filter.wa.txt" > "$T/mut-filter"; reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/mut-filter" run -- tests/test_x.py); has "filtro SEM '$mut': o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'; done
+for pos in first last; do { [ $pos = first ] && echo '+ *.py'; cat "$HERE/hetzner-rsync-filter.wa.txt"; [ $pos = last ] && echo '+ *.py'; } > "$T/plus-filter"
+  reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/plus-filter" run -- tests/test_x.py); has "filtro com '+ *.py' $pos (antes das regras de segredo / no lugar do '- *' final): o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'; done
 # o rsync do nó usa o filtro, com --delete-excluded, e o ssh reaproveita a conexão
 reset; date > "$NODEFLAG"; run -- tests/test_x.py >/dev/null; has "rsync do nó: --filter com o arquivo do repositório" "$STUB_LOG" 'RSYNC:.*--filter=\. .*hetzner-rsync-filter\.wa\.txt'; has "rsync do nó: --delete-excluded" "$STUB_LOG" 'RSYNC:.*--delete --delete-excluded'
 has "rsync do nó: destino é o espelho do slot" "$STUB_LOG" 'RSYNC:.* hetzner-teste:gt-remote/mirror/wa-1/'; hasnt "rsync do nó: NÃO usa a lista de exclusões do MBP" "$STUB_LOG" 'RSYNC:.*hetzner-teste.*--exclude'
@@ -812,8 +822,9 @@ has "job do nó: presença dedicada/livre" "$(lsf RUN hetzner)" 'PR_WHY=dedicada
 reset; run -- tests/test_x.py >/dev/null; has "job do MBP: PATH do Homebrew (como sempre)" "$(lsf RUN mbp)" '/opt/homebrew/bin'; has "job do MBP: a biblioteca de presença" "$(lsf RUN mbp)" 'ioreg'
 
 # ===== SEGURANÇA, de verdade: o rsync REAL com os argumentos do mbp-run, contra uma árvore com dado e segredo plantados =====
-WTD="$T/wtd"; mkdir -p "$WTD/tests/fixtures" "$WTD/tests/data" "$WTD/lib" "$WTD/contacts_auth" "$WTD/data" "$WTD/viewer/data" "$WTD/shared/logs" "$WTD/logs" "$WTD/.gc"
+WTD="$T/wtd"; mkdir -p "$WTD/tests/fixtures" "$WTD/tests/data" "$WTD/lib" "$WTD/contacts_auth" "$WTD/processo_lookup" "$WTD/data" "$WTD/viewer/data" "$WTD/shared/logs" "$WTD/logs" "$WTD/.gc"
 : > "$WTD/tests/test_x.py"; echo ok > "$WTD/tests/ok.json"; echo ok > "$WTD/tests/data/fixture.json"; echo ok > "$WTD/tests/fixtures/win.jsonl"; echo code > "$WTD/lib/a.py"; echo code > "$WTD/contacts_auth/server.py"
+echo code > "$WTD/processo_lookup/pdpj_token.py"; echo code > "$WTD/tests/test_pdpj_token_refresh.py"; echo ok > "$WTD/lib/rules.yaml"   # código/config de nome parecido com credencial: TEM que chegar
 for lk in $LEAKS; do mkdir -p "$WTD/$(dirname "$lk")"; echo secret > "$WTD/$lk"; done
 DEST="$T/home/gt-remote/mirror/wa-1"
 leakcheck() { # imprime os arquivos plantados que chegaram ao destino (vazio = nada vazou)
@@ -821,7 +832,7 @@ leakcheck() { # imprime os arquivos plantados que chegaram ao destino (vazio = n
 reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; mkdir -p "$DEST/processo_lookup" "$DEST/shared/logs.backup"; echo old > "$DEST/processo_lookup/.env.pdpj"; echo old > "$DEST/shared/logs.backup/x.out"
 STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTD" -- tests/test_x.py >"$T/out" 2>"$T/err"; rc=$?; expect "rsync real: a bateria roda no nó" 0 "$rc"; has "…no nó" "$J" '"host":"hetzner"'
 eq "NADA de dado ou segredo plantado chegou ao nó (a lista abaixo tem de ser vazia)" "" "$(leakcheck)"
-for okf in lib/a.py tests/test_x.py tests/ok.json tests/data/fixture.json tests/fixtures/win.jsonl contacts_auth/server.py; do n=$((n+1)); if [ -f "$DEST/$okf" ]; then echo "ok   chegou (é código/fixture): $okf"; else echo "FAIL não chegou: $okf"; fails=$((fails+1)); fi; done
+for okf in lib/a.py tests/test_x.py tests/ok.json tests/data/fixture.json tests/fixtures/win.jsonl contacts_auth/server.py processo_lookup/pdpj_token.py tests/test_pdpj_token_refresh.py lib/rules.yaml; do n=$((n+1)); if [ -f "$DEST/$okf" ]; then echo "ok   chegou (é código/fixture): $okf"; else echo "FAIL não chegou: $okf"; fails=$((fails+1)); fi; done
 n=$((n+1)); if [ ! -e "$DEST/processo_lookup/.env.pdpj" ] && [ ! -e "$DEST/shared/logs.backup/x.out" ]; then echo "ok   --delete-excluded limpa o que uma semeadura antiga deixou (.env.pdpj e shared/logs.backup/x.out)"; else echo "FAIL o destino manteve segredo/log antigo"; fails=$((fails+1)); fi
 MUT="$T/mutdir"; mkdir -p "$MUT"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt; do ln -sf "$HERE/$mf" "$MUT/$mf"; done
 # controle negativo 1: sem o --filter, o vazamento aparece — prova que o teste enxerga o defeito
@@ -836,6 +847,12 @@ n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-nosane.sh"; then echo "FAIL controle: o s
   n=$((n+1)); if [ -e "$DEST/tests/fixtures/y.duckdb" ]; then echo "ok   controle: sem a conferência de ordem, o filtro do rascunho deixa passar tests/fixtures/y.duckdb"; else echo "FAIL controle: o filtro inseguro não vazou nada — o teste não enxerga o defeito"; fails=$((fails+1)); fi; fi
 reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; HETZNER_RSYNC_FILTER="$T/unsafe-filter" STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTD" -- tests/test_x.py >/dev/null 2>&1
 n=$((n+1)); if [ ! -e "$DEST/tests/fixtures/y.duckdb" ]; then echo "ok   o script real, com o filtro inseguro, não envia nada (a conferência de ordem barra)"; else echo "FAIL o script real enviou dado com o filtro inseguro"; fails=$((fails+1)); fi
+# controle negativo 3: o filtro só-denylist (a forma que o gate reprovou em 14/10) sem a conferência deixa sair credencial de nome desconhecido; com a conferência, nada sai
+printf '%s\n' '- .env' '- client_secret*.json' '- *.duckdb*' '- *.db' '- *.csv' '- *.parquet' '- *.gz' '- *.pem' '- *.pkl' '+ /tests/***' '- data/' '- /shared/' '- .gc' > "$T/denylist-filter"
+reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; HETZNER_RSYNC_FILTER="$T/denylist-filter" STUB_RSYNC_REAL=1 "$MUT/mut-nosane.sh" --repo wa --dir "$WTD" -- tests/test_x.py >/dev/null 2>&1
+n=$((n+1)); if [ -e "$DEST/processo_lookup/.pdpj_token.txt" ] && [ -e "$DEST/.netrc" ] && [ -e "$DEST/lib/dump.zip" ]; then echo "ok   controle: o filtro só-denylist, sem a conferência, deixa sair .pdpj_token.txt, .netrc e dump.zip (o teste enxerga a classe)"; else echo "FAIL controle: o filtro só-denylist não vazou — o teste não enxerga a classe"; fails=$((fails+1)); fi
+reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; HETZNER_RSYNC_FILTER="$T/denylist-filter" STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTD" -- tests/test_x.py >/dev/null 2>&1
+n=$((n+1)); if [ ! -e "$DEST/processo_lookup/.pdpj_token.txt" ] && [ ! -e "$DEST/.netrc" ]; then echo "ok   o script real, com o filtro só-denylist, não envia nada (o filter_sane recusa: falta o '- *' final e as âncoras)"; else echo "FAIL o script real enviou credencial com o filtro só-denylist"; fails=$((fails+1)); fi
 find "$DEST" -mindepth 1 -delete 2>/dev/null
 
 

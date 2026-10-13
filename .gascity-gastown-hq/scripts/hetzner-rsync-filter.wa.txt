@@ -1,17 +1,23 @@
 # hetzner-rsync-filter.wa.txt — o QUE sai do mini para o nó Linux de testes (Hetzner). Só código + tests/. (ga-zri39b)
 #
 # Contents
-#   Como é lido · Seção 1 (nega sempre) · Seção 2 (tests/) · Seção 3 (o resto é só código)
+#   Como é lido · O que garante · Seção 1 (nega sempre) · Seção 2 (tests/) · Seção 3 (fora de tests/: só sai o que está na lista)
 #
 # COMO É LIDO: o mbp-run.sh passa este arquivo ao rsync como `--filter=". <este arquivo>"`, com --delete --delete-excluded. O rsync usa a PRIMEIRA
 #   regra que casa, de cima para baixo — por isso a ORDEM é a segurança: a seção 1 vem antes de `+ /tests/***`, então nada dela sai nem de dentro de
 #   tests/. --delete-excluded faz o destino PERDER o que o filtro exclui (uma semeadura antiga que levou segredo é limpa na próxima rodada).
-#   Nenhum dado de cliente sai do mini: é a regra do Athos para o servidor alugado, e o selftest planta um *.duckdb, um .env e um data/ e confere que não chegam.
-#   Arquivo ausente ou ilegível = o mbp-run.sh NÃO usa o nó (estado inerte; cai no MBP): sem este filtro não se sabe o que enviar.
+#   Arquivo ausente, ilegível ou fora do formato que o mbp-run.sh confere (filter_sane) = o nó NÃO é usado (estado inerte; cai no MBP).
+# O QUE GARANTE: o filtro olha NOME e pasta, nunca o conteúdo — não sabe se um .py tem senha colada dentro. Garante que (1) nome de segredo ou de dado conhecido não sai
+#   e (2) nome DESCONHECIDO não sai: fora de tests/ só sai a extensão listada na seção 3 (o `- *` do fim barra o resto), então arquivo novo é inerte até alguém o listar.
+#   Dentro de tests/ sai tudo que a seção 1 não nega (é onde ficam as fixtures). Custo de negar demais: teste vermelho no nó, refeito local pelo gate.
+#   Medido (13/10, o seed manual do nó): levou processo_lookup/.env.pdpj, contacts_auth/client_secret.json e shared/logs.backup-*/*.out.
+#   Medido (14/10, revisão do gate): a versão só-denylist deixava sair processo_lookup/.pdpj_token.txt (credencial viva do PDPJ, gitignored), .netrc, token.txt, secrets.json,
+#   service_account.json, *.keystore, token.pickle e formatos de dado não listados (zip, sql, tsv, ndjson) — a seção 1 (formas de segredo) e o `- *` da seção 3 existem por isso.
+#   Resíduo (14/10, dry-run na árvore real): .json/.md/.html FORA de tests/ com nome neutro ainda sai — a lista é por extensão, não por conteúdo. O caso medido,
+#   docs/mrv_artifacts/mrv_decisores.json (CPFs, só no disco), é barrado pela pasta (`*_artifacts/`); export novo em outra pasta de docs/ só é barrado quando alguém a listar aqui.
 #   Medido (13/10, openrsync do macOS): `- **/data/` NÃO casa um data/ na raiz (só os aninhados), por isso a regra é `- data/` (qualquer nível).
-#   Medido (13/10, o seed manual do nó): levou processo_lookup/.env.pdpj, contacts_auth/client_secret.json e shared/logs.backup-*/*.out — a seção 1 e a 3 existem por isso.
 #
-# SEÇÃO 1 — NEGA SEMPRE, em qualquer pasta (inclusive tests/): credencial e formato de dado.
+# SEÇÃO 1 — NEGA SEMPRE, em qualquer pasta (inclusive tests/): credencial, formas de segredo e formato de dado.
 - .env
 - .env.*
 - *.pem
@@ -19,6 +25,12 @@
 - *.p12
 - *.pfx
 - *.crt
+- *.p8
+- *.jks
+- *.keystore
+- *.gpg
+- *.token
+- *.pickle
 - id_rsa*
 - id_ed25519*
 - *.kdbx
@@ -27,10 +39,31 @@
 - cookies*.json
 - cookies*.txt
 - *.session
+- .netrc
+- .npmrc
+- .pypirc
+- .pgpass
+- .htpasswd
+- .git-credentials
+- .aws/
+- .ssh/
+- .gnupg/
 - auth/
 - auth-*/
 - auth_*/
 - auth.bak*/
+# dotfile com palavra de segredo no nome (.pdpj_token.txt, .token) e arquivo de dado/config com ela (token.txt, access_token.json, secrets.yaml, service_account.json).
+# Só a extensão que começa com j/y/t/i (json, yaml, yml, txt, ini...) é negada: processo_lookup/pdpj_token.py e tests/test_pdpj_token*.py são CÓDIGO que o nó precisa.
+- .*[Tt][Oo][Kk][Ee][Nn]*
+- *[Tt][Oo][Kk][Ee][Nn]*.[jyti]*
+- *[Ss][Ee][Cc][Rr][Ee][Tt]*.[jyti]*
+- *[Pp][Aa][Ss][Ss][Ww]*.[jyti]*
+- *[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]*.[jyti]*
+- *[Aa][Pp][Ii][-_][Kk][Ee][Yy]*.[jyti]*
+- *[Ss][Ee][Rr][Vv][Ii][Cc][Ee][-_][Aa][Cc][Cc][Oo][Uu][Nn][Tt]*.[jyti]*
+- *[Pp][Rr][Ii][Vv][Aa][Tt][Ee][-_][Kk][Ee][Yy]*.[jyti]*
+- *[Tt][Oo][Kk][Ee][Nn]
+- *[Ss][Ee][Cc][Rr][Ee][Tt]
 - *.duckdb*
 - *.db
 - *.db-*
@@ -43,17 +76,19 @@
 - *.csv
 - __pycache__
 - .pytest_cache
-# SEÇÃO 2 — tests/ vai inteiro (fixtures json/jsonl/xml/txt são código de teste; os formatos de dado já saíram na seção 1).
+# SEÇÃO 2 — tests/ vai inteiro (fixtures json/jsonl/xml/txt são código de teste; segredo e formato de dado já saíram na seção 1).
 + /tests/***
-# SEÇÃO 3 — fora de tests/: só código. Estas pastas e arquivos nunca saem do mini.
+# SEÇÃO 3 — fora de tests/: pastas que nunca saem, e DEPOIS a lista do que sai. O que não está na lista cai no `- *` do fim.
 - .git
 - .repo.git
 - .worktrees
 - .viewer-deploy-clone
 - .playwright-mcp
 - .claude
+- .codex
 - .gemini
 - .gc
+- .runtime
 - .beads
 - venv
 - .venv
@@ -62,6 +97,9 @@
 - refinery/
 - polecats/
 - scratchpad/
+- witness/
+- *_artifacts/
+- *.bak-*/
 - node_modules
 - /shared/
 - /config
@@ -70,10 +108,21 @@
 - /logs
 - /logs.*
 - data/
-- .DS_Store
-- *.bak
-- *.log
-- *.jsonl
-- *.out
-- *.err
-- *.pid
+# a lista do que sai (código, doc e config do repositório). `+ */` deixa o rsync entrar nas pastas; imagem, pdf, binário e log não estão aqui de propósito.
++ */
++ *.py
++ *.sh
++ *.md
++ *.json
++ *.plist
++ *.html
++ *.css
++ *.js
++ *.mjs
++ *.cjs
++ *.ts
++ *.sql
++ *.yaml
++ *.yml
++ *.ini
+- *

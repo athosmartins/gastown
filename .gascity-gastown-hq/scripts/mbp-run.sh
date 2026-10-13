@@ -39,8 +39,9 @@
 #   CADEIA        nó Linux -> MBP -> mini, com os mesmos códigos 96..99: qualquer motivo para o nó não rodar (bandeira, inalcançável, sem saúde,
 #                 slots cheios, base ausente, ssh que caiu no meio, filtro ilegível, repo que não é wa) cai no MBP, e daí no
 #                 que já existia. Servidor fora do ar NUNCA trava o gate. Só pytest vai ao nó (--exec segue no MBP; é a bead do REA).
-#   SEGURANÇA     o rsync para o nó usa SÓ scripts/hetzner-rsync-filter.wa.txt (código + tests/; nunca *.duckdb/*.db/*.csv/*.parquet/*.gz, segredo,
-#                 data/, shared/, logs) com --delete-excluded. Nenhum dado de cliente sai do mini. Filtro ilegível = o nó NÃO é usado.
+#   SEGURANÇA     o rsync para o nó usa SÓ scripts/hetzner-rsync-filter.wa.txt, com --delete-excluded. O filtro olha NOME e pasta, nunca o conteúdo: nome de segredo
+#                 ou de dado conhecido não sai, e fora de tests/ só sai a extensão de código/doc listada (nome desconhecido fica inerte). Filtro fora da forma
+#                 que o filter_sane confere = o nó NÃO é usado.
 #   LOG           toda linha de $CITY/.gc/logs/mbp-run.jsonl traz "host":"hetzner"|"mbp".
 #
 # PRESENÇA DO ATHOS (ga-77c1qg; decisão dele em 12/10: o MBP é o notebook de trabalho dele, o mini é o servidor)
@@ -486,7 +487,7 @@ while [ \$n -le $cap ]; do
   if mkdir "\$S/\$n" 2>/dev/null; then
     printf '%s\n' '$OWNER' > "\$S/\$n/owner"; printf '%s\n' '$SLOT_INFO' > "\$S/\$n/info"
     occ=\$(ls -1 "\$S" | grep -c '^[0-9][0-9]*\$')
-    if [ "\$occ" -le $cap ]; then echo "SLOT=\$n"; echo "OCC=\$occ"; exit 0; fi
+    if [ "\$occ" -le $cap ]; then echo "SLOT=\$n"; exit 0; fi
     rm -f "\$S/\$n/owner" "\$S/\$n/info"; rmdir "\$S/\$n" 2>/dev/null
     break
   fi
@@ -512,7 +513,6 @@ acquire() {
   for attempt in 1 2; do
     out=$(acquire_once); rc=$?
     SLOT=$(echo "$out" | sed -n 's/^SLOT=//p' | head -1)
-    OCC=$(echo "$out" | sed -n 's/^OCC=//p' | head -1)   # quantos slots ocupados com o meu (divide os núcleos do nó entre as baterias); ausente = 1
     [ -n "$SLOT" ] && return 0
     [ $rc -eq 255 ] && { say "ssh caiu ao pegar slot"; return 98; }
     [ $attempt -eq 2 ] && break
@@ -548,19 +548,22 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
 # ---- nó Linux: guardas de segurança --------------------------------------------------------------------------------------
-# filter_sane: o filtro do rsync é a fronteira de dados do servidor alugado, então ele é CONFERIDO, não só lido. Vale se (1) abre e não é vazio, (2) a regra
-# `+ /tests/***` existe e (3) as regras de segredo e de formato de dado (.env, client_secret, *.duckdb, *.db, *.csv, *.parquet, *.gz) vêm ANTES dela: o rsync usa
-# a primeira regra que casa, e um filtro que inclui tests/ primeiro deixa passar um *.duckdb plantado lá dentro (o que o rascunho inicial fazia). rc 0 = vale · 1 = não vale.
+# filter_sane: o filtro do rsync é a fronteira de dados do servidor alugado, então ele é CONFERIDO, não só lido. Confere a FORMA, não a suficiência (essa é o teste com rsync
+# de verdade, no selftest e no prod test): (1) abre e não é vazio, (2) `+ /tests/***` existe, (3) as 12 regras-âncora de cada classe (.env, .netrc, client_secret, dotfile de
+# token, token/secret com extensão de dado, .pickle, *.duckdb/.db/.csv/.parquet/.gz) vêm ANTES dela — o rsync usa a primeira regra que casa, e quem inclui tests/ primeiro deixa passar
+# um *.duckdb plantado lá dentro —, (4) nenhum `+` antes dela e nenhum `+ *` em lugar nenhum, (5) a ÚLTIMA regra é `- *` (sem ela, nome desconhecido sai). rc 0 = vale · 1 = não.
 filter_sane() {
   [ -f "$NODE_FILTER" ] && [ -r "$NODE_FILTER" ] && [ -s "$NODE_FILTER" ] || return 1
   awk '
+    BEGIN { split(".env|.netrc|client_secret*.json|.*[Tt][Oo][Kk][Ee][Nn]*|*[Tt][Oo][Kk][Ee][Nn]*.[jyti]*|*[Ss][Ee][Cc][Rr][Ee][Tt]*.[jyti]*|*.pickle|*.duckdb*|*.db|*.csv|*.parquet|*.gz", c, "|")
+            for (i in c) { want["- " c[i]] = 1; nwant++ } }
     /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
-    { line = $0; sub(/[[:space:]]+$/, "", line) }
+    { line = $0; sub(/[[:space:]]+$/, "", line); last = line }
+    line ~ /^\+ \*+$/ { bad = 1 }
     line == "+ /tests/***" { if (!tests) tests = NR; next }
-    line == "- .env" || line == "- client_secret*.json" || line == "- *.duckdb*" || line == "- *.db" || line == "- *.csv" || line == "- *.parquet" || line == "- *.gz" {
-      if (!tests) pre[line] = 1
-      next }
-    END { n = 0; for (k in pre) n++; exit !(tests && n == 7) }' "$NODE_FILTER"
+    !tests && line ~ /^\+/ { bad = 1 }
+    !tests && (line in want) { seen[line] = 1 }
+    END { n = 0; for (k in seen) n++; exit !(tests && !bad && n == nwant && last == "- *") }' "$NODE_FILTER"
 }
 # node_wanted <args>: o nó entra na cadeia? Devolve 1 quando não e deixa o motivo em NODE_WHY (vira uma linha do log). A bandeira desligada NÃO é recusa: é o interruptor.
 NODE_WHY=""
@@ -568,12 +571,13 @@ node_wanted() {
   NODE_WHY=""
   [ "$host_sel" != mbp ] || return 1
   [ -f "$NODE_FLAG" ] || return 1
-  [ "$repo" = wa ] || return 1
-  filter_sane || { NODE_WHY="filtro-invalido"; say "o filtro do rsync do nó ($NODE_FILTER) não abre ou não tem a ordem de segurança (segredo/dado ANTES de + /tests/***) — o nó NÃO é usado"; return 1; }
+  [ "$repo" = wa ] || { [ "$host_sel" = linux ] && say "o nó Linux só roda o repo wa (este é '$repo') — rode local"; return 1; }
+  filter_sane || { NODE_WHY="filtro-invalido"; say "o filtro do rsync do nó ($NODE_FILTER) não abre ou não está na forma conferida pelo filter_sane (regras de segredo/dado ANTES de + /tests/***, nada que inclua tudo, \`- *\` no fim) — o nó NÃO é usado"; return 1; }
   return 0
 }
 # ---- seed / check -----------------------------------------------------------------------------------------------
 # --host linux fixa o nó nos modos que olham UM host (--check, --seed); sem --host, esses modos continuam sendo do MBP como sempre foram.
+case "$host_sel:$mode" in linux:remote_pause|linux:install_tools) say "--host linux não vale para --$(echo "$mode" | tr _ -): a pausa e as ferramentas são do MBP"; exit 97 ;; esac
 [ "$host_sel" = linux ] && use_host linux
 if [ "$mode" = check ]; then
   preflight; rc=$?
@@ -674,7 +678,6 @@ _attempt_pytest() {
   local orig=("$@")
   preflight || { rc=$?; log_refusal; return $rc; }
   SLOT_INFO=$(slot_info_for "$repo" pytest "$@")
-  OCC=1
   acquire || { rc=$?; if [ $rc -eq 96 ]; then fall slots "$rc"; else fall ssh-caiu "$rc"; fi; return $rc; }
   T0=$(date +%s)
   mkdir -p "$CITY/.gc/run" 2>/dev/null; TMPOUT=$(mktemp "$CITY/.gc/run/mbp-run.XXXXXX")
@@ -692,8 +695,8 @@ mkdir -p "\$HOME/gt-remote/mirror" && $cpcmd "\$B" "\$M" && echo MIRROR_SEEDED
 EOF
   ); mrc=$?
   case "$m" in
-    *NOBASE*) say "base ~/gt-remote/$base ausente no $HNAME — rode: mbp-run.sh $([ "$HOSTKIND" = linux ] && echo '--host linux ')--seed $repo"; fall sem-base 97; return 97 ;;
-    *NOVENV*) say "venv ~/gt-remote/$rv ausente no $HNAME — rode: mbp-run.sh $([ "$HOSTKIND" = linux ] && echo '--host linux ')--seed $repo"; fall sem-venv 97; return 97 ;;
+    *NOBASE*) say "base ~/gt-remote/$base ausente no $HNAME — $([ "$HOSTKIND" = linux ] && echo 'o Mayor monta a base do nó à mão (a semeadura é a fatia 4 da ga-zri39b)' || echo "rode: mbp-run.sh --seed $repo")"; fall sem-base 97; return 97 ;;
+    *NOVENV*) say "venv ~/gt-remote/$rv ausente no $HNAME — $([ "$HOSTKIND" = linux ] && echo 'o Mayor monta o venv do nó à mão (a semeadura é a fatia 4 da ga-zri39b)' || echo "rode: mbp-run.sh --seed $repo")"; fall sem-venv 97; return 97 ;;
     *MIRROR_*) ;;
     *) [ $mrc -eq 255 ] && { say "ssh caiu ao preparar o espelho"; fall ssh-caiu 98; return 98; }; say "espelho falhou: $m"; fall espelho-falhou 98; return 98 ;;
   esac

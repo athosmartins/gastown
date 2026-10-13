@@ -45,7 +45,8 @@ scan_node_base() {
   local leaks bad
   if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$NODE_HOST" true >/dev/null 2>&1; then warn "o nó $NODE_HOST não respondeu ao ssh — checks vivos do servidor pulados (a cadeia cai no MBP)"; return 0; fi
   leaks="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$NODE_HOST" 'cd ~/gt-remote/wa-base 2>/dev/null || { echo NOBASE; exit 0; }
-    find . \( -name ".env" -o -name ".env.*" -o -name "client_secret*.json" -o -name "credentials*.json" -o -name "*.pem" -o -name "*.key" -o -name "*.duckdb*" -o -name "*.db" -o -name "*.sqlite*" -o -name "*.parquet" -o -name "*.csv" -o -name "*.gz" -o -name "*.pkl" -o -name "*.xlsx" -o -path "./shared" -o -path "./data" -o -path "./logs" \) -print 2>/dev/null | grep -v -E "^\./\.env\.example$" | head -20; echo SCAN_DONE' 2>/dev/null)"
+    find . \( -name ".env" -o -name ".env.*" -o -name "client_secret*.json" -o -name "credentials*.json" -o -name "*.pem" -o -name "*.key" -o -name "*.duckdb*" -o -name "*.db" -o -name "*.sqlite*" -o -name "*.parquet" -o -name "*.csv" -o -name "*.gz" -o -name "*.pkl" -o -name "*.xlsx" -o -path "./shared" -o -path "./data" -o -path "./logs" \
+      -o -name ".*token*" -o -name "*token" -o -name "*token*.json" -o -name "*token*.txt" -o -name ".netrc" -o -name ".npmrc" -o -name ".pgpass" -o -name "secrets*.json" -o -name "service_account*.json" -o -name "*.keystore" -o -name "*.pickle" \) -print 2>/dev/null | grep -v -E "^\./\.env\.example$" | head -20; echo SCAN_DONE' 2>/dev/null)"
   if [[ "$leaks" == *NOBASE* ]]; then warn "o nó ainda não tem ~/gt-remote/wa-base — a cadeia cai no MBP até lá"
   elif [[ "$leaks" != *SCAN_DONE* ]]; then warn "não consegui varrer a base do nó (ssh caiu no meio): a checagem de vazamento NÃO foi feita"
   else
@@ -71,7 +72,8 @@ tmpc="$(tmpcity)"
 chk="$(MBP_CITY="$tmpc" "$BASH32" "$RUN" --host linux --check 2>/dev/null | sed -n 's/^node_filter_ok=//p')"
 [[ "$chk" == 1 ]] || fail "o mbp-run.sh vivo NÃO aceita o filtro $FILTER (node_filter_ok='${chk:-vazio}'): o nó não seria usado"
 awk '/^\+ \/tests\/\*\*\*$/ { t = NR } /^- \*\.duckdb\*$/ { d = NR } END { exit !(t && d && d < t) }' "$FILTER" || fail "no filtro, *.duckdb não vem ANTES de + /tests/***"
-log "filtro do rsync: ordem de segurança ✓ (aceito pelo mbp-run.sh vivo)"
+awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next } { last = $0 } END { exit !(last == "- *") }' "$FILTER" || fail "no filtro, a última regra não é '- *': nome desconhecido sairia do mini"
+log "filtro do rsync: ordem de segurança e '- *' final ✓ (aceito pelo mbp-run.sh vivo)"
 
 run_suite "selftest do nó Linux (mbp-run.sh)" 120 env MBP_SELFTEST_ONLY=node timeout 900 "$BASH32" "$SELFTEST"
 run_suite "selftest do atalho do pytest (bandeira do nó)" 150 timeout 600 "$BASH32" "$SHIM_ST"
