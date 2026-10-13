@@ -758,6 +758,17 @@ _pool_ceiling_lib_failed_note() {
   return 0
 }
 # SELFTEST-EXTRACT pool-ceiling-note: END
+# ── ga-qmymjm: the post-merge tail runs OUTSIDE the sweep (gate-postmerge.lib.sh) ──
+# What follows a confirmed merge (the source bead's hand-off or close, the rig deploy, daemon-refresh, holds, mails) took a median 1.3 min of the
+# sweep that holds the gate lock, and the next review waited for it. gate_finalize_run forks that tail into its own process group instead. The lib
+# is OPTIONAL: missing/unloadable -> GATE_PM_LIB_OK=0 and the tail runs inline, as it always did (the gate must never die for lack of an
+# optimisation). GATE_PM_LIB is a test seam. stderr is NOT suppressed: a corrupt sibling is a deploy fault and must be loud.
+GATE_PM_LIB_OK=0
+_GATE_PM_LIB="${GATE_PM_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/gate-postmerge.lib.sh}"
+if [ -r "$_GATE_PM_LIB" ]; then
+  # shellcheck disable=SC1090
+  if . "$_GATE_PM_LIB" && type gate_pm_begin >/dev/null 2>&1; then GATE_PM_LIB_OK=1; fi
+fi
 case "$GATE_CODE_REVIEWERS"      in ''|*[!0-9]*) GATE_CODE_REVIEWERS=2 ;; esac
 case "$GATE_SWAP_FREE_FLOOR_MB"  in ''|*[!0-9]*) GATE_SWAP_FREE_FLOOR_MB=512 ;; esac
 case "$GATE_SWAP_GROW_DISK_MIN_MB" in ''|*[!0-9]*) GATE_SWAP_GROW_DISK_MIN_MB=4096 ;; esac
@@ -9834,6 +9845,23 @@ fi
       close_open_run_verdicts "$GATE_RUN_ID" "terminal PASSED" || true
     fi
 
+    # ── ga-qmymjm: THE POST-MERGE TAIL — everything from here to the "Gate PASSED" log ───────────────────────────
+    # The merge is confirmed, the integrity check passed, the survival ledger has the SHA, the marker and the gate-run are terminal and their
+    # verdict beads closed: nothing below decides whether the NEXT branch may be reviewed. It used to run inside the sweep that holds the gate lock
+    # (median 1.3 min after the merge, p90 3.4 — ga-bk5j8u.1's 50-round measurement) and the next admission waited for it. It is now a function that
+    # the fork block below runs beside the sweep (own process group; gate-postmerge.lib.sh), or inline when the lib is missing, the switch is off
+    # (GATE_POSTMERGE_ASYNC=0 / $GC_CITY/.gc/gate-postmerge.off) or DRY_RUN=1. The body is the code that was here, in the same order; inline it runs
+    # in the sweep's own shell with the same globals and errexit as before — the only additions are the gate_pm_step markers and the deploy lock.
+    # The source bead keeps gate:queued + gate:reviewing until the tail moves it, which keeps it out of the dog pool probe (scripts/pool-probe.sh)
+    # and the Pilot meanwhile — both exclude those two labels.
+    # The deploy of one runtime dir is serialised by gate_pm_deploy_lock_* (the sweep lock used to do that). A tail that fails or vanishes leaves a
+    # label + comment on the source bead, an event and a job file — see gate-postmerge.lib.sh, THE THIRD STATE.
+    # The fork-block helpers have no-op stand-ins when the lib is absent, or when a harness extracts this function without it.
+    for _GATE_PM_FN in gate_pm_step gate_pm_deploy_lock_acquire gate_pm_deploy_lock_release gate_pm_child_init gate_pm_child_ok; do
+      declare -F "$_GATE_PM_FN" >/dev/null 2>&1 || eval "$_GATE_PM_FN() { return 0; }"
+    done
+    _gate_pm_tail() {
+    gate_pm_step "source-bead"
     # ── ga-esbg: DRIVE THE SOURCE BEAD TO ITS TERMINAL/HANDOFF STATE ──────────
     # A gate PASS+merge MUST NOT leave the source bead in_progress with the live
     # builder still assigned. The legacy PASS path only added gate:passed + a
@@ -10158,6 +10186,13 @@ PYEOF
           warn "ga-l7n3v: rig $RIG's runtime_dir ($DR_RUNTIME_DIR) is not a git work tree — daemon liveness could not be checked for $BEAD_ID."
           DAEMON_SOFT_WARN="rig $RIG runtime_dir ($DR_RUNTIME_DIR) is not a git work tree — daemon liveness could not be checked"
         else
+          # ga-qmymjm: the sweep lock used to make two merges to the same rig deploy one after the other; the tail no longer holds it, so the
+          # deploy + daemon-refresh of one runtime dir take their own lock (gate_pm_deploy_lock_*). rc 75 = still held by a LIVE tail after
+          # GATE_PM_DEPLOY_LOCK_WAIT_S: the deploy is NOT run and the bead is HELD below (DEPLOY_LOCK_TIMEOUT) — "could not deploy" must not read
+          # as "deployed clean". Any other non-zero rc = the lock itself is unusable: carry on, as before this lock existed.
+          gate_pm_step "daemon-liveness"
+          DR_LOCK_RC=0
+          if [ "$DRY_RUN" != "1" ]; then gate_pm_deploy_lock_acquire "$DR_RUNTIME_DIR" || DR_LOCK_RC=$?; fi
           DR_DEPLOY_CMD=$(_gl7n3v_runbook_field "$RIG" "deploy_cmd" || true)
           DR_SENSITIVE=$(_gl7n3v_runbook_field "$RIG" "sensitive_daemons" | tr '\n' ' ' || true)
           DR_EXTRA_ROOTS=$(_gl7n3v_runbook_field "$RIG" "extra_runtime_roots" | tr '\n' ' ' || true)
@@ -10176,7 +10211,7 @@ PYEOF
           DR_DEPLOY_FAILED=0
           DR_DEPLOY_OUTPUT=""
           DR_DEPLOY_RC=0
-          if [ -n "$DR_DEPLOY_CMD" ]; then
+          if [ -n "$DR_DEPLOY_CMD" ] && [ "$DR_LOCK_RC" != "75" ]; then
             if [ "$DRY_RUN" = "1" ]; then
               log "ga-l7n3v: DRY_RUN=1 — WOULD deploy rig $RIG runtime ($DR_RUNTIME_DIR): $DR_DEPLOY_CMD"
             else
@@ -10229,7 +10264,13 @@ PYEOF
               fi
             fi
           fi
-          if [ "$DR_DEPLOY_FAILED" = "1" ]; then
+          if [ "$DR_LOCK_RC" = "75" ]; then
+            # ga-qmymjm: another post-merge tail has been deploying this runtime dir for the whole wait. Nothing was deployed or checked for this
+            # merge — hold it (same hold path as DEPLOY_FAILED), never close it unverified.
+            DAEMON_HOLD_VERDICT="DEPLOY_LOCK_TIMEOUT"
+            DAEMON_HOLD_REASON="rig $RIG runtime dir $DR_RUNTIME_DIR was still being deployed by another post-merge tail after ${GATE_PM_LOCK_WAITED_S:-?}s — this merge was NOT deployed and its daemons were NOT checked"
+            DAEMON_HOLD_DETAIL="deploy lock: $(gate_pm_dir 2>/dev/null || echo '?')/deploy-lock (owner file inside); wait limit GATE_PM_DEPLOY_LOCK_WAIT_S=${GATE_PM_DEPLOY_LOCK_WAIT_S:-900}"
+          elif [ "$DR_DEPLOY_FAILED" = "1" ]; then
             # Deploy itself failed: skip daemon-refresh.sh entirely (checking
             # freshness against an undeployed tree would only produce a
             # misleading SKIPPED/not_applicable, exactly the bug this
@@ -10342,8 +10383,10 @@ Closed with delivery:daemon-stale-locked (not delivery:daemon-unverified — thi
             esac
             # SELFTEST-EXTRACT daemon-refresh-verdict-case: END
           fi
+          gate_pm_deploy_lock_release   # ga-qmymjm: the deploy + daemon-refresh are over; holds, mails and the close below need no lock
         fi
 
+        gate_pm_step "hold-or-close"
         if [ -n "$DAEMON_HOLD_VERDICT" ]; then
           # HELD — mirrors the IS_PARTIAL branch's shape exactly (hold, don't
           # close, comment + mail Mayor + notify author), for a DIFFERENT
@@ -10390,6 +10433,10 @@ Closed with delivery:daemon-stale-locked (not delivery:daemon-unverified — thi
               ;;
             DEPLOY_FAILED)
               DAEMON_HOLD_ACTION="investigate why the rig deploy_cmd itself failed (see Refresh detail below for its output) — the merged code was never even pulled onto the runtime checkout, so no daemon could possibly be serving it yet. Fix the deploy (conflict? auth? network?), re-run it manually, confirm the runtime is on sha=$MERGE_SHA, then close this bead manually once confirmed live."
+              ;;
+            DEPLOY_LOCK_TIMEOUT)
+              # ga-qmymjm: nothing was deployed for THIS merge — another merge's deploy of the same runtime dir held the lock for the whole wait.
+              DAEMON_HOLD_ACTION="check whether the other deploy of this rig's runtime dir finished or is stuck (the lock directory named in Refresh detail below has an owner file: pid:epoch:gate-run; \`ps -p <pid>\` tells if it is alive). This merge was NOT deployed and its daemons were NOT checked. Once nothing is deploying, run the rig's deploy_cmd by hand (or re-run daemon-refresh.sh), confirm the runtime is on sha=$MERGE_SHA, then close this bead manually once confirmed live."
               ;;
             JOB_NOT_INSTALLED)
               # wa-jts45: daemon-refresh.sh's Step 1b — a *.plist this deploy
@@ -10681,12 +10728,14 @@ $OPEN_SIBLINGS_FOR_CLOSE"
             log "  Source bead $BEAD_ID closed (gate PASS + merged)."
           else
             warn "Could not close source bead $BEAD_ID even after lease-aware reclaim — re-pick vector remains, see post-merge verification below (ga-v5acl)"
+            GATE_PM_CLOSE_FAILED=1   # ga-qmymjm: the tail's postmerge_done outcome must not say "closed" for this
           fi
           fi
           # SELFTEST-EXTRACT pass-close-decision: END
         fi
       fi
 
+      gate_pm_step "postmerge-verify"
       # (3) POST-MERGE VERIFICATION (ga-esbg): assert the source bead no longer
       #     appears in any re-spawn / re-pick selector the dispatcher knows about.
       #     If it does, a live loop vector remains — comment + escalate (never
@@ -10773,6 +10822,7 @@ $OPEN_SIBLINGS_FOR_CLOSE"
     # merge is the critical operation; this cleanup is strictly best-effort. Runs
     # ONLY on the PASS/merge-success path (inside `if OVERALL_VERDICT = PASS`,
     # after a real MERGE_SHA), never on FAIL.
+    gate_pm_step "reap-wrapper"
     if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
       WRAPPER_DEPS_JSON="$(bd -C "$BEAD_CITY" dep list "$BEAD_ID" --direction=up --json 2>/dev/null || echo "")"
       # Select OPEN (non-closed) dependents that are coordination wrappers:
@@ -10811,6 +10861,7 @@ $OPEN_SIBLINGS_FOR_CLOSE"
     # sets a durable "pilot:dispatched" label when it autonomously pulls a story
     # (see pilot-dispatcher.sh). If present, use a distinct prefix/emoji so Athos
     # can tell an autonomous Pilot merge apart from a human/Mayor-dispatched one.
+    gate_pm_step "notify"
     PILOT_ORIGIN=0
     if [ -n "$BEAD_ID" ]; then
       # ga-h199q: routed through the read-cache shim — cosmetic-only read (picks
@@ -10828,6 +10879,30 @@ $OPEN_SIBLINGS_FOR_CLOSE"
       NOTIFY_FORCE_DIGEST=1 notify -k gate-pass -t "Quality Gate PASSED" -p 2 "Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
       log "Gate PASSED: branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
     fi
+    }
+    # ── ga-qmymjm: run the tail beside the sweep (own process group), or inline ──────────────────────────────────
+    # gate_pm_begin registers the job (the record that makes a lost tail findable) and says whether to go async; no registration = inline.
+    # `set -m` gives the subshell its own process group: launchd kills the job's process group when the sweep exits, and a plain `&` would die
+    # with it. stdin is closed on purpose (with job control on, bash no longer does it for a background job). The subshell is a COPY of this shell,
+    # so the tail sees every variable as it is now; nothing it sets comes back, and nothing after this block reads anything the tail sets (the
+    # FAIL path below assigns its own SRC_LABELS etc.). supersede_sibling_runs stays here, in the sweep: it is what keeps a duplicate run of this
+    # same branch from being admitted, and the tail's sibling-hold check ran before it in the old order too.
+    # SELFTEST-EXTRACT postmerge-fork: BEGIN
+    GATE_PM_ASYNC=0
+    if [ "${GATE_PM_LIB_OK:-0}" = "1" ] && [ "${DRY_RUN:-0}" != "1" ] \
+       && gate_pm_begin "$GATE_RUN_ID" "$MARKER_ID" "${BEAD_ID:-}" "${BEAD_CITY:-$GC_CITY}" "${RIG:-unknown}" "$BRANCH" "$MERGE_SHA"; then
+      GATE_PM_ASYNC=1
+    fi
+    if [ "$GATE_PM_ASYNC" = "1" ]; then
+      set -m
+      ( gate_pm_child_init; _gate_pm_tail; gate_pm_child_ok ) </dev/null &
+      GATE_PM_CHILD=$!
+      set +m
+      gate_pm_after_fork "$GATE_PM_CHILD" || true
+    else
+      _gate_pm_tail
+    fi
+    # SELFTEST-EXTRACT postmerge-fork: END
     supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID" "$RIG"
 else
   # ── FAIL path ─────────────────────────────────────────────────────────────
@@ -13054,6 +13129,10 @@ if [ "${GATE_PHASE_C_ONLY:-0}" = "1" ]; then
 else
   log "=== Dispatcher sweep start (DRY_RUN=${DRY_RUN}) ==="
 fi
+
+# ga-qmymjm: post-merge tails forked by an EARLIER sweep that never reported back (killed hard, machine restarted): said out loud, once each
+# (label + comment on the source bead, event, nudge). Detection only — see gate-postmerge.lib.sh. One local directory listing when all is well.
+if [ "${GATE_PM_LIB_OK:-0}" = "1" ]; then gate_pm_sweep || true; fi
 
 # ── ga-bgvc0: ambient Dolt-CPU snapshot (BEFORE the janitors) ─────────────────
 # The Step 0b-1 headroom gate must judge the data plane by its AMBIENT load, not
