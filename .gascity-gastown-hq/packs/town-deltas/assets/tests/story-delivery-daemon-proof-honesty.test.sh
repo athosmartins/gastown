@@ -79,20 +79,34 @@ nok() { FAIL=$((FAIL+1)); echo "  FAIL - $1"; [ -n "${2:-}" ] && echo "         
 BLOCK="$(sed -n '/# ── Step 8: Mark story:done/,/# ── Step 9: Log to story-delivery.jsonl/p' "$DELIVERY" | sed '$d')"
 [ -n "$BLOCK" ] || { echo "FAIL: could not extract Step 8 block"; exit 1; }
 
+# ga-njpnhv: Step 8 now writes through the verified-write helpers (a read-back after every
+# write), so this harness loads them from the script and its stub bd PERSISTS what it is
+# told -- labels added show up in the next `show`, `close` flips the status. A stub that
+# always answered "no labels, open" would read every write as lost.
+HELPERS="$(sed -n '/^# BEGIN verified-writes/,/^# END verified-writes/p' "$DELIVERY")"
+[ -n "$HELPERS" ] || { echo "FAIL: could not extract the verified-writes helpers"; exit 1; }
+export DELIVERY_WRITE_BACKOFF_S=0
+
 # run_block <refresh_proof> [<story_test_missing>]
 run_block() {
   local proof="$1" test_missing="${2:-1}"
   local T; T="$(mktemp -d)"
   BD_LOG="$T/bd.log"
+  : > "$T/labels"; echo open > "$T/status"
   bd() {
-    # bd -C <store> show <id> --json  → minimal well-formed bead for the
-    # PILOT_ORIGIN re-check and the CLOSE_STATUS_NOW probe.
+    # bd -C <store> show <id> --json  → the bead as the writes so far left it, for the
+    # PILOT_ORIGIN re-check, the CLOSE_STATUS_NOW probe and the helpers' read-back.
     if [ "$3" = "show" ]; then
-      echo '{"labels":[],"status":"open"}'
+      printf '{"id":"ga-test","status":"%s","labels":[%s]}\n' "$(cat "$T/status")" \
+        "$(sed 's/.*/"&"/' "$T/labels" | paste -sd, -)"
       return 0
     fi
     echo "bd $*" >> "$BD_LOG"
-    # `bd close` succeeds; everything else no-ops (matches production's `|| true` guards).
+    case "$3" in
+      label) if [ "$4" = "add" ]; then echo "$6" >> "$T/labels"
+             else grep -vxF -- "$6" "$T/labels" > "$T/labels.n"; mv "$T/labels.n" "$T/labels"; fi ;;
+      close) echo closed > "$T/status" ;;
+    esac
     return 0
   }
   notify() { :; }
@@ -114,7 +128,7 @@ run_block() {
   local PROD_TEST_SCRIPT="/tmp/fake-prod-test.sh"
   local REFRESH_PROOF="$proof"
 
-  ( set -o pipefail; for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
+  ( set -o pipefail; eval "$HELPERS"; for _t in _once; do eval "$BLOCK"; done ) >/dev/null 2>&1
   RUN_RC=$?
   LAST_BD="$(cat "$BD_LOG" 2>/dev/null || true)"
   rm -rf "$T"

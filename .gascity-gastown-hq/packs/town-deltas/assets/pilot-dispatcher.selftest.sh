@@ -516,7 +516,11 @@ chmod +x "$SHIMBIN/bd"
 cat > "$SHIMBIN/gc" <<'SHIM'
 #!/usr/bin/env bash
 case "$*" in
-  *"rig list"*)      printf '{"rigs":[]}' ;;     # rig fallback → empty
+  *"rig list"*)      # ga-wrjvat: FAKE_RIG_LIST_JSON says which rigs — and so which stores — exist. The store guards
+                     # (ga-653ilw / ga-vp2zr0) ask "which store does this pool read?" from this list; an empty one
+                     # makes every answer UNKNOWN and the dispatcher dispatches nothing. Default stays empty (rig
+                     # fallback → none), so every scenario that does not set it is byte-identical to before.
+                     if [ -n "${FAKE_RIG_LIST_JSON:-}" ]; then printf '%s' "$FAKE_RIG_LIST_JSON"; else printf '{"rigs":[]}'; fi ;;
   *sling*)
     # ga-eu8vr: the live gc binary ALWAYS emits this benign warning on stderr —
     # on success AND failure alike. Mirror it so the test proves the dispatcher
@@ -909,6 +913,7 @@ run_capacity() {
     PILOT_HQ_PATH_EXISTS_GUARD="${PILOT_HQ_PATH_EXISTS_GUARD:-}" \
     PILOT_TEST_RIG_HAS_FILE="${PILOT_TEST_RIG_HAS_FILE:-}" \
     PILOT_SUSPENDED_CREWS_OVERRIDE="${PILOT_SUSPENDED_CREWS_OVERRIDE:-}" \
+    FAKE_RIG_LIST_JSON="${FAKE_RIG_LIST_JSON:-}" \
     PILOT_DOLT_LATENCY_OVERRIDE_MS="$([ "${1:-10}" -gt 200 ] 2>/dev/null && echo 3000 || echo 100)" \
     PILOT_DOLT_CPU_OVERRIDE="${1:-10}" \
     FAKE_INFLIGHT_JSON="${2:-[]}" \
@@ -4911,9 +4916,17 @@ has "$DISPATCHER" 'ga-hn3kh'                    "ga-hn3kh guard comment is wired
 # (so STORY_RIG infers "lexbh" from the prefix, but STORY_RIG_EXPLICIT stays 0
 # since no metadata["story.rig"] is set — the precise precondition that lets
 # content-keyword inference override the bead's own native rig).
+# ga-wrjvat: the ps-worker fallback is only reached once the store guards (ga-653ilw / ga-vp2zr0) can
+# say WHERE the pool reads. They ask `gc rig list`; the base shim answers "no rigs", which is UNKNOWN →
+# "cannot tell" → the dispatcher (rightly) dispatches nothing, so 18am-1/2 saw no builder at all. The
+# fixture was behind the guard, not the guard behind the fixture: give the shim the rig the real town has —
+# property_scrapers (the rig ps-worker builds for), registered at the fixture city, the store these beads
+# live in. The guard then answers "serves" by an actual comparison. Its refusal side (a store the pool
+# cannot read) stays proven by POOL-STORE-A; nothing here loosens it.
+RIGS18AM='{"rigs":[{"name":"property_scrapers","path":"'"$FIXCITY"'","hq":false}]}'
 echo "Scenario 18am-1 (ga-gbzxos AC1, updated by ga-wnojmm): lx- bead with 'terreno', batista-ps suspended → ps-worker pool, not batista-ps, not held forever"
 LX_TERRENO='[{"id":"lx-dnwtest","title":"Recorte de data errado no chat sobre quota de terreno por UH","priority":2,"issue_type":"bug","description":"fixture body — quota de terreno por UH conforme lei de uso do solo","status":"open","labels":["lane:small","story:approved"],"assignee":null,"created_at":"2026-09-06T12:47:00Z","metadata":{}}]'
-LOG18AM1="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "[]" 1 "$LX_TERRENO")"
+LOG18AM1="$(FAKE_RIG_LIST_JSON="$RIGS18AM" PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "[]" 1 "$LX_TERRENO")"
 B18AM1="$(dispatched_builder "$LOG18AM1")"
 if [ "$B18AM1" = "batista-ps" ]; then
   bad "REGRESSION (ga-gbzxos): lx- bead dispatched to SUSPENDED batista-ps — the lx-dnw infinite-loop bug"
@@ -4944,7 +4957,7 @@ echo "Scenario 18am-2 (ga-gbzxos AC2): genuine property_scrapers domain build, b
 # already proven above to route to batista-ps when it is NOT suspended). Reusing
 # it here isolates suspension as the ONLY variable between "routes to batista-ps"
 # (18a) and "must NOT route to batista-ps" (here).
-LOG18AM2="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "[]" 1 "$PS_DOMAIN_SMALL")"
+LOG18AM2="$(FAKE_RIG_LIST_JSON="$RIGS18AM" PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "[]" 1 "$PS_DOMAIN_SMALL")"
 B18AM2="$(dispatched_builder "$LOG18AM2")"
 if [ "$B18AM2" = "batista-ps" ]; then
   bad "REGRESSION (ga-gbzxos): genuine property_scrapers domain build dispatched to SUSPENDED batista-ps"
@@ -4959,7 +4972,7 @@ NOW_ISO18AM2B="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 INFLIGHT18AM2B="[{\"id\":\"if-psworker\",\"labels\":[\"story:in-flight\",\"lane:small\"],\"updated_at\":\"$NOW_ISO18AM2B\",\"metadata\":{\"pilot.sling_bead\":\"tt-sling-psworker\"}}]"
 SESSIONS18AM2B='{"sessions":[{"session_name":"ps-worker","closed":false}]}'
 SLINGMAP18AM2B='{"tt-sling-psworker":"ps-worker"}'
-LOG18AM2B="$(PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "$INFLIGHT18AM2B" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18AM2B" "$SLINGMAP18AM2B")"
+LOG18AM2B="$(FAKE_RIG_LIST_JSON="$RIGS18AM" PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" run_capacity 10 "$INFLIGHT18AM2B" 1 "$PS_DOMAIN_SMALL" "$SESSIONS18AM2B" "$SLINGMAP18AM2B")"
 if echo "$LOG18AM2B" | grep "Busy builders (live in-flight): ps-worker" >/dev/null; then
   ok "precondition: ps-worker computed as busy this sweep (fixture wired correctly)"
 else
@@ -7008,6 +7021,16 @@ fi
 CAPQ_WA_RIG_DIR="$WORK/capq-fake-wa-rig"
 CAPQ_PS_RIG_DIR="$WORK/capq-fake-ps-rig"
 mkdir -p "$CAPQ_WA_RIG_DIR" "$CAPQ_PS_RIG_DIR"
+# ga-wrjvat: the pre-claim skip only calls a bead "queued behind the cap" once it knows WHICH STORE the bead lives in and
+# that the pool reads it (ga-vp2zr0: _pilot_bead_home_store, from the id prefix via $GC_CITY/.beads/routes.jsonl). A fixture
+# city with no routes file leaves every wa-*/ps-* bead's store unknown, and "unknown" is the inert state — no skip, no queue
+# line — so the fixtures below need the same prefix → store map the real city has (same format as the live file). The
+# guard is untouched; the refusal side (a bead in a store the pool cannot read) stays proven by POOL-STORE-A.
+mkdir -p "$FIXCITY/.beads"
+printf '%s\n' \
+  '{"prefix":"ga","path":"."}' \
+  '{"prefix":"wa","path":"'"$CAPQ_WA_RIG_DIR"'"}' \
+  '{"prefix":"ps","path":"'"$CAPQ_PS_RIG_DIR"'"}' > "$FIXCITY/.beads/routes.jsonl"
 CAPQ_SHIMBIN="$WORK/capq-bin"
 mkdir -p "$CAPQ_SHIMBIN"; _st_shimdir_ready "$CAPQ_SHIMBIN"
 
@@ -7199,11 +7222,16 @@ LOG_CQE="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" 3 0)"
   || bad "CAPQ-E: a routed bead with pool room was skipped or not dispatched — over-blocking"
 
 echo "Scenario CAPQ-F (ga-in9ebr): a full wa pool must NOT starve a candidate for a pool WITH room (no head-of-line blocking)"
-CAPQ_MIX_FX="[$(printf '%s' "$CAPQ_WA_ROUTED_FX" | sed 's/^\[//; s/\]$//' | sed 's/"priority":2/"priority":0/'),$(printf '%s' "$CAPQ_PS_FX" | sed 's/^\[//; s/\]$//')]"
+# ga-wrjvat: the full-pool bead must head the ordered pool for this to test head-of-line blocking — and it used to get
+# there by being P0. Since ga-5fn5p3 a P0/P1 waiting behind a full pool makes every P2+ bead cede in ANY pool on purpose
+# (that rule has its own selftest, pilot-dispatcher.priority-yield.selftest.sh), so the ps P2 bead could no longer
+# dispatch and this scenario was asserting the opposite of the yield. Same order, no yield: the wa bead stays P2 like the
+# ps one and goes first because it is OLDER (priority > type > age, oldest first — ga-9t9acg.2).
+CAPQ_MIX_FX="[$(printf '%s' "$CAPQ_WA_ROUTED_FX" | sed 's/^\[//; s/\]$//' | sed 's/2026-06-16T/2026-06-01T/'),$(printf '%s' "$CAPQ_PS_FX" | sed 's/^\[//; s/\]$//')]"
 LOG_CQF="$(run_capq_dispatch "$CAPQ_MIX_FX" 4 0)"
 if [ "$(capq_n 'label add ps-capq1 story:in-flight')" -ge 1 ] && grep -q 'session new ps-worker' "$STATE/session_new.log" 2>/dev/null \
    && [ "$(capq_n 'label (add|remove) wa-capq2')" = "0" ] && echo "$LOG_CQF" | grep "ga-in9ebr: wa-capq2 QUEUED" >/dev/null; then
-  ok "CAPQ-F: P0 wa bead (pool full) is skipped; the P2 ps bead (pool has room) still dispatches in the same sweep"
+  ok "CAPQ-F: the older wa bead (pool full) is skipped; the P2 ps bead (pool has room) still dispatches in the same sweep"
 else
   bad "CAPQ-F: the full wa pool blocked (or mis-handled) the ps candidate — head-of-line blocking / over-skip"
 fi
@@ -8070,7 +8098,10 @@ echo "Scenario TOPUP-ELIGIBILITY-3: structural — real HQ + rig-fallback querie
 # _filter_candidates), which ALSO appears at the 2
 # PILOT_TEST_*_TOPUP_CANDIDATES_JSON seam branches (deliberately — the seam
 # exists specifically to exercise this chain against injected fixtures, see
-# the ga-oc6knj comment above those branches), so it expects 4, not 2.
+# the ga-oc6knj comment above those branches), so it expects 4, not 2 — and, since ga-vp2zr0, 5: the blind-route heal
+# (_pilot_heal_hq_blind_routes) touches only "the beads the top-up would have counted as demand", so it runs the SAME
+# chain on its own query. The extra site is pinned to that function right after the loop, so the count cannot be met by
+# a copy that wandered somewhere else (ga-wrjvat).
 # ga-9t9acg.4: the pick (the EPIC-title skip + the order rule + the
 # "previous pick" fallback) is ONE helper, _topup_pick_first, so the 4
 # pipelines cannot drift apart: each must END in it (4), and the EPIC-title
@@ -8082,7 +8113,7 @@ echo "Scenario TOPUP-ELIGIBILITY-3: structural — real HQ + rig-fallback querie
 # selftest C7 and, through the real filters, C10).
 for _tue3_pat_want in \
   '"${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0|2' \
-  '| _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null|4' \
+  '| _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null|5' \
   '| _topup_pick_first |||4' \
   '--arg epic_re "$_TOPUP_EPIC_TITLE_RE"|1' \
   '"") | test($epic_re; "i")) | not)]|1'; do
@@ -8095,6 +8126,13 @@ for _tue3_pat_want in \
     bad "expected exactly $_tue3_want occurrence(s) of '$_tue3_pat', found ${_tue3_count:-0} — HQ, rig-fallback, or a test seam is missing this piece of the ga-8pv70k follow-up fix"
   fi
 done
+# The fifth site, by place: exactly one chain inside the ga-vp2zr0 heal (the other four are the top-up's own).
+_tue3_heal_n="$(sed -n '/^_pilot_heal_hq_blind_routes() {/,/^}/p' "$DISPATCHER" | grep -cF -- '| _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null' || true)"
+if [ "${_tue3_heal_n:-0}" -eq 1 ]; then
+  ok "the filter chain's fifth occurrence lives in _pilot_heal_hq_blind_routes (ga-vp2zr0: the heal re-routes only what the top-up would have counted)"
+else
+  bad "expected exactly 1 occurrence of the top-up filter chain inside _pilot_heal_hq_blind_routes, found ${_tue3_heal_n:-0} — the heal and the top-up would disagree on what is eligible (ga-vp2zr0)"
+fi
 has "$DISPATCHER" '^_TOPUP_WORKER_EXCLUDE_LABELS=\(' \
   "_TOPUP_WORKER_EXCLUDE_LABELS is a single shared array (not re-typed per call site)"
 has "$DISPATCHER" "_TOPUP_EPIC_TITLE_RE='\\^\\(EPIC\\|" \
@@ -9268,6 +9306,14 @@ chmod +x "$Y1M40_JQ_BAD/jq" "$Y1M40_GC_BAD/gc"
 # shim) and, for rig-bd-*, a `bd` that fails only the `list` of the tier named by its token in that rig's directory.
 Y1M40_RIG_REAL="$WORK/y1m40-rig-real-dir"; Y1M40_RIG_GHOST_DIR="$WORK/y1m40-rig-dir-never-created"
 mkdir -p "$Y1M40_RIG_REAL"
+# ga-wrjvat: every rig bead of this block is a wa-* one, dispatched to the wa-worker pool, and the store guards
+# (ga-653ilw / ga-vp2zr0) only let a pool take a bead living in the one rig clone it reads. With an empty rig list the
+# bead's store falls back to HQ (STORY_BEAD_CITY = GC_CITY) and the guard has no rig to compare it with — "cannot tell",
+# which dispatches nothing. So the base `gc` shim registers whatsapp_automation at a real directory (hq:false) and the
+# bead is stored THERE, like a real rig bead. The guards are untouched: the refusals stay proven by POOL-STORE-A/B/C.
+Y1M40_WA_RIG_DIR="$WORK/y1m40-wa-rig"
+mkdir -p "$Y1M40_WA_RIG_DIR"
+Y1M40_RIGS='{"rigs":[{"name":"whatsapp_automation","path":"'"$Y1M40_WA_RIG_DIR"'","hq":false}]}'
 _y1m40_mk_rig_shims() {  # $1 = mode  $2 = path the fake `gc rig list` reports  $3 = token of the `bd list` that fails ("" = none)
   local _d="$WORK/y1m40-$1"
   mkdir -p "$_d"
@@ -9321,6 +9367,7 @@ run_y1m40() {
     DISPATCH_TO_CAPACITY=1 \
     FAKE_BUGS_JSON="${1:-[]}" \
     FAKE_BLOCKED_IDS="" \
+    FAKE_RIG_LIST_JSON="$Y1M40_RIGS" \
     PILOT_TEST_CREW_BRANCH_BEADS="${2:-}" \
     ${_y_rig[@]+"${_y_rig[@]}"} \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
