@@ -758,6 +758,17 @@ _pool_ceiling_lib_failed_note() {
   return 0
 }
 # SELFTEST-EXTRACT pool-ceiling-note: END
+# ── ga-qmymjm: the post-merge tail runs OUTSIDE the sweep (gate-postmerge.lib.sh) ──
+# What follows a confirmed merge (the source bead's hand-off or close, the rig deploy, daemon-refresh, holds, mails) took a median 1.3 min of the
+# sweep that holds the gate lock, and the next review waited for it. gate_finalize_run forks that tail into its own process group instead. The lib
+# is OPTIONAL: missing/unloadable -> GATE_PM_LIB_OK=0 and the tail runs inline, as it always did (the gate must never die for lack of an
+# optimisation). GATE_PM_LIB is a test seam. stderr is NOT suppressed: a corrupt sibling is a deploy fault and must be loud.
+GATE_PM_LIB_OK=0
+_GATE_PM_LIB="${GATE_PM_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/gate-postmerge.lib.sh}"
+if [ -r "$_GATE_PM_LIB" ]; then
+  # shellcheck disable=SC1090
+  if . "$_GATE_PM_LIB" && type gate_pm_begin >/dev/null 2>&1; then GATE_PM_LIB_OK=1; fi
+fi
 case "$GATE_CODE_REVIEWERS"      in ''|*[!0-9]*) GATE_CODE_REVIEWERS=2 ;; esac
 case "$GATE_SWAP_FREE_FLOOR_MB"  in ''|*[!0-9]*) GATE_SWAP_FREE_FLOOR_MB=512 ;; esac
 case "$GATE_SWAP_GROW_DISK_MIN_MB" in ''|*[!0-9]*) GATE_SWAP_GROW_DISK_MIN_MB=4096 ;; esac
@@ -7027,6 +7038,162 @@ gate_park_note_skipped() {
   return 0
 }
 
+# gate_open_conflict_repair_bead <marker> <branch> <bead> <rig> <repo> <files> <main_sha> <liveness> <default_branch> <merge_in_range>   (ga-buqnjc)
+# A genuine, deterministic merge conflict with NO live author used to end in a mail to the Mayor, who then
+# rebased by hand (12/10: ga-wuwuk7 twice, ga-pfc2ww, ga-atsahv.3 — every one a text-only conflict in a runbook
+# or a comment). This opens ONE repair bead routed to the dog pool instead: it carries the branch, the
+# conflicting files and the rule "keep the behaviour of both sides; text/doc-only = join both". The dog
+# rebases, runs the tests of the touched files and re-submits the branch as a fresh marker (the guard's Step 4b
+# supersedes the parked one). A logic conflict it cannot merge safely goes back to the Mayor from the dog.
+# It reports through two globals and ALWAYS returns 0 (the caller runs under `set -e`):
+#   GATE_CONFLICT_REPAIR_RESULT  opened | existing | fallback:<why>
+#   GATE_CONFLICT_REPAIR_BEAD    the repair bead id for opened/existing, else ""
+#     opened      a new repair bead was created — the caller must NOT mail the Mayor
+#     existing    a repair bead for this branch IN THIS REPO is still open — no duplicate is created, no mail.
+#                 This marker's id is added to that bead (conflict-repair-of:<marker>) so the watchdog, which
+#                 looks a bead up by MARKER, holds its own escalation for this marker too; if that write
+#                 fails the result is a fallback (we could not make the "a dog is on it" statement true).
+#     fallback    no repair bead is confirmed for this branch in this repo, so the caller keeps mailing the Mayor,
+#                 exactly as before this function: kill switch, branch name or marker id that cannot be a
+#                 label, repo path empty/"unknown" (the branch's identity cannot be confirmed), repair beads
+#                 unreadable, MAX_ATTEMPTS already spent on this branch in this repo, MAX_OPEN dogs already
+#                 queued, the branch carries a merge commit not on main (re-anchoring that is 'git merge', a
+#                 Mayor decision, ga-kyxih — the dog's runbook is a rebase), the marker could not be linked to
+#                 the existing bead, or the create could not be confirmed. Doubt is NEVER read as "a dog is on
+#                 it": silencing the Mayor is the one outcome that cannot be undone, so every state this
+#                 function cannot confirm falls back to the mail (three-state read, error != empty, ga-p5q3 class).
+# Dedup is per BRANCH + REPO (labels conflict-repair-branch:<b> AND conflict-repair-repo:<path>), not per marker: the
+# dog's re-submission mints a new marker, and the old one was the only thing a marker label could have been
+# tied to. A branch NAME is not an identity: this city already has one name in two repos (HQ marker ga-3uct94
+# and WA marker ga-z9npl3, both feat/ga-dxyvxr-quiet-hours-gate), so a bead opened for one repo must never be
+# read as "a dog is on it" for the other (same rule as ga-95tq3p / ga-tvpo6z: an identity we cannot confirm is NOT
+# a match). The attempt cap counts CLOSED repair beads of the branch in that repo too, so a branch that keeps
+# re-conflicting after repairs ends up on the Mayor's desk instead of cycling through dogs forever; the open cap
+# (MAX_OPEN) is deliberately city-wide — it bounds how many dogs this path may occupy, whatever the repo.
+# The repo is the path the caller resolved for the marker's rig (RIG_PATH), compared as text: two rigs that point into
+# ONE git repo count as two repos here. That errs toward a second bead for a branch (capped by MAX_OPEN, and the
+# dog's force-with-lease push fails safe), never toward calling another repo's bead "ours".
+GATE_CONFLICT_REPAIR_ENABLED="${GATE_CONFLICT_REPAIR_ENABLED:-1}"
+GATE_CONFLICT_REPAIR_MAX_ATTEMPTS="${GATE_CONFLICT_REPAIR_MAX_ATTEMPTS:-3}"
+GATE_CONFLICT_REPAIR_MAX_OPEN="${GATE_CONFLICT_REPAIR_MAX_OPEN:-3}"
+GATE_CONFLICT_REPAIR_LABEL="gate-conflict-repair"
+GATE_CONFLICT_REPAIR_RESULT=""
+GATE_CONFLICT_REPAIR_BEAD=""
+gate_open_conflict_repair_bead() {
+  local _marker="${1:-}" _branch="${2:-}" _bead="${3:-}" _rig="${4:-}" _repo="${5:-}" _files="${6:-}"
+  local _sha="${7:-}" _trace="${8:-}" _main="${9:-main}" _mir="${10:-0}" _json _here _open_here _all_here _open_all _desc _new _n _linked
+  GATE_CONFLICT_REPAIR_RESULT=""
+  GATE_CONFLICT_REPAIR_BEAD=""
+  if [ "$GATE_CONFLICT_REPAIR_ENABLED" = "0" ]; then
+    GATE_CONFLICT_REPAIR_RESULT="fallback:disabled"; return 0
+  fi
+  case "$_branch" in
+    ""|*,*|*[[:space:]]*) GATE_CONFLICT_REPAIR_RESULT="fallback:branch-not-label-safe"; return 0 ;;
+  esac
+  case "$_marker" in
+    ""|*,*|*[[:space:]]*) GATE_CONFLICT_REPAIR_RESULT="fallback:marker-not-label-safe"; return 0 ;;
+  esac
+  # The repo is half of the identity (a branch NAME recurs across repos). Empty, the "unknown" sentinel or a value
+  # that cannot be a label is not a confirmed repo, so there is nothing to tell this branch from the same name
+  # elsewhere: no bead is looked up or opened, the Mayor is mailed.
+  case "$_repo" in
+    ""|unknown|*,*|*[[:space:]]*) GATE_CONFLICT_REPAIR_RESULT="fallback:repo-unconfirmed"; return 0 ;;
+  esac
+  if [ "$_mir" = "1" ]; then
+    GATE_CONFLICT_REPAIR_RESULT="fallback:merge-commit-in-range"; return 0
+  fi
+  case "$GATE_CONFLICT_REPAIR_MAX_ATTEMPTS" in ""|*[!0-9]*) GATE_CONFLICT_REPAIR_RESULT="fallback:bad-cap-setting"; return 0 ;; esac
+  case "$GATE_CONFLICT_REPAIR_MAX_OPEN" in ""|*[!0-9]*) GATE_CONFLICT_REPAIR_RESULT="fallback:bad-cap-setting"; return 0 ;; esac
+  _json=$(bd -C "$GC_CITY" list --json --all --include-infra --limit 0 -l "$GATE_CONFLICT_REPAIR_LABEL" 2>/dev/null) || _json=""
+  # A row with no readable status is neither open nor closed: the counts below treat "not closed" as "a dog may be on it",
+  # so such a row is unreadable input, not an open bead (a missing status must not read as "open").
+  if ! printf '%s' "$_json" | jq -e 'type == "array" and all(.[]; ((.status? // null) | type) == "string")' >/dev/null 2>&1; then
+    warn "Repair beads for $_branch: could not read them (bd list returned nothing, non-JSON, an error, or a row without a status) — cannot tell whether a dog is already on it, so the Mayor is mailed (ga-buqnjc)."
+    GATE_CONFLICT_REPAIR_RESULT="fallback:repair-beads-unreadable"; return 0
+  fi
+  # vazio → no bead of this branch+repo yet (_here=[], counts 0: a new one may open); falhou/ilegível → _here/counts come back
+  # empty or non-numeric and the loop below sends them to fallback:repair-beads-unreadable (the mail), never to "none"
+  _here=$(printf '%s' "$_json" | jq -c --arg b "conflict-repair-branch:$_branch" --arg r "conflict-repair-repo:$_repo" \
+            '[.[] | select((.labels // []) | (index($b) != null and index($r) != null))]' 2>/dev/null) || _here=""
+  _open_here=$(printf '%s' "$_here" | jq -r '[.[] | select(.status != "closed")] | length' 2>/dev/null) || _open_here=""
+  _all_here=$(printf '%s' "$_here" | jq -r 'length' 2>/dev/null) || _all_here=""
+  _open_all=$(printf '%s' "$_json" | jq -r '[.[] | select(.status != "closed")] | length' 2>/dev/null) || _open_all=""
+  for _n in "$_open_here" "$_all_here" "$_open_all"; do
+    case "$_n" in ""|*[!0-9]*) GATE_CONFLICT_REPAIR_RESULT="fallback:repair-beads-unreadable"; return 0 ;; esac
+  done
+  if [ "$_open_here" -gt 0 ]; then
+    # vazio/falhou → an open bead whose id cannot be read back is not "a dog is on it": fallback:repair-beads-unreadable
+    GATE_CONFLICT_REPAIR_BEAD=$(printf '%s' "$_here" | jq -r '[.[] | select(.status != "closed")][0].id // empty' 2>/dev/null) || GATE_CONFLICT_REPAIR_BEAD=""
+    case "$GATE_CONFLICT_REPAIR_BEAD" in
+      ""|*[!A-Za-z0-9._-]*) GATE_CONFLICT_REPAIR_BEAD=""; GATE_CONFLICT_REPAIR_RESULT="fallback:repair-beads-unreadable"; return 0 ;;
+    esac
+    # The watchdog (FIX 9) finds the bead of a marker by conflict-repair-of:<marker>, so this marker must be on it.
+    # vazio → not linked yet (link it); falhou/ilegível → "" counts as not linked and the add below is tried (a failed
+    # check can only cause one redundant add, never skip a needed one; if bd refuses the redundant add the result is the
+    # mail, the visible side); a failed add → fallback:marker-link-failed (the mail).
+    _linked=$(printf '%s' "$_here" | jq -r --arg id "$GATE_CONFLICT_REPAIR_BEAD" --arg l "conflict-repair-of:$_marker" \
+                '[.[] | select(.id == $id) | select((.labels // []) | index($l) != null)] | length' 2>/dev/null) || _linked=""
+    if [ "$_linked" != "1" ]; then
+      if ! bd -C "$GC_CITY" label add "$GATE_CONFLICT_REPAIR_BEAD" "conflict-repair-of:$_marker" -q >/dev/null 2>&1; then
+        warn "Repair bead $GATE_CONFLICT_REPAIR_BEAD for $_branch is open, but linking marker $_marker to it failed — the watchdog could not tell it is on this marker, so the Mayor is mailed (ga-buqnjc)."
+        GATE_CONFLICT_REPAIR_BEAD=""; GATE_CONFLICT_REPAIR_RESULT="fallback:marker-link-failed"; return 0
+      fi
+    fi
+    GATE_CONFLICT_REPAIR_RESULT="existing"; return 0
+  fi
+  if [ "$_all_here" -ge "$GATE_CONFLICT_REPAIR_MAX_ATTEMPTS" ]; then
+    GATE_CONFLICT_REPAIR_RESULT="fallback:attempts-exhausted($_all_here of $GATE_CONFLICT_REPAIR_MAX_ATTEMPTS)"; return 0
+  fi
+  if [ "$_open_all" -ge "$GATE_CONFLICT_REPAIR_MAX_OPEN" ]; then
+    GATE_CONFLICT_REPAIR_RESULT="fallback:open-cap($_open_all of $GATE_CONFLICT_REPAIR_MAX_OPEN)"; return 0
+  fi
+  _desc="Conserto automático de conflito de merge (ga-buqnjc) — aberto pelo gate; o Mayor NÃO precisa ser acionado.
+
+O branch abaixo tem um conflito de merge GENUÍNO e determinístico contra origin/$_main e não existe sessão de autor viva para resolvê-lo. Antes, o gate mandava mail ao Mayor, que rebaseava à mão. Quem rebaseia agora é você.
+
+branch: $_branch
+repo: ${_repo:-desconhecido}
+marker (parkeado em gate-status:needs-rebase): $_marker
+bead de origem: ${_bead:-desconhecido} (rig ${_rig:-desconhecido})
+arquivos em conflito: ${_files:-desconhecido}
+origin/$_main quando o conflito foi visto: ${_sha:-desconhecido}
+liveness do autor (ga-it1of): ${_trace:-none}
+cidade: $GC_CITY
+
+REGRA: manter o comportamento dos DOIS lados. Conflito só de texto/doc/comentário = juntar os dois lados (keep-both); nunca descarte um lado só para o conflito sumir.
+
+PASSOS (verifique entre eles):
+1. Worktree próprio — NUNCA edite no checkout principal do repo:
+   git -C <repo> fetch origin $_main $_branch
+   git -C <repo> worktree add <dir-scratch> -b repair/<id-deste-bead> origin/$_branch
+   Anote o sha de origin/$_branch que você viu aqui.
+2. git rebase origin/$_main. Em cada conflito:
+   - texto/doc/runbook/comentário: junte os dois lados.
+   - código de lógica: só resolva se der para manter o comportamento dos dois lados com certeza. Se as duas mudanças disputam a mesma linha de lógica e você teria de escolher um lado: git rebase --abort, NÃO adivinhe, vá para ESCALAR.
+3. Confira que nada se perdeu: as mudanças do branch seguem todas lá e as de origin/$_main também (git range-diff origin/$_main...<sha anotado> origin/$_main...HEAD; git diff --stat).
+4. Rode os testes dos arquivos tocados: /bin/bash -n em cada .sh e o *.selftest.sh dele; python3 -m py_compile e os testes de cada .py; só-doc: confira que os comandos e links citados seguem coerentes.
+5. Publique: git push --force-with-lease=$_branch:<sha anotado> origin HEAD:$_branch (o autor está morto; ninguém mais empurra neste branch). Confirme com git ls-remote que origin/$_branch é o seu HEAD.
+6. RE-ENFILEIRE como marker NOVO (não mexa no antigo): siga docs/gate-marker-recipe.md — copie branch/bead_id/author/rig/bead_rig da descrição do marker $_marker (bd -C <cidade> show $_marker), troque só base_commit (merge-base FRESCO de origin/$_main e origin/$_branch) e submitted_at. O guard supersede o marker antigo sozinho (Step 4b). Não mexa nos labels do bead de origem.
+7. Limpe o que criou (sem rm -rf): git -C <repo> worktree remove --force <dir-scratch> e git -C <repo> branch -D repair/<id-deste-bead>. Vale também no caminho ESCALAR.
+8. Feche este bead: gc bd close <este-bead> --reason \"rebaseado sobre origin/$_main, testes ok, re-enfileirado como <marker novo>\". Depois: gc runtime drain-ack && exit.
+
+ESCALAR — conflito de lógica sem resolução segura, teste quebrado depois do rebase, push recusado: NÃO force nada. Mande mail ao Mayor com o diagnóstico (arquivos, trechos em conflito, o que você tentou), faça a limpeza do passo 7 e feche este bead com --reason dizendo por quê. O marker continua em needs-rebase e o gate-recovery-watchdog volta a avisar o Mayor depois do prazo."
+  _new=$(bd -C "$GC_CITY" create "gate-conflict-repair: $_branch" -t task -p 2 \
+          -l "$GATE_CONFLICT_REPAIR_LABEL" -l "conflict-repair-of:$_marker" -l "conflict-repair-branch:$_branch" -l "conflict-repair-repo:$_repo" \
+          -d "$_desc" --metadata '{"gc.routed_to":"gastown.dog"}' --silent 2>/dev/null) || _new=""
+  case "$_new" in
+    ""|*[!A-Za-z0-9._-]*)
+      # not "create failed": a create that committed and then died before printing its id looks the same from here, so
+      # a bead may exist, and any later lookup by its labels (this helper's, or the watchdog's by marker) will find it.
+      # Say "unconfirmed", and let the mail say it too.
+      warn "Repair bead for $_branch: could not CONFIRM that bd create opened one (it failed or printed something that is not a bead id: [${_new:-empty}]) — the Mayor is mailed instead, and a bead may still exist (ga-buqnjc)."
+      GATE_CONFLICT_REPAIR_RESULT="fallback:create-unconfirmed"; return 0 ;;
+  esac
+  GATE_CONFLICT_REPAIR_BEAD="$_new"
+  GATE_CONFLICT_REPAIR_RESULT="opened"
+  return 0
+}
+
 # gate_noeval_requeue_decision <marker_id>   (ga-5w2gpw item a)
 # A run in which NOBODY JUDGED THE CODE — a live-but-slow reviewer that timed out, or a verdict bead closed with no verdict
 # (ga-w7pm55) — is not a rejection of anything, so it is re-queued (fresh reviewers next sweep) instead of going down the FAIL
@@ -9834,6 +10001,24 @@ fi
       close_open_run_verdicts "$GATE_RUN_ID" "terminal PASSED" || true
     fi
 
+    # ── ga-qmymjm: THE POST-MERGE TAIL — everything from here to the "Gate PASSED" log ───────────────────────────
+    # The merge is confirmed, the integrity check passed, the survival ledger has the SHA, the marker and the gate-run are terminal and their
+    # verdict beads closed: nothing below decides whether the NEXT branch may be reviewed. It used to run inside the sweep that holds the gate lock
+    # (median 1.3 min after the merge, p90 3.4 — ga-bk5j8u.1's 50-round measurement) and the next admission waited for it. It is now a function that
+    # the fork block below runs beside the sweep (own process group; gate-postmerge.lib.sh), or inline when the lib is missing, the switch is off
+    # (GATE_POSTMERGE_ASYNC=0 / $GC_CITY/.gc/gate-postmerge.off) or DRY_RUN=1. The body is the code that was here, in the same order; inline it runs
+    # in the sweep's own shell with the same globals and errexit as before — the only additions are the gate_pm_step markers and the deploy lock.
+    # The source bead keeps gate:queued + gate:reviewing until the tail moves it, which keeps it out of the dog pool probe (scripts/pool-probe.sh)
+    # and the Pilot meanwhile — both exclude those two labels.
+    # The deploy of one runtime dir is serialised by gate_pm_deploy_lock_* (the sweep lock used to do that). A tail that fails or vanishes leaves a
+    # label + comment on the source bead, an event and a job file — see gate-postmerge.lib.sh, THE THIRD STATE.
+    # The fork-block helpers have no-op stand-ins when the lib is absent, or when a harness extracts this function without it.
+    for _GATE_PM_FN in gate_pm_step gate_pm_deploy_lock_acquire gate_pm_deploy_lock_release gate_pm_child_init gate_pm_child_ok; do
+      declare -F "$_GATE_PM_FN" >/dev/null 2>&1 || eval "$_GATE_PM_FN() { return 0; }"
+    done
+    _gate_pm_tail() {
+    GATE_PM_CLOSE_FAILED=0   # per run, like IS_*/RESPAWN_HITS below: an INLINE run (the sweep's own shell) must not leave it raised for the next run's tail
+    gate_pm_step "source-bead"
     # ── ga-esbg: DRIVE THE SOURCE BEAD TO ITS TERMINAL/HANDOFF STATE ──────────
     # A gate PASS+merge MUST NOT leave the source bead in_progress with the live
     # builder still assigned. The legacy PASS path only added gate:passed + a
@@ -10158,6 +10343,13 @@ PYEOF
           warn "ga-l7n3v: rig $RIG's runtime_dir ($DR_RUNTIME_DIR) is not a git work tree — daemon liveness could not be checked for $BEAD_ID."
           DAEMON_SOFT_WARN="rig $RIG runtime_dir ($DR_RUNTIME_DIR) is not a git work tree — daemon liveness could not be checked"
         else
+          # ga-qmymjm: the sweep lock used to make two merges to the same rig deploy one after the other; the tail no longer holds it, so the
+          # deploy + daemon-refresh of one runtime dir take their own lock (gate_pm_deploy_lock_*). rc 75 = still held by a LIVE tail after
+          # GATE_PM_DEPLOY_LOCK_WAIT_S: the deploy is NOT run and the bead is HELD below (DEPLOY_LOCK_TIMEOUT) — "could not deploy" must not read
+          # as "deployed clean". Any other non-zero rc = the lock itself is unusable: carry on, as before this lock existed.
+          gate_pm_step "daemon-liveness"
+          DR_LOCK_RC=0
+          if [ "$DRY_RUN" != "1" ]; then gate_pm_deploy_lock_acquire "$DR_RUNTIME_DIR" || DR_LOCK_RC=$?; fi
           DR_DEPLOY_CMD=$(_gl7n3v_runbook_field "$RIG" "deploy_cmd" || true)
           DR_SENSITIVE=$(_gl7n3v_runbook_field "$RIG" "sensitive_daemons" | tr '\n' ' ' || true)
           DR_EXTRA_ROOTS=$(_gl7n3v_runbook_field "$RIG" "extra_runtime_roots" | tr '\n' ' ' || true)
@@ -10176,7 +10368,7 @@ PYEOF
           DR_DEPLOY_FAILED=0
           DR_DEPLOY_OUTPUT=""
           DR_DEPLOY_RC=0
-          if [ -n "$DR_DEPLOY_CMD" ]; then
+          if [ -n "$DR_DEPLOY_CMD" ] && [ "$DR_LOCK_RC" != "75" ]; then
             if [ "$DRY_RUN" = "1" ]; then
               log "ga-l7n3v: DRY_RUN=1 — WOULD deploy rig $RIG runtime ($DR_RUNTIME_DIR): $DR_DEPLOY_CMD"
             else
@@ -10229,7 +10421,13 @@ PYEOF
               fi
             fi
           fi
-          if [ "$DR_DEPLOY_FAILED" = "1" ]; then
+          if [ "$DR_LOCK_RC" = "75" ]; then
+            # ga-qmymjm: another post-merge tail has been deploying this runtime dir for the whole wait. Nothing was deployed or checked for this
+            # merge — hold it (same hold path as DEPLOY_FAILED), never close it unverified.
+            DAEMON_HOLD_VERDICT="DEPLOY_LOCK_TIMEOUT"
+            DAEMON_HOLD_REASON="rig $RIG runtime dir $DR_RUNTIME_DIR was still being deployed by another post-merge tail after ${GATE_PM_LOCK_WAITED_S:-?}s — this merge was NOT deployed and its daemons were NOT checked"
+            DAEMON_HOLD_DETAIL="deploy lock: $(gate_pm_dir 2>/dev/null || echo '?')/deploy-lock (owner file inside); wait limit GATE_PM_DEPLOY_LOCK_WAIT_S=${GATE_PM_DEPLOY_LOCK_WAIT_S:-900}"
+          elif [ "$DR_DEPLOY_FAILED" = "1" ]; then
             # Deploy itself failed: skip daemon-refresh.sh entirely (checking
             # freshness against an undeployed tree would only produce a
             # misleading SKIPPED/not_applicable, exactly the bug this
@@ -10342,8 +10540,10 @@ Closed with delivery:daemon-stale-locked (not delivery:daemon-unverified — thi
             esac
             # SELFTEST-EXTRACT daemon-refresh-verdict-case: END
           fi
+          gate_pm_deploy_lock_release   # ga-qmymjm: the deploy + daemon-refresh are over; holds, mails and the close below need no lock
         fi
 
+        gate_pm_step "hold-or-close"
         if [ -n "$DAEMON_HOLD_VERDICT" ]; then
           # HELD — mirrors the IS_PARTIAL branch's shape exactly (hold, don't
           # close, comment + mail Mayor + notify author), for a DIFFERENT
@@ -10390,6 +10590,10 @@ Closed with delivery:daemon-stale-locked (not delivery:daemon-unverified — thi
               ;;
             DEPLOY_FAILED)
               DAEMON_HOLD_ACTION="investigate why the rig deploy_cmd itself failed (see Refresh detail below for its output) — the merged code was never even pulled onto the runtime checkout, so no daemon could possibly be serving it yet. Fix the deploy (conflict? auth? network?), re-run it manually, confirm the runtime is on sha=$MERGE_SHA, then close this bead manually once confirmed live."
+              ;;
+            DEPLOY_LOCK_TIMEOUT)
+              # ga-qmymjm: nothing was deployed for THIS merge — another merge's deploy of the same runtime dir held the lock for the whole wait.
+              DAEMON_HOLD_ACTION="check whether the other deploy of this rig's runtime dir finished or is stuck (the lock directory named in Refresh detail below has an owner file: pid:epoch:gate-run; \`ps -p <pid>\` tells if it is alive). This merge was NOT deployed and its daemons were NOT checked. Once nothing is deploying, run the rig's deploy_cmd by hand (or re-run daemon-refresh.sh), confirm the runtime is on sha=$MERGE_SHA, then close this bead manually once confirmed live."
               ;;
             JOB_NOT_INSTALLED)
               # wa-jts45: daemon-refresh.sh's Step 1b — a *.plist this deploy
@@ -10681,12 +10885,14 @@ $OPEN_SIBLINGS_FOR_CLOSE"
             log "  Source bead $BEAD_ID closed (gate PASS + merged)."
           else
             warn "Could not close source bead $BEAD_ID even after lease-aware reclaim — re-pick vector remains, see post-merge verification below (ga-v5acl)"
+            GATE_PM_CLOSE_FAILED=1   # ga-qmymjm: the tail's postmerge_done outcome must not say "closed" for this
           fi
           fi
           # SELFTEST-EXTRACT pass-close-decision: END
         fi
       fi
 
+      gate_pm_step "postmerge-verify"
       # (3) POST-MERGE VERIFICATION (ga-esbg): assert the source bead no longer
       #     appears in any re-spawn / re-pick selector the dispatcher knows about.
       #     If it does, a live loop vector remains — comment + escalate (never
@@ -10773,6 +10979,7 @@ $OPEN_SIBLINGS_FOR_CLOSE"
     # merge is the critical operation; this cleanup is strictly best-effort. Runs
     # ONLY on the PASS/merge-success path (inside `if OVERALL_VERDICT = PASS`,
     # after a real MERGE_SHA), never on FAIL.
+    gate_pm_step "reap-wrapper"
     if [ -n "$BEAD_ID" ] && [ "$DRY_RUN" != "1" ]; then
       WRAPPER_DEPS_JSON="$(bd -C "$BEAD_CITY" dep list "$BEAD_ID" --direction=up --json 2>/dev/null || echo "")"
       # Select OPEN (non-closed) dependents that are coordination wrappers:
@@ -10811,6 +11018,7 @@ $OPEN_SIBLINGS_FOR_CLOSE"
     # sets a durable "pilot:dispatched" label when it autonomously pulls a story
     # (see pilot-dispatcher.sh). If present, use a distinct prefix/emoji so Athos
     # can tell an autonomous Pilot merge apart from a human/Mayor-dispatched one.
+    gate_pm_step "notify"
     PILOT_ORIGIN=0
     if [ -n "$BEAD_ID" ]; then
       # ga-h199q: routed through the read-cache shim — cosmetic-only read (picks
@@ -10828,6 +11036,30 @@ $OPEN_SIBLINGS_FOR_CLOSE"
       NOTIFY_FORCE_DIGEST=1 notify -k gate-pass -t "Quality Gate PASSED" -p 2 "Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
       log "Gate PASSED: branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
     fi
+    }
+    # ── ga-qmymjm: run the tail beside the sweep (own process group), or inline ──────────────────────────────────
+    # gate_pm_begin registers the job (the record that makes a lost tail findable) and says whether to go async; no registration = inline.
+    # `set -m` gives the subshell its own process group: launchd kills the job's process group when the sweep exits, and a plain `&` would die
+    # with it. stdin is closed on purpose (with job control on, bash no longer does it for a background job). The subshell is a COPY of this shell,
+    # so the tail sees every variable as it is now; nothing it sets comes back, and nothing after this block reads anything the tail sets (the
+    # FAIL path below assigns its own SRC_LABELS etc.). supersede_sibling_runs stays here, in the sweep: it is what keeps a duplicate run of this
+    # same branch from being admitted, and the tail's sibling-hold check ran before it in the old order too.
+    # SELFTEST-EXTRACT postmerge-fork: BEGIN
+    GATE_PM_ASYNC=0
+    if [ "${GATE_PM_LIB_OK:-0}" = "1" ] && [ "${DRY_RUN:-0}" != "1" ] \
+       && gate_pm_begin "$GATE_RUN_ID" "$MARKER_ID" "${BEAD_ID:-}" "${BEAD_CITY:-$GC_CITY}" "${RIG:-unknown}" "$BRANCH" "$MERGE_SHA"; then
+      GATE_PM_ASYNC=1
+    fi
+    if [ "$GATE_PM_ASYNC" = "1" ]; then
+      set -m
+      ( gate_pm_child_init; _gate_pm_tail; gate_pm_child_ok ) </dev/null &
+      GATE_PM_CHILD=$!
+      set +m
+      gate_pm_after_fork "$GATE_PM_CHILD" || true
+    else
+      _gate_pm_tail
+    fi
+    # SELFTEST-EXTRACT postmerge-fork: END
     supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID" "$RIG"
 else
   # ── FAIL path ─────────────────────────────────────────────────────────────
@@ -13054,6 +13286,10 @@ if [ "${GATE_PHASE_C_ONLY:-0}" = "1" ]; then
 else
   log "=== Dispatcher sweep start (DRY_RUN=${DRY_RUN}) ==="
 fi
+
+# ga-qmymjm: post-merge tails forked by an EARLIER sweep that never reported back (killed hard, machine restarted): said out loud, once each
+# (label + comment on the source bead, event, nudge). Detection only — see gate-postmerge.lib.sh. One local directory listing when all is well.
+if [ "${GATE_PM_LIB_OK:-0}" = "1" ]; then gate_pm_sweep || true; fi
 
 # ── ga-bgvc0: ambient Dolt-CPU snapshot (BEFORE the janitors) ─────────────────
 # The Step 0b-1 headroom gate must judge the data plane by its AMBIENT load, not
@@ -17680,16 +17916,35 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
         else
           _REBASE_REANCHOR_ADVICE="Needs re-anchor/rebuild or a Mayor decision."
         fi
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate SKIPPED + ESCALATED (ga-q3ig2): branch $BRANCH has a genuine, deterministic merge conflict (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) and no live author session exists (ga-it1of liveness check: ${REBASE_LIVENESS_TRACE:-none}). A server-side rebase retry would fail identically, so the marker is parked at needs-rebase immediately (NOT re-queued) — it no longer blocks the queue. $_REBASE_REANCHOR_ADVICE" 2>/dev/null || true
+        # ga-buqnjc: the repair goes to the dog pool, not to the Mayor — a repair bead that rebases keeping both
+        # sides, tests the touched files and re-submits. The Mayor is mailed only when no repair bead covers this
+        # branch (see gate_open_conflict_repair_bead for each way that can happen).
+        gate_open_conflict_repair_bead "$MARKER_ID" "$BRANCH" "${BEAD_ID:-}" "${RIG:-}" "${RIG_PATH:-}" "${CONFLICT_FILES:-unknown}" "${MAIN_HEAD_SHA:-}" "${REBASE_LIVENESS_TRACE:-none}" "${DEFAULT_BRANCH:-main}" "${BRANCH_HAS_MERGE_IN_RANGE:-0}"
+        case "$GATE_CONFLICT_REPAIR_RESULT" in
+          opened|existing)
+            _REPAIR_TAIL="Repair bead ${GATE_CONFLICT_REPAIR_BEAD:-?} ($GATE_CONFLICT_REPAIR_RESULT) routed to the dog pool (ga-buqnjc): it rebases onto $DEFAULT_BRANCH keeping the behaviour of both sides, runs the tests of the touched files and re-submits the branch as a fresh marker. The Mayor is NOT mailed; a logic conflict the dog cannot merge safely comes back to the Mayor from the dog."
+            ;;
+          *)
+            _REPAIR_TAIL="No repair bead confirmed (${GATE_CONFLICT_REPAIR_RESULT:-unknown}) — escalated to the Mayor by mail. $_REBASE_REANCHOR_ADVICE"
+            ;;
+        esac
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate SKIPPED + ESCALATED (ga-q3ig2): branch $BRANCH has a genuine, deterministic merge conflict (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) and no live author session exists (ga-it1of liveness check: ${REBASE_LIVENESS_TRACE:-none}). A server-side rebase retry would fail identically, so the marker is parked at needs-rebase immediately (NOT re-queued) — it no longer blocks the queue. $_REPAIR_TAIL" 2>/dev/null || true
         if [ -n "$BEAD_ID" ]; then
           bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
         fi
-        gc --city "$GC_CITY" mail send mayor \
-          -s "Gate escalation: $BRANCH genuine conflict (no live author)" \
-          -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) has a genuine, deterministic conflict vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). Conflicting: ${CONFLICT_FILES:-unknown}. Author session is gone — gate cannot self-heal, and a rebase retry would fail identically. Liveness candidates checked (ga-it1of): ${REBASE_LIVENESS_TRACE:-none}. Parked at needs-rebase (not blocking the queue). Needs a manual re-anchor/rebuild or a decision." 2>/dev/null \
-          || warn "Could not mail Mayor for gate escalation on $BRANCH"
         REBASE_EVENT="dispatcher_needs_rebase_immediate"
         REBASE_VERDICT="NEEDS_REBASE (genuine conflict, dead author — immediate skip)"
+        case "$GATE_CONFLICT_REPAIR_RESULT" in
+          opened|existing)
+            REBASE_VERDICT="$REBASE_VERDICT; repair bead ${GATE_CONFLICT_REPAIR_BEAD:-?} for the dog pool (ga-buqnjc)"
+            ;;
+          *)
+            gc --city "$GC_CITY" mail send mayor \
+              -s "Gate escalation: $BRANCH genuine conflict (no live author)" \
+              -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) has a genuine, deterministic conflict vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). Conflicting: ${CONFLICT_FILES:-unknown}. Author session is gone — gate cannot self-heal, and a rebase retry would fail identically. Liveness candidates checked (ga-it1of): ${REBASE_LIVENESS_TRACE:-none}. Parked at needs-rebase (not blocking the queue). No repair bead is CONFIRMED for the dog pool (${GATE_CONFLICT_REPAIR_RESULT:-unknown}, ga-buqnjc); when the reason is create-unconfirmed one may still exist, so look before rebasing by hand: bd list --all -l gate-conflict-repair -l conflict-repair-branch:$BRANCH. Otherwise this needs a manual re-anchor/rebuild or a decision." 2>/dev/null \
+              || warn "Could not mail Mayor for gate escalation on $BRANCH"
+            ;;
+        esac
       else
         # ga-8dehbc: NOT parked (external transition respected, or the write failed) — no marker comment, source-bead label/re-route, nudge or Mayor mail.
         gate_park_note_skipped "$_RQ_RC"
