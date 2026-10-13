@@ -1147,7 +1147,7 @@ reviewer_last_active_stale() {
 # Every newly-linked bead now has this function try three distinct avenues,
 # not one, before it is allowed to end up silently unclaimable.
 assign_verdict_bead_verified() {
-  local _vb="$1" _sname="$2" _ctx="${3:-}" _seen _seen_meta _try
+  local _vb="$1" _sname="$2" _ctx="${3:-}" _seen _seen_meta _try _vb_json
   [ -z "$_vb" ] && return 1
   [ -z "$_sname" ] && { warn "  Verdict-assign (${_ctx}): empty session name for bead ${_vb} — durable channel NOT wired."; return 1; }
   for _try in 1 2 3 4; do
@@ -1160,7 +1160,10 @@ assign_verdict_bead_verified() {
     # false-alarm that masqueraded as a lost --assignee write, ga-vephl). Use the
     # array-safe `if type=="array" then .[0] else . end` pattern that the rest of
     # this dispatcher already uses for every other `bd show --json` parse.
-    _seen=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+    # ga-bk5j8u.1: ONE read per try — the assignee and the metadata fallback below come out of the same JSON
+    # (it used to be two back-to-back `bd show` of the same bead whenever the assignee had not landed yet).
+    _vb_json=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null || echo "")
+    _seen=$(printf '%s' "$_vb_json" | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
     if [ "$_seen" = "$_sname" ]; then
       [ "$_try" -gt 1 ] && log "  Verdict-assign (${_ctx}): bead ${_vb} → ${_sname} verified on retry ${_try}."
       return 0
@@ -1169,7 +1172,7 @@ assign_verdict_bead_verified() {
     # above. If metadata.gc.session_name is already there, the bead is
     # discoverable via the reviewer's documented fallback channel; no need to
     # keep chasing the assignee column specifically.
-    _seen_meta=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.session_name"] // empty' 2>/dev/null || echo "")
+    _seen_meta=$(printf '%s' "$_vb_json" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.session_name"] // empty' 2>/dev/null || echo "")
     if [ "$_seen_meta" = "$_sname" ]; then
       log "  Verdict-assign (${_ctx}): bead ${_vb} assignee write didn't land but metadata.gc.session_name did (retry ${_try}) — durable link present via the fallback channel (ga-qqtoo)."
       return 0
@@ -1593,6 +1596,78 @@ gate_bead_has_prior_sha_fail() {
   labels=$(bd -C "$city" show "$bead" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || echo "")
   gate_labels_have_sha_fail "$labels" "$sha"
+}
+
+# ── ga-x4rbnt: what a REJECTED `git push` was rejected FOR ─────────────────────
+# do_merge_ff used to call every failed FF push "main moved during push; will retry" and threw the stderr away. A pre-push hook
+# that refuses the range (ga-vhzdh5.3: the ga-oj73m scripts/ guard, three ALL-PASS runs in a row) is usually not a race: it tends to
+# answer the same on every attempt, so the retry loop and the re-submission repeated the same refusal, each one behind a full review.
+# "Usually" is not "always": .githooks/pre-push itself refuses with "remote unreachable ... Retry when network is available" (exit 1)
+# when its own `git ls-remote` blips. So ONE refusal never ends the retries — it takes the same words twice in a row
+# (gate_push_hook_confirmed, applied in the retry loop) — and a hook whose own words say the refusal is transient is never "hook"
+# (gate_push_hook_transient). Without that, a network blip would turn an all-PASS run into a false FAIL and spend a fix attempt.
+# gate_push_reject_class <git-push-stderr-text> — pure (no IO, set -e safe). Prints
+#   race     git itself says the ref moved: a `! [rejected]` line (non-fast-forward / fetch first / stale info) — retry, as before
+#   hook     a hook refused it, and nothing else in the text says "the ref moved" or "try again later":
+#              - `! [remote rejected] … hook declined` (a server-side pre-receive / protected-branch hook), or
+#              - the local pre-push shape: git prints the hook's own output and then `error: failed to push some refs`, with
+#                NO `! [` line at all (measured on git 2.54: the push never reaches the remote, so there is no per-ref status)
+#   unknown  anything else — an empty capture, a `fatal:` (network, auth, not a repository), a refspec error, a remote rejection
+#            that is not a hook (`failed to update ref`, a lock), or a hook that says its refusal is transient — and the caller
+#            keeps today's behavior (race: retry).
+# "hook" is a PROVISIONAL reading, not a proof: the local-hook arm fires by elimination (no `! [` line, no `fatal:`, no refspec
+# error, git's closing line), so a hook that exits 1 without a word, or any other failure with no per-ref status, lands there too.
+# That is why the caller needs the same words twice before it stops retrying. The closing line is matched in English: the caller
+# pushes with LC_ALL=C; under another locale this degrades to "unknown" (retry), the safe direction.
+gate_push_hook_transient() {
+  local lc
+  lc=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "$lc" in
+    *unreachable*|*network*|*"timed out"*|*"time out"*|*timeout*|*"try again"*|*temporar*|*"could not resolve"*|*"connection "*) printf 'yes' ;;
+    *) printf 'no' ;;
+  esac
+}
+gate_push_reject_class() {
+  local txt="${1:-}" verdict="unknown" words
+  [ -n "$txt" ] || { printf 'unknown'; return 0; }
+  case "$txt" in
+    *"! [rejected]"*)                      printf 'race'; return 0 ;;
+    *"fatal:"*|*"refspec"*)                printf 'unknown'; return 0 ;;
+    *"! [remote rejected]"*"hook declined"*) verdict="hook" ;;
+    *"! [remote rejected]"*)               printf 'unknown'; return 0 ;;
+    *"error: failed to push some refs"*)   verdict="hook" ;;
+  esac
+  if [ "$verdict" = "hook" ]; then
+    # judge the hook's words, not git's own boilerplate (the `To <url>` line could say anything)
+    words=$(printf '%s\n' "$txt" | grep -v -E '^(hint:|To |error: failed to push some refs)' || true)
+    [ "$(gate_push_hook_transient "$words")" = "no" ] || verdict="unknown"
+  fi
+  printf '%s' "$verdict"
+}
+
+# gate_push_hook_confirmed <previous-detail> <this-detail> — pure. `confirmed` only when a hook refused two pushes IN A ROW with the
+# SAME non-empty words: that is the evidence the refusal is deterministic. Everything else is `once`: a first sighting, a different
+# text (the cause is moving), or no words at all — two empty captures are not "the same words", they are two unknowns.
+gate_push_hook_confirmed() {
+  if [ -n "${1:-}" ] && [ "${1:-}" = "${2:-}" ]; then printf 'confirmed'; else printf 'once'; fi
+}
+
+# gate_push_hook_feedback <branch> <default-branch> <detail> — pure. The FAIL text for a CONFIRMED hook refusal. FAIL_REASONS is
+# rendered with `echo -e` downstream, which would turn a backslash sequence in the hook's own words into a newline or a tab: the
+# backslashes are doubled so the words reach the author as the hook wrote them.
+gate_push_hook_feedback() {
+  local detail
+  detail=$(printf '%s' "${3:-}" | sed 's/\\/\\\\/g')
+  printf '%s' "The push of $1 to $2 was REFUSED BY A HOOK on two consecutive attempts, with the same words, after an all-PASS verdict (merge result: failed_push_hook_rejected, ga-x4rbnt) — so it is not a lost race and the retries were stopped. Re-submitting the same range is expected to be refused the same way until what the hook objects to changes (the hook's policy, or what the range touches). The hook said:
+${detail:-<no hook output was captured>}
+Fix what the hook objects to (or have its policy changed), then re-submit. Nothing is wrong with the reviewed code itself, unless the hook is objecting to it."
+}
+
+# gate_push_reject_detail <git-push-stderr-text> — pure. The part of the text a person needs to act on: the hook's own words
+# (and git's `! [remote rejected]` status line), without git's `hint:` boilerplate, the `To <url>` line or the closing `error:
+# failed to push some refs` line. Capped (12 lines, 800 bytes): it lands in a bead comment and a mail.
+gate_push_reject_detail() {
+  printf '%s\n' "${1:-}" | grep -v -E '^(hint:|To |error: failed to push some refs)' | grep -v -E '^[[:space:]]*$' | head -n 12 | cut -c1-200 | head -c 800 || true
 }
 
 # ── ga-l7mvtw: stale-reviewed-SHA fix-attempt guard ───────────────────────────
@@ -2526,6 +2601,11 @@ _gate_lock_write_hb() { printf '%s\n' "$GATE_LOCK_TOKEN" > "$GATE_LOCK_HB" 2>/de
 # peer that recovered our lock after we were (wrongly) judged stale.
 _release_gate_lock() {
   local _own
+  # ga-bk5j8u.1: a Phase-C-only child BORROWS its parent's lock (see
+  # _gate_lock_borrow_ok); the parent still holds it, so the borrower must never
+  # remove it — not from its own EXIT, nor from cleanup_reviewer_sessions that
+  # gate_finalize_run calls. Checked FIRST: the token below is the parent's.
+  [ "${GATE_LOCK_BORROWED:-0}" = "1" ] && return 0
   _own=$(head -n1 "$GATE_LOCK_HB" 2>/dev/null || true)
   [ "$_own" = "$GATE_LOCK_TOKEN" ] && rm -rf "$GATE_LOCK_DIR" 2>/dev/null
   return 0
@@ -2607,6 +2687,231 @@ _acquire_gate_lock() {
   fi
   rmdir "$_reaping" 2>/dev/null || true
   log "Recovered STALE gate lock (heartbeat age ${_age}s ≥ ${GATE_LOCK_MAX_AGE}s) — taking over (ga-7s0or pattern)."
+  return 0
+}
+
+# ── ga-bk5j8u.1: collect a verdict when it lands, not when the next sweep starts ──
+# Phase C used to run ONLY at the top of a sweep, and a sweep that admits a
+# marker holds the process (and the lock) for a median ~9 min of slow bd/gc
+# calls, so a verdict that landed meanwhile waited for the next sweep: measured
+# over the last 50 rounds, verdict -> Phase C notices = median 3.0 min / p90 9.2.
+#
+# A sweep now looks, at statement boundaries, for a verdict bead of an in-flight
+# run that closed since it started, and when it finds one runs a Phase-C-only
+# pass AT THAT POINT: the same script, started as a CHILD (GATE_PHASE_C_ONLY=1)
+# that BORROWS this sweep's lock instead of acquiring one. The parent waits for
+# the child, so nothing ever runs beside it — merges stay serial under the one
+# lock, and no run is finalized by two processes at once.
+#
+# The hint is the city event log (.gc/events.jsonl, a bead.closed line carrying
+# the verdict bead's gate-run:<id> label): a local file read, zero Dolt load, so
+# it can be checked at every safe point without raising the cost of the sweep.
+# It is only a HINT. Before a child starts, two LIVE bd reads (not the read-cache
+# shim: it serves stale data when bd is down) confirm the run is still running and
+# has no non-closed verdict bead left — a read that fails or is not a JSON array
+# confirms nothing; and the child re-derives everything from the beads like any
+# Phase C. A missing/unreadable log yields no hint (and one warning per sweep), so
+# the worst case is the old behaviour (next sweep notices).
+#
+# Lock borrowing is proven, not assumed: the borrower must be a DIRECT child of
+# the pid named in the token, that pid must be alive, and the heartbeat must hold
+# the same token. Anything else (a reviewer that runs the dispatcher by hand and
+# inherited the variables, a stale env) fails closed and does nothing.
+GATE_MIDSWEEP_ENABLED="${GATE_MIDSWEEP_ENABLED:-1}"     # kill switch: 0 = old behaviour
+GATE_EVENTS_FILE="${GATE_EVENTS_FILE:-${GC_CITY:-}/.gc/events.jsonl}"
+# Exit code of a Phase-C-only child that did NOT do its job (lock borrow refused, or lost midway). Distinct from 0
+# ("collected, or nothing to collect") so the parent can warn instead of logging a refusal as a success.
+GATE_PHASE_C_ONLY_NOTRUN_RC=75
+
+# rc 0 iff THIS process is a Phase-C-only child entitled to borrow the lock.
+# Arg: the expected parent pid (the caller passes $PPID; a selftest passes a stand-in).
+# SELFTEST-EXTRACT gate-lock-borrow-ok-fn: BEGIN
+_gate_lock_borrow_ok() {
+  local _ppid="${1:-}" _tok="${GATE_LOCK_BORROW_TOKEN:-}" _pid _hb
+  [ "${GATE_PHASE_C_ONLY:-0}" = "1" ] || return 1
+  [ "$GATE_LOCK_ENABLED" = "1" ] || return 1
+  [ -n "$_tok" ] || return 1
+  _pid="${_tok%%:*}"
+  case "$_pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_pid" = "$_ppid" ] || return 1          # a direct child of the holder, not a descendant
+  kill -0 "$_pid" 2>/dev/null || return 1     # the holder is alive
+  [ -d "$GATE_LOCK_DIR" ] || return 1
+  _hb=$(head -n1 "$GATE_LOCK_HB" 2>/dev/null || true)
+  [ "$_hb" = "$_tok" ] || return 1            # the lock on disk is that holder's
+  return 0
+}
+# SELFTEST-EXTRACT gate-lock-borrow-ok-fn: END
+
+# Pure. $1 = JSON-lines text of city events. Prints the gate-run id of every
+# bead.closed event of a verdict bead (once each, in order). Unparseable lines
+# are ignored (a half-written last line must not hide the ones before it).
+# SELFTEST-EXTRACT gate-event-closed-verdict-runs-fn: BEGIN
+gate_event_closed_verdict_runs() {
+  printf '%s\n' "${1:-}" | jq -R -r '
+    fromjson? | select(type == "object" and .type == "bead.closed")
+    | .payload | select(type == "object")
+    | select((.labels // []) | index("type:quality-gate-verdict"))
+    | (.labels // [])[] | select(startswith("gate-run:")) | ltrimstr("gate-run:")
+  ' 2>/dev/null | awk 'NF && !seen[$0]++' || true
+}
+# SELFTEST-EXTRACT gate-event-closed-verdict-runs-fn: END
+
+# Pure. $1 = JSON array of running gate-run beads, $2 = JSON array of NON-closed
+# verdict beads, $3 = space-separated run ids to skip, $4 = candidate run ids
+# (newline/space separated). Prints the candidates (each once) that are running,
+# not skipped, and have no non-closed verdict bead.
+# THREE states per list, not two: an array (possibly empty: "I read it, here is
+# what is there"), or anything else (empty, null, an object, garbage: "I could not
+# read it"). Only the first can make a run ready — "no open verdict" is a claim
+# about the world that needs a read that succeeded, so an unreadable $2 must never
+# come out the same as `[]`. Both inputs are checked on their own: the two are not
+# symmetric once a default fills one of them in (the old `${2:-[]}` did exactly
+# that, and an empty open list read as "nothing open").
+# SELFTEST-EXTRACT gate-verdict-ready-runs-fn: BEGIN
+gate_verdict_ready_runs() {
+  printf '%s' "${1-}" | jq -e 'type == "array"' >/dev/null 2>&1 || return 0   # running list unreadable
+  printf '%s' "${2-}" | jq -e 'type == "array"' >/dev/null 2>&1 || return 0   # open-verdict list unreadable
+  jq -n -r --argjson running "$1" --argjson open "$2" \
+    --arg skip "${3:-}" --arg cand "${4:-}" '
+    ($skip | split(" ") | map(select(. != ""))) as $sk
+    | ($cand | split("\n") | map(split(" ")) | add // [] | map(select(. != "")) | unique) as $cd
+    | [ $running[]? | .id // empty ] as $run
+    | [ $open[]? | (.labels // [])[] | select(startswith("gate-run:")) | ltrimstr("gate-run:") ] as $pend
+    | $cd[] | select(. as $c | ($run | index($c)) and ($sk | index($c) | not) and ($pend | index($c) | not))
+  ' 2>/dev/null || true
+}
+# SELFTEST-EXTRACT gate-verdict-ready-runs-fn: END
+
+# Byte offset into the events file from which the NEXT look reads. Set once per
+# sweep, before Phase C starts, so a verdict that closes while Phase C runs is
+# still seen (Phase C may have finalized it already; the confirm step drops it).
+gate_midsweep_arm() {
+  GATE_MIDSWEEP_DONE=""
+  GATE_MIDSWEEP_PENDING=""
+  GATE_ADMITTING_RUN=""
+  GATE_MIDSWEEP_BLIND_LOGGED=0
+  GATE_MIDSWEEP_OFF=$({ wc -c < "$GATE_EVENTS_FILE"; } 2>/dev/null | tr -d ' ' || true)   # { } so a failed "<" is silenced too
+  case "${GATE_MIDSWEEP_OFF:-}" in
+    ''|*[!0-9]*) GATE_MIDSWEEP_OFF=""; _gate_midsweep_blind "the size of $GATE_EVENTS_FILE could not be read" ;;
+  esac
+  return 0
+}
+
+# Said once per sweep, from whichever read first fails: mid-sweep collection cannot
+# see the event log, so this sweep falls back to the old behaviour (verdicts are
+# collected at the top of the next sweep). Without the line, "feature off" and
+# "feature on, nothing closed" look the same in the log.
+_gate_midsweep_blind() {
+  [ "${GATE_MIDSWEEP_BLIND_LOGGED:-0}" = "1" ] && return 0
+  GATE_MIDSWEEP_BLIND_LOGGED=1
+  warn "Mid-sweep collection is blind this sweep: $1 — verdicts are collected at the top of the next sweep, as before (ga-bk5j8u.1)."
+  return 0
+}
+
+# Read the events appended since the last look; advances the offset (in BYTES —
+# never a character count). The result is left in GATE_MIDSWEEP_NEW (newline-
+# separated run ids, "" when none) and NOT printed: the offset is a global, and a
+# caller that took the output with $(...) would advance it in a subshell and
+# re-read the same events at every safe point. A file that shrank was rotated:
+# read the new file whole.
+# The offset moves only over bytes that were READ and are COMPLETE lines: a failed
+# read leaves it where it was (the next safe point reads the same bytes again), and
+# a line the writer is still in the middle of appending is left for the next look —
+# its tail would otherwise arrive as a second, unparseable half and the event would
+# be lost with no trace.
+gate_midsweep_new_runs() {
+  local _size _len _chunk _partial _got _unfinished
+  GATE_MIDSWEEP_NEW=""
+  [ -n "${GATE_MIDSWEEP_OFF:-}" ] || return 0
+  _size=$({ wc -c < "$GATE_EVENTS_FILE"; } 2>/dev/null | tr -d ' ' || true)
+  case "${_size:-}" in
+    ''|*[!0-9]*) _gate_midsweep_blind "the size of $GATE_EVENTS_FILE could not be read"; return 0 ;;
+  esac
+  [ "$_size" -lt "$GATE_MIDSWEEP_OFF" ] && GATE_MIDSWEEP_OFF=0
+  [ "$_size" -gt "$GATE_MIDSWEEP_OFF" ] || return 0
+  _len=$((_size - GATE_MIDSWEEP_OFF))
+  if [ "$_len" -gt 67108864 ]; then   # 64 MB gap: not a sweep-sized one
+    GATE_MIDSWEEP_OFF=$_size
+    _gate_midsweep_blind "$_len new bytes in $GATE_EVENTS_FILE since the last look is not a sweep-sized gap; skipped"
+    return 0
+  fi
+  # `printf x` keeps the chunk's trailing newlines through $(...), so the bytes of an unfinished last line can be counted.
+  _chunk=$(tail -c +"$((GATE_MIDSWEEP_OFF + 1))" "$GATE_EVENTS_FILE" 2>/dev/null | head -c "$_len"; printf x)
+  _chunk="${_chunk%x}"
+  [ "${#_chunk}" -gt 0 ] || { _gate_midsweep_blind "$GATE_EVENTS_FILE could not be read"; return 0; }
+  _partial="${_chunk##*$'\n'}"                       # text after the last newline: "" when the chunk ends on a complete line
+  _got=$(printf '%s' "$_chunk" | wc -c | tr -d ' ')              # bytes actually read (the file may have shrunk since the size look)
+  _unfinished=$(printf '%s' "$_partial" | wc -c | tr -d ' ')
+  GATE_MIDSWEEP_OFF=$((GATE_MIDSWEEP_OFF + _got - _unfinished))
+  _chunk="${_chunk%"$_partial"}"
+  [ -n "$_chunk" ] || return 0
+  GATE_MIDSWEEP_NEW=$(gate_event_closed_verdict_runs "$_chunk")
+  return 0
+}
+
+# One LIVE `bd list` for the confirm step — never through bd-list-cached.sh. The
+# shim serves its last-good cache (and exits 0) when the live read fails, so a bd
+# outage looked like fresh data; and with no cache file a bd that exits 0 with no
+# output comes back as an empty answer with rc 0. This step decides whether a
+# child finalizes a run, so it must either see the world now or say it could not.
+# rc 0 only for a JSON array on stdout; anything else -> rc 1 and nothing printed.
+_gate_midsweep_read() {
+  local _out
+  _out=$(bd -C "$GC_CITY" list --json --include-infra --limit 0 "$@" 2>/dev/null) || return 1
+  printf '%s' "$_out" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+  printf '%s\n' "$_out"
+}
+
+# The child launcher is its own function so a selftest can substitute it. $1 =
+# the run ids the child may touch — ONLY those (it never sweeps the rest).
+_gate_run_phase_c_child() {
+  GATE_PHASE_C_ONLY=1 GATE_PHASE_C_ONLY_RUNS="$1" GATE_LOCK_BORROW_TOKEN="$GATE_LOCK_TOKEN" bash "$0"
+}
+
+# Safe-point hook. Call it only at a top-level statement boundary of the MAIN
+# shell (the child must be a direct child of the lock holder). Cheap when
+# nothing closed. Never fails the sweep.
+gate_midsweep_collect() {
+  local _where="${1:-?}" _cand _running _open _ready _skip _rc=0
+  [ "$GATE_MIDSWEEP_ENABLED" = "1" ] || return 0
+  [ "$GATE_LOCK_ENABLED" = "1" ] || return 0
+  [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ] || return 0
+  [ "${GATE_PHASE_C_ONLY:-0}" = "1" ] && return 0      # a child never starts a child
+  gate_midsweep_new_runs
+  _cand="$GATE_MIDSWEEP_NEW"
+  # Candidates whose confirming reads failed at an earlier safe point are tried again here (the events they came
+  # from were consumed; without this a transient bd failure would push them back to the next sweep's Phase C).
+  _cand="${GATE_MIDSWEEP_PENDING:-}
+$_cand"
+  GATE_MIDSWEEP_PENDING=""
+  case "$_cand" in *[![:space:]]*) ;; *) return 0 ;; esac
+  _skip="${GATE_ADMITTING_RUN:-} ${GATE_MIDSWEEP_DONE:-}"
+  # The two confirming reads: live, and each must come back as a JSON array (see _gate_midsweep_read). A read that
+  # could not be made keeps the candidates for the next safe point; it is never taken for "nothing is open".
+  # (Not cached on purpose: a cache that serves its last-good copy when bd is down would let a stale "no verdict
+  # open" start a child.) A fresh, readable "not ready" drops the candidate: a run with a verdict still open gets
+  # its own close event later, and the run being admitted / one already handed to a child is not wanted again.
+  if ! _running=$(_gate_midsweep_read -l type:quality-gate-run -l gate-status:running) \
+     || ! _open=$(_gate_midsweep_read -l type:quality-gate-verdict); then
+    GATE_MIDSWEEP_PENDING="$_cand"
+    return 0
+  fi
+  _ready=$(gate_verdict_ready_runs "$_running" "$_open" "$_skip" "$_cand" | tr '\n' ' ')
+  _ready="${_ready% }"
+  [ -n "$_ready" ] || return 0
+  GATE_MIDSWEEP_DONE="${GATE_MIDSWEEP_DONE:-} $_ready"
+  _gate_lock_write_hb
+  log "Mid-sweep ($_where): verdict(s) closed for run(s) $_ready — collecting now with a Phase-C-only pass instead of waiting for the next sweep (ga-bk5j8u.1)."
+  _gate_run_phase_c_child "$_ready" || _rc=$?
+  _gate_lock_write_hb
+  if [ "$_rc" = "$GATE_PHASE_C_ONLY_NOTRUN_RC" ]; then
+    # The child answered "I did not collect" (it refused the lock borrow, or lost it midway). Logging this as a
+    # success would leave a systematic break — the borrow proof never passing — looking like a feature that
+    # works and finds nothing.
+    warn "Mid-sweep ($_where): the Phase-C-only pass did NOT run for run(s) $_ready (rc=$_rc: lock borrow refused or lost; the child's log line says which) — the next sweep's Phase C collects them. If this shows up every sweep, mid-sweep collection is inert (ga-bk5j8u.1)."
+  elif [ "$_rc" != "0" ]; then
+    warn "Mid-sweep ($_where): Phase-C-only pass exited rc=$_rc — the next sweep's Phase C re-checks every run (ga-bk5j8u.1)."
+  fi
   return 0
 }
 
@@ -6989,6 +7294,39 @@ fi
 # SELFTEST-EXTRACT fastlane-lib-load: END
 unset _GATE_FL_LIB
 
+# ── ga-dzzqvw: the task-rapida lane (a short review for a small task) lives in ONE sibling lib (gate-taskrapida.lib.sh) ──
+# Same contract as the fast lane's lib above, and for the same reasons: its absence is NOT fatal, because the lane is only ever GRANTED.
+# Without the lib every task simply takes the normal gate (today's behavior); the decision (just before Step 6) checks
+# `declare -F gate_taskrapida_decide` before calling, so a missing, unreadable or half-written lib reads as "normal gate", never as an
+# unbound function under `set -e`, and never as a dead sweep (`bash -n` first: a SYNTAX error in a sourced file kills this daemon even behind `|| true`).
+# SELFTEST-EXTRACT taskrapida-lib-load: BEGIN
+_GATE_TR_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-taskrapida.lib.sh" || true
+if [ -r "$_GATE_TR_LIB" ] && "${BASH:-/bin/bash}" -n "$_GATE_TR_LIB" 2>/dev/null; then
+  { source "$_GATE_TR_LIB" 2>/dev/null; } || true
+fi
+# SELFTEST-EXTRACT taskrapida-lib-load: END
+unset _GATE_TR_LIB
+
+# ── ga-mzw9dt: content the reviewers APPROVED that failed only at the merge goes back in WITHOUT a new review ──────
+# Same rules as the fast lane's lib above: its absence is NOT fatal (it only ever GRANTS — without it every claim takes the normal
+# gate, today's behavior), a syntax error in it must read as "no lib" and not kill this daemon, and the call site checks
+# `declare -F gate_remerge_decide` before calling. Needs gate-fastlane.lib.sh (classify_raw / run_tests) loaded first.
+# NOT silent, though: GATE_RM_LIB_WHY keeps the reason, and the claim-time block logs it and writes a gate_remerge event for every claim
+# that would have been looked at — a sweep that could not evaluate remerge must not read like one that found no approval.
+# SELFTEST-EXTRACT remerge-lib-load: BEGIN
+GATE_RM_LIB_WHY=""
+_GATE_RM_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-remerge.lib.sh" || true
+if [ ! -r "$_GATE_RM_LIB" ]; then
+  GATE_RM_LIB_WHY="gate-remerge.lib.sh is missing or unreadable"
+elif ! "${BASH:-/bin/bash}" -n "$_GATE_RM_LIB" 2>/dev/null; then
+  GATE_RM_LIB_WHY="gate-remerge.lib.sh has a syntax error"
+else
+  { source "$_GATE_RM_LIB" 2>/dev/null; } || GATE_RM_LIB_WHY="gate-remerge.lib.sh failed while loading"
+fi
+if ! declare -F gate_remerge_decide >/dev/null 2>&1; then GATE_RM_LIB_WHY="${GATE_RM_LIB_WHY:-gate-remerge.lib.sh did not define gate_remerge_decide}"; fi
+# SELFTEST-EXTRACT remerge-lib-load: END
+unset _GATE_RM_LIB
+
 # ── ga-piscg: systemic spawn-abort escalation (consecutive-abort alert) ───────
 # The dispatcher processes exactly ONE queued marker per sweep. A broken spawn
 # mechanism (gate-reviewer template misconfig / session-cap deadlock — ga-mzc3h)
@@ -8506,6 +8844,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     MERGE_ATTEMPT=0
 
     do_merge_ff() {
+      local PUSH_ERR_FILE=""   # ga-x4rbnt: the FF push's stderr capture (made inside the push's own condition, below)
       # Arguments: IS_CONTAINER_RIG, BRANCH, DEFAULT_BRANCH — all from outer scope.
       # Returns: sets MERGE_SHA, MERGE_PRE_MAIN_SHA, and MERGE_RESULT in outer
       # scope. MERGE_PRE_MAIN_SHA (ga-6zkhci, Mayor decision 2026-09-15) is
@@ -8899,6 +9238,26 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           ;;
       esac
 
+      # ── ga-mzw9dt: a remerge was granted for the content of an EARLIER approval — ask once more about the commit that lands ──
+      # Same reason as the fast lane's block below: with zero reviewers the claim-time decision is the only control, and the push sends
+      # $CUR_BRANCH, whatever origin/$BRANCH is NOW (branches do move mid-run). A clean yes needs this commit to land, on $CUR_MAIN,
+      # exactly what the approved commit lands. Anything else (tip moved, content changed, switch thrown, unreadable) does NOT push:
+      # failed_remerge_revoked, which gate_finalize_run turns into a re-queue to the normal gate and never into a FAIL.
+      # It sits AHEAD of the fast lane's confirmation on purpose: that one promises NOTHING executable between itself and the push
+      # (gate-fastlane.selftest.sh pins it). The two never both act — a remerge needs GATE_LANE != fast, and the fast lane's block is one
+      # `if` that does nothing for any other lane.
+      # SELFTEST-EXTRACT remerge-push-confirm: BEGIN
+      if [ "${GATE_REMERGE:-0}" = "1" ]; then
+        GATE_REMERGE_CONFIRM_CODE=""; GATE_REMERGE_CONFIRM_WHY=""   # a missing/erroring confirm must not be explained by a previous round's cause
+        if ! { declare -F gate_remerge_confirm >/dev/null 2>&1 && gate_remerge_confirm git_rig "$CUR_MAIN" "$CUR_BRANCH"; }; then
+          err "  Remerge revoked at the push (ga-mzw9dt, attempt $((MERGE_ATTEMPT+1))): ${GATE_REMERGE_CONFIRM_WHY:-the confirmation could not run (gate_remerge_confirm missing or errored)} [${GATE_REMERGE_CONFIRM_CODE:-unknown}] — NOT pushing $CUR_BRANCH; the marker goes back to the normal gate (a new review)."
+          GATE_REMERGE=0
+          MERGE_RESULT="failed_remerge_revoked"
+          return 1
+        fi
+      fi
+      # SELFTEST-EXTRACT remerge-push-confirm: END
+
       # ── ga-atsahv: the fast lane was granted for a DIFF — this is the last moment it can be asked about the commit that lands ──
       # The lane was decided minutes ago on $BRANCH_SHA; the push below sends $CUR_BRANCH, which is whatever origin/$BRANCH is NOW,
       # after the merge-time rebase and every git round-trip above (branches do move mid-run: see ga-l7mvtw). With zero
@@ -8921,7 +9280,14 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       # SELFTEST-EXTRACT fastlane-push-confirm: END
 
       # FF push
-      if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
+      # ga-x4rbnt: the push's stderr is KEPT (it was `2>/dev/null`) so a refusal can be told from a lost race. A capture that cannot
+      # be made (no temp file) is today's behavior: stderr to /dev/null, every failed push a race. The temp file is made INSIDE the
+      # condition below, not on a line of its own above it: the lane confirmations above (ga-atsahv) must have nothing executable
+      # between them and this push, and a `return` earlier in this function must never leave a temp file behind.
+      # LC_ALL=C: the classifier reads git's closing `error: failed to push some refs` line in English; a translated git degrades to
+      # "unknown" (retry), safe but blind. The hook's own words are the hook's, whatever the locale.
+      if PUSH_ERR_FILE=$(mktemp "${GATE_FS_TMPDIR:-/tmp}/gc-gate-push-err-XXXXXX" 2>/dev/null) || PUSH_ERR_FILE=""; LC_ALL=C git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>"${PUSH_ERR_FILE:-/dev/null}"; then
+        [ -z "$PUSH_ERR_FILE" ] || rm -f "$PUSH_ERR_FILE" 2>/dev/null || true
         git_rig fetch origin 2>/dev/null || warn "Post-FF-push fetch failed"
         local POST_MAIN
         POST_MAIN=$(rig_resolve_commit "origin/$DEFAULT_BRANCH")
@@ -9016,20 +9382,64 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           return 1
         fi
       else
-        # FF push rejected: main moved between our rebase and push (race)
-        warn "  FF push rejected (attempt $((MERGE_ATTEMPT+1))) — main moved during push; will retry"
-        MERGE_RESULT="failed_push_race"
+        # FF push rejected. Usually main moved between our rebase and push (race). A hook that refuses the range tends to answer the
+        # same every time (ga-x4rbnt), so it gets its own result and its own words in the feedback — but ONE refusal proves nothing
+        # (a hook can fail on a network blip): the retry loop below only stops on the SAME words twice in a row.
+        # SELFTEST-EXTRACT push-reject-class: BEGIN
+        # The two ends of git's output are not interchangeable: the markers that tell a hook from a race (the `! [` status lines
+        # and the closing `error: failed to push some refs`) are at the END, the hook's own words at the START. Classify from the
+        # tail, quote from the head — a verbose hook (a long diff) must not push the markers out of a front-only window.
+        local PUSH_ERR_TXT="" PUSH_ERR_HEAD="" PUSH_REJECT_CLASS="unknown"
+        if [ -n "$PUSH_ERR_FILE" ]; then
+          PUSH_ERR_TXT=$(tail -c 65536 "$PUSH_ERR_FILE" 2>/dev/null) || PUSH_ERR_TXT=""
+          PUSH_ERR_HEAD=$(head -c 8192 "$PUSH_ERR_FILE" 2>/dev/null) || PUSH_ERR_HEAD=""
+          rm -f "$PUSH_ERR_FILE" 2>/dev/null || true
+        fi
+        PUSH_REJECT_CLASS=$(gate_push_reject_class "$PUSH_ERR_TXT") || PUSH_REJECT_CLASS="unknown"
+        if [ "$PUSH_REJECT_CLASS" = "hook" ]; then
+          GATE_PUSH_HOOK_DETAIL=$(gate_push_reject_detail "$PUSH_ERR_HEAD") || GATE_PUSH_HOOK_DETAIL=""
+          err "  FF push read as REFUSED BY A HOOK (attempt $((MERGE_ATTEMPT+1))) — provisional until the same words repeat (ga-x4rbnt): ${GATE_PUSH_HOOK_DETAIL:-no hook output captured}"
+          MERGE_RESULT="failed_push_hook_rejected"
+        else
+          if [ "$PUSH_REJECT_CLASS" = "race" ]; then
+            warn "  FF push rejected (attempt $((MERGE_ATTEMPT+1))) — main moved during push; will retry"
+          else
+            # unknown: say what was NOT learned, and quote what git said — "main moved" would claim a cause nobody established
+            warn "  FF push rejected (attempt $((MERGE_ATTEMPT+1))) — cause unknown (class=$PUSH_REJECT_CLASS), treated as a lost race; will retry. git said: $(printf '%s\n' "${PUSH_ERR_HEAD:-<nothing captured>}" | grep -v -E '^[[:space:]]*$' | head -n 1 | cut -c1-200)"
+          fi
+          MERGE_RESULT="failed_push_race"
+        fi
+        # SELFTEST-EXTRACT push-reject-class: END
         return 1
       fi
     }
 
     GATE_BEAD_CLOSED_LATE=0  # ga-5w2gpw (c): set by do_merge_ff's pre-push re-check ONLY when it saw a CLOSED bead
+    GATE_PUSH_HOOK_DETAIL=""  # ga-x4rbnt: set by do_merge_ff ONLY when a hook refused the push (the hook's own words, for the feedback)
+    GATE_PUSH_HOOK_PREV=""    # ga-x4rbnt: the hook's words from the PREVIOUS attempt, iff that attempt was also a hook refusal
     while [ "$MERGE_ATTEMPT" -lt "$MAX_MERGE_RETRIES" ]; do
       MERGE_ATTEMPT=$((MERGE_ATTEMPT + 1))
       log "Merge attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES ..."
+      GATE_PUSH_HOOK_DETAIL=""  # nothing from an earlier attempt may be read as this attempt's words
       if do_merge_ff; then
         break
       fi
+      # ga-x4rbnt: ONE hook refusal is not evidence that the hook answers the same every time (.githooks/pre-push refuses with
+      # "remote unreachable ... Retry when network is available" when its ls-remote blips). The refusal is deterministic — and the
+      # retries stop — only when the previous attempt was ALSO a hook refusal with the same words. A first sighting, different
+      # words, or no words at all is retried as a race; if the attempts run out unconfirmed the run ends as failed_push_race,
+      # exactly as it did before this classifier existed (the safe direction: a hand-off that re-submits, never a false "deterministic").
+      # SELFTEST-EXTRACT push-hook-confirm: BEGIN
+      if [ "$MERGE_RESULT" = "failed_push_hook_rejected" ]; then
+        if [ "$(gate_push_hook_confirmed "$GATE_PUSH_HOOK_PREV" "$GATE_PUSH_HOOK_DETAIL")" != "confirmed" ]; then
+          log "  A hook refused the push (attempt $MERGE_ATTEMPT) — one refusal does not prove the hook answers the same every time; retrying, and only the same words twice in a row end the retries (ga-x4rbnt)."
+          GATE_PUSH_HOOK_PREV="$GATE_PUSH_HOOK_DETAIL"
+          MERGE_RESULT="failed_push_race"
+        fi
+      else
+        GATE_PUSH_HOOK_PREV=""   # the refusals must be CONSECUTIVE
+      fi
+      # SELFTEST-EXTRACT push-hook-confirm: END
       # Only retry on push-race or stale-after-rebase; give up on conflict/worktree failure
       # ga-360a7l: failed_bead_blocked_late (closed/park at the pre-push
       # re-check) joins this list — a human decision or terminal bead state,
@@ -9041,6 +9451,8 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
          [ "$MERGE_RESULT" = "failed_sha_resolution" ] || \
          [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ] || \
          [ "$MERGE_RESULT" = "failed_lane_revoked" ] || \
+         [ "$MERGE_RESULT" = "failed_push_hook_rejected" ] || \
+         [ "$MERGE_RESULT" = "failed_remerge_revoked" ] || \
          [ "$MERGE_RESULT" = "failed_bead_blocked_late" ]; then
         log "  Non-retryable failure ($MERGE_RESULT). Stopping retry loop."
         break
@@ -9102,11 +9514,49 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       if [ "$GATE_RUN_ID" != "unknown" ]; then
         bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run ended without a verdict (fast lane revoked at the push, ga-atsahv): marker $MARKER_ID ${_RQ_NOTE}. NOT a FAIL." 2>/dev/null || true
         set_gate_status "$GATE_RUN_ID" "superseded"
-        bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — fast lane revoked at the push (ga-atsahv), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher." 2>/dev/null || true
+        bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — fast lane revoked at the push (ga-atsahv), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher." 2>/dev/null || true  # verdict-net-ok: a fast-lane run asks for ZERO reviewers, so it has no verdict beads to close
       fi
       return 0
     fi
     # SELFTEST-EXTRACT fastlane-lane-revoked: END
+
+    # ── ga-mzw9dt: the remerge was REVOKED at the push — a re-queue, never a FAIL ───────────────────────────────────
+# do_merge_ff's last look (gate_remerge_confirm) found the commit about to land is no longer what the approved commit lands, or could not
+# tell. NOTHING was pushed and remerge only ever GRANTS, so this is no verdict on the author's code: no GATE-FEEDBACK, no gate:needs-fix, no
+# fix-attempt spent; the marker goes back to queued. The approval is CONSUMED (label removed) so a revocation that would repeat converges on
+# one ordinary review instead of looping (if the label cannot be removed the loop is possible, and the comment says so). Recorded as a
+# `gate_remerge` event (revoked) and GATE_REMERGE goes back to 0 (this path returns before dispatcher_complete), so the count never credits a run that merged nothing.
+# SELFTEST-EXTRACT remerge-revoked: BEGIN
+    if [ "${MERGE_RESULT:-}" = "failed_remerge_revoked" ]; then
+      GATE_REMERGE=0
+      GATE_REMERGE_CODE="revoked-${GATE_REMERGE_CONFIRM_CODE:-unknown}"
+      GATE_REMERGE_WHY="remerge granted, then revoked at the push (${GATE_REMERGE_CONFIRM_CODE:-unknown}): ${GATE_REMERGE_CONFIRM_WHY:-no reason recorded} — nothing was pushed; the normal gate decides"
+      warn "ga-mzw9dt: ${GATE_REMERGE_WHY}"
+      _RM_UNSTAMP_NOTE="the approval on the bead was consumed (label removed), so the next claim is an ordinary review"
+      if ! { declare -F gate_remerge_unstamp >/dev/null 2>&1 && gate_remerge_unstamp "$BEAD_CITY" "$BEAD_ID" "${GATE_REMERGE_LABEL:-}"; }; then
+        _RM_UNSTAMP_NOTE="the approval label could NOT be removed from the bead — the next claim may be revoked the same way"
+      fi
+      if declare -F gate_remerge_record >/dev/null 2>&1; then
+        gate_remerge_record "$GC_CITY" "$MARKER_ID" "$BEAD_ID" "$BRANCH" "${RIG:-unknown}" "$QG_LOG" "${GATE_REMERGE_WOULD_REVIEWERS:-}" revoked "${BRANCH_SHA:-}" || true
+      fi
+      _RQ_RC=0
+      gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching" || _RQ_RC=$?
+      _RQ_NOTE="re-queued for the normal gate"
+      gate_requeue_narrate "$_RQ_RC"
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state
+      if [ "$_RQ_SKIPPED" = "1" ]; then
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Remerge revoked at the push (ga-mzw9dt): ${GATE_REMERGE_CONFIRM_WHY:-no reason recorded} — NOT a code FAIL, and nothing was pushed; ${_RM_UNSTAMP_NOTE}. The marker was NOT re-queued: ${_RQ_WHY}." 2>/dev/null || true
+      else
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Remerge revoked at the push (ga-mzw9dt): ${GATE_REMERGE_CONFIRM_WHY:-no reason recorded} — NOT a code FAIL, and nothing was pushed; ${_RM_UNSTAMP_NOTE}. Marker re-queued for the normal gate." 2>/dev/null || true
+      fi
+      if [ "$GATE_RUN_ID" != "unknown" ]; then
+        bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run ended without a verdict (remerge revoked at the push, ga-mzw9dt): marker $MARKER_ID ${_RQ_NOTE}. NOT a FAIL." 2>/dev/null || true
+        set_gate_status "$GATE_RUN_ID" "superseded"
+        bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — remerge revoked at the push (ga-mzw9dt), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher." 2>/dev/null || true  # verdict-net-ok: a remerge run asks for ZERO reviewers, so it has no verdict beads to close
+      fi
+      return 0
+    fi
+    # SELFTEST-EXTRACT remerge-revoked: END
 
     if [[ "$MERGE_RESULT" = failed* ]]; then
       # Merge failed despite all-PASS verdict — degrade to FAIL
@@ -9142,6 +9592,12 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         # FAIL_REASONS in this file already uses (labels/mails downstream,
         # keyed off OVERALL_VERDICT+FAIL_REASONS generically).
         FAIL_REASONS="Branch $BRANCH's own commits do not reference source bead $BEAD_ID, caught at the actual FF-push point (ga-pfgnv: do_merge_ff's direct-FF/post-rebase-fallthrough path — the branch-content-coherence gap Step 10's own check, keyed on a potentially-stale \$BRANCH_SHA, does not cover). This is the same branch-reused-by-unrelated-work signature ga-y9a1d describes. Not merging $BRANCH. A human must verify: is this bead's real fix still on some other ref (check \`git log --all -S '<known marker text>'\`), or does $BEAD_ID need a fresh submission?"
+      elif [ "$MERGE_RESULT" = "failed_push_hook_rejected" ]; then
+        # ga-x4rbnt: a hook refused the push on two consecutive attempts with the same words (the retry loop only leaves this result
+        # standing then). The code PASSED review; re-submitting the same range is expected to be refused the same way (ga-vhzdh5.3:
+        # three ALL-PASS runs, one refusal). Say WHO refused and WHAT it said, so the author fixes the cause instead of
+        # re-submitting. No gate:needs-rebase wording: a rebase does not change what the hook reads.
+        FAIL_REASONS=$(gate_push_hook_feedback "$BRANCH" "$DEFAULT_BRANCH" "${GATE_PUSH_HOOK_DETAIL:-}")
       elif [ "$MERGE_RESULT" = "failed_bead_blocked_late" ] || [ "$MERGE_RESULT" = "failed_bead_unknown" ]; then
         # ga-360a7l: the live re-check immediately before push (do_merge_ff)
         # is what actually fired — GATE_360A7L_LATE_REASON already names the
@@ -9150,6 +9606,31 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       else
         FAIL_REASONS="Merge failed after all-PASS verdict. Merge result: $MERGE_RESULT. Check git state of rig $RIG."
       fi
+      # ── ga-mzw9dt: the reviewers APPROVED this commit; the merge is what failed. Say so on the bead, where the next claim reads it. ──
+      # Only for failures about the MERGE (not a closed/parked bead, a branch that does not cite its bead, an unresolvable sha), only for
+      # a run that really had reviewers (a remerge must not refresh the epoch of the approval it was granted on), and only for the commit
+      # THEY reviewed ($BRANCH_SHA). The stamp writes the approval into $QG_LOG first and the label (only a pointer to that record) second,
+      # and reads the label back; if either is missing the only cost is an ordinary review on resubmission.
+      # (failed_push_hook_rejected is named by ga-mzw9dt.1; until it lands that result never occurs and the entry is inert.)
+      # The next claim (gate_remerge_decide) honors it only if the tip still lands the same tree.
+      # SELFTEST-EXTRACT remerge-stamp: BEGIN
+      case "$MERGE_RESULT" in
+        failed_merge_time_conflict|failed_merge_time_rebase|failed_push_race|failed_push_hook_rejected)
+          if [ "${REQUIRED_REVIEWERS:-0}" -ge 1 ] 2>/dev/null && [ "${GATE_LANE:-normal}" != "fast" ] && [ "${GATE_REMERGE:-0}" != "1" ] \
+             && [ -n "${BRANCH_SHA:-}" ] && [ -n "${BEAD_ID:-}" ]; then
+            if ! declare -F gate_remerge_stamp >/dev/null 2>&1; then
+              # not silent: the reviewers approved this commit and nothing recorded it — the next claim cannot know
+              warn "ga-mzw9dt: the remerge lib is not loaded (${GATE_RM_LIB_WHY:-gate_remerge_stamp is not defined}) — the approval of ${BRANCH_SHA:0:12} on $BEAD_ID was NOT recorded; the resubmission will be an ordinary review."
+            elif gate_remerge_stamp "$BEAD_CITY" "$BEAD_ID" "$BRANCH_SHA" "$(date +%s 2>/dev/null || true)" "$QG_LOG"; then
+              log "ga-mzw9dt: approval of ${BRANCH_SHA:0:12} stamped on $BEAD_ID (gate-approved) — a resubmission of the same content may skip the review."
+              FAIL_REASONS="${FAIL_REASONS}
+The reviewers APPROVED commit ${BRANCH_SHA:0:12} — only the merge failed — and that approval is recorded on this bead (ga-mzw9dt). Re-submit the SAME content, or a clean rebase of it onto $DEFAULT_BRANCH, and the dispatcher checks at the next claim whether it can merge WITHOUT a new review (remerge sem nova revisão): it lands exactly what was approved on today's $DEFAULT_BRANCH, the directed tests pass, and the approval has not expired. If any of that does not hold — a conflict that is still there, a tip that changed — the normal review applies. Anything you change, including a conflict you resolve by hand, is new content and gets the normal review."
+            else
+              warn "ga-mzw9dt: could not stamp (and read back) the approval of ${BRANCH_SHA:0:12} on $BEAD_ID — the resubmission will be an ordinary review."
+            fi
+          fi ;;
+      esac
+      # SELFTEST-EXTRACT remerge-stamp: END
       warn "All-PASS verdict but merge failed ($MERGE_RESULT). Setting gate to failed."
     fi
 
@@ -10356,6 +10837,18 @@ else
   # long comment at the newly-inserted `fi` above this if for the full story.
   log "Gate FAILED: $FAIL_REASONS"
 
+  # ── ga-mzw9dt: a reviewer FAIL ends any earlier approval of this bead's content ───────────────────────────────────
+  # An approval stamped by an earlier run (reviewers all PASSED, merge failed) stays on the bead for its TTL. This run's reviewers FAILED a
+  # diff that contained that content: if the author drops what they objected to and sends the approved commit back rebased, decide would
+  # grant it with no review although a later review rejected a diff containing it. So a reviewer FAIL takes the approval off. Only a REAL
+  # reviewer FAIL (ANY_FAIL=1): a merge failure degraded to FAIL after an all-PASS verdict has ANY_FAIL=0 and is what WRITES the approval.
+  # SELFTEST-EXTRACT remerge-consume-on-fail: BEGIN
+  if [ "${ANY_FAIL:-0}" = "1" ] && [ -n "${BEAD_ID:-}" ] && declare -F gate_remerge_consume >/dev/null 2>&1; then
+    gate_remerge_consume "$BEAD_CITY" "$BEAD_ID" \
+      || warn "ga-mzw9dt: could not take the gate-approved label(s) off $BEAD_ID after a reviewer FAIL (or could not read its labels) — an earlier approval may still stand, and a resubmission of that earlier commit could skip a review that a later reviewer rejected."
+  fi
+  # SELFTEST-EXTRACT remerge-consume-on-fail: END
+
   # ga-aijm2v.5 wiring[reset]: per-run state for the deferred-Mayor-page logic (rule 3).
   # gate_finalize_run is invoked once per marker from Phase C's loop in the SAME process, so
   # these are globals that would otherwise LEAK from one run into the next — a stale
@@ -11099,6 +11592,9 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
   # nobody having passed it. Say what actually happened instead.
   if [ "${GATE_LANE:-normal}" = "fast" ]; then
     REASON="fast_lane_mechanical_checks_no_llm_review"
+  elif [ "${GATE_REMERGE:-0}" = "1" ]; then
+    # ga-mzw9dt: no reviewer ran in THIS run — the approval it merged on was given by an earlier one. Say that, not a quorum of nobody.
+    REASON="remerge_sem_nova_revisao_approved_${GATE_REMERGE_SHA:0:12}"
   else
     REASON="quorum_${REQUIRED_REVIEWERS}_of_${REQUIRED_REVIEWERS}_independent_sessions"
   fi
@@ -11120,10 +11616,11 @@ jq -c -n \
   --argjson reviewers "$REQUIRED_REVIEWERS" \
   --arg dry_run "$DRY_RUN" \
   --arg lane "${GATE_LANE:-normal}" \
+  --arg remerge "${GATE_REMERGE:-0}" \
   '{ts: $ts, event: "dispatcher_complete", branch: $branch, bead: $bead,
     rig: $rig, tier: $tier, result: $result, reason: $reason,
     gate_run: $gate_run, marker: $marker, elapsed_s: $elapsed_s,
-    reviewers: $reviewers, dry_run: $dry_run, lane: $lane}' \
+    reviewers: $reviewers, dry_run: $dry_run, lane: $lane, remerge: $remerge}' \
   >> "$QG_LOG" 2>/dev/null || true
 # ga-syxaki (E5): outcome line for a run that had an extra reviewer slot (no-op otherwise).
 if [ "${GATE_E5_LIB_OK:-0}" = "1" ]; then gate_e5_log_run_end || true; fi
@@ -12500,7 +12997,21 @@ if [ "$GATE_LOCK_ENABLED" = "1" ]; then
   # genuine continuation always matches, while any descendant process has a
   # different pid and fails closed into the normal _acquire_gate_lock path.
   _gate_hb_tok=$(head -n1 "$GATE_LOCK_HB" 2>/dev/null || true)
-  if [ "$GATE_ADMIT_ROUND" -gt 0 ] 2>/dev/null \
+  if [ "${GATE_PHASE_C_ONLY:-0}" = "1" ]; then
+    # ga-bk5j8u.1: a Phase-C-only child started by gate_midsweep_collect. It does
+    # NOT acquire the lock (its parent holds it and is waiting for us) and never
+    # releases it (_release_gate_lock is a no-op once GATE_LOCK_BORROWED=1). It
+    # takes the PARENT's token so the heartbeat it refreshes stays the parent's.
+    # Anything that is not provably a direct child of the live holder does nothing.
+    if _gate_lock_borrow_ok "$PPID"; then
+      GATE_LOCK_BORROWED=1
+      GATE_LOCK_TOKEN="$GATE_LOCK_BORROW_TOKEN"
+      _gate_lock_write_hb
+    else
+      log "Phase-C-only pass refused: not a direct child of a live lock holder with a matching heartbeat — doing nothing (ga-bk5j8u.1)."
+      exit "$GATE_PHASE_C_ONLY_NOTRUN_RC"     # not 0: the parent tells "collected" from "refused" by this code
+    fi
+  elif [ "$GATE_ADMIT_ROUND" -gt 0 ] 2>/dev/null \
      && [ -d "$GATE_LOCK_DIR" ] \
      && [ "$_gate_hb_tok" = "$GATE_LOCK_TOKEN" ] \
      && [ "${GATE_LOCK_TOKEN%%:*}" = "$$" ]; then
@@ -12537,7 +13048,12 @@ if [ "$GATE_LOCK_ENABLED" = "1" ]; then
 fi
 
 echo ""
-log "=== Dispatcher sweep start (DRY_RUN=${DRY_RUN}) ==="
+if [ "${GATE_PHASE_C_ONLY:-0}" = "1" ]; then
+  # Not a sweep start: watchdogs and the throughput reports count the banner below.
+  log "--- Phase-C-only pass (mid-sweep, borrowed lock) for run(s): ${GATE_PHASE_C_ONLY_RUNS:-none} (ga-bk5j8u.1) ---"
+else
+  log "=== Dispatcher sweep start (DRY_RUN=${DRY_RUN}) ==="
+fi
 
 # ── ga-bgvc0: ambient Dolt-CPU snapshot (BEFORE the janitors) ─────────────────
 # The Step 0b-1 headroom gate must judge the data plane by its AMBIENT load, not
@@ -12578,12 +13094,22 @@ fi
 # independent hang/stranded-run detectors, both wall-clock-based and already
 # safe across process boundaries — never by a debounced in-poll counter that
 # only made sense inside one long-lived blocking process. See ga-eqjo PR.
+# ga-bk5j8u.1: start watching the event log for verdict closes from HERE, so one
+# that lands while Phase C itself runs is not missed (a child never arms: it
+# neither looks nor starts children). See gate_midsweep_collect.
+if [ "${GATE_PHASE_C_ONLY:-0}" != "1" ]; then gate_midsweep_arm; fi
 if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
   # ga-h199q: routed through the read-cache shim (see live_sibling_run_for_branch's
   # header comment — identical query, same-sweep dedup across 4 call sites).
   # ga-jnajhn: --limit 0 — Phase C finalizes/times out EVERY in-flight run; a
   # default-50 cut would leave the oldest (most likely hung) ones un-swept.
   PHASE_C_RUNNING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "[]")
+  # ga-bk5j8u.1: a Phase-C-only child touches ONLY the runs its parent confirmed
+  # (verdicts all in, run still running, not the run the parent is admitting). An
+  # unreadable list or a jq failure leaves it nothing to do — never "everything".
+  if [ "${GATE_PHASE_C_ONLY:-0}" = "1" ]; then
+    PHASE_C_RUNNING_JSON=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq -c --arg ids "${GATE_PHASE_C_ONLY_RUNS:-}" '($ids | split(" ")) as $w | [ .[] | select(.id as $i | $w | index($i)) ]' 2>/dev/null || echo "[]")
+  fi
   PHASE_C_COUNT=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq 'length' 2>/dev/null || echo "0")
   case "$PHASE_C_COUNT" in ''|*[!0-9]*) PHASE_C_COUNT=0 ;; esac
   if [ "$PHASE_C_COUNT" -gt 0 ]; then
@@ -12594,6 +13120,16 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
     # cleanup_reviewer_sessions' GATE_SWEEP_HAS_MORE_WORK handling above.
     GATE_SWEEP_HAS_MORE_WORK=1
     for PC_I in $(seq 0 $((PHASE_C_COUNT - 1))); do
+      # ga-bk5j8u.1: a Phase-C-only child re-proves its borrow before EACH run. If its parent died
+      # (SIGKILL: the child would otherwise outlive it, finalizing under a dead holder's token while a
+      # peer sweep reclaims the lock and runs Phase C on the same run) or the heartbeat is no longer
+      # the parent's, it stops here. Runs it did not reach are collected by the next sweep's Phase C.
+      # BEFORE the heartbeat write below: that write is unconditional, and a child that has lost the
+      # lock must not stamp the old holder's token over a peer's heartbeat.
+      if [ "${GATE_PHASE_C_ONLY:-0}" = "1" ] && ! _gate_lock_borrow_ok "$PPID"; then
+        warn "Phase-C-only pass: the borrowed lock is no longer provably the parent's (parent gone, or the lock was reclaimed) — stopping before gate-run #${PC_I} of ${PHASE_C_COUNT}; the next sweep's Phase C re-checks every run (ga-bk5j8u.1)."
+        exit "$GATE_PHASE_C_ONLY_NOTRUN_RC"
+      fi
       # ga-eqjo (code-review fix): refresh the single-instance lock's heartbeat
       # at the TOP of every Phase C iteration, mirroring what the old Step 8
       # poll loop did every 30s for the same reason (that loop's own comment:
@@ -13076,6 +13612,14 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
   fi
 fi
 
+# ga-bk5j8u.1: a Phase-C-only child ends here — admission (Step 0a onward) is the
+# parent's, which is waiting for this process. Exit WITHOUT touching the lock.
+if [ "${GATE_PHASE_C_ONLY:-0}" = "1" ]; then
+  # How many of the handed runs were really swept: 0 of N says "already finalized, or the running list could not be read".
+  log "--- Phase-C-only pass done; back to the admitting sweep: ${PHASE_C_COUNT:-0} of the handed run(s) [${GATE_PHASE_C_ONLY_RUNS:-none}] were still running and swept (ga-bk5j8u.1) ---"
+  exit 0
+fi
+
 # ── Step 0a: TTL recovery — re-queue zombie dispatching markers ───────────────
 # If a marker has been in gate-status:dispatching for > DISPATCHING_TTL_MINUTES,
 # the dispatcher process was killed mid-run (after claiming but before completing).
@@ -13199,6 +13743,8 @@ if [ "$DISPATCHING_COUNT" -gt 0 ]; then
   done
 fi
 # SELFTEST-EXTRACT dispatching-ttl-recovery: END
+
+gate_midsweep_collect "step-0a-2" || true   # ga-bk5j8u.1
 
 # ── Step 0a-2 (ga-zl277): reap orphaned gate-reviewer sessions ────────────────
 # Backstop for the EXIT trap below: a dispatcher killed by SIGKILL/OOM/launchd
@@ -13382,6 +13928,8 @@ if [ "$REVIEWER_SESSION_COUNT" -gt 0 ]; then
 fi
 # SELFTEST-EXTRACT reviewer-janitor-0a2: END
 
+gate_midsweep_collect "step-0a-3" || true   # ga-bk5j8u.1
+
 # ── Step 0a-3 (ga-rstw5): reconcile container-rig bare mains to origin ─────────
 # Container rigs (.repo.git) keep a LOCAL refs/heads/<main> that a push to origin
 # never advances; when it drifts/forks from origin/<main> the durable-landing step
@@ -13454,6 +14002,8 @@ if [ "$RECON_RIG_COUNT" -gt 0 ]; then
     esac
   done
 fi
+
+gate_midsweep_collect "step-0a-4" || true   # ga-bk5j8u.1
 
 # ── Step 0a-4 (ga-88sl7): reap needs-rebase markers for already-merged branches ─
 # gate-status:needs-rebase is EXCLUDED from Step 0b's queued-only selection
@@ -13671,6 +14221,8 @@ case "$GATE_VM_CEILING_AFTER_S" in ''|*[!0-9]*) GATE_VM_CEILING_AFTER_S=86400 ;;
 gate_vm_hold_ceiling_sweep "$GC_CITY/.gc/runtime/voicebot-vm-hold-gate" "$(date +%s)" "$GATE_VM_CEILING_AFTER_S" \
   || warn "gate_vm_hold_ceiling_sweep failed (non-fatal, ga-wye9vt)."
 
+gate_midsweep_collect "step-0b" || true   # ga-bk5j8u.1
+
 # ── Step 0b: Find a queued marker ────────────────────────────────────────────
 # quality-gate-guard.sh claims, validates, derives author, and parks markers as
 # gate-status:queued.  We only process queued markers — the guard already did
@@ -13857,6 +14409,8 @@ if [ "${_gc_variable_count:-0}" -ge "$GC_VARIABLE_SESSION_MAX" ] 2>/dev/null; th
   log "GLOBAL variable-session cap hit ($_gc_variable_count/$GC_VARIABLE_SESSION_MAX: wa-worker+ps-worker+gate-reviewer combined) — QUEUED, leaving $COUNT marker(s) queued, retried next sweep (ga-jezvn)."
   exit 0
 fi
+
+gate_midsweep_collect "step-0b-1" || true   # ga-bk5j8u.1
 
 # ── Step 0b-1 (ga-cw4pm): dynamic-concurrency headroom gate ───────────────────
 # There IS queued work. Before opening a NEW run (claiming a marker + spawning N
@@ -14475,6 +15029,8 @@ DESC=$(printf '%s\n' "$MARKER" | jq -r '.description // ""')
 
 log "Attempting to claim marker $MARKER_ID ..."
 
+gate_midsweep_collect "step-1" || true   # ga-bk5j8u.1
+
 # ── Step 1: Atomic claim — transition queued → dispatching ───────────────────
 # ga-qblq4: verify FIRST (pure read, no mutation) — then add dispatching
 # BEFORE removing queued, same invariant as set_gate_status/ga-i0n83. The
@@ -14801,6 +15357,8 @@ fi
 
 log "Authoritative author: $AUTHOR"
 
+gate_midsweep_collect "step-4" || true   # ga-bk5j8u.1
+
 # ── Step 4: Determine rig path and git references ─────────────────────────────
 # SELFTEST-EXTRACT rig-path-resolve: BEGIN
 # ga-eqjo: rig/BEAD_CITY/DEFAULT_BRANCH resolution itself now lives in
@@ -15047,6 +15605,7 @@ if [ -z "$BRANCH_SHA" ]; then
 fi
 
 log "  branch_sha=$BRANCH_SHA"
+gate_midsweep_collect "step-4b" || true   # ga-bk5j8u.1
 # ── Step 4b: Already-merged detection ────────────────────────────────────────
 # If the branch tip is already an ancestor of the rig's default branch, the
 # work has already been merged.  Re-spawning reviewers on merged work wastes
@@ -15302,6 +15861,8 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       ;;
   esac
 fi
+
+gate_midsweep_collect "step-4c" || true   # ga-bk5j8u.1
 
 # ── Step 4c: Stale-base check (Bug 1a) ───────────────────────────────────────
 # Require that the branch be CURRENT with main before review starts.
@@ -17384,6 +17945,8 @@ fi
 
 log "  Branch $BRANCH is current with $DEFAULT_BRANCH — stale-base check passed."
 
+gate_midsweep_collect "step-5" || true   # ga-bk5j8u.1
+
 # ── Step 5: Code-vs-non-code tier classification ──────────────────────────────
 #
 # NON-CODE: ALL changed files are ONLY in docs/, tests/ (test_*.py, *_test.py,
@@ -17709,7 +18272,7 @@ if [ -n "$_DP_KIND" ]; then
   else
     _DP_WHAT="has a diff of $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole (GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET)"
     _DP_PRINCIPLE="The gate does not review a part of a diff and merge on it"
-    _DP_TODO="WHAT TO DO: split the work into branches that each stay under those limits and send each one through /gate-done. If this change really must land as ONE piece, the Mayor decides: read it and merge by hand, or raise GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET on the dispatcher."
+    _DP_TODO="WHAT TO DO: split the work into branches that each stay under those limits and send each one through /gate-done. Slice VERTICALLY: each slice delivers one visible, testable behavior end to end, with the minimum test that proves it — not a layer (schema only, API only, infra only), whose feedback only arrives once every other layer is done. If this change really must land as ONE piece, the Mayor decides: read it and merge by hand, or raise GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET on the dispatcher."
     _DP_SUBJ="diff too large to review whole"
     _DP_EVENT="dispatcher_park_diff_too_large"
     _DP_LOGWHY="diff too large to review whole: $_DP_SIZE"
@@ -17798,6 +18361,54 @@ if [ "$GATE_LANE" = "fast" ]; then
   REQUIRED_REVIEWERS=0
 fi
 # SELFTEST-EXTRACT fastlane-decide: END
+# ── ga-dzzqvw: the task-rapida lane — a SMALL TASK gets one reviewer and a short prompt (Athos, 2026-10-12) ──
+# "Task com até 200 linhas de código e que não mexe em envio de mensagem, dinheiro ou dado de cliente: uma revisão curta, sem bateria de
+# testes, em ~5 min. O resto continua no gate normal." Asked only of a run the DOC/TEST lane did NOT take (that one has no reviewer to cut),
+# and like it the lane is only ever GRANTED: the source bead has to BE a task (bd), the diff has to count at most 200 production lines
+# (E11's own counter), and no file may match the risk list (.gc/gate-task-rapida-risco.txt). Anything unreadable, over, or merely unverified
+# leaves the run exactly as the tier step made it. Same merge, same delivery: only the reviewer count and the prompt differ.
+# The lane's own answer rides in GATE_TR_CODE / GATE_TR_LINES (never in GATE_LANE_REASON_CODE, which the fast lane's tally buckets own), so a
+# tally can say why a task was NOT granted (gate-lane-tally.py learns to in ga-dzzqvw.1; until then the fields are only recorded). A lib that
+# returns something other than a clean grant or a clean refusal is "decision-errored".
+# Nothing from an earlier round of this process (gate_continue_or_exit re-enters) may be read as this round's, hence the reset first.
+# SELFTEST-EXTRACT taskrapida-decide: BEGIN
+GATE_TR_CODE=""; GATE_TR_WHY=""; GATE_TR_LINES=""; GATE_REVIEW_PROMPT_MODE=""
+if [ "$GATE_LANE" != "normal" ]; then
+  : # the DOC/TEST lane took this run (ZERO reviewers): nothing to decide here, and no refusal to record
+elif [ -z "${CHANGED_FILES:-}" ]; then
+  GATE_TR_CODE="no-changed-files"
+  GATE_TR_WHY="the dispatcher's own changed-file list is empty (git error or empty diff) — cannot size the task, normal gate"
+elif ! declare -F gate_taskrapida_decide >/dev/null 2>&1; then
+  GATE_TR_CODE="lib-not-loaded"
+  GATE_TR_WHY="task-rapida lib not loaded (gate-taskrapida.lib.sh missing or unreadable) — normal gate"
+else
+  # the source bead lives in ITS rig's store, not always the HQ's; a failed or half-printed read is handed over as "" (the lib calls that type-unreadable)
+  _TR_JSON=$(bd -C "${BEAD_CITY:-$GC_CITY}" show "$BEAD_ID" --json 2>/dev/null) || _TR_JSON=""
+  # the lib writes the lane variables only on a grant, but a lib that errors half way must not leave its writes behind
+  _TR_SAVE_LANE="$GATE_LANE"; _TR_SAVE_REASON="${GATE_LANE_REASON:-}"; _TR_SAVE_CODE="${GATE_LANE_REASON_CODE:-}"
+  _TR_SAVE_FILES="${GATE_LANE_FILES:-}"; _TR_SAVE_COUNTS="${GATE_LANE_COUNTS:-}"
+  _TR_RC=0
+  gate_taskrapida_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$_TR_JSON" "${RIG:-}" "$POLICY_FILES" || _TR_RC=$?
+  if [ "$_TR_RC" = "0" ] && [ "${GATE_LANE:-}" = "task-rapida" ] && [ "${GATE_TR_CODE:-}" = "granted" ]; then
+    TIER="TASK-RAPIDA"
+    REQUIRED_REVIEWERS=1
+    GATE_REVIEW_PROMPT_MODE="task-rapida"
+  else
+    GATE_LANE="$_TR_SAVE_LANE"; GATE_LANE_REASON="$_TR_SAVE_REASON"; GATE_LANE_REASON_CODE="$_TR_SAVE_CODE"
+    GATE_LANE_FILES="$_TR_SAVE_FILES"; GATE_LANE_COUNTS="$_TR_SAVE_COUNTS"
+    if [ "$_TR_RC" != "1" ] || [ -z "${GATE_TR_CODE:-}" ] || [ "${GATE_TR_CODE:-}" = "granted" ]; then
+      # fail closed: a decision that errored, or that contradicts itself, is not a decision (a "granted" nobody got is no refusal reason)
+      GATE_TR_CODE="decision-errored"
+      GATE_TR_WHY="task-rapida decision errored or was contradictory (rc=$_TR_RC) — normal gate"
+      GATE_TR_LINES=""
+    fi
+  fi
+fi
+case "${GATE_TR_CODE:-}" in
+  ''|granted) ;;
+  *) log "Task-rapida lane: not granted (${GATE_TR_CODE}) — ${GATE_TR_WHY:-no reason recorded}" ;;
+esac
+# SELFTEST-EXTRACT taskrapida-decide: END
 log "Lane: $GATE_LANE — ${GATE_LANE_REASON:-no reason recorded}"
 # SELFTEST-EXTRACT fastlane-record: BEGIN
 if declare -F gate_fastlane_record >/dev/null 2>&1; then
@@ -17812,11 +18423,74 @@ else
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg branch "$BRANCH" --arg bead "${BEAD_ID:-}" --arg rig "${RIG:-unknown}" \
     --arg marker "${MARKER_ID:-}" --arg lane "$GATE_LANE" --arg reason "$GATE_LANE_REASON" --arg code "$GATE_LANE_REASON_CODE" \
     --arg dry_run "${DRY_RUN:-0}" --argjson would "$_FL_WOULD" \
+    --arg tr_code "${GATE_TR_CODE:-}" --arg tr_lines "${GATE_TR_LINES:-}" \
     '{ts: $ts, event: "gate_lane", lane: $lane, branch: $branch, bead: $bead, rig: $rig, marker: $marker,
-      counts: "", reason: $reason, reason_code: $code, files: "", would_have_reviewers: $would, dry_run: $dry_run}' \
+      counts: "", reason: $reason, reason_code: $code, files: "", would_have_reviewers: $would, dry_run: $dry_run,
+      tr_code: $tr_code, tr_lines: $tr_lines}' \
     >> "$QG_LOG" 2>/dev/null || true
 fi
 # SELFTEST-EXTRACT fastlane-record: END
+
+# ── ga-mzw9dt: remerge — reviewer-APPROVED content that failed only at the merge is not reviewed again ────────────
+# 7 of 75 reviews on 12/10 were APPROVED and lost at the merge, and every resubmission paid a COMPLETE new review for content nobody had
+# changed. A run whose reviewers all PASSED but whose merge failed stamps the approved commit on the source bead (gate-approved:<sha>:<epoch>,
+# see the failed* block in gate_finalize_run). Here, at the next claim and before any reviewer exists, gate-remerge.lib.sh asks whether the
+# tip lands on today's main exactly what that commit lands (git merge-tree, same tree). If so, and the directed tests still pass, the run asks
+# for ZERO reviewers and goes through the same gate_finalize_run, with do_merge_ff asking again right before the push. Like the fast lane it
+# only GRANTS, never a verdict: no approval, an unreadable one, a changed tree, a real conflict, a failing test, the kill switch
+# (.gc/gate-remerge.off) all mean the normal gate, i.e. today's behavior. Every claim that carried an approval — and every eligible claim
+# the lib was not there to look at (code lib-not-loaded) — is counted in the jsonl.
+GATE_REMERGE=0; GATE_REMERGE_CODE=""; GATE_REMERGE_WHY=""; GATE_REMERGE_SHA=""; GATE_REMERGE_LABEL=""; GATE_REMERGE_AGE_S=""
+GATE_REMERGE_CONFIRM_CODE=""; GATE_REMERGE_CONFIRM_WHY=""   # nothing from an earlier round of this process may be read as this round's
+GATE_REMERGE_WOULD_REVIEWERS="$REQUIRED_REVIEWERS"
+# SELFTEST-EXTRACT remerge-decide: BEGIN
+if [ "$GATE_LANE" != "fast" ] && [ "${REQUIRED_REVIEWERS:-0}" -ge 1 ] 2>/dev/null && [ -n "${BEAD_ID:-}" ]; then
+  if declare -F gate_remerge_decide >/dev/null 2>&1; then
+    # a fresh read, not the cache shim: "?" is what a read that failed looks like to the decision (could not tell -> normal gate)
+    _RM_LABELS="?"
+    _RM_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null | jq -er 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null) || _RM_LABELS="?"
+    _RM_RC=0
+    gate_remerge_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$_RM_LABELS" "$(date +%s 2>/dev/null || true)" "$QG_LOG" || _RM_RC=$?
+    if [ "$_RM_RC" != "0" ]; then
+      # fail closed: a decision that errored is not a decision, whatever it had already written
+      GATE_REMERGE=0; GATE_REMERGE_CODE="decision-errored"; GATE_REMERGE_WHY="remerge decision errored (rc=$_RM_RC) — normal gate"
+    fi
+    # Anything that is not exactly 1 is 0 — a lib bug must not be able to produce a third state.
+    case "${GATE_REMERGE:-0}" in 1) ;; *) GATE_REMERGE=0 ;; esac
+    if [ "$GATE_REMERGE" = "1" ]; then
+      TIER="REMERGE"
+      REQUIRED_REVIEWERS=0
+    fi
+  else
+    # The lib did not load. That is NOT "this bead carries no approval": say so (the line below, and a gate_remerge event), the way the
+    # fast lane does for a missing gate-fastlane.lib.sh. The run takes the normal gate — today's behavior.
+    GATE_REMERGE=0; GATE_REMERGE_CODE="lib-not-loaded"
+    GATE_REMERGE_WHY="remerge lib not loaded (${GATE_RM_LIB_WHY:-gate_remerge_decide is not defined}) — normal gate"
+  fi
+fi
+# SELFTEST-EXTRACT remerge-decide: END
+# SELFTEST-EXTRACT remerge-record: BEGIN
+if [ -n "${GATE_REMERGE_CODE:-}" ] && [ "$GATE_REMERGE_CODE" != "no-approval" ]; then
+  log "Remerge (ga-mzw9dt): ${GATE_REMERGE_CODE} — ${GATE_REMERGE_WHY:-no reason recorded}"
+  if [ "$GATE_REMERGE" = "1" ]; then _RM_DEC="granted"; else _RM_DEC="declined"; fi
+  if declare -F gate_remerge_record >/dev/null 2>&1; then
+    gate_remerge_record "$GC_CITY" "$MARKER_ID" "$BEAD_ID" "$BRANCH" "${RIG:-unknown}" "$QG_LOG" "$GATE_REMERGE_WOULD_REVIEWERS" "$_RM_DEC" "$BRANCH_SHA" || true
+  else
+    # The recorder lives in the lib that did not load — and a period with a broken lib is exactly what the count must be able to see.
+    # Without this event those claims are simply absent from it. Same fields as gate_remerge_record's event; a reviewer count that is
+    # not a number is null (UNKNOWN), never a measured 0 (--argjson dies on non-numeric).
+    _RM_WOULD="${GATE_REMERGE_WOULD_REVIEWERS:-}"; case "$_RM_WOULD" in ''|*[!0-9]*) _RM_WOULD=null ;; esac
+    jq -c -n \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg decision "$_RM_DEC" --arg code "$GATE_REMERGE_CODE" --arg reason "${GATE_REMERGE_WHY:-}" \
+      --arg branch "${BRANCH:-}" --arg bead "${BEAD_ID:-}" --arg rig "${RIG:-unknown}" --arg marker "${MARKER_ID:-}" \
+      --arg head "${BRANCH_SHA:-}" --arg dry_run "${DRY_RUN:-0}" --argjson would "$_RM_WOULD" \
+      '{ts: $ts, event: "gate_remerge", decision: $decision, code: $code, reason: $reason, branch: $branch, bead: $bead, rig: $rig,
+        marker: $marker, approved_sha: "", head_sha: $head, approved_age_s: null, would_have_reviewers: $would, dry_run: $dry_run}' \
+      >> "${QG_LOG:-/dev/null}" 2>/dev/null || true
+  fi
+fi
+# SELFTEST-EXTRACT remerge-record: END
+gate_midsweep_collect "step-6" || true   # ga-bk5j8u.1
 
 # ── Step 6: Create gate-run tracking bead ────────────────────────────────────
 
@@ -17829,6 +18503,11 @@ GATE_START_EPOCH=$(date +%s)
 GATE_E5_RUN_DESC_LINE=""
 if [ "${GATE_E5_ACTIVE:-0}" = "1" ]; then GATE_E5_RUN_DESC_LINE=$'\n'"e5_arm: ${GATE_E5_ARM:-?}"; fi
 # SELFTEST-EXTRACT e5-run-desc: END
+
+# ga-mzw9dt: a run that goes in on an earlier approval says so in its own record, with the commit the approval is for. Only a granted
+# remerge carries the line, so every other run's record is byte-identical to today's.
+GATE_REMERGE_RUN_DESC_LINE=""
+if [ "${GATE_REMERGE:-0}" = "1" ]; then GATE_REMERGE_RUN_DESC_LINE=$'\n'"remerge: sem nova revisão (approved_sha ${GATE_REMERGE_SHA:-?}, ${GATE_REMERGE_CODE:-?})"; fi
 
 GATE_RUN_ID=$(bd -C "$GC_CITY" create \
   "gate-run: $BRANCH ($BEAD_ID)" \
@@ -17848,7 +18527,7 @@ required_reviewers: $REQUIRED_REVIEWERS
 branch_sha: $BRANCH_SHA
 marker_id: $MARKER_ID
 started_at: $NOW
-verdict_timeout_minutes: $VERDICT_TIMEOUT_MINUTES${GATE_E5_RUN_DESC_LINE:-}" \
+verdict_timeout_minutes: $VERDICT_TIMEOUT_MINUTES${GATE_E5_RUN_DESC_LINE:-}${GATE_REMERGE_RUN_DESC_LINE:-}" \
   --json 2>/dev/null | jq -r '.id // empty' || echo "")
 
 if [ -z "$GATE_RUN_ID" ]; then
@@ -17856,6 +18535,10 @@ if [ -z "$GATE_RUN_ID" ]; then
   GATE_RUN_ID="unknown"
 fi
 log "Gate-run bead: $GATE_RUN_ID"
+# ga-bk5j8u.1: this run is being admitted by THIS process, which owns its reviewer sessions and the Step 7b/8
+# bookkeeping below; a mid-sweep pass never collects it (a child finalizing it underneath would race that). A verdict
+# that lands this early waits for the next sweep's Phase C, exactly as before.
+GATE_ADMITTING_RUN="$GATE_RUN_ID"
 # ga-ub8yq: one self-contained record joining run+bead+size, keyed by GATE_RUN_ID
 # (unique per attempt) so gate-review-size-report.py can pair each attempt with
 # its own "Gate run complete: gate_run=..." verdict line without guessing from
@@ -17897,8 +18580,10 @@ fi
 # whether this process is alive. A LIVE fast run whose finalize (full-suite check + up to 3 merge attempts) outlasts
 # that grace on a loaded host can therefore be closed and its marker re-queued while it is still merging. The lock above
 # keeps another SWEEP off it; Vector B is the guard, not a sweep, so it is not stopped by the lock.
+# ga-mzw9dt: the remerge goes through this same block, and for the same reasons — it has no reviewer either (REQUIRED_REVIEWERS=0, an
+# approval earlier reviewers already gave), so it must not enter Steps 7-8 and must keep the citywide lock for the whole finalize.
 # SELFTEST-EXTRACT fastlane-bypass: BEGIN
-if [ "$GATE_LANE" = "fast" ]; then
+if [ "$GATE_LANE" = "fast" ] || [ "${GATE_REMERGE:-0}" = "1" ]; then
   VERDICT_BEAD_IDS=()
   SESSION_IDS=()
   REVIEW_TASKS=()
@@ -17917,7 +18602,15 @@ if [ "$GATE_LANE" = "fast" ]; then
   REQUEUE_REASON="quota"
   VERDICTS_RECEIVED=0
   ANY_FAIL=0
-  log "Fast lane (ga-atsahv): branch=$BRANCH — ${GATE_LANE_REASON}. Finalizing with ZERO reviewers; the merge-side checks still run."
+  if [ "${GATE_REMERGE:-0}" = "1" ]; then
+    log "Remerge sem nova revisão (ga-mzw9dt): branch=$BRANCH — ${GATE_REMERGE_WHY}. Finalizing with ZERO reviewers; the merge-side checks still run."
+    bd -C "$GC_CITY" comment "$MARKER_ID" "remerge sem nova revisão (ga-mzw9dt): ${GATE_REMERGE_WHY} The reviewers approved ${GATE_REMERGE_SHA:-?} earlier and the merge failed for a reason that is not the code; no reviewer is spawned. Merge-side checks (content coherence, full-suite regression, merge-time rebase, push-time re-confirmation) still run." 2>/dev/null || true
+    if [ "$GATE_RUN_ID" != "unknown" ]; then
+      bd -C "$GC_CITY" comment "$GATE_RUN_ID" "remerge sem nova revisão (ga-mzw9dt): approved ${GATE_REMERGE_SHA:-?} (${GATE_REMERGE_CODE}); this run asks for ZERO reviewers." 2>/dev/null || true
+    fi
+  else
+    log "Fast lane (ga-atsahv): branch=$BRANCH — ${GATE_LANE_REASON}. Finalizing with ZERO reviewers; the merge-side checks still run."
+  fi
   # Phase C refreshes the lock heartbeat at the top of each run it finalizes: a held lock with a stale heartbeat is
   # reclaimed by a second sweep, and the part below (full-suite check, up to 3 merge attempts) is the slow part.
   if [ "$GATE_LOCK_ENABLED" = "1" ]; then _gate_lock_write_hb; fi
@@ -18500,6 +19193,9 @@ for _ack_attempt in $(seq 1 "$ACK_MAX_RETRIES"); do
     fi
   done
   [ "$_all_acked" = "1" ] && break
+  # ga-bk5j8u.1: the ACK wait is idle time (up to ACK_MAX_RETRIES x ACK_WAIT_SECS); a verdict that landed is collected
+  # here instead of waiting for the next sweep. The lock is held across it (the child borrows it, we wait for it).
+  gate_midsweep_collect "step-7b-ack" || true
   sleep "$ACK_WAIT_SECS" || true
 done
 for k in "${!VERDICT_BEAD_IDS[@]}"; do

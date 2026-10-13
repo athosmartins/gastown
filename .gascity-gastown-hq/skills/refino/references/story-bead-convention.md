@@ -430,6 +430,10 @@ When Refino determines a story is too big:
    - `--parent <epic-id>`
    - title only (Fields 1-8 left blank until each sub-story is refined)
 
+Each sub-story is a **vertical** slice: one visible, testable behavior end to
+end, with the minimum test that proves it — never a layer by itself (only
+schema, only API, only infra) (ga-x8mmt7).
+
 ```bash
 # Convert parent to epic.
 # --set-labels atomically replaces the lifecycle label with story:epic-split.

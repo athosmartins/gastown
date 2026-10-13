@@ -1497,7 +1497,9 @@ grep -q '^lane: \$GATE_LANE$' "$DISPATCHER" && ok "the gate-run bead records its
 # the push-time confirmation: the check and the act are ONE variable, with NOTHING between them (gate round 2, issue 2)
 L_PCB=$(grep -n 'SELFTEST-EXTRACT fastlane-push-confirm: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
 L_PCE=$(grep -n 'SELFTEST-EXTRACT fastlane-push-confirm: END' "$DISPATCHER" | head -1 | cut -d: -f1)
-L_PUSH=$(grep -n -F 'if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH"' "$DISPATCHER" | head -1 | cut -d: -f1)
+# ga-x4rbnt: no `if ` anchor — the push line also carries its stderr capture and an env prefix (LC_ALL=C); an anchor on the old text found
+# nothing, L_PUSH came back empty, the sed range below errored into an empty BETWEEN, and "NOTHING executable sits between" passed vacuously.
+L_PUSH=$(grep -n -F 'git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH"' "$DISPATCHER" | head -1 | cut -d: -f1)
 L_LATE=$(grep -n 'LIVE re-check #2 — AUTHORITATIVE' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$L_PCB" ] && [ -n "$L_PCE" ] && [ -n "$L_PUSH" ] && [ -n "$L_LATE" ] && [ "$L_LATE" -lt "$L_PCB" ] && [ "$L_PCE" -lt "$L_PUSH" ]; then ok "the lane confirm (lines $L_PCB-$L_PCE) comes after the late bead re-check (line $L_LATE) and before the FF push (line $L_PUSH)"; else bad "push-confirm placement: late-recheck=$L_LATE confirm=$L_PCB-$L_PCE push=$L_PUSH"; fi
 BETWEEN=$(sed -n "$((${L_PCE:-0}+1)),$((${L_PUSH:-0}-1))p" "$DISPATCHER" | grep -v -E '^[[:space:]]*(#.*)?$' || true)
@@ -1570,7 +1572,10 @@ case "$JQ_ERR" in *"could not append the gate_lane event"*) ok "a failing jq: th
 # ── 8. mutation checks of THIS harness ─────────────────────────────────────────────────────────────────────
 echo "── 8. mutation checks: the assertions above must be load-bearing ──"
 # 8a. a bypass that never fires must be caught by the finalize assertion
-BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed 's/^if \[ "\$GATE_LANE" = "fast" \]; then/if false; then/')"
+# ga-mzw9dt: the bypass condition also takes a granted remerge (`|| [ "${GATE_REMERGE:-0}" = "1" ]`); the mutant rewrites the WHOLE condition, so it still
+# means "a bypass that never fires". Anchored on the text up to `; then`, so a condition that grows again is caught instead of silently not mutated.
+BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed -E 's/^if \[ "\$GATE_LANE" = "fast" \]( \|\| .*)?; then$/if false; then/')"
+[ "$BYPBLK_USE" != "$BYPBLK" ] && ok "mutant 8a really mutated the bypass condition (it would otherwise be the real code and prove nothing)" || bad "mutant 8a did not match the bypass condition — the harness would be blind"
 byp_case fast fast
 case "$BYP_OUT" in *"FINALIZE overall=PASS"*) bad "mutant bypass (never fires) still passed the finalize assertion — the harness is blind" ;; *) ok "a bypass that never fires turns the fast-lane assertion RED" ;; esac
 BYPBLK_USE=""

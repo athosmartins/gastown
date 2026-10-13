@@ -58,8 +58,10 @@ check "bead mode com a chave: não tem o parágrafo" "$([ "$(has "TEST WRAPPER" 
 STRIPPED="${ON/"$PARA"/}"
 check "ligado MENOS o parágrafo == desligado (nada mais mudou, byte a byte)" "$([ "$STRIPPED" = "$OFF" ] && echo 1 || echo 0)"
 # a ordem dos três marcos: fim do RUNNING TESTS < parágrafo < comandos do veredito (índices por awk, sem case dentro de $())
+# o marco do fim do RUNNING TESTS é a ÚLTIMA frase do bloco (ga-bk5j8u.2 a reescreveu; antes era "best defence the gate has."):
+# se o bloco for reescrito de novo, troque este marco junto — com marco ausente P1=0 e a checagem reprova, não passa em silêncio.
 pos() { printf '%s' "$ON" | awk -v k="$1" 'BEGIN{RS="\001"} {print index($0,k)}'; }
-P1=$(pos "best defence the gate has."); P2=$(pos "TEST WRAPPER"); P3=$(pos "After completing your review")
+P1=$(pos "failing test blocks only when this diff made it fail."); P2=$(pos "TEST WRAPPER"); P3=$(pos "After completing your review")
 check "o parágrafo fica logo depois do RUNNING TESTS e antes dos comandos do veredito" "$([ "$P1" -gt 0 ] && [ "$P2" -gt "$P1" ] && [ "$P3" -gt "$P2" ] && echo 1 || echo 0)"
 
 # 4 texto do builder (pre-gate) nunca recebe: não há gate nem cidade

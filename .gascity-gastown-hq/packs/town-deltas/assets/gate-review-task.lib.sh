@@ -26,6 +26,11 @@
 # (the gate, never the builder's text mode), the MBP offload flag is on, the wrapper is executable and .gc/gate-pytest.off is absent —
 # so with the switch off the task is byte-identical to before. It only tests files; no bd, no gc, no network.
 #
+# ONE optional switch picks the judging text (ga-dzzqvw): ${GATE_REVIEW_PROMPT_MODE:-}. "task-rapida" renders the short body of the fast
+# lane for a small task; empty, unset or any other value renders the full body below, byte for byte as before. Only the gate sets it
+# (from the task-rapida lane decision); the builder pre-gate run never does. The short body does not carry the TEST WRAPPER paragraph: it
+# sends the reviewer to run at most the tests the diff itself adds or changes, so there is no battery to offload.
+#
 # Editing the prompt text below changes what every reviewer is told, and what the builder rehearses against. Keep the
 # prose free of apostrophes: while this text sat inside a command substitution in the dispatcher, one stray apostrophe
 # made /bin/bash 3.2 misparse the whole file and the gate spawned no reviewer for ~3h (ga-6aj348). It no longer sits in a
@@ -283,15 +288,90 @@ are visibly mid-turn, and past that it is thrown away and reviewed again from ze
 else — your work is lost. Plan to deliver with margin: when about 8 minutes remain, stop
 starting test runs, deliver the verdict you can defend from what you verified, and say in the
 Summary which checks you did not get to run (that is honest coverage, not a FAIL).
-RUNNING TESTS: a foreground shell command is capped at 600 s, so never wrap a suite in a
-timeout you expect it to hit — a run killed by your own cap while it was passing is a run
-paid for nothing. Long runs: start them in the background (run_in_background or nohup),
-poll, and split per file; never restart a run your own cap killed; never run the whole
-tests/ directory. A test that is already red on the reviewed base for the SAME test id is
-pre-existing: report it as non-blocking — a failing test blocks only when this diff made it
-fail. Mutation and reproduction probes you write yourself are not covered by any of this:
-run them, they are the best defence the gate has.${_GATE_TW}
+RUNNING TESTS: this machine is shared with the whole city and the gate queue waits on every
+review, so test execution has a ceiling: everything you run in this review, test files and
+probes together, adds up to about 3 minutes of execution. Spend it where it can change the
+verdict. Run only the test files this diff changed and the tests it adds, one file at a time,
+and skip suites for code the diff does not touch. Write a mutation or reproduction probe only
+when reading the code leaves a suspected defect undecided: a probe that confirms what you
+already read costs minutes and adds no information. The ceiling limits execution, never
+scrutiny: read every changed line as closely as before, and a defect you can ground in the
+changed lines blocks exactly as it did. When the ceiling is reached with a check still open,
+stop and deliver the verdict you can defend, with every check left open named as not run in
+the Summary (honest coverage, not a FAIL).
+A foreground shell command is capped at 600 s, so do not wrap a test in a timeout you expect
+it to hit: a run killed by your own cap while it was passing is a run paid for nothing. Start
+anything longer in the background (run_in_background or nohup) and poll it; do not restart a
+run your own cap killed, and do not run the whole tests/ directory. A test that is already
+red on the reviewed base for the SAME test id is pre-existing: report it as non-blocking; a
+failing test blocks only when this diff made it fail.${_GATE_TW}
 TASK
+}
+
+# _gate_review_task_body_rapida — the judging text of the task-rapida lane (ga-dzzqvw): a small task with no message sending, money or
+# customer data gets ONE short review of the diff, no test battery, a verdict in about 5 minutes. Same header fields and same diff as the
+# full body; the long guidance (refutation pass, running tests, E5 coverage rules) is left out on purpose — the E5 slot is never active in
+# this lane. What blocks and what does not is the normal gate's, in fewer words; the third-state family still blocks.
+_gate_review_task_body_rapida() {
+  cat <<TASK
+FAST-LANE REVIEW (task-rapida) — You are reviewer $i of $REQUIRED_REVIEWERS for branch: $BRANCH
+Author (EXCLUDED from reviewing): $AUTHOR
+Rig: $RIG
+Branch SHA: $BRANCH_SHA
+
+This is a small task that the gate measured as touching no message sending, no money and no customer data.
+It gets ONE short review: the diff below, read adversarially, with your assigned lens.
+
+YOUR REVIEW LENS: $REVIEWER_LENS
+
+CHANGED FILES:
+$CHANGED_FILES
+
+DIFF SUMMARY:
+$DIFF_SUMMARY
+
+$DIFF_HEADER
+$DIFF_FULL
+
+--- YOUR TASK ---
+Read the diff above and judge it. DO NOT run test suites, builds or linters: this lane has no test battery.
+You may run ONLY the tests that this diff itself adds or changes, and only if they finish in about 3 minutes
+in total (usually a few seconds). You may read other files of the repo for context.
+The author ($AUTHOR) cannot review their own work, and you must not consider what anyone else thinks.
+
+SCOPE CHECK, FIRST: if the diff touches the sending of messages (whatsapp, campaigns, notifiers, follow-ups),
+money (payments, billing, collections, credit) or customer data (leads, contacts, CRM, databases, migrations),
+the verdict is FAIL with the single blocking issue "out of the task-rapida scope: <what it touches>", and you
+tell the builder to add the label gate:normal-only to the bead and resubmit, so the normal gate reviews it.
+Do not review anything else in that case.
+
+WHAT BLOCKS (verdict FAIL): a defect you can ground in specific changed lines that changes BEHAVIOR: incorrect
+output or state, a failing test that this diff made fail, data loss, a crash, a security hole. The third-state
+family BLOCKS too, always: a log, status or return value that reports success when the operation failed; a
+silent fallback or swallowed error that hides a failure; a read that could not be made (unknown) turned into
+a yes or a no; a test that passes without exercising the path it claims to test.
+WHAT DOES NOT BLOCK (report it under "Non-blocking findings" at its real severity, never drop it): a comment
+or docstring that misdescribes code which itself behaves correctly; a log line whose wording is wrong but that
+does NOT report success on a failure; style or naming.
+Before you raise an issue, re-read the changed lines and confirm the defect is really there. If you are not
+sure, re-read until you can decide; never drop a real finding because you are unsure. Your verdict is FAIL
+only if at least one blocking issue survives that check; otherwise it is PASS.
+TIME BUDGET: aim to deliver the verdict in about 5 minutes. The hard limit of this run is
+${GATE_REVIEW_BUDGET_MINUTES:-unknown} minutes counted from the moment your task was sent to you; past it the
+run is thrown away and reviewed again from zero. Deliver the verdict you can defend from the diff, and say in the
+Summary which checks you did not get to run (that is honest coverage, not a FAIL).
+TASK
+}
+
+# _gate_review_task_pick_body — which judging text this render uses. The gate sets GATE_REVIEW_PROMPT_MODE=task-rapida for a run the
+# task-rapida lane granted (quality-gate-dispatcher.sh) and leaves it empty otherwise; the builder never sets it, so pre-gate-review.sh
+# renders the full body as before. Any other value, an unset or an empty one is the FULL body: a switch that cannot be read never
+# shortens what a reviewer is told.
+_gate_review_task_pick_body() {
+  case "${GATE_REVIEW_PROMPT_MODE:-}" in
+    task-rapida) _gate_review_task_body_rapida ;;
+    *) _gate_review_task_body ;;
+  esac
 }
 
 # _gate_review_task_verdict_bead — where the gate's reviewer records its verdict: a verdict bead.
@@ -361,12 +441,12 @@ gate_render_review_task() {
         echo "gate_render_review_task: bead mode needs gc_city and verdict_bead_id" >&2
         return 2
       fi
-      _gate_review_task_body
+      _gate_review_task_pick_body
       printf '\n'
       _gate_review_task_verdict_bead
       ;;
     text)
-      _gate_review_task_body
+      _gate_review_task_pick_body
       printf '\n'
       _gate_review_task_verdict_text
       ;;

@@ -915,6 +915,11 @@ gate_fastlane_record() {
     bd -C "$city" update "$marker" --set-metadata "gate.lane=${GATE_LANE}" -q >/dev/null 2>&1 || true
     bd -C "$city" update "$marker" --set-metadata "gate.lane_reason=$(printf '%s' "$GATE_LANE_REASON" | cut -c1-300)" -q >/dev/null 2>&1 || true
     bd -C "$city" update "$marker" --set-metadata "gate.lane_files=$(gate_fastlane_files_oneline)" -q >/dev/null 2>&1 || true
+    # ga-dzzqvw: the task-rapida lane's own answer (granted, or why it refused). Only when that lane actually decided: a run the fast lane took, or
+    # one from before the lane existed, has no such answer and writes none.
+    if [ -n "${GATE_TR_CODE:-}" ]; then
+      bd -C "$city" update "$marker" --set-metadata "gate.tr_code=${GATE_TR_CODE}" -q >/dev/null 2>&1 || true
+    fi
     back=$(bd -C "$city" show "$marker" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .metadata["gate.lane"] // ""' 2>/dev/null) || back=""
     if [ "$back" != "$GATE_LANE" ]; then
       echo "[gate-fastlane] WARN: lane '${GATE_LANE}' NOT confirmed on marker $marker after write (read back: '${back:-unreadable}') — the jsonl event below is still written" >&2
@@ -928,9 +933,10 @@ gate_fastlane_record() {
       --arg lane "$GATE_LANE" --arg reason "$GATE_LANE_REASON" --arg code "${GATE_LANE_REASON_CODE:-}" \
       --arg counts "$GATE_LANE_COUNTS" --arg dry_run "${DRY_RUN:-0}" \
       --arg files "$(gate_fastlane_files_oneline)" --argjson would "$would" \
+      --arg tr_code "${GATE_TR_CODE:-}" --arg tr_lines "${GATE_TR_LINES:-}" \
       '{ts: $ts, event: "gate_lane", lane: $lane, branch: $branch, bead: $bead, rig: $rig, marker: $marker,
         counts: $counts, reason: $reason, reason_code: $code, files: $files, would_have_reviewers: $would,
-        dry_run: $dry_run}' \
+        dry_run: $dry_run, tr_code: $tr_code, tr_lines: $tr_lines}' \
       >> "$qg_log" 2>/dev/null \
       || echo "[gate-fastlane] WARN: could not append the gate_lane event to $qg_log — the weekly tally will under-count this decision" >&2
   fi

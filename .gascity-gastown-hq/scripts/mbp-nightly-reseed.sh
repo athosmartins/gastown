@@ -17,7 +17,8 @@
 #           SABER se pode rodar: não conseguir olhar a chave ($CITY/.gc inacessível), criar/tomar/remover o lock ou gravar
 #           o dono dele, ou medir um lock sem pid.
 #   PULADO  nada foi tentado, por escolha, com evidência positiva: chave desligada (falta $CITY/.gc/mbp-offload.on com
-#           $CITY/.gc acessível), dreno do reboot vivo, ou outro reseed em andamento (lock com pid vivo, ou lock sem pid criado
+#           $CITY/.gc acessível), MBP pausado pelo Athos (arquivo $CITY/.gc/mbp-offload.pause aqui, ou rc 99 do `mbp-run.sh --seed`
+#           quando a pausa está no MBP; ga-77c1qg), dreno do reboot vivo, ou outro reseed em andamento (lock com pid vivo, ou lock sem pid criado
 #           há menos de LOCK_FRESCO_S). Sem notify, exit 0. PULADO nunca é dito para o que falhou ou para o que não se
 #           pôde ler. Dreno com "até" implausível e lock com mais de 2 prazos de idade não pulam: avisam (WARN) e seguem,
 #           para que um arquivo podre não vire noite perdida muda.
@@ -40,6 +41,7 @@ DRAIN_FILE=${MBP_RESEED_DRAIN_FILE:-$HOME/.gastown/run/city-drain.level}
 TIMEOUT_S=${MBP_RESEED_TIMEOUT_S:-1800}
 REPOS=${MBP_RESEED_REPOS:-"wa ps"}
 FLAG="$CITY/.gc/mbp-offload.on"
+PAUSEFILE="$CITY/.gc/mbp-offload.pause"
 LOG="$CITY/.gc/logs/mbp-nightly-reseed.jsonl"
 LOCK="$CITY/.gc/mbp-nightly-reseed.lock"
 TO=$(command -v timeout || command -v gtimeout || true)
@@ -73,6 +75,8 @@ falhou() { # detalhe [resumo]  -> jsonl + UM notify (prio 4) + exit 1; o único 
 # "não sei" não pode virar "desligada" (noite sem reseed, em silêncio, para sempre).
 [ -f "$FLAG" ] || { [ -d "$CITY/.gc" ] && [ -x "$CITY/.gc" ]; } || falhou "não consegui olhar a chave $FLAG ($CITY/.gc ausente ou sem permissão de acesso)"
 [ -f "$FLAG" ] || skip "offload desligado (falta $FLAG)"
+# pausa do Athos ("pausar até eu liberar", ga-77c1qg): é uma ordem dele, não um defeito. Só o arquivo existir é a evidência positiva.
+[ -e "$PAUSEFILE" ] && skip "MBP pausado pelo Athos ($PAUSEFILE: $(head -n 1 "$PAUSEFILE" 2>/dev/null | cut -c1-100))"
 
 # dreno do reboot: arquivo de 4 linhas DRAIN|escrito|boot|até (nightly-reboot.sh). Vivo = linha 4 no futuro.
 # Ausente ou vencido = livre. Presente e ilegível = não dá para saber: segue (o dano de semear durante o dreno é pequeno,
@@ -163,13 +167,14 @@ trap 'exit 143' TERM INT HUP
 meaning() { # rc
   case "$1" in
     97) echo "configuração (uso errado, base ausente ou site-packages local não achado)" ;;
+    99) echo "MBP pausado pelo Athos" ;;
     98) echo "MBP indisponível/sem saúde (ssh, RAM, swap, bateria) ou ssh/rsync caiu no meio" ;;
     124|137) echo "estourou o prazo de ${TIMEOUT_S}s" ;;
     *) echo "rc inesperado" ;;
   esac
 }
 
-failed=""; summary=""; nok=0
+failed=""; summary=""; nok=0; npaused=0
 for repo in $REPOS; do
   out=$(mktemp "${TMPDIR:-/tmp}/mbp-reseed.XXXXXX") || { failed="$failed $repo(sem tmp)"; summary="$summary $repo=FALHOU:-"; continue; }
   s0=$(date +%s)
@@ -179,6 +184,9 @@ for repo in $REPOS; do
   secs=$(( $(date +%s) - s0 ))
   if [ "$rc" -eq 0 ]; then
     say "$repo OK (${secs}s) — ${last:-sem saída}"; nok=$((nok+1)); summary="$summary $repo=OK:0"
+  elif [ "$rc" -eq 99 ]; then
+    # 99 é a resposta explícita do mbp-run: "o dono mandou não usar" (pausa gravada no MBP). Não é falha; é dito, e fica no log.
+    say "$repo PULADO (${secs}s) — $(meaning "$rc"): ${last:-sem saída}"; npaused=$((npaused+1)); summary="$summary $repo=PULADO:99"
   else
     say "$repo FALHOU rc=$rc (${secs}s) — $(meaning "$rc"): ${last:-sem saída}"
     failed="$failed $repo(rc=$rc: $(meaning "$rc"))"; summary="$summary $repo=FALHOU:$rc"
@@ -186,9 +194,12 @@ for repo in $REPOS; do
   rm -f "$out"
 done
 summary=${summary# }
-[ "$nok" -gt 0 ] || [ -n "$failed" ] || failed=" nenhum repo para semear (MBP_RESEED_REPOS vazio)"   # nada semeado não é OK
+[ "$nok" -gt 0 ] || [ "$npaused" -gt 0 ] || [ -n "$failed" ] || failed=" nenhum repo para semear (MBP_RESEED_REPOS vazio)"   # nada semeado não é OK
 
 [ -z "$failed" ] || falhou "$failed" "$summary"
+if [ "$nok" -eq 0 ] && [ "$npaused" -gt 0 ]; then
+  say "PULADO — MBP pausado pelo Athos (pausa gravada no MBP)"; record PULADO "MBP pausado pelo Athos (pausa gravada no MBP)" "$summary"; say "VEREDITO: PULADO"; exit 0
+fi
 record OK "" "$summary"
 say "VEREDITO: OK"
 exit 0

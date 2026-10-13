@@ -403,6 +403,12 @@ Cada uma dessas pode ser refinada separadamente depois.
 Quer ajustar essa divisão antes de continuar?
 ```
 
+Propose the split in **vertical** slices: each smaller story delivers one
+visible, testable behavior end to end (something Athos could see working), with
+the minimum test that proves it. Never propose a story that is a layer by
+itself (only schema, only API, only infra) — its feedback would only arrive
+once every other layer is done (ga-x8mmt7).
+
 After Athos confirms the split, document it as the `notes` of the bead and
 change the bead type to `epic`. Create child bead stubs for each sub-story
 (title only, `story:unrefined` label) with `--type feature` — a slice of a

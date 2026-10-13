@@ -729,6 +729,7 @@ has "3rd: gate:needs-fix removed again (the Pilot must not redispatch)" "$CALLS"
 has "3rd: the mayor is mailed" "$CALLS" "GC --city $MRK_STORE mail send mayor -s Gate E11: $BB recusado 3x por tamanho"
 has "3rd: the comment says 'refusal 3 of 3'" "$CALLS" "refusal 3 of 3"
 has "3rd: the mail to the mayor carries the slicing command with -t (ga-2xdj1x)" "$CALLS" "bd create '<titulo>' --parent $BB -t "
+has "3rd: the mail to the mayor also says the slice is VERTICAL, one end-to-end behavior and not a layer (ga-x8mmt7)" "$CALLS" "e fatia VERTICAL: um comportamento testavel de ponta a ponta, nao uma camada so de schema/API/infra"
 
 echo "  — ga-2xdj1x: the slices are born with the type of the source bead (a slice of a feature is a feature) —"
 # <issue_type the fake bd shows> <the -t the reason must carry>. Controls: a task stays task, a bug stays bug (the hint
@@ -741,6 +742,7 @@ slice_type_case() {
   run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
   eq "slice type [$1]: refused (rc 1)" "$RC" "1"
   has "slice type [$1]: the reason says -t $2" "$CALLS" "bd create '<titulo da fatia>' --parent $BB -t $2."
+  has "slice type [$1]: the reason says to slice VERTICALLY, not by layer (ga-x8mmt7)" "$CALLS" "Fatie na VERTICAL: cada fatia entrega um comportamento visivel e testavel de ponta a ponta, nao uma camada (so schema, so API ou so infra)"
 }
 slice_type_case feature feature
 slice_type_case task task
@@ -977,6 +979,7 @@ has "refusal text: ...and both caps, naming the one exceeded" "$CALLS" "Os tetos
 lacks "refusal text: does not blame the production cap" "$CALLS" "Estourou o teto de producao."
 has "refusal text: asks for slices" "$CALLS" "O QUE FAZER: dividir em fatias"
 has "refusal text: the total-cap refusal also carries the typed slicing command (ga-2xdj1x: a feature slice is born -t feature)" "$CALLS" "bd create '<titulo da fatia>' --parent $BB -t "
+has "refusal text: the total-cap refusal also says to slice VERTICALLY (ga-x8mmt7)" "$CALLS" "Fatie na VERTICAL: cada fatia entrega um comportamento visivel e testavel de ponta a ponta, nao uma camada (so schema, so API ou so infra)"
 has "refusal text: keep only the minimum test that proves the behavior" "$CALLS" "mantenha so o teste minimo que prova o comportamento"
 has "refusal text: the guide, test lines <= code lines" "$CALLS" "(guia: linhas de teste <= linhas de codigo)"
 has "refusal text: the exemption label is still named" "$CALLS" "gate:size-exempt"
@@ -1140,6 +1143,7 @@ run_e11 1 "$RIG_OK" "$BB" feat/tot1300; RC=$?
 eq "3rd refusal on the total cap still refuses" "$RC" "1"
 has "3rd: gate:needs-human" "$CALLS" "BD -C $SRC_STORE label add $BB gate:needs-human"
 has "3rd: the mayor is told what was exceeded" "$CALLS" "foi recusado na submissao pela 3a vez: 1300 linhas no total (producao: 600) > teto do total 1000. Ficou com gate:needs-human"
+has "3rd: ...and that the slices are VERTICAL, not layers (ga-x8mmt7)" "$CALLS" "e fatia VERTICAL: um comportamento testavel de ponta a ponta, nao uma camada so de schema/API/infra"
 
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" -eq 0 ]; then echo "  RESULT: PASS"; exit 0; fi

@@ -70,7 +70,8 @@ log "runbook descreve o critério novo ✓"
 # Inclui o caso do defeito (swap 5.248 MB parado com 3,9 GB livres PASSA), RAM baixa (recusa) e o controle
 # negativo (cada porta removida deixa o mutante de reproduzir o motivo). vazio (sem saída) → FAIL;
 # timeout/falhou → FAIL; resultado sem a linha "N/N ok" com N==N → FAIL.
-OUT="$(timeout 900 bash "$SELFTEST" 2>&1)" || {
+# MBP_SELFTEST_SKIP=presenca: a presença (ga-77c1qg) tem a própria história e o próprio orçamento de 900 s; esta cobre só a suíte do critério de saúde
+OUT="$(MBP_SELFTEST_SKIP=presenca timeout 900 bash "$SELFTEST" 2>&1)" || {
   echo "$OUT" | tail -30 >&2
   fail "mbp-run.selftest.sh falhou (ou estourou 900 s) contra a árvore viva"
 }
