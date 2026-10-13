@@ -202,6 +202,19 @@ r=$(bdenv "$B32" -c 'set -euo pipefail; source "$1"; if gate_remerge_unstamp /ci
 eq "unstamp removes exactly that label and reads back" "$r|$(labels_of ga-3)" "GONE|story:approved"
 r=$(bdenv FAKE_BD_FAIL_LABEL_REMOVE=1 "$B32" -c 'set -euo pipefail; source "$1"; if gate_remerge_unstamp /city ga-3 "$2"; then echo GONE; else echo STILL; fi' _ "$RMLIB" "story:approved")
 eq "a label that cannot be removed is reported" "$r" "STILL"
+# gate_remerge_consume: EVERY approval label comes off (a later reviewer FAIL ends the earlier approval), read back; "could not tell" is not "gone"
+cons() { bdenv "$@" "$B32" -c 'set -euo pipefail; source "$1"; if gate_remerge_consume "$2" "$3"; then echo GONE; else echo STILL; fi' _ "$RMLIB" "${CONS_CITY-/city}" "${CONS_BEAD-ga-4}"; }   # no colon: an EMPTY value must stay empty (that is the case under test)
+reset_bd; printf 'story:approved\ngate-approved:%s:5\ngate-approved:%s:9\ngate:needs-fix\n' "$S40" "$S64" > "$T/fakebd/labels.ga-4"
+eq "consume removes EVERY approval label (the old and the new one), leaves the others, and reads back" "$(cons X=1)|$(labels_of ga-4)" "GONE|story:approved gate:needs-fix"
+reset_bd; echo "story:approved" > "$T/fakebd/labels.ga-5"
+eq "a bead with no approval: nothing to remove is success, and nothing else is touched" "$(CONS_BEAD=ga-5 cons X=1)|$(labels_of ga-5)" "GONE|story:approved"
+reset_bd
+eq "a bead with NO labels at all is also 'nothing to remove'" "$(CONS_BEAD=ga-7 cons X=1)" "GONE"
+reset_bd; printf 'gate-approved:%s:5\n' "$S40" > "$T/fakebd/labels.ga-6"
+eq "labels that cannot be removed → STILL (reported, never 'gone')" "$(CONS_BEAD=ga-6 cons FAKE_BD_FAIL_LABEL_REMOVE=1)|$(labels_of ga-6)" "STILL|gate-approved:$S40:5"
+eq "labels that cannot be READ → STILL (could not tell is not gone)" "$(CONS_BEAD=ga-6 cons FAKE_BD_FAIL_SHOW=1)" "STILL"
+eq "no city → STILL" "$(CONS_CITY= CONS_BEAD=ga-6 cons X=1)" "STILL"
+eq "no bead → STILL" "$(CONS_BEAD= cons X=1)" "STILL"
 
 reset_bd; QL="$T/qg.jsonl"; rm -f "$QL"
 rec() { # <decision> [VAR=val ...] — gate_remerge_record on a marker, with the decision globals a real decide leaves behind

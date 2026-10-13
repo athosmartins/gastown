@@ -15,20 +15,25 @@ RECBLK=$(extract_block "$DISPATCHER" remerge-record)
 PCBLK=$(extract_block "$DISPATCHER" remerge-push-confirm)
 REVBLK=$(extract_block "$DISPATCHER" remerge-revoked)
 STAMPBLK=$(extract_block "$DISPATCHER" remerge-stamp)
-for b in LOADBLK DECBLK RECBLK PCBLK REVBLK STAMPBLK; do
+CONBLK=$(extract_block "$DISPATCHER" remerge-consume-on-fail)
+for b in LOADBLK DECBLK RECBLK PCBLK REVBLK STAMPBLK CONBLK; do
   if [ -n "$(eval "echo \"\${$b}\"")" ]; then ok "block located in the dispatcher: $b"; else bad "block $b not found — the dispatcher has no remerge wiring (SELFTEST-EXTRACT sentinel missing)"; fi
 done
 
 echo "  ·· lib load ··"
-mkdir -p "$T/ld/good" "$T/ld/bad" "$T/ld/none"
+mkdir -p "$T/ld/good" "$T/ld/bad" "$T/ld/none" "$T/ld/empty" "$T/ld/fail"
 cp "$RMLIB" "$T/ld/good/gate-remerge.lib.sh"
 printf 'gate_remerge_decide() {\n  if then fi ((\n' > "$T/ld/bad/gate-remerge.lib.sh"
-for k in good bad none; do
-  { printf 'set -euo pipefail\n'; printf '%s\n' "$LOADBLK"; printf 'if declare -F gate_remerge_decide >/dev/null 2>&1; then echo LOADED; else echo NOLIB; fi\n'; } > "$T/ld/$k/run.sh"
+printf ': a lib that loads and defines nothing\n' > "$T/ld/empty/gate-remerge.lib.sh"
+printf 'return 7\n' > "$T/ld/fail/gate-remerge.lib.sh"
+for k in good bad none empty fail; do
+  { printf 'set -euo pipefail\n'; printf '%s\n' "$LOADBLK"; printf 'if declare -F gate_remerge_decide >/dev/null 2>&1; then echo "LOADED:${GATE_RM_LIB_WHY:-}"; else echo "NOLIB:${GATE_RM_LIB_WHY:-}"; fi\n'; } > "$T/ld/$k/run.sh"
 done
-eq "a good lib next to the dispatcher is loaded" "$("$B32" "$T/ld/good/run.sh" 2>&1 | tail -1)" "LOADED"
-eq "a lib with a SYNTAX error reads as 'no lib' — it does not kill the daemon" "$("$B32" "$T/ld/bad/run.sh" 2>&1 | tail -1)" "NOLIB"
-eq "no lib file at all reads as 'no lib'" "$("$B32" "$T/ld/none/run.sh" 2>&1 | tail -1)" "NOLIB"
+eq "a good lib next to the dispatcher is loaded (and there is no reason to give)" "$("$B32" "$T/ld/good/run.sh" 2>&1 | tail -1)" "LOADED:"
+eq "a lib with a SYNTAX error reads as 'no lib' — it does not kill the daemon — and SAYS why" "$("$B32" "$T/ld/bad/run.sh" 2>&1 | tail -1)" "NOLIB:gate-remerge.lib.sh has a syntax error"
+eq "no lib file at all reads as 'no lib' and says why" "$("$B32" "$T/ld/none/run.sh" 2>&1 | tail -1)" "NOLIB:gate-remerge.lib.sh is missing or unreadable"
+eq "a lib that loads but defines no decision reads as 'no lib' and says why" "$("$B32" "$T/ld/empty/run.sh" 2>&1 | tail -1)" "NOLIB:gate-remerge.lib.sh did not define gate_remerge_decide"
+eq "a lib that fails WHILE loading reads as 'no lib' and says why" "$("$B32" "$T/ld/fail/run.sh" 2>&1 | tail -1)" "NOLIB:gate-remerge.lib.sh failed while loading"
 
 echo "  ·· decision ··"
 dcase() { # <name> <header/stub code> <want line>
@@ -47,7 +52,10 @@ dcase "lib says yes"                       'gate_remerge_decide() { SEEN="$4"; G
 dcase "lib says no"                        'gate_remerge_decide() { SEEN="$4"; GATE_REMERGE=0; GATE_REMERGE_CODE=content-changed; }'                  "remerge=0 code=content-changed rev=2 tier=CODE seen=story:approved gate:needs-fix"
 dcase "lib ERRORS after saying yes"        'gate_remerge_decide() { GATE_REMERGE=1; GATE_REMERGE_CODE=granted-exact; return 7; }'                     "remerge=0 code=decision-errored rev=2 tier=CODE seen=none"
 dcase "lib returns garbage as the answer"  'gate_remerge_decide() { GATE_REMERGE=banana; GATE_REMERGE_CODE=x; }'                                       "remerge=0 code=x rev=2 tier=CODE seen=none"
-dcase "lib not loaded at all"              ':'                                                                                                           "remerge=0 code= rev=2 tier=CODE seen=none"
+dcase "lib not loaded at all (an eligible run) → SAYS so, and takes the normal gate" ':'                                                          "remerge=0 code=lib-not-loaded rev=2 tier=CODE seen=none"
+dcase "lib absent, but the run was never eligible (fast lane) → no noise"           'GATE_LANE=fast; REQUIRED_REVIEWERS=0; TIER=FAST-LANE'          "remerge=0 code= rev=0 tier=FAST-LANE seen=none"
+dcase "lib absent, a run with no reviewer anyway → no noise"                         'REQUIRED_REVIEWERS=0'                                          "remerge=0 code= rev=0 tier=CODE seen=none"
+dcase "lib absent, no source bead id → no noise"                                     'BEAD_ID=""'                                                    "remerge=0 code= rev=2 tier=CODE seen=none"
 dcase "the fast lane is untouched (no second decision)" 'GATE_LANE=fast; REQUIRED_REVIEWERS=0; TIER=FAST-LANE; gate_remerge_decide() { SEEN=called; GATE_REMERGE=1; }' "remerge=0 code= rev=0 tier=FAST-LANE seen=none"
 dcase "a run that would have no reviewer anyway is untouched" 'REQUIRED_REVIEWERS=0; gate_remerge_decide() { SEEN=called; GATE_REMERGE=1; }'          "remerge=0 code= rev=0 tier=CODE seen=none"
 dcase "no source bead id → no decision"    'BEAD_ID=""; gate_remerge_decide() { SEEN=called; GATE_REMERGE=1; }'                                       "remerge=0 code= rev=2 tier=CODE seen=none"
@@ -55,6 +63,8 @@ dcase "labels that cannot be read reach the decision as '?'" 'gate_remerge_decid
 reset_bd
 dcase "a bead with NO labels reaches the decision as an empty list, not as '?'" 'gate_remerge_decide() { SEEN="[$4]"; GATE_REMERGE=0; GATE_REMERGE_CODE=no-approval; }' "remerge=0 code=no-approval rev=2 tier=CODE seen=[]" X=1
 reset_bd; printf 'story:approved\n' > "$T/fakebd/labels.ga-x"
+{ printf 'set -euo pipefail\ngit_rig() { :; }\nDEFAULT_BRANCH=main; BEAD_CITY=/city; BEAD_ID=ga-x; BRANCH_SHA=abc; GC_CITY=/city; QG_LOG=/q\nGATE_LANE=normal; REQUIRED_REVIEWERS=2; TIER=CODE; GATE_REMERGE=0\nGATE_RM_LIB_WHY="gate-remerge.lib.sh has a syntax error"\n'; printf '%s\n' "$DECBLK"; printf 'echo "WHY=$GATE_REMERGE_WHY"\n'; } > "$T/dw.sh"
+has "lib absent: the reason the lib did not load reaches the log line's text" "$(bdenv X=1 "$B32" "$T/dw.sh" 2>&1 | tail -1)" "gate-remerge.lib.sh has a syntax error"
 
 echo "  ·· the real decision block + the real libs + real git ··"
 real_dec() { # <head> <labels...> -> RESULT line from the dispatcher's own block
@@ -97,6 +107,14 @@ rcase "a decline is recorded"                                                   
 rcase "a grant is recorded"                                                        granted-exact 1 "CALLED:granted:abc END"
 { printf 'set -euo pipefail\nlog(){ :; }\nGATE_REMERGE_CODE=expired; GATE_REMERGE=0; GATE_REMERGE_WHY=w\n'; printf '%s\n' "$RECBLK"; printf 'echo SURVIVED\n'; } > "$T/rc2.sh"
 eq "recorder missing (lib did not load): the block survives set -euo pipefail" "$("$B32" "$T/rc2.sh" 2>&1 | tail -1)" "SURVIVED"
+# …and it is NOT silent: the lib that did not load is a period the count must be able to see, so the event is written inline
+QGE="$T/rec-event.jsonl"; : > "$QGE"
+{ printf 'set -euo pipefail\nlog(){ :; }\nGATE_REMERGE_CODE=lib-not-loaded; GATE_REMERGE=0; GATE_REMERGE_WHY="remerge lib not loaded (x)"; GATE_REMERGE_WOULD_REVIEWERS=%q\nMARKER_ID=mk-9; BEAD_ID=ga-x; BRANCH=feat/x; RIG=gascity; BRANCH_SHA=abc123; QG_LOG=%q\n' 2 "$QGE"; printf '%s\n' "$RECBLK"; printf 'echo DONE\n'; } > "$T/rc3.sh"
+eq "recorder missing: the block still ends cleanly while writing the event" "$("$B32" "$T/rc3.sh" 2>&1 | tail -1)" "DONE"
+ev() { jq -r '[.event,.decision,.code,.bead,.marker,.head_sha,(.would_have_reviewers|tostring),(.approved_age_s|tostring),.approved_sha] | join("|")' "$QGE" 2>/dev/null | tail -1; }
+eq "recorder missing: an inline gate_remerge event is still written (declined, lib-not-loaded, the reviewers a normal run uses, no approval age)" "$(ev)" "gate_remerge|declined|lib-not-loaded|ga-x|mk-9|abc123|2|null|"
+: > "$QGE"; sed -i.bak 's/GATE_REMERGE_WOULD_REVIEWERS=2/GATE_REMERGE_WOULD_REVIEWERS=abc/' "$T/rc3.sh"
+eq "…a reviewer count that is not a number is null (unknown), never a measured 0, and never kills the block" "$("$B32" "$T/rc3.sh" 2>&1 | tail -1)|$(ev)" "DONE|gate_remerge|declined|lib-not-loaded|ga-x|mk-9|abc123|null|null|"
 
 echo "  ·· push-time confirm (inside do_merge_ff, before the push) ··"
 pcase() { # <name> <stub> <want>
@@ -171,6 +189,37 @@ scase "…even if a reviewer count were left over"                              
 scase "stamp fails (label did not stick) → warned, hand-off text unchanged"                  failed_push_race             2 normal 0 1 "yes|yes|plain"
 { printf 'set -euo pipefail\nBEAD_CITY=/c; BEAD_ID=ga-x; BRANCH_SHA=%s; DEFAULT_BRANCH=main; MERGE_RESULT=failed_push_race; REQUIRED_REVIEWERS=2; GATE_LANE=normal; GATE_REMERGE=0; FAIL_REASONS=x\nlog(){ :; }; warn(){ :; }\n' "$S40"; printf '%s\n' "$STAMPBLK"; printf 'echo "SURVIVED:$FAIL_REASONS"\n'; } > "$T/st2.sh"
 eq "stamper missing (lib did not load): the block survives set -euo pipefail and changes nothing" "$("$B32" "$T/st2.sh" 2>&1 | tail -1)" "SURVIVED:x"
+stlib() { # <MERGE_RESULT> <REQUIRED_REVIEWERS> <GATE_LANE> -> the WARN lines of a run whose stamper is missing
+  { printf 'set -euo pipefail\nBEAD_CITY=/c; BEAD_ID=ga-x; BRANCH_SHA=%s; DEFAULT_BRANCH=main; MERGE_RESULT=%q; REQUIRED_REVIEWERS=%q; GATE_LANE=%q; GATE_REMERGE=0; FAIL_REASONS=x; GATE_RM_LIB_WHY="gate-remerge.lib.sh is missing or unreadable"\n' "$S40" "$1" "$2" "$3"
+    printf 'log(){ :; }; warn(){ echo "WARN: $*" >> "$LOGF"; }\n'; printf '%s\n' "$STAMPBLK"; printf 'echo "SURVIVED:$FAIL_REASONS"\n'; } > "$T/st3.sh"
+  : > "$T/st3.log"; LOGF="$T/st3.log" "$B32" "$T/st3.sh" 2>&1 | tail -1 > "$T/st3.out"; cat "$T/st3.out" "$T/st3.log" | tr '\n' '~'
+}
+r=$(stlib failed_push_race 2 normal)
+case "$r" in "SURVIVED:x~WARN: "*"missing or unreadable"*"NOT recorded"*) ok "stamper missing: a WARN says the approval was NOT recorded and why — the author's text is untouched" ;; *) bad "stamper missing is silent or wrong: [$r]" ;; esac
+eq "stamper missing, but the run was never stampable (fast lane) → no WARN" "$(stlib failed_push_race 0 fast)" "SURVIVED:x~"
+eq "stamper missing, but the failure is not about the merge → no WARN" "$(stlib failed_bead_blocked_late 2 normal)" "SURVIVED:x~"
+# the text the author reads promises what decide can deliver, no more
+{ printf 'set -euo pipefail\nBEAD_CITY=/c; BEAD_ID=ga-x; BRANCH_SHA=%s; DEFAULT_BRANCH=main; QG_LOG=/q; MERGE_RESULT=failed_merge_time_conflict; REQUIRED_REVIEWERS=2; GATE_LANE=normal; GATE_REMERGE=0; FAIL_REASONS=base\nlog(){ :; }; warn(){ :; }\ngate_remerge_stamp() { return 0; }\n' "$S40"; printf '%s\n' "$STAMPBLK"; printf 'printf "%%s" "$FAIL_REASONS"\n'; } > "$T/st4.sh"
+r=$("$B32" "$T/st4.sh" 2>&1)
+has "author text: says the dispatcher CHECKS at the next claim (a conflict that is still there is declined)" "$r" "checks at the next claim whether it can merge WITHOUT a new review"
+case "$r" in *"is merged WITHOUT a new review"*) bad "author text still promises an unconditional skip: [$r]" ;; *) ok "author text no longer promises an unconditional skip" ;; esac
+
+echo "  ·· a reviewer FAIL ends any earlier approval (and a merge failure, which WRITES it, does not) ··"
+ccase() { # <name> <ANY_FAIL> <BEAD_ID> <consume: rc | NONE> <want>
+  { printf 'set -euo pipefail\nBEAD_CITY=/city; BEAD_ID=%q; ANY_FAIL=%q\n' "$3" "$2"
+    printf 'warn(){ echo "WARN: $*" >> "$LOGF"; }\n'
+    if [ "$4" != "NONE" ]; then printf 'gate_remerge_consume() { echo "CONSUME:$1:$2" >> "$LOGF"; return %s; }\n' "$4"; fi
+    printf 'one() {\n%s\n  echo AFTER >> "$LOGF"\n}\none\n' "$CONBLK"
+  } > "$T/cn.sh"
+  : > "$T/cn.log"
+  local out; out=$(LOGF="$T/cn.log" "$B32" "$T/cn.sh" 2>&1 | tr '\n' ' ' | sed 's/ $//'); out="$out$(sed 's/^WARN:.*/WARN/' "$T/cn.log" | tr '\n' ' ' | sed 's/ $//')"
+  if [ "$out" = "$5" ]; then ok "consume block: $1"; else bad "consume block: $1 → '$out', want '$5'"; fi
+}
+ccase "a reviewer FAIL (ANY_FAIL=1) consumes the earlier approval, and the run goes on"       1 ga-x 0    "CONSUME:/city:ga-x AFTER"
+ccase "a merge failure degraded to FAIL (ANY_FAIL=0) must NOT consume — it is what WRITES the approval" 0 ga-x 0    "AFTER"
+ccase "consume could not finish (rc 1) → a WARN says the earlier approval may still stand"     1 ga-x 1    "CONSUME:/city:ga-x WARN AFTER"
+ccase "no source bead id → nothing to consume"                                                  1 ""   0    "AFTER"
+ccase "the lib is not loaded → nothing to call (the claim already said so), and the FAIL path goes on" 1 ga-x NONE "AFTER"
 
 echo "── 6. drift guards ──"
 grep -qF 'gate_remerge_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$_RM_LABELS" "$(date +%s 2>/dev/null || true)" "$QG_LOG"' "$DISPATCHER" \
@@ -201,6 +250,25 @@ if [ -n "$LN_ST" ] && [ -n "$LN_FR" ] && [ "$LN_FR" -lt "$LN_ST" ]; then ok "the
 if grep -n 'OVERALL_VERDICT\|FAIL_REASONS\|gate:needs-fix\|gate:needs-human\|set_gate_status' "$RMLIB" | grep -v '^[0-9]*:#' >/dev/null; then bad "the remerge lib touches a verdict (it must only ever grant)"; else ok "the remerge lib never touches a verdict, a fix label or a gate status — it only grants"; fi
 # no read of the rebase-stable digest: the equality is the landing tree
 if grep -v '^[[:space:]]*#' "$RMLIB" | grep -q '_gate_fastlane_digest_file\|GATE_LANE_DIGEST'; then bad "the remerge lib uses the fast lane's -U0 digest (it cannot tell a moved line)"; else ok "the remerge lib compares landing TREES, not the -U0 digest"; fi
+# the fast lane (ga-atsahv) promises NOTHING executable between its push-time confirmation and the push; the remerge confirmation therefore sits AHEAD of
+# it (the two never both act). gate-fastlane.selftest.sh pins the property too, but takes 20+ minutes — this is the quick guard for the region.
+LN_RMC_B=$(grep -n 'SELFTEST-EXTRACT remerge-push-confirm: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
+LN_RMC_E=$(grep -n 'SELFTEST-EXTRACT remerge-push-confirm: END' "$DISPATCHER" | head -1 | cut -d: -f1)
+LN_FLC_B=$(grep -n 'SELFTEST-EXTRACT fastlane-push-confirm: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
+LN_FLC_E=$(grep -n 'SELFTEST-EXTRACT fastlane-push-confirm: END' "$DISPATCHER" | head -1 | cut -d: -f1)
+LN_LATE=$(grep -n 'LIVE re-check #2 — AUTHORITATIVE' "$DISPATCHER" | head -1 | cut -d: -f1)
+LN_PUSH=$(grep -n -F 'git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH"' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$LN_LATE" ] && [ -n "$LN_RMC_B" ] && [ -n "$LN_RMC_E" ] && [ -n "$LN_FLC_B" ] && [ "$LN_LATE" -lt "$LN_RMC_B" ] && [ "$LN_RMC_E" -lt "$LN_FLC_B" ]; then
+  ok "order inside do_merge_ff: late bead re-check → remerge confirm → fast-lane confirm (the fast lane's stays last before the push)"
+else bad "confirm order is wrong: late=$LN_LATE remerge=$LN_RMC_B-$LN_RMC_E fastlane=$LN_FLC_B"; fi
+if [ -n "$LN_FLC_E" ] && [ -n "$LN_PUSH" ] && [ "$LN_FLC_E" -lt "$LN_PUSH" ]; then
+  GAPCODE=$(sed -n "$((LN_FLC_E+1)),$((LN_PUSH-1))p" "$DISPATCHER" | grep -v -E '^[[:space:]]*(#.*)?$' || true)
+  if [ -z "$GAPCODE" ]; then ok "nothing executable between the fast-lane confirmation and the FF push (the fast lane's own promise holds)"; else bad "executable code between the fast-lane confirmation and the push: $GAPCODE"; fi
+else bad "could not locate the fast-lane confirm END ($LN_FLC_E) and the FF push ($LN_PUSH)"; fi
+# consume-on-fail sits in the FAIL path, after the verdict is logged
+LN_CON=$(grep -n 'SELFTEST-EXTRACT remerge-consume-on-fail: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
+LN_FAILLOG=$(grep -n '^  log "Gate FAILED: \$FAIL_REASONS"' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$LN_CON" ] && [ -n "$LN_FAILLOG" ] && [ "$LN_FAILLOG" -lt "$LN_CON" ]; then ok "the consume block is in the FAIL path (after the FAIL is logged)"; else bad "consume placement: faillog=$LN_FAILLOG consume=$LN_CON"; fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

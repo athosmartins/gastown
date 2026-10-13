@@ -7311,11 +7311,19 @@ unset _GATE_TR_LIB
 # Same rules as the fast lane's lib above: its absence is NOT fatal (it only ever GRANTS — without it every claim takes the normal
 # gate, today's behavior), a syntax error in it must read as "no lib" and not kill this daemon, and the call site checks
 # `declare -F gate_remerge_decide` before calling. Needs gate-fastlane.lib.sh (classify_raw / run_tests) loaded first.
+# NOT silent, though: GATE_RM_LIB_WHY keeps the reason, and the claim-time block logs it and writes a gate_remerge event for every claim
+# that would have been looked at — a sweep that could not evaluate remerge must not read like one that found no approval.
 # SELFTEST-EXTRACT remerge-lib-load: BEGIN
+GATE_RM_LIB_WHY=""
 _GATE_RM_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-remerge.lib.sh" || true
-if [ -r "$_GATE_RM_LIB" ] && "${BASH:-/bin/bash}" -n "$_GATE_RM_LIB" 2>/dev/null; then
-  { source "$_GATE_RM_LIB" 2>/dev/null; } || true
+if [ ! -r "$_GATE_RM_LIB" ]; then
+  GATE_RM_LIB_WHY="gate-remerge.lib.sh is missing or unreadable"
+elif ! "${BASH:-/bin/bash}" -n "$_GATE_RM_LIB" 2>/dev/null; then
+  GATE_RM_LIB_WHY="gate-remerge.lib.sh has a syntax error"
+else
+  { source "$_GATE_RM_LIB" 2>/dev/null; } || GATE_RM_LIB_WHY="gate-remerge.lib.sh failed while loading"
 fi
+if ! declare -F gate_remerge_decide >/dev/null 2>&1; then GATE_RM_LIB_WHY="${GATE_RM_LIB_WHY:-gate-remerge.lib.sh did not define gate_remerge_decide}"; fi
 # SELFTEST-EXTRACT remerge-lib-load: END
 unset _GATE_RM_LIB
 
@@ -9230,6 +9238,26 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           ;;
       esac
 
+      # ── ga-mzw9dt: a remerge was granted for the content of an EARLIER approval — ask once more about the commit that lands ──
+      # Same reason as the fast lane's block below: with zero reviewers the claim-time decision is the only control, and the push sends
+      # $CUR_BRANCH, whatever origin/$BRANCH is NOW (branches do move mid-run). A clean yes needs this commit to land, on $CUR_MAIN,
+      # exactly what the approved commit lands. Anything else (tip moved, content changed, switch thrown, unreadable) does NOT push:
+      # failed_remerge_revoked, which gate_finalize_run turns into a re-queue to the normal gate and never into a FAIL.
+      # It sits AHEAD of the fast lane's confirmation on purpose: that one promises NOTHING executable between itself and the push
+      # (gate-fastlane.selftest.sh pins it). The two never both act — a remerge needs GATE_LANE != fast, and the fast lane's block is one
+      # `if` that does nothing for any other lane.
+      # SELFTEST-EXTRACT remerge-push-confirm: BEGIN
+      if [ "${GATE_REMERGE:-0}" = "1" ]; then
+        GATE_REMERGE_CONFIRM_CODE=""; GATE_REMERGE_CONFIRM_WHY=""   # a missing/erroring confirm must not be explained by a previous round's cause
+        if ! { declare -F gate_remerge_confirm >/dev/null 2>&1 && gate_remerge_confirm git_rig "$CUR_MAIN" "$CUR_BRANCH"; }; then
+          err "  Remerge revoked at the push (ga-mzw9dt, attempt $((MERGE_ATTEMPT+1))): ${GATE_REMERGE_CONFIRM_WHY:-the confirmation could not run (gate_remerge_confirm missing or errored)} [${GATE_REMERGE_CONFIRM_CODE:-unknown}] — NOT pushing $CUR_BRANCH; the marker goes back to the normal gate (a new review)."
+          GATE_REMERGE=0
+          MERGE_RESULT="failed_remerge_revoked"
+          return 1
+        fi
+      fi
+      # SELFTEST-EXTRACT remerge-push-confirm: END
+
       # ── ga-atsahv: the fast lane was granted for a DIFF — this is the last moment it can be asked about the commit that lands ──
       # The lane was decided minutes ago on $BRANCH_SHA; the push below sends $CUR_BRANCH, which is whatever origin/$BRANCH is NOW,
       # after the merge-time rebase and every git round-trip above (branches do move mid-run: see ga-l7mvtw). With zero
@@ -9250,23 +9278,6 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         fi
       fi
       # SELFTEST-EXTRACT fastlane-push-confirm: END
-
-      # ── ga-mzw9dt: a remerge was granted for the content of an EARLIER approval — ask once more about the commit that lands ──
-      # Same reason as the fast lane's block above: with zero reviewers the claim-time decision is the only control, and the push sends
-      # $CUR_BRANCH, whatever origin/$BRANCH is NOW (branches do move mid-run). A clean yes needs this commit to land, on $CUR_MAIN,
-      # exactly what the approved commit lands. Anything else (tip moved, content changed, switch thrown, unreadable) does NOT push:
-      # failed_remerge_revoked, which gate_finalize_run turns into a re-queue to the normal gate and never into a FAIL.
-      # SELFTEST-EXTRACT remerge-push-confirm: BEGIN
-      if [ "${GATE_REMERGE:-0}" = "1" ]; then
-        GATE_REMERGE_CONFIRM_CODE=""; GATE_REMERGE_CONFIRM_WHY=""   # a missing/erroring confirm must not be explained by a previous round's cause
-        if ! { declare -F gate_remerge_confirm >/dev/null 2>&1 && gate_remerge_confirm git_rig "$CUR_MAIN" "$CUR_BRANCH"; }; then
-          err "  Remerge revoked at the push (ga-mzw9dt, attempt $((MERGE_ATTEMPT+1))): ${GATE_REMERGE_CONFIRM_WHY:-the confirmation could not run (gate_remerge_confirm missing or errored)} [${GATE_REMERGE_CONFIRM_CODE:-unknown}] — NOT pushing $CUR_BRANCH; the marker goes back to the normal gate (a new review)."
-          GATE_REMERGE=0
-          MERGE_RESULT="failed_remerge_revoked"
-          return 1
-        fi
-      fi
-      # SELFTEST-EXTRACT remerge-push-confirm: END
 
       # FF push
       # ga-x4rbnt: the push's stderr is KEPT (it was `2>/dev/null`) so a refusal can be told from a lost race. A capture that cannot
@@ -9503,7 +9514,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       if [ "$GATE_RUN_ID" != "unknown" ]; then
         bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run ended without a verdict (fast lane revoked at the push, ga-atsahv): marker $MARKER_ID ${_RQ_NOTE}. NOT a FAIL." 2>/dev/null || true
         set_gate_status "$GATE_RUN_ID" "superseded"
-        bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — fast lane revoked at the push (ga-atsahv), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher." 2>/dev/null || true
+        bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — fast lane revoked at the push (ga-atsahv), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher." 2>/dev/null || true  # verdict-net-ok: a fast-lane run asks for ZERO reviewers, so it has no verdict beads to close
       fi
       return 0
     fi
@@ -9541,7 +9552,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       if [ "$GATE_RUN_ID" != "unknown" ]; then
         bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run ended without a verdict (remerge revoked at the push, ga-mzw9dt): marker $MARKER_ID ${_RQ_NOTE}. NOT a FAIL." 2>/dev/null || true
         set_gate_status "$GATE_RUN_ID" "superseded"
-        bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — remerge revoked at the push (ga-mzw9dt), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher." 2>/dev/null || true
+        bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — remerge revoked at the push (ga-mzw9dt), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher." 2>/dev/null || true  # verdict-net-ok: a remerge run asks for ZERO reviewers, so it has no verdict beads to close
       fi
       return 0
     fi
@@ -9606,11 +9617,14 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       case "$MERGE_RESULT" in
         failed_merge_time_conflict|failed_merge_time_rebase|failed_push_race|failed_push_hook_rejected)
           if [ "${REQUIRED_REVIEWERS:-0}" -ge 1 ] 2>/dev/null && [ "${GATE_LANE:-normal}" != "fast" ] && [ "${GATE_REMERGE:-0}" != "1" ] \
-             && [ -n "${BRANCH_SHA:-}" ] && [ -n "${BEAD_ID:-}" ] && declare -F gate_remerge_stamp >/dev/null 2>&1; then
-            if gate_remerge_stamp "$BEAD_CITY" "$BEAD_ID" "$BRANCH_SHA" "$(date +%s 2>/dev/null || true)" "$QG_LOG"; then
-              log "ga-mzw9dt: approval of ${BRANCH_SHA:0:12} stamped on $BEAD_ID (gate-approved) — a resubmission of the same content skips the review."
+             && [ -n "${BRANCH_SHA:-}" ] && [ -n "${BEAD_ID:-}" ]; then
+            if ! declare -F gate_remerge_stamp >/dev/null 2>&1; then
+              # not silent: the reviewers approved this commit and nothing recorded it — the next claim cannot know
+              warn "ga-mzw9dt: the remerge lib is not loaded (${GATE_RM_LIB_WHY:-gate_remerge_stamp is not defined}) — the approval of ${BRANCH_SHA:0:12} on $BEAD_ID was NOT recorded; the resubmission will be an ordinary review."
+            elif gate_remerge_stamp "$BEAD_CITY" "$BEAD_ID" "$BRANCH_SHA" "$(date +%s 2>/dev/null || true)" "$QG_LOG"; then
+              log "ga-mzw9dt: approval of ${BRANCH_SHA:0:12} stamped on $BEAD_ID (gate-approved) — a resubmission of the same content may skip the review."
               FAIL_REASONS="${FAIL_REASONS}
-The reviewers APPROVED commit ${BRANCH_SHA:0:12} — only the merge failed — and that approval is recorded on this bead (ga-mzw9dt). Re-submit the SAME content, or a clean rebase of it onto $DEFAULT_BRANCH, and it is merged WITHOUT a new review (remerge sem nova revisão). Anything you change — including a conflict you resolve by hand — is new content and gets the normal review."
+The reviewers APPROVED commit ${BRANCH_SHA:0:12} — only the merge failed — and that approval is recorded on this bead (ga-mzw9dt). Re-submit the SAME content, or a clean rebase of it onto $DEFAULT_BRANCH, and the dispatcher checks at the next claim whether it can merge WITHOUT a new review (remerge sem nova revisão): it lands exactly what was approved on today's $DEFAULT_BRANCH, the directed tests pass, and the approval has not expired. If any of that does not hold — a conflict that is still there, a tip that changed — the normal review applies. Anything you change, including a conflict you resolve by hand, is new content and gets the normal review."
             else
               warn "ga-mzw9dt: could not stamp (and read back) the approval of ${BRANCH_SHA:0:12} on $BEAD_ID — the resubmission will be an ordinary review."
             fi
@@ -10822,6 +10836,18 @@ else
   # was FAIL from before this function's outer merge-attempt check — see the
   # long comment at the newly-inserted `fi` above this if for the full story.
   log "Gate FAILED: $FAIL_REASONS"
+
+  # ── ga-mzw9dt: a reviewer FAIL ends any earlier approval of this bead's content ───────────────────────────────────
+  # An approval stamped by an earlier run (reviewers all PASSED, merge failed) stays on the bead for its TTL. This run's reviewers FAILED a
+  # diff that contained that content: if the author drops what they objected to and sends the approved commit back rebased, decide would
+  # grant it with no review although a later review rejected a diff containing it. So a reviewer FAIL takes the approval off. Only a REAL
+  # reviewer FAIL (ANY_FAIL=1): a merge failure degraded to FAIL after an all-PASS verdict has ANY_FAIL=0 and is what WRITES the approval.
+  # SELFTEST-EXTRACT remerge-consume-on-fail: BEGIN
+  if [ "${ANY_FAIL:-0}" = "1" ] && [ -n "${BEAD_ID:-}" ] && declare -F gate_remerge_consume >/dev/null 2>&1; then
+    gate_remerge_consume "$BEAD_CITY" "$BEAD_ID" \
+      || warn "ga-mzw9dt: could not take the gate-approved label(s) off $BEAD_ID after a reviewer FAIL (or could not read its labels) — an earlier approval may still stand, and a resubmission of that earlier commit could skip a review that a later reviewer rejected."
+  fi
+  # SELFTEST-EXTRACT remerge-consume-on-fail: END
 
   # ga-aijm2v.5 wiring[reset]: per-run state for the deferred-Mayor-page logic (rule 3).
   # gate_finalize_run is invoked once per marker from Phase C's loop in the SAME process, so
@@ -18412,36 +18438,55 @@ fi
 # tip lands on today's main exactly what that commit lands (git merge-tree, same tree). If so, and the directed tests still pass, the run asks
 # for ZERO reviewers and goes through the same gate_finalize_run, with do_merge_ff asking again right before the push. Like the fast lane it
 # only GRANTS, never a verdict: no approval, an unreadable one, a changed tree, a real conflict, a failing test, the kill switch
-# (.gc/gate-remerge.off) all mean the normal gate, i.e. today's behavior. Every claim that carried an approval is counted in the jsonl.
+# (.gc/gate-remerge.off) all mean the normal gate, i.e. today's behavior. Every claim that carried an approval — and every eligible claim
+# the lib was not there to look at (code lib-not-loaded) — is counted in the jsonl.
 GATE_REMERGE=0; GATE_REMERGE_CODE=""; GATE_REMERGE_WHY=""; GATE_REMERGE_SHA=""; GATE_REMERGE_LABEL=""; GATE_REMERGE_AGE_S=""
 GATE_REMERGE_CONFIRM_CODE=""; GATE_REMERGE_CONFIRM_WHY=""   # nothing from an earlier round of this process may be read as this round's
 GATE_REMERGE_WOULD_REVIEWERS="$REQUIRED_REVIEWERS"
 # SELFTEST-EXTRACT remerge-decide: BEGIN
-if [ "$GATE_LANE" != "fast" ] && [ "${REQUIRED_REVIEWERS:-0}" -ge 1 ] 2>/dev/null && [ -n "${BEAD_ID:-}" ] \
-   && declare -F gate_remerge_decide >/dev/null 2>&1; then
-  # a fresh read, not the cache shim: "?" is what a read that failed looks like to the decision (could not tell -> normal gate)
-  _RM_LABELS="?"
-  _RM_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null | jq -er 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null) || _RM_LABELS="?"
-  _RM_RC=0
-  gate_remerge_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$_RM_LABELS" "$(date +%s 2>/dev/null || true)" "$QG_LOG" || _RM_RC=$?
-  if [ "$_RM_RC" != "0" ]; then
-    # fail closed: a decision that errored is not a decision, whatever it had already written
-    GATE_REMERGE=0; GATE_REMERGE_CODE="decision-errored"; GATE_REMERGE_WHY="remerge decision errored (rc=$_RM_RC) — normal gate"
-  fi
-  # Anything that is not exactly 1 is 0 — a lib bug must not be able to produce a third state.
-  case "${GATE_REMERGE:-0}" in 1) ;; *) GATE_REMERGE=0 ;; esac
-  if [ "$GATE_REMERGE" = "1" ]; then
-    TIER="REMERGE"
-    REQUIRED_REVIEWERS=0
+if [ "$GATE_LANE" != "fast" ] && [ "${REQUIRED_REVIEWERS:-0}" -ge 1 ] 2>/dev/null && [ -n "${BEAD_ID:-}" ]; then
+  if declare -F gate_remerge_decide >/dev/null 2>&1; then
+    # a fresh read, not the cache shim: "?" is what a read that failed looks like to the decision (could not tell -> normal gate)
+    _RM_LABELS="?"
+    _RM_LABELS=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null | jq -er 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null) || _RM_LABELS="?"
+    _RM_RC=0
+    gate_remerge_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$_RM_LABELS" "$(date +%s 2>/dev/null || true)" "$QG_LOG" || _RM_RC=$?
+    if [ "$_RM_RC" != "0" ]; then
+      # fail closed: a decision that errored is not a decision, whatever it had already written
+      GATE_REMERGE=0; GATE_REMERGE_CODE="decision-errored"; GATE_REMERGE_WHY="remerge decision errored (rc=$_RM_RC) — normal gate"
+    fi
+    # Anything that is not exactly 1 is 0 — a lib bug must not be able to produce a third state.
+    case "${GATE_REMERGE:-0}" in 1) ;; *) GATE_REMERGE=0 ;; esac
+    if [ "$GATE_REMERGE" = "1" ]; then
+      TIER="REMERGE"
+      REQUIRED_REVIEWERS=0
+    fi
+  else
+    # The lib did not load. That is NOT "this bead carries no approval": say so (the line below, and a gate_remerge event), the way the
+    # fast lane does for a missing gate-fastlane.lib.sh. The run takes the normal gate — today's behavior.
+    GATE_REMERGE=0; GATE_REMERGE_CODE="lib-not-loaded"
+    GATE_REMERGE_WHY="remerge lib not loaded (${GATE_RM_LIB_WHY:-gate_remerge_decide is not defined}) — normal gate"
   fi
 fi
 # SELFTEST-EXTRACT remerge-decide: END
 # SELFTEST-EXTRACT remerge-record: BEGIN
 if [ -n "${GATE_REMERGE_CODE:-}" ] && [ "$GATE_REMERGE_CODE" != "no-approval" ]; then
   log "Remerge (ga-mzw9dt): ${GATE_REMERGE_CODE} — ${GATE_REMERGE_WHY:-no reason recorded}"
+  if [ "$GATE_REMERGE" = "1" ]; then _RM_DEC="granted"; else _RM_DEC="declined"; fi
   if declare -F gate_remerge_record >/dev/null 2>&1; then
-    if [ "$GATE_REMERGE" = "1" ]; then _RM_DEC="granted"; else _RM_DEC="declined"; fi
     gate_remerge_record "$GC_CITY" "$MARKER_ID" "$BEAD_ID" "$BRANCH" "${RIG:-unknown}" "$QG_LOG" "$GATE_REMERGE_WOULD_REVIEWERS" "$_RM_DEC" "$BRANCH_SHA" || true
+  else
+    # The recorder lives in the lib that did not load — and a period with a broken lib is exactly what the count must be able to see.
+    # Without this event those claims are simply absent from it. Same fields as gate_remerge_record's event; a reviewer count that is
+    # not a number is null (UNKNOWN), never a measured 0 (--argjson dies on non-numeric).
+    _RM_WOULD="${GATE_REMERGE_WOULD_REVIEWERS:-}"; case "$_RM_WOULD" in ''|*[!0-9]*) _RM_WOULD=null ;; esac
+    jq -c -n \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg decision "$_RM_DEC" --arg code "$GATE_REMERGE_CODE" --arg reason "${GATE_REMERGE_WHY:-}" \
+      --arg branch "${BRANCH:-}" --arg bead "${BEAD_ID:-}" --arg rig "${RIG:-unknown}" --arg marker "${MARKER_ID:-}" \
+      --arg head "${BRANCH_SHA:-}" --arg dry_run "${DRY_RUN:-0}" --argjson would "$_RM_WOULD" \
+      '{ts: $ts, event: "gate_remerge", decision: $decision, code: $code, reason: $reason, branch: $branch, bead: $bead, rig: $rig,
+        marker: $marker, approved_sha: "", head_sha: $head, approved_age_s: null, would_have_reviewers: $would, dry_run: $dry_run}' \
+      >> "${QG_LOG:-/dev/null}" 2>/dev/null || true
   fi
 fi
 # SELFTEST-EXTRACT remerge-record: END

@@ -298,6 +298,25 @@ gate_remerge_unstamp() {
   return 0
 }
 
+# gate_remerge_consume <city> <bead> — takes EVERY approval label off the bead. Used when a LATER run's reviewers FAIL: that review judged a
+# diff containing the approved content, so the earlier approval no longer stands — without this, an author who drops what the reviewers
+# rejected and sends the approved commit back rebased would be granted a remerge with no review, over a later review that rejected a diff
+# containing it. Reads the labels back; returns 0 iff no approval label is left, 1 when one is left or the labels cannot be read ("could not
+# tell" is not "gone"). The caller says so when it returns 1: a label that stays leaves the earlier approval standing.
+gate_remerge_consume() {
+  local city="$1" bead="$2" labels="" left="" w
+  [ -n "$city" ] && [ -n "$bead" ] || return 1
+  labels=$(bd -C "$city" show "$bead" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null) || return 1
+  for w in $labels; do
+    case "$w" in "$GATE_REMERGE_LABEL_PREFIX"*) bd -C "$city" label remove "$bead" "$w" -q >/dev/null 2>&1 || true ;; esac
+  done
+  left=$(bd -C "$city" show "$bead" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null) || return 1
+  for w in $left; do
+    case "$w" in "$GATE_REMERGE_LABEL_PREFIX"*) return 1 ;; esac
+  done
+  return 0
+}
+
 # gate_remerge_record <city> <marker> <bead> <branch> <rig> <qg_log> <would_have_reviewers> <decision> [head_sha] — decision is granted | declined |
 # revoked (granted, then withdrawn at the push). Observability only: a failed write is said on stderr and never changes the decision.
 # Writes the marker's metadata (gate.remerge, gate.remerge_reason) and appends one `gate_remerge` event (decision, code, approved and claimed
