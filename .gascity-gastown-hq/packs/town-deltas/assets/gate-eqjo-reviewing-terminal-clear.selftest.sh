@@ -165,11 +165,13 @@ echo "── 4. Regression guard: pre-existing wa-qq33j clear sites are untouche
 # wear a pool-probe veto while it waits for the normal gate) — 17 wa-qq33j-tagged
 # (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1
 # ga-hwzzou + 1 ga-3bp42c + 1 ga-wye9vt + 1 ga-atsahv) + 2 ga-n2cpe-tagged = 19.
+# ga-mzw9dt (2026-10-12) added a 20th site: a remerge REVOKED at the push (SELFTEST-EXTRACT remerge-revoked), same shape as the
+# fast lane's branch above (nothing pushed, marker re-queued, so it clears gate:reviewing too, tagged wa-qq33j): 18 + 2 ga-n2cpe = 20.
 TOTAL_CLEARS=$(grep -cF "$CLEAR_NEEDLE" "$DISPATCHER")
-if [ "$TOTAL_CLEARS" = "19" ]; then
-  ok "total gate:reviewing clear call sites = 19 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 1 ga-wye9vt + 1 ga-atsahv + 2 ga-n2cpe) — got $TOTAL_CLEARS"
+if [ "$TOTAL_CLEARS" = "20" ]; then
+  ok "total gate:reviewing clear call sites = 20 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 1 ga-wye9vt + 1 ga-atsahv + 1 ga-mzw9dt + 2 ga-n2cpe) — got $TOTAL_CLEARS"
 else
-  bad "expected 19 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 1 ga-wye9vt + 1 ga-atsahv + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
+  bad "expected 20 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 1 ga-wye9vt + 1 ga-atsahv + 1 ga-mzw9dt + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
 fi
 
 echo "── 5. MUTATION TEST: stripping the ga-n2cpe clears must flip sections 1-2 to RED ──"

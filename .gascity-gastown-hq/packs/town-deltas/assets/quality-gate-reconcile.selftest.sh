@@ -482,13 +482,14 @@ grep -q 'set_gate_status "$sibling_id" "superseded"' "$DISPATCHER" && ok "dispat
 # Section 3/4 above already drift-guard for the guard's Vector B and the
 # dispatcher's own sibling-supersede.
 echo "── 4b. drift-guard: dispatcher retires GATE_RUN_ID on quota-stop/dead-reviewer requeue (ga-fi1dh) ──"
-# 3 = the two infra requeue branches above + the fast lane's "revoked at the push" branch (ga-atsahv,
+# 3 (4 with the remerge, below) = the two infra requeue branches above + the fast lane's "revoked at the push" branch (ga-atsahv,
 # SELFTEST-EXTRACT fastlane-lane-revoked): it too re-queues the marker without a verdict, so it retires its
 # own gate-run the same way — otherwise Phase C's `-l gate-status:running` query would re-pick the run.
+# 4 = + the remerge's "revoked at the push" branch (ga-mzw9dt, SELFTEST-EXTRACT remerge-revoked): same shape, same reason.
 # It closes with its own wording (not "Closed by dispatcher (ga-fi1dh)"), so the close count below stays 2.
 # The two per-branch greps further down are what pin that each infra branch still has its own retirement.
-eq "dispatcher supersedes GATE_RUN_ID in each requeue branch (quota-stop + dead-reviewer + fast-lane revoked)" \
-   "$(grep -c 'set_gate_status "$GATE_RUN_ID" "superseded"' "$DISPATCHER")" "3"
+eq "dispatcher supersedes GATE_RUN_ID in each requeue branch (quota-stop + dead-reviewer + fast-lane revoked + remerge revoked)" \
+   "$(grep -c 'set_gate_status "$GATE_RUN_ID" "superseded"' "$DISPATCHER")" "4"
 eq "dispatcher closes GATE_RUN_ID in BOTH requeue branches (ga-fi1dh)" \
    "$(grep -c 'Closed by dispatcher (ga-fi1dh)' "$DISPATCHER")" "2"
 grep -q 'gate-run superseded (terminal) — infra re-queue (ga-eqjo)' "$DISPATCHER" \
