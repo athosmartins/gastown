@@ -7049,18 +7049,30 @@ gate_park_note_skipped() {
 #   GATE_CONFLICT_REPAIR_RESULT  opened | existing | fallback:<why>
 #   GATE_CONFLICT_REPAIR_BEAD    the repair bead id for opened/existing, else ""
 #     opened      a new repair bead was created — the caller must NOT mail the Mayor
-#     existing    a repair bead for this branch is still open — no duplicate is created, no mail
-#     fallback    no repair bead exists for this branch, so the caller keeps mailing the Mayor, exactly as
-#                 before this function: kill switch, branch name that cannot be a label, repair beads
-#                 unreadable, MAX_ATTEMPTS already spent on this branch, MAX_OPEN dogs already queued, the
-#                 branch carries a merge commit not on main (re-anchoring that is 'git merge', a Mayor
-#                 decision, ga-kyxih — the dog's runbook is a rebase), or the create failed. Doubt is NEVER read as "a dog is on it": silencing the Mayor is the
-#                 one outcome that cannot be undone, so every state this function cannot confirm falls
-#                 back to the mail (three-state read, error != empty, ga-p5q3 class).
-# Dedup is per BRANCH (labels conflict-repair-branch:<b>), not per marker: the dog's re-submission mints a
-# new marker, and the old one was the only thing the label could have been tied to. The attempt cap counts
-# CLOSED repair beads of the branch too, so a branch that keeps re-conflicting after repairs ends up on the
-# Mayor's desk instead of cycling through dogs forever.
+#     existing    a repair bead for this branch IN THIS REPO is still open — no duplicate is created, no mail.
+#                 This marker's id is added to that bead (conflict-repair-of:<marker>) so the watchdog, which
+#                 looks a bead up by MARKER, holds its own escalation for this marker too; if that write
+#                 fails the result is a fallback (we could not make the "a dog is on it" statement true).
+#     fallback    no repair bead is confirmed for this branch in this repo, so the caller keeps mailing the Mayor,
+#                 exactly as before this function: kill switch, branch name or marker id that cannot be a
+#                 label, repo path empty/"unknown" (the branch's identity cannot be confirmed), repair beads
+#                 unreadable, MAX_ATTEMPTS already spent on this branch in this repo, MAX_OPEN dogs already
+#                 queued, the branch carries a merge commit not on main (re-anchoring that is 'git merge', a
+#                 Mayor decision, ga-kyxih — the dog's runbook is a rebase), the marker could not be linked to
+#                 the existing bead, or the create could not be confirmed. Doubt is NEVER read as "a dog is on
+#                 it": silencing the Mayor is the one outcome that cannot be undone, so every state this
+#                 function cannot confirm falls back to the mail (three-state read, error != empty, ga-p5q3 class).
+# Dedup is per BRANCH + REPO (labels conflict-repair-branch:<b> AND conflict-repair-repo:<path>), not per marker: the
+# dog's re-submission mints a new marker, and the old one was the only thing a marker label could have been
+# tied to. A branch NAME is not an identity: this city already has one name in two repos (HQ marker ga-3uct94
+# and WA marker ga-z9npl3, both feat/ga-dxyvxr-quiet-hours-gate), so a bead opened for one repo must never be
+# read as "a dog is on it" for the other (same rule as ga-95tq3p / ga-tvpo6z: an identity we cannot confirm is NOT
+# a match). The attempt cap counts CLOSED repair beads of the branch in that repo too, so a branch that keeps
+# re-conflicting after repairs ends up on the Mayor's desk instead of cycling through dogs forever; the open cap
+# (MAX_OPEN) is deliberately city-wide — it bounds how many dogs this path may occupy, whatever the repo.
+# The repo is the path the caller resolved for the marker's rig (RIG_PATH), compared as text: two rigs that point into
+# ONE git repo count as two repos here. That errs toward a second bead for a branch (capped by MAX_OPEN, and the
+# dog's force-with-lease push fails safe), never toward calling another repo's bead "ours".
 GATE_CONFLICT_REPAIR_ENABLED="${GATE_CONFLICT_REPAIR_ENABLED:-1}"
 GATE_CONFLICT_REPAIR_MAX_ATTEMPTS="${GATE_CONFLICT_REPAIR_MAX_ATTEMPTS:-3}"
 GATE_CONFLICT_REPAIR_MAX_OPEN="${GATE_CONFLICT_REPAIR_MAX_OPEN:-3}"
@@ -7069,7 +7081,7 @@ GATE_CONFLICT_REPAIR_RESULT=""
 GATE_CONFLICT_REPAIR_BEAD=""
 gate_open_conflict_repair_bead() {
   local _marker="${1:-}" _branch="${2:-}" _bead="${3:-}" _rig="${4:-}" _repo="${5:-}" _files="${6:-}"
-  local _sha="${7:-}" _trace="${8:-}" _main="${9:-main}" _mir="${10:-0}" _json _here _open_here _all_here _open_all _desc _new _n
+  local _sha="${7:-}" _trace="${8:-}" _main="${9:-main}" _mir="${10:-0}" _json _here _open_here _all_here _open_all _desc _new _n _linked
   GATE_CONFLICT_REPAIR_RESULT=""
   GATE_CONFLICT_REPAIR_BEAD=""
   if [ "$GATE_CONFLICT_REPAIR_ENABLED" = "0" ]; then
@@ -7077,6 +7089,15 @@ gate_open_conflict_repair_bead() {
   fi
   case "$_branch" in
     ""|*,*|*[[:space:]]*) GATE_CONFLICT_REPAIR_RESULT="fallback:branch-not-label-safe"; return 0 ;;
+  esac
+  case "$_marker" in
+    ""|*,*|*[[:space:]]*) GATE_CONFLICT_REPAIR_RESULT="fallback:marker-not-label-safe"; return 0 ;;
+  esac
+  # The repo is half of the identity (a branch NAME recurs across repos). Empty, the "unknown" sentinel or a value
+  # that cannot be a label is not a confirmed repo, so there is nothing to tell this branch from the same name
+  # elsewhere: no bead is looked up or opened, the Mayor is mailed.
+  case "$_repo" in
+    ""|unknown|*,*|*[[:space:]]*) GATE_CONFLICT_REPAIR_RESULT="fallback:repo-unconfirmed"; return 0 ;;
   esac
   if [ "$_mir" = "1" ]; then
     GATE_CONFLICT_REPAIR_RESULT="fallback:merge-commit-in-range"; return 0
@@ -7088,7 +7109,10 @@ gate_open_conflict_repair_bead() {
     warn "Repair beads for $_branch: could not read them (bd list returned nothing, non-JSON, or an error) — cannot tell whether a dog is already on it, so the Mayor is mailed (ga-buqnjc)."
     GATE_CONFLICT_REPAIR_RESULT="fallback:repair-beads-unreadable"; return 0
   fi
-  _here=$(printf '%s' "$_json" | jq -c --arg l "conflict-repair-branch:$_branch" '[.[] | select((.labels // []) | index($l))]' 2>/dev/null) || _here=""
+  # vazio → no bead of this branch+repo yet (_here=[], counts 0: a new one may open); falhou/ilegível → _here/counts come back
+  # empty or non-numeric and the loop below sends them to fallback:repair-beads-unreadable (the mail), never to "none"
+  _here=$(printf '%s' "$_json" | jq -c --arg b "conflict-repair-branch:$_branch" --arg r "conflict-repair-repo:$_repo" \
+            '[.[] | select((.labels // []) | (index($b) != null and index($r) != null))]' 2>/dev/null) || _here=""
   _open_here=$(printf '%s' "$_here" | jq -r '[.[] | select(.status != "closed")] | length' 2>/dev/null) || _open_here=""
   _all_here=$(printf '%s' "$_here" | jq -r 'length' 2>/dev/null) || _all_here=""
   _open_all=$(printf '%s' "$_json" | jq -r '[.[] | select(.status != "closed")] | length' 2>/dev/null) || _open_all=""
@@ -7096,7 +7120,23 @@ gate_open_conflict_repair_bead() {
     case "$_n" in ""|*[!0-9]*) GATE_CONFLICT_REPAIR_RESULT="fallback:repair-beads-unreadable"; return 0 ;; esac
   done
   if [ "$_open_here" -gt 0 ]; then
+    # vazio/falhou → an open bead whose id cannot be read back is not "a dog is on it": fallback:repair-beads-unreadable
     GATE_CONFLICT_REPAIR_BEAD=$(printf '%s' "$_here" | jq -r '[.[] | select(.status != "closed")][0].id // empty' 2>/dev/null) || GATE_CONFLICT_REPAIR_BEAD=""
+    case "$GATE_CONFLICT_REPAIR_BEAD" in
+      ""|*[!A-Za-z0-9._-]*) GATE_CONFLICT_REPAIR_BEAD=""; GATE_CONFLICT_REPAIR_RESULT="fallback:repair-beads-unreadable"; return 0 ;;
+    esac
+    # The watchdog (FIX 9) finds the bead of a marker by conflict-repair-of:<marker>, so this marker must be on it.
+    # vazio → not linked yet (link it); falhou/ilegível → "" counts as not linked and the add below is tried (a failed
+    # check can only cause one redundant add, never skip a needed one; if bd refuses the redundant add the result is the
+    # mail, the visible side); a failed add → fallback:marker-link-failed (the mail).
+    _linked=$(printf '%s' "$_here" | jq -r --arg id "$GATE_CONFLICT_REPAIR_BEAD" --arg l "conflict-repair-of:$_marker" \
+                '[.[] | select(.id == $id) | select((.labels // []) | index($l) != null)] | length' 2>/dev/null) || _linked=""
+    if [ "$_linked" != "1" ]; then
+      if ! bd -C "$GC_CITY" label add "$GATE_CONFLICT_REPAIR_BEAD" "conflict-repair-of:$_marker" -q >/dev/null 2>&1; then
+        warn "Repair bead $GATE_CONFLICT_REPAIR_BEAD for $_branch is open, but linking marker $_marker to it failed — the watchdog could not tell it is on this marker, so the Mayor is mailed (ga-buqnjc)."
+        GATE_CONFLICT_REPAIR_BEAD=""; GATE_CONFLICT_REPAIR_RESULT="fallback:marker-link-failed"; return 0
+      fi
+    fi
     GATE_CONFLICT_REPAIR_RESULT="existing"; return 0
   fi
   if [ "$_all_here" -ge "$GATE_CONFLICT_REPAIR_MAX_ATTEMPTS" ]; then
@@ -7132,16 +7172,20 @@ PASSOS (verifique entre eles):
 4. Rode os testes dos arquivos tocados: /bin/bash -n em cada .sh e o *.selftest.sh dele; python3 -m py_compile e os testes de cada .py; só-doc: confira que os comandos e links citados seguem coerentes.
 5. Publique: git push --force-with-lease=$_branch:<sha anotado> origin HEAD:$_branch (o autor está morto; ninguém mais empurra neste branch). Confirme com git ls-remote que origin/$_branch é o seu HEAD.
 6. RE-ENFILEIRE como marker NOVO (não mexa no antigo): siga docs/gate-marker-recipe.md — copie branch/bead_id/author/rig/bead_rig da descrição do marker $_marker (bd -C <cidade> show $_marker), troque só base_commit (merge-base FRESCO de origin/$_main e origin/$_branch) e submitted_at. O guard supersede o marker antigo sozinho (Step 4b). Não mexa nos labels do bead de origem.
-7. Feche este bead: gc bd close <este-bead> --reason \"rebaseado sobre origin/$_main, testes ok, re-enfileirado como <marker novo>\". Depois: gc runtime drain-ack && exit.
+7. Limpe o que criou (sem rm -rf): git -C <repo> worktree remove --force <dir-scratch> e git -C <repo> branch -D repair/<id-deste-bead>. Vale também no caminho ESCALAR.
+8. Feche este bead: gc bd close <este-bead> --reason \"rebaseado sobre origin/$_main, testes ok, re-enfileirado como <marker novo>\". Depois: gc runtime drain-ack && exit.
 
-ESCALAR — conflito de lógica sem resolução segura, teste quebrado depois do rebase, push recusado: NÃO force nada. Mande mail ao Mayor com o diagnóstico (arquivos, trechos em conflito, o que você tentou) e feche este bead com --reason dizendo por quê. O marker continua em needs-rebase e o gate-recovery-watchdog volta a avisar o Mayor depois do prazo."
+ESCALAR — conflito de lógica sem resolução segura, teste quebrado depois do rebase, push recusado: NÃO force nada. Mande mail ao Mayor com o diagnóstico (arquivos, trechos em conflito, o que você tentou), faça a limpeza do passo 7 e feche este bead com --reason dizendo por quê. O marker continua em needs-rebase e o gate-recovery-watchdog volta a avisar o Mayor depois do prazo."
   _new=$(bd -C "$GC_CITY" create "gate-conflict-repair: $_branch" -t task -p 2 \
-          -l "$GATE_CONFLICT_REPAIR_LABEL" -l "conflict-repair-of:$_marker" -l "conflict-repair-branch:$_branch" \
+          -l "$GATE_CONFLICT_REPAIR_LABEL" -l "conflict-repair-of:$_marker" -l "conflict-repair-branch:$_branch" -l "conflict-repair-repo:$_repo" \
           -d "$_desc" --metadata '{"gc.routed_to":"gastown.dog"}' --silent 2>/dev/null) || _new=""
   case "$_new" in
     ""|*[!A-Za-z0-9._-]*)
-      warn "Repair bead for $_branch: bd create failed or printed something that is not a bead id ([${_new:-empty}]) — the Mayor is mailed instead (ga-buqnjc)."
-      GATE_CONFLICT_REPAIR_RESULT="fallback:create-failed"; return 0 ;;
+      # not "create failed": a create that committed and then died before printing its id looks the same from here, so
+      # a bead may exist, and any later lookup by its labels (this helper's, or the watchdog's by marker) will find it.
+      # Say "unconfirmed", and let the mail say it too.
+      warn "Repair bead for $_branch: could not CONFIRM that bd create opened one (it failed or printed something that is not a bead id: [${_new:-empty}]) — the Mayor is mailed instead, and a bead may still exist (ga-buqnjc)."
+      GATE_CONFLICT_REPAIR_RESULT="fallback:create-unconfirmed"; return 0 ;;
   esac
   GATE_CONFLICT_REPAIR_BEAD="$_new"
   GATE_CONFLICT_REPAIR_RESULT="opened"
@@ -17879,7 +17923,7 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
             _REPAIR_TAIL="Repair bead ${GATE_CONFLICT_REPAIR_BEAD:-?} ($GATE_CONFLICT_REPAIR_RESULT) routed to the dog pool (ga-buqnjc): it rebases onto $DEFAULT_BRANCH keeping the behaviour of both sides, runs the tests of the touched files and re-submits the branch as a fresh marker. The Mayor is NOT mailed; a logic conflict the dog cannot merge safely comes back to the Mayor from the dog."
             ;;
           *)
-            _REPAIR_TAIL="No repair bead (${GATE_CONFLICT_REPAIR_RESULT:-unknown}) — escalated to the Mayor by mail. $_REBASE_REANCHOR_ADVICE"
+            _REPAIR_TAIL="No repair bead confirmed (${GATE_CONFLICT_REPAIR_RESULT:-unknown}) — escalated to the Mayor by mail. $_REBASE_REANCHOR_ADVICE"
             ;;
         esac
         bd -C "$GC_CITY" comment "$MARKER_ID" "Gate SKIPPED + ESCALATED (ga-q3ig2): branch $BRANCH has a genuine, deterministic merge conflict (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) and no live author session exists (ga-it1of liveness check: ${REBASE_LIVENESS_TRACE:-none}). A server-side rebase retry would fail identically, so the marker is parked at needs-rebase immediately (NOT re-queued) — it no longer blocks the queue. $_REPAIR_TAIL" 2>/dev/null || true
@@ -17895,7 +17939,7 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           *)
             gc --city "$GC_CITY" mail send mayor \
               -s "Gate escalation: $BRANCH genuine conflict (no live author)" \
-              -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) has a genuine, deterministic conflict vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). Conflicting: ${CONFLICT_FILES:-unknown}. Author session is gone — gate cannot self-heal, and a rebase retry would fail identically. Liveness candidates checked (ga-it1of): ${REBASE_LIVENESS_TRACE:-none}. Parked at needs-rebase (not blocking the queue). No repair bead was opened for the dog pool (${GATE_CONFLICT_REPAIR_RESULT:-unknown}, ga-buqnjc) — needs a manual re-anchor/rebuild or a decision." 2>/dev/null \
+              -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) has a genuine, deterministic conflict vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). Conflicting: ${CONFLICT_FILES:-unknown}. Author session is gone — gate cannot self-heal, and a rebase retry would fail identically. Liveness candidates checked (ga-it1of): ${REBASE_LIVENESS_TRACE:-none}. Parked at needs-rebase (not blocking the queue). No repair bead is CONFIRMED for the dog pool (${GATE_CONFLICT_REPAIR_RESULT:-unknown}, ga-buqnjc); when the reason is create-unconfirmed one may still exist, so look before rebasing by hand: bd list --all -l gate-conflict-repair -l conflict-repair-branch:$BRANCH. Otherwise this needs a manual re-anchor/rebuild or a decision." 2>/dev/null \
               || warn "Could not mail Mayor for gate escalation on $BRANCH"
             ;;
         esac

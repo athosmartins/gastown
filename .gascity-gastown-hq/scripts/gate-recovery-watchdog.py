@@ -360,9 +360,11 @@ GRW_RECOVER_NEEDS_REBASE_ENABLED = os.environ.get("GRW_RECOVER_NEEDS_REBASE_ENAB
 NEEDS_REBASE_AGE_MINUTES = int(os.environ.get("GRW_NEEDS_REBASE_AGE_MINUTES", "15"))    # a marker must sit needs-rebase >this before the FIRST escalation — mirrors FIX2/FIX7's young-skip window (gives an already-in-progress manual fix time to land first). Deliberately short: the measured failure mode is SILENCE OVER DAYS, not noise over minutes — see NEEDS_REBASE_ALERT_COOLDOWN_SEC for the much longer re-escalation spacing.
 NEEDS_REBASE_MAX_PER_SWEEP = int(os.environ.get("GRW_NEEDS_REBASE_MAX_PER_SWEEP", "5"))
 # ga-buqnjc: on a dead-author genuine conflict the DISPATCHER no longer mails the Mayor — it opens a repair bead for the dog pool
-# (label gate-conflict-repair + conflict-repair-branch:<branch>; quality-gate-dispatcher.sh gate_open_conflict_repair_bead). FIX 9 would
-# re-mail the Mayor ~15min later for the very same marker, so while such a bead is OPEN and younger than this grace it holds its own
-# escalation; an older one means the dog is stuck or gone, and FIX 9 escalates exactly as before. Unreadable repair beads never hold it.
+# (label gate-conflict-repair + conflict-repair-of:<marker> + conflict-repair-branch:<branch> + conflict-repair-repo:<path>;
+# quality-gate-dispatcher.sh gate_open_conflict_repair_bead). FIX 9 would re-mail the Mayor ~15min later for the very same marker, so
+# while a bead OF THAT MARKER is OPEN and younger than this grace it holds its own escalation; an older one means the dog is stuck or
+# gone, and FIX 9 escalates exactly as before. Unreadable repair beads never hold it. The bead is found by MARKER id, not by branch name
+# (a branch name recurs across repos; conflict_repair_state explains why).
 NEEDS_REBASE_REPAIR_GRACE_MINUTES = int(os.environ.get("GRW_NEEDS_REBASE_REPAIR_GRACE_MINUTES", "180"))
 CONFLICT_REPAIR_LABEL = "gate-conflict-repair"
 NEEDS_REBASE_ALERT_COOLDOWN_SEC = int(os.environ.get("GRW_NEEDS_REBASE_ALERT_COOLDOWN_SEC", "21600"))  # 6h — mirrors gate-merge-survival-sweep.sh's ALERT_COOLDOWN for the same "keep reminding about a stuck condition that needs a human DECISION, not a fix-attempt" shape; a 2h default (WAKE_BACKOFF_MAX_SEC) would re-page too often for a marker whose own text says "Needs re-anchor/rebuild or a Mayor decision" — this is not urgent-minute-by-minute, it is P3-with-a-known-workaround (the Mayor's own framing on wa-juety)
@@ -4604,19 +4606,27 @@ def _open_needs_rebase_markers():
         return None
 
 
-def conflict_repair_state(branch, now):
-    """(state, bead_id) of the dog-pool repair bead for BRANCH (ga-buqnjc). Three states, never two:
-      'open'    — a NOT-closed bead labelled gate-conflict-repair + conflict-repair-branch:<branch>
+def conflict_repair_state(marker_id, now):
+    """(state, bead_id) of the dog-pool repair bead for the MARKER marker_id (ga-buqnjc). Three states, never two:
+      'open'    — a NOT-closed bead labelled gate-conflict-repair + conflict-repair-of:<marker_id>
                   exists and is younger than NEEDS_REBASE_REPAIR_GRACE_MINUTES
       'stale'   — one exists but is older: the dog is stuck or gone, nobody is on it
-      'none'    — the list was READ and nothing for this branch is open
+      'none'    — the list was READ and nothing for this marker is open
       'unknown' — the list could not be read (bd failed / printed non-JSON), or an open bead has no
                   parsable created_at so its age cannot be bounded
+    Keyed on the MARKER, never on the branch name: a branch NAME recurs across repos in this city (HQ marker
+    ga-3uct94 and WA marker ga-z9npl3 are both feat/ga-dxyvxr-quiet-hours-gate), so a bead opened for another
+    repo's marker must not read as "a dog is on it" here, whereas a marker id cannot collide. The dispatcher
+    writes conflict-repair-of:<marker> when it opens the bead and adds it again when it reuses an open bead for
+    a second marker of the same branch+repo (gate_open_conflict_repair_bead). That also means this side needs
+    no rig lookup at all — the rig value the dispatcher canonicalises never has to be re-derived here.
     Only 'open' holds the escalation (needs_rebase_verdict); 'unknown' takes the same side as 'none'
     on purpose — FIX 9 fails toward visibility. Reads real bd, not the list cache: a stale cached
     'open' would silence a Mayor escalation for as long as the cache lives."""
-    if not branch:
+    if not marker_id:
         return ("none", "")
+    # vazio → [] → 'none' (the list was read and nothing is open for this marker); falhou/ilegível → 'unknown' (never 'none',
+    # never 'open'); both land on "escalate" in needs_rebase_verdict, so a doubtful read can only cost a Mayor mail
     r = sh(["bd", "-C", CITY, "list", "--json", "--all", "--include-infra", "--limit", "0",
             "-l", CONFLICT_REPAIR_LABEL], timeout=25)
     if not r or r.returncode != 0:
@@ -4627,8 +4637,8 @@ def conflict_repair_state(branch, now):
         return ("unknown", "")
     if not isinstance(rows, list):
         return ("unknown", "")
-    want = "conflict-repair-branch:%s" % branch
-    youngest = None   # (age_sec, id) of the freshest open bead for the branch
+    want = "conflict-repair-of:%s" % marker_id
+    youngest = None   # (age_sec, id) of the freshest open bead for the marker
     for row in rows:
         if not isinstance(row, dict) or row.get("status") == "closed":
             continue
@@ -4679,8 +4689,8 @@ def needs_rebase_verdict(age_sec, threshold_sec, source_resolved, source_closed,
       skip:parked-needs-human — source already carries gate:needs-human; a
                             different mechanism (gate-needs-human-divergence-
                             sweep) owns escalation for that bead.
-      skip:repair-in-flight — repair_state == 'open' (ga-buqnjc): a repair bead for this
-                            branch is open and inside its grace window, so a dog is already
+      skip:repair-in-flight — repair_state == 'open' (ga-buqnjc): a repair bead OF THIS MARKER
+                            is open and inside its grace window, so a dog is already
                             rebasing it and the Mayor must not be asked for the same thing.
                             Checked AFTER the close verdicts (a landed branch still closes
                             the marker) and after needs-human. Any other repair_state —
@@ -4782,7 +4792,7 @@ def recover_needs_rebase_markers(now, rstate):
         repair_bead = ""
         repair_state = "none"
         if verdict == "escalate":   # ga-buqnjc: only now is it worth a bd read — is a dog already on it?
-            repair_state, repair_bead = conflict_repair_state(branch, now)
+            repair_state, repair_bead = conflict_repair_state(mid, now)   # by MARKER id: a branch name recurs across repos
             verdict = needs_rebase_verdict(age, NEEDS_REBASE_AGE_MINUTES * 60, resolved,
                                             sclosed, needs_human, branch_state, repair_state)
 
@@ -5919,9 +5929,10 @@ def _selftest():
     _CRS_NOW = 1_800_000_000.0
     def _crs_ts(ago_sec):
         return datetime.datetime.fromtimestamp(_CRS_NOW - ago_sec, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    def _crs_row(rid, branch, status="open", ago=600, created=None):
+    def _crs_row(rid, marker, status="open", ago=600, created=None, branch="fix/ga-1-x", repo="/repo/a"):
         return {"id": rid, "status": status, "created_at": (_crs_ts(ago) if created is None else created),
-                "labels": ["gate-conflict-repair", "conflict-repair-of:m-x", "conflict-repair-branch:%s" % branch]}
+                "labels": ["gate-conflict-repair", "conflict-repair-of:%s" % marker,
+                           "conflict-repair-branch:%s" % branch, "conflict-repair-repo:%s" % repo]}
     _crs_calls = []
     def _crs_sh(stdout="", rc=0, dead=False):
         def _fake(args, timeout=20, stdin=None):
@@ -5931,34 +5942,42 @@ def _selftest():
             return subprocess.CompletedProcess(args=args, returncode=rc, stdout=stdout)
         return _fake
     _CRS_BR = "fix/ga-1-x"
+    _CRS_MK = "m-nr1"
     _real_sh_crs = globals()["sh"]
     try:
         def _crs(rows=None, **kw):
             globals()["sh"] = _crs_sh(stdout=(json.dumps(rows) if rows is not None else kw.pop("stdout", "")), **kw)
-            return conflict_repair_state(_CRS_BR, _CRS_NOW)
-        ok(_crs([_crs_row("ga-rep1", _CRS_BR)]) == ("open", "ga-rep1"),
-           "ga-buqnjc conflict_repair_state: a fresh open repair bead for the branch → ('open', id)")
+            return conflict_repair_state(_CRS_MK, _CRS_NOW)
+        ok(_crs([_crs_row("ga-rep1", _CRS_MK)]) == ("open", "ga-rep1"),
+           "ga-buqnjc conflict_repair_state: a fresh open repair bead OF THE MARKER → ('open', id)")
         ok(any("list" in c and "gate-conflict-repair" in c for c in _crs_calls) and not any(c[0] == "bash" for c in _crs_calls),
            "ga-buqnjc conflict_repair_state: reads real bd (not the list cache) filtered on the gate-conflict-repair label")
-        ok(_crs([_crs_row("ga-rep1", _CRS_BR, status="closed")]) == ("none", ""),
+        ok(_crs([_crs_row("ga-rep1", _CRS_MK, status="closed")]) == ("none", ""),
            "ga-buqnjc conflict_repair_state: a CLOSED repair bead holds nothing → 'none'")
-        ok(_crs([_crs_row("ga-rep2", "fix/other")]) == ("none", ""),
-           "ga-buqnjc conflict_repair_state: another branch's open repair bead holds nothing → 'none'")
+        ok(_crs([_crs_row("ga-rep2", "m-other", branch="fix/other")]) == ("none", ""),
+           "ga-buqnjc conflict_repair_state: another marker's (and branch's) open repair bead holds nothing → 'none'")
+        # THE gate-fix 1 class (identity collapse): the SAME branch name under another repo's marker is not "a dog is on it" here.
+        ok(_crs([_crs_row("ga-repWA", "m-wa-marker", branch=_CRS_BR, repo="/repo/b")]) == ("none", ""),
+           "ga-buqnjc conflict_repair_state: SAME branch NAME but another repo's marker → 'none' (a bead found by branch name alone would read 'open' and silence the Mayor)")
+        ok(_crs([_crs_row("ga-repWA", "m-wa-marker", branch=_CRS_BR, repo="/repo/b"), _crs_row("ga-rep1", _CRS_MK)]) == ("open", "ga-rep1"),
+           "ga-buqnjc conflict_repair_state: the other repo's bead beside our own → OUR bead decides ('open', ours)")
+        ok(_crs([_crs_row("ga-rep1", _CRS_MK, branch="fix/x", repo="/repo/a")]) == ("open", "ga-rep1"),
+           "ga-buqnjc conflict_repair_state: a bead the dispatcher linked to this marker holds it (the 'existing' case: one bead, several markers)")
         ok(_crs([]) == ("none", ""), "ga-buqnjc conflict_repair_state: a read that found no repair bead at all → 'none'")
-        ok(_crs([_crs_row("ga-rep1", _CRS_BR, ago=(NEEDS_REBASE_REPAIR_GRACE_MINUTES + 1) * 60)]) == ("stale", "ga-rep1"),
+        ok(_crs([_crs_row("ga-rep1", _CRS_MK, ago=(NEEDS_REBASE_REPAIR_GRACE_MINUTES + 1) * 60)]) == ("stale", "ga-rep1"),
            "ga-buqnjc conflict_repair_state: open but past the grace → 'stale' (the dog is stuck; FIX 9 escalates again)")
-        ok(_crs([_crs_row("ga-old", _CRS_BR, ago=(NEEDS_REBASE_REPAIR_GRACE_MINUTES + 60) * 60), _crs_row("ga-new", _CRS_BR, ago=300)]) == ("open", "ga-new"),
+        ok(_crs([_crs_row("ga-old", _CRS_MK, ago=(NEEDS_REBASE_REPAIR_GRACE_MINUTES + 60) * 60), _crs_row("ga-new", _CRS_MK, ago=300)]) == ("open", "ga-new"),
            "ga-buqnjc conflict_repair_state: a stale bead plus a fresh one → the FRESH one decides ('open')")
         ok(_crs(rc=1, stdout="") == ("unknown", "") and _crs(dead=True) == ("unknown", ""),
            "ga-buqnjc conflict_repair_state: bd failed / sh() returned None → 'unknown' (error != empty)")
         ok(_crs(stdout="not json")[0] == "unknown" and _crs(stdout='{"error":"database is locked"}')[0] == "unknown" and _crs(stdout="")[0] == "unknown",
            "ga-buqnjc conflict_repair_state: non-JSON / error envelope / empty output → 'unknown', never read as 'none'")
-        ok(_crs([_crs_row("ga-rep1", _CRS_BR, created="garbage")])[0] == "unknown",
+        ok(_crs([_crs_row("ga-rep1", _CRS_MK, created="garbage")])[0] == "unknown",
            "ga-buqnjc conflict_repair_state: an open bead whose age cannot be parsed cannot be bounded → 'unknown'")
         _crs_calls.clear()
         globals()["sh"] = _crs_sh()
         ok(conflict_repair_state("", _CRS_NOW) == ("none", "") and not _crs_calls,
-           "ga-buqnjc conflict_repair_state: no branch → 'none' without touching bd")
+           "ga-buqnjc conflict_repair_state: no marker id → 'none' without touching bd")
     finally:
         globals()["sh"] = _real_sh_crs
     # the WIRING: drive recover_needs_rebase_markers itself, every collaborator stubbed, and count the mails
@@ -5971,8 +5990,8 @@ def _selftest():
         mk = {"id": "m-nr1", "created_at": _crs_ts(age_sec), "metadata": {},
               "labels": ["type:quality-gate-marker", "gate-status:needs-rebase", "branch:%s" % _CRS_BR,
                          "source-bead:ga-1", "bead-rig:gastown"]}
-        def _crs_stub(branch, now):
-            reads.append(branch)
+        def _crs_stub(marker_id, now):
+            reads.append(marker_id)
             return repair
         restore = _nr_patch(
             GRW_ENABLED=True, GRW_DRY_RUN=dry, GRW_RECOVER_NEEDS_REBASE_ENABLED=True,
@@ -5995,6 +6014,8 @@ def _selftest():
     _m, _n, _r, _out = _nr_run(("open", "ga-rep1"))
     ok(not _m and not _n and "ga-rep1" in _out and "Mayor escalation held" in _out,
        "ga-buqnjc WIRING: an open repair bead → NO Mayor mail and NO notify from FIX 9, and the log names the repair bead (out=%r)" % _out)
+    ok(_r == ["m-nr1"] and _r != [_CRS_BR],
+       "ga-buqnjc WIRING: FIX 9 looks the repair bead up by the MARKER id (m-nr1), not by the branch name %r — a branch name recurs across repos (reads=%r)" % (_CRS_BR, _r))
     _m, _n, _r, _out = _nr_run(("none", ""))
     ok(len(_m) == 1 and len(_n) == 1 and _m[0][0][-1] == "" if _m and _m[0][0] else False,
        "ga-buqnjc WIRING: no repair bead → FIX 9 escalates exactly as before (one mail, one notify, no repair note)")

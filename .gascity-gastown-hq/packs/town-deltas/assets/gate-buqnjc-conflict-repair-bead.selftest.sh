@@ -10,14 +10,20 @@
 # What this file locks:
 #   1. the helper, on its own, against a STATEFUL bd stub (state lives in files — `$(bd create ...)` runs the stub in
 #      a subshell, so a variable would be lost):
-#        * opens exactly one bead: routed gc.routed_to=gastown.dog, labelled for dedup (branch + marker), carrying the
-#          branch, the conflicting files, the marker and the rule "manter o comportamento dos DOIS lados"
-#        * no duplicates: an OPEN repair bead for the branch -> `existing`, nothing created
-#        * attempt cap: a branch that already spent MAX_ATTEMPTS repair beads (closed ones count) -> fallback
-#        * open cap: MAX_OPEN dogs already queued -> fallback
+#        * opens exactly one bead: routed gc.routed_to=gastown.dog, labelled for dedup (branch + repo + marker), carrying
+#          the branch, the conflicting files, the marker and the rule "manter o comportamento dos DOIS lados"
+#        * no duplicates: an OPEN repair bead for the branch IN THIS REPO -> `existing`, nothing created, and the new
+#          marker is linked to that bead (the watchdog finds a bead by marker)
+#        * IDENTITY (gate-fix 1): a branch NAME is not an identity — the same name in another repo is not "a dog is on it",
+#          for the open-bead lookup AND the attempt cap; a repo that is empty/"unknown" is never a match (-> the mail)
+#        * attempt cap: a branch that already spent MAX_ATTEMPTS repair beads in this repo (closed ones count) -> fallback
+#        * open cap: MAX_OPEN dogs already queued (city-wide, on purpose) -> fallback
 #        * every state it cannot confirm falls back to the MAIL, never to silence: list failed / non-JSON / error
-#          envelope / empty, create failed / empty / not a bead id, kill switch, merge-commit-in-range, a branch name
-#          that cannot be a label, a bad cap setting
+#          envelope / empty, create failed / empty / not a bead id (worded "unconfirmed": a bead may exist), the link
+#          to an existing bead failed, kill switch, merge-commit-in-range, a branch/marker that cannot be a label, a
+#          repo that cannot be confirmed, a bad cap setting
+#        * the bd stub models --all / -l / --limit (closed hidden without --all, -l ANDed, cut at 50 without --limit 0),
+#          and the source is drift-guarded on those three flags: dropping one is a failing test, not a silent pass
 #        * returns 0 under `set -eu` in every one of those, and tolerates missing arguments
 #   2. the dead-conflict park block extracted from the LIVE dispatcher (sentinel ga-8dehbc-park-dead-conflict):
 #        * repair bead opened/existing -> NO mail to the Mayor; marker comment names the bead; source bead still
@@ -60,12 +66,12 @@ extract_block() {
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/buqnjc.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 ROWS="$WORK/rows.json"; CREATES="$WORK/creates"; BDLOG="$WORK/bd.log"; COMMENTS="$WORK/comments"; GCLOG="$WORK/gc.log"
-WARNS="$WORK/warn.log"; LABELS_BEAD="$WORK/bead-labels"; STATUS_LOG="$WORK/status.log"
+WARNS="$WORK/warn.log"; LABELS_BEAD="$WORK/bead-labels"; STATUS_LOG="$WORK/status.log"; REPAIR_ADDS="$WORK/repair-adds"
 
 # ── the stateful bd stub ──────────────────────────────────────────────────────────
 GC_CITY="test-city"; BEAD_CITY="bead-city"
 MARKER_ID="m-buqnjc"; BEAD_ID="bead-buqnjc"; BRANCH="fix/ga-buqnjc-fixture"
-LIST_MODE=ok; CREATE_MODE=ok; MARK_LABELS="type:quality-gate-marker gate-status:dispatching"; MARK_STATUS=open
+LIST_MODE=ok; CREATE_MODE=ok; LABEL_MODE=ok; MARK_LABELS="type:quality-gate-marker gate-status:dispatching"; MARK_STATUS=open
 labs_json() { local l first=1 out=""; for l in $1; do [ "$first" = 1 ] || out="$out,"; first=0; out="$out\"$l\""; done; printf '%s' "$out"; }
 bd() {
   printf '%s\n' "$*" | head -1 >> "$BDLOG"
@@ -76,7 +82,23 @@ bd() {
         garbage)  echo "bd: something broke"; return 0 ;;
         envelope) echo '{"error":"database is locked"}'; return 0 ;;
         empty)    return 0 ;;
-        *)        cat "$ROWS"; return 0 ;;
+        *)
+          # Models the three bd behaviours the helper's correctness hangs on (gate-fix 1, ga-buqnjc): closed beads are HIDDEN
+          # unless --all is given, repeated -l filters are ANDed, and the result is cut at 50 rows unless --limit 0 (bd's default).
+          # A stub that returned everything for any flags is what let a dropped --all / --limit pass the old suite.
+          local _all=0 _limit=50 _filters="" _a _prev=""
+          shift 3
+          for _a in "$@"; do
+            case "$_prev" in --limit) _limit="$_a" ;; -l) _filters="$_filters $_a" ;; esac
+            [ "$_a" = "--all" ] && _all=1
+            _prev="$_a"
+          done
+          jq -c --argjson all "$_all" --argjson limit "$_limit" --arg filters "$_filters" '
+            ($filters | split(" ") | map(select(length > 0))) as $f
+            | [ .[] | select($all == 1 or .status != "closed")
+                    | select(. as $r | all($f[]; . as $x | (($r.labels // []) | index($x)) != null)) ]
+            | if $limit == 0 then . else .[0:$limit] end' "$ROWS"
+          return 0 ;;
       esac ;;
     create)
       case "$CREATE_MODE" in
@@ -104,6 +126,12 @@ bd() {
       printf '[{"id":"%s","status":"open","labels":[]}]' "${4:-}"; return 0 ;;
     label)
       if [ "${5:-}" = "$BEAD_ID" ] && [ "${4:-}" = "add" ]; then echo "${6:-}" >> "$LABELS_BEAD"; fi
+      # a label added to a REPAIR bead (anything but the source bead): recorded and written into the row, or refused
+      if [ "${4:-}" = "add" ] && [ "${5:-}" != "$BEAD_ID" ]; then
+        [ "$LABEL_MODE" = "fail" ] && return 1
+        echo "${5:-} ${6:-}" >> "$REPAIR_ADDS"
+        jq -c --arg id "${5:-}" --arg l "${6:-}" 'map(if .id == $id then .labels += [$l] else . end)' "$ROWS" > "$ROWS.new" && mv "$ROWS.new" "$ROWS"
+      fi
       return 0 ;;
     comment)
       printf '%s\t%s\n' "${4:-}" "$(printf '%s' "${5:-}" | tr '\n' ' ')" >> "$COMMENTS"; return 0 ;;
@@ -125,17 +153,22 @@ err()  { echo "ERR:$*" >> "$WARNS"; return 0; }
 
 reset_world() { # reset_world [rows-json]
   rm -rf "$CREATES"; mkdir -p "$CREATES"
-  : > "$BDLOG"; : > "$COMMENTS"; : > "$GCLOG"; : > "$WARNS"; : > "$LABELS_BEAD"; : > "$STATUS_LOG"
+  : > "$BDLOG"; : > "$COMMENTS"; : > "$GCLOG"; : > "$WARNS"; : > "$LABELS_BEAD"; : > "$STATUS_LOG"; : > "$REPAIR_ADDS"
   printf '%s' "${1:-[]}" > "$ROWS"
-  LIST_MODE=ok; CREATE_MODE=ok
+  LIST_MODE=ok; CREATE_MODE=ok; LABEL_MODE=ok
   MARK_LABELS="type:quality-gate-marker gate-status:dispatching"; MARK_STATUS=open
   GATE_CONFLICT_REPAIR_ENABLED=1; GATE_CONFLICT_REPAIR_MAX_ATTEMPTS=3; GATE_CONFLICT_REPAIR_MAX_OPEN=3
   REBASE_EVENT="PRESET-EVENT"; REBASE_VERDICT="PRESET-VERDICT"; _REQUEUE_RESPECTED=""
 }
 creates_n() { ls "$CREATES" 2>/dev/null | wc -l | tr -d ' '; }
-row() { # row <id> <status> <branch>
-  printf '{"id":"%s","status":"%s","created_at":"2026-10-12T19:00:00Z","labels":["gate-conflict-repair","conflict-repair-of:m-old","conflict-repair-branch:%s"]}' "$1" "$2" "$3"
+row() { # row <id> <status> <branch> [repo=/repo/fixture] [marker=m-old]   (a repair bead as the dispatcher labels it)
+  printf '{"id":"%s","status":"%s","created_at":"2026-10-12T19:00:00Z","labels":["gate-conflict-repair","conflict-repair-of:%s","conflict-repair-branch:%s","conflict-repair-repo:%s"]}' \
+    "$1" "$2" "${5:-m-old}" "$3" "${4:-/repo/fixture}"
 }
+unrelated() { # unrelated <id> <status> — an open bead that is NOT a repair bead (no gate-conflict-repair label)
+  printf '{"id":"%s","status":"%s","created_at":"2026-10-12T19:00:00Z","labels":["story:in-flight"]}' "$1" "$2"
+}
+adds_n() { grep -c . "$REPAIR_ADDS" 2>/dev/null || true; }
 call_helper() { gate_open_conflict_repair_bead "$MARKER_ID" "$BRANCH" "$BEAD_ID" "rig-fixture" "/repo/fixture" "docs/a.md scripts/b.sh" "abc1234" "trace-xyz" "main" "${1:-0}"; }
 
 # ── 1. the helper on its own ──────────────────────────────────────────────────────
@@ -154,8 +187,8 @@ if has "$CT" "ARGS=-t task -p 2" && has "$CT" '--metadata {"gc.routed_to":"gasto
 else
   bad "create args wrong: $(grep '^ARGS=' "$CF" | cut -c1-300)"
 fi
-if has "$CT" "LABELS=gate-conflict-repair conflict-repair-of:$MARKER_ID conflict-repair-branch:$BRANCH"; then
-  ok "labels carry the dedup keys: gate-conflict-repair, conflict-repair-of:<marker>, conflict-repair-branch:<branch>"
+if has "$CT" "LABELS=gate-conflict-repair conflict-repair-of:$MARKER_ID conflict-repair-branch:$BRANCH conflict-repair-repo:/repo/fixture"; then
+  ok "labels carry the dedup keys: gate-conflict-repair, conflict-repair-of:<marker>, conflict-repair-branch:<branch>, conflict-repair-repo:<path> (the branch's identity is branch AND repo)"
 else
   bad "labels wrong: $(grep '^LABELS=' "$CF")"
 fi
@@ -164,10 +197,10 @@ MISSING=""
 for needle in "branch: $BRANCH" "repo: /repo/fixture" "marker (parkeado em gate-status:needs-rebase): $MARKER_ID" "bead de origem: $BEAD_ID" \
               "docs/a.md scripts/b.sh" "origin/main quando o conflito foi visto: abc1234" "trace-xyz" "manter o comportamento dos DOIS lados" \
               "Conflito só de texto/doc/comentário = juntar os dois lados" "git rebase origin/main" "force-with-lease" "docs/gate-marker-recipe.md" \
-              "ESCALAR" "gc runtime drain-ack"; do
+              "ESCALAR" "gc runtime drain-ack" "git -C <repo> worktree remove --force <dir-scratch>" "branch -D repair/<id-deste-bead>"; do
   has "$CT" "$needle" || MISSING="$MISSING [$needle]"
 done
-[ -z "$MISSING" ] && ok "the description carries the branch, repo, marker, source bead, conflicting files, the 'keep both sides' rule, the rebase/test/push/re-submit steps and the escalation exit" \
+[ -z "$MISSING" ] && ok "the description carries the branch, repo, marker, source bead, conflicting files, the 'keep both sides' rule, the rebase/test/push/re-submit steps, the worktree+branch cleanup (no rm -rf) and the escalation exit" \
   || bad "description is missing:$MISSING"
 if ! has "$CT" 'gc bd close <este-bead>' ; then bad "description lost its close instruction"; else ok "the dog is told to close the bead and drain-ack"; fi
 
@@ -179,13 +212,23 @@ else
   bad "second call must not create: result=[$GATE_CONFLICT_REPAIR_RESULT] bead=[$GATE_CONFLICT_REPAIR_BEAD] creates=$(creates_n)"
 fi
 # the re-submission mints a NEW marker for the same branch: still one bead
+if [ "$(adds_n)" = 0 ]; then
+  ok "the SAME marker swept again needs no link: no label written (it is already on the bead)"
+else
+  bad "same marker must not be re-linked: adds=[$(cat "$REPAIR_ADDS")]"
+fi
 MARKER_BEFORE="$MARKER_ID"; MARKER_ID="m-new-marker"
 call_helper
 MARKER_ID="$MARKER_BEFORE"
 if [ "$GATE_CONFLICT_REPAIR_RESULT" = "existing" ] && [ "$(creates_n)" = 1 ]; then
-  ok "dedup is per BRANCH, not per marker: a new marker for the same branch still finds the open bead"
+  ok "dedup is per BRANCH+REPO, not per marker: a new marker for the same branch still finds the open bead"
 else
   bad "a new marker on the same branch must reuse the open bead: result=[$GATE_CONFLICT_REPAIR_RESULT] creates=$(creates_n)"
+fi
+if [ "$(cat "$REPAIR_ADDS")" = "ga-rep1 conflict-repair-of:m-new-marker" ]; then
+  ok "the new marker is LINKED to the existing bead (conflict-repair-of:m-new-marker) — the watchdog finds a bead by marker, so it holds its escalation for this marker too"
+else
+  bad "the new marker must be linked to ga-rep1: adds=[$(cat "$REPAIR_ADDS")]"
 fi
 
 reset_world "[$(row ga-oldc closed "$BRANCH")]"
@@ -194,6 +237,88 @@ if [ "$GATE_CONFLICT_REPAIR_RESULT" = "opened" ] && [ "$(creates_n)" = 1 ]; then
   ok "a CLOSED repair bead (1 of 3 attempts) does not block a new one → opened"
 else
   bad "closed bead must not block: result=[$GATE_CONFLICT_REPAIR_RESULT] creates=$(creates_n)"
+fi
+
+# ── identity: a branch NAME is not an identity (gate-fix 1) ──
+# The reviewer's probe, verbatim: ONE open repair bead for branch X in repo B; a marker from repo A with the same branch name.
+reset_world "[$(row ga-repWA open "$BRANCH" /repo/other m-wa)]"
+call_helper; RC=$?
+if [ "$RC" = 0 ] && [ "$GATE_CONFLICT_REPAIR_RESULT" = "opened" ] && [ "$GATE_CONFLICT_REPAIR_BEAD" = "ga-rep1" ] && [ "$(creates_n)" = 1 ] && [ "$(adds_n)" = 0 ]; then
+  ok "IDENTITY: an open bead for the SAME branch name in ANOTHER repo is not 'a dog is on it' → this repo gets its OWN bead (ga-rep1), and the other repo's bead is not touched"
+else
+  bad "same branch name, other repo must open its own bead: result=[$GATE_CONFLICT_REPAIR_RESULT] bead=[$GATE_CONFLICT_REPAIR_BEAD] creates=$(creates_n) adds=[$(cat "$REPAIR_ADDS")]"
+fi
+call_helper
+if [ "$GATE_CONFLICT_REPAIR_RESULT" = "existing" ] && [ "$GATE_CONFLICT_REPAIR_BEAD" = "ga-rep1" ] && [ "$(creates_n)" = 1 ]; then
+  ok "…and the next sweep of that repo's marker reuses ITS bead (ga-rep1), never the other repo's (ga-repWA)"
+else
+  bad "second sweep must find this repo's own bead: result=[$GATE_CONFLICT_REPAIR_RESULT] bead=[$GATE_CONFLICT_REPAIR_BEAD] creates=$(creates_n)"
+fi
+reset_world "[$(row ga-x1 closed "$BRANCH" /repo/other),$(row ga-x2 closed "$BRANCH" /repo/other),$(row ga-x3 closed "$BRANCH" /repo/other)]"
+call_helper
+if [ "$GATE_CONFLICT_REPAIR_RESULT" = "opened" ] && [ "$(creates_n)" = 1 ]; then
+  ok "IDENTITY: the attempt cap is per branch+repo — 3 closed beads of the same branch NAME in another repo do not spend this repo's attempts"
+else
+  bad "attempts of another repo must not count: result=[$GATE_CONFLICT_REPAIR_RESULT] creates=$(creates_n)"
+fi
+for r in "" "unknown" "/repo/with space" "/repo/with,comma"; do
+  reset_world "[]"
+  gate_open_conflict_repair_bead "$MARKER_ID" "$BRANCH" "$BEAD_ID" "rig-fixture" "$r" "docs/a.md" "abc1234" "trace" "main" "0"
+  if [ "$GATE_CONFLICT_REPAIR_RESULT" = "fallback:repo-unconfirmed" ] && [ ! -s "$BDLOG" ] && [ -z "$GATE_CONFLICT_REPAIR_BEAD" ]; then
+    ok "repo [$r] is not a confirmed identity → fallback:repo-unconfirmed (the Mayor), no bd call, nothing looked up or opened"
+  else
+    bad "repo [$r] must fall back: result=[$GATE_CONFLICT_REPAIR_RESULT] bdlog=[$(cat "$BDLOG")]"
+  fi
+done
+reset_world "[]"; MK_SAVE="$MARKER_ID"; MARKER_ID=""; call_helper; MARKER_ID="$MK_SAVE"
+[ "$GATE_CONFLICT_REPAIR_RESULT" = "fallback:marker-not-label-safe" ] && [ ! -s "$BDLOG" ] \
+  && ok "an empty marker id cannot be linked or labelled → fallback:marker-not-label-safe, no bd call" || bad "empty marker: result=[$GATE_CONFLICT_REPAIR_RESULT]"
+
+# ── the three bd flags the lookup hangs on (the review's medium finding: the old stub ignored all three) ──
+reset_world "[$(row ga-oldc closed "$BRANCH"),$(row ga-oldd closed "$BRANCH"),$(row ga-olde closed "$BRANCH")]"
+call_helper
+if has "$GATE_CONFLICT_REPAIR_RESULT" "fallback:attempts-exhausted" && [ "$(creates_n)" = 0 ]; then
+  ok "--all matters: the 3 CLOSED beads are only visible with --all, and they are what stops a branch cycling through dogs forever"
+else
+  bad "closed beads invisible → cap never trips: result=[$GATE_CONFLICT_REPAIR_RESULT] creates=$(creates_n)"
+fi
+FILLER=""; i=0; while [ "$i" -lt 60 ]; do FILLER="$FILLER$(row "ga-fill$i" closed "fix/filler-$i" /repo/filler),"; i=$((i+1)); done
+reset_world "[${FILLER}$(row ga-late open "$BRANCH")]"
+call_helper
+if [ "$GATE_CONFLICT_REPAIR_RESULT" = "existing" ] && [ "$GATE_CONFLICT_REPAIR_BEAD" = "ga-late" ] && [ "$(creates_n)" = 0 ]; then
+  ok "--limit 0 matters: the open bead is row 61 behind 60 closed ones — found, no duplicate (bd cuts at 50 rows without --limit 0)"
+else
+  bad "row 61 not seen → a duplicate dog: result=[$GATE_CONFLICT_REPAIR_RESULT] bead=[$GATE_CONFLICT_REPAIR_BEAD] creates=$(creates_n)"
+fi
+reset_world "[$(unrelated ga-u1 open),$(unrelated ga-u2 open),$(unrelated ga-u3 open)]"
+call_helper
+if [ "$GATE_CONFLICT_REPAIR_RESULT" = "opened" ] && [ "$(creates_n)" = 1 ]; then
+  ok "-l matters: 3 open beads that are NOT repair beads do not count toward the open cap → opened"
+else
+  bad "unrelated beads counted as repair beads: result=[$GATE_CONFLICT_REPAIR_RESULT] creates=$(creates_n)"
+fi
+HELPER_SRC="$(sed -n '/^gate_open_conflict_repair_bead() {/,/^}/p' "$DISPATCHER")"
+LIST_LINE="$(printf '%s\n' "$HELPER_SRC" | grep 'bd -C "\$GC_CITY" list ' | head -1)"
+if has "$LIST_LINE" "--json" && has "$LIST_LINE" "--all" && has "$LIST_LINE" "--limit 0" && has "$LIST_LINE" '-l "$GATE_CONFLICT_REPAIR_LABEL"'; then
+  ok "source drift-guard: the helper's bd list call still carries --json --all --limit 0 -l \$GATE_CONFLICT_REPAIR_LABEL"
+else
+  bad "the helper's bd list call lost a flag it depends on: [$LIST_LINE]"
+fi
+
+# a bead that is open but whose id cannot be read back is not 'a dog is on it'
+reset_world '[{"id":"","status":"open","created_at":"2026-10-12T19:00:00Z","labels":["gate-conflict-repair","conflict-repair-of:m-old","conflict-repair-branch:'"$BRANCH"'","conflict-repair-repo:/repo/fixture"]}]'
+call_helper
+if [ "$GATE_CONFLICT_REPAIR_RESULT" = "fallback:repair-beads-unreadable" ] && [ -z "$GATE_CONFLICT_REPAIR_BEAD" ] && [ "$(creates_n)" = 0 ]; then
+  ok "an open repair bead whose id is empty/unreadable → fallback:repair-beads-unreadable (never 'existing' with no bead to point at)"
+else
+  bad "open bead with no id: result=[$GATE_CONFLICT_REPAIR_RESULT] bead=[$GATE_CONFLICT_REPAIR_BEAD]"
+fi
+# linking a second marker to the existing bead fails → the dispatcher cannot make 'a dog is on this marker' true → the mail
+reset_world "[$(row ga-rep1 open "$BRANCH")]"; LABEL_MODE=fail; MK_SAVE="$MARKER_ID"; MARKER_ID="m-second"; call_helper; MARKER_ID="$MK_SAVE"
+if [ "$GATE_CONFLICT_REPAIR_RESULT" = "fallback:marker-link-failed" ] && [ -z "$GATE_CONFLICT_REPAIR_BEAD" ] && has "$(cat "$WARNS")" "linking marker m-second"; then
+  ok "the link to the existing bead fails → fallback:marker-link-failed (no bead claimed, a warning says why): the Mayor is mailed, not left to wait for a hold that will not come"
+else
+  bad "link failure must fall back: result=[$GATE_CONFLICT_REPAIR_RESULT] bead=[$GATE_CONFLICT_REPAIR_BEAD] warns=[$(cat "$WARNS")]"
 fi
 
 reset_world "[$(row ga-c1 closed "$BRANCH"),$(row ga-c2 closed "$BRANCH"),$(row ga-c3 closed "$BRANCH")]"
@@ -228,8 +353,8 @@ reset_world '{"not":"an array"}'; call_helper
 
 for mode in fail empty garbage; do
   reset_world "[]"; CREATE_MODE="$mode"; call_helper
-  if [ "$GATE_CONFLICT_REPAIR_RESULT" = "fallback:create-failed" ] && [ -z "$GATE_CONFLICT_REPAIR_BEAD" ] && has "$(cat "$WARNS")" "Mayor is mailed instead"; then
-    ok "create $mode → fallback:create-failed with NO bead id claimed, and a warning"
+  if [ "$GATE_CONFLICT_REPAIR_RESULT" = "fallback:create-unconfirmed" ] && [ -z "$GATE_CONFLICT_REPAIR_BEAD" ] && has "$(cat "$WARNS")" "could not CONFIRM" && has "$(cat "$WARNS")" "a bead may still exist" && has "$(cat "$WARNS")" "Mayor is mailed instead"; then
+    ok "create $mode → fallback:create-unconfirmed with NO bead id claimed, and a warning that says 'could not CONFIRM' and that a bead may still exist (not 'no bead was opened')"
   else
     bad "create $mode must fall back: result=[$GATE_CONFLICT_REPAIR_RESULT] bead=[$GATE_CONFLICT_REPAIR_BEAD]"
   fi
@@ -268,16 +393,19 @@ reset_world "[]"; GATE_CONFLICT_REPAIR_MAX_OPEN="many"; call_helper
 seteu_scenarios() {
   set -eu
   local scenario
-  for scenario in ok existing exhausted unreadable createfail disabled; do
+  for scenario in ok existing linkfail exhausted unreadable createfail disabled; do
     reset_world "[]"
-    if [ "$scenario" = existing ]; then printf '%s' "[$(row ga-x open "$BRANCH")]" > "$ROWS"; fi
-    if [ "$scenario" = exhausted ]; then printf '%s' "[$(row ga-1 closed "$BRANCH"),$(row ga-2 closed "$BRANCH"),$(row ga-3 closed "$BRANCH")]" > "$ROWS"; fi
+    if [ "$scenario" = existing ]; then printf '%s' "[$(row ga-x open "$BRANCH" /r)]" > "$ROWS"; fi
+    if [ "$scenario" = linkfail ]; then printf '%s' "[$(row ga-x open "$BRANCH" /r m-other)]" > "$ROWS"; LABEL_MODE=fail; fi
+    if [ "$scenario" = exhausted ]; then printf '%s' "[$(row ga-1 closed "$BRANCH" /r),$(row ga-2 closed "$BRANCH" /r),$(row ga-3 closed "$BRANCH" /r)]" > "$ROWS"; fi
     if [ "$scenario" = unreadable ]; then LIST_MODE=fail; fi
     if [ "$scenario" = createfail ]; then CREATE_MODE=fail; fi
     if [ "$scenario" = disabled ]; then GATE_CONFLICT_REPAIR_ENABLED=0; fi
     gate_open_conflict_repair_bead "$MARKER_ID" "$BRANCH" "$BEAD_ID" "r" "/r" "f" "s" "t" "main" "0"
     echo "$scenario:$GATE_CONFLICT_REPAIR_RESULT"
   done
+  gate_open_conflict_repair_bead "$MARKER_ID" "$BRANCH" "$BEAD_ID" "r" "" "f" "s" "t" "main" "0"
+  echo "norepo:$GATE_CONFLICT_REPAIR_RESULT"
   gate_open_conflict_repair_bead
   echo "noargs:$GATE_CONFLICT_REPAIR_RESULT"
   echo DONE
@@ -340,16 +468,50 @@ reset_world "[]"; LIST_MODE=fail
 run_block
 MC="$(marker_comment)"; MAIL="$(cat "$GCLOG")"
 if has "$OUT" "RC=0" && [ "$(mail_count)" = 1 ] && [ "$(creates_n)" = 0 ] \
-   && has "$MAIL" "Gate escalation: $BRANCH genuine conflict (no live author)" && has "$MAIL" "No repair bead was opened for the dog pool (fallback:repair-beads-unreadable, ga-buqnjc)"; then
+   && has "$MAIL" "Gate escalation: $BRANCH genuine conflict (no live author)" && has "$MAIL" "No repair bead is CONFIRMED for the dog pool (fallback:repair-beads-unreadable, ga-buqnjc)"; then
   ok "repair beads unreadable → NO bead and the Mayor IS mailed (same subject as before), with the reason in the mail"
 else
   bad "fallback path wrong: mails=$(mail_count) creates=$(creates_n) mail=[$MAIL]"
 fi
-if has "$MC" "Gate SKIPPED + ESCALATED (ga-q3ig2)" && has "$MC" "No repair bead (fallback:repair-beads-unreadable) — escalated to the Mayor by mail" \
+if has "$MC" "Gate SKIPPED + ESCALATED (ga-q3ig2)" && has "$MC" "No repair bead confirmed (fallback:repair-beads-unreadable) — escalated to the Mayor by mail" \
    && has "$MC" "Needs re-anchor/rebuild or a Mayor decision." && ! has "$(getl VERDICT)" "repair bead"; then
   ok "fallback marker comment says the Mayor was mailed and keeps the re-anchor advice; the verdict does not claim a repair bead"
 else
   bad "fallback comment/verdict wrong: [$MC] verdict=[$(getl VERDICT)]"
+fi
+
+# the repo the park block hands the helper is RIG_PATH: an unresolved one must reach the Mayor, not a dog
+reset_world "[]"; RIG_PATH_SAVE="$RIG_PATH"; RIG_PATH=""
+run_block
+MC="$(marker_comment)"; MAIL="$(cat "$GCLOG")"
+if [ "$(mail_count)" = 1 ] && [ "$(creates_n)" = 0 ] && has "$MAIL" "fallback:repo-unconfirmed" && has "$MC" "No repair bead confirmed (fallback:repo-unconfirmed)"; then
+  ok "no repo path (RIG_PATH empty) → NO bead, the Mayor IS mailed, and both the mail and the marker comment say why (fallback:repo-unconfirmed)"
+else
+  bad "unconfirmed repo in the block: mails=$(mail_count) creates=$(creates_n) mail=[$MAIL] comment=[$MC]"
+fi
+RIG_PATH="$RIG_PATH_SAVE"
+
+# a SECOND marker of the same branch+repo is swept while the first one's bead is still open (the dog has not closed it yet)
+reset_world "[]"
+run_block
+MK_SAVE="$MARKER_ID"; MARKER_ID="m-second"; MARK_LABELS="type:quality-gate-marker gate-status:dispatching"; : > "$GCLOG"; : > "$COMMENTS"
+run_block
+MC="$(grep "^m-second	" "$COMMENTS" | head -1)"
+MARKER_ID="$MK_SAVE"
+if [ "$(creates_n)" = 1 ] && [ "$(mail_count)" = 0 ] && has "$MC" "Repair bead ga-rep1 (existing)" && [ "$(cat "$REPAIR_ADDS")" = "ga-rep1 conflict-repair-of:m-second" ]; then
+  ok "a second marker of the same branch+repo → still ONE bead, no mail, and the second marker is linked to it (so the watchdog holds ITS escalation too)"
+else
+  bad "second marker: creates=$(creates_n) mails=$(mail_count) comment=[$MC] adds=[$(cat "$REPAIR_ADDS")]"
+fi
+
+reset_world "[]"; CREATE_MODE=garbage
+run_block
+MAIL="$(cat "$GCLOG")"
+if [ "$(mail_count)" = 1 ] && has "$MAIL" "No repair bead is CONFIRMED" && has "$MAIL" "create-unconfirmed" && has "$MAIL" "one may still exist" \
+   && has "$MAIL" "bd list --all -l gate-conflict-repair -l conflict-repair-branch:$BRANCH"; then
+  ok "create unconfirmed → the Mayor's mail says a bead MAY exist and gives the exact lookup to run before rebasing by hand (a dog and the Mayor must not both start the same rebase)"
+else
+  bad "create-unconfirmed mail wording: [$MAIL]"
 fi
 
 reset_world "[]"; BRANCH_HAS_MERGE_IN_RANGE=1
@@ -395,6 +557,12 @@ if grep -q 'conflict_repair_state' "$SELF_DIR/../../../scripts/gate-recovery-wat
   ok "the watchdog (FIX 9) reads the same repair beads — it holds its own Mayor escalation while one is open"
 else
   bad "gate-recovery-watchdog.py has no conflict_repair_state — FIX 9 would mail the Mayor ~15min after the dispatcher opened the bead"
+fi
+WD_FILE="$SELF_DIR/../../../scripts/gate-recovery-watchdog.py"
+if grep -q 'want = "conflict-repair-of:%s" % marker_id' "$WD_FILE" 2>/dev/null && ! grep -q 'want = "conflict-repair-branch' "$WD_FILE" 2>/dev/null; then
+  ok "the watchdog looks a repair bead up by MARKER (conflict-repair-of:<marker>), not by branch name — and the dispatcher writes that label at create and when it reuses a bead"
+else
+  bad "gate-recovery-watchdog.py conflict_repair_state must key on conflict-repair-of:<marker> (a branch name recurs across repos)"
 fi
 LBL_D="$(sed -n 's/^GATE_CONFLICT_REPAIR_LABEL="\(.*\)"/\1/p' "$DISPATCHER" | head -1)"
 LBL_W="$(sed -n 's/^CONFLICT_REPAIR_LABEL = "\(.*\)"/\1/p' "$SELF_DIR/../../../scripts/gate-recovery-watchdog.py" | head -1)"
