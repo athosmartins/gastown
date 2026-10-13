@@ -245,12 +245,26 @@ _file_size_bytes() {
   stat -f %z "$1" 2>/dev/null
 }
 
+# _free_bytes <path> → free bytes on the filesystem that holds path (`df -k`, the
+# same portability note as above), or EMPTY when df cannot say. EMPTY is "cannot
+# tell", never 0: the one caller cuts a file only on positive evidence of too
+# little room, so an unreadable answer must not look like an empty disk.
+_free_bytes() {
+  local kb
+  # vazio/falhou/ilegível → kb não-numérico → imprime nada (o chamador não corta)
+  kb="$(df -k "$1" 2>/dev/null | awk 'NR==2 {print $4}')"
+  case "$kb" in ''|*[!0-9]*) return 0 ;; esac
+  echo $(( kb * 1024 ))
+}
+
 # _tail_cap_one <path> <keep_bytes> → how the file ended up (the caller logs
 # what ACTUALLY happened, never "tail kept" for a file that lost its tail):
 #   0 = back under the cap with its last keep_bytes still in it
-#   2 = emptied: the tail could not be copied aside (most likely no space) so it was cut fully
+#   2 = emptied: the tail could not be copied aside AND the filesystem has less free
+#       space than keep_bytes (positive evidence of no room), so it was cut fully
 #   3 = emptied, and the tail could not be written back (it is in <path>.tailcap.tmp)
-#   1 = nothing freed: the file could not be truncated (or has vanished)
+#   1 = nothing freed: the file could not be truncated (or has vanished), or the
+#       tail copy failed without proof of a full disk (room, or free space unreadable)
 #   4 = refused: keep_bytes is not a positive byte count, so nobody knows what to
 #       keep; neither the file nor the side file was touched
 # Keeps the last keep_bytes IN the live file: copy the tail aside, truncate in
@@ -266,9 +280,10 @@ _tail_cap_one() {
   local path="$1" keep="$2" tmp="$1.tailcap.tmp"
   # keep is what stays in the file. A value that is not a positive byte count
   # (empty, text, 0, a leading zero -- the caller computes it, so it never has
-  # one) means "do not know what to keep", NOT "keep nothing": `tail -c ""` fails
-  # exactly like a full disk, lands in the no-room branch below, and would empty
-  # the whole file under a cause nobody observed. Refused before anything is touched.
+  # one) means "do not know what to keep", NOT "keep nothing": `tail -c ""` just
+  # fails, and a destructive branch must never be reachable from a limit nobody
+  # could read (the cut below compares free space against keep, too). Refused
+  # before anything is touched.
   case "$keep" in ''|*[!0-9]*|0*) return 4 ;; esac
   # `: >` CREATES a missing file; a path that vanished since the stat must not
   # come back as an empty file this reaper made.
@@ -284,13 +299,19 @@ _tail_cap_one() {
     rm -f "$tmp"
     return 0
   fi
-  # The tail could not be copied aside. The case this is FOR is a full disk (the
-  # low-disk case the reaper exists for), where recovering space outranks keeping
-  # history (same rule as the cp backup in the first class). The code does NOT
-  # check the cause: with a valid keep, any failure of the copy (an unwritable
-  # side-file path too) reaches this cut, which is why the caller's log line says
-  # "no room?" and not "no room".
+  # The tail could not be copied aside. The case this cut is FOR is a full disk
+  # (the low-disk case the reaper exists for), where recovering space outranks
+  # keeping history (same rule as the cp backup in the first class). But a failed
+  # copy is not proof of a full disk (an unusable side-file path, an unreadable
+  # source ...), so the cut needs positive evidence: after the partial copy is
+  # gone, the filesystem has LESS free space than keep_bytes. Room that is enough,
+  # or free space that cannot be read, means the cause is unknown -> nothing is cut.
   rm -f "$tmp"
+  local free
+  # vazio/falhou/ilegível → free vazio → não corta (rc 1); medido e >= keep → não corta (rc 1)
+  free="$(_free_bytes "$path")"
+  case "$free" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$free" -lt "$keep" ] || return 1
   if : > "$path" 2>>"$LOG"; then
     return 2
   fi
@@ -378,7 +399,7 @@ _cap_pass() {
       2)
         capped=$((capped + 1))
         freed_bytes=$((freed_bytes + size))
-        log "capped: $path (${size} bytes -> EMPTY: the tail could not be copied aside (no room?), so it was cut fully)"
+        log "capped: $path (${size} bytes -> EMPTY: no room to copy the tail aside, so it was cut fully)"
         ;;
       3)
         capped=$((capped + 1))

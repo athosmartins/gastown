@@ -269,22 +269,60 @@ tail -n 1 "$F1" | grep -q 'line 0050400 ' && ok "tail_cap_one: newest line is st
 
 echo ""
 echo "=== tail-cap class: outcomes that are NOT 'tail kept' are reported as what they are ==="
-# No room to copy the tail aside: simulated by putting a directory where the side
-# file must go. Space outranks history, so the file is emptied -- and the return
+# No room to copy the tail aside: the copy fails (simulated by putting a directory
+# where the side file must go) AND the filesystem really has less free space than
+# keep (_free_bytes stubbed inside a subshell, so the real one is untouched
+# elsewhere). Space outranks history, so the file is emptied -- and the return
 # code and the log line must say EMPTY, never "last N kept".
 F4="$CAPDIR/noroom.log"
 mkfile "$F4" 50400
 mkdir "$F4.tailcap.tmp"
-_tail_cap_one "$F4" "$KEEP"; RC4=$?
-[ "$RC4" = "2" ] && [ "$(_file_size_bytes "$F4")" = "0" ] && ok "tail_cap_one: tail cannot be copied aside -> file emptied, rc 2" || bad "tail_cap_one: no-room case rc=$RC4 size='$(_file_size_bytes "$F4")'"
+# shellcheck disable=SC2329  # overrides the sourced function inside this subshell; _tail_cap_one calls it
+RC4=$( _free_bytes() { echo 0; }; _tail_cap_one "$F4" "$KEEP" 2>/dev/null; echo $? )
+[ "$RC4" = "2" ] && [ "$(_file_size_bytes "$F4")" = "0" ] && ok "tail_cap_one: copy fails and the disk has no room -> file emptied, rc 2" || bad "tail_cap_one: no-room case rc=$RC4 size='$(_file_size_bytes "$F4")'"
 rmdir "$F4.tailcap.tmp"
 CAP_MB=2; KEEP_MB=1; LOG_REAPER_PATHS=""; LOG_REAPER_CAP_REAL_DEFAULT_PATHS="/tmp/log-reaper-nonexistent-cap-marker-$$"; ENABLED=1; DRY_RUN=0; PROD=0
 mkfile "$F4" 60000
 mkdir "$F4.tailcap.tmp"
 LOG_REAPER_CAP_PATHS="$F4"; : > "$LOG_REAPER_LOG"
-main
-grep -q "capped: $F4 .*EMPTY: the tail could not be copied aside (no room?)" "$LOG_REAPER_LOG" && ! grep -q "last .* kept" "$LOG_REAPER_LOG" && ok "main(): the no-room cut is logged as EMPTY, not as a kept tail" || bad "main(): no-room outcome mislabelled — log: $(cat "$LOG_REAPER_LOG")"
+# shellcheck disable=SC2329  # overrides the sourced function inside this subshell; main() reaches it
+( _free_bytes() { echo 0; }; main ) 2>/dev/null
+grep -q "capped: $F4 .*EMPTY: no room to copy the tail aside" "$LOG_REAPER_LOG" && ! grep -q "last .* kept" "$LOG_REAPER_LOG" && ok "main(): the no-room cut is logged as EMPTY, not as a kept tail" || bad "main(): no-room outcome mislabelled — log: $(cat "$LOG_REAPER_LOG")"
 rmdir "$F4.tailcap.tmp"
+
+# The SAME failed copy on a disk that has room is not a full disk (the side-file
+# path is unusable, the source is unreadable, ...): the cause is unknown, so
+# NOTHING is cut -- rc 1, file byte-identical -- instead of the destructive
+# default. Same when the free space cannot be read at all. The boundary: free ==
+# keep fits the copy, free == keep-1 does not.
+mkfile "$F4" 50400; SUM4="$(cksum < "$F4")"
+mkdir "$F4.tailcap.tmp"
+# shellcheck disable=SC2329  # overrides the sourced function inside these subshells; _tail_cap_one calls it
+RC4B=$( _free_bytes() { echo 999999999999; }; _tail_cap_one "$F4" "$KEEP" 2>/dev/null; echo $? )
+[ "$RC4B" = "1" ] && [ "$(cksum < "$F4")" = "$SUM4" ] && ok "tail_cap_one: copy fails but the disk has room -> NOT cut (rc 1, file byte-identical)" || bad "tail_cap_one: failed copy on a disk with room rc=$RC4B size='$(_file_size_bytes "$F4")'"
+# shellcheck disable=SC2329  # overrides the sourced function inside this subshell; _tail_cap_one calls it
+RC4C=$( _free_bytes() { :; }; _tail_cap_one "$F4" "$KEEP" 2>/dev/null; echo $? )
+[ "$RC4C" = "1" ] && [ "$(cksum < "$F4")" = "$SUM4" ] && ok "tail_cap_one: copy fails and free space is unreadable -> NOT cut (rc 1)" || bad "tail_cap_one: unreadable free space rc=$RC4C size='$(_file_size_bytes "$F4")'"
+# shellcheck disable=SC2329  # overrides the sourced function inside this subshell; _tail_cap_one calls it
+RC4D=$( _free_bytes() { echo "$KEEP"; }; _tail_cap_one "$F4" "$KEEP" 2>/dev/null; echo $? )
+[ "$RC4D" = "1" ] && [ "$(cksum < "$F4")" = "$SUM4" ] && ok "tail_cap_one: free == keep fits the copy -> NOT cut (boundary)" || bad "tail_cap_one: free==keep rc=$RC4D size='$(_file_size_bytes "$F4")'"
+# shellcheck disable=SC2329  # overrides the sourced function inside this subshell; _tail_cap_one calls it
+RC4E=$( _free_bytes() { echo $(( KEEP - 1 )); }; _tail_cap_one "$F4" "$KEEP" 2>/dev/null; echo $? )
+[ "$RC4E" = "2" ] && [ "$(_file_size_bytes "$F4")" = "0" ] && ok "tail_cap_one: free == keep-1 does not fit -> cut (boundary)" || bad "tail_cap_one: free==keep-1 rc=$RC4E size='$(_file_size_bytes "$F4")'"
+rmdir "$F4.tailcap.tmp"
+# end to end: the unknown-cause failure is reported as a failure, counted, not "capped"
+mkfile "$F4" 60000; SUM4="$(cksum < "$F4")"
+mkdir "$F4.tailcap.tmp"
+LOG_REAPER_CAP_PATHS="$F4"; : > "$LOG_REAPER_LOG"
+# shellcheck disable=SC2329  # overrides the sourced function inside this subshell; main() reaches it
+( _free_bytes() { echo 999999999999; }; main ) 2>/dev/null
+[ "$(cksum < "$F4")" = "$SUM4" ] && grep -q "FAILED to cap: $F4 (nothing freed)" "$LOG_REAPER_LOG" && ! grep -q "^\[[^]]*\] capped: " "$LOG_REAPER_LOG" && ok "main(): a failed copy on a disk with room is logged FAILED, file untouched, not 'capped'" || bad "main(): failed copy on a disk with room — log: $(cat "$LOG_REAPER_LOG")"
+grep -q "cap cycle complete: checked=1 capped=0 skipped=0 missing=0 unreadable=0 failed=1 " "$LOG_REAPER_LOG" && ok "main(): ... and counted as failed" || bad "main(): summary mismatch — got: $(grep 'cap cycle complete' "$LOG_REAPER_LOG")"
+rmdir "$F4.tailcap.tmp"
+# _free_bytes itself: a number for a real path, EMPTY (cannot tell) for one df cannot answer for
+FB="$(_free_bytes "$CAPDIR")"
+case "$FB" in ''|*[!0-9]*) bad "free_bytes: expected a number for a real path, got '$FB'" ;; *) ok "free_bytes: a real path gives a byte count" ;; esac
+[ -z "$(_free_bytes "/nonexistent/path-$$/x" 2>/dev/null)" ] && ok "free_bytes: a path df cannot answer for -> EMPTY, not 0" || bad "free_bytes: nonexistent path gave '$(_free_bytes "/nonexistent/path-$$/x" 2>/dev/null)'"
 # A path that vanished after the stat must not be re-created by the truncate.
 _tail_cap_one "$CAPDIR/vanished.log" "$KEEP"; RCV=$?
 [ "$RCV" = "1" ] && [ ! -e "$CAPDIR/vanished.log" ] && ok "tail_cap_one: a vanished file is not re-created as an empty one (rc 1)" || bad "tail_cap_one: vanished file rc=$RCV exists=$([ -e "$CAPDIR/vanished.log" ] && echo yes || echo no)"
