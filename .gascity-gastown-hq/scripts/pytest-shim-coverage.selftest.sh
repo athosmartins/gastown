@@ -9,7 +9,9 @@
 # CASOS: o mesmo instante em `Z`, `+00:00`, `-03:00` e `+09:00` dá o MESMO corte nos dois logs · sem fuso ou lixo → erro, sem relatório · linha sem ts ou com ts ilegível fica FORA do corte e o
 #   relatório diz quantas (não some calada) · sem --desde nada é cortado e não há AVISO · linha que é JSON mas não é objeto não derruba · --dias 0 → erro · log que existe e não abre → erro,
 #   não "sem log" · log ausente → "sem log" · --desde vazio → erro.
-# CONTROLES M1-M4: cada mutante do coverage.py tem de ser pego (M1 lê o deslocamento como se fosse UTC, M2 engole a contagem de linhas sem ts, M3 trata log ilegível como ausente,
+# F (ga-7q35xn): o transcrito é cortado por instante como os logs · a forma venv se divide em "o hook alcança" / "fora do alcance" com a leitura do próprio hook · o alcance EFETIVO só credita
+#   o venv até o que o log do hook PROVA (hook inerte, sessão velha ou log vazio não inflam) · divergências dão AVISO.
+# CONTROLES M1-M7: cada mutante do coverage.py tem de ser pego (M1 lê o deslocamento como se fosse UTC, M2 engole a contagem de linhas sem ts, M3 trata log ilegível como ausente,
 #   M4 deixa --desde vazio virar "sem corte").
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -104,9 +106,44 @@ else
   echo "skip E (root lê qualquer arquivo)"
 fi
 
+
+# =============================== F. o hook venv-rewrite (ga-7q35xn): o transcrito guarda o comando ORIGINAL, o log do hook é a prova ===============================
+# 5 comandos de pytest nos transcritos: (1) venv de nível de topo, depois do corte · (2) venv só como texto entre aspas · (3) python3 -m pytest (PATH) · (4) venv ANTES do corte ·
+# (5) venv sem timestamp. Com --desde 03:30Z entram 1, 2, 3; o 4 fica fora por ser anterior e o 5 fica fora e DITO.
+PROJ="$T/home/.claude/projects/-w-whatsapp-automation"; mkdir -p "$PROJ"
+tu() { jq -nc --arg ts "$1" --arg c "$2" '{timestamp:$ts, message:{content:[{type:"tool_use",name:"Bash",input:{command:$c}}]}}'; }
+{ tu "2026-10-14T04:00:00Z" "cd rig && /w/venv/bin/python -m pytest tests/a.py -q"
+  tu "2026-10-14T04:01:00Z" "bash -c '/w/venv/bin/python -m pytest tests/b.py'"
+  tu "2026-10-14T04:02:00Z" "python3 -m pytest tests/c.py"
+  tu "2026-10-14T01:00:00Z" "/w/venv/bin/python -m pytest tests/d.py"
+  jq -nc --arg c "/w/venv/bin/python -m pytest tests/e.py" '{message:{content:[{type:"tool_use",name:"Bash",input:{command:$c}}]}}'; } > "$PROJ/s1.jsonl"
+touch -t 202610150000 "$PROJ/s1.jsonl"   # mtime depois de qualquer corte usado aqui: o filtro por arquivo não esconde o teste
+HOOKLOG="$T/city/.gc/logs/pytest-venv-rewrite.jsonl"; rm -f "$HOOKLOG"
+run "$COV" --desde "2026-10-14T03:30:00Z"; rc_is "F sem log do hook: rc 0" 0
+check   "F o transcrito é cortado por INSTANTE: 3 rodadas (a anterior ao corte e a sem timestamp ficam fora)" '3 comandos|\(desde 2026-10-14T03:30:00Z'
+check   "F a forma venv é separada: o hook alcança 1" 'forma venv/bin/python: 2 .*o hook alcança 1 e 1 ficam fora'
+check   "F o venv só citado entre aspas conta como FORA do alcance do hook" 'venv/bin/python -m pytest \[fora do alcance do hook\]'
+check   "F a rodada sem timestamp fora do corte é DITA" '1 comando\(s\) de pytest nos transcritos sem timestamp legível ficaram FORA do corte'
+check   "F sem log do hook: diz que o hook não reescreveu nada" 'sem pytest-venv-rewrite.jsonl'
+check   "F SEM prova do hook o venv alcançável NÃO conta: alcance efetivo 1 de 3 (só o PATH)" 'alcance EFETIVO: 1 de 3 \(33%\).*venv reescrito 0'
+run "$COV" --desde "2026-10-14T00:30:00-03:00"; check "F o mesmo instante com -03:00 dá o mesmo corte nos transcritos" 'alcance EFETIVO: 1 de 3'
+printf '%s\n' '{"ts":"2026-10-14T05:00:00Z","src":"venv-rewrite","n":1}' > "$HOOKLOG"
+run "$COV" --desde "2026-10-14T03:30:00Z"
+check   "F com 1 reescrita no log: alcance efetivo 2 de 3 (PATH 1 + venv 1)" 'alcance EFETIVO: 2 de 3 \(66%\).*PATH 1 \+ venv reescrito 1'
+nocheck "F log e transcrito concordam: sem AVISO de divergência" 'AVISO: o hook reescreveu|AVISO: o log tem mais'
+: > "$HOOKLOG"; run "$COV" --desde "2026-10-14T03:30:00Z"
+check   "F log vazio: o hook alcança 1 comando e reescreveu 0 → AVISO (sessão velha ou hook inerte)" 'AVISO: o hook reescreveu 0 de 1'
+check   "F …e o venv NÃO conta como alcançado" 'alcance EFETIVO: 1 de 3'
+printf '%s\n%s\n%s\n' '{"ts":"2026-10-14T05:00:00Z","n":1}' '{"ts":"2026-10-14T05:01:00Z","n":1}' '{"ts":"2026-10-14T05:02:00Z","n":1}' > "$HOOKLOG"; run "$COV" --desde "2026-10-14T03:30:00Z"
+check   "F mais reescritas no log que comandos nos transcritos → AVISO" 'AVISO: o log tem mais reescritas \(3\)'
+check   "F …e o excedente NÃO infla o alcance: continua 2 de 3" 'alcance EFETIVO: 2 de 3'
+printf '%s\n' '{"ts":"2026-10-14T01:00:00Z","n":1}' '{"n":1}' > "$HOOKLOG"; run "$COV" --desde "2026-10-14T03:30:00Z"
+check   "F linha do log do hook anterior ao corte fica fora, a sem ts fica fora e é dita" '1 linha\(s\) do log do hook sem ts legível ficaram FORA do corte'
+rm -f "$HOOKLOG"
+
 # =============================== M. controles negativos: cada mutante tem de ser pego ===============================
 mutant() { # <nome> <sed-expr>
-  cp "$COV" "$T/mut/$1.py"; sed -i.bak -e "$2" "$T/mut/$1.py"
+  cp "$COV" "$T/mut/$1.py"; cp "$HERE/pytest-shim/venv-rewrite-hook.py" "$T/mut/venv-rewrite-hook.py"; sed -i.bak -e "$2" "$T/mut/$1.py"
   if cmp -s "$COV" "$T/mut/$1.py"; then n=$((n+1)); fails=$((fails+1)); echo "FAIL mutante $1: o sed não mudou nada (o controle não controla)"; return 1; fi
   return 0; }
 caught() { n=$((n+1)); if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: o mutante NÃO foi pego (esperava '$2', veio '$3')"; fails=$((fails+1)); fi; }
@@ -131,6 +168,19 @@ fi
 mutant m4 's/    if a.desde is not None:/    if a.desde:/' && {
   run "$T/mut/m4.py" --desde ""
   caught "M4 --desde vazio vira 'sem corte' calado: rc 0 (o caso B reprova o mutante)" "0" "$RC"; }
+
+# M5: o venv alcançável conta inteiro, mesmo sem prova do hook (um hook inerte inflaria o número)
+mutant m5 's/done_venv = min(v_hook, rewrote or 0)/done_venv = v_hook/' && {
+  rm -f "$HOOKLOG"; run "$T/mut/m5.py" --desde "2026-10-14T03:30:00Z"
+  caught "M5 sem a prova do log o venv alcançável é creditado: 2 de 3 (os casos F reprovam o mutante)" "2" "$(sed -n 's/.*alcance EFETIVO: \([0-9]*\) de .*/\1/p' "$T/out" | head -1)"; }
+# M6: o transcrito não é cortado por instante (o --desde só cortaria os logs, como antes)
+mutant m6 's/^                            if t < desde:$/                            if False:/' && {
+  rm -f "$HOOKLOG"; run "$T/mut/m6.py" --desde "2026-10-14T03:30:00Z"
+  caught "M6 transcrito sem corte: a rodada anterior entra (4 em vez de 3) (os casos F reprovam o mutante)" "1" "$(grep -c 'comandos só citam' "$T/out" | tr -d ' ')"; check "M6 …total de rodadas inflado" 'alcance EFETIVO: 1 de 4'; }
+# M7: o hook é lido por uma regex parecida em vez do módulo: o texto entre aspas passa a contar como alcançável
+mutant m7 's/        return bool(hook.rewrite(cmd, "\/x\/bin\/python3")\[1\])/        return True/' && {
+  rm -f "$HOOKLOG"; run "$T/mut/m7.py" --desde "2026-10-14T03:30:00Z"
+  caught "M7 todo venv é 'alcançável' (inclusive o texto entre aspas): o hook alcança 2 (o caso F reprova o mutante)" "1" "$(grep -c 'o hook alcança 2 e 0 ficam fora' "$T/out" | tr -d ' ')"; }
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

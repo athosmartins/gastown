@@ -87,6 +87,8 @@ CUT_OUTPUT_EVENTS = ("PostToolUse", "PostToolUseFailure")
 # ga-fl2nek: matchers de SessionStart que o `gc prime --hook` do workdir (ou um padrão genérico) pode ocupar. Um hook de hooks_extra com um destes SUBSTITUI a
 # entrada do workdir na mescla por identidade de matcher (internal/overlay/merge.go hookEntryKey) — o `gc prime` deixaria de rodar na sessão.
 SESSION_START_SHARED_MATCHERS = {"", "startup", "resume", "clear", "compact", "*", ".*"}
+# ga-7q35xn: matchers de PreToolUse que o home-scan-guard (`^Bash$`) e os hooks do workdir (`Bash`) já ocupam; um hook de hooks_extra com um destes os SUBSTITUI na mescla
+PRE_TOOL_USE_SHARED_MATCHERS = ("^Bash$", "Bash")
 
 
 def _cmd(h):
@@ -344,10 +346,10 @@ def check_hooks_extra(m, role, r, cfg):
             for e in mine:
                 mt = e.get("matcher")
                 # o invariante é LITERAL, não "igual ao do manifesto": um matcher ruim escrito no manifesto passaria pela comparação com ele mesmo
-                if mt != want_entries[0]["matcher"] or (event == "SessionStart" and mt in SESSION_START_SHARED_MATCHERS):
+                if mt != want_entries[0]["matcher"] or (event == "SessionStart" and mt in SESSION_START_SHARED_MATCHERS) or (event == "PreToolUse" and mt in PRE_TOOL_USE_SHARED_MATCHERS):
                     errs.append(f"overlay '{role}': hook {event} de '{name}' com matcher {mt!r}; tem que ser um matcher PRÓPRIO ({want_entries[0]['matcher']!r}) — o motor mescla por "
-                                "identidade de matcher, e o `gc prime --hook` do workdir mora noutra entrada de SessionStart (um matcher igual ao dele a SUBSTITUIRIA)")
-            if not any("CLAUDE_ENV_FILE" in _cmd(h) for e in mine for h in e["hooks"]):
+                                "identidade de matcher: `gc prime --hook` mora noutra entrada de SessionStart e os hooks do home-scan-guard/dangerous-command em `Bash`/`^Bash$` de PreToolUse (um matcher igual ao deles os SUBSTITUIRIA)")
+            if event == "SessionStart" and not any("CLAUDE_ENV_FILE" in _cmd(h) for e in mine for h in e["hooks"]):
                 errs.append(f"overlay '{role}': hook {event} de '{name}' não escreve em CLAUDE_ENV_FILE — é o único jeito de o PATH chegar aos comandos Bash da sessão")
     return errs
 
@@ -558,7 +560,7 @@ def hook_dirs(cfg, marker):
         for e in entries if isinstance(entries, list) else []:
             for h in (e.get("hooks") if isinstance(e, dict) and isinstance(e.get("hooks"), list) else []):
                 mm = re.search(r"D='([^']+)'", _cmd(h)) if marker in _cmd(h) else None
-                if mm:
+                if mm and mm.group(1) not in out:   # dois eventos do mesmo atalho apontam o MESMO diretório: uma vez só
                     out.append(mm.group(1))
     return out
 
@@ -592,11 +594,13 @@ def cmd_live(m, gt_root=None):
                 print(f"  NOT-REGISTERED {role}: o overlay não registra o hook '{name}'")
                 rc = 1
             for path in dirs:
-                real = os.path.join(path.replace(root, gt_root, 1) if gt_root else path, df["live_file"])
-                # o hook de SessionStart testa `[ -x ... ]`, não só existência: arquivo presente sem bit de execução é no-op calado, então `live` tem de concordar com ele
-                live = os.path.isfile(real) and os.access(real, os.X_OK)
-                print(f"  {'LIVE' if live else 'INERT':11s} {role}: {real}" + ("" if live else f"  (o hook '{name}' está registrado mas o arquivo não existe ou não é executável: no-op)"))
-                rc = rc or (0 if live else 1)
+                base = path.replace(root, gt_root, 1) if gt_root else path
+                # o hook testa `[ -x python3 ]` e `[ -f <script> ]`, não só existência: `live` tem de concordar com ele (arquivo presente sem bit de execução = no-op calado)
+                for rel, need_x in [(df["live_file"], True)] + [(f, False) for f in df.get("live_also", [])]:
+                    real = os.path.normpath(os.path.join(base, rel))
+                    live = os.path.isfile(real) and (os.access(real, os.X_OK) or not need_x)
+                    print(f"  {'LIVE' if live else 'INERT':11s} {role}: {real}" + ("" if live else f"  (o hook '{name}' está registrado mas o arquivo não existe" + (" ou não é executável" if need_x else "") + ": no-op)"))
+                    rc = rc or (0 if live else 1)
     print("pool-preamble-build live: " + ("todos os papéis LIVE" if rc == 0 else "há papel NÃO guardado ou INERTE"))
     return rc
 

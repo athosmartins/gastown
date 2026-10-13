@@ -40,7 +40,7 @@ cat > "$T/gate-stub.sh" <<'EOF'
 #!/bin/sh
 { echo "GATE_CALL"; for a in "$@"; do echo "  arg:$a"; done
   echo "  env:PY=${GATE_PYTEST_PY:-}"; echo "  env:LOG=${GATE_PYTEST_LOG:-}"; echo "  env:OFF=${GATE_PYTEST_OFF_FILE:-}"; echo "  env:TAG=${GATE_PYTEST_TAG:-}"
-  echo "  env:ACTIVE=${GC_PYTEST_SHIM_ACTIVE:-}"; echo "  env:HINT=${GATE_PYTEST_LOCAL_HINT:-}"; echo "  cwd=$(pwd -P)"; } >> "$STUB_LOG"
+  echo "  env:SHIMPY=${PYTEST_SHIM_PY:-}"; echo "  env:ACTIVE=${GC_PYTEST_SHIM_ACTIVE:-}"; echo "  env:HINT=${GATE_PYTEST_LOCAL_HINT:-}"; echo "  cwd=$(pwd -P)"; } >> "$STUB_LOG"
 exit "${STUB_GATE_RC:-0}"
 EOF
 # mbp-run stub (casos B): o MBP de mentira
@@ -128,6 +128,29 @@ shebang_case "shebang '#!/bin/sh' (não é python) cai no python3 do PATH" "#!/b
 shebang_case "shebang de python que não abre cai no python3 do PATH" "#!$T/real/python9.99" "$T/real/python3"
 shebang_case "arquivo sem shebang cai no python3 do PATH" "# sem shebang" "$T/real/python3"
 
+# =============================== A9. PYTEST_SHIM_PY (ga-7q35xn): o python que o worker DIGITOU, em TODO caminho local ===============================
+# O hook PreToolUse reescreve `venv/bin/python -m pytest ...` para `env PYTEST_SHIM_PY=<esse python> <atalho>/bin/python3 -m pytest ...`. Se o atalho deixar passar (chave off,
+# bypass, aninhado, sem alvo) ou mandar o gate rodar aqui, quem roda TEM de ser o python do worker (as dependências do rig estão nele): cair no python3 do PATH muda o teste.
+mkdir -p "$T/wt/venv/bin"
+cat > "$T/wt/venv/bin/python" <<'EOF'
+#!/bin/sh
+{ echo "VENV_CALL argv0=$0"; for a in "$@"; do echo "  arg:$a"; done; echo "  env:SHIMPY=${PYTEST_SHIM_PY:-}"; } >> "$STUB_LOG"
+exit "${STUB_PY_RC:-0}"
+EOF
+chmod +x "$T/wt/venv/bin/python"; VPY="$T/wt/venv/bin/python"
+reset; rm -f "$KEY"; rc=$(STUB_PY_RC=2 PYTEST_SHIM_PY="$VPY" run python3 -m pytest tests/test_a.py -q); expect "A9 chave off: roda o python DO WORKER (rc é o dele)" 2 "$rc"
+has "A9 chave off: o python do worker foi chamado" "$STUB_LOG" 'VENV_CALL'; hasnt "A9 chave off: o python3 do PATH NÃO foi chamado" "$STUB_LOG" 'PY_CALL'
+has "A9 chave off: argumentos de hoje (-m pytest + alvo)" "$STUB_LOG" 'arg:tests/test_a.py'; has "A9 chave off: o '-m pytest' continua" "$STUB_LOG" 'arg:pytest'
+hasnt "A9 PYTEST_SHIM_PY não vaza para o python do worker (nem para um python3 aninhado dele)" "$STUB_LOG" 'env:SHIMPY=.+'
+reset; rc=$(PYTEST_SHIM_PY=venv/bin/python run python3 -m pytest tests/test_a.py -q); expect "A9 caminho relativo" 0 "$rc"; has "A9 relativo vira ABSOLUTO contra o cwd (o gate pode mudar de diretório)" "$STUB_LOG" 'argv0=/.*/wt/venv/bin/python$'; hasnt "A9 relativo: não executa o caminho relativo cru" "$STUB_LOG" 'argv0=venv'
+reset; use_gate_stub; rc=$(PYTEST_SHIM_PY="$VPY" run python3 -m pytest tests/test_a.py -q); expect "A9 gate: desvia normalmente" 0 "$rc"
+has "A9 gate: o python que roda AQUI é o do worker" "$STUB_LOG" "env:PY=$VPY"; hasnt "A9 gate: não é o python3 do PATH" "$STUB_LOG" "env:PY=$T/real/python3"; hasnt "A9 gate: PYTEST_SHIM_PY não vaza" "$STUB_LOG" 'env:SHIMPY=.+'
+reset; use_gate_stub; rc=$(PYTEST_SHIM_PY="$VPY" GC_PYTEST_SHIM=off run python3 -m pytest tests/test_a.py); expect "A9 bypass GC_PYTEST_SHIM=off → python do worker" 0 "$rc"; has "A9 bypass: python do worker" "$STUB_LOG" 'VENV_CALL'; hasnt "A9 bypass: gate não chamado" "$STUB_LOG" 'GATE_CALL'; hasnt "A9 bypass: python3 do PATH não chamado" "$STUB_LOG" 'PY_CALL'
+reset; use_gate_stub; rc=$(PYTEST_SHIM_PY="$VPY" GC_PYTEST_SHIM_ACTIVE=1 run python3 -m pytest tests/test_a.py); expect "A9 aninhado → python do worker" 0 "$rc"; has "A9 aninhado: python do worker" "$STUB_LOG" 'VENV_CALL'; hasnt "A9 aninhado: python3 do PATH não chamado" "$STUB_LOG" 'PY_CALL'
+reset; use_gate_stub; rc=$(PYTEST_SHIM_PY="$VPY" run python3 -m pytest -q); expect "A9 sem alvo → python do worker" 0 "$rc"; has "A9 sem alvo: python do worker" "$STUB_LOG" 'VENV_CALL'; hasnt "A9 sem alvo: python3 do PATH não chamado" "$STUB_LOG" 'PY_CALL'
+reset; use_gate_stub; rc=$(PYTEST_SHIM_PY="$T/wt/venv/bin/nao-existe" run python3 -m pytest tests/test_a.py); n=$((n+1)); if [ "$rc" != 0 ]; then echo "ok   A9 python do worker que não existe → erro (rc=$rc), não um pytest com outro python"; else echo "FAIL A9 python do worker inexistente saiu 0"; fails=$((fails+1)); fi
+hasnt "A9 inexistente: NUNCA cai para o python3 do PATH" "$STUB_LOG" 'PY_CALL'; hasnt "A9 inexistente: o gate não roda com outro python" "$STUB_LOG" 'GATE_CALL.*'
+
 # =============================== B. o gate DE VERDADE (mbp-run stub): os controles do bead ===============================
 runb() { run_in "$SHIMDIR" "$T/whatsapp_automation" "$@"; }
 ( cd "$T/whatsapp_automation" && git init -q . 2>/dev/null )
@@ -183,6 +206,15 @@ mutant m3 's#^py_pytest_skip() {#py_pytest_skip() { SKIP=2; return 0;#' && {
 mutant m4 '/^export GC_PYTEST_SHIM_ACTIVE=1/d' && {
   reset; use_gate_stub; rc=$(run_in "$T/mut/m4" "$T/wt" python3 -m pytest tests/test_a.py); c=$(grep -c 'env:ACTIVE=1' "$STUB_LOG")
   caught "M4 sem a guarda aninhada o gate não vê GC_PYTEST_SHIM_ACTIVE (o caso A1 reprova o mutante)" 0 "$c"; }
+
+# M5 o PYTEST_SHIM_PY é ignorado quando o atalho deixa passar: cai no python3 do PATH
+mutant m5 's#^  \[ -n "\$VENV_PY" \] \&\& \[ "\$_rr_name" != pytest \] \&\& exec "\$VENV_PY" "\$@"#  :#' && {
+  reset; use_gate_stub; rm -f "$KEY"; rc=$(PYTEST_SHIM_PY="$VPY" run_in "$T/mut/m5" "$T/wt" python3 -m pytest tests/test_a.py); c=$(grep -c VENV_CALL "$STUB_LOG")
+  caught "M5 sem o python do worker no passe direto roda o python3 do PATH (o caso A9 'chave off' reprova o mutante)" 0 "$c"; }
+# M6 a variável não é removida do ambiente: vaza para o python do worker e para python3 aninhados
+mutant m6 's#^VENV_PY=\${PYTEST_SHIM_PY:-}; unset PYTEST_SHIM_PY#VENV_PY=${PYTEST_SHIM_PY:-}#' && {
+  reset; rm -f "$KEY"; rc=$(PYTEST_SHIM_PY="$VPY" run_in "$T/mut/m6" "$T/wt" python3 -m pytest tests/test_a.py); c=$(grep -c 'env:SHIMPY=.' "$STUB_LOG")
+  caught "M6 sem o unset a variável vaza para o filho (o caso A9 'não vaza' reprova o mutante)" 1 "$c"; }
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

@@ -190,6 +190,19 @@ for role, overlay, want in (("wa-worker", "pool-wa-worker", True), ("ps-worker",
     except Exception as e:
         errs.append(f"{role}: não consegui ler {p}: {e!r}")
         continue
+    try:
+        pre = json.load(open(p, encoding="utf-8")).get("hooks", {}).get("PreToolUse", [])
+    except Exception as e:
+        errs.append(f"{role}: não consegui ler {p}: {e!r}")
+        continue
+    pre_mine = [e for e in pre if any("pytest-shim" in h.get("command", "") for h in e.get("hooks", []))]
+    # ga-7q35xn: o hook que reescreve `venv/bin/python -m pytest` — matcher PRÓPRIO (nunca `Bash`/`^Bash$`: o motor mescla por identidade de matcher e SUBSTITUIRIA os hooks do
+    # home-scan-guard/dangerous-command), filtro `if` para só rodar em comando que cita pytest, e o script do hook no comando
+    if want and not (len(pre_mine) == 1 and pre_mine[0].get("matcher") not in ("Bash", "^Bash$") and "venv-rewrite-hook.py" in pre_mine[0]["hooks"][0]["command"]
+                     and pre_mine[0]["hooks"][0].get("if") == "Bash(*pytest*)"):
+        errs.append(f"{role}: o overlay devia ter UM hook PreToolUse do pytest-shim (matcher próprio, if Bash(*pytest*), venv-rewrite-hook.py)")
+    if not want and pre_mine:
+        errs.append(f"{role}: o overlay não devia ter o hook PreToolUse do pytest-shim (só os workers)")
     mine = [e for e in ss if any("pytest-shim" in h.get("command", "") for h in e.get("hooks", []))]
     if want and not (len(mine) == 1 and mine[0].get("matcher") == "^(startup|resume|clear|compact)$" and "CLAUDE_ENV_FILE" in mine[0]["hooks"][0]["command"]):
         errs.append(f"{role}: o overlay devia ter UM hook SessionStart do pytest-shim (matcher ^(startup|resume|clear|compact)$, escreve em CLAUDE_ENV_FILE)")
@@ -242,6 +255,31 @@ p = sys.argv[1]; d = json.load(open(p)); d["hooks"]["SessionStart"] = "isto não
 json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
 PYEOF
 if run_check | grep -q Traceback; then bad "o check estoura traceback com SessionStart malformado"; else ok "SessionStart malformado não gera traceback"; fi
+# ga-7q35xn: o hook PreToolUse que reescreve `venv/bin/python -m pytest`
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p))
+m["common"]["hooks_extra_defs"]["pytest-shim"]["hooks"]["PreToolUse"][0]["matcher"] = "^Bash$"
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+expect_fail "matcher do hook PreToolUse volta a '^Bash\$' (substituiria os hooks do home-scan-guard na mescla por identidade)" "hook PreToolUse de 'pytest-shim' com matcher '^Bash\$'"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-wa-worker/.claude/settings.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["hooks"]["PreToolUse"] = [e for e in d["hooks"]["PreToolUse"] if not any("pytest-shim" in h.get("command", "") for h in e.get("hooks", []))]
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+expect_fail "overlay commitado do wa-worker sem o hook PreToolUse do pytest-shim" "perdeu o hook PreToolUse de 'pytest-shim'"
+if python3 -I "$PIN_SHIM_PY" "$T/packs/town-deltas/assets/claude-overlays" >/dev/null 2>&1; then bad "o pino NÃO pegou o wa-worker sem o PreToolUse"; else ok "reprova (pino independente): wa-worker sem o hook PreToolUse"; fi
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-dog/.claude/settings.json" "$T/packs/town-deltas/assets/claude-overlays/pool-wa-worker/.claude/settings.json" <<'PYEOF'
+import json, sys
+src = [e for e in json.load(open(sys.argv[2]))["hooks"]["PreToolUse"] if any("pytest-shim" in h.get("command", "") for h in e.get("hooks", []))]
+p = sys.argv[1]; d = json.load(open(p)); d["hooks"]["PreToolUse"] = d["hooks"].get("PreToolUse", []) + src
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+expect_fail "o hook PreToolUse vaza para o overlay do dog (que não o pediu)" "overlay 'dog': carrega o hook PreToolUse de 'pytest-shim'"
+if python3 -I "$PIN_SHIM_PY" "$T/packs/town-deltas/assets/claude-overlays" >/dev/null 2>&1; then bad "o pino NÃO pegou o PreToolUse no dog"; else ok "reprova (pino independente): o hook PreToolUse no dog"; fi
 # `live`: registrado != vivo. O hook é [ -f "$P" ] || exit 0, então um overlay correto com o script ausente é um no-op calado.
 reset_tree
 LIVEROOT="$W/liveroot"; mkdir -p "$LIVEROOT/.gascity-gastown-hq/scripts"
@@ -249,12 +287,15 @@ if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-r
 : > "$LIVEROOT/.gascity-gastown-hq/scripts/home-scan-guard.sh"
 # ga-fl2nek: com o guard presente e o atalho de pytest AUSENTE, os workers ficam INERT (o hook é `[ -x "$D/python3" ] || exit 0`: registrado e calado)
 if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT para o atalho de pytest ausente"; else echo "$o" | grep -q 'INERT.*wa-worker.*pytest-shim' && ok "live: guard presente + atalho de pytest AUSENTE = INERT no worker, rc != 0" || bad "live: sem INERT do atalho no output: $o"; fi
-mkdir -p "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin"; : > "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
+mkdir -p "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin"; : > "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"; chmod 755 "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
+# ga-7q35xn: python3 executável MAS o script do hook PreToolUse ausente = o hook PreToolUse é no-op calado (`[ -f … ]`), então `live` diz INERT para ele
+if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT sem o venv-rewrite-hook.py"; else echo "$o" | grep -q 'INERT.*wa-worker.*venv-rewrite-hook.py' && ok "live: python3 presente mas venv-rewrite-hook.py AUSENTE = INERT no worker, rc != 0" || bad "live: sem INERT do script do hook no output: $o"; fi
+: > "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/venv-rewrite-hook.py"
 # gate-fix (ga-fl2nek): python3 PRESENTE mas SEM bit de execução = o hook `[ -x ]` é no-op calado, então `live` diz INERT (antes dizia LIVE: o arquivo existia)
 chmod 644 "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
 if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT para o atalho sem bit de execução"; else echo "$o" | grep -q 'INERT.*wa-worker.*pytest-shim' && ok "live: atalho de pytest presente mas NÃO executável = INERT no worker, rc != 0" || bad "live: sem INERT do atalho não executável no output: $o"; fi
 chmod 755 "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
-if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)" && [ "$(echo "$o" | grep -c '^  LIVE')" = "6" ]; then ok "live: guard + atalho presentes = 4 guards e 2 atalhos de worker LIVE, rc 0"; else bad "live: esperava 6 LIVE e rc 0: $o"; fi
+if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)" && [ "$(echo "$o" | grep -c '^  LIVE')" = "8" ]; then ok "live: guard + atalho presentes = 4 guards e, por worker, python3 + venv-rewrite-hook.py (2 papéis × 2) LIVE, rc 0"; else bad "live: esperava 8 LIVE e rc 0: $o"; fi
 reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'EOF'
 import json, sys
 p = sys.argv[1]; m = json.load(open(p)); m["common"]["hooks"]["PreToolUse"][0]["hooks"][0]["if"] = "Bash(du *)"

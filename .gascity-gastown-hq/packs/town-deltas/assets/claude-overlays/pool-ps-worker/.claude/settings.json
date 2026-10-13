@@ -39,6 +39,17 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "^(Bash|pytest-shim-venv)$",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(*pytest*)",
+            "command": ": pytest-shim; D='/Users/athos/gt/.gascity-gastown-hq/scripts/pytest-shim/bin'; [ -x \"$D/python3\" ] && [ -f \"$D/../venv-rewrite-hook.py\" ] && command -v python3 >/dev/null 2>&1 || exit 0; exec python3 -I \"$D/../venv-rewrite-hook.py\"",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUse": [

@@ -9,7 +9,7 @@
 #   cópia extra e entrada com o nosso hook noutro matcher saem sem tocar no que não é nosso · --check não escreve e diz ACTIVE / INERT / NOT-ACTIVE (rc 1 nos dois últimos) ·
 #   alvos padrão = crews (as duas profundidades), NUNCA a raiz da cidade, o overlay-base, witness nem refinery · JSON ilegível ou hooks.SessionStart que não é lista não para os outros alvos ·
 #   manifesto sem a definição / sem o marcador = FATAL sem escrever nada.
-#   Controles negativos M1-M3: sem a idempotência semântica, sem a preservação dos hooks alheios e comando que diverge do manifesto — cada mutante tem de ser pego.
+#   Controles negativos M1-M4: sem a idempotência semântica, sem a preservação dos hooks alheios, comando que diverge do manifesto e só o SessionStart aplicado — cada mutante tem de ser pego.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ACT="$HERE/pytest-shim-activate.sh"
@@ -22,6 +22,7 @@ trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 ROOT="$T/gt"; mkdir -p "$ROOT/.gascity-gastown-hq/scripts/pytest-shim/bin" "$ROOT/.gascity-gastown-hq/packs/town-deltas/assets/claude-overlays" "$ROOT/wa/crew/oracle/.claude" "$ROOT/wa/crew/.claude" "$ROOT/ps/crew/mila/.claude" "$ROOT/wa/witness/.claude" "$ROOT/wa/refinery/.claude"
 cp "$MAN_SRC" "$ROOT/.gascity-gastown-hq/packs/town-deltas/assets/claude-overlays/pool-roles.json"
 : > "$ROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"; chmod +x "$ROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
+: > "$ROOT/.gascity-gastown-hq/scripts/pytest-shim/venv-rewrite-hook.py"   # ga-7q35xn: o hook PreToolUse também só vale com o script presente
 export PYTEST_SHIM_RIGS_ROOT="$ROOT" PYTEST_SHIM_GT_ROOT="$ROOT"
 CREW1="$ROOT/wa/crew/oracle/.claude/settings.json"; CREW2="$ROOT/ps/crew/mila/.claude/settings.json"; CREW3="$ROOT/wa/crew/.claude/settings.json"
 WIT="$ROOT/wa/witness/.claude/settings.json"; REF="$ROOT/wa/refinery/.claude/settings.json"
@@ -37,6 +38,7 @@ EOF
 }
 for f in "$CREW1" "$CREW2" "$CREW3"; do fresh "$f"; done; fresh "$WIT"; fresh "$REF"; fresh "$CITYS"
 WANT_CMD=$(jq -r '.hooks.SessionStart[] | select(.matcher == "^(startup|resume|clear|compact)$") | .hooks[0].command' "$WA_OVERLAY" | sed "s#/Users/athos/gt#$ROOT#")
+WANT_PRE_CMD=$(jq -r '.hooks.PreToolUse[] | select(.matcher == "^(Bash|pytest-shim-venv)$") | .hooks[0].command' "$WA_OVERLAY" | sed "s#/Users/athos/gt#$ROOT#")
 ss() { jq -c '.hooks.SessionStart' "$1"; }
 pre() { jq -c '.hooks.PreToolUse' "$1"; }
 
@@ -45,7 +47,8 @@ out=$("$ACT" 2>&1); rc=$?; expect "ativa: rc 0" 0 "$rc"
 for f in "$CREW1" "$CREW2" "$CREW3"; do
   expect "$(basename "$(dirname "$(dirname "$f")")") ($f): hook nosso presente" 1 "$(jq '[.hooks.SessionStart[] | select(.hooks[]? | .command | contains("pytest-shim"))] | length' "$f")"
   expect "…o gc prime --hook continua intacto, na posição 0" '{"matcher":"","hooks":[{"type":"command","command":"/Users/athos/.local/bin/gt prime --hook"}]}' "$(jq -c '.hooks.SessionStart[0]' "$f")"
-  expect "…os hooks do PreToolUse não foram tocados" '[{"matcher":"Bash","hooks":[{"type":"command","command":"dangerous-command-guard a"},{"type":"command","command":"dangerous-command-guard b"}]}]' "$(pre "$f")"
+  expect "…o dangerous-command (PreToolUse) continua intacto, na posição 0" '{"matcher":"Bash","hooks":[{"type":"command","command":"dangerous-command-guard a"},{"type":"command","command":"dangerous-command-guard b"}]}' "$(jq -c '.hooks.PreToolUse[0]' "$f")"
+  expect "…o hook PreToolUse nosso foi acrescentado, numa entrada própria" 1 "$(jq '[.hooks.PreToolUse[] | select(.hooks[]? | .command | contains("pytest-shim"))] | length' "$f")"
   expect "…permissions intactas" '["Bash(sudo:*)"]' "$(jq -c '.permissions.deny' "$f")"
 done
 for f in "$WIT" "$REF" "$CITYS"; do expect "alvo padrão NÃO inclui $(basename "$(dirname "$(dirname "$f")")")/…$(basename "$(dirname "$f")") (witness, refinery, raiz da cidade)" 0 "$(jq '[.hooks.SessionStart[]? | select(.hooks[]? | .command | contains("pytest-shim"))] | length' "$f")"; done
@@ -53,6 +56,11 @@ for f in "$WIT" "$REF" "$CITYS"; do expect "alvo padrão NÃO inclui $(basename 
 expect "o comando escrito == o comando do overlay do wa-worker (fonte única)" "$WANT_CMD" "$(jq -r '.hooks.SessionStart[1].hooks[0].command' "$CREW1")"
 expect "o matcher é próprio, não o do gc prime" '^(startup|resume|clear|compact)$' "$(jq -r '.hooks.SessionStart[1].matcher' "$CREW1")"
 expect "o timeout vem do manifesto" 5 "$(jq '.hooks.SessionStart[1].hooks[0].timeout' "$CREW1")"
+# 2b o PreToolUse (ga-7q35xn): mesma fonte do overlay do wa-worker, matcher PRÓPRIO (nunca Bash: o motor mescla por identidade e SUBSTITUIRIA o dangerous-command), filtro `if`
+expect "o comando PreToolUse escrito == o do overlay do wa-worker (fonte única)" "$WANT_PRE_CMD" "$(jq -r '.hooks.PreToolUse[1].hooks[0].command' "$CREW1")"
+expect "o matcher do PreToolUse é próprio, não 'Bash'" '^(Bash|pytest-shim-venv)$' "$(jq -r '.hooks.PreToolUse[1].matcher' "$CREW1")"
+expect "o filtro if vem do manifesto (o Python só roda em comando que cita pytest)" 'Bash(*pytest*)' "$(jq -r '.hooks.PreToolUse[1].hooks[0].if' "$CREW1")"
+expect "o hook PreToolUse chama o venv-rewrite-hook.py" 1 "$(jq -r '.hooks.PreToolUse[1].hooks[0].command' "$CREW1" | grep -c 'venv-rewrite-hook.py')"
 # 3 idempotente: 2ª execução não reescreve nem faz backup
 before=$(ls "$ROOT"/wa/crew/oracle/.claude | wc -l | tr -d ' ')
 out=$("$ACT" 2>&1); rc=$?; expect "2ª execução: rc 0" 0 "$rc"; expect "2ª execução: tudo ACTIVE" 3 "$(echo "$out" | grep -c '^ACTIVE')"
@@ -74,6 +82,10 @@ expect "o hook nosso dobrado em outro matcher saiu, o alheio ficou" '[{"type":"c
 mv "$ROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3" "$T/py3.away"
 out=$("$ACT" --check 2>&1); rc=$?; expect "--check com o atalho ausente: rc 1" 1 "$rc"; expect "…diz INERT (registrado mas no-op) nas 3 crews ativadas" 3 "$(echo "$out" | grep -c "^INERT")"
 mv "$T/py3.away" "$ROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
+# 6b ga-7q35xn: python3 presente mas o script do hook PreToolUse ausente também é INERT (o PreToolUse é `[ -f … ]`: registrado e calado)
+mv "$ROOT/.gascity-gastown-hq/scripts/pytest-shim/venv-rewrite-hook.py" "$T/hook.away"
+out=$("$ACT" --check 2>&1); rc=$?; expect "--check com o script do hook ausente: rc 1" 1 "$rc"; expect "…diz INERT nas 3 crews ativadas" 3 "$(echo "$out" | grep -c "^INERT")"
+mv "$T/hook.away" "$ROOT/.gascity-gastown-hq/scripts/pytest-shim/venv-rewrite-hook.py"
 # 7 alvo ruim não para os outros
 printf '{ isto nao e json' > "$ROOT/wa/crew/.claude/settings.json"; fresh "$CREW2"
 out=$("$ACT" 2>&1); rc=$?; expect "JSON ilegível: rc 1 (falhou um alvo)" 1 "$rc"; expect "…mas a crew boa foi ativada" 1 "$(jq '[.hooks.SessionStart[] | select(.hooks[]? | .command | contains("pytest-shim"))] | length' "$CREW2")"
@@ -103,9 +115,14 @@ mutant m2 's#then (($e.hooks // \[\]) + \[$hook\])#then [$hook]#' && {
   "$T/mut-m2.sh" "$CREW1" >/dev/null 2>&1; c=$(jq '[.hooks.SessionStart[].hooks[] | select(.command == "hook-alheio")] | length' "$CREW1")
   n=$((n+1)); if [ "$c" = 0 ]; then echo "ok   M2 sem a preservação, o hook alheio na entrada dedicada some (o caso 5 reprova o mutante)"; else echo "FAIL M2: o mutante NÃO foi pego (hook alheio ainda lá: $c)"; fails=$((fails+1)); fi; }
 # M3 comando que diverge do manifesto: o mutante escreve outro texto
-mutant m3 's#--argjson hook "\$HOOK"#--argjson hook "{\\"type\\":\\"command\\",\\"command\\":\\": pytest-shim; exit 0\\",\\"timeout\\":5}"#' && {
+mutant m3 's#--argjson defs "\$DEFS"#--argjson defs "[{\\"event\\":\\"SessionStart\\",\\"matcher\\":\\"^(startup|resume|clear|compact)$\\",\\"hook\\":{\\"type\\":\\"command\\",\\"command\\":\\": pytest-shim; exit 0\\",\\"timeout\\":5}}]"#' && {
   fresh "$CREW1"; "$T/mut-m3.sh" "$CREW1" >/dev/null 2>&1; got=$(jq -r '.hooks.SessionStart[1].hooks[0].command' "$CREW1")
   n=$((n+1)); if [ "$got" != "$WANT_CMD" ]; then echo "ok   M3 comando divergente do manifesto é visível (o caso 2 reprova o mutante)"; else echo "FAIL M3: o mutante NÃO foi pego"; fails=$((fails+1)); fi; }
+
+# M4 só o SessionStart é aplicado: o hook PreToolUse nunca chega à crew
+mutant m4 's#reduce \$defs\[\] as \$d#reduce ($defs | map(select(.event == "SessionStart")))[] as $d#' && {
+  fresh "$CREW1"; "$T/mut-m4.sh" "$CREW1" >/dev/null 2>&1; c=$(jq '[.hooks.PreToolUse[]? | select(.hooks[]? | .command | contains("pytest-shim"))] | length' "$CREW1")
+  n=$((n+1)); if [ "$c" = 0 ]; then echo "ok   M4 sem o laço por evento o PreToolUse não chega à crew (o caso 1 reprova o mutante)"; else echo "FAIL M4: o mutante NÃO foi pego (PreToolUse nosso: $c)"; fails=$((fails+1)); fi; }
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

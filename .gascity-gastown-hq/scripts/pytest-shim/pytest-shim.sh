@@ -17,7 +17,10 @@
 # O QUE INTERCEPTA — medido em 601 chamadas de Bash dos workers e crews em 14 dias: `python3 -m pytest` é a forma dominante (288) e
 #   `venv/bin/python -m pytest` a segunda (161); o `pytest` solto é minoria. Por isso `python3`/`python` olham os argumentos e só desvia
 #   `[opções do python] -m pytest ...` (também `-mpytest`); qualquer outra coisa executa o python de verdade, com os mesmos argumentos e o mesmo
-#   stdin. LIMITE CONHECIDO: `venv/bin/python -m pytest` (caminho explícito) NÃO passa pelo PATH e não é desviado por este atalho.
+#   stdin. `venv/bin/python -m pytest` (caminho explícito) NÃO passa pelo PATH: quem o desvia é o hook PreToolUse venv-rewrite-hook.py (ga-7q35xn), que reescreve
+#   o comando para `env PYTEST_SHIM_PY=<esse python> <atalho>/bin/python3 -m pytest ...`. PYTEST_SHIM_PY é o python que o worker DIGITOU: toda execução local
+#   (passe direto, motivo de deixar passar, fallback do gate) usa ELE e nunca o python3 do PATH (outras dependências = outro resultado de teste). É lido e
+#   REMOVIDO do ambiente logo no início (não vaza para um python3 aninhado do teste) e tornado absoluto contra o cwd (o gate pode mudar de diretório).
 #
 # QUANDO NÃO INTERCEPTA (roda o comando de hoje, sem nenhuma saída a mais):
 #   atalho já ativo (execução aninhada, ex.: um teste que chama python3 -m pytest) · GC_PYTEST_SHIM=off no comando · offload desligado
@@ -47,6 +50,10 @@ esac
 CITY=${PYTEST_SHIM_CITY:-${GC_CITY_PATH:-${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}}}
 LOG="$CITY/.gc/logs/pytest-shim.jsonl"
 REAL=""; SKIP=0; SHEBANG_PY=""
+# vazio (variável ausente) → o comportamento de sempre (python do PATH); ilegível (caminho que não executa) → não há python do worker para rodar: o `exec` abaixo
+# falha com o erro do sistema, rc 126/127, como o comando original falharia, e NUNCA cai para o python3 do PATH
+VENV_PY=${PYTEST_SHIM_PY:-}; unset PYTEST_SHIM_PY
+case $VENV_PY in ''|/*) ;; *) VENV_PY=$PWD/$VENV_PY ;; esac
 
 # REAL = o primeiro executável `$1` do PATH que não seja o diretório deste atalho (nem outro nome para o mesmo arquivo: PATH com o diretório duas
 # vezes, ou por um symlink, não pode virar recursão). Não acha → alguns lugares conhecidos; não acha nada → rc 1. Sem subshell: o resultado vai na variável.
@@ -98,6 +105,7 @@ log_pass() { # $1 = motivo
 
 run_real() { # $1 = nome; o resto são os argumentos ORIGINAIS
   _rr_name=$1; shift
+  [ -n "$VENV_PY" ] && [ "$_rr_name" != pytest ] && exec "$VENV_PY" "$@"
   find_real "$_rr_name" || { printf '%s: command not found\n' "$_rr_name" >&2; exit 127; }
   exec "$REAL" "$@"
 }
@@ -165,7 +173,7 @@ case "$SHIM_AS" in
   pytest)
     if find_real pytest && shebang_python "$REAL"; then real_py=$SHEBANG_PY; fi
     [ -n "$real_py" ] || { find_real python3 && real_py=$REAL; } ;;
-  *) find_real "$SHIM_AS" && real_py=$REAL ;;
+  *) if [ -n "$VENV_PY" ]; then [ -x "$VENV_PY" ] && real_py=$VENV_PY; else find_real "$SHIM_AS" && real_py=$REAL; fi ;;
 esac
 if [ -z "$real_py" ]; then
   # sem python de verdade não há como rodar nem aqui: o comando original dá o erro de "não achei" que o worker veria sem o atalho
