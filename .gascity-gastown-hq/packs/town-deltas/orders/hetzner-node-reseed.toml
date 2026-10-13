@@ -1,0 +1,16 @@
+# ga-zri39b: daily reseed of the Hetzner test node (its base tree through the security filter, and its Python venv when the mini's freeze changed).
+#
+# The node has its own flag ($CITY/.gc/hetzner-node.on) and is a dedicated machine, so this is NOT folded into mbp-nightly-reseed (built around the MacBook's switch and
+# pause). With the flag absent the wrapper is a silent no-op: the trial ends by deleting the flag and this order stops by itself.
+#
+# CRON IS UTC (see engine-window-reboot-noon.toml): 08:55 UTC = 05:55 local (-03) — after the 04:47-05:37 restic window and the MBP reseed at 05:50, before the 06:30 lotes
+# rebuild. A run is an rsync delta plus a few ssh round trips; a dependency change adds a `uv pip install`.
+#
+# Verify after a reload:  gc order show hetzner-node-reseed   -> Source: .../town-deltas/...
+#                         tail -n 3 $GC_CITY_PATH/.gc/logs/hetzner-node-reseed.jsonl
+[order]
+description = "Daily reseed of the Hetzner test node: base tree through the security filter (--delete-excluded) + audit + venv reinstall when the freeze changed (ga-zri39b); no-op while the node flag is absent"
+trigger = "cron"
+schedule = "55 8 * * *"
+timeout = "1000s"
+exec = "$PACK_DIR/assets/scripts/hetzner-node-reseed-order.sh"
