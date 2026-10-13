@@ -944,6 +944,109 @@ log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [story-delivery] $*"; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [story-delivery] ERROR: $*"; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [story-delivery] WARN: $*"; }
 
+# ── ga-njpnhv: a terminal write is READ BACK, never assumed ────────────────────
+# BEGIN verified-writes (story-delivery-terminal-write-verified.test.sh extracts this
+# region by these two markers -- keep them)
+#
+# THE BUG (13/10 ga-mzw9dt.3; the evening before, ga-dzzqvw): Step 8 wrote `label add
+# story:done` and `close` as `bd ... -q 2>/dev/null || true`, then logged "story:done set
+# on <id>" unconditionally and the sweep reported PASS. On both beads every write in a
+# ~5s window never landed (the `✓ Added label ...` echo a healthy run leaves in the log
+# is absent; five minutes later the bead still read story:approved + delivery:running),
+# so a human closed one by hand. 2 of 296 deliveries -- both in the last 7h -- and bd's
+# stderr, the only evidence of WHY, went to /dev/null: the cause of the write failure is
+# still unmeasured. This makes the next one say it, retry it, and refuse to call it done.
+#
+# "Written" and "bd said nothing" used to be one outcome. A write now ends in one of
+# THREE: landed (the bead reads back as asked) / did not land / could not tell.
+# Scope: every label/close/comment write of Step 8 (the terminal), where the false
+# success was claimed. The ~50 halt-path writes elsewhere in this file still use
+# `-q 2>/dev/null || true`; moving them onto these helpers is the same one-line change
+# each, not done here (each has its own test stub to adapt).
+DELIVERY_WRITE_DEGRADED=0
+
+# _delivery_verify <label-present|label-absent|closed|none> <id> [<label>]
+#   0 = the bead reads as asked · 1 = it does not · 2 = the bead could not be read.
+# `jq -e` alone exits 1 for false AND null and 5 for an error, so the exit code is mapped
+# here: a bead that did not come back must never read as "the label is absent".
+_delivery_verify() {
+  local mode="$1" sid="$2" label="${3:-}" out prog rc=0
+  local pre='(if type=="array" then .[0] else . end) as $b | if (($b|type)!="object") or (($b.id // "")=="") then error("no bead") else ('
+  local post=') end'
+  case "$mode" in
+    none)          return 0 ;;
+    label-present) prog='any(($b.labels // [])[]; . == $l)' ;;
+    label-absent)  prog='any(($b.labels // [])[]; . == $l) | not' ;;
+    closed)        prog='$b.status == "closed"' ;;
+    *)             return 2 ;;
+  esac
+  out=$(bd -C "$STORY_STORE" show "$sid" --json 2>/dev/null) || return 2
+  if printf '%s' "$out" | jq -e --arg l "$label" "${pre}${prog}${post}" >/dev/null 2>&1; then
+    return 0
+  else
+    rc=$?
+  fi
+  [ "$rc" = "1" ] && return 1
+  return 2
+}
+
+# _delivery_write <what> <id> <mode> <label> -- <bd subcommand args...>
+#   Runs `bd -C $STORY_STORE <args>`, then reads the bead back (mode, see above). Only a
+#   confirmed read-back is "landed" (return 0). 1 = did not land. 2 = bd exited 0 but the
+#   bead could not be read back (written, unconfirmed -- not claimed as done).
+#   A read-back that matches wins over bd's exit code: `label remove` of a label that is
+#   already gone exits non-zero and is still the state we asked for.
+#   Retries (DELIVERY_WRITE_ATTEMPTS, default 3, backoff DELIVERY_WRITE_BACKOFF_S * n) are
+#   safe because add/remove/close are idempotent. After one write exhausts its retries the
+#   rest of THIS story's terminal makes a single attempt each (DELIVERY_WRITE_DEGRADED), so
+#   a real outage costs one backoff, not one per write. bd's stdout is left alone (it is the
+#   "✓ Added label" echo the log relies on); its stderr is kept and printed on failure.
+#   `none` (comments) has no read-back: bd's exit status is all there is, and says so.
+_delivery_write() {
+  local what="$1" sid="$2" mode="$3" label="$4" word=landed
+  shift 5
+  local max="${DELIVERY_WRITE_ATTEMPTS:-3}" gap="${DELIVERY_WRITE_BACKOFF_S:-2}"
+  local attempt=1 rc=0 state=1 errf said="" nosay="<nothing on stderr>"
+  case "$max" in ''|*[!0-9]*|0) max=3 ;; esac
+  case "$gap" in ''|*[!0-9]*) gap=2 ;; esac
+  [ "${DELIVERY_WRITE_DEGRADED:-0}" = "1" ] && max=1
+  errf=$(mktemp "${TMPDIR:-/tmp}/delivery-write.XXXXXX" 2>/dev/null) || errf=/dev/null
+  # no capture file is a THIRD answer, not "bd said nothing": never print the second for the third
+  [ "$errf" = "/dev/null" ] && nosay="<stderr not captured: mktemp failed>"
+  while :; do
+    if bd -C "$STORY_STORE" "$@" 2>"$errf"; then rc=0; else rc=$?; fi
+    if [ "$mode" = "none" ]; then
+      if [ "$rc" = "0" ]; then state=0; else state=1; fi
+    elif _delivery_verify "$mode" "$sid" "$label"; then
+      state=0
+    else
+      state=$?
+    fi
+    if [ "$state" = "0" ]; then
+      [ "$errf" = "/dev/null" ] || rm -f "$errf"
+      return 0
+    fi
+    [ "$attempt" -ge "$max" ] && break
+    [ "$errf" = "/dev/null" ] || said=$(head -c 200 "$errf" | tr '\n' ' ')
+    warn "bd $what: attempt $attempt/$max did not land (bd rc=$rc, read-back=$([ "$state" = "2" ] && echo unreadable || echo not-as-asked)); retrying in $((gap * attempt))s. bd said: ${said:-$nosay}"
+    sleep "$((gap * attempt))"
+    attempt=$((attempt + 1))
+  done
+  DELIVERY_WRITE_DEGRADED=1
+  [ "$state" = "2" ] && word=unreadable || word=not-as-asked
+  [ "$errf" = "/dev/null" ] || said=$(head -c 300 "$errf" | tr '\n' ' ')
+  err "FAIL: bd $what did NOT land after $attempt attempt(s) -- bd rc=$rc, read-back=$word. bd said: ${said:-$nosay}"
+  [ "$errf" = "/dev/null" ] || rm -f "$errf"
+  if [ "$rc" = "0" ] && [ "$state" = "2" ]; then return 2; fi
+  return 1
+}
+
+delivery_label_add()    { _delivery_write "label add $2 on $1"    "$1" label-present "$2" -- label add    "$1" "$2" -q; }
+delivery_label_remove() { _delivery_write "label remove $2 on $1" "$1" label-absent  "$2" -- label remove "$1" "$2" -q; }
+delivery_close()        { _delivery_write "close $1"              "$1" closed        ""   -- close "$1" -r "$2"; }
+delivery_comment()      { _delivery_write "comment on $1"         "$1" none          ""   -- comment "$1" "$2"; }
+# END verified-writes
+
 echo ""
 log "=== Delivery sweep start (DRY_RUN=${DRY_RUN}) ==="
 
@@ -4418,9 +4521,15 @@ fi
 DELIVERY_END=$(date +%s)
 ELAPSED=$((DELIVERY_END - DELIVERY_START))
 
+# ga-njpnhv: which terminal writes did NOT land (read back), space-separated; empty = all did.
+# Reset per story, and so is the degraded latch: one story's outage must not make the next
+# story's writes single-attempt.
+TERMINAL_WRITE_FAIL=""
+STORY_DONE_LANDED=0
+DELIVERY_WRITE_DEGRADED=0
+
 if [ "$DRY_RUN" = "1" ]; then
-  log "DRY_RUN=1 — WOULD: bd label remove $STORY_ID delivery:running"
-  log "DRY_RUN=1 — WOULD: bd label add $STORY_ID story:done"
+  log "DRY_RUN=1 — WOULD: bd label add $STORY_ID story:done, then (read back) label remove $STORY_ID delivery:running"
   log "DRY_RUN=1 — WOULD: bd comment $STORY_ID 'Delivery COMPLETE...'"
   log "DRY_RUN=1 — notify 'Story $STORY_ID done'"
   # ga-i53ua: durable terminal — the data-level close that takes the executed
@@ -4429,8 +4538,25 @@ if [ "$DRY_RUN" = "1" ]; then
   log "DRY_RUN=1 — WOULD: bd label remove $STORY_ID story:in-flight"
   log "DRY_RUN=1 — WOULD: bd close $STORY_ID -r 'Story DELIVERED … (ga-i53ua durable terminal; delivery close_reason → painel Done)'"
 else
-  bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-  bd -C "$STORY_STORE" label add    "$STORY_ID" "story:done"       -q 2>/dev/null || true
+  # ga-njpnhv: story:done FIRST, and only a story:done that reads back releases the lock.
+  # Before: the lock was released, then the label added with `|| true` -- a lost add left
+  # the story with NEITHER (the next sweep re-delivered it from scratch) while the log said
+  # "set". delivery:running stays when story:done did not land: it is the lock every sweep
+  # already respects (a stale one is renewed and re-processed, ga-015qqe).
+  if delivery_label_add "$STORY_ID" "story:done"; then
+    STORY_DONE_LANDED=1
+    delivery_label_remove "$STORY_ID" "delivery:running" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL remove:delivery:running"
+  else
+    TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL add:story:done"
+  fi
+  # What the comment and the push below may claim follows what actually landed.
+  if [ "$STORY_DONE_LANDED" = "1" ]; then
+    DONE_HEAD="Delivery COMPLETE. story:done"
+    DONE_TITLE="Story DONE"; DONE_PRIO=2
+  else
+    DONE_HEAD="Delivery DEPLOYED, but the story:done label did NOT land (ga-njpnhv) — this bead is NOT marked done"
+    DONE_TITLE="Story deployed, NOT marked done"; DONE_PRIO=4
+  fi
 
   # wa-wzvg: detect Pilot origin (durable "pilot:dispatched" label set by the
   # Pilot when it autonomously pulled the story). Used to differentiate the
@@ -4464,13 +4590,13 @@ else
     # judged it not needed). delivery:daemon-unverified means "could not check";
     # putting this case under it would make two different facts one label, and
     # tell Athos "may still be dormant" about something the system judged safe.
-    symbol_unreachable_locked) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-stale-locked" -q 2>/dev/null || true ;;
+    symbol_unreachable_locked) delivery_label_add "$STORY_ID" "delivery:daemon-stale-locked" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL add:delivery:daemon-stale-locked" ;;
     # ga-xrn8ni: same third answer, on human- rather than automation-attested
     # evidence — a human, not daemon-refresh.sh, confirmed the still-stale
     # daemon(s) unreachable for this exact merge. Own label, own tier: folding
     # it into symbol_unreachable_locked would claim notify_only_locked status
     # this daemon may not have (it may just be SENSITIVE with no drain path).
-    symbol_unreachable_human_confirmed) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-stale-human-confirmed" -q 2>/dev/null || true ;;
+    symbol_unreachable_human_confirmed) delivery_label_add "$STORY_ID" "delivery:daemon-stale-human-confirmed" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL add:delivery:daemon-stale-human-confirmed" ;;
     # ga-65o94h: same third answer, on the helper's closure-only evidence — the
     # still-stale daemon(s) are not locked (they CAN be restarted) but only
     # share an import closure with the merge and have no call-graph path to a
@@ -4478,8 +4604,8 @@ else
     # locked would claim notify_only_locked status they do not have, and folding
     # it into delivery:daemon-unverified would say "may still be dormant" about
     # something the system checked and judged not needed.
-    symbol_unreachable_closure_only) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-stale-closure-only" -q 2>/dev/null || true ;;
-    *) bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:daemon-unverified" -q 2>/dev/null || true ;;
+    symbol_unreachable_closure_only) delivery_label_add "$STORY_ID" "delivery:daemon-stale-closure-only" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL add:delivery:daemon-stale-closure-only" ;;
+    *) delivery_label_add "$STORY_ID" "delivery:daemon-unverified" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL add:delivery:daemon-unverified" ;;
   esac
 
   # UNTESTED terminal success is now NO_HARNESS=1 ONLY (ga-857v FIX 2: a missing
@@ -4488,20 +4614,20 @@ else
     DONE_TEST_LINE="SKIPPED — rig '$RIG' has no prod-test harness (interim policy per ga-dqp)."
     DONE_NOTE="a real prod-test harness for this rig is a DESTINY follow-up item."
     DONE_PUSH_TAIL="prod test SKIPPED (no harness for $RIG)"
-    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:untested).
+    delivery_comment "$STORY_ID" "$DONE_HEAD (delivery:untested).
 Rig: $RIG
 Deploy: $DEPLOY_CMD
 Prod test: $DONE_TEST_LINE
 Elapsed: ${ELAPSED}s
 $(refino_criteria_status_line "${MISSING_META:-}")
-NOTE: $DONE_NOTE" 2>/dev/null || true
+NOTE: $DONE_NOTE" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL comment:delivery-complete"
     # wa-uthi: TERMINAL SUCCESS (story:done) — push KEPT. wa-wzvg: Pilot-differentiated.
-    notify -t "${PILOT_PREFIX}Story DONE (untested)" -p 2 "${PILOT_PREFIX}Story $STORY_ID ($STORY_TITLE) — deployed, $DONE_PUSH_TAIL" 2>/dev/null || true
+    notify -t "${PILOT_PREFIX}${DONE_TITLE} (untested)" -p "$DONE_PRIO" "${PILOT_PREFIX}Story $STORY_ID ($STORY_TITLE) — deployed, $DONE_PUSH_TAIL" 2>/dev/null || true
   else
     # delivery:tested — rig harness passed (full when a story-specific test exists,
     # baseline-only when it does not — ga-857v FIX 2). Add an explicit
     # delivery:tested label so the tested state is queryable (acceptance wording).
-    bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:tested" -q 2>/dev/null || true
+    delivery_label_add "$STORY_ID" "delivery:tested" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL add:delivery:tested"
     if [ "$STORY_TEST_MISSING" = "1" ]; then
       DONE_TEST_LINE="$PROD_TEST_SCRIPT — rig BASELINE harness only, no story-specific test (ga-857v FIX 2)"
       DONE_PUSH_TAIL="deployed + baseline-tested in prod"
@@ -4531,16 +4657,21 @@ NOTE: $DONE_NOTE" 2>/dev/null || true
       symbol_unreachable_closure_only) DONE_PUSH_TAIL="deployed + tested in prod; a daemon still runs the old code but only shares an import closure with this merge — no call-graph path from it to a symbol this merge changed (evidence, not proof; see delivery:daemon-stale-closure-only)" ;;
       *) DONE_PUSH_TAIL="deployed (rig harness passed); DAEMON LIVENESS NOT VERIFIED — merged code may still be dormant, see delivery:daemon-unverified" ;;
     esac
-    bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery COMPLETE. story:done (delivery:tested).
+    delivery_comment "$STORY_ID" "$DONE_HEAD (delivery:tested).
 Rig: $RIG
 Deploy: $DEPLOY_CMD
 Prod test: $DONE_TEST_LINE
 Elapsed: ${ELAPSED}s
-$(refino_criteria_status_line "${MISSING_META:-}")" 2>/dev/null || true
+$(refino_criteria_status_line "${MISSING_META:-}")" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL comment:delivery-complete"
     # wa-uthi: TERMINAL SUCCESS (story:done) — push KEPT. wa-wzvg: Pilot-differentiated.
-    notify -t "${PILOT_PREFIX}Story DONE" -p 2 "${PILOT_PREFIX}Story $STORY_ID ($STORY_TITLE) — $DONE_PUSH_TAIL" 2>/dev/null || true
+    notify -t "${PILOT_PREFIX}${DONE_TITLE}" -p "$DONE_PRIO" "${PILOT_PREFIX}Story $STORY_ID ($STORY_TITLE) — $DONE_PUSH_TAIL" 2>/dev/null || true
   fi
-  log "story:done set on $STORY_ID"
+  # ga-njpnhv: the claim follows the read-back, never the attempt.
+  if [ "$STORY_DONE_LANDED" = "1" ]; then
+    log "story:done set on $STORY_ID"
+  else
+    err "story:done was NOT set on $STORY_ID — the write did not land (FAIL line above). Deployed and prod-tested, but NOT marked done: delivery:running is kept as the lock, and once it is stale (ga-015qqe) a later sweep re-processes this story."
+  fi
 
   # ── ga-i53ua: DRIVE THE STORY TO ITS DURABLE TERMINAL STATE ─────────────────
   # THE BUG: the steps above add the story:done LABEL but never (a) remove the
@@ -4565,16 +4696,16 @@ $(refino_criteria_status_line "${MISSING_META:-}")" 2>/dev/null || true
   # Fully guarded: every step `|| true`. If close fails (e.g. cross-store no-op),
   # the merged-bead-janitor remains a backstop, but the story:approved REMOVAL
   # above still pulls the bead out of Aprovadas even if it stays open.
-  bd -C "$STORY_STORE" label remove "$STORY_ID" "story:approved"  -q 2>/dev/null || true
-  bd -C "$STORY_STORE" label remove "$STORY_ID" "story:in-flight" -q 2>/dev/null || true
+  delivery_label_remove "$STORY_ID" "story:approved" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL remove:story:approved"
+  delivery_label_remove "$STORY_ID" "story:in-flight" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL remove:story:in-flight"
   # ga-iwv0: this terminal is reached only after the daemon-refresh verified the deploy is LIVE,
   # so clear any deploy-pending/failed markers left by an earlier halted attempt — the bead is
   # now genuinely deployed; stale markers must not linger on a delivered story.
-  bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:deploy-pending" -q 2>/dev/null || true
-  bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:failed"          -q 2>/dev/null || true
+  delivery_label_remove "$STORY_ID" "delivery:deploy-pending" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL remove:delivery:deploy-pending"
+  delivery_label_remove "$STORY_ID" "delivery:failed" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL remove:delivery:failed"
   # ga-2kaan2: Step 6a already dropped a stale delivery:pending-vm, but with `|| true`; a failed
   # removal there must not leave a hold label on a story that is now delivered.
-  bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:pending-vm"      -q 2>/dev/null || true
+  delivery_label_remove "$STORY_ID" "delivery:pending-vm" || TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL remove:delivery:pending-vm"
   # wa-xokje: this story is genuinely delivered now — drop its halt-dedup
   # fingerprint (see Step 5b) so a FUTURE, unrelated halt on this same
   # STORY_ID (should one ever recur) is never silently matched against a
@@ -4589,18 +4720,24 @@ $(refino_criteria_status_line "${MISSING_META:-}")" 2>/dev/null || true
   # already the single, accurate source of truth for what was actually
   # confirmed (including the NOT-verified case); repeating a blanket "verified"
   # claim in the same sentence would just contradict it.
-  DELIVERY_CLOSE_REASON="Story DELIVERED — story:done (rig $RIG, ${DONE_PUSH_TAIL:-delivered}). Closed by story-delivery (ga-i53ua durable terminal)."
+  if [ "$STORY_DONE_LANDED" = "1" ]; then
+    DELIVERY_CLOSE_REASON="Story DELIVERED — story:done (rig $RIG, ${DONE_PUSH_TAIL:-delivered}). Closed by story-delivery (ga-i53ua durable terminal)."
+  else
+    DELIVERY_CLOSE_REASON="Story DELIVERED — deployed (rig $RIG, ${DONE_PUSH_TAIL:-delivered}), but the story:done label did NOT land (ga-njpnhv). Closed by story-delivery (ga-i53ua durable terminal)."
+  fi
   CLOSE_STATUS_NOW=$(bd -C "$STORY_STORE" show "$STORY_ID" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || echo "open")
   if [ "$CLOSE_STATUS_NOW" != "closed" ]; then
-    if bd -C "$STORY_STORE" close "$STORY_ID" -r "$DELIVERY_CLOSE_REASON" 2>/dev/null; then
+    if delivery_close "$STORY_ID" "$DELIVERY_CLOSE_REASON"; then
       log "Story $STORY_ID CLOSED (delivery terminal: story:approved removed; delivery close_reason → painel Done)."
     else
+      TERMINAL_WRITE_FAIL="$TERMINAL_WRITE_FAIL close"
       warn "Could not close story $STORY_ID at delivery terminal (non-fatal; story:approved already removed so it leaves Aprovadas; merged-bead-janitor backstops the close)."
     fi
   else
     log "Story $STORY_ID already closed — story:approved removed; delivery terminal idempotent."
   fi
+  [ -z "$TERMINAL_WRITE_FAIL" ] || err "FAIL: terminal writes for $STORY_ID that did NOT land:$TERMINAL_WRITE_FAIL (each has its own FAIL line above with bd's stderr)"
 fi
 
 # ── Step 9: Log to story-delivery.jsonl ───────────────────────────────────────
@@ -4608,6 +4745,10 @@ fi
 # a missing story-specific test now runs the rig baseline → PASS (tested).
 if [ "$DRY_RUN" = "1" ]; then
   DELIVERY_RESULT="dry_run"
+elif [ "$STORY_DONE_LANDED" != "1" ]; then
+  # ga-njpnhv: deployed, but story:done never read back. "PASS" here was the false claim;
+  # the name carries FAIL so gate-health-monitor's [DELIVERY-FAIL] alarm picks it up as is.
+  DELIVERY_RESULT="PASS_TERMINAL_WRITE_FAIL"
 elif [ "$NO_HARNESS" = "1" ]; then
   DELIVERY_RESULT="PASS_UNTESTED"
 else
@@ -4624,12 +4765,13 @@ jq -c -n \
   --arg prod_test "$PROD_TEST_SCRIPT" \
   --argjson elapsed_s "$ELAPSED" \
   --arg dry_run "$DRY_RUN" \
-  '{ts: $ts, event: "delivery_complete", story_id: $story_id, story_title: $story_title,
+  --arg terminal_failed "${TERMINAL_WRITE_FAIL# }" \
+  '{ts: $ts, event: "delivery_complete", story_id: $story_id, story: $story_id, story_title: $story_title,
     rig: $rig, result: $result, deploy_cmd: $deploy_cmd, prod_test: $prod_test,
-    elapsed_s: $elapsed_s, dry_run: $dry_run}' \
+    elapsed_s: $elapsed_s, dry_run: $dry_run, terminal_failed: $terminal_failed}' \
   >> "$DELIVERY_LOG" 2>/dev/null || true
 
-log "=== Delivery sweep complete: story=$STORY_ID rig=$RIG result=$([ "$DRY_RUN" = "1" ] && echo dry_run || echo PASS) elapsed=${ELAPSED}s ==="
+log "=== Delivery sweep complete: story=$STORY_ID rig=$RIG result=$([ "$DRY_RUN" = "1" ] && echo dry_run || { [ "$DELIVERY_RESULT" = "PASS_TERMINAL_WRITE_FAIL" ] && echo PASS_TERMINAL_WRITE_FAIL || echo PASS; }) elapsed=${ELAPSED}s ==="
 
 done < <(echo "$STORIES_JSON" | jq -c '.[]')
 log "=== Delivery sweep finished ==="
