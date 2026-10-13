@@ -19,8 +19,8 @@
 #   mbp-run.sh --check               # imprime a saúde do MBP (preflight, com a presença do Athos e as tarefas em curso) e sai
 #   mbp-run.sh --remote-pause on|off # grava/remove ~/gt-remote/PAUSE no MBP (a chave "pausar até eu liberar"; quem chama é o mbp-offload.sh)
 #   mbp-run.sh --install-tools       # copia mbp-presence.sh e mbp-controle.sh (como `gascity-mbp`) para ~/gt-remote/bin/ no MBP
-#   mbp-run.sh --host linux|mbp ...  # fixa UM host (sem a cadeia): vale para --check
-#        --host linux --check          saúde do nó Linux (preflight + bandeira + filtro)
+#   mbp-run.sh --host linux|mbp ...  # fixa UM host (sem a cadeia): vale para --check, e é como o shadow roda o lado do MBP
+#        --host linux --check          saúde do nó Linux (preflight + bandeira + janela da sombra)
 #
 # CÓDIGOS DE SAÍDA — qualquer 96..99 significa "rode local": quem chama NUNCA trata isso como falha de teste.
 #   0..95  código do pytest/comando remoto (propagado)
@@ -37,13 +37,20 @@
 #   LIGA/DESLIGA  arquivo $CITY/.gc/hetzner-node.on (apagar = desligar; o nó em si é do Mayor). Independe do mbp-offload.on e da pausa do Athos:
 #                 a pausa existe porque o MBP é o notebook dele, o nó é máquina dedicada (presença sempre LIVRE).
 #   CADEIA        nó Linux -> MBP -> mini, com os mesmos códigos 96..99: qualquer motivo para o nó não rodar (bandeira, inalcançável, sem saúde,
-#                 slots cheios, base ausente, ssh que caiu no meio, filtro ilegível, repo que não é wa) cai no MBP, e daí no
+#                 slots cheios, base ausente, ssh que caiu no meio, filtro ilegível, repo que não é wa, teste mac-only) cai no MBP, e daí no
 #                 que já existia. Servidor fora do ar NUNCA trava o gate. Só pytest vai ao nó (--exec segue no MBP; é a bead do REA).
 #   SEGURANÇA     o rsync para o nó usa SÓ scripts/hetzner-rsync-filter.wa.txt, com --delete-excluded. O filtro olha NOME e pasta, nunca o conteúdo: nome de segredo
 #                 ou de dado conhecido não sai, e fora de tests/ só sai código e os arquivos de dado/config listados POR CAMINHO (nome desconhecido fica inerte).
 #                 Filtro fora da forma que o filter_sane confere = o nó NÃO é usado. O CONTEÚDO é conferido por node_guard (scripts/hetzner-pii-scan.py): arquivo
 #                 com lista de telefones/CPFs fica no mini, e se a varredura não termina o nó NÃO é usado.
-#   LOG           toda linha de $CITY/.gc/logs/mbp-run.jsonl traz "host":"hetzner"|"mbp".
+#   MAC-ONLY     scripts/hetzner-mac-only.txt (um glob por linha) + $CITY/.gc/hetzner-mac-only.learned (aprendido pela sombra): bateria com algum
+#                 alvo da lista pula o nó (launchd/plist, osascript, /Users, ADB). Lista ilegível = o nó NÃO é usado (inerte).
+#   SOMBRA        nas primeiras 24 h da bandeira (HETZNER_SHADOW_WINDOW_S) ~10% das baterias (HETZNER_SHADOW_PCT) rodam TAMBÉM no MBP, em paralelo;
+#                 rc diferente (ou arquivos reprovados diferentes) vai para $CITY/.gc/logs/hetzner-shadow.jsonl e os arquivos divergentes entram na
+#                 lista aprendida. Quem chamou recebe sempre o resultado do nó; a sombra só mede.
+#   PARALELISMO   pytest-xdist (-n) em baterias grandes (>= HETZNER_XDIST_MIN_TESTS testes, 40), com núcleos / baterias em curso; nunca por cima de
+#                 -n, -p no:xdist, --pdb, --co, --lf... do chamador. O ganho do nó é o paralelismo: um teste só empata com o mini.
+#   LOG           toda linha de $CITY/.gc/logs/mbp-run.jsonl traz "host":"hetzner"|"mbp" (e "shadow":1 no lado de sombra do MBP).
 #
 # PRESENÇA DO ATHOS (ga-77c1qg; decisão dele em 12/10: o MBP é o notebook de trabalho dele, o mini é o servidor)
 #   O preflight lê, NO MBP e na mesma chamada ssh, se o Athos está lá (scripts/mbp-presence.sh: tela bloqueada, ou sem teclado/mouse
@@ -108,11 +115,20 @@ OWNER="$ME:$$:$(date +%s)"
 NODE_HOST=${HETZNER_NODE_HOST:-hetzner-teste}
 NODE_FLAG="$CITY/.gc/hetzner-node.on"
 NODE_FILTER=${HETZNER_RSYNC_FILTER:-$HERE/hetzner-rsync-filter.wa.txt}
+NODE_MAC_ONLY=${HETZNER_MAC_ONLY_LIST:-$HERE/hetzner-mac-only.txt}
+NODE_LEARNED="$CITY/.gc/hetzner-mac-only.learned"
+NODE_SHADOW_LOG="$CITY/.gc/logs/hetzner-shadow.jsonl"
+NODE_SHADOW_PCT=$(num_or "${HETZNER_SHADOW_PCT:-10}" 10); [ "$NODE_SHADOW_PCT" -le 100 ] || NODE_SHADOW_PCT=10
+NODE_SHADOW_WINDOW_S=$(num_or "${HETZNER_SHADOW_WINDOW_S:-86400}" 86400)   # a janela conta da hora da bandeira (touch na bandeira reabre a sombra)
+NODE_SHADOW_WAIT_S=$(num_or "${HETZNER_SHADOW_WAIT_S:-120}" 120)           # quanto esperar o lado do MBP depois que o nó terminou
 NODE_MAX_SLOTS=$(num_or "${HETZNER_MAX_SLOTS:-6}" 6); [ "$NODE_MAX_SLOTS" -ge 1 ] || NODE_MAX_SLOTS=6
 NODE_MIN_DISK_MB=$(num_or "${HETZNER_MIN_DISK_MB:-2048}" 2048)
+NODE_XDIST_MIN=$(num_or "${HETZNER_XDIST_MIN_TESTS:-40}" 40)
+NODE_XDIST_OFF=${HETZNER_XDIST_OFF:-0}                                     # 1 = nunca injeta -n
 NODE_PERSIST_S=$(num_or "${HETZNER_SSH_PERSIST_S:-600}" 600)               # ssh mini->nó custa ~3 s por conexão (RTT 200 ms): a conexão é reaproveitada entre baterias
 SSH_OPTS_NODE="-o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm/%C -o ControlPersist=$NODE_PERSIST_S"
 HOSTKIND=mac; HOSTLOG=mbp; HNAME=MBP
+SHADOW_RUN=${MBP_RUN_SHADOW:-0}                                            # 1 = este processo é o lado de MBP de uma sombra (o log o marca)
 use_host() { # linux | mbp
   case "$1" in
     linux) HOSTKIND=linux; HOSTLOG=hetzner; HNAME="nó Linux"; MBP_HOST=$NODE_HOST; SSH_OPTS=$SSH_OPTS_NODE ;;
@@ -169,9 +185,9 @@ rssh_s() { "$SSH_BIN" $SSH_OPTS "$MBP_HOST" bash -s -- "$@"; }   # idem, com arg
 
 log_run() { # repo mode slot rc secs   (+ globais PRES e DEMOTED: o estado em que a execução largou e se foi rebaixada no meio)
   mkdir -p "$(dirname "$LOG")" 2>/dev/null
-  # host: onde a execução rodou (hetzner|mbp)
-  printf '{"ts":"%s","repo":"%s","mode":"%s","slot":"%s","rc":%s,"secs":%s,"nargs":%s,"presence":"%s","demoted":%s,"host":"%s"}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" "$5" "$(( $# - 5 ))" "${PRES:--}" "${DEMOTED:-0}" "$HOSTLOG" >> "$LOG" 2>/dev/null || true
+  # host: onde a execução rodou (hetzner|mbp); shadow=1 só no lado de MBP de uma sombra (esse rc não é o que o chamador recebeu)
+  printf '{"ts":"%s","repo":"%s","mode":"%s","slot":"%s","rc":%s,"secs":%s,"nargs":%s,"presence":"%s","demoted":%s,"host":"%s"%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" "$5" "$(( $# - 5 ))" "${PRES:--}" "${DEMOTED:-0}" "$HOSTLOG" "$([ "$SHADOW_RUN" = 1 ] && printf ',"shadow":1')" >> "$LOG" 2>/dev/null || true
 }
 
 # ---- leitura do preflight ---------------------------------------------------------------------------------------
@@ -189,8 +205,8 @@ log_refusal() { # usa REFUSAL e PF
   a=$(pf_get avail_mb); s=$(pf_get swap_mb); d=$(pf_get swap_delta_mb); p=$(pf_get pressure)
   isnum "$a" || a=null; isnum "$s" || s=null; isint "$d" || d=null; isnum "$p" || p=null
   mkdir -p "$(dirname "$LOG")" 2>/dev/null
-  printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":%s,"secs":0,"nargs":0,"reason":"%s","avail_mb":%s,"swap_mb":%s,"swap_delta_mb":%s,"pressure":%s,"presence":"%s","host":"%s"}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${REFUSAL_RC:-98}" "${REFUSAL:-desconhecido}" "$a" "$s" "$d" "$p" "${PRES:--}" "$HOSTLOG" >> "$LOG" 2>/dev/null \
+  printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":%s,"secs":0,"nargs":0,"reason":"%s","avail_mb":%s,"swap_mb":%s,"swap_delta_mb":%s,"pressure":%s,"presence":"%s","host":"%s"%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${REFUSAL_RC:-98}" "${REFUSAL:-desconhecido}" "$a" "$s" "$d" "$p" "${PRES:--}" "$HOSTLOG" "$([ "$SHADOW_RUN" = 1 ] && printf ',"shadow":1')" >> "$LOG" 2>/dev/null \
     || say "AVISO: recusa '${REFUSAL:-desconhecido}' NÃO gravada em $LOG — a contagem de 72 h (mbp-offload.sh counts) não vai incluí-la"
 }
 
@@ -234,8 +250,8 @@ remote_header() {
 #   lê campo vazio como "não consegui saber" e recusa. Sem swap nenhum (SwapTotal 0) é uma leitura VÁLIDA de 0.
 preflight_script_linux() {
   remote_header PREFLIGHT
-  printf 'PSI_S2=%s\nPSI_F2=%s\nPSI_S4=%s\nPSI_F4=%s\n' "$(num_or "${HETZNER_PSI_SOME_WARN:-10}" 10)" "$(num_or "${HETZNER_PSI_FULL_WARN:-1}" 1)" \
-    "$(num_or "${HETZNER_PSI_SOME_CRIT:-40}" 40)" "$(num_or "${HETZNER_PSI_FULL_CRIT:-10}" 10)"
+  printf 'PSI_S2=%s\nPSI_F2=%s\nPSI_S4=%s\nPSI_F4=%s\nWAVENV=%s\n' "$(num_or "${HETZNER_PSI_SOME_WARN:-10}" 10)" "$(num_or "${HETZNER_PSI_FULL_WARN:-1}" 1)" \
+    "$(num_or "${HETZNER_PSI_SOME_CRIT:-40}" 40)" "$(num_or "${HETZNER_PSI_FULL_CRIT:-10}" 10)" "$(HOSTKIND=linux venv_of wa)"
   cat <<'EOF'
 SAMPLE_S=${1:-2}; PROC=${2:-/proc}
 [ "$SAMPLE_S" -ge 1 ] 2>/dev/null || SAMPLE_S=2
@@ -261,6 +277,9 @@ nc=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)
 if isnum "$nc" && [ "$nc" -ge 1 ]; then echo "ncpu=$nc"; else echo "ncpu="; fi
 # disco livre do home, em MB (rsync de worktree + espelhos por slot). ilegível → vazio
 echo "disk_mb=$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print int($4 / 1024) }')"
+# pytest-xdist no venv do nó: 1 tem · 0 não tem · vazio = não consegui olhar (o lado local trata vazio como 0: não injeta -n)
+sp=$(ls -d "$HOME/gt-remote/$WAVENV"/lib/python3*/site-packages 2>/dev/null | head -1)
+if [ -n "$sp" ] && ls "$sp" >/dev/null 2>&1; then if ls "$sp" | grep -q '^pytest_xdist-'; then echo "xdist=1"; else echo "xdist=0"; fi; else echo "xdist="; fi
 presence_probe
 for d in "$HOME"/gt-remote/slots/*/; do
   [ -d "$d" ] || continue
@@ -376,7 +395,7 @@ slot_cap() {
   local cpu mem avail
   if [ "$HOSTKIND" = linux ]; then
     # máquina dedicada: o teto é HETZNER_MAX_SLOTS (6), ainda limitado pela RAM de agora, como no modo LIVRE do MBP. Cada bateria grande usa vários núcleos
-    # (e dividem os núcleos entre si), então "um slot por núcleo" colocaria 16 pytest disputando o mesmo disco.
+    # (xdist divide os núcleos pelas baterias em curso), então "um slot por núcleo" colocaria 16 pytest -n 2 disputando o mesmo disco.
     cpu=$NODE_MAX_SLOTS; avail=$(pf_get avail_mb)
     if isnum "$avail"; then
       mem=$(( 1 + (avail - MIN_AVAIL_MB) / SLOT_MEM_MB )); [ "$mem" -ge 1 ] || mem=1
@@ -544,11 +563,11 @@ true
 EOF
   SLOT=""
 }
-cleanup() { release; [ -n "${TMPOUT:-}" ] && rm -f "$TMPOUT"; [ -n "${SENT:-}" ] && { rm -f "$SENT" "$SENT.held" "$SENT.out" "$SENT.hp" "$SENT.v"; rmdir "$SENT.dst" 2>/dev/null; }; return 0; }
+cleanup() { type shadow_abort >/dev/null 2>&1 && shadow_abort; release; [ -n "${TMPOUT:-}" ] && rm -f "$TMPOUT"; [ -n "${SENT:-}" ] && { rm -f "$SENT" "$SENT.held" "$SENT.out" "$SENT.hp" "$SENT.v"; rmdir "$SENT.dst" 2>/dev/null; }; return 0; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-# ---- nó Linux: guardas de segurança --------------------------------------------------------------------------------------
+# ---- nó Linux: guardas de segurança, lista mac-only, sombra, xdist ----------------------------------------------------------
 # filter_sane: o filtro do rsync é a fronteira de dados do servidor alugado, então ele é CONFERIDO, não só lido. Confere a FORMA, não a suficiência (essa é o teste com rsync
 # de verdade, no selftest e no prod test): (1) abre e não é vazio, (2) `+ /tests/***` existe, (3) as 12 regras-âncora de cada classe (.env, .netrc, client_secret, dotfile de
 # token, token/secret com extensão de dado, .pickle, *.duckdb/.db/.csv/.parquet/.gz) vêm ANTES dela — o rsync usa a primeira regra que casa, e quem inclui tests/ primeiro deixa passar
@@ -568,6 +587,34 @@ filter_sane() {
     !tests && (line in want) { seen[line] = 1 }
     END { n = 0; for (k in seen) n++; exit !(tests && !bad && n == nwant && last == "- *") }' "$NODE_FILTER"
 }
+# mac_only_match <args do pytest>: imprime o 1º alvo da lista mac-only. rc 0 = há alvo mac-only · 1 = nenhum · 2 = a lista não deu para ler (o chamador NÃO usa o nó: sem a
+# lista não se sabe o que tem de ficar no Mac). A lista estática precisa existir; a aprendida pela sombra pode ainda não existir, mas se existe tem de abrir.
+mac_only_match() {
+  local lf a f g
+  [ -f "$NODE_MAC_ONLY" ] && [ -r "$NODE_MAC_ONLY" ] || return 2
+  if [ -e "$NODE_LEARNED" ]; then [ -f "$NODE_LEARNED" ] && [ -r "$NODE_LEARNED" ] || return 2; fi
+  for a in "$@"; do
+    case "$a" in -*) continue ;; esac
+    f="${a%%::*}"; f="${f#"$dir"/}"
+    for lf in "$NODE_MAC_ONLY" "$NODE_LEARNED"; do
+      [ -f "$lf" ] || continue
+      while IFS= read -r g || [ -n "$g" ]; do
+        g=${g#"${g%%[![:space:]]*}"}; g=${g%"${g##*[![:space:]]}"}
+        case "$g" in ''|'#'*) continue ;; esac
+        # shellcheck disable=SC2254
+        case "$f" in $g) printf '%s\n' "$f"; return 0 ;; esac
+      done < "$lf"
+    done
+  done
+  return 1
+}
+fmtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }   # mtime em segundos; ilegível → vazio
+# janela da sombra: HETZNER_SHADOW_WINDOW_S depois da hora da bandeira. Hora ilegível = janela ABERTA (o lado que protege o veredito; custa só carga a mais)
+shadow_window_open() {
+  local t now; t=$(fmtime "$NODE_FLAG"); now=$(date +%s)
+  isnum "$t" || return 0
+  [ $(( now - t )) -lt "$NODE_SHADOW_WINDOW_S" ]
+}
 # node_wanted <args>: o nó entra na cadeia? Devolve 1 quando não e deixa o motivo em NODE_WHY (vira uma linha do log). A bandeira desligada NÃO é recusa: é o interruptor.
 NODE_WHY=""
 node_wanted() {
@@ -576,6 +623,13 @@ node_wanted() {
   [ -f "$NODE_FLAG" ] || return 1
   [ "$repo" = wa ] || { [ "$host_sel" = linux ] && say "o nó Linux só roda o repo wa (este é '$repo') — rode local"; return 1; }
   filter_sane || { NODE_WHY="filtro-invalido"; say "o filtro do rsync do nó ($NODE_FILTER) não abre ou não está na forma conferida pelo filter_sane (regras de segredo/dado ANTES de + /tests/***, nada que inclua tudo, \`- *\` no fim) — o nó NÃO é usado"; return 1; }
+  local mo mrc
+  mo=$(mac_only_match "$@"); mrc=$?
+  case $mrc in
+    0) NODE_WHY="mac-only"; say "$mo está na lista mac-only — esta bateria não vai ao nó Linux"; return 1 ;;
+    1) ;;
+    *) NODE_WHY="mac-only-ilegivel"; say "a lista mac-only ($NODE_MAC_ONLY / $NODE_LEARNED) não abre — sem ela não se sabe o que tem de ficar no Mac; o nó NÃO é usado"; return 1 ;;
+  esac
   return 0
 }
 # node_guard: o filtro olha NOME e pasta; isto olha o CONTEÚDO do que ele deixaria sair (hetzner-pii-scan.py, o mesmo que o prod test roda no servidor). Arquivo com LISTA de telefones/CPFs (>=20 / >=3)
@@ -602,6 +656,92 @@ node_guard() {
   [ "$nheld" -eq 0 ] || say "NOTE: $nheld arquivo(s) com lista de telefones/CPFs ficam no mini e NÃO vão ao $HNAME ($(cut -f3 "$SENT.out" | head -n 4 | tr '\n' ' ')…): teste que os lê ou importa falha aqui — rode esse teste local."
   return 0
 }
+# node_xdist_n <args>: quantos workers do pytest-xdist usar (imprime N) ou nada. O ganho do nó é o paralelismo (um teste só empata com o mini). Só em bateria grande
+# (contagem de `def test_` nos alvos; ilegível = 0 = não injeta), com xdist instalado no nó, e nunca por cima de uma escolha do chamador.
+node_xdist_n() {
+  [ "$HOSTKIND" = linux ] && [ "$NODE_XDIST_OFF" != 1 ] && [ "$(pf_get xdist)" = 1 ] || return 0
+  local a f c n=0 nc occ w
+  for a in "$@"; do
+    case "$a" in
+      -n|-n?*|--numprocesses|--numprocesses=*|--dist|--dist=*|-d|--pdb|--trace|--co|--collect-only|--setup-show|--sw|--stepwise|--lf|--last-failed|--ff|--nf|--looponfail|--forked|-pno:xdist|no:xdist) return 0 ;;
+    esac
+  done
+  for a in "$@"; do
+    case "$a" in -*) continue ;; *::*) n=$((n + 1)); continue ;; esac
+    f="${a#"$dir"/}"
+    if [ -f "$dir/$f" ]; then c=$(grep -c -E '^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+test_' "$dir/$f" 2>/dev/null); isnum "$c" && n=$((n + c))
+    elif [ -d "$dir/$f" ]; then c=$(grep -r -c -E --include='test_*.py' '^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+test_' "$dir/$f" 2>/dev/null | awk -F: '{ s += $NF } END { print s + 0 }'); isnum "$c" && n=$((n + c)); fi
+  done
+  [ "$n" -ge "$NODE_XDIST_MIN" ] || return 0
+  nc=$(pf_get ncpu); isnum "$nc" && [ "$nc" -ge 2 ] || return 0
+  occ=$(num_or "${OCC:-1}" 1); [ "$occ" -ge 1 ] || occ=1
+  w=$(( nc / occ )); [ "$w" -ge 2 ] || w=2; [ "$w" -le "$nc" ] || w=$nc
+  echo "$w"
+}
+# arquivos reprovados (FAILED/ERROR do resumo -rfEs) de uma saída de pytest, ordenados, sem repetição
+failed_files() { sed -n -E 's/^(FAILED|ERROR) ([^: ]+).*/\2/p' "$1" 2>/dev/null | sort -u; }
+
+SHADOW_PID=""; SHADOW_OUT=""
+shadow_start() { # "$@" = args ORIGINAIS do pytest. Decide e dispara o lado de MBP em paralelo; SHADOW_PID fica vazio quando não há sombra.
+  SHADOW_PID=""; SHADOW_OUT=""
+  [ "$HOSTKIND" = linux ] && [ "$host_sel" = auto ] && [ "$SHADOW_RUN" != 1 ] || return 0
+  [ "$NODE_SHADOW_PCT" -gt 0 ] || return 0
+  shadow_window_open || return 0
+  [ $(( RANDOM % 100 )) -lt "$NODE_SHADOW_PCT" ] || return 0
+  mkdir -p "$CITY/.gc/run" 2>/dev/null
+  SHADOW_OUT=$(mktemp "$CITY/.gc/run/mbp-shadow.XXXXXX" 2>/dev/null) || { SHADOW_OUT=""; say "AVISO: sombra não iniciada (sem arquivo temporário)"; return 0; }
+  ( exec env MBP_RUN_SHADOW=1 "$HERE/$(basename "$0")" --host mbp --repo "$repo" --dir "$dir" -- "$@" >"$SHADOW_OUT" 2>&1 </dev/null ) &
+  SHADOW_PID=$!
+}
+shadow_abort() { # o nó caiu no meio: o lado de MBP da sombra não tem mais com quem comparar
+  if [ -n "$SHADOW_PID" ]; then kill "$SHADOW_PID" 2>/dev/null; wait "$SHADOW_PID" 2>/dev/null; SHADOW_PID=""; fi
+  [ -z "$SHADOW_OUT" ] || rm -f "$SHADOW_OUT"; SHADOW_OUT=""
+  return 0
+}
+shadow_log() { # veredito rc_nó rc_mbp arquivos aprendidos
+  mkdir -p "$(dirname "$NODE_SHADOW_LOG")" 2>/dev/null
+  printf '{"ts":"%s","repo":"%s","verdict":"%s","a_host":"hetzner","a_rc":%s,"b_host":"mbp","b_rc":%s,"files":"%s","learned":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo" "$1" "$2" "${3:-null}" "$(printf '%s' "$4" | tr -d '"\\' | tr '\n' ',' | cut -c1-300)" "${5:-0}" >> "$NODE_SHADOW_LOG" 2>/dev/null \
+    || say "AVISO: veredito da sombra NÃO gravado em $NODE_SHADOW_LOG"
+}
+shadow_finish() { # rc_do_nó arquivo_da_saída_do_nó "$@" (args originais). Espera o MBP (até NODE_SHADOW_WAIT_S), compara e aprende.
+  [ -n "$SHADOW_PID" ] || return 0
+  local arc="$1" aout="$2" brc waited=0 bf af diffs="" t f learned=0; shift 2
+  while kill -0 "$SHADOW_PID" 2>/dev/null && [ "$waited" -lt "$NODE_SHADOW_WAIT_S" ]; do sleep 1; waited=$((waited + 1)); done
+  if kill -0 "$SHADOW_PID" 2>/dev/null; then
+    kill "$SHADOW_PID" 2>/dev/null; wait "$SHADOW_PID" 2>/dev/null
+    shadow_log timeout "$arc" null "" 0; say "sombra: o MBP não terminou em ${NODE_SHADOW_WAIT_S}s depois do nó — sem veredito"
+  else
+    wait "$SHADOW_PID" 2>/dev/null; brc=$?
+    case "$brc" in
+      96|97|98|99) shadow_log skipped "$arc" "$brc" "" 0; say "sombra: o MBP não rodou (rc=$brc) — sem veredito" ;;
+      *)
+        af=$(failed_files "$aout"); bf=$(failed_files "$SHADOW_OUT")
+        if [ "$arc" = "$brc" ] && [ "$af" = "$bf" ]; then shadow_log same "$arc" "$brc" "" 0
+        else
+          # arquivos que reprovam só de um lado; rc diferente sem nenhum arquivo legível → TODOS os alvos (mais arquivos no Mac, nunca menos)
+          diffs=$(printf '%s\n%s\n' "$af" "$bf" | grep -v '^$' | sort | uniq -u)
+          if [ -z "$diffs" ]; then
+            for t in "$@"; do
+              case "$t" in -*) continue ;; esac
+              f="${t%%::*}"; f="${f#"$dir"/}"
+              case "$f" in *.py) diffs="$diffs${diffs:+,}$f" ;; esac
+            done
+            diffs=$(printf '%s' "$diffs" | tr ',' '\n')
+          fi
+          if [ -n "$diffs" ]; then
+            if { printf '# %s sombra: rc nó=%s mbp=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arc" "$brc"; printf '%s\n' "$diffs"; } >> "$NODE_LEARNED" 2>/dev/null; then
+              learned=$(printf '%s\n' "$diffs" | grep -c .)
+            else say "AVISO: não consegui gravar $NODE_LEARNED — o arquivo divergente NÃO foi marcado como mac-only"; fi
+          fi
+          shadow_log diverge "$arc" "$brc" "$diffs" "$learned"
+          say "sombra: DIVERGÊNCIA (nó rc=$arc, MBP rc=$brc) — marcado como mac-only: $(printf '%s' "$diffs" | tr '\n' ' ')"
+        fi ;;
+    esac
+  fi
+  rm -f "$SHADOW_OUT"; SHADOW_OUT=""; SHADOW_PID=""
+}
+
 # ---- seed / check -----------------------------------------------------------------------------------------------
 # --host linux fixa o nó nos modos que olham UM host (--check, --seed); sem --host, esses modos continuam sendo do MBP como sempre foram.
 case "$host_sel:$mode" in linux:remote_pause|linux:install_tools) say "--host linux não vale para --$(echo "$mode" | tr _ -): a pausa e as ferramentas são do MBP"; exit 97 ;; esac
@@ -615,6 +755,8 @@ if [ "$mode" = check ]; then
   if [ "$HOSTKIND" = linux ]; then
     echo "node_flag=$([ -f "$NODE_FLAG" ] && echo on || echo off)"
     echo "node_filter_ok=$(filter_sane && echo 1 || echo 0)"
+    mac_only_match >/dev/null; echo "node_mac_only_rc=$?"
+    echo "node_shadow_window_open=$([ -f "$NODE_FLAG" ] && { shadow_window_open && echo 1 || echo 0; } || echo -)"   # sem bandeira não há janela
   fi
   exit $rc
 fi
@@ -701,7 +843,7 @@ attempt_pytest() {
   return $rc
 }
 _attempt_pytest() {
-  local base rv M m mrc rrc cpcmd pathline JOBDEF rc SECS
+  local base rv M m mrc rrc xn cpcmd pathline JOBDEF rc SECS
   local orig=("$@")
   preflight || { rc=$?; log_refusal; return $rc; }
   if [ "$HOSTKIND" = linux ]; then node_guard || { say "não consegui varrer o conteúdo do que iria ao $HNAME (lista do rsync ou hetzner-pii-scan.py falhou) — o nó NÃO é usado, rode local"; fall varredura-falhou 98; return 98; }; fi
@@ -735,6 +877,9 @@ EOF
     "$RSYNC_BIN" -a --delete -e "$SSH_BIN $SSH_OPTS" "${EXCLUDES[@]}" "$dir"/ "$MBP_HOST:$M/" >/dev/null 2>&1
   fi
   rrc=$?; [ $rrc -eq 0 ] || { say "rsync do worktree falhou (rc=$rrc) — rode local"; fall rsync-falhou 98; return 98; }
+  # paralelismo do nó (o ganho dele): só aqui, depois que o slot disse quantas baterias há em curso
+  xn=$(node_xdist_n "$@")
+  if [ -n "$xn" ]; then set -- -n "$xn" "$@"; say "xdist: $xn workers (núcleos do nó / baterias em curso)"; fi
   qargs=$(printf '%q ' "$@")
   if [ "$HOSTKIND" = linux ]; then pathline='export PATH="$HOME/.local/bin:$PATH" PYTHONDONTWRITEBYTECODE=1'
   else pathline='export PATH=/opt/homebrew/bin:$PATH PYTHONDONTWRITEBYTECODE=1'; fi
@@ -743,17 +888,19 @@ $pathline
 job() { cd "\$HOME/$M" || return 97; \$MBP_BG nice -n "\$MBP_NICE" "\$HOME/gt-remote/$rv/bin/python" -m pytest -p no:cacheprovider $qargs; }
 mbp_supervise job
 EOF
+  shadow_start "${orig[@]}"
   run_remote RUN "$JOBDEF"
   if [ $RC -ne 0 ] && grep -q -E 'shared/data|\.db\b|unable to open database' "$TMPOUT"; then
     say "NOTE: shared/data/ e *.db NÃO são enviados ao $HNAME; teste que lê esses arquivos falha aqui — rode esse teste local."
   fi
   SECS=$(( $(date +%s) - T0 ))
   if [ $RC -eq 255 ]; then
-    say "ssh caiu durante a execução — rode local"; log_run "$repo" pytest "$SLOT" 255 "$SECS" "${orig[@]}"; return 98
+    say "ssh caiu durante a execução — rode local"; log_run "$repo" pytest "$SLOT" 255 "$SECS" "${orig[@]}"; shadow_abort; return 98
   fi
   if [ $RC -eq 124 ]; then say "timeout de ${RUN_TIMEOUT}s"; fi
   log_run "$repo" pytest "$SLOT" "$RC" "$SECS" "${orig[@]}"
   say "rodou em $HOSTLOG ($HNAME) slot=$SLOT secs=$SECS rc=$RC"
+  shadow_finish "$RC" "$TMPOUT" "${orig[@]}"
   return $RC
 }
 
@@ -828,7 +975,7 @@ if [ $node_possible -eq 1 ]; then
     [ "$host_sel" != linux ] || exit $nrc
     say "o nó Linux não rodou (rc=$nrc) — tentando o MBP"
   else
-    # o nó estava ligado e NÃO foi usado por um motivo (filtro inválido): uma linha no log, para o relatório contar os fallbacks
+    # o nó estava ligado e NÃO foi usado por um motivo (filtro, lista mac-only, repo): uma linha no log, para o relatório contar os fallbacks
     if [ -n "$NODE_WHY" ]; then use_host linux; fall "$NODE_WHY" 98; fi
     [ "$host_sel" != linux ] || exit 98
   fi

@@ -34,6 +34,8 @@
 #   NOME NEUTRO (docs/**/ab_results/*.json, scripts/*estado.json, state.json...) com telefone/CPF dentro não chega; config listada por caminho chega · CONTEÚDO: node_guard retém, mesmo em nome e
 #   pasta liberados, o arquivo com LISTA de telefones (>=20) ou CPFs (>=3), deixa passar 3 números e cauda sintética, e SEM a varredura (hetzner-pii-scan.py) o nó NÃO é usado · arquivo que a varredura não lê, ou caminho retido com barra invertida que a regra `- /caminho` não segura (conferido por um 2º rsync -n), também: o nó NÃO é usado ·
 #   filtro ausente, vazio, fora de ordem, sem o `- *` final, sem uma regra-âncora, com `+` que inclua tudo (`+ /**`...), `!` ou `.` = o nó NÃO é usado.
+#   FATIA 2: lista mac-only (glob, node id, caminho absoluto, comentário/CRLF, aprendida; ausente ou ilegível = o nó NÃO é usado) · xdist (limiar, núcleos/baterias, o -n
+#   do chamador vence, xdist ausente/ilegível) · sombra (igual, diverge por rc e por arquivo, MBP fora, MBP lento, janela de 24 h, abortada).
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -304,9 +306,11 @@ exit "${STUB_RUN_RC:-0}"
 EOF
 chmod +x "$T/bin/ssh" "$T/bin/rsync" "$T/fake/"* "$T/home/gt-remote/venv/bin/python"
 
-# nó Linux: o rsync de verdade (para o teste de vazamento) e a raiz do /proc falso do preflight dele
+# nó Linux: venv com xdist, pastas do "nó" no HOME falso, lista mac-only hermética e sombra DESLIGADA por padrão (os casos do nó a ligam)
+mkdir -p "$T/home/gt-remote/venv-wa/lib/python3.14/site-packages/pytest_xdist-3.8.0.dist-info" "$T/home/gt-remote/venv-wa/bin" "$T/home/gt-remote/wa-base"
+: > "$T/mac-only.txt"
 REAL_RSYNC=$(PATH=/usr/bin:/bin:/opt/homebrew/bin command -v rsync)
-export REAL_RSYNC STUB_PROCDIR="$T/proc"
+export REAL_RSYNC HETZNER_MAC_ONLY_LIST="$T/mac-only.txt" HETZNER_SHADOW_PCT=0 STUB_PROCDIR="$T/proc"
 unset MBP_MAX_SWAP_MB MBP_MAX_SWAP_GROWTH_MB MBP_SWAP_SAMPLE_S MBP_MAX_PRESSURE_LEVEL MBP_MIN_AVAIL_MB MBP_MIN_BATT MBP_MAX_SLOTS MBP_SLOT_MAX_AGE_S MBP_RUN_TIMEOUT_S MBP_HOST
 export PATH="$T/bin:$PATH" MBP_CITY="$T/city" MBP_SSH="$T/bin/ssh" MBP_RSYNC="$T/bin/rsync"
 export STUB_LOG="$T/stub.log" STUB_REAPED="$T/reaped" STUB_SWAPCNT="$T/swapcnt" FAKE="$T/fake" STUB_HOME="$T/home" STUB_SEEN="$T/seen-info" STUB_STATE_FILE="$T/presence.state"
@@ -317,7 +321,7 @@ J="$T/city/.gc/logs/mbp-run.jsonl"
 fails=0; n=0
 reset() { : > "$STUB_LOG"; rm -f "$STUB_REAPED" "$J" "$STUB_STATE_FILE" "$STUB_SEEN" "$FLAG_PAUSE" "$T/home/gt-remote/PAUSE"; mkdir -p "$T/home/gt-remote/slots"; find "$T/home/gt-remote/slots" -mindepth 1 -delete 2>/dev/null
   unset STUB_LOCKED STUB_IDLE_S STUB_HOLD STUB_ASSERT_FAIL STUB_ASSERT_RAW STUB_NCPU STUB_NCPU_FAIL STUB_RSYNC_FAIL_BIN STUB_WAIT_RENICE STUB_RUNMODE STUB_RUN_SLEEP STUB_FLIP_STATE STUB_FLIP_PAUSE STUB_DIRECT_OUT STUB_DIRECT_RC STUB_REAL_SLEEP MBP_FORCE_PRESENCE MBP_MAX_SLOTS MBP_USE_SLOTS MBP_SLOT_MEM_MB MBP_AWAY_IDLE_S MBP_WATCH_S PRESENCE_FORCE_USO PRESENCE_AWAY_S
-  rm -f "$T/city/.gc/hetzner-node.on" "$T"/last-script-*-hetzner.sh "$T"/last-script-*-mbp.sh
+  rm -f "$T/city/.gc/hetzner-node.on" "$T/city/.gc/hetzner-mac-only.learned" "$T/city/.gc/logs/hetzner-shadow.jsonl" "$T"/last-script-*-hetzner.sh "$T"/last-script-*-mbp.sh
   unset STUB_UNREACHABLE_NODE STUB_UNREACHABLE_MBP STUB_PF_RAW_NODE STUB_NOBASE_NODE STUB_NOVENV_NODE STUB_RUN_RC_NODE STUB_RUN_RC_MBP STUB_RUN_OUT_NODE STUB_RUN_OUT_MBP STUB_RUN_SLEEP_NODE STUB_RUN_SLEEP_MBP \
     STUB_N_MEMINFO_RAW STUB_N_AVAIL_MB STUB_N_SWAPTOTAL_MB STUB_N_SWAPFREE_MB STUB_N_SWAPFREE2_MB STUB_N_PSI_MISSING STUB_N_PSI_RAW STUB_N_PSI_SOME STUB_N_PSI_FULL STUB_N_NPROC STUB_N_NPROC_FAIL STUB_N_DISK_MB STUB_N_DISK_FAIL STUB_N_DISK_RAW \
     STUB_RSYNC_REAL HETZNER_XDIST_OFF HETZNER_XDIST_MIN_TESTS HETZNER_RSYNC_FILTER HETZNER_MAX_SLOTS HETZNER_SHADOW_WAIT_S HETZNER_SHADOW_WINDOW_S HETZNER_MIN_DISK_MB HETZNER_NODE_HOST MBP_RUN_SHADOW
@@ -708,7 +712,11 @@ neg_presenca() {
 # ---- O NÓ LINUX (ga-zri39b) ------------------------------------------------------------------------------------------------------
 # O ssh stub reconhece o host pelo argumento (hetzner-teste = nó, o resto = MBP) e grava HOSTCALL:<host>:<NOME> no log; o preflight do nó roda DE VERDADE contra um /proc falso
 # ($STUB_PROCDIR, gerado a partir de STUB_N_*); o rsync pode rodar de verdade (STUB_RSYNC_REAL=1) para o teste de vazamento. Nada toca o servidor nem o live.
-NODEFLAG="$T/city/.gc/hetzner-node.on"
+NODEFLAG="$T/city/.gc/hetzner-node.on"; LEARNED="$T/city/.gc/hetzner-mac-only.learned"; SHLOG="$T/city/.gc/logs/hetzner-shadow.jsonl"; MACONLY="$T/mac-only.txt"
+XDIST_DIR="$T/home/gt-remote/venv-wa/lib/python3.14/site-packages/pytest_xdist-3.8.0.dist-info"
+xdist_on()  { mkdir -p "$XDIST_DIR"; mkdir -p "$T/home/gt-remote/venv-wa/lib/python3.14/site-packages"; }
+xdist_off() { rmdir "$XDIST_DIR" 2>/dev/null; mkdir -p "$T/home/gt-remote/venv-wa/lib/python3.14/site-packages"; }
+xdist_gone() { rmdir "$XDIST_DIR" 2>/dev/null; rmdir "$T/home/gt-remote/venv-wa/lib/python3.14/site-packages" "$T/home/gt-remote/venv-wa/lib/python3.14" "$T/home/gt-remote/venv-wa/lib" 2>/dev/null; }
 nrun() { "$RUN" --host linux --repo wa --dir "$T/wt" -- "$@" >"$T/out" 2>"$T/err"; echo $?; }       # só o nó (sem cadeia)
 pfv() { "$RUN" --host linux --check 2>/dev/null | sed -n "s/^$1=//p"; }
 # "rc:motivo" de uma execução SÓ no nó (a última recusa do log); a bandeira do nó tem de estar ligada
@@ -730,7 +738,7 @@ LEAKS="$LEAKS processo_lookup/.pdpj_token.txt .netrc lib/.pgpass token.txt lib/a
 node_cases() {
 echo "--- nó Linux de testes (ga-zri39b)"
 local rc out f
-reset; date > "$FLAG"
+reset; xdist_on; date > "$FLAG"
 
 # ===== a cadeia nó -> MBP -> local =====
 reset; rc=$(run -- tests/test_x.py); expect "nó desligado (sem a bandeira): roda no MBP como sempre" 0 "$rc"
@@ -771,9 +779,10 @@ eq "…e por um mínimo de 1" 1 "$(STUB_N_AVAIL_MB=3072 pfv slot_cap)"
 reset; rc=$("$RUN" --host linux --check >"$T/out" 2>"$T/err"; echo $?); expect "--host linux --check saudável" 0 "$rc"
 has "check: avail_mb vem do MemAvailable" "$T/out" '^avail_mb=24000$'; has "check: pressão PSI normal = 1" "$T/out" '^pressure=1$'; has "check: presença sempre livre" "$T/out" '^presence=livre$'
 has "check: o porquê é 'dedicada'" "$T/out" '^presence_why=dedicada$'; has "check: nunca pausado" "$T/out" '^paused=0$'; has "check: sem bateria (power=ac)" "$T/out" '^power=ac$'
-has "check: núcleos" "$T/out" '^ncpu=16$'; has "check: disco livre" "$T/out" '^disk_mb=280000$'
+has "check: núcleos" "$T/out" '^ncpu=16$'; has "check: disco livre" "$T/out" '^disk_mb=280000$'; has "check: xdist presente" "$T/out" '^xdist=1$'
 has "check: swap 0 é leitura válida (sem swap)" "$T/out" '^swap_mb=0$'; has "check: delta do swap 0" "$T/out" '^swap_delta_mb=0$'
-has "check: a bandeira do nó" "$T/out" '^node_flag=off$'; has "check: filtro conferido" "$T/out" '^node_filter_ok=1$'
+has "check: a bandeira do nó" "$T/out" '^node_flag=off$'; has "check: filtro conferido" "$T/out" '^node_filter_ok=1$'; has "check: lista mac-only lida (1 = nenhum alvo)" "$T/out" '^node_mac_only_rc=1$'; has "check: sem bandeira, sem janela" "$T/out" '^node_shadow_window_open=-$'
+date > "$NODEFLAG"; "$RUN" --host linux --check >"$T/out" 2>/dev/null; has "check com a bandeira: janela da sombra aberta" "$T/out" '^node_shadow_window_open=1$'; rm -f "$NODEFLAG"
 eq "PSI some=9.99 full=0.99 → 1" 1 "$(STUB_N_PSI_SOME=9.99 STUB_N_PSI_FULL=0.99 pfv pressure)"
 eq "PSI some=10.00 → 2 (fronteira)" 2 "$(STUB_N_PSI_SOME=10.00 pfv pressure)"
 eq "PSI full=1.00 → 2 (fronteira)" 2 "$(STUB_N_PSI_FULL=1.00 pfv pressure)"
@@ -799,6 +808,8 @@ eq "swap usado no teto (8192 MB) recusa" "98:swap_teto" "$(STUB_N_SWAPTOTAL_MB=9
 eq "disco livre baixo (1000 MB) recusa" "98:disco" "$(STUB_N_DISK_MB=1000 outcome_n)"; eq "disco no mínimo (2048) passa" "0:-" "$(STUB_N_DISK_MB=2048 outcome_n)"
 eq "disco ilegível recusa com motivo próprio" "98:ilegivel:disk" "$(STUB_N_DISK_FAIL=1 outcome_n)"; eq "df com formato estranho → ilegível" "98:ilegivel:disk" "$(STUB_N_DISK_RAW='nada' outcome_n)"
 eq "núcleos ilegíveis: ncpu vazio (e a bateria ainda roda)" "" "$(STUB_N_NPROC_FAIL=1 pfv ncpu)"; eq "…rodando" "0:-" "$(STUB_N_NPROC_FAIL=1 outcome_n)"
+eq "xdist ausente no venv do nó: xdist=0" 0 "$(xdist_off; pfv xdist)"; eq "venv ilegível: xdist vazio (≠ 0)" "" "$(xdist_gone; pfv xdist)"; xdist_on
+eq "xdist presente: xdist=1" 1 "$(pfv xdist)"
 rm -f "$NODEFLAG"
 
 # ===== segurança: o filtro =====
@@ -856,7 +867,7 @@ eq "NADA de dado ou segredo plantado chegou ao nó, nem arquivo de nome neutro, 
 has "o node_guard avisa quantos reteve" "$T/err" 'NOTE: 3 arquivo\(s\) com lista de telefones/CPFs ficam no mini e NÃO vão ao nó Linux'; hasnt "…e o aviso nunca traz o VALOR" "$T/err" '5531[0-9]{8}'
 for okf in lib/a.py tests/test_x.py tests/ok.json tests/data/fixture.json tests/fixtures/win.jsonl contacts_auth/server.py processo_lookup/pdpj_token.py tests/test_pdpj_token_refresh.py lib/rules.yaml $OKCFG $PASSF; do n=$((n+1)); if [ -f "$DEST/$okf" ]; then echo "ok   chegou (é código/config listado/abaixo do limite): $okf"; else echo "FAIL não chegou: $okf"; fails=$((fails+1)); fi; done
 n=$((n+1)); if [ ! -e "$DEST/processo_lookup/.env.pdpj" ] && [ ! -e "$DEST/shared/logs.backup/x.out" ]; then echo "ok   --delete-excluded limpa o que uma semeadura antiga deixou (.env.pdpj e shared/logs.backup/x.out)"; else echo "FAIL o destino manteve segredo/log antigo"; fails=$((fails+1)); fi
-MUT="$T/mutdir"; mkdir -p "$MUT"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt hetzner-pii-scan.py; do ln -sf "$HERE/$mf" "$MUT/$mf"; done   # o pii-scan TEM de estar aqui: sem ele o node_guard do mutante falha fechado e nada vaza, e o controle diria que o teste não enxerga o defeito
+MUT="$T/mutdir"; mkdir -p "$MUT"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt hetzner-pii-scan.py hetzner-mac-only.txt; do ln -sf "$HERE/$mf" "$MUT/$mf"; done   # o pii-scan TEM de estar aqui: sem ele o node_guard do mutante falha fechado e nada vaza, e o controle diria que o teste não enxerga o defeito; a lista mac-only idem (ilegível = o nó não é usado)
 # controle negativo 1: sem o --filter, o vazamento aparece — prova que o teste enxerga o defeito
 sed 's/--filter=". \$NODE_FILTER" //' "$RUN" > "$MUT/mut-nofilter.sh"; chmod +x "$MUT/mut-nofilter.sh"
 n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-nofilter.sh"; then echo "FAIL controle: o sed não mudou nada"; fails=$((fails+1)); else
@@ -916,6 +927,71 @@ reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; STUB_RS
 expect "quebra de linha no nome do arquivo: o scanner não o abre (rc 3) e o nó NÃO é usado, cai no MBP" 0 "$rc"; has "…motivo varredura-falhou no host hetzner" "$J" '"reason":"varredura-falhou".*"host":"hetzner"'
 n=$((n+1)); if [ ! -e "$DEST/lib/a.py" ] && [ -z "$(find "$DEST/lib" -name 'nl*' 2>/dev/null)" ]; then echo "ok   …e nada foi enviado ao nó (nem o arquivo de nome partido)"; else echo "FAIL o nó recebeu arquivos apesar de um nome que a lista parte em dois"; fails=$((fails+1)); fi
 find "$DEST" -mindepth 1 -delete 2>/dev/null
+
+# ===== lista mac-only =====
+reset; date > "$NODEFLAG"; printf '%s\n' 'tests/test_x.py' > "$MACONLY"; rc=$(run -- tests/test_x.py); expect "alvo na lista mac-only: roda no MBP" 0 "$rc"
+hasnt "…o nó não é chamado" "$STUB_LOG" 'HOSTCALL:hetzner'; has "…o motivo vai ao log" "$J" '"reason":"mac-only".*"host":"hetzner"'; has "…a mensagem diz qual arquivo" "$T/err" 'tests/test_x.py está na lista mac-only'; has "…e roda no MBP" "$J" '"mode":"pytest".*"host":"mbp"'
+reset; date > "$NODEFLAG"; printf '# comentário\n\n  tests/test_x.py  \r\n' > "$MACONLY"; run -- tests/test_x.py >/dev/null; has "lista com comentário, linha vazia, espaços e CRLF ainda casa" "$J" '"reason":"mac-only"'
+reset; date > "$NODEFLAG"; printf 'tests/mac/*\n' > "$MACONLY"; run -- tests/mac/test_a.py -q >/dev/null; has "glob (tests/mac/*) casa" "$J" '"reason":"mac-only"'
+reset; date > "$NODEFLAG"; printf 'tests/test_x.py\n' > "$MACONLY"; run -- tests/test_x.py::test_a -q >/dev/null; has "node id (arquivo::teste) casa pelo arquivo" "$J" '"reason":"mac-only"'
+reset; date > "$NODEFLAG"; printf 'tests/test_x.py\n' > "$MACONLY"; run -- "$T/wt/tests/test_x.py" >/dev/null; has "caminho absoluto dentro do worktree casa" "$J" '"reason":"mac-only"'
+reset; date > "$NODEFLAG"; printf 'tests/test_b.py\n' > "$MACONLY"; run -- tests/test_a.py tests/test_b.py tests/test_c.py >/dev/null; has "UM alvo mac-only manda a bateria INTEIRA ao MBP" "$J" '"reason":"mac-only"'; hasnt "…nada vai ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'
+reset; date > "$NODEFLAG"; printf 'tests/test_other.py\n' > "$MACONLY"; run -- tests/test_x.py >/dev/null; has "alvo fora da lista: vai ao nó" "$J" '"host":"hetzner"'; hasnt "…sem recusa" "$J" 'mac-only'
+reset; date > "$NODEFLAG"; : > "$MACONLY"; printf 'tests/test_x.py\n' > "$LEARNED"; rc=$(run -- tests/test_x.py); expect "lista APRENDIDA pela sombra também vale" 0 "$rc"; has "…vai ao MBP" "$J" '"reason":"mac-only"'
+reset; date > "$NODEFLAG"; : > "$MACONLY"; printf 'tests/test_x.py\n' > "$LEARNED"; chmod 000 "$LEARNED"; run -- tests/test_x.py >/dev/null; has "lista aprendida existe mas não abre: o nó NÃO é usado" "$J" '"reason":"mac-only-ilegivel"'; hasnt "…nenhuma chamada ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; chmod 644 "$LEARNED"
+reset; date > "$NODEFLAG"; chmod 000 "$MACONLY"; run -- tests/test_x.py >/dev/null; has "lista estática ilegível (sem permissão): o nó NÃO é usado" "$J" '"reason":"mac-only-ilegivel"'; hasnt "…nenhuma chamada ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; chmod 644 "$MACONLY"
+reset; date > "$NODEFLAG"; rc=$(HETZNER_MAC_ONLY_LIST="$T/nao-existe.txt" run -- tests/test_x.py); expect "lista estática AUSENTE: o nó NÃO é usado, cai no MBP" 0 "$rc"; has "…motivo" "$J" '"reason":"mac-only-ilegivel"'
+reset; date > "$NODEFLAG"; : > "$MACONLY"; rc=$(run -- tests/test_x.py); has "lista vazia é válida (nenhum glob casa): vai ao nó" "$J" '"host":"hetzner"'
+reset; : > "$MACONLY"; mc=$("$RUN" --host linux --check 2>/dev/null | sed -n 's/^node_mac_only_rc=//p'); eq "--check: lista vazia = rc 1 (nenhum alvo)" 1 "$mc"; chmod 000 "$MACONLY"; mc=$("$RUN" --host linux --check 2>/dev/null | sed -n 's/^node_mac_only_rc=//p'); eq "--check: lista ilegível = rc 2" 2 "$mc"; chmod 644 "$MACONLY"
+
+# ===== paralelismo (xdist) =====
+printf 'def test_%d(): pass\n' $(seq 1 50) > "$T/wt/tests/test_big.py"
+reset; date > "$NODEFLAG"; run -- tests/test_big.py -q >/dev/null; has "bateria grande (50 testes): injeta -n 16 (16 núcleos, 1 bateria)" "$(lsf RUN hetzner)" 'pytest -p no:cacheprovider -n 16 tests/test_big\.py -q'; has "…e avisa" "$T/err" 'xdist: 16 workers'
+reset; date > "$NODEFLAG"; run -- tests/test_x.py -q >/dev/null; hasnt "bateria pequena (arquivo vazio): sem -n" "$(lsf RUN hetzner)" 'cacheprovider -n '
+reset; date > "$NODEFLAG"; run -- tests/test_big.py -n 3 >/dev/null; hasnt "o -n do chamador vence: nenhum -n injetado na frente" "$(lsf RUN hetzner)" 'cacheprovider -n '; has "…e fica o dele" "$(lsf RUN hetzner)" 'cacheprovider tests/test_big\.py -n 3'
+for fl in "-p no:xdist" "--pdb" "--collect-only" "--co" "--dist=loadfile" "-d" "--lf"; do reset; date > "$NODEFLAG"; run -- tests/test_big.py $fl >/dev/null; hasnt "chamador com '$fl': xdist não é injetado" "$(lsf RUN hetzner)" ' -n 16'; done
+reset; date > "$NODEFLAG"; xdist_off; run -- tests/test_big.py >/dev/null; hasnt "xdist ausente no nó: sem -n" "$(lsf RUN hetzner)" ' -n 16'; xdist_gone; reset; date > "$NODEFLAG"; run -- tests/test_big.py >/dev/null; hasnt "venv ilegível (xdist vazio): sem -n (o inerte)" "$(lsf RUN hetzner)" ' -n 16'; xdist_on
+reset; date > "$NODEFLAG"; HETZNER_XDIST_OFF=1 run -- tests/test_big.py >/dev/null; hasnt "HETZNER_XDIST_OFF=1: sem -n" "$(lsf RUN hetzner)" ' -n 16'
+reset; date > "$NODEFLAG"; HETZNER_XDIST_MIN_TESTS=100 run -- tests/test_big.py >/dev/null; hasnt "limiar HETZNER_XDIST_MIN_TESTS=100: 50 testes não bastam" "$(lsf RUN hetzner)" ' -n 16'
+reset; date > "$NODEFLAG"; HETZNER_XDIST_MIN_TESTS=1 run -- tests/test_x.py::test_a >/dev/null; has "node id explícito conta como 1 teste (limiar 1 → injeta)" "$(lsf RUN hetzner)" ' -n 16 '
+reset; date > "$NODEFLAG"; run -- tests >/dev/null; has "diretório como alvo: conta os testes dos arquivos (50) → injeta" "$(lsf RUN hetzner)" ' -n 16 '
+reset; date > "$NODEFLAG"; STUB_N_NPROC_FAIL=1 run -- tests/test_big.py >/dev/null; hasnt "núcleos ilegíveis: sem -n (não inventa um número)" "$(lsf RUN hetzner)" 'cacheprovider -n '
+reset; date > "$NODEFLAG"; STUB_N_NPROC=8 run -- tests/test_big.py >/dev/null; has "8 núcleos: -n 8" "$(lsf RUN hetzner)" ' -n 8 '
+reset; date > "$NODEFLAG"; for i in 1 2 3; do mkslot $i; done; STUB_SLOTS=exec run -- tests/test_big.py >/dev/null; has "com 3 baterias já em curso (a minha é a 4ª): núcleos / 4 = -n 4" "$(lsf RUN hetzner)" ' -n 4 '
+reset; date > "$NODEFLAG"; for i in 1 2 3 4 5; do mkslot $i; done; STUB_SLOTS=exec run -- tests/test_big.py >/dev/null; has "6ª bateria: 16 / 6 = 2 workers (nunca menos que 2)" "$(lsf RUN hetzner)" ' -n 2 '
+reset; date > "$NODEFLAG"; run -- tests/test_big.py >/dev/null; has "o log registra os argumentos ORIGINAIS (nargs=1: só o arquivo, sem o -n injetado)" "$J" '"nargs":1'
+reset; run -- tests/test_big.py >/dev/null; hasnt "MBP: nunca injeta -n" "$(lsf RUN mbp)" ' -n 16'
+
+# ===== a sombra =====
+shadow_env() { reset; date > "$NODEFLAG"; export HETZNER_SHADOW_PCT=100 STUB_RUN_OUT_NODE='NODE-OUT' STUB_RUN_OUT_MBP='MBP-ONLY-MARKER'; }
+shadow_end() { export HETZNER_SHADOW_PCT=0; unset STUB_RUN_OUT_NODE STUB_RUN_OUT_MBP; }
+shadow_env; rc=$(run -- tests/test_x.py); expect "sombra 100%, resultados iguais: quem chamou recebe o do nó" 0 "$rc"
+has "sombra: o MBP também rodou (em paralelo)" "$STUB_LOG" 'HOSTCALL:mbp:RUN'; has "sombra: veredito 'same' no log da sombra" "$SHLOG" '"verdict":"same","a_host":"hetzner","a_rc":0,"b_host":"mbp","b_rc":0'
+has "sombra: o lado de MBP é marcado shadow:1 no log de execuções" "$J" '"host":"mbp".*"shadow":1'; grep '"host":"hetzner"' "$J" > "$T/hz.log"; hasnt "sombra: a linha do nó NÃO é marcada" "$T/hz.log" 'shadow'
+hasnt "sombra: a saída do MBP NÃO chega a quem chamou" "$T/out" 'MBP-ONLY-MARKER'; has "sombra: a saída do nó chega" "$T/out" 'NODE-OUT'; [ ! -e "$LEARNED" ] && ok "sombra igual: nada é aprendido" || bad "sombra igual aprendeu algo"
+[ "$(grep -c 'HOSTCALL:mbp:RUN' "$STUB_LOG")" = 1 ] && ok "a sombra roda UMA vez no MBP (o filho não faz outra sombra)" || bad "a sombra rodou mais de uma vez no MBP"
+n=$((n+1)); if ls "$T/city/.gc/run/" 2>/dev/null | grep -q 'mbp-shadow'; then echo "FAIL sobrou arquivo temporário da sombra"; fails=$((fails+1)); else echo "ok   a sombra apaga o próprio arquivo temporário"; fi
+shadow_env; rc=$(STUB_RUN_RC_NODE=0 STUB_RUN_RC_MBP=1 run -- tests/test_x.py); expect "sombra diverge (nó 0, MBP 1): o chamador recebe o rc do NÓ" 0 "$rc"
+has "divergência: veredito no log" "$SHLOG" '"verdict":"diverge","a_host":"hetzner","a_rc":0,"b_host":"mbp","b_rc":1,"files":"tests/test_x.py"'; has "divergência: o arquivo entra na lista aprendida" "$LEARNED" '^tests/test_x\.py$'; has "divergência: avisa" "$T/err" 'sombra: DIVERGÊNCIA \(nó rc=0, MBP rc=1\)'
+shadow_end; : > "$STUB_LOG"; rm -f "$J"; rc=$(run -- tests/test_x.py); has "a divergência aprendida vale na rodada seguinte (sombra desligada): vai ao MBP" "$J" '"reason":"mac-only"'
+shadow_env; STUB_RUN_RC_NODE=1 STUB_RUN_RC_MBP=1 STUB_RUN_OUT_NODE='FAILED tests/a.py::t - x' STUB_RUN_OUT_MBP='FAILED tests/a.py::t - x' run -- tests/a.py tests/b.py >/dev/null
+has "mesmo rc e mesmos arquivos reprovados: 'same'" "$SHLOG" '"verdict":"same"'
+shadow_env; STUB_RUN_RC_NODE=1 STUB_RUN_RC_MBP=1 STUB_RUN_OUT_NODE='FAILED tests/a.py::t - x' STUB_RUN_OUT_MBP='FAILED tests/a.py::t - x\nFAILED tests/b.py::u - y' run -- tests/a.py tests/b.py >/dev/null
+has "mesmo rc (1) mas reprovam arquivos diferentes: diverge" "$SHLOG" '"verdict":"diverge"'; has "só o arquivo que difere é marcado (b.py)" "$LEARNED" '^tests/b\.py$'; hasnt "…e o que reprova dos dois lados (a.py) não" "$LEARNED" 'a\.py'
+shadow_env; STUB_RUN_RC_NODE=0 STUB_RUN_RC_MBP=1 run -- tests/a.py tests/b.py::t >/dev/null
+has "rc difere sem nenhum arquivo legível: TODOS os alvos .py viram mac-only (mais no Mac, nunca menos)" "$LEARNED" '^tests/a\.py$'; has "…inclusive o de node id (pelo arquivo)" "$LEARNED" '^tests/b\.py$'
+shadow_env; rc=$(STUB_RUN_RC_NODE=1 STUB_RUN_RC_MBP=0 run -- tests/test_x.py); expect "nó 1, MBP 0: o chamador recebe o 1 do nó" 1 "$rc"; has "…e é divergência" "$SHLOG" '"verdict":"diverge","a_host":"hetzner","a_rc":1,"b_host":"mbp","b_rc":0'
+shadow_env; rc=$(STUB_UNREACHABLE_MBP=1 run -- tests/test_x.py); expect "MBP fora na sombra: o chamador não sente" 0 "$rc"; has "veredito 'skipped' com o rc do MBP" "$SHLOG" '"verdict":"skipped","a_host":"hetzner","a_rc":0,"b_host":"mbp","b_rc":98'; [ ! -e "$LEARNED" ] && ok "MBP indisponível: nada é aprendido" || bad "aprendeu sem comparar"
+shadow_env; rm -f "$FLAG"; rc=$(run -- tests/test_x.py); expect "MBP desligado: a sombra não roda e o nó responde" 0 "$rc"; has "veredito 'skipped' (rc 99)" "$SHLOG" '"verdict":"skipped".*"b_rc":99'; date > "$FLAG"
+shadow_env; start=$(date +%s); rc=$(HETZNER_SHADOW_WAIT_S=1 STUB_RUN_SLEEP_MBP=25 run -- tests/test_x.py); el=$(( $(date +%s) - start )); expect "MBP lento (25 s): o chamador não espera além do teto da sombra" 0 "$rc"
+has "veredito 'timeout'" "$SHLOG" '"verdict":"timeout"'; n=$((n+1)); if [ "$el" -lt 20 ]; then echo "ok   o teto de espera (1 s) foi respeitado (${el}s, o MBP lento levaria 25 s)"; else echo "FAIL esperou o MBP lento (${el}s)"; fails=$((fails+1)); fi; [ ! -e "$LEARNED" ] && ok "timeout: nada é aprendido" || bad "timeout aprendeu"
+shadow_env; touch -t 202001010000 "$NODEFLAG"; run -- tests/test_x.py >/dev/null; hasnt "bandeira com mais de 24 h: janela fechada, sem sombra" "$STUB_LOG" 'HOSTCALL:mbp'
+shadow_env; touch -t 202001010000 "$NODEFLAG"; HETZNER_SHADOW_WINDOW_S=999999999 run -- tests/test_x.py >/dev/null; has "janela configurável (HETZNER_SHADOW_WINDOW_S) reabre a sombra" "$STUB_LOG" 'HOSTCALL:mbp:RUN'
+shadow_env; export HETZNER_SHADOW_PCT=0; run -- tests/test_x.py >/dev/null; hasnt "HETZNER_SHADOW_PCT=0: sem sombra" "$STUB_LOG" 'HOSTCALL:mbp'
+shadow_env; STUB_UNREACHABLE_NODE=1 run -- tests/test_x.py >/dev/null; [ "$(grep -c 'HOSTCALL:mbp:RUN' "$STUB_LOG")" = 1 ] && ok "nó fora (a bateria foi ao MBP): não há o que comparar, sem sombra" || bad "sombra com o nó fora"
+[ ! -e "$SHLOG" ] && ok "…e nenhum veredito é gravado" || bad "veredito gravado sem sombra"
+shadow_env; rc=$(STUB_RUN_RC_NODE=255 run -- tests/test_x.py); expect "nó cai no meio com a sombra rodando: a bateria vai ao MBP e a sombra é abortada" 0 "$rc"; [ ! -e "$SHLOG" ] && ok "…sem veredito da sombra" || bad "veredito de uma sombra abortada"
+shadow_end
 
 
 reset

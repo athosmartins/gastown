@@ -1,0 +1,76 @@
+# hetzner-mac-only.txt — arquivos de teste que NUNCA vão ao nó Linux (Hetzner): rodam no MBP ou no mini. Um glob por linha; # comenta. (ga-zri39b)
+#
+# Contents
+#   O que entra aqui · Como a lista é lida · Como se mantém
+#
+# O QUE ENTRA AQUI: teste que depende do macOS (launchd/plist de verdade, osascript, caminhos /Users/..., ADB, binários do Homebrew). No Linux ele reprova
+#   (ou, pior, passa vazio) por causa do AMBIENTE, não do código — e o veredito do gate não pode depender disso (Athos 13/10: o servidor é o destino de
+#   100% das baterias, menos estas).
+# COMO A LISTA É LIDA (scripts/mbp-run.sh, mac_only_match): o glob casa o caminho relativo ao worktree (ex.: tests/test_launchd_plist.py ou tests/mac/*).
+#   Basta UM alvo da bateria casar para a bateria inteira pular o nó e ir ao MBP (e, se ele não puder, ao mini). Lista ausente ou ilegível = o nó NÃO é usado
+#   (sem a lista não se sabe o que tem de ficar no Mac). Esta é a lista ESTÁTICA, em git; a que a sombra aprende sozinha mora em
+#   $CITY/.gc/hetzner-mac-only.learned (mesmo formato, lida junto).
+# COMO SE MANTÉM: a sombra (primeiras 24 h da bandeira, ~10% das baterias rodam nos dois lados) acrescenta na lista aprendida todo arquivo cujo resultado
+#   diverge. Quando um arquivo aprendido se confirma, copie-o para cá (aprendido some quando o .gc é recriado). Medição que gerou a semente abaixo: ver o comentário
+#   da bead ga-zri39b (rodada completa no nó × os mesmos arquivos no mini).
+#
+
+# --- semente (medida em 13/10 na rodada real no nó; ver o comentário da ga-zri39b) ---
+# Método: dos 566 arquivos de teste do WA que rodei um a um no nó (os 354 com assinatura de macOS/host + os ~200 primeiros em ordem alfabética), 68 NÃO passaram; 11 citam
+# shared/data (o gate-pytest.sh já os mantém no mini) e dos 57 restantes, 38 PASSAM no mini. É esta lista: falha no nó E passa no mini = o ambiente do nó, não o código.
+# Os 19 que também não passam no mini (ou travam sob o load dele) ficam FORA: não há evidência de que o nó erre sozinho. Fuso (TZ=America/Sao_Paulo) NÃO mudou nenhum: 0 de 57.
+# Esta é a lista de partida: a sombra (primeiras 24 h) acrescenta o que faltar em $CITY/.gc/hetzner-mac-only.learned; o que se confirmar lá, copie para cá.
+
+# CAMINHO-/Users/athos (8): caminho absoluto do mini (/Users/athos/...) que não existe no servidor
+tests/test_assertiva_keepalive.py
+tests/test_backup_incremental_wa_csg5c.py
+tests/test_classification_dashboard_auth_watchdog_wa_upayp.py
+tests/test_contagem_staleness_alert_reaches_push_wa_15glu.py
+tests/test_cpf_consolidado_freshness_alert_reaches_push_wa_dy3f0.py
+tests/test_inbound_ungrounded_ask_wa_97scg.py
+tests/test_painel_visibilidade.py
+tests/test_warming_engine.py
+
+# ASSERT (16): launchd/plist/launchctl, python do Homebrew (/opt/homebrew/bin/python3), PATH do mini ou binário do macOS: o comportamento testado é o do macOS
+tests/test_area_por_fracao_wa_tch5r.py
+tests/test_ban_risk_monitor_launch_path_wa_646bd.py
+tests/test_build_ficha360_search_index_wa_598mf.py
+tests/test_deploy_daemons_reload_scheduled_running_wa_az8ox.py
+tests/test_detect_swallowed_daemon_deploy_wa_ohcqo.py
+tests/test_fleet_quiet_hold_wa_zqed1.py
+tests/test_inbound_writers_chat_id_dedup.py
+tests/test_iptu_bh_sweep_wrapper.py
+tests/test_launchd_auto_reinstall_path.py
+tests/test_lotes_rebuild_pix_atributos_step_wa_wcux2.py
+tests/test_painel_regate_wa_8v3nb.py
+tests/test_pbh_edificacao_scrape_wrapper.py
+tests/test_plist_notify_alcancavel_wa_rxczz.py
+tests/test_rfb_s3_freshness_cron_wa_x783h.py
+tests/test_wa_audit_deadman.py
+tests/test_wap010_diario_wa_s7kmb.py
+
+# PLAYWRIGHT/BROWSER (3): precisam de um navegador (Chromium/Playwright) que o servidor não tem
+tests/test_map_viewer_esc_atalhos_e2e_wa_krgps6.py
+tests/test_map_viewer_segurar_carrinho_e2e_wa_u6bxvq.py
+tests/test_pregao_sort_panel_e2e.py
+
+# SEM-GIT (2): chamam `git ls-files`/`git rev-parse` no repo: o .git nunca vai ao nó (de propósito: histórico não é código de teste)
+tests/test_plist_command_fidelity.py
+tests/test_plists_parseiam.py
+
+# DEP-FALTANDO:crew (1): importam `crew.*`: as pastas de crew são espaços de trabalho de agentes e o filtro as exclui
+tests/test_assertiva_bridge_md.py
+
+# DADO (4): leem um banco do mini (shared/data) por um caminho que o gate-pytest não enxerga; o MBP também não tem o dado: vão ao MBP, reprovam lá e rodam no mini, como antes desta bead
+tests/test_build_ficha360_search_index.py
+tests/test_frota_aquecimento.py
+tests/test_frota_unificada.py
+tests/test_inbound_media_causal_unbalanced_wa_rz4r2.py
+
+# ARQUIVO-AUSENTE (3): leem arquivo de dado/config do mini; mesma observação dos de banco
+tests/test_admin_grade_vs_busca_wa_krqxj.py
+tests/test_captura_plists_e_rotulo_wa_7p41s.py
+tests/test_map_viewer_fd_ceiling_wa_2jagt.py
+
+# OUTRO (1): reprovam no nó por motivo que não é um dos acima (a sombra e o log dizem mais)
+tests/test_botao_dono_por_terreno.py
