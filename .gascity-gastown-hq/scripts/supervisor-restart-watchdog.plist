@@ -17,8 +17,10 @@
        ga-0ox5tq): each sample also counts the supervisor's open fds with
        `lsof -n -P -p <pid>` (the `fds` field). Above 30,000 it only records;
        above 40,000 it runs `launchctl kickstart -k gui/<uid>/com.gascity.
-       supervisor` (tmux sessions outlive it), notifies at priority 4 and does
-       not restart again for 30 minutes. A count it could not read is `fds:null`
+       supervisor`, notifies at priority 4 and does not restart again for 30
+       minutes. The city's tmux server runs outside the supervisor's process
+       group (seen 2026-10-13), so its sessions should survive; the record's
+       sessions_before/sessions_after are the proof on the first real event. A count it could not read is `fds:null`
        and never restarts anything. The lsof walk is what a run costs now: 0.65s
        at 900 fds, growing with the count (bounded at 120s in the script), so
        a run is still far inside StartInterval=900. Single-instance-locked
