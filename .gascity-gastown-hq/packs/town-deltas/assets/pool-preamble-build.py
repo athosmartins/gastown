@@ -593,8 +593,9 @@ def cmd_live(m, gt_root=None):
                 rc = 1
             for path in dirs:
                 real = os.path.join(path.replace(root, gt_root, 1) if gt_root else path, df["live_file"])
-                live = os.path.isfile(real)
-                print(f"  {'LIVE' if live else 'INERT':11s} {role}: {real}" + ("" if live else f"  (o hook '{name}' está registrado mas o arquivo não existe: no-op)"))
+                # o hook de SessionStart testa `[ -x ... ]`, não só existência: arquivo presente sem bit de execução é no-op calado, então `live` tem de concordar com ele
+                live = os.path.isfile(real) and os.access(real, os.X_OK)
+                print(f"  {'LIVE' if live else 'INERT':11s} {role}: {real}" + ("" if live else f"  (o hook '{name}' está registrado mas o arquivo não existe ou não é executável: no-op)"))
                 rc = rc or (0 if live else 1)
     print("pool-preamble-build live: " + ("todos os papéis LIVE" if rc == 0 else "há papel NÃO guardado ou INERTE"))
     return rc

@@ -250,6 +250,10 @@ if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-r
 # ga-fl2nek: com o guard presente e o atalho de pytest AUSENTE, os workers ficam INERT (o hook é `[ -x "$D/python3" ] || exit 0`: registrado e calado)
 if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT para o atalho de pytest ausente"; else echo "$o" | grep -q 'INERT.*wa-worker.*pytest-shim' && ok "live: guard presente + atalho de pytest AUSENTE = INERT no worker, rc != 0" || bad "live: sem INERT do atalho no output: $o"; fi
 mkdir -p "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin"; : > "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
+# gate-fix (ga-fl2nek): python3 PRESENTE mas SEM bit de execução = o hook `[ -x ]` é no-op calado, então `live` diz INERT (antes dizia LIVE: o arquivo existia)
+chmod 644 "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
+if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT para o atalho sem bit de execução"; else echo "$o" | grep -q 'INERT.*wa-worker.*pytest-shim' && ok "live: atalho de pytest presente mas NÃO executável = INERT no worker, rc != 0" || bad "live: sem INERT do atalho não executável no output: $o"; fi
+chmod 755 "$LIVEROOT/.gascity-gastown-hq/scripts/pytest-shim/bin/python3"
 if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)" && [ "$(echo "$o" | grep -c '^  LIVE')" = "6" ]; then ok "live: guard + atalho presentes = 4 guards e 2 atalhos de worker LIVE, rc 0"; else bad "live: esperava 6 LIVE e rc 0: $o"; fi
 reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'EOF'
 import json, sys

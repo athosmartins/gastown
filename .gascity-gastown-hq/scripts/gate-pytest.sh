@@ -452,6 +452,8 @@ SECS=$(( $(date +%s) - T_START ))
 if [ $GREEN_MBP -eq 1 ] && [ "$RC" = 0 ]; then
   ESCOPO="."; [ $GREEN_PARTIAL -eq 1 ] && ESCOPO=" SÓ para os alvos que não pularam (os que pularam rodaram aqui)."
   say "nota: verde do MBP aceito como veio${ESCOPO} O MBP não tem shared/data nem .env: um teste que lê dado por um caminho que o wrapper não vê (constante numa lib, fixture) pode ter passado VAZIO lá — se o código testado lê dado, trate este verde como não verificado e rode esses arquivos aqui com ${LOCAL_HINT}"
+  # variável de ambiente posta na frente do comando não viaja: o comando remoto do mbp-run é fixo (export PATH=... PYTHONDONTWRITEBYTECODE=1)
+  say "nota: variável de ambiente posta na frente do comando (FOO=1 python3 -m pytest, PYTHONPATH=, PYTEST_ADDOPTS) NÃO chega ao MBP: o verde acima pode ser um verde sem ela — se o teste depende dela, rode aqui."
 fi
 # O log é o insumo do antes×depois: uma linha que não foi gravada some da contagem. O rc do revisor não depende dele (nunca falha por
 # causa do log), mas a falta é DITA na saída, não engolida — quem lê "execuções: N" sabe que pode faltar uma.

@@ -10,7 +10,9 @@ POR QUÊ: o aceite da ga-fl2nek é ">= 70% das rodadas de pytest dos workers no 
 
 USO:    python3 -I scripts/pytest-shim/coverage.py [--dias 14] [--desde 2026-10-14T00:00:00Z]
         --dias: janela dos transcritos (arquivos de ~/.claude/projects modificados nos últimos N dias; só as pastas de projeto cujo nome cita whatsapp-automation ou
-        property-scrapers — raiz fixa, nunca varredura do $HOME). --desde: corta o log do atalho e o mbp-run.jsonl no mesmo instante (ISO com fuso).
+        property-scrapers — raiz fixa, nunca varredura do $HOME). --desde: corta o log do atalho e o mbp-run.jsonl no mesmo instante (ISO com fuso, qualquer
+        deslocamento: `...Z`, `...-03:00` — o corte é feito em INSTANTES, não em texto; os logs gravam UTC `...Z`). Linha de log sem ts legível não é "antes" nem
+        "depois" do corte: fica fora da conta e o relatório diz quantas.
 
 O QUE CONTA: um comando Bash com UMA forma de pytest (a primeira que casa), nesta ordem:
     mbp-run.sh                      o worker chamou o wrapper à mão (preâmbulo ga-yvs19w)
@@ -28,7 +30,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 PROJECTS = os.path.expanduser("~/.claude/projects")
 CITY = os.environ.get("GC_CITY_PATH") or "/Users/athos/gt/.gascity-gastown-hq"
@@ -38,6 +40,16 @@ FORMS = (
     ("python3|python -m pytest", re.compile(r"(?:^|[;&|(]\s*|\bexec\s+|\btimeout\s+\d+\s+|\bnice\s+(?:-n\s*\d+\s+)?|\benv\s+(?:\S+=\S+\s+)*|=\S*\s+)python3?(?:\.\d+)?\s+(?:-\S+\s+)*-m\s*pytest\b")),
     ("pytest solto", re.compile(r"(?:^|[;&|(]\s*|\bexec\s+|\btimeout\s+\d+\s+|\bnice\s+(?:-n\s*\d+\s+)?)pytest(?:\s|$)")),
 )
+
+
+def parse_iso(s):
+    """Instante ISO-8601 COM fuso → datetime em UTC. None se não abrir ou se não tiver fuso (sem fuso a data seria lida na zona da máquina)."""
+    # vazio → None; ilegível → None. Quem chama trata None como "não sei", nunca como "antes do corte" nem como "depois"
+    try:
+        d = datetime.fromisoformat(re.sub(r"[zZ]$", "+00:00", str(s).strip()))
+    except ValueError:
+        return None
+    return d.astimezone(timezone.utc) if d.tzinfo is not None else None
 
 
 def classify(cmd):
@@ -91,36 +103,57 @@ def scan(dias):
 
 
 def read_jsonl(path, desde):
-    rows, bad = [], 0
+    """(linhas, linhas que não abriram como objeto JSON, linhas sem ts legível fora do corte). `desde` é um instante (datetime UTC) ou None.
+    Arquivo ausente → (None, 0, 0): "ainda não existe". Arquivo que existe e não abre é outra coisa — sai com erro, não vira "ainda não existe"."""
+    rows, bad, no_ts = [], 0, 0
+    # vazio (arquivo ausente) → None, o relatório diz "sem log"; falhou/ilegível (permissão, I/O) → sai com o erro: contagem de aceite parcial é pior que nenhuma
     try:
         with open(path) as fh:
             for line in fh:
                 if not line.strip():
                     continue
+                # vazio (linha em branco) → pulada acima; falhou/ilegível (não é JSON, ou JSON que não é objeto) → contada em `bad`, o relatório diz
                 try:
                     r = json.loads(line)
                 except ValueError:
                     bad += 1
                     continue
-                if not desde or str(r.get("ts", "")) >= desde:
-                    rows.append(r)
-    except OSError:
-        return None, 0
-    return rows, bad
+                if not isinstance(r, dict):
+                    bad += 1
+                    continue
+                if desde:
+                    # vazio (sem ts) ou ilegível (não abre / sem fuso) → fora da conta e contada em `no_ts`; nunca "antes do corte" calado
+                    t = parse_iso(r.get("ts", ""))
+                    if t is None:
+                        no_ts += 1
+                        continue
+                    if t < desde:
+                        continue
+                rows.append(r)
+    except FileNotFoundError:
+        return None, 0, 0
+    except OSError as e:
+        sys.exit(f"não consegui ler {path}: {e}")
+    return rows, bad, no_ts
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--dias", type=int, default=14)
-    ap.add_argument("--desde", default=None, help="ISO com fuso, ex.: 2026-10-14T00:00:00Z")
+    ap.add_argument("--desde", default=None, help="ISO com fuso, ex.: 2026-10-14T00:00:00Z ou 2026-10-13T21:00:00-03:00")
     a = ap.parse_args(argv)
-    if a.desde:
-        try:
-            tz = datetime.fromisoformat(a.desde.replace("Z", "+00:00")).tzinfo
-        except ValueError:
-            sys.exit("--desde inválido (ISO com fuso, ex.: 2026-10-14T00:00:00Z)")
-        if tz is None:
-            sys.exit("--desde precisa de fuso (ex.: 2026-10-14T00:00:00Z): sem fuso a data seria lida na zona da máquina")
+    if a.dias < 1:
+        ap.error("--dias precisa ser >= 1 (0 ou negativo varreria zero transcritos e o relatório diria 0 rodadas como se fosse medida)")
+    desde = None
+    if a.desde is not None:
+        # vazio ("") e ilegível/sem fuso → sai com erro: `--desde "$VAR"` com VAR vazia não pode virar "sem corte" calado (a contagem do aceite sairia inflada)
+        desde = parse_iso(a.desde)
+        if desde is None:
+            sys.exit("--desde inválido ou sem fuso (ISO com fuso, ex.: 2026-10-14T00:00:00Z ou 2026-10-13T21:00:00-03:00): sem fuso a data seria lida na zona da máquina")
+    # o corte que de fato vale, em UTC — é este texto que vai nos rótulos, não o que foi digitado
+    cut_txt = ""
+    if desde:
+        cut_txt = f" (desde {desde.strftime('%Y-%m-%dT%H:%M:%SZ')}" + (f", digitado {a.desde}" if a.desde.strip() != desde.strftime("%Y-%m-%dT%H:%M:%SZ") else "") + ")"
     forms, unreadable = scan(a.dias)
     runs = {k: v for k, v in forms.items() if k != "outro"}
     total = sum(runs.values())
@@ -132,8 +165,8 @@ def main(argv=None):
     reach = runs.get("python3|python -m pytest", 0) + runs.get("pytest solto", 0)
     if total:
         print(f"  -> o atalho ALCANÇA {reach} de {total} ({100 * reach // total}%); fora do alcance (caminho explícito de python): {runs.get('venv/bin/python -m pytest', 0)} ({100 * runs.get('venv/bin/python -m pytest', 0) // total}%)")
-    rows, bad = read_jsonl(os.path.join(CITY, ".gc/logs/pytest-shim.jsonl"), a.desde)
-    print("== log do atalho" + (f" (desde {a.desde})" if a.desde else ""))
+    rows, bad, no_ts = read_jsonl(os.path.join(CITY, ".gc/logs/pytest-shim.jsonl"), desde)
+    print("== log do atalho" + cut_txt)
     if rows is None:
         print("  (sem pytest-shim.jsonl: nenhuma execução passou pelo atalho ainda)")
     else:
@@ -145,14 +178,20 @@ def main(argv=None):
         why = collections.Counter(re.sub(r":.*", "", r.get("detail", "")) for r in rows if r.get("ran") == "local")
         for k, v in why.most_common(8):
             print(f"     local por: {k or '(sem detalhe)'}: {v}")
-    print("== mbp-run.jsonl" + (f" (desde {a.desde})" if a.desde else "") + ": recusas do preflight e execuções (insumo do aceite de carga)")
-    mrows, mbad = read_jsonl(os.path.join(CITY, ".gc/logs/mbp-run.jsonl"), a.desde)
+    if no_ts:
+        print(f"  AVISO: {no_ts} linha(s) do log do atalho sem ts legível ficaram FORA do corte — a contagem acima pode estar abaixo do real")
+    print("== mbp-run.jsonl" + cut_txt + ": recusas do preflight e execuções (insumo do aceite de carga)")
+    mrows, mbad, mno_ts = read_jsonl(os.path.join(CITY, ".gc/logs/mbp-run.jsonl"), desde)
     if mrows is None:
         print("  (sem mbp-run.jsonl)")
     else:
         ref = collections.Counter(r.get("reason", "?") for r in mrows if r.get("mode") == "preflight")
         ran = sum(1 for r in mrows if r.get("mode") in ("pytest", "exec"))
         print(f"  execuções no MBP: {ran}; recusas: " + (", ".join(f"{k}={v}" for k, v in ref.most_common()) or "nenhuma"))
+        if mno_ts:
+            print(f"  AVISO: {mno_ts} linha(s) do mbp-run.jsonl sem ts legível ficaram FORA do corte — a contagem acima pode estar abaixo do real")
+        if mbad:
+            print(f"  AVISO: {mbad} linha(s) do mbp-run.jsonl não abriram como objeto JSON")
     return 0
 
 
