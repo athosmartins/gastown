@@ -42,6 +42,7 @@ cat > "$FAKE_BIN/launchctl" <<'FAKE'
 # current pid (file `pid`) and the kickstart ledger (`kickstart.log`).
 D="${FAKE_DIR:-/nonexistent-fake-dir}"
 if [ "${1:-}" = "print" ]; then
+  { echo x >> "$D/print.log"; } 2>/dev/null     # how many times the script asked (the restart wait must not spin)
   if [ "${FAKE_LAUNCHCTL_EMPTY:-0}" = "1" ]; then
     exit 1
   fi
@@ -61,10 +62,16 @@ fi
 if [ "${1:-}" = "kickstart" ]; then
   printf '%s\n' "$*" >> "$D/kickstart.log"
   [ "${FAKE_KICKSTART_FAIL:-0}" = "1" ] && exit 1
+  # FAKE_KICKSTART_RC: the client exits with this status (124 = it timed out, 137 = it was killed).
+  # Unless FAKE_KICKSTART_LANDS=1 the job was NOT touched; with it, launchd did the kill although
+  # the client never said so — the case the script cannot tell from the exit status alone.
+  if [ -n "${FAKE_KICKSTART_RC:-}" ] && [ "${FAKE_KICKSTART_LANDS:-0}" != "1" ]; then exit "$FAKE_KICKSTART_RC"; fi
   : > "$D/kicked"
   # the respawned job gets a new pid, unless the scenario says it never came back
   [ "${FAKE_KICKSTART_NO_NEWPID:-0}" = "1" ] || echo $(( $(cat "$D/pid" 2>/dev/null || echo 4242) + 1 )) > "$D/pid"
-  exit 0
+  # the state directory goes read-only right after the kick: whatever the script writes next must fail
+  [ "${FAKE_KICKSTART_LOCK_STATE:-0}" = "1" ] && chmod 555 "${GC_CITY_PATH:-/nonexistent}/.gc/state"
+  exit "${FAKE_KICKSTART_RC:-0}"
 fi
 exit 1
 FAKE
@@ -486,6 +493,122 @@ wd FAKE_LSOF_FDS=50000 FAKE_TMUX_FAIL=1; REC=$(last_record "$CITY_X")
 [ "$(field guard_action "$REC")" = "restart_ok" ] && [ "$(field sessions_before "$REC")" = "null" ] && [ "$(field sessions_after "$REC")" = "null" ] \
   && ok "R3: tmux not answering -> sessions are null (unknown), never 0, and the restart still goes ahead" || bad "R3: $REC"
 
+echo "== ga-xuo89c (gate-fix 1): the guard is credited with a restart only when one happened =="
+
+deaths() { jq -s 'map(.delta_since_last - (.delta_guard_restart // 0)) | add' "$(ledger_file "$1")"; }
+# the credit lives in the guard state file: null = "no restart to credit"
+credited_runs() { jq -c '.runs_at_restart' "$(guard_file "$1")"; }
+
+# S1. The reviewer's reproduction, verbatim: the kick FAILS, then launchd's own
+#     respawn (a genuine death) bumps runs. That death is not the guard's.
+new_city s1
+RUNS_X=10 wd FAKE_LSOF_FDS=50000 FAKE_KICKSTART_FAIL=1; REC=$(last_record "$CITY_X")
+[ "$(field guard_action "$REC")" = "restart_failed" ] && [ "$(field guard_stamp "$REC")" = "unattributed" ] && [ "$(credited_runs "$CITY_X")" = "null" ] \
+  && ok "S1: a failed kick leaves nothing credited (guard_stamp=unattributed, runs_at_restart=null in the state file)" \
+  || bad "S1: stamp=$(field guard_stamp "$REC") credited=$(credited_runs "$CITY_X") $REC"
+fake_reset "$CITY_X"
+RUNS_X=11 wd FAKE_LSOF_FDS=100; REC=$(last_record "$CITY_X")
+[ "$(field delta_since_last "$REC")" = "1" ] && [ "$(field delta_guard_restart "$REC")" = "0" ] \
+  && ok "S1: the first genuine death after the failed kick is NOT credited to the guard (delta_guard_restart=0)" || bad "S1: $REC"
+[ "$(deaths "$CITY_X")" = "1" ] && ok "S1: the header's jq query counts that death (deaths=1, not 0)" || bad "S1: deaths=$(deaths "$CITY_X")"
+# ...and the failed attempt still holds the cooldown: crediting nothing must not mean retrying every cycle
+fake_reset "$CITY_X"; RUNS_X=11 wd FAKE_LSOF_FDS=50000; REC=$(last_record "$CITY_X")
+[ "$(field guard_action "$REC")" = "cooldown" ] && [ "$(kicks "$CITY_X")" = "1" ] \
+  && ok "S1: the cooldown of the failed attempt is intact (still 1 kickstart)" || bad "S1 cooldown: $REC kicks=$(kicks "$CITY_X")"
+
+# S2. Exit status other than 1 and not a timeout: still "launchctl said no, nothing was killed".
+new_city s2
+RUNS_X=10 wd FAKE_LSOF_FDS=50000 FAKE_KICKSTART_RC=5; REC=$(last_record "$CITY_X")
+[ "$(field guard_action "$REC")" = "restart_failed" ] && [ "$(field guard_stamp "$REC")" = "unattributed" ] && [ "$(credited_runs "$CITY_X")" = "null" ] \
+  && grep -q 'exit 5, nothing was killed' "$CITY_X/.fake/notify.log" \
+  && ok "S2: kickstart exit 5 -> restart_failed, uncredited, and the notify names the exit status" || bad "S2: $REC $(cat "$CITY_X/.fake/notify.log" 2>/dev/null)"
+
+# S3. The call timed out (124) and nothing happened: not "failed", not "restarted" — unknown.
+new_city s3
+RUNS_X=10 wd FAKE_LSOF_FDS=50000 FAKE_KICKSTART_RC=124 SRW_RESTART_WAIT=2 SRW_RESTART_POLL=1; REC=$(last_record "$CITY_X")
+if [ "$(field guard_action "$REC")" = "restart_unknown" ] && [ "$(field guard_stamp "$REC")" = "unattributed" ] && [ "$(credited_runs "$CITY_X")" = "null" ] \
+   && [ "$(field restart_new_pid "$REC")" = "null" ] && [ "$(kicks "$CITY_X")" = "1" ]; then
+  ok "S3: kickstart timed out (124), pid unchanged -> restart_unknown, uncredited, no new pid claimed"
+else
+  bad "S3: $REC"
+fi
+grep -q 'may or may not have restarted' "$CITY_X/.fake/notify.log" && ! grep -q 'FAILED' "$CITY_X/.fake/notify.log" \
+  && ok "S3: the notify says 'may or may not', not FAILED (a timeout is not a refusal)" || bad "S3 notify: $(cat "$CITY_X/.fake/notify.log" 2>/dev/null)"
+fake_reset "$CITY_X"; RUNS_X=11 wd FAKE_LSOF_FDS=100; REC=$(last_record "$CITY_X")
+[ "$(field delta_since_last "$REC")" = "1" ] && [ "$(field delta_guard_restart "$REC")" = "0" ] && [ "$(deaths "$CITY_X")" = "1" ] \
+  && ok "S3: the next +1 is counted as a death, not swallowed (an unknown kick is never credited)" || bad "S3 next: $REC deaths=$(deaths "$CITY_X")"
+fake_reset "$CITY_X"; RUNS_X=11 wd FAKE_LSOF_FDS=50000; REC=$(last_record "$CITY_X")
+[ "$(field guard_action "$REC")" = "cooldown" ] && ok "S3: the unknown attempt holds the cooldown too" || bad "S3 cooldown: $REC"
+
+# S4. Killed by a signal (137): the same third state.
+new_city s4
+RUNS_X=10 wd FAKE_LSOF_FDS=50000 FAKE_KICKSTART_RC=137 SRW_RESTART_WAIT=2 SRW_RESTART_POLL=1; REC=$(last_record "$CITY_X")
+[ "$(field guard_action "$REC")" = "restart_unknown" ] && [ "$(credited_runs "$CITY_X")" = "null" ] \
+  && ok "S4: kickstart killed by a signal (137) -> restart_unknown, uncredited" || bad "S4: $REC"
+
+# S5. The call timed out but launchd DID restart the job: a different pid is proof.
+new_city s5
+RUNS_X=10 wd FAKE_LSOF_FDS=50000 FAKE_KICKSTART_RC=124 FAKE_KICKSTART_LANDS=1 SRW_RESTART_WAIT=2 SRW_RESTART_POLL=1; REC=$(last_record "$CITY_X")
+if [ "$(field guard_action "$REC")" = "restart_ok" ] && [ "$(field guard_stamp "$REC")" = "attributed" ] && [ "$(credited_runs "$CITY_X")" = "10" ] \
+   && [ "$(field restart_new_pid "$REC")" = "4243" ]; then
+  ok "S5: kickstart timed out but the pid changed -> restart_ok, credited (runs_at_restart=10)"
+else
+  bad "S5: credited=$(credited_runs "$CITY_X") $REC"
+fi
+fake_reset "$CITY_X"; RUNS_X=11 wd FAKE_LSOF_FDS=100; REC=$(last_record "$CITY_X")
+[ "$(field delta_guard_restart "$REC")" = "1" ] && [ "$(deaths "$CITY_X")" = "0" ] \
+  && ok "S5: and that restart is not counted as a death (delta_guard_restart=1, deaths=0)" || bad "S5 next: $REC deaths=$(deaths "$CITY_X")"
+
+# S6. The kick is accepted (exit 0) but the new pid is never seen: launchd took the
+#     request, so it is credited (restart_unconfirmed is about the pid, not the kick).
+new_city s6
+RUNS_X=10 wd FAKE_LSOF_FDS=50000 FAKE_KICKSTART_NO_NEWPID=1 SRW_RESTART_WAIT=2 SRW_RESTART_POLL=1; REC=$(last_record "$CITY_X")
+[ "$(field guard_action "$REC")" = "restart_unconfirmed" ] && [ "$(field guard_stamp "$REC")" = "attributed" ] && [ "$(credited_runs "$CITY_X")" = "10" ] \
+  && ok "S6: kickstart exit 0, pid unchanged -> restart_unconfirmed, still credited (launchd accepted the kill)" || bad "S6: credited=$(credited_runs "$CITY_X") $REC"
+
+# S7. The restart happened but the credit cannot be written: the record says so,
+#     instead of reporting a credit that is not in the state file.
+new_city s7; wd FAKE_LSOF_FDS=1                                   # create the dirs first
+PROBE_DIR="$SCRATCH_ROOT/probe-ro"; mkdir -p "$PROBE_DIR"; chmod 555 "$PROBE_DIR"
+if touch "$PROBE_DIR/.p" 2>/dev/null; then
+  rm -f "$PROBE_DIR/.p"
+  echo "  skip S7: cannot make a directory unwritable here (running as uid $(id -u))"
+else
+  RUNS_X=10 wd FAKE_LSOF_FDS=50000 FAKE_KICKSTART_LOCK_STATE=1; REC=$(last_record "$CITY_X")
+  chmod 755 "$CITY_X/.gc/state"
+  if [ "$(field guard_action "$REC")" = "restart_ok" ] && [ "$(field guard_stamp "$REC")" = "unattributed" ] && [ "$(credited_runs "$CITY_X")" = "null" ] \
+     && grep -q 'could not be written' "$SCRATCH_ROOT/last.out"; then
+    ok "S7: restart_ok but the credit could not be written -> guard_stamp=unattributed, a WARN line, nothing credited"
+  else
+    bad "S7: credited=$(credited_runs "$CITY_X") $REC $(cat "$SCRATCH_ROOT/last.out")"
+  fi
+fi
+chmod 755 "$PROBE_DIR"
+
+# S8. A successful kick is credited, and the cycles with no kick say so.
+new_city s8
+wd FAKE_LSOF_FDS=100; REC=$(last_record "$CITY_X")
+[ "$(field guard_stamp "$REC")" = "none" ] && ok "S8: no kickstart attempted -> guard_stamp=none" || bad "S8: $REC"
+wd FAKE_LSOF_FDS=40001; REC=$(last_record "$CITY_X")
+[ "$(field guard_action "$REC")" = "restart_ok" ] && [ "$(field guard_stamp "$REC")" = "attributed" ] && [ "$(credited_runs "$CITY_X")" = "1" ] \
+  && ok "S8: kick landed -> guard_stamp=attributed, runs_at_restart=1 in the state file" || bad "S8: $REC"
+fake_reset "$CITY_X"; wd FAKE_LSOF_FDS=45000; REC=$(last_record "$CITY_X")
+[ "$(field guard_action "$REC")" = "cooldown" ] && [ "$(field guard_stamp "$REC")" = "none" ] \
+  && ok "S8: a refused restart (cooldown) attempted no kickstart -> guard_stamp=none" || bad "S8 cooldown: $REC"
+
+# S9. A garbage SRW_RESTART_POLL falls back to the default; it must not turn the wait into a busy loop.
+new_city s9
+wd FAKE_LSOF_FDS=50000 FAKE_KICKSTART_NO_NEWPID=1 SRW_RESTART_WAIT=3 SRW_RESTART_POLL=abc; REC=$(last_record "$CITY_X")
+PRINTS=$(count_lines "$CITY_X/.fake/print.log")
+[ "$(field guard_action "$REC")" = "restart_unconfirmed" ] && [ "$PRINTS" -le 8 ] \
+  && ok "S9: SRW_RESTART_POLL=abc -> default poll, $PRINTS launchctl-print calls over a 3s wait (a busy loop makes hundreds)" || bad "S9: prints=$PRINTS $REC"
+eval "$(grep -E '^_srw_dec\(\)' "$SRC")"
+DEC_OK=1
+for CASE in "abc:2" ":2" "1.5:1.5" "1.2.3:2" ".:2" "0.5:0.5" "3:3" "-1:2" "1e3:2"; do
+  GOT=$(_srw_dec "${CASE%%:*}" 2); [ "$GOT" = "${CASE##*:}" ] || { DEC_OK=0; bad "S9: _srw_dec '${CASE%%:*}' -> '$GOT', expected '${CASE##*:}'"; }
+done
+[ "$DEC_OK" = "1" ] && ok "S9: _srw_dec accepts digits with one dot (3, 0.5, 1.5) and falls back on everything else (abc, empty, 1.2.3, ., -1, 1e3)"
+
 echo "== ga-xuo89c: restarts the guard caused are not counted as deaths =="
 
 new_city q
@@ -513,10 +636,10 @@ echo "== ga-xuo89c AC2: every record carries the fds field =="
 ALL=0; BAD_REC=0
 for L in $(find "$SCRATCH_ROOT" -name supervisor-restart-watchdog.jsonl); do
   ALL=$((ALL + $(wc -l < "$L")))
-  BAD_REC=$((BAD_REC + $(jq -c 'select((has("fds") and has("fds_state") and has("guard_action") and has("pid") and has("delta_guard_restart")) | not)' "$L" | wc -l)))
+  BAD_REC=$((BAD_REC + $(jq -c 'select((has("fds") and has("fds_state") and has("guard_action") and has("guard_stamp") and has("pid") and has("delta_guard_restart")) | not)' "$L" | wc -l)))
 done
 [ "$ALL" -gt 20 ] && [ "$BAD_REC" = "0" ] \
-  && ok "AC2: $ALL ledger records across every scenario (ok, warn, restart, unreadable, no_pid...) all carry fds/fds_state/guard_action/pid" \
+  && ok "AC2: $ALL ledger records across every scenario (ok, warn, restart, unreadable, no_pid...) all carry fds/fds_state/guard_action/guard_stamp/pid" \
   || bad "AC2: $BAD_REC of $ALL records miss a guard field"
 
 echo "== ga-xuo89c: the script is only allowed ONE mutation, and it has to be the guarded one =="
@@ -539,11 +662,19 @@ if [ "$KS" = "1" ] && grep -qE 'launchctl kickstart -k "gui/\$\{UID_NUM\}/\$\{SU
 else
   bad "K: expected exactly one 'launchctl kickstart -k gui/\${UID_NUM}/\${SUPERVISOR_LABEL}', found $KS kickstart line(s)"
 fi
-L_STAMP=$(grep -n '_srw_guard_state_write "\$RUNS"' "$CODE" | head -1 | cut -d: -f1)
 L_KICK=$(grep -n 'launchctl kickstart' "$CODE" | head -1 | cut -d: -f1)
-[ -n "$L_STAMP" ] && [ -n "$L_KICK" ] && [ "$L_STAMP" -lt "$L_KICK" ] \
-  && ok "K: the cooldown stamp is written before the kickstart (a run that dies mid-restart still leaves its cooldown)" \
-  || bad "K: stamp line ${L_STAMP:-none} vs kickstart line ${L_KICK:-none}"
+L_COOL=$(grep -n '_srw_guard_state_write null "\${SUP_PID' "$CODE" | head -1 | cut -d: -f1)
+[ -n "$L_COOL" ] && [ -n "$L_KICK" ] && [ "$L_COOL" -lt "$L_KICK" ] \
+  && ok "K: the cooldown stamp (runs_at_restart=null) is written before the kickstart (a run that dies mid-restart still leaves its cooldown)" \
+  || bad "K: cooldown stamp line ${L_COOL:-none} vs kickstart line ${L_KICK:-none}"
+# The credit ("this +1 in runs was ours") must come strictly AFTER the kick, and
+# nothing before the kick may carry a runs value: a stamp for a restart that has
+# not happened yet is exactly what swallowed a real death (gate-fix 1).
+L_CREDIT=$(grep -n '_srw_guard_state_write "\$RUNS"' "$CODE" | head -1 | cut -d: -f1)
+N_CREDIT=$(grep -c '_srw_guard_state_write "\$RUNS"' "$CODE")
+[ "$N_CREDIT" = "1" ] && [ -n "$L_CREDIT" ] && [ -n "$L_KICK" ] && [ "$L_CREDIT" -gt "$L_KICK" ] \
+  && ok "K: the only write that carries a runs value comes after the kickstart (nothing is credited before it happened)" \
+  || bad "K: $N_CREDIT credit write(s); first at line ${L_CREDIT:-none} vs kickstart line ${L_KICK:-none}"
 /bin/bash -n "$SRC" && ok "K: the script parses under /bin/bash $(/bin/bash -c 'echo $BASH_VERSION') (what the plist runs)" || bad "K: syntax error under /bin/bash"
 
 echo

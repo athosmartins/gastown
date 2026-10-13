@@ -30,6 +30,23 @@
 # wholesale every cycle. Thresholds/timeouts are env-overridable (SRW_*) for
 # the selftest only; launchd runs the defaults.
 #
+# What the kickstart did is three-state too, and the ledger only credits the
+# guard with a restart it KNOWS happened: `launchctl kickstart` answering 0 is
+# "done", answering non-zero is "nothing was killed" (guard_action=restart_failed),
+# and not answering at all (timeout, or killed by a signal) is "launchd may have
+# killed the job anyway" (restart_unknown unless the pid changes). The cooldown is
+# stamped BEFORE the kick (with runs_at_restart=null); runs_at_restart is only
+# filled in AFTER the kick is known to have landed, and `guard_stamp` says which
+# way it went:
+#   none ........ no kickstart was attempted this cycle
+#   attributed .. the kick landed and the state file credits it to the guard
+#                 (the next window's delta_guard_restart will be 1)
+#   unattributed  a kickstart was attempted and is NOT credited to the guard:
+#                 it failed (nothing to credit), its outcome is unknown, or the
+#                 credit could not be written. In the last two cases a restart
+#                 that really happened is counted as a death in the next window —
+#                 the guard_action in the same record says which case it was.
+#
 # Answering "how many times did it DIE in the last 24h and why" is then a jq
 # query against the ledger (delta_guard_restart = restarts the fd guard itself
 # caused, so they are not counted as deaths):
@@ -55,6 +72,10 @@ log() { printf '[supervisor-restart-watchdog] %s\n' "$*"; }
 # A non-numeric override falls back to the default instead of becoming a
 # threshold the arithmetic below would choke on (or, worse, read as 0).
 _srw_num() { case "$1" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
+# Same for a duration given to `sleep`, which also takes a fraction (0.5): digits
+# with at most one dot, and at least one digit. Anything else is the default —
+# a `sleep` that fails would turn the restart wait below into a busy loop.
+_srw_dec() { case "$1" in ''|*[!0-9.]*|*.*.*|.) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
 FDS_WARN="$(_srw_num "${SRW_FDS_WARN:-}" 30000)"
 FDS_RESTART="$(_srw_num "${SRW_FDS_RESTART:-}" 40000)"
 FDS_COOLDOWN_SEC="$(_srw_num "${SRW_FDS_COOLDOWN_SEC:-}" 1800)"
@@ -63,7 +84,7 @@ FDS_COOLDOWN_SEC="$(_srw_num "${SRW_FDS_COOLDOWN_SEC:-}" 1800)"
 # instance lock below covers the manual case.
 SRW_LSOF_TIMEOUT="$(_srw_num "${SRW_LSOF_TIMEOUT:-}" 120)"
 SRW_RESTART_WAIT="$(_srw_num "${SRW_RESTART_WAIT:-}" 60)"
-SRW_RESTART_POLL="${SRW_RESTART_POLL:-2}"
+SRW_RESTART_POLL="$(_srw_dec "${SRW_RESTART_POLL:-}" 2)"
 SRW_TMUX_SOCKET="${SRW_TMUX_SOCKET:-gascity}"
 GUARD_STATE_FILE="$STATE_DIR/supervisor-fds-guard.json"
 
@@ -354,7 +375,7 @@ _srw_guard_state_write() {
 # vocabulary and numbers are integers or the literal null — nothing needs
 # JSON-escaping (same invariant as the record below).
 FDS="";            FDS_STATE="no_pid"
-GUARD_ACTION="none"
+GUARD_ACTION="none"; GUARD_STAMP="none"; KICK_RC=""
 RESTART_NEW_PID="null"; FDS_AFTER="null"
 SESSIONS_BEFORE="null"; SESSIONS_AFTER="null"
 COOLDOWN_REMAINING="null"
@@ -363,8 +384,13 @@ _srw_guard_state_read
 
 # Restarts the guard itself caused are in `runs` too (kickstart -k = +1), so
 # they would be counted as deaths. The window (PREV_RUNS, RUNS] holds the
-# guard's restart iff the runs value it stamped at kick time (the value BEFORE
-# the +1) lies in [PREV_RUNS, RUNS). Stateless: nothing to clear afterwards.
+# guard's restart iff the runs value it stamped for that kick (the value BEFORE
+# the +1) lies in [PREV_RUNS, RUNS). Stateless: nothing to clear afterwards —
+# which is why the stamp must only ever hold a kick that LANDED: a stamp for a
+# kick that did not happen would sit there, and the first real death after it
+# would be credited to the guard and vanish from the death count. The stamp is
+# therefore written after the kick is known (see _srw_fds_guard_restart), and
+# stays null — "no restart to credit" — until then.
 DELTA_GUARD=0
 if [ "$GS_STATE_KIND" = "ok" ] && [ -n "$GS_RUNS_AT_RESTART" ] && [ -n "$PREV_RUNS" ] \
    && [ "$COUNTER_RESET" = "false" ] && [ "$DELTA" -gt 0 ] \
@@ -374,7 +400,7 @@ fi
 
 # Sets GUARD_ACTION (+ the evidence variables) for a count above FDS_RESTART.
 _srw_fds_guard_restart() {
-  local _age _rc _deadline _p
+  local _age _landed _deadline _p
   case "$GS_STATE_KIND" in
     unreadable)
       # Keep the bad file for whoever looks, then re-stamp "restarted just now"
@@ -399,19 +425,32 @@ _srw_fds_guard_restart() {
   # kickstart, the next cycle must already see the restart. And if the stamp
   # cannot be written, no restart — a restart that can't be rate-limited
   # could loop every 15 min.
-  if ! _srw_guard_state_write "$RUNS" "${SUP_PID:-null}" "$FDS" false; then
+  # runs_at_restart is null here on purpose: this stamp says "the guard is
+  # about to try", not "the guard restarted the supervisor". The restart is
+  # credited below, once it is known to have happened (a run that dies in
+  # between leaves a null — an uncredited restart is counted as a death, which
+  # is visible; a credited restart that never happened would swallow one).
+  if ! _srw_guard_state_write null "${SUP_PID:-null}" "$FDS" false; then
     GUARD_ACTION="state_unwritable"
     return 0
   fi
   SESSIONS_BEFORE="$(_srw_count_sessions)"
+  GUARD_STAMP="unattributed"
   log "fds=${FDS} > ${FDS_RESTART} on pid ${SUP_PID} — kickstart -k ${SUPERVISOR_LABEL} (cooldown ${FDS_COOLDOWN_SEC}s stamped)"
   timeout 30 launchctl kickstart -k "gui/${UID_NUM}/${SUPERVISOR_LABEL}" >/dev/null 2>&1
-  _rc=$?
-  if [ "$_rc" -ne 0 ]; then
+  KICK_RC=$?
+  # Three answers, not two. 0: launchd took the request. Another exit status
+  # below 128 (and not 124): launchctl answered "no" and nothing was killed.
+  # 124 (timeout) or above 128 (killed by a signal): launchctl never answered,
+  # and launchd may have killed the job anyway — unknown, not failed.
+  if [ "$KICK_RC" -eq 0 ]; then
+    _landed=yes;     GUARD_ACTION="restart_unconfirmed"
+  elif [ "$KICK_RC" -eq 124 ] || [ "$KICK_RC" -gt 128 ]; then
+    _landed=unknown; GUARD_ACTION="restart_unknown"
+  else
     GUARD_ACTION="restart_failed"
     return 0
   fi
-  GUARD_ACTION="restart_unconfirmed"
   _deadline=$(( SECONDS + SRW_RESTART_WAIT ))
   while [ "$SECONDS" -lt "$_deadline" ]; do
     # vazio → no pid line yet = not respawned, keep waiting; falhou/ilegível → same, bounded by the deadline
@@ -420,10 +459,21 @@ _srw_fds_guard_restart() {
     if [ -n "$_p" ] && [ "$_p" != "$SUP_PID" ]; then
       RESTART_NEW_PID="$_p"
       GUARD_ACTION="restart_ok"
+      _landed=yes     # a different pid is proof, whatever the kickstart call said
       break
     fi
     sleep "$SRW_RESTART_POLL"
   done
+  # Credit the restart to the guard only now that it is known to have happened.
+  # If the credit cannot be written the record says so (guard_stamp stays
+  # unattributed): the next window will count this restart as a death.
+  if [ "$_landed" = "yes" ]; then
+    if _srw_guard_state_write "$RUNS" "${SUP_PID:-null}" "$FDS" false; then
+      GUARD_STAMP="attributed"
+    else
+      log "WARN: the restart happened but its credit could not be written to ${GUARD_STATE_FILE} — the next death count will include it"
+    fi
+  fi
   # The city's tmux server is not in the supervisor's process group (observed
   # 2026-10-13: ppid 1, own pgid), so launchd's group kill should not reach it;
   # the before/after counts are the evidence that the sessions really survived (AC 3 of ga-xuo89c).
@@ -452,8 +502,10 @@ case "$GUARD_ACTION" in
     _srw_notify "supervisor had ${FDS} fds (> ${FDS_RESTART}): restarted. pid ${SUP_PID} -> ${RESTART_NEW_PID}; fds after: ${FDS_AFTER}; tmux sessions ${SESSIONS_BEFORE} -> ${SESSIONS_AFTER}." ;;
   restart_unconfirmed)
     _srw_notify "supervisor had ${FDS} fds (> ${FDS_RESTART}): kickstart sent but no new pid within ${SRW_RESTART_WAIT}s. tmux sessions ${SESSIONS_BEFORE} -> ${SESSIONS_AFTER}. Check the supervisor." ;;
+  restart_unknown)
+    _srw_notify "supervisor had ${FDS} fds (> ${FDS_RESTART}): the kickstart call never answered (exit ${KICK_RC}) and no new pid appeared within ${SRW_RESTART_WAIT}s — it may or may not have restarted. tmux sessions ${SESSIONS_BEFORE} -> ${SESSIONS_AFTER}. Check the supervisor. Next try after the ${FDS_COOLDOWN_SEC}s cooldown." ;;
   restart_failed)
-    _srw_notify "supervisor has ${FDS} fds (> ${FDS_RESTART}) and kickstart FAILED. Next try after the ${FDS_COOLDOWN_SEC}s cooldown." ;;
+    _srw_notify "supervisor has ${FDS} fds (> ${FDS_RESTART}) and kickstart FAILED (exit ${KICK_RC}, nothing was killed). Next try after the ${FDS_COOLDOWN_SEC}s cooldown." ;;
   cooldown)
     _srw_notify "supervisor has ${FDS} fds (> ${FDS_RESTART}) again inside the ${FDS_COOLDOWN_SEC}s cooldown — NOT restarting (${COOLDOWN_REMAINING}s left). A fresh process should not leak this fast." ;;
   cooldown_state_unreadable|state_unwritable)
@@ -468,9 +520,9 @@ esac
 # the fixed vocabulary above, or a timestamp WE generated — none can contain a
 # quote/backslash/newline, so no escaping is needed and no external process
 # sits on the write's atomicity.
-RECORD=$(printf '{"ts":"%s","runs":%s,"last_exit_code":%s,"delta_since_last":%s,"counter_reset":%s,"reason_exit_nonzero":%s,"reason_log_matches":%s,"log_checked":%s,"log_offset":%s,"pid":%s,"fds":%s,"fds_state":"%s","guard_action":"%s","delta_guard_restart":%s,"restart_new_pid":%s,"fds_after":%s,"sessions_before":%s,"sessions_after":%s,"cooldown_remaining_s":%s}' \
+RECORD=$(printf '{"ts":"%s","runs":%s,"last_exit_code":%s,"delta_since_last":%s,"counter_reset":%s,"reason_exit_nonzero":%s,"reason_log_matches":%s,"log_checked":%s,"log_offset":%s,"pid":%s,"fds":%s,"fds_state":"%s","guard_action":"%s","guard_stamp":"%s","delta_guard_restart":%s,"restart_new_pid":%s,"fds_after":%s,"sessions_before":%s,"sessions_after":%s,"cooldown_remaining_s":%s}' \
   "$SAMPLE_TS" "$RUNS" "$EXIT_CODE_JSON" "$DELTA" "$COUNTER_RESET" "$REASON_EXIT_NONZERO" "$CODESIGN_MATCHES" "$LOG_CHECKED" "$LOG_SIZE" \
-  "${SUP_PID:-null}" "${FDS:-null}" "$FDS_STATE" "$GUARD_ACTION" "$DELTA_GUARD" "$RESTART_NEW_PID" "$FDS_AFTER" "$SESSIONS_BEFORE" "$SESSIONS_AFTER" "$COOLDOWN_REMAINING")
+  "${SUP_PID:-null}" "${FDS:-null}" "$FDS_STATE" "$GUARD_ACTION" "$GUARD_STAMP" "$DELTA_GUARD" "$RESTART_NEW_PID" "$FDS_AFTER" "$SESSIONS_BEFORE" "$SESSIONS_AFTER" "$COOLDOWN_REMAINING")
 printf '%s\n' "$RECORD" >> "$LEDGER_FILE"
 
 # ---- persist state (atomic replace via temp+mv; jq is fine here since the

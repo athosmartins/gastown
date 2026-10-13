@@ -8,12 +8,14 @@
 # Verifies on the DEPLOYED $CITY/scripts/supervisor-restart-watchdog.sh (the file
 # launchd runs in place), under /bin/bash 3.2 (the interpreter the plist names):
 #   1. it parses under /bin/bash and has exactly ONE launchctl mutation — a
-#      `kickstart -k` on the supervisor label, written after the cooldown stamp;
+#      `kickstart -k` on the supervisor label, the cooldown stamped before it and
+#      the restart credited to the guard only after it;
 #   2. a REAL run of it against fake launchctl/lsof/tmux/notify in a throwaway
 #      dir, with the DEFAULT thresholds: 100 fds -> recorded only; 40,001 fds ->
 #      exactly one kickstart, notify -p 4, ledger evidence (new pid, fds_after,
 #      tmux sessions before/after); an immediate second >40k -> cooldown, no
-#      second kickstart; an lsof that fails/hangs -> fds:null and no kickstart.
+#      second kickstart; an lsof that fails/hangs -> fds:null and no kickstart;
+#      a kickstart that FAILS credits nothing, so the next real death is counted.
 #      The fakes sit first on PATH, so the real supervisor is never touched.
 # The feature's own selftest (70+ assertions, minutes at this city's load) is NOT
 # re-run here; set RUN_FULL_SELFTEST=1 to include it.
@@ -52,11 +54,16 @@ printf '%s\n' "$CODE" | grep -qE 'launchctl kickstart -k "gui/\$\{UID_NUM\}/\$\{
 if printf '%s\n' "$CODE" | grep -qE 'launchctl[[:space:]]+(bootout|bootstrap|unload|load|stop|start|kill|remove|disable|enable)|pkill|killall'; then
   fail "the watchdog contains a launchctl bootout/unload/stop-style call or a pkill"
 fi
-L_STAMP="$(printf '%s\n' "$CODE" | grep -n '_srw_guard_state_write "\$RUNS"' | head -1 | cut -d: -f1)"
 L_KICK="$(printf '%s\n' "$CODE" | grep -n 'launchctl kickstart' | head -1 | cut -d: -f1)"
-[[ -n "$L_STAMP" && -n "$L_KICK" && "$L_STAMP" -lt "$L_KICK" ]] \
-  || fail "the cooldown stamp (line ${L_STAMP:-none}) must be written before the kickstart (line ${L_KICK:-none})"
-log "  one kickstart -k on the supervisor label, cooldown stamped before it ✓"
+L_COOL="$(printf '%s\n' "$CODE" | grep -n '_srw_guard_state_write null "\${SUP_PID' | head -1 | cut -d: -f1)"
+[[ -n "$L_COOL" && -n "$L_KICK" && "$L_COOL" -lt "$L_KICK" ]] \
+  || fail "the cooldown stamp (line ${L_COOL:-none}) must be written before the kickstart (line ${L_KICK:-none})"
+# the credit ("this +1 in runs was ours") is the only write that carries a runs value, and it comes after the kick
+N_CREDIT="$(printf '%s\n' "$CODE" | grep -c '_srw_guard_state_write "\$RUNS"')"
+L_CREDIT="$(printf '%s\n' "$CODE" | grep -n '_srw_guard_state_write "\$RUNS"' | head -1 | cut -d: -f1)"
+[[ "$N_CREDIT" == "1" && -n "$L_CREDIT" && -n "$L_KICK" && "$L_CREDIT" -gt "$L_KICK" ]] \
+  || fail "the restart must be credited only after the kickstart (credit writes: $N_CREDIT, first at line ${L_CREDIT:-none}, kickstart at line ${L_KICK:-none})"
+log "  one kickstart -k on the supervisor label, cooldown stamped before it, the restart credited after it ✓"
 
 log "Running the deployed watchdog against fake launchctl/lsof/tmux/notify (default thresholds, state in a throwaway dir)..."
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/story-ga-xuo89c.XXXXXX")" || fail "cannot create a scratch dir"
@@ -68,11 +75,12 @@ cat > "$FAKE/launchctl" <<'FAKE'
 #!/bin/bash
 D="$FAKE_DIR"
 if [ "${1:-}" = "print" ]; then
-  printf '\truns = 7\n\tpid = %s\n\tlast exit code = 0\n' "$(cat "$D/pid" 2>/dev/null || echo 4242)"
+  printf '\truns = %s\n\tpid = %s\n\tlast exit code = 0\n' "${FAKE_RUNS:-7}" "$(cat "$D/pid" 2>/dev/null || echo 4242)"
   exit 0
 fi
 if [ "${1:-}" = "kickstart" ]; then
   printf '%s\n' "$*" >> "$D/kickstart.log"
+  [ "${FAKE_KICKSTART_FAIL:-0}" = "1" ] && exit 1
   : > "$D/kicked"
   echo $(( $(cat "$D/pid" 2>/dev/null || echo 4242) + 1 )) > "$D/pid"
   exit 0
@@ -129,7 +137,9 @@ grep -qx "kickstart -k gui/$(id -u)/com.gascity.supervisor" "$WORK/fake/kickstar
   || fail "40001 fds: the ledger lacks the restart evidence (new pid / fds_after / sessions before+after): $R"
 [[ "$(nlines "$WORK/fake/notify.log")" == "1" ]] && grep -q -- '-p 4 ' "$WORK/fake/notify.log" \
   || fail "40001 fds: expected one notify at priority 4: $(cat "$WORK/fake/notify.log" 2>/dev/null)"
-log "  40,001 fds -> one 'kickstart -k', notify -p 4, ledger: new pid 4243, fds_after 300, tmux sessions 9 -> 9 ✓"
+[[ "$(jq -r .guard_stamp <<<"$R")" == "attributed" && "$(jq -c .runs_at_restart "$WORK/city/.gc/state/supervisor-fds-guard.json")" == "7" ]] \
+  || fail "40001 fds: the restart that happened must be credited to the guard (guard_stamp=attributed, runs_at_restart=7): $R"
+log "  40,001 fds -> one 'kickstart -k', notify -p 4, ledger: new pid 4243, fds_after 300, tmux sessions 9 -> 9, credited ✓"
 
 rm -f "$WORK/fake/kicked" "$WORK/fake/pid"     # the fake supervisor comes back leaking
 run_wd FAKE_LSOF_FDS=45000
@@ -137,6 +147,26 @@ R="$(last)"
 [[ "$(jq -r .guard_action <<<"$R")" == "cooldown" && "$(nlines "$WORK/fake/kickstart.log")" == "1" ]] \
   || fail "a second >40k reading inside 30 minutes must not restart again: $R"
 log "  >40k again right away -> cooldown, still one kickstart ✓"
+
+# a kickstart that FAILS credits nothing: the next +1 in runs is a death and has to be counted as one
+C3="$WORK/city3"; mkdir -p "$C3"
+run_wd3() { env PATH="$FAKE:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin" \
+      GC_CITY_PATH="$C3" GC_SUPERVISOR_LOG="$WORK/supervisor.log" TMPDIR="$WORK/tmp" \
+      FAKE_DIR="$WORK/fake3" SRW_LSOF_TIMEOUT=2 "$@" /bin/bash "$WD" >"$WORK/last.out" 2>&1; }
+mkdir -p "$WORK/fake3"
+LEDGER3="$C3/.gc/logs/supervisor-restart-watchdog.jsonl"
+run_wd3 FAKE_RUNS=10 FAKE_LSOF_FDS=50000 FAKE_KICKSTART_FAIL=1
+R="$(tail -1 "$LEDGER3")"
+[[ "$(jq -r .guard_action <<<"$R")" == "restart_failed" && "$(jq -r .guard_stamp <<<"$R")" == "unattributed" \
+   && "$(jq -c .runs_at_restart "$C3/.gc/state/supervisor-fds-guard.json")" == "null" ]] \
+  || { tail -5 "$WORK/last.out" >&2; fail "a failed kickstart must leave nothing credited (restart_failed / unattributed / runs_at_restart null): $R"; }
+run_wd3 FAKE_RUNS=11 FAKE_LSOF_FDS=100
+R="$(tail -1 "$LEDGER3")"
+[[ "$(jq -r .delta_since_last <<<"$R")" == "1" && "$(jq -r .delta_guard_restart <<<"$R")" == "0" ]] \
+  || fail "the first real death after a failed kickstart was credited to the guard: $R"
+DEATHS="$(jq -s 'map(.delta_since_last - (.delta_guard_restart // 0)) | add' "$LEDGER3")"
+[[ "$DEATHS" == "1" ]] || fail "deaths over the failed-kick scenario: expected 1, got $DEATHS"
+log "  kickstart fails -> nothing credited; the next runs +1 counts as a death (deaths=1, not 0) ✓"
 
 for MODE in fail slow; do
   C2="$WORK/city2-$MODE"; mkdir -p "$C2"
@@ -150,9 +180,9 @@ done
 log "  lsof failing / hanging -> fds:null, guard_action=unreadable, no kickstart ✓"
 
 # every record carries the field AC2 asks for
-BAD="$(jq -c 'select((has("fds") and has("fds_state") and has("guard_action")) | not)' "$LEDGER" | wc -l | tr -d ' ')"
-[[ "$BAD" == "0" ]] || fail "$BAD ledger record(s) without fds/fds_state/guard_action"
-log "  every synthetic ledger record carries fds/fds_state/guard_action ✓"
+BAD="$(jq -c 'select((has("fds") and has("fds_state") and has("guard_action") and has("guard_stamp")) | not)' "$LEDGER" | wc -l | tr -d ' ')"
+[[ "$BAD" == "0" ]] || fail "$BAD ledger record(s) without fds/fds_state/guard_action/guard_stamp"
+log "  every synthetic ledger record carries fds/fds_state/guard_action/guard_stamp ✓"
 
 if [[ "${RUN_FULL_SELFTEST:-0}" == "1" ]]; then
     [[ -f "$SELFTEST" ]] || fail "selftest missing: $SELFTEST"
