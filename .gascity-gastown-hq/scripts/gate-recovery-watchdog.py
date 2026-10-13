@@ -4612,8 +4612,9 @@ def conflict_repair_state(marker_id, now):
                   exists and is younger than NEEDS_REBASE_REPAIR_GRACE_MINUTES
       'stale'   — one exists but is older: the dog is stuck or gone, nobody is on it
       'none'    — the list was READ and nothing for this marker is open
-      'unknown' — the list could not be read (bd failed / printed non-JSON), or an open bead has no
-                  parsable created_at so its age cannot be bounded
+      'unknown' — the list could not be read (bd failed / printed non-JSON), or a row is not an object, or
+                  this marker's bead has no readable status (neither open nor closed), or an open bead has
+                  no parsable created_at so its age cannot be bounded
     Keyed on the MARKER, never on the branch name: a branch NAME recurs across repos in this city (HQ marker
     ga-3uct94 and WA marker ga-z9npl3 are both feat/ga-dxyvxr-quiet-hours-gate), so a bead opened for another
     repo's marker must not read as "a dog is on it" here, whereas a marker id cannot collide. The dispatcher
@@ -4640,9 +4641,14 @@ def conflict_repair_state(marker_id, now):
     want = "conflict-repair-of:%s" % marker_id
     youngest = None   # (age_sec, id) of the freshest open bead for the marker
     for row in rows:
-        if not isinstance(row, dict) or row.get("status") == "closed":
-            continue
+        if not isinstance(row, dict):
+            return ("unknown", "")   # a row that is not even an object cannot be ruled out as this marker's bead
         if want not in (row.get("labels") or []):
+            continue
+        status = row.get("status")
+        if not isinstance(status, str) or not status:
+            return ("unknown", str(row.get("id") or ""))   # this marker's bead, status unreadable: neither open nor closed
+        if status == "closed":
             continue
         created = _iso_epoch(row.get("created_at"))
         if created is None:
@@ -5974,6 +5980,14 @@ def _selftest():
            "ga-buqnjc conflict_repair_state: non-JSON / error envelope / empty output → 'unknown', never read as 'none'")
         ok(_crs([_crs_row("ga-rep1", _CRS_MK, created="garbage")])[0] == "unknown",
            "ga-buqnjc conflict_repair_state: an open bead whose age cannot be parsed cannot be bounded → 'unknown'")
+        _nostat = _crs_row("ga-rep1", _CRS_MK)
+        del _nostat["status"]
+        ok(_crs([_nostat]) == ("unknown", "ga-rep1") and _crs([dict(_nostat, status=None)])[0] == "unknown" and _crs([dict(_nostat, status="")])[0] == "unknown",
+           "ga-buqnjc conflict_repair_state: this marker's bead with NO readable status (absent / null / empty) is neither open nor closed → 'unknown', never 'open' (a missing status must not silence the Mayor)")
+        ok(_crs([_crs_row("ga-rep2", "m-other", status="closed"), "junk"])[0] == "unknown",
+           "ga-buqnjc conflict_repair_state: a row that is not an object cannot be ruled out → 'unknown'")
+        ok(_crs([dict(_crs_row("ga-rep2", "m-other"), status=None)]) == ("none", ""),
+           "ga-buqnjc conflict_repair_state: ANOTHER marker's bead with no status is not ours → still 'none' (status only matters for the row that would hold us)")
         _crs_calls.clear()
         globals()["sh"] = _crs_sh()
         ok(conflict_repair_state("", _CRS_NOW) == ("none", "") and not _crs_calls,

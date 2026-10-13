@@ -305,6 +305,18 @@ else
   bad "the helper's bd list call lost a flag it depends on: [$LIST_LINE]"
 fi
 
+# a row WITHOUT a status is neither open nor closed: "not closed" must not be read as "a dog may be on it"
+reset_world '[{"id":"ga-nostatus","labels":["gate-conflict-repair","conflict-repair-of:m-old","conflict-repair-branch:'"$BRANCH"'","conflict-repair-repo:/repo/fixture"]}]'
+call_helper
+if [ "$GATE_CONFLICT_REPAIR_RESULT" = "fallback:repair-beads-unreadable" ] && [ "$(creates_n)" = 0 ] && has "$(cat "$WARNS")" "a row without a status"; then
+  ok "a repair bead row with NO status → fallback:repair-beads-unreadable (never 'existing'), and the warning names the cause"
+else
+  bad "row without status must be unreadable: result=[$GATE_CONFLICT_REPAIR_RESULT] creates=$(creates_n) warns=[$(cat "$WARNS")]"
+fi
+reset_world '[{"id":"ga-nullstatus","status":null,"labels":["gate-conflict-repair"]}]'
+call_helper
+[ "$GATE_CONFLICT_REPAIR_RESULT" = "fallback:repair-beads-unreadable" ] && ok "a row with status null is unreadable too (and not even this branch's row: the whole list is distrusted)" || bad "null status: [$GATE_CONFLICT_REPAIR_RESULT]"
+
 # a bead that is open but whose id cannot be read back is not 'a dog is on it'
 reset_world '[{"id":"","status":"open","created_at":"2026-10-12T19:00:00Z","labels":["gate-conflict-repair","conflict-repair-of:m-old","conflict-repair-branch:'"$BRANCH"'","conflict-repair-repo:/repo/fixture"]}]'
 call_helper

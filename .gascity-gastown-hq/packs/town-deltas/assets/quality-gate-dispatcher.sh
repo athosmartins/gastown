@@ -7105,8 +7105,10 @@ gate_open_conflict_repair_bead() {
   case "$GATE_CONFLICT_REPAIR_MAX_ATTEMPTS" in ""|*[!0-9]*) GATE_CONFLICT_REPAIR_RESULT="fallback:bad-cap-setting"; return 0 ;; esac
   case "$GATE_CONFLICT_REPAIR_MAX_OPEN" in ""|*[!0-9]*) GATE_CONFLICT_REPAIR_RESULT="fallback:bad-cap-setting"; return 0 ;; esac
   _json=$(bd -C "$GC_CITY" list --json --all --include-infra --limit 0 -l "$GATE_CONFLICT_REPAIR_LABEL" 2>/dev/null) || _json=""
-  if ! printf '%s' "$_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    warn "Repair beads for $_branch: could not read them (bd list returned nothing, non-JSON, or an error) — cannot tell whether a dog is already on it, so the Mayor is mailed (ga-buqnjc)."
+  # A row with no readable status is neither open nor closed: the counts below treat "not closed" as "a dog may be on it",
+  # so such a row is unreadable input, not an open bead (a missing status must not read as "open").
+  if ! printf '%s' "$_json" | jq -e 'type == "array" and all(.[]; ((.status? // null) | type) == "string")' >/dev/null 2>&1; then
+    warn "Repair beads for $_branch: could not read them (bd list returned nothing, non-JSON, an error, or a row without a status) — cannot tell whether a dog is already on it, so the Mayor is mailed (ga-buqnjc)."
     GATE_CONFLICT_REPAIR_RESULT="fallback:repair-beads-unreadable"; return 0
   fi
   # vazio → no bead of this branch+repo yet (_here=[], counts 0: a new one may open); falhou/ilegível → _here/counts come back
