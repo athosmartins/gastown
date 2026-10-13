@@ -217,7 +217,9 @@ gate_pm_deploy_lock_acquire() {
   local rt="${1:-}" d lk h wait_max max_age t0 now owner opid oat omt dead grave
   [ -n "$rt" ] || return 0
   d="$(gate_pm_dir)/deploy-lock"
-  mkdir -p "$d" 2>/dev/null || return 2
+  # An unusable lock directory is a fail-open (the caller deploys without the lock): said here, once, never quiet. In async mode gate_pm_begin made
+  # this directory moments ago, so reaching this line means the disk changed under the tail; inline, the sweep lock still serialises the deploys.
+  mkdir -p "$d" 2>/dev/null || { _gate_pm_warn "ga-qmymjm: deploy lock UNUSABLE (cannot create $d) — the deploy of $rt runs WITHOUT the lock"; return 2; }
   h=$(printf '%s' "$rt" | cksum | cut -d' ' -f1)
   lk="$d/$h.d"
   wait_max="${GATE_PM_DEPLOY_LOCK_WAIT_S:-900}"; max_age="${GATE_PM_DEPLOY_LOCK_MAX_AGE_S:-1800}"

@@ -337,6 +337,8 @@ echo "── 4. deploy lock ──"
   rm -f "$LK/owner"; rmdir "$LK"
   # L6 unwritable lock directory → rc 2 (the caller carries on, as before the lock existed)
   rc=0; ( GATE_PM_DIR=/dev/null/x; gate_pm_deploy_lock_acquire "$RT" ) || rc=$?; [ "$rc" = "2" ] && res="$res L6"
+  # L6b ...and it says so: carrying on without the lock is a fail-open, and a silent one reads as "locked" (the log is the only trace)
+  grep -q "deploy lock UNUSABLE" "$SB/lock.log" && res="$res L6b"
   # L7 two tails, one lock: no interleaving
   : > "$SB/order.txt"
   for who in A B; do
@@ -359,6 +361,7 @@ chk L4a "ownerless dir younger than a minute: not called dead (rc 75)"
 chk L4b "ownerless dir older than a minute: taken over"
 chk L5  "release leaves a lock owned by someone else"
 chk L6  "unwritable lock directory: rc 2 (carry on as before)"
+chk L6b "...and the warning says the deploy runs WITHOUT the lock (a fail-open must be visible, not quiet)"
 chk L7  "two tails, one lock: A-start A-end B-start B-end — never interleaved"
 
 echo "── 5. event shapes ──"
@@ -395,6 +398,13 @@ if seq_ok "$L_INTEG" "$L_MARK" "$L_RUNCL" "$L_TAIL" "$L_ESBG" "$L_DEPLOY" "$L_HO
   ok "order: integrity check < marker passed < gate-run closed < [ _gate_pm_tail { source-bead < deploy < hold < close < verify < reap < Gate PASSED } ] < fork block < supersede < FAIL path"
 else bad "order of sync part / tail / fork block / supersede is wrong ($L_INTEG $L_MARK $L_RUNCL $L_TAIL $L_ESBG $L_DEPLOY $L_HOLD $L_CLOSE $L_VERIFY $L_REAP $L_PASSLOG $L_FORKB $L_FORKE $L_SUPER $L_FAIL)"; fi
 if [ "$(grep -c '^    _gate_pm_tail() {' "$DISPATCHER")" = "1" ] && [ "$(grep -c 'set_gate_status "\$MARKER_ID" "passed"' "$DISPATCHER")" = "1" ]; then ok "one tail function, one terminal marker transition"; else bad "tail function / marker transition count"; fi
+# GATE_PM_CLOSE_FAILED is the one outcome flag the old code never had: every other (IS_*, RESPAWN_HITS, DAEMON_HOLD_VERDICT) is reset inside the
+# tail on each run. A run that raised it INLINE (same shell as the sweep) would otherwise leak it into the next ASYNC run's forked copy, and that
+# tail would report outcome=unresolved:close-failed for a bead it closed fine. So: reset before the first step, raised only after that.
+L_CFRESET=$(lno '^    GATE_PM_CLOSE_FAILED=0' || true)   # absent = empty = a clean FAIL below, not an errexit that kills the selftest
+L_STEP1=$(lno 'gate_pm_step "source-bead"' || true)
+L_CFSET=$(lno 'GATE_PM_CLOSE_FAILED=1' || true)
+if seq_ok "$L_TAIL" "$L_CFRESET" "$L_STEP1" "$L_CFSET" && [ "$(grep -c '^    GATE_PM_CLOSE_FAILED=0' "$DISPATCHER")" = "1" ]; then ok "the tail resets GATE_PM_CLOSE_FAILED=0 before its first step, so a close failure of one run never colours the next"; else bad "GATE_PM_CLOSE_FAILED is not reset at the top of the tail (tail=$L_TAIL reset=$L_CFRESET step1=$L_STEP1 raise=$L_CFSET)"; fi
 if seq_ok "$L_SWEEPSTART" "$L_PMSWEEP" "$L_PHASEC"; then ok "gate_pm_sweep runs right after 'sweep start', before Phase C"; else bad "gate_pm_sweep not between sweep start and Phase C"; fi
 # what must NOT be in the tail: anything another component needs the moment the merge is confirmed
 TAILF="$SB/tail.txt"; sed -n "${L_TAIL},$((L_FORKB-1))p" "$DISPATCHER" > "$TAILF"

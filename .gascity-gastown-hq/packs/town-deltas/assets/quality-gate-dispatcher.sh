@@ -9861,6 +9861,7 @@ fi
       declare -F "$_GATE_PM_FN" >/dev/null 2>&1 || eval "$_GATE_PM_FN() { return 0; }"
     done
     _gate_pm_tail() {
+    GATE_PM_CLOSE_FAILED=0   # per run, like IS_*/RESPAWN_HITS below: an INLINE run (the sweep's own shell) must not leave it raised for the next run's tail
     gate_pm_step "source-bead"
     # ── ga-esbg: DRIVE THE SOURCE BEAD TO ITS TERMINAL/HANDOFF STATE ──────────
     # A gate PASS+merge MUST NOT leave the source bead in_progress with the live
