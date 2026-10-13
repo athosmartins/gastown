@@ -8824,6 +8824,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     MERGE_ATTEMPT=0
 
     do_merge_ff() {
+      local PUSH_ERR_FILE=""   # ga-x4rbnt: the FF push's stderr capture (made inside the push's own condition, below)
       # Arguments: IS_CONTAINER_RIG, BRANCH, DEFAULT_BRANCH — all from outer scope.
       # Returns: sets MERGE_SHA, MERGE_PRE_MAIN_SHA, and MERGE_RESULT in outer
       # scope. MERGE_PRE_MAIN_SHA (ga-6zkhci, Mayor decision 2026-09-15) is
@@ -9240,12 +9241,12 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
 
       # FF push
       # ga-x4rbnt: the push's stderr is KEPT (it was `2>/dev/null`) so a refusal can be told from a lost race. A capture that cannot
-      # be made (no temp file) is today's behavior: stderr to /dev/null, every failed push a race.
-      local PUSH_ERR_FILE=""
-      PUSH_ERR_FILE=$(mktemp "${GATE_FS_TMPDIR:-/tmp}/gc-gate-push-err-XXXXXX" 2>/dev/null) || PUSH_ERR_FILE=""
+      # be made (no temp file) is today's behavior: stderr to /dev/null, every failed push a race. The temp file is made INSIDE the
+      # condition below, not on a line of its own above it: the lane confirmations above (ga-atsahv) must have nothing executable
+      # between them and this push, and a `return` earlier in this function must never leave a temp file behind.
       # LC_ALL=C: the classifier reads git's closing `error: failed to push some refs` line in English; a translated git degrades to
       # "unknown" (retry), safe but blind. The hook's own words are the hook's, whatever the locale.
-      if LC_ALL=C git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>"${PUSH_ERR_FILE:-/dev/null}"; then
+      if PUSH_ERR_FILE=$(mktemp "${GATE_FS_TMPDIR:-/tmp}/gc-gate-push-err-XXXXXX" 2>/dev/null) || PUSH_ERR_FILE=""; LC_ALL=C git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>"${PUSH_ERR_FILE:-/dev/null}"; then
         [ -z "$PUSH_ERR_FILE" ] || rm -f "$PUSH_ERR_FILE" 2>/dev/null || true
         git_rig fetch origin 2>/dev/null || warn "Post-FF-push fetch failed"
         local POST_MAIN

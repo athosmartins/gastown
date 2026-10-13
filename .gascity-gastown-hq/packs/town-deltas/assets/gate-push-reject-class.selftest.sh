@@ -241,6 +241,17 @@ echo "── 4. drift guards ──"
 if grep -q '\[ "\$MERGE_RESULT" = "failed_push_hook_rejected" \] || \\' "$DISPATCHER"; then ok "retry loop: failed_push_hook_rejected is in the NON-retryable list"; else bad "retry loop does not list failed_push_hook_rejected as non-retryable"; fi
 if grep -q 'git_rig push origin "\${CUR_BRANCH}:refs/heads/\$DEFAULT_BRANCH" 2>/dev/null' "$DISPATCHER"; then bad "the FF push still discards its stderr (2>/dev/null)"; else ok "the FF push no longer discards its stderr"; fi
 if grep -q 'REFUSED BY A HOOK' "$DISPATCHER" && grep -q 'GATE_PUSH_HOOK_DETAIL:-' "$DISPATCHER"; then ok "the FAIL feedback names the hook and carries its words"; else bad "the FAIL feedback does not carry the hook's words"; fi
+# the fast lane (ga-atsahv) promises NOTHING executable between its push-time confirmation and the push. The stderr capture of this fix must not
+# be a line of its own in that gap (gate-fastlane.selftest.sh checks it too, but takes 20+ minutes; this is the quick guard for this region).
+L_PCE=$(grep -n 'SELFTEST-EXTRACT fastlane-push-confirm: END' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_PUSH=$(grep -n -F 'git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH"' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$L_PCE" ] && [ -n "$L_PUSH" ] && [ "$L_PCE" -lt "$L_PUSH" ]; then
+  GAPCODE=$(sed -n "$((L_PCE+1)),$((L_PUSH-1))p" "$DISPATCHER" | grep -v -E '^[[:space:]]*(#.*)?$' || true)
+  if [ -z "$GAPCODE" ]; then ok "nothing executable between the fast-lane confirmation and the FF push (the capture is made inside the push's condition)"; else bad "executable code between the fast-lane confirmation and the push: $GAPCODE"; fi
+else
+  bad "could not locate the fast-lane confirmation END ($L_PCE) and the FF push ($L_PUSH) — the gap property cannot be checked"
+fi
+if grep -q 'PUSH_ERR_FILE=\$(mktemp .* LC_ALL=C git_rig push origin' "$DISPATCHER"; then ok "the capture temp file is made in the push's own condition (no temp file survives an earlier return)"; else bad "the capture temp file is made outside the push's condition"; fi
 if grep -q 'LC_ALL=C git_rig push origin' "$DISPATCHER"; then ok "the FF push is made with LC_ALL=C (the classifier reads git's closing line in English)"; else bad "the FF push does not force LC_ALL=C"; fi
 if grep -q 'tail -c 65536 "\$PUSH_ERR_FILE"' "$DISPATCHER" && grep -q 'head -c 8192 "\$PUSH_ERR_FILE"' "$DISPATCHER"; then ok "the capture is classified from its tail and quoted from its head"; else bad "the capture is not read from both ends"; fi
 if grep -q 'GATE_PUSH_HOOK_DETAIL=""  # nothing from an earlier attempt' "$DISPATCHER"; then ok "retry loop: the hook's words are reset before every attempt (no stale words read as this attempt's)"; else bad "retry loop does not reset the hook's words per attempt"; fi

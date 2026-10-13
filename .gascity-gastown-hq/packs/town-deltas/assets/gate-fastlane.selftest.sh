@@ -1497,7 +1497,9 @@ grep -q '^lane: \$GATE_LANE$' "$DISPATCHER" && ok "the gate-run bead records its
 # the push-time confirmation: the check and the act are ONE variable, with NOTHING between them (gate round 2, issue 2)
 L_PCB=$(grep -n 'SELFTEST-EXTRACT fastlane-push-confirm: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
 L_PCE=$(grep -n 'SELFTEST-EXTRACT fastlane-push-confirm: END' "$DISPATCHER" | head -1 | cut -d: -f1)
-L_PUSH=$(grep -n -F 'if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH"' "$DISPATCHER" | head -1 | cut -d: -f1)
+# ga-x4rbnt: no `if ` anchor — the push line also carries its stderr capture and an env prefix (LC_ALL=C); an anchor on the old text found
+# nothing, L_PUSH came back empty, the sed range below errored into an empty BETWEEN, and "NOTHING executable sits between" passed vacuously.
+L_PUSH=$(grep -n -F 'git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH"' "$DISPATCHER" | head -1 | cut -d: -f1)
 L_LATE=$(grep -n 'LIVE re-check #2 — AUTHORITATIVE' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$L_PCB" ] && [ -n "$L_PCE" ] && [ -n "$L_PUSH" ] && [ -n "$L_LATE" ] && [ "$L_LATE" -lt "$L_PCB" ] && [ "$L_PCE" -lt "$L_PUSH" ]; then ok "the lane confirm (lines $L_PCB-$L_PCE) comes after the late bead re-check (line $L_LATE) and before the FF push (line $L_PUSH)"; else bad "push-confirm placement: late-recheck=$L_LATE confirm=$L_PCB-$L_PCE push=$L_PUSH"; fi
 BETWEEN=$(sed -n "$((${L_PCE:-0}+1)),$((${L_PUSH:-0}-1))p" "$DISPATCHER" | grep -v -E '^[[:space:]]*(#.*)?$' || true)
