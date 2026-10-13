@@ -604,6 +604,22 @@ eq "json em uso: modo, ociosidade e porquê" "em_uso/42/input_recente" "$(printf
 mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; printf '{"ts":"%s","repo":"wa","mode":"pytest","slot":"1","rc":0,"secs":4,"nargs":2,"presen' "$t_now"; echo; } > "$J"
 j=$(st --json); n=$((n+1)); if printf '%s' "$j" | jq -e . >/dev/null 2>&1; then echo "ok   status --json continua JSON válido com linha truncada no log"; else echo "FAIL JSON quebrou com linha truncada no log"; fails=$((fails+1)); fi
 unset STUB_CHECK_OUT
+# nó Linux (ga-zri39b): bandeira própria, independente da chave do MBP
+NF="$T/city/.gc/hetzner-node.on"
+reset; MBP_CITY="$T/city" bash "$OFFL" node status >"$T/out" 2>&1; has "node status: desligado diz como ligar" "$T/out" '^DESLIGADO \(liga: mbp-offload\.sh node on\)'
+MBP_CITY="$T/city" bash "$OFFL" node on >"$T/out" 2>&1; expect "node on" 0 "$?"; n=$((n+1)); if [ -f "$NF" ]; then echo "ok   node on cria a bandeira"; else echo "FAIL node on não criou a bandeira"; fails=$((fails+1)); fi
+has "node on: o conteúdo é a hora (a sombra de 24 h conta daí)" "$NF" '^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9:]+Z$'; has "node on: diz o que fica de reserva" "$T/out" 'LIGADO .*MBP.*mini'
+MBP_CITY="$T/city" bash "$OFFL" node status >"$T/out" 2>&1; has "node status: ligado desde <hora>" "$T/out" '^LIGADO desde 20[0-9][0-9]-'
+STUB_CHECK_OUT="$CK_LIVRE"; export STUB_CHECK_OUT; st > "$T/out"; has "status do MBP mostra a linha do nó" "$T/out" '^Nó Linux de testes: LIGADO desde 20'
+j=$(st --json); eq "status --json: node.flag" on "$(printf '%s' "$j" | jq -r .node.flag)"; has "status --json: node.since é uma data" <(printf '%s' "$j" | jq -r .node.since) '^20[0-9][0-9]-'
+eq "status --json: as chaves antigas continuam (aditivo)" "true" "$(printf '%s' "$j" | jq -r 'has("offload") and has("mode") and has("tasks") and has("today") and has("recent")')"
+unset STUB_CHECK_OUT
+MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" off >"$T/out" 2>&1; n=$((n+1)); if [ -f "$NF" ]; then echo "ok   mbp-offload.sh off NÃO desliga o nó (bandeira independente)"; else echo "FAIL o off do MBP apagou a bandeira do nó"; fails=$((fails+1)); fi
+MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" pause >"$T/out" 2>&1; n=$((n+1)); if [ -f "$NF" ]; then echo "ok   mbp-offload.sh pause NÃO desliga o nó"; else echo "FAIL a pausa do MBP apagou a bandeira do nó"; fails=$((fails+1)); fi
+rm -f "$FLAG_PAUSE"; date > "$FLAG"
+MBP_CITY="$T/city" bash "$OFFL" node off >"$T/out" 2>&1; expect "node off" 0 "$?"; n=$((n+1)); if [ ! -e "$NF" ]; then echo "ok   node off apaga a bandeira"; else echo "FAIL node off não apagou"; fails=$((fails+1)); fi
+MBP_CITY="$T/city" bash "$OFFL" node off >"$T/out" 2>&1; expect "node off de novo (já desligado) é idempotente" 0 "$?"
+MBP_CITY="$T/city" bash "$OFFL" node bogus >"$T/out" 2>&1; expect "node com argumento inválido: rc 2" 2 "$?"
 # pause / resume
 reset; unset STUB_REMOTE_RC
 MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" pause >"$T/out" 2>&1; expect "pause" 0 "$?"
@@ -651,6 +667,12 @@ reset; mkdir -p "$(dirname "$J")"; : > "$J"; eq "hoje[$L]: log vazio é 0, não 
 reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre","demoted":0'; r_line "$t_now" 60 ',"presence":"uso","demoted":1'; r_line "$t_now" 30 ''
   r_line "$t_ayer" 600 ',"presence":"livre"'; printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"nargs":0,"reason":"ram"}\n' "$t_now"; } > "$J"
 eq "hoje[$L]: separa livre/em uso/sem presença; ontem e recusa ficam fora" "3 execuções, 1 min no MBP (livre: 1, em uso: 1, sem presença registrada: 1)" "$(tdy)"
+reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 120 ',"presence":"livre","demoted":0,"host":"hetzner"'; r_line "$t_now" 60 ',"presence":"uso","demoted":0'; r_line "$t_now" 30 ',"presence":"livre","host":"hetzner"'; } > "$J"
+eq "hoje[$L]: o nó Linux fica FORA dos minutos do MBP e vem à parte" "1 execuções, 1 min no MBP (livre: 0, em uso: 1) + 2 no nó Linux (2 min)" "$(tdy)"
+reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 120 ',"presence":"livre","host":"hetzner"'; } > "$J"
+eq "hoje[$L]: só execuções do nó: 0 no MBP, sem inventar presença" "0 execuções, 0 min no MBP (livre: 0, em uso: 0) + 1 no nó Linux (2 min)" "$(tdy)"
+reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre","host":"mbp"'; } > "$J"
+eq "hoje[$L]: host=mbp explícito conta como MBP, sem a parte do nó" "1 execuções, 0 min no MBP (livre: 1, em uso: 0)" "$(tdy)"
 reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; printf '{"ts":"%s","repo":"wa","mode":"pyt' "$t_now"; echo; } > "$J"
 eq "hoje[$L]: linha truncada é avisada" "1 execuções, 0 min no MBP (livre: 1, em uso: 0); 1 linha(s) ilegível(is) no log (não contadas)" "$(tdy)"
 reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; printf '{"ts":"ontem","repo":"wa","mode":"pytest","secs":1}\n'; echo null; } > "$J"
@@ -1221,6 +1243,8 @@ reset; mkdir -p "$(dirname "$J")"; : > "$J"; eq "contagem[$L]: log vazio é 0, n
 reset; mkdir -p "$(dirname "$J")"; { l_run; l_run; l_ref ram; l_ref ram; l_ref swap_cresce; l_ref ram "$t_old"; } > "$J"
 eq "contagem[$L]: por motivo, e recusa de 5 dias atrás fica fora" "2 execuções; recusas: ram=2 swap_cresce=1" "$(cnt)"
 reset; mkdir -p "$(dirname "$J")"; l_run > "$J"; eq "contagem[$L]: lido e sem recusa" "1 execuções; recusas: nenhuma" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; { l_run; l_ref ram; printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"nargs":0,"reason":"ram","host":"hetzner"}\n{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"nargs":0,"reason":"ram","host":"hetzner"}\n{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"nargs":0,"reason":"inalcancavel","host":"hetzner"}\n' "$t_now" "$t_now" "$t_now"; } > "$J"
+eq "contagem[$L]: recusa do nó leva o prefixo hetzner: (linha sem host = MBP)" "1 execuções; recusas: hetzner:inalcancavel=1 hetzner:ram=2 ram=1" "$(cnt)"
 reset; mkdir -p "$(dirname "$J")"; { l_run; l_ref ram; printf '{"ts":"%s","repo":"-","mode":"pref' "$t_now"; echo; } > "$J"
 eq "contagem[$L]: linha de recusa truncada é avisada e o resto conta" "1 execuções; recusas: ram=1; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
 reset; mkdir -p "$(dirname "$J")"; { l_run; printf '{"ts":"%s","mode":"preflight","rc":98}\n' "$t_now"; } > "$J"

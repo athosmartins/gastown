@@ -1,0 +1,16 @@
+# ga-zri39b: daily mail to the Mayor with the Hetzner test node's performance and cost (Athos 13/10: "100% dos testes vão ao servidor externo, com
+# acompanhamento de performance e custo").
+#
+# Runs scripts/hetzner-daily-report.sh --mail through a wrapper that goes quiet once the node is off and idle for 24 h, so the trial ends without anyone having to
+# remember to delete this order. One mail a day on purpose (a mail is a permanent Dolt commit): batteries per host, mean time, shadow divergences, fallbacks, cost.
+#
+# CRON IS UTC (see engine-window-reboot-noon.toml): 11:00 UTC = 08:00 local (-03), so the report is in the Mayor's inbox at the start of the day.
+#
+# Verify after a reload:  gc order show hetzner-daily-report   -> Source: .../town-deltas/...
+#                         bash $GC_CITY_PATH/scripts/hetzner-daily-report.sh      (the same text, on screen, without mailing)
+[order]
+description = "Daily mail to the Mayor: Hetzner test node — batteries per host, time, shadow divergences, fallbacks and cost (ga-zri39b); silent once the node is off and idle"
+trigger = "cron"
+schedule = "0 11 * * *"
+timeout = "120s"
+exec = "$PACK_DIR/assets/scripts/hetzner-daily-report-order.sh"

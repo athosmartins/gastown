@@ -22,7 +22,11 @@
 #   mbp-offload.sh status --json   o mesmo em JSON (insumo do botão do painel)
 #   mbp-offload.sh counts    só a linha da contagem das últimas 72 h (sem falar com o MBP): "<N> execuções; recusas: <motivo>=<n>"
 #                            ou "sem log ainda" ou "ilegível"; linhas do log que não deu para ler vêm avisadas, nunca omitidas
-#   mbp-offload.sh today     só o total de hoje (sem falar com o MBP): "<N> execuções, <M> min no MBP (livre: a, em uso: b)"
+#   mbp-offload.sh today     só o total de hoje (sem falar com o MBP): "<N> execuções, <M> min no MBP (livre: a, em uso: b)" e, se o nó Linux rodou
+#                            algo, " + <K> no nó Linux (<T> min)"
+#   mbp-offload.sh node on|off|status   a bandeira do NÓ LINUX de testes (Hetzner, ga-zri39b): $CITY/.gc/hetzner-node.on. É independente da chave do MBP: `off`
+#                            e `pause` acima NÃO desligam o nó (que é máquina dedicada), e o nó ligado segue valendo com o MBP desligado ou pausado. Desligar o nó =
+#                            `node off` (apaga a bandeira; o servidor em si é do Mayor). Quem decide a cadeia nó -> MBP -> mini é o mbp-run.sh
 #
 # A CHAVE é só arquivo-bandeira: sem daemon, sem launchd, sem estado escondido. O botão do painel (bead própria, mockup antes)
 # apenas chama este script.
@@ -37,6 +41,7 @@ CITY=${MBP_CITY:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}
 FLAG="$CITY/.gc/mbp-offload.on"
 PAUSE="$CITY/.gc/mbp-offload.pause"
 LOG="$CITY/.gc/logs/mbp-run.jsonl"
+NODEFLAG="$CITY/.gc/hetzner-node.on"
 RUN="${MBP_OFFLOAD_RUN:-$(cd "$(dirname "$0")" && pwd)/mbp-run.sh}"
 
 # Contagem das últimas 72 h: "<N> execuções; recusas: <motivo>=<n> ..." ou "...; recusas: nenhuma".
@@ -61,7 +66,7 @@ recent_counts() {
     | (([$e[] | select(.bad)] | length) + ([$w[] | select((.mode | type) != "string" or (.mode == "preflight" and (.reason | type) != "string"))] | length)) as $bad
     | ([$w[] | select((.mode | type) == "string" and .mode != "preflight")] | length) as $runs
     | [$w[] | select(.mode == "preflight" and (.reason | type) == "string")] as $ref
-    | "\($runs) execuções; recusas: " + (if ($ref | length) == 0 then "nenhuma" else ($ref | group_by(.reason) | map("\(.[0].reason)=\(length)") | join(" ")) end)
+    | "\($runs) execuções; recusas: " + (if ($ref | length) == 0 then "nenhuma" else ($ref | group_by((if .host == "hetzner" then "hetzner:" else "" end) + .reason) | map("\(if .[0].host == "hetzner" then "hetzner:" else "" end)\(.[0].reason)=\(length)") | join(" ")) end)
       + (if $bad > 0 then "; \($bad) linha(s) ilegível(is) no log (não contadas)" else "" end)
   ' "$LOG" 2>/dev/null) || { echo "ilegível"; return; }
   [ -n "$out" ] || { echo "ilegível"; return; }
@@ -83,13 +88,17 @@ today_counts() {
       | if type == "object" and ((try (.ts | fromdateiso8601) catch null) | type) == "number" and ((.mode | type) == "string")
         then {l: ., t: (.ts | fromdateiso8601)} else {bad: 1} end] as $e
     | ([$e[] | select(.bad)] | length) as $bad
-    | [$e[] | select(.l and .t >= $since and .l.mode != "preflight") | .l] as $r
+    | [$e[] | select(.l and .t >= $since and .l.mode != "preflight") | .l] as $all
+    | [$all[] | select(.host == "hetzner")] as $nr
+    | [$all[] | select(.host != "hetzner")] as $r
     | ([$r[] | select(.presence == "livre")] | length) as $livre
     | ([$r[] | select(.presence == "uso")] | length) as $uso
     | (($r | length) - $livre - $uso) as $sem
     | (([$r[] | (.secs | numbers)] | add) // 0) as $secs
+    | (([$nr[] | (.secs | numbers)] | add) // 0) as $nsecs
     | "\($r | length) execuções, \(($secs / 60) | floor) min no MBP (livre: \($livre), em uso: \($uso)"
       + (if $sem > 0 then ", sem presença registrada: \($sem)" else "" end) + ")"
+      + (if ($nr | length) > 0 then " + \($nr | length) no nó Linux (\(($nsecs / 60) | floor) min)" else "" end)
       + (if $bad > 0 then "; \($bad) linha(s) ilegível(is) no log (não contadas)" else "" end)
   ' "$LOG" 2>/dev/null) || { echo "ilegível"; return; }
   [ -n "$out" ] || { echo "ilegível"; return; }
@@ -138,6 +147,17 @@ why_text() { # presence_why idle_s
   esac
 }
 
+# a hora em que a bandeira do nó foi ligada (o conteúdo é uma data ISO; sem ele, a hora do arquivo); vazio = desligado / não consegui ler
+node_since() {
+  [ -f "$NODEFLAG" ] || return 0
+  local c; c=$(head -n 1 "$NODEFLAG" 2>/dev/null | tr -d '\r')
+  case "$c" in 20[0-9][0-9]-*) printf '%s' "$c" ;; *) date -u -r "$(stat -f %m "$NODEFLAG" 2>/dev/null || stat -c %Y "$NODEFLAG" 2>/dev/null)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ;; esac
+}
+node_state_text() {
+  if [ -f "$NODEFLAG" ]; then echo "LIGADO desde $(node_since | grep . || echo '?') (a sombra de 24 h conta daí; desliga: mbp-offload.sh node off)"
+  else echo "DESLIGADO (liga: mbp-offload.sh node on) — as baterias seguem a cadeia de sempre"; fi
+}
+
 cmd=${1:-status}
 case "$cmd" in
   on)  mkdir -p "$(dirname "$FLAG")" && date -u +%Y-%m-%dT%H:%M:%SZ > "$FLAG" && echo "MBP offload: LIGADO" ;;
@@ -157,6 +177,13 @@ case "$cmd" in
       exit 1
     fi ;;
   install-mbp) "$RUN" --install-tools ;;
+  node)
+    case "${2:-status}" in
+      on)  mkdir -p "$(dirname "$NODEFLAG")" && date -u +%Y-%m-%dT%H:%M:%SZ > "$NODEFLAG" && echo "Nó Linux de testes: LIGADO (a sombra de 24 h começa agora; o MBP, a pausa dele e o mini seguem como reserva)" || { echo "Nó Linux: NÃO consegui gravar $NODEFLAG" >&2; exit 1; } ;;
+      off) rm -f "$NODEFLAG"; [ -e "$NODEFLAG" ] && { echo "Nó Linux: NÃO consegui apagar $NODEFLAG" >&2; exit 1; }; echo "Nó Linux de testes: DESLIGADO (bandeira apagada; o servidor em si é do Mayor)" ;;
+      status) node_state_text ;;
+      *) echo "uso: $0 node on|off|status" >&2; exit 2 ;;
+    esac ;;
   status)
     state=off; [ -f "$FLAG" ] && state=on
     health=$(MBP_CITY="$CITY" "$RUN" --check 2>/dev/null); hrc=$?
@@ -177,11 +204,11 @@ case "$cmd" in
       hj=$(printf '%s\n' "$health" | awk -F= 'NF==2 && $1!="" && $1!="task" {printf "%s\"%s\":\"%s\"", (n++?",":""), $1, $2}')
       recent_json=$(printf '%s\n' "$recent" | jq -Rn '[inputs | select(length > 0) | (try fromjson catch {unreadable: .})]' 2>/dev/null) || recent_json=null
       jq -n --arg offload "$state" --arg mode "$mode" --arg why "$mwhy" --arg presence "$presence" --arg idle "$idle" --arg cap "$cap" \
-        --arg today "$(today_counts)" --argjson healthy "$([ $hrc -eq 0 ] && echo true || echo false)" \
+        --arg today "$(today_counts)" --arg nodeflag "$([ -f "$NODEFLAG" ] && echo on || echo off)" --arg nodesince "$(node_since)" --argjson healthy "$([ $hrc -eq 0 ] && echo true || echo false)" \
         --argjson paused_local "$([ "$paused_l" = 1 ] && echo true || echo false)" --argjson paused_mbp "$([ "$paused_r" = 1 ] && echo true || echo false)" \
         --argjson health "{$hj}" --argjson tasks "$tasks_json" --argjson recent "$recent_json" \
         '{offload: $offload, mode: $mode, mode_why: $why, presence: $presence, idle_s: ($idle | tonumber? // null), slot_cap: ($cap | tonumber? // null),
-          paused: {local: $paused_local, mbp: $paused_mbp}, tasks: $tasks, today: $today, healthy: $healthy, health: $health, recent: $recent}'
+          paused: {local: $paused_local, mbp: $paused_mbp}, tasks: $tasks, today: $today, healthy: $healthy, health: $health, recent: $recent, node: {flag: $nodeflag, since: $nodesince}}'
     else
       echo "MBP offload: $(echo $state | tr a-z A-Z)  (since: $( [ -f "$FLAG" ] && cat "$FLAG" || echo - ))"
       case "$mode" in
@@ -196,16 +223,17 @@ case "$cmd" in
         echo "Rodando agora no MBP: $live tarefa(s)"
         tasks_text "$health"
       fi
+      echo "Nó Linux de testes: $(node_state_text)"
       echo "Hoje: $(today_counts)"
       if [ $hrc -eq 0 ]; then echo "MBP saudável:"; elif [ $hrc -eq 99 ]; then echo "MBP pausado (rc=99); leituras do preflight:"; else echo "MBP SEM SAÚDE (rc=$hrc) — execuções caem para local:"; fi
       printf '%s\n' "$health" | grep -v '^task=' | sed 's/^/  /'
       echo "últimas execuções ($LOG):"
-      if [ -n "$recent" ]; then printf '%s\n' "$recent" | jq -r '"  \(.ts) \(.repo)/\(.mode) slot=\(.slot) rc=\(.rc) \(.secs)s" + (if .presence then " presença=\(.presence)" else "" end) + (if .demoted == 1 then " REBAIXADA-NO-MEIO" else "" end) + (if .reason then " motivo=\(.reason)" else "" end)' 2>/dev/null || printf '%s\n' "$recent"
+      if [ -n "$recent" ]; then printf '%s\n' "$recent" | jq -r '"  \(.ts) \(.repo)/\(.mode) slot=\(.slot) rc=\(.rc) \(.secs)s" + (if .presence then " presença=\(.presence)" else "" end) + (if .host then " host=\(.host)" else "" end) + (if .demoted == 1 then " REBAIXADA-NO-MEIO" else "" end) + (if .reason then " motivo=\(.reason)" else "" end)' 2>/dev/null || printf '%s\n' "$recent"
       else echo "  (nenhuma)"; fi
       echo "últimas 72 h: $(recent_counts)"
     fi ;;
   counts) recent_counts ;;
   today) today_counts ;;
   -h|--help|help) sed -n '2,/^[^#]/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) echo "uso: $0 on|off|pause|resume [--local-only]|install-mbp|status [--json]|counts|today" >&2; exit 2 ;;
+  *) echo "uso: $0 on|off|pause|resume [--local-only]|install-mbp|node on|off|status|status [--json]|counts|today" >&2; exit 2 ;;
 esac
