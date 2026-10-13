@@ -10,7 +10,9 @@ O QUE MEDE
             e JULGADO = PASS ou FAIL com "Reviewer N FAIL: VERDICT: FAIL" no reason; só então elapsed > 0) e o MESMO dia (BRT, UTC-3, como o
             painel — não o fuso da máquina). Os SEM VEREDITO (FAIL por TIMEOUT, bead já fechado, merge que falhou depois do all-PASS...)
             ficam FORA da média, porque o elapsed deles é a espera, não uma revisão, e aparecem CONTADOS na última coluna (o `sem_veredito`
-            do painel). Duas diferenças de propósito, as duas CONTADAS no aviso em vez de sumirem: (1) elapsed_s que não se lê num evento julgado
+            do painel). A coluna `revisões` conta o que ENTROU na média: o julgado com elapsed_s 0, ausente, vazio ou
+            negativo fica fora dela e não tem contagem à parte (o painel também o tira da média, mas o conta entre os julgados).
+            Duas diferenças de propósito, as duas CONTADAS no aviso em vez de sumirem: (1) elapsed_s que não se lê num evento julgado
             (texto, `true`, [] ou {}, NaN, Infinity, inteiro que não cabe em float — o painel lê como 0 s, 1 s ou infinito); (2) evento que o painel
             contaria mas cujo ts não se lê (ausente, ilegível, sem fuso, fora do que o dia BRT calcula) — o painel o descarta sem dizer.
             --dias N são os últimos N dias QUE TÊM evento, não N dias de calendário: um buraco no log alarga o intervalo (a coluna da data mostra).
@@ -21,21 +23,23 @@ O QUE MEDE
             soma da duração das chamadas Bash cujo comando cita pytest (python3 -m pytest, gate-pytest.sh, tail/sleep em log de pytest
             que o comando nomeia). --corte <ISO> parte as sessões em antes/depois do deploy do wrapper e compara as médias.
             O que a tabela NÃO consegue medir é DITO no aviso, nunca some: sessão cuja chamada de teste nunca voltou (sem duração, fica fora
-            da média — e é justamente a espera mais longa), arquivo de transcrição que não abre, linha ilegível. Se NENHUMA sessão entra na
-            tabela, o rc 2 diz qual dessas coisas aconteceu: "chamada que nunca voltou" não é "ninguém rodou teste".
+            da média — e é justamente a espera mais longa), arquivo de transcrição que não abre (ou que sumiu / é symlink quebrado), linha ilegível,
+            resultado carimbado ANTES da chamada (duração que não se lê: não vira "0 s de teste"). Se NENHUMA sessão entra na tabela, o rc 2 diz qual
+            dessas coisas aconteceu: "chamada que nunca voltou" não é "ninguém rodou teste". Pasta que NÃO existe também é rc 2 com a mensagem própria.
             É uma DICA, não a medida (veja LIMITES): a medida é `dias` (revisao_media_min) e `wrapper` (os segundos que o próprio
             wrapper registra).
   wrapper   o que o gate-pytest.sh registrou em .gc/logs/gate-pytest.jsonl: execuções por destino (mbp, local, mbp+local), segundos
-            no MBP e aqui, e os motivos de rodar aqui. Só existe depois do deploy.
+            no MBP e aqui, e os motivos de rodar aqui. Só existe depois do deploy. Execução cujo `session` não é texto entra na soma e fica FORA
+            de "sessões distintas", DITA no aviso.
 
 USO
   gate-review-test-time.py dias [--dias 7]
   gate-review-test-time.py sessoes [--n 20] [--corte 2026-10-12T06:00:00Z]
   gate-review-test-time.py wrapper [--desde 2026-10-12T06:00:00Z]
   gate-review-test-time.py --selftest
-  Opção sem valor, desconhecida ou com valor inválido (--dias e --n: inteiro >= 1; 0 e negativo não são "nenhum" nem "tudo"; --corte e --desde:
-  data ISO COM fuso, 2026-10-12T06:00:00Z ou ...-03:00 — sem fuso seria lida na zona da máquina, e o dia do `dias` é BRT) é uso errado
-  (rc 2, com a mensagem): nunca cai no padrão em silêncio ("sem corte", "desde sempre") nem vira uma medição vazia.
+  Opção sem valor, com valor VAZIO (`--desde "$X"` com X sem valor), desconhecida ou com valor inválido (--dias e --n: inteiro >= 1; 0 e negativo não são
+  "nenhum" nem "tudo"; --corte e --desde: data ISO COM fuso, 2026-10-12T06:00:00Z ou ...-03:00 — sem fuso seria lida na zona da máquina, e o dia do `dias`
+  é BRT) é uso errado (rc 2, com a mensagem): nunca cai no padrão em silêncio ("sem corte", "desde sempre") nem vira uma medição vazia.
   Linha de log ou de transcrição ilegível é pulada e CONTADA no aviso do fim, nunca some; transcrição que nem abre também é contada. `dias` sem NENHUM evento contável (log vazio,
   girado, formato mudado) é rc 2 com a mensagem — "não consegui medir" não é "zero revisões".
 
@@ -189,7 +193,7 @@ def session_stats(path):
     TRÊS estados, que quem chama NÃO pode misturar: None = o arquivo não abriu (OSError: "não consegui saber"); início None = abriu, mas não tem nenhum
     carimbo legível (arquivo vazio, ou só lixo: as linhas ilegíveis dele continuam no último campo, não somem junto); início de verdade = a sessão.
     Linha que não é JSON, ou é JSON que não é um objeto (`null`, um número), é pulada e CONTADA (último campo), nunca some em silêncio nem derruba a leitura;
-    o mesmo vale para o que está DENTRO dela e não tem o formato esperado (`message` que não é objeto, chamada Bash sem comando em texto, chamada de teste com id que não é texto; um resultado com id ilegível não casa, e a chamada dele cai em "sem resultado casado")
+    o mesmo vale para o que está DENTRO dela e não tem o formato esperado (`message` que não é objeto, chamada Bash sem comando em texto, chamada de teste com id que não é texto; um resultado com id ilegível não casa, e a chamada dele cai em "sem resultado casado"; um resultado carimbado ANTES da chamada tem duração que não se lê: conta em `bad`, não é "0 s" nem entra nas chamadas casadas)
     e para a linha de carimbo ilegível que carrega chamada de ferramenta (ela sairia da soma sem rastro). Linha em branco, e linha sem carimbo e sem
     chamada (resumo, snapshot), não contam."""
     uses, first, last, wait, runs, unmatched, bad = {}, None, None, 0.0, 0, 0, 0
@@ -238,8 +242,13 @@ def session_stats(path):
                         else:  # chamada de teste cujo resultado nunca casaria: CONTADA, não some
                             bad += 1
                 elif b.get("type") == "tool_result" and isinstance(b.get("tool_use_id"), str) and b["tool_use_id"] in uses:
-                    wait += max(0.0, ts - uses.pop(b["tool_use_id"]))
-                    runs += 1
+                    # duração ≥ 0 → soma; resultado carimbado ANTES da chamada (relógio ou ordem do arquivo) é duração que não se lê: CONTADA em `bad`, não vira "0 s de teste" nem entra em `runs`
+                    gap = ts - uses.pop(b["tool_use_id"])
+                    if gap < 0:
+                        bad += 1
+                    else:
+                        wait += gap
+                        runs += 1
     unmatched = len(uses)
     if first is None or last is None:  # nenhum carimbo legível: sem sessão para medir, mas as linhas ilegíveis que ela teve continuam contadas (uses está vazio: só se guarda chamada com carimbo)
         return None, 0.0, 0.0, 0, 0, bad
@@ -254,8 +263,19 @@ def cmd_sessoes(n, corte, dirpath=None):
         if c is None:
             print(f"sessoes: --corte '{corte}' não é uma data ISO com fuso (termine em Z ou use ±hh:mm; sem fuso seria lida numa zona que ninguém escolheu)", file=sys.stderr)
             return 2
-    files = sorted(glob.glob(os.path.join(dirpath, "*.jsonl")), key=os.path.getmtime, reverse=True)
-    rows, badl, ilegiveis, sem_volta, un = [], 0, 0, 0, 0
+    # pasta que existe e está vazia → "nenhuma sessão achada" (abaixo); pasta que NÃO existe (GATE_REVIEW_TRANSCRIPTS errada, outra máquina) → rc 2 dizendo isso: "não consegui saber" não lê como "ninguém rodou teste"
+    if not os.path.isdir(dirpath):
+        print(f"sessoes: a pasta de transcrições não existe (ou não é pasta): {dirpath} — GATE_REVIEW_TRANSCRIPTS aponta para o lugar certo? Isto NÃO é 'ninguém rodou teste'", file=sys.stderr)
+        return 2
+    # sem data de modificação que se leia (o arquivo sumiu entre o glob e o stat, ou é symlink quebrado) → não dá para ordenar nem abrir: fica FORA e CONTADO em `ilegiveis`, nunca derruba o sort
+    stamped, ilegiveis = [], 0
+    for f in glob.glob(os.path.join(dirpath, "*.jsonl")):
+        try:
+            stamped.append((os.path.getmtime(f), f))
+        except OSError:
+            ilegiveis += 1
+    files = [f for _, f in sorted(stamped, key=lambda mf: mf[0], reverse=True)]
+    rows, badl, sem_volta, un = [], 0, 0, 0
     for f in files:
         st = session_stats(f)
         # vazio (sem carimbo, sem teste) → fora da tabela, sem alarme; falhou (o arquivo não abre) → CONTADO em `ilegiveis`, nunca tratado como "sessão sem teste"
@@ -272,7 +292,7 @@ def cmd_sessoes(n, corte, dirpath=None):
             break
     avisos = []
     if ilegiveis:
-        avisos.append(f"{ilegiveis} arquivo(s) de transcrição não puderam ser lidos (permissão ou erro de leitura) e ficaram FORA")
+        avisos.append(f"{ilegiveis} arquivo(s) de transcrição não puderam ser lidos (permissão, erro de leitura, sumiu ou symlink quebrado) e ficaram FORA")
     if sem_volta:
         avisos.append(f"{sem_volta} sessão(ões) ficaram FORA da tabela: nenhuma chamada de teste delas voltou com resultado (o revisor pode ter morrido esperando o teste, a espera mais longa)")
     if un:
@@ -314,8 +334,9 @@ def seconds(e, key):
 
 def cmd_wrapper(desde, path=None):
     path = path or os.path.join(CITY, ".gc", "logs", "gate-pytest.jsonl")
-    since = epoch(desde) if desde else None
-    if desde and since is None:
+    # --desde não dado (None) → sem corte, o log inteiro (é o padrão do comando); dado e vazio ('') ou ilegível → rc 2, nunca "desde sempre": '' é falso mas NÃO é "não dado"
+    since = epoch(desde) if desde is not None else None
+    if desde is not None and since is None:
         print(f"wrapper: --desde '{desde}' não é uma data ISO com fuso (termine em Z ou use ±hh:mm; sem fuso seria lida numa zona que ninguém escolheu)", file=sys.stderr)
         return 2
     try:
@@ -323,7 +344,7 @@ def cmd_wrapper(desde, path=None):
     except OSError as e:
         print(f"wrapper: ainda não há {path} ({e.strerror}) — o wrapper não rodou ou não foi implantado", file=sys.stderr)
         return 2
-    n, bad, ran, sec, motivos, sess = 0, 0, {}, [0, 0, 0], {}, set()
+    n, bad, ran, sec, motivos, sess, sess_bad = 0, 0, {}, [0, 0, 0], {}, set(), 0
     with fh:
         for line in fh:
             if not line.strip():  # linha em branco não é linha ilegível (mesmo critério de session_stats)
@@ -352,8 +373,13 @@ def cmd_wrapper(desde, path=None):
             k = str(e.get("ran", "?"))
             ran[k] = ran.get(k, 0) + 1
             sec[0] += secs[0]; sec[1] += secs[1]; sec[2] += secs[2]
-            if e.get("session"):
-                sess.add(e["session"])
+            # vazio (ausente, null, "") → execução sem sessão: não entra nas distintas, sem alarme; ilegível (lista, objeto, número: não é texto) → CONTADA à parte — a execução fica na soma (os segundos se leem), nem crash (set.add de lista) nem some
+            sid = e.get("session")
+            if isinstance(sid, str):
+                if sid:
+                    sess.add(sid)
+            elif sid is not None:
+                sess_bad += 1
             # execução sem `detail` (todas as só-MBP) não tem motivo de rodar aqui: balde com nome próprio, não um "-" que lê como motivo; detail que a regex apagaria inteiro fica como veio
             primeiro = str(e.get("detail") or "").split(";")[0]
             key = re.sub(r"[:(].*$", "", primeiro) or primeiro or "(sem detalhe)"
@@ -363,6 +389,8 @@ def cmd_wrapper(desde, path=None):
     print("motivos: " + ", ".join(f"{k}={v}" for k, v in sorted(motivos.items(), key=lambda kv: -kv[1])))
     if bad:
         print(f"(aviso: {bad} linha(s) ilegíveis puladas)")
+    if sess_bad:
+        print(f"(aviso: {sess_bad} execução(ões) com `session` que não é texto entraram na soma, mas ficaram FORA de 'sessões distintas')")
     return 0
 
 
@@ -557,9 +585,32 @@ def selftest():
         ok(rc == 0 and "2 linha(s) de transcrição ilegíveis" in out and "arquivo(s) de transcrição não puderam" not in out,
            f"sessoes: as linhas ilegíveis de um arquivo sem carimbo aparecem no aviso; arquivo vazio não alarma (rc={rc}, aviso={[l for l in out.splitlines() if 'aviso' in l]})")
         # --corte inválido é uso errado ANTES de ler as transcrições: pasta vazia não pode mascará-lo como 'nenhuma sessão achada'; data sem fuso também
-        for corte_ruim in ("lixo", "2026-10-12T06:00:00", "2026-10-12"):
+        for corte_ruim in ("lixo", "2026-10-12T06:00:00", "2026-10-12", ""):  # "" direto em cmd_sessoes: `is not None` já o recusava; fica fixado para não regredir como o --desde
             rc, out, err = run_sessoes(sess_dir("tr9-" + str(len(corte_ruim))), 5, corte_ruim)
             ok(rc == 2 and "--corte" in err and "nenhuma sessão" not in err, f"sessoes: --corte {corte_ruim!r} inválido/sem fuso: rc 2 nomeando --corte (rc={rc}, err={err.strip()[:100]})")
+        # arquivo que SUMIU entre o glob e o stat (aqui: symlink quebrado) não derruba o sort com FileNotFoundError: fica FORA e CONTADO; a sessão boa ao lado segue na tabela
+        dq = sess_dir("tr10", ok=casada)
+        os.symlink(os.path.join(t, "alvo-que-nao-existe"), os.path.join(dq, "quebrado.jsonl"))
+        try:
+            rc, out, err = run_sessoes(dq)
+        except Exception as ex:  # o crash vira FALHA com nome, não derruba o resto do selftest
+            rc, out, err = None, "", f"{type(ex).__name__}: {ex}"
+        ok(rc == 0 and "1 arquivo(s) de transcrição não puderam ser lidos" in out and "últimas 1 sessões com teste" in out,
+           f"sessoes: symlink quebrado = 1 arquivo CONTADO no aviso, sem crash, a sessão boa segue (rc={rc}, err={err.strip()[:70]})")
+        # pasta que NÃO existe (GATE_REVIEW_TRANSCRIPTS errada) não lê como a pasta existente e vazia ("nenhuma sessão ... achada"): rc 2 dizendo que a pasta não existe
+        rc, out, err = run_sessoes(os.path.join(t, "pasta-que-nao-existe"))
+        ok(rc == 2 and "não existe" in err and "nenhuma sessão" not in err, f"sessoes: pasta inexistente = rc 2 'não existe', não 'nenhuma sessão achada' (rc={rc}, err={err.strip()[:90]})")
+        # resultado carimbado ANTES da chamada (10:03 < 10:05): duração que não se lê — CONTADA em `bad`, não vira "0 s de teste" nem "chamada casada"
+        neg = "\n".join([ev("2026-10-12T10:00:00Z", [{"type": "text", "text": "oi"}]),
+                         ev("2026-10-12T10:05:00Z", [{"type": "tool_use", "id": "n1", "name": "Bash", "input": {"command": "python3 -m pytest tests/z.py"}}]),
+                         ev("2026-10-12T10:03:00Z", [{"type": "tool_result", "tool_use_id": "n1", "content": "ok"}]),
+                         ev("2026-10-12T10:10:00Z", [{"type": "text", "text": "fim"}])]) + "\n"
+        pneg = os.path.join(t, "neg.jsonl"); open(pneg, "w").write(neg)
+        stn = session_stats(pneg)
+        ok(stn is not None and stn[3] == 0 and stn[4] == 0 and stn[5] == 1 and stn[2] == 0.0,
+           f"session_stats: resultado antes da chamada = 1 CONTADO, 0 chamadas casadas, 0 s de espera (não uma chamada de 0 s) (st={stn})")
+        rc, out, err = run_sessoes(sess_dir("tr11", neg=neg))
+        ok(rc == 2 and "1 linha(s) de transcrição ilegíveis" in err, f"sessoes: a sessão do resultado-antes-da-chamada não some em silêncio, o rc 2 diz a linha contada (rc={rc}, err={err.strip()[:100]})")
         # DENTRO da linha: o que não tem o formato esperado é CONTADO (nem crash, nem some); linha sem carimbo e sem chamada (resumo) e `content` em texto são normais
         d2 = os.path.join(t, "tr2"); os.makedirs(d2)
         lines2 = [json.dumps(o) for o in (
@@ -591,7 +642,11 @@ def selftest():
                            (("dias", "--dias", "abc"), "--dias"), (("sessoes", "--n", "1.5"), "--n"),
                            # 0 e negativo são inteiros mas não são "nenhum" nem "tudo": `--dias 0` listava o histórico INTEIRO, `--dias -2` descartava dias, `--n 0` dava medição vazia
                            (("dias", "--dias", "0"), "--dias"), (("dias", "--dias", "-2"), "--dias"), (("sessoes", "--n", "0"), "--n"),
-                           (("sessoes", "--n", "-1", "--corte", "2026-10-12T00:00:00Z"), "--n")):
+                           (("sessoes", "--n", "-1", "--corte", "2026-10-12T00:00:00Z"), "--n"),
+                           # valor VAZIO (`--desde "$X"` com X sem valor) é opção sem valor: `if desde` lia '' como "não dado" e o wrapper imprimia o log INTEIRO com rc 0, com cara de "desde o deploy"
+                           (("wrapper", "--desde", ""), "--desde precisa de um valor"), (("wrapper", "--desde", "  "), "--desde precisa de um valor"),
+                           (("sessoes", "--corte", ""), "--corte precisa de um valor"), (("sessoes", "--n", ""), "--n precisa de um valor"),
+                           (("dias", "--dias", ""), "--dias precisa de um valor")):
             r, msg = run_main(*args)
             ok(r == 2 and frag in msg, f"uso errado {' '.join(args)}: rc 2 e a mensagem diz o motivo (rc={r}, '{msg.strip()[:70]}')")
         ok(int_opt({"--n": "3"}, "--n", 20) == 3 and int_opt({}, "--n", 20) == 20 and int_opt({"--dias": "1"}, "--dias", 7) == 1,
@@ -608,6 +663,13 @@ def selftest():
         with contextlib.redirect_stderr(io.StringIO()):
             rcd = (cmd_wrapper("2026-10-12T06:00:00", w), cmd_wrapper("2026-10-12", w))
         ok(rcd == (2, 2), f"wrapper: --desde sem fuso = rc 2, não lido na zona da máquina (rc={rcd})")
+        # cmd_wrapper chamado direto (sem a porta do parse_opts): '' é "dado e ilegível", não "não dado" — rc 2, a mensagem nomeia --desde e NENHUMA tabela sai (não é o log inteiro com cara de medição)
+        for desde_ruim in ("", "  "):
+            buf_e, err_e = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_e), contextlib.redirect_stderr(err_e):
+                rce = cmd_wrapper(desde_ruim, w)
+            ok(rce == 2 and "--desde" in err_e.getvalue() and not buf_e.getvalue(),
+               f"wrapper: cmd_wrapper({desde_ruim!r}) direto = rc 2 e nenhuma tabela, não o log inteiro (rc={rce}, stdout={buf_e.getvalue()[:40]!r})")
         # a execução sem `detail` (todas as só-MBP) não é um "motivo de rodar aqui": o balde tem nome próprio, não um '-' que parece um motivo
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -638,6 +700,20 @@ def selftest():
         ok("segundos: total=15 no MBP=10 aqui=5" in out, "wrapper: segundos ilegíveis não somam 0 nem entram na soma")
         rc, out = run_wrapper("2026-10-12T00:00:00Z")
         ok(rc == 0 and "execuções: 1 " in out and "9 linha(s) ilegíveis" in out, "wrapper --desde: linha sem data é contada, não some em silêncio")
+        # `session` que não é texto (lista, objeto, número): a execução fica na soma e o `wrapper` NÃO morre (set.add de lista), mas a execução é DITA; ausente, null e "" são execução sem sessão, sem alarme
+        w3 = os.path.join(t, "w3.jsonl")
+        lin_w = '{"ts":"2026-10-12T10:0%d:00Z","ran":"mbp","secs":10,"mbp_secs":10,"local_secs":0,"detail":""%s}\n'
+        open(w3, "w").write(lin_w % (0, ',"session":"s1"') + lin_w % (1, ',"session":["s1"]') + lin_w % (2, ',"session":{"a":1}') + lin_w % (3, ',"session":7')
+                            + lin_w % (4, ',"session":null') + lin_w % (5, ',"session":""') + lin_w % (6, ""))
+        buf3 = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf3):
+                rc3 = cmd_wrapper(None, w3)
+            o3 = buf3.getvalue()
+        except Exception as ex:  # o crash vira FALHA com nome, não derruba o resto do selftest
+            rc3, o3 = None, f"{type(ex).__name__}: {ex}"
+        ok(rc3 == 0 and "execuções: 7  sessões distintas: 1 " in o3 and "3 execução(ões) com `session` que não é texto" in o3 and "linha(s) ilegíveis" not in o3,
+           f"wrapper: session lista/objeto/número = 3 DITAS e dentro da soma, sem crash; null, \"\" e ausente não alarmam (rc={rc3}, saída={o3.strip()[:90]!r})")
         # `null` e `[]` não citam dispatcher_complete: irrelevantes, nem entram na conta. As duas últimas citam e não são objeto: contadas.
         evs, sv, bad = gate_events_from_lines(['null', '[]', '{"event":"dispatcher_complete","ts":"2026-10-10T12:00:00Z","bead":"a","result":"PASS","elapsed_s":60}',
                                                '"dispatcher_complete"', '["dispatcher_complete"]'])
@@ -661,6 +737,9 @@ def parse_opts(args, allowed):
             raise UsageError(f"argumento desconhecido: {a} (aceita: {', '.join(sorted(allowed)) or 'nenhum'})")
         if i + 1 >= len(args) or args[i + 1].startswith("--"):
             raise UsageError(f"{a} precisa de um valor")
+        # valor VAZIO ('' ou só espaço: `--desde "$X"` com X sem valor) é opção sem valor, não um valor — a porta única de todas as opções, para nenhuma delas ler "vazio" como "não dado"
+        if not args[i + 1].strip():
+            raise UsageError(f"{a} precisa de um valor (veio vazio — variável de shell sem valor?)")
         out[a] = args[i + 1]
         i += 2
     return out
