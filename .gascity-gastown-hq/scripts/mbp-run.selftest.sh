@@ -25,6 +25,11 @@
 #   Athos volta ou pausa, sem atrasar o fim da execução nem deixar processo para trás. mbp-offload: modos do status, tarefas órfãs,
 #   JSON, total do dia (sob cada jq), pause/resume. gascity-mbp (mbp-controle.sh). MBP_SELFTEST_ONLY=presenca|chave roda só essa parte;
 #   MBP_SELFTEST_SKIP=presenca pula a presença (a suíte antiga, sozinha, cabe nos 900 s do prod test do ga-9e2rjh).
+# NÓ LINUX (ga-zri39b; MBP_SELFTEST_ONLY=node roda só esta parte): a cadeia nó -> MBP -> local com os códigos 96..99 (nó fora, sem RAM, base/venv ausentes, slots cheios,
+#   ssh que cai no meio) e a bandeira própria do nó (independe do mbp-offload.on e da pausa do Athos) · o preflight do nó roda DE VERDADE contra um /proc falso
+#   (MemAvailable, SwapTotal/SwapFree e crescimento, PSI → níveis 1/2/4, disco, núcleos; ilegível ≠ baixo) · SEGURANÇA: o rsync REAL com os argumentos do mbp-run, contra uma árvore
+#   com .duckdb/.db/.csv/.env/segredo/data/shared/logs plantados (dentro e fora de tests/) — nada chega; o que uma semeadura antiga deixou é apagado; controles negativos (sem
+#   --filter, e filtro com a ordem errada sem a conferência) VAZAM e são pegos · filtro ausente, vazio ou na ordem errada = o nó NÃO é usado.
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -40,14 +45,37 @@ mkdir -p "$T/bin" "$T/fake" "$T/city/.gc/logs" "$T/wt/tests"
 cat > "$T/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 args="$*"
+# qual host é o destino: o nó Linux (hetzner-teste) ou o MBP. Cada caso liga a falha que quer por host (STUB_*_NODE / STUB_*_MBP).
+case "$args" in *hetzner-teste*) host=hetzner ;; *) host=mbp ;; esac
 if [ "${STUB_UNREACHABLE:-0}" = 1 ]; then exit 255; fi
+if [ "$host" = hetzner ] && [ "${STUB_UNREACHABLE_NODE:-0}" = 1 ]; then exit 255; fi
+if [ "$host" = mbp ] && [ "${STUB_UNREACHABLE_MBP:-0}" = 1 ]; then exit 255; fi
 case "$args" in *"bash -s"*) s=$(cat); name=$(printf '%s' "$s" | sed -n '1s/^# MBP://p') ;; *) name="DIRECT"; s="" ;; esac
 echo "$name" >> "$STUB_LOG"
+echo "HOSTCALL:$host:$name" >> "$STUB_LOG"
+[ "$name" = DIRECT ] || printf '%s\n' "$s" > "$(dirname "$STUB_LOG")/last-script-$name-$host.sh"
 # HOME falso: a biblioteca de presença e a listagem de tarefas leem $HOME/gt-remote (PAUSE, slots/) no "MBP"
 rexec() { printf '%s\n' "$s" | HOME="$STUB_HOME" PATH="$FAKE:$PATH" STUB_REAL_SLEEP="${1:-0}" "$STUB_REMOTE_BASH" -s -- ${2:-}; }
+# /proc falso do nó Linux, gerado a cada chamada a partir de STUB_N_* (raiz em $STUB_PROCDIR, passada ao script remoto como 2º argumento)
+mkproc() {
+  local d="$STUB_PROCDIR"; mkdir -p "$d/pressure"
+  if [ -n "${STUB_N_MEMINFO_RAW:-}" ]; then printf '%b\n' "$STUB_N_MEMINFO_RAW" > "$d/meminfo"
+  else printf 'MemTotal:       32000000 kB\nMemFree:        1000000 kB\nMemAvailable:   %s kB\nSwapTotal:      %s kB\nSwapFree:       %s kB\n' \
+    "$(( ${STUB_N_AVAIL_MB:-24000} * 1024 ))" "$(( ${STUB_N_SWAPTOTAL_MB:-0} * 1024 ))" "$(( ${STUB_N_SWAPFREE_MB:-0} * 1024 ))" > "$d/meminfo"; fi
+  if [ "${STUB_N_PSI_MISSING:-0}" = 1 ]; then rm -f "$d/pressure/memory"
+  elif [ -n "${STUB_N_PSI_RAW:-}" ]; then printf '%b\n' "$STUB_N_PSI_RAW" > "$d/pressure/memory"
+  else printf 'some avg10=%s avg60=0.00 avg300=0.00 total=1\nfull avg10=%s avg60=0.00 avg300=0.00 total=1\n' "${STUB_N_PSI_SOME:-0.00}" "${STUB_N_PSI_FULL:-0.00}" > "$d/pressure/memory"; fi
+  echo "0.50 0.40 0.30 1/200 12345" > "$d/loadavg"
+}
 case "$name" in
   PREFLIGHT)
-    if [ -n "${STUB_PF_RAW:-}" ]; then printf '%b\n' "$STUB_PF_RAW"; else
+    if [ "$host" = hetzner ]; then
+      if [ -n "${STUB_PF_RAW_NODE:-}" ]; then printf '%b\n' "$STUB_PF_RAW_NODE"; else
+        rm -f "$STUB_SWAPCNT"; sample=""
+        case "$args" in *"bash -s -- "*) sample=${args##*bash -s -- } ;; esac
+        mkproc; rexec 0 "$sample $STUB_PROCDIR"
+      fi
+    elif [ -n "${STUB_PF_RAW:-}" ]; then printf '%b\n' "$STUB_PF_RAW"; else
       rm -f "$STUB_SWAPCNT"; sample=""
       case "$args" in *"bash -s -- "*) sample=${args##*bash -s -- } ;; esac
       rexec 0 "$sample"
@@ -61,21 +89,50 @@ case "$name" in
     else echo "SLOT=1"; fi ;;
   SLOT_REAP) if [ "${STUB_SLOTS:-free}" = exec ]; then rexec 0; exit $?; else touch "$STUB_REAPED"; fi ;;
   SLOT_RELEASE) if [ "${STUB_SLOTS:-free}" = exec ]; then rexec 0; exit $?; fi ;;
-  MIRROR) if [ "${STUB_NOBASE:-0}" = 1 ]; then echo NOBASE; exit 97; else echo MIRROR_OK; fi ;;
+  MIRROR)
+    if [ "$host" = hetzner ] && [ "${STUB_NOBASE_NODE:-0}" = 1 ]; then echo NOBASE; exit 97
+    elif [ "$host" = hetzner ] && [ "${STUB_NOVENV_NODE:-0}" = 1 ]; then echo NOVENV; exit 97
+    elif [ "${STUB_NOBASE:-0}" = 1 ]; then echo NOBASE; exit 97; else echo MIRROR_OK; fi ;;
   RUN|EXEC)
     printf '%s\n' "$s" > "$(dirname "$STUB_LOG")/last-script-$name.sh"
     # STUB_RUNMODE=exec: executa o script recebido de verdade (sleep REAL: o vigia precisa esperar), com python/taskpolicy/renice falsos
     if [ "${STUB_RUNMODE:-canned}" = exec ]; then rexec 1; exit $?
-    elif [ "$name" = RUN ]; then [ "${STUB_RUN_RC:-0}" = 255 ] && exit 255; echo "${STUB_RUN_OUT:-stub-run-ok}"; exit "${STUB_RUN_RC:-0}"
+    elif [ "$name" = RUN ]; then
+      rc_v=${STUB_RUN_RC:-0}; out_v=""; slp=0
+      if [ "$host" = hetzner ]; then rc_v=${STUB_RUN_RC_NODE:-$rc_v}; out_v=${STUB_RUN_OUT_NODE:-}; slp=${STUB_RUN_SLEEP_NODE:-0}
+      else rc_v=${STUB_RUN_RC_MBP:-$rc_v}; out_v=${STUB_RUN_OUT_MBP:-}; slp=${STUB_RUN_SLEEP_MBP:-0}; fi
+      [ "$rc_v" = 255 ] && exit 255
+      [ "$slp" = 0 ] || sleep "$slp"
+      if [ -n "$out_v" ]; then printf '%b\n' "$out_v"; else echo "${STUB_RUN_OUT:-stub-run-ok}"; fi
+      exit "$rc_v"
     else echo "stub-exec-ok"; exit "${STUB_RUN_RC:-0}"; fi ;;
-  DIRECT) echo "DIRECT:$args" >> "$STUB_LOG"; [ -z "${STUB_DIRECT_OUT:-}" ] || echo "$STUB_DIRECT_OUT"; exit "${STUB_DIRECT_RC:-0}" ;;
+  DIRECT)
+    echo "DIRECT:$args" >> "$STUB_LOG"
+    [ -z "${STUB_DIRECT_OUT:-}" ] || echo "$STUB_DIRECT_OUT"; exit "${STUB_DIRECT_RC:-0}" ;;
 esac
 exit 0
 EOF
 cat > "$T/bin/rsync" <<'EOF'
 #!/usr/bin/env bash
 echo "RSYNC:$*" >> "$STUB_LOG"
+# o rsync real (openrsync) procura `rsync` no PATH para subir o processo servidor local: ESTE stub. O filho `--server` vai direto ao binário de verdade.
+case "$*" in --server*) exec "$REAL_RSYNC" "$@" ;; esac
 case "$*" in *gt-remote/bin*) [ "${STUB_RSYNC_FAIL_BIN:-0}" = 1 ] && exit 1 ;; esac   # só a cópia de ferramentas para ~/gt-remote/bin
+# STUB_RSYNC_REAL=1: roda o rsync DE VERDADE com os argumentos que o mbp-run montou (filtro incluso), com o destino remoto trocado por uma pasta do "nó"
+# ($STUB_HOME/<caminho>) e o -e/ssh descartado. É assim que o teste de vazamento vê o que o filtro realmente deixa sair.
+if [ "${STUB_RSYNC_REAL:-0}" = 1 ]; then
+  case "${!#}" in hetzner-teste:*) ;; *) exit "${STUB_RSYNC_RC:-0}" ;; esac   # o lado do MBP continua enlatado (ele recebe a árvore maior por desenho)
+  a=(); skip=0
+  for x in "$@"; do
+    if [ $skip -eq 1 ]; then skip=0; continue; fi
+    [ "$x" = -e ] && { skip=1; continue; }
+    a+=("$x")
+  done
+  last=$(( ${#a[@]} - 1 )); dest="${a[$last]}"
+  case "$dest" in *:*) dest="$STUB_HOME/${dest#*:}" ;; esac
+  a[$last]="$dest"; mkdir -p "$dest"
+  "$REAL_RSYNC" "${a[@]}"; exit $?
+fi
 exit "${STUB_RSYNC_RC:-0}"
 EOF
 
@@ -137,6 +194,27 @@ cat > "$T/fake/sleep" <<'EOF'
 #!/usr/bin/env bash
 if [ "${STUB_REAL_SLEEP:-0}" = 1 ]; then exec /bin/sleep "$@"; fi
 echo "SLEEP:$*" >> "$STUB_LOG"
+# nó Linux: entre as duas leituras do swap o "SwapFree" muda (STUB_N_SWAPFREE2_MB), para testar o crescimento
+if [ -n "${STUB_PROCDIR:-}" ] && [ -n "${STUB_N_SWAPFREE2_MB:-}" ] && [ -f "$STUB_PROCDIR/meminfo" ]; then
+  sed -i.bak "s/^SwapFree:.*/SwapFree:       $(( STUB_N_SWAPFREE2_MB * 1024 )) kB/" "$STUB_PROCDIR/meminfo"; rm -f "$STUB_PROCDIR/meminfo.bak"
+fi
+EOF
+# ferramentas falsas do NÓ LINUX (só o preflight dele as enxerga): nproc/getconf (núcleos), df (disco livre)
+cat > "$T/fake/nproc" <<'EOF'
+#!/usr/bin/env bash
+[ "${STUB_N_NPROC_FAIL:-0}" = 1 ] && exit 1
+echo "${STUB_N_NPROC:-16}"
+EOF
+cat > "$T/fake/getconf" <<'EOF'
+#!/usr/bin/env bash
+[ "${STUB_N_NPROC_FAIL:-0}" = 1 ] && exit 1
+exec /usr/bin/getconf "$@"
+EOF
+cat > "$T/fake/df" <<'EOF'
+#!/usr/bin/env bash
+[ "${STUB_N_DISK_FAIL:-0}" = 1 ] && exit 1
+[ -n "${STUB_N_DISK_RAW:-}" ] && { printf '%b\n' "$STUB_N_DISK_RAW"; exit 0; }
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 300000000 8000000 %s 3%% /\n' "$(( ${STUB_N_DISK_MB:-280000} * 1024 ))"
 EOF
 # ioreg falso, no formato REAL (medido no MBP em 12/10: dict raiz com IOConsoleUsers[ {CGSSessionScreenIsLocked, kCGSSessionOnConsoleKey, ...} ];
 # a marca de bloqueio só existe com a tela bloqueada). Estado: env STUB_LOCKED/STUB_IDLE_S, ou o arquivo STUB_STATE_FILE (muda no meio da execução).
@@ -221,6 +299,9 @@ exit "${STUB_RUN_RC:-0}"
 EOF
 chmod +x "$T/bin/ssh" "$T/bin/rsync" "$T/fake/"* "$T/home/gt-remote/venv/bin/python"
 
+# nó Linux: o rsync de verdade (para o teste de vazamento) e a raiz do /proc falso do preflight dele
+REAL_RSYNC=$(PATH=/usr/bin:/bin:/opt/homebrew/bin command -v rsync)
+export REAL_RSYNC STUB_PROCDIR="$T/proc"
 unset MBP_MAX_SWAP_MB MBP_MAX_SWAP_GROWTH_MB MBP_SWAP_SAMPLE_S MBP_MAX_PRESSURE_LEVEL MBP_MIN_AVAIL_MB MBP_MIN_BATT MBP_MAX_SLOTS MBP_SLOT_MAX_AGE_S MBP_RUN_TIMEOUT_S MBP_HOST
 export PATH="$T/bin:$PATH" MBP_CITY="$T/city" MBP_SSH="$T/bin/ssh" MBP_RSYNC="$T/bin/rsync"
 export STUB_LOG="$T/stub.log" STUB_REAPED="$T/reaped" STUB_SWAPCNT="$T/swapcnt" FAKE="$T/fake" STUB_HOME="$T/home" STUB_SEEN="$T/seen-info" STUB_STATE_FILE="$T/presence.state"
@@ -231,6 +312,10 @@ J="$T/city/.gc/logs/mbp-run.jsonl"
 fails=0; n=0
 reset() { : > "$STUB_LOG"; rm -f "$STUB_REAPED" "$J" "$STUB_STATE_FILE" "$STUB_SEEN" "$FLAG_PAUSE" "$T/home/gt-remote/PAUSE"; mkdir -p "$T/home/gt-remote/slots"; find "$T/home/gt-remote/slots" -mindepth 1 -delete 2>/dev/null
   unset STUB_LOCKED STUB_IDLE_S STUB_HOLD STUB_ASSERT_FAIL STUB_ASSERT_RAW STUB_NCPU STUB_NCPU_FAIL STUB_RSYNC_FAIL_BIN STUB_WAIT_RENICE STUB_RUNMODE STUB_RUN_SLEEP STUB_FLIP_STATE STUB_FLIP_PAUSE STUB_DIRECT_OUT STUB_DIRECT_RC STUB_REAL_SLEEP MBP_FORCE_PRESENCE MBP_MAX_SLOTS MBP_USE_SLOTS MBP_SLOT_MEM_MB MBP_AWAY_IDLE_S MBP_WATCH_S PRESENCE_FORCE_USO PRESENCE_AWAY_S
+  rm -f "$T/city/.gc/hetzner-node.on" "$T"/last-script-*-hetzner.sh "$T"/last-script-*-mbp.sh
+  unset STUB_UNREACHABLE_NODE STUB_UNREACHABLE_MBP STUB_PF_RAW_NODE STUB_NOBASE_NODE STUB_NOVENV_NODE STUB_RUN_RC_NODE STUB_RUN_RC_MBP STUB_RUN_OUT_NODE STUB_RUN_OUT_MBP STUB_RUN_SLEEP_NODE STUB_RUN_SLEEP_MBP \
+    STUB_N_MEMINFO_RAW STUB_N_AVAIL_MB STUB_N_SWAPTOTAL_MB STUB_N_SWAPFREE_MB STUB_N_SWAPFREE2_MB STUB_N_PSI_MISSING STUB_N_PSI_RAW STUB_N_PSI_SOME STUB_N_PSI_FULL STUB_N_NPROC STUB_N_NPROC_FAIL STUB_N_DISK_MB STUB_N_DISK_FAIL STUB_N_DISK_RAW \
+    STUB_RSYNC_REAL HETZNER_XDIST_OFF HETZNER_XDIST_MIN_TESTS HETZNER_RSYNC_FILTER HETZNER_MAX_SLOTS HETZNER_SHADOW_WAIT_S HETZNER_SHADOW_WINDOW_S HETZNER_MIN_DISK_MB HETZNER_NODE_HOST MBP_RUN_SHADOW
   unset STUB_UNREACHABLE STUB_AVAIL_MB STUB_SWAP_MB STUB_SWAP2_MB STUB_SWAP_RAW STUB_SWAP2_RAW STUB_PRESSURE STUB_PRESSURE_FAIL STUB_VM_FAIL STUB_VM_DROP STUB_PAGE_SIZE STUB_COMP_PAGES STUB_MP_FAIL STUB_MP_PCT STUB_PF_RAW STUB_POWER STUB_BATT STUB_PMSET_FAIL STUB_PMSET_RAW STUB_SLOTS STUB_NOBASE STUB_RUN_RC STUB_RUN_OUT STUB_RSYNC_RC; }
 expect() { # nome rc_esperado rc_real [grep-no-log padrão]
   n=$((n+1))
@@ -240,10 +325,10 @@ eq() { # nome esperado real
   n=$((n+1)); if [ "$2" = "$3" ]; then echo "ok   $1 ($3)"; else echo "FAIL $1: esperado '$2', veio '$3'"; fails=$((fails+1)); fi
 }
 has() { # nome arquivo padrão
-  n=$((n+1)); if grep -q -E "$3" "$2"; then echo "ok   $1"; else echo "FAIL $1: '$3' ausente em $2"; fails=$((fails+1)); fi
+  n=$((n+1)); if grep -q -E -e "$3" "$2"; then echo "ok   $1"; else echo "FAIL $1: '$3' ausente em $2"; fails=$((fails+1)); fi
 }
 hasnt() {
-  n=$((n+1)); if grep -q -E "$3" "$2"; then echo "FAIL $1: '$3' presente em $2"; fails=$((fails+1)); else echo "ok   $1"; fi
+  n=$((n+1)); if grep -q -E -e "$3" "$2"; then echo "FAIL $1: '$3' presente em $2"; fails=$((fails+1)); else echo "ok   $1"; fi
 }
 run() { "$RUN" --repo wa --dir "$T/wt" "$@" >"$T/out" 2>"$T/err"; echo $?; }
 chk() { "$RUN" --check >"$T/out" 2>"$T/err"; echo $?; }
@@ -615,11 +700,154 @@ neg_presenca() {
   mut_compare "run: teto pela RAM" 2 sm_cap_mem "$RUN" 's/\[ "\$mem" -ge "\$cpu" \] || cpu=\$mem/true/' "$T/mut.sh"
 }
 
+# ---- O NÓ LINUX (ga-zri39b) ------------------------------------------------------------------------------------------------------
+# O ssh stub reconhece o host pelo argumento (hetzner-teste = nó, o resto = MBP) e grava HOSTCALL:<host>:<NOME> no log; o preflight do nó roda DE VERDADE contra um /proc falso
+# ($STUB_PROCDIR, gerado a partir de STUB_N_*); o rsync pode rodar de verdade (STUB_RSYNC_REAL=1) para o teste de vazamento. Nada toca o servidor nem o live.
+NODEFLAG="$T/city/.gc/hetzner-node.on"
+nrun() { "$RUN" --host linux --repo wa --dir "$T/wt" -- "$@" >"$T/out" 2>"$T/err"; echo $?; }       # só o nó (sem cadeia)
+pfv() { "$RUN" --host linux --check 2>/dev/null | sed -n "s/^$1=//p"; }
+# "rc:motivo" de uma execução SÓ no nó (a última recusa do log); a bandeira do nó tem de estar ligada
+outcome_n() { local rc r; rm -f "$J"; "$RUN" --host linux --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>&1; rc=$?
+  r=$(grep '"mode":"preflight"' "$J" 2>/dev/null | tail -1 | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p'); echo "$rc:${r:--}"; }
+lastscript() { cat "$T/last-script-$1-$2.sh" 2>/dev/null; }     # conteúdo do script remoto que o mbp-run mandou: NOME host
+lsf() { echo "$T/last-script-$1-$2.sh"; }                          # o CAMINHO desse script (has/hasnt leem arquivo)
+ok() { n=$((n+1)); echo "ok   $1"; }
+bad() { n=$((n+1)); echo "FAIL $1"; fails=$((fails+1)); }
+LEAKS="x.duckdb lib/leak.duckdb tests/fixtures/y.duckdb tests/y.db .env lib/.env.pdpj contacts_auth/client_secret.json data/a.txt viewer/data/b.py shared/logs/a.out logs/l.txt lib/x.csv tests/z.csv lib/k.pem lib/t.parquet lib/b.gz lib/c.pkl .gc/state"
+
+node_cases() {
+echo "--- nó Linux de testes (ga-zri39b)"
+local rc out f
+reset; date > "$FLAG"
+
+# ===== a cadeia nó -> MBP -> local =====
+reset; rc=$(run -- tests/test_x.py); expect "nó desligado (sem a bandeira): roda no MBP como sempre" 0 "$rc"
+hasnt "nó desligado: nenhuma chamada ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; has "nó desligado: o log marca host=mbp" "$J" '"host":"mbp"'; hasnt "nó desligado: o log não cita hetzner" "$J" 'hetzner'
+reset; date > "$NODEFLAG"; rc=$(run -- tests/test_x.py); expect "nó ligado e saudável: roda" 0 "$rc"
+has "roda no nó: log host=hetzner" "$J" '"mode":"pytest".*"host":"hetzner"'; hasnt "…e não toca o MBP" "$STUB_LOG" 'HOSTCALL:mbp'; has "diz onde rodou" "$T/err" 'rodou em hetzner \(nó Linux\)'
+has "o preflight do nó tem presença livre no slot" "$J" '"presence":"livre"'
+reset; date > "$NODEFLAG"; rc=$(STUB_RUN_RC_NODE=3 run -- tests/test_x.py); expect "o rc do pytest no nó é propagado (3)" 3 "$rc"; has "…e logado" "$J" '"rc":3.*"host":"hetzner"'; hasnt "…sem tentar o MBP" "$STUB_LOG" 'HOSTCALL:mbp'
+reset; date > "$NODEFLAG"; rc=$(STUB_UNREACHABLE_NODE=1 run -- tests/test_x.py); expect "nó inalcançável: cai no MBP e roda" 0 "$rc"
+has "nó inalcançável: recusa do nó no log, com motivo e host" "$J" '"mode":"preflight".*"reason":"inalcancavel".*"host":"hetzner"'; has "…e a execução é do MBP" "$J" '"mode":"pytest".*"host":"mbp"'
+has "avisa que tentou o MBP" "$T/err" 'o nó Linux não rodou \(rc=98\) — tentando o MBP'; has "mensagem fala do nó, não do MBP" "$T/err" 'nó Linux inalcançável'
+reset; date > "$NODEFLAG"; rc=$(STUB_N_AVAIL_MB=1000 run -- tests/test_x.py); expect "nó sem RAM: cai no MBP" 0 "$rc"; has "motivo ram no host hetzner" "$J" '"reason":"ram".*"host":"hetzner"'; has "mensagem fala do nó" "$T/err" 'nó Linux sem RAM livre'
+reset; date > "$NODEFLAG"; rc=$(STUB_UNREACHABLE=1 run -- tests/test_x.py); expect "nó E MBP fora: 98 (quem chamou roda local)" 98 "$rc"
+reset; date > "$NODEFLAG"; rm -f "$FLAG"; rc=$(run -- tests/test_x.py); expect "MBP desligado mas nó ligado: roda no nó" 0 "$rc"; has "…host=hetzner" "$J" '"host":"hetzner"'
+reset; date > "$NODEFLAG"; rm -f "$FLAG"; rc=$(STUB_UNREACHABLE_NODE=1 run -- tests/test_x.py); expect "nó fora e MBP desligado: 99" 99 "$rc"
+date > "$FLAG"
+reset; date > "$NODEFLAG"; echo "origem=painel desde=hoje" > "$FLAG_PAUSE"; rc=$(run -- tests/test_x.py); expect "pausa do Athos (é do notebook dele) NÃO vale para o nó" 0 "$rc"; has "…roda no nó" "$J" '"host":"hetzner"'
+reset; date > "$NODEFLAG"; echo "origem=painel desde=hoje" > "$FLAG_PAUSE"; rc=$(STUB_UNREACHABLE_NODE=1 run -- tests/test_x.py); expect "nó fora e MBP pausado: 99" 99 "$rc"
+reset; date > "$NODEFLAG"; rc=$("$RUN" --repo ps --dir "$T/wt" -- tests/test_x.py >/dev/null 2>&1; echo $?); expect "repo ps: o nó só tem o wa, roda no MBP" 0 "$rc"
+hasnt "ps: nenhuma chamada ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; hasnt "ps: não grava recusa do nó (não é recusa)" "$J" '"host":"hetzner"'
+reset; date > "$NODEFLAG"; printf '#!/usr/bin/env bash\necho x\n' > "$T/bin/fakecmd"; chmod +x "$T/bin/fakecmd"; "$RUN" --exec -- "$T/bin/fakecmd" >"$T/out" 2>"$T/err"; expect "--exec com o nó ligado: segue no MBP" 0 "$?"; hasnt "--exec nunca vai ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'
+reset; date > "$NODEFLAG"; "$RUN" --host linux --exec -- "$T/bin/fakecmd" >"$T/out" 2>"$T/err"; expect "--host linux --exec: 97" 97 "$?"
+reset; "$RUN" --host foo --repo wa --dir "$T/wt" -- tests/test_x.py >"$T/out" 2>"$T/err"; expect "--host inválido: 97" 97 "$?"
+reset; rc=$(nrun tests/test_x.py); expect "--host linux com a bandeira do nó desligada: 99" 99 "$rc"; hasnt "…sem chamar ninguém" "$STUB_LOG" 'HOSTCALL'
+reset; date > "$NODEFLAG"; rc=$(STUB_UNREACHABLE_NODE=1 nrun tests/test_x.py); expect "--host linux com o nó fora: 98, SEM cair no MBP" 98 "$rc"; hasnt "…o MBP não é chamado" "$STUB_LOG" 'HOSTCALL:mbp'
+reset; date > "$NODEFLAG"; rc=$(STUB_NOBASE_NODE=1 run -- tests/test_x.py); expect "base ausente no nó: cai no MBP" 0 "$rc"; has "motivo sem-base no host hetzner" "$J" '"reason":"sem-base".*"host":"hetzner"'; has "diz como semear o nó" "$T/err" '--host linux --seed wa'
+reset; date > "$NODEFLAG"; rc=$(STUB_NOVENV_NODE=1 run -- tests/test_x.py); expect "venv ausente no nó: cai no MBP" 0 "$rc"; has "motivo sem-venv" "$J" '"reason":"sem-venv".*"host":"hetzner"'
+reset; date > "$NODEFLAG"; rc=$(STUB_RUN_RC_NODE=255 run -- tests/test_x.py); expect "ssh cai NO MEIO da execução no nó: cai no MBP e roda" 0 "$rc"; has "…a queda é logada com host=hetzner rc=255" "$J" '"rc":255.*"host":"hetzner"'; has "…e o MBP rodou" "$J" '"rc":0.*"host":"mbp"'
+reset; date > "$NODEFLAG"; for i in 1 2 3 4 5 6; do mkslot $i; done; rc=$(STUB_SLOTS=exec run -- tests/test_x.py); expect "slots do nó cheios (teto 6): cai no MBP" 0 "$rc"; has "motivo slots no host hetzner" "$J" '"reason":"slots".*"host":"hetzner"'
+reset; date > "$NODEFLAG"; capn=$(HETZNER_MAX_SLOTS=2 "$RUN" --host linux --check 2>/dev/null | sed -n 's/^slot_cap=//p'); eq "teto de slots do nó configurável (HETZNER_MAX_SLOTS=2)" 2 "$capn"
+eq "teto de slots do nó: padrão 6 (a RAM de 24 GB não limita)" 6 "$(pfv slot_cap)"
+eq "teto de slots do nó limitado pela RAM de agora (3840 MB → 2)" 2 "$(STUB_N_AVAIL_MB=3840 pfv slot_cap)"
+eq "…e por um mínimo de 1" 1 "$(STUB_N_AVAIL_MB=3072 pfv slot_cap)"
+
+# ===== preflight do nó, lido de /proc =====
+reset; rc=$("$RUN" --host linux --check >"$T/out" 2>"$T/err"; echo $?); expect "--host linux --check saudável" 0 "$rc"
+has "check: avail_mb vem do MemAvailable" "$T/out" '^avail_mb=24000$'; has "check: pressão PSI normal = 1" "$T/out" '^pressure=1$'; has "check: presença sempre livre" "$T/out" '^presence=livre$'
+has "check: o porquê é 'dedicada'" "$T/out" '^presence_why=dedicada$'; has "check: nunca pausado" "$T/out" '^paused=0$'; has "check: sem bateria (power=ac)" "$T/out" '^power=ac$'
+has "check: núcleos" "$T/out" '^ncpu=16$'; has "check: disco livre" "$T/out" '^disk_mb=280000$'
+has "check: swap 0 é leitura válida (sem swap)" "$T/out" '^swap_mb=0$'; has "check: delta do swap 0" "$T/out" '^swap_delta_mb=0$'
+has "check: a bandeira do nó" "$T/out" '^node_flag=off$'; has "check: filtro conferido" "$T/out" '^node_filter_ok=1$'
+eq "PSI some=9.99 full=0.99 → 1" 1 "$(STUB_N_PSI_SOME=9.99 STUB_N_PSI_FULL=0.99 pfv pressure)"
+eq "PSI some=10.00 → 2 (fronteira)" 2 "$(STUB_N_PSI_SOME=10.00 pfv pressure)"
+eq "PSI full=1.00 → 2 (fronteira)" 2 "$(STUB_N_PSI_FULL=1.00 pfv pressure)"
+eq "PSI some=39.99 → 2" 2 "$(STUB_N_PSI_SOME=39.99 pfv pressure)"
+eq "PSI some=40.00 → 4 (crítico)" 4 "$(STUB_N_PSI_SOME=40.00 pfv pressure)"
+eq "PSI full=10.00 → 4" 4 "$(STUB_N_PSI_FULL=10.00 pfv pressure)"
+eq "PSI ilegível (lixo) → pressure vazio, NUNCA 1" "" "$(STUB_N_PSI_RAW='garbage' pfv pressure)"
+eq "PSI sem a linha 'full' → vazio" "" "$(STUB_N_PSI_RAW='some avg10=0.00 avg60=0.00 avg300=0.00 total=1' pfv pressure)"
+eq "PSI avg10 com formato estranho → vazio" "" "$(STUB_N_PSI_RAW='some avg10=abc\nfull avg10=0.00' pfv pressure)"
+eq "PSI ausente (kernel sem PSI) → vazio" "" "$(STUB_N_PSI_MISSING=1 pfv pressure)"
+date > "$NODEFLAG"
+eq "pressão 2 recusa (mesmo critério do MBP)" "98:pressao" "$(STUB_N_PSI_SOME=12 outcome_n)"; eq "pressão 4 recusa" "98:pressao" "$(STUB_N_PSI_SOME=45 outcome_n)"
+eq "pressão ilegível recusa com motivo próprio" "98:ilegivel:pressure" "$(STUB_N_PSI_RAW=garbage outcome_n)"; eq "PSI ausente recusa com motivo próprio" "98:ilegivel:pressure" "$(STUB_N_PSI_MISSING=1 outcome_n)"
+eq "MemAvailable ausente → vazio, recusa 'ilegivel:avail'" "98:ilegivel:avail" "$(STUB_N_MEMINFO_RAW='MemTotal:       32000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB' outcome_n)"
+eq "MemAvailable em unidade que não é kB → ilegível" "98:ilegivel:avail" "$(STUB_N_MEMINFO_RAW='MemAvailable: 24000 MB\nSwapTotal: 0 kB\nSwapFree: 0 kB' outcome_n)"
+eq "RAM baixa recusa" "98:ram" "$(STUB_N_AVAIL_MB=2000 outcome_n)"
+eq "sem as linhas de swap → delta ilegível (não 0)" "98:ilegivel:swap_delta" "$(STUB_N_MEMINFO_RAW='MemAvailable: 24576000 kB' outcome_n)"
+eq "SwapFree maior que SwapTotal → ilegível" "98:ilegivel:swap_delta" "$(STUB_N_MEMINFO_RAW='MemAvailable: 24576000 kB\nSwapTotal: 1000 kB\nSwapFree: 2000 kB' outcome_n)"
+eq "swap CRESCENDO 500 MB entre as leituras recusa" "98:swap_cresce" "$(STUB_N_SWAPTOTAL_MB=8000 STUB_N_SWAPFREE_MB=7000 STUB_N_SWAPFREE2_MB=6500 outcome_n)"
+eq "swap crescendo 128 MB (fronteira) passa" "0:-" "$(STUB_N_SWAPTOTAL_MB=8000 STUB_N_SWAPFREE_MB=7000 STUB_N_SWAPFREE2_MB=6872 outcome_n)"
+eq "swap alto mas PARADO passa" "0:-" "$(STUB_N_SWAPTOTAL_MB=8000 STUB_N_SWAPFREE_MB=1000 STUB_N_SWAPFREE2_MB=1000 outcome_n)"
+eq "swap usado no teto (8192 MB) recusa" "98:swap_teto" "$(STUB_N_SWAPTOTAL_MB=9000 STUB_N_SWAPFREE_MB=500 STUB_N_SWAPFREE2_MB=500 outcome_n)"
+eq "disco livre baixo (1000 MB) recusa" "98:disco" "$(STUB_N_DISK_MB=1000 outcome_n)"; eq "disco no mínimo (2048) passa" "0:-" "$(STUB_N_DISK_MB=2048 outcome_n)"
+eq "disco ilegível recusa com motivo próprio" "98:ilegivel:disk" "$(STUB_N_DISK_FAIL=1 outcome_n)"; eq "df com formato estranho → ilegível" "98:ilegivel:disk" "$(STUB_N_DISK_RAW='nada' outcome_n)"
+eq "núcleos ilegíveis: ncpu vazio (e a bateria ainda roda)" "" "$(STUB_N_NPROC_FAIL=1 pfv ncpu)"; eq "…rodando" "0:-" "$(STUB_N_NPROC_FAIL=1 outcome_n)"
+rm -f "$NODEFLAG"
+
+# ===== segurança: o filtro =====
+reset; date > "$NODEFLAG"; rc=$(run -- tests/test_x.py); has "filtro de verdade (o do repositório) vale: roda no nó" "$J" '"host":"hetzner"'
+printf '%s\n' '+ /tests/***' '- .env' '- client_secret*.json' '- *.duckdb*' '- *.db' '- *.csv' '- *.parquet' '- *.gz' > "$T/unsafe-filter"
+reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/unsafe-filter" run -- tests/test_x.py); expect "filtro com + /tests/*** ANTES das regras de dado: o nó NÃO é usado, cai no MBP" 0 "$rc"
+hasnt "…nenhum rsync ao nó" "$STUB_LOG" 'RSYNC:.*hetzner-teste'; hasnt "…nenhuma chamada ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'; has "…motivo no log" "$J" '"reason":"filtro-invalido".*"host":"hetzner"'; has "…mensagem explica a ordem" "$T/err" 'ordem de segurança'
+reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/nao-existe" run -- tests/test_x.py); expect "filtro ausente: o nó NÃO é usado" 0 "$rc"; has "…motivo filtro-invalido" "$J" '"reason":"filtro-invalido"'; hasnt "…nenhuma chamada ao nó" "$STUB_LOG" 'HOSTCALL:hetzner'
+: > "$T/empty-filter"; reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/empty-filter" run -- tests/test_x.py); has "filtro vazio: o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'
+grep -v -F -x -e '- *.parquet' "$HERE/hetzner-rsync-filter.wa.txt" > "$T/missing-rule-filter"; reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/missing-rule-filter" run -- tests/test_x.py); has "filtro SEM uma das regras de dado (parquet): o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'
+grep -v -F -x -e '+ /tests/***' "$HERE/hetzner-rsync-filter.wa.txt" > "$T/notests-filter"; reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/notests-filter" run -- tests/test_x.py); has "filtro sem a regra de tests/: o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'
+# o rsync do nó usa o filtro, com --delete-excluded, e o ssh reaproveita a conexão
+reset; date > "$NODEFLAG"; run -- tests/test_x.py >/dev/null; has "rsync do nó: --filter com o arquivo do repositório" "$STUB_LOG" 'RSYNC:.*--filter=\. .*hetzner-rsync-filter\.wa\.txt'; has "rsync do nó: --delete-excluded" "$STUB_LOG" 'RSYNC:.*--delete --delete-excluded'
+has "rsync do nó: destino é o espelho do slot" "$STUB_LOG" 'RSYNC:.* hetzner-teste:gt-remote/mirror/wa-1/'; hasnt "rsync do nó: NÃO usa a lista de exclusões do MBP" "$STUB_LOG" 'RSYNC:.*hetzner-teste.*--exclude'
+has "ssh do nó: conexão reaproveitada (ControlPersist=600)" "$STUB_LOG" 'RSYNC:.*ControlPersist=600.*hetzner-teste'; has "ssh do nó: ControlMaster=auto" "$STUB_LOG" 'RSYNC:.*ControlMaster=auto.*hetzner-teste'
+reset; run -- tests/test_x.py >/dev/null; hasnt "rsync do MBP: SEM --delete-excluded (como sempre)" "$STUB_LOG" 'RSYNC:.*--delete-excluded'; has "rsync do MBP: ControlPersist=60 (não mudou)" "$STUB_LOG" 'RSYNC:.*ControlPersist=60 '
+reset; date > "$NODEFLAG"; HETZNER_SSH_PERSIST_S=90 run -- tests/test_x.py >/dev/null; has "persistência do ssh do nó configurável" "$STUB_LOG" 'RSYNC:.*ControlPersist=90.*hetzner-teste'
+# espelho: cópia do Linux x clone APFS do macOS
+reset; date > "$NODEFLAG"; run -- tests/test_x.py >/dev/null; has "espelho do nó: cp -a --reflink=auto" "$(lsf MIRROR hetzner)" 'cp -a --reflink=auto'; hasnt "espelho do nó: sem o clone APFS" "$(lsf MIRROR hetzner)" 'cp -cR'
+has "espelho do nó: confere o venv antes" "$(lsf MIRROR hetzner)" 'gt-remote/venv-wa/bin/python'; has "espelho do nó: base wa-base" "$(lsf MIRROR hetzner)" 'gt-remote/wa-base'
+reset; run -- tests/test_x.py >/dev/null; has "espelho do MBP: clone APFS (cp -cR), como sempre" "$(lsf MIRROR mbp)" 'cp -cR'; hasnt "espelho do MBP: sem --reflink" "$(lsf MIRROR mbp)" 'reflink'
+reset; date > "$NODEFLAG"; run -- tests/test_x.py >/dev/null; has "job do nó: PATH com ~/.local/bin (uv)" "$(lsf RUN hetzner)" 'export PATH="\$HOME/.local/bin:\$PATH"'; has "job do nó: o python é o venv-wa" "$(lsf RUN hetzner)" 'gt-remote/venv-wa/bin/python'
+has "job do nó: nice (o taskpolicy do macOS não existe lá)" "$(lsf RUN hetzner)" 'nice -n'; hasnt "job do nó: sem a biblioteca de presença do macOS (ioreg)" "$(lsf RUN hetzner)" 'ioreg'
+has "job do nó: presença dedicada/livre" "$(lsf RUN hetzner)" 'PR_WHY=dedicada'
+reset; run -- tests/test_x.py >/dev/null; has "job do MBP: PATH do Homebrew (como sempre)" "$(lsf RUN mbp)" '/opt/homebrew/bin'; has "job do MBP: a biblioteca de presença" "$(lsf RUN mbp)" 'ioreg'
+
+# ===== SEGURANÇA, de verdade: o rsync REAL com os argumentos do mbp-run, contra uma árvore com dado e segredo plantados =====
+WTD="$T/wtd"; mkdir -p "$WTD/tests/fixtures" "$WTD/tests/data" "$WTD/lib" "$WTD/contacts_auth" "$WTD/data" "$WTD/viewer/data" "$WTD/shared/logs" "$WTD/logs" "$WTD/.gc"
+: > "$WTD/tests/test_x.py"; echo ok > "$WTD/tests/ok.json"; echo ok > "$WTD/tests/data/fixture.json"; echo ok > "$WTD/tests/fixtures/win.jsonl"; echo code > "$WTD/lib/a.py"; echo code > "$WTD/contacts_auth/server.py"
+for lk in $LEAKS; do mkdir -p "$WTD/$(dirname "$lk")"; echo secret > "$WTD/$lk"; done
+DEST="$T/home/gt-remote/mirror/wa-1"
+leakcheck() { # imprime os arquivos plantados que chegaram ao destino (vazio = nada vazou)
+  local lk got=""; for lk in $LEAKS; do [ -e "$DEST/$lk" ] && got="$got $lk"; done; printf '%s' "${got# }"; }
+reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; mkdir -p "$DEST/processo_lookup" "$DEST/shared/logs.backup"; echo old > "$DEST/processo_lookup/.env.pdpj"; echo old > "$DEST/shared/logs.backup/x.out"
+STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTD" -- tests/test_x.py >"$T/out" 2>"$T/err"; rc=$?; expect "rsync real: a bateria roda no nó" 0 "$rc"; has "…no nó" "$J" '"host":"hetzner"'
+eq "NADA de dado ou segredo plantado chegou ao nó (a lista abaixo tem de ser vazia)" "" "$(leakcheck)"
+for okf in lib/a.py tests/test_x.py tests/ok.json tests/data/fixture.json tests/fixtures/win.jsonl contacts_auth/server.py; do n=$((n+1)); if [ -f "$DEST/$okf" ]; then echo "ok   chegou (é código/fixture): $okf"; else echo "FAIL não chegou: $okf"; fails=$((fails+1)); fi; done
+n=$((n+1)); if [ ! -e "$DEST/processo_lookup/.env.pdpj" ] && [ ! -e "$DEST/shared/logs.backup/x.out" ]; then echo "ok   --delete-excluded limpa o que uma semeadura antiga deixou (.env.pdpj e shared/logs.backup/x.out)"; else echo "FAIL o destino manteve segredo/log antigo"; fails=$((fails+1)); fi
+MUT="$T/mutdir"; mkdir -p "$MUT"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt; do ln -sf "$HERE/$mf" "$MUT/$mf"; done
+# controle negativo 1: sem o --filter, o vazamento aparece — prova que o teste enxerga o defeito
+sed 's/--filter=". \$NODE_FILTER" //' "$RUN" > "$MUT/mut-nofilter.sh"; chmod +x "$MUT/mut-nofilter.sh"
+n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-nofilter.sh"; then echo "FAIL controle: o sed não mudou nada"; fails=$((fails+1)); else
+  reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; STUB_RSYNC_REAL=1 "$MUT/mut-nofilter.sh" --repo wa --dir "$WTD" -- tests/test_x.py >/dev/null 2>&1
+  lk=$(leakcheck); n=$((n+1)); if [ -n "$lk" ]; then echo "ok   controle: o mutante sem o filtro VAZA ($(printf '%s' "$lk" | wc -w | tr -d ' ') arquivos plantados chegaram)"; else echo "FAIL controle: o mutante sem filtro não vazou — o teste não enxerga o defeito"; fails=$((fails+1)); fi; fi
+# controle negativo 2: filtro com a ordem errada + a conferência de ordem removida → um *.duckdb DENTRO de tests/ chega
+sed 's/^  filter_sane || { NODE_WHY="filtro-invalido".*$/  true/' "$RUN" > "$MUT/mut-nosane.sh"; chmod +x "$MUT/mut-nosane.sh"
+n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-nosane.sh"; then echo "FAIL controle: o sed da conferência não mudou nada"; fails=$((fails+1)); else
+  reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; HETZNER_RSYNC_FILTER="$T/unsafe-filter" STUB_RSYNC_REAL=1 "$MUT/mut-nosane.sh" --repo wa --dir "$WTD" -- tests/test_x.py >/dev/null 2>&1
+  n=$((n+1)); if [ -e "$DEST/tests/fixtures/y.duckdb" ]; then echo "ok   controle: sem a conferência de ordem, o filtro do rascunho deixa passar tests/fixtures/y.duckdb"; else echo "FAIL controle: o filtro inseguro não vazou nada — o teste não enxerga o defeito"; fails=$((fails+1)); fi; fi
+reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; HETZNER_RSYNC_FILTER="$T/unsafe-filter" STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTD" -- tests/test_x.py >/dev/null 2>&1
+n=$((n+1)); if [ ! -e "$DEST/tests/fixtures/y.duckdb" ]; then echo "ok   o script real, com o filtro inseguro, não envia nada (a conferência de ordem barra)"; else echo "FAIL o script real enviou dado com o filtro inseguro"; fails=$((fails+1)); fi
+find "$DEST" -mindepth 1 -delete 2>/dev/null
+
+
+reset
+}
+
 if [ -n "${MBP_SELFTEST_ONLY:-}" ]; then
   date > "$FLAG"
   case "$MBP_SELFTEST_ONLY" in
     presenca) presenca_cases; neg_presenca ;;
     chave) chave_cases ;;
+    node) node_cases ;;
     *) echo "MBP_SELFTEST_ONLY desconhecido: $MBP_SELFTEST_ONLY" >&2; exit 2 ;;
   esac
   echo "---"; echo "$((n-fails))/$n ok"
@@ -784,7 +1012,7 @@ reset; mkdir -p "$(dirname "$J")" "$T/nojq"; l_run > "$J"; ln -sf "$(command -v 
 eq "contagem: jq ausente é 'ilegível', nunca 'nenhuma'" "ilegível" "$(PATH="$T/nojq" /bin/bash "$OFFLOAD" counts 2>&1)"
 
 # controle negativo: sem a checagem de flag o caso "off" PASSARIA a rodar — prova que o teste 1 enxerga o defeito
-reset; rm -f "$FLAG"; neg=$(sed 's/^\[ -f "\$FLAG" \] || {.*$/true/' "$RUN" > "$T/mut.sh"; chmod +x "$T/mut.sh"; "$T/mut.sh" --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>&1; echo $?)
+reset; rm -f "$FLAG"; neg=$(sed 's/^[[:space:]]*\[ -f "\$FLAG" \] || {.*$/true/' "$RUN" > "$T/mut.sh"; chmod +x "$T/mut.sh"; "$T/mut.sh" --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>&1; echo $?)
 n=$((n+1)); if [ "$neg" != 99 ]; then echo "ok   controle negativo (mutante sem a trava não sai 99: rc=$neg)"; else echo "FAIL controle negativo: o mutante ainda saiu 99"; fails=$((fails+1)); fi
 date > "$FLAG"
 
@@ -818,5 +1046,6 @@ if [ "${MBP_SELFTEST_SKIP:-}" != presenca ]; then
   presenca_cases; neg_presenca
   chave_cases
 fi
+node_cases
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

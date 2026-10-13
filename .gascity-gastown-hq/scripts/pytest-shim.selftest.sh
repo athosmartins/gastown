@@ -59,7 +59,8 @@ unset GC_PYTEST_SHIM GC_PYTEST_SHIM_ACTIVE GATE_PYTEST_PY GATE_PYTEST_LOG GATE_P
 LOGF="$T/city/.gc/logs/pytest-shim.jsonl"; GLOG="$T/city/.gc/logs/gate-pytest.jsonl"
 KEY="$T/city/.gc/mbp-offload.on"
 fails=0; n=0
-reset() { : > "$STUB_LOG"; rm -f "$LOGF" "$GLOG" "$T/city/.gc/mbp-offload.pause" "$T/city/.gc/pytest-shim.off"; touch "$KEY"
+NODEKEY="$T/city/.gc/hetzner-node.on"
+reset() { : > "$STUB_LOG"; rm -f "$LOGF" "$GLOG" "$T/city/.gc/mbp-offload.pause" "$T/city/.gc/pytest-shim.off" "$NODEKEY"; touch "$KEY"
   unset STUB_GATE_RC STUB_PY_RC STUB_PYTEST_RC STUB_PY_STDIN STUB_MBP_RC STUB_MBP_OUT GC_PYTEST_SHIM GC_PYTEST_SHIM_ACTIVE; unset PYTEST_SHIM_GATE; }
 expect() { n=$((n+1)); if [ "$2" = "$3" ]; then echo "ok   $1 (rc=$3)"; else echo "FAIL $1: esperado rc=$2, veio $3"; fails=$((fails+1)); fi; }
 has()   { n=$((n+1)); if grep -q -E -e "$3" "$2" 2>/dev/null; then echo "ok   $1"; else echo "FAIL $1: '$3' ausente em $2"; fails=$((fails+1)); fi; }
@@ -105,6 +106,12 @@ reset; use_gate_stub; rm -f "$KEY"; rc=$(STUB_PY_RC=2 run python3 -m pytest test
 hasnt "A6 chave off: gate não chamado" "$STUB_LOG" 'GATE_CALL'; has "A6 chave off: python de verdade com os MESMOS argumentos" "$STUB_LOG" 'arg:tests/test_a.py'; has "A6 chave off: o '-m pytest' continua" "$STUB_LOG" 'arg:pytest'
 has "A6 chave off: motivo no log" "$LOGF" '"src":"shim-pass".*"ran":"local".*"detail":"offload-desligado"'; has "A6 chave off: a sessão vai no log" "$LOGF" '"session":"selftest"'; hasnt "A6 chave off: nenhuma saída a mais" "$T/out" 'pytest-shim'
 reset; use_gate_stub; : > "$T/city/.gc/mbp-offload.pause"; rc=$(run pytest tests/test_a.py); expect "A6 pausa do Athos → comando de hoje" 0 "$rc"; hasnt "A6 pausa: gate não chamado" "$STUB_LOG" 'GATE_CALL'; has "A6 pausa: motivo" "$LOGF" 'offload-pausado'
+# A6n o nó Linux (ga-zri39b) tem a bandeira dele: ligada, o atalho desvia ao gate MESMO com o MBP desligado ou pausado (o mbp-run.sh decide a cadeia)
+reset; use_gate_stub; rm -f "$KEY"; touch "$NODEKEY"; rc=$(run pytest tests/test_a.py); expect "A6n nó ligado + mbp-offload.on ausente → vai ao gate" 0 "$rc"
+has "A6n nó ligado, MBP desligado: gate chamado" "$STUB_LOG" 'GATE_CALL'; hasnt "A6n nó ligado: sem linha de passe no log" "$LOGF" 'offload-desligado'
+reset; use_gate_stub; : > "$T/city/.gc/mbp-offload.pause"; touch "$NODEKEY"; rc=$(run pytest tests/test_a.py); expect "A6n nó ligado + MBP pausado → vai ao gate" 0 "$rc"
+has "A6n nó ligado, MBP pausado: gate chamado" "$STUB_LOG" 'GATE_CALL'; hasnt "A6n a pausa do MBP não vale para o nó" "$LOGF" 'offload-pausado'
+reset; use_gate_stub; rm -f "$KEY"; rc=$(run pytest tests/test_a.py); expect "A6n os dois desligados → comando de hoje" 0 "$rc"; hasnt "A6n os dois desligados: gate não chamado" "$STUB_LOG" 'GATE_CALL'; has "A6n os dois desligados: motivo" "$LOGF" 'offload-desligado'
 reset; use_gate_stub; touch "$T/city/.gc/pytest-shim.off"; rc=$(run pytest tests/test_a.py); expect "A6 chave pytest-shim.off → comando de hoje" 0 "$rc"; hasnt "A6 shim.off: gate não chamado" "$STUB_LOG" 'GATE_CALL'; has "A6 shim.off: motivo" "$LOGF" 'chave-pytest-shim-off'
 reset; use_gate_stub; rc=$(GC_PYTEST_SHIM=off run pytest tests/test_a.py); expect "A6 GC_PYTEST_SHIM=off → comando de hoje" 0 "$rc"; hasnt "A6 bypass: gate não chamado" "$STUB_LOG" 'GATE_CALL'; hasnt "A6 bypass: sem linha no log" "$LOGF" 'shim-pass'
 reset; use_gate_stub; rc=$(GC_PYTEST_SHIM_ACTIVE=1 run python3 -m pytest tests/test_a.py); expect "A6 execução aninhada → comando de hoje" 0 "$rc"; hasnt "A6 aninhada: gate não chamado" "$STUB_LOG" 'GATE_CALL'; hasnt "A6 aninhada: sem linha no log" "$LOGF" 'shim-pass'
@@ -194,6 +201,14 @@ caught() { n=$((n+1)); if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL 
 mutant m1 '/offload-desligado/d' && {
   reset; use_gate_stub; rm -f "$KEY"; rc=$(run_in "$T/mut/m1" "$T/wt" pytest tests/test_a.py); c=$(grep -c GATE_CALL "$STUB_LOG")
   caught "M1 sem a chave off o gate é chamado (o caso A6 reprova o mutante)" 1 "$c"; }
+# M1n sem a bandeira do nó no teste: com o MBP desligado e o nó ligado o gate NÃO seria chamado
+mutant m1n 's# || \[ \$NODE_ON -eq 1 \] # #' && {
+  reset; use_gate_stub; rm -f "$KEY"; touch "$NODEKEY"; rc=$(run_in "$T/mut/m1n" "$T/wt" pytest tests/test_a.py); c=$(grep -c GATE_CALL "$STUB_LOG")
+  caught "M1n sem a bandeira do nó o gate não é chamado (o caso A6n reprova o mutante)" 0 "$c"; }
+# M1p a pausa do MBP passa a valer para o nó também: com o nó ligado e o MBP pausado o gate NÃO seria chamado
+mutant m1p 's# \&\& \[ \$NODE_ON -eq 0 \] \&\& \[ -e "\$CITY/.gc/mbp-offload.pause" \]# \&\& [ -e "$CITY/.gc/mbp-offload.pause" ]#' && {
+  reset; use_gate_stub; : > "$T/city/.gc/mbp-offload.pause"; touch "$NODEKEY"; rc=$(run_in "$T/mut/m1p" "$T/wt" pytest tests/test_a.py); c=$(grep -c GATE_CALL "$STUB_LOG")
+  caught "M1p a pausa do MBP bloqueando o nó (o caso A6n reprova o mutante)" 0 "$c"; }
 # M2 rc engolido: `exec` trocado por chamada seguida de exit 0
 mutant m2 's#^exec /usr/bin/env bash "\$GATE" -- "\$@"#/usr/bin/env bash "$GATE" -- "$@"; exit 0#' && {
   reset; use_gate_stub; rc=$(STUB_GATE_RC=7 run_in "$T/mut/m2" "$T/wt" python3 -m pytest tests/test_a.py)

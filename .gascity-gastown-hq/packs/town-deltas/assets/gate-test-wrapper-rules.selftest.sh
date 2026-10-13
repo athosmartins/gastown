@@ -27,6 +27,11 @@ has() { if [[ "$2" == *"$1"* ]]; then echo 1; else echo 0; fi; }
 # 1 caminhos que NÃO imprimem nada
 out=$(gate_test_wrapper_rules ""); check "cidade vazia: nada" "$([ -z "$out" ] && echo 1 || echo 0)"
 out=$(gate_test_wrapper_rules "$C"); check "offload.on ausente: nada" "$([ -z "$out" ] && echo 1 || echo 0)"
+# o nó Linux (ga-zri39b) tem a bandeira dele: ligada sozinha já anuncia o wrapper (o mbp-run.sh decide a cadeia nó -> MBP -> aqui)
+touch "$C/.gc/hetzner-node.on"; out=$(gate_test_wrapper_rules "$C"); check "só hetzner-node.on ligado (sem mbp-offload.on): imprime" "$([ -n "$out" ] && echo 1 || echo 0)"
+check "só o nó ligado: o parágrafo cita o servidor Linux" "$(has "Linux test server" "$out")"
+touch "$C/.gc/gate-pytest.off"; out=$(gate_test_wrapper_rules "$C"); check "nó ligado + gate-pytest.off: nada" "$([ -z "$out" ] && echo 1 || echo 0)"; rm -f "$C/.gc/gate-pytest.off"
+rm -f "$C/.gc/hetzner-node.on"
 touch "$C/.gc/mbp-offload.on"
 touch "$C/.gc/gate-pytest.off"; out=$(gate_test_wrapper_rules "$C"); check "gate-pytest.off presente: nada" "$([ -z "$out" ] && echo 1 || echo 0)"
 rm -f "$C/.gc/gate-pytest.off"

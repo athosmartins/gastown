@@ -24,7 +24,8 @@
 #
 # QUANDO NÃO INTERCEPTA (roda o comando de hoje, sem nenhuma saída a mais):
 #   atalho já ativo (execução aninhada, ex.: um teste que chama python3 -m pytest) · GC_PYTEST_SHIM=off no comando · offload desligado
-#   (falta $CITY/.gc/mbp-offload.on) ou pausado ($CITY/.gc/mbp-offload.pause) · chave $CITY/.gc/pytest-shim.off · nenhum argumento que possa ser
+#   (faltam $CITY/.gc/mbp-offload.on E $CITY/.gc/hetzner-node.on) ou pausado ($CITY/.gc/mbp-offload.pause, e só se o nó Linux também estiver desligado) ·
+#   chave $CITY/.gc/pytest-shim.off · nenhum argumento que possa ser
 #   alvo de teste (`pytest`, `pytest --version`, `pytest -h`). O resto da decisão (MBP sem saúde, slots cheios, alvo que lê shared/data, flag que
 #   depende do disco daqui, diretório como alvo, suíte inteira) é do gate-pytest.sh, que cai em "rodar aqui" com o motivo.
 #
@@ -143,8 +144,11 @@ if [ "$SHIM_AS" != pytest ] && [ "$SKIP" -eq 0 ]; then run_real "$SHIM_AS" "$@";
 [ -n "${GC_PYTEST_SHIM_ACTIVE:-}" ] && run_real "$SHIM_AS" "$@"
 [ "${GC_PYTEST_SHIM:-}" = off ] && run_real "$SHIM_AS" "$@"
 PASS=""
-[ -f "$CITY/.gc/mbp-offload.on" ] || PASS="offload-desligado"
-[ -z "$PASS" ] && [ -e "$CITY/.gc/mbp-offload.pause" ] && PASS="offload-pausado"
+# O nó Linux de testes (ga-zri39b) tem a bandeira DELE: com ela ligada o atalho desvia mesmo com o MBP desligado ou pausado (a pausa é do notebook do Athos, o
+# nó é máquina dedicada). Quem decide a cadeia nó -> MBP -> aqui é o mbp-run.sh; se nenhum dos dois puder, o gate-pytest.sh roda aqui como sempre.
+NODE_ON=0; [ -f "$CITY/.gc/hetzner-node.on" ] && NODE_ON=1
+[ -f "$CITY/.gc/mbp-offload.on" ] || [ $NODE_ON -eq 1 ] || PASS="offload-desligado"
+[ -z "$PASS" ] && [ $NODE_ON -eq 0 ] && [ -e "$CITY/.gc/mbp-offload.pause" ] && PASS="offload-pausado"
 [ -z "$PASS" ] && [ -f "$CITY/.gc/pytest-shim.off" ] && PASS="chave-pytest-shim-off"
 if [ -z "$PASS" ]; then
   # alvo possível = algum argumento do pytest que não começa com `-`; sem nenhum (`pytest`, `--version`, `-h`) não há o que mandar ao MBP

@@ -63,7 +63,7 @@ log "Live-city switches drive the real prompt paragraph..."
 # shellcheck disable=SC1090
 ( . "$TASKLIB" || exit 3
   live=$(gate_test_wrapper_rules "$CITY")
-  if [[ -f "$CITY/.gc/mbp-offload.on" && ! -f "$CITY/.gc/gate-pytest.off" ]]; then
+  if [[ ( -f "$CITY/.gc/mbp-offload.on" || -f "$CITY/.gc/hetzner-node.on" ) && ! -f "$CITY/.gc/gate-pytest.off" ]]; then
     [[ -n "$live" ]] || { echo "offload ON and no gate-pytest.off, yet the paragraph is empty" >&2; exit 1; }
     echo "  switches ON  -> paragraph present ✓"
   else

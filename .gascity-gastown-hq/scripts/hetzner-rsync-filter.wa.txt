@@ -1,0 +1,79 @@
+# hetzner-rsync-filter.wa.txt — o QUE sai do mini para o nó Linux de testes (Hetzner). Só código + tests/. (ga-zri39b)
+#
+# Contents
+#   Como é lido · Seção 1 (nega sempre) · Seção 2 (tests/) · Seção 3 (o resto é só código)
+#
+# COMO É LIDO: o mbp-run.sh passa este arquivo ao rsync como `--filter=". <este arquivo>"`, com --delete --delete-excluded. O rsync usa a PRIMEIRA
+#   regra que casa, de cima para baixo — por isso a ORDEM é a segurança: a seção 1 vem antes de `+ /tests/***`, então nada dela sai nem de dentro de
+#   tests/. --delete-excluded faz o destino PERDER o que o filtro exclui (uma semeadura antiga que levou segredo é limpa na próxima rodada).
+#   Nenhum dado de cliente sai do mini: é a regra do Athos para o servidor alugado, e o selftest planta um *.duckdb, um .env e um data/ e confere que não chegam.
+#   Arquivo ausente ou ilegível = o mbp-run.sh NÃO usa o nó (estado inerte; cai no MBP): sem este filtro não se sabe o que enviar.
+#   Medido (13/10, openrsync do macOS): `- **/data/` NÃO casa um data/ na raiz (só os aninhados), por isso a regra é `- data/` (qualquer nível).
+#   Medido (13/10, o seed manual do nó): levou processo_lookup/.env.pdpj, contacts_auth/client_secret.json e shared/logs.backup-*/*.out — a seção 1 e a 3 existem por isso.
+#
+# SEÇÃO 1 — NEGA SEMPRE, em qualquer pasta (inclusive tests/): credencial e formato de dado.
+- .env
+- .env.*
+- *.pem
+- *.key
+- *.p12
+- *.pfx
+- *.crt
+- id_rsa*
+- id_ed25519*
+- *.kdbx
+- credentials*.json
+- client_secret*.json
+- cookies*.json
+- cookies*.txt
+- *.session
+- auth/
+- auth-*/
+- auth_*/
+- auth.bak*/
+- *.duckdb*
+- *.db
+- *.db-*
+- *.sqlite*
+- *.parquet
+- *.wal
+- *.gz
+- *.pkl
+- *.xlsx
+- *.csv
+- __pycache__
+- .pytest_cache
+# SEÇÃO 2 — tests/ vai inteiro (fixtures json/jsonl/xml/txt são código de teste; os formatos de dado já saíram na seção 1).
++ /tests/***
+# SEÇÃO 3 — fora de tests/: só código. Estas pastas e arquivos nunca saem do mini.
+- .git
+- .repo.git
+- .worktrees
+- .viewer-deploy-clone
+- .playwright-mcp
+- .claude
+- .gemini
+- .gc
+- .beads
+- venv
+- .venv
+- venv-*
+- crew/
+- refinery/
+- polecats/
+- scratchpad/
+- node_modules
+- /shared/
+- /config
+- /data
+- /data.*
+- /logs
+- /logs.*
+- data/
+- .DS_Store
+- *.bak
+- *.log
+- *.jsonl
+- *.out
+- *.err
+- *.pid
