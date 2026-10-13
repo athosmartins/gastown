@@ -41,8 +41,11 @@
 # larger blast radius than restarting a single leaf daemon (global
 # DEPLOY/RESTART HYGIENE doctrine's "ask per process" applies with extra
 # weight here) -- this guard pages so a human/Mayor can decide when,
-# deliberately, matching how supervisor-restart-watchdog.sh (ga-b0gltl) is
-# ALSO explicitly detection-only for the same process.
+# deliberately, matching how supervisor-restart-watchdog.sh's restart counter
+# (ga-b0gltl) is detection-only for the same process. Its one exception is a
+# restart on a measured fd count above 40,000 (ga-xuo89c, fd-leak stop-gap):
+# a number that says the supervisor is about to hit its descriptor ceiling,
+# not a suspicion about formulas, so it does not carry over to this guard.
 #
 # No bd label/comment on any specific bead: unlike a single daemon's own
 # entrypoint fix (one commit, one bead, a clean regex off the commit

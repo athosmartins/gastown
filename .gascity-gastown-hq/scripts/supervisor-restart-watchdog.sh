@@ -10,14 +10,31 @@
 #
 # This script takes ONE sample per invocation (`launchctl print`), diffs the
 # `runs` counter against the previous sample, and appends one JSONL record to
-# .gc/logs/supervisor-restart-watchdog.jsonl. It never restarts, reconfigures,
-# or otherwise touches the supervisor — see ga-b0gltl for why that is
-# explicitly out of scope until this counter tells us the real frequency.
+# .gc/logs/supervisor-restart-watchdog.jsonl. The COUNTER half never restarts,
+# reconfigures, or otherwise touches the supervisor — see ga-b0gltl for why
+# that was out of scope until the counter told us the real frequency.
 #
-# Answering "how many restarts in the last 24h and why" is then a jq query
-# against the ledger, e.g.:
+# The ONE exception is the fd guard (ga-xuo89c): the engine's config watcher
+# leaks its whole watch set on every reload (ga-0ox5tq, fsnotify v1.9.0), the
+# supervisor hit the 61,440 per-process ceiling on 13/10 ~8.5h after boot and
+# the city went ~1h30 without viable sessions. Until the engine window ships
+# the real fix, every sample also counts the supervisor's open fds:
+#   fds <= 30,000 .......... nothing (the number is only recorded)
+#   30,000 < fds <= 40,000 . recorded + a log line, NO action
+#   fds > 40,000 ........... `launchctl kickstart -k` on the supervisor, a
+#                            `notify -p 4`, and no second restart within 30 min
+# A count that could not be read (no pid, lsof failed/timed out/unparsable) is
+# `fds:null` with the reason in `fds_state` and NEVER restarts anything — an
+# unread number is not a big number. The 30-min cooldown lives in its own file
+# (supervisor-fds-guard.json) because the sample state below is rewritten
+# wholesale every cycle. Thresholds/timeouts are env-overridable (SRW_*) for
+# the selftest only; launchd runs the defaults.
+#
+# Answering "how many times did it DIE in the last 24h and why" is then a jq
+# query against the ledger (delta_guard_restart = restarts the fd guard itself
+# caused, so they are not counted as deaths):
 #   jq -s --arg since "$(date -u -v-1d +%Y-%m-%dT%H:%M:%SZ)" \
-#     '[.[] | select(.ts >= $since)] | {restarts: (map(.delta_since_last) | add), samples: length}' \
+#     '[.[] | select(.ts >= $since)] | {deaths: (map(.delta_since_last - (.delta_guard_restart // 0)) | add), samples: length}' \
 #     .gc/logs/supervisor-restart-watchdog.jsonl
 set -uo pipefail
 
@@ -33,6 +50,22 @@ UID_NUM="$(id -u)"
 mkdir -p "$STATE_DIR" "$LEDGER_DIR"
 
 log() { printf '[supervisor-restart-watchdog] %s\n' "$*"; }
+
+# ---- fd guard configuration (ga-xuo89c) ----
+# A non-numeric override falls back to the default instead of becoming a
+# threshold the arithmetic below would choke on (or, worse, read as 0).
+_srw_num() { case "$1" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
+FDS_WARN="$(_srw_num "${SRW_FDS_WARN:-}" 30000)"
+FDS_RESTART="$(_srw_num "${SRW_FDS_RESTART:-}" 40000)"
+FDS_COOLDOWN_SEC="$(_srw_num "${SRW_FDS_COOLDOWN_SEC:-}" 1800)"
+# lsof on a leaking supervisor has to walk tens of thousands of fds, so the
+# bound is generous; launchd never overlaps two runs of the same job and the
+# instance lock below covers the manual case.
+SRW_LSOF_TIMEOUT="$(_srw_num "${SRW_LSOF_TIMEOUT:-}" 120)"
+SRW_RESTART_WAIT="$(_srw_num "${SRW_RESTART_WAIT:-}" 60)"
+SRW_RESTART_POLL="${SRW_RESTART_POLL:-2}"
+SRW_TMUX_SOCKET="${SRW_TMUX_SOCKET:-gascity}"
+GUARD_STATE_FILE="$STATE_DIR/supervisor-fds-guard.json"
 
 # ---- single-instance lock ----
 # Ported (liveness-only reclaim logic kept verbatim in spirit) from
@@ -159,6 +192,12 @@ if [ -z "$RUNS" ]; then
 fi
 EXIT_CODE_JSON="${EXIT_CODE:-null}"
 
+# The job's pid is the first top-level `pid = N` line. Absent while the job is
+# between runs (just died, launchd has not respawned it yet) — the fd guard
+# below reads that as "no pid", not as "0 fds".
+SUP_PID="$(printf '%s\n' "$PRINT_OUT" | grep -E '^[[:space:]]*pid = [0-9]+[[:space:]]*$' | head -1 | grep -oE '[0-9]+')"
+NOW_EPOCH="$(date +%s)"
+
 # ---- previous state ----
 # HAVE_PREV_LOG_OFFSET is tracked separately from PREV_LOG_OFFSET's value —
 # "no state file yet" and "prior offset was legitimately 0 (log started
@@ -221,15 +260,217 @@ if [ -f "$SUPERVISOR_LOG" ]; then
   fi
 fi
 
+# ---- fd guard (ga-xuo89c) ----
+# Three states for the fd count, never two: a number (ok), "could not read it"
+# (no_pid / lsof_timeout / lsof_failed / lsof_unparsable — FDS stays empty), and
+# nothing in between. Only a number above the threshold can restart anything.
+
+# Counts the supervisor's open FILE DESCRIPTORS (lsof rows whose FD column is
+# a number plus an optional access-mode/lock suffix: 12r, 7u, 7uW, 255 — not
+# cwd/txt/mem, which never touch the descriptor table the 61,440 ceiling is
+# about). Sets M_FDS (integer or "") and M_STATE.
+_srw_measure_fds() {
+  local _pid="$1" _tmp _rc _n
+  M_FDS=""
+  # vazio → no pid means "no_pid", fds stays empty; falhou/ilegível → same (never a 0)
+  case "$_pid" in ''|*[!0-9]*) M_STATE="no_pid"; return 0 ;; esac
+  _tmp="$(mktemp "${TMPDIR:-/tmp}/srw-lsof.XXXXXX" 2>/dev/null)" || { M_STATE="lsof_failed"; return 0; }
+  # -n -P: no DNS / service-name lookups — with tens of thousands of sockets they are what makes lsof slow.
+  # The output goes to a file and lsof's status is read on its own: a run that
+  # timed out (124) leaves a PARTIAL table, and a partial table must never be counted.
+  # vazio → no header / no numeric rows = "lsof_unparsable"; falhou/ilegível → timeout = "lsof_timeout", other rc = "lsof_failed"
+  timeout "$SRW_LSOF_TIMEOUT" lsof -n -P -p "$_pid" > "$_tmp" 2>/dev/null
+  _rc=$?
+  case "$_rc" in
+    124|137) M_STATE="lsof_timeout" ;;
+    0|1)
+      # rc 1 is lsof's "some warning"; the rows are still usable if the header and at least one fd are there.
+      _n="$(awk 'NR == 1 { hdr = ($1 == "COMMAND"); next } $4 ~ /^[0-9]+[a-zA-Z]*$/ { n++ } END { if (hdr && n > 0) print n; else print "bad" }' "$_tmp" 2>/dev/null)"
+      case "$_n" in
+        ''|*[!0-9]*) M_STATE="lsof_unparsable" ;;
+        *) M_FDS="$_n"; M_STATE="ok" ;;
+      esac ;;
+    *) M_STATE="lsof_failed" ;;
+  esac
+  rm -f "$_tmp" 2>/dev/null
+  return 0
+}
+
+# Prints the number of tmux sessions on the city's socket, or "null" when tmux
+# did not answer. Evidence only — no decision depends on it.
+_srw_count_sessions() {
+  local _out
+  # vazio → rc 0 with no lines is 0 sessions; falhou/ilegível → non-zero rc (no server, timeout) is "null" (unknown, not 0)
+  _out="$(timeout 10 tmux -L "$SRW_TMUX_SOCKET" list-sessions -F x 2>/dev/null)" || { printf 'null'; return 0; }
+  printf '%s' "$(printf '%s\n' "$_out" | grep -c .)"
+}
+
+# Best effort: a notify that fails or hangs must not change what the guard did.
+_srw_notify() {
+  command -v notify >/dev/null 2>&1 || return 0
+  timeout 20 notify -t "Supervisor fd guard" -p 4 "$1" >/dev/null 2>&1 || log "WARN: notify failed or timed out"
+  return 0
+}
+
+# ---- cooldown state: its own file, not the sample state ----
+# The sample state is rewritten wholesale (4 fields) at the end of every run;
+# a cooldown kept there would be wiped one cycle after the restart.
+GS_STATE_KIND="absent"      # absent | ok | unreadable
+GS_LAST_EPOCH=""
+GS_RUNS_AT_RESTART=""
+
+_srw_guard_state_read() {
+  local _e _r
+  GS_LAST_EPOCH=""; GS_RUNS_AT_RESTART=""
+  # vazio → no file = never restarted, the guard may act; falhou/ilegível → "unreadable", the guard does NOT act on it
+  [ -e "$GUARD_STATE_FILE" ] || { GS_STATE_KIND="absent"; return 0; }
+  _e="$(jq -r '.last_restart_epoch // empty' "$GUARD_STATE_FILE" 2>/dev/null)"
+  case "$_e" in ''|*[!0-9]*) GS_STATE_KIND="unreadable"; return 0 ;; esac
+  # A stamp further ahead than one cooldown window cannot be a real past restart
+  # (clock stepped back, or a garbage value) — unreadable, so it is quarantined
+  # and re-stamped instead of blocking the guard for the rest of that future.
+  if [ "$_e" -gt $(( NOW_EPOCH + FDS_COOLDOWN_SEC )) ]; then GS_STATE_KIND="unreadable"; return 0; fi
+  _r="$(jq -r '.runs_at_restart // empty' "$GUARD_STATE_FILE" 2>/dev/null)"
+  case "$_r" in *[!0-9]*) _r="" ;; esac
+  GS_LAST_EPOCH="$_e"; GS_RUNS_AT_RESTART="$_r"; GS_STATE_KIND="ok"
+}
+
+# _srw_guard_state_write <runs_at_restart|null> <pid|null> <fds|null> <inferred:true|false>
+# Stamps NOW as the last restart. temp+mv: a reader sees the old file or the
+# new one, never half of one. rc != 0 means the stamp did NOT land.
+_srw_guard_state_write() {
+  local _tmp
+  _tmp="$(mktemp "${GUARD_STATE_FILE}.XXXXXX" 2>/dev/null)" || return 1
+  if jq -n --argjson e "$NOW_EPOCH" --arg ts "$SAMPLE_TS" --argjson r "$1" --argjson p "$2" --argjson f "$3" --argjson i "$4" \
+       '{last_restart_epoch:$e, last_restart_ts:$ts, runs_at_restart:$r, pid_before:$p, fds_before:$f, inferred:$i}' > "$_tmp" 2>/dev/null \
+     && [ -s "$_tmp" ] && mv "$_tmp" "$GUARD_STATE_FILE" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$_tmp" 2>/dev/null
+  return 1
+}
+
+# Everything the ledger/notify say about the guard. Strings are from a fixed
+# vocabulary and numbers are integers or the literal null — nothing needs
+# JSON-escaping (same invariant as the record below).
+FDS="";            FDS_STATE="no_pid"
+GUARD_ACTION="none"
+RESTART_NEW_PID="null"; FDS_AFTER="null"
+SESSIONS_BEFORE="null"; SESSIONS_AFTER="null"
+COOLDOWN_REMAINING="null"
+
+_srw_guard_state_read
+
+# Restarts the guard itself caused are in `runs` too (kickstart -k = +1), so
+# they would be counted as deaths. The window (PREV_RUNS, RUNS] holds the
+# guard's restart iff the runs value it stamped at kick time (the value BEFORE
+# the +1) lies in [PREV_RUNS, RUNS). Stateless: nothing to clear afterwards.
+DELTA_GUARD=0
+if [ "$GS_STATE_KIND" = "ok" ] && [ -n "$GS_RUNS_AT_RESTART" ] && [ -n "$PREV_RUNS" ] \
+   && [ "$COUNTER_RESET" = "false" ] && [ "$DELTA" -gt 0 ] \
+   && [ "$GS_RUNS_AT_RESTART" -ge "$PREV_RUNS" ] && [ "$GS_RUNS_AT_RESTART" -lt "$RUNS" ]; then
+  DELTA_GUARD=1
+fi
+
+# Sets GUARD_ACTION (+ the evidence variables) for a count above FDS_RESTART.
+_srw_fds_guard_restart() {
+  local _age _rc _deadline _p
+  case "$GS_STATE_KIND" in
+    unreadable)
+      # Keep the bad file for whoever looks, then re-stamp "restarted just now"
+      # (inferred): the inert direction — no restart for one window — and it
+      # heals itself instead of staying unreadable forever.
+      cp "$GUARD_STATE_FILE" "${GUARD_STATE_FILE}.unreadable.${NOW_EPOCH}" 2>/dev/null
+      if _srw_guard_state_write null null null true; then
+        GUARD_ACTION="cooldown_state_unreadable"
+      else
+        GUARD_ACTION="state_unwritable"
+      fi
+      return 0 ;;
+    ok)
+      _age=$(( NOW_EPOCH - GS_LAST_EPOCH ))
+      if [ "$_age" -lt "$FDS_COOLDOWN_SEC" ]; then
+        GUARD_ACTION="cooldown"
+        COOLDOWN_REMAINING=$(( FDS_COOLDOWN_SEC - _age ))
+        return 0
+      fi ;;
+  esac
+  # Stamp the cooldown BEFORE the kick: if this run dies or hangs after
+  # kickstart, the next cycle must already see the restart. And if the stamp
+  # cannot be written, no restart — a restart that can't be rate-limited
+  # could loop every 15 min.
+  if ! _srw_guard_state_write "$RUNS" "${SUP_PID:-null}" "$FDS" false; then
+    GUARD_ACTION="state_unwritable"
+    return 0
+  fi
+  SESSIONS_BEFORE="$(_srw_count_sessions)"
+  log "fds=${FDS} > ${FDS_RESTART} on pid ${SUP_PID} — kickstart -k ${SUPERVISOR_LABEL} (cooldown ${FDS_COOLDOWN_SEC}s stamped)"
+  timeout 30 launchctl kickstart -k "gui/${UID_NUM}/${SUPERVISOR_LABEL}" >/dev/null 2>&1
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    GUARD_ACTION="restart_failed"
+    return 0
+  fi
+  GUARD_ACTION="restart_unconfirmed"
+  _deadline=$(( SECONDS + SRW_RESTART_WAIT ))
+  while [ "$SECONDS" -lt "$_deadline" ]; do
+    # vazio → no pid line yet = not respawned, keep waiting; falhou/ilegível → same, bounded by the deadline
+    _p="$(timeout 10 launchctl print "gui/${UID_NUM}/${SUPERVISOR_LABEL}" 2>/dev/null \
+          | grep -E '^[[:space:]]*pid = [0-9]+[[:space:]]*$' | head -1 | grep -oE '[0-9]+')"
+    if [ -n "$_p" ] && [ "$_p" != "$SUP_PID" ]; then
+      RESTART_NEW_PID="$_p"
+      GUARD_ACTION="restart_ok"
+      break
+    fi
+    sleep "$SRW_RESTART_POLL"
+  done
+  # The city's tmux server is not in the supervisor's process group (observed
+  # 2026-10-13: ppid 1, own pgid), so launchd's group kill should not reach it;
+  # the before/after counts are the evidence that the sessions really survived (AC 3 of ga-xuo89c).
+  SESSIONS_AFTER="$(_srw_count_sessions)"
+  if [ "$GUARD_ACTION" = "restart_ok" ]; then
+    _srw_measure_fds "$RESTART_NEW_PID"
+    [ "$M_STATE" = "ok" ] && FDS_AFTER="$M_FDS"
+  fi
+  return 0
+}
+
+_srw_measure_fds "$SUP_PID"
+FDS="$M_FDS"; FDS_STATE="$M_STATE"
+if [ "$FDS_STATE" != "ok" ]; then
+  GUARD_ACTION="unreadable"
+  log "fds not readable (${FDS_STATE}) — no action taken"
+elif [ "$FDS" -gt "$FDS_RESTART" ]; then
+  _srw_fds_guard_restart
+elif [ "$FDS" -gt "$FDS_WARN" ]; then
+  GUARD_ACTION="warn"
+  log "fds=${FDS} > ${FDS_WARN} (restart above ${FDS_RESTART}) — recorded only"
+fi
+
+case "$GUARD_ACTION" in
+  restart_ok)
+    _srw_notify "supervisor had ${FDS} fds (> ${FDS_RESTART}): restarted. pid ${SUP_PID} -> ${RESTART_NEW_PID}; fds after: ${FDS_AFTER}; tmux sessions ${SESSIONS_BEFORE} -> ${SESSIONS_AFTER}." ;;
+  restart_unconfirmed)
+    _srw_notify "supervisor had ${FDS} fds (> ${FDS_RESTART}): kickstart sent but no new pid within ${SRW_RESTART_WAIT}s. tmux sessions ${SESSIONS_BEFORE} -> ${SESSIONS_AFTER}. Check the supervisor." ;;
+  restart_failed)
+    _srw_notify "supervisor has ${FDS} fds (> ${FDS_RESTART}) and kickstart FAILED. Next try after the ${FDS_COOLDOWN_SEC}s cooldown." ;;
+  cooldown)
+    _srw_notify "supervisor has ${FDS} fds (> ${FDS_RESTART}) again inside the ${FDS_COOLDOWN_SEC}s cooldown — NOT restarting (${COOLDOWN_REMAINING}s left). A fresh process should not leak this fast." ;;
+  cooldown_state_unreadable|state_unwritable)
+    _srw_notify "supervisor has ${FDS} fds (> ${FDS_RESTART}) but the guard state (${GUARD_STATE_FILE}) is ${GUARD_ACTION} — NOT restarting." ;;
+esac
+
 # ---- append ledger record ----
 # Pure-bash printf, not a piped jq: a single printf-to-an-append-fd is one
 # write() syscall, atomic for payloads under PIPE_BUF (64KiB) per POSIX — the
 # same guarantee gc_ledger.py's O_APPEND writer relies on. Every field here is
-# either an integer, a bash-literal true/false, or a timestamp WE generated —
-# none can contain a quote/backslash/newline, so no escaping is needed and no
-# external process sits on the write's atomicity.
-RECORD=$(printf '{"ts":"%s","runs":%s,"last_exit_code":%s,"delta_since_last":%s,"counter_reset":%s,"reason_exit_nonzero":%s,"reason_log_matches":%s,"log_checked":%s,"log_offset":%s}' \
-  "$SAMPLE_TS" "$RUNS" "$EXIT_CODE_JSON" "$DELTA" "$COUNTER_RESET" "$REASON_EXIT_NONZERO" "$CODESIGN_MATCHES" "$LOG_CHECKED" "$LOG_SIZE")
+# either an integer, the literal null, a bash-literal true/false, a string from
+# the fixed vocabulary above, or a timestamp WE generated — none can contain a
+# quote/backslash/newline, so no escaping is needed and no external process
+# sits on the write's atomicity.
+RECORD=$(printf '{"ts":"%s","runs":%s,"last_exit_code":%s,"delta_since_last":%s,"counter_reset":%s,"reason_exit_nonzero":%s,"reason_log_matches":%s,"log_checked":%s,"log_offset":%s,"pid":%s,"fds":%s,"fds_state":"%s","guard_action":"%s","delta_guard_restart":%s,"restart_new_pid":%s,"fds_after":%s,"sessions_before":%s,"sessions_after":%s,"cooldown_remaining_s":%s}' \
+  "$SAMPLE_TS" "$RUNS" "$EXIT_CODE_JSON" "$DELTA" "$COUNTER_RESET" "$REASON_EXIT_NONZERO" "$CODESIGN_MATCHES" "$LOG_CHECKED" "$LOG_SIZE" \
+  "${SUP_PID:-null}" "${FDS:-null}" "$FDS_STATE" "$GUARD_ACTION" "$DELTA_GUARD" "$RESTART_NEW_PID" "$FDS_AFTER" "$SESSIONS_BEFORE" "$SESSIONS_AFTER" "$COOLDOWN_REMAINING")
 printf '%s\n' "$RECORD" >> "$LEDGER_FILE"
 
 # ---- persist state (atomic replace via temp+mv; jq is fine here since the
