@@ -1572,7 +1572,10 @@ case "$JQ_ERR" in *"could not append the gate_lane event"*) ok "a failing jq: th
 # ── 8. mutation checks of THIS harness ─────────────────────────────────────────────────────────────────────
 echo "── 8. mutation checks: the assertions above must be load-bearing ──"
 # 8a. a bypass that never fires must be caught by the finalize assertion
-BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed 's/^if \[ "\$GATE_LANE" = "fast" \]; then/if false; then/')"
+# ga-mzw9dt: the bypass condition also takes a granted remerge (`|| [ "${GATE_REMERGE:-0}" = "1" ]`); the mutant rewrites the WHOLE condition, so it still
+# means "a bypass that never fires". Anchored on the text up to `; then`, so a condition that grows again is caught instead of silently not mutated.
+BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed -E 's/^if \[ "\$GATE_LANE" = "fast" \]( \|\| .*)?; then$/if false; then/')"
+[ "$BYPBLK_USE" != "$BYPBLK" ] && ok "mutant 8a really mutated the bypass condition (it would otherwise be the real code and prove nothing)" || bad "mutant 8a did not match the bypass condition — the harness would be blind"
 byp_case fast fast
 case "$BYP_OUT" in *"FINALIZE overall=PASS"*) bad "mutant bypass (never fires) still passed the finalize assertion — the harness is blind" ;; *) ok "a bypass that never fires turns the fast-lane assertion RED" ;; esac
 BYPBLK_USE=""
