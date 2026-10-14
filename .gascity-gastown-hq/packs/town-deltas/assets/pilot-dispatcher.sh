@@ -9865,6 +9865,143 @@ EOF_PYCLEAR
   return 0
 }
 
+# ── ga-2lca0l: a P0/P1 that a pool TOP-UP session was opened for is being built — it is not "waiting for a slot" ───────────────
+# The top-up opens its session with `gc session new <pool> --title-hint "pool top-up: <bead>"` and binds nothing to it: the session
+# boots, runs the pool's generic probe and claims whatever that probe returns first. 14/10: wa-hut4l5.4 (P1) stayed open and
+# unassigned for ~4h behind a pool that was "full" because of the session opened FOR it (which claimed wa-470co3 instead); the
+# yield counted it as the head waiter and ceded ~150 P2+ beads a sweep to a P1 nobody was building (dispatched=0, free slots).
+# Three pieces: the claim is written AT SPAWN (_topup_bind_after_spawn), a P0/P1 with a live top-up session is not a waiter and its
+# claim is repaired when it has none (_pilot_priority_topup_building), and a streak of cede-only sweeps is mailed (_pilot_yield_stall_check).
+
+# _topup_session_for <bead-id> [fresh] — print "<session_name>\037<work_dir>\037<name,alias,id,...>" of the NEWEST live session
+# (state active|creating|start-pending, not closed) whose title is exactly "pool top-up: <bead-id>" (the title the top-up gives it;
+# 'wa-p1' never matches a session for 'wa-p1.2'). Exit 0 = answered (nothing printed = no such session); exit 1 = CANNOT TELL (the
+# roster is unreadable). Reads the sweep-start roster (_SESSIONS_JSON) when it is valid, else `gc session list`; "fresh" always
+# asks gc — the roster of a sweep cannot contain a session born during it.
+_topup_session_for() {
+  local _id="${1:-}" _json=""
+  [ -n "$_id" ] || return 1
+  if [ "${2:-}" != "fresh" ] && printf '%s' "${_SESSIONS_JSON:-}" | jq -e '.sessions | type == "array"' >/dev/null 2>&1; then
+    _json="$_SESSIONS_JSON"
+  else
+    _json=$(gc --city "$GC_CITY" session list --json 2>/dev/null) || return 1
+    [ -n "$_json" ] || return 1
+  fi
+  printf '%s' "$_json" | jq -r --arg t "pool top-up: $_id" '
+    if (.sessions | type) != "array" then error("no roster") else
+      [.sessions[] | select(.closed != true and ((.state // "") | IN("active", "creating", "start-pending"))
+                            and (((.title // "") == $t) or ((.title // "") | startswith($t + " "))))]
+      | reduce .[] as $s (null; if . == null or ($s.created_at // "") >= (.created_at // "") then $s else . end)
+      | if . == null then empty else
+          [(.session_name // .name // .alias // .id // ""), (.work_dir // ""),
+           ([.session_name, .name, .alias, .id, .agent_name] | map(select(. != null and . != "")) | unique | join(","))] | join("\u001f")
+        end
+    end' 2>/dev/null
+}
+
+# _topup_bind_claim <store> <bead-id> <session> <work_dir> — write the claim a worker would have written itself (status in_progress,
+# assignee = the session, gc.session_name / gc.work_dir — what the reclaim guard heals from), but only onto a bead that is still open
+# and UNASSIGNED: re-read first, and the write itself is conditional (--if-assignee '' --if-status open), so a claim that lands in
+# between is never overwritten. Exit 0 = claimed (or already this session's); 1 = could not (read or write failed); 2 = the bead is no
+# longer claimable (someone else has it / not open). DRY_RUN says what it would do and writes nothing.
+_topup_bind_claim() {
+  local _store="${1:-}" _id="${2:-}" _sess="${3:-}" _wd="${4:-}" _json _st _asg _w=0
+  local -a _args
+  [ -n "$_store" ] && [ -n "$_id" ] && [ -n "$_sess" ] || return 1
+  _json=$(timeout 15 bd -C "$_store" show "$_id" --json 2>/dev/null) || return 1
+  _json=$(printf '%s' "$_json" | jq -c 'if type == "array" then .[0] else . end | if type == "object" then . else empty end' 2>/dev/null) || return 1
+  [ -n "$_json" ] || return 1
+  _st=$(printf '%s' "$_json" | jq -r '.status // ""' 2>/dev/null) || return 1
+  _asg=$(printf '%s' "$_json" | jq -r '.assignee // ""' 2>/dev/null) || return 1
+  [ "$_asg" != "$_sess" ] || return 0
+  [ -z "$_asg" ] && [ "$_st" = "open" ] || return 2
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    log "ga-2lca0l: DRY_RUN=1 — WOULD write the claim of $_id to its top-up session $_sess (status in_progress, assignee, gc.session_name${_wd:+, gc.work_dir})."
+    return 0
+  fi
+  _args=(update "$_id" --status in_progress --assignee "$_sess" --if-assignee "" --if-status open --set-metadata "gc.session_name=$_sess")
+  [ -z "$_wd" ] || _args+=(--set-metadata "gc.work_dir=$_wd")
+  timeout 30 bd -C "$_store" "${_args[@]}" -q >/dev/null 2>&1 || _w=$?
+  case "$_w" in 0) return 0 ;; 13) return 2 ;; *) return 1 ;; esac
+}
+
+# _topup_bind_after_spawn <pool> <bead-id> — right after a top-up spawn SUCCEEDED "for" <bead-id>: bind the new session to it, so its
+# worker resumes THAT bead (prompt Step 1a/1b: assigned work first) instead of running the generic probe and taking another. The
+# session is found by its title in a FRESH roster. Fail-open and always exit 0: the spawn already happened, and a bind that did not
+# land is repaired by the next sweep's _pilot_priority_topup_building while the bead is a P0/P1 that waits. PILOT_TOPUP_BIND=0 = off.
+_topup_bind_after_spawn() {
+  local _pool="${1:-}" _id="${2:-}" _row _sess _wd _store _rc=0
+  [ "${PILOT_TOPUP_BIND:-1}" = "1" ] || return 0
+  [ -n "$_id" ] || return 0
+  if ! _row=$(_topup_session_for "$_id" fresh); then
+    warn "ga-2lca0l: CANNOT TELL which session the top-up opened for $_id (the session roster could not be read) — its claim is not written at spawn (fail-open; a P0/P1 is repaired by the next sweep's yield scan)."
+    return 0
+  fi
+  if [ -z "$_row" ]; then
+    warn "ga-2lca0l: no live top-up session titled 'pool top-up: $_id' after the $_pool spawn (still registering?) — its claim is not written at spawn (fail-open; a P0/P1 is repaired by the next sweep's yield scan)."
+    return 0
+  fi
+  _sess="${_row%%$'\037'*}"; _wd="${_row#*$'\037'}"; _wd="${_wd%%$'\037'*}"
+  if ! _store=$(_topup_pending_store "$_pool" "$_id"); then
+    warn "ga-2lca0l: top-up session $_sess was opened for $_id but the store holding it could not be found — its claim is not written at spawn (fail-open)."
+    return 0
+  fi
+  _topup_bind_claim "$_store" "$_id" "$_sess" "$_wd" || _rc=$?
+  case "$_rc" in
+    0) log "ga-2lca0l: bound top-up session $_sess to $_id at spawn (claim written before the worker boots: it resumes this bead instead of probing for another)." ;;
+    2) log "ga-2lca0l: $_id is no longer open and unassigned right after the spawn ($_sess) — someone claimed it first; nothing written." ;;
+    *) warn "ga-2lca0l: could not write the claim of $_id to its top-up session $_sess (store $_store unreadable or the write failed) — fail-open; a P0/P1 is repaired by the next sweep's yield scan." ;;
+  esac
+  return 0
+}
+
+# _pilot_priority_topup_building <bead-id> <pool> — is this P0/P1 behind a "full" pool being BUILT by a top-up session already?
+#   exit 0 = yes: a live top-up session is on it and the claim is (now) its own — NOT a waiter (a slot would not get it anything
+#            the session is not already doing). Sets _PY_TOPUP_SESS. An unassigned bead gets its claim written here.
+#   exit 1 = no: no live session titled for it, or the session is not building it (it holds another bead — the 14/10 drift —, is not
+#            an active owner, or the bead is claimed by someone else / not open, or the repair write failed). A waiter, as before.
+#   exit 2 = CANNOT TELL (roster, bead or store unreadable): never a waiter on a guess, never "building" on one.
+# The Pilot never takes a claim from anyone and never gives a session a second bead. DRY_RUN reads, decides, writes nothing.
+_pilot_priority_topup_building() {
+  local _id="${1:-}" _pool="${2:-}" _row _sess _wd _syn _store _json _st _asg _held _brc=0
+  _PY_TOPUP_SESS=""
+  [ -n "$_id" ] || return 1
+  case "$_pool" in wa-worker|ps-worker) ;; *) return 1 ;; esac   # the pools the top-up opens sessions for
+  _row=$(_topup_session_for "$_id") || return 2
+  [ -n "$_row" ] || return 1
+  _sess="${_row%%$'\037'*}"; _wd="${_row#*$'\037'}"; _syn="${_wd#*$'\037'}"; _wd="${_wd%%$'\037'*}"
+  _store=$(_topup_pending_store "$_pool" "$_id") || return 2
+  _json=$(timeout 15 bd -C "$_store" show "$_id" --json 2>/dev/null) || return 2
+  _json=$(printf '%s' "$_json" | jq -c 'if type == "array" then .[0] else . end | if type == "object" then . else empty end' 2>/dev/null) || return 2
+  [ -n "$_json" ] || return 2
+  _st=$(printf '%s' "$_json" | jq -r '.status // ""' 2>/dev/null) || return 2
+  _asg=$(printf '%s' "$_json" | jq -r '.assignee // ""' 2>/dev/null) || return 2
+  if [ -n "$_asg" ]; then
+    case ",$_syn," in
+      *",$_asg,"*) _PY_TOPUP_SESS="$_sess"; return 0 ;;
+    esac
+    log "ga-2lca0l: $_id has a top-up session ($_sess) but is claimed by $_asg — not the session's; the Pilot never takes a claim: still a waiter."
+    return 1
+  fi
+  [ "$_st" = "open" ] || return 1
+  if declare -F _session_is_active_owner >/dev/null 2>&1 && ! _session_is_active_owner "$_sess"; then
+    log "ga-2lca0l: $_id has a top-up session ($_sess) but it is not an active owner (asleep or idle past the threshold) — not building it; still a waiter."
+    return 1
+  fi
+  _held=$(timeout 15 bd -C "$_store" list --status in_progress --assignee "$_sess" --limit 0 --json 2>/dev/null) || return 2
+  _held=$(printf '%s' "$_held" | jq -r --arg id "$_id" 'if type == "array" then [.[] | select(.id != $id) | .id] | join(",") else error("not a list") end' 2>/dev/null) || return 2
+  if [ -n "$_held" ]; then
+    log "ga-2lca0l: $_id has a top-up session ($_sess) but that session already holds $_held — it is building that, not $_id (a second bead would double-book it): still a waiter."
+    return 1
+  fi
+  _topup_bind_claim "$_store" "$_id" "$_sess" "$_wd" || _brc=$?
+  case "$_brc" in
+    0) _PY_TOPUP_SESS="$_sess"; return 0 ;;
+    2) return 1 ;;
+    *) warn "ga-2lca0l: could not write the claim of $_id to its top-up session $_sess — falling back to counting it as a waiter (the claim is retried next sweep)."; return 1 ;;
+  esac
+}
+
 # _pilot_priority_waiting_scan — ONCE per sweep, after the dynamic ceilings and before the pool top-up: find the HEAD WAITER, the
 # best-ordered P0/P1 bead (from the emit's _PY_P01) whose pool is positively at its cap AND that this sweep could dispatch. The
 # second half is the gate-round-1 class: a bead is only "waiting" if a slot would get it a session, so one the sweep's own filters
@@ -9876,10 +10013,12 @@ EOF_PYCLEAR
 # deferred beads never reach the emit (its chain is the dispatch chain). NOT checked, on purpose: dispatch_one's ownership guard
 # (crew branch / live gate / external claim — several git, bd and session reads per bead, only meaningful after the claim); the
 # label-level cases of it are already out of the emit, so a bead only that guard refuses can keep the yield up for a sweep.
+# ga-2lca0l: a bead behind a full pool that a live TOP-UP session was opened for is being built, not waiting (and its claim is
+# repaired when it has none — _pilot_priority_topup_building); it is passed over and the walk goes on to the next row.
 # Sets _PY_WAIT_* ("" = nobody known to wait) and _PY_BLIND. A (pool, store) pair that read "not full" is not asked again for the
 # next bead of the same pair. Always exit 0.
 _pilot_priority_waiting_scan() {
-  local _rows _id _prio _rig _pool _why _story _seen=" " _key _skipped=0 _skip_first="" _unread=0
+  local _rows _id _prio _rig _pool _why _story _seen=" " _key _skipped=0 _skip_first="" _unread=0 _tb _built=0 _built_first="" _tbblind=0
   _PY_SCANNED=1; _PY_BLIND=0
   _PY_WAIT_ID=""; _PY_WAIT_PRIO=""; _PY_WAIT_RIG=""; _PY_WAIT_POOL=""; _PY_WAIT_LIVE=""; _PY_WAIT_MAX=""
   if ! _pilot_priority_yield_enabled; then
@@ -9914,6 +10053,13 @@ _pilot_priority_waiting_scan() {
     case "$_seen" in *" $_key "*) continue ;; esac
     _story=$(jq -cn --arg id "$_id" --arg p "$_pool" '{id: $id, metadata: {"gc.routed_to": $p}}' 2>/dev/null) || continue
     if _pilot_pool_cap_full_for "$_story"; then
+      # ga-2lca0l: the pool is full — but a session opened FOR this bead is already on it: nothing to wait for. Not added to _seen
+      # (the pair read "full", not "not full"), so the next row of the pair is asked too.
+      _tb=0; _pilot_priority_topup_building "$_id" "$_PCAP_POOL" || _tb=$?
+      case "$_tb" in
+        0) _built=$((_built + 1)); [ -n "$_built_first" ] || _built_first="$_id → ${_PY_TOPUP_SESS:-?}"; continue ;;
+        2) _tbblind=$((_tbblind + 1)); continue ;;
+      esac
       _PY_WAIT_ID="$_id"; _PY_WAIT_PRIO="$_prio"; _PY_WAIT_RIG="$_rig"
       _PY_WAIT_POOL="$_PCAP_POOL"; _PY_WAIT_LIVE="$_PCAP_LIVE"; _PY_WAIT_MAX="$_PCAP_MAX"
       break
@@ -9930,12 +10076,19 @@ EOF_PYSCAN
   if [ "$_skipped" -gt 0 ]; then
     log "ga-5fn5p3: $_skipped P0/P1 bead(s) of the emit are NOT counted as waiting — this sweep cannot hand them a session (first: $_skip_first; not-a-fix = gate focus ON and no fix label, braked = pilot:topup-braked, refused:<reasons> = the pool's own probe refuses it, so no worker would take it even with a free slot)."
   fi
+  if [ "$_built" -gt 0 ]; then
+    log "ga-2lca0l: $_built P0/P1 bead(s) behind a full pool are NOT counted as waiting — a live top-up session opened for each is already on it (first: $_built_first), so there is no slot left to wait for and nothing to cede."
+  fi
   # ga-qmfm8r: independent of where the walk above stopped — the whole list is read for the Mayor's notice and for forgetting.
   _pilot_priority_unservable_sync
   # Unreadable facts only matter when no waiter was found: with one in hand the doubt changes nothing about who cedes.
   if [ "$_unread" -gt 0 ] && [ -z "$_PY_WAIT_ID" ]; then
     _PY_BLIND=1
     warn "ga-5fn5p3: CANNOT TELL whether $_unread P0/P1 bead(s) of the emit could be dispatched this sweep (focus/brake facts unreadable) — not counted as waiting; no P2+ bead is ceded on a guess (fail-open, counted as priority_yield_blind in the sweep event)."
+  fi
+  if [ "$_tbblind" -gt 0 ] && [ -z "$_PY_WAIT_ID" ]; then
+    _PY_BLIND=1
+    warn "ga-2lca0l: CANNOT TELL whether $_tbblind P0/P1 bead(s) behind a full pool already have a top-up session on them (the session roster, the bead or its store could not be read) — not counted as waiting; no P2+ bead is ceded on a guess (fail-open, counted as priority_yield_blind in the sweep event)."
   fi
   if [ -n "$_PY_WAIT_ID" ]; then
     log "ga-5fn5p3: P$_PY_WAIT_PRIO $_PY_WAIT_ID (rig $_PY_WAIT_RIG) waits for capacity — $_PY_WAIT_POOL is at its session cap ($_PY_WAIT_LIVE/$_PY_WAIT_MAX): no P2+ bead opens a pool session this sweep (dispatch or top-up) until it has a slot."
@@ -9949,7 +10102,7 @@ EOF_PYSCAN
 # sweep's own dispatch (the pre-claim cap skip, or dispatch_one's cap branches): it is a waiter, whether or not the scan knew it.
 # Only the FIRST one is kept (the pool is walked in work order, so the first is the best). Always exit 0.
 _pilot_priority_waiter_note() {
-  local _b="${1:-}" _cls _id _rig _ref
+  local _b="${1:-}" _cls _id _rig _ref _wpool _tb
   [ -z "${_PY_WAIT_ID:-}" ] || return 0
   _pilot_priority_yield_enabled || return 0
   _cls=$(_pilot_priority_class_of "$_b")
@@ -9968,6 +10121,16 @@ _pilot_priority_waiter_note() {
     _pilot_priority_unservable_note "$_id" "$_cls" "$_ref"
     return 0
   fi
+  # ga-2lca0l: queued behind a full pool, but a session opened FOR it is already on it — being built, not waiting.
+  _wpool="${2:-}"
+  [ -n "$_wpool" ] || _wpool=$(printf '%s' "$_b" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null) || _wpool=""
+  _tb=0; _pilot_priority_topup_building "$_id" "$_wpool" || _tb=$?
+  case "$_tb" in
+    0) log "ga-2lca0l: P$_cls $_id queued behind a full pool but a live top-up session (${_PY_TOPUP_SESS:-?}) is on it — it is being built, NOT recorded as the waiter."; return 0 ;;
+    2) _PY_SCANNED=1; _PY_BLIND=1
+       warn "ga-2lca0l: CANNOT TELL whether $_id already has a top-up session on it (the session roster, the bead or its store could not be read) — not recorded as the waiter; no P2+ bead is ceded on a guess (fail-open, counted as priority_yield_blind in the sweep event)."
+       return 0 ;;
+  esac
   _rig=$(printf '%s' "$_b" | jq -r '.metadata["story.rig"] // ""' 2>/dev/null) || _rig=""
   _PY_SCANNED=1
   _PY_WAIT_ID="$_id"; _PY_WAIT_PRIO="$_cls"; _PY_WAIT_RIG="${_rig:-?}"
@@ -10042,6 +10205,62 @@ _pilot_priority_yield_release() {
     esac
   fi
   if [ -n "$_builder" ]; then unmark_pool_builder "$_builder"; fi
+  return 0
+}
+# _pilot_yield_stall_check — ga-2lca0l (3): the ALARM for a yield that starves the pool. Step 5's ga-y1m40 streak deliberately ignores a
+# sweep that only ceded (PRIORITY_YIELDED counts as backpressure in _pool_saturated_sweep), so a P1 that cedes the whole city for
+# hours was a WARN nobody read. Called once per sweep, after Step 5: a sweep with dispatched=0, free lane slots and PRIORITY_YIELDED>0
+# behind a known head waiter extends a streak (state file: count<TAB>waiter<TAB>mailed); any other sweep ends it, and so does a new
+# head waiter (a different P1 starting to wait is not the same starvation). At PILOT_YIELD_STALL_SWEEPS (default 6, ~30 min) the
+# Mayor is mailed ONCE per streak, naming the P0/P1 and the pool's sessions (what each was opened for). The state is recorded as
+# mailed only after gc accepted the mail: a failed send is retried next sweep. DRY_RUN reads the state, says what it would send and
+# writes nothing. Always exit 0 — an alarm must never stop the sweep.
+_pilot_yield_stall_check() {
+  local _state="${PILOT_YIELD_STALL_FILE:-${GC_CITY:-/nonexistent}/.gc/priority-yield-stall.state}"
+  local _need="${PILOT_YIELD_STALL_SWEEPS:-6}" _cnt=0 _wid="" _mailed="" _roster _list _subj _body _tmp
+  case "$_need" in ''|*[!0-9]*|0) _need=6 ;; esac
+  if [ "${DISPATCHED:-1}" -ne 0 ] 2>/dev/null || [ "${PRIORITY_YIELDED:-0}" -le 0 ] 2>/dev/null \
+     || ! { [ "${SMALL_SLOTS:-0}" -gt 0 ] 2>/dev/null || [ "${BIG_SLOTS:-0}" -gt 0 ] 2>/dev/null; } \
+     || [ -z "${_PY_WAIT_ID:-}" ]; then
+    [ "${DRY_RUN:-0}" = "1" ] || rm -f "$_state" 2>/dev/null || true
+    return 0
+  fi
+  if [ -r "$_state" ]; then
+    IFS=$'\t' read -r _cnt _wid _mailed < "$_state" 2>/dev/null || true
+  fi
+  case "$_cnt" in ''|*[!0-9]*) _cnt=0 ;; esac
+  if [ "$_wid" = "$_PY_WAIT_ID" ]; then _cnt=$((_cnt + 1)); else _cnt=1; _mailed=""; fi
+  if [ "$_cnt" -ge "$_need" ] && [ "$_mailed" != "1" ]; then
+    _subj="Pilot: P${_PY_WAIT_PRIO:-?} ${_PY_WAIT_ID} segura o pool há ${_cnt} varreduras (dispatched=0, vagas livres, ${PRIORITY_YIELDED} cessões)"
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+      log "ga-2lca0l: DRY_RUN=1 — WOULD tell the Mayor — $_subj"
+      return 0
+    fi
+    _roster=$(gc --city "$GC_CITY" session list --json 2>/dev/null) || _roster=""
+    if [ -z "$_roster" ] || ! _list=$(printf '%s' "$_roster" | jq -r --arg pool "${_PY_WAIT_POOL:-}" '
+        if (.sessions | type) != "array" then error("no roster") else
+          [.sessions[] | select(.closed != true and (.template // "") == $pool)
+           | "  - " + (.session_name // .name // .alias // .id // "?") + " (" + (.state // "?") + ") — " + (.title // "sem título")] | join("\n")
+        end' 2>/dev/null); then
+      _list="(lista de sessões do pool ilegível nesta varredura)"
+    elif [ -z "$_list" ]; then
+      _list="(nenhuma sessão viva do pool)"
+    fi
+    _body="$(printf 'A P%s %s (rig %s) espera vaga em %s (%s/%s) e, por isso, o Pilot cede o pool a ela: %s varreduras seguidas com dispatched=0, vagas livres nas lanes e %s P2+ cedidas na última.\n\nSessões do pool agora:\n%s\n\nSe alguma dessas sessões foi aberta PARA essa bead (título "pool top-up: %s") e está construindo outra coisa, a cessão está presa a uma construção que não existe — reivindique a bead para a sessão certa ou libere o pool. Se nenhuma sessão está nela e o pool está cheio de trabalho legítimo, é só fila: nada a fazer.\n\nAviso único por sequência (e por P0/P1): outro só chega se a sequência quebrar ou mudar a bead que espera. (ga-2lca0l; em 14/10 wa-hut4l5.4 segurou ~150 P2+ por varredura durante ~4h.)' \
+      "${_PY_WAIT_PRIO:-?}" "$_PY_WAIT_ID" "${_PY_WAIT_RIG:-?}" "${_PY_WAIT_POOL:-?}" "${_PY_WAIT_LIVE:-?}" "${_PY_WAIT_MAX:-?}" "$_cnt" "$PRIORITY_YIELDED" "$_list" "$_PY_WAIT_ID")"
+    if gc --city "$GC_CITY" mail send mayor -s "$_subj" -m "$_body" >/dev/null 2>&1; then
+      _mailed=1
+      log "ga-2lca0l: told the Mayor — $_subj"
+    else
+      warn "ga-2lca0l: could not mail the Mayor about $_PY_WAIT_ID holding the pool for $_cnt sweep(s) — retried next sweep."
+    fi
+  fi
+  [ "${DRY_RUN:-0}" != "1" ] || return 0
+  _tmp="$_state.tmp.$$"
+  if printf '%s\t%s\t%s\n' "$_cnt" "$_PY_WAIT_ID" "$_mailed" > "$_tmp" 2>/dev/null && mv "$_tmp" "$_state" 2>/dev/null; then :; else
+    rm -f "$_tmp" 2>/dev/null || true
+    warn "ga-2lca0l: could not record the yield-stall streak in $_state — the count restarts next sweep until the file is writable."
+  fi
   return 0
 }
 # SELFTEST-EXTRACT pilot-priority-yield: END
@@ -10188,6 +10407,10 @@ _pilot_pool_topup() {
         1) warn "ga-9t9acg.4: respawn brake OFF for $_pool — its worker's Step 1b2 probe (agents/$_pool/prompt.template.md) is not on the shared order yet (slice ga-9t9acg.5/.6), so it may take another bead than $_pending and this spawn is NOT counted toward ga-653ilw's brake. Re-arms by itself once the probe is migrated." ;;
         *) warn "ga-9t9acg.4: cannot read $GC_CITY/agents/$_pool/prompt.template.md to tell whether the $_pool worker's probe is on the shared order — this spawn for $_pending is NOT counted toward ga-653ilw's brake (fail-open; the next spawn re-checks)." ;;
       esac
+      # ga-2lca0l: bind the new session to the bead it was opened FOR — the claim is written before the worker boots, so it resumes
+      # this bead (prompt Step 1a/1b) instead of running the generic probe and building another (14/10: wa-hut4l5.4 → wa-470co3).
+      # Fail-open and always exit 0 (see _topup_bind_after_spawn); `|| true` keeps `set -e` out of it.
+      _topup_bind_after_spawn "$_pool" "$_pending" || true
       _live=$((_live + 1))
       _global=$((_global + 1))
       # ga-5fn5p3: the dispatch lanes later in this sweep read the per-pool live count from the cache the scan above warmed
@@ -14406,5 +14629,9 @@ if [ "$DRY_RUN" != "1" ] && [ "$DISPATCHED" -eq "0" ] && [ "$_pool_saturated_swe
 elif [ "$DRY_RUN" != "1" ] && [ -f "$PILOT_STALL_STATE" ]; then
   rm -f "$PILOT_STALL_STATE" 2>/dev/null || true
 fi
+
+# ga-2lca0l (3): the cede-only streak Step 5 above deliberately ignores (a sweep that only ceded is "saturated") is its own alarm:
+# N sweeps with dispatched=0, free slots and cessions → the Mayor is mailed once, naming the P0/P1 and the pool's sessions.
+_pilot_yield_stall_check || true
 
 log "=== Pilot sweep complete: dispatched=$DISPATCHED (small_slots=$SMALL_SLOTS big_slots=$BIG_SLOTS dolt_saturated_at_start=${PILOT_DOLT_SATURATED_AT_START:-0}) ==="

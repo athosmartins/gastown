@@ -67,7 +67,13 @@ case "$args" in
     for a in "$@"; do [ "$prev" = "show" ] && id="$a"; prev="$a"; done
     [ -f "$W/show.$id.json" ] && { cat "$W/show.$id.json"; exit 0; }
     exit 1 ;;
-  *" label "*|*" update "*) echo "$args" >> "$W/bd.writes"; exit 0 ;;
+  *" list "*)
+    [ -e "$W/bd.list.fail" ] && exit 1
+    asg=""; prev=""
+    for a in "$@"; do [ "$prev" = "--assignee" ] && asg="$a"; case "$a" in --assignee=*) asg="${a#--assignee=}" ;; esac; prev="$a"; done
+    [ -f "$W/inprog.$asg.json" ] && { cat "$W/inprog.$asg.json"; exit 0; }
+    echo '[]'; exit 0 ;;
+  *" label "*|*" update "*) echo "$args" >> "$W/bd.writes"; [ -e "$W/bd.update.fail" ] && exit 1; exit 0 ;;
 esac
 exit 0
 BDEOF
@@ -76,6 +82,12 @@ cat > "$WORK/bin/gc" <<'GCEOF'
 #!/usr/bin/env bash
 W="${SELFTEST_WORK:?}"
 printf 'CALL %s\n' "$(printf '%s ' "$@" | tr '\n' ' ')" >> "$W/gc.calls"
+case "$*" in
+  *"session list"*)
+    [ -e "$W/sessions.fail" ] && exit 1
+    if [ -f "$W/sessions.json" ]; then cat "$W/sessions.json"; else echo '{"ok":true,"schema_version":"1","sessions":[],"summary":{}}'; fi
+    exit 0 ;;
+esac
 [ -e "$W/gc.fail" ] && exit 1
 exit 0
 GCEOF
@@ -87,7 +99,7 @@ TOEOF
 chmod +x "$WORK/bin/bd" "$WORK/bin/gc" "$WORK/bin/timeout"
 sandbox_path_init "$WORK" jq || exit 2
 
-reset() { rm -f "$WORK"/cap.* "$WORK"/bd.writes "$WORK"/log.txt "$WORK"/unmark.log "$WORK"/show.*.json "$WORK"/crew.* "$WORK"/builders.* "$WORK/city/.gc/priority-yield.off" "$WORK"/gc.calls "$WORK"/gc.fail "$WORK"/unservable.state; }
+reset() { rm -f "$WORK"/cap.* "$WORK"/bd.writes "$WORK"/log.txt "$WORK"/unmark.log "$WORK"/show.*.json "$WORK"/crew.* "$WORK"/builders.* "$WORK/city/.gc/priority-yield.off" "$WORK"/gc.calls "$WORK"/gc.fail "$WORK"/unservable.state "$WORK"/sessions.json "$WORK"/sessions.fail "$WORK"/inprog.*.json "$WORK"/bd.list.fail "$WORK"/bd.update.fail "$WORK"/owner.inactive.* "$WORK"/stall.state "$WORK"/stall.state.tmp.*; }
 logged()   { grep -qF -- "$1" "$WORK/log.txt" 2>/dev/null; }
 warned()   { grep -qF -- "warn	"  "$WORK/log.txt" 2>/dev/null && grep -F -- "warn	" "$WORK/log.txt" | grep -qF -- "$1"; }
 writes()   { [ -f "$WORK/bd.writes" ] && wc -l < "$WORK/bd.writes" | tr -d ' ' || echo 0; }
@@ -141,6 +153,9 @@ run_py() {
     rig_has_persistent_crew_capability() { [ -e "$WORK/crew.$1" ]; }
     unmark_pool_builder() { echo "$1" >> "$WORK/unmark.log"; }
     _topup_pending_store() { [ -d "$WORK/store" ] && [ -e "$WORK/store.ok" ] && { printf '%s' "$WORK/store"; return 0; }; return 1; }
+    # ga-2lca0l: the sweep's active-owner roster, stubbed (live + not asleep + not idle past the threshold); a name is inactive iff its marker exists.
+    _session_is_active_owner() { [ -n "${1:-}" ] && [ ! -e "$WORK/owner.inactive.$1" ]; }
+    PILOT_YIELD_STALL_FILE="$WORK/stall.state"
     eval "$FUNCS"
     eval "$_script"
   )
@@ -479,6 +494,182 @@ n_copy="$(code_lines | grep -c "$LBL_PR" || true)"
 echo "$PROJECT_SRC" | grep -q 'pool_veto_reasons' && echo "$PROJECT_SRC" | grep -q 'pool_veto_cfg wa' \
   && ok "K16 the projection asks the library (pool_veto_reasons with pool_veto_cfg wa)" || bad "K16 the projection does not call the veto library"
 
+# ── L: ga-2lca0l — a P0/P1 with a LIVE top-up session opened for it is being built, not waiting ────────────────────────
+# 14/10: wa-hut4l5.4 (P1) was the head waiter for ~4h with the pool full because of the very session the Pilot opened for it
+# ("pool top-up: wa-hut4l5.4"). That session never saw its target: it ran the generic pool probe, claimed wa-470co3 and built that.
+# The bead stayed `open`, unassigned; the yield kept ceding ~150 P2+ beads per sweep to a P1 nobody was building (dispatched=0).
+# The fixture below is that shape: the session list carries the real title the Pilot gives the session.
+echo "L. a P0/P1 with a live top-up session opened for it is not 'waiting'; the claim is written/repaired (ga-2lca0l)"
+sess() {
+  jq -cn --arg n "$1" --arg t "$2" --arg s "${3:-active}" --arg c "${4:-false}" --arg ca "${5:-2026-10-14T08:47:19Z}" \
+    '{id: ("ga-wisp-" + $n), name: $n, session_name: $n, alias: $n, agent_name: $n, template: "wa-worker", title: $t, state: $s,
+      work_dir: "/rig/crew/worker", created_at: $ca, last_active: "0001-01-01T00:00:00Z", closed: ($c == "true")}'
+}
+sessions() { local _o="" _s; for _s in "$@"; do _o="${_o:+$_o,}$_s"; done; printf '{"ok":true,"schema_version":"1","sessions":[%s],"summary":{}}' "$_o" > "$WORK/sessions.json"; }
+claim_state() { jq -cn --arg id "$1" --arg st "$2" --arg a "$3" '{id: $id, status: $st, assignee: $a, metadata: {"gc.routed_to": "wa-worker"}}' > "$WORK/show.$1.json"; }
+holds() { printf '[{"id":"%s","status":"in_progress"}]' "$2" > "$WORK/inprog.$1.json"; }
+SESS_A="wa-worker-adhoc-aaa"
+POPL="$(arr "$(bead wa-p1 1 wa-worker wa)")"
+want_write() { [ "$(writes)" = "1" ] && grep -qF -- "-C $WORK/store update wa-p1" "$WORK/bd.writes" && grep -qF -- "--status in_progress" "$WORK/bd.writes" && grep -qF -- "--assignee $1" "$WORK/bd.writes"; }
+
+# L1/L2 — the bead's own Aceite: with a session, no cession and a repaired claim; without one, it cedes exactly as before.
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "$(scan_with "$POPL"); _pilot_priority_yield_for '$P2PS' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT= BLIND=0" && echo "$out" | grep -qx "DISPATCHES" \
+  && ok "L1a P1 with NO assignee + a live 'pool top-up: wa-p1' session + pool at cap → NOT a waiter, the P2 does not cede" || bad "L1a: $out"
+want_write "$SESS_A" && ok "L1b ...and the claim is REPAIRED: one write, status in_progress + assignee = that session, in the store holding the bead" || bad "L1b writes=$(writes): $(cat "$WORK/bd.writes" 2>/dev/null)"
+grep -qF -- "--set-metadata gc.session_name=$SESS_A" "$WORK/bd.writes" && grep -qF -- "--set-metadata gc.work_dir=/rig/crew/worker" "$WORK/bd.writes" \
+  && ok "L1c ...with the same gc.session_name / gc.work_dir a real claim writes (the reclaim guard heals from them)" || bad "L1c: $(cat "$WORK/bd.writes" 2>/dev/null)"
+logged "wa-p1" && logged "$SESS_A" && logged "NOT counted as waiting" && ok "L1d the log says which bead, which session, and that it is not counted as waiting" || bad "L1d: $(cat "$WORK/log.txt")"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess wa-worker-adhoc-zzz 'pool top-up: wa-other')"
+out="$(run_py "$(scan_with "$POPL"); _pilot_priority_yield_for '$P2PS' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT=wa-p1 BLIND=0" && echo "$out" | grep -qx "CEDES" && [ "$(writes)" = "0" ] \
+  && ok "L2 (control) the same P1 with NO session on it (only one for another bead) → still the head waiter, the P2 cedes, nothing is written — as today" || bad "L2: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess wa-worker-adhoc-wa-p1x 'pool top-up: wa-p1.2')"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT=wa-p1 BLIND=0" ] && [ "$(writes)" = "0" ] && ok "L2b a session for 'wa-p1.2' is not a session for 'wa-p1' (the title is matched whole, never by prefix)" || bad "L2b: $out"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1' active true)"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT=wa-p1 BLIND=0" ] && [ "$(writes)" = "0" ] && ok "L3 a CLOSED top-up session is not building anything → waiter, no write" || bad "L3: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1' asleep)"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT=wa-p1 BLIND=0" ] && [ "$(writes)" = "0" ] && ok "L3b an ASLEEP one is not building it either (and does not take a cap slot) → waiter, no write" || bad "L3b: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"; : > "$WORK/owner.inactive.$SESS_A"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT=wa-p1 BLIND=0" ] && [ "$(writes)" = "0" ] && ok "L3c a session that is not an ACTIVE owner (idle past the threshold) → waiter, no write (ga-46wq5 would take the claim back: no flapping)" || bad "L3c: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""
+sessions "$(sess wa-worker-adhoc-old 'pool top-up: wa-p1' active false 2026-10-14T05:00:00Z)" "$(sess "$SESS_A" 'pool top-up: wa-p1' active false 2026-10-14T08:47:19Z)"
+run_py "$(scan_with "$POPL")" >/dev/null
+want_write "$SESS_A" && ok "L3d two live sessions titled for the bead → the NEWEST one gets the claim" || bad "L3d: $(cat "$WORK/bd.writes" 2>/dev/null)"
+
+# L4 — three states: the roster that cannot be read is "cannot tell", never "no session" (and never "building").
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; : > "$WORK/sessions.fail"
+out="$(run_py "$(scan_with "$POPL"); _pilot_priority_yield_for '$P2PS' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT= BLIND=1" && echo "$out" | grep -qx "DISPATCHES" && [ "$(writes)" = "0" ] && warned "CANNOT TELL" \
+  && ok "L4a session list FAILS → BLIND=1, nobody is declared a waiter, the P2 is not ceded on a guess, nothing written, said in the log" || bad "L4a: $out / $(cat "$WORK/log.txt")"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; echo 'not json' > "$WORK/sessions.json"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT= BLIND=1" ] && [ "$(writes)" = "0" ] && ok "L4b a roster that is not JSON → the same BLIND=1" || bad "L4b: $out"
+reset; cap wa-worker 2 2; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT= BLIND=1" ] && [ "$(writes)" = "0" ] && ok "L4c the bead's store cannot be found → BLIND=1, no write (no guess about whose claim it is)" || bad "L4c: $out"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"; : > "$WORK/bd.list.fail"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT= BLIND=1" ] && [ "$(writes)" = "0" ] && ok "L4d cannot tell whether the session already holds other work → BLIND=1, no write (never double-book on a guess)" || bad "L4d: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT= BLIND=1" ] && [ "$(writes)" = "0" ] && ok "L4e the bead itself cannot be read → BLIND=1, no write" || bad "L4e: $out writes=$(writes)"
+
+# L5..L9 — the claim state decides what is written.
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 in_progress "$SESS_A"; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT= BLIND=0" ] && [ "$(writes)" = "0" ] && ok "L5 already claimed by that session → not a waiter and NOTHING is written (the claim is there)" || bad "L5: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 in_progress someone-else; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT=wa-p1 BLIND=0" ] && [ "$(writes)" = "0" ] && ok "L6 claimed by SOMEONE ELSE → the Pilot never takes a claim: waiter as today, no write" || bad "L6: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"; holds "$SESS_A" wa-470co3
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT=wa-p1 BLIND=0" ] && [ "$(writes)" = "0" ] && logged "wa-470co3" \
+  && ok "L7 DRIFT (the 14/10 shape): the session already holds wa-470co3 → it is NOT building wa-p1: still the waiter, no write (a second bead would double-book it), the log names what it holds" || bad "L7: $out writes=$(writes) / $(cat "$WORK/log.txt")"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"; : > "$WORK/bd.update.fail"
+out="$(run_py "$(scan_with "$POPL")")"
+[ "$out" = "WAIT=wa-p1 BLIND=0" ] && warned "could not" && ok "L8 the repair write FAILS → falls back to today's behaviour (waiter) and says so; never 'building' on a claim that did not land" || bad "L8: $out / $(cat "$WORK/log.txt")"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "DRY_RUN=1; $(scan_with "$POPL")")"
+[ "$out" = "WAIT= BLIND=0" ] && [ "$(writes)" = "0" ] && logged "WOULD" && ok "L9 DRY_RUN=1 → the same decision, no write, the log says WOULD" || bad "L9: $out writes=$(writes)"
+
+# L10 — the scan walks PAST a building row to the next one, and reads the sweep's roster when it has one.
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; cap ps-worker 1 1; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+POP2L="$(arr "$(bead wa-p1 1 wa-worker wa)" "$(bead ps-p1 1 ps-worker ps)")"
+out="$(run_py "$(scan_with "$POP2L")")"
+[ "$out" = "WAIT=ps-p1 BLIND=0" ] && ok "L10a the head row is being built → the NEXT P0/P1 behind a full pool is the waiter (one built P1 does not hide another that waits)" || bad "L10a: $out"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; : > "$WORK/sessions.fail"
+out="$(run_py "_SESSIONS_JSON='$(sessions_json_inline=$(jq -cn --arg n "$SESS_A" '{ok:true,sessions:[{name:$n,session_name:$n,alias:$n,agent_name:$n,id:"ga-wisp-x",template:"wa-worker",title:"pool top-up: wa-p1",state:"active",work_dir:"/rig/crew/worker",created_at:"2026-10-14T08:47:19Z",closed:false}]}'); echo "$sessions_json_inline")'; $(scan_with "$POPL")")"
+[ "$out" = "WAIT= BLIND=0" ] && ! grep -q 'session list' "$WORK/gc.calls" 2>/dev/null && ok "L10b the sweep's own roster (_SESSIONS_JSON) is used when it is readable — no second 'gc session list'" || bad "L10b: $out calls=$(cat "$WORK/gc.calls" 2>/dev/null)"
+
+# L11 — the second entry point: a P0/P1 that ends QUEUED during the sweep's own dispatch.
+reset; : > "$WORK/store.ok"; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "_pilot_priority_waiter_note '$(bead wa-p1 1 wa-worker wa)' wa-worker 2 2; echo \"WAIT=[\${_PY_WAIT_ID:-}] BLIND=\${_PY_BLIND}\"")"
+[ "$out" = "WAIT=[] BLIND=0" ] && want_write "$SESS_A" && ok "L11a a P1 that queued behind the full pool but has a live top-up session → not recorded as the waiter, claim repaired" || bad "L11a: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; claim_state wa-p1 open ""
+out="$(run_py "_pilot_priority_waiter_note '$(bead wa-p1 1 wa-worker wa)' wa-worker 2 2; echo \"WAIT=[\${_PY_WAIT_ID:-}]\"")"
+[ "$out" = "WAIT=[wa-p1]" ] && [ "$(writes)" = "0" ] && ok "L11b (control) the same without a session → recorded as the waiter, as today" || bad "L11b: $out"
+reset; : > "$WORK/store.ok"; claim_state wa-p1 open ""; : > "$WORK/sessions.fail"
+out="$(run_py "_pilot_priority_waiter_note '$(bead wa-p1 1 wa-worker wa)' wa-worker 2 2; echo \"WAIT=[\${_PY_WAIT_ID:-}] BLIND=\${_PY_BLIND}\"")"
+[ "$out" = "WAIT=[] BLIND=1" ] && ok "L11c the roster cannot be read → not recorded, BLIND=1" || bad "L11c: $out"
+reset; : > "$WORK/store.ok"; claim_state new1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: new1')"
+out="$(run_py "_pilot_priority_waiter_note '$(bead new1 1 - wa)' '' 2 2; echo \"WAIT=[\${_PY_WAIT_ID:-}]\"")"
+[ "$out" = "WAIT=[new1]" ] && ok "L11d a bead with no route and no pool argument (first sight) keeps the old behaviour: no pool, no top-up session to look for" || bad "L11d: $out"
+
+# L12 — the claim is written AT SPAWN, before the worker boots (the cause, not just the repair): the session then resumes it in Step 1a.
+reset; : > "$WORK/store.ok"; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "_topup_bind_after_spawn wa-worker wa-p1; echo rc=\$?")"
+[ "$out" = "rc=0" ] && want_write "$SESS_A" && grep -qF -- "--set-metadata gc.session_name=$SESS_A" "$WORK/bd.writes" \
+  && ok "L12a right after the spawn the session is BOUND to its bead: status in_progress + assignee = the new session (+ gc.session_name / gc.work_dir)" || bad "L12a: $out writes=$(writes): $(cat "$WORK/bd.writes" 2>/dev/null)"
+reset; : > "$WORK/store.ok"; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "_SESSIONS_JSON='{\"ok\":true,\"sessions\":[]}'; _topup_bind_after_spawn wa-worker wa-p1; echo rc=\$?")"
+[ "$out" = "rc=0" ] && want_write "$SESS_A" && ok "L12b the bind reads a FRESH roster (the sweep-start one cannot contain a session born this sweep)" || bad "L12b: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; claim_state wa-p1 in_progress someone-else; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "_topup_bind_after_spawn wa-worker wa-p1; echo rc=\$?")"
+[ "$out" = "rc=0" ] && [ "$(writes)" = "0" ] && ok "L12c the bead got a claim in the meantime → nothing is written over it" || bad "L12c: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; claim_state wa-p1 open ""
+out="$(run_py "_topup_bind_after_spawn wa-worker wa-p1; echo rc=\$?")"
+[ "$out" = "rc=0" ] && [ "$(writes)" = "0" ] && warned "no live top-up session" && ok "L12d the session cannot be found → no write, a warn, rc 0 (the spawn already happened; the sweep-level repair is the net)" || bad "L12d: $out"
+reset; : > "$WORK/store.ok"; claim_state wa-p1 open ""; : > "$WORK/sessions.fail"
+out="$(run_py "_topup_bind_after_spawn wa-worker wa-p1; echo rc=\$?")"
+[ "$out" = "rc=0" ] && [ "$(writes)" = "0" ] && warned "CANNOT TELL" && ok "L12e the roster cannot be read → no write, a warn, rc 0" || bad "L12e: $out"
+reset; : > "$WORK/store.ok"; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"; : > "$WORK/bd.update.fail"
+out="$(run_py "_topup_bind_after_spawn wa-worker wa-p1; echo rc=\$?")"
+[ "$out" = "rc=0" ] && warned "could not" && ok "L12f the write fails → warn, rc 0 (never stops the sweep)" || bad "L12f: $out"
+reset; : > "$WORK/store.ok"; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "DRY_RUN=1; _topup_bind_after_spawn wa-worker wa-p1; echo rc=\$?")"
+[ "$out" = "rc=0" ] && [ "$(writes)" = "0" ] && ok "L12g DRY_RUN=1 → no write" || bad "L12g: $out writes=$(writes)"
+reset; : > "$WORK/store.ok"; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "PILOT_TOPUP_BIND=0; _topup_bind_after_spawn wa-worker wa-p1; echo rc=\$?")"
+[ "$out" = "rc=0" ] && [ "$(writes)" = "0" ] && ok "L12h PILOT_TOPUP_BIND=0 → the spawn binds nothing (kill switch)" || bad "L12h: $out writes=$(writes)"
+
+# L13 — the alarm: N consecutive sweeps with dispatched=0, free slots and cessions > 0 → the Mayor is mailed ONCE, naming the P0/P1 and the pool sessions.
+stall_sweep() {  # stall_sweep <dispatched> <yielded> <small_slots> [extra shell]  — one sweep's Step 5 in a fresh process, sharing the state file
+  run_py "PILOT_YIELD_STALL_SWEEPS=3; DISPATCHED=$1; PRIORITY_YIELDED=$2; SMALL_SLOTS=$3; BIG_SLOTS=0; _PY_WAIT_ID=wa-p1; _PY_WAIT_PRIO=1; _PY_WAIT_RIG=wa; _PY_WAIT_POOL=wa-worker; _PY_WAIT_LIVE=2; _PY_WAIT_MAX=2; ${4:+$4; }_pilot_yield_stall_check; echo rc=\$?"
+}
+reset; sessions "$(sess "$SESS_A" 'pool top-up: wa-470co3')" "$(sess wa-worker-adhoc-bbb 'pool top-up: wa-cng2n8')"
+stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null
+[ "$(mails)" = "0" ] && ok "L13a two sweeps of the pattern (N=3) → no mail yet" || bad "L13a mails=$(mails)"
+out="$(stall_sweep 0 150 2)"
+[ "$(mails)" = "1" ] && echo "$out" | grep -qx "rc=0" && grep -F 'mail send mayor' "$WORK/gc.calls" | grep -qF 'wa-p1' && grep -F 'mail send mayor' "$WORK/gc.calls" | grep -qF "$SESS_A" \
+  && grep -F 'mail send mayor' "$WORK/gc.calls" | grep -qF 'wa-worker-adhoc-bbb' && grep -F 'mail send mayor' "$WORK/gc.calls" | grep -qF 'pool top-up: wa-470co3' \
+  && ok "L13b the 3rd sweep → ONE mail to the Mayor naming the P1 and every pool session (name + what it was opened for)" || bad "L13b mails=$(mails): $(cat "$WORK/gc.calls" 2>/dev/null)"
+stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null
+[ "$(mails)" = "1" ] && ok "L13c the streak goes on → NOT mailed again (once per streak and waiter)" || bad "L13c mails=$(mails)"
+stall_sweep 1 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null
+[ "$(mails)" = "1" ] && ok "L13d a sweep that DISPATCHED ends the streak (the count restarts: 2 more sweeps are not enough)" || bad "L13d mails=$(mails)"
+stall_sweep 0 150 2 >/dev/null
+[ "$(mails)" = "2" ] && ok "L13e ...and a NEW streak of 3 mails again" || bad "L13e mails=$(mails)"
+reset; sessions "$(sess "$SESS_A" 'pool top-up: wa-470co3')"
+stall_sweep 0 0 2 >/dev/null; stall_sweep 0 0 2 >/dev/null; stall_sweep 0 0 2 >/dev/null; stall_sweep 0 0 2 >/dev/null
+[ "$(mails)" = "0" ] && ok "L13f (control) dispatched=0 with NO cession is not this alarm (that is Step 5's own stall counter)" || bad "L13f mails=$(mails)"
+reset; sessions "$(sess "$SESS_A" 'pool top-up: wa-470co3')"
+stall_sweep 0 150 0 >/dev/null; stall_sweep 0 150 0 >/dev/null; stall_sweep 0 150 0 >/dev/null; stall_sweep 0 150 0 >/dev/null
+[ "$(mails)" = "0" ] && ok "L13g (control) cessions but NO free slot → no mail (the lanes are simply full)" || bad "L13g mails=$(mails)"
+reset; sessions "$(sess "$SESS_A" 'pool top-up: wa-470co3')"
+stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 "_PY_WAIT_ID=ps-p1" >/dev/null
+[ "$(mails)" = "0" ] && ok "L13h the head waiter CHANGED mid-streak → the streak restarts (it is not the same P1 being starved)" || bad "L13h mails=$(mails)"
+reset; sessions "$(sess "$SESS_A" 'pool top-up: wa-470co3')"
+stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null; before="$(cat "$WORK/stall.state" 2>/dev/null)"
+stall_sweep 0 150 2 "DRY_RUN=1" >/dev/null
+[ "$(mails)" = "0" ] && [ -n "$before" ] && [ "$(cat "$WORK/stall.state")" = "$before" ] && logged "WOULD" \
+  && ok "L13i DRY_RUN=1 → reads the streak, says what it would send on the 3rd sweep, mails nothing and leaves the state file as it was" || bad "L13i mails=$(mails) state=$(cat "$WORK/stall.state" 2>/dev/null) before=$before"
+reset; sessions "$(sess "$SESS_A" 'pool top-up: wa-470co3')"; : > "$WORK/gc.fail"
+stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null
+rm -f "$WORK/gc.fail"; stall_sweep 0 150 2 >/dev/null
+[ "$(mails)" = "2" ] && ok "L13j a mail that FAILED is retried on the next sweep (recorded as sent only after gc accepted it)" || bad "L13j mails=$(mails): $(cat "$WORK/gc.calls" 2>/dev/null)"
+reset; : > "$WORK/sessions.fail"
+stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null
+[ "$(mails)" = "1" ] && grep -F 'mail send mayor' "$WORK/gc.calls" | grep -qF 'wa-p1' && ok "L13k the pool sessions cannot be listed → the mail still goes (naming the P1) and says the list was unreadable" || bad "L13k mails=$(mails)"
+reset
+out="$(run_py "PILOT_YIELD_STALL_SWEEPS=3; DISPATCHED=0; PRIORITY_YIELDED=150; SMALL_SLOTS=2; BIG_SLOTS=0; _PY_WAIT_ID=''; _pilot_yield_stall_check; _pilot_yield_stall_check; _pilot_yield_stall_check; echo rc=\$?")"
+[ "$out" = "rc=0" ] && [ "$(mails)" = "0" ] && ok "L13l no head waiter known → nothing to name, no streak, no mail" || bad "L13l: $out mails=$(mails)"
+
 # ── I: the wiring in the dispatcher (order assertions — the functions above are inert unless these hold) ─────────────────
 echo "I. wiring order in the dispatcher"
 ln() { grep -n -m1 -- "$1" "$DISPATCHER" | cut -d: -f1; }
@@ -500,6 +691,24 @@ L_PROMPT="$(grep -n -m1 'WORKTREE_DIRECTIVE=\$(worktree_directive_for' "$DISPATC
 L_FOCUS="$(grep -n -m1 '^export PILOT_GATE_FOCUS$' "$DISPATCHER" | cut -d: -f1)"
 { [ -n "$L_FOCUS" ] && [ -n "$L_SCAN" ] && [ "$L_FOCUS" -lt "$L_SCAN" ]; } && ok "I7 PILOT_GATE_FOCUS is decided BEFORE the scan reads it (the emit runs earlier and cannot know it; the scan can)" || bad "I7 focus=$L_FOCUS scan=$L_SCAN"
 grep -q 'priority_yield_blind: num(\$blind)' "$DISPATCHER" && grep -q '"yielded_priority"' "$DISPATCHER" && ok "I6 the sweep event carries priority_yield_blind and the yielded_priority outcome" || bad "I6 sweep event fields missing"
+# ga-2lca0l: the claim is written at spawn, the scan and the queued-note ask whether a top-up session is already on the bead, the alarm runs.
+L_NOTE="$(grep -n -m1 '0) _topup_note_spawn "\$_pool" "\$_pending"' "$DISPATCHER" | cut -d: -f1)"
+L_BIND="$(grep -n -m1 '^[[:space:]]*_topup_bind_after_spawn "\$_pool" "\$_pending"' "$DISPATCHER" | cut -d: -f1)"
+L_GLOB="$(grep -n -m1 '^[[:space:]]*_global=\$((_global + 1))' "$DISPATCHER" | cut -d: -f1)"
+{ [ -n "$L_SPAWN" ] && [ -n "$L_NOTE" ] && [ -n "$L_BIND" ] && [ -n "$L_GLOB" ] && [ "$L_SPAWN" -lt "$L_NOTE" ] && [ "$L_NOTE" -lt "$L_BIND" ] && [ "$L_BIND" -lt "$L_GLOB" ]; } \
+  && ok "I8 the top-up binds the new session to its bead right after a SUCCESSFUL spawn (after the brake's note, before the live count moves)" || bad "I8 spawn=$L_SPAWN note=$L_NOTE bind=$L_BIND glob=$L_GLOB"
+L_TBN="$(grep -c '_pilot_priority_topup_building "\$' "$DISPATCHER")"
+[ "${L_TBN:-0}" -ge 2 ] && ok "I9 _pilot_priority_topup_building is called from BOTH entry points (the scan and the queued-note), not only defined" || bad "I9 call sites=$L_TBN"
+L_SCANCAP="$(grep -n -m1 'if _pilot_pool_cap_full_for "\$_story"; then' "$DISPATCHER" | cut -d: -f1)"
+L_SCANTB="$(grep -n -m1 '_tb=0; _pilot_priority_topup_building "\$_id" "\$_PCAP_POOL"' "$DISPATCHER" | cut -d: -f1)"
+L_SCANWAIT="$(grep -n -m1 '^      _PY_WAIT_ID="\$_id"; _PY_WAIT_PRIO="\$_prio"' "$DISPATCHER" | cut -d: -f1)"
+{ [ -n "$L_SCANCAP" ] && [ -n "$L_SCANTB" ] && [ -n "$L_SCANWAIT" ] && [ "$L_SCANCAP" -lt "$L_SCANTB" ] && [ "$L_SCANTB" -lt "$L_SCANWAIT" ]; } \
+  && ok "I10 in the scan the building check sits between 'the pool is full' and 'so this bead is the waiter'" || bad "I10 cap=$L_SCANCAP tb=$L_SCANTB wait=$L_SCANWAIT"
+L_STALL="$(grep -n -m1 '^_pilot_yield_stall_check || true$' "$DISPATCHER" | cut -d: -f1)"
+L_Y1M="$(grep -n -m1 'ga-y1m40: dispatched=0 with free slots' "$DISPATCHER" | cut -d: -f1)"
+L_DONE="$(grep -n 'log "=== Pilot sweep complete: dispatched=' "$DISPATCHER" | tail -1 | cut -d: -f1)"   # the last one: the end of the sweep
+{ [ -n "$L_STALL" ] && [ -n "$L_Y1M" ] && [ -n "$L_DONE" ] && [ "$L_Y1M" -lt "$L_STALL" ] && [ "$L_STALL" -lt "$L_DONE" ]; } \
+  && ok "I11 the yield-stall alarm runs once per sweep, after Step 5's own streak and before the sweep-complete line" || bad "I11 y1m40=$L_Y1M stall=$L_STALL done=$L_DONE"
 
 echo
 echo "pilot-dispatcher.priority-yield.selftest: $PASS passed, $FAIL failed"
