@@ -9,8 +9,8 @@ Contents
 USO
   remote-bundle-build.py build --city C --claude-home ~/.claude --role dog --role-dir C/.gc/agents/dogs/gastown.dog-1 \
       --remote-root /home/runner/gt-remote/bundle --remote-home /home/runner --out OUT [--skills]
-  remote-bundle-build.py verify OUT          # re-hasheia os arquivos e confere com o manifest (inclui bit de execução e bundle_hash;
-                                          pasta ou arquivo ilegível, symlink e arquivo a mais são diferença, não "limpo")
+  remote-bundle-build.py verify OUT          # re-hasheia os arquivos e confere com o manifest (inclui o bit de execução, lido do modo, e o
+                                          bundle_hash; pasta ou arquivo ilegível, symlink no lugar de arquivo e arquivo a mais são diferença, não "limpo")
 
 O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
   keep  — o script é portável (bash/jq/python3, sem nada de macOS) e é copiado para home/.claude/hooks/;
@@ -19,12 +19,16 @@ O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
           literal que o gc injeta, variável só GC_*, argumentos sem caractere de controle nem ; & | ` $ ( ) < >, e o
           subcomando executado é o do token que decidiu. O manifest lista o que o atalho precisa aceitar (shim_needs): o
           subcomando e os argumentos, exatamente como são enviados;
-  drop  — não se aplica no servidor (TCC do macOS, FUSE, ntfy com tópico privado, experimento de log local...).
+  drop  — não se aplica no servidor (TCC do macOS, FUSE, ntfy com tópico privado, experimento de log local...). Só some o hook que a
+          POLICY classificou: o trecho do comando escolhe a linha, mas o comando INTEIRO tem que ter a forma dele — script em
+          ~/.claude/hooks/<nome do token>, `gt tap guard cross-clone-block` (gt com ~/.local/bin/ opcional) ou o PREFIXO do wrapper
+          `: <marcador>; P='<cidade>/scripts/<marcador>.sh'; [ -f "$P" ] || ` (a cauda do wrapper é gerada e não é lida: o manifest guarda o
+          sha256 do comando inteiro). Guarda irmã (`gt tap guard dangerous-command`) ou comando com algo a mais NÃO é descartado: recusa.
   Chaves de settings fora da lista de portáveis (modelo, statusLine, plugins...) são descartadas e registradas.
   Só é lido o que está nomeado aqui: settings.local.json NUNCA entra (guarda permissões e segredos de sessões).
 
 POR QUE FALHA EM VEZ DE COPIAR (três estados: sei que serve / sei que não serve / não sei — o último não vira "serve"):
-  hook que não está na tabela, grupo de hooks sem a lista `hooks`, comando de shim que ganhou mais coisa (newline, PATH
+  hook que não está na tabela (ou que só CONTÉM o token de uma linha, ou casa com mais de uma: vale para keep, shim e drop), grupo de hooks sem a lista `hooks`, comando de shim que ganhou mais coisa (newline, PATH
   diferente, variável que não é GC_*...), script `keep` com construção de macOS ou com
   caminho do mini, segredo, CPF/CNPJ/telefone, arquivo de dado (*.duckdb/*.db/*.csv/*.parquet/*.gz...), binário,
   symlink de skill que sai da cidade, pasta ilegível dentro de uma skill, `--skills` com a pasta vazia, ou qualquer `/Users/` sobrando no que seria enviado
@@ -32,7 +36,7 @@ POR QUE FALHA EM VEZ DE COPIAR (três estados: sei que serve / sei que não serv
 
 SAÍDA (OUT/): home/.claude/{settings.json,hooks/*} → {remote_home}/.claude/ · city/settings.json → arquivo de --settings ·
   role/<papel>/.claude/{settings.json,skills/*} → .claude/ do diretório de trabalho da sessão · manifest.json (veredito
-  por hook, shim_needs, chaves descartadas, contagem de regras de permissão descartadas, sha256 de cada arquivo, bundle_hash — sem data/hora: mesma entrada, mesmo hash).
+  por hook com `command` (a parte reconhecida) e `command_sha256` (do comando inteiro, drop inclusive), shim_needs, chaves descartadas, contagem de regras de permissão descartadas, sha256 de cada arquivo, bundle_hash — sem data/hora: mesma entrada, mesmo hash).
 
 OUT: só é substituído se não existe, está vazio ou é um bundle que este builder gravou (manifest.json com version 1 e
   bundle_hash, e nada além do que o manifest lista); nunca se for (ou contiver) --city/--claude-home/--role-dir/--mini-home.
@@ -60,7 +64,10 @@ class Refused(Exception):
     pass
 
 
-# (trecho do comando, veredito, motivo). A primeira linha que casa decide; sem casar → Refused.
+# (trecho do comando, veredito, motivo). O trecho só ESCOLHE a linha; quem decide é a forma: o comando INTEIRO tem que ser o hook que a
+# linha classificou (keep, shim e drop), e comando que casa com nenhuma linha, ou com mais de uma, → Refused. Por isso o token de um drop
+# nomeia o hook, não a família (`gt tap guard cross-clone-block`, não `gt tap guard`): uma guarda irmã cai em "sem veredito" em vez de sumir.
+# O wrapper é a exceção declarada (WRAPPERS): o token é o marcador e o que se confere é o prefixo.
 POLICY = [
     ("gc handoff", "shim", "ciclo de contexto: o gc de verdade roda no mini"),
     ("gc prime", "shim", "monta o prompt da sessão a partir do estado da cidade (mini)"),
@@ -68,10 +75,10 @@ POLICY = [
     ("gc mail check", "shim", "entrega mail pendente à sessão"),
     ("home-scan-guard", "drop", "guarda do TCC do macOS; no Linux não há TCC"),
     ("cut-output-shadow", "drop", "experimento em sombra; o log é local do mini e ninguém o agregaria"),
-    ("fuse-avoidance", "drop", "CloudStorage/Mobile Documents não existem no servidor"),
-    ("ntfy-prompt-submit", "drop", "tópico ntfy privado + CLI notify; o servidor não guarda segredo"),
-    ("ntfy-on-stop", "drop", "idem ntfy-prompt-submit"),
-    ("gt tap guard", "drop", "usa o binário gt e o layout de clones do mini; GAP: reescrever p/ clones do servidor"),
+    ("fuse-avoidance.sh", "drop", "CloudStorage/Mobile Documents não existem no servidor"),
+    ("ntfy-prompt-submit.sh", "drop", "tópico ntfy privado + CLI notify; o servidor não guarda segredo"),
+    ("ntfy-on-stop.sh", "drop", "idem ntfy-prompt-submit.sh"),
+    ("gt tap guard cross-clone-block", "drop", "usa o binário gt e o layout de clones do mini; GAP: reescrever p/ clones do servidor"),
     ("enforce-multiple-choice-question.sh", "keep", "regra 1 do Athos vale em qualquer host (jq, falha aberta)"),
     ("enforce-mail-mcq-on-send.sh", "keep", "idem, no canal gc mail send (jq+python3, falha aberta)"),
     ("filter-bash-output.sh", "keep", "poupa tokens da cota compartilhada (jq)"),
@@ -79,6 +86,9 @@ POLICY = [
     ("filter-scraper-output.sh", "keep", "idem"),
     ("log-token-usage.sh", "keep", "grava só em ~/.claude/usage-analytics.jsonl do servidor"),
 ]
+# drop em forma de wrapper: `: <marcador>; P='<cidade>/scripts/<marcador>.sh'; [ -f "$P" ] || <cauda gerada>` (home-scan-guard-activate.sh, overlays).
+# O prefixo é conferido; a cauda é gerada e não é lida: o manifest guarda o sha256 do comando inteiro para ela ser auditável.
+WRAPPERS = {"home-scan-guard", "cut-output-shadow"}
 # O shim é comparado INTEIRO (fullmatch, sem strip nem normalização): o que o builder decide é a string que vai para o servidor.
 # O PATH é o literal que o gc injeta, não "qualquer coisa entre aspas"; variável só GC_*; nada de caractere de controle (newline = 2º comando).
 GC_PATH = 'export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH" && '
@@ -154,29 +164,46 @@ class Bundle:
         self.files[rel] = (data, ex)
 
     def hook_verdict(self, src: str, event: str, matcher, cmd: str) -> str:
-        for token, verdict, why in POLICY:
-            if token in cmd:
-                break
-        else:
+        # nenhuma linha casa → "sem veredito"; mais de uma → o comando junta hooks (o 1º token decidiria pelos outros): recusa nos dois
+        hits = [row for row in POLICY if row[0] in cmd]
+        if not hits:
             raise Refused(f"hook sem veredito em {src}/{event}: {cmd[:100]!r} — acrescente à POLICY (keep/shim/drop)")
+        if len(hits) > 1:
+            raise Refused(f"hook em {src}/{event} casa com {len(hits)} linhas da POLICY: o veredito veio de {hits[0][0]!r} mas o comando "
+                          f"também traz {[h[0] for h in hits[1:]]}: {cmd[:100]!r}")
+        token, verdict, why = hits[0]
+        # a linha só ESCOLHEU o hook; o comando INTEIRO tem que ser ele, senão o que é decidido (a linha) não é o que o shell executa
+        # (wrapper: só o prefixo é conferido, a cauda gerada não é lida — por isso o sha256 do comando inteiro vai para o manifest)
         if verdict == "shim":
             m = SHIM_RE.fullmatch(cmd)
             if not m:
                 raise Refused(f"hook shim em {src}/{event} ganhou mais que um `gc ...`: {cmd[:100]!r}")
-            if f"gc {m.group(1)}" != token:  # o token decidiu "shim" por um trecho, mas o que executa é outro subcomando
-                raise Refused(f"hook shim em {src}/{event}: o veredito veio de {token!r} mas o comando executa `gc {m.group(1)}`: {cmd[:100]!r}")
             if self.rewrite(cmd) != cmd:  # shim_needs tem que ser a string que VAI: reescrita de caminho não pode mexer nela
                 raise Refused(f"hook shim em {src}/{event} tem caminho do mini: {cmd[:100]!r}")
             self.shim_needs.add(m.group(1) + m.group(2))
-        elif verdict == "keep":
+        elif token.endswith(".sh"):  # script em ~/.claude/hooks, keep ou drop
             m = re.fullmatch(r"(?:~|\$HOME|%s)/\.claude/hooks/([\w.-]+)" % re.escape(self.home), cmd)
             if not m:
-                raise Refused(f"hook keep em {src}/{event} não é só ~/.claude/hooks/<script>: {cmd[:100]!r}")
-            if m.group(1) != token:  # o token casou por trecho do nome: script que ninguém classificou não vira "keep"
-                raise Refused(f"hook keep em {src}/{event}: {m.group(1)!r} só contém o token {token!r}, não é ele — classifique-o na POLICY")
-            self.keep_script(m.group(1))
-        self.hooks.append({"source": src, "event": event, "matcher": matcher, "verdict": verdict, "token": token,
-                           "reason": why})
+                raise Refused(f"hook {verdict} em {src}/{event} não é só ~/.claude/hooks/<script>: {cmd[:100]!r}")
+            if m.group(1) != token:  # o token casou por trecho do nome: script que ninguém classificou não vira keep nem é descartado
+                raise Refused(f"hook {verdict} em {src}/{event}: {m.group(1)!r} só contém o token {token!r}, não é ele — classifique-o na POLICY")
+            if verdict == "keep":
+                self.keep_script(m.group(1))
+        elif token in WRAPPERS:
+            m = re.match(r": %s; P='%s/scripts/%s\.sh'; \[ -f \"\$P\" \] \|\| " % (token, re.escape(str(self.city)), token), cmd)
+            if not m:
+                raise Refused(f"hook {verdict} em {src}/{event} não é só o wrapper `: {token}; P='<cidade>/scripts/{token}.sh'; [ -f \"$P\" ] || ...`: "
+                              f"{cmd[:100]!r}")
+        elif token == "gt tap guard cross-clone-block":
+            m = re.fullmatch(r"(?:(?:~|\$HOME|%s)/\.local/bin/)?%s" % (re.escape(self.home), re.escape(token)), cmd)
+            if not m:
+                raise Refused(f"hook {verdict} em {src}/{event} não é só `{token}` (com ~/.local/bin/ opcional): {cmd[:100]!r}")
+        else:  # linha da POLICY sem forma de comando conhecida: não sei o que ela classifica
+            raise Refused(f"POLICY: a linha {token!r} ({verdict}) não tem forma de comando conhecida em hook_verdict")
+        # `command` é só a parte RECONHECIDA (o resto de um wrapper não é lido) e `command_sha256` é do comando inteiro: o que foi
+        # descartado fica auditável sem o manifest carregar texto que nenhuma forma conferiu
+        self.hooks.append({"source": src, "event": event, "matcher": matcher, "verdict": verdict, "token": token, "reason": why,
+                           "command": self.rewrite(m.group(0)), "command_sha256": hashlib.sha256(cmd.encode()).hexdigest()})
         return verdict
 
     def keep_script(self, name: str) -> None:
@@ -338,6 +365,11 @@ def write_atomic(b: Bundle, manifest: dict, out: Path, protect: list) -> None:
             p.write_bytes(data)
             p.chmod(0o755 if ex else 0o644)
         (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        # pasta que o builder acabou de criar: mkdir segue o umask de quem roda (0700 com umask 077) e o modo de pasta não entra no bundle_hash;
+        # fixo como o dos arquivos. Sem subpasta → nada a fazer; chmod que falha → OSError sobe e vira "não consegui gravar"
+        for root, dirs, _ in os.walk(tmp):
+            for d in dirs:
+                os.chmod(os.path.join(root, d), 0o755)
         if out.exists():
             old = out.with_name(out.name + ".old")
             os.replace(out, old)
@@ -371,9 +403,13 @@ def verify(d: Path) -> int:
     for rel, (sha, ex) in want.items():
         p = d / rel
         try:
-            if not p.is_file():
+            # p.is_file() segue link: um symlink no lugar do arquivo, com o mesmo conteúdo, passaria. O bit é o do modo, não de os.access
+            # (que olha o usuário e a montagem: noexec dava "mudou" em bundle intacto)
+            if p.is_symlink():
+                bad.append(f"symlink no lugar de {rel}")
+            elif not p.is_file():
                 bad.append(f"falta {rel}")
-            elif hashlib.sha256(p.read_bytes()).hexdigest() != sha or os.access(p, os.X_OK) != ex:
+            elif hashlib.sha256(p.read_bytes()).hexdigest() != sha or (p.stat().st_mode & 0o111 != 0) != ex:
                 bad.append(f"mudou {rel}")
         except OSError as e:  # arquivo que não abre: não sei se mudou, e "não sei" não é "limpo"
             bad.append(f"ilegível {rel}: {e.strerror}")
