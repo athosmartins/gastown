@@ -33,8 +33,8 @@
 # Needs gate_e11_count_production_lines (quality-gate-guard.sh, sourced lib-only by the dispatcher); without it: counter-missing.
 
 # gate_taskrapida_codes — "code<TAB>label" per line: every GATE_TR_CODE this lib can leave, in one place. gate-taskrapida.selftest.sh
-# fails when this list and its cases drift. The weekly tally does NOT read it yet: that is slice 2 of the story (ga-dzzqvw.1), which
-# adds gate-lane-tally.py's TR_REASON_CODES and the check that the two lists agree.
+# fails when this list and its cases drift. The weekly tally (python) cannot source this file, so gate-lane-tally.py keeps its own copy
+# (TR_REASON_CODES, printed by `gate-lane-tally.py --list-tr-codes`) and the same selftest fails when the two lists differ in a code or in a word.
 gate_taskrapida_codes() {
   printf '%s\t%s\n' \
     granted           "concedida: task pequena, fora da lista de risco" \

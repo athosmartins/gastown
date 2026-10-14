@@ -293,8 +293,103 @@ grep -q '^exec = "\$PACK_DIR/assets/scripts/gate-lane-weekly.sh"$' "$ORDER" && o
 grep -q '^interval = "168h"$' "$ORDER" && grep -q '^trigger = "cooldown"$' "$ORDER" && ok "order is weekly (cooldown 168h)" || bad "order schedule drifted"
 grep -q 'gate-lane-tally.py" --weekly --days 7' "$WEEKLY" && ok "wrapper runs the tally in --weekly mode over 7 days" || bad "wrapper drifted"
 grep -q -i -E 'gc mail|mail send' "$TALLY" "$WEEKLY" && bad "the tally mails someone (the pattern that got the previous weekly report disabled)" || ok "no mail path anywhere in the tally/wrapper"
-STRAY_IDS=$(grep -n -o -E 'ga-[a-z0-9]{5,7}' "$TALLY" "$WEEKLY" | grep -v 'ga-atsahv' || true)
-if [ -n "$STRAY_IDS" ]; then bad "a hardcoded bead id other than the story's own appears in the tally"; else ok "no hardcoded bead id besides the story's own"; fi
+STRAY_IDS=$(grep -n -o -E 'ga-[a-z0-9]{5,7}' "$TALLY" "$WEEKLY" | grep -v -E 'ga-(atsahv|dzzqvw)' || true)
+if [ -n "$STRAY_IDS" ]; then bad "a hardcoded bead id other than the two stories this tally serves appears in the tally"; else ok "no hardcoded bead id besides the two stories this tally serves (ga-atsahv, ga-dzzqvw)"; fi
+
+# ── the task-rapida lane (ga-dzzqvw): how many, why not, first review, time, bugs after ──────────────────────────────────────
+cat > "$T/bin/bd" <<'EOF'
+#!/bin/bash
+echo "$*" >> "${FAKE_BD_LOG:-/dev/null}"
+case "${FAKE_BD_MODE:-ok}" in
+  fail) echo "boom" >&2; exit 1 ;;
+  notlist) echo '{"error":"x"}' ;;
+  badrow) echo '[{"title":"a row with no id"}]' ;;
+  *) cat "$FAKE_BD_JSON" ;;
+esac
+EOF
+chmod +x "$T/bin/bd"
+cat > "$T/bugs.json" <<'EOF'
+[{"id":"bug-1","title":"quebrou depois de ga-b1","created_at":"2026-10-02T12:00:00Z"},
+ {"id":"bug-2","title":"y","description":"regressao em ga-b2.","created_at":"2026-10-03T10:00:00Z"},
+ {"id":"bug-3","title":"antes da decisao: ga-b1","created_at":"2026-10-02T08:00:00Z"},
+ {"id":"bug-4","title":"ga-b10 ga-b1-x ga-b1.2 xga-b1","created_at":"2026-10-06T00:00:00Z"},
+ {"id":"bug-5","title":"nada a ver","created_at":"2026-10-06T00:00:00Z"},
+ {"id":"bug-6","title":"w","description":"ga-b3 falhou","created_at":"sem data"}]
+EOF
+L3="$T/qg3.jsonl"
+cat > "$L3" <<'EOF'
+{"ts":"2026-09-20T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg-old","bead":"ga-bold","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-02T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg1","bead":"ga-b1","tr_code":"granted","tr_lines":"150","dry_run":"0"}
+{"ts":"2026-10-02T09:05:00Z","event":"dispatcher_complete","lane":"task-rapida","marker":"tg1","result":"PASS","elapsed_s":300,"dry_run":"0"}
+{"ts":"2026-10-03T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg2","bead":"ga-b2","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-03T09:15:00Z","event":"dispatcher_complete","lane":"normal","marker":"tg2","result":"FAIL","elapsed_s":900,"dry_run":"0"}
+{"ts":"2026-10-03T11:00:00Z","event":"dispatcher_complete","lane":"normal","marker":"tg2","result":"PASS","elapsed_s":200,"dry_run":"0"}
+{"ts":"2026-10-04T08:00:00Z","event":"gate_lane","lane":"normal","marker":"tg4","reason_code":"code-or-prompt","tr_code":"over-limit","dry_run":"0"}
+{"ts":"2026-10-04T08:30:00Z","event":"dispatcher_complete","lane":"normal","marker":"tg4","result":"FAIL","elapsed_s":77777,"dry_run":"0"}
+{"ts":"2026-10-04T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg3","bead":"ga-b3","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-04T10:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg4","bead":"ga-b4","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-04T10:20:00Z","event":"dispatcher_complete","lane":"normal","marker":"tg4","result":"PASS","dry_run":"0"}
+{"ts":"2026-10-05T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg5","bead":"ga-b5","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-05T09:30:00Z","event":"gate_lane","lane":"normal","marker":"tg5","reason_code":"code-or-prompt","tr_code":"risk-file","dry_run":"0"}
+{"ts":"2026-10-05T10:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg-dry","bead":"ga-bdry","tr_code":"granted","dry_run":"1"}
+{"ts":"2026-10-06T09:00:00Z","event":"gate_lane","lane":"normal","marker":"r1","reason_code":"code-or-prompt","tr_code":"not-task","dry_run":"0"}
+{"ts":"2026-10-06T09:30:00Z","event":"dispatcher_complete","lane":"normal","marker":"r1","result":"FAIL","elapsed_s":99999,"dry_run":"0"}
+{"ts":"2026-10-06T09:01:00Z","event":"gate_lane","lane":"normal","marker":"r2","reason_code":"code-or-prompt","tr_code":"not-task","dry_run":"0"}
+{"ts":"2026-10-06T09:02:00Z","event":"gate_lane","lane":"normal","marker":"r3","reason_code":"code-or-prompt","tr_code":"over-limit","dry_run":"0"}
+{"ts":"2026-10-06T09:03:00Z","event":"gate_lane","lane":"normal","marker":"r4","reason_code":"code-or-prompt","tr_code":"banana","dry_run":"0"}
+{"ts":"2026-10-06T09:04:00Z","event":"gate_lane","lane":"normal","marker":"r5","reason_code":"code-or-prompt","tr_code":"switch-off","dry_run":"0"}
+{"ts":"2026-10-06T09:05:00Z","event":"gate_lane","lane":"normal","marker":"r6","reason_code":"code-or-prompt","tr_code":42,"dry_run":"0"}
+{"ts":"2026-10-06T09:06:00Z","event":"gate_lane","lane":"normal","marker":"n1","reason_code":"code-or-prompt","dry_run":"0"}
+{"ts":"2026-10-06T09:07:00Z","event":"gate_lane","lane":"fast","marker":"f1","would_have_reviewers":1,"reason_code":"fast","tr_code":"","dry_run":"0"}
+{"ts":"2026-10-06T09:08:00Z","event":"dispatcher_complete","lane":"fast","marker":"f1","result":"PASS","dry_run":"0"}
+EOF
+BDLOG="$T/bd.log"; : > "$BDLOG"
+J3=$(PATH="$T/bin:$PATH" FAKE_BD_JSON="$T/bugs.json" FAKE_BD_LOG="$BDLOG" python3 "$TALLY" --log "$L3" --now "$NOW" --json --bug-city /cityA --bug-city /cityB)
+chkj() { local got; got=$(printf '%s' "$J3" | python3 -c "import sys,json; print(json.load(sys.stdin)$2)" 2>&1); [ "$got" = "$3" ] && ok "task-rapida: $1 = $3" || bad "task-rapida: $1: got '$got', want '$3'"; }
+chkj "decisions (the re-decided tg5 counts once, as normal; dry run and pre-window grant are out)" "['decisions']" 13
+chkj "grants (last decision per marker): tg1-tg4" "['tr_granted']" 4
+chkj "a grant is neither fast nor normal: normal = tg5 + r1-r6 + n1" "['normal']" 8
+chkj "…and a grant never lands in the fast-lane's 'outro' bucket" "['normal_reasons'].get('outro (reason_code desconhecido)', 0)" 0
+chkj "refusals: tg5 (risk-file) + 2 not-task + over-limit + banana + switch-off + a non-string code; n1 (no tr_code) is not one" "['tr_refused']" 7
+chkj "refusal bucket, a listed code, by its label" "['tr_refusals']['bead de origem nao e task']" 2
+chkj "refusal bucket: a code nobody listed AND a non-string code land in 'outro', loudly" "['tr_refusals']['outro (reason_code desconhecido)']" 2
+chkj "first review: PASS (tg1, whose event says lane=task-rapida; tg4, whose event says lane=normal — the shape the dispatcher really writes, ga-ufeq1c — and whose earlier normal-lane FAIL is not the lane's)" "['tr_first_pass']" 2
+chkj "first review: FAIL (tg2, completed as lane=normal — its later PASS is not the first review; r1's normal-lane FAIL is no lane run)" "['tr_first_fail']" 1
+chkj "granted with no completed run in the window (tg3)" "['tr_no_verdict']" 1
+chkj "time: median of the first runs with a readable elapsed_s (300, 900)" "['tr_elapsed_median_s']" 600.0
+chkj "time: max" "['tr_elapsed_max_s']" 900
+chkj "time: first runs above 10 min (the story's bar)" "['tr_over_10min']" 1
+chkj "time: a run with no elapsed_s is counted apart, not as 0 (tg4)" "['tr_elapsed_unknown']" 1
+chkj "time: max is the lane's own 900 s — the 77777 s (tg4, before its grant) and 99999 s (r1, normal lane) runs are not the lane's" "['tr_elapsed_max_s']" 900
+# the join is what finds the lane's runs (their events say lane=normal): take it out and the lane's first reviews vanish — the check can fail
+sed 's/ or (decision_in_effect(c.get("marker"), t) or {}).get("lane") == "task-rapida"//' "$TALLY" > "$T/tally-mut-join.py"
+if cmp -s "$TALLY" "$T/tally-mut-join.py"; then bad "task-rapida mutation: the join expression was not found in the tally (the control is a no-op)"
+else
+  JMJ=$(PATH="$T/bin:$PATH" FAKE_BD_JSON="$T/bugs.json" python3 "$T/tally-mut-join.py" --log "$L3" --now "$NOW" --json)
+  [ "$(printf '%s' "$JMJ" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tr_first_pass'], d['tr_first_fail'], d['tr_no_verdict'])")" = "1 0 3" ] \
+    && ok "task-rapida mutation: without the join only tg1 (lane=task-rapida on its event) is seen — the other three read as 'no verdict'" \
+    || bad "task-rapida mutation: the join does not matter to the counts: $JMJ"
+fi
+chkj "bugs after: bug-1 (ga-b1), bug-2 (ga-b2 + sentence dot), bug-6 (ga-b3, undated: counted); not bug-3 (before the grant), bug-4 (ga-b10, ga-b1-x, ga-b1.2, xga-b1), bug-5" "['tr_bugs_after_ids']" "['bug-1', 'bug-2', 'bug-6']"
+grep -q -- '-C /cityA list -t bug --all --limit 0 --created-after 2026-10-01T12:00:00Z --json' "$BDLOG" && grep -q -- '-C /cityB list' "$BDLOG" && ok "task-rapida: every --bug-city is searched, all statuses, no truncation, from the window start" || bad "task-rapida: bd calls: $(cat "$BDLOG")"
+for mode in fail notlist badrow; do
+  JM=$(PATH="$T/bin:$PATH" FAKE_BD_MODE=$mode python3 "$TALLY" --log "$L3" --now "$NOW" --json)
+  [ "$(printf '%s' "$JM" | python3 -c "import sys,json; print(json.load(sys.stdin)['tr_bugs_after'])")" = "None" ] && ok "task-rapida: bd answers '$mode' → bugs-after is null (could not tell), never 0" || bad "task-rapida: bd '$mode' collapsed to a number: $JM"
+done
+TM=$(PATH="$T/bin:$PATH" FAKE_BD_MODE=fail python3 "$TALLY" --log "$L3" --now "$NOW")
+case "$TM" in *"NÃO DEU PARA APURAR"*"NÃO é zero"*) ok "task-rapida: the report says the bug look-up failed and that it is not zero" ;; *) bad "task-rapida: the failed look-up is not loud: $TM" ;; esac
+JNONE=$(PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bd-none.log" python3 "$TALLY" --log "$L2" --now "$NOW" --json)
+[ "$(printf '%s' "$JNONE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tr_granted'], d['tr_refused'], d['tr_bugs_after'])")" = "0 0 0" ] && [ ! -s "$T/bd-none.log" ] && ok "task-rapida: nothing granted → bugs-after is a real 0 and bd is not even called" || bad "task-rapida: no-grant window: $JNONE / $(cat "$T/bd-none.log" 2>/dev/null)"
+T3=$(PATH="$T/bin:$PATH" FAKE_BD_JSON="$T/bugs.json" python3 "$TALLY" --log "$L3" --now "$NOW")
+for want in "task-rapida 4" "1ª revisão: PASS 2 | FAIL 1 | sem veredito na janela 1 (de 4 concedida(s))" "mediana 10.0 min, máx 15.0 min, acima de 10 min: 1" "1 run(s) sem elapsed_s legível" "2  não concedida: bead de origem nao e task" "bugs abertos depois citando uma task da faixa: 3 (bug-1, bug-2, bug-6) [lojas buscadas:"; do
+  case "$T3" in *"$want"*) ok "task-rapida report: '$want'" ;; *) bad "task-rapida report lacks '$want': $T3" ;; esac
+done
+NL3=$(PATH="$T/bin:$PATH" FAKE_BD_JSON="$T/bugs.json" python3 -c "
+import importlib.util, json, sys
+s = importlib.util.spec_from_file_location('t', '$TALLY'); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(m.notify_line(json.loads(sys.argv[1])))" "$J3")
+case "$NL3" in *"task-rapida: 4 concedida(s), 7 não concedida(s), 1ª revisão PASS 2/FAIL 1, mediana 10.0 min, bugs depois 3"*) ok "task-rapida: the notify line (the only thing a human reads) carries the lane's numbers" ;; *) bad "task-rapida: notify line: $NL3" ;; esac
+[ "$(python3 "$TALLY" --list-tr-codes | wc -l | tr -d ' ')" = "25" ] && python3 "$TALLY" --list-tr-codes | grep -q '^granted	' && ok "task-rapida: --list-tr-codes lists the 25 codes (granted + 24 refusals)" || bad "task-rapida: --list-tr-codes"
 
 echo
 echo "== gate-lane-tally.selftest: $PASS passed, $FAIL failed =="
