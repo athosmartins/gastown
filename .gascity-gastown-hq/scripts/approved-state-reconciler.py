@@ -318,6 +318,21 @@ _PILOT_CAP_PICK_RE = re.compile(
 _PILOT_CAP_DISPATCH_RE = re.compile(
     r"ga-in9ebr: (?P<pool>\S+) pool at session cap "
     r"\((?P<live>\d+) active/creating >= (?P<max>\d+) max\) — QUEUED (?P<bead>[^\s:]+):")
+# The third shape (ga-80yi6w, Mayor 14/10): a P2+ bead the Pilot did NOT queue at a cap itself
+# but CEDED to a P0/P1 that waits behind a full pool (ga-5fn5p3, the cross-rig priority yield).
+# Same cause, same wait: the pool named is the WAITER's pool and live/max are its session count
+# and cap, so the entry carries the same (pool, live, max, epoch) as a cap line and the note is
+# coalesced into the same one-per-pool mail. Checked against the REAL log (2409 lines on
+# 14/10 09:58), all three emitters of _pilot_priority_yield_say write this one prefix; only the
+# text after the closing parenthesis differs, so the pattern stops there. <rig> and the
+# classes can be "?" when the Pilot had nothing to say; live/max "?" simply does not match
+# (an unmatched line only ever means "no evidence").
+#   "ga-5fn5p3: <bead> P<class> cedida a P0/P1 de <rig> (P<prio> <waiter> waits behind
+#    <pool> <live>/<max>) — not claimed, no writes this sweep; ..."
+_PILOT_CAP_YIELD_RE = re.compile(
+    r"ga-5fn5p3: (?P<bead>\S+) P(?:\d|\?) cedida a P0/P1 de (?:\S+) "
+    r"\(P(?:\d|\?) (?P<waiter>\S+) waits behind (?P<pool>\S+) "
+    r"(?P<live>\d+)/(?P<max>\d+)\)")
 # How long a cap line stays evidence. Same margin reasoning as
 # PILOT_DISPATCHABLE_TTL / PILOT_SWEEP_PAUSE_TTL_SEC (ga-abfcdz, ga-ndh7jm):
 # real sweep-to-sweep intervals run 640-1394s, and a whole-sweep deferral (which
@@ -1747,7 +1762,8 @@ def _sweep_halt_clause(reason):
 
 def _pilot_cap_evidence(now):
     """Return a _CapEvidence — {bead_id: {"pool", "live", "max", "epoch"}} for every bead
-    the Pilot ITSELF reported QUEUED at a pool session cap within
+    the Pilot ITSELF reported QUEUED at a pool session cap, or CEDED to a P0/P1 waiting
+    behind one (ga-80yi6w: those entries also carry "ceded_to": the waiter's id), within
     PILOT_CAP_EVIDENCE_TTL_SEC — or None when the Pilot log cannot be read or holds no
     fresh evaluating sweep.
 
@@ -1857,19 +1873,25 @@ def _pilot_cap_evidence(now):
             running_cut = True
             running_cut_why = running_cut_why or _sweep_halt_clause(m_halt.group("reason"))
             continue
-        m = _PILOT_CAP_PICK_RE.search(line) or _PILOT_CAP_DISPATCH_RE.search(line)
+        m = (_PILOT_CAP_PICK_RE.search(line) or _PILOT_CAP_DISPATCH_RE.search(line)
+             or _PILOT_CAP_YIELD_RE.search(line))
         if not m:
             continue
         epoch = _ts_epoch(line)
         if epoch is None:
             continue
         _proof(epoch)   # a datable cap line is itself proof a sweep evaluated
-        running[m.group("bead")] = {
+        entry = {
             "pool": m.group("pool"),
             "live": int(m.group("live")),
             "max": int(m.group("max")),
             "epoch": epoch,
         }
+        if m.re is _PILOT_CAP_YIELD_RE:
+            # ga-80yi6w: ceded to a P0/P1 that waits behind this pool — still a capacity
+            # wait, but the note words it as priority, not as "queued at the cap".
+            entry["ceded_to"] = m.group("waiter")
+        running[m.group("bead")] = entry
 
     if newest_eval is None or (now - newest_eval) > PILOT_CAP_EVIDENCE_TTL_SEC:
         # Readable log, but the Pilot's CURRENT dispatch decision is not in it: no
@@ -2533,6 +2555,13 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
       - no ntfy phone push and no human-touch ledger entry: nothing here asks a
         human to act (the false alarm this replaces DID count as a human touch).
 
+    ga-80yi6w: a bead the Pilot CEDED to a P0/P1 that waits behind this same pool (the
+    priority yield, ga-5fn5p3) is a capacity wait too — the pool's cap is what holds the
+    waiter, and the P2+ bead is kept back so it cannot take the slot. It rides this same
+    one-note-per-pool path (never one mail per ceded bead); only the wording differs, and
+    ONLY when at least one ceded bead is in the queue — a pool with none gets the note
+    byte-for-byte as before.
+
     Never fires in DRY_RUN mode (no state update, no mutation).
     """
     bead_id = bead.get("id") or bead.get("issue_id") or ""
@@ -2584,6 +2613,9 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
     # walk everyone, so a bead dispatched inside the TTL is still counted until its line
     # ages out: the depth is informational (it names the queue's size), not a live length.
     waiting = [b for b, e in cap_evidence.items() if e["pool"] == pool]
+    # Of those, the ones ceded to a P0/P1 (ga-80yi6w) — sorted so the example named in the
+    # note does not depend on dict order.
+    ceded = sorted(b for b in waiting if cap_evidence[b].get("ceded_to"))
     fsa = state.get("first_seen_approved", {})
     waits = sorted(((now - fsa[b]) / 60.0, b) for b in waiting if b in fsa)
     if waits:
@@ -2592,8 +2624,9 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
         oldest_age, oldest_id = age_min, bead_id
 
     _log("CAPACITY-WAIT (not dispatch-failing): pool %s | %d active/creating >= %d max | "
-         "%d queued at the cap | oldest %s %.0fmin | trigger %s | ordinal=%d%s" % (
-         pool, live, cap, len(waiting), oldest_id, oldest_age, bead_id, ordinal,
+         "%d queued at the cap (%d ceded to P0/P1) | oldest %s %.0fmin | trigger %s | "
+         "ordinal=%d%s" % (
+         pool, live, cap, len(waiting), len(ceded), oldest_id, oldest_age, bead_id, ordinal,
          " (cap changed → escalation reset)" if state_changed else ""))
 
     if DRY_RUN:
@@ -2604,9 +2637,20 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
     cap_env = "PILOT_%s_MAX" % re.sub(r"[^A-Z0-9]+", "_", pool.upper())
     seen_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cur["epoch"]))
     subject = ("Reconciler: aguardando capacidade do pool %s — %d ativa(s) no teto %d, "
-               "%d bead(s) na fila (mais antiga %s, %dmin) — NÃO é falha de despacho%s"
-               % (pool, live, cap, len(waiting), oldest_id, int(oldest_age),
+               "%d bead(s) na fila%s (mais antiga %s, %dmin) — NÃO é falha de despacho%s"
+               % (pool, live, cap, len(waiting),
+                  ", %d cedida(s) a P0/P1" % len(ceded) if ceded else "",
+                  oldest_id, int(oldest_age),
                   "" if ordinal == 1 else " (repeat #%d)" % ordinal))
+    ceded_para = ""
+    if ceded:
+        waiter = sorted(cap_evidence[b]["ceded_to"] for b in ceded)[0]
+        ceded_para = (
+            "CEDIDAS: %d das beads da fila foram CEDIDAS (ga-5fn5p3): enquanto uma bead P0/P1\n"
+            "espera neste mesmo teto (ex.: %s), o Pilot não abre sessão para P2+ — a P2+ fica\n"
+            "parada de propósito para não tomar o slot que a P0/P1 vai usar. É prioridade, não\n"
+            "falha: nada a consertar na bead cedida; ela volta sozinha quando a P0/P1 despachar.\n"
+            "Ex. cedida: %s.\n\n" % (len(ceded), waiter, ceded[0]))
     body = (
         "APPROVED-STATE-RECONCILER: aguardando CAPACIDADE do pool — NÃO é falha de despacho\n\n"
         "Pool: %s — %d sessão(ões) active/creating para um teto de %d (palavras do próprio\n"
@@ -2618,15 +2662,17 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
         "capacidade — não é bug de query nem de filtro no pilot-dispatcher.sh. A bead sai\n"
         "sozinha quando um slot libera. Esta nota é UMA por pool (backoff 1h/4h/12h), não\n"
         "uma por bead.\n\n"
+        "%s"
         "CONFERIR (só se a espera parecer longa demais):\n"
         "1. gc session list | grep %s — as %d sessões ativas estão progredindo? Sessão\n"
         "   zumbi/fantasma ocupando o teto trava a fila SEM o despacho falhar: teto cheio\n"
         "   é o sintoma, não a causa.\n"
         "2. O teto %d é o desejado? Vem do env %s do Pilot (com.gascity.pilot.plist) —\n"
         "   é alavanca operacional; mexer nela é decisão de capacidade, não de despacho.\n"
-        "Fonte: linhas 'ga-in9ebr: ... pool at session cap' de .gc/logs/pilot-dispatcher.log.\n"
+        "Fonte: linhas 'ga-in9ebr: ... pool at session cap'%s de .gc/logs/pilot-dispatcher.log.\n"
     ) % (pool, live, cap, seen_at, len(waiting), oldest_id, int(oldest_age),
-         ordinal, bead_id, pool, live, cap, cap_env)
+         ordinal, bead_id, ceded_para, pool, live, cap, cap_env,
+         " e 'ga-5fn5p3: ... cedida a P0/P1'" if ceded else "")
 
     if _do_mail_mayor is not None:
         sent = bool(_do_mail_mayor(subject, body))
@@ -4033,9 +4079,15 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
         # deliberately not an alarm about a failure.
         cap_ev = cap_evidence.get(bead_id) if cap_evidence else None
         if cap_ev is not None:
-            _log("  %s: daemon-age=%.0fmin, the Pilot queued it at the %s session cap "
-                 "(%d active/creating >= %d max) — capacity wait, NOT dispatch failing" % (
-                 bead_id, starve_age_min, cap_ev["pool"], cap_ev["live"], cap_ev["max"]))
+            if cap_ev.get("ceded_to"):
+                _log("  %s: daemon-age=%.0fmin, the Pilot ceded it to P0/P1 %s, which waits "
+                     "behind the %s session cap (%d/%d) — capacity wait, NOT dispatch failing" % (
+                     bead_id, starve_age_min, cap_ev["ceded_to"], cap_ev["pool"],
+                     cap_ev["live"], cap_ev["max"]))
+            else:
+                _log("  %s: daemon-age=%.0fmin, the Pilot queued it at the %s session cap "
+                     "(%d active/creating >= %d max) — capacity wait, NOT dispatch failing" % (
+                     bead_id, starve_age_min, cap_ev["pool"], cap_ev["live"], cap_ev["max"]))
             _alarm_capacity_wait(rig_root, bead, starve_age_min, cap_ev, cap_evidence,
                                  now, state)
             continue
@@ -8589,6 +8641,160 @@ def _selftest():
         _bad("(ga-9ekn2l-q)", "log=%r state=%r" % (
              [l for l in _q_buf.getvalue().splitlines() if "capacity" in l][:3],
              st.get("capacity_wait")))
+
+    # ── ga-80yi6w (scope extension, Mayor 14/10): a P2+ bead CEDED to a P0/P1 by the priority ──
+    # yield (ga-5fn5p3) is a capacity wait, not "dispatch failing". Measured 14/10: wa-i4rygj,
+    # wa-ul6arx.1, wa-1bthqx ... each drew its own starving mail while the Pilot log said, per
+    # sweep, "cedida a P0/P1 ... (P1 <waiter> waits behind wa-worker 3/2)". The fixtures below
+    # use the REAL line shape of pilot-dispatcher.log (verified 14/10, three emitter tails).
+    def _cede_line(epoch, bead, waiter="wa-hut4l5.4", pool="wa-worker", live=3, cap=2,
+                   rig="whatsapp_automation", tail=None):
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(epoch))
+        return ("%s [pilot-dispatcher] ga-5fn5p3: %s P2 cedida a P0/P1 de %s (P1 %s waits "
+                "behind %s %d/%d) — %s" % (
+                ts, bead, rig, waiter, pool, live, cap,
+                tail or "not claimed, no writes this sweep; stays story:approved and is "
+                        "re-evaluated every sweep."))
+
+    def _cede_log_at(t, ceded, queued=(), live=3, cap=2, dispatched=0):
+        """One evaluating sweep ending at t (a FULL WALK by default): a cession line per
+        `ceded` bead, a cap-queued line per `queued` bead, then the sweep-complete line."""
+        lines = [_cede_line(t - 60 + i, b, live=live, cap=cap) for i, b in enumerate(ceded)]
+        lines += [_cap_pick_line(t - 50 + i, b, live=live, cap=cap)
+                  for i, b in enumerate(queued)]
+        lines.append(_sweep_log_line_slots(t - 40, 3, 1, dispatched=dispatched))
+        return lines
+
+    print("\nScenario (ga-80yi6w-e): the REAL cession-line shapes (all three emitter tails, "
+          "rig '?' and a named rig, dotted bead id, live > max) parse into evidence that "
+          "carries the waiter; a plain cap-queued entry gains no 'ceded_to' key")
+    _t_e = NOW - 100
+    _read_pilot_log_lines = lambda: [
+        _cede_line(_t_e - 3, "wa-ul6arx.1"),
+        _cede_line(_t_e - 2, "wa-f8ia8v", waiter="wa-ycufyg", rig="?", live=2, cap=2),
+        _cede_line(_t_e - 1, "ga-80yi6w-e3", waiter="ga-zzzzzz", pool="gastown.dog", live=2,
+                   cap=2, tail="claim released before the prompt is built (target "
+                                "gastown.dog is a pool); stays story:approved, re-evaluated "
+                                "next sweep."),
+        _cap_pick_line(_t_e, "ga-80yi6w-e4"),
+        _sweep_log_line_slots(_t_e + 1, 3, 1)]
+    ev_e = _pilot_cap_evidence(NOW)
+    _e_ok = ev_e is not None
+    if _e_ok:
+        _e_ok = (ev_e.get("wa-ul6arx.1", {}).get("ceded_to") == "wa-hut4l5.4"
+                 and ev_e["wa-ul6arx.1"]["pool"] == "wa-worker"
+                 and ev_e["wa-ul6arx.1"]["live"] == 3 and ev_e["wa-ul6arx.1"]["max"] == 2
+                 and ev_e.get("wa-f8ia8v", {}).get("ceded_to") == "wa-ycufyg"
+                 and ev_e.get("ga-80yi6w-e3", {}).get("pool") == "gastown.dog"
+                 and ev_e["ga-80yi6w-e3"]["ceded_to"] == "ga-zzzzzz"
+                 and "ceded_to" not in ev_e.get("ga-80yi6w-e4", {"ceded_to": 1}))
+    if _e_ok:
+        _ok("(ga-80yi6w-e): 3 cession tails parse (pool, live/max, waiter); queued entry "
+            "keeps its original shape")
+    else:
+        _bad("(ga-80yi6w-e)", "got %r" % (ev_e,))
+
+    print("\nScenario (ga-80yi6w-f): END-TO-END — 3 beads ceded + 1 plain cap-queued in ONE "
+          "pool, the same list in each of the 3 rigs, all in the latest FULL-WALK sweep: "
+          "exactly ONE capacity-wait note for the pool (never one per bead), 0 'dispatch "
+          "failing', the note says CEDIDAS and names the waiter; a second cycle inside the "
+          "backoff sends nothing")
+    _ced_f = ["ga-80yi6w-f0", "ga-80yi6w-f1", "ga-80yi6w-f2"]
+    _que_f = ["ga-80yi6w-f3"]
+    _bd_approved = lambda root: [_make_bead(b, labels=list(_LBL9)) for b in _ced_f + _que_f]
+    _read_pilot_dispatchable_file = lambda: None
+    _read_pilot_sweep_pause_state_file = _pause_off
+    st = _reset()
+    for _bf in _ced_f + _que_f:
+        st["first_seen_approved"][_bf] = NOW - 1774 * 60
+    _read_pilot_log_lines = lambda: _cede_log_at(NOW, _ced_f, _que_f)
+    run_cycle(NOW, st)
+    cap80f, df80f = _cap_mails(), _df_mails()
+    _reset_captures()
+    _t_f2 = NOW + 600
+    _read_pilot_log_lines = lambda: _cede_log_at(_t_f2, _ced_f, _que_f)
+    run_cycle(_t_f2, st)
+    n80f2 = len(_cap_mails())
+    _f_problems = []
+    if df80f:
+        _f_problems.append("still 'dispatch failing': %r" % ([s for s, _ in df80f],))
+    if len(cap80f) != 1:
+        _f_problems.append("want exactly 1 capacity-wait note, got %d" % len(cap80f))
+    else:
+        _s80f, _b80f = cap80f[0]
+        for needle in ("wa-worker", "4 bead(s) na fila", "3 cedida(s) a P0/P1",
+                       "NÃO é falha de despacho"):
+            if needle not in _s80f:
+                _f_problems.append("subject missing %r: %r" % (needle, _s80f))
+        for needle in ("CEDIDAS: 3", "ga-5fn5p3", "wa-hut4l5.4", "É prioridade, não",
+                       "PILOT_WA_WORKER_MAX"):
+            if needle not in _b80f:
+                _f_problems.append("body missing %r" % needle)
+    if n80f2:
+        _f_problems.append("repeat inside the backoff mailed %d" % n80f2)
+    if st.get("capacity_wait", {}).get("wa-worker", {}).get("count") != 1:
+        _f_problems.append("capacity_wait state: %r" % (st.get("capacity_wait"),))
+    if flow_authority_calls or notify_calls:
+        _f_problems.append("side effects: flow=%r notify=%r" % (flow_authority_calls, notify_calls))
+    if _f_problems:
+        _bad("(ga-80yi6w-f)", "; ".join(_f_problems))
+    else:
+        _ok("(ga-80yi6w-f): 12 bead-rig evaluations → 1 note naming 3 ceded; 0 inside the "
+            "backoff; 0 'dispatch failing'")
+
+    print("\nScenario (ga-80yi6w-g): regression — a pool whose queue holds NO ceded bead "
+          "gets the capacity-wait note without any cession wording (subject and body are "
+          "as before ga-80yi6w)")
+    _que_g = ["ga-80yi6w-g0", "ga-80yi6w-g1"]
+    _bd_approved = lambda root: [_make_bead(b, labels=list(_LBL9)) for b in _que_g]
+    st = _reset()
+    for _bg in _que_g:
+        st["first_seen_approved"][_bg] = NOW - 1774 * 60
+    _read_pilot_log_lines = lambda: _cap_log_at(NOW, _que_g)
+    run_cycle(NOW, st)
+    cap80g = _cap_mails()
+    if (len(cap80g) == 1 and "cedida" not in cap80g[0][0] and "CEDIDAS" not in cap80g[0][1]
+            and "cedida a P0/P1" not in cap80g[0][1] and not _df_mails()):
+        _ok("(ga-80yi6w-g): queued-only pool → note carries no cession wording")
+    else:
+        _bad("(ga-80yi6w-g)", "cap=%r df=%r" % (cap80g, _df_mails()))
+
+    print("\nScenario (ga-80yi6w-h): falsification — the bead WAS ceded, but only in an OLDER "
+          "sweep; the latest evaluating sweep (a FULL WALK) does not list it → STILL "
+          "'dispatch failing' (a stale cession line must not hide a genuine failure); and a "
+          "cession line past the evidence TTL is no evidence at all")
+    _h_bead = "ga-80yi6w-h"
+    _bd_approved = lambda root: [_make_bead(_h_bead, labels=list(_LBL9))]
+    _read_pilot_log_lines = lambda: [
+        _cede_line(NOW - 1400, _h_bead), _sweep_log_line_slots(NOW - 1399, 3, 1),
+        _cede_line(NOW - 700, "ga-80yi6w-other"),
+        _sweep_log_line_slots(NOW - 40, 3, 1, dispatched=0)]
+    st = _reset()
+    st["first_seen_approved"][_h_bead] = NOW - 1774 * 60
+    run_cycle(NOW, st)
+    _h_df, _h_cap = len(_df_mails()), len(_cap_mails())
+    _read_pilot_log_lines = lambda: [
+        _cede_line(NOW - 3000, "ga-80yi6w-old"), _sweep_log_line_slots(NOW - 2999, 3, 1),
+        _sweep_log_line_slots(NOW - 30, 3, 1, dispatched=0)]
+    ev_h = _pilot_cap_evidence(NOW)
+    if _h_df == 1 and _h_cap == 0 and ev_h is not None and "ga-80yi6w-old" not in ev_h:
+        _ok("(ga-80yi6w-h): superseded cession still alarms; 50-minute-old cession line "
+            "is dropped")
+    else:
+        _bad("(ga-80yi6w-h)", "df=%s cap=%s ev=%r" % (_h_df, _h_cap, ev_h))
+
+    print("\nScenario (ga-80yi6w-i): a cession line without a readable pool N/M (the '?' "
+          "placeholders) is NOT evidence — the capacity claim needs the numbers")
+    _read_pilot_log_lines = lambda: [
+        "%s [pilot-dispatcher] ga-5fn5p3: ga-80yi6w-i P2 cedida a P0/P1 de ? (P1 wa-x "
+        "waits behind wa-worker ?/?) — not claimed, no writes this sweep" % time.strftime(
+            "[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - 60)),
+        _sweep_log_line_slots(NOW - 40, 3, 1)]
+    ev_i = _pilot_cap_evidence(NOW)
+    if ev_i == {}:
+        _ok("(ga-80yi6w-i): '?/?' cession carries no evidence")
+    else:
+        _bad("(ga-80yi6w-i)", "got %r" % (ev_i,))
 
     # ── ga-5bzrzu: ONE note per COMMON CAUSE for the "Pilot pausado" starving mails ──
     # Measured 11/10 09:2x-10:1x: 20+ "buildable bead <id> starving — dispatch failing (Pilot
