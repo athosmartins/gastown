@@ -109,9 +109,10 @@ MARKET, MARKET_REPO = "claude-plugins-official", "anthropics/claude-plugins-offi
 PLUGINS = ("superpowers", "security-guidance", "frontend-design")
 PLUGIN_KEYS = ("enabledPlugins", "extraKnownMarketplaces")
 REMOTE_PATH = 'export PATH="$HOME/.local/bin:$PATH"; '
-PROBE_CMD = (REMOTE_PATH + 'd=$(mktemp -d) || exit 125; cd "$d" || exit 125; '
+# Pasta FIXA: o claude cria um projeto em ~/.claude/projects por diretório de trabalho, e um mktemp por chamada deixaria um novo a cada hora.
+PROBE_CMD = (REMOTE_PATH + f'd={shlex.quote(RHOME)}/gt-remote/probe; mkdir -p "$d" && cd "$d" || exit 125; '
              'timeout 90 claude -p "Responda apenas: OK" --model haiku --output-format json --no-session-persistence '
-             '--setting-sources local </dev/null; rc=$?; cd /; rmdir "$d" 2>/dev/null; exit $rc')
+             '--setting-sources local </dev/null')
 EXPIRED_RE = re.compile(r"not logged in|/login|log in|expired|invalid.{0,20}(token|credential)|unauthori[sz]ed|authentication|\b401\b", re.I)
 QUOTA_RE = re.compile(r"usage limit|limit reached|rate.?limit|quota|too many requests|\b429\b|credit balance|out of (extra )?usage", re.I)
 TOKEN_RES = (re.compile(rb"sk-ant-[A-Za-z0-9_-]{16,}"), re.compile(rb'"(?:access|refresh)Token"\s*:\s*"[A-Za-z0-9._-]{16,}"'),
@@ -566,7 +567,7 @@ def cmd_push_bundle(a) -> int:
 def cmd_canary(a) -> int:
     cmd = (REMOTE_PATH + f'd={shlex.quote(RHOME)}/gt-remote/canary; mkdir -p "$d" && cd "$d" || exit 125; '
            f'timeout 100 claude -p "Responda apenas: OK" --settings {shlex.quote(RROOT)}/city/settings.json --dangerously-skip-permissions '
-           f'--model sonnet --output-format json --no-session-persistence </dev/null')
+           f'--tools "" --model sonnet --output-format json --no-session-persistence </dev/null')  # sem ferramenta nenhuma: o canary só precisa responder
     state, why = probe(cmd)
     print(f"canary: {state}" + (f": {why}" if why else ""))
     return 0 if state == "ok" else 1

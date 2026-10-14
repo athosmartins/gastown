@@ -57,7 +57,7 @@ PY
     exit 0;;
 esac
 case "$1" in
-  -p) echo probe >>"$F/calls"; echo "$*" >>"$F/probe.args"; rd probe.out; exit "$(rd probe.rc)";;
+  -p) echo probe >>"$F/calls"; echo "$*" >>"$F/probe.args"; { printf '<%s>' "$@"; echo; } >>"$F/probe.argv"; pwd >>"$F/probe.pwd"; rd probe.out; exit "$(rd probe.rc)";;
   --version) if [ -f "$F/version" ]; then cat "$F/version"; exit 0; fi; echo "claude: not found" >&2; exit 127;;
 esac
 exit 98
@@ -102,6 +102,8 @@ for rel, (txt, ex) in content.items():
     open(p, "w").write(txt)
     os.chmod(p, 0o755 if ex else 0o644)
     files[rel] = {"sha256": sha(txt.encode()), "exec": ex}
+if rd("bad_dest"):  # entrada só no manifesto (sem arquivo): só passa se o verify for forçado a passar
+    files[rd("bad_dest")] = {"sha256": sha(b""), "exec": False}
 json.dump({"version": 1, "bundle_hash": bh(files), "files": files}, open(out + "/manifest.json", "w"))
 EOF
 chmod +x "$T/bin/"* "$SRV/.local/bin/claude"
@@ -171,6 +173,9 @@ setprobe "$P_OK" 0; age checked -1000; g "volta a medir logo, sem esperar a jane
 reset; g . 0 ok
 has "sonda não carrega o settings do usuário" "$(cat "$FAKE/probe.args")" "--setting-sources local"
 has "sonda não grava transcrição" "$(cat "$FAKE/probe.args")" "--no-session-persistence"
+reset; g . 0 ok; age checked -1000; age probe -5000; g . 0 ok; eq "2 chamadas" "$(calls probe)" 2
+eq "a sonda roda sempre na mesma pasta (o claude cria um projeto por pasta: mktemp deixaria um novo por hora)" "$(sort -u "$FAKE/probe.pwd" | wc -l | tr -d ' ')" 1
+eq "e é a pasta fixa" "$(sort -u "$FAKE/probe.pwd")" "$SRV/gt-remote/probe"
 
 echo "== status"
 reset; out=$(python3 -I "$S" status); eq "status ok" $? 0; has "json" "$out" '"state": "ok"'
@@ -199,7 +204,7 @@ HETZNER_REMOTE_HOME=/home python3 -I "$S" gate >/dev/null 2>&1; eq "HOME remoto 
 echo "== push-bundle (loopback: o install roda de verdade)"
 HOOK=$SRV/.claude/hooks/a.sh; CITYF=$RROOT/city/settings.json
 srv_reset() { case "$SRV" in */hzc-selftest.*/srv) rm -rf "$SRV/gt-remote" "$SRV/.claude" "$T/out" "$T/elsewhere";; *) echo "srv_reset recusado"; exit 2;; esac
-  rm -f "$FAKE"/{drop_hook,extra_file,home_settings,rsync.mode,verify.rc.mini,verify.rc.server}; mkdir -p "$SRV/.claude/hooks" "$RROOT/work"
+  rm -f "$FAKE"/{drop_hook,extra_file,bad_dest,home_settings,rsync.mode,verify.rc.mini,verify.rc.server}; mkdir -p "$SRV/.claude/hooks" "$RROOT/work"
   echo '{"enabledPlugins":{"x@y":true},"extraKnownMarketplaces":{}}' >"$SRV/.claude/settings.json"; echo k >"$RROOT/work/keep.txt"; echo f >"$SRV/.claude/hooks/foreign.sh"; }
 pb() { PBOUT=$(python3 -I "$S" push-bundle --role dog --role-dir "$T/role" --out "$T/out" 2>&1); PBRC=$?; }
 reset; srv_reset; pb; eq "caminho feliz" $PBRC 0; has "msg" "$PBOUT" "no servidor"
@@ -228,6 +233,8 @@ srv_reset; rm -rf "$SRV/.claude/hooks"; mkdir -p "$T/elsewhere"; ln -s "$T/elsew
 no "nada no destino do link" "$T/elsewhere/a.sh"; no "city não foi escrito antes da recusa" "$CITYF"
 srv_reset; echo other/x >"$FAKE/extra_file"; pb; eq "camada desconhecida" $PBRC 1; has "msg" "$PBOUT" "camada desconhecida"; no "nada instalado" "$HOOK"
 srv_reset; echo "home/.claude/../evil" >"$FAKE/extra_file"; pb; eq "caminho com .." $PBRC 1; has "msg" "$PBOUT" "com .."; no "nada instalado" "$HOOK"
+srv_reset; echo "home/.claude/" >"$FAKE/bad_dest"; echo 0 >"$FAKE/verify.rc.mini"; echo 0 >"$FAKE/verify.rc.server"; pb
+eq "destino fora das raízes, mesmo com o verify forçado a passar (o verify é guarda de deriva, não de adversário)" $PBRC 1; has "msg" "$PBOUT" "destino fora das raizes"; no "nada instalado" "$HOOK"; no "nem o city" "$CITYF"
 srv_reset; echo corrupt >"$FAKE/rsync.mode"; pb; eq "bundle corrompido na viagem" $PBRC 1; has "msg" "$PBOUT" "verify NO SERVIDOR"; no "nada instalado" "$HOOK"
 srv_reset; pb; echo '{"permissions":{"x":1}}' >"$FAKE/home_settings"; echo noop >"$FAKE/rsync.mode"; pb
 eq "stage velho e coerente, hash diferente" $PBRC 1; has "msg" "$PBOUT" "bundle_hash do servidor"
@@ -264,6 +271,8 @@ reset; echo '[]' >"$FAKE/mk.out"; : >"$FAKE/mk.addfail"; pl; eq "marketplace add
 echo "== canary"
 reset; out=$(python3 -I "$S" canary); eq "canary ok" $? 0; has "usa o settings do city" "$(cat "$FAKE/probe.args")" "--settings $RROOT/city/settings.json"
 has "como o provider" "$(cat "$FAKE/probe.args")" "--dangerously-skip-permissions"
+has "mas sem ferramenta nenhuma (--tools com argumento vazio; revisão de segurança 14/10)" "$(cat "$FAKE/probe.argv")" "<--tools><>"
+reset; g . 0 ok; hasnt "a sonda não usa --dangerously-skip-permissions" "$(cat "$FAKE/probe.args")" "--dangerously-skip-permissions"
 reset; setprobe "$P_LOGOUT" 1; out=$(python3 -I "$S" canary); eq "canary deslogado" $? 1; has "msg" "$out" "expired"
 
 echo "== fingerprint e leak-scan"

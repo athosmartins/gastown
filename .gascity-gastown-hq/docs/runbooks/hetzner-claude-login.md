@@ -31,7 +31,7 @@ Medido por ssh em 14/10 (20h BRT), só leitura, depois das instalações:
 * Login: `claude auth status --json` → `loggedIn=false`, `authMethod=none`; `~/.claude/.credentials.json` não existe. `claude remote-control` sem login responde *"You must be logged in to use Remote Control. Remote Control is only available with claude.ai subscriptions"* — o login do servidor precisa ser pela **assinatura** (`--claudeai`, o padrão), não pelo Console.
 * A credencial do mini, antes do login: `fingerprint --save` gravado em `<cidade>/.gc/hetzner-claude.fp-before.json` (14/10 20h22 BRT; `.gc/` não é versionado). É contra esse arquivo que o `--compare` roda depois.
 
-Arquivos que esta fatia escreveu no servidor (tudo dentro de `/home/runner`): `~/.local/bin/claude`, `~/.local/share/claude/`, `~/.claude/` (settings, hooks, plugins, backups, projects de teste), `~/.claude.json`, `~/gt-remote/bundle/`, `~/gt-remote/bundle-out/`, `~/gt-remote/bin/remote-bundle-build.py`, `~/gt-remote/home-settings.merged.json`, `~/gt-remote/bundle-installed.json` e, no `canary`, `~/gt-remote/canary/`. O único `rsync --delete` é sobre `bundle-out/`.
+Arquivos que esta fatia escreveu no servidor (tudo dentro de `/home/runner`): `~/.local/bin/claude`, `~/.local/share/claude/`, `~/.claude/` (settings, hooks, plugins, backups, projects de teste), `~/.claude.json`, `~/gt-remote/bundle/`, `~/gt-remote/bundle-out/`, `~/gt-remote/bin/remote-bundle-build.py`, `~/gt-remote/home-settings.merged.json`, `~/gt-remote/bundle-installed.json` e, na chamada de modelo do `status`/`gate` e no `canary`, as pastas de trabalho fixas `~/gt-remote/probe/` e `~/gt-remote/canary/` (fixas de propósito: o claude cria um projeto em `~/.claude/projects` por pasta, e uma pasta nova por chamada deixaria um por hora). O único `rsync --delete` é sobre `bundle-out/`.
 
 ## Comandos (`hetzner-claude.py`)
 
@@ -42,7 +42,7 @@ python3 -I $S/hetzner-claude.py status [--fresh] [--probe] # JSON do estado; --f
 python3 -I $S/hetzner-claude.py install-claude --installer-sha256 <hash> [--version V]
 python3 -I $S/hetzner-claude.py plugins                    # instala o que falta e lista o resultado
 python3 -I $S/hetzner-claude.py push-bundle --role dog --role-dir <dir do papel> --out <OUT novo ou do próprio builder>
-python3 -I $S/hetzner-claude.py canary                     # sessão mínima do jeito do provider (--settings do bundle, --dangerously-skip-permissions)
+python3 -I $S/hetzner-claude.py canary                     # sessão mínima com os argumentos do provider (--settings do bundle, --dangerously-skip-permissions) e SEM ferramenta (--tools "")
 python3 -I $S/hetzner-claude.py fingerprint --save F | --compare F   # prova de que a credencial do MINI não mexeu
 python3 -I $S/hetzner-claude.py leak-scan PATH...          # formato de token do claude em arquivos; imprime arquivo e contagem, nunca o texto
 bash $S/hetzner-claude.selftest.sh                         # hermético (servidor = pasta mktemp, ssh falso que roda o comando de verdade)
@@ -94,7 +94,8 @@ Não há poller periódico, de propósito: o estado se renova quando alguém per
 **MEDIDO**
 * Tudo da seção "O que está no servidor agora".
 * `gate`/`status` contra o servidor real, deslogado: `state: logged-out`, saída 1.
-* Selftest: 185 casos, 0 falhas. Mutantes (cópias do script com UMA guarda apagada, o selftest rodado contra cada uma): `MUTANTES_PLACEHOLDER`.
+* Selftest: 197 casos, 0 falhas. Os casos novos desta rodada (sonda sempre na mesma pasta, canary sem ferramenta, destino fora das raízes) reprovam: os dois primeiros contra o script do commit anterior (3 falhas, medido), o terceiro contra o mutante que apaga a guarda.
+* Mutantes (24 cópias do script, cada uma com UMA guarda apagada: `is_error` ignorado, gate aceitando `unknown`, lock ignorado, data no futuro como cache, `loggedIn` de tipo errado, rc do `auth status`, hash do instalador, `.off`, ssh 255, plugin desligado, versão diferente, symlink/destino/remoção fora das raízes no instalador do servidor, entre outras): **24 de 24 reprovam**. Na 1ª rodada 1 sobreviveu — `inside(d)`, a recusa de destino fora das raízes: o caso não existia; sem a guarda o instalador ainda recusava, mas com um `StopIteration` em vez da mensagem. Ganhou caso e o mutante reprova.
 * Dois builds seguidos do bundle, mesmo `bundle_hash` (`0d204dbbebe6`), e o mesmo do de 14/10 00h.
 
 **INFERIDO**
@@ -107,8 +108,10 @@ Não há poller periódico, de propósito: o estado se renova quando alguém per
 
 ## Limites
 
+* **Tempo do `gate`:** com o cache válido (120 s) é só leitura de arquivo. Com o cache vencido custa 1 ssh (`claude auth status`); a cada hora custa também a chamada de modelo (limite 90 s no servidor, 120 s no mini). Pior caso, calculado dos limites e não medido: ~150 s se o servidor estiver lento. O `start` do provider tem timeout próprio (60 s por padrão): quem chama o `gate` decide se espera ou trata timeout como bloqueado (o certo é bloqueado).
+* **O `canary` mantém `--dangerously-skip-permissions`** porque o que ele prova é que o bundle carrega e a sessão responde com os argumentos que o provider vai usar; a revisão automática de segurança (14/10) apontou o flag, e a resposta foi tirar o que ele poderia soltar: `--tools ""` desliga toda ferramenta, então o canary não tem como rodar comando, editar arquivo nem abrir rede além da chamada ao modelo. `--tools ""` com esses flags foi medido no mini (`claude -p`, haiku): `is_error false`, resposta `OK`. A sonda de `status`/`gate` nem usa `--dangerously-skip-permissions`.
 * Uma conta só. Cota esgotada ou login expirado seguram `start` novo até normalizar; não há failover para outra conta (o mecanismo do mini usa o Keychain do macOS e não existe no Linux).
 * O hash do instalador é conferido contra o que o chamador passou, não contra uma fonte independente: quem passa o hash é quem leu o script.
 * `leak-scan` reconhece formatos conhecidos (`sk-ant-…`, `accessToken`/`refreshToken` em JSON, `claudeAiOauth`); formato que ele não conhece passa. Arquivo que não lê ou maior que 20 MB sai 3 ("não consegui ler" nunca vira "limpo").
 * `fingerprint`: o hash do `oauthAccount` decide; o `mdat` do Keychain só informa, porque o mini renova o próprio token o dia todo (medido 14/10: 16:29Z → 22:32Z em 12 min, sem ninguém mexer).
-* Entrega: `hetzner-claude.py` com 692 linhas (limite do gate E11: 800 de produção; o selftest e este runbook não contam).
+* Entrega: `hetzner-claude.py` com 693 linhas (limite do gate E11: 800 de produção; o selftest e este runbook não contam).
