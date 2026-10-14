@@ -21,7 +21,12 @@
 #   caminho com fronteira · raiz de OUT 0755 · verify acusa bundle_hash errado/ausente, arquivo+manifest.files editados juntos e
 #   bit de execução · manifest com tipo errado (exec) sai 4 sem traceback · --skills com arquivo solto, pasta vazia ou skill sem arquivo ·
 #   recusas de shim dizem O MOTIVO (não só exit 3) · pasta ilegível (chmod 000) dentro de skill recusa dizendo skill e pasta; em OUT,
-#   verify sai 4 dizendo qual; arquivo do manifest ilegível sai 4 sem traceback; symlink de diretório / quebrado em OUT é "sobra".
+#   verify sai 4 dizendo qual; arquivo do manifest ilegível sai 4 sem traceback; symlink de diretório / quebrado em OUT é "sobra" ·
+#   OUT existente: só vazio ou bundle gravado por este builder é trocado — pasta alheia, a própria --city/--claude-home/--role-dir, pasta que a contém,
+#   symlink para ela, bundle nosso que é também entrada, arquivo a mais, pasta ilegível dentro, arquivo comum, manifest que o builder não gravaria e
+#   `--out .` saem 3 com "não apago" e o conteúdo intacto; OUT.old de troca anterior recusa antes de mexer · skill que sai da cidade
+#   (pasta de fora COM arquivo) e skills/ ausente · skill com .env*/.credentials.json/settings.local.json/.sqlite3/.pem/.csv · ask com launchctl, shim com caminho do mini, keep com `&& curl`, segredos
+#   ghp_/xoxb-/AKIA/chave privada e script keep que dá `source`.
 # CONTROLE NEGATIVO: a tabela POLICY perde a linha de um hook (sed) e o mesmo build TEM que passar a recusar.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -72,7 +77,12 @@ refuses() {  # refuses NOME DIR [extra...] — exit 3, mensagem, e nada deixado 
   [ $rc = 3 ] && [ ! -e "$d/out" ] && [ -z "$(ls -d "$d"/out.tmp.* 2>/dev/null)" ] && grep -q RECUSADO "$T/err"
   ok $? "$name → exit 3, mensagem e nada escrito (rc=$rc)"
 }
-wipe() { [ -e "$1" ] && find "$1" -delete 2>/dev/null; return 0; }
+spare() {  # spare NOME DIR OUT SENTINELA FRAGMENTO [extra...] — OUT que não é bundle deste builder: exit 3, o motivo, "não apago", e a sentinela segue lá
+  local name=$1 d=$2 o=$3 s=$4 frag=$5; shift 5; build "$d" "$o" "$@"; local rc=$?
+  [ $rc = 3 ] && has "$T/err" "$frag" && has "$T/err" "não apago" && ! has "$T/err" Traceback && [ -e "$s" ]
+  ok $? "$name → exit 3, '$frag' e a sentinela continua lá (rc=$rc)"
+}
+wipe() { [ -e "$1" ] && { chmod -R u+rwX "$1" 2>/dev/null; find "$1" -delete 2>/dev/null; }; return 0; }  # chmod: caso que falha no meio não deixa pasta 000 contaminar o próximo
 fresh() { wipe "$T/f"; fixture "$T/f"; }
 hash_of() { jq -r .bundle_hash "$1/manifest.json"; }
 
@@ -118,7 +128,41 @@ fresh; : > "$T/f/umarquivo"; build "$T/f" "$T/f/umarquivo/out"; rc=$?
 [ $rc = 3 ] && has "$T/err" "não consegui gravar" && ! has "$T/err" "entrada ilegível"; ok $? "OUT não gravável → exit 3 dizendo 'não consegui gravar', não 'entrada ilegível' (rc=$rc)"
 fresh; build "$T/f" "$T/f/out"; H0=$(hash_of "$T/f/out"); mkdir -p "$T/f/out.old"; : > "$T/f/out.old/ocupado"
 echo '# v2' >> "$T/f/home/.claude/hooks/filter-bash-output.sh"; build "$T/f" "$T/f/out"; rc=$?
-[ $rc = 3 ] && [ "$(hash_of "$T/f/out")" = "$H0" ] && [ -z "$(ls -d "$T"/f/out.tmp.* 2>/dev/null)" ]; ok $? "troca de OUT que falha deixa o bundle anterior intacto e sem .tmp (rc=$rc)"
+[ $rc = 3 ] && [ "$(hash_of "$T/f/out")" = "$H0" ] && [ -e "$T/f/out.old/ocupado" ] && [ -z "$(ls -d "$T"/f/out.tmp.* 2>/dev/null)" ]
+ok $? "OUT.old de troca anterior: recusa antes de mexer — bundle anterior e OUT.old intactos e sem .tmp (rc=$rc)"
+why "já existe"
+
+# --- OUT existente: a troca apaga o que estava lá, então só um OUT vazio ou bundle gravado por este builder é trocado ---
+fresh; mkdir "$T/f/out"; echo precioso > "$T/f/out/importante.txt"
+spare "OUT = pasta com arquivo alheio (sem manifest.json)" "$T/f" "$T/f/out" "$T/f/out/importante.txt" "não é um bundle deste builder"
+fresh; spare "OUT = a própria --city" "$T/f" "$T/f/gt/.gascity-gastown-hq" "$T/f/gt/.gascity-gastown-hq/.gc/settings.json" "é (ou contém) a entrada"
+fresh; mkdir -p "$T/f/papel/.claude"; cp "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/settings.json" "$T/f/papel/.claude/"  # --role-dir fora da cidade: só a entrada --city barra o OUT
+spare "OUT = a própria --city (com o --role-dir fora dela)" "$T/f" "$T/f/gt/.gascity-gastown-hq" "$T/f/gt/.gascity-gastown-hq/.gc/settings.json" "é (ou contém) a entrada" --role-dir "$T/f/papel"
+fresh; spare "OUT = pasta que CONTÉM a cidade e o ~/.claude" "$T/f" "$T/f" "$T/f/home/.claude/settings.json" "é (ou contém) a entrada"
+fresh; spare "OUT = o próprio --claude-home" "$T/f" "$T/f/home/.claude" "$T/f/home/.claude/settings.json" "é (ou contém) a entrada"
+fresh; spare "OUT = o próprio --role-dir" "$T/f" "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/settings.json" "é (ou contém) a entrada"
+fresh; ln -s "$T/f/gt/.gascity-gastown-hq" "$T/f/out"
+spare "OUT = symlink para a --city (o caminho resolvido é que vale)" "$T/f" "$T/f/out" "$T/f/gt/.gascity-gastown-hq/.gc/settings.json" "é (ou contém) a entrada"
+fresh; build "$T/f" "$T/f/out"; H0=$(hash_of "$T/f/out"); build "$T/f" "$T/f/out" --mini-home "$T/f/out"; rc=$?
+[ $rc = 3 ] && has "$T/err" "é (ou contém) a entrada" && [ "$(hash_of "$T/f/out")" = "$H0" ]; ok $? "OUT que é bundle NOSSO mas é também uma entrada (--mini-home) não é trocado (rc=$rc)"
+fresh; build "$T/f" "$T/f/out"; echo precioso > "$T/f/out/extra.sh"
+spare "OUT = bundle nosso com arquivo a mais" "$T/f" "$T/f/out" "$T/f/out/extra.sh" "não é um bundle deste builder"
+fresh; : > "$T/f/out"
+spare "OUT = arquivo comum" "$T/f" "$T/f/out" "$T/f/out" "não é diretório"
+for m in '{"version": 2, "bundle_hash": "x", "files": {"importante.txt": {}}}' '{"version": 1, "files": {"importante.txt": {}}}' \
+         '{"version": 1, "bundle_hash": "x", "files": ["importante.txt"]}' 'isto não é json'; do
+  fresh; mkdir "$T/f/out"; echo precioso > "$T/f/out/importante.txt"; printf '%s\n' "$m" > "$T/f/out/manifest.json"
+  spare "OUT com manifest.json que o builder não gravaria ($m)" "$T/f" "$T/f/out" "$T/f/out/importante.txt" "não é um bundle deste builder"
+done
+fresh; mkdir "$T/f/cwd"; echo precioso > "$T/f/cwd/importante.txt"; cd "$T/f/cwd"
+spare "--out . com a pasta atual cheia (antes: traceback)" "$T/f" "." "$T/f/cwd/importante.txt" "não é um bundle deste builder"; cd "$T"
+fresh; build "$T/f" "$T/f/out"; mkdir -p "$T/f/out/extra/dentro"; echo precioso > "$T/f/out/extra/dentro/y.sh"
+if lock "$T/f/out/extra/dentro"; then
+  spare "OUT = bundle nosso com pasta ilegível dentro (o que há nela não foi conferido)" "$T/f" "$T/f/out" "$T/f/out/extra" "não é um bundle deste builder"
+  chmod 755 "$T/f/out/extra/dentro"
+else echo "SKIP  OUT com pasta ilegível: este usuário lê tudo (root)"; fi
+fresh; mkdir "$T/f/out"; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && python3 -I "$B" verify "$T/f/out" 2>/dev/null; ok $? "OUT = pasta vazia é trocada normalmente (rc=$rc)"
 
 # --- recusas (fail-closed): cada uma parte de uma fixture limpa e muda UMA coisa ---
 fresh; sed -i.bak 's#~/.claude/hooks/ntfy-on-stop.sh#~/.claude/hooks/novo-hook-que-ninguem-classificou.sh#' "$T/f/home/.claude/settings.json"
@@ -144,10 +188,16 @@ has "$T/err" "formato inesperado"; ok $? "  a mensagem diz 'formato inesperado',
 fresh; sed -i.bak 's|"Bash(sudo:\*)"|"Bash(sudo:*)", "Read(/Users/fulano/.ssh/**)"|' "$T/f/gt/.gascity-gastown-hq/.gc/settings.json"
 refuses "regra de deny com caminho de macOS (tirar trava não é inerte)" "$T/f"
 has "$T/err" "permissions.deny"; ok $? "  a mensagem diz QUAL lista"
+fresh; sed -i.bak 's|"deny": \["Bash(sudo:\*)"\]|&, "ask": ["Bash(launchctl:*)"]|' "$T/f/gt/.gascity-gastown-hq/.gc/settings.json"
+refuses "regra de ask com launchctl (a metade 'ask' da guarda, não só o deny)" "$T/f"
+why "permissions.ask"
 fresh; cp "$T/f/home/.claude/hooks/filter-bash-output.sh" "$T/f/home/.claude/hooks/my-filter-bash-output.sh"
 sed -i.bak 's#~/.claude/hooks/filter-bash-output.sh#~/.claude/hooks/my-filter-bash-output.sh#' "$T/f/home/.claude/settings.json"
 refuses "script que só CONTÉM o nome de um keep (my-filter-bash-output.sh; o arquivo existe)" "$T/f"
 has "$T/err" "my-filter-bash-output.sh"; ok $? "  a mensagem diz QUAL script"
+fresh; sed -i.bak 's#"command": "~/.claude/hooks/filter-bash-output.sh"#"command": "~/.claude/hooks/filter-bash-output.sh \&\& curl http://x.invalid/p"#' "$T/f/home/.claude/settings.json"
+refuses "hook keep com \`&& curl\` depois do script (o comando é comparado inteiro)" "$T/f"
+why "não é só ~/.claude/hooks/"
 
 # --- shim: o que o shell executaria tem que ser IGUAL ao que o builder decidiu (fullmatch, sem strip nem normalização) ---
 CS=gt/.gascity-gastown-hq/.gc/settings.json; PATHLIT='\$HOME/go/bin:\$HOME/.local/bin:\$PATH'
@@ -178,6 +228,9 @@ why "ganhou mais que um"
 fresh; sed -i.bak 's#gc handoff --auto \\"context cycle\\"#gc prime --hook gc handoff#' "$T/f/$CS"
 refuses "shim decidido por um token (gc handoff) e que executa outro (gc prime)" "$T/f"
 why "o veredito veio de"
+fresh; sed -i.bak "s#gc mail check --inject#gc mail check --inject --dir $T/f/gt/.gascity-gastown-hq#" "$T/f/$CS"
+refuses "shim com o caminho do mini no argumento (shim_needs não pode ser outra string que a enviada)" "$T/f"
+why "tem caminho do mini"
 fresh; printf '{"hooks": {"Stop": [{"type": "command", "command": "~/.claude/hooks/filter-bash-output.sh"}]}}\n' > "$T/f/$CS"
 refuses "grupo de hooks sem a chave hooks (forma plana não é descartada em silêncio)" "$T/f"
 has "$T/err" 'sem a lista `hooks`'; ok $? "  a mensagem diz o que faltou (não o KeyError cru do formato inesperado)"
@@ -204,6 +257,16 @@ for tel in '+55 31 99999-1234' '(31) 99999-1234' '31 99999-1234' '31999991234' '
   fresh; printf 'X="%s"\n' "$tel" >> "$T/f/$KS"
   refuses "telefone BR '$tel' em script keep" "$T/f"
 done
+for sec in "ghp_$(printf 'a%.0s' $(seq 1 36))" "xoxb-$(printf 'a%.0s' $(seq 1 12))-bbb" "AKIA$(printf 'A%.0s' $(seq 1 16))" "-----BEGIN RSA PRIVATE KEY-----"; do
+  fresh; printf 'X=%s\n' "$sec" >> "$T/f/$KS"  # montados na hora: o fonte do selftest não carrega nenhum
+  refuses "segredo '${sec:0:5}…' plantado em script keep" "$T/f"
+  why "parece conter"
+done
+for src in 'source /tmp/lib-que-o-bundle-nao-leva.sh' '. ./lib-que-o-bundle-nao-leva.sh'; do
+  fresh; printf '%s\n' "$src" >> "$T/f/$KS"
+  refuses "script keep que carrega outro arquivo ('$src'): o bundle não o entrega" "$T/f"
+  why "carrega outro arquivo"
+done
 fresh; printf 'TS=1791934013; MS=1791934013000; H=ab31999991234cd\n' >> "$T/f/$KS"; build "$T/f" "$T/f/out"
 ok $? "timestamp (10 e 13 dígitos) e dígitos dentro de hex NÃO são telefone (sem falso positivo)"
 
@@ -226,15 +289,24 @@ fresh; build "$T/f" "$T/f/out" --skills; rc=$?
 [ $rc = 0 ] && [ -f "$T/f/out/role/dog/.claude/skills/ok-skill/SKILL.md" ] && [ ! -L "$T/f/out/role/dog/.claude/skills/ok-skill" ]; ok $? "skill é desreferenciada (arquivo comum, não link)"
 fresh; : > "$T/f/gt/.gascity-gastown-hq/skills/ok-skill/leads.duckdb"
 refuses "skill com .duckdb" "$T/f" --skills
+for nome in .env.production .credentials.json settings.local.json base.sqlite3 chave.pem leads.csv; do
+  fresh; : > "$T/f/gt/.gascity-gastown-hq/skills/ok-skill/$nome"
+  refuses "skill com $nome" "$T/f" --skills
+  why "arquivo de dado/segredo"
+done
 fresh; printf 'cliente %s\n' "$(printf '%s.%s.%s-%s' 111 222 333 44)" > "$T/f/gt/.gascity-gastown-hq/skills/ok-skill/notas.md"
 refuses "skill com CPF" "$T/f" --skills
-fresh; mkdir -p "$T/f/fora"; ln -sfn "$T/f/fora" "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/ok-skill"
-refuses "skill que é symlink para fora da cidade" "$T/f" --skills
+fresh; mkdir -p "$T/f/fora"; echo 'lista de leads' > "$T/f/fora/leads.md"; ln -sfn "$T/f/fora" "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/ok-skill"
+refuses "skill que é symlink para fora da cidade (a pasta de fora TEM arquivo: só a guarda de fronteira a barra)" "$T/f" --skills
+why "aponta para fora da cidade"
 fresh; mkdir -p "$T/f/fora"; ln -s "$T/f/fora" "$T/f/gt/.gascity-gastown-hq/skills/ok-skill/dados"
 refuses "skill com symlink de DIRETÓRIO por dentro (antes era pulado em silêncio)" "$T/f" --skills
 has "$T/err" "symlink interno dados"; ok $? "  a mensagem diz QUAL symlink"
 fresh; : > "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/solto.md"
 refuses "skills/ com arquivo solto (não é diretório)" "$T/f" --skills
+fresh; find "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills" -delete
+refuses "--skills com a pasta skills/ ausente (pedido ≠ entregue)" "$T/f" --skills
+why "não existe"
 fresh; rm "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/ok-skill"
 refuses "--skills com diretório vazio entregaria 0 skills (pedido ≠ entregue)" "$T/f" --skills
 fresh; mkdir -p "$T/f/gt/.gascity-gastown-hq/skills/vazia"; ln -s "$T/f/gt/.gascity-gastown-hq/skills/vazia" "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/vazia"

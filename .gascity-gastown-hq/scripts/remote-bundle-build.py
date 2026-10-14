@@ -34,8 +34,12 @@ SAÍDA (OUT/): home/.claude/{settings.json,hooks/*} → {remote_home}/.claude/ �
   role/<papel>/.claude/{settings.json,skills/*} → .claude/ do diretório de trabalho da sessão · manifest.json (veredito
   por hook, shim_needs, chaves descartadas, contagem de regras de permissão descartadas, sha256 de cada arquivo, bundle_hash — sem data/hora: mesma entrada, mesmo hash).
 
-CÓDIGOS: 0 ok · 2 uso · 3 recusado (política/guarda/entrada ilegível/OUT não gravável) · 4 verify encontrou diferença
-  ou não conseguiu ler o manifest, uma pasta ou um arquivo de OUT.
+OUT: só é substituído se não existe, está vazio ou é um bundle que este builder gravou (manifest.json com version 1 e
+  bundle_hash, e nada além do que o manifest lista); nunca se for (ou contiver) --city/--claude-home/--role-dir/--mini-home.
+  Qualquer outra coisa em OUT, ou (com OUT existente) um OUT.old de troca anterior, → exit 3 e nada é apagado. OUT é resolvido (realpath) antes.
+
+CÓDIGOS: 0 ok · 2 uso · 3 recusado (política/guarda/entrada ilegível/OUT que não é bundle deste builder ou não gravável) ·
+  4 verify encontrou diferença ou não conseguiu ler o manifest, uma pasta ou um arquivo de OUT.
 """
 from __future__ import annotations
 
@@ -183,6 +187,8 @@ class Bundle:
         bad = MAC_ONLY.search(code)
         if bad:
             raise Refused(f"hook keep {name}: construção de macOS/caminho do mini no código: {bad.group(0)!r}")
+        if re.search(r"^\s*(?:source|\.)\s", code, re.M):  # o script que ele carrega não está no bundle: não sei se é portável
+            raise Refused(f"hook keep {name}: carrega outro arquivo (source/.), que o bundle não entrega")
         self.add(f"home/.claude/hooks/{name}", p.read_bytes(), ex=True)
 
     def settings(self, src: str, kind: str, path: Path) -> dict:
@@ -281,7 +287,48 @@ class Bundle:
                 "bundle_hash": listing_hash({rel: (hashlib.sha256(d).hexdigest(), ex) for rel, (d, ex) in self.files.items()})}
 
 
-def write_atomic(b: Bundle, manifest: dict, out: Path) -> None:
+def scan(d: Path) -> tuple[set[str], list[str]]:
+    """Tudo que há sob d, menos manifest.json (link para pasta conta e não é descido), e as pastas que não listou."""
+    seen: set[str] = set()
+    bad: list[str] = []
+
+    def unreadable(e: OSError) -> None:  # rglob engolia a pasta que não lista: o que há dentro não foi conferido, e isso não é "limpo"
+        bad.append(f"pasta ilegível {os.path.relpath(e.filename or d, d)}: {e.strerror}")
+    for root, dirs, names in os.walk(d, onerror=unreadable):
+        seen |= {os.path.relpath(os.path.join(root, n), d) for n in names + [x for x in dirs if os.path.islink(os.path.join(root, x))]}
+    seen.discard("manifest.json")
+    return seen, bad
+
+
+def check_out(out: Path, protect: list) -> None:
+    """A troca apaga o que estava em OUT: só passa quando OUT não existe, está vazio ou é um bundle que este builder gravou."""
+    for p in protect:
+        real = Path(os.path.realpath(p))
+        if out == real or out in real.parents:
+            raise Refused(f"OUT {out} é (ou contém) a entrada {real}: não apago")
+    if not os.path.lexists(out):
+        return
+    if not out.is_dir():
+        raise Refused(f"OUT {out} existe e não é diretório: não apago")
+    old = out.with_name(out.name + ".old")
+    if os.path.lexists(old):
+        raise Refused(f"{old} já existe (sobra de uma troca anterior?): remova-o ou escolha outro OUT; não apago")
+    if not any(out.iterdir()):
+        return
+    seen, bad = scan(out)
+    try:
+        doc = json.loads((out / "manifest.json").read_text())
+        ours = doc["version"] == 1 and isinstance(doc["bundle_hash"], str) and isinstance(doc["files"], dict)
+    except (OSError, ValueError, KeyError, TypeError):
+        ours = False
+    if not ours or bad or not seen <= set(doc["files"]):
+        raise Refused(f"OUT existe e não é um bundle deste builder (sem manifest.json válido, ou com arquivo/pasta que ele não grava): "
+                      f"não apago {out}")
+
+
+def write_atomic(b: Bundle, manifest: dict, out: Path, protect: list) -> None:
+    check_out(out, protect)
+    out.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix=out.name + ".tmp.", dir=out.parent))
     try:
         tmp.chmod(0o755)
@@ -320,14 +367,7 @@ def verify(d: Path) -> int:
     except (OSError, ValueError, KeyError, AttributeError, TypeError) as e:  # sem manifest legível não há o que conferir: não é "limpo"
         print(f"remote-bundle-build verify: manifest.json ilegível em {d}: {e!r}", file=sys.stderr)
         return MISMATCH
-    bad: list[str] = []
-    seen: set[str] = set()
-
-    def unreadable(e: OSError) -> None:  # rglob engolia a pasta que não lista: o que há dentro não foi conferido, e isso não é "limpo"
-        bad.append(f"pasta ilegível {os.path.relpath(e.filename or d, d)}: {e.strerror}")
-    for root, dirs, names in os.walk(d, onerror=unreadable):  # tudo que não é pasta conta, e link para pasta (que o walk não desce) também
-        seen |= {os.path.relpath(os.path.join(root, n), d) for n in names + [x for x in dirs if os.path.islink(os.path.join(root, x))]}
-    seen.discard("manifest.json")
+    seen, bad = scan(d)
     for rel, (sha, ex) in want.items():
         p = d / rel
         try:
@@ -375,10 +415,12 @@ def main(argv: list[str]) -> int:
     except (AttributeError, TypeError, KeyError) as e:  # JSON válido com forma que o claude não usa (hooks como lista...)
         print(f"remote-bundle-build: RECUSADO: settings com formato inesperado: {e!r}", file=sys.stderr)
         return REFUSED
-    out = Path(a.out)
+    out = Path(os.path.realpath(a.out))  # um só caminho para decidir e para agir: "." e symlink para a cidade aparecem como o que são
     try:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        write_atomic(bundle, manifest, out)
+        write_atomic(bundle, manifest, out, [bundle.city, a.claude_home, a.role_dir, a.mini_home])
+    except Refused as e:
+        print(f"remote-bundle-build: RECUSADO: {e}", file=sys.stderr)
+        return REFUSED
     except OSError as e:  # a entrada estava boa; o que falhou foi gravar — a mensagem não pode culpar a entrada
         print(f"remote-bundle-build: RECUSADO: não consegui gravar {out}: {e}", file=sys.stderr)
         return REFUSED
