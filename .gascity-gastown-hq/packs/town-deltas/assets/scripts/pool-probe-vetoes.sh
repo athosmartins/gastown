@@ -20,6 +20,11 @@
 #                        this bead": a false page costs one Mayor wake (what happened before this
 #                        story); a false silence strands a bead with nobody told.
 #
+# A third direction, ga-qmfm8r: pool_veto_cfg wa | dog = ONE pool's own list, exactly. The Pilot's priority
+# cession asks "will THIS pool's worker take this P0?" — and a label only the wa pool refuses
+# (delivery:pending-restart) is invisible to `all` and over-reported by `any` for a dog bead. The question
+# is about one named pool, so it gets that pool's list, not a summary of the others.
+#
 # What is snapshotted, and where each snapshot comes from (read 2026-09-26, not remembered):
 #   DOG     the gastown.dog probe = the engine's bdReadyPoolDemandExcludeLabelArgs (exact labels) +
 #           poolDemandLabelFilterJQ (prefix families). The LIVE binary is gc-1.1.1-engwin0919.
@@ -46,7 +51,7 @@ POOL_VETO_NEXT_ACTION_WA=true
 
 # jq definitions, to be PREPENDED to a jq program that runs on ONE bead object (an element of `bd show
 # --json` or an event's payload.bead): `pool_veto_reasons($now; $cfg)` echoes an ARRAY of short reason
-# strings — empty means nothing vetoes it. $cfg is the output of `pool_veto_cfg any|all`; $now is epoch.
+# strings — empty means nothing vetoes it. $cfg is the output of `pool_veto_cfg any|all|wa|dog`; $now is epoch.
 POOL_VETO_JQ_DEFS='
 def pool_held($now):
   ((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:")))) as $h
@@ -69,8 +74,9 @@ def pool_veto_reasons($now; $cfg):
       ( if pool_held($now) then "held" else empty end ) ];
 '
 
-# pool_veto_cfg any|all — prints the JSON config for pool_veto_reasons; non-zero + empty stdout when it
-# cannot (bad mode, jq missing/failed). Callers MUST treat empty as "cannot tell", never as "no vetoes".
+# pool_veto_cfg any|all|wa|dog — prints the JSON config for pool_veto_reasons; non-zero + empty stdout when
+# it cannot (bad mode, jq missing/failed). Callers MUST treat empty as "cannot tell", never as "no vetoes".
+# wa also answers for ps-worker (same list, asserted by pool-probe-vetoes.selftest.sh).
 pool_veto_cfg() {
   jq -cn --arg mode "${1:-}" \
     --argjson de "$POOL_VETO_EXACT_DOG" --argjson we "$POOL_VETO_EXACT_WA" \
@@ -82,5 +88,9 @@ pool_veto_cfg() {
       { exact: [ $de[] | select(. as $x | ($we | index($x)) != null) ],
         prefix: [ $dp[] | select(. as $x | ($wp | index($x)) != null) ],
         next_action: ($dn and $wn) }
-    else error("pool_veto_cfg: mode must be any or all") end' 2>/dev/null
+    elif $mode == "wa" then
+      { exact: $we, prefix: $wp, next_action: $wn }
+    elif $mode == "dog" then
+      { exact: $de, prefix: $dp, next_action: $dn }
+    else error("pool_veto_cfg: mode must be any, all, wa or dog") end' 2>/dev/null
 }

@@ -16,6 +16,11 @@
 # are pilot-dispatcher.pool-cap-fail-closed / ga-in9ebr) and the rig/builder lookups are stubbed; the priority class comes from
 # the REAL work-order library (scripts/work-order.sh), so "what counts as P0/P1/P2+" is the city's definition, not a copy.
 #
+# ga-qmfm8r (section K): a P0/P1 whose label the TARGET POOL'S OWN PROBE refuses (delivery:pending-restart on wa-worker) is not "waiting" —
+# no worker takes it, so ceding to it only starves everything else (13/10: 9h, 157 P2+ ceded to wa-gg9uhf). The refusal list comes from
+# scripts/pool-probe-vetoes.sh, the one place that owns it; this selftest sources the REAL library, it carries no list of its own. The
+# Mayor is told ONCE per (bead, reasons) through `gc mail send mayor` (stubbed here: the sandbox PATH has no real gc).
+#
 # Every scenario that asserts the FIX fails on a dispatcher without the block (FATAL: block not found) and on the mutants listed
 # at the bottom of the bead comment. Exit 0 iff every scenario behaves as expected.
 
@@ -24,6 +29,7 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="${PILOT_DISPATCHER_PATH:-$SELF_DIR/pilot-dispatcher.sh}"
 WO_LIB="${PILOT_WORK_ORDER_LIB:-$SELF_DIR/scripts/work-order.sh}"
+PPV_LIB="${PILOT_POOL_VETOES_LIB:-$SELF_DIR/scripts/pool-probe-vetoes.sh}"
 
 PASS=0
 FAIL=0
@@ -32,6 +38,7 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 
 [ -f "$DISPATCHER" ] || { echo "FATAL: dispatcher not found at $DISPATCHER" >&2; exit 2; }
 [ -f "$WO_LIB" ]     || { echo "FATAL: work-order library not found at $WO_LIB" >&2; exit 2; }
+[ -f "$PPV_LIB" ]    || { echo "FATAL: pool-probe-vetoes library not found at $PPV_LIB" >&2; exit 2; }
 . "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
 # shellcheck disable=SC1090
 . "$WO_LIB" || { echo "FATAL: cannot source $WO_LIB" >&2; exit 2; }
@@ -64,18 +71,28 @@ case "$args" in
 esac
 exit 0
 BDEOF
+# Fake gc (ga-qmfm8r): records every call on ONE line in $W/gc.calls (newlines of the mail body flattened) and fails iff $W/gc.fail exists.
+cat > "$WORK/bin/gc" <<'GCEOF'
+#!/usr/bin/env bash
+W="${SELFTEST_WORK:?}"
+printf 'CALL %s\n' "$(printf '%s ' "$@" | tr '\n' ' ')" >> "$W/gc.calls"
+[ -e "$W/gc.fail" ] && exit 1
+exit 0
+GCEOF
 cat > "$WORK/bin/timeout" <<'TOEOF'
 #!/usr/bin/env bash
 shift
 exec "$@"
 TOEOF
-chmod +x "$WORK/bin/bd" "$WORK/bin/timeout"
+chmod +x "$WORK/bin/bd" "$WORK/bin/gc" "$WORK/bin/timeout"
 sandbox_path_init "$WORK" jq || exit 2
 
-reset() { rm -f "$WORK"/cap.* "$WORK"/bd.writes "$WORK"/log.txt "$WORK"/unmark.log "$WORK"/show.*.json "$WORK"/crew.* "$WORK"/builders.* "$WORK/city/.gc/priority-yield.off"; }
+reset() { rm -f "$WORK"/cap.* "$WORK"/bd.writes "$WORK"/log.txt "$WORK"/unmark.log "$WORK"/show.*.json "$WORK"/crew.* "$WORK"/builders.* "$WORK/city/.gc/priority-yield.off" "$WORK"/gc.calls "$WORK"/gc.fail "$WORK"/unservable.state; }
 logged()   { grep -qF -- "$1" "$WORK/log.txt" 2>/dev/null; }
 warned()   { grep -qF -- "warn	"  "$WORK/log.txt" 2>/dev/null && grep -F -- "warn	" "$WORK/log.txt" | grep -qF -- "$1"; }
 writes()   { [ -f "$WORK/bd.writes" ] && wc -l < "$WORK/bd.writes" | tr -d ' ' || echo 0; }
+mails()     { local n; n=$(grep -c 'mail send mayor' "$WORK/gc.calls" 2>/dev/null) || true; echo "${n:-0}"; }
+gc_calls()  { [ -f "$WORK/gc.calls" ] && wc -l < "$WORK/gc.calls" | tr -d ' ' || echo 0; }
 cap_calls() { [ -f "$WORK/cap.calls" ] && wc -l < "$WORK/cap.calls" | tr -d ' ' || echo 0; }
 
 # bead <id> <priority|-> <routed_to|-> <store> [type] [label,label...] — one bead as the emit's ordered population carries it.
@@ -101,6 +118,9 @@ run_py() {
     SELFTEST_WORK="$WORK"; export SELFTEST_WORK
     GC_CITY="$WORK/city"; DRY_RUN=0
     unset PILOT_PRIORITY_YIELD PILOT_PRIORITY_YIELD_OFF_FILE
+    PILOT_PRIORITY_UNSERVABLE_FILE="$WORK/unservable.state"
+    # shellcheck disable=SC1090
+    . "$PPV_LIB" || exit 97
     log()  { printf 'log\t%s\n'  "$*" >> "$WORK/log.txt"; }
     warn() { printf 'warn\t%s\n' "$*" >> "$WORK/log.txt"; }
     # The pool-cap probe, stubbed: same contract as the real one (rc 0 = positively full, sets _PCAP_*; rc 1 = not full or cannot tell,
@@ -323,12 +343,135 @@ out="$(run_py "_PY_EMIT_OK=1; _PY_P01='[{\"id\":\"x\",\"priority\":0,\"rig\":\"w
 [ "$out" = "WAIT= BLIND=1" ] && warned "CANNOT TELL whether 1 P0/P1" && [ "$(cap_calls)" = "0" ] \
   && ok "J6 (third state) a row WITHOUT the focus/brake facts → BLIND=1, not a waiter, its pool not probed — unreadable is never 'waiting'" || bad "J6: $out calls=$(cap_calls)"
 reset; cap wa-worker 2 2
-out="$(run_py "_PY_EMIT_OK=1; _PY_P01='[{\"id\":\"x\",\"priority\":0,\"rig\":\"wa\",\"routed_to\":\"wa-worker\",\"focus_fix\":\"yes\",\"braked\":false},{\"id\":\"y\",\"priority\":1,\"rig\":\"wa\",\"routed_to\":\"wa-worker\",\"focus_fix\":false,\"braked\":false}]'; _pilot_priority_waiting_scan; echo \"WAIT=\${_PY_WAIT_ID:-} BLIND=\${_PY_BLIND}\"")"
+out="$(run_py "_PY_EMIT_OK=1; _PY_P01='[{\"id\":\"x\",\"priority\":0,\"rig\":\"wa\",\"routed_to\":\"wa-worker\",\"focus_fix\":\"yes\",\"braked\":false},{\"id\":\"y\",\"priority\":1,\"rig\":\"wa\",\"routed_to\":\"wa-worker\",\"focus_fix\":false,\"braked\":false,\"refused\":\"\"}]'; _pilot_priority_waiting_scan; echo \"WAIT=\${_PY_WAIT_ID:-} BLIND=\${_PY_BLIND}\"")"
 [ "$out" = "WAIT=y BLIND=0" ] && ok "J6b an unreadable row followed by a real waiter → the waiter is used and the sweep is NOT blind (the doubt changes nothing)" || bad "J6b: $out"
 # Drift guard: the projection's focus predicate must be the one _filter_candidates applies under focus (keep-in-sync pair).
 pred() { grep -o 'any((\.labels // \[\])\[\]; \. == "gate:needs-fix".*"impacto:dano-ao-vivo")' <<< "$1" | head -1; }
 P_PROJ="$(pred "$PROJECT_SRC")"; P_FILT="$(pred "$(fn_src _filter_candidates)")"
 { [ -n "$P_PROJ" ] && [ "$P_PROJ" = "$P_FILT" ]; } && ok "J7 drift guard: the projection's focus predicate is byte-identical to _filter_candidates' focus clause" || bad "J7 predicates differ: proj=[$P_PROJ] filter=[$P_FILT]"
+
+# ── K: a P0/P1 that the pool's OWN probe refuses is not waiting (ga-qmfm8r) ──────────────────────────────────────────
+# 13/10: wa-gg9uhf (P0, gate:needs-fix) carried delivery:pending-restart, which the wa-worker probe refuses. No worker would take it, yet it
+# counted as "P0 waiting behind wa-worker 2/2" and 157 P2+ beads ceded to it for ~9h until the Mayor removed the label by hand.
+echo "K. a P0/P1 the target pool's probe refuses (ga-qmfm8r)"
+LBL_PR="delivery:pending-restart"
+P0PR="$(bead wa-p0 0 wa-worker wa task "gate:needs-fix,$LBL_PR")"
+P2WA="$(bead wa-p2 2 wa-worker wa)"
+reset; cap wa-worker 2 2
+out="$(run_py "$(scan_with "$(arr "$P0PR")"); _pilot_priority_yield_for '$P2WA' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT= BLIND=0" && echo "$out" | grep -qx "DISPATCHES" \
+  && ok "K1 (the incident) P0 with $LBL_PR behind a full wa-worker + a P2 of the same rig → no waiter, the P2 DISPATCHES" || bad "K1: $out / $(cat "$WORK/log.txt")"
+[ "$(mails)" = "1" ] && grep -F 'mail send mayor' "$WORK/gc.calls" | grep -qF "wa-p0" && grep -F 'mail send mayor' "$WORK/gc.calls" | grep -qF "$LBL_PR" \
+  && ok "K1b exactly ONE mail to the Mayor, and it names the bead and the label" || bad "K1b mails=$(mails): $(cat "$WORK/gc.calls" 2>/dev/null)"
+grep -F 'mail send mayor' "$WORK/gc.calls" 2>/dev/null | grep -qF "P0 que nenhum worker pode pegar: wa-p0 $LBL_PR" \
+  && ok "K1c the subject reads 'P0 que nenhum worker pode pegar: <id> <rótulo>'" || bad "K1c subject: $(cat "$WORK/gc.calls" 2>/dev/null)"
+[ "$(cap_calls)" = "0" ] && logged "wa-p0 (refused:label:$LBL_PR)" && ok "K1d the refused row is skipped WITHOUT probing its pool, and the sweep log names the refusal" || bad "K1d calls=$(cap_calls) / $(cat "$WORK/log.txt")"
+# the SECOND sweep (same state, same bead): no new mail
+out="$(run_py "$(scan_with "$(arr "$P0PR")")")"
+[ "$out" = "WAIT= BLIND=0" ] && [ "$(mails)" = "1" ] && ok "K2 the next sweep still refuses it and sends NO second mail (once per bead+reasons, not once per sweep)" || bad "K2: $out mails=$(mails)"
+# the label goes away: the P0 waits again (and the state is forgotten)
+out="$(run_py "$(scan_with "$(arr "$(bead wa-p0 0 wa-worker wa task gate:needs-fix)")")")"
+[ "$out" = "WAIT=wa-p0 BLIND=0" ] && [ "$(mails)" = "1" ] && ok "K3 label cleared → the P0 is a waiter again (the cession is right for a bead a worker CAN take), no mail" || bad "K3: $out mails=$(mails)"
+out="$(run_py "$(scan_with "$(arr "$P0PR")")")"
+[ "$out" = "WAIT= BLIND=0" ] && [ "$(mails)" = "2" ] && ok "K3b the label comes BACK → a fresh occurrence, a fresh mail (2 in all)" || bad "K3b: $out mails=$(mails)"
+
+# control: without the refused label the SAME bead cedes the P2 and nobody is mailed
+reset; cap wa-worker 2 2
+out="$(run_py "$(scan_with "$(arr "$(bead wa-p0 0 wa-worker wa task gate:needs-fix)")"); _pilot_priority_yield_for '$P2WA' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT=wa-p0 BLIND=0" && echo "$out" | grep -qx "CEDES" && [ "$(mails)" = "0" ] \
+  && ok "K4 (control) the same P0 WITHOUT $LBL_PR → head waiter, the P2 cedes, no mail (the fix does not turn the rule off)" || bad "K4: $out mails=$(mails)"
+
+# a mail that fails is retried the next sweep, and never changes what cedes
+reset; cap wa-worker 2 2; : > "$WORK/gc.fail"
+out="$(run_py "$(scan_with "$(arr "$P0PR")"); _pilot_priority_yield_for '$P2WA' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "DISPATCHES" && [ "$(mails)" = "1" ] && [ ! -s "$WORK/unservable.state" ] \
+  && ok "K5 the mail FAILS → the P2 still dispatches (the doubt is about telling the Mayor, not about the bead) and nothing is remembered" || bad "K5: $out mails=$(mails) state=$(cat "$WORK/unservable.state" 2>/dev/null)"
+rm -f "$WORK/gc.fail"
+run_py "$(scan_with "$(arr "$P0PR")")" >/dev/null
+[ "$(mails)" = "2" ] && [ -s "$WORK/unservable.state" ] && ok "K5b the next sweep retries (2 attempts) and, sent, remembers it" || bad "K5b mails=$(mails)"
+run_py "$(scan_with "$(arr "$P0PR")")" >/dev/null
+[ "$(mails)" = "2" ] && ok "K5c … and stops there" || bad "K5c mails=$(mails)"
+
+# the list of refusals is the POOL's: ps-worker shares wa's list; delivery:partial is a dog-only refusal
+reset; cap ps-worker 1 1
+out="$(run_py "$(scan_with "$(arr "$(bead ps-p1 1 ps-worker ps task "$LBL_PR")")")")"
+[ "$out" = "WAIT= BLIND=0" ] && [ "$(mails)" = "1" ] && grep -qF "P1 que nenhum worker pode pegar: ps-p1 $LBL_PR" "$WORK/gc.calls" \
+  && ok "K6 a P1 routed to ps-worker with $LBL_PR is refused too, and the subject says P1" || bad "K6: $out mails=$(mails) $(cat "$WORK/gc.calls" 2>/dev/null)"
+reset; cap wa-worker 2 2
+out="$(run_py "$(scan_with "$(arr "$(bead wa-part 0 wa-worker wa task delivery:partial)")")")"
+[ "$out" = "WAIT=wa-part BLIND=0" ] && [ "$(mails)" = "0" ] \
+  && ok "K7 (control) delivery:partial is refused by the DOG probe only → a wa-worker P0 carrying it still waits (the list is per pool, not the union)" || bad "K7: $out mails=$(mails)"
+
+# two refusals on one bead = one mail naming both; a different set of reasons later = a new mail
+reset; cap wa-worker 2 2
+BOTH="$(bead wa-p0 0 wa-worker wa task "$LBL_PR,pilot:no-auto-dispatch")"
+run_py "$(scan_with "$(arr "$BOTH")")" >/dev/null
+[ "$(mails)" = "1" ] && grep -F 'mail send mayor' "$WORK/gc.calls" | grep -qF "$LBL_PR" && grep -F 'mail send mayor' "$WORK/gc.calls" | grep -qF "pilot:no-auto-dispatch" \
+  && ok "K8 two refused labels on one bead → ONE mail that names both" || bad "K8 mails=$(mails): $(cat "$WORK/gc.calls" 2>/dev/null)"
+run_py "$(scan_with "$(arr "$(bead wa-p0 0 wa-worker wa task "needs-human")")")" >/dev/null
+[ "$(mails)" = "2" ] && ok "K8b the reasons CHANGE (another label refuses it now) → a new mail: the old one no longer tells the truth" || bad "K8b mails=$(mails)"
+reset; cap wa-worker 2 2
+run_py "$(scan_with "$(arr "$P0PR" "$(bead wa-p0b 1 wa-worker wa task needs-human)")")" >/dev/null
+[ "$(mails)" = "2" ] && ok "K8c two different refused beads → two mails (one per bead)" || bad "K8c mails=$(mails)"
+
+# a refused P0 does not hide a real waiter behind it
+reset; cap wa-worker 2 2
+out="$(run_py "$(scan_with "$(arr "$P0PR" "$(bead wa-p1 1 wa-worker wa task gate:needs-fix)")"); _pilot_priority_yield_for '$P2WA' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT=wa-p1 BLIND=0" && echo "$out" | grep -qx "CEDES" && [ "$(mails)" = "1" ] \
+  && ok "K9 [refused P0, real P1] behind a full pool → the P1 is the head waiter (the P2 cedes to IT), and the P0 is still reported" || bad "K9: $out mails=$(mails)"
+
+# first-sight bead that ends QUEUED during the sweep's own dispatch: the same filter at the second entry point
+reset
+out="$(run_py "_pilot_priority_waiter_note '$(bead new0 0 - wa task "$LBL_PR")' wa-worker 2 2; echo \"WAIT=[\${_PY_WAIT_ID:-}]\"; _pilot_priority_yield_for '$P2WA' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT=\[\]" && echo "$out" | grep -qx "DISPATCHES" && [ "$(mails)" = "1" ] && grep -qF "new0 $LBL_PR" "$WORK/gc.calls" \
+  && ok "K10 a first-sight P0 with $LBL_PR that queues behind a full pool is NOT recorded as the waiter (the dispatch-time entry point), and is reported once" || bad "K10: $out mails=$(mails)"
+reset
+out="$(run_py "_pilot_priority_waiter_note '$(bead new0 0 - wa task gate:needs-fix)' wa-worker 2 2; echo \"WAIT=[\${_PY_WAIT_ID:-}]\"")"
+[ "$out" = "WAIT=[new0]" ] && [ "$(mails)" = "0" ] && ok "K10b (control) the same first-sight P0 without the label IS the waiter, as before" || bad "K10b: $out mails=$(mails)"
+reset
+out="$(run_py "_pilot_priority_waiter_note '$(bead new0 0 - wa task "$LBL_PR")' wa-worker 2 2; _pilot_priority_waiter_note '$(bead new0 0 - wa task "$LBL_PR")' wa-worker 2 2; echo \"WAIT=[\${_PY_WAIT_ID:-}]\"")"
+[ "$out" = "WAIT=[]" ] && [ "$(mails)" = "1" ] && ok "K10c the same refused bead noted twice in one sweep → still one mail" || bad "K10c: $out mails=$(mails)"
+
+reset
+out="$(run_py "POOL_VETO_JQ_DEFS=''; _pilot_priority_waiter_note '$(bead new0 0 - wa task gate:needs-fix)' wa-worker 2 2; echo \"WAIT=[\${_PY_WAIT_ID:-}] BLIND=\${_PY_BLIND}\"")"
+[ "$out" = "WAIT=[] BLIND=1" ] && [ "$(mails)" = "0" ] && warned "CANNOT TELL whether the pool's probe refuses new0" \
+  && ok "K10d (third state) the veto library not loaded at the dispatch-time entry point → not recorded as the waiter, BLIND=1, no mail" || bad "K10d: $out mails=$(mails)"
+
+# the third state: cannot tell → blind, nothing ceded, nobody mailed
+reset; cap wa-worker 2 2
+out="$(run_py "POOL_VETO_JQ_DEFS=''; $(scan_with "$(arr "$P0PR")")")"
+[ "$out" = "WAIT= BLIND=1" ] && [ "$(mails)" = "0" ] && warned "CANNOT TELL" \
+  && ok "K11 the veto library's jq definitions are not loaded → the sweep is BLIND (nothing ceded, no mail) — missing is 'cannot tell', not 'nothing is refused'" || bad "K11: $out mails=$(mails)"
+reset; cap wa-worker 2 2
+out="$(run_py "unset -f pool_veto_cfg; $(scan_with "$(arr "$P0PR")")")"
+[ "$out" = "WAIT= BLIND=1" ] && [ "$(mails)" = "0" ] && ok "K11b pool_veto_cfg missing → BLIND, same" || bad "K11b: $out mails=$(mails)"
+reset; cap wa-worker 2 2
+out="$(run_py "pool_veto_cfg() { return 1; }; $(scan_with "$(arr "$P0PR")")")"
+[ "$out" = "WAIT= BLIND=1" ] && ok "K11c pool_veto_cfg fails → BLIND, same" || bad "K11c: $out"
+reset; cap wa-worker 2 2
+out="$(run_py "_PY_EMIT_OK=1; _PY_P01='[{\"id\":\"x\",\"priority\":0,\"rig\":\"wa\",\"routed_to\":\"wa-worker\",\"focus_fix\":false,\"braked\":false}]'; _pilot_priority_waiting_scan; echo \"WAIT=\${_PY_WAIT_ID:-} BLIND=\${_PY_BLIND}\"")"
+[ "$out" = "WAIT= BLIND=1" ] && [ "$(cap_calls)" = "0" ] && [ "$(mails)" = "0" ] \
+  && ok "K12 (third state) a row WITHOUT the refusal fact → BLIND, not a waiter, its pool not probed, nobody mailed" || bad "K12: $out calls=$(cap_calls) mails=$(mails)"
+
+# DRY_RUN: look, say, do not write
+reset; cap wa-worker 2 2
+out="$(run_py "DRY_RUN=1; $(scan_with "$(arr "$P0PR")"); _pilot_priority_yield_for '$P2WA' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "DISPATCHES" && [ "$(gc_calls)" = "0" ] && [ ! -e "$WORK/unservable.state" ] && logged "WOULD" \
+  && ok "K13 DRY_RUN=1 → the P2 still dispatches, NO mail, NO state written, the log says what it WOULD send" || bad "K13: $out gc=$(gc_calls) / $(cat "$WORK/log.txt")"
+
+# the rule off: nothing is scanned, so nothing is reported
+reset; cap wa-worker 2 2
+run_py "PILOT_PRIORITY_YIELD=0; $(scan_with "$(arr "$P0PR")")" >/dev/null
+[ "$(mails)" = "0" ] && ok "K14 PILOT_PRIORITY_YIELD=0 → the scan does not run, so no mail either" || bad "K14 mails=$(mails)"
+
+# one source for the list: the yield adds NO label list of its own — it reads the refusal through the library. (The pool TOP-UP keeps its own
+# older array, _TOPUP_WORKER_EXCLUDE_LABELS, which feeds `bd --exclude-label` flags; that copy predates this bead and is outside it, so its lines
+# are the one thing this guard lets through.)
+code_lines() { grep -v '^[[:space:]]*#' "$DISPATCHER" | grep -v -- '^[[:space:]]*--exclude-label "'; }
+n_copy="$(code_lines | grep -c "$LBL_PR" || true)"
+[ "$n_copy" = "0" ] && ok "K15 drift guard: '$LBL_PR' appears in NO code line of the dispatcher outside the top-up's bd flag array (the yield's list lives in pool-probe-vetoes.sh only)" || bad "K15: $n_copy code line(s) of the dispatcher carry the label"
+echo "$PROJECT_SRC" | grep -q 'pool_veto_reasons' && echo "$PROJECT_SRC" | grep -q 'pool_veto_cfg wa' \
+  && ok "K16 the projection asks the library (pool_veto_reasons with pool_veto_cfg wa)" || bad "K16 the projection does not call the veto library"
 
 # ── I: the wiring in the dispatcher (order assertions — the functions above are inert unless these hold) ─────────────────
 echo "I. wiring order in the dispatcher"

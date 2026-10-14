@@ -5112,6 +5112,19 @@ fi
 unset _GC_WO_SIBLING
 # SELFTEST-EXTRACT work-order-source: END
 
+# ga-qmfm8r: the list of beads a pool worker's own probe REFUSES lives in ONE place, scripts/pool-probe-vetoes.sh (shared with
+# nudge-on-route-gated.sh and the gate's FAIL path) — the priority yield below asks it "will THIS pool take this P0/P1?", it carries
+# no copy of the list. Same sibling-source idiom, and the same degradation, as work-order.sh above: a missing/unreadable lib is a
+# deploy fault, so it is loud, and the yield reads it as "cannot tell" (blind, nothing ceded on it) — never as "nothing is refused".
+# The lib has no side effect at source time (its own selftest sources it twice under set -euo pipefail).
+_GC_PPV_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/pool-probe-vetoes.sh"
+if [ -r "$_GC_PPV_SIBLING" ]; then
+  source "$_GC_PPV_SIBLING"
+else
+  warn "ga-qmfm8r: pool-probe-vetoes.sh missing/unreadable ($_GC_PPV_SIBLING) — the priority yield cannot tell which P0/P1 beads a pool probe refuses: every sweep is counted as priority_yield_blind and nothing is ceded on it, until it is restored."
+fi
+unset _GC_PPV_SIBLING
+
 # _emit_query_one <db_dir> <store_label> — print the fully-filtered eligible
 # candidate array for ONE store, with a "store" field stamped on each item.
 # Mirrors the Tier-1 (bug + tech-debt), Tier-2 (story:approved) and optional
@@ -5177,24 +5190,35 @@ _emit_query_one() {
 #                    clamp and without the top-up brake — so these two say whether THIS sweep could hand the bead a session
 #                    at all (focus_fix = the very label predicate of _filter_candidates' focus clause, keep the two in sync;
 #                    braked = the label _topup_exclude_braked drops). The scan reads them: a waiter is a bead that could run.
+#                    refused (ga-qmfm8r): the reasons, joined by ",", for which the TARGET POOL'S OWN PROBE refuses the bead
+#                    ("" = nothing refuses it), computed by scripts/pool-probe-vetoes.sh (pool_veto_reasons over pool_veto_cfg wa:
+#                    wa-worker and ps-worker share one list) — never by a list kept here. A bead no worker will take is not waiting
+#                    for capacity; null = the library could not say, which the scan reads as "cannot tell".
 #   _PY_CLASS_BY_ID  JSON object id → priority class 0..5, for EVERY bead of the population (the top-up asks
 #                    "what priority is the bead I am about to open a session for?").
 # The class is the work-order library's own (wo_prio_class: 0..4 → itself, anything else → 5) — read from the lib's jq
 # definitions, never re-derived here.
-# THREE states: both projections made → _PY_EMIT_OK=1; either one failed, the lib's definitions are not loaded, or the
-# emit never ran → _PY_EMIT_OK=0 with both EMPTY. Empty is "cannot tell", never "nobody waits": the scan reads it as blind.
+# THREE states: both projections made → _PY_EMIT_OK=1; either one failed, the lib's definitions are not loaded (work-order.sh,
+# and since ga-qmfm8r pool-probe-vetoes.sh), or the emit never ran → _PY_EMIT_OK=0 with both EMPTY. Empty is "cannot tell", never
+# "nobody waits": the scan reads it as blind.
 # Always returns 0 (the emit is fail-open and must stay so).
 _PY_P01=""; _PY_CLASS_BY_ID=""; _PY_EMIT_OK=0
 _pilot_priority_project_emit() {
-  local _in="${1:-}" _p01 _cls
+  local _in="${1:-}" _p01 _cls _cfg _now
   _PY_P01=""; _PY_CLASS_BY_ID=""; _PY_EMIT_OK=0
   [ -n "${WORK_ORDER_JQ_DEFS:-}" ] || return 0
-  _p01=$(printf '%s' "$_in" | jq -c "$WORK_ORDER_JQ_DEFS"'
+  # ga-qmfm8r: the pool's refusal list is the library's. Not loaded / no config / no clock = cannot tell = EMIT_OK stays 0.
+  [ -n "${POOL_VETO_JQ_DEFS:-}" ] || return 0
+  declare -F pool_veto_cfg >/dev/null 2>&1 || return 0
+  _cfg=$(pool_veto_cfg wa 2>/dev/null) && [ -n "$_cfg" ] || return 0
+  _now=$(date +%s 2>/dev/null) && [ -n "$_now" ] || return 0
+  _p01=$(printf '%s' "$_in" | jq -c --argjson cfg "$_cfg" --argjson now "$_now" "$WORK_ORDER_JQ_DEFS$POOL_VETO_JQ_DEFS"'
       [ .[] | select(wo_prio_class <= 1)
             | { id: (.id // ""), priority: .priority, rig: (._emit_store // ""),
                 routed_to: ((.metadata | if type == "object" then .["gc.routed_to"] else null end) // ""),
                 focus_fix: any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo"),
-                braked: any((.labels // [])[]; . == "pilot:topup-braked") }
+                braked: any((.labels // [])[]; . == "pilot:topup-braked"),
+                refused: (try (pool_veto_reasons($now; $cfg) | join(",") | gsub("[[:cntrl:]]"; " ")) catch null) }
             | select(.id != "" and (.routed_to == "wa-worker" or .routed_to == "ps-worker")) ]' 2>/dev/null) || _p01=""
   _cls=$(printf '%s' "$_in" | jq -c "$WORK_ORDER_JQ_DEFS"'
       [ .[] | select((.id | type) == "string" and .id != "") | { key: .id, value: wo_prio_class } ] | from_entries' 2>/dev/null) || _cls=""
@@ -9678,6 +9702,10 @@ _pilot_pool_cap_full_for() {
 #     at its cap — the very test (_pilot_pool_cap_full_for) the pre-claim queue skip uses, so "waiting" means one thing in the
 #     file. "Dispatchable" is judged for THIS sweep: with gate focus ON only a fix counts (a non-fix would never get the slot),
 #     and a bead the top-up brake holds is stuck, not waiting. A first-sight bead (no route yet) joins the moment its own dispatch attempt ends queued behind a cap.
+#     ga-qmfm8r: and a bead the pool's OWN PROBE REFUSES (e.g. delivery:pending-restart on wa-worker) is stuck too — no worker takes
+#     it even with a free slot, so ceding to it only starves the rest (13/10: wa-gg9uhf held 157 P2+ for ~9h). The refusal is asked of
+#     scripts/pool-probe-vetoes.sh, never a list kept here; a refused P0/P1 is not waiting, and the Mayor is mailed ONCE about it
+#     ("P0 que nenhum worker pode pegar: <id> <rótulo>") instead of the rule silently ceding to it.
 #   * Only P2..P4 (class 2..4 of the work-order library) cede. P0 and P1 never do — which is also why the one exception Athos
 #     decided on 06/10 (a P0 bug labelled impacto:dano-ao-vivo goes first) needs no code here: it is P0, it never cedes, and
 #     among the waiters the library's own order already puts it first. A priority the library cannot read (class 5) never
@@ -9689,7 +9717,8 @@ _pilot_pool_cap_full_for() {
 #     every sweep: the moment no P0/P1 waits, it dispatches.
 #   * FAIL-OPEN, and COUNTED: if the emit's population or a pool's session count cannot be READ, nothing is ceded on a guess
 #     (dispatch proceeds exactly as before this rule) and the sweep event carries priority_yield_blind=1. The direction of the
-#     doubt is the pre-existing behaviour — the bead's own wording: "leitura que falha → não bloqueia e conta".
+#     doubt is the pre-existing behaviour — the bead's own wording: "leitura que falha → não bloqueia e conta". Includes the veto
+#     library (ga-qmfm8r): not loaded, or a row it could not judge, is "cannot tell" — never "nothing is refused".
 #   * Off switches: PILOT_PRIORITY_YIELD=0 (plist) or `touch $GC_CITY/.gc/priority-yield.off` (instant, no reload).
 # NOT covered, on purpose: the Mayor's manual slings to gastown.dog and the dog's own probe (they never pass through this
 # script), and what machine pressure cuts first (pool-ceiling.sh / pool-ceiling-engine.sh, same bead, see their headers).
@@ -9740,11 +9769,107 @@ _pilot_priority_pool_bound_pre() {
   return 0
 }
 
+# ── ga-qmfm8r: a P0/P1 that the target pool's own probe REFUSES does not wait for capacity — nobody can take it ──────────────────
+# 13/10: wa-gg9uhf (P0) carried delivery:pending-restart, which the wa-worker probe refuses. The yield still counted it as "P0 waiting
+# behind wa-worker 2/2" and ceded 157 P2+ beads to it for ~9h, until the Mayor removed the label by hand. A slot freeing up would not
+# have helped it: the probe would have refused it again. "Waiting" therefore means "waits for a slot AND a worker would take it".
+# The refusal comes from scripts/pool-probe-vetoes.sh (pool_veto_cfg wa; ps-worker shares the list) — the one place that owns "what the
+# probe refuses". This script keeps no copy: add a label there and the yield follows. Three states, as everywhere in this rule: refused
+# (not a waiter), not refused (may be one), CANNOT TELL (library missing / no config / unreadable row — not a waiter, and the sweep is
+# BLIND, nothing is ceded on a guess).
+# A refused P0/P1 is not silently dropped either: it is state the Mayor must act on (a P0 that nothing can pick up), so the Mayor is
+# told ONCE per (bead, reasons) — see _pilot_priority_unservable_note.
+_PY_UNSERV_SENT=""    # "id<TAB>reasons" lines noticed this sweep (in-process guard, in case the state file cannot be written)
+
+# _pilot_priority_refusal_of <bead-json> — print the reasons (",", possibly EMPTY = nothing refuses it) for which the wa/ps-worker probe
+# refuses this bead, exit 0; or print nothing and exit 1 when that cannot be told (library not loaded, no config, no clock, not a bead).
+# The projection in _pilot_priority_project_emit asks the same question for the whole population in one jq pass.
+_pilot_priority_refusal_of() {
+  local _cfg _now _r
+  [ -n "${POOL_VETO_JQ_DEFS:-}" ] || return 1
+  declare -F pool_veto_cfg >/dev/null 2>&1 || return 1
+  _cfg=$(pool_veto_cfg wa 2>/dev/null) && [ -n "$_cfg" ] || return 1
+  _now=$(date +%s 2>/dev/null) && [ -n "$_now" ] || return 1
+  _r=$(printf '%s' "${1:-}" | jq -r --argjson cfg "$_cfg" --argjson now "$_now" "$POOL_VETO_JQ_DEFS"'
+      if type == "object" then (pool_veto_reasons($now; $cfg) | join(",") | gsub("[[:cntrl:]]"; " ")) else error("not a bead") end' 2>/dev/null) || return 1
+  printf '%s' "$_r"
+  return 0
+}
+
+# _pilot_priority_unservable_state — the file that remembers which (bead, reasons) the Mayor was already told about.
+_pilot_priority_unservable_state() { printf '%s' "${PILOT_PRIORITY_UNSERVABLE_FILE:-${GC_CITY:-/nonexistent}/.gc/priority-yield-unservable.state}"; }
+
+# _pilot_priority_unservable_note <id> <priority> <reasons> — tell the Mayor ONCE that a P0/P1 is routed to a pool whose probe refuses
+# it. "Once" = once per (bead, reasons): the same pair is never mailed twice; a bead whose refusal went away and came back (the sync below
+# forgets it in between), or whose reasons CHANGED, is a new occurrence. It is a MAIL and not a nudge because a P0 nobody can take is
+# durable state to act on, not a wake-up. The state is recorded only after the mail was accepted (exit 0): a send that failed is tried
+# again next sweep. DRY_RUN says what it would send and writes nothing. Always exit 0 — telling the Mayor must never stop the sweep.
+_pilot_priority_unservable_note() {
+  local _id="${1:-}" _prio="${2:-?}" _reasons="${3:-}" _state _line _lbl _subj _body _tmp
+  [ -n "$_id" ] && [ -n "$_reasons" ] || return 0
+  _line="$_id"$'\t'"$_reasons"
+  case "$_PY_UNSERV_SENT" in *"$_line"$'\n'*) return 0 ;; esac
+  _state=$(_pilot_priority_unservable_state)
+  if [ -r "$_state" ] && grep -qxF -- "$_line" "$_state" 2>/dev/null; then return 0; fi
+  # "label:delivery:pending-restart,prefix:pool:refused-x,held" → "delivery:pending-restart, pool:refused-x, held"
+  _lbl=$(printf '%s' "$_reasons" | sed -E 's/(^|,)(label|prefix):/\1/g; s/,/, /g')
+  _subj="P${_prio} que nenhum worker pode pegar: ${_id} ${_lbl}"
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    _PY_UNSERV_SENT="$_PY_UNSERV_SENT$_line"$'\n'
+    log "ga-qmfm8r: WOULD tell the Mayor — $_subj"
+    return 0
+  fi
+  _body="$(printf 'A bead %s (P%s) está roteada para um pool cujo probe a RECUSA (%s) — nenhum worker vai pegá-la, ainda que haja vaga.\n\nPor isso o Pilot NÃO a conta como "P0/P1 esperando vaga": a cessão de prioridade (ga-5fn5p3) não cede nada a ela. (ga-qmfm8r: em 13/10 uma P0 nessa situação, wa-gg9uhf, segurou 157 P2+ por ~9h.)\n\nSe o rótulo ainda é verdade (ex.: aguarda um restart que só você faz), faça o que ele pede. Se é resíduo, remova o rótulo e ela volta ao pool sozinha.\n\nAviso único por (bead, rótulo): outro só chega se o rótulo mudar, ou sair e voltar.' "$_id" "$_prio" "$_lbl")"
+  if gc --city "$GC_CITY" mail send mayor -s "$_subj" -m "$_body" >/dev/null 2>&1; then
+    _PY_UNSERV_SENT="$_PY_UNSERV_SENT$_line"$'\n'
+    _tmp="$_state.tmp.$$"
+    if { [ ! -r "$_state" ] || awk -F'\t' -v id="$_id" '$1 != id' "$_state"; printf '%s\n' "$_line"; } > "$_tmp" 2>/dev/null && mv "$_tmp" "$_state" 2>/dev/null; then
+      log "ga-qmfm8r: told the Mayor — $_subj"
+    else
+      rm -f "$_tmp" 2>/dev/null || true
+      warn "ga-qmfm8r: told the Mayor about $_id ($_lbl) but could not record it in $_state — it is not mailed again within this sweep, but a later sweep will repeat it until the file is writable."
+    fi
+  else
+    warn "ga-qmfm8r: could not mail the Mayor about $_id ($_lbl): the P0/P1 is routed to a pool whose probe refuses it — retried next sweep."
+  fi
+  return 0
+}
+
+# _pilot_priority_unservable_sync — after a scan that could READ the emit's P0/P1 list: tell the Mayor about every refused row
+# (_pilot_priority_unservable_note, deduped) and FORGET the rows that are readable and no longer refused, so a refusal that comes back
+# is a fresh occurrence. A row that cannot be read forgets nothing; a bead that simply left the list is left alone (it may be back next
+# sweep, and the same refusal is not news twice). Always exit 0.
+_pilot_priority_unservable_sync() {
+  local _rows _clear _id _prio _reasons _state _tmp _ids=""
+  _rows=$(printf '%s' "${_PY_P01:-}" | jq -r '.[] | select((.refused | type) == "string" and .refused != "") | [.id, (.priority | tostring), .refused] | join("\u001f")' 2>/dev/null) || return 0
+  while IFS=$'\037' read -r _id _prio _reasons; do
+    [ -n "$_id" ] || continue
+    _pilot_priority_unservable_note "$_id" "$_prio" "$_reasons"
+  done <<EOF_PYUNSERV
+$_rows
+EOF_PYUNSERV
+  [ "${DRY_RUN:-0}" != "1" ] || return 0
+  _state=$(_pilot_priority_unservable_state)
+  [ -s "$_state" ] || return 0
+  _clear=$(printf '%s' "${_PY_P01:-}" | jq -r '.[] | select((.refused | type) == "string" and .refused == "") | .id' 2>/dev/null) || return 0
+  [ -n "$_clear" ] || return 0
+  while IFS= read -r _id; do
+    [ -z "$_id" ] || _ids="$_ids $_id"
+  done <<EOF_PYCLEAR
+$_clear
+EOF_PYCLEAR
+  _tmp="$_state.tmp.$$"
+  if awk -F'\t' -v ids="$_ids " 'index(ids, " " $1 " ") == 0' "$_state" > "$_tmp" 2>/dev/null && mv "$_tmp" "$_state" 2>/dev/null; then :; else rm -f "$_tmp" 2>/dev/null || true; fi
+  return 0
+}
+
 # _pilot_priority_waiting_scan — ONCE per sweep, after the dynamic ceilings and before the pool top-up: find the HEAD WAITER, the
 # best-ordered P0/P1 bead (from the emit's _PY_P01) whose pool is positively at its cap AND that this sweep could dispatch. The
 # second half is the gate-round-1 class: a bead is only "waiting" if a slot would get it a session, so one the sweep's own filters
 # never hand a session — a non-fix under gate focus (PILOT_GATE_FOCUS=1, set AFTER the emit), or one the top-up brake holds — is
-# skipped and counted in the log; a row whose two facts cannot be read is "cannot tell" (BLIND), never "waiting". Siblings swept:
+# skipped and counted in the log; a row whose two facts cannot be read is "cannot tell" (BLIND), never "waiting". Since ga-qmfm8r a
+# bead the target pool's own probe REFUSES is skipped the same way (why = refused:<reasons>, decisive over the other facts) and the
+# Mayor is told once (_pilot_priority_unservable_sync); a row whose refusal cannot be read is "cannot tell" too. Siblings swept:
 # a store the pool cannot read is already "not full" in _pilot_pool_cap_full_for; hold/veto labels, exec:manual, blocked and
 # deferred beads never reach the emit (its chain is the dispatch chain). NOT checked, on purpose: dispatch_one's ownership guard
 # (crew branch / live gate / external claim — several git, bd and session reads per bead, only meaningful after the claim); the
@@ -9769,7 +9894,8 @@ _pilot_priority_waiting_scan() {
   # A population that cannot be walked is "cannot tell", not "nobody waits": the empty string an unreadable list would
   # produce must not reach the loop (error and empty would be the same value).
   if ! _rows=$(printf '%s' "$_PY_P01" | jq -r --arg focus "${PILOT_GATE_FOCUS:-0}" '.[] | [.id, (.priority | tostring), .rig, .routed_to,
-      (if ((.focus_fix | type) != "boolean") or ((.braked | type) != "boolean") then "?"
+      (if ((.refused | type) == "string") and .refused != "" then "refused:" + .refused
+       elif ((.refused | type) != "string") or ((.focus_fix | type) != "boolean") or ((.braked | type) != "boolean") then "?"
        elif .braked then "braked" elif ($focus == "1" and (.focus_fix | not)) then "not-a-fix" else "" end)] | join("\u001f")' 2>/dev/null); then
     _PY_BLIND=1
     warn "ga-5fn5p3: CANNOT TELL which P0/P1 beads wait for capacity (the emit's P0/P1 list is not readable) — no P2+ bead is ceded on a guess; dispatch proceeds as before (fail-open, counted as priority_yield_blind in the sweep event)."
@@ -9800,8 +9926,10 @@ _pilot_priority_waiting_scan() {
 $_rows
 EOF_PYSCAN
   if [ "$_skipped" -gt 0 ]; then
-    log "ga-5fn5p3: $_skipped P0/P1 bead(s) of the emit are NOT counted as waiting — this sweep cannot hand them a session (first: $_skip_first; not-a-fix = gate focus ON and no fix label, braked = pilot:topup-braked)."
+    log "ga-5fn5p3: $_skipped P0/P1 bead(s) of the emit are NOT counted as waiting — this sweep cannot hand them a session (first: $_skip_first; not-a-fix = gate focus ON and no fix label, braked = pilot:topup-braked, refused:<reasons> = the pool's own probe refuses it, so no worker would take it even with a free slot)."
   fi
+  # ga-qmfm8r: independent of where the walk above stopped — the whole list is read for the Mayor's notice and for forgetting.
+  _pilot_priority_unservable_sync
   # Unreadable facts only matter when no waiter was found: with one in hand the doubt changes nothing about who cedes.
   if [ "$_unread" -gt 0 ] && [ -z "$_PY_WAIT_ID" ]; then
     _PY_BLIND=1
@@ -9819,13 +9947,25 @@ EOF_PYSCAN
 # sweep's own dispatch (the pre-claim cap skip, or dispatch_one's cap branches): it is a waiter, whether or not the scan knew it.
 # Only the FIRST one is kept (the pool is walked in work order, so the first is the best). Always exit 0.
 _pilot_priority_waiter_note() {
-  local _b="${1:-}" _cls _id _rig
+  local _b="${1:-}" _cls _id _rig _ref
   [ -z "${_PY_WAIT_ID:-}" ] || return 0
   _pilot_priority_yield_enabled || return 0
   _cls=$(_pilot_priority_class_of "$_b")
   case "$_cls" in 0|1) ;; *) return 0 ;; esac
   _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || _id=""
   [ -n "$_id" ] || return 0
+  # ga-qmfm8r: the same refusal filter as the scan, at the second entry point — a first-sight P0/P1 that queued behind a full pool but
+  # whose pool probe refuses it would starve every P2+ just as the scan's row did.
+  if ! _ref=$(_pilot_priority_refusal_of "$_b"); then
+    _PY_SCANNED=1; _PY_BLIND=1
+    warn "ga-qmfm8r: CANNOT TELL whether the pool's probe refuses $_id (pool-probe-vetoes.sh not loaded or the bead unreadable) — not recorded as the waiter; no P2+ bead is ceded on a guess (fail-open, counted as priority_yield_blind in the sweep event)."
+    return 0
+  fi
+  if [ -n "$_ref" ]; then
+    log "ga-qmfm8r: P$_cls $_id queued behind a full pool but its pool's probe refuses it ($_ref) — no worker would take it with a free slot, so it is NOT recorded as the waiter."
+    _pilot_priority_unservable_note "$_id" "$_cls" "$_ref"
+    return 0
+  fi
   _rig=$(printf '%s' "$_b" | jq -r '.metadata["story.rig"] // ""' 2>/dev/null) || _rig=""
   _PY_SCANNED=1
   _PY_WAIT_ID="$_id"; _PY_WAIT_PRIO="$_cls"; _PY_WAIT_RIG="${_rig:-?}"
