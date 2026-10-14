@@ -19,16 +19,25 @@
 #   O ENV DE QUEM CHAMA NÃO MUDA O VEREDITO (gate-fix 4, ga-szz40p): dono vivo lido sob TZ=UTC, TZ=Asia/Tokyo e LC_ALL=pt_BR.UTF-8
 #   (a string de `ps lstart` muda com eles) espera (91), nunca é reaped; ponta a ponta, A grava o dono num env e B chega noutro;
 #   o swap saudável/alto lido sob vírgula decimal (pt_BR) não vira 93 ·
+#   "NÃO CONSEGUI DESCOBRIR" NÃO É "NÃO TEM" NEM "MORREU" (gate-fix 5, ga-szz40p): dono da trava que EXISTE e não se lê — chmod 000, symlink
+#   pendurado, lixo, arquivo vazio, pasta da trava sem busca; dono vivo ou morto — espera e acaba em 91 (`pid ?`), a idade da pasta não o
+#   torna órfão (a idade só julga a trava SEM arquivo de dono); com o ps cego para a hora de início só a prova do kernel decide (vivo,
+#   outro usuário/EPERM = vivo, ESRCH = morto, pid que o kernel não representa = não sei = 91); com o ps cego para o ESTADO o varredor só
+#   apaga o scratch de pid provadamente morto, o stop_tree não diz "nada a matar" (o filho que ignora TERM leva KILL) e o timeout vale;
+#   stop_tree avisa quando não prova que um pid morreu e quando o `pgrep -P` falha; o watchdog do timeout que não lê o ppid do filho
+#   não o corta (não provou que é dele) e avisa ·
 #   --push/--pull/--env · uso errado (94, inclusive dois --push de mesmo nome) · log sem argumentos do comando · --check ·
 #   --pull no MBP que falhou (mbp-run sai 0 e só avisa): 93, nunca "chegou" · configuração numérica com zero à esquerda, sinal ou
 #   estouro: 93 sem rodar (a aritmética do bash leria 08/010 como octal).
 # CONTROLE NEGATIVO: cada porta (marcador "# gate:<nome>" no script: disk, swap, lock, lock-live, cleanup, fallback, timeout,
 #   exit-trap, self-chain, opt-sem-valor, ilegivel-disco/swap/pgrep, pull-mbp, isnum, push-dup, e as do gate-fix 2: reap-mutex,
 #   reap-rejudge, owner-claim, owner-lost, lock-vanish, release-owner, orphan-live, timeout-private, sinal-log, e as do gate-fix 4:
-#   proc-start-env (testada por metade: sem TZ=UTC e sem LC_ALL=C) e sysctl-env) é removida numa cópia e
+#   proc-start-env (testada por metade: sem TZ=UTC e sem LC_ALL=C) e sysctl-env, e as do gate-fix 5: owner-unreadable, lock-searchable,
+#   owner-symlink, lock-kill0, lock-eperm, lock-unknown, alive-kill0 (por 3 probes: varredor, stop_tree e watchdog), alive-eperm,
+#   alive-unknown, stop-proof, tree-pgrep e timeout-ppid) é removida numa cópia e
 #   o mutante TEM que deixar de reproduzir o resultado do script real no caso que a protege — inclusive "ilegível virou pode-rodar".
 #   O teste de concorrência também tem que FALHAR no rea-run.sh anterior ao gate-fix 2 (a corrida existia de verdade): ver o
-#   comentário da seção 7b e REA_RUN_UNDER_TEST.
+#   comentário da seção 7b e REA_RUN_UNDER_TEST. Idem os casos da seção 7d contra o rea-run.sh anterior ao gate-fix 5.
 # REA_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro rea-run.sh.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -107,7 +116,33 @@ if [ -n "${STUB_PS_SLOW_PID:-}" ]; then
 fi
 exec /bin/ps "$@"
 EOF
-chmod +x "$T/bin/"*
+cat > "$T/bin/ps-blind" <<'EOF'
+#!/usr/bin/env bash
+# um ps que NÃO ENXERGA: stdout vazio e rc 1 (o que um ps sem fork/fd/permissão devolve) quando a consulta casa STUB_PS_BLIND_FIELD (ex.:
+#   state=, lstart=) e, se STUB_PS_BLIND_PID existir, só para esse pid. Todo o resto vai ao ps de verdade. Serve de REA_RUN_PS (proc_start, alive
+#   e o ppid do watchdog) e, como `ps` em $T/shadow, de ps do PATH — o único jeito de cegar também o rea-run.sh ANTERIOR, que chamava `ps` solto.
+if [ -n "${STUB_PS_BLIND_FIELD:-}" ]; then
+  case "$*" in *"$STUB_PS_BLIND_FIELD"*)
+    [ -z "${STUB_PS_BLIND_PID:-}" ] && exit 1
+    case "$*" in *"-p $STUB_PS_BLIND_PID") exit 1 ;; esac ;;
+  esac
+fi
+exec /bin/ps "$@"
+EOF
+mkdir -p "$T/shadow"; ln -s ../bin/ps-blind "$T/shadow/ps"
+cat > "$T/shadow/pgrep" <<'EOF'
+#!/usr/bin/env bash
+# `pgrep -P` (filhos de um pid), que o rea-run.sh chama pelo PATH: STUB_PGREP_P=fail sai com rc 3 (falhou) · =bogus lista os filhos de verdade MAIS um
+# pid que o kernel não representa (2147483648), só na 1ª chamada (STUB_PGREP_P_MARK) — a liveness dele nem se lê nem se prova. O resto: pgrep de verdade.
+if [ "${1:-}" = -P ]; then
+  case "${STUB_PGREP_P:-}" in
+    fail) exit 3 ;;
+    bogus) if [ ! -e "${STUB_PGREP_P_MARK:-/nonexistent}" ]; then : > "$STUB_PGREP_P_MARK"; /usr/bin/pgrep "$@"; echo 2147483648; exit 0; fi ;;
+  esac
+fi
+exec /usr/bin/pgrep "$@"
+EOF
+chmod +x "$T/bin/"* "$T/shadow/pgrep"
 # mv/ln que imitam o processo PARADO entre o mkdir e a gravação do dono: quando ele volta e grava (.../owner), a trava dele já foi
 # removida e REFEITA por outro, com dono VIVO (STUB_FOREIGN_PID/START). STUB_CLAIM_MODE: real = a gravação segue sobre a trava do
 # outro · fail = a gravação falha depois da troca · failclean = a gravação falha e ninguém trocou nada (erro de verdade).
@@ -144,7 +179,7 @@ reset_env() {
   export REA_RUN_DF="$T/bin/df" REA_RUN_SYSCTL="$T/bin/sysctl" REA_RUN_PGREP="$T/bin/pgrep"
   export REA_RUN_POLL_S=0.1 REA_RUN_KILL_GRACE_S=1 REA_RUN_WAIT_S=30 REA_RUN_TIMEOUT_S=60 REA_RUN_MIN_FREE_GB=10 REA_RUN_MAX_SWAP_MB=6144
   export STUB_MBP_LOG="$T/mbp.$N.log" STUB_PGREP_FILE="$T/pgrep.$N" MARK="$T/mark.$N"
-  unset REA_RUN_LOCK_DIR STUB_PGREP_SAMPLES REA_RUN_PGREP_PATTERN STUB_DF_FAIL STUB_DF_RAW STUB_DF_KB STUB_SWAP_FAIL STUB_SWAP_RAW STUB_SWAP_USED STUB_MBP_OUT STUB_MBP_PULL STUB_MBP_PULL_SKIP STUB_MBP_PULL_MTIME REA_RUN_LOCK_ORPHAN_S REA_RUN_NICE REA_RUN_PS STUB_PS_SLOW_PID STUB_PS_DELAY REA_RUN_LOCKF REA_RUN_REAP_WAIT_S STUB_CLAIM_MODE STUB_FOREIGN_PID STUB_FOREIGN_START STUB_MKDIR_FAIL_ONCE STUB_MKDIR_MARK
+  unset REA_RUN_LOCK_DIR STUB_PGREP_SAMPLES REA_RUN_PGREP_PATTERN STUB_DF_FAIL STUB_DF_RAW STUB_DF_KB STUB_SWAP_FAIL STUB_SWAP_RAW STUB_SWAP_USED STUB_MBP_OUT STUB_MBP_PULL STUB_MBP_PULL_SKIP STUB_MBP_PULL_MTIME REA_RUN_LOCK_ORPHAN_S REA_RUN_NICE REA_RUN_PS STUB_PS_SLOW_PID STUB_PS_DELAY STUB_PS_BLIND_FIELD STUB_PS_BLIND_PID STUB_PGREP_P STUB_PGREP_P_MARK REA_RUN_LOCKF REA_RUN_REAP_WAIT_S STUB_CLAIM_MODE STUB_FOREIGN_PID STUB_FOREIGN_START STUB_MKDIR_FAIL_ONCE STUB_MKDIR_MARK
   export STUB_MBP_RC=99
   find "$REA_RUN_CITY" "$REA_RUN_SCRATCH_ROOT" -depth -delete 2>/dev/null
   : > "$STUB_MBP_LOG"; rm -f "$STUB_PGREP_FILE" "$MARK"
@@ -305,7 +340,7 @@ pstart() { LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | sed 's/  */ /g;s/
 mklock() { mkdir -p "$LOCK"; printf '%s\n%s\n%s\n' "$1" "$(date +%s)" "$2" > "$LOCK/owner"; }
 reset_env; mklock 999999 "Mon Jan  1 00:00:00 2001"; run --local -- sh -c "echo x > '$MARK'"
 eq "trava de dono morto é reaped" 0 "$RC"; has "trava morta: aviso" "trava órfã removida" "$OUT"; [ -e "$MARK" ]; ok "trava morta: comando rodou" $?; clean_after "trava morta"
-sleep 60 & holder=$!; BGPIDS="$BGPIDS $holder"
+sleep 900 & holder=$!; BGPIDS="$BGPIDS $holder"
 reset_env; mklock "$holder" "$(pstart "$holder")"; run --local --wait-s 1 -- sh -c "echo x > '$MARK'"
 eq "trava de dono VIVO não é reaped (91)" 91 "$RC"; [ ! -e "$MARK" ]; ok "dono vivo: comando NÃO rodou" $?
 eq "dono vivo: trava intacta" "$holder" "$(sed -n 1p "$LOCK/owner" 2>/dev/null)"; has "dono vivo: motivo" '"reason":"trava-ocupada"' "$(cat "$LOGF")"
@@ -371,7 +406,7 @@ run --local -- sh -c "echo x > '$MARK'"; eq "release sem mutex: a próxima execu
 
 # gravar o dono da trava: o processo parado entre o mkdir e a gravação volta DEPOIS de a trava dele ter sido removida e refeita por
 # outro (dono vivo). O `mv` antigo sobrescrevia o dono do outro; o erro apagava a trava do outro. Agora a gravação é `ln` (exclusiva).
-sleep 60 >/dev/null 2>&1 & foreign=$!; BGPIDS="$BGPIDS $foreign"; fstart=$(pstart "$foreign")
+sleep 900 >/dev/null 2>&1 & foreign=$!; BGPIDS="$BGPIDS $foreign"; fstart=$(pstart "$foreign")
 for mode in real fail; do
   reset_env; export STUB_CLAIM_MODE=$mode STUB_FOREIGN_PID=$foreign STUB_FOREIGN_START="$fstart"
   PATH="$T/claim:$PATH" run --local --wait-s 1 -- sh -c "echo x > '$MARK'"
@@ -407,7 +442,7 @@ rm -rf "$LOCK"
 # um 2º comando pesado ao mesmo tempo — o que a trava existe para impedir. Aqui o env difere DE PROPÓSITO e o dono vivo tem que ser
 # respeitado (91, nada roda, trava intacta). Os testes TÊM que falhar no rea-run.sh sem o env fixado (REA_RUN_UNDER_TEST).
 ps_env() { env $1 ps -o lstart= -p "$2" 2>/dev/null | sed 's/  */ /g;s/^ //;s/ $//'; }   # $1 = "VAR=x VAR2=y" (sem aspas: vira vários argumentos)
-sleep 60 & holder=$!; BGPIDS="$BGPIDS $holder"
+sleep 900 & holder=$!; BGPIDS="$BGPIDS $holder"
 SWAP_PONTO='total = 8192.00M  used = 1000.00M  free = 100.00M  (encrypted)'   # swap em formato fixo: aqui só a TRAVA está em teste (o swap tem os casos dele, abaixo)
 for e in "TZ=Asia/Tokyo" "TZ=America/New_York" "LC_ALL=pt_BR.UTF-8" "LC_ALL=pt_BR.UTF-8 TZ=Asia/Tokyo"; do
   [ "$(ps_env "$e" "$holder")" != "$(pstart "$holder")" ]; ok "pré-condição: sob $e o ps mostra OUTRA string da hora de início (senão o caso não prova nada)" $?
@@ -441,6 +476,109 @@ reset_env; export STUB_SWAP_USED=1000.50M; OUT=$(LC_ALL=pt_BR.UTF-8 "$RUN" --loc
 eq "swap saudável lido sob LC_ALL=pt_BR (vírgula): roda (0), não vira 93" 0 "$RC"; [ -e "$MARK" ]; ok "swap sob pt_BR: comando rodou" $?
 reset_env; export STUB_SWAP_USED=7000.50M; OUT=$(LC_ALL=pt_BR.UTF-8 "$RUN" --local -- sh -c "echo x > '$MARK'" 2>&1); RC=$?
 eq "swap alto lido sob LC_ALL=pt_BR: recusa pelo MOTIVO certo (92, não 93)" 92 "$RC"; [ ! -e "$MARK" ]; ok "swap alto sob pt_BR: comando NÃO rodou" $?; has "swap alto sob pt_BR: motivo" "swap-alto" "$(cat "$LOGF")"
+
+# ---- 7d. "não consegui descobrir" não é "não tem" nem "morreu" (gate-fix 5, ga-szz40p) -------------------------------------------
+# Duas quedas do 3º estado no 2º. (a) O dono da trava era lido com `sed 2>/dev/null`: arquivo que EXISTE e não abre saía vazio, igual a "sem
+# dono", e a IDADE da pasta o declarava órfão — a trava de um dono VIVO era removida e rodava um 2º comando pesado. (b) `alive` dava "morto" para
+# todo `ps` sem saída: o ps que falhou apagava o scratch de uma execução viva e fazia o stop_tree dizer "nada a matar". Estes casos TÊM que falhar
+# no rea-run.sh anterior (REA_RUN_UNDER_TEST=<eee0faea5>); o ps cego entra pelo PATH ($T/shadow) porque aquele script chamava `ps` solto.
+# Controle (já nas seções 7 e 9): trava SEM arquivo de dono e velha é reaped; scratch de pid morto é apagado.
+old_lock() { touch -t "$(date -v-5M +%Y%m%d%H%M.%S 2>/dev/null || date -d '-5 min' +%Y%m%d%H%M.%S)" "$LOCK"; }   # mtime muito além de REA_RUN_LOCK_ORPHAN_S (30 s)
+rodou() { [ -e "$MARK" ] && echo rodou || echo parou; }
+probe_owner000() { reset_env; sleep 30 >/dev/null 2>&1 & local h=$!; mklock "$h" "$(pstart "$h")"; chmod 000 "$LOCK/owner"; old_lock
+  RUN="$1" run --local --wait-s 1 -- sh -c "echo x > '$MARK'"; chmod 600 "$LOCK/owner" 2>/dev/null; kill "$h" 2>/dev/null; echo "$RC|$(rodou)"; }
+probe_dir000() { reset_env; sleep 30 >/dev/null 2>&1 & local h=$!; mklock "$h" "$(pstart "$h")"; old_lock; chmod 000 "$LOCK"
+  RUN="$1" run --local --wait-s 1 -- sh -c "echo x > '$MARK'"; chmod 700 "$LOCK" 2>/dev/null; kill "$h" 2>/dev/null; echo "$RC|$(rodou)"; }
+probe_owner_symlink() { reset_env; mkdir -p "$LOCK"; ln -s "$T/nao-existe.$N" "$LOCK/owner"; old_lock
+  RUN="$1" run --local --wait-s 1 -- sh -c "echo x > '$MARK'"; echo "$RC|$(rodou)"; }
+probe_lock_blind() { # dono $2 (início $3) lido por um ps cego para a hora de início DESSE pid: só o kill -0 decide
+  reset_env; mklock "$2" "$3"; export REA_RUN_PS="$T/bin/ps-blind" STUB_PS_BLIND_FIELD=lstart= STUB_PS_BLIND_PID="$2"
+  RUN="$1" run --local --wait-s 1 -- sh -c "echo x > '$MARK'"; echo "$RC|$(rodou)"; }
+probe_lock_blind_live() { sleep 30 >/dev/null 2>&1 & local h=$! r; r=$(probe_lock_blind "$1" "$h" "$(pstart "$h")"); kill "$h" 2>/dev/null; echo "$r"; }
+probe_lock_blind_pid1() { probe_lock_blind "$1" 1 "Mon Jan  1 00:00:00 2001"; }      # pid 1 é de OUTRO usuário: o kill -0 dá "Operation not permitted" (vivo)
+probe_lock_blind_dead() { probe_lock_blind "$1" 999999 "Mon Jan  1 00:00:00 2001"; } # "No such process": a prova do kernel de que morreu
+probe_lock_bigpid() { probe_lock_blind "$1" 2147483648 "Mon Jan  1 00:00:00 2001"; } # pid que o kernel nem representa: kill -0 não dá ESRCH nem EPERM
+probe_sweep_blind() { # ps cego para o ESTADO: scratch de pid que pode estar vivo fica; o de pid provadamente morto vai
+  reset_env; sleep 30 >/dev/null 2>&1 & local f=$! R="$REA_RUN_SCRATCH_ROOT" d a b c e
+  mkdir -p "$R/run.$f.LIVE" "$R/run.1.OUTRO" "$R/run.2147483648.FORA" "$R/run.999999.OLD"
+  for d in "$R"/run.*; do echo x > "$d/cap.json"; done; chmod -R go-rwx "$R"
+  STUB_PS_BLIND_FIELD=state= PATH="$T/shadow:$PATH" RUN="$1" run --local -- true
+  [ -f "$R/run.$f.LIVE/cap.json" ] && a=intacto || a=apagado;            [ -f "$R/run.1.OUTRO/cap.json" ] && b=intacto || b=apagado
+  [ -f "$R/run.2147483648.FORA/cap.json" ] && c=intacto || c=apagado;    [ -f "$R/run.999999.OLD/cap.json" ] && e=intacto || e=apagado
+  kill "$f" 2>/dev/null
+  echo "$RC|vivo=$a|outro-usuario=$b|fora-do-kernel=$c|morto=$e|aviso=$(printf '%s' "$OUT" | grep -c 'não consegui ler se o pid 2147483648 vive')"; }
+probe_stop_blind() { # o filho ignora TERM; com o ps cego para o estado só o KILL o pára — "nada a matar" o deixaria rodando sem trava
+  reset_env; local pf="$T/ign.$N" w gp v=morto rc
+  STUB_PS_BLIND_FIELD=state= PATH="$T/shadow:$PATH" "$1" --local -- sh -c "trap '' TERM; echo \$\$ > '$pf'; while :; do sleep 1; done" >/dev/null 2>&1 & w=$!
+  for _ in $(seq 1 50); do [ -s "$pf" ] && break; sleep 0.1; done
+  kill -TERM "$w"; wait "$w" 2>/dev/null; rc=$?
+  gp=$(cat "$pf" 2>/dev/null); kill -0 "$gp" 2>/dev/null && { v=vivo; kill -KILL "$gp" 2>/dev/null; }
+  echo "$rc|filho=$v"; }
+probe_timeout_blind() { reset_env; export REA_RUN_TIMEOUT_S=1   # o watchdog também não pode ler "ps sem saída" como "o comando já saiu"
+  STUB_PS_BLIND_FIELD=state= PATH="$T/shadow:$PATH" RUN="$1" run --local -- sh -c "sleep 6; echo fim > '$MARK'"
+  echo "$RC|$([ -e "$MARK" ] && echo terminou || echo cortado)"; }
+probe_timeout_ppid() { reset_env; export REA_RUN_TIMEOUT_S=1   # o ps não lê o ppid do filho: o watchdog não prova que é dele — não corta, e AVISA (não cala)
+  STUB_PS_BLIND_FIELD=ppid= PATH="$T/shadow:$PATH" RUN="$1" run --local -- sh -c "sleep 4; echo fim > '$MARK'"
+  echo "$RC|$([ -e "$MARK" ] && echo terminou || echo cortado)|aviso=$(printf '%s\n' "$OUT" | grep -c 'não consegui ler o ppid')"; }
+probe_stop_unsure() { # a 1ª listagem de filhos ganha um pid que o kernel não representa: nem se lê nem se prova que morreu — avisa e manda KILL
+  reset_env; local pf="$T/su.$N" o="$T/su-out.$N" w rc; rm -f "$T/sum.$N"
+  STUB_PGREP_P=bogus STUB_PGREP_P_MARK="$T/sum.$N" PATH="$T/shadow:$PATH" "$1" --local -- sh -c "echo \$\$ > '$pf'; sleep 30" >"$o" 2>&1 & w=$!
+  for _ in $(seq 1 50); do [ -s "$pf" ] && break; sleep 0.1; done
+  kill -TERM "$w"; wait "$w" 2>/dev/null; rc=$?
+  echo "$rc|aviso=$(grep -c 'não consegui provar' "$o")"; }
+probe_tree_pgrep() { # `pgrep -P` que FALHA não é "sem filhos": a lista fica incompleta e o stop_tree avisa
+  reset_env; local pf="$T/tp.$N" o="$T/tp-out.$N" w rc n
+  STUB_PGREP_P=fail PATH="$T/shadow:$PATH" "$1" --local -- sh -c "sleep 30 & echo \$! > '$pf'; wait" >"$o" 2>&1 & w=$!
+  for _ in $(seq 1 50); do [ -s "$pf" ] && break; sleep 0.1; done
+  kill -TERM "$w"; wait "$w" 2>/dev/null; rc=$?
+  kill -KILL "$(cat "$pf" 2>/dev/null)" 2>/dev/null   # o neto não foi alcançado (era o aviso): fecha aqui
+  n=$(grep -c 'não consegui listar os filhos' "$o"); echo "$rc|aviso=$([ "$n" -ge 1 ] && echo sim || echo nao)"; }
+
+sleep 900 >/dev/null 2>&1 & h7=$!; BGPIDS="$BGPIDS $h7"; h7s=$(pstart "$h7")
+mk_dono_ilegivel() { # variante — trava de mtime VELHO cujo dono EXISTE mas não se lê/valida: a idade da pasta NÃO pode julgá-la
+  case "$1" in
+    live-chmod000)     mklock "$h7" "$h7s"; chmod 000 "$LOCK/owner" ;;
+    dead-chmod000)     mklock 999999 "Mon Jan  1 00:00:00 2001"; chmod 000 "$LOCK/owner" ;;
+    symlink-pendurado) mkdir -p "$LOCK"; ln -s "$T/nao-existe.$N" "$LOCK/owner" ;;
+    lixo)              mkdir -p "$LOCK"; echo lixo > "$LOCK/owner" ;;
+    vazio)             mkdir -p "$LOCK"; : > "$LOCK/owner" ;;
+    pasta-chmod000)    mklock "$h7" "$h7s" ;;
+  esac
+  old_lock
+  if [ "$1" = pasta-chmod000 ]; then chmod 000 "$LOCK"; fi
+  return 0
+}
+for v in live-chmod000 dead-chmod000 symlink-pendurado lixo vazio pasta-chmod000; do
+  reset_env; mk_dono_ilegivel "$v"
+  case "$v" in
+    pasta-chmod000) [ ! -x "$LOCK" ]; ok "pré-condição ($v): a pasta da trava está mesmo sem busca para este usuário (como root o chmod não barra)" $? ;;
+    *-chmod000) [ ! -r "$LOCK/owner" ]; ok "pré-condição ($v): o dono está mesmo ilegível para este usuário (como root o chmod não barra)" $? ;;
+  esac
+  run --local --wait-s 1 -- sh -c "echo x > '$MARK'"
+  chmod 700 "$LOCK" 2>/dev/null; chmod 600 "$LOCK/owner" 2>/dev/null   # destranca só para conferir e limpar
+  eq "dono que EXISTE e não se lê ($v): espera e acaba em 91 — a idade da pasta não o torna órfão" 91 "$RC"
+  [ ! -e "$MARK" ]; ok "dono ilegível ($v): o comando NÃO rodou" $?
+  [ -e "$LOCK/owner" ] || [ -L "$LOCK/owner" ]; ok "dono ilegível ($v): a trava e o dono seguem lá" $?
+  has "dono ilegível ($v): a mensagem mostra 'pid ?'" "pid ?" "$OUT"
+  case "$OUT" in *"trava órfã removida"*) ok "dono ilegível ($v): sem 'trava órfã removida'" 1 ;; *) ok "dono ilegível ($v): sem 'trava órfã removida'" 0 ;; esac
+  has "dono ilegível ($v): motivo no log" '"reason":"trava-ocupada"' "$(cat "$LOGF" 2>/dev/null)"
+  [ "$v" = live-chmod000 ] && eq "dono ilegível ($v): o dono gravado segue intacto" "$h7" "$(sed -n 1p "$LOCK/owner" 2>/dev/null)"
+done
+kill "$h7" 2>/dev/null
+# o ps NÃO devolve a hora de início do dono (cego): só a prova do kernel decide. Vivo responde; "Operation not permitted" é vivo de outro usuário; só
+# "No such process" é morto; qualquer outra coisa (pid que o kernel nem representa) é "não sei". Nos casos de dúvida NADA é removido.
+eq "ps cego + dono vivo: 91 e nada roda" "91|parou" "$(probe_lock_blind_live "$RUN")"
+eq "ps cego + dono de OUTRO usuário (pid 1, EPERM): é vivo — 91 e nada roda" "91|parou" "$(probe_lock_blind_pid1 "$RUN")"
+eq "ps cego + pid que o kernel nem representa: não sei — 91 e nada roda" "91|parou" "$(probe_lock_bigpid "$RUN")"
+eq "ps cego + dono morto (No such process): a prova do kernel basta — órfã removida, roda" "0|rodou" "$(probe_lock_blind_dead "$RUN")"
+# alive: o ps que falhou NÃO é pid morto
+eq "ps cego para o estado: o varredor só apaga o scratch de pid provadamente morto (vivo, de outro usuário e inalcançável ficam, e avisa)" \
+  "0|vivo=intacto|outro-usuario=intacto|fora-do-kernel=intacto|morto=apagado|aviso=1" "$(probe_sweep_blind "$RUN")"
+eq "ps cego para o estado: o stop_tree não diz 'nada a matar' — o filho que ignora TERM leva KILL" "143|filho=morto" "$(probe_stop_blind "$RUN")"
+eq "ps cego para o estado: o timeout vale (124, comando cortado)" "124|cortado" "$(probe_timeout_blind "$RUN")"
+eq "ps que não lê o ppid do filho: o watchdog não corta o que não provou ser dele — e avisa, não sai calado" "0|terminou|aviso=1" "$(probe_timeout_ppid "$RUN")"
+eq "stop_tree sem prova de que um pid morreu: avisa" "143|aviso=1" "$(probe_stop_unsure "$RUN")"
+eq "pgrep -P que falha não vira 'sem filhos': avisa" "143|aviso=sim" "$(probe_tree_pgrep "$RUN")"
 
 # ---- 8. sinal e timeout -----------------------------------------------------------------------------------------------
 reset_env; PIDF="$T/gpid.$N"
@@ -667,7 +805,7 @@ mutant_check owner-claim probe_claim_real '/# gate:owner-claim/s/ln "\$tmp"/mv -
 mutant_check owner-lost probe_claim_fail '/# gate:owner-lost/s/\[ -e "\$LOCK_DIR\/owner" \] \&\& continue/false/'
 mutant_check lock-vanish probe_vanish '/# gate:lock-vanish/s/.*/      die 93 "trava-nao-criavel" "mutante"/'
 mutant_check release-owner probe_release_takeover '/# gate:release-owner/s/if \[ "\$(owner_field 1)" = "\$\$" \]; then/if true; then/'
-mutant_check orphan-live probe_orphan_live '/# gate:orphan-live/s/alive "\$opid" \&\& continue/:/'
+mutant_check orphan-live probe_orphan_live '/# gate:orphan-live/s/\[ \$ar -ne 1 \]/false/'
 mutant_check timeout-private probe_timeout_private '/# gate:timeout-private/s/TMO="\$SCRATCH_ROOT\/tmo.\$\$"/TMO="$LOCK_DIR\/timeout"/'
 mutant_check sinal-log probe_sinal_log '/# gate:sinal-log/s/.*/  :/'
 
@@ -680,6 +818,23 @@ probe_swap_locale() { reset_env; export STUB_SWAP_USED=1000.50M; OUT=$(LC_ALL=pt
 mutant_check proc-start-tz probe_ps_tz '/# gate:proc-start-env/s/ TZ=UTC//'
 mutant_check proc-start-lc probe_ps_lc '/# gate:proc-start-env/s/LC_ALL=C //'
 mutant_check sysctl-env probe_swap_locale '/# gate:sysctl-env/s/LC_ALL=C //'
+
+# ---- portas novas do gate-fix 5: "não consegui descobrir" não cai em "não tem" nem em "morreu" -------------------------------------
+# Cada porta aqui apaga UMA proteção do 3º estado; o probe é o mesmo caso das seções 7d.
+mutant_check owner-unreadable probe_owner000 '/# gate:owner-unreadable/s/if owner_unreadable; then/if false; then/'
+mutant_check lock-searchable probe_dir000 '/# gate:lock-searchable/s/\[ -x "\$LOCK_DIR" \] || return 0/:/'
+mutant_check owner-symlink probe_owner_symlink '/# gate:owner-symlink/s/ || \[ -L "\$LOCK_DIR\/owner" \]//'
+mutant_check lock-kill0 probe_lock_blind_live '/# gate:lock-kill0/s/&& { echo live; return; }/\&\& { echo stale; return; }/'
+mutant_check lock-eperm probe_lock_blind_pid1 '/# gate:lock-eperm/s/echo live/echo stale/'
+mutant_check lock-unknown probe_lock_bigpid '/# gate:lock-unknown/s/echo unknown/echo stale/'
+mutant_check alive-kill0 probe_sweep_blind '/# gate:alive-kill0/s/.*/  return 1/'
+mutant_check alive-kill0-stop probe_stop_blind '/# gate:alive-kill0/s/.*/  return 1/'
+mutant_check alive-kill0-timeout probe_timeout_blind '/# gate:alive-kill0/s/.*/  return 1/'
+mutant_check alive-eperm probe_sweep_blind '/# gate:alive-eperm/s/return 0/return 1/'
+mutant_check alive-unknown probe_sweep_blind '/# gate:alive-unknown/s/return 2/return 1/'
+mutant_check stop-proof probe_stop_unsure '/# gate:stop-proof/s/\[ \$? -ne 1 \]/[ $? -eq 0 ]/'
+mutant_check tree-pgrep probe_tree_pgrep '/# gate:tree-pgrep/s/\[ \$rc -gt 1 \]/false/'
+mutant_check timeout-ppid probe_timeout_ppid '/# gate:timeout-ppid/s/\[ -z "\$wppid" \]/false/'
 
 printf '\nrea-run.selftest: %s ok, %s falha(s)\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

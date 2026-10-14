@@ -46,8 +46,9 @@
 #        apague o destino antigo antes de pedir de novo.
 #   mini: (1) checa disco/swap já de cara (não vale esperar a trava para ser recusado depois) → (2) pega a trava
 #        (mkdir atômico em $CITY/.gc/run/rea-run.lock; dono = pid + hora de início do processo, gravado por `ln`, que é
-#        criação EXCLUSIVA e nunca sobrescreve o dono de outro; dono morto ou pid reaproveitado é reaped, sob mutex — ver
-#        "Remoção da trava") e espera até --wait-s → (3) espera não haver outro `rea` rodando (rodado por fora do
+#        criação EXCLUSIVA e nunca sobrescreve o dono de outro; dono PROVADAMENTE morto ou com outro início (pid
+#        reaproveitado) é reaped, sob mutex — ver "Remoção da trava"; dono que não se consegue ler/provar NÃO é reaped — ver
+#        "Três estados") e espera até --wait-s → (3) espera não haver outro `rea` rodando (rodado por fora do
 #        wrapper; só processo `node .../bin/rea` conta, não o texto "bin/rea" no argumento de outro processo) → (4) checa disco/swap DE NOVO, já sob a trava → (5) apaga scratch órfão de execução que morreu →
 #        (6) cria scratch 0700 fora de qualquer repo → (7) roda o comando com cwd = scratch, nice 10, timeout e
 #        $REA_RUN_SCRATCH → (8) --pull → (9) apaga o scratch (também em erro, timeout, INT/TERM/HUP) e solta a trava.
@@ -69,6 +70,18 @@
 #        saudável). Varredura da classe: não há outra string comparada entre processos neste script; `df -Pk`, `stat` (mtime da trava),
 #        `date +%s`, o estado/ppid do `ps` e o awk só leem inteiros, que o env não muda; o único resíduo é cosmético (a casa decimal
 #        de machine_msg, só na mensagem).
+#   Três estados (ga-szz40p gate-fix 5): "tenho", "não tenho" e "não consegui descobrir" não podem virar a mesma coisa. Havia duas
+#        quedas do 3º no 2º: (a) `lock_state` lia o dono com `sed 2>/dev/null` — arquivo que EXISTE mas não abre (chmod 000, falta de
+#        fd) saía vazio, igual a "sem dono", e a IDADE da pasta o declarava órfão: a trava de um dono VIVO era removida e rodava um 2º
+#        comando pesado; (b) `alive` dava "morto" para qualquer `ps` sem saída — o `ps` que falhou apagava o scratch de uma execução
+#        viva (varredura) e fazia o `stop_tree` declarar "nada a matar", soltando a trava com a árvore ainda rodando. Agora:
+#        * trava com arquivo `owner` (ou symlink com esse nome) cujo pid/início não saem ambos válidos, ou pasta sem permissão de
+#          busca = `unknown`: inerte — espera, e acaba em 91 com `pid ?` na mensagem. A idade só julga a trava SEM arquivo de dono;
+#        * `alive` devolve 0 vivo, 1 morto, 2 não sei. Só vale "morto" o `ps` que respondeu zumbi ou o "No such process" do
+#          `kill -0` (o "Operation not permitted" de outro usuário é VIVO); `lock_state` usa a mesma prova depois que o ps não
+#          deu a hora de início. Quem lê 2 não apaga, não reapa e não dá a árvore por morta (o `stop_tree` espera, manda KILL e avisa).
+#        Para sair de uma trava `unknown` que ninguém mais segura: confira que não há `rea-run.sh` vivo e remova a pasta à mão
+#        (`rm -r $CITY/.gc/run/rea-run.lock`); o wrapper não a remove por conta própria, de propósito.
 #   Scratch órfão: o nome carrega o pid de quem o criou (run.<pid>.XXXXXX; marcador de timeout tmo.<pid>, fora da trava). O passo 5
 #        só apaga o de pid MORTO: pid vivo, nome sem pid e symlink ficam. Não depende de a trava ter dado exclusividade.
 #   Log: $CITY/.gc/logs/rea-run.jsonl — um evento por execução (ran), recusa/espera esgotada (refused), desvio para o mini
@@ -76,8 +89,14 @@
 #        URL/segredo). Uso errado (94), configuração inválida (93) e --check NÃO gravam log: só o stderr.
 #
 # LIMITES CONHECIDOS (o que sobra depois da correção — janelas estreitas, não fechadas):
-#   - Dono órfão com dono gravado: a remoção é exata (veredito e `mv` sob o mesmo mutex, e só quem está sob o mutex remove ou
-#     solta). Não há janela entre julgar e agir para uma trava com dono.
+#   - Dono gravado e LEGÍVEL com início diferente do processo vivo, ou processo morto: a remoção é exata (veredito e `mv` sob o mesmo
+#     mutex, e só quem está sob o mutex remove ou solta). "Dono vivo nunca é removido" vale enquanto o dono se LÊ e o ps/kill
+#     respondem; dono que existe e não se lê, ou liveness sem prova, é `unknown` (inerte, 91) — o custo é uma trava presa até alguém
+#     a remover à mão, nunca um 2º comando pesado. Não há janela entre julgar e agir para uma trava com dono lido.
+#   - `ps` ilegível: o watchdog de timeout só age sobre quem provou ser filho direto (ppid lido); sem o ppid ele sai SEM matar e AVISA
+#     (`não consegui ler o ppid`): o comando segue além do timeout até terminar (a trava continua presa por ele: lado seguro). A varredura do `self_chain` com ps
+#     falho vê menos ancestrais e conta mais "outro rea" (espera/91), nunca menos. `pgrep -P` que falha deixa de listar os
+#     filhos de um pid: o `stop_tree` avisa (`não consegui listar os filhos`) e pode não alcançar os descendentes dele.
 #   - Trava SEM dono (quem fez o mkdir parou/morreu antes de gravar): só é julgada órfã pela idade (REA_RUN_LOCK_ORPHAN_S, 30 s).
 #     O criador que só volta a andar depois disso encontra a trava removida: se ninguém a refez, sai 93 "trava-sem-dono" (recusa
 #     espúria, nada roda); se outro a refez, a gravação por `ln` falha e ele espera como os demais — nunca toma nem apaga a trava
@@ -92,8 +111,8 @@
 #   - pid reaproveitado: o scratch de um pid morto cujo número hoje é de outro processo fica até aquele processo sair (sobra lixo,
 #     nunca perda). SIGKILL entre o `mv` da trava velha e o `find -delete` deixa `rea-run.lock.stale.<pid>` ao lado (lixo inerte).
 #
-# O QUE NÃO FAZ: não classifica o que é "pesado" (quem chama decide); não mata Chrome que o comando deixou vivo fora da
-#   árvore dele; SIGKILL no wrapper não limpa — o scratch órfão (de pid morto) é apagado na próxima execução (passo 5) e a trava
+# O QUE NÃO FAZ: não classifica o que é "pesado" (quem chama decide); não repassa o stdin ao comando que roda no mini (ele roda com stdin=/dev/null);
+#   não mata Chrome que o comando deixou vivo fora da árvore dele; SIGKILL no wrapper não limpa — o scratch órfão (de pid morto) é apagado na próxima execução (passo 5) e a trava
 #   morta é reaped pela próxima execução, sob o mutex.
 set -o pipefail
 set -u
@@ -123,7 +142,7 @@ KILL_GRACE_S=${REA_RUN_KILL_GRACE_S:-3}
 LOCK_ORPHAN_S=${REA_RUN_LOCK_ORPHAN_S:-30}   # trava sem arquivo de dono mais velha que isto: quem a criou morreu entre o mkdir e a escrita
 REAP_WAIT_S=${REA_RUN_REAP_WAIT_S:-5}   # espera máxima pelo mutex de remoção da trava (quem o segura o faz por milissegundos)
 LOCKF_BIN=${REA_RUN_LOCKF:-lockf}
-PS_BIN=${REA_RUN_PS:-ps}   # só o proc_start passa por aqui: costura de teste (o selftest alarga a janela "julguei velha" → "ajo")
+PS_BIN=${REA_RUN_PS:-ps}   # proc_start, alive e o ppid do watchdog passam por aqui: costura de teste (o selftest alarga a janela "julguei velha" → "ajo")
 NICE=${REA_RUN_NICE:-10}
 umask 077
 
@@ -301,18 +320,44 @@ MODE=local
 DEADLINE=$(( $(date +%s) + WAIT_S ))
 LOCK_HELD=0; SCR=""; CHILD=""; WD=""; SIGRC=""; TMO=""
 
-alive() { local s; s=$(ps -o state= -p "$1" 2>/dev/null); [ -n "$s" ] && [ "${s#Z}" = "$s" ]; }   # vivo e não-zumbi
-tree_pids() { local c; printf '%s\n' "$1"; for c in $(pgrep -P "$1" 2>/dev/null); do tree_pids "$c"; done; }
-stop_tree() { # TERM na árvore, espera KILL_GRACE_S, KILL no que sobrou
-  local pids p i
+# alive PID → 0 = vivo · 1 = morto (inclusive zumbi) · 2 = não sei. "O ps não devolveu nada" NÃO é "morreu": é o mesmo vazio de um ps que
+# falhou (fork, EMFILE, sandbox). Só vale como "morto" a prova do kernel — o "No such process" do kill -0; responder, ou negar por permissão
+# (pid de outro usuário), é vivo. Quem decide ler 2 como "não consegui provar que morreu" e ficar do lado inerte (não apaga, não dá por morto).
+# Custo, com o ps cego: um filho que já morreu e ainda não foi colhido (zumbi) responde ao `kill -0`, então o stop_tree espera a graça inteira.
+alive() {
+  local s kerr
+  s=$("$PS_BIN" -o state= -p "$1" 2>/dev/null)
+  if [ -n "$s" ]; then [ "${s#Z}" = "$s" ] && return 0; return 1; fi
+  kerr=$(LC_ALL=C kill -0 "$1" 2>&1) && return 0                                          # gate:alive-kill0
+  case "$kerr" in
+    *"No such process"*) return 1 ;;
+    *"not permitted"*) return 0 ;;                                                        # gate:alive-eperm
+    *) return 2 ;;                                                                        # gate:alive-unknown
+  esac
+}
+tree_pids() { # o pid e, recursivamente, os filhos. `pgrep -P` sai 1 sem filhos e >1 quando FALHOU: lista incompleta, e avisa (roda em $(...): só o stderr chega)
+  local c kids rc
+  printf '%s\n' "$1"
+  kids=$(pgrep -P "$1" 2>/dev/null); rc=$?
+  [ $rc -gt 1 ] && say "AVISO: não consegui listar os filhos do pid $1 (pgrep -P falhou, rc $rc) — os descendentes dele podem seguir vivos"   # gate:tree-pgrep
+  for c in $kids; do tree_pids "$c"; done
+}
+stop_tree() { # TERM na árvore, espera KILL_GRACE_S, KILL no que sobrou — só dá a árvore por morta com a PROVA de que morreu
+  local pids p i a unsure=""
   pids=$(tree_pids "$1")
   for p in $pids; do kill -TERM "$p" 2>/dev/null; done
   i=0; while [ $i -lt $(( KILL_GRACE_S * 5 )) ]; do
-    local any=0; for p in $pids; do alive "$p" && any=1; done
+    local any=0; for p in $pids; do alive "$p"; [ $? -ne 1 ] && any=1; done                # gate:stop-proof
     [ $any -eq 0 ] && return 0
     sleep 0.2; i=$(( i + 1 ))
   done
-  for p in $pids; do alive "$p" && kill -KILL "$p" 2>/dev/null; done
+  for p in $pids; do
+    alive "$p"; a=$?
+    [ $a -eq 1 ] && continue
+    kill -KILL "$p" 2>/dev/null
+    [ $a -eq 2 ] && unsure="$unsure $p"
+  done
+  [ -z "$unsure" ] || say "AVISO: não consegui provar que o(s) pid$unsure morreu(ram) (o estado do processo não se lê) — mandei KILL assim mesmo"
   return 0
 }
 
@@ -387,18 +432,35 @@ trap 'on_signal INT 2' INT
 trap 'on_signal TERM 15' TERM
 trap 'on_signal HUP 1' HUP
 
+# "Não há dono" e "há um dono que não consegui ler" são coisas DIFERENTES, e só a primeira autoriza julgar a trava pela idade (quem fez o mkdir
+# morreu antes de gravar). A segunda — o arquivo do dono existe (ou é um symlink com esse nome) mas o `sed` falhou (permissão, EMFILE, fork), ou o
+# conteúdo não é um dono, ou a pasta da trava não tem permissão de busca (aí nem `-e owner` enxerga o arquivo) — é "não sei": a trava é tratada
+# como de dono vivo. O dono é gravado por `ln` de um arquivo completo, então um dono ilegível nunca é uma gravação pela metade. Só testes de
+# arquivo do próprio bash: nenhum fork que possa falhar e virar "sem dono".
+owner_unreadable() { # 0 = pode haver um dono que não li · 1 = não há arquivo de dono
+  [ -x "$LOCK_DIR" ] || return 0                                                          # gate:lock-searchable
+  [ -e "$LOCK_DIR/owner" ] || [ -L "$LOCK_DIR/owner" ]                                    # gate:owner-symlink
+}
+owner_pid() { local p; p=$(owner_field 1); if isnum "$p"; then printf '%s' "$p"; else printf '?'; fi; }   # "?" quando o dono não se lê
 lock_state() { # stale | live | unknown  — quem segura a trava agora
-  local pid started cur age
+  local pid started cur age kerr
   pid=$(owner_field 1); started=$(owner_field 3)
   if ! isnum "$pid" || [ -z "$started" ]; then
+    if owner_unreadable; then echo unknown; return; fi                                    # gate:owner-unreadable
     age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0) ))
     [ "$age" -gt "$LOCK_ORPHAN_S" ] 2>/dev/null && [ "$age" -lt 1000000000 ] && { echo stale; return; }
     echo unknown; return
   fi
   cur=$(proc_start "$pid")
   if [ -n "$cur" ]; then [ "$cur" = "$started" ] && echo live || echo stale; return; fi   # gate:lock-live — outro início = pid reaproveitado
-  kill -0 "$pid" 2>/dev/null && { echo live; return; }                                    # ps não viu mas o pid responde
-  echo stale
+  # O ps não devolveu a hora de início: o processo não existe OU o ps falhou (os dois dão o mesmo vazio). Só o "No such process" do kill prova
+  # que morreu; responder, ou negar por permissão, é vivo; qualquer outra falha do kill é "não sei" (inerte).
+  kerr=$(LC_ALL=C kill -0 "$pid" 2>&1) && { echo live; return; }                          # gate:lock-kill0
+  case "$kerr" in
+    *"No such process"*) echo stale ;;
+    *"not permitted"*) echo live ;;                                                       # gate:lock-eperm
+    *) echo unknown ;;                                                                    # gate:lock-unknown
+  esac
 }
 claim_owner() { # $1 = hora de início deste processo. Grava o dono SÓ se a trava ainda não tem um: `ln` é criação exclusiva e atômica
   local tmp="$LOCK_DIR/owner.tmp.$$" rc   # (o `mv` sobrescreveria o dono de outro — o que acontece com quem ficou parado entre o mkdir e aqui)
@@ -431,8 +493,8 @@ acquire_lock() {
       say "trava órfã removida (dono morto ou pid reaproveitado)"; continue
     fi
     now=$(date +%s)
-    [ "$now" -ge "$DEADLINE" ] && die 91 "trava-ocupada" "esperei ${WAIT_S}s e a trava segue com pid $(owner_field 1)${REAP_NOTE} — tente depois"
-    if [ $(( now - last_msg )) -ge 60 ]; then say "aguardando a trava (dono pid $(owner_field 1), desde $(owner_field 2))${REAP_NOTE}"; last_msg=$now; fi
+    [ "$now" -ge "$DEADLINE" ] && die 91 "trava-ocupada" "esperei ${WAIT_S}s e a trava segue com pid $(owner_pid)${REAP_NOTE} — tente depois"
+    if [ $(( now - last_msg )) -ge 60 ]; then say "aguardando a trava (dono pid $(owner_pid), desde $(owner_field 2))${REAP_NOTE}"; last_msg=$now; fi
     sleep "$POLL_S"
   done
 }
@@ -467,7 +529,11 @@ for old in "$SCRATCH_ROOT"/run.* "$SCRATCH_ROOT"/tmo.*; do
   [ -e "$old" ] || [ -L "$old" ] || continue
   base=${old##*/}; opid=${base#*.}; opid=${opid%%.*}
   isnum "$opid" || { say "AVISO: $old não traz o pid de quem o criou — não apago"; continue; }
-  alive "$opid" && continue                                                                       # gate:orphan-live
+  alive "$opid"; ar=$?                                                                            # 1 = prova de que morreu; 0 e 2 (não sei) NÃO apagam
+  if [ $ar -ne 1 ]; then                                                                          # gate:orphan-live
+    [ $ar -eq 2 ] && say "AVISO: não consegui ler se o pid $opid vive — não apago $old"
+    continue
+  fi
   case "$base" in
     tmo.*) rm -f -- "$old" ;;
     *) say "scratch órfão $old — apagando"; rm_scratch "$old" || log_event cleanup-failed local 0 "orfao-nao-apagado" ;;
@@ -489,7 +555,14 @@ CHILD=$!
     kill -0 "$$" 2>/dev/null || exit 0   # o wrapper morreu (SIGKILL): ninguém limpa, e o pid de CHILD pode já ser de outro processo
     left=$(( left - step ))
   done
-  { alive "$CHILD" && [ "$(ps -o ppid= -p "$CHILD" 2>/dev/null | tr -d ' ')" = "$$" ]; } || exit 0   # CHILD já saiu (zumbi inclusive), ou o pid foi reaproveitado
+  alive "$CHILD"; [ $? -eq 1 ] && exit 0                                                            # CHILD já saiu (zumbi inclusive); "não sei" segue para a prova do ppid
+  wppid=$("$PS_BIN" -o ppid= -p "$CHILD" 2>/dev/null | tr -d ' ')
+  if [ -z "$wppid" ]; then                                                                          # gate:timeout-ppid
+    alive "$CHILD"; [ $? -eq 1 ] && exit 0                                                          # saiu entre uma leitura e outra
+    say "AVISO: não consegui ler o ppid do pid $CHILD (ps) — não provo que é o comando e NÃO o corto pelo timeout de ${RUN_TIMEOUT}s; ele segue até terminar"
+    exit 0
+  fi
+  [ "$wppid" = "$$" ] || exit 0                                                                     # lido e é de outro: o pid foi reaproveitado
   echo 1 > "$TMO"; stop_tree "$CHILD" ) &                                                        # gate:timeout
 WD=$!
 RC=0
