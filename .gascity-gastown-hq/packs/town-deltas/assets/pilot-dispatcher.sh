@@ -9960,7 +9960,7 @@ _topup_bind_after_spawn() {
 #            the session is not already doing). Sets _PY_TOPUP_SESS. An unassigned bead gets its claim written here.
 #   exit 1 = no: no live session titled for it, or the session is not building it (it holds another bead — the 14/10 drift —, is not
 #            an active owner, or the bead is claimed by someone else / not open, or the repair write failed). A waiter, as before.
-#   exit 2 = CANNOT TELL (roster, bead or store unreadable): never a waiter on a guess, never "building" on one.
+#   exit 2 = CANNOT TELL (roster, bead, store or the sweep's active-owner roster unreadable): never a waiter on a guess, never "building" on one.
 # The Pilot never takes a claim from anyone and never gives a session a second bead. DRY_RUN reads, decides, writes nothing.
 _pilot_priority_topup_building() {
   local _id="${1:-}" _pool="${2:-}" _row _sess _wd _syn _store _json _st _asg _held _brc=0
@@ -9984,7 +9984,12 @@ _pilot_priority_topup_building() {
     return 1
   fi
   [ "$_st" = "open" ] || return 1
-  if declare -F _session_is_active_owner >/dev/null 2>&1 && ! _session_is_active_owner "$_sess"; then
+  # "Active owner" is read off the sweep's dead-worker roster: when that roster is not trustworthy (_DEADWORKER_OK!=1: unreadable, or
+  # no live session at all) _session_is_active_owner answers "no" for EVERY session — a verdict from nothing — so it is CANNOT TELL.
+  if ! declare -F _session_is_active_owner >/dev/null 2>&1 || [ "${_DEADWORKER_OK:-0}" != "1" ]; then
+    return 2
+  fi
+  if ! _session_is_active_owner "$_sess"; then
     log "ga-2lca0l: $_id has a top-up session ($_sess) but it is not an active owner (asleep or idle past the threshold) — not building it; still a waiter."
     return 1
   fi
@@ -10217,10 +10222,20 @@ _pilot_priority_yield_release() {
 # writes nothing. Always exit 0 — an alarm must never stop the sweep.
 _pilot_yield_stall_check() {
   local _state="${PILOT_YIELD_STALL_FILE:-${GC_CITY:-/nonexistent}/.gc/priority-yield-stall.state}"
-  local _need="${PILOT_YIELD_STALL_SWEEPS:-6}" _cnt=0 _wid="" _mailed="" _roster _list _subj _body _tmp
+  local _need="${PILOT_YIELD_STALL_SWEEPS:-6}" _cnt=0 _wid="" _mailed="" _roster _list _subj _body _tmp _n
   case "$_need" in ''|*[!0-9]*|0) _need=6 ;; esac
-  if [ "${DISPATCHED:-1}" -ne 0 ] 2>/dev/null || [ "${PRIORITY_YIELDED:-0}" -le 0 ] 2>/dev/null \
-     || ! { [ "${SMALL_SLOTS:-0}" -gt 0 ] 2>/dev/null || [ "${BIG_SLOTS:-0}" -gt 0 ] 2>/dev/null; } \
+  # A counter this sweep cannot read is "cannot tell", not a value: `[ abc -ne 0 ]` is an ERROR (rc 2), which the tests below would
+  # take as "false" and count the sweep as dispatched=0. The streak ends instead — nothing is counted and nothing is mailed on it.
+  for _n in "${DISPATCHED:-}" "${PRIORITY_YIELDED:-}" "${SMALL_SLOTS:-}" "${BIG_SLOTS:-}"; do
+    case "$_n" in
+      ''|*[!0-9]*)
+        warn "ga-2lca0l: CANNOT READ this sweep's counters (dispatched='${DISPATCHED:-}' yielded='${PRIORITY_YIELDED:-}' small_slots='${SMALL_SLOTS:-}' big_slots='${BIG_SLOTS:-}') — the cede-only streak is ended, not extended (inert: nothing counted, no mail)."
+        [ "${DRY_RUN:-0}" = "1" ] || rm -f "$_state" 2>/dev/null || true
+        return 0 ;;
+    esac
+  done
+  if [ "$DISPATCHED" -ne 0 ] || [ "$PRIORITY_YIELDED" -le 0 ] \
+     || ! { [ "$SMALL_SLOTS" -gt 0 ] || [ "$BIG_SLOTS" -gt 0 ]; } \
      || [ -z "${_PY_WAIT_ID:-}" ]; then
     [ "${DRY_RUN:-0}" = "1" ] || rm -f "$_state" 2>/dev/null || true
     return 0

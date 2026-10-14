@@ -155,6 +155,7 @@ run_py() {
     _topup_pending_store() { [ -d "$WORK/store" ] && [ -e "$WORK/store.ok" ] && { printf '%s' "$WORK/store"; return 0; }; return 1; }
     # ga-2lca0l: the sweep's active-owner roster, stubbed (live + not asleep + not idle past the threshold); a name is inactive iff its marker exists.
     _session_is_active_owner() { [ -n "${1:-}" ] && [ ! -e "$WORK/owner.inactive.$1" ]; }
+    _DEADWORKER_OK=1   # the sweep's roster is trustworthy (the dispatcher sets 0 when it is not); the L3e case overrides it
     PILOT_YIELD_STALL_FILE="$WORK/stall.state"
     eval "$FUNCS"
     eval "$_script"
@@ -541,6 +542,14 @@ reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""
 sessions "$(sess wa-worker-adhoc-old 'pool top-up: wa-p1' active false 2026-10-14T05:00:00Z)" "$(sess "$SESS_A" 'pool top-up: wa-p1' active false 2026-10-14T08:47:19Z)"
 run_py "$(scan_with "$POPL")" >/dev/null
 want_write "$SESS_A" && ok "L3d two live sessions titled for the bead → the NEWEST one gets the claim" || bad "L3d: $(cat "$WORK/bd.writes" 2>/dev/null)"
+# L3e — "is it an active owner?" is only as good as the roster behind it: with an untrustworthy one the answer is "cannot tell", not "no".
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "_DEADWORKER_OK=0; $(scan_with "$POPL"); _pilot_priority_yield_for '$P2PS' && echo CEDES || echo DISPATCHES")"
+echo "$out" | grep -qx "WAIT= BLIND=1" && echo "$out" | grep -qx "DISPATCHES" && [ "$(writes)" = "0" ] && warned "CANNOT TELL" \
+  && ok "L3e the sweep's dead-worker roster is untrustworthy (_DEADWORKER_OK!=1) → BLIND=1: not 'inactive' (a verdict from nothing), not 'building', no write, no cession on a guess" || bad "L3e: $out writes=$(writes) / $(cat "$WORK/log.txt")"
+reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; sessions "$(sess "$SESS_A" 'pool top-up: wa-p1')"
+out="$(run_py "unset -f _session_is_active_owner; $(scan_with "$POPL")")"
+[ "$out" = "WAIT= BLIND=1" ] && [ "$(writes)" = "0" ] && ok "L3f the owner check is not even loaded → BLIND=1, no write (a missing check never lets a claim through)" || bad "L3f: $out writes=$(writes)"
 
 # L4 — three states: the roster that cannot be read is "cannot tell", never "no session" (and never "building").
 reset; : > "$WORK/store.ok"; cap wa-worker 2 2; claim_state wa-p1 open ""; : > "$WORK/sessions.fail"
@@ -669,6 +678,14 @@ stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null; stall_sweep 0 15
 reset
 out="$(run_py "PILOT_YIELD_STALL_SWEEPS=3; DISPATCHED=0; PRIORITY_YIELDED=150; SMALL_SLOTS=2; BIG_SLOTS=0; _PY_WAIT_ID=''; _pilot_yield_stall_check; _pilot_yield_stall_check; _pilot_yield_stall_check; echo rc=\$?")"
 [ "$out" = "rc=0" ] && [ "$(mails)" = "0" ] && ok "L13l no head waiter known → nothing to name, no streak, no mail" || bad "L13l: $out mails=$(mails)"
+# L13m — a counter the sweep cannot read is "cannot tell": the streak ENDS (not extended) and the log says so — it never counts as dispatched=0.
+reset; sessions "$(sess "$SESS_A" 'pool top-up: wa-470co3')"
+stall_sweep 0 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null; stall_sweep abc 150 2 >/dev/null; stall_sweep 0 150 2 >/dev/null
+[ "$(mails)" = "0" ] && [ "$(cut -f1 "$WORK/stall.state" 2>/dev/null)" = "1" ] && warned "CANNOT READ" \
+  && ok "L13m dispatched='abc' in the middle of a streak → no mail, the count restarts at 1 afterwards, said in the log" || bad "L13m mails=$(mails) state=$(cat "$WORK/stall.state" 2>/dev/null)"
+reset; sessions "$(sess "$SESS_A" 'pool top-up: wa-470co3')"
+stall_sweep 0 '' 2 >/dev/null; stall_sweep 0 150 '' >/dev/null; stall_sweep 0 150 2 "BIG_SLOTS=x" >/dev/null
+[ "$(mails)" = "0" ] && [ ! -e "$WORK/stall.state" ] && warned "CANNOT READ" && ok "L13n an empty yield count, an empty slot count and a non-numeric big-slot count all end the streak too (no state kept)" || bad "L13n mails=$(mails) state=$(cat "$WORK/stall.state" 2>/dev/null)"
 
 # ── I: the wiring in the dispatcher (order assertions — the functions above are inert unless these hold) ─────────────────
 echo "I. wiring order in the dispatcher"
