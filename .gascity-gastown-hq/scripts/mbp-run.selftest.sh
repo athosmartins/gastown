@@ -30,8 +30,10 @@
 #   (MemAvailable, SwapTotal/SwapFree e crescimento, PSI → níveis 1/2/4, disco, núcleos; ilegível ≠ baixo) · SEGURANÇA: o rsync REAL com os argumentos do mbp-run, contra uma árvore
 #   com .duckdb/.db/.csv/.env/segredo/data/shared/logs e nomes de credencial (.pdpj_token.txt, .netrc, token.txt, secrets.json, *.keystore, formato desconhecido .zip) plantados
 #   (dentro e fora de tests/) — nada chega, e o código de nome parecido (pdpj_token.py, test_pdpj_token_*.py) chega; o que uma semeadura antiga deixou é apagado; controles negativos
-#   (sem --filter, filtro com a ordem errada sem a conferência, filtro só-denylist sem a conferência) VAZAM e são pegos · filtro ausente, vazio, fora de ordem, sem o `- *` final
-#   ou sem uma regra-âncora = o nó NÃO é usado.
+#   (sem --filter, filtro com a ordem errada sem a conferência, filtro só-denylist sem a conferência, a lista por EXTENSÃO da 1ª correção, sem o node_guard) VAZAM e são pegos ·
+#   NOME NEUTRO (docs/**/ab_results/*.json, scripts/*estado.json, state.json...) com telefone/CPF dentro não chega; config listada por caminho chega · CONTEÚDO: node_guard retém, mesmo em nome e
+#   pasta liberados, o arquivo com LISTA de telefones (>=20) ou CPFs (>=3), deixa passar 3 números e cauda sintética, e SEM a varredura (hetzner-pii-scan.py) o nó NÃO é usado ·
+#   filtro ausente, vazio, fora de ordem, sem o `- *` final, sem uma regra-âncora, com `+` que inclua tudo (`+ /**`...), `!` ou `.` = o nó NÃO é usado.
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -117,6 +119,7 @@ EOF
 cat > "$T/bin/rsync" <<'EOF'
 #!/usr/bin/env bash
 echo "RSYNC:$*" >> "$STUB_LOG"
+case "$*" in *--out-format*) exec "$REAL_RSYNC" "$@" ;; esac   # a lista do node_guard (-n --out-format) roda DE VERDADE sobre a árvore local: o guard falha fechado, um stub mudo desligaria o nó em todo teste
 # o rsync real (openrsync) procura `rsync` no PATH para subir o processo servidor local: ESTE stub. O filho `--server` vai direto ao binário de verdade.
 case "$*" in --server*) exec "$REAL_RSYNC" "$@" ;; esac
 case "$*" in *gt-remote/bin*) [ "${STUB_RSYNC_FAIL_BIN:-0}" = 1 ] && exit 1 ;; esac   # só a cópia de ferramentas para ~/gt-remote/bin
@@ -717,6 +720,11 @@ ok() { n=$((n+1)); echo "ok   $1"; }
 bad() { n=$((n+1)); echo "FAIL $1"; fails=$((fails+1)); }
 LEAKS="x.duckdb lib/leak.duckdb tests/fixtures/y.duckdb tests/y.db .env lib/.env.pdpj contacts_auth/client_secret.json data/a.txt viewer/data/b.py shared/logs/a.out logs/l.txt lib/x.csv tests/z.csv lib/k.pem lib/t.parquet lib/b.gz lib/c.pkl .gc/state"
 # a classe que o gate achou (14/10): credencial com nome que nenhuma denylist conhecia + formato/pasta que nenhuma lista previa
+# a classe da 2ª revisão (14/10): arquivo de NOME NEUTRO com dado de cliente dentro, em pasta que a lista por extensão deixava sair; e o que TEM que chegar (config por caminho + código)
+NEUTRAL="docs/auto_response/ab_results/cycle1_new_rules_200.json scripts/campanhas_aprovar_enriquecer_estado.json docs/pix_verdicts/pix_verdicts.json analysis/numero_certo/results/baseline.json scripts/peter/mrv_bh/socios_cache.json state.json config.json hex_cells/fixtures/status.json daemons/static/map_viewer/piloto3d.json docs/relatorio.md docs/page.html processo_lookup/consulta.html lib/export.sql scripts/export.sql assets/warming_docs/pool.json lib/README.md lib/export.html"
+OKCFG="lib/changelog.d/a.json lib/silence.yml daemons/deploy_deps.json daemons/restart_policy.yaml daemons/anuncios/changelog.d/app/c.json templates/auto_responses/a.json templates/pregao.html daemons/templates/d.html migrations/0001.sql launchd/l.plist deploy/d.plist daemons/launchd/dl.plist scripts/s.plist pytest.ini CLAUDE.md AGENTS.md docs/superpowers/runbooks/job-agendado-veredito-alerta.md viewer/app.js viewer/x.mjs lib/x.ts lib/style.css"
+# o CONTEÚDO que o node_guard olha: LISTA de telefones/CPFs fica no mini mesmo em nome e pasta liberados (HELDF); 3 números, ou 32 de cauda sintética, passam (PASSF)
+HELDF="lib/leads_list.py lib/changelog.d/dump.json tests/fixtures/cpfs.json"; PASSF="lib/few.py lib/synthetic.py"
 LEAKS="$LEAKS processo_lookup/.pdpj_token.txt .netrc lib/.pgpass token.txt lib/api_token lib/access_token.json service_account.json secrets.json lib/app.keystore lib/token.pickle lib/GOOGLE_TOKEN.json lib/Secrets.YAML tests/fixtures/token.json tests/fixtures/.token tests/fixtures/secrets.yaml lib/dump.zip lib/leads.ndjson lib/notes.txt lib/shot.png run.log .runtime/s.json witness/s.json docs/mrv_artifacts/mrv_decisores.json lib.bak-1/a.py"
 
 node_cases() {
@@ -806,6 +814,8 @@ for mut in '- *' '- .netrc' '- .*[Tt][Oo][Kk][Ee][Nn]*' '- *[Tt][Oo][Kk][Ee][Nn]
   grep -v -F -x -e "$mut" "$HERE/hetzner-rsync-filter.wa.txt" > "$T/mut-filter"; reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/mut-filter" run -- tests/test_x.py); has "filtro SEM '$mut': o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'; done
 for pos in first last; do { [ $pos = first ] && echo '+ *.py'; cat "$HERE/hetzner-rsync-filter.wa.txt"; [ $pos = last ] && echo '+ *.py'; } > "$T/plus-filter"
   reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/plus-filter" run -- tests/test_x.py); has "filtro com '+ *.py' $pos (antes das regras de segredo / no lugar do '- *' final): o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'; done
+for ins in '+ /**' '+ **/**' '+ /*' '+ **' '!' '. /dev/null'; do { sed '$d' "$HERE/hetzner-rsync-filter.wa.txt"; echo "$ins"; echo '- *'; } > "$T/catch-filter"
+  reset; date > "$NODEFLAG"; rc=$(HETZNER_RSYNC_FILTER="$T/catch-filter" run -- tests/test_x.py); has "filtro com '$ins' antes do '- *' final: o nó NÃO é usado" "$J" '"reason":"filtro-invalido"'; hasnt "…nenhum rsync ao nó" "$STUB_LOG" 'RSYNC:.*hetzner-teste'; done
 # o rsync do nó usa o filtro, com --delete-excluded, e o ssh reaproveita a conexão
 reset; date > "$NODEFLAG"; run -- tests/test_x.py >/dev/null; has "rsync do nó: --filter com o arquivo do repositório" "$STUB_LOG" 'RSYNC:.*--filter=\. .*hetzner-rsync-filter\.wa\.txt'; has "rsync do nó: --delete-excluded" "$STUB_LOG" 'RSYNC:.*--delete --delete-excluded'
 has "rsync do nó: destino é o espelho do slot" "$STUB_LOG" 'RSYNC:.* hetzner-teste:gt-remote/mirror/wa-1/'; hasnt "rsync do nó: NÃO usa a lista de exclusões do MBP" "$STUB_LOG" 'RSYNC:.*hetzner-teste.*--exclude'
@@ -821,20 +831,32 @@ has "job do nó: nice (o taskpolicy do macOS não existe lá)" "$(lsf RUN hetzne
 has "job do nó: presença dedicada/livre" "$(lsf RUN hetzner)" 'PR_WHY=dedicada'
 reset; run -- tests/test_x.py >/dev/null; has "job do MBP: PATH do Homebrew (como sempre)" "$(lsf RUN mbp)" '/opt/homebrew/bin'; has "job do MBP: a biblioteca de presença" "$(lsf RUN mbp)" 'ioreg'
 
+# opção que pede valor, na última posição: o laço de argumentos avança (antes `shift 2` falhava e girava para sempre)
+for opt in --host --repo --dir; do timeout 10 "$RUN" $opt >/dev/null 2>&1; rc=$?; if [ $rc -ne 124 ]; then ok "$opt como ÚLTIMO argumento termina (rc=$rc), não gira"; else bad "$opt como último argumento girou até o timeout"; fi; done
+reset; date > "$NODEFLAG"; run -- tests/test_x.py >/dev/null
+if awk '/echo NOVENV/ { v = NR } /echo MIRROR_OK/ { m = NR } END { exit !(v && m && v < m) }' "$(lsf MIRROR hetzner)"; then ok "espelho do nó: o venv é conferido ANTES de aceitar um espelho que já existe"; else bad "espelho do nó: o venv só é conferido quando o espelho ainda não existe"; fi
+
 # ===== SEGURANÇA, de verdade: o rsync REAL com os argumentos do mbp-run, contra uma árvore com dado e segredo plantados =====
 WTD="$T/wtd"; mkdir -p "$WTD/tests/fixtures" "$WTD/tests/data" "$WTD/lib" "$WTD/contacts_auth" "$WTD/processo_lookup" "$WTD/data" "$WTD/viewer/data" "$WTD/shared/logs" "$WTD/logs" "$WTD/.gc"
 : > "$WTD/tests/test_x.py"; echo ok > "$WTD/tests/ok.json"; echo ok > "$WTD/tests/data/fixture.json"; echo ok > "$WTD/tests/fixtures/win.jsonl"; echo code > "$WTD/lib/a.py"; echo code > "$WTD/contacts_auth/server.py"
 echo code > "$WTD/processo_lookup/pdpj_token.py"; echo code > "$WTD/tests/test_pdpj_token_refresh.py"; echo ok > "$WTD/lib/rules.yaml"   # código/config de nome parecido com credencial: TEM que chegar
 for lk in $LEAKS; do mkdir -p "$WTD/$(dirname "$lk")"; echo secret > "$WTD/$lk"; done
+for lk in $NEUTRAL; do mkdir -p "$WTD/$(dirname "$lk")"; echo '[{"phone": "+5531987654321", "cpf": "123.456.789-09"}]' > "$WTD/$lk"; done
+for lk in $OKCFG; do mkdir -p "$WTD/$(dirname "$lk")"; echo ok > "$WTD/$lk"; done
+phones() { awk -v n="$1" 'BEGIN { for (i = 1; i <= n; i++) printf "\"+55319%08d\",\n", (i * 7654321) % 100000000 }'; }
+phones 25 > "$WTD/lib/leads_list.py"; phones 25 > "$WTD/lib/changelog.d/dump.json"; phones 3 > "$WTD/lib/few.py"
+awk 'BEGIN { for (i = 1; i <= 4; i++) printf "\"%03d.456.789-%02d\",\n", i, i }' > "$WTD/tests/fixtures/cpfs.json"
+awk 'BEGIN { for (i = 0; i < 32; i++) printf "\"+55319999%d%d%d%d%d\",\n", int(i/16)%2, int(i/8)%2, int(i/4)%2, int(i/2)%2, i%2 }' > "$WTD/lib/synthetic.py"
 DEST="$T/home/gt-remote/mirror/wa-1"
 leakcheck() { # imprime os arquivos plantados que chegaram ao destino (vazio = nada vazou)
-  local lk got=""; for lk in $LEAKS; do [ -e "$DEST/$lk" ] && got="$got $lk"; done; printf '%s' "${got# }"; }
+  local lk got=""; for lk in $LEAKS $NEUTRAL $HELDF; do [ -e "$DEST/$lk" ] && got="$got $lk"; done; printf '%s' "${got# }"; }
 reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; mkdir -p "$DEST/processo_lookup" "$DEST/shared/logs.backup"; echo old > "$DEST/processo_lookup/.env.pdpj"; echo old > "$DEST/shared/logs.backup/x.out"
 STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTD" -- tests/test_x.py >"$T/out" 2>"$T/err"; rc=$?; expect "rsync real: a bateria roda no nó" 0 "$rc"; has "…no nó" "$J" '"host":"hetzner"'
-eq "NADA de dado ou segredo plantado chegou ao nó (a lista abaixo tem de ser vazia)" "" "$(leakcheck)"
-for okf in lib/a.py tests/test_x.py tests/ok.json tests/data/fixture.json tests/fixtures/win.jsonl contacts_auth/server.py processo_lookup/pdpj_token.py tests/test_pdpj_token_refresh.py lib/rules.yaml; do n=$((n+1)); if [ -f "$DEST/$okf" ]; then echo "ok   chegou (é código/fixture): $okf"; else echo "FAIL não chegou: $okf"; fails=$((fails+1)); fi; done
+eq "NADA de dado ou segredo plantado chegou ao nó, nem arquivo de nome neutro, nem lista de telefones/CPFs (a lista abaixo tem de ser vazia)" "" "$(leakcheck)"
+has "o node_guard avisa quantos reteve" "$T/err" 'NOTE: 3 arquivo\(s\) com lista de telefones/CPFs ficam no mini e NÃO vão ao nó Linux'; hasnt "…e o aviso nunca traz o VALOR" "$T/err" '5531[0-9]{8}'
+for okf in lib/a.py tests/test_x.py tests/ok.json tests/data/fixture.json tests/fixtures/win.jsonl contacts_auth/server.py processo_lookup/pdpj_token.py tests/test_pdpj_token_refresh.py lib/rules.yaml $OKCFG $PASSF; do n=$((n+1)); if [ -f "$DEST/$okf" ]; then echo "ok   chegou (é código/config listado/abaixo do limite): $okf"; else echo "FAIL não chegou: $okf"; fails=$((fails+1)); fi; done
 n=$((n+1)); if [ ! -e "$DEST/processo_lookup/.env.pdpj" ] && [ ! -e "$DEST/shared/logs.backup/x.out" ]; then echo "ok   --delete-excluded limpa o que uma semeadura antiga deixou (.env.pdpj e shared/logs.backup/x.out)"; else echo "FAIL o destino manteve segredo/log antigo"; fails=$((fails+1)); fi
-MUT="$T/mutdir"; mkdir -p "$MUT"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt; do ln -sf "$HERE/$mf" "$MUT/$mf"; done
+MUT="$T/mutdir"; mkdir -p "$MUT"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt hetzner-pii-scan.py; do ln -sf "$HERE/$mf" "$MUT/$mf"; done   # o pii-scan TEM de estar aqui: sem ele o node_guard do mutante falha fechado e nada vaza, e o controle diria que o teste não enxerga o defeito
 # controle negativo 1: sem o --filter, o vazamento aparece — prova que o teste enxerga o defeito
 sed 's/--filter=". \$NODE_FILTER" //' "$RUN" > "$MUT/mut-nofilter.sh"; chmod +x "$MUT/mut-nofilter.sh"
 n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-nofilter.sh"; then echo "FAIL controle: o sed não mudou nada"; fails=$((fails+1)); else
@@ -853,6 +875,22 @@ reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; HETZNER
 n=$((n+1)); if [ -e "$DEST/processo_lookup/.pdpj_token.txt" ] && [ -e "$DEST/.netrc" ] && [ -e "$DEST/lib/dump.zip" ]; then echo "ok   controle: o filtro só-denylist, sem a conferência, deixa sair .pdpj_token.txt, .netrc e dump.zip (o teste enxerga a classe)"; else echo "FAIL controle: o filtro só-denylist não vazou — o teste não enxerga a classe"; fails=$((fails+1)); fi
 reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; HETZNER_RSYNC_FILTER="$T/denylist-filter" STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTD" -- tests/test_x.py >/dev/null 2>&1
 n=$((n+1)); if [ ! -e "$DEST/processo_lookup/.pdpj_token.txt" ] && [ ! -e "$DEST/.netrc" ]; then echo "ok   o script real, com o filtro só-denylist, não envia nada (o filter_sane recusa: falta o '- *' final e as âncoras)"; else echo "FAIL o script real enviou credencial com o filtro só-denylist"; fails=$((fails+1)); fi
+# controle negativo 4: a lista por EXTENSÃO (a 1ª correção, que o gate reprovou) deixa sair arquivo de nome neutro com dado dentro; a seção 3b atual, não
+{ sed '/^# 3b/,$d' "$HERE/hetzner-rsync-filter.wa.txt"; printf '%s\n' '+ *.json' '+ *.md' '+ *.html' '+ *.yaml' '+ *.yml' '+ *.sql' '+ *.plist' '+ *.ini' '- *'; } > "$T/ext-filter"
+reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; HETZNER_RSYNC_FILTER="$T/ext-filter" STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTD" -- tests/test_x.py >/dev/null 2>&1
+n=$((n+1)); if [ -e "$DEST/docs/auto_response/ab_results/cycle1_new_rules_200.json" ] && [ -e "$DEST/scripts/campanhas_aprovar_enriquecer_estado.json" ] && [ -e "$DEST/state.json" ]; then echo "ok   controle: a lista por extensão deixa sair ab_results/*.json, *_estado.json e state.json (o teste enxerga a classe)"; else echo "FAIL controle: a lista por extensão não vazou — o teste não enxerga a classe"; fails=$((fails+1)); fi
+# controle negativo 5: sem o node_guard, a LISTA de telefones/CPFs em nome e pasta liberados chega
+sed 's/^  if \[ "\$HOSTKIND" = linux \]; then node_guard .*$/  HELD=\/dev\/null/' "$RUN" > "$MUT/mut-noguard.sh"; chmod +x "$MUT/mut-noguard.sh"
+n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-noguard.sh"; then echo "FAIL controle: o sed do node_guard não mudou nada"; fails=$((fails+1)); else
+  reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; STUB_RSYNC_REAL=1 "$MUT/mut-noguard.sh" --repo wa --dir "$WTD" -- tests/test_x.py >/dev/null 2>&1
+  n=$((n+1)); if [ -e "$DEST/lib/leads_list.py" ] && [ -e "$DEST/lib/changelog.d/dump.json" ] && [ -e "$DEST/tests/fixtures/cpfs.json" ]; then echo "ok   controle: sem o node_guard a lista de telefones/CPFs chega (o teste enxerga o conteúdo)"; else echo "FAIL controle: sem o node_guard nada vazou — o teste não enxerga o conteúdo"; fails=$((fails+1)); fi; fi
+# controle 6: a varredura que não roda (hetzner-pii-scan.py ausente) NÃO é "nada retido": o nó não é usado, cai no MBP
+NOSCAN="$T/noscandir"; mkdir -p "$NOSCAN"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt; do ln -sf "$HERE/$mf" "$NOSCAN/$mf"; done   # SEM o hetzner-pii-scan.py, de propósito (o $MUT o tem)
+cp "$RUN" "$NOSCAN/mut-noscan.sh"; chmod +x "$NOSCAN/mut-noscan.sh"
+n=$((n+1)); if [ ! -e "$NOSCAN/hetzner-pii-scan.py" ] && [ -e "$MUT/hetzner-pii-scan.py" ]; then echo "ok   premissa dos controles: o scanner está no diretório dos mutantes e NÃO no diretório do controle 6"; else echo "FAIL premissa dos controles: o scanner tem de estar em \$MUT e ausente em \$NOSCAN"; fails=$((fails+1)); fi
+reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; STUB_RSYNC_REAL=1 "$NOSCAN/mut-noscan.sh" --repo wa --dir "$WTD" -- tests/test_x.py >"$T/out" 2>"$T/err"; rc=$?
+expect "varredura de conteúdo que não roda: o nó NÃO é usado e a cadeia cai no MBP" 0 "$rc"; has "…motivo varredura-falhou no host hetzner" "$J" '"reason":"varredura-falhou".*"host":"hetzner"'; hasnt "…nenhum rsync ao nó" "$STUB_LOG" 'RSYNC:.*hetzner-teste'; has "…e a mensagem diz o que faltou" "$T/err" 'não consegui varrer o conteúdo'
+n=$((n+1)); if [ ! -e "$DEST/lib/a.py" ]; then echo "ok   …e nada foi enviado ao nó"; else echo "FAIL a varredura falhou mas o nó recebeu arquivos"; fails=$((fails+1)); fi
 find "$DEST" -mindepth 1 -delete 2>/dev/null
 
 

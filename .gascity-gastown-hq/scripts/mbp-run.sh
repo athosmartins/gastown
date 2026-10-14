@@ -40,8 +40,9 @@
 #                 slots cheios, base ausente, ssh que caiu no meio, filtro ilegível, repo que não é wa) cai no MBP, e daí no
 #                 que já existia. Servidor fora do ar NUNCA trava o gate. Só pytest vai ao nó (--exec segue no MBP; é a bead do REA).
 #   SEGURANÇA     o rsync para o nó usa SÓ scripts/hetzner-rsync-filter.wa.txt, com --delete-excluded. O filtro olha NOME e pasta, nunca o conteúdo: nome de segredo
-#                 ou de dado conhecido não sai, e fora de tests/ só sai a extensão de código/doc listada (nome desconhecido fica inerte). Filtro fora da forma
-#                 que o filter_sane confere = o nó NÃO é usado.
+#                 ou de dado conhecido não sai, e fora de tests/ só sai código e os arquivos de dado/config listados POR CAMINHO (nome desconhecido fica inerte).
+#                 Filtro fora da forma que o filter_sane confere = o nó NÃO é usado. O CONTEÚDO é conferido por node_guard (scripts/hetzner-pii-scan.py): arquivo
+#                 com lista de telefones/CPFs fica no mini, e se a varredura não termina o nó NÃO é usado.
 #   LOG           toda linha de $CITY/.gc/logs/mbp-run.jsonl traz "host":"hetzner"|"mbp".
 #
 # PRESENÇA DO ATHOS (ga-77c1qg; decisão dele em 12/10: o MBP é o notebook de trabalho dele, o mini é o servidor)
@@ -137,17 +138,17 @@ pause_arg=""; host_sel=auto
 pushes=(); pulls=(); envs=(); keep=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --host) host_sel="${2:-}"; shift 2 ;;
-    --repo) repo="${2:-}"; shift 2 ;;
-    --dir) dir="${2:-}"; shift 2 ;;
+    --host) host_sel="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    --repo) repo="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    --dir) dir="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
     --exec) mode=exec; shift ;;
-    --seed) mode=seed; seed_repo="${2:-}"; shift 2 ;;
+    --seed) mode=seed; seed_repo="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
     --check) mode=check; shift ;;
-    --remote-pause) mode=remote_pause; pause_arg="${2:-}"; shift 2 ;;
+    --remote-pause) mode=remote_pause; pause_arg="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
     --install-tools) mode=install_tools; shift ;;
-    --push) pushes+=("${2:-}"); shift 2 ;;
-    --pull) pulls+=("${2:-}"); shift 2 ;;
-    --env) envs+=("${2:-}"); shift 2 ;;
+    --push) pushes+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
+    --pull) pulls+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
+    --env) envs+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
     --keep) keep=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
@@ -543,7 +544,7 @@ true
 EOF
   SLOT=""
 }
-cleanup() { release; [ -n "${TMPOUT:-}" ] && rm -f "$TMPOUT"; }
+cleanup() { release; [ -n "${TMPOUT:-}" ] && rm -f "$TMPOUT"; [ -n "${SENT:-}" ] && { rm -f "$SENT" "$SENT.held" "$SENT.out"; rmdir "$SENT.dst" 2>/dev/null; }; return 0; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
@@ -551,7 +552,8 @@ trap 'exit 130' INT TERM HUP
 # filter_sane: o filtro do rsync é a fronteira de dados do servidor alugado, então ele é CONFERIDO, não só lido. Confere a FORMA, não a suficiência (essa é o teste com rsync
 # de verdade, no selftest e no prod test): (1) abre e não é vazio, (2) `+ /tests/***` existe, (3) as 12 regras-âncora de cada classe (.env, .netrc, client_secret, dotfile de
 # token, token/secret com extensão de dado, .pickle, *.duckdb/.db/.csv/.parquet/.gz) vêm ANTES dela — o rsync usa a primeira regra que casa, e quem inclui tests/ primeiro deixa passar
-# um *.duckdb plantado lá dentro —, (4) nenhum `+` antes dela e nenhum `+ *` em lugar nenhum, (5) a ÚLTIMA regra é `- *` (sem ela, nome desconhecido sai). rc 0 = vale · 1 = não.
+# um *.duckdb plantado lá dentro —, (4) nenhum `+` antes dela e nenhum `+` que inclua tudo (`+ *`, `+ **`, `+ /*`, `+ /**`, `+ **/**`...) em lugar nenhum, só regras `- x`/`+ x` (um `!`, que
+# zera a lista, ou um `.`/`:`, que traz outro arquivo, não passam), (5) a ÚLTIMA regra é `- *` (sem ela, nome desconhecido sai). rc 0 = vale · 1 = não.
 filter_sane() {
   [ -f "$NODE_FILTER" ] && [ -r "$NODE_FILTER" ] && [ -s "$NODE_FILTER" ] || return 1
   awk '
@@ -559,7 +561,8 @@ filter_sane() {
             for (i in c) { want["- " c[i]] = 1; nwant++ } }
     /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
     { line = $0; sub(/[[:space:]]+$/, "", line); last = line }
-    line ~ /^\+ \*+$/ { bad = 1 }
+    line !~ /^[-+] / { bad = 1 }
+    line ~ /^\+ [*\/]+$/ && line != "+ */" { bad = 1 }
     line == "+ /tests/***" { if (!tests) tests = NR; next }
     !tests && line ~ /^\+/ { bad = 1 }
     !tests && (line in want) { seen[line] = 1 }
@@ -573,6 +576,20 @@ node_wanted() {
   [ -f "$NODE_FLAG" ] || return 1
   [ "$repo" = wa ] || { [ "$host_sel" = linux ] && say "o nó Linux só roda o repo wa (este é '$repo') — rode local"; return 1; }
   filter_sane || { NODE_WHY="filtro-invalido"; say "o filtro do rsync do nó ($NODE_FILTER) não abre ou não está na forma conferida pelo filter_sane (regras de segredo/dado ANTES de + /tests/***, nada que inclua tudo, \`- *\` no fim) — o nó NÃO é usado"; return 1; }
+  return 0
+}
+# node_guard: o filtro olha NOME e pasta; isto olha o CONTEÚDO do que ele deixaria sair (hetzner-pii-scan.py, o mesmo que o prod test roda no servidor). Arquivo com LISTA de telefones/CPFs (>=20 / >=3)
+# fica no mini: vira regra `- /caminho` em $HELD, que o rsync lê ANTES do filtro. FALHA FECHADA: a lista do rsync ou a varredura que não termina = rc 1 e o nó NÃO é usado (erro e "nada retido" não são a mesma coisa).
+SENT=""; HELD=""
+node_guard() {
+  local nheld
+  mkdir -p "$CITY/.gc/run" 2>/dev/null; SENT=$(mktemp "$CITY/.gc/run/mbp-sent.XXXXXX") || return 1; HELD="$SENT.held"
+  mkdir "$SENT.dst" || return 1
+  "$RSYNC_BIN" -a -n --out-format='%n' --filter=". $NODE_FILTER" "$dir"/ "$SENT.dst"/ 2>/dev/null | grep -v '/$' > "$SENT"
+  [ "${PIPESTATUS[0]}" -eq 0 ] && [ -s "$SENT" ] || return 1
+  python3 -I "$HERE/hetzner-pii-scan.py" "$dir" --rules "$HELD" < "$SENT" > "$SENT.out" 2>/dev/null && [ -f "$HELD" ] || return 1
+  nheld=$(wc -l < "$SENT.out" | tr -d ' ')
+  [ "$nheld" -eq 0 ] || say "NOTE: $nheld arquivo(s) com lista de telefones/CPFs ficam no mini e NÃO vão ao $HNAME ($(cut -f3 "$SENT.out" | head -n 4 | tr '\n' ' ')…): teste que os lê ou importa falha aqui — rode esse teste local."
   return 0
 }
 # ---- seed / check -----------------------------------------------------------------------------------------------
@@ -677,6 +694,7 @@ _attempt_pytest() {
   local base rv M m mrc rrc cpcmd pathline JOBDEF rc SECS
   local orig=("$@")
   preflight || { rc=$?; log_refusal; return $rc; }
+  if [ "$HOSTKIND" = linux ]; then node_guard || { say "não consegui varrer o conteúdo do que iria ao $HNAME (lista do rsync ou hetzner-pii-scan.py falhou) — o nó NÃO é usado, rode local"; fall varredura-falhou 98; return 98; }; fi
   SLOT_INFO=$(slot_info_for "$repo" pytest "$@")
   acquire || { rc=$?; if [ $rc -eq 96 ]; then fall slots "$rc"; else fall ssh-caiu "$rc"; fi; return $rc; }
   T0=$(date +%s)
@@ -688,9 +706,9 @@ _attempt_pytest() {
   m=$(rssh <<EOF 2>/dev/null
 # MBP:MIRROR
 B="\$HOME/gt-remote/$base"; M="\$HOME/$M"
+[ -x "\$HOME/gt-remote/$rv/bin/python" ] || { echo NOVENV; exit 97; }
 [ -d "\$M" ] && { echo MIRROR_OK; exit 0; }
 [ -d "\$B" ] || { echo NOBASE; exit 97; }
-[ -x "\$HOME/gt-remote/$rv/bin/python" ] || { echo NOVENV; exit 97; }
 mkdir -p "\$HOME/gt-remote/mirror" && $cpcmd "\$B" "\$M" && echo MIRROR_SEEDED
 EOF
   ); mrc=$?
@@ -702,7 +720,7 @@ EOF
   esac
   if [ "$HOSTKIND" = linux ]; then
     # SEGURANÇA: só o filtro decide o que sai do mini. --delete-excluded tira do espelho o que o filtro exclui (inclusive o que uma semeadura antiga tenha levado).
-    "$RSYNC_BIN" -a --delete --delete-excluded --filter=". $NODE_FILTER" -e "$SSH_BIN $SSH_OPTS" "$dir"/ "$MBP_HOST:$M/" >/dev/null 2>&1
+    "$RSYNC_BIN" -a --delete --delete-excluded --filter=". $HELD" --filter=". $NODE_FILTER" -e "$SSH_BIN $SSH_OPTS" "$dir"/ "$MBP_HOST:$M/" >/dev/null 2>&1
   else
     "$RSYNC_BIN" -a --delete -e "$SSH_BIN $SSH_OPTS" "${EXCLUDES[@]}" "$dir"/ "$MBP_HOST:$M/" >/dev/null 2>&1
   fi
