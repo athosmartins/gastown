@@ -2727,7 +2727,7 @@ _reap_backup_residue() {
   local retirer="$CITY/scripts/dolt-backup-reseed.sh"
   if [ -f "$retirer" ]; then
     if GC_CITY_PATH="$CITY" RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN=0 timeout 60 bash "$retirer" --retire-superseded-new --all >> "$LOG" 2>&1; then
-      log "backup-new-retire OK"
+      log "backup-new-retire OK (exit 0 — what was retired, spared or dry-run is in the retire-superseded-new lines above)"
     else
       log "backup-new-retire FAILED or aborted (nonzero exit) — see log lines above; the *.old reclaim below still runs"
     fi
