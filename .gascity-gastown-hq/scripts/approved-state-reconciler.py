@@ -320,13 +320,15 @@ _PILOT_CAP_DISPATCH_RE = re.compile(
     r"\((?P<live>\d+) active/creating >= (?P<max>\d+) max\) — QUEUED (?P<bead>[^\s:]+):")
 # The third shape (ga-80yi6w, Mayor 14/10): a P2+ bead the Pilot did NOT queue at a cap itself
 # but CEDED to a P0/P1 that waits behind a full pool (ga-5fn5p3, the cross-rig priority yield).
-# Same cause, same wait: the pool named is the WAITER's pool and live/max are its session count
-# and cap, so the entry carries the same (pool, live, max, epoch) as a cap line and the note is
-# coalesced into the same one-per-pool mail. Checked against the REAL log (2409 lines on
-# 14/10 09:58), all three emitters of _pilot_priority_yield_say write this one prefix; only the
-# text after the closing parenthesis differs, so the pattern stops there. <rig> and the
-# classes can be "?" when the Pilot had nothing to say; live/max "?" simply does not match
-# (an unmatched line only ever means "no evidence").
+# Same cause, same wait: the pool named is the WAITER's pool (the yield is cross-pool — while a
+# P0/P1 waits behind it, no P2+ bead opens a session in ANY pool — so the ceded bead itself may
+# route elsewhere) and live/max are that pool's session count and cap. The entry carries the same
+# (pool, live, max, epoch) as a cap line and the note is coalesced into the same one-per-pool
+# mail. Checked against the REAL log (2409 lines on 14/10 09:58): all three emitters of
+# _pilot_priority_yield_say write this one prefix; only the text after the closing parenthesis
+# differs, so the pattern stops there. <rig> and the classes can be "?" when the Pilot had
+# nothing to say; live/max "?" simply does not match (an unmatched line only ever means
+# "no evidence").
 #   "ga-5fn5p3: <bead> P<class> cedida a P0/P1 de <rig> (P<prio> <waiter> waits behind
 #    <pool> <live>/<max>) — not claimed, no writes this sweep; ..."
 _PILOT_CAP_YIELD_RE = re.compile(
@@ -2555,10 +2557,12 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
       - no ntfy phone push and no human-touch ledger entry: nothing here asks a
         human to act (the false alarm this replaces DID count as a human touch).
 
-    ga-80yi6w: a bead the Pilot CEDED to a P0/P1 that waits behind this same pool (the
-    priority yield, ga-5fn5p3) is a capacity wait too — the pool's cap is what holds the
-    waiter, and the P2+ bead is kept back so it cannot take the slot. It rides this same
-    one-note-per-pool path (never one mail per ceded bead); only the wording differs, and
+    ga-80yi6w: a bead the Pilot CEDED to a P0/P1 waiting behind this pool (the priority
+    yield, ga-5fn5p3) is a capacity wait too: this pool's cap is what holds the waiter, and
+    while it waits NO P2+ bead opens a session in ANY pool (those sessions would take the RAM
+    the waiter needs). So the ceded bead may belong to a DIFFERENT pool than the one named
+    here; it is grouped under the WAITER's pool because that cap is the cause. It rides this
+    same one-note-per-pool path (never one mail per ceded bead); only the wording differs, and
     ONLY when at least one ceded bead is in the queue — a pool with none gets the note
     byte-for-byte as before.
 
@@ -2647,9 +2651,10 @@ def _alarm_capacity_wait(rig_root, bead, age_min, ev, cap_evidence, now, state):
         waiter = sorted(cap_evidence[b]["ceded_to"] for b in ceded)[0]
         ceded_para = (
             "CEDIDAS: %d das beads da fila foram CEDIDAS (ga-5fn5p3): enquanto uma bead P0/P1\n"
-            "espera neste mesmo teto (ex.: %s), o Pilot não abre sessão para P2+ — a P2+ fica\n"
-            "parada de propósito para não tomar o slot que a P0/P1 vai usar. É prioridade, não\n"
-            "falha: nada a consertar na bead cedida; ela volta sozinha quando a P0/P1 despachar.\n"
+            "espera vaga atrás deste teto (ex.: %s), o Pilot não abre sessão para NENHUMA bead\n"
+            "P2+, em NENHUM pool — essas sessões tomariam a RAM de que a P0/P1 precisa. A cedida\n"
+            "pode ser de outro pool (o teto que a segura é este). É prioridade, não falha: nada\n"
+            "a consertar na bead cedida; ela volta sozinha quando a P0/P1 conseguir a vaga.\n"
             "Ex. cedida: %s.\n\n" % (len(ceded), waiter, ceded[0]))
     body = (
         "APPROVED-STATE-RECONCILER: aguardando CAPACIDADE do pool — NÃO é falha de despacho\n\n"
@@ -8727,7 +8732,7 @@ def _selftest():
             if needle not in _s80f:
                 _f_problems.append("subject missing %r: %r" % (needle, _s80f))
         for needle in ("CEDIDAS: 3", "ga-5fn5p3", "wa-hut4l5.4", "É prioridade, não",
-                       "PILOT_WA_WORKER_MAX"):
+                       "NENHUMA bead", "outro pool", "PILOT_WA_WORKER_MAX"):
             if needle not in _b80f:
                 _f_problems.append("body missing %r" % needle)
     if n80f2:
