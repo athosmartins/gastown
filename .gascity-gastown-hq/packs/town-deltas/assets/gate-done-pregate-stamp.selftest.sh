@@ -28,6 +28,10 @@
 #   P7 (mutation) the OLD `$PREGATE_LABEL_ARG` shape hands bd ONE word under zsh and two under bash, so P1 can discriminate
 #   P8 structure: no PREGATE_LABEL_ARG left in either copy of gate-done.md, the roster call no longer discards stderr,
 #      and the two copies of gate-done.md (commands/ and internal/templates/) are byte-identical
+#   P9 program closed (.gc/pregate.off, ga-ufskhy.1; ga-gla16p) -> roster rc 5: arm empty, NO label, and NOT the "NOT recorded"
+#      line on stdout (it used to print on every submission since 03/10); the script's own reason still reaches stderr; an
+#      UNVERIFIABLE switch (stat fails with something other than "no such file") gets the same quiet answer; and the loud
+#      branch is not widened: rc 2 (P4) and rc 4 (P3) still say "NOT recorded"
 #
 # Exit 0 iff every assertion holds. zsh scenarios are skipped (loudly) only when zsh is not installed.
 # Bash 3.2 compatible (no associative arrays, no mapfile).
@@ -103,6 +107,15 @@ done
 # ── fixture: a fake city whose pre-gate-review.sh is the REAL one, and a stub bd ──
 CITY="$T/city"; mkdir -p "$CITY/packs/town-deltas" "$T/bin" "$T/work" "$T/state"
 ln -s "$SELF_DIR" "$CITY/packs/town-deltas/assets"
+
+# a second fake city whose pre-gate-review.sh is a STUB that prints $STUB_ROSTER_OUT and exits $STUB_ROSTER_RC — for the roster
+# outcomes the real script cannot be made to produce on demand (P9: a 5 that prints an arm, a 3, a 2). Reached via AC_CITY=$CITY5.
+CITY5="$T/city5"; mkdir -p "$CITY5/packs/town-deltas/assets"
+cat > "$CITY5/packs/town-deltas/assets/pre-gate-review.sh" <<'RSTUB'
+#!/usr/bin/env bash
+[ -n "${STUB_ROSTER_OUT:-}" ] && printf '%s\n' "$STUB_ROSTER_OUT"
+exit "${STUB_ROSTER_RC:-0}"
+RSTUB
 
 # bd stub. Records every call (one argv word per line, so a word that contains a space is visible as such), keeps the
 # marker's labels in $STUB_DIR/labels, and can be told to fail: BD_STUB_LABEL_FAIL=1 (label add exits 1, stores nothing),
@@ -234,6 +247,41 @@ if [ "$RUN" -eq 1 ]; then
     run_step3 "$sh" "$ON_BEAD" "$T/logs" BD_STUB_SHOW_FAIL=1
     has_str "$OUT" "labels: <unreadable>" "(P6/$sh) unreadable read-back is reported as <unreadable>, not as success"
     not_str "$OUT" "Pre-gate arm: pregate:on is on marker" "(P6/$sh) …and does NOT claim success"
+
+    # P9 the program is CLOSED (.gc/pregate.off, ga-ufskhy.1): the REAL roster exits 5 by design — no arm, no row, nothing on
+    # stdout. That is not a failure, so Step 3 must not print "NOT recorded" (ga-gla16p: it did, on every submission since 03/10).
+    rm -rf "$T/logs" "$CITY/.gc"; mkdir -p "$CITY/.gc"; : > "$CITY/.gc/pregate.off"
+    run_step3 "$sh" "$ON_BEAD" "$T/logs"
+    eq "$RC_END" "0" "(P9/$sh) program closed: the driver ran to its end"
+    eq "$(field "$OUT" RC)" "5" "(P9/$sh) the real roster's own exit status (5) reaches the caller"
+    eq "$(field "$OUT" ARM)" "" "(P9/$sh) no arm: PREGATE_ARM is empty — a closed program assigns none"
+    not_str "$OUT" "NOT recorded" "(P9/$sh) …and a closed program is not reported as a recording failure"
+    has_str "$ERR" "the pre-gate program is over" "(P9/$sh) …but the script's own reason still reaches the builder's terminal"
+    eq "$(label_add_calls)" "0" "(P9/$sh) no 'label add' at all"
+    eq "$(labels_file)" "" "(P9/$sh) no pregate:* label on the marker"
+    [ ! -s "$T/logs/runs.jsonl" ] && ok "(P9/$sh) nothing was written to the roster (it must not grow after the end)" || bad "(P9/$sh) a row reached the roster after the program ended"
+    # a switch that cannot be LOOKED at (here: .gc is a file, so stat says "Not a directory") gets the script's inert answer
+    # too (rc 5) — and its reason, program-off-unverifiable, must still be on the terminal rather than swallowed
+    rm -rf "$CITY/.gc" "$T/logs"; : > "$CITY/.gc"
+    run_step3 "$sh" "$ON_BEAD" "$T/logs"
+    eq "$(field "$OUT" RC)" "5" "(P9/$sh) unverifiable switch: roster exit 5 as well"
+    eq "$(field "$OUT" ARM)" "" "(P9/$sh) …no arm, no label"
+    has_str "$ERR" "program-off-unverifiable:not-a-directory" "(P9/$sh) …and the 'could not tell' reason is visible on stderr, not collapsed into 'off'"
+    not_str "$OUT" "NOT recorded" "(P9/$sh) …and stdout stays quiet"
+    rm -f "$CITY/.gc"
+
+    # P9 (stub roster) — only the EXACT pair "exit 5 + empty arm" is quiet. Every other non-zero outcome stays loud, and a 5
+    # that nevertheless printed an arm is a contradiction, not a closed program. The stub stands in for pre-gate-review.sh.
+    for scenario in "5:|quiet" "5:on|loud" "3:|loud" "2:|loud"; do
+      src="${scenario%%|*}"; want="${scenario##*|}"; src_rc="${src%%:*}"; src_out="${src#*:}"
+      rm -rf "$T/logs"
+      run_step3 "$sh" "$ON_BEAD" "$T/logs" "AC_CITY=$CITY5" "STUB_ROSTER_RC=$src_rc" "STUB_ROSTER_OUT=$src_out"
+      eq "$(field "$OUT" RC)" "$src_rc" "(P9/$sh/stub rc=$src_rc arm='$src_out') the exit status reaches the caller unchanged"
+      eq "$(field "$OUT" ARM)" "" "(P9/$sh/stub rc=$src_rc arm='$src_out') PREGATE_ARM ends empty, so no label is stamped"
+      eq "$(label_add_calls)" "0" "(P9/$sh/stub rc=$src_rc arm='$src_out') no 'label add'"
+      if [ "$want" = quiet ]; then not_str "$OUT" "NOT recorded" "(P9/$sh/stub rc=$src_rc arm='$src_out') quiet: program closed is not a failure"
+      else has_str "$OUT" "pre-gate roster NOT recorded" "(P9/$sh/stub rc=$src_rc arm='$src_out') loud: still reported, never silently absent"; fi
+    done
   done
 
   # ── P7 mutation check: the OLD shape (an unquoted "-l pregate:<arm>" variable) under each shell ──
@@ -262,6 +310,10 @@ echo "── (P8) structure ──"
 if [ -f "$GATE_DONE" ]; then
   n_old=$(grep -c 'PREGATE_LABEL_ARG' "$GATE_DONE" || true)
   eq "$n_old" "0" "(P8) no PREGATE_LABEL_ARG left in gate-done.md (nothing in Step 3 depends on word-splitting the arm)"
+  # Step 2b is a no-op while .gc/pregate.off exists (ga-gla16p): the builder is no longer told to run the closed review
+  n_run=$(grep -c 'pre-gate-review.sh" run' "$GATE_DONE" || true)
+  eq "$n_run" "0" "(P8) gate-done.md no longer tells the builder to run the closed pre-gate review (Step 2b is a no-op)"
+  has_str "$(cat "$GATE_DONE")" "## Step 2b: Pre-gate self-review (CLOSED" "(P8) Step 2b says it is closed, in the heading"
   # the roster call itself: its stderr must not be discarded (the WARN is the only trace of a failed roster write)
   roster_line="$(grep -F 'pre-gate-review.sh" roster' "$GATE_DONE" | head -1)"
   has_str "$roster_line" 'roster "$BEAD_ID" "$BRANCH"' "(P8) the roster call is present in Step 3"
