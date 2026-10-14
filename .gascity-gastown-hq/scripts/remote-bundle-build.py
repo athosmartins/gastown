@@ -9,20 +9,25 @@ Contents
 USO
   remote-bundle-build.py build --city C --claude-home ~/.claude --role dog --role-dir C/.gc/agents/dogs/gastown.dog-1 \
       --remote-root /home/runner/gt-remote/bundle --remote-home /home/runner --out OUT [--skills]
-  remote-bundle-build.py verify OUT          # re-hasheia os arquivos e confere com o manifest
+  remote-bundle-build.py verify OUT          # re-hasheia os arquivos e confere com o manifest (inclui bit de execução e bundle_hash)
 
 O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
   keep  — o script é portável (bash/jq/python3, sem nada de macOS) e é copiado para home/.claude/hooks/;
   shim  — o comando só chama `gc` (handoff, prime, nudge drain, mail check) e fica como está: no servidor `gc` é o
-          atalho ssh→mini (fatia seguinte). O manifest lista o que o atalho precisa aceitar (shim_needs);
+          atalho ssh→mini (fatia seguinte). É comparado INTEIRO, sem strip nem normalização (SHIM_RE.fullmatch): o PATH é o
+          literal que o gc injeta, variável só GC_*, argumentos sem caractere de controle nem ; & | ` $ ( ) < >, e o
+          subcomando executado é o do token que decidiu. O manifest lista o que o atalho precisa aceitar (shim_needs): o
+          subcomando e os argumentos, exatamente como são enviados;
   drop  — não se aplica no servidor (TCC do macOS, FUSE, ntfy com tópico privado, experimento de log local...).
   Chaves de settings fora da lista de portáveis (modelo, statusLine, plugins...) são descartadas e registradas.
   Só é lido o que está nomeado aqui: settings.local.json NUNCA entra (guarda permissões e segredos de sessões).
 
 POR QUE FALHA EM VEZ DE COPIAR (três estados: sei que serve / sei que não serve / não sei — o último não vira "serve"):
-  hook que não está na tabela, comando de shim que ganhou mais coisa, script `keep` com construção de macOS ou com
+  hook que não está na tabela, grupo de hooks sem a lista `hooks`, comando de shim que ganhou mais coisa (newline, PATH
+  diferente, variável que não é GC_*...), script `keep` com construção de macOS ou com
   caminho do mini, segredo, CPF/CNPJ/telefone, arquivo de dado (*.duckdb/*.db/*.csv/*.parquet/*.gz...), binário,
-  symlink de skill que sai da cidade, ou qualquer `/Users/` sobrando no que seria enviado → exit 3 e NADA é escrito.
+  symlink de skill que sai da cidade, `--skills` com a pasta vazia, ou qualquer `/Users/` sobrando no que seria enviado
+  → exit 3 e NADA é escrito.
 
 SAÍDA (OUT/): home/.claude/{settings.json,hooks/*} → {remote_home}/.claude/ · city/settings.json → arquivo de --settings ·
   role/<papel>/.claude/{settings.json,skills/*} → .claude/ do diretório de trabalho da sessão · manifest.json (veredito
@@ -69,7 +74,11 @@ POLICY = [
     ("filter-scraper-output.sh", "keep", "idem"),
     ("log-token-usage.sh", "keep", "grava só em ~/.claude/usage-analytics.jsonl do servidor"),
 ]
-SHIM_RE = re.compile(r"^(?:export PATH=\"[^\"]*\" && )?(?:[A-Z_]+=[\w-]+ )*gc ((?:handoff|prime|nudge drain|mail check)\b[^;&|`$()<>]*)$")
+# O shim é comparado INTEIRO (fullmatch, sem strip nem normalização): o que o builder decide é a string que vai para o servidor.
+# O PATH é o literal que o gc injeta, não "qualquer coisa entre aspas"; variável só GC_*; nada de caractere de controle (newline = 2º comando).
+GC_PATH = 'export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH" && '
+SHIM_RE = re.compile("(?:" + re.escape(GC_PATH) + r")?(?:GC_[A-Z_]+=[\w-]+ )*gc (handoff|prime|nudge drain|mail check)"
+                     r"((?: [^\x00-\x1f\x7f;&|`$()<>]*)?)")
 
 USER_KEYS = {"$schema", "cleanupPeriodDays", "env", "permissions", "hooks", "skipDangerousModePermissionPrompt",
              "skipAutoPermissionPrompt"}
@@ -92,11 +101,16 @@ SECRETS = [
     ("tópico ntfy", re.compile(r"ntfy\.sh/[A-Za-z0-9_-]{6,}")),
     ("CPF", re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b")),
     ("CNPJ", re.compile(r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b")),
-    ("telefone BR", re.compile(r"\+55\s?\(?\d{2}\)?\s?9?\d{4}[- ]?\d{4}")),
+    ("telefone BR", re.compile(r"(?<![0-9A-Za-z])(?:(?:\+?55[\s-]?)?\(?[1-9][1-9]\)?[\s-]?(?:9\d{4}|[2-5]\d{3})[\s-]\d{4}"
+                               r"|(?:\+?55)?[1-9][1-9]9\d{8})(?![0-9A-Za-z])")),
 ]
 DATA_SUFFIX = {".db", ".duckdb", ".sqlite", ".sqlite3", ".csv", ".parquet", ".gz", ".zip", ".tar", ".xlsx", ".pem", ".key"}
 DATA_NAMES = {"settings.local.json", ".credentials.json", ".env"}
 MAX_FILE = 512 * 1024
+
+
+def listing_hash(items: dict[str, tuple[str, bool]]) -> str:  # items: caminho → (sha256 do conteúdo, bit de execução)
+    return hashlib.sha256("".join(f"{int(ex)} {sha} {rel}\n" for rel, (sha, ex) in sorted(items.items())).encode()).hexdigest()
 
 
 class Bundle:
@@ -111,10 +125,11 @@ class Bundle:
         self.shim_needs: set[str] = set()
         self.dropped_keys: dict[str, list[str]] = {}
         self.dropped_rules: dict[str, int] = {}
+        self.skill_count = 0
 
     def rewrite(self, s: str) -> str:
-        for old, new in self.rules:
-            s = s.replace(old, new)
+        for old, new in self.rules:  # fronteira nos dois lados: gt-backup, gt2 e /xx/Users/... não são o caminho; sobram e a guarda de /Users/ recusa
+            s = re.sub(r"(?<![\w.-])" + re.escape(old) + r"(?![\w.-])", lambda _m, new=new: new, s)
         return s
 
     def add(self, rel: str, data: bytes, ex: bool = False) -> None:
@@ -134,19 +149,22 @@ class Bundle:
         self.files[rel] = (data, ex)
 
     def hook_verdict(self, src: str, event: str, matcher, cmd: str) -> str:
-        cmd = cmd.strip()
         for token, verdict, why in POLICY:
             if token in cmd:
                 break
         else:
             raise Refused(f"hook sem veredito em {src}/{event}: {cmd[:100]!r} — acrescente à POLICY (keep/shim/drop)")
         if verdict == "shim":
-            m = SHIM_RE.match(cmd)
+            m = SHIM_RE.fullmatch(cmd)
             if not m:
                 raise Refused(f"hook shim em {src}/{event} ganhou mais que um `gc ...`: {cmd[:100]!r}")
-            self.shim_needs.add(re.sub(r"\s+", " ", m.group(1)).strip())
+            if f"gc {m.group(1)}" != token:  # o token decidiu "shim" por um trecho, mas o que executa é outro subcomando
+                raise Refused(f"hook shim em {src}/{event}: o veredito veio de {token!r} mas o comando executa `gc {m.group(1)}`: {cmd[:100]!r}")
+            if self.rewrite(cmd) != cmd:  # shim_needs tem que ser a string que VAI: reescrita de caminho não pode mexer nela
+                raise Refused(f"hook shim em {src}/{event} tem caminho do mini: {cmd[:100]!r}")
+            self.shim_needs.add(m.group(1) + m.group(2))
         elif verdict == "keep":
-            m = re.match(r"^(?:~|\$HOME|%s)/\.claude/hooks/([\w.-]+)$" % re.escape(self.home), cmd)
+            m = re.fullmatch(r"(?:~|\$HOME|%s)/\.claude/hooks/([\w.-]+)" % re.escape(self.home), cmd)
             if not m:
                 raise Refused(f"hook keep em {src}/{event} não é só ~/.claude/hooks/<script>: {cmd[:100]!r}")
             if m.group(1) != token:  # o token casou por trecho do nome: script que ninguém classificou não vira "keep"
@@ -187,9 +205,11 @@ class Bundle:
         for event, groups in hooks.items():
             kept_groups = []
             for g in groups:
-                kept = [h for h in g.get("hooks", [])
+                if not isinstance(g, dict) or not isinstance(g.get("hooks"), list):
+                    raise Refused(f"grupo de hooks em {src}/{event} sem a lista `hooks` (forma plana?): sem veredito possível")
+                kept = [h for h in g["hooks"]
                         if h.get("type") != "command" or self.hook_verdict(src, event, g.get("matcher"), h.get("command", "")) != "drop"]
-                if any(h.get("type") != "command" for h in g.get("hooks", [])):
+                if any(h.get("type") != "command" for h in g["hooks"]):
                     raise Refused(f"hook que não é `command` em {src}/{event}: sem veredito possível")
                 if kept:
                     kept_groups.append({**g, "hooks": json.loads(self.rewrite(json.dumps(kept)))})
@@ -216,10 +236,12 @@ class Bundle:
         sdir = role_dir / ".claude" / "skills"
         if not sdir.is_dir():
             raise Refused(f"--skills pedido mas {sdir} não existe")
+        self.skill_count = 0
         for link in sorted(sdir.iterdir()):
             real = link.resolve()
             if not real.is_dir() or self.city not in real.parents:
                 raise Refused(f"skill {link.name}: aponta para fora da cidade ou não é diretório ({real})")
+            before = len(self.files)
             for root, dirs, names in os.walk(real, followlinks=False):
                 for d in dirs:  # walk lista link-para-diretório em `dirs` e não desce: pularia em silêncio
                     if (Path(root) / d).is_symlink():
@@ -229,6 +251,11 @@ class Bundle:
                     if f.is_symlink():
                         raise Refused(f"skill {link.name}: symlink interno {f.relative_to(real)}")
                     self.add(f"role/{role}/.claude/skills/{link.name}/{f.relative_to(real)}", f.read_bytes(), f.stat().st_mode & 0o111 != 0)
+            if len(self.files) == before:  # skill é a pasta com os arquivos; pasta vazia entregaria uma skill que não existe
+                raise Refused(f"skill {link.name}: diretório sem nenhum arquivo")
+            self.skill_count += 1
+        if not self.skill_count:  # pedido ≠ entregue: "ok 3 arquivos" com --skills não pode esconder que nenhuma skill foi
+            raise Refused(f"--skills pedido mas {sdir} não tem nenhuma skill: entregaria 0")
 
     def build(self) -> dict:
         a = self.a
@@ -240,7 +267,6 @@ class Bundle:
             self.add(dest, (json.dumps(out, indent=2, sort_keys=True) + "\n").encode())
         if a.skills:
             self.skills(a.role, Path(a.role_dir))
-        listing = "".join(f"{int(ex)} {hashlib.sha256(d).hexdigest()} {rel}\n" for rel, (d, ex) in sorted(self.files.items()))
         return {"version": 1, "remote_root": a.remote_root, "remote_home": a.remote_home, "role": a.role,
                 "install": {"home/.claude": a.remote_home + "/.claude", "city/settings.json": a.remote_root + "/city/settings.json",
                             f"role/{a.role}/.claude": "<diretório de trabalho da sessão>/.claude"},
@@ -248,12 +274,13 @@ class Bundle:
                 "dropped_keys": {k: sorted(set(v)) for k, v in sorted(self.dropped_keys.items())},
                 "dropped_rules": dict(sorted(self.dropped_rules.items())),
                 "files": {rel: {"sha256": hashlib.sha256(d).hexdigest(), "exec": ex} for rel, (d, ex) in sorted(self.files.items())},
-                "bundle_hash": hashlib.sha256(listing.encode()).hexdigest()}
+                "bundle_hash": listing_hash({rel: (hashlib.sha256(d).hexdigest(), ex) for rel, (d, ex) in self.files.items()})}
 
 
 def write_atomic(b: Bundle, manifest: dict, out: Path) -> None:
     tmp = Path(tempfile.mkdtemp(prefix=out.name + ".tmp.", dir=out.parent))
     try:
+        tmp.chmod(0o755)
         for rel, (data, ex) in b.files.items():
             p = tmp / rel
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -281,7 +308,11 @@ def write_atomic(b: Bundle, manifest: dict, out: Path) -> None:
 
 def verify(d: Path) -> int:
     try:
-        want = {rel: (info["sha256"], info["exec"]) for rel, info in json.loads((d / "manifest.json").read_text())["files"].items()}
+        doc = json.loads((d / "manifest.json").read_text())
+        want = {rel: (info["sha256"], info["exec"]) for rel, info in doc["files"].items()}
+        declared = doc.get("bundle_hash")
+        if not all(isinstance(sha, str) and isinstance(ex, bool) for sha, ex in want.values()):
+            raise TypeError("files[*].sha256 não é texto ou files[*].exec não é booleano")
     except (OSError, ValueError, KeyError, AttributeError, TypeError) as e:  # sem manifest legível não há o que conferir: não é "limpo"
         print(f"remote-bundle-build verify: manifest.json ilegível em {d}: {e!r}", file=sys.stderr)
         return MISMATCH
@@ -294,6 +325,8 @@ def verify(d: Path) -> int:
         elif hashlib.sha256(p.read_bytes()).hexdigest() != sha or os.access(p, os.X_OK) != ex:
             bad.append(f"mudou {rel}")
     bad += [f"sobra {r}" for r in sorted(seen - set(want))]
+    if declared != listing_hash(want):  # arquivo e manifest.files editados juntos só se denunciam aqui; ausente também é diferente
+        bad.append("bundle_hash do manifest ausente ou diferente do recalculado a partir de manifest.files")
     for line in bad:
         print("remote-bundle-build verify:", line, file=sys.stderr)
     return MISMATCH if bad else 0
@@ -336,8 +369,8 @@ def main(argv: list[str]) -> int:
     except OSError as e:  # a entrada estava boa; o que falhou foi gravar — a mensagem não pode culpar a entrada
         print(f"remote-bundle-build: RECUSADO: não consegui gravar {out}: {e}", file=sys.stderr)
         return REFUSED
-    print(f"remote-bundle-build: ok {len(manifest['files'])} arquivos, hash {manifest['bundle_hash'][:12]}, "
-          f"shim_needs={manifest['shim_needs']}")
+    print(f"remote-bundle-build: ok {len(manifest['files'])} arquivos{f', {bundle.skill_count} skills' if a.skills else ''}, "
+          f"hash {manifest['bundle_hash'][:12]}, shim_needs={manifest['shim_needs']}")
     return 0
 
 
