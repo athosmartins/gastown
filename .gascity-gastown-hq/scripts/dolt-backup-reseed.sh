@@ -1084,7 +1084,10 @@ _release_stale_new() {
 #
 # Esta função RENOMEIA <db>.new → <db>.old. NUNCA apaga: o .old que resulta é o
 # resíduo que o único apagador da cidade (dolt-backup-residue-reclaim.sh, com
-# prova de S3) já conhece e libera. Renomear é reversível; apagar não é.
+# prova de S3) já conhece e libera. Renomear é reversível; apagar não é — mas a
+# reversão só existe até o reclaim apagar o .old, e o guard roda os dois na mesma
+# passada: para um .new já fora da janela de 2h do reclaim (o rename não muda o
+# mtime do diretório) com prova de S3 válida, essa janela pode ser de segundos.
 #
 # Só renomeia com TODAS as provas abaixo; qualquer uma ausente, ilegível ou
 # indeterminada → NADA é renomeado (três estados: provado / refutado / não sei —
@@ -1250,7 +1253,7 @@ _retire_superseded_new() {
         # DENTRO de um .old pré-existente), não só o retorno do mv.
         if mv -- "$new_dir" "$old_dir" 2>>"$LOG" \
            && [ ! -e "$new_dir" ] && [ -f "$old_dir/manifest" ] && [ ! -e "$old_dir/$db.new" ]; then
-          log "retire-superseded-new '$db': APOSENTADO — $new_dir renomeado para $old_dir (~${size_mb:-?}MB; nada apagado; dolt-backup-residue-reclaim.sh libera com prova de S3 — para desfazer: mv $old_dir $new_dir)"
+          log "retire-superseded-new '$db': APOSENTADO — $new_dir renomeado para $old_dir (~${size_mb:-?}MB; nada apagado; dolt-backup-residue-reclaim.sh libera com prova de S3 — só dá para desfazer (mv $old_dir $new_dir) enquanto o reclaim não o apagou)"
         else
           log "retire-superseded-new '$db': FALHA ao renomear $new_dir para $old_dir (a primária e o S3 não foram tocados) — investigue"
           notify_fail "retire-superseded-new: falha ao renomear ${new_dir} para ${old_dir} — ver $LOG"

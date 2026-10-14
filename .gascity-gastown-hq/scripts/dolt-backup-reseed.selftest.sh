@@ -1282,7 +1282,7 @@ retire_cli() {   # <env assignments...> -- <args...> — runs the script for rea
   env -i HOME="$LIB_SCRATCH" TMPDIR="$LIB_SCRATCH" PATH="$LIB_SCRATCH/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     GC_CITY_PATH="$RET_CITY" GC_BACKUP_ARTIFACT_DIR="$PRIMARY_ROOT" RESEED_LOG="$RET_LOG" \
     RESEED_PS_BIN="$LIB_SCRATCH/bin/ps-stub" RESEED_S3_BACKUP_LOCKDIR="$STALE_LOCKDIR" \
-    DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY=/usr/bin/true "${envs[@]}" \
+    DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY=/usr/bin/true ${envs[@]+"${envs[@]}"} \
     timeout 60 /bin/bash "$SCRIPT" "$@" > "$LIB_SCRATCH/retire-cli.out" 2>&1
 }
 mk_stalenew_scenario; retire_cli -- --retire-superseded-new hq; rc=$?

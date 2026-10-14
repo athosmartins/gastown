@@ -164,7 +164,7 @@ _status_report_db() {
   # the manifest is the only reliable signal — don't also make the WARNING
   # unreliable by over-firing it).
   if [ -n "$n_manifest" ]; then
-    printf '    \xe2\x9a\xa0\xef\xb8\x8f .new presente = troca INCOMPLETA (reseed sempre renomeia .new embora ao terminar). O discriminador de qual copia presta e SEMPRE o MANIFEST acima, NUNCA o nome nem o mtime — os dois ja apontaram pro lado errado numa incidente real (ga-odtd3f, 2026-09-21). Se a primaria TAMBEM tem manifest, o .new e estritamente mais velho que ela e nada o usa (a troca abortou e outra rodada ja refez a primaria — ga-m9wpnk), o guard de disco (so em WARN/CRITICAL) o renomeia para .old (dolt-backup-reseed.sh --retire-superseded-new) e o residue-reclaim o apaga com prova de S3; nos demais casos o .new fica ate alguem resolver\n'
+    printf '    \xe2\x9a\xa0\xef\xb8\x8f .new presente = troca INCOMPLETA (reseed sempre renomeia .new embora ao terminar). O discriminador de qual copia presta e SEMPRE o MANIFEST acima, NUNCA o nome nem o mtime — os dois ja apontaram pro lado errado numa incidente real (ga-odtd3f, 2026-09-21). Se a primaria TAMBEM tem manifest (a troca abortou e outra rodada ja refez a primaria — ga-m9wpnk), o guard de disco (so em WARN/CRITICAL) renomeia o .new para .old (dolt-backup-reseed.sh --retire-superseded-new) quando, NA HORA de rodar, prova que nenhum backup/restore/reseed o esta usando e que o item mais novo dele e estritamente anterior ao da primaria (o mtime entra ali so como trava extra de seguranca; quem diz qual copia presta continua sendo o MANIFEST); depois o residue-reclaim apaga o .old com prova de S3. Nos demais casos o .new fica ate alguem resolver\n'
   fi
 
   return "$rc"

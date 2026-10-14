@@ -2738,7 +2738,8 @@ _reap_backup_residue() {
   # a couple of `du` reads; generous enough for a handful of .old residues
   # (realistically at most one per db) even under a slow network, while still
   # bounded so a wedged guard cycle can't hang past this file's own 300s
-  # StartInterval.
+  # StartInterval: the whole lever (the 60s retire above + this 180s) is 240s
+  # worst case.
   if DOLT_BACKUP_RESIDUE_RECLAIM_PROD=1 timeout 180 bash "$reaper" >> "$LOG" 2>&1; then
     log "backup-residue-reap OK"
   else
