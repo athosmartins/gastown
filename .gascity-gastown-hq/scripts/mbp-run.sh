@@ -544,7 +544,7 @@ true
 EOF
   SLOT=""
 }
-cleanup() { release; [ -n "${TMPOUT:-}" ] && rm -f "$TMPOUT"; [ -n "${SENT:-}" ] && { rm -f "$SENT" "$SENT.held" "$SENT.out"; rmdir "$SENT.dst" 2>/dev/null; }; return 0; }
+cleanup() { release; [ -n "${TMPOUT:-}" ] && rm -f "$TMPOUT"; [ -n "${SENT:-}" ] && { rm -f "$SENT" "$SENT.held" "$SENT.out" "$SENT.hp" "$SENT.v"; rmdir "$SENT.dst" 2>/dev/null; }; return 0; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
@@ -579,7 +579,10 @@ node_wanted() {
   return 0
 }
 # node_guard: o filtro olha NOME e pasta; isto olha o CONTEÚDO do que ele deixaria sair (hetzner-pii-scan.py, o mesmo que o prod test roda no servidor). Arquivo com LISTA de telefones/CPFs (>=20 / >=3)
-# fica no mini: vira regra `- /caminho` em $HELD, que o rsync lê ANTES do filtro. FALHA FECHADA: a lista do rsync ou a varredura que não termina = rc 1 e o nó NÃO é usado (erro e "nada retido" não são a mesma coisa).
+# fica no mini: vira regra `- /caminho` em $HELD, que o rsync lê ANTES do filtro. FALHA FECHADA (rc 1 = o nó NÃO é usado; erro e "nada retido" não são a mesma coisa): a lista do rsync que não sai, a varredura que
+# não termina, arquivo listado que a varredura não conseguiu LER (rc 3 do scanner: nome com quebra de linha, que a lista parte em dois, ou arquivo que sumiu/ficou ilegível entre a lista e a varredura; sem permissão desde o início já derruba a própria lista, rc 23), e regra que NÃO segura o arquivo — um caminho com barra invertida
+# vira `- /a\\b` e o rsync não o casa —, o que é conferido de verdade: um 2º rsync -n com $HELD não pode listar nenhum caminho retido. LIMITE: a lista e a varredura são um retrato de poucos segundos antes
+# da cópia (o rsync da cópia anda a árvore de novo); arquivo editado nessa janela não é revarrido. A fronteira que vale no instante da cópia é o filtro (nome/pasta); isto é a segunda camada.
 SENT=""; HELD=""
 node_guard() {
   local nheld
@@ -589,6 +592,13 @@ node_guard() {
   [ "${PIPESTATUS[0]}" -eq 0 ] && [ -s "$SENT" ] || return 1
   python3 -I "$HERE/hetzner-pii-scan.py" "$dir" --rules "$HELD" < "$SENT" > "$SENT.out" 2>/dev/null && [ -f "$HELD" ] || return 1
   nheld=$(wc -l < "$SENT.out" | tr -d ' ')
+  if [ "$nheld" -gt 0 ]; then
+    # vazio (nenhum caminho retido) → nada a conferir, pula; falhou (rsync -n sem resposta, lista ilegível) ou algum caminho retido AINDA listado → rc 1, o nó NÃO é usado (grep: 1 = nenhum casou = ok; 0 = vazou; 2 = erro)
+    cut -f3- "$SENT.out" > "$SENT.hp" || return 1
+    "$RSYNC_BIN" -a -n --out-format='%n' --filter=". $HELD" --filter=". $NODE_FILTER" "$dir"/ "$SENT.dst"/ 2>/dev/null | grep -v '/$' > "$SENT.v"
+    [ "${PIPESTATUS[0]}" -eq 0 ] || return 1
+    grep -qxF -f "$SENT.hp" "$SENT.v"; [ $? -eq 1 ] || return 1
+  fi
   [ "$nheld" -eq 0 ] || say "NOTE: $nheld arquivo(s) com lista de telefones/CPFs ficam no mini e NÃO vão ao $HNAME ($(cut -f3 "$SENT.out" | head -n 4 | tr '\n' ' ')…): teste que os lê ou importa falha aqui — rode esse teste local."
   return 0
 }

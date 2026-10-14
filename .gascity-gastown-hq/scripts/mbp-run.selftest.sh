@@ -32,7 +32,7 @@
 #   (dentro e fora de tests/) — nada chega, e o código de nome parecido (pdpj_token.py, test_pdpj_token_*.py) chega; o que uma semeadura antiga deixou é apagado; controles negativos
 #   (sem --filter, filtro com a ordem errada sem a conferência, filtro só-denylist sem a conferência, a lista por EXTENSÃO da 1ª correção, sem o node_guard) VAZAM e são pegos ·
 #   NOME NEUTRO (docs/**/ab_results/*.json, scripts/*estado.json, state.json...) com telefone/CPF dentro não chega; config listada por caminho chega · CONTEÚDO: node_guard retém, mesmo em nome e
-#   pasta liberados, o arquivo com LISTA de telefones (>=20) ou CPFs (>=3), deixa passar 3 números e cauda sintética, e SEM a varredura (hetzner-pii-scan.py) o nó NÃO é usado ·
+#   pasta liberados, o arquivo com LISTA de telefones (>=20) ou CPFs (>=3), deixa passar 3 números e cauda sintética, e SEM a varredura (hetzner-pii-scan.py) o nó NÃO é usado · arquivo que a varredura não lê, ou caminho retido com barra invertida que a regra `- /caminho` não segura (conferido por um 2º rsync -n), também: o nó NÃO é usado ·
 #   filtro ausente, vazio, fora de ordem, sem o `- *` final, sem uma regra-âncora, com `+` que inclua tudo (`+ /**`...), `!` ou `.` = o nó NÃO é usado.
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
@@ -891,6 +891,30 @@ n=$((n+1)); if [ ! -e "$NOSCAN/hetzner-pii-scan.py" ] && [ -e "$MUT/hetzner-pii-
 reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; STUB_RSYNC_REAL=1 "$NOSCAN/mut-noscan.sh" --repo wa --dir "$WTD" -- tests/test_x.py >"$T/out" 2>"$T/err"; rc=$?
 expect "varredura de conteúdo que não roda: o nó NÃO é usado e a cadeia cai no MBP" 0 "$rc"; has "…motivo varredura-falhou no host hetzner" "$J" '"reason":"varredura-falhou".*"host":"hetzner"'; hasnt "…nenhum rsync ao nó" "$STUB_LOG" 'RSYNC:.*hetzner-teste'; has "…e a mensagem diz o que faltou" "$T/err" 'não consegui varrer o conteúdo'
 n=$((n+1)); if [ ! -e "$DEST/lib/a.py" ]; then echo "ok   …e nada foi enviado ao nó"; else echo "FAIL a varredura falhou mas o nó recebeu arquivos"; fails=$((fails+1)); fi
+# controle 7 (revisão de segurança do commit, 14/10): (a) caminho retido que a REGRA não segura — barra invertida no nome: `- /lib/bs\\x.py` não casa no rsync e o arquivo sairia sem varredura; (b) arquivo que o rsync não
+# consegue ler (chmod 000): o próprio `rsync -n` da lista sai com rc 23 e o nó não é usado; (c) quebra de linha DENTRO do nome: a lista sai (rc 0) mas parte o nome em dois pedaços que o scanner não abre — rc 3 do scanner.
+# Nos três o nó NÃO é usado (varredura-falhou) e nada chega; sem a conferência do 2º rsync -n o (a) VAZA (mutante).
+WTB="$T/wtb"; mkdir -p "$WTB/tests" "$WTB/lib"; : > "$WTB/tests/test_x.py"; echo code > "$WTB/lib/a.py"; phones 25 > "$WTB/lib/bs\\x.py"
+reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTB" -- tests/test_x.py >"$T/out" 2>"$T/err"; rc=$?
+expect "caminho retido com barra invertida (a regra não o segura): o nó NÃO é usado e a cadeia cai no MBP" 0 "$rc"; has "…motivo varredura-falhou no host hetzner" "$J" '"reason":"varredura-falhou".*"host":"hetzner"'
+n=$((n+1)); if [ ! -e "$DEST/lib/a.py" ] && [ ! -e "$DEST/lib/bs\\x.py" ]; then echo "ok   …e nada foi enviado ao nó (nem o arquivo retido)"; else echo "FAIL o nó recebeu arquivos apesar de a regra de retenção não segurar um caminho"; fails=$((fails+1)); fi
+sed 's/^    grep -qxF -f "\$SENT.hp" "\$SENT.v"; \[ \$? -eq 1 \] || return 1$/    true/' "$RUN" > "$MUT/mut-noverify.sh"; chmod +x "$MUT/mut-noverify.sh"
+n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-noverify.sh"; then echo "FAIL controle: o sed da conferência da regra não mudou nada"; fails=$((fails+1)); else
+  reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; STUB_RSYNC_REAL=1 "$MUT/mut-noverify.sh" --repo wa --dir "$WTB" -- tests/test_x.py >/dev/null 2>&1
+  n=$((n+1)); if [ -e "$DEST/lib/bs\\x.py" ]; then echo "ok   controle: sem a conferência do 2º rsync -n, o arquivo com barra invertida (retido, 25 telefones) CHEGA ao nó (o teste enxerga o defeito)"; else echo "FAIL controle: sem a conferência o arquivo com barra invertida não chegou — o teste não enxerga o defeito"; fails=$((fails+1)); fi; fi
+WTU="$T/wtu"; mkdir -p "$WTU/tests" "$WTU/lib"; : > "$WTU/tests/test_x.py"; echo code > "$WTU/lib/a.py"; echo code > "$WTU/lib/locked.py"; chmod 000 "$WTU/lib/locked.py"
+reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTU" -- tests/test_x.py >"$T/out" 2>"$T/err"; rc=$?; chmod 600 "$WTU/lib/locked.py"
+expect "arquivo que o rsync não consegue ler: o nó NÃO é usado e a cadeia cai no MBP" 0 "$rc"; has "…motivo varredura-falhou no host hetzner" "$J" '"reason":"varredura-falhou".*"host":"hetzner"'
+n=$((n+1)); if [ ! -e "$DEST/lib/a.py" ]; then echo "ok   …e nada foi enviado ao nó (lista que falha não é 'nada retido')"; else echo "FAIL o rsync não leu um arquivo mas o nó recebeu arquivos"; fails=$((fails+1)); fi
+# o scanner sozinho: um caminho da lista que não abre = rc 3 (varredura incompleta, e a linha -1 -1 + a regra continuam saindo); tudo lido = rc 0
+printf 'lib/a.py\nlib/nao-existe.py\n' | python3 -I "$HERE/hetzner-pii-scan.py" "$WTB" --rules "$T/scan.rules" > "$T/scan.out"; expect "scanner: caminho da lista que não abre → rc 3 (varredura incompleta)" 3 "$?"
+eq "scanner: o ilegível sai como linha -1 -1 com o caminho (retido, sem valor)" "$(printf -- '-1\t-1\tlib/nao-existe.py')" "$(cat "$T/scan.out")"
+eq "scanner: …e a regra de retenção sai" "- /lib/nao-existe.py" "$(cat "$T/scan.rules")"
+printf 'lib/a.py\n' | python3 -I "$HERE/hetzner-pii-scan.py" "$WTB" > /dev/null; expect "scanner: tudo lido → rc 0" 0 "$?"
+WTN="$T/wtn"; mkdir -p "$WTN/tests" "$WTN/lib"; : > "$WTN/tests/test_x.py"; echo code > "$WTN/lib/a.py"; phones 25 > "$WTN/lib/nl"$'\n'"x.py"
+reset; date > "$NODEFLAG"; find "$DEST" -mindepth 1 -delete 2>/dev/null; STUB_RSYNC_REAL=1 "$RUN" --repo wa --dir "$WTN" -- tests/test_x.py >"$T/out" 2>"$T/err"; rc=$?
+expect "quebra de linha no nome do arquivo: o scanner não o abre (rc 3) e o nó NÃO é usado, cai no MBP" 0 "$rc"; has "…motivo varredura-falhou no host hetzner" "$J" '"reason":"varredura-falhou".*"host":"hetzner"'
+n=$((n+1)); if [ ! -e "$DEST/lib/a.py" ] && [ -z "$(find "$DEST/lib" -name 'nl*' 2>/dev/null)" ]; then echo "ok   …e nada foi enviado ao nó (nem o arquivo de nome partido)"; else echo "FAIL o nó recebeu arquivos apesar de um nome que a lista parte em dois"; fails=$((fails+1)); fi
 find "$DEST" -mindepth 1 -delete 2>/dev/null
 
 

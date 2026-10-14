@@ -83,7 +83,8 @@ sweep_wa_tree() {
   hit="$(grep -E '^(docs/auto_response/ab_results/|docs/pix_verdicts/|analysis/.*\.json$|scripts/peter/mrv_bh/.*\.json$|scripts/campanhas_[^/]*estado\.json$|state\.json$|config\.json$)|pdpj_token\.txt|mrv_decisores|client_secret|(^|/)\.env' "$lst" | head -5)"
   [[ -z "$hit" ]] || fail "SEGURANÇA: o filtro vivo deixaria sair da árvore do WA uma classe de dado conhecida:
 $hit"
-  python3 -I "$CITY/scripts/hetzner-pii-scan.py" "$wa" --rules "$d/held.rules" < "$lst" > "$held" || fail "hetzner-pii-scan.py falhou na árvore do WA"
+  python3 -I "$CITY/scripts/hetzner-pii-scan.py" "$wa" --rules "$d/held.rules" < "$lst" > "$held"; rc=$?
+  [[ $rc -eq 0 ]] || fail "hetzner-pii-scan.py não varreu a árvore do WA inteira (rc=$rc; 3 = algum arquivo da lista não pôde ser lido): varredura incompleta não é 'nada retido'"
   hit="$(awk -F'\t' '$3 !~ /^tests\// && $3 !~ /\.(py|sh|js|mjs|cjs|ts|css)$/' "$held" | head -5)"
   [[ -z "$hit" ]] || fail "SEGURANÇA: pasta de dado/config liberada por caminho tem LISTA de telefones/CPFs (telefones<TAB>CPFs<TAB>caminho):
 $hit"
