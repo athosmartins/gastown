@@ -1062,6 +1062,248 @@ _release_stale_new() {
   return 0
 }
 
+# ═══ ga-m9wpnk: APOSENTAR UM <db>.new SUPERADO COMO <db>.old ═══
+#
+# Caso medido 13/10: .dolt-backup/whatsapp_automation.new (1,5 GB, de 12/10
+# 15:28) ficou 30h ao lado de uma primária JÁ boa (manifest, sincronizada em
+# 13/10 20:46), com o disco no piso crítico do Dolt (2,4 GB livres, piso 3 GB).
+# Origem: no dia 12/10 o dolt-disk-floor-guard (CRITICAL) disparou
+# `dolt-backup-reseed.sh whatsapp_automation` sob `timeout` de 240s; o reseed
+# construiu o .new e foi MORTO pelo timeout durante a restauração de
+# verificação (15:32). O trap de saída só remove o diretório de verificação —
+# nada remove o .new de um reseed morto por sinal. Depois disso a primária foi
+# refeita por outra rodada e passou a ser mais nova que o .new.
+#
+# Nenhuma ferramenta era dona desse estado (primária COM manifest + .new COM
+# manifest + sem .old): dolt-backup-swap-repair.sh só age quando a primária
+# NÃO tem manifest; dolt-backup-residue-reclaim.sh só varre *.old;
+# `--release-stale-new` (ga-bo08jp) apaga, mas só roda quando um humano o chama;
+# o guarda pula todo banco com resíduo .new/.old (_reap_bloated_backup_staging);
+# e o Preflight 3 do próprio reseed morre com "$db.new já existe" — o resíduo
+# também travou o reseed noturno de 13/10 04:04.
+#
+# Esta função RENOMEIA <db>.new → <db>.old. NUNCA apaga: o .old que resulta é o
+# resíduo que o único apagador da cidade (dolt-backup-residue-reclaim.sh, com
+# prova de S3) já conhece e libera. Renomear é reversível; apagar não é.
+#
+# Só renomeia com TODAS as provas abaixo; qualquer uma ausente, ilegível ou
+# indeterminada → NADA é renomeado (três estados: provado / refutado / não sei —
+# só o primeiro autoriza; ga-p5q3). Standalone, como os irmãos acima:
+#   dolt-backup-reseed.sh --retire-superseded-new <db>
+#   dolt-backup-reseed.sh --retire-superseded-new --all     (todo $BACKUP_ROOT/*.new)
+#   1. primária: existe, não é symlink, TEM manifest e fecha localmente
+#      (_s3proof_local_closure_ok — toda tabela que o manifest nomeia existe);
+#   2. o .new TEM manifest (um .new sem manifest é um build interrompido, não
+#      um backup: este caminho não o toca — é o caso do --release-stale-new);
+#   3. não existe <db>.old (nem como symlink ou arquivo): nunca sobrescreve, e
+#      o .old que já existe pertence ao residue-reclaim;
+#   4. idade: o item mais novo DENTRO do .new é estritamente mais velho que o
+#      item mais novo da primária (um .new mais novo que a primária pode ser o
+#      candidato legítimo a uma troca, e fica onde está);
+#   5. nada em curso (_stale_new_idle_state: lock do backup noturno, processo de
+#      backup/restore/reseed, ps ilegível = em curso).
+# Seco por padrão: só RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN=0|no|false|off age;
+# ''/1/yes/true/on é seco; qualquer outro valor é "não reconhecido" e também é
+# seco (e o log diz isso). Quem chama de verdade (o guarda de disco) passa 0.
+#
+# Quem apaga depois é o residue-reclaim, com as provas dele (idade do .old,
+# manifest no S3, fingerprint mais novo que o .old, coerência de tamanho). Se
+# elas não valerem, o .old simplesmente fica — mesma situação de qualquer .old.
+
+# _retire_dry_run_state <valor> → imprime ACT, DRY ou UNRECOGNIZED. Só ACT age.
+_retire_dry_run_state() {
+  case "${1-}" in
+    0|no|NO|No|false|FALSE|False|off|OFF|Off) printf 'ACT' ;;
+    ''|1|yes|YES|Yes|true|TRUE|True|on|ON|On)  printf 'DRY' ;;
+    *) printf 'UNRECOGNIZED' ;;
+  esac
+}
+
+# _should_retire_superseded_new <primary_ok> <new_manifest_ok> <old_absent>
+#   <new_mtime> <primary_mtime> <idle> → 0 (true) SÓ quando todas as provas
+# acima valem. Pura: toda entrada vem do chamador. Entrada vazia/não numérica,
+# ou flag diferente do literal "1", falha FECHADO.
+_should_retire_superseded_new() {
+  local primary_ok="${1-}" new_manifest_ok="${2-}" old_absent="${3-}"
+  local new_mtime="${4-}" primary_mtime="${5-}" idle="${6-}"
+  local v
+  for v in "$new_mtime" "$primary_mtime"; do
+    case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  done
+  [ "$primary_ok" = "1" ] || return 1
+  [ "$new_manifest_ok" = "1" ] || return 1
+  [ "$old_absent" = "1" ] || return 1
+  [ "$new_mtime" -lt "$primary_mtime" ] || return 1
+  [ "$idle" = "1" ] || return 1
+  return 0
+}
+
+# _retire_superseded_new <db> — ver o cabeçalho acima. Toda ramificação RETORNA
+# (nunca die/exit): seguro de chamar de um harness que faz source do script.
+# Retorno: 0 = aposentou, poupou (prova não estabelecida), dry-run ou nada a
+# fazer; 1 = uso inválido ou o rename falhou.
+_retire_superseded_new() {
+  local db="${1-}"
+  if [ -z "$db" ]; then
+    log "retire-superseded-new: uso: $0 --retire-superseded-new <nome-do-banco>|--all"
+    return 1
+  fi
+  case "$db" in
+    *[!A-Za-z0-9_]*)
+      log "retire-superseded-new: RECUSANDO nome de banco '$db' — só [A-Za-z0-9_] (o nome vira parte de um caminho que será renomeado)"
+      return 1
+      ;;
+  esac
+  case "${BACKUP_ROOT:-}" in
+    ''|/)
+      log "retire-superseded-new '$db': RECUSANDO — BACKUP_ROOT vazio ou '/'"
+      return 1
+      ;;
+  esac
+  local primary_dir="$BACKUP_ROOT/$db"
+  local new_dir="$BACKUP_ROOT/$db.new"
+  local old_dir="$BACKUP_ROOT/$db.old"
+
+  if [ -L "$new_dir" ]; then
+    log "retire-superseded-new '$db': RECUSANDO — $new_dir é um symlink; este caminho nunca segue nem move link"
+    return 0
+  fi
+  if [ ! -e "$new_dir" ]; then
+    log "retire-superseded-new '$db': nada a aposentar — não existe $new_dir"
+    return 0
+  fi
+  if [ ! -d "$new_dir" ]; then
+    log "retire-superseded-new '$db': RECUSANDO — $new_dir não é um diretório"
+    return 0
+  fi
+
+  # 3. .old: ausente → única situação que deixa renomear (old_absent=1);
+  # presente (diretório, arquivo ou symlink, mesmo quebrado) → old_absent=0 e o
+  # gate recusa. O pai ($BACKUP_ROOT) acabou de ser lido acima ($new_dir é um
+  # diretório dentro dele), então "não existe" aqui não é um "não consegui ver".
+  local old_absent=0
+  if [ ! -e "$old_dir" ] && [ ! -L "$old_dir" ]; then
+    old_absent=1
+  fi
+
+  # 4. idade. vazio → _newest_mtime não mediu (nunca imprime 0): o gate exige
+  # número e recusa, o log mostra "none"; falhou/ilegível (find/stat falhou em
+  # algum item) → idem, mesmo caminho inerte — nunca vira "0 = muito antigo".
+  local new_mtime primary_mtime=""
+  new_mtime="$(_newest_mtime "$new_dir")"
+  [ -d "$primary_dir" ] && primary_mtime="$(_newest_mtime "$primary_dir")"
+
+  # 1. primária. vazio (não existe, é symlink, sem manifest) → primary_ok=0,
+  # recusa; falhou/ilegível (manifest que não lê, tabela que falta) →
+  # _s3proof_local_closure_ok devolve 1 → primary_ok=0, o mesmo caminho inerte.
+  local primary_ok=0
+  if [ -d "$primary_dir" ] && [ ! -L "$primary_dir" ] && _s3proof_local_closure_ok "$primary_dir"; then
+    primary_ok=1
+  fi
+
+  # 2. o .new tem manifest. vazio (manifest de 0 bytes ou ausente) → 0, recusa;
+  # falhou/ilegível → o teste falha → 0, o mesmo caminho inerte.
+  local new_manifest_ok=0
+  if [ -f "$new_dir/manifest" ] && [ -s "$new_dir/manifest" ]; then
+    new_manifest_ok=1
+  fi
+
+  # 5. nada em curso. unknown (ps falhou / não listou nada) → idle=0, recusa.
+  local idle_state idle_kind idle_detail idle=0
+  idle_state="$(_stale_new_idle_state "$new_dir")"
+  IFS="$(printf '\t')" read -r idle_kind idle_detail <<< "$idle_state"
+  [ "$idle_kind" = "idle" ] && idle=1
+
+  if _should_retire_superseded_new "$primary_ok" "$new_manifest_ok" "$old_absent" \
+       "${new_mtime:-}" "${primary_mtime:-}" "$idle"; then
+    local size_kb size_mb=""
+    size_kb="$(du -sk "$new_dir" 2>/dev/null | awk '{print $1}')"
+    case "$size_kb" in ''|*[!0-9]*) : ;; *) size_mb=$(( size_kb / 1024 )) ;; esac
+    log "retire-superseded-new '$db': PROVA OK — primária $primary_dir TEM manifest e fecha localmente (item mais novo=${primary_mtime}); $new_dir TEM manifest e é mais velho que a primária (item mais novo=${new_mtime}); $old_dir não existe; nenhum backup/restore/reseed em curso — ${db}.new (~${size_mb:-?}MB) está superado"
+    local dry_state
+    dry_state="$(_retire_dry_run_state "${RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN-}")"
+    case "$dry_state" in
+      ACT) : ;;
+      UNRECOGNIZED)
+        log "retire-superseded-new '$db': DRY-RUN — RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN='${RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN-}' não é reconhecido (agir só com 0|no|false|off); nada renomeado"
+        return 0
+        ;;
+      *)
+        log "retire-superseded-new '$db': DRY-RUN — nada renomeado (RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN não é 0|no|false|off); aposentaria ~${size_mb:-?}MB como ${db}.old"
+        return 0
+        ;;
+    esac
+    case "$new_dir" in
+      "$BACKUP_ROOT"/*.new)
+        if [ "$(basename "$new_dir")" != "$db.new" ]; then
+          log "retire-superseded-new '$db': RECUSANDO — '$new_dir' não tem a forma <db>.new esperada (guarda de segurança)"
+          return 0
+        fi
+        # `mv dir já-existente` MOVE PARA DENTRO dele em vez de recusar, e o -n
+        # do mv não impede isso para diretório: por isso o .old é conferido de
+        # novo imediatamente antes (o gate acima mediu um instante atrás).
+        if [ -e "$old_dir" ] || [ -L "$old_dir" ]; then
+          log "retire-superseded-new '$db': RECUSANDO — $old_dir apareceu entre a prova e o rename; nada renomeado"
+          return 0
+        fi
+        # Verifica o EFEITO (o .new sumiu, o .old tem o manifest e nada foi parar
+        # DENTRO de um .old pré-existente), não só o retorno do mv.
+        if mv -- "$new_dir" "$old_dir" 2>>"$LOG" \
+           && [ ! -e "$new_dir" ] && [ -f "$old_dir/manifest" ] && [ ! -e "$old_dir/$db.new" ]; then
+          log "retire-superseded-new '$db': APOSENTADO — $new_dir renomeado para $old_dir (~${size_mb:-?}MB; nada apagado; dolt-backup-residue-reclaim.sh libera com prova de S3 — para desfazer: mv $old_dir $new_dir)"
+        else
+          log "retire-superseded-new '$db': FALHA ao renomear $new_dir para $old_dir (a primária e o S3 não foram tocados) — investigue"
+          notify_fail "retire-superseded-new: falha ao renomear ${new_dir} para ${old_dir} — ver $LOG"
+          return 1
+        fi
+        ;;
+      *)
+        log "retire-superseded-new '$db': RECUSANDO — '$new_dir' fora de \$BACKUP_ROOT/*.new (guarda de segurança)"
+        return 0
+        ;;
+    esac
+  else
+    log "retire-superseded-new '$db': SPARED — prova não estabelecida, nada foi renomeado (primary_ok=${primary_ok} new_manifest_ok=${new_manifest_ok} old_absent=${old_absent} idle=${idle} [${idle_kind:-?}${idle_detail:+: $idle_detail}] new_mtime=${new_mtime:-none} primary_mtime=${primary_mtime:-none})"
+  fi
+  return 0
+}
+
+# _retire_superseded_new_all — roda _retire_superseded_new em todo
+# $BACKUP_ROOT/*.new. Retorno: 0 = varreu (inclusive "nada a varrer"); 1 = não
+# deu para varrer ($BACKUP_ROOT inválido/ilegível) ou algum rename falhou.
+# Nomes fora de [A-Za-z0-9_] são ignorados com uma linha de log (não são
+# backup de banco desta cidade e não devem falhar a varredura todo ciclo).
+_retire_superseded_new_all() {
+  case "${BACKUP_ROOT:-}" in
+    ''|/)
+      log "retire-superseded-new --all: RECUSANDO — BACKUP_ROOT vazio ou '/'"
+      return 1
+      ;;
+  esac
+  # vazio → um BACKUP_ROOT sem nenhum *.new é o caso normal (rc 0, "nada a varrer");
+  # falhou/ilegível → um BACKUP_ROOT que não é diretório legível NÃO é "vazio":
+  # rc 1, para o chamador ver que a varredura não aconteceu.
+  if [ ! -d "$BACKUP_ROOT" ] || [ ! -r "$BACKUP_ROOT" ]; then
+    log "retire-superseded-new --all: BACKUP_ROOT '$BACKUP_ROOT' não é um diretório legível — nada varrido"
+    return 1
+  fi
+  local f db n=0 rc=0
+  for f in "$BACKUP_ROOT"/*.new; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    db="$(basename "$f" .new)"
+    case "$db" in
+      ''|*[!A-Za-z0-9_]*)
+        log "retire-superseded-new --all: ignorando '$f' — nome fora de [A-Za-z0-9_]"
+        continue
+        ;;
+    esac
+    n=$((n+1))
+    _retire_superseded_new "$db" || rc=1
+  done
+  [ "$n" -gt 0 ] || log "retire-superseded-new --all: nada a varrer — nenhum $BACKUP_ROOT/*.new"
+  return $rc
+}
+
 # _run_reseed <db> — todo o mecanismo (preflights, construção, verificação,
 # troca), extraído para função só para caber num LIB mode testável
 # (DOLT_BACKUP_RESEED_LIB=1) sem mudar nenhum comportamento do fluxo normal.
@@ -1367,6 +1609,20 @@ fi
 # Like the mode above, never part of the normal invocation; must be asked for.
 if [ "$DB" = "--release-stale-new" ]; then
   _release_stale_new "${2:-}"
+  exit $?
+fi
+
+# ga-m9wpnk: standalone mode — retire (RENAME to .old, never delete) a "<db>.new" that a
+# valid primary has superseded, so dolt-backup-residue-reclaim.sh frees it with S3 proof
+# (see _retire_superseded_new's own header). Dry by default; the disk-floor guard is the
+# caller that passes RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN=0. Exit code: 0 = swept/spared/
+# dry-run/nothing to do; 1 = bad usage, unreadable BACKUP_ROOT, or a rename failed.
+if [ "$DB" = "--retire-superseded-new" ]; then
+  if [ "${2:-}" = "--all" ]; then
+    _retire_superseded_new_all
+  else
+    _retire_superseded_new "${2:-}"
+  fi
   exit $?
 fi
 

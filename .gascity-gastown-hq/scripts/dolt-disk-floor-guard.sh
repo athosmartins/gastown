@@ -2697,6 +2697,18 @@ _reap_orphan_test_dolt_processes() {
 # what it would free, deletes nothing) whenever its BACKUP_ROOT resolves to
 # the real default — which is also what keeps this safe to invoke from this
 # file's own selftest below.
+#
+# ga-m9wpnk: before that reclaim, this lever also RETIRES a "<db>.new" that a
+# valid primary has superseded (`dolt-backup-reseed.sh --retire-superseded-new
+# --all`: a RENAME to <db>.old, never a delete). Measured 13/10: a reseed this
+# very guard triggered at CRITICAL (12/10 15:28) was killed by its own 240s
+# `timeout` during the verification restore, nothing removes the .new of a
+# killed reseed, and the reclaim below only sweeps *.old — so whatsapp_automation
+# .new (1.5 GB) sat 30h beside a good primary while the disk was at Dolt's
+# critical floor, and _reap_bloated_backup_staging skips any db with residue.
+# The retire is dry unless this caller passes RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN=0
+# (the same "only the real caller opts in" shape as the PROD sentinel above); the
+# deleter stays the one below, with its S3 proof. Its failure never blocks the reclaim.
 _reap_backup_residue() {
   if [ "$ENABLED" != "1" ]; then
     log "backup-residue-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
@@ -2706,6 +2718,21 @@ _reap_backup_residue() {
   if [ ! -f "$reaper" ]; then
     log "backup-residue-reap SKIP — $reaper not found"
     return
+  fi
+  # ga-m9wpnk: retire first. The rename keeps the directory's own mtime, so a
+  # .new already past the reclaim's 2h settle window is eligible for it on this
+  # very pass. 60s: per .new it reads a manifest, a few mtimes and one process
+  # listing — no network. Only reached when the reclaimer exists (the check
+  # above): the retire's .old is only useful if the reclaimer can free it.
+  local retirer="$CITY/scripts/dolt-backup-reseed.sh"
+  if [ -f "$retirer" ]; then
+    if GC_CITY_PATH="$CITY" RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN=0 timeout 60 bash "$retirer" --retire-superseded-new --all >> "$LOG" 2>&1; then
+      log "backup-new-retire OK"
+    else
+      log "backup-new-retire FAILED or aborted (nonzero exit) — see log lines above; the *.old reclaim below still runs"
+    fi
+  else
+    log "backup-new-retire SKIP — $retirer not found; the *.old reclaim below still runs"
   fi
   # 180s: each candidate makes up to two bounded (20s default) AWS calls plus
   # a couple of `du` reads; generous enough for a handful of .old residues
