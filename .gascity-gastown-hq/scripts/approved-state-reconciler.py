@@ -1186,12 +1186,26 @@ def _pilot_still_held_reason(labels, now):
 
     CORRECT APPROACH (mayor RE-FIX GUIDANCE, 2026-07-25): evaluate the bead's
     OWN current labels with the SAME rule _filter_candidates applies — do not
-    parse anything else's log or text. Mirrors pilot-dispatcher.sh
-    _filter_candidates EXACTLY: held iff "pilot:held" is present AND (no
-    held-until label exists at all, OR the LATEST/MAX held-until epoch has not
-    yet passed). held-until labels ACCUMULATE without pruning (ga-4aree) — an
-    older expired stamp must never mask a newer still-valid one, so this takes
-    the max of every held-until epoch found, never just the first.
+    parse anything else's log or text. held-until labels ACCUMULATE without
+    pruning (ga-4aree) — an older expired stamp must never mask a newer
+    still-valid one, so this takes the max of every held-until epoch found,
+    never just the first.
+
+    The rule, as pilot-dispatcher.sh _filter_candidates states it since
+    ga-0eib9f (search "ga-0eib9f" there; pilot-dispatcher.held-until-alone.
+    selftest.sh pins the Pilot side). Three label states, not two — the third
+    is "cannot tell", and the answer under doubt is INERT (held):
+      1. A valid held-until epoch (digits only, like the Pilot's
+         ^[0-9]+\\z) whose MAX has not passed → HELD, with or without
+         pilot:held. A FUTURE stamp is a hold BY ITSELF (ga-80yi6w: ga-mhe7x7,
+         ps-0gsi, ps-pjsg, wa-haoxnx carried only the timed label, this
+         function returned None for lack of pilot:held, and the reconciler
+         mailed "STILL starving" for a bead the Pilot was deliberately holding).
+      2. pilot:held present, no valid epoch → HELD (indefinite hold).
+      3. No pilot:held, held-until label(s) present but none a valid epoch →
+         HELD (unreadable stamp).
+    Not held: valid epochs that have all passed (expired hold), or neither
+    pilot:held nor any held-until label.
 
     This does not re-close the exact ga-t1ub9 timing gap (the brief window
     where the label is fully ABSENT between one hold's expiry and the next
@@ -1200,21 +1214,31 @@ def _pilot_still_held_reason(labels, now):
     race window preferable to log-scraping's worse failure mode of silently
     suppressing real alarms on unrelated beads.
     """
-    if park_labels.PILOT_HELD_LABEL not in labels:
-        return None
     prefix = park_labels.PILOT_HELD_LABEL + "-until:"
+    raw = [lab[len(prefix):] for lab in labels if lab.startswith(prefix)]
+    # The Pilot reads an epoch with jq test("^[0-9]+\\z") | tonumber. int() alone
+    # would also accept "-5", "+5", " 5" and "5_0", so the shape is checked first.
     epochs = []
-    for lab in labels:
-        if lab.startswith(prefix):
-            try:
-                epochs.append(int(lab[len(prefix):]))
-            except ValueError:
-                pass
-    if not epochs:
+    for r in raw:
+        if not re.fullmatch(r"[0-9]+", r):
+            continue
+        try:
+            epochs.append(int(r))
+        except ValueError:
+            # >4300 digits trips Python's int() limit; jq's tonumber reads the same
+            # label as an astronomically large epoch, i.e. a hold that never ends.
+            epochs.append(float("inf"))
+    if epochs:
+        latest = max(epochs)
+        if latest >= now:
+            return "pilot:held-until:%s (not yet expired)" % latest
+        # every valid stamp has passed: an expired hold, held no more
+        return None
+    if park_labels.PILOT_HELD_LABEL in labels:
         return "pilot:held (no held-until epoch — indefinite hold)"
-    latest = max(epochs)
-    if latest >= now:
-        return "pilot:held-until:%d (not yet expired)" % latest
+    if raw:
+        return ("pilot:held-until:%s (unreadable epoch, no pilot:held — cannot tell "
+                "when the hold ends, so it stays held)" % raw[0])
     return None
 
 
@@ -3888,11 +3912,12 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
             continue
 
         # pilot:held / pilot:held-until:<epoch> — mirrors pilot-dispatcher.sh's
-        # _filter_candidates EXACTLY (ga-6om6a RE-FIX): held iff pilot:held is
-        # present AND the latest/max held-until epoch (if any) has not yet
-        # passed. See _pilot_still_held_reason() docstring for why this replaced
-        # gate-fix attempt 1's log-scraping approach (ga-an81u AC1 for the
-        # original bare pilot:held signal this supersedes).
+        # _filter_candidates (ga-6om6a RE-FIX, held-until-alone clause ga-80yi6w):
+        # the latest/max valid held-until epoch not yet passed holds the bead with
+        # or without pilot:held; pilot:held with no valid epoch, or an unreadable
+        # stamp, also holds. See _pilot_still_held_reason() docstring for the full
+        # rule and for why this replaced gate-fix attempt 1's log-scraping
+        # approach (ga-an81u AC1 for the original bare pilot:held signal).
         pilot_held_reason = _pilot_still_held_reason(labels, now)
         if pilot_held_reason is not None:
             _log("  %s: no signal, daemon-age=%.0fmin, %s — no alarm" % (
@@ -6276,6 +6301,78 @@ def _selftest():
     else:
         _bad("(ww)", "FALSELY alarmed — took the FIRST held-until label "
              "instead of the MAX/latest; mail_calls=%s" % mail_calls)
+
+    # ga-80yi6w: the Pilot (ga-0eib9f) treats a FUTURE pilot:held-until:<epoch> as a
+    # hold BY ITSELF — no pilot:held needed. This reconciler used to return "not held"
+    # the moment pilot:held was absent, so ga-mhe7x7 (held-until 18/10, deliberately)
+    # alarmed "STILL starving 3208min". Four scenarios pin the four label shapes the
+    # Pilot's _filter_candidates distinguishes when pilot:held is ABSENT.
+    print("\nScenario (ga-80yi6w-a): pilot:held-until:<FUTURE> ALONE (no pilot:held) "
+          "→ no alarm (the Pilot holds it; ga-mhe7x7 / ps-0gsi / wa-haoxnx repro)")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-hu1", age_min=0.1,
+        labels=["story:approved", "pilot:held-until:%d" % int(NOW + 3600)])]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_hu1 = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_hu1["first_seen_approved"]["ga-hu1"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_hu1)
+    if not any("ga-hu1" in subj for subj, _ in mail_calls):
+        _ok("(ga-80yi6w-a): held-until:<future> alone → no alarm")
+    else:
+        _bad("(ga-80yi6w-a)", "FALSELY alarmed a bead the Pilot holds by its "
+             "future held-until alone; mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ga-80yi6w-b): pilot:held-until:<PAST> ALONE (no pilot:held) → "
+          "STILL alarms (an expired stamp is not a hold; fix is not over-permissive)")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-hu2", age_min=0.1,
+        labels=["story:approved", "pilot:held-until:%d" % int(NOW - 3600)])]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_hu2 = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_hu2["first_seen_approved"]["ga-hu2"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_hu2)
+    if any("ga-hu2" in subj for subj, _ in mail_calls):
+        _ok("(ga-80yi6w-b): expired held-until alone → still alarms")
+    else:
+        _bad("(ga-80yi6w-b)", "FAILED to alarm on a bead whose only hold stamp is "
+             "expired — fix became over-permissive; mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ga-80yi6w-c): pilot:held-until:<UNREADABLE> ALONE (no "
+          "pilot:held) → no alarm (cannot tell → INERT, same as the Pilot)")
+    _bd_approved = lambda root: [_make_bead(
+        "ga-hu3", age_min=0.1,
+        labels=["story:approved", "pilot:held-until:soon"])]
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    st_hu3 = {"routed": {}, "alarmed": {}, "first_seen_approved": {}, "flagged": {}}
+    st_hu3["first_seen_approved"]["ga-hu3"] = NOW - (_STARVE + 5) * 60
+    _reset_captures()
+    run_cycle(NOW, st_hu3)
+    if not any("ga-hu3" in subj for subj, _ in mail_calls):
+        _ok("(ga-80yi6w-c): unreadable held-until alone → no alarm (inert under doubt)")
+    else:
+        _bad("(ga-80yi6w-c)", "alarmed on an unreadable held-until stamp the Pilot "
+             "treats as a hold; mail_calls=%s" % mail_calls)
+
+    print("\nScenario (ga-80yi6w-d): epoch shapes the Pilot's ^[0-9]+\\z rejects "
+          "(\"-5\", \"+5\", \" 5\", \"5_0\") are UNREADABLE, not epochs — Python's "
+          "int() would have read them as numbers")
+    _shape_bad = []
+    for _shape in ("-5", "+9999999999", " 9999999999", "9_9_9_9_9_9_9_9_9_9", ""):
+        if _pilot_still_held_reason(
+                ["story:approved", "pilot:held-until:" + _shape], NOW) is None:
+            _shape_bad.append(_shape)
+        # …and with pilot:held present, an unreadable-only stamp stays an indefinite hold
+        if _pilot_still_held_reason(
+                ["story:approved", "pilot:held", "pilot:held-until:" + _shape],
+                NOW) is None:
+            _shape_bad.append("pilot:held+" + _shape)
+    if not _shape_bad:
+        _ok("(ga-80yi6w-d): non-[0-9]+ epochs are unreadable → held, with or "
+            "without pilot:held")
+    else:
+        _bad("(ga-80yi6w-d)", "treated these as an expired/absent hold: %r" % _shape_bad)
 
     print("\nScenario (xx): ga-6om6a — pilot:refused-reason:<slug> (the "
           "PERMANENT audit label inflight-reclaim-guard.py promotes "
