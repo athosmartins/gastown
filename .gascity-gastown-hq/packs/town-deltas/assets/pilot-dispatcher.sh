@@ -9823,7 +9823,9 @@ _pilot_priority_unservable_note() {
   if gc --city "$GC_CITY" mail send mayor -s "$_subj" -m "$_body" >/dev/null 2>&1; then
     _PY_UNSERV_SENT="$_PY_UNSERV_SENT$_line"$'\n'
     _tmp="$_state.tmp.$$"
-    if { [ ! -r "$_state" ] || awk -F'\t' -v id="$_id" '$1 != id' "$_state"; printf '%s\n' "$_line"; } > "$_tmp" 2>/dev/null && mv "$_tmp" "$_state" 2>/dev/null; then
+    # The old lines are copied only if awk could READ them: a failed read must not become an "empty state" that mv then writes over the
+    # file (that would forget every other bead the Mayor was told about) — it takes the warn branch below, the state stays as it was.
+    if { { [ ! -r "$_state" ] || awk -F'\t' -v id="$_id" '$1 != id' "$_state"; } && printf '%s\n' "$_line"; } > "$_tmp" 2>/dev/null && mv "$_tmp" "$_state" 2>/dev/null; then
       log "ga-qmfm8r: told the Mayor — $_subj"
     else
       rm -f "$_tmp" 2>/dev/null || true

@@ -391,6 +391,12 @@ run_py "$(scan_with "$(arr "$P0PR")")" >/dev/null
 [ "$(mails)" = "2" ] && [ -s "$WORK/unservable.state" ] && ok "K5b the next sweep retries (2 attempts) and, sent, remembers it" || bad "K5b mails=$(mails)"
 run_py "$(scan_with "$(arr "$P0PR")")" >/dev/null
 [ "$(mails)" = "2" ] && ok "K5c … and stops there" || bad "K5c mails=$(mails)"
+# the state file that cannot be READ while it is being updated is "cannot tell", not "empty": it must not be rewritten from nothing
+reset; cap wa-worker 2 2
+printf 'other-1\tlabel:needs-human\nother-2\tlabel:on-device\n' > "$WORK/unservable.state"
+out="$(run_py "awk() { return 2; }; $(scan_with "$(arr "$P0PR")")")"
+[ "$(mails)" = "1" ] && [ "$(cat "$WORK/unservable.state")" = "$(printf 'other-1\tlabel:needs-human\nother-2\tlabel:on-device')" ] && warned "could not record it" \
+  && ok "K5d (third state) the old state cannot be read (awk fails) → the file is left as it was (the other beads stay remembered), the failure is a warning" || bad "K5d mails=$(mails) state=$(cat "$WORK/unservable.state" 2>/dev/null | tr '\n\t' '|.')"
 
 # the list of refusals is the POOL's: ps-worker shares wa's list; delivery:partial is a dog-only refusal
 reset; cap ps-worker 1 1
