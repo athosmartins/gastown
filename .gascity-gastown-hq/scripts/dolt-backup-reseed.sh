@@ -1307,6 +1307,34 @@ _retire_superseded_new_all() {
   return $rc
 }
 
+# Sinal recebido DURANTE a troca (ver _reseed_swap_begin). Global porque é compartilhada
+# entre quem a grava (o trap de _reseed_swap_begin) e quem a lê (_reseed_swap_end).
+RESEED_PENDING_SIG=""
+
+# _reseed_swap_begin / _reseed_swap_mv / _reseed_swap_end — ga-0m4fqu (gate-fix 1).
+# A troca do Passo 3 são duas renomeações (no modo de baixo disco, uma). Um sinal entre
+# elas deixaria $BACKUP_DIR AUSENTE, com o novo (verificado) e o antigo lado a lado, e o
+# handler teria de descrever essa janela. Em vez disso ela deixa de existir: durante a
+# troca o sinal só é ANOTADO (RESEED_PENDING_SIG) e, concluída a troca, _reseed_swap_end o
+# entrega ao handler de verdade, já com SWAP_DONE=1. Os mv da troca rodam com o sinal
+# IGNORADO (_reseed_swap_mv): o `timeout` do guard sinaliza o grupo todo, e um mv morto por
+# sinal devolve rc!=0 mesmo tendo renomeado -- o die "nada trocado" que lê esse rc mentiria.
+# Se a troca falhar o script morre por die(), cuja mensagem diz o estado; o sinal anotado
+# é então descartado, porque o processo termina de qualquer jeito.
+_reseed_swap_begin() {
+  RESEED_PENDING_SIG=""
+  trap 'RESEED_PENDING_SIG=TERM' TERM
+  trap 'RESEED_PENDING_SIG=INT' INT
+  trap 'RESEED_PENDING_SIG=HUP' HUP
+}
+_reseed_swap_mv() { ( trap '' TERM INT HUP; exec mv "$@" ); }
+_reseed_swap_end() {
+  trap '_reseed_interrupted TERM' TERM
+  trap '_reseed_interrupted INT' INT
+  trap '_reseed_interrupted HUP' HUP
+  [ -z "$RESEED_PENDING_SIG" ] || _reseed_interrupted "$RESEED_PENDING_SIG"
+}
+
 # _reseed_interrupted <sinal> — ga-0m4fqu. Handler de TERM/INT/HUP de _run_reseed.
 # O guard (dolt-disk-floor-guard.sh) dispara este script sob `timeout 240`, e o
 # `timeout` manda o sinal para o GRUPO inteiro: sem handler o script morria calado
@@ -1316,20 +1344,52 @@ _retire_superseded_new_all() {
 # O handler não conserta nada (o que sobrou só se prova com um restore, e quem
 # chama está matando este processo): diz a verdade sobre o estado que fica e sai.
 # Nunca apaga: depois de OLD_FREED_EARLY=1 o $NEW_DIR pode ser a ÚNICA cópia
-# local, e um sinal não diz "não restaura". DB/NEW_DIR/BACKUP_DIR/OLD_FREED_EARLY
-# são locais de _run_reseed; o trap roda com ele na pilha, então este handler os
-# enxerga (escopo dinâmico do bash).
+# local, e um sinal não diz "não restaura".
+#
+# Três situações, e a mensagem sai do ESTADO em que o script estava, não de um palpite:
+#   1. SWAP_DONE=1 -- a troca terminou e o novo foi verificado por restore; só o que vem
+#      depois (a publicação da prova no S3) foi cortado. Sem alarme e sem a frase "SEM
+#      BACKUP LOCAL": o backup local está no lugar e o dolt-s3-backup.sh leria a frase
+#      como "o backup local se perdeu" (is_local_backup_lost_refusal).
+#   2. o antigo foi (ou estava sendo) liberado -- sem backup local válido; alarma.
+#   3. nada do antigo foi tocado -- ele segue intacto.
+# DB/NEW_DIR/OLD_DIR/BACKUP_DIR/OLD_FREED_EARLY/OLD_RELEASE_STARTED/NEW_VERIFIED/SWAP_DONE
+# são locais de _run_reseed; o trap roda com ele na pilha, então este handler os enxerga
+# (escopo dinâmico do bash).
 _reseed_interrupted() {
   local sig="$1" code=143
   case "$sig" in INT) code=130 ;; HUP) code=129 ;; esac
+  if [ "${SWAP_DONE:-0}" = "1" ]; then
+    local old_txt="o antigo está preservado em $OLD_DIR"
+    [ "${OLD_FREED_EARLY:-0}" = "1" ] && old_txt="o antigo já tinha sido liberado, com prova do S3"
+    log "INTERROMPIDO por $sig DEPOIS da troca: a troca terminou e o backup novo foi verificado por restore — $BACKUP_DIR é o backup novo e está no lugar ($old_txt). Só a publicação da prova no S3 (aws s3 sync + _meta/latest.json) foi cortada: o backup local NÃO está em dúvida. O próximo reseed ou a rodada diária publica; até lá o residue-reclaim poupa o .old."
+    exit "$code"
+  fi
+  local verified_txt="é uma cópia NÃO verificada por restore" half_txt=" e pode estar completa ou pela metade (confira se tem manifest)"
+  if [ "${NEW_VERIFIED:-0}" = "1" ]; then
+    verified_txt="foi verificado por restore, mas não chegou a ser promovido"
+    half_txt=""
+  fi
   # OLD_RELEASE_STARTED cobre a janela do próprio `rm -rf` do antigo (27s para 2 GB em
   # 15/10): o sinal pode cair no meio dele, com OLD_FREED_EARLY ainda 0 e a primária
   # pela metade. Nessa janela "o antigo segue intacto" seria falso.
   if [ "${OLD_FREED_EARLY:-0}" = "1" ] || [ "${OLD_RELEASE_STARTED:-0}" = "1" ]; then
-    log "INTERROMPIDO por $sig durante/depois da liberação do backup antigo: o antigo foi (ou estava sendo) apagado — $BACKUP_DIR pode não existir ou estar pela metade — e '$DB' está SEM BACKUP LOCAL VÁLIDO. $NEW_DIR (se existir) pode estar completo ou pela metade (confira se tem manifest) e NÃO foi verificado por restore: fica PRESERVADO — pode ser a única cópia local, não é resíduo comum — e o S3 (provado antes da liberação) é o fallback. Para terminar com $BACKUP_DIR ausente: $0 --promote-new-after-release $DB (restaura $NEW_DIR para conferir antes de promover; recusa se $BACKUP_DIR existir; precisa de disco livre para o restore). Se $BACKUP_DIR ficou pela metade, ele tem de ser liberado antes — leia o cabeçalho de _release_manifestless_primary (exige prova do S3) em vez de apagar à mão."
-    notify_fail "reseed de '$DB' INTERROMPIDO por $sig durante/depois da liberação do backup antigo: '$DB' está SEM BACKUP LOCAL VÁLIDO; $NEW_DIR (se existir) foi preservado SEM verificação (pode estar pela metade) — NÃO apague. O S3 é o fallback. Ver $LOG."
+    # O que fazer depois depende do que o `rm -rf` cortado deixou em $BACKUP_DIR, e isso se
+    # LÊ do disco: --release-manifestless-primary recusa primária que TEM manifest, e
+    # --promote-new-after-release recusa enquanto $BACKUP_DIR existir -- uma primária pela
+    # metade que ainda tem o manifest não tem ferramenta, só decisão manual.
+    local next
+    if [ ! -e "$BACKUP_DIR" ]; then
+      next="Para terminar: $0 --promote-new-after-release $DB (restaura $NEW_DIR para conferir antes de promover; precisa de disco livre para o restore)."
+    elif [ -s "$BACKUP_DIR/manifest" ]; then
+      next="$BACKUP_DIR AINDA EXISTE, com manifest, mas o rm -rf do antigo foi cortado e ele pode estar incompleto: nenhuma ferramenta cobre isso (--release-manifestless-primary recusa primária com manifest; --promote-new-after-release recusa enquanto $BACKUP_DIR existir). É decisão manual — confira $BACKUP_DIR contra o S3 antes de remover qualquer coisa, e NÃO apague $NEW_DIR."
+    else
+      next="$BACKUP_DIR ainda existe, sem manifest (o que o rm -rf cortado deixou): libere-o com $0 --release-manifestless-primary $DB (exige prova do S3) e depois $0 --promote-new-after-release $DB."
+    fi
+    log "INTERROMPIDO por $sig durante/depois da liberação do backup antigo: o antigo foi (ou estava sendo) apagado e '$DB' está SEM BACKUP LOCAL VÁLIDO. $NEW_DIR (se existir) ${verified_txt}${half_txt}, e fica PRESERVADO — pode ser a única cópia local, não é resíduo comum; o S3 (provado antes da liberação) é o fallback. $next"
+    notify_fail "reseed de '$DB' INTERROMPIDO por $sig durante/depois da liberação do backup antigo: '$DB' está SEM BACKUP LOCAL VÁLIDO; $NEW_DIR (se existir) foi preservado — NÃO apague. O S3 é o fallback. Ver $LOG."
   else
-    log "INTERROMPIDO por $sig antes de liberar o backup antigo: o antigo segue intacto em $BACKUP_DIR; $NEW_DIR (se existir) é uma cópia não verificada e nada foi trocado."
+    log "INTERROMPIDO por $sig antes de liberar o backup antigo: o antigo segue intacto em $BACKUP_DIR; $NEW_DIR (se existir) $verified_txt, e nada foi trocado."
   fi
   exit "$code"
 }
@@ -1419,6 +1479,8 @@ _run_reseed() {
 
   local OLD_FREED_EARLY=0
   local OLD_RELEASE_STARTED=0   # vira 1 ANTES de cada remoção do backup antigo (ver _reseed_interrupted)
+  local NEW_VERIFIED=0          # vira 1 quando o restore de verificação do novo passou (ver _reseed_interrupted)
+  local SWAP_DONE=0             # vira 1 quando a troca terminou (ver _reseed_swap_begin / _reseed_interrupted)
 
   # ga-0m4fqu: daqui em diante um sinal vira uma linha de log que diz o estado
   # (ver _reseed_interrupted). Instalado ANTES do Passo 0.5 para cobrir também a
@@ -1536,6 +1598,12 @@ _run_reseed() {
       die "SEM BACKUP LOCAL: modo de baixo disco já tinha liberado o antigo (com prova do S3), e a restauração de verificação do novo NÃO TERMINOU (rc=$RESTORE_RC) -- isso NÃO é veredito de que o novo não restaura. $NEW_DIR foi PRESERVADO, sem verificação: pode ser a única cópia local. '$DB' está sem backup local válido agora -- o S3 verificado antes da liberação é o fallback. Para terminar: $0 --promote-new-after-release $DB (precisa de disco livre para o restore)."
     fi
     rm -rf "$NEW_DIR"
+    # Aqui OLD_FREED_EARLY=0 para um restore que não terminou (o caso =1 saiu acima): o antigo
+    # segue intacto. O novo é descartado como sempre, mas a mensagem não pode chamar "não
+    # terminou" de "não restaura" -- o desfecho é o mesmo, o veredito não.
+    if [ "$RESTORE_RC" -eq 124 ] || [ "$RESTORE_RC" -ge 128 ]; then
+      die "a restauração de verificação do backup novo NÃO TERMINOU (rc=$RESTORE_RC) -- 124 = estourou o timeout, >=128 = morta por sinal/OOM; isso NÃO é veredito de que o novo não restaura. Nada foi trocado; o antigo segue intacto em $BACKUP_DIR; o novo (não verificado) foi descartado e é refeito na próxima rodada."
+    fi
     if [ "$OLD_FREED_EARLY" = "1" ]; then
       die "SEM BACKUP LOCAL: modo de baixo disco já tinha liberado o antigo (com prova do S3), e o backup novo NÃO RESTAURA. '$DB' está sem backup local agora -- o S3 verificado antes da liberação é o único fallback. Investigue imediatamente."
     fi
@@ -1571,39 +1639,45 @@ _run_reseed() {
 
   # ── Passo 3: trocar (só agora, com prova na mão) ────────────────────────────
   log "verificação OK. Trocando."
+  NEW_VERIFIED=1
+  _reseed_swap_begin
 
   if [ "$OLD_FREED_EARLY" = "1" ]; then
     # O antigo já foi liberado (com prova do S3) lá no Passo 1.5 -- não há
     # ".old" para criar, só promover o novo já verificado direto ao lugar.
-    if ! mv "$NEW_DIR" "$BACKUP_DIR"; then
+    if ! _reseed_swap_mv "$NEW_DIR" "$BACKUP_DIR"; then
       die "SEM BACKUP LOCAL: modo de baixo disco já tinha liberado o antigo, e promover o novo (verificado) TAMBÉM falhou. '$DB' está SEM BACKUP LOCAL agora. $NEW_DIR (verificado, mv falhou no meio) pode estar parcialmente movido; investigue AGORA -- o S3 é o único fallback."
     fi
+    SWAP_DONE=1
     local NEW_SIZE; NEW_SIZE=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
     log "trocado (modo de baixo disco — sem período de .old, antigo já liberado com prova do S3). novo=$NEW_SIZE ($NEW_FILES arquivos)"
+    _reseed_swap_end
     _publish_after_swap "$DB" "$BACKUP_DIR" "$RESTORED_COUNT"
     log "=== re-seed de '$DB' concluído com sucesso (modo de baixo disco) ==="
     exit 0
   fi
 
-  mv "$BACKUP_DIR" "$OLD_DIR" || die "falhou ao mover o backup antigo; nada trocado"
-  if ! mv "$NEW_DIR" "$BACKUP_DIR"; then
+  _reseed_swap_mv "$BACKUP_DIR" "$OLD_DIR" || die "falhou ao mover o backup antigo; nada trocado"
+  if ! _reseed_swap_mv "$NEW_DIR" "$BACKUP_DIR"; then
     # gate-fix 2 (ga-kawer3): o rollback abaixo não pode se autodeclarar
     # bem-sucedido sem checar o próprio resultado -- é a REGRA INEGOCIÁVEL do
     # topo do arquivo (nunca declarar êxito sem verificar) aplicada ao próprio
     # caminho de recuperação. "mv foi chamado" e "o antigo está de volta" são
     # perguntas diferentes; só a segunda autoriza dizer "RESTAURADO".
-    if mv "$OLD_DIR" "$BACKUP_DIR"; then
+    if _reseed_swap_mv "$OLD_DIR" "$BACKUP_DIR"; then
       die "falhou ao promover o backup novo — rollback confirmado, antigo RESTAURADO em $BACKUP_DIR. O novo (verificado, mas não promovido) segue intacto em $NEW_DIR para investigação; não foi apagado."
     else
       die "FALHA DUPLA -- o cenário mais grave que este script pode produzir: falhou ao promover o novo E o rollback do antigo TAMBÉM falhou. $BACKUP_DIR pode estar ausente ou vazio agora. NÃO toque em nada: o antigo (bom) pode ainda estar em $OLD_DIR e o novo (verificado) em $NEW_DIR, mas qual sobreviveu não está confirmado. Investigue manualmente antes de qualquer ação."
     fi
   fi
 
+  SWAP_DONE=1
   # Reaponta o remote canônico (o caminho não mudou, mas o conteúdo sim).
   local OLD_SIZE NEW_SIZE
   OLD_SIZE=$(du -sh "$OLD_DIR" 2>/dev/null | awk '{print $1}')
   NEW_SIZE=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
   log "trocado. antigo=$OLD_SIZE ($OLD_FILES arquivos) -> novo=$NEW_SIZE ($NEW_FILES arquivos)"
+  _reseed_swap_end
 
   # ⚠️ NÃO apagamos o antigo automaticamente. Ele fica em .old para um humano
   # (ou para dolt-backup-residue-reclaim.sh, com prova do S3) remover depois.

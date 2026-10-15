@@ -715,6 +715,10 @@ case "${RESEED_STUB_MODE:-ok}" in
   disk) echo "ABORTADO: disco insuficiente. NÃO iniciando: ..."; exit 1 ;;
   residue) echo "ABORTADO: .dolt-backup/$1.old já existe — resíduo de uma execução anterior. Investigue antes."; exit 1 ;;
   other) echo "ABORTADO: o backup novo NÃO RESTAURA. Nada foi trocado."; exit 1 ;;
+  # ga-0m4fqu: low-disk run, killed by the guard's timeout AFTER the swap, during the S3 publish.
+  postswap) echo "modo de baixo disco: antigo liberado (~2.0G). ATENÇÃO: '$1' fica SEM BACKUP LOCAL até a verificação abaixo terminar -- o S3 é o único fallback nesta janela."
+            echo "trocado (modo de baixo disco — sem período de .old)."
+            echo "INTERROMPIDO por TERM DEPOIS da troca: a troca terminou e o backup novo foi verificado por restore."; exit 143 ;;
 esac
 STUB
 chmod +x "$RESEED_STUB_DIR/reseed.sh"
@@ -836,7 +840,11 @@ RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UP
   _reseed_staging_if_enabled "testdb"
 grep -qF "$C3_ROOT/testdb.new" "$NOTIFY_STUB_CALLS" && ok "scenario C3: names the residue that actually exists ($C3_ROOT/testdb.new)" || bad "scenario C3: should name the .new that exists"
 grep -qF "testdb.old" "$NOTIFY_STUB_CALLS" && bad "scenario C3: names a testdb.old that does not exist (the old text's flaw)" || ok "scenario C3: does not name a residue path that is not there"
-grep -qF "remova o resíduo à mão" "$NOTIFY_STUB_CALLS" && ok "scenario C3: primary has a manifest → removal advice is given" || bad "scenario C3: with a good primary the removal advice should be given"
+grep -qF -e "--release-stale-new testdb" "$NOTIFY_STUB_CALLS" && ok "scenario C3: primary has a manifest → points at the tool that removes a .new WITH an S3 proof" || bad "scenario C3: should point at --release-stale-new"
+# gate-fix 1 (low): a manifest that is present does not prove the primary restores (a cut rm -rf can
+# leave the manifest and lose tables), so even here the alarm must not say "delete by hand".
+grep -qF "remova" "$NOTIFY_STUB_CALLS" && bad "scenario C3: still tells the reader to remove the residue by hand on the strength of a manifest" || ok "scenario C3: no 'remova à mão' — a present manifest is a gate, not a proof"
+grep -qF "NÃO prova que ela restaura" "$NOTIFY_STUB_CALLS" && ok "scenario C3: says the manifest does not prove the primary restores" || bad "scenario C3: should say a manifest is not proof"
 rm -rf "$C3_ROOT"
 # C4: primary ABSENT, .new has a manifest → it may be the only local copy: never "remova".
 C4_ROOT="$(mktemp -d /tmp/s3backup-selftest-c4.XXXXXX)"
@@ -859,6 +867,18 @@ RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UP
   _reseed_staging_if_enabled "testdb"
 grep -qF "NÃO apague" "$NOTIFY_STUB_CALLS" && ok "scenario C5: empty primary manifest is not 'proven good' → cautious text" || bad "scenario C5: an empty manifest must not unlock the removal advice"
 rm -rf "$C4_ROOT" "$C5_ROOT"
+
+# C6 (gate-fix 1): the reseed was killed AFTER its swap succeeded. Its captured output still holds the
+# low-disk status line "fica SEM BACKUP LOCAL até a verificação ... terminar", written BEFORE the
+# verification -- that stale line must not raise the CRITICAL "a reconstrução FALHOU" alarm.
+: > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=postswap LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  _reseed_staging_if_enabled "testdb"
+RC=$?
+[ "$RC" -eq 1 ] && ok "scenario C6 (killed after the swap): returns failure (the run did not finish)" || bad "scenario C6: expected rc=1, got rc=$RC"
+grep -qF "SEM BACKUP LOCAL" "$NOTIFY_STUB_CALLS" && bad "scenario C6: paged the lost-local-backup alarm for a run whose swap SUCCEEDED" || ok "scenario C6: no false 'SEM BACKUP LOCAL' page — the swap had succeeded"
+grep -qF "CRÍTICO" "$RESEED_TEST_LOG" && bad "scenario C6: logged the CRÍTICO line" || ok "scenario C6: no CRÍTICO line in the log"
 
 # Scenario D: RESEED_AFTER_UPLOAD=0 → reseed script never even invoked.
 : > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"

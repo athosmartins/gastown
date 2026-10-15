@@ -229,13 +229,14 @@ is_stale_residue_refusal() {
 }
 
 # _stale_residue_alarm_text <db> — ga-0m4fqu. The words of the "reseed blocked by
-# residue" alarm. "Remove it by hand" is only right while the PRIMARY is good: a
-# guard-triggered reseed killed after it had freed the primary (15/10 11:15) leaves
-# a complete <db>.new beside NO primary, and that .new is then the only local copy.
-# The old text named "${db}.old" even when the residue was ".new", and told whoever
-# read it to delete. Three answers collapse to two here on purpose: a primary
-# manifest that is present is the only thing that unlocks "remove"; absent, empty
-# or unreadable all get the cautious text, because deleting is the irreversible side.
+# residue" alarm. The old text told the reader to "remove it by hand" and named
+# "${db}.old" even when the residue was ".new". That is wrong whenever the residue is
+# the only complete local copy: a guard-triggered reseed killed after it had freed the
+# primary (15/10 11:15) left a complete <db>.new beside NO primary.
+# A primary manifest that is present is a GATE, not a proof: a cut `rm -rf` can leave
+# the manifest and lose tables, so even then the text does not say "delete" -- it names
+# the tools that remove residue only with an S3 proof. Absent, empty or unreadable
+# manifest gets the cautious text, because deleting is the irreversible side.
 _stale_residue_alarm_text() {
   local db="$1" found="" p
   for p in "$BACKUP_ROOT/$db.new" "$BACKUP_ROOT/$db.old"; do
@@ -244,7 +245,7 @@ _stale_residue_alarm_text() {
   [ -n "$found" ] || found="${BACKUP_ROOT}/${db}.new ou ${BACKUP_ROOT}/${db}.old"
   # vazio/ausente/ilegivel -> sem manifest provado -> texto cauteloso (nao apagar)
   if [ -s "$BACKUP_ROOT/$db/manifest" ]; then
-    echo "backup off-box: reseed de $db bloqueado por resíduo de execução anterior em $found — a primária $BACKUP_ROOT/$db tem manifest; remova o resíduo à mão uma vez para destravar"
+    echo "backup off-box: reseed de $db bloqueado por resíduo de execução anterior em $found — a primária $BACKUP_ROOT/$db tem manifest, mas isso NÃO prova que ela restaura (um rm -rf cortado pode deixar o manifest e perder tabelas). Não apague à mão: para um .new use dolt-backup-reseed.sh --release-stale-new $db; para um .old, dolt-backup-residue-reclaim.sh — os dois só removem com prova do S3. Ver $LOG."
   else
     echo "backup off-box: reseed de $db bloqueado por resíduo em $found — e a primária $BACKUP_ROOT/$db NÃO tem manifest legível (ausente, vazia ou ilegível): o resíduo pode ser a ÚNICA cópia local. NÃO apague à mão. Se a primária estiver ausente, o caminho é dolt-backup-reseed.sh --promote-new-after-release $db (restaura e confere antes de promover); o S3 é o fallback. Ver $LOG."
   fi
@@ -275,6 +276,12 @@ is_low_disk_proof_failed_refusal() {
 # it changes what dolt-restore-verify.sh's local-restore checks can rely on.
 is_local_backup_lost_refusal() {
   case "$1" in
+    # ga-0m4fqu: a reseed killed AFTER its swap succeeded (dolt-backup-reseed.sh's handler
+    # says "DEPOIS da troca") has the verified backup in place. The captured output of a
+    # low-disk run still carries the status line written before the verification --
+    # "ATENÇÃO: ... fica SEM BACKUP LOCAL até a verificação ... terminar" -- and that
+    # stale line alone would read as a loss and page the CRITICAL alarm.
+    *"DEPOIS da troca"*) return 1 ;;
     *"SEM BACKUP LOCAL"*) return 0 ;;
     *) return 1 ;;
   esac

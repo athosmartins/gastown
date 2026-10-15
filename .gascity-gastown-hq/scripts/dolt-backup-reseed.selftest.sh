@@ -129,6 +129,9 @@ case "$*" in
     # the post-swap PUBLISH sync (ga-6xo4r0): logged where Part 3 expects it
     echo "$*" >> ./s3-sync.log
     printf '%s\n' "${AWS_REQUEST_CHECKSUM_CALCULATION:-<unset>}" >> ./s3-sync-checksum-env.log
+    # ga-0m4fqu: FAKE_AWS_SYNC_SLEEP=<s> makes the publish take that long, so a scenario can
+    # signal the reseed while it is publishing -- AFTER the swap has already succeeded.
+    [ -n "${FAKE_AWS_SYNC_SLEEP:-}" ] && sleep "$FAKE_AWS_SYNC_SLEEP"
     [ "${FAKE_S3_SYNC_FAIL:-0}" = "1" ] && exit 1 || exit 0
     ;;
   *"s3 cp"*"/manifest"*)
@@ -1627,6 +1630,7 @@ run_scenario_signalled() { # <root> <signal> <marker> env...
       timeout 600 "$SCRIPT" hq > "$root/out.log" 2>&1 ) &
   pid=$!
   for i in $(seq 1 240); do grep -q "$marker" "$root/out.log" 2>/dev/null && break; sleep 0.5; done
+  [ -z "${SIGNAL_DELAY:-}" ] || sleep "$SIGNAL_DELAY"   # lets the step AFTER the marker get going
   kill -"$sig" "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null; RC=$?
 }
@@ -1694,7 +1698,103 @@ run_scenario "$ROOT14" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=5 FAKE_RESTORE_RC=1
 [ "$RC" -ne 0 ] && ok "scenario 14 (restore rc=124, old backup untouched): exits non-zero" || bad "scenario 14: expected non-zero exit"
 [ -f "$ROOT14/city/.dolt-backup/hq/old-bloat.bin" ] && ok "scenario 14: the old backup is intact" || bad "scenario 14: the old backup was damaged"
 [ ! -e "$ROOT14/city/.dolt-backup/hq.new" ] && ok "scenario 14: the unverified .new is dropped, as before (nothing depends on it)" || bad "scenario 14: expected the .new to be dropped when the old backup is intact"
+# gate-fix 1 (medium): the behaviour was pinned, the MESSAGE was not -- it still said "NÃO RESTAURA"
+# (a verdict) for a restore that merely did not finish, contradicting the header comment.
+grep -q "NÃO TERMINOU (rc=124)" "$ROOT14/out.log" && ok "scenario 14: the log says the restore did not finish, with the rc" || bad "scenario 14: missing the 'NÃO TERMINOU (rc=124)' line"
+grep -q "NÃO RESTAURA" "$ROOT14/out.log" && bad "scenario 14: reports 'NÃO RESTAURA' (a verdict) for a restore that did not finish" || ok "scenario 14: no false 'NÃO RESTAURA' verdict"
 rm -rf "$ROOT14" 2>/dev/null
+
+# ── gate-fix 1 (ga-0m4fqu): a signal AFTER the swap is not "sem backup local". ──
+# The first handler picked its story from PRE-swap indicators (OLD_FREED_EARLY / OLD_RELEASE_STARTED)
+# and nothing cleared them once the swap had succeeded. After the swap comes _publish_after_swap
+# (aws s3 sync --delete, budget up to 1200s) -- at the very tail of a budget-bound run, exactly
+# where a borderline run gets killed. A TERM there made the handler say the backup was lost, and
+# page a priority-4 alarm, although the verified backup had been promoted.
+# S15: low-disk mode (OLD_FREED_EARLY=1), TERM while the post-swap publish sleeps.
+ROOT15="/tmp/reseed-selftest-s15.$$"
+setup_scenario "$ROOT15" 10 20 50; mk_notify_capture "$ROOT15"
+# shellcheck disable=SC2086
+SIGNAL_DELAY=1 run_scenario_signalled "$ROOT15" TERM "trocado (modo de baixo disco" $LOWDISK_ENV FAKE_AWS_SYNC_SLEEP=120 DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY="$ROOT15/notify-capture"
+[ "$RC" -ne 0 ] && ok "scenario 15 (low-disk, TERM during the post-swap publish): exits non-zero" || bad "scenario 15: expected non-zero exit, got 0"
+[ -f "$ROOT15/city/.dolt-backup/hq/new-backup.bin" ] && [ ! -e "$ROOT15/city/.dolt-backup/hq.new" ] && ok "scenario 15: the verified backup was promoted and stays in place" || bad "scenario 15: setup did not reach the promoted state, so it does not test the post-swap window"
+grep -q "INTERROMPIDO por TERM DEPOIS da troca" "$ROOT15/out.log" && ok "scenario 15: the log says the signal came AFTER the swap" || bad "scenario 15: missing the 'DEPOIS da troca' line"
+# (the low-disk run also logs "ATENÇÃO: ... fica SEM BACKUP LOCAL até a verificação" BEFORE verifying -- true at
+# that moment, so the claim is judged on the line the handler writes about the interruption)
+grep "INTERROMPIDO" "$ROOT15/out.log" | grep -q "SEM BACKUP LOCAL" && bad "scenario 15: the handler claims SEM BACKUP LOCAL although the verified backup is in place (the gate's repro)" || ok "scenario 15: the handler makes no false SEM BACKUP LOCAL claim"
+grep -qE "durante/depois da liberação|antes de liberar" "$ROOT15/out.log" && bad "scenario 15: reports a pre-swap story after the swap" || ok "scenario 15: no pre-swap story after the swap"
+[ -s "$ROOT15/notify.log" ] && bad "scenario 15: paged an alarm although nothing was lost: $(cat "$ROOT15/notify.log")" || ok "scenario 15: no alarm — the local backup is not in doubt"
+( PATH="$ROOT15/bin:$PATH" DOLT_S3_BACKUP_LIB=1 . "$S3_BACKUP_SCRIPT"
+  if is_local_backup_lost_refusal "$(cat "$ROOT15/out.log")"; then echo "  FAIL: scenario 15: dolt-s3-backup.sh's 04:00 wrapper would raise the CRITICAL 'a reconstrução FALHOU' alarm for a run whose swap succeeded"
+  else echo "  PASS: scenario 15: the 04:00 wrapper does NOT classify this output as a lost local backup"; fi ) > "$ROOT15/classify.log" 2>&1
+cat "$ROOT15/classify.log"; grep -q "^  PASS:" "$ROOT15/classify.log" && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+pkill -f "reseed-selftest-s15.$$" 2>/dev/null
+rm -rf "$ROOT15" 2>/dev/null
+
+# S16: normal mode (both pre-swap flags 0 -- the handler's old fallthrough said "nada foi trocado").
+ROOT16="/tmp/reseed-selftest-s16.$$"
+setup_scenario "$ROOT16" 5 5 200; mk_notify_capture "$ROOT16"
+SIGNAL_DELAY=1 run_scenario_signalled "$ROOT16" TERM "antigo preservado em" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=5 FAKE_AWS_SYNC_SLEEP=120 DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY="$ROOT16/notify-capture"
+[ "$RC" -ne 0 ] && ok "scenario 16 (normal mode, TERM during the post-swap publish): exits non-zero" || bad "scenario 16: expected non-zero exit, got 0"
+[ -f "$ROOT16/city/.dolt-backup/hq/new-backup.bin" ] && [ -d "$ROOT16/city/.dolt-backup/hq.old" ] && ok "scenario 16: the new backup is in place and the old one is in hq.old" || bad "scenario 16: setup did not reach the swapped state"
+grep -q "INTERROMPIDO por TERM DEPOIS da troca" "$ROOT16/out.log" && grep -q "preservado em $ROOT16/city/.dolt-backup/hq.old" "$ROOT16/out.log" && ok "scenario 16: the log says AFTER the swap and where the old backup is" || bad "scenario 16: missing the 'DEPOIS da troca' line naming hq.old"
+grep -qE "nada foi trocado|antes de liberar|SEM BACKUP LOCAL" "$ROOT16/out.log" && bad "scenario 16: reports 'nothing was swapped' / lost backup after the swap" || ok "scenario 16: no false 'nada foi trocado'"
+[ -s "$ROOT16/notify.log" ] && bad "scenario 16: paged an alarm although nothing was lost" || ok "scenario 16: no alarm"
+pkill -f "reseed-selftest-s16.$$" 2>/dev/null
+rm -rf "$ROOT16" 2>/dev/null
+
+# S17: normal mode, the signal lands in the GAP between the two renames (the old backup already moved
+# to .old, the new not yet in place). The swap must finish before the signal is acted on: the db is
+# never left without its canonical path, and the log never describes a half-swap.
+ROOT17="/tmp/reseed-selftest-s17.$$"
+setup_scenario "$ROOT17" 5 5 200; mk_notify_capture "$ROOT17"
+cat > "$ROOT17/bin/mv" <<'MVEOF'
+#!/bin/bash
+# Holds RIGHT AFTER the swap's first rename ($1=<db> -> $2=<db>.old), once, so a scenario can signal in the gap.
+/bin/mv "$@"; rc=$?
+if [ "$rc" -eq 0 ] && [ -n "${FAKE_MV_GAP_SLEEP:-}" ] && [ "${2##*.}" = "old" ] && [ ! -e "${FAKE_MV_GAP_FLAG:-/nonexistent}" ]; then
+  : > "$FAKE_MV_GAP_FLAG"; echo "FAKE-MV-GAP: parado entre os dois mv"; sleep "$FAKE_MV_GAP_SLEEP"
+fi
+exit $rc
+MVEOF
+chmod +x "$ROOT17/bin/mv"
+run_scenario_signalled "$ROOT17" TERM "FAKE-MV-GAP" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=5 FAKE_MV_GAP_SLEEP=4 FAKE_MV_GAP_FLAG="$ROOT17/gap.flag" DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY="$ROOT17/notify-capture"
+[ "$RC" -ne 0 ] && ok "scenario 17 (normal mode, TERM between the two renames): exits non-zero" || bad "scenario 17: expected non-zero exit, got 0"
+[ -f "$ROOT17/city/.dolt-backup/hq/new-backup.bin" ] && [ -d "$ROOT17/city/.dolt-backup/hq.old" ] && [ ! -e "$ROOT17/city/.dolt-backup/hq.new" ] && ok "scenario 17: the swap FINISHED despite the signal — hq is the new backup, hq.old the old one, no hq.new" || bad "scenario 17: the swap was left half-done (hq absent or hq.new still there)"
+grep -q "INTERROMPIDO por TERM DEPOIS da troca" "$ROOT17/out.log" && ok "scenario 17: the signal is reported only after the swap, as 'DEPOIS da troca'" || bad "scenario 17: missing the 'DEPOIS da troca' line"
+grep -qE "nada foi trocado|antes de liberar|SEM BACKUP LOCAL" "$ROOT17/out.log" && bad "scenario 17: describes the half-swap as 'nada foi trocado' / lost backup" || ok "scenario 17: no false state report for the gap"
+[ -s "$ROOT17/notify.log" ] && bad "scenario 17: paged an alarm although nothing was lost" || ok "scenario 17: no alarm"
+pkill -f "reseed-selftest-s17.$$" 2>/dev/null
+rm -rf "$ROOT17" 2>/dev/null
+
+# S18 (gate-fix 1, low): after a cut `rm -rf` of the old backup, "what next" must be read off the DISK.
+# --release-manifestless-primary refuses a primary that HAS a manifest, and --promote-new-after-release
+# refuses while the primary path exists, so a half-removed primary that kept its manifest has no tool.
+HROOT="/tmp/reseed-selftest-s18.$$"
+_s18_run() { # <none|manifest|nomanifest> <old_freed_early> <new_verified>
+  ( rm -rf "$HROOT"; mkdir -p "$HROOT/hq.new"
+    case "$1" in
+      manifest)   mkdir -p "$HROOT/hq"; echo m > "$HROOT/hq/manifest" ;;
+      nomanifest) mkdir -p "$HROOT/hq"; echo x > "$HROOT/hq/leftover" ;;
+    esac
+    DB=hq; BACKUP_DIR="$HROOT/hq"; NEW_DIR="$HROOT/hq.new"; OLD_DIR="$HROOT/hq.old"
+    OLD_FREED_EARLY="$2"; OLD_RELEASE_STARTED=1; NEW_VERIFIED="$3"; SWAP_DONE=0
+    notify_fail() { echo "NOTIFY: $*"; }
+    _reseed_interrupted TERM ) 2>&1
+}
+OUT18="$(_s18_run none 1 0)"
+case "$OUT18" in *"--promote-new-after-release hq"*) ok "scenario 18a (primary gone): points at --promote-new-after-release" ;; *) bad "scenario 18a: should point at --promote-new-after-release" ;; esac
+case "$OUT18" in *"AINDA EXISTE"*) bad "scenario 18a: claims the primary still exists" ;; *) ok "scenario 18a: does not claim a primary that is not there" ;; esac
+case "$OUT18" in *"NOTIFY:"*) ok "scenario 18a: alarms (no valid local backup)" ;; *) bad "scenario 18a: no alarm for a db without a valid local backup" ;; esac
+OUT18="$(_s18_run manifest 0 0)"
+case "$OUT18" in *"AINDA EXISTE"*"nenhuma ferramenta cobre"*"NÃO apague"*) ok "scenario 18b (half-removed primary that KEPT its manifest): says no tool covers it, manual decision, do not delete .new" ;; *) bad "scenario 18b: should say there is no tool for a half-removed primary with a manifest" ;; esac
+case "$OUT18" in *"libere-o com"*) bad "scenario 18b: sends the reader down a tool that refuses this state (a dead end)" ;; *) ok "scenario 18b: does not send the reader down a dead end" ;; esac
+OUT18="$(_s18_run nomanifest 0 0)"
+case "$OUT18" in *"libere-o com"*"--release-manifestless-primary hq"*"--promote-new-after-release hq"*) ok "scenario 18c (leftovers without a manifest): release-manifestless-primary, then promote" ;; *) bad "scenario 18c: should send the reader through release-manifestless-primary and then promote" ;; esac
+OUT18="$(_s18_run none 1 1)"
+case "$OUT18" in *"foi verificado por restore, mas não chegou a ser promovido"*) ok "scenario 18d: a .new that HAD passed verification is not described as unverified" ;; *) bad "scenario 18d: should say the .new was verified" ;; esac
+OUT18="$(_s18_run none 1 0)"
+case "$OUT18" in *"NÃO verificada por restore"*) ok "scenario 18d: a .new that had NOT been verified says so" ;; *) bad "scenario 18d: should say the .new was not verified" ;; esac
+rm -rf "$HROOT" 2>/dev/null
 
 # ── Scenario 5: RESEED_ALLOW_LOW_DISK=0 → old refuse-only behavior preserved ──
 ROOT5="/tmp/reseed-selftest-s5.$$"
