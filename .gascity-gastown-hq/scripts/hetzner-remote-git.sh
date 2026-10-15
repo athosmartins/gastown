@@ -28,7 +28,7 @@ cmd_pull() {   # 1) pergunta ao espelho o filtro VIGENTE (gt-mirror-spec; sai co
   if spec=$(timeout 120 $pre -p "${BASH_REMATCH[3]}" "${BASH_REMATCH[1]}@${BASH_REMATCH[2]}" "gt-mirror-spec '${BASH_REMATCH[4]}'" 2> "$ef") \
      && [ "$(printf '%s\n' "$spec" | head -n 1)" = '/*' ] && [ "$(printf '%s\n' "$spec" | grep -c '^!')" -ge 20 ] && oid=$(printf '%s\n' "$spec" | git hash-object --stdin); then
     old=$(g config gtremote.sparseoid || true)
-    printf '%s\n' "$spec" > "$GR/$RIG/sparse.new" && printf '%s\n' "$spec" | sed -e '1d' -e 's/^!//' > "$GR/$RIG/deny.new" && mv "$GR/$RIG/sparse.new" "$GR/$RIG/sparse" && mv "$GR/$RIG/deny.new" "$GR/$RIG/deny" \
+    printf '%s\n' "$spec" > "$GR/$RIG/sparse.new.$$" && printf '%s\n' "$spec" | sed -e '1d' -e 's/^!//' > "$GR/$RIG/deny.new.$$" && mv "$GR/$RIG/sparse.new.$$" "$GR/$RIG/sparse" && mv "$GR/$RIG/deny.new.$$" "$GR/$RIG/deny" \
       && g config gtremote.sparseoid "$oid" && g config remote.origin.partialclonefilter "sparse:oid=$oid" || die 3 "não gravei o filtro recebido"
     [ -z "$old" ] || [ "$old" = "$oid" ] || echo "pull rig=$RIG AVISO: o filtro do espelho mudou ($old → $oid); rode scan: dado já baixado antes da mudança não some sozinho"
     if GIT_TERMINAL_PROMPT=0 timeout 1800 git -C "$GR/$RIG/repo.git" fetch -q --prune "--filter=sparse:oid=$oid" origin 2> "$ef"; then PULL=ok; rm -f "$GR/$RIG/last-pull-error"; fi
@@ -44,7 +44,7 @@ cmd_bootstrap() {
   local rig=$1 url=$2 key=$3 kh=$4 p mux="-o ControlMaster=auto -o ControlPersist=120 -o ControlPath=$GR/.cm-%C" sshc; shift 4
   [[ "$rig" =~ $RE_RIG ]] && [[ "$key" =~ $RE_PATH ]] && [[ "$kh" =~ $RE_PATH ]] || die 2 "rig, chave ou known_hosts com caractere que recuso"
   [[ "$url" =~ ^ssh://[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:[0-9]+/[a-z][a-z0-9_-]*\.git$ ]] || die 2 "url do espelho deve ser ssh://usuario@host:porta/<rig>.git"
-  [ -r "$key" ] && [ -r "$kh" ] || die 3 "chave ou known_hosts ilegível"
+  [ -r "$key" ] && [ -r "$kh" ] || die 3 "chave ou known_hosts ilegível"; for p in "$@"; do [[ "$p" =~ ^[a-z][a-z0-9_-]*/$ ]] || die 2 "prefixo inválido: $p (como no init do espelho: letras minúsculas, dígitos, _ e -, terminando em /)"; done
   [ -n "${GT_REMOTE_NOMUX:-}" ] && mux="-o ControlMaster=no"
   mkdir -p "$GR/$rig/wt" || die 3 "não criei $GR/$rig"; RIG=$rig
   [ -d "$GR/$rig/repo.git" ] || git init -q --bare "$GR/$rig/repo.git" || die 3 "git init falhou"
@@ -73,9 +73,12 @@ cmd_wt_rm() {
   kb=$(du -sk "$path" | cut -f1); g worktree remove --force "$path" && g worktree prune && [ ! -e "$path" ] && echo "wt-rm: $bead removido, liberou ${kb} KB" || die 3 "não removi $path"
 }
 cmd_status() {
-  local rigs r b o s; rigs=${1:-$(ls "$GR" 2>/dev/null | while read -r r; do [ -d "$GR/$r/repo.git" ] && echo "$r"; done)}; [ -n "$rigs" ] || die 2 "nenhum clone"
+  local rigs r b o s p pre; rigs=${1:-$(ls "$GR" 2>/dev/null | while read -r r; do [ -d "$GR/$r/repo.git" ] && echo "$r"; done)}; [ -n "$rigs" ] || die 2 "nenhum clone"
   for r in $rigs; do rig_of "$r"; lag_fields; echo "$RIG: main=$LAG_MAIN idade_do_origin_min=$LAG_MIN idade_do_commit_main_min=$MAIN_AGE último_pull_com_erro=[$(cut -d' ' -f2- "$GR/$RIG/last-pull-error" 2>/dev/null)]"
-    for b in $(g for-each-ref --format='%(refname:strip=2)' refs/heads/crew refs/heads/worker); do s=$(g rev-parse "refs/heads/$b"); o=$(g rev-parse -q --verify "refs/remotes/origin/$b" 2>/dev/null || true); p=$(g rev-parse -q --verify "refs/gt/published/$b" 2>/dev/null || true)
+    # os prefixos são os que o bootstrap deu a ESTE clone (crew/ worker/ + os do rig, em remote.origin.push): listar só crew/ e worker/ escondia branch pendente de outro prefixo
+    pre=$(g config --get-all remote.origin.push | sed -n 's|^refs/heads/\(.*\)\*:refs/heads/.*|refs/heads/\1|p'); [ -n "$pre" ] || pre="refs/heads/crew/ refs/heads/worker/"
+    # shellcheck disable=SC2086  # $pre: prefixos de ref sem espaço (o bootstrap só aceita [a-z0-9_-]/)
+    for b in $(g for-each-ref --format='%(refname:strip=2)' $pre); do s=$(g rev-parse "refs/heads/$b"); o=$(g rev-parse -q --verify "refs/remotes/origin/$b" 2>/dev/null || true); p=$(g rev-parse -q --verify "refs/gt/published/$b" 2>/dev/null || true)
       if [ "$s" = "$o" ] || [ "$s" = "$p" ]; then echo "  $b: publicada no origin"
       elif g merge-base --is-ancestor "$s" refs/remotes/origin/main 2>/dev/null; then echo "  $b: sem trabalho novo (já está no main)"
       else echo "  $b: PENDENTE (empurre ao espelho ou aguarde o mini publicar)"; fi; done; done

@@ -31,8 +31,15 @@ state_of() { printf '%s/state/%s' "$MH" "$1"; }
 rigs_of() {   # sem argumento: todos os espelhos; com argumento: ele, ou erro (chame como `x=$(rigs_of ..) || exit`: die dentro de $(...) só sai do subshell)
   local r; if [ -n "${1:-}" ]; then [[ "$1" =~ $RIG_RE ]] && [ -d "$(repo_of "$1")" ] || die 2 "espelho desconhecido: $1"; echo "$1"
   else for r in "$MH"/repos/*.git; do [ -d "$r" ] && basename "$r" .git; done; fi; }
-lock_take() { local d=$1 n=$2 p; while ! mkdir "$d" 2>/dev/null; do p=$(cat "$d/pid" 2>/dev/null)
-  if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$d"; continue; fi; [ "$n" -le 0 ] && return 1; n=$((n-1)); sleep 1; done; echo $$ > "$d/pid"; }
+lock_age() { local m; m=$(stat -f %m "$1" 2>/dev/null); case $m in ''|*[!0-9]*) m=$(stat -c %Y "$1" 2>/dev/null);; esac; case $m in ''|*[!0-9]*) return 1;; esac; echo $(( $(date +%s) - m )); }   # segundos desde o mkdir/pid (macOS: -f %m; GNU: -c %Y)
+lock_alive() { local c; kill -0 "$1" 2>/dev/null || return 1; c=$(ps -o command= -p "$1" 2>/dev/null); [ -z "$c" ] || grep -qF -- "${SELF##*/}" <<< "$c"; }   # pid vivo E é este script (pid reaproveitado por outro programa não segura a trava); ps mudo = não sei = vivo
+# lock_take <dir> <espera-s>: 0 peguei · 1 dono vivo dentro do prazo (concorrente normal) · 2 dono vivo há mais de HETZNER_MIRROR_LOCK_MAX s (parado?) · 3 erro MEU (disco, permissão, pid que não grava)
+lock_take() { local d=$1 n=$2 p a; while ! mkdir "$d" 2>/dev/null; do [ -d "$d" ] || return 3; p=$(cat "$d/pid" 2>/dev/null); a=$(lock_age "$d") || return 3
+  if { [ -z "$p" ] && [ "$a" -gt 30 ]; } || { [ -n "$p" ] && ! lock_alive "$p"; }; then rm -rf "$d" 2>/dev/null; [ ! -e "$d" ] || return 3; continue; fi   # sem pid há >30 s = o dono morreu entre o mkdir e a gravação
+  [ -n "$p" ] && [ "$a" -gt "${HETZNER_MIRROR_LOCK_MAX:-3600}" ] && return 2; [ "$n" -le 0 ] && return 1; n=$((n-1)); sleep 1; done
+  echo $$ > "$d/pid" 2>/dev/null || { rmdir "$d" 2>/dev/null; return 3; }; }
+lock_why() { case $1 in 1) echo "outro $2 em curso";; 2) echo "a trava de $2 está parada: o dono (pid $(cat "$3/pid" 2>/dev/null)) vive há mais de ${HETZNER_MIRROR_LOCK_MAX:-3600}s; mate-o ou apague $3";; *) echo "não consegui pegar a trava de $2 ($3): erro de disco/permissão aqui, não de outro $2";; esac; }
+proc_is() { local c; kill -0 "$1" 2>/dev/null && c=$(ps -o command= -p "$1" 2>/dev/null) && grep -qF -- "$2" <<< "$c"; }   # pid vivo E é o NOSSO processo (pid reaproveitado depois de reboot não vale como "rodando"); ps mudo = não sei = "parado", o lado visível
 tmo() { if command -v timeout >/dev/null; then timeout "$@"; else shift; "$@"; fi; }   # fetch/push sem limite penduram o lock; sem `timeout` na máquina, roda sem
 bg_run() { local log=$1; shift; ( trap '' HUP; exec "$@" ) >> "$log" 2>&1 < /dev/null & }   # sem nohup: o do macOS falha sem tty ("can't detach from console"), que é o caso do hook sob o sshd
 
@@ -41,7 +48,7 @@ sparse_spec() {   # sparse_spec [rig]
   local rig=${1:-} out c d x
   [ -r "$FILTER" ] || { echo "hetzner-mirror: filtro de dados ilegível ($FILTER): não gero o filtro do espelho" >&2; return 3; }
   out=$(awk '/^# SE.+O 1/{s=1;a=1;next} /^# SE.+O 2/{if(s)e=1;s=0;next}
-    s&&/^[+-] /{ if(/^\+/||/^- [!#]/||/[[:space:]]$/)b=1; else{print "!" substr($0,3);n++}; next }
+    s&&/^[+-] /{ if(/^\+/||/^- [!#]/||/[[:space:]]$/||/^[+-] .*\/./)b=1; else{print "!" substr($0,3);n++}; next }   # barra só no fim (pasta): o rsync casa regra com barra no meio pelo caminho todo, o git pela raiz
     s&&!/^#/&&!/^[[:space:]]*$/{b=1}
     END{ if(!a||!e||b||n<20)exit 3 }' "$FILTER") || { echo "hetzner-mirror: Seção 1 do filtro ausente, truncada ou com regra que não sei traduzir: recuso" >&2; return 3; }
   for c in '*.csv' '*.db' '*.parquet' '.env' '*.duckdb*'; do   # a Seção 1 sem estes é um filtro cortado/adulterado, não um filtro menor
@@ -74,10 +81,10 @@ cmd_init() {
   sparse_spec > /dev/null || exit 3; [ -r "$SCAN" ] || die 3 "varredura de conteúdo ausente ($SCAN)"
   r=$(repo_of "$rig"); mkdir -p "$MH/repos" "$(state_of "$rig")" && chmod 700 "$MH" || die 3 "não consegui criar $MH"
   if [ ! -d "$r" ]; then
-    if [ -n "$seed" ]; then "$GIT" clone -q --bare --local "$seed" "$r.new" 2>/dev/null || die 3 "seed ilegível: $seed"   # hardlink: não copia 400 MB
-      "$GIT" -C "$r.new" for-each-ref --format='delete %(refname)' | "$GIT" -C "$r.new" update-ref --stdin || die 3 "não limpei as refs do seed"   # só os OBJETOS do seed ficam
-    else "$GIT" init -q --bare "$r.new" || die 3 "git init falhou"; fi
-    mv "$r.new" "$r" || die 3 "não consegui publicar $r"
+    if [ -n "$seed" ]; then "$GIT" clone -q --bare --local "$seed" "$r.new.$$" 2>/dev/null || die 3 "seed ilegível: $seed"   # hardlink: não copia 400 MB
+      "$GIT" -C "$r.new.$$" for-each-ref --format='delete %(refname)' | "$GIT" -C "$r.new.$$" update-ref --stdin || die 3 "não limpei as refs do seed"   # só os OBJETOS do seed ficam
+    else "$GIT" init -q --bare "$r.new.$$" || die 3 "git init falhou"; fi
+    mv "$r.new.$$" "$r" || die 3 "não consegui publicar $r"
   fi
   c() { "$GIT" -C "$r" config "$@"; }
   c remote.origin.url "$url"; c --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'; c remote.origin.tagopt --no-tags
@@ -96,9 +103,10 @@ branch_pending() { local r=$1 b=$2 s o p; s=$("$GIT" -C "$r" rev-parse -q --veri
   o=$("$GIT" -C "$r" rev-parse -q --verify "refs/remotes/origin/$b" 2>/dev/null || true); p=$("$GIT" -C "$r" rev-parse -q --verify "refs/gt/published/$b" 2>/dev/null || true)
   [ "$s" != "$o" ] && [ "$s" != "$p" ]; }
 cmd_publish() {   # empurra ao origin, SEM force, cada branch aceita ainda pendente
-  local rigs rig r b s pfx p ok rc=0 prc err url; rigs=$(rigs_of "${1:-}") || exit $?
+  local rigs rig r b s pfx p ok rc=0 prc err url lk; rigs=$(rigs_of "${1:-}") || exit $?
   for rig in $rigs; do r=$(repo_of "$rig"); prc=0; url=$("$GIT" -C "$r" config --get remote.origin.url) || { echo "publish $rig: sem url do origin" >&2; rc=1; continue; }
-    lock_take "$r/gtm-publish.lock" "${HETZNER_MIRROR_PUBLISH_WAIT:-60}" || { echo "publish $rig: outro publish em curso (o próximo sweep refaz)" >&2; rc=1; continue; }
+    lock_take "$r/gtm-publish.lock" "${HETZNER_MIRROR_PUBLISH_WAIT:-60}"; lk=$?
+    [ $lk = 0 ] || { echo "publish $rig: $(lock_why $lk publish "$r/gtm-publish.lock")$([ $lk != 1 ] || echo " (o próximo sweep refaz)")" >&2; rc=1; continue; }
     if pfx=$("$GIT" -C "$r" config --get-all gtmirror.prefix); then
       for b in $("$GIT" -C "$r" for-each-ref --format='%(refname:strip=2)' refs/heads/); do
         ok=0; for p in $pfx; do case "$b" in "$p"?*) ok=1;; esac; done; [ $ok = 1 ] || continue
@@ -113,18 +121,19 @@ cmd_publish() {   # empurra ao origin, SEM force, cada branch aceita ainda pende
     rm -rf "$r/gtm-publish.lock"; rc=$((rc | prc))
   done; return $rc
 }
-cmd_scan_rig() {   # varre o conteúdo novo; só depois de TUDO gravado o filtro novo e o carimbo de cobertura entram (nessa ordem). rc 1 = o espelho NÃO serve até a próxima rodada
-  local rig=$1 r spec oid out; r=$(repo_of "$rig")
-  out=$(python3 -I "$SCAN" "$r" "$(state_of "$rig")" 2>&1) || { echo "sync $rig: $out" >&2; echo "sync $rig: varredura de conteúdo falhou: o espelho NÃO serve até a próxima rodada boa" >&2; return 1; }; echo "sync $rig: $out"
-  spec=$(sparse_spec "$rig") || { echo "sync $rig: filtro ilegível depois da varredura: o espelho NÃO serve" >&2; return 1; }
+serve_note() { mirror_ready "$1" && echo "as pontas não mudaram desde a última varredura boa: o espelho segue servindo" || echo "o espelho NÃO serve até uma rodada boa (a varredura não cobre as pontas atuais)"; }
+cmd_scan_rig() {   # varre o conteúdo novo; só depois de TUDO gravado o filtro novo e o carimbo de cobertura entram (nessa ordem). rc 1 = a cobertura NÃO avançou (as pontas novas, se houver, ficam sem serviço; as velhas seguem servidas)
+  local rig=$1 r spec oid out rc tm=${HETZNER_MIRROR_SCAN_TIMEOUT:-1800}; r=$(repo_of "$rig")
+  out=$(tmo "$tm" python3 -I "$SCAN" "$r" "$(state_of "$rig")" 2>&1) || { rc=$?; [ $rc != 124 ] || out="$out (cortada: passou de ${tm}s; a leitura de blobs grava a cada ${HETZNER_MIRROR_SCAN_CKPT:-30}s e a próxima rodada continua do último ponto gravado)"; echo "sync $rig: $out" >&2; echo "sync $rig: varredura de conteúdo falhou: $(serve_note "$r")" >&2; return 1; }; echo "sync $rig: $out"
+  spec=$(sparse_spec "$rig") || { echo "sync $rig: filtro ilegível depois da varredura: $(serve_note "$r")" >&2; return 1; }
   oid=$(printf '%s\n' "$spec" | "$GIT" -C "$r" hash-object -w --stdin) && "$GIT" -C "$r" config gtmirror.sparseoid "$oid" && "$GIT" -C "$r" config gtmirror.scannedtips "$(tips_hash "$r")" \
-    || { echo "sync $rig: não gravei o filtro/cobertura: o espelho NÃO serve" >&2; return 1; }
+    || { echo "sync $rig: não gravei o filtro/cobertura: $(serve_note "$r")" >&2; return 1; }
 }
 cmd_sync() {
-  local rigs rig r rc=0 err m; rigs=$(rigs_of "${1:-}") || exit $?
+  local rigs rig r rc=0 err m lk; rigs=$(rigs_of "${1:-}") || exit $?
   [ -n "$rigs" ] || { echo "sync: nenhum espelho (rode init)"; return 0; }
-  for rig in $rigs; do r=$(repo_of "$rig")
-    if lock_take "$r/gtm-fetch.lock" 0; then
+  for rig in $rigs; do r=$(repo_of "$rig"); lock_take "$r/gtm-fetch.lock" 0; lk=$?
+    if [ $lk = 0 ]; then
       if err=$(GIT_TERMINAL_PROMPT=0 tmo 900 "$GIT" -C "$r" fetch -q --prune --no-tags origin 2>&1); then
         if cmd_scan_rig "$rig"; then
           m=$("$GIT" -C "$r" rev-parse -q --verify refs/remotes/origin/main 2>/dev/null || echo desconhecido)
@@ -135,20 +144,22 @@ cmd_sync() {
         else rc=1; "$GIT" -C "$r" config gtmirror.lastfetcherror "$(iso) varredura de conteúdo falhou"; fi
       else rc=1; echo "sync $rig: origin inacessível: $(printf '%s' "$err" | tail -n 1)" >&2; "$GIT" -C "$r" config gtmirror.lastfetcherror "$(iso) $(printf '%s' "$err" | tail -n 1)"; fi
       rm -rf "$r/gtm-fetch.lock"
-    else echo "sync $rig: outro sync em curso"; fi
+    elif [ $lk = 1 ]; then echo "sync $rig: $(lock_why 1 sync)"   # concorrente normal: rc 0. Parada (2) e erro meu (3) NÃO são isso: rc 1 e erro registrado, para o status mostrar
+    else rc=1; err=$(lock_why $lk sync "$r/gtm-fetch.lock"); echo "sync $rig: $err" >&2; "$GIT" -C "$r" config gtmirror.lastfetcherror "$(iso) $err" 2>/dev/null; fi
     cmd_publish "$rig" || rc=1
   done; return $rc
 }
 cmd_status() {
-  local rigs rig r rc=0 t pend b pfx p spec rdy e n; rigs=$(rigs_of "${1:-}") || exit $?
+  local rigs rig r rc=0 t pend b pfx p spec rdy e n age mx=${HETZNER_MIRROR_STALE_MIN:-60}; rigs=$(rigs_of "${1:-}") || exit $?   # rc 0 só com tudo em dia: pronto, filtro igual, sem erro, nada pendente, último sync bom de menos de $mx min
   [ -n "$rigs" ] || { echo "status: nenhum espelho (rode init)"; return 1; }
   for rig in $rigs; do r=$(repo_of "$rig"); pend=""
     t=$("$GIT" -C "$r" log -1 --format=%ct refs/gt/synced 2>/dev/null); pfx=$("$GIT" -C "$r" config --get-all gtmirror.prefix) || pfx=""
     for b in $("$GIT" -C "$r" for-each-ref --format='%(refname:strip=2)' refs/heads/); do for p in $pfx; do case "$b" in "$p"?*) branch_pending "$r" "$b" && pend="$pend $b";; esac; done; done
-    spec=igual; [ "$(sparse_spec "$rig" 2>/dev/null | "$GIT" hash-object --stdin)" = "$("$GIT" -C "$r" config gtmirror.sparseoid)" ] || spec="DIFERENTE-ou-ilegível(rode sync)"
+    spec=igual; [ "$(sparse_spec "$rig" 2>/dev/null | "$GIT" hash-object --stdin)" = "$("$GIT" -C "$r" config gtmirror.sparseoid)" ] || { spec="DIFERENTE-ou-ilegível(rode sync)"; rc=1; }
+    age=desconhecido; [ -z "$t" ] || { age="$(( ($(date +%s) - t) / 60 )) min"; [ "${age% min}" -le "$mx" ] || { age="$age (VELHO: passou de $mx min)"; rc=1; }; }
     mirror_ready "$r" && rdy=sim || { rdy="NÃO (varredura não cobre as pontas: o servidor não é atendido)"; rc=1; }
     if [ -e "$(state_of "$rig")/deny-extra" ]; then n=$(grep -c . "$(state_of "$rig")/deny-extra" 2>/dev/null); [ $? -le 1 ] || { n="ILEGÍVEL"; rc=1; }; else n="0 (nenhuma varredura ainda)"; fi
-    echo "$rig: pronto=$rdy · último fetch+varredura bons há $([ -n "$t" ] && echo "$(( ($(date +%s) - t) / 60 )) min" || echo desconhecido) · caminhos negados por conteúdo=$n · prefixos=[$(echo $pfx)] · filtro=$spec · pendentes ao origin=[${pend# }]"
+    echo "$rig: pronto=$rdy · último fetch+varredura bons há $age · caminhos negados por conteúdo=$n · prefixos=[$(echo $pfx)] · filtro=$spec · pendentes ao origin=[${pend# }]"
     for e in lastfetcherror lastpublisherror; do [ -n "$("$GIT" -C "$r" config gtmirror.$e)" ] && { echo "  $e: $("$GIT" -C "$r" config gtmirror.$e)"; rc=1; }; done
     [ -z "$pend" ] && [ -n "$t" ] || rc=1
   done; return $rc
@@ -214,8 +225,8 @@ cmd_authorize() {   # authorize <arquivo.pub>: UMA chave ed25519 pura; grava a l
   want=$(printf 'restrict,from="127.0.0.1,::1",command="HETZNER_MIRROR_HOME=%s %s serve" ssh-ed25519 %s gt-mirror' "$MH" "$SELF" "$key")
   if grep -qF -- "$key" "$MH/authorized_keys"; then   # a chave já está: se o comando forçado aponta para OUTRO script (cópia de antes do merge), troca a linha; senão não mexe
     grep -qxF -- "$want" "$MH/authorized_keys" && { echo "authorize: a chave já está lá"; return 0; }
-    grep -vF -- "$key" "$MH/authorized_keys" > "$MH/authorized_keys.new"; [ $? -le 1 ] || { rm -f "$MH/authorized_keys.new"; die 3 "não consegui ler authorized_keys: não troco a linha"; }   # rc 1 = sobrou zero linhas (ok); rc 2 = erro de leitura
-    printf '%s\n' "$want" >> "$MH/authorized_keys.new" && chmod 600 "$MH/authorized_keys.new" && mv "$MH/authorized_keys.new" "$MH/authorized_keys" && echo "authorize: comando forçado atualizado" || die 3 "não consegui trocar a linha"
+    grep -vF -- "$key" "$MH/authorized_keys" > "$MH/authorized_keys.new.$$"; [ $? -le 1 ] || { rm -f "$MH/authorized_keys.new.$$"; die 3 "não consegui ler authorized_keys: não troco a linha"; }   # rc 1 = sobrou zero linhas (ok); rc 2 = erro de leitura
+    printf '%s\n' "$want" >> "$MH/authorized_keys.new.$$" && chmod 600 "$MH/authorized_keys.new.$$" && mv "$MH/authorized_keys.new.$$" "$MH/authorized_keys" && echo "authorize: comando forçado atualizado" || die 3 "não consegui trocar a linha"
     return 0
   fi
   printf '%s\n' "$want" >> "$MH/authorized_keys" && echo "authorize: ok"
@@ -252,8 +263,8 @@ cmd_sshd() {
   case "${1:-}" in
     run) exec /usr/sbin/sshd -D -e -f "$MH/sshd_config" ;;
     start) /usr/sbin/sshd -t -f "$MH/sshd_config" || die 3 "sshd_config recusado"; /usr/sbin/sshd -f "$MH/sshd_config" -E "$MH/sshd.log" && sleep 1 && cmd_sshd status ;;
-    stop) if [ -n "$p" ] && ps -o command= -p "$p" 2>/dev/null | grep -qF -- "$MH/sshd_config"; then kill "$p" && echo "sshd do espelho: parado"; else echo "sshd do espelho: não estava rodando"; fi ;;
-    status) if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then echo "sshd do espelho: rodando (pid $p, 127.0.0.1:$PORT)"; else echo "sshd do espelho: parado"; return 1; fi ;;
+    stop) if [ -n "$p" ] && proc_is "$p" "$MH/sshd_config"; then kill "$p" && echo "sshd do espelho: parado"; else echo "sshd do espelho: não estava rodando"; fi ;;
+    status) if [ -n "$p" ] && proc_is "$p" "$MH/sshd_config"; then echo "sshd do espelho: rodando (pid $p, 127.0.0.1:$PORT)"; else echo "sshd do espelho: parado"; return 1; fi ;;
     *) die 2 "uso: sshd start|stop|status|run" ;;
   esac
 }
@@ -263,9 +274,9 @@ cmd_tunnel() {   # túnel reverso: a porta do sshd do espelho aparece no loopbac
   pf="$MH/tunnel-$h.pid"; p=$(cat "$pf" 2>/dev/null)
   case "$a" in
     run) exec "${cmd[@]}" ;;
-    start) if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then echo "túnel $h: já rodando (pid $p)"; else mkdir -p "$MH"; bg_run "$MH/tunnel-$h.log" "${cmd[@]}"; echo $! > "$pf"; sleep 3; cmd_tunnel status "$h"; fi ;;
-    stop) if [ -n "$p" ] && ps -o command= -p "$p" 2>/dev/null | grep -qF -- "${cmd[*]}"; then kill "$p" && echo "túnel $h: parado"; else echo "túnel $h: não estava rodando"; fi; rm -f "$pf" ;;
-    status) if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then echo "túnel $h: rodando (pid $p)"; else echo "túnel $h: parado"; return 1; fi ;;
+    start) if [ -n "$p" ] && proc_is "$p" "${cmd[*]}"; then echo "túnel $h: já rodando (pid $p)"; else mkdir -p "$MH"; bg_run "$MH/tunnel-$h.log" "${cmd[@]}"; echo $! > "$pf"; sleep 3; cmd_tunnel status "$h"; fi ;;
+    stop) if [ -n "$p" ] && proc_is "$p" "${cmd[*]}"; then kill "$p" && echo "túnel $h: parado"; else echo "túnel $h: não estava rodando"; fi; rm -f "$pf" ;;
+    status) if [ -n "$p" ] && proc_is "$p" "${cmd[*]}"; then echo "túnel $h: rodando (pid $p)"; else echo "túnel $h: parado"; return 1; fi ;;
     *) die 2 "uso: tunnel start|stop|status|run <host-ssh>" ;;
   esac
 }

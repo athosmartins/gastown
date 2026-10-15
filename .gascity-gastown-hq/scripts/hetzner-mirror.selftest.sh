@@ -10,7 +10,7 @@ export HETZNER_MIRROR_HOME=$T/mh HETZNER_MIRROR_ALLOW_WORKTREE=1 HETZNER_MIRROR_
 export HETZNER_MIRROR_PORT; HETZNER_MIRROR_PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
 SRV_HOME=$T/srvhome; mkdir -p "$SRV_HOME/.ssh" "$T/srv"; FAKE=${HMST_FAKE:-}
 ok() { N=$((N+1)); echo "ok   $N - $1"; }
-bad() { N=$((N+1)); F=$((F+1)); echo "FAIL $N - $1"; [ -n "${2:-}" ] && echo "     $2" | head -n 6; }
+bad() { N=$((N+1)); F=$((F+1)); echo "FAIL $N - $1"; [ -z "${2:-}" ] || echo "     $2" | head -n 6; return 0; }   # sempre 0: `A && bad .. || ok ..` contava o caso duas vezes quando bad vinha sem evidência
 cleanup() { "$M" sshd stop > /dev/null 2>&1; [ -n "${HMST_KEEP:-}" ] && echo "(mantido: $T)" || rm -rf "$T"; }; trap cleanup EXIT
 rc_is() { local want=$1 desc=$2; shift 2; OUT=$("$@" 2>&1); local got=$?; [ "$got" = "$want" ] && ok "$desc" || bad "$desc (rc=$got, queria $want)" "$OUT"; }
 has() { printf '%s' "$OUT" | grep -qF -- "$1" && ok "$2" || bad "$2 (faltou: $1)" "$OUT"; }
@@ -30,7 +30,7 @@ fi
 
 # ── fixture: "GitHub" com dado de todo tipo no histórico; um clone de trabalho (seed) com branch local que NÃO pode vazar ─────────────────────────────────────────────────────────
 O=$T/origin.git; W=$T/work; git init -q --bare "$O"; git clone -q "$O" "$W" 2>/dev/null
-( cd "$W" && mkdir -p lib docs/notes auth src scripts .beads/backup data && echo 'print(1)' > lib/a.py && echo 'DATA-MARK leads' > docs/leads.csv && echo 'DATA-MARK sql' > lib/g.db && echo 'DATA-MARK env' > .env && echo 'DATA-MARK auth' > auth/k.py && echo ok > src/token_helper.py \
+( cd "$W" && mkdir -p lib docs/notes auth src scripts .beads/backup data && echo 'print(1)' > lib/a.py && echo 'DATA-MARK leads' > docs/leads.csv && echo 'DATA-MARK sql' > lib/g.db && echo 'DATA-MARK env' > .env && echo 'DATA-MARK auth' > auth/k.py && echo ok > src/token_helper.py && printf '\211PNG\r\n\032\n\0DATA-MARK png\n' > docs/shot.png \
   && echo '{"a":"DATA-MARK bead"}' > .beads/backup/b.jsonl && echo 'DATA-MARK data' > data/x.txt && { phones 30; echo 'DATA-MARK ab'; } > docs/notes/ab_results.json && { echo '# DATA-MARK gen'; echo 'NUMS = ['; phones 25 | sed 's/.*/  "&",/'; echo ']'; } > scripts/gen.py \
   && phones 5 > docs/notes/small.json && echo '# readme' > docs/README.md && echo 'same-bytes-dupe' > docs/dupe.txt && echo 'same-bytes-dupe' > .beads/backup/dupe.txt \
   && git add -A && git commit -qm c1 && git rm -q docs/leads.csv && echo 'print(2)' >> lib/a.py && git commit -qam c2 \
@@ -48,6 +48,7 @@ mkfilter "$T/f-nosec2" -e '/^# SEÇÃO 2/,$d'; HETZNER_MIRROR_FILTER=$T/f-nosec2
 mkfilter "$T/f-plus" -e 's/^- \.env$/+ .env/'; HETZNER_MIRROR_FILTER=$T/f-plus rc_is 3 "sparse: regra '+' na Seção 1 → recusa" "$M" sparse
 mkfilter "$T/f-nocsv" -e '/^- \*\.csv$/d'; HETZNER_MIRROR_FILTER=$T/f-nocsv rc_is 3 "sparse: filtro sem *.csv → recusa" "$M" sparse; has '*.csv' "sparse: diz qual regra faltou"
 mkfilter "$T/f-trail" -e 's/^- \*\.pem$/- *.pem /'; HETZNER_MIRROR_FILTER=$T/f-trail rc_is 3 "sparse: regra com espaço no fim → recusa" "$M" sparse
+mkfilter "$T/f-slash" -e 's/^- \*\.pem$/- sub\/x.pem/'; HETZNER_MIRROR_FILTER=$T/f-slash rc_is 3 "sparse: regra com barra no MEIO (o rsync casa no fim do caminho, o filtro daqui só na raiz) → recusa" "$M" sparse
 HETZNER_MIRROR_FILTER=$T/nao-existe rc_is 3 "sparse: filtro ausente → recusa" "$M" sparse
 awk '/^# SEÇÃO 1/{print; n=0; next} /^# SEÇÃO 2/{print; s=1} !s&&/^- /{n++; if(n>8)next} {print}' "$HERE/hetzner-rsync-filter.wa.txt" > "$T/f-few"; HETZNER_MIRROR_FILTER=$T/f-few rc_is 3 "sparse: poucas regras (<20) → recusa" "$M" sparse
 
@@ -57,7 +58,8 @@ SR0=$T/scan0; git init -q --bare "$SR0.git"; git clone -q "$SR0.git" "$SR0" 2>/d
 git -C "$SR0.git" update-ref refs/remotes/origin/main "$(git -C "$SR0.git" rev-parse main)"
 rc_is 0 "scan: 1ª rodada" python3 -I "$SC" "$SR0.git" "$ST0"; has '1 sinalizado' "scan: achou o arquivo com 30 telefones"
 [ "$(cat "$ST0/deny-extra")" = '!/leads.txt' ] && ok "scan: nega só o caminho sinalizado (few.txt com 3 telefones e ok.py passam)" || bad "scan: deny-extra" "$(cat "$ST0/deny-extra")"
-awk -F'\t' 'length($1) != 40 { bad = 1 } END { exit bad }' "$ST0/seen.tsv" && ok "scan: seen.tsv guarda oids INTEIROS (40), não abreviados" || bad "scan: seen.tsv com oid abreviado" "$(head -n 3 "$ST0/seen.tsv")"
+head -n 1 "$ST0/seen.tsv" | grep -q '^#ruler=' && ok "scan: seen.tsv começa com a versão da régua" || bad "scan: seen.tsv sem versão da régua" "$(head -n 1 "$ST0/seen.tsv")"
+awk -F'\t' '/^#/ { next } length($1) != 40 { bad = 1 } END { exit bad }' "$ST0/seen.tsv" && ok "scan: seen.tsv guarda oids INTEIROS (40), não abreviados" || bad "scan: seen.tsv com oid abreviado" "$(head -n 3 "$ST0/seen.tsv")"
 rc_is 0 "scan: repetir não relê nada" python3 -I "$SC" "$SR0.git" "$ST0"; has '0 blob(s) novos' "scan: 2ª rodada sem blob novo"
 ( cd "$SR0" && git mv leads.txt moved.txt && git commit -qm mv && git push -q origin main 2>&1 | tail -n 1 ); git -C "$SR0.git" update-ref refs/remotes/origin/main "$(git -C "$SR0.git" rev-parse main)"
 rc_is 0 "scan: rodada com renomeação" python3 -I "$SC" "$SR0.git" "$ST0"; grep -qxF '!/moved.txt' "$ST0/deny-extra" && grep -qxF '!/leads.txt' "$ST0/deny-extra" && ok "scan: o MESMO blob com outro nome também é negado (renomear não escapa)" || bad "scan: renomeação" "$(cat "$ST0/deny-extra")"
@@ -75,6 +77,36 @@ rc_is 0 "scan: arquivo que entra por TROCA DE TIPO (symlink → arquivo) é lido
 ( cd "$SR1" && phones 30 > $'u\342\200\250v.txt' && git add -A && git commit -qm u2028 && git push -q origin main 2>&1 | tail -n 1 ); git -C "$SR1.git" update-ref refs/remotes/origin/main "$(git -C "$SR1.git" rev-parse main)"; python3 -I "$SC" "$SR1.git" "$ST1" > /dev/null; DE1=$(cat "$ST1/deny-extra"); python3 -I "$SC" "$SR1.git" "$ST1" > /dev/null   # U+2028 passa pelo guarda de caminho; o git lê o filtro só por \n
 [ "$(cat "$ST1/deny-extra")" = "$DE1" ] && grep -qxF $'!/u\342\200\250v.txt' "$ST1/deny-extra" && ok "scan: nome com U+2028 sobrevive à releitura do deny-extra (1 regra, não 2 quebradas)" || bad "scan: U+2028 partiu o deny-extra" "$(cat "$ST1/deny-extra")"
 mv "$ST1/deny-extra" "$T/de1.bak"; rc_is 3 "scan: seen.tsv tem blob sinalizado mas o deny-extra sumiu → recusa (estado sumido não é 'nada negado')" python3 -I "$SC" "$SR1.git" "$ST1"; [ ! -s "$ST1/deny-extra" ] && ok "scan: não regravou um deny-extra vazio" || bad "scan: regravou o deny-extra"; mv "$T/de1.bak" "$ST1/deny-extra"
+# conteúdo que o varredor NÃO sabe ler (UTF-16, zip, imagem, PDF, latin-1) é "não sei"; não saber é sinalizado (estado inerte), nunca "limpo". Nomes neutros de propósito: só o CONTEÚDO pode pegá-los
+SR2=$T/scan2; ST2=$T/scan2-state; git init -q --bare "$SR2.git"; git clone -q "$SR2.git" "$SR2" 2>/dev/null
+( cd "$SR2" && mkdir -p assets && phones 30 | iconv -f UTF-8 -t UTF-16 > u16.txt && phones 30 | iconv -f UTF-8 -t UTF-16LE > u16le.txt && phones 30 | python3 -I -c 'import sys,zipfile;z=zipfile.ZipFile("neutral.zip","w",zipfile.ZIP_DEFLATED);z.writestr("p.txt",sys.stdin.read());z.close()' \
+  && printf '\211PNG\r\n\032\n\0neutral' > assets/shot.png && { printf '%%PDF-1.4\n'; phones 3; } > doc.pdf && printf 'caf\351\n' > latin1.txt && printf 'a\303\247\303\243o\n' > readme.txt && { printf '\357\273\277'; phones 3; } > bom.txt \
+  && git add -A && git commit -qm opaque && git branch -M main && git push -q origin main 2>&1 | tail -n 1 ); git -C "$SR2.git" update-ref refs/remotes/origin/main "$(git -C "$SR2.git" rev-parse main)"
+rc_is 0 "scan: conteúdo ilegível → rodada completa" python3 -I "$SC" "$SR2.git" "$ST2"; has '6 sinalizado' "scan: 6 blobs sinalizados (UTF-16 com e sem BOM, zip, PNG, PDF, latin-1)"
+for f in u16.txt u16le.txt neutral.zip assets/shot.png doc.pdf latin1.txt; do grep -qxF "!/$f" "$ST2/deny-extra" && ok "scan: $f (o varredor não sabe ler) é negado" || bad "scan: $f ilegível passou como limpo" "$(cat "$ST2/deny-extra")"; done
+for f in readme.txt bom.txt; do grep -qxF "!/$f" "$ST2/deny-extra" && bad "scan: texto UTF-8 legível ($f) negado à toa" || ok "scan: texto UTF-8 legível ($f: acento, BOM, 3 telefones) NÃO é negado"; done
+grep -v '^#' "$ST2/seen.tsv" | awk -F'\t' '{ print $1 "\t0" }' > "$T/seen-old"; mv "$T/seen-old" "$ST2/seen.tsv"; : > "$ST2/deny-extra"   # o estado que a régua ANTERIOR deixou: sem versão, tudo "limpo"
+rc_is 0 "scan: seen.tsv de outra régua (sem a versão atual) não vale: lê tudo de novo" python3 -I "$SC" "$SR2.git" "$ST2"; has '6 sinalizado' "scan: releu e achou os 6"; grep -qxF '!/assets/shot.png' "$ST2/deny-extra" && ok "scan: o deny-extra voltou com o PNG" || bad "scan: régua nova não releu" "$(cat "$ST2/deny-extra")"
+# a cobertura que o ESPELHO guarda (gtmirror.scannedtips) cai quando o estado do varredor não vale: senão o espelho seguiria servindo, com o filtro velho, durante a releitura inteira
+git -C "$SR2.git" config gtmirror.scannedtips old-stamp; grep -v '^#' "$ST2/seen.tsv" > "$T/seen-nohdr"; mv "$T/seen-nohdr" "$ST2/seen.tsv"
+rc_is 0 "scan: estado sem versão → relê" python3 -I "$SC" "$SR2.git" "$ST2"; git -C "$SR2.git" config gtmirror.scannedtips > /dev/null && bad "scan: o selo de cobertura antigo sobreviveu ao estado inválido" || ok "scan: estado inválido derruba o selo de cobertura do espelho (fica inerte até a varredura nova)"
+git -C "$SR2.git" config gtmirror.scannedtips keep-stamp; rc_is 0 "scan: estado válido: repetir" python3 -I "$SC" "$SR2.git" "$ST2"; [ "$(git -C "$SR2.git" config gtmirror.scannedtips)" = keep-stamp ] && ok "scan: estado válido NÃO mexe no selo" || bad "scan: mexeu no selo com estado válido"; git -C "$SR2.git" config --unset gtmirror.scannedtips
+# a varredura da história inteira pode passar do corte do sync (carga alta): cada rodada deixa o que já leu (seen.tsv, a cada HETZNER_MIRROR_SCAN_CKPT s) e a seguinte continua dali, em vez de recomeçar do zero para sempre.
+# Fila por oid: a.txt (limpo) < caminho-que-o-filtro-não-nega < shot.png (PNG). O corte cai no meio, com o PNG por ler; o estado é o da régua ANTIGA, com scanned-tips velho (o que a produção tem hoje)
+SR3=$T/scan3; ST3=$T/scan3-state; git init -q --bare "$SR3.git"; git clone -q "$SR3.git" "$SR3" 2>/dev/null; k=0
+while :; do k=$((k+1)); oa=$(printf 'code%s\n' $k | git hash-object --stdin); op=$({ phones 30; echo "v$k"; } | git hash-object --stdin); og=$(printf '\211PNG\r\n\032\n\0neutral%s' $k | git hash-object --stdin)
+  [ "$(printf '%s\n' "$oa" "$op" "$og" | LC_ALL=C sort | tr '\n' ' ')" = "$oa $op $og " ] && break; done
+( cd "$SR3" && printf 'code%s\n' $k > a.txt && printf '\211PNG\r\n\032\n\0neutral%s' $k > shot.png && git add -A && git commit -qm c1 && git branch -M main && git push -q origin main 2>&1 | tail -n 1 ); C1=$(git -C "$SR3.git" rev-parse main); git -C "$SR3.git" update-ref refs/remotes/origin/main "$C1"
+rc_is 0 "scan: histórico de 2 blobs (a.txt, shot.png) → rodada completa" python3 -I "$SC" "$SR3.git" "$ST3"
+grep -v '^#' "$ST3/seen.tsv" | awk -F'\t' '{ print $1 "\t0" }' > "$T/seen-old3"; mv "$T/seen-old3" "$ST3/seen.tsv"; : > "$ST3/deny-extra"   # a régua anterior: sem versão, tudo "limpo"; o scanned-tips dela continua lá
+( cd "$SR3" && { phones 30; echo "v$k"; } > $'bad\nname.txt' && git add -A && git commit -qm nl && git push -q origin main 2>&1 | tail -n 1 ); git -C "$SR3.git" update-ref refs/remotes/origin/main "$(git -C "$SR3.git" rev-parse main)"
+HETZNER_MIRROR_SCAN_CKPT=0 rc_is 3 "scan: rodada que para no meio da fila (caminho que o filtro não nega) → rc 3" python3 -I "$SC" "$SR3.git" "$ST3"
+{ [ "$(grep -vc '^#' "$ST3/seen.tsv")" = 1 ] && head -n 1 "$ST3/seen.tsv" | grep -q '^#ruler='; } && ok "scan: o que foi lido antes de parar ficou gravado (1 blob, régua nova)" || bad "scan: parar no meio jogou o progresso fora" "$(cat "$ST3/seen.tsv")"
+[ ! -e "$ST3/scanned-tips" ] && ok "scan: estado de régua antiga derruba também o scanned-tips do varredor (senão o ^velho esconderia a história não relida)" || bad "scan: scanned-tips da régua antiga sobreviveu" "$(cat "$ST3/scanned-tips")"
+: > "$ST3/seen.tsv.new.4242"; git -C "$SR3.git" update-ref refs/remotes/origin/main "$C1"
+rc_is 0 "scan: sem o caminho que travava, a rodada seguinte continua dali" python3 -I "$SC" "$SR3.git" "$ST3"; has '1 blob(s) novos' "scan: leu só o que faltava (1 blob), não recomeçou do zero"
+grep -qxF '!/shot.png' "$ST3/deny-extra" && ok "scan: o PNG que ficou por ler no corte é negado (a régua nova valeu para a história inteira)" || bad "scan: PNG por ler escapou" "$(cat "$ST3/deny-extra")"
+[ ! -e "$ST3/seen.tsv.new.4242" ] && ok "scan: temporário que um corte deixou no estado é recolhido" || bad "scan: temporário de corte ficou no estado"
 
 # ── C. init ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 HETZNER_MIRROR_FILTER=$T/f-nocsv rc_is 3 "init: filtro ruim → recusa" "$M" init wa "$O"; [ ! -e "$T/mh/repos/wa.git" ] && ok "init: filtro ruim não cria nada" || bad "init: criou espelho com filtro ruim"
@@ -102,6 +134,7 @@ rc_is 0 "sync: ok (varre o histórico)" "$M" sync wa; has 'sinalizado' "sync: re
 [ -z "$(gx "$MR" for-each-ref refs/heads)" ] && ok "sync: o espelho não ganha refs/heads (branch do origin fica em refs/remotes)" || bad "sync: refs/heads apareceu"
 rc_is 0 "status: sincronizado e pronto" "$M" status wa; has 'pronto=sim' "status: pronto=sim"
 DX=$T/mh/state/wa/deny-extra; grep -qxF '!/docs/notes/ab_results.json' "$DX" && grep -qxF '!/docs/notes/renamed_results.json' "$DX" && grep -qxF '!/scripts/gen.py' "$DX" && ok "varredura: nega nome neutro (.json), o MESMO blob renomeado e código com lista (.py)" || bad "varredura: deny-extra" "$(cat "$DX")"
+grep -qxF '!/docs/shot.png' "$DX" && ok "varredura: PNG de nome neutro (conteúdo que o varredor não lê) é negado" || bad "varredura: PNG de nome neutro passou" "$(cat "$DX")"
 ! grep -q 'small.json' "$DX" && ! grep -q 'a.py' "$DX" && ok "varredura: arquivo com 5 telefones e código comum NÃO são negados" || bad "varredura: negou demais" "$(cat "$DX")"
 rc_is 0 "sparse <rig>: o filtro do rig inclui os caminhos da varredura" "$M" sparse wa; has '!/scripts/gen.py' "sparse <rig>: tem gen.py"
 chmod 000 "$DX"; rc_is 1 "status: deny-extra ilegível → rc 1 e diz ILEGÍVEL (não '0 negados')" "$M" status wa; has 'ILEGÍVEL' "status: mostra ILEGÍVEL"; rc_is 3 "sparse <rig>: deny-extra ilegível → recusa" "$M" sparse wa; chmod 644 "$DX"
@@ -111,6 +144,35 @@ rc_is 1 "sync: origin fora → rc 1" "$M" sync wa; has 'inacessível' "sync: err
 rc_is 1 "status: origin fora → rc 1 com o erro" "$M" status wa; has lastfetcherror "status: mostra o erro de fetch"
 SSH_ORIGINAL_COMMAND="gt-mirror-spec 'wa'" "$M" serve > /dev/null 2>&1; [ $? = 0 ] && ok "serve: origin fora mas pontas já varridas → o spec continua servindo (o servidor não depende do origin)" || bad "serve: spec caiu com o origin fora"
 mv "$O.off" "$O"; sleep 1; rc_is 0 "sync: origin de volta → ok" "$M" sync wa; rc_is 0 "status: erro some depois do fetch bom" "$M" status wa
+# a trava do sync: de quem é, e o que "outro sync em curso" quer dizer (antes: pid-less nunca recolhida, pid reaproveitado segurava, e um sync PARADO saía rc 0 igual a um concorrente normal)
+LK=$MR/gtm-fetch.lock; LKP=$MR/gtm-publish.lock
+mkdir "$LK"; rc_is 0 "trava: sem pid e NOVA (o dono pode estar gravando o pid agora) é respeitada" "$M" sync wa; has 'outro sync em curso' "trava: diz que há outro sync"; rmdir "$LK"
+mkdir "$LK"; touch -t 202001010000 "$LK"; rc_is 0 "trava: sem pid e VELHA (o dono morreu entre o mkdir e a gravação) é recolhida e o sync roda" "$M" sync wa; has 'sync wa: ok' "trava: o sync rodou"; [ ! -e "$LK" ] && ok "trava: não ficou nada" || { bad "trava: ficou"; rm -rf "$LK"; }
+sleep 300 & SLP=$!; mkdir "$LK"; echo "$SLP" > "$LK/pid"; rc_is 0 "trava: pid VIVO mas de outro programa (pid reaproveitado) não segura a trava" "$M" sync wa; has 'sync wa: ok' "trava: o sync rodou apesar do pid vivo"; kill "$SLP" 2> /dev/null; rm -rf "$LK"
+bash -c 'exec -a hetzner-mirror.sh sleep 300' & HOLD=$!; mkdir "$LK"; echo "$HOLD" > "$LK/pid"; sleep 1
+rc_is 0 "trava: dono vivo e legítimo, há pouco tempo → 'outro sync em curso', rc 0" "$M" sync wa; has 'outro sync em curso' "trava: sync concorrente normal"
+touch -t 202001010000 "$LK"; rc_is 1 "trava: o MESMO dono há muito tempo (travado?) → rc 1, não o rc 0 de um sync concorrente normal" "$M" sync wa; has 'parada' "trava: diz que passou do esperado"; hasnt 'outro sync em curso' "trava: não finge ser concorrente normal"
+rc_is 1 "status: trava parada deixa o erro registrado" "$M" status wa; has lastfetcherror "status: mostra o erro da trava"; kill "$HOLD" 2> /dev/null; rm -rf "$LK"; rc_is 0 "sync: sem a trava, volta ao normal e limpa o erro" "$M" sync wa; rc_is 0 "status: limpo" "$M" status wa
+rc_is 1 "trava: o pid não grava (umask) → publish rc 1" bash -c 'umask 0577; exec "$0" publish wa' "$M"; has 'não consegui pegar a trava' "trava: diz que o erro é meu"; hasnt 'outro publish em curso' "trava: não acusa 'outro publish' quando o erro é meu"
+[ ! -e "$LKP" ] && ok "trava: o pid que não grava não deixa trava órfã" || { bad "trava: ficou trava sem pid"; chmod 700 "$LKP"; rm -rf "$LKP"; }
+if [ "$(id -u)" != 0 ]; then chmod 555 "$MR"; rc_is 1 "trava: não consigo criar a trava (espelho sem escrita) → rc 1" "$M" sync wa; hasnt 'outro sync em curso' "trava: erro de disco não é 'outro sync em curso'"; chmod 755 "$MR"; fi
+printf 'import time\ntime.sleep(60)\n' > "$T/hangscan.py"; T0=$SECONDS
+HETZNER_MIRROR_SCAN=$T/hangscan.py HETZNER_MIRROR_SCAN_TIMEOUT=3 rc_is 1 "sync: varredura que PENDURA é cortada no limite → rc 1" "$M" sync wa; [ $((SECONDS - T0)) -lt 30 ] && ok "sync: o corte veio em segundos, não em 60" || bad "sync: esperou $((SECONDS - T0)) s pela varredura"
+rc_is 0 "sync: depois do corte volta ao normal" "$M" sync wa; rc_is 0 "status: limpo depois do corte" "$M" status wa
+# status: rc 0 só com tudo em dia (antes: rc 0 com o último sync bom de 30 dias atrás e com o filtro DIFERENTE do gravado)
+STAMP_OK=$(gx "$MR" rev-parse refs/gt/synced); gx "$MR" update-ref refs/gt/synced "$(GIT_COMMITTER_DATE='2020-01-01T00:00:00Z' GIT_AUTHOR_DATE='2020-01-01T00:00:00Z' gx "$MR" commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -m old)"
+rc_is 1 "status: último sync bom velho demais → rc 1, não 'em dia'" "$M" status wa; has 'VELHO' "status: diz VELHO"; gx "$MR" update-ref refs/gt/synced "$STAMP_OK"; rc_is 0 "status: com o carimbo de volta, rc 0" "$M" status wa
+mkfilter "$T/f-nopem" -e '/^- \*\.pem$/d'; HETZNER_MIRROR_FILTER=$T/f-nopem rc_is 1 "status: filtro vigente ≠ o gravado → rc 1" "$M" status wa; has 'DIFERENTE' "status: diz DIFERENTE"
+# pid reaproveitado (reboot) não é "rodando": sshd status e tunnel start/status conferem o PROCESSO, não só o pid
+sleep 300 & RP=$!; mkdir -p "$T/mh-reuse"; echo "$RP" > "$T/mh-reuse/sshd.pid"
+HETZNER_MIRROR_HOME=$T/mh-reuse rc_is 1 "sshd status: pid vivo de OUTRO programa não é 'rodando'" "$M" sshd status; has 'parado' "sshd status: diz parado"
+echo "$RP" > "$T/mh/tunnel-reuse.invalid.pid"; rc_is 1 "tunnel status: pid vivo de outro programa → parado, rc 1" "$M" tunnel status reuse.invalid; has 'parado' "tunnel status: diz parado"
+echo "$RP" > "$T/mh/tunnel-reuse.invalid.pid"; rc_is 1 "tunnel start: pid reaproveitado não impede de subir (o host não existe: sobe e cai)" "$M" tunnel start reuse.invalid; hasnt 'já rodando' "tunnel start: não diz 'já rodando' por causa do pid de outro programa"; kill "$RP" 2> /dev/null; rm -f "$T/mh/tunnel-reuse.invalid.pid"
+# o limiar do varredor do espelho é o do hetzner-pii-scan.py (o main dele, nph/ncp): um muda sem o outro e este caso quebra
+grep -q '^PH_MIN, CP_MIN = 20, 3 ' "$SC" && grep -q 'nph, ncp = None, None, 20, 3$' "$HERE/hetzner-pii-scan.py" && ok "limiares: 20 telefones / 3 CPFs iguais nos dois varredores" || bad "limiares: os dois varredores divergem" "$(grep -n 'PH_MIN, CP_MIN =' "$SC"; grep -n 'nph, ncp =' "$HERE/hetzner-pii-scan.py")"
+# temporário com nome FIXO (.new) em caminho que pode rodar em dobro: dois processos escreveriam no mesmo arquivo
+grep -nE '[A-Za-z_]\.new"' "$M" "$R" "$SC" > "$T/fixednew"; [ ! -s "$T/fixednew" ] && ok "temporários: nenhum nome fixo '.new' (todos levam o pid)" || bad "temporários: nome fixo" "$(cat "$T/fixednew")"
+ls "$ST2" | grep -q '\.new' && bad "scan: sobrou temporário no estado" "$(ls "$ST2")" || ok "scan: nenhum temporário sobrando no estado"
 
 # ── E. serve: o que a chave consegue rodar ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 serve() { SSH_ORIGINAL_COMMAND="$1" "$M" serve < /dev/null; }
@@ -148,7 +210,8 @@ if [ -z "$FAKE" ]; then
   OUT=$(ssh -F /dev/null -p "$PORT" -o PubkeyAuthentication=no -o PreferredAuthentications=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KH" -v "$U@127.0.0.1" true 2>&1 < /dev/null)
   printf '%s' "$OUT" | grep -qE 'Authentications that can continue: publickey[[:space:]]*$' && ok "ssh: só publickey é oferecido (sem senha, sem keyboard-interactive)" || bad "ssh: métodos oferecidos" "$(printf '%s' "$OUT" | grep 'can continue')"
 else GS=$T/fakessh; : > "$KH"; fi
-rc_is 0 "bootstrap: clone parcial pelo espelho" srv bootstrap wa "$URL" "$KEY" "$KH"; has 'resultado=ok' "bootstrap: o pull inicial deu certo"
+rc_is 2 "bootstrap: prefixo inválido (maiúscula/espaço) é recusado, como no init do espelho" srv bootstrap wa "$URL" "$KEY" "$KH" "Bad Prefix/"; has "prefixo inválido" "bootstrap: diz qual prefixo"
+rc_is 0 "bootstrap: clone parcial pelo espelho" srv bootstrap wa "$URL" "$KEY" "$KH" feat/; has 'resultado=ok' "bootstrap: o pull inicial deu certo"
 SR=$T/srv/git/wa/repo.git
 gx "$SR" rev-parse -q --verify refs/remotes/origin/main > /dev/null && ok "clone: tem origin/main" || bad "clone: sem origin/main"
 [ "$(gx "$SR" config --get-regexp '^remote\..*\.url$' | awk '{print $2}')" = "$URL" ] && ok "clone: o ÚNICO remoto é o espelho" || bad "clone: remotos" "$(gx "$SR" config --get-regexp '^remote\..*\.url$')"
@@ -252,6 +315,8 @@ OUT=$(push origin worker/ga-t1); [ "$(gx "$MR" rev-parse refs/heads/worker/ga-t1
 wait_for 30 "[ -n \"\$(git -C '$MR' config gtmirror.lastpublisherror)\" ]" && ok "origin fora: o erro de publicação fica registrado" || bad "origin fora: sem erro registrado" "$(tail -n 3 "$T/mh/publish.log")"
 rc_is 1 "status: pendente é rc 1" "$M" status wa; has 'worker/ga-t1' "status: lista a branch pendente"; has lastpublisherror "status: mostra o erro"; has 'pronto=sim' "status: pendência de publicação não derruba o 'pronto'"
 OUT=$(srv status wa); has PENDENTE "servidor status: a branch aparece PENDENTE"
+FZ=$(gx "$SR" commit-tree "$(gx "$SR" rev-parse 'refs/remotes/origin/main^{tree}')" -p refs/remotes/origin/main -m fz); gx "$SR" update-ref refs/heads/feat/zz "$FZ"
+OUT=$(srv status wa); has 'feat/zz: PENDENTE' "servidor status: branch de prefixo do rig (feat/) também é listada, não só crew/ e worker/"; gx "$SR" update-ref -d refs/heads/feat/zz
 mv "$O.off" "$O"; rc_is 0 "origin de volta: sync publica" "$M" sync wa; [ "$(gx "$O" rev-parse refs/heads/worker/ga-t1)" = "$LATE" ] && ok "origin de volta: a branch chegou, sem perder nada" || bad "origin de volta: não chegou"
 rc_is 0 "status: limpo depois de publicar" "$M" status wa; rc_is 0 "pull: servidor puxa" srv pull wa; OUT=$(srv status wa); has 'worker/ga-t1: publicada no origin' "servidor status: agora publicada"; has 'sem trabalho novo' "servidor status: branch sem commit novo não é pendente"
 
