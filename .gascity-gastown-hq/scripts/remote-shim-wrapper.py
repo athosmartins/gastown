@@ -30,6 +30,8 @@ LISTA PERMITIDA
 POR QUE RECUSA EM VEZ DE ADAPTAR (está na lista / não está / não consegui saber — o último não vira "está")
   Config ilegível, routes.jsonl ilegível, log de auditoria que não grava, identidade fora do padrão, ferramenta que não achei → não executa.
   A requisição é registrada (hash do argv, nunca o texto; uma RECUSA grava o motivo, que pode citar até 60 caracteres do argumento) ANTES de rodar; sem rastro não há execução.
+  Todo pedido que chegou a decidir "roda" fecha o log com uma linha `done …` (rc=N, nao-iniciado, killed sig=N, unknown): a linha `ok` sozinha não quer dizer "rodou".
+  Depois que o filho existe NADA vira "RECUSADO": falha do próprio wrapper nessa fase sai 125 ("iniciado, desfecho desconhecido"), porque quem lê 77 repete o pedido.
 
 SUBCOMANDOS
   serve --config CONF                    forced-command (SSH_ORIGINAL_COMMAND na entrada)
@@ -39,7 +41,8 @@ SUBCOMANDOS
 CONFIG (JSON): {"city": "/abs", "identity_pattern": "regex", "nudge_pattern": "regex", "gate_done_bin": "/abs"|null, "log": "/abs", "timeout_s": 300, "bin_dirs": ["/abs"]}
   Só `city` e `identity_pattern` são obrigatórios (sem `nudge_pattern` o nudge é recusado); chave desconhecida é erro.
 
-CÓDIGOS: o do comando executado · 77 recusado · 124 estourou timeout_s · 126 não consegui executar · 127 ferramenta não encontrada · 2 uso.
+CÓDIGOS: o do comando executado · 77 recusado (nada executou) · 124 estourou timeout_s · 125 o comando FOI iniciado e o wrapper falhou antes de saber o desfecho (pode ter rodado) ·
+  126 não consegui executar · 127 ferramenta não encontrada · 2 uso. O código do próprio comando pode coincidir com estes; o stderr (`remote-shim-wrapper: …`) e o log dizem de quem é.
 """
 from __future__ import annotations
 
@@ -57,7 +60,8 @@ import sys
 import time
 from pathlib import Path
 
-REFUSED, TIMEOUT, NOEXEC, NOTFOUND = 77, 124, 126, 127
+REFUSED, TIMEOUT, UNKNOWN, NOEXEC, NOTFOUND = 77, 124, 125, 126, 127
+_STARTED: list = []  # o filho, assim que existe: o handler de sinal e o último catch-all precisam achá-lo (e saber que, daqui em diante, nada é "recusado")
 PROTO = "rs1"
 MAX_CMD, MAX_ARGS, MAX_TEXT = 200_000, 64, 20_000
 ALLOW_META = ("athos.", "story.")  # as únicas chaves que fórmula/agente de worker escreve (grep em 14/10); gc./pilot./gate./delivery. são plano de controle, o resto é desconhecido: recusa
@@ -85,8 +89,8 @@ def no_surrogate(s: str) -> bool:  # surrogate solto vira byte cru (0x80-0xFF) n
     return re.search(r"[\ud800-\udfff]", s) is None
 
 
-def v_line(s: str) -> bool:  # texto que vira digitação no terminal de OUTRA sessão: sem ESC, CR, LF nem outro controle C0/C1 (só tab)
-    return v_text(s) and not re.search(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]", s)
+def v_line(s: str) -> bool:  # texto que vira digitação no terminal de OUTRA sessão: nenhum controle C0/C1 (TAB, ESC, CR, LF inclusive), nem separador de linha Unicode, nem controle bidi
+    return v_text(s) and not re.search(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]", s)
 
 
 def v_kv(s: str) -> bool:
@@ -208,8 +212,9 @@ def load_config(path: str) -> dict:
     except (OSError, ValueError) as e:
         raise Refused(f"config ilegível ({path}): {e!r}")
     ok = {"city", "identity_pattern", "nudge_pattern", "gate_done_bin", "log", "timeout_s", "bin_dirs"}
-    if set(raw) - ok or not {"city", "identity_pattern"} <= set(raw):
-        raise Refused(f"config com chave desconhecida ou sem city/identity_pattern: {sorted(set(raw) ^ ok)[:8]}")
+    unknown, missing = sorted(set(raw) - ok), sorted({"city", "identity_pattern"} - set(raw))
+    if unknown or missing:
+        raise Refused("config: " + "; ".join(([f"chave desconhecida {unknown[:8]}"] if unknown else []) + ([f"sem city/identity_pattern, falta {missing}"] if missing else [])))
     home = pwd.getpwuid(os.getuid()).pw_dir
     cfg = {"gate_done_bin": None, "log": f"{home}/.gastown/logs/remote-shim.log", "timeout_s": 300,
            "bin_dirs": ["/opt/homebrew/bin", "/usr/local/bin", f"{home}/.local/bin", f"{home}/go/bin"], **raw}
@@ -221,7 +226,7 @@ def load_config(path: str) -> dict:
     paths = [cfg["city"], cfg["log"]] + list(cfg["bin_dirs"]) + ([cfg["gate_done_bin"]] if cfg["gate_done_bin"] else [])
     if not all(isinstance(p, str) and os.path.isabs(p) for p in paths) or not os.path.isdir(cfg["city"]):
         raise Refused("config: city, log, bin_dirs e gate_done_bin têm que ser caminho absoluto, e city uma pasta")
-    if not (isinstance(cfg["timeout_s"], int) and 1 <= cfg["timeout_s"] <= 3600):
+    if not (type(cfg["timeout_s"]) is int and 1 <= cfg["timeout_s"] <= 3600):  # (type, não isinstance: o JSON `true` é int em Python e viraria 1 s)
         raise Refused("config: timeout_s entre 1 e 3600")
     cfg["home"] = home
     return cfg
@@ -244,8 +249,8 @@ def decode(raw: str | None) -> tuple[str, list[str], dict]:
     try:
         b = m.group(1)
         doc = json.loads(base64.urlsafe_b64decode(b + "=" * (-len(b) % 4)).decode("utf-8"), object_pairs_hook=no_dups)
-    except (ValueError, UnicodeError) as e:
-        raise Refused(f"pedido ilegível: {e}")
+    except (ValueError, UnicodeError, RecursionError) as e:  # (JSON aninhado fundo estoura a pilha dentro do teto de tamanho)
+        raise Refused(f"pedido ilegível: {type(e).__name__}: {str(e)[:80]}")
     if not (isinstance(doc, dict) and set(doc) == {"tool", "argv", "env"} and isinstance(doc["tool"], str)
             and isinstance(doc["argv"], list) and isinstance(doc["env"], dict)):
         raise Refused("pedido com forma inesperada (esperado tool, argv, env)")
@@ -317,70 +322,115 @@ def audit(cfg: dict, *fields: str) -> None:
         os.close(fd)
 
 
-def kill_group(p) -> None:  # o filho pode ter saído um instante antes: grupo que já não existe não é erro (nem vira "RECUSADO: erro interno" depois de ter rodado)
+def say(msg: str) -> None:  # stderr pode já ter fechado (o cliente ssh foi embora): avisar é melhor esforço e nunca muda o desfecho
+    try:
+        print(f"remote-shim-wrapper: {msg}", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def kill_group(p) -> None:  # o filho pode ter saído um instante antes: isso não é erro (nem vira "RECUSADO" depois de ter rodado)
     try:
         os.killpg(p.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except ProcessLookupError:  # o grupo já não existe (filho já reapado)
         pass
+    except PermissionError:  # macOS: grupo cujo único membro já saiu e ainda não foi reapado dá EPERM, não ESRCH
+        if p.poll() is None:  # (o poll reapa) e o filho continua VIVO: não consegui matá-lo — isso não é a corrida, e tem que aparecer
+            raise
+
+
+def who_declared(env: dict | None) -> str:  # quem o pedido DIZ ser (declaração, não prova): `?` nem decodificou, `sem-alias` decodificou e não trouxe
+    alias = (env or {}).get("GC_ALIAS") or (env or {}).get("GC_AGENT")
+    return "?" if env is None else f"declarado={alias[:60]}" if alias else "sem-alias"
 
 
 def serve(config: str) -> int:
     client = (os.environ.get("SSH_CLIENT", "").split() or ["?"])[0]
     client = client if re.fullmatch(r"[0-9A-Fa-f.:]{1,45}", client) else "?"
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    cfg = None
+    cfg = declared = None
     try:
         cfg = load_config(config)
         tool, argv, env = decode(os.environ.get("SSH_ORIGINAL_COMMAND"))
+        declared = env
         rule, final, cwd, env = decide(cfg, tool, argv, env)
         alias = env.get("GC_ALIAS") or env.get("GC_AGENT")
         if tool == "gate-done":
             exe = cfg["gate_done_bin"]
-            if not exe or not os.access(exe, os.X_OK):
+            if not exe:
                 raise Refused("gate-done: nenhum executável configurado (gate_done_bin) no mini — ver runbook, pontos em aberto")
+            if not os.access(exe, os.X_OK):
+                raise Refused(f"gate-done: gate_done_bin está configurado ({exe[:60]!r}) mas não é um executável")
         else:
             exe = next((os.path.join(d, tool) for d in cfg["bin_dirs"] if os.access(os.path.join(d, tool), os.X_OK)), None)
             if not exe:
                 raise Refused(f"{tool} não encontrado em {cfg['bin_dirs']}", NOTFOUND)
+        home, user = cfg["home"], pwd.getpwuid(os.getuid()).pw_name
+        child = {"HOME": home, "USER": user, "LOGNAME": user, "LANG": "en_US.UTF-8",
+                 "PATH": ":".join(cfg["bin_dirs"] + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]), "BEADS_ACTOR": alias, **env}
+        t0 = time.time()
+
+        def outcome(what: str) -> None:  # a linha de desfecho: dizer que não gravou é melhor que calar (a linha `ok` sozinha seria lida como "rodou")
+            try:
+                audit(cfg, ts, client, alias, what, rule.label(), f"{time.time() - t0:.1f}s")
+            except OSError as e:
+                say(f"aviso: não consegui gravar o desfecho ({what}) no log ({e.strerror})")
+
+        def die(sig, _frame):  # o cliente ssh foi embora: o filho não pode sobreviver sozinho (ele está numa sessão própria)
+            for p in _STARTED:
+                try:
+                    kill_group(p)
+                except Exception:
+                    pass
+            outcome(f"done killed sig={sig} " + ("filho-encerrado" if _STARTED else "filho-nao-iniciado"))
+            os._exit(128 + sig)
+        for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):  # antes do Popen: depois dele haveria uma janela em que o filho já existe e o sinal o deixaria solto
+            signal.signal(s, die)
         try:
             audit(cfg, ts, client, alias, "ok", rule.label(), hashlib.sha256(json.dumps([tool, argv]).encode()).hexdigest()[:12])
         except OSError as e:
             raise Refused(f"não consegui gravar o log de auditoria ({e.strerror}); não executo sem rastro")
-    except Refused as e:
-        print(f"remote-shim-wrapper: RECUSADO: {e}", file=sys.stderr)
+    except Exception as e:  # Refused é o caso normal; um erro que não previ, ainda ANTES do Popen, também não executa nada — e também fica no log
+        r = e if isinstance(e, Refused) else Refused(f"erro interno {type(e).__name__}: {e}")
+        say(f"RECUSADO: {r}")
         if cfg:
             try:
-                audit(cfg, ts, client, "?", "refused", str(e), "")
+                audit(cfg, ts, client, who_declared(declared), "refused", str(r), "")
             except OSError:
                 pass  # a recusa já saiu pelo stderr; o que não pode acontecer é executar sem rastro, e aqui nada executa
-        return e.rc
-    home, user = cfg["home"], pwd.getpwuid(os.getuid()).pw_name
-    child = {"HOME": home, "USER": user, "LOGNAME": user, "LANG": "en_US.UTF-8",
-             "PATH": ":".join(cfg["bin_dirs"] + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]), "BEADS_ACTOR": alias, **env}
-    t0 = time.time()
+        return r.rc
+    # daqui em diante o comando vai começar (ou já começou): nada abaixo pode virar "RECUSADO", que quem chama leria como "nada executou"
     try:
-        p = subprocess.Popen([exe] + final, cwd=cwd, env=child, start_new_session=True)
+        _STARTED.append(subprocess.Popen([exe] + final, cwd=cwd, env=child, start_new_session=True))
     except OSError as e:
-        print(f"remote-shim-wrapper: não consegui executar {tool}: {e.strerror}", file=sys.stderr)
+        say(f"não consegui executar {tool}: {e.strerror}")
+        outcome(f"done rc={NOEXEC} nao-iniciado")
         return NOEXEC
-
-    def die(sig, _frame):  # o cliente ssh foi embora: o filho não pode sobreviver sozinho (ele está numa sessão própria)
-        kill_group(p)
-        os._exit(128 + sig)
-    for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
-        signal.signal(s, die)
+    except Exception as e:  # algo que não é OSError saiu do Popen: não sei se o filho nasceu, e sem o handle não posso encerrá-lo
+        say(f"ATENÇÃO: {tool} pode ter sido iniciado (o Popen levantou {type(e).__name__}: {e}); desfecho desconhecido — não repita às cegas")
+        outcome(f"done unknown {type(e).__name__}")
+        return UNKNOWN
+    p = _STARTED[0]
     try:
-        rc = p.wait(timeout=cfg["timeout_s"])
-    except subprocess.TimeoutExpired:
-        kill_group(p)
-        p.wait()
-        rc = TIMEOUT
-        print(f"remote-shim-wrapper: {tool} passou de {cfg['timeout_s']}s e foi encerrado", file=sys.stderr)
-    rc = 128 - rc if rc < 0 else rc
-    try:
-        audit(cfg, ts, client, alias, f"done rc={rc}", rule.label(), f"{time.time() - t0:.1f}s")
-    except OSError as e:  # o comando já rodou e a linha `ok` está no log; o que falta é o desfecho, e isso é dito em vez de calado
-        print(f"remote-shim-wrapper: aviso: o comando terminou (rc={rc}) mas não consegui gravar o desfecho no log ({e.strerror})", file=sys.stderr)
+        try:
+            rc = p.wait(timeout=cfg["timeout_s"])
+        except subprocess.TimeoutExpired:
+            rc = p.poll()  # o filho pode ter saído entre o último poll do wait e o prazo: terminou sozinho, não estourou
+            if rc is None:
+                kill_group(p)
+                p.wait()
+                rc = TIMEOUT
+                say(f"{tool} passou de {cfg['timeout_s']}s e foi encerrado")
+        rc = 128 - rc if rc < 0 else rc
+    except Exception as e:  # o comando JÁ foi iniciado e pode ter feito efeito: o desfecho é desconhecido, e dizer "recusado" faria o cliente repetir
+        try:
+            kill_group(p)
+        except Exception:
+            pass
+        say(f"ATENÇÃO: {tool} FOI INICIADO e o wrapper falhou depois ({type(e).__name__}: {e}); o comando pode ter rodado e o grupo foi encerrado — não repita às cegas")
+        outcome(f"done unknown {type(e).__name__}")
+        return UNKNOWN
+    outcome(f"done rc={rc}")
     return rc
 
 
@@ -394,7 +444,10 @@ def authorized_line(config: str, pubkey: str, frm: str | None) -> str:
     if frm is not None and not re.fullmatch(r"[0-9A-Za-z.:,/*?!-]{1,200}", frm):
         raise Refused("--from: só endereços, CIDR ou curinga, sem aspas nem espaço")
     cmd = " ".join(shlex.quote(x) for x in [sys.executable, "-I", os.path.realpath(__file__), "serve", "--config", os.path.realpath(config)])
-    opts = ["restrict"] + ([f'from="{frm}"'] if frm else []) + ['command="' + cmd.replace("\\", "\\\\").replace('"', '\\"') + '"']
+    if re.search(r"[\x00-\x1f\x7f]", cmd):  # uma quebra de linha no caminho viraria uma SEGUNDA linha (outra chave, outras opções) no authorized_keys
+        raise Refused("caminho (python, wrapper ou config) com caractere de controle: não vai para o authorized_keys")
+    # o sshd (opt_dequote) só desfaz `\\"` dentro de command="…": dobrar a barra invertida a entregaria dobrada ao shell, e o wrapper não acharia a config (medido num sshd real)
+    opts = ["restrict"] + ([f'from="{frm}"'] if frm else []) + ['command="' + cmd.replace('"', '\\"') + '"']
     return f"{','.join(opts)} {parts[0]} {parts[1]} remote-shim-hetzner"
 
 
@@ -411,8 +464,11 @@ def main(argv: list[str]) -> int:
     if n.cmd == "serve":
         try:
             return serve(n.config)
-        except Exception as e:  # nunca cair para "executar" por causa de um erro que não previ
-            print(f"remote-shim-wrapper: RECUSADO: erro interno {type(e).__name__}: {e}", file=sys.stderr)
+        except Exception as e:  # serve() já cobre os dois lados do Popen; esta é a última rede, e conta o estado verdadeiro: com o filho vivo nunca diz "RECUSADO"
+            if _STARTED:
+                say(f"ATENÇÃO: o comando FOI INICIADO e o wrapper falhou depois ({type(e).__name__}: {e}); pode ter rodado — não repita às cegas")
+                return UNKNOWN
+            say(f"RECUSADO: erro interno {type(e).__name__}: {e}")
             return REFUSED
     if n.cmd == "list":
         print("\n".join(r.label() for r in RULES))
@@ -421,7 +477,7 @@ def main(argv: list[str]) -> int:
     try:
         print(authorized_line(n.config, n.pubkey, n.frm))
     except (Refused, OSError) as e:
-        print(f"remote-shim-wrapper: RECUSADO: {e}", file=sys.stderr)
+        say(f"RECUSADO: {e}")
         return REFUSED
     return 0
 

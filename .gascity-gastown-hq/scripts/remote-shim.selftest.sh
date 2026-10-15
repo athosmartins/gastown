@@ -141,6 +141,11 @@ denied "gc session nudge com ESC" "fora do formato" gc session nudge mayor $'\x1
 denied "gc session nudge com CR" "fora do formato" gc session nudge mayor $'a\rrm -rf x'
 denied "gc session nudge com LF" "fora do formato" gc session nudge mayor $'a\nb'
 denied "gc session nudge com C1 (CSI 8 bits)" "fora do formato" gc session nudge mayor $'a\xc2\x9bb'
+# alvo VÁLIDO nos três abaixo: o que recusa é o texto, não o alvo
+denied "gc session nudge com TAB (autocompletar no terminal do destino)" "fora do formato" gc session nudge gastown.mayor $'a\tb'
+denied "gc session nudge com U+2028 (separador de linha Unicode)" "fora do formato" gc session nudge gastown.mayor $'a\xe2\x80\xa8b'
+denied "gc session nudge com U+202E (inversão bidi: o texto exibido não é o digitado)" "fora do formato" gc session nudge gastown.mayor $'a\xe2\x80\xaeb'
+allowed "controle: pontuação e acento comuns (travessão U+2014 incluído) passam" gc session nudge gastown.mayor 'olá — ação: ok (v2)'
 denied "gc session nudge --delivery inventado" "fora do formato" gc session nudge mayor x --delivery now
 denied "gc session nudge --delivery immediate" "fora do formato" gc session nudge gastown.mayor oi --delivery immediate
 denied "gc session nudge para alvo fora do nudge_pattern" "nudge_pattern" gc session nudge outra-sessao oi
@@ -177,6 +182,8 @@ badreq "env com valor que não é texto" "env: valor" "$(raw '{"tool":"bd","argv
 badreq "pedido grande demais" "grande demais" "rs1 $(python3 -I -c 'print("A"*300000)')"
 badreq "argv com surrogate solto (viraria o byte C1 0x9b cru no nudge)" "surrogate" "$(raw '{"tool":"gc","argv":["session","nudge","gastown.mayor","a\udc9bb"],"env":{"GC_ALIAS":"gastown.dog-1"}}')"
 badreq "mais de 64 argumentos" "argv" "$(python3 -I -c 'import json,base64;print("rs1 "+base64.urlsafe_b64encode(json.dumps({"tool":"bd","argv":["show"]+["ga-1"]*70,"env":{"GC_ALIAS":"gastown.dog-1"}}).encode()).decode().rstrip("="))')"
+badreq "JSON aninhado fundo demais (RecursionError no json.loads, 120 KB: abaixo do teto de tamanho)" "ilegível" "$(python3 -I -c 'import base64;print("rs1 "+base64.urlsafe_b64encode(("["*60000+"]"*60000).encode()).decode().rstrip("="),end="")')"
+tail -1 "$LOGF" | grep -qF "refused"; ok $? "  e essa recusa ficou no log de auditoria (antes caía no catch-all e o log nem era criado)"
 b=$(calls); wrap "$(rq bd '{}' show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "sem GC_ALIAS/GC_AGENT"; ok $? "sem identidade: recusa"
 b=$(calls); wrap "$(rq bd '{"GC_ALIAS":"gastown.mayor"}' show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "identity_pattern"; ok $? "alias do Mayor não casa com identity_pattern"
 for al in gastown.dog-1x evil-gastown.dog-1 "gastown.dog-1/../mayor"; do
@@ -202,6 +209,8 @@ cfgcase "não é JSON" "config ilegível" "{x"
 cfgcase "é lista" "config ilegível" "[]"
 cfgcase "chave desconhecida" "chave desconhecida" "{\"city\":\"$CITY\",\"identity_pattern\":\"x\",\"shell\":\"/bin/sh\"}"
 cfgcase "sem identity_pattern" "sem city/identity_pattern" "{\"city\":\"$CITY\"}"
+! has "$T/err" "nudge_pattern"; ok $? "  a mensagem diz o que FALTA e não chama de 'desconhecida' uma chave opcional (nudge_pattern, log, bin_dirs…)"
+cfgcase "timeout true (JSON booleano não é número)" "timeout_s" "{\"city\":\"$CITY\",\"identity_pattern\":\"x\",\"timeout_s\":true}"
 cfgcase "regex ruim" "identity_pattern inválido" "{\"city\":\"$CITY\",\"identity_pattern\":\"(\"}"
 cfgcase "city relativa" "caminho absoluto" "{\"city\":\"city\",\"identity_pattern\":\"x\"}"
 cfgcase "city que não é pasta" "caminho absoluto" "{\"city\":\"$T/nada\",\"identity_pattern\":\"x\"}"
@@ -212,6 +221,9 @@ b=$(calls); printf '{"city":"%s","identity_pattern":"(gastown\\\\.dog-1|dog-gavy
 CONF_OVERRIDE="$T/conf-nobin.json" wrap "$REQ_OK"; [ "$RC" = 127 ] && [ "$(calls)" = "$b" ] && has "$T/err" "não encontrado"; ok $? "ferramenta que não achei: 127, diz onde procurou e não executa"
 b=$(calls); printf '{"city":"%s","identity_pattern":"(gastown\\\\.dog-1|dog-gavycydh)","bin_dirs":["%s"]}' "$CITY" "$FB" > "$T/conf-nogd.json"
 CONF_OVERRIDE="$T/conf-nogd.json" wrap "$(rq gate-done "$ID")"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "gate-done: nenhum executável configurado"; ok $? "gate-done sem gate_done_bin: recusa dizendo por quê"
+printf '#!/bin/sh\n' > "$T/gd-noexec"; chmod 600 "$T/gd-noexec"
+b=$(calls); printf '{"city":"%s","identity_pattern":"(gastown\\\\.dog-1|dog-gavycydh)","gate_done_bin":"%s","bin_dirs":["%s"]}' "$CITY" "$T/gd-noexec" "$FB" > "$T/conf-gdnx.json"
+CONF_OVERRIDE="$T/conf-gdnx.json" wrap "$(rq gate-done "$ID")"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "está configurado" && ! has "$T/err" "nenhum executável configurado"; ok $? "gate-done com gate_done_bin que existe mas não é executável: recusa dizendo 'configurado mas inutilizável', não 'não configurado'"
 mv "$CITY/.beads/routes.jsonl" "$CITY/.beads/routes.off"; denied "-C com routes.jsonl ilegível (não sei ≠ qualquer rig)" "routes.jsonl" bd -C wa_rig show wa-1; allowed "sem -C, routes.jsonl ausente não atrapalha" bd show ga-1
 mv "$CITY/.beads/routes.off" "$CITY/.beads/routes.jsonl"
 mkdir -p "$T/ro"; chmod 500 "$T/ro"
@@ -225,7 +237,17 @@ echo "== timeout e auditoria"
 sed 's/"timeout_s": 120/"timeout_s": 3/' "$CONF" > "$T/conf-tmo.json"  # timeout curto SÓ neste caso: com a máquina carregada, 3s no resto do selftest matava o bd falso
 t0=$(date +%s); CONF_OVERRIDE="$T/conf-tmo.json" call bd close ga-1 --reason SLEEP; t1=$(date +%s)
 [ "$RC" = 124 ] && [ $((t1-t0)) -lt 30 ] && has "$T/err" "passou de 3s"; ok $? "timeout_s: 124 em ~3s (bem antes dos 37s do comando), com aviso"
-sleep 0.3; [ -s "$FB/sleep.pid" ] && ! kill -0 "$(cat "$FB/sleep.pid")" 2>/dev/null; ok $? "o timeout mata o GRUPO (o neto 'sleep 37' não sobrevive)"
+gone() {  # gone ARQUIVO-DE-PID → 0 se o processo sumiu (ou virou zumbi) em até 10 s; o kill -0 ainda "vê" o zumbi até o init reapar, e 0,3 s fixos reprovavam sob carga
+  [ -s "$1" ] || return 1
+  local pid st i; pid=$(cat "$1")
+  for i in $(seq 1 100); do
+    st=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$st" in ""|Z*) return 0;; esac
+    sleep 0.1
+  done
+  return 1
+}
+gone "$FB/sleep.pid"; ok $? "o timeout mata o GRUPO (o neto 'sleep 37' não sobrevive)"
 call bd comment ga-1 'SEGREDO-4711 texto do comentário'
 ! grep -q 'SEGREDO-4711' "$LOGF"; ok $? "o log de auditoria não guarda o texto do argumento"
 has "$LOGF" "203.0.113.9"; ok $? "o log guarda o ip do cliente (SSH_CLIENT)"
@@ -236,13 +258,103 @@ has "$LOGF" "refused"; ok $? "o log registra recusas"
 [ "$(stat -f '%Lp' "$LOGF" 2>/dev/null || stat -c '%a' "$LOGF")" = 600 ]; ok $? "o log é 0600"
 call bd close ga-1 --reason BREAKLOG; [ "$RC" = 0 ] && has "$T/err" "não consegui gravar o desfecho"; ok $? "desfecho que não grava no log: o comando rodou (rc 0) e o aviso diz que o log ficou sem o desfecho"
 rmdir "$LOGF" 2>/dev/null  # (o falso trocou o log por uma pasta; a próxima chamada o recria)
-python3 -I - "$W" <<'EOF2'
-import importlib.util, subprocess, sys
+kg() {  # kg reaped|unreaped|alive-eperm → 0 se kill_group se comportou como deve (a corrida entre o fim do filho e o kill)
+  python3 -I - "$W" "$1" <<'EOF2'
+import importlib.util, os, signal, subprocess, sys, time
 s = importlib.util.spec_from_file_location("w", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
-p = subprocess.Popen(["true"], start_new_session=True); p.wait()
-m.kill_group(p)  # o grupo já não existe: não pode levantar
+how = sys.argv[2]
+def zombie(pid):  # espera o filho virar zumbi (saiu, ainda não reapado) SEM reapá-lo; via ps porque o python do sistema no macOS não tem os.waitid
+    for _ in range(500):
+        if subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip().startswith("Z"):
+            return
+        time.sleep(0.02)
+    raise SystemExit("o filho não virou zumbi")
+if how == "alive-eperm":  # EPERM com o filho VIVO não é a corrida: é "não consegui matar", e tem que levantar (senão o p.wait() seguinte pendura)
+    real = os.killpg
+    def eperm(pg, sig): raise PermissionError(1, "Operation not permitted")
+    os.killpg = eperm
+    p = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        m.kill_group(p)
+        ok = False
+    except PermissionError:
+        ok = True
+    finally:
+        os.killpg = real
+        real(p.pid, signal.SIGKILL); p.wait()
+    sys.exit(0 if ok else 1)
+p = subprocess.Popen(["true"], start_new_session=True)
+if how == "reaped":
+    p.wait()
+else:  # saiu e continua zumbi: o estado em que serve() chama kill_group ANTES de o p.wait() reapar (no macOS o killpg dá EPERM, não ESRCH)
+    zombie(p.pid)
+m.kill_group(p)
+p.wait()
 EOF2
-ok $? "kill_group: grupo cujo filho já saiu não vira erro (a corrida entre o fim do filho e o kill)"
+}
+kg reaped; ok $? "kill_group: grupo cujo filho já foi reapado não vira erro (ESRCH)"
+kg unreaped; ok $? "kill_group: grupo cujo filho SAIU e ainda não foi reapado não vira erro (macOS: EPERM — o estado real da corrida, que o teste antigo não exercia)"
+kg alive-eperm; ok $? "kill_group: EPERM com o filho ainda VIVO levanta (não engole 'não consegui matar')"
+# harness: roda o serve() REAL do wrapper com UMA falha forçada em ponto escolhido (no ambiente de um sshd, como o wrap)
+cat > "$T/race.py" <<'EOF2'
+import importlib.util, os, subprocess, sys, time
+s = importlib.util.spec_from_file_location("w", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+mode = sys.argv[2]
+def zombie(pid):  # espera o filho virar zumbi (saiu, ainda não reapado) SEM reapá-lo; via ps porque o python do sistema no macOS não tem os.waitid
+    for _ in range(500):
+        if subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip().startswith("Z"):
+            return
+        time.sleep(0.02)
+    raise RuntimeError("o filho não virou zumbi")
+real_wait, state = subprocess.Popen.wait, []
+def wait(self, timeout=None):
+    if timeout is not None and not state:
+        state.append(1)
+        if mode == "race":  # o filho SAIU (ainda zumbi) e o wait diz que o prazo estourou: o fim do filho corre com o timeout
+            zombie(self.pid)
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        if mode == "boom":  # o próprio wrapper falha DEPOIS de o comando ter rodado
+            real_wait(self)
+            raise RuntimeError("boom")
+    return real_wait(self, timeout)
+if mode in ("race", "boom"):
+    subprocess.Popen.wait = wait
+elif mode == "nopopen":
+    def popen(*a, **k): raise OSError(13, "Permission denied")
+    subprocess.Popen = popen
+elif mode == "internal":  # erro que o wrapper não previu, ANTES de o comando começar
+    def decide(*a, **k): raise RuntimeError("inesperado")
+    m.decide = decide
+sys.exit(m.main(["serve", "--config", sys.argv[3]]))
+EOF2
+harness() {  # harness MODO "<SSH_ORIGINAL_COMMAND>" → RC, $T/out, $T/err
+  env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin SSH_CLIENT="203.0.113.9 5555 22" SSH_ORIGINAL_COMMAND="$2" python3 -I "$T/race.py" "$W" "$1" "$CONF" > "$T/out" 2> "$T/err" < /dev/null
+  RC=$?
+}
+lastlog() { tail -1 "$LOGF" | grep -qF -- "$1"; }
+b=$(calls); harness race "$REQ_OK"
+[ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && ! has "$T/err" "RECUSADO" && ! has "$T/err" "passou de"; ok $? "corrida fim-do-filho × prazo: o filho TERMINOU, vale o código dele (0) — nunca 'RECUSADO' (o falso rodou) nem 'estourou o prazo'"
+lastlog "done rc=0"; ok $? "  e o log fecha com o desfecho real"
+b=$(calls); harness boom "$REQ_OK"
+[ "$RC" = 125 ] && [ "$(calls)" = $((b+1)) ] && has "$T/err" "INICIADO" && ! has "$T/err" "RECUSADO"; ok $? "falha do wrapper DEPOIS de o comando ter rodado: 125 e 'INICIADO' (o falso rodou) — nunca 77/'RECUSADO', que o cliente leria como 'nada executou' e repetiria"
+lastlog "done unknown"; ok $? "  e o log fecha com 'done unknown' (a linha 'ok' sozinha, lida como 'rodou', não fica sem desfecho)"
+b=$(calls); harness nopopen "$REQ_OK"
+[ "$RC" = 126 ] && [ "$(calls)" = "$b" ] && has "$T/err" "não consegui executar"; ok $? "Popen que falha: 126 e o falso NÃO rodou"
+lastlog "done rc=126"; ok $? "  e o log tem o desfecho (126, nao-iniciado): sem ele o 'ok' lido sozinho diria 'rodou'"
+b=$(calls); harness internal "$REQ_OK"
+[ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "RECUSADO: erro interno RuntimeError"; ok $? "erro que o wrapper não previu ANTES do comando: 77 'erro interno' e o falso NÃO rodou"
+lastlog "refused"; ok $? "  e essa recusa também fica no log (antes só a recusa de Refused era auditada)"
+rm -f "$FB/sleep.pid"
+env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin SSH_CLIENT="203.0.113.9 5555 22" SSH_ORIGINAL_COMMAND="$(rq bd "$ID" close ga-1 --reason SLEEP)" python3 -I "$W" serve --config "$CONF" > "$T/out" 2> "$T/err" < /dev/null &
+WPID=$!
+for _ in $(seq 1 300); do [ -s "$FB/sleep.pid" ] && break; sleep 0.2; done
+kill -TERM "$WPID"; wait "$WPID"; RC=$?
+[ "$RC" = 143 ]; ok $? "SIGTERM no wrapper (o cliente ssh foi embora): sai 143"
+lastlog "done killed sig=15"; ok $? "  e o log fecha com 'done killed sig=15' (o 'ok' não fica sem desfecho)"
+gone "$FB/sleep.pid"; ok $? "  e o filho (o neto 'sleep 37') não sobrevive ao wrapper"
+call bd sql "select 1"; lastlog "declarado=gastown.dog-1	refused"; ok $? "linha de recusa de um pedido que decodificou leva o alias que ele DECLAROU (declarado=…), não '?'"
+wrap "$(rq bd '{}' show ga-1)"; lastlog "sem-alias	refused"; ok $? "  pedido que decodificou e não trouxe alias: 'sem-alias' (≠ '?', que é 'nem decodificou')"
+wrap 'rs1 A'; lastlog "?	refused"; ok $? "  pedido que nem decodificou: '?'"
 
 echo "== authorized-line"
 line=$(python3 -I "$W" authorized-line --config "$CONF" --pubkey "$KD/user_key.pub" --from "127.0.0.1,10.0.0.0/8"); RC=$?
@@ -250,18 +362,31 @@ line=$(python3 -I "$W" authorized-line --config "$CONF" --pubkey "$KD/user_key.p
 case "$line" in restrict,from=\"127.0.0.1,10.0.0.0/8\",command=\"*\ -I\ *serve\ --config\ *\"\ ssh-ed25519\ AAAA*\ remote-shim-hetzner) true;; *) false;; esac; ok $? "forma: restrict, from=, command=\"<python> -I <wrapper> serve --config <conf>\", chave, comentário fixo"
 has <(printf '%s' "$line") "alguem@servidor" ; [ $? != 0 ]; ok $? "o comentário da chave original não vai (nem nada além do tipo e do blob)"
 python3 -I "$W" authorized-line --config "$CONF" --pubkey "$KD/user_key.pub" | grep -q '^restrict,command='; ok $? "sem --from: restrict,command= (sem from)"
-QD="$T/dir com espaço"; QQ="$T/q\"uote"; mkdir -p "$QD" "$QQ"; cp "$CONF" "$QD/conf.json"; cp "$CONF" "$QQ/conf.json"
-for c in "$QD/conf.json" "$QQ/conf.json"; do
+QD="$T/dir com espaço"; QQ="$T/q\"uote"; QB="$T/back\\slash"; QBQ="$T/b\\\"q"; mkdir -p "$QD" "$QQ" "$QB" "$QBQ"
+for d in "$QD" "$QQ" "$QB" "$QBQ"; do cp "$CONF" "$d/conf.json"; done
+for c in "$QD/conf.json" "$QQ/conf.json" "$QB/conf.json" "$QBQ/conf.json"; do
   l=$(python3 -I "$W" authorized-line --config "$c" --pubkey "$KD/user_key.pub")
   python3 -I - "$l" "$c" <<'EOF2'
-import re, shlex, sys
+import shlex, sys
 line, conf = sys.argv[1], sys.argv[2]
-m = re.match(r'restrict,command="((?:[^"\\]|\\.)*)" ssh-ed25519 ', line)
-argv = shlex.split(re.sub(r'\\(["\\])', r'\1', m.group(1)))  # o que o sshd tira das aspas do authorized_keys e entrega ao shell
-sys.exit(0 if argv[1] == "-I" and argv[-3:] == ["serve", "--config", conf] else 1)
+def dequote(s):  # opt_dequote do OpenSSH (auth-options.c): dentro de command="…" SÓ \" é escape; qualquer outra barra invertida é literal
+    assert s[0] == '"'
+    i, out = 1, []
+    while i < len(s) and s[i] != '"':
+        if s[i] == '\\' and s[i + 1:i + 2] == '"':
+            i += 1
+        out.append(s[i])
+        i += 1
+    return "".join(out), s[i + 1:]
+assert line.startswith("restrict,command=")
+cmd, rest = dequote(line[len("restrict,command="):])
+argv = shlex.split(cmd)  # o que o sshd entrega ao shell de login
+sys.exit(0 if rest.startswith(" ssh-ed25519 ") and argv[1] == "-I" and argv[-3:] == ["serve", "--config", conf] else 1)
 EOF2
-  ok $? "  caminho com espaço/aspas ($(basename "$(dirname "$c")")) volta inteiro depois do authorized_keys e do shell"
+  ok $? "  caminho com espaço/aspas/barra invertida ($(basename "$(dirname "$c")")) volta inteiro depois do authorized_keys e do shell"
 done
+QN="$T/nl"$'\n'"x"; mkdir -p "$QN"; cp "$CONF" "$QN/conf.json"
+python3 -I "$W" authorized-line --config "$QN/conf.json" --pubkey "$KD/user_key.pub" > "$T/out" 2> "$T/err"; [ $? = 77 ] && [ ! -s "$T/out" ] && has "$T/err" "caractere de controle"; ok $? "caminho com quebra de linha: recusa (imprimiria DUAS linhas no authorized_keys)"
 printf 'command="/bin/sh" %s\n' "$(cat "$KD/user_key.pub")" > "$KD/with_opts.pub"
 python3 -I "$W" authorized-line --config "$CONF" --pubkey "$KD/with_opts.pub" >/dev/null 2>"$T/err"; [ $? = 77 ] && has "$T/err" "sem opções na frente"; ok $? "pubkey com opções na frente: recusa"
 { cat "$KD/user_key.pub"; cat "$KD/user_key.pub"; } > "$KD/two.pub"
@@ -299,9 +424,14 @@ if start_sshd; then
   python3 -I "$W" authorized-line --config "$CONF" --pubkey "$KD/user_key.pub" --from 127.0.0.1 > "$SD/authorized_keys"
   tmo 20 ssh "${SSHO[@]}" "$USER@127.0.0.1" "$REQ_OK" > "$T/out" 2> "$T/err" < /dev/null; RC=$?
   [ "$RC" = 0 ] && has "$T/out" "FAKE-bd-OUT"; ok $? "from= que casa: volta a rodar o pedido bom"
+  for c in "$QQ" "$QB" "$QBQ"; do  # o que o sshd de VERDADE faz com o command="…" quando o caminho da config tem aspas / barra invertida
+    python3 -I "$W" authorized-line --config "$c/conf.json" --pubkey "$KD/user_key.pub" --from 127.0.0.1 > "$SD/authorized_keys"
+    tmo 20 ssh "${SSHO[@]}" "$USER@127.0.0.1" "$REQ_OK" > "$T/out" 2> "$T/err" < /dev/null; RC=$?
+    [ "$RC" = 0 ] && has "$T/out" "FAKE-bd-OUT"; ok $? "config em caminho com aspas/barra invertida ($(basename "$c")): o command= sobrevive ao sshd de verdade e o wrapper acha a config"
+  done
 else
-  skip "sshd de verdade: não subiu (sshd=${SSHD:-ausente}) — 8 casos da chave/forced-command ficaram SEM rodar; os outros casos NÃO provam que a chave só roda o wrapper"
-  skipped=$((skipped+7))
+  skip "sshd de verdade: não subiu (sshd=${SSHD:-ausente}) — 11 casos da chave/forced-command ficaram SEM rodar; os outros casos NÃO provam que a chave só roda o wrapper"
+  skipped=$((skipped+10))
 fi
 
 echo "== documentação: a lista do runbook é a do código"
@@ -324,7 +454,7 @@ if sys.argv[3] not in s:
 open(sys.argv[2], "w").write(s.replace(sys.argv[3], sys.argv[4], 1))
 EOF2
 }
-withmutant() { local W0=$W; W="$T/mutant.py"; "$@"; W=$W0; }
+withmutant() { local W0=$W r; W="$T/mutant.py"; "$@"; r=$?; W=$W0; return $r; }  # devolve o status do comando (os que olham $RC não dependem disso)
 mutate '    Rule("gc", ["prime", "--hook"]),
 ' ''; ok $? "controle: a linha 'gc prime --hook' existe na RULES"
 b=$(calls); withmutant call gc prime --hook; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ]; ok $? "  sem essa linha o MESMO comando passa a ser recusado (a tabela RULES é o que decide)"
@@ -337,6 +467,12 @@ mutate 'if k not in ENV_VAL or not re.fullmatch(ENV_VAL[k], env[k])]' 'if False]
 BINREQ="$(rq bd '{"GC_ALIAS":"gastown.dog-1","GC_BIN":"/tmp/x"}' show ga-1)"
 wrap "$BINREQ"; R0=$RC; withmutant wrap "$BINREQ"; R1=$RC
 [ "$R0" = 77 ] && [ "$R1" = 0 ]; ok $? "  sem ela GC_BIN=/tmp/x chega ao filho (com ela é recusado)"
+mutate 'if p.poll() is None:  # (o poll reapa)' 'if True:  # (o poll reapa)'; ok $? "controle: o kill_group separa 'filho zumbi' (EPERM benigno) de 'filho vivo' pelo poll"
+withmutant kg unreaped; [ $? != 0 ]; ok $? "  sem a separação (EPERM sempre levanta) o MESMO caso do filho zumbi volta a levantar"
+mutate 'if p.poll() is None:  # (o poll reapa)' 'if False:  # (o poll reapa)'; ok $? "controle: a mesma guarda, do outro lado"
+withmutant kg alive-eperm; [ $? != 0 ]; ok $? "  sem a separação (EPERM nunca levanta) o EPERM de filho VIVO é engolido"
+mutate 'rc = p.poll()  # o filho pode ter saído' 'rc = None  # o filho pode ter saído'; ok $? "controle: o poll depois do TimeoutExpired existe"
+withmutant harness race "$REQ_OK"; [ "$RC" = 124 ]; ok $? "  sem ele a corrida 'o filho já tinha terminado' vira 124 'passou do prazo'"
 
 echo
 if [ "$skipped" -gt 0 ]; then echo "AVISO: $skipped caso(s) NÃO rodaram (SKIP acima) — não contam como passou"; fi
