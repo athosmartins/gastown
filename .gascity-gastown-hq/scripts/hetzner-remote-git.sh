@@ -95,6 +95,8 @@ cmd_scan() {
     # violação = um blob PRESENTE aqui sob um caminho que o filtro nega. Pares (blob, caminho) de TODA a história via `log --raw` (só árvores: não busca nada no espelho) e blobs fisicamente
     # presentes via --batch-all-objects (também não busca). `rev-list --objects` não serve: nomeia cada objeto UMA vez (o mesmo conteúdo sob outro caminho esconde o primeiro) e lista árvores.
     if ! g log --all -m -z --raw --no-renames --no-abbrev --format= --diff-filter=AMC > "$t/raw" 2>/dev/null; then echo "scan $RIG: git log falhou: NÃO consegui varrer o histórico"; rc=2; continue; fi
+    # o parse abaixo é por linha (NUL→\n): um nome com \n pode forjar um registro ":…" e esconder um arquivo negado sob outro nome. Em saída legítima de `log -z --raw --format=` não existe \n (0 em 4 clones reais): qualquer \n = recuso
+    [ "$(tr -cd '\n' < "$t/raw" | wc -c | tr -d ' ')" = 0 ] || { echo "scan $RIG: há nome de arquivo com quebra de linha no histórico (o parse por linha não é seguro): NÃO consegui varrer"; rc=2; continue; }
     tr '\0' '\n' < "$t/raw" | awk 'want { if (mode != "160000") print oid "\t" $0; want = 0; next } /^:/ { split($0, f, " "); mode = f[2]; oid = f[4]; want = 1; next } length($0) { stray = 1 } END { if (want || stray) exit 3 }' > "$t/pairs.raw" \
       && sort -u "$t/pairs.raw" > "$t/pairs" || { echo "scan $RIG: saída do git log ilegível (ou caminho com quebra de linha): NÃO consegui varrer o histórico"; rc=2; continue; }
     if ! g cat-file --batch-all-objects --batch-check='%(objectname) %(objecttype)' > "$t/all" 2>/dev/null; then echo "scan $RIG: cat-file falhou: NÃO consegui listar os objetos"; rc=2; continue; fi
