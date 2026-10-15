@@ -297,7 +297,7 @@ kg unreaped; ok $? "kill_group: grupo cujo filho SAIU e ainda não foi reapado n
 kg alive-eperm; ok $? "kill_group: EPERM com o filho ainda VIVO levanta (não engole 'não consegui matar')"
 # harness: roda o serve() REAL do wrapper com UMA falha forçada em ponto escolhido (no ambiente de um sshd, como o wrap)
 cat > "$T/race.py" <<'EOF2'
-import importlib.util, os, subprocess, sys, time
+import importlib.util, os, signal, subprocess, sys, time
 s = importlib.util.spec_from_file_location("w", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
 mode = sys.argv[2]
 def zombie(pid):  # espera o filho virar zumbi (saiu, ainda não reapado) SEM reapá-lo; via ps porque o python do sistema no macOS não tem os.waitid
@@ -313,12 +313,17 @@ def wait(self, timeout=None):
         if mode == "race":  # o filho SAIU (ainda zumbi) e o wait diz que o prazo estourou: o fim do filho corre com o timeout
             zombie(self.pid)
             raise subprocess.TimeoutExpired(self.args, timeout)
-        if mode == "boom":  # o próprio wrapper falha DEPOIS de o comando ter rodado
+        if mode in ("boom", "boomnokill"):  # o próprio wrapper falha DEPOIS de o comando ter rodado
             real_wait(self)
             raise RuntimeError("boom")
+        if mode == "termnokill":  # o sinal chega com o filho já criado
+            os.kill(os.getpid(), signal.SIGTERM)
     return real_wait(self, timeout)
-if mode in ("race", "boom"):
+if mode in ("race", "boom", "boomnokill", "termnokill"):
     subprocess.Popen.wait = wait
+if mode in ("boomnokill", "termnokill"):  # o kill do grupo LEVANTA (EPERM com o filho vivo): "não consegui encerrar" não pode virar "encerrado"
+    def kill(p): raise PermissionError(1, "Operation not permitted")
+    m.kill_group = kill
 elif mode == "nopopen":
     def popen(*a, **k): raise OSError(13, "Permission denied")
     subprocess.Popen = popen
@@ -338,6 +343,15 @@ lastlog "done rc=0"; ok $? "  e o log fecha com o desfecho real"
 b=$(calls); harness boom "$REQ_OK"
 [ "$RC" = 125 ] && [ "$(calls)" = $((b+1)) ] && has "$T/err" "INICIADO" && ! has "$T/err" "RECUSADO"; ok $? "falha do wrapper DEPOIS de o comando ter rodado: 125 e 'INICIADO' (o falso rodou) — nunca 77/'RECUSADO', que o cliente leria como 'nada executou' e repetiria"
 lastlog "done unknown"; ok $? "  e o log fecha com 'done unknown' (a linha 'ok' sozinha, lida como 'rodou', não fica sem desfecho)"
+has "$T/err" "o grupo foi encerrado"; ok $? "  e, com o kill funcionando, a mensagem diz que o grupo foi encerrado"
+harness boomnokill "$REQ_OK"
+[ "$RC" = 125 ] && has "$T/err" "NÃO consegui encerrar o grupo" && ! has "$T/err" "o grupo foi encerrado"; ok $? "falha pós-início com o kill do grupo LEVANTANDO: a mensagem diz 'NÃO consegui encerrar', não 'encerrado' (terceiro estado)"
+lastlog "done unknown RuntimeError filho-nao-encerrado"; ok $? "  e o log também"
+b=$(calls); harness termnokill "$REQ_OK"
+# neste caso o kill do grupo foi feito para LEVANTAR: o filho segue vivo e grava a sua linha em calls.log DEPOIS de o wrapper sair — esperar, senão a linha cai no caso seguinte e quebra a contagem dele
+for _ in $(seq 1 200); do [ "$(calls)" -gt "$b" ] && break; sleep 0.1; done
+[ "$RC" = 143 ] && [ "$(calls)" = $((b+1)) ]; ok $? "SIGTERM com o filho criado: sai 143 mesmo se o kill do grupo levantar (e o filho que ficou vivo terminou a sua chamada)"
+lastlog "done killed sig=15 filho-nao-encerrado"; ok $? "  e o log diz 'filho-nao-encerrado', não 'filho-encerrado' (o handler não afirma o que não conseguiu)"
 b=$(calls); harness nopopen "$REQ_OK"
 [ "$RC" = 126 ] && [ "$(calls)" = "$b" ] && has "$T/err" "não consegui executar"; ok $? "Popen que falha: 126 e o falso NÃO rodou"
 lastlog "done rc=126"; ok $? "  e o log tem o desfecho (126, nao-iniciado): sem ele o 'ok' lido sozinho diria 'rodou'"
@@ -350,11 +364,17 @@ WPID=$!
 for _ in $(seq 1 300); do [ -s "$FB/sleep.pid" ] && break; sleep 0.2; done
 kill -TERM "$WPID"; wait "$WPID"; RC=$?
 [ "$RC" = 143 ]; ok $? "SIGTERM no wrapper (o cliente ssh foi embora): sai 143"
-lastlog "done killed sig=15"; ok $? "  e o log fecha com 'done killed sig=15' (o 'ok' não fica sem desfecho)"
+lastlog "done killed sig=15 filho-encerrado"; ok $? "  e o log fecha com 'done killed sig=15 filho-encerrado' (o 'ok' não fica sem desfecho)"
 gone "$FB/sleep.pid"; ok $? "  e o filho (o neto 'sleep 37') não sobrevive ao wrapper"
 call bd sql "select 1"; lastlog "declarado=gastown.dog-1	refused"; ok $? "linha de recusa de um pedido que decodificou leva o alias que ele DECLAROU (declarado=…), não '?'"
 wrap "$(rq bd '{}' show ga-1)"; lastlog "sem-alias	refused"; ok $? "  pedido que decodificou e não trouxe alias: 'sem-alias' (≠ '?', que é 'nem decodificou')"
 wrap 'rs1 A'; lastlog "?	refused"; ok $? "  pedido que nem decodificou: '?'"
+logclean() {  # a última linha do log não tem controle C0/C1 (fora o TAB entre campos), separador de linha Unicode nem bidi: o que o cliente declara não reescreve um log lido no terminal
+  tail -1 "$LOGF" | python3 -I -c 'import re, sys; l = sys.stdin.read(); sys.exit(1 if re.search(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]", l.rstrip("\n")) else 0)'
+}
+wrap "$(rq bd "$(python3 -I -c 'import json; print(json.dumps({"GC_ALIAS": "gastown.dog-1\u001b[31m\u202e\nFAKE"}))')" show ga-1)"
+lastlog "declarado=gastown.dog-1" && lastlog "FAKE" && logclean; ok $? "alias DECLARADO com ESC, bidi e quebra de linha: a linha de recusa o leva sem nenhum deles (nem parte o registro em dois)"
+call bd $'\x1b]0;evil\x07x'; lastlog "comando fora da lista" && logclean; ok $? "argumento com ESC/BEL no motivo da recusa: o log não o leva cru"
 
 echo "== authorized-line"
 line=$(python3 -I "$W" authorized-line --config "$CONF" --pubkey "$KD/user_key.pub" --from "127.0.0.1,10.0.0.0/8"); RC=$?
@@ -473,6 +493,10 @@ mutate 'if p.poll() is None:  # (o poll reapa)' 'if False:  # (o poll reapa)'; o
 withmutant kg alive-eperm; [ $? != 0 ]; ok $? "  sem a separação (EPERM nunca levanta) o EPERM de filho VIVO é engolido"
 mutate 'rc = p.poll()  # o filho pode ter saído' 'rc = None  # o filho pode ter saído'; ok $? "controle: o poll depois do TimeoutExpired existe"
 withmutant harness race "$REQ_OK"; [ "$RC" = 124 ]; ok $? "  sem ele a corrida 'o filho já tinha terminado' vira 124 'passou do prazo'"
+mutate 'return "filho-nao-encerrado"' 'return "filho-encerrado"'; ok $? "controle: end_children separa 'encerrei' de 'o kill levantou'"
+withmutant harness termnokill "$REQ_OK"; ! tail -1 "$LOGF" | grep -qF "filho-nao-encerrado"; ok $? "  sem a separação o log afirma 'filho-encerrado' mesmo com o kill levantando"
+mutate 'LOG_BAD.sub("?", f)[:200]' 're.sub(r"[\t\r\n]", " ", f)[:200]'; ok $? "controle: o log higieniza TODOS os campos (não só TAB/CR/LF, como antes)"
+withmutant call bd $'\x1b]0;evil\x07x'; ! logclean; ok $? "  sem isso o MESMO argumento com ESC/BEL chega cru ao log"
 
 echo
 if [ "$skipped" -gt 0 ]; then echo "AVISO: $skipped caso(s) NÃO rodaram (SKIP acima) — não contam como passou"; fi

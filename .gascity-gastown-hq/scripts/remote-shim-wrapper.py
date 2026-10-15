@@ -30,7 +30,7 @@ LISTA PERMITIDA
 POR QUE RECUSA EM VEZ DE ADAPTAR (está na lista / não está / não consegui saber — o último não vira "está")
   Config ilegível, routes.jsonl ilegível, log de auditoria que não grava, identidade fora do padrão, ferramenta que não achei → não executa.
   A requisição é registrada (hash do argv, nunca o texto; uma RECUSA grava o motivo, que pode citar até 60 caracteres do argumento) ANTES de rodar; sem rastro não há execução.
-  Todo pedido que chegou a decidir "roda" fecha o log com uma linha `done …` (rc=N, nao-iniciado, killed sig=N, unknown): a linha `ok` sozinha não quer dizer "rodou".
+  Todo pedido que chegou a decidir "roda" fecha o log com uma linha `done …` (rc=N, nao-iniciado, killed sig=N filho-encerrado|filho-nao-encerrado|sem-filho-registrado, unknown): a linha `ok` sozinha não quer dizer "rodou".
   Depois que o filho existe NADA vira "RECUSADO": falha do próprio wrapper nessa fase sai 125 ("iniciado, desfecho desconhecido"), porque quem lê 77 repete o pedido.
 
 SUBCOMANDOS
@@ -311,10 +311,13 @@ def decide(cfg: dict, tool: str, argv: list[str], env: dict) -> tuple[Rule, list
     raise Refused(f"{tool} {' '.join(argv[:len(cand[0].words)])}: {reason}")
 
 
+LOG_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")  # o mesmo conjunto de v_line: controle C0/C1 (TAB e quebra de linha inclusive), separador de linha Unicode, controle bidi
+
+
 def audit(cfg: dict, *fields: str) -> None:
     p = Path(cfg["log"])
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    line = "\t".join(re.sub(r"[\t\r\n]", " ", f)[:200] for f in fields) + "\n"
+    line = "\t".join(LOG_BAD.sub("?", f)[:200] for f in fields) + "\n"  # TODOS os campos: o alias/argumento declarado pelo cliente entra em recusas, e ESC ou bidi num log lido no terminal o reescreve
     fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         os.write(fd, line.encode("utf-8", "replace"))
@@ -342,6 +345,17 @@ def kill_group(p) -> None:  # o filho pode ter saído um instante antes: isso n�
 def who_declared(env: dict | None) -> str:  # quem o pedido DIZ ser (declaração, não prova): `?` nem decodificou, `sem-alias` decodificou e não trouxe
     alias = (env or {}).get("GC_ALIAS") or (env or {}).get("GC_AGENT")
     return "?" if env is None else f"declarado={alias[:60]}" if alias else "sem-alias"
+
+
+def end_children() -> str:  # encerra o grupo do filho e diz o que de fato aconteceu: um kill que levantou NÃO é "encerrado"
+    if not _STARTED:
+        return "sem-filho-registrado"  # (registrado, não "iniciado": entre o Popen devolver e o append há uma instrução em que o filho já existe)
+    try:
+        for p in _STARTED:
+            kill_group(p)
+    except Exception:
+        return "filho-nao-encerrado"
+    return "filho-encerrado"
 
 
 def serve(config: str) -> int:
@@ -377,14 +391,9 @@ def serve(config: str) -> int:
                 say(f"aviso: não consegui gravar o desfecho ({what}) no log ({e.strerror})")
 
         def die(sig, _frame):  # o cliente ssh foi embora: o filho não pode sobreviver sozinho (ele está numa sessão própria)
-            for p in _STARTED:
-                try:
-                    kill_group(p)
-                except Exception:
-                    pass
-            outcome(f"done killed sig={sig} " + ("filho-encerrado" if _STARTED else "filho-nao-iniciado"))
+            outcome(f"done killed sig={sig} {end_children()}")
             os._exit(128 + sig)
-        for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):  # antes do Popen: depois dele haveria uma janela em que o filho já existe e o sinal o deixaria solto
+        for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):  # antes do Popen: depois dele a janela com o filho vivo e sem handler seria a do wait inteiro; sobra só a de uma instrução (ver end_children)
             signal.signal(s, die)
         try:
             audit(cfg, ts, client, alias, "ok", rule.label(), hashlib.sha256(json.dumps([tool, argv]).encode()).hexdigest()[:12])
@@ -423,12 +432,10 @@ def serve(config: str) -> int:
                 say(f"{tool} passou de {cfg['timeout_s']}s e foi encerrado")
         rc = 128 - rc if rc < 0 else rc
     except Exception as e:  # o comando JÁ foi iniciado e pode ter feito efeito: o desfecho é desconhecido, e dizer "recusado" faria o cliente repetir
-        try:
-            kill_group(p)
-        except Exception:
-            pass
-        say(f"ATENÇÃO: {tool} FOI INICIADO e o wrapper falhou depois ({type(e).__name__}: {e}); o comando pode ter rodado e o grupo foi encerrado — não repita às cegas")
-        outcome(f"done unknown {type(e).__name__}")
+        ended = end_children() == "filho-encerrado"
+        say(f"ATENÇÃO: {tool} FOI INICIADO e o wrapper falhou depois ({type(e).__name__}: {e}); o comando pode ter rodado e "
+            + ("o grupo foi encerrado" if ended else "eu NÃO consegui encerrar o grupo: ele pode seguir rodando") + " — não repita às cegas")
+        outcome(f"done unknown {type(e).__name__}" + ("" if ended else " filho-nao-encerrado"))
         return UNKNOWN
     outcome(f"done rc={rc}")
     return rc
