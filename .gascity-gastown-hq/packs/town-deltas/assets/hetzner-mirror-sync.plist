@@ -4,10 +4,6 @@
 <dict>
 	<key>EnvironmentVariables</key>
 	<dict>
-		<key>GC_CITY</key>
-		<string>/Users/athos/gt/.gascity-gastown-hq</string>
-		<key>GC_CITY_PATH</key>
-		<string>/Users/athos/gt/.gascity-gastown-hq</string>
 		<key>HOME</key>
 		<string>/Users/athos</string>
 		<key>PATH</key>

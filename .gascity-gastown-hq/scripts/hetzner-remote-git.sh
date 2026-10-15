@@ -1,15 +1,12 @@
 #!/bin/bash
-# hetzner-remote-git.sh — o lado SERVIDOR do espelho git (ga-2hd02v.1.3, fatia 4). Roda no Hetzner como `runner`; o mini o instala em ~/gt-remote/bin/. Runbook: docs/runbooks/hetzner-git-mirror.md
+# hetzner-remote-git.sh — o lado SERVIDOR do espelho git (ga-2hd02v.1.3, fatia 4). Roda no Hetzner como `runner`, instalado em ~/gt-remote/bin/. Doc: docs/runbooks/hetzner-git-mirror.md
 #
 # ## Contents
-#   O que é · Subcomandos · Códigos de saída
+#   Subcomandos · Códigos de saída
 #
-# O QUE É: por rig, um clone BARE parcial (~/gt-remote/git/<rig>/repo.git) cujo ÚNICO remoto é o espelho do mini (ssh, chave dedicada, host key fixada), e um worktree por bead
-#   (…/wt/<bead>). O clone pede ao espelho o filtro de dados (sparse:oid) e o worktree usa os mesmos padrões: arquivo de dado/segredo não existe aqui, nem na árvore nem no histórico.
-#   Nenhum remoto aponta para o GitHub e não há credencial dele neste host (`scan` confere). O trabalho volta por `git push origin worker/<bead>` ao espelho; o mini o publica no origin.
-# SUBCOMANDOS: bootstrap <rig> <url-do-espelho> <chave> <known_hosts> [prefixo/]...  (o filtro de dados vem do ESPELHO a cada pull: gt-mirror-spec)
-#   pull <rig> · wt-add <rig> <bead> [base] · wt-rm <rig> <bead> · status [rig] · scan [rig...]
-# CÓDIGOS: 0 ok · 1 achou violação (scan) / pull falhou · 2 uso ou NÃO consegui varrer (nunca "limpo") · 3 recusado por não poder conferir
+# Por rig, um clone BARE parcial (~/gt-remote/git/<rig>/repo.git) cujo ÚNICO remoto é o espelho do mini, e um worktree por bead (…/wt/<bead>). O filtro de dados vem do ESPELHO a cada pull; nenhum remoto aponta para o GitHub.
+# SUBCOMANDOS: bootstrap <rig> <url-do-espelho> <chave> <known_hosts> [prefixo/]... | pull <rig> | wt-add <rig> <bead> [base] | wt-rm <rig> <bead> | status [rig] | scan [rig...]
+# CÓDIGOS: 0 ok · 1 violação (scan) / pull falhou · 2 uso ou NÃO consegui varrer (nunca "limpo") · 3 recusado por não poder conferir
 set -u
 GR=${GT_REMOTE_GIT:-$HOME/gt-remote/git}
 RE_RIG='^[a-z][a-z0-9_-]{0,40}$'; RE_BEAD='^[a-z0-9][a-z0-9._-]{0,60}$'; RE_PATH='^[A-Za-z0-9_./-]+$'
@@ -85,9 +82,9 @@ cmd_status() {
 }
 
 # ── scan: dado/segredo e credencial do GitHub neste host. 0 limpo · 1 violação · 2 não consegui varrer (nunca "limpo") ───────────────────────────────────────────────────────
-denied() {   # stdin: caminhos (um por linha) → stdout: os que o filtro nega; rc 2 se não consegui avaliar
-  local t rc=2; t=$(mktemp -d) || return 2
-  if git init -q "$t/r" 2>/dev/null; then git -C "$t/r" -c core.quotepath=false -c core.excludesFile="$GR/$RIG/deny" check-ignore --no-index --stdin; case $? in 0|1) rc=0 ;; esac; fi
+denied() {   # stdin: caminhos (um por linha) → stdout: os que o filtro nega, SEM aspas; rc 2 se não consegui avaliar. -z dos dois lados: sem ele o git imprime " \\ tab escapados e o cruzamento com os pares não reconhece o caminho
+  local t rc=2 st; t=$(mktemp -d) || return 2
+  if git init -q "$t/r" 2>/dev/null; then tr '\n' '\0' | git -C "$t/r" -c core.excludesFile="$GR/$RIG/deny" check-ignore --no-index -z --stdin | tr '\0' '\n'; st=${PIPESTATUS[1]}; case $st in 0|1) rc=0 ;; esac; fi
   rm -rf "$t"; return $rc
 }
 cmd_scan() {
@@ -98,17 +95,20 @@ cmd_scan() {
     # violação = um blob PRESENTE aqui sob um caminho que o filtro nega. Pares (blob, caminho) de TODA a história via `log --raw` (só árvores: não busca nada no espelho) e blobs fisicamente
     # presentes via --batch-all-objects (também não busca). `rev-list --objects` não serve: nomeia cada objeto UMA vez (o mesmo conteúdo sob outro caminho esconde o primeiro) e lista árvores.
     if ! g log --all -m -z --raw --no-renames --no-abbrev --format= --diff-filter=AMC > "$t/raw" 2>/dev/null; then echo "scan $RIG: git log falhou: NÃO consegui varrer o histórico"; rc=2; continue; fi
-    tr '\0' '\n' < "$t/raw" | awk 'want { if (mode != "160000") print oid "\t" $0; want = 0; next } /^:/ { split($0, f, " "); mode = f[2]; oid = f[4]; want = 1 } END { if (want) exit 3 }' > "$t/pairs.raw" \
-      && sort -u "$t/pairs.raw" > "$t/pairs" || { echo "scan $RIG: saída do git log ilegível: NÃO consegui varrer o histórico"; rc=2; continue; }
+    tr '\0' '\n' < "$t/raw" | awk 'want { if (mode != "160000") print oid "\t" $0; want = 0; next } /^:/ { split($0, f, " "); mode = f[2]; oid = f[4]; want = 1; next } length($0) { stray = 1 } END { if (want || stray) exit 3 }' > "$t/pairs.raw" \
+      && sort -u "$t/pairs.raw" > "$t/pairs" || { echo "scan $RIG: saída do git log ilegível (ou caminho com quebra de linha): NÃO consegui varrer o histórico"; rc=2; continue; }
     if ! g cat-file --batch-all-objects --batch-check='%(objectname) %(objecttype)' > "$t/all" 2>/dev/null; then echo "scan $RIG: cat-file falhou: NÃO consegui listar os objetos"; rc=2; continue; fi
     awk '$2 == "blob" { print $1 }' "$t/all" | sort -u > "$t/present"
     awk 'index($0, "\t") { print substr($0, index($0, "\t") + 1) }' "$t/pairs" | sort -u | denied > "$t/denied-paths" || { echo "scan $RIG: não consegui avaliar os nomes do histórico"; rc=2; continue; }
+    awk 'NR == FNR { i = index($0, "\t"); if (i) k[substr($0, i + 1)] = 1; next } !($0 in k) { bad = 1 } END { exit bad }' "$t/pairs" "$t/denied-paths" \
+      || { echo "scan $RIG: o filtro devolveu um caminho que não está nos pares (aspas/escape?): NÃO consegui varrer"; rc=2; continue; }
     # violação = blob presente cujos caminhos são TODOS negados. Se algum caminho permitido carrega os mesmos bytes (fórmula copiada em outra pasta, arquivo vazio), a presença se explica e é contada à parte:
     # o filtro age por caminho, e bytes idênticos sob um nome permitido são permitidos. (Resíduo declarado no runbook: um segredo copiado para um caminho comum passa.)
     awk -v ex="$t/expl" 'FILENAME == ARGV[1] { present[$1] = 1; next } FILENAME == ARGV[2] { dp[$0] = 1; next }
       { i = index($0, "\t"); if (!i) next; o = substr($0, 1, i - 1); p = substr($0, i + 1); if (!(o in present)) next; if (p in dp) { if (!(o in fd)) fd[o] = p } else al[o] = 1 }
       END { for (o in fd) if (o in al) n++; else print fd[o]; print n + 0 > ex }' "$t/present" "$t/denied-paths" "$t/pairs" | sort -u > "$t/hit-obj" || { echo "scan $RIG: não consegui cruzar blobs e caminhos"; rc=2; continue; }
-    ( cd "$GR/$RIG" && find . -type f -not -path './repo.git/*' ) > "$t/files" 2>/dev/null || { echo "scan $RIG: find falhou: NÃO consegui varrer a árvore"; rc=2; continue; }
+    ( cd "$GR/$RIG" && find . -type f -not -path './repo.git/*' -print0 ) > "$t/files0" 2>/dev/null && tr '\0' '\n' < "$t/files0" > "$t/files" && [ "$(tr -cd '\0' < "$t/files0" | wc -c | tr -d ' ')" = "$(wc -l < "$t/files" | tr -d ' ')" ] \
+      || { echo "scan $RIG: find falhou ou há nome de arquivo com quebra de linha: NÃO consegui varrer a árvore"; rc=2; continue; }
     sed -e 's|^\./||' "$t/files" | grep -v -e '^sparse$' -e '^deny$' -e '^last-pull-error$' -e '/\.git$' | denied > "$t/hit-tree" || { echo "scan $RIG: não consegui avaliar a árvore"; rc=2; continue; }
     u=$(g config --get-regexp '^remote\..*\.url$' | awk '{print $2}' | grep -v -x -F "$(g config gtremote.mirrorurl)"; true)
     n="$(wc -l < "$t/pairs" | tr -d ' ') pares blob/caminho, $(wc -l < "$t/present" | tr -d ' ') blobs presentes ($(cat "$t/expl" 2>/dev/null || echo ?) deles com os mesmos bytes sob caminho permitido), $(wc -l < "$t/files" | tr -d ' ') arquivos"

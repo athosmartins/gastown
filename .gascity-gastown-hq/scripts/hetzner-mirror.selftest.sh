@@ -1,8 +1,7 @@
 #!/bin/bash
 # hetzner-mirror.selftest.sh — hermético: tudo em mktemp, sshd próprio em loopback numa porta aleatória, "GitHub" = um bare local, "servidor" = outro HOME. Não toca ~/.ssh, os espelhos
 # reais, o GitHub nem a rede. Cobre hetzner-mirror.sh + hetzner-mirror-scan.py + hetzner-remote-git.sh (ga-2hd02v.1.3).
-# Leva de 2 a 10 min conforme a carga (cada ssh custa caro com o mini sob carga). Para desenvolver: HMST_FAKE=1 troca o ssh por uma chamada direta ao `serve` (pula só os casos do sshd real);
-# HMST_KEEP=1 não apaga o diretório temporário no fim (para autópsia). O veredito que vale é a rodada SEM HMST_FAKE.
+# Leva de 2 a 10 min conforme a carga. HMST_FAKE=1 troca o ssh por chamada direta ao `serve` (pula só os casos do sshd real); HMST_KEEP=1 guarda o tmp. O veredito que vale é a rodada SEM HMST_FAKE.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd -P); M=$HERE/hetzner-mirror.sh; R=$HERE/hetzner-remote-git.sh; SC=$HERE/hetzner-mirror-scan.py
 T=$(mktemp -d "${TMPDIR:-/tmp}/hmst.XXXXXX"); chmod 700 "$T"; N=0; F=0
@@ -172,6 +171,10 @@ PL2=$(printf 'x' | git -C "$SR" hash-object -w --stdin); TR2=$(printf '100644 bl
 rc_is 1 "scan: dado com ESPAÇO no nome também é pego" srv scan wa; has 'my leads.csv' "scan: mostra o nome inteiro"; git -C "$SR" update-ref -d refs/heads/worker/plant2
 PL3=$(printf 'x' | git -C "$SR" hash-object -w --stdin); TR3=$(printf '100644 blob %s\tab_results.json\n' "$PL3" | git -C "$SR" mktree); TR4=$(printf '040000 tree %s\tnotes\n' "$TR3" | git -C "$SR" mktree); TR5=$(printf '040000 tree %s\tdocs\n' "$TR4" | git -C "$SR" mktree)
 git -C "$SR" update-ref refs/heads/worker/plant3 "$(git -C "$SR" commit-tree "$TR5" -m p3)"; rc_is 1 "scan: caminho negado pela VARREDURA DE CONTEÚDO também é pego no servidor" srv scan wa; has 'ab_results.json' "scan: mostra o caminho"; git -C "$SR" update-ref -d refs/heads/worker/plant3
+for nm in 'dq"x.csv' 'bs\x.csv' $'tab\tx.csv'; do PLQ=$(printf 'x' | git -C "$SR" hash-object -w --stdin); git -C "$SR" update-ref refs/heads/worker/plantq "$(git -C "$SR" commit-tree "$(printf '100644 blob %s\t%s\0' "$PLQ" "$nm" | git -C "$SR" mktree -z)" -m q)"
+  OUT=$(srv scan wa 2>&1); [ $? = 1 ] && ok "scan: nome com caractere que o git escapa [$(printf '%s' "$nm" | tr '\t' T)] e que o filtro nega → VIOLAÇÃO (não vira 'caminho permitido')" || bad "scan: nome escapado passou [$nm]" "$OUT"; git -C "$SR" update-ref -d refs/heads/worker/plantq; done
+PLN=$(printf 'x' | git -C "$SR" hash-object -w --stdin); git -C "$SR" update-ref refs/heads/worker/plantn "$(git -C "$SR" commit-tree "$(printf '100644 blob %s\tnl\nx.csv\0' "$PLN" | git -C "$SR" mktree -z)" -m n)"
+rc_is 2 "scan: nome com quebra de linha → rc 2 (não consegui varrer; nunca 'limpo')" srv scan wa; git -C "$SR" update-ref -d refs/heads/worker/plantn; rc_is 0 "scan: sem as plantas volta a limpo" srv scan wa
 git -C "$SR" config remote.gh.url https://github.com/x/y.git; rc_is 1 "scan: remoto do GitHub → VIOLAÇÃO" srv scan wa; git -C "$SR" config --unset remote.gh.url
 touch "$SRV_HOME/.git-credentials"; rc_is 1 "scan: .git-credentials no host → VIOLAÇÃO" srv scan wa; rm -f "$SRV_HOME/.git-credentials"
 echo 'export GITHUB_TOKEN=x' > "$SRV_HOME/.profile"; rc_is 1 "scan: token do GitHub no .profile → VIOLAÇÃO" srv scan wa; rm -f "$SRV_HOME/.profile"

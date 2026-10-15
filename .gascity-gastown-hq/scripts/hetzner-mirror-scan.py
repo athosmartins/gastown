@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""hetzner-mirror-scan.py — olha o CONTEÚDO de tudo que o histórico do espelho (hetzner-mirror.sh) ainda não foi conferido e diz QUAIS CAMINHOS o servidor não pode receber (ga-2hd02v.1.3).
+"""hetzner-mirror-scan.py — diz QUAIS CAMINHOS o servidor não pode receber, olhando o CONTEÚDO do histórico do espelho ainda não conferido (ga-2hd02v.1.3).
 
 ## Contents
   Uso · O que conta · O que NÃO garante · Códigos
 
-USO: python3 -I hetzner-mirror-scan.py <repo.git> <estado-dir>
-  Lê as pontas de refs/remotes/origin/*, percorre os commits novos desde a última varredura COMPLETA (estado-dir/scanned-tips) e, para cada par (blob, caminho) que um commit introduz
-  (inclui o mesmo blob com outro nome: renomear não escapa), aplica a MESMA régua do hetzner-pii-scan.py (>=20 telefones ou >=3 CPFs distintos; a função `counts` é importada de lá, não copiada).
-  Um blob sinalizado nega o CAMINHO (todas as versões dele, de qualquer commit) em estado-dir/deny-extra, uma linha por caminho no formato do filtro (`!/caminho`, escapado como o sparse:oid lê).
-  Memória entre rodadas: estado-dir/seen.tsv (blob<TAB>0|1) evita reler; scanned-tips só avança quando TUDO foi lido e gravado — a última coisa que este script faz.
-O QUE CONTA: a forma, como o hetzner-pii-scan.py. Blob > 50 MB, ou que o git não entrega, vale como SINALIZADO/ilegível (não saber não é "limpo").
-O QUE NÃO GARANTE: dado sem forma de telefone/CPF (nome, e-mail, CNPJ, endereço) nem lista pequena. Um caminho sinalizado cujo nome não cabe numa linha do filtro (quebra de linha, controle, espaço no fim) NÃO tem como ser negado:
-  o script recusa (rc 3) em vez de seguir sem negá-lo.
+USO: python3 -I hetzner-mirror-scan.py <repo.git> <estado-dir>. Para cada par (blob, caminho) que um commit novo de refs/remotes/origin/* introduz (o mesmo blob com outro nome também: renomear não escapa), aplica a régua do
+  hetzner-pii-scan.py (>=20 telefones ou >=3 CPFs; a função `counts` é importada de lá). Blob sinalizado nega o CAMINHO (todas as versões) em estado-dir/deny-extra (`!/caminho`, escapado como o sparse:oid lê).
+  seen.tsv (blob<TAB>0|1) evita reler; scanned-tips só avança quando TUDO foi lido e gravado — a última coisa que este script faz.
+O QUE CONTA: a forma. Blob > 50 MB, ou que o git não entrega por inteiro, vale como SINALIZADO/falha (não saber não é "limpo"). Caminho sinalizado que o filtro não consegue negar (quebra de linha, controle, espaço no fim): rc 3.
+O QUE NÃO GARANTE: dado sem forma de telefone/CPF (nome, e-mail, CNPJ, endereço) nem lista pequena.
 CÓDIGOS: 0 varredura completa e gravada · 3 não consegui varrer (nada avançou; o espelho continua "não pronto") · 2 uso
 """
 import importlib.util

@@ -1,25 +1,16 @@
 #!/bin/bash
-# hetzner-mirror.sh — o espelho git do servidor Hetzner (ga-2hd02v.1.3, fatia 4). Roda no MINI. Runbook: docs/runbooks/hetzner-git-mirror.md
+# hetzner-mirror.sh — o espelho git do servidor Hetzner (ga-2hd02v.1.3, fatia 4). Roda no MINI. Doc: docs/runbooks/hetzner-git-mirror.md
 #
 # ## Contents
-#   O que é · O que garante e o que não · Subcomandos · Códigos de saída
+#   Subcomandos · Códigos de saída
 #
-# O QUE É: o servidor alugado NÃO tem credencial do GitHub. Ele só fala com um espelho bare por rig que mora aqui ($MH/repos/<rig>.git), por ssh, com uma chave que só roda
-#   git-upload-pack / git-receive-pack / gt-mirror-spec nesses espelhos (`serve`), num sshd PRÓPRIO só-chave em loopback (o sshd principal do mini oferece senha).
-#   `sync` busca o origin, varre o CONTEÚDO do que chegou (hetzner-mirror-scan.py) e só então libera o servidor; o espelho só aceita refs/heads/{crew,worker}/* + prefixos extras
-#   por rig (`hook pre-receive`); `publish` empurra essas branches ao origin (sem force), chamado pelo post-receive e a cada sync. Gate, merge e push seguem no mini.
-#   Mini fora = o push espera: o espelho guarda e `status` mostra.
-# O QUE GARANTE: (1) o servidor recebe o histórico SEM blob de dado/segredo (`sparse:oid`, de qualquer commit): nome da Seção 1 de hetzner-rsync-filter.wa.txt + .beads/ data/ logs/ + os
-#   CAMINHOS que a varredura de conteúdo sinalizou (lista de telefones/CPFs, mesma régua do hetzner-pii-scan.py). O upload-pack só serve com o filtro certo E com a varredura cobrindo as pontas
-#   atuais, e, sem GIT_PROTOCOL (o sshd não aceita env), só serve ponta de ref: fetch por oid de blob omitido é recusado;
-#   (2) push de main/master, tag, apagar, reescrever histórico, branch fora dos prefixos ou commit com caminho de dado é recusado ANTES de entrar;
-#   (3) nada é decidido por leitura que falhou: filtro/varredura/ref ilegível ou push que não deu para conferir ⇒ recusa (estado inerte), nunca "limpo".
-# O QUE NÃO GARANTE: dado sem forma de telefone/CPF (nome, e-mail, CNPJ, lista pequena) nem arquivo de dado com nome neutro e pouco conteúdo; os NOMES dos arquivos omitidos aparecem nas árvores;
-#   dado que chegue SÓ por um commit de merge o pre-receive não vê. Mudar o filtro/varredura não remove o que um servidor JÁ baixou: refaça o clone (bootstrap em diretório novo).
+# O servidor NÃO tem credencial do GitHub: fala só com um espelho bare por rig daqui ($MH/repos/<rig>.git), por ssh (sshd próprio só-chave em loopback; a chave só roda `serve`). O filtro de dados (sparse:oid) =
+#   Seção 1 de hetzner-rsync-filter.wa.txt + .beads/ data/ logs/ + os CAMINHOS que a varredura de CONTEÚDO sinalizou; o upload-pack só serve com o filtro vigente E a varredura cobrindo as pontas. Push do servidor:
+#   só crew/ worker/ + prefixos do rig, nunca main/tag/apagar/reescrever/dado; `publish` empurra ao origin sem force. Leitura que falha ⇒ recusa (estado inerte), nunca "limpo". Limites e resíduos: ver o runbook.
 #
 # SUBCOMANDOS: init <rig> <origin-url> [--seed GITDIR] [--prefix P/]... | sync [rig] | publish [rig] | status [rig] | sparse [rig] | authorize <pubkey> | hostkey | sshd start|stop|status|run | tunnel start|stop|status|run <host-ssh>
 #   (uso interno: serve · hook pre-receive|post-receive · pack-hook · spec-out <rig>)
-# CÓDIGOS: 0 ok · 1 pendente/falha visível (origin fora, branch não publicada, varredura falhou) · 2 uso · 3 recusado por não poder conferir (fail-closed) · 75 espelho em atualização (tente de novo) · 126 serve recusou
+# CÓDIGOS: 0 ok · 1 pendente/falha visível · 2 uso · 3 recusado por não poder conferir (fail-closed) · 75 espelho em atualização (tente de novo) · 126 serve recusou
 set -u
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")
 CITY=${GC_CITY_PATH:-$(cd "$(dirname "$SELF")/.." && pwd -P)}
