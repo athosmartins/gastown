@@ -13,29 +13,31 @@ O QUE É
 PROTOCOLO (v1)
   SSH_ORIGINAL_COMMAND = `rs1 <base64url sem padding de um JSON {"tool": "bd"|"gc"|"gate-done", "argv": [texto...], "env": {NOME: texto}}>`.
   O JSON vai codificado porque o ssh entrega a linha ao shell de login do mini; base64url não tem caractere que o shell interprete, e o
-  argv chega inteiro, byte a byte, sem aspas para errar. Chave duplicada, chave a mais, tipo errado, NUL, tamanho acima do teto → recusa.
-  `env` só aceita as variáveis de IDENTIDADE da sessão (ENV_VAL): GC_BIN, GC_HOME, GC_CITY_PATH, GC_DOLT_PORT... NÃO são aceitas, porque
-  apontariam o gc/bd do mini para outro lugar. Toda requisição precisa de GC_ALIAS (ou GC_AGENT) que case com `identity_pattern` da
-  config (o Mayor/coordenadores não casam): é a identidade que vira BEADS_ACTOR e a que o gc usa. Ela é declaração do servidor, não
-  prova — o que limita o estrago é o padrão da config, não a honestidade do cliente.
+  argv chega inteiro, byte a byte. Chave duplicada, chave a mais, tipo errado, NUL, surrogate solto, tamanho acima do teto → recusa.
+  `env` só aceita as variáveis de IDENTIDADE da sessão (ENV_VAL): GC_BIN, GC_HOME, GC_CITY_PATH, GC_DOLT_PORT... NÃO são aceitas (apontariam
+  o gc/bd do mini para outro lugar), nem GC_SESSION_ID (nenhum padrão o liga ao alias; o `gc handoff` aceita o alias). Toda requisição precisa de
+  GC_ALIAS (ou GC_AGENT), e tudo que diz QUEM é a sessão (alias, agent, nome da sessão, template) tem que casar com `identity_pattern` da config
+  (o Mayor/coordenadores não casam): é a identidade que vira BEADS_ACTOR e a que o gc usa. É declaração do servidor, não prova — o que limita
+  o estrago é o padrão da config, não a honestidade do cliente.
 
 LISTA PERMITIDA
-  É a tabela RULES (e `list` a imprime; o runbook docs/runbooks/remote-shim.md carrega a mesma saída e o selftest confere as duas).
-  Cada regra é uma forma EXATA: palavras fixas, flags nomeadas, valores validados; o argv executado é o do cliente, na ordem dele, só com a flag curta trocada pela longa. Flag fora da regra, flag repetida, valor fora do
-  formato, argumento a mais ou a menos → recusa. Sem `--flag=valor` (só `--flag valor`). `bd -C <dir>` só vale se <dir> for a cidade, um
-  rig da routes.jsonl da cidade (caminho real ou só o nome do rig); sem routes.jsonl legível o `-C` é recusado.
+  É a tabela RULES (`list` a imprime; o runbook carrega a mesma saída e o selftest confere as duas). Cada regra é uma forma EXATA: palavras
+  fixas, flags nomeadas, valores validados; o argv executado é o do cliente, na ordem dele, só com a flag curta trocada pela longa. Flag fora
+  da regra, repetida, valor fora do formato, argumento a mais ou a menos → recusa. Sem `--flag=valor`. `bd -C <dir>` só vale para a cidade ou
+  um rig da routes.jsonl (caminho real ou nome); sem routes.jsonl legível o `-C` é recusado. `bd update` só grava chaves ALLOW_META; o alvo
+  de `gc session nudge` tem que casar com `nudge_pattern` (sem a chave na config, nudge não roda).
 
-POR QUE RECUSA EM VEZ DE ADAPTAR (três estados: está na lista / não está / não consegui saber — o último não vira "está")
-  Config ilegível, routes.jsonl ilegível, log de auditoria que não grava, identidade fora do padrão, ferramenta que não achei →
-  não executa. A requisição é registrada (hash do argv, nunca o texto) ANTES de rodar; sem rastro não há execução.
+POR QUE RECUSA EM VEZ DE ADAPTAR (está na lista / não está / não consegui saber — o último não vira "está")
+  Config ilegível, routes.jsonl ilegível, log de auditoria que não grava, identidade fora do padrão, ferramenta que não achei → não executa.
+  A requisição é registrada (hash do argv, nunca o texto) ANTES de rodar; sem rastro não há execução.
 
 SUBCOMANDOS
   serve --config CONF                    forced-command (SSH_ORIGINAL_COMMAND na entrada)
   list                                   imprime a lista permitida (regras e variáveis de ambiente)
   authorized-line --config CONF --pubkey ARQ.pub [--from CIDR[,CIDR]]   imprime a linha do authorized_keys; NÃO grava nada
 
-CONFIG (JSON): {"city": "/abs", "identity_pattern": "regex", "gate_done_bin": "/abs"|null, "log": "/abs", "timeout_s": 300, "bin_dirs": ["/abs"]}
-  Só `city` e `identity_pattern` são obrigatórios; chave desconhecida é erro.
+CONFIG (JSON): {"city": "/abs", "identity_pattern": "regex", "nudge_pattern": "regex", "gate_done_bin": "/abs"|null, "log": "/abs", "timeout_s": 300, "bin_dirs": ["/abs"]}
+  Só `city` e `identity_pattern` são obrigatórios (sem `nudge_pattern` o nudge é recusado); chave desconhecida é erro.
 
 CÓDIGOS: o do comando executado · 77 recusado · 124 estourou timeout_s · 126 não consegui executar · 127 ferramenta não encontrada · 2 uso.
 """
@@ -58,7 +60,7 @@ from pathlib import Path
 REFUSED, TIMEOUT, NOEXEC, NOTFOUND = 77, 124, 126, 127
 PROTO = "rs1"
 MAX_CMD, MAX_ARGS, MAX_TEXT = 200_000, 64, 20_000
-DENY_META = ("gc.", "pilot.")  # chaves de metadata do plano de controle (rota, despacho): quem escreve decide o que o engine faz com o bead
+ALLOW_META = ("athos.", "story.")  # as únicas chaves que fórmula/agente de worker escreve (grep em 14/10); gc./pilot./gate./delivery. são plano de controle, o resto é desconhecido: recusa
 
 
 class Refused(Exception):
@@ -79,6 +81,10 @@ def v_text(s: str) -> bool:
     return 0 < len(s) <= MAX_TEXT and "\0" not in s
 
 
+def no_surrogate(s: str) -> bool:  # surrogate solto vira byte cru (0x80-0xFF) no argv do filho, e v_line não o enxerga
+    return re.search(r"[\ud800-\udfff]", s) is None
+
+
 def v_line(s: str) -> bool:  # texto que vira digitação no terminal de OUTRA sessão: sem ESC, CR, LF nem outro controle C0/C1 (só tab)
     return v_text(s) and not re.search(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]", s)
 
@@ -86,7 +92,7 @@ def v_line(s: str) -> bool:  # texto que vira digitação no terminal de OUTRA s
 def v_kv(s: str) -> bool:
     k, sep, val = s.partition("=")
     return bool(sep) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,63}", k) is not None \
-        and not k.lower().startswith(DENY_META) and len(val) <= 4000 and "\0" not in val
+        and k.startswith(ALLOW_META) and len(val) <= 4000 and "\0" not in val
 
 
 def v_n(s: str) -> bool:  # --limit 0 é "tudo": varredura de beads inteiros não sai do mini
@@ -95,10 +101,10 @@ def v_n(s: str) -> bool:  # --limit 0 é "tudo": varredura de beads inteiros nã
 
 VAL = {"id": _fm(ID), "ids": _fm(ID + "(?:," + ID + "){0,49}"), "word": _fm(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,79}"),
        "status": _fm(r"[a-z_]{1,20}(?:,[a-z_]{1,20}){0,5}"), "kv": v_kv, "text": v_text, "line": v_line, "n": v_n,
-       "delivery": _fm(r"immediate|wait-idle|queue")}
+       "delivery": _fm(r"wait-idle|queue")}
 _IDENT = r"[A-Za-z0-9][A-Za-z0-9._@/-]{0,95}"
 # única entrada de ambiente aceita do cliente (e o valor tem formato): o servidor declara QUEM é a sessão, nada que aponte caminho
-ENV_VAL = {"GC_AGENT": _IDENT, "GC_ALIAS": _IDENT, "GC_SESSION_NAME": _IDENT, "GC_SESSION_ID": _IDENT, "GC_TEMPLATE": _IDENT,
+ENV_VAL = {"GC_AGENT": _IDENT, "GC_ALIAS": _IDENT, "GC_SESSION_NAME": _IDENT, "GC_TEMPLATE": _IDENT,
            "GC_SESSION_ORIGIN": r"[a-z]{1,20}", "GC_MANAGED_SESSION_HOOK": r"1", "GC_HOOK_EVENT_NAME": r"[A-Za-z]{1,30}"}
 
 
@@ -201,7 +207,7 @@ def load_config(path: str) -> dict:
             raise ValueError("a config tem que ser um objeto JSON")
     except (OSError, ValueError) as e:
         raise Refused(f"config ilegível ({path}): {e!r}")
-    ok = {"city", "identity_pattern", "gate_done_bin", "log", "timeout_s", "bin_dirs"}
+    ok = {"city", "identity_pattern", "nudge_pattern", "gate_done_bin", "log", "timeout_s", "bin_dirs"}
     if set(raw) - ok or not {"city", "identity_pattern"} <= set(raw):
         raise Refused(f"config com chave desconhecida ou sem city/identity_pattern: {sorted(set(raw) ^ ok)[:8]}")
     home = pwd.getpwuid(os.getuid()).pw_dir
@@ -209,6 +215,7 @@ def load_config(path: str) -> dict:
            "bin_dirs": ["/opt/homebrew/bin", "/usr/local/bin", f"{home}/.local/bin", f"{home}/go/bin"], **raw}
     try:
         cfg["identity_re"] = re.compile(cfg["identity_pattern"])
+        cfg["nudge_re"] = re.compile(cfg["nudge_pattern"]) if cfg.get("nudge_pattern") else None
     except (re.error, TypeError) as e:
         raise Refused(f"identity_pattern inválido: {e}")
     paths = [cfg["city"], cfg["log"]] + list(cfg["bin_dirs"]) + ([cfg["gate_done_bin"]] if cfg["gate_done_bin"] else [])
@@ -242,10 +249,10 @@ def decode(raw: str | None) -> tuple[str, list[str], dict]:
     if not (isinstance(doc, dict) and set(doc) == {"tool", "argv", "env"} and isinstance(doc["tool"], str)
             and isinstance(doc["argv"], list) and isinstance(doc["env"], dict)):
         raise Refused("pedido com forma inesperada (esperado tool, argv, env)")
-    if len(doc["argv"]) > MAX_ARGS or not all(isinstance(a, str) and "\0" not in a and len(a) <= MAX_TEXT for a in doc["argv"]):
-        raise Refused("argv: mais de 64 itens, item que não é texto, com NUL ou grande demais")
-    if not all(isinstance(v, str) for v in doc["env"].values()):
-        raise Refused("env: valor que não é texto")
+    if len(doc["argv"]) > MAX_ARGS or not all(isinstance(a, str) and "\0" not in a and len(a) <= MAX_TEXT and no_surrogate(a) for a in doc["argv"]):
+        raise Refused("argv: mais de 64 itens, item que não é texto, com NUL, surrogate solto ou grande demais")
+    if not all(isinstance(v, str) and no_surrogate(v) for v in doc["env"].values()):
+        raise Refused("env: valor que não é texto (ou com surrogate solto)")
     return doc["tool"], doc["argv"], doc["env"]
 
 
@@ -270,7 +277,7 @@ def decide(cfg: dict, tool: str, argv: list[str], env: dict) -> tuple[Rule, list
     alias = env.get("GC_ALIAS") or env.get("GC_AGENT")
     if not alias:
         raise Refused("sem GC_ALIAS/GC_AGENT: não executo sem saber quem pede")
-    for k in ("GC_ALIAS", "GC_AGENT"):
+    for k in ("GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME", "GC_TEMPLATE"):  # tudo que diz QUEM é a sessão (o gc resolve handoff/drain/mail por elas)
         if k in env and not cfg["identity_re"].fullmatch(env[k]):
             raise Refused(f"{k} não casa com identity_pattern da config")
     cwd = os.path.realpath(cfg["city"])
@@ -288,7 +295,11 @@ def decide(cfg: dict, tool: str, argv: list[str], env: dict) -> tuple[Rule, list
     reason = None
     for r in sorted(cand, key=lambda r: -len(r.words)):
         try:
-            return r, list(r.words) + r.apply(argv[len(r.words):]), cwd, env
+            args = argv[len(r.words):]
+            final = list(r.words) + r.apply(args)
+            if r.words == ("session", "nudge") and not (cfg["nudge_re"] and cfg["nudge_re"].fullmatch(args[0])):
+                raise Refused("alvo do nudge fora do nudge_pattern da config (sem a chave na config, nudge não roda)")
+            return r, final, cwd, env
         except Refused as e:
             reason = reason or str(e)
     raise Refused(f"{tool} {' '.join(argv[:len(cand[0].words)])}: {reason}")

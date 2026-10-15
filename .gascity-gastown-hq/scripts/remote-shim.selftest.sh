@@ -7,17 +7,13 @@
 # Contents
 #   Casos · Controle negativo · Mutantes (como rodar)
 #
-# CASOS: cada forma da LISTA roda e o argv que chega ao bd/gc falso é o canônico (cwd certo, BEADS_ACTOR = alias, identidade encaminhada), incluindo
-#   os 3 comandos novos da decisão do Mayor e as formas que o hook REAL manda · RECUSA (exit 77, a mensagem diz o motivo e o falso NÃO é chamado) de
-#   tudo fora da lista e das variações dos 3 novos · protocolo, identidade e config tortos · log de auditoria que não grava → não executa
-#   HIGIENE: BASH_ENV/LD_PRELOAD/GC_CITY_PATH/PYTHONPATH do ambiente do sshd NÃO chegam ao filho · timeout mata o grupo (neto inclusive) · o log
-#   tem ip/alias/regra/hash, a linha `ok` ANTES da execução e `done rc=` depois, e NUNCA o texto do argumento
-#   SSHD DE VERDADE: a chave NÃO roda `touch`, nem sem comando, nem -R, nem pty; from= que não casa nega a chave; uma chave VÁLIDA não listada é
-#   negada e, listada, a MESMA chave entra (o controle da negação) · DOC: a saída de `list` é igual ao bloco da lista do runbook
-# CONTROLE NEGATIVO: uma regra apagada, a guarda de metadata gc.*, o formato do id e a lista de variáveis de ambiente apagados fazem o MESMO
-#   caso passar a se comportar diferente.
-# MUTANTES: WRAPPER_UNDER_TEST=<cópia do wrapper com UMA guarda apagada> FAILFAST=1 bash remote-shim.selftest.sh (FAILFAST para no 1º caso
-#   que reprova: o mutante morreu). A campanha inteira é `python3 -I scripts/remote-shim.mutants.py`, da fatia 1.2.2.
+# CASOS: cada forma da LISTA roda com o argv canônico no bd/gc falso (cwd, BEADS_ACTOR, identidade) · RECUSA (77, com o motivo, sem chamar o falso)
+#   de tudo fora da lista e das variações dos 3 novos · protocolo, identidade (alias, agent, sessão, template), config e metadata tortos · log que
+#   não grava → não executa · HIGIENE de ambiente, timeout mata o grupo, auditoria · SSHD DE VERDADE: a chave só roda o wrapper (nem touch, shell,
+#   -R, pty; from= que não casa nega; chave válida não listada é negada e, listada, a MESMA entra) · DOC: `list` == bloco da lista do runbook
+# CONTROLE NEGATIVO: apagar uma regra, os prefixos de metadata, o formato do id ou a lista de env faz o MESMO caso se comportar diferente.
+# MUTANTES: WRAPPER_UNDER_TEST=<cópia com UMA guarda apagada> FAILFAST=1 bash remote-shim.selftest.sh; a campanha inteira é
+#   `python3 -I scripts/remote-shim.mutants.py` (fatia 1.2.2).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/remote-shim.selftest.lib.sh"
@@ -31,9 +27,9 @@ allowed "bd -C ." bd -C . show ga-1; lastis "cwd=$CITY"; ok $? "  cwd=cidade"
 allowed "bd list com todas as flags (curtas viram longas)" bd list --json -s open,in_progress -a gastown.dog-1 -l x:a -l b --parent ga-1 -n 5 --id ga-1,wa-2
 lastis "argv=[list][--json][--status][open,in_progress][--assignee][gastown.dog-1][--label][x:a][--label][b][--parent][ga-1][--limit][5][--id][ga-1,wa-2]"; ok $? "  argv canônico"
 allowed "bd list sem flag" bd list
-allowed "bd update --set-metadata (repetida, com quebra de linha)" bd update ga-1 --set-metadata a=b --set-metadata $'athos.acao=linha1\nlinha2' --json
-lastis "argv=[update][ga-1][--set-metadata][a=b][--set-metadata][athos.acao=linha1\\nlinha2][--json]"; ok $? "  argv canônico, valor multilinha inteiro"
-allowed "bd update com chave de domínio (delivery.x)" bd update ga-1 --set-metadata delivery.running_since=2026-10-14
+allowed "bd update --set-metadata (repetida, com quebra de linha)" bd update ga-1 --set-metadata story.a=b --set-metadata $'athos.acao=linha1\nlinha2' --json
+lastis "argv=[update][ga-1][--set-metadata][story.a=b][--set-metadata][athos.acao=linha1\\nlinha2][--json]"; ok $? "  argv canônico, valor multilinha inteiro"
+allowed "bd update com chave story.x" bd update ga-1 --set-metadata story.resumo=ok
 allowed "bd comment <id> palavras..." bd comment ga-1 hello there world; lastis "argv=[comment][ga-1][hello][there][world]"; ok $? "  argv canônico"
 allowed "bd comment com texto que começa com '-'" bd comment ga-1 -- '- item' ; lastis "argv=[comment][ga-1][--][- item]"; ok $? "  o -- do cliente segue na mesma ordem"
 printf 'texto vindo do stdin' > "$T/stdin.txt"; STDIN_FILE="$T/stdin.txt" allowed "bd comment <id> --stdin" bd comment ga-1 --stdin
@@ -81,7 +77,8 @@ denied "bd update --set-metadata gc.routed_to" "fora do formato" bd update ga-1 
 denied "bd update --set-metadata pilot.x" "fora do formato" bd update ga-1 --set-metadata pilot.dispatched_at=1
 denied "bd update --set-metadata GC.x (maiúscula)" "fora do formato" bd update ga-1 --set-metadata GC.routed_to=x
 denied "bd update --set-metadata sem '='" "fora do formato" bd update ga-1 --set-metadata abc
-denied "bd update --unset-metadata" "flag fora da lista" bd update ga-1 --set-metadata a=b --unset-metadata c
+for k in gate.submitted_by delivery.x Story.x foo.bar; do denied "bd update --set-metadata $k (prefixo fora da lista athos./story.)" "fora do formato" bd update ga-1 --set-metadata "$k=x"; done
+denied "bd update --unset-metadata" "flag fora da lista" bd update ga-1 --set-metadata story.a=b --unset-metadata c
 denied "bd comment --file" "flag fora da lista" bd comment ga-1 --file /etc/passwd
 denied "bd comment sem texto" "faltam argumentos" bd comment ga-1
 denied "bd comment --stdin com texto" "flag fora da lista" bd comment ga-1 oi --stdin
@@ -128,6 +125,10 @@ denied "gc session nudge com CR" "fora do formato" gc session nudge mayor $'a\rr
 denied "gc session nudge com LF" "fora do formato" gc session nudge mayor $'a\nb'
 denied "gc session nudge com C1 (CSI 8 bits)" "fora do formato" gc session nudge mayor $'a\xc2\x9bb'
 denied "gc session nudge --delivery inventado" "fora do formato" gc session nudge mayor x --delivery now
+denied "gc session nudge --delivery immediate" "fora do formato" gc session nudge gastown.mayor oi --delivery immediate
+denied "gc session nudge para alvo fora do nudge_pattern" "nudge_pattern" gc session nudge outra-sessao oi
+printf '{"city":"%s","identity_pattern":"(gastown\\\\.dog-1|dog-gavycydh)","bin_dirs":["%s"]}' "$CITY" "$FB" > "$T/conf-nonudge.json"
+CONF_OVERRIDE="$T/conf-nonudge.json" denied "gc session nudge com a config SEM nudge_pattern" "sem a chave" gc session nudge gastown.mayor oi
 denied "ferramenta dolt" "comando fora da lista" dolt sql
 denied "ferramenta bw" "comando fora da lista" bw get password x
 denied "ferramenta security" "comando fora da lista" security find-generic-password
@@ -150,6 +151,7 @@ badreq "argv com NUL" "argv" "$(raw '{"tool":"bd","argv":["show","ga-1\u0000x"],
 badreq "tool que não é texto" "forma inesperada" "$(raw '{"tool":3,"argv":[],"env":{}}')"
 badreq "env com valor que não é texto" "env: valor" "$(raw '{"tool":"bd","argv":["show","ga-1"],"env":{"GC_ALIAS":5}}')"
 badreq "pedido grande demais" "grande demais" "rs1 $(python3 -I -c 'print("A"*300000)')"
+badreq "argv com surrogate solto (viraria o byte C1 0x9b cru no nudge)" "surrogate" "$(raw '{"tool":"gc","argv":["session","nudge","gastown.mayor","a\udc9bb"],"env":{"GC_ALIAS":"gastown.dog-1"}}')"
 badreq "mais de 64 argumentos" "argv" "$(python3 -I -c 'import json,base64;print("rs1 "+base64.urlsafe_b64encode(json.dumps({"tool":"bd","argv":["show"]+["ga-1"]*70,"env":{"GC_ALIAS":"gastown.dog-1"}}).encode()).decode().rstrip("="))')"
 b=$(calls); wrap "$(rq bd '{}' show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "sem GC_ALIAS/GC_AGENT"; ok $? "sem identidade: recusa"
 b=$(calls); wrap "$(rq bd '{"GC_ALIAS":"gastown.mayor"}' show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "identity_pattern"; ok $? "alias do Mayor não casa com identity_pattern"
@@ -159,6 +161,8 @@ done
 b=$(calls); wrap "$(rq bd '{"GC_ALIAS":"gastown.dog-1","GC_AGENT":"gastown.mayor"}' show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "GC_AGENT"; ok $? "GC_AGENT do Mayor com alias bom: recusa"
 b=$(calls); wrap "$(rq bd '{"GC_ALIAS":"gastown.dog-1","GC_CITY_PATH":"/x"}' show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "env fora da lista"; ok $? "env fora da lista (GC_CITY_PATH): recusa"
 b=$(calls); wrap "$(rq bd '{"GC_ALIAS":"gastown.dog-1","GC_BIN":"/tmp/x"}' show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ]; ok $? "env fora da lista (GC_BIN): recusa"
+b=$(calls); wrap "$(rq bd '{"GC_ALIAS":"gastown.dog-1","GC_SESSION_ID":"ga-mayor1"}' show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "env fora da lista"; ok $? "GC_SESSION_ID não atravessa (nenhum padrão o liga ao alias; o handoff aceita o alias): recusa"
+for k in GC_SESSION_NAME GC_TEMPLATE; do b=$(calls); wrap "$(rq bd "{\"GC_ALIAS\":\"gastown.dog-1\",\"$k\":\"gastown.mayor\"}" show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "$k"; ok $? "$k do Mayor com alias bom: recusa (tudo que diz quem é a sessão casa com identity_pattern)"; done
 b=$(calls); wrap "$(rq bd '{"GC_ALIAS":"gastown.dog-1","GC_SESSION_NAME":"a b"}' show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "fora do formato"; ok $? "valor de env fora do formato: recusa"
 b=$(calls); wrap "$(rq bd '{"GC_ALIAS":"gastown.dog-1","GC_MANAGED_SESSION_HOOK":"2"}' show ga-1)"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ]; ok $? "GC_MANAGED_SESSION_HOOK só aceita 1"
 badreq "pedido bom seguido de ';' e outro comando" "fora do formato" "$REQ_OK; touch $T/PWNED-tail"
@@ -180,15 +184,15 @@ cfgcase "city que não é pasta" "caminho absoluto" "{\"city\":\"$T/nada\",\"ide
 cfgcase "timeout 0" "timeout_s" "{\"city\":\"$CITY\",\"identity_pattern\":\"x\",\"timeout_s\":0}"
 cfgcase "gate_done_bin relativo" "caminho absoluto" "{\"city\":\"$CITY\",\"identity_pattern\":\"x\",\"gate_done_bin\":\"gatedone\"}"
 cfgcase "bin_dirs relativo" "caminho absoluto" "{\"city\":\"$CITY\",\"identity_pattern\":\"x\",\"bin_dirs\":[\"bin\"]}"
-b=$(calls); printf '{"city":"%s","identity_pattern":"gastown\\\\.dog-1","bin_dirs":["%s/vazio"]}' "$CITY" "$T" > "$T/conf-nobin.json"; mkdir -p "$T/vazio"
+b=$(calls); printf '{"city":"%s","identity_pattern":"(gastown\\\\.dog-1|dog-gavycydh)","bin_dirs":["%s/vazio"]}' "$CITY" "$T" > "$T/conf-nobin.json"; mkdir -p "$T/vazio"
 CONF_OVERRIDE="$T/conf-nobin.json" wrap "$REQ_OK"; [ "$RC" = 127 ] && [ "$(calls)" = "$b" ] && has "$T/err" "não encontrado"; ok $? "ferramenta que não achei: 127, diz onde procurou e não executa"
-b=$(calls); printf '{"city":"%s","identity_pattern":"gastown\\\\.dog-1","bin_dirs":["%s"]}' "$CITY" "$FB" > "$T/conf-nogd.json"
+b=$(calls); printf '{"city":"%s","identity_pattern":"(gastown\\\\.dog-1|dog-gavycydh)","bin_dirs":["%s"]}' "$CITY" "$FB" > "$T/conf-nogd.json"
 CONF_OVERRIDE="$T/conf-nogd.json" wrap "$(rq gate-done "$ID")"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "gate-done: nenhum executável configurado"; ok $? "gate-done sem gate_done_bin: recusa dizendo por quê"
 mv "$CITY/.beads/routes.jsonl" "$CITY/.beads/routes.off"; denied "-C com routes.jsonl ilegível (não sei ≠ qualquer rig)" "routes.jsonl" bd -C wa_rig show wa-1; allowed "sem -C, routes.jsonl ausente não atrapalha" bd show ga-1
 mv "$CITY/.beads/routes.off" "$CITY/.beads/routes.jsonl"
 mkdir -p "$T/ro"; chmod 500 "$T/ro"
 if [ ! -w "$T/ro" ]; then
-  printf '{"city":"%s","identity_pattern":"gastown\\\\.dog-1","log":"%s/ro/sub/x.log","bin_dirs":["%s"]}' "$CITY" "$T" "$FB" > "$T/conf-ro.json"
+  printf '{"city":"%s","identity_pattern":"(gastown\\\\.dog-1|dog-gavycydh)","log":"%s/ro/sub/x.log","bin_dirs":["%s"]}' "$CITY" "$T" "$FB" > "$T/conf-ro.json"
   b=$(calls); CONF_OVERRIDE="$T/conf-ro.json" wrap "$REQ_OK"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "não executo sem rastro"; ok $? "log de auditoria que não grava: NÃO executa"
 else skip "log não gravável (rodando como root: chmod não impede)"; fi
 chmod 700 "$T/ro"
@@ -300,7 +304,7 @@ withmutant() { local W0=$W; W="$T/mutant.py"; "$@"; W=$W0; }
 mutate '    Rule("gc", ["prime", "--hook"]),
 ' ''; ok $? "controle: a linha 'gc prime --hook' existe na RULES"
 b=$(calls); withmutant call gc prime --hook; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ]; ok $? "  sem essa linha o MESMO comando passa a ser recusado (a tabela RULES é o que decide)"
-mutate 'and not k.lower().startswith(DENY_META) ' ''; ok $? "controle: a guarda de metadata gc./pilot. existe"
+mutate 'and k.startswith(ALLOW_META) ' ''; ok $? "controle: a lista de prefixos de metadata existe"
 b=$(calls); withmutant call bd update ga-1 --set-metadata gc.routed_to=x; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "  sem ela 'gc.routed_to=x' passa a rodar (o caso de recusa acima de fato a exercita)"
 mutate '"id": _fm(ID), ' '"id": lambda s: True, '; ok $? "controle: o formato do id existe"
 b=$(calls); withmutant call bd show 'ga-1;id'; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "  sem ele 'ga-1;id' passa a rodar"

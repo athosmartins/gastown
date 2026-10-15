@@ -1,8 +1,5 @@
-# remote-shim.selftest.lib.sh — harness comum dos selftests do atalho bd/gc/gate-done (ga-2hd02v.1.2.x). NÃO roda sozinho: é carregado (`.`) por
-# remote-shim.selftest.sh (lado do mini) e por remote-shim-client.selftest.sh (lado do servidor + cadeia inteira). Quem carrega faz `set -u` e define HERE.
-#
-# Contents
-#   Ambiente (pasta tmp, cidade, rigs, bd/gc/gate-done falsos, config) · Funções (ok, allowed, denied, badreq…) · Chaves · start_sshd
+# remote-shim.selftest.lib.sh — harness comum dos selftests do atalho (ga-2hd02v.1.2.x), carregado (`.`) por remote-shim.selftest.sh (lado do mini) e por
+# remote-shim-client.selftest.sh (servidor + cadeia); quem carrega faz `set -u` e define HERE. Tem: ambiente (tmp, cidade, falsos, config), funções, chaves, start_sshd.
 W="${WRAPPER_UNDER_TEST:-$HERE/remote-shim-wrapper.py}"
 S="${SHIM_UNDER_TEST:-$HERE/remote-shim.py}"
 BUILD="$HERE/remote-bundle-build.py"
@@ -45,7 +42,7 @@ exit 0
 EOF
 chmod +x "$FB/$tool"; done
 cat > "$CONF" <<EOF
-{"city": "$CITY", "identity_pattern": "(gastown\\\\.dog-[0-9]+|wa-worker-[a-z0-9-]+)", "gate_done_bin": "$FB/gatedone", "log": "$LOGF", "timeout_s": 120, "bin_dirs": ["$FB"]}
+{"city": "$CITY", "identity_pattern": "(gastown\\\\.dog-[0-9]+|gastown\\\\.dog|dog-[a-z0-9]+|wa-worker-[a-z0-9-]+)", "nudge_pattern": "gastown\\\\.(mayor|deacon)", "gate_done_bin": "$FB/gatedone", "log": "$LOGF", "timeout_s": 120, "bin_dirs": ["$FB"]}
 EOF
 ID='{"GC_ALIAS":"gastown.dog-1","GC_AGENT":"gastown.dog-1","GC_SESSION_NAME":"dog-gavycydh"}'
 
