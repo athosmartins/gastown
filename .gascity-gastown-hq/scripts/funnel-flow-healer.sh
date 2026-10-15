@@ -122,6 +122,28 @@ do_kickstart() {  # do_kickstart <label>
   launchctl kickstart -k "gui/$UID_NUM/$label" >/dev/null 2>&1
 }
 
+# Is this launchd job switched off ON PURPOSE (`launchctl disable`)? Three answers:
+#   "yes" disabled; "no" enabled or never listed; "?" launchctl gave no usable answer (it failed, or it
+#   exited 0 without the `disabled services = {` table) - NOT "no": handle_signature logs that doubt.
+# The Mayor paused the refino on 14/10 on the Athos's order, and this healer kept kickstarting it and
+# paging the Athos about a pause he asked for; "disabled" is taken as that word. It is not proof the job
+# is not running: `launchctl disable` alone leaves an already-loaded job loaded (both refino jobs were
+# also unloaded, so their log stays frozen by design), and a loaded+disabled+hung job would read as paused.
+# Stubbable through the same FLOW_HEALER_FAKE_LAUNCHCTL seam as do_kickstart.
+job_disabled() {  # job_disabled <label>
+  local label="$1" out row
+  if [ -n "${FLOW_HEALER_FAKE_LAUNCHCTL:-}" ]; then
+    out=$("$FLOW_HEALER_FAKE_LAUNCHCTL" print-disabled "gui/$UID_NUM") || { echo "?"; return; }
+  else
+    out=$(launchctl print-disabled "gui/$UID_NUM" 2>/dev/null) || { echo "?"; return; }
+  fi
+  # Asked and answered, but not with the table (empty, usage text, a changed format): that cannot be read as "enabled".
+  printf '%s\n' "$out" | grep -qF 'disabled services = {' || { echo "?"; return; }
+  # -F: the dots in a label are literal, not "any character".
+  row=$(printf '%s\n' "$out" | grep -F "\"$label\" => ")
+  if printf '%s\n' "$row" | grep -qE '=> (disabled|true)([[:space:]]|$)'; then echo "yes"; else echo "no"; fi
+}
+
 # gc mail send mayor wrapper (stubbable in selftest via FLOW_HEALER_FAKE_MAIL).
 do_mail_mayor() {  # do_mail_mayor <subject> <body>
   local subj="$1" body="$2"
@@ -272,6 +294,21 @@ handle_signature() {
   local age; age=$(log_age_min "$logf")
   local frozen=0; [ "$age" -gt "$freeze" ] && frozen=1
   local stalled=0; { [ "$demand" = "1" ] && [ "$frozen" = "1" ]; } && stalled=1
+
+  # Deliberately disabled job -> paused, not stalled (also clears its strikes).
+  # "?" (could not tell) keeps the old behaviour - a doubt must not hide a real stall - but says so
+  # (JSONL event + stderr, like _tsw_authority_unreadable), so a healer that kickstarts a job the
+  # Athos paused is seen to have been unable to ask, not mistaken for a check that found it enabled.
+  if [ "$stalled" = "1" ]; then
+    local disabled; disabled=$(job_disabled "$label")
+    if [ "$disabled" = "yes" ]; then
+      stalled=0
+      emit "paused" ",\"sig\":\"$sig\",\"label\":\"$label\",\"reason\":\"launchd job disabled on purpose\""
+    elif [ "$disabled" != "no" ]; then
+      emit "paused-check-unreadable" ",\"sig\":\"$sig\",\"label\":\"$label\",\"reason\":\"launchctl print-disabled gave no usable answer\""
+      echo "funnel-flow-healer: WARN: cannot tell whether $label is disabled on purpose (launchctl print-disabled gave no usable answer) - treated as ENABLED, a stalled job is still kickstarted" >&2
+    fi
+  fi
 
   local action; action=$(decide_action "$sig" "$stalled")
   local strikes; strikes=$(get "$sig.strikes" 0)

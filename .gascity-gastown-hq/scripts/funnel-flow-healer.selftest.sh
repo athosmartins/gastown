@@ -127,9 +127,25 @@ eq "healthy auto-refino = NONE" "$h2" "NONE"
 echo "== (g) end-to-end handle_signature with STUBBED side-effects (zero real calls) =="
 reset_state
 CALLS="$WORK/calls.log"; : > "$CALLS"
-stub_launchctl() { echo "launchctl $*" >> "$CALLS"; return 0; }
+# print-disabled answers like the real launchctl (a "disabled services = {" table, one
+# `"label" => enabled|disabled` row per job). DISABLED_ANSWER picks the auto-refino row, or
+# "fail" (exit 1) / "garbled" (exit 0, no table) = launchctl could not give a usable answer.
+# Default "enabled" = the plain path every section but (g2) runs on.
+DISABLED_ANSWER=enabled
+stub_launchctl() {
+  echo "launchctl $*" >> "$CALLS"
+  if [ "$1" = "print-disabled" ]; then
+    case "$DISABLED_ANSWER" in
+      fail)    return 1 ;;
+      garbled) echo "launchctl: unexpected output"; return 0 ;;
+    esac
+    printf 'disabled services = {\n\t"com.gascity.auto-refino-dispatcher" => %s\n}\n' "$DISABLED_ANSWER"
+  fi
+  return 0
+}
 stub_mail()      { echo "mail subj=$1" >> "$CALLS"; return 0; }
 stub_notify()    { echo "notify title=$1" >> "$CALLS"; return 0; }
+export DISABLED_ANSWER
 export -f stub_launchctl stub_mail stub_notify
 export FLOW_HEALER_FAKE_LAUNCHCTL=stub_launchctl
 export FLOW_HEALER_FAKE_MAIL=stub_mail
@@ -158,6 +174,52 @@ if [ -s "$CALLS" ] && ! grep -qvE '^(launchctl|mail|notify) ' "$CALLS" 2>/dev/nu
 else
   bad "expected only stub calls recorded, got: calls=$(cat "$CALLS" 2>/dev/null || echo '(empty)')"
 fi
+unset FLOW_HEALER_FAKE_LAUNCHCTL FLOW_HEALER_FAKE_MAIL FLOW_HEALER_FAKE_NOTIFY FLOW_HEALER_FAKE_MTIME_AUTO_REFINO_DISPATCHER_LOG
+
+echo "== (g2) a job switched off with launchctl disable is paused, not stalled (refino pause 14/10) =="
+# Three answers, three different traces: disabled -> "paused"; enabled -> neither event; launchctl
+# could not answer -> "paused-check-unreadable" (+ a stderr WARN). JSONL is NOT cleared by
+# reset_state, so each case starts from an empty one - an event can only come from that case.
+EVENTS_RE='"event":"paused"|"event":"paused-check-unreadable"'
+g2_case() {  # g2_case <DISABLED_ANSWER>: fresh state, 8 frozen+demand runs of the auto-refino signature
+  reset_state; : > "$CALLS"; : > "$JSONL"; DISABLED_ANSWER="$1"
+  for _ in 1 2 3 4 5 6 7 8; do
+    handle_signature "auto-refino" "com.gascity.auto-refino-dispatcher" "/x/auto-refino-dispatcher.log" 15 1 "census-blob" >/dev/null 2>>"$WORK/g2.err"
+  done
+}
+export FLOW_HEALER_FAKE_MTIME_AUTO_REFINO_DISPATCHER_LOG=0
+export FLOW_HEALER_FAKE_LAUNCHCTL=stub_launchctl FLOW_HEALER_FAKE_MAIL=stub_mail FLOW_HEALER_FAKE_NOTIFY=stub_notify
+: > "$WORK/g2.err"
+g2_case disabled
+if grep -qE '^launchctl kickstart|^mail |^notify ' "$CALLS"; then
+  bad "disabled job was kickstarted/escalated: $(grep -E '^launchctl kickstart|^mail |^notify ' "$CALLS")"
+else
+  ok "disabled job: 8 frozen runs, no kickstart, no mail, no notify"
+fi
+eq "disabled job leaves no strikes" "$(cat "$FLOW_HEALER_STATE_DIR/auto-refino.strikes" 2>/dev/null || echo 0)" "0"
+eq "disabled job: the pause is logged (paused)" "$(grep -c '"event":"paused"' "$JSONL" || true)" "8"
+eq "disabled job: no doubt event (a known answer is not doubt)" "$(grep -c '"event":"paused-check-unreadable"' "$JSONL" || true)" "0"
+eq "disabled job: nothing on stderr" "$(wc -c < "$WORK/g2.err" | tr -d ' ')" "0"
+# Enabled again -> the old behaviour comes back, with neither event.
+g2_case enabled
+if grep -q '^launchctl kickstart -k' "$CALLS"; then ok "enabled job still kickstarted"; else bad "enabled job not kickstarted: $(cat "$CALLS")"; fi
+eq "enabled job: neither paused nor doubt event" "$(grep -cE "$EVENTS_RE" "$JSONL" || true)" "0"
+# launchctl could not answer (non-zero exit, or exit 0 without the table) -> fail-open is right (doubt
+# must not hide a stall) but it must be SEEN: it may not look like "enabled".
+for answer in fail garbled; do
+  : > "$WORK/g2.err"; g2_case "$answer"
+  if grep -q '^launchctl kickstart -k' "$CALLS"; then ok "$answer: unreadable disabled-state still kickstarts (doubt hides nothing)"; else bad "$answer: doubt hid the stall: $(cat "$CALLS")"; fi
+  eq "$answer: the doubt is logged (paused-check-unreadable, once per stalled run)" "$(grep -c '"event":"paused-check-unreadable"' "$JSONL" || true)" "8"
+  eq "$answer: not reported as paused" "$(grep -c '"event":"paused"' "$JSONL" || true)" "0"
+  if grep -q 'funnel-flow-healer: WARN: .*auto-refino-dispatcher' "$WORK/g2.err"; then ok "$answer: WARN on stderr names the job"; else bad "$answer: no stderr WARN (got: $(cat "$WORK/g2.err"))"; fi
+done
+# The label is matched literally: com.gascity.auto-refino-dispatcher must not pause a job whose label only
+# matches as a regex (the dots) - here a different job is the one disabled.
+reset_state; : > "$CALLS"; : > "$JSONL"
+job_ans=$(DISABLED_ANSWER=enabled; stub_launchctl() { printf 'disabled services = {\n\t"comXgascityXauto-refino-dispatcher" => disabled\n}\n'; }
+          FLOW_HEALER_FAKE_LAUNCHCTL=stub_launchctl job_disabled "com.gascity.auto-refino-dispatcher")
+eq "a look-alike label (dots as wildcards) is not this job" "$job_ans" "no"
+DISABLED_ANSWER=enabled
 unset FLOW_HEALER_FAKE_LAUNCHCTL FLOW_HEALER_FAKE_MAIL FLOW_HEALER_FAKE_NOTIFY FLOW_HEALER_FAKE_MTIME_AUTO_REFINO_DISPATCHER_LOG
 
 echo "== (h) flow-authority marker parsing (imp14): a Python-float expires_at must not abort (ga-nixb58) =="
@@ -260,7 +322,7 @@ seed_confirmed_gate; write_marker "$(marker_at "$FUT.938316")"
 out=$(run_two 2>/dev/null)
 eq "TSW active, float marker: run reaches its end" "$out" "reached-end"
 eq "TSW active, float marker: the pilot signature was still evaluated" "$([ -f "$FLOW_HEALER_STATE_DIR/pilot.strikes" ] && echo yes || echo no)" "yes"
-eq "TSW active, float marker: kickstart deferred (no launchctl call)" "$(grep -c '^launchctl' "$CALLS" || true)" "0"
+eq "TSW active, float marker: kickstart deferred (no kickstart call)" "$(grep -c '^launchctl kickstart' "$CALLS" || true)" "0"
 eq "TSW active, float marker: the deferral is logged (tsw-defer)" "$(grep -c '"event":"tsw-defer"' "$JSONL" || true)" "1"
 
 # i-2: the float marker is EXPIRED: nothing to defer to, so the kickstart must really happen.

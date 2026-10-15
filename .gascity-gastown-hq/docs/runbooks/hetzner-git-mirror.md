@@ -1,0 +1,104 @@
+# Espelho git do servidor Hetzner · runbook
+
+## Contents
+• O que é · Peças · Como funciona · Instalação · Operação
+• O que foi MEDIDO · O que foi INFERIDO · O que NÃO foi testado · Limites e resíduos · Como desfazer
+
+Bead ga-2hd02v.1.3 (fatia 4 do ga-2hd02v.1; desenho do ga-ukxa3k). Regras do Athos: servidor SEM credencial do GitHub; nenhum dado de lead/cliente nem backup de bead fora do mini.
+
+## O que é
+O servidor trabalha num clone próprio de cada rig e **devolve o trabalho ao origin pelo espelho do mini**; nunca fala com o GitHub. Gate, merge e push seguem no mini. Nenhuma sessão real roda no servidor até a fatia 6 (ga-2hd02v.1.5).
+
+```
+servidor (runner) ──ssh -p 2293──▶ túnel reverso ──▶ sshd próprio do mini, só chave, 127.0.0.1:2293
+ clone parcial + worktree/bead                        └─ comando forçado `hetzner-mirror.sh serve`: git-upload-pack | git-receive-pack | gt-mirror-spec
+                                      espelho bare por rig ◀─ sync (fetch + varredura de conteúdo) ◀─ GitHub
+                                      └─ publish ─▶ GitHub (sem force, só branches aceitas)
+```
+
+## Peças
+| peça | onde | faz |
+|---|---|---|
+| `scripts/hetzner-mirror.sh` | mini | `init sync publish status authorize sshd tunnel`; internos `serve hook pack-hook spec-out` |
+| `scripts/hetzner-mirror-scan.py` | mini | varre o CONTEÚDO de cada (blob, caminho) que um commit novo introduz; régua importada de `hetzner-pii-scan.py` (≥20 telefones ou ≥3 CPFs). **O que ele não sabe ler (binário, imagem, PDF, zip, UTF-16, fora de UTF-8) conta como sinalizado, não como limpo** |
+| `scripts/hetzner-remote-git.sh` | servidor, `~/gt-remote/bin/` | `bootstrap pull wt-add wt-rm status scan` |
+| `packs/town-deltas/assets/hetzner-mirror-{sshd,tunnel,sync}.plist` | mini (launchd) | sshd e túnel de pé; `sync` a cada 5 min |
+| `scripts/hetzner-mirror.selftest.sh` | — | hermético, 319 casos, 0 falhas, sshd real, 66 s com o mini a load 26–39 (`HMST_FAKE=1` troca o ssh por chamada direta, só para desenvolver) |
+| `<cidade>/.gc/hetzner-mirror/` · `~/gt-remote/{bin,git,keys}` | mini · servidor | estado (`repos/`, `state/<rig>/`, `authorized_keys`); só estas 3 pastas do servidor são desta fatia (o resto é do ga-zri39b) |
+
+## Como funciona
+**Filtro de dados = nome + pasta + CONTEÚDO.** Só por nome não basta: varredura de todo o histórico do WA achou 65 caminhos com listas de telefone/CPF e a Seção 1 do filtro de rsync pega 4; os outros 61 (43 ainda no HEAD) iriam ao servidor (`data/tracked_contacts.json` com 5.462 telefones, backup `.db` com 3.473, 14 `ab_results/*.json`, `.beads/backup/*`). O filtro do espelho é a Seção 1 + `.beads/ data/ logs/` + os caminhos que a varredura sinalizou (todas as versões do caminho, e o mesmo blob com outro nome).
+
+**"Limpo" é positivo.** Só passa como limpo o blob que o varredor LÊ como texto — UTF-8 estrito, sem NUL, sem cabeçalho de PDF/zip/gzip — e onde a régua não achou lista. Todo o resto (PNG, PDF, zip, UTF-16, latin-1, qualquer binário, blob >50 MB) tem o CAMINHO negado em todas as versões: não saber o que há dentro não é "limpo", e o NOME do arquivo não ajuda (`pdpj_<CPF>.png`, um `.zip` de leads com nome neutro). A régua ganhou versão: `seen.tsv` de outra régua (ou sem versão) não vale como cobertura, a história é relida inteira e o selo `gtmirror.scannedtips` do espelho e o `scanned-tips` do varredor caem ANTES da releitura, então o espelho fica inerte (rc 75 ao servidor) até a varredura nova terminar, em vez de servir com o filtro velho. A releitura grava o que já leu a cada 30 s (`seen.tsv` da régua nova); sem apagar o `scanned-tips` velho, uma rodada seguinte leria só o que veio depois dele e nunca veria a história que a régua nova ainda não leu (caso do selftest que reprova a versão sem essa linha).
+
+**Código → servidor.** `sync` busca o origin, varre o conteúdo novo e só então grava o filtro novo e a marca de cobertura das pontas. O `upload-pack` só serve com `--filter=sparse:oid=<filtro vigente>` E cobertura em dia; o servidor pergunta o filtro por `gt-mirror-spec` (rc 75 enquanto varre). Sem `GIT_PROTOCOL` (o sshd não aceita env) o git fala v0: **fetch por oid de blob omitido é recusado**, inclusive o lazy fetch.
+
+**Trabalho → origin.** O worker empurra `worker/<bead>` (ou `crew/`, ou `fix/` `feat/` nos rigs que usam). `pre-receive` recusa main/master, tag, apagar, reescrever, prefixo fora da lista e commit que toque caminho de dado. `post-receive` publica em segundo plano, sem force, pela URL (pelo remoto nomeado o git mexeria em `refs/remotes/origin`, que a cobertura precisa estável). Origin fora: o espelho guarda, `status` mostra `PENDENTE` + erro, o próximo `sync` publica.
+
+**Worktree.** `wt-add <rig> <bead> [base]` faz `pull`, cria `wt/<bead>` (branch `worker/<bead>`) com sparse-checkout do mesmo filtro e grava em `worktrees.jsonl` `main`, `main_age_min`, `lag_min` (idade da última varredura boa do espelho) e `pull` (`ok`|`erro`: com o espelho em atualização o worktree sai do que havia e **diz**). Todo `pull` grava `lag_min` em `pulls.jsonl`.
+
+## Instalação
+Coordene com o dono do ga-zri39b (servidor compartilhado). Rode do **caminho mergeado** `$GC_CITY_PATH/scripts/`: `init`/`authorize` recusam `.gc-worktrees` (hook e comando forçado carregam o caminho do script).
+
+```bash
+export HETZNER_MIRROR_HOME=$GC_CITY_PATH/.gc/hetzner-mirror; B=$GC_CITY_PATH/scripts/hetzner-mirror.sh
+$B init whatsapp_automation https://github.com/athosmartins/whatsapp-automation.git --seed ~/gt/whatsapp_automation/.git --prefix fix/ --prefix feat/
+$B init gascity https://github.com/athosmartins/gastown.git --seed ~/gt/.git --prefix fix/ --prefix feat/
+$B sync                      # 1º sync varre o histórico inteiro (ver MEDIDO); o servidor só é atendido depois
+ssh hetzner-teste 'umask 077; mkdir -p ~/gt-remote/{bin,git,keys}; ssh-keygen -q -t ed25519 -N "" -C gt-mirror -f ~/gt-remote/keys/gt_mirror'   # a privada nunca sai de lá
+ssh hetzner-teste 'cat ~/gt-remote/keys/gt_mirror.pub' > $HETZNER_MIRROR_HOME/server-key.pub
+scp -q $GC_CITY_PATH/scripts/hetzner-remote-git.sh hetzner-teste:gt-remote/bin/ && ssh hetzner-teste 'chmod 755 ~/gt-remote/bin/hetzner-remote-git.sh'
+$B authorize $HETZNER_MIRROR_HOME/server-key.pub; $B sshd start; $B hostkey > $HETZNER_MIRROR_HOME/server-known_hosts
+scp -q $HETZNER_MIRROR_HOME/server-known_hosts hetzner-teste:gt-remote/keys/gt_known_hosts; $B tunnel start hetzner-teste
+ssh hetzner-teste 'K=~/gt-remote/keys; R=~/gt-remote/bin/hetzner-remote-git.sh
+  for r in whatsapp_automation gascity; do $R bootstrap $r ssh://athos@127.0.0.1:2293/$r.git $K/gt_mirror $K/gt_known_hosts fix/ feat/; done; $R scan'
+```
+
+**Durável.** `start` só guarda um pid. Pare-os (`$B sshd stop; $B tunnel stop hetzner-teste`) e carregue os plists: `for n in hetzner-mirror-{sshd,tunnel,sync}; do cp $GC_CITY_PATH/packs/town-deltas/assets/$n.plist ~/Library/LaunchAgents/com.gascity.$n.plist; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.$n.plist; done`. O `sync` tem trava por rig (rodada em curso é pulada, não empilhada): dono vivo e legítimo = `outro sync em curso`, rc 0; pid morto, pid reaproveitado por OUTRO programa, ou trava sem pid há mais de 30 s = recolhida sozinha; dono vivo há mais de 1 h (`HETZNER_MIRROR_LOCK_MAX`) = `trava … parada`, rc 1 e `lastfetcherror` (mate o processo ou apague a pasta); erro de disco/permissão = `não consegui pegar a trava`, rc 1. A varredura é cortada em 30 min (`HETZNER_MIRROR_SCAN_TIMEOUT`) mas guarda o que leu a cada 30 s, então a releitura longa se completa em várias rodadas; fetch em 15 min e cada push em 5.
+
+**Troca para o caminho mergeado.** Antes do merge a prova rodou de uma cópia estável em `<cidade>/.gc/hetzner-mirror/bin/` (é o que hoje os hooks e a chave apontam). Depois: `$B init <rig> <url> [--prefix …]` (reescreve os hooks) e `$B authorize …/server-key.pub` (diz `comando forçado atualizado`); só então apague `bin/`.
+
+## Operação
+`$B status` (rc 0 só com tudo em dia: `pronto`, filtro `igual`, nenhum erro registrado, nada pendente e último fetch+varredura bons de menos de 60 min, `HETZNER_MIRROR_STALE_MIN`; passou disso diz `VELHO` e dá rc 1): por rig `pronto` (cobertura nas pontas atuais), idade do último fetch+varredura bons, caminhos negados por conteúdo, filtro `igual`/`DIFERENTE`, branches `pendentes ao origin`, últimos erros. No servidor: `hetzner-remote-git.sh status` (`publicada`/`PENDENTE`/`sem trabalho novo`).
+
+| sintoma | o que fazer |
+|---|---|
+| `pronto=NÃO` por mais de uns minutos | `$B sync <rig>`; erro em `lastfetcherror`; log em `<cidade>/.gc/logs/hetzner-mirror-sync-launchd.err`. O servidor segue com o que já baixou |
+| `pull` do servidor: `em atualização` (75) | normal durante `sync`; `wt-add` sai do que havia e grava `"pull":"erro"` |
+| `scan` do servidor: `VIOLAÇÃO` | filtro mudou depois do download, ou algo plantado: refaça o clone em diretório novo, não conserte à mão |
+| `scan` rc 2 | não consegui varrer (clone ilegível, lista ausente, nome de arquivo com quebra de linha); nunca é "limpo" |
+| `sync`: `caminho sinalizado que o filtro não consegue negar` | arquivo sinalizado (lista, ou que o varredor não sabe ler) com nome com quebra de linha/espaço no fim: o espelho NÃO avança a cobertura (de propósito: as pontas novas ficam sem serviço) e **o caso trava toda varredura seguinte**. Sai só quando o commit deixa de ser alcançável: branch que não é a main → apague a branch no origin e rode `sync`. Se está na **main** não há conserto dentro do espelho (o commit é histórico): decisão do Athos |
+| `sync`: `trava … parada` / `não consegui pegar a trava` | o 1º: um `hetzner-mirror.sh` vivo há mais de 1 h segura `repos/<rig>.git/gtm-fetch.lock` (`ps` no pid que está lá); o 2º: disco cheio/sem permissão em `repos/<rig>.git` |
+| `sync`: `varredura de conteúdo falhou … (cortada: passou de 1800s)` | a máquina está sobrecarregada demais para a releitura inteira (a do 1º sync, ou a que a mudança de régua força). A leitura de blobs grava `seen.tsv`/`deny-extra` a cada 30 s (`HETZNER_MIRROR_SCAN_CKPT`) e a rodada seguinte continua do último ponto gravado: basta o `sync` rodar de novo (o plist faz a cada 5 min); suba `HETZNER_MIRROR_SCAN_TIMEOUT` só se cada rodada for muito curta. O corte durante o `git log` inicial, ou antes do 1º checkpoint, não grava nada. Enquanto a varredura não fecha, `status` mostra `pronto=NÃO` e, se já gravou caminhos novos, `filtro=DIFERENTE` (o filtro que serve é o gravado no fim da última varredura boa; o `deny-extra` parcial só vale quando a cobertura avança) |
+| `serve.log` com recusas | alguém tentou outro comando com a chave; revogue apagando a linha de `authorized_keys` |
+
+## O que foi MEDIDO
+**Varredura nova (régua 2: ilegível = sinalizado), medida em 15/10 numa cópia CoW do espelho vivo do WA, sem tocar no vivo.** Mini a load 40–60, 10 núcleos, o processo com ~10% de CPU: a história inteira (35.667 pares, 35.356 blobs) fechou em **3 rodadas cortadas a 600 s, 1.634 s de relógio ao todo e 268 s de CPU** (254 user + 14 sys), pico de memória 373 MB, **512 blobs sinalizados e 189 caminhos negados (eram 64 com o varredor anterior)**; 91 deles estão no HEAD, os outros 98 só em versões antigas (40 `.pyc`, 24 `.db`…). **A mesma varredura sem checkpoint foi cortada pelo `timeout 1800` (rc 124, 212 s de CPU gastos, nada gravado)**: foi essa medição que levou ao checkpoint a cada 30 s, e é por isso que a 1ª releitura precisa do `sync` rodando de novo (plist a cada 5 min), não de uma rodada só. HQ, mesmo método: o HEAD (2.810 arquivos) tem 0 ilegíveis e 0 listas; a história inteira (26.259 pares) fechou em 2 rodadas, 1.087 s de relógio e 249 s de CPU (237 user + 11 sys), pico 320 MB, 1 blob sinalizado em 2 caminhos negados (`.beads-wisp/beads.db` e `.beads/daemon-….log.gz`, ambos já cobertos por nome, nenhum no HEAD).
+**HEAD do WA (7.686 arquivos) pela régua nova: 7.595 limpos, 43 com lista de telefone/CPF (18 `.py`, 18 `.json`, 4 `.md`, 2 `.js`, 1 `.txt`) e 48 que o varredor não sabe ler** (31 `.png`, 6 `.jpg`, 2 `.pdf`, 2 `.gz`, 2 `.onnx`, 1 `.db`, 1 `.raw`, 1 `.wasm`, 2 sem extensão). Dos 48, 3 (`.db`, 2 `.gz`) a Seção 1 do rsync já negava por nome; **os outros 45 chegavam ao servidor antes desta correção, incluindo `processo_lookup/debug_screenshots/pdpj_08997148621.png`** (nome com CPF, conteúdo imagem), e agora são negados.
+Ao vivo em 14/10, com o varredor ANTERIOR (mini com load 105–120, servidor a ~200 ms; log completo no comentário do ga-2hd02v.1.3). **1º `sync`: WA 268 s (35.667 pares, 64 caminhos negados por conteúdo), HQ 232 s (0 negados); `sync` incremental 11 s; `bootstrap` WA 178 s / 129 MB, HQ 124 s / 64 MB; `wt-add` 7 s (153 MB, 7.624 dos 7.691 arquivos); `scan` do servidor `limpo` nos dois.** Entrega: commit descartável de `worker/…` do servidor ao origin do WA em 27 s do `wt-add`, sem ação humana (`main_age_min=113`, `lag_min=9` gravados). Fronteira: `lib/action_log.py` está no servidor; `tests/test_phone_etl.py` dá `unadvertised object`; pelo túnel só `publickey` e um comando recusado de cada vez.
+**O custo: 91 arquivos do HEAD do WA não chegam ao servidor** (43 com lista + 48 ilegíveis, medido acima). Código/teste com telefone/CPF dentro: os 18 `.py` (testes como `test_phone_etl`, `test_ficha360_data`, `test_getzip_pipeline`, `test_obito_demandas`, mais `daemons/clientes_seed.py`, `scripts/draft_comparison_server.py`, `scripts/generate_draft_experiments.py`) e 2 `.js`; a saída é trocar números reais por sintéticos nas fixtures (a régua ignora número cujos 8 últimos dígitos têm ≤3 algarismos diferentes) — trabalho do WA. **Custo novo, de recurso e não de dado: o que o varredor não sabe ler também sai, mesmo sendo inocente** — os 2 modelos `lib/predictive_dialer/voicebot/*.onnx`, `office_ambience_8k.raw`, `viewer/sql-wasm.wasm`, os ícones `daemons/app_static/*.png`, `daemons/static/…` e as imagens/PDFs de `assets/warming_*`. Um worker que precise de um deles falha; liberar um formato exige o varredor aprender a LÊ-LO (decisão de produto, não desta fatia: abrir uma exceção por extensão reabriria `pdpj_<CPF>.png`). Lista exata: `state/whatsapp_automation/deny-extra`.
+**Os testes mordem.** Cópias com UMA guarda quebrada reprovam o teste da guarda (cobertura, limiar de conteúdo, `pre-receive`, filtro do `upload-pack`, `--no-abbrev`, `check-ignore -z`). Bugs reais que só apareceram porque os testes foram escritos para falhar: `git log --raw` ABREVIA o oid; o `nohup` do macOS falha sem tty (o `post-receive` nunca publicava sob o sshd); sem `-z` o `check-ignore` devolve o caminho escapado e o `scan` tratava um arquivo negado com `"`/`\`/tab no nome como permitido. Na correção do gate de 15/10: os casos novos reprovam o código anterior (43 de 304 casos no HEAD do commit anterior; 4 de 312 no varredor sem checkpoint) e o checkpoint "ingênuo" (sem derrubar o `scanned-tips` velho) reprova 3 casos; o que só apareceu **medindo** e não lendo: o corte de 1800 s jogava fora toda a releitura do WA sob carga.
+
+## O que foi INFERIDO
+• O sshd principal do mini oferece `publickey,password,keyboard-interactive` (medido com `ssh -o PreferredAuthentications=none -v`); que um túnel até a porta 22 exporia a senha do usuário a um servidor alugado é inferência de risco, não ataque testado.
+• Que o filtro vindo do espelho vale para outros rigs: só foi exercido em WA e HQ.
+
+## O que NÃO foi testado
+• **Plists carregados no launchd e sobrevivendo a reboot** (só `plutil -lint`; o caminho dentro deles é o mergeado). Hoje sshd e túnel são processos de pid e o `sync` só roda quando chamado: **até carregar os plists o clone do servidor envelhece**. A entrega (`story-delivery`) já exige o plist carregado.
+• Origin/GitHub fora **em produção** (só no selftest); recuperação do túnel após queda; branch empurrada no `gascity` (público: só clone e `scan` ao vivo); `property_scrapers`/`lexbh`/`marketing` (sem espelho; `data/` e `logs/` valem como pasta negada em QUALQUER rig); blob >50 MB; `sync` concorrente com push em produção.
+• `authorize` com `authorized_keys` ilegível: o ramo recusa, mas o `authorize` faz `chmod 600` antes de ler e o selftest não o provoca.
+• **A trava e o corte de varredura sob o launchd de verdade.** Pid reaproveitado, trava velha, trava sem pid, pid que não grava e varredura cortada foram provados no selftest (dono simulado com `exec -a hetzner-mirror.sh sleep`, gravação de pid falha com `umask 0577`); o plist do `sync` chama `/bin/bash …/hetzner-mirror.sh sync` (lido) e `ps -o command=` devolve 206 caracteres sem truncar (medido), mas o `sync` nunca rodou carregado no launchd.
+• **O espelho ao vivo.** Em 15/10 o `status` novo, rodado contra o estado real, deu rc 1 (`VELHO`, 207 min) e `sshd`/`túnel` estavam `parado` (os pids 37028/39450 de 14/10 não existem mais; plists não carregados): o servidor não está sendo atendido agora. O estado ao vivo ainda é da régua antiga (sem a versão no `seen.tsv`): o 1º `sync` depois do deploy relê a história inteira e derruba o selo `scannedtips` antes (o espelho fica inerte, rc 75, até acabar) — essa releitura NÃO foi rodada no espelho vivo, só numa cópia (ver MEDIDO).
+• Sessão real do claude no servidor (fatia 6) e se um worker sente falta dos 21 arquivos.
+
+## Limites e resíduos
+• A varredura é heurística de forma (telefone BR e CPF, ≥20/≥3): não vê nome, e-mail, CNPJ, endereço nem lista pequena, nem lista que está em texto legível mas codificada (base64, escapes) ou com dígitos que não são 0-9. O conteúdo que ela não sabe ler é sinalizado (custo declarado em MEDIDO), não aceito.
+• **O fluxo do rsync (`hetzner-pii-scan.py`, ga-zri39b) tem um ponto cego maior e NÃO é desta fatia**: lê com `errors="replace"` e não trata ilegível como sinalizado. Medido com 30 telefones: em ASCII, latin-1 e NUL+ASCII é retido; em UTF-16 e dentro de `.zip` **não** (rc 0, nada retido). Os dois limiares (20/3) são iguais nos dois varredores e um caso do selftest quebra se divergirem.
+• Os NOMES dos arquivos omitidos aparecem nas árvores; falso positivo por nome existe (`*.db-*` pega `com.whatsapp.db-sync.plist`; `*token*.toml` pega `token-ledger-harvest.toml`).
+• Bytes idênticos sob um caminho permitido chegam (fórmula copiada, arquivo vazio); o `scan` conta e não acusa. Um segredo copiado para um nome comum passaria.
+• Mudar filtro ou varredura não remove o que o servidor JÁ baixou. O `pre-receive` confere NOMES (todo status menos D: inclui troca de tipo e o que entra só num merge, via `--cc`), não conteúdo. Mini fora = o push espera.
+• A trava recolhida por pid morto ou sem pid não é atômica: dois processos que a vejam velha ao mesmo tempo podem os dois recolher e os dois seguir (janela de milissegundos, só depois de uma trava abandonada). O `sync` é idempotente e o `fetch` do git tem a própria trava, então o pior caso é um fetch recusado, não estado corrompido (inferido, não provocado).
+• O varredor lê o blob inteiro na memória antes de comparar com o limite de 50 MB; um blob enorme custa memória, não correção (ele sai sinalizado). `wt-add` descarta o `AVISO` de filtro mudado do `pull` (o `pull` avulso o mostra; o `scan` do servidor acusa o dado que ficou).
+
+## Como desfazer
+`$B tunnel stop hetzner-teste; $B sshd stop`; `launchctl bootout gui/$(id -u)/com.gascity.hetzner-mirror-{sshd,tunnel,sync}` e apagar os plists de `~/Library/LaunchAgents`; apagar a linha de `authorized_keys` revoga a chave. Servidor: `rm -r ~/gt-remote/git ~/gt-remote/keys ~/gt-remote/bin/hetzner-remote-git.sh`. Os espelhos em `repos/` se recriam com `init`.

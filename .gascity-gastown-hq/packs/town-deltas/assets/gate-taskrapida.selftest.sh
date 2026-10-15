@@ -332,13 +332,17 @@ CASE_CODES=$({ sed -En 's/.*expect "[^"]*" (normal|task-rapida|fast) ([a-z0-9-]+
 DISPATCHER_CODES="lib-not-loaded no-changed-files decision-errored"
 for c in $LIB_CODES; do
   case " $DISPATCHER_CODES " in *" $c "*) continue ;; esac
-  if printf '%s\n' "$CASE_CODES" | grep -qx "$c"; then ok "code with a case: $c"; else bad "code with NO case in this selftest: $c"; fi
+  # ga-ufeq1c: membership is asked of a here-string, not `printf | grep -q`. Under `set -o pipefail` grep -q quits at its first match, a printf
+  # still writing then dies of SIGPIPE, and the pipeline's 141 reads as "not found": a code that IS listed was reported missing at random
+  # (measured on the real lists, 100 passes of this loop's 22 checks: 5-6% false "missing" with the pipe, on the file as it was at HEAD
+  # too; 0 with the here-string. The two loops below have the same shape and the same fix, but were not measured separately).
+  if grep -qx "$c" <<<"$CASE_CODES"; then ok "code with a case: $c"; else bad "code with NO case in this selftest: $c"; fi
 done
 for c in $CASE_CODES; do
-  if printf '%s\n' "$LIB_CODES" | grep -qx "$c"; then :; else bad "a case expects the code '$c' but gate_taskrapida_codes does not list it"; fi
+  if grep -qx "$c" <<<"$LIB_CODES"; then :; else bad "a case expects the code '$c' but gate_taskrapida_codes does not list it"; fi
 done
 for c in $DISPATCHER_CODES; do
-  if printf '%s\n' "$LIB_CODES" | grep -qx "$c"; then ok "dispatcher-level code listed by the lib: $c"; else bad "dispatcher-level code '$c' is not in gate_taskrapida_codes (the tally would not know the bucket)"; fi
+  if grep -qx "$c" <<<"$LIB_CODES"; then ok "dispatcher-level code listed by the lib: $c"; else bad "dispatcher-level code '$c' is not in gate_taskrapida_codes (the tally would not know the bucket)"; fi
   if grep -q "GATE_TR_CODE=\"$c\"" "$DISPATCHER"; then ok "the dispatcher sets GATE_TR_CODE=$c on its own path"; else bad "the dispatcher never sets GATE_TR_CODE=\"$c\""; fi
 done
 # the weekly tally (python) buckets the lane's refusals by its own copy of this list: same codes, same words. A tally that does not know
@@ -513,7 +517,14 @@ L_TRL=$(grep -n 'SELFTEST-EXTRACT taskrapida-lib-load: BEGIN' "$DISPATCHER" | he
 L_GUARD=$(grep -n 'GATE_GUARD_LIB_ONLY=1' "$DISPATCHER" | head -1 | cut -d: -f1)   # E11's counter comes from the guard sourced lib-only: declared BEFORE the decision runs
 { [ -n "$L_TRL" ] && [ -n "$L_GUARD" ] && [ -n "$L_TRD_B" ] && [ "$L_TRL" -lt "$L_TRD_B" ] && [ "$L_GUARD" -lt "$L_TRD_B" ]; } && ok "the lib (line $L_TRL) and E11's counter (line $L_GUARD) are both loaded before the decision (line $L_TRD_B)" || bad "load placement: lib=$L_TRL guard=$L_GUARD decision=$L_TRD_B"
 # only the fast lane is special downstream: everything that is not exactly "fast" takes the normal merge path
-BAD_LANE_USES=$(grep -n 'GATE_LANE' "$DISPATCHER" | grep -F 'task-rapida' | awk -F: -v b="${L_TRD_B:-0}" -v e="${L_TRD_E:-0}" '($1 < b || $1 > e) && $0 !~ /^[0-9]+:[[:space:]]*#/' || true)
+# ga-ufeq1c: ONE other place may name the lane -- Phase C's restore of the label from the run's own record (SELFTEST-EXTRACT
+# phase-c-lane-restore, two lines: a reset to "normal" and an assignment), so that dispatcher_complete says which lane the run was
+# admitted under. It decides nothing: no branch of the merge path reads it as anything but "not fast". It is exempt as a delimited
+# block, never as a line pattern, so a use anywhere else (or a missing block) is still reported; gate-phase-c-lane-restore.selftest.sh
+# pins what the block does.
+L_RST_B=$(grep -n 'SELFTEST-EXTRACT phase-c-lane-restore: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
+L_RST_E=$(grep -n 'SELFTEST-EXTRACT phase-c-lane-restore: END' "$DISPATCHER" | head -1 | cut -d: -f1)
+BAD_LANE_USES=$(grep -n 'GATE_LANE' "$DISPATCHER" | grep -F 'task-rapida' | awk -F: -v b="${L_TRD_B:-0}" -v e="${L_TRD_E:-0}" -v rb="${L_RST_B:-0}" -v re="${L_RST_E:-0}" '($1 < b || $1 > e) && !($1 > rb && $1 < re) && $0 !~ /^[0-9]+:[[:space:]]*#/' || true)
 [ -z "$BAD_LANE_USES" ] && ok "no line outside the lane's own block treats GATE_LANE=task-rapida specially (the merge path is the normal gate's)" || bad "something else in the dispatcher special-cases task-rapida: $BAD_LANE_USES"
 
 echo
