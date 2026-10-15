@@ -45,6 +45,17 @@ allowed "gc mail archive 2 ids" gc mail archive ga-a ga-b
 allowed "gc mail send" gc mail send mayor -s Assunto -m 'corpo -com traço'; lastis "argv=[mail][send][mayor][--subject][Assunto][--message][corpo -com traço]"; ok $? "  argv canônico"
 allowed "gc mail reply" gc mail reply ga-abc -m ok
 allowed "gc session nudge" gc session nudge gastown.mayor olá mundo --delivery queue; lastis "argv=[session][nudge][gastown.mayor][olá][mundo][--delivery][queue]"; ok $? "  argv canônico"
+allowed "gc session nudge com a flag ANTES do alvo (o gc aceita flag em qualquer posição)" gc session nudge --delivery queue gastown.mayor oi; lastis "argv=[session][nudge][--delivery][queue][gastown.mayor][oi]"; ok $? "  argv canônico"
+# ids no formato REAL de produção: 653/653 ids de mail/wisp medidos na cidade (14/10) são <prefixo>-wisp-<sufixo>, com DOIS hífens
+allowed "gc mail read com id real de mail (ga-wisp-…)" gc mail read ga-wisp-0i6hr; lastis "argv=[mail][read][ga-wisp-0i6hr]"; ok $? "  argv canônico"
+allowed "gc mail peek --json com id real" gc mail peek ga-wisp-7afbf --json
+allowed "gc mail archive com 2 ids reais" gc mail archive ga-wisp-0i6hr ga-wisp-2mpem9c
+allowed "gc mail reply com id real" gc mail reply ga-wisp-0i6hr -m ok
+allowed "bd show em wisp" bd show ga-wisp-072rx --json
+allowed "bd comment em wisp" bd comment ga-wisp-072rx feito
+allowed "bd close em wisp" bd close ga-wisp-072rx --reason ok
+allowed "bd update em wisp" bd update ga-wisp-072rx --set-metadata story.a=b
+allowed "bd list --parent/--id com ids de wisp" bd list --parent ga-wisp-0i6hr --id ga-wisp-072rx,wa-wisp-0a0mav
 HOOKENV='{"GC_ALIAS":"gastown.dog-1","GC_AGENT":"gastown.dog-1","GC_SESSION_NAME":"dog-gavycydh","GC_MANAGED_SESSION_HOOK":"1","GC_HOOK_EVENT_NAME":"SessionStart"}'
 b=$(calls); wrap "$(rq gc "$HOOKENV" prime --hook)"; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && lastis "hook=1/SessionStart" && lastis "argv=[prime][--hook]"; ok $? "gc prime --hook (decisão do Mayor) + GC_MANAGED_SESSION_HOOK/GC_HOOK_EVENT_NAME chegam ao gc"
 b=$(calls); wrap "$(rq gc "$HOOKENV" prime --hook --hook-format codex)"; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && lastis "argv=[prime][--hook][--hook-format][codex]"; ok $? "gc prime --hook --hook-format codex (a forma que o hook REAL do mini manda)"
@@ -87,6 +98,12 @@ denied "bd close --force" "flag fora da lista" bd close ga-1 --force
 denied "bd close sem id" "faltam argumentos" bd close
 denied "id com ';'" "fora do formato" bd show 'ga-1;id'
 denied "id com \$()" "fora do formato" bd show 'ga-$(id)'
+denied "id de wisp com ';'" "fora do formato" bd show 'ga-wisp-1;id'
+denied "id de wisp com \$()" "fora do formato" gc mail read 'ga-wisp-$(id)'
+denied "id com segmento vazio" "fora do formato" bd show 'ga--x'
+denied "id terminado em hífen" "fora do formato" bd show 'ga-wisp-'
+denied "id com 3 hífens (o teto são 2: <prefixo>-wisp-<sufixo>)" "fora do formato" bd show 'ga-a-b-c'
+denied "id de wisp em --id com ';'" "fora do formato" bd list --id 'ga-wisp-1,ga-wisp-2;id'
 denied "id começando com '-'" "flag fora da lista" bd show -ga-1
 denied "id com espaço" "fora do formato" bd show 'ga-1 ga-2'
 denied "bd -C fora das rotas" "não é a cidade nem um rig" bd -C /etc show ga-1
@@ -129,6 +146,13 @@ denied "gc session nudge --delivery immediate" "fora do formato" gc session nudg
 denied "gc session nudge para alvo fora do nudge_pattern" "nudge_pattern" gc session nudge outra-sessao oi
 printf '{"city":"%s","identity_pattern":"(gastown\\\\.dog-1|dog-gavycydh)","bin_dirs":["%s"]}' "$CITY" "$FB" > "$T/conf-nonudge.json"
 CONF_OVERRIDE="$T/conf-nonudge.json" denied "gc session nudge com a config SEM nudge_pattern" "sem a chave" gc session nudge gastown.mayor oi
+denied "gc session nudge com flag primeiro e alvo fora do nudge_pattern" "nudge_pattern" gc session nudge --delivery queue outra-sessao oi
+# o guarda tem que olhar o alvo que o gc usa (o 1º posicional), não o args[0]: com um padrão de NEGAÇÃO ("qualquer um menos o Mayor") a flag na frente o furava
+printf '{"city":"%s","identity_pattern":"(gastown\\\\.dog-1|dog-gavycydh)","nudge_pattern":"(?!gastown\\\\.mayor$)[a-z0-9._-]+","bin_dirs":["%s"]}' "$CITY" "$FB" > "$T/conf-denynudge.json"
+CONF_OVERRIDE="$T/conf-denynudge.json" denied "nudge (padrão de negação) direto ao alvo vetado" "nudge_pattern" gc session nudge gastown.mayor oi
+CONF_OVERRIDE="$T/conf-denynudge.json" denied "nudge (padrão de negação) com --delivery ANTES do alvo vetado" "nudge_pattern" gc session nudge --delivery queue gastown.mayor oi
+CONF_OVERRIDE="$T/conf-denynudge.json" denied "nudge (padrão de negação) com -- ANTES do alvo vetado" "nudge_pattern" gc session nudge -- gastown.mayor oi
+CONF_OVERRIDE="$T/conf-denynudge.json" allowed "nudge (padrão de negação) com flag antes de alvo permitido" gc session nudge --delivery queue outra-sessao oi
 denied "ferramenta dolt" "comando fora da lista" dolt sql
 denied "ferramenta bw" "comando fora da lista" bw get password x
 denied "ferramenta security" "comando fora da lista" security find-generic-password

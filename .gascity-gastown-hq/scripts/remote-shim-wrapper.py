@@ -29,7 +29,7 @@ LISTA PERMITIDA
 
 POR QUE RECUSA EM VEZ DE ADAPTAR (está na lista / não está / não consegui saber — o último não vira "está")
   Config ilegível, routes.jsonl ilegível, log de auditoria que não grava, identidade fora do padrão, ferramenta que não achei → não executa.
-  A requisição é registrada (hash do argv, nunca o texto) ANTES de rodar; sem rastro não há execução.
+  A requisição é registrada (hash do argv, nunca o texto; uma RECUSA grava o motivo, que pode citar até 60 caracteres do argumento) ANTES de rodar; sem rastro não há execução.
 
 SUBCOMANDOS
   serve --config CONF                    forced-command (SSH_ORIGINAL_COMMAND na entrada)
@@ -74,7 +74,7 @@ def _fm(p: str):
     return lambda s: c.fullmatch(s) is not None
 
 
-ID = r"[A-Za-z][A-Za-z0-9]{0,15}-[A-Za-z0-9]{1,16}(?:\.[0-9]{1,4}){0,3}"
+ID = r"[A-Za-z][A-Za-z0-9]{0,15}(?:-[A-Za-z0-9]{1,16}){1,2}(?:\.[0-9]{1,4}){0,3}"  # 2 hífens são os wisps/mails reais (ga-wisp-0i6hr: 653/653 medidos em 14/10); 3 ou mais não existem
 
 
 def v_text(s: str) -> bool:
@@ -129,7 +129,7 @@ class Rule:
         return " ".join(s)
 
     def apply(self, args: list[str]) -> list[str]:
-        """Recebe o argv depois das palavras fixas; devolve os argumentos a executar (a ORDEM do cliente, flags curtas viram longas) ou levanta Refused."""
+        """Recebe o argv depois das palavras fixas; devolve (argumentos a executar na ORDEM do cliente, flags curtas viram longas; só os posicionais, na ordem) ou levanta Refused."""
         out, pos, seen, i, dd = [], [], set(), 0, False
         while i < len(args):
             a = args[i]
@@ -170,7 +170,7 @@ class Rule:
             p += take
         if p != len(pos):
             raise Refused("argumento a mais")
-        return out
+        return out, pos
 
 
 _J = {"--json": F()}
@@ -296,8 +296,9 @@ def decide(cfg: dict, tool: str, argv: list[str], env: dict) -> tuple[Rule, list
     for r in sorted(cand, key=lambda r: -len(r.words)):
         try:
             args = argv[len(r.words):]
-            final = list(r.words) + r.apply(args)
-            if r.words == ("session", "nudge") and not (cfg["nudge_re"] and cfg["nudge_re"].fullmatch(args[0])):
+            out, pos = r.apply(args)
+            final = list(r.words) + out
+            if r.words == ("session", "nudge") and not (cfg["nudge_re"] and cfg["nudge_re"].fullmatch(pos[0])):  # pos[0] é o alvo que o gc usa; args[0] podia ser uma flag
                 raise Refused("alvo do nudge fora do nudge_pattern da config (sem a chave na config, nudge não roda)")
             return r, final, cwd, env
         except Refused as e:
