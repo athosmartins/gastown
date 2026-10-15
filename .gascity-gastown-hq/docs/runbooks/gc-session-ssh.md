@@ -3,7 +3,7 @@
 ## Contents
 
 • O que esta fatia é — e o que não é · Como ligar (config, city.toml, janela do engine) · Operações
-• Teto do host e o MBP · Quando o ssh não responde · Medido, inferido, não testado · Pontos em aberto · Limites
+• Teto do host · **O MBP como host (ga-w7qwl1)** · Quando o ssh não responde · Medido, inferido, não testado · Pontos em aberto · Limites
 
 Bead ga-2hd02v.1.1 (fatia 2 do ga-2hd02v, desenho do estudo ga-ukxa3k, aprovada por Athos em 14/10 18:42). **Entrega duas peças:** (1) `scripts/gc-session-ssh`, o provider no protocolo `exec:` do engine, que abre as sessões de pool num host remoto por ssh com a mesma interface das locais; (2) um patch do engine, `docs/pending-engine-window/ga-2hd02v-hybrid-remote-exec.patch`, que deixa o provider híbrido usar esse script como lado remoto. **O patch NÃO está aplicado**: nada foi compilado, trocado nem reiniciado em produção. Sem o patch o script já funciona sozinho (`GC_SESSION=exec:<cidade>/scripts/gc-session-ssh` serve um teste isolado), mas só o patch deixa a cidade rodar sessões locais e remotas juntas.
 
@@ -80,11 +80,72 @@ O **prompt de partida** também vai (campos `prompt_suffix` e `prompt_flag` do J
 
 **O que o `start` NÃO faz** (cada item é de outra fatia ou é recusa de propósito; o que for pedido e ignorado aparece em `ignored` no dry-run e no log): `pre_start`, `session_setup*`, `session_live`, `pack_overlay_dirs`/`overlay_dir`, `copy_files` e `nudge` do JSON do start (o provider exec do engine também não entrega este último: quem entrega é o `Nudge` depois do `start`).
 
-## Teto do host e o MBP
+## Teto do host
 
 O teto é **por host e contado à parte do teto do mini**: a contagem é `tmux -L <socket> list-sessions` do próprio host, no mesmo script que cria a sessão, sob `flock`. O teto N aceita N sessões e recusa a N+1 com `host H está no teto: N de N sessões` (exit 1); “já existe” sai como `session X already exists`, que o engine converte em `ErrSessionExists`. O teto do mini não muda.
 
-**O MBP (ga-w7qwl1) reaproveita o provider** sem código novo: outra entrada em `hosts` (outro `ssh`, outro `cap`, outro `remote_root`) e outra instância do provider com `GC_SSH_HOST=mbp`. Cada host tem o seu estado em `<estado>/<host>/` e a sua contagem.
+## O MBP como host (ga-w7qwl1)
+
+**Estado: código e testes prontos; NADA está vivo, e nenhuma sessão rodou no MBP.** O provider agora sabe ser um host seguro para o notebook do Athos; o resto do caminho até "uma bead construída no MBP numa madrugada" é de outras entregas, nesta ordem: (1) a janela do engine que aplica o patch do híbrido, e a decisão do Mayor de ligar `[session] provider = "hybrid"`; (2) o bundle de settings/hooks do `remote-bundle-build.py` instalado em `/Users/athos/gt-remote/bundle` no MBP, mais os atalhos `bd`/`gc`/`gate-done` do MBP para o mini (a .1.2 só fez o lado do servidor Hetzner); (3) clone do rig e credencial de push no MBP (o código vai ao origin direto de lá); (4) um pool `…-remote-mbp-…` e o roteamento do Pilot para ele, usando `gc-session-ssh gate mbp` como medida de demanda; (5) a noite de canário. Até (2) estar pronto, um `start` no MBP abre e cai com `comando não encontrado` (o lançador confere a 1ª palavra do comando).
+
+**Config** (no mesmo `session-ssh.json` do servidor; o `ssh` é o `MAC_HOST` do `mbp-run.sh`):
+
+```json
+"mbp": {"ssh": "athos@athoss-macbook-pro.local", "cap": 2,
+        "remote_root": "/Users/athos/gt-remote/bundle", "remote_home": "/Users/athos", "mini_home": "/Users/athos",
+        "path_extra": ["/opt/homebrew/bin", "/Users/athos/.local/bin"],
+        "presence_gate": true, "sleeps": true}
+```
+
+| chave | para quê |
+|---|---|
+| `path_extra` | dirs à frente do PATH do ssh (sem login o MBP só tem `/usr/bin:/bin:/usr/sbin:/sbin`; o `tmux` e o `node` estão em `/opt/homebrew/bin`, medido) |
+| `presence_gate` | liga a regra de presença no `start`, o `nice 10` e o vigia da sessão |
+| `gate_cmd` | lista; padrão `<cidade>/scripts/mbp-run.sh --check`, o MESMO veredito do `mbp-offload.sh` (bandeira, pausa, presença, saúde, `slot_cap`) |
+| `presence_lib` | padrão `<remote_home>/gt-remote/bin/mbp-presence.sh` (instalada por `mbp-offload.sh install-mbp`); sem ela o `start` recusa |
+| `watch_s` | intervalo do vigia, 5 s |
+| `sleeps` | o host pode estar fora do ar sem que isso seja anormal (ver `list-running`) |
+
+**Qual host.** `$GC_SSH_HOST` > o que o nome da sessão pede (`<papel>-remote-<host>-<n>`, ex.: `wa-worker-remote-mbp-1`; é o mesmo `-remote-` do `remote_match` do híbrido) > `default_host`. Nome que pede um host fora da config recusa dizendo qual. Assim o servidor e o MBP convivem sob UM `remote_exec`.
+
+**Quem abre (regra do Athos, ga-77c1qg): só evidência positiva de "Athos fora e MBP saudável".** A cada `start`, antes de qualquer ssh de abertura:
+
+| o que a checagem diz | `start` |
+|---|---|
+| rc 0, `presence=livre`, `paused=0`, `paused_local=0`, `offload_flag=on`, `slot_cap` ≥ 1 | abre; teto = menor entre `cap` e `slot_cap` |
+| rc 99 (bandeira desligada ou pausa) | recusa |
+| rc 98 (RAM, pressão, swap, bateria ou ssh) | recusa |
+| rc 0 mas `presence` ≠ `livre` (em uso, input recente, tela em uso, ilegível) | recusa |
+| saída vazia ou ilegível, comando que não roda ou passa de 60 s, `slot_cap` ausente ou 0 | recusa |
+
+A recusa sai com exit 1 e o motivo (`host mbp: não abro sessão nova — Athos está no MBP (presença=uso, motivo=input_recente)`), não faz nenhum ssh de abertura e deixa uma linha `refused` em `<estado>/mbp/events.jsonl`. Como a checagem roda em TODO start, "o Athos voltou → nenhuma sessão nova" vale na próxima tentativa, sem esperar varredura do Pilot. `gc-session-ssh gate mbp` dá o mesmo veredito sem abrir nada (JSON; exit 0 libera, 1 recusa): é o que um pool deve consultar para decidir se quer sessão agora, em vez de pedir e levar recusa.
+
+**Se ele volta com a sessão rodando.** Cada sessão nasce em `nice -n 10` com um vigia ao lado (bash + biblioteca de presença do host, a cada `watch_s`): voltou ou pausou → `renice 19` + `taskpolicy -b` em toda a árvore da sessão, e nunca mais sobe (o mesmo do `mbp_supervise` do `mbp-run.sh`). A sessão **não é morta**: termina sob prioridade de fundo, e a bead continua com ela. O provider NÃO devolve bead à fila: matar um build no meio é pior que deixá-lo terminar devagar (o que `taskpolicy -b` compra foi medido no ga-77c1qg: −3% no primeiro plano com 1 execução em fundo), e a bead só volta se a sessão morrer, pelo caminho que já existe. O vigia termina com a sessão.
+
+**`list-running` com mais de um host.** Junta todos os hosts da config (ou só o de `$GC_SSH_HOST`). Host que não responde = erro, nunca lista vazia — **salvo** host `sleeps` sem nenhuma sessão nossa registrada em `<estado>/<host>/running/` (criada no `start`, apagada no `stop`, corrigida sozinha quando o host responde): ali "não responde" é só o notebook fora do ar, e não pode derrubar a lista do servidor. Registro que não dá para ler conta como "há sessão" (não sei não vira "nada lá").
+
+**Placar.** `scripts/session-host-scoreboard.py [--noites N] [--json]`: por noite (20:00 → 08:00) e por host, construtores, revisores e recusas por motivo. Mini = eventos `session.woke` do engine (conta o pedido do engine, não a abertura confirmada); hosts remotos = `started`/`refused` do provider.
+
+**Nada de segredo novo no MBP.** O provider leva só comando, `GC_*`/`TERM`/`LANG`/`LC_*`/`TZ` e o prompt de partida; variável com `TOKEN|SECRET|PASSWORD|KEY…` no nome não vai sem `env_allow`; o diretório de trabalho cai dentro de `remote_root` (teste `mbp:` do selftest). A guarda de `/Users/` agora aceita só o home do PRÓPRIO host (`/Users/athos` no MBP) e continua recusando o de outro usuário; com o MBP e o mini no mesmo `/Users/athos`, um caminho do mini fora de `~/gt` passa pela guarda (o lançador ainda confere a 1ª palavra do comando e o `cd` do diretório de trabalho).
+
+**MEDIDO (15/10).**
+* MBP: Darwin arm64, macOS 27.0.1, bash 3.2.57, `tmux 3.6a`, `claude 2.1.299` e `node` em `/opt/homebrew/bin`; `git` em `/usr/bin`; sem `flock` (não precisa: o `flock` é do lado do mini) e sem `gh`; `taskpolicy` e `caffeinate` presentes; PATH sem login = `/usr/bin:/bin:/usr/sbin:/sbin`; `~/gt-remote/bin/mbp-presence.sh` já instalado; `pmset`: `sleep 0` na tomada (o Mac não dorme por ociosidade), `displaysleep 180`.
+* `mbp-run.sh --check` ao vivo, duas leituras: com o Athos fora (ocioso 8149 s) rc 0, `presence=livre`, `slot_cap=2`; cerca de 30 min depois, com ele no MBP (`idle_s=0`) e pressão de memória 2, rc 98, `presence=uso`, `slot_cap=1` — e `gc-session-ssh gate mbp` com a config real recusou: `MBP sem saúde ou fora do ar (rc 98)`. A regra recusa de verdade no notebook em uso.
+* Selftest hermético (`gc-session-ssh.selftest.sh`, grupo `mbp`, 53 casos; resumo completo no comentário final do bead). O "host" do teste é o próprio mini (macOS: bash 3.2 e `ps`/`awk` BSD, os mesmos do MBP) com tmux em socket de teste, e `renice`/`taskpolicy` falsos que registram o pid.
+
+**INFERIDO.** As mensagens de erro do `tmux 3.6a` (`no server running`, `error connecting to … (No such file or directory)`) são as mesmas do tmux 3.x do mini, de onde saiu o `sessions()`; o `ps -e -o pid= -o ppid=` do MBP é o do mini (mesmo macOS).
+
+**NÃO TESTADO.**
+* Qualquer sessão real no MBP por este provider. O teste ao vivo (`start` de um `cat` num socket de teste do MBP, `peek`, vigia com a `mbp-presence.sh` de verdade, `stop`, limpeza) foi preparado e NÃO rodou porque o Athos estava usando o MBP — a regra recusou, que é o comportamento certo. Fica para uma janela com o MBP livre.
+* O vigia com `renice`/`taskpolicy` de verdade. Os testes provam QUEM é rebaixado e QUANDO; o efeito do `taskpolicy -b` já foi medido no ga-77c1qg. Observação: o `ps -o nice` do mini mostra 20 para quem roda sob prioridade de fundo, até para `nice -n 10`, então o valor absoluto de nice não serve de prova num teste rodado por uma sessão de agente.
+* MBP dormindo ou de tampa fechada: na tomada o `pmset` hoje impede dormir; na bateria ou de tampa fechada o Mac pode dormir, a sessão congela, `is-running` e `list-running` dão erro (por desenho) e a bead fica `in_progress` até ele acordar. O reclaim guard NÃO foi verificado para sessão remota congelada.
+
+**Pontos em aberto (MBP).**
+1. A sessão roda como o usuário do Athos, com `--dangerously-skip-permissions`, e portanto enxerga o home inteiro do notebook. O que limita: `cwd` e caminhos reescritos para `remote_root`, ambiente filtrado, e as regras `deny` do bundle (INFERIDO que valem sob `--dangerously-skip-permissions`; não testado). Não há usuário macOS dedicado — decisão de risco que cabe ao Athos se quiser mais isolamento.
+2. O `start` custa uma ida extra ao MBP (`mbp-run.sh --check`, ~1–3 s) antes do ssh de abertura, e a recusa NÃO é lembrada: um pool que insiste em pedir sessão enquanto a regra recusa gera uma checagem (um ssh ao MBP) e uma linha `refused` por tentativa. Por isso o pool deve consultar `gate mbp` antes de pedir (fatia 3), não depender da recusa do `start`.
+3. O `slot_cap` vem da RAM livre de agora e não desconta as sessões que o provider já abriu; o teto real é `min(cap, slot_cap)` comparado ao número de sessões do provider.
+4. **O notebook cai da rede com sessão aberta.** `is-running` sai 1 (erro), e o ponto 5 dos pontos em aberto do provider (o engine lê esse erro como `false`) pesa muito mais num notebook do que num servidor: wifi que troca de rede, tampa fechada, reinício. O efeito possível é o engine achar a sessão morta, reabrir a mesma ou reclamar a bead enquanto ela segue rodando no MBP quando ele volta. O provider não esconde o erro (devolver `true` com o host fora do ar esconderia sessão morta de verdade). Decidir isto — retentativa no `is-running`, ou o Pilot/reclaim guard tratando "host `sleeps` sem resposta" como "não sei" — é parte do pool/roteamento (item 4 do estado acima), e precisa de uma medida no engine com o patch aplicado.
+5. **O host do notebook TEM que levar `presence_gate: true`.** É o único jeito de a regra do Athos valer; uma entrada `mbp` sem ele abre sessão com o Athos usando o MBP. O provider recusa valor que não seja `true`/`false` (um `"true"` em texto não passa), mas não adivinha qual host é um notebook.
 
 ## Quando o ssh não responde
 
@@ -128,5 +189,5 @@ Medido nas duas formas (porta fechada, e script com `ssh` falso que não respond
 ## Limites
 
 * Produção: **nada foi aplicado ao engine**. O patch está só em `docs/pending-engine-window/` e o Mayor agenda a janela (aplicar com `git apply`, `go build`, trocar o binário, reiniciar o supervisor — nesta ordem e só lá).
-* Código de produção: o provider tem 476 linhas e o patch do engine 34 (o resto do patch são testes e docs): ~500, abaixo das 800 do gate E11.
+* Código de produção: o provider tinha 476 linhas e o patch do engine 34. A fatia do MBP (ga-w7qwl1) soma ~160 no provider e ~160 no placar (`session-host-scoreboard.py`) e não toca o patch do engine: ~320 nesta fatia, abaixo das 800 do gate E11.
 * Um ssh por operação: para dezenas de sessões o custo é o do ControlMaster (reaproveitado), não de uma conexão nova por chamada.

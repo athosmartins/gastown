@@ -3,7 +3,7 @@
 ## Contents
 
 • Por quê e resultado medido (11/10/2026) · Como ligar e desligar · **Presença do Athos: o MBP é o notebook dele (ga-77c1qg)** · Como usar
-• Revisor do gate (ga-xm1jfl) · **Atalho do pytest dos workers e crews (ga-fl2nek)** · **Nó Linux de testes (Hetzner, ga-zri39b)** · REA pesado: `rea-run.sh` · Códigos de saída · O que mora no MBP (`~/gt-remote`) · Manutenção
+• Sessões de pool no MBP (ga-w7qwl1) · Revisor do gate (ga-xm1jfl) · **Atalho do pytest dos workers e crews (ga-fl2nek)** · **Nó Linux de testes (Hetzner, ga-zri39b)** · REA pesado: `rea-run.sh` · Códigos de saída · O que mora no MBP (`~/gt-remote`) · Manutenção
 • Limites conhecidos
 
 ## Por quê e resultado medido (11/10/2026)
@@ -68,6 +68,9 @@ Ou seja: com ele fora, `nice 10` é aceitável; com ele presente, só prioridade
 **Registro.** Cada linha de `mbp-run.jsonl` ganhou `"presence":"livre|uso"` (o modo em que largou) e `"demoted":0|1` (rebaixada no meio); recusas ganham `presence` e a pausa no MBP é uma recusa com `"rc":99,"reason":"pausado_mbp"`. Linhas antigas, sem `presence`, entram no total do dia como "sem presença registrada".
 
 **O que NÃO foi observado ao vivo.** O MBP estava bloqueado e ocioso o tempo todo do teste (ociosidade > 2 h): o ramo "Athos fisicamente de volta" (desbloquear, mexer no mouse) foi coberto por simulação fiel ao plist real, e o rebaixamento no meio foi observado ao vivo acionando a pausa (nice 10 → 20 em < 9 s), não por input. Conferir quando ele estiver usando: `mbp-offload.sh status` deve virar `EM USO` em ≤ 1 min depois que ele mexe no MBP (cada `status` lê a presença na hora).
+
+## Sessões de pool no MBP (ga-w7qwl1)
+**Estado:** o provider `scripts/gc-session-ssh` já aceita o MBP como host sob esta MESMA regra de presença; nada está vivo (falta o patch do híbrido no engine, o bundle e os atalhos `bd`/`gc` no MBP, o clone do rig e o pool/roteamento do Pilot). Um `start` só abre com evidência positiva de "Athos fora e MBP saudável" — a checagem é o `mbp-run.sh --check` deste runbook (bandeira, pausa, presença, saúde, `slot_cap`) — e o teto de sessões do host é o menor entre o `cap` da config e o `slot_cap`. A sessão nasce em `nice 10` e, se ele voltar ou pausar, um vigia rebaixa a árvore para prioridade de fundo (a sessão não é morta). Detalhes, config e o que falta: `docs/runbooks/gc-session-ssh.md`, seção "O MBP como host". Placar por host e por noite: `scripts/session-host-scoreboard.py`.
 
 ## Como usar
 ```bash

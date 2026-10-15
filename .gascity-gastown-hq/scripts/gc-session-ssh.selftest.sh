@@ -32,7 +32,7 @@ for v in $(env | sed -n 's/^\(GC_[A-Za-z0-9_]*\)=.*/\1/p') TMUX TMUX_PANE GC_SSH
 T=$(cd "$(mktemp -d /tmp/gcs.XXXXXX)" && pwd -P)  # curto: o caminho do socket do tmux tem limite de ~100 caracteres
 SOCK="gct$$"
 export TMUX_TMPDIR="$T/tmux"; mkdir -p "$TMUX_TMPDIR" "$T/bin" "$T/home" "$T/remote/home" "$T/state"
-cleanup() { for s in "$SOCK" "${SOCK}b"; do tmux -L "$s" kill-server 2>/dev/null; done; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
+cleanup() { for s in "$SOCK" "${SOCK}b" "${SOCK}m"; do tmux -L "$s" kill-server 2>/dev/null; done; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
 trap cleanup EXIT
 fails=0; n=0
 ok() { n=$((n+1)); if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; fails=$((fails+1)); fi; }
@@ -46,6 +46,7 @@ cat > "$T/bin/ssh" <<'EOF'
 [ -z "${FAKE_SSH_FAIL:-}" ] || { echo "ssh: connect to host fakehost port 22: Connection timed out" >&2; exit 255; }
 [ -z "${FAKE_SSH_HANG:-}" ] || exec sleep 30
 while [ $# -gt 0 ]; do case "$1" in -o) shift 2;; -*) shift;; *) break;; esac; done
+[ -z "${FAKE_SSH_FAIL_HOST:-}" ] || [ "$FAKE_SSH_FAIL_HOST" != "$1" ] || { echo "ssh: connect to host $1 port 22: Operation timed out" >&2; exit 255; }
 shift
 [ -z "${FAKE_SSH_NOISE:-}" ] || echo "bashrc: bem-vindo ao servidor"
 if [ -n "${FAKE_SSH_JUNK:-}" ]; then cat >/dev/null; echo "saida sem marcadores"; exit 0; fi
@@ -260,7 +261,139 @@ g_terr() {  # o tmux do host responde mas não consegue olhar (socket sem permis
   pv stop te-1 </dev/null
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; return 0; }
+
+# ---------- mbp: o MBP como host (ga-w7qwl1) — regra de presença no start, host pelo nome da sessão, vigia de prioridade, eventos ----------
+cfgm() {  # cfgm [EXTRA-JSON-do-host-m]  → $T/cfg.json com a (padrão, sem regra), m (o "MBP": presença, PATH extra, dorme) e h (home em /Users, só dry-run)
+  mkdir -p "$T/extra" "$T/lib"
+  jq -n --argjson extra "${1:-{\}}" --arg rr "$RR" --arg rh "$RH" --arg s "$SOCK" --arg chk "$T/bin/fake-check" --arg lib "$T/lib/presence.sh" --arg ex "$T/extra" \
+    '{default_host:"a", hosts:{a:{ssh:"fakehost",cap:3,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test"},
+      m:({ssh:"fakembp",cap:2,remote_root:$rr,remote_home:$rh,socket:($s+"m"),mini_home:"/Users/test",presence_gate:true,sleeps:true,watch_s:1,
+         gate_cmd:[$chk],presence_lib:$lib,path_extra:[$ex]}+$extra),
+      h:{ssh:"fakehost",cap:1,remote_root:"/Users/athos/gt-remote/bundle",remote_home:"/Users/athos",socket:($s+"h"),mini_home:"/Users/test"}}}' > "$T/cfg.json"
+}
+setup_mbp() {
+  mkdir -p "$T/lib" "$T/extra"
+  cat > "$T/bin/fake-check" <<EOF
+#!/bin/sh
+# falso do \`mbp-run.sh --check\`: a resposta vem do arquivo $T/chk.mode
+case "\$(cat "$T/chk.mode" 2>/dev/null)" in
+  livre)    printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=%s\n' "\${SLOT:-3}"; exit 0 ;;
+  slot1)    printf 'presence=livre\npresence_why=bloqueada\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=1\n'; exit 0 ;;
+  uso)      printf 'presence=uso\npresence_why=input_recente\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\n'; exit 0 ;;
+  pausado)  printf 'presence=livre\npaused=1\npaused_local=0\noffload_flag=on\nslot_cap=3\n'; exit 99 ;;
+  semsaude) printf 'presence=livre\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\n'; exit 98 ;;
+  pausalocal) printf 'presence=livre\npaused=0\npaused_local=1\noffload_flag=on\nslot_cap=3\n'; exit 0 ;;
+  flagoff)  printf 'presence=livre\npaused=0\npaused_local=0\noffload_flag=off\nslot_cap=3\n'; exit 0 ;;
+  semcap)   printf 'presence=livre\npaused=0\npaused_local=0\noffload_flag=on\n'; exit 0 ;;
+  cap0)     printf 'presence=livre\npaused=0\npaused_local=0\noffload_flag=on\nslot_cap=0\n'; exit 0 ;;
+  sempresenca) printf 'paused=0\npaused_local=0\noffload_flag=on\nslot_cap=3\n'; exit 0 ;;
+  lixo)     echo banana; exit 0 ;;
+  *)        exit 0 ;;   # vazio: saiu 0 sem dizer nada
+esac
+EOF
+  chmod +x "$T/bin/fake-check"
+  # biblioteca de presença falsa (o modo vem de $T/pres.mode, a pausa de $T/pres.pause): as mesmas variáveis da mbp-presence.sh de verdade
+  printf 'presence_eval() { PR_MODE=$(cat "%s/pres.mode" 2>/dev/null || echo uso); PR_PAUSED=0; [ -e "%s/pres.pause" ] && PR_PAUSED=1; return 0; }\n' "$T" "$T" > "$T/lib/presence.sh"
+  echo livre > "$T/pres.mode"; rm -f "$T/pres.pause"
+}
+mode() { echo "$1" > "$T/chk.mode"; }
+nicen() { ps -o nice= -p "$1" 2>/dev/null | tr -d ' '; }
+wait_nice() {  # wait_nice PID MIN SEGUNDOS → 0 se o nice de PID chegou a MIN
+  local i n; for i in $(seq 1 $(( $3 * 4 ))); do n=$(nicen "$1"); [ -n "$n" ] && [ "$n" -ge "$2" ] 2>/dev/null && return 0; sleep 0.25; done; return 1
+}
+
+g_mbp() {
+  setup_mbp; cfgm; fresh; local pid i m
+  # --- dry-run: o que o start do MBP leva ---
+  mode livre; pv --dry-run start w-remote-m-0 < <(req "claude --x"); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = m ]; ok $? "mbp: o nome w-remote-m-0 escolhe o host m (dry-run)"
+  [ "$(jq -r '.gate[0]' "$T/out")" = "$T/bin/fake-check" ] && [ "$(jq -r '.path_extra[0]' "$T/out")" = "$T/extra" ]; ok $? "mbp: o dry-run mostra a checagem de presença e o PATH extra do host"
+  jq -r '.launcher[]' "$T/out" | grep -q '^nice -n 10 sh -c '; ok $? "mbp: a sessão do MBP nasce em nice 10"
+  jq -r '.launcher[]' "$T/out" | grep -q 'taskpolicy -b -p'; ok $? "mbp: o lançador leva o vigia que rebaixa a árvore (renice 19 + taskpolicy -b)"
+  nossh; ok $? "mbp: dry-run não conecta nem consulta a presença"
+  pv --dry-run start w-1 < <(req "claude --x"); [ "$(jq -r .host "$T/out")" = a ] && [ "$(jq -r .gate "$T/out")" = null ] && ! jq -r '.launcher[]' "$T/out" | grep -q 'taskpolicy\|^nice '; ok $? "mbp: nome sem -remote- continua no host padrão, sem regra de presença nem vigia (o servidor Linux não muda)"
+  pv --dry-run start w-remote-zz-1 < <(req "claude"); [ $RC = 1 ] && has "$T/err" "'zz'" && nossh; ok $? "mbp: nome que pede um host que a config não tem recusa dizendo qual, sem ssh"
+  GC_SSH_HOST=a pv --dry-run start w-remote-m-1 < <(req "claude"); [ "$(jq -r .host "$T/out")" = a ]; ok $? "mbp: \$GC_SSH_HOST (decisão explícita de quem opera) vale mais que o nome"
+  # --- /Users/ no home do próprio host: o do MBP vale, o de outro usuário não ---
+  GC_SSH_HOST=h pv --dry-run start x-1 < <(req "claude --d /Users/test/trab" "$CITY/.gc/agents/dog" '{"env":{"GC_CITY":"'"$CITY"'","GC_HOME":"/Users/test/.gc"}}')
+  [ $RC = 0 ] && [ "$(jq -r .env.GC_HOME "$T/out")" = /Users/athos/.gc ] && jq -r .command "$T/out" | grep -q -- '--d /Users/athos/trab'; ok $? "mbp: com home /Users/athos no host, o caminho do mini vira o do MBP e passa (rc=$RC $(head -c 150 "$T/err"))"
+  GC_SSH_HOST=h pv --dry-run start x-2 < <(req "claude --d /Users/outro/trab"); [ $RC = 1 ] && has "$T/err" 'caminho do mini'; ok $? "mbp: /Users/ de OUTRO usuário continua recusado mesmo num host cujo home é /Users/..."
+  # --- gate: só evidência positiva de "Athos fora e MBP saudável" abre sessão ---
+  fresh; mode livre; pv start w-remote-m-1 < <(req cat); ok $RC "mbp: Athos fora e MBP saudável → o start abre (rc=$RC $(head -c 200 "$T/err"))"
+  [ "$(count x "${SOCK}m")" = 1 ] && [ "$(count)" = 0 ]; ok $? "mbp: a sessão está no socket do host m, não no do padrão"
+  jq -e 'select(.event=="started" and .host=="m" and .session=="w-remote-m-1")' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "mbp: o start deixa uma linha 'started' em <estado>/m/events.jsonl (insumo do placar)"
+  [ -e "$T/state/m/running/w-remote-m-1" ]; ok $? "mbp: ...e registra a sessão como aberta por nós"
+  for m in uso pausado semsaude pausalocal flagoff semcap cap0 sempresenca lixo vazio; do
+    mode $m; fresh; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'não abro sessão nova' && nossh && [ "$(count x "${SOCK}m")" = 1 ]
+    ok $? "mbp: checagem '$m' → start recusado, sem ssh e sem sessão nova (rc=$RC $(head -c 120 "$T/err"))"
+  done
+  mode uso; pv start w-remote-m-9 < <(req cat); has "$T/err" 'Athos está no MBP' && has "$T/err" 'input_recente'; ok $? "mbp: a recusa por uso diz que o Athos está no MBP e por quê"
+  mode pausado; pv start w-remote-m-9 < <(req cat); has "$T/err" 'pausado'; ok $? "mbp: a recusa por pausa/bandeira (rc 99) diz isso"
+  mode semsaude; pv start w-remote-m-9 < <(req cat); has "$T/err" 'sem saúde'; ok $? "mbp: a recusa por MBP sem saúde (rc 98) diz isso"
+  jq -e 'select(.event=="refused" and .host=="m" and (.reason|test("Athos está no MBP")))' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "mbp: cada recusa vira linha 'refused' com o motivo no events.jsonl"
+  mkdir -p "$T/noexec"; cfgm '{"gate_cmd":["'"$T"'/noexec/nao-existe"]}'; mode livre; fresh; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'não consegui rodar a checagem' && nossh; ok $? "mbp: checagem que não roda → recusa (não abre 'por falta de resposta')"
+  cfgm; mode livre; pv start w-remote-m-2 < <(req cat); ok $RC "mbp: com tudo de volta ao normal, o próximo start abre sozinho"
+  # --- o teto é o menor entre o do host e o slot_cap da checagem ---
+  pv stop w-remote-m-2 </dev/null; pv stop w-remote-m-1 </dev/null; mode slot1; pv start w-remote-m-1 < <(req cat); pv start w-remote-m-2 < <(req cat)
+  [ $RC = 1 ] && has "$T/err" 'teto' && [ "$(count x "${SOCK}m")" = 1 ]; ok $? "mbp: cap 2 no host, slot_cap 1 na checagem → a 2ª sessão não abre (vale o menor)"
+  # --- gate <host>: o veredito de um start agora, sem abrir nada ---
+  mode livre; fresh; pv gate m </dev/null; [ $RC = 0 ] && [ "$(jq -r .ok "$T/out")" = true ] && [ "$(jq -r .slot_cap "$T/out")" = 3 ] && [ "$(jq -r .cap "$T/out")" = 2 ]; ok $? "mbp: gate m com o Athos fora → ok, exit 0, com o slot_cap e o cap"
+  mode uso; pv gate m </dev/null; [ $RC = 1 ] && [ "$(jq -r .ok "$T/out")" = false ] && jq -r .reason "$T/out" | grep -q 'Athos está no MBP'; ok $? "mbp: gate m com o Athos usando → exit 1 e o motivo"
+  pv gate a </dev/null; [ $RC = 0 ] && jq -r .reason "$T/out" | grep -q 'não tem regra de presença'; ok $? "mbp: gate de um host sem regra de presença → ok (o servidor Linux não depende do Athos)"
+  pv gate zz </dev/null; [ $RC = 1 ]; ok $? "mbp: gate de host desconhecido → exit 1"
+  [ "$(count x "${SOCK}m")" = 1 ]; ok $? "mbp: gate não abre nem fecha nenhuma sessão"
+  # --- list-running: todos os hosts; o notebook dormindo não derruba a lista ---
+  pv stop w-remote-m-1 </dev/null; pv start w-a-1 < <(req cat); mode livre; pv start w-remote-m-3 < <(req cat)
+  pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-a-1 && has "$T/out" w-remote-m-3; ok $? "mbp: list-running junta as sessões de todos os hosts"
+  GC_SSH_HOST=m pv list-running w- </dev/null; [ "$(cat "$T/out")" = w-remote-m-3 ]; ok $? "mbp: \$GC_SSH_HOST fixa o list-running num host só"
+  FAKE_SSH_FAIL_HOST=fakembp pv list-running w- </dev/null; [ $RC = 1 ] && has "$T/err" fakembp; ok $? "mbp: notebook fora do ar COM sessão nossa registrada → list-running é erro (não sei o que há lá)"
+  pv stop w-remote-m-3 </dev/null; FAKE_SSH_FAIL_HOST=fakembp pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-a-1 && has "$T/state/m/session-ssh.log" 'não conta'; ok $? "mbp: notebook fora do ar SEM sessão nossa → só ele sai da lista (a do servidor continua), e o log diz"
+  pv stop w-a-1 </dev/null
+  FAKE_SSH_FAIL_HOST=fakehost pv list-running w- </dev/null; [ $RC = 1 ] && has "$T/err" fakehost; ok $? "mbp: o host que NÃO dorme, fora do ar e sem sessão registrada, continua sendo erro (nunca lista vazia)"
+  mode livre; pv start w-remote-m-4 < <(req cat); tmux -L "${SOCK}m" kill-session -t =w-remote-m-4 2>/dev/null; pv list-running w- </dev/null; [ ! -e "$T/state/m/running/w-remote-m-4" ]; ok $? "mbp: sessão que o host já não tem sai do registro quando o host responde (o registro se corrige sozinho)"
+  # --- PATH extra do host ---
+  pv start w-remote-m-5 < <(req "sh -c 'echo \$PATH > $T/path.out; exec cat'"); sleep 0.5
+  case "$(cat "$T/path.out" 2>/dev/null)" in "$T/extra:"*) true;; *) false;; esac; ok $? "mbp: o PATH da sessão começa pelo path_extra do host (Homebrew do MBP)"
+  pv stop w-remote-m-5 </dev/null
+  # --- vigia: o Athos volta (ou pausa) com a sessão rodando → a árvore cai para prioridade de fundo, uma vez, e a sessão NÃO é morta ---
+  # `renice`/`taskpolicy` falsos no PATH do "host" só registram o pid: o nice real não serve de prova aqui (quem roda o teste pode já
+  # estar em prioridade de fundo — o `ps` do mini mostra 20 até para `nice -n 10`); o que vale é QUEM foi rebaixado e QUANDO.
+  mkdir -p "$T/home/.local/bin"; : > "$T/demote.log"
+  for t in renice taskpolicy; do printf '#!/bin/sh\necho "%s $*" >> "%s/demote.log"\n' "$t" "$T" > "$T/home/.local/bin/$t"; chmod +x "$T/home/.local/bin/$t"; done
+  echo livre > "$T/pres.mode"; rm -f "$T/pres.pause" "$T/wpid.out"
+  pv start w-remote-m-6 < <(req "sh -c 'echo \$\$ > $T/wpid.out; exec sleep 300'"); ok $RC "mbp: (preparo) sessão de longa duração (rc=$RC $(head -c 150 "$T/err"))"; sleep 3; pid=$(cat "$T/wpid.out" 2>/dev/null)
+  [ -n "$pid" ] && [ ! -s "$T/demote.log" ]; ok $? "mbp: com o Athos fora, ninguém é rebaixado (pid=$pid, $(wc -l < "$T/demote.log") chamadas)"
+  echo uso > "$T/pres.mode"; for i in $(seq 1 40); do grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log" && break; sleep 0.25; done
+  grep -q "^renice -n 19 -p $pid\$" "$T/demote.log" && grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log"; ok $? "mbp: o Athos voltou → o processo da sessão (pid $pid) leva renice 19 + taskpolicy -b em poucos segundos"
+  m=$(wc -l < "$T/demote.log"); echo livre > "$T/pres.mode"; sleep 3
+  ! grep -vE '^(renice -n 19 -p [0-9]+|taskpolicy -b -p [0-9]+)$' "$T/demote.log" | grep -q .; ok $? "mbp: ...e quando ele sai de novo nada sobe a prioridade (só há chamadas de rebaixamento)"
+  pv is-running w-remote-m-6 </dev/null; [ "$(cat "$T/out")" = true ] && kill -0 "$pid" 2>/dev/null; ok $? "mbp: a sessão em curso NÃO é morta (termina o que estava fazendo)"
+  pv stop w-remote-m-6 </dev/null; sleep 2; ! pgrep -f 'PRESENCE_LIB_ONLY=1' >/dev/null; ok $? "mbp: o vigia termina junto com a sessão (nenhum sobrou)"
+  : > "$T/demote.log"; rm -f "$T/wpid.out"; : > "$T/pres.pause"; echo livre > "$T/pres.mode"
+  pv start w-remote-m-7 < <(req "sh -c 'echo \$\$ > $T/wpid.out; exec sleep 300'"); sleep 1; pid=$(cat "$T/wpid.out" 2>/dev/null)
+  for i in $(seq 1 40); do grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log" && break; sleep 0.25; done
+  grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log"; ok $? "mbp: a pausa do Athos (arquivo de pausa) também rebaixa a sessão em curso"
+  pv stop w-remote-m-7 </dev/null; rm -f "$T/pres.pause" "$T/home/.local/bin/renice" "$T/home/.local/bin/taskpolicy"
+  # --- sem a biblioteca de presença no host não há vigia, então não há sessão ---
+  mv "$T/lib/presence.sh" "$T/lib/presence.sh.off"; fresh; pv start w-remote-m-8 < <(req cat); [ $RC = 1 ] && has "$T/err" 'biblioteca de presença' && [ "$(count x "${SOCK}m")" = 0 ]; ok $? "mbp: sem a biblioteca de presença no host o start recusa (uma sessão sem vigia não abre) (rc=$RC)"
+  mv "$T/lib/presence.sh.off" "$T/lib/presence.sh"
+  # --- nada de segredo novo no MBP: o env é o mesmo filtro do servidor ---
+  pv --dry-run start w-remote-m-0 < <(req claude '' '{"env":{"GC_CITY":"'"$CITY"'","GC_INSTANCE_TOKEN":"x","ANTHROPIC_API_KEY":"k","GITHUB_TOKEN":"g","LANG":"C"}}' | jq '.work_dir="'"$CITY"'/.gc/agents/dog"')
+  [ "$(jq -r '.env | has("GC_INSTANCE_TOKEN") or has("ANTHROPIC_API_KEY") or has("GITHUB_TOKEN")' "$T/out")" = false ]; ok $? "mbp: token, chave de API e credencial do GitHub NÃO vão para o MBP"
+  jq -r .work_dir "$T/out" | grep -q "^$RR/"; ok $? "mbp: o diretório de trabalho fica dentro da raiz do bundle (gt-remote), nunca no resto do home do Athos"
+  # --- config: a regra de presença não pode ser desligada por engano, e sem default_host o host vem do nome ---
+  for v in '"true"' 1 null '"sim"'; do
+    cfgm '{"presence_gate":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'presence_gate'" && nossh; ok $? "mbp: presence_gate=$v (não é true/false) recusa a config, sem ssh (rc=$RC)"
+  done
+  cfgm '{"sleeps":"talvez"}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'sleeps'"; ok $? "mbp: sleeps que não é booleano recusa a config"
+  cfgm '{"gate_cmd":"mbp-run.sh --check"}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gate_cmd'"; ok $? "mbp: gate_cmd em texto (não lista) recusa a config"
+  cfgm; jq 'del(.default_host)' "$T/cfg.json" > "$T/cfg.nd" && mv "$T/cfg.nd" "$T/cfg.json"; setup_mbp; mode livre
+  pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = m ]; ok $? "mbp: sem default_host o nome da sessão ainda escolhe o host (rc=$RC $(head -c 120 "$T/err"))"
+  pv start w-remote-m-1 < <(req cat); pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-remote-m-1; ok $? "mbp: sem default_host o list-running ainda junta os hosts (rc=$RC $(head -c 120 "$T/err"))"
+  pv stop w-remote-m-1 </dev/null
+  cfg 3
+}
+
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group mbp && g_mbp; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 all
@@ -279,7 +412,21 @@ echo "== $((n-fails))/$n ok =="
   mutant live "nome exato no is-running (grep -x do has)" 's/grep -qxF -- "\$1"/grep -qF -- "$1"/'
   mutant live "nome exato no start (grep -x do 'já existe')" 's/grep -qxF -- @NAME@/grep -qF -- @NAME@/'
   mutant live "alvo de painel (=nome:)" 's/return q("=" + name + ":")/return q("=" + name)/'
-  mutant guard "guarda de /Users/" 's/if "\/Users\/" in v:/if False:/'
+  mutant guard "guarda de /Users/ (nenhum /Users/ é recusado)" 's/if any(u != cfg.home for u in/if any(False for u in/'
+  mutant mbp "guarda de /Users/ (qualquer /Users/ é recusado, até o home do host)" 's/if any(u != cfg.home for u in/if any(True for u in/'
+  mutant mbp "presence_gate fora de true/false aceito" 's/if k in h and not isinstance(h\[k\], bool):/if False:/'
+  mutant mbp "list-running exige default_host" 's/^    cfg_hosts = load_config()\[2\].get("hosts")$/    cfg_hosts = Cfg().names/'
+  mutant mbp "sem regra de presença no start" 's/if cfg.gate and not dry:/if False:/'
+  mutant mbp "presença ilegível passa (só 'uso' explícito recusa)" 's/if kv.get("presence") != "livre":/if kv.get("presence") == "uso":/'
+  mutant mbp "pausa local ignorada" 's/if kv.get("paused") != "0" or kv.get("paused_local") != "0":/if kv.get("paused") != "0":/'
+  mutant mbp "rc 99 (pausa/bandeira) não reconhecido" 's/if r.returncode == 99:/if False:/'
+  mutant mbp "slot_cap da checagem ignorado" 's/cap = min(cap, g\["slot_cap"\])/pass/'
+  mutant mbp "host pelo nome da sessão" 's/return m.group(1) if m else ""/return ""/'
+  mutant mbp "sem vigia de prioridade" 's/^    if cfg.gate:$/    if False:/'
+  mutant mbp "PATH extra do host" 's/"".join(d + ":" for d in cfg.path_extra)/""/'
+  mutant mbp "host que dorme sempre ignorado no list-running" 's/if cfg.sleeps and not cfg.known():/if cfg.sleeps:/'
+  mutant mbp "host que NÃO dorme também ignorado no list-running" 's/if cfg.sleeps and not cfg.known():/if not cfg.known():/'
+  mutant mbp "registro de sessões nunca marcado" 's/^                open(os.path.join(self.mkstate("running"), name), "a").close()/                pass/'
   mutant dry "filtro de env" 's/ or (SECRETISH.search(k) and k not in cfg.env_allow)//;s/not ENV_OK.fullmatch(k)/False/'
   mutant proto "exit 2 das desconhecidas" 's/        return 2$/        return 0/'
   mutant down "marcador de fim" 's/if BEGIN not in lines or END not in lines:/if BEGIN not in lines:/'
