@@ -196,7 +196,8 @@ cmd_hook() {
     [ "$("$GIT" cat-file -t "$new" 2>/dev/null)" = commit ] || { echo "espelho: recusado — $ref não aponta para um commit legível" >&2; bad=1; continue; }
     if ! [[ "$old" =~ ^0+$ ]] && ! "$GIT" merge-base --is-ancestor "$old" "$new" 2>/dev/null; then echo "espelho: recusado — $ref reescreve histórico já entregue (use outro nome de branch)" >&2; bad=1; continue; fi
     # dado no commit: os caminhos tocados pelos commits NOVOS passam pelas mesmas regras do filtro. Cada etapa vai a arquivo para o rc de cada uma ser lido (NUL não cabe em variável)
-    if ! "$GIT" log --format= --name-only -z --no-renames --diff-filter=AMC "$new" --not --all > "$t/paths" 2>/dev/null; then echo "espelho: recusado — não consegui ler os arquivos de $ref" >&2; bad=1; continue; fi
+    # --cc: sem ele o git não lista NADA de um commit de merge, e um arquivo de dado que entra só no próprio merge passava; -m listaria também o que veio do outro lado e já estava no histórico (recusaria merge legítimo)
+    if ! "$GIT" log --format= --name-only -z --no-renames --diff-filter=AMC --cc "$new" --not --all > "$t/paths" 2>/dev/null; then echo "espelho: recusado — não consegui ler os arquivos de $ref" >&2; bad=1; continue; fi
     if ! tr -s '\0' < "$t/paths" | deny_match "$rig" > "$t/hits"; then echo "espelho: recusado — não consegui conferir arquivos de dado em $ref" >&2; bad=1; continue; fi
     if [ -s "$t/hits" ]; then echo "espelho: recusado — $ref traz arquivo de dado/segredo (filtro do servidor): $(tr '\0' ' ' < "$t/hits" | cut -c1-300)" >&2; bad=1; fi
   done
