@@ -4,7 +4,7 @@
 ## Contents
   Uso · O que conta · O que NÃO garante · Códigos
 
-USO: python3 -I hetzner-mirror-scan.py <repo.git> <estado-dir>. Para cada par (blob, caminho) que um commit novo de refs/remotes/origin/* introduz (o mesmo blob com outro nome também: renomear não escapa), aplica a régua do
+USO: python3 -I hetzner-mirror-scan.py <repo.git> <estado-dir>. Para cada par (blob, caminho) que um commit novo de refs/remotes/origin/* introduz — todo status MENOS D, que não traz blob: A, M, T (troca de tipo)…; o mesmo blob com outro nome também: renomear não escapa — aplica a régua do
   hetzner-pii-scan.py (>=20 telefones ou >=3 CPFs; a função `counts` é importada de lá). Blob sinalizado nega o CAMINHO (todas as versões) em estado-dir/deny-extra (`!/caminho`, escapado como o sparse:oid lê).
   seen.tsv (blob<TAB>0|1) evita reler; scanned-tips só avança quando TUDO foi lido e gravado — a última coisa que este script faz.
 O QUE CONTA: a forma. Blob > 50 MB, ou que o git não entrega por inteiro, vale como SINALIZADO/falha (não saber não é "limpo"). Caminho sinalizado que o filtro não consegue negar (quebra de linha, controle, espaço no fim): rc 3.
@@ -32,6 +32,10 @@ def esc(p):   # como o hetzner-pii-scan.py: o sparse:oid lê `\` `*` `?` `[` com
     return "!/" + re.sub(r"([\\*?\[\]])", r"\\\1", p)
 
 
+def lines(t):   # só \n separa linha, como o git lê o filtro: str.splitlines() também parte em U+2028/U+2029/U+0085, que o guarda de caminho deixa passar
+    return [l for l in t.split("\n") if l]
+
+
 def atomic(path, text):
     tmp = path + ".new"
     with open(tmp, "w") as f:
@@ -56,11 +60,11 @@ def main(argv):
     os.makedirs(st, exist_ok=True)
     counts = load_counts()
     try:
-        tips = git(repo, "for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes/origin").decode().splitlines()
+        tips = lines(git(repo, "for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes/origin").decode())
         tipshas = sorted({l.split(" ", 1)[0] for l in tips})
         old = []
         if os.path.exists(os.path.join(st, "scanned-tips")):
-            old = [l.split(" ", 1)[0] for l in open(os.path.join(st, "scanned-tips")).read().splitlines() if l]
+            old = [l.split(" ", 1)[0] for l in lines(open(os.path.join(st, "scanned-tips")).read())]
         if old:   # uma ponta velha que o git não conhece mais (gc, prune) não pode virar `^sha`: o git log recusaria; sem ela a varredura só lê mais
             chk = subprocess.run(["git", "-C", repo, "cat-file", "--batch-check"], input="".join(o + "\n" for o in old).encode(), capture_output=True)
             if chk.returncode != 0:
@@ -68,13 +72,15 @@ def main(argv):
             old = [f[0] for f in (l.split() for l in chk.stdout.decode().splitlines()) if len(f) >= 2 and f[1] == "commit"]
         seen = {}
         if os.path.exists(os.path.join(st, "seen.tsv")):
-            for l in open(os.path.join(st, "seen.tsv")).read().splitlines():
+            for l in lines(open(os.path.join(st, "seen.tsv")).read()):
                 o, _, f = l.partition("\t")
                 if o and f in ("0", "1"):
                     seen[o] = f == "1"
-        deny = set(l for l in (open(os.path.join(st, "deny-extra")).read().splitlines() if os.path.exists(os.path.join(st, "deny-extra")) else []) if l)
+        deny = set(lines(open(os.path.join(st, "deny-extra")).read())) if os.path.exists(os.path.join(st, "deny-extra")) else set()
+        if any(seen.values()) and not deny:   # blob sinalizado sem nenhum caminho negado = deny-extra perdido (restauro parcial, apagado); regravá-lo vazio enfraqueceria o filtro em silêncio
+            raise RuntimeError("seen.tsv tem blob sinalizado mas deny-extra está vazio ou sumiu: apague seen.tsv e scanned-tips em %s para reler tudo" % st)
         revs = "".join(s + "\n" for s in tipshas) + "".join("^" + o + "\n" for o in old)
-        raw = git(repo, "log", "--stdin", "-m", "-z", "--raw", "--no-renames", "--no-abbrev", "--format=", "--diff-filter=AMC", inp=revs.encode()) if tipshas else b""
+        raw = git(repo, "log", "--stdin", "-m", "-z", "--raw", "--no-renames", "--no-abbrev", "--format=", "--diff-filter=d", inp=revs.encode()) if tipshas else b""
         pairs, toks = set(), raw.split(b"\0")
         i = 0
         while i < len(toks):

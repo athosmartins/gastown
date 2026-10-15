@@ -23,7 +23,7 @@ servidor (runner) ──ssh -p 2293──▶ túnel reverso ──▶ sshd próp
 | `scripts/hetzner-mirror-scan.py` | mini | varre o CONTEÚDO de cada (blob, caminho) que um commit novo introduz; régua importada de `hetzner-pii-scan.py` (≥20 telefones ou ≥3 CPFs) |
 | `scripts/hetzner-remote-git.sh` | servidor, `~/gt-remote/bin/` | `bootstrap pull wt-add wt-rm status scan` |
 | `packs/town-deltas/assets/hetzner-mirror-{sshd,tunnel,sync}.plist` | mini (launchd) | sshd e túnel de pé; `sync` a cada 5 min |
-| `scripts/hetzner-mirror.selftest.sh` | — | hermético, 232 casos, 0 falhas, sshd real (`HMST_FAKE=1` troca o ssh por chamada direta, só para desenvolver) |
+| `scripts/hetzner-mirror.selftest.sh` | — | hermético, 248 casos, 0 falhas, sshd real (`HMST_FAKE=1` troca o ssh por chamada direta, só para desenvolver) |
 | `<cidade>/.gc/hetzner-mirror/` · `~/gt-remote/{bin,git,keys}` | mini · servidor | estado (`repos/`, `state/<rig>/`, `authorized_keys`); só estas 3 pastas do servidor são desta fatia (o resto é do ga-zri39b) |
 
 ## Como funciona
@@ -87,7 +87,7 @@ Ao vivo em 14/10 (mini com load 105–120, servidor a ~200 ms; log completo no c
 • A varredura é heurística de forma (telefone BR e CPF, ≥20/≥3): não vê nome, e-mail, CNPJ, endereço nem lista pequena. O mesmo vale para o rsync.
 • Os NOMES dos arquivos omitidos aparecem nas árvores; falso positivo por nome existe (`*.db-*` pega `com.whatsapp.db-sync.plist`; `*token*.toml` pega `token-ledger-harvest.toml`).
 • Bytes idênticos sob um caminho permitido chegam (fórmula copiada, arquivo vazio); o `scan` conta e não acusa. Um segredo copiado para um nome comum passaria.
-• Mudar filtro ou varredura não remove o que o servidor JÁ baixou. Dado que chegue ao servidor só por commit de merge: a ida vê (`-m`), o `pre-receive` na volta não. Mini fora = o push espera.
+• Mudar filtro ou varredura não remove o que o servidor JÁ baixou. O `pre-receive` confere NOMES (todo status menos D: inclui troca de tipo e o que entra só num merge, via `--cc`), não conteúdo. Mini fora = o push espera.
 
 ## Como desfazer
 `$B tunnel stop hetzner-teste; $B sshd stop`; `launchctl bootout gui/$(id -u)/com.gascity.hetzner-mirror-{sshd,tunnel,sync}` e apagar os plists de `~/Library/LaunchAgents`; apagar a linha de `authorized_keys` revoga a chave. Servidor: `rm -r ~/gt-remote/git ~/gt-remote/keys ~/gt-remote/bin/hetzner-remote-git.sh`. Os espelhos em `repos/` se recriam com `init`.

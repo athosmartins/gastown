@@ -58,8 +58,8 @@ cmd_bootstrap() {
 cmd_wt_add() {   # worktree por bead; ANTES atualiza o clone e GRAVA a idade do main usado (e se o pull falhou, grava que falhou: o worktree sai do que havia)
   rig_of "${1:-}"; [ -s "$GR/$RIG/sparse" ] || die 3 "clone sem filtro de dados (nenhum pull deu certo ainda): não crio worktree"; local bead=${2:-} base=${3:-main} path pull=ok line; [[ "$bead" =~ $RE_BEAD ]] || die 2 "bead inválida: $bead"
   [[ "$base" =~ $RE_BEAD ]] || die 2 "base inválida: $base"; path="$GR/$RIG/wt/$bead"
-  [ -e "$path" ] && { echo "wt-add: $path já existe"; return 0; }
-  cmd_pull "$RIG" > /dev/null 2>&1 || pull=erro
+  if [ -e "$path" ]; then git -C "$path" ls-files 2>/dev/null | head -n 1 | grep -q . || die 3 "worktree incompleto em $path (o checkout anterior não terminou): rode wt-rm $RIG $bead e tente de novo"; echo "wt-add: $path já existe"; return 0; fi
+  cmd_pull "$RIG" > /dev/null || pull=erro   # só o stdout calado: o die 3 do pull (que encerra o script) precisa dizer o motivo
   g rev-parse -q --verify "refs/remotes/origin/$base" > /dev/null || die 3 "o clone não tem origin/$base (pull=$pull): não invento base"
   if g rev-parse -q --verify "refs/heads/worker/$bead" > /dev/null; then g worktree add -q --no-checkout "$path" "worker/$bead" || die 3 "worktree add falhou"
   else g worktree add -q --no-checkout -b "worker/$bead" "$path" "refs/remotes/origin/$base" || die 3 "worktree add falhou"; fi
@@ -92,9 +92,9 @@ cmd_scan() {
   t=$(mktemp -d) || return 2
   for r in $rigs; do rig_of "$r"
     [ -s "$GR/$RIG/deny" ] || { echo "scan $RIG: sem a lista de dados ($GR/$RIG/deny): NÃO consegui varrer"; rc=2; continue; }
-    # violação = um blob PRESENTE aqui sob um caminho que o filtro nega. Pares (blob, caminho) de TODA a história via `log --raw` (só árvores: não busca nada no espelho) e blobs fisicamente
+    # violação = um blob PRESENTE aqui sob um caminho que o filtro nega. Pares (blob, caminho) de TODA a história via `log --raw`, todo status menos D (--diff-filter=d: A, M, T…; só árvores, não busca nada no espelho) e blobs fisicamente
     # presentes via --batch-all-objects (também não busca). `rev-list --objects` não serve: nomeia cada objeto UMA vez (o mesmo conteúdo sob outro caminho esconde o primeiro) e lista árvores.
-    if ! g log --all -m -z --raw --no-renames --no-abbrev --format= --diff-filter=AMC > "$t/raw" 2>/dev/null; then echo "scan $RIG: git log falhou: NÃO consegui varrer o histórico"; rc=2; continue; fi
+    if ! g log --all -m -z --raw --no-renames --no-abbrev --format= --diff-filter=d > "$t/raw" 2>/dev/null; then echo "scan $RIG: git log falhou: NÃO consegui varrer o histórico"; rc=2; continue; fi
     # o parse abaixo é por linha (NUL→\n): um nome com \n pode forjar um registro ":…" e esconder um arquivo negado sob outro nome. Em saída legítima de `log -z --raw --format=` não existe \n (0 em 4 clones reais): qualquer \n = recuso
     [ "$(tr -cd '\n' < "$t/raw" && echo x)" = x ] || { echo "scan $RIG: há nome de arquivo com quebra de linha no histórico (o parse por linha não é seguro): NÃO consegui varrer"; rc=2; continue; }
     tr '\0' '\n' < "$t/raw" | awk 'want { if (mode != "160000") print oid "\t" $0; want = 0; next } /^:/ { split($0, f, " "); mode = f[2]; oid = f[4]; want = 1; next } length($0) { stray = 1 } END { if (want || stray) exit 3 }' > "$t/pairs.raw" \
