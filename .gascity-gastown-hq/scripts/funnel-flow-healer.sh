@@ -122,6 +122,22 @@ do_kickstart() {  # do_kickstart <label>
   launchctl kickstart -k "gui/$UID_NUM/$label" >/dev/null 2>&1
 }
 
+# Is this launchd job switched off ON PURPOSE (`launchctl disable`)? Three answers:
+# "yes" (disabled), "no" (enabled or never listed), "?" (could not ask launchctl).
+# A disabled job writes no log by design, so its frozen log is not a stall: the
+# Mayor paused the refino on 14/10 on the Athos's order, and this healer kept
+# kickstarting it and paging the Athos about a pause he asked for.
+# Stubbable through the same FLOW_HEALER_FAKE_LAUNCHCTL seam as do_kickstart.
+job_disabled() {  # job_disabled <label>
+  local label="$1" out
+  if [ -n "${FLOW_HEALER_FAKE_LAUNCHCTL:-}" ]; then
+    out=$("$FLOW_HEALER_FAKE_LAUNCHCTL" print-disabled "gui/$UID_NUM") || { echo "?"; return; }
+  else
+    out=$(launchctl print-disabled "gui/$UID_NUM" 2>/dev/null) || { echo "?"; return; }
+  fi
+  if printf '%s\n' "$out" | grep -qE "\"$label\" => (disabled|true)"; then echo "yes"; else echo "no"; fi
+}
+
 # gc mail send mayor wrapper (stubbable in selftest via FLOW_HEALER_FAKE_MAIL).
 do_mail_mayor() {  # do_mail_mayor <subject> <body>
   local subj="$1" body="$2"
@@ -272,6 +288,13 @@ handle_signature() {
   local age; age=$(log_age_min "$logf")
   local frozen=0; [ "$age" -gt "$freeze" ] && frozen=1
   local stalled=0; { [ "$demand" = "1" ] && [ "$frozen" = "1" ]; } && stalled=1
+
+  # Deliberately disabled job -> paused, not stalled (also clears its strikes).
+  # "?" keeps the old behaviour: a doubt must not hide a real stall.
+  if [ "$stalled" = "1" ] && [ "$(job_disabled "$label")" = "yes" ]; then
+    stalled=0
+    emit "paused" ",\"sig\":\"$sig\",\"label\":\"$label\",\"reason\":\"launchd job disabled on purpose\""
+  fi
 
   local action; action=$(decide_action "$sig" "$stalled")
   local strikes; strikes=$(get "$sig.strikes" 0)

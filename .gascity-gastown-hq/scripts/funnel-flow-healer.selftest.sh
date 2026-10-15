@@ -160,6 +160,40 @@ else
 fi
 unset FLOW_HEALER_FAKE_LAUNCHCTL FLOW_HEALER_FAKE_MAIL FLOW_HEALER_FAKE_NOTIFY FLOW_HEALER_FAKE_MTIME_AUTO_REFINO_DISPATCHER_LOG
 
+echo "== (g2) a job switched off with launchctl disable is paused, not stalled (refino pause 14/10) =="
+reset_state
+CALLS="$WORK/calls.log"; : > "$CALLS"
+DISABLED_ANSWER=disabled
+stub_launchctl() {
+  echo "launchctl $*" >> "$CALLS"
+  if [ "$1" = "print-disabled" ]; then
+    [ "$DISABLED_ANSWER" = "fail" ] && return 1
+    printf '\t"com.gascity.auto-refino-dispatcher" => %s\n' "$DISABLED_ANSWER"
+  fi
+  return 0
+}
+export -f stub_launchctl stub_mail stub_notify
+export FLOW_HEALER_FAKE_LAUNCHCTL=stub_launchctl FLOW_HEALER_FAKE_MAIL=stub_mail FLOW_HEALER_FAKE_NOTIFY=stub_notify
+export FLOW_HEALER_FAKE_MTIME_AUTO_REFINO_DISPATCHER_LOG=0
+run_ar() { handle_signature "auto-refino" "com.gascity.auto-refino-dispatcher" "/x/auto-refino-dispatcher.log" 15 1 "census-blob" >/dev/null; }
+for _ in 1 2 3 4 5 6 7 8; do run_ar; done
+if grep -qE '^launchctl kickstart|^mail |^notify ' "$CALLS"; then
+  bad "disabled job was kickstarted/escalated: $(grep -E '^launchctl kickstart|^mail |^notify ' "$CALLS")"
+else
+  ok "disabled job: 8 frozen runs, no kickstart, no mail, no notify"
+fi
+eq "disabled job leaves no strikes" "$(cat "$FLOW_HEALER_STATE_DIR/auto-refino.strikes" 2>/dev/null || echo 0)" "0"
+if grep -q '"event":"paused"' "$JSONL" 2>/dev/null; then ok "the pause is logged"; else bad "no paused event in $JSONL"; fi
+# Enabled again -> the old behaviour comes back.
+reset_state; : > "$CALLS"; DISABLED_ANSWER=enabled
+run_ar; run_ar
+if grep -q '^launchctl kickstart -k' "$CALLS"; then ok "enabled job still kickstarted"; else bad "enabled job not kickstarted: $(cat "$CALLS")"; fi
+# launchctl could not answer -> doubt does not hide a stall.
+reset_state; : > "$CALLS"; DISABLED_ANSWER=fail
+run_ar; run_ar
+if grep -q '^launchctl kickstart -k' "$CALLS"; then ok "unreadable disabled-state still kickstarts (doubt hides nothing)"; else bad "doubt hid the stall: $(cat "$CALLS")"; fi
+unset FLOW_HEALER_FAKE_LAUNCHCTL FLOW_HEALER_FAKE_MAIL FLOW_HEALER_FAKE_NOTIFY FLOW_HEALER_FAKE_MTIME_AUTO_REFINO_DISPATCHER_LOG
+
 echo "== (h) flow-authority marker parsing (imp14): a Python-float expires_at must not abort (ga-nixb58) =="
 # The marker path comes from env and a selftest must never touch the LIVE marker: it is pinned
 # inside $WORK above - refuse to write a single marker if that ever stops being true.
@@ -260,7 +294,7 @@ seed_confirmed_gate; write_marker "$(marker_at "$FUT.938316")"
 out=$(run_two 2>/dev/null)
 eq "TSW active, float marker: run reaches its end" "$out" "reached-end"
 eq "TSW active, float marker: the pilot signature was still evaluated" "$([ -f "$FLOW_HEALER_STATE_DIR/pilot.strikes" ] && echo yes || echo no)" "yes"
-eq "TSW active, float marker: kickstart deferred (no launchctl call)" "$(grep -c '^launchctl' "$CALLS" || true)" "0"
+eq "TSW active, float marker: kickstart deferred (no launchctl call)" "$(grep -c '^launchctl kickstart' "$CALLS" || true)" "0"
 eq "TSW active, float marker: the deferral is logged (tsw-defer)" "$(grep -c '"event":"tsw-defer"' "$JSONL" || true)" "1"
 
 # i-2: the float marker is EXPIRED: nothing to defer to, so the kickstart must really happen.
