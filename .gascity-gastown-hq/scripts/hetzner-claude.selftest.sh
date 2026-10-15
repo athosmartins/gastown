@@ -1,6 +1,7 @@
 #!/bin/bash
 # hetzner-claude.selftest.sh — hermético e em LOOPBACK: o "servidor" é uma pasta (mktemp) e o ssh falso roda o comando DE VERDADE nela,
-# com HOME apontando para lá. O claude do servidor é falso (lê arquivos em $FAKE). Nada toca a rede, o servidor
+# com HOME apontando para lá; o shell, o python e o rsync do caminho de instalação EXECUTAM no teste (o rascunho anterior casava o
+# TEXTO do comando e nunca rodava a conferência). O claude do servidor é falso (lê arquivos em $FAKE). Nada toca a rede, o servidor
 # real nem a credencial do mini. Os textos de erro de COTA e de login EXPIRADO são sintéticos (só o de "deslogado" foi medido em
 # 14/10): estes casos provam o classificador, não o texto real do claude — isso só se mede depois do login.
 # HETZNER_CLAUDE_UNDER_TEST=<arquivo> roda o mesmo selftest contra uma cópia alterada (mutante); HZC_FAILFAST=1 para na 1ª falha.
@@ -13,7 +14,7 @@ trap 'case "$T" in */hzc-selftest.*) chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T
 SRV=$T/srv
 mkdir -p "$T/bin" "$T/state" "$T/fake" "$T/home" "$T/city" "$SRV/.local/bin"
 export FAKE=$T/fake SRV HETZNER_STATE_DIR=$T/state GC_CITY_PATH=$T/city HOME=$T/home HETZNER_REMOTE_HOME=$SRV \
-  HETZNER_REMOTE_ROOT=$SRV/gt-remote/bundle PATH="$T/bin:$PATH"
+  HETZNER_REMOTE_ROOT=$SRV/gt-remote/bundle HETZNER_BUILDER=$T/builder.py PATH="$T/bin:$PATH"
 STATE=$T/state; SF=$STATE/hetzner-claude.state.json; RROOT=$HETZNER_REMOTE_ROOT
 cat >"$T/bin/ssh" <<'EOF'
 #!/bin/sh
@@ -24,7 +25,19 @@ while [ "$1" = "-o" ]; do shift 2; done
 shift
 HOME=$SRV exec sh -c "$*"
 EOF
+cat >"$T/bin/rsync" <<'EOF'
+#!/bin/sh
+case "$(cat "$FAKE/rsync.mode" 2>/dev/null)" in
+  fail) echo "rsync: connection unexpectedly closed" >&2; exit 23;;
+  noop) exit 0;;
+  corrupt) /usr/bin/rsync "$@" || exit $?
+           for last; do :; done; d=${last#*:}
+           f=$(find "$d" -type f -name a.sh | head -1); [ -n "$f" ] && printf 'X' >>"$f"; exit 0;;
+esac
+exec /usr/bin/rsync "$@"
+EOF
 printf '#!/bin/sh\necho "$*" >>"$FAKE/notify.log"\n' >"$T/bin/notify"
+printf '#!/bin/sh\n[ "$1" = "--version" ] && { echo "2.1.300 (Claude Code)"; exit 0; }\nexit 99\n' >"$T/bin/claude"
 printf '#!/bin/sh\necho "$*" >>"$FAKE/security.args"\n[ -f "$FAKE/mdat" ] || exit 44\nprintf "    \\"mdat\\"<timedate>=0x00  \\"%%s\\\\000\\"\\n" "$(cat "$FAKE/mdat")"\n' >"$T/bin/security"
 cat >"$SRV/.local/bin/claude" <<'EOF'
 #!/bin/bash
@@ -32,11 +45,68 @@ F=$FAKE
 rd() { cat "$F/$1" 2>/dev/null; }
 case "$1 $2 $3" in
   "auth status "*) echo auth >>"$F/calls"; rd auth.out; exit "$(rd auth.rc)";;
+  "plugin marketplace list") rd mk.out; exit 0;;
+  "plugin marketplace add") echo "$4" >>"$F/mk.added"; [ -f "$F/mk.addfail" ] && exit 1; echo '[{"name":"claude-plugins-official"}]' >"$F/mk.out"; exit 0;;
+  "plugin install "*) grep -qx -- "$3" "$F/failinstall" 2>/dev/null && exit 1; echo "$3" >>"$F/installed.ids"; exit 0;;
+  "plugin list --json") if [ -f "$F/list.garble" ] && [ -f "$F/installed.ids" ]; then echo garbage; exit 0; fi  # só a leitura DEPOIS de instalar
+    python3 -I - "$F" <<'PY'
+import json, os, sys
+f = sys.argv[1]
+ids = [l.strip() for l in open(f + "/installed.ids")] if os.path.exists(f + "/installed.ids") else []
+off = [l.strip() for l in open(f + "/disabled")] if os.path.exists(f + "/disabled") else []
+print(json.dumps([{"id": i, "version": "1", "enabled": i not in off} for i in ids]))
+PY
+    exit 0;;
 esac
 case "$1" in
   -p) echo probe >>"$F/calls"; echo "$*" >>"$F/probe.args"; { printf '<%s>' "$@"; echo; } >>"$F/probe.argv"; pwd >>"$F/probe.pwd"; rd probe.out; exit "$(rd probe.rc)";;
+  --version) if [ -f "$F/version" ]; then cat "$F/version"; exit 0; fi; echo "claude: not found" >&2; exit 127;;
 esac
 exit 98
+EOF
+cat >"$T/builder.py" <<'EOF'
+import hashlib, json, os, shutil, sys
+F, a = os.environ["FAKE"], sys.argv
+def rd(n, d=None):
+    try:
+        return open(F + "/" + n).read().strip()
+    except OSError:
+        return d
+def sha(b):
+    return hashlib.sha256(b).hexdigest()
+def bh(files):
+    return sha(json.dumps(files, sort_keys=True).encode())
+if a[1] == "verify":
+    side = "server" if os.environ.get("HOME", "").startswith(os.environ["SRV"]) else "mini"
+    forced = rd("verify.rc." + side)
+    if forced:
+        sys.exit(int(forced))
+    d = a[2]
+    m = json.load(open(d + "/manifest.json"))
+    for rel, info in m["files"].items():
+        if sha(open(d + "/" + rel, "rb").read()) != info["sha256"]:
+            print("diferente:", rel)
+            sys.exit(4)
+    sys.exit(0 if m.get("bundle_hash") == bh(m["files"]) else 4)
+out = a[a.index("--out") + 1]
+content = {"city/settings.json": ('{"city": 1}', False), "home/.claude/settings.json": (rd("home_settings", '{"permissions": {}}'), False),
+           "home/.claude/hooks/a.sh": ("#!/bin/sh\n", True), "role/dog/.claude/settings.json": ("{}", False)}
+if rd("drop_hook"):
+    content.pop("home/.claude/hooks/a.sh")
+for extra in (rd("extra_file", "") or "").split():
+    content[extra] = ("x", False)
+if os.path.isdir(out):
+    shutil.rmtree(out)
+files = {}
+for rel, (txt, ex) in content.items():
+    p = out + "/" + rel
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    open(p, "w").write(txt)
+    os.chmod(p, 0o755 if ex else 0o644)
+    files[rel] = {"sha256": sha(txt.encode()), "exec": ex}
+if rd("bad_dest"):  # entrada só no manifesto (sem arquivo): só passa se o verify for forçado a passar
+    files[rd("bad_dest")] = {"sha256": sha(b""), "exec": False}
+json.dump({"version": 1, "bundle_hash": bh(files), "files": files}, open(out + "/manifest.json", "w"))
 EOF
 chmod +x "$T/bin/"* "$SRV/.local/bin/claude"
 pass=0; fail=0
@@ -45,6 +115,8 @@ bad() { fail=$((fail + 1)); echo "FAIL: $1"; [ -z "${HZC_FAILFAST:-}" ] || exit 
 eq() { if [ "$2" = "$3" ]; then ok; else bad "$1 (obtido '$2', esperado '$3')"; fi; }
 has() { if printf '%s' "$2" | grep -qF -- "$3"; then ok; else bad "$1 (não achei '$3' em: $2)"; fi; }
 hasnt() { if printf '%s' "$2" | grep -qF -- "$3"; then bad "$1 (achei '$3')"; else ok; fi; }
+yes() { if [ -e "$2" ]; then ok; else bad "$1 (não existe: $2)"; fi; }
+no() { if [ -e "$2" ] || [ -L "$2" ]; then bad "$1 (existe: $2)"; else ok; fi; }
 setauth() { printf '%s' "$1" >"$FAKE/auth.out"; echo "$2" >"$FAKE/auth.rc"; }
 setprobe() { printf '%s' "$1" >"$FAKE/probe.out"; echo "$2" >"$FAKE/probe.rc"; }
 reset() { rm -f "$STATE"/hetzner-claude.* "$FAKE"/*; : >"$FAKE/calls"; setauth "$AUTH_ON" 0; setprobe "$P_OK" 0; }
@@ -157,6 +229,77 @@ eq "e recebeu 0 bytes do stdin do chamador" "$(awk '{s+=$1} END{print s+0}' "$FA
 HETZNER_STATE_TTL=abc python3 -I "$S" gate >/dev/null 2>&1; eq "TTL inválido" $? 2
 HETZNER_REMOTE_HOME=/home python3 -I "$S" gate >/dev/null 2>&1; eq "HOME remoto raso demais" $? 2
 
+echo "== push-bundle (loopback: o install roda de verdade)"
+HOOK=$SRV/.claude/hooks/a.sh; CITYF=$RROOT/city/settings.json
+srv_reset() { case "$SRV" in */hzc-selftest.*/srv) rm -rf "$SRV/gt-remote" "$SRV/.claude" "$T/out" "$T/elsewhere";; *) echo "srv_reset recusado"; exit 2;; esac
+  rm -f "$FAKE"/{drop_hook,extra_file,bad_dest,home_settings,rsync.mode,verify.rc.mini,verify.rc.server}; mkdir -p "$SRV/.claude/hooks" "$RROOT/work"
+  echo '{"enabledPlugins":{"x@y":true},"extraKnownMarketplaces":{}}' >"$SRV/.claude/settings.json"; echo k >"$RROOT/work/keep.txt"; echo f >"$SRV/.claude/hooks/foreign.sh"; }
+pb() { PBOUT=$(python3 -I "$S" push-bundle --role dog --role-dir "$T/role" --out "$T/out" 2>&1); PBRC=$?; }
+reset; srv_reset; pb; eq "caminho feliz" $PBRC 0; has "msg" "$PBOUT" "no servidor"
+yes "hook instalado" "$HOOK"; [ -x "$HOOK" ] && ok || bad "hook sem bit de execução"
+[ -x "$SRV/.claude/settings.json" ] && bad "settings.json executável" || ok
+yes "city/settings.json no RROOT" "$CITYF"
+yes "role fica em bundle-out" "$SRV/gt-remote/bundle-out/role/dog/.claude/settings.json"; no "role não vai ao RROOT" "$RROOT/role"
+yes "arquivo alheio no RROOT sobrevive" "$RROOT/work/keep.txt"; yes "hook alheio sobrevive" "$SRV/.claude/hooks/foreign.sh"
+SJ=$(cat "$SRV/.claude/settings.json"); has "settings tem a chave do bundle" "$SJ" '"permissions"'; has "plugin no settings" "$SJ" "superpowers@claude-plugins-official"
+hasnt "github fora" "$SJ" "github@"; hasnt "playwright fora" "$SJ" "playwright"; hasnt "a chave velha do servidor foi trocada pelas do bundle" "$SJ" "x@y"
+eq "settings instalado = o mesclado enviado" "$(cmp -s "$SRV/.claude/settings.json" "$SRV/gt-remote/home-settings.merged.json" && echo sim)" sim
+echo "== push-bundle: atualização que tira um hook"
+echo 1 >"$FAKE/drop_hook"; pb; eq "2º push" $PBRC 0; has "conta o removido" "$PBOUT" "1 removidos"
+no "hook que o bundle tirou sumiu" "$HOOK"; yes "hook alheio continua" "$SRV/.claude/hooks/foreign.sh"; yes "work continua" "$RROOT/work/keep.txt"
+yes "settings do bundle continua" "$SRV/.claude/settings.json"; yes "city continua" "$CITYF"
+echo "== push-bundle: registro anterior ilegível = não remove nada"
+srv_reset; pb; echo garbage >"$SRV/gt-remote/bundle-installed.json"; echo 1 >"$FAKE/drop_hook"; pb; eq "push" $PBRC 0; has "avisa" "$PBOUT" "nada removido"; yes "hook fica" "$HOOK"
+echo "== push-bundle: o registro anterior não manda apagar fora das raízes"
+srv_reset; pb; echo keep >"$T/outside.txt"
+python3 -I -c 'import json,sys; json.dump(json.load(open(sys.argv[1])) + [sys.argv[2]], open(sys.argv[1], "w"))' "$SRV/gt-remote/bundle-installed.json" "$T/outside.txt"
+echo 1 >"$FAKE/drop_hook"; pb; eq "push" $PBRC 0; yes "arquivo fora das raízes sobrevive" "$T/outside.txt"; no "e o hook que o bundle tirou sumiu" "$HOOK"
+has "o que ficou sem remover é contado, não calado" "$PBOUT" "1 NAO removidos"
+echo "== push-bundle: o registro anterior não manda apagar através de um symlink no caminho"
+srv_reset; pb; rm -rf "$SRV/.claude/hooks"; mkdir -p "$T/elsewhere"; echo keep >"$T/elsewhere/a.sh"; ln -s "$T/elsewhere" "$SRV/.claude/hooks"
+echo 1 >"$FAKE/drop_hook"; pb; eq "push" $PBRC 0; yes "o arquivo do outro lado do symlink sobrevive" "$T/elsewhere/a.sh"; has "e é contado" "$PBOUT" "1 NAO removidos"
+echo "== push-bundle: recusas (nada pela metade)"
+srv_reset; echo '{"model":"opus"}' >"$SRV/.claude/settings.json"; pb; eq "settings do servidor com chave alheia" $PBRC 1; has "msg" "$PBOUT" "nao conhece"
+no "nada instalado" "$HOOK"; no "nem o city" "$CITYF"
+srv_reset; rm -rf "$SRV/.claude/hooks"; mkdir -p "$T/elsewhere"; ln -s "$T/elsewhere" "$SRV/.claude/hooks"; pb; eq "hooks é symlink" $PBRC 1; has "msg" "$PBOUT" "symlink no destino"
+no "nada no destino do link" "$T/elsewhere/a.sh"; no "city não foi escrito antes da recusa" "$CITYF"
+srv_reset; echo other/x >"$FAKE/extra_file"; pb; eq "camada desconhecida" $PBRC 1; has "msg" "$PBOUT" "camada desconhecida"; no "nada instalado" "$HOOK"
+srv_reset; echo "home/.claude/../evil" >"$FAKE/extra_file"; pb; eq "caminho com .." $PBRC 1; has "msg" "$PBOUT" "com .."; no "nada instalado" "$HOOK"
+srv_reset; echo "home/.claude/" >"$FAKE/bad_dest"; echo 0 >"$FAKE/verify.rc.mini"; echo 0 >"$FAKE/verify.rc.server"; pb
+eq "destino fora das raízes, mesmo com o verify forçado a passar (o verify é guarda de deriva, não de adversário)" $PBRC 1; has "msg" "$PBOUT" "destino fora das raizes"; no "nada instalado" "$HOOK"; no "nem o city" "$CITYF"
+srv_reset; echo corrupt >"$FAKE/rsync.mode"; pb; eq "bundle corrompido na viagem" $PBRC 1; has "msg" "$PBOUT" "verify NO SERVIDOR"; no "nada instalado" "$HOOK"
+srv_reset; pb; echo '{"permissions":{"x":1}}' >"$FAKE/home_settings"; echo noop >"$FAKE/rsync.mode"; pb
+eq "stage velho e coerente, hash diferente" $PBRC 1; has "msg" "$PBOUT" "bundle_hash do servidor"
+srv_reset; echo fail >"$FAKE/rsync.mode"; pb; eq "rsync falha" $PBRC 1; has "msg" "$PBOUT" "rsync do bundle"
+srv_reset; echo 4 >"$FAKE/verify.rc.mini"; pb; eq "verify no mini falha" $PBRC 1; has "msg" "$PBOUT" "verify (mini)"; no "nada foi staged no servidor" "$SRV/gt-remote/bundle-out"
+srv_reset; echo 4 >"$FAKE/verify.rc.server"; pb; eq "verify no servidor falha" $PBRC 1; has "msg" "$PBOUT" "verify NO SERVIDOR"; no "nada instalado" "$HOOK"
+srv_reset; echo '{"enabledPlugins":{}}' >"$FAKE/home_settings"; pb; eq "bundle já traz enabledPlugins" $PBRC 3; has "msg" "$PBOUT" "já traz"
+
+echo "== install-claude (loopback)"
+printf '#!/bin/bash\necho "$@" >"$FAKE/installer.args"\n[ -f "$FAKE/installer.noop" ] || echo "$1 (Claude Code)" >"$FAKE/version"\n' >"$T/installer.sh"
+SHA=$(shasum -a 256 "$T/installer.sh" | cut -d' ' -f1); export HETZNER_INSTALLER_URL=file://$T/installer.sh
+ic() { ICOUT=$(python3 -I "$S" install-claude --installer-sha256 "$1" ${2:+--version "$2"} 2>&1); ICRC=$?; }
+reset; echo "2.1.300 (Claude Code)" >"$FAKE/version"; ic "$SHA" 2.1.300; eq "já instalado" $ICRC 0; no "não reinstala" "$FAKE/installer.args"
+reset; echo "2.1.299 (Claude Code)" >"$FAKE/version"; ic "$(printf 'c%.0s' $(seq 64))" 2.1.300; eq "hash diferente" $ICRC 3; has "msg" "$ICOUT" "mudou"; no "nada rodou" "$FAKE/installer.args"
+reset; ic "$SHA" 2.1.300; eq "instala" $ICRC 0; eq "recebeu a versão" "$(cat "$FAKE/installer.args" 2>/dev/null)" "2.1.300"
+reset; ic "$SHA"; eq "sem --version usa a do mini" $ICRC 0; eq "versão do mini" "$(cat "$FAKE/installer.args" 2>/dev/null)" "2.1.300"
+reset; echo "2.1.299 (Claude Code)" >"$FAKE/version"; : >"$FAKE/installer.noop"; ic "$SHA" 2.1.300; eq "versão não muda = falha" $ICRC 1; has "msg" "$ICOUT" "esperado 2.1.300"
+reset; ic "$SHA" '2.1.3;x'; eq "versão inválida" $ICRC 2
+reset; ic "abc" 2.1.300; eq "sha inválido" $ICRC 2
+unset HETZNER_INSTALLER_URL
+
+echo "== plugins (loopback)"
+pl() { PLOUT=$(python3 -I "$S" plugins 2>&1); PLRC=$?; }
+reset; echo '[]' >"$FAKE/mk.out"; pl; eq "do zero" $PLRC 0; eq "marketplace adicionado 1 vez" "$(wc -l <"$FAKE/mk.added" | tr -d ' ')" 1
+eq "3 plugins" "$(wc -l <"$FAKE/installed.ids" | tr -d ' ')" 3; hasnt "sem github" "$(cat "$FAKE/installed.ids")" github; hasnt "sem playwright" "$(cat "$FAKE/installed.ids")" playwright
+pl; eq "de novo" $PLRC 0; eq "não reinstala" "$(wc -l <"$FAKE/installed.ids" | tr -d ' ')" 3
+reset; echo '[{"name":"claude-plugins-official"}]' >"$FAKE/mk.out"; pl; eq "marketplace presente" $PLRC 0; no "não adiciona de novo" "$FAKE/mk.added"
+reset; echo garbage >"$FAKE/mk.out"; pl; eq "lista ilegível não é lista vazia" $PLRC 1; has "msg" "$PLOUT" "não consegui listar"
+reset; echo '{"error":"x"}' >"$FAKE/mk.out"; pl; eq "JSON que não é lista não é lista vazia" $PLRC 1; has "msg" "$PLOUT" "não consegui listar"; no "e nada foi adicionado" "$FAKE/mk.added"
+reset; echo '[]' >"$FAKE/mk.out"; echo superpowers@claude-plugins-official >"$FAKE/failinstall"; pl; eq "install falha" $PLRC 1; has "msg" "$PLOUT" "install superpowers"
+reset; echo '[]' >"$FAKE/mk.out"; echo security-guidance@claude-plugins-official >"$FAKE/disabled"; pl; eq "plugin desligado" $PLRC 1; has "msg" "$PLOUT" "desligados"
+reset; echo '[]' >"$FAKE/mk.out"; : >"$FAKE/mk.addfail"; pl; eq "marketplace add falha" $PLRC 1
+reset; echo '[]' >"$FAKE/mk.out"; : >"$FAKE/list.garble"; pl; eq "a lista de DEPOIS de instalar ilegível" $PLRC 1; has "diz que não conseguiu reler" "$PLOUT" "não consegui reler"; hasnt "e não finge que faltam" "$PLOUT" "faltam"
 
 echo "== canary"
 reset; out=$(python3 -I "$S" canary); eq "canary ok" $? 0; has "usa o settings do city" "$(cat "$FAKE/probe.args")" "--settings $RROOT/city/settings.json"
