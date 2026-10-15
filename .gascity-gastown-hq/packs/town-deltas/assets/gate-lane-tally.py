@@ -196,6 +196,8 @@ def _rig_paths(city, timeout=90):
         if p.returncode != 0:
             return None, f"gc rig list saiu com {p.returncode}: {' '.join(p.stderr.split())[:120] or 'sem mensagem'}"
         rigs = json.loads(p.stdout)["rigs"]
+        if not isinstance(rigs, list):   # an answer in another shape would read as "no rig has a path" — say what it was instead
+            return None, "gc rig list: o campo rigs não é uma lista"
         return {r["name"]: r["path"] for r in rigs if isinstance(r, dict) and isinstance(r.get("name"), str)
                 and isinstance(r.get("path"), str) and r["path"].startswith("/")}, ""
     except Exception as e:

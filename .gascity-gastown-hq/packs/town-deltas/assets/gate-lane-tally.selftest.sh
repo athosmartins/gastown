@@ -319,6 +319,7 @@ echo "$*" >> "${FAKE_GC_LOG:-/dev/null}"
 case "${FAKE_GC_MODE:-ok}" in
   fail) echo "gc boom" >&2; exit 1 ;;
   junk) echo "not json" ;;
+  notlist) echo '{"rigs":{"whatsapp_automation":"/rigW"}}' ;;
   *) cat "$FAKE_GC_JSON" ;;
 esac
 EOF
@@ -457,12 +458,14 @@ print(m.notify_line(json.loads(sys.argv[1])))" "$J5")
 case "$NL5" in *"ATENÇÃO bugs depois NÃO apurado em 1/2 concedida(s)"*"mystery_rig"*"não é zero"*) ok "task-rapida: the notify line (the one a human reads) carries the gap and its reason" ;; *) bad "task-rapida: notify line hides the gap: $NL5" ;; esac
 
 # the rig list itself fails or is garbage: every rig grant is un-looked-up, and the reason says what gc said
-for mode in fail junk; do
+for mode in fail junk notlist; do
   JG=$(GC_CITY_PATH=/hq PATH="$T/bin:$PATH" FAKE_GC_MODE=$mode FAKE_GC_JSON="$T/rigs.json" FAKE_BD_BY_STORE="$T/st" python3 "$TALLY" --log "$L4" --now "$NOW" --json)
   chk4 "gc rig list '$mode': the count is null, all 3 grants un-looked-up" "$JG" "d['tr_bugs_after'], d['tr_bugs_uncovered']" "None 3"
 done
 JG=$(GC_CITY_PATH=/hq PATH="$T/bin:$PATH" FAKE_GC_MODE=fail FAKE_GC_JSON="$T/rigs.json" FAKE_BD_BY_STORE="$T/st" python3 "$TALLY" --log "$L4" --now "$NOW" --json)
 case "$(pj "$JG" "d['tr_bugs_note']")" in *"gc rig list saiu com 1"*"gc boom"*) ok "task-rapida: the note carries gc's exit code and stderr" ;; *) bad "task-rapida: note: $(pj "$JG" "d['tr_bugs_note']")" ;; esac
+JGN=$(GC_CITY_PATH=/hq PATH="$T/bin:$PATH" FAKE_GC_MODE=notlist FAKE_GC_JSON="$T/rigs.json" FAKE_BD_BY_STORE="$T/st" python3 "$TALLY" --log "$L4" --now "$NOW" --json)
+case "$(pj "$JGN" "d['tr_bugs_note']")" in *"o campo rigs não é uma lista"*) ok "task-rapida: a rig list in another shape is named as such, not read as 'no rig has a path'" ;; *) bad "task-rapida: note: $(pj "$JGN" "d['tr_bugs_note']")" ;; esac
 
 # one store cannot be read: the grants of that store are un-looked-up; the failed store is named with bd's own rc and stderr
 touch "$T/st/_rigP.fail"
