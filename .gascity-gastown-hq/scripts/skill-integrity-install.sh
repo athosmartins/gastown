@@ -44,6 +44,21 @@ say() { echo "[skill-integrity-install] $*"; }
 install_plist() {
     local src="$1" label="$2"
     local dst="$LAUNCH_AGENTS/$label.plist"
+    # ga-jh3ske: a label a human paused with `launchctl disable` is NEVER
+    # reinstalled or re-enabled here. Three answers, not two: "yes" skips,
+    # "no" installs, "?" (print-disabled unreadable) also skips — loudly —
+    # because the inert path for "I can't tell whether this was paused on
+    # purpose" is to leave it alone, not to re-arm it (15/10: the two refino
+    # dispatchers Athos paused on 14/10 came back twice through this path).
+    case "$(_disabled_state "$label")" in
+        yes)
+            say "SKIP $label: launchctl-disabled (parada deliberada) — não reinstalo nem religo."
+            return 0 ;;
+        no) ;;
+        *)
+            say "WARNING: SKIP $label: não consegui ler launchctl print-disabled — não religo às cegas; confira à mão."
+            return 0 ;;
+    esac
     if [[ "$NO_LAUNCHD" == "true" ]]; then
         say "Skipping launchd install for $label (SKILL_INTEGRITY_NO_LAUNCHD=true)."
         return 0
@@ -61,8 +76,11 @@ install_plist() {
     if launchctl bootstrap "gui/$uid" "$dst" >/dev/null 2>&1; then
         say "launchd bootstrap OK ($label)"
     else
-        # Fall back to legacy load for older macOS.
-        launchctl load -w "$dst" >/dev/null 2>&1 \
+        # Fall back to legacy load for older macOS. No `-w`: that flag clears
+        # the launchctl disable override, which is exactly how a paused label
+        # got re-armed (ga-jh3ske). A disabled label never reaches this line
+        # (guard above); for an enabled one plain `load` is enough.
+        launchctl load "$dst" >/dev/null 2>&1 \
             && say "launchd load OK ($label, legacy)" \
             || say "WARNING: launchd registration failed for $label"
     fi
@@ -92,6 +110,21 @@ _plist_label() {
 # launchd or root state.
 _is_loaded() { launchctl list "$1" >/dev/null 2>&1; }
 
+# _disabled_state <label> — "yes" if the label carries a launchctl disable
+# override (deliberate pause, survives reboot), "no" if print-disabled was
+# read and does not list it as disabled, "?" if print-disabled could not be
+# read at all. Same source of truth as daemon-presence-watchdog.sh's
+# _deliberately_disabled (ga-jh3ske). Under SKILL_INTEGRITY_NO_LAUNCHD=true
+# there is no launchd to ask, so it answers "no" (tests override it to
+# exercise "yes" and "?"). Broken out so a test can shadow it.
+_disabled_state() {
+    local lbl="$1" out
+    if [[ "$NO_LAUNCHD" == "true" ]]; then echo no; return; fi
+    out="$(launchctl print-disabled "gui/$(id -u)" 2>/dev/null)" || { echo "?"; return; }
+    if ! printf '%s' "$out" | grep -q '=>'; then echo "?"; return; fi
+    if printf '%s' "$out" | grep -Eq "\"$lbl\" *=> *disabled"; then echo yes; else echo no; fi
+}
+
 # scan_and_install_new_plists <dir> — for every *.plist directly under <dir>
 # (non-recursive, matching daemon-presence-watchdog.sh's own scan scope)
 # whose Label starts with com.gascity. and is NOT currently loaded, install
@@ -110,11 +143,12 @@ _is_loaded() { launchctl list "$1" >/dev/null 2>&1; }
 # part of deploy_cmd, which fires per merged story, not on a fixed timer)
 # would restart daemons unrelated to whatever actually changed — including
 # mid-run interruption of a daemon that happens to be executing at that
-# moment. The accepted tradeoff: a daemon a human deliberately paused
-# (`launchctl bootout`, not decommissioned) looks identical to "never
-# installed" to this loop and would get silently reinstalled on the next
-# gascity deploy — same ambiguity daemon-presence-watchdog.sh's alerting
-# already has, just with an action attached instead of just a mail.
+# moment. A daemon a human deliberately paused is told apart from "never
+# installed" by its launchctl disable override (_disabled_state, ga-jh3ske):
+# disabled → skipped with a SKIP line, never reinstalled. A pause done with
+# bootout ALONE (no disable) still looks like "never installed" here — and
+# does not survive a reboot either, so disable is the only pause this city
+# recognizes (see .gc/refino-paused-by-mayor.note).
 scan_and_install_new_plists() {
     local dir="$1" f label
     for f in "$dir"/*.plist; do
@@ -127,6 +161,15 @@ scan_and_install_new_plists() {
         if _is_loaded "$label"; then
             continue
         fi
+        case "$(_disabled_state "$label")" in
+            yes)
+                say "SKIP $label: launchctl-disabled (parada deliberada) — não reinstalo nem religo."
+                continue ;;
+            no) ;;
+            *)
+                say "WARNING: SKIP $label: não consegui ler launchctl print-disabled — não religo às cegas; confira à mão."
+                continue ;;
+        esac
         say "NEW PLIST detected (label not loaded, never installed): $label ($f) -- installing"
         install_plist "$f" "$label"
         # ga-7ryjey acceptance criterion b): verify via a FRESH launchctl

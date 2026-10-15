@@ -22,6 +22,11 @@
 #   6. already-installed hardcoded label (skill-audit) -> still untouched if loaded
 #      (regression guard: this loop must never re-touch the two hand-wired
 #      installs just because they're also *.plist files in the same dir)
+#   7. post-install re-check queries launchctl again -> VERIFIED (ga-7ryjey b)
+#   8. not loaded but launchctl-DISABLED (deliberate pause)  -> SKIP line, never installed (ga-jh3ske)
+#   9. not loaded and print-disabled unreadable ("?")       -> WARNING+SKIP, never installed (third state)
+#  10. hand-wired install_plist() on a disabled label        -> SKIP before any launchd action
+#      (8-10 override _disabled_state, broken out in the source for exactly this)
 #
 # Exit 0 iff every scenario behaves as expected.
 set -uo pipefail
@@ -177,5 +182,50 @@ else
 fi
 
 echo
+# ── Scenario 8: not loaded, but launchctl-disabled -> SKIP, never installed ──
+# ga-jh3ske: on 15/10 the two refino dispatchers Athos paused with
+# `launchctl disable` were re-armed twice by this loop (`load -w`). A paused
+# label is NOT "never installed".
+echo "Scenario 8: com.gascity.* plist not loaded but launchctl-disabled -> SKIP, not installed"
+DIR8D="$TMP/s8-disabled"; mkdir -p "$DIR8D"
+mk_plist "$DIR8D/paused.plist" "com.gascity.paused"
+_is_loaded() { return 1; }
+_disabled_state() { [ "$1" = "com.gascity.paused" ] && echo yes || echo no; }
+OUT="$(scan_and_install_new_plists "$DIR8D" 2>&1)"
+if printf '%s' "$OUT" | grep "SKIP com.gascity.paused: launchctl-disabled" >/dev/null \
+   && ! printf '%s' "$OUT" | grep -E "NEW PLIST detected|Skipping launchd install|Installed plist" >/dev/null; then
+  ok "disabled label skipped with an explicit SKIP line; install_plist never reached"
+else
+  bad "a launchctl-disabled label must be skipped, not reinstalled (ga-jh3ske)" "$OUT"
+fi
+
+# ── Scenario 9: disabled-state unreadable ("?") -> WARNING + SKIP (third state) ──
+echo "Scenario 9: print-disabled unreadable -> WARNING + SKIP, not installed"
+DIR9U="$TMP/s9-unknown"; mkdir -p "$DIR9U"
+mk_plist "$DIR9U/unknown.plist" "com.gascity.unknown"
+_is_loaded() { return 1; }
+_disabled_state() { echo "?"; }
+OUT="$(scan_and_install_new_plists "$DIR9U" 2>&1)"
+if printf '%s' "$OUT" | grep "WARNING: SKIP com.gascity.unknown" >/dev/null \
+   && ! printf '%s' "$OUT" | grep -E "NEW PLIST detected|Skipping launchd install|Installed plist" >/dev/null; then
+  ok "unreadable disable state is reported loudly and does NOT fall through to install"
+else
+  bad "'cannot tell' must not collapse into 'not disabled' (install)" "$OUT"
+fi
+
+# ── Scenario 10: hand-wired install_plist() on a disabled label -> SKIP ──────
+echo "Scenario 10: install_plist() called directly on a disabled label -> SKIP before launchd"
+DIR10="$TMP/s10-handwired"; mkdir -p "$DIR10"
+mk_plist "$DIR10/hw.plist" "com.gascity.handwired"
+_disabled_state() { echo yes; }
+OUT="$(install_plist "$DIR10/hw.plist" "com.gascity.handwired" 2>&1)"
+if printf '%s' "$OUT" | grep "SKIP com.gascity.handwired: launchctl-disabled" >/dev/null \
+   && ! printf '%s' "$OUT" | grep -E "Skipping launchd install|Installed plist" >/dev/null; then
+  ok "hand-wired install path honors the pause too"
+else
+  bad "install_plist() itself must refuse a disabled label (hand-wired calls bypass the scan loop)" "$OUT"
+fi
+_disabled_state() { echo no; }
+
 printf 'skill-integrity-install selftest: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
