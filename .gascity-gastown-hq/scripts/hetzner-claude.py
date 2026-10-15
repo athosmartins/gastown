@@ -13,16 +13,19 @@ SUBCOMANDOS
   canary                    sessão mínima do jeito do provider (--settings do bundle, --dangerously-skip-permissions): responde?
   fingerprint [--save F | --compare F]   impressão da credencial do MINI, só atributos: o hash do oauthAccount DECIDE; o mdat do
                             Keychain só informa (o mini renova o token sozinho, então ele anda sem que ninguém mexa).
-  leak-scan PATH...         procura formato de token do claude em arquivos; imprime arquivo e contagem, nunca o texto achado.
+  leak-scan PATH...         procura formato de token do claude em arquivos; imprime arquivo e contagem, nunca o texto achado. Symlink para fora do
+                            que foi varrido, arquivo que não é comum (FIFO...), ilegível e raiz sem nenhum arquivo lido saem 3, nunca "limpo".
 
 ESTADO E GUARDA
-  <estado>/hetzner-claude.state.json: {state, reason, checked_at, probe, login}; probe = a última chamada de modelo {state, reason, at}. state ∈ ok | logged-out | expired | quota |
+  <estado>/hetzner-claude.state.json: {state, reason, checked_at, probe, login, known}; probe = a última chamada de modelo {state, reason, at};
+  known = o último estado MEDIDO (ok/logged-out/expired/quota), que "não consegui saber" não apaga. state ∈ ok | logged-out | expired | quota |
   unreachable | unknown. TRÊS respostas, não duas: "não consegui saber" (ssh fora, JSON ilegível, tipo errado) é `unreachable` ou
   `unknown`, e o gate trata como bloqueado. `ok` exige `claude auth status` com loggedIn == true E uma chamada de modelo real
   (haiku, 1 turno) com is_error == false e saída 0: a medição de 14/10 mostrou que um servidor DESLOGADO responde subtype "success"
   com is_error true, então subtype não decide nada. A chamada de modelo é repetida a cada PROBE_OK_TTL (1 h) enquanto ok, e a
-  cada PROBE_RETRY (15 min) enquanto expired/quota. Aviso visível: linha no log a cada mudança; `notify` só quando ok -> logged-out
-  ou ok -> expired (nunca por cota: a regra da cidade é não mandar aviso de crédito/cota ao celular do Athos).
+  cada PROBE_RETRY (15 min) enquanto expired/quota. Aviso visível: linha no log a cada mudança; `notify` só quando o último estado medido era ok e
+  agora é logged-out ou expired (nunca por cota: a regra da cidade é não mandar aviso de crédito/cota ao celular do Athos), e só DEPOIS de o estado
+  novo estar gravado: gravação que falha bloqueia o gate e não avisa. Quem esperou a trava herda a medida de quem a tinha, em vez de repetir o ssh.
   Bandeira manual: <estado>/hetzner-claude.off (existir = bloqueado), para o Mayor segurar o servidor na hora.
 
 O QUE NÃO FAZ
@@ -33,7 +36,7 @@ CONFIGURAÇÃO (ambiente)  HETZNER_SSH_HOST (hetzner-teste) · HETZNER_REMOTE_HO
   HETZNER_STATE_DIR (<cidade>/.gc) · HETZNER_STATE_TTL (120) · HETZNER_PROBE_OK_TTL (3600) · HETZNER_PROBE_RETRY (900)
   HETZNER_SSH_TIMEOUT (30) · HETZNER_PROBE_TIMEOUT (120) · HETZNER_LOCK_WAIT (20)
 
-CÓDIGOS  0 ok · 1 bloqueado / falhou · 2 uso ou configuração inválida · 3 recusa de segurança, ou "não consegui ler" (nunca vira "limpo")
+CÓDIGOS  0 ok · 1 bloqueado / falhou / MUDOU (fingerprint) · 2 uso ou configuração inválida · 3 recusa de segurança, ou "não consegui ler/saber" (nunca vira "limpo" nem "igual")
 """
 from __future__ import annotations
 
@@ -44,6 +47,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -93,6 +97,7 @@ if RHOME.count("/") < 2:
     die(2, f"HETZNER_REMOTE_HOME precisa ter ao menos dois níveis (ex.: /home/runner): {RHOME!r}")
 
 STATES = ("ok", "logged-out", "expired", "quota", "unreachable", "unknown")
+KNOWN = STATES[:4]  # medidos; unreachable/unknown são "não consegui saber"
 REMOTE_PATH = 'export PATH="$HOME/.local/bin:$PATH"; '
 # Pasta FIXA: o claude cria um projeto em ~/.claude/projects por diretório de trabalho, e um mktemp por chamada deixaria um novo a cada hora.
 PROBE_CMD = (REMOTE_PATH + f'd={shlex.quote(RHOME)}/gt-remote/probe; mkdir -p "$d" && cd "$d" || exit 125; '
@@ -125,8 +130,9 @@ class Res:
 
 def ssh(cmd: str, timeout: int = SSH_TIMEOUT, stdin: bytes | None = None) -> Res:
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", HOST, cmd]
+    kw = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}  # sem entrada própria: não herda o stdin do chamador
     try:
-        p = subprocess.run(argv, input=stdin, capture_output=True, timeout=timeout)
+        p = subprocess.run(argv, capture_output=True, timeout=timeout, **kw)
     except subprocess.TimeoutExpired:
         return Res(None, timed_out=True)
     except OSError as e:
@@ -206,10 +212,17 @@ def read_state():
 def write_state(st: dict) -> None:
     os.makedirs(STATE_DIR, exist_ok=True)
     tmp = f"{STATE_FILE}.{os.getpid()}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(st, f, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp, STATE_FILE)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(st, f, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, STATE_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def fresh(st, now: float) -> bool:  # data no futuro (relógio, edição à mão) não é "recente": é ilegível
@@ -239,19 +252,26 @@ def refresh(prev, force_probe: bool = False) -> dict:
             state, reason = (ps, pw) if ps == "unreachable" else (pr["state"], pr["reason"])
         else:
             state, reason = pr["state"], pr["reason"]
-    st = {"state": state, "reason": reason, "checked_at": now, "probe": pr, "login": login}
-    transition(prev["state"] if prev else None, state, reason)
-    return st
+    return {"state": state, "reason": reason, "checked_at": now, "probe": pr, "login": login, "known": state if state in KNOWN else last_known(prev)}
 
 
-def transition(old, new, reason: str) -> None:
-    if old == new:
-        return
-    log(f"estado {old or '-'} -> {new}: {reason}")
-    if old == "ok" and new in ("logged-out", "expired"):
+def last_known(prev):
+    """O último veredito MEDIDO (ok/logged-out/expired/quota). 'Não consegui saber' (ssh fora, resposta ilegível) não apaga o que se sabia."""
+    if not prev:
+        return None
+    k = prev.get("known")
+    return k if k in KNOWN else (prev["state"] if prev["state"] in KNOWN else None)
+
+
+def transition(prev, st: dict) -> None:
+    """Só DEPOIS de o estado novo estar gravado: o aviso se apoia no estado em disco para não repetir, então gravação que falha não pode avisar."""
+    old, new = (prev["state"] if prev else None), st["state"]
+    if old != new:
+        log(f"estado {old or '-'} -> {new}: {st['reason']}")
+    if last_known(prev) == "ok" and new in ("logged-out", "expired"):
         try:
             subprocess.run(["notify", "-t", "Hetzner claude", f"login do servidor: {new} — sessões novas lá estão seguradas"],
-                           capture_output=True, timeout=20)
+                           capture_output=True, timeout=20, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError) as e:
             log(f"notify falhou: {e}")
 
@@ -285,8 +305,12 @@ def current(fresh_only: bool = False, force_probe: bool = False):
     with Lock() as lk:
         if not lk.got:
             return {"state": "unknown", "reason": f"estado vencido e outro processo o atualiza há mais de {LOCK_WAIT}s", "checked_at": time.time()}
-        st = refresh(read_state(), force_probe)
+        prev = read_state()
+        if not fresh_only and not force_probe and fresh(prev, time.time()):
+            return prev  # quem tinha a trava acabou de medir: herda a medida em vez de repetir o ssh
+        st = refresh(prev, force_probe)
         write_state(st)
+        transition(prev, st)
         return st
 
 
@@ -335,7 +359,7 @@ def fingerprint() -> dict:
     if sys.platform == "darwin":
         fp["keychain_mdat"] = "unknown"
         try:  # sem -g e sem -w: o macOS devolve só atributos, nunca o segredo
-            p = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials"], capture_output=True, text=True, timeout=15)
+            p = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials"], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
             m = re.search(r'"mdat"<timedate>=\S+\s+"(\d{14}Z)', p.stdout)
             if p.returncode == 0 and m:
                 fp["keychain_mdat"] = m.group(1)
@@ -347,8 +371,14 @@ def fingerprint() -> dict:
 def cmd_fingerprint(a) -> int:
     now = fingerprint()
     if a.save:
-        with open(a.save, "w") as f:
-            json.dump(now, f, sort_keys=True)
+        if now["oauthAccount_sha256_16"] == "unknown":  # um "antes" desconhecido só falharia depois, no --compare, sem dizer por quê
+            print("hetzner-claude: NÃO SEI o oauthAccount do mini (~/.claude.json ilegível): não gravei o 'antes'", file=sys.stderr)
+            return 3
+        try:
+            with open(a.save, "w") as f:
+                json.dump(now, f, sort_keys=True)
+        except OSError as e:
+            die(3, f"não consegui gravar {a.save}: {e}")
         print(json.dumps(now, sort_keys=True))
         return 0
     if not a.compare:
@@ -359,6 +389,8 @@ def cmd_fingerprint(a) -> int:
             before = json.load(f)
     except (OSError, ValueError) as e:
         die(3, f"não consegui ler {a.compare}: {e}")
+    if not isinstance(before, dict):  # JSON válido que não é um "antes": sair 1 aqui seria dizer MUDOU
+        die(3, f"{a.compare} não é um objeto JSON de impressão")
     rc = 0
     for k in sorted(set(now) | set(before)):
         b, n = before.get(k, "unknown"), now.get(k, "unknown")
@@ -372,28 +404,52 @@ def cmd_fingerprint(a) -> int:
 
 
 def cmd_leak_scan(a) -> int:
+    """Tudo que não foi lido é dito, e nada do que não foi lido pode parecer limpo: symlink para fora, não-arquivo, ilegível, raiz que não rendeu nada."""
     hits, unreadable, files, links = [], [], 0, 0
+    reals = [os.path.realpath(r) for r in a.paths]
+
+    def covered(p: str) -> bool:  # alvo existente DENTRO de uma raiz varrida: o walk já leu o alvo de verdade
+        t = os.path.realpath(p)
+        return os.path.exists(t) and any(t == r or t.startswith(r + os.sep) for r in reals)
+
+    def scan(p: str, follow: bool = False) -> None:  # follow: arquivo dado na linha de comando é lido mesmo sendo symlink
+        nonlocal files, links
+        try:
+            st = os.stat(p) if follow else os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):
+                links += 1
+                if not covered(p):
+                    unreadable.append(p + " (symlink para fora do que foi varrido, não seguido)")
+                return
+            if not stat.S_ISREG(st.st_mode):  # FIFO/socket/dispositivo: abrir pendura (FIFO) ou não acaba (/dev/zero)
+                unreadable.append(p + " (não é arquivo comum)")
+                return
+            if st.st_size > 20_000_000:
+                unreadable.append(p + " (maior que 20 MB)")
+                return
+            with open(p, "rb") as f:
+                data = f.read()
+        except OSError:
+            unreadable.append(p)
+            return
+        files += 1
+        n = sum(len(rx.findall(data)) for rx in TOKEN_RES)
+        if n:
+            hits.append((p, n))
+
     for root in a.paths:
-        walk = [(os.path.dirname(root), [], [os.path.basename(root)])] if os.path.isfile(root) else os.walk(root, onerror=lambda e: unreadable.append(str(e.filename)))
-        for dp, _dn, fn in walk:
-            for name in fn:
-                p = os.path.join(dp, name)
-                try:
-                    if os.path.islink(p):
-                        links += 1
-                        continue
-                    if os.path.getsize(p) > 20_000_000:
-                        unreadable.append(p + " (maior que 20 MB)")
-                        continue
-                    with open(p, "rb") as f:
-                        data = f.read()
-                except OSError:
-                    unreadable.append(p)
-                    continue
-                files += 1
-                n = sum(len(rx.findall(data)) for rx in TOKEN_RES)
-                if n:
-                    hits.append((p, n))
+        before_files, before_bad = files, len(unreadable)
+        if os.path.isfile(root):
+            scan(root, follow=True)
+        else:
+            for dp, dn, fn in os.walk(root, onerror=lambda e: unreadable.append(str(e.filename))):
+                for d in dn:  # symlink para PASTA vem em dirnames e o walk não entra nele: sem isto ele não era lido nem contado
+                    if os.path.islink(os.path.join(dp, d)):
+                        scan(os.path.join(dp, d))
+                for name in fn:
+                    scan(os.path.join(dp, name))
+        if files == before_files and len(unreadable) == before_bad:  # raiz que não rendeu arquivo nem erro (pasta vazia): não olhou nada
+            unreadable.append(root + " (nenhum arquivo lido)")
     for p, n in hits:
         print(f"ACHOU formato de token: {p} ({n})")
     for p in unreadable:
