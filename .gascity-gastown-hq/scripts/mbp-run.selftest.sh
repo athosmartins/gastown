@@ -108,7 +108,13 @@ case "$name" in
       if [ "$host" = hetzner ]; then rc_v=${STUB_RUN_RC_NODE:-$rc_v}; out_v=${STUB_RUN_OUT_NODE:-}; slp=${STUB_RUN_SLEEP_NODE:-0}
       else rc_v=${STUB_RUN_RC_MBP:-$rc_v}; out_v=${STUB_RUN_OUT_MBP:-}; slp=${STUB_RUN_SLEEP_MBP:-0}; fi
       [ "$rc_v" = 255 ] && exit 255
-      [ "$slp" = 0 ] || sleep "$slp"
+      # STUB_NODE_WAIT_FOR=<arquivo>: o nó só devolve depois que esse arquivo existe (sincroniza com a sombra, sem depender de relógio); STUB_SLEEP_MARK=<prefixo>: o lado de MBP marca
+      # <prefixo>.start antes de dormir e <prefixo>.end SÓ se o sono terminar (um sono interrompido por kill não marca)
+      if [ "$host" = hetzner ] && [ -n "${STUB_NODE_WAIT_FOR:-}" ]; then w=0; while [ ! -e "$STUB_NODE_WAIT_FOR" ] && [ "$w" -lt 240 ]; do /bin/sleep 0.5; w=$((w + 1)); done; fi
+      if [ "$slp" != 0 ]; then
+        [ -z "${STUB_SLEEP_MARK:-}" ] || [ "$host" = hetzner ] || : > "$STUB_SLEEP_MARK.start"
+        if /bin/sleep "$slp"; then [ -z "${STUB_SLEEP_MARK:-}" ] || [ "$host" = hetzner ] || : > "$STUB_SLEEP_MARK.end"; fi
+      fi
       if [ -n "$out_v" ]; then printf '%b\n' "$out_v"; else echo "${STUB_RUN_OUT:-stub-run-ok}"; fi
       exit "$rc_v"
     else echo "stub-exec-ok"; exit "${STUB_RUN_RC:-0}"; fi ;;
@@ -983,8 +989,14 @@ has "rc difere sem nenhum arquivo legível: TODOS os alvos .py viram mac-only (m
 shadow_env; rc=$(STUB_RUN_RC_NODE=1 STUB_RUN_RC_MBP=0 run -- tests/test_x.py); expect "nó 1, MBP 0: o chamador recebe o 1 do nó" 1 "$rc"; has "…e é divergência" "$SHLOG" '"verdict":"diverge","a_host":"hetzner","a_rc":1,"b_host":"mbp","b_rc":0'
 shadow_env; rc=$(STUB_UNREACHABLE_MBP=1 run -- tests/test_x.py); expect "MBP fora na sombra: o chamador não sente" 0 "$rc"; has "veredito 'skipped' com o rc do MBP" "$SHLOG" '"verdict":"skipped","a_host":"hetzner","a_rc":0,"b_host":"mbp","b_rc":98'; [ ! -e "$LEARNED" ] && ok "MBP indisponível: nada é aprendido" || bad "aprendeu sem comparar"
 shadow_env; rm -f "$FLAG"; rc=$(run -- tests/test_x.py); expect "MBP desligado: a sombra não roda e o nó responde" 0 "$rc"; has "veredito 'skipped' (rc 99)" "$SHLOG" '"verdict":"skipped".*"b_rc":99'; date > "$FLAG"
-shadow_env; start=$(date +%s); rc=$(HETZNER_SHADOW_WAIT_S=1 STUB_RUN_SLEEP_MBP=25 run -- tests/test_x.py); el=$(( $(date +%s) - start )); expect "MBP lento (25 s): o chamador não espera além do teto da sombra" 0 "$rc"
-has "veredito 'timeout'" "$SHLOG" '"verdict":"timeout"'; n=$((n+1)); if [ "$el" -lt 20 ]; then echo "ok   o teto de espera (1 s) foi respeitado (${el}s, o MBP lento levaria 25 s)"; else echo "FAIL esperou o MBP lento (${el}s)"; fails=$((fails+1)); fi; [ ! -e "$LEARNED" ] && ok "timeout: nada é aprendido" || bad "timeout aprendeu"
+# o teto de espera tem de DERRUBAR a sombra: o trap `exit 130` do filho só roda quando o comando em primeiro plano dele (o ssh ao MBP) termina, então um kill só no PID deixava o wait segurando quem chamou até o MBP acabar.
+# Sem relógio (carga do mini varia de 6 s a 26 s no mesmo caso): o nó só devolve depois que a sombra começou a dormir no MBP (60 s), e se confere que o sono NÃO chegou ao fim quando quem chamou voltou.
+rm -f "$T/slow.start" "$T/slow.end"
+shadow_env; rc=$(HETZNER_SHADOW_WAIT_S=1 STUB_SLEEP_MARK="$T/slow" STUB_NODE_WAIT_FOR="$T/slow.start" STUB_RUN_SLEEP_MBP=60 run -- tests/test_x.py); late=0; [ -e "$T/slow.end" ] && late=1
+expect "MBP lento (dormindo 60 s): quem chamou recebe o rc do nó" 0 "$rc"; has "veredito 'timeout'" "$SHLOG" '"verdict":"timeout"'
+[ -e "$T/slow.start" ] && ok "a sombra já dormia no MBP quando o teto (1 s) estourou (o caso não é vazio)" || bad "a sombra nem chegou a dormir no MBP"
+[ "$late" = 0 ] && ok "o teto derruba a sombra: quem chamou volta ANTES de o MBP lento acordar" || bad "quem chamou ficou preso até o MBP lento acordar (a sombra não foi derrubada)"
+[ ! -e "$LEARNED" ] && ok "timeout: nada é aprendido" || bad "timeout aprendeu"
 shadow_env; touch -t 202001010000 "$NODEFLAG"; run -- tests/test_x.py >/dev/null; hasnt "bandeira com mais de 24 h: janela fechada, sem sombra" "$STUB_LOG" 'HOSTCALL:mbp'
 shadow_env; touch -t 202001010000 "$NODEFLAG"; HETZNER_SHADOW_WINDOW_S=999999999 run -- tests/test_x.py >/dev/null; has "janela configurável (HETZNER_SHADOW_WINDOW_S) reabre a sombra" "$STUB_LOG" 'HOSTCALL:mbp:RUN'
 shadow_env; export HETZNER_SHADOW_PCT=0; run -- tests/test_x.py >/dev/null; hasnt "HETZNER_SHADOW_PCT=0: sem sombra" "$STUB_LOG" 'HOSTCALL:mbp'

@@ -507,7 +507,7 @@ while [ \$n -le $cap ]; do
   if mkdir "\$S/\$n" 2>/dev/null; then
     printf '%s\n' '$OWNER' > "\$S/\$n/owner"; printf '%s\n' '$SLOT_INFO' > "\$S/\$n/info"
     occ=\$(ls -1 "\$S" | grep -c '^[0-9][0-9]*\$')
-    if [ "\$occ" -le $cap ]; then echo "SLOT=\$n"; exit 0; fi
+    if [ "\$occ" -le $cap ]; then echo "SLOT=\$n"; echo "OCC=\$occ"; exit 0; fi
     rm -f "\$S/\$n/owner" "\$S/\$n/info"; rmdir "\$S/\$n" 2>/dev/null
     break
   fi
@@ -533,6 +533,7 @@ acquire() {
   for attempt in 1 2; do
     out=$(acquire_once); rc=$?
     SLOT=$(echo "$out" | sed -n 's/^SLOT=//p' | head -1)
+    OCC=$(echo "$out" | sed -n 's/^OCC=//p' | head -1)   # quantos slots ocupados com o meu (divide os núcleos do nó entre as baterias); ausente = 1
     [ -n "$SLOT" ] && return 0
     [ $rc -eq 255 ] && { say "ssh caiu ao pegar slot"; return 98; }
     [ $attempt -eq 2 ] && break
@@ -693,8 +694,22 @@ shadow_start() { # "$@" = args ORIGINAIS do pytest. Decide e dispara o lado de M
   ( exec env MBP_RUN_SHADOW=1 "$HERE/$(basename "$0")" --host mbp --repo "$repo" --dir "$dir" -- "$@" >"$SHADOW_OUT" 2>&1 </dev/null ) &
   SHADOW_PID=$!
 }
+descendants() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do echo "$c"; descendants "$c"; done; }
+# Derruba a sombra DE VERDADE. O trap `exit 130` dela só roda quando o comando em primeiro plano (o ssh ao MBP) termina: um `kill` só no PID deixa o `wait` segurando quem chamou até o MBP acabar,
+# e o teto de espera (e o aborto com o nó caído) não limitariam nada. Ordem: TERM no processo da sombra (o trap fica pendente), depois nos filhos (o comando em primeiro plano acaba, o trap roda e
+# ela libera o slot do MBP), espera limitada, e KILL se ainda estiver viva (sem pgrep a lista de filhos vem vazia: o KILL ainda solta quem chamou em até 10 s).
+shadow_kill() { # PID
+  local pid="$1" kids k w=0
+  kids=$(descendants "$pid")
+  kill "$pid" 2>/dev/null
+  for k in $kids; do kill "$k" 2>/dev/null; done
+  while kill -0 "$pid" 2>/dev/null && [ "$w" -lt 10 ]; do sleep 1; w=$((w + 1)); done
+  kill -KILL "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  return 0
+}
 shadow_abort() { # o nó caiu no meio: o lado de MBP da sombra não tem mais com quem comparar
-  if [ -n "$SHADOW_PID" ]; then kill "$SHADOW_PID" 2>/dev/null; wait "$SHADOW_PID" 2>/dev/null; SHADOW_PID=""; fi
+  if [ -n "$SHADOW_PID" ]; then shadow_kill "$SHADOW_PID"; SHADOW_PID=""; fi
   [ -z "$SHADOW_OUT" ] || rm -f "$SHADOW_OUT"; SHADOW_OUT=""
   return 0
 }
@@ -709,7 +724,7 @@ shadow_finish() { # rc_do_nó arquivo_da_saída_do_nó "$@" (args originais). Es
   local arc="$1" aout="$2" brc waited=0 bf af diffs="" t f learned=0; shift 2
   while kill -0 "$SHADOW_PID" 2>/dev/null && [ "$waited" -lt "$NODE_SHADOW_WAIT_S" ]; do sleep 1; waited=$((waited + 1)); done
   if kill -0 "$SHADOW_PID" 2>/dev/null; then
-    kill "$SHADOW_PID" 2>/dev/null; wait "$SHADOW_PID" 2>/dev/null
+    shadow_kill "$SHADOW_PID"
     shadow_log timeout "$arc" null "" 0; say "sombra: o MBP não terminou em ${NODE_SHADOW_WAIT_S}s depois do nó — sem veredito"
   else
     wait "$SHADOW_PID" 2>/dev/null; brc=$?
@@ -848,6 +863,7 @@ _attempt_pytest() {
   preflight || { rc=$?; log_refusal; return $rc; }
   if [ "$HOSTKIND" = linux ]; then node_guard || { say "não consegui varrer o conteúdo do que iria ao $HNAME (lista do rsync ou hetzner-pii-scan.py falhou) — o nó NÃO é usado, rode local"; fall varredura-falhou 98; return 98; }; fi
   SLOT_INFO=$(slot_info_for "$repo" pytest "$@")
+  OCC=1
   acquire || { rc=$?; if [ $rc -eq 96 ]; then fall slots "$rc"; else fall ssh-caiu "$rc"; fi; return $rc; }
   T0=$(date +%s)
   mkdir -p "$CITY/.gc/run" 2>/dev/null; TMPOUT=$(mktemp "$CITY/.gc/run/mbp-run.XXXXXX")

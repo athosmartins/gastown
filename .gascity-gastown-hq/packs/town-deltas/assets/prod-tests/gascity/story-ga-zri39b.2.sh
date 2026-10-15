@@ -83,7 +83,8 @@ MBP_CITY="$tmpc" "$BASH32" "$RUN" --host linux --repo wa --dir "$tmpc/wt" -- "$f
 grep -q '"reason":"mac-only"' "$tmpc/.gc/logs/mbp-run.jsonl" 2>/dev/null || fail "o motivo mac-only não foi para o log"
 log "alvo da lista mac-only fica fora do nó (rc 98, motivo no log) ✓"
 
-run_suite "selftest do nó Linux (mbp-run.sh): cadeia, segurança, mac-only, xdist e sombra" 200 env MBP_SELFTEST_ONLY=node timeout 900 "$BASH32" "$SELFTEST"
+# 2700 s: o selftest passa de 300 casos e cada um sobe o mbp-run.sh inteiro; medido em 15/10 com o mini a load 50–65 foram 24 min, e o story-delivery roda o prod test a ni 15 (mais lento ainda). 900 s matava um selftest verde.
+run_suite "selftest do nó Linux (mbp-run.sh): cadeia, segurança, mac-only, xdist e sombra" 200 env MBP_SELFTEST_ONLY=node timeout 2700 "$BASH32" "$SELFTEST"
 scan_node_base
 
 log "PASS"
