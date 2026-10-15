@@ -1664,6 +1664,35 @@ gap2_skip_no_changes() {
   fi
 }
 
+# _gate_passed_on_bead <gc_city> <bead_id> — rc0 iff the bead's labels, READ NOW, carry gate:passed.
+# vazio → no labels, or none of them gate:passed: rc1. falhou/ilegível → `bd show` errors, or its
+# output is not JSON jq can read: rc1 as well — never rc0, so "could not read" is never "confirmed".
+_gate_passed_on_bead() {
+  local labels
+  labels=$(bd -C "$1" show "$2" --json 2>/dev/null \
+    | jq -r '(if type=="array" then .[0] else . end) | (.labels // []) | join(" ")' 2>/dev/null) || return 1
+  case " $labels " in *" gate:passed "*) return 0 ;; esac
+  return 1
+}
+
+# gate_passed_confirm <gc_city> <bead_id> — ga-botvu2: READ BACK the gate:passed a hand-off just
+# wrote. Every hand-off writes it as `bd label add … "gate:passed" -q 2>/dev/null || true`, which
+# swallows every failure; a story handed off WITHOUT it is invisible to story-delivery (whose
+# selector is story:approved + gate:passed) and merged-bead-janitor, reading "no gate:passed" as
+# "never queued for delivery", closes it as done on the spot. So: label present → rc0; missing →
+# write it once more and read again; still missing → leave a comment on the bead saying so and
+# return 1. rc0 iff the label was READ on the bead, never on the strength of the write's own rc.
+# Silent on stdout/stderr — lib-region code, log()/warn() are defined below the GATE_GUARD_LIB_ONLY
+# cutoff — so the durable record is that bead comment. Callers `|| true`: the hand-off carries on.
+gate_passed_confirm() {
+  local city="$1" id="$2"
+  if _gate_passed_on_bead "$city" "$id"; then return 0; fi
+  bd -C "$city" label add "$id" "gate:passed" -q 2>/dev/null || true
+  if _gate_passed_on_bead "$city" "$id"; then return 0; fi
+  bd -C "$city" comment "$id" "ga-botvu2: the quality gate PASSED this bead but could NOT confirm gate:passed on it, even after a second write — the label is missing or unreadable. story-delivery selects story:approved + gate:passed, so it will not deploy this story until the label is added by hand (bd label add $id gate:passed). merged-bead-janitor will not hold it for delivery either." 2>/dev/null || true
+  return 1
+}
+
 # gap2_apply_pass_verdict <bead_id> <sling_id> <is_story_approved> <verdict> —
 # ga-1un0n: the SHARED terminal action for free:pass-stranded's two
 # affirmative verdicts (close:merge-verified / close:untracked-delivery).
@@ -1710,6 +1739,7 @@ gap2_apply_pass_verdict() {
         ;;
     esac
     bd -C "$GC_CITY" label add "$bead_id" "gate:passed" -q 2>/dev/null || true
+    gate_passed_confirm "$GC_CITY" "$bead_id" || true   # ga-botvu2: read the label back; a missing one is recorded on the bead
     bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-1un0n): sling bead $sling_id gate-passed and closed, and $story_reason. story:in-flight + pilot:dispatched cleared; gate:passed set — story-delivery will deploy and mark story:done." 2>/dev/null || true
   else
     # ga-1un0n: bug/task messages preserved VERBATIM from the pre-fix code —

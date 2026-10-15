@@ -10040,6 +10040,7 @@ fi
       # gate:passed is BOTH the success label AND story-delivery's pickup signal
       # (story-delivery selects story:approved + gate:passed, excluding story:done).
       bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+      gate_passed_confirm "$BEAD_CITY" "$BEAD_ID" || true   # ga-botvu2: read the label back; a missing one is recorded on the bead
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true   # ga-ufskhy 07/10: passed is not queued (ga-i0n83 contradiction)
       # ga-tuk26: clear residue from an EARLIER failed cycle on this SAME bead.
       # gate:failed/gate:needs-fix are only ever ADDED on FAIL (~line 3923/3987
@@ -14363,6 +14364,7 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
             # STORY → hand off to story-delivery, same as Step 4b's already-merged
             # path: gate:passed is delivery's pickup signal; do not close here.
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+            gate_passed_confirm "$BEAD_CITY" "$BEAD_ID" || true   # ga-botvu2: read the label back; a missing one is recorded on the bead
             bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true   # ga-ufskhy 07/10: passed is not queued (ga-i0n83 contradiction)
             # ga-tuk26: clear residue from an earlier failed cycle — see the
             # PASS-path sibling (ga-esbg block, ~line 3545) for full rationale.
@@ -15968,6 +15970,7 @@ if [ "$ALREADY_MERGED" = "1" ]; then
           # gate:superseded on a story: that label is a non-delivery word the painel
           # would mis-route, and superseded is not the story's outcome (it WAS merged).
           bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+          gate_passed_confirm "$BEAD_CITY" "$BEAD_ID" || true   # ga-botvu2: read the label back; a missing one is recorded on the bead
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true   # ga-ufskhy 07/10: passed is not queued (ga-i0n83 contradiction)
           # ga-tuk26: clear residue from an earlier failed cycle — see the
           # PASS-path sibling (ga-esbg block, ~line 3545) for full rationale.

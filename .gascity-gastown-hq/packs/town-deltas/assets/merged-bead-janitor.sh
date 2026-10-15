@@ -91,6 +91,24 @@ DRY_RUN="${JANITOR_DRY_RUN:-0}"
 # Optional rig filter (space-separated prefixes/names); empty = all rigs.
 RIGS_FILTER="${JANITOR_RIGS:-}"
 
+# ── Story delivery grace (ga-botvu2) ─────────────────────────────────────────
+# A story handed off by the gate (story:approved + gate:passed) is WAITING for
+# story-delivery to deploy and prod-test it, and merge evidence in origin/main is
+# present from the very first second — so without a wait the story sweep below closes
+# it as story:done before the deploy ever ran. The sweep leaves such a story alone for
+# this many seconds after its last update; past that, a delivery that never came is
+# presumed stuck and the janitor closes it as an explicit BACKSTOP (label
+# delivery:janitor-backstop, close reason says deploy/prod-test were NOT verified).
+#
+# 1800 s, not the 600 s first proposed: story-delivery processes stories one at a
+# time and one story's pass takes 6.5-10 min when a deploy + prod-test runs. Measured on
+# its log, 319 passes: p50 32 s, p90 466 s, p95 609 s, p99 931 s, max 1546 s — a 600 s
+# wait would still close a story whose own pass is mid-flight, or one queued behind
+# another. The janitor itself sweeps every 900 s, so the effective wait is 1800-2700 s.
+# Override with JANITOR_STORY_DELIVERY_GRACE_SECONDS (a non-number holds every
+# gate:passed story, loudly, rather than silently dropping the wait).
+STORY_DELIVERY_GRACE_SECONDS="${JANITOR_STORY_DELIVERY_GRACE_SECONDS:-1800}"
+
 # ── Branch-prune sweep (ga-tijv5 extension, 2026-07-01) — OPT-IN, default OFF ─
 # Merged crew branches (crew/<persona>/<id>) accumulate on the shared remotes and
 # are NEVER pruned after merge (measured 2026-07-01: 495 on whatsapp-automation,
@@ -300,8 +318,11 @@ janitor_decide() {
 #                      <has_builder> <delivery_active>
 #                      <sig_commit> <sig_marker> <sig_branch> <sig_commit_stale>
 #                      <sig_marker_superseded> <sig_commit_docs_only> <sig_marker_stale>
+#                      <gate_passed_grace>
 # Each arg is 0|1 (sig_commit_stale/sig_marker_superseded/sig_commit_docs_only/
-# sig_marker_stale default to 0 when omitted — backward-compatible).
+# sig_marker_stale default to 0 when omitted — backward-compatible). The last arg is the
+# story_gate_passed_grace_state word, none|waiting|elapsed|unknown (default none when omitted;
+# the live sweep always passes it — drift-guarded in the selftest).
 # Echoes "<verdict>:<reason>", verdict ∈ {done,keep}. Guards are evaluated FIRST and in
 # a fixed precedence — ANY active-rework or not-a-merged-story condition wins over the
 # merge signals (zero false-positive is paramount: a genuinely-pending approved story
@@ -327,7 +348,7 @@ janitor_story_decide() {
   local is_epic="$1" has_open_marker="$2" already_done="$3" in_flight="$4" \
         has_builder="$5" delivery_active="$6" sig_commit="$7" sig_marker="$8" sig_branch="$9" \
         sig_commit_stale="${10:-0}" sig_marker_superseded="${11:-0}" sig_commit_docs_only="${12:-0}" \
-        sig_marker_stale="${13:-0}"
+        sig_marker_stale="${13:-0}" gate_passed_grace="${14-none}"
   # — Guards (keep) — first match wins (each returns) —
   # SECURITY (sibling-path parity, ga-v3o6i sweep): ACTIVE-WORK guards MUST precede
   # already_done. A bead can carry a stale story:done label AND be re-opened (open
@@ -340,6 +361,15 @@ janitor_story_decide() {
   if [ "$has_builder" = "1" ];     then echo "keep:live-builder-assignee"; return 0; fi
   if [ "$delivery_active" = "1" ]; then echo "keep:delivery-owns-it"; return 0; fi
   if [ "$already_done" = "1" ];    then echo "keep:already-story-done"; return 0; fi
+  # ga-botvu2: a story the gate PASSED is waiting for story-delivery to deploy it; merge
+  # evidence is present from second zero, so only a grace that has ELAPSED lets it through.
+  # Allowlist, not denylist: `none` (no gate:passed — not waiting for delivery) and `elapsed`
+  # pass; `waiting`, `unknown` and anything else (an empty or garbled state included) keep.
+  case "$gate_passed_grace" in
+    none|elapsed) ;;
+    waiting)      echo "keep:gate-passed-awaiting-delivery-grace"; return 0 ;;
+    *)            echo "keep:gate-passed-grace-unreadable"; return 0 ;;
+  esac
   # — Merge evidence (done) — same triangulation as janitor_decide —
   if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ] && [ "$sig_commit_docs_only" != "1" ]; then
                                    echo "done:commit-in-origin-main"; return 0; fi
@@ -382,6 +412,45 @@ story_delivery_owns_labels() {
 # fix-attempt 2, reviewer's pre-existing `info`).
 story_labels_readable() {
   printf '%s' "$1" | grep -w "story:approved" >/dev/null
+}
+
+# iso_epoch <timestamp> — echoes the epoch seconds of a UTC `…Z` timestamp (fractional
+# seconds tolerated), or NOTHING when it cannot. bd emits UTC `Z` timestamps.
+# vazio → nothing echoed (the caller sees "no timestamp"); falhou/ilegível (garbage, a
+# `+hh:mm` offset form, jq missing) → also nothing echoed — never a made-up 0 or "now",
+# which would read as "just updated" or "ancient". Callers must test the result for digits.
+iso_epoch() {
+  printf '%s' "$1" | jq -Rr 'sub("\\.[0-9]+Z$"; "Z") | (try fromdateiso8601 catch "") | tostring' 2>/dev/null || true
+}
+
+# story_gate_passed_grace_state <space-joined labels> <updated_at> <now_epoch> <grace_seconds>
+# — echoes none | waiting | elapsed | unknown (ga-botvu2): has the story that the gate PASSED
+# been waiting for story-delivery long enough that the janitor may stop waiting for it?
+#   none     no gate:passed label: the story is not queued for delivery, the wait does not apply
+#   waiting  gate:passed, last updated less than <grace_seconds> ago: delivery may still be coming
+#   elapsed  gate:passed, last updated at least <grace_seconds> ago: delivery is presumed stuck
+#   unknown  gate:passed, but the age cannot be computed (timestamp, clock or grace unreadable)
+# vazio → an empty label list or no gate:passed on it is `none` (the sweep has already refused rows
+# whose labels it could not read: story_labels_readable); an empty updated_at is `unknown`, NOT
+# `elapsed`. falhou/ilegível → `unknown`, which janitor_story_decide keeps exactly like `waiting`
+# (the inert outcome: the story stays open and the next sweep asks again) — an unreadable age
+# must never be read as "old enough", the same fail-closed rule as story_labels_readable.
+# A timestamp in the future (clock skew) is `unknown` as well. The clock is `updated_at`, the last
+# write to the bead. It is never EARLIER than the write of gate:passed (the handoff keeps writing
+# after it: hygiene labels, a comment, the builder clear), so the age measured here is never longer
+# than the real wait — a later write (a comment, a label) only postpones the backstop, never hastens it.
+story_gate_passed_grace_state() {
+  local labels="$1" updated_at="$2" now="$3" grace="$4" upd
+  case " $labels " in
+    *" gate:passed "*) ;;
+    *) echo none; return 0 ;;
+  esac
+  case "$now"   in ''|*[!0-9]*) echo unknown; return 0 ;; esac
+  case "$grace" in ''|*[!0-9]*) echo unknown; return 0 ;; esac
+  upd=$(iso_epoch "$updated_at")
+  case "$upd" in ''|*[!0-9]*) echo unknown; return 0 ;; esac
+  [ "$upd" -le "$now" ] || { echo unknown; return 0; }
+  if [ $((now - upd)) -ge "$grace" ]; then echo elapsed; else echo waiting; fi
 }
 
 # ga-v8ui5 (gate-feedback follow-up): is a janitor_decide/janitor_story_decide
@@ -1518,7 +1587,10 @@ EOF
   # gate PASS, stories are handed to delivery OPEN with story:approved; if delivery
   # never completes they strand here and the Kanban shows false backlog. With merge
   # evidence AND no active rework, drive story:approved → story:done.
-  STORIES=$(bd -C "$RPATH" list --status open --json -l story:approved 2>/dev/null || echo '[]')
+  # --limit 0: every approved story, not bd's default first 50 — a story past the cutoff would never
+  # age through its grace. vazio → no stories to reconcile; falhou/ilegível → also `[]`: the inert
+  # outcome (no row is decided on, nothing is closed, the next sweep asks again).
+  STORIES=$(bd -C "$RPATH" list --status open --limit 0 --json -l story:approved 2>/dev/null || echo '[]')
   [ -z "$STORIES" ] && STORIES='[]'
   SN=$(printf '%s' "$STORIES" | jq 'length' 2>/dev/null || echo 0)
   [ "$SN" = "0" ] || log "rig $RNAME ($RPREFIX): $SN open story:approved bead(s) to check for story:done reconciliation"
@@ -1549,6 +1621,15 @@ EOF
     S_DELIV=0
     if story_delivery_owns_labels "$SLABELS"; then S_DELIV=1; fi
 
+    # ga-botvu2: a story the gate PASSED but delivery has not touched yet carries NONE of the
+    # delivery:* labels above, yet is queued for story-delivery. How long it has waited decides
+    # whether the janitor may stop waiting. vazio → updated_at "" is `unknown`, not `elapsed`;
+    # falhou/ilegível → `unknown` too, and so does an empty S_GRACE (the helper crashed): both
+    # land in the keep branch of janitor_story_decide, never in a close.
+    S_UPDATED=$(printf '%s' "$s" | jq -r '.updated_at // ""' 2>/dev/null || true)
+    S_GRACE=$(story_gate_passed_grace_state "$SLABELS" "$S_UPDATED" "$(date +%s)" "$STORY_DELIVERY_GRACE_SECONDS")
+    S_GRACE_OPEN=0; case "$S_GRACE" in none|elapsed) S_GRACE_OPEN=1 ;; esac
+
     # Markers (HQ-resident, regardless of which store the bead lives in).
     SMK=$(markers_for_bead "$SID")
     S_OPENMK=0;  has_open_marker "$SMK"           && S_OPENMK=1
@@ -1558,7 +1639,8 @@ EOF
     # Only pay for the git scans when no cheap guard already forces keep.
     S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""; S_SIGCOMMIT_STALE=0; S_SIGCOMMIT_DOCS_ONLY=0; S_BCOMMENTS=""
     if [ "$S_EPIC" = "0" ] && [ "$S_DONE" = "0" ] && [ "$S_OPENMK" = "0" ] \
-       && [ "$S_INFLIGHT" = "0" ] && [ "$S_BUILDER" = "0" ] && [ "$S_DELIV" = "0" ]; then
+       && [ "$S_INFLIGHT" = "0" ] && [ "$S_BUILDER" = "0" ] && [ "$S_DELIV" = "0" ] \
+       && [ "$S_GRACE_OPEN" = "1" ]; then
       # Signal A — commit whose SUBJECT SCOPE is this story id, in the story's OWN rig repo.
       # Strict subject-scope (header before the first colon) to reject incidental body
       # mentions AND trailing "(context/<id>)" parens of a still-open story — see
@@ -1617,7 +1699,7 @@ EOF
     fi
 
     S_VERDICT_LINE=$(janitor_story_decide "$S_EPIC" "$S_OPENMK" "$S_DONE" "$S_INFLIGHT" \
-                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE")
+                       "$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE" "$S_GRACE")
     S_VERDICT="${S_VERDICT_LINE%%:*}"; S_REASON="${S_VERDICT_LINE#*:}"
 
     if [ "$S_VERDICT" = "done" ]; then
@@ -1663,9 +1745,18 @@ EOF
         continue
       fi
 
+      # ga-botvu2: S_GRACE=elapsed means the gate passed this story and story-delivery never
+      # finished it within the grace — the close below is a BACKSTOP, not a delivered story.
+      # `none` (no gate:passed) was never queued for delivery, so it keeps the plain wording.
+      S_BACKSTOP=0; [ "$S_GRACE" = "elapsed" ] && S_BACKSTOP=1
+
       if [ "$DRY_RUN" = "1" ]; then
         log "WOULD-DONE $SID ($RNAME) — $S_EVID — \"$STITLE\""
-        log "WOULD-DONE: story:done added, story:approved removed, story:in-flight removed, bead closed (delivery close_reason → painel Done)"
+        if [ "$S_BACKSTOP" = "1" ]; then
+          log "WOULD-DONE: BACKSTOP (gate:passed, no delivery within ${STORY_DELIVERY_GRACE_SECONDS}s) — delivery:janitor-backstop + story:done added, story:approved removed, story:in-flight removed, bead closed; deploy/prod-test NOT verified"
+        else
+          log "WOULD-DONE: story:done added, story:approved removed, story:in-flight removed, bead closed (delivery close_reason → painel Done)"
+        fi
       else
         # Drive to the durable terminal — mirrors story-delivery (ga-i53ua):
         #   1. add story:done          (terminal label)
@@ -1675,16 +1766,37 @@ EOF
         #      (_closed_bead_belongs_in_done/_is_delivery_close: "merged" triggers Done)
         # story-delivery.sh L886 explicitly delegates this close to the janitor:
         #   "merged-bead-janitor backstops the close".
-        # All steps || true — idempotent.
+        # All steps || true — idempotent, except the backstop label below, whose failure is recorded.
+        if [ "$S_BACKSTOP" = "1" ]; then
+          # The label is the machine-readable "this story was NOT delivered" mark; it goes on BEFORE
+          # the close so it survives a failed close. falhou → warn and carry on: the close reason and
+          # the comment below say the same thing in words, and a story that merged still must leave
+          # Aprovadas — but the log shows the mark is missing.
+          bd -C "$RPATH" label add "$SID" "delivery:janitor-backstop" -q 2>/dev/null \
+            || warn "could not add delivery:janitor-backstop to $SID ($RNAME) — close reason and comment still say deploy was NOT verified"
+        fi
         bd -C "$RPATH" label add "$SID" "story:done" -q 2>/dev/null || true
         bd -C "$RPATH" label remove "$SID" "story:approved" -q 2>/dev/null || true
         bd -C "$RPATH" label remove "$SID" "story:in-flight" -q 2>/dev/null || true
-        JCLOSE_MSG="merged-bead-janitor ($SOURCE_BEAD): code merged to origin/main — $S_EVID. Gate→delivery→done did not complete (cross-store, superseded path, rig-store delivery blind spot, or delivery crash); janitor drives durable terminal: story:done added, story:approved removed, bead closed. Mirrors story-delivery ga-i53ua."
+        if [ "$S_BACKSTOP" = "1" ]; then
+          JCLOSE_MSG="merged-bead-janitor ($SOURCE_BEAD, ga-botvu2 backstop): code merged to origin/main — $S_EVID. The gate passed this story (gate:passed) but story-delivery did not finish it within ${STORY_DELIVERY_GRACE_SECONDS}s, so the janitor closed it: DEPLOY AND PROD-TEST WERE NOT VERIFIED. Labelled delivery:janitor-backstop; story:done added, story:approved removed."
+        else
+          JCLOSE_MSG="merged-bead-janitor ($SOURCE_BEAD): code merged to origin/main — $S_EVID. Gate→delivery→done did not complete (cross-store, superseded path, rig-store delivery blind spot, or delivery crash); janitor drives durable terminal: story:done added, story:approved removed, bead closed. Mirrors story-delivery ga-i53ua."
+        fi
         if bd -C "$RPATH" close "$SID" -r "$JCLOSE_MSG" 2>/dev/null; then
-          log "DONE $SID ($RNAME) — $S_EVID"
-          bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-gosfs story:done reconciliation): code is in origin/main — $S_EVID — but the story was stranded story:approved (gate→delivery→done did not complete: cross-store gate:passed, superseded path, rig-store delivery never scanned, or a delivery crash). Driven to durable terminal: story:done added, story:approved removed (exits Aprovadas), bead closed (painel Done via delivery close_reason). Mirrors story-delivery ga-i53ua." 2>/dev/null || true
+          if [ "$S_BACKSTOP" = "1" ]; then
+            log "DONE-BACKSTOP $SID ($RNAME) — $S_EVID — gate:passed, no delivery within ${STORY_DELIVERY_GRACE_SECONDS}s, deploy NOT verified"
+            bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-botvu2 backstop): code is in origin/main — $S_EVID — and the gate PASSED this story, but story-delivery did not complete it within ${STORY_DELIVERY_GRACE_SECONDS}s (no delivery:tested / story:done from delivery; it never ran, crashed, or is stuck). Closed as a BACKSTOP so it does not sit in Aprovadas forever. THIS IS NOT A VERIFIED DELIVERY: deploy and prod-test did not run to completion. Check the deployed state yourself. Marked delivery:janitor-backstop; story:done added, story:approved removed." 2>/dev/null || true
+          else
+            log "DONE $SID ($RNAME) — $S_EVID"
+            bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-gosfs story:done reconciliation): code is in origin/main — $S_EVID — but the story was stranded story:approved (gate→delivery→done did not complete: cross-store gate:passed, superseded path, rig-store delivery never scanned, or a delivery crash). Driven to durable terminal: story:done added, story:approved removed (exits Aprovadas), bead closed (painel Done via delivery close_reason). Mirrors story-delivery ga-i53ua." 2>/dev/null || true
+          fi
           DONE_COUNT=$((DONE_COUNT+1))
-          DONE_SUMMARY+=("$SID ($RNAME): $S_EVID")
+          if [ "$S_BACKSTOP" = "1" ]; then
+            DONE_SUMMARY+=("$SID ($RNAME): $S_EVID [BACKSTOP: delivery:janitor-backstop, deploy NOT verified]")
+          else
+            DONE_SUMMARY+=("$SID ($RNAME): $S_EVID")
+          fi
         else
           err "story close failed for $SID ($RNAME)"
           DONE_COUNT=$((DONE_COUNT+1))
@@ -1694,6 +1806,11 @@ EOF
     else
       S_KEEP_MSG="keep-story $SID ($RNAME) — $S_REASON"
       [ -n "$S_COMMIT_EVID" ] && S_KEEP_MSG="$S_KEEP_MSG [$S_COMMIT_EVID]"
+      # ga-botvu2: say WHY a gate-passed story is held and for how long, so a story that stays
+      # open past the grace (unreadable updated_at, say) is visible in the log, not just silent.
+      case "$S_REASON" in
+        gate-passed-*) S_KEEP_MSG="$S_KEEP_MSG [updated_at=${S_UPDATED:-<none>} grace=${STORY_DELIVERY_GRACE_SECONDS}s state=${S_GRACE:-<none>}]" ;;
+      esac
       log "$S_KEEP_MSG"
       # Orphan-close backstop: a bead that already has story:done (from a prior
       # janitor pass) but was never closed — the close step was missing until this

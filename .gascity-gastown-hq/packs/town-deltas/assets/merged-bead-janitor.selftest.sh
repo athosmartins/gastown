@@ -35,7 +35,8 @@ for fn in janitor_decide janitor_story_decide token_bounded scan_commit_for_bead
           bead_lookup_one resolve_bead_state \
           commit_epoch commit_evidence_stale comments_for_bead commit_touches_only_pending_patch \
           terminal_passed_marker_epoch marker_evidence_stale \
-          sling_beads_from_show sling_signals_for_id sling_fallback_eligible_reason; do
+          sling_beads_from_show sling_signals_for_id sling_fallback_eligible_reason \
+          iso_epoch story_gate_passed_grace_state; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by janitor"; exit 1; }
 done
 
@@ -794,7 +795,7 @@ grep -q 'delivery-owns-it' "$JANITOR"            && ok "delivery-active guard pr
 grep -q 'story-in-flight-active-rework' "$JANITOR" && ok "story in-flight guard present" || bad "story in-flight guard missing"
 # The story sweep must select OPEN story:approved beads (the stuck-merged shape),
 # distinct from the in_progress sweep above.
-grep -q 'list --status open --json -l story:approved' "$JANITOR" \
+grep -q 'list --status open --limit 0 --json -l story:approved' "$JANITOR" \
   && ok "story sweep selects open story:approved" || bad "story sweep selector missing"
 # ga-<story-close>: durable terminal — story sweep must also remove story:approved and CLOSE
 # the bead (not just add story:done label). Absence of close left wa-7nz9l + wa-14w76 in
@@ -1386,16 +1387,17 @@ grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$
   && ok "ga-hcj4 stranded-wrapper sweep threads is_delivery_partial into janitor_decide" \
   || bad "ga-hcj4 sweep not threading is_delivery_partial"
 # Negative check: the story sweep's own janitor_story_decide call must end in
-# sig_marker_stale (ga-tysvjp legitimately extended it, see §18 below — sig_commit_docs_only,
-# ga-fbycg, is no longer the tail) and NOT grow a delivery:partial-shaped arg beyond that —
+# gate_passed_grace (ga-botvu2 legitimately extended it past sig_marker_stale, which ga-tysvjp
+# had extended past sig_commit_docs_only, ga-fbycg — see §18 below) and NOT grow a
+# delivery:partial-shaped arg beyond that —
 # confirms this fix deliberately left THIS label alone (see header above) rather than
 # silently drifting it out of sync with a copy-paste that half-applies. (Was a two-grep
 # AND-NOT before ga-fbycg added a real 12th arg, then an exact-tail match ending at
 # sig_commit_docs_only before ga-tysvjp added a real 13th arg; only "no
 # delivery-partial/daemon-hold-shaped arg" holds across all of these, never "no further
 # arg at all".)
-if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE")' "$JANITOR"; then
-  ok "story sweep's janitor_story_decide call ends at sig_marker_stale (no delivery:partial label ever reaches a story bead)"
+if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE" "$S_GRACE")' "$JANITOR"; then
+  ok "story sweep's janitor_story_decide call ends at gate_passed_grace (no delivery:partial label ever reaches a story bead)"
 else
   bad "story sweep's janitor_story_decide call signature changed unexpectedly — re-check ga-f54ui's story-sweep-exclusion rationale"
 fi
@@ -1434,8 +1436,8 @@ grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$
 # legitimate 12th/13th args, but still no daemon-hold-shaped arg beyond them
 # (delivery:pending-restart is stamped only in quality-gate-dispatcher.sh's non-story
 # branch, so a story bead never carries it).
-if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE")' "$JANITOR"; then
-  ok "story sweep's janitor_story_decide call ends at sig_marker_stale (no delivery:pending-restart label ever reaches a story bead)"
+if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE" "$S_GRACE")' "$JANITOR"; then
+  ok "story sweep's janitor_story_decide call ends at gate_passed_grace (no delivery:pending-restart label ever reaches a story bead)"
 else
   bad "story sweep's janitor_story_decide call signature changed unexpectedly — re-check ga-l7n3v's story-sweep-exclusion rationale"
 fi
@@ -1502,7 +1504,7 @@ grep -qF 'janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SI
   && ok "in_progress sweep threads sig_commit_docs_only into janitor_decide" || bad "in_progress sweep not threading sig_commit_docs_only"
 grep -qF 'janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD" "$F_SIGCOMMIT_DOCS_ONLY"' "$JANITOR" \
   && ok "ga-hcj4 stranded-wrapper sweep threads sig_commit_docs_only into janitor_decide" || bad "ga-hcj4 sweep not threading sig_commit_docs_only"
-grep -qF '"$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE")' "$JANITOR" \
+grep -qF '"$S_SIGBRANCH" "$S_SIGCOMMIT_STALE" "$S_SIGMK_SUPER" "$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE" "$S_GRACE")' "$JANITOR" \
   && ok "story sweep threads sig_commit_docs_only into janitor_story_decide" || bad "story sweep not threading sig_commit_docs_only"
 # Signal C must gate on a TRUSTED flag that ALSO requires docs_only!=1 at all three call
 # sites, so a docs-only-flagged signal A never blinds the sweep to an independent,
@@ -1588,6 +1590,194 @@ RL_BLOCK=$(sed -n "${RL_LN:-1},$((${RL_LN:-1}+4))p" "$JANITOR" 2>/dev/null)
 printf '%s' "$RL_BLOCK" | grep -q 'continue' \
   && ok "an unreadable story row is skipped with 'continue' (no decision, no mutation)" \
   || bad "the unreadable-row branch does not 'continue' — it would fall through to the decision"
+
+# ── ga-botvu2: a gate-passed story WAITS for story-delivery before the janitor closes it ──
+# The gate hands a story off OPEN as story:approved + gate:passed and story-delivery deploys and
+# prod-tests it. Merge evidence is in origin/main from the first second, so the story sweep used to
+# close it as story:done before the deploy ran. Now it keeps the story for a grace after its last
+# update; past the grace it closes it as an explicit BACKSTOP (delivery:janitor-backstop, close
+# reason says deploy was NOT verified). An age that cannot be computed keeps the story.
+echo ""
+echo "── ga-botvu2: iso_epoch ──"
+# 2026-10-15T17:51:50Z = 1792086710 (checked against `date -u -j -f` / jq on the day this was written).
+E0=1792086710
+eq "iso_epoch Z timestamp"                    "$(iso_epoch 2026-10-15T17:51:50Z)"        "$E0"
+eq "iso_epoch tolerates fractional seconds"   "$(iso_epoch 2026-10-15T17:51:50.123456Z)" "$E0"
+eq "iso_epoch empty -> nothing"               "$(iso_epoch '')"                          ""
+eq "iso_epoch garbage -> nothing"             "$(iso_epoch 'not-a-date')"                ""
+eq "iso_epoch +hh:mm offset form -> nothing (never a guess)" "$(iso_epoch 2026-10-15T17:51:50-03:00)" ""
+
+echo ""
+echo "── ga-botvu2: story_gate_passed_grace_state (none|waiting|elapsed|unknown) ──"
+GL="ctx:ready story:approved gate:passed"
+U="2026-10-15T17:51:50Z"
+gs() { story_gate_passed_grace_state "$1" "$2" "$3" "$4"; }
+eq "60 s old,  grace 600  -> waiting"   "$(gs "$GL" "$U" $((E0+60))   600)"  "waiting"
+eq "599 s old, grace 600  -> waiting"   "$(gs "$GL" "$U" $((E0+599))  600)"  "waiting"
+eq "600 s old, grace 600  -> elapsed (boundary is >=)" "$(gs "$GL" "$U" $((E0+600))  600)"  "elapsed"
+eq "900 s old, grace 600  -> elapsed"   "$(gs "$GL" "$U" $((E0+900))  600)"  "elapsed"
+eq "900 s old, grace 1800 -> waiting"   "$(gs "$GL" "$U" $((E0+900))  1800)" "waiting"
+eq "1799 s old, grace 1800 -> waiting"  "$(gs "$GL" "$U" $((E0+1799)) 1800)" "waiting"
+eq "1800 s old, grace 1800 -> elapsed"  "$(gs "$GL" "$U" $((E0+1800)) 1800)" "elapsed"
+eq "grace 0 -> elapsed at once (an operator's explicit choice)" "$(gs "$GL" "$U" "$E0" 0)" "elapsed"
+eq "no gate:passed, ancient -> none (the wait does not apply)" "$(gs "ctx:ready story:approved" "$U" $((E0+99999)) 1800)" "none"
+eq "empty labels -> none"               "$(gs "" "$U" $((E0+60)) 1800)" "none"
+eq "gate:passed-warn is a different label -> none (whole-token match)" "$(gs "story:approved gate:passed-warn" "$U" $((E0+60)) 1800)" "none"
+eq "empty updated_at -> unknown, NOT elapsed"      "$(gs "$GL" ""            $((E0+99999)) 1800)" "unknown"
+eq "garbage updated_at -> unknown, NOT elapsed"    "$(gs "$GL" "yesterday"   $((E0+99999)) 1800)" "unknown"
+eq "offset-form updated_at -> unknown"             "$(gs "$GL" "2026-10-15T14:51:50-03:00" $((E0+99999)) 1800)" "unknown"
+eq "updated_at in the future (clock skew) -> unknown" "$(gs "$GL" "$U" $((E0-5)) 1800)" "unknown"
+eq "empty now -> unknown"               "$(gs "$GL" "$U" "" 1800)" "unknown"
+eq "non-numeric now -> unknown"         "$(gs "$GL" "$U" "abc" 1800)" "unknown"
+eq "empty grace -> unknown"             "$(gs "$GL" "$U" $((E0+99999)) "")" "unknown"
+eq "non-numeric grace -> unknown (a typo holds the story, it does not drop the wait)" "$(gs "$GL" "$U" $((E0+99999)) "10min")" "unknown"
+
+echo ""
+echo "── ga-botvu2: janitor_story_decide honours the grace ──"
+# Strongest merge evidence (commit + marker + branch), no other guard: only the grace can hold it.
+gd() { janitor_story_decide 0 0 0 0 0 0 1 1 1 0 0 0 0 "$@"; }
+eq "waiting -> keep"                    "$(gd waiting)"  "keep:gate-passed-awaiting-delivery-grace"
+eq "unknown -> keep (unreadable)"       "$(gd unknown)"  "keep:gate-passed-grace-unreadable"
+eq "empty state -> keep (unreadable)"   "$(gd '')"       "keep:gate-passed-grace-unreadable"
+eq "unrecognised state -> keep (allowlist, not denylist)" "$(gd bogus)" "keep:gate-passed-grace-unreadable"
+eq "elapsed -> done (the backstop)"     "$(gd elapsed)"  "done:commit-in-origin-main"
+eq "none -> done (not a gate-passed story: behaviour unchanged)" "$(gd none)" "done:commit-in-origin-main"
+eq "13-arg call (state omitted) -> done: the old signature still works" \
+   "$(janitor_story_decide 0 0 0 0 0 0 1 1 1 0 0 0 0)" "done:commit-in-origin-main"
+# The guards that were already there still outrank the grace, in both directions.
+eq "epic is still kept when elapsed"            "$(janitor_story_decide 1 0 0 0 0 0 1 1 1 0 0 0 0 elapsed)" "keep:epic-parent-never-autoclosed"
+eq "open marker is still kept when elapsed"    "$(janitor_story_decide 0 1 0 0 0 0 1 1 1 0 0 0 0 elapsed)" "keep:active-open-gate-marker"
+eq "in-flight rework is still kept when elapsed" "$(janitor_story_decide 0 0 0 1 0 0 1 1 1 0 0 0 0 elapsed)" "keep:story-in-flight-active-rework"
+eq "delivery-owned (running/failed/pending-vm) is still kept when elapsed" \
+   "$(janitor_story_decide 0 0 0 0 0 1 1 1 1 0 0 0 0 elapsed)" "keep:delivery-owns-it"
+eq "already story:done keeps its own reason while waiting (the orphan-close needs it)" \
+   "$(janitor_story_decide 0 0 1 0 0 0 1 1 1 0 0 0 0 waiting)" "keep:already-story-done"
+eq "waiting with no merge evidence -> still keep" "$(janitor_story_decide 0 0 0 0 0 0 0 0 0 0 0 0 0 waiting | cut -d: -f1)" "keep"
+eq "elapsed with no merge evidence -> keep: elapsed alone closes nothing" \
+   "$(janitor_story_decide 0 0 0 0 0 0 0 0 0 0 0 0 0 elapsed)" "keep:no-merge-evidence"
+
+# The default is a number a reader can check, and it is not the 600 s first proposed (see the comment
+# on STORY_DELIVERY_GRACE_SECONDS: one delivery pass measured up to 1546 s).
+DEF_GRACE=$(env -u JANITOR_STORY_DELIVERY_GRACE_SECONDS bash -c 'JANITOR_LIB_ONLY=1 source "$1" && printf %s "$STORY_DELIVERY_GRACE_SECONDS"' _ "$JANITOR" 2>/dev/null)
+eq "default story-delivery grace is 1800 s" "$DEF_GRACE" "1800"
+OVR_GRACE=$(JANITOR_STORY_DELIVERY_GRACE_SECONDS=600 bash -c 'JANITOR_LIB_ONLY=1 source "$1" && printf %s "$STORY_DELIVERY_GRACE_SECONDS"' _ "$JANITOR" 2>/dev/null)
+eq "JANITOR_STORY_DELIVERY_GRACE_SECONDS overrides it" "$OVR_GRACE" "600"
+
+echo ""
+echo "── ga-botvu2: drift-guards on the live sweep ──"
+grep -qF -- '--status open --limit 0 --json -l story:approved' "$JANITOR" \
+  && ok "story sweep lists ALL approved stories (--limit 0), so none is cut off before it ages through the grace" \
+  || bad "story sweep's bd list lost --limit 0 — a story past bd's default cutoff would never be reconciled"
+grep -qF 'story_gate_passed_grace_state "$SLABELS" "$S_UPDATED" "$(date +%s)" "$STORY_DELIVERY_GRACE_SECONDS")' "$JANITOR" \
+  && ok "story sweep derives S_GRACE from the row's labels, updated_at, the clock and the grace" \
+  || bad "story sweep does not compute S_GRACE from story_gate_passed_grace_state"
+grep -qF '"$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE" "$S_GRACE")' "$JANITOR" \
+  && ok "story sweep passes S_GRACE as janitor_story_decide's last arg (an omitted arg means 'no wait')" \
+  || bad "story sweep does not pass S_GRACE to janitor_story_decide — the wait would never be applied"
+grep -qF '[ "$S_GRACE_OPEN" = "1" ]; then' "$JANITOR" \
+  && ok "story sweep skips the git scans while the grace holds the story" \
+  || bad "story sweep scans git for a story the grace already holds"
+BL_LN=$(grep -n 'label add "\$SID" "delivery:janitor-backstop"' "$JANITOR" | head -1 | cut -d: -f1)
+CL_LN=$(grep -n 'if bd -C "\$RPATH" close "\$SID" -r "\$JCLOSE_MSG"' "$JANITOR" | head -1 | cut -d: -f1)
+if [ -n "$BL_LN" ] && [ -n "$CL_LN" ] && [ "$BL_LN" -lt "$CL_LN" ]; then
+  ok "the backstop label is added (L$BL_LN) BEFORE the story is closed (L$CL_LN), so it survives a failed close"
+else
+  bad "backstop label is not added before the close (label=L${BL_LN:-none}, close=L${CL_LN:-none})"
+fi
+grep -qF 'DEPLOY AND PROD-TEST WERE NOT VERIFIED' "$JANITOR" \
+  && ok "the backstop close reason says deploy and prod-test were NOT verified" \
+  || bad "the backstop close reason does not say the deploy was unverified"
+grep -qF '[ "$S_GRACE" = "elapsed" ] && S_BACKSTOP=1' "$JANITOR" \
+  && ok "only an ELAPSED grace makes a close a backstop" \
+  || bad "backstop condition changed — a story that never was gate-passed could be labelled (or the reverse)"
+
+echo ""
+echo "── ga-botvu2: the REAL sweep, stubbed bd/gc + a real git fixture (the acceptance scenarios) ──"
+# One origin with a commit "feat(ga-fixture1): …" on main, one rig clone of it; per scenario a fresh
+# stories.json, stub bd (logs every call, serves the story list, answers `[]` otherwise) and stub gc
+# (serves the rig list). The janitor runs end to end; we read what it asked bd to do. Lives under
+# $T, which the EXIT trap above already cleans.
+BV="$T/botvu2"; mkdir -p "$BV"
+git init -q --bare -b main "$BV/origin.git"
+git init -q -b main "$BV/rig"
+( cd "$BV/rig" && echo a > a && git add a && git commit -q -m "base" \
+  && echo b > b && git add b && git commit -q -m "feat(ga-fixture1): the story" \
+  && git remote add origin "$BV/origin.git" && git push -q origin main ) >/dev/null 2>&1
+BV_N=0
+# bv_run <age_seconds|EMPTY|GARBAGE> <labels> <grace seconds | -> — runs the sweep, sets BV_LOG (bd call log)
+bv_run() {
+  local age="$1" labels="$2" grace="$3" d upd now e
+  BV_N=$((BV_N+1)); d="$BV/run$BV_N"; mkdir -p "$d/bin" "$d/city/.gc/logs"
+  now=$(date +%s)
+  case "$age" in
+    EMPTY)   upd="" ;;
+    GARBAGE) upd="sometime last week" ;;
+    *)       e=$((now - age)); upd=$(date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ) ;;
+  esac
+  jq -n --arg id ga-fixture1 --arg upd "$upd" --arg labels "$labels" \
+    '[{id:$id, title:"fixture story", issue_type:"feature", status:"open", assignee:"", updated_at:$upd, labels:($labels|split(" "))}]' > "$d/stories.json"
+  cat > "$d/bin/gc" <<STUB
+#!/usr/bin/env bash
+if [ "\$3" = "rig" ] && [ "\$4" = "list" ]; then
+  printf '{"rigs":[{"name":"fixrig","prefix":"ga","path":"$BV/rig","default_branch":"main","hq":false}]}'
+fi
+exit 0
+STUB
+  cat > "$d/bin/bd" <<STUB
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$d/bd.log"
+case " \$* " in
+  *" list "*"story:approved"*) cat "$d/stories.json" ;;
+  *" list "*|*" comments "*) printf '[]' ;;
+esac
+exit 0
+STUB
+  chmod +x "$d/bin/gc" "$d/bin/bd"; : > "$d/bd.log"
+  if [ "$grace" = "-" ]; then
+    env -u JANITOR_STORY_DELIVERY_GRACE_SECONDS GC_CITY_PATH="$d/city" JANITOR_LOG_STDOUT=1 PATH="$d/bin:$PATH" bash "$JANITOR" > "$d/out.log" 2>&1
+  else
+    env JANITOR_STORY_DELIVERY_GRACE_SECONDS="$grace" GC_CITY_PATH="$d/city" JANITOR_LOG_STDOUT=1 PATH="$d/bin:$PATH" bash "$JANITOR" > "$d/out.log" 2>&1
+  fi
+  BV_LOG="$d/bd.log"; BV_OUT="$d/out.log"
+}
+bv_closed()   { grep -qE ' close ga-fixture1 ' "$BV_LOG"; }
+bv_backstop() { grep -qE ' label add ga-fixture1 delivery:janitor-backstop' "$BV_LOG"; }
+bv_unverified() { grep -E ' close ga-fixture1 ' "$BV_LOG" | grep -qF 'NOT VERIFIED'; }
+PASSED="story:approved gate:passed"
+
+# The bead's own numbers (grace 600): 60 s -> the janitor leaves it; 900 s -> it closes it, marked.
+bv_run 60 "$PASSED" 600
+if bv_closed; then bad "approved+passed, 60 s old, grace 600: the janitor CLOSED the story before delivery (the bug)"; else ok "approved+passed, 60 s old, grace 600 -> NOT closed"; fi
+grep -qF 'gate-passed-awaiting-delivery-grace' "$BV_OUT" && ok "...and the log says why (awaiting delivery grace)" || bad "the keep is not explained in the log"
+bv_run 900 "$PASSED" 600
+if bv_closed; then ok "approved+passed, 900 s old, grace 600 -> closed"; else bad "approved+passed, 900 s old, grace 600: not closed (the backstop never fires)"; fi
+if bv_backstop; then ok "...with the delivery:janitor-backstop label"; else bad "...but WITHOUT the delivery:janitor-backstop label"; fi
+if bv_unverified; then ok "...and a close reason that says the deploy was NOT verified"; else bad "...but the close reason does not say the deploy was unverified"; fi
+grep -qE ' label add ga-fixture1 story:done' "$BV_LOG" && ok "...story:done is still set (consumers that route on it keep working)" || bad "story:done not set on the backstop close"
+
+# The shipped default (1800 s): 900 s is still inside one delivery pass's worst case -> keep.
+bv_run 900 "$PASSED" -
+if bv_closed; then bad "default grace: 900 s old story closed — a delivery pass can legitimately take 1546 s"; else ok "default grace (1800 s): 900 s old -> NOT closed"; fi
+bv_run 2000 "$PASSED" -
+if bv_closed && bv_backstop; then ok "default grace: 2000 s old -> closed as a backstop"; else bad "default grace: 2000 s old story not closed as a backstop (closed=$(bv_closed && echo y || echo n), label=$(bv_backstop && echo y || echo n))"; fi
+
+# Not gate-passed -> the story was never queued for delivery: unchanged behaviour, no backstop mark.
+bv_run 60 "story:approved" 600
+if bv_closed; then ok "approved WITHOUT gate:passed + merge evidence, 60 s old -> closed as before"; else bad "approved without gate:passed no longer closes (regression of ga-gosfs)"; fi
+if bv_backstop; then bad "a story that was never gate-passed got the backstop label"; else ok "...and without the backstop label"; fi
+
+# Delivery owns it -> kept at any age.
+bv_run 5000 "$PASSED delivery:running" 600
+if bv_closed; then bad "delivery:running story closed at 5000 s"; else ok "gate:passed + delivery:running, 5000 s old -> NOT closed (delivery owns it)"; fi
+
+# An age the janitor cannot compute keeps the story, however old it may really be.
+bv_run EMPTY "$PASSED" 600
+if bv_closed; then bad "story with an EMPTY updated_at was closed (empty read as 'old')"; else ok "gate:passed + empty updated_at -> NOT closed"; fi
+bv_run GARBAGE "$PASSED" 600
+if bv_closed; then bad "story with an unparseable updated_at was closed"; else ok "gate:passed + unparseable updated_at -> NOT closed"; fi
+grep -qF 'state=unknown' "$BV_OUT" && ok "...and the log names the unreadable state" || bad "an unreadable age is kept silently"
+bv_run 5000 "$PASSED" "ten-minutes"
+if bv_closed; then bad "an unparseable grace setting dropped the wait and closed the story"; else ok "gate:passed + non-numeric grace setting -> NOT closed (the typo holds, loudly)"; fi
 
 echo ""
 echo "──────────────────────────────────────────"

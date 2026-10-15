@@ -6,7 +6,8 @@
 • Pending-crew-branch veto (wa-1jk89) — one signal can't vouch for a sibling branch
 • Guards (zero false-positive is the paramount constraint)
 • Durable prevention — commit convention (fixes the sibling root cause)
-• Joint/split beads — the stale-comment guard (ga-2zp4h) · Operating
+• Joint/split beads — the stale-comment guard (ga-2zp4h)
+• Gate-passed stories wait for delivery (ga-botvu2) · Operating
 
 Closes beads that are stuck `in_progress` ("em voo" on the Kanban) even though
 their code is already merged to `origin/main`. Runs as a launchd sweep
@@ -121,6 +122,40 @@ which are bead-specific and unaffected. This doesn't prove the bead is
 unfinished; it means a single old commit shouldn't be trusted alone once the
 bead's own story has visibly continued since (reassignment, scope narrowing, a
 follow-up comment).
+
+## Gate-passed stories wait for delivery (ga-botvu2)
+
+The story sweep (ga-gosfs) closes `story:approved` stories whose code is in `origin/main`. A story the
+gate just PASSED is exactly that — `story:approved` + `gate:passed`, merged, waiting for `story-delivery`
+to deploy and prod-test it — so the sweep used to close it as `story:done` before the deploy ever ran.
+
+Now a story carrying `gate:passed` is left alone for a **grace** counted from its last update
+(`updated_at`). The outcome has four states (`story_gate_passed_grace_state`):
+
+| state | meaning | the sweep |
+|---|---|---|
+| `none` | no `gate:passed` — never queued for delivery | closes on merge evidence, as before |
+| `waiting` | `gate:passed`, younger than the grace | keeps it (`keep:gate-passed-awaiting-delivery-grace`) |
+| `elapsed` | `gate:passed`, older than the grace | closes it as a **backstop** |
+| `unknown` | `gate:passed` but the age can't be computed (`updated_at` empty/unparseable, clock skew, bad grace setting) | keeps it (`keep:gate-passed-grace-unreadable`) — never read as "old enough" |
+
+A **backstop** close is not a delivery: the story gets the label `delivery:janitor-backstop` (added before the
+close, so it survives a failed close), `story:done` as before (the painel and other consumers route on it),
+and a close reason and comment that say **deploy and prod-test were NOT verified**. Anything labelled
+`delivery:janitor-backstop` should be checked by hand.
+
+The default grace is **1800 s** (`JANITOR_STORY_DELIVERY_GRACE_SECONDS` overrides it; the janitor runs every
+900 s, so the effective wait is 1800–2700 s). Not the 600 s first proposed: `story-delivery` handles stories
+one at a time and a single pass takes 6.5–10 min when it deploys — measured on its log (319 passes) p50 32 s,
+p90 466 s, p95 609 s, p99 931 s, max 1546 s. A 600 s grace would still close a story whose own pass is
+mid-flight, or one queued behind another. A non-numeric setting does not drop the wait: it holds every
+gate-passed story and the log says `state=unknown`.
+
+The other half is the hand-off itself: a story handed off without `gate:passed` is invisible to `story-delivery`
+(and, by the table above, closed on sight). The dispatcher's three hand-off writes and the guard's
+`gap2_apply_pass_verdict` used to write the label with `|| true`; they now call `gate_passed_confirm`
+(`quality-gate-guard.sh`), which reads the label back, rewrites it once, and — if it is still missing —
+comments on the bead with the hand fix. Proven by `gate-passed-confirm.selftest.sh`.
 
 ## Operating
 
