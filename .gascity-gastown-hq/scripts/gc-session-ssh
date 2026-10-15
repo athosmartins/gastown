@@ -21,6 +21,9 @@ O QUE FAZ
   (--settings, --dangerously-skip-permissions, --model, --remote-control...) mais o prompt de partida (prompt_suffix/prompt_flag do
   JSON do start — campos que o patch do engine acrescenta); grava tudo num lançador temporário que se apaga ao rodar.
   Falha de ssh = erro visível (stderr, exit 1, linha em <estado>/session-ssh.log) e nada pela metade; o mini não é tocado.
+  "Não sei" nunca vira resposta: se o ssh responde mas o tmux do host não consegue olhar (ex.: socket sem permissão), as operações sobre
+  sessões (todas, menos attach, que entrega o terminal ao tmux do host) saem com erro e o motivo — nunca `false`, lista vazia ou "há vaga". Sessão que não existe (tmux respondeu) segue o contrato do exec: stop,
+  interrupt, nudge, send-keys, clear-scrollback e get-last-activity saem 0 sem fazer nada; `stop` só sai 0 se a sessão sumiu.
 
 O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
   pre_start, session_setup*, session_live, overlay/pack_overlay_dirs, copy_files, copy-to: NÃO executam nem copiam (seriam comandos e
@@ -69,7 +72,9 @@ RUNNER = 'umask 077; f=$(mktemp) || exit 125; cat >"$f"; sh "$f" </dev/null; rc=
 PRELUDE = r"""PATH="$HOME/.local/bin:$HOME/go/bin:/usr/local/bin:$PATH"; export PATH
 T() { tmux -L @SOCK@ "$@"; }
 sessions() { o=$(T list-sessions -F '#{session_name}' 2>&1) && { [ -z "$o" ] || printf '%s\n' "$o"; return 0; }
-  case "$o" in *"no server running"*|*"error connecting to"*) return 0;; esac; printf '%s\n' "$o" >&2; return 1; }
+  case "$o" in *"no server running"*|*"error connecting to"*"(No such file or directory)"*) return 0;; esac; printf '%s\n' "$o" >&2; return 1; }
+has() { s=$(sessions) || return 2; printf '%s\n' "$s" | grep -qxF -- "$1"; }
+live() { has "$1"; r=$?; [ "$r" -ne 1 ] || exit 0; [ "$r" -eq 0 ] || exit 1; }
 tree() { ps -e -o pid= -o ppid= | awk -v r="$1" '{p[$1]=$2} END{for(i in p){q=i;while(q!=""&&q!=0&&q!=1){if(q==r){print i;break};q=p[q]}}}'; }
 hasproc() { ps -e -o pid= -o ppid= -o args= | awk -v r="$1" -v want="$2" 'BEGIN{n=split(want,w,",");for(i=1;i<=n;i++)W[w[i]]=1}
   {p[$1]=$2;a=$3;sub(/.*\//,"",a);A[$1]=a} END{for(i in p){q=i;while(q!=""&&q!=0&&q!=1){if(q==r){if(A[i] in W)f=1;break};q=p[q]}} print f?"true":"false"}'; }
@@ -289,7 +294,7 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
         fcntl.flock(lf, fcntl.LOCK_EX)
         rc, out, err = remote(cfg, body, cfg.start_timeout)
     if rc == EX_CAP or rc == EX_EXISTS:
-        raise Fail(err)
+        raise Fail(err or f"start de {name} recusado em {cfg.host} (rc={rc}, sem mensagem)")
     if rc != 0:
         raise Fail(f"start em {cfg.host} falhou (rc={rc}): {err or out or 'sem mensagem'}")
     cfg.log(f"start {name} ok" + (f" ignored={','.join(p['ignored'])}" if p["ignored"] else "") +
@@ -300,11 +305,13 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
 # ---------- as demais operações ----------
 
 def op_stop(cfg: Cfg, name: str, args: list, dry: bool) -> int:
-    body = """pp=$(T list-panes -t @PTGT@ -F '#{pane_pid}' 2>/dev/null | head -1); pids=
+    body = """has @NAME@; [ $? -ne 2 ] || exit 1
+pp=$(T list-panes -t @PTGT@ -F '#{pane_pid}' 2>/dev/null | head -1); pids=
 [ -z "$pp" ] || pids=$(tree "$pp")
 T kill-session -t @TGT@ 2>/dev/null
 if [ -n "$pids" ]; then kill -TERM $pids 2>/dev/null; sleep 1; kill -KILL $pids 2>/dev/null; fi
-rm -f @RUN@/@NAME@.sh @RUN@/@NAME@.exit; exit 0""".replace("@TGT@", tgt(name)).replace("@PTGT@", ptgt(name)).replace("@RUN@", q(cfg.root + "/run")).replace("@NAME@", name)
+rm -f @RUN@/@NAME@.sh @RUN@/@NAME@.exit
+has @NAME@; [ $? -eq 1 ] || { echo "sessão @NAME@ continua aberta depois do stop" >&2; exit 1; }""".replace("@TGT@", tgt(name)).replace("@PTGT@", ptgt(name)).replace("@RUN@", q(cfg.root + "/run")).replace("@NAME@", name)
     run(cfg, "stop", body, dry)
     if not dry:
         meta_clear(cfg, name)
@@ -312,12 +319,13 @@ rm -f @RUN@/@NAME@.sh @RUN@/@NAME@.exit; exit 0""".replace("@TGT@", tgt(name)).r
 
 
 def op_interrupt(cfg: Cfg, name: str, args: list, dry: bool) -> int:
-    run(cfg, "interrupt", f"T send-keys -t {ptgt(name)} C-c 2>/dev/null; exit 0", dry)
+    run(cfg, "interrupt", f"live {q(name)}; T send-keys -t {ptgt(name)} C-c 2>/dev/null; exit 0", dry)
     return 0
 
 
 def op_is_running(cfg: Cfg, name: str, args: list, dry: bool) -> int:
-    print(run(cfg, "is-running", f"T has-session -t {tgt(name)} 2>/dev/null && echo true || echo false", dry)[1])
+    # false = o tmux do host respondeu e a sessão não está na lista; tmux que não conseguiu olhar (has → 2) é erro, nunca "false"
+    print(run(cfg, "is-running", f"has {q(name)}; case $? in 0) echo true;; 1) echo false;; *) exit 1;; esac", dry)[1])
     return 0
 
 
@@ -326,7 +334,9 @@ def op_process_alive(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     if not names:
         print("true")  # contrato do engine: sem nomes, vale
         return 0
-    body = f"pp=$(T list-panes -t {ptgt(name)} -F '#{{pane_pid}}' 2>/dev/null | head -1); [ -n \"$pp\" ] || {{ echo false; exit 0; }}\nhasproc \"$pp\" {q(','.join(names))}"
+    body = (f"has {q(name)}; r=$?; [ \"$r\" -ne 1 ] || {{ echo false; exit 0; }}; [ \"$r\" -eq 0 ] || exit 1\n"  # tmux sem resposta = erro, não "false"
+            f"pp=$(T list-panes -t {ptgt(name)} -F '#{{pane_pid}}' 2>/dev/null | head -1); [ -n \"$pp\" ] || {{ echo false; exit 0; }}\n"
+            f"hasproc \"$pp\" {q(','.join(names))}")
     print(run(cfg, "process-alive", body, dry)[1])
     return 0
 
@@ -336,7 +346,7 @@ def op_nudge(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     if not text:
         return 0
     b = f"{cfg.socket}-{name}"
-    body = (f"T has-session -t {tgt(name)} 2>/dev/null || exit 0\nprintf %s {q(base64.b64encode(text).decode())} | base64 -d | T load-buffer -b {q(b)} - || exit 1\n"
+    body = (f"live {q(name)}\nprintf %s {q(base64.b64encode(text).decode())} | base64 -d | T load-buffer -b {q(b)} - || exit 1\n"
             f"T paste-buffer -d -p -b {q(b)} -t {ptgt(name)} || exit 1\nsleep 0.3; T send-keys -t {ptgt(name)} Enter")
     run(cfg, "nudge", body, dry)
     return 0
@@ -344,7 +354,7 @@ def op_nudge(cfg: Cfg, name: str, args: list, dry: bool) -> int:
 
 def op_send_keys(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     if args:
-        run(cfg, "send-keys", f"for k in {' '.join(q(k) for k in args)}; do T send-keys -t {ptgt(name)} -- \"$k\" 2>/dev/null; done; exit 0", dry)
+        run(cfg, "send-keys", f"live {q(name)}; for k in {' '.join(q(k) for k in args)}; do T send-keys -t {ptgt(name)} -- \"$k\" 2>/dev/null; done; exit 0", dry)
     return 0
 
 
@@ -365,14 +375,14 @@ def op_list_running(cfg: Cfg, prefix: str, args: list, dry: bool) -> int:
 
 
 def op_last_activity(cfg: Cfg, name: str, args: list, dry: bool) -> int:
-    out = run(cfg, "get-last-activity", f"T display-message -p -t {ptgt(name)} '#{{session_activity}}' 2>/dev/null; exit 0", dry)[1].strip()
+    out = run(cfg, "get-last-activity", f"live {q(name)}; T display-message -p -t {ptgt(name)} '#{{session_activity}}' 2>/dev/null; exit 0", dry)[1].strip()
     if out.isdigit():
         print(datetime.fromtimestamp(int(out), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     return 0
 
 
 def op_clear_scrollback(cfg: Cfg, name: str, args: list, dry: bool) -> int:
-    run(cfg, "clear-scrollback", f"T clear-history -t {ptgt(name)} 2>/dev/null; exit 0", dry)
+    run(cfg, "clear-scrollback", f"live {q(name)}; T clear-history -t {ptgt(name)} 2>/dev/null; exit 0", dry)
     return 0
 
 

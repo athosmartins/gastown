@@ -16,10 +16,14 @@
 #   (flock) · down — ssh fora do ar/mudo/sem marcadores/com ruído: start recusa dizendo o host, list-running é ERRO (nunca lista vazia),
 #   nada pela metade, meta continua funcionando · meta — set/get/remove/stop, chave inválida, nada no "servidor" · conf — config
 #   ausente, cap ausente/0/string, host desconhecido, destino ssh com '-', raiz com espaço, nome de sessão inválido: exit 1, sem ssh ·
-#   guard — caminho do mini que sobra no comando/env/workdir recusa e nada abre.
+#   guard — caminho do mini que sobra no comando/env/workdir recusa e nada abre · terr — o tmux do host existe mas não consegue olhar
+#   (socket sem permissão): is-running, list-running, process-alive, start, stop, interrupt, nudge, send-keys, peek, clear-scrollback e
+#   get-last-activity dão ERRO com o motivo, nunca "false"/"vazio"/"há vaga"/"parou"; já a sessão AUSENTE (tmux respondeu) dá rc 0 nas
+#   operações de melhor esforço (grupo live), e stop só diz que parou se a sessão sumiu (tmux falso que não derruba, grupo live).
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar: teto do host, nome
-#   exato, guarda de /Users/, filtro de env, exit 2 das desconhecidas, marcador de fim, erro de ssh, flock. Mais: contra um stub que só
-#   sai 0, quase tudo falha.
+#   exato (sessão, is-running, start), alvo de painel =nome:, guarda de /Users/, filtro de env, exit 2 das desconhecidas, marcador de fim,
+#   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
+#   ausente, e o stop que não confere que a sessão sumiu (15 mutantes). Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -108,6 +112,7 @@ g_dry() {
 }
 
 g_live() {
+  local op real r1
   cfg 3; mkdir -p "$RH"; fresh
   pv start live-1 < <(req "cat"); ok $RC "live: start abre a sessão (rc=$RC $(head -c 200 "$T/err"))"
   pv is-running live-1 </dev/null; [ "$(cat "$T/out")" = true ]; ok $? "live: is-running true"
@@ -127,6 +132,9 @@ g_live() {
   pv list-running live </dev/null; [ ! -s "$T/out" ]; ok $? "live: depois do stop, fora do list-running"
   pv stop live-1 </dev/null; [ $RC = 0 ]; ok $? "live: stop de sessão que não existe é idempotente"
   pv stop nunca-existiu </dev/null; [ $RC = 0 ]; ok $? "live: stop de nome desconhecido rc 0"
+  for op in interrupt clear-scrollback get-last-activity; do pv $op nunca-existiu </dev/null; [ $RC = 0 ] && [ ! -s "$T/out" ]; ok $? "live: $op de sessão que não existe: rc 0 e nada na saída (melhor esforço, como manda o contrato do exec)"; done
+  pv nudge nunca-existiu < <(printf x); [ $RC = 0 ]; ok $? "live: nudge de sessão que não existe: rc 0 (melhor esforço)"
+  pv send-keys nunca-existiu k </dev/null; [ $RC = 0 ]; ok $? "live: send-keys de sessão que não existe: rc 0 (melhor esforço)"
   pv start live-env < <(req "sh -c 'pwd > $T/pwd.out; echo \"\$GC_AGENT:\${GC_INSTANCE_TOKEN:-sem}\" > $T/env.out; exec cat'" | jq '.env.GC_INSTANCE_TOKEN="x"')
   [ "$(cat "$T/pwd.out" 2>/dev/null)" = "$(cd "$RR/city/.gc/agents/dog" && pwd -P)" ]; ok $? "live: a sessão roda no work_dir reescrito (e ele foi criado)"
   [ "$(cat "$T/env.out" 2>/dev/null)" = "dog-1:sem" ]; ok $? "live: env chega (GC_AGENT) e o token não"
@@ -143,10 +151,17 @@ sys.stdout.write('linha1 \$(touch $T/PWNED) \`touch $T/PWNED2\` \'aspas\' \"dq\"
   pv start live-nf < <(req "nao-existe-xyz --x"); [ $RC = 1 ] && has "$T/err" 'comando não encontrado'; ok $? "live: comando que não existe → start falha dizendo qual"
   pv is-running live-nf </dev/null; [ "$(cat "$T/out")" = false ]; ok $? "live: ...e não deixa sessão"
   pv start live-die < <(req "sh -c 'exit 3'"); [ $RC = 1 ] && has "$T/err" 'saiu com 3'; ok $? "live: comando que morre logo → start falha com o código de saída"
-  pv start pfx-ab < <(req "cat"); pv start pfx-a < <(req "cat"); pv stop pfx-a </dev/null
+  pv start pfx-ab < <(req "cat"); pv start pfx-a < <(req "cat"); ok $RC "live: nome EXATO: pfx-a abre com pfx-ab já aberto (não é 'already exists' por prefixo; rc=$RC)"; pv stop pfx-a </dev/null
   pv is-running pfx-ab </dev/null; [ "$(cat "$T/out")" = true ]; ok $? "live: nome EXATO: parar pfx-a não toca em pfx-ab"
   pv is-running pfx-a </dev/null; [ "$(cat "$T/out")" = false ]; ok $? "live: nome EXATO: is-running pfx-a não casa pfx-ab por prefixo"
+  pv stop pfx-a </dev/null; pv is-running pfx-ab </dev/null; [ "$(cat "$T/out")" = true ]; ok $? "live: nome EXATO: stop de pfx-a que já não existe NÃO derruba pfx-ab (o tmux casaria por prefixo)"
   pv stop pfx-ab </dev/null
+  # stop só diz que parou se a sessão sumiu: um tmux que não derruba (um falso na frente do verdadeiro no PATH do "host") é erro
+  real=$(command -v tmux); mkdir -p "$T/home/.local/bin"
+  printf '#!/bin/sh\nfor a in "$@"; do case "$a" in kill-session|list-panes) exit 1;; esac; done\nexec %s "$@"\n' "$real" > "$T/home/.local/bin/tmux"; chmod +x "$T/home/.local/bin/tmux"
+  pv start live-st < <(req "cat"); pv stop live-st </dev/null; r1=$RC
+  [ $r1 = 1 ] && has "$T/err" 'continua aberta' && [ "$(count)" = 1 ]; ok $? "live: stop de uma sessão que o tmux não derruba é ERRO e a sessão segue lá, não 'parou' (rc=$r1)"
+  rm -f "$T/home/.local/bin/tmux"; pv stop live-st </dev/null; [ $RC = 0 ] && [ "$(count)" = 0 ]; ok $? "live: ...e com o tmux de verdade o mesmo stop derruba"
 }
 
 g_cap() {
@@ -225,7 +240,27 @@ g_guard() {
   [ "$(count)" = 0 ]; ok $? "guard: nenhuma sessão aberta"
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; return 0; }
+g_terr() {  # o tmux do host responde mas não consegue olhar (socket sem permissão): "não sei" não vira "false", "lista vazia" nem "tem vaga"
+  [ "$(id -u)" != 0 ] || { echo "skip terr: root ignora chmod"; return 0; }
+  cfg 2; fresh; local sd="$TMUX_TMPDIR/tmux-$(id -u)" r1 op
+  pv start te-1 < <(req cat); ok $RC "terr: (preparo) uma sessão aberta (rc=$RC)"
+  chmod 000 "$sd"
+  pv is-running te-1 </dev/null; r1=$RC; [ $r1 = 1 ] && [ ! -s "$T/out" ] && has "$T/err" 'Permission denied'; ok $? "terr: is-running com tmux sem acesso é ERRO dizendo o motivo, não 'false' (rc=$r1)"
+  pv list-running te </dev/null; [ $RC = 1 ] && [ ! -s "$T/out" ]; ok $? "terr: list-running com tmux sem acesso é erro, não lista vazia"
+  pv process-alive te-1 < <(printf 'cat\n'); [ $RC = 1 ] && [ ! -s "$T/out" ]; ok $? "terr: process-alive com tmux sem acesso é erro, não 'false'"
+  pv start te-2 < <(req cat); [ $RC = 1 ] && has "$T/err" 'Permission denied'; ok $? "terr: start com tmux sem acesso recusa dizendo o motivo (não conta 0 sessões)"
+  for op in interrupt clear-scrollback get-last-activity; do pv $op te-1 </dev/null; [ $RC = 1 ] && [ ! -s "$T/out" ]; ok $? "terr: $op com tmux sem acesso é erro (não finge ter feito)"; done
+  pv nudge te-1 < <(printf x); [ $RC = 1 ]; ok $? "terr: nudge com tmux sem acesso é erro (não finge ter entregue)"
+  pv send-keys te-1 k </dev/null; [ $RC = 1 ]; ok $? "terr: send-keys com tmux sem acesso é erro"
+  pv peek te-1 5 </dev/null; [ $RC = 1 ] && [ ! -s "$T/out" ]; ok $? "terr: peek com tmux sem acesso é erro, não tela vazia"
+  pv stop te-1 </dev/null; [ $RC = 1 ]; ok $? "terr: stop com tmux sem acesso é erro (não finge ter parado)"
+  chmod 700 "$sd"
+  [ "$(count)" = 1 ]; ok $? "terr: ...e nada foi aberto (só a sessão de antes)"
+  pv is-running te-1 </dev/null; [ "$(cat "$T/out")" = true ]; ok $? "terr: com o acesso de volta, is-running volta a dizer true"
+  pv stop te-1 </dev/null
+}
+
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 all
@@ -241,6 +276,8 @@ echo "== $((n-fails))/$n ok =="
   }
   mutant cap "teto do host" 's/\[ "\$n" -lt @CAP@ \]/true/'
   mutant live "nome exato (sessão)" 's/return q("=" + name)  # sessão/return q(name)  # sessão/'
+  mutant live "nome exato no is-running (grep -x do has)" 's/grep -qxF -- "\$1"/grep -qF -- "$1"/'
+  mutant live "nome exato no start (grep -x do 'já existe')" 's/grep -qxF -- @NAME@/grep -qF -- @NAME@/'
   mutant live "alvo de painel (=nome:)" 's/return q("=" + name + ":")/return q("=" + name)/'
   mutant guard "guarda de /Users/" 's/if "\/Users\/" in v:/if False:/'
   mutant dry "filtro de env" 's/ or (SECRETISH.search(k) and k not in cfg.env_allow)//;s/not ENV_OK.fullmatch(k)/False/'
@@ -248,6 +285,10 @@ echo "== $((n-fails))/$n ok =="
   mutant down "marcador de fim" 's/if BEGIN not in lines or END not in lines:/if BEGIN not in lines:/'
   mutant down "erro de ssh (rc 255)" 's/if p.returncode == 255:/if False:/'
   mutant cap "flock no mini" 's/fcntl.flock(lf, fcntl.LOCK_EX)/pass/'
+  mutant terr "tmux sem acesso tolerado como 'sem servidor'" 's/\*"error connecting to"\*"(No such file or directory)"\*/*"error connecting to"*/'
+  mutant terr "has engole o erro do tmux (vira 'false')" 's/s=\$(sessions) || return 2;/s=$(sessions);/'
+  mutant live "melhor esforço: sessão ausente passa a dar erro" 's/\[ "\$r" -ne 1 \] || exit 0;/true;/'
+  mutant live "stop não confere que a sessão sumiu" 's/\[ \$? -eq 1 \] || { echo "sessão @NAME@ continua/true || { echo "sessão @NAME@ continua/'
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
   r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
