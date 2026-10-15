@@ -33,7 +33,7 @@ fi
 O=$T/origin.git; W=$T/work; git init -q --bare "$O"; git clone -q "$O" "$W" 2>/dev/null
 ( cd "$W" && mkdir -p lib docs/notes auth src scripts .beads/backup data && echo 'print(1)' > lib/a.py && echo 'DATA-MARK leads' > docs/leads.csv && echo 'DATA-MARK sql' > lib/g.db && echo 'DATA-MARK env' > .env && echo 'DATA-MARK auth' > auth/k.py && echo ok > src/token_helper.py \
   && echo '{"a":"DATA-MARK bead"}' > .beads/backup/b.jsonl && echo 'DATA-MARK data' > data/x.txt && { phones 30; echo 'DATA-MARK ab'; } > docs/notes/ab_results.json && { echo '# DATA-MARK gen'; echo 'NUMS = ['; phones 25 | sed 's/.*/  "&",/'; echo ']'; } > scripts/gen.py \
-  && phones 5 > docs/notes/small.json && echo '# readme' > docs/README.md \
+  && phones 5 > docs/notes/small.json && echo '# readme' > docs/README.md && echo 'same-bytes-dupe' > docs/dupe.txt && echo 'same-bytes-dupe' > .beads/backup/dupe.txt \
   && git add -A && git commit -qm c1 && git rm -q docs/leads.csv && echo 'print(2)' >> lib/a.py && git commit -qam c2 \
   && git mv docs/notes/ab_results.json docs/notes/renamed_results.json && git commit -qm c3-rename && git branch -M main && git push -q origin main 2>&1 | tail -n 1
   git checkout -q -b feat/x && echo x > lib/x.py && git add -A && git commit -qm fx && git push -q origin feat/x 2>&1 | tail -n 1; git checkout -q main
@@ -98,6 +98,7 @@ rc_is 0 "status: sincronizado e pronto" "$M" status wa; has 'pronto=sim' "status
 DX=$T/mh/state/wa/deny-extra; grep -qxF '!/docs/notes/ab_results.json' "$DX" && grep -qxF '!/docs/notes/renamed_results.json' "$DX" && grep -qxF '!/scripts/gen.py' "$DX" && ok "varredura: nega nome neutro (.json), o MESMO blob renomeado e código com lista (.py)" || bad "varredura: deny-extra" "$(cat "$DX")"
 ! grep -q 'small.json' "$DX" && ! grep -q 'a.py' "$DX" && ok "varredura: arquivo com 5 telefones e código comum NÃO são negados" || bad "varredura: negou demais" "$(cat "$DX")"
 rc_is 0 "sparse <rig>: o filtro do rig inclui os caminhos da varredura" "$M" sparse wa; has '!/scripts/gen.py' "sparse <rig>: tem gen.py"
+chmod 000 "$DX"; rc_is 1 "status: deny-extra ilegível → rc 1 e diz ILEGÍVEL (não '0 negados')" "$M" status wa; has 'ILEGÍVEL' "status: mostra ILEGÍVEL"; rc_is 3 "sparse <rig>: deny-extra ilegível → recusa" "$M" sparse wa; chmod 644 "$DX"
 rc_is 2 "sync: rig desconhecido → uso" "$M" sync nao-existe
 STAMP1=$(gx "$MR" rev-parse refs/gt/synced); mv "$O" "$O.off"
 rc_is 1 "sync: origin fora → rc 1" "$M" sync wa; has 'inacessível' "sync: erro visível"; [ "$(gx "$MR" rev-parse refs/gt/synced)" = "$STAMP1" ] && ok "sync: origin fora NÃO renova o carimbo" || bad "sync: carimbo renovado sem fetch"
@@ -155,6 +156,7 @@ MIRROR_HITS=$(marked "$MR"); CLONE_HITS=$(marked "$SR")   # conteúdo, não nome
 for f in lib/a.py src/token_helper.py docs/notes/small.json docs/README.md; do gx "$SR" cat-file -e "refs/remotes/origin/main:$f" 2>/dev/null && gx "$SR" cat-file -p "refs/remotes/origin/main:$f" > /dev/null 2>&1 && ok "clone: tem $f (código/dado inofensivo chega)" || bad "clone: faltou $f"; done
 gx "$SR" rev-parse -q --verify refs/gt/synced > /dev/null && ok "clone: recebeu o carimbo refs/gt/synced" || bad "clone: sem carimbo"
 rc_is 0 "scan: clone limpo" srv scan wa; has 'limpo' "scan: diz limpo com contagem"
+has 'mesmos bytes sob caminho permitido' "scan: conta os blobs que um caminho permitido explica"; has '(1 deles' "scan: o duplicado do fixture (.beads/backup/dupe.txt = docs/dupe.txt) é explicado, não violação"
 # pedidos que o espelho tem de recusar
 mkdir -p "$T/probe"; BLOB=$(gx "$MR" rev-parse "refs/remotes/origin/main~2:docs/leads.csv"); gx "$MR" cat-file -e "$BLOB" 2>/dev/null && [ -n "$BLOB" ] && ok "fixture: o blob de dado existe no espelho do mini (o teste de recusa abaixo não é vazio)" || bad "fixture: blob de dado inexistente: $BLOB"
 OUT=$(GIT_SSH_COMMAND="$GS" git clone -q --bare "$URL" "$T/probe/nofilter" 2>&1); [ ! -d "$T/probe/nofilter" ] && ok "espelho: clone SEM filtro é recusado" || bad "espelho: clone sem filtro passou" "$OUT"
@@ -187,6 +189,8 @@ rc_is 1 "pull do servidor com o espelho em atualização → erro VISÍVEL (não
 rc_is 0 "worktree com o espelho em atualização sai do que havia (pull=erro registrado)" srv wt-add wa ga-old; has '"pull":"erro"' "wt-add: grava pull=erro no registro"; rc_is 0 "wt-rm do worktree de teste" srv wt-rm wa ga-old
 rc_is 0 "sync: varre o novo e libera" "$M" sync wa; has '1 sinalizado' "sync incremental: só o blob novo foi lido e sinalizado"; grep -qxF '!/docs/new_dump.txt' "$DX" && ok "varredura incremental: new_dump.txt negado" || bad "varredura incremental" "$(cat "$DX")"
 rc_is 0 "pull do servidor depois" srv pull wa; has 'resultado=ok' "pull: ok"
+tail -n 1 "$T/srv/git/pulls.jsonl" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); assert d["rig"]=="wa" and d["pull"]=="ok" and isinstance(d["lag_min"],int) and len(d["main"])==7' && ok "pull: o atraso fica registrado em pulls.jsonl (lag_min inteiro)" || bad "pull: pulls.jsonl" "$(tail -n 2 "$T/srv/git/pulls.jsonl")"
+grep -q '"pull":"erro"' "$T/srv/git/pulls.jsonl" && ok "pull: o pull que falhou também ficou registrado (pull=erro)" || bad "pull: pull com erro não registrado" """$(cat "$T/srv/git/pulls.jsonl")"
 gx "$SR" cat-file -p refs/remotes/origin/main:lib/new_code.py > /dev/null 2>&1 && ok "incremental: o código novo chegou" || bad "incremental: código novo não chegou"
 [ "$(marked "$SR")" = 0 ] && ok "incremental: o dump com 25 telefones NÃO chegou ao servidor (zero blob de dado)" || bad "incremental: dado novo chegou ao servidor"
 rc_is 0 "scan do servidor continua limpo" srv scan wa

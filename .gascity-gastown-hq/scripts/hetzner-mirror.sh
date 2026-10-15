@@ -156,8 +156,8 @@ cmd_status() {
     for b in $("$GIT" -C "$r" for-each-ref --format='%(refname:strip=2)' refs/heads/); do for p in $pfx; do case "$b" in "$p"?*) branch_pending "$r" "$b" && pend="$pend $b";; esac; done; done
     spec=igual; [ "$(sparse_spec "$rig" 2>/dev/null | "$GIT" hash-object --stdin)" = "$("$GIT" -C "$r" config gtmirror.sparseoid)" ] || spec="DIFERENTE-ou-ilegível(rode sync)"
     mirror_ready "$r" && rdy=sim || { rdy="NÃO (varredura não cobre as pontas: o servidor não é atendido)"; rc=1; }
-    n=$(grep -c . "$(state_of "$rig")/deny-extra" 2>/dev/null || true)
-    echo "$rig: pronto=$rdy · último fetch+varredura bons há $([ -n "$t" ] && echo "$(( ($(date +%s) - t) / 60 )) min" || echo desconhecido) · caminhos negados por conteúdo=${n:-0} · prefixos=[$(echo $pfx)] · filtro=$spec · pendentes ao origin=[${pend# }]"
+    if [ -e "$(state_of "$rig")/deny-extra" ]; then n=$(grep -c . "$(state_of "$rig")/deny-extra" 2>/dev/null); [ $? -le 1 ] || { n="ILEGÍVEL"; rc=1; }; else n="0 (nenhuma varredura ainda)"; fi
+    echo "$rig: pronto=$rdy · último fetch+varredura bons há $([ -n "$t" ] && echo "$(( ($(date +%s) - t) / 60 )) min" || echo desconhecido) · caminhos negados por conteúdo=$n · prefixos=[$(echo $pfx)] · filtro=$spec · pendentes ao origin=[${pend# }]"
     for e in lastfetcherror lastpublisherror; do [ -n "$("$GIT" -C "$r" config gtmirror.$e)" ] && { echo "  $e: $("$GIT" -C "$r" config gtmirror.$e)"; rc=1; }; done
     [ -z "$pend" ] && [ -n "$t" ] || rc=1
   done; return $rc
@@ -222,7 +222,8 @@ cmd_authorize() {   # authorize <arquivo.pub>: UMA chave ed25519 pura; grava a l
   want=$(printf 'restrict,from="127.0.0.1,::1",command="HETZNER_MIRROR_HOME=%s %s serve" ssh-ed25519 %s gt-mirror' "$MH" "$SELF" "$key")
   if grep -qF -- "$key" "$MH/authorized_keys"; then   # a chave já está: se o comando forçado aponta para OUTRO script (cópia de antes do merge), troca a linha; senão não mexe
     grep -qxF -- "$want" "$MH/authorized_keys" && { echo "authorize: a chave já está lá"; return 0; }
-    { grep -vF -- "$key" "$MH/authorized_keys" || true; printf '%s\n' "$want"; } > "$MH/authorized_keys.new" && chmod 600 "$MH/authorized_keys.new" && mv "$MH/authorized_keys.new" "$MH/authorized_keys" && echo "authorize: comando forçado atualizado" || die 3 "não consegui trocar a linha"
+    grep -vF -- "$key" "$MH/authorized_keys" > "$MH/authorized_keys.new"; [ $? -le 1 ] || { rm -f "$MH/authorized_keys.new"; die 3 "não consegui ler authorized_keys: não troco a linha"; }   # rc 1 = sobrou zero linhas (ok); rc 2 = erro de leitura
+    printf '%s\n' "$want" >> "$MH/authorized_keys.new" && chmod 600 "$MH/authorized_keys.new" && mv "$MH/authorized_keys.new" "$MH/authorized_keys" && echo "authorize: comando forçado atualizado" || die 3 "não consegui trocar a linha"
     return 0
   fi
   printf '%s\n' "$want" >> "$MH/authorized_keys" && echo "authorize: ok"

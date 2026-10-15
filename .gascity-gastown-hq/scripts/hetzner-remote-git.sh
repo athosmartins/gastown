@@ -36,8 +36,11 @@ cmd_pull() {   # 1) pergunta ao espelho o filtro VIGENTE (gt-mirror-spec; sai co
     [ -z "$old" ] || [ "$old" = "$oid" ] || echo "pull rig=$RIG AVISO: o filtro do espelho mudou ($old → $oid); rode scan: dado já baixado antes da mudança não some sozinho"
     if GIT_TERMINAL_PROMPT=0 timeout 1800 git -C "$GR/$RIG/repo.git" fetch -q --prune "--filter=sparse:oid=$oid" origin 2> "$ef"; then PULL=ok; rm -f "$GR/$RIG/last-pull-error"; fi
   fi
-  [ $PULL = ok ] || echo "$(now) $(grep . "$ef" | tail -n 1 | tr -d '"')" > "$GR/$RIG/last-pull-error"; rm -f "$ef"
-  lag_fields; echo "pull rig=$RIG resultado=$PULL main=$LAG_MAIN lag_min=$LAG_MIN$([ $PULL = erro ] && echo " erro=\"$(cut -d' ' -f2- "$GR/$RIG/last-pull-error")\"")"; [ $PULL = ok ]
+  [ $PULL = ok ] || { grep -q . "$ef" || echo "o espelho não devolveu um filtro de dados válido (resposta vazia ou sem regras)" > "$ef"; echo "$(now) $(grep . "$ef" | tail -n 1 | tr -d '"')" > "$GR/$RIG/last-pull-error"; }; rm -f "$ef"
+  lag_fields; echo "pull rig=$RIG resultado=$PULL main=$LAG_MAIN lag_min=$LAG_MIN$([ $PULL = erro ] && echo " erro=\"$(cut -d' ' -f2- "$GR/$RIG/last-pull-error")\"")"
+  # o atraso fica REGISTRADO a cada pull (não só no wt-add): lag_min = idade da última varredura boa do espelho; null = o clone não tem carimbo (nunca vira 0)
+  printf '{"ts":"%s","rig":"%s","pull":"%s","main":"%s","lag_min":%s}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RIG" "$PULL" "$LAG_MAIN" "$LAG_MIN" >> "$GR/pulls.jsonl" 2>/dev/null || echo "pull rig=$RIG AVISO: não consegui gravar $GR/pulls.jsonl"
+  [ $PULL = ok ]
 }
 cmd_bootstrap() {
   [ $# -ge 4 ] || die 2 "uso: bootstrap <rig> <url> <chave> <known_hosts> [prefixo/]..."
@@ -99,11 +102,16 @@ cmd_scan() {
       && sort -u "$t/pairs.raw" > "$t/pairs" || { echo "scan $RIG: saída do git log ilegível: NÃO consegui varrer o histórico"; rc=2; continue; }
     if ! g cat-file --batch-all-objects --batch-check='%(objectname) %(objecttype)' > "$t/all" 2>/dev/null; then echo "scan $RIG: cat-file falhou: NÃO consegui listar os objetos"; rc=2; continue; fi
     awk '$2 == "blob" { print $1 }' "$t/all" | sort -u > "$t/present"
-    awk -F'\t' 'NR == FNR { p[$1] = 1; next } ($1 in p) { print $2 }' "$t/present" "$t/pairs" | sort -u | denied > "$t/hit-obj" || { echo "scan $RIG: não consegui avaliar os nomes do histórico"; rc=2; continue; }
+    awk 'index($0, "\t") { print substr($0, index($0, "\t") + 1) }' "$t/pairs" | sort -u | denied > "$t/denied-paths" || { echo "scan $RIG: não consegui avaliar os nomes do histórico"; rc=2; continue; }
+    # violação = blob presente cujos caminhos são TODOS negados. Se algum caminho permitido carrega os mesmos bytes (fórmula copiada em outra pasta, arquivo vazio), a presença se explica e é contada à parte:
+    # o filtro age por caminho, e bytes idênticos sob um nome permitido são permitidos. (Resíduo declarado no runbook: um segredo copiado para um caminho comum passa.)
+    awk -v ex="$t/expl" 'FILENAME == ARGV[1] { present[$1] = 1; next } FILENAME == ARGV[2] { dp[$0] = 1; next }
+      { i = index($0, "\t"); if (!i) next; o = substr($0, 1, i - 1); p = substr($0, i + 1); if (!(o in present)) next; if (p in dp) { if (!(o in fd)) fd[o] = p } else al[o] = 1 }
+      END { for (o in fd) if (o in al) n++; else print fd[o]; print n + 0 > ex }' "$t/present" "$t/denied-paths" "$t/pairs" | sort -u > "$t/hit-obj" || { echo "scan $RIG: não consegui cruzar blobs e caminhos"; rc=2; continue; }
     ( cd "$GR/$RIG" && find . -type f -not -path './repo.git/*' ) > "$t/files" 2>/dev/null || { echo "scan $RIG: find falhou: NÃO consegui varrer a árvore"; rc=2; continue; }
     sed -e 's|^\./||' "$t/files" | grep -v -e '^sparse$' -e '^deny$' -e '^last-pull-error$' -e '/\.git$' | denied > "$t/hit-tree" || { echo "scan $RIG: não consegui avaliar a árvore"; rc=2; continue; }
     u=$(g config --get-regexp '^remote\..*\.url$' | awk '{print $2}' | grep -v -x -F "$(g config gtremote.mirrorurl)"; true)
-    n="$(wc -l < "$t/pairs" | tr -d ' ') pares blob/caminho, $(wc -l < "$t/present" | tr -d ' ') blobs presentes, $(wc -l < "$t/files" | tr -d ' ') arquivos"
+    n="$(wc -l < "$t/pairs" | tr -d ' ') pares blob/caminho, $(wc -l < "$t/present" | tr -d ' ') blobs presentes ($(cat "$t/expl" 2>/dev/null || echo ?) deles com os mesmos bytes sob caminho permitido), $(wc -l < "$t/files" | tr -d ' ') arquivos"
     if [ -s "$t/hit-obj" ] || [ -s "$t/hit-tree" ] || [ -n "$u" ] || g config --get-regexp '^remote\..*\.url$' | grep -qi github; then
       echo "scan $RIG: VIOLAÇÃO ($n) historico=[$(head -n 5 "$t/hit-obj" | tr '\n' ' ')] arvore=[$(head -n 5 "$t/hit-tree" | tr '\n' ' ')] remotos_fora_do_espelho=[$u]"; [ $rc = 0 ] && rc=1
     else echo "scan $RIG: limpo ($n conferidos)"; fi

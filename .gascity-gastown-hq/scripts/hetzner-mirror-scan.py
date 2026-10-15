@@ -102,7 +102,8 @@ def main(argv):
                     raise RuntimeError("o git não entregou o blob %s" % oid)
                 size = int(hdr[2])
                 body = cat.stdout.read(size)
-                cat.stdout.read(1)
+                if len(body) != size or cat.stdout.read(1) != b"\n":   # o git morreu no meio do blob: conteúdo truncado NÃO é conteúdo limpo
+                    raise RuntimeError("leitura curta do blob %s (%d de %d bytes)" % (oid, len(body), size))
                 if size > BIG:
                     seen[oid] = True
                 else:
@@ -116,7 +117,8 @@ def main(argv):
                     raise RuntimeError("caminho sinalizado que o filtro não consegue negar (quebra de linha, controle ou espaço no fim): %r" % p[:80])
                 deny.add(esc(p))
         cat.stdin.close()
-        cat.wait()
+        if cat.wait() != 0:
+            raise RuntimeError("git cat-file terminou com erro")
         atomic(os.path.join(st, "deny-extra"), "".join(d + "\n" for d in sorted(deny)))
         atomic(os.path.join(st, "seen.tsv"), "".join("%s\t%d\n" % (o, v) for o, v in sorted(seen.items())))
         atomic(os.path.join(st, "scanned-tips"), "".join(l + "\n" for l in sorted(tips)))
