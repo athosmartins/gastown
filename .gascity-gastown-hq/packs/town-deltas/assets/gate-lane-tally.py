@@ -38,6 +38,13 @@ A window with zero decisions has two meanings and they must not read alike: noth
 history line, no notify) or something happened that the decisions cannot show — every gate_lane line truncated
 by a disk-full append, or the producer stopped while fast runs kept merging. The second is reported loudly.
 
+The task-rapida lane (ga-dzzqvw) has its own section, built from the same log: grants (the LAST decision per marker), why the others were
+not granted (tr_code), the FIRST review of each granted marker and how long it took, and the bugs opened after a grant that cite its task.
+Only a run that ended with PASS or FAIL is a review; one the dispatcher closed with neither (SKIPPED_BEAD_CLOSED...) is counted apart and
+never enters the first-review counts or the median. The bug count is a number ONLY when every grant was looked up: in the HQ store and in the
+store of its own rig (from `gc rig list`, by the rig on the event) — a grant with no bead id, no rig, a rig whose store does not resolve or a
+store that cannot be read makes it null ("could not tell"), with how many and why; what the other grants turned up is kept as a floor.
+
 exit 0  tallied. A window with zero decisions and no signal is a valid, quiet tally and says so; zero decisions
         WITH a signal is tallied too, but as a warning (report, history line, notify), never as "nothing happened"
 exit 2  could not tally — log missing/unreadable. NOT "0 saved": error and empty must not look the same.
@@ -160,42 +167,97 @@ def _id_re(bead):
     return re.compile(r'(?<![\w.-])' + re.escape(bead) + r'(?![\w-]|\.\w)')
 
 
-def _bugs_after(items, cities, since_s, timeout=90):
-    """Bug beads opened AFTER a task of the lane was granted that cite that task (title or description) -> (count, ids, note).
-    Nothing granted: (0, [], "") — there is nothing to look for. A read that failed or that cannot be read (bd missing, timeout, rc != 0,
-    an answer that is not a JSON list, a row without an id): (None, [], why) — never 0, a failed look is not a clean week. A granted
-    decision with no bead id on its event cannot be looked up: it is named in `note`, and with nothing left to look up the count is None.
-    Only the stores in `cities` are searched; the report says which."""
-    if not items:
-        return 0, [], ""
-    pats = [(b, t, _id_re(b)) for b, t in items if isinstance(b, str) and b]
-    note = f"{len(items) - len(pats)} concedida(s) sem bead de origem no evento: não procuradas" if len(pats) != len(items) else ""
-    if not pats:
-        return None, [], note
+def _read_store(city, since_s, timeout):
+    """One bead store's bugs created since the window opened -> (rows, why). `rows` is a list (possibly empty: a real "no bugs here") or None with the
+    reason it could not be read: bd missing, timeout, rc != 0 (with its stderr), an answer that is not JSON, not a list, or a row with no id."""
+    try:
+        p = subprocess.run(["bd", "-C", city, "list", "-t", "bug", "--all", "--limit", "0", "--created-after", since_s, "--json"],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return None, repr(e)
+    if p.returncode != 0:   # before the JSON: a failing bd prints nothing parseable, and its rc and stderr are the diagnosis
+        return None, f"bd saiu com {p.returncode}: {' '.join(p.stderr.split())[:120] or 'sem mensagem'}"
+    try:
+        rows = json.loads(p.stdout)
+    except ValueError as e:
+        return None, f"resposta do bd não é JSON ({e})"
+    if not isinstance(rows, list):
+        return None, "bd respondeu algo que não é uma lista"
+    if any(not isinstance(row, dict) or not row.get("id") for row in rows):
+        return None, "linha do bd ilegível (um bug que cita a task poderia estar nela)"
+    return rows, ""
+
+
+def _rig_paths(city, timeout=90):
+    """rig name -> the path of its bead store, from `gc rig list` (the same list the dispatcher uses) -> (map, why). None + why when the list
+    could not be read; a rig row without a usable path is simply absent, so its grants read as 'store not resolved'."""
+    try:
+        p = subprocess.run(["gc", "--city", city, "rig", "list", "--json"], capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            return None, f"gc rig list saiu com {p.returncode}: {' '.join(p.stderr.split())[:120] or 'sem mensagem'}"
+        rigs = json.loads(p.stdout)["rigs"]
+        return {r["name"]: r["path"] for r in rigs if isinstance(r, dict) and isinstance(r.get("name"), str)
+                and isinstance(r.get("path"), str) and r["path"].startswith("/")}, ""
+    except Exception as e:
+        return None, f"gc rig list: {e!r}"
+
+
+def _bugs_after(grants, explicit, rig_paths, rig_why, since_s, always=(), timeout=90):
+    """Bug beads opened AFTER a task of the lane was granted that cite that task (title or description). `grants` = [(bead, rig, granted_at)].
+    A bug about a rig task is filed either in that rig's own store or in the HQ store (the gate's and the daemons' bugs are HQ beads that cite
+    the rig task — measured on the live log), so each grant is looked up in BOTH: the rig's store (the path comes from `rig_paths`, by the rig
+    on its event), every store in `always` (the HQ city) and every store in `explicit` (--bug-city). Returns a dict: count (an int ONLY when every grant was looked up, else None),
+    ids, found (what the grants that WERE looked up turned up — a floor, not the total), uncovered (how many grants were not), note, stores
+    (read OK), failed. A grant is NOT looked up — and the count then cannot be a number — when it has no bead id, no rig on its event (and no
+    explicit store to stand in), a rig whose store did not resolve, or a store that could not be read: "I never looked where the answer lives"
+    must not be reported as "no bugs". Nothing granted: a real 0, and nothing is called."""
+    res = {"count": 0, "ids": [], "found": 0, "uncovered": 0, "note": "", "stores": [], "failed": []}
+    if not grants:
+        return res
+    why, want = {}, []   # why: reason -> grants it left un-looked-up; want: (bead pattern, granted_at, its store or None = the explicit ones, looked_up)
+
+    def lose(reason):
+        why[reason] = why.get(reason, 0) + 1
+        res["uncovered"] += 1
+    for bead, rig, t in grants:
+        if not (isinstance(bead, str) and bead):
+            lose("sem bead de origem no evento")
+        elif isinstance(rig, str) and rig:
+            path = (rig_paths or {}).get(rig)
+            if path is None:   # its bugs may still turn up in an explicit store, so it stays in `want` — but it is already counted as not looked up
+                lose(f"loja do rig {rig} não resolvida" + (f" ({rig_why})" if rig_why else ""))
+            want.append((_id_re(bead), t, path, path is not None))
+        elif explicit:
+            want.append((_id_re(bead), t, None, True))
+        else:
+            lose("sem rig no evento e nenhuma --bug-city dada")
+    stores = list(dict.fromkeys(list(always) + list(explicit) + [path for _, _, path, _ in want if path]))
+    rows_by, bad = {}, {}
+    for s in stores:
+        rows, w = _read_store(s, since_s, timeout)
+        if rows is None:
+            bad[s] = w
+        else:
+            rows_by[s] = rows
     found = {}
-    for city in cities:
-        # vazio (a JSON list of no bugs) → a real 0 for this store; falhou/ilegível (exception, rc != 0, not a list, a row with no id) → (None, why), never 0
-        try:
-            p = subprocess.run(["bd", "-C", city, "list", "-t", "bug", "--all", "--limit", "0", "--created-after", since_s, "--json"],
-                               capture_output=True, text=True, timeout=timeout)
-            rows = json.loads(p.stdout)
-        except Exception as e:
-            return None, [], f"{city}: {e!r}"
-        if p.returncode != 0 or not isinstance(rows, list):
-            return None, [], f"{city}: bd saiu com {p.returncode} ou respondeu algo que não é uma lista"
-        for row in rows:
-            if not isinstance(row, dict) or not row.get("id"):
-                return None, [], f"{city}: linha do bd ilegível (um bug que cita a task poderia estar nela)"
-            text = f"{row.get('title') or ''}\n{row.get('description') or ''}"
-            try:
-                created = dt.datetime.fromisoformat(str(row.get("created_at")).replace("Z", "+00:00"))
-                created = created if created.tzinfo else created.replace(tzinfo=dt.timezone.utc)
-            except ValueError:
-                created = None   # undated: bd already cut at the window start, so it is counted (one too many beats one hidden)
-            for bead, t, pat in pats:
+    for pat, t, path, looked_up in want:
+        down = [s for s in list(always) + ([path] if path else list(explicit)) if s in bad]
+        if looked_up and down:
+            lose("busca falhou em " + ", ".join(f"{s} ({bad[s]})" for s in down))
+        for s, rows in rows_by.items():
+            for row in rows:
+                text = f"{row.get('title') or ''}\n{row.get('description') or ''}"
+                try:
+                    created = dt.datetime.fromisoformat(str(row.get("created_at")).replace("Z", "+00:00"))
+                    created = created if created.tzinfo else created.replace(tzinfo=dt.timezone.utc)
+                except ValueError:
+                    created = None   # undated: bd already cut at the window start, so it is counted (one too many beats one hidden)
                 if (created is None or created > t) and pat.search(text):
-                    found[row["id"]] = bead
-    return len(found), sorted(found), note
+                    found[row["id"]] = True
+    res.update(found=len(found), ids=sorted(found), stores=sorted(rows_by), failed=sorted(f"{s}: {w}" for s, w in bad.items()),
+               count=len(found) if not res["uncovered"] else None,
+               note="; ".join(f"{n} concedida(s): {reason}" for reason, n in sorted(why.items())))
+    return res
 
 
 def tally(log_path, days, now, cities=None):
@@ -264,7 +326,7 @@ def tally(log_path, days, now, cities=None):
 
     # A run belongs to the task-rapida lane when the decision in effect for its marker WHEN IT COMPLETED was the lane's grant — or when the event
     # says so itself. The event's own `lane` cannot be the test: a reviewed run is finalized by a later sweep that does not restore GATE_LANE, so
-    # every one of them reads lane=normal (measured on the whole live log 2026-10-14: 6 real grants, 6 completions all lane=normal, none lane=task-rapida; bead ga-ufeq1c).
+    # every one of them reads lane=normal (measured on the whole live log 2026-10-14: 6 real grants, 6 completions all lane=normal, none lane=task-rapida).
     # Reading only the event would report those runs as "no verdict yet" — a false zero. A normal-lane run of the same marker from BEFORE the grant
     # is not the lane's: the decision in effect then was another one.
     tr_completes = [(t, c) for t, c in other_completes
@@ -306,12 +368,27 @@ def tally(log_path, days, now, cities=None):
         name = None if e.get("lane") == "task-rapida" else _tr_bucket(e)
         if name is not None:
             tr_refusals[name] = tr_refusals.get(name, 0) + 1
-    first = {}   # marker -> its FIRST completed run in the window: the first review is what the lane is judged on
-    for t, c in sorted(tr_completes, key=lambda tc: tc[0]):
-        first.setdefault(c.get("marker") or "?", c)
+    # A review is a run that ENDED with a verdict. A run the dispatcher closed without one (SKIPPED_BEAD_CLOSED: "neither PASS nor FAIL", written with
+    # no lane and elapsed_s 0) is not a first review and must not pass for a run time: it is counted apart, by its result, and a marker whose only
+    # runs were of that kind is "no verdict". A run with no marker cannot be tied to any grant, so each is its own run — never merged into one.
+    first = {}   # marker -> its FIRST run with a verdict in the window: the first review is what the lane is judged on
+    ended, unattributed = {}, set()   # result -> runs that ended without a verdict; keys of `first` that belong to no marker
+    for i, (t, c) in enumerate(sorted(tr_completes, key=lambda tc: tc[0])):
+        res = c.get("result")
+        if res not in ("PASS", "FAIL"):
+            name = res if isinstance(res, str) and res else "(sem result)"
+            ended[name] = ended.get(name, 0) + 1
+            continue
+        key = c.get("marker")
+        if not (isinstance(key, str) and key):
+            key = f"?{i}"
+            unattributed.add(key)
+        first.setdefault(key, c)
     secs = sorted(c["elapsed_s"] for c in first.values() if _is_secs(c.get("elapsed_s")))   # a run with no readable elapsed_s is counted apart, not as 0
     mid = (secs[(len(secs) - 1) // 2] + secs[len(secs) // 2]) / 2 if secs else None
-    bug_n, bug_ids, bug_note = _bugs_after([(e.get("bead"), decisions[m][-1][0]) for m, e in tr_granted.items()], cities or [DEFAULT_CITY], since_s)
+    grants = [(e.get("bead"), e.get("rig"), decisions[m][-1][0]) for m, e in tr_granted.items()]
+    rig_paths, rig_why = _rig_paths(DEFAULT_CITY) if any(isinstance(g[1], str) and g[1] for g in grants) else (None, "")   # no rig on any grant: no need to ask
+    bugs = _bugs_after(grants, list(cities or []), rig_paths, rig_why, since_s, always=[DEFAULT_CITY])
     return {
         "since": since_s, "days": days, "decisions": len(last_decision), "fast": fast, "normal": normal,
         "fast_runs_completed": len(completes), "fast_pass": passed, "fast_fail": failed,
@@ -321,10 +398,15 @@ def tally(log_path, days, now, cities=None):
         "tr_granted": len(tr_granted), "tr_refused": sum(tr_refusals.values()), "tr_refusals": tr_refusals,
         "tr_runs": len(first), "tr_first_pass": sum(1 for c in first.values() if c.get("result") == "PASS"),
         "tr_first_fail": sum(1 for c in first.values() if c.get("result") == "FAIL"),
-        "tr_no_verdict": sum(1 for m in tr_granted if m not in first),   # granted in the window, no completed run in it (yet)
+        "tr_no_verdict": sum(1 for m in tr_granted if m not in first),   # granted in the window, no run with a verdict in it (yet)
+        "tr_ended_no_verdict": sum(ended.values()), "tr_ended_results": ended,   # runs the dispatcher closed with neither PASS nor FAIL
+        "tr_first_outside_grants": sum(1 for k in first if k not in unattributed and k not in tr_granted),   # marker re-decided after its run: in PASS/FAIL, not in "granted"
+        "tr_unattributed": len(unattributed),
         "tr_elapsed_median_s": mid, "tr_elapsed_max_s": secs[-1] if secs else None,
         "tr_over_10min": sum(1 for s in secs if s > _TR_OVER_S), "tr_elapsed_unknown": len(first) - len(secs),
-        "tr_bugs_after": bug_n, "tr_bugs_after_ids": bug_ids, "tr_bugs_note": bug_note, "tr_stores": list(cities or [DEFAULT_CITY]),
+        "tr_bugs_after": bugs["count"], "tr_bugs_after_ids": bugs["ids"], "tr_bugs_note": bugs["note"], "tr_bugs_found_partial": bugs["found"],
+        "tr_bugs_uncovered": bugs["uncovered"], "tr_stores": bugs["stores"], "tr_stores_failed": bugs["failed"],
+        "tr_grant_rigs": sorted({g[1] for g in grants if isinstance(g[1], str) and g[1]}),   # the rigs the grants came from: what "every store was read" is measured against
     }
 
 
@@ -340,13 +422,21 @@ def _render_tr(r):
     if not r["tr_granted"]:
         return out
     out.append(f"    1ª revisão: PASS {r['tr_first_pass']} | FAIL {r['tr_first_fail']} | sem veredito na janela {r['tr_no_verdict']} (de {r['tr_granted']} concedida(s))")
+    if r["tr_ended_no_verdict"]:
+        what = ", ".join(f"{k} {n}" for k, n in sorted(r["tr_ended_results"].items()))
+        out.append(f"    {r['tr_ended_no_verdict']} run(s) da faixa encerrado(s) sem veredito PASS/FAIL ({what}): não são revisão — ficaram fora da 1ª revisão e da mediana")
+    if r["tr_first_outside_grants"]:
+        out.append(f"    ({r['tr_first_outside_grants']} 1ª revisão(ões) de marker(s) cuja concessão foi trocada depois: contam em PASS/FAIL, não em 'concedidas')")
+    if r["tr_unattributed"]:
+        out.append(f"    ({r['tr_unattributed']} run(s) da faixa sem marker no evento: contados um a um, sem ligar a nenhuma concessão)")
     if r["tr_elapsed_median_s"] is not None:
         out.append(f"    tempo do run (elapsed_s da 1ª rodada): mediana {_min(r['tr_elapsed_median_s'])}, máx {_min(r['tr_elapsed_max_s'])}, "
                    f"acima de 10 min: {r['tr_over_10min']}")
     if r["tr_elapsed_unknown"]:
         out.append(f"    ({r['tr_elapsed_unknown']} run(s) sem elapsed_s legível: ficaram fora da mediana)")
     if r["tr_bugs_after"] is None:
-        out.append(f"    ATENÇÃO: bugs abertos depois citando uma task da faixa: NÃO DEU PARA APURAR ({r['tr_bugs_note']}) — isto NÃO é zero")
+        out.append(f"    ATENÇÃO: bugs abertos depois citando uma task da faixa: NÃO DEU PARA APURAR em {r['tr_bugs_uncovered']} de {r['tr_granted']} concedida(s) "
+                   f"({r['tr_bugs_note']}) — achados nas outras: {r['tr_bugs_found_partial']} — isto NÃO é zero")
     else:
         ids = f" ({', '.join(r['tr_bugs_after_ids'])})" if r["tr_bugs_after_ids"] else ""
         out.append(f"    bugs abertos depois citando uma task da faixa: {r['tr_bugs_after']}{ids} [lojas buscadas: {', '.join(r['tr_stores'])}]")
@@ -416,8 +506,14 @@ def notify_line(r):
             line += f", 1ª revisão PASS {r['tr_first_pass']}/FAIL {r['tr_first_fail']}"
             if r["tr_elapsed_median_s"] is not None:
                 line += f", mediana {_min(r['tr_elapsed_median_s'])}"
-            line += (f", bugs depois {r['tr_bugs_after']}" if r["tr_bugs_after"] is not None
-                     else ", ATENÇÃO bugs depois NÃO apurado (não é zero)")
+            stores = ", ".join(os.path.basename(x.rstrip("/")) for x in r["tr_stores"]) or "nenhuma"
+            if r["tr_bugs_after"] is not None:
+                line += f", bugs depois {r['tr_bugs_after']} (lojas: {stores})"
+            else:   # the one number that says whether the shortened review is safe: when it cannot be had, the line says how much of it is missing and why
+                line += (f", ATENÇÃO bugs depois NÃO apurado em {r['tr_bugs_uncovered']}/{r['tr_granted']} concedida(s) "
+                         f"({r['tr_bugs_note'][:140]}); achados nas outras {r['tr_bugs_found_partial']} (lojas: {stores}) — não é zero")
+        if r["tr_ended_no_verdict"]:
+            line += f"; {r['tr_ended_no_verdict']} run(s) da faixa encerrado(s) sem veredito"
     if r["unreadable_lines"]:
         line += f"; ATENÇÃO {r['unreadable_lines']} linha(s) do log ilegíveis — números podem estar subcontados"
     return line
@@ -434,7 +530,8 @@ def main(argv):
     ap.add_argument("--no-notify", action="store_true")
     ap.add_argument("--list-codes", action="store_true", help="print the reason codes this tally knows, then exit")
     ap.add_argument("--list-tr-codes", action="store_true", help="print the task-rapida codes (tr_code) this tally knows, then exit")
-    ap.add_argument("--bug-city", action="append", help="a bead store searched for bugs that cite a task of the lane (repeatable; default: the HQ city)")
+    ap.add_argument("--bug-city", action="append", help="an EXTRA bead store searched for bugs that cite a task of the lane (repeatable). The HQ store and the store of each "
+                    "grant's own rig (its path comes from `gc rig list`) are searched without being asked; a grant whose store cannot be resolved or read makes the count unknown, never 0")
     a = ap.parse_args(argv)
     if a.list_codes:
         for code, (label, mech) in REASON_CODES.items():
