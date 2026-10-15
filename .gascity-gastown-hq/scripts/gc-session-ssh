@@ -4,12 +4,13 @@ interface das locais (start, stop, interrupt, is-running, peek, nudge, send-keys
 meta, attach). ga-2hd02v.1.1, desenho do ga-ukxa3k, fatia 2. Python 3.9+, só biblioteca padrão.
 
 Contents
-  Uso · O que faz · O que NÃO faz · Configuração · Códigos de saída
+  Uso · O que faz · Vários hosts e o MBP · O que NÃO faz · Configuração · Códigos de saída
 
 USO
   GC_SESSION=exec:<cidade>/scripts/gc-session-ssh                (ou, no híbrido, `remote_exec` — patch em docs/pending-engine-window/)
   gc-session-ssh <op> <sessão> [args]        o engine chama assim, com o JSON do start na entrada padrão
   gc-session-ssh --dry-run start <sessão> < start.json     (ou GC_SSH_DRYRUN=1) imprime o que rodaria no host e NÃO conecta
+  gc-session-ssh gate <host>      (não é do protocolo do engine) o veredito de um start AGORA nesse host, sem abrir nada: JSON, exit 0/1
 
 O QUE FAZ
   Cada operação é UM ssh (ControlMaster em ~/.ssh/cm, o mesmo do mbp-run.sh) que leva um script sh pela entrada padrão; o
@@ -25,6 +26,17 @@ O QUE FAZ
   sessões (todas, menos attach, que entrega o terminal ao tmux do host) saem com erro e o motivo — nunca `false`, lista vazia ou "há vaga". Sessão que não existe (tmux respondeu) segue o contrato do exec: stop,
   interrupt, nudge, send-keys, clear-scrollback e get-last-activity saem 0 sem fazer nada; `stop` só sai 0 se a sessão sumiu.
 
+VÁRIOS HOSTS E O MBP (ga-w7qwl1)  O host de uma sessão vem de $GC_SSH_HOST, senão do que o NOME pede (`<papel>-remote-<host>-…`, o mesmo
+  `-remote-` do remote_match do híbrido), senão de default_host; nome que pede host fora da config recusa. list-running junta TODOS os hosts
+  (ou só o de $GC_SSH_HOST); host que não responde é erro — salvo um host `sleeps` (notebook) sem nenhuma sessão nossa registrada em
+  <estado>/<host>/running/, que só sai da lista. Host com `presence_gate` (o MBP, notebook de trabalho do Athos): a CADA start roda
+  `gate_cmd` (padrão: scripts/mbp-run.sh --check, a mesma regra do mbp-offload) e só abre com evidência POSITIVA de "Athos fora e MBP
+  saudável" — em uso, pausa, bandeira desligada, sem saúde, resposta ilegível ou que não roda: recusa, sem ssh. O teto efetivo é o menor
+  entre `cap` e o slot_cap da checagem (RAM). A sessão nasce em nice 10 com um vigia ao lado (biblioteca de presença do host, instalada por
+  `mbp-offload.sh install-mbp`): se o Athos voltar ou pausar, a árvore da sessão cai para prioridade de fundo e não volta a subir; a
+  sessão em curso NÃO é morta. Sem a biblioteca no host o start recusa. Cada start/recusa/stop vira uma linha em <estado>/<host>/events.jsonl
+  (insumo do placar: scripts/session-host-scoreboard.py).
+
 O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
   pre_start, session_setup*, session_live, overlay/pack_overlay_dirs, copy_files, copy-to: NÃO executam nem copiam (seriam comandos e
   arquivos do mini no servidor; as fatias .1.2/.1.3 decidem) — ficam registrados como "ignored". `nudge` do start também não é
@@ -38,8 +50,9 @@ CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta 
      "remote_root": "/home/runner/gt-remote/bundle", "remote_home": "/home/runner"}}}
   obrigatórios: ssh (alias/destino), cap (teto de sessões deste host, contado SÓ no socket do provider, separado do teto do mini),
   remote_root (= --remote-root do remote-bundle-build.py), remote_home. opcionais: socket (gc-remote), connect_timeout (10),
-  timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home. O host vem de $GC_SSH_HOST ou default_host:
-  um segundo host (o MBP, ga-w7qwl1) é outra entrada + outra instância do provider com GC_SSH_HOST. Estado no mini:
+  timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home. Só para o notebook (MBP): path_extra [] (dirs
+  absolutos à frente do PATH do ssh sem login: /opt/homebrew/bin), presence_gate (true), gate_cmd ([lista]), presence_lib (padrão
+  <remote_home>/gt-remote/bin/mbp-presence.sh), watch_s (5), sleeps (true). Estado no mini:
   $GC_EXEC_STATE_DIR ou <cidade>/.gc/runtime/session-ssh, sempre em <estado>/<host>/. Não há padrão para o cap: sem ele não abre sessão.
 
 CÓDIGOS  0 ok · 1 erro (mensagem em stderr; "already exists" no start vira ErrSessionExists no engine) · 2 operação não suportada
@@ -69,7 +82,7 @@ EX_CAP, EX_EXISTS = 10, 11
 # o ssh leva `sh -c '<RUNNER>'` (uma string, qualquer shell de login a entende) e o script vai pela entrada padrão: não há limite de
 # argv (o prompt tem dezenas de KB) e o script lê a entrada inteira ANTES de rodar, então comando nenhum dele a come.
 RUNNER = 'umask 077; f=$(mktemp) || exit 125; cat >"$f"; sh "$f" </dev/null; rc=$?; rm -f "$f"; exit $rc'
-PRELUDE = r"""PATH="$HOME/.local/bin:$HOME/go/bin:/usr/local/bin:$PATH"; export PATH
+PRELUDE = r"""PATH="@PATHX@$HOME/.local/bin:$HOME/go/bin:/usr/local/bin:$PATH"; export PATH
 T() { tmux -L @SOCK@ "$@"; }
 sessions() { o=$(T list-sessions -F '#{session_name}' 2>&1) && { [ -z "$o" ] || printf '%s\n' "$o"; return 0; }
   case "$o" in *"no server running"*|*"error connecting to"*"(No such file or directory)"*) return 0;; esac; printf '%s\n' "$o" >&2; return 1; }
@@ -89,19 +102,26 @@ class Fail(Exception):
     """Erro esperado: a mensagem vai para stderr, exit 1 (o engine a mostra no erro da operação)."""
 
 
+def load_config() -> tuple:
+    """(cidade, caminho, objeto) da configuração; ausente ou ilegível = Fail."""
+    city = os.path.dirname(os.path.dirname(os.path.realpath(sys.argv[0])))
+    path = os.environ.get("GC_SSH_CONFIG") or os.path.join(city, ".gc", "session-ssh.json")
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raise Fail(f"sem configuração: {path} não existe (ver docs/runbooks/gc-session-ssh.md)")
+    except (OSError, ValueError) as e:
+        raise Fail(f"configuração ilegível em {path}: {e}")
+    return city, path, raw if isinstance(raw, dict) else {}
+
+
 class Cfg:
-    def __init__(self) -> None:
-        self.city_guess = os.path.dirname(os.path.dirname(os.path.realpath(sys.argv[0])))
-        path = os.environ.get("GC_SSH_CONFIG") or os.path.join(self.city_guess, ".gc", "session-ssh.json")
-        try:
-            with open(path) as f:
-                raw = json.load(f)
-        except FileNotFoundError:
-            raise Fail(f"sem configuração: {path} não existe (ver docs/runbooks/gc-session-ssh.md)")
-        except (OSError, ValueError) as e:
-            raise Fail(f"configuração ilegível em {path}: {e}")
-        raw = raw if isinstance(raw, dict) else {}
-        self.host = os.environ.get("GC_SSH_HOST") or raw.get("default_host")
+    def __init__(self, host: str = "", session: str = "") -> None:
+        self.city_guess, path, raw = load_config()
+        self.names = sorted(raw["hosts"]) if isinstance(raw.get("hosts"), dict) else []
+        # host: argumento explícito (gate <host>) > $GC_SSH_HOST > o que o NOME da sessão pede (`…-remote-<host>-…`) > default_host
+        self.host = host or os.environ.get("GC_SSH_HOST") or self.host_of(session) or raw.get("default_host")
         h = (raw.get("hosts") or {}).get(self.host) if isinstance(raw.get("hosts"), dict) else None
         if not isinstance(h, dict):
             raise Fail(f"host {self.host!r} não está em {path}")
@@ -118,8 +138,26 @@ class Cfg:
         self.ssh_opts = [str(x) for x in h.get("ssh_opts") or []]
         self.env_allow = set(h.get("env_allow") or [])
         self.mini_home = os.path.realpath(h.get("mini_home") or os.path.expanduser("~"))
+        # host que é o notebook do Athos (ga-w7qwl1): PATH extra (Homebrew não está no PATH do ssh sem login), regra de presença no
+        # start, vigia de prioridade na sessão, e `sleeps` = pode estar dormindo/fora (ver list-running)
+        self.path_extra = [self.need({"x": x}, "x", PATH_RE) for x in h.get("path_extra") or []]
+        for k in ("presence_gate", "sleeps"):  # "true" (texto) não pode desligar em silêncio a regra que protege o Athos
+            if k in h and not isinstance(h[k], bool):
+                raise Fail(f"host {self.host}: '{k}' tem que ser true ou false ({h[k]!r})")
+        self.gate, self.sleeps = h.get("presence_gate", False), h.get("sleeps", False)
+        self.plib = self.need(h, "presence_lib", PATH_RE, self.home + "/gt-remote/bin/mbp-presence.sh")
+        self.gate_cmd = h.get("gate_cmd") or [os.path.join(self.city_guess, "scripts", "mbp-run.sh"), "--check"]
+        if not isinstance(self.gate_cmd, list) or not all(isinstance(x, str) and x for x in self.gate_cmd):
+            raise Fail(f"host {self.host}: 'gate_cmd' tem que ser uma lista de textos")
+        self.watch_s = self.num(h, "watch_s", 5)
         base = os.environ.get("GC_EXEC_STATE_DIR") or os.path.join(self.city_guess, ".gc", "runtime", "session-ssh")
         self.state = os.path.join(base, re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.host)))
+
+    def host_of(self, session: str) -> str:
+        m = re.search(r"-remote-([A-Za-z0-9_]+)", session or "")
+        if m and m.group(1) not in self.names:
+            raise Fail(f"sessão {session}: o nome pede o host {m.group(1)!r}, que não está na config ({', '.join(self.names) or 'sem hosts'})")
+        return m.group(1) if m else ""
 
     def need(self, h: dict, key: str, rx: re.Pattern, default: str = "") -> str:
         v = h.get(key, default)
@@ -146,6 +184,34 @@ class Cfg:
             pass  # o log é auxiliar: falhar em gravá-lo não pode virar falha da operação
 
 
+    def event(self, kind: str, name: str, **kw) -> None:
+        """Uma linha por fato em <estado>/events.jsonl (started, refused, stopped): é a fonte do placar por host (session-host-scoreboard.py)."""
+        try:
+            with open(os.path.join(self.mkstate(), "events.jsonl"), "a") as f:
+                f.write(json.dumps(dict(ts=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), host=self.host, session=name,
+                                        event=kind, **kw), ensure_ascii=False) + "\n")
+        except OSError:
+            pass  # auxiliar, como o log
+
+    def mark(self, name: str, on: bool) -> None:
+        """Sessões que ESTE provider abriu e ainda não parou, no mini: é o que separa "host fora do ar, sem nada nosso lá" de "não sei"."""
+        try:
+            if on:
+                open(os.path.join(self.mkstate("running"), name), "a").close()
+            else:
+                os.unlink(os.path.join(self.state, "running", name))
+        except OSError:
+            pass
+
+    def known(self) -> bool:
+        try:
+            return bool(os.listdir(os.path.join(self.state, "running")))
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True  # não consegui ler o registro: não sei, e "não sei" não vira "nada lá"
+
+
 # ---------- transporte ----------
 
 def ssh_argv(cfg: Cfg, tty: bool = False) -> list:
@@ -162,7 +228,7 @@ def ssh_argv(cfg: Cfg, tty: bool = False) -> list:
 
 def remote(cfg: Cfg, body: str, timeout: int = 0, dry: bool = False) -> tuple:
     """Roda `body` (sh) no host e devolve (rc, saída entre marcadores, stderr). ssh que falha ou não responde → Fail."""
-    script = PRELUDE.replace("@SOCK@", q(cfg.socket)) + body + f"\n)\nrc=$?\necho {END}\nexit $rc\n"
+    script = PRELUDE.replace("@SOCK@", q(cfg.socket)).replace("@PATHX@", "".join(d + ":" for d in cfg.path_extra)) + body + f"\n)\nrc=$?\necho {END}\nexit $rc\n"
     argv = ssh_argv(cfg) + ["sh -c " + q(RUNNER)]
     if dry:
         print(json.dumps({"ssh": argv, "script": script}, indent=2))
@@ -241,12 +307,29 @@ def plan_start(cfg: Cfg, name: str, req: dict) -> dict:
         else:
             env[k] = m.map(env_in[k])
     for what, v in [("work_dir", workdir), ("command", command)] + [(f"env {k}", v) for k, v in env.items()]:
-        if "/Users/" in v:  # o caminho do mini não existe no host: recusa em vez de abrir uma sessão que cairia no primeiro uso
+        # o caminho do mini não existe no host: recusa em vez de abrir uma sessão que cairia no primeiro uso. Num host cujo home também
+        # é /Users/<x> (o MBP), o home dele é o único /Users/ que vale; o de outro usuário continua recusado
+        if any(u != cfg.home for u in re.findall(r"/Users/[A-Za-z0-9_.-]+", v)):
             raise Fail(f"start recusado: {what} ainda tem caminho do mini depois da reescrita: {v[:120]!r}")
     suffix, flag = m.map(req.get("prompt_suffix") or ""), req.get("prompt_flag") or ""
     line = command + (f" {flag} {suffix}" if flag and suffix else f" {suffix}" if suffix else "")
     return {"work_dir": workdir, "command": line, "env": env, "env_dropped": dropped,
             "ignored": [k for k in IGNORED if req.get(k)], "cap": cfg.cap, "socket": cfg.socket}
+
+
+# Vigia de presença (hosts com presence_gate), um por sessão: se o Athos voltar ou pausar, a ÁRVORE de processos da sessão cai para
+# prioridade de fundo (renice 19 + taskpolicy -b, o mesmo do mbp_supervise do mbp-run.sh) e nunca volta a subir; termina com o lançador.
+# Os argumentos: $1 = biblioteca de presença (a do mbp-run.sh, em ~/gt-remote/bin), $2 = pid do lançador, $3 = intervalo em segundos.
+WATCH = r'''export PRESENCE_LIB_ONLY=1; . "$1" || exit 0; me=$2
+while kill -0 "$me" 2>/dev/null; do
+  presence_eval
+  if [ "$PR_MODE" != livre ] || [ "$PR_PAUSED" = 1 ]; then
+    for p in $(ps -e -o pid= -o ppid= | awk -v r="$me" '{p[$1]=$2} END{for(i in p){q=i;while(q!=""&&q!=0&&q!=1){if(q==r){print i;break};q=p[q]}}}'); do
+      [ "$p" = "$$" ] || { renice -n 19 -p "$p"; taskpolicy -b -p "$p"; } >/dev/null 2>&1
+    done
+  fi
+  sleep "$3"
+done'''
 
 
 def launcher(cfg: Cfg, name: str, p: dict) -> str:
@@ -259,7 +342,46 @@ def launcher(cfg: Cfg, name: str, p: dict) -> str:
     out += [f"unset {k}" if v == "" else f"export {k}={q(v)}" for k, v in p["env"].items()]
     if first and "=" not in first and first not in ("env", "exec"):
         out.append(f'command -v {q(first)} >/dev/null 2>&1 || {{ echo "comando não encontrado: "{q(first)} >{q(exitf)}; exit 127; }}')
-    return "\n".join(out + [f"sh -c {q(p['command'])}", "rc=$?", f'[ "$rc" -eq 0 ] || echo "saiu com $rc" >{q(exitf)}', 'exit "$rc"']) + "\n"
+    if cfg.gate:
+        out.append(f"bash -c {q(WATCH)} _ {q(cfg.plib)} $$ {cfg.watch_s} </dev/null >/dev/null 2>&1 &")
+    run_cmd = f"{'nice -n 10 ' if cfg.gate else ''}sh -c {q(p['command'])}"  # notebook do Athos: começa em nice 10 (mbp-run.sh, modo livre)
+    return "\n".join(out + [run_cmd, "rc=$?", f'[ "$rc" -eq 0 ] || echo "saiu com $rc" >{q(exitf)}', 'exit "$rc"']) + "\n"
+
+
+def gate_check(cfg: Cfg) -> dict:
+    """A regra do Athos para o MBP (ga-77c1qg), a mesma do mbp-run.sh: só evidência POSITIVA de "Athos fora e MBP saudável" libera.
+    Pausa, bandeira desligada, em uso, sem saúde ou qualquer coisa que a checagem não deixe ler recusa (o lado que protege o Athos)."""
+    def no(why: str) -> dict:
+        return {"host": cfg.host, "ok": False, "reason": why, "slot_cap": None}
+    try:
+        r = subprocess.run(cfg.gate_cmd, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return no("a checagem de presença do MBP não respondeu em 60s")
+    except OSError as e:
+        return no(f"não consegui rodar a checagem de presença ({e})")
+    kv = dict(l.split("=", 1) for l in r.stdout.decode("utf-8", "replace").splitlines() if "=" in l)
+    cap = kv.get("slot_cap", "")
+    if r.returncode == 99:
+        return no("MBP desligado ou pausado (bandeira ou pausa do Athos)")
+    if r.returncode != 0:
+        return no(f"MBP sem saúde ou fora do ar (rc {r.returncode})")
+    if kv.get("presence") != "livre":
+        return no(f"Athos está no MBP (presença={kv.get('presence') or 'ilegível'}, motivo={kv.get('presence_why') or '?'})")
+    if kv.get("paused") != "0" or kv.get("paused_local") != "0":
+        return no("pausa do Athos ativa")
+    if kv.get("offload_flag") != "on":
+        return no("bandeira mbp-offload desligada")
+    if not cap.isdigit() or int(cap) < 1:
+        return no(f"teto de slots ilegível ou zero na checagem (slot_cap={cap!r})")
+    return {"host": cfg.host, "ok": True, "reason": "Athos fora e MBP saudável", "slot_cap": int(cap)}
+
+
+def op_gate(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    """`gate <host>`: o veredito de um start AGORA, sem abrir nada (para o teto/escala do pool): JSON, exit 0 libera, 1 recusa."""
+    v = gate_check(cfg) if cfg.gate and not dry else {"host": cfg.host, "ok": True, "slot_cap": None,
+                                                       "reason": "dry-run: não consultei" if cfg.gate else "este host não tem regra de presença"}
+    print(json.dumps(dict(v, cap=cfg.cap), ensure_ascii=False, sort_keys=True))
+    return 0 if v["ok"] else 1
 
 
 def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
@@ -270,10 +392,18 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     if not isinstance(req, dict):
         raise Fail("start: a entrada tem que ser um objeto JSON")
     p = plan_start(cfg, name, req)
+    cap = cfg.cap
+    if cfg.gate and not dry:  # regra de presença: a cada start, na hora (é o que faz "o Athos voltou → nada novo" valer já na próxima tentativa)
+        g = gate_check(cfg)
+        if not g["ok"]:
+            cfg.event("refused", name, reason=g["reason"])
+            raise Fail(f"host {cfg.host}: não abro sessão nova — {g['reason']}")
+        cap = min(cap, g["slot_cap"])  # o teto de RAM do mbp-run.sh (slot_cap) também vale para as sessões
     run_dir, exitf = f"{cfg.root}/run", f"{cfg.root}/run/{name}.exit"
     lpath = f"{run_dir}/{name}.sh"
     if dry:
         print(json.dumps(dict(p, host=cfg.host, session=name, launcher=launcher(cfg, name, p).split("\n"),
+                              gate=cfg.gate_cmd if cfg.gate else None, path_extra=cfg.path_extra,
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0
@@ -281,12 +411,14 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
 printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
 n=$(printf '%s\\n' "$s" | grep -c .)
 [ "$n" -lt @CAP@ ] || { echo "host @HOST@ está no teto: $n de @CAP@ sessões" >&2; exit 10; }
-mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
+@PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
 rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1
 T new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" || { rm -f @LAUNCH@; exit 1; }
 sleep 1
 T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@; exit 1; }"""
-    for k, v in {"@NAME@": q(name), "@CAP@": str(cfg.cap), "@HOST@": q(cfg.host), "@RUN@": q(run_dir), "@WORKDIR@": q(p["work_dir"]),
+    plib = f'[ -r {q(cfg.plib)} ] || {{ echo "host @HOST@: sem a biblioteca de presença ({cfg.plib}); rode mbp-offload.sh install-mbp" >&2; exit 12; }}\n' if cfg.gate else ""
+    body = body.replace("@PLIBCHECK@", plib)
+    for k, v in {"@NAME@": q(name), "@CAP@": str(cap), "@HOST@": q(cfg.host), "@RUN@": q(run_dir), "@WORKDIR@": q(p["work_dir"]),
                  "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name),
                  "@B64@": q(base64.b64encode(launcher(cfg, name, p).encode()).decode())}.items():
         body = body.replace(k, v)
@@ -294,9 +426,13 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
         fcntl.flock(lf, fcntl.LOCK_EX)
         rc, out, err = remote(cfg, body, cfg.start_timeout)
     if rc == EX_CAP or rc == EX_EXISTS:
+        if rc == EX_CAP:
+            cfg.event("refused", name, reason="teto do host")
         raise Fail(err or f"start de {name} recusado em {cfg.host} (rc={rc}, sem mensagem)")
     if rc != 0:
         raise Fail(f"start em {cfg.host} falhou (rc={rc}): {err or out or 'sem mensagem'}")
+    cfg.event("started", name)
+    cfg.mark(name, True)
     cfg.log(f"start {name} ok" + (f" ignored={','.join(p['ignored'])}" if p["ignored"] else "") +
             (f" env_dropped={','.join(p['env_dropped'])}" if p["env_dropped"] else ""))
     return 0
@@ -315,6 +451,8 @@ has @NAME@; [ $? -eq 1 ] || { echo "sessão @NAME@ continua aberta depois do sto
     run(cfg, "stop", body, dry)
     if not dry:
         meta_clear(cfg, name)
+        cfg.event("stopped", name)
+        cfg.mark(name, False)
     return 0
 
 
@@ -364,13 +502,39 @@ def op_peek(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     return 0
 
 
-def op_list_running(cfg: Cfg, prefix: str, args: list, dry: bool) -> int:
+def op_list_running(prefix: str, dry: bool) -> int:
+    """Sessões de TODOS os hosts da config (ou só do $GC_SSH_HOST). Host que não responde = erro (o engine trata como lista parcial),
+    nunca "vazio" — salvo um host `sleeps` (notebook) sem nenhuma sessão nossa registrada: ali "não responde" é só o notebook fora do ar."""
     if not re.fullmatch(r"[A-Za-z0-9_-]*", prefix or ""):
         raise Fail(f"prefixo inválido: {prefix!r}")
-    _, out, _ = run(cfg, "list-running", "sessions", dry)  # falha de ssh = erro (o engine trata como lista parcial), nunca "vazio"
-    for s in out.split("\n"):
-        if s and s.startswith(prefix):
-            print(s)
+    cfg_hosts = load_config()[2].get("hosts")
+    hosts = [os.environ["GC_SSH_HOST"]] if os.environ.get("GC_SSH_HOST") else sorted(cfg_hosts) if isinstance(cfg_hosts, dict) else []
+    if not hosts:
+        raise Fail("a configuração não tem nenhum host")
+    bad = []
+    for h in hosts:
+        cfg = Cfg(host=h)
+        try:
+            _, out, _ = run(cfg, "list-running", "sessions", dry)
+        except Fail as e:
+            if cfg.sleeps and not cfg.known():
+                cfg.log(f"list-running: host sem resposta e sem sessão nossa registrada, não conta: {e}")
+            else:
+                bad.append(str(e))
+            continue
+        live = [x for x in out.split("\n") if x]
+        for x in live:
+            if x.startswith(prefix):
+                print(x)
+        if not dry:  # o host respondeu: o registro de sessões abertas volta a ser o que o host de fato tem
+            try:
+                for m in os.listdir(os.path.join(cfg.state, "running")):
+                    if m not in live:
+                        cfg.mark(m, False)
+            except OSError:
+                pass  # sem registro legível não há o que acertar; o próximo start o refaz
+    if bad:
+        raise Fail("; ".join(bad))
     return 0
 
 
@@ -444,29 +608,33 @@ def op_remove_meta(cfg: Cfg, name: str, args: list, dry: bool) -> int:
 
 # Só estas operações existem. As que o protocolo conhece e este provider NÃO serve (check-image, copy-to, watch-startup, run-live) e as
 # desconhecidas caem fora daqui e saem com 2 ("não suportado") sem abrir ssh, sem ler a entrada, sem tocar em sessão.
-OPS = {"start": op_start, "stop": op_stop, "interrupt": op_interrupt, "is-running": op_is_running, "process-alive": op_process_alive,
-       "nudge": op_nudge, "send-keys": op_send_keys, "peek": op_peek, "list-running": op_list_running, "get-last-activity": op_last_activity,
+OPS = {"gate": op_gate, "start": op_start, "stop": op_stop, "interrupt": op_interrupt, "is-running": op_is_running, "process-alive": op_process_alive,
+       "nudge": op_nudge, "send-keys": op_send_keys, "peek": op_peek, "get-last-activity": op_last_activity,
        "clear-scrollback": op_clear_scrollback, "attach": op_attach, "set-meta": op_set_meta, "get-meta": op_get_meta,
        "remove-meta": op_remove_meta}
-NAMELESS = {"list-running"}  # o 2º argumento é um prefixo, não um nome de sessão
+NAMELESS = {"list-running", "gate"}  # o 2º argumento é um prefixo (list-running) ou um host (gate), não um nome de sessão
 
 
 def main(argv: list) -> int:
     args = argv[1:]
     dry = bool(args and args[0] == "--dry-run") or os.environ.get("GC_SSH_DRYRUN") == "1"
     args = args[1:] if args and args[0] == "--dry-run" else args
-    if not args or args[0] not in OPS:
+    if not args or (args[0] not in OPS and args[0] != "list-running"):
         return 2
     op, rest = args[0], args[1:]
+    arg = rest[0] if rest else ""
+    cfg = None
     try:
-        cfg = Cfg()
+        if op == "list-running":
+            return op_list_running(arg, dry)
         if op not in NAMELESS:
-            check_name(rest[0] if rest else "")
-        return OPS[op](cfg, rest[0] if rest else "", rest[1:], dry)
+            check_name(arg)
+        cfg = Cfg(host=arg if op == "gate" else "", session="" if op == "gate" else arg)
+        return OPS[op](cfg, arg, rest[1:], dry)
     except Fail as e:
         sys.stderr.write(f"gc-session-ssh {op}: {e}\n")
         try:
-            Cfg().log(f"{op} {rest[0] if rest else ''} FALHOU: {e}")
+            (cfg or Cfg()).log(f"{op} {arg} FALHOU: {e}")
         except Fail:
             pass
         return 1
