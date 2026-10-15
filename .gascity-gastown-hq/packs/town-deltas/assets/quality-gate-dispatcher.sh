@@ -11825,6 +11825,7 @@ fi
 
 # ── Step 11: Log to quality-gate.jsonl ───────────────────────────────────────
 
+# SELFTEST-EXTRACT dispatcher-complete-event: BEGIN
 mkdir -p "$(dirname "$QG_LOG")"
 REASON=""
 if [ "$OVERALL_VERDICT" = "PASS" ]; then
@@ -11862,6 +11863,7 @@ jq -c -n \
     gate_run: $gate_run, marker: $marker, elapsed_s: $elapsed_s,
     reviewers: $reviewers, dry_run: $dry_run, lane: $lane, remerge: $remerge}' \
   >> "$QG_LOG" 2>/dev/null || true
+# SELFTEST-EXTRACT dispatcher-complete-event: END
 # ga-syxaki (E5): outcome line for a run that had an extra reviewer slot (no-op otherwise).
 if [ "${GATE_E5_LIB_OK:-0}" = "1" ]; then gate_e5_log_run_end || true; fi
 
@@ -13454,6 +13456,19 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # SELFTEST-EXTRACT e5-run-arm: BEGIN
       GATE_E5_RUN_ARM=$(extract "e5_arm")
       # SELFTEST-EXTRACT e5-run-arm: END
+      # ga-ufeq1c: the lane this run was ADMITTED under. A task-rapida run is decided in one sweep and finalized in a later one (its
+      # reviewer's verdict is collected here), and GATE_LANE is process-local: left alone, Step 11 wrote lane=normal on the
+      # dispatcher_complete of every task-rapida run (5 of 5 measured on 14/10). The run's own record carries it ("lane:", written at
+      # Step 6 from the same variable), so it is read back from there like tier / required_reviewers above. Reset FIRST: this loop
+      # finalizes several runs in one process, and run A's lane must not leak into run B whose record has none (a run from before
+      # the line existed is "normal", which is what it always was). Only task-rapida is restored, on purpose: it is the one lane
+      # finalized by a LATER sweep. The fast lane finalizes in the process that decided it and its push-time confirmation needs
+      # GATE_LANE_DIGEST, which a later process does not have (gate_fastlane_confirm would revoke it), so "fast" read from a record
+      # here stays "normal", exactly as before. Anything else read from the record is "normal" too.
+      # SELFTEST-EXTRACT phase-c-lane-restore: BEGIN
+      GATE_LANE="normal"
+      case "$(extract "lane")" in task-rapida) GATE_LANE="task-rapida" ;; esac
+      # SELFTEST-EXTRACT phase-c-lane-restore: END
       case "$REQUIRED_REVIEWERS" in ''|*[!0-9]*) REQUIRED_REVIEWERS=1 ;; esac
       case "$PC_TIMEOUT_MIN" in ''|*[!0-9]*) PC_TIMEOUT_MIN="$VERDICT_TIMEOUT_MINUTES" ;; esac
 
