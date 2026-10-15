@@ -1597,6 +1597,13 @@ printf '%s' "$RL_BLOCK" | grep -q 'continue' \
 # close it as story:done before the deploy ran. Now it keeps the story for a grace after its last
 # update; past the grace it closes it as an explicit BACKSTOP (delivery:janitor-backstop, close
 # reason says deploy was NOT verified). An age that cannot be computed keeps the story.
+#
+# GATE-FIX 1: "last update" cannot be bd's `updated_at` ALONE. `bd label add/remove` and `bd comment` do
+# not advance it (only `bd update` does), so the hand-off (label remove x2, label add gate:passed, a
+# comment) left it at some earlier, unrelated write, the first sweep read that as an old story and closed
+# it as a BACKSTOP seconds after the gate passed it. The hand-off now STAMPS gate.passed_at (epoch) and
+# the grace counts from max(updated_at, stamp). A gate:passed story with NO stamp is `unstamped`: kept, and
+# the janitor writes gate.passed_seen_at on first sight so the wait starts then.
 echo ""
 echo "── ga-botvu2: iso_epoch ──"
 # 2026-10-15T17:51:50Z = 1792086710 (checked against `date -u -j -f` / jq on the day this was written).
@@ -1606,31 +1613,67 @@ eq "iso_epoch tolerates fractional seconds"   "$(iso_epoch 2026-10-15T17:51:50.1
 eq "iso_epoch empty -> nothing"               "$(iso_epoch '')"                          ""
 eq "iso_epoch garbage -> nothing"             "$(iso_epoch 'not-a-date')"                ""
 eq "iso_epoch +hh:mm offset form -> nothing (never a guess)" "$(iso_epoch 2026-10-15T17:51:50-03:00)" ""
+eq "iso_epoch +00:00 is UTC, the same instant as Z" "$(iso_epoch 2026-10-15T17:51:50+00:00)" "$E0"
+eq "iso_epoch +00:00 with fractional seconds"       "$(iso_epoch 2026-10-15T17:51:50.5+00:00)" "$E0"
 
 echo ""
-echo "── ga-botvu2: story_gate_passed_grace_state (none|waiting|elapsed|unknown) ──"
+echo "── ga-botvu2: story_gate_passed_grace_state (none|waiting|elapsed|unstamped|unknown) ──"
+# args: labels updated_at now grace [gate.passed_at epoch] [gate.passed_seen_at epoch]. The clock is the
+# LATEST of updated_at / the hand-off stamp / the janitor's first-seen stamp; updated_at alone is not a clock.
 GL="ctx:ready story:approved gate:passed"
 U="2026-10-15T17:51:50Z"
-gs() { story_gate_passed_grace_state "$1" "$2" "$3" "$4"; }
-eq "60 s old,  grace 600  -> waiting"   "$(gs "$GL" "$U" $((E0+60))   600)"  "waiting"
-eq "599 s old, grace 600  -> waiting"   "$(gs "$GL" "$U" $((E0+599))  600)"  "waiting"
-eq "600 s old, grace 600  -> elapsed (boundary is >=)" "$(gs "$GL" "$U" $((E0+600))  600)"  "elapsed"
-eq "900 s old, grace 600  -> elapsed"   "$(gs "$GL" "$U" $((E0+900))  600)"  "elapsed"
-eq "900 s old, grace 1800 -> waiting"   "$(gs "$GL" "$U" $((E0+900))  1800)" "waiting"
-eq "1799 s old, grace 1800 -> waiting"  "$(gs "$GL" "$U" $((E0+1799)) 1800)" "waiting"
-eq "1800 s old, grace 1800 -> elapsed"  "$(gs "$GL" "$U" $((E0+1800)) 1800)" "elapsed"
-eq "grace 0 -> elapsed at once (an operator's explicit choice)" "$(gs "$GL" "$U" "$E0" 0)" "elapsed"
+gs()  { story_gate_passed_grace_state "$1" "$2" "$3" "$4" "${5-}" "${6-}"; }
+gsp() { gs "$1" "$2" "$3" "$4" "$E0"; }     # the hand-off stamped at the same moment as updated_at ($E0)
+eq "60 s old,  grace 600  -> waiting"   "$(gsp "$GL" "$U" $((E0+60))   600)"  "waiting"
+eq "599 s old, grace 600  -> waiting"   "$(gsp "$GL" "$U" $((E0+599))  600)"  "waiting"
+eq "600 s old, grace 600  -> elapsed (boundary is >=)" "$(gsp "$GL" "$U" $((E0+600))  600)"  "elapsed"
+eq "900 s old, grace 600  -> elapsed"   "$(gsp "$GL" "$U" $((E0+900))  600)"  "elapsed"
+eq "900 s old, grace 1800 -> waiting"   "$(gsp "$GL" "$U" $((E0+900))  1800)" "waiting"
+eq "1799 s old, grace 1800 -> waiting"  "$(gsp "$GL" "$U" $((E0+1799)) 1800)" "waiting"
+eq "1800 s old, grace 1800 -> elapsed"  "$(gsp "$GL" "$U" $((E0+1800)) 1800)" "elapsed"
+eq "grace 0 -> elapsed at once (an operator's explicit choice)" "$(gsp "$GL" "$U" "$E0" 0)" "elapsed"
 eq "no gate:passed, ancient -> none (the wait does not apply)" "$(gs "ctx:ready story:approved" "$U" $((E0+99999)) 1800)" "none"
+eq "...stamps on a story with no gate:passed change nothing" "$(gs "ctx:ready story:approved" "$U" $((E0+99999)) 1800 "$E0" "$E0")" "none"
 eq "empty labels -> none"               "$(gs "" "$U" $((E0+60)) 1800)" "none"
 eq "gate:passed-warn is a different label -> none (whole-token match)" "$(gs "story:approved gate:passed-warn" "$U" $((E0+60)) 1800)" "none"
-eq "empty updated_at -> unknown, NOT elapsed"      "$(gs "$GL" ""            $((E0+99999)) 1800)" "unknown"
-eq "garbage updated_at -> unknown, NOT elapsed"    "$(gs "$GL" "yesterday"   $((E0+99999)) 1800)" "unknown"
-eq "offset-form updated_at -> unknown"             "$(gs "$GL" "2026-10-15T14:51:50-03:00" $((E0+99999)) 1800)" "unknown"
-eq "updated_at in the future (clock skew) -> unknown" "$(gs "$GL" "$U" $((E0-5)) 1800)" "unknown"
-eq "empty now -> unknown"               "$(gs "$GL" "$U" "" 1800)" "unknown"
-eq "non-numeric now -> unknown"         "$(gs "$GL" "$U" "abc" 1800)" "unknown"
-eq "empty grace -> unknown"             "$(gs "$GL" "$U" $((E0+99999)) "")" "unknown"
-eq "non-numeric grace -> unknown (a typo holds the story, it does not drop the wait)" "$(gs "$GL" "$U" $((E0+99999)) "10min")" "unknown"
+eq "empty updated_at -> unknown, NOT elapsed"      "$(gsp "$GL" ""            $((E0+99999)) 1800)" "unknown"
+eq "garbage updated_at -> unknown, NOT elapsed"    "$(gsp "$GL" "yesterday"   $((E0+99999)) 1800)" "unknown"
+eq "offset-form updated_at -> unknown"             "$(gsp "$GL" "2026-10-15T14:51:50-03:00" $((E0+99999)) 1800)" "unknown"
+eq "updated_at in the future (clock skew) -> unknown" "$(gsp "$GL" "$U" $((E0-5)) 1800)" "unknown"
+eq "empty now -> unknown"               "$(gsp "$GL" "$U" "" 1800)" "unknown"
+eq "non-numeric now -> unknown"         "$(gsp "$GL" "$U" "abc" 1800)" "unknown"
+eq "empty grace -> unknown"             "$(gsp "$GL" "$U" $((E0+99999)) "")" "unknown"
+eq "non-numeric grace -> unknown (a typo holds the story, it does not drop the wait)" "$(gsp "$GL" "$U" $((E0+99999)) "10min")" "unknown"
+
+echo ""
+echo "── ga-botvu2 gate-fix 1: the clock starts at the HAND-OFF, not at some earlier write ──"
+# THE reviewed bug. updated_at is an hour-plus old (bd does not move it on label add/remove/comment); the
+# gate handed the story off 60 s ago and stamped it. The story must WAIT.
+HO=$((E0+5000))     # the hand-off moment; updated_at is still $E0, 5000 s older
+eq "hand-off 60 s ago, updated_at 5000 s old -> waiting (counted from the hand-off)" "$(gs "$GL" "$U" $((HO+60)) 1800 "$HO")" "waiting"
+eq "hand-off 1799 s ago -> waiting"                   "$(gs "$GL" "$U" $((HO+1799)) 1800 "$HO")" "waiting"
+eq "hand-off 1800 s ago -> elapsed (boundary is >=)"  "$(gs "$GL" "$U" $((HO+1800)) 1800 "$HO")" "elapsed"
+eq "hand-off long ago and updated_at old too -> elapsed" "$(gs "$GL" "$U" $((HO+99999)) 1800 "$E0")" "elapsed"
+U_NEW="$(date -u -r $((E0+5000)) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$((E0+5000))" +%Y-%m-%dT%H:%M:%SZ)"
+eq "a LATER write (updated_at 60 s ago) postpones an old stamp -> waiting" "$(gs "$GL" "$U_NEW" $((E0+5060)) 1800 "$E0")" "waiting"
+eq "...updated_at can only postpone: stamp 6799 s old, updated_at 1799 s old -> waiting" "$(gs "$GL" "$U_NEW" $((E0+5000+1799)) 1800 "$E0")" "waiting"
+eq "...and 1800 s after that later write -> elapsed" "$(gs "$GL" "$U_NEW" $((E0+5000+1800)) 1800 "$E0")" "elapsed"
+# No stamp = the janitor does not know when the story was handed off.
+eq "gate:passed, NO stamp, updated_at ancient -> unstamped, NOT elapsed" "$(gs "$GL" "$U" $((E0+99999)) 1800)" "unstamped"
+eq "...empty stamp strings are 'no stamp' too" "$(gs "$GL" "$U" $((E0+99999)) 1800 "" "")" "unstamped"
+eq "first seen 60 s ago (no hand-off stamp) -> waiting"  "$(gs "$GL" "$U" $((HO+60)) 1800 "" "$HO")" "waiting"
+eq "first seen 1800 s ago -> elapsed"                    "$(gs "$GL" "$U" $((HO+1800)) 1800 "" "$HO")" "elapsed"
+eq "hand-off stamp and first-seen both present: the LATER one counts (stamp later)" "$(gs "$GL" "$U" $((HO+60)) 1800 "$HO" "$E0")" "waiting"
+eq "...(first-seen later)"                               "$(gs "$GL" "$U" $((HO+60)) 1800 "$E0" "$HO")" "waiting"
+eq "...both old -> elapsed"                              "$(gs "$GL" "$U" $((HO+99999)) 1800 "$E0" "$E0")" "elapsed"
+# A stamp that is there but cannot be read is not 'no stamp': unknown, and it does not fall back.
+eq "garbage hand-off stamp -> unknown"                   "$(gs "$GL" "$U" $((HO+99999)) 1800 "soon")" "unknown"
+eq "...and it does not fall back to a good first-seen"   "$(gs "$GL" "$U" $((HO+99999)) 1800 "soon" "$E0")" "unknown"
+eq "garbage first-seen (no hand-off stamp) -> unknown"   "$(gs "$GL" "$U" $((HO+99999)) 1800 "" "later")" "unknown"
+eq "hand-off stamp in the future (clock skew) -> unknown" "$(gs "$GL" "$U" $((HO+60)) 1800 $((HO+9999)))" "unknown"
+eq "first-seen in the future -> unknown"                 "$(gs "$GL" "$U" $((HO+60)) 1800 "" $((HO+9999)))" "unknown"
+eq "a good stamp does not rescue an unreadable updated_at (row not trusted) -> unknown" "$(gs "$GL" "" $((HO+99999)) 1800 "$E0")" "unknown"
+eq "non-numeric grace with a stamp -> unknown"           "$(gs "$GL" "$U" $((HO+99999)) "10min" "$E0")" "unknown"
 
 echo ""
 echo "── ga-botvu2: janitor_story_decide honours the grace ──"
@@ -1638,6 +1681,7 @@ echo "── ga-botvu2: janitor_story_decide honours the grace ──"
 gd() { janitor_story_decide 0 0 0 0 0 0 1 1 1 0 0 0 0 "$@"; }
 eq "waiting -> keep"                    "$(gd waiting)"  "keep:gate-passed-awaiting-delivery-grace"
 eq "unknown -> keep (unreadable)"       "$(gd unknown)"  "keep:gate-passed-grace-unreadable"
+eq "unstamped -> keep (the clock has not started; never closed on an age nobody measured)" "$(gd unstamped)" "keep:gate-passed-grace-not-started"
 eq "empty state -> keep (unreadable)"   "$(gd '')"       "keep:gate-passed-grace-unreadable"
 eq "unrecognised state -> keep (allowlist, not denylist)" "$(gd bogus)" "keep:gate-passed-grace-unreadable"
 eq "elapsed -> done (the backstop)"     "$(gd elapsed)"  "done:commit-in-origin-main"
@@ -1652,6 +1696,7 @@ eq "delivery-owned (running/failed/pending-vm) is still kept when elapsed" \
    "$(janitor_story_decide 0 0 0 0 0 1 1 1 1 0 0 0 0 elapsed)" "keep:delivery-owns-it"
 eq "already story:done keeps its own reason while waiting (the orphan-close needs it)" \
    "$(janitor_story_decide 0 0 1 0 0 0 1 1 1 0 0 0 0 waiting)" "keep:already-story-done"
+eq "unstamped with the strongest evidence is still kept"    "$(janitor_story_decide 0 0 0 0 0 0 1 1 1 0 0 0 0 unstamped | cut -d: -f1)" "keep"
 eq "waiting with no merge evidence -> still keep" "$(janitor_story_decide 0 0 0 0 0 0 0 0 0 0 0 0 0 waiting | cut -d: -f1)" "keep"
 eq "elapsed with no merge evidence -> keep: elapsed alone closes nothing" \
    "$(janitor_story_decide 0 0 0 0 0 0 0 0 0 0 0 0 0 elapsed)" "keep:no-merge-evidence"
@@ -1668,9 +1713,17 @@ echo "── ga-botvu2: drift-guards on the live sweep ──"
 grep -qF -- '--status open --limit 0 --json -l story:approved' "$JANITOR" \
   && ok "story sweep lists ALL approved stories (--limit 0), so none is cut off before it ages through the grace" \
   || bad "story sweep's bd list lost --limit 0 — a story past bd's default cutoff would never be reconciled"
-grep -qF 'story_gate_passed_grace_state "$SLABELS" "$S_UPDATED" "$(date +%s)" "$STORY_DELIVERY_GRACE_SECONDS")' "$JANITOR" \
-  && ok "story sweep derives S_GRACE from the row's labels, updated_at, the clock and the grace" \
-  || bad "story sweep does not compute S_GRACE from story_gate_passed_grace_state"
+grep -qF 'story_gate_passed_grace_state "$SLABELS" "$S_UPDATED" "$S_NOW" "$STORY_DELIVERY_GRACE_SECONDS" "$S_PASSED_AT" "$S_SEEN_AT")' "$JANITOR" \
+  && ok "story sweep derives S_GRACE from the row's labels, updated_at, the clock, the grace AND the stamps" \
+  || bad "story sweep does not compute S_GRACE from story_gate_passed_grace_state with the hand-off stamps"
+# The two halves of one contract: what the guard WRITES is what the janitor READS.
+GUARD_LIB="$SELF_DIR/quality-gate-guard.sh"
+grep -qF 'gate.passed_at' "$GUARD_LIB" && grep -qF '"gate.passed_at"' "$JANITOR" \
+  && ok "the hand-off stamp key (gate.passed_at) is the same in the guard that writes it and the janitor that reads it" \
+  || bad "gate.passed_at is not named by both quality-gate-guard.sh and merged-bead-janitor.sh — the clock would never start"
+grep -qF 'gate.passed_seen_at' "$JANITOR" \
+  && ok "the janitor stamps gate.passed_seen_at on first sight of an unstamped gate:passed story" \
+  || bad "the janitor never writes gate.passed_seen_at — an unstamped story could never age out"
 grep -qF '"$S_SIGCOMMIT_DOCS_ONLY" "$S_SIGMK_STALE" "$S_GRACE")' "$JANITOR" \
   && ok "story sweep passes S_GRACE as janitor_story_decide's last arg (an omitted arg means 'no wait')" \
   || bad "story sweep does not pass S_GRACE to janitor_story_decide — the wait would never be applied"
@@ -1703,48 +1756,201 @@ git init -q -b main "$BV/rig"
 ( cd "$BV/rig" && echo a > a && git add a && git commit -q -m "base" \
   && echo b > b && git add b && git commit -q -m "feat(ga-fixture1): the story" \
   && git remote add origin "$BV/origin.git" && git push -q origin main ) >/dev/null 2>&1
-BV_N=0
-# bv_run <age_seconds|EMPTY|GARBAGE> <labels> <grace seconds | -> — runs the sweep, sets BV_LOG (bd call log)
-bv_run() {
-  local age="$1" labels="$2" grace="$3" d upd now e
-  BV_N=$((BV_N+1)); d="$BV/run$BV_N"; mkdir -p "$d/bin" "$d/city/.gc/logs"
+BV_N=0; BV_K=0
+epoch_iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+# bv_fixture <age_seconds|EMPTY|GARBAGE> <labels> <hand-off stamp age_seconds|GARBAGE|-> <first-seen age_seconds|GARBAGE|->
+# — a fresh run dir $BV_D holding ONE open story and a STATEFUL stub bd. The stub is bd 1.1.0 as MEASURED on
+# the live store: `label add/remove` and `comment` do NOT advance updated_at, `update` does, `close` closes.
+# That is the whole point of the gate-fix: a stub that served a frozen updated_at, or moved it on every write,
+# could not tell a janitor that reads the right clock from one that reads the wrong one.
+bv_fixture() {
+  local age="$1" labels="$2" pa="${3:--}" sa="${4:--}" now upd meta='{}'
+  BV_N=$((BV_N+1)); BV_K=0; BV_D="$BV/run$BV_N"; mkdir -p "$BV_D/bin" "$BV_D/city/.gc/logs"
   now=$(date +%s)
   case "$age" in
     EMPTY)   upd="" ;;
     GARBAGE) upd="sometime last week" ;;
-    *)       e=$((now - age)); upd=$(date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ) ;;
+    *)       upd=$(epoch_iso $((now - age))) ;;
   esac
-  jq -n --arg id ga-fixture1 --arg upd "$upd" --arg labels "$labels" \
-    '[{id:$id, title:"fixture story", issue_type:"feature", status:"open", assignee:"", updated_at:$upd, labels:($labels|split(" "))}]' > "$d/stories.json"
-  cat > "$d/bin/gc" <<STUB
+  case "$pa" in -) ;; GARBAGE) meta=$(jq -c '. + {"gate.passed_at":"soon"}' <<<"$meta") ;;
+    *) meta=$(jq -c --arg v "$((now - pa))" '. + {"gate.passed_at":$v}' <<<"$meta") ;; esac
+  case "$sa" in -) ;; GARBAGE) meta=$(jq -c '. + {"gate.passed_seen_at":"later"}' <<<"$meta") ;;
+    *) meta=$(jq -c --arg v "$((now - sa))" '. + {"gate.passed_seen_at":$v}' <<<"$meta") ;; esac
+  jq -n --arg id ga-fixture1 --arg upd "$upd" --arg labels "$labels" --argjson meta "$meta" \
+    '[{id:$id, title:"fixture story", issue_type:"feature", status:"open", assignee:"", updated_at:$upd, labels:($labels|split(" ")), metadata:$meta}]' > "$BV_D/stories.json"
+  cat > "$BV_D/bin/gc" <<STUB
 #!/usr/bin/env bash
 if [ "\$3" = "rig" ] && [ "\$4" = "list" ]; then
   printf '{"rigs":[{"name":"fixrig","prefix":"ga","path":"$BV/rig","default_branch":"main","hq":false}]}'
 fi
 exit 0
 STUB
-  cat > "$d/bin/bd" <<STUB
+  cat > "$BV_D/bin/bd" <<'STUB'
 #!/usr/bin/env bash
-printf '%s\\n' "\$*" >> "$d/bd.log"
-case " \$* " in
-  *" list "*"story:approved"*) cat "$d/stories.json" ;;
-  *" list "*|*" comments "*) printf '[]' ;;
+D="$(cd "$(dirname "$0")/.." && pwd)"
+printf '%s\n' "$*" >> "$D/bd.log"
+[ "${1:-}" = "-C" ] && shift 2
+cmd="${1:-}"; sub="${2:-}"
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+mut() { jq "$@" "$D/stories.json" > "$D/stories.tmp" && mv "$D/stories.tmp" "$D/stories.json"; }
+case "$cmd" in
+  list)
+    case " $* " in
+      *"story:approved"*)
+        if [ -n "${BV_LIST_FAILS:-}" ]; then echo "Error: database is unavailable" >&2; exit 1; fi
+        jq '[.[] | select(.status == "open")]' "$D/stories.json" ;;
+      *) printf '[]' ;;
+    esac ;;
+  show)     cat "$D/stories.json" ;;
+  comments) printf '[]' ;;
+  label)
+    case "$sub" in
+      add)    mut --arg l "$4" '.[0].labels |= ((. + [$l]) | unique)' ;;
+      remove) mut --arg l "$4" '.[0].labels |= map(select(. != $l))' ;;
+    esac ;;
+  update)
+    [ -n "${BV_UPDATE_FAILS:-}" ] && exit 1
+    shift 2
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --set-metadata)   mut --arg k "${2%%=*}" --arg v "${2#*=}" --arg now "$now" '.[0].metadata[$k] = $v | .[0].updated_at = $now'; shift ;;
+        --unset-metadata) mut --arg k "$2" --arg now "$now" 'del(.[0].metadata[$k]) | .[0].updated_at = $now'; shift ;;
+      esac
+      shift
+    done ;;
+  close)    mut '.[0].status = "closed"' ;;
 esac
 exit 0
 STUB
-  chmod +x "$d/bin/gc" "$d/bin/bd"; : > "$d/bd.log"
+  chmod +x "$BV_D/bin/gc" "$BV_D/bin/bd"; : > "$BV_D/bd.log"
+}
+# bv_sweep <grace seconds | -> — one janitor run against $BV_D; the state persists across sweeps. BV_LOG is
+# the bd calls of THIS run only (truncated first). BV_DRY / BV_UPDATE_FAILS / BV_LIST_FAILS opt in per call.
+bv_sweep() {
+  local grace="$1"
+  BV_K=$((BV_K+1)); BV_OUT="$BV_D/out$BV_K.log"; BV_LOG="$BV_D/bd.log"; : > "$BV_LOG"
   if [ "$grace" = "-" ]; then
-    env -u JANITOR_STORY_DELIVERY_GRACE_SECONDS GC_CITY_PATH="$d/city" JANITOR_LOG_STDOUT=1 PATH="$d/bin:$PATH" bash "$JANITOR" > "$d/out.log" 2>&1
+    env -u JANITOR_STORY_DELIVERY_GRACE_SECONDS GC_CITY_PATH="$BV_D/city" JANITOR_LOG_STDOUT=1 JANITOR_DRY_RUN="${BV_DRY:-0}" \
+      BV_UPDATE_FAILS="${BV_UPDATE_FAILS:-}" BV_LIST_FAILS="${BV_LIST_FAILS:-}" PATH="$BV_D/bin:$PATH" bash "$JANITOR" > "$BV_OUT" 2>&1
   else
-    env JANITOR_STORY_DELIVERY_GRACE_SECONDS="$grace" GC_CITY_PATH="$d/city" JANITOR_LOG_STDOUT=1 PATH="$d/bin:$PATH" bash "$JANITOR" > "$d/out.log" 2>&1
+    env JANITOR_STORY_DELIVERY_GRACE_SECONDS="$grace" GC_CITY_PATH="$BV_D/city" JANITOR_LOG_STDOUT=1 JANITOR_DRY_RUN="${BV_DRY:-0}" \
+      BV_UPDATE_FAILS="${BV_UPDATE_FAILS:-}" BV_LIST_FAILS="${BV_LIST_FAILS:-}" PATH="$BV_D/bin:$PATH" bash "$JANITOR" > "$BV_OUT" 2>&1
   fi
-  BV_LOG="$d/bd.log"; BV_OUT="$d/out.log"
+}
+# bv_run <age|EMPTY|GARBAGE> <labels> <grace|-> [stamp age|GARBAGE|-] [first-seen age|GARBAGE|-] — fixture + sweep.
+# The hand-off stamp defaults to the SAME age as updated_at (the hand-off was the last write); `-` = unstamped.
+bv_run() {
+  local pa="${4-}"
+  if [ -z "$pa" ]; then case "$1" in EMPTY|GARBAGE) pa=- ;; *) pa="$1" ;; esac; fi
+  bv_fixture "$1" "$2" "$pa" "${5:--}"; bv_sweep "$3"
+}
+# bv_handoff — the REAL gap2_apply_pass_verdict (quality-gate-guard.sh's lib) against the stub bd, in its own
+# process: label remove x2, label add gate:passed, gate_passed_confirm, comment. BV_LOG = its bd calls.
+bv_handoff() {
+  BV_LOG="$BV_D/bd.log"; : > "$BV_LOG"
+  env PATH="$BV_D/bin:$PATH" GATE_GUARD_LIB_ONLY=1 \
+    bash -c 'source "$1" >/dev/null 2>&1; gap2_apply_pass_verdict ga-fixture1 ga-sling1 1 close:merge-verified' _ "$GUARD_LIB" > "$BV_D/handoff.out" 2>&1
+}
+# bv_age_all <seconds> — time passes: updated_at and the stamps move back to <seconds> ago (the janitor reads `date`).
+bv_age_all() {
+  local t=$(( $(date +%s) - $1 ))
+  jq --argjson t "$t" '.[0].updated_at = ($t|todate) | .[0].metadata |= with_entries(if (.key=="gate.passed_at" or .key=="gate.passed_seen_at") then .value = ($t|tostring) else . end)' \
+    "$BV_D/stories.json" > "$BV_D/stories.tmp" && mv "$BV_D/stories.tmp" "$BV_D/stories.json"
 }
 bv_closed()   { grep -qE ' close ga-fixture1 ' "$BV_LOG"; }
 bv_backstop() { grep -qE ' label add ga-fixture1 delivery:janitor-backstop' "$BV_LOG"; }
 bv_unverified() { grep -E ' close ga-fixture1 ' "$BV_LOG" | grep -qF 'NOT VERIFIED'; }
+bv_updates()  { grep -cE ' update ga-fixture1 ' "$BV_LOG" || true; }
+bv_meta()     { jq -r --arg k "$1" '.[0].metadata[$k] // ""' "$BV_D/stories.json"; }
+bv_labels()   { jq -r '.[0].labels | join(" ")' "$BV_D/stories.json"; }
+bv_upd()      { jq -r '.[0].updated_at' "$BV_D/stories.json"; }
 PASSED="story:approved gate:passed"
 
+echo ""
+echo "── the stub bd is honest about bd 1.1.0 (the premise of every scenario below) ──"
+bv_fixture 7200 "story:approved story:in-flight pilot:dispatched" - -
+UPD0=$(bv_upd)
+( PATH="$BV_D/bin:$PATH"; bd -C x label remove ga-fixture1 story:in-flight -q; bd -C x label add ga-fixture1 gate:passed -q; bd -C x comment ga-fixture1 "hand-off" )
+eq "label add/remove and comment do NOT advance updated_at" "$(bv_upd)" "$UPD0"
+( PATH="$BV_D/bin:$PATH"; bd -C x update ga-fixture1 --set-metadata k=v -q )
+if [ "$(bv_upd)" != "$UPD0" ] && [ "$(bv_meta k)" = "v" ]; then ok "update --set-metadata advances updated_at and stores the value"; else bad "stub: update did not move updated_at / store k=v"; fi
+
+echo ""
+echo "── gate-fix 1, END TO END: the real hand-off, then the real sweep ──"
+# A story whose LAST write was 2 h ago (a builder comment, the Pilot dispatch). The gate passes it: the real
+# gap2_apply_pass_verdict runs against the stub. Then the real janitor sweeps, seconds later, with the
+# merge evidence already in origin/main. Before the fix: updated_at (2 h old) read as an old story -> the
+# janitor closed it as a BACKSTOP seconds after the gate passed it, with a false "never ran or crashed".
+bv_fixture 7200 "story:approved story:in-flight pilot:dispatched" - -
+bv_handoff
+case " $(bv_labels) " in *" gate:passed "*) ok "hand-off: the story wears gate:passed" ;; *) bad "hand-off: gate:passed missing (labels: $(bv_labels))" ;; esac
+case " $(bv_labels) " in *" story:in-flight "*) bad "hand-off: story:in-flight still there" ;; *) ok "hand-off: story:in-flight cleared" ;; esac
+HOP=$(bv_meta gate.passed_at)
+case "$HOP" in
+  ''|*[!0-9]*) bad "hand-off: no gate.passed_at stamp on the story (got [$HOP]) — nothing records WHEN the gate handed it off" ;;
+  *) if [ "$HOP" -ge $(( $(date +%s) - 60 )) ]; then ok "hand-off: gate.passed_at is the hand-off moment ($HOP)"; else bad "hand-off: gate.passed_at $HOP is not recent"; fi ;;
+esac
+bv_sweep -
+if bv_closed; then bad "the sweep CLOSED the story seconds after the gate passed it (hand-off left updated_at 2 h old) — the bug"; else ok "sweep seconds after the hand-off: story NOT closed"; fi
+if bv_backstop; then bad "...and it was labelled delivery:janitor-backstop"; else ok "...and not labelled as a backstop"; fi
+grep -qF 'gate-passed-awaiting-delivery-grace' "$BV_OUT" && ok "...the log says it is waiting for delivery" || bad "...the log does not say why it was kept"
+eq "...the stamped story needs no first-seen stamp from the janitor" "$(bv_meta gate.passed_seen_at)" ""
+bv_age_all 2000
+bv_sweep -
+if bv_closed && bv_backstop; then ok "2000 s after the hand-off (default grace 1800): closed as a BACKSTOP — the wait is a wait, not a veto"; else bad "2000 s after the hand-off: not closed as a backstop (closed=$(bv_closed && echo y || echo n), label=$(bv_backstop && echo y || echo n))"; fi
+
+echo ""
+echo "── gate-fix 1: a gate:passed story with NO stamp (handed off before this fix, or the stamp write failed) ──"
+bv_fixture 5000 "$PASSED" - -
+bv_sweep -
+if bv_closed; then bad "unstamped gate:passed story, updated_at 5000 s old: CLOSED on an age nobody measured"; else ok "unstamped, updated_at 5000 s old -> NOT closed (the clock starts when the janitor first sees it)"; fi
+SEEN=$(bv_meta gate.passed_seen_at)
+case "$SEEN" in ''|*[!0-9]*) bad "...the janitor wrote no gate.passed_seen_at (got [$SEEN])" ;; *) ok "...the janitor stamped gate.passed_seen_at=$SEEN" ;; esac
+grep -qF 'state=unstamped' "$BV_OUT" || grep -qF 'stamp-story ga-fixture1' "$BV_OUT" && ok "...and the log says it started the clock" || bad "...the log does not say the clock started"
+bv_sweep -
+if bv_closed; then bad "second sweep, seconds later: closed"; else ok "second sweep, seconds later -> still NOT closed"; fi
+eq "...and it does not re-stamp (the first sight is the start)" "$(bv_updates)" "0"
+bv_age_all 2000
+bv_sweep -
+if bv_closed && bv_backstop; then ok "2000 s after first sight: closed as a BACKSTOP"; else bad "2000 s after first sight: not closed as a backstop"; fi
+
+BV_DRY=1; bv_fixture 5000 "$PASSED" - -; bv_sweep -; BV_DRY=0
+if bv_closed; then bad "dry-run closed an unstamped story"; else ok "dry-run: unstamped story NOT closed"; fi
+eq "dry-run writes nothing to the story (no update call)" "$(bv_updates)" "0"
+eq "...no first-seen stamp stored"        "$(bv_meta gate.passed_seen_at)" ""
+grep -qF 'WOULD-STAMP-STORY ga-fixture1' "$BV_OUT" && ok "...the log says what it would have stamped" || bad "...dry-run is silent about the stamp"
+
+BV_UPDATE_FAILS=1; bv_fixture 5000 "$PASSED" - -; bv_sweep -; BV_UPDATE_FAILS=
+if bv_closed; then bad "stamp write failed (bd update refuses): the story was closed anyway"; else ok "first-seen stamp cannot be written -> story NOT closed (no clock = no close)"; fi
+grep -qF 'could not write gate.passed_seen_at' "$BV_OUT" && ok "...and the log says the stamp failed" || bad "...the failed stamp is invisible in the log"
+
+echo ""
+echo "── gate-fix 1: the sweep's story list failing is not invisible ──"
+BV_LIST_FAILS=1; bv_fixture 5000 "$PASSED" - -; bv_sweep -; BV_LIST_FAILS=
+if bv_closed; then bad "story list failed: a story was closed"; else ok "story list fails -> nothing closed"; fi
+grep -qF 'could not list open story:approved' "$BV_OUT" && ok "...and the log says the list failed" || bad "...a failed story list is silent in the log (looks like 'no stories')"
+
+echo ""
+echo "── gate-fix 1: the sweep against stamped fixtures ──"
+# The decisive pair: updated_at is OLD (5000 s), the hand-off stamp is NEW (60 s). Before the fix: closed.
+bv_run 5000 "$PASSED" 600 60
+if bv_closed; then bad "stamp 60 s old, updated_at 5000 s old, grace 600: CLOSED (counted from the unrelated earlier write)"; else ok "stamp 60 s old, updated_at 5000 s old, grace 600 -> NOT closed"; fi
+bv_run 5000 "$PASSED" 600 900
+if bv_closed && bv_backstop; then ok "stamp 900 s old, updated_at 5000 s old, grace 600 -> closed as a backstop"; else bad "stamp 900 s old, grace 600: not closed as a backstop"; fi
+bv_run 60 "$PASSED" 600 900
+if bv_closed; then bad "updated_at 60 s old, stamp 900 s old, grace 600: closed (a later write must postpone, never hasten)"; else ok "updated_at 60 s old, stamp 900 s old, grace 600 -> NOT closed (updated_at can only postpone)"; fi
+bv_run 5000 "$PASSED" 600 GARBAGE
+if bv_closed; then bad "unreadable hand-off stamp: closed"; else ok "garbage gate.passed_at -> NOT closed"; fi
+grep -qF 'state=unknown' "$BV_OUT" && ok "...the log names the unreadable state" || bad "...an unreadable stamp is kept silently"
+bv_run 5000 "$PASSED" 600 - 60
+if bv_closed; then bad "first-seen 60 s ago, grace 600: closed"; else ok "no hand-off stamp, first seen 60 s ago, grace 600 -> NOT closed"; fi
+bv_run 5000 "$PASSED" 600 - 900
+if bv_closed && bv_backstop; then ok "no hand-off stamp, first seen 900 s ago, grace 600 -> closed as a backstop"; else bad "first seen 900 s ago, grace 600: not closed as a backstop"; fi
+bv_run GARBAGE "$PASSED" 600 5000
+if bv_closed; then bad "unreadable updated_at with an old stamp: closed"; else ok "garbage updated_at + old stamp -> NOT closed (an unreadable row is not decided on)"; fi
+
+echo ""
+echo "── ga-botvu2: the REAL sweep, stubbed bd/gc + a real git fixture (the acceptance scenarios) ──"
 # The bead's own numbers (grace 600): 60 s -> the janitor leaves it; 900 s -> it closes it, marked.
 bv_run 60 "$PASSED" 600
 if bv_closed; then bad "approved+passed, 60 s old, grace 600: the janitor CLOSED the story before delivery (the bug)"; else ok "approved+passed, 60 s old, grace 600 -> NOT closed"; fi
@@ -1762,9 +1968,10 @@ bv_run 2000 "$PASSED" -
 if bv_closed && bv_backstop; then ok "default grace: 2000 s old -> closed as a backstop"; else bad "default grace: 2000 s old story not closed as a backstop (closed=$(bv_closed && echo y || echo n), label=$(bv_backstop && echo y || echo n))"; fi
 
 # Not gate-passed -> the story was never queued for delivery: unchanged behaviour, no backstop mark.
-bv_run 60 "story:approved" 600
+bv_run 60 "story:approved" 600 -
 if bv_closed; then ok "approved WITHOUT gate:passed + merge evidence, 60 s old -> closed as before"; else bad "approved without gate:passed no longer closes (regression of ga-gosfs)"; fi
 if bv_backstop; then bad "a story that was never gate-passed got the backstop label"; else ok "...and without the backstop label"; fi
+eq "...and the janitor wrote nothing to it that it would not have before (no stamp)" "$(bv_updates)" "0"
 
 # Delivery owns it -> kept at any age.
 bv_run 5000 "$PASSED delivery:running" 600

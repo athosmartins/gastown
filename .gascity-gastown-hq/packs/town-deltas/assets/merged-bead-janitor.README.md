@@ -129,15 +129,35 @@ The story sweep (ga-gosfs) closes `story:approved` stories whose code is in `ori
 gate just PASSED is exactly that — `story:approved` + `gate:passed`, merged, waiting for `story-delivery`
 to deploy and prod-test it — so the sweep used to close it as `story:done` before the deploy ever ran.
 
-Now a story carrying `gate:passed` is left alone for a **grace** counted from its last update
-(`updated_at`). The outcome has four states (`story_gate_passed_grace_state`):
+Now a story carrying `gate:passed` is left alone for a **grace** counted from the moment the gate **handed it
+off**. The outcome has five states (`story_gate_passed_grace_state`):
 
 | state | meaning | the sweep |
 |---|---|---|
 | `none` | no `gate:passed` — never queued for delivery | closes on merge evidence, as before |
-| `waiting` | `gate:passed`, younger than the grace | keeps it (`keep:gate-passed-awaiting-delivery-grace`) |
-| `elapsed` | `gate:passed`, older than the grace | closes it as a **backstop** |
-| `unknown` | `gate:passed` but the age can't be computed (`updated_at` empty/unparseable, clock skew, bad grace setting) | keeps it (`keep:gate-passed-grace-unreadable`) — never read as "old enough" |
+| `waiting` | `gate:passed`, handed off less than the grace ago | keeps it (`keep:gate-passed-awaiting-delivery-grace`) |
+| `elapsed` | `gate:passed`, handed off at least the grace ago | closes it as a **backstop** |
+| `unstamped` | `gate:passed` but nothing records when it was handed off | keeps it (`keep:gate-passed-grace-not-started`) and **starts the clock now** (below) |
+| `unknown` | `gate:passed` but the age can't be computed (`updated_at` or a stamp empty/unparseable/in the future, bad grace setting) | keeps it (`keep:gate-passed-grace-unreadable`) — never read as "old enough" |
+
+**The clock is not `updated_at`.** `bd label add/remove` and `bd comment` do **not** advance a bead's
+`updated_at` (only `bd update` does — measured on bd 1.1.0), and a hand-off is exactly label remove ×2, label add
+`gate:passed`, a comment. Counting from `updated_at` alone therefore counted from some earlier, unrelated write:
+the first sweep after the gate passed a story read it as old, closed it as a backstop seconds later, and wrote
+a false "never ran, crashed, or is stuck". So the hand-off **stamps** it:
+
+| key (bead metadata) | written by | meaning |
+|---|---|---|
+| `gate.passed_at` | `gate_passed_confirm` in `quality-gate-guard.sh`, right after it confirms `gate:passed` (read back, retried once) | the hand-off moment, epoch seconds |
+| `gate.passed_seen_at` | this janitor, the first sweep that sees a `gate:passed` story with no `gate.passed_at` (handed off before the stamp existed, or its write failed) — not in dry-run | the moment the wait started, epoch seconds |
+
+The clock is the **latest** of `updated_at`, `gate.passed_at` and `gate.passed_seen_at`: `updated_at` can only
+postpone the backstop, never hasten it. A stamp that is present but unreadable (or in the future) is `unknown`
+and does not fall back to the other one; a story with no stamp at all is never aged by a guess. If the
+janitor cannot write `gate.passed_seen_at`, it holds the story (`unknown`) and logs `could not write
+gate.passed_seen_at`. The keep line shows `updated_at`, `passed_at`, `seen_at`, the grace and the state.
+Proven end to end by the `gate-fix 1` sections of `merged-bead-janitor.selftest.sh`: the real hand-off code runs
+against a stub bd whose `updated_at` moves only on `update`, then the real sweep must hold the story.
 
 A **backstop** close is not a delivery: the story gets the label `delivery:janitor-backstop` (added before the
 close, so it survives a failed close), `story:done` as before (the painel and other consumers route on it),
@@ -155,7 +175,14 @@ The other half is the hand-off itself: a story handed off without `gate:passed` 
 (and, by the table above, closed on sight). The dispatcher's three hand-off writes and the guard's
 `gap2_apply_pass_verdict` used to write the label with `|| true`; they now call `gate_passed_confirm`
 (`quality-gate-guard.sh`), which reads the label back, rewrites it once, and — if it is still missing —
-comments on the bead with the hand fix. Proven by `gate-passed-confirm.selftest.sh`.
+comments on the bead with the hand fix (and says so on stderr, so a failed comment is not the end of the trail).
+Once the label is confirmed it also records `gate.passed_at` (above), read back and retried once; a stamp that
+cannot be written is recorded on the bead and does not change the result — the janitor holds an unstamped
+story rather than closing it. Proven by `gate-passed-confirm.selftest.sh`.
+
+The VM-hold write in `gate_merged_path_vm_gate` (ga-buac0o) also sets `gate:passed`, but on a bead that carries
+`delivery:pending-vm`, which the janitor already treats as delivery-owned; it does not stamp, and if the hold is
+later released the janitor stamps it at first sight.
 
 ## Operating
 

@@ -96,7 +96,8 @@ RIGS_FILTER="${JANITOR_RIGS:-}"
 # story-delivery to deploy and prod-test it, and merge evidence in origin/main is
 # present from the very first second — so without a wait the story sweep below closes
 # it as story:done before the deploy ever ran. The sweep leaves such a story alone for
-# this many seconds after its last update; past that, a delivery that never came is
+# this many seconds after the gate handed it off (the gate stamps gate.passed_at; see
+# story_gate_passed_grace_state for the clock); past that, a delivery that never came is
 # presumed stuck and the janitor closes it as an explicit BACKSTOP (label
 # delivery:janitor-backstop, close reason says deploy/prod-test were NOT verified).
 #
@@ -364,10 +365,12 @@ janitor_story_decide() {
   # ga-botvu2: a story the gate PASSED is waiting for story-delivery to deploy it; merge
   # evidence is present from second zero, so only a grace that has ELAPSED lets it through.
   # Allowlist, not denylist: `none` (no gate:passed — not waiting for delivery) and `elapsed`
-  # pass; `waiting`, `unknown` and anything else (an empty or garbled state included) keep.
+  # pass; `waiting`, `unstamped` (nothing records when the gate handed it off), `unknown` and anything
+  # else (an empty or garbled state included) keep.
   case "$gate_passed_grace" in
     none|elapsed) ;;
     waiting)      echo "keep:gate-passed-awaiting-delivery-grace"; return 0 ;;
+    unstamped)    echo "keep:gate-passed-grace-not-started"; return 0 ;;
     *)            echo "keep:gate-passed-grace-unreadable"; return 0 ;;
   esac
   # — Merge evidence (done) — same triangulation as janitor_decide —
@@ -415,32 +418,54 @@ story_labels_readable() {
 }
 
 # iso_epoch <timestamp> — echoes the epoch seconds of a UTC `…Z` timestamp (fractional
-# seconds tolerated), or NOTHING when it cannot. bd emits UTC `Z` timestamps.
-# vazio → nothing echoed (the caller sees "no timestamp"); falhou/ilegível (garbage, a
-# `+hh:mm` offset form, jq missing) → also nothing echoed — never a made-up 0 or "now",
+# seconds tolerated), or NOTHING when it cannot. bd emits UTC `Z` timestamps; `+00:00` is the
+# same instant spelled differently and is read too.
+# vazio → nothing echoed (the caller sees "no timestamp"); falhou/ilegível (garbage, any other
+# `±hh:mm` offset form, jq missing) → also nothing echoed — never a made-up 0 or "now",
 # which would read as "just updated" or "ancient". Callers must test the result for digits.
 iso_epoch() {
-  printf '%s' "$1" | jq -Rr 'sub("\\.[0-9]+Z$"; "Z") | (try fromdateiso8601 catch "") | tostring' 2>/dev/null || true
+  printf '%s' "$1" | jq -Rr 'sub("[+]00:00$"; "Z") | sub("\\.[0-9]+Z$"; "Z") | (try fromdateiso8601 catch "") | tostring' 2>/dev/null || true
+}
+
+# _stamp_epoch <value> <now_epoch> — echoes a metadata stamp as a plain epoch, or NOTHING when it is not
+# a number (digits only, at most 12 of them) or lies in the future. Leading zeros are decimal, not octal.
+_stamp_epoch() {
+  case "$1" in ''|*[!0-9]*) return 0 ;; esac
+  [ "${#1}" -le 12 ] || return 0
+  [ "$((10#$1))" -le "$2" ] || return 0
+  printf '%s' "$((10#$1))"
 }
 
 # story_gate_passed_grace_state <space-joined labels> <updated_at> <now_epoch> <grace_seconds>
-# — echoes none | waiting | elapsed | unknown (ga-botvu2): has the story that the gate PASSED
-# been waiting for story-delivery long enough that the janitor may stop waiting for it?
-#   none     no gate:passed label: the story is not queued for delivery, the wait does not apply
-#   waiting  gate:passed, last updated less than <grace_seconds> ago: delivery may still be coming
-#   elapsed  gate:passed, last updated at least <grace_seconds> ago: delivery is presumed stuck
-#   unknown  gate:passed, but the age cannot be computed (timestamp, clock or grace unreadable)
+#                               [<gate.passed_at epoch>] [<gate.passed_seen_at epoch>]
+# — echoes none | waiting | elapsed | unstamped | unknown (ga-botvu2): has the story that the gate
+# PASSED been waiting for story-delivery long enough that the janitor may stop waiting for it?
+#   none       no gate:passed label: the story is not queued for delivery, the wait does not apply
+#   waiting    gate:passed, handed off less than <grace_seconds> ago: delivery may still be coming
+#   elapsed    gate:passed, handed off at least <grace_seconds> ago: delivery is presumed stuck
+#   unstamped  gate:passed, but nothing records WHEN it was handed off: the clock has not started
+#   unknown    gate:passed, but the age cannot be computed (timestamp, stamp, clock or grace unreadable)
+# THE CLOCK. bd's `updated_at` is NOT when gate:passed was written: `bd label add/remove` and
+# `bd comment` do not advance it (only `bd update` does — measured on bd 1.1.0), and the hand-off is
+# exactly label remove x2, label add gate:passed, a comment. So updated_at stays at some earlier,
+# unrelated write, and counting from it closed a story seconds after the gate passed it. The hand-off
+# therefore STAMPS gate.passed_at (epoch, quality-gate-guard.sh: gate_passed_confirm), and the clock is the
+# LATEST of updated_at, gate.passed_at and gate.passed_seen_at (the janitor's own stamp, written the first
+# time it sees a gate:passed story that has no hand-off stamp — a story handed off before the stamp
+# existed, or whose stamp write failed). updated_at can therefore only POSTPONE the backstop, never
+# hasten it: a later write (a comment-plus-update, a label sync) is not delivery, but waiting a little
+# longer is the inert direction.
 # vazio → an empty label list or no gate:passed on it is `none` (the sweep has already refused rows
 # whose labels it could not read: story_labels_readable); an empty updated_at is `unknown`, NOT
-# `elapsed`. falhou/ilegível → `unknown`, which janitor_story_decide keeps exactly like `waiting`
-# (the inert outcome: the story stays open and the next sweep asks again) — an unreadable age
-# must never be read as "old enough", the same fail-closed rule as story_labels_readable.
-# A timestamp in the future (clock skew) is `unknown` as well. The clock is `updated_at`, the last
-# write to the bead. It is never EARLIER than the write of gate:passed (the handoff keeps writing
-# after it: hygiene labels, a comment, the builder clear), so the age measured here is never longer
-# than the real wait — a later write (a comment, a label) only postpones the backstop, never hastens it.
+# `elapsed`; both stamps empty is `unstamped`, NOT `elapsed` and NOT `waiting` (the sweep stamps the
+# first sight and keeps the story). falhou/ilegível → `unknown`, which janitor_story_decide keeps exactly
+# like `waiting` (the inert outcome: the story stays open and the next sweep asks again) — an unreadable
+# age must never be read as "old enough", the same fail-closed rule as story_labels_readable. A stamp
+# that is there but unreadable is `unknown` too and does NOT fall back to the other stamp; a timestamp
+# or stamp in the future (clock skew) is `unknown`; a good stamp does not rescue an unreadable updated_at
+# (a row that cannot be read is not decided on).
 story_gate_passed_grace_state() {
-  local labels="$1" updated_at="$2" now="$3" grace="$4" upd
+  local labels="$1" updated_at="$2" now="$3" grace="$4" passed_at="${5-}" seen_at="${6-}" upd clock p="" sn=""
   case " $labels " in
     *" gate:passed "*) ;;
     *) echo none; return 0 ;;
@@ -450,7 +475,19 @@ story_gate_passed_grace_state() {
   upd=$(iso_epoch "$updated_at")
   case "$upd" in ''|*[!0-9]*) echo unknown; return 0 ;; esac
   [ "$upd" -le "$now" ] || { echo unknown; return 0; }
-  if [ $((now - upd)) -ge "$grace" ]; then echo elapsed; else echo waiting; fi
+  clock="$upd"
+  if [ -n "$passed_at" ]; then
+    p=$(_stamp_epoch "$passed_at" "$now")
+    [ -n "$p" ] || { echo unknown; return 0; }
+    [ "$p" -le "$clock" ] || clock="$p"
+  fi
+  if [ -n "$seen_at" ]; then
+    sn=$(_stamp_epoch "$seen_at" "$now")
+    [ -n "$sn" ] || { echo unknown; return 0; }
+    [ "$sn" -le "$clock" ] || clock="$sn"
+  fi
+  if [ -z "$p" ] && [ -z "$sn" ]; then echo unstamped; return 0; fi
+  if [ $((now - clock)) -ge "$grace" ]; then echo elapsed; else echo waiting; fi
 }
 
 # ga-v8ui5 (gate-feedback follow-up): is a janitor_decide/janitor_story_decide
@@ -1590,7 +1627,11 @@ EOF
   # --limit 0: every approved story, not bd's default first 50 — a story past the cutoff would never
   # age through its grace. vazio → no stories to reconcile; falhou/ilegível → also `[]`: the inert
   # outcome (no row is decided on, nothing is closed, the next sweep asks again).
-  STORIES=$(bd -C "$RPATH" list --status open --limit 0 --json -l story:approved 2>/dev/null || echo '[]')
+  # falhou is said out loud (warn): a failed list and an empty one both end in `[]`, and only one of them is quiet.
+  if ! STORIES=$(bd -C "$RPATH" list --status open --limit 0 --json -l story:approved 2>/dev/null); then
+    warn "rig $RNAME ($RPREFIX): could not list open story:approved beads — no story is reconciled this sweep (ga-botvu2)"
+    STORIES='[]'
+  fi
   [ -z "$STORIES" ] && STORIES='[]'
   SN=$(printf '%s' "$STORIES" | jq 'length' 2>/dev/null || echo 0)
   [ "$SN" = "0" ] || log "rig $RNAME ($RPREFIX): $SN open story:approved bead(s) to check for story:done reconciliation"
@@ -1623,11 +1664,33 @@ EOF
 
     # ga-botvu2: a story the gate PASSED but delivery has not touched yet carries NONE of the
     # delivery:* labels above, yet is queued for story-delivery. How long it has waited decides
-    # whether the janitor may stop waiting. vazio → updated_at "" is `unknown`, not `elapsed`;
-    # falhou/ilegível → `unknown` too, and so does an empty S_GRACE (the helper crashed): both
-    # land in the keep branch of janitor_story_decide, never in a close.
+    # whether the janitor may stop waiting. The clock is the hand-off stamp the gate wrote
+    # (gate.passed_at), NOT updated_at alone — label/comment writes do not advance updated_at
+    # (see story_gate_passed_grace_state). vazio → updated_at "" is `unknown`, not `elapsed`, and no
+    # stamp at all is `unstamped`, not `elapsed`; falhou/ilegível → `unknown` too, and so does an
+    # empty S_GRACE (the helper crashed): all of them land in the keep branch of
+    # janitor_story_decide, never in a close.
     S_UPDATED=$(printf '%s' "$s" | jq -r '.updated_at // ""' 2>/dev/null || true)
-    S_GRACE=$(story_gate_passed_grace_state "$SLABELS" "$S_UPDATED" "$(date +%s)" "$STORY_DELIVERY_GRACE_SECONDS")
+    S_PASSED_AT=$(printf '%s' "$s" | jq -r '(.metadata // {}) | (.["gate.passed_at"] // "") | tostring' 2>/dev/null || true)
+    S_SEEN_AT=$(printf '%s' "$s" | jq -r '(.metadata // {}) | (.["gate.passed_seen_at"] // "") | tostring' 2>/dev/null || true)
+    S_NOW=$(date +%s)
+    S_GRACE=$(story_gate_passed_grace_state "$SLABELS" "$S_UPDATED" "$S_NOW" "$STORY_DELIVERY_GRACE_SECONDS" "$S_PASSED_AT" "$S_SEEN_AT")
+    if [ "$S_GRACE" = "unstamped" ]; then
+      # Nothing records when the gate handed this story off (handed off before the stamp existed, or its
+      # stamp write failed). Keep it, and start the wait HERE, at the first sweep that sees it: written
+      # once, read back by every later sweep. Not in dry-run (no writes). A stamp that cannot be written
+      # leaves no clock, so the story is held (unknown) rather than aged by a guess.
+      if [ "$DRY_RUN" = "1" ]; then
+        log "WOULD-STAMP-STORY $SID ($RNAME) — gate:passed with no gate.passed_at: would write gate.passed_seen_at=$S_NOW so the delivery wait starts now"
+      elif bd -C "$RPATH" update "$SID" --set-metadata "gate.passed_seen_at=$S_NOW" -q 2>/dev/null; then
+        S_SEEN_AT="$S_NOW"
+        S_GRACE=$(story_gate_passed_grace_state "$SLABELS" "$S_UPDATED" "$S_NOW" "$STORY_DELIVERY_GRACE_SECONDS" "$S_PASSED_AT" "$S_SEEN_AT")
+        log "stamp-story $SID ($RNAME) — gate:passed with no gate.passed_at: the delivery wait starts now (gate.passed_seen_at=$S_NOW)"
+      else
+        warn "could not write gate.passed_seen_at on $SID ($RNAME) — holding the story: with no clock it cannot be aged by a guess"
+        S_GRACE=unknown
+      fi
+    fi
     S_GRACE_OPEN=0; case "$S_GRACE" in none|elapsed) S_GRACE_OPEN=1 ;; esac
 
     # Markers (HQ-resident, regardless of which store the bead lives in).
@@ -1786,7 +1849,7 @@ EOF
         if bd -C "$RPATH" close "$SID" -r "$JCLOSE_MSG" 2>/dev/null; then
           if [ "$S_BACKSTOP" = "1" ]; then
             log "DONE-BACKSTOP $SID ($RNAME) — $S_EVID — gate:passed, no delivery within ${STORY_DELIVERY_GRACE_SECONDS}s, deploy NOT verified"
-            bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-botvu2 backstop): code is in origin/main — $S_EVID — and the gate PASSED this story, but story-delivery did not complete it within ${STORY_DELIVERY_GRACE_SECONDS}s (no delivery:tested / story:done from delivery; it never ran, crashed, or is stuck). Closed as a BACKSTOP so it does not sit in Aprovadas forever. THIS IS NOT A VERIFIED DELIVERY: deploy and prod-test did not run to completion. Check the deployed state yourself. Marked delivery:janitor-backstop; story:done added, story:approved removed." 2>/dev/null || true
+            bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-botvu2 backstop): code is in origin/main — $S_EVID — and the gate PASSED this story, but story-delivery did not complete it within ${STORY_DELIVERY_GRACE_SECONDS}s of the gate handing it off (gate.passed_at, or the janitor's first sight of the label when the hand-off left no stamp: gate.passed_seen_at) — no delivery:tested / story:done from delivery; it never ran, crashed, or is stuck. Closed as a BACKSTOP so it does not sit in Aprovadas forever. THIS IS NOT A VERIFIED DELIVERY: deploy and prod-test did not run to completion. Check the deployed state yourself. Marked delivery:janitor-backstop; story:done added, story:approved removed." 2>/dev/null || true
           else
             log "DONE $SID ($RNAME) — $S_EVID"
             bd -C "$RPATH" comment "$SID" "merged-bead-janitor ($SOURCE_BEAD, ga-gosfs story:done reconciliation): code is in origin/main — $S_EVID — but the story was stranded story:approved (gate→delivery→done did not complete: cross-store gate:passed, superseded path, rig-store delivery never scanned, or a delivery crash). Driven to durable terminal: story:done added, story:approved removed (exits Aprovadas), bead closed (painel Done via delivery close_reason). Mirrors story-delivery ga-i53ua." 2>/dev/null || true
@@ -1807,9 +1870,9 @@ EOF
       S_KEEP_MSG="keep-story $SID ($RNAME) — $S_REASON"
       [ -n "$S_COMMIT_EVID" ] && S_KEEP_MSG="$S_KEEP_MSG [$S_COMMIT_EVID]"
       # ga-botvu2: say WHY a gate-passed story is held and for how long, so a story that stays
-      # open past the grace (unreadable updated_at, say) is visible in the log, not just silent.
+      # open past the grace (unreadable updated_at or stamp, say) is visible in the log, not just silent.
       case "$S_REASON" in
-        gate-passed-*) S_KEEP_MSG="$S_KEEP_MSG [updated_at=${S_UPDATED:-<none>} grace=${STORY_DELIVERY_GRACE_SECONDS}s state=${S_GRACE:-<none>}]" ;;
+        gate-passed-*) S_KEEP_MSG="$S_KEEP_MSG [updated_at=${S_UPDATED:-<none>} passed_at=${S_PASSED_AT:-<none>} seen_at=${S_SEEN_AT:-<none>} grace=${STORY_DELIVERY_GRACE_SECONDS}s state=${S_GRACE:-<none>}]" ;;
       esac
       log "$S_KEEP_MSG"
       # Orphan-close backstop: a bead that already has story:done (from a prior

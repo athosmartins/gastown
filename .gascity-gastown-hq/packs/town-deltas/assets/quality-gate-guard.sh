@@ -1675,22 +1675,63 @@ _gate_passed_on_bead() {
   return 1
 }
 
+# _gate_passed_stamp_read <gc_city> <bead_id> — echoes the bead's gate.passed_at metadata, READ NOW.
+# vazio → no stamp (or no metadata): nothing echoed. falhou/ilegível → `bd show` errors, or its output is
+# not JSON jq can read: nothing echoed as well — the caller sees "not confirmed", never a made-up value.
+_gate_passed_stamp_read() {
+  bd -C "$1" show "$2" --json 2>/dev/null \
+    | jq -r '(if type=="array" then .[0] else . end) | ((.metadata // {})["gate.passed_at"] // "") | tostring' 2>/dev/null || true
+}
+
+# _gate_passed_stamp <gc_city> <bead_id> — ga-botvu2 (gate-fix 1): record WHEN the gate handed the story
+# off, as `gate.passed_at=<epoch>` in the bead's metadata, READ IT BACK, retry once. merged-bead-janitor
+# starts its delivery grace at this moment. bd's own `updated_at` cannot stand in for it: `bd label
+# add/remove` and `bd comment` do not advance it (only `bd update` does), so the hand-off — label
+# remove x2, label add gate:passed, a comment — leaves it at some earlier, unrelated write, and a
+# janitor sweep seconds after the gate passed the story read that as an old story and closed it as done.
+# rc0 iff the value just written was READ back. Not confirmed → the old stamp (if any) is unset — it must
+# not stand for this hand-off — and the failure is left on the bead and on stderr; rc1. The janitor treats
+# a gate:passed story with no stamp as "unknown, keep": it starts the wait itself at first sight.
+_gate_passed_stamp() {
+  local city="$1" id="$2" now got try
+  for try in 1 2; do
+    now=$(date +%s)
+    bd -C "$city" update "$id" --set-metadata "gate.passed_at=$now" -q 2>/dev/null || true
+    got=$(_gate_passed_stamp_read "$city" "$id")
+    if [ "$got" = "$now" ]; then return 0; fi
+  done
+  bd -C "$city" update "$id" --unset-metadata "gate.passed_at" -q 2>/dev/null || true
+  bd -C "$city" comment "$id" "ga-botvu2: the quality gate PASSED this bead and gate:passed is on it, but the hand-off moment (gate.passed_at) could NOT be recorded, even after a second write. merged-bead-janitor will not close the story on that account: with no stamp it starts its delivery wait the first time it sees the label (gate.passed_seen_at), so the story is held at least one full grace after that." 2>/dev/null || true
+  echo "gate_passed_confirm: could not record gate.passed_at on $id after a second write — the janitor will start its delivery wait at first sight instead" >&2
+  return 1
+}
+
 # gate_passed_confirm <gc_city> <bead_id> — ga-botvu2: READ BACK the gate:passed a hand-off just
 # wrote. Every hand-off writes it as `bd label add … "gate:passed" -q 2>/dev/null || true`, which
 # swallows every failure; a story handed off WITHOUT it is invisible to story-delivery (whose
 # selector is story:approved + gate:passed) and merged-bead-janitor, reading "no gate:passed" as
-# "never queued for delivery", closes it as done on the spot. So: label present → rc0; missing →
-# write it once more and read again; still missing → leave a comment on the bead saying so and
-# return 1. rc0 iff the label was READ on the bead, never on the strength of the write's own rc.
-# Silent on stdout/stderr — lib-region code, log()/warn() are defined below the GATE_GUARD_LIB_ONLY
-# cutoff — so the durable record is that bead comment. Callers `|| true`: the hand-off carries on.
+# "never queued for delivery", closes it as done on the spot. So: label present → carry on; missing →
+# write it once more and read again; still missing → leave a comment on the bead saying so, a line on
+# stderr, and return 1. rc0 iff the label was READ on the bead, never on the strength of the write's own rc.
+# Once the label is confirmed the hand-off moment is STAMPED too (_gate_passed_stamp: gate.passed_at, the
+# janitor's grace clock); a stamp that cannot be written is recorded there and does NOT change the rc —
+# the label is what story-delivery needs, and the janitor holds an unstamped story rather than closing it.
+# No stamp when the label is unconfirmed: a stamp on a bead without gate:passed would outlive a label
+# added by hand later and read as an old hand-off.
+# Lib-region code: log()/warn() are defined below the GATE_GUARD_LIB_ONLY cutoff, hence the plain
+# `echo … >&2` next to the durable record (the bead comment). Callers `|| true`: the hand-off carries on.
 gate_passed_confirm() {
   local city="$1" id="$2"
-  if _gate_passed_on_bead "$city" "$id"; then return 0; fi
-  bd -C "$city" label add "$id" "gate:passed" -q 2>/dev/null || true
-  if _gate_passed_on_bead "$city" "$id"; then return 0; fi
-  bd -C "$city" comment "$id" "ga-botvu2: the quality gate PASSED this bead but could NOT confirm gate:passed on it, even after a second write — the label is missing or unreadable. story-delivery selects story:approved + gate:passed, so it will not deploy this story until the label is added by hand (bd label add $id gate:passed). merged-bead-janitor will not hold it for delivery either." 2>/dev/null || true
-  return 1
+  if ! _gate_passed_on_bead "$city" "$id"; then
+    bd -C "$city" label add "$id" "gate:passed" -q 2>/dev/null || true
+    if ! _gate_passed_on_bead "$city" "$id"; then
+      bd -C "$city" comment "$id" "ga-botvu2: the quality gate PASSED this bead but could NOT confirm gate:passed on it, even after a second write — the label is missing or unreadable. story-delivery selects story:approved + gate:passed, so it will not deploy this story until the label is added by hand (bd label add $id gate:passed). merged-bead-janitor will not hold it for delivery either." 2>/dev/null || true
+      echo "gate_passed_confirm: the gate PASSED $id but gate:passed could not be confirmed on it after a second write — add it by hand: bd label add $id gate:passed" >&2
+      return 1
+    fi
+  fi
+  _gate_passed_stamp "$city" "$id" || true
+  return 0
 }
 
 # gap2_apply_pass_verdict <bead_id> <sling_id> <is_story_approved> <verdict> —
