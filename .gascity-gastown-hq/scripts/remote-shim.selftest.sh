@@ -64,7 +64,7 @@ allowed 'gc handoff --auto "context cycle" (a forma que o hook REAL manda)' gc h
 allowed "gc nudge drain --inject (decisão do Mayor)" gc nudge drain --inject; lastis "argv=[nudge][drain][--inject]"; ok $? "  argv canônico"
 allowed "gate-done (executável configurado)" gate-done; lastis "gatedone	cwd=$CITY"; ok $? "  roda o gatedone da config, na cidade"
 call bd close ga-1 --reason FAIL7; [ "$RC" = 7 ] && has "$T/err" "fake-err"; ok $? "o código de saída (7) e o stderr do comando passam adiante"
-call gc mail check --inject; [ ! -e "$T/PWNED-bashenv" ] && [ ! -e "$T/PWNED-pythonpath" ]; ok $? "higiene: BASH_ENV e PYTHONPATH do ambiente de entrada não executaram nada"
+b=$(calls); call gc mail check --inject; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && [ ! -e "$T/PWNED-bashenv" ] && [ ! -e "$T/PWNED-pythonpath" ]; ok $? "higiene: o comando RODOU e BASH_ENV e PYTHONPATH do ambiente de entrada não executaram nada (sem o 'rodou', um pedido recusado também deixaria os arquivos sem nascer)"
 lastis "bashenv=UNSET	ld=UNSET	citypath=UNSET	pypath=UNSET"; ok $? "higiene: BASH_ENV, LD_PRELOAD, GC_CITY_PATH e PYTHONPATH não chegam ao filho"
 
 echo "== lista: o que NÃO roda (77 + motivo + o bd/gc falso não é chamado)"
@@ -145,6 +145,9 @@ denied "gc session nudge com C1 (CSI 8 bits)" "fora do formato" gc session nudge
 denied "gc session nudge com TAB (autocompletar no terminal do destino)" "fora do formato" gc session nudge gastown.mayor $'a\tb'
 denied "gc session nudge com U+2028 (separador de linha Unicode)" "fora do formato" gc session nudge gastown.mayor $'a\xe2\x80\xa8b'
 denied "gc session nudge com U+202E (inversão bidi: o texto exibido não é o digitado)" "fora do formato" gc session nudge gastown.mayor $'a\xe2\x80\xaeb'
+denied "gc session nudge com U+200E (LRM: marca de direção, reordena o que se vê)" "fora do formato" gc session nudge gastown.mayor $'a\xe2\x80\x8eb'
+denied "gc session nudge com U+200F (RLM)" "fora do formato" gc session nudge gastown.mayor $'a\xe2\x80\x8fb'
+denied "gc session nudge com U+061C (ALM)" "fora do formato" gc session nudge gastown.mayor $'a\xd8\x9cb'
 allowed "controle: pontuação e acento comuns (travessão U+2014 incluído) passam" gc session nudge gastown.mayor 'olá — ação: ok (v2)'
 denied "gc session nudge --delivery inventado" "fora do formato" gc session nudge mayor x --delivery now
 denied "gc session nudge --delivery immediate" "fora do formato" gc session nudge gastown.mayor oi --delivery immediate
@@ -165,6 +168,13 @@ denied "ferramenta sh" "comando fora da lista" sh -c id
 denied "ferramenta ssh" "comando fora da lista" ssh outro
 denied "gate-done com flag" "flag fora da lista" gate-done --bead ga-1
 denied "gate-done com argumento" "argumento a mais" gate-done ga-1
+# um `--` sem nada depois não é "forma EXATA": o executável receberia argc=1 argv=[--] (o gate-done é um script, não um cobra)
+denied "gate-done --" "sem nada depois" gate-done --
+denied "gc handoff --auto --" "sem nada depois" gc handoff --auto --
+denied "gc prime --hook --" "sem nada depois" gc prime --hook --
+denied "gc nudge drain --inject --" "sem nada depois" gc nudge drain --inject --
+denied "bd show <id> --" "sem nada depois" bd show ga-1 --
+allowed "controle: o -- COM algo depois continua valendo (bd show -- <id>)" bd show -- ga-1; lastis "argv=[show][--][ga-1]"; ok $? "  argv na ordem do cliente"
 
 echo "== protocolo, identidade e config"
 badreq "pedido vazio" "sem comando" ""
@@ -248,8 +258,8 @@ gone() {  # gone ARQUIVO-DE-PID → 0 se o processo sumiu (ou virou zumbi) em at
   return 1
 }
 gone "$FB/sleep.pid"; ok $? "o timeout mata o GRUPO (o neto 'sleep 37' não sobrevive)"
-call bd comment ga-1 'SEGREDO-4711 texto do comentário'
-! grep -q 'SEGREDO-4711' "$LOGF"; ok $? "o log de auditoria não guarda o texto do argumento"
+b=$(calls); call bd comment ga-1 'SEGREDO-4711 texto do comentário'
+[ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && ! grep -q 'SEGREDO-4711' "$LOGF"; ok $? "o comando RODOU e o log de auditoria não guarda o texto do argumento (sem o 'rodou', uma recusa também não o guardaria: apagada a regra do bd comment, só o grep passava)"
 has "$LOGF" "203.0.113.9"; ok $? "o log guarda o ip do cliente (SSH_CLIENT)"
 has "$LOGF" "gastown.dog-1	ok	bd [-C <rig>] close <id> [--json] [--reason|-r <text>]"; ok $? "o log guarda alias, veredito e a regra"
 grep -P '\tok\t' "$LOGF" >/dev/null 2>&1 || grep -E "$(printf '\t')ok$(printf '\t')" "$LOGF" >/dev/null; ok $? "o log tem linhas 'ok' (gravadas ANTES de executar)"
@@ -306,11 +316,12 @@ def zombie(pid):  # espera o filho virar zumbi (saiu, ainda não reapado) SEM re
             return
         time.sleep(0.02)
     raise RuntimeError("o filho não virou zumbi")
-real_wait, state = subprocess.Popen.wait, []
+real_wait, state, target = subprocess.Popen.wait, [], []  # target: o filho que o wrapper espera (não o `ps` do zombie(), cujo subprocess.run também termina com um poll())
 def wait(self, timeout=None):
     if timeout is not None and not state:
         state.append(1)
-        if mode == "race":  # o filho SAIU (ainda zumbi) e o wait diz que o prazo estourou: o fim do filho corre com o timeout
+        if mode in ("race", "race2"):  # o filho SAIU (ainda zumbi) e o wait diz que o prazo estourou: o fim do filho corre com o timeout
+            target.append(self.pid)
             zombie(self.pid)
             raise subprocess.TimeoutExpired(self.args, timeout)
         if mode in ("boom", "boomnokill"):  # o próprio wrapper falha DEPOIS de o comando ter rodado
@@ -319,8 +330,26 @@ def wait(self, timeout=None):
         if mode == "termnokill":  # o sinal chega com o filho já criado
             os.kill(os.getpid(), signal.SIGTERM)
     return real_wait(self, timeout)
-if mode in ("race", "boom", "boomnokill", "termnokill"):
+if mode in ("race", "race2", "boom", "boomnokill", "termnokill"):
     subprocess.Popen.wait = wait
+if mode == "race2":  # a janela de microssegundos entre o poll depois do prazo e o kill: o poll ainda vê o filho vivo, e quando o kill chega ele já saiu com o código DELE
+    real_poll, polls = subprocess.Popen.poll, []
+    def poll(self):
+        if target and self.pid == target[0] and not polls:  # só a 1ª olhada DO WRAPPER no filho que ele espera (o poll() que o subprocess.run do `ps` faz não pode gastá-la: foi o que fez este caso passar vazio no wrapper antigo)
+            polls.append(1)
+            return None
+        return real_poll(self)
+    subprocess.Popen.poll = poll
+if mode == "termpopen":  # o sinal chega DENTRO do Popen: o filho já foi criado (e já trabalha), mas o Popen ainda não devolveu o handle a quem o chamou
+    real_init = subprocess.Popen.__init__
+    def init(self, *a, **k):
+        real_init(self, *a, **k)
+        for _ in range(300):  # espera o filho de verdade começar (o falso grava o pid do neto): um sinal antes disso não prova nada
+            if os.path.exists(sys.argv[4]) and os.path.getsize(sys.argv[4]) > 0:
+                break
+            time.sleep(0.1)
+        os.kill(os.getpid(), signal.SIGTERM)
+    subprocess.Popen.__init__ = init
 if mode in ("boomnokill", "termnokill"):  # o kill do grupo LEVANTA (EPERM com o filho vivo): "não consegui encerrar" não pode virar "encerrado"
     def kill(p): raise PermissionError(1, "Operation not permitted")
     m.kill_group = kill
@@ -333,13 +362,16 @@ elif mode == "internal":  # erro que o wrapper não previu, ANTES de o comando c
 sys.exit(m.main(["serve", "--config", sys.argv[3]]))
 EOF2
 harness() {  # harness MODO "<SSH_ORIGINAL_COMMAND>" → RC, $T/out, $T/err
-  env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin SSH_CLIENT="203.0.113.9 5555 22" SSH_ORIGINAL_COMMAND="$2" python3 -I "$T/race.py" "$W" "$1" "$CONF" > "$T/out" 2> "$T/err" < /dev/null
+  env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin SSH_CLIENT="203.0.113.9 5555 22" SSH_ORIGINAL_COMMAND="$2" python3 -I "$T/race.py" "$W" "$1" "$CONF" "$FB/sleep.pid" > "$T/out" 2> "$T/err" < /dev/null
   RC=$?
 }
 lastlog() { tail -1 "$LOGF" | grep -qF -- "$1"; }
 b=$(calls); harness race "$REQ_OK"
 [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && ! has "$T/err" "RECUSADO" && ! has "$T/err" "passou de"; ok $? "corrida fim-do-filho × prazo: o filho TERMINOU, vale o código dele (0) — nunca 'RECUSADO' (o falso rodou) nem 'estourou o prazo'"
 lastlog "done rc=0"; ok $? "  e o log fecha com o desfecho real"
+b=$(calls); harness race2 "$REQ_OK"
+[ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && ! has "$T/err" "passou de" && ! has "$T/err" "RECUSADO"; ok $? "corrida fim-do-filho × kill (o poll ainda o vê vivo, e ele sai com o código DELE antes do kill chegar): vale o código dele (0), não 124 'passou do prazo'"
+lastlog "done rc=0"; ok $? "  e o log fecha com o código real, não com 124"
 b=$(calls); harness boom "$REQ_OK"
 [ "$RC" = 125 ] && [ "$(calls)" = $((b+1)) ] && has "$T/err" "INICIADO" && ! has "$T/err" "RECUSADO"; ok $? "falha do wrapper DEPOIS de o comando ter rodado: 125 e 'INICIADO' (o falso rodou) — nunca 77/'RECUSADO', que o cliente leria como 'nada executou' e repetiria"
 lastlog "done unknown"; ok $? "  e o log fecha com 'done unknown' (a linha 'ok' sozinha, lida como 'rodou', não fica sem desfecho)"
@@ -352,6 +384,10 @@ b=$(calls); harness termnokill "$REQ_OK"
 for _ in $(seq 1 200); do [ "$(calls)" -gt "$b" ] && break; sleep 0.1; done
 [ "$RC" = 143 ] && [ "$(calls)" = $((b+1)) ]; ok $? "SIGTERM com o filho criado: sai 143 mesmo se o kill do grupo levantar (e o filho que ficou vivo terminou a sua chamada)"
 lastlog "done killed sig=15 filho-nao-encerrado"; ok $? "  e o log diz 'filho-nao-encerrado', não 'filho-encerrado' (o handler não afirma o que não conseguiu)"
+rm -f "$FB/sleep.pid"; b=$(calls); harness termpopen "$(rq bd "$ID" close ga-1 --reason SLEEP)"
+[ "$RC" = 143 ] && [ "$(calls)" = $((b+1)) ]; ok $? "SIGTERM DENTRO do Popen (o filho já roda, o Popen ainda não devolveu o handle): sai 143 e o comando tinha mesmo começado"
+lastlog "done killed sig=15 filho-encerrado" && ! lastlog "sem-filho-registrado"; ok $? "  e o log diz 'filho-encerrado' (o sinal esperou o filho ser registrado e aí o encerrou), nunca 'sem-filho-registrado' com o comando rodando"
+gone "$FB/sleep.pid"; ok $? "  e o filho (o neto 'sleep 37') não sobrevive: antes o handler saía sem matar nada e o comando rodava até o fim com o cliente já longe"
 b=$(calls); harness nopopen "$REQ_OK"
 [ "$RC" = 126 ] && [ "$(calls)" = "$b" ] && has "$T/err" "não consegui executar"; ok $? "Popen que falha: 126 e o falso NÃO rodou"
 lastlog "done rc=126"; ok $? "  e o log tem o desfecho (126, nao-iniciado): sem ele o 'ok' lido sozinho diria 'rodou'"
@@ -366,13 +402,15 @@ kill -TERM "$WPID"; wait "$WPID"; RC=$?
 [ "$RC" = 143 ]; ok $? "SIGTERM no wrapper (o cliente ssh foi embora): sai 143"
 lastlog "done killed sig=15 filho-encerrado"; ok $? "  e o log fecha com 'done killed sig=15 filho-encerrado' (o 'ok' não fica sem desfecho)"
 gone "$FB/sleep.pid"; ok $? "  e o filho (o neto 'sleep 37') não sobrevive ao wrapper"
+b=$(calls); call bd show ga-1; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "pedido para parear as duas linhas de auditoria rodou"
+tail -2 "$LOGF" | awk -F'\t' 'NR==1 {o = $4; oh = $6; ots = $1} NR==2 {d = $4; dh = $7; dts = $1} END {exit !(o == "ok" && d ~ /^done / && oh != "" && oh == dh && ots == dts)}'; ok $? "as linhas 'ok' e 'done' do mesmo pedido levam o MESMO ts e a MESMA hash do argv (é como duas chamadas simultâneas do mesmo alias e regra se pareiam)"
 call bd sql "select 1"; lastlog "declarado=gastown.dog-1	refused"; ok $? "linha de recusa de um pedido que decodificou leva o alias que ele DECLAROU (declarado=…), não '?'"
 wrap "$(rq bd '{}' show ga-1)"; lastlog "sem-alias	refused"; ok $? "  pedido que decodificou e não trouxe alias: 'sem-alias' (≠ '?', que é 'nem decodificou')"
 wrap 'rs1 A'; lastlog "?	refused"; ok $? "  pedido que nem decodificou: '?'"
 logclean() {  # a última linha do log não tem controle C0/C1 (fora o TAB entre campos), separador de linha Unicode nem bidi: o que o cliente declara não reescreve um log lido no terminal
-  tail -1 "$LOGF" | python3 -I -c 'import re, sys; l = sys.stdin.read(); sys.exit(1 if re.search(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]", l.rstrip("\n")) else 0)'
+  tail -1 "$LOGF" | python3 -I -c 'import re, sys; l = sys.stdin.read(); sys.exit(1 if re.search(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]", l.rstrip("\n")) else 0)'
 }
-wrap "$(rq bd "$(python3 -I -c 'import json; print(json.dumps({"GC_ALIAS": "gastown.dog-1\u001b[31m\u202e\nFAKE"}))')" show ga-1)"
+wrap "$(rq bd "$(python3 -I -c 'import json; print(json.dumps({"GC_ALIAS": "gastown.dog-1\u001b[31m\u202e\u200e\u200f\u061c\nFAKE"}))')" show ga-1)"
 lastlog "declarado=gastown.dog-1" && lastlog "FAKE" && logclean; ok $? "alias DECLARADO com ESC, bidi e quebra de linha: a linha de recusa o leva sem nenhum deles (nem parte o registro em dois)"
 call bd $'\x1b]0;evil\x07x'; lastlog "comando fora da lista" && logclean; ok $? "argumento com ESC/BEL no motivo da recusa: o log não o leva cru"
 
@@ -380,8 +418,13 @@ echo "== authorized-line"
 line=$(python3 -I "$W" authorized-line --config "$CONF" --pubkey "$KD/user_key.pub" --from "127.0.0.1,10.0.0.0/8"); RC=$?
 [ "$RC" = 0 ] && [ "$(printf '%s\n' "$line" | wc -l | tr -d ' ')" = 1 ]; ok $? "imprime UMA linha"
 case "$line" in restrict,from=\"127.0.0.1,10.0.0.0/8\",command=\"*\ -I\ *serve\ --config\ *\"\ ssh-ed25519\ AAAA*\ remote-shim-hetzner) true;; *) false;; esac; ok $? "forma: restrict, from=, command=\"<python> -I <wrapper> serve --config <conf>\", chave, comentário fixo"
-has <(printf '%s' "$line") "alguem@servidor" ; [ $? != 0 ]; ok $? "o comentário da chave original não vai (nem nada além do tipo e do blob)"
-python3 -I "$W" authorized-line --config "$CONF" --pubkey "$KD/user_key.pub" | grep -q '^restrict,command='; ok $? "sem --from: restrict,command= (sem from)"
+printf '%s' "$line" > "$T/line.txt"  # arquivo, não <(…): a substituição de processo ilegível daria "não achei" e o controle negativo passaria vazio
+has "$T/line.txt" "ssh-ed25519 AAAA" && ! has "$T/line.txt" "alguem@servidor"; ok $? "o comentário da chave original não vai (nem nada além do tipo e do blob); o controle positivo: o arquivo lido tem a chave"
+python3 -I "$W" authorized-line --config "$CONF" --pubkey "$KD/user_key.pub" > "$T/out" 2> "$T/err"; RC=$?
+[ "$RC" = 0 ] && grep -q '^restrict,command=' "$T/out"; ok $? "sem --from: restrict,command= (sem from)"
+has "$T/err" "sem --from"; ok $? "  e AVISA no stderr que a chave vale de qualquer endereço (a ausência de --from era um fail-open calado)"
+python3 -I "$W" authorized-line --config "$CONF" --pubkey "$KD/user_key.pub" --from 127.0.0.1 > "$T/out" 2> "$T/err"; RC=$?
+[ "$RC" = 0 ] && [ -s "$T/out" ] && ! has "$T/err" "sem --from"; ok $? "  com --from não avisa nada (o aviso não é ruído fixo)"
 QD="$T/dir com espaço"; QQ="$T/q\"uote"; QB="$T/back\\slash"; QBQ="$T/b\\\"q"; mkdir -p "$QD" "$QQ" "$QB" "$QBQ"
 for d in "$QD" "$QQ" "$QB" "$QBQ"; do cp "$CONF" "$d/conf.json"; done
 for c in "$QD/conf.json" "$QQ/conf.json" "$QB/conf.json" "$QBQ/conf.json"; do
@@ -463,15 +506,34 @@ if [ -f "$RUNBOOK" ] && has "$RUNBOOK" "$BEGIN" && has "$RUNBOOK" "$END"; then
   [ -s "$T/doc-diff.txt" ] && head -20 "$T/doc-diff.txt"
   [ "$(sort "$T/code-list.txt" | uniq -d | wc -l | tr -d ' ')" = 0 ]; ok $? "nenhuma regra repetida na lista"
 else ok 1 "o runbook $RUNBOOK tem o bloco <!-- allowlist:begin/end -->"; fi
+# a config que o runbook manda instalar "enquanto o Mayor não define os papéis" é dita INERTE: o selftest roda ESSA config (só city, log e bin_dirs trocados pelos do hermético)
+python3 -I - "$RUNBOOK" "$CITY" "$FB" "$LOGF" > "$T/conf-runbook.json" <<'EOF2'
+import json, re, sys
+rb, city, fb, log = sys.argv[1:5]
+m = re.search(r'^\s+`(\{"city".*\})`', open(rb).read(), re.M)
+if not m:
+    sys.exit(1)
+cfg = json.loads(m.group(1))
+cfg.update(city=city, log=log, bin_dirs=[fb])
+print(json.dumps(cfg))
+EOF2
+[ -s "$T/conf-runbook.json" ] && grep -q '"identity_pattern"' "$T/conf-runbook.json"; ok $? "controle: a config do passo 1 do runbook foi extraída (e tem identity_pattern)"
+for al in servidor-x servidor-abc-1 gastown.dog-1 gastown.mayor dog-gavycydh; do
+  b=$(calls); CONF_OVERRIDE="$T/conf-runbook.json" wrap "$(rq bd "{\"GC_ALIAS\":\"$al\"}" show ga-1)"
+  [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "não casa com identity_pattern"; ok $? "a config de exemplo do runbook é INERTE: alias '$al' recusado por identity_pattern (a doc dizia 'recusa tudo' e o marcador antigo deixava passar servidor-*)"
+done
 
 echo "== controle negativo: apagar a guarda faz o MESMO caso se comportar diferente"
-mutate() {  # mutate 'texto a trocar' 'texto novo' → $T/mutant.py (falha se o texto não está no wrapper: o controle não pode virar vazio)
-  python3 -I - "$W" "$T/mutant.py" "$1" "$2" <<'EOF2'
+mutate() {  # mutate 'texto a trocar' 'texto novo' ['outro texto' 'outro novo'...] → $T/mutant.py (falha se QUALQUER texto não está no wrapper: o controle não pode virar vazio)
+  python3 -I - "$W" "$T/mutant.py" "$@" <<'EOF2'
 import sys
 s = open(sys.argv[1]).read()
-if sys.argv[3] not in s:
-    sys.exit(3)
-open(sys.argv[2], "w").write(s.replace(sys.argv[3], sys.argv[4], 1))
+pairs = sys.argv[3:]
+for old, new in zip(pairs[::2], pairs[1::2]):
+    if old not in s:
+        sys.exit(3)
+    s = s.replace(old, new, 1)
+open(sys.argv[2], "w").write(s)
 EOF2
 }
 withmutant() { local W0=$W r; W="$T/mutant.py"; "$@"; r=$?; W=$W0; return $r; }  # devolve o status do comando (os que olham $RC não dependem disso)
@@ -492,11 +554,22 @@ withmutant kg unreaped; [ $? != 0 ]; ok $? "  sem a separação (EPERM sempre le
 mutate 'if p.poll() is None:  # (o poll reapa)' 'if False:  # (o poll reapa)'; ok $? "controle: a mesma guarda, do outro lado"
 withmutant kg alive-eperm; [ $? != 0 ]; ok $? "  sem a separação (EPERM nunca levanta) o EPERM de filho VIVO é engolido"
 mutate 'rc = p.poll()  # o filho pode ter saído' 'rc = None  # o filho pode ter saído'; ok $? "controle: o poll depois do TimeoutExpired existe"
-withmutant harness race "$REQ_OK"; [ "$RC" = 124 ]; ok $? "  sem ele a corrida 'o filho já tinha terminado' vira 124 'passou do prazo'"
+withmutant harness race "$REQ_OK"; [ "$RC" = 0 ] && ! has "$T/err" "passou de"; ok $? "  sem SÓ ele a corrida 'o filho já tinha terminado' segue 0: a decisão pelo código do wait() depois do kill a cobre (duas guardas em profundidade; cada uma é provada por si)"
+mutate 'rc = p.poll()  # o filho pode ter saído' 'rc = None  # o filho pode ter saído' 'if rc == -signal.SIGKILL:' 'if True:'; ok $? "controle: as duas guardas da corrida existem"
+withmutant harness race "$REQ_OK"; [ "$RC" = 124 ] && has "$T/err" "passou de"; ok $? "  sem as DUAS a corrida 'o filho já tinha terminado' vira 124 'passou do prazo'"
 mutate 'return "filho-nao-encerrado"' 'return "filho-encerrado"'; ok $? "controle: end_children separa 'encerrei' de 'o kill levantou'"
-withmutant harness termnokill "$REQ_OK"; ! tail -1 "$LOGF" | grep -qF "filho-nao-encerrado"; ok $? "  sem a separação o log afirma 'filho-encerrado' mesmo com o kill levantando"
+withmutant harness termnokill "$REQ_OK"; lastlog "done killed sig=15 filho-encerrado" && ! lastlog "filho-nao-encerrado"; ok $? "  sem a separação o log afirma 'filho-encerrado' mesmo com o kill levantando (e a linha de desfecho existe: sem ela o 'não tem filho-nao-encerrado' passaria vazio)"
 mutate 'LOG_BAD.sub("?", f)[:200]' 're.sub(r"[\t\r\n]", " ", f)[:200]'; ok $? "controle: o log higieniza TODOS os campos (não só TAB/CR/LF, como antes)"
 withmutant call bd $'\x1b]0;evil\x07x'; ! logclean; ok $? "  sem isso o MESMO argumento com ESC/BEL chega cru ao log"
+mutate '    Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}),
+' ''; ok $? "controle: a regra 'bd comment <id> <texto>...' existe na RULES"
+b=$(calls); withmutant call bd comment ga-1 'SEGREDO-4711 texto do comentário'; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && ! grep -q 'SEGREDO-4711' "$LOGF"; ok $? "  sem a regra o MESMO pedido é recusado e o grep do log também passa: é o 'RODOU' (rc 0 + uma chamada) do caso do SEGREDO que prova o caminho, não o grep"
+mutate 'if _LAUNCH["on"]:' 'if False:'; ok $? "controle: o handler de sinal adia o sinal enquanto o Popen está em curso"
+rm -f "$FB/sleep.pid"; withmutant harness termpopen "$(rq bd "$ID" close ga-1 --reason SLEEP)"
+lastlog "done killed sig=15 sem-filho-registrado"; ok $? "  sem o adiamento o MESMO caso volta a sair com 'sem-filho-registrado' (o comando RODANDO, o handler sem filho para matar)"
+[ -s "$FB/sleep.pid" ] && kill "$(cat "$FB/sleep.pid")" 2>/dev/null; rm -f "$FB/sleep.pid"  # (o neto que o mutante deixou vivo)
+mutate 'if rc == -signal.SIGKILL:' 'if True:'; ok $? "controle: o código do wait() depois do kill decide entre 'estourou' (morreu do NOSSO SIGKILL) e 'saiu sozinho antes do kill'"
+withmutant harness race2 "$REQ_OK"; [ "$RC" = 124 ] && has "$T/err" "passou de"; ok $? "  sem essa decisão a corrida volta a perder o código real do filho (124 'passou do prazo' com o comando já terminado)"
 
 echo
 if [ "$skipped" -gt 0 ]; then echo "AVISO: $skipped caso(s) NÃO rodaram (SKIP acima) — não contam como passou"; fi

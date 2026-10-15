@@ -31,12 +31,14 @@ POR QUE RECUSA EM VEZ DE ADAPTAR (está na lista / não está / não consegui sa
   Config ilegível, routes.jsonl ilegível, log de auditoria que não grava, identidade fora do padrão, ferramenta que não achei → não executa.
   A requisição é registrada (hash do argv, nunca o texto; uma RECUSA grava o motivo, que pode citar até 60 caracteres do argumento) ANTES de rodar; sem rastro não há execução.
   Todo pedido que chegou a decidir "roda" fecha o log com uma linha `done …` (rc=N, nao-iniciado, killed sig=N filho-encerrado|filho-nao-encerrado|sem-filho-registrado, unknown): a linha `ok` sozinha não quer dizer "rodou".
+  A `ok` e a `done` do mesmo pedido levam o mesmo ts e a mesma hash do argv: é assim que se pareiam. Um sinal que chega DENTRO do Popen (o filho já pode existir, ainda não registrado) é anotado e
+  reenviado quando o filho estiver registrado, e aí o grupo é encerrado: `sem-filho-registrado` só existe quando o Popen nem começou.
   Depois que o filho existe NADA vira "RECUSADO": falha do próprio wrapper nessa fase sai 125 ("iniciado, desfecho desconhecido"), porque quem lê 77 repete o pedido.
 
 SUBCOMANDOS
   serve --config CONF                    forced-command (SSH_ORIGINAL_COMMAND na entrada)
   list                                   imprime a lista permitida (regras e variáveis de ambiente)
-  authorized-line --config CONF --pubkey ARQ.pub [--from CIDR[,CIDR]]   imprime a linha do authorized_keys; NÃO grava nada
+  authorized-line --config CONF --pubkey ARQ.pub [--from CIDR[,CIDR]]   imprime a linha do authorized_keys; NÃO grava nada (sem --from avisa no stderr: a chave valeria de qualquer endereço)
 
 CONFIG (JSON): {"city": "/abs", "identity_pattern": "regex", "nudge_pattern": "regex", "gate_done_bin": "/abs"|null, "log": "/abs", "timeout_s": 300, "bin_dirs": ["/abs"]}
   Só `city` e `identity_pattern` são obrigatórios (sem `nudge_pattern` o nudge é recusado); chave desconhecida é erro.
@@ -61,7 +63,10 @@ import time
 from pathlib import Path
 
 REFUSED, TIMEOUT, UNKNOWN, NOEXEC, NOTFOUND = 77, 124, 125, 126, 127
-_STARTED: list = []  # o filho, assim que existe: o handler de sinal e o último catch-all precisam achá-lo (e saber que, daqui em diante, nada é "recusado")
+_STARTED: list = []  # o filho, assim que o Popen o devolve: o handler de sinal e o último catch-all precisam achá-lo (e saber que, daqui em diante, nada é "recusado")
+# `on`: o Popen está em curso. O filho já pode existir (o fork/exec inteiro acontece dentro do Popen) e _STARTED ainda não o tem; nesse intervalo o handler de sinal NÃO
+# age (não há o que encerrar e dizer "sem filho" seria falso): guarda o sinal em `sig` e o serve() o reenvia quando o filho estiver registrado.
+_LAUNCH: dict = {"on": False, "sig": None}
 PROTO = "rs1"
 MAX_CMD, MAX_ARGS, MAX_TEXT = 200_000, 64, 20_000
 ALLOW_META = ("athos.", "story.")  # as únicas chaves que fórmula/agente de worker escreve (grep em 14/10); gc./pilot./gate./delivery. são plano de controle, o resto é desconhecido: recusa
@@ -89,8 +94,13 @@ def no_surrogate(s: str) -> bool:  # surrogate solto vira byte cru (0x80-0xFF) n
     return re.search(r"[\ud800-\udfff]", s) is None
 
 
-def v_line(s: str) -> bool:  # texto que vira digitação no terminal de OUTRA sessão: nenhum controle C0/C1 (TAB, ESC, CR, LF inclusive), nem separador de linha Unicode, nem controle bidi
-    return v_text(s) and not re.search(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]", s)
+# um só conjunto para o que NÃO pode chegar ao terminal de outra sessão nem ao log: controle C0/C1 (TAB, ESC, CR e LF inclusive), separador de linha Unicode e toda
+# marca/controle bidi (LRM/RLM U+200E-F, ALM U+061C, embeddings/overrides U+202A-E, isolates U+2066-9): mudam o que se VÊ sem mudar o que foi digitado
+CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]")
+
+
+def v_line(s: str) -> bool:  # texto que vira digitação no terminal de OUTRA sessão
+    return v_text(s) and not CTRL.search(s)
 
 
 def v_kv(s: str) -> bool:
@@ -132,14 +142,15 @@ class Rule:
             s.append((nm if f.req else f"[{nm}]") + ("..." if f.rep else ""))
         return " ".join(s)
 
-    def apply(self, args: list[str]) -> list[str]:
+    def apply(self, args: list[str]) -> tuple[list[str], list[str]]:
         """Recebe o argv depois das palavras fixas; devolve (argumentos a executar na ORDEM do cliente, flags curtas viram longas; só os posicionais, na ordem) ou levanta Refused."""
-        out, pos, seen, i, dd = [], [], set(), 0, False
+        out, pos, seen, i, dd, after_dd = [], [], set(), 0, False, 0
         while i < len(args):
             a = args[i]
             if dd or not a.startswith("-") or a == "-":
                 pos.append(a)
                 out.append(a)
+                after_dd += dd
                 i += 1
             elif a == "--":  # fim das flags: o que vem depois é posicional, mesmo que comece com `-` (só texto livre aceita isso)
                 dd, i = True, i + 1
@@ -160,6 +171,8 @@ class Rule:
                         raise Refused(f"{name} sem valor ou com valor fora do formato <{f.val}>")
                     out += [name, args[i + 1]]
                     i += 2
+        if dd and not after_dd:  # `--` sem nada depois não é "forma EXATA": o executável receberia argc=1 argv=[--] (o gate-done é um script, não um cobra que o absorve)
+            raise Refused("`--` sem nada depois")
         for n, f in self.flags.items():
             if f.req and n not in seen:
                 raise Refused(f"falta {n}")
@@ -311,7 +324,7 @@ def decide(cfg: dict, tool: str, argv: list[str], env: dict) -> tuple[Rule, list
     raise Refused(f"{tool} {' '.join(argv[:len(cand[0].words)])}: {reason}")
 
 
-LOG_BAD = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")  # o mesmo conjunto de v_line: controle C0/C1 (TAB e quebra de linha inclusive), separador de linha Unicode, controle bidi
+LOG_BAD = CTRL  # o MESMO objeto que o v_line usa: não há duas listas para divergir
 
 
 def audit(cfg: dict, *fields: str) -> None:
@@ -349,7 +362,7 @@ def who_declared(env: dict | None) -> str:  # quem o pedido DIZ ser (declaraçã
 
 def end_children() -> str:  # encerra o grupo do filho e diz o que de fato aconteceu: um kill que levantou NÃO é "encerrado"
     if not _STARTED:
-        return "sem-filho-registrado"  # (registrado, não "iniciado": entre o Popen devolver e o append há uma instrução em que o filho já existe)
+        return "sem-filho-registrado"  # verdade porque o handler de sinal só chega aqui FORA do Popen (ver _LAUNCH): sem filho registrado quer dizer que o Popen ainda nem começou
     try:
         for p in _STARTED:
             kill_group(p)
@@ -383,20 +396,24 @@ def serve(config: str) -> int:
         child = {"HOME": home, "USER": user, "LOGNAME": user, "LANG": "en_US.UTF-8",
                  "PATH": ":".join(cfg["bin_dirs"] + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]), "BEADS_ACTOR": alias, **env}
         t0 = time.time()
+        rid = hashlib.sha256(json.dumps([tool, argv]).encode()).hexdigest()[:12]  # a linha `ok` e a `done` do mesmo pedido levam o mesmo ts e esta hash: é assim que se pareiam
 
         def outcome(what: str) -> None:  # a linha de desfecho: dizer que não gravou é melhor que calar (a linha `ok` sozinha seria lida como "rodou")
             try:
-                audit(cfg, ts, client, alias, what, rule.label(), f"{time.time() - t0:.1f}s")
+                audit(cfg, ts, client, alias, what, rule.label(), f"{time.time() - t0:.1f}s", rid)
             except OSError as e:
                 say(f"aviso: não consegui gravar o desfecho ({what}) no log ({e.strerror})")
 
         def die(sig, _frame):  # o cliente ssh foi embora: o filho não pode sobreviver sozinho (ele está numa sessão própria)
+            if _LAUNCH["on"]:  # Popen em curso: o filho pode já existir (o fork/exec inteiro roda lá dentro) e ainda não estar em _STARTED. Agir agora não mataria nada e o log diria "sem filho" com o comando rodando
+                _LAUNCH["sig"] = _LAUNCH["sig"] or sig  # (não uso máscara de sinal em volta do Popen: o filho a herdaria bloqueada e o bd/gc rodaria sem poder receber SIGTERM)
+                return
             outcome(f"done killed sig={sig} {end_children()}")
             os._exit(128 + sig)
-        for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):  # antes do Popen: depois dele a janela com o filho vivo e sem handler seria a do wait inteiro; sobra só a de uma instrução (ver end_children)
+        for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):  # antes do Popen: depois dele a janela com o filho vivo e sem handler seria a do wait inteiro
             signal.signal(s, die)
         try:
-            audit(cfg, ts, client, alias, "ok", rule.label(), hashlib.sha256(json.dumps([tool, argv]).encode()).hexdigest()[:12])
+            audit(cfg, ts, client, alias, "ok", rule.label(), rid)
         except OSError as e:
             raise Refused(f"não consegui gravar o log de auditoria ({e.strerror}); não executo sem rastro")
     except Exception as e:  # Refused é o caso normal; um erro que não previ, ainda ANTES do Popen, também não executa nada — e também fica no log
@@ -409,16 +426,21 @@ def serve(config: str) -> int:
                 pass  # a recusa já saiu pelo stderr; o que não pode acontecer é executar sem rastro, e aqui nada executa
         return r.rc
     # daqui em diante o comando vai começar (ou já começou): nada abaixo pode virar "RECUSADO", que quem chama leria como "nada executou"
+    _LAUNCH["on"] = True  # de agora até o filho estar em _STARTED um sinal só é anotado (ver die)
     try:
         _STARTED.append(subprocess.Popen([exe] + final, cwd=cwd, env=child, start_new_session=True))
     except OSError as e:
+        _LAUNCH["on"] = False  # o exec falhou: não há filho, e um sinal volta a ter o tratamento normal
         say(f"não consegui executar {tool}: {e.strerror}")
         outcome(f"done rc={NOEXEC} nao-iniciado")
         return NOEXEC
-    except Exception as e:  # algo que não é OSError saiu do Popen: não sei se o filho nasceu, e sem o handle não posso encerrá-lo
+    except Exception as e:  # algo que não é OSError saiu do Popen: não sei se o filho nasceu, e sem o handle não posso encerrá-lo. `on` fica ligado de propósito: um sinal daqui até a saída é anotado e NÃO reenviado (nada a encerrar), em vez de o log dizer "sem filho"
         say(f"ATENÇÃO: {tool} pode ter sido iniciado (o Popen levantou {type(e).__name__}: {e}); desfecho desconhecido — não repita às cegas")
         outcome(f"done unknown {type(e).__name__}")
         return UNKNOWN
+    _LAUNCH["on"] = False
+    if _LAUNCH["sig"]:  # um sinal chegou durante o Popen: com o filho registrado o handler o encerra e diz a verdade (o comando começou e o grupo foi encerrado)
+        die(_LAUNCH["sig"], None)
     p = _STARTED[0]
     try:
         try:
@@ -427,9 +449,10 @@ def serve(config: str) -> int:
             rc = p.poll()  # o filho pode ter saído entre o último poll do wait e o prazo: terminou sozinho, não estourou
             if rc is None:
                 kill_group(p)
-                p.wait()
-                rc = TIMEOUT
-                say(f"{tool} passou de {cfg['timeout_s']}s e foi encerrado")
+                rc = p.wait()
+                if rc == -signal.SIGKILL:  # morreu do NOSSO kill: estourou o prazo. Outro código é de um filho que saiu sozinho entre o poll e o kill, e vale o código dele
+                    rc = TIMEOUT
+                    say(f"{tool} passou de {cfg['timeout_s']}s e foi encerrado")
         rc = 128 - rc if rc < 0 else rc
     except Exception as e:  # o comando JÁ foi iniciado e pode ter feito efeito: o desfecho é desconhecido, e dizer "recusado" faria o cliente repetir
         ended = end_children() == "filho-encerrado"
@@ -450,6 +473,8 @@ def authorized_line(config: str, pubkey: str, frm: str | None) -> str:
         raise Refused("pubkey: esperado UMA chave pública sem opções na frente (tipo + base64 [+ comentário])")
     if frm is not None and not re.fullmatch(r"[0-9A-Za-z.:,/*?!-]{1,200}", frm):
         raise Refused("--from: só endereços, CIDR ou curinga, sem aspas nem espaço")
+    if frm is None:  # a linha sai igual, mas vale de QUALQUER endereço: fail-open que antes não dizia nada
+        say("AVISO: sem --from a chave vale a partir de QUALQUER endereço (restrict e command= continuam valendo); use --from <ip do servidor ou do túnel>")
     cmd = " ".join(shlex.quote(x) for x in [sys.executable, "-I", os.path.realpath(__file__), "serve", "--config", os.path.realpath(config)])
     if re.search(r"[\x00-\x1f\x7f]", cmd):  # uma quebra de linha no caminho viraria uma SEGUNDA linha (outra chave, outras opções) no authorized_keys
         raise Refused("caminho (python, wrapper ou config) com caractere de controle: não vai para o authorized_keys")
@@ -471,8 +496,8 @@ def main(argv: list[str]) -> int:
     if n.cmd == "serve":
         try:
             return serve(n.config)
-        except Exception as e:  # serve() já cobre os dois lados do Popen; esta é a última rede, e conta o estado verdadeiro: com o filho vivo nunca diz "RECUSADO"
-            if _STARTED:
+        except Exception as e:  # serve() já cobre os dois lados do Popen; esta é a última rede, e conta o estado verdadeiro: com o filho vivo (ou o Popen em curso) nunca diz "RECUSADO"
+            if _STARTED or _LAUNCH["on"]:
                 say(f"ATENÇÃO: o comando FOI INICIADO e o wrapper falhou depois ({type(e).__name__}: {e}); pode ter rodado — não repita às cegas")
                 return UNKNOWN
             say(f"RECUSADO: erro interno {type(e).__name__}: {e}")
