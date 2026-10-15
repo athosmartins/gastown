@@ -228,6 +228,28 @@ is_stale_residue_refusal() {
   esac
 }
 
+# _stale_residue_alarm_text <db> — ga-0m4fqu. The words of the "reseed blocked by
+# residue" alarm. "Remove it by hand" is only right while the PRIMARY is good: a
+# guard-triggered reseed killed after it had freed the primary (15/10 11:15) leaves
+# a complete <db>.new beside NO primary, and that .new is then the only local copy.
+# The old text named "${db}.old" even when the residue was ".new", and told whoever
+# read it to delete. Three answers collapse to two here on purpose: a primary
+# manifest that is present is the only thing that unlocks "remove"; absent, empty
+# or unreadable all get the cautious text, because deleting is the irreversible side.
+_stale_residue_alarm_text() {
+  local db="$1" found="" p
+  for p in "$BACKUP_ROOT/$db.new" "$BACKUP_ROOT/$db.old"; do
+    [ -e "$p" ] && found="${found:+$found e }$p"
+  done
+  [ -n "$found" ] || found="${BACKUP_ROOT}/${db}.new ou ${BACKUP_ROOT}/${db}.old"
+  # vazio/ausente/ilegivel -> sem manifest provado -> texto cauteloso (nao apagar)
+  if [ -s "$BACKUP_ROOT/$db/manifest" ]; then
+    echo "backup off-box: reseed de $db bloqueado por resíduo de execução anterior em $found — a primária $BACKUP_ROOT/$db tem manifest; remova o resíduo à mão uma vez para destravar"
+  else
+    echo "backup off-box: reseed de $db bloqueado por resíduo em $found — e a primária $BACKUP_ROOT/$db NÃO tem manifest legível (ausente, vazia ou ilegível): o resíduo pode ser a ÚNICA cópia local. NÃO apague à mão. Se a primária estiver ausente, o caminho é dolt-backup-reseed.sh --promote-new-after-release $db (restaura e confere antes de promover); o S3 é o fallback. Ver $LOG."
+  fi
+}
+
 # ga-i99qsp: dolt-backup-reseed.sh's low-disk fallback refuses (exit 1,
 # NOTHING touched — no rename, no delete) when the S3 proof it needs before
 # freeing the old copy early doesn't hold (ga-gsnee8: the S3 copy does not
@@ -1148,7 +1170,7 @@ _reseed_staging_if_enabled() {
   fi
   if is_stale_residue_refusal "$out"; then
     log "$db: staging reseed BLOCKED — stale .old/.new residue from a prior run — ver $LOG"
-    notify_fail "backup off-box: reseed de $db bloqueado por resíduo (.old ou .new) de execução anterior em ${BACKUP_ROOT}/${db}.old — remova à mão uma vez para destravar"
+    notify_fail "$(_stale_residue_alarm_text "$db")"
     return 1
   fi
   if is_low_disk_proof_failed_refusal "$out"; then

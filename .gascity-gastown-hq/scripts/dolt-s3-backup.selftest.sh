@@ -820,7 +820,45 @@ RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UP
 RC=$?
 [ "$RC" -eq 1 ] && ok "scenario C2 (residue refusal): returns failure" || bad "scenario C2 (residue refusal): expected rc=1, got rc=$RC"
 grep -qF "staging reseed BLOCKED" "$RESEED_TEST_LOG" && ok "scenario C2: logged the BLOCKED line" || bad "scenario C2: missing BLOCKED log line"
-grep -qF "resíduo (.old ou .new)" "$NOTIFY_STUB_CALLS" && ok "scenario C2: notify message names the residue cause specifically (actionable, not generic)" || bad "scenario C2: notify message should name the residue cause"
+grep -qF "resíduo" "$NOTIFY_STUB_CALLS" && grep -qF "/fake/.dolt-backup/testdb.new" "$NOTIFY_STUB_CALLS" && ok "scenario C2: notify message names the residue cause AND the actual path(s) (actionable, not generic)" || bad "scenario C2: notify message should name the residue cause and the path"
+
+# Scenarios C3/C4 (ga-0m4fqu): "remove it by hand" is advice only while the PRIMARY
+# is good. Measured 15/10: a guard-triggered reseed killed after it freed the
+# primary left a complete <db>.new beside NO primary; the old alarm said "remova à
+# mão" and named "<db>.old" — a path that did not exist — about the only local copy.
+# C3: primary HAS a manifest, residue is a .new → removal advice, naming the .new.
+C3_ROOT="$(mktemp -d /tmp/s3backup-selftest-c3.XXXXXX)"
+mkdir -p "$C3_ROOT/testdb" "$C3_ROOT/testdb.new"; echo m > "$C3_ROOT/testdb/manifest"; echo m > "$C3_ROOT/testdb.new/manifest"
+: > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=residue LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  BACKUP_ROOT="$C3_ROOT" \
+  _reseed_staging_if_enabled "testdb"
+grep -qF "$C3_ROOT/testdb.new" "$NOTIFY_STUB_CALLS" && ok "scenario C3: names the residue that actually exists ($C3_ROOT/testdb.new)" || bad "scenario C3: should name the .new that exists"
+grep -qF "testdb.old" "$NOTIFY_STUB_CALLS" && bad "scenario C3: names a testdb.old that does not exist (the old text's flaw)" || ok "scenario C3: does not name a residue path that is not there"
+grep -qF "remova o resíduo à mão" "$NOTIFY_STUB_CALLS" && ok "scenario C3: primary has a manifest → removal advice is given" || bad "scenario C3: with a good primary the removal advice should be given"
+rm -rf "$C3_ROOT"
+# C4: primary ABSENT, .new has a manifest → it may be the only local copy: never "remova".
+C4_ROOT="$(mktemp -d /tmp/s3backup-selftest-c4.XXXXXX)"
+mkdir -p "$C4_ROOT/testdb.new"; echo m > "$C4_ROOT/testdb.new/manifest"
+: > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=residue LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  BACKUP_ROOT="$C4_ROOT" \
+  _reseed_staging_if_enabled "testdb"
+grep -qF "ÚNICA cópia local" "$NOTIFY_STUB_CALLS" && grep -qF "NÃO apague" "$NOTIFY_STUB_CALLS" && ok "scenario C4: primary absent → alarm says the residue may be the ONLY local copy and not to delete it" || bad "scenario C4: with no primary the alarm must warn against deleting"
+grep -qF "remova" "$NOTIFY_STUB_CALLS" && bad "scenario C4: tells the reader to remove the only local copy" || ok "scenario C4: no removal advice when the primary is not proven"
+grep -qF -e "--promote-new-after-release testdb" "$NOTIFY_STUB_CALLS" && ok "scenario C4: points at the promote path that verifies by restore" || bad "scenario C4: should point at --promote-new-after-release"
+# C5: primary dir exists but its manifest is EMPTY → same as absent (empty is not "proven good").
+C5_ROOT="$(mktemp -d /tmp/s3backup-selftest-c5.XXXXXX)"
+mkdir -p "$C5_ROOT/testdb" "$C5_ROOT/testdb.new"; : > "$C5_ROOT/testdb/manifest"; echo m > "$C5_ROOT/testdb.new/manifest"
+: > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"
+RESEED_SCRIPT="$RESEED_STUB_DIR/reseed.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+  RESEED_STUB_MODE=residue LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+  BACKUP_ROOT="$C5_ROOT" \
+  _reseed_staging_if_enabled "testdb"
+grep -qF "NÃO apague" "$NOTIFY_STUB_CALLS" && ok "scenario C5: empty primary manifest is not 'proven good' → cautious text" || bad "scenario C5: an empty manifest must not unlock the removal advice"
+rm -rf "$C4_ROOT" "$C5_ROOT"
 
 # Scenario D: RESEED_AFTER_UPLOAD=0 → reseed script never even invoked.
 : > "$NOTIFY_STUB_CALLS"; : > "$RESEED_TEST_LOG"

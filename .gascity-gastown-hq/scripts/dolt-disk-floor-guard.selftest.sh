@@ -2745,6 +2745,74 @@ CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; STATE_RESEED_TRIGGER_DIR="$REAL_STAT
 rm -rf "$FAKE_CITY"
 
 echo ""
+echo "=== _reseed_trigger_fits / size ceiling on the guard-triggered reseed (ga-0m4fqu) ==="
+# 15/10 11:11: the guard ran dolt-backup-reseed.sh for whatsapp_automation (1.6-2.0 GB)
+# under `timeout 240`. That reseed needs minutes, so the kill landed mid-verification
+# — after the low-disk mode had already deleted the primary. Fix: do not try a reseed
+# that cannot fit in the budget. Ceiling shrunk to 1 MB here so the fixtures stay tiny.
+FIT_DIR="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-fit.XXXXXX)"
+mkdir -p "$FIT_DIR/small" "$FIT_DIR/big"
+dd if=/dev/zero of="$FIT_DIR/big/blob" bs=1048576 count=3 >/dev/null 2>&1
+REAL_MAX_MB="$RESEED_TRIGGER_MAX_BACKUP_MB"; RESEED_TRIGGER_MAX_BACKUP_MB=1
+case "$(_reseed_trigger_fits "$FIT_DIR/small")" in "ok 0") ok "_reseed_trigger_fits: empty dir → 'ok 0' (fits)" ;; *) bad "_reseed_trigger_fits: empty dir should be 'ok 0', got '$(_reseed_trigger_fits "$FIT_DIR/small")'" ;; esac
+case "$(_reseed_trigger_fits "$FIT_DIR/big")" in "too-big 3") ok "_reseed_trigger_fits: 3 MB over a 1 MB ceiling → 'too-big 3'" ;; *) bad "_reseed_trigger_fits: 3 MB dir should be 'too-big 3', got '$(_reseed_trigger_fits "$FIT_DIR/big")'" ;; esac
+# falhou/ilegível: three states — a du failure must be neither "fits" nor "too big"
+case "$(_reseed_trigger_fits "$FIT_DIR/does-not-exist")" in "unknown") ok "_reseed_trigger_fits: unreadable size → 'unknown' (not 'ok', not 'too-big')" ;; *) bad "_reseed_trigger_fits: a du failure must be 'unknown', got '$(_reseed_trigger_fits "$FIT_DIR/does-not-exist")'" ;; esac
+# the ceiling itself is inclusive: exactly 1 MB fits
+dd if=/dev/zero of="$FIT_DIR/small/one" bs=1048576 count=1 >/dev/null 2>&1
+case "$(_reseed_trigger_fits "$FIT_DIR/small")" in ok*) ok "_reseed_trigger_fits: a backup exactly at the ceiling still fits" ;; *) bad "_reseed_trigger_fits: at-ceiling should fit, got '$(_reseed_trigger_fits "$FIT_DIR/small")'" ;; esac
+RESEED_TRIGGER_MAX_BACKUP_MB="$REAL_MAX_MB"
+# a garbage env value must fall back to the default, not to 0 (which would skip every db)
+GARBAGE_MAX="$(DOLT_DISK_FLOOR_RESEED_TRIGGER_MAX_BACKUP_MB=abc DOLT_DISK_FLOOR_GUARD_LIB=1 bash -c ". '$SCRIPT'; echo \"\$RESEED_TRIGGER_MAX_BACKUP_MB\"" 2>/dev/null | tail -1)"
+[ "$GARBAGE_MAX" = "400" ] && ok "RESEED_TRIGGER_MAX_BACKUP_MB: a non-numeric env value falls back to 400" || bad "RESEED_TRIGGER_MAX_BACKUP_MB: garbage env should fall back to 400, got '$GARBAGE_MAX'"
+rm -rf "$FIT_DIR"
+
+# End to end through the real loop: the oversized db sorts FIRST ("a-big" < "b-small"),
+# so a skip that wrongly took the one-db slot, or wrote cooldown state, would show here.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city16.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts" "$FAKE_CITY/.dolt-backup/a-big" "$FAKE_CITY/.dolt-backup/b-small" "$FAKE_CITY/.beads/dolt/a-big" "$FAKE_CITY/.beads/dolt/b-small"
+dd if=/dev/zero of="$FAKE_CITY/.dolt-backup/a-big/blob" bs=1048576 count=3 >/dev/null 2>&1
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/dolt-backup-reseed.sh" <<EOF
+#!/bin/bash
+echo "\$1" >> "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/dolt-backup-reseed.sh"
+: > "$LOG"
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"; REAL_STATE_RESEED_TRIGGER_DIR="$STATE_RESEED_TRIGGER_DIR"; REAL_MAX_MB="$RESEED_TRIGGER_MAX_BACKUP_MB"
+CITY="$FAKE_CITY"; DOLTDIR="$FAKE_CITY/.beads/dolt"; STATE_RESEED_TRIGGER_DIR="$FAKE_CITY/state-reseed"; RESEED_TRIGGER_MAX_BACKUP_MB=1
+_reap_bloated_backup_staging 1
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; STATE_RESEED_TRIGGER_DIR="$REAL_STATE_RESEED_TRIGGER_DIR"; RESEED_TRIGGER_MAX_BACKUP_MB="$REAL_MAX_MB"
+if [ -f "$CAPTURE_FILE" ] && [ "$(cat "$CAPTURE_FILE")" = "b-small" ]; then
+  ok "_reap_bloated_backup_staging: the oversized db is skipped and the small one behind it still gets its attempt (a skip does not take the one-db slot)"
+else
+  bad "_reap_bloated_backup_staging: expected only b-small to be attempted, got: $([ -f "$CAPTURE_FILE" ] && cat "$CAPTURE_FILE" || echo 'nothing')"
+fi
+[ -e "$FAKE_CITY/state-reseed/a-big" ] && bad "_reap_bloated_backup_staging: a size skip wrote cooldown state for a-big (it was never attempted)" || ok "_reap_bloated_backup_staging: a size skip writes no cooldown state"
+grep -q "backup-staging-reap SKIP a-big — its backup is 3 MB, over the 1 MB ceiling" "$LOG" && ok "_reap_bloated_backup_staging: the skip is logged with the size, the ceiling and why" || bad "_reap_bloated_backup_staging: missing the oversize SKIP log line (log: $(tail -3 "$LOG" | tr '\n' '|'))"
+rm -rf "$FAKE_CITY"
+
+# Only the oversized db present → nothing runs at all (the real 15/10 shape: WA is the
+# only big one). The lever must end the cycle quietly, not fall through to a reseed.
+FAKE_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-city17.XXXXXX)"
+mkdir -p "$FAKE_CITY/scripts" "$FAKE_CITY/.dolt-backup/wa" "$FAKE_CITY/.beads/dolt/wa"
+dd if=/dev/zero of="$FAKE_CITY/.dolt-backup/wa/blob" bs=1048576 count=3 >/dev/null 2>&1
+CAPTURE_FILE="$FAKE_CITY/capture.txt"
+cat > "$FAKE_CITY/scripts/dolt-backup-reseed.sh" <<EOF
+#!/bin/bash
+echo "\$1" >> "$CAPTURE_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_CITY/scripts/dolt-backup-reseed.sh"
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"; REAL_STATE_RESEED_TRIGGER_DIR="$STATE_RESEED_TRIGGER_DIR"; REAL_MAX_MB="$RESEED_TRIGGER_MAX_BACKUP_MB"
+CITY="$FAKE_CITY"; DOLTDIR="$FAKE_CITY/.beads/dolt"; STATE_RESEED_TRIGGER_DIR="$FAKE_CITY/state-reseed"; RESEED_TRIGGER_MAX_BACKUP_MB=1
+_reap_bloated_backup_staging 1
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; STATE_RESEED_TRIGGER_DIR="$REAL_STATE_RESEED_TRIGGER_DIR"; RESEED_TRIGGER_MAX_BACKUP_MB="$REAL_MAX_MB"
+[ -f "$CAPTURE_FILE" ] && bad "_reap_bloated_backup_staging: ran the reseed for a db over the ceiling (the 15/10 whatsapp_automation shape)" || ok "_reap_bloated_backup_staging: a lone oversized db is not reseeded under the guard's short budget"
+rm -rf "$FAKE_CITY"
+
+echo ""
 echo "=== _resurrect_dolt: escalation cooldown (ga-f4l2z, mirrors ga-q4cqr) ==="
 # Tests the REAL _resurrect_dolt (still the function sourced from the
 # library at this point — the main()-scenario section further below is what

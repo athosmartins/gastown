@@ -1399,6 +1399,11 @@ case "$args" in
     ;;
   *"backup restore"*)
     [ "${FAKE_RESTORE_FAIL:-0}" = "1" ] && exit 1
+    # ga-0m4fqu: FAKE_RESTORE_RC=<n> exits with exactly that status (124 = the `timeout
+    # 1800` fired, 137 = OOM-kill); FAKE_RESTORE_SLEEP=<s> makes the restore take that
+    # long, so a scenario can signal the reseed while it is verifying.
+    [ -n "${FAKE_RESTORE_RC:-}" ] && exit "$FAKE_RESTORE_RC"
+    [ -n "${FAKE_RESTORE_SLEEP:-}" ] && sleep "$FAKE_RESTORE_SLEEP"
     # invoked as: dolt backup restore file://<NEW_DIR> <verify_name>, cwd=$VERIFY_DIR
     verify_name="${@: -1}"
     mkdir -p "./$verify_name"
@@ -1603,6 +1608,93 @@ if [ "$RC" -ne 0 ]; then ok "scenario 8 (ultra freed-then-rebuild-fails): exits 
 if grep -q "SEM BACKUP LOCAL" "$ROOT8/out.log" 2>/dev/null; then ok "scenario 8: distinctive 'SEM BACKUP LOCAL' message present"; else bad "scenario 8: missing the distinctive no-local-backup message"; fi
 if [ -e "$ROOT8/city/.dolt-backup/hq" ]; then bad "scenario 8: old was freed and new was never promoted — .dolt-backup/hq should not exist"; else ok "scenario 8: confirms the invariant-(c) window is real via the ultra trigger too"; fi
 rm -rf "$ROOT8" 2>/dev/null
+
+# ══ ga-0m4fqu: a reseed that is KILLED, or whose verification restore does not FINISH,
+# is not a reseed whose backup "does not restore". 15/10 11:15:10: the disk-floor guard ran
+# this script under `timeout 240`; in low-disk mode it had already deleted the primary, and
+# the kill landed mid-verification. Nothing was logged, and a complete-but-unverified
+# whatsapp_automation.new (1.9 GB) was left beside NO primary — then read by everyone as
+# "resíduo" to delete. These scenarios pin what must happen instead. ══
+mk_notify_capture() { # <root> — a notifier that records its arguments (the default stub swallows them)
+  printf '#!/bin/bash\necho "$*" >> "%s/notify.log"\n' "$1" > "$1/notify-capture"; chmod +x "$1/notify-capture"
+}
+# Like run_scenario, but under GNU timeout — the shape the guard uses, which signals its whole
+# process group — and sends <signal> to it once the log shows <marker>.
+run_scenario_signalled() { # <root> <signal> <marker> env...
+  local root="$1" sig="$2" marker="$3" pid i; shift 3
+  ( cd "$root" && exec env "$@" PATH="$root/bin:$PATH" GC_CITY_PATH="$root/city" \
+      RESEED_LOG="$root/city/reseed.log" DOLT_BIN=dolt GC_BIN=gc \
+      timeout 600 "$SCRIPT" hq > "$root/out.log" 2>&1 ) &
+  pid=$!
+  for i in $(seq 1 240); do grep -q "$marker" "$root/out.log" 2>/dev/null && break; sleep 0.5; done
+  kill -"$sig" "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null; RC=$?
+}
+LOWDISK_ENV="FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_AWS_MANIFEST_OK=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=20M"
+
+# S9: low-disk mode freed the primary, then TERM lands during the verification restore.
+ROOT9="/tmp/reseed-selftest-s9.$$"
+setup_scenario "$ROOT9" 10 20 50; mk_notify_capture "$ROOT9"
+# shellcheck disable=SC2086
+run_scenario_signalled "$ROOT9" TERM "restaurando o backup novo" $LOWDISK_ENV FAKE_RESTORE_SLEEP=120 DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY="$ROOT9/notify-capture"
+if [ "$RC" -ne 0 ]; then ok "scenario 9 (TERM mid-verification, primary already freed): exits non-zero"; else bad "scenario 9: expected non-zero exit, got 0"; fi
+[ ! -e "$ROOT9/city/.dolt-backup/hq" ] && ok "scenario 9: setup is the 15/10 shape — the primary is gone" || bad "scenario 9: setup did not reach the freed-primary state, so it does not test the incident"
+[ -d "$ROOT9/city/.dolt-backup/hq.new" ] && ok "scenario 9: hq.new is PRESERVED (it may be the only local copy)" || bad "scenario 9: hq.new was deleted by a signal — the 15/10 data-loss path"
+grep -q "INTERROMPIDO por TERM" "$ROOT9/out.log" && ok "scenario 9: the log says the reseed was interrupted (15/10 logged nothing)" || bad "scenario 9: no INTERROMPIDO line — the kill is silent again"
+grep -q "SEM BACKUP LOCAL VÁLIDO" "$ROOT9/out.log" && grep -q "PRESERVADO" "$ROOT9/out.log" && ok "scenario 9: the log names the state: no valid local backup, .new preserved" || bad "scenario 9: the log does not say what state was left"
+grep -q "INTERROMPIDO por TERM" "$ROOT9/notify.log" 2>/dev/null && ok "scenario 9: the alarm fired (the guard path was 'unalarmed' before)" || bad "scenario 9: no alarm for a db left without a valid local backup"
+( PATH="$ROOT9/bin:$PATH" DOLT_S3_BACKUP_LIB=1 . "$S3_BACKUP_SCRIPT"
+  if is_local_backup_lost_refusal "$(cat "$ROOT9/out.log")"; then echo "  PASS: scenario 9: dolt-s3-backup.sh's 04:00 wrapper classifies this output as the CRITICAL 'SEM BACKUP LOCAL' alarm"
+  else echo "  FAIL: scenario 9: the 04:00 wrapper would NOT classify this as a lost local backup"; fi ) > "$ROOT9/classify.log" 2>&1
+cat "$ROOT9/classify.log"; grep -q "^  PASS:" "$ROOT9/classify.log" && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+pkill -f "reseed-selftest-s9.$$" 2>/dev/null
+rm -rf "$ROOT9" 2>/dev/null
+
+# S10: the same TERM, but the primary was NEVER touched (ample margin) — must say the old one is intact.
+ROOT10="/tmp/reseed-selftest-s10.$$"
+setup_scenario "$ROOT10" 5 5 200; mk_notify_capture "$ROOT10"
+run_scenario_signalled "$ROOT10" TERM "restaurando o backup novo" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=5 FAKE_RESTORE_SLEEP=120 DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY="$ROOT10/notify-capture"
+[ -f "$ROOT10/city/.dolt-backup/hq/old-bloat.bin" ] && ok "scenario 10 (TERM, primary never touched): the old backup is intact" || bad "scenario 10: the old backup was damaged"
+grep -q "antes de liberar o backup antigo: o antigo segue intacto" "$ROOT10/out.log" && ok "scenario 10: the log says the old backup is intact — true here, and only here" || bad "scenario 10: expected the 'antigo segue intacto' line"
+grep -q "SEM BACKUP LOCAL" "$ROOT10/out.log" && bad "scenario 10: claims SEM BACKUP LOCAL although the primary was never touched" || ok "scenario 10: no false SEM BACKUP LOCAL claim"
+[ -s "$ROOT10/notify.log" ] && bad "scenario 10: alarmed although nothing was lost" || ok "scenario 10: no alarm when nothing was lost"
+pkill -f "reseed-selftest-s10.$$" 2>/dev/null
+rm -rf "$ROOT10" 2>/dev/null
+
+# S11/S12: the verification restore does not FINISH (124 = its own timeout fired; 137 = OOM-killed)
+# after the primary was freed. Not a verdict on the backup: .new stays, nothing says 'NÃO RESTAURA'.
+for RC_CASE in 124 137; do
+  ROOT11="/tmp/reseed-selftest-s11-$RC_CASE.$$"
+  setup_scenario "$ROOT11" 10 20 50; mk_notify_capture "$ROOT11"
+  # shellcheck disable=SC2086
+  run_scenario "$ROOT11" $LOWDISK_ENV FAKE_RESTORE_RC=$RC_CASE DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY="$ROOT11/notify-capture"
+  [ "$RC" -ne 0 ] && ok "scenario 11 (restore rc=$RC_CASE after the primary was freed): exits non-zero" || bad "scenario 11 (rc=$RC_CASE): expected non-zero exit"
+  [ -d "$ROOT11/city/.dolt-backup/hq.new" ] && ok "scenario 11 (rc=$RC_CASE): hq.new is PRESERVED — an unfinished restore is not 'does not restore'" || bad "scenario 11 (rc=$RC_CASE): hq.new was deleted on a restore that merely did not finish"
+  grep -q "NÃO TERMINOU (rc=$RC_CASE)" "$ROOT11/out.log" && ok "scenario 11 (rc=$RC_CASE): the log says the restore did not finish, with the rc" || bad "scenario 11 (rc=$RC_CASE): missing the 'NÃO TERMINOU' line"
+  grep -q "NÃO RESTAURA" "$ROOT11/out.log" && bad "scenario 11 (rc=$RC_CASE): reports 'NÃO RESTAURA' for a restore that did not finish" || ok "scenario 11 (rc=$RC_CASE): no false 'NÃO RESTAURA' verdict"
+  grep -q "SEM BACKUP LOCAL" "$ROOT11/out.log" && ok "scenario 11 (rc=$RC_CASE): still raises the SEM BACKUP LOCAL alarm text" || bad "scenario 11 (rc=$RC_CASE): lost the SEM BACKUP LOCAL alarm"
+  [ -s "$ROOT11/notify.log" ] && ok "scenario 11 (rc=$RC_CASE): the alarm fired from the reseed itself" || bad "scenario 11 (rc=$RC_CASE): no alarm fired"
+  rm -rf "$ROOT11" 2>/dev/null
+done
+
+# S13: a GENUINE restore failure (rc=1) is unchanged — the unverified .new is discarded.
+ROOT13="/tmp/reseed-selftest-s13.$$"
+setup_scenario "$ROOT13" 10 20 50
+# shellcheck disable=SC2086
+run_scenario "$ROOT13" $LOWDISK_ENV FAKE_RESTORE_RC=1
+[ ! -e "$ROOT13/city/.dolt-backup/hq.new" ] && ok "scenario 13 (genuine restore failure, rc=1): the bad hq.new is still discarded — only 'did not finish' changed" || bad "scenario 13: a genuine restore failure should still discard hq.new"
+grep -q "NÃO RESTAURA" "$ROOT13/out.log" && ok "scenario 13: the verdict 'NÃO RESTAURA' is still given for a real failure" || bad "scenario 13: lost the 'NÃO RESTAURA' verdict for a real failure"
+rm -rf "$ROOT13" 2>/dev/null
+
+# S14: outside low-disk mode (old backup untouched) a restore that does not finish keeps today's
+# behaviour: the unverified .new is dropped and the intact old backup stays.
+ROOT14="/tmp/reseed-selftest-s14.$$"
+setup_scenario "$ROOT14" 5 5 200
+run_scenario "$ROOT14" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=5 FAKE_RESTORE_RC=124
+[ "$RC" -ne 0 ] && ok "scenario 14 (restore rc=124, old backup untouched): exits non-zero" || bad "scenario 14: expected non-zero exit"
+[ -f "$ROOT14/city/.dolt-backup/hq/old-bloat.bin" ] && ok "scenario 14: the old backup is intact" || bad "scenario 14: the old backup was damaged"
+[ ! -e "$ROOT14/city/.dolt-backup/hq.new" ] && ok "scenario 14: the unverified .new is dropped, as before (nothing depends on it)" || bad "scenario 14: expected the .new to be dropped when the old backup is intact"
+rm -rf "$ROOT14" 2>/dev/null
 
 # ── Scenario 5: RESEED_ALLOW_LOW_DISK=0 → old refuse-only behavior preserved ──
 ROOT5="/tmp/reseed-selftest-s5.$$"

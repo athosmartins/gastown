@@ -435,11 +435,30 @@ STATE_RESURRECT_ESCALATE_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-resurrect-
 # job but would block this guard's own ~300s StartInterval cycle for up to 30
 # cycles' worth of wall time; 240s mirrors _reap_backup_residue's 180s
 # same-file precedent (a bit larger because a reseed does real sync/restore
-# I/O, not just an S3 head-object check). A timeout kill mid-reseed carries
-# the same "SEM BACKUP LOCAL, unalarmed" residual risk the daily cron's own
-# timeout wrapper already has — not a new risk this lever introduces, just a
-# second, shorter-fused caller of it.
+# I/O, not just an S3 head-object check). A timeout kill mid-reseed leaves the
+# db with no verified local backup: rare for a db that fits this budget, CERTAIN
+# for one that does not — which is what RESEED_TRIGGER_MAX_BACKUP_MB below
+# exists to keep out of this lever.
 RESEED_TRIGGER_TIMEOUT_SECS="${DOLT_DISK_FLOOR_RESEED_TRIGGER_TIMEOUT_SECS:-240}"
+
+# ga-0m4fqu: ceiling (MB) on the size of a db's CURRENT backup dir for this lever
+# to try a reseed at all. Above it the reseed cannot finish inside
+# RESEED_TRIGGER_TIMEOUT_SECS, so the attempt is a guaranteed loser. Measured
+# 15/10: whatsapp_automation (1.6-2.0 GB) needs sync ~75s + S3 proof ~35s + a
+# verification restore of >=130s even on a calm day (14/10 04:03-04:06). This
+# lever only fires at CRITICAL, where the reseed picks its low-disk mode, which
+# deletes the old primary BEFORE it verifies the new copy — so the 240s kill
+# (15/10 11:15:10, and 12/10 15:28) lands mid-verification and leaves a
+# complete-but-unverified <db>.new beside NO primary, which then blocks the 04:00
+# reseed ("já existe") for as long as nobody clears it. The small dbs (<=17 MB)
+# finished in 1-29s on 15/10. 400 MB is ~85s at the best-case rate: ~3x headroom
+# under 240s.
+# A db above the ceiling is left to dolt-s3-backup.sh's 04:00 run, whose per-db
+# budget (1800s, 3600s for hq) was sized for it. A size that cannot be read is
+# skipped too: without it a fit cannot be told from a loser, and the inert answer
+# is to leave the backup alone.
+RESEED_TRIGGER_MAX_BACKUP_MB="${DOLT_DISK_FLOOR_RESEED_TRIGGER_MAX_BACKUP_MB:-400}"
+case "$RESEED_TRIGGER_MAX_BACKUP_MB" in ''|*[!0-9]*) RESEED_TRIGGER_MAX_BACKUP_MB=400 ;; esac
 
 # ga-74tts6: per-db cooldown between guard-triggered reseed attempts. A
 # success moves avail back up, so the NEXT cycle's was_critical gate alone
@@ -2747,6 +2766,22 @@ _reap_backup_residue() {
   fi
 }
 
+# _reseed_trigger_fits <backup_dir> — ga-0m4fqu. Prints exactly one of
+# "ok <MB>", "too-big <MB>" or "unknown", and returns 0 either way: the caller
+# reads the word. Three answers on purpose — "the size could not be read" must
+# not come out as "small enough" (that is the call that sends a 2 GB backup into
+# a 240s budget) nor as "too big" (which would blame the db for a du failure).
+_reseed_trigger_fits() {
+  local dir="$1" kb mb
+  # vazio (dir sem arquivos) -> 0 MB, cabe; falhou/ilegivel -> "unknown": o
+  # chamador pula o db sem tocar no backup.
+  kb="$(du -sk "$dir" 2>/dev/null | awk '{print $1}')"
+  case "$kb" in ''|*[!0-9]*) echo "unknown"; return 0 ;; esac
+  mb=$(( kb / 1024 ))
+  if [ "$mb" -gt "$RESEED_TRIGGER_MAX_BACKUP_MB" ]; then echo "too-big $mb"; else echo "ok $mb"; fi
+  return 0
+}
+
 # _reap_bloated_backup_staging <was_critical> — tenth reclaim lever (ga-74tts6):
 # unlike _reap_backup_residue above (which only ever releases ALREADY-retired
 # .old residue), this one triggers dolt-backup-reseed.sh's full shrink-in-place
@@ -2781,12 +2816,15 @@ _reap_backup_residue() {
 # regardless of how many dbs are eligible — if more than one genuinely needs
 # it, later CRITICAL cycles (5min apart) pick up the rest. Per-db cooldown
 # (RESEED_TRIGGER_COOLDOWN_SECS) avoids hammering a db whose reseed attempt
-# just failed; deliberately does NOT try to judge "is this db's backup
-# actually bloated enough to be worth it" — dolt-backup-reseed.sh's own
-# preflight already picks the safest available mode (normal/low-disk/ultra)
-# for whatever the CURRENT free space is, so an unnecessary attempt on an
-# already-lean backup just does the same reseed the daily cron would have
-# done anyway, not a wasted or risky one.
+# just failed. It does NOT judge "is this db's backup actually bloated enough to
+# be worth it" — dolt-backup-reseed.sh's own preflight already picks the safest
+# available mode (normal/low-disk/ultra) for whatever the CURRENT free space is,
+# so an unnecessary attempt on an already-lean backup just does the same reseed
+# the daily cron would have done anyway. It judges exactly ONE thing before
+# triggering (ga-0m4fqu): whether the reseed can FINISH inside
+# RESEED_TRIGGER_TIMEOUT_SECS (_reseed_trigger_fits). A db whose backup is over
+# RESEED_TRIGGER_MAX_BACKUP_MB, or whose size cannot be read, is skipped — and
+# the skip neither takes this cycle's one-db slot nor starts that db's cooldown.
 _reap_bloated_backup_staging() {
   local was_critical="${1:-0}"
   if [ "$ENABLED" != "1" ]; then
@@ -2809,7 +2847,7 @@ _reap_bloated_backup_staging() {
 
   mkdir -p "$STATE_RESEED_TRIGGER_DIR" 2>/dev/null || true
   local now_epoch; now_epoch=$(date +%s)
-  local dir base db state_file last
+  local dir base db state_file last fit
   for dir in "$backup_root"/*/; do
     [ -d "$dir" ] || continue
     base="$(basename "$dir")"
@@ -2821,6 +2859,19 @@ _reap_bloated_backup_staging() {
       log "backup-staging-reap SKIP $db — .new/.old residue present (a reseed is already in flight or needs manual attention first)"
       continue
     fi
+
+    # ga-0m4fqu: only try a reseed that can finish inside the budget. A skip
+    # `continue`s: it does not take the one-db slot and writes no cooldown state.
+    fit="$(_reseed_trigger_fits "$backup_root/$db")"
+    case "$fit" in
+      ok*) ;;
+      too-big*)
+        log "backup-staging-reap SKIP $db — its backup is ${fit#too-big } MB, over the ${RESEED_TRIGGER_MAX_BACKUP_MB} MB ceiling: a reseed that size cannot finish inside ${RESEED_TRIGGER_TIMEOUT_SECS}s, and the timeout kill lands mid-verification (12/10 and 15/10, ga-0m4fqu). Left to the 04:00 dolt-s3-backup.sh run."
+        continue ;;
+      *)
+        log "backup-staging-reap SKIP $db — could not read the size of its backup, so a reseed that fits cannot be told from one that does not; the backup is left untouched."
+        continue ;;
+    esac
 
     state_file="$STATE_RESEED_TRIGGER_DIR/$db"
     last=""

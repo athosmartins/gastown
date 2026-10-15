@@ -1307,6 +1307,33 @@ _retire_superseded_new_all() {
   return $rc
 }
 
+# _reseed_interrupted <sinal> — ga-0m4fqu. Handler de TERM/INT/HUP de _run_reseed.
+# O guard (dolt-disk-floor-guard.sh) dispara este script sob `timeout 240`, e o
+# `timeout` manda o sinal para o GRUPO inteiro: sem handler o script morria calado
+# no meio da verificação (12/10 15:28 e 15/10 11:15:10). O de 15/10, em modo de
+# baixo disco, já tinha apagado a primária antiga e deixou o .new completo, sem
+# verificação, ao lado de NENHUMA primária — e nenhuma linha de log dizia isso.
+# O handler não conserta nada (o que sobrou só se prova com um restore, e quem
+# chama está matando este processo): diz a verdade sobre o estado que fica e sai.
+# Nunca apaga: depois de OLD_FREED_EARLY=1 o $NEW_DIR pode ser a ÚNICA cópia
+# local, e um sinal não diz "não restaura". DB/NEW_DIR/BACKUP_DIR/OLD_FREED_EARLY
+# são locais de _run_reseed; o trap roda com ele na pilha, então este handler os
+# enxerga (escopo dinâmico do bash).
+_reseed_interrupted() {
+  local sig="$1" code=143
+  case "$sig" in INT) code=130 ;; HUP) code=129 ;; esac
+  # OLD_RELEASE_STARTED cobre a janela do próprio `rm -rf` do antigo (27s para 2 GB em
+  # 15/10): o sinal pode cair no meio dele, com OLD_FREED_EARLY ainda 0 e a primária
+  # pela metade. Nessa janela "o antigo segue intacto" seria falso.
+  if [ "${OLD_FREED_EARLY:-0}" = "1" ] || [ "${OLD_RELEASE_STARTED:-0}" = "1" ]; then
+    log "INTERROMPIDO por $sig durante/depois da liberação do backup antigo: o antigo foi (ou estava sendo) apagado — $BACKUP_DIR pode não existir ou estar pela metade — e '$DB' está SEM BACKUP LOCAL VÁLIDO. $NEW_DIR (se existir) pode estar completo ou pela metade (confira se tem manifest) e NÃO foi verificado por restore: fica PRESERVADO — pode ser a única cópia local, não é resíduo comum — e o S3 (provado antes da liberação) é o fallback. Para terminar com $BACKUP_DIR ausente: $0 --promote-new-after-release $DB (restaura $NEW_DIR para conferir antes de promover; recusa se $BACKUP_DIR existir; precisa de disco livre para o restore). Se $BACKUP_DIR ficou pela metade, ele tem de ser liberado antes — leia o cabeçalho de _release_manifestless_primary (exige prova do S3) em vez de apagar à mão."
+    notify_fail "reseed de '$DB' INTERROMPIDO por $sig durante/depois da liberação do backup antigo: '$DB' está SEM BACKUP LOCAL VÁLIDO; $NEW_DIR (se existir) foi preservado SEM verificação (pode estar pela metade) — NÃO apague. O S3 é o fallback. Ver $LOG."
+  else
+    log "INTERROMPIDO por $sig antes de liberar o backup antigo: o antigo segue intacto em $BACKUP_DIR; $NEW_DIR (se existir) é uma cópia não verificada e nada foi trocado."
+  fi
+  exit "$code"
+}
+
 # _run_reseed <db> — todo o mecanismo (preflights, construção, verificação,
 # troca), extraído para função só para caber num LIB mode testável
 # (DOLT_BACKUP_RESEED_LIB=1) sem mudar nenhum comportamento do fluxo normal.
@@ -1391,6 +1418,17 @@ _run_reseed() {
   [ -e "$OLD_DIR" ] && die "$OLD_DIR já existe — resíduo de uma execução anterior. Investigue antes."
 
   local OLD_FREED_EARLY=0
+  local OLD_RELEASE_STARTED=0   # vira 1 ANTES de cada remoção do backup antigo (ver _reseed_interrupted)
+
+  # ga-0m4fqu: daqui em diante um sinal vira uma linha de log que diz o estado
+  # (ver _reseed_interrupted). Instalado ANTES do Passo 0.5 para cobrir também a
+  # janela do modo ULTRA, que apaga o antigo antes de construir qualquer coisa.
+  # Se o sinal chegar só ao script e não ao filho em primeiro plano, o bash adia o
+  # handler até o filho terminar. O `timeout` do guard sinaliza o grupo todo (o log de
+  # 15/10 mostra o filho "Terminated: 15"), então ali o filho cai junto e o handler roda já.
+  trap '_reseed_interrupted TERM' TERM
+  trap '_reseed_interrupted INT' INT
+  trap '_reseed_interrupted HUP' HUP
 
   # ── Passo 0.5 (só quando nem uma cópia nova cabe com o antigo no lugar,
   # ga-74tts6): liberar o antigo AGORA, com prova do S3, ANTES de escrever
@@ -1406,6 +1444,7 @@ _run_reseed() {
     fi
     local OLD_FREED_SIZE; OLD_FREED_SIZE="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
     log "modo ULTRA de baixo disco: prova do S3 OK para '$DB' -- liberando o antigo ($BACKUP_DIR, ~${OLD_FREED_SIZE:-?}) ANTES de construir, porque não há espaço para os dois coexistirem."
+    OLD_RELEASE_STARTED=1
     if ! rm -rf "$BACKUP_DIR"; then
       die "modo ULTRA de baixo disco: rm -rf do backup antigo falhou -- NADA foi trocado, mas investigue $BACKUP_DIR manualmente (pode estar parcialmente removido)."
     fi
@@ -1463,6 +1502,7 @@ _run_reseed() {
       fi
       local OLD_FREED_SIZE; OLD_FREED_SIZE="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
       log "modo de baixo disco: prova do S3 OK para '$DB' -- liberando o antigo ($BACKUP_DIR, ~${OLD_FREED_SIZE:-?}) ANTES da verificação, para caber o restore."
+      OLD_RELEASE_STARTED=1
       if ! rm -rf "$BACKUP_DIR"; then
         rm -rf "$NEW_DIR"
         die "modo de baixo disco: rm -rf do backup antigo falhou -- NADA foi trocado, mas investigue $BACKUP_DIR manualmente (pode estar parcialmente removido)."
@@ -1483,7 +1523,18 @@ _run_reseed() {
   trap cleanup_verify_dir EXIT
 
   log "restaurando o backup novo para conferência..."
-  if ! ( cd "$VERIFY_DIR" && timeout 1800 "$DOLT_BIN" backup restore "file://$NEW_DIR" "${DB}_verify" >/dev/null 2>&1 ); then
+  # ga-0m4fqu: o restore tem TRÊS resultados, não dois: restaurou (0), NÃO restaura
+  # (o dolt falhou) e NÃO CONSEGUI SABER — 124 (o `timeout 1800` estourou) ou >=128
+  # (o filho morreu por sinal, p.ex. OOM-kill 137). Os dois últimos não são veredito
+  # sobre o backup. Tratá-los como "NÃO RESTAURA" apagava o .new — que, depois da
+  # liberação antecipada do antigo, é a única cópia local.
+  local RESTORE_RC=0
+  ( cd "$VERIFY_DIR" && timeout 1800 "$DOLT_BIN" backup restore "file://$NEW_DIR" "${DB}_verify" >/dev/null 2>&1 ) || RESTORE_RC=$?
+  if [ "$RESTORE_RC" -ne 0 ]; then
+    if [ "$OLD_FREED_EARLY" = "1" ] && { [ "$RESTORE_RC" -eq 124 ] || [ "$RESTORE_RC" -ge 128 ]; }; then
+      notify_fail "reseed de '$DB': a restauração de verificação NÃO TERMINOU (rc=$RESTORE_RC; 124 = estourou o timeout, >=128 = morta por sinal/OOM) e o backup antigo já tinha sido liberado: '$DB' está SEM BACKUP LOCAL VÁLIDO; $NEW_DIR foi preservado SEM verificação — NÃO apague. O S3 é o fallback. Ver $LOG."
+      die "SEM BACKUP LOCAL: modo de baixo disco já tinha liberado o antigo (com prova do S3), e a restauração de verificação do novo NÃO TERMINOU (rc=$RESTORE_RC) -- isso NÃO é veredito de que o novo não restaura. $NEW_DIR foi PRESERVADO, sem verificação: pode ser a única cópia local. '$DB' está sem backup local válido agora -- o S3 verificado antes da liberação é o fallback. Para terminar: $0 --promote-new-after-release $DB (precisa de disco livre para o restore)."
+    fi
     rm -rf "$NEW_DIR"
     if [ "$OLD_FREED_EARLY" = "1" ]; then
       die "SEM BACKUP LOCAL: modo de baixo disco já tinha liberado o antigo (com prova do S3), e o backup novo NÃO RESTAURA. '$DB' está sem backup local agora -- o S3 verificado antes da liberação é o único fallback. Investigue imediatamente."
