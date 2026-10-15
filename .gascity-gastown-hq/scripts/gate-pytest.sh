@@ -61,18 +61,23 @@
 #   AVISO (o rc do revisor não muda): uma execução fora do log é dita, não some da contagem em silêncio.
 #   Ajustes por ambiente: GATE_PYTEST_MBP_TIMEOUT_S (420), GATE_PYTEST_PY (python3), GATE_PYTEST_FORCE_LOCAL_LIST,
 #   GATE_PYTEST_MBP_RUN, GATE_PYTEST_CITY.
+#   Outro chamador (o atalho de pytest dos workers, scripts/pytest-shim/, ga-fl2nek) usa a MESMA política com a chave, o log, o
+#   prefixo das mensagens e a dica de "rode aqui" DELE, para não misturar a contagem do gate nem desligar o gate por engano:
+#   GATE_PYTEST_OFF_FILE, GATE_PYTEST_LOG, GATE_PYTEST_TAG, GATE_PYTEST_LOCAL_HINT. Sem essas variáveis nada muda para o revisor.
 set -o pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CITY=${GATE_PYTEST_CITY:-${GC_CITY_PATH:-${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}}}
 MBP_RUN=${GATE_PYTEST_MBP_RUN:-$HERE/mbp-run.sh}
 PY=${GATE_PYTEST_PY:-python3}
-OFF_FILE="$CITY/.gc/gate-pytest.off"
+OFF_FILE=${GATE_PYTEST_OFF_FILE:-$CITY/.gc/gate-pytest.off}
 FORCE_LOCAL_LIST=${GATE_PYTEST_FORCE_LOCAL_LIST:-$HERE/gate-pytest.force-local}
-LOG="$CITY/.gc/logs/gate-pytest.jsonl"
+LOG=${GATE_PYTEST_LOG:-$CITY/.gc/logs/gate-pytest.jsonl}
+TAG=${GATE_PYTEST_TAG:-gate-pytest}
+LOCAL_HINT=${GATE_PYTEST_LOCAL_HINT:-python3 -m pytest direto}
 export MBP_RUN_TIMEOUT_S="${GATE_PYTEST_MBP_TIMEOUT_S:-${MBP_RUN_TIMEOUT_S:-420}}"
 
-say() { printf 'gate-pytest: %s\n' "$*"; }
+say() { printf '%s: %s\n' "$TAG" "$*"; }
 usage() { sed -n '2,/^set -o pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }   # até a linha anterior ao código: o cabeçalho pode crescer
 
 dir="$PWD"; repo=""
@@ -446,7 +451,9 @@ SECS=$(( $(date +%s) - T_START ))
 # visível. Só quando um verde do MBP foi mesmo aceito (nada reconferido aqui, ao menos para um alvo) e o veredito final é verde; vem ANTES da linha final (o revisor copia a última).
 if [ $GREEN_MBP -eq 1 ] && [ "$RC" = 0 ]; then
   ESCOPO="."; [ $GREEN_PARTIAL -eq 1 ] && ESCOPO=" SÓ para os alvos que não pularam (os que pularam rodaram aqui)."
-  say "nota: verde do MBP aceito como veio${ESCOPO} O MBP não tem shared/data nem .env: um teste que lê dado por um caminho que o wrapper não vê (constante numa lib, fixture) pode ter passado VAZIO lá — se o código testado lê dado, trate este verde como não verificado e rode esses arquivos aqui com python3 -m pytest direto"
+  say "nota: verde do MBP aceito como veio${ESCOPO} O MBP não tem shared/data nem .env: um teste que lê dado por um caminho que o wrapper não vê (constante numa lib, fixture) pode ter passado VAZIO lá — se o código testado lê dado, trate este verde como não verificado e rode esses arquivos aqui com ${LOCAL_HINT}"
+  # variável de ambiente posta na frente do comando não viaja: o comando remoto do mbp-run é fixo (export PATH=... PYTHONDONTWRITEBYTECODE=1)
+  say "nota: variável de ambiente posta na frente do comando (FOO=1 python3 -m pytest, PYTHONPATH=, PYTEST_ADDOPTS) NÃO chega ao MBP: o verde acima pode ser um verde sem ela — se o teste depende dela, rode aqui."
 fi
 # O log é o insumo do antes×depois: uma linha que não foi gravada some da contagem. O rc do revisor não depende dele (nunca falha por
 # causa do log), mas a falta é DITA na saída, não engolida — quem lê "execuções: N" sabe que pode faltar uma.

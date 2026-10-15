@@ -1017,6 +1017,318 @@ else
   grep -qF "FALHA" "$LOG" && ! grep -qF "LIBERADA" "$LOG" && ok "S23: logged FALHA and did NOT claim LIBERADA" || bad "S23: log claims success or lacks FALHA"
   [ -s "$NOTIFY_CALLS_FILE_PROMOTE" ] && ok "S23: notify_fail fired (a delete that fails is a real anomaly)" || bad "S23: notify_fail should have fired"
 fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 1f (ga-m9wpnk): _retire_superseded_new() — a "<db>.new" left beside a VALID
+# primary (both have a manifest, no .old) is RENAMED to .old so that
+# dolt-backup-residue-reclaim.sh (the one deleter, with S3 proof) frees it. Measured
+# 13/10: whatsapp_automation.new (1.5 GB) sat 30h beside a good primary while the disk
+# was at Dolt's critical floor — swap-repair acts only when the PRIMARY lacks a manifest,
+# residue-reclaim globs *.old only, --release-stale-new has no automatic caller.
+# Same fixtures as Part 1e (stubbed ps; the rename is REAL, against a scratch tree).
+# Nothing here may ever delete, and nothing here may touch S3.
+# ═══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── _retire_superseded_new() — pure gate + dry-run vocabulary (ga-m9wpnk) ──"
+
+if type _should_retire_superseded_new >/dev/null 2>&1 && type _retire_superseded_new >/dev/null 2>&1 \
+   && type _retire_superseded_new_all >/dev/null 2>&1 && type _retire_dry_run_state >/dev/null 2>&1; then
+  ok "_should_retire_superseded_new / _retire_superseded_new / _retire_superseded_new_all / _retire_dry_run_state defined by lib-mode source"
+else
+  bad "the retire-superseded-new functions are NOT defined — the mode does not exist yet"
+fi
+
+# args: primary_ok new_manifest_ok old_absent new_mtime primary_mtime idle
+rgate() { _should_retire_superseded_new "$@" 2>/dev/null; }
+rgate 1 1 1 1000 5000 1 && ok "retire gate: primary ok, .new has a manifest, no .old, .new older than the primary, idle → retire" || bad "retire gate: the all-good case must retire"
+rgate 1 1 1 5000 5000 1 && bad "retire gate: .new mtime == primary mtime retired (must be STRICTLY older)" || ok "retire gate: .new as new as the primary → keep"
+rgate 1 1 1 5001 5000 1 && bad "retire gate: .new NEWER than the primary retired (it may be the freshest copy)" || ok "retire gate: .new newer than the primary → keep"
+for pos in 1 2 3 6; do
+  for v in 0 "" x 2 " 1"; do
+    args=(1 1 1 1000 5000 1); args[$((pos-1))]="$v"
+    rgate "${args[@]}" && bad "retire gate: flag arg $pos='$v' retired (only a literal 1 is proof)" || ok "retire gate: flag arg $pos='$v' → keep"
+  done
+done
+for pos in 4 5; do
+  for v in "" abc -5 1.5; do
+    args=(1 1 1 1000 5000 1); args[$((pos-1))]="$v"
+    rgate "${args[@]}" && bad "retire gate: numeric arg $pos='$v' retired" || ok "retire gate: numeric arg $pos='$v' → keep (fail closed)"
+  done
+done
+rgate && bad "retire gate: no args retired" || ok "retire gate: no args → keep"
+
+# The dry-run switch: only an explicit opt-out acts. 'true' being DRY is the ga-p3ynfr lesson
+# (a boolean-looking value must never fall through to ACT); an unknown word is named, not guessed.
+_rd() { local got; got="$(_retire_dry_run_state "$2")"; [ "$got" = "$1" ] && ok "dry-run state '$2' → $got" || bad "dry-run state '$2': expected $1, got $got"; }
+_rd ACT 0; _rd ACT no; _rd ACT false; _rd ACT off; _rd ACT FALSE
+_rd DRY ""; _rd DRY 1; _rd DRY true; _rd DRY TRUE; _rd DRY yes; _rd DRY on
+_rd UNRECOGNIZED sim; _rd UNRECOGNIZED 2; _rd UNRECOGNIZED " 1 "; _rd UNRECOGNIZED "0;x"; _rd UNRECOGNIZED nao
+_rd_bad=0
+for v in "" 1 true TRUE yes on sim 2 x " 1 " "1;rm" TrUe " 0" "0 " "false "; do
+  [ "$(_retire_dry_run_state "$v")" = "ACT" ] && { bad "dry-run: ambiguous value '$v' resolved to ACT"; _rd_bad=1; }
+done
+[ "$_rd_bad" = "0" ] && ok "dry-run: no ambiguous value resolves to ACT"
+
+echo ""
+echo "── _retire_superseded_new() — real rename against a scratch fixture, stubbed ps (ga-m9wpnk) ──"
+
+_run_retire() {   # [db] — rc of _retire_superseded_new; RETIRE_DRY unset → "0" (act), set (even '') is passed through
+  (cd "$LIB_SCRATCH" && PATH="$LIB_SCRATCH/bin:$PATH" \
+    BACKUP_ROOT="${RETIRE_ROOT-$PRIMARY_ROOT}" NOTIFY="$LIB_SCRATCH/bin/notify" \
+    RESEED_PS_BIN="$LIB_SCRATCH/bin/ps-stub" \
+    RESEED_S3_BACKUP_LOCKDIR="$STALE_LOCKDIR" \
+    RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN="${RETIRE_DRY-0}" \
+    _retire_superseded_new "$@") >/dev/null 2>&1
+}
+_run_retire_all() {   # rc of _retire_superseded_new_all
+  (cd "$LIB_SCRATCH" && PATH="$LIB_SCRATCH/bin:$PATH" \
+    BACKUP_ROOT="${RETIRE_ROOT-$PRIMARY_ROOT}" NOTIFY="$LIB_SCRATCH/bin/notify" \
+    RESEED_PS_BIN="$LIB_SCRATCH/bin/ps-stub" \
+    RESEED_S3_BACKUP_LOCKDIR="$STALE_LOCKDIR" \
+    RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN="${RETIRE_DRY-0}" \
+    _retire_superseded_new_all "$@") >/dev/null 2>&1
+}
+r_kept() {   # <label> <log-substring> [old_expected=0] — hq.new still fully there, nothing created/moved, the log says why
+  if [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && [ -f "$PRIMARY_ROOT/hq.new/data.bin" ] \
+     && [ -s "$PRIMARY_ROOT/other.new/manifest" ] && [ -s "$FB/hq/manifest" ] && [ ! -e "$PRIMARY_ROOT/hq.old/hq.new" ]; then
+    ok "$1: hq.new KEPT in place, sibling/bucket intact"
+  else
+    bad "$1: FAIL-CLOSED VIOLATED — hq.new was moved/deleted, or something else was touched"
+  fi
+  if [ "${3:-0}" = "0" ]; then
+    [ ! -e "$PRIMARY_ROOT/hq.old" ] && [ ! -L "$PRIMARY_ROOT/hq.old" ] && ok "$1: no hq.old was created" || bad "$1: an hq.old appeared"
+  fi
+  if grep -qF "$2" "$LOG"; then ok "$1: logged '$2'"; else bad "$1: log lacks '$2' — $(tr '\n' '|' < "$LOG" | cut -c1-300)"; fi
+}
+
+# R1: every proof holds → hq.new is RENAMED to hq.old; nothing is deleted, nothing else is touched.
+mk_stalenew_scenario; : > "$LOG"
+R1_FILES="$(find "$PRIMARY_ROOT/hq.new" | wc -l | tr -d ' ')"
+R1_MTIME="$(stat -f %m "$PRIMARY_ROOT/hq.new")"
+_run_retire hq; rc=$?
+[ "$rc" -eq 0 ] && ok "R1 (all proofs hold): rc 0" || bad "R1: rc=$rc"
+[ ! -e "$PRIMARY_ROOT/hq.new" ] && [ -s "$PRIMARY_ROOT/hq.old/manifest" ] && ok "R1: hq.new is now hq.old (manifest there)" || bad "R1: hq.new was not renamed to hq.old"
+[ "$(find "$PRIMARY_ROOT/hq.old" | wc -l | tr -d ' ')" = "$R1_FILES" ] && [ -f "$PRIMARY_ROOT/hq.old/data.bin" ] && [ -f "$PRIMARY_ROOT/hq.old/$(tid 1)" ] \
+  && ok "R1: hq.old holds every one of the $R1_FILES entries hq.new had — RENAMED, nothing deleted" || bad "R1: hq.old does not hold what hq.new held"
+[ "$(stat -f %m "$PRIMARY_ROOT/hq.old")" = "$R1_MTIME" ] && ok "R1: the directory mtime survived the rename (residue-reclaim's settle window is measured on it)" || bad "R1: the rename changed the directory mtime — the settle window would restart"
+[ -f "$PRIMARY_ROOT/hq/data.bin" ] && [ -s "$PRIMARY_ROOT/other.new/manifest" ] && [ -s "$FB/hq/manifest" ] && ok "R1: primary hq, sibling other.new and the S3 bucket untouched" || bad "R1: something besides hq.new was touched"
+[ ! -s "$FAKE_AWS_CALLS" ] && ok "R1: ZERO aws calls — the retire path is S3-free (the reclaim that deletes later does its own S3 proof)" || bad "R1: the retire path called aws: $(tr '\n' '|' < "$FAKE_AWS_CALLS" | cut -c1-200)"
+grep -qF "PROVA OK" "$LOG" && grep -qF "APOSENTADO" "$LOG" && ok "R1: logged PROVA OK then APOSENTADO" || bad "R1: missing PROVA OK / APOSENTADO"
+grep -qF "LIBERADA" "$LOG" && bad "R1: logged LIBERADA — a retire is not a release" || ok "R1: never claims to have freed anything"
+# idempotent: a second run has nothing to do and changes nothing.
+: > "$LOG"; _run_retire hq; rc=$?
+[ "$rc" -eq 0 ] && [ -s "$PRIMARY_ROOT/hq.old/manifest" ] && [ ! -e "$PRIMARY_ROOT/hq.new" ] && grep -qF "nada a aposentar" "$LOG" && ok "R1b: second run → rc 0, 'nada a aposentar', hq.old untouched" || bad "R1b: second run misbehaved (rc=$rc)"
+
+# R2: dry by default — anything but an explicit opt-out proves, logs, and renames NOTHING.
+for v in "" 1 true TRUE yes on; do
+  mk_stalenew_scenario; : > "$LOG"; RETIRE_DRY="$v" _run_retire hq; rc=$?
+  r_kept "R2 (RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN='$v' → dry)" "DRY-RUN"
+  [ "$rc" -eq 0 ] && grep -qF "PROVA OK" "$LOG" && ok "R2 ('$v'): rc 0 and the proof is still logged" || bad "R2 ('$v'): rc=$rc / no PROVA OK"
+done
+mk_stalenew_scenario; : > "$LOG"; RETIRE_DRY=sim _run_retire hq
+r_kept "R2b (unrecognized value 'sim')" "não é reconhecido"
+mk_stalenew_scenario; : > "$LOG"
+(cd "$LIB_SCRATCH" && PATH="$LIB_SCRATCH/bin:$PATH" BACKUP_ROOT="$PRIMARY_ROOT" NOTIFY="$LIB_SCRATCH/bin/notify" RESEED_PS_BIN="$LIB_SCRATCH/bin/ps-stub" \
+  RESEED_S3_BACKUP_LOCKDIR="$STALE_LOCKDIR"; unset RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN; _retire_superseded_new hq) >/dev/null 2>&1
+r_kept "R2c (variable UNSET → dry: a caller that forgets the flag never acts)" "DRY-RUN"
+for v in 0 no false off; do
+  mk_stalenew_scenario; : > "$LOG"; RETIRE_DRY="$v" _run_retire hq
+  [ ! -e "$PRIMARY_ROOT/hq.new" ] && [ -s "$PRIMARY_ROOT/hq.old/manifest" ] && ok "R2d (explicit opt-out '$v'): renamed" || bad "R2d: '$v' did not act"
+done
+unset RETIRE_DRY
+
+# R3: a <db>.old already there (any kind) → never overwritten, never moved INTO. It belongs to the reclaim.
+mk_stalenew_scenario; mkdir -p "$PRIMARY_ROOT/hq.old"; echo mine > "$PRIMARY_ROOT/hq.old/marker"; : > "$LOG"; _run_retire hq
+r_kept "R3a (hq.old is a directory)" "old_absent=0" 1
+[ "$(cat "$PRIMARY_ROOT/hq.old/marker" 2>/dev/null)" = "mine" ] && [ "$(ls "$PRIMARY_ROOT/hq.old" | wc -l | tr -d ' ')" = "1" ] && ok "R3a: the existing hq.old is byte-for-byte untouched (nothing moved into it)" || bad "R3a: the existing hq.old was modified"
+mk_stalenew_scenario; mkdir -p "$LIB_SCRATCH/elsewhere"; echo keep > "$LIB_SCRATCH/elsewhere/precious"; ln -s "$LIB_SCRATCH/elsewhere" "$PRIMARY_ROOT/hq.old"; : > "$LOG"; _run_retire hq
+r_kept "R3b (hq.old is a symlink)" "old_absent=0" 1
+[ -f "$LIB_SCRATCH/elsewhere/precious" ] && [ ! -e "$LIB_SCRATCH/elsewhere/hq.new" ] && ok "R3b: the link target received nothing" || bad "R3b: something was moved through the symlink"
+rm -f "$PRIMARY_ROOT/hq.old"; rm -rf "$LIB_SCRATCH/elsewhere"
+mk_stalenew_scenario; ln -s "$LIB_SCRATCH/no-such-target" "$PRIMARY_ROOT/hq.old"; : > "$LOG"; _run_retire hq
+r_kept "R3c (hq.old is a BROKEN symlink — [ -e ] alone would call it absent)" "old_absent=0" 1
+rm -f "$PRIMARY_ROOT/hq.old"
+mk_stalenew_scenario; echo file > "$PRIMARY_ROOT/hq.old"; : > "$LOG"; _run_retire hq
+r_kept "R3d (hq.old is a plain file)" "old_absent=0" 1
+rm -f "$PRIMARY_ROOT/hq.old"
+
+# R4: the primary is not provably a good backup → hq.new may be the only copy that restores → keep.
+mk_stalenew_scenario; rm -f "$PRIMARY_ROOT/hq/manifest"; : > "$LOG"; _run_retire hq
+r_kept "R4a (primary has NO manifest)" "primary_ok=0"
+mk_stalenew_scenario; rm -f "$PRIMARY_ROOT/hq/$(tid 2).darc"; : > "$LOG"; _run_retire hq
+r_kept "R4b (primary manifest names a table that is gone — no local closure)" "primary_ok=0"
+mk_stalenew_scenario; rm -rf "$PRIMARY_ROOT/hq"; : > "$LOG"; _run_retire hq
+r_kept "R4c (no primary at all)" "primary_ok=0"
+mk_stalenew_scenario; mv "$PRIMARY_ROOT/hq" "$PRIMARY_ROOT/hq_real"; ln -s "$PRIMARY_ROOT/hq_real" "$PRIMARY_ROOT/hq"; : > "$LOG"; _run_retire hq
+r_kept "R4d (primary is a symlink)" "primary_ok=0"
+rm -rf "$PRIMARY_ROOT/hq_real"; rm -f "$PRIMARY_ROOT/hq"
+mk_stalenew_scenario; : > "$PRIMARY_ROOT/hq/manifest"; : > "$LOG"; _run_retire hq
+r_kept "R4e (primary manifest is empty)" "primary_ok=0"
+
+# R5: the .new has no manifest → it is an interrupted build, not a superseded backup: not this path's case.
+mk_stalenew_scenario; rm -f "$PRIMARY_ROOT/hq.new/manifest"; : > "$LOG"; _run_retire hq
+if [ -f "$PRIMARY_ROOT/hq.new/data.bin" ] && [ ! -e "$PRIMARY_ROOT/hq.old" ]; then ok "R5a (hq.new has no manifest): left where it is"; else bad "R5a: a manifest-less hq.new was moved"; fi
+grep -qF "new_manifest_ok=0" "$LOG" && ok "R5a: logged new_manifest_ok=0" || bad "R5a: missing new_manifest_ok=0"
+mk_stalenew_scenario; : > "$PRIMARY_ROOT/hq.new/manifest"; : > "$LOG"; _run_retire hq
+if [ -f "$PRIMARY_ROOT/hq.new/data.bin" ] && [ ! -e "$PRIMARY_ROOT/hq.old" ]; then ok "R5b (hq.new manifest is empty): left where it is"; else bad "R5b: an empty-manifest hq.new was moved"; fi
+
+# R6: age — a .new that is as new as, or newer than, the primary may be the freshest copy / a build in progress.
+mk_stalenew_scenario; set_tree_mtime "$PRIMARY_ROOT/hq.new" 3600; : > "$LOG"; _run_retire hq
+r_kept "R6a (hq.new NEWER than the primary)" "new_manifest_ok=1"
+mk_stalenew_scenario; set_tree_mtime "$PRIMARY_ROOT/hq" 7200; set_tree_mtime "$PRIMARY_ROOT/hq.new" 7200; : > "$LOG"; _run_retire hq
+r_kept "R6b (same mtime as the primary — not STRICTLY older)" "SPARED"
+mk_stalenew_scenario; touch "$PRIMARY_ROOT/hq.new/$(tid 1)"; : > "$LOG"; _run_retire hq
+r_kept "R6c (the dir mtime is old but a file INSIDE hq.new was just written — a build in progress)" "SPARED"
+
+# R7: the backup/restore must not be running (unknown counts as running).
+mk_stalenew_scenario; mkdir -p "$STALE_LOCKDIR"; : > "$LOG"; _run_retire hq
+r_kept "R7a (nightly dolt-s3-backup single-instance lock present)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_OUT="4242 1 /bin/bash /x/scripts/dolt-s3-backup.sh"; : > "$LOG"; _run_retire hq
+r_kept "R7b (dolt-s3-backup.sh is running)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_OUT="4243 1 /bin/bash /x/scripts/dolt-backup-reseed.sh hq"; : > "$LOG"; _run_retire hq
+r_kept "R7c (another dolt-backup-reseed.sh is running — it may be about to swap hq.new in)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_OUT="4244 1 /bin/bash /x/scripts/dolt-restore-verify.sh"; : > "$LOG"; _run_retire hq
+r_kept "R7d (dolt-restore-verify.sh is running)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_OUT="4245 4244 timeout 1800 dolt backup restore file://$PRIMARY_ROOT/hq.new hq_verify"; : > "$LOG"; _run_retire hq
+r_kept "R7e (a process has hq.new open — a verification restore of it)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_FAIL=1; : > "$LOG"; _run_retire hq
+r_kept "R7f (ps fails: whether a backup runs is UNKNOWN)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_EMPTY=1; : > "$LOG"; _run_retire hq
+r_kept "R7g (ps lists nothing at all — not a believable idle)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_OUT="$(printf '%s\n%s\n%s' \
+  "$$ $PPID /bin/bash /x/scripts/dolt-backup-reseed.sh --retire-superseded-new --all" \
+  "9101 $$ /bin/bash /x/scripts/dolt-backup-reseed.sh --retire-superseded-new --all" \
+  "$PPID 1 /usr/bin/timeout 60 bash /x/scripts/dolt-backup-reseed.sh --retire-superseded-new --all")"; : > "$LOG"; _run_retire hq
+[ ! -e "$PRIMARY_ROOT/hq.new" ] && [ -s "$PRIMARY_ROOT/hq.old/manifest" ] && ok "R7h (only this run, its subshell and its launcher mention the script): still RETIRED — self is not 'another run'" || bad "R7h: the retire refused because of its own command line (the guard would never be able to act)"
+mk_stalenew_scenario; export FAKE_PS_OUT="$(printf '%s\n%s' \
+  "$$ $PPID /bin/bash /x/scripts/dolt-backup-reseed.sh --retire-superseded-new --all" \
+  "9201 1 /bin/bash /x/scripts/dolt-backup-reseed.sh hq")"; : > "$LOG"; _run_retire hq
+r_kept "R7i (a look-alike whose parent is NOT this run = a concurrent reseed)" "idle=0"
+unset FAKE_PS_OUT FAKE_PS_FAIL FAKE_PS_EMPTY
+
+# R8: nothing / symlink / odd shapes.
+mk_stalenew_scenario; rm -rf "$PRIMARY_ROOT/hq.new"; : > "$LOG"; _run_retire hq; rc=$?
+[ "$rc" -eq 0 ] && [ ! -e "$PRIMARY_ROOT/hq.old" ] && grep -qF "nada a aposentar" "$LOG" && ok "R8a (no hq.new): rc 0, 'nada a aposentar', no hq.old" || bad "R8a: expected a clean no-op (rc=$rc)"
+mk_stalenew_scenario; rm -rf "$PRIMARY_ROOT/hq.new"; mkdir -p "$LIB_SCRATCH/elsewhere"; echo keep > "$LIB_SCRATCH/elsewhere/precious"
+ln -s "$LIB_SCRATCH/elsewhere" "$PRIMARY_ROOT/hq.new"; touch -h -t "$(ago_touch 172800)" "$PRIMARY_ROOT/hq.new"; : > "$LOG"; _run_retire hq
+if [ -L "$PRIMARY_ROOT/hq.new" ] && [ -f "$LIB_SCRATCH/elsewhere/precious" ] && [ ! -e "$PRIMARY_ROOT/hq.old" ]; then ok "R8b (hq.new is a symlink): link and target untouched, no hq.old"; else bad "R8b: a symlink hq.new was followed/moved"; fi
+grep -qF "RECUSANDO" "$LOG" && ok "R8b: logged RECUSANDO" || bad "R8b: missing RECUSANDO"
+rm -f "$PRIMARY_ROOT/hq.new"; rm -rf "$LIB_SCRATCH/elsewhere"
+mk_stalenew_scenario; rm -rf "$PRIMARY_ROOT/hq.new"; echo notadir > "$PRIMARY_ROOT/hq.new"; : > "$LOG"; _run_retire hq
+if [ -f "$PRIMARY_ROOT/hq.new" ] && [ ! -e "$PRIMARY_ROOT/hq.old" ] && grep -qF "RECUSANDO" "$LOG"; then ok "R8c (hq.new is a plain file): refused, untouched"; else bad "R8c: a plain-file hq.new was moved"; fi
+for badname in "" "../hq" "hq/x" "a b" "hq.old" ".." "hq;x" "hq.new"; do
+  mk_stalenew_scenario; : > "$LOG"
+  _run_retire "$badname"; rc=$?
+  if [ "$rc" -ne 0 ] && [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && [ ! -e "$PRIMARY_ROOT/hq.old" ] && stale_untouched; then ok "R8d: db name '$badname' → rc=$rc, nothing moved"; else bad "R8d: db name '$badname' was not refused cleanly (rc=$rc)"; fi
+done
+mk_stalenew_scenario; : > "$LOG"; RETIRE_ROOT="" _run_retire hq; rc=$?
+[ "$rc" -ne 0 ] && [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && ok "R8e (BACKUP_ROOT empty): rc=$rc, nothing moved" || bad "R8e: an empty BACKUP_ROOT was not refused (rc=$rc)"
+
+# R9: a failing rename is a FAILURE, never reported as retired.
+mk_stalenew_scenario; chmod 555 "$PRIMARY_ROOT"; : > "$LOG"; : > "$NOTIFY_CALLS_FILE_PROMOTE"; _run_retire hq; rc=$?
+chmod 755 "$PRIMARY_ROOT"
+if [ "$(id -u)" = "0" ]; then
+  ok "R9 skipped (root ignores directory permissions)"
+else
+  [ "$rc" -ne 0 ] && ok "R9 (mv fails): rc=$rc, nonzero" || bad "R9: a failed rename returned 0"
+  grep -qF "FALHA" "$LOG" && ! grep -qF "APOSENTADO" "$LOG" && ok "R9: logged FALHA and did NOT claim APOSENTADO" || bad "R9: log claims success or lacks FALHA"
+  [ -s "$NOTIFY_CALLS_FILE_PROMOTE" ] && ok "R9: notify_fail fired (a rename that fails is a real anomaly)" || bad "R9: notify_fail should have fired"
+  [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && [ ! -e "$PRIMARY_ROOT/hq.old" ] && ok "R9: hq.new still in place" || bad "R9: hq.new vanished although the rename failed"
+fi
+
+echo ""
+echo "── _retire_superseded_new_all() — the sweep the disk-floor guard runs (ga-m9wpnk) ──"
+mk_sweep_scenario() {   # hq + dc each: valid primary, valid OLDER .new. other.new: no primary. a-b.new: odd name.
+  mk_stalenew_scenario
+  mk_backup_tables "$PRIMARY_ROOT/dc" 6;     mk_backup_tables "$PRIMARY_ROOT/dc.new" 4
+  mk_backup_tables "$PRIMARY_ROOT/a-b" 6;    mk_backup_tables "$PRIMARY_ROOT/a-b.new" 4
+  set_tree_mtime "$PRIMARY_ROOT/dc" 10800;   set_tree_mtime "$PRIMARY_ROOT/dc.new" 172800
+  set_tree_mtime "$PRIMARY_ROOT/a-b" 10800;  set_tree_mtime "$PRIMARY_ROOT/a-b.new" 172800
+}
+mk_sweep_scenario; : > "$LOG"; _run_retire_all; rc=$?
+[ "$rc" -eq 0 ] && ok "W1 (sweep): rc 0" || bad "W1: rc=$rc"
+if [ ! -e "$PRIMARY_ROOT/hq.new" ] && [ -s "$PRIMARY_ROOT/hq.old/manifest" ] && [ ! -e "$PRIMARY_ROOT/dc.new" ] && [ -s "$PRIMARY_ROOT/dc.old/manifest" ]; then ok "W1: hq.new → hq.old AND dc.new → dc.old (every provable .new, not just the first)"; else bad "W1: the sweep did not retire both hq.new and dc.new"; fi
+[ -s "$PRIMARY_ROOT/other.new/manifest" ] && [ ! -e "$PRIMARY_ROOT/other.old" ] && ok "W1: other.new (no primary beside it) left alone" || bad "W1: other.new, which has no valid primary, was touched"
+[ -s "$PRIMARY_ROOT/a-b.new/manifest" ] && [ ! -e "$PRIMARY_ROOT/a-b.old" ] && grep -qF "ignorando" "$LOG" && ok "W1: 'a-b.new' (name outside [A-Za-z0-9_]) ignored with a log line, not a failure" || bad "W1: the odd-named dir was touched or not reported"
+[ -f "$PRIMARY_ROOT/hq/data.bin" ] && [ -s "$PRIMARY_ROOT/dc/manifest" ] && [ -s "$FB/hq/manifest" ] && ok "W1: primaries and bucket untouched" || bad "W1: a primary or the bucket was touched"
+: > "$LOG"; _run_retire_all; rc=$?
+[ "$rc" -eq 0 ] && [ -s "$PRIMARY_ROOT/hq.old/manifest" ] && [ -s "$PRIMARY_ROOT/dc.old/manifest" ] && ok "W1b: a second sweep is a no-op (rc 0, both .old intact)" || bad "W1b: second sweep misbehaved (rc=$rc)"
+mk_sweep_scenario; mkdir -p "$PRIMARY_ROOT/dc.old"; echo mine > "$PRIMARY_ROOT/dc.old/marker"; : > "$LOG"; _run_retire_all; rc=$?
+[ -s "$PRIMARY_ROOT/hq.old/manifest" ] && [ -s "$PRIMARY_ROOT/dc.new/manifest" ] && [ "$(cat "$PRIMARY_ROOT/dc.old/marker")" = "mine" ] && ok "W2 (dc already has a .old): hq retired, dc.new kept, dc.old untouched — one db's refusal does not stop the others" || bad "W2: per-db isolation broken"
+mk_sweep_scenario; : > "$LOG"; RETIRE_DRY=1 _run_retire_all; rc=$?
+[ "$rc" -eq 0 ] && [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && [ -s "$PRIMARY_ROOT/dc.new/manifest" ] && [ ! -e "$PRIMARY_ROOT/hq.old" ] && [ ! -e "$PRIMARY_ROOT/dc.old" ] && ok "W3 (sweep, DRY_RUN=1): nothing renamed" || bad "W3: a dry sweep renamed something"
+unset RETIRE_DRY
+mk_stalenew_scenario; rm -rf "$PRIMARY_ROOT/hq.new" "$PRIMARY_ROOT/other.new"; : > "$LOG"; _run_retire_all; rc=$?
+[ "$rc" -eq 0 ] && grep -qF "nada a varrer" "$LOG" && ok "W4 (no *.new at all): rc 0, 'nada a varrer'" || bad "W4: expected a clean no-op (rc=$rc)"
+: > "$LOG"; RETIRE_ROOT="$LIB_SCRATCH/no-such-root" _run_retire_all; rc=$?
+[ "$rc" -ne 0 ] && [ ! -e "$LIB_SCRATCH/no-such-root" ] && grep -qF "não é um diretório legível" "$LOG" && ok "W5 (BACKUP_ROOT missing): rc=$rc — 'could not look' is NOT 'nothing to sweep'" || bad "W5: a missing BACKUP_ROOT was reported as an empty sweep (rc=$rc)"
+: > "$LOG"; RETIRE_ROOT="" _run_retire_all; rc=$?
+[ "$rc" -ne 0 ] && ok "W6 (BACKUP_ROOT empty): rc=$rc" || bad "W6: an empty BACKUP_ROOT was not refused"
+mk_sweep_scenario; chmod 555 "$PRIMARY_ROOT"; : > "$LOG"; _run_retire_all; rc=$?
+chmod 755 "$PRIMARY_ROOT"
+if [ "$(id -u)" != "0" ]; then
+  [ "$rc" -ne 0 ] && ok "W7 (every mv fails): the sweep's rc is nonzero (rc=$rc) — the guard sees the failure" || bad "W7: a sweep whose renames all failed returned 0"
+fi
+
+echo ""
+echo "── --retire-superseded-new as a real subprocess (the form the disk-floor guard calls) (ga-m9wpnk) ──"
+RET_CITY="$LIB_SCRATCH/retire-city"; RET_LOG="$LIB_SCRATCH/retire-cli.log"
+mkdir -p "$RET_CITY/.gc/logs"
+retire_cli() {   # <env assignments...> -- <args...> — runs the script for real; rc out, output in $LIB_SCRATCH/retire-cli.out
+  local envs=() a
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  shift
+  : > "$RET_LOG"
+  env -i HOME="$LIB_SCRATCH" TMPDIR="$LIB_SCRATCH" PATH="$LIB_SCRATCH/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    GC_CITY_PATH="$RET_CITY" GC_BACKUP_ARTIFACT_DIR="$PRIMARY_ROOT" RESEED_LOG="$RET_LOG" \
+    RESEED_PS_BIN="$LIB_SCRATCH/bin/ps-stub" RESEED_S3_BACKUP_LOCKDIR="$STALE_LOCKDIR" \
+    DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY=/usr/bin/true ${envs[@]+"${envs[@]}"} \
+    timeout 60 /bin/bash "$SCRIPT" "$@" > "$LIB_SCRATCH/retire-cli.out" 2>&1
+}
+mk_stalenew_scenario; retire_cli -- --retire-superseded-new hq; rc=$?
+if [ "$rc" -eq 0 ] && [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && [ ! -e "$PRIMARY_ROOT/hq.old" ] && grep -qF "DRY-RUN" "$RET_LOG"; then
+  ok "C1 (no flag): the script run with --retire-superseded-new is DRY — proves, logs, renames nothing"
+else bad "C1: the CLI mode without the flag acted or failed (rc=$rc): $(tail -3 "$RET_LOG" | tr '\n' '|')"; fi
+mk_stalenew_scenario; retire_cli RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN=0 -- --retire-superseded-new hq; rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$PRIMARY_ROOT/hq.new" ] && [ -s "$PRIMARY_ROOT/hq.old/manifest" ] && grep -qF "APOSENTADO" "$RET_LOG"; then
+  ok "C2 (flag=0): hq.new → hq.old through the real entry point (and the ephemeral-db check, which sits later, did not swallow 'hq')"
+else bad "C2: the CLI mode with the flag did not retire (rc=$rc): $(tail -3 "$RET_LOG" | tr '\n' '|')"; fi
+mk_stalenew_scenario; retire_cli RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN=0 -- --retire-superseded-new --all; rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$PRIMARY_ROOT/hq.new" ] && [ -s "$PRIMARY_ROOT/hq.old/manifest" ] && [ -s "$PRIMARY_ROOT/other.new/manifest" ]; then
+  ok "C3 (--all, flag=0): sweep through the real entry point retires hq.new, leaves other.new"
+else bad "C3: --all did not behave (rc=$rc): $(tail -3 "$RET_LOG" | tr '\n' '|')"; fi
+mk_stalenew_scenario; retire_cli RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN=0 -- --retire-superseded-new; rc=$?
+if [ "$rc" -ne 0 ] && [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && [ ! -e "$PRIMARY_ROOT/hq.old" ]; then
+  ok "C4 (no db and no --all): usage error, rc=$rc, nothing moved"
+else bad "C4: a bare --retire-superseded-new did something (rc=$rc)"; fi
+
+echo ""
+echo "── drift-guard: the retire path can rename, never delete, and never touches S3 (ga-m9wpnk) ──"
+RETIRE_BODY="$(awk '/^_retire_superseded_new\(\)/,/^\}/' "$SCRIPT"; awk '/^_retire_superseded_new_all\(\)/,/^\}/' "$SCRIPT")"
+if [ -n "$RETIRE_BODY" ] && ! printf '%s\n' "$RETIRE_BODY" | grep -v '^[[:space:]]*#' | grep -qE '(^|[^[:alnum:]_.$-])(rm|rmdir|unlink|safe-clean)([[:space:]]|$)'; then
+  ok "the retire functions contain no rm/rmdir/unlink — the one deleter stays dolt-backup-residue-reclaim.sh"
+else
+  bad "a delete command appeared in (or the retire functions vanished from) the retire path"
+fi
+N_RETIRE_MV=$(printf '%s\n' "$RETIRE_BODY" | grep -v '^[[:space:]]*#' | grep -cE '(^|[[:space:]])mv -- ')
+if [ "$N_RETIRE_MV" -eq 1 ] && printf '%s\n' "$RETIRE_BODY" | grep -qF 'mv -- "$new_dir" "$old_dir"' && printf '%s\n' "$RETIRE_BODY" | grep -qF '"$BACKUP_ROOT"/*.new)'; then
+  ok "the retire path has exactly one mv (new_dir → old_dir), behind a \"\$BACKUP_ROOT\"/*.new case guard"
+else
+  bad "expected exactly one 'mv -- \"\$new_dir\" \"\$old_dir\"' behind a case guard on \"\$BACKUP_ROOT\"/*.new (found $N_RETIRE_MV mv)"
+fi
+if ! printf '%s\n' "$RETIRE_BODY" | grep -v '^[[:space:]]*#' | grep -qE '\$AWS|s3api|aws s3|\$BUCKET'; then
+  ok "the retire path makes no S3 call (the reclaim that deletes later does its own S3 proof)"
+else
+  bad "the retire path calls S3 — it should only rename; the S3 proof belongs to the reclaim"
+fi
+if printf '%s\n' "$RETIRE_BODY" | grep -qF '_s3proof_local_closure_ok "$primary_dir"' && printf '%s\n' "$RETIRE_BODY" | grep -qF '_stale_new_idle_state "$new_dir"'; then
+  ok "the retire path takes the primary's local closure proof and the shared idle check (reused, not reimplemented)"
+else
+  bad "the retire path lost the primary closure proof or the idle check"
+fi
+N_HEAD_AFTER="$(grep -cF 's3api head-object' "$SCRIPT")"
+[ "$N_HEAD_AFTER" -eq 2 ] && ok "head-object count in reseed is unchanged by the retire path (still 2)" || bad "head-object count changed ($N_HEAD_AFTER) — the retire path must not add an S3 probe"
+
 unset FAKE_FP_RUN_UTC FAKE_FP_DB FAKE_PS_OUT FAKE_PS_FAIL FAKE_PS_EMPTY FAKE_AWS_MANIFEST_OK FAKE_AWS_FINGERPRINT_OK FAKE_S3_META_SEED_FILE
 rm -f "$STALE_FAILED_META"
 

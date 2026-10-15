@@ -1050,6 +1050,203 @@ delivery_comment()      { _delivery_write "comment on $1"         "$1" none     
 echo ""
 log "=== Delivery sweep start (DRY_RUN=${DRY_RUN}) ==="
 
+# get_runbook_field — defined here, ahead of Step 0-pre and Step 0a, because Step
+# 0-pre needs a rig's runtime_dir before the runbook file is checked in Step 0.
+# It only reads $RUNBOOK_FILE when called, so a missing file fails the lookup
+# (callers treat that as "unknown") and Step 0 still reports it as before.
+get_runbook_field() {
+  local rig_name="$1"
+  local field="$2"
+  python3 - <<PYEOF
+import re, sys
+
+rig_name = '$rig_name'
+field = '$field'
+
+with open('$RUNBOOK_FILE') as f:
+    content = f.read()
+
+# Find the [[rig]] block for our rig
+# Simple parser: split on [[rig]] boundaries, find the one with name = "rig_name"
+blocks = re.split(r'\[\[rig\]\]', content)
+for block in blocks:
+    m = re.search(r'name\s*=\s*"([^"]+)"', block)
+    if m and m.group(1) == rig_name:
+        # Find the field value
+        fm = re.search(rf'{re.escape(field)}\s*=\s*"([^"]*)"', block)
+        if fm:
+            print(fm.group(1))
+        else:
+            # Check for array (daemon_restarts = [])
+            am = re.search(rf'{re.escape(field)}\s*=\s*\[([^\]]*)\]', block)
+            if am:
+                items = [x.strip().strip('"') for x in am.group(1).split(',') if x.strip().strip('"')]
+                print('\n'.join(items))
+        sys.exit(0)
+# Not found
+sys.exit(1)
+PYEOF
+}
+
+# ── Step 0-pre: daemon-refresh baseline — advance over a delta no daemon can load (ga-thoo16) ──
+# The baseline marker ($RIG.sha) and the per-daemon pins ($RIG.perdaemon) only
+# moved from inside Step 5b, and Step 5b runs for a STORY awaiting delivery.
+# A delta that arrives any other way never reached it: a task/bug closed by the
+# Step 1b reconciler, or the rig's own deploy.sh resetting the checkout before a
+# scheduled run (property_scrapers: the checkout moves at 00:01/12:01 with no
+# story involved). Nothing then said "that delta touched no daemon", the marker
+# stayed put, the Step 0a alarm below fired, and every later helper run got a
+# window that only widened. Runs once per sweep, before the alarm, so a delta
+# that is inert never alarms; like the alarm it is not gated on story traffic.
+#
+# What it does, per rig that already has a marker:
+#   marker == HEAD of the rig's runtime checkout → nothing is left to examine;
+#       refresh the file's mtime so Step 0a does not call a fully-current marker
+#       "frozen". Content unchanged.
+#   marker is an ancestor of HEAD and marker..HEAD changes ONLY tests/**, docs/**
+#       or *.md → move the marker to HEAD, and move every per-daemon pin that is
+#       unflagged, a real ancestor of HEAD, and whose OWN pin..HEAD is inert too.
+#       Logs "advanced: delta sem daemon afetado". The patterns are the helper's
+#       DEFAULT_NO_RESTART_PATTERNS ("no daemon on any rig imports a test or doc
+#       file", ga-dk7fw); a test fails if the two lists drift apart.
+#   anything else → nothing moves, and the reason is logged once per
+#       (marker, HEAD) pair — the 2 days of silence were the problem.
+# It only ever moves a marker forward over files the helper itself would call
+# structurally inert. It never judges code: a code file, a scheduled-job file
+# (scripts/*, a plist template — what JOB_NOT_INSTALLED is about), a rename out
+# of code (--no-renames lists the old path), a git failure, a marker that is not
+# a commit or not an ancestor, an unknown rig, or DRY_RUN=1 all leave every file
+# as it was. A stuck-flagged pin is never touched (ga-n2jnsa re-examines it each
+# cycle). Code in the window is NOT handled here: that still needs the helper's
+# verdict from Step 5b, and this step does not pretend otherwise.
+DRI_NO_DAEMON_PATTERNS="tests/** docs/** *.md"
+# dri_delta_inert <runtime_dir> <from> <to> — 0 every changed file is covered,
+# 1 some file is not, 2 git could not list them. Sets DRI_N (files changed),
+# DRI_N_OTHER (not covered) and DRI_FIRST_OTHER.
+dri_delta_inert() {
+  DRI_N=0; DRI_N_OTHER=0; DRI_FIRST_OTHER=""
+  local list f pat cov
+  if ! list="$(git -c core.quotepath=off -C "$1" diff --name-only --no-renames "$2" "$3" 2>/dev/null)"; then
+    return 2
+  fi
+  set -f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    DRI_N=$((DRI_N + 1))
+    cov=0
+    for pat in $DRI_NO_DAEMON_PATTERNS; do
+      # shellcheck disable=SC2254  # deliberate glob match, not literal
+      case "$f" in $pat) cov=1; break ;; esac
+    done
+    if [ "$cov" -eq 0 ]; then
+      DRI_N_OTHER=$((DRI_N_OTHER + 1))
+      [ -n "$DRI_FIRST_OTHER" ] || DRI_FIRST_OTHER="$f"
+    fi
+  done <<< "$list"
+  set +f
+  [ "$DRI_N_OTHER" -eq 0 ]
+}
+DRI_DIR="$GC_CITY/.gc/runtime/daemon-refresh-baseline"
+if [ -d "$DRI_DIR" ]; then
+  for _dri_sha_file in "$DRI_DIR"/*.sha; do
+    [ -f "$_dri_sha_file" ] || continue
+    _dri_rig="$(basename "$_dri_sha_file" .sha)"
+    _dri_rt="$(get_runbook_field "$_dri_rig" "runtime_dir" 2>/dev/null || echo "")"
+    [ -n "$_dri_rt" ] || continue
+    git -C "$_dri_rt" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
+    _dri_head="$(git -C "$_dri_rt" rev-parse --verify -q 'HEAD^{commit}' 2>/dev/null || echo "")"
+    [ -n "$_dri_head" ] || continue
+    _dri_old_raw="$(tr -d '[:space:]' < "$_dri_sha_file" 2>/dev/null || echo "")"
+    case "$_dri_old_raw" in ''|*[!0-9a-fA-F]*) continue ;; esac
+    _dri_old="$(git -C "$_dri_rt" rev-parse --verify -q "${_dri_old_raw}^{commit}" 2>/dev/null || echo "")"
+    [ -n "$_dri_old" ] || continue
+    if [ "$_dri_old" = "$_dri_head" ]; then
+      [ "$DRY_RUN" = "1" ] || touch "$_dri_sha_file" 2>/dev/null || true
+      continue
+    fi
+    _dri_why=""
+    _dri_nfiles=0
+    if ! git -C "$_dri_rt" merge-base --is-ancestor "$_dri_old" "$_dri_head" >/dev/null 2>&1; then
+      _dri_why="the marker ${_dri_old:0:9} is not an ancestor of the checkout's HEAD ${_dri_head:0:9} (reset/rebase) — only a Step 5b verdict can re-anchor it"
+    else
+      _dri_rc=0; dri_delta_inert "$_dri_rt" "$_dri_old" "$_dri_head" || _dri_rc=$?
+      _dri_nfiles="$DRI_N"
+      if [ "$_dri_rc" -eq 2 ]; then
+        _dri_why="git could not list the files changed in ${_dri_old:0:9}..${_dri_head:0:9} (unknown is not inert)"
+      elif [ "$_dri_rc" -ne 0 ]; then
+        _dri_why="$DRI_N_OTHER of $DRI_N file(s) changed in ${_dri_old:0:9}..${_dri_head:0:9} are outside tests/**, docs/**, *.md (first: $DRI_FIRST_OTHER) — only the helper's verdict from Step 5b can move it"
+      fi
+    fi
+    _dri_why_file="$DRI_DIR/$_dri_rig.idle-advance-why"
+    if [ -n "$_dri_why" ]; then
+      if [ "$DRY_RUN" != "1" ] && [ "$(cat "$_dri_why_file" 2>/dev/null || echo "")" != "$_dri_old $_dri_head" ]; then
+        log "Daemon refresh: baseline for rig $_dri_rig NOT advanced by the idle check (ga-thoo16): $_dri_why."
+        printf '%s' "$_dri_old $_dri_head" > "$_dri_why_file" 2>/dev/null || true
+      fi
+      continue
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+      log "Daemon refresh: DRY_RUN — WOULD advance baseline for rig $_dri_rig ${_dri_old:0:9} -> ${_dri_head:0:9}: delta sem daemon afetado ($_dri_nfiles file(s), all tests/**, docs/** or *.md)."
+      continue
+    fi
+    # per-daemon pins first (same order as Step 5b: the rig-wide marker is only
+    # written once the pins it implies are on disk).
+    _dri_pd_file="$DRI_DIR/$_dri_rig.perdaemon"
+    _dri_pd_moved=0; _dri_pd_kept=0; _dri_pd_out=""; _dri_cache=" "
+    if [ -s "$_dri_pd_file" ]; then
+      while IFS= read -r _dri_line || [ -n "$_dri_line" ]; do
+        _dri_l1=""; _dri_l2=""; _dri_l3=""
+        read -r _dri_l1 _dri_l2 _dri_l3 <<< "$_dri_line" || true
+        _dri_new_line="$_dri_line"
+        # only "<label> <hex sha>" with no flag and nothing after it is a pin we
+        # may move; "<label> <sha> stuck", "<label>" alone and anything odd are
+        # copied through byte for byte.
+        if [ -n "$_dri_l1" ] && [ -n "$_dri_l2" ] && [ -z "$_dri_l3" ]; then
+          case "$_dri_l2" in
+            *[!0-9a-fA-F]*) ;;
+            *)
+              _dri_pin="$(git -C "$_dri_rt" rev-parse --verify -q "${_dri_l2}^{commit}" 2>/dev/null || echo "")"
+              if [ -n "$_dri_pin" ] && [ "$_dri_pin" != "$_dri_head" ] \
+                 && git -C "$_dri_rt" merge-base --is-ancestor "$_dri_pin" "$_dri_head" >/dev/null 2>&1; then
+                case "$_dri_cache" in
+                  *" $_dri_pin=ok "*) _dri_prc=0 ;;
+                  *" $_dri_pin=no "*) _dri_prc=1 ;;
+                  *)
+                    _dri_prc=0; dri_delta_inert "$_dri_rt" "$_dri_pin" "$_dri_head" || _dri_prc=$?
+                    if [ "$_dri_prc" -eq 0 ]; then _dri_cache="${_dri_cache}${_dri_pin}=ok "; else _dri_cache="${_dri_cache}${_dri_pin}=no "; fi
+                    ;;
+                esac
+                if [ "$_dri_prc" -eq 0 ]; then
+                  _dri_new_line="$_dri_l1 $_dri_head"
+                  _dri_pd_moved=$((_dri_pd_moved + 1))
+                fi
+              fi
+              ;;
+          esac
+        fi
+        [ "$_dri_new_line" != "$_dri_line" ] || _dri_pd_kept=$((_dri_pd_kept + 1))
+        _dri_pd_out="${_dri_pd_out}${_dri_new_line}"$'\n'
+      done < "$_dri_pd_file"
+      if [ "$_dri_pd_moved" -gt 0 ]; then
+        if printf '%s' "$_dri_pd_out" > "$_dri_pd_file.tmp.$$" 2>/dev/null && mv -f "$_dri_pd_file.tmp.$$" "$_dri_pd_file" 2>/dev/null; then
+          :
+        else
+          rm -f "$_dri_pd_file.tmp.$$" 2>/dev/null || true
+          warn "could not persist the per-daemon baseline for rig $_dri_rig at $_dri_pd_file (idle advance skipped this sweep; ga-thoo16)"
+          continue
+        fi
+      fi
+    fi
+    if printf '%s\n' "$_dri_head" > "$_dri_sha_file.tmp.$$" 2>/dev/null && mv -f "$_dri_sha_file.tmp.$$" "$_dri_sha_file" 2>/dev/null; then
+      rm -f "$_dri_why_file" 2>/dev/null || true
+      log "Daemon refresh: baseline for rig $_dri_rig advanced: delta sem daemon afetado (${_dri_old:0:9} -> ${_dri_head:0:9}; $_dri_nfiles file(s), all under tests/**, docs/** or *.md — no daemon or scheduled job can load them; per-daemon pins moved: $_dri_pd_moved, left as they were: $_dri_pd_kept) (ga-thoo16)."
+    else
+      rm -f "$_dri_sha_file.tmp.$$" 2>/dev/null || true
+      warn "could not persist daemon-refresh baseline for rig $_dri_rig at $_dri_sha_file (idle advance skipped this sweep; ga-thoo16)"
+    fi
+  done
+fi
+
 # ── Step 0a: daemon-refresh baseline staleness alarm (ga-gjum0y) ──────────────
 # Runs once per sweep, unconditionally — deliberately NOT inside Step 5b below,
 # which only executes for a rig that HAS a story awaiting delivery right now.
@@ -1106,39 +1303,7 @@ if [ ! -f "$RUNBOOK_FILE" ]; then
   exit 1
 fi
 
-get_runbook_field() {
-  local rig_name="$1"
-  local field="$2"
-  python3 - <<PYEOF
-import re, sys
-
-rig_name = '$rig_name'
-field = '$field'
-
-with open('$RUNBOOK_FILE') as f:
-    content = f.read()
-
-# Find the [[rig]] block for our rig
-# Simple parser: split on [[rig]] boundaries, find the one with name = "rig_name"
-blocks = re.split(r'\[\[rig\]\]', content)
-for block in blocks:
-    m = re.search(r'name\s*=\s*"([^"]+)"', block)
-    if m and m.group(1) == rig_name:
-        # Find the field value
-        fm = re.search(rf'{re.escape(field)}\s*=\s*"([^"]*)"', block)
-        if fm:
-            print(fm.group(1))
-        else:
-            # Check for array (daemon_restarts = [])
-            am = re.search(rf'{re.escape(field)}\s*=\s*\[([^\]]*)\]', block)
-            if am:
-                items = [x.strip().strip('"') for x in am.group(1).split(',') if x.strip().strip('"')]
-                print('\n'.join(items))
-        sys.exit(0)
-# Not found
-sys.exit(1)
-PYEOF
-}
+# get_runbook_field is defined above, before Step 0-pre (ga-thoo16).
 
 # ── FIX 1 (ga-857v): safe untracked-vs-tracked reconciliation before ff-pull ──
 # Problem: deploy_cmd typically runs `git -C <runtime> pull --ff-only`. If the

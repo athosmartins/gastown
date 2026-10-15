@@ -73,6 +73,47 @@ if a and a[0] == "find-generic-password":
 sys.exit(2)
 '''
 
+FAKE_TMUX = r'''#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_TMUX_DIR"]
+a = sys.argv[1:]
+with open(os.path.join(d, "tmux.log"), "a") as f:
+    f.write(json.dumps(a) + "\n")
+if a[:1] == ["-L"]:
+    a = a[2:]
+if os.environ.get("FAKE_TMUX_DOWN"):
+    sys.exit(1)
+pp = os.path.join(d, "panes.json")
+panes = json.load(open(pp)) if os.path.exists(pp) else {}
+t = a[a.index("-t") + 1] if "-t" in a else None
+p = panes.get(t)
+if a[:1] == ["display-message"]:
+    if p is None:
+        sys.exit(1)
+    print(p["pid"])
+    sys.exit(0)
+if a[:1] == ["capture-pane"]:
+    if p is None:
+        sys.exit(1)
+    p["captures"] = p.get("captures", 0) + 1
+    text = p["text"]
+    if p.get("flip_after") is not None and p["captures"] > p["flip_after"]:
+        text = p["flip_text"]
+    json.dump(panes, open(pp, "w"))
+    sys.stdout.write(text)
+    sys.exit(0)
+if a[:1] == ["send-keys"]:
+    if p is None:
+        sys.exit(1)
+    with open(os.path.join(d, "keys.log"), "a") as f:
+        f.write(t + " " + " ".join(a[a.index(t) + 1:]) + "\n")
+    if p.get("escape_clears"):
+        p["text"] = p["clear_text"]
+    json.dump(panes, open(pp, "w"))
+    sys.exit(0)
+sys.exit(2)
+'''
+
 NOTIFY = "#!/bin/sh\necho \"$@\" >> \"$FAKE_SEC_DIR/notify.log\"\n[ -n \"$FAKE_NOTIFY_FAIL\" ] && exit 7\nexit 0\n"
 EMAIL = {"crypto": "athoscrypto@gmail.com", "amb": "throw.away.amb@gmail.com", "b85": "athosb85@gmail.com",
          "terr": "terrenos.incorporacoes@gmail.com", "martins": "athosmartins@gmail.com"}
@@ -180,6 +221,8 @@ def _nothing_real_was_touched(tmp_path_factory):
     _sentinel(guard / "security", hits)
     _sentinel(guard / "bin" / "notify", hits)
     _sentinel(guard / "bin" / "security", hits)
+    _sentinel(guard / "tmux", hits)
+    _sentinel(guard / "bin" / "tmux", hits)
     _GUARD.update(dir=guard, hits=hits)
     with _watching(_real_files()) as touched:
         yield
@@ -190,7 +233,7 @@ def _nothing_real_was_touched(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def _pin_env(monkeypatch, tmp_path):
     g = _GUARD["dir"]
-    for k, v in {"CLAUDE_CREW_NOTIFY": g / "notify", "CLAUDE_CREW_SECURITY": g / "security",
+    for k, v in {"CLAUDE_CREW_NOTIFY": g / "notify", "CLAUDE_CREW_SECURITY": g / "security", "CLAUDE_CREW_TMUX": g / "tmux",
                  "GC_CITY_PATH": tmp_path / "pinned-city", "CLAUDE_CREW_STATE": tmp_path / "pinned-state.json",
                  "CLAUDE_CREW_DECISION": tmp_path / "pinned-decision.json", "CLAUDE_CREW_SESSIONS_DIR": tmp_path / "pinned-sessions",
                  "CLAUDE_CREW_ACCOUNTS_DIR": tmp_path / "pinned-accts", "HOME": tmp_path / "pinned-home"}.items():
@@ -321,7 +364,8 @@ class World:
 
         self.srv = http.server.HTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
-        for name, body in (("security", FAKE_SECURITY), ("notify", NOTIFY)):
+        (self.d / "tmuxd").mkdir()
+        for name, body in (("security", FAKE_SECURITY), ("notify", NOTIFY), ("tmux", FAKE_TMUX)):
             p = self.d / name
             p.write_text(body.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))   # not the PATH's python: PATH is pinned to the sentinels
             p.chmod(p.stat().st_mode | stat.S_IEXEC)
@@ -330,17 +374,19 @@ class World:
         self.now = time.time()
         for k, v in {
             "FAKE_SEC_DIR": str(self.d), "CLAUDE_CREW_SECURITY": str(self.d / "security"),
+            "FAKE_TMUX_DIR": str(self.d / "tmuxd"), "CLAUDE_CREW_TMUX": str(self.d / "tmux"),
             "CLAUDE_CREW_NOTIFY": str(self.d / "notify"), "CLAUDE_CREW_STATE": str(self.d / "crew_state.json"),
             "CLAUDE_CREW_DECISION": str(self.d / "pool_decision.json"), "CLAUDE_CREW_SESSIONS_DIR": str(self.d / "sessions"),
             "CLAUDE_CREW_ACCOUNTS_DIR": str(self.d / "accts"), "CLAUDE_CREW_USER": "athos", "GC_CITY_PATH": str(self.d / "city"),
             "CLAUDE_CREW_PROFILE_URL": f"http://127.0.0.1:{self.srv.server_address[1]}/profile", "CLAUDE_CREW_NOW": str(self.now),
         }.items():
             monkeypatch.setenv(k, v)
-        for k in ("GC_CREW_ACCOUNT", "CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_SEC_WFAIL", "FAKE_SEC_DROP", "FAKE_NOTIFY_FAIL"):
+        for k in ("GC_CREW_ACCOUNT", "CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_SEC_WFAIL", "FAKE_SEC_DROP", "FAKE_NOTIFY_FAIL",
+                  "GC_CREW_UNSTICK", "FAKE_TMUX_DOWN", "CLAUDE_CREW_TMUX_SOCKET"):
             monkeypatch.delenv(k, raising=False)
         self.mp = monkeypatch
         # the world must be sealed: every seam inside this tmp dir, none of them a sentinel
-        for fn in (crew.security_bin, crew.state_path, crew.decision_path, crew.sessions_dir):
+        for fn in (crew.security_bin, crew.state_path, crew.decision_path, crew.sessions_dir, crew.tmux_bin):
             assert str(fn()).startswith(str(self.d)), f"{fn.__name__} escapes the test world: {fn()}"
         assert os.environ["CLAUDE_CREW_NOTIFY"].startswith(str(self.d)) and str(crew.city()).startswith(str(self.d))
 
@@ -401,6 +447,27 @@ class World:
     def state(self):
         p = self.d / "crew_state.json"
         return json.loads(p.read_text()) if p.exists() else {}
+
+    # tmux (ga-ci3uao): a pane is {pid, text, ...}; the fake logs every argv and every key it is asked to send
+    def pane(self, pane_id, pid, text, **kw):
+        p = self.d / "tmuxd" / "panes.json"
+        panes = json.loads(p.read_text()) if p.exists() else {}
+        panes[pane_id] = {"pid": pid, "text": text, **kw}
+        p.write_text(json.dumps(panes))
+
+    def pane_set(self, pane_id, **kw):
+        p = self.d / "tmuxd" / "panes.json"
+        panes = json.loads(p.read_text())
+        panes[pane_id].update(kw)
+        p.write_text(json.dumps(panes))
+
+    def keys(self):
+        p = self.d / "tmuxd" / "keys.log"
+        return p.read_text().splitlines() if p.exists() else []
+
+    def tmux_calls(self):
+        p = self.d / "tmuxd" / "tmux.log"
+        return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
 
     def log(self):
         p = self.d / "city" / ".gc" / "logs" / "claude-crew-account.log"
@@ -1360,3 +1427,310 @@ def test_the_real_script_run_from_an_empty_environment_stays_inside_the_test_wor
     assert not _GUARD["hits"].exists()
     d = _env_i(w, interpreter, "--dry-run")
     assert d.returncode == 0 and "crew" in d.stderr and len(w.notified()) == 1
+
+
+# ══ ga-ci3uao: a bridge that is up is not a session on the new account ═══════════════════════════════════════════
+# 14/10: the switch ran, VERIFY said "all 5 Remote Control bridges are still up" - and the Mayor and three crews sat on the old
+# account's limit screen for 12 minutes until the Athos switched them by hand. The check now LOOKS at each session's screen.
+PROMPT_BOX = "● Done.\n\n╭────────────────────────────╮\n│ >                          │\n╰────────────────────────────╯\n  ? for shortcuts\n"
+LIMIT_MODAL = ("● Working on it...\n\n You've hit your weekly limit · resets 8pm\n\n What do you want to do?\n\n"
+               " ❯ 1. Stop and wait for limit to reset\n   2. Wait here, then continue automatically at Oct 14 at 8pm\n"
+               "   3. Upgrade your plan\n\n Enter to confirm · Esc to cancel\n")
+BANNER_ONLY = " You've hit your weekly limit · resets 8pm\n\n" + PROMPT_BOX
+QUOTED_MODAL = ("● The bead shows the screen:\n  > What do you want to do?\n  > 1. Stop and wait for limit to reset\n"
+                "  > Enter to confirm · Esc to cancel\n\n" + PROMPT_BOX)
+PERMISSION_DIALOG = "Bash command\n  rm -rf x\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Enter to confirm · Esc to cancel\n"
+OTHER_QUESTION = "What do you want to do?\n ❯ 1. Resume the conversation\n   2. Start a new one\n\n Enter to confirm · Esc to cancel\n"
+REVERSED_ORDER = " ❯ 1. Stop and wait for limit to reset\n What do you want to do?\n\n Enter to confirm · Esc to cancel\n"
+OUTPUT_AFTER_MODAL = LIMIT_MODAL + "\n● more output came after it\n"
+
+
+def _rc(w, pid, pane, text, *, name="Mayor", tmux=True, **kw):
+    """A Remote Control session that lives in a tmux pane showing `text` (the pane's process is the session's own, as in production)."""
+    d = {"pid": pid, "bridgeSessionId": f"cse_{pid}", "name": name, "status": "busy", "procStart": _lstart(pid)}
+    if tmux:
+        d["tmux"] = f"gastown__x:@3.{pane}"
+    (w.d / "sessions" / f"{pid}.json").write_text(json.dumps(d))
+    if tmux:
+        w.pane(pane, pid, text, **kw)
+
+
+@pytest.mark.parametrize("text,want", [
+    (LIMIT_MODAL, "limit"), (PROMPT_BOX, "clear"), ("", "clear"), (BANNER_ONLY, "banner"),
+    (QUOTED_MODAL, "clear"),               # an agent quoting the modal has its prompt box under the quote
+    (PERMISSION_DIALOG, "clear"),          # same footer, another question
+    (OTHER_QUESTION, "clear"),             # same question, no "Stop and wait for limit to reset"
+    (REVERSED_ORDER, "clear"),             # option before the question
+    (OUTPUT_AFTER_MODAL, "banner"),        # the modal is not the last thing on the screen: it is not open any more
+])
+def test_the_limit_modal_is_recognised_only_when_it_is_the_last_thing_on_the_screen(text, want):
+    assert crew.screen_verdict(text) == want
+
+
+def test_a_session_on_the_limit_screen_fails_the_verify_and_the_push_names_it(w):
+    me = os.getpid()
+    _rc(w, me, "%5", LIMIT_MODAL)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    assert "VERIFY FAILED" in w.log() and "Mayor" in w.log() and "VERIFY ok" not in w.log()
+    v = w.state()["verify_last"]
+    assert v["verdict"] == "failed" and v["limit"] == [me] and v["clear"] == 0 and v["to"] == EMAIL["amb"]
+    assert w.state()["limit_watch"]["pids"][str(me)]["name"] == f"Mayor ({me})"
+    pushes = [n for n in w.notified() if "limit screen" in n]
+    assert len(pushes) == 1 and "Mayor" in pushes[0] and "job falhou" in pushes[0] and "did NOT pick up the new login" in pushes[0]
+    assert "automatic Escape is off" in pushes[0] and w.keys() == []        # a human has to arm the key
+
+
+def test_when_every_session_was_looked_at_and_none_is_on_the_limit_screen_the_verify_is_ok(w):
+    me = os.getpid()
+    _rc(w, me, "%5", PROMPT_BOX)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    assert "VERIFY ok - none of the 1 sessions looked at is on claude's limit screen" in w.log()
+    v = w.state()["verify_last"]
+    assert v["verdict"] == "ok" and v["looked"] == 1 and v["clear"] == 1 and v["limit"] == []
+    assert "limit_watch" not in w.state() and not w.notified() and w.keys() == []
+
+
+@pytest.mark.parametrize("how", ["no-tmux-field", "tmux-down", "no-tmux-binary", "pane-of-another-process", "pane-unknown"])
+def test_a_screen_that_cannot_be_looked_at_is_not_verified_and_never_ok(w, monkeypatch, how):
+    me = os.getpid()
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        _rc(w, me, "%5", LIMIT_MODAL, tmux=(how != "no-tmux-field"))
+        if how == "tmux-down":
+            monkeypatch.setenv("FAKE_TMUX_DOWN", "1")
+        elif how == "no-tmux-binary":
+            monkeypatch.setenv("CLAUDE_CREW_TMUX", str(w.d / "nowhere"))
+        elif how == "pane-of-another-process":
+            w.pane("%5", other.pid, LIMIT_MODAL)                   # the pane id was recycled: that screen is somebody else's
+        elif how == "pane-unknown":
+            w.pane("%5", me, LIMIT_MODAL)
+            (w.d / "sessions" / f"{me}.json").write_text(json.dumps({**json.loads((w.d / "sessions" / f"{me}.json").read_text()),
+                                                                     "tmux": "gastown__x:@3.%9"}))
+        _switch_crypto_to_amb(w)
+        w.run(at=w.now + 90)
+    finally:
+        other.kill()
+        other.wait()
+    assert "VERIFY NOT VERIFIED" in w.log() and "VERIFY ok" not in w.log() and "VERIFY FAILED" not in w.log()
+    assert w.state()["verify_last"]["verdict"] == "not-verified" and w.state()["verify_last"]["cannot_tell"] == [me]
+    assert "limit_watch" not in w.state() and not w.notified() and w.keys() == []     # cannot tell: no push, no key
+
+
+def test_the_limit_message_without_the_modal_is_cannot_tell_never_stuck_and_never_pressed(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    _rc(w, os.getpid(), "%5", BANNER_ONLY)
+    _switch_crypto_to_amb(w)
+    for k in (90, 150, 210):
+        w.run(at=w.now + k)
+    assert w.state()["verify_last"]["verdict"] == "not-verified" and "limit_watch" not in w.state()
+    assert "the limit message is on screen but not the modal" in w.log()
+    assert w.keys() == [] and not w.notified()
+
+
+def test_a_session_that_started_after_the_switch_is_not_judged_by_it(w):
+    _rc(w, os.getpid(), "%5", PROMPT_BOX)
+    _switch_crypto_to_amb(w)
+    newcomer = subprocess.Popen(["sleep", "60"])
+    try:
+        _rc(w, newcomer.pid, "%6", LIMIT_MODAL, name="Newcomer")   # born after the rewrite: its limit is its own
+        w.run(at=w.now + 90)
+    finally:
+        newcomer.kill()
+        newcomer.wait()
+    assert w.state()["verify_last"]["looked"] == 1 and "limit_watch" not in w.state() and "Newcomer" not in w.log()
+    assert not any("%6" in json.dumps(c) for c in w.tmux_calls())
+
+
+def test_a_bridge_that_is_lost_keeps_the_verify_from_being_ok_even_when_the_rest_is_clear(w):
+    a, b = os.getpid(), subprocess.Popen(["sleep", "60"])
+    try:
+        _rc(w, a, "%5", PROMPT_BOX)
+        _rc(w, b.pid, "%6", PROMPT_BOX, name="Thies")
+        _switch_crypto_to_amb(w)
+        (w.d / "sessions" / f"{b.pid}.json").write_text(json.dumps({"pid": b.pid, "name": "Thies", "procStart": _lstart(b.pid)}))   # bridge gone
+        w.run(at=w.now + 90)
+    finally:
+        b.kill()
+        b.wait()
+    assert any("lost Remote Control" in n for n in w.notified())
+    assert "VERIFY ok" not in w.log() and w.state()["verify_last"]["verdict"] == "not-verified"
+
+
+def test_unarmed_a_stuck_session_is_watched_and_alerted_but_never_pressed(w):
+    _rc(w, os.getpid(), "%5", LIMIT_MODAL)
+    _switch_crypto_to_amb(w)
+    for k in (90, 150, 210, 270):
+        w.run(at=w.now + k)
+    assert w.keys() == [] and not any(c[:1] == ["send-keys"] for c in w.tmux_calls())
+    assert str(os.getpid()) in w.state()["limit_watch"]["pids"] and len(w.notified()) == 1
+
+
+def test_armed_one_escape_after_the_settle_and_a_second_look_then_the_watch_ends(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    _rc(w, os.getpid(), "%5", LIMIT_MODAL, escape_clears=True, clear_text=PROMPT_BOX)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    assert w.keys() == [] and "will be tried" in w.notified()[0]        # found on this run: seen once is not enough to press
+    w.run(at=w.now + 150)
+    assert w.keys() == ["%5 Escape"] and "Escape sent (try 1 of 2)" in w.log()
+    w.run(at=w.now + 210)
+    assert w.keys() == ["%5 Escape"] and "left the limit screen" in w.log() and "limit_watch" not in w.state()
+    assert not secrets_in(w.log() + (w.d / "crew_state.json").read_text() + "".join(w.notified()), w)
+
+
+def test_an_escape_that_does_not_take_is_repeated_once_after_a_minute_then_the_failure_is_pushed(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    _rc(w, os.getpid(), "%5", LIMIT_MODAL)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    w.run(at=w.now + 150)
+    assert len(w.keys()) == 1
+    w.run(at=w.now + 180)                                                # only 30 s after the first key
+    assert len(w.keys()) == 1
+    w.run(at=w.now + 215)
+    assert len(w.keys()) == 2
+    w.run(at=w.now + 280)
+    assert len(w.keys()) == 2                                            # MAX_ESC_TRIES: never a third
+    assert any("after 2 Escape(s) from this script" in n for n in w.notified())
+
+
+def test_armed_but_the_new_account_is_itself_exhausted_no_key(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    _rc(w, os.getpid(), "%5", LIMIT_MODAL)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    w.decide("amb", exhausted=["amb"])
+    w.run(at=w.now + 150)
+    assert w.keys() == [] and "no Escape sent" in w.log() and "itself registered exhausted" in w.log()
+
+
+def test_armed_but_the_default_item_does_not_hold_the_new_login_no_key(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    _rc(w, os.getpid(), "%5", LIMIT_MODAL)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    w.default("crypto", blob("crypto", rt="crypto-again"))               # somebody put another login there; the profile says whose
+    w.run(at=w.now + 150)
+    assert w.keys() == [] and "no Escape sent - cannot tell that the default item holds" in w.log()
+
+
+def test_armed_but_too_soon_after_the_switch_no_key(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    _rc(w, os.getpid(), "%5", LIMIT_MODAL)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    st = w.state()
+    st["last_switch"]["at"] = w.now + 100                                # a (re)switch 10 s before the next run: claude has not re-read yet
+    (w.d / "crew_state.json").write_text(json.dumps(st))
+    w.run(at=w.now + 110)
+    assert w.keys() == [] and "has not been in place long enough" in w.log()
+
+
+def test_armed_but_the_pane_changed_between_the_look_and_the_key_nothing_is_sent(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    _rc(w, os.getpid(), "%5", LIMIT_MODAL)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    w.pane_set("%5", captures=0, flip_after=1, flip_text=PROMPT_BOX)     # the first read (the watch) sees the modal, the second (the key) does not
+    w.run(at=w.now + 150)
+    assert w.keys() == [] and "not on the limit screen when the key was due" in w.log()
+
+
+def test_the_escape_knob_the_env_beats_the_file_and_off_is_the_default(w, monkeypatch):
+    assert crew.unstick_armed() is False
+    (w.d / "city" / ".gc" / "crew-unstick-on").write_text("")
+    assert crew.unstick_armed() is True
+    monkeypatch.setenv("GC_CREW_UNSTICK", "0")
+    assert crew.unstick_armed() is False                                 # the kill switch wins over the file
+    (w.d / "city" / ".gc" / "crew-unstick-on").unlink()
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    assert crew.unstick_armed() is True
+
+
+def test_a_dry_run_looks_but_never_presses_pushes_or_writes(w, monkeypatch, capsys):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    _rc(w, os.getpid(), "%5", LIMIT_MODAL)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    pushes, state = len(w.notified()), (w.d / "crew_state.json").read_text()
+    capsys.readouterr()
+    w.run(dry=True, at=w.now + 150)
+    assert w.keys() == [] and len(w.notified()) == pushes and (w.d / "crew_state.json").read_text() == state
+    assert f"DRY-RUN would send Mayor ({os.getpid()}) one Escape" in capsys.readouterr().err
+
+
+def test_a_watch_that_has_run_its_course_is_dropped_without_a_key(w, monkeypatch):
+    monkeypatch.setenv("GC_CREW_UNSTICK", "1")
+    _rc(w, os.getpid(), "%5", LIMIT_MODAL)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    w.run(at=w.now + 90 + crew.LIMIT_WATCH_S + 1)
+    assert w.keys() == [] and "the watch is dropped" in w.log() and "limit_watch" not in w.state()
+
+
+def test_a_watched_session_that_ends_on_its_own_is_dropped(w):
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        _rc(w, other.pid, "%6", LIMIT_MODAL, name="Crew")
+        _switch_crypto_to_amb(w)
+        w.run(at=w.now + 90)
+        assert str(other.pid) in w.state()["limit_watch"]["pids"]
+    finally:
+        other.kill()
+        other.wait()
+    w.run(at=w.now + 150)
+    assert "ended on its own while on the limit screen" in w.log() and "limit_watch" not in w.state()
+
+
+def test_a_limit_watch_record_that_cannot_be_read_is_dropped_and_the_switch_still_happens(w):
+    (w.d / "crew_state.json").write_text(json.dumps({"limit_watch": "garbage"}))
+    _switch_crypto_to_amb(w)
+    assert "limit_watch record in the state cannot be read" in w.log()
+    assert w.state()["last_switch"]["to"] == EMAIL["amb"] and "limit_watch" not in w.state()
+
+
+def test_a_bug_in_the_screen_check_does_not_cost_the_bridge_verdict_or_the_switch(w, monkeypatch):
+    _rc(w, os.getpid(), "%5", PROMPT_BOX)
+    _switch_crypto_to_amb(w)
+    monkeypatch.setattr(crew, "look", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    w.run(at=w.now + 90)
+    assert "the screen check failed (RuntimeError)" in w.log() and "all 1 Remote Control bridges are still up" in w.log()
+    assert w.state()["verify_last"]["verdict"] == "not-verified" and "pending_verify" not in w.state()
+
+
+def test_a_bug_in_the_watch_does_not_stop_the_switch(w, monkeypatch):
+    monkeypatch.setattr(crew, "watch_limits", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    (w.d / "crew_state.json").write_text(json.dumps({"limit_watch": {"to": EMAIL["amb"], "pids": {}}}))
+    _switch_crypto_to_amb(w)
+    assert "the limit-screen watch failed (RuntimeError)" in w.log() and w.state()["last_switch"]["to"] == EMAIL["amb"]
+
+
+def test_a_pane_is_the_sessions_when_its_process_is_an_ancestor_not_only_when_it_is_the_same_pid(w):
+    me = os.getpid()
+    w.pane("%5", os.getppid(), LIMIT_MODAL)                              # claude started by a wrapper that the pane runs
+    assert crew.look(me, "gastown__x:@3.%5") == ("limit", "%5", "")
+    stranger = subprocess.Popen(["sleep", "60"])
+    try:
+        w.pane("%5", stranger.pid, LIMIT_MODAL)
+        assert crew.look(me, "gastown__x:@3.%5")[0] == "unknown"
+    finally:
+        stranger.kill()
+        stranger.wait()
+
+
+def test_a_session_name_cannot_smuggle_control_characters_or_a_command_into_a_push():
+    lbl = crew._label("Ma\nyor\x1b[31m; rm -rf /", 5)
+    assert "\n" not in lbl and "\x1b" not in lbl and "[" not in lbl and lbl.endswith("(5)")
+    assert crew._label(None, 7) == "pid 7" and crew._label("???", 8) == "pid 8"
+
+
+def test_when_there_is_no_time_left_the_screens_are_cannot_tell_and_nothing_slow_stands_in_front_of_the_switch(w, monkeypatch):
+    monkeypatch.setattr(crew, "LOOK_BUDGET_S", -1)                       # a loaded machine: every tmux/ps call would be slow
+    _rc(w, os.getpid(), "%5", LIMIT_MODAL)
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    assert "no time was left to look at every screen in this run" in w.log()
+    assert w.state()["verify_last"]["verdict"] == "not-verified" and "limit_watch" not in w.state()
+    assert w.tmux_calls() == [] and not w.notified()                     # not looked at is not "stuck" and not "clear"

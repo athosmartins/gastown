@@ -2499,6 +2499,93 @@ CITY="$REAL_CITY"
 rm -rf "$FAKE_CITY"
 
 echo ""
+echo "=== _reap_backup_residue: retires a superseded <db>.new before the *.old reclaim (ga-m9wpnk) ==="
+# 13/10: a reseed this guard triggered at CRITICAL was killed by its own timeout and left
+# whatsapp_automation.new (1.5 GB) beside a good primary for 30h — the reclaim below only
+# sweeps *.old. The guard now calls `dolt-backup-reseed.sh --retire-superseded-new --all`
+# (a rename; the deleter stays the reclaim) before the reclaim. Hermetic: CITY is a disposable
+# tree whose reseed and reclaim scripts are STUBS that append what they received to one
+# order file — nothing is renamed, deleted or sent.
+mk_retire_city() {   # <tag> <reseed-stub-exit|none> <reclaim|none> — fresh fake city, stubs record to $FAKE_CITY/order.txt
+  FAKE_CITY="$(mktemp -d "/tmp/dolt-disk-floor-guard-selftest-retire-$1.XXXXXX")"
+  mkdir -p "$FAKE_CITY/scripts"
+  ORDER_FILE="$FAKE_CITY/order.txt"; : > "$ORDER_FILE"
+  if [ "$2" != "none" ]; then
+    cat > "$FAKE_CITY/scripts/dolt-backup-reseed.sh" <<EOF
+#!/bin/bash
+echo "RETIRE args=\$* dry=\${RESEED_RETIRE_SUPERSEDED_NEW_DRY_RUN-unset} city=\${GC_CITY_PATH-unset}" >> "$ORDER_FILE"
+exit $2
+EOF
+    chmod +x "$FAKE_CITY/scripts/dolt-backup-reseed.sh"
+  fi
+  if [ "$3" != "none" ]; then
+    cat > "$FAKE_CITY/scripts/dolt-backup-residue-reclaim.sh" <<EOF
+#!/bin/bash
+echo "RECLAIM prod=\${DOLT_BACKUP_RESIDUE_RECLAIM_PROD-unset}" >> "$ORDER_FILE"
+exit 0
+EOF
+    chmod +x "$FAKE_CITY/scripts/dolt-backup-residue-reclaim.sh"
+  fi
+}
+REAL_CITY="$CITY"; REAL_LOG="$LOG"
+
+mk_retire_city a 0 yes
+CITY="$FAKE_CITY"; LOG="$FAKE_CITY/guard.log"; : > "$LOG"
+_reap_backup_residue
+CITY="$REAL_CITY"; LOG="$REAL_LOG"
+if [ "$(head -1 "$ORDER_FILE")" = "RETIRE args=--retire-superseded-new --all dry=0 city=$FAKE_CITY" ]; then
+  ok "_reap_backup_residue: calls the reseed script with --retire-superseded-new --all, DRY_RUN=0 (the explicit opt-in) and GC_CITY_PATH=its own CITY"
+else
+  bad "_reap_backup_residue: retire call wrong or missing — order file: $(tr '\n' '|' < "$ORDER_FILE")"
+fi
+if [ "$(sed -n 2p "$ORDER_FILE")" = "RECLAIM prod=1" ] && [ "$(wc -l < "$ORDER_FILE" | tr -d ' ')" = "2" ]; then
+  ok "_reap_backup_residue: the retire runs BEFORE the *.old reclaim (so the reclaim sees the new .old on the same pass), each exactly once"
+else
+  bad "_reap_backup_residue: order wrong — expected RETIRE then RECLAIM prod=1, got: $(tr '\n' '|' < "$ORDER_FILE")"
+fi
+grep -qF "backup-new-retire OK" "$FAKE_CITY/guard.log" && ok "_reap_backup_residue: logs 'backup-new-retire OK'" || bad "_reap_backup_residue: no 'backup-new-retire OK' in the guard log"
+rm -rf "$FAKE_CITY"
+
+mk_retire_city b 1 yes
+CITY="$FAKE_CITY"; LOG="$FAKE_CITY/guard.log"; : > "$LOG"
+_reap_backup_residue; rc=$?
+CITY="$REAL_CITY"; LOG="$REAL_LOG"
+if [ "$rc" -eq 0 ] && grep -qF "RECLAIM prod=1" "$ORDER_FILE" && grep -qF "backup-new-retire FAILED" "$FAKE_CITY/guard.log"; then
+  ok "_reap_backup_residue: a retire that exits nonzero is logged FAILED and does NOT stop the *.old reclaim (rc 0)"
+else
+  bad "_reap_backup_residue: failed retire broke the lever (rc=$rc): $(tr '\n' '|' < "$ORDER_FILE") / $(tr '\n' '|' < "$FAKE_CITY/guard.log")"
+fi
+rm -rf "$FAKE_CITY"
+
+mk_retire_city c none yes
+CITY="$FAKE_CITY"; LOG="$FAKE_CITY/guard.log"; : > "$LOG"
+_reap_backup_residue; rc=$?
+CITY="$REAL_CITY"; LOG="$REAL_LOG"
+if [ "$rc" -eq 0 ] && [ "$(cat "$ORDER_FILE")" = "RECLAIM prod=1" ] && grep -qF "backup-new-retire SKIP" "$FAKE_CITY/guard.log"; then
+  ok "_reap_backup_residue: reseed script missing → retire SKIP logged, the *.old reclaim still runs"
+else
+  bad "_reap_backup_residue: missing reseed script broke the lever (rc=$rc): $(tr '\n' '|' < "$ORDER_FILE")"
+fi
+rm -rf "$FAKE_CITY"
+
+mk_retire_city d 0 none
+CITY="$FAKE_CITY"; LOG="$FAKE_CITY/guard.log"; : > "$LOG"
+_reap_backup_residue
+CITY="$REAL_CITY"; LOG="$REAL_LOG"
+[ ! -s "$ORDER_FILE" ] && ok "_reap_backup_residue: no reclaimer → no retire either (a .old nobody frees would only move the residue)" || bad "_reap_backup_residue: retired although the deleter is missing: $(tr '\n' '|' < "$ORDER_FILE")"
+rm -rf "$FAKE_CITY"
+
+mk_retire_city e 0 yes
+CITY="$FAKE_CITY"; LOG="$FAKE_CITY/guard.log"; : > "$LOG"
+ENABLED=0
+_reap_backup_residue
+# shellcheck disable=SC2034  # read by every _reap_* call and main() in later scenarios below
+ENABLED=1
+CITY="$REAL_CITY"; LOG="$REAL_LOG"
+[ ! -s "$ORDER_FILE" ] && ok "_reap_backup_residue: ENABLED=0 runs neither the retire nor the reclaim (notify-only mode renames nothing)" || bad "_reap_backup_residue: ENABLED=0 still ran: $(tr '\n' '|' < "$ORDER_FILE")"
+rm -rf "$FAKE_CITY"
+
+echo ""
 echo "=== _reap_bloated_backup_staging: invokes reseed for an eligible db, CRITICAL only (ga-74tts6) ==="
 # Hermetic: CITY/DOLTDIR/STATE_RESEED_TRIGGER_DIR redirected to a disposable
 # tmp tree containing a FAKE dolt-backup-reseed.sh that only records the db

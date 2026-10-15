@@ -15,7 +15,10 @@
 # the gate rebased and that carries no merge commit, every commit there as an equivalent patch per
 # `git cherry`, ga-1md7na; a merge commit, which cherry cannot see, blocks that proof; see the LOCK
 # CONTRACT in the reaper), and any
-# verdict other than exactly 'unparseable' is KEPT; the SIGTERM guard kills a crew claude proc
+# verdict other than exactly 'unparseable' is KEPT; ga-yw18yk: a branch that never shipped is still reaped (tree only,
+# branch kept, detached HEAD parked on rescue/) when every bead the tree is named for is CLOSED long enough, and kept
+# for every state that is not that (open, young, unknown, unreadable, lookup failed, op in progress, dirty, in use);
+# the SIGTERM guard kills a crew claude proc
 # but never a supervisor/pilot; kill is default-OFF; the feature has a kill-switch + dry-run.
 # Process probes are faked so it's hermetic. Exit 0 iff all hold.
 set -uo pipefail
@@ -53,6 +56,15 @@ export WORKTREE_REAPER_FAKE_SESSION_LIST="$EMPTY_SESSIONS"
 # make the suite depend on the machine either. A scenario that wants pressure mode sets the
 # variable on its own `bash "$REAPER"` call, which overrides this per call.
 export WORKTREE_REAPER_PRESSURE_FREE_GB=0
+
+# ga-yw18yk: the same hermeticity, for the BEAD lookup. An unparseable lock whose tree is clean/aged/unused
+# now asks `bd` whether the worktree's bead is closed; without a seam every scenario below that keeps such a
+# lock would shell out to the real `bd` against a temp repo with no beads database (slow, and dependent on
+# this machine). Pin it to "the lookup worked and found no bead" for every invocation; the ga-yw18yk scenarios
+# override it per call, and the one that exercises the real `bd` call unsets it (env -u) behind a stub on PATH.
+EMPTY_BEADS="$TMP/empty_beads.json"
+printf '[]' > "$EMPTY_BEADS"
+export WORKTREE_REAPER_FAKE_BEADS="$EMPTY_BEADS"
 
 # ── build a temp "town" ($TMP) containing one rig repo with an origin/main ───────
 TOWN="$TMP/town"; mkdir -p "$TOWN"
@@ -1452,6 +1464,248 @@ pe_br pe_kb && ok "ga-1md7na (k): a branch with 1 commit NOT in main is KEPT eve
 mk_rebased_rig pe_kc "$PE_MERGE_OWN";                                   db_unreg pe_kc; db_run pe_kc
 pe_br pe_kc && ok "ga-1md7na (k): a branch whose tip is a merge carrying its own content is KEPT on proof=patch_equivalent" \
             || bad "ga-1md7na (k): a branch holding merge-only content was DELETED on proof=patch_equivalent"
+
+echo "── ga-yw18yk: a free-text lock on a worktree whose BEAD is closed ──"
+# The measured leak (14/10): 20 crew/worker-wa-* trees of CLOSED beads, 6h-15d old, ~165-340 MB each, held by a
+# lock whose reason is free text ("wa-621dz active build"). Not "pid N", names no live session -> "unparseable";
+# its branch is neither an ancestor of main nor patch-equivalent (a bead closed without a merge, a squash with
+# local commits), so neither earlier proof fires and the tree sat there on every sweep (1.580 kept_locked_unparseable).
+# The third proof: EVERY bead id the tree's directory/branch names is confirmed CLOSED for long enough. The branch is
+# never deleted on it (only the tree goes), and a detached HEAD gets a rescue/ branch first.
+BC_ID="wa-bc1xyz"
+: > "$TMP/bc_nolsof.txt"
+bc_iso() { date -u -v-"$1"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "$1 hours ago" +%Y-%m-%dT%H:%M:%SZ; }
+bc_bead() { # bc_bead <id> <status> [<hours since closed>] → one element of what `bd list --json` prints
+  if [ -n "${3:-}" ]; then printf '{"id":"%s","status":"%s","closed_at":"%s"}' "$1" "$2" "$(bc_iso "$3")"
+  else printf '{"id":"%s","status":"%s","closed_at":null}' "$1" "$2"; fi
+}
+# mk_bc_rig <name> [<setup run inside the worktree>] [<age in hours>] — $TMP/<name>/rig with crew/worker-wa-bc1xyz on
+# branch crew/wa-worker/wa-bc1xyz carrying ONE commit that main lacks (so neither delivery proof can fire), CLEAN,
+# locked with the free-text reason from the ticket, <age> (default 3) hours old.
+mk_bc_rig() {
+  local name="$1" extra="${2:-}" root; root="$TMP/$name"; mkdir -p "$root"
+  git init -q --bare "$root/remote.git"
+  git init -q -b main "$root/rig"
+  ( cd "$root/rig" || exit 1
+    git remote add origin "$root/remote.git"
+    echo base > base.txt; git add base.txt; git commit -qm base
+    git push -q origin main; git fetch -q origin
+    git remote set-head origin main 2>/dev/null || true
+    mkdir -p crew
+    git worktree add -q "crew/worker-$BC_ID" -b "crew/wa-worker/$BC_ID" main
+    ( cd "crew/worker-$BC_ID" && echo built > built.txt && git add built.txt && git commit -qm "built, never merged" )
+    git worktree lock --reason "$BC_ID active build" "crew/worker-$BC_ID"
+    if [ -n "$extra" ]; then ( cd "crew/worker-$BC_ID" && eval "$extra" ); fi
+  ) >/dev/null 2>&1
+  pe_age "$root/rig/crew/worker-$BC_ID" "${3:-3}"
+}
+run_bc() { # run_bc <name> <beads-json-array | @missing> [ENV=val ...] — the lookup goes through the FAKE_BEADS seam
+  local name="$1" beads="$2"; shift 2
+  if [ "$beads" = "@missing" ]; then rm -f "$TMP/$name.beads.json"; else printf '%s' "$beads" > "$TMP/$name.beads.json"; fi
+  env WORKTREE_REAPER_GT="$TMP/$name" WORKTREE_REAPER_LOG="$TMP/$name.jsonl" \
+    WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_nolsof.txt" \
+    WORKTREE_REAPER_FAKE_BEADS="$TMP/$name.beads.json" "$@" bash "$REAPER" >/dev/null 2>&1
+}
+bc_wt() { git -C "$TMP/$1/rig" worktree list --porcelain 2>/dev/null | grep -E "/crew/worker-$BC_ID\$" >/dev/null; }
+bc_br() { git -C "$TMP/$1/rig" rev-parse --verify -q "refs/heads/crew/wa-worker/$BC_ID" >/dev/null 2>&1; }
+bc_tip() { git -C "$TMP/$1/rig" rev-parse "refs/heads/crew/wa-worker/$BC_ID" 2>/dev/null; }
+bc_kept() { # bc_kept <name> <label> — tree + branch intact, kept_locked_unparseable logged, no bead_closed reap
+  if bc_wt "$1" && bc_br "$1" && [ "$(events "$1" kept_locked_unparseable)" = "1" ] \
+     && [ "$(events "$1" reaped_locked_unparseable_bead_closed)" = "0" ]; then ok "ga-yw18yk: $2 → KEPT (tree + branch intact, kept_locked_unparseable logged)"
+  else bad "ga-yw18yk: $2 → NOT kept (wt=$(bc_wt "$1" && echo y || echo n) br=$(bc_br "$1" && echo y || echo n) kept_ev=$(events "$1" kept_locked_unparseable) reaped_bc=$(events "$1" reaped_locked_unparseable_bead_closed))"; fi
+}
+
+# (a) the measured bug: bead closed 10h ago, tree clean + aged + unused → tree REAPED, branch and its commit KEPT
+mk_bc_rig bc_a; BC_A_TIP="$(bc_tip bc_a)"
+run_bc bc_a "[$(bc_bead "$BC_ID" closed 10)]"
+bc_wt bc_a && bad "ga-yw18yk (a): locked worktree of a CLOSED bead (clean, aged, unused) NOT reaped — the measured leak" \
+           || ok "ga-yw18yk (a): locked worktree of a CLOSED bead (clean, aged, unused) REAPED"
+{ bc_br bc_a && [ "$(bc_tip bc_a)" = "$BC_A_TIP" ]; } && ok "ga-yw18yk (a): the branch survives with its unmerged commit (no data loss: only the tree goes)" \
+           || bad "ga-yw18yk (a): the branch (or its commit) was lost — the reap must never delete an unmerged branch"
+[ "$(events bc_a reaped_locked_unparseable_bead_closed)" = "1" ] && [ "$(events bc_a kept_locked_unparseable)" = "0" ] \
+  && ok "ga-yw18yk (a): logged as reaped_locked_unparseable_bead_closed (its own event, not the ancestry/patch ones)" \
+  || bad "ga-yw18yk (a): expected exactly 1 reaped_locked_unparseable_bead_closed and 0 kept_locked_unparseable, saw $(events bc_a reaped_locked_unparseable_bead_closed)/$(events bc_a kept_locked_unparseable)"
+grep '"event":"reaped_locked_unparseable_bead_closed"' "$TMP/bc_a.jsonl" 2>/dev/null | grep -F "\"verdict\":\"bead_closed $BC_ID\"" >/dev/null \
+  && ok "ga-yw18yk (a): the event's verdict field names the closed bead it relied on (not just the directory name)" \
+  || bad "ga-yw18yk (a): the reap event does not say which bead was closed: $(grep bead_closed "$TMP/bc_a.jsonl" 2>/dev/null | head -1)"
+
+# (b) the bead is still OPEN (the worker may be mid-build) → KEPT
+mk_bc_rig bc_b; run_bc bc_b "[$(bc_bead "$BC_ID" open)]";            bc_kept bc_b "bead OPEN"
+mk_bc_rig bc_b2; run_bc bc_b2 "[$(bc_bead "$BC_ID" in_progress)]";   bc_kept bc_b2 "bead IN_PROGRESS"
+
+# (c) the tree holds uncommitted work → KEPT (and, being locked, never preserve-and-forced either)
+mk_bc_rig bc_c 'echo wip > wip.txt'; run_bc bc_c "[$(bc_bead "$BC_ID" closed 10)]"
+bc_kept bc_c "bead closed but the tree is DIRTY"
+[ -f "$TMP/bc_c/rig/crew/worker-$BC_ID/wip.txt" ] && ok "ga-yw18yk (c): the uncommitted file is still on disk" || bad "ga-yw18yk (c): uncommitted work was destroyed"
+
+# (d) closed only 1h ago (default grace is 6h) → KEPT: a gate-fix round may be about to reopen/re-use it
+mk_bc_rig bc_d; run_bc bc_d "[$(bc_bead "$BC_ID" closed 1)]";        bc_kept bc_d "bead closed only 1h ago (grace 6h)"
+mk_bc_rig bc_d2; run_bc bc_d2 "[$(bc_bead "$BC_ID" closed 1)]" WORKTREE_REAPER_CLOSED_BEAD_HOURS=banana
+bc_kept bc_d2 "unparseable WORKTREE_REAPER_CLOSED_BEAD_HOURS falls back to the 6h grace"
+mk_bc_rig bc_d3; run_bc bc_d3 "[$(bc_bead "$BC_ID" closed 1)]" WORKTREE_REAPER_CLOSED_BEAD_HOURS=0
+bc_wt bc_d3 && bad "ga-yw18yk (d): WORKTREE_REAPER_CLOSED_BEAD_HOURS=0 was ignored (a bead closed 1h ago should qualify)" \
+            || ok "ga-yw18yk (d): WORKTREE_REAPER_CLOSED_BEAD_HOURS is honoured (0 → a bead closed 1h ago qualifies)"
+
+# (e) a live process has the tree as its cwd → KEPT
+mk_bc_rig bc_e; ( cd "$TMP/bc_e/rig/crew/worker-$BC_ID" && pwd -P > "$TMP/bc_e.lsof" )   # realpath: lsof reports /private/var, mktemp says /var
+run_bc bc_e "[$(bc_bead "$BC_ID" closed 10)]" WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_e.lsof"
+bc_kept bc_e "bead closed but a process has the tree as its cwd"
+
+# (f) the lookup cannot tell: failed (seam file missing), junk output, bead absent from a SUCCESSFUL answer, status
+#     closed but no readable closed_at → none of these is "closed" → KEPT
+mk_bc_rig bc_f1; run_bc bc_f1 "@missing";                              bc_kept bc_f1 "bead lookup FAILED"
+mk_bc_rig bc_f2; run_bc bc_f2 'this is not json';                      bc_kept bc_f2 "bead lookup printed JUNK"
+mk_bc_rig bc_f3; run_bc bc_f3 '{"id":"wa-bc1xyz","status":"closed"}';  bc_kept bc_f3 "bead lookup printed an object, not the array"
+mk_bc_rig bc_f4; run_bc bc_f4 '[]';                                    bc_kept bc_f4 "bead NOT FOUND (the id was never a bead)"
+mk_bc_rig bc_f5; run_bc bc_f5 "[$(bc_bead "$BC_ID" closed)]";          bc_kept bc_f5 "bead closed but closed_at missing"
+mk_bc_rig bc_f6; run_bc bc_f6 '[{"id":"wa-bc1xyz","status":"closed","closed_at":"yesterday-ish"}]'; bc_kept bc_f6 "bead closed but closed_at unreadable"
+
+# (g) two beads named by the tree (directory = wa-bc1xyz, branch = wa-bc2xyz): ALL found must be closed
+mk_bc_rig bc_g 'git branch -m crew/wa-worker/wa-bc2xyz'
+git -C "$TMP/bc_g/rig" rev-parse --verify -q refs/heads/crew/wa-worker/wa-bc2xyz >/dev/null 2>&1 || bad "ga-yw18yk fixture (g): branch rename failed"
+run_bc bc_g "[$(bc_bead "$BC_ID" closed 10),$(bc_bead wa-bc2xyz open)]"
+if bc_wt bc_g && [ "$(events bc_g kept_locked_unparseable)" = "1" ] && [ "$(events bc_g reaped_locked_unparseable_bead_closed)" = "0" ]; then
+  ok "ga-yw18yk (g): directory names a closed bead but the branch names an OPEN one → KEPT"
+else bad "ga-yw18yk (g): a tree naming an open bead was reaped on its other, closed bead"; fi
+mk_bc_rig bc_g2 'git branch -m crew/wa-worker/wa-bc2xyz'; run_bc bc_g2 "[$(bc_bead "$BC_ID" closed 10),$(bc_bead wa-bc2xyz closed 9)]"
+bc_wt bc_g2 && bad "ga-yw18yk (g): both named beads closed, tree NOT reaped" || ok "ga-yw18yk (g): every named bead closed → REAPED"
+
+# (h) detached HEAD carrying a commit no branch holds → a rescue/ branch FIRST, then the tree goes
+mk_bc_rig bc_h 'git checkout -q --detach && echo orphan > orphan.txt && git add orphan.txt && git commit -qm "detached-only work"'
+BC_H_HEAD="$(git -C "$TMP/bc_h/rig/crew/worker-$BC_ID" rev-parse HEAD 2>/dev/null)"; BC_H_RESCUE="rescue/$BC_ID-$(printf '%s' "$BC_H_HEAD" | cut -c1-9)"
+run_bc bc_h "[$(bc_bead "$BC_ID" closed 10)]"
+bc_wt bc_h && bad "ga-yw18yk (h): detached-HEAD tree of a closed bead NOT reaped" || ok "ga-yw18yk (h): detached-HEAD tree of a closed bead REAPED"
+[ -n "$BC_H_HEAD" ] && [ "$(git -C "$TMP/bc_h/rig" rev-parse --verify -q "refs/heads/$BC_H_RESCUE" 2>/dev/null)" = "$BC_H_HEAD" ] \
+  && ok "ga-yw18yk (h): the detached commit is held by $BC_H_RESCUE (nothing is left only in a removed tree)" \
+  || bad "ga-yw18yk (h): no $BC_H_RESCUE pointing at the detached HEAD — the commit is lost with the tree"
+# (h2) the rescue branch cannot be created (a ref blocks its name) → the tree is KEPT, never removed without it
+mk_bc_rig bc_h2 'git checkout -q --detach && echo orphan > orphan.txt && git add orphan.txt && git commit -qm "detached-only work"'
+BC_H2_HEAD="$(git -C "$TMP/bc_h2/rig/crew/worker-$BC_ID" rev-parse HEAD 2>/dev/null)"
+git -C "$TMP/bc_h2/rig" branch "rescue/$BC_ID-$(printf '%s' "$BC_H2_HEAD" | cut -c1-9)/blocker" main >/dev/null 2>&1
+run_bc bc_h2 "[$(bc_bead "$BC_ID" closed 10)]"
+if bc_wt bc_h2 && [ "$(events bc_h2 reaped_locked_unparseable_bead_closed)" = "0" ] && [ "$(events bc_h2 bead_closed_rescue_failed)" = "1" ]; then
+  ok "ga-yw18yk (h2): the rescue branch could not be created → tree KEPT, bead_closed_rescue_failed logged"
+else bad "ga-yw18yk (h2): rescue creation failed but the tree was reaped / the failure not logged (wt=$(bc_wt bc_h2 && echo y || echo n) rescue_failed=$(events bc_h2 bead_closed_rescue_failed))"; fi
+
+# (i) younger than the age gate → KEPT before the lock is even looked at (the proof never shortens the age gate)
+mk_bc_rig bc_i '' 0; run_bc bc_i "[$(bc_bead "$BC_ID" closed 10)]" WORKTREE_REAPER_STALE_HOURS=24
+bc_wt bc_i && bc_br bc_i && ok "ga-yw18yk (i): a tree younger than the age gate is KEPT even though its bead is long closed" \
+            || bad "ga-yw18yk (i): a fresh tree was reaped on the bead proof"
+
+# (j) dry-run (ENABLED=0): says what it would do, does it not
+mk_bc_rig bc_j; run_bc bc_j "[$(bc_bead "$BC_ID" closed 10)]" WORKTREE_REAPER_ENABLED=0
+if bc_wt bc_j && bc_br bc_j && [ "$(events bc_j would_reap_locked_unparseable_bead_closed)" = "1" ]; then
+  ok "ga-yw18yk (j): dry-run logs would_reap_locked_unparseable_bead_closed and removes nothing"
+else bad "ga-yw18yk (j): dry-run — wt=$(bc_wt bc_j && echo y || echo n) would_ev=$(events bc_j would_reap_locked_unparseable_bead_closed)"; fi
+
+# (k) the pid contract still wins: a lock naming a LIVE pid is never reaped on the bead proof
+mk_bc_rig bc_k; git -C "$TMP/bc_k/rig" worktree unlock "crew/worker-$BC_ID" >/dev/null 2>&1
+git -C "$TMP/bc_k/rig" worktree lock --reason "$BC_ID pid 4242 build" "crew/worker-$BC_ID" >/dev/null 2>&1
+printf '4242 alive 600 10\n' > "$TMP/bc_k.ps"
+run_bc bc_k "[$(bc_bead "$BC_ID" closed 10)]" WORKTREE_REAPER_FAKE_PS="$TMP/bc_k.ps"
+bc_wt bc_k && bc_br bc_k && [ "$(events bc_k reaped_locked_unparseable_bead_closed)" = "0" ] \
+  && ok "ga-yw18yk (k): a pid-confirmed LIVE holder is still kept — the bead proof only replaces the 'unparseable' verdict's gap" \
+  || bad "ga-yw18yk (k): a live-pid lock was reaped on the bead proof"
+
+# (l) the REAL `bd` call (no seam), through a stub on PATH: argv shape, a failing bd, a junk bd, a hanging bd (bounded)
+BC_BIN="$TMP/bc_bin"; mkdir -p "$BC_BIN"
+cat > "$BC_BIN/bd" <<'BCBD'
+#!/bin/sh
+echo "$*" >> "${FAKE_BD_LOG:-/dev/null}"
+case "${FAKE_BD_MODE:-ok}" in
+  ok)   case "$2" in
+          */.gascity-gastown-hq) [ "${FAKE_BD_JSON_HQ:-}" = "@empty" ] && exit 0; cat "${FAKE_BD_JSON_HQ:-$FAKE_BD_JSON}" ;;
+          *) cat "$FAKE_BD_JSON" ;;
+        esac ;;
+  empty) exit 0 ;;   # rc 0 and NOTHING on stdout: not "no such bead" (that is the array []), just no answer
+  fail) echo "boom" >&2; exit 1 ;;
+  junk) echo "this is not json" ;;
+  hang) exec sleep 30 ;;
+esac
+BCBD
+chmod +x "$BC_BIN/bd"
+run_bc_bd() { # run_bc_bd <name> <mode> [ENV=val ...]
+  local name="$1" mode="$2"; shift 2
+  env -u WORKTREE_REAPER_FAKE_BEADS PATH="$BC_BIN:$PATH" FAKE_BD_MODE="$mode" FAKE_BD_JSON="$TMP/$name.beads.json" FAKE_BD_LOG="$TMP/$name.bd.log" \
+    WORKTREE_REAPER_GT="$TMP/$name" WORKTREE_REAPER_LOG="$TMP/$name.jsonl" WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+    WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_nolsof.txt" "$@" bash "$REAPER" >/dev/null 2>&1
+}
+mk_bc_rig bc_l1; printf '%s' "[$(bc_bead "$BC_ID" closed 10)]" > "$TMP/bc_l1.beads.json"; run_bc_bd bc_l1 ok
+bc_wt bc_l1 && bad "ga-yw18yk (l): the real bd lookup (stub on PATH) did not lead to a reap" || ok "ga-yw18yk (l): the real bd lookup (stub on PATH) → closed bead REAPED"
+if grep -E -- "^-C .*/rig list --id .*$BC_ID.* --all --json --limit 0\$" "$TMP/bc_l1.bd.log" >/dev/null 2>&1; then
+  ok "ga-yw18yk (l): bd is called as 'bd -C <repo> list --id <ids> --all --json --limit 0' (closed beads included, no 50-row truncation)"
+else bad "ga-yw18yk (l): unexpected bd call shape: $(head -2 "$TMP/bc_l1.bd.log" 2>/dev/null)"; fi
+mk_bc_rig bc_l2; printf '%s' "[$(bc_bead "$BC_ID" closed 10)]" > "$TMP/bc_l2.beads.json"; run_bc_bd bc_l2 fail;  bc_kept bc_l2 "real bd EXITED non-zero"
+mk_bc_rig bc_l3; printf '%s' "[$(bc_bead "$BC_ID" closed 10)]" > "$TMP/bc_l3.beads.json"; run_bc_bd bc_l3 junk;  bc_kept bc_l3 "real bd printed JUNK"
+mk_bc_rig bc_l4; printf '%s' "[$(bc_bead "$BC_ID" closed 10)]" > "$TMP/bc_l4.beads.json"
+BC_T0=$(date +%s); run_bc_bd bc_l4 hang WORKTREE_REAPER_BEAD_LOOKUP_TIMEOUT=2; BC_T1=$(date +%s)
+bc_kept bc_l4 "real bd HUNG (bounded by WORKTREE_REAPER_BEAD_LOOKUP_TIMEOUT)"
+[ $((BC_T1 - BC_T0)) -lt 20 ] && ok "ga-yw18yk (l): a hung bd cost the sweep $((BC_T1 - BC_T0))s, not the stub's 30s" \
+                              || bad "ga-yw18yk (l): a hung bd held the sweep for $((BC_T1 - BC_T0))s — the lookup is not bounded"
+
+# (n) a merge / rebase / cherry-pick under way in the tree is not a finished worktree, whatever the bead says → KEPT
+mk_bc_rig bc_n 'echo "$(git rev-parse main)" > "$(git rev-parse --git-path MERGE_HEAD)"'
+run_bc bc_n "[$(bc_bead "$BC_ID" closed 10)]"
+bc_kept bc_n "bead closed but a MERGE is in progress in the tree"
+mk_bc_rig bc_n2 'mkdir -p "$(git rev-parse --git-path rebase-merge)"'
+run_bc bc_n2 "[$(bc_bead "$BC_ID" closed 10)]"
+bc_kept bc_n2 "bead closed but a REBASE is in progress in the tree"
+
+# (o) a name the rig database does not hold, with a prefix it has no beads for, is asked of the HQ database too:
+#     directory = rig bead wa-bc1xyz (closed), branch = HQ bead ga-bc9xyz. Open there → KEPT; closed there → REAPED.
+mk_bc_rig bc_o 'git branch -m crew/wa-worker/ga-bc9xyz'
+printf '%s' "[$(bc_bead "$BC_ID" closed 10)]" > "$TMP/bc_o.beads.json"; printf '%s' "[$(bc_bead ga-bc9xyz open)]" > "$TMP/bc_o.hq.json"
+run_bc_bd bc_o ok FAKE_BD_JSON_HQ="$TMP/bc_o.hq.json"
+if bc_wt bc_o && [ "$(events bc_o kept_locked_unparseable)" = "1" ] && [ "$(events bc_o reaped_locked_unparseable_bead_closed)" = "0" ]; then
+  ok "ga-yw18yk (o): the rig's bead is closed but the HQ bead named by the branch is OPEN → KEPT"
+else bad "ga-yw18yk (o): a tree naming an open HQ bead was reaped on its closed rig bead (the HQ database was not asked)"; fi
+if [ "$(grep -c -- 'list --id' "$TMP/bc_o.bd.log" 2>/dev/null)" = "2" ] && grep -E -- "^-C .*/\.gascity-gastown-hq list --id ga-bc9xyz --all" "$TMP/bc_o.bd.log" >/dev/null 2>&1; then
+  ok "ga-yw18yk (o): exactly one extra bd call, to the HQ database, asking only for the name the rig could not account for"
+else bad "ga-yw18yk (o): unexpected bd calls: $(tr '\n' '|' < "$TMP/bc_o.bd.log" 2>/dev/null)"; fi
+mk_bc_rig bc_o2 'git branch -m crew/wa-worker/ga-bc9xyz'
+printf '%s' "[$(bc_bead "$BC_ID" closed 10)]" > "$TMP/bc_o2.beads.json"; printf '%s' "[$(bc_bead ga-bc9xyz closed 9)]" > "$TMP/bc_o2.hq.json"
+run_bc_bd bc_o2 ok FAKE_BD_JSON_HQ="$TMP/bc_o2.hq.json"
+bc_wt bc_o2 && bad "ga-yw18yk (o): both the rig bead and the HQ bead closed, tree NOT reaped" || ok "ga-yw18yk (o): rig bead and HQ bead both closed → REAPED"
+# ... and an HQ database that cannot be asked keeps the tree (a possibly-open bead is not a closed one)
+mk_bc_rig bc_o3 'git branch -m crew/wa-worker/ga-bc9xyz'
+printf '%s' "[$(bc_bead "$BC_ID" closed 10)]" > "$TMP/bc_o3.beads.json"
+run_bc_bd bc_o3 ok FAKE_BD_JSON_HQ=/nonexistent/hq.json
+if bc_wt bc_o3 && [ "$(events bc_o3 kept_locked_unparseable)" = "1" ] && [ "$(events bc_o3 reaped_locked_unparseable_bead_closed)" = "0" ] \
+   && [ "$(events bc_o3 bead_lookup_failed)" = "1" ]; then
+  ok "ga-yw18yk (o): the HQ database could not be read → KEPT, and bead_lookup_failed says why"
+else bad "ga-yw18yk (o): unreadable HQ database — wt=$(bc_wt bc_o3 && echo y || echo n) kept_ev=$(events bc_o3 kept_locked_unparseable) lookup_failed_ev=$(events bc_o3 bead_lookup_failed)"; fi
+
+# (p) bd exits 0 but prints NOTHING. That is no answer, not the answer "none of these exist" (which is the array []):
+#     jq exits 0 on empty input too, so reading the silence as "not found" would let a possibly-open bead go unseen.
+mk_bc_rig bc_p1; printf '%s' "[$(bc_bead "$BC_ID" closed 10)]" > "$TMP/bc_p1.beads.json"; run_bc_bd bc_p1 empty
+if bc_wt bc_p1 && bc_br bc_p1 && [ "$(events bc_p1 reaped_locked_unparseable_bead_closed)" = "0" ] && [ "$(events bc_p1 bead_lookup_failed)" = "1" ]; then
+  ok "ga-yw18yk (p): the rig database answers with silence → KEPT, and bead_lookup_failed says so"
+else bad "ga-yw18yk (p): empty bd output — wt=$(bc_wt bc_p1 && echo y || echo n) reaped=$(events bc_p1 reaped_locked_unparseable_bead_closed) lookup_failed_ev=$(events bc_p1 bead_lookup_failed)"; fi
+mk_bc_rig bc_p2 'git branch -m crew/wa-worker/ga-bc9xyz'
+printf '%s' "[$(bc_bead "$BC_ID" closed 10)]" > "$TMP/bc_p2.beads.json"
+run_bc_bd bc_p2 ok FAKE_BD_JSON_HQ=@empty
+if bc_wt bc_p2 && [ "$(events bc_p2 reaped_locked_unparseable_bead_closed)" = "0" ] && [ "$(events bc_p2 bead_lookup_failed)" = "1" ]; then
+  ok "ga-yw18yk (p): the rig's bead is closed but the HQ database answers with silence → KEPT (a silent HQ is not 'no HQ bead')"
+else bad "ga-yw18yk (p): silent HQ database — wt=$(bc_wt bc_p2 && echo y || echo n) reaped=$(events bc_p2 reaped_locked_unparseable_bead_closed) lookup_failed_ev=$(events bc_p2 bead_lookup_failed)"; fi
+
+# (m) loop 1 (the legacy .gc-worktrees glob, label 'town', branch passed empty): same proof, branch read from the tree itself
+BCTOWN="$TMP/bc_m"; mkdir -p "$BCTOWN/.gc-worktrees"; git init -q --bare "$TMP/bc_m.git"; git init -q -b main "$BCTOWN"
+( cd "$BCTOWN" || exit 1
+  git remote add origin "$TMP/bc_m.git"; echo t > t.txt; git add t.txt; git commit -qm t
+  git push -q origin main; git fetch -q origin; git remote set-head origin main 2>/dev/null || true
+  git worktree add -q .gc-worktrees/ga-bc3xyz-build -b fix/ga-bc3xyz-build main
+  ( cd .gc-worktrees/ga-bc3xyz-build && echo b > b.txt && git add b.txt && git commit -qm "built, never merged" )
+  git worktree lock --reason "ga-bc3xyz gate-fix r1 builder" .gc-worktrees/ga-bc3xyz-build
+) >/dev/null 2>&1
+pe_age "$BCTOWN/.gc-worktrees/ga-bc3xyz-build" 3
+printf '%s' "[$(bc_bead ga-bc3xyz closed 10)]" > "$TMP/bc_m.beads.json"
+WORKTREE_REAPER_GT="$BCTOWN" WORKTREE_REAPER_LOG="$TMP/bc_m.jsonl" WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_nolsof.txt" WORKTREE_REAPER_FAKE_BEADS="$TMP/bc_m.beads.json" bash "$REAPER" >/dev/null 2>&1
+git -C "$BCTOWN" worktree list --porcelain 2>/dev/null | grep -E "/\.gc-worktrees/ga-bc3xyz-build\$" >/dev/null \
+  && bad "ga-yw18yk (m): loop-1 locked worktree of a closed bead NOT reaped (call-site wiring drifted from the pool loop)" \
+  || ok "ga-yw18yk (m): loop-1 (legacy path-glob) also reaps a locked worktree of a closed bead"
+git -C "$BCTOWN" rev-parse --verify -q refs/heads/fix/ga-bc3xyz-build >/dev/null 2>&1 \
+  && ok "ga-yw18yk (m): loop-1 keeps the (unmerged) branch" || bad "ga-yw18yk (m): loop-1 deleted an unmerged branch"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"

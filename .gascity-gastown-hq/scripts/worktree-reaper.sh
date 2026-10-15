@@ -77,6 +77,17 @@ case "$SESSION_LIST_TIMEOUT" in ''|*[!0-9]*) SESSION_LIST_TIMEOUT=60 ;; esac
 SESSION_LIST_KILL_GRACE="${WORKTREE_REAPER_SESSION_LIST_KILL_GRACE:-5}"
 case "$SESSION_LIST_KILL_GRACE" in ''|*[!0-9]*) SESSION_LIST_KILL_GRACE=5 ;; esac
 [ "$SESSION_LIST_KILL_GRACE" -ge 1 ] || SESSION_LIST_KILL_GRACE=5  # `-k 0` means "never KILL" in timeout(1)
+# ga-yw18yk: the BEAD-CLOSED proof (see _bead_closed_proof). A bead must have been closed for at least this many
+# hours before a tree that names it may be reaped on that alone: the gate-fix rounds of a bead run for hours after
+# it first closes, and the worker that built it can still be finishing. 6 is the youngest tree in the measured leak.
+BEAD_CLOSED_HOURS="${WORKTREE_REAPER_CLOSED_BEAD_HOURS:-6}"
+case "$BEAD_CLOSED_HOURS" in ''|*[!0-9]*) BEAD_CLOSED_HOURS=6 ;; esac
+# ... and the bound (seconds) on each `bd list` that proof costs (TERM at N, KILL 5s later). A lookup that times out
+# is "could not tell", so the tree is KEPT — never reaped on a guess — and the sweep is held for at most this long.
+BEAD_LOOKUP_TIMEOUT="${WORKTREE_REAPER_BEAD_LOOKUP_TIMEOUT:-20}"
+case "$BEAD_LOOKUP_TIMEOUT" in ''|*[!0-9]*) BEAD_LOOKUP_TIMEOUT=20 ;; esac
+[ "$BEAD_LOOKUP_TIMEOUT" -ge 1 ] || BEAD_LOOKUP_TIMEOUT=20          # timeout(1) treats 0 as "no bound at all"
+BEAD_LOOKUP_KILL_GRACE=5
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # _json_esc <text> — make free text safe to interpolate into a hand-built JSON log line
@@ -112,6 +123,11 @@ if [ "$free_gb" -lt "$PRESSURE_FREE_GB" ] 2>/dev/null; then gate_hours="$PRESSUR
 reaped=0; skipped_dirty=0; kept=0; branches_deleted=0; pool_reaped=0; zombie_reaped=0; preserved_dirty=0
 kept_session_list_unavailable=0   # ga-vs6shu: locks KEPT only because the session list could not be fetched
 _ZL_VERDICT=""                    # ga-vs6shu: reap_zombie_locked's verdict, handed to its caller (never recomputed)
+bead_lookup_failed=0              # ga-yw18yk: bead lookups that could not be answered (each leaves its tree KEPT)
+_BC_FAILED_SEEN=""                # ga-yw18yk: repos whose failed lookup is already logged this sweep (one event per repo)
+_BC_PROOF_IDS=""                  # ga-yw18yk: _bead_closed_proof's answer, handed to its caller: the closed bead ids it relied on
+_BC_PROOF_FIRST=""                # ... and the first of them (the label of a rescue/ branch)
+_BC_ROWS=""; _BC_FOUND_IDS=""; _BC_FOUND_PFX=""   # ga-yw18yk: _bead_ask's working set while one proof is being decided
 # ga-pdrij: the rig-worktree backlog is LARGE (704 observed — the legacy loop used
 # `git -C $GT` and could never remove rig-owned worktrees, so they piled up). Bound the
 # per-sweep pool reaping so a single run is never a massive destructive operation; the
@@ -372,7 +388,12 @@ preserve_and_reap_dirty() {
 #        whose HEAD never is one — it carries NO merge commit (`git cherry` cannot see them, so any one blocks the
 #        proof) and every commit it carries is there as an equivalent patch: `git cherry` exited 0 and printed only
 #        '-' lines (reaped_locked_unparseable_patch_equivalent; its local branch goes under that same proof). A
-#        merge check or a `git cherry` that fails or prints anything else proves nothing. Any proof missing →
+#        merge check or a `git cherry` that fails or prints anything else proves nothing. A branch that never
+#        shipped has a THIRD proof, which says the work is OVER, not that it shipped (ga-yw18yk): every bead the
+#        tree's directory/branch is named for is CLOSED, for at least BEAD_CLOSED_HOURS, and no rebase/merge/
+#        cherry-pick is under way (reaped_locked_unparseable_bead_closed; see _bead_closed_proof). On that proof the
+#        tree goes and the BRANCH STAYS, and a detached HEAD is first parked on rescue/<bead>-<sha9>. A bead that
+#        is open, unreadable or not found, or a lookup that fails, proves nothing. Any proof missing →
 #        KEPT (kept_locked_unparseable). Ignored files are not part of "clean" and go with the tree.
 #   3. any other verdict, or none (empty): KEPT (kept_locked_unrecognized_verdict). Only the exact verdict
 #      "unparseable" reaches the independent-proof path.
@@ -645,6 +666,196 @@ reap_zombie_locked() {
   return 3
 }
 
+# ── BEAD-CLOSED PROOF (ga-yw18yk) ─────────────────────────────────────────────────
+# Third independent proof that a lock has nothing left to protect, for the tree whose branch was never merged: a
+# bead closed without a merge, or squash-merged with local commits, is neither an ancestor of origin/<default> nor
+# patch-equivalent to it, and its worker wrote the lock reason as free text ("wa-621dz active build"), so the
+# session lookup cannot name a holder either. Measured 14/10: 20 such trees of CLOSED beads, 6h to 15 days old,
+# 165-340 MB each, ~3 GB on a 2-6 GB-free disk, kept on every sweep (1,580 kept_locked_unparseable events).
+#
+# What it proves: the bead(s) the tree is named for are CLOSED, and have been for BEAD_CLOSED_HOURS. What it does NOT
+# prove, and so never does: that the work shipped. Hence the tree goes and the BRANCH STAYS (the caller passes no
+# delete proof, so only a branch already merged into origin/<default> is ever deleted), and a DETACHED HEAD, which
+# no branch holds, is first parked on a rescue/<bead>-<sha9> branch.
+#
+# The three states of "what does the bead say", never collapsed into one value:
+#   closed (and for long enough)          → proven
+#   open / in_progress / blocked / ...    → not proven (the worker may be mid-build)
+#   the lookup could not be answered (bd missing, failed, timed out, junk output, no closed_at) → not proven, logged
+# A name token that is no bead at all ("wa-worker" in crew/wa-worker/<bead>) is simply absent from a SUCCESSFUL
+# answer and is ignored; but at least one named bead must exist, and EVERY one that exists must be closed.
+# Seam: WORKTREE_REAPER_FAKE_BEADS=<file holding the JSON array `bd list --json` would print>, for the selftest.
+
+# _wt_bead_candidates <wt> <branch> → bead-id-shaped tokens of the directory name and branch, one per line, unique:
+# <2-4 letters>-<3-8 of a-z0-9>[.<n>]..., read off hyphen/slash-separated neighbours ("worker-wa-74p0o0" → wa-74p0o0,
+# "crew/wa-worker/wa-y0su67.2-x" → wa-worker, wa-y0su67.2). Over-matching is harmless (a non-bead is ignored above);
+# the shape only has to be wide enough not to miss a real id. No interval expressions: macOS awk lacks them.
+_wt_bead_candidates() {
+  printf '%s\n%s\n' "$(basename "$1")" "$2" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C awk '
+    {
+      nc = split($0, chunk, /[^a-z0-9.-]+/)
+      for (c = 1; c <= nc; c++) {
+        nt = split(chunk[c], tok, "-")
+        for (i = 1; i < nt; i++) {
+          p = tok[i]; s = tok[i + 1]
+          if (p !~ /^[a-z]+$/ || length(p) < 2 || length(p) > 4) continue
+          if (!match(s, /^[a-z0-9]+/)) continue
+          blen = RLENGTH; rest = substr(s, blen + 1)
+          if (blen < 3 || blen > 8 || rest !~ /^(\.[0-9]+)*$/) continue
+          id = p "-" s
+          if (!(id in seen)) { seen[id] = 1; print id }
+        }
+      }
+    }'
+}
+
+# _nl_has <newline-separated-list> <item> — exact membership, no pipe (nothing for pipefail to invert).
+_nl_has() {
+  case "
+$1
+" in *"
+$2
+"*) return 0 ;; esac
+  return 1
+}
+
+# _bead_lookup <dir> <csv-ids> — print the JSON array of the beads among <csv-ids> that exist in <dir>'s database
+# (`--all`: a closed bead is exactly what we are asking for; `--limit 0`: bd's default cap of 50 is silent in the
+# JSON). Non-zero = the question was NOT answered; an empty array is a real answer ("none of these exist here").
+_bead_lookup() {
+  local dir="$1" ids="$2"
+  if [ -n "${WORKTREE_REAPER_FAKE_BEADS:-}" ]; then
+    [ -f "$WORKTREE_REAPER_FAKE_BEADS" ] || return 66
+    cat "$WORKTREE_REAPER_FAKE_BEADS"; return $?
+  fi
+  command -v bd >/dev/null 2>&1 || return 127
+  command -v timeout >/dev/null 2>&1 || return 127
+  timeout -k "$BEAD_LOOKUP_KILL_GRACE" "$BEAD_LOOKUP_TIMEOUT" bd -C "$dir" list --id "$ids" --all --json --limit 0 </dev/null 2>/dev/null
+}
+
+# _bead_lookup_failed <repo> <rc> <why> — count it, and log ONE event per repo per sweep (the kept tree is already
+# logged every sweep as kept_locked_unparseable; this says WHY the new proof could not even be tried).
+_bead_lookup_failed() {
+  bead_lookup_failed=$((bead_lookup_failed+1))
+  _nl_has "$_BC_FAILED_SEEN" "$1" && return 0
+  _BC_FAILED_SEEN="$_BC_FAILED_SEEN${_BC_FAILED_SEEN:+
+}$1"
+  printf '{"ts":"%s","event":"bead_lookup_failed","repo":"%s","rc":%s,"why":"%s"}\n' \
+    "$(ts)" "$(_json_esc "$(basename "$1")")" "$2" "$(_json_esc "$3")" >> "$LOG" 2>/dev/null
+}
+
+# _worktree_op_in_progress <wt> — a rebase / merge / cherry-pick / revert / bisect is under way in the tree. Its
+# state lives in the tree's git dir, not in `git status`, and a half-done operation is not a finished worktree, so it
+# is never reaped on the bead's say-so. Can't read the git dir → treated as in progress.
+_worktree_op_in_progress() {
+  local p gp
+  for p in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+    gp="$(cd "$1" 2>/dev/null && git rev-parse --git-path "$p" 2>/dev/null)" || return 0
+    case "$gp" in /*) : ;; *) gp="$1/$gp" ;; esac
+    [ -e "$gp" ] && return 0
+  done
+  return 1
+}
+
+# _rescue_detached_head <repo> <wt> <label> — park the tree's detached HEAD on rescue/<label>-<sha9> (the convention
+# of the manual rescue, rescue/wa-0ye8hw-a7e50fe20) so the commit is held by a branch before the tree is removed.
+# 0 only when that branch exists and points at HEAD afterwards (re-checked, not assumed from git's exit code).
+_rescue_detached_head() {
+  local repo="$1" wt="$2" label="$3" head name
+  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"
+  [ -n "$head" ] && [ -n "$label" ] || return 1
+  name="rescue/$label-$(printf '%s' "$head" | cut -c1-9)"
+  if [ "$(git -C "$repo" rev-parse --verify -q "refs/heads/$name" 2>/dev/null)" != "$head" ]; then
+    git -C "$repo" branch "$name" "$head" >/dev/null 2>&1 || return 1
+  fi
+  [ "$(git -C "$repo" rev-parse --verify -q "refs/heads/$name" 2>/dev/null)" = "$head" ]
+}
+
+# _bead_ask <repo> <dir> <csv-ids> — ask <dir>'s database about <csv-ids> and append what exists to the proof's
+# working set ($_BC_ROWS: "id<TAB>status<TAB>closed-epoch-or-->" lines; $_BC_FOUND_IDS / $_BC_FOUND_PFX: the ids and
+# the prefixes that answered). Main shell only — it updates counters, so never call it inside $(...). 0 = answered
+# (possibly with nothing), 1 = could not be answered (already logged).
+_bead_ask() {
+  local repo="$1" dir="$2" q="$3" raw rc part bid tab
+  raw="$(_bead_lookup "$dir" "$q")"; rc=$?
+  if [ "$rc" -ne 0 ]; then _bead_lookup_failed "$repo" "$rc" "bd_failed"; return 1; fi
+  # Exit 0 with NOTHING printed is no answer either: jq also exits 0 on empty input, so without this check the
+  # extraction below would read the silence as "none of these beads exist" (the array [] is how bd says that).
+  if ! printf '%s' "$raw" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    _bead_lookup_failed "$repo" 0 "unreadable_answer"; return 1
+  fi
+  part="$(printf '%s' "$raw" | jq -r --arg ids "$q" '
+    if type != "array" then error("bd list did not print an array") else . end
+    | ($ids | split(",")) as $want
+    | .[]
+    | select(type == "object" and (.id | type) == "string" and (.id as $i | $want | any(. == $i)))
+    | [ .id,
+        ((.status // "") | if . == "" then "-" else . end),
+        ((.closed_at // "") | if type != "string" or . == "" then "-"
+           else (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | (try fromdateiso8601 catch "-") | tostring) end) ]
+    | @tsv' 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then _bead_lookup_failed "$repo" "$rc" "unreadable_answer"; return 1; fi
+  [ -n "$part" ] || return 0
+  _BC_ROWS="$_BC_ROWS${_BC_ROWS:+
+}$part"
+  tab="$(printf '\t')"
+  while IFS="$tab" read -r bid _ _; do
+    [ -n "$bid" ] || continue
+    _BC_FOUND_IDS="$_BC_FOUND_IDS${_BC_FOUND_IDS:+
+}$bid"
+    _BC_FOUND_PFX="$_BC_FOUND_PFX${_BC_FOUND_PFX:+
+}${bid%%-*}"
+  done <<EOF
+$part
+EOF
+  return 0
+}
+
+# _bead_closed_proof <repo> <wt> <br> — 0 iff the proof above holds. On 0, $_BC_PROOF_IDS holds the closed bead ids it
+# relied on and $_BC_PROOF_FIRST the first of them. The repo's own database is asked first; a rig repo (not the town
+# root) is also asked, in the HQ database, about the named beads the first answer does not account for (a ga-*
+# worktree can live in a rig repo). Any lookup that cannot be answered ends it: not proven.
+_bead_closed_proof() {
+  local repo="$1" wt="$2" br="$3" cur cands q hq c cp rest="" bid st ce now_s need n_found=0 first="" closed_ids="" tab
+  _BC_PROOF_IDS=""; _BC_PROOF_FIRST=""; _BC_ROWS=""; _BC_FOUND_IDS=""; _BC_FOUND_PFX=""
+  _worktree_op_in_progress "$wt" && return 1
+  cur="$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null)"; [ -n "$cur" ] || cur="$br"
+  cands="$(_wt_bead_candidates "$wt" "$cur")"
+  [ -n "$cands" ] || return 1
+  q="$(printf '%s' "$cands" | tr '\n' ',')"; q="${q%,}"
+  _bead_ask "$repo" "$repo" "$q" || return 1
+  hq="$GT/.gascity-gastown-hq"
+  if [ "$repo" != "$GT" ] && [ "$repo" != "$hq" ]; then
+    # only the names the first answer does not account for: an unfound name whose prefix IS that of a bead already
+    # found there is just a word (wa-worker next to wa-<bead>), not a bead that lives elsewhere
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      _nl_has "$_BC_FOUND_IDS" "$c" && continue
+      cp="${c%%-*}"
+      _nl_has "$_BC_FOUND_PFX" "$cp" && continue
+      rest="$rest${rest:+,}$c"
+    done <<EOF
+$cands
+EOF
+    if [ -n "$rest" ]; then _bead_ask "$repo" "$hq" "$rest" || return 1; fi
+  fi
+  now_s=$(date +%s); need=$((BEAD_CLOSED_HOURS * 3600)); tab="$(printf '\t')"
+  while IFS="$tab" read -r bid st ce; do
+    [ -n "$bid" ] || continue
+    [ "$st" = "closed" ] || return 1                      # any named bead not closed: the worker may be live
+    case "$ce" in ''|*[!0-9]*) return 1 ;; esac           # closed, but when? unknown → not proven
+    [ $((now_s - ce)) -ge "$need" ] || return 1           # closed too recently
+    _nl_has "$closed_ids" "$bid" && continue
+    closed_ids="$closed_ids${closed_ids:+
+}$bid"; n_found=$((n_found+1)); [ -n "$first" ] || first="$bid"
+  done <<EOF
+$_BC_ROWS
+EOF
+  [ "$n_found" -ge 1 ] || return 1                       # no named bead exists: nothing says the work is over
+  _BC_PROOF_IDS="$(printf '%s' "$closed_ids" | tr '\n' ' ')"; _BC_PROOF_IDS="${_BC_PROOF_IDS% }"; _BC_PROOF_FIRST="$first"
+  return 0
+}
+
 # _reap_or_log_unparseable_lock <repo> <wt> <br> <reason> <age_h> <label> [<verdict>] —
 # ga-vs6shu: called when reap_zombie_locked returned 2 (holder is not a
 # pid-confirmed zombie). Splits what used to be a SINGLE collapsed
@@ -661,6 +872,9 @@ reap_zombie_locked() {
 #       of what its text says or whether it could be parsed at all. This is
 #       the actual measured bug: 51 real worktrees (2.3G) sat locked forever
 #       this way, ALL already in this exact state.
+#       The same reap also happens on the BEAD-CLOSED proof (ga-yw18yk) for a tree whose branch never
+#       shipped: its bead(s) closed for BEAD_CLOSED_HOURS, tree clean and unused, no operation under way.
+#       That one removes the tree only; the branch is kept (see _bead_closed_proof).
 #   1 = kept, CONFIRMED live (verdict live/live_session): a session named in
 #       the reason is genuinely alive AND working in this exact worktree.
 #   1 = kept, UNKNOWN (verdict "unknown <cause>"): the session list could not
@@ -716,7 +930,7 @@ _reap_or_log_unparseable_lock() {
   # "clean" verdict. This is new code on a destructive path, so it earns the
   # stricter form: only a CONFIRMED-successful, CONFIRMED-empty status counts
   # as clean; any command failure falls through to the safe "kept" branch.
-  local _status_out _status_rc _proof=""
+  local _status_out _status_rc _proof="" _unused=0
   _status_out="$(git -C "$wt" status --porcelain 2>/dev/null)"; _status_rc=$?
   # "Delivered" has two proofs (ga-1md7na): HEAD is an ancestor of origin/<default>, or — for a branch the
   # gate rebased, whose HEAD can never be one — it carries no merge commit and every commit it carries is in
@@ -728,31 +942,54 @@ _reap_or_log_unparseable_lock() {
     elif _ref_patch_equivalent "$repo" "$(git -C "$wt" rev-parse HEAD 2>/dev/null)"; then _proof="patch_equivalent"
     fi
   fi
+  # The THIRD proof (ga-yw18yk), for a tree neither of those can vouch for: every bead it is named for is closed.
+  # Last and gated on everything cheap first, because it costs a `bd` call: aged, git-clean and not in use (which
+  # is probed here once and remembered in _unused, not asked again below). A positive answer needs
+  # _bead_closed_proof to exist and say yes; where it does not (the unit sandbox) the tree is simply not proven.
+  if [ -z "$_proof" ] && [ "$age" -gt "$gate_hours" ] 2>/dev/null \
+     && [ "$_status_rc" -eq 0 ] && [ -z "$_status_out" ] \
+     && ! _worktree_in_use "$wt" \
+     && _bead_closed_proof "$repo" "$wt" "$br"; then
+    _proof="bead_closed"; _unused=1
+  fi
   if [ -n "$_proof" ] \
      && [ "$_status_rc" -eq 0 ] && [ -z "$_status_out" ] \
-     && ! _worktree_in_use "$wt"; then
+     && { [ "$_unused" = "1" ] || ! _worktree_in_use "$wt"; }; then
     # The event names which proof reaped it; the ancestry one keeps its ga-vs6shu name.
-    local _ev_reaped="reaped_locked_unparseable_safe" _ev_would="would_reap_locked_unparseable_safe" _del_proof=""
+    local _ev_reaped="reaped_locked_unparseable_safe" _ev_would="would_reap_locked_unparseable_safe" _del_proof="" _ev_verdict=""
     if [ "$_proof" = "patch_equivalent" ]; then
       _ev_reaped="reaped_locked_unparseable_patch_equivalent"
       _ev_would="would_reap_locked_unparseable_patch_equivalent"
       _del_proof="patch_equivalent"
+    elif [ "$_proof" = "bead_closed" ]; then
+      # No _del_proof: this proof says the work is OVER, not that it SHIPPED, so only a branch already merged
+      # into origin/<default> is ever deleted along with the tree. The verdict field carries the beads relied on.
+      _ev_reaped="reaped_locked_unparseable_bead_closed"
+      _ev_would="would_reap_locked_unparseable_bead_closed"
+      _ev_verdict="bead_closed $_BC_PROOF_IDS"
     fi
     if [ "$ENABLED" = "1" ]; then
+      # A DETACHED HEAD is held by no branch: park it on rescue/<bead>-<sha9> first, and if that cannot be done the
+      # tree stays (its commits would be the only copy). A tree on a branch needs nothing: the branch outlives it.
+      if [ "$_proof" = "bead_closed" ] && ! git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1 \
+         && ! _rescue_detached_head "$repo" "$wt" "$_BC_PROOF_FIRST"; then
+        _log_lock_event bead_closed_rescue_failed "$repo" "$wt" "$br" "$age" "$label" "$_ev_verdict" "$reason"
+        return 1
+      fi
       # No `worktree unlock` first — `remove -f -f` is git's own way to remove a LOCKED
       # worktree, and skipping the unlock means a remove that fails cannot leave the
       # worktree stripped of a lock whose holder we never identified (there would be
       # nothing to restore it FROM; reap_zombie_locked's unlock is different: there the
       # holder is confirmed dead).
       if git -C "$repo" worktree remove -f -f "$wt" 2>/dev/null; then
-        _log_lock_event "$_ev_reaped" "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
+        _log_lock_event "$_ev_reaped" "$repo" "$wt" "$br" "$age" "$label" "$_ev_verdict" "$reason"
         delete_merged_local_branch "$repo" "$br" "$_del_proof"
         return 0
       fi
       _log_lock_event unparseable_safe_reap_failed "$repo" "$wt" "$br" "$age" "$label"
       return 1
     fi
-    _log_lock_event "$_ev_would" "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
+    _log_lock_event "$_ev_would" "$repo" "$wt" "$br" "$age" "$label" "$_ev_verdict" "$reason"
     return 1
   fi
   _log_lock_event kept_locked_unparseable "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
@@ -979,6 +1216,6 @@ for _repo in "$GT"/*/; do
   fi
 done
 
-printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s}\n' \
-  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" >> "$LOG" 2>/dev/null
+printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s,"bead_lookup_failed":%s}\n' \
+  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" "$bead_lookup_failed" >> "$LOG" 2>/dev/null
 exit 0

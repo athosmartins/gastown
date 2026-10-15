@@ -1,0 +1,139 @@
+# hetzner-rsync-filter.wa.txt — o QUE sai do mini para o nó Linux de testes (Hetzner). Código + tests/ + um punhado de config por PASTA. (ga-zri39b)
+#
+# Contents
+#   Como é lido · O que garante · O que não garante · Seção 1 (nega sempre) · Seção 2 (tests/) · Seção 3 (fora de tests/: código e config listados)
+#
+# COMO É LIDO: o mbp-run.sh passa este arquivo ao rsync como `--filter=". <este arquivo>"`, com --delete --delete-excluded. O rsync usa a PRIMEIRA regra que casa, de cima para baixo —
+#   por isso a ORDEM é a segurança: a seção 1 vem antes de `+ /tests/***`, então nada dela sai nem de dentro de tests/. --delete-excluded faz o destino PERDER o que o filtro exclui.
+#   Arquivo ausente, ilegível ou fora do formato que o mbp-run.sh confere (filter_sane) = o nó NÃO é usado (estado inerte; cai no MBP).
+# O QUE GARANTE (por NOME e PASTA): (1) nome de segredo ou de dado conhecido não sai; (2) nome DESCONHECIDO não sai — fora de tests/ só sai código (py sh js mjs cjs ts css) e os arquivos de
+#   dado/config das linhas `+` da seção 3b, cada uma por caminho. .json/.md/.html/.yaml/.sql/.plist com nome neutro em qualquer outra pasta (docs/, scripts/, analysis/, a raiz...) é inerte até
+#   alguém listá-lo. Custo de negar demais: teste vermelho no nó, refeito local pelo gate. Nomes de PASTA (só o nome) saem junto com a árvore.
+# O QUE NÃO GARANTE: o filtro nunca lê CONTEÚDO. Código com lista de telefones colada (scripts/generate_draft_experiments.py, scripts/draft_comparison_server.py: ~40 e ~20 números) e fixture de
+#   tests/ com dump de leads passariam por nome. Quem olha o conteúdo é o mbp-run.sh (node_guard + hetzner-pii-scan.py): retém, no mini, o arquivo com >=20 telefones ou >=3 CPFs distintos, e não
+#   usa o nó se não conseguir varrer. É heurística de forma (não vê nome, e-mail, CNPJ nem lista pequena): o resíduo é esse, e vale também para as linhas `+` da seção 3b.
+# MEDIDO: 13/10, seed manual do nó: levou processo_lookup/.env.pdpj, contacts_auth/client_secret.json e shared/logs.backup-*/*.out. 14/10, 1ª revisão do gate: a versão só-denylist deixava sair
+#   .pdpj_token.txt (credencial viva), .netrc, token.txt, secrets.json, *.keystore, token.pickle e formatos não listados. 14/10, 2ª revisão: a lista por extensão mandava docs/auto_response/ab_results/*.json
+#   (200 conversas de lead cada), scripts/campanhas_aprovar_enriquecer_estado.json (CPFs) e docs/pix_verdicts/*.json — nome neutro, dado dentro; dry-run na árvore rastreada de 7.648 arquivos.
+#   openrsync do macOS: `- **/data/` NÃO casa um data/ na raiz (só os aninhados), por isso a regra é `- data/` (qualquer nível).
+#
+# SEÇÃO 1 — NEGA SEMPRE, em qualquer pasta (inclusive tests/): credencial, formas de segredo e formato de dado.
+- .env
+- .env.*
+- *.pem
+- *.key
+- *.p12
+- *.pfx
+- *.crt
+- *.p8
+- *.jks
+- *.keystore
+- *.gpg
+- *.token
+- *.pickle
+- id_rsa*
+- id_ed25519*
+- *.kdbx
+- credentials*.json
+- client_secret*.json
+- cookies*.json
+- cookies*.txt
+- *.session
+- .netrc
+- .npmrc
+- .pypirc
+- .pgpass
+- .htpasswd
+- .git-credentials
+- .aws/
+- .ssh/
+- .gnupg/
+- auth/
+- auth-*/
+- auth_*/
+- auth.bak*/
+# dotfile com palavra de segredo no nome (.pdpj_token.txt, .token) e arquivo de dado/config com ela (token.txt, access_token.json, secrets.yaml, service_account.json).
+# Só a extensão que começa com j/y/t/i (json, yaml, yml, txt, ini...) é negada: processo_lookup/pdpj_token.py e tests/test_pdpj_token*.py são CÓDIGO que o nó precisa.
+- .*[Tt][Oo][Kk][Ee][Nn]*
+- *[Tt][Oo][Kk][Ee][Nn]*.[jyti]*
+- *[Ss][Ee][Cc][Rr][Ee][Tt]*.[jyti]*
+- *[Pp][Aa][Ss][Ss][Ww]*.[jyti]*
+- *[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]*.[jyti]*
+- *[Aa][Pp][Ii][-_][Kk][Ee][Yy]*.[jyti]*
+- *[Ss][Ee][Rr][Vv][Ii][Cc][Ee][-_][Aa][Cc][Cc][Oo][Uu][Nn][Tt]*.[jyti]*
+- *[Pp][Rr][Ii][Vv][Aa][Tt][Ee][-_][Kk][Ee][Yy]*.[jyti]*
+- *[Tt][Oo][Kk][Ee][Nn]
+- *[Ss][Ee][Cc][Rr][Ee][Tt]
+- *.duckdb*
+- *.db
+- *.db-*
+- *.sqlite*
+- *.parquet
+- *.wal
+- *.gz
+- *.pkl
+- *.xlsx
+- *.csv
+- __pycache__
+- .pytest_cache
+# SEÇÃO 2 — tests/ vai inteiro (fixtures json/jsonl/xml/txt são código de teste; segredo e formato de dado já saíram na seção 1).
++ /tests/***
+# SEÇÃO 3 — fora de tests/: pastas que nunca saem, e DEPOIS a lista do que sai. O que não está na lista cai no `- *` do fim.
+- .git
+- .repo.git
+- .worktrees
+- .viewer-deploy-clone
+- .playwright-mcp
+- .claude
+- .codex
+- .gemini
+- .gc
+- .runtime
+- .beads
+- venv
+- .venv
+- venv-*
+- crew/
+- refinery/
+- polecats/
+- scratchpad/
+- witness/
+- *_artifacts/
+- *.bak-*/
+- node_modules
+- /shared/
+- /config
+- /data
+- /data.*
+- /logs
+- /logs.*
+- data/
+# 3a — código: sai em qualquer pasta que não foi negada acima. `+ */` deixa o rsync entrar nas pastas; imagem, pdf, binário, log e extensão desconhecida ficam de fora.
++ */
++ *.py
++ *.sh
++ *.js
++ *.mjs
++ *.cjs
++ *.ts
++ *.css
+# 3b — dado/config que o código lê, UM CAMINHO por linha (nunca por extensão solta). Cada pasta foi varrida na árvore rastreada do WA: zero arquivo com lista de telefone/CPF (o prod test repete).
++ /lib/**.json
++ /lib/**.yaml
++ /lib/**.yml
++ /daemons/*.json
++ /daemons/*.yaml
++ /daemons/**/changelog.d/**.json
++ /templates/**.json
++ /templates/**.html
++ /daemons/templates/**.html
++ /migrations/*.sql
++ /launchd/*.plist
++ /deploy/*.plist
++ /daemons/launchd/*.plist
++ /scripts/*.plist
++ /pytest.ini
++ /CLAUDE.md
++ /AGENTS.md
++ /docs/superpowers/runbooks/job-agendado-veredito-alerta.md
+- *

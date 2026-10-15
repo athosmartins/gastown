@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# mbp-run.sh — roda testes dirigidos (pytest) ou um comando pesado (rea/jadx/...) no MacBook Pro.
+# mbp-run.sh — roda testes dirigidos (pytest) ou um comando pesado (rea/jadx/...) no nó Linux de testes (Hetzner) ou no MacBook Pro.
 #
 # Contents
-#   Por quê · Uso · Códigos de saída · Presença do Athos · Toggle · Como funciona · Segurança
+#   Por quê · Uso · Códigos de saída · O nó Linux (ga-zri39b) · Presença do Athos · Toggle · Como funciona · Segurança
 #
 # POR QUÊ (Athos 11/10): o mini vive com load 40-60 e swap alto; os MESMOS 231 testes de lot_groups levam
 #   161 s no mini e 5,3 s no MBP. O MBP (16 GB, 12 CPUs) vira nó de capacidade, com chave de ligar/desligar.
+#   (Athos 13/10) 100% dos testes vão a um servidor externo: o nó Linux é o destino PADRÃO, o MBP vira reserva e o mini o último recurso.
 #
 # USO
 #   mbp-run.sh [--repo wa|ps] [--dir <worktree>] -- <args do pytest>        # ex.: -- tests/test_x.py -q
@@ -18,6 +19,8 @@
 #   mbp-run.sh --check               # imprime a saúde do MBP (preflight, com a presença do Athos e as tarefas em curso) e sai
 #   mbp-run.sh --remote-pause on|off # grava/remove ~/gt-remote/PAUSE no MBP (a chave "pausar até eu liberar"; quem chama é o mbp-offload.sh)
 #   mbp-run.sh --install-tools       # copia mbp-presence.sh e mbp-controle.sh (como `gascity-mbp`) para ~/gt-remote/bin/ no MBP
+#   mbp-run.sh --host linux|mbp ...  # fixa UM host (sem a cadeia): vale para --check
+#        --host linux --check          saúde do nó Linux (preflight + bandeira + filtro)
 #
 # CÓDIGOS DE SAÍDA — qualquer 96..99 significa "rode local": quem chama NUNCA trata isso como falha de teste.
 #   0..95  código do pytest/comando remoto (propagado)
@@ -29,6 +32,18 @@
 #       devolve swap depois de uma pressão. Cada recusa vai para o log com o motivo (campo "reason").
 #   97  configuração (uso errado, árvore-base ausente no MBP -> rode --seed)
 #   96  slots ocupados (o teto depende da presença do Athos: veja abaixo)
+#
+# O NÓ LINUX (ga-zri39b; servidor alugado por hora, teste de 1 semana aprovado pelo Athos em 13/10, ssh alias `hetzner-teste`)
+#   LIGA/DESLIGA  arquivo $CITY/.gc/hetzner-node.on (apagar = desligar; o nó em si é do Mayor). Independe do mbp-offload.on e da pausa do Athos:
+#                 a pausa existe porque o MBP é o notebook dele, o nó é máquina dedicada (presença sempre LIVRE).
+#   CADEIA        nó Linux -> MBP -> mini, com os mesmos códigos 96..99: qualquer motivo para o nó não rodar (bandeira, inalcançável, sem saúde,
+#                 slots cheios, base ausente, ssh que caiu no meio, filtro ilegível, repo que não é wa) cai no MBP, e daí no
+#                 que já existia. Servidor fora do ar NUNCA trava o gate. Só pytest vai ao nó (--exec segue no MBP; é a bead do REA).
+#   SEGURANÇA     o rsync para o nó usa SÓ scripts/hetzner-rsync-filter.wa.txt, com --delete-excluded. O filtro olha NOME e pasta, nunca o conteúdo: nome de segredo
+#                 ou de dado conhecido não sai, e fora de tests/ só sai código e os arquivos de dado/config listados POR CAMINHO (nome desconhecido fica inerte).
+#                 Filtro fora da forma que o filter_sane confere = o nó NÃO é usado. O CONTEÚDO é conferido por node_guard (scripts/hetzner-pii-scan.py): arquivo
+#                 com lista de telefones/CPFs fica no mini, e se a varredura não termina o nó NÃO é usado.
+#   LOG           toda linha de $CITY/.gc/logs/mbp-run.jsonl traz "host":"hetzner"|"mbp".
 #
 # PRESENÇA DO ATHOS (ga-77c1qg; decisão dele em 12/10: o MBP é o notebook de trabalho dele, o mini é o servidor)
 #   O preflight lê, NO MBP e na mesma chamada ssh, se o Athos está lá (scripts/mbp-presence.sh: tela bloqueada, ou sem teclado/mouse
@@ -51,7 +66,8 @@
 set -o pipefail
 
 CITY=${MBP_CITY:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}
-MBP_HOST=${MBP_HOST:-athos@athoss-macbook-pro.local}
+MAC_HOST=${MBP_HOST:-athos@athoss-macbook-pro.local}
+MBP_HOST=$MAC_HOST     # MBP_HOST é o host-ALVO da vez (use_host troca entre o MBP e o nó Linux); o MBP é o padrão de todos os modos que não são pytest
 FLAG="$CITY/.gc/mbp-offload.on"
 PAUSEFILE="$CITY/.gc/mbp-offload.pause"
 LOG="$CITY/.gc/logs/mbp-run.jsonl"
@@ -83,9 +99,26 @@ SSH_BIN=${MBP_SSH:-ssh}
 umask 077
 mkdir -p "$HOME/.ssh/cm" 2>/dev/null && chmod 700 "$HOME/.ssh/cm" 2>/dev/null   # sockets do ssh ficam num dir privado, nunca em /tmp (mbp-sec 11/10)
 RSYNC_BIN=${MBP_RSYNC:-rsync}
-SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm/%C -o ControlPersist=60"
+SSH_OPTS_MAC="-o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm/%C -o ControlPersist=60"
+SSH_OPTS=$SSH_OPTS_MAC
 ME="$(hostname -s 2>/dev/null || echo mini)"
 OWNER="$ME:$$:$(date +%s)"
+
+# ---- o nó Linux (ga-zri39b) ---------------------------------------------------------------------------------------------------
+NODE_HOST=${HETZNER_NODE_HOST:-hetzner-teste}
+NODE_FLAG="$CITY/.gc/hetzner-node.on"
+NODE_FILTER=${HETZNER_RSYNC_FILTER:-$HERE/hetzner-rsync-filter.wa.txt}
+NODE_MAX_SLOTS=$(num_or "${HETZNER_MAX_SLOTS:-6}" 6); [ "$NODE_MAX_SLOTS" -ge 1 ] || NODE_MAX_SLOTS=6
+NODE_MIN_DISK_MB=$(num_or "${HETZNER_MIN_DISK_MB:-2048}" 2048)
+NODE_PERSIST_S=$(num_or "${HETZNER_SSH_PERSIST_S:-600}" 600)               # ssh mini->nó custa ~3 s por conexão (RTT 200 ms): a conexão é reaproveitada entre baterias
+SSH_OPTS_NODE="-o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm/%C -o ControlPersist=$NODE_PERSIST_S"
+HOSTKIND=mac; HOSTLOG=mbp; HNAME=MBP
+use_host() { # linux | mbp
+  case "$1" in
+    linux) HOSTKIND=linux; HOSTLOG=hetzner; HNAME="nó Linux"; MBP_HOST=$NODE_HOST; SSH_OPTS=$SSH_OPTS_NODE ;;
+    *)     HOSTKIND=mac;   HOSTLOG=mbp;     HNAME=MBP;        MBP_HOST=$MAC_HOST;  SSH_OPTS=$SSH_OPTS_MAC ;;
+  esac
+}
 
 EXCLUDES=(--exclude .git --exclude venv --exclude .venv --exclude crew --exclude refinery --exclude .worktrees
   --exclude shared/data --exclude __pycache__ --exclude node_modules --exclude '*.db' --exclude '*.db-wal'
@@ -101,20 +134,21 @@ say() { printf 'mbp-run: %s\n' "$*" >&2; }
 usage() { sed -n '2,/^[^#]/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//' >&2; }   # só o bloco de comentário do topo (o limite fixo 2,36 vazava código quando o cabeçalho mudava)
 
 repo=""; dir="$PWD"; mode=pytest; seed_repo=""
-pause_arg=""
+pause_arg=""; host_sel=auto
 pushes=(); pulls=(); envs=(); keep=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo) repo="${2:-}"; shift 2 ;;
-    --dir) dir="${2:-}"; shift 2 ;;
+    --host) host_sel="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    --repo) repo="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    --dir) dir="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
     --exec) mode=exec; shift ;;
-    --seed) mode=seed; seed_repo="${2:-}"; shift 2 ;;
+    --seed) mode=seed; seed_repo="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
     --check) mode=check; shift ;;
-    --remote-pause) mode=remote_pause; pause_arg="${2:-}"; shift 2 ;;
+    --remote-pause) mode=remote_pause; pause_arg="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
     --install-tools) mode=install_tools; shift ;;
-    --push) pushes+=("${2:-}"); shift 2 ;;
-    --pull) pulls+=("${2:-}"); shift 2 ;;
-    --env) envs+=("${2:-}"); shift 2 ;;
+    --push) pushes+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
+    --pull) pulls+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
+    --env) envs+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
     --keep) keep=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
@@ -122,8 +156,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-base_of() { case "$1" in wa) echo whatsapp_automation ;; ps) echo property_scrapers ;; esac; }
-venv_of() { case "$1" in wa) echo venv ;; ps) echo venv-ps ;; esac; }
+case "$host_sel" in auto|linux|mbp) ;; *) say "uso: --host linux|mbp"; exit 97 ;; esac
+# nomes na máquina remota: no MBP a base é gt-remote/whatsapp_automation e o venv gt-remote/venv; no nó Linux (montado pelo Mayor) são wa-base e venv-wa.
+# O nó só tem o wa: ps no nó Linux não existe (vazio → o chamador cai no MBP).
+base_of() { if [ "$HOSTKIND" = linux ]; then case "$1" in wa) echo wa-base ;; esac; else case "$1" in wa) echo whatsapp_automation ;; ps) echo property_scrapers ;; esac; fi; }
+venv_of() { if [ "$HOSTKIND" = linux ]; then case "$1" in wa) echo venv-wa ;; esac; else case "$1" in wa) echo venv ;; ps) echo venv-ps ;; esac; fi; }
 local_root_of() { case "$1" in wa) echo /Users/athos/gt/whatsapp_automation ;; ps) echo /Users/athos/.property-scrapers/runtime/main ;; esac; }
 local_venv_of() { case "$1" in wa) echo /Users/athos/gt/whatsapp_automation/venv ;; ps) echo /Users/athos/.property-scrapers/runtime/main/venv ;; esac; }
 
@@ -132,8 +169,9 @@ rssh_s() { "$SSH_BIN" $SSH_OPTS "$MBP_HOST" bash -s -- "$@"; }   # idem, com arg
 
 log_run() { # repo mode slot rc secs   (+ globais PRES e DEMOTED: o estado em que a execução largou e se foi rebaixada no meio)
   mkdir -p "$(dirname "$LOG")" 2>/dev/null
-  printf '{"ts":"%s","repo":"%s","mode":"%s","slot":"%s","rc":%s,"secs":%s,"nargs":%s,"presence":"%s","demoted":%s}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" "$5" "$(( $# - 5 ))" "${PRES:--}" "${DEMOTED:-0}" >> "$LOG" 2>/dev/null || true
+  # host: onde a execução rodou (hetzner|mbp)
+  printf '{"ts":"%s","repo":"%s","mode":"%s","slot":"%s","rc":%s,"secs":%s,"nargs":%s,"presence":"%s","demoted":%s,"host":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" "$5" "$(( $# - 5 ))" "${PRES:--}" "${DEMOTED:-0}" "$HOSTLOG" >> "$LOG" 2>/dev/null || true
 }
 
 # ---- leitura do preflight ---------------------------------------------------------------------------------------
@@ -151,8 +189,8 @@ log_refusal() { # usa REFUSAL e PF
   a=$(pf_get avail_mb); s=$(pf_get swap_mb); d=$(pf_get swap_delta_mb); p=$(pf_get pressure)
   isnum "$a" || a=null; isnum "$s" || s=null; isint "$d" || d=null; isnum "$p" || p=null
   mkdir -p "$(dirname "$LOG")" 2>/dev/null
-  printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":%s,"secs":0,"nargs":0,"reason":"%s","avail_mb":%s,"swap_mb":%s,"swap_delta_mb":%s,"pressure":%s,"presence":"%s"}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${REFUSAL_RC:-98}" "${REFUSAL:-desconhecido}" "$a" "$s" "$d" "$p" "${PRES:--}" >> "$LOG" 2>/dev/null \
+  printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":%s,"secs":0,"nargs":0,"reason":"%s","avail_mb":%s,"swap_mb":%s,"swap_delta_mb":%s,"pressure":%s,"presence":"%s","host":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${REFUSAL_RC:-98}" "${REFUSAL:-desconhecido}" "$a" "$s" "$d" "$p" "${PRES:--}" "$HOSTLOG" >> "$LOG" 2>/dev/null \
     || say "AVISO: recusa '${REFUSAL:-desconhecido}' NÃO gravada em $LOG — a contagem de 72 h (mbp-offload.sh counts) não vai incluí-la"
 }
 
@@ -163,6 +201,12 @@ remote_header() {
   local lib
   printf '# MBP:%s\n' "$1"
   printf 'PRESENCE_AWAY_S=%s\nPRESENCE_WATCH_S=%s\nPRESENCE_LIB_ONLY=1\n' "$AWAY_S" "$WATCH_S"
+  if [ "$HOSTKIND" = linux ]; then
+    # máquina dedicada: não há Athos para proteger. Presença é SEMPRE livre e nunca há pausa remota; a biblioteca do macOS (ioreg/pmset) nem é enviada.
+    printf '%s\n' 'presence_eval() { PR_MODE=livre; PR_WHY=dedicada; PR_LOCKED=; PR_IDLE=; PR_HOLD=; PR_PAUSED=0; }' \
+      'presence_probe() { presence_eval; echo "presence=livre"; echo "presence_why=dedicada"; echo "paused=0"; }'
+    return 0
+  fi
   [ "${MBP_FORCE_PRESENCE:-}" = uso ] && printf 'PRESENCE_FORCE_USO=1\n'
   lib=$(cat "$PRESENCE_LIB" 2>/dev/null)
   if [ -n "$lib" ]; then printf '%s\n' "$lib"
@@ -183,7 +227,55 @@ remote_header() {
 #
 # PRESENÇA (ga-77c1qg): a mesma chamada traz presence=livre|uso (+ presence_why), paused, ncpu e as tarefas em curso (task=...). A
 # presença NÃO recusa por si: ela decide o TETO de slots e a prioridade (ver o cabeçalho). Só a pausa recusa (rc 99).
+# Preflight do nó Linux: os MESMOS pares k=v do macOS, lidos de /proc (o 2º argumento posicional é a raiz do /proc, só o selftest muda).
+#   RAM = MemAvailable · swap = SwapTotal - SwapFree (e o crescimento entre duas leituras) · pressão = PSI de memória, mapeada para os níveis do
+#   macOS (1 normal, 2 aviso, 4 crítico) para o lado local julgar igual · bateria não existe (power=ac) · presença = sempre livre (máquina dedicada).
+#   Mesma regra de sempre: leitura que vazia, falha ou vem em formato inesperado deixa o campo VAZIO, nunca 0 e nunca "normal" — o lado local
+#   lê campo vazio como "não consegui saber" e recusa. Sem swap nenhum (SwapTotal 0) é uma leitura VÁLIDA de 0.
+preflight_script_linux() {
+  remote_header PREFLIGHT
+  printf 'PSI_S2=%s\nPSI_F2=%s\nPSI_S4=%s\nPSI_F4=%s\n' "$(num_or "${HETZNER_PSI_SOME_WARN:-10}" 10)" "$(num_or "${HETZNER_PSI_FULL_WARN:-1}" 1)" \
+    "$(num_or "${HETZNER_PSI_SOME_CRIT:-40}" 40)" "$(num_or "${HETZNER_PSI_FULL_CRIT:-10}" 10)"
+  cat <<'EOF'
+SAMPLE_S=${1:-2}; PROC=${2:-/proc}
+[ "$SAMPLE_S" -ge 1 ] 2>/dev/null || SAMPLE_S=2
+isnum() { [ "$1" -ge 0 ] 2>/dev/null; }
+mi() { awk -v k="$1:" '$1 == k && $2 ~ /^[0-9]+$/ && $3 == "kB" { print $2; exit }' "$PROC/meminfo" 2>/dev/null; }
+swap_used() { local st sf; st=$(mi SwapTotal); sf=$(mi SwapFree); if isnum "$st" && isnum "$sf" && [ "$sf" -le "$st" ]; then echo $(( (st - sf) / 1024 )); fi; }
+s1=$(swap_used)
+ma=$(mi MemAvailable)
+if isnum "$ma"; then echo "avail_mb=$(( ma / 1024 ))"; else echo "avail_mb="; fi
+echo "compressed_mb="
+# PSI: `some` e `full` avg10 = % do tempo, nos últimos 10 s, com tarefas paradas esperando memória. Faltou uma das duas linhas, ou o formato mudou → NADA
+psi_level() { awk -v s2="$PSI_S2" -v f2="$PSI_F2" -v s4="$PSI_S4" -v f4="$PSI_F4" '
+  ($1 == "some" || $1 == "full") { for (i = 2; i <= NF; i++) if ($i ~ /^avg10=[0-9]+(\.[0-9]+)?$/) { sub(/^avg10=/, "", $i); v[$1] = $i + 0; got[$1] = 1 } }
+  END { if (!(got["some"] && got["full"])) exit 1
+        if (v["some"] >= s4 || v["full"] >= f4) print 4; else if (v["some"] >= s2 || v["full"] >= f2) print 2; else print 1 }'; }
+lvl=$(psi_level 2>/dev/null < "$PROC/pressure/memory")
+if isnum "$lvl"; then echo "pressure=$lvl"; else echo "pressure="; fi
+echo "mem_free_pct="
+echo "power=ac"
+echo "batt="
+echo "load=$(awk '{print $1}' "$PROC/loadavg" 2>/dev/null)"
+nc=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)
+if isnum "$nc" && [ "$nc" -ge 1 ]; then echo "ncpu=$nc"; else echo "ncpu="; fi
+# disco livre do home, em MB (rsync de worktree + espelhos por slot). ilegível → vazio
+echo "disk_mb=$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print int($4 / 1024) }')"
+presence_probe
+for d in "$HOME"/gt-remote/slots/*/; do
+  [ -d "$d" ] || continue
+  tn=${d%/}; tn=${tn##*/}
+  echo "task=$tn|$(cat "$d/owner" 2>/dev/null | tr -d ' |\n')|$(cat "$d/info" 2>/dev/null | tr '\n|' '  ' | cut -c1-160)|$(stat -c %Y "$d" 2>/dev/null)"
+done
+sleep "$SAMPLE_S"
+s2=$(swap_used)
+echo "swap_mb=$s2"
+if isnum "$s1" && isnum "$s2"; then echo "swap_delta_mb=$(( s2 - s1 ))"; else echo "swap_delta_mb="; fi
+EOF
+}
+
 preflight_script() {
+  if [ "$HOSTKIND" = linux ]; then preflight_script_linux; return; fi
   remote_header PREFLIGHT
   cat <<'EOF'
 SAMPLE_S=${1:-2}
@@ -230,12 +322,12 @@ EOF
 }
 
 preflight() {
-  local out rc avail swap delta pressure power batt
+  local out rc avail swap delta pressure power batt disk
   REFUSAL=""; REFUSAL_RC=98
   # Script remoto: toda leitura que vazia, falha ou vem em formato inesperado deixa o campo VAZIO (nunca 0, nunca "normal");
   # o lado local lê campo vazio como "não consegui saber" e recusa (estado inerte). $1 = janela da amostra de swap, em segundos.
   out=$(preflight_script | rssh_s "$SWAP_SAMPLE_S" 2>/dev/null); rc=$?
-  [ $rc -eq 0 ] && [ -n "$out" ] || { REFUSAL=inalcancavel; say "MBP inalcançável (ssh rc=$rc) — rode local"; return 98; }
+  [ $rc -eq 0 ] && [ -n "$out" ] || { REFUSAL=inalcancavel; say "$HNAME inalcançável (ssh rc=$rc) — rode local"; return 98; }
   PF="$out"
   # Presença: valor ausente ou fora de {livre,uso} é "uso" (nunca "livre"); MBP_FORCE_PRESENCE=uso só piora.
   PRES=$(pf_get presence); PRES_WHY=$(pf_get presence_why); NCPU=$(pf_get ncpu)
@@ -244,25 +336,31 @@ preflight() {
   # Pausa do Athos (arquivo no MBP): vem antes da saúde — é uma ordem dele, não uma medida. Só o literal 1 pausa (o teste do arquivo
   # é um [ -e ], que não tem terceiro estado).
   if [ "$(pf_get paused)" = 1 ]; then
-    REFUSAL_RC=99; refuse pausado_mbp "MBP pausado pelo Athos ($(pf_get pause_info))"; return 99
+    REFUSAL_RC=99; refuse pausado_mbp "$HNAME pausado pelo Athos ($(pf_get pause_info))"; return 99
   fi
   # Lado local: campo AUSENTE ou ilegível ≠ valor baixo. Os três estados (tem / não tem / não consegui saber) NUNCA caem no
   # mesmo resultado: ilegível recusa com motivo "ilegivel:<campo>" (distinto de ram/pressao/swap) para o log não mentir.
   avail=$(pf_get avail_mb); swap=$(pf_get swap_mb); delta=$(pf_get swap_delta_mb); pressure=$(pf_get pressure)
   power=$(pf_get power); batt=$(pf_get batt)
-  isnum "$avail" || { refuse ilegivel:avail "RAM disponível do MBP ilegível"; return 98; }    # gate:ilegivel-avail
-  [ "$avail" -ge "$MIN_AVAIL_MB" ] || { refuse ram "MBP sem RAM livre ($avail MB < $MIN_AVAIL_MB)"; return 98; }    # gate:ram
-  case "$pressure" in 1|2|4) ;; *) refuse ilegivel:pressure "pressão de memória do MBP ilegível (nível '${pressure:-}')"; return 98 ;; esac    # gate:ilegivel-pressao
-  [ "$pressure" -le "$MAX_PRESSURE" ] || { refuse pressao "MBP sob pressão de memória (nível $pressure > $MAX_PRESSURE; 1=normal 2=aviso 4=crítico)"; return 98; }    # gate:pressao
-  isint "$delta" || { refuse ilegivel:swap_delta "crescimento do swap do MBP ilegível"; return 98; }    # gate:ilegivel-delta
-  [ "$delta" -le "$MAX_SWAP_GROWTH_MB" ] || { refuse swap_cresce "MBP trocando memória agora (swap cresceu $delta MB em ${SWAP_SAMPLE_S}s > $MAX_SWAP_GROWTH_MB)"; return 98; }    # gate:cresce
-  isnum "$swap" || { refuse ilegivel:swap "swap usado do MBP ilegível"; return 98; }    # gate:ilegivel-swap
-  [ "$swap" -lt "$MAX_SWAP_MB" ] || { refuse swap_teto "MBP com swap acima do teto ($swap MB >= $MAX_SWAP_MB)"; return 98; }    # gate:teto
+  isnum "$avail" || { refuse ilegivel:avail "RAM disponível do $HNAME ilegível"; return 98; }    # gate:ilegivel-avail
+  [ "$avail" -ge "$MIN_AVAIL_MB" ] || { refuse ram "$HNAME sem RAM livre ($avail MB < $MIN_AVAIL_MB)"; return 98; }    # gate:ram
+  case "$pressure" in 1|2|4) ;; *) refuse ilegivel:pressure "pressão de memória do $HNAME ilegível (nível '${pressure:-}')"; return 98 ;; esac    # gate:ilegivel-pressao
+  [ "$pressure" -le "$MAX_PRESSURE" ] || { refuse pressao "$HNAME sob pressão de memória (nível $pressure > $MAX_PRESSURE; 1=normal 2=aviso 4=crítico)"; return 98; }    # gate:pressao
+  isint "$delta" || { refuse ilegivel:swap_delta "crescimento do swap do $HNAME ilegível"; return 98; }    # gate:ilegivel-delta
+  [ "$delta" -le "$MAX_SWAP_GROWTH_MB" ] || { refuse swap_cresce "$HNAME trocando memória agora (swap cresceu $delta MB em ${SWAP_SAMPLE_S}s > $MAX_SWAP_GROWTH_MB)"; return 98; }    # gate:cresce
+  isnum "$swap" || { refuse ilegivel:swap "swap usado do $HNAME ilegível"; return 98; }    # gate:ilegivel-swap
+  [ "$swap" -lt "$MAX_SWAP_MB" ] || { refuse swap_teto "$HNAME com swap acima do teto ($swap MB >= $MAX_SWAP_MB)"; return 98; }    # gate:teto
   # fonte de energia ilegível recusa com motivo próprio (antes caía em "battery" e virava recusa por bateria baixa no log)
-  case "$power" in ac|battery) ;; *) refuse ilegivel:power "fonte de energia do MBP ilegível ('${power:-}')"; return 98 ;; esac    # gate:ilegivel-power
+  case "$power" in ac|battery) ;; *) refuse ilegivel:power "fonte de energia do $HNAME ilegível ('${power:-}')"; return 98 ;; esac    # gate:ilegivel-power
   if [ "$power" = battery ]; then
-    isnum "$batt" || { refuse ilegivel:batt "carga da bateria do MBP ilegível"; return 98; }    # gate:ilegivel-batt
-    [ "$batt" -gt "$MIN_BATT" ] || { refuse bateria "MBP na bateria ($batt% <= $MIN_BATT%)"; return 98; }
+    isnum "$batt" || { refuse ilegivel:batt "carga da bateria do $HNAME ilegível"; return 98; }    # gate:ilegivel-batt
+    [ "$batt" -gt "$MIN_BATT" ] || { refuse bateria "$HNAME na bateria ($batt% <= $MIN_BATT%)"; return 98; }
+  fi
+  # só o nó Linux: disco cheio faz o rsync do worktree falhar no meio. ilegível ≠ pouco: recusa com motivo próprio
+  if [ "$HOSTKIND" = linux ]; then
+    disk=$(pf_get disk_mb)
+    isnum "$disk" || { refuse ilegivel:disk "disco livre do $HNAME ilegível"; return 98; }    # gate:ilegivel-disco
+    [ "$disk" -ge "$NODE_MIN_DISK_MB" ] || { refuse disco "$HNAME sem disco livre ($disk MB < $NODE_MIN_DISK_MB)"; return 98; }    # gate:disco
   fi
   return 0
 }
@@ -276,6 +374,16 @@ preflight() {
 #   EM USO  = USE_SLOTS (1).
 slot_cap() {
   local cpu mem avail
+  if [ "$HOSTKIND" = linux ]; then
+    # máquina dedicada: o teto é HETZNER_MAX_SLOTS (6), ainda limitado pela RAM de agora, como no modo LIVRE do MBP. Cada bateria grande usa vários núcleos
+    # (e dividem os núcleos entre si), então "um slot por núcleo" colocaria 16 pytest disputando o mesmo disco.
+    cpu=$NODE_MAX_SLOTS; avail=$(pf_get avail_mb)
+    if isnum "$avail"; then
+      mem=$(( 1 + (avail - MIN_AVAIL_MB) / SLOT_MEM_MB )); [ "$mem" -ge 1 ] || mem=1
+      [ "$mem" -ge "$cpu" ] || cpu=$mem
+    fi
+    echo "$cpu"; return
+  fi
   if [ "$PRES" = livre ]; then
     if [ -n "$MAX_SLOTS" ]; then cpu=$MAX_SLOTS
     elif isnum "$NCPU" && [ "$NCPU" -ge 1 ]; then cpu=$NCPU
@@ -389,7 +497,7 @@ done
 for d in "\$S"/*/; do
   [ -d "\$d" ] || continue
   m=\${d%/}; m=\${m##*/}
-  echo "BUSY \$m \$(cat "\$d/owner" 2>/dev/null | tr -d ' ') \$(stat -f %m "\$d" 2>/dev/null)"
+  echo "BUSY \$m \$(cat "\$d/owner" 2>/dev/null | tr -d ' ') \$(stat -c %Y "\$d" 2>/dev/null || stat -f %m "\$d" 2>/dev/null)"
 done
 echo FULL; exit 3
 EOF
@@ -424,7 +532,7 @@ acquire() {
     done <<<"$out"
     [ $reaped -eq 1 ] || break
   done
-  say "slots do MBP ocupados (teto $(slot_cap), modo ${PRES:-?}) — rode local"; return 96
+  say "slots do $HNAME ocupados (teto $(slot_cap), modo ${PRES:-?}) — rode local"; return 96
 }
 release() {
   [ -n "$SLOT" ] || return 0
@@ -436,17 +544,78 @@ true
 EOF
   SLOT=""
 }
-cleanup() { release; [ -n "${TMPOUT:-}" ] && rm -f "$TMPOUT"; }
+cleanup() { release; [ -n "${TMPOUT:-}" ] && rm -f "$TMPOUT"; [ -n "${SENT:-}" ] && { rm -f "$SENT" "$SENT.held" "$SENT.out" "$SENT.hp" "$SENT.v"; rmdir "$SENT.dst" 2>/dev/null; }; return 0; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
+# ---- nó Linux: guardas de segurança --------------------------------------------------------------------------------------
+# filter_sane: o filtro do rsync é a fronteira de dados do servidor alugado, então ele é CONFERIDO, não só lido. Confere a FORMA, não a suficiência (essa é o teste com rsync
+# de verdade, no selftest e no prod test): (1) abre e não é vazio, (2) `+ /tests/***` existe, (3) as 12 regras-âncora de cada classe (.env, .netrc, client_secret, dotfile de
+# token, token/secret com extensão de dado, .pickle, *.duckdb/.db/.csv/.parquet/.gz) vêm ANTES dela — o rsync usa a primeira regra que casa, e quem inclui tests/ primeiro deixa passar
+# um *.duckdb plantado lá dentro —, (4) nenhum `+` antes dela e nenhum `+` que inclua tudo (`+ *`, `+ **`, `+ /*`, `+ /**`, `+ **/**`...) em lugar nenhum, só regras `- x`/`+ x` (um `!`, que
+# zera a lista, ou um `.`/`:`, que traz outro arquivo, não passam), (5) a ÚLTIMA regra é `- *` (sem ela, nome desconhecido sai). rc 0 = vale · 1 = não.
+filter_sane() {
+  [ -f "$NODE_FILTER" ] && [ -r "$NODE_FILTER" ] && [ -s "$NODE_FILTER" ] || return 1
+  awk '
+    BEGIN { split(".env|.netrc|client_secret*.json|.*[Tt][Oo][Kk][Ee][Nn]*|*[Tt][Oo][Kk][Ee][Nn]*.[jyti]*|*[Ss][Ee][Cc][Rr][Ee][Tt]*.[jyti]*|*.pickle|*.duckdb*|*.db|*.csv|*.parquet|*.gz", c, "|")
+            for (i in c) { want["- " c[i]] = 1; nwant++ } }
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    { line = $0; sub(/[[:space:]]+$/, "", line); last = line }
+    line !~ /^[-+] / { bad = 1 }
+    line ~ /^\+ [*\/]+$/ && line != "+ */" { bad = 1 }
+    line == "+ /tests/***" { if (!tests) tests = NR; next }
+    !tests && line ~ /^\+/ { bad = 1 }
+    !tests && (line in want) { seen[line] = 1 }
+    END { n = 0; for (k in seen) n++; exit !(tests && !bad && n == nwant && last == "- *") }' "$NODE_FILTER"
+}
+# node_wanted <args>: o nó entra na cadeia? Devolve 1 quando não e deixa o motivo em NODE_WHY (vira uma linha do log). A bandeira desligada NÃO é recusa: é o interruptor.
+NODE_WHY=""
+node_wanted() {
+  NODE_WHY=""
+  [ "$host_sel" != mbp ] || return 1
+  [ -f "$NODE_FLAG" ] || return 1
+  [ "$repo" = wa ] || { [ "$host_sel" = linux ] && say "o nó Linux só roda o repo wa (este é '$repo') — rode local"; return 1; }
+  filter_sane || { NODE_WHY="filtro-invalido"; say "o filtro do rsync do nó ($NODE_FILTER) não abre ou não está na forma conferida pelo filter_sane (regras de segredo/dado ANTES de + /tests/***, nada que inclua tudo, \`- *\` no fim) — o nó NÃO é usado"; return 1; }
+  return 0
+}
+# node_guard: o filtro olha NOME e pasta; isto olha o CONTEÚDO do que ele deixaria sair (hetzner-pii-scan.py, o mesmo que o prod test roda no servidor). Arquivo com LISTA de telefones/CPFs (>=20 / >=3)
+# fica no mini: vira regra `- /caminho` em $HELD, que o rsync lê ANTES do filtro. FALHA FECHADA (rc 1 = o nó NÃO é usado; erro e "nada retido" não são a mesma coisa): a lista do rsync que não sai, a varredura que
+# não termina, arquivo listado que a varredura não conseguiu LER (rc 3 do scanner: nome com quebra de linha, que a lista parte em dois, ou arquivo que sumiu/ficou ilegível entre a lista e a varredura; sem permissão desde o início já derruba a própria lista, rc 23), e regra que NÃO segura o arquivo — um caminho com barra invertida
+# vira `- /a\\b` e o rsync não o casa —, o que é conferido de verdade: um 2º rsync -n com $HELD não pode listar nenhum caminho retido. LIMITE: a lista e a varredura são um retrato de poucos segundos antes
+# da cópia (o rsync da cópia anda a árvore de novo); arquivo editado nessa janela não é revarrido. A fronteira que vale no instante da cópia é o filtro (nome/pasta); isto é a segunda camada.
+SENT=""; HELD=""
+node_guard() {
+  local nheld
+  mkdir -p "$CITY/.gc/run" 2>/dev/null; SENT=$(mktemp "$CITY/.gc/run/mbp-sent.XXXXXX") || return 1; HELD="$SENT.held"
+  mkdir "$SENT.dst" || return 1
+  "$RSYNC_BIN" -a -n --out-format='%n' --filter=". $NODE_FILTER" "$dir"/ "$SENT.dst"/ 2>/dev/null | grep -v '/$' > "$SENT"
+  [ "${PIPESTATUS[0]}" -eq 0 ] && [ -s "$SENT" ] || return 1
+  python3 -I "$HERE/hetzner-pii-scan.py" "$dir" --rules "$HELD" < "$SENT" > "$SENT.out" 2>/dev/null && [ -f "$HELD" ] || return 1
+  nheld=$(wc -l < "$SENT.out" | tr -d ' ')
+  if [ "$nheld" -gt 0 ]; then
+    # vazio (nenhum caminho retido) → nada a conferir, pula; falhou (rsync -n sem resposta, lista ilegível) ou algum caminho retido AINDA listado → rc 1, o nó NÃO é usado (grep: 1 = nenhum casou = ok; 0 = vazou; 2 = erro)
+    cut -f3- "$SENT.out" > "$SENT.hp" || return 1
+    "$RSYNC_BIN" -a -n --out-format='%n' --filter=". $HELD" --filter=". $NODE_FILTER" "$dir"/ "$SENT.dst"/ 2>/dev/null | grep -v '/$' > "$SENT.v"
+    [ "${PIPESTATUS[0]}" -eq 0 ] || return 1
+    grep -qxF -f "$SENT.hp" "$SENT.v"; [ $? -eq 1 ] || return 1
+  fi
+  [ "$nheld" -eq 0 ] || say "NOTE: $nheld arquivo(s) com lista de telefones/CPFs ficam no mini e NÃO vão ao $HNAME ($(cut -f3 "$SENT.out" | head -n 4 | tr '\n' ' ')…): teste que os lê ou importa falha aqui — rode esse teste local."
+  return 0
+}
 # ---- seed / check -----------------------------------------------------------------------------------------------
+# --host linux fixa o nó nos modos que olham UM host (--check, --seed); sem --host, esses modos continuam sendo do MBP como sempre foram.
+case "$host_sel:$mode" in linux:remote_pause|linux:install_tools) say "--host linux não vale para --$(echo "$mode" | tr _ -): a pausa e as ferramentas são do MBP"; exit 97 ;; esac
+[ "$host_sel" = linux ] && use_host linux
 if [ "$mode" = check ]; then
   preflight; rc=$?
   printf '%s\n' "${PF:-}"; echo "offload_flag=$([ -f "$FLAG" ] && echo on || echo off)"
   echo "paused_local=$([ -e "$PAUSEFILE" ] && echo 1 || echo 0)"
   echo "pause_local_info=$(head -n 1 "$PAUSEFILE" 2>/dev/null | tr -d '|\r' | cut -c1-100)"
   [ -n "$PRES" ] && echo "slot_cap=$(slot_cap)"
+  if [ "$HOSTKIND" = linux ]; then
+    echo "node_flag=$([ -f "$NODE_FLAG" ] && echo on || echo off)"
+    echo "node_filter_ok=$(filter_sane && echo 1 || echo 0)"
+  fi
   exit $rc
 fi
 
@@ -483,6 +652,7 @@ fi
 refresh_tools() { install_tools >/dev/null 2>&1 || say "AVISO: não atualizei ~/gt-remote/bin no MBP (gascity-mbp); rode: mbp-offload.sh install-mbp"; }
 if [ "$mode" = seed ]; then
   case "$seed_repo" in wa|ps) ;; *) say "uso: --seed wa|ps"; exit 97 ;; esac
+  if [ "$HOSTKIND" = linux ]; then say "a semeadura do nó Linux ainda não existe (fatia 4 da ga-zri39b)"; exit 97; fi
   [ -e "$PAUSEFILE" ] && { say "pausado pelo Athos ($PAUSEFILE) — não semeio"; exit 99; }
   preflight || exit $?
   # com o Athos no MBP (ou sem saber), o receptor do rsync roda em prioridade de fundo: a semeadura é I/O no notebook dele
@@ -509,55 +679,94 @@ if [ "$mode" = seed ]; then
 fi
 
 # ---- caminho normal (pytest | exec) ----------------------------------------------------------------------------
-[ -f "$FLAG" ] || { say "offload desligado (falta $FLAG) — rode local"; exit 99; }
-[ -e "$PAUSEFILE" ] && { say "pausado pelo Athos ($(head -n 1 "$PAUSEFILE" 2>/dev/null | cut -c1-100)) — rode local"; exit 99; }
+# pytest: CADEIA nó Linux -> MBP (-> o chamador roda no mini quando sobra 96..99). Cada host é uma TENTATIVA (attempt_pytest) que devolve o rc do pytest, ou 96..99 = "este host
+# não rodou, tente o próximo". exec (REA/APK) continua só no MBP.
+mac_gates() { # as chaves do MBP: bandeira e pausa do Athos
+  [ -f "$FLAG" ] || { say "offload desligado (falta $FLAG) — rode local"; return 99; }
+  [ -e "$PAUSEFILE" ] && { say "pausado pelo Athos ($(head -n 1 "$PAUSEFILE" 2>/dev/null | cut -c1-100)) — rode local"; return 99; }
+  return 0
+}
+fall() { # motivo rc: o host não rodou. Só o nó grava a linha (o log do MBP segue como era); é por ela que "recusas/fallbacks" se medem.
+  REFUSAL="$1"; REFUSAL_RC="$2"
+  [ "$HOSTKIND" = linux ] && log_refusal
+  return 0
+}
 
-if [ "$mode" = pytest ]; then
-  if [ -z "$repo" ]; then
-    case "$dir" in *whatsapp_automation*) repo=wa ;; *property_scrapers*|*property-scrapers*) repo=ps ;; esac
-  fi
-  case "$repo" in wa|ps) ;; *) say "não deduzi o repo de '$dir' — use --repo wa|ps"; usage; exit 97 ;; esac
-  [ $# -gt 0 ] || { say "faltam os argumentos do pytest (use -- tests/test_x.py)"; exit 97; }
-  [ -d "$dir/tests" ] || { say "$dir não tem tests/ — use --dir <worktree>"; exit 97; }
-else
-  [ $# -gt 0 ] || { say "faltou o comando (use -- <comando>)"; exit 97; }
-fi
-
-preflight || { rc=$?; log_refusal; exit $rc; }
-SLOT_INFO=$(slot_info_for "${repo:-exec}" "$mode" "$@")
-acquire || exit $?
-T0=$(date +%s)
-mkdir -p "$CITY/.gc/run" 2>/dev/null; TMPOUT=$(mktemp "$CITY/.gc/run/mbp-run.XXXXXX")
-RC=0
-qargs=$(printf '%q ' "$@")
-
-if [ "$mode" = pytest ]; then
+# Uma tentativa de pytest no host da vez (use_host). Libera o slot e apaga a saída temporária antes de devolver, para a próxima tentativa partir do zero.
+attempt_pytest() {
+  local rc
+  _attempt_pytest "$@"; rc=$?
+  release
+  [ -z "${TMPOUT:-}" ] || rm -f "$TMPOUT"; TMPOUT=""
+  return $rc
+}
+_attempt_pytest() {
+  local base rv M m mrc rrc cpcmd pathline JOBDEF rc SECS
+  local orig=("$@")
+  preflight || { rc=$?; log_refusal; return $rc; }
+  if [ "$HOSTKIND" = linux ]; then node_guard || { say "não consegui varrer o conteúdo do que iria ao $HNAME (lista do rsync ou hetzner-pii-scan.py falhou) — o nó NÃO é usado, rode local"; fall varredura-falhou 98; return 98; }; fi
+  SLOT_INFO=$(slot_info_for "$repo" pytest "$@")
+  acquire || { rc=$?; if [ $rc -eq 96 ]; then fall slots "$rc"; else fall ssh-caiu "$rc"; fi; return $rc; }
+  T0=$(date +%s)
+  mkdir -p "$CITY/.gc/run" 2>/dev/null; TMPOUT=$(mktemp "$CITY/.gc/run/mbp-run.XXXXXX")
+  RC=0
   base=$(base_of "$repo"); rv=$(venv_of "$repo"); M="gt-remote/mirror/$repo-$SLOT"
+  [ -n "$base" ] && [ -n "$rv" ] || { say "o $HNAME não tem o repo '$repo'"; fall repo-sem-no 97; return 97; }
+  cpcmd="cp -cR"; [ "$HOSTKIND" = linux ] && cpcmd="cp -a --reflink=auto"   # APFS clone no macOS; no Linux, cópia (reflink quando o disco deixa)
   m=$(rssh <<EOF 2>/dev/null
 # MBP:MIRROR
 B="\$HOME/gt-remote/$base"; M="\$HOME/$M"
+[ -x "\$HOME/gt-remote/$rv/bin/python" ] || { echo NOVENV; exit 97; }
 [ -d "\$M" ] && { echo MIRROR_OK; exit 0; }
 [ -d "\$B" ] || { echo NOBASE; exit 97; }
-mkdir -p "\$HOME/gt-remote/mirror" && cp -cR "\$B" "\$M" && echo MIRROR_SEEDED
+mkdir -p "\$HOME/gt-remote/mirror" && $cpcmd "\$B" "\$M" && echo MIRROR_SEEDED
 EOF
   ); mrc=$?
   case "$m" in
-    *NOBASE*) say "base ~/gt-remote/$base ausente no MBP — rode: mbp-run.sh --seed $repo"; exit 97 ;;
+    *NOBASE*) say "base ~/gt-remote/$base ausente no $HNAME — $([ "$HOSTKIND" = linux ] && echo 'o Mayor monta a base do nó à mão (a semeadura é a fatia 4 da ga-zri39b)' || echo "rode: mbp-run.sh --seed $repo")"; fall sem-base 97; return 97 ;;
+    *NOVENV*) say "venv ~/gt-remote/$rv ausente no $HNAME — $([ "$HOSTKIND" = linux ] && echo 'o Mayor monta o venv do nó à mão (a semeadura é a fatia 4 da ga-zri39b)' || echo "rode: mbp-run.sh --seed $repo")"; fall sem-venv 97; return 97 ;;
     *MIRROR_*) ;;
-    *) [ $mrc -eq 255 ] && { say "ssh caiu ao preparar o espelho"; exit 98; }; say "espelho falhou: $m"; exit 98 ;;
+    *) [ $mrc -eq 255 ] && { say "ssh caiu ao preparar o espelho"; fall ssh-caiu 98; return 98; }; say "espelho falhou: $m"; fall espelho-falhou 98; return 98 ;;
   esac
-  "$RSYNC_BIN" -a --delete -e "$SSH_BIN $SSH_OPTS" "${EXCLUDES[@]}" "$dir"/ "$MBP_HOST:$M/" >/dev/null 2>&1
-  rrc=$?; [ $rrc -eq 0 ] || { say "rsync do worktree falhou (rc=$rrc) — rode local"; exit 98; }
+  if [ "$HOSTKIND" = linux ]; then
+    # SEGURANÇA: só o filtro decide o que sai do mini. --delete-excluded tira do espelho o que o filtro exclui (inclusive o que uma semeadura antiga tenha levado).
+    "$RSYNC_BIN" -a --delete --delete-excluded --filter=". $HELD" --filter=". $NODE_FILTER" -e "$SSH_BIN $SSH_OPTS" "$dir"/ "$MBP_HOST:$M/" >/dev/null 2>&1
+  else
+    "$RSYNC_BIN" -a --delete -e "$SSH_BIN $SSH_OPTS" "${EXCLUDES[@]}" "$dir"/ "$MBP_HOST:$M/" >/dev/null 2>&1
+  fi
+  rrc=$?; [ $rrc -eq 0 ] || { say "rsync do worktree falhou (rc=$rrc) — rode local"; fall rsync-falhou 98; return 98; }
+  qargs=$(printf '%q ' "$@")
+  if [ "$HOSTKIND" = linux ]; then pathline='export PATH="$HOME/.local/bin:$PATH" PYTHONDONTWRITEBYTECODE=1'
+  else pathline='export PATH=/opt/homebrew/bin:$PATH PYTHONDONTWRITEBYTECODE=1'; fi
   IFS= read -r -d '' JOBDEF <<EOF || true
-export PATH=/opt/homebrew/bin:\$PATH PYTHONDONTWRITEBYTECODE=1
+$pathline
 job() { cd "\$HOME/$M" || return 97; \$MBP_BG nice -n "\$MBP_NICE" "\$HOME/gt-remote/$rv/bin/python" -m pytest -p no:cacheprovider $qargs; }
 mbp_supervise job
 EOF
   run_remote RUN "$JOBDEF"
   if [ $RC -ne 0 ] && grep -q -E 'shared/data|\.db\b|unable to open database' "$TMPOUT"; then
-    say "NOTE: shared/data/ e *.db NÃO são enviados ao MBP; teste que lê esses arquivos falha aqui — rode esse teste local."
+    say "NOTE: shared/data/ e *.db NÃO são enviados ao $HNAME; teste que lê esses arquivos falha aqui — rode esse teste local."
   fi
-else
+  SECS=$(( $(date +%s) - T0 ))
+  if [ $RC -eq 255 ]; then
+    say "ssh caiu durante a execução — rode local"; log_run "$repo" pytest "$SLOT" 255 "$SECS" "${orig[@]}"; return 98
+  fi
+  if [ $RC -eq 124 ]; then say "timeout de ${RUN_TIMEOUT}s"; fi
+  log_run "$repo" pytest "$SLOT" "$RC" "$SECS" "${orig[@]}"
+  say "rodou em $HOSTLOG ($HNAME) slot=$SLOT secs=$SECS rc=$RC"
+  return $RC
+}
+
+# ---- --exec (REA/APK): só no MBP -----------------------------------------------------------------------------------------------
+run_exec() {
+  local X kv p envline pl rel dest JOBDEF SECS
+  preflight || { rc=$?; log_refusal; exit $rc; }
+  SLOT_INFO=$(slot_info_for "exec" "$mode" "$@")
+  acquire || exit $?
+  T0=$(date +%s)
+  mkdir -p "$CITY/.gc/run" 2>/dev/null; TMPOUT=$(mktemp "$CITY/.gc/run/mbp-run.XXXXXX")
+  RC=0
+  qargs=$(printf '%q ' "$@")
   X="gt-remote/exec/$SLOT"
   "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "mkdir -p $X/in" || { say "ssh caiu ao preparar o scratch"; exit 98; }
   for p in "${pushes[@]+"${pushes[@]}"}"; do
@@ -582,10 +791,50 @@ EOF
   if [ $keep -eq 0 ]; then
     "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "find $X -mindepth 1 -delete" >/dev/null 2>&1 || say "AVISO: scratch $X não foi limpo"
   fi
+  SECS=$(( $(date +%s) - T0 ))
+  if [ $RC -eq 255 ]; then say "ssh caiu durante a execução — rode local"; log_run "exec" "$mode" "$SLOT" 255 "$SECS" "$@"; exit 98; fi
+  if [ $RC -eq 124 ]; then say "timeout de ${RUN_TIMEOUT}s"; fi
+  log_run "exec" "$mode" "$SLOT" "$RC" "$SECS" "$@"
+  exit $RC
+}
+
+# ---- orquestração ------------------------------------------------------------------------------------------------------------------
+if [ "$mode" = exec ]; then
+  [ "$host_sel" != linux ] || { say "--exec roda só no MBP (o nó Linux é de pytest)"; exit 97; }
+  mac_gates || exit $?
+  [ $# -gt 0 ] || { say "faltou o comando (use -- <comando>)"; exit 97; }
+  use_host mbp
+  run_exec "$@"
 fi
 
-SECS=$(( $(date +%s) - T0 ))
-if [ $RC -eq 255 ]; then say "ssh caiu durante a execução — rode local"; log_run "${repo:-exec}" "$mode" "$SLOT" 255 "$SECS" "$@"; exit 98; fi
-if [ $RC -eq 124 ]; then say "timeout de ${RUN_TIMEOUT}s"; fi
-log_run "${repo:-exec}" "$mode" "$SLOT" "$RC" "$SECS" "$@"
-exit $RC
+# pytest. Com o nó possível, a validação de uso vem antes (precisa do repo); sem o nó, a ordem de sempre: as chaves do MBP primeiro (rc 99 sem olhar os argumentos).
+node_possible=0
+[ "$host_sel" != mbp ] && [ -f "$NODE_FLAG" ] && node_possible=1
+if [ "$host_sel" = linux ] && [ $node_possible -eq 0 ]; then say "nó Linux desligado (falta $NODE_FLAG) — rode local"; exit 99; fi
+if [ $node_possible -eq 0 ]; then mac_gates || exit $?; fi
+
+if [ -z "$repo" ]; then
+  case "$dir" in *whatsapp_automation*) repo=wa ;; *property_scrapers*|*property-scrapers*) repo=ps ;; esac
+fi
+case "$repo" in wa|ps) ;; *) say "não deduzi o repo de '$dir' — use --repo wa|ps"; usage; exit 97 ;; esac
+[ $# -gt 0 ] || { say "faltam os argumentos do pytest (use -- tests/test_x.py)"; exit 97; }
+[ -d "$dir/tests" ] || { say "$dir não tem tests/ — use --dir <worktree>"; exit 97; }
+
+if [ $node_possible -eq 1 ]; then
+  if node_wanted "$@"; then
+    use_host linux
+    attempt_pytest "$@"; nrc=$?
+    case $nrc in 96|97|98|99) ;; *) exit $nrc ;; esac
+    [ "$host_sel" != linux ] || exit $nrc
+    say "o nó Linux não rodou (rc=$nrc) — tentando o MBP"
+  else
+    # o nó estava ligado e NÃO foi usado por um motivo (filtro inválido): uma linha no log, para o relatório contar os fallbacks
+    if [ -n "$NODE_WHY" ]; then use_host linux; fall "$NODE_WHY" 98; fi
+    [ "$host_sel" != linux ] || exit 98
+  fi
+  use_host mbp
+  mac_gates || exit $?
+fi
+use_host mbp
+attempt_pytest "$@"
+exit $?

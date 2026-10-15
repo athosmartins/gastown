@@ -400,7 +400,9 @@ rig:
 
 ```bash
 RIG_PATH=<rig-path>   # from `gc rig list`
+# BEGIN commit-count
 TOPLEVEL=$(git -C "$RIG_PATH" rev-parse --show-toplevel 2>/dev/null)
+REL=""
 if [ -z "$TOPLEVEL" ]; then
   # rev-parse --show-toplevel fails on some worktrees (property_scrapers,
   # lexbh — a `.git` file points at a sibling `.repo.git` without full
@@ -409,11 +411,10 @@ if [ -z "$TOPLEVEL" ]; then
   # returns a correct (not a loud-failing) answer either way. Use the
   # explicit form so correctness doesn't depend on that per-subcommand
   # accident; these two rigs are standalone repos, so no pathspec needed.
-  LOG_OUT=$(git --git-dir="$RIG_PATH/.repo.git" --work-tree="$RIG_PATH" \
-    log --since=$SINCE --until=$UNTIL --oneline main)
+  rig_git() { git --git-dir="$RIG_PATH/.repo.git" --work-tree="$RIG_PATH" "$@"; }
 elif [ "$TOPLEVEL" = "$RIG_PATH" ]; then
   # standalone repo, the rig IS the toplevel (marketing, whatsapp_automation)
-  LOG_OUT=$(git -C "$RIG_PATH" log --since=$SINCE --until=$UNTIL --oneline main)
+  rig_git() { git -C "$RIG_PATH" "$@"; }
 else
   # rig is a subdirectory of a bigger shared repo — gascity, gastown, and
   # deacon all resolve to the SAME toplevel (/Users/athos/gt), so an
@@ -423,9 +424,36 @@ else
   # cross-subtree overlap found — though a single commit touching two
   # rigs' subtrees at once is structurally possible and would double-
   # count across rigs if it ever happens; not observed so far).
+  rig_git() { git -C "$TOPLEVEL" "$@"; }
   REL=${RIG_PATH#$TOPLEVEL/}
-  LOG_OUT=$(git -C "$TOPLEVEL" log --since=$SINCE --until=$UNTIL --oneline main -- "$REL")
 fi
+
+# WHICH main to count (ga-31j3yu). The local `main` is only as current as the
+# last pull in that checkout; origin/main is where the gate lands work. Counting
+# the local one read 0 for whatsapp_automation on a 133-commit day (its local
+# main was 254 commits behind): git exits 0 and prints nothing, so the exit-status
+# check below cannot see it and the 0 looks like a measurement. origin/main here is
+# the remote-tracking ref: as fresh as that checkout's last fetch (this block only
+# reads, it never fetches), so it can still trail the real remote. Four states:
+#   origin/main resolves             -> count it; also say how far local main is from it
+#   no remote at all (marketing)     -> local main IS the only truth; count it, labeled
+#   remote exists, no origin/main    -> cannot know which main is current: "?"
+#   `git remote` itself failed       -> "?"
+COMMIT_COUNT="?"; COMMIT_REF=unknown; BEHIND="-"; AHEAD="-"; COUNT_REF=""
+REMOTES=$(rig_git remote 2>/dev/null); REMOTES_RC=$?
+if rig_git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
+  COUNT_REF=refs/remotes/origin/main; COMMIT_REF=origin/main
+  # `rev-list --left-right --count A...B` prints "<only in A> <only in B>" (tab-separated)
+  DIV=$(rig_git rev-list --left-right --count refs/heads/main...refs/remotes/origin/main 2>/dev/null)
+  AHEAD=$(printf '%s\n' "$DIV" | awk '{print $1}'); BEHIND=$(printf '%s\n' "$DIV" | awk '{print $2}')
+  # anything that is not two plain integers means the comparison failed: "?", not 0
+  case "$AHEAD:$BEHIND" in *[!0-9:]*|:*|*:) AHEAD="?"; BEHIND="?" ;; esac
+elif [ "$REMOTES_RC" -eq 0 ] && [ -z "$REMOTES" ]; then
+  COUNT_REF=refs/heads/main; COMMIT_REF=main-local-no-remote
+elif [ "$REMOTES_RC" -eq 0 ]; then
+  COMMIT_REF=origin-main-missing
+fi
+
 # Check git log's own exit status IMMEDIATELY, with NO pipe in between —
 # gate-fix history (ga-x3b4ro attempt 1): a prior version of this fix piped
 # straight into `| wc -l | tr -d ' '` and checked `$?` after that, but wc/tr
@@ -433,24 +461,44 @@ fi
 # reflected tr's status, not git log's (reproduced live: `COMMIT_COUNT=$(false
 # | wc -l | tr -d " "); echo "$COMMIT_COUNT $?"` prints "0 0", identical to
 # the genuine-zero case) — the exact bug this fix exists to prevent,
-# reproduced one level down inside its own fix. Capturing raw output into
-# LOG_OUT first sidesteps the pipe entirely: POSIX defines an `if/elif/else`
-# block's own exit status as the status of the last command run in whichever
-# branch executed, which here is always the `LOG_OUT=$(git ... log ...)`
-# assignment — so the `$?` below is always git log's real exit status.
-if [ $? -ne 0 ]; then
-  COMMIT_COUNT="?"
-elif [ -z "$LOG_OUT" ]; then
-  COMMIT_COUNT=0
-else
-  COMMIT_COUNT=$(printf '%s\n' "$LOG_OUT" | wc -l | tr -d ' ')
+# reproduced one level down inside its own fix. So: capture raw output into
+# LOG_OUT, read the status on the same line, and only then count.
+if [ -n "$COUNT_REF" ]; then
+  if [ -n "$REL" ]; then
+    LOG_OUT=$(rig_git log --since=$SINCE --until=$UNTIL --oneline "$COUNT_REF" -- "$REL"); LOG_RC=$?
+  else
+    LOG_OUT=$(rig_git log --since=$SINCE --until=$UNTIL --oneline "$COUNT_REF"); LOG_RC=$?
+  fi
+  if [ "$LOG_RC" -ne 0 ]; then
+    COMMIT_COUNT="?"
+  elif [ -z "$LOG_OUT" ]; then
+    COMMIT_COUNT=0
+  else
+    COMMIT_COUNT=$(printf '%s\n' "$LOG_OUT" | wc -l | tr -d ' ')
+  fi
 fi
+echo "commits=$COMMIT_COUNT ref=$COMMIT_REF local_main_behind=$BEHIND local_main_ahead=$AHEAD"
+# END commit-count
 ```
 
-**A failed `git log` above renders `COMMIT_COUNT="?"`, never `0`** — a failed
-command and a genuinely quiet rig must never collapse into the same number.
-If a rig shows `?` in the table, say so in Highlights instead of asserting
-no activity happened.
+**The block's last line is what the By Rig table and Highlights are built
+from.** `commits=` fills the Commits cell. The rest says how far to trust it:
+
+- `commits=?` is never `0` — a failed command, an unreadable ref and a
+  genuinely quiet rig must never collapse into the same number. Say in
+  Highlights that the rig shows `?` and why (`ref=origin-main-missing` /
+  `ref=unknown` / a failed `git log`), instead of asserting no activity happened.
+- `ref=origin/main` is the normal case. `local_main_behind=N` (N > 0) means that
+  checkout's local main is N commits behind what the gate landed: the count is
+  still right (it came from origin/main), but put "<rig>: local main is N behind
+  origin/main" in Highlights so the stale checkout is visible. `local_main_ahead=N`
+  (N > 0) means N commits exist on local main that origin/main does not have:
+  they are NOT in the Commits cell, and Highlights must say so. A `?` in either
+  field means the comparison failed — say that too, not "in sync".
+- `ref=main-local-no-remote` (marketing today: no remote configured) means local
+  main is the only main there is. Write the number and append
+  " (local main, no remote)" in the cell. It is a fact about the source, not a
+  problem, so it needs no Highlights line.
 
 c) **Incidents** — per rig, bounded [SINCE, UNTIL), including closed beads (many
 incidents are filed and resolved within minutes — `--all` is required or they're
@@ -816,6 +864,9 @@ Transform data into a formatted digest and deliver it.
 ## Highlights
 - Notable completions
 - Incidents (if any)
+- Commit-count caveats from step 2b (a `?`, local main behind/ahead of
+  origin/main) — a Commits figure that disagrees with the rest of the digest
+  must be explained here, never left looking like a clean measurement
 
 ## Agent Health
 - Agents started/stopped/crashed: N/N/N — the woke/stopped/crashed figures step 3a

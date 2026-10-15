@@ -4,7 +4,7 @@
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TALLY="$SELF_DIR/gate-lane-tally.py"
+TALLY="${GATE_LANE_TALLY_UNDER_TEST:-$SELF_DIR/gate-lane-tally.py}"   # a control run points this at the previous tally
 WEEKLY="$SELF_DIR/scripts/gate-lane-weekly.sh"
 ORDER="$SELF_DIR/../orders/gate-lane-weekly.toml"
 LIB="$SELF_DIR/gate-fastlane.lib.sh"
@@ -293,8 +293,263 @@ grep -q '^exec = "\$PACK_DIR/assets/scripts/gate-lane-weekly.sh"$' "$ORDER" && o
 grep -q '^interval = "168h"$' "$ORDER" && grep -q '^trigger = "cooldown"$' "$ORDER" && ok "order is weekly (cooldown 168h)" || bad "order schedule drifted"
 grep -q 'gate-lane-tally.py" --weekly --days 7' "$WEEKLY" && ok "wrapper runs the tally in --weekly mode over 7 days" || bad "wrapper drifted"
 grep -q -i -E 'gc mail|mail send' "$TALLY" "$WEEKLY" && bad "the tally mails someone (the pattern that got the previous weekly report disabled)" || ok "no mail path anywhere in the tally/wrapper"
-STRAY_IDS=$(grep -n -o -E 'ga-[a-z0-9]{5,7}' "$TALLY" "$WEEKLY" | grep -v 'ga-atsahv' || true)
-if [ -n "$STRAY_IDS" ]; then bad "a hardcoded bead id other than the story's own appears in the tally"; else ok "no hardcoded bead id besides the story's own"; fi
+STRAY_IDS=$(grep -h -n -o -E 'ga-[a-z0-9]{5,7}' "$TALLY" "$WEEKLY" | grep -v -E 'ga-(atsahv|dzzqvw)' || true)   # -h: the file's NAME is not part of what is checked (a worktree path with ga-dzzqvw in it hid every hit)
+if [ -n "$STRAY_IDS" ]; then bad "a hardcoded bead id other than the two stories this tally serves appears in the tally"; else ok "no hardcoded bead id besides the two stories this tally serves (ga-atsahv, ga-dzzqvw)"; fi
+
+# ── the task-rapida lane (ga-dzzqvw): how many, why not, first review, time, bugs after ──────────────────────────────────────
+cat > "$T/bin/bd" <<'EOF'
+#!/bin/bash
+echo "$*" >> "${FAKE_BD_LOG:-/dev/null}"
+if [ -n "${FAKE_BD_BY_STORE:-}" ]; then   # per-store answers: <dir>/<path with / as _> is the JSON, <that>.fail makes THAT store fail; a store with neither is a real empty list
+  f="$FAKE_BD_BY_STORE/$(printf %s "$2" | tr '/' '_')"
+  if [ -e "$f.fail" ]; then echo "boom in $2" >&2; exit 1; fi
+  if [ -e "$f" ]; then cat "$f"; else echo '[]'; fi
+  exit 0
+fi
+case "${FAKE_BD_MODE:-ok}" in
+  fail) echo "boom" >&2; exit 1 ;;
+  notlist) echo '{"error":"x"}' ;;
+  badrow) echo '[{"title":"a row with no id"}]' ;;
+  *) cat "$FAKE_BD_JSON" ;;
+esac
+EOF
+cat > "$T/bin/gc" <<'EOF'
+#!/bin/bash
+echo "$*" >> "${FAKE_GC_LOG:-/dev/null}"
+case "${FAKE_GC_MODE:-ok}" in
+  fail) echo "gc boom" >&2; exit 1 ;;
+  junk) echo "not json" ;;
+  notlist) echo '{"rigs":{"whatsapp_automation":"/rigW"}}' ;;
+  *) cat "$FAKE_GC_JSON" ;;
+esac
+EOF
+chmod +x "$T/bin/bd" "$T/bin/gc"
+cat > "$T/bugs.json" <<'EOF'
+[{"id":"bug-1","title":"quebrou depois de ga-b1","created_at":"2026-10-02T12:00:00Z"},
+ {"id":"bug-2","title":"y","description":"regressao em ga-b2.","created_at":"2026-10-03T10:00:00Z"},
+ {"id":"bug-3","title":"antes da decisao: ga-b1","created_at":"2026-10-02T08:00:00Z"},
+ {"id":"bug-4","title":"ga-b10 ga-b1-x ga-b1.2 xga-b1","created_at":"2026-10-06T00:00:00Z"},
+ {"id":"bug-5","title":"nada a ver","created_at":"2026-10-06T00:00:00Z"},
+ {"id":"bug-6","title":"w","description":"ga-b3 falhou","created_at":"sem data"}]
+EOF
+L3="$T/qg3.jsonl"
+cat > "$L3" <<'EOF'
+{"ts":"2026-09-20T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg-old","bead":"ga-bold","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-02T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg1","bead":"ga-b1","tr_code":"granted","tr_lines":"150","dry_run":"0"}
+{"ts":"2026-10-02T09:05:00Z","event":"dispatcher_complete","lane":"task-rapida","marker":"tg1","result":"PASS","elapsed_s":300,"dry_run":"0"}
+{"ts":"2026-10-03T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg2","bead":"ga-b2","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-03T09:15:00Z","event":"dispatcher_complete","lane":"normal","marker":"tg2","result":"FAIL","elapsed_s":900,"dry_run":"0"}
+{"ts":"2026-10-03T11:00:00Z","event":"dispatcher_complete","lane":"normal","marker":"tg2","result":"PASS","elapsed_s":200,"dry_run":"0"}
+{"ts":"2026-10-04T08:00:00Z","event":"gate_lane","lane":"normal","marker":"tg4","reason_code":"code-or-prompt","tr_code":"over-limit","dry_run":"0"}
+{"ts":"2026-10-04T08:30:00Z","event":"dispatcher_complete","lane":"normal","marker":"tg4","result":"FAIL","elapsed_s":77777,"dry_run":"0"}
+{"ts":"2026-10-04T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg3","bead":"ga-b3","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-04T10:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg4","bead":"ga-b4","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-04T10:20:00Z","event":"dispatcher_complete","lane":"normal","marker":"tg4","result":"PASS","dry_run":"0"}
+{"ts":"2026-10-05T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg5","bead":"ga-b5","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-05T09:30:00Z","event":"gate_lane","lane":"normal","marker":"tg5","reason_code":"code-or-prompt","tr_code":"risk-file","dry_run":"0"}
+{"ts":"2026-10-05T10:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"tg-dry","bead":"ga-bdry","tr_code":"granted","dry_run":"1"}
+{"ts":"2026-10-06T09:00:00Z","event":"gate_lane","lane":"normal","marker":"r1","reason_code":"code-or-prompt","tr_code":"not-task","dry_run":"0"}
+{"ts":"2026-10-06T09:30:00Z","event":"dispatcher_complete","lane":"normal","marker":"r1","result":"FAIL","elapsed_s":99999,"dry_run":"0"}
+{"ts":"2026-10-06T09:01:00Z","event":"gate_lane","lane":"normal","marker":"r2","reason_code":"code-or-prompt","tr_code":"not-task","dry_run":"0"}
+{"ts":"2026-10-06T09:02:00Z","event":"gate_lane","lane":"normal","marker":"r3","reason_code":"code-or-prompt","tr_code":"over-limit","dry_run":"0"}
+{"ts":"2026-10-06T09:03:00Z","event":"gate_lane","lane":"normal","marker":"r4","reason_code":"code-or-prompt","tr_code":"banana","dry_run":"0"}
+{"ts":"2026-10-06T09:04:00Z","event":"gate_lane","lane":"normal","marker":"r5","reason_code":"code-or-prompt","tr_code":"switch-off","dry_run":"0"}
+{"ts":"2026-10-06T09:05:00Z","event":"gate_lane","lane":"normal","marker":"r6","reason_code":"code-or-prompt","tr_code":42,"dry_run":"0"}
+{"ts":"2026-10-06T09:06:00Z","event":"gate_lane","lane":"normal","marker":"n1","reason_code":"code-or-prompt","dry_run":"0"}
+{"ts":"2026-10-06T09:07:00Z","event":"gate_lane","lane":"fast","marker":"f1","would_have_reviewers":1,"reason_code":"fast","tr_code":"","dry_run":"0"}
+{"ts":"2026-10-06T09:08:00Z","event":"dispatcher_complete","lane":"fast","marker":"f1","result":"PASS","dry_run":"0"}
+EOF
+BDLOG="$T/bd.log"; : > "$BDLOG"
+J3=$(PATH="$T/bin:$PATH" FAKE_BD_JSON="$T/bugs.json" FAKE_BD_LOG="$BDLOG" python3 "$TALLY" --log "$L3" --now "$NOW" --json --bug-city /cityA --bug-city /cityB)
+chkj() { local got; got=$(printf '%s' "$J3" | python3 -c "import sys,json; print(json.load(sys.stdin)$2)" 2>&1); [ "$got" = "$3" ] && ok "task-rapida: $1 = $3" || bad "task-rapida: $1: got '$got', want '$3'"; }
+chkj "decisions (the re-decided tg5 counts once, as normal; dry run and pre-window grant are out)" "['decisions']" 13
+chkj "grants (last decision per marker): tg1-tg4" "['tr_granted']" 4
+chkj "a grant is neither fast nor normal: normal = tg5 + r1-r6 + n1" "['normal']" 8
+chkj "…and a grant never lands in the fast-lane's 'outro' bucket" "['normal_reasons'].get('outro (reason_code desconhecido)', 0)" 0
+chkj "refusals: tg5 (risk-file) + 2 not-task + over-limit + banana + switch-off + a non-string code; n1 (no tr_code) is not one" "['tr_refused']" 7
+chkj "refusal bucket, a listed code, by its label" "['tr_refusals']['bead de origem nao e task']" 2
+chkj "refusal bucket: a code nobody listed AND a non-string code land in 'outro', loudly" "['tr_refusals']['outro (reason_code desconhecido)']" 2
+chkj "first review: PASS (tg1, whose event says lane=task-rapida; tg4, whose event says lane=normal — the shape the dispatcher really writes, ga-ufeq1c — and whose earlier normal-lane FAIL is not the lane's)" "['tr_first_pass']" 2
+chkj "first review: FAIL (tg2, completed as lane=normal — its later PASS is not the first review; r1's normal-lane FAIL is no lane run)" "['tr_first_fail']" 1
+chkj "granted with no completed run in the window (tg3)" "['tr_no_verdict']" 1
+chkj "time: median of the first runs with a readable elapsed_s (300, 900)" "['tr_elapsed_median_s']" 600.0
+chkj "time: max" "['tr_elapsed_max_s']" 900
+chkj "time: first runs above 10 min (the story's bar)" "['tr_over_10min']" 1
+chkj "time: a run with no elapsed_s is counted apart, not as 0 (tg4)" "['tr_elapsed_unknown']" 1
+chkj "time: max is the lane's own 900 s — the 77777 s (tg4, before its grant) and 99999 s (r1, normal lane) runs are not the lane's" "['tr_elapsed_max_s']" 900
+# the join is what finds the lane's runs (their events say lane=normal): take it out and the lane's first reviews vanish — the check can fail
+sed 's/ or (decision_in_effect(c.get("marker"), t) or {}).get("lane") == "task-rapida"//' "$TALLY" > "$T/tally-mut-join.py"
+if cmp -s "$TALLY" "$T/tally-mut-join.py"; then bad "task-rapida mutation: the join expression was not found in the tally (the control is a no-op)"
+else
+  JMJ=$(PATH="$T/bin:$PATH" FAKE_BD_JSON="$T/bugs.json" python3 "$T/tally-mut-join.py" --log "$L3" --now "$NOW" --json)
+  [ "$(printf '%s' "$JMJ" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tr_first_pass'], d['tr_first_fail'], d['tr_no_verdict'])")" = "1 0 3" ] \
+    && ok "task-rapida mutation: without the join only tg1 (lane=task-rapida on its event) is seen — the other three read as 'no verdict'" \
+    || bad "task-rapida mutation: the join does not matter to the counts: $JMJ"
+fi
+chkj "bugs after: bug-1 (ga-b1), bug-2 (ga-b2 + sentence dot), bug-6 (ga-b3, undated: counted); not bug-3 (before the grant), bug-4 (ga-b10, ga-b1-x, ga-b1.2, xga-b1), bug-5" "['tr_bugs_after_ids']" "['bug-1', 'bug-2', 'bug-6']"
+grep -q -- '-C /cityA list -t bug --all --limit 0 --created-after 2026-10-01T12:00:00Z --json' "$BDLOG" && grep -q -- '-C /cityB list' "$BDLOG" && ok "task-rapida: every --bug-city is searched, all statuses, no truncation, from the window start" || bad "task-rapida: bd calls: $(cat "$BDLOG")"
+for mode in fail notlist badrow; do
+  JM=$(PATH="$T/bin:$PATH" FAKE_BD_MODE=$mode python3 "$TALLY" --log "$L3" --now "$NOW" --json)
+  [ "$(printf '%s' "$JM" | python3 -c "import sys,json; print(json.load(sys.stdin)['tr_bugs_after'])")" = "None" ] && ok "task-rapida: bd answers '$mode' → bugs-after is null (could not tell), never 0" || bad "task-rapida: bd '$mode' collapsed to a number: $JM"
+done
+TM=$(PATH="$T/bin:$PATH" FAKE_BD_MODE=fail python3 "$TALLY" --log "$L3" --now "$NOW")
+case "$TM" in *"NÃO DEU PARA APURAR"*"NÃO é zero"*) ok "task-rapida: the report says the bug look-up failed and that it is not zero" ;; *) bad "task-rapida: the failed look-up is not loud: $TM" ;; esac
+JNONE=$(PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bd-none.log" python3 "$TALLY" --log "$L2" --now "$NOW" --json)
+[ "$(printf '%s' "$JNONE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tr_granted'], d['tr_refused'], d['tr_bugs_after'])")" = "0 0 0" ] && [ ! -s "$T/bd-none.log" ] && ok "task-rapida: nothing granted → bugs-after is a real 0 and bd is not even called" || bad "task-rapida: no-grant window: $JNONE / $(cat "$T/bd-none.log" 2>/dev/null)"
+T3=$(PATH="$T/bin:$PATH" FAKE_BD_JSON="$T/bugs.json" python3 "$TALLY" --log "$L3" --now "$NOW" --bug-city /cityA --bug-city /cityB)
+for want in "task-rapida 4" "1ª revisão: PASS 2 | FAIL 1 | sem veredito na janela 1 (de 4 concedida(s))" "mediana 10.0 min, máx 15.0 min, acima de 10 min: 1" "1 run(s) sem elapsed_s legível" "2  não concedida: bead de origem nao e task" "bugs abertos depois citando uma task da faixa: 3 (bug-1, bug-2, bug-6) [lojas buscadas:"; do
+  case "$T3" in *"$want"*) ok "task-rapida report: '$want'" ;; *) bad "task-rapida report lacks '$want': $T3" ;; esac
+done
+NL3=$(PATH="$T/bin:$PATH" FAKE_BD_JSON="$T/bugs.json" python3 -c "
+import importlib.util, json, sys
+s = importlib.util.spec_from_file_location('t', '$TALLY'); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(m.notify_line(json.loads(sys.argv[1])))" "$J3")
+case "$NL3" in *"task-rapida: 4 concedida(s), 7 não concedida(s), 1ª revisão PASS 2/FAIL 1, mediana 10.0 min, bugs depois 3"*) ok "task-rapida: the notify line (the only thing a human reads) carries the lane's numbers" ;; *) bad "task-rapida: notify line: $NL3" ;; esac
+[ "$(python3 "$TALLY" --list-tr-codes | wc -l | tr -d ' ')" = "25" ] && python3 "$TALLY" --list-tr-codes | grep -q '^granted	' && ok "task-rapida: --list-tr-codes lists the 25 codes (granted + 24 refusals)" || bad "task-rapida: --list-tr-codes"
+
+# ── gate-fix 1 (gate_run ga-lkohfb): the bugs-after search looks where the answer lives, and says when it did not ─────────────────────────
+# The lane's tasks are rig beads (wa-, ps-), and their bugs are filed in THEIR rig's store. A search of the HQ store alone reported "no bugs" for
+# a place where none are filed. The stores now come from the rig on each grant's event (rig list), and a grant whose store was not looked at
+# makes the count unknown (null + how many + why), never a number.
+pj() { printf '%s' "$1" | python3 -c "import sys,json; d=json.load(sys.stdin); print($2)" 2>&1; }
+chk4() { local got; got=$(pj "$2" "$3"); [ "$got" = "$4" ] && ok "task-rapida: $1 = $4" || bad "task-rapida: $1: got '$got', want '$4'"; }
+mkdir -p "$T/st"
+cat > "$T/rigs.json" <<'EOF'
+{"rigs":[{"name":"gascity","path":"/hq"},{"name":"whatsapp_automation","path":"/rigW"},{"name":"property_scrapers","path":"/rigP"}]}
+EOF
+L4="$T/qg4.jsonl"
+cat > "$L4" <<'EOF'
+{"ts":"2026-10-02T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"w1","bead":"wa-w1","rig":"whatsapp_automation","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-02T09:05:00Z","event":"dispatcher_complete","lane":"normal","marker":"w1","result":"PASS","elapsed_s":300,"dry_run":"0"}
+{"ts":"2026-10-03T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"p1","bead":"ps-p1","rig":"property_scrapers","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-03T09:05:00Z","event":"dispatcher_complete","lane":"normal","marker":"p1","result":"PASS","elapsed_s":400,"dry_run":"0"}
+{"ts":"2026-10-04T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"g1","bead":"ga-g1","rig":"gascity","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-04T09:05:00Z","event":"dispatcher_complete","lane":"normal","marker":"g1","result":"PASS","elapsed_s":500,"dry_run":"0"}
+EOF
+echo '[{"id":"bug-w","title":"quebrou wa-w1","created_at":"2026-10-02T12:00:00Z"}]' > "$T/st/_rigW"
+echo '[{"id":"bug-g","title":"quebrou ga-g1","created_at":"2026-10-04T12:00:00Z"},{"id":"bug-h","title":"infra do gate","description":"citou wa-w1 sem o bead de origem","created_at":"2026-10-02T13:00:00Z"}]' > "$T/st/_hq"
+GCLOG="$T/gc.log"; : > "$GCLOG"; BDLOG4="$T/bd4.log"; : > "$BDLOG4"
+run4() { GC_CITY_PATH=/hq PATH="$T/bin:$PATH" FAKE_GC_JSON="$T/rigs.json" FAKE_GC_LOG="$GCLOG" FAKE_BD_BY_STORE="$T/st" FAKE_BD_LOG="$BDLOG4" python3 "$1" --log "$2" --now "$NOW" "${@:3}"; }
+J4=$(run4 "$TALLY" "$L4" --json)
+chk4 "no --bug-city at all: the rig stores AND the HQ store are searched (bug-h is filed in HQ about a wa- task; bug-w in the rig's own store)" "$J4" "d['tr_bugs_after'], d['tr_bugs_after_ids']" "3 ['bug-g', 'bug-h', 'bug-w']"
+chk4 "coverage is carried: the stores that were read" "$J4" "d['tr_stores']" "['/hq', '/rigP', '/rigW']"
+chk4 "nothing left un-looked-up" "$J4" "d['tr_bugs_uncovered'], d['tr_stores_failed']" "0 []"
+chk4 "the rigs the grants came from are in the output (what 'every store was read' is measured against)" "$J4" "d['tr_grant_rigs']" "['gascity', 'property_scrapers', 'whatsapp_automation']"
+grep -q -- '-C /rigW list' "$BDLOG4" && grep -q -- '-C /rigP list' "$BDLOG4" && grep -q -- '-C /hq list' "$BDLOG4" && ok "task-rapida: bd was called on /rigW, /rigP and the HQ store (the rig list drove it)" || bad "task-rapida: bd calls: $(cat "$BDLOG4")"
+grep -q -- 'rig list --json' "$GCLOG" && ok "task-rapida: the stores come from gc rig list" || bad "task-rapida: gc was not asked: $(cat "$GCLOG")"
+NL4=$(python3 -c "
+import importlib.util, json, sys
+s = importlib.util.spec_from_file_location('t', '$TALLY'); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(m.notify_line(json.loads(sys.argv[1])))" "$J4")
+case "$NL4" in *"bugs depois 3 (lojas: hq, rigP, rigW)"*) ok "task-rapida: the notify line says WHICH stores the bug count covers" ;; *) bad "task-rapida: notify line carries no store coverage: $NL4" ;; esac
+
+# a rig nobody can resolve: its grant was not looked up, so the count is unknown — the other grants' finds are kept as a floor
+L5="$T/qg5.jsonl"; { head -n 2 "$L4"; echo '{"ts":"2026-10-03T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"x1","bead":"zz-x1","rig":"mystery_rig","tr_code":"granted","dry_run":"0"}'; } > "$L5"
+J5=$(run4 "$TALLY" "$L5" --json)
+chk4 "a grant whose rig is not in the rig list: the count is null, not a number" "$J5" "d['tr_bugs_after']" "None"
+chk4 "…one grant of two was not looked up, and the other's finds (bug-w in its rig, bug-h in HQ) are kept as a floor" "$J5" "d['tr_bugs_uncovered'], d['tr_bugs_found_partial']" "1 2"
+case "$(pj "$J5" "d['tr_bugs_note']")" in *"mystery_rig"*"não resolvida"*) ok "task-rapida: the note names the rig whose store did not resolve" ;; *) bad "task-rapida: note: $(pj "$J5" "d['tr_bugs_note']")" ;; esac
+T5=$(run4 "$TALLY" "$L5")
+case "$T5" in *"NÃO DEU PARA APURAR em 1 de 2 concedida(s)"*"achados nas outras: 2"*"NÃO é zero"*) ok "task-rapida: the report says 1 of 2 was not looked up, what the others found, and that it is not zero" ;; *) bad "task-rapida: report: $T5" ;; esac
+NL5=$(python3 -c "
+import importlib.util, json, sys
+s = importlib.util.spec_from_file_location('t', '$TALLY'); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(m.notify_line(json.loads(sys.argv[1])))" "$J5")
+case "$NL5" in *"ATENÇÃO bugs depois NÃO apurado em 1/2 concedida(s)"*"mystery_rig"*"não é zero"*) ok "task-rapida: the notify line (the one a human reads) carries the gap and its reason" ;; *) bad "task-rapida: notify line hides the gap: $NL5" ;; esac
+
+# the rig list itself fails or is garbage: every rig grant is un-looked-up, and the reason says what gc said
+for mode in fail junk notlist; do
+  JG=$(GC_CITY_PATH=/hq PATH="$T/bin:$PATH" FAKE_GC_MODE=$mode FAKE_GC_JSON="$T/rigs.json" FAKE_BD_BY_STORE="$T/st" python3 "$TALLY" --log "$L4" --now "$NOW" --json)
+  chk4 "gc rig list '$mode': the count is null, all 3 grants un-looked-up" "$JG" "d['tr_bugs_after'], d['tr_bugs_uncovered']" "None 3"
+done
+JG=$(GC_CITY_PATH=/hq PATH="$T/bin:$PATH" FAKE_GC_MODE=fail FAKE_GC_JSON="$T/rigs.json" FAKE_BD_BY_STORE="$T/st" python3 "$TALLY" --log "$L4" --now "$NOW" --json)
+case "$(pj "$JG" "d['tr_bugs_note']")" in *"gc rig list saiu com 1"*"gc boom"*) ok "task-rapida: the note carries gc's exit code and stderr" ;; *) bad "task-rapida: note: $(pj "$JG" "d['tr_bugs_note']")" ;; esac
+JGN=$(GC_CITY_PATH=/hq PATH="$T/bin:$PATH" FAKE_GC_MODE=notlist FAKE_GC_JSON="$T/rigs.json" FAKE_BD_BY_STORE="$T/st" python3 "$TALLY" --log "$L4" --now "$NOW" --json)
+case "$(pj "$JGN" "d['tr_bugs_note']")" in *"o campo rigs não é uma lista"*) ok "task-rapida: a rig list in another shape is named as such, not read as 'no rig has a path'" ;; *) bad "task-rapida: note: $(pj "$JGN" "d['tr_bugs_note']")" ;; esac
+
+# one store cannot be read: the grants of that store are un-looked-up; the failed store is named with bd's own rc and stderr
+touch "$T/st/_rigP.fail"
+J6=$(run4 "$TALLY" "$L4" --json)
+chk4 "one store failing (bd rc 1): the count is null" "$J6" "d['tr_bugs_after'], d['tr_bugs_uncovered'], d['tr_bugs_found_partial']" "None 1 3"
+case "$(pj "$J6" "d['tr_stores_failed']")" in *"/rigP: bd saiu com 1: boom in /rigP"*) ok "task-rapida: the failed store is named with bd's rc and stderr (not a JSON-decode message)" ;; *) bad "task-rapida: failed: $(pj "$J6" "d['tr_stores_failed']")" ;; esac
+rm -f "$T/st/_rigP.fail"
+touch "$T/st/_hq.fail"
+J6B=$(run4 "$TALLY" "$L4" --json)
+chk4 "the HQ store failing leaves all 3 grants un-looked-up (the gate's own bugs are filed there)" "$J6B" "d['tr_bugs_after'], d['tr_bugs_uncovered']" "None 3"
+rm -f "$T/st/_hq.fail"
+
+# events with no rig and no --bug-city: nothing says where to look, so nothing is claimed
+J7=$(PATH="$T/bin:$PATH" FAKE_BD_JSON="$T/bugs.json" python3 "$TALLY" --log "$L3" --now "$NOW" --json)
+chk4 "grants with no rig on the event and no --bug-city: null, not a number" "$J7" "d['tr_bugs_after'], d['tr_bugs_uncovered']" "None 4"
+case "$(pj "$J7" "d['tr_bugs_note']")" in *"sem rig no evento"*) ok "task-rapida: the note says why" ;; *) bad "task-rapida: note: $(pj "$J7" "d['tr_bugs_note']")" ;; esac
+JF=$(PATH="$T/bin:$PATH" FAKE_BD_MODE=fail python3 "$TALLY" --log "$L3" --now "$NOW" --json --bug-city /cityA)
+case "$(pj "$JF" "d['tr_stores_failed']")" in *"/cityA: bd saiu com 1: boom"*) ok "task-rapida: bd's rc is read BEFORE its output (a failing bd prints nothing parseable) and stderr is kept" ;; *) bad "task-rapida: failed: $(pj "$JF" "d['tr_stores_failed']")" ;; esac
+
+# ── gate-fix 1, second blocking issue: a run that ended with neither PASS nor FAIL is no review and no run time ─────────────────────────────
+L8="$T/qg8.jsonl"
+cat > "$L8" <<'EOF'
+{"ts":"2026-10-02T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"s1","bead":"ga-s1","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-02T09:01:00Z","event":"dispatcher_complete","lane":"normal","marker":"s1","result":"SKIPPED_BEAD_CLOSED","elapsed_s":0,"dry_run":"0"}
+{"ts":"2026-10-03T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"s2","bead":"ga-s2","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-03T09:10:00Z","event":"dispatcher_complete","lane":"normal","marker":"s2","result":"PASS","elapsed_s":600,"dry_run":"0"}
+{"ts":"2026-10-04T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"s3","bead":"ga-s3","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-04T09:01:00Z","event":"dispatcher_complete","lane":"normal","marker":"s3","result":"SKIPPED_BEAD_CLOSED","elapsed_s":0,"dry_run":"0"}
+{"ts":"2026-10-04T10:00:00Z","event":"dispatcher_complete","lane":"normal","marker":"s3","result":"FAIL","elapsed_s":900,"dry_run":"0"}
+{"ts":"2026-10-05T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"s4","bead":"ga-s4","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-05T09:01:00Z","event":"dispatcher_complete","lane":"normal","marker":"s4","dry_run":"0"}
+{"ts":"2026-10-05T09:02:00Z","event":"dispatcher_complete","lane":"normal","marker":"s4","result":42,"dry_run":"0"}
+EOF
+run8() { PATH="$T/bin:$PATH" FAKE_BD_BY_STORE="$T/st" python3 "$1" --log "$L8" --now "$NOW" --bug-city /cityA "${@:2}"; }
+J8=$(run8 "$TALLY" --json)
+chk4 "first review: PASS s2; FAIL s3 (its earlier SKIPPED run is not a review); s1 and s4 have none" "$J8" "d['tr_first_pass'], d['tr_first_fail'], d['tr_no_verdict']" "1 1 2"
+chk4 "the three parts add up to the grants (PASS + FAIL + no verdict = granted)" "$J8" "d['tr_first_pass'] + d['tr_first_fail'] + d['tr_no_verdict'] == d['tr_granted']" "True"
+chk4 "runs that ended without a verdict are counted apart, by result (a missing and a non-string result both read '(sem result)')" "$J8" "d['tr_ended_no_verdict'], sorted(d['tr_ended_results'].items())" "4 [('(sem result)', 2), ('SKIPPED_BEAD_CLOSED', 2)]"
+chk4 "time: the median is of s2 (600) and s3 (900) only — a 0 s SKIPPED run is no run time" "$J8" "d['tr_elapsed_median_s'], d['tr_elapsed_max_s'], d['tr_elapsed_unknown']" "750.0 900 0"
+T8=$(run8 "$TALLY")
+for want in "1ª revisão: PASS 1 | FAIL 1 | sem veredito na janela 2 (de 4 concedida(s))" "4 run(s) da faixa encerrado(s) sem veredito PASS/FAIL ((sem result) 2, SKIPPED_BEAD_CLOSED 2)" "mediana 12.5 min"; do
+  case "$T8" in *"$want"*) ok "task-rapida report: '$want'" ;; *) bad "task-rapida report lacks '$want': $T8" ;; esac
+done
+NL8=$(python3 -c "
+import importlib.util, json, sys
+s = importlib.util.spec_from_file_location('t', '$TALLY'); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(m.notify_line(json.loads(sys.argv[1])))" "$J8")
+case "$NL8" in *"4 run(s) da faixa encerrado(s) sem veredito"*) ok "task-rapida: the notify line counts the runs that ended without a verdict" ;; *) bad "task-rapida: notify line: $NL8" ;; esac
+
+# the low findings of the same review: a marker re-decided after its run, and runs with no marker
+L9="$T/qg9.jsonl"
+cat > "$L9" <<'EOF'
+{"ts":"2026-10-02T09:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"d1","bead":"ga-d1","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-02T09:05:00Z","event":"dispatcher_complete","lane":"normal","marker":"d1","result":"PASS","elapsed_s":300,"dry_run":"0"}
+{"ts":"2026-10-03T09:00:00Z","event":"gate_lane","lane":"normal","marker":"d1","reason_code":"code-or-prompt","tr_code":"risk-file","dry_run":"0"}
+{"ts":"2026-10-03T10:00:00Z","event":"gate_lane","lane":"task-rapida","marker":"d2","bead":"ga-d2","tr_code":"granted","dry_run":"0"}
+{"ts":"2026-10-04T09:05:00Z","event":"dispatcher_complete","lane":"task-rapida","result":"PASS","elapsed_s":100,"dry_run":"0"}
+{"ts":"2026-10-04T09:06:00Z","event":"dispatcher_complete","lane":"task-rapida","result":"FAIL","elapsed_s":200,"dry_run":"0"}
+EOF
+J9=$(PATH="$T/bin:$PATH" FAKE_BD_BY_STORE="$T/st" python3 "$TALLY" --log "$L9" --now "$NOW" --json --bug-city /cityA)
+chk4 "runs with no marker are each their own run, not merged into one '?' (PASS 1 + FAIL 1), next to d1's PASS" "$J9" "d['tr_first_pass'], d['tr_first_fail'], d['tr_unattributed']" "2 1 2"
+chk4 "a marker re-decided to normal after its run: its first review counts in PASS/FAIL and is said to be outside 'granted'" "$J9" "d['tr_granted'], d['tr_first_outside_grants'], d['tr_no_verdict']" "1 1 1"
+T9=$(PATH="$T/bin:$PATH" FAKE_BD_BY_STORE="$T/st" python3 "$TALLY" --log "$L9" --now "$NOW" --bug-city /cityA)
+for want in "1 1ª revisão(ões) de marker(s) cuja concessão foi trocada depois" "2 run(s) da faixa sem marker no evento"; do
+  case "$T9" in *"$want"*) ok "task-rapida report: '$want'" ;; *) bad "task-rapida report lacks '$want': $T9" ;; esac
+done
+
+# the checks above can fail: each guard taken out of the tally makes one of them see the difference
+mutant() {   # mutant <name> <sed expression> <scenario that must then differ from the real tally's answer>
+  sed "$2" "$TALLY" > "$T/mut-$1.py"
+  if cmp -s "$TALLY" "$T/mut-$1.py"; then bad "task-rapida mutation '$1': the expression was not found in the tally (the control is a no-op)"; return 1; fi
+}
+mutant count-number 's/count=len(found) if not res\["uncovered"\] else None/count=len(found)/' && {
+  [ "$(pj "$(run4 "$T/mut-count-number.py" "$L5" --json)" "d['tr_bugs_after']")" != "None" ] && ok "task-rapida mutation: with the 'uncovered → null' guard removed, an un-looked-up grant still yields a number (the checks above see it)" || bad "task-rapida mutation 'count-number' survives"; }
+mutant store-down 's/if looked_up and down:/if False:/' && {
+  touch "$T/st/_rigP.fail"; [ "$(pj "$(run4 "$T/mut-store-down.py" "$L4" --json)" "d['tr_bugs_after']")" != "None" ] && ok "task-rapida mutation: with the 'store could not be read' guard removed the count is a number (the checks above see it)" || bad "task-rapida mutation 'store-down' survives"; rm -f "$T/st/_rigP.fail"; }
+mutant hq-down 's/for s in list(always) + (\[path\] if path else list(explicit)) if s in bad\]/for s in ([path] if path else list(explicit)) if s in bad]/' && {
+  touch "$T/st/_hq.fail"; [ "$(pj "$(run4 "$T/mut-hq-down.py" "$L4" --json)" "d['tr_bugs_uncovered']")" != "3" ] && ok "task-rapida mutation: with the HQ store out of the coverage check, its failure no longer leaves the grants un-looked-up (the check above sees it)" || bad "task-rapida mutation 'hq-down' survives"; rm -f "$T/st/_hq.fail"; }
+mutant no-verdict 's/if res not in ("PASS", "FAIL"):/if False:/' && {
+  [ "$(pj "$(run8 "$T/mut-no-verdict.py" --json)" "d['tr_first_pass'], d['tr_first_fail'], d['tr_ended_no_verdict']")" != "1 1 4" ] && ok "task-rapida mutation: with the verdict filter removed, a SKIPPED run is counted as a review (the checks above see it)" || bad "task-rapida mutation 'no-verdict' survives"; }
+mutant merged-unmarked 's/key = f"?{i}"/key = "?"/' && {
+  [ "$(pj "$(PATH="$T/bin:$PATH" FAKE_BD_BY_STORE="$T/st" python3 "$T/mut-merged-unmarked.py" --log "$L9" --now "$NOW" --json --bug-city /cityA)" "d['tr_first_pass'], d['tr_first_fail']")" != "2 1" ] && ok "task-rapida mutation: with the per-run key removed the marker-less runs merge into one (the checks above see it)" || bad "task-rapida mutation 'merged-unmarked' survives"; }
+mutant rc-after-json 's/    if p.returncode != 0:   # before the JSON/    if False:   # before the JSON/' && {
+  [ "$(pj "$(PATH="$T/bin:$PATH" FAKE_BD_MODE=fail python3 "$T/mut-rc-after-json.py" --log "$L3" --now "$NOW" --json --bug-city /cityA)" "d['tr_stores_failed']")" != "$(pj "$JF" "d['tr_stores_failed']")" ] && ok "task-rapida mutation: without the rc check the failure reads as a JSON-decode message (the check above sees it)" || bad "task-rapida mutation 'rc-after-json' survives"; }
 
 echo
 echo "== gate-lane-tally.selftest: $PASS passed, $FAIL failed =="

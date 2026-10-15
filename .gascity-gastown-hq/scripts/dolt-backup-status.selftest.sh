@@ -101,6 +101,7 @@ printf '%s' "$out" | grep -qF "MANIFEST=AUSENTE" && ok "scenario B: primary repo
 printf '%s' "$out" | grep -qF "NAO E UM BACKUP VALIDO" && ok "scenario B: primary explicitly called out as not a valid backup" || bad "scenario B: missing explicit invalid-backup wording"
 printf '%s' "$out" | grep -qF "ESTE presta, o PRIMARY acima nao" && ok "scenario B: .new is explicitly pointed to as the one that works" || bad "scenario B: missing the 'this one is good' pointer to .new"
 printf '%s' "$out" | grep -qF "troca INCOMPLETA" && ok "scenario B: .new residue explained as an incomplete swap" || bad "scenario B: missing incomplete-swap explanation"
+printf '%s' "$out" | grep -qF -- "--retire-superseded-new" && ok "scenario B: warning names the guard's retire for a .new older than a valid primary (ga-m9wpnk)" || bad "scenario B: warning does not mention --retire-superseded-new"
 rm -rf "$SRD_ROOT/hq" "$SRD_ROOT/hq.new"
 
 # Scenario C: healthy primary with ROUTINE .old residue (normal post-reseed

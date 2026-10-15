@@ -518,6 +518,12 @@ gate_deliver_review_task() {
 # there was never anyone to notify, not a new failure to escalate). On a 1
 # from a non-empty notify_author, the mayor escalation + bd comment have
 # ALREADY been sent — the caller needs no further fallback of its own.
+#
+# The caller MUST still neutralize that 1 with `|| true`: this script runs under
+# `set -euo pipefail`, so a bare call turns an already-handled outcome into the death
+# of the calling shell (ga-4n5ktn — the async post-merge tail of wa-smp3gh; before the
+# tail was async, the whole sweep). gate-author-notify-errexit.selftest.sh checks
+# every call statement of both helpers.
 # SELFTEST-EXTRACT notify-author-with-fallback: BEGIN
 notify_author_with_fallback() {
   local _bead_id="$1" _notify_author="$2" _author="$3" _subject="$4" _body="$5" _fail_context="$6"
@@ -581,6 +587,8 @@ notify_author_with_fallback() {
 # there was never anyone to notify, not a new failure to escalate). On a 1
 # from a non-empty notify_author, the mayor escalation + bd comment have
 # ALREADY been sent — the caller needs no further fallback of its own.
+# Same contract as notify_author_with_fallback: the caller neutralizes the 1 with
+# `|| true` (ga-4n5ktn; gate-author-notify-errexit.selftest.sh checks every call).
 # SELFTEST-EXTRACT nudge-author-with-fallback: BEGIN
 nudge_author_with_fallback() {
   local _bead_id="$1" _notify_author="$2" _author="$3" _message="$4" _fail_context="$5"
@@ -8842,7 +8850,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; the
       "Your gate PASS is held for reconciliation: 2 branches on $BEAD_ID (ga-lxz5w)" \
       "$(printf 'Your branch %s PASSED gate review, but it was NOT merged.\n\nA sibling branch %s is concurrently active in the gate for the same source bead %s (gate-status:%s). Auto-merging either branch would silently discard the other. %s\n\nNothing to do from your side right now — a human must pick the correct/superset branch and clear gate:needs-human before either can proceed.\n\nBead: %s   Rig: %s\nYour branch: %s (gate run %s)\nSibling branch: %s (gate-status:%s)' \
         "$BRANCH" "$GATE_LXZ5W_SIB_BRANCH" "$BEAD_ID" "$GATE_LXZ5W_SIB_STATUS" "$(gate_needs_human_clause "$_NH_STATUS")" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID" "$GATE_LXZ5W_SIB_BRANCH" "$GATE_LXZ5W_SIB_STATUS")" \
-      "sibling-branch race on $BEAD_ID (ga-lxz5w)"
+      "sibling-branch race on $BEAD_ID (ga-lxz5w)" || true
     warn "ga-lxz5w: sibling branch $GATE_LXZ5W_SIB_BRANCH (gate-status:$GATE_LXZ5W_SIB_STATUS) active for bead $BEAD_ID — downgrading $BRANCH's PASS to FAIL (needs-human armed=$_NH_STATUS)."
   fi
 fi
@@ -8899,7 +8907,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ];
         "Your gate submission is held: branch content mismatch on $BEAD_ID (ga-y9a1d)" \
         "$(printf 'Your branch %s reached the gate merge step for bead %s, but its own commits do not reference that bead at all.\n\n%s\n\nNothing to do from your side unless you recognize this — a human is reconciling. If your real fix is still sitting as a local/unpushed commit somewhere, it is not lost: `git log --all -S '"'"'<a distinctive string from your fix>'"'"'` will find it on any ref, including ones never merged.\n\nBead: %s   Rig: %s\nBranch: %s (sha %s, gate run %s)' \
           "$BRANCH" "$BEAD_ID" "$FAIL_REASONS" "$BEAD_ID" "$RIG" "$BRANCH" "$BRANCH_SHA" "$GATE_RUN_ID")" \
-        "branch-content mismatch on $BEAD_ID (ga-y9a1d)"
+        "branch-content mismatch on $BEAD_ID (ga-y9a1d)" || true
       warn "ga-y9a1d: branch $BRANCH's $GATE_Y9A1D_COUNT unique commit(s) never mention bead $BEAD_ID (suspects: ${GATE_Y9A1D_SUSPECTS:-none found}) — downgrading PASS to FAIL (needs-human armed=$_NH_STATUS)."
     fi
   fi
@@ -8935,7 +8943,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH_SHA" ];
         "Your gate submission is held: full-suite regression on $BEAD_ID (ga-3wgx8)" \
         "$(printf 'Your branch %s reached the gate merge step for bead %s with a reviewer PASS, but the rig'"'"'s own full test suite is red on this branch and green on %s — a regression outside your diff.\n\n%s\n\nNothing to do from your side unless you recognize this — a human is reconciling.\n\nBead: %s   Rig: %s\nBranch: %s (sha %s, gate run %s)' \
           "$BRANCH" "$BEAD_ID" "$DEFAULT_BRANCH" "$FAIL_REASONS" "$BEAD_ID" "${RIG:-unknown}" "$BRANCH" "$BRANCH_SHA" "$GATE_RUN_ID")" \
-        "full-suite regression on $BEAD_ID (ga-3wgx8)"
+        "full-suite regression on $BEAD_ID (ga-3wgx8)" || true
       warn "ga-3wgx8: ${RIG:-unknown} full suite red on $BRANCH, green on $DEFAULT_BRANCH — downgrading PASS to FAIL (needs-human armed=$_NH_STATUS)."
       ;;
     preexisting-debt|unmeasured)
@@ -10231,7 +10239,7 @@ $PARTIAL_EVIDENCE${_GATE_NBF_BLOCK:-}" 2>/dev/null || true
           "Your gate PASS is held for scope review: $BEAD_ID (ga-k2wjn)" \
           "$(printf 'Your branch %s PASSED gate review and merged (sha %s), but the source bead %s was NOT closed.\n\nga-k2wjn/ga-zhfk8: %s Held as delivery:partial + scope:needs-review pending Mayor review.\n\n%s\n\n%s\n\nIf this diff genuinely covers every enumerated item, add label scope_covered:all and close manually (or re-submit to the gate); otherwise the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s)' \
             "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$SCOPE_HOLD_WEAK_SIGNAL_NOTE" "$PARTIAL_EVIDENCE" "$SCOPE_HOLD_ALWAYS_CHECK" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
-          "scope-hold on $BEAD_ID (ga-k2wjn)"
+          "scope-hold on $BEAD_ID (ga-k2wjn)" || true
       else
         # BUG/TASK → verify daemon liveness BEFORE closing (ga-l7n3v). THE BUG
         # this closes: this branch used to close unconditionally on gate PASS
@@ -10665,7 +10673,7 @@ $DAEMON_HOLD_DETAIL${_GATE_NBF_BLOCK:-}" 2>/dev/null || true
             "Your gate PASS is held for daemon verification: $BEAD_ID (ga-l7n3v)" \
             "$(printf 'Your branch %s PASSED gate review and merged (sha %s), but the source bead %s was NOT closed.\n\nga-l7n3v: daemon verification %s — %s. Held as delivery:pending-restart.\n\nACTION: %s\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s)' \
               "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$DAEMON_HOLD_VERDICT" "$DAEMON_HOLD_REASON" "$DAEMON_HOLD_ACTION" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
-            "daemon-hold on $BEAD_ID (ga-l7n3v)"
+            "daemon-hold on $BEAD_ID (ga-l7n3v)" || true
           # SELFTEST-EXTRACT daemon-hold-block: END
         else
           # ga-rhzbii: before closing, check whether another gate marker/run
@@ -11449,7 +11457,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
           "$_NH_MAIL_SUBJ" \
           "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. %s\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
             "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$(gate_needs_human_clause "$_NH_STATUS")" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
-          "gate-fix-cap escalation on $BEAD_ID (armed=$_NH_STATUS)"
+          "gate-fix-cap escalation on $BEAD_ID (armed=$_NH_STATUS)" || true
       else
         # gate:needs-human was already on the source bead when this FAIL began. That does NOT prove
         # the Mayor was paged (see the note above), so GATE_FAIL_CAP_ESCALATED stays 0. The deferred

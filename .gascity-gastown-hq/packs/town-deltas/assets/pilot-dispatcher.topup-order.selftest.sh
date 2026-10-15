@@ -243,6 +243,7 @@ run_topup() {
     _pilot_topup_spawn() { printf '%s\n' "$2" >> "$WORK/spawn.log"; return 0; }
     _pilot_priority_yield_for_id() { return 1; }   # ga-5fn5p3: no head waiter known = the cross-rig priority yield is idle = this order, unchanged (the yield has its own selftest)
     _topup_note_spawn() { return 0; }
+    _topup_bind_after_spawn() { return 0; }   # ga-2lca0l: the claim written at spawn has its own selftest (priority-yield, section L); this one is about the ORDER of the pick
     eval "$TOPUP_VARS"; eval "$PRELUDE"
     apply_libmode
     _TOPUP_RIG_PATHS_JSON="$(cat "$WORK/rigs.json")"
@@ -290,6 +291,7 @@ run_topup_real() {
     _pilot_topup_spawn() { printf '%s\n' "$2" >> "$WORK/spawn.log"; return 0; }
     _pilot_priority_yield_for_id() { return 1; }   # ga-5fn5p3: no head waiter known = the cross-rig priority yield is idle = this order, unchanged (the yield has its own selftest)
     _topup_note_spawn() { return 0; }
+    _topup_bind_after_spawn() { return 0; }   # ga-2lca0l: the claim written at spawn has its own selftest (priority-yield, section L); this one is about the ORDER of the pick
     eval "$TOPUP_VARS"; eval "$REAL_FILTERS"; eval "$PRELUDE"
     eval "$(need _topup_worker_probe_migrated)"   # _pilot_pool_topup asks it after every spawn; absent, it would add a stderr line of its own
     apply_libmode
@@ -325,6 +327,7 @@ run_sweeps() {
     _pilot_variable_session_count() { _PLSC_N=0; return 0; }
     _pilot_topup_spawn() { printf '%s\n' "$2" >> "$WORK/spawn.log"; return 0; }
     _pilot_priority_yield_for_id() { return 1; }   # ga-5fn5p3: no head waiter known = the cross-rig priority yield is idle = this order, unchanged (the yield has its own selftest)
+    _topup_bind_after_spawn() { return 0; }   # ga-2lca0l: ...and nothing here claims the bead on purpose (the worker that takes some other bead); the bind has its own selftest
     eval "$TOPUP_VARS"; eval "$PRELUDE"
     eval "$(need _topup_pending_store _topup_note_spawn _topup_worker_probe_migrated)"
     apply_libmode

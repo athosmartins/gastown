@@ -85,6 +85,15 @@ eq "all.prefix is the intersection (5: no blocked-reason:)" "$(printf '%s' "$ALL
 eq "next_action: any=or, all=and" "$(printf '%s' "$ANY" | jq -r '.next_action'):$(printf '%s' "$ALL" | jq -r '.next_action')" "true:false"
 OUT="$(pool_veto_cfg bogus)"; rc=$?
 eq "an unknown mode yields NOTHING and rc != 0 (never an empty config that reads as 'no vetoes')" "$rc:${OUT:-<empty>}" "5:<empty>"
+# ga-qmfm8r: one pool's OWN list — the Pilot asks "will THIS pool's worker take it", not "will any/every pool".
+WA="$(pool_veto_cfg wa)"; DOG="$(pool_veto_cfg dog)"
+eq "wa.exact == POOL_VETO_EXACT_WA (the pool's own list, verbatim)" "$(printf '%s' "$WA" | jq -c '.exact | sort')" "$(printf '%s' "$POOL_VETO_EXACT_WA" | jq -c 'sort')"
+eq "dog.exact == POOL_VETO_EXACT_DOG (the pool's own list, verbatim)" "$(printf '%s' "$DOG" | jq -c '.exact | sort')" "$(printf '%s' "$POOL_VETO_EXACT_DOG" | jq -c 'sort')"
+eq "wa.prefix == POOL_VETO_PREFIX_WA" "$(printf '%s' "$WA" | jq -c '.prefix | sort')" "$(printf '%s' "$POOL_VETO_PREFIX_WA" | jq -c 'sort')"
+eq "dog.prefix == POOL_VETO_PREFIX_DOG" "$(printf '%s' "$DOG" | jq -c '.prefix | sort')" "$(printf '%s' "$POOL_VETO_PREFIX_DOG" | jq -c 'sort')"
+eq "next_action: wa=$POOL_VETO_NEXT_ACTION_WA dog=$POOL_VETO_NEXT_ACTION_DOG, each pool its own" "$(printf '%s' "$WA" | jq -r '.next_action'):$(printf '%s' "$DOG" | jq -r '.next_action')" "$POOL_VETO_NEXT_ACTION_WA:$POOL_VETO_NEXT_ACTION_DOG"
+eq "wa refuses delivery:pending-restart, dog does not (the ga-qmfm8r incident label)" "$(printf '%s' "$WA" | jq -r '.exact | index("delivery:pending-restart") != null'):$(printf '%s' "$DOG" | jq -r '.exact | index("delivery:pending-restart") != null')" "true:false"
+eq "dog refuses delivery:partial, wa does not" "$(printf '%s' "$DOG" | jq -r '.exact | index("delivery:partial") != null'):$(printf '%s' "$WA" | jq -r '.exact | index("delivery:partial") != null')" "true:false"
 
 echo "== 5. pool_veto_reasons — what refuses a bead, per pool_veto_cfg any"
 NOW=1790400000
@@ -120,6 +129,13 @@ eq "pilot:held-until in the PAST released the hold" "$(reasons "{\"labels\":[\"p
 eq "pilot:held-until with no parseable deadline is a hold" "$(reasons '{"labels":["pilot:held-until:soon"]}')" "held"
 eq "several vetoes are all listed" "$(reasons '{"labels":["needs-human","exec:manual"]}')" "label:needs-human,label:exec:manual"
 eq "pilot:reclaim-count:<n> (a SORT key in the probes) is not a veto" "$(reasons '{"labels":["pilot:reclaim-count:2"]}')" "-"
+# ga-qmfm8r: the SAME bead is refused or not depending on WHICH pool is asked
+eq "delivery:pending-restart is refused by the wa pool" "$(reasons '{"labels":["delivery:pending-restart"]}' wa)" "label:delivery:pending-restart"
+eq "delivery:pending-restart is NOT refused by the dog pool" "$(reasons '{"labels":["delivery:pending-restart"]}' dog)" "-"
+eq "delivery:partial is refused by the dog pool" "$(reasons '{"labels":["delivery:partial"]}' dog)" "label:delivery:partial"
+eq "delivery:partial is NOT refused by the wa pool" "$(reasons '{"labels":["delivery:partial"]}' wa)" "-"
+eq "delivery:pending-restart is invisible to the intersection (why 'all' could not answer the Pilot)" "$(reasons '{"labels":["delivery:pending-restart"]}' all)" "-"
+eq "a plain gate-FAILED bead is not refused by the wa pool either" "$(reasons "$REAL" wa)" "-"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"

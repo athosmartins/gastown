@@ -3,20 +3,30 @@
 <plist version="1.0"><dict>
   <key>Label</key><string>com.gascity.supervisor-restart-watchdog</string>
 
-  <!-- Detection-only restart counter (ga-b0gltl): com.gascity.supervisor dies
-       periodically and launchd's KeepAlive silently respawns it, so the
+  <!-- Restart counter (ga-b0gltl) + fd guard (ga-xuo89c): com.gascity.supervisor
+       dies periodically and launchd's KeepAlive silently respawns it, so the
        crash never surfaces as a visible failure — only as an unattributed
        dispatch gap. This job takes ONE sample per invocation (`launchctl
        print`), diffs the `runs` counter against the previous sample, and
        appends one JSONL record to .gc/logs/supervisor-restart-watchdog.jsonl
        with the delta and, when there is one, a reason (non-zero exit code,
        or an OS_REASON_*/codesign match in the bytes of supervisor.log
-       appended since the previous sample). It never restarts, reconfigures,
-       or otherwise touches the supervisor — see the script header and
-       ga-b0gltl for why that is explicitly out of scope until this counter
-       tells us the real frequency. Single-instance-locked (ga-y0g5x
-       pattern): a measured run takes ~0.08s, so StartInterval=900 leaves a
-       huge margin and this will never stack concurrent instances. -->
+       appended since the previous sample).
+       The counter half never touches the supervisor. The one exception is the
+       fd guard (ga-xuo89c, stop-gap for the engine's fsnotify watch leak
+       ga-0ox5tq): each sample also counts the supervisor's open fds with
+       `lsof -n -P -p <pid>` (the `fds` field). Above 30,000 it only records;
+       above 40,000 it runs `launchctl kickstart -k gui/<uid>/com.gascity.
+       supervisor`, notifies at priority 4 and does not restart again for 30
+       minutes. The city's tmux server runs outside the supervisor's process
+       group (seen 2026-10-13), so its sessions should survive; the record's
+       sessions_before/sessions_after are the proof on the first real event. A count it could not read is `fds:null`
+       and never restarts anything. The lsof walk is what a run costs now: 0.65s
+       at 900 fds, growing with the count (bounded at 120s in the script), so
+       a run is still far inside StartInterval=900. Single-instance-locked
+       (ga-y0g5x pattern), so a slow run can never stack concurrent instances.
+       The PATH below carries /opt/homebrew/bin (timeout, tmux), /usr/sbin
+       (lsof) and ~/.local/bin (notify). -->
   <key>ProgramArguments</key><array>
     <string>/bin/bash</string>
     <string>/Users/athos/gt/.gascity-gastown-hq/scripts/supervisor-restart-watchdog.sh</string>

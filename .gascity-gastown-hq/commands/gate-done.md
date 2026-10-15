@@ -11,7 +11,7 @@ allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash
 • What This Does · Pre-flight Checks
 • Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
 • Step 1: Push your branch (fail-closed verification) · Step 2: Gather context
-• Step 2b: Pre-gate self-review (A/B experiment, ga-gnr3tw — half of all beads)
+• Step 2b: Pre-gate self-review (CLOSED — nothing to run while .gc/pregate.off exists)
 • Step 3: Create the ready-for-gate marker · Step 4: Report · Common Issues
 
 Signal that your work is complete and ready to pass through the quality gate.
@@ -25,10 +25,8 @@ Arguments: $ARGUMENTS
 1. Runs a mandatory self-audit of your OWN diff for the "third state" defect
    class (see below) — the single class reviewers reject most often.
 2. Validates your working tree is clean and pushed.
-3. For half of all beads (experiment ga-gnr3tw, Step 2b): runs the gate
-   reviewer's own prompt on your diff before it costs a gate cycle, and tells
-   you what it would reject. The other half skips it, by a fixed function of
-   the bead id.
+3. (Step 2b, the pre-gate self-review experiment ga-gnr3tw, is CLOSED since
+   2026-10-03 — there is nothing to run for it.)
 4. Creates a durable bead marker in the CITY database (so the guard can find
    it), then re-reads it to confirm the ready-for-gate label landed —
    self-healing if not (ga-ehbw5).
@@ -800,52 +798,9 @@ inside a registered rig directory. `Bead rig` shows which Dolt store owns the so
 bead (HQ `gascity` vs the code-rig); it is recorded so the gate closes the bead in
 the correct store.
 
-## Step 2b: Pre-gate self-review (A/B experiment, ga-gnr3tw — half of all beads)
+## Step 2b: Pre-gate self-review (CLOSED — nothing to run)
 
-**Why.** The gate now rejects what an easier reviewer used to approve — measured
-(E0, ga-5vi6cp): of 10 diffs re-judged, 7 had a real behaviour defect and 0 were
-unfounded. The bar is not coming down; what ARRIVES has to get better. About half of
-the FAILs are an edge case / an error that reads as empty / a third state, a fifth is
-a comment promising more than the code does, a tenth is a test that never exercises
-the path. You can catch those yourself if you look with the reviewer's own eyes: this
-step runs the gate reviewer's OWN prompt (same lens, same bar, same model and effort)
-on your diff BEFORE it costs a gate cycle. It writes nothing to the gate.
-
-**It is an experiment, so it runs for half of the beads.** Which half is a fixed
-function of your bead id (SHA-256 parity) — not something you pick or should try to
-predict. On the other half the script prints `SKIPPED … control-arm`, exits 0 within a
-second, and there is nothing for you to do: go to Step 3. Do NOT pass `--force` to see
-which arm you are in, or to re-roll: it contaminates the measurement the Mayor is
-using to decide whether this becomes mandatory.
-
-Run it from your checkout (HEAD on your branch, clean tree, already pushed by Step 1),
-filling `<BRANCH>` and `<BEAD_ID>` from what Step 2 printed (shell variables do not
-persist between tool calls). **A review takes minutes (up to ~25) — run it as a
-BACKGROUND command (Bash tool `run_in_background: true`) and read the output when it
-finishes; do not kill it, and do not treat the wait as a hang.**
-
-```bash
-bash "$GC_CITY_PATH/packs/town-deltas/assets/pre-gate-review.sh" run "<BRANCH>" --bead "<BEAD_ID>"
-echo "pre-gate exit code: $?"
-```
-
-The last line of output is `PREGATE_RESULT arm=… verdict=… reason=… attempt=… coverage=…`.
-`coverage=` says how much of your diff the reviewer was shown: `full`, `partial:<shown>/<total>`
-(files — a diff over the line budget is cut, and the files it did not get are listed), `unknown`,
-or `n/a` when the run ended before a diff was read. A PASS only clears what was read. Three
-outcomes, never two — a check that could not run is not a check that passed:
-
-| exit | verdict | what you do |
-|---|---|---|
-| 0 | `PASS` | No blocking defect found in a diff the reviewer saw whole (`coverage=full`). Go to Step 3. |
-| 0 | `SKIPPED` | Control arm, or you already used the per-bead cap (3 runs). Go to Step 3. |
-| 10 | `FAIL` | The reviewer found blocking defect(s), printed above. For EACH one, re-read the cited lines and decide whether it is real. Fix the real ones — fix the CLASS, sweep your whole diff for siblings, not only the cited line (the same shape hides elsewhere in the same diff) — commit, and re-run `/gate-done` from Step 1. If you judge a finding a false positive you may still submit: say which and why in `SELF_AUDIT_SUMMARY`; the real gate decides. If `coverage=` is not `full`, the FAIL stands but fixing it does not clear the files listed under `COVERAGE` — nobody has reviewed those. |
-| 3 | `INCONCLUSIVE` | It could not judge (`reason=` says why: machine guard, busy, timeout, no verdict line, `record-unwritable` — a review that could not be put on the log is not started…). NOT a verdict, and not a reason to wait. Go to Step 3 and put `pre-gate inconclusive (<reason>)` in `SELF_AUDIT_SUMMARY`. **Exception — `reason=partial-diff:<shown>/<total>-files` or `reason=coverage-unknown`:** the reviewer said PASS, but only for the part it was shown (or an amount that could not be established). That is not a clearance, and re-running shows it the same part. The unread files are listed under `COVERAGE` in the output: review those yourself with the reviewer's lens (the Pre-flight Self-Audit), then go to Step 3 and put `pre-gate partial (<reason>): <what you checked in the unread files, and what you found>` in `SELF_AUDIT_SUMMARY`. **The real gate is stricter than this rehearsal (ga-5w2gpw):** it hands each reviewer the WHOLE diff or does not review it. Over `GATE_DIFF_LINE_BUDGET` (6000 lines) or `GATE_DIFF_BYTE_BUDGET` (400000 bytes), or when it cannot read the diff at all (files listed, no diff text), it PARKS the branch (`gate-status:error` + `gate:needs-human:technical`; you and the Mayor are mailed) instead of merging on a part of it or on nothing. If the output carries the `NOTE: the real gate parks a diff over …` line, split the branch into pieces under those limits BEFORE Step 3 and send each through `/gate-done`. |
-| 129 / 130 / 143 | `INCONCLUSIVE` `reason=interrupted:<HUP\|INT\|TERM>` | The review was interrupted (you or the session stopped it). It is on the record and counts as one of your 3 runs, whatever it had already spent — the money was spent even though no verdict came back. NOT a verdict. Go to Step 3 and put `pre-gate interrupted (<what stopped it>)` in `SELF_AUDIT_SUMMARY`. You may re-run while you have runs left, but that starts a new full review. |
-| 2 (or anything else) | — | The call itself was wrong (bad flag, empty `<BEAD_ID>`) or the script crashed. NOT a verdict. Fix the call if it is yours (an empty `<BEAD_ID>` means Step 2 did not run in this shell), otherwise go to Step 3 and say `pre-gate not run (<what happened>)` in `SELF_AUDIT_SUMMARY`. |
-
-The step is fail-open on tooling (a missing script or an unresolved model must never
-block a submission) and fail-visible (the reason is printed and recorded).
+The pre-gate experiment (ga-gnr3tw) was ended on 2026-10-03 (ga-ufskhy.1, merge 3f619d0d8). While `$GC_CITY_PATH/.gc/pregate.off` exists, `pre-gate-review.sh` answers `SKIPPED reason=program-off` right away without running any review, so this step is a no-op: go straight to Step 3 and do not run the script. To reopen the program, delete that file and restore this step's full text (the command and its exit-code table) from `git show 46e73903c:.gascity-gastown-hq/commands/gate-done.md`.
 
 ## Step 3: Create the ready-for-gate marker
 
@@ -897,11 +852,15 @@ SELF_AUDIT_SUMMARY=$(printf '%s' "${SELF_AUDIT_SUMMARY:-<not recorded - see Pre-
 # builder who skipped it is on neither arm and the comparison quietly becomes one among the builders who complied), and
 # learn the A/B arm so it can be stamped on the marker once the marker exists (after the read-back below). The arm is a
 # pure function of the bead id, so it is recomputed here and survives Step 2b having run in another shell.
-# `roster` exits 0 = arm printed AND on the roster; 4 = arm printed but the roster row was NOT written; anything else =
-# no arm. Its stderr stays attached to YOUR terminal on purpose (the WARN naming a failed roster write is the only trace of
-# it), and every outcome other than 0 prints a "pre-gate roster NOT recorded" line: a submission that is missing from the
-# roster must be visible, never silently absent. If the arm cannot be computed (no sha256 tool, empty id) NO label is
-# written: "unknown" must never read as "off" in the measurement.
+# `roster` exits 0 = arm printed AND on the roster; 4 = arm printed but the roster row was NOT written; 5 = the program is
+# CLOSED (.gc/pregate.off, ga-ufskhy.1: by design no arm, no row, nothing printed on stdout); anything else = no arm. Its
+# stderr stays attached to YOUR terminal on purpose (the WARN naming a failed roster write — and, for 5, the reason the
+# script gives — are the only trace of it), and every outcome other than 0 and 5 prints a "pre-gate roster NOT recorded"
+# line: a submission that is missing from the roster must be visible, never silently absent. 5 is the one outcome that is
+# not a failure (ga-gla16p: it used to land in the "no arm" line below on EVERY submission since 03/10), so it prints nothing
+# here — but only the exact pair "5 + empty arm" is treated that way; a 5 that DID print an arm, like any 2/3/4 outcome, is
+# still the loud line. If the arm cannot be computed (no sha256 tool, empty id) NO label is written: "unknown" must never
+# read as "off" in the measurement.
 # This runs in every agent's shell, which in this city is zsh, not bash. The block between the SELFTEST-EXTRACT sentinels
 # is executed VERBATIM under bash AND zsh by gate-done-pregate-stamp.selftest.sh — keep the sentinels in place.
 # SELFTEST-EXTRACT pregate-roster: BEGIN
@@ -910,6 +869,8 @@ case "$PREGATE_RC:$PREGATE_ARM" in
   0:on|0:off) ;;
   4:on|4:off)
     echo "pre-gate roster NOT recorded: the assignment of $BEAD_ID ($PREGATE_ARM) could not be written to the roster (see the WARN above) - it will be missing from the experiment count; the marker still gets its pregate:$PREGATE_ARM label." ;;
+  5:)
+    PREGATE_ARM="" ;;
   *)
     echo "pre-gate roster NOT recorded: no arm could be determined for $BEAD_ID (roster exit $PREGATE_RC) - it is off the roster and gets no pregate:* label."
     PREGATE_ARM="" ;;

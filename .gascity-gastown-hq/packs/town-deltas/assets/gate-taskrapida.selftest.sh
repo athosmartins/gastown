@@ -341,6 +341,18 @@ for c in $DISPATCHER_CODES; do
   if printf '%s\n' "$LIB_CODES" | grep -qx "$c"; then ok "dispatcher-level code listed by the lib: $c"; else bad "dispatcher-level code '$c' is not in gate_taskrapida_codes (the tally would not know the bucket)"; fi
   if grep -q "GATE_TR_CODE=\"$c\"" "$DISPATCHER"; then ok "the dispatcher sets GATE_TR_CODE=$c on its own path"; else bad "the dispatcher never sets GATE_TR_CODE=\"$c\""; fi
 done
+# the weekly tally (python) buckets the lane's refusals by its own copy of this list: same codes, same words. A tally that does not know
+# a code files it under "outro", so a code added here and not there is a refusal nobody can read; and a reworded label is a different report
+# (ga-dzzqvw.1). Mutation below: the check can fail.
+LIB_LIST=$("$B32" -c 'source "$1"; gate_taskrapida_codes' _ "$LIB" 2>/dev/null | sort) || LIB_LIST=""
+TALLY_PY="$SELF_DIR/gate-lane-tally.py"
+TALLY_LIST=$(python3 "$TALLY_PY" --list-tr-codes 2>/dev/null | sort) || TALLY_LIST=""
+if [ -n "$LIB_LIST" ] && [ "$LIB_LIST" = "$TALLY_LIST" ]; then ok "the tally lists exactly the lib's codes and labels ($(printf '%s\n' "$LIB_LIST" | wc -l | tr -d ' '))"
+else bad "the tally's TR_REASON_CODES and gate_taskrapida_codes differ: $(diff <(printf '%s\n' "$LIB_LIST") <(printf '%s\n' "$TALLY_LIST") | head -6 | tr '\n' ' ')"; fi
+sed 's/"over-limit": *"[^"]*"/"over-limit": "reworded"/' "$TALLY_PY" > "$T/tally-mut.py"
+[ "$(python3 "$T/tally-mut.py" --list-tr-codes 2>/dev/null | sort)" != "$LIB_LIST" ] && ok "mutation: a reworded label in the tally IS seen as a difference" || bad "mutation: the drift check cannot tell a reworded label apart"
+sed '/^    "decision-errored":/d' "$TALLY_PY" > "$T/tally-mut2.py"
+[ "$(python3 "$T/tally-mut2.py" --list-tr-codes 2>/dev/null | sort)" != "$LIB_LIST" ] && ok "mutation: a code missing from the tally IS seen as a difference" || bad "mutation: the drift check cannot tell a missing code apart"
 
 # ── 9. the dispatcher wiring: the blocks it runs, extracted verbatim ─────────────────────────────────────────
 echo "── 9. dispatcher wiring ──"

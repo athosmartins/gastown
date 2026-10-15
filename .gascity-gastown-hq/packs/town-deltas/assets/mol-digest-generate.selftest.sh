@@ -16,6 +16,11 @@
 #
 # Defect 2 (step 3): the `--metadata` JSON must survive TOML unescaping.
 #
+# Defect 3 (2b, ga-31j3yu): the Commits column counted the rig's LOCAL main. A checkout nobody pulls
+# keeps an old local main, so `git log` exits 0 with no rows and the digest shows 0 for a busy day.
+# The count must come from origin/main, say how far local main is from it, and be `?` — never a
+# number from the wrong main — when it cannot tell which main is current.
+#
 # FORMULA=<path> overrides the file under test (used to prove this harness
 # fails against the pre-fix formula).  Exit 0 iff every assertion holds.
 set -uo pipefail
@@ -167,7 +172,7 @@ chmod +x "$TMP/bin/gc"
 # PATH so the shells under test are the same ones as before (the sandbox does not swap in /bin/bash 3.2).
 . "$HERE/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/selftest-sandbox-path.lib.sh" >&2; exit 2; }
 SANDBOX_SHELLS="bash"; command -v zsh >/dev/null 2>&1 && SANDBOX_SHELLS="bash zsh"
-sandbox_path_init "$TMP" jq python3 $SANDBOX_SHELLS || exit 2   # jq: metadata/count checks; python3: the rotate hook; gc is the stub above
+sandbox_path_init "$TMP" jq python3 git $SANDBOX_SHELLS || exit 2   # jq: metadata/count checks; python3: the rotate hook; git: the 2b commit-count block (real repos below); gc is the stub above
 
 # ---- defect 1: session lifecycle counts ---------------------------------------
 BLOCK="$TMP/lifecycle.sh"
@@ -332,6 +337,104 @@ STUB
   else
     bad "--metadata is not the expected JSON; the agent would pass: '$META'"
   fi
+fi
+
+# ---- defect 3: the Commits column counts the main that is CURRENT (ga-31j3yu) ---------------
+# Real git repos with fixed commit dates, so what is under test is git's answer to the delivered
+# block, not a stub's. Expected numbers come from how many commits the fixture creates, never from
+# running the recipe's own `git log`.
+echo "-- step 2b commit count: origin/main, not a stale local main (ga-31j3yu)"
+CBLOCK="$TMP/commit-count.sh"
+extract region collect-data "# BEGIN commit-count" "# END commit-count" > "$CBLOCK"
+if [ ! -s "$CBLOCK" ]; then
+  bad "collect-data has no '# BEGIN/END commit-count' block — 2b still counts the rig's local main"
+else
+  C0=2026-10-11T00:00:00Z; C1=2026-10-12T00:00:00Z
+  # fixture git: no user/system config, no signing, fixed identity
+  g() { env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
+  commit_at() { # <repo> <iso date> [file]: one commit with that author+committer date
+    local r="$1" d="$2" f="${3:-}"
+    if [ -n "$f" ]; then mkdir -p "$r/$(dirname "$f")"; echo "$d" >> "$r/$f"; g -C "$r" add "$f"; fi
+    GIT_AUTHOR_DATE="$d" GIT_COMMITTER_DATE="$d" g -C "$r" commit -q --allow-empty -m "c $d $f"
+  }
+  CF="$TMP/cfix"; mkdir -p "$CF"
+  g init -q --bare -b main "$CF/origin.git"
+  g init -q -b main "$CF/work"; g -C "$CF/work" remote add origin "$CF/origin.git"
+  commit_at "$CF/work" 2026-10-09T10:00:00Z a/f0
+  g -C "$CF/work" push -q origin main
+  g clone -q "$CF/origin.git" "$CF/stale"            # the rig checkout nobody pulls
+  # the gate lands 3 commits inside the window (2 under a/, 1 under b/) and 1 after it
+  commit_at "$CF/work" 2026-10-11T09:00:00Z a/f1
+  commit_at "$CF/work" 2026-10-11T12:00:00Z a/f2
+  commit_at "$CF/work" 2026-10-11T18:00:00Z b/f3
+  commit_at "$CF/work" 2026-10-12T09:00:00Z a/f4
+  g -C "$CF/work" push -q origin main
+  g -C "$CF/stale" fetch -q origin                    # origin/main moves, local main does not
+  # sync: pulled up to date. ahead: pulled + one local-only commit in the window.
+  # diverged: stale + one local-only commit.
+  cp -R "$CF/stale" "$CF/sync";     g -C "$CF/sync" merge -q --ff-only origin/main
+  cp -R "$CF/sync" "$CF/ahead";     commit_at "$CF/ahead" 2026-10-11T20:00:00Z a/local1
+  cp -R "$CF/stale" "$CF/diverged"; commit_at "$CF/diverged" 2026-10-11T21:00:00Z a/local2
+  # no remote at all (marketing): local main is the only main there is
+  g init -q -b main "$CF/solo"
+  commit_at "$CF/solo" 2026-10-11T10:00:00Z s1; commit_at "$CF/solo" 2026-10-11T11:00:00Z s2
+  # a remote is configured but origin/main was never fetched: cannot tell which main is current
+  cp -R "$CF/solo" "$CF/norefs"; g -C "$CF/norefs" remote add origin "$CF/does-not-exist.git"
+  # origin/main resolves but there is no local `main` branch: the comparison fails, the count does not
+  cp -R "$CF/stale" "$CF/nomain"; g -C "$CF/nomain" checkout -q -b other; g -C "$CF/nomain" branch -q -D main
+  # origin/main resolves as a ref but its tip object is gone: the ref check passes and `git log` itself fails
+  cp -R "$CF/stale" "$CF/lostobj"
+  lo_sha=$(g -C "$CF/lostobj" rev-parse refs/remotes/origin/main); lo_obj="$CF/lostobj/.git/objects/${lo_sha:0:2}/${lo_sha:2}"
+  if [ -f "$lo_obj" ]; then rm -f "$lo_obj"; ok "fixture premise: origin/main tip is a loose object, removed"; else bad "fixture premise: origin/main tip is not a loose object ($lo_obj)"; fi
+  # not a repository at all
+  mkdir "$CF/notrepo"
+  # property_scrapers/lexbh layout: git-dir is a sibling .repo.git, `rev-parse --show-toplevel` fails
+  cp -R "$CF/sync" "$CF/pscr"; mv "$CF/pscr/.git" "$CF/pscr/.repo.git"
+
+  # fixture premises, so a green run cannot be a vacuous one
+  stale_local=$(g -C "$CF/stale" log --since=$C0 --until=$C1 --oneline main | wc -l | tr -d ' ')
+  [ "$stale_local" = 0 ] && ok "fixture reproduces ga-31j3yu: stale local main sees 0 commits where origin/main has 3" \
+    || bad "fixture does not reproduce the bug (stale local main sees '$stale_local', want 0)"
+  if g -C "$CF/pscr" rev-parse --show-toplevel >/dev/null 2>&1; then bad "fixture premise: pscr should NOT resolve a toplevel"; else ok "fixture premise: .repo.git layout resolves no toplevel"; fi
+
+  run_commits() { # <shell> <rig path> <since> <until> -> the block's last line
+    PATH="$SANDBOX_PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 RIG_PATH="$2" SINCE="$3" UNTIL="$4" "$1" "$CBLOCK" 2>/dev/null | tail -n 1
+  }
+  expect_commits() { # <shell> <label> <rig path> <since> <until> <want>
+    local got; got=$(run_commits "$1" "$3" "$4" "$5")
+    [ "$got" = "$6" ] && ok "$1: $2: $got" || bad "$1: $2: got '$got', want '$6'"
+  }
+  for sh in bash zsh; do
+    command -v "$sh" >/dev/null || { echo "  (skip $sh: not installed)"; continue; }
+    expect_commits "$sh" "stale local main -> counted from origin/main, staleness reported" "$CF/stale"    $C0 $C1 "commits=3 ref=origin/main local_main_behind=4 local_main_ahead=0"
+    expect_commits "$sh" "up to date -> same count, in sync"                                "$CF/sync"     $C0 $C1 "commits=3 ref=origin/main local_main_behind=0 local_main_ahead=0"
+    expect_commits "$sh" "local-only commit is reported ahead, not counted"                 "$CF/ahead"    $C0 $C1 "commits=3 ref=origin/main local_main_behind=0 local_main_ahead=1"
+    expect_commits "$sh" "diverged both ways -> both numbers"                               "$CF/diverged" $C0 $C1 "commits=3 ref=origin/main local_main_behind=4 local_main_ahead=1"
+    expect_commits "$sh" "a covered but quiet window is a real 0"                           "$CF/stale"    2026-10-20T00:00:00Z 2026-10-21T00:00:00Z "commits=0 ref=origin/main local_main_behind=4 local_main_ahead=0"
+    expect_commits "$sh" "rig is a subtree of a shared repo: only its own path counts"      "$CF/stale/a"  $C0 $C1 "commits=2 ref=origin/main local_main_behind=4 local_main_ahead=0"
+    expect_commits "$sh" ".repo.git layout (no toplevel) still counts from origin/main"     "$CF/pscr"     $C0 $C1 "commits=3 ref=origin/main local_main_behind=0 local_main_ahead=0"
+    expect_commits "$sh" "no local main branch -> count stands, comparison is ? (not 'in sync')" "$CF/nomain" $C0 $C1 "commits=3 ref=origin/main local_main_behind=? local_main_ahead=?"
+    expect_commits "$sh" "git log fails after the ref check -> ?, not 0" "$CF/lostobj" $C0 $C1 "commits=? ref=origin/main local_main_behind=? local_main_ahead=?"
+    expect_commits "$sh" "no remote at all -> local main, labeled"                          "$CF/solo"     $C0 $C1 "commits=2 ref=main-local-no-remote local_main_behind=- local_main_ahead=-"
+    expect_commits "$sh" "remote configured but no origin/main -> ?, not a number"          "$CF/norefs"   $C0 $C1 "commits=? ref=origin-main-missing local_main_behind=- local_main_ahead=-"
+    expect_commits "$sh" "not a repository -> ?, not 0"                                     "$CF/notrepo"  $C0 $C1 "commits=? ref=unknown local_main_behind=- local_main_ahead=-"
+  done
+fi
+
+# the delivered text must tell the agent where the new fields go (a computed field nobody is told to
+# print is the same silent failure one step later)
+STEP2B_TEXT=$(extract fence collect-data 'commit-count')
+if [ -z "$STEP2B_TEXT" ]; then
+  bad "no delivered code block with the commit-count markers in collect-data"
+else
+  python3 - "$FORMULA" <<'PY' && ok "2b prose wires ref/behind/ahead into the table and Highlights" || bad "2b prose does not tell the agent what to do with ref/behind/ahead"
+import sys, tomllib
+d = tomllib.load(open(sys.argv[1], "rb"))
+steps = {s["id"]: s["description"] for s in d["steps"]}
+c, g = steps["collect-data"], steps["generate-and-send"]
+need_c = ["local_main_behind", "local_main_ahead", "main-local-no-remote", "origin-main-missing", "never `0`"]
+sys.exit(0 if all(x in c for x in need_c) and "Commit-count caveats" in g else 1)
+PY
 fi
 
 echo "== $P ok, $F bad =="

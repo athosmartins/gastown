@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que faz (a cada 60 s, sob flock) · Garantias · Liga/desliga · Riscos abertos (não medidos)
+• O que faz (a cada 60 s, sob flock) · A tela do limite e o Escape (ga-ci3uao) · Garantias · Liga/desliga · Riscos abertos (não medidos)
 
 Fase 2 da ga-xoe5ao. O pool headless (ga-8hcnvb.1, `claude-pool-account.py`) decide a conta; este script **segue** a decisão
 para quem usa Remote Control (Mayor + crews), reescrevendo o item DEFAULT do Keychain `Claude Code-credentials`.
@@ -41,6 +41,52 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
    "nenhuma sobrou para verificar"). Pid reaproveitado pelo SO não conta como bridge viva (compara `procStart` da sessão com
    `TZ=UTC ps -o lstart=`).
 
+## A tela do limite e o Escape (ga-ci3uao)
+**O que aconteceu (14/10, ga-ci3uao):** a troca rodou 16:09Z e o VERIFY registrou "all 5 Remote Control bridges are still up" — verdade, e
+irrelevante: a ponte do RC não diz em QUAL conta a sessão está. Mayor, oracle, peter e thies seguiram 10–12 min na tela de limite da conta
+antiga (a pergunta "What do you want to do? / 1. Stop and wait for limit to reset ... Enter to confirm · Esc to cancel") até o Athos trocar
+à mão. Reprodução exata do relato: com o script ANTERIOR, uma sessão nessa tela dá só `all 1 Remote Control bridges are still up`
+(teste `test_a_session_on_the_limit_screen_fails_the_verify_and_the_push_names_it`, que reprova no HEAD anterior).
+
+**O que o VERIFY faz agora (leitura apenas):** para cada sessão com ponte no ar, lê a tela do pane (`tmux -L gascity display-message` +
+`capture-pane`, pelo campo `tmux` do arquivo da sessão) e só confia no pane se o processo da sessão estiver DENTRO dele (id de pane
+reaproveitado = tela de outra sessão). Três respostas, nunca duas:
+- **limite**: o modal é a ÚLTIMA coisa na tela (pergunta, opção 1, rodapé, nessa ordem). Citação do modal no transcript, diálogo de
+  permissão (mesmo rodapé, outra pergunta) e o modal já fechado (saída depois dele) NÃO casam.
+- **limpa**: pane lido e sem o modal.
+- **não sei**: sem pane do tmux da cidade (ex.: sessão aberta em terminal comum — hoje o "Revit"), tmux/ps mudos, pane que não é mais da
+  sessão, ou a mensagem "You've hit your … limit" na tela SEM o modal (pode ser linha velha do scrollback: não prova nada).
+
+Veredito único no log (e em `verify_last` no estado): `VERIFY ok` (todas lidas, nenhuma no limite, nenhuma ponte em dúvida) · `VERIFY FAILED`
+(alguma no limite: push `rc-limit-stuck` que NOMEIA a sessão, e ela entra em `limit_watch` por 15 min) · `VERIFY NOT VERIFIED` (qualquer outra
+coisa — só log, sem push). "Não sei" nunca vira "ok". Efeito prático: enquanto houver uma sessão RC fora do tmux da cidade, TODA troca fecha
+como `NOT VERIFIED`; isso é o estado honesto, não um defeito.
+
+**O Escape (passo 5) — DESLIGADO por padrão.** Armar: `touch /Users/athos/gt/.gascity-gastown-hq/.gc/crew-unstick-on` (ou `GC_CREW_UNSTICK=1`);
+`GC_CREW_UNSTICK=0` desarma mesmo com o arquivo. É a mesma exceção do pool (docs/claude-pool-account.md, "The Escape exception") estendida a
+Mayor e crews, o que **reverte a linha "Mayor and crew sessions on the modal are never pressed"** daquele doc — por isso nasce desligada:
+ligar é decisão de produto do Athos/Mayor, não de quem escreveu o código. Armada, manda UMA tecla (Escape) por sessão, só se TODOS valem:
+```
+ a sessão estava no ar na troca (nascida depois da troca tem limite PRÓPRIO: nunca é apertada)   · a tela do limite foi vista em duas rodadas,
+ com >= 30 s entre elas (achada numa rodada não é apertada na mesma)   · >= 45 s desde a troca (o claude relê o item em ~30 s)
+ · a decisão do pool ainda é a conta da troca e ela NÃO está esgotada (Escape numa conta rejeitada só cai no próximo 429)
+ · o item default é legível, login completo, e o dono é essa conta   · o arquivo da sessão tem a hora de início (prova que é o mesmo processo)
+ · imediatamente antes da tecla: o mesmo processo no pane e o modal ainda a última coisa na tela   · máx. 2 por sessão, >= 60 s entre elas,
+ 6 por rodada. A tentativa é contada ANTES da tecla. Depois de 2 sem efeito: push `rc-limit-unstick-failed` (apertar à mão / reiniciar).
+```
+Qualquer leitura que não consegue dizer é "não": não aperta e não esquece. `--dry-run` olha e diz "would send", nunca aperta nem avisa.
+Um erro dentro dessa checagem não derruba a troca: é capturado e logado (`the screen check failed` / `the limit-screen watch failed`).
+
+**NÃO medido, e o que isso limita:** a causa de FUNDO de a sessão não reler o login após a troca (bead ga-ci3uao, hipóteses a/b/c). Lendo o
+binário 2.1.300 (`strings`, sem rodar nada): o `Keychain` tem cache de 30 s; achei releitura da credencial no tratamento de 401, na renovação
+do access token, no "sibling-login watch" (só com aviso de login na tela) e na atualização de políticas; NÃO achei releitura ligada a um 429
+de limite semanal. Não rastreei todos os chamadores (`hae`/`lve` limpam o cache e relêem; não vi quem os chama por requisição), então isto é
+indício de leitura de código, NÃO medição ao vivo, e não descarta a hipótese (c) (sessão parada no modal, que o pool mediu em 2.1.291).
+Consequência: o Escape cura o caso em que a sessão está parada no MODAL; se a sessão estiver com o token antigo em memória e a tela só com a
+mensagem, o modal não existe, o VERIFY diz `NOT VERIFIED` e o Escape não ajuda — aí só reiniciar a sessão (fora do escopo: derrubaria o link
+de RC que a Fase 2 existe para preservar). O aceite ao vivo (esgotar uma conta de verdade e ver Mayor + crews responderem sozinhos) continua
+pendente e precisa do OK do Athos.
+
 ## Garantias
 - Nunca chama `claude`; custo de crédito zero (só o perfil, grátis). Nunca escreve no item hasheado do pool.
 - Token nunca em argv, ambiente, log, estado ou notificação.
@@ -58,6 +104,7 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
 
 ## Liga/desliga
 - Kill switch: `touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-crew-account` (ou `GC_CREW_ACCOUNT=0`).
+- Escape nas sessões presas no limite (ga-ci3uao): `touch /Users/athos/gt/.gascity-gastown-hq/.gc/crew-unstick-on` arma; apagar o arquivo (ou `GC_CREW_UNSTICK=0`) desarma. Nasce desarmado.
 - Ativação (humana, separada do merge): copiar `packs/town-deltas/assets/claude-crew-account.plist` para
   `~/Library/LaunchAgents` e `launchctl load`. Aceite ao vivo (trocar e voltar) só com OK do Athos.
 
@@ -81,7 +128,7 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
 - A conta terrenos não tem login completo guardado: precisa de re-login humano (ga-xknkke); NÃO logar sozinho.
 - 2ª etapa (reinício em momento ocioso se o RC cair) fora de escopo.
 
-Testes: `scripts/test_claude_crew_account.py` (80 testes, shim de `security`, servidor de perfil em loopback). O harness é
+Testes: `scripts/test_claude_crew_account.py` (140 testes, shim de `security`, servidor de perfil em loopback, `tmux` falso que registra cada argv e cada tecla). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).

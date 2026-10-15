@@ -475,7 +475,8 @@ in the selftest ever touches a real pane.
   only the refused calls are free. "No credit" in the Athos decision holds for what the switch itself does, not for this.
 - A limit modal already open in a live TUI does not notice the restored credential by itself (needs Esc): the daemon sends that
   Escape to pool sessions only, in the cycle of a switch - see "The Escape exception". Mayor and crew sessions on the modal are never
-  pressed (they are not on the pool item), and neither is a pool session the daemon cannot prove (can't tell = no key).
+  pressed BY THIS DAEMON (they are not on the pool item); `claude-crew-account.py` has its own Escape for them, OFF by default
+  (ga-ci3uao, docs/claude-crew-account.md). Neither is a pool session pressed that the daemon cannot prove (can't tell = no key).
   Only the account **switch** is cured this way: a session whose own account is still exhausted just meets the modal again.
 - The verdict comes from a 1-token call on `PROBE_MODEL`, the model the pool runs. Whether a window that limits only
   some models shows up in the `anthropic-ratelimit-unified-*` headers was not measured here. `PROBE_MODEL` is a model ID

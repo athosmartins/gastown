@@ -1,0 +1,476 @@
+#!/usr/bin/env -S python3 -I
+"""gc-session-ssh — provider de sessões do Gas City (protocolo `exec:`) que abre as sessões num host remoto por ssh, com a mesma
+interface das locais (start, stop, interrupt, is-running, peek, nudge, send-keys, list-running, process-alive, get-last-activity,
+meta, attach). ga-2hd02v.1.1, desenho do ga-ukxa3k, fatia 2. Python 3.9+, só biblioteca padrão.
+
+Contents
+  Uso · O que faz · O que NÃO faz · Configuração · Códigos de saída
+
+USO
+  GC_SESSION=exec:<cidade>/scripts/gc-session-ssh                (ou, no híbrido, `remote_exec` — patch em docs/pending-engine-window/)
+  gc-session-ssh <op> <sessão> [args]        o engine chama assim, com o JSON do start na entrada padrão
+  gc-session-ssh --dry-run start <sessão> < start.json     (ou GC_SSH_DRYRUN=1) imprime o que rodaria no host e NÃO conecta
+
+O QUE FAZ
+  Cada operação é UM ssh (ControlMaster em ~/.ssh/cm, o mesmo do mbp-run.sh) que leva um script sh pela entrada padrão; o
+  script usa um tmux em socket próprio (`tmux -L <socket>`), então só as sessões deste provider existem lá. A saída vem entre
+  marcadores: ruído de .bashrc não vira dado e resposta cortada é erro, não "lista vazia".
+  start: confere o teto do host (`cap`) e a existência NO MESMO script que abre a sessão, sob flock no mini; reescreve os caminhos do
+  mini para os do host com as MESMAS regras do remote-bundle-build.py (cidade → <remote_root>/city, ~/gt → <remote_root>/work, home →
+  remote_home, e <cidade>/.gc/settings.json → <remote_root>/city/settings.json, onde o bundle o instala); passa o comando como veio
+  (--settings, --dangerously-skip-permissions, --model, --remote-control...) mais o prompt de partida (prompt_suffix/prompt_flag do
+  JSON do start — campos que o patch do engine acrescenta); grava tudo num lançador temporário que se apaga ao rodar.
+  Falha de ssh = erro visível (stderr, exit 1, linha em <estado>/session-ssh.log) e nada pela metade; o mini não é tocado.
+  "Não sei" nunca vira resposta: se o ssh responde mas o tmux do host não consegue olhar (ex.: socket sem permissão), as operações sobre
+  sessões (todas, menos attach, que entrega o terminal ao tmux do host) saem com erro e o motivo — nunca `false`, lista vazia ou "há vaga". Sessão que não existe (tmux respondeu) segue o contrato do exec: stop,
+  interrupt, nudge, send-keys, clear-scrollback e get-last-activity saem 0 sem fazer nada; `stop` só sai 0 se a sessão sumiu.
+
+O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
+  pre_start, session_setup*, session_live, overlay/pack_overlay_dirs, copy_files, copy-to: NÃO executam nem copiam (seriam comandos e
+  arquivos do mini no servidor; as fatias .1.2/.1.3 decidem) — ficam registrados como "ignored". `nudge` do start também não é
+  entregue (o provider exec do engine tampouco; quem entrega é o Nudge depois do start). Env: só GC_*, TERM, LANG, LC_*, TZ, e o que
+  parece segredo (TOKEN, SECRET, PASSWORD, KEY...) não vai, a menos que o nome esteja em `env_allow` da config. check-image,
+  watch-startup, run-live e qualquer operação desconhecida: exit 2 ("não suportado"), sem tocar em sessão nenhuma.
+  Meta (set/get/remove-meta) fica no MINI (<estado>/meta): nada disso vai para o servidor.
+
+CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta acima de scripts/)
+  {"default_host": "hetzner", "hosts": {"hetzner": {"ssh": "hetzner-teste", "cap": 4,
+     "remote_root": "/home/runner/gt-remote/bundle", "remote_home": "/home/runner"}}}
+  obrigatórios: ssh (alias/destino), cap (teto de sessões deste host, contado SÓ no socket do provider, separado do teto do mini),
+  remote_root (= --remote-root do remote-bundle-build.py), remote_home. opcionais: socket (gc-remote), connect_timeout (10),
+  timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home. O host vem de $GC_SSH_HOST ou default_host:
+  um segundo host (o MBP, ga-w7qwl1) é outra entrada + outra instância do provider com GC_SSH_HOST. Estado no mini:
+  $GC_EXEC_STATE_DIR ou <cidade>/.gc/runtime/session-ssh, sempre em <estado>/<host>/. Não há padrão para o cap: sem ele não abre sessão.
+
+CÓDIGOS  0 ok · 1 erro (mensagem em stderr; "already exists" no start vira ErrSessionExists no engine) · 2 operação não suportada
+"""
+from __future__ import annotations
+
+import base64
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+NAME_RE = re.compile(r"[A-Za-z0-9_-]+")  # o mesmo conjunto que o tmux local aceita (validSessionNameRe do engine): vai para shell
+KEY_RE = re.compile(r"[A-Za-z0-9_.-]+")
+PATH_RE = re.compile(r"/[A-Za-z0-9_./+-]+")  # caminho remoto da config: absoluto, sem espaço nem aspas (entra em script de shell)
+HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]*")
+ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ENV_OK = re.compile(r"GC_[A-Z0-9_]+|TERM|LANG|LC_[A-Z_]+|TZ")
+SECRETISH = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIVATE", re.I)
+IGNORED = ("pre_start", "session_setup", "session_setup_script", "session_live", "pack_overlay_dirs", "overlay_dir", "copy_files", "nudge")
+BEGIN, END = "@@GC-BEGIN@@", "@@GC-END@@"
+EX_CAP, EX_EXISTS = 10, 11
+# o ssh leva `sh -c '<RUNNER>'` (uma string, qualquer shell de login a entende) e o script vai pela entrada padrão: não há limite de
+# argv (o prompt tem dezenas de KB) e o script lê a entrada inteira ANTES de rodar, então comando nenhum dele a come.
+RUNNER = 'umask 077; f=$(mktemp) || exit 125; cat >"$f"; sh "$f" </dev/null; rc=$?; rm -f "$f"; exit $rc'
+PRELUDE = r"""PATH="$HOME/.local/bin:$HOME/go/bin:/usr/local/bin:$PATH"; export PATH
+T() { tmux -L @SOCK@ "$@"; }
+sessions() { o=$(T list-sessions -F '#{session_name}' 2>&1) && { [ -z "$o" ] || printf '%s\n' "$o"; return 0; }
+  case "$o" in *"no server running"*|*"error connecting to"*"(No such file or directory)"*) return 0;; esac; printf '%s\n' "$o" >&2; return 1; }
+has() { s=$(sessions) || return 2; printf '%s\n' "$s" | grep -qxF -- "$1"; }
+live() { has "$1"; r=$?; [ "$r" -ne 1 ] || exit 0; [ "$r" -eq 0 ] || exit 1; }
+tree() { ps -e -o pid= -o ppid= | awk -v r="$1" '{p[$1]=$2} END{for(i in p){q=i;while(q!=""&&q!=0&&q!=1){if(q==r){print i;break};q=p[q]}}}'; }
+hasproc() { ps -e -o pid= -o ppid= -o args= | awk -v r="$1" -v want="$2" 'BEGIN{n=split(want,w,",");for(i=1;i<=n;i++)W[w[i]]=1}
+  {p[$1]=$2;a=$3;sub(/.*\//,"",a);A[$1]=a} END{for(i in p){q=i;while(q!=""&&q!=0&&q!=1){if(q==r){if(A[i] in W)f=1;break};q=p[q]}} print f?"true":"false"}'; }
+echo @@GC-BEGIN@@
+(
+command -v tmux >/dev/null 2>&1 || { echo "tmux não está instalado no host" >&2; exit 127; }
+"""
+q = shlex.quote
+
+
+class Fail(Exception):
+    """Erro esperado: a mensagem vai para stderr, exit 1 (o engine a mostra no erro da operação)."""
+
+
+class Cfg:
+    def __init__(self) -> None:
+        self.city_guess = os.path.dirname(os.path.dirname(os.path.realpath(sys.argv[0])))
+        path = os.environ.get("GC_SSH_CONFIG") or os.path.join(self.city_guess, ".gc", "session-ssh.json")
+        try:
+            with open(path) as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            raise Fail(f"sem configuração: {path} não existe (ver docs/runbooks/gc-session-ssh.md)")
+        except (OSError, ValueError) as e:
+            raise Fail(f"configuração ilegível em {path}: {e}")
+        raw = raw if isinstance(raw, dict) else {}
+        self.host = os.environ.get("GC_SSH_HOST") or raw.get("default_host")
+        h = (raw.get("hosts") or {}).get(self.host) if isinstance(raw.get("hosts"), dict) else None
+        if not isinstance(h, dict):
+            raise Fail(f"host {self.host!r} não está em {path}")
+        self.ssh = self.need(h, "ssh", HOST_RE)
+        self.root = self.need(h, "remote_root", PATH_RE).rstrip("/")
+        self.home = self.need(h, "remote_home", PATH_RE).rstrip("/")
+        self.socket = self.need(h, "socket", NAME_RE, "gc-remote")
+        cap = h.get("cap")
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+            raise Fail(f"host {self.host}: 'cap' (teto de sessões) ausente ou inválido — sem teto não abre sessão")
+        self.cap = cap
+        self.timeout, self.start_timeout, self.connect_timeout = (self.num(h, k, d) for k, d in
+                                                                  (("timeout", 25), ("start_timeout", 60), ("connect_timeout", 10)))
+        self.ssh_opts = [str(x) for x in h.get("ssh_opts") or []]
+        self.env_allow = set(h.get("env_allow") or [])
+        self.mini_home = os.path.realpath(h.get("mini_home") or os.path.expanduser("~"))
+        base = os.environ.get("GC_EXEC_STATE_DIR") or os.path.join(self.city_guess, ".gc", "runtime", "session-ssh")
+        self.state = os.path.join(base, re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.host)))
+
+    def need(self, h: dict, key: str, rx: re.Pattern, default: str = "") -> str:
+        v = h.get(key, default)
+        if not isinstance(v, str) or not rx.fullmatch(v) or v in ("/", "") or v.startswith("-"):
+            raise Fail(f"host {self.host}: '{key}' ausente ou inválido ({v!r})")
+        return v
+
+    def num(self, h: dict, key: str, default: int) -> int:
+        v = h.get(key, default)
+        if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 600:
+            raise Fail(f"host {self.host}: '{key}' tem que ser um inteiro de 1 a 600 ({v!r})")
+        return v
+
+    def mkstate(self, *sub: str) -> str:
+        d = os.path.join(self.state, *sub)
+        os.makedirs(d, 0o700, exist_ok=True)
+        return d
+
+    def log(self, msg: str) -> None:
+        try:
+            with open(os.path.join(self.mkstate(), "session-ssh.log"), "a") as f:
+                f.write(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {self.host} {msg}\n")
+        except OSError:
+            pass  # o log é auxiliar: falhar em gravá-lo não pode virar falha da operação
+
+
+# ---------- transporte ----------
+
+def ssh_argv(cfg: Cfg, tty: bool = False) -> list:
+    a = [os.environ.get("GC_SSH_BIN") or "ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={cfg.connect_timeout}",
+         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]
+    cm = os.path.join(os.path.expanduser("~"), ".ssh", "cm")  # o mesmo ControlPath do mbp-run.sh: a conexão é reaproveitada
+    try:
+        os.makedirs(cm, 0o700, exist_ok=True)
+        a += ["-o", "ControlMaster=auto", "-o", f"ControlPath={cm}/%C", "-o", "ControlPersist=600"]
+    except OSError:
+        pass  # sem multiplexar ainda funciona, só mais devagar
+    return a + (["-t"] if tty else []) + cfg.ssh_opts + [cfg.ssh]
+
+
+def remote(cfg: Cfg, body: str, timeout: int = 0, dry: bool = False) -> tuple:
+    """Roda `body` (sh) no host e devolve (rc, saída entre marcadores, stderr). ssh que falha ou não responde → Fail."""
+    script = PRELUDE.replace("@SOCK@", q(cfg.socket)) + body + f"\n)\nrc=$?\necho {END}\nexit $rc\n"
+    argv = ssh_argv(cfg) + ["sh -c " + q(RUNNER)]
+    if dry:
+        print(json.dumps({"ssh": argv, "script": script}, indent=2))
+        return 0, "", ""
+    t = timeout or cfg.timeout
+    try:
+        p = subprocess.run(argv, input=script.encode(), capture_output=True, timeout=t)
+    except subprocess.TimeoutExpired:
+        raise Fail(f"host {cfg.host} ({cfg.ssh}) não respondeu em {t}s por ssh")
+    except OSError as e:
+        raise Fail(f"não consegui rodar ssh: {e}")
+    err = p.stderr.decode("utf-8", "replace").strip()
+    if p.returncode == 255:
+        raise Fail(f"ssh para o host {cfg.host} ({cfg.ssh}) falhou: {err or 'sem mensagem'}")
+    lines = p.stdout.decode("utf-8", "replace").split("\n")
+    if BEGIN not in lines or END not in lines:
+        raise Fail(f"resposta de {cfg.host} sem marcadores (rc={p.returncode}): {err or 'sem mensagem'}")
+    return p.returncode, "\n".join(lines[lines.index(BEGIN) + 1:len(lines) - 1 - lines[::-1].index(END)]), err
+
+
+def run(cfg: Cfg, what: str, body: str, dry: bool, timeout: int = 0, ok: tuple = (0,)) -> tuple:
+    rc, out, err = remote(cfg, body, timeout, dry)
+    if rc not in ok:
+        raise Fail(f"{what} em {cfg.host} falhou (rc={rc}): {err or out or 'sem mensagem'}")
+    return rc, out, err
+
+
+def tgt(name: str) -> str:
+    return q("=" + name)  # sessão pelo nome EXATO (sem o '=' o tmux casa por prefixo)
+
+
+def ptgt(name: str) -> str:
+    return q("=" + name + ":")  # idem para alvo de painel/janela: '=nome' sozinho não resolve ("can't find pane"), '=nome:' sim
+
+
+def check_name(name: str) -> str:
+    if not NAME_RE.fullmatch(name or ""):
+        raise Fail(f"nome de sessão inválido: {name!r}")
+    return name
+
+
+# ---------- start ----------
+
+class Mapper:
+    """As regras de caminho do remote-bundle-build.py (mesma fronteira nos dois lados), mais o arquivo de --settings da cidade."""
+
+    def __init__(self, cfg: Cfg, city: str) -> None:
+        cities = list(dict.fromkeys([city, os.path.realpath(city)]))
+        self.rules = [(f"{c}/.gc/settings.json", cfg.root + "/city/settings.json") for c in cities]
+        for c in cities:
+            self.rules += [(c, cfg.root + "/city"), (os.path.dirname(c), cfg.root + "/work")]
+        self.rules.append((cfg.mini_home, cfg.home))
+
+    def map(self, s: str) -> str:
+        for old, new in self.rules:
+            s = re.sub(r"(?<![\w.-])" + re.escape(old) + r"(?![\w.-])", lambda _m, new=new: new, s)
+        return s
+
+
+def plan_start(cfg: Cfg, name: str, req: dict) -> dict:
+    env_in = req.get("env") or {}
+    if not isinstance(env_in, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env_in.items()):
+        raise Fail("start: 'env' tem que ser um objeto de strings")
+    for k in ("work_dir", "command", "prompt_suffix", "prompt_flag"):
+        if not isinstance(req.get(k) or "", str):
+            raise Fail(f"start: '{k}' tem que ser texto")
+    m = Mapper(cfg, env_in.get("GC_CITY") or os.environ.get("GC_CITY") or cfg.city_guess)
+    workdir = m.map(req.get("work_dir") or "") or cfg.home
+    command = m.map(req.get("command") or "")
+    if not command.strip():
+        raise Fail("start sem command")
+    env, dropped = {}, []
+    for k in sorted(env_in):
+        if not ENV_KEY.fullmatch(k) or not ENV_OK.fullmatch(k) or (SECRETISH.search(k) and k not in cfg.env_allow):
+            dropped.append(k)
+        else:
+            env[k] = m.map(env_in[k])
+    for what, v in [("work_dir", workdir), ("command", command)] + [(f"env {k}", v) for k, v in env.items()]:
+        if "/Users/" in v:  # o caminho do mini não existe no host: recusa em vez de abrir uma sessão que cairia no primeiro uso
+            raise Fail(f"start recusado: {what} ainda tem caminho do mini depois da reescrita: {v[:120]!r}")
+    suffix, flag = m.map(req.get("prompt_suffix") or ""), req.get("prompt_flag") or ""
+    line = command + (f" {flag} {suffix}" if flag and suffix else f" {suffix}" if suffix else "")
+    return {"work_dir": workdir, "command": line, "env": env, "env_dropped": dropped,
+            "ignored": [k for k in IGNORED if req.get(k)], "cap": cfg.cap, "socket": cfg.socket}
+
+
+def launcher(cfg: Cfg, name: str, p: dict) -> str:
+    exitf = f"{cfg.root}/run/{name}.exit"
+    try:
+        first = (shlex.split(p["command"]) or [""])[0]
+    except ValueError:  # aspas que não fecham: o sh do host é quem vai dizer; só não há o que conferir antes
+        first = ""
+    out = ["#!/bin/sh", 'rm -f -- "$0"', f"cd {q(p['work_dir'])} || exit 1"]
+    out += [f"unset {k}" if v == "" else f"export {k}={q(v)}" for k, v in p["env"].items()]
+    if first and "=" not in first and first not in ("env", "exec"):
+        out.append(f'command -v {q(first)} >/dev/null 2>&1 || {{ echo "comando não encontrado: "{q(first)} >{q(exitf)}; exit 127; }}')
+    return "\n".join(out + [f"sh -c {q(p['command'])}", "rc=$?", f'[ "$rc" -eq 0 ] || echo "saiu com $rc" >{q(exitf)}', 'exit "$rc"']) + "\n"
+
+
+def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except ValueError as e:
+        raise Fail(f"start: JSON inválido na entrada: {e}")
+    if not isinstance(req, dict):
+        raise Fail("start: a entrada tem que ser um objeto JSON")
+    p = plan_start(cfg, name, req)
+    run_dir, exitf = f"{cfg.root}/run", f"{cfg.root}/run/{name}.exit"
+    lpath = f"{run_dir}/{name}.sh"
+    if dry:
+        print(json.dumps(dict(p, host=cfg.host, session=name, launcher=launcher(cfg, name, p).split("\n"),
+                              tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
+                              ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
+        return 0
+    body = """s=$(sessions) || exit 1
+printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
+n=$(printf '%s\\n' "$s" | grep -c .)
+[ "$n" -lt @CAP@ ] || { echo "host @HOST@ está no teto: $n de @CAP@ sessões" >&2; exit 10; }
+mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
+rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1
+T new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" || { rm -f @LAUNCH@; exit 1; }
+sleep 1
+T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@; exit 1; }"""
+    for k, v in {"@NAME@": q(name), "@CAP@": str(cfg.cap), "@HOST@": q(cfg.host), "@RUN@": q(run_dir), "@WORKDIR@": q(p["work_dir"]),
+                 "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name),
+                 "@B64@": q(base64.b64encode(launcher(cfg, name, p).encode()).decode())}.items():
+        body = body.replace(k, v)
+    with open(os.path.join(cfg.mkstate(), "lock"), "a") as lf:  # cap + criação são um passo só; entre processos do mini, um por vez
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        rc, out, err = remote(cfg, body, cfg.start_timeout)
+    if rc == EX_CAP or rc == EX_EXISTS:
+        raise Fail(err or f"start de {name} recusado em {cfg.host} (rc={rc}, sem mensagem)")
+    if rc != 0:
+        raise Fail(f"start em {cfg.host} falhou (rc={rc}): {err or out or 'sem mensagem'}")
+    cfg.log(f"start {name} ok" + (f" ignored={','.join(p['ignored'])}" if p["ignored"] else "") +
+            (f" env_dropped={','.join(p['env_dropped'])}" if p["env_dropped"] else ""))
+    return 0
+
+
+# ---------- as demais operações ----------
+
+def op_stop(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    body = """has @NAME@; [ $? -ne 2 ] || exit 1
+pp=$(T list-panes -t @PTGT@ -F '#{pane_pid}' 2>/dev/null | head -1); pids=
+[ -z "$pp" ] || pids=$(tree "$pp")
+T kill-session -t @TGT@ 2>/dev/null
+if [ -n "$pids" ]; then kill -TERM $pids 2>/dev/null; sleep 1; kill -KILL $pids 2>/dev/null; fi
+rm -f @RUN@/@NAME@.sh @RUN@/@NAME@.exit
+has @NAME@; [ $? -eq 1 ] || { echo "sessão @NAME@ continua aberta depois do stop" >&2; exit 1; }""".replace("@TGT@", tgt(name)).replace("@PTGT@", ptgt(name)).replace("@RUN@", q(cfg.root + "/run")).replace("@NAME@", name)
+    run(cfg, "stop", body, dry)
+    if not dry:
+        meta_clear(cfg, name)
+    return 0
+
+
+def op_interrupt(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    run(cfg, "interrupt", f"live {q(name)}; T send-keys -t {ptgt(name)} C-c 2>/dev/null; exit 0", dry)
+    return 0
+
+
+def op_is_running(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    # false = o tmux do host respondeu e a sessão não está na lista; tmux que não conseguiu olhar (has → 2) é erro, nunca "false"
+    print(run(cfg, "is-running", f"has {q(name)}; case $? in 0) echo true;; 1) echo false;; *) exit 1;; esac", dry)[1])
+    return 0
+
+
+def op_process_alive(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    names = [n for n in sys.stdin.read().split() if re.fullmatch(r"[A-Za-z0-9._+-]+", n)]
+    if not names:
+        print("true")  # contrato do engine: sem nomes, vale
+        return 0
+    body = (f"has {q(name)}; r=$?; [ \"$r\" -ne 1 ] || {{ echo false; exit 0; }}; [ \"$r\" -eq 0 ] || exit 1\n"  # tmux sem resposta = erro, não "false"
+            f"pp=$(T list-panes -t {ptgt(name)} -F '#{{pane_pid}}' 2>/dev/null | head -1); [ -n \"$pp\" ] || {{ echo false; exit 0; }}\n"
+            f"hasproc \"$pp\" {q(','.join(names))}")
+    print(run(cfg, "process-alive", body, dry)[1])
+    return 0
+
+
+def op_nudge(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    text = sys.stdin.buffer.read()
+    if not text:
+        return 0
+    b = f"{cfg.socket}-{name}"
+    body = (f"live {q(name)}\nprintf %s {q(base64.b64encode(text).decode())} | base64 -d | T load-buffer -b {q(b)} - || exit 1\n"
+            f"T paste-buffer -d -p -b {q(b)} -t {ptgt(name)} || exit 1\nsleep 0.3; T send-keys -t {ptgt(name)} Enter")
+    run(cfg, "nudge", body, dry)
+    return 0
+
+
+def op_send_keys(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    if args:
+        run(cfg, "send-keys", f"live {q(name)}; for k in {' '.join(q(k) for k in args)}; do T send-keys -t {ptgt(name)} -- \"$k\" 2>/dev/null; done; exit 0", dry)
+    return 0
+
+
+def op_peek(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    n = int(args[0]) if args and re.fullmatch(r"-?\d+", args[0]) else 0
+    print(run(cfg, "peek", f"T capture-pane -p -t {ptgt(name)} -S {-n if n > 0 else '-'}", dry)[1])
+    return 0
+
+
+def op_list_running(cfg: Cfg, prefix: str, args: list, dry: bool) -> int:
+    if not re.fullmatch(r"[A-Za-z0-9_-]*", prefix or ""):
+        raise Fail(f"prefixo inválido: {prefix!r}")
+    _, out, _ = run(cfg, "list-running", "sessions", dry)  # falha de ssh = erro (o engine trata como lista parcial), nunca "vazio"
+    for s in out.split("\n"):
+        if s and s.startswith(prefix):
+            print(s)
+    return 0
+
+
+def op_last_activity(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    out = run(cfg, "get-last-activity", f"live {q(name)}; T display-message -p -t {ptgt(name)} '#{{session_activity}}' 2>/dev/null; exit 0", dry)[1].strip()
+    if out.isdigit():
+        print(datetime.fromtimestamp(int(out), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    return 0
+
+
+def op_clear_scrollback(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    run(cfg, "clear-scrollback", f"live {q(name)}; T clear-history -t {ptgt(name)} 2>/dev/null; exit 0", dry)
+    return 0
+
+
+def op_attach(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    argv = ssh_argv(cfg, tty=True) + [f"tmux -L {q(cfg.socket)} attach-session -t {tgt(name)}"]
+    if dry:
+        print(json.dumps(argv))
+        return 0
+    os.execvp(argv[0], argv)
+    return 1
+
+
+# ---------- meta (no mini; nada disto vai para o servidor) ----------
+
+def meta_file(cfg: Cfg, name: str, key: str) -> str:
+    if not KEY_RE.fullmatch(key or ""):
+        raise Fail(f"chave de meta inválida: {key!r}")
+    return os.path.join(cfg.state, "meta", name, key)
+
+
+def meta_clear(cfg: Cfg, name: str) -> None:
+    d = os.path.join(cfg.state, "meta", name)
+    try:
+        for f in os.listdir(d):
+            os.unlink(os.path.join(d, f))
+        os.rmdir(d)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise Fail(f"não consegui limpar o meta de {name}: {e}")
+
+
+def op_set_meta(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    path = meta_file(cfg, name, args[0] if args else "")
+    cfg.mkstate("meta", name)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(sys.stdin.read())
+    os.replace(tmp, path)
+    return 0
+
+
+def op_get_meta(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    try:
+        with open(meta_file(cfg, name, args[0] if args else "")) as f:
+            sys.stdout.write(f.read())
+    except FileNotFoundError:
+        pass  # chave ausente = vazio, como nos outros providers
+    return 0
+
+
+def op_remove_meta(cfg: Cfg, name: str, args: list, dry: bool) -> int:
+    try:
+        os.unlink(meta_file(cfg, name, args[0] if args else ""))
+    except FileNotFoundError:
+        pass
+    return 0
+
+
+# Só estas operações existem. As que o protocolo conhece e este provider NÃO serve (check-image, copy-to, watch-startup, run-live) e as
+# desconhecidas caem fora daqui e saem com 2 ("não suportado") sem abrir ssh, sem ler a entrada, sem tocar em sessão.
+OPS = {"start": op_start, "stop": op_stop, "interrupt": op_interrupt, "is-running": op_is_running, "process-alive": op_process_alive,
+       "nudge": op_nudge, "send-keys": op_send_keys, "peek": op_peek, "list-running": op_list_running, "get-last-activity": op_last_activity,
+       "clear-scrollback": op_clear_scrollback, "attach": op_attach, "set-meta": op_set_meta, "get-meta": op_get_meta,
+       "remove-meta": op_remove_meta}
+NAMELESS = {"list-running"}  # o 2º argumento é um prefixo, não um nome de sessão
+
+
+def main(argv: list) -> int:
+    args = argv[1:]
+    dry = bool(args and args[0] == "--dry-run") or os.environ.get("GC_SSH_DRYRUN") == "1"
+    args = args[1:] if args and args[0] == "--dry-run" else args
+    if not args or args[0] not in OPS:
+        return 2
+    op, rest = args[0], args[1:]
+    try:
+        cfg = Cfg()
+        if op not in NAMELESS:
+            check_name(rest[0] if rest else "")
+        return OPS[op](cfg, rest[0] if rest else "", rest[1:], dry)
+    except Fail as e:
+        sys.stderr.write(f"gc-session-ssh {op}: {e}\n")
+        try:
+            Cfg().log(f"{op} {rest[0] if rest else ''} FALHOU: {e}")
+        except Fail:
+            pass
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
