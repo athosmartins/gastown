@@ -13,7 +13,7 @@ PARA QUE SERVE
 COMO DECIDE (a medição é a evidência; a decisão é da política, que o plano confere contra a medição a cada execução)
   escopo   label com.gascity.* ou com.gastown.* cujo programa NÃO vive na árvore de outro rig (esses viram bead no rig dele). RunAtLoad=true.
   medição  LÊ = o programa tem uma CHAMADA a bd/gc/dolt (posição de comando, ou subprocess ["bd", ...]; linha de log/comentário não conta) · TALVEZ = só menção solta ·
-           NÃO ACHEI = programa legível sem menção · ILEGÍVEL = não consegui ler o programa. Segue o programa e os .sh/.py com caminho absoluto dentro de um `-c`; NÃO segue
+           NÃO ACHEI = programa legível sem menção · ILEGÍVEL = não consegui ler o programa (inclui script executado direto ou citado no `-c` que não existe). Segue o programa e os .sh/.py com caminho absoluto dentro de um `-c`; NÃO segue
            script chamado por script (um job que lê o Dolt por dentro de outro script aparece como TALVEZ/NÃO ACHEI, e ficar sem wrapper é o comportamento de hoje).
   política wrap (embrulha) · isento (precisa rodar com o Dolt fora, ou tem ato útil que não precisa dele, ou é KeepAlive) · nao-medido (sem leitura medida). Na dúvida: isento.
 
@@ -140,15 +140,18 @@ def measure(args):
         return "ILEGIVEL", "ProgramArguments vazio"
     if os.path.basename(args[0]) in CLIS:
         return "LE", "(programa) " + " ".join(args)[:100]
-    paths, srcs = [], []
+    named, srcs = [], []   # named = script que o job executa direto (shebang) ou cita no `-c`: ausente/ilegível = não sei, nunca "sem menção"
+    if args[0].startswith("/") and args[0].endswith((".sh", ".py")):   # GUARD:direct-exec
+        named.append(args[0])
     if len(args) >= 3 and os.path.basename(args[0]) in SHELLS and args[1] == "-c":
         inline = " ".join(args[2:])
         srcs.append(("(inline)", inline))
-        paths += INLINE_PATH.findall(inline)
-    paths += [a for a in args[1:] if a.startswith("/")]
+        named += INLINE_PATH.findall(inline)
+    paths = named + [a for a in args[1:] if a.startswith("/")]   # o resto dos argumentos com `/` pode ser diretório/dado: ausente aí não conta
     unreadable = 0
     for p in dict.fromkeys(paths):
         if not os.path.isfile(p):
+            unreadable += p in named   # GUARD:named-missing
             continue
         text = read_text(p)
         if text is None:

@@ -70,7 +70,7 @@ com.gascity.supervisor-restart-watchdog	nao-medido	nenhuma menção a bd/gc/dolt
 com.gascity.wa-beads-config-guard	nao-medido	nenhuma menção a bd/gc/dolt no programa. KeepAlive
 com.gascity.wa-root-main-guard	nao-medido	nenhuma menção a bd/gc/dolt no programa
 com.gascity.worktree-reaper	nao-medido	só `command -v gc`; nenhuma chamada a bd/gc achada (a LÊ anterior era texto de mensagem jq)
-com.gastown.bw-serve	nao-medido	sem arquivo de programa legível (servidor do Bitwarden); nenhuma chamada a bd/gc/dolt achada. KeepAlive
+com.gastown.bw-serve	nao-medido	script executado direto (servidor do Bitwarden), lido: nenhuma menção a bd/gc/dolt. KeepAlive
 com.gastown.drive-pressure-monitor	nao-medido	nenhuma menção a bd/gc/dolt no programa
 com.gastown.git-maintenance-runner	nao-medido	só cita gc de git em comentário; nenhuma chamada a bd/gc/dolt achada
 com.gastown.machine-health-reporter	nao-medido	nenhuma menção a bd/gc/dolt no programa

@@ -21,17 +21,17 @@ python3 -I $GC_CITY_PATH/scripts/wait-for-dolt-plan.py --apply --only com.gascit
 python3 -I $GC_CITY_PATH/scripts/wait-for-dolt-plan.py --revert [--only LABEL]
 ```
 
-Lê `~/Library/LaunchAgents` (o que roda, não o repositório). Nunca chama `launchctl`. Selftest: `python3 -I scripts/wait-for-dolt-plan.selftest.py` (12 cenários + 14 mutantes). Decisões em `scripts/wait-for-dolt.policy.tsv` (`label<TAB>decisão<TAB>motivo`); o plano as confere contra a medição a cada execução.
+Lê `~/Library/LaunchAgents` (o que roda, não o repositório). Nunca chama `launchctl`. Selftest: `python3 -I scripts/wait-for-dolt-plan.selftest.py` (12 cenários + 16 mutantes). Decisões em `scripts/wait-for-dolt.policy.tsv` (`label<TAB>decisão<TAB>motivo`); o plano as confere contra a medição a cada execução.
 
 * **Escopo**: label `com.gascity.*` ou `com.gastown.*`, `RunAtLoad`, programa fora da árvore de outro rig (esses viram bead no rig dele).
-* **Medição** (evidência `arquivo:linha`): LÊ = o programa CHAMA `bd`/`gc`/`dolt` (posição de comando ou `subprocess`); mensagem de log, `jq`, comentário e texto entre aspas não contam (um casamento por texto marcou o `worktree-reaper` como LÊ por causa de uma mensagem do jq; o leitor sabe distinguir aspas e agora ele é TALVEZ). TALVEZ = só menção solta; NÃO ACHEI; ILEGÍVEL.
+* **Medição** (evidência `arquivo:linha`): LÊ = o programa CHAMA `bd`/`gc`/`dolt` (posição de comando ou `subprocess`); mensagem de log, `jq`, comentário e texto entre aspas não contam (um casamento por texto marcou o `worktree-reaper` como LÊ por causa de uma mensagem do jq; o leitor sabe distinguir aspas e agora ele é TALVEZ). TALVEZ = só menção solta; NÃO ACHEI = programa lido, sem menção; ILEGÍVEL = não consegui ler (inclui o script executado direto ou citado no `-c` que não existe: nunca vira NÃO ACHEI).
 * **`wrap`**: o job só AVALIA dado de bead/sessão (varre, zela, reapa, mede fila). Sem Dolt não há o que avaliar, e uma leitura vazia ou com erro no boot é o risco que o wrapper tira.
 * **`isento`**: (a) KeepAlive: o launchd relança sozinho, e o wrapper trocaria o respawn por uma espera de até o prazo; (b) ciclo de vida ou observador do Dolt (precisa rodar com o Dolt fora); (c) alarme/monitor de recurso com ato útil que não precisa do Dolt. **Na dúvida: isento** (= comportamento de hoje).
 * **`nao-medido`**: nenhuma chamada a `bd`/`gc`/`dolt` achada no programa. Não segue script chamado por script.
 
 ## Retrato medido em 16/10/2026
 
-455 plists, 248 com `RunAtLoad`, **74 no escopo HQ** (174 fora: outro rig ou outro label). Medido: LÊ=46 · TALVEZ=8 · NÃO ACHEI=18 · ILEGÍVEL=2. Política: **wrap=19** (20 linhas: um job está em 2 arquivos), **isento=30** (15 KeepAlive/ciclo de vida, 5 observadores do Dolt, 10 alarmes/monitores), **nao-medido=24**. Todos os 19 a embrulhar disparam por `StartInterval` (`I`), nenhum é KeepAlive.
+455 plists, 248 com `RunAtLoad`, **74 no escopo HQ** (174 fora: outro rig ou outro label). Medido: LÊ=46 · TALVEZ=8 · NÃO ACHEI=19 · ILEGÍVEL=1. Política: **wrap=19** (20 linhas: um job está em 2 arquivos), **isento=30** (15 KeepAlive/ciclo de vida, 5 observadores do Dolt, 10 alarmes/monitores), **nao-medido=24**. Todos os 19 a embrulhar disparam por `StartInterval` (`I`), nenhum é KeepAlive.
 
 | Job (com.gascity.) | Disparo | Chamada medida | Linhas de chamada |
 |---|---|---|---|

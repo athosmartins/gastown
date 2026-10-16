@@ -5,7 +5,7 @@ Não lê o ~/Library/LaunchAgents, não chama launchctl.
 Contents
   Casos · Controle negativo (mutantes) · Variáveis
 
-CASOS: plano é SÓ LEITURA (checksum da pasta não muda) e a medição separa chamada de texto (echo/log/jq/comentário/aspas ≠ LÊ) · escopo (label de fora, programa na árvore de outro
+CASOS: plano é SÓ LEITURA (checksum da pasta não muda) e a medição separa chamada de texto (echo/log/jq/comentário/aspas ≠ LÊ), lê o script executado direto e trata script citado que não existe como ILEGÍVEL · escopo (label de fora, programa na árvore de outro
   rig, RunAtLoad=false) · plist ilegível listado · plist que o expat recusa e o plutil aceita · --apply: ProgramArguments novo exato, demais chaves e a ordem delas preservadas, o que não é
   wrap fica byte a byte igual, backup byte a byte do original, idempotente (2ª vez não embrulha de novo) · --revert devolve o original e é idempotente · RECUSAS (nada é escrito): divergência,
   wrapper ausente/não executável/com sintaxe ruim, wrap em KeepAlive, wrap sem chamada medida, label em 2 arquivos · plist symlink / com chave Program / que o plutil -lint recusa não são
@@ -48,6 +48,7 @@ PROGRAMS = {
     "e.sh": '#!/bin/bash\nx=$(timeout 20 gc rig list --json)\n',
     "k.sh": '#!/bin/bash\n"$GC" nudge x\n',
     "n.sh": '#!/bin/bash\ndf -h\n',
+    "m.sh": '#!/bin/bash\nbd list --json >/dev/null 2>&1\n',
 }
 for name, body in PROGRAMS.items():
     open(f"{PROG}/{name}", "w").write(body)
@@ -72,6 +73,8 @@ def fixture(name):
     plist(d, "com.gascity.inline-e", ["/bin/bash", "-c", f"{PROG}/e.sh && echo done"], StartInterval=120)
     plist(d, "com.gascity.noprog-i", ["/bin/true"], StartInterval=60)
     plist(d, "com.gascity.nolook-n", ["/bin/bash", f"{PROG}/n.sh"], StartInterval=60)
+    plist(d, "com.gascity.direct-p", [f"{PROG}/m.sh"], StartInterval=60)
+    plist(d, "com.gascity.gone-q", ["/bin/bash", "-c", f"{PROG}/nao-existe.sh && echo done"], StartInterval=60)
     plist(d, "com.other.f", ["/bin/bash", f"{PROG}/a.sh"], StartInterval=60)
     plist(d, "com.gascity.otherrig-g", ["/bin/bash", f"{ROOT}/otherrig/scripts/x.sh"], StartInterval=60)
     plist(d, "com.gascity.norun-h", ["/bin/bash", f"{PROG}/a.sh"], RunAtLoad=False)
@@ -89,6 +92,8 @@ com.gascity.keepalive-c\tisento\tKeepAlive
 com.gascity.logonly-b\tnao-medido\tb
 com.gascity.noprog-i\tnao-medido\ti
 com.gascity.nolook-n\tnao-medido\tn
+com.gascity.direct-p\tnao-medido\tp
+com.gascity.gone-q\tnao-medido\tq
 """
 WRAP_LABELS = ["reaper-a", "py-d", "inline-e", "lenient-k"]
 _n = [0]
@@ -126,9 +131,10 @@ def prog_of(d, label):
 def c_plan_readonly():
     d = fixture("plan"); before = snap(d)
     rc, out, _ = run([], d)
-    return (rc == 0 and snap(d) == before and "medido (escopo HQ): LE=5 · TALVEZ=1 · NAO-ACHEI=1 · ILEGIVEL=1" in out and "garbage.plist" in out
+    return (rc == 0 and snap(d) == before and "medido (escopo HQ): LE=6 · TALVEZ=1 · NAO-ACHEI=1 · ILEGIVEL=2" in out and "garbage.plist" in out
             and out.count("A EMBRULHAR") == 4 and "com.other.f" in out.split("== FORA DO ESCOPO")[1] and "otherrig-g" in out.split("== FORA DO ESCOPO")[1]
-            and "norun-h" not in out and "política: wrap=4 · isento=1 · nao-medido=3 · embrulhados hoje: 0 de 4" in out)
+            and "norun-h" not in out and "política: wrap=4 · isento=1 · nao-medido=5 · embrulhados hoje: 0 de 4" in out
+            and "direct-p [LE]" in out and "gone-q [ILEGIVEL]" in out)
 
 
 def c_apply_revert():
@@ -248,7 +254,7 @@ def c_wrapper_gone():
 
 
 SUITE = [
-    (c_plan_readonly, "plano é só leitura; medição separa chamada de texto (b.sh = TALVEZ); escopo; ilegível; plutil; contagens"),
+    (c_plan_readonly, "plano é só leitura; medição separa chamada de texto (b.sh = TALVEZ); script direto é lido; script citado e ausente = ILEGÍVEL; escopo; ilegível; plutil; contagens"),
     (c_apply_revert, "--apply exato + chaves/ordem + backup byte a byte + idempotente; --revert devolve o original e é idempotente"),
     (c_refuse_divergence, "job fora da política → exit 1 e --apply recusa sem escrever nada"),
     (c_refuse_wrapper, "wrapper ausente / não executável / sintaxe ruim → exit 4 sem escrever nada"),
@@ -275,6 +281,8 @@ MUTANTS = [   # (nome, expressão sed, cenário)
     ("label-duplicado-passa", "/GUARD:dup-label/ s/if len(fs) > 1:/if False:/", c_duplicate_label),
     ("only-desconhecido-passa", "/GUARD:only-unknown/ s/if .*:   # GUARD/if False:   # GUARD/", c_only_canary),
     ("wrapper-sumido-passa", "/GUARD:wrapper-missing-div/ s/if wrapped and not (.*):/if False:/", c_wrapper_gone),
+    ("direto-nao-e-lido", "/GUARD:direct-exec/ s/if args\\[0\\]/if False and args[0]/", c_plan_readonly),
+    ("citado-ausente-vira-sem-mencao", "/GUARD:named-missing/ s/unreadable += p in named/pass/", c_plan_readonly),
     ("revert-erra-o-corte", "/GUARD:inner-strip/ s/args.index(\"--\") + 1:/args.index(\"--\"):/", c_apply_revert),
 ]
 
