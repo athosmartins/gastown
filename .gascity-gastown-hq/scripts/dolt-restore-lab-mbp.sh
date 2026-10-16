@@ -18,7 +18,7 @@
 #   LISTA     os objetos do prefixo <db>/ do bucket: key<TAB>size<TAB>etag. Chave fora de [A-Za-z0-9._/-], com "..", fora do prefixo,
 #             tamanho ou ETag ilegível, lista vazia ou que soma 0 bytes = UNKNOWN (nada é enviado a lugar nenhum).
 #
-# ESTADO  $STATE/lock · $STATE/runs/<UTC>/ (manifest.json, listing.tsv, orchestrator.log)
+# ESTADO  $STATE/lock (+ lock.reclaim, o mutex de quem recolhe uma trava velha) · $STATE/runs/<UTC>-<pid>/ (manifest.json, listing.tsv, orchestrator.log)
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,20 +34,25 @@ CALL_S="${LABMBP_CALL_S:-900}"
 # tudo que sai do mini rumo ao MBP (mbp-run) roda SEM nenhuma variável AWS_* do ambiente: só o aws do mini enxerga a credencial
 NOAWS=(env); for v in $(env | cut -d= -f1 | grep '^AWS_'); do NOAWS+=(-u "$v"); done
 DB="hq"; MODE=run
-LOCKED=0; WHY=""; RUN=""; OUT=""
+LOCKED=0; RECL=0; WHY=""; RUN=""; OUT=""
 NOBJ="?"; TOTAL_KB="?"
 
 log() { printf '%s [lab-mbp] %s\n' "$(date '+%F %T')" "$*"; [ -z "$RUN" ] || printf '%s %s\n' "$(date '+%T')" "$*" >> "$RUN/orchestrator.log"; }
 isnum() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# Formas conferidas AQUI, na variavel que e usada (a do SQL), e nao so no ajudante: listas explicitas, sem faixa — a faixa a-v depende do locale no bash 3.2.
+ishead() { case "${1:-}" in ''|*[!0123456789abcdefghijklmnopqrstuv]*) return 1 ;; esac; [ "${#1}" -eq 32 ]; }
+isutc() { case "${1:-}" in ''|*[!0123456789TZ:-]*) return 1 ;; esac; [ "${#1}" -eq 20 ]; }
 
 # Um ajudante Python só (JSON/CSV sem jq). Qualquer exceção sai com status != 0: quem chama trata como "ilegível".
 read -r -d '' PYHELP <<'PY' || true
 import csv, json, re, sys
 mode = sys.argv[1]
-H = re.compile(r"[0-9a-v]{32}\Z"); N = re.compile(r"[A-Za-z0-9_]+\Z")
-if mode == "meta":                      # stdin = latest.json; argv[2] = db  → run_utc<TAB>head
+# tudo que vem do S3 e NAO CONFIAVEL: so ASCII, ancorado no fim com \Z ($ aceitaria um \n final; \d e str.isdigit() aceitam digitos Unicode)
+H = re.compile(r"[0-9a-v]{32}\Z"); N = re.compile(r"[A-Za-z0-9_]+\Z"); D = re.compile(r"[0-9]+\Z")
+U = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+if mode == "meta":                      # stdin = latest.json; argv[2] = db  → run_utc<TAB>head (a linha e partida no TAB: nenhum campo pode ter um)
     d = json.load(sys.stdin); ru = d["run_utc"]; hd = d["databases"][sys.argv[2]]["head"]
-    assert isinstance(ru, str) and ru and isinstance(hd, str) and H.match(hd)
+    assert isinstance(ru, str) and U.match(ru) and isinstance(hd, str) and H.match(hd)
     print("%s\t%s" % (ru, hd))
 elif mode == "union":                   # stdin = SHOW FULL TABLES AS OF (csv); argv[2] = head → um SELECT com a contagem de cada tabela
     assert H.match(sys.argv[2]); names = []
@@ -59,41 +64,57 @@ elif mode == "union":                   # stdin = SHOW FULL TABLES AS OF (csv); 
 elif mode == "manifest":                # stdin = t,n (csv); argv[2] = db, argv[3] = head
     t = {}
     for r in list(csv.reader(sys.stdin))[1:]:
-        assert N.match(r[0]) and r[1].isdigit(); t[r[0]] = int(r[1])
+        assert N.match(r[0]) and D.match(r[1]); t[r[0]] = int(r[1])
     assert t and H.match(sys.argv[3])
     print(json.dumps({"schema": 1, "db": sys.argv[2], "as_of": sys.argv[3], "tables": t}, sort_keys=True))
 elif mode == "listing":                 # stdin = `s3api list-objects-v2 --output text` (key, size, "etag"); argv[2] = prefix ("hq/") → key<TAB>size<TAB>etag
     K = re.compile(r"[A-Za-z0-9._/-]+\Z"); E = re.compile(r"[0-9a-f]{32}(-[0-9]+)?\Z"); rows = []
     for ln in sys.stdin.read().splitlines():
         k, s, e = ln.split("\t"); e = e.strip('"')
-        assert K.match(k) and k.startswith(sys.argv[2]) and ".." not in k.split("/") and s.isdigit() and E.match(e)
+        assert K.match(k) and k.startswith(sys.argv[2]) and ".." not in k.split("/") and D.match(s) and E.match(e)
         rows.append("%s\t%s\t%s" % (k, s, e))
     assert rows
     print("\n".join(rows))
 PY
 
-cleanup() { [ "$LOCKED" -eq 0 ] || rm -rf "$STATE/lock"; }
+cleanup() { [ "$LOCKED" -eq 0 ] || rm -rf "$STATE/lock"; [ "$RECL" -eq 0 ] || rmdir "$STATE/lock.reclaim" 2>/dev/null; }
 trap cleanup EXIT
+# SIGTERM/INT/HUP: o bash so roda este trap quando o filho em primeiro plano (dolt/aws sob timeout) termina, entao um kill espera ate CALL_S;
+# um kill -9 nao roda trap nenhum e deixa a trava para o proximo recolher (pid morto) — nada fica preso para sempre.
 trap 'exit 143' INT TERM HUP
 
 usage() { sed -n '2,/^set -uo/p' "$0" | sed '$d' | cut -c3-; }
 
+# A trava existente pode ser recolhida? 0 = sim (sumiu, pid morto ou velha) · 1 = nao (WHY diz por que). Le o estado de AGORA, nao um valor guardado.
+lock_stale() {
+  local p; p=$(cat "$STATE/lock/pid" 2>/dev/null)
+  [ -d "$STATE/lock" ] || return 0
+  # 12 h = mais que o teto de uma rodada: a trava mais velha e de uma rodada que morreu, mesmo que o pid exista (pid reaproveitado apos reboot)
+  [ -z "$(find "$STATE/lock" -maxdepth 0 -mmin +720 2>/dev/null)" ] || return 0
+  if isnum "$p"; then   # kill -0 da EPERM para pid de outro usuario: ps -p nao
+    if kill -0 "$p" 2>/dev/null || ps -p "$p" >/dev/null 2>&1; then WHY="outra rodada em curso (pid $p): nada a fazer"; return 1; fi
+    return 0
+  fi
+  WHY="trava sem pid legivel e recente ($STATE/lock): nada a fazer"; return 1   # pid vazio/ilegivel nao e morto: e de quem acabou de criar
+}
+
 # Uma rodada por vez. 0 = trava tomada · 1 = outra rodada em curso (WHY diz qual) · 2 = nao deu para criar a trava (NAO e "nada a fazer").
+# Recolher trava velha e o unico passo que apaga a trava de OUTRA rodada: um recolhedor por vez (mutex lock.reclaim), velhice conferida DE NOVO la dentro.
 take_lock() {
   mkdir -p "$STATE" || return 2
-  local p old
+  local m="$STATE/lock.reclaim" rc=0
   if ! mkdir "$STATE/lock" 2>/dev/null; then
     [ -d "$STATE/lock" ] || return 2   # mkdir falhou e nao ha trava (EACCES/EROFS/ENOSPC): nao e "outra rodada em curso"
-    p=$(cat "$STATE/lock/pid" 2>/dev/null); old=$(find "$STATE/lock" -maxdepth 0 -mmin +720 2>/dev/null)
-    # 12 h = mais que o teto de uma rodada: a trava mais velha e de uma rodada que morreu, mesmo que o pid exista (pid reaproveitado apos reboot)
-    if [ -n "$old" ]; then :
-    elif isnum "$p"; then   # kill -0 da EPERM para pid de outro usuario: ps -p nao
-      if kill -0 "$p" 2>/dev/null || ps -p "$p" >/dev/null 2>&1; then WHY="outra rodada em curso (pid $p): nada a fazer"; return 1; fi
-    else WHY="trava sem pid legivel e recente ($STATE/lock): nada a fazer"; return 1; fi   # pid vazio/ilegivel nao e morto: e de quem acabou de criar
-    log "trava de pid morto/antiga recolhida"; rm -rf "$STATE/lock"
-    if ! mkdir "$STATE/lock" 2>/dev/null; then [ -d "$STATE/lock" ] || return 2; WHY="outra rodada pegou a trava"; return 1; fi
+    lock_stale || return 1
+    [ -z "$(find "$m" -maxdepth 0 -mmin +10 2>/dev/null)" ] || rmdir "$m" 2>/dev/null   # mutex de 10 min+ e de quem morreu dentro dele (milissegundos)
+    mkdir "$m" 2>/dev/null || { WHY="outra rodada esta recolhendo a trava velha: nada a fazer"; return 1; }; RECL=1
+    if lock_stale; then log "trava de pid morto/antiga recolhida"; rm -rf "$STATE/lock"
+      if mkdir "$STATE/lock" 2>/dev/null; then LOCKED=1; echo "$$" > "$STATE/lock/pid" || rc=2   # LOCKED antes: pid que nao grava, o cleanup apaga a trava
+      elif [ -d "$STATE/lock" ]; then WHY="outra rodada pegou a trava"; rc=1; else rc=2; fi
+    else rc=1; fi
+    rmdir "$m" 2>/dev/null; RECL=0; return "$rc"
   fi
-  LOCKED=1; echo "$$" > "$STATE/lock/pid" || return 2   # LOCKED antes: se o pid nao puder ser gravado, o cleanup apaga a trava
+  LOCKED=1; echo "$$" > "$STATE/lock/pid" || return 2
 }
 
 # --- o MBP esta livre? So se o mbp-run --check sai 0 E diz presence=livre E paused=0. A presenca e independente da pausa e da saude (RAM/swap,
@@ -117,7 +138,9 @@ build_manifest() {
   meta=$(bounded "$AWS" s3 cp "s3://$BUCKET/_meta/latest.json" - 2>"$RUN/aws.err") || { WHY="nao li _meta/latest.json: $(head -c 200 "$RUN/aws.err")"; return 1; }
   line=$(printf '%s' "$meta" | "$PY" -I -c "$PYHELP" meta "$DB" 2>/dev/null) || { WHY="_meta/latest.json sem run_utc/head valido para $DB"; return 1; }
   FP1="${line%%$'\t'*}"; AS_OF="${line#*$'\t'}"
-  PORT=$(awk '/^listener:/{f=1} f&&/port:/{print $2; exit}' "$DOLT_CFG" 2>/dev/null)
+  # o que decide e o que age sao a mesma variavel: AS_OF vai DENTRO do SQL, entao e conferido aqui, mesmo que o ajudante tenha aprovado
+  ishead "$AS_OF" && isutc "$FP1" || { WHY="_meta/latest.json sem run_utc/head valido para $DB (forma inesperada)"; return 1; }
+  PORT=$(awk '/^listener:/{f=1; next} f && /^[^ \t#]/{exit} f && /^[ \t]+port:/{print $2; exit}' "$DOLT_CFG" 2>/dev/null)   # so a porta do bloco listener:
   isnum "$PORT" || { WHY="porta do dolt ilegivel em $DOLT_CFG"; return 1; }
   n=$(q "SELECT COUNT(*) FROM dolt_log WHERE commit_hash = '$AS_OF'" 2>"$RUN/dolt.err" | tail -1)
   isnum "$n" || { WHY="nao consegui perguntar ao dolt vivo se o commit existe: $(head -c 200 "$RUN/dolt.err")"; return 1; }
@@ -164,8 +187,8 @@ main() {
 
   [ -n "$TMO" ] || unknown "sem timeout/gtimeout no PATH (brew install coreutils; o PATH do launchd precisa de /opt/homebrew/bin)"
   take_lock; case $? in 0) ;; 1) VERDICT=SKIPPED; finish 0 ;; *) unknown "nao consegui criar $STATE (ou a trava dentro dela)" ;; esac   # SKIPPED: o agendador ve que nao rodou
-  RUN="$STATE/runs/$(date -u +%Y%m%dT%H%M%SZ)"; OUT="$RUN/out"
-  mkdir -p "$OUT" || unknown "nao consegui criar $RUN"
+  RUN="$STATE/runs/$(date -u +%Y%m%dT%H%M%SZ)-$$"; OUT="$RUN/out"   # com o pid: duas rodadas no mesmo segundo (trava recolhida) nao dividem a pasta
+  { mkdir -p "$STATE/runs" && mkdir "$RUN" && mkdir "$OUT"; } || unknown "nao consegui criar $RUN"
   build_manifest || unknown "$WHY"
   list_objects || unknown "$WHY"
   log "manifest AS OF $AS_OF ($NTAB tabelas, run_utc=$FP1):"; cat "$RUN/manifest.json"   # third-state-waiver: so exibe; build_manifest ja provou o arquivo nao-vazio

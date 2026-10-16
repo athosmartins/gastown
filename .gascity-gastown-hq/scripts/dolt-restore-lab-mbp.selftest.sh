@@ -41,6 +41,7 @@ case "$1 $2" in
     case "$3" in
       */_meta/latest.json)
         [ "${FAKE_AWS_HANG:-0}" != 1 ] || exec sleep 30   # pendurado: so o timeout do orquestrador resolve
+        if [ -n "${FAKE_GATE:-}" ]; then g=0; while [ ! -e "$FAKE_GATE" ] && [ "$g" -lt 300 ]; do sleep 0.2; g=$((g+1)); done; fi   # segura quem tem a trava
         [ "${FAKE_LATEST_FAIL:-0}" != 1 ] || { echo "An error occurred (AccessDenied) when calling the GetObject operation" >&2; exit 1; }
         case "${FAKE_LATEST:-ok}" in
           ok) cat "$FAKE_ROOT/latest1.json" ;;
@@ -49,6 +50,14 @@ case "$1 $2" in
           norun) printf '{"databases":{"hq":{"head":"%s"}}}\n' "$FAKE_HEAD" ;;
           otherdb) printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq_old":{"head":"%s"}}}\n' "$FAKE_HEAD" ;;
           html) echo "<html>503 Slow Down</html>" ;;
+          # entrada hostil: o que o S3 devolve nunca vira SQL do banco vivo
+          tabsql) printf '{"run_utc":"2026-10-16T07:07:25Z\\t'"'"'; CREATE TABLE pwned (i int); -- ","databases":{"hq":{"head":"%s"}}}\n' "$FAKE_HEAD" ;;
+          nlrun) printf '{"run_utc":"2026-10-16T07:07:25Z\\n","databases":{"hq":{"head":"%s"}}}\n' "$FAKE_HEAD" ;;
+          trailrun) printf '{"run_utc":"2026-10-16T07:07:25Zjunk","databases":{"hq":{"head":"%s"}}}\n' "$FAKE_HEAD" ;;
+          uniutc) printf '{"run_utc":"\\u0662\\u0660\\u0662\\u0666-10-16T07:07:25Z","databases":{"hq":{"head":"%s"}}}\n' "$FAKE_HEAD" ;;
+          nlhead) printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq":{"head":"%s\\n"}}}\n' "$FAKE_HEAD" ;;
+          tabhead) printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq":{"head":"%s\\t'"'"'; CREATE TABLE pwned (i int); -- "}}}\n' "$FAKE_HEAD" ;;
+          longhead) printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq":{"head":"%sa"}}}\n' "$FAKE_HEAD" ;;
         esac ;;
       *) echo x >> "$FAKE_CAP/objreads"; exit 1 ;;   # a dry-run never reads an object
     esac ;;
@@ -56,7 +65,7 @@ case "$1 $2" in
     [ "${FAKE_LIST_HANG:-0}" != 1 ] || exec sleep 30
     [ "${FAKE_LIST_FAIL:-0}" != 1 ] || { echo "An error occurred (AccessDenied) when calling the ListObjectsV2 operation" >&2; exit 1; }
     [ "${FAKE_LIST_EMPTY:-0}" != 1 ] || { echo None; exit 0; }
-    python3 -I - "$FAKE_ROOT/s3" <<'PY'
+    PYTHONIOENCODING=utf-8 python3 -I - "$FAKE_ROOT/s3" <<'PY'
 import hashlib, os, sys
 root = sys.argv[1]; E = os.environ; P = 8 * 1024 * 1024
 for d, _, fs in sorted(os.walk(root + "/hq")):
@@ -71,6 +80,7 @@ for d, _, fs in sorted(os.walk(root + "/hq")):
         if E.get("FAKE_LIST_ZERO") == "1": n = 0
         if E.get("FAKE_LIST_ETAG_JUNK") == key: e = "not-an-etag"
         if E.get("FAKE_LIST_SIZE_JUNK") == key: n = "12KB"
+        if E.get("FAKE_LIST_SIZE_UNI") == key: n = "\u0665"
         print("%s\t%s\t\"%s\"" % (key, n, e))
 bk = os.environ.get("FAKE_LIST_BADKEY")
 if bk: print({"1": "hq/a;touch pwned", "2": "hq/../x", "3": "other/x", "4": "hq/a b"}[bk] + "\t5\t\"d41d8cd98f00b204e9800998ecf8427e\"")
@@ -98,6 +108,7 @@ case "$q" in
   *"UNION ALL"*)
     [ "${FAKE_COUNT_FAIL:-0}" != 1 ] || { echo "table not found" >&2; exit 1; }
     [ "${FAKE_COUNT_JUNK:-0}" != 1 ] || { printf 't,n\nissues,many\nlabels,7\n'; exit 0; }
+    [ "${FAKE_COUNT_UNI:-0}" != 1 ] || { printf 't,n\nissues,\xd9\xa5\nlabels,7\n'; exit 0; }   # U+0665: str.isdigit() aceita, int() converte
     case "$q" in
       *'`issues` AS OF '*'`labels` AS OF '*) printf 't,n\nissues,5\nlabels,7\n' ;;
       *) printf 't,n\nissues,6\nlabels,8\n' ;;
@@ -123,7 +134,15 @@ case "${FAKE_PRESENCE:-livre}" in
 esac
 exit 0
 EOF
-chmod +x "$T/bin/"* "$T/scripts/"*.sh
+# pylie: faz as vezes do python3; no modo `meta` APROVA o que FAKE_PYLIE disser (um ajudante que deixou passar valor hostil); o resto e o python3 de verdade
+cat > "$T/bin/pylie" <<'EOF'
+#!/bin/bash
+if [ "${4:-}" = meta ]; then cat > /dev/null; printf '%b\n' "$FAKE_PYLIE"; exit 0; fi
+exec python3 "$@"
+EOF
+mkdir -p "$T/fakedate"   # date com o segundo CONGELADO so no nome da pasta da rodada: duas rodadas "no mesmo segundo"
+printf '#!/bin/bash\n[ "$*" = "-u +%%Y%%m%%dT%%H%%M%%SZ" ] && { echo 20261016T000000Z; exit 0; }\nexec /bin/date "$@"\n' > "$T/fakedate/date"
+chmod +x "$T/bin/"* "$T/scripts/"*.sh "$T/fakedate/date"
 printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq":{"issues":5,"head":"%s","backup_size":"13G"}}}\n' "$HEAD_H" > "$T/latest1.json"
 
 # ---- harness ---------------------------------------------------------------------------------------------------------------
@@ -197,6 +216,51 @@ reset; FAKE_COUNT_FAIL=1 run --dry-run;   chk_unknown "contagem AS OF falhou: ta
 reset; FAKE_COUNT_JUNK=1 run --dry-run;   chk_unknown "contagem AS OF falhou" "contagem que nao e numero" nao
 check "$([ -s "$(RUNDIR)manifest.json" ] && echo cheio || echo vazio)" vazio "contagem que nao e numero: nenhum manifest utilizavel ficou"
 
+echo "-- entrada hostil do S3 (latest.json): nada disso chega ao banco vivo — UNKNOWN e NENHUMA chamada ao dolt"
+chk_hostile() {   # $1 = valor de FAKE_LATEST · $2 = rotulo
+  FAKE_LATEST="$1" run --dry-run
+  chk_unknown "sem run_utc/head valido para hq" "$2" nao
+  check "$(calls dolt.argv)" 0 "$2: o dolt vivo nem foi chamado"
+  hasnt "$OUT" "forma inesperada" "$2: ja o ajudante Python recusou (a conferencia em bash e a 2a camada, nao a 1a)"
+  check "$([ -e "$T/pwned" ] && echo sim || echo nao)" nao "$2: nada foi criado"
+}
+reset; chk_hostile tabsql "run_utc com TAB e SQL (a injecao que partia o AS_OF)"
+reset; chk_hostile nlrun "run_utc com quebra de linha no fim"
+reset; chk_hostile trailrun "run_utc com lixo depois do Z"
+reset; chk_hostile uniutc "run_utc com digitos Unicode"
+reset; chk_hostile nlhead "head com quebra de linha no fim"
+reset; chk_hostile tabhead "head com TAB e SQL"
+reset; chk_hostile longhead "head com 33 caracteres"
+check "$(canary_hits)" 0 "entrada hostil: o canario continua fora de qualquer arquivo e da saida"
+# defesa em profundidade: um ajudante que APROVOU o valor hostil (aqui, um python3 de mentira) nao basta — a variavel que vai ao SQL e conferida em bash
+chk_lie() {   # $1 = o que o ajudante "aprovou" (printf %b) · $2 = rotulo
+  FAKE_PYLIE="$1" LABMBP_PY="$T/bin/pylie" run --dry-run
+  chk_unknown "forma inesperada" "$2" nao
+  check "$(calls dolt.argv)" 0 "$2: o dolt vivo nem foi chamado"
+}
+reset; FAKE_PYLIE="2026-10-16T07:07:25Z\t$HEAD_H" LABMBP_PY="$T/bin/pylie" run --dry-run
+has "$OUT" "RESULT: DRY db=hq rc=0 as_of=$HEAD_H" "ajudante de mentira que diz a verdade: a rodada passa (o teste de mentira mede o que diz medir)"
+reset; chk_lie "2026-10-16T07:07:25Z\t'; CREATE TABLE pwned (i int); --" "ajudante aprovou head com SQL"
+reset; chk_lie "2026-10-16T07:07:25Z\t${HEAD_H}\n; CREATE TABLE pwned (i int); --" "ajudante aprovou head com quebra de linha e SQL"
+reset; chk_lie "2026-10-16T07:07:25Z\t${HEAD_H}\tx" "ajudante aprovou um segundo TAB"
+reset; chk_lie "x\t${HEAD_H}" "ajudante aprovou run_utc que nao e data"
+reset; chk_lie "2026-10-16T07:07:25;\t${HEAD_H}" "ajudante aprovou run_utc de 20 caracteres com ; no fim"
+reset; chk_lie "2026-10-16T07:07:25Z0\t${HEAD_H}" "ajudante aprovou run_utc de 21 caracteres"
+reset; chk_lie "2026-10-16T07:07:25Z\t${HEAD_H}a" "ajudante aprovou head de 33 caracteres"
+reset; chk_lie "2026-10-16T07:07:25Z\t${HEAD_H%?}" "ajudante aprovou head de 31 caracteres"
+reset; chk_lie "2026-10-16T07:07:25Z\t$(printf %s "$HEAD_H" | tr a-z A-Z)" "ajudante aprovou head em maiusculas"
+reset; chk_lie "2026-10-16T07:07:25Z\t" "ajudante aprovou head vazio"
+reset; FAKE_COUNT_UNI=1 run --dry-run;    chk_unknown "contagem AS OF falhou" "contagem com digito Unicode (isdigit aceitaria)" nao
+reset; FAKE_LIST_SIZE_UNI=hq/abc123 run --dry-run; chk_unknown "tamanho ou ETag ilegivel" "tamanho com digito Unicode" sim
+
+echo "-- porta: so a do bloco listener:"
+reset; printf 'listener:\n  host: 0.0.0.0\nmetrics:\n  port: 9999\n' > "$T/city/.gc/runtime/packs/dolt/dolt-config.yaml"; run --dry-run
+chk_unknown "porta do dolt ilegivel" "listener sem porta e porta de OUTRO bloco depois (nao e a do dolt)" nao
+check "$(calls dolt.argv)" 0 "porta de outro bloco: o dolt nao foi chamado"
+reset; printf '# dolt\nmetrics:\n  port: 9999\nlistener:\n\n  # porta\n  host: 0.0.0.0\n  port: 4242 # sql\nbehavior:\n  port: 1\n' > "$T/city/.gc/runtime/packs/dolt/dolt-config.yaml"; run --dry-run
+has "$(cat "$T/cap/dolt.argv")" "--port 4242 " "porta do listener: com comentario, linha em branco e outro bloco antes e depois"
+hasnt "$(cat "$T/cap/dolt.argv")" "--port 9999" "a porta de outro bloco nao foi usada"
+
 echo "-- dry-run: lista do S3 ruim = UNKNOWN"
 reset; FAKE_LIST_FAIL=1 run --dry-run;    chk_unknown "nao consegui listar s3://urblink-dolt-backups/hq/: An error occurred (AccessDenied)" "listagem negada" sim
 reset; FAKE_LIST_EMPTY=1 run --dry-run;   chk_unknown "veio vazia ou fora do formato" "lista vazia (None)" sim
@@ -264,6 +328,42 @@ has "$OUT" "RESULT: DRY" "pid ilegivel e trava antiga: recolhida"
 reset; mkdir -p "$T/state/lock"; echo $$ > "$T/state/lock/pid"; touch -t 202001010000 "$T/state/lock"; run --dry-run
 has "$OUT" "trava de pid morto/antiga recolhida" "trava de 12 h+ com pid VIVO (pid reaproveitado): recolhida"
 has "$OUT" "RESULT: DRY" "trava velha com pid vivo: a rodada roda"
+check "$(ls "$T/state")" "runs" "trava recolhida: o mutex de recolhimento foi liberado (so sobrou runs/)"
+reset; sh -c 'exit 0' & dead=$!; wait $dead; mkdir -p "$T/state/lock" "$T/state/lock.reclaim"; echo "$dead" > "$T/state/lock/pid"; run --dry-run
+check "$RC" 0 "trava morta + outro recolhedor com o mutex (recente): rc 0"
+has "$OUT" "RESULT: SKIPPED db=hq rc=0" "mutex recente: SKIPPED (quem recolhe vai rodar)"
+has "$OUT" "outra rodada esta recolhendo a trava velha" "mutex recente: diz que outra rodada esta recolhendo"
+check "$(calls aws.argv)" 0 "mutex recente: nada foi lido do S3"
+check "$([ -d "$T/state/lock.reclaim" ] && [ -d "$T/state/lock" ] && echo sim || echo nao)" sim "mutex recente: nem o mutex nem a trava do outro foram tocados"
+reset; sh -c 'exit 0' & dead=$!; wait $dead; mkdir -p "$T/state/lock" "$T/state/lock.reclaim"; echo "$dead" > "$T/state/lock/pid"; touch -t 202001010000 "$T/state/lock.reclaim"; run --dry-run
+has "$OUT" "RESULT: DRY" "mutex de 10 min+ (dono morreu dentro dele): ignorado, a rodada roda"
+check "$(ls "$T/state")" "runs" "mutex velho: nada sobrou alem de runs/"
+# a velhice e conferida DE NOVO dentro do mutex: a trava que ficou VIVA entre a decisao "velha" e o recolhimento nao pode ser apagada
+reset; mkdir -p "$T/state/lock"; echo $$ > "$T/state/lock/pid"
+out=$(LABMBP_LIB=1 LABMBP_CITY="$T/city" LABMBP_STATE="$T/state" "${LABMBP_TEST_BASH:-bash}" -c '
+  . "$1"; eval "$(declare -f lock_stale | sed "1s/lock_stale/real_stale/")"
+  n=0; lock_stale() { n=$((n+1)); if [ "$n" -eq 1 ]; then return 0; fi; real_stale; }   # a 1a leitura diz "velha"; ate a 2a ela ficou viva
+  take_lock; rc=$?; echo "rc=$rc leituras=$n pid=$(cat "$STATE/lock/pid" 2>/dev/null) mutex=$([ -d "$STATE/lock.reclaim" ] && echo preso || echo livre) why=$WHY"' _ "$T/scripts/dolt-restore-lab-mbp.sh" 2>&1)
+check "$out" "rc=1 leituras=2 pid=$$ mutex=livre why=outra rodada em curso (pid $$): nada a fazer" "trava que ficou viva entre a decisao e o recolhimento: NAO e apagada, rc 1, mutex liberado"
+# trava que sumiu entre o mkdir que falhou e a leitura: nao ha o que proteger (pode recolher), e o mutex preso e solto pelo cleanup
+reset
+out=$(LABMBP_LIB=1 LABMBP_CITY="$T/city" LABMBP_STATE="$T/state" "${LABMBP_TEST_BASH:-bash}" -c '
+  . "$1"; lock_stale; a=$?; mkdir -p "$STATE/lock.reclaim"; RECL=1; cleanup; echo "stale=$a mutex=$([ -d "$STATE/lock.reclaim" ] && echo preso || echo solto)"' _ "$T/scripts/dolt-restore-lab-mbp.sh" 2>&1)
+check "$out" "stale=0 mutex=solto" "sem trava: lock_stale diz 'pode recolher'; morrer com o mutex na mao: o cleanup solta o mutex"
+# varias rodadas ao mesmo tempo sobre uma trava morta: so UMA roda; quem tem a trava fica segurando (FAKE_GATE) ate as outras terminarem
+reset; sh -c 'exit 0' & dead=$!; wait $dead; mkdir -p "$T/state/lock"; echo "$dead" > "$T/state/lock/pid"; rm -f "$T/gate"; rm -f "$T"/c?.out
+for i in 1 2 3 4 5 6; do FAKE_GATE="$T/gate" envrun --dry-run > "$T/c$i.out" 2>&1 & done
+n=0; while [ "$(grep -l 'RESULT:' "$T"/c?.out 2>/dev/null | wc -l | tr -d ' ')" -lt 5 ] && [ "$n" -lt 240 ]; do sleep 0.5; n=$((n+1)); done
+: > "$T/gate"; wait
+check "$(grep -l 'RESULT: DRY' "$T"/c?.out | wc -l | tr -d ' ')" 1 "6 rodadas sobre a mesma trava morta: exatamente UMA roda"
+check "$(grep -l 'RESULT: SKIPPED' "$T"/c?.out | wc -l | tr -d ' ')" 5 "6 rodadas sobre a mesma trava morta: as outras 5 saem SKIPPED"
+check "$(ls "$T/state/runs" | wc -l | tr -d ' ')" 1 "6 rodadas sobre a mesma trava morta: uma pasta de rodada so"
+check "$(ls "$T/state")" "runs" "6 rodadas: trava e mutex liberados no fim"
+# duas rodadas no MESMO segundo (a trava foi recolhida no meio) nao dividem a pasta
+reset; PATH="$T/fakedate:$PATH" run --dry-run; PATH="$T/fakedate:$PATH" run --dry-run
+check "$(ls "$T/state/runs" | wc -l | tr -d ' ')" 2 "duas rodadas no mesmo segundo: duas pastas (o pid entra no nome)"
+check "$(ls "$T/state/runs" | grep -c '^20261016T000000Z-[0-9][0-9]*$')" 2 "o nome da pasta e <UTC>-<pid>"
+check "$(ls "$T"/state/runs/*/manifest.json | wc -l | tr -d ' ')" 2 "cada rodada tem o seu manifest"
 reset; chmod 555 "$T/state"
 if [ -w "$T/state" ]; then echo "  SKIP: estado somente-leitura (chmod 555 nao impede este usuario)"; else
   run --dry-run
