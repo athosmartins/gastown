@@ -510,5 +510,59 @@ lock_paths_agree() {  # lock_paths_agree <label> <city dir> <runtime dir or ""> 
 lock_paths_agree "runtime dir given (GC_CITY_RUNTIME_DIR, as the supervisor sets it)" "$E2E/city-x" "$E2E/runtime-x"
 lock_paths_agree "no runtime dir given (derived from the city)" "$E2E/city-y" ""
 
+echo "=== ga-48e0du: the order declares a timeout the run fits in — and one that cannot stack ==="
+# With no `timeout` the engine kills an exec order at 300 s (orders.Order.TimeoutOrDefault; see mol-dog-reaper.toml, ga-x2fj8h). The exporter commits ONLY after every database has been
+# exported (the one commit_archive_snapshot after the loop), so a run killed before that leaves the files written and NOTHING committed: on 2026-10-16 the archive HEAD froze at 12:08:15Z while
+# eight runs in a row were killed at 5m02s-5m06s (`gc order history jsonl-export`; the last run that finished took 4m07s, so the ceiling was already 82% used). The data did not grow
+# (hq/issues.jsonl 71.39 -> 71.97 MB between the last commit and the fix); the host load did (84 on 10 cores). A run now needs about 6-8 minutes — an ESTIMATE from file mtimes, not a stopwatch.
+# The script has no single-flight lock, so the timeout must also stay under the 15 m interval: two exports in one git working tree is the ga-fxrrav failure.
+ORDER_TOML="$HERE/../../orders/jsonl-export.toml"
+order_field() {  # order_field <file> <key> — the value of `key = "..."` on a non-comment line (a `# key = ...` line does not count)
+  # vazio → prints nothing (the caller turns that into "not declared"); falhou/ilegível → the caller checks the file is readable BEFORE calling, so nothing here is read from a missing file
+  grep -E "^[[:space:]]*$2[[:space:]]*=" "$1" | head -1 | sed -E 's/^[^=]*=[[:space:]]*"?([0-9a-z]*)"?.*$/\1/'
+}
+dur_s() {  # dur_s <Ns|Nm|Nh> — seconds on stdout; returns 1 (prints nothing) for empty or anything that is not one plain duration
+  # 10# on purpose: a leading zero ("0840s") is decimal here, not an octal error in $(( ))
+  case "$1" in ''|*[!0-9smh]*) return 1 ;; esac
+  local n="${1%[smh]}" u="${1: -1}"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  case "$u" in s) echo $((10#$n)) ;; m) echo $((10#$n * 60)) ;; h) echo $((10#$n * 3600)) ;; *) return 1 ;; esac
+}
+order_timeout_verdict() {  # order_timeout_verdict <order toml> — "ok", or the reason it is not. Every doubt is a reason: nothing here defaults to ok.
+  local f="$1" t i ts is
+  [ -r "$f" ] || { echo "cannot read $f"; return 0; }
+  t="$(order_field "$f" timeout)"; i="$(order_field "$f" interval)"
+  [ -n "$t" ] || { echo "no timeout declared: the engine's 300 s default applies"; return 0; }
+  ts="$(dur_s "$t")" || { echo "timeout '$t' is not one plain Ns/Nm/Nh duration"; return 0; }
+  is="$(dur_s "$i")" || { echo "interval '$i' unreadable: cannot tell whether runs can stack"; return 0; }
+  [ "$ts" -ge 600 ] || { echo "timeout ${ts}s is under 600 s: a run needs about 6-8 min"; return 0; }
+  [ "$ts" -lt "$is" ] || { echo "timeout ${ts}s is not under the ${is}s interval and the script has no lock: two exports could overlap"; return 0; }
+  echo ok
+}
+v="$(order_timeout_verdict "$ORDER_TOML")"
+[ "$v" = ok ] && ok "jsonl-export.toml: timeout declared, at least 600 s, and under the interval" || bad "jsonl-export.toml: $v"
+# the check bites: each of these order files must be refused for its own reason, and only the sound ones pass
+mk_order() {  # mk_order <name> <interval value or ""> <timeout line or ""> — writes $WORK/order-<name>.toml and prints its path
+  { printf '[order]\nexec = "x"\ntrigger = "cooldown"\n'; [ -n "$2" ] && printf 'interval = "%s"\n' "$2"; [ -n "$3" ] && printf '%s\n' "$3"; } > "$WORK/order-$1.toml"
+  printf '%s' "$WORK/order-$1.toml"
+}
+expect_verdict() {  # expect_verdict <label> <file> <"ok" | substring of the reason>
+  local got; got="$(order_timeout_verdict "$2")"
+  if [ "$3" = ok ]; then [ "$got" = ok ] && ok "$1 -> ok" || bad "$1 -> '$got', wanted ok"
+  else case "$got" in *"$3"*) ok "$1 -> refused ($3)" ;; *) bad "$1 -> '$got', wanted a refusal naming '$3'" ;; esac; fi
+}
+expect_verdict "no timeout line"                          "$(mk_order none 15m '')"                                         "no timeout declared"
+expect_verdict "only a commented-out timeout"             "$(mk_order commented 15m '# timeout = "840s"')"                  "no timeout declared"
+expect_verdict "timeout 300s (the engine default)"        "$(mk_order t300 15m 'timeout = "300s"')"                         "under 600"
+expect_verdict "timeout equal to the interval"            "$(mk_order teq 15m 'timeout = "900s"')"                          "not under"
+expect_verdict "timeout above the interval"               "$(mk_order t1800 15m 'timeout = "1800s"')"                       "not under"
+expect_verdict "timeout 'ten' (not a duration)"           "$(mk_order tten 15m 'timeout = "ten"')"                          "not one plain"
+expect_verdict "timeout 1h30m (compound, not accepted)"   "$(mk_order tcomp 15m 'timeout = "1h30m"')"                       "not one plain"
+expect_verdict "no interval at all"                       "$(mk_order noint '' 'timeout = "840s"')"                         "interval '' unreadable"
+expect_verdict "order file missing"                       "$WORK/order-does-not-exist.toml"                                 "cannot read"
+expect_verdict "timeout 840s"                             "$(mk_order t840 15m 'timeout = "840s"')"                         ok
+expect_verdict "timeout 14m, trailing comment"            "$(mk_order t14m 15m 'timeout = "14m"   # headroom, see the header')" ok
+expect_verdict "timeout 0840s (leading zero is decimal)"  "$(mk_order t0840 15m 'timeout = "0840s"')"                       ok
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

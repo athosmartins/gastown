@@ -32,8 +32,27 @@
 # enabled) — via the script's own
 # default, NOT via GC_PACK_STATE_DIR (which gc points at packs/town-deltas for this order).
 # The old packs/town-deltas/jsonl-archive is no longer written; it is left in place.
+#
+# ga-48e0du: `timeout` is declared. An exec order that names none gets the engine default of 300 s
+# (orders.Order.TimeoutOrDefault — see mol-dog-reaper.toml, ga-x2fj8h), and this script commits ONCE, after
+# every database has been exported. A run killed before that leaves the files written and nothing committed:
+# on 2026-10-16 the archive HEAD froze at 12:08:15Z while eight runs in a row ended `exec-failed` at 5m02s-5m06s
+# (`gc order history jsonl-export`; the last run that finished took 4m07s — the ceiling was already 82% used),
+# so the committed snapshot stayed 8 h old, and the working tree the S3 mirror copies was a mix of files from
+# different killed runs (hq 20:04Z, whatsapp_automation 19:08Z). The data did not grow (hq/issues.jsonl
+# 71.39 -> 71.97 MB across that window); the host load did (84 on 10 cores at the time of the fix), and the
+# time is not Dolt alone: in the 20:00Z run, from the file mtimes, the `jq` scrub of that 72 MB file took ~80 s
+# and the `jq` validate + flat copy right after it ~67 s. A run now needs about 6-8 minutes — an ESTIMATE from
+# those mtimes, not a stopwatch run.
+#
+# 840 s = 14 min: about twice that estimate, and deliberately UNDER the 15 m interval. The script has no
+# single-flight lock of its own (the compactor has one; this exporter takes none), so a timeout above the
+# interval would let the next tick start a second export in the same git working tree — the concurrent-export
+# failure of ga-fxrrav. If a run ever needs more than 14 min, give the script a lock FIRST, then raise this.
+# jsonl-export.selftest.sh (ga-48e0du) fails if `timeout` is missing, under 600 s, or not under `interval`.
 [order]
 description = "Export Dolt databases to JSONL git archive (ga-7sxdmb — replaces mol-dog-jsonl)"
 exec = "$PACK_DIR/assets/scripts/jsonl-export.sh"
 trigger = "cooldown"
 interval = "15m"
+timeout = "840s"
