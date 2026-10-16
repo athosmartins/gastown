@@ -1,0 +1,224 @@
+diff --git a/cmd/gc/beads_provider_lifecycle_test.go b/cmd/gc/beads_provider_lifecycle_test.go
+index ac536d048..32a286660 100644
+--- a/cmd/gc/beads_provider_lifecycle_test.go
++++ b/cmd/gc/beads_provider_lifecycle_test.go
+@@ -9115,6 +9115,69 @@ func TestGcBeadsBdStartUsesGCBinManagedConfigWriter(t *testing.T) {
+ 	}
+ }
+ 
++// TestGcBeadsBdStartBindHost pins the listener host the provider hands to
++// `gc dolt-state start-managed` (ga-k7o6ou): loopback unless GC_DOLT_HOST names
++// the wildcard explicitly. The fake gc renders `host:` from the --host it was
++// given, so the generated dolt-config.yaml is what Dolt would have bound.
++func TestGcBeadsBdStartBindHost(t *testing.T) {
++	tests := []struct {
++		name     string
++		hostEnv  string // empty means GC_DOLT_HOST is not set at all
++		wantHost string
++	}{
++		{name: "unset binds loopback", hostEnv: "", wantHost: "127.0.0.1"},
++		{name: "explicit wildcard is the opt-in", hostEnv: "0.0.0.0", wantHost: "0.0.0.0"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			cityPath := t.TempDir()
++			if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
++				t.Fatal(err)
++			}
++			if err := MaterializeBuiltinPacks(cityPath); err != nil {
++				t.Fatalf("MaterializeBuiltinPacks: %v", err)
++			}
++			script := gcBeadsBdScriptPath(cityPath)
++
++			binDir := filepath.Join(t.TempDir(), "bin")
++			if err := os.MkdirAll(binDir, 0o755); err != nil {
++				t.Fatal(err)
++			}
++			fakeGC := writeFakeManagedConfigWriterGC(t, binDir, filepath.Join(t.TempDir(), "gc-invocation"))
++			writeFakeManagedConfigWriterDolt(t, binDir)
++
++			extra := []string{
++				"GC_CITY_PATH=" + cityPath,
++				"GC_BIN=" + fakeGC,
++				"PATH=" + strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
++			}
++			if tt.hostEnv != "" {
++				extra = append(extra, "GC_DOLT_HOST="+tt.hostEnv)
++			}
++			env := sanitizedBaseEnv(extra...)
++			cmd := exec.Command(script, "start")
++			cmd.Env = env
++			if out, err := cmd.CombinedOutput(); err != nil {
++				t.Fatalf("gc-beads-bd start failed: %v\n%s", err, out)
++			}
++			t.Cleanup(func() {
++				stop := exec.Command(script, "stop")
++				stop.Env = env
++				_ = stop.Run()
++			})
++
++			configData, err := os.ReadFile(filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt-from-gc", "dolt-config.yaml"))
++			if err != nil {
++				t.Fatalf("ReadFile(dolt-config.yaml): %v", err)
++			}
++			want := "  host: " + tt.wantHost + "\n"
++			if !strings.Contains(string(configData), want) {
++				t.Fatalf("dolt-config.yaml listener host != %s, config:\n%s", tt.wantHost, configData)
++			}
++		})
++	}
++}
++
+ func TestGcBeadsBdStartManagedHelperDoesNotInheritStartLockFD(t *testing.T) {
+ 	cityPath := t.TempDir()
+ 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+diff --git a/cmd/gc/dolt_port_selection.go b/cmd/gc/dolt_port_selection.go
+index 842648be1..9b1cb1d16 100644
+--- a/cmd/gc/dolt_port_selection.go
++++ b/cmd/gc/dolt_port_selection.go
+@@ -164,10 +164,11 @@ func nextAvailableManagedDoltPort(seed int) int {
+ // port has failed. Using the same host as the eventual bind avoids picking a
+ // port that probes free on 127.0.0.1 but is actually busy on the bind host
+ // (e.g. another process holds 192.168.1.5:X while leaving 127.0.0.1:X free,
+-// and dolt is binding 0.0.0.0:X, which would fail). Blank host normalizes
+-// to "0.0.0.0" inside managedDoltPortAvailableFn (the indirection over
+-// managedDoltPortAvailableForHost) to match the bind default in
+-// startManagedDoltProcessWithOptions.
++// and dolt is binding 0.0.0.0:X, which would fail). A blank host probes the
++// wildcard inside managedDoltPortAvailableFn (the indirection over
++// managedDoltPortAvailableForHost). startManagedDoltProcessWithOptions
++// resolves a blank BIND host to loopback before it reaches this probe, so
++// the start path always probes the host it is about to bind.
+ func nextAvailableManagedDoltPortForHost(host string, seed int) int {
+ 	port := seed
+ 	for attempts := 0; attempts < 100; attempts++ {
+diff --git a/cmd/gc/dolt_recover_managed.go b/cmd/gc/dolt_recover_managed.go
+index 676d60b8b..6209a8152 100644
+--- a/cmd/gc/dolt_recover_managed.go
++++ b/cmd/gc/dolt_recover_managed.go
+@@ -29,7 +29,7 @@ func recoverManagedDoltProcess(cityPath, host, port, user, logLevel string, time
+ 		return managedDoltRecoverReport{}, fmt.Errorf("missing port")
+ 	}
+ 	if strings.TrimSpace(host) == "" {
+-		host = "0.0.0.0"
++		host = managedDoltDefaultBindHost
+ 	}
+ 	if strings.TrimSpace(user) == "" {
+ 		user = "root"
+diff --git a/cmd/gc/dolt_start_managed.go b/cmd/gc/dolt_start_managed.go
+index 50f8391d8..eca6ab611 100644
+--- a/cmd/gc/dolt_start_managed.go
++++ b/cmd/gc/dolt_start_managed.go
+@@ -113,6 +113,11 @@ func init() {
+ 	os.Exit(runManagedDoltTestWatchdog(os.Args[2:], os.Stdout, os.Stderr))
+ }
+ 
++// managedDoltDefaultBindHost is the listener host used when a caller names none. The managed
++// server runs as root with an empty password, so the default is loopback; listening on every
++// interface (0.0.0.0) has to be asked for by name (ga-k7o6ou).
++const managedDoltDefaultBindHost = "127.0.0.1"
++
+ func startManagedDoltProcess(cityPath, host, port, user, logLevel string, timeout time.Duration) (managedDoltStartReport, error) {
+ 	return startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel, -1, timeout, true)
+ }
+@@ -131,7 +136,7 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
+ 		return managedDoltStartReport{}, fmt.Errorf("invalid port %q", port)
+ 	}
+ 	if strings.TrimSpace(host) == "" {
+-		host = "0.0.0.0"
++		host = managedDoltDefaultBindHost
+ 	}
+ 	if strings.TrimSpace(user) == "" {
+ 		user = "root"
+@@ -305,8 +310,8 @@ func resolveManagedDoltStartAddressInUseRetryWindow(cityPath string) time.Durati
+ // became free within the window. A non-positive retryWindow returns false
+ // immediately (no wait).
+ //
+-// The host argument matches the host dolt will bind to (typically "0.0.0.0"
+-// in production); using the same host for the probe and the bind avoids
++// The host argument matches the host dolt will bind to (loopback unless the
++// caller asked for the wildcard); using the same host for the probe and the bind avoids
+ // false-positive availability reports caused by interface-specific bind
+ // states. The poll interval is shrunk to the retry window when the window is
+ // shorter than the default 2s, so a sub-2s window still gets one check
+diff --git a/cmd/gc/dolt_start_managed_test.go b/cmd/gc/dolt_start_managed_test.go
+index 2f44a0682..560c4999a 100644
+--- a/cmd/gc/dolt_start_managed_test.go
++++ b/cmd/gc/dolt_start_managed_test.go
+@@ -1237,3 +1237,47 @@ func TestRegisterManagedDoltTestProcessSnapshotsIdentity(t *testing.T) {
+ 		t.Errorf("StartIdentity = %q, want non-empty snapshot", got.StartIdentity)
+ 	}
+ }
++
++// TestStartManagedDoltProcessWithOptions_BlankHostBindsLoopback pins the bind
++// default (ga-k7o6ou): a caller that names no listener host gets the loopback
++// interface, never the wildcard. The config file written here is what
++// `dolt sql-server --config` reads, so it is the artifact asserted on; the
++// readiness probe must target the same host the listener binds.
++func TestStartManagedDoltProcessWithOptions_BlankHostBindsLoopback(t *testing.T) {
++	const port = 17795
++	var readyHost string
++	cityPath := installStartManagedDoltLoopStubs(t, startManagedDoltLoopStubs{
++		startFn: func(cityPath, _, _ string, _ *os.File) (managedDoltStartedProcess, error) {
++			return managedDoltStartedProcess{CityPath: cityPath, PID: 0}, nil
++		},
++		waitReadyFn: func(_, host, _, _ string, _ int, _ time.Duration, _ bool) (managedDoltWaitReadyReport, error) {
++			readyHost = host
++			return managedDoltWaitReadyReport{Ready: true, PIDAlive: true}, nil
++		},
++		logSuffixFn:     func(_ string, _ int64) (string, error) { return "", nil },
++		portAvailableFn: func(_ string, _ int) bool { return true },
++		retryWindow:     50 * time.Millisecond,
++	})
++
++	if _, err := startManagedDoltProcessWithOptions(cityPath, "", strconv.Itoa(port), "root", "warning", -1, time.Second, false); err != nil {
++		t.Fatalf("startManagedDoltProcessWithOptions: %v", err)
++	}
++
++	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
++	if err != nil {
++		t.Fatalf("resolveManagedDoltRuntimeLayout: %v", err)
++	}
++	config, err := os.ReadFile(layout.ConfigFile)
++	if err != nil {
++		t.Fatalf("ReadFile(%s): %v", layout.ConfigFile, err)
++	}
++	if !strings.Contains(string(config), "  host: 127.0.0.1\n") {
++		t.Errorf("blank host must render a loopback listener, config:\n%s", config)
++	}
++	if strings.Contains(string(config), "0.0.0.0") {
++		t.Errorf("blank host must not render the wildcard, config:\n%s", config)
++	}
++	if readyHost != "127.0.0.1" {
++		t.Errorf("readiness probed host %q, want the bound host 127.0.0.1", readyHost)
++	}
++}
+diff --git a/examples/bd/assets/scripts/gc-beads-bd.sh b/examples/bd/assets/scripts/gc-beads-bd.sh
+index 038baf936..e85180c7b 100755
+--- a/examples/bd/assets/scripts/gc-beads-bd.sh
++++ b/examples/bd/assets/scripts/gc-beads-bd.sh
+@@ -13,7 +13,9 @@
+ #   GC_PACK_STATE_DIR — canonical pack runtime root for dolt (optional)
+ #   GC_DOLT       — set to "skip" to no-op all operations (exit 2)
+ #   GC_BEADS_BACKEND — "dolt" (default) or "doltlite"
+-#   GC_DOLT_HOST  — dolt server host (empty = local server)
++#   GC_DOLT_HOST  — dolt server host (empty = local managed server on 127.0.0.1;
++#                   0.0.0.0 = local managed server on EVERY interface, explicit opt-in;
++#                   any other value = a REMOTE server this script never starts or stops)
+ #   GC_DOLT_PORT  — dolt server port (default: ephemeral, hashed from city path)
+ #   GC_DOLT_USER  — dolt user (default: root)
+ #   GC_DOLT_PASSWORD — dolt password (default: empty)
+@@ -24,7 +26,12 @@ set -e
+ # --- Configuration ---
+ 
+ # DOLT_PORT is set after derived paths are resolved (see allocate_port below).
+-DOLT_HOST="${GC_DOLT_HOST:-0.0.0.0}"
++# Bind host of the MANAGED server: loopback unless GC_DOLT_HOST names the wildcard on purpose.
++# The managed server runs as root with an empty password, so listening on every interface
++# exposes the whole beads/mail database to the LAN (ga-k7o6ou).
++# Do NOT "harden" this by exporting GC_DOLT_HOST=127.0.0.1: is_remote() below reads any value
++# other than 0.0.0.0 as a remote server, and op_start would then exit 2 without starting anything.
++DOLT_HOST="${GC_DOLT_HOST:-127.0.0.1}"
+ DOLT_USER="${GC_DOLT_USER:-root}"
+ DOLT_PASSWORD="${GC_DOLT_PASSWORD:-}"
+ DOLT_LOGLEVEL="${GC_DOLT_LOGLEVEL:-warning}"

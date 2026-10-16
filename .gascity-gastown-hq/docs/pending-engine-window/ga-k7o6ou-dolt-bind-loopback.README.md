@@ -74,12 +74,42 @@ is `unknown`, never `clean`.
 
 ## Tests
 
-Engine (`cmd/gc`):
+**The two Go tests below were written but NOT RUN.** At 15/10 21:09 the Dolt server crashed on a
+full data volume (`no space left on device`), and a cold build of `cmd/gc` can peak near 2.5 GiB
+there, so I did not compile Go. Run them on the engine tree before the window:
+
+```
+git -C <engine> apply ga-k7o6ou-dolt-bind-loopback.patch
+go test ./cmd/gc -count=1 -v -run 'TestGcBeadsBdStartBindHost|TestStartManagedDoltProcessWithOptions_BlankHostBindsLoopback'
+```
+
+Check `df` first: the test binary needs roughly 1.5-2.5 GiB of temp plus build cache. To see
+the tests fail on the base, apply the patch and then revert only the four non-test files
+(`git checkout HEAD -- examples/bd cmd/gc/dolt_start_managed.go cmd/gc/dolt_recover_managed.go
+cmd/gc/dolt_port_selection.go`) before running them.
 
 * `TestGcBeadsBdStartBindHost` runs the real script with a fake `gc` that renders `host:` from
   `--host`: unset renders `127.0.0.1`; explicit `GC_DOLT_HOST=0.0.0.0` renders `0.0.0.0`.
 * `TestStartManagedDoltProcessWithOptions_BlankHostBindsLoopback` asserts the written
-  `dolt-config.yaml` and the readiness-probe host for a blank host.
+  `dolt-config.yaml` and the readiness-probe host for a blank host. It covers the Go default,
+  which is not the live path; nothing below exercises it.
+
+What *was* run, for the live path (the shell script), without compiling anything: the fake `gc`
+and `dolt` scripts were lifted verbatim out of `beads_provider_lifecycle_test.go` and the REAL
+`gc-beads-bd.sh` was started against a throwaway city (fake `gc` allocates port 3311; the live
+Dolt on :52756 was untouched), unpatched vs patched:
+
+| script | `GC_DOLT_HOST` | `start` rc | listener host rendered |
+|---|---|---|---|
+| unpatched | unset | 0 | `0.0.0.0` (the bug) |
+| unpatched | `0.0.0.0` | 0 | `0.0.0.0` |
+| unpatched | `127.0.0.1` | 2 | none (the trap: nothing started) |
+| patched | unset | 0 | `127.0.0.1` |
+| patched | `0.0.0.0` | 0 | `0.0.0.0` (opt-in kept) |
+| patched | `127.0.0.1` | 2 | none (trap unchanged; now documented) |
+
+Also done without a build: `gofmt -l` clean on the 5 changed Go files, `sh -n` on the script,
+`git apply --check` clean on the tree of the live binary (`engine-window-1011b`).
 
 Sampler: `scripts/dolt-remote-peer-audit.selftest.sh` (43 checks: classification, the three
 states, lock, log cap, the report verdicts). Seven deliberately broken copies (unknown
@@ -89,7 +119,7 @@ no-LISTEN guard removed) are each caught by at least one check.
 
 ## Applying in the window
 
-1. `git -C <engine> apply --check ga-k7o6ou-dolt-bind-loopback.patch`.
+1. `git -C <engine> apply --check ga-k7o6ou-dolt-bind-loopback.patch`, then the two Go tests above.
 2. Normal engine window. The first gc command that materializes the packs after the swap
    rewrites the script; confirm what will actually run with
    `grep -n '^DOLT_HOST=' $GC_CITY_PATH/.gc/system/packs/bd/assets/scripts/gc-beads-bd.sh`
