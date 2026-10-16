@@ -53,22 +53,46 @@ gc would stop managing Dolt at its next restart. Two more dead ends, both checke
 `lsof` line whose COMMAND is `dolt` and counts only client-side sockets with a local PID, and a
 remote client has none. `scripts/dolt-remote-peer-audit.sh` asks the inverted question: it reads
 the Dolt process's own sockets, keeps only those on a port Dolt listens on (its outbound
-connections, e.g. S3 backup, are not clients), and classifies each peer as `loopback`,
-`self_lan` (a client on this machine using the LAN IP; breaks under a loopback bind too) or
-`remote`. Each sample is `clean`, `nonloopback` or `unknown`; a failed `lsof` or a missing pid
-is `unknown`, never `clean`.
+connections, e.g. S3 backup, are not clients), and classifies each peer as `loopback` (IPv4
+`127.*`, including `::ffff:127.*`), `loopback6` (`[::1]`), `self_lan` (a client on this machine
+using the LAN IP; breaks under a loopback bind too) or `remote`. Each sample is `clean`,
+`nonloopback` or `unknown`; a failed `lsof` or a missing pid is `unknown`, never `clean`.
+
+`[::1]` has its own bucket and counts as `nonloopback` because the live listener is dual-stack
+(`lsof` shows `IPv6 *:52756`) and a `127.0.0.1` bind makes it IPv4-only: a client that reaches
+the port over `::1` gets `ECONNREFUSED` (measured with a plain Python socket pair, both ways).
+It is conservative: a client that dials `localhost` and falls back to IPv4 by itself would show
+up here too, and the probe cannot tell the two apart. Find out who it is before lifting the
+block.
+
+The log is read with suspicion. `report` accepts only a line that matches the exact record
+format the sampler writes, whole; anything else is an unreadable line. A sampler append cut in
+the middle (the data volume filled on 15/10 at 21:09), or a log that ends in a run of zero bytes
+(a crash or reboot can leave that where an append never reached disk; simulated in the selftest, not measured), is closed with a newline by the next sample,
+so it cannot glue onto the next record. The script pins `LC_ALL=C`: in a UTF-8 shell the macOS
+`awk` aborts on a line cut inside a multibyte character, and `report` would give no verdict
+until that line aged out of the log. An unreadable line that mentions
+`nonloopback` stops the verdict from being `LIMPO`, because it cannot be dated and so cannot be
+shown to lie outside the window.
 
 * It runs from `packs/town-deltas/assets/com.gascity.dolt-remote-peer-audit.plist` (60 s,
   ~0.17 s CPU per sample). The deploy installer loads new `com.gascity.*` plists from that
   directory on the first deploy after merge. Merged is not alive: confirm with
   `launchctl list | grep dolt-remote-peer-audit` and a growing
   `.gc/logs/dolt-remote-peers.jsonl`.
-* Verdict: `scripts/dolt-remote-peer-audit.sh report 48`. Exit 0 `LIMPO`; exit 1 `BLOQUEADO`
-  (lists the peers); exit 2 `INSUFICIENTE` (under 48 h of coverage, a gap above 15 min, more
-  than 10% `unknown`, or unreadable lines). A `BLOQUEADO` answer restarts the clock: deal with
-  that client, then wait for 48 h of clean samples.
+* Verdict: `scripts/dolt-remote-peer-audit.sh report 48` (hours are decimal: `08` is 8). Exit 0
+  `LIMPO`; exit 1 `BLOQUEADO` (lists the peers; for `[::1]` it also says why); exit 2
+  `INSUFICIENTE` (under 48 h of coverage, a gap above 15 min, more than 10% `unknown`, a
+  stretch of more than 15 min made only of `unknown`, more than 1% unreadable lines, or any
+  unreadable line that mentions `nonloopback`). A `BLOQUEADO` answer restarts the clock: deal
+  with that client, then wait for 48 h of clean samples.
 * Limit: it is a snapshot every 60 s. A client that connects for milliseconds once a day can
-  slip past it. `LIMPO` means "no non-loopback connection in N samples over H hours".
+  slip past it. `LIMPO` means "no client outside the IPv4 loopback in N valid readings (+M
+  unknown) over H hours".
+* A sampler that hangs holds the lock and sampling stops (`dolt-pid-lib` runs one `lsof` with
+  no time limit before the bounded one). That shows up as `INSUFICIENTE` ("the last sample is
+  old"), never as `LIMPO`. A lock with no readable pid is taken over once it is 10 minutes old
+  (`DOLT_PEER_AUDIT_LOCK_STALE_MIN`); a lock whose owner is alive never is.
 * Retire it after the bind is live and proven (`launchctl bootout` + `launchctl disable`, then
   delete the plist): a remote client is then refused, not seen.
 
@@ -151,5 +175,7 @@ projection deletes `GC_DOLT_HOST` for managed-local targets in places
   still advertises `GC_DOLT_HOST` as the way to customize; see the trap above.
 * `root` with an empty password. Loopback shrinks who can reach it to local processes; it does
   not authenticate them. Setting a password is a separate hardening bead.
-* IPv6: a `127.0.0.1` bind drops the dual-stack wildcard. No client was seen on `::1`, and
-  gc's own connect host is `127.0.0.1` (`connect_host`, `managedDoltConnectHost`).
+* IPv6: a `127.0.0.1` bind drops the dual-stack wildcard, so `::1` clients are refused. The
+  sampler now counts them in their own `loopback6` field and any of them blocks the verdict, so
+  the 48 h log answers this itself instead of resting on a one-off look. gc's own connect host
+  is `127.0.0.1` (`connect_host`, `managedDoltConnectHost`).
