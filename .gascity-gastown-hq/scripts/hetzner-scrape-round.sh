@@ -17,7 +17,7 @@
 #
 # CÓDIGOS DE SAÍDA — 96..99 significam "rode local": quem chama NUNCA trata isso como falha do raspador (mesma convenção do mbp-run.sh).
 #   0..94  código do raspador (propagado); 95 = rc >= 95 do raspador (inclusive 124 = estourou o --timeout, ou rc ilegível no nó): o valor cru vai SEMPRE na linha `scraper_rc_raw=`
-#   97  uso errado (inclusive opção sem valor), nome inválido, raspador fora da lista ou BLOQUEADO, código do rig ou lista ausente (também no `check`), staging dentro de shared/ (jamais grava na produção)
+#   97  uso errado (inclusive opção sem valor e `--tenant` — inteiro ou abreviado — depois do `--`), nome inválido, raspador fora da lista ou BLOQUEADO (inclusive: sem --tenant, raspador com algum `!raspador:tenant`), código do rig ou lista ausente (também no `check`), staging dentro de shared/ (jamais grava na produção)
 #   98  nó indisponível ou sem condição: ssh não responde, ambiente não preparado (rode bootstrap), disco < HETZNER_SCRAPE_MIN_DISK_MB, conteúdo reprovado pela varredura, ssh caiu no meio
 #   99  desligado: falta $CITY/.gc/hetzner-node.on (a mesma bandeira do nó de testes; apagar = desligar)
 #
@@ -79,6 +79,8 @@ loose_realpath() {
 }
 
 # eligibility <raspador> [tenant]: imprime ALLOW | BLOCK <motivo> | NONE | UNREADABLE. rc 0 = pode rodar. A linha `!nome` (ou `!nome:tenant`) bloqueia e VENCE a permissão.
+# Sem tenant (tn vazio) o raspador roda TODOS os tenants ativos, então qualquer `!nome:tenant` dele bloqueia a rodada inteira (BLOCK, nomeando os tenants): o bloqueio por tenant não pode ser contornado por não dizer o tenant.
+# Permissão só de tenant (`nome:tenant`) sem tenant pedido não casa → NONE (recusa), como antes.
 eligibility() {
   local sc=$1 tn=${2:-} v rc
   [ -r "$ELIGIBLE" ] || { echo UNREADABLE; return 3; }
@@ -89,9 +91,11 @@ eligibility() {
       neg=0; if (substr(line,1,1)=="!") { neg=1; line=substr(line,2) }
       n=split(line,p,":"); name=p[1]; ten=(n>1 ? p[2] : "")
       if (name!=sc) next
-      if (ten!="" && ten!=tn) next
+      if (ten!="" && ten!=tn) { if (neg && tn=="") { tb=tb (tb=="" ? "" : ",") ten; if (twhy=="") twhy=why } next }
       if (neg) { blocked=1; bwhy=why } else allowed=1 }
-    END { if (blocked) { print "BLOCK " bwhy; exit 1 } if (allowed) { print "ALLOW"; exit 0 } print "NONE"; exit 2 }' "$ELIGIBLE"); rc=$?
+    END { if (blocked) { print "BLOCK " bwhy; exit 1 }
+          if (tb!="") { print "BLOCK sem --tenant a rodada pega todos os tenants ativos e " sc " tem tenant bloqueado: " tb (twhy=="" ? "" : " (" twhy ")") " — rode com --tenant <outro>"; exit 1 }
+          if (allowed) { print "ALLOW"; exit 0 } print "NONE"; exit 2 }' "$ELIGIBLE"); rc=$?
   echo "$v"; return $rc
 }
 
@@ -269,6 +273,12 @@ cmd_run() {
       --) shift; extra=("$@"); break;;
       *) die 97 "run: argumento desconhecido: $1 (argumentos do raspador vão depois de --)";;
     esac
+  done
+  # a elegibilidade checa o --tenant de ANTES do `--`, mas o argparse do raspador fica com o ÚLTIMO: tenant dito depois do `--` (inteiro, abreviado — --ten/--te —, com `=`) trocaria o checado → 97. Sem argumentos do raspador, nada a checar. `-t...` também é recusado: nenhum raspador o define hoje, e não se sabe o que será
+  local a k
+  for a in "${extra[@]+"${extra[@]}"}"; do
+    k=${a%%=*}
+    case $k in --t*) case --tenant in "$k"*) die 97 "run: '$a' depois de -- escolheria o tenant por fora da checagem: use --tenant <tenant> antes do --";; esac;; -t*) die 97 "run: '$a' depois de -- pode escolher o tenant por fora da checagem: use --tenant <tenant> antes do --";; esac
   done
   [[ "$sc" =~ $NAME_RE ]] || die 97 "run: nome de raspador inválido: '${sc}'"
   [ -z "$tn" ] || [[ "$tn" =~ $TENANT_RE ]] || die 97 "run: tenant inválido: '$tn'"

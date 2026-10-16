@@ -157,6 +157,11 @@ hsr -- eligible beta;                 check "eligible: a linha !beta VENCE a per
 hsr -- eligible gamma;                check "eligible: raspador que não está na lista -> NONE, rc 97 (não medi ≠ libera)" '[ $RC -eq 97 ] && [ "$OUT" = NONE ]'
 hsr -- eligible delta t1;             check "eligible: !delta:t9 não bloqueia o tenant t1" '[ $RC -eq 0 ] && [ "$OUT" = ALLOW ]'
 hsr -- eligible delta t9;             check "eligible: !delta:t9 bloqueia o tenant t9" '[ $RC -eq 97 ] && has "^BLOCK"'
+# sem tenant o raspador roda TODOS os tenants ativos: o bloqueio por tenant não pode ser contornado por não dizer o tenant
+hsr -- eligible delta;                check "eligible: delta SEM tenant -> BLOCK nomeando t9 (!delta:t9 não é contornado), rc 97" '[ $RC -eq 97 ] && has "^BLOCK .*t9" && has "--tenant <outro>"'
+printf 'echo:t1\n' > "$T/eligible.onlyten"
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.onlyten" -- eligible echo;       check "eligible: permissão só de tenant (echo:t1) sem tenant -> NONE, rc 97" '[ $RC -eq 97 ] && [ "$OUT" = NONE ]'
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.onlyten" -- eligible echo t1;    check "eligible: permissão só de tenant (echo:t1) com o tenant t1 -> ALLOW" '[ $RC -eq 0 ] && [ "$OUT" = ALLOW ]'
 hsr -- eligible 'a;b';                check "eligible: nome com metacaractere é recusado, rc 97" '[ $RC -eq 97 ] && has "inválido"'
 hsr -- eligible;                      check "eligible sem argumento: rc 97" '[ $RC -eq 97 ]'
 hsr HETZNER_SCRAPE_ELIGIBLE="$T/nao-existe" -- eligible alpha; check "eligible: lista ilegível -> UNREADABLE, rc 97 (falha fechada)" '[ $RC -eq 97 ] && has "UNREADABLE"'
@@ -180,6 +185,15 @@ C0=$(ncalls)
 hsr -- run 'A;b';                     check "run: nome inválido -> 97, sem ssh" '[ $RC -eq 97 ] && [ "$(ncalls)" = "$C0" ]'
 hsr -- run beta;                      check "run: raspador bloqueado -> 97 com o motivo, sem ssh" '[ $RC -eq 97 ] && has "BLOQUEADO" && has "motivo do bloqueio da beta" && [ "$(ncalls)" = "$C0" ]'
 hsr -- run gamma;                     check "run: raspador fora da lista -> 97, sem ssh" '[ $RC -eq 97 ] && has "não está em" && [ "$(ncalls)" = "$C0" ]'
+hsr -- run delta;                     check "run: delta SEM --tenant (roda todos os tenants, e t9 está bloqueado) -> 97 com o tenant nomeado, sem ssh" '[ $RC -eq 97 ] && has "BLOQUEADO" && has "t9" && has "--tenant <outro>" && [ "$(ncalls)" = "$C0" ]'
+hsr -- run delta --tenant t9;         check "run: delta --tenant t9 -> 97 (bloqueado), sem ssh" '[ $RC -eq 97 ] && has "BLOQUEADO" && [ "$(ncalls)" = "$C0" ]'
+hsr -- run delta --tenant t1;         check "run: delta --tenant t1 passa da elegibilidade (para só no código ausente do fake, não em BLOQUEADO), sem ssh" '[ $RC -eq 97 ] && has "código do raspador ausente" && ! has "BLOQUEADO" && [ "$(ncalls)" = "$C0" ]'
+# a 2ª porta: argumentos depois do `--` seguem VERBATIM ao raspador e o argparse fica com o último --tenant (tn=t1 passaria na checagem, o raspador rodaria t9)
+for a in "--tenant t9" "--tenant=t9" "--ten t9" "--te=t9" "--t t9" "-t t9"; do
+  hsr -- run delta --tenant t1 -- $a;  check "run: delta --tenant t1 -- $a -> 97 (tenant por fora da checagem), sem ssh" '[ $RC -eq 97 ] && has "antes do --" && [ "$(ncalls)" = "$C0" ]'
+done
+hsr -- run delta -- --tenant t9;      check "run: delta -- --tenant t9 (sem --tenant antes) -> 97, sem ssh" '[ $RC -eq 97 ] && has "antes do --" && [ "$(ncalls)" = "$C0" ]'
+hsr -- run delta --tenant t1 -- --limit 5 --finalidade venda; check "run: argumentos do raspador que não são tenant (--limit, --finalidade) depois do -- passam pela guarda (param só no código ausente do fake)" '[ $RC -eq 97 ] && has "código do raspador ausente" && ! has "antes do --"'
 hsr -- run alpha --tenant 'x y';      check "run: tenant com espaço -> 97" '[ $RC -eq 97 ]'
 hsr -- run alpha --limit abc;         check "run: --limit não numérico -> 97" '[ $RC -eq 97 ]'
 hsr -- run alpha --timeout 0;         check "run: --timeout 0 -> 97" '[ $RC -eq 97 ]'
