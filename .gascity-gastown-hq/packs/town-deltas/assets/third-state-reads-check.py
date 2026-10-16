@@ -5,11 +5,13 @@ Why: "could not read" handled as empty/zero is 6 of the 7 first-attempt rejectio
 approval (59% with vs 62% without), so the gate must refuse. This is the "has a failure test?" layer: error-empty-conflation-scan.sh judges HOW a script
 handles a failed read (whole files, report-only); this reads only the ADDED lines of `git diff base...head`, finds the new reads, and asks per read whether
 a test touched by the same diff makes that KIND of read fail (unreadable/missing file, corrupt JSON, failing command, locked or missing db, dead URL).
-NOT reads, from the calibration on 90 real branches (HQ + WA rig, see the bead): a dict .get() (51 of the 122 first-pass flags were in-memory lookups), SQL that
-writes or configures, head/tail/cat on a pipe or a heredoc write, code under docs/. Coverage is per FILE and KIND (a touched test that names the file and
-carries a failure marker for that kind), not per read: that is the check's known limit, and why a waiver names its reason.
-It never judges the handling: a test that injects the failure is the evidence that somebody looked. A read that cannot meaningfully fail is waived on its
-line (or the line above) with  third-state-waiver: <reason of 10+ chars>  — listed in the output, never silent.
+NOT reads (calibration on 90 real branches): a dict .get() (51 of the 122 first-pass flags), SQL that writes or configures, head/tail/cat on a pipe, a
+heredoc write, code under docs/. Coverage is per FILE and KIND (a touched test that names the file and carries a failure marker for that kind), not per
+read: the known limit, and why a waiver names its reason.
+Exclusions are decided per CALL, never per line (a write-mode open() or an INSERT beside a read hides nothing). A failure marker is an INJECTION (an
+exception raised or caught, a non-zero literal, a missing path, a stub that fails), never a bare word a happy-path test also contains (returncode,
+timeout, 500, missing) and never a comment. It reads only what it recognises: files it has no rules for are counted and named, never silently ok.
+A read that cannot meaningfully fail is waived on its line (or the line above) with  third-state-waiver: <reason of 10+ chars>  — listed, never silent.
 
 Modes (<state>/third-state-reads.conf; the file is born ABSENT = not switched on, the Mayor writes it):  mode=enforce|warn|off  and  enforce_pct=1..100.
   enforce  exit = the verdict.   warn  prints the verdict, exits 0.   off  checks nothing.   enforce_pct<100: a bead is in the "enforce" arm or the
@@ -37,16 +39,87 @@ OTHER_CODE = (".go", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".rb", ".java
 GENERIC = re.compile(r"os\.Open\(|ReadFile\(|readFileSync|exec\.Command\(|http\.(Get|Post)\(|sql\.Open\(|Unmarshal\(|child_process|fetch\(|JSON\.parse\(|File\.read|open\(")
 WAIVER = re.compile(r"third-state-waiver:\s*(\S.{9,})")
 
-# a statement that WRITES or configures (DDL, INSERT/UPDATE/DELETE, SET, non-schema PRAGMA) is not a read; the SQL text may sit on the next added line
-DB_WRITE = r"\.execute\(\s*[rbfu]{0,2}(\"\"\"|\'\'\'|\"|\')\s*(CREATE|INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE|SET|BEGIN|COMMIT|ROLLBACK|VACUUM|ATTACH|DETACH|PRAGMA\s+(?!table_x?info|index_list|foreign_key_list))\b"
+# a statement that WRITES or configures (DDL, INSERT/UPDATE/DELETE, SET, non-schema PRAGMA) is not a read; matched at the text right after each `.execute(`
+# (the SQL may sit on the next added line). It is judged per call: one INSERT on a line does not hide a SELECT or a fetch beside it.
+SQL_WRITE = r"\s*[rbfu]{0,2}(\"\"\"|\'\'\'|\"|\')\s*(CREATE|INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE|SET|BEGIN|COMMIT|ROLLBACK|VACUUM|ATTACH|DETACH|PRAGMA\s+(?!table_x?info|index_list|foreign_key_list))\b"
+OPEN_RE = r"(?<![\w.])open\(|\b(?:gzip|bz2|lzma|io|codecs)\.open\("   # open(file, mode); Path(p).open(mode) takes the mode first (PATH_OPEN)
+PATH_OPEN = r"\)\.open\("
+OTHER_FILE = r"\.(read_text|read_bytes)\(|\bos\.(walk|listdir|scandir)\(|\bglob\.i?glob\(|\.(iterdir|rglob)\("
+DB_READ = r"\bsqlite3\.connect\(|\.(fetchall|fetchone|fetchmany)\("
 
-# (kind, pattern that makes a line a read, pattern that makes it NOT one)
+
+def strip_comments(s):
+    """The code part of a line: a '#' outside quotes, at the start or after whitespace, begins a comment."""
+    q = ""
+    for i, c in enumerate(s):
+        if q:
+            q = "" if c == q and s[i - 1] != "\\" else q
+        elif c in "\"'":
+            q = c
+        elif c == "#" and (i == 0 or s[i - 1] in " \t"):
+            return s[:i]
+    return s
+
+
+def call_args(s, i):
+    """Top-level arguments of the call whose '(' ends just before s[i]; None when it never closes in s (then the caller treats it as a read)."""
+    args, cur, depth, q, k = [], "", 0, "", i
+    while k < len(s):
+        c = s[k]
+        if q:
+            if c == "\\":
+                cur, k = cur + s[k:k + 2], k + 1
+            else:
+                cur, q = cur + c, "" if c == q else q
+        elif c in "\"'":
+            cur, q = cur + c, c
+        elif c in "([{":
+            cur, depth = cur + c, depth + 1
+        elif c in ")]}" and depth:
+            cur, depth = cur + c, depth - 1
+        elif c == ")":
+            return args + [cur.strip()] if cur.strip() else args
+        elif c == "," and not depth:
+            args, cur = args + [cur.strip()], ""
+        else:
+            cur += c
+        k += 1
+    return None
+
+
+def writes_only(args, pos):
+    """open() writes (and so reads nothing) only when its MODE argument -- mode= or the positional at `pos` -- is a string literal that starts with w, a or x.
+    No mode, a variable, r / rb / r+, or a call that never closes is a read; a quoted 'w' elsewhere in the arguments (a filename) is not a mode."""
+    if args is None:
+        return False
+    named = [a.split("=", 1)[1].strip() for a in args if re.match(r"mode\s*=(?!=)", a)]
+    plain = [a for a in args if not re.match(r"[A-Za-z_]\w*\s*=(?!=)", a)]
+    mode = named[0] if named else plain[pos] if len(plain) > pos else ""
+    return bool(re.fullmatch(r"""(["'])[bt]*[wax][^"']*\1""", mode))
+
+
+def file_not_read(code, probe):
+    if re.search(OTHER_FILE, code):
+        return False
+    calls = [(m.end(), 1) for m in re.finditer(OPEN_RE, code)] + [(m.end(), 0) for m in re.finditer(PATH_OPEN, code)]
+    return bool(calls) and all(writes_only(call_args(probe, e), pos) for e, pos in calls)
+
+
+def db_not_read(code, probe):
+    if re.search(DB_READ, code):
+        return False
+    ends = [m.end() for m in re.finditer(r"[.]execute\(", code)]
+    return bool(ends) and all(re.match(SQL_WRITE, probe[e:], re.I) for e in ends)
+
+
+# (kind, pattern that makes a line a read, f(code, probe) -> True when the line is NOT a read after all). `code` is the line without its comment, `probe` is
+# `code` plus up to 3 following added lines (a wrapped call), so every exclusion is judged on the call, not on the line.
 READS = {
     "py": (
-        ("file", r"(^|[^\w.])open\(|\.(read_text|read_bytes)\(|\bos\.(walk|listdir|scandir)\(|\bglob\.i?glob\(|\.(iterdir|rglob)\(", r"open\([^)]*['\"][wax]"),
+        ("file", OPEN_RE + "|" + PATH_OPEN + "|" + OTHER_FILE, file_not_read),
         ("parse", r"\b(json|tomllib|yaml|pickle|plistlib)\.(loads?|safe_load)\(", None),
         ("cmd", r"\bsubprocess\.(run|check_output|check_call|call|Popen|getoutput|getstatusoutput)\(|\bos\.(popen|system)\(", None),
-        ("db", r"\bsqlite3\.connect\(|\.(fetchall|fetchone|fetchmany)\(|\.execute\(", DB_WRITE),
+        ("db", DB_READ + r"|[.]execute\(", db_not_read),
         ("http", r"\burlopen\(|\brequests\.(get|post|put|delete|head|request)\(|\bhttpx\.|\bhttp\.client\.|\bcreate_connection\(", None),
     ),
     "sh": (
@@ -54,14 +127,29 @@ READS = {
         ("file", r"(^\s*|;\s*|&&\s*|\|\|\s*|\bdo\s+|\bthen\s+)(cat|head|tail)\s+(-\S+\s+)*[^\s|;&<>-]|\bread\b[^<]*<\s*[^<(&\s]|\bdone\s*<\s*[^<(&\s]", None),
     ),
 }
-# what, inside the ADDED lines of a test that mentions the file, counts as making that kind of read fail
-FAILS = {
-    "file": r"chmod\s+0|unreadable|ilegív|inexist|nonexist|does[-_ ]not[-_ ]exist|no[-_ ]such|missing|ausente|rm\s+-f|FileNotFoundError|PermissionError|OSError|IOError|ENOENT|EACCES",
-    "parse": r"corrupt|garbage|truncat|malformed|invalid|not[-_ ]?json|broken|\{\{\{|partial|ilegív|JSONDecodeError|ValueError|ParseError",
-    "cmd": r"exit\s+[1-9]|return\s+[1-9]|returncode|rc\s*=\s*[1-9]|(?-i:\bfalse\b)|command not found|not on PATH|PATH=|CalledProcessError|TimeoutExpired|FileNotFoundError|non-?zero",
-    "db": r"OperationalError|DatabaseError|locked|corrupt|not a database|no such table|readonly|read-only|missing db|unable to open|ausente|ilegív|inexist|n[aã]o existe|does not exist",
-    "http": r"URLError|HTTPError|ConnectionError|timeout|timed out|refused|unreachable|offline|\b[45][0-9][0-9]\b|DNS",
-}
+
+# what, in the ADDED lines of a test (comments stripped) that names the file, counts as making that kind of read fail: an INJECTION, not a mention.
+# Not markers, because happy-path tests contain them: returncode == 0, timeout=5, a bare 4xx/5xx, missing, invalid, partial, rm -f, exit N, "false" in JSON.
+SIDE = r"side_effect\s*=\s*[\w.]*(?:Error|Exception|Expired|Timeout)\b"
+NOFILE = r"""["'/][^"'\s]*(?:nonexist|inexist|no[-_/]?such|does[-_]?not[-_]?exist|n[aã]o[-_/]?existe|absent|ausente|/dev/null/|/nope\b|/nowhere\b|missing[\w-]*[.]\w{2,4}\b)"""
+GARBAGE = r"""["'][^"'\n]*(?:garbage|corrupt|truncated|malformed|not[-_ ]?json|\{\{\{)|(?:echo|printf)\s[^|;&\n]*(?:garbage|corrupt|truncated|malformed|notjson)"""
+FAILS = {k: "|".join((SIDE,) + v) for k, v in {
+    "file": (r"FileNotFoundError|PermissionError|IsADirectoryError|NotADirectoryError|OSError|IOError|ENOENT|EACCES", NOFILE,
+             r"chmod\s+(?:0+|[ugoa]*-[rwx]+)\b|os\.chmod\([^)]*\b0(?:o0+)?\s*\)"),
+    "parse": (r"JSONDecodeError|ValueError|ParseError|TOMLDecodeError|YAMLError|UnpicklingError|ExpatError|UnicodeDecodeError", GARBAGE,
+              r"""(["'])[\[{](?:(?!\1)[^\]}\n])*\1"""),
+    "cmd": (r"CalledProcessError|TimeoutExpired|SubprocessError|FileNotFoundError|PermissionError|OSError",
+            r"\b(?:returncode|exit_?code|rc)\s*(?:!=\s*0|>\s*0|==?\s*[1-9]|:\s*[1-9])|\$\?\s*(?:-ne|!=)\s*0|\$\?\s*(?:=|==|-eq)\s*[1-9]",
+            r"\(\)\s*\{[^}]*\b(?:false|(?:return|exit)\s+[1-9])", r"\breturn\s+\(?\s*[1-9]\d*\s*,", r"(?:printf|echo)\b[^\n]*exit\s+[1-9]",
+            r"<<-?\s*[\"']?(\w+)[\"']?[^\n]*\n(?:(?![ \t]*\1[ \t]*$)[^\n]*\n)*?[ \t]*exit\s+[1-9]", r"^\s*false\s*$", r"command not found",
+            r"""PATH=["']?[^:\s"']*(?:nonexist|empty|nobin|no[-_]?such|/dev/null)|PATH=["']?(?=\s|$|["'])"""),
+    "db": (r"OperationalError|DatabaseError|sqlite3\.Error|database is locked|database disk image is malformed|not a database|no such table|unable to open database|"
+           r"read-?only database|BEGIN\s+(?:EXCLUSIVE|IMMEDIATE)", NOFILE, GARBAGE),
+    "http": (r"URLError|HTTPError|HTTPStatusError|ConnectionError|ConnectionRefusedError|ConnectionResetError|TimeoutError|socket\.timeout|gaierror|ReadTimeout|"
+             r"ConnectTimeout|RemoteDisconnected|requests\.exceptions|timed out|connection refused|name or service not known|network is unreachable",
+             r"(?:status(?:_code)?|http_code)\W{1,4}[45]\d\d\b|\bHTTP/\d(?:[.]\d)?\s+[45]\d\d\b|send_(?:response|error)\(\s*[45]\d\d",
+             r"""https?://[^\s"']*(?:localhost:[01]\b|127[.]0[.]0[.]1:[01]\b|nonexist\w*|[.]invalid\b|unreachable)"""),
+}.items()}
 
 
 class Cant(Exception):
@@ -70,7 +158,7 @@ class Cant(Exception):
 
 def git_diff(repo, base, head):
     # vazio → diff vazio = a branch não muda nada (rc 0 legítimo); falhou/ilegível (sem git, base inexistente, timeout) → Cant, nunca "diff vazio"
-    cmd = ["git", "-C", repo, "-c", "core.quotepath=off", "diff", "--no-color", "--no-ext-diff", "--unified=0", "%s...%s" % (base, head)]
+    cmd = ["git", "-C", repo, "-c", "core.quotepath=off", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--unified=0", "%s...%s" % (base, head)]
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=120)
     except (OSError, subprocess.SubprocessError) as e:
@@ -106,33 +194,59 @@ def parse_diff(text):
     return files, bad
 
 
+def lang_of(path, added):
+    """py / sh / other-code / "" by extension; a NEW extensionless file by its shebang (first added line is line 1)."""
+    ext = os.path.splitext(path)[1]
+    if ext in LANG:
+        return LANG[ext]
+    m = re.match(r"#!.*\b(python|bash|zsh|sh)\d*\b", added[0][1]) if not ext and added and added[0][0] == 1 else None
+    return "" if not m else "py" if m.group(1) == "python" else "sh"
+
+
+def waiver_of(t, before):
+    w = WAIVER.search(t) or WAIVER.search(before)
+    return w.group(1).strip() if w else ""
+
+
 def find_reads(files):
-    """-> (reads [(path, line, kind, text, waiver)], tests {path: text}, unsupported [(path, line)])."""
-    reads, tests, unsup = [], {}, []
+    """-> (reads [(path, line, kind, text, waiver)], tests {path: (text, text without comments)}, unsupported [(path, line)], not_analysed [path])."""
+    reads, tests, unsup, skipped = [], {}, [], []
     for path in sorted(files):
         added = files[path]
         if SKIP_RE.search(path):
+            skipped.append(path)
             continue
         if TEST_RE.search(path):
-            tests[path] = "\n".join(t for _, t in added)
+            tests[path] = ("\n".join(t for _, t in added), "\n".join(strip_comments(t) for _, t in added))
             continue
-        ext = os.path.splitext(path)[1]
+        ext, lang = os.path.splitext(path)[1], lang_of(path, added)
+        prev, text_of, nu = {}, dict(added), 0
         if ext in OTHER_CODE:
-            unsup += [(path, n) for n, t in added if GENERIC.search(t)][:3]
+            for n, t in added:
+                prev[n] = t
+                if GENERIC.search(t):
+                    w = waiver_of(t, prev.get(n - 1, ""))
+                    if w:
+                        reads.append((path, n, "other", t.strip(), w))
+                    elif nu < 3:
+                        unsup.append((path, n))
+                        nu += 1
             continue
-        rules = READS.get(LANG.get(ext, ""), ())
-        prev, text_of = {}, dict(added)
+        if not lang:
+            skipped.append(path)
+            continue
         for n, t in added:
             prev[n] = t
             if t.lstrip().startswith("#"):
                 continue
-            for kind, inc, exc in rules:
-                # a line that ends in `.execute(` carries its SQL on the next added line; no other line looks ahead
-                probe = t + " " + text_of.get(n + 1, "") if kind == "db" and re.search(r"[.]execute\(\s*$", t) else t
-                if re.search(inc, t) and not (exc and re.search(exc, probe, re.I if kind == "db" else 0)):
-                    w = WAIVER.search(t) or WAIVER.search(prev.get(n - 1, ""))
-                    reads.append((path, n, kind, t.strip(), w.group(1).strip() if w else ""))
-    return reads, tests, unsup
+            code, nxt = strip_comments(t), []
+            while len(nxt) < 3 and n + len(nxt) + 1 in text_of:
+                nxt.append(strip_comments(text_of[n + len(nxt) + 1]))
+            probe = " ".join([code] + nxt)
+            for kind, inc, notread in READS[lang]:
+                if re.search(inc, code) and not (notread and notread(code, probe)):
+                    reads.append((path, n, kind, t.strip(), waiver_of(t, prev.get(n - 1, ""))))
+    return reads, tests, unsup, skipped
 
 
 def stem(path):
@@ -142,7 +256,7 @@ def stem(path):
 def covered(read, tests):
     path, _, kind, _, _ = read
     s = stem(path)
-    return any((s in tp or s in tt) and re.search(FAILS[kind], tt, re.I) for tp, tt in tests.items())
+    return any((s in tp or s in raw) and re.search(FAILS[kind], code, re.I | re.M) for tp, (raw, code) in tests.items())
 
 
 def load_conf(state):
@@ -187,9 +301,13 @@ def arm_of(state, bead, pct, record):
         try:
             d = json.loads(line)
         except ValueError:
+            if json.dumps(bead) in line:
+                return None, "arms file has a corrupt line that names %s (repair or remove it; a redraw could flip a recorded holdout)" % bead
             continue
-        if isinstance(d, dict) and d.get("bead") == bead and d.get("arm") in ("enforce", "holdout"):
-            return d["arm"], ""
+        if isinstance(d, dict) and d.get("bead") == bead:
+            if d.get("arm") in ("enforce", "holdout"):
+                return d["arm"], ""
+            return None, "arms file: the row of %s has no valid arm (repair or remove it)" % bead
     arm = "enforce" if int(hashlib.sha256((SALT + ":" + bead).encode()).hexdigest()[:8], 16) % 100 < pct else "holdout"
     if record:
         row = json.dumps({"bead": bead, "arm": arm, "pct": pct, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}) + "\n"
@@ -256,12 +374,12 @@ def main():
             arm = "enforce"
     eff = "warn" if mode == "warn" or arm == "holdout" else "enforce"
 
-    cant, findings, waived, nreads = [], [], [], 0
+    cant, findings, waived, nreads, skipped = [], [], [], 0, []
     try:
         files, bad = parse_diff(git_diff(a.repo, a.base, a.head))
         if bad:
             cant.append("%d diff line(s) outside a readable file header" % bad)
-        reads, tests, unsup = find_reads(files)
+        reads, tests, unsup, skipped = find_reads(files)
         nreads = len(reads)
         for r in reads:
             if r[4]:
@@ -279,14 +397,19 @@ def main():
         for p, n, k, t, _ in findings:
             print("  %s:%d  [%s]  %s" % (p, n, k, t[:110]))
         print("  Fix: add, in a test of THIS diff that names the file, a case where the read FAILS (file unreadable/missing, JSON corrupt, command exits non-zero,\n"
-              "  db locked or missing, URL down) and assert the code lands in the inert state; or waive on the line:  third-state-waiver: <why it cannot fail>")
+              "  db locked or missing, URL down) and assert the code lands in the inert state -- inject it (raise/side_effect, a missing path, a stub that\n"
+              "  fails); a comment, a test name or an assertion that the call succeeded is not an injection. Or waive on the line:  third-state-waiver: <why it cannot fail>")
     for p, n, k, t, w in waived:
         print("  waived  %s:%d  [%s]  %s" % (p, n, k, w))
     for c in cant:
         print("%s NÃO SEI -- %s -- %s" % (tag, c, refuse if not findings else "also"))
+    if skipped:
+        print("NOTE: %d changed file(s) NOT analysed (docs/ build/ dist/ vendor/ retired/, or no rules for the type; a read in them is not seen): %s%s"
+              % (len(skipped), ", ".join(skipped[:5]), " ..." if len(skipped) > 5 else ""))
     if verdict == "ok":
-        print("%s ok -- %d new read(s), each with a failure test or a waiver (%d waived)." % (tag, nreads, len(waived)))
-    print("%s verdict=%s mode=%s arm=%s reads=%d uncovered=%d waived=%d" % (tag, verdict, eff if arm != "holdout" else "holdout", arm, nreads, len(findings), len(waived)))
+        print("%s ok -- %d recognised new read(s), each with a failure test or a waiver (%d waived)." % (tag, nreads, len(waived)))
+    print("%s verdict=%s mode=%s arm=%s reads=%d uncovered=%d waived=%d skipped=%d"
+          % (tag, verdict, eff if arm != "holdout" else "holdout", arm, nreads, len(findings), len(waived), len(skipped)))
     if eff != "enforce":
         return 0
     return 1 if findings else 2 if cant else 0

@@ -714,17 +714,17 @@ fi
 
 "Could not read" handled as empty/zero is 6 of the 7 first-attempt rejections, and prose
 (the E12 doctrine) did not move it, so the gate checks it. `third-state-reads-check.py`
-reads the ADDED lines of `origin/main...HEAD`, finds the new reads (open/read, json,
-subprocess, sqlite SELECTs, http; a dict `.get()` is not one) and asks per read whether a test
-of the same diff injects its failure. Exit 1 = a read with no failure test (file:line
-listed), exit 2 = could not tell (bad diff or base, an unsupported language, an invalid
-`.gc/third-state-reads.conf`); same hard-gate `TEST_EXIT`/`TEST_OUTPUT` signal as 2b-2d,
-and unknown is not pass. The mode (`enforce|warn|off`) and the holdout (`enforce_pct`)
-live in `$GC_CITY_PATH/.gc/third-state-reads.conf`, which is born ABSENT = not switched
-on; a `warn` or holdout bead prints the list and exits 0. The city's copy of the script
-is used before the branch's: a branch must not be judged by a checker it can edit.
-A crashed script is exit 2, never a finding. Kill switch: `THIRD_STATE_READS_CHECK=off`
-or the flag file `$GC_CITY_PATH/.gc/third-state-reads-check.off` makes the step a loud no-op.
+reads the ADDED lines of `origin/main...HEAD`, finds the new reads it recognises (open/read,
+json, subprocess, sqlite SELECTs, http; a dict `.get()` is not one) and asks per read whether a
+test of the same diff injects its failure. Exit 1 = a read with no failure test (file:line
+listed), exit 2 = could not tell (bad diff or base, an invalid `.gc/third-state-reads.conf`);
+same hard-gate `TEST_EXIT`/`TEST_OUTPUT` signal as 2b-2d, and unknown is not pass. Files it
+cannot analyse are named in a `NOT analysed` note. The mode (`enforce|warn|off`) and the holdout
+(`enforce_pct`) live in `$GC_CITY_PATH/.gc/third-state-reads.conf`, born ABSENT = not switched
+on; `warn` and holdout beads print the list and exit 0. The city's copy of the script is used
+before the branch's: a branch must not be judged by a checker it can edit. A crashed script is
+exit 2, never a finding. Kill switch: `THIRD_STATE_READS_CHECK=off` or the flag file
+`$GC_CITY_PATH/.gc/third-state-reads-check.off` makes the step a loud no-op.
 
 ```bash
 # SELFTEST-EXTRACT third-state-reads-step2e: BEGIN
@@ -737,7 +737,7 @@ elif [ ! -f "$TSR_CHK" ]; then
   # Fail-soft, same convention as 2b-2d: a city snapshot that predates this story's own merge must not block on a check that cannot run yet.
   echo "NOTE: third-state-reads-check.py not found in the city or the branch -- skipped (pre-ga-57e7l0.1 city snapshot?)."
 else
-  # vazio → o script diz "ok -- 0 new read(s)" e sai 0; falhou/ilegível → sai 2 (não sei) e o passo reprova (TEST_EXIT=2), nunca "sem leituras novas"
+  # vazio → o script diz "ok -- 0 recognised new read(s)" e sai 0; falhou/ilegível → sai 2 (não sei) e o passo reprova (TEST_EXIT=2), nunca "sem leituras novas"
   TSR_OUT=$(python3 "$TSR_CHK" --repo "$WORKTREE_PATH" --base origin/main --head HEAD --city "$GC_CITY_PATH" --bead "$TSR_BEAD" 2>&1)
   TSR_RC=$?
   # exit 1 only counts as a finding when the script says so; a crash (no verdict line), a missing python3 (127) or any other code is "could not tell"

@@ -2,18 +2,13 @@
 # prod-tests/gascity/story-ga-57e7l0.1.sh — prod test for ga-57e7l0.1 (slice 2/3 of ga-57e7l0): /gate-done and the gate runner REFUSE a diff with a new failable
 # read that no test makes fail (assets/third-state-reads-check.py).
 #
-# What "deployed and correct" means here:
-#   (1) the pieces are in the LIVE tree and parse: the checker, its selftest, the gate formula, commands/gate-done.md;
-#   (2) the gate formula carries step 2e exactly once, valid TOML, and its snippet has no backslash (a TOML """ string would eat it);
-#   (3) gate-done.md has the refusal section after the third-state self-audit and before Step 1, listed under ## Contents;
-#   (4) the hermetic selftest passes on the live tree (each kind of read against its previous HEAD, the modes and arms, six mutants, step 2e run in
-#       bash 3.2 and zsh);
-#   (5) the checker runs on a REAL diff of the live repo, read-only (scratch state dir, warn mode, --no-record) and prints a verdict line: exit 0, not a crash.
-#
-# Not asserted here, and why: (a) the mode on the live city — .gc/third-state-reads.conf is born ABSENT (= "fatia 2 não ligada" to the report) and
-# writing it is the Mayor's step after reading the false-positive calibration on the bead; this test only says which state it is in. (b) that the third-state
-# share of rejections fell below 30% and first-attempt approval reached 60% is a measurement over 7 days of gate runs (third-state-report.py), not a deploy check.
-# Nothing is written outside a scratch dir. Called by run.sh after deploy (STORY_ID=ga-57e7l0.1). Exits 0 on pass.
+# Deployed and correct means: (1) the checker, its selftest, the gate formula and commands/gate-done.md are in the LIVE tree and parse; (2) the formula
+# carries step 2e exactly once, valid TOML, no backslash in the snippet (a TOML """ string would eat it); (3) gate-done.md has the refusal section after
+# the third-state self-audit and before Step 1, listed under ## Contents; (4) the hermetic selftest passes on the live tree; (5) the checker runs on a REAL
+# diff of the live repo, read-only (scratch state dir, warn mode, --no-record) and prints a verdict line: exit 0, not a crash.
+# Not asserted: (a) the mode on the live city -- .gc/third-state-reads.conf is born ABSENT (= "fatia 2 não ligada") and the Mayor writes it after reading
+# the calibration on the bead; this test only says which state it is in. (b) the third-state share falling below 30% and first-attempt approval reaching
+# 60% is a 7-day measurement (third-state-report.py), not a deploy check. Nothing is written outside a scratch dir. Called by run.sh after deploy.
 
 set -uo pipefail
 
@@ -66,7 +61,7 @@ grep -q 'selftest: [0-9]* passed, 0 failed' "$S/selftest.out" || fail "the selft
 log "third-state-reads-check.selftest.sh: $(grep 'selftest:' "$S/selftest.out") ✓"
 
 # ── 5. the checker on a real diff of the live repo, read-only ──────────────────────────────────
-# exit 0 + a verdict line = it ran; the live HEAD may be main itself (an empty diff, "0 new read(s)") and that is a real answer, not a skipped check
+# exit 0 + a verdict line = it ran; the live HEAD may be main itself (an empty diff, "0 recognised new read(s)") and that is a real answer, not a skipped check
 REPO="$(git -C "$CITY" rev-parse --show-toplevel 2>/dev/null)" || fail "$CITY is not inside a git repository"
 mkdir -p "$S/state" && printf 'mode=warn\n' > "$S/state/third-state-reads.conf" || fail "could not write the scratch conf"
 rc=0; THIRD_STATE_READS_STATE_DIR="$S/state" python3 -I "$CHECK" --repo "$REPO" --base origin/main --head HEAD --no-record > "$S/live.out" 2>&1 || rc=$?
