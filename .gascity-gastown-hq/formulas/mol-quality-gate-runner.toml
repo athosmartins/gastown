@@ -710,6 +710,55 @@ fi
 # SELFTEST-EXTRACT e12-coverage-step2d: END
 ```
 
+**2e. A new failable read needs a test that makes it fail (ga-57e7l0.1):**
+
+"Could not read" handled as empty/zero is 6 of the 7 first-attempt rejections, and prose
+(the E12 doctrine) did not move it, so the gate checks it. `third-state-reads-check.py`
+reads the ADDED lines of `origin/main...HEAD`, finds the new reads (open/read, json,
+subprocess, sqlite SELECTs, http; a dict `.get()` is not one) and asks per read whether a test
+of the same diff injects its failure. Exit 1 = a read with no failure test (file:line
+listed), exit 2 = could not tell (bad diff or base, an unsupported language, an invalid
+`.gc/third-state-reads.conf`); same hard-gate `TEST_EXIT`/`TEST_OUTPUT` signal as 2b-2d,
+and unknown is not pass. The mode (`enforce|warn|off`) and the holdout (`enforce_pct`)
+live in `$GC_CITY_PATH/.gc/third-state-reads.conf`, which is born ABSENT = not switched
+on; a `warn` or holdout bead prints the list and exits 0. The city's copy of the script
+is used before the branch's: a branch must not be judged by a checker it can edit.
+A crashed script is exit 2, never a finding. Kill switch: `THIRD_STATE_READS_CHECK=off`
+or the flag file `$GC_CITY_PATH/.gc/third-state-reads-check.off` makes the step a loud no-op.
+
+```bash
+# SELFTEST-EXTRACT third-state-reads-step2e: BEGIN
+TSR_BEAD="{{bead_id}}"
+TSR_CHK="$GC_CITY_PATH/packs/town-deltas/assets/third-state-reads-check.py"
+[ -f "$TSR_CHK" ] || TSR_CHK="$WORKTREE_PATH/.gascity-gastown-hq/packs/town-deltas/assets/third-state-reads-check.py"
+if [ "${THIRD_STATE_READS_CHECK:-}" = "off" ] || [ -f "$GC_CITY_PATH/.gc/third-state-reads-check.off" ]; then
+  echo "NOTE: third-state reads check (ga-57e7l0.1) is switched OFF (THIRD_STATE_READS_CHECK=off or .gc/third-state-reads-check.off) -- not checked."
+elif [ ! -f "$TSR_CHK" ]; then
+  # Fail-soft, same convention as 2b-2d: a city snapshot that predates this story's own merge must not block on a check that cannot run yet.
+  echo "NOTE: third-state-reads-check.py not found in the city or the branch -- skipped (pre-ga-57e7l0.1 city snapshot?)."
+else
+  # vazio → o script diz "ok -- 0 new read(s)" e sai 0; falhou/ilegível → sai 2 (não sei) e o passo reprova (TEST_EXIT=2), nunca "sem leituras novas"
+  TSR_OUT=$(python3 "$TSR_CHK" --repo "$WORKTREE_PATH" --base origin/main --head HEAD --city "$GC_CITY_PATH" --bead "$TSR_BEAD" 2>&1)
+  TSR_RC=$?
+  # exit 1 only counts as a finding when the script says so; a crash (no verdict line), a missing python3 (127) or any other code is "could not tell"
+  if [ "$TSR_RC" -eq 1 ] && ! echo "$TSR_OUT" | grep -q 'verdict=reads-without-test'; then TSR_RC=2; fi
+  if [ "$TSR_RC" -gt 2 ]; then TSR_RC=2; fi
+  echo "$TSR_OUT"
+  if [ "$TSR_RC" -ne 0 ]; then
+    TEST_EXIT=$TSR_RC
+    TEST_OUTPUT="$TEST_OUTPUT
+
+THIRD-STATE READS CHECK FAILED (ga-57e7l0.1, exit $TSR_RC: 1 = a new read with no test that
+injects its failure, 2 = could not tell): this branch adds a read that can fail, and nothing
+proves the code lands in the inert state when it does. To fix: add, in a test of this diff
+that names the file, a case where the read FAILS (file unreadable/missing, JSON corrupt,
+command exits non-zero, db locked or missing, URL down), commit, re-run /gate-done.
+$TSR_OUT"
+  fi
+fi
+# SELFTEST-EXTRACT third-state-reads-step2e: END
+```
+
 **3. Handle test failure:**
 
 If `TEST_EXIT != 0`:

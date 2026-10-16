@@ -1,5 +1,5 @@
 ## Contents
-- Como rodar · Como ler uma célula · Ler os 7 dias contra a meta · Limites conhecidos · Manter o ledger manual
+- Como rodar · Como ler uma célula · Ler os 7 dias contra a meta · Limites conhecidos · Ligar a fatia 2 · Manter o ledger manual
 
 # Relatório do 3º estado (ga-57e7l0.2)
 
@@ -51,6 +51,15 @@ Meta da história (7 dias): reprovações por 3º estado **< 30%** e 1ª tentati
   uma linha por bead (`{"bead":"<id>","arm":"enforce"|"holdout"}`, a 1ª linha da bead vale); conf sem esse arquivo = `NÃO SEI`, e bead sem linha vai para `sem registro de braço`.
 - O rótulo **subconta**: o revisor nem sempre escreve `root-class:error-vs-empty` (gate-run ga-91m4ga não tem e é 3º estado). Por isso o ledger manual vence o rótulo.
 - Uma bead que passou nos revisores e falhou no merge tem 1º veredito FAIL e entra na conta da 1ª tentativa como FAIL (é o que o gate registrou), mas não na do 3º estado.
+
+## Ligar a fatia 2
+A checagem de leitura nova sem teste de falha (`third-state-reads-check.py`, ga-57e7l0.1) nasce **desligada**: conf ausente = "fatia 2 não ligada". Quem liga é o Mayor, depois de ler a calibração
+na bead ga-57e7l0.1. A conf é `.gc/third-state-reads.conf`, uma chave por linha:
+- `mode=enforce|warn|off` (sem `mode=` vale `enforce`) e `enforce_pct=1..100` (sem a chave vale 100).
+- Para os 7 dias de medição: `mode=enforce` + `enforce_pct=50`. Metade das beads é recusada de verdade; a outra metade (`holdout`) roda a mesma checagem como `warn`. Cada bead grava o braço em
+  `.gc/third-state-reads-arms.jsonl` (a 1ª linha vale) e este relatório compara os dois braços.
+- `mode=off` conta como **ligada** para este relatório (a conf existe) mas não checa nada; para parar só a checagem, use `THIRD_STATE_READS_CHECK=off` ou o arquivo `.gc/third-state-reads-check.off`.
+- Conf inválida = exit 2 `NÃO SEI`, nunca "desligada". Falso positivo pontual: `third-state-waiver: <motivo de 10+ caracteres>` na linha da leitura ou na de cima (a saída lista o waiver).
 
 ## Manter o ledger manual
 `packs/town-deltas/assets/third-state-manual.tsv`: uma linha por (bead, dia UTC) — `bead<TAB>AAAA-MM-DD<TAB>3o-estado|outro<TAB>fonte`. Vale para todo FAIL de revisor da bead naquele dia.

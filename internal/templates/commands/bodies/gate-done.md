@@ -1,7 +1,7 @@
 ---
 description: Signal work ready for quality gate (writes durable marker; launchd guard picks it up within ~2 min)
 argument-hint: ""
-allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git fetch:*), Bash(git log:*), Bash(git diff:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*), Bash(bash:*)
+allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git fetch:*), Bash(git log:*), Bash(git diff:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*), Bash(bash:*), Bash(python3:*)
 ---
 
 # Gate Done — Signal Work Ready for Quality Gate
@@ -10,6 +10,7 @@ allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash
 
 • What This Does · Pre-flight Checks
 • Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
+• Pre-flight Check: NEW READS NEED A FAILURE TEST (mechanical — before you push)
 • Step 1: Push your branch (fail-closed verification) · Step 2: Gather context
 • Step 2b: Pre-gate self-review (CLOSED — nothing to run while .gc/pregate.off exists)
 • Step 3: Create the ready-for-gate marker · Step 4: Report · Common Issues
@@ -151,6 +152,39 @@ This is a judgment sweep, not a lint — nothing here can grade it for you but
 you. You'll record a one-line result of it in Step 3 below, so the sweep
 leaves a trail instead of disappearing into the same silence it exists to
 catch.
+
+## Pre-flight Check: NEW READS NEED A FAILURE TEST (mechanical — before you push)
+
+The sweep above is judgment, and prose did not move first-attempt approval
+(59% with the E12 doctrine, 62% without), so this one is mechanical.
+`third-state-reads-check.py` reads the ADDED lines of your diff, finds every NEW
+read that can fail (open/read, json, subprocess, sqlite SELECTs, http; a dict
+`.get()` is not one, the sweep above covers that) and asks, per read, whether a
+test in the same diff makes that kind of read fail: file unreadable or missing,
+JSON corrupt, command exits non-zero, db locked or missing, URL down. A read
+with no such test is listed as `file:line` and the check refuses.
+
+```bash
+# <bead-id> = the bead you are building (the id in your branch name). --no-record: the gate runner
+# records the arm (its step 2e repeats this check); this is the early look, before a review cycle burns.
+python3 "$GC_CITY_PATH/packs/town-deltas/assets/third-state-reads-check.py" --repo . --base origin/main --head HEAD --bead "<bead-id>" --no-record
+echo "third-state-reads-check exit: $?"
+```
+
+- **exit 0** — carry on. "not switched on", `warn` and the holdout arm also exit 0:
+  they print the list and do not refuse — read it anyway.
+- **exit 1** — STOP, do not push. For each listed `file:line`, add to a test that
+  names that file a case where the read FAILS, and assert the code lands in the
+  INERT state (rule 2 above). Commit, re-run. A read that truly cannot fail (a
+  packaged constant) is waived on its line with
+  `third-state-waiver: <why, 10+ chars>`; the waiver is listed and reviewers see it.
+- **exit 2** — it could not tell (bad diff or base, a language it has no rules
+  for, an invalid `.gc/third-state-reads.conf`, a missing bead id for the arm).
+  That is not ok and not skippable: read the reason, fix what it names, re-run.
+  If the script is not in the city snapshot yet, say so in Step 3's summary.
+
+Only the Mayor switches the check off (`THIRD_STATE_READS_CHECK=off` or the flag
+file `$GC_CITY_PATH/.gc/third-state-reads-check.off`).
 
 ## Step 1: Push your branch (fail-closed verification)
 
