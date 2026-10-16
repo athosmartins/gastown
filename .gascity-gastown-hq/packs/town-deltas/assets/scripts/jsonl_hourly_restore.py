@@ -20,12 +20,16 @@ A CONTA (issues, labels, dependências, comentários): manifest − exclusões p
   labels, dependências e comentários) o que entrou no import tem que ter voltado igual. Exclusão por desenho = tombstone
   (o importer o pula), filho de issue que não está no dump, aresta cujo alvo não está no store e comentários de conteúdo
   idêntico que o import funde; cada uma aparece NOMEADA e CONTADA no relatório. Coluna do dump que o conversor não leva ao
-  import (fora das conhecidas abaixo) é NOMEADA e contada em unmapped_columns: não some em silêncio, mas também não reprova a
-  prova. Medido em 16/10 nos dumps ao vivo: gastown work_type=1667, wisp_type=10, row_lock=22; lexbh row_lock=16. Se o
-  `bd import` aceita a coluna, é um nome a mais em _STR_FIELDS; quem mede isso com o bd real é a fatia 4.
+  import (fora das conhecidas abaixo), de QUALQUER tabela, é NOMEADA e contada em unmapped_columns ("work_type" nas issues,
+  "<tabela>.<coluna>" nas demais): não some em silêncio, mas também não reprova a prova. Medido em 16/10 nos dumps ao vivo:
+  gastown work_type=1667, wisp_type=10, row_lock=22; lexbh row_lock=16. Nas dependências, metadata/thread_id/depends_on_wisp_id
+  estão vazios nos 7 bancos medidos (o hq estourou o tempo da consulta: lá só o wisp foi medido, 0). Se o `bd import` aceita a coluna, é um nome a mais em _STR_FIELDS/_CARRIED; quem mede isso com o bd real é a fatia 4.
 
 FAIL-CLOSED: tabela ausente, truncada, malformada ou linha sem id/alvo é erro (rc 1) e o --out é REMOVIDO — o convert grava
-  em <out>.part e só renomeia depois da última linha, porque o leitor emite linhas antes de validar o fim do documento. Valor
+  em <out>.part e só renomeia depois da última linha, porque o leitor emite linhas antes de validar o fim do documento. Coluna
+  NOT NULL do bd AUSENTE da linha (comments: id/author/text/created_at; dependencies: type), type de dependência vazio, id de
+  issue vazio e linha de config sem key também são erro: ausente é "não sei" e nunca vira "" nem "blocks" (que bloqueia o ready).
+  Coluna presente e "" é valor e segue como veio. Valor
   do dump que o conversor não conseguiu carregar (prioridade não numérica, metadata que não é objeto, data fora do formato)
   é contado em bad_values e REPROVA a prova. Entrada da prova ilegível ou fora da forma (stats, manifest, import, export) dá
   verdict "fail" com rc 1 — nunca traceback, nunca "ok".
@@ -115,6 +119,17 @@ _BOOL_FIELDS = ("pinned", "ephemeral", "is_template", "no_history")
 _COMPUTED = {"id", "is_blocked", "content_hash", "compaction_level", "timeout_ns"}
 _KNOWN = set(_TS_FIELDS) | set(_STR_FIELDS) | set(_BOOL_FIELDS) | {"priority", "estimated_minutes", "metadata"} | _COMPUTED
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$")
+# o mesmo para as tabelas-filhas: o que cada uma leva ao import (o `id` da dependência é gerado pelo bd). Outra coluna com valor é contada
+_CARRIED = {"labels": {"issue_id", "label"}, "comments": {"id", "issue_id", "author", "text", "created_at"}, "config": {"key", "value"},
+            "dependencies": {"id", "issue_id", "depends_on_issue_id", "depends_on_external", "depends_on_id", "type", "created_at", "created_by"}}
+_BLANK = ("", None, "0", "{}", "null", {}, [])  # o default do schema do bd é metadata "{}" e thread_id "": isso não é dado perdido
+
+
+def _audit(stats, table, row):
+    """Colunas de `row` que o conversor não leva ao import, com valor: contadas como "<tabela>.<coluna>" (nunca descartadas em silêncio)."""
+    for k, v in row.items():
+        if k not in _CARRIED[table] and v not in _BLANK:
+            stats["unmapped_columns"][table + "." + k] = stats["unmapped_columns"].get(table + "." + k, 0) + 1
 
 
 def _ts(v, stats):
@@ -184,17 +199,31 @@ def _convert(base, db, out_path, stats):
     labels, deps, config = list(_rows(base, "labels")), list(_rows(base, "dependencies")), list(_rows(base, "config"))
     by_label, by_dep, by_comment = {}, {}, {}
     for r in labels:
+        _audit(stats, "labels", r)
         by_label.setdefault(r["issue_id"], []).append(r["label"])
     for r in deps:
+        _audit(stats, "dependencies", r)
+        # type é NOT NULL DEFAULT 'blocks': ausente ou "" = não sei o tipo, e "blocks" tem efeito (bloqueia o ready) => erro, nunca o default
+        if not r.get("type"):
+            raise DumpError("dependência sem type em %s" % r.get("issue_id"))
         by_dep.setdefault(r["issue_id"], []).append(r)
+    for r in config:
+        _audit(stats, "config", r)
     n_comments = 0
     for r in _rows(base, "comments"):
+        # NOT NULL no schema: AUSENTE ou null (ex.: o dump trouxe `body` no lugar de `text`) = não sei => erro; presente e "" é valor e passa
+        gone = [c for c in ("id", "author", "text", "created_at") if r.get(c) is None]
+        if gone:
+            raise DumpError("comentário sem %s em %s" % (",".join(gone), r.get("issue_id")))
+        _audit(stats, "comments", r)
         n_comments += 1
         by_comment.setdefault(r["issue_id"], []).append(r)
     # 1ª passada: ids que vão existir. O importer só aceita aresta cujo alvo está no store (ou é `external:`); a aresta para
     # um issue de outro banco / escrubado volta como "dangling", contada em vez de sumir calada.
     ids, every = set(), set()
     for row in _rows(base, "issues"):
+        if not row["id"]:  # id vazio = linha sem id, que o docstring já trata como erro
+            raise DumpError("issue com id vazio no dump")
         if row["id"] in every:
             raise DumpError("issue repetido no dump: %s" % row["id"])
         every.add(row["id"])
@@ -223,16 +252,15 @@ def _convert(base, db, out_path, stats):
                     if not target.startswith("external:") and target not in ids:
                         n_dangling += 1
                         continue
-                    kept.append({"issue_id": d["issue_id"], "depends_on_id": target, "type": d.get("type") or "blocks",
+                    kept.append({"issue_id": d["issue_id"], "depends_on_id": target, "type": d["type"],
                                  **({"created_at": _ts(d["created_at"], stats)} if d.get("created_at") else {}),
                                  **({"created_by": d["created_by"]} if d.get("created_by") else {})})
                 if kept:
                     rec["dependencies"] = kept
                 n_dep += len(kept)
             if iid in by_comment:
-                rec["comments"] = [{"id": c.get("id", ""), "issue_id": iid, "author": c.get("author", ""),
-                                    "text": c.get("text", ""), "created_at": _ts(c.get("created_at", ""), stats)}
-                                   for c in by_comment[iid]]
+                rec["comments"] = [{"id": c["id"], "issue_id": iid, "author": c["author"], "text": c["text"],
+                                    "created_at": _ts(c["created_at"], stats)} for c in by_comment[iid]]
                 n_com += len(by_comment[iid])
             n_issues += 1
             out.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -247,7 +275,7 @@ def _convert(base, db, out_path, stats):
         "written": {"issues": n_issues, "labels": n_lab, "dependencies": n_dep, "comments": n_com},
         "orphans": orphan,
         "dangling_dependencies": n_dangling,
-        "config": {r["key"]: r["value"] for r in config if "key" in r},
+        "config": {r["key"]: r["value"] for r in config},  # linha sem key ou sem value = KeyError = rc 1 (não é "linha vazia")
         "bad_values": {k: stats[k] for k in ("bad_priority", "bad_estimated_minutes", "bad_metadata", "bad_timestamp")},
         "unmapped_columns": stats["unmapped_columns"],
     }
@@ -282,7 +310,9 @@ def _scan(path):
     idênticos do gastown viraram "429 de 443" sem que ninguém soubesse explicar a diferença."""
     fps, labels, deps, comments = {}, collections.Counter(), collections.Counter(), collections.Counter()
     # arquivo vazio (0 linhas) → 0 issues, e a conta o compara com o esperado (só passa se o esperado também for 0); ausente, linha
-    # ilegível ou fora da forma → DumpError, que o cmd_reconcile devolve como verdict fail
+    # ilegível ou fora da forma → DumpError, que o cmd_reconcile devolve como verdict fail. Isso inclui dependência sem `type` e
+    # comentário sem author/text/created_at: o convert sempre os grava e o export do bd os trouxe em todas as linhas medidas (lexbh,
+    # 16/10), então a chave que SUMIU é o bd (ou o import) perdendo o dado — um default aqui o igualaria ao "blocks"/"" legítimo dos dois lados
     try:
         f = open(path, "r", encoding="utf-8")
     except OSError as e:
@@ -301,9 +331,9 @@ def _scan(path):
                 for lb in rec.get("labels") or []:
                     labels[(iid, lb)] += 1
                 for d in rec.get("dependencies") or []:
-                    deps[(d["issue_id"], d["depends_on_id"], d.get("type") or "blocks")] += 1
+                    deps[(d["issue_id"], d["depends_on_id"], d["type"])] += 1
                 for c in rec.get("comments") or []:
-                    comments[(iid, c.get("author", ""), c.get("text", ""), c.get("created_at", ""))] += 1
+                    comments[(iid, c["author"], c["text"], c["created_at"])] += 1
             except _BAD as e:
                 raise DumpError("%s:%d linha ilegível ou fora da forma (%s: %s)" % (path, n, type(e).__name__, e))
     return fps, labels, deps, comments
@@ -369,7 +399,7 @@ def reconcile(db, manifest_counts, conv, imp_path, exp_path):
            "table": table, "problems": problems,
            "exclusions": {"tombstones": conv["tombstones_skipped"], "orphans": orph,
                           "dangling_dependencies": conv["dangling_dependencies"], "duplicate_comments_collapsed": collapsed},
-           "unmapped_columns": conv.get("unmapped_columns", {})}
+           "unmapped_columns": conv["unmapped_columns"]}  # stats sem a chave = KeyError = verdict fail; "{}" diria "nada ficou de fora" sem saber
     return rep["verdict"], rep
 
 

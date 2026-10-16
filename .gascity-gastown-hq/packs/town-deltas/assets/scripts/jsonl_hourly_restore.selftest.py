@@ -268,11 +268,19 @@ with tempfile.TemporaryDirectory(prefix="jhrst.") as T:
         r = run("convert", "--dump", d2, "--db", "hq", "--out", P(name))
         return r, os.path.exists(P(name)) or os.path.exists(P(name) + ".part")
 
+    # coluna NOT NULL do bd AUSENTE de uma linha = dump com outra forma (desconhecido): erro, nunca "" nem "blocks". Uma por coluna.
+    CM = {"id": "c1", "issue_id": "hq-1", "author": "x", "text": "oi", "created_at": "2026-05-16 15:00:00"}
+    DP = {"issue_id": "hq-1", "depends_on_issue_id": "hq-2", "type": "blocks"}
+    wo = lambda d, k: {a: b for a, b in d.items() if a != k}  # noqa: E731
+    NOT_NULL = (tuple(("comentário sem %s (veio 'body')" % k, {"comments": table([dict(wo(CM, k), body="oi")])}) for k in ("id", "author", "text", "created_at"))
+                + (("dependência sem type", {"dependencies": table([wo(DP, "type")])}),
+                   ("dependência com type vazio", {"dependencies": table([dict(DP, type="")])}),
+                   ("issue com id vazio", {"issues": table([{"id": ""}])}), ("config sem key", {"config": table([{"value": "hq"}])})))
     for label, patch in (("tabela ausente", {"comments": None}), ("issues truncado", {"issues": '{"rows":[{"id":"hq-1","title":"t"}'}),
                          ("dependência sem alvo nenhum", {"dependencies": table([{"issue_id": "hq-1", "depends_on_issue_id": "", "depends_on_external": "", "type": "blocks"}])}),
                          ("issue sem id", {"issues": table([{"title": "sem id"}])}),
                          ("id de issue repetido", {"issues": table([{"id": "hq-1"}, {"id": "hq-1"}])}),
-                         ("label sem issue_id", {"labels": table([{"label": "a"}])})):
+                         ("label sem issue_id", {"labels": table([{"label": "a"}])})) + NOT_NULL:
         (rc, so, se), left = convert_with(patch)
         check("convert: %s => rc 1, JSON de erro, nenhum arquivo sobra" % label, rc == 1 and "error" in json.loads(so) and not left, so + se)
 
@@ -297,6 +305,21 @@ with tempfile.TemporaryDirectory(prefix="jhrst.") as T:
     rc, so, se = run("convert", "--dump", P("dump"), "--db", "../hq", "--out", P("o4.jsonl"))
     check("convert: nome de banco fora do molde (../hq) => rc 2 (uso), nada gravado", rc == 2 and not os.path.exists(P("o4.jsonl")), so + se)
 
+    # controle: coluna PRESENTE e vazia é valor (não é "desconhecido") e segue como veio; só a AUSENTE é erro
+    two = [{"id": "hq-1", "title": "um", "status": "open", "priority": "1", "issue_type": "task"}, {"id": "hq-2", "title": "dois", "status": "open", "priority": "1", "issue_type": "task"}]
+    write_db(P("dump-empty"), "hq", issues=two, comments=[dict(CM, author="", text="")], dependencies=[dict(DP, type="related", metadata="{}", thread_id="", id="d1")])
+    rc, so, se = run("convert", "--dump", P("dump-empty"), "--db", "hq", "--out", P("imp-empty.jsonl"))
+    r1 = {r["id"]: r for r in jlines(P("imp-empty.jsonl"))}["hq-1"]
+    check("convert: autor e texto PRESENTES e vazios passam como vieram; type presente é mantido; metadata '{}' e thread_id '' não são coluna perdida",
+          rc == 0 and r1["comments"][0]["author"] == "" and r1["comments"][0]["text"] == "" and r1["dependencies"][0]["type"] == "related"
+          and json.loads(so)["unmapped_columns"] == {}, so + se)
+    # coluna de OUTRA tabela que o conversor não leva ao import: nomeada "<tabela>.<coluna>" e contada (o docstring promete; antes só as issues eram auditadas)
+    write_db(P("dump-um"), "hq", issues=two, labels=[{"issue_id": "hq-1", "label": "a", "cor": "azul"}], comments=[dict(CM, anexo="x.png")],
+             dependencies=[dict(DP, type="waits-for", id="d1", metadata="{\"gate\":\"all-children\"}", thread_id="th-9")], config=[{"key": "k", "value": "v", "nota": "z"}])
+    rc, so, se = run("convert", "--dump", P("dump-um"), "--db", "hq", "--out", P("imp-um.jsonl"))
+    check("convert: coluna de labels/comments/dependencies/config que o conversor não leva é NOMEADA e contada (waits-for com metadata não some em silêncio)",
+          rc == 0 and json.loads(so)["unmapped_columns"] == {"labels.cor": 1, "comments.anexo": 1, "dependencies.metadata": 1, "dependencies.thread_id": 1, "config.nota": 1}, so + se)
+
     # ── D2. entrada da prova ilegível: verdict fail, rc 1, stderr vazio ──
     print("-- D2. reconcile com entrada ilegível")
     put(P("empty.json"), "")
@@ -308,21 +331,29 @@ with tempfile.TemporaryDirectory(prefix="jhrst.") as T:
     json.dump({"databases": {"outro": {}}}, open(P("man-nodb.json"), "w"))
     json.dump(dict(st, db="wa"), open(P("stats-wa.json"), "w"))
     json.dump({k: v for k, v in st.items() if k != "bad_values"}, open(P("stats-nobv.json"), "w"))
+    json.dump({k: v for k, v in st.items() if k != "unmapped_columns"}, open(P("stats-noum.json"), "w"))
     put(P("exp-corrupt.jsonl"), open(imp).read() + "{isto não é json\n")
     put(P("exp-list.jsonl"), "[1]\n")
     put(P("exp-noid.jsonl"), '{"_type":"issue","title":"sem id"}\n')
     put(P("exp-empty.jsonl"), "")
+    for fn_, (key, col) in (("exp-noauthor.jsonl", ("comments", "author")), ("exp-nodeptype.jsonl", ("dependencies", "type"))):
+        ls_ = jlines(imp)
+        ls_[0][key][0].pop(col)  # o export do bd trouxe as duas chaves em todas as linhas medidas (16/10, lexbh): sumiu = o bd perdeu o dado, não "vazio"
+        put_lines(P(fn_), ls_)
     for label, args, *why in (
             ("stats vazio (0 bytes)", dict(stats=P("empty.json"))), ("stats que não é JSON", dict(stats=P("notjson.json"))),
             ("stats ausente", dict(stats=P("nao-existe.json"))), ("stats que é lista", dict(stats=P("list.json"))),
-            ("stats sem bad_values", dict(stats=P("stats-nobv.json"))), ("stats de OUTRO banco", dict(stats=P("stats-wa.json"))),
+            ("stats sem bad_values", dict(stats=P("stats-nobv.json"))), ("stats sem unmapped_columns", dict(stats=P("stats-noum.json"))),
+            ("stats de OUTRO banco", dict(stats=P("stats-wa.json"))),
             ("manifest vazio", dict(manifest=P("empty.json"))), ("manifest sem 'databases'", dict(manifest=P("man-nodbs.json"))),
             ("manifest que é lista", dict(manifest=P("list.json"))), ("banco ausente do manifest", dict(manifest=P("man-nodb.json"))),
             ("manifest com contagem em texto", dict(manifest=P("man-str.json")), "contagem inteira de labels"),
             ("manifest sem a contagem de comments", dict(manifest=P("man-lack.json")), "contagem inteira de comments"),
             ("export ausente", dict(exp=P("nao-existe.jsonl"))), ("export com linha que não é JSON", dict(exp=P("exp-corrupt.jsonl"))),
             ("export com linha que não é objeto", dict(exp=P("exp-list.jsonl"))), ("export com issue sem id", dict(exp=P("exp-noid.jsonl"))),
-            ("export vazio (0 linhas)", dict(exp=P("exp-empty.jsonl"))), ("import ausente", dict(imported=P("nao-existe.jsonl")))):
+            ("export vazio (0 linhas)", dict(exp=P("exp-empty.jsonl"))), ("import ausente", dict(imported=P("nao-existe.jsonl"))),
+            ("export com comentário sem author", dict(exp=P("exp-noauthor.jsonl")), "ilegível ou fora da forma"),
+            ("export com dependência sem type", dict(exp=P("exp-nodeptype.jsonl")), "ilegível ou fora da forma")):
         rc, rp, se = rec(args.get("manifest", P("man.json")), args.get("exp", imp), args.get("stats", P("stats.json")), args.get("imported", imp))
         check("reconcile reprova (sem traceback): %s" % label, rc == 1 and rp["verdict"] == "fail" and rp["problems"] and se == ""
               and all(w in " ".join(rp["problems"]) for w in why), json.dumps(rp)[:200] + se[:200])
