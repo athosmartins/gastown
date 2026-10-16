@@ -200,7 +200,8 @@ m() { echo "$FAKE_S3_ROOT/${1#s3://}"; }
 [ "$1" = s3 ] || exit 2
 case "$2" in
   ls)   [ -n "${FAKE_AWS_LS_FAIL:-}" ] && exit 1; echo "Total Objects: 3"; echo "   Total Size: $(( $(du -sk "$(m "$5")" | cut -f1) * 1024 ))" ;;
-  sync) [ -n "${FAKE_AWS_SYNC_FAIL:-}" ] && exit 1; mkdir -p "$4"; cp -R "$(m "$3")/." "$4/" ;;
+  sync) [ -n "${FAKE_AWS_SYNC_FAIL:-}" ] && exit 1; mkdir -p "$4"; cp -R "$(m "$3")/." "$4/"
+        if [ -n "${FAKE_AWS_SYNC_UNREADABLE:-}" ]; then chmod 000 "$4/manifest"; fi ;;
 esac
 EOF
 chmod +x "$SCRATCH/fake-aws.sh"
@@ -462,13 +463,155 @@ wait_late
 check "$([ -s "$SCRATCH/late-env.log" ] && sort -u "$SCRATCH/late-env.log" | tr '\n' ' ')" "1 " "todo dolt da rodada recebe DOLT_DISABLE_EVENT_FLUSH=1"
 check "$([ -e "$SCRATCH/late-spawned" ] && echo disparou || echo nenhum)" nenhum "nenhum processo tardio chega a ser disparado"
 check_clean "e nada recria o workdir depois da limpeza"
-# the earliest refusal of all (--db) still runs `dolt version` for the report: the switch must already be on at the top of the run
+# the earliest refusal of all (--db) has no dolt home of its own yet, so it runs NO dolt (it used to run `dolt version` for
+# the report, with the host's HOME, and that created ~/.dolt there)
 rm -rf "$WD"; rm -f "$SCRATCH/late-env.log" "$SCRATCH/late-spawned" "$SCRATCH/late-finished"
 LAB_DOLT="$SCRATCH/late-dolt.sh" lab --db "nome invalido" --source "$SRC" --manifest "$SCRATCH/m.ok.json"
 check "$RC" 2 "--db invalido (a recusa mais cedo de todas): rc 2"
 wait_late
-check "$([ -s "$SCRATCH/late-env.log" ] && sort -u "$SCRATCH/late-env.log" | tr '\n' ' ')" "1 " "o dolt do relatorio de uma rodada recusada cedo tambem recebe a chave"
+check "$([ -e "$SCRATCH/late-env.log" ] && echo chamou || echo nenhum)" nenhum "uma rodada recusada cedo nao chama o dolt (nem para a versao do relatorio)"
 check_clean "rodada recusada cedo: nada recria o workdir"
+rm -rf "$WD"
+
+echo "── gate-fix 2: o que existe mas nao da para ler nao e 'backup quebrado' ──"
+# Permission cases need a non-root user: root reads everything, so the lab would (rightly) go on and restore.
+if [ "$(id -u)" -eq 0 ]; then
+  echo "  SKIP: rodando como root (le qualquer diretorio): casos de permissao nao se aplicam"
+else
+  # the committed script said FAIL "backup sem arquivo manifest" for a source that HAS the manifest but cannot be entered
+  cp -R "$SCRATCH/fix/alpha-bk" "$SCRATCH/r444-bk"; chmod 444 "$SCRATCH/r444-bk"
+  lab --db alpha --source "file://$SCRATCH/r444-bk" --manifest "$SCRATCH/m.ok.json"
+  chmod 755 "$SCRATCH/r444-bk"
+  check "$RC" 2 "origem com manifest dentro mas sem permissao de entrar (modo 444): rc 2, nao FAIL"
+  check "$(jget "$REP" verdict)" UNKNOWN "relatorio diz UNKNOWN"
+  echo "$ERR" | grep -q 'origem ilegivel' && ok "o motivo diz 'origem ilegivel'" || bad "motivo: $ERR"
+  # WHICH source: a refusal that lost the path (an empty one handed to find) is still rc 2 but tells the operator nothing
+  echo "$ERR" | grep -qF "origem ilegivel: $SCRATCH/r444-bk (o laboratorio nao consegue entrar nela" && ok "o motivo cita a origem que nao da para entrar" || bad "motivo sem a origem: $ERR"
+  echo "$ERR" | grep -q 'sem arquivo manifest' && bad "disse 'sem arquivo manifest' de um manifest que existe" || ok "e nao afirma que o manifest nao existe"
+  echo "$ERR" | grep -q 'backup ~0KB' && bad "leitura parcial virou 'backup ~0KB' no gate de disco" || ok "e nao passa pelo gate de disco com um tamanho falso"
+  check_clean "recusa por origem ilegivel nao deixa nada no workdir"
+  # a symlink to the backup dir (an external disk, a moved backup): handed the link itself, `du` says 0KB and `find` lists the
+  # link alone, so the disk gate and the walk would be looking at nothing
+  ln -s "$SCRATCH/fix/alpha-bk" "$SCRATCH/link-bk"
+  lab --db alpha --source "file://$SCRATCH/link-bk" --manifest "$SCRATCH/m.ok.json"
+  check "$RC" 0 "origem que e um symlink para o backup: rc 0 (o link e seguido uma vez)"
+  echo "$ERR" | grep -q 'backup ~0KB' && bad "o gate de disco mediu o symlink (~0KB) em vez do backup" || ok "o tamanho medido e o do backup, nao o do link"
+  cp -R "$SCRATCH/fix/alpha-bk" "$SCRATCH/link-real-bk"; ln -s "$SCRATCH/link-real-bk" "$SCRATCH/link-bad"
+  vf=$(find "$SCRATCH/link-real-bk" -type f ! -name manifest ! -name LOCK | head -1); chmod 000 "$vf"
+  lab --db alpha --source "file://$SCRATCH/link-bad" --manifest "$SCRATCH/m.ok.json"
+  chmod 644 "$vf"
+  check "$RC" 2 "symlink para um backup com arquivo ilegivel: rc 2 (a checagem anda pelo diretorio, nao para no link)"
+  echo "$ERR" | grep -q 'origem ilegivel' && ok "e o motivo diz 'origem ilegivel'" || bad "motivo: $ERR"
+  # a file the lab cannot open: du and `-f` are happy, dolt exits 1 — and that used to read as "the backup is broken"
+  for victim in manifest table; do
+    rm -rf "$SCRATCH/r000-bk"; cp -R "$SCRATCH/fix/alpha-bk" "$SCRATCH/r000-bk"
+    if [ "$victim" = manifest ]; then vf="$SCRATCH/r000-bk/manifest"
+    else vf=$(find "$SCRATCH/r000-bk" -type f ! -name manifest ! -name LOCK | head -1); fi
+    chmod 000 "$vf"
+    lab --db alpha --source "file://$SCRATCH/r000-bk" --manifest "$SCRATCH/m.ok.json"
+    chmod 644 "$vf"
+    check "$RC" 2 "arquivo da origem ($victim) que o laboratorio nao consegue abrir: rc 2, nao FAIL"
+    echo "$ERR" | grep -q "origem ilegivel: .*$(basename "$vf")" && ok "o motivo cita o arquivo ($victim)" || bad "motivo: $ERR"
+  done
+  # the same read through the fetched copy of an S3 source
+  FAKE_AWS_SYNC_UNREADABLE=1 LAB_AWS="$SCRATCH/fake-aws.sh" lab --db alpha --source s3://urblink-test/alpha --manifest "$SCRATCH/m.ok.json"
+  check "$RC" 2 "copia baixada do s3 com arquivo ilegivel: rc 2, nao FAIL"
+  echo "$ERR" | grep -q 'copia baixada do s3 ilegivel' && ok "o motivo diz que a copia baixada e ilegivel" || bad "motivo: $ERR"
+  check_clean "e o workdir fica limpo"
+  # _du_kb itself: a number from a partial read is not a size
+  mkdir -p "$SCRATCH/du-t/ok/sub" "$SCRATCH/du-t/bad/sub"; echo x > "$SCRATCH/du-t/ok/sub/f"; echo x > "$SCRATCH/du-t/bad/sub/f"
+  chmod 000 "$SCRATCH/du-t/bad/sub"
+  DU_OK=$(DOLT_RESTORE_LAB_LIB=1 bash -c 'source "$1"; _du_kb "$2"; echo "st=$?"' _ "$SCRIPT" "$SCRATCH/du-t/ok" 2>/dev/null | tr '\n' ' ')
+  DU_BAD=$(DOLT_RESTORE_LAB_LIB=1 bash -c 'source "$1"; _du_kb "$2"; echo "st=$?"' _ "$SCRIPT" "$SCRATCH/du-t/bad" 2>/dev/null | tr '\n' ' ')
+  chmod 755 "$SCRATCH/du-t/bad/sub"
+  echo "$DU_OK" | grep -q -E '^[0-9]+ st=0 $' && ok "_du_kb de um diretorio legivel: numero e status 0" || bad "_du_kb legivel: '$DU_OK'"
+  check "$DU_BAD" "st=1 " "_du_kb de um diretorio parcialmente ilegivel: status 1 e nada impresso (nao um tamanho menor)"
+  # an EMPTY subdirectory the lab can read but not enter (r--): find lists it without a word (rc 0, nothing inside to stat) and
+  # there is no file for the per-file check to fail on — only the directory's own x bit says the lab cannot go in
+  rm -rf "$SCRATCH/rx-bk"; cp -R "$SCRATCH/fix/alpha-bk" "$SCRATCH/rx-bk"; mkdir "$SCRATCH/rx-bk/vazio"; chmod 444 "$SCRATCH/rx-bk/vazio"
+  lab --db alpha --source "file://$SCRATCH/rx-bk" --manifest "$SCRATCH/m.ok.json"
+  chmod 755 "$SCRATCH/rx-bk/vazio"
+  check "$RC" 2 "subdiretorio vazio que o laboratorio le mas nao entra (modo 444): rc 2, nao uma restauracao as cegas"
+  echo "$ERR" | grep -q "origem ilegivel: .*rx-bk/vazio" && ok "o motivo cita o subdiretorio" || bad "motivo: $ERR"
+fi
+# find that walks everything and THEN exits non-zero (a file that vanished mid-walk, an I/O error): nothing in the listing is
+# unreadable, so only find's own status can say the listing is not the whole backup. A stand-in find, because no real layout
+# makes find fail without also leaving an unreadable entry behind.
+mkdir -p "$SCRATCH/find-shim"
+printf '#!/bin/sh\n%s "$@"\necho "find: sumiu no meio da caminhada" >&2\nexit 1\n' "$(command -v find)" > "$SCRATCH/find-shim/find"; chmod +x "$SCRATCH/find-shim/find"
+PATH="$SCRATCH/find-shim:$PATH" lab --db alpha --source "$SRC" --manifest "$SCRATCH/m.ok.json"
+check "$RC" 2 "find que sai com erro depois de listar tudo: rc 2, listagem incompleta nao e veredito"
+echo "$ERR" | grep -q 'o find nao conseguiu listar tudo' && ok "o motivo diz que o find nao listou tudo" || bad "motivo: $ERR"
+check_clean "e o workdir fica limpo"
+
+echo "── gate-fix 2: limpeza que nao apagou tem que aparecer ──"
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/m.ok.json"
+echo "$OUT" | grep -q ' cleanup=ok report=' && ok "rodada normal: RESULT diz cleanup=ok" || bad "RESULT: $OUT"
+check "$(jget "$REP" cleanup)" ok "e o relatorio diz cleanup ok"
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/m.ok.json" --keep
+echo "$OUT" | grep -q ' cleanup=mantido report=' && ok "--keep: RESULT diz cleanup=mantido" || bad "RESULT: $OUT"
+[ -d "$(jget "$REP" run_dir)/restored/alpha" ] && ok "--keep: o relatorio diz ONDE ficaram os dados (run_dir)" || bad "run_dir: $(jget "$REP" run_dir)"
+rm -rf "$WD"
+lab --db 'nome invalido' --source "$SRC" --manifest "$SCRATCH/m.ok.json"
+echo "$OUT" | grep -q ' cleanup=nao-havia report=' && ok "recusa antes de criar o scratch: cleanup=nao-havia" || bad "RESULT: $OUT"
+check "$(jget "$REP" run_dir)" None "e sem run_dir (null)"
+if [ "$(id -u)" -eq 0 ]; then
+  echo "  SKIP: rodando como root (root apaga ate subdiretorio sem escrita): caso de limpeza que falha nao se aplica"
+else
+  # a restore that leaves a read-only subdirectory behind: `rm -rf` cannot empty it, so the restored copy stays on the host
+  wrapper stuck-restore-dolt.sh backup 'dolt "$@" || exit $?; mkdir "$PWD/travado" && : > "$PWD/travado/f" && chmod 555 "$PWD/travado"; exit 0'
+  LAB_DOLT="$SCRATCH/stuck-restore-dolt.sh" lab --db alpha --source "$SRC" --manifest "$SCRATCH/m.ok.json"
+  check "$RC" 0 "limpeza que falha nao muda o veredito do restore (rc 0)"
+  echo "$OUT" | grep -q ' cleanup=falhou report=' && ok "mas a linha RESULT diz cleanup=falhou" || bad "RESULT: $OUT"
+  echo "$ERR" | grep -q 'AVISO: nao consegui apagar .*run-' && ok "e o log avisa que os dados ficaram (com o caminho)" || bad "log: $ERR"
+  check "$(jget "$REP" cleanup)" falhou "e o relatorio diz cleanup falhou"
+  check "$(jget "$REP" tables.issues.restored)" 5 "e o relatorio ainda tem as contagens (a limpeza roda ANTES de o relatorio ser escrito)"
+  [ -d "$(jget "$REP" run_dir)/restored/travado" ] && ok "e run_dir aponta para onde os dados ficaram" || bad "run_dir: $(jget "$REP" run_dir)"
+  [ ! -e "$WD/.lab.lock" ] && ok "a trava e solta mesmo assim (a proxima rodada nao fica presa)" || bad "trava ficou"
+  chmod -R u+w "$WD" 2>/dev/null; rm -rf "$WD"
+fi
+# on_exit runs the wrap-up AGAIN when a signal lands during the removal, by which time the counts file may already be gone:
+# a second pass that cannot read it must keep the counts the first pass took, not turn them into "no counts"
+SNAP=$(DOLT_RESTORE_LAB_LIB=1 bash -c 'source "$1"; TABLES_TXT=$(printf "t1\t3\t3\n"); TABLES_TSV="$2/nao-existe.tsv"; RUN=""; REPORT=""; _wrap_up >/dev/null 2>&1; printf "%s" "$TABLES_TXT" | tr "\t" "|"' _ "$SCRIPT" "$SCRATCH" 2>/dev/null)
+check "$SNAP" "t1|3|3" "segunda passada do wrap-up sem o arquivo de contagens: as contagens da primeira continuam"
+
+echo "── gate-fix 2: o motivo do flatten, a versao do dolt e a contagem vazia ──"
+LAB_DOLT="$SCRATCH/refuse-restore-dolt.sh" lab --db alpha --source "$SRC" --manifest "$SCRATCH/m.ok.json" --flatten
+check "$(jget "$REP" flatten.result)" SKIPPED "--flatten pedido e restore recusado: flatten SKIPPED"
+check "$(jget "$REP" flatten.why)" rodada-terminou-antes-do-flatten "e o motivo NAO diz 'nao-pedido' (foi pedido)"
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/m.ok.json"
+check "$(jget "$REP" flatten.why)" nao-pedido "sem --flatten o motivo e 'nao-pedido'"
+# a signal while the flatten runs: result UNKNOWN, and the why must not be a leftover
+wrapper hang-gc-sig-dolt.sh gc ': > "'"$SCRATCH"'/gc-started"; exec sleep 31.'"$$"''
+rm -f "$SCRATCH/gc-started" "$REP"; rm -rf "$WD"
+env -u DOLT_ROOT_PATH HOME="$SCRATCH/home" LAB_DOLT="$SCRATCH/hang-gc-sig-dolt.sh" bash "$SCRIPT" run --workdir "$WD" --report "$REP" \
+  --db alpha --source "$SRC" --manifest "$SCRATCH/m.ok.json" --flatten >"$SCRATCH/sig2.out" 2>"$SCRATCH/sig2.err" &
+LABP=$!
+i=0; while [ ! -e "$SCRATCH/gc-started" ] && [ "$i" -lt 3000 ]; do sleep 0.1; i=$((i+1)); done
+kill -TERM "$LABP" 2>/dev/null; wait "$LABP" 2>/dev/null
+check "$(jget "$REP" flatten.result)" UNKNOWN "SIGTERM no meio do flatten: flatten UNKNOWN"
+check "$(jget "$REP" flatten.why)" flatten-interrompido-antes-de-concluir "e o motivo diz que foi interrompido (nao 'nao-pedido')"
+check_clean "e nada fica no workdir"
+pkill -f "sleep 31\.$$" 2>/dev/null
+# an early refusal has no dolt home: the host's ~/.dolt must stay untouched and the version is "not measured", not a guess
+rm -rf "$SCRATCH/home/.dolt"
+lab --db 'nome invalido' --source "$SRC" --manifest "$SCRATCH/m.ok.json"
+check "$RC" 2 "recusa antes do DOLT_ROOT_PATH: rc 2"
+[ ! -e "$SCRATCH/home/.dolt" ] && ok "a recusa nao cria ~/.dolt no HOME do host" || bad "criou $(ls -A "$SCRATCH/home/.dolt" | tr '\n' ' ') em ~/.dolt"
+check "$(jget "$REP" dolt_version)" None "dolt_version nao medido vira null"
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/m.ok.json"
+check "$(jget "$REP" dolt_version | grep -c '^dolt version')" 1 "rodada completa: dolt_version medido, com o dolt home do laboratorio"
+[ ! -e "$SCRATCH/home/.dolt" ] && ok "e o ~/.dolt do host continua intocado" || bad "criou ~/.dolt"
+# a manifest the parser accepted but that delivered no table: "0 tables checked" is not OK
+cat > "$SCRATCH/emptyparse-py.sh" <<EOF
+#!/bin/bash
+[ "\$3" = "$SCRATCH/m.ok.json" ] && { cat >/dev/null; exit 0; }
+exec python3 "\$@"
+EOF
+chmod +x "$SCRATCH/emptyparse-py.sh"
+LAB_PY="$SCRATCH/emptyparse-py.sh" lab --db alpha --source "$SRC" --manifest "$SCRATCH/m.ok.json"
+check "$RC" 2 "parser que nao entrega nenhuma tabela: rc 2 (zero tabelas conferidas nao e OK)"
+echo "$ERR" | grep -q 'nenhuma tabela' && ok "o motivo diz que nenhuma tabela foi conferida" || bad "motivo: $ERR"
 rm -rf "$WD"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="

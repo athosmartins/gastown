@@ -34,16 +34,23 @@
 #   2 UNKNOWN  could not check: bad/empty/other-db/unknown-schema manifest, no dolt/python3/timeout,
 #              fetch failed, disk too small, another run in progress, a restore or a count that did
 #              not FINISH (timeout, killed by a signal, any status but dolt's own 1), a relative
-#              file:// source, a bad LAB_* setting, a script abort or a signal mid-run
+#              file:// source, a source (or fetched copy) the lab cannot fully read, a bad LAB_*
+#              setting, a script abort or a signal mid-run
 #   3 SLOW     everything passed but fetch+restore+count took longer than the RTO
 # The rule: only a CONCLUSIVE observation about the backup contents is rc 1 or rc 0; anything that
 # stops the lab from reaching a conclusion is rc 2 with a reason. The exit code is the RESTORE verdict
 # only. The flatten result is in the report and on the RESULT line (flatten=OK|FAIL|SKIPPED|UNKNOWN):
 # it is research, it must not page anyone as a backup failure.
 #
+# CLEANUP: the restored copy is real data, deleted at the end. Whether that worked is on the RESULT line and in
+# the report (cleanup=ok|falhou|mantido|nao-havia; run_dir=<path> when the data is still there) and, for a
+# failed removal, in an AVISO log line. It never changes the exit code: whoever reads RESULT must look at it.
+#
 # TIMEOUT: every dolt/aws step runs under GNU `timeout` (LAB_TIMEOUT_BIN, else `timeout`, else
 # `gtimeout` — macOS has only the latter, from Homebrew coreutils, and a launchd/ssh PATH may lack
-# /opt/homebrew/bin). With none, the lab REFUSES (rc 2): it never silently runs without a limit.
+# /opt/homebrew/bin). With none, the lab REFUSES (rc 2): it never silently runs without a limit. The limit is
+# SOFT: `timeout` sends TERM and no more, so a dolt that ignores TERM (or sits in uninterruptible I/O) is not
+# stopped by it.
 #
 # DISK: needs LAB_DISK_MARGIN_PCT (default 400) of the backup size free — the fetched copy, the
 # restored copy and gc headroom (dolt gc wants 2-2.8x the database). Unreadable = UNKNOWN.
@@ -68,7 +75,7 @@ RC=0; REASON=""; RUN=""; LOCK=""; LOCK_OWNED=0; KEEP=0; FINISHED=0; TIMEOUT_CMD=
 T_FETCH=""; T_RESTORE=""; T_COUNT=""; T_TOTAL=""; RESTORE_KB=""; SRC_KIND=""; SRC_KB=""
 F_RESULT="SKIPPED"; F_WHY="nao-pedido"; F_COMMITS_BEFORE=""; F_COMMITS_AFTER=""
 F_KB_BEFORE=""; F_KB_AFTER=""; F_FLATTEN_S=""; F_GC_S=""
-TABLES_TSV=""; STARTED=""; MANIFEST_OK=1
+TABLES_TSV=""; TABLES_TXT=""; STARTED=""; MANIFEST_OK=1; SRC_BAD=""; CLEANUP="nao-havia"; DOLT_VERSION=""
 DB=""; SOURCE=""; MANIFEST=""; WORKDIR=""; RTO=1800; REPORT=""; FLATTEN=0; GC_ARGS=""
 REPORT_STATE="nao-pedido"; START_EPOCH=$(date +%s)
 
@@ -160,16 +167,48 @@ _sql_int() {
 
 _count() { _sql_int "$1" "SELECT COUNT(*) FROM \`$2\`"; }  # table name was validated by the manifest parser
 
-_du_kb() { du -sk "$1" 2>/dev/null | awk '{print $1}'; }
+# _du_kb <dir> — prints the size in KB. Status 0 only when du itself finished clean: a du that hit "Permission denied"
+# on part of the tree still prints a number, and that number is the size of what it could read, not the size.
+# vazio/ilegivel → status 1 and nothing printed (callers read "" as "not measured"); falhou (du != 0) → status 1.
+_du_kb() {
+  local out
+  out=$(du -sk "$1" 2>/dev/null) || return 1
+  out=$(printf '%s\n' "$out" | awk 'NR==1{print $1}')
+  case "$out" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$out"
+}
 
-_write_report() {  # key=value pairs; flatten.* nests; numbers become ints; tables from $TABLES_TSV. Returns python's status.
+# _src_readable <dir> — 0 when everything under <dir> can be read: every directory listed AND entered, every file opened.
+# 1 otherwise, with the first offender in SRC_BAD. Whoever says "no manifest here" or "dolt refused this backup" must
+# first know the lab could LOOK: a directory it cannot enter makes `[ -f manifest ]` false and a file it cannot open
+# makes dolt exit 1, and both used to read as "backup broken". Not readable → the caller says rc 2 (not a verdict).
+# vazio (listagem sem nenhuma linha) → 1; falhou (find saiu != 0, ex.: Permission denied) → 1.
+_src_readable() {
+  local f list="$RUN/src.list"
+  SRC_BAD=""
+  if ! find "$1" > "$list" 2>/dev/null; then SRC_BAD="$1 (o find nao conseguiu listar tudo)"; return 1; fi
+  [ -s "$list" ] || { SRC_BAD="$1 (listagem vazia)"; return 1; }
+  while IFS= read -r f; do
+    if [ -d "$f" ]; then { [ -r "$f" ] && [ -x "$f" ]; } || { SRC_BAD="$f"; return 1; }
+    else [ -r "$f" ] || { SRC_BAD="$f"; return 1; }
+    fi
+  done < "$list"
+  return 0
+}
+
+# _need_readable <dir> <what> — rc 2 and out when <dir> is not fully readable
+_need_readable() {
+  _src_readable "$1" || { note_rc 2 "$2 ilegivel: $SRC_BAD (o laboratorio nao consegue le-la; nao e veredito sobre o backup)"; finish; }
+}
+
+_write_report() {  # key=value pairs; flatten.* nests; numbers become ints; tables from $TABLES_TXT. Returns python's status.
   [ -n "${REPORT:-}" ] || return 0
   local wst
-  "$LAB_PY" -I - "$REPORT" "${TABLES_TSV:-}" "$@" <<'PY'
+  LAB_TABLES_TXT="${TABLES_TXT:-}" "$LAB_PY" -I - "$REPORT" "$@" <<'PY'
 import json, os, re, sys
-path, tsv = sys.argv[1], sys.argv[2]
+path = sys.argv[1]
 d = {}
-for a in sys.argv[3:]:
+for a in sys.argv[2:]:
     k, _, v = a.partition("=")
     text = k.split(".")[-1] in ("db", "host", "reason", "why", "gc_args")
     if not text and v == "":
@@ -181,10 +220,11 @@ for a in sys.argv[3:]:
     else:
         d[k] = v
 t = {}
-if tsv and os.path.isfile(tsv):
-    for line in open(tsv):
-        n, e, r = (line.rstrip("\n").split("\t") + ["", ""])[:3]
-        t[n] = {"expected": int(e), "restored": int(r) if r != "" else None}
+for line in os.environ.get("LAB_TABLES_TXT", "").splitlines():
+    if not line:
+        continue
+    n, e, r = (line.split("\t") + ["", ""])[:3]
+    t[n] = {"expected": int(e), "restored": int(r) if r != "" else None}
 d["tables"] = t
 tmp = path + ".tmp.%d" % os.getpid()
 with open(tmp, "w") as f:
@@ -227,42 +267,77 @@ _stop_children() {
   return 0
 }
 
+# cleanup — delete the scratch dir ($RUN, restored data included) and release the lock. Sets CLEANUP, which the RESULT
+# line and the report carry: nao-havia (no scratch dir was ever created) | ok (removed) | mantido (--keep) | falhou
+# (still there after the retries: the restored copy is STILL ON THIS HOST). The exit code is the restore verdict, so
+# this field and the AVISO log line are the only places that say the data stayed — a failed removal is never silent.
 cleanup() {
-  local i=0
-  if [ -n "$RUN" ] && [ "$KEEP" -eq 0 ]; then
+  local i=0 gone=0 err=""
+  CLEANUP="nao-havia"
+  if [ -n "$RUN" ] && [ "$KEEP" -eq 1 ]; then
+    CLEANUP="mantido"; log "mantido por --keep: $RUN (os dados restaurados ficam la; apague a mao quando acabar)"
+  elif [ -n "$RUN" ]; then
     case "$RUN" in
       "$WORKDIR"/run-*)
-        # a child that was just told to stop may still be writing: retry a few times instead of leaving gigabytes behind
-        while [ -d "$RUN" ] && [ "$i" -lt 5 ]; do rm -rf "$RUN" 2>/dev/null; [ -d "$RUN" ] && sleep 1; i=$((i+1)); done ;;
+        # a child that was just told to stop may still be writing: retry a few times instead of leaving gigabytes behind.
+        # "Gone" needs rm's own status AND the path absent: `[ ! -e ]` alone is also true when the path cannot be looked at.
+        while [ "$i" -lt 5 ]; do
+          if err=$(rm -rf "$RUN" 2>&1) && [ ! -e "$RUN" ]; then gone=1; break; fi
+          i=$((i+1)); [ "$i" -lt 5 ] && sleep 1
+        done
+        if [ "$gone" -eq 1 ]; then CLEANUP="ok"
+        else
+          CLEANUP="falhou"; err=$(printf '%s\n' "$err" | head -1)
+          log "AVISO: nao consegui apagar $RUN (${err:-o rm nao disse nada e o caminho continua la}); os dados restaurados continuam neste host, apague a mao"
+        fi ;;
+      *) CLEANUP="falhou"; log "AVISO: recusei apagar $RUN (fora de $WORKDIR/run-*); os dados restaurados continuam neste host, apague a mao" ;;
     esac
   fi
-  if [ "$LOCK_OWNED" -eq 1 ] && [ -n "$LOCK" ]; then rm -rf "$LOCK"; fi
+  if [ "$LOCK_OWNED" -eq 1 ] && [ -n "$LOCK" ]; then rm -rf "$LOCK"; LOCK_OWNED=0; fi
   return 0
 }
 
-# _emit_result — write the report, print the RESULT line. Used by finish() and by the abort handler.
+# _emit_result — write the report, print the RESULT line. Used by _wrap_up only, AFTER cleanup (so both can say whether
+# the restored copy is still on this host).
 _emit_result() {
-  local vname
-  T_TOTAL=$(( $(_now) - START_EPOCH ))
+  local vname leftover=""
   vname=$(_verdict_name "$RC")
+  case "$CLEANUP" in falhou|mantido) leftover="$RUN" ;; esac
   REPORT_STATE="${REPORT:-none}"
   if [ -n "$REPORT" ] && ! _write_report schema=1 db="$DB" verdict="$vname" rc="$RC" reason="$REASON" host="$(hostname -s 2>/dev/null)" \
-    started_at="$STARTED" finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" dolt_version="$("$LAB_DOLT" version 2>/dev/null | head -1)" \
+    started_at="$STARTED" finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" dolt_version="$DOLT_VERSION" \
     source_kind="$SRC_KIND" source_kb="$SRC_KB" rto_seconds="$RTO" fetch_s="$T_FETCH" restore_s="$T_RESTORE" \
     count_s="$T_COUNT" total_s="$T_TOTAL" restored_kb="$RESTORE_KB" timeout_bin="$TIMEOUT_CMD" \
     flatten.result="$F_RESULT" flatten.why="$F_WHY" flatten.commits_before="$F_COMMITS_BEFORE" \
     flatten.commits_after="$F_COMMITS_AFTER" flatten.kb_before="$F_KB_BEFORE" flatten.kb_after_gc="$F_KB_AFTER" \
-    flatten.flatten_s="$F_FLATTEN_S" flatten.gc_s="$F_GC_S" flatten.gc_args="$GC_ARGS"; then
+    flatten.flatten_s="$F_FLATTEN_S" flatten.gc_s="$F_GC_S" flatten.gc_args="$GC_ARGS" cleanup="$CLEANUP" run_dir="$leftover"; then
     REPORT_STATE="falhou"      # asked for, not written: the caller must not go looking for (or trust) a file
   fi
-  printf 'RESULT: %s db=%s rc=%s total_s=%s flatten=%s report=%s\n' "$vname" "$DB" "$RC" "$T_TOTAL" "$F_RESULT" "$REPORT_STATE"
+  printf 'RESULT: %s db=%s rc=%s total_s=%s flatten=%s cleanup=%s report=%s\n' "$vname" "$DB" "$RC" "$T_TOTAL" "$F_RESULT" "$CLEANUP" "$REPORT_STATE"
 }
 
-# finish — the normal exit: report + RESULT line + exit code. FINISHED is set first so the EXIT trap does not
-# report a second time (nor loop) if emitting itself trips.
-finish() {
+# _wrap_up — the end of every run, in this order: stop the clock (total_s runs up to the end of the flatten and leaves the
+# removal of the restored copy out, so a slow rm cannot read as a slow run), delete the scratch dir, THEN write the
+# report and the RESULT line.
+# FINISHED is set only after the cleanup, right before emitting: a signal that lands during the removal reaches
+# on_exit with FINISHED=0 and still ends as UNKNOWN with a RESULT line (never silence), and the retry there finishes
+# the removal; setting it before emitting keeps the EXIT trap from reporting twice (nor looping) if emitting trips.
+_wrap_up() {
+  local t
+  T_TOTAL=$(( $(_now) - START_EPOCH ))
+  # The counts live in $RUN, which cleanup is about to delete and the report is written after it: take them now.
+  # vazio (no file: the run ended before any count) → TABLES_TXT stays as it was ("" → "tables": {} in the report).
+  # falhou (the file is there but cat cannot read it) → the same: a failed read never replaces what an earlier pass took —
+  # on_exit runs this again when a signal lands DURING cleanup, by which time the file may already be gone.
+  if [ -n "$TABLES_TSV" ] && [ -f "$TABLES_TSV" ] && t=$(cat "$TABLES_TSV" 2>/dev/null); then TABLES_TXT="$t"; fi
+  cleanup
   FINISHED=1
   _emit_result
+}
+
+# finish — the normal exit: cleanup + report + RESULT line + exit code.
+finish() {
+  _wrap_up
   exit "$RC"
 }
 
@@ -273,12 +348,10 @@ finish() {
 on_exit() {
   local st=$?
   if [ "$FINISHED" -eq 0 ]; then
-    FINISHED=1
     note_rc 2 "rodada abortada antes de concluir (erro do script ou sinal; status $st)"
     _stop_children
-    _emit_result
+    _wrap_up
   fi
-  cleanup
   exit "$RC"
 }
 
@@ -352,8 +425,9 @@ _fsql_fail() {
 # EVERY step is checked: an unchecked `reset` once left a no-op "flatten" that looked fine.
 _flatten() {
   local d="$1" tsv="$2" roots nroots root br t e r n st s0 s1 s2
-  F_RESULT=UNKNOWN
+  F_RESULT=UNKNOWN; F_WHY="flatten-interrompido-antes-de-concluir"   # what a signal in the middle of it leaves in the report
   F_COMMITS_BEFORE=$(_sql_int "$d" "SELECT COUNT(*) FROM dolt_log") || { F_WHY="sem-contagem-de-commits"; return 0; }
+  # vazio/falhou → "" = tamanho nao medido (null no relatorio, "?" no motivo); informativo, nao muda o veredito do flatten
   F_KB_BEFORE=$(_du_kb "$d/.dolt")
   if [ "$F_COMMITS_BEFORE" -le 2 ]; then F_RESULT=SKIPPED; F_WHY="nada-a-achatar(commits=$F_COMMITS_BEFORE)"; return 0; fi
   roots=$(cd "$d" && _run_to "$LAB_SQL_TIMEOUT" "$LAB_DOLT" sql -q "SELECT commit_hash FROM dolt_commit_ancestors WHERE parent_hash IS NULL" -r csv 2>/dev/null | tail -n +2)
@@ -375,7 +449,7 @@ _flatten() {
   # shellcheck disable=SC2086
   if ! _fstep "$d" gc gc $GC_ARGS; then F_GC_S=$(( $(_now) - s1 )); return 0; fi
   s2=$(_now); F_GC_S=$(( s2 - s1 ))
-  F_KB_AFTER=$(_du_kb "$d/.dolt")
+  F_KB_AFTER=$(_du_kb "$d/.dolt")   # vazio/falhou → "" (nao medido), como acima
   F_COMMITS_AFTER=$(_sql_int "$d" "SELECT COUNT(*) FROM dolt_log"); st=$?
   if [ "$st" -ne 0 ]; then F_COMMITS_AFTER=""; _fsql_fail "$st" "contagem-de-commits"; return 0; fi
   if [ "$F_COMMITS_AFTER" -ge "$F_COMMITS_BEFORE" ]; then F_RESULT=FAIL; F_WHY="historia-nao-encolheu($F_COMMITS_BEFORE->$F_COMMITS_AFTER)"; return 0; fi
@@ -385,11 +459,11 @@ _flatten() {
     if [ "$st" -ne 0 ]; then _fsql_fail "$st" "tabela:$t"; return 0; fi
     if [ "$n" != "$r" ]; then F_RESULT=FAIL; F_WHY="contagem-mudou-no-flatten:$t($r->$n)"; return 0; fi
   done < "$tsv"
-  F_RESULT=OK; F_WHY="commits $F_COMMITS_BEFORE->$F_COMMITS_AFTER, ${F_KB_BEFORE}KB->${F_KB_AFTER}KB"
+  F_RESULT=OK; F_WHY="commits $F_COMMITS_BEFORE->$F_COMMITS_AFTER, ${F_KB_BEFORE:-?}KB->${F_KB_AFTER:-?}KB"
 }
 
 run_lab() {
-  local srcdir fetchdir restored_dir t e n st s0 s1 avail need v ls_out
+  local srcdir fetchdir restored_dir t e n st s0 s1 avail need v ls_out phys ncount=0
   # After a command the dolt CLI starts a detached `dolt send-metrics`. Under host load it runs late — after cleanup
   # has removed $RUN — and recreates $RUN/dolt-home/.dolt, so the workdir keeps a stray run-* directory (an intermittent
   # leftover at load 60-100; measured: 12 of 12 dolt-homes came back with it on, 0 of 12 with it off). It also sends
@@ -423,10 +497,15 @@ run_lab() {
   # not have, and this way the host user's ~/.dolt is never read or written. Removed with $RUN.
   export DOLT_ROOT_PATH="$RUN/dolt-home"
   if ! { mkdir -p "$DOLT_ROOT_PATH" \
-      && "$LAB_DOLT" config --global --add user.name restore-lab >/dev/null 2>&1 \
-      && "$LAB_DOLT" config --global --add user.email restore-lab@localhost >/dev/null 2>&1; }; then
+      && _run_to "$LAB_SQL_TIMEOUT" "$LAB_DOLT" config --global --add user.name restore-lab >/dev/null 2>&1 \
+      && _run_to "$LAB_SQL_TIMEOUT" "$LAB_DOLT" config --global --add user.email restore-lab@localhost >/dev/null 2>&1; }; then
     note_rc 2 "nao consegui preparar o DOLT_ROOT_PATH do laboratorio (identidade do dolt)"; finish
   fi
+  # The version for the report is read HERE — with the lab's own dolt home and under the timeout — and never in
+  # _emit_result: a refusal before this point has no home of its own, and `dolt version` run with the host's would
+  # create ~/.dolt there (and its version check can reach the network, which a hung connection would turn into a hung
+  # exit path). vazio/falhou/estourou o tempo → "" = relatorio dolt_version null (nao medido); nunca muda o veredito.
+  DOLT_VERSION=$(_run_to 60 "$LAB_DOLT" version 2>/dev/null | head -1)
   # The manifest first: if it is unusable we still drill (the timing is worth having) but the verdict is UNKNOWN.
   MANIFEST_OK=1
   if ! _parse_manifest "$MANIFEST" "$DB" > "$RUN/expected.tsv" 2> "$RUN/manifest.err"; then
@@ -443,6 +522,13 @@ run_lab() {
   esac
   if [ "$SRC_KIND" = file ]; then
     [ -d "$srcdir" ] || { note_rc 2 "origem nao existe: $srcdir"; finish; }
+    # A symlink to the backup dir is followed ONCE, here: handed the link itself, `du` says 0KB and `find` lists the link
+    # alone, so the disk gate and the readability walk below would be looking at nothing. Not enterable → not readable.
+    phys=$(cd "$srcdir" 2>/dev/null && pwd -P) \
+      || { note_rc 2 "origem ilegivel: $srcdir (o laboratorio nao consegue entrar nela; nao e veredito sobre o backup)"; finish; }
+    srcdir="$phys"
+    _need_readable "$srcdir" "origem"
+    # vazio/falhou → "" → rc 2 "nao consegui medir" logo abaixo; a leitura parcial que o du aceitaria como tamanho nao passa
     SRC_KB=$(_du_kb "$srcdir")
   else
     command -v "$LAB_AWS" >/dev/null 2>&1 || { note_rc 2 "aws ausente (origem s3:// precisa do aws CLI)"; finish; }
@@ -465,7 +551,10 @@ run_lab() {
       T_FETCH=$(( $(_now) - s0 )); note_rc 2 "aws s3 sync falhou ou estourou o tempo (credencial, rede ou bucket)"; finish
     fi
     T_FETCH=$(( $(_now) - s0 )); srcdir="$fetchdir"
+    _need_readable "$srcdir" "copia baixada do s3"
   fi
+  # `-f` is a verdict only because the walk above proved this directory can be listed and entered (a manifest that
+  # could not be looked at used to be "backup sem manifest", rc 1)
   if [ ! -f "$srcdir/manifest" ]; then note_rc 1 "backup sem arquivo manifest do dolt (nao restaura)"; finish; fi
 
   # The restore verdict. 0 = restored. Exactly 1 = dolt itself said no (a broken .darc, a bad backup): FAIL. Anything
@@ -482,7 +571,7 @@ run_lab() {
     *) note_rc 2 "dolt backup restore nao terminou: $(_st_words "$st") (LAB_RESTORE_TIMEOUT=${LAB_RESTORE_TIMEOUT}s)"; finish ;;
   esac
   if [ ! -d "$restored_dir/.dolt" ]; then note_rc 2 "dolt backup restore terminou sem criar o banco $DB (nao e um veredito sobre o backup)"; finish; fi
-  RESTORE_KB=$(_du_kb "$restored_dir")
+  RESTORE_KB=$(_du_kb "$restored_dir")   # vazio/falhou → "" (nao medido: restored_kb null), nao muda o veredito
   [ "$SRC_KIND" = s3 ] && [ "$KEEP" -eq 0 ] && rm -rf "$RUN/fetch"   # frees the fetched copy: gc needs the room
 
   s0=$(_now)
@@ -490,6 +579,7 @@ run_lab() {
     : > "$TABLES_TSV"
     while IFS="$(printf '\t')" read -r t e; do
       [ -n "$t" ] || continue
+      ncount=$((ncount+1))
       n=$(_count "$restored_dir" "$t"); st=$?
       case "$st" in
         0) printf '%s\t%s\t%s\n' "$t" "$e" "$n" >> "$TABLES_TSV"
@@ -500,6 +590,9 @@ run_lab() {
            note_rc 2 "contagem da tabela $t nao terminou ou veio ilegivel (LAB_SQL_TIMEOUT=${LAB_SQL_TIMEOUT}s): nao e veredito sobre o backup" ;;
       esac
     done < "$RUN/expected.tsv"
+    # vazio → UNKNOWN: "0 tabelas conferidas" must not read as "every table checked" (the parser rejects an empty
+    # manifest, but an OK has to rest on a count made, not on a parser that was expected to say no)
+    [ "$ncount" -gt 0 ] || note_rc 2 "nenhuma tabela do manifest foi conferida (a lista de tabelas chegou vazia)"
   fi
   T_COUNT=$(( $(_now) - s0 ))
   if [ $(( $(_now) - START_EPOCH )) -gt "$RTO" ]; then note_rc 3 "fetch+restore+contagem em $(( $(_now) - START_EPOCH ))s, acima do RTO de ${RTO}s"; fi
@@ -534,7 +627,7 @@ main() {
       --rto-seconds) RTO="$2"; shift 2 ;;
       --report) REPORT="$2"; shift 2 ;;
       --gc-args) GC_ARGS="$2"; shift 2 ;;
-      --flatten) FLATTEN=1; shift ;;
+      --flatten) FLATTEN=1; F_WHY="rodada-terminou-antes-do-flatten"; shift ;;   # not "nao-pedido": it WAS asked
       --keep) KEEP=1; shift ;;
       *) echo "opcao desconhecida: $1" >&2; return 2 ;;
     esac
