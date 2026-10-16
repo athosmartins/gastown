@@ -297,6 +297,12 @@ if [ -r "$SRV/.claude/settings.json" ]; then ok; else  # o instalador do servido
 fi
 chmod 644 "$SRV/.claude/settings.json"
 reset; srv_reset; rm -f "$SRV/.claude/settings.json"; pb; eq "settings ausente no servidor (1º push) = vazio, instala" $PBRC 0; yes "hook instalado" "$HOOK"
+# gate-fix 4 (third-state): texto que não é JSON não é "vazio" — nem no servidor, nem no bundle
+reset; srv_reset; printf 'notjson garbage {' >"$SRV/.claude/settings.json"; pb
+eq "settings do servidor existe mas não é JSON → recusa (não vira {})" $PBRC 1; has "msg" "$PBOUT" "não é JSON"; no "nada instalado" "$HOOK"
+eq "e o settings do servidor ficou como estava" "$(cat "$SRV/.claude/settings.json")" 'notjson garbage {'
+reset; srv_reset; printf 'notjson garbage {' >"$FAKE/home_settings"; pb
+[ "$PBRC" != 0 ]; eq "home settings do bundle não é JSON → não instala (rc=$PBRC)" $? 0; no "nada instalado" "$HOOK"
 
 echo "== install-claude (loopback)"
 printf '#!/bin/bash\necho "$@" >"$FAKE/installer.args"\n[ -f "$FAKE/installer.noop" ] || echo "$1 (Claude Code)" >"$FAKE/version"\n' >"$T/installer.sh"

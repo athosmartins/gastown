@@ -537,8 +537,11 @@ print("ok %d arquivos, %d removidos (do bundle anterior)" % (len(plan), gone) + 
 
 
 def merged_home_settings(path: str) -> dict:
-    with open(path) as f:
-        base = json.load(f)
+    try:
+        with open(path) as f:
+            base = json.load(f)
+    except (OSError, ValueError) as e:  # ausente, ilegível ou não-JSON: nada a mesclar com segurança → recusa (nunca vira "{}")
+        die(3, f"{path} não é JSON legível ({type(e).__name__}): não há settings de casa para levar ao servidor")
     if not isinstance(base, dict):
         die(3, f"{path} não é um objeto JSON")
     clash = [k for k in PLUGIN_KEYS if k in base]
@@ -568,7 +571,7 @@ def cmd_push_bundle(a) -> int:
     home_settings = os.path.join(out, "home", ".claude", "settings.json")
     merged = merged_home_settings(home_settings)
     with open(home_settings) as f:
-        allowed = sorted(set(json.load(f)) | set(PLUGIN_KEYS) | set(OWN_KEYS))
+        allowed = sorted(set(json.load(f)) | set(PLUGIN_KEYS) | set(OWN_KEYS))  # third-state-waiver: merged_home_settings() acabou de abrir e validar ESTE arquivo (ausente/ilegível/não-JSON já saiu com 3 lá)
     stage, q = f"{RHOME}/{BUNDLE_OUT}", shlex.quote
     # vazio → arquivo ausente (o `[ -e ]` sai 3) ou sem texto: não há nada de seu a preservar; falhou/ilegível → ssh caiu (None/255), o cat não leu (1) ou
     # qualquer outro rc: NÃO sei o que há lá, e o install troca o arquivo — recusa, em vez de mesclar como se estivesse vazio e apagar tema/notificação
@@ -580,7 +583,8 @@ def cmd_push_bundle(a) -> int:
     try:
         cur = json.loads(r.out) if r.rc == 0 and r.out.strip() else {}
     except ValueError:
-        cur = {}  # ilegível: o instalador lá embaixo recusa pelo mesmo motivo
+        # texto que não é JSON NÃO é "vazio": mesclar {} apagaria tema/notificação do servidor como se não existissem — recusa aqui, antes do rsync
+        die(1, f"settings.json do servidor existe mas não é JSON ({_short(r.out, 80)}): recuso mesclar às cegas (nada foi instalado)")
     merged.update({k: cur[k] for k in OWN_KEYS if isinstance(cur, dict) and k in cur and k not in merged})
     r = ssh(f"mkdir -p {q(stage)} {q(RHOME + '/gt-remote/bin')}")
     if r.rc != 0:
