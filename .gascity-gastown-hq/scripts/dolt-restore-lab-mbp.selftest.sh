@@ -109,6 +109,7 @@ case "$q" in
     [ "${FAKE_COUNT_FAIL:-0}" != 1 ] || { echo "table not found" >&2; exit 1; }
     [ "${FAKE_COUNT_JUNK:-0}" != 1 ] || { printf 't,n\nissues,many\nlabels,7\n'; exit 0; }
     [ "${FAKE_COUNT_UNI:-0}" != 1 ] || { printf 't,n\nissues,\xd9\xa5\nlabels,7\n'; exit 0; }   # U+0665: str.isdigit() aceita, int() converte
+    [ "${FAKE_COUNT_PARTIAL:-0}" != 1 ] || { printf 't,n\nissues,5\n'; echo "connection lost" >&2; exit 1; }   # imprime a 1a tabela e morre: o que sobra NAO pode parecer um manifest
     case "$q" in
       *'`issues` AS OF '*'`labels` AS OF '*) printf 't,n\nissues,5\nlabels,7\n' ;;
       *) printf 't,n\nissues,6\nlabels,8\n' ;;
@@ -116,20 +117,26 @@ case "$q" in
   *) echo "fake dolt: consulta inesperada: $q" >&2; exit 1 ;;
 esac
 EOF
-# mbp-run: only --check exists in this slice. FAKE_PRESENCE chooses the answer (pausa/ram/semp/pl1: presence=livre, mas o MBP RECUSA ou nao prova paused=0).
+# mbp-run: only --check exists in this slice. FAKE_PRESENCE chooses the answer. Same lines as the REAL mbp-run --check (probe, offload_flag=, paused_local=), and each
+# scenario gets exactly ONE thing wrong (pausa/ram/semp/pl1/offoff/semflag/sempl/big: presence=livre, but the MBP REFUSES or does not prove it); raw = FAKE_RAW (printf %b), rc FAKE_RAW_RC.
 cat > "$T/scripts/mbp-run.sh" <<'EOF'
 #!/bin/bash
 echo "$*" >> "$FAKE_CAP/mbprun.calls"
 env > "$FAKE_CAP/mbprun.env.$$"
 case "${FAKE_PRESENCE:-livre}" in
-  livre) printf 'presence=livre\npresence_why=ocioso\npaused=0\navail_mb=5000\n' ;;
-  uso) printf 'presence=uso\npresence_why=teclado\npaused=0\n' ;;
+  livre) printf 'presence=livre\npresence_why=ocioso\npaused=0\navail_mb=5000\noffload_flag=on\npaused_local=0\n' ;;
+  uso) printf 'presence=uso\npresence_why=teclado\npaused=0\noffload_flag=on\npaused_local=0\n' ;;
   lixo) printf 'algo=estranho\n' ;;
   vazio) ;;
-  pausa) printf 'presence=livre\npaused=1\n'; exit 99 ;;
-  ram) echo "mbp-run: RAM/swap alto — rode local"; printf 'presence=livre\npaused=0\n'; exit 98 ;;
-  semp) printf 'presence=livre\npresence_why=ocioso\n' ;;
-  pl1) printf 'presence=livre\npaused=0\npaused_local=1\n' ;;
+  pausa) printf 'presence=livre\npaused=1\noffload_flag=on\npaused_local=0\n'; exit 99 ;;
+  ram) echo "mbp-run: RAM/swap alto — rode local"; printf 'presence=livre\npaused=0\noffload_flag=on\npaused_local=0\n'; exit 98 ;;
+  semp) printf 'presence=livre\npresence_why=ocioso\noffload_flag=on\npaused_local=0\n' ;;
+  pl1) printf 'presence=livre\npaused=0\noffload_flag=on\npaused_local=1\n' ;;
+  offoff) printf 'presence=livre\npaused=0\noffload_flag=off\npaused_local=0\n' ;;   # o que o mbp-run real imprime, com rc 0, quando o dono desligou o uso
+  semflag) printf 'presence=livre\npaused=0\npaused_local=0\n' ;;
+  sempl) printf 'presence=livre\npaused=0\noffload_flag=on\n' ;;
+  big) printf 'presence=livre\npaused=0\noffload_flag=on\npaused_local=0\n'; i=0; while [ "$i" -lt 300 ]; do printf 'task=%0900d|x|y|z\n' 0; i=$((i+1)); done ;;   # tudo certo, e ~270 KB depois das chaves
+  raw) printf '%b' "$FAKE_RAW"; exit "${FAKE_RAW_RC:-0}" ;;
   off) echo "mbp-run: MBP inalcançável (ssh rc=255) — rode local"; printf 'offload_flag=on\n'; exit 98 ;;
 esac
 exit 0
@@ -214,7 +221,9 @@ reset; FAKE_TABLES=none run --dry-run;    chk_unknown "lista de tabelas vazia ou
 reset; FAKE_TABLES=badname run --dry-run; chk_unknown "lista de tabelas vazia ou com nome fora de" "nome de tabela com ; (nunca vira SQL)" nao
 reset; FAKE_COUNT_FAIL=1 run --dry-run;   chk_unknown "contagem AS OF falhou: table not found" "contagem falhou" nao
 reset; FAKE_COUNT_JUNK=1 run --dry-run;   chk_unknown "contagem AS OF falhou" "contagem que nao e numero" nao
-check "$([ -s "$(RUNDIR)manifest.json" ] && echo cheio || echo vazio)" vazio "contagem que nao e numero: nenhum manifest utilizavel ficou"
+check "$([ -e "$(RUNDIR)manifest.json" ] && echo ficou || echo nenhum)" nenhum "contagem que nao e numero: nenhum manifest.json ficou (nem vazio: o redirect do python o cria antes de falhar; so o rm -f o tira)"
+reset; FAKE_COUNT_PARTIAL=1 run --dry-run; chk_unknown "contagem AS OF falhou: connection lost" "dolt que imprime a 1a tabela e morre" nao
+check "$([ -e "$(RUNDIR)manifest.json" ] && echo ficou || echo nenhum)" nenhum "dolt que morre no meio: nenhum manifest.json (parcial, com cara de valido) fica na rodada"
 
 echo "-- entrada hostil do S3 (latest.json): nada disso chega ao banco vivo — UNKNOWN e NENHUMA chamada ao dolt"
 chk_hostile() {   # $1 = valor de FAKE_LATEST · $2 = rotulo
@@ -301,9 +310,83 @@ reset; FAKE_PRESENCE=semp run --check
 check "$RC" 4 "presence=livre sem a linha paused=: rc 4 (paused ausente nao vale 0)"
 has "$OUT" "paused=?" "paused ausente: o motivo diz '?'"
 reset; FAKE_PRESENCE=pl1 run --check;   check "$RC" 4 "paused_local=1: rc 4"
+# o dono desligou o uso do MBP (mbp-offload off): o mbp-run real SAI 0 e so a linha offload_flag=off diz; o --exec sairia 99
+reset; FAKE_PRESENCE=offoff run --check
+check "$RC" 4 "offload_flag=off (mbp-run sai 0): rc 4 — presence=livre sozinha nao prova que o MBP aceita trabalho"
+has "$OUT" "offload_flag=off" "offload desligado: o motivo diz qual chave falhou"
+reset; FAKE_PRESENCE=semflag run --check
+check "$RC" 4 "sem a linha offload_flag=: rc 4 (ausente nao vale 'on')"
+has "$OUT" "offload_flag=?" "offload_flag ausente: o motivo diz '?'"
+reset; FAKE_PRESENCE=sempl run --check
+check "$RC" 4 "sem a linha paused_local=: rc 4 (ausente nao vale 0)"
+has "$OUT" "paused_local=?" "paused_local ausente: o motivo diz '?'"
+reset; FAKE_PRESENCE=big run --check
+check "$RC" 0 "saida de ~270 KB com tudo certo: rc 0 (cauda longa nao vira 'chave ausente')"
+# a tabela: (rotulo, saida crua do mbp-run, rc do mbp-run, rc esperado). So rc 0 E as quatro chaves exatas, no INICIO da linha, valem 'livre'.
+GOOD='presence=livre\npaused=0\noffload_flag=on\npaused_local=0\n'
+raw_chk() { reset; FAKE_PRESENCE=raw FAKE_RAW="$2" FAKE_RAW_RC="$3" run --check; check "$RC" "$4" "$1"; }
+raw_chk "cru: as quatro chaves exatas, rc 0 -> livre"                   "$GOOD" 0 0
+raw_chk "cru: tudo certo mas o mbp-run saiu 1 -> nao livre"             "$GOOD" 1 4
+raw_chk "cru: chave no meio de outra linha nao conta (xpresence=)"      'xpresence=livre\npaused=0\noffload_flag=on\npaused_local=0\n' 0 4
+raw_chk "cru: offload_flag so dentro de uma linha task= nao conta"      'presence=livre\npaused=0\npaused_local=0\ntask=1|offload_flag=on|x\n' 0 4
+raw_chk "cru: presence=uso antes de presence=livre: vale a 1a linha"    'presence=uso\npresence=livre\npaused=0\noffload_flag=on\npaused_local=0\n' 0 4
+raw_chk "cru: presence=livre com espaco no fim nao e livre"             'presence=livre \npaused=0\noffload_flag=on\npaused_local=0\n' 0 4
+raw_chk "cru: presence=livres nao e livre"                              'presence=livres\npaused=0\noffload_flag=on\npaused_local=0\n' 0 4
+raw_chk "cru: CRLF (presence=livre\\r) nao e livre"                     'presence=livre\r\npaused=0\noffload_flag=on\npaused_local=0\n' 0 4
+raw_chk "cru: offload_flag=ON (caixa alta) nao e on"                    'presence=livre\npaused=0\noffload_flag=ON\npaused_local=0\n' 0 4
+raw_chk "cru: offload_flag= vazio nao e on"                             'presence=livre\npaused=0\noffload_flag=\npaused_local=0\n' 0 4
+raw_chk "cru: paused= vazio nao e 0"                                    'presence=livre\npaused=\noffload_flag=on\npaused_local=0\n' 0 4
+raw_chk "cru: paused_local=01 nao e 0"                                  'presence=livre\npaused=0\noffload_flag=on\npaused_local=01\n' 0 4
 reset; run --dry-run --check;           check "$RC" 2 "--dry-run e --check juntos: rc 2 (um modo por vez)"
 reset; run --check --dry-run;           check "$RC" 2 "--check e --dry-run juntos: rc 2"
 check "$(calls mbprun.calls)" 0 "dois modos: o MBP nao foi tocado"
+
+echo "-- --check contra o mbp-run VERDADEIRO (so o ssh e falso): o que ele imprime e o que o orquestrador le"
+# O fake de cima so prova o que EU acho que o mbp-run imprime. Aqui o script real (scripts/mbp-run.sh) roda inteiro; falso e so o ssh (a sonda
+# do MBP) e a pasta da cidade (bandeira e pausa). Assim a chave que decide ("livre") e a mesma que o --exec depois exige (bandeira + sem pausa).
+mkdir -p "$T/home"
+cat > "$T/bin/sshprobe" <<'EOF'
+#!/bin/bash
+cat > /dev/null   # o script de sonda chega pelo stdin
+echo x >> "$FAKE_CAP/ssh.calls"; env > "$FAKE_CAP/ssh.env.$$"
+[ "${PROBE_RC:-0}" = 0 ] || exit "$PROBE_RC"
+printf 'presence=%s\npresence_why=teste\npaused=%s\navail_mb=%s\ncompressed_mb=100\npressure=1\nmem_free_pct=50\npower=ac\nbatt=100\nload=1.0\nncpu=8\nswap_mb=%s\nswap_delta_mb=0\n' \
+  "${PROBE_PRES:-livre}" "${PROBE_PAUSED:-0}" "${PROBE_AVAIL:-5000}" "${PROBE_SWAP:-100}"
+EOF
+chmod +x "$T/bin/sshprobe"
+# real on|off [pause] — bandeira do offload ligada/desligada e, se pedido, a pausa do Athos no mini; PROBE_* vem do prefixo
+real() {
+  reset; rm -rf "$T/mbpcity"; mkdir -p "$T/mbpcity/.gc/logs"
+  [ "$1" != on ] || : > "$T/mbpcity/.gc/mbp-offload.on"
+  [ "${2:-}" != pause ] || echo "teste" > "$T/mbpcity/.gc/mbp-offload.pause"
+  LABMBP_MBP_RUN="$HERE/mbp-run.sh" MBP_SSH="$T/bin/sshprobe" MBP_CITY="$T/mbpcity" HOME="$T/home" run --check
+}
+real on
+check "$RC" 0 "real: bandeira ligada, sem pausa, MBP livre: rc 0"
+has "$OUT" "MBP livre" "real: diz que esta livre"
+check "$(calls ssh.calls)" 1 "real: o mbp-run verdadeiro sondou o MBP (uma vez, pelo ssh falso)"
+check "$(grep -h -c '^AWS_' "$T"/cap/ssh.env.* | awk '{s+=$1} END{print s+0}')" 0 "real: nenhuma variavel AWS_* chega a sessao do MBP (a credencial do mini fica no mini)"
+check "$(canary_hits)" 0 "real: o canario nao aparece em nada"
+real off
+check "$RC" 4 "real: offload DESLIGADO (mbp-offload off; o mbp-run sai 0 e o --exec sairia 99): rc 4"
+has "$OUT" "offload_flag=off" "real: o motivo e a bandeira"
+real on pause
+check "$RC" 4 "real: pausa do Athos no mini: rc 4"
+has "$OUT" "paused_local=1" "real: o motivo e a pausa local"
+PROBE_PAUSED=1 real on
+check "$RC" 4 "real: pausa gravada no MBP (mbp-run sai 99): rc 4"
+has "$OUT" "rc=99" "real: o motivo traz o rc 99"
+PROBE_PRES=uso real on
+check "$RC" 4 "real: Athos usando o MBP: rc 4"
+has "$OUT" "presence=uso" "real: o motivo traz a presenca"
+PROBE_RC=255 real on
+check "$RC" 4 "real: MBP inalcancavel (ssh 255): rc 4"
+has "$OUT" "inalcançável" "real: o motivo e o do mbp-run"
+PROBE_SWAP=9393 real on
+check "$RC" 4 "real: swap acima do teto (o caso de hoje, 9393 MB): rc 4"
+has "$OUT" "rc=98" "real: o motivo traz o rc 98"
+PROBE_AVAIL=1000 real on
+check "$RC" 4 "real: pouca RAM livre: rc 4"
 
 echo "-- trava: so uma rodada por vez; estado inutilizavel nao e 'nada a fazer'"
 reset; mkdir -p "$T/state/lock"; echo $$ > "$T/state/lock/pid"; run --dry-run

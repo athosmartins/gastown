@@ -33,8 +33,7 @@ CALL_S="${LABMBP_CALL_S:-900}"
 
 # tudo que sai do mini rumo ao MBP (mbp-run) roda SEM nenhuma variável AWS_* do ambiente: só o aws do mini enxerga a credencial
 NOAWS=(env); for v in $(env | cut -d= -f1 | grep '^AWS_'); do NOAWS+=(-u "$v"); done
-DB="hq"; MODE=run
-LOCKED=0; RECL=0; WHY=""; RUN=""; OUT=""
+DB="hq"; MODE=run; LOCKED=0; RECL=0; WHY=""; RUN=""; OUT=""
 NOBJ="?"; TOTAL_KB="?"
 
 log() { printf '%s [lab-mbp] %s\n' "$(date '+%F %T')" "$*"; [ -z "$RUN" ] || printf '%s %s\n' "$(date '+%T')" "$*" >> "$RUN/orchestrator.log"; }
@@ -118,14 +117,17 @@ take_lock() {
   LOCKED=1; echo "$$" > "$STATE/lock/pid" || return 2
 }
 
-# --- o MBP esta livre? So se o mbp-run --check sai 0 E diz presence=livre E paused=0. A presenca e independente da pausa e da saude (RAM/swap,
-# rc 98/99): um MBP que RECUSA ainda imprime presence=livre. Qualquer outra coisa (uso, vazio, inalcancavel, pausa, paused ausente) e "nao".
+# --- o MBP esta livre? So se o mbp-run --check sai 0 E CADA chave abaixo esta na saida com o valor de "livre": presence=livre paused=0 paused_local=0
+# offload_flag=on. A presenca e independente da pausa e da saude (um MBP que RECUSA ainda imprime presence=livre) e o offload desligado
+# (mbp-offload off => o --exec sai 99) so aparece na linha offload_flag=, nunca no rc. Linha ausente/vazia/outra = nao provada = "nao".
 mbp_free() {
-  local o rc pres paused; o=$("${NOAWS[@]}" "$MBP_RUN" --host mbp --check 2>&1); rc=$?
-  pres=$(printf '%s\n' "$o" | sed -n 's/^presence=//p' | head -1); paused=$(printf '%s\n' "$o" | sed -n 's/^paused=//p' | head -1)
-  if [ "$rc" -eq 0 ] && [ "$pres" = livre ] && [ "$paused" = 0 ] && ! printf '%s\n' "$o" | grep -q '^paused_local=1$'; then WHY=""; return 0; fi
-  WHY=$(printf '%s\n' "$o" | grep -v -E '^[a-z_]+=' | head -1)
-  WHY="${WHY:-MBP sem presence=livre}; rc=$rc presence=${pres:-?} paused=${paused:-?}"; return 1
+  local o rc kv k v seen="" bad=0 nl=$'\n'; o=$("${NOAWS[@]}" "$MBP_RUN" --host mbp --check 2>&1); rc=$?
+  for kv in presence=livre paused=0 paused_local=0 offload_flag=on; do   # sem pipe: um grep -q que sai cedo faz o printf morrer de SIGPIPE e o `!` le "ausente"
+    k=${kv%%=*}; v=$nl$o$nl; case "$v" in *"$nl$k="*) v=${v#*"$nl$k="}; v=${v%%"$nl"*} ;; *) v="?" ;; esac   # 1a linha k=...; ausente = ?
+    seen="$seen $k=$v"; [ "$v" = "${kv#*=}" ] || bad=1
+  done
+  if [ "$rc" -eq 0 ] && [ "$bad" -eq 0 ]; then WHY=""; return 0; fi
+  WHY=$(printf '%s\n' "$o" | grep -v -E '^[a-z_]+=' | head -1); WHY="${WHY:-MBP nao provou estar livre}; rc=$rc$seen"; return 1
 }
 
 # --- consulta ao banco VIVO do mini (só leitura) ---------------------------------------------------------------------------
@@ -135,7 +137,7 @@ q() { DOLT_CLI_PASSWORD='' bounded "$DOLT" --host 127.0.0.1 --port "$PORT" --use
 
 # Monta $RUN/manifest.json AS OF o head do latest.json. Deixa AS_OF, FP1 e NTAB. Falha com WHY (rc 1 = UNKNOWN).
 build_manifest() {
-  local meta line n tabs sql
+  local meta line n tabs sql cnt
   meta=$(bounded "$AWS" s3 cp "s3://$BUCKET/_meta/latest.json" - 2>"$RUN/aws.err") || { WHY="nao li _meta/latest.json: $(head -c 200 "$RUN/aws.err")"; return 1; }
   line=$(printf '%s' "$meta" | "$PY" -I -c "$PYHELP" meta "$DB" 2>/dev/null) || { WHY="_meta/latest.json sem run_utc/head valido para $DB"; return 1; }
   FP1="${line%%$'\t'*}"; AS_OF="${line#*$'\t'}"
@@ -148,8 +150,8 @@ build_manifest() {
   [ "$n" -ge 1 ] || { WHY="o commit $AS_OF do latest.json NAO existe no banco vivo (reescrito/flatten?): sem manifest exato, sem veredito"; return 1; }
   tabs=$(q "SHOW FULL TABLES AS OF '$AS_OF'" 2>"$RUN/dolt.err") || { WHY="SHOW TABLES AS OF falhou: $(head -c 200 "$RUN/dolt.err")"; return 1; }
   sql=$(printf '%s\n' "$tabs" | "$PY" -I -c "$PYHELP" union "$AS_OF" 2>/dev/null) || { WHY="lista de tabelas vazia ou com nome fora de [A-Za-z0-9_]"; return 1; }
-  q "$sql" 2>"$RUN/dolt.err" | "$PY" -I -c "$PYHELP" manifest "$DB" "$AS_OF" > "$RUN/manifest.json" 2>/dev/null \
-    && [ -s "$RUN/manifest.json" ] || { WHY="contagem AS OF falhou: $(head -c 200 "$RUN/dolt.err")"; return 1; }
+  cnt=$(q "$sql" 2>"$RUN/dolt.err") && printf '%s\n' "$cnt" | "$PY" -I -c "$PYHELP" manifest "$DB" "$AS_OF" > "$RUN/manifest.json" 2>/dev/null \
+    && [ -s "$RUN/manifest.json" ] || { rm -f "$RUN/manifest.json"; WHY="contagem AS OF falhou: $(head -c 200 "$RUN/dolt.err")"; return 1; }   # dolt que morre no meio: nenhum manifest parcial fica com cara de valido
   NTAB=$("$PY" -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["tables"]))' "$RUN/manifest.json" 2>/dev/null) || NTAB="?"
 }
 
@@ -165,9 +167,7 @@ list_objects() {
 }
 
 finish() {  # $1 = rc final; resumo + RESULT
-  local rc="$1"
-  log "RESULT: ${VERDICT:-UNKNOWN} db=$DB rc=$rc as_of=${AS_OF:-?} tabelas=${NTAB:-?} objetos=$NOBJ run=${RUN:-?}"; [ -z "$WHY" ] || log "motivo: $WHY"
-  exit "$rc"
+  log "RESULT: ${VERDICT:-UNKNOWN} db=$DB rc=$1 as_of=${AS_OF:-?} tabelas=${NTAB:-?} objetos=$NOBJ run=${RUN:-?}"; [ -z "$WHY" ] || log "motivo: $WHY"; exit "$1"
 }
 unknown() { VERDICT=UNKNOWN; WHY="$*"; finish 2; }
 
