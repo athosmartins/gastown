@@ -1,13 +1,18 @@
 #!/bin/bash
-# dolt-restore-lab-mbp.selftest.sh — tests for dolt-restore-lab-mbp.sh, the mini's half (ga-3kmvyr, slice 2/4: --dry-run and --check).
+# dolt-restore-lab-mbp.selftest.sh — tests for dolt-restore-lab-mbp.sh and dolt-restore-lab-mbp-side.sh (ga-3kmvyr).
 #
-# Hermetic: the REAL orchestrator runs against FAKES — aws (latest.json, the object listing), the live dolt and mbp-run.sh (--check
-# only). Nothing of the live city, S3, the MBP or the real dolt is touched. The canary credential sits in the orchestrator's
-# environment (the mini has one): it must reach neither mbp-run nor any file or output, and no sts call and no object read is ever made.
+# Hermetic: the REAL orchestrator and the REAL MBP wrapper run against FAKES — aws (latest.json, the object listing, the objects), the
+# live dolt, ssh (runs the "remote" command locally in a clean environment), mbp-run.sh (plays the MBP: copies the pushed dir to a slot,
+# runs the wrapper under `env -i`, pulls out/, wipes the slot), the lab (checks the copy it got against the S3 fixture, writes a
+# report.json from the manifest it received) and notify. Nothing of the live city, S3, the MBP or the real dolt is touched.
+# The canary credential is the point: it sits in the orchestrator's environment (the mini has a credential) and must be in no argv log,
+# no env dump of anything that goes to the MBP, no file, no output — and no sts call is ever made.
+# The first sections are the whole run (slice 3/4); the last ones are the mini's read-only half (slice 2/4): --dry-run, --check, lock, arguments.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCH_SRC="${LABMBP_SCRIPT_UNDER_TEST:-$HERE/dolt-restore-lab-mbp.sh}"
+SIDE_SRC="${LABMBP_SIDE_UNDER_TEST:-$HERE/dolt-restore-lab-mbp-side.sh}"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -16,9 +21,10 @@ check() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (esperado '$2', veio '$
 has()  { if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (nao achei '$2')"; fi; }
 hasnt(){ if printf '%s' "$1" | grep -qF -- "$2"; then bad "$3 (achei '$2')"; else ok "$3"; fi; }
 HEAD_H="gaffd3qkn1bfe87s8tgvoiic790r1u62"
+BKT="s3://urblink-dolt-backups"
 
-mkdir -p "$T/scripts" "$T/bin" "$T/secret" "$T/s3/hq"
-cp "$ORCH_SRC" "$T/scripts/dolt-restore-lab-mbp.sh"
+mkdir -p "$T/scripts" "$T/bin" "$T/secret" "$T/home/gt-remote/lab/bin" "$T/tmp" "$T/s3/hq"
+cp "$ORCH_SRC" "$T/scripts/dolt-restore-lab-mbp.sh"; cp "$SIDE_SRC" "$T/scripts/dolt-restore-lab-mbp-side.sh"
 printf 'AKIACANARYTESTKEY123\nCANARYsecretKEY0123456789abcdef/+xyz\nCANARYtoken0123456789ABCDEFGHIJKLMNOP==\n' > "$T/secret/canary.txt"
 # the S3 fixture: 5 files, one zero-size, one nested, one multipart (9 MiB = 2 parts of 8 MiB)
 python3 -I - "$T/s3/hq" <<'PY'
@@ -41,10 +47,14 @@ case "$1 $2" in
     case "$3" in
       */_meta/latest.json)
         [ "${FAKE_AWS_HANG:-0}" != 1 ] || exec sleep 30   # pendurado: so o timeout do orquestrador resolve
+        n=$(cat "$FAKE_CAP/latest.n" 2>/dev/null || echo 0); echo $((n+1)) > "$FAKE_CAP/latest.n"
+        [ "${FAKE_LATEST_HANG_AFTER:-0}" != 1 ] || [ "$n" -lt 1 ] || { trap 'touch "$FAKE_CAP/hang.term"; exit 143' TERM; sleep 30 >/dev/null 2>&1 </dev/null & wait $!; }   # so a RELEITURA do fim da rodada pendura; hang.term = o timeout do orquestrador chegou
+        [ "${FAKE_LATEST_FAIL_AFTER:-0}" != 1 ] || [ "$n" -lt 1 ] || { echo "An error occurred (AccessDenied) when calling the GetObject operation" >&2; exit 1; }
         if [ -n "${FAKE_GATE:-}" ]; then g=0; while [ ! -e "$FAKE_GATE" ] && [ "$g" -lt 300 ]; do sleep 0.2; g=$((g+1)); done; fi   # segura quem tem a trava
         [ "${FAKE_LATEST_FAIL:-0}" != 1 ] || { echo "An error occurred (AccessDenied) when calling the GetObject operation" >&2; exit 1; }
+        [ "$n" -lt 1 ] || [ -z "${FAKE_LATEST2:-}" ] || FAKE_LATEST="$FAKE_LATEST2"   # a RELEITURA do fim da rodada pode devolver outra coisa
         case "${FAKE_LATEST:-ok}" in
-          ok) cat "$FAKE_ROOT/latest1.json" ;;
+          ok) if [ "${FAKE_MOVE:-0}" = 1 ] && [ "$n" -ge 1 ]; then cat "$FAKE_ROOT/latest2.json"; else cat "$FAKE_ROOT/latest1.json"; fi ;;
           nohead) printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq":{"issues":5}}}\n' ;;
           badhead) printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq":{"head":"x; DROP TABLE issues"}}}\n' ;;
           norun) printf '{"databases":{"hq":{"head":"%s"}}}\n' "$FAKE_HEAD" ;;
@@ -59,7 +69,18 @@ case "$1 $2" in
           tabhead) printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq":{"head":"%s\\t'"'"'; CREATE TABLE pwned (i int); -- "}}}\n' "$FAKE_HEAD" ;;
           longhead) printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq":{"head":"%sa"}}}\n' "$FAKE_HEAD" ;;
         esac ;;
-      *) echo x >> "$FAKE_CAP/objreads"; exit 1 ;;   # a dry-run never reads an object
+      s3://urblink-dolt-backups/hq/*)
+        echo x >> "$FAKE_CAP/objreads"
+        key="${3#s3://urblink-dolt-backups/}"; ck="$FAKE_CAP/obj.$(printf '%s' "$key" | tr / _)"
+        n=$(cat "$ck" 2>/dev/null || echo 0); echo $((n+1)) > "$ck"
+        [ -z "${FAKE_OBJ_SLOW:-}" ] || sleep "$FAKE_OBJ_SLOW"
+        [ "${FAKE_OBJ_HANG:-}" != "$key" ] || exec sleep 60   # aws cp pendurado: so o teto por objeto resolve
+        if [ "${FAKE_OBJ_FAIL:-}" = "$key" ] || { [ "${FAKE_OBJ_FAIL_ONCE:-}" = "$key" ] && [ "$n" -eq 0 ]; }; then
+          echo "fatal error: An error occurred (500) when calling the GetObject operation (reached max retries)" >&2; exit 1; fi
+        if [ "${FAKE_OBJ_TRUNC:-}" = "$key" ]; then head -c 100 "$FAKE_ROOT/s3/$key"; exit 0; fi
+        if [ "${FAKE_OBJ_CORRUPT:-}" = "$key" ]; then { printf 'Z'; tail -c +2 "$FAKE_ROOT/s3/$key"; }; exit 0; fi
+        cat "$FAKE_ROOT/s3/$key" ;;
+      *) exit 1 ;;
     esac ;;
   "s3api list-objects-v2")
     [ "${FAKE_LIST_HANG:-0}" != 1 ] || exec sleep 30
@@ -78,10 +99,13 @@ for d, _, fs in sorted(os.walk(root + "/hq")):
                 digs.append(hashlib.md5(c).digest()); n += len(c)
         e = hashlib.md5(b"").hexdigest() if not digs else digs[0].hex() if len(digs) == 1 else "%s-%d" % (hashlib.md5(b"".join(digs)).hexdigest(), len(digs))
         if E.get("FAKE_LIST_ZERO") == "1": n = 0
+        if key == E.get("FAKE_LIST_ETAG_MP"): e = "0" * 32 + "-3"
+        if key == E.get("FAKE_LIST_ETAG_BAD"): e = "1" * 32
         if E.get("FAKE_LIST_ETAG_JUNK") == key: e = "not-an-etag"
         if E.get("FAKE_LIST_SIZE_JUNK") == key: n = "12KB"
         if E.get("FAKE_LIST_SIZE_UNI") == key: n = "\u0665"
         print("%s\t%s\t\"%s\"" % (key, n, e))
+if E.get("FAKE_LIST_DIRMARK") == "1": print("hq/emptydir/\t0\t\"d41d8cd98f00b204e9800998ecf8427e\"")
 bk = os.environ.get("FAKE_LIST_BADKEY")
 if bk: print({"1": "hq/a;touch pwned", "2": "hq/../x", "3": "other/x", "4": "hq/a b"}[bk] + "\t5\t\"d41d8cd98f00b204e9800998ecf8427e\"")
 PY
@@ -93,6 +117,7 @@ EOF
 cat > "$T/bin/dolt" <<'EOF'
 #!/bin/bash
 echo "$*" >> "$FAKE_CAP/dolt.argv"
+[ "${1:-}" = version ] && { [ "${FAKE_DOLT_VER_HANG:-0}" != 1 ] || { trap 'touch "$FAKE_CAP/hang.term"; exit 143' TERM; sleep 30 >/dev/null 2>&1 </dev/null & wait $!; }; echo "dolt version 2.3.1"; exit 0; }
 [ "${FAKE_DOLT_DOWN:-0}" != 1 ] || { echo "connection refused" >&2; exit 1; }
 [ "${FAKE_DOLT_HANG:-0}" != 1 ] || exec sleep 30
 q=""; while [ $# -gt 0 ]; do [ "$1" = -q ] && { q="$2"; break; }; shift; done
@@ -117,30 +142,142 @@ case "$q" in
   *) echo "fake dolt: consulta inesperada: $q" >&2; exit 1 ;;
 esac
 EOF
-# mbp-run: only --check exists in this slice. FAKE_PRESENCE chooses the answer. Same lines as the REAL mbp-run --check (probe, offload_flag=, paused_local=), and each
-# scenario gets exactly ONE thing wrong (pausa/ram/semp/pl1/offoff/semflag/sempl/big: presence=livre, but the MBP REFUSES or does not prove it); raw = FAKE_RAW (printf %b), rc FAKE_RAW_RC.
+cat > "$T/bin/notify" <<'EOF'
+#!/bin/bash
+echo "$*" >> "$FAKE_CAP/notify.log"
+EOF
+# ssh: the "MBP" is this machine in a clean environment. Records argv and its own env; can drop mid-object or tamper with the copy
+# right before stream.done; after the command it looks for big files on the mini (the data must be a pipe, never a file).
+cat > "$T/bin/ssh" <<'EOF'
+#!/bin/bash
+echo "$*" >> "$FAKE_CAP/ssh.calls"
+[ -e "$FAKE_CAP/ssh.env" ] || env > "$FAKE_CAP/ssh.env"
+cmd="${!#}"; LS="$FAKE_ROOT/mbp/gt-remote/exec/1/in/lab-src"
+case "$cmd" in
+  "printf x > "*stream.done*)
+    case "${FAKE_TAMPER:-}" in
+      missing) rm -f "$LS/manifest" ;;
+      extra) echo junk > "$LS/EXTRA" ;;
+      size) printf 'x' >> "$LS/manifest" ;;
+    esac ;;
+  *"cat > "*)
+    if [ -n "${FAKE_SSH_DROP:-}" ] && printf '%s' "$cmd" | grep -qF -- "/$FAKE_SSH_DROP'"; then
+      n=$(cat "$FAKE_CAP/ssh.drop.n" 2>/dev/null || echo 0); echo $((n+1)) > "$FAKE_CAP/ssh.drop.n"
+      if [ "${FAKE_SSH_DROP_ONCE:-0}" != 1 ] || [ "$n" -eq 0 ]; then
+        dest=$(printf '%s' "$cmd" | sed -n "s/.*cat > '\([^']*\)'.*/\1/p"); mkdir -p "$(dirname "$dest")"; head -c 1000 > "$dest"; exit 255
+      fi
+    fi ;;
+esac
+env -i HOME="$FAKE_ROOT/home" PATH=/usr/bin:/bin /bin/sh -c "$cmd"; rc=$?
+find "$FAKE_ROOT/tmp" "$FAKE_ROOT/state" "$FAKE_ROOT/city" "$FAKE_ROOT/cap" -type f -size +1000k 2>/dev/null | grep -c . >> "$FAKE_CAP/mini-big"
+exit $rc
+EOF
+# the MBP: plays mbp-run.sh. --check by FAKE_PRESENCE: same lines as the REAL mbp-run --check (probe, offload_flag=, paused_local=), and each scenario gets exactly ONE thing wrong
+# (pausa/ram/semp/pl1/offoff/semflag/sempl/big: presence=livre, but the MBP REFUSES or does not prove it); raw = FAKE_RAW (printf %b), rc FAKE_RAW_RC. --exec copies the push into a slot
+# and runs the command under `env -i`.
 cat > "$T/scripts/mbp-run.sh" <<'EOF'
 #!/bin/bash
 echo "$*" >> "$FAKE_CAP/mbprun.calls"
 env > "$FAKE_CAP/mbprun.env.$$"
-case "${FAKE_PRESENCE:-livre}" in
-  livre) printf 'presence=livre\npresence_why=ocioso\npaused=0\navail_mb=5000\noffload_flag=on\npaused_local=0\n' ;;
-  uso) printf 'presence=uso\npresence_why=teclado\npaused=0\noffload_flag=on\npaused_local=0\n' ;;
-  lixo) printf 'algo=estranho\n' ;;
-  vazio) ;;
-  pausa) printf 'presence=livre\npaused=1\noffload_flag=on\npaused_local=0\n'; exit 99 ;;
-  ram) echo "mbp-run: RAM/swap alto — rode local"; printf 'presence=livre\npaused=0\noffload_flag=on\npaused_local=0\n'; exit 98 ;;
-  semp) printf 'presence=livre\npresence_why=ocioso\noffload_flag=on\npaused_local=0\n' ;;
-  pl1) printf 'presence=livre\npaused=0\noffload_flag=on\npaused_local=1\n' ;;
-  offoff) printf 'presence=livre\npaused=0\noffload_flag=off\npaused_local=0\n' ;;   # o que o mbp-run real imprime, com rc 0, quando o dono desligou o uso
-  semflag) printf 'presence=livre\npaused=0\npaused_local=0\n' ;;
-  sempl) printf 'presence=livre\npaused=0\noffload_flag=on\n' ;;
-  big) printf 'presence=livre\npaused=0\noffload_flag=on\npaused_local=0\n'; i=0; while [ "$i" -lt 300 ]; do printf 'task=%0900d|x|y|z\n' 0; i=$((i+1)); done ;;   # tudo certo, e ~270 KB depois das chaves
-  raw) printf '%b' "$FAKE_RAW"; exit "${FAKE_RAW_RC:-0}" ;;
-  off) echo "mbp-run: MBP inalcançável (ssh rc=255) — rode local"; printf 'offload_flag=on\n'; exit 98 ;;
+if [ "${1:-}" = --host ]; then
+  case "${FAKE_PRESENCE:-livre}" in
+    livre) printf 'presence=livre\npresence_why=ocioso\npaused=0\navail_mb=5000\noffload_flag=on\npaused_local=0\n' ;;
+    uso) printf 'presence=uso\npresence_why=teclado\npaused=0\noffload_flag=on\npaused_local=0\n' ;;
+    lixo) printf 'algo=estranho\n' ;;
+    vazio) ;;
+    pausa) printf 'presence=livre\npaused=1\noffload_flag=on\npaused_local=0\n'; exit 99 ;;
+    ram) echo "mbp-run: RAM/swap alto — rode local"; printf 'presence=livre\npaused=0\noffload_flag=on\npaused_local=0\n'; exit 98 ;;
+    semp) printf 'presence=livre\npresence_why=ocioso\noffload_flag=on\npaused_local=0\n' ;;
+    pl1) printf 'presence=livre\npaused=0\noffload_flag=on\npaused_local=1\n' ;;
+    offoff) printf 'presence=livre\npaused=0\noffload_flag=off\npaused_local=0\n' ;;   # o que o mbp-run real imprime, com rc 0, quando o dono desligou o uso
+    semflag) printf 'presence=livre\npaused=0\npaused_local=0\n' ;;
+    sempl) printf 'presence=livre\npaused=0\noffload_flag=on\n' ;;
+    big) printf 'presence=livre\npaused=0\noffload_flag=on\npaused_local=0\n'; i=0; while [ "$i" -lt 300 ]; do printf 'task=%0900d|x|y|z\n' 0; i=$((i+1)); done ;;   # tudo certo, e ~270 KB depois das chaves
+    raw) printf '%b' "$FAKE_RAW"; exit "${FAKE_RAW_RC:-0}" ;;
+    off) echo "mbp-run: MBP inalcançável (ssh rc=255) — rode local"; printf 'offload_flag=on\n'; exit 98 ;;
+  esac
+  exit 0
+fi
+shift; push=""; pull=""
+while [ $# -gt 0 ]; do case "$1" in --push) push="$2"; shift 2 ;; --pull) pull="$2"; shift 2 ;; --) shift; break ;; *) shift ;; esac; done
+echo "modes: dir=$(stat -f %Lp "$push") parent=$(stat -f %Lp "$(dirname "$push")")" >> "$FAKE_CAP/modes"
+SLOT="$FAKE_ROOT/mbp/gt-remote/exec/1"
+case "${FAKE_EXEC:-run}" in
+  refuse98) echo "mbp-run: MBP em uso — rode local"; exit 98 ;;
+  noready) sleep "${FAKE_NOREADY_S:-4}"; exit 0 ;;
+  badslot) echo "[lab-mbp] ready slot=$FAKE_BADSLOT"; sleep 2; exit 0 ;;
 esac
-exit 0
+rm -rf "$SLOT"; mkdir -p "$SLOT/in" && cp -Rp "$push" "$SLOT/in/"
+printf 'lab=%s\ndolt_version=%s\nleak=%s\ndisk=%s\n' "${SC_LAB:-ok}" "${SC_DOLT_VER:-2.3.1}" "${SC_LEAK:-0}" "${SC_DISK:-ok}" > "$FAKE_ROOT/scen"
+extra=(); [ "${SC_AWSENV:-0}" != 1 ] || extra=(AWS_PROFILE=leaky)
+for t in ps env; do rm -f "$FAKE_ROOT/home/gt-remote/lab/bin/$t"; done   # SC_BROKEN=ps|env: that tool fails (exit 1, no output) in the MBP session
+[ -z "${SC_BROKEN:-}" ] || { printf '#!/bin/sh\nexit 1\n' > "$FAKE_ROOT/home/gt-remote/lab/bin/$SC_BROKEN"; chmod +x "$FAKE_ROOT/home/gt-remote/lab/bin/$SC_BROKEN"; }
+[ "${FAKE_MINI_LEAK:-0}" != 1 ] || echo "AWS_SECRET_ACCESS_KEY=whatever" > "$(dirname "$push")/stray.txt"
+[ "${FAKE_MINI_LEAK:-0}" != 3 ] || { mkdir "$FAKE_ROOT/state/zz-unreadable" && chmod 000 "$FAKE_ROOT/state/zz-unreadable"; }
+[ "${FAKE_MINI_LEAK:-0}" != 2 ] || echo '{"cmd":"AWS_ACCESS_KEY_ID=whatever"}' > "$FAKE_ROOT/city/.gc/logs/mbp-run.jsonl"
+if [ "${FAKE_EXEC:-run}" = die_after_ready ]; then   # the job dies (and mbp-run wipes the slot) while the mini is still sending
+  ( cd "$SLOT" && exec env -i HOME="$FAKE_ROOT/home" PATH="/usr/bin:/bin:/usr/sbin:/sbin" FAKE_SCEN="$FAKE_ROOT/scen" LAB_POLL_S=0.2 "$@" 2>&1 ) &
+  wp=$!; n=0; until [ -d "$SLOT/in/lab-src" ] || [ $n -ge 50 ]; do sleep 0.1; n=$((n+1)); done
+  sleep 1.5; kill $wp 2>/dev/null; wait $wp 2>/dev/null; [ "${FAKE_KEEP_SLOT:-0}" = 1 ] || rm -rf "$SLOT"; sleep "${FAKE_STAY_S:-0}"; echo "mbp-run: ssh caiu durante a execução — rode local"; exit 98
+fi
+( cd "$SLOT" && env -i HOME="$FAKE_ROOT/home" PATH="/usr/bin:/bin:/usr/sbin:/sbin" FAKE_SCEN="$FAKE_ROOT/scen" FAKE_S3="$FAKE_ROOT/s3" FAKE_CAP="$FAKE_CAP" \
+    LAB_SAMPLE_S=1 LAB_POLL_S=0.2 "${extra[@]}" "$@" 2>&1 ) | cat
+rc=${PIPESTATUS[0]}
+grep -rIlF -f "$FAKE_ROOT/secret/canary.txt" "$SLOT" 2>/dev/null | grep -c . > "$FAKE_CAP/slot-canary-files"
+if [ "${FAKE_EXEC:-run}" = drop ]; then rm -rf "$SLOT"; echo "mbp-run: ssh caiu durante a execução — rode local"; exit 98; fi
+rel=${pull%%:*}; dest=${pull#*:}
+[ -z "$pull" ] || { mkdir -p "$dest"; cp -Rp "$SLOT/$rel." "$dest" 2>/dev/null; }
+chmod -R u+rwx "$SLOT" 2>/dev/null; rm -rf "$SLOT"
+[ "${FAKE_EXEC:-run}" != killparent ] || kill -9 $PPID   # the orchestrator's subshell dies before it can record this exit code
+exit $rc
 EOF
+# the lab, as the MBP wrapper calls it: compares the copy with the S3 fixture and writes the report
+cat > "$T/scripts/dolt-restore-lab.sh" <<'EOF'
+#!/bin/bash
+sc() { sed -n "s/^$1=//p" "$FAKE_SCEN"; }
+while [ $# -gt 0 ]; do case "$1" in --manifest) M="$2" ;; --report) R="$2" ;; --source) SRC="${2#file://}" ;; esac; shift; done
+echo x >> "$FAKE_CAP/lab.invoked"; echo "${AWS_SHARED_CREDENTIALS_FILE:-unset} ${AWS_CONFIG_FILE:-unset}" > "$FAKE_CAP/lab.awsfiles"
+if diff -r "$SRC" "$FAKE_S3/hq" >/dev/null 2>&1; then echo "lab: source identical to the S3 fixture"; else echo "lab: source DIFFERENT from the S3 fixture"; fi
+if [ "$(sc leak)" = 1 ]; then   # a process with a credential in its argv that is GONE before the lab ends: only a periodic ps sample can see it.
+  # It lives until the wrapper's sampler has recorded a hit (30 s cap), however slow ps is on a loaded machine.
+  bash -c "sleep 35; :" AKIAQQQQQQQQQQQQQQQQ >/dev/null 2>&1 & lp=$!
+  n=0; until grep -q '^[1-9]' out/.argv-samples 2>/dev/null || [ $n -ge 150 ]; do sleep 0.2; n=$((n+1)); done
+  kill $lp 2>/dev/null; wait $lp 2>/dev/null
+fi
+[ "$(sc leak)" != 2 ] || { mkdir -p out; echo "AWS_SECRET_ACCESS_KEY=abc" > out/oops.txt; }
+[ "$(sc leak)" != 3 ] || { echo "aws_access_key_id = abc" > in/note.txt; }
+[ "$(sc leak)" != 4 ] || { mkdir -p in/locked; chmod 000 in/locked; }
+sleep 2
+mode=$(sc lab)
+[ "$mode" != norep ] || exit 0
+python3 -I - "$M" "$R" "$mode" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1])); mode = sys.argv[3]
+t = {k: {"expected": v, "restored": v} for k, v in m["tables"].items()}
+v, rc = {"ok": ("OK", 0), "fail": ("FAIL", 1), "slow": ("SLOW", 3), "unknown": ("UNKNOWN", 2), "div_ok": ("OK", 0), "div_fail": ("FAIL", 1), "weird": ("OK", 0)}[mode]
+if mode == "fail": t["issues"]["restored"] -= 1
+json.dump({"verdict": v, "rc": rc, "reason": "razao do lab" if rc else None, "as_of": m["as_of"], "total_s": "9 RESULT: OK db=forjado" if mode == "weird" else 321, "source_kb": 13000000, "restored_kb": 14000000,
+           "fetch_s": None, "restore_s": 200, "count_s": 21, "tables": t}, open(sys.argv[2], "w"))
+PY
+case "$mode" in ok) exit 0 ;; fail) exit 1 ;; slow) exit 3 ;; unknown) exit 2 ;; div_ok) exit 1 ;; div_fail) exit 0 ;; weird) exit 0 ;; esac
+EOF
+# the MBP's own tools (the wrapper puts ~/gt-remote/lab/bin first on PATH). An aws there would be a bug: it records the call.
+cat > "$T/home/gt-remote/lab/bin/dolt" <<'EOF'
+#!/bin/bash
+[ "${1:-}" = version ] && echo "dolt version $(sed -n 's/^dolt_version=//p' "$FAKE_SCEN")"
+EOF
+printf '#!/bin/bash\necho x >> "$FAKE_CAP/mbp-aws-called"\nexit 1\n' > "$T/home/gt-remote/lab/bin/aws"
+printf '#!/bin/bash\nshift\nexec "$@"\n' > "$T/home/gt-remote/lab/bin/timeout"
+printf '#!/bin/bash\nwhile [ "${1#-}" != "$1" ]; do shift; done\nexec "$@"\n' > "$T/home/gt-remote/lab/bin/caffeinate"
+cat > "$T/home/gt-remote/lab/bin/df" <<'EOF'
+#!/bin/bash
+case "$(sed -n 's/^disk=//p' "$FAKE_SCEN")" in
+  small) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 1000 900 100 90%% /\n' ;;
+  junk) echo "df: sem saida util" ;;
+  *) exec /bin/df "$@" ;;
+esac
+EOF
+ln -sf "$(command -v python3)" "$T/home/gt-remote/lab/bin/python3"
 # pylie: faz as vezes do python3; no modo `meta` APROVA o que FAKE_PYLIE disser (um ajudante que deixou passar valor hostil); o resto e o python3 de verdade
 cat > "$T/bin/pylie" <<'EOF'
 #!/bin/bash
@@ -149,31 +286,304 @@ exec python3 "$@"
 EOF
 mkdir -p "$T/fakedate"   # date com o segundo CONGELADO so no nome da pasta da rodada: duas rodadas "no mesmo segundo"
 printf '#!/bin/bash\n[ "$*" = "-u +%%Y%%m%%dT%%H%%M%%SZ" ] && { echo 20261016T000000Z; exit 0; }\nexec /bin/date "$@"\n' > "$T/fakedate/date"
-chmod +x "$T/bin/"* "$T/scripts/"*.sh "$T/fakedate/date"
+chmod +x "$T/bin/"* "$T/scripts/"*.sh "$T/home/gt-remote/lab/bin/"* "$T/fakedate/date"
 printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq":{"issues":5,"head":"%s","backup_size":"13G"}}}\n' "$HEAD_H" > "$T/latest1.json"
+printf '{"run_utc":"2026-10-16T07:59:00Z","databases":{"hq":{"issues":5,"head":"%s","backup_size":"13G"}}}\n' "$HEAD_H" > "$T/latest2.json"
 
 # ---- harness ---------------------------------------------------------------------------------------------------------------
 reset() {
-  rm -rf "$T/state" "$T/cap" "$T/city" "$T/pwned"
-  mkdir -p "$T/state" "$T/cap" "$T/city/.gc/runtime/packs/dolt"
+  rm -rf "$T/state" "$T/cap" "$T/city" "$T/tmp" "$T/mbp" "$T/pwned" "$T/scen"
+  mkdir -p "$T/state" "$T/cap" "$T/tmp" "$T/mbp" "$T/city/.gc/run" "$T/city/.gc/logs" "$T/city/.gc/runtime/packs/dolt"
   printf 'listener:\n  port: 4242\n' > "$T/city/.gc/runtime/packs/dolt/dolt-config.yaml"
 }
 # envrun [args] — FAKE_*/LABMBP_* come from the caller's environment prefix. The mini HAS an AWS credential (the canary).
 envrun() {
+  env LABMBP_CITY="$T/city" LABMBP_STATE="${STATE_OVERRIDE:-$T/state}" LABMBP_AWS="$T/bin/aws" LABMBP_DOLT="$T/bin/dolt" LABMBP_NOTIFY="$T/bin/notify" \
+      MBP_SSH="$T/bin/ssh" MBP_HOST=fake@mbp LABMBP_SSH_OPTS="-o Fake=1" LABMBP_POLL_S=0.2 LABMBP_RETRY_S=0.2 LABMBP_NOW_HOUR="${LABMBP_NOW_HOUR:-0}" LABMBP_STREAM_S="${LABMBP_STREAM_S:-120}" \
+      AWS_ACCESS_KEY_ID="$(sed -n 1p "$T/secret/canary.txt")" AWS_SECRET_ACCESS_KEY="$(sed -n 2p "$T/secret/canary.txt")" AWS_SESSION_TOKEN="$(sed -n 3p "$T/secret/canary.txt")" \
+      TMPDIR="$T/tmp" FAKE_CAP="$T/cap" FAKE_ROOT="$T" "${LABMBP_TEST_BASH:-bash}" "$T/scripts/dolt-restore-lab-mbp.sh" "$@"
+}
+run() {
   env LABMBP_CITY="$T/city" LABMBP_STATE="${STATE_OVERRIDE:-$T/state}" LABMBP_AWS="$T/bin/aws" LABMBP_DOLT="$T/bin/dolt" FAKE_HEAD="$HEAD_H" \
       AWS_ACCESS_KEY_ID="$(sed -n 1p "$T/secret/canary.txt")" AWS_SECRET_ACCESS_KEY="$(sed -n 2p "$T/secret/canary.txt")" AWS_SESSION_TOKEN="$(sed -n 3p "$T/secret/canary.txt")" \
       FAKE_CAP="$T/cap" FAKE_ROOT="$T" "${LABMBP_TEST_BASH:-bash}" "$T/scripts/dolt-restore-lab-mbp.sh" "$@"
 }
 run() { OUT=$(envrun "$@" 2>&1); RC=$?; }
 canary_hits() {   # files that must not hold the canary + the output of the run
-  local n; n=$(grep -rIlF -f "$T/secret/canary.txt" "$T/cap" "$T/state" "$T/city" 2>/dev/null | grep -c .)
+  local n; n=$(grep -rIlF -f "$T/secret/canary.txt" "$T/cap" "$T/state" "$T/city" "$T/home" "$T/tmp" "$T/mbp" 2>/dev/null | grep -c .)
   printf '%s' "$OUT" | grep -qF -f "$T/secret/canary.txt" && n=$((n+1)); echo "$n"
 }
 cnt() { local n; n=$(grep -c "$2" "$T/cap/$1" 2>/dev/null); echo "${n:-0}"; }
 calls() { cnt "$1" .; }
+execs() { cnt mbprun.calls -e--exec; }
+objreads() { cnt aws.argv "s3 cp $BKT/hq/"; }
+summ() { cat "$T"/state/runs/*/summary.txt 2>/dev/null; }
+labstream() { cat "$T"/state/runs/*/out/lab.stream 2>/dev/null; }
+tmpleft() { ls -A "$T/tmp" 2>/dev/null | grep -c .; }
+mbpfiles() { find "$T/mbp" -type f 2>/dev/null | grep -c .; }
+labran() { [ -e "$T/cap/lab.invoked" ] && echo sim || echo nao; }
+lastfinal() { [ -s "$T/state/last-final" ] && echo sim || echo nao; }
 RUNDIR() { ls -d "$T"/state/runs/*/ 2>/dev/null | head -1; }
 
-echo "== ga-3kmvyr.2: orquestrador, metade do mini (manifest AS OF + lista do S3; nada vai ao MBP) =="
+echo "== ga-3kmvyr: orquestrador do restore no MBP (o mini le o S3 e envia por ssh; nenhuma credencial vai ao MBP) =="
+# ---------------------------------------------------------------------------------------------------------------------------------
+echo "-- caminho feliz (OK), credencial canario no ambiente do mini"
+reset; run
+check "$RC" 0 "OK: rc 0"
+has "$OUT" "RESULT: OK db=hq rc=0 as_of=$HEAD_H tabelas=2 objetos=5 stream_s=" "RESULT traz verdict, commit AS OF, tabelas e objetos"
+check "$(python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["as_of"], sorted(m["tables"].items()), m["schema"], m["db"])' "$(ls "$T"/state/runs/*/manifest.json)")" "$HEAD_H [('issues', 5), ('labels', 7)] 1 hq" "manifest: commit do latest.json, so BASE TABLE (a view fica de fora), contagens AS OF"
+has "$(cat "$T/cap/dolt.argv")" "AS OF '$HEAD_H'" "a contagem foi feita AS OF o commit"
+has "$(cat "$T/cap/dolt.argv")" "commit_hash = '$HEAD_H'" "o commit foi procurado no log do banco vivo"
+has "$(cat "$T/cap/aws.argv")" "s3api list-objects-v2 --bucket urblink-dolt-backups --prefix hq/" "a lista de objetos vem do S3 (prefixo hq/)"
+check "$(objreads)" 5 "os 5 objetos da lista foram lidos do S3, um cp cada"
+has "$(cat "$T/cap/aws.argv")" "s3 cp $BKT/hq/oldgen/aaa -" "o objeto vai para stdout (cp ... -), nao para disco"
+check "$(labstream | grep -c 'lab: source identical')" 1 "a copia que o lab recebeu e IDENTICA ao S3 (incluindo o vazio, o aninhado e o multiparte)"
+check "$(labran)" sim "o lab rodou"
+# credential hygiene: nothing AWS reaches the MBP
+check "$(cat "$T/cap/lab.awsfiles")" "/dev/null /dev/null" "o lab roda com os arquivos de credencial/config da AWS apontados para /dev/null"
+check "$(canary_hits)" 0 "CREDENCIAL: o canario nao esta em nenhum argv, env, arquivo nem na saida"
+check "$(grep -c -E '^AWS_' "$T"/cap/mbprun.env.* "$T/cap/ssh.env" | awk -F: '{s+=$2} END{print s+0}')" 0 "o ambiente do mbp-run e do ssh nao carrega AWS_* (o mini tem credencial, o que vai ao MBP nao)"
+hasnt "$(cat "$T/cap/mbprun.calls" "$T/cap/ssh.calls")" "--env" "mbp-run chamado sem --env"
+check "$(calls sts.calls)" 0 "nenhum sts foi chamado"
+check "$(calls mbp-aws-called)" 0 "o aws do MBP nunca foi chamado"
+check "$(cat "$T/cap/slot-canary-files")" 0 "o slot do MBP nao tem o canario em nenhum arquivo"
+check "$(grep -E -c -- "--exec --push $T/tmp/lab-mbp\.[A-Za-z0-9]+/lab-in --pull out/:$T/state/runs/[0-9TZ]+-[0-9]+/out/ -- bash in/lab-in/dolt-restore-lab-mbp-side.sh" "$T/cap/mbprun.calls")" 1 "push do stage e pull de out/ para a pasta da rodada"
+has "$(cat "$T/cap/mbprun.calls")" "in/lab-in/dolt-restore-lab-mbp-side.sh --db hq --dolt-version 2.3.1 --rto-seconds 3600 --src-kb $EXPKB --margin-pct 400 --stream-wait-s 420" "o comando remoto leva so nomes e numeros (inclusive o tamanho do backup; espera = teto do envio + 300 s)"
+has "$(grep -h '^MBP_RUN_TIMEOUT_S=\|^MBP_SLOT_MAX_AGE_S=' "$T"/cap/mbprun.env.* | sort | tr '\n' ' ')" "MBP_RUN_TIMEOUT_S=12600 MBP_SLOT_MAX_AGE_S=14400" "tetos do mbp-run para uma rodada longa"
+check "$(cat "$T/cap/modes")" "modes: dir=700 parent=700" "stage 0700 no momento do push"
+check "$(sort -u "$T/cap/mini-big" | tr -d '\n')" 0 "o mini NUNCA guardou o dado: nenhum arquivo grande no disco dele durante o envio"
+check "$(mbpfiles)" 0 "o slot do MBP foi limpo no fim"
+check "$(tmpleft)" 0 "o stage do mini foi apagado"
+S=$(summ)
+has "$S" "envio: objetos=5 kb=$EXPKB stream_s=" "resumo traz o envio: objetos e KB"
+has "$S" "etag_verificado=5 etag_nao_verificavel=0" "os 5 ETags fecharam (inclusive o composto do multiparte e o do objeto vazio)"
+has "$S" "dolt_version_mbp=2.3.1" "evidencia do MBP: versao do dolt"
+has "$S" "copia_conferida=objetos=5 bytes=$EXPB" "evidencia do MBP: a copia conferida contra a lista"
+check "$(echo "$S" | grep -c 'free_kb_before=[0-9]')" 1 "disco livre do MBP medido antes da rodada"
+has "$S" "mbp-higiene: aws_env_vars=0 ps_acertos=0 arquivos-com-credencial=0" "higiene do MBP: contagens zero"
+has "$S" "mini-higiene: arquivos-com-cara-de-credencial=0" "higiene do mini: zero"
+hasnt "$S" "ALERTA" "sem alerta"
+has "$S" "table=issues expected=5 restored=5" "resumo traz a contagem por tabela"
+has "$S" "total_s=321" "resumo traz o tempo total"
+has "$S" "backup_kb=13000000 restaurado_kb=14000000" "resumo traz os tamanhos"
+check "$(calls notify.log)" 0 "OK nao dispara notify"
+check "$(lastfinal)" sim "OK grava last-final"
+check "$([ -d "$T/state/lock" ] && echo sim || echo nao)" nao "a trava foi solta"
+
+echo "-- ja rodou esta semana"
+run
+check "$RC" 0 "segunda rodada: rc 0"
+has "$OUT" "ja ha veredito conclusivo" "pula: ja ha veredito conclusivo"
+has "$OUT" "RESULT: SKIPPED db=hq rc=0" "pula: RESULT SKIPPED (o agendador ve que nao rodou)"
+check "$(execs)" 1 "o MBP nao foi tocado de novo"
+run --force
+check "$(execs)" 2 "--force roda de novo"
+# uma tentativa que NAO deu veredito conclusivo (UNKNOWN) tambem segura as janelas seguintes por 12 h: so a primeira que acha o MBP livre trabalha
+reset; SC_DOLT_VER=2.3.0 run
+check "$RC" 2 "tentativa que deu UNKNOWN (dolt do MBP em outra versao)"; check "$(lastfinal)" nao "UNKNOWN nao e veredito da semana"; check "$(execs)" 1 "o MBP foi tocado uma vez"
+run
+check "$RC" 0 "a janela seguinte, minutos depois, pula"; has "$OUT" "uma rodada ja comecou nas ultimas 12 h" "diz por que pula"; has "$OUT" "RESULT: SKIPPED db=hq rc=0" "tentativa recente: RESULT SKIPPED"; check "$(execs)" 1 "o MBP nao foi tocado de novo"
+run --force
+check "$(execs)" 2 "--force ignora a tentativa recente"
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+echo "-- vereditos do lab"
+reset; SC_LAB=fail run
+check "$RC" 1 "FAIL: rc 1"; has "$OUT" "RESULT: FAIL" "RESULT FAIL"
+has "$(summ)" "table=issues expected=5 restored=4" "FAIL mostra a tabela que nao bate"
+check "$(calls notify.log)" 1 "FAIL dispara notify"; check "$(lastfinal)" sim "FAIL e conclusivo: grava last-final"
+check "$(canary_hits)" 0 "FAIL: canario ausente"
+reset; SC_LAB=fail FAKE_MOVE=1 run
+check "$RC" 2 "FAIL com o latest.json mudado no meio: rebaixado para UNKNOWN (rc 2)"
+has "$OUT" "FAIL rebaixado" "diz que o FAIL foi rebaixado e por que"
+check "$([ -e "$T/state/last-final" ] && echo sim || echo nao)" nao "FAIL rebaixado nao conta como veredito da semana"
+reset; SC_LAB=fail FAKE_LATEST_FAIL_AFTER=1 run
+check "$RC" 2 "FAIL e o latest.json nao relê: UNKNOWN, nao FAIL"
+reset; SC_LAB=ok FAKE_MOVE=1 run
+check "$RC" 0 "OK com o latest.json mudado no meio continua OK (igualdade exata num commit e prova)"
+reset; SC_LAB=fail FAKE_LATEST2=tabsql run
+check "$RC" 2 "FAIL e a releitura do latest.json vem hostil: UNKNOWN, nao FAIL"; has "$OUT" "FAIL rebaixado" "o rebaixamento e dito"
+hasnt "$OUT" "CREATE TABLE" "o texto hostil da releitura nao chega ao log nem ao notify"; hasnt "$(cat "$T/cap/notify.log" 2>/dev/null)" "CREATE TABLE" "nem ao notify"
+reset; SC_LAB=weird run
+check "$RC" 0 "campo do relatorio com texto no lugar de numero: o veredito vem do campo conferido (OK)"
+check "$(printf '%s\n' "$OUT" | grep -c 'RESULT:')" 1 "e a linha RESULT continua uma so (o texto forjado virou ?)"; has "$OUT" "total_s=? " "o campo ilegivel e ?"
+reset; SC_LAB=slow run
+check "$RC" 3 "SLOW: rc 3"; check "$(calls notify.log)" 1 "SLOW dispara notify"; check "$(lastfinal)" sim "SLOW e conclusivo"
+reset; SC_LAB=unknown run
+check "$RC" 2 "UNKNOWN do lab: rc 2"; check "$(calls notify.log)" 1 "UNKNOWN dispara notify"
+check "$(lastfinal)" nao "UNKNOWN nao grava last-final"
+check "$([ -s "$T/state/last-attempt" ] && echo sim)" sim "UNKNOWN grava last-attempt (a rodada comecou)"
+run
+has "$OUT" "uma rodada ja comecou nas ultimas 12 h" "a janela seguinte da mesma noite nao repete uma rodada que ja comecou"
+reset; SC_LAB=norep run
+check "$RC" 2 "lab sai 0 SEM relatorio: UNKNOWN, nunca OK"; hasnt "$OUT" "RESULT: OK" "sem relatorio nao ha OK"
+has "$OUT" "relatorio do MBP ausente" "diz que o relatorio faltou"
+reset; SC_LAB=div_fail run
+check "$RC" 2 "lab sai 0 mas o relatorio diz FAIL: divergencia = UNKNOWN"; has "$OUT" "nao bate com o relatorio" "diz que nao bate"
+reset; SC_LAB=div_ok run
+check "$RC" 2 "lab sai 1 mas o relatorio diz OK: divergencia = UNKNOWN"
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+echo "-- falha no meio do envio: UNKNOWN, nunca restore sobre copia parcial"
+reset; FAKE_OBJ_FAIL_ONCE=hq/big run
+check "$RC" 0 "objeto que falha uma vez e reenviado: OK"; has "$OUT" "objeto hq/big falhou" "o log diz que tentou de novo"; check "$(cnt aws.argv "s3 cp $BKT/hq/big -")" 2 "o objeto foi lido duas vezes"
+check "$(labstream | grep -c 'lab: source identical')" 1 "e a copia final e identica ao S3"
+reset; FAKE_SSH_DROP=big FAKE_SSH_DROP_ONCE=1 run
+check "$RC" 0 "ssh cai no meio de um objeto uma vez: o objeto e reenviado inteiro, OK"
+check "$(labstream | grep -c 'lab: source identical')" 1 "e o arquivo parcial deu lugar a copia inteira"
+reset; FAKE_OBJ_FAIL=hq/big run
+check "$RC" 2 "objeto que falha sempre: UNKNOWN"; has "$OUT" "objeto hq/big: o envio falhou" "diz qual objeto e por que"
+check "$(labran)" nao "o lab NAO rodou sobre copia incompleta"; has "$(labstream)" "stream.failed" "o MBP foi avisado do fracasso do envio"
+check "$(lastfinal)" nao "sem last-final"; check "$(calls notify.log)" 1 "notify"; check "$(mbpfiles)" 0 "slot limpo"; check "$(tmpleft)" 0 "stage apagado"
+reset; FAKE_OBJ_TRUNC=hq/big run
+check "$RC" 2 "aws sai 0 com o objeto cortado: UNKNOWN pelo tamanho"; has "$OUT" "o MBP gravou 100 bytes" "diz o tamanho gravado"; check "$(labran)" nao "o lab NAO rodou"
+reset; FAKE_OBJ_CORRUPT=hq/abc123 run
+check "$RC" 2 "objeto com o mesmo tamanho e conteudo diferente: UNKNOWN pelo ETag"; has "$OUT" "objeto hq/abc123: ETag" "diz o ETag"; check "$(labran)" nao "o lab NAO rodou"
+reset; FAKE_OBJ_CORRUPT=hq/big run
+check "$RC" 2 "multiparte corrompido (ETag composto recalculavel): UNKNOWN"; has "$OUT" "ETag composto" "diz que o composto nao fecha"
+reset; FAKE_LIST_ETAG_BAD=hq/abc123 run
+check "$RC" 2 "a lista diz um ETag simples que o objeto nao tem: UNKNOWN"
+reset; FAKE_LIST_ETAG_MP=hq/abc123 run
+check "$RC" 0 "ETag composto que nao e de partes de 8 MiB: so o tamanho vale, OK"; has "$(summ)" "etag_verificado=4 etag_nao_verificavel=1" "o resumo conta o nao verificavel"
+mkdir -p "$T/s3/hq/emptydir"; reset; FAKE_LIST_DIRMARK=1 run; rmdir "$T/s3/hq/emptydir"
+check "$RC" 0 "marcador de pasta na lista: a pasta e criada no MBP e o resto segue"; check "$(labstream | grep -c 'lab: source identical')" 1 "copia identica, com a pasta vazia"
+reset; FAKE_OBJ_SLOW=2 LABMBP_STREAM_S=1 run
+check "$RC" 2 "envio passou do teto de tempo: UNKNOWN"; has "$OUT" "o envio passou de 1s" "diz o teto"; check "$(labran)" nao "o lab NAO rodou"; has "$(labstream)" "stream.failed" "o MBP soube que acabou"
+reset; FAKE_EXEC=die_after_ready FAKE_OBJ_SLOW=1 run
+check "$RC" 2 "o job do MBP morre com o envio em curso: UNKNOWN"; has "$OUT" "terminou antes do fim do envio" "diz que o job acabou"
+check "$(mbpfiles)" 0 "e o mini PAROU de enviar: nada recriado no slot ja limpo"
+reset; FAKE_EXEC=die_after_ready FAKE_STAY_S=9 FAKE_OBJ_SLOW=1 run
+check "$RC" 2 "o slot sumiu mas o mbp-run ainda nao avisou (a corrida): UNKNOWN"; check "$(mbpfiles)" 0 "e o mini NAO recriou o slot que o mbp-run apagou (a guarda do lado do MBP)"
+reset; FAKE_EXEC=die_after_ready FAKE_KEEP_SLOT=1 FAKE_OBJ_SLOW=2 run
+check "$RC" 2 "o job morre mas o slot fica de pe: UNKNOWN"; has "$OUT" "terminou antes do fim do envio" "diz que o job acabou"
+check "$([ "$(objreads)" -lt 5 ] && echo parou || echo mandou-tudo)" parou "e o mini PAROU de ler o S3 mesmo sem a trava do slot limpo"
+
+echo "-- a copia no disco do MBP tem de ser a lista (o wrapper confere por conta propria)"
+for tm in missing:faltam=1 extra:sobram=1 size:tamanho-diferente=1; do
+  reset; FAKE_TAMPER=${tm%%:*} run
+  check "$RC" 2 "copia adulterada (${tm%%:*}) depois do envio: UNKNOWN"; has "$OUT" "a copia no MBP nao e a lista do S3: faltam=" "recusa com o motivo"; has "$OUT" "${tm#*:}" "e conta o que difere (${tm#*:})"
+  check "$(labran)" nao "copia adulterada (${tm%%:*}): o lab NAO rodou"
+done
+
+echo "-- lista do S3 ruim: nada e enviado"
+for f in FAKE_LIST_FAIL FAKE_LIST_EMPTY FAKE_LIST_BADKEY; do
+  reset; export "$f=1"; run; unset "$f"
+  check "$RC" 2 "$f: UNKNOWN"; check "$(execs)" 0 "$f: nada foi empurrado ao MBP"; check "$(objreads)" 0 "$f: nenhum objeto lido"
+  check "$([ -e "$T/state/last-attempt" ] && echo sim || echo nao)" nao "$f: a rodada nao 'comecou'"; check "$(tmpleft)" 0 "$f: sem stage"
+done
+reset; FAKE_LIST_BADKEY=1 run
+has "$OUT" "fora do formato" "chave com caractere de shell: a lista e recusada, diz que veio fora do formato"
+for bk in 2:com-ponto-ponto 3:fora-do-prefixo-hq; do
+  reset; FAKE_LIST_BADKEY=${bk%%:*} run
+  check "$RC" 2 "chave ${bk#*:}: UNKNOWN"; has "$OUT" "fora do formato" "chave ${bk#*:}: lista recusada"; check "$(execs)" 0 "chave ${bk#*:}: nada empurrado ao MBP"; check "$(objreads)" 0 "chave ${bk#*:}: nenhum objeto lido"
+done
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+echo "-- MBP nao livre / mbp-run recusa (antes de comecar)"
+for pr in uso lixo off; do
+  reset; FAKE_PRESENCE=$pr LABMBP_NOW_HOUR=0 run
+  check "$RC" 4 "presenca '$pr' as 00h: adiado (rc 4)"
+  check "$(calls aws.argv)" 0 "presenca '$pr': o S3 nem foi tocado"
+  check "$(execs)" 0 "presenca '$pr': nada foi empurrado ao MBP"
+  check "$(calls notify.log)" 0 "adiado nao dispara notify"
+done
+reset; FAKE_PRESENCE=uso LABMBP_NOW_HOUR=1 run; check "$RC" 4 "01h ainda adia"
+reset; FAKE_PRESENCE=uso LABMBP_NOW_HOUR=2 run
+check "$RC" 2 "02h (ultima janela): adiar vira UNKNOWN"; check "$(calls notify.log)" 1 "e dispara notify"; has "$OUT" "adiado ate a ultima janela" "diz por que"
+reset; FAKE_EXEC=refuse98 LABMBP_NOW_HOUR=0 run
+check "$RC" 4 "mbp-run recusa (98) antes do ready: adiado"; check "$(objreads)" 0 "recusa: nenhum objeto lido"; check "$(tmpleft)" 0 "recusa: stage apagado"
+reset; FAKE_EXEC=refuse98 LABMBP_NOW_HOUR=2 run; check "$RC" 2 "mbp-run recusa na ultima janela: UNKNOWN"
+reset; FAKE_EXEC=drop run
+check "$RC" 2 "mbp-run cai (98) DEPOIS do ready e do envio: UNKNOWN (nao adiado)"; has "$OUT" "caiu ou estourou" "diz que caiu no meio"; check "$(lastfinal)" nao "sem last-final"
+reset; FAKE_EXEC=killparent run
+check "$RC" 2 "relatorio OK mas o rc do mbp-run se perdeu: UNKNOWN, nunca OK"; has "$OUT" "mbp-run rc=?" "diz que o rc e desconhecido"; check "$(lastfinal)" nao "sem last-final"
+reset; FAKE_EXEC=noready FAKE_NOREADY_S=4 LABMBP_READY_S=1 run
+check "$RC" 2 "o MBP nunca fica pronto: UNKNOWN"; has "$OUT" "o MBP nao ficou pronto em 1s" "diz que nao ficou pronto"; check "$(objreads)" 0 "nenhum objeto lido"; check "$(calls notify.log)" 1 "notify"
+
+for bs in "/a/../b/exec/1" "/a b;touch $T/pwned/exec/1" "relativo/exec/1" "/x/exec/1x"; do
+  reset; FAKE_EXEC=badslot FAKE_BADSLOT="$bs" run
+  check "$RC" 2 "o wrapper devolve o slot '$bs': UNKNOWN"; has "$OUT" "caminho de slot inesperado" "recusa o caminho"
+  check "$(objreads)" 0 "slot '$bs': nenhum objeto lido"; check "$([ -e "$T/pwned" ] && echo sim || echo nao)" nao "slot '$bs': nada executado"
+done
+
+echo "-- bloqueios do lado do mini"
+reset; FAKE_HEAD_COUNT=0 run
+check "$RC" 2 "commit do latest.json ausente no banco vivo: UNKNOWN, nunca OK"; has "$OUT" "NAO existe no banco vivo" "diz que o commit nao existe"; check "$(objreads)" 0 "nenhum objeto lido"
+reset; FAKE_LATEST_FAIL=1 run
+check "$RC" 2 "latest.json ilegivel: UNKNOWN"; check "$(execs)" 0 "nada foi empurrado ao MBP"
+reset; printf '{"run_utc":"x","databases":{"hq":{"head":"ABC"}}}' > "$T/latest1.json"; run
+check "$RC" 2 "head que nao e hash de commit: UNKNOWN"
+printf '{"run_utc":"2026-10-16T07:07:25Z","databases":{"hq":{"issues":5,"head":"%s","backup_size":"13G"}}}\n' "$HEAD_H" > "$T/latest1.json"
+
+echo "-- recusa do wrapper do MBP (antes do envio)"
+reset; SC_DOLT_VER=2.3.0 run
+check "$RC" 2 "dolt do MBP em outra versao: UNKNOWN"; has "$OUT" "dolt do MBP e 2.3.0, o do mini e 2.3.1" "diz as duas versoes"
+check "$(objreads)" 0 "recusa antes do ready: nenhum objeto lido"; check "$(tmpleft)" 0 "stage apagado"; check "$(labran)" nao "o lab nao rodou"
+reset; SC_DISK=small run
+check "$RC" 2 "disco do MBP curto: UNKNOWN"; has "$OUT" "disco insuficiente no MBP (100KB livres" "diz quanto tem"; check "$(objreads)" 0 "e nenhum byte foi enviado"
+reset; SC_DISK=junk run
+check "$RC" 2 "disco do MBP ilegivel: UNKNOWN, nunca OK"; has "$OUT" "nao consegui medir o disco livre do MBP" "diz que nao mediu"; check "$(objreads)" 0 "nenhum byte enviado"
+
+# the wrapper alone, in a slot of its own (no mbp-run, no orchestrator): wrun [env VAR=...] ARGS → WOUT, WRC
+wrun() {
+  rm -rf "$T/wslot" "$T/wrc"; mkdir -p "$T/wslot"; printf 'lab=ok\ndolt_version=2.3.1\nleak=0\ndisk=ok\n' > "$T/scen"
+  ( cd "$T/wslot" && env -i HOME="${WHOME:-$T/home}" PATH="${WPATH:-/usr/bin:/bin}" LAB_BREW_BIN="${WBREW:-/nonexistent}" FAKE_SCEN="$T/scen" LAB_POLL_S=0.2 \
+      /bin/bash "$T/scripts/dolt-restore-lab-mbp-side.sh" --db hq --dolt-version 2.3.1 --rto-seconds 3600 --src-kb 100 "$@" > "$T/wout" 2>&1; echo $? > "$T/wrc" ) &
+  local n=0; until [ -e "$T/wrc" ] || [ $n -ge 100 ]; do sleep 0.2; n=$((n+1)); done
+  [ -e "$T/wrc" ] || { touch "$T/wslot/stream.failed"; until [ -e "$T/wrc" ]; do sleep 0.2; done; }   # a wrapper that never gives up is told to stop
+  WRC=$(cat "$T/wrc"); WOUT=$(cat "$T/wout")
+}
+for tool in dolt python3 timeout; do   # a PATH of system tools WITHOUT $tool, and a MBP home whose lab/bin lacks it
+  rm -rf "$T/np" "$T/nh"; mkdir -p "$T/np" "$T/nh/gt-remote/lab/bin"
+  ln -sf /usr/bin/* /bin/* /usr/sbin/* /sbin/* "$T/np/" 2>/dev/null; rm -f "$T/np/$tool"; [ "$tool" != timeout ] || rm -f "$T/np/gtimeout"
+  ln -sf "$T/home/gt-remote/lab/bin"/* "$T/nh/gt-remote/lab/bin/"; rm -f "$T/nh/gt-remote/lab/bin/$tool"
+  WHOME="$T/nh" WPATH="$T/np" wrun --stream-wait-s 1
+  check "$WRC" 2 "wrapper sem $tool no MBP: UNKNOWN"; has "$WOUT" "ferramenta ausente no MBP: $tool" "diz qual ferramenta falta"; check "$(printf '%s' "$WOUT" | grep -c 'ready slot')" 0 "e nao fica pronto para o envio"
+done
+wrun --stream-wait-s 1
+check "$WRC" 2 "wrapper: o mini nunca manda o fim do envio: UNKNOWN pelo teto de espera"; has "$WOUT" "nao terminou o envio em 1s" "diz o teto"
+
+echo "-- higiene detecta credencial"
+reset; SC_BROKEN=env run
+check "$RC" 0 "env quebrado no MBP: o veredito do restore fica"; has "$(summ)" "aws_env_vars=?" "a contagem fica '?', nunca 0"; has "$(summ)" "ALERTA" "e a prova nao medida avisa"; check "$(calls notify.log)" 1 "notify"
+reset; SC_BROKEN=ps run
+check "$RC" 0 "ps quebrado no MBP: o veredito do restore fica"; has "$(summ)" "ps_acertos=?" "sem nenhuma amostra de ps, os acertos ficam '?', nunca 0"; has "$(summ)" "ALERTA" "e a prova nao medida avisa"; check "$(calls notify.log)" 1 "notify"
+reset; SC_AWSENV=1 run
+check "$RC" 0 "variavel AWS_* na sessao remota nao muda o veredito do restore"; has "$(summ)" "aws_env_vars=1" "a contagem aparece"; has "$(summ)" "ALERTA" "mas o resumo grita"; check "$(calls notify.log)" 1 "e dispara notify mesmo com OK"
+reset; SC_LEAK=1 run
+has "$(summ)" "ALERTA" "credencial no argv de um processo do MBP: ALERTA"; check "$(summ | grep -c 'ps_acertos=[1-9]')" 1 "o ps do MBP achou"; check "$(calls notify.log)" 1 "notify"
+reset; SC_LEAK=2 run
+has "$(summ)" "ALERTA" "credencial gravada em out/ do slot do MBP: ALERTA"; check "$(summ | grep -c 'arquivos-com-credencial=[1-9]')" 1 "o grep do slot achou o arquivo"
+reset; SC_LEAK=3 run
+has "$(summ)" "ALERTA" "credencial gravada em in/ do slot do MBP: ALERTA"
+reset; SC_LEAK=4 run
+check "$RC" 0 "grep do slot nao consegue ler uma pasta: o veredito fica"; has "$(summ)" "arquivos-com-credencial=?" "a contagem fica '?', nunca 0"; has "$(summ)" "ALERTA" "e a prova nao medida avisa"; check "$(calls notify.log)" 1 "notify"
+reset; FAKE_MINI_LEAK=1 run
+check "$RC" 0 "arquivo com cara de credencial no stage do mini nao muda o veredito"; has "$(summ)" "mini-higiene: arquivos-com-cara-de-credencial=1" "o grep do mini achou"; has "$(summ)" "ALERTA" "e grita"
+reset; FAKE_MINI_LEAK=2 run
+has "$(summ)" "mini-higiene: arquivos-com-cara-de-credencial=1" "credencial no log do mbp-run: o grep do mini achou"
+reset; FAKE_MINI_LEAK=3 run; chmod -R u+rwx "$T/state/zz-unreadable" 2>/dev/null
+check "$RC" 0 "grep do mini nao consegue ler uma pasta: o veredito fica"; has "$(summ)" "mini-higiene: arquivos-com-cara-de-credencial=?" "a contagem fica '?', nunca 0"
+has "$(summ)" "ALERTA" "e a prova nao medida avisa"; check "$(calls notify.log)" 1 "notify"
+
+echo "-- orquestrador morto no meio do envio"
+reset
+( FAKE_OBJ_SLOW=2 envrun --force > "$T/kill.out" 2>&1 ) & KP=$!
+n=0; until grep -q "s3 cp $BKT/hq/" "$T/cap/aws.argv" 2>/dev/null || [ $n -ge 100 ]; do sleep 0.2; n=$((n+1)); done
+OP=$(cat "$T/state/lock/pid" 2>/dev/null); [ -z "$OP" ] || kill "$OP"
+wait $KP; KRC=$?
+n=0; until [ ! -d "$T/mbp/gt-remote/exec/1" ] || [ $n -ge 150 ]; do sleep 0.2; n=$((n+1)); done
+check "$KRC" 143 "TERM no meio do envio: o orquestrador sai com 143"
+check "$(labran)" nao "o lab NAO rodou sobre o que ja tinha chegado"
+has "$(labstream)" "stream.failed" "o MBP foi avisado e desistiu"
+check "$([ -d "$T/state/lock" ] && echo sim || echo nao)" nao "a trava foi solta"; check "$(tmpleft)" 0 "o stage foi apagado"; check "$(lastfinal)" nao "sem last-final"
+
+echo "-- estado inutilizavel numa rodada real: UNKNOWN e aviso, nao o silencio de 'nada a fazer'"
+reset; : > "$T/notadir"; STATE_OVERRIDE="$T/notadir/state" run
+check "$RC" 2 "rodada real sem estado: rc 2"; has "$OUT" "nao consegui criar $T/notadir/state" "o motivo diz qual pasta"
+check "$(execs)" 0 "sem estado nao toca o MBP"; check "$(calls notify.log)" 1 "e avisa (rc 2 de uma rodada real)"
+
+echo "== a metade do mini, so leitura (fatia 2/4): --dry-run, --check, trava, argumentos =="
 # ---------------------------------------------------------------------------------------------------------------------------------
 echo "-- dry-run, caminho feliz, credencial canario no ambiente do mini"
 reset; run --dry-run
@@ -508,13 +918,17 @@ reset; FAKE_LIST_HANG=1 LABMBP_CALL_S=2 run --dry-run; chk_unknown "sem resposta
 reset; mkdir -p "$T/nobin"; for c in env bash cut grep date dirname cat rm mkdir sed head tail awk find ps python3 ls; do ln -sf "$(command -v $c)" "$T/nobin/$c"; done
 PATH="$T/nobin" run --dry-run; chk_unknown "sem timeout/gtimeout no PATH" "sem timeout no PATH" nao
 check "$(calls dolt.argv)" 0 "sem timeout: o dolt nem foi chamado"
+# o restore de verdade tambem nao fica pendurado: cada chamada tem teto e o objeto tem o seu (o que sobra do teto do envio, no minimo 30 s)
+reset; FAKE_DOLT_VER_HANG=1 LABMBP_CALL_S=3 run
+check "$RC" 2 "dolt version pendurado: UNKNOWN"; check "$([ -e "$T/cap/hang.term" ] && echo sim || echo nao)" sim "dolt version pendurado: o teto matou a chamada (nao esperou ela acabar)"; has "$OUT" "nao consegui ler a versao do dolt do mini" "dolt version pendurado: diz o que faltou"; check "$(execs)" 0 "dolt version pendurado: o MBP nao foi tocado"
+reset; SC_LAB=fail FAKE_LATEST_HANG_AFTER=1 LABMBP_CALL_S=3 run
+check "$RC" 2 "FAIL e a releitura do latest.json pendurada: UNKNOWN, nao FAIL"; check "$([ -e "$T/cap/hang.term" ] && echo sim || echo nao)" sim "releitura pendurada: o teto matou a chamada"; has "$OUT" "FAIL rebaixado" "releitura pendurada: diz que rebaixou"; check "$(lastfinal)" nao "releitura pendurada: nao conta como veredito"
+reset; FAKE_OBJ_HANG=hq/LOCK LABMBP_STREAM_S=1 LABMBP_OBJ_MIN_S=2 run   # hq/LOCK e o 1o da lista (ordem binaria): nenhum objeto antes dele gasta o 1 s do envio, nem com a maquina carregada
+check "$RC" 2 "aws cp de um objeto pendurado: UNKNOWN"; has "$OUT" "objeto hq/LOCK: o envio falhou" "objeto pendurado: diz qual"; has "$OUT" "aws s3 cp sem resposta em 2s (timeout)" "objeto pendurado: o piso do teto vale quando o envio ja estourou"; check "$(labran)" nao "objeto pendurado: o lab NAO rodou"
+reset; FAKE_OBJ_HANG=hq/abc123 LABMBP_STREAM_S=20 LABMBP_OBJ_MIN_S=2 run
+check "$RC" 2 "objeto pendurado com tempo de envio sobrando: UNKNOWN"; has "$OUT" "aws s3 cp sem resposta em " "tempo sobrando: diz o teto"; has "$OUT" "tentando de novo" "tempo sobrando: o objeto foi tentado de novo"; hasnt "$(printf '%s\n' "$OUT" | grep 'tentando de novo')" "sem resposta em 2s" "o teto da 1a tentativa e o que SOBRA do envio, nao o piso (a 2a ja nao tem sobra)"
 
 echo "-- argumentos"
-reset; run
-check "$RC" 2 "sem --dry-run nem --check: rc 2 (o restore chega na fatia 3/4)"
-has "$OUT" "fatia 3/4" "sem modo: a mensagem diz quando o restore chega"
-check "$(calls aws.argv)" 0 "sem modo: nada foi lido do S3"
-check "$(calls mbprun.calls)" 0 "sem modo: o MBP nao foi tocado"
 reset; run --dry-run --db 'hq;x';  check "$RC" 2 "--db com ';': rc 2"
 reset; run --dry-run --db;         check "$RC" 2 "--db sem valor: rc 2"
 reset; run --dry-run --assim;      check "$RC" 2 "opcao desconhecida: rc 2"
@@ -526,6 +940,13 @@ reset; run --dry-run --db hq_old
 check "$RC" 2 "--db outro: latest.json sem esse banco: rc 2"
 has "$OUT" "RESULT: UNKNOWN db=hq_old rc=2" "--db outro: RESULT diz o banco pedido"
 has "$OUT" "sem run_utc/head valido para hq_old" "--db outro: o motivo diz o banco"
+
+echo "-- so da rodada completa: --dry-run nao envia nem avisa; --install-dolt"
+reset; run --dry-run; check "$(objreads)" 0 "--dry-run nao le objeto"; check "$(execs)" 0 "--dry-run nao toca o MBP"; check "$(calls notify.log)" 0 "--dry-run nao notifica"
+check "$([ -e "$T/state/last-attempt" ] && echo sim || echo nao)" nao "--dry-run nao marca tentativa"
+reset; run --install-dolt
+check "$RC" 0 "--install-dolt: rc 0"; has "$OUT" "dolt version 2.3.1" "instala e mostra a versao"; check "$([ -x "$T/home/gt-remote/lab/bin/dolt" ] && echo sim)" sim "o dolt do mini foi copiado para ~/gt-remote/lab/bin"
+check "$(grep -c -E '^AWS_' "$T"/cap/mbprun.env.* | awk -F: '{s+=$2} END{print s+0}')" 0 "--install-dolt tambem roda sem AWS_*"
 
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
