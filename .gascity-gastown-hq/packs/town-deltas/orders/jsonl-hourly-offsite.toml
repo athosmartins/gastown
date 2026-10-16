@@ -1,0 +1,41 @@
+# ga-c0939v: sobe a cada hora o dump JSONL (jsonl-export, a cada 15 min) ao S3, com manifest e verificação.
+#
+# Por quê: todo backup do city era diário (DoltHub 03:30, S3 ~04:00, restic 04:47) = RPO de 24 h para os beads.
+# O jsonl-export já grava o dump de todos os bancos num repo git local a cada 15-30 min, mas o único espelho dele
+# (scripts/dolt-s3-backup.sh, `aws s3 sync --delete` da árvore de trabalho) roda uma vez por noite. Meta do Athos
+# (15/10): perder no máximo 1 h de beads. Este order é a metade "upload"; a metade "dá para restaurar" é
+# assets/scripts/jsonl-hourly-restore.sh — um objeto no S3 sem restore provado NÃO conta como RPO.
+#
+# Onde grava: s3://urblink-dolt-backups/jsonl-hourly/ (prefixo próprio). O dolt-s3-backup.sh noturno usa `sync --delete`
+# em `jsonl-archive/` e em `<banco>/` (um prefixo por banco Dolt) e escreve `_meta/`; nenhum banco se chama jsonl-hourly,
+# então os dois não se pisam. Hetzner fica de fora: regra de 13/10, nenhum dado de beads lá.
+#
+# interval 1h: é o que o Athos pediu. O RPO real NÃO é 1 h cravada — é a idade do dump na hora da captura (o exporter
+# roda a cada 15 min mas observamos 16-28 min entre commits) + 60 min + a duração do run: pior caso ~1h40, típico ~1h05.
+# Para 1h10 no pior caso o caminho é interval = "30m" (custo: ~98 MB gzip a cada 30 min, medido); fica como decisão de produto,
+# registrada no bead e em docs/runbooks/jsonl-hourly-offsite.md.
+#
+# O que sobe: o HEAD do repo do exporter, sem .git, sem os bancos de teste/benchmark que o exporter também arquiva
+# (JHO_IGNORE_DBS, default `bench_*,fixdepkeys_*`; o manifest os nomeia). Snapshot `broken` (banco obrigatório ausente ou
+# vazio, tabela ilegível) NÃO sobe nada e não move latest.json: o que está em jsonl-hourly/ é sempre um dump que passou na
+# conferência. Isso acopla: um banco real com export quebrado barra o snapshot inteiro (falha fechada, alerta no 2º run seguido).
+#
+# timeout 2400s: build (≤ 900 s) + upload do snapshot e do manifest (≤ 1200 s cada, na prática ~2 min para ~98 MB)
+# + retenção. interval (3600 s) > timeout, e o script tem lock single-flight, então runs não empilham.
+#
+# Credencial: o aws precisa estar acessível ao ambiente do order (mesma que dolt-s3-backup.sh usa). Se não estiver, o
+# script sai com "RESULT: unknown"/fail e, depois de 2 execuções seguidas, manda `notify` — não fica calado.
+# Liveness (`jsonl-hourly-offsite.sh --status`): lê latest.json do S3 e diz há quanto tempo o script bateu o ponto.
+#
+# Para desfazer: remover este arquivo e `gc order` recarrega; os objetos em jsonl-hourly/ podem ficar (versões
+# não correntes expiram em 30 dias pela regra do bucket) ou ser apagados com `aws s3 rm --recursive`.
+#
+# Verify after a reload:  gc order show jsonl-hourly-offsite   -> Source: .../town-deltas/...
+#                         bash $GC_CITY_PATH/packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh --status
+#                         tail -3 $GC_CITY_PATH/.gc/logs/jsonl-hourly-offsite.log
+[order]
+description = "Hourly offsite upload of the JSONL dump archive to S3 with manifest + sha256 verification (ga-c0939v — RPO 1h for beads)"
+trigger = "cooldown"
+interval = "1h"
+timeout = "2400s"
+exec = "$PACK_DIR/assets/scripts/jsonl-hourly-offsite.sh"
