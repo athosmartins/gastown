@@ -5,14 +5,14 @@
 #   Escopo · Como rodar · Stub do aws · Cenários
 #
 # ESCOPO: hermético. `aws` é um stub que guarda "objetos" num diretório temporário e valida o sha256 como o S3 valida;
-#   `notify` é um stub que só anota. Repositórios git, estado e logs vivem em mktemp. Nenhuma rede, nenhum bd, nenhum dolt,
-#   nenhuma credencial, nada em ~/.aws, nada do S3 real. O helper python tem a própria suíte (jsonl_hourly.selftest.py), chamada no fim.
+#   `notify` é um stub que anota e imita o roteador real (sem push forçado vai ao digest, rc 12 sob saída estrita; só o forçado chega ao telefone). Repositórios
+#   git, estado e logs vivem em mktemp. Nenhuma rede, bd, dolt ou credencial, nada em ~/.aws, nada do S3 real. O helper python tem a própria suíte, chamada no fim.
 # COMO RODAR: /bin/bash jsonl-hourly-offsite.selftest.sh     (rc 0 = tudo passou; última linha `=== RESULT: PASS=n FAIL=n ===`)
 #   JHO_SCRIPT=/outro/jsonl-hourly-offsite.sh  roda a suíte contra uma cópia (é como se faz o teste de mutação: quebrar um guarda e ver cair).
 # CENÁRIOS: caminho feliz e layout das chaves · HEAD e não árvore de trabalho · latest.json por último · HEAD igual (só bate o ponto) ·
 #   objeto sumido · HEAD novo · snapshot broken não avança latest.json · banco obrigatório ausente · put/head/tamanho/checksum falhando ·
-#   S3 fora do ar (rc 2) · pouco disco · archive inválido · lock vivo e lock morto · alerta (2 seguidas, no máx. 1 a cada 6 h, zera no sucesso) ·
-#   retenção (e retenção falhando) · --status · modo biblioteca.
+#   S3 fora do ar (rc 2) · pouco disco · archive inválido · lock vivo e lock morto · alerta (2 seguidas, no máx. 1 a cada 6 h, zera no sucesso; só conta como
+#   enviado se chegou; rc 2 antes do lock e run morto contam) · retenção (e retenção falhando) · --status · modo biblioteca.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -102,7 +102,11 @@ STUB
 chmod +x "$WORK/bin/aws"
 cat > "$WORK/bin/notify" <<'STUB'
 #!/bin/bash
-echo "$*" >> "${NOTIFY_LOG:?}"
+# como o roteador real: sem NOTIFY_FORCE_PUSH=1 a fonte cai no digest mudo (rc 12 sob NOTIFY_STRICT_EXIT=1, rc 0 sem); só a chamada forçada chega ao telefone (notify.pushed). NOTIFY_RC=n força o rc.
+echo "force=${NOTIFY_FORCE_PUSH:-} strict=${NOTIFY_STRICT_EXIT:-} $*" >> "${NOTIFY_LOG:?}"
+[ -n "${NOTIFY_RC:-}" ] && exit "$NOTIFY_RC"
+if [ "${NOTIFY_FORCE_PUSH:-}" != 1 ]; then [ "${NOTIFY_STRICT_EXIT:-}" = 1 ] && exit 12; exit 0; fi
+echo "$*" >> "${NOTIFY_LOG%.log}.pushed"
 STUB
 chmod +x "$WORK/bin/notify"
 # helper embrulhado (JHO_PY): repassa tudo ao real; WRAP=db_string estraga .databases do manifest, WRAP=retention_fail derruba o `retention`
@@ -139,8 +143,8 @@ new_env() { # nome — cria archive git com hq (2 issues) e wa (1), e zera bucke
 commit_all() { GIT add -A >/dev/null && GIT commit -q -m "${1:-change}"; }
 NOW_OFF=0
 offsite() { # args... ; env extra via prefixo `env`; define OUT, ERR, RC
-  OUT="$(JHO_ARCHIVE="$ARCH" JHO_STATE_DIR="$S/state" JHO_LOG="$S/log/offsite.log" JHO_AWS="$WORK/bin/aws" JHO_NOTIFY="$WORK/bin/notify" \
-        STUB_DIR="$S/bucket" NOTIFY_LOG="$S/notify.log" JHO_REQUIRED_DBS="${REQ:-hq,wa}" JHO_NOW=$((T0 + NOW_OFF)) JHO_S3_TIMEOUT=60 \
+  OUT="$(JHO_ARCHIVE="$ARCH" JHO_STATE_DIR="${STATE_OVR:-$S/state}" JHO_LOG="$S/log/offsite.log" JHO_AWS="${AWS_BIN:-$WORK/bin/aws}" JHO_NOTIFY="${NOTIFY_BIN:-$WORK/bin/notify}" \
+        STUB_DIR="$S/bucket" NOTIFY_LOG="$S/notify.log" JHO_REQUIRED_DBS="${REQ:-hq,wa}" JHO_NOW=$((T0 + NOW_OFF)) JHO_S3_TIMEOUT=60 JHO_MIN_FREE_MB=1 \
         "$SCRIPT" "$@" 2>"$S/stderr")"
   RC=$?; ERR="$(cat "$S/stderr")"
 }
@@ -152,6 +156,7 @@ clear_inject() { rm -f "$S/bucket/inject/$1"; }
 jqf() { jq -r "$1" "$2" 2>/dev/null; }
 LATEST() { echo "$S/bucket/obj/jsonl-hourly/latest.json"; }
 ARTKEY() { objs | grep '\.tar\.gz$' | tail -1; }
+pushed() { cat "$S/notify.pushed" 2>/dev/null | wc -l | tr -d ' '; }   # alertas que chegaram ao telefone (chamada forçada ao notify)
 
 echo "=== jsonl-hourly-offsite.selftest.sh ==="
 echo "bash: ${BASH_VERSION}"
@@ -296,6 +301,9 @@ grep -q 'banco obrigatório hq foi ignorado' "$S/log/offsite.log" && ok "e o log
 new_env ign3; write_db benchmark_real r-1; : > "$ARCH/benchmark_real/config.jsonl"; commit_all "nome parecido"
 offsite
 eq "nome parecido que não casa (benchmark_real) com export quebrado continua vetando: rc 1" "$RC:$(objs | wc -l | tr -d ' ')" "1:0"
+new_env keymm; NOW_OFF=0; offsite   # latest.json passa a apontar para OUTRO snapshot: não se bate o ponto em cima dele, republica
+jq '.snapshot_key = "jsonl-hourly/snap/outro.tar.gz"' "$(LATEST)" > "$S/l.json" && cp "$S/l.json" "$(LATEST)"; NOW_OFF=600; offsite
+eq "latest.json de outro snapshot: não bate o ponto em cima dele, republica" "${OUT%% key=*}:$(jqf .snapshot_key "$(LATEST)" | grep -c outro)" "RESULT: ok new:0"
 
 # ── 8. falhas de upload ─────────────────────────────────────────────────────────────────────────
 echo "-- 8. falhas de upload (todas fail-closed)"
@@ -329,7 +337,7 @@ case " $* " in *" head-object "*) out="$(printf '%s' "$out" | jq -c 'del(.Checks
 printf '%s\n' "$out"; exit $rc
 STUB
 chmod +x "$WORK/bin/aws-nosum"
-OUT="$(JHO_ARCHIVE="$ARCH" JHO_STATE_DIR="$S/state" JHO_LOG="$S/log/offsite.log" JHO_AWS="$WORK/bin/aws-nosum" JHO_NOTIFY="$WORK/bin/notify" STUB_DIR="$S/bucket" NOTIFY_LOG="$S/notify.log" JHO_REQUIRED_DBS=hq,wa JHO_NOW=$T0 "$SCRIPT" 2>"$S/stderr")"; RC=$?
+OUT="$(JHO_ARCHIVE="$ARCH" JHO_STATE_DIR="$S/state" JHO_LOG="$S/log/offsite.log" JHO_AWS="$WORK/bin/aws-nosum" JHO_NOTIFY="$WORK/bin/notify" STUB_DIR="$S/bucket" NOTIFY_LOG="$S/notify.log" JHO_REQUIRED_DBS=hq,wa JHO_NOW=$T0 JHO_MIN_FREE_MB=1 "$SCRIPT" 2>"$S/stderr")"; RC=$?
 eq "S3 sem checksum no head: rc 1 (ausência não vale como igualdade)" "$RC:$([ -e "$(LATEST)" ] && echo has || echo none)" "1:none"
 
 new_env stubsane
@@ -383,6 +391,27 @@ NOW_OFF=$((7 * 3600 + 900)); offsite; eq "conserto: rc 0, contador zera" "$RC:$(
 printf '{"rows":[{"id":"hq-1"' > "$ARCH/hq/issues.jsonl"; commit_all "quebrou de novo"
 NOW_OFF=$((7 * 3600 + 1800)); offsite
 eq "quebrou de novo: 1ª falha da nova série não alerta" "$RC:$(wc -l < "$S/notify.log" | tr -d ' ')" "1:2"
+# o alerta tem que CHEGAR (push forçado, saída estrita) e só então conta como enviado; senão AVISO, limite de 6 h intocado e nova tentativa no run seguinte
+broke() { printf '{"rows":[{"id":"hq-1"' > "$ARCH/hq/issues.jsonl"; commit_all "quebrado"; }
+new_env push; broke; NOW_OFF=0; offsite; NOW_OFF=900; offsite
+eq "alerta chegou ao telefone (push forçado) e o log diz enviado" "$(pushed):$(grep -c 'alerta enviado' "$S/log/offsite.log")" "1:1"
+undelivered() { # nome VAR=valor — notify que sai sem entregar (12 = digest/teto; binário ausente = 127)
+  new_env "$1"; broke; export "$2"; NOW_OFF=0; offsite; NOW_OFF=900; offsite
+  eq "$2: alerta não entregue: AVISO no log, sem 'enviado', sem last_alert_epoch" "$(grep -c 'alerta NÃO entregue' "$S/log/offsite.log"):$(grep -c 'alerta enviado' "$S/log/offsite.log"):$(jqf '.last_alert_epoch // "none"' "$ST")" "1:0:none"
+  unset "${2%%=*}"; NOW_OFF=1800; offsite
+  eq "$2: o run seguinte (notify de volta, ainda dentro das 6 h) entrega" "$(pushed)" 1
+}
+undelivered alert12 NOTIFY_RC=12; undelivered alert127 "NOTIFY_BIN=$WORK/bin/inexistente"
+new_env prelock; AWS_BIN=/nao/existe; NOW_OFF=0; offsite; r1="$RC:$(grep -c 'UNKNOWN: aws ausente' "$S/log/offsite.log"):$(jqf .consecutive_not_ok "$ST")"
+NOW_OFF=900; offsite; unset AWS_BIN
+eq "pré-lock (aws ausente): rc 2, linha no log e conta como run sem snapshot" "$r1" "2:1:1"
+eq "pré-lock: a 2ª seguida alerta e o alerta chega" "$(pushed)" 1
+new_env nostate; : > "$S/arquivo"; STATE_OVR="$S/arquivo/x" offsite
+eq "sem como gravar o estado: rc 2 e, sem contador, o alerta sai já (não fica mudo)" "$RC:$(pushed)" "2:1"
+new_env dead; broke; printf '{"consecutive_not_ok":0,"attempt_open":true}\n' > "$ST"; NOW_OFF=0; offsite
+eq "run anterior morto (timeout do order, kill, reboot) conta: com a falha de agora são 2 seguidas e o alerta sai" "$RC:$(pushed)" "1:1"
+NOW_OFF=900; offsite
+eq "a tentativa fechou: o run morto não é recontado" "$(grep -c 'run anterior não terminou' "$S/log/offsite.log")" 1
 
 # ── 12. retenção ─────────────────────────────────────────────────────────────────────────────────
 echo "-- 12. retenção"

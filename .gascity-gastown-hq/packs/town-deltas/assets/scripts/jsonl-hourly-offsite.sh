@@ -4,44 +4,41 @@
 # Contents
 #   Por quê · O que sobe · Garantias · Estados e códigos de saída · Retenção · Alerta · Modo --status · Costuras de teste
 #
-# POR QUÊ: todos os backups do city eram diários (S3 04:00, DoltHub 03:30, restic 04:47) = RPO 24 h. O jsonl-export.sh
-#   já arquiva o dump de todos os bancos a cada ~15-30 min num repo git LOCAL; o espelho que existia (dolt-s3-backup.sh,
-#   `aws s3 sync --delete` da árvore de trabalho) roda uma vez por noite e copia a árvore no meio de uma escrita.
-#   Meta do Athos (15/10): perder no máximo 1 h de beads. Este script é a metade "upload" disso; a metade "dá para
-#   restaurar" é o jsonl-hourly-restore.sh — SEM a prova de restore, um objeto no S3 não conta como RPO.
+# POR QUÊ: todos os backups do city eram diários (S3 04:00, DoltHub 03:30, restic 04:47) = RPO 24 h. O jsonl-export.sh já arquiva o dump de todos os bancos a
+#   cada ~15-30 min num repo git LOCAL; o espelho que existia (dolt-s3-backup.sh, `aws s3 sync --delete`) roda uma vez por noite e copia a árvore no meio de
+#   uma escrita. Meta do Athos (15/10): perder no máximo 1 h de beads. Este script é a metade "upload"; a metade "dá para restaurar" é o
+#   jsonl-hourly-restore.sh — SEM a prova de restore, um objeto no S3 não conta como RPO.
 #
 # O QUE SOBE (medido em 16/10: ~570 MB de árvore, 122 MB gzip, ~14 s de CPU; tudo bem abaixo do limite de 5 GB do put-object)
 #   jsonl-hourly/snap/<AAAAMMDDTHHMMSSZ>-<sha12 do HEAD>.tar.gz           <db>/<tabela>.jsonl de TODOS os bancos
 #   jsonl-hourly/snap/<AAAAMMDDTHHMMSSZ>-<sha12>.manifest.json             contagens lidas DO ARTEFATO, sha256 por tabela, data_as_of
 #   jsonl-hourly/latest.json                                               ponteiro para o último snapshot que passou em TUDO; escrito por último
-#   A fonte é `git archive <sha do HEAD>`, não a árvore de trabalho: o HEAD é o único estado que o exporter garantiu
-#   completo (o gate de export curto roda antes do commit). Ficam de fora os `<db>.jsonl` da raiz (cópias exatas de
-#   <db>/issues.jsonl) e as sobras `*.tmp.*` de export abortado que já foram commitadas.
-#   Bancos que casam JHO_IGNORE_DBS (padrão `bench_*,fixdepkeys_*`: benchmark e teste que o exporter arquiva) também ficam de fora, e o
-#   manifest os nomeia em `ignored_dbs`. Motivo: o 1º upload real (16/10) reprovou porque bench_hq_copy tem config/metadata com 0 bytes, e UM
-#   banco de lixo vetava a cópia de TODOS. Banco obrigatório que case com o padrão => broken. JHO_IGNORE_DBS="" desliga.
+#   A fonte é `git archive <sha do HEAD>`, não a árvore de trabalho: o HEAD é o único estado que o exporter garantiu completo (o gate de export curto roda antes
+#   do commit). Ficam de fora os `<db>.jsonl` da raiz (cópias exatas de <db>/issues.jsonl) e as sobras `*.tmp.*` de export abortado já commitadas.
+#   Bancos que casam JHO_IGNORE_DBS (padrão `bench_*,fixdepkeys_*`; "" desliga) também ficam de fora e o manifest os nomeia em `ignored_dbs`; obrigatório que case => broken.
 #
 # GARANTIAS (e o que cada uma NÃO garante)
 #   - integridade do upload: put-object leva o sha256 calculado aqui (--checksum-sha256); o S3 recusa o objeto se os bytes
 #     que chegaram não batem, e o head-object tem que devolver o mesmo tamanho E o mesmo sha256. Sem isso, o snapshot não vira "latest".
-#   - legibilidade: as contagens do manifest vêm de LER o .tar.gz final tabela por tabela (o caminho que o restore percorre).
-#     Tabela ilegível, banco (não ignorado) sem alguma das 6 tabelas ou banco obrigatório ausente => verdict "broken": NADA sobe (nem
-#     artefato nem manifest: 122 MB por hora de um snapshot inutilizável é custo e ocuparia o piso da retenção), latest.json NÃO anda,
-#     os problemas vão inteiros para o log e o run sai 1. Um banco REAL com export quebrado também veta (fail-closed, e o alerta
-#     leva o motivo): é escolha de desenho, o acoplamento é o preço de nunca anunciar como "latest" um snapshot que não restaura.
+#   - legibilidade: as contagens do manifest vêm de LER o .tar.gz final tabela por tabela (o caminho que o restore percorre). Tabela ilegível, banco (não
+#     ignorado) sem alguma das 6 tabelas ou banco obrigatório ausente => "broken": NADA sobe (122 MB/h de snapshot inutilizável é custo e ocuparia o piso da
+#     retenção), latest.json NÃO anda, os problemas vão para o log e o run sai 1. Um banco REAL quebrado também veta (fail-closed): o acoplamento é o preço de
+#     nunca anunciar como "latest" um snapshot que não restaura.
 #   - NÃO garante que o restore funcione: quem prova isso é jsonl-hourly-restore.sh, rodado de verdade (docs/runbooks/jsonl-hourly-offsite.md).
-#   - RPO real = idade do dump na hora da captura (exporter ~15-30 min) + 60 min do intervalo + duração do run: pior caso ~1h40,
-#     não 1h cravada. `data_as_of` no manifest/latest.json diz até quando o snapshot enxerga.
+#   - RPO real = idade do dump na captura + 60 min + duração do run (pior caso ~1h40, detalhe no order e no runbook); `data_as_of` diz até quando o snapshot enxerga.
 #
-# ESTADOS (três, e o neutro é inerte): rc 0 = snapshot novo verificado, ou HEAD igual ao último verificado cujo objeto ainda existe
-#   (só atualiza `checked_at` de latest.json) · rc 1 = falhou ou ficou "broken" · rc 2 = não deu para avaliar (sem aws/git/python3,
-#   archive ilegível, pouco disco): nada foi tentado, o estado de falhas só conta · rc 3 = uso. Outro run em andamento (lock vivo) => rc 0 em silêncio.
+# ESTADOS (três, e o neutro é inerte): rc 0 = snapshot novo verificado, ou HEAD igual ao último verificado cujo objeto ainda existe (só atualiza `checked_at`) ·
+#   rc 1 = falhou ou ficou "broken" · rc 2 = não deu para avaliar (sem aws/git/python3/jq, archive ilegível, pouco disco, estado sem como gravar): nada foi
+#   tentado e conta como run sem snapshot · rc 3 = uso. Outro run em andamento (lock vivo) => rc 0 em silêncio.
 #
 # RETENÇÃO (só no prefixo jsonl-hourly/snap/, só no formato exato de chave; depois do snapshot novo verificado):
-#   tudo das últimas JHO_KEEP_RECENT_H (48) horas + o primeiro snapshot de cada dia UTC até JHO_KEEP_DAILY_DAYS (14) + os JHO_KEEP_FLOOR (6)
-#   mais novos + o apontado por latest.json. Apagar em bucket versionado cria delete marker; as versões antigas saem pela regra de 30 dias que já existe.
+#   últimas JHO_KEEP_RECENT_H (48) horas + o 1º snapshot de cada dia UTC até JHO_KEEP_DAILY_DAYS (14) + os JHO_KEEP_FLOOR (6) mais novos + o apontado por
+#   latest.json. Apagar em bucket versionado cria delete marker; as versões antigas saem pela regra de 30 dias que já existe.
 #
-# ALERTA: JHO_ALERT_AFTER (2) execuções seguidas sem snapshot novo verificado => `notify` (no máx. 1 a cada JHO_ALERT_EVERY_S, 6 h).
+# ALERTA: JHO_ALERT_AFTER (2) execuções seguidas sem snapshot novo verificado (fail, unknown, ou run morto: `attempt_open` no estado, contado pelo run seguinte) =>
+#   `notify` com NOTIFY_FORCE_PUSH=1 NOTIFY_STRICT_EXIT=1 (sem o force o roteador manda esta fonte ao digest mudo: rc 0, nada no telefone). Só rc 0 conta como entregue:
+#   grava last_alert_epoch (no máx. 1 a cada JHO_ALERT_EVERY_S, 6 h) e loga "alerta enviado"; senão loga AVISO e o run seguinte tenta de novo.
+#   Sem como gravar o estado, avisa sem esperar o 2º run e, sem registro do último aviso, a cada run: nunca mudo.
 # MODO --status: lê latest.json do S3 e diz há quanto tempo o script bateu o ponto e até quando o dado enxerga (rc 0 vivo, 1 velho, 2 sem leitura).
 #
 # COSTURAS DE TESTE: JHO_LIB=1 só define funções; JHO_ARCHIVE, JHO_STATE_DIR, JHO_LOG, JHO_AWS, JHO_NOTIFY, JHO_NOW (epoch) apontam para fixtures.
@@ -111,19 +108,25 @@ state_update() { # jq-filter args...  (aplica o filtro ao estado atual, ou a {} 
   state_write "$(printf '%s' "$cur" | jq -c "$@" "$f")"
 }
 
-notify_fail() { "$NOTIFY" -t "Jsonl hourly offsite" -p 4 "🚨 $*" >/dev/null 2>&1 || true; }
+# FORCE_PUSH: sem ele o roteador do notify manda esta fonte (fora da allowlist) para o digest mudo: rc 0 e nada no telefone. STRICT_EXIT: rc != 0 = não saiu. Devolve o rc.
+notify_fail() { NOTIFY_FORCE_PUSH=1 NOTIFY_STRICT_EXIT=1 "$NOTIFY" -t "Jsonl hourly offsite" -p 4 "🚨 $*" >/dev/null 2>&1; }
 
-# Conta mais uma execução sem snapshot novo e decide se avisa. $1 = motivo curto.
+# Conta mais uma execução sem snapshot novo e decide se avisa. $1 = motivo curto. Fecha a tentativa (attempt_open).
 register_not_ok() {
-  local reason="$1" n last now alert
+  local reason="$1" n last now arc
   now="$(now_epoch)"
   n="$(state_get '.consecutive_not_ok' 0)"; n=$((n + 1))
   last="$(state_get '.last_alert_epoch' 0)"
-  state_update '.consecutive_not_ok = $n | .last_not_ok_reason = $r | .last_not_ok_at = $t' --argjson n "$n" --arg r "$reason" --arg t "$(iso_now)" || log "AVISO: não gravei o estado"
+  # contador que não grava não vira "1 seguida, sem alerta": sem como contar, avisa já
+  state_update '.consecutive_not_ok = $n | .last_not_ok_reason = $r | .last_not_ok_at = $t | .attempt_open = false' --argjson n "$n" --arg r "$reason" --arg t "$(iso_now)" || { log "AVISO: não gravei o estado; sem contador, aviso já"; n=$ALERT_AFTER; }
   if [ "$n" -ge "$ALERT_AFTER" ] && [ $((now - last)) -ge "$ALERT_EVERY_S" ]; then
-    notify_fail "$n execuções seguidas sem snapshot horário novo no S3 ($reason). Último bom: $(state_get '.last_success_at' nunca)"
-    state_update '.last_alert_epoch = $e' --argjson e "$now" || true
-    log "alerta enviado (consecutive_not_ok=$n)"
+    notify_fail "$n execuções seguidas sem snapshot horário novo no S3 ($reason). Último bom: $(state_get '.last_success_at' nunca)"; arc=$?
+    if [ $arc -eq 0 ]; then   # só rc 0 é entregue: gasta o limite de 6 h e diz "enviado"
+      state_update '.last_alert_epoch = $e' --argjson e "$now" || log "AVISO: alerta saiu mas last_alert_epoch não gravou (repete no próximo run)"
+      log "alerta enviado (consecutive_not_ok=$n)"
+    else
+      log "AVISO: alerta NÃO entregue (rc=$arc); o próximo run tenta de novo"
+    fi
   fi
 }
 
@@ -165,14 +168,18 @@ MODE="run"
 case "${1:-}" in
   --status) MODE="status" ;;
   "") ;;
-  -h|--help) sed -n '2,50p' "${BASH_SOURCE[0]}"; exit 0 ;;
+  -h|--help) sed -n '2,44p' "${BASH_SOURCE[0]}"; exit 0 ;;
   *) echo "uso: jsonl-hourly-offsite.sh [--status]" >&2; exit 3 ;;
 esac
 
-[ -n "$TIMEOUT_BIN" ] || { echo "timeout (GNU) ausente" >&2; exit 2; }
-for t in jq git python3; do command -v "$t" >/dev/null 2>&1 || { echo "$t ausente" >&2; exit 2; }; done
-[ -x "$AWS" ] || command -v "$AWS" >/dev/null 2>&1 || { echo "aws ausente ($AWS)" >&2; exit 2; }
-[ -f "$PY" ] || { echo "helper ausente: $PY" >&2; exit 2; }
+unknown() { # rc 2, sem veredito. Em run conta como run sem snapshot (antes só stderr: PATH sem /opt/homebrew/bin falhava toda hora, mudo); em --status só diz
+  if [ "$MODE" = run ]; then log "UNKNOWN: $*"; register_not_ok "unknown: $*"; echo "RESULT: unknown $*"; else echo "UNKNOWN: $*" >&2; fi
+  exit 2
+}
+[ -n "$TIMEOUT_BIN" ] || unknown "timeout (GNU) ausente"
+for t in jq git python3; do command -v "$t" >/dev/null 2>&1 || unknown "$t ausente"; done
+[ -x "$AWS" ] || command -v "$AWS" >/dev/null 2>&1 || unknown "aws ausente ($AWS)"
+[ -f "$PY" ] || unknown "helper ausente: $PY"
 
 # ── --status ─────────────────────────────────────────────────────────────────────────────
 if [ "$MODE" = status ]; then
@@ -194,7 +201,7 @@ now=int(sys.argv[3]); print(now-ep(sys.argv[1]), now-ep(sys.argv[2]))' "$checked
 fi
 
 # ── lock (mkdir atômico; dono = pid; reclama se o dono morreu ou passou de LOCK_STALE_MIN) ─────────────
-mkdir -p "$STATE_DIR" || { echo "não criei $STATE_DIR" >&2; exit 2; }
+mkdir -p "$STATE_DIR" || unknown "não criei $STATE_DIR"
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
   holder="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
   # sem pid ainda NÃO é dono morto: o outro run fez o mkdir e ainda não gravou o pid. Só reclama depois de 1 min.
@@ -220,10 +227,12 @@ if [ -d "$WORKROOT" ]; then find "$WORKROOT" -maxdepth 1 -name 'run.*' -type d -
 mkdir -p "$WD"
 
 START="$(now_epoch)"
-state_update '.last_attempt_at = $t' --arg t "$(iso_now)" || true
+# run que começou e nunca registrou desfecho (morto pelo timeout do order, kill, reboot) deixou attempt_open: conta agora como run sem snapshot
+# vazio → false (não há run morto); falhou/ilegível → false também: sem prova de run morto, o inerte é não contar (o AVISO de estado não gravado já grita)
+if [ "$(state_get '.attempt_open' false)" = true ]; then log "run anterior não terminou (timeout do order, kill ou reboot): conta como run sem snapshot"; register_not_ok "run anterior não terminou"; fi
+state_update '.last_attempt_at = $t | .attempt_open = true' --arg t "$(iso_now)" || log "AVISO: não gravei o estado"
 
 # ── pré-voo: tudo aqui é rc 2 (sem veredito), nada foi tentado ───────────────────────────────
-unknown() { log "UNKNOWN: $*"; register_not_ok "unknown: $*"; echo "RESULT: unknown $*"; exit 2; }
 git -C "$ARCHIVE" rev-parse --git-dir >/dev/null 2>&1 || unknown "archive não é um repo git: $ARCHIVE"
 SHA="$(git -C "$ARCHIVE" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || unknown "archive sem HEAD"
 HEAD_EPOCH="$(git -C "$ARCHIVE" log -1 --format=%ct "$SHA" 2>/dev/null)"
@@ -244,15 +253,16 @@ if [ "$LAST_SHA" = "$SHA" ] && [ -n "$LAST_KEY" ]; then
   if [ $hrc -eq 0 ]; then
     LAST_STEM="$(basename "${LAST_KEY%.tar.gz}")"
     cur="$(mktemp "$WD/latest.XXXXXX")"
-    if s3api get-object --bucket "$BUCKET" --key "$(s3key_latest)" "$cur" >/dev/null 2>&1 && jq -e '.snapshot_key' "$cur" >/dev/null 2>&1; then
+    # vazio/sem snapshot_key/de outro snapshot → não bate o ponto, vai para o snapshot novo; falhou/ilegível → idem (nunca reescreve um latest.json que não é o nosso)
+    if s3api get-object --bucket "$BUCKET" --key "$(s3key_latest)" "$cur" >/dev/null 2>&1 && jq -e --arg k "$LAST_KEY" '.snapshot_key == $k' "$cur" >/dev/null 2>&1; then
       jq --arg t "$(iso_now)" '.checked_at = $t' "$cur" > "$WD/latest.new" 2>/dev/null \
         && LSHA="$(python3 -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$WD/latest.new")" \
         && s3_put_verified "$(s3key_latest)" "$WD/latest.new" "$LSHA" application/json \
-        && { state_update '.consecutive_not_ok = 0 | .last_check_at = $t' --arg t "$(iso_now)" || true
+        && { state_update '.consecutive_not_ok = 0 | .attempt_open = false | .last_check_at = $t' --arg t "$(iso_now)" || log "AVISO: estado não gravado (o contador de falhas pode ficar sem zerar)"
              log "HEAD $SHA12 já está no S3 ($LAST_STEM): ponto batido"; echo "RESULT: ok unchanged key=$LAST_KEY head_age_s=$HEAD_AGE"; exit 0; }
       log "não consegui reescrever latest.json; sigo para um snapshot novo"
     else
-      log "latest.json não lido; sigo para um snapshot novo"
+      log "latest.json não lido, ilegível ou de outro snapshot; sigo para um snapshot novo"
     fi
   elif [ $hrc -eq 2 ]; then
     unknown "S3 não respondeu ao head-object de $LAST_KEY"
@@ -297,7 +307,7 @@ jq -n --arg key "$ART" --arg mkey "$(s3key_manifest "$STEM")" --arg sha "$ART_SH
 LSHA="$(python3 -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$WD/latest.json")"
 s3_put_verified "$(s3key_latest)" "$WD/latest.json" "$LSHA" application/json || fail "upload de latest.json não verificou"
 
-state_update '.consecutive_not_ok = 0 | .last_success_at = $t | .last_success_sha = $s | .last_success_key = $k | .last_success_bytes = $b | .last_success_data_as_of = $a' \
+state_update '.consecutive_not_ok = 0 | .attempt_open = false | .last_success_at = $t | .last_success_sha = $s | .last_success_key = $k | .last_success_bytes = $b | .last_success_data_as_of = $a' \
   --arg t "$(iso_now)" --arg s "$SHA" --arg k "$ART" --argjson b "$ART_BYTES" --arg a "$(jq -r '.data_as_of' "$WD/manifest.json")" || log "AVISO: estado não gravado"
 DUR=$(( $(now_epoch) - START ))
 log "OK $STEM: $ART_BYTES bytes, $(jq -r '[.databases | to_entries[] | .value.issues] | add' "$WD/manifest.json") issues em $(jq -r '.databases | length' "$WD/manifest.json") bancos (ignorados: $(jq -r '.ignored_dbs | join(",") | if . == "" then "nenhum" else . end' "$WD/manifest.json")), ${DUR}s"
