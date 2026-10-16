@@ -17,7 +17,8 @@
 #   • a sombra: mesmo rc / divergência / não rodou / estourou o tempo, e os arquivos que viraram mac-only;
 #   • o custo: preço/hora do tipo no local do servidor × horas de vida dentro da janela (estimativa; a fatura é por hora cheia), horas desde a criação e tráfego.
 # ESTADOS QUE NÃO SE CONFUNDEM: sem log ainda · log ilegível · zero execuções · custo "indisponível (motivo)" — nunca "0" no lugar de "não consegui saber".
-#   Linha do log que não dá para ler vem AVISADA ("N linha(s) ilegível(is)"), não omitida.
+#   Linha do log que não dá para ler vem AVISADA ("N linha(s) ilegível(is)"), não omitida. Lista mac-only aprendida que não abre diz "sem arquivo … ou ilegível", nunca "0 arquivo(s)".
+#   Texto que não se formou (jq falhou) sai rc 4 com ALERTA e, com --mail, NADA é enviado: relatório truncado não passa por completo.
 set -o pipefail
 CITY=${HETZNER_REPORT_CITY:-${GC_CITY_PATH:-${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}}}
 LOG="$CITY/.gc/logs/mbp-run.jsonl"
@@ -89,8 +90,12 @@ if [ -f "$SHADOW_LOG" ]; then
   [ -n "$shadow_json" ] || shadow_json='"ilegivel"'
 fi
 
+# grep -v: rc 0 = há linhas úteis, rc 1 = nenhuma (arquivo vazio ou só comentário: 0 de verdade), rc ≥ 2 = não consegui ler → null, nunca "0" (o `grep -c .` do fim sempre imprime um número, então não distingue sozinho)
 learned_n=null
-if [ -f "$LEARNED" ]; then learned_n=$(grep -v -E '^[[:space:]]*(#|$)' "$LEARNED" 2>/dev/null | sort -u | grep -c . ); case "$learned_n" in ''|*[!0-9]*) learned_n=null ;; esac; fi
+if [ -f "$LEARNED" ]; then
+  learned_body=$(grep -v -E '^[[:space:]]*(#|$)' "$LEARNED" 2>/dev/null); learned_rc=$?
+  if [ $learned_rc -le 1 ]; then learned_n=$(printf '%s\n' "$learned_body" | sort -u | grep -c .); case "$learned_n" in ''|*[!0-9]*) learned_n=null ;; esac; fi
+fi
 
 # ---- custo (API da Hetzner) -------------------------------------------------------------------------------------------------------
 # indisponível (motivo) é um estado de primeira classe: sem hcloud, sem token, sem rede, resposta que não é JSON ou sem servidor com o rótulo → NUNCA "0".
@@ -159,10 +164,12 @@ text_report() {
      else "Custo: indisponível (\(.cost.why)) — NÃO é zero, é \"não consegui saber\"" end)'
 }
 
-if [ $as_json -eq 1 ]; then printf '%s\n' "$report_json"; else text_report; fi
+# texto que não se formou (jq falhou no meio) é ALERTA e rc 4, nunca um relatório truncado dado por completo, nem mail vazio contado como enviado
+if [ $as_json -eq 1 ]; then printf '%s\n' "$report_json"
+else text_report || { echo "hetzner-daily-report: ALERTA: não consegui formatar o texto do relatório (jq falhou)" >&2; exit 4; }; fi
 
 if [ $do_mail -eq 1 ]; then
-  body=$(text_report)
+  body=$(text_report) && [ -n "$body" ] || { echo "hetzner-daily-report: ALERTA: não consegui formatar o texto do relatório — NADA foi enviado ao Mayor" >&2; exit 4; }
   if gc mail send mayor -s "Nó Linux de testes: relatório diário ($(date -u +%Y-%m-%d))" -m "$body" >/dev/null 2>&1; then echo "hetzner-daily-report: relatório enviado ao Mayor" >&2
   else echo "hetzner-daily-report: ALERTA: NÃO consegui enviar o relatório ao Mayor (gc mail send falhou)" >&2; exit 5; fi
 fi

@@ -6,7 +6,7 @@
 #
 # CASOS: sem log / log ilegível / zero execuções são três respostas diferentes · contagem por host (linha antiga sem "host" = mbp) · o lado de MBP da sombra
 #   não entra na conta · janela de horas · linha truncada AVISADA · recusas por host e motivo · tempo médio/mediana/máximo · sombra (iguais, divergências, arquivos) ·
-#   lista aprendida · custo: preço/hora × horas na janela, servidor mais velho que a janela, e CADA falha (sem hcloud, sem token, hcloud falhou, resposta que não é
+#   lista aprendida (ausente, ilegível e só-comentário são três respostas) · texto que não se forma (rc 4, nenhum mail) · custo: preço/hora × horas na janela, servidor mais velho que a janela, e CADA falha (sem hcloud, sem token, hcloud falhou, resposta que não é
 #   JSON, lista vazia, sem preço) vira "indisponível (motivo)" e nunca "€0" · --json · --mail (ok e falha) · o wrapper do order (liga/desliga/ocioso/log ilegível).
 # CONTROLE NEGATIVO: o mutante que conta o lado de sombra como execução do MBP e o que lê custo indisponível como zero TÊM de reprovar nos casos acima.
 set -u
@@ -46,13 +46,19 @@ now=$(date +%s); created=$(( now - ${STUB_AGE_H:-6} * 3600 ))
 c=$(date -u -r "$created" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$created" +%Y-%m-%dT%H:%M:%SZ)
 printf '[{"name":"urblink-teste-1","status":"running","created":"%s","location":{"name":"fsn1"},"outgoing_traffic":2000000000,"included_traffic":21990000000000,"server_type":{"name":"cax41","prices":[{"location":"fsn1","price_hourly":{"gross":"%s"}}]}}]' "$c" "${STUB_PRICE:-0.1}"
 EOF
+# jq: só o formatador de texto do relatório chama `jq -r` como 1º argumento; STUB_JQ_FAIL_TEXT=1 derruba esse e o resto passa ao jq de verdade
+cat > "$T/bin/jq" <<'EOF'
+#!/usr/bin/env bash
+[ "${STUB_JQ_FAIL_TEXT:-0}" = 1 ] && [ "${1:-}" = "-r" ] && { echo "stub jq: falha injetada" >&2; exit 5; }
+exec "$(PATH="$STUB_REAL_PATH" command -v jq)" "$@"
+EOF
 chmod +x "$T/bin/"*
 export STUB_LOG="$T/stub.log"
 # PATH sem o hcloud de verdade (/opt/homebrew/bin) — jq vem de /usr/bin
-SAFEPATH="/usr/bin:/bin:/usr/sbin:/sbin"
+SAFEPATH="/usr/bin:/bin:/usr/sbin:/sbin"; export STUB_REAL_PATH="$SAFEPATH"
 run() { HETZNER_REPORT_CITY="$C" PATH="$T/bin:$SAFEPATH" "$REPORT" "$@" 2>"$T/err"; }
 run_nostub() { HETZNER_REPORT_CITY="$C" PATH="$SAFEPATH" "$REPORT" "$@" 2>"$T/err"; }
-reset() { : > "$STUB_LOG"; rm -f "$LOG" "$SLOG" "$FLAG" "$LEARN"; unset STUB_HCLOUD_RC STUB_HCLOUD_OUT STUB_AGE_H STUB_PRICE STUB_GC_RC STUB_SECRET_FAIL HCLOUD_TOKEN; }
+reset() { : > "$STUB_LOG"; rm -f "$LOG" "$SLOG" "$FLAG" "$LEARN"; unset STUB_HCLOUD_RC STUB_HCLOUD_OUT STUB_AGE_H STUB_PRICE STUB_GC_RC STUB_SECRET_FAIL STUB_JQ_FAIL_TEXT HCLOUD_TOKEN; }
 now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ago() { date -u -v-"$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "$1 ago" +%Y-%m-%dT%H:%M:%SZ; }
 t_old=$(ago 3d); t_2h=$(ago 2H 2>/dev/null || ago "2 hours")
@@ -98,6 +104,10 @@ has "sombra: arquivos que viraram mac-only" "viraram mac-only: tests/test_x.py, 
 has "sombra: linha truncada avisada" "1 linha(s) ilegível(is) no log da sombra" "$out"
 has "lista aprendida: 2 arquivos únicos (comentário, vazio e repetido não contam)" "Lista mac-only aprendida: 2 arquivo(s)" "$out"
 rm -f "$LEARN"; out=$(run --no-cost); has "sem lista aprendida: dito (não '0 arquivos')" "Lista mac-only aprendida: sem arquivo" "$out"
+printf 'tests/test_x.py\n' > "$LEARN"; chmod 000 "$LEARN"; out=$(run --no-cost); j=$(run --no-cost --json); chmod 644 "$LEARN"
+has "lista aprendida que não abre: 'sem arquivo … ou ilegível'" "Lista mac-only aprendida: sem arquivo" "$out"; hasnt "lista aprendida ilegível NÃO vira '0 arquivo(s)'" "0 arquivo(s)" "$out"
+eq "lista aprendida ilegível: --json traz null, não 0" "null" "$(printf '%s' "$j" | jq -c '.mac_only_learned')"
+printf '# só comentário\n\n' > "$LEARN"; out=$(run --no-cost); has "lista só com comentário: 0 arquivo(s) de verdade" "Lista mac-only aprendida: 0 arquivo(s)" "$out"
 
 echo "--- custo"
 reset; L "$now" 0 5 ',"host":"hetzner"' > "$LOG"
@@ -124,6 +134,10 @@ eq "--json: hetzner.n" 1 "$(printf '%s' "$j" | jq -r '.runs.hetzner.n')"; eq "--
 j=$(HCLOUD_TOKEN=abc run --json); eq "--json: custo ok" "ok" "$(printf '%s' "$j" | jq -r '.cost.state')"
 out=$(run --no-cost --mail); rc=$?; eq "--mail: rc 0" 0 "$rc"; has "--mail: manda ao Mayor com assunto datado" "GC:mail send mayor -s Nó Linux de testes: relatório diário ($(date -u +%Y-%m-%d))" "$(cat "$STUB_LOG")"
 : > "$STUB_LOG"; out=$(STUB_GC_RC=1 run --no-cost --mail); rc=$?; eq "--mail que falha: rc 5 (não finge que enviou)" 5 "$rc"; has "--mail que falha: ALERTA" "ALERTA: NÃO consegui enviar" "$(cat "$T/err")"
+out=$(STUB_JQ_FAIL_TEXT=1 run --no-cost); rc=$?; eq "texto que não se formou (jq falhou): rc 4" 4 "$rc"; has "…com ALERTA" "não consegui formatar o texto do relatório" "$(cat "$T/err")"
+: > "$STUB_LOG"; out=$(STUB_JQ_FAIL_TEXT=1 run --no-cost --mail); rc=$?; eq "--mail com texto que não se formou: rc 4" 4 "$rc"; hasnt "…e nenhum mail sai" "GC:mail" "$(cat "$STUB_LOG")"
+# --json --mail: a tela não passa pelo formatador, então quem pega é o corpo do mail (vazio/truncado não é enviado nem contado como enviado)
+: > "$STUB_LOG"; out=$(STUB_JQ_FAIL_TEXT=1 run --no-cost --json --mail); rc=$?; eq "--json --mail com corpo que não se formou: rc 4" 4 "$rc"; hasnt "…e nenhum mail sai" "GC:mail" "$(cat "$STUB_LOG")"; has "…e diz que NADA foi enviado" "NADA foi enviado ao Mayor" "$(cat "$T/err")"; hasnt "…e não diz 'enviado' como se tivesse ido" "relatório enviado ao Mayor" "$(cat "$T/err")"
 
 echo "--- wrapper do order"
 wrap() { GC_CITY_PATH="$C" HETZNER_REPORT_SCRIPT="$REPORT" PATH="$T/bin:$SAFEPATH" bash "$WRAP" 2>"$T/err"; echo "rc=$?"; }
