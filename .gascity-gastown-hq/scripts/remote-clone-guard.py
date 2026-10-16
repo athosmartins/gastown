@@ -17,7 +17,9 @@ COMO DECIDE (os três estados — sei que pode / sei que não pode / não sei �
   elif/do/while/until/!/function, de cd/pushd, de command/env/sudo/xargs/nohup…, de bash -c / eval / $(…) / crases / <(…) / find -exec, e do corpo
   de um heredoc ou here-string que um shell lê) o alvo é o diretório depois dos `-C` (relativos entre si), mais --git-dir/--work-tree/GIT_DIR/
   GIT_WORK_TREE, resolvido com realpath (symlink para outro clone não escapa). Subcomando que não está na lista de LEITURA (inclusive o que não
-  conheço, alias…) conta como escrita. Alvo no território e fora do clone próprio → bloqueia; alvo que não consigo resolver ($VAR, glob, crase,
+  conheço, alias…) conta como escrita. Leitura que traz configuração capaz de rodar um programa também conta: `-c`/`--config-env` com chave que não é só
+  de exibição ou identidade (alias.*, core.pager/fsmonitor/sshCommand, diff.external, filter.*…), `-p`/`--paginate`, `--exec-path`, GIT_CONFIG_*/GIT_PAGER/
+  GIT_EXTERNAL_DIFF/GIT_SSH*/GIT_EDITOR… (lista fechada: chave que não conheço = não sei = escrita). Alvo no território e fora do clone próprio → bloqueia; alvo que não consigo resolver ($VAR, glob, crase,
   ~usuário) numa escrita → bloqueia, com a mensagem dizendo para usar caminho literal.
   cd/pushd só muda o diretório que EU entendo: opções -L/-P/-e/-@, `--` e UM argumento; o resto (`cd -Z x`, dois argumentos, `pushd +1`, `pushd`
   sozinho) deixa o diretório "não sei". Lançadores que não modelo (flock, ionice, ssh, su -c, parallel, script -c, trap, watch, tmux…; a lista OPAQUE)
@@ -34,7 +36,8 @@ CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json [pasta-do-proje
 
 LIMITES (é trava contra engano, não sandbox contra quem quer burlar). NÃO vejo: script que o comando executa (`bash x.sh`, `source x`), `python -c` e
   outras linguagens, variável que guarda o git ou o diretório, comando montado em pipe (`echo '…' | sh`), função ou alias definido em OUTRA chamada,
-  CDPATH, redirecionamento de shell (`> arquivo`), `sed -i`, `rm`/`cp` no clone alheio ou nos hooks. A lista OPAQUE é fechada: um lançador que não
+  CDPATH, redirecionamento de shell (`> arquivo`), `sed -i`, `rm`/`cp` no clone alheio ou nos hooks, e a configuração que JÁ está no .git/config do clone
+  alheio (alias, filter, textconv, fsmonitor: uma leitura lá a executa). A lista OPAQUE é fechada: um lançador que não
   está nela (`lockrun git …`) esconde o git numa palavra que não abro. Falso positivo que fica: git com diretório implícito atrás de um lançador da
   lista (`flock L git commit`) bloqueia; escreva `git -C <caminho absoluto do seu clone>`. O fecho de verdade (usuário Unix por sessão) é outro
   trabalho; ver o runbook.
@@ -58,6 +61,8 @@ LIST_VAL = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-
 LIST_EQ = ("--sort=", "--format=", "--abbrev=", "--color=", "--column=")  # valor só junto da opção: separado, `--sort novo` é palavra solta e não sei o que é
 CONFIG_SCOPE = {"--local", "--global", "--system", "--worktree", "--show-origin", "--show-scope", "--includes", "--no-includes", "--name-only", "-z", "--null"}
 WRITES = re.compile(r"--(?:output|lost-found|open-files-in-pager|ext-diff)(?:=|$)|-O")  # flag de comando de LEITURA que grava arquivo ou roda programa
+CFG_SAFE = re.compile(r"(?:color|advice)\.[\w.-]+|core\.(?:quotepath|abbrev|precomposeunicode)|safe\.directory|user\.(?:name|email)")  # chaves de `-c` que só mudam exibição/identidade; qualquer outra (alias.*, core.pager/fsmonitor/sshCommand/hooksPath, diff.external, filter.*, credential.helper…) pode fazer o git rodar um programa
+CFG_ENV = re.compile(r"GIT_(?:CONFIG\w*|EXTERNAL_DIFF|PAGER|SSH\w*|ASKPASS|EDITOR|SEQUENCE_EDITOR|PROXY_COMMAND|EXEC_PATH|TEMPLATE_DIR)|SSH_ASKPASS")  # variáveis que fazem o git rodar um programa ou ler configuração de outro lugar
 PUNCT, SEPS = set("();<>|&"), {";", "&&", "||", "|", "&", "|&", ";;"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh"}
 WRAP = {"command", "builtin", "exec", "nohup", "time", "env", "sudo", "doas", "xargs", "nice", "timeout", "stdbuf", "setsid"}
@@ -219,12 +224,19 @@ def chdir(args: list, cwd, push: bool):
 
 def git_hit(seg: list, env: dict, cwd, terr: str, own):
     gd, wt, i = env.get("GIT_DIR"), env.get("GIT_WORK_TREE"), 1
+    runs = any(CFG_ENV.fullmatch(k) for k in env)  # o git deste comando pode rodar um programa que o guarda não vê (configuração injetada): leitura deixa de valer como leitura
     while i < len(seg) and seg[i].startswith("-"):
         a = seg[i]
         if a == "-C" and i + 1 < len(seg):
             cwd, i = res(seg[i + 1], cwd), i + 2
-        elif a in ("-c", "--config-env", "--namespace") and i + 1 < len(seg):
+        elif a in ("-c", "--config-env") and i + 1 < len(seg):
+            runs, i = runs or not CFG_SAFE.fullmatch(seg[i + 1].partition("=")[0]), i + 2
+        elif a == "--namespace" and i + 1 < len(seg):
             i += 2
+        elif a.startswith("--config-env="):
+            runs, i = runs or not CFG_SAFE.fullmatch(a.partition("=")[2].partition("=")[0]), i + 1
+        elif a in ("-p", "--paginate") or a.startswith("--exec-path"):  # o pager e o diretório de programas do git são programas que o guarda não vê
+            runs, i = True, i + 1
         elif a.startswith(("--git-dir", "--work-tree")):
             k, _, v = a.partition("=")
             if not v and i + 1 < len(seg):
@@ -234,11 +246,12 @@ def git_hit(seg: list, env: dict, cwd, terr: str, own):
         else:
             i += 1
     sub, rest = (seg[i] if i < len(seg) else ""), seg[i + 1:]
-    if is_read(sub, rest):
+    read = is_read(sub, rest)
+    if read and not runs:
         return None
     for t in [cwd] + [res(x, cwd) for x in (gd, wt) if x]:
         if t is None or (inside(t, terr) and not (own and inside(t, own))):
-            return t, "git " + sub
+            return t, "git " + sub + (" (leitura com configuração que roda programa: -c, GIT_PAGER…)" if read else "")
     return None
 
 

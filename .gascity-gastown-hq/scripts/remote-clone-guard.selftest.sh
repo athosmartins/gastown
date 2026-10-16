@@ -9,9 +9,10 @@
 #   clone · evade — a mesma escrita embrulhada (command/env/sudo/xargs, bash -c, eval, $(…), crase, find -exec, ; && || |, heredoc) ·
 #   closed — o que não sei NÃO vira liberado (variável, glob, ~usuário, subcomando desconhecido, stdin que não é JSON e cita git/file_path; sem citar, libera) · tools — Edit/Write/MultiEdit/
 #   NotebookEdit · shell — o git atrás de palavra reservada (if/then/{/!/function), de `<(…)`, de cd/pushd com opção, de lançador que não modelo (flock/ssh/su…),
-#   de heredoc e here-string que um shell lê, de `\`+newline (e os controles que NÃO podem bloquear) · msg — o texto da recusa · check — --selfcheck com settings bom e com cada defeito · hook — o comando de hook de
+#   de heredoc e here-string que um shell lê, de `\`+newline (e os controles que NÃO podem bloquear) · cfg — a LEITURA que traz configuração capaz de rodar programa
+#   (`-c alias.x=…`, `--config-env`, `-p`, `--exec-path`, GIT_CONFIG_*/GIT_PAGER/GIT_EXTERNAL_DIFF…) deixa de valer como leitura no clone alheio; chave só de exibição e o próprio clone seguem livres · msg — o texto da recusa · check — --selfcheck com settings bom e com cada defeito · hook — o comando de hook de
 #   verdade (`python3 -I <guarda> || exit 2`) sai 2 se o guarda trava, some ou tem erro de sintaxe (falha fechada), e 0 se libera.
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (60 mutantes); e
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (67 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 set -u
@@ -245,6 +246,24 @@ EOF"
   b 0 "pass: continuação de linha entre -C e o subcomando de leitura" "git -C $OTH \\
 log"
 }
+g_cfg() {  # parecer de segurança do push da rodada 1: leitura que TRAZ configuração capaz de rodar programa (alias, pager, fsmonitor…) não é leitura
+  local c
+  for c in "git -C $OTH -c alias.log='!git commit -m x' log" "git -C $OTH -c core.pager='sh -c x' log" "git -C $OTH -c core.fsmonitor=/tmp/x status" \
+           "git -C $OTH -c Alias.log=x log" "git -C $OTH -c alias.log log" "git -c core.pager=x -C $OTH log" "git -C $OTH -c user.name=a -c core.pager=x log" \
+           "git -C $OTH --config-env=alias.log=EVIL log" "git -C $OTH --config-env alias.log=EVIL log" "git -C $OTH -p log" "git -C $OTH --paginate log" \
+           "git -C $OTH --exec-path=/tmp/x log" "git -C $OTH --exec-path log" \
+           "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.log GIT_CONFIG_VALUE_0='!x' git -C $OTH log" "GIT_EXTERNAL_DIFF=/tmp/x git -C $OTH diff" "GIT_PAGER='sh -c x' git -C $OTH log" \
+           "env GIT_SSH_COMMAND=x git -C $OTH ls-remote origin" "export GIT_PAGER=x; git -C $OTH log" "GIT_EDITOR=x git -C $OTH log" \
+           "cd $OTH && git -c alias.log=x log" "bash -c 'git -C $OTH -c alias.log=x log'" "flock $T/l git -C $OTH -c alias.log=x log" "git -C \$X -c alias.log=x log"; do
+    b 2 "cfg: $c" "$c"
+  done
+  for c in "git -C $OTH -c color.ui=never log" "git -C $OTH -c safe.directory='*' status" "git -C $OTH -c core.quotepath=false -c advice.detachedHead=false diff" \
+           "git -C $OTH -c user.name=a -c user.email=b@c log" "git -C $OTH --config-env=user.name=NAMEVAR log" "git -C $OTH --no-pager log" "GIT_TERMINAL_PROMPT=0 git -C $OTH log" \
+           "git -C $OWN -c core.pager=cat log" "git -c alias.x=y status" "GIT_PAGER=cat git log" "git -C $OWN -p log" "git -C $OUT -c alias.log=x log" "GIT_PAGER=cat git -C $OUT log"; do
+    b 0 "pass: $c" "$c"
+  done
+  b 2 "cfg: a mensagem diz que a LEITURA foi barrada pela configuração" "git -C $OTH -c alias.log=x log"; grep -qF "leitura com configuração que roda programa" "$T/err"; ok $? "cfg: a recusa nomeia o motivo (leitura com configuração que roda programa)"
+}
 g_tools() {
   local t
   for t in "Edit file_path" "Write file_path" "MultiEdit file_path" "NotebookEdit notebook_path"; do
@@ -332,7 +351,7 @@ g_hook() {  # o comando que vai no settings do servidor
   c="python3-que-nao-existe -I $P || exit 2"; sh -c "$c" <<<"$js" >/dev/null 2>&1; [ $? = 2 ]; ok $? "hook: python ausente (127) vira 2"
 }
 
-all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group tools && g_tools; group msg && g_msg
+all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group cfg && g_cfg; group tools && g_tools; group msg && g_msg
         group check && g_check; group hook && g_hook; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
@@ -407,9 +426,16 @@ echo "== $((n-fails))/$n ok =="
   mutant closed "branch --contains -D x vira leitura" 's/^            if t.startswith("-"):/            if False:/'
   mutant closed "git config chave valor vira leitura" 's/len(rest) - len(flags) == 1 and/len(rest) - len(flags) >= 1 and/'
   mutant closed "git config --unset chave vira leitura" 's/ and all(t in CONFIG_SCOPE for t in flags))/)/'
+  mutant cfg "leitura com configuração que roda programa volta a ser leitura (o guarda de antes)" 's/    if read and not runs:/    if read:/'
+  mutant cfg "-c / --config-env com chave que roda programa não conta" 's/runs, i = runs or not CFG_SAFE.fullmatch(seg\[i + 1\].partition("=")\[0\]), i + 2/runs, i = runs, i + 2/'
+  mutant cfg "--config-env=CHAVE=VAR (junto) não conta" 's/runs, i = runs or not CFG_SAFE.fullmatch(a.partition("=")\[2\].partition("=")\[0\]), i + 1/runs, i = runs, i + 1/'
+  mutant cfg "-p / --paginate / --exec-path não contam" 's/            runs, i = True, i + 1/            runs, i = runs, i + 1/'
+  mutant cfg "GIT_CONFIG_* / GIT_PAGER / GIT_EXTERNAL_DIFF… não contam" 's/    runs = any(CFG_ENV.fullmatch(k) for k in env)/    runs = False/'
+  mutant cfg "toda chave de -c vale como segura" 's/CFG_SAFE = re.compile(r"(?:color|advice)/CFG_SAFE = re.compile(r".*|(?:color|advice)/'
+  mutant cfg "nenhuma chave de -c vale como segura (os controles que passam importam)" 's/CFG_SAFE = re.compile(r"(?:color|advice)/CFG_SAFE = re.compile(r"(?!)(?:color|advice)/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
-  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,tools,msg,check" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,cfg,tools,msg,check" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }
