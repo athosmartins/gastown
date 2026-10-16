@@ -106,10 +106,11 @@ take_lock() {
   if ! mkdir "$STATE/lock" 2>/dev/null; then
     [ -d "$STATE/lock" ] || return 2   # mkdir falhou e nao ha trava (EACCES/EROFS/ENOSPC): nao e "outra rodada em curso"
     lock_stale || return 1
-    [ -z "$(find "$m" -maxdepth 0 -mmin +10 2>/dev/null)" ] || rmdir "$m" 2>/dev/null   # mutex de 10 min+ e de quem morreu dentro dele (milissegundos)
-    mkdir "$m" 2>/dev/null || { WHY="outra rodada esta recolhendo a trava velha: nada a fazer"; return 1; }; RECL=1
-    if lock_stale; then log "trava de pid morto/antiga recolhida"; rm -rf "$STATE/lock"
-      if mkdir "$STATE/lock" 2>/dev/null; then LOCKED=1; echo "$$" > "$STATE/lock/pid" || rc=2   # LOCKED antes: pid que nao grava, o cleanup apaga a trava
+    [ -z "$(find "$m" -maxdepth 0 -mmin +10 2>/dev/null)" ] || rmdir "$m" 2>/dev/null || [ ! -d "$m" ] || return 2   # mutex de 10 min+ = de quem morreu dentro dele (ms); que nao sai = rc 2. Dois recolhedores quebrando o MESMO mutex morto juntos ainda se atropelam: dupla falha rara
+    mkdir "$m" 2>/dev/null || { [ -d "$m" ] || return 2; WHY="outra rodada esta recolhendo a trava velha: nada a fazer"; return 1; }; RECL=1   # sem mutex NEM dir: erro, nao "outra rodada"
+    if lock_stale; then log "trava de pid morto/antiga recolhida"
+      if ! rm -rf "$STATE/lock" 2>/dev/null; then WHY="nao consegui apagar a trava velha $STATE/lock"; rc=2   # trava velha que nao sai nao e "outra rodada pegou"
+      elif mkdir "$STATE/lock" 2>/dev/null; then LOCKED=1; echo "$$" > "$STATE/lock/pid" || rc=2   # LOCKED antes: pid que nao grava, o cleanup apaga a trava
       elif [ -d "$STATE/lock" ]; then WHY="outra rodada pegou a trava"; rc=1; else rc=2; fi
     else rc=1; fi
     rmdir "$m" 2>/dev/null; RECL=0; return "$rc"
@@ -186,7 +187,7 @@ main() {
   if [ "$MODE" = check ]; then mbp_free && { log "MBP livre"; exit 0; }; log "MBP nao livre: $WHY"; exit 4; fi
 
   [ -n "$TMO" ] || unknown "sem timeout/gtimeout no PATH (brew install coreutils; o PATH do launchd precisa de /opt/homebrew/bin)"
-  take_lock; case $? in 0) ;; 1) VERDICT=SKIPPED; finish 0 ;; *) unknown "nao consegui criar $STATE (ou a trava dentro dela)" ;; esac   # SKIPPED: o agendador ve que nao rodou
+  take_lock; case $? in 0) ;; 1) VERDICT=SKIPPED; finish 0 ;; *) unknown "${WHY:-nao consegui criar $STATE (ou a trava dentro dela)}" ;; esac   # SKIPPED: o agendador ve que nao rodou
   RUN="$STATE/runs/$(date -u +%Y%m%dT%H%M%SZ)-$$"; OUT="$RUN/out"   # com o pid: duas rodadas no mesmo segundo (trava recolhida) nao dividem a pasta
   { mkdir -p "$STATE/runs" && mkdir "$RUN" && mkdir "$OUT"; } || unknown "nao consegui criar $RUN"
   build_manifest || unknown "$WHY"

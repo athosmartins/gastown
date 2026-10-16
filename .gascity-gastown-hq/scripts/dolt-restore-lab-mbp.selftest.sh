@@ -373,6 +373,35 @@ if [ -w "$T/state" ]; then echo "  SKIP: estado somente-leitura (chmod 555 nao i
   check "$(calls aws.argv)" 0 "somente-leitura: nada foi lido do S3"
 fi
 chmod 755 "$T/state"
+# trava velha que NAO da para recolher (mutex que nao nasce, mutex velho que nao sai, trava que nao e apagada) e erro rc 2, nunca o "nada a fazer" do SKIPPED
+reset; sh -c 'exit 0' & dead=$!; wait $dead; mkdir -p "$T/state/lock"; echo "$dead" > "$T/state/lock/pid"; chmod 555 "$T/state"
+if [ -w "$T/state" ]; then echo "  SKIP: estado somente-leitura (chmod 555 nao impede este usuario)"; else
+  run --dry-run
+  check "$RC" 2 "trava morta, mutex que nao nasce (somente-leitura): rc 2, nao o 0 de 'outra rodada recolhendo'"
+  has "$OUT" "RESULT: UNKNOWN db=hq rc=2" "mutex que nao nasce: RESULT UNKNOWN"
+  hasnt "$OUT" "recolhendo" "mutex que nao nasce: nao culpa 'outra rodada recolhendo'"
+  check "$(calls aws.argv)" 0 "mutex que nao nasce: nada foi lido do S3"
+fi
+chmod 755 "$T/state"
+reset; sh -c 'exit 0' & dead=$!; wait $dead; mkdir -p "$T/state/lock" "$T/state/lock.reclaim"; echo "$dead" > "$T/state/lock/pid"; touch -t 202001010000 "$T/state/lock.reclaim"; chmod 555 "$T/state"
+if [ -w "$T/state" ]; then echo "  SKIP: estado somente-leitura (chmod 555 nao impede este usuario)"; else
+  run --dry-run
+  check "$RC" 2 "mutex velho que nao sai (somente-leitura): rc 2, nao o 0 de 'outra rodada recolhendo'"
+  has "$OUT" "RESULT: UNKNOWN db=hq rc=2" "mutex velho que nao sai: RESULT UNKNOWN"
+  check "$(calls aws.argv)" 0 "mutex velho que nao sai: nada foi lido do S3"
+fi
+chmod 755 "$T/state"
+reset; sh -c 'exit 0' & dead=$!; wait $dead; mkdir -p "$T/state/lock/sub"; echo "$dead" > "$T/state/lock/pid"; echo x > "$T/state/lock/sub/f"; chmod 555 "$T/state/lock/sub"
+if [ -w "$T/state/lock/sub" ]; then echo "  SKIP: pasta somente-leitura (chmod 555 nao impede este usuario)"; else
+  run --dry-run
+  check "$RC" 2 "trava velha que nao pode ser apagada: rc 2, nao o 0 de 'outra rodada pegou a trava'"
+  has "$OUT" "RESULT: UNKNOWN db=hq rc=2" "trava que nao sai: RESULT UNKNOWN"
+  has "$OUT" "nao consegui apagar a trava velha" "trava que nao sai: o motivo diz que a trava velha nao saiu"
+  hasnt "$OUT" "pegou a trava" "trava que nao sai: nao culpa 'outra rodada pegou a trava'"
+  check "$([ -d "$T/state/lock.reclaim" ] && echo preso || echo livre)" livre "trava que nao sai: o mutex foi liberado"
+  check "$(calls aws.argv)" 0 "trava que nao sai: nada foi lido do S3"
+fi
+chmod -R u+w "$T/state"
 reset; um=$(umask); umask 0222   # a trava nasce 0555: o mkdir passa, mas o pid nao pode ser gravado dentro dela
 if [ "$(id -u)" = 0 ]; then echo "  SKIP: pid nao gravavel (root escreve em dir 0555)"; else
   run --dry-run
