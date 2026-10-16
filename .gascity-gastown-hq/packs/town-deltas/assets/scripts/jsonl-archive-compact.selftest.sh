@@ -131,7 +131,7 @@ run_jac() {
   JAC_REPOS="$repos" JAC_STATE="${T_STATE:-$WORK/state.json}" JAC_LOG="${T_LOG:-$WORK/log}" JAC_LOCK="${T_LOCK:-$WORK/lock}" JAC_GC="${T_GC:-$WORK/gc-stub}" \
   JAC_LOOSE_LIMIT_KIB="${T_LIMIT:-1024}" JAC_LOOSE_ALARM_KIB="${T_ALARM:-100000}" JAC_BATCH_OBJECTS="${T_BATCH:-25}" \
   JAC_PACKS_LIMIT="${T_PACKS:-8}" JAC_PACKS_ALARM="${T_PACKS_ALARM:-20}" JAC_FREE_KIB="${T_FREE:-90000000}" \
-  JAC_ALERT_EVERY_S="${T_ALERT_EVERY:-21600}" JAC_HEADROOM_KIB=0 \
+  JAC_ALERT_EVERY_S="${T_ALERT_EVERY:-21600}" JAC_HEADROOM_KIB="${T_HEADROOM:-0}" \
   JAC_GIT="${T_GIT:-git}" JAC_GIT_TIMEOUT_S="${T_GIT_TIMEOUT:-300}" JAC_MAX_BATCHES="${T_MAX_BATCHES:-0}" JAC_DEADLINE_S="${T_DEADLINE:-780}" \
   JAC_MIN_BATCH_S="${T_MIN_BATCH:-}" JAC_GC_TIMEOUT_S="${T_GC_TIMEOUT:-}" JAC_MIN_GC_BUDGET_S="${T_MIN_GC:-}" \
   JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" JAC_MAIL_TIMEOUT_S="${T_MAIL_TIMEOUT:-}" \
@@ -1491,6 +1491,19 @@ out="$(T_TAIL=10 T_TAIL_OBJS=20 run_tail "$TB1")"; rc=$?
 out="$(T_TAIL=abc T_TAIL_OBJS=20 run_tail "$TB")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(pack_count "$TB")" = "$PCB" ] && printf '%s' "$out" | grep -q 'tail consolidation is OFF: a JAC_TAIL_\* setting is not a number'; } \
   && ok "a malformed limit is not 'off, quietly' and not a crash: the log says tail consolidation is OFF and why; nothing is touched" || bad "malformed JAC_TAIL_LIMIT_KIB handled wrong (rc=$rc): $out"
+
+# B2. a setting the tail DEPENDS ON but does not own (the loose limit, the headroom, the gc budget) that is not a number: `[ n -ge abc ]` fails with status 2, which an `if` reads as FALSE — "no loose backlog" —
+# so the pass would start on a limit it could not read. Each of the three must keep the pass off, with the reason in the log.
+for kv in LIMIT:T_LIMIT HEADROOM:T_HEADROOM MINGC:T_MIN_GC; do
+  rm -f "$WORK/state.json" "$WORK/log"; PCB2="$(pack_count "$TB")"
+  case "${kv%%:*}" in
+    LIMIT) out="$(T_LIMIT=abc T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TB")"; rc=$? ;;
+    HEADROOM) out="$(T_HEADROOM=abc T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TB")"; rc=$? ;;
+    MINGC) out="$(T_MIN_GC=abc T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TB")"; rc=$? ;;
+  esac
+  { [ "$(pack_count "$TB")" = "$PCB2" ] && printf '%s' "$out" | grep -q 'tail consolidation is OFF: a setting it depends on is not a number' && ! printf '%s' "$out" | grep -q 'tail consolidation: [0-9]'; } \
+    && ok "a non-numeric ${kv%%:*} setting → the tail stays OFF with the reason in the log, packs untouched" || bad "tail ran or stayed silent with a non-numeric ${kv%%:*} setting (rc=$rc, packs $PCB2 -> $(pack_count "$TB")): $out"
+done
 
 # C. the objects-per-pass cap: 7 objects take two 3-object packs; the other two stay, and a pack that does not fit (the base: 27 objects) is never taken
 TC="$WORK/tc"; tailrepo "$TC" 4; PCC="$(pack_count "$TC")"; rm -f "$WORK/state.json" "$WORK/log"; BPC="$(base_pack "$TC")"; BSC="$(cksum < "$BPC")"

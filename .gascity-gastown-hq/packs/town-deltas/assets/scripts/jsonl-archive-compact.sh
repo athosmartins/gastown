@@ -757,6 +757,11 @@ tail_pass() {
     log "  tail consolidation is OFF: a JAC_TAIL_* setting is not a number (limit='$TAIL_LIMIT_KIB' objects='$TAIL_MAX_OBJECTS' timeout='$TAIL_TIMEOUT_S' window='$TAIL_WINDOW' depth='$TAIL_DEPTH') — nothing is consolidated by size until it is fixed"
     return 0
   fi
+  # the pass also reads three settings it does not own: `[ n -ge abc ]` ends 2, which an `if` takes as FALSE, so a loose limit it cannot read would read as "no loose backlog" and the pass would start (measured: packs 5 -> 2)
+  if ! { is_uint "$LOOSE_LIMIT_KIB" && is_uint "$HEADROOM_KIB" && is_uint "$MIN_GC_BUDGET_S"; }; then
+    log "  tail consolidation is OFF: a setting it depends on is not a number (loose_limit_kib='$LOOSE_LIMIT_KIB' headroom_kib='$HEADROOM_KIB' min_gc_budget_s='$MIN_GC_BUDGET_S') — nothing is consolidated by size until it is fixed"
+    return 0
+  fi
   if ! tail_plan; then
     log "  tail consolidation skipped: the pack directory of $repo could not be listed — nothing consolidated by size this run"
     return 0
