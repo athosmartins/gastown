@@ -1,0 +1,24 @@
+# ga-c0939v.2: sobe a cada hora o dump JSONL (jsonl-export, a cada 15 min) ao S3, com manifest e sha256 conferido.
+# Por quê, o que sobe, garantias e códigos de saída: cabeçalho de assets/scripts/jsonl-hourly-offsite.sh e
+# docs/runbooks/jsonl-hourly-offsite.md. Aqui fica só o que é do order.
+#
+# interval 1h: é o que o Athos pediu (15/10: perder no máximo 1 h de beads). O RPO real NÃO é 1 h cravada: é a idade do dump
+# na captura (exporter a cada 15 min, medido 16-28) + 60 min + a duração do run = pior caso ~1h40, típico ~1h05.
+# Para 1h10 no pior caso o caminho é interval = "30m" (custo: ~98 MB gzip a cada 30 min); é decisão de produto.
+#
+# timeout 2400s: build (≤ 900 s) + upload do snapshot e do manifest (≤ 1200 s cada; na prática ~2 min) + retenção.
+# interval (3600 s) > timeout e o script tem lock single-flight: runs não empilham.
+#
+# Credencial: o aws precisa estar acessível ao ambiente do order (a mesma do dolt-s3-backup.sh). Sem ela o script sai com
+# fail/unknown e, no 2º run seguido sem snapshot novo, manda `notify`: não fica calado.
+#
+# Desfazer: remover este arquivo (o `gc order` recarrega); os objetos em jsonl-hourly/ podem ficar (versões não correntes
+# expiram em 30 dias pela regra do bucket) ou sair com `aws s3 rm --recursive`.
+# Conferir depois de recarregar: gc order show jsonl-hourly-offsite · gc order history jsonl-hourly-offsite
+#   bash $GC_CITY_PATH/packs/town-deltas/assets/scripts/jsonl-hourly-offsite.sh --status
+[order]
+description = "Hourly offsite upload of the JSONL dump archive to S3 with manifest + sha256 verification (ga-c0939v — RPO 1h for beads)"
+trigger = "cooldown"
+interval = "1h"
+timeout = "2400s"
+exec = "$PACK_DIR/assets/scripts/jsonl-hourly-offsite.sh"
