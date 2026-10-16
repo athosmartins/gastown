@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""remote-clone-guard.py — substituto, no SERVIDOR Hetzner, do `gt tap guard cross-clone-block` do mini (ga-2hd02v.1.5; decisão Q4 do
+r"""remote-clone-guard.py — substituto, no SERVIDOR Hetzner, do `gt tap guard cross-clone-block` do mini (ga-2hd02v.1.5; decisão Q4 do
 Mayor: sessão remota só é liberada depois que existir um substituto). Hook PreToolUse (Bash, Edit, Write, MultiEdit, NotebookEdit).
 
 Contents
@@ -27,7 +27,15 @@ COMO DECIDE (os três estados — sei que pode / sei que não pode / não sei �
   opções (WOPT; `sudo -n` não é o `-n` do xargs) e só entendo o que está nela: opção que não está = não sei onde o comando começa, e o embrulho vale como
   lançador OPACO (abaixo). `find -exec`/`-ok` rodam no diretório do find; `-execdir`/`-okdir` rodam no de CADA achado, que não sei qual é → "não sei" (git de
   escrita ali só passa com `-C <caminho absoluto>`). `bash -c -e '…'`: o script é a primeira palavra depois do -c que não é opção. O número colado no
-  redirecionamento (`2>/dev/null`) é o descritor, não um argumento. Lançadores que não modelo (flock, ionice, ssh, su -c, parallel, script -c, trap, watch, tmux…; a lista OPAQUE)
+  redirecionamento (`2>/dev/null`) é o descritor, não um argumento.
+  O que o SHELL lê como texto não é operador nem some: `;` `&` `|` `(` `)` `<` `>` entre aspas ou depois de `\` (`echo '>' && git -C x commit`, `tr -d '<>' ; git …`, o `';'` e o `\;` do find)
+  são palavras, `$'…'` (com \xHH, \NNN, \uHHHH e os escapes de uma letra decodificados) e `$"…"` também, e a palavra vazia (`''`, `""`) fica no lugar (`git -C '' -C x commit`). Só
+  pontuação sem aspas é operador. Um redirecionamento leva UMA palavra como alvo (e o `$( )` dela roda); se em vez de palavra vem um operador (`git … >` sem alvo, que o shell recusa),
+  o operador segue valendo e o trecho é conferido. Aspa que não fecha (ou `\` no fim): o shell recusa a linha e só roda o que veio ANTES dela, salvo se a aspa está num comentário `#`, e então o que vem DEPOIS roda;
+  como o guarda não lê comentário, a aspa solta sai do texto e o resto é conferido como comando (o que vem antes dela é lido igual).
+  Onde o git escreve por ARGUMENTO, sem -C/--git-dir: em worktree (add/remove/move/lock/repair), clone, init, checkout-index, submodule, archive, bundle e format-patch TODA palavra é
+  tratada como caminho (também o valor de `--opção=valor` e o `-oVALOR` colado), e em QUALQUER subcomando o valor de --output/--prefix/--separate-git-dir/--lost-found/--file/--template
+  (junto ou no token seguinte); resolvido como o `-C` (URL `https://…` não é caminho). Lançadores que não modelo (flock, ionice, ssh, su -c, parallel, script -c, trap, watch, tmux…; a lista OPAQUE)
   são abertos com o diretório "não sei": o git dentro deles só passa se for leitura ou com `-C <caminho absoluto>`. Um embrulho com opção que não conheço vale como um deles.
   Falha do próprio guarda (exceção) → bloqueia, se o pedido cita git/file_path/notebook_path; um stdin que nem é JSON e não cita nenhum dos três
   LIBERA (lixo no stdin não derruba a sessão inteira; o Claude sempre manda JSON válido). O comando do hook é `python3 -I <este arquivo> || exit 2`,
@@ -45,7 +53,13 @@ LIMITES (é trava contra engano, não sandbox contra quem quer burlar). NÃO vej
   alheio (alias, filter, textconv, fsmonitor: uma leitura lá a executa). A lista OPAQUE é fechada: um lançador que não
   está nela (`lockrun git …`) esconde o git numa palavra que não abro. Falsos positivos que ficam (todos no lado fechado): git com diretório implícito atrás de um lançador da
   lista (`flock L git commit`), de um embrulho com opção que não conheço (`sudo --nova git commit`) ou de um `-execdir`/`-okdir` bloqueia; e `git --opção-nova VALOR -C
-  <seu clone> commit` bloqueia. Escreva `git -C <caminho absoluto do seu clone>`. O fecho de verdade (usuário Unix por sessão) é outro
+  <seu clone> commit` bloqueia; e, nos subcomandos de destino, TODA palavra vale como caminho: `git clone <clone alheio> <seu clone>/sub` e `git submodule add <caminho
+  no alheio> …` bloqueiam mesmo só LENDO do alheio. Escreva `git -C <caminho absoluto do seu clone>`.
+  Comentário `#` não é lido: o que vem depois dele é conferido como comando (`git status # depois; git -C <alheio> commit` bloqueia; um apóstrofo nele é só um caractere solto).
+  Destino que só vem em opção ou subcomando que a lista DEST/PATHOPT não tem (`config -f <arquivo>`, `fast-import --export-marks=…`, `pack-objects <base>`, `unpack-objects`…) NÃO é conferido:
+  rodado do clone próprio, passa. Também não vejo QUAL ref o git escreve, só ONDE ele roda: do clone PRÓPRIO, `git push origin --delete worker/<outra sessão>` (ou `:worker/<outra>`,
+  `push --force … HEAD:worker/<outra>`), `branch -D`, `update-ref`, `worktree prune` e `gc --prune=now` mexem no estado COMPARTILHADO (o espelho repo.git) sem citar o caminho do alheio.
+  `$'…'` só tem os escapes acima decodificados (`\cX` e o que não conheço ficam como estão). O fecho de verdade (usuário Unix por sessão, permissão por branch no remoto) é outro
   trabalho; ver o runbook.
 """
 from __future__ import annotations
@@ -98,7 +112,15 @@ FD = re.compile(r"(^|[\s;&|(])\d+(?=[<>])")  # `2>/dev/null`, `1>&2`: o número 
 SHELLY = re.compile(r"[$`*?\[{]")
 PIECE = re.compile(r"&&|\|\||\|&|;;|[;&|()]|[<>]+&?")
 SUBST, BACKTICK = re.compile(r"\$S([0-9a-f]*)\$"), re.compile(r"`([^`]*)`")
-HEREDOC = re.compile(r"(<<-?\s*(['\"]?)(\w+)\2[^\n]*)\n(.*?)\n[ \t]*\3[ \t]*(?=\n|$)", re.S)
+HEREDOC = re.compile(r"(?<!<)(<<-?\s*(['\"]?)(\w+)\2[^\n]*)\n(.*?)\n[ \t]*\3[ \t]*(?=\n|$)", re.S)
+PROT = {c: chr(0xF0000 + ord(c)) for c in "();<>|&'"}  # `;<>…` entre aspas ou depois de `\` é TEXTO: antes do shlex (que tira as aspas) vira um caractere de uso privado, e só depois volta (ver protect)
+UNPROT = str.maketrans({v: k for k, v in PROT.items()})
+ANSI = re.compile(r"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c.|.)", re.S)  # os escapes de `$'…'`
+ESC = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+# git que escreve onde o ARGUMENTO manda, sem -C nem --git-dir: `worktree remove ../outro`, `clone <repo> <outro>/x`, `init <outro>/x`, `checkout-index --prefix=<outro>/`…
+DEST = {"worktree", "init", "clone", "checkout-index", "submodule", "archive", "bundle", "format-patch"}  # nestes TODA palavra (e o valor de `--opção=valor`) pode ser o caminho
+PATHOPT = {"--output", "--prefix", "--separate-git-dir", "--lost-found", "--file", "--template"}  # em QUALQUER subcomando: a opção cujo valor é um caminho onde o git escreve
+URL = re.compile(r"\w+://")
 CONT = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")  # barra + newline com número ÍMPAR de barras: continuação de linha (com número par a última barra é a barra escapada)
 
 
@@ -197,14 +219,81 @@ def heredoc(m) -> str:
     return m.group(1) + ("" if m.group(2) else "\n: " + " ".join(x.group(0) for x in SUBST.finditer(hide(m.group(4)))))
 
 
+def ansi(m) -> str:
+    r"""Um escape de `$'…'`: \xHH, \NNN (octal), \uHHHH, \n, \t… O que não conheço fica como está (o bash também mantém a barra)."""
+    e = m.group(1)
+    if e[0] in "xuU" and len(e) > 1:
+        return chr(int(e[1:], 16))
+    if e[0] in "01234567":
+        return chr(int(e, 8) & 255)
+    return ESC.get(e, m.group(0))
+
+
+class Unclosed(ValueError):
+    """Aspa que não fecha (ou `\\` no fim): `pos` é onde ela abre no texto que o protect() leu."""
+
+    def __init__(self, pos: int):
+        super().__init__("aspas que não fecham")
+        self.pos = pos
+
+
+def protect(cmd: str) -> str:
+    """O shlex tira as aspas e a barra: `'>'` e `\\>` saem como `>`, igual a um `>` de verdade, e `''` sai como palavra vazia. Aqui cada `;&|()<>` que o SHELL lê como
+    texto (entre aspas, ou depois de `\\`) vira um caractere reservado (PROT), que words() devolve ao texto DEPOIS de decidir quem é operador. `$'…'` leva os escapes
+    decodificados (`$'\\x67it'` é git; `$'\\''` é uma aspa, não o fim) e `$"…"` perde o `$`. Unclosed = aspas que não fecham ou `\\` no fim (a posição vai junto)."""
+    out, i, q, qpos = [], 0, "", 0
+    while i < len(cmd):
+        c = cmd[i]
+        if q == "'":
+            q = "" if c == "'" else q
+            out.append(c if c == "'" else PROT.get(c, c))
+        elif q == '"' and c != "\\":
+            q = "" if c == '"' else q
+            out.append(c if c == '"' else PROT.get(c, c))
+        elif c == "\\" and i + 1 < len(cmd):  # dentro de aspas duplas ou fora: barra + o caractere seguinte é um par só
+            out += [c, PROT.get(cmd[i + 1], cmd[i + 1])]
+            i += 1
+        elif q:
+            out.append(c)  # barra solta no fim, dentro de aspas duplas: o laço acaba com a aspa aberta
+        elif c == "\\":
+            raise Unclosed(i)  # barra solta no fim, fora de aspas (as de dentro de aspas e as seguidas de caractere já foram tratadas acima)
+        elif c == "$" and (m := SUBST.match(cmd, i)):  # o `$S<hex>$` de hide(): inteiro, sem olhar a aspa que vem depois dele
+            out.append(m.group())
+            i = m.end() - 1
+        elif c == "$" and cmd[i + 1:i + 2] == '"':  # `$"…"` (tradução de locale) é só `"…"`: o `$` vai embora
+            pass
+        elif c == "$" and cmd[i + 1:i + 2] == "'":
+            j = i + 2
+            while j < len(cmd) and cmd[j] != "'":
+                j += 2 if cmd[j] == "\\" else 1
+            if j >= len(cmd):
+                raise Unclosed(i + 1)
+            out.append("'" + "".join(PROT.get(x, x) for x in ANSI.sub(ansi, cmd[i + 2:j])) + "'")
+            i = j
+        else:
+            if c in "'\"":
+                q, qpos = c, i
+            out.append(c)
+        i += 1
+    if q:
+        raise Unclosed(qpos)
+    return "".join(out)
+
+
 def words(cmd: str) -> list:
+    """As palavras do comando como (texto, operador?). operador = pontuação do SHELL (`;`, `&&`, `>`, `<(`…): `';'`, `\\;`, `'>'` e `''` são palavras, e a vazia FICA (`git -C '' -C x`).
+    Aspa que não fecha (ou `\\` no fim): o shell recusa a linha e só roda o que veio ANTES dela, a não ser que a aspa esteja num comentário `#` (que o guarda não lê como
+    comentário) e então o que vem DEPOIS roda. A aspa solta sai do texto e o resto é conferido como comando, as duas hipóteses de uma vez; o texto antes dela é lido igual."""
     cmd = FD.sub(r"\1", hide(CONT.sub(r"\1", HEREDOC.sub(heredoc, cmd))).replace("\n", " ; "))  # newline separa comandos; `\` + newline os junta
-    try:
-        lx = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-        lx.whitespace_split, lx.commenters = True, ""
-        return list(lx)
-    except ValueError:  # aspas que não fecham: o sh é quem vai dizer; aqui só não há como conferir por tokens, então separa na marra
-        return re.findall(r"[^\s;&|()]+|[;&|()]+", cmd.replace("'", "").replace('"', ""))
+    while True:  # termina: cada volta tira um caractere, e a próxima aspa solta só pode estar mais adiante (o que sobra de um tipo de aspa depois de tirar a solta é par ou tem uma só)
+        try:
+            text = protect(cmd)
+            break
+        except Unclosed as e:
+            cmd = cmd[:e.pos] + cmd[e.pos + 1:]
+    lx = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lx.whitespace_split, lx.commenters = True, ""
+    return [(t.translate(UNPROT), bool(t) and set(t) <= PUNCT) for t in lx]
 
 
 def wopt(w: str, seg: list):
@@ -278,6 +367,21 @@ def chdir(args: list, cwd, push: bool):
     return res(args[0] if args else "~", cwd)
 
 
+def dests(sub: str, rest: list) -> list:
+    """As palavras que dizem ONDE o git escreve quando o lugar vem como argumento (e não como -C/--git-dir): em DEST toda palavra, o valor de `--opção=valor` e o
+    `-oVALOR` colado; em qualquer subcomando o valor de PATHOPT (`--output=x`, `--prefix x`). URL (`https://…`) não é caminho."""
+    out, val = [], False
+    for t in rest:
+        name, eq, v = t.partition("=")
+        if val:  # o valor da opção anterior, no token seguinte
+            out, val = out + [t], False
+        elif name in PATHOPT:
+            out, val = (out + [v], False) if eq else (out, True)
+        elif sub in DEST:
+            out.append(v if t[:2] == "--" and eq else "" if t[:2] == "--" else t[2:] if t[:1] == "-" else t)
+    return [x for x in out if x and not URL.match(x)]
+
+
 def git_hit(seg: list, env: dict, cwd, terr: str, own):
     gd, wt, i, lost = env.get("GIT_DIR"), env.get("GIT_WORK_TREE"), 1, False
     runs = any(CFG_ENV.fullmatch(k) for k in env)  # o git deste comando pode rodar um programa que o guarda não vê (configuração injetada): leitura deixa de valer como leitura
@@ -309,7 +413,7 @@ def git_hit(seg: list, env: dict, cwd, terr: str, own):
     read = not lost and is_read(sub, rest)
     if read and not runs:
         return None
-    for t in [cwd] + [res(x, cwd) for x in (gd, wt) if x]:
+    for t in [cwd] + [res(x, cwd) for x in (gd, wt) if x] + [res(x, cwd) for x in dests(sub, rest)]:
         if t is None or (inside(t, terr) and not (own and inside(t, own))):
             return t, "git " + sub + (" (leitura com configuração que roda programa: -c, GIT_PAGER…)" if read else "")
     return None
@@ -321,12 +425,18 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
         return None, "comando aninhado fundo demais para conferir"
     st, stack, seg = {"cwd": cwd, "env": {}}, [], []
 
-    def one(seg: list, blind: bool = False):
-        for w in seg:  # $(…) e crases dentro de qualquer palavra rodam (até no valor de VAR=…): confere o miolo
+    def inner(ws: list):
+        for w in ws:  # $(…) e crases dentro de qualquer palavra rodam (até no valor de VAR=…, ou no alvo de um redirecionamento): confere o miolo
             for m in SUBST.finditer(w):
                 r = scan(bytes.fromhex(m.group(1)).decode(), st["cwd"], terr, own, depth + 1)
                 if r:
                     return r
+        return None
+
+    def one(seg: list, blind: bool = False):
+        r = inner(seg)
+        if r:
+            return r
         env, seg, b, opq = peel(seg)
         blind = blind or b
         if not seg:
@@ -360,7 +470,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
                     return scan(script[0], cwd, terr, own, depth + 1)
         elif c == "eval":
             return scan(" ".join(seg[1:]), cwd, terr, own, depth + 1)
-        elif c == "find" or c[:1] == "-":  # o `\;` do find fecha o trecho: um segundo `-exec …` chega aqui como PRIMEIRA palavra do trecho seguinte (ou depois de `-o`/`\)`)
+        elif c == "find":  # o `\;` e o `\(` do find são palavras (words() não os toma por operador do shell): todos os `-exec` do find estão neste trecho
             for j, t in enumerate(seg):
                 if t in ("-exec", "-execdir", "-ok", "-okdir"):  # -exec/-ok rodam no diretório do find; -execdir/-okdir no de CADA achado, que não sei qual é: cego
                     r = one(seg[j + 1:], blind or t.endswith("dir"))
@@ -371,15 +481,19 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
         return None
 
     skip, herestr = False, False
-    for tok in words(cmd) + [";"]:
-        if skip:  # alvo de redirecionamento
+    for tok, op in words(cmd) + [(";", True)]:  # o `;` do fim fecha o último trecho
+        if skip and not op:  # alvo de redirecionamento: só uma PALAVRA é alvo. Operador logo depois (`git … >` sem alvo, que o shell recusa) segue como operador: engolir o `;` do fim ou o `&&` deixava o trecho sem conferir
             skip = False
+            r = inner([tok])  # `> $(git -C x commit)`: o $( ) do alvo roda
+            if r:
+                return r
             if herestr and runs_text(seg):  # `bash <<< 'git -C x commit'`: a palavra é o script que o shell vai ler
                 r = scan(tok, st["cwd"], terr, own, depth + 1)
                 if r:
                     return r
             herestr = False
-        elif set(tok) <= PUNCT:  # o shlex junta pontuação colada (`);`, `&&(`, `2>&1`): separa de novo
+        elif op:  # o shlex junta pontuação colada (`);`, `&&(`, `2>&1`): separa de novo
+            skip = herestr = False  # um operador que chega com um redirecionamento esperando alvo não é o alvo
             for pc in PIECE.findall(tok):
                 if pc in SEPS or pc in ("(", ")"):
                     r = one(seg)

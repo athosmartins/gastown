@@ -10,7 +10,8 @@ USO
   GC_SESSION=exec:<cidade>/scripts/gc-session-ssh                (ou, no híbrido, `remote_exec` — patch em docs/pending-engine-window/)
   gc-session-ssh <op> <sessão> [args]        o engine chama assim, com o JSON do start na entrada padrão
   gc-session-ssh --dry-run start <sessão> < start.json     (ou GC_SSH_DRYRUN=1) imprime o que rodaria no host e NÃO conecta
-                                                           (`would_refuse`: a recusa de política — sessão real sem liberação… — que o start de verdade daria, ou null)
+                                                           (`would_refuse`: a recusa LOCAL de política — sessão real sem liberação… — que o start de verdade daria; null = nenhuma recusa
+                                                           local, NÃO "o start vai ser aceito": o sha e o --selfcheck do guarda só rodam no host, no start de verdade)
 
 O QUE FAZ
   Cada operação é UM ssh (ControlMaster em ~/.ssh/cm, o mesmo do mbp-run.sh) que leva um script sh pela entrada padrão; o

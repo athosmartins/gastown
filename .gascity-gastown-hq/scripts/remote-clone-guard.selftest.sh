@@ -13,8 +13,11 @@
 #   -exec depois do `\;`), na tabela de opções de CADA embrulho (sudo -n, xargs -a, stdbuf -o L, timeout --signal, nice -5…; opção que não conheço = lançador opaco),
 #   nas opções de topo do git que levam valor (--attr-source) e na palavra do shell no lugar do subcomando (`git $FLAGS -C x commit`), no `bash -c -e '…'` e no descritor de `2>/dev/null` (que não é argumento) · cfg — a LEITURA que traz configuração capaz de rodar programa
 #   (`-c alias.x=…`, `--config-env`, `-p`, `--exec-path`, GIT_CONFIG_*/GIT_PAGER/GIT_EXTERNAL_DIFF…) deixa de valer como leitura no clone alheio; chave só de exibição e o próprio clone seguem livres · msg — o texto da recusa · check — --selfcheck com settings bom e com cada defeito · hook — o comando de hook de
-#   verdade (`python3 -I <guarda> || exit 2`) sai 2 se o guarda trava, some ou tem erro de sintaxe (falha fechada), e 0 se libera.
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (86 mutantes); e
+#   verdade (`python3 -I <guarda> || exit 2`) sai 2 se o guarda trava, some ou tem erro de sintaxe (falha fechada), e 0 se libera · lex — o que o shell lê como TEXTO não vira operador nem
+#   some (subgrupos: lexq aspas e `\` · lexs redirecionamento sem alvo · lexe palavra vazia · lexd `$'…'`/`$"…"` · lexu aspa ou `\` que não fecha, também num comentário `#` · lexr `$( )` do alvo
+#   de redirecionamento · lexh heredoc/`<<<`/find · lexp os controles que NÃO bloqueiam) · dest — o lugar onde o git escreve vem como ARGUMENTO, sem -C (worktree remove ../outro,
+#   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp).
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (115 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 set -u
@@ -29,6 +32,7 @@ mkdir -p "$OWN/sub" "$OTH/sub" "$TERR/r/repo.git" "$OUT/.git"
 fails=0; n=0
 ok() { n=$((n+1)); if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; fails=$((fails+1)); fi; }
 group() { [ -z "${RCG_ONLY:-}" ] || case ",$RCG_ONLY," in *",$1,"*) return 0;; *) return 1;; esac; }
+grp() { group "$1" || group "$2"; }  # subgrupo OU o grupo inteiro (RCG_ONLY=lex roda todos os lex*, RCG_ONLY=lexq só um: cada mutante roda só o subgrupo que o cobre)
 mk() { python3 -c 'import json,sys; print(json.dumps({"tool_name": sys.argv[1], "cwd": sys.argv[2], "tool_input": {sys.argv[3]: sys.argv[4]}}))' "$@"; }
 run() {  # run PROJ < json   → RC, $T/err
   if [ -n "$1" ]; then (cd "$OWN" && CLAUDE_PROJECT_DIR="$1" python3 -I "$P" >"$T/o" 2>"$T/err"); else (cd "$OWN" && python3 -I "$P" >"$T/o" 2>"$T/err"); fi; RC=$?
@@ -113,6 +117,8 @@ g_evade() {
   b 2 "evade: depois de |" "echo x | git -C $OTH commit -F -"
   b 2 "evade: dentro de ( )" "(git -C $OTH commit)"
   b 2 "evade: ( ); colado" "(cd $OTH; git commit);"
+  b 2 "evade: ); colado e o git que vem depois (a pontuação colada separa, não engole a próxima palavra)" "(true); git -C $OTH commit -m y"
+  b 2 "evade: );git colado dos dois lados" "(true);git -C $OTH commit -m y"
   b 2 "evade: cd && git" "cd $OTH && git commit"
   b 2 "evade: cd; git" "cd $OTH; git commit"
   b 2 "evade: pushd" "pushd $OTH; git commit"
@@ -302,6 +308,97 @@ g_wrap() {  # gate ga-iczduy (rodada 2): o MESMO defeito das rodadas anteriores 
     b 2 "wrap: o descritor some, o argumento que é número fica: $c" "$c"
   done
 }
+g_lex() {  # gate ga-cgu53f (rodada 3): o shlex tira as aspas e a barra, então `'>'`, `\>` e `''` chegavam ao guarda como um `>` de verdade ou como NADA; o que o shell lê como texto tem que continuar sendo palavra
+  local c NL=$'\n'
+  if grp lexq lex; then
+  for c in "echo '>' && git -C $OTH commit -m y" "echo '>>' && git -C $OTH commit -m y" "echo '<' && git -C $OTH commit -m y" "echo '<>' && git -C $OTH commit -m y" "echo '&>' && git -C $OTH commit -m y" \
+           "echo \\> ; git -C $OTH commit -m y" "echo \\< ; git -C $OTH commit -m y" "echo \\>x ; git -C $OTH commit -m y" "echo \">\" && git -C $OTH commit -m y" "tr -d '<>' ; git -C $OTH commit -m y" \
+           "echo '>' || git -C $OTH commit -m y" "echo '>' | git -C $OTH commit -m y" "echo '>' & git -C $OTH commit -m y" "echo '<'${NL}git -C $OTH commit -m y" "echo 'a > b' ; git -C $OTH commit -m y" \
+           "echo '>' ; echo '<' ; git -C $OTH commit -m y" "echo '(' ; git -C $OTH commit -m y" "echo ')' ; git -C $OTH commit -m y" "echo '&&' ; git -C $OTH push" "echo \"a;b\" ; git -C $OTH commit -m y" \
+           "bash -c \"echo '>' && git -C $OTH commit -m y\"" "sh -c \"git -C $OTH commit -m '>'\"" "eval \"echo '>' ; git -C $OTH commit -m y\"" "ssh host \"echo '>' ; git -C $OTH commit\""; do
+    b 2 "lex: operador entre aspas ou com barra é palavra, o git depois dele é conferido: $c" "$c"
+  done
+  for c in "xargs -I '>' git -C $OTH commit -m y" "xargs -I '>>' git -C $OTH commit -m y" "xargs -I '<' git -C $OTH commit -m y" "xargs -I '<>' git -C $OTH commit -m y" "xargs -I '&>' git -C $OTH commit -m y" \
+           "xargs -I \\> git -C $OTH commit -m y" "xargs -I \">\" git -C $OTH commit -m y" "xargs -d '>' git -C $OTH commit -m y" "xargs -E '<' git -C $OTH commit -m y" \
+           "(cd $OTH && echo ')' && git commit -m y)" "echo '(' ; cd $OTH ; echo ')' ; git commit -m y" "(cd $OTH && echo \\) && git commit -m y)" "echo \"(\" ; cd $OTH ; echo \")\" ; git commit -m y"; do
+    b 2 "lex: o operador entre aspas ou com barra como VALOR de opção não engole o git, e o ')' de texto não desfaz o cd: $c" "$c"
+  done
+  fi
+  if grp lexs lex; then
+  for c in "git -C $OTH commit -m '>'" "git -C $OTH commit -m '<'" "git -C $OTH commit -m '>>'" "git -C $OTH commit -m '<>'" "git -C $OTH commit -m '&>'" "git -C $OTH tag -a v1 -m '<'" "git -C $OTH commit -m \">\"" "git -C $OTH commit -m \\>" \
+           "git -C $OTH commit -m ';'" "git -C $OTH commit -m '&&'" "git -C $OTH commit -m '|'" "git -C $OTH commit >" "git -C $OTH commit <" "git -C $OTH commit -m y 2>" "echo hi > && git -C $OTH commit -m y" \
+           "echo hi > ; git -C $OTH commit -m y" "echo hi >> | git -C $OTH commit -m y" "echo hi > f ; git -C $OTH commit -m y" "echo hi >f && git -C $OTH commit -m y"; do
+    b 2 "lex: operador no fim ou sem alvo não engole o terminador, e o alvo de verdade é só uma palavra: $c" "$c"
+  done
+  fi
+  if grp lexe lex; then
+  for c in "git -C '' -C $OTH commit -m y" "git -C \"\" -C $OTH commit -m y" "git -C $OTH -C '' commit -m y" "git -C '' -C '' -C $OTH commit" "git -C $OTH commit -m ''" "echo '' && git -C $OTH commit -m y" "echo \"\" ; git -C $OTH commit -m y" \
+           "sudo -u '' git -C $OTH commit -m y" "env -u '' git -C $OTH commit -m y" "nice -n '' git -C $OTH commit -m y" "git -c '' -C $OTH commit -m y" "git --git-dir '' -C $OTH commit" "cd '' ; git -C $OTH commit -m y" \
+           "xargs -I '' git -C $OTH commit"; do
+    b 2 "lex: palavra vazia ('' ou \"\") fica no lugar e não desloca o que vem depois: $c" "$c"
+  done
+  fi
+  if grp lexd lex; then
+  for c in "\$'git' -C $OTH commit -m y" "\$\"git\" -C $OTH commit -m y" "\$'\\x67it' -C $OTH commit -m y" "\$'\\147it' -C $OTH commit -m y" "g\$'i't -C $OTH commit -m y" "git -C \$'$OTH' commit -m y" \
+           "echo \$'\\'' ; git -C $OTH commit -m y ; echo \$'\\''" "echo \$'\\'' ; git -C $OTH commit -m y ; echo \\'" "echo \$(git -C $OTH commit -m y)'x'"; do
+    b 2 "lex: \$'…' e \$\"…\" são palavras do shell (o \$ some, os escapes valem), e o \$( ) colado numa aspa fica inteiro: $c" "$c"
+  done
+  fi
+  if grp lexu lex; then
+  for c in "git -C '' -C $OTH commit -m y ; echo 'x" "\$'git' -C $OTH commit -m y${NL}echo 'oops" "git -C $OTH commit -m y ; echo 'x" "git -C $OTH -C '' commit -m y ; echo \"x" \
+           "bash -c 'git -C $OTH commit -m y' # it's" "xargs -I '>' git -C $OTH commit -m y # it's" "bash -c 'git -C $OTH commit -m y' \\" "git -C $OTH commit -m y \\" "eval 'git -C $OTH commit -m y' # it's" \
+           "git status # it's${NL}git -C $OTH commit -m y" "git status # say \"hi${NL}git -C $OTH commit -m y" "git status # don't \"x${NL}git -C $OTH commit -m y" "echo \"it's${NL}git -C $OTH commit -m y" "echo \$'x${NL}git -C $OTH commit -m y"; do
+    b 2 "lex: aspa que não fecha (ou \\ no fim): sai do texto e o resto é conferido, o shell pode ter lido a aspa num comentário #: $c" "$c"
+  done
+  for c in "git status # it's fine" "git commit -m y # don't" "git status \\" "git log # it's ; git -C $OTH log" "git -C $OTH log # it's" "git commit -m \"it's\" # don't" "git status # \"x" "git status # it's \"x" "ls # it's" "echo \"it's\" ; git status" "git status ${NL}# it's"; do
+    b 0 "pass: lex: aspa ou \\ solto no fim de um comando que não escreve em clone alheio segue livre: $c" "$c"
+  done
+  fi
+  if grp lexr lex; then
+  for c in "echo hi > \$(git -C $OTH commit -m y)" "echo hi >> \$(git -C $OTH commit -m y)" "cat < \$(git -C $OTH commit -m y)" "echo hi 2> \$(git -C $OTH commit -m y)" "echo hi >| \$(git -C $OTH commit -m y)" \
+           "echo hi >& \$(git -C $OTH commit -m y)" "cat <<< \$(git -C $OTH commit -m y)" "echo hi > \`git -C $OTH commit -m y\`"; do
+    b 2 "lex: o \$( ) do alvo de um redirecionamento roda: $c" "$c"
+  done
+  fi
+  if grp lexh lex; then
+  b 2 "lex: <<< não abre heredoc (o que vem depois é comando)" "cat <<< EOF${NL}git -C $OTH commit -m y${NL}EOF"
+  b 2 "lex: <<<PALAVRA colado não abre heredoc" "cat <<<EOF${NL}git -C $OTH commit -m y${NL}EOF"
+  for c in "find . '(' -name a ')' -exec git -C $OTH commit -m x ';'" "find . -name x -exec echo {} ';' -exec git -C $OTH commit -m x ';'" "find . -exec git -C $OTH commit -m '>' \\;" "eval echo hi ';' git -C $OTH commit"; do
+    b 2 "lex: find/eval com \`;\` entre aspas ou com barra: $c" "$c"
+  done
+  fi
+  if grp lexp lex; then
+  for c in "git -C '' commit -m y" "git -C \"\" commit -m y" "git -C $OWN -C '' commit -m y" "echo '>' && git commit -m y" "echo \\> ; git commit -m y" "git commit -m '>'" "git commit -m '<>'" "git commit -m 'a; b && c | d (e) > f'" \
+           "git commit -m 'git -C $OTH commit'" "git commit -m \"git -C $OTH push; ok\"" "echo '>' ; git -C $OTH log" "tr -d '<>' ; git add -A" "git commit -m ''" "echo '' && git commit -m y" "git commit -m \$'a\\nb'" "git commit -m \$'it\\'s'" \
+           "cat <<< hello && git status" "cat <<< x; cat <<EOF${NL}git -C $OTH commit -m y${NL}EOF" "echo a >| $OWN/f && git commit -m y" "git commit -m x > $OWN/log; git status" "git status > $OWN/o 2>&1" "sudo -u '' git commit -m y" \
+           "echo hi > '' ; git commit -m y" "echo hi > \$(mktemp)" "git -C $OTH log > \$(mktemp)" "cat <<< \$(echo hi)" "bash -c \"echo '>' && git commit -m y\"" "git commit -m \$\"mensagem\"" "echo \$'git' -C $OTH commit"; do
+    b 0 "pass: lex: o que o shell lê como texto não vira operador nem some: $c" "$c"
+  done
+  fi
+}
+g_dest() {  # gate ga-cgu53f (rodada 3, medium): o lugar onde o git escreve vem como ARGUMENTO (sem -C): worktree remove ../outro, clone <repo> <outro>/x, init <outro>/x, checkout-index --prefix=<outro>/
+  local c
+  if grp destb dest; then
+  for c in "git worktree remove --force ../other" "git worktree remove $OTH" "git worktree move $OTH ../x" "git worktree move ../x $OTH/sub" "git worktree add $OTH/sub" "git worktree add -b nb $OTH/sub" "git worktree lock ../other" \
+           "git worktree unlock $OTH" "git worktree repair $OTH" "git clone $OWN $OTH/sub" "git clone --depth 1 https://example.com/x.git $OTH/sub" "git clone $OWN ../other/sub" "git clone https://example.com/x.git ../other" \
+           "git clone https://example.com/x.git $OTH --depth 1" "git init $OTH/sub" "git init --bare $OTH/sub.git" "git init --separate-git-dir=$OTH/g x" "git init --separate-git-dir $OTH/g x" "git checkout-index --prefix=$OTH/ -a" \
+           "git checkout-index -a --prefix $OTH/" "git archive -o $OTH/a.tar HEAD" "git archive --output=$OTH/a.tar HEAD" "git archive -o$OTH/a.tar HEAD" "git bundle create $OTH/b.bundle HEAD" "git format-patch -o $OTH HEAD~1" \
+           "git format-patch -o$OTH HEAD~1" "git format-patch --output-directory=$OTH HEAD~1" "git submodule add ./x $OTH/s" "git diff --output=$OTH/f" "git log --output=$OTH/f" "git show --output $OTH/f" "git diff --output $OTH/f" \
+           "git worktree add \$X" "git worktree remove \"\$WT\"" "git init \$D" "git archive -o \$F HEAD" "git diff --output=\$F" "git worktree add $TERR/r/repo.git/x" "git clone $OWN $TERR/r/wt/nova" "cd $OWN && git worktree add ../nova"; do
+    b 2 "dest: o destino que vem como argumento é conferido: $c" "$c"
+  done
+  b 2 "dest: clone com origem no clone alheio bloqueia (falso positivo ASSUMIDO: não separo a origem do destino)" "git clone $OTH $OWN/sub"
+  fi
+  if grp destp dest; then
+  for c in "git worktree list" "git worktree list --porcelain" "git worktree add $OUT/wt" "git worktree remove $OUT/wt" "git worktree add -b nb $OUT/wt" "git clone https://example.com/x.git" "git clone https://example.com/x.git sub" \
+           "git clone 'https://example.com/r.git?x=1' sub" "git clone git@example.com:x/y.git $OWN/sub" "git clone ssh://git@example.com/x/y.git $OUT/y" "git init" "git init $OWN/sub" "git init $OUT/new" "git init --separate-git-dir=$OUT/g x" \
+           "git checkout-index --prefix=$OWN/x/ -a" "git checkout-index -a --prefix $OWN/x/" "git archive -o $OWN/a.tar HEAD" "git archive -o $OUT/a.tar HEAD" "git archive --output=$OWN/a.tar HEAD" "git diff --output=$OWN/f" "git log --output=$OUT/f" \
+           "git bundle create $OUT/b HEAD" "git format-patch -o $OWN/patches HEAD~1" "git format-patch -o$OWN/patches HEAD~1" "git submodule add ./x $OWN/s" "git commit -m \"veja $OTH/arquivo\"" "git commit -m x $OWN/f" \
+           "git -C $OTH worktree list" "git -C $OTH log --oneline -- $OTH/x" "git config user.name 'A B'" "git config alias.x '!git log *'" "git -C $OWN worktree add $OUT/wt" "git -C $OUT/repo worktree add $OUT/wt2"; do
+    b 0 "pass: dest: o que não aponta para outro clone segue livre: $c" "$c"
+  done
+  fi
+}
 g_cfg() {  # parecer de segurança do push da rodada 1: leitura que TRAZ configuração capaz de rodar programa (alias, pager, fsmonitor…) não é leitura
   local c
   for c in "git -C $OTH -c alias.log='!git commit -m x' log" "git -C $OTH -c core.pager='sh -c x' log" "git -C $OTH -c core.fsmonitor=/tmp/x status" \
@@ -427,7 +524,7 @@ g_hook() {  # o comando que vai no settings do servidor
   c="python3-que-nao-existe -I $P || exit 2"; sh -c "$c" <<<"$js" >/dev/null 2>&1; [ $? = 2 ]; ok $? "hook: python ausente (127) vira 2"
 }
 
-all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; group cfg && g_cfg; group tools && g_tools; group msg && g_msg
+all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg
         group check && g_check; group hook && g_hook; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
@@ -510,7 +607,6 @@ echo "== $((n-fails))/$n ok =="
   mutant cfg "toda chave de -c vale como segura" 's/CFG_SAFE = re.compile(r"(?:color|advice)/CFG_SAFE = re.compile(r".*|(?:color|advice)/'
   mutant cfg "nenhuma chave de -c vale como segura (os controles que passam importam)" 's/CFG_SAFE = re.compile(r"(?:color|advice)/CFG_SAFE = re.compile(r"(?!)(?:color|advice)/'
   mutant wrap "find -execdir/-okdir rodam no diretório do find (não ficam cegos)" 's/one(seg\[j + 1:\], blind or t.endswith("dir"))/one(seg[j + 1:], blind)/'
-  mutant wrap "o segundo -exec (primeira palavra do trecho depois do \;) não é aberto" 's/        elif c == "find" or c\[:1\] == "-":/        elif c == "find":/'
   mutant wrap "opção que não conheço de embrulho vira opção sem argumento" 's/            if name not in flag | arg | joined:/            if False:/'
   mutant wrap "sudo -n volta a levar argumento (a tabela única de antes)" 's/"-C -c -D -g -h -p -R -r -T -t -U -u --close-from/"-n -C -c -D -g -h -p -R -r -T -t -U -u --close-from/'
   mutant wrap "-- não encerra as opções do embrulho" 's/        if t == "--":/        if False:/'
@@ -525,12 +621,42 @@ echo "== $((n-fails))/$n ok =="
   mutant wrap "o descritor de 2>/dev/null conta como argumento" 's/^FD = re.compile(.*)  #/FD = re.compile(r"(?!)")  #/'
   mutant wrap "número com espaço antes do > (argumento!) é tratado como descritor" 's/\\d+(?=\[<>\])/\\d+\\s*(?=[<>])/'
   mutant wrap "palavra do shell na posição do subcomando do git não esconde um -C" 's/    if SHELLY.search(sub):/    if False:/'
+  mutant lexq "aspas simples: o ;<>… dentro delas volta a ser operador" "s/out.append(c if c == \"'\" else PROT.get(c, c))/out.append(c)/"
+  mutant lexq "aspas duplas: o ;<>… dentro delas volta a ser operador" "s/out.append(c if c == '\"' else PROT.get(c, c))/out.append(c)/"
+  mutant lexq "barra + caractere (\\>): o caractere escapado volta a ser operador" 's/out += \[c, PROT.get(cmd\[i + 1\], cmd\[i + 1\])\]/out += [c, cmd[i + 1]]/'
+  mutant lexq "quem é operador é decidido DEPOIS de devolver os caracteres protegidos" 's/bool(t) and set(t) <= PUNCT) for t in lx\]/bool(t) and set(t.translate(UNPROT)) <= PUNCT) for t in lx]/'
+  mutant lexs "redirecionamento sem alvo (> no fim) engole o terminador" 's/if skip and not op:/if skip:/'
+  mutant lexs "operador que chega com redirecionamento esperando alvo não zera o alvo" 's/^\( *\)skip = herestr = False  # um operador.*/\1pass/'
+  mutant lexe "a palavra vazia ('' ou \"\") some da lista de palavras" 's/ for t in lx\]/ for t in lx if t]/'
+  mutant lexe "a palavra vazia vale como operador" 's/(t.translate(UNPROT), bool(t) and set(t)/(t.translate(UNPROT), set(t)/'
+  mutant lexd "\$'…' não é aberto (o \$ fica e o git vira \$git)" "s/elif c == \"\\\$\" and cmd\[i + 1:i + 2\] == \"'\":/elif False:/"
+  mutant lexd "\$\"…\" não perde o \$" "s/elif c == \"\\\$\" and cmd\[i + 1:i + 2\] == '\"':/elif False:/"
+  mutant lexd "escape hexadecimal de \$'…' não é decodificado" 's/return chr(int(e\[1:\], 16))/return m.group(0)/'
+  mutant lexd "escape octal de \$'…' não é decodificado" 's/return chr(int(e, 8) & 255)/return m.group(0)/'
+  mutant lexd "aspa escapada dentro de \$'…' (\\') fecha o \$'…'" 's/j += 2 if cmd\[j\] == "\\\\" else 1/j += 1/'
+  mutant lexd "\$S<hex>\$ de um \$( ) colado numa aspa perde o \$ final" 's/elif c == "\$" and (m := SUBST.match(cmd, i)):/elif False:/'
+  mutant lexu "aspa que não fecha: em vez de sair do texto ela fecha no fim (o que vem depois, até a linha seguinte, vira texto)" 's/cmd = cmd\[:e.pos\] + cmd\[e.pos + 1:\]/cmd += cmd[e.pos]/'
+  mutant lexu "aspa que não fecha: nada a conserta (o ValueError sobe e o pedido todo é bloqueado)" 's/cmd = cmd\[:e.pos\] + cmd\[e.pos + 1:\]/raise/'
+  mutant lexu "aspa que não fecha: a que sobra no fim do texto não é percebida" 's/^    if q:$/    if False:/'
+  mutant lexu "\\ solto no fim (fora de aspas) não é percebida" 's/^\( *\)raise Unclosed(i)  # barra solta no fim.*/\1out.append(c)/'
+  mutant lexu "\$'… que não fecha não é percebido (o resto vira texto dentro dele)" 's/raise Unclosed(i + 1)/pass/'
+  mutant lexr "o \$( ) do alvo de um redirecionamento não roda" 's/^\( *\)r = inner(\[tok\])  # .*/\1r = None/'
+  mutant lexh "<<< volta a abrir heredoc (esconde os comandos depois dele)" 's/^HEREDOC = re.compile(r"(?<!<)/HEREDOC = re.compile(r"/'
+  mutant wrap,lexh "o segundo -exec (depois do \;) não é aberto" 's/r = one(seg\[j + 1:\], blind or t.endswith("dir"))/return one(seg[j + 1:], blind or t.endswith("dir"))/'
+  mutant destb "o destino que vem como argumento não é conferido" 's/ + \[res(x, cwd) for x in dests(sub, rest)\]//'
+  mutant destb "--output/--prefix/--separate-git-dir (PATHOPT) não são lidos" 's/        elif name in PATHOPT:/        elif False:/'
+  mutant destb "toda palavra de worktree/clone/init/checkout-index… não conta como destino" 's/        elif sub in DEST:/        elif False:/'
+  mutant destb "worktree sai da lista DEST (git worktree remove ../outro)" 's/^DEST = {"worktree", /DEST = {/'
+  mutant destb "-oVALOR (colado) não é lido" 's/ else t\[2:\] if t\[:1\] == "-" else t)/ else "" if t[:1] == "-" else t)/'
+  mutant destb "--opção VALOR (valor no token seguinte) não é lido" 's/if eq else (out, True)/if eq else (out, False)/'
+  mutant destb "--opção=VALOR não é lido" 's/out, val = (out + \[v\], False) if eq else/out, val = (out, False) if eq else/'
+  mutant destp "URL (https://…) vira caminho" 's/ and not URL.match(x)\]/]/'
   mutant check "selfcheck ignora campo extra do hook (if, async…)" 's/ and set(h) <= {"type", "command", "timeout"}//'
   mutant check "selfcheck ignora campo extra do grupo" 's/ and set(g) <= {"matcher", "hooks"}//'
   mutant check "selfcheck não exige type=command" 's/ and h.get("type") == "command"//'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
-  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,cfg,tools,msg,check" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }
