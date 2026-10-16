@@ -113,6 +113,12 @@ HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 # kickstart -k (un-stick) + alert. Override via DPW_HEARTBEAT; a daemon NOT listed is
 # wedge-unchecked.
 #
+# ga-29ssni — refino-gate-dispatcher: 1200 s = 6.7x o ciclo de 180 s do plist e bem abaixo do que um pendurão custa
+# (ilimitado). O sweep dele ESPERA até 20 min pelo veredito do revisor, então o dispatcher carimba o heartbeat a cada
+# volta do laço de espera (refino-gate-dispatcher.sh `_refino_hb`) — a janela de silêncio de uma revisão saudável é uma
+# volta (30 s + as chamadas bd/gc dela), não os 20 min. Arquivo ausente = sem veredito de wedge (`_log_age` devolve
+# vazio), então o primeiro deploy não dispara kickstart antes de o dispatcher criar o arquivo.
+#
 # The heartbeat file does NOT need to be a dedicated touch-file — a script's normal
 # launchd-captured stdout (StandardOutPath, "*.out") works too, PROVIDED the script logs
 # unconditionally as its first action in main(), before any early-exit (kill-switch,
@@ -124,6 +130,7 @@ DPW_HEARTBEAT="${DPW_HEARTBEAT:-com.gascity.pilot|$HQ/.gc/logs/pilot-dispatcher.
 com.gascity.inflight-reclaim-guard|$HQ/.gc/logs/inflight-reclaim-guard-launchd.out|1500
 com.gascity.context-check-dispatcher|$HQ/.gc/logs/context-check-dispatcher.log|3000
 com.gascity.quality-gate-dispatcher|$HQ/.gc/logs/quality-gate-dispatcher.heartbeat|600
+com.gascity.refino-gate-dispatcher|$HQ/.gc/logs/refino-gate-dispatcher.heartbeat|1200
 com.gascity.auto-refino-dispatcher|$HQ/.gc/logs/auto-refino-dispatcher.log|1500
 com.gascity.story-delivery|$HQ/.gc/logs/story-delivery.log|1500
 com.gascity.approved-state-reconciler|$HQ/.gc/logs/approved-state-reconciler.out|3000
@@ -1572,6 +1579,35 @@ GCSTUB20
     esac
   done
   unset _gap_lbl _gap_line
+
+  echo "Scenario 22b (ga-29ssni): real default DPW_HEARTBEAT covers refino-gate-dispatcher, and the file is the one the dispatcher stamps"
+  # Três coisas precisam ser verdade juntas, ou a entrada é decoração: (a) o rótulo tem entrada com arquivo + limite
+  # numérico, (b) o rótulo também está em DPW_CRITICAL (o laço só itera sobre ele), (c) o dispatcher REALMENTE grava
+  # esse arquivo — um nome divergente faz o watchdog ler "arquivo ausente" para sempre, que `_log_age` trata como
+  # "sem veredito" (silêncio, nunca alarme), então a cobertura pareceria viva e não existiria.
+  _rg_lbl="com.gascity.refino-gate-dispatcher"
+  _rg_line="$(printf '%s\n' "$_REAL_DEFAULT_HEARTBEAT" | awk -F'|' -v l="$_rg_lbl" '$1==l{print; exit}')"
+  _rg_file="$(printf '%s' "$_rg_line" | awk -F'|' '{print $2}')"
+  _rg_max="$(printf '%s' "$_rg_line" | awk -F'|' '{print $3}')"
+  if [ -n "$_rg_line" ]; then ok "DPW_HEARTBEAT default covers $_rg_lbl ($_rg_line)"; else bad "DPW_HEARTBEAT default MISSING an entry for $_rg_lbl"; fi
+  case "$_rg_max" in ''|*[!0-9]*) bad "$_rg_lbl heartbeat threshold is not numeric ([$_rg_max])" ;; *) ok "$_rg_lbl heartbeat threshold is numeric ($_rg_max s)" ;; esac
+  # O limite tem de cobrir uma volta saudável do laço de espera (30 s + chamadas) e ficar longe dos 20 min de espera.
+  if [ "${_rg_max:-0}" -ge 600 ] 2>/dev/null && [ "${_rg_max:-99999}" -le 1800 ] 2>/dev/null; then
+    ok "$_rg_lbl threshold ${_rg_max}s is inside the sane window (600-1800 s)"
+  else
+    bad "$_rg_lbl threshold ${_rg_max}s is outside 600-1800 s (too tight kills healthy reviews; too loose never catches a hang)"
+  fi
+  case " $_REAL_DEFAULT_CRITICAL " in
+    *" $_rg_lbl "*) ok "$_rg_lbl is also in DPW_CRITICAL (heartbeat entry is reachable)" ;;
+    *) bad "$_rg_lbl has a heartbeat entry but is NOT in DPW_CRITICAL (dead config)" ;;
+  esac
+  _rg_disp="$(cd "$(dirname "$0")" && pwd)/../packs/town-deltas/assets/refino-gate-dispatcher.sh"
+  if [ -r "$_rg_disp" ] && grep -qF "$(basename "$_rg_file")" "$_rg_disp"; then
+    ok "refino-gate-dispatcher.sh stamps $(basename "$_rg_file") — the same file the watchdog reads"
+  else
+    bad "refino-gate-dispatcher.sh does not mention $(basename "$_rg_file") — the watchdog would read a file nobody writes"
+  fi
+  unset _rg_lbl _rg_line _rg_file _rg_max _rg_disp
 
   echo "Scenario 23 (ga-g92h): _exit_class distinguishes OOM-killed (137) from a real failure"
   # Provenance checks off (matches the imp17 block's own convention above) --

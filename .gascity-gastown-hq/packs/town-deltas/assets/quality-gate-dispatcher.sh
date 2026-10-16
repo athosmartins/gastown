@@ -59,6 +59,22 @@ _QHC_SCRIPT="${GC_CITY}/packs/town-deltas/assets/quiet-hours-check.sh"
 [ -r "$_QHC_SCRIPT" ] && { source "$_QHC_SCRIPT" 2>/dev/null; } || true
 unset _QHC_SCRIPT
 
+# ga-29ssni: teto de tempo para `gc session new` (os 3 spawns de reviewer abaixo). Sem teto, um Dolt que não
+# responde prendia este processo para sempre. Lib irmã, carregada pelo diretório DESTE arquivo (não por GC_CITY),
+# no mesmo molde fail-soft de cima: `source` de arquivo ausente mata um `set -e` antes de qualquer `|| true`.
+# Lib ausente → gate_bounded_spawn vira passagem direta (spawn SEM teto, como era antes) e gate_spawn_err_is_timeout
+# responde sempre 0: derrubar todo spawn do gate por um arquivo faltando seria pior que o bug. O aviso sai em toda
+# execução enquanto a lib faltar, no stderr do launchd (este trecho roda antes do `exec >> "$LOG"`).
+_GATE_SNB_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/session-new-bounded.lib.sh" || true
+if [ -r "$_GATE_SNB_LIB" ]; then
+  source "$_GATE_SNB_LIB"
+else
+  echo "WARN: ga-29ssni: session-new-bounded.lib.sh ausente/ilegível ($_GATE_SNB_LIB) — 'gc session new' do gate roda SEM teto de tempo" >&2
+  gate_bounded_spawn() { "$@"; }
+  gate_spawn_err_is_timeout() { printf '0'; }
+fi
+unset _GATE_SNB_LIB
+
 # ga-dtecvq: the queue order this sweep computed is PUBLISHED (gate_publish_queue_order) so the
 # gate-recovery-watchdog can prove a queued marker is invisible to the dispatcher without
 # inferring it from claim order. Same [ -r ] source-fail-soft convention as the libs above; the
@@ -1227,7 +1243,7 @@ respawn_reviewer_slot() {
   local _rev=$(( _idx + 1 ))
   local _err_file="/tmp/gate-reviewer-respawn-err-$$.${_idx}"
   local _json _new_sid _rs_rc _rs_emb_rc
-  _json=$(gc --city "$GC_CITY" session new gate-reviewer \
+  _json=$(gate_bounded_spawn gc --city "$GC_CITY" session new gate-reviewer \
     --no-attach \
     --title "gate-reviewer-${_rev} (re-convened): $BRANCH" \
     --json \
@@ -4947,10 +4963,17 @@ EOF_IDS
 # genuinely broken spawn still reaches gate-status:error after 3 attempts,
 # same as every other pattern here — this widens what gets a retry, not
 # whether the cap exists.
+#
+# ga-29ssni: `spawn_timeout:` (a linha que gate_bounded_spawn escreve quando `gc session new` estoura o teto de
+# GATE_SPAWN_TIMEOUT_SECS) também é transitório: um Dolt lento/pendurado é a mesma família de "invalid connection", e
+# o requeue entre varreduras (limitado por GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS) é o tratamento certo — o marker volta
+# para a fila em vez de parar em gate-status:error por um pendurão. O texto é literal de propósito (não lê a variável
+# da lib): se a lib faltar, esta função continua definida e não quebra sob `set -u`; o selftest
+# session-new-bounded.selftest.sh trava os dois textos iguais.
 is_transient_spawn_error() {
   local err_text="${1:-}"
   case "$err_text" in
-    *"invalid connection"*|*"read tcp"*|*"broken pipe"*|*"connection reset"*|*"dial tcp"*|*"connection refused"*|*"i/o timeout"*|*"native_store_unavailable"*)
+    *"invalid connection"*|*"read tcp"*|*"broken pipe"*|*"connection reset"*|*"dial tcp"*|*"connection refused"*|*"i/o timeout"*|*"native_store_unavailable"*|*"spawn_timeout:"*)
       printf '1' ;;
     *)
       printf '0' ;;
@@ -19024,7 +19047,7 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
   # NOTE: this loop runs at top-level script scope (not a function), so we do
   # NOT use `local` here — `local` outside a function errors to stderr.
   _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}"
-  SESSION_JSON=$(gc --city "$GC_CITY" session new gate-reviewer \
+  SESSION_JSON=$(gate_bounded_spawn gc --city "$GC_CITY" session new gate-reviewer \
     --no-attach \
     --title "gate-reviewer-$i: $BRANCH" \
     --json \
@@ -19055,8 +19078,13 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
   # cross-sweep gate_spawn_failure_requeue_or_error path below.
 # SELFTEST-EXTRACT spawn-retry-loop: BEGIN
   _spawn_retry_n=0
+  # ga-29ssni: um spawn que ESTOUROU o teto não é repetido aqui. Exit 124 é o `timeout` matando o CLI, não "a sessão
+  # não foi criada" — o `gc session new` cria o bead da sessão antes de terminar, então repetir às cegas abre um
+  # segundo reviewer (mesma regra do Pilot, ga-oa004t). Quem decide é o requeue entre varreduras
+  # (gate_spawn_failure_requeue_or_error), que já tem teto de tentativas.
   while [ -z "$SESSION_ID" ] \
       && [ "$_spawn_retry_n" -lt "$GATE_SPAWN_RETRY_MAX" ] \
+      && [ "$(gate_spawn_err_is_timeout "$_spawn_err")" != "1" ] \
       && [ "$(is_transient_spawn_error "$_spawn_err")" = "1" ]; do
     _spawn_retry_n=$((_spawn_retry_n + 1))
     _spawn_backoff_secs=$((GATE_SPAWN_RETRY_BACKOFF_SECS * (1 << (_spawn_retry_n - 1))))
@@ -19067,7 +19095,7 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
     # them). Ask Dolt, bounded (GATE_SPAWN_DOLT_WAIT_SECS per retry, 0 = off), then retry anyway.
     gate_spawn_wait_dolt_ready "$i" || true
     _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}.r${_spawn_retry_n}"
-    SESSION_JSON=$(gc --city "$GC_CITY" session new gate-reviewer \
+    SESSION_JSON=$(gate_bounded_spawn gc --city "$GC_CITY" session new gate-reviewer \
       --no-attach \
       --title "gate-reviewer-$i: $BRANCH" \
       --json \

@@ -460,6 +460,13 @@ ok "located live spawn-retry-loop block via sentinel extraction"
 # until this export was added.
 export -f is_transient_spawn_error
 export -f capture_spawn_err_tail
+# ga-29ssni: the extracted loop now spawns through gate_bounded_spawn (a function — the mocked gc() below is a shell
+# function, so the wrapper passes it straight through, no `timeout`) and asks gate_spawn_err_is_timeout before it
+# retries. Without these two exports the child bash reports "command not found", every spawn comes back as `{}`
+# and sections 4/4b-4c fail with GC_CALLS=0 — the loop never reaches the mocked gc at all. The timeout behaviour
+# itself (no in-process retry after a spawn_timeout:) is proven in session-new-bounded.selftest.sh, section 8.
+export -f gate_bounded_spawn
+export -f gate_spawn_err_is_timeout
 
 # (a) first attempt failed transiently; the mocked `gc session new` succeeds
 # on its SECOND call (the in-process retry) — the loop must recover without

@@ -92,6 +92,24 @@ unset _REFINO_GATE_QHC_SIB
 LOG_DIR="$GC_CITY/.gc/logs"
 LOG="$LOG_DIR/refino-gate-dispatcher.log"
 RG_LOG="$GC_CITY/.gc/refino-gate.jsonl"
+# ga-29ssni: heartbeat próprio, só o mtime importa (conteúdo nunca é lido). O daemon-presence-watchdog compara o
+# mtime com o limite de com.gascity.refino-gate-dispatcher (1200 s) e, se passar, dá kickstart. Sem este arquivo o
+# refino-gate só constava da lista de PRESENÇA (está carregado?), não da de HEARTBEAT (está andando?): um processo
+# pendurado continuava "carregado" para sempre e o launchd não dispara de novo enquanto a execução anterior não acaba.
+RG_HB_FILE="$LOG_DIR/refino-gate-dispatcher.heartbeat"
+
+# ga-29ssni: teto de tempo para `gc session new` (refino_spawn_reviewer abaixo). Lib irmã, fail-soft: ausente →
+# passagem direta, ou seja, spawn SEM teto como antes (um `source` de arquivo ausente mataria este `set -e` sem log,
+# ga-q4sadt, e derrubar todo spawn do refino-gate por um arquivo faltando seria pior que o bug).
+_REFINO_SNB_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/session-new-bounded.lib.sh"
+if [ -r "$_REFINO_SNB_LIB" ]; then
+  source "$_REFINO_SNB_LIB"
+else
+  echo "WARN: ga-29ssni: session-new-bounded.lib.sh ausente/ilegível ($_REFINO_SNB_LIB) — 'gc session new' do refino-gate roda SEM teto de tempo" >&2
+  gate_bounded_spawn() { "$@"; }
+  gate_spawn_err_is_timeout() { printf '0'; }
+fi
+unset _REFINO_SNB_LIB
 
 # ── Tunables (env-overridable for the selftest) ───────────────────────────────
 # Max bounce-back rounds before escalating to Athos (no infinite loop).
@@ -191,9 +209,13 @@ REFINO_START_FAIL_STREAK_FILE="${REFINO_START_FAIL_STREAK_FILE:-$GC_CITY/.gc/ref
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-log()  { echo "[$(ts)] $*" | tee -a "$LOG" >/dev/null 2>&1 || echo "[$(ts)] $*"; }
-warn() { echo "[$(ts)] WARN: $*" | tee -a "$LOG" >/dev/null 2>&1 || echo "[$(ts)] WARN: $*"; }
-err()  { echo "[$(ts)] ERROR: $*" | tee -a "$LOG" >/dev/null 2>&1 || echo "[$(ts)] ERROR: $*"; }
+# ga-29ssni: `: >` zera o arquivo (muda o mtime sem fork de `touch`); falhar ao gravar NUNCA derruba o dispatcher —
+# o pior caso é o heartbeat envelhecer e o watchdog dar um kickstart que não era necessário, nunca o contrário.
+_refino_hb() { : > "$RG_HB_FILE" 2>/dev/null || true; }
+log()  { echo "[$(ts)] $*" | tee -a "$LOG" >/dev/null 2>&1 || echo "[$(ts)] $*"; _refino_hb; }
+warn() { echo "[$(ts)] WARN: $*" | tee -a "$LOG" >/dev/null 2>&1 || echo "[$(ts)] WARN: $*"; _refino_hb; }
+err()  { echo "[$(ts)] ERROR: $*" | tee -a "$LOG" >/dev/null 2>&1 || echo "[$(ts)] ERROR: $*"; _refino_hb; }
+_refino_hb   # toda execução carimba na largada, mesmo as que saem cedo (fila vazia, horário de silêncio)
 
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -960,7 +982,7 @@ refino_spawn_reviewer() {
   local _title_suffix=""
   [ "$_reason" = "reconvene" ] && _title_suffix=" (re-convened)"
   local _spawn_err_file="/tmp/refino-reviewer-spawn-err-$$.${_reason}"
-  SESSION_JSON=$(gc --city "$GC_CITY" session new "$REFINO_REVIEWER_TEMPLATE" \
+  SESSION_JSON=$(gate_bounded_spawn gc --city "$GC_CITY" session new "$REFINO_REVIEWER_TEMPLATE" \
     --no-attach \
     --title "refino-reviewer: $STORY_ID (round $THIS_ROUND)${_title_suffix}" \
     --json \
@@ -1032,6 +1054,10 @@ DEADLINE=$(( $(date +%s) + REFINO_VERDICT_TIMEOUT_MINUTES * 60 ))
 VERDICT="TIMEOUT"
 FAIL_NOTES=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  # ga-29ssni: este laço espera até REFINO_VERDICT_TIMEOUT_MINUTES (20 min) e em dia normal não loga nada a cada volta.
+  # Sem este carimbo o heartbeat envelheceria 20 min numa revisão SAUDÁVEL e o watchdog mataria o processo no meio.
+  # Um bd/gc pendurado DENTRO da volta impede o carimbo da volta seguinte — é exatamente o que o watchdog deve pegar.
+  _refino_hb
   VB=$(bd_ show "$VERDICT_BEAD_ID" --json 2>/dev/null || echo "[]")
   VB_LABELS=$(echo "$VB" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")')
   VB_VERDICT=$(refino_gate_verdict_from_labels "$VB_LABELS")
