@@ -15,11 +15,13 @@
 #   • baterias por host (hetzner | mbp) com rc 0 / rc 1 / outro, tempo médio, mediana (com quantidade par, a média dos dois do meio) e máximo — o lado de MBP da sombra (execuções E recusas) NÃO entra, é contado à parte;
 #   • recusas e fallbacks por host e motivo (inalcancavel, ram, slots, mac-only, filtro-invalido, rsync-falhou...): é a medida de "o servidor segurou?";
 #   • a sombra: mesmo rc / divergência / não rodou / estourou o tempo, e os arquivos que viraram mac-only;
-#   • o custo: preço/hora do tipo no local do servidor × horas de vida dentro da janela (estimativa; a fatura é por hora cheia), horas desde a criação e tráfego.
+#   • o custo: preço/hora do tipo no local do servidor × horas de vida dentro da janela (estimativa; a fatura é por hora cheia), horas desde a criação e tráfego
+#     (tráfego que a API não deu — ausente, null, não numérico — sai "indisponível", nunca "0 GB").
 # ESTADOS QUE NÃO SE CONFUNDEM: sem log ainda · log ilegível · zero execuções · custo "indisponível (motivo)" — nunca "0" no lugar de "não consegui saber".
 #   Linha do log que não dá para ler vem AVISADA ("N linha(s) ilegível(is)"), não omitida — vale também para a que é JSON com ts mas que o relatório não sabe classificar
 #   (sem mode, host que não é hetzner|mbp [sem o campo = mbp], rc/secs que não são número, recusa sem motivo, marcador de sombra ou veredito desconhecido). Lista mac-only aprendida que não abre diz "sem arquivo … ou ilegível", nunca "0 arquivo(s)".
 #   Texto que não se formou (jq falhou) sai rc 4 com ALERTA e, com --mail, NADA é enviado: relatório truncado não passa por completo.
+#   --hours é decimal mesmo com zero à esquerda (010 = 10 h, não o octal 8; o bash leria 08/09 como erro de base), de 1 a 99999; hora ou janela que não se formam: rc 4 com ALERTA, nunca um cabeçalho em 1970.
 set -o pipefail
 CITY=${HETZNER_REPORT_CITY:-${GC_CITY_PATH:-${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}}}
 LOG="$CITY/.gc/logs/mbp-run.jsonl"
@@ -40,12 +42,21 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$hours" in ''|*[!0-9]*) echo "hetzner-daily-report: --hours precisa de um inteiro (veio '$hours')" >&2; exit 2 ;; esac
+# só dígitos NÃO basta: "010" na conta de baixo é octal (8) e "08" é erro de base (since vazio → cabeçalho em 1970 e log "ilegível" com rc 0).
+# Tira os zeros à esquerda (só zeros → vazio → 0 → recusado abaixo), limita o tamanho (a conta de segundos não pode estourar) e só então vira número.
+digits=${hours#"${hours%%[!0]*}"}
+[ ${#digits} -le 5 ] || { echo "hetzner-daily-report: --hours precisa ser <= 99999 (veio '$hours')" >&2; exit 2; }
+hours=$(( 10#${digits:-0} ))
 [ "$hours" -ge 1 ] || { echo "hetzner-daily-report: --hours precisa ser >= 1" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || { echo "hetzner-daily-report: jq ausente — sem ele não leio o log" >&2; exit 3; }
 
-now=$(date +%s); since=$(( now - hours * 3600 ))
+# hora lida → janela; `date` que falhou/veio vazia é ALERTA e rc 4 (sem hora a janela não existe), nunca a conta rodando com since vazio
+now=$(date +%s)
+case "$now" in ''|*[!0-9]*) echo "hetzner-daily-report: ALERTA: não consegui ler a hora (date +%s veio '$now') — sem ela não há janela" >&2; exit 4 ;; esac
+since=$(( now - hours * 3600 ))
 iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; }
 since_iso=$(iso "$since"); now_iso=$(iso "$now")
+[ -n "$since_iso" ] && [ -n "$now_iso" ] || { echo "hetzner-daily-report: ALERTA: não consegui escrever a janela como data (since='$since_iso' until='$now_iso')" >&2; exit 4; }
 
 # ---- execuções e recusas (mbp-run.jsonl) -------------------------------------------------------------------------------------------
 # Três estados: log ausente → "sem log ainda" · jq/leitura falhou → "ilegivel" · lido → o objeto. Linha ilegível conta em `bad` (e vem avisada).
@@ -121,15 +132,20 @@ if [ $do_cost -eq 1 ]; then
       raw=$(HCLOUD_TOKEN="$tok" $TMO hcloud server list -l "$LABEL" -o json 2>/dev/null); rc=$?
       if [ $rc -ne 0 ] || [ -z "$raw" ]; then cost_json=$(jq -n --arg why "hcloud falhou (rc=$rc)" '{state: "indisponivel", why: $why}')
       else
+        # `created` da API vem com "+00:00" ou fração de segundo conforme o cliente: o mesmo instante, não "resposta ilegível" (que é o que o fromdateiso8601 puro dá).
+        # Tráfego: número → GB; ausente/null/outra coisa → null (o texto diz "indisponível"; `// 0` o transformava em "0 GB de 0 GB incluídos").
         cost_json=$(printf '%s' "$raw" | jq --argjson now "$now" --argjson since "$since" --arg label "$LABEL" '
+          def epoch: sub("\\.[0-9]+"; "") | ((capture("^(?<b>.*)(?<sg>[+-])(?<h>[0-9]{2}):?(?<m>[0-9]{2})$")) // null) as $o
+            | if $o then (($o.b + "Z") | fromdateiso8601) - (($o.sg + "1" | tonumber) * (($o.h | tonumber) * 3600 + ($o.m | tonumber) * 60)) else fromdateiso8601 end;
+          def gb: if type == "number" then . / 1000000000 else null end;
           if type != "array" then {state: "indisponivel", why: "resposta da API não é uma lista"}
           elif length == 0 then {state: "indisponivel", why: ("nenhum servidor com o rótulo " + $label)}
           else
-            [ .[] | (.created | fromdateiso8601) as $c
+            [ .[] | (.created | epoch) as $c
               | ((.location.name // "") as $loc | [(.server_type.prices // [])[] | select(.location == $loc) | (.price_hourly.gross | tonumber)] | .[0]) as $p
               | {name: .name, type: .server_type.name, location: .location.name, status: .status, hourly_eur: $p,
                  up_h_total: (($now - $c) / 3600), up_h_window: (($now - ([$c, $since] | max)) / 3600),
-                 out_gb: ((.outgoing_traffic // 0) / 1000000000), included_gb: ((.included_traffic // 0) / 1000000000)} ] as $s
+                 out_gb: (.outgoing_traffic | gb), included_gb: (.included_traffic | gb)} ] as $s
             | if ([$s[] | select(.hourly_eur == null)] | length) > 0 then {state: "indisponivel", why: "sem preço/hora no tipo ou local do servidor"}
               else {state: "ok", servers: $s,
                     window_eur: ([$s[] | .hourly_eur * .up_h_window] | add), total_eur: ([$s[] | .hourly_eur * .up_h_total] | add)} end
@@ -150,6 +166,9 @@ text_report() {
     def hline($k; $h): if $h.n == 0 then "\($k)=0" else "\($k)=\($h.n) (rc0=\($h.rc0) rc1=\($h.rc1) outro=\($h.other))" end;
     def tline($k; $h): if $h.n == 0 then empty else "\($k) média \($h.mean_s // "?") s · mediana \($h.median_s // "?") s · máx \($h.max_s // "?") s" end;
     def rline($r): if ($r | length) == 0 then "nenhuma" else ($r | to_entries | map("\(.key)=\(.value)") | join(" ")) end;
+    # tráfego que a API não deu (null) é "indisponível": só um número de verdade vira "N GB" (0 GB é um zero que a API informou)
+    def traf: if .out_gb == null then "tráfego de saída: indisponível"
+      else "tráfego de saída \(.out_gb * 100 | floor / 100) GB" + (if .included_gb == null then " (franquia incluída: indisponível)" else " de \(.included_gb | floor) GB incluídos" end) end;
     "Nó Linux de testes — últimas \(.window_h) h (\(.since) → \(.until))",
     (if (.runs | type) == "string" then
         "Baterias: \(if .runs == "ilegivel" then "log ilegível — não consegui contar" else "sem log ainda" end)"
@@ -168,7 +187,7 @@ text_report() {
      end),
     "Lista mac-only aprendida: \(if .mac_only_learned == null then "sem arquivo (nenhuma divergência até agora) ou ilegível" else "\(.mac_only_learned) arquivo(s)" end)",
     (if .cost.state == "ok" then
-        (.cost.servers[] | "Custo: \(.name) (\(.type), \(.location), \(.status)) a €\(.hourly_eur * 10000 | round / 10000)/h — vivo há \(.up_h_total * 10 | floor / 10) h; tráfego de saída \(.out_gb * 100 | floor / 100) GB de \(.included_gb | floor) GB incluídos"),
+        (.cost.servers[] | "Custo: \(.name) (\(.type), \(.location), \(.status)) a €\(.hourly_eur * 10000 | round / 10000)/h — vivo há \(.up_h_total * 10 | floor / 10) h; \(traf)"),
         "Custo estimado na janela: €\(.cost.window_eur * 100 | round / 100) · acumulado desde a criação: €\(.cost.total_eur * 100 | round / 100) (preço/hora × horas de vida; a fatura é por hora cheia)"
      else "Custo: indisponível (\(.cost.why)) — NÃO é zero, é \"não consegui saber\"" end)'
 }

@@ -618,6 +618,16 @@ eq "status --json: as chaves antigas continuam (aditivo)" "true" "$(printf '%s' 
 TZ=UTC touch -t 202610150930.00 "$NF"
 MBP_CITY="$T/city" bash "$OFFL" node status >"$T/out" 2>&1; has "node status depois de um touch: 'desde' é a hora do ARQUIVO (a que a sombra usa), não o conteúdo antigo" "$T/out" '^LIGADO desde 2026-10-15T09:30:00Z '
 j=$(st --json); eq "status --json depois de um touch: node.since é a hora do arquivo" "2026-10-15T09:30:00Z" "$(printf '%s' "$j" | jq -r .node.since)"
+# `node on` com a bandeira JÁ ligada não regrava: regravar muda o mtime e a sombra de 24 h recomeça sem ninguém ter pedido
+before=$(stat -f %m "$NF" 2>/dev/null || stat -c %Y "$NF"); body_before=$(cat "$NF")
+MBP_CITY="$T/city" bash "$OFFL" node on >"$T/out" 2>&1; expect "node on com a bandeira já ligada: rc 0" 0 "$?"
+eq "node on repetido NÃO muda o mtime da bandeira (a sombra não reabre)" "$before" "$(stat -f %m "$NF" 2>/dev/null || stat -c %Y "$NF")"; eq "…nem o conteúdo" "$body_before" "$(cat "$NF")"
+has "node on repetido: diz que já estava ligado, desde quando, e como reabrir de propósito" "$T/out" 'já LIGADO desde 2026-10-15T09:30:00Z .*NÃO foi regravada.*touch '
+# node.since no --json: desligado = null; ligado e mtime ilegível = "unreadable" (os dois eram "" e só o node.flag distinguia)
+mkdir -p "$T/nostat"; printf '#!/bin/sh\nexit 1\n' > "$T/nostat/stat"; chmod +x "$T/nostat/stat"
+j=$(PATH="$T/nostat:$PATH" st --json); eq "status --json, bandeira ligada e mtime ilegível: node.since = \"unreadable\" (não \"\")" "unreadable" "$(printf '%s' "$j" | jq -r .node.since)"
+eq "…e node.flag segue on" "on" "$(printf '%s' "$j" | jq -r .node.flag)"
+mv "$NF" "$NF.bak"; j=$(st --json); eq "status --json, bandeira desligada: node.since = null" "null" "$(printf '%s' "$j" | jq -c .node.since)"; eq "…e node.flag = off" "off" "$(printf '%s' "$j" | jq -r .node.flag)"; mv "$NF.bak" "$NF"
 unset STUB_CHECK_OUT
 MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" off >"$T/out" 2>&1; n=$((n+1)); if [ -f "$NF" ]; then echo "ok   mbp-offload.sh off NÃO desliga o nó (bandeira independente)"; else echo "FAIL o off do MBP apagou a bandeira do nó"; fails=$((fails+1)); fi
 MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" pause >"$T/out" 2>&1; n=$((n+1)); if [ -f "$NF" ]; then echo "ok   mbp-offload.sh pause NÃO desliga o nó"; else echo "FAIL a pausa do MBP apagou a bandeira do nó"; fails=$((fails+1)); fi
@@ -687,6 +697,11 @@ reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; r_
 eq "hoje[$L]: host que não é hetzner nem mbp é avisado, não vira minuto do MBP" "1 execuções, 0 min no MBP (livre: 1, em uso: 0); 1 linha(s) ilegível(is) no log (não contadas)" "$(tdy)"
 reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; r_line "$t_ayer" 60 ',"presence":"livre","host":"hetzner2"'; } > "$J"
 eq "hoje[$L]: host desconhecido de ONTEM fica fora (a janela é a de hoje)" "1 execuções, 0 min no MBP (livre: 1, em uso: 0)" "$(tdy)"
+# secs que não é número (texto, null, ausente) não soma: a linha é AVISADA — sem isso "N execuções" teria mais linhas que os minutos somados e o total pareceria completo
+reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 120 ',"presence":"livre"'; r_line "$t_now" '"x"' ',"presence":"livre"'; r_line "$t_now" null ',"presence":"livre"'; } > "$J"
+eq "hoje[$L]: secs não numérico (texto, null) é avisado e não entra na conta" "1 execuções, 2 min no MBP (livre: 1, em uso: 0); 2 linha(s) ilegível(is) no log (não contadas)" "$(tdy)"
+reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 120 ',"presence":"livre","host":"hetzner"'; r_line "$t_now" '"x"' ',"presence":"livre","host":"hetzner"'; } > "$J"
+eq "hoje[$L]: o mesmo no nó Linux: avisado, e o '+ N no nó' não conta a linha sem tempo" "0 execuções, 0 min no MBP (livre: 0, em uso: 0) + 1 no nó Linux (2 min); 1 linha(s) ilegível(is) no log (não contadas)" "$(tdy)"
 }
 JQPIN=""; today_cases "jq do PATH"
 for cand in /usr/bin/jq /opt/homebrew/bin/jq; do

@@ -5,11 +5,13 @@
 #   Casos · Controle negativo
 #
 # CASOS: sem log / log ilegível / zero execuções são três respostas diferentes · contagem por host (linha antiga sem "host" = mbp) · o lado de MBP da sombra
-#   (execuções E recusas) não entra na conta · janela de horas · linha truncada AVISADA, e também a que é JSON mas não dá para classificar (sem mode, host que não é
+#   (execuções E recusas) não entra na conta · janela de horas (--hours com zero à esquerda é decimal: 08, 010, 012; teto de 5 dígitos) · linha truncada AVISADA, e também a que é JSON mas não dá para classificar (sem mode, host que não é
 #   hetzner/mbp, rc/secs que não são número, recusa sem motivo, marcador de sombra ou veredito desconhecido) · --hours sem valor · recusas por host e motivo ·
 #   tempo médio/mediana (par: média dos dois do meio)/máximo · sombra (iguais, divergências, arquivos) ·
 #   lista aprendida (ausente, ilegível e só-comentário são três respostas) · texto que não se forma (rc 4, nenhum mail) · custo: preço/hora × horas na janela, servidor mais velho que a janela, e CADA falha (sem hcloud, sem token, hcloud falhou, resposta que não é
-#   JSON, lista vazia, sem preço) vira "indisponível (motivo)" e nunca "€0" · --json · --mail (ok e falha) · o wrapper do order (liga/desliga/ocioso/log ilegível).
+#   JSON, lista vazia, sem preço) vira "indisponível (motivo)" e nunca "€0" · tráfego ausente/null/não numérico vira "indisponível", nunca "0 GB" · `created` com +00:00, fração ou
+#   outro fuso é o mesmo instante · --json · --mail (ok e falha) · o wrapper do order (liga/desliga/ocioso/log ilegível/linha que o relatório avisa como ilegível).
+# HDR_SELFTEST_JQDIR=<dir com um jq> roda o relatório sob outro jq (o do order é o do Homebrew; sem isso é o /usr/bin).
 # CONTROLE NEGATIVO: o mutante que conta o lado de sombra como execução do MBP e o que lê custo indisponível como zero TÊM de reprovar nos casos acima.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -56,8 +58,8 @@ exec "$(PATH="$STUB_REAL_PATH" command -v jq)" "$@"
 EOF
 chmod +x "$T/bin/"*
 export STUB_LOG="$T/stub.log"
-# PATH sem o hcloud de verdade (/opt/homebrew/bin) — jq vem de /usr/bin
-SAFEPATH="/usr/bin:/bin:/usr/sbin:/sbin"; export STUB_REAL_PATH="$SAFEPATH"
+# PATH sem o hcloud de verdade (/opt/homebrew/bin) — jq vem de /usr/bin (HDR_SELFTEST_JQDIR=<dir com um jq> o troca: o order roda com o jq do Homebrew, outra versão)
+SAFEPATH="${HDR_SELFTEST_JQDIR:+$HDR_SELFTEST_JQDIR:}/usr/bin:/bin:/usr/sbin:/sbin"; export STUB_REAL_PATH="$SAFEPATH"
 run() { HETZNER_REPORT_CITY="$C" PATH="$T/bin:$SAFEPATH" "$REPORT" "$@" 2>"$T/err"; }
 run_nostub() { HETZNER_REPORT_CITY="$C" PATH="$SAFEPATH" "$REPORT" "$@" 2>"$T/err"; }
 reset() { : > "$STUB_LOG"; rm -f "$LOG" "$SLOG" "$FLAG" "$LEARN"; unset STUB_HCLOUD_RC STUB_HCLOUD_OUT STUB_AGE_H STUB_PRICE STUB_GC_RC STUB_SECRET_FAIL STUB_JQ_FAIL_TEXT HCLOUD_TOKEN; }
@@ -97,6 +99,22 @@ run_capped() {
   wait "$pid"
 }
 run_capped --no-cost --hours; rc=$?; eq "--hours sem valor (último argumento): rc 2, não trava" 2 "$rc"; has "…e diz o que faltou" "--hours precisa de um valor" "$(cat "$T/err")"
+
+echo "--- --hours com zero à esquerda é decimal (o bash lê 010 como OCTAL = 8, e 08/09 como erro de base)"
+agoh() { ago "${1}H" 2>/dev/null || ago "$1 hours"; }
+reset; { L "$(agoh 1)" 0 11 ',"host":"hetzner"'; L "$(agoh 9)" 0 22 ',"host":"hetzner"'; L "$(agoh 11)" 0 33 ',"host":"hetzner"'; } > "$LOG"
+for h in 08 09 010 012; do
+  d=$((10#$h)); j=$(run --no-cost --json --hours "$h"); rc=$?
+  eq "--hours $h: rc 0" 0 "$rc"; hasnt "--hours $h: nada de erro de base no stderr" "too great" "$(cat "$T/err")"
+  eq "--hours $h: o rótulo e a janela de fato concordam ($d h = $((d * 3600)) s)" "$d $((d * 3600))" "$(printf '%s' "$j" | jq -r '"\(.window_h) \((.until | fromdateiso8601) - (.since | fromdateiso8601))"' 2>/dev/null)"
+done
+out=$(run --no-cost --hours 08); has "--hours 08: a janela de 8 h pega só a bateria de 1 h atrás" "hetzner=1 (" "$out"; has "…e o cabeçalho diz 8 h" "últimas 8 h" "$out"; hasnt "…e o log legível não vira 'log ilegível'" "log ilegível" "$out"
+out=$(run --no-cost --hours 010); has "--hours 010: janela de 10 h pega a de 9 h atrás (em octal seria 8 h e daria 1)" "hetzner=2 (" "$out"
+out=$(run --no-cost --hours 012); has "--hours 012: janela de 12 h pega as 3 (em octal seria 10 h e daria 2)" "hetzner=3 (" "$out"
+j=$(run --no-cost --json --hours 0000000000000000024); rc=$?; eq "zeros demais à esquerda não estouram nada: rc 0" 0 "$rc"; eq "…e valem 24 h de verdade (86400 s; em octal seriam 20 h)" "24 86400" "$(printf '%s' "$j" | jq -r '"\(.window_h) \((.until | fromdateiso8601) - (.since | fromdateiso8601))"' 2>/dev/null)"
+out=$(run --no-cost --hours 000); rc=$?; eq "--hours 000: rc 2 (o piso é 1 h)" 2 "$rc"
+out=$(run --no-cost --hours 99999999999999999999); rc=$?; eq "--hours com 20 dígitos: rc 2 (estouraria a conta de segundos)" 2 "$rc"; has "…e diz o teto" "precisa ser <= 99999" "$(cat "$T/err")"
+out=$(run --no-cost --hours 99999); rc=$?; eq "--hours 99999 (o teto) segue valendo" 0 "$rc"
 
 echo "--- mediana"
 reset; { L "$now" 0 10 ',"host":"hetzner"'; L "$now" 0 20 ',"host":"hetzner"'; L "$now" 0 30 ',"host":"hetzner"'; L "$now" 0 100 ',"host":"hetzner"'; } > "$LOG"
@@ -176,6 +194,24 @@ out=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT='oops not json' run); has "resposta que n
 out=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT='[]' run); has "lista vazia: indisponível (não €0)" "nenhum servidor com o rótulo projeto=ga-27oza3" "$out"
 out=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT='{"error":"x"}' run); has "resposta que não é lista: indisponível" "resposta da API não é uma lista" "$out"
 out=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT='[{"name":"s","status":"running","created":"2026-10-13T10:00:00Z","location":{"name":"fsn1"},"server_type":{"name":"x","prices":[]}}]' run); has "sem preço do tipo: indisponível" "sem preço/hora no tipo ou local" "$out"; hasnt "sem preço NÃO diz €0" "€0" "$out"
+# tráfego ausente/null/que não é número é "não consegui saber", nunca "0 GB de 0 GB incluídos" (o jq engolia o null em 0 com `// 0`)
+srv() { printf '[{"name":"s1","status":"running","created":"%s","location":{"name":"fsn1"}%s,"server_type":{"name":"cax41","prices":[{"location":"fsn1","price_hourly":{"gross":"0.1"}}]}}]' "${2:-$(agoh 6)}" "$1"; }
+for tr in ',"outgoing_traffic":null,"included_traffic":null' '' ',"outgoing_traffic":"abc","included_traffic":"x"' ',"outgoing_traffic":null,"included_traffic":21990000000000'; do
+  out=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT="$(srv "$tr")" run); j=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT="$(srv "$tr")" run --json)
+  has "tráfego de saída [${tr:-ausente}]: indisponível" "tráfego de saída: indisponível" "$out"; hasnt "…e NÃO diz 0 GB" "0 GB" "$out"; has "…o custo em si segue (€0.6: o preço não depende do tráfego)" "Custo estimado na janela: €0.6" "$out"
+  eq "…--json: out_gb é null, não 0" "null" "$(printf '%s' "$j" | jq -c '.cost.servers[0].out_gb')"
+done
+out=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT="$(srv ',"outgoing_traffic":2000000000,"included_traffic":null')" run); j=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT="$(srv ',"outgoing_traffic":2000000000,"included_traffic":null')" run --json)
+has "saída conhecida e franquia desconhecida: diz as duas coisas" "tráfego de saída 2 GB (franquia incluída: indisponível)" "$out"; hasnt "…e a franquia NÃO vira '0 GB incluídos'" "de 0 GB" "$out"; eq "…--json: included_gb é null" "null" "$(printf '%s' "$j" | jq -c '.cost.servers[0].included_gb')"
+out=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT="$(srv ',"outgoing_traffic":0,"included_traffic":21990000000000')" run); has "zero DE VERDADE segue sendo zero (servidor novo, nada saiu)" "tráfego de saída 0 GB de 21990 GB incluídos" "$out"
+# 'created' como a API da Hetzner o escreve (+00:00), com fração de segundo ou com outro fuso: é o MESMO instante, não "resposta ilegível"
+c6=$(agoh 6); c6z=${c6%Z}
+isoat() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }; e6=$(( $(date +%s) - 6 * 3600 ))
+# +08:00 e +09:00 também: "08"/"09" no fuso é a mesma armadilha do octal do --hours
+for cr in "${c6z}+00:00" "${c6z}.123456789Z" "$(agoh 4 | sed 's/Z$/+02:00/')" "$(agoh 9 | sed 's/Z$/-03:00/')" "$(isoat $((e6 + 8 * 3600)) | sed 's/Z$/+08:00/')" "$(isoat $((e6 + 9 * 3600)) | sed 's/Z$/+0900/')"; do
+  out=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT="$(srv ',"outgoing_traffic":2000000000,"included_traffic":21990000000000' "$cr")" run); has "created '$cr' = 6 h atrás: custo €0.6" "Custo estimado na janela: €0.6" "$out"
+done
+out=$(HCLOUD_TOKEN=abc STUB_HCLOUD_OUT="$(srv '' ontem)" run); has "created que não é data: indisponível (resposta ilegível), nunca €0" "indisponível (resposta da API ilegível)" "$out"; hasnt "…nem €0" "€0" "$out"
 
 echo "--- --json e --mail"
 reset; L "$now" 0 5 ',"host":"hetzner"' > "$LOG"
@@ -197,6 +233,14 @@ reset; : > "$STUB_LOG"; L "$now" 0 5 ',"host":"mbp"' > "$LOG"; out=$(wrap); hasn
 reset; : > "$STUB_LOG"; out=$(wrap); has "desligado e sem log nenhum: manda (não sei se o nó trabalhou)" "GC:mail send mayor" "$(cat "$STUB_LOG")"
 reset; : > "$STUB_LOG"; L "$now" 0 5 ',"host":"mbp"' > "$LOG"; chmod 000 "$LOG"; out=$(wrap); has "desligado e log ilegível: manda (o inerte é avisar)" "GC:mail send mayor" "$(cat "$STUB_LOG")"; chmod 644 "$LOG"
 reset; out=$(GC_CITY_PATH="$C" HETZNER_REPORT_SCRIPT="$T/nao-existe.sh" PATH="$T/bin:$SAFEPATH" bash "$WRAP" 2>&1; echo "rc=$?"); has "relatório ausente é FALHA (rc 1), não sucesso calado" "rc=1" "$out"; has "…e diz qual" "report script not found" "$out"
+# linha que o relatório AVISA como ilegível pode ter sido uma bateria do nó: o wrapper não pode decidir "ocioso" por cima do aviso do próprio relatório
+reset; : > "$STUB_LOG"; { L "$now" 0 5 ',"host":"mbp"'; printf '{"ts":"%s","repo":"wa","slot":"1","rc":0,"secs":3,"host":"hetzner"}\n' "$now"; printf '{"ts":"%s","repo":"wa","mode":"pyt' "$now"; echo; } > "$LOG"
+rep=$(run --no-cost); out=$(wrap)
+has "(o relatório diz 'hetzner=0' e avisa 2 linhas ilegíveis)" "⚠️ 2 linha(s) ilegível(is)" "$rep"; has "desligado, nó 'sem execuções' mas com linha ilegível: manda (o inerte é avisar)" "GC:mail send mayor" "$(cat "$STUB_LOG")"; hasnt "…e não diz 'nothing to report'" "nothing to report" "$out"
+reset; : > "$STUB_LOG"; { L "$now" 0 5 ',"host":"mbp"'; printf '{"ts":"%s","repo":"wa","mode":"pyt' "$now"; echo; } > "$LOG"; out=$(wrap)
+has "desligado, só uma linha truncada (sem ts) e o resto ocioso: manda" "GC:mail send mayor" "$(cat "$STUB_LOG")"
+reset; : > "$STUB_LOG"; { L "$now" 0 5 ',"host":"mbp"'; L "$now" 0 7 ',"host":"mbp"'; } > "$LOG"; out=$(wrap)
+hasnt "controle: log inteiro legível e ocioso continua calado" "GC:mail" "$(cat "$STUB_LOG")"; has "…com rc 0" "rc=0" "$out"
 
 echo "--- controle negativo"
 sed 's/ and \.shadow != 1//' "$REPORT" > "$T/mut1.sh"; chmod +x "$T/mut1.sh"

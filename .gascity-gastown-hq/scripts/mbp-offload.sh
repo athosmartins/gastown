@@ -77,7 +77,8 @@ recent_counts() {
 
 # Total de hoje (desde a meia-noite LOCAL), do log: "<N> execuções, <M> min no MBP (livre: a, em uso: b[, sem presença registrada: c])".
 # Mesmos três estados da contagem de 72 h: log ausente → "sem log ainda"; jq falhou/relógio ilegível → "ilegível" (nunca "0
-# execuções"); lido → o total. Linha do log que não dá para ler não derruba nem some: vem avisada (inclusive a de host que não é hetzner|mbp). Recusas do preflight não são execução.
+# execuções"); lido → o total. Linha do log que não dá para ler não derruba nem some: vem avisada (inclusive a de host que não é hetzner|mbp e a de secs que não é número: sem ela
+# os "N execuções" teriam mais linhas que os minutos somados, e o total pareceria completo). Recusas do preflight não são execução.
 # São minutos de MBP LITERAIS: a execução do lado de MBP de uma sombra ("shadow":1) conta aqui, porque o MBP trabalhou de verdade (o relatório diário a tira, que mede o nó).
 # (a soma de $bad vem entre parênteses e o $r é ligado no começo da pipeline: o "A + B as $x" do jq 1.7.1 lê diferente do 1.8.1.)
 today_counts() {
@@ -93,7 +94,7 @@ today_counts() {
         then {l: ., t: (.ts | fromdateiso8601)} else {bad: 1} end] as $e
     | ([$e[] | select(.bad)] | length) as $bad0
     | [$e[] | select(.l and .t >= $since and .l.mode != "preflight") | .l] as $win
-    | [$win[] | select(hostok)] as $all
+    | [$win[] | select(hostok and ((.secs | type) == "number"))] as $all
     | (($bad0 + (($win | length) - ($all | length)))) as $bad
     | [$all[] | select(.host == "hetzner")] as $nr
     | [$all[] | select(.host != "hetzner")] as $r
@@ -155,7 +156,7 @@ why_text() { # presence_why idle_s
 
 # a hora em que a bandeira do nó vale como ligada = o MTIME do arquivo, nunca o texto gravado dentro dele: a janela de 24 h da sombra
 # (mbp-run.sh shadow_window_open) conta pelo mtime, e `touch` a reabre (runbook). Pelo conteúdo, depois de um touch o status seguiria dizendo
-# a hora antiga do `node on`. Vazio = desligado / mtime ilegível (quem chama mostra "?", nunca uma data inventada).
+# a hora antiga do `node on`. Vazio = desligado / mtime ilegível (quem chama mostra "?", nunca uma data inventada; no --json: desligado = null, ligado e ilegível = "unreadable").
 node_since() {
   [ -f "$NODEFLAG" ] || return 0
   local m; m=$(stat -f %m "$NODEFLAG" 2>/dev/null || stat -c %Y "$NODEFLAG" 2>/dev/null)
@@ -188,7 +189,12 @@ case "$cmd" in
   install-mbp) "$RUN" --install-tools ;;
   node)
     case "${2:-status}" in
-      on)  mkdir -p "$(dirname "$NODEFLAG")" && date -u +%Y-%m-%dT%H:%M:%SZ > "$NODEFLAG" && echo "Nó Linux de testes: LIGADO (a sombra de 24 h começa agora; o MBP, a pausa dele e o mini seguem como reserva)" || { echo "Nó Linux: NÃO consegui gravar $NODEFLAG" >&2; exit 1; } ;;
+      on)
+        # já ligado: NÃO regrava. A janela de 24 h da sombra conta do mtime da bandeira (mbp-run.sh shadow_window_open), então regravar = recomeçar a sombra sem querer.
+        # Reabrir de propósito: `touch` na bandeira (ou node off && node on).
+        if [ -f "$NODEFLAG" ]; then echo "Nó Linux de testes: já LIGADO desde $(node_since | grep . || echo '?') — a bandeira NÃO foi regravada (regravar reabriria a sombra de 24 h; para reabri-la de propósito: touch $NODEFLAG)"
+        else mkdir -p "$(dirname "$NODEFLAG")" && date -u +%Y-%m-%dT%H:%M:%SZ > "$NODEFLAG" && echo "Nó Linux de testes: LIGADO (a sombra de 24 h começa agora; o MBP, a pausa dele e o mini seguem como reserva)" || { echo "Nó Linux: NÃO consegui gravar $NODEFLAG" >&2; exit 1; }
+        fi ;;
       off) rm -f "$NODEFLAG"; [ -e "$NODEFLAG" ] && { echo "Nó Linux: NÃO consegui apagar $NODEFLAG" >&2; exit 1; }; echo "Nó Linux de testes: DESLIGADO (bandeira apagada; o servidor em si é do Mayor)" ;;
       status) node_state_text ;;
       *) echo "uso: $0 node on|off|status" >&2; exit 2 ;;
@@ -217,7 +223,8 @@ case "$cmd" in
         --argjson paused_local "$([ "$paused_l" = 1 ] && echo true || echo false)" --argjson paused_mbp "$([ "$paused_r" = 1 ] && echo true || echo false)" \
         --argjson health "{$hj}" --argjson tasks "$tasks_json" --argjson recent "$recent_json" \
         '{offload: $offload, mode: $mode, mode_why: $why, presence: $presence, idle_s: ($idle | tonumber? // null), slot_cap: ($cap | tonumber? // null),
-          paused: {local: $paused_local, mbp: $paused_mbp}, tasks: $tasks, today: $today, healthy: $healthy, health: $health, recent: $recent, node: {flag: $nodeflag, since: $nodesince}}'
+          paused: {local: $paused_local, mbp: $paused_mbp}, tasks: $tasks, today: $today, healthy: $healthy, health: $health, recent: $recent,
+          node: {flag: $nodeflag, since: (if $nodeflag == "off" then null elif $nodesince == "" then "unreadable" else $nodesince end)}}'
     else
       echo "MBP offload: $(echo $state | tr a-z A-Z)  (since: $( [ -f "$FLAG" ] && cat "$FLAG" || echo - ))"
       case "$mode" in

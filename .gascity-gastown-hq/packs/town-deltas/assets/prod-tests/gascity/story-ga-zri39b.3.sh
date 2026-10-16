@@ -11,8 +11,10 @@
 #   existia aqui só olhava nome, só a wa-base, sem token e sem conteúdo, e nem chegava a ser chamada). Este teste PASSAR não diz nada sobre o que o servidor guarda.
 # POR QUE É SEGURO RODAR: os selftests usam stubs de ssh/rsync/python e uma cidade temporária; as leituras vivas são SÓ leitura. Nada é semeado, instalado nem apagado no servidor, e nenhuma
 #   bandeira é ligada ou desligada.
-# O QUE É AVISO E NÃO FALHA: a linha `Custo: indisponível (motivo)` (API fora, sem token, servidor já apagado pelo Mayor ao fim do teste de 1 semana: o relatório diz "não consegui saber", e isso é o
-#   comportamento certo, não defeito do código) e a ausência de hcloud ou do token no cofre. O relatório que QUEBRA na rota da API (rc ≠ 0, ou saída sem nenhuma linha `Custo:`) é FALHA.
+# O QUE É AVISO E NÃO FALHA: a linha `Custo: indisponível (motivo)` quando o motivo é do MUNDO — hcloud falhou (API fora, rede, token vencido) ou "nenhum servidor com o rótulo" (o Mayor já apagou o
+#   servidor ao fim do teste de 1 semana): o relatório diz "não consegui saber", e isso é o comportamento certo. Também aviso: tráfego "indisponível" no servidor, e a ausência de hcloud ou do token no cofre.
+#   É FALHA o relatório que QUEBRA na rota da API (rc ≠ 0, ou saída sem nenhuma linha `Custo:`) e o que NÃO ENTENDE a resposta viva — "resposta da API ilegível / não é uma lista" ou "sem preço": com hcloud e
+#   token, isso é o código lendo o formato errado (os selftests só provam o formato que o autor escreveu nos stubs), não indisponibilidade. Essa rota só se exercita de verdade com um servidor no ar.
 #
 # Chamado por run.sh depois do deploy (STORY_ID=ga-zri39b.3). Sai 0 se passar.
 set -uo pipefail
@@ -59,15 +61,20 @@ out="$("$BASH32" "$REPORT" --no-cost 2>&1)" || fail "hetzner-daily-report.sh --n
 printf '%s\n' "$out" | grep -q '^Baterias' || fail "o relatório vivo não tem a linha 'Baterias': $out"
 log "relatório vivo (sem custo) ✓: $(printf '%s\n' "$out" | grep '^Baterias' | head -n 1 | cut -c1-110)"
 # o custo: com hcloud e token o relatório chama a API (rota que o --no-cost acima não exercita). O relatório sempre imprime UMA linha `Custo:` e sai 0: o preço, ou "indisponível (motivo)" (nunca €0).
-# vazio (sem linha `Custo:`) ou falhou (rc ≠ 0) → FALHA, o relatório quebrou; `Custo: indisponível` → aviso, a API/o servidor não responderam e o relatório disse isso; sem hcloud/token → aviso, não há o que rodar
+# vazio (sem linha `Custo:`), falhou (rc ≠ 0) ou "não entendi a resposta da API" → FALHA, o relatório quebrou; indisponível por motivo do mundo (API fora, servidor apagado) → aviso, o relatório disse isso;
+# sem hcloud/token → aviso, não há o que rodar
 if command -v hcloud >/dev/null 2>&1 && secret Hetzner --field notes >/dev/null 2>&1; then
   cost_out="$("$BASH32" "$REPORT" 2>&1)"; cost_rc=$?
   [[ $cost_rc -eq 0 ]] || fail "hetzner-daily-report.sh (com custo) saiu rc=$cost_rc na cidade viva: $cost_out"
   cost="$(printf '%s\n' "$cost_out" | grep '^Custo' | head -n 1)"
   case "$cost" in
     "") fail "o relatório com custo saiu 0 mas sem nenhuma linha 'Custo:': $cost_out" ;;
+    "Custo: indisponível (resposta da API"*|"Custo: indisponível (sem preço"*) fail "o relatório não entende a resposta VIVA da API de custo (o formato não é o que o código lê): $cost" ;;
     "Custo: indisponível"*) warn "custo indisponível, e o relatório disse isso: $(printf '%s' "$cost" | cut -c1-140)" ;;
-    *) log "custo: $(printf '%s' "$cost" | cut -c1-110)" ;;
+    *)
+      printf '%s\n' "$cost_out" | grep -q '^Custo estimado na janela: €' || fail "linha de custo de servidor sem a linha 'Custo estimado na janela: €': $cost_out"
+      case "$cost" in *"tráfego de saída: indisponível"*) warn "a API não deu o tráfego do servidor (o relatório diz indisponível): $(printf '%s' "$cost" | cut -c1-140)" ;; esac
+      log "custo: $(printf '%s' "$cost" | cut -c1-110)" ;;
   esac
 else warn "sem hcloud ou sem o token no cofre: o custo sairia como indisponível"; fi
 
