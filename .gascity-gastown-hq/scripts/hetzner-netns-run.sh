@@ -41,8 +41,8 @@ mkdir -p "/etc/netns/$NS" && echo "nameserver 192.0.2.1" > "/etc/netns/$NS/resol
 ip netns exec "$NS" nft -f - <<'EOF' || fail nft
 table inet gtn {
   counter egress { }
-  chain out { type filter hook output priority 0; policy drop; oifname "lo" accept; counter name egress reject }
-  chain in { type filter hook input priority 0; policy drop; iifname "lo" accept }
+  chain out { type filter hook output priority 0; policy drop; oifname "lo" accept; counter name egress reject; }
+  chain in { type filter hook input priority 0; policy drop; iifname "lo" accept; }
 }
 EOF
 # vazio/falhou/ilegível (a regra `reject` não aparece na listagem) → 98, o comando NÃO roda: isolamento não confirmado nunca vira "isolado"
