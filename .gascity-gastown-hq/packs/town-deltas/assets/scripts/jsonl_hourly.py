@@ -28,7 +28,10 @@ SUBCOMANDOS (stdout = JSON, rc 0 ok / 1 dump ilegível / 2 uso)
 
 FAIL-CLOSED: dump truncado, com lixo depois do `}` final, com vírgula sobrando ou fora da forma
   `{"rows":[...]}` / `{}` é ERRO, nunca "contei até onde deu": uma contagem parcial passaria por contagem do
-  manifest e a prova de restore compararia dois números igualmente errados.
+  manifest e a prova de restore compararia dois números igualmente errados. Idem para o tar de entrada do build sem a marca
+  de fim (cortado num limite de membro), e para o manifest cujo inspect e build não descrevem os mesmos arquivos com os mesmos
+  bytes. Na retenção, só snapshot COMPLETO (tar.gz + manifest) ocupa vaga do piso ou ancora o "primeiro do dia", e botão fora do
+  limite (--floor < 1, janela < 0) é recusado com rc 2 em vez de afinar a política.
 """
 import argparse
 import codecs
@@ -48,9 +51,11 @@ CHUNK = 8 * 1024 * 1024
 # arquivo é lixo e ler o resto dele para a memória só atrasaria o erro.
 MAX_ROW_CHARS = 128 * 1024 * 1024
 
-_WS = re.compile(r"\s*")
-_HEAD = re.compile(r'\s*\{\s*"rows"\s*:\s*\[')
-_EMPTY = re.compile(r"\s*\{\s*\}\s*\Z")
+# espaço de JSON são exatamente 4 caracteres; `\s` casaria também NBSP, U+2028, VT, FF — e "lixo depois do } final é erro" não valeria
+_W = r"[ \t\r\n]*"
+_WS = re.compile(_W)
+_HEAD = re.compile(_W + r'\{' + _W + r'"rows"' + _W + r':' + _W + r'\[')
+_EMPTY = re.compile(_W + r'\{' + _W + r'\}' + _W + r'\Z')
 
 
 class DumpError(Exception):
@@ -58,7 +63,11 @@ class DumpError(Exception):
 
 
 def iter_rows(fh, chunk=CHUNK):
-    """Gera cada objeto de `rows` lendo `fh` (binário) em blocos; memória ~ bloco + maior linha."""
+    """Gera cada objeto de `rows` lendo `fh` (binário) em blocos; memória ~ bloco + maior linha.
+
+    ATENÇÃO a quem consome em streaming: as linhas saem ANTES de o fim do documento ser validado. Se o iterador levantar
+    DumpError (truncado, lixo depois do `}`), tudo que já foi emitido tem que ser descartado — só `count_rows` é seguro
+    por construção (a exceção joga fora o contador)."""
     dec = codecs.getincrementaldecoder("utf-8")(errors="strict")
     jd = json.JSONDecoder()
     st = {"buf": "", "pos": 0, "eof": False}
@@ -190,6 +199,24 @@ class _Hasher(io.RawIOBase):
         return b
 
 
+class _Tail:
+    """Leitura do tar de entrada que lembra os últimos 1024 bytes. O tarfile em modo stream lê um tar cortado num limite de membro
+    como "fim do arquivo"; a marca de fim (>= 1024 bytes NUL, que todo tar completo tem) é o que separa o completo do cortado.
+    Escaparia à checagem só um tar cortado logo depois de um membro cujo PRÓPRIO conteúdo termina em >= 1024 NUL (um .jsonl termina em `}` ou `}\\n`)."""
+
+    def __init__(self, src):
+        self.src, self.tail, self.n = src, b"", 0
+
+    def read(self, size=-1):
+        b = self.src.read(size)
+        self.n += len(b)
+        self.tail = (self.tail + b)[-1024:]
+        return b
+
+    def has_end_marker(self):
+        return self.n >= 1024 and self.tail == bytes(1024)
+
+
 def parse_ignore(spec):
     """'a*, b_* ,' -> ['a*', 'b_*']. Aparado e sem itens vazios (um padrão vazio não pode virar 'casa com tudo')."""
     return [x.strip() for x in (spec or "").split(",") if x.strip()]
@@ -204,13 +231,16 @@ def cmd_build(args):
     files, skipped = [], []
     seen = set()
     ignore, ignored = parse_ignore(args.ignore_db), set()
+    tail = _Tail(sys.stdin.buffer)
     # fileobj + filename="" : o GzipFile não grava o nome do arquivo de saída no cabeçalho, então o mesmo
     # conteúdo dá os mesmos bytes (e o mesmo sha256) em qualquer diretório de trabalho
-    with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as src, open(args.out, "wb") as raw, \
+    with tarfile.open(fileobj=tail, mode="r|") as src, open(args.out, "wb") as raw, \
             gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=args.level, mtime=0) as gz, \
             tarfile.open(fileobj=gz, mode="w|", format=tarfile.PAX_FORMAT) as dst:
         for m in src:
             if not m.isreg():
+                if m.issym() or m.islnk():
+                    skipped.append(m.name)   # não viaja, mas é NOMEADO; diretórios (um por pasta no git archive) não entram
                 continue
             name = m.name
             mm = MEMBER_RE.match(name)
@@ -232,6 +262,12 @@ def cmd_build(args):
             if hs.n != m.size:
                 raise SystemExit("leitura curta em %s: %d de %d bytes" % (name, hs.n, m.size))
             files.append({"path": name, "bytes": hs.n, "sha256": hs.h.hexdigest()})
+        # o tarfile para na 1ª faixa de zeros; o resto do stdin é lido até o fim para conferir a marca de fim do tar
+        # vazio (stdin já no fim) → o laço não roda e a marca é conferida; falhou (OSError) → sobe ao main: rc 1 e o --files-out não é escrito
+        while tail.read(CHUNK):
+            pass
+        if not tail.has_end_marker():
+            raise SystemExit("tar de entrada sem a marca de fim (cortado num limite de membro?): %d bytes lidos" % tail.n)
     sha, n = sha256_file(args.out)
     doc = {"files": files, "skipped": skipped, "ignored_dbs": sorted(ignored), "ignore_patterns": ignore,
            "artifact": {"bytes": n, "sha256": sha}}
@@ -296,6 +332,18 @@ def build_manifest(insp, built, meta, required_dbs):
     problems = []
     for e in insp.get("errors", []):
         problems.append("%s: %s" % (e["path"], e["error"]))
+    # o veredito é calculado sobre o que o inspect LEU; o que subiu é o que o build GRAVOU. Têm que ser o mesmo conjunto, com os mesmos
+    # bytes — senão ok descreveria outro artefato.
+    # vazio (inspect sem arquivos) → tudo que o build gravou vira "não lido": broken; falhou/ilegível (sem a chave `files`) → o mesmo, broken
+    insp_bytes = {f["path"]: f.get("bytes") for f in insp.get("files", [])}
+    built_bytes = {f["path"]: f["bytes"] for f in built.get("files", [])}
+    for p in sorted(set(insp_bytes) | set(built_bytes)):
+        if p not in insp_bytes:
+            problems.append("%s gravado pelo build mas não lido do artefato" % p)
+        elif p not in built_bytes:
+            problems.append("%s lido do artefato mas não gravado pelo build" % p)
+        elif insp_bytes[p] != built_bytes[p]:
+            problems.append("%s: %s bytes lidos do artefato, %s gravados pelo build" % (p, insp_bytes[p], built_bytes[p]))
     dbs = insp.get("databases", {})
     for db, tables in sorted(dbs.items()):
         for t in TABLES:
@@ -367,14 +415,15 @@ def retention_deletes(keys, prefix, now, keep_recent_s, keep_daily_days, floor, 
         d["kinds"].add(m.group(3))
     if not stems:
         return []
-    # o piso conta só snapshots COMPLETOS: uploads quebrados em sequência não podem ocupar as vagas dos bons
+    # o piso e o "primeiro do dia" contam só snapshots COMPLETOS: um upload quebrado não pode ocupar a vaga de um bom — nem a
+    # sequência do piso, nem a âncora do dia (órfão como 1º carimbo do dia apagaria todos os completos daquele dia)
     complete_desc = [x for x in sorted(stems, key=lambda x: stems[x]["ts"], reverse=True)
                      if stems[x]["kinds"] == {"tar.gz", "manifest.json"}]
     keep = set(complete_desc[:floor])
     if protect:
         keep.add(protect)
     first_of_day = {}
-    for st in sorted(stems, key=lambda x: stems[x]["ts"]):
+    for st in sorted(complete_desc, key=lambda x: stems[x]["ts"]):
         day = datetime.datetime.fromtimestamp(stems[st]["ts"], datetime.timezone.utc).strftime("%Y%m%d")
         first_of_day.setdefault(day, st)
     for st, d in stems.items():
@@ -398,6 +447,16 @@ def retention_deletes(keys, prefix, now, keep_recent_s, keep_daily_days, floor, 
         for kind in sorted(stems[st]["kinds"]):
             out.append("%s/snap/%s.%s" % (prefix, st, kind))
     return out
+
+
+def _int_min(lo):
+    def conv(s):
+        v = int(s)   # não-número: ValueError, que o argparse transforma em rc 2
+        if v < lo:
+            raise argparse.ArgumentTypeError("precisa ser >= %d (recebi %d)" % (lo, v))
+        return v
+    conv.__name__ = "inteiro"
+    return conv
 
 
 def cmd_retention(args):
@@ -441,9 +500,11 @@ def main(argv=None):
     rt = sub.add_parser("retention")
     rt.add_argument("--prefix", required=True)
     rt.add_argument("--now", type=int, required=True)
-    rt.add_argument("--keep-recent-h", type=int, default=48)
-    rt.add_argument("--keep-daily-days", type=int, default=14)
-    rt.add_argument("--floor", type=int, default=6)
+    # único caminho que decide o que se APAGA do backup de DR (a lista sai em stdout; quem apaga é o chamador): valor que afinaria a
+    # política abaixo do piso é recusado (rc 2), não aplicado
+    rt.add_argument("--keep-recent-h", type=_int_min(0), default=48)
+    rt.add_argument("--keep-daily-days", type=_int_min(0), default=14)
+    rt.add_argument("--floor", type=_int_min(1), default=6)
     rt.add_argument("--protect", default="")
     rt.set_defaults(fn=cmd_retention)
     args = ap.parse_args(argv)

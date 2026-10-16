@@ -9,12 +9,15 @@ COMO RODAR: python3 -I jsonl_hourly.selftest.py   (rc 0 = tudo passou; a última
 O QUE PROVA:
   A. o parser incremental conta certo em QUALQUER tamanho de bloco (1 byte inclusive) e REJEITA todo dump truncado,
      com lixo, com vírgula sobrando ou não-UTF-8 — a varredura de truncamento cobre cada prefixo possível de um dump válido;
-  B. build/inspect: só entram <db>/<tabela>.jsonl, o artefato é determinístico, lixo de export abortado fica de fora e
-     tabela ilegível vira erro (nunca contagem parcial);
-  C. manifest: broken quando falta tabela, banco obrigatório ou há erro de parse;
+     só os 4 espaços de JSON valem como espaço (NBSP, U+2028, VT, FF são lixo);
+  B. build/inspect: só entram <db>/<tabela>.jsonl, o artefato é determinístico, lixo de export abortado fica de fora, symlink/
+     hardlink é NOMEADO em skipped, tar de entrada cortado num limite de membro falha (rc != 0) e tabela ilegível vira erro;
+  C. manifest: broken quando falta tabela, banco obrigatório ou há erro de parse, ou quando o inspect e o build não descrevem os
+     mesmos arquivos com os mesmos bytes;
   C2. banco ignorado (--ignore-db): sai do artefato, é NOMEADO no manifest, e nunca vale para banco obrigatório;
   E. retention: só toca chaves no formato exato, respeita piso, janela recente, primeiro do dia e o protegido; uma chave na
-     forma exata mas com data impossível (mês 13) é ignorada, reportada e nunca apagada, sem parar a retenção das outras.
+     forma exata mas com data impossível (mês 13) é ignorada, reportada e nunca apagada, sem parar a retenção das outras;
+     upload quebrado (sem manifest) não ancora o "primeiro do dia" nem ocupa o piso; botão fora do limite é recusado (rc 2).
 NÃO COBRE o lado do restore (convert/extract/reconcile): a suíte dele é jsonl_hourly_restore.selftest.py (ga-c0939v.3); os blocos
   seguem o nome original A-E do commit 629fdabf1, por isso não há bloco D aqui.
 """
@@ -111,6 +114,12 @@ bad_docs = {
     "{}{}": b"{}{}",
     "não-UTF8": b'{"rows":[{"a":"\xff\xfe"}]}',
     "json inválido na linha": b'{"rows":[{"a":}]}',
+    # espaço que NÃO é espaço de JSON (só ' ', \t, \n, \r são): o docstring promete que lixo depois do } final é erro
+    "NBSP depois do } final": b'{"rows":[{"a":"1"}]}\xc2\xa0',
+    "U+2028 entre as linhas": b'{"rows":[{"a":"1"}\xe2\x80\xa8,{"a":"2"}]}',
+    "NBSP antes do cabeçalho": b'\xc2\xa0{"rows":[]}',
+    "NBSP em {} vazio": b"{}\xc2\xa0",
+    "VT depois do ]": b'{"rows":[{"a":"1"}]\x0b}',
 }
 for name, data in bad_docs.items():
     got = [raises(data, c) for c in CHUNKS]
@@ -139,6 +148,9 @@ def why(data, chunk):
 check("dump cortado depois de uma linha completa diz que truncou DENTRO de rows (não só que falta o })",
       all("truncado dentro de rows" in why(b'{"rows":[{"a":"1"}', c) for c in CHUNKS), [why(b'{"rows":[{"a":"1"}', c) for c in CHUNKS])
 check("o dump inteiro e o dump sem o \\n final são aceitos", len(rows(doc, 3)) == 2 and len(rows(doc[:-1], 3)) == 2)
+ws_ok = b'{"rows":\t[ {"a":"1"}\t,\r\n{"a":"2"} ]\r\n}\r\n'
+check("os 4 espaços de JSON (espaço, tab, \\r, \\n) seguem aceitos em todo lugar", all(len(rows(ws_ok, c)) == 2 for c in CHUNKS)
+      and all(len(rows(b" \t\r\n{}\r\n\t ", c)) == 0 for c in CHUNKS))
 
 # ── B. build / inspect ────────────────────────────────────────────────────────────────
 print("-- B. build / inspect")
@@ -196,6 +208,35 @@ with tempfile.TemporaryDirectory(prefix="jhst.") as T:
                      stdin=make_tar([("hq/issues.jsonl", "{}"), ("hq/issues.jsonl", "{}")]))
     check("build: membro repetido => erro (não escolhe um em silêncio)", rc != 0, "%s %s" % (so, se))
 
+    # tar de entrada cortado num LIMITE de membro: o tarfile em modo stream lê isso como "fim do arquivo" e o build dava rc 0 com
+    # o banco inteiro faltando. Um tar completo termina em >= 1024 bytes NUL; sem isso o build tem que falhar, em qualquer ponto de corte.
+    offs = [mi.offset for mi in tarfile.open(fileobj=io.BytesIO(tar_bytes)).getmembers()]
+    cut_rcs = {}
+    for idx in (1, 6, 12):   # começo do 2º, do 7º (o banco 'wa' some inteiro) e do 13º membro
+        cut_rcs[idx] = run("build", "--out", os.path.join(T, "cut.tar.gz"), "--files-out", os.path.join(T, "cut.json"), stdin=tar_bytes[:offs[idx]])
+    check("build: tar cortado num limite de membro => rc != 0 e a causa vai para o stderr (não rc 0 com banco faltando)",
+          all(r[0] != 0 and r[2].strip() for r in cut_rcs.values()), repr({i: (r[0], r[2][-80:]) for i, r in cut_rcs.items()}))
+    rc, so, se = run("build", "--out", os.path.join(T, "full.tar.gz"), "--files-out", os.path.join(T, "full.json"), stdin=tar_bytes)
+    check("build: o tar completo (com a faixa final de zeros) segue passando", rc == 0, "%s %s" % (so, se))
+
+    # symlink/hardlink não viaja, mas não pode sumir em silêncio: entra em skipped (e daí em `excluded` do manifest).
+    # Diretórios NÃO entram: o `git archive` emite um por pasta e inundaria o manifest.
+    bio = io.BytesIO()
+    with tarfile.open(fileobj=bio, mode="w") as tf_:
+        for nm, ty, ln in (("hq", tarfile.DIRTYPE, ""), ("wa/labels.jsonl", tarfile.SYMTYPE, "issues.jsonl"), ("wa/config.jsonl", tarfile.LNKTYPE, "hq/config.jsonl")):
+            ti = tarfile.TarInfo(name=nm)
+            ti.type, ti.linkname = ty, ln
+            tf_.addfile(ti)
+        for nm, content in db_members("hq", [{"id": "hq-1"}]):
+            ti = tarfile.TarInfo(name=nm)
+            ti.size = len(content.encode())
+            tf_.addfile(ti, io.BytesIO(content.encode()))
+    link_out, link_files = os.path.join(T, "link.tar.gz"), os.path.join(T, "link.json")
+    rc, so, se = run("build", "--out", link_out, "--files-out", link_files, stdin=bio.getvalue())
+    link_built = json.load(open(link_files))
+    check("build: symlink e hardlink ficam NOMEADOS em skipped; o diretório não", rc == 0
+          and sorted(link_built["skipped"]) == ["wa/config.jsonl", "wa/labels.jsonl"], "%s %s" % (rc, link_built["skipped"]))
+
     bad_members = db_members("hq", [{"id": "hq-1"}]) + [("hq/comments.jsonl", '{"rows":[{"id":"c1"},{"id":"c2"')]
     bad_members = [m for i, m in enumerate(bad_members) if not (m[0] == "hq/comments.jsonl" and i < 5)]
     outb, fb = os.path.join(T, "e.tar.gz"), os.path.join(T, "e.json")
@@ -220,6 +261,27 @@ with tempfile.TemporaryDirectory(prefix="jhst.") as T:
     check("manifest: banco obrigatório com 0 issues => broken", jh.build_manifest(zero, built, meta, ["wa"])["verdict"] == "broken")
     check("manifest: sem bancos => broken", jh.build_manifest({"databases": {}, "files": [], "errors": []}, built, meta, [])["verdict"] == "broken")
     check("manifest: erro de parse no artefato => broken", jh.build_manifest(insp_bad, built, meta, [])["verdict"] == "broken")
+    # o que o build gravou e o que o inspect leu do artefato têm que ser o MESMO conjunto, com os mesmos bytes: senão o veredito
+    # (calculado sobre o que foi lido) descreve outra coisa que não o que subiu, e files[].rows sai null com verdict ok.
+    no_wa = json.loads(json.dumps(insp))
+    del no_wa["databases"]["wa"]
+    no_wa["files"] = [f for f in no_wa["files"] if not f["path"].startswith("wa/")]
+    mw = jh.build_manifest(no_wa, built, meta, [])
+    check("manifest: banco gravado pelo build mas AUSENTE do que o inspect leu (e não obrigatório) => broken, nomeando o arquivo",
+          mw["verdict"] == "broken" and any("wa/issues.jsonl" in p for p in mw["problems"]), json.dumps(mw["problems"])[:200])
+    diff_b = json.loads(json.dumps(insp))
+    diff_b["files"][0]["bytes"] += 1
+    md = jh.build_manifest(diff_b, built, meta, [])
+    check("manifest: bytes do arquivo diferentes entre o inspect e o build => broken, nomeando o arquivo",
+          md["verdict"] == "broken" and any(diff_b["files"][0]["path"] in p for p in md["problems"]), json.dumps(md["problems"])[:200])
+    extra = json.loads(json.dumps(insp))
+    extra["files"].append({"path": "hq/fantasma.jsonl", "bytes": 3, "rows": 0})
+    me = jh.build_manifest(extra, built, meta, [])
+    check("manifest: arquivo que o inspect leu e o build não gravou => broken, nomeando o arquivo",
+          me["verdict"] == "broken" and any("hq/fantasma.jsonl" in p for p in me["problems"]), json.dumps(me["problems"])[:200])
+    nofiles = json.loads(json.dumps(insp))
+    del nofiles["files"]
+    check("manifest: inspect sem a chave `files` (ilegível) => broken, nunca ok", jh.build_manifest(nofiles, built, meta, [])["verdict"] == "broken")
     miss = json.loads(json.dumps(insp))
     del miss["databases"]["hq"]["labels"]
     mm = jh.build_manifest(miss, built, meta, [])
@@ -358,6 +420,34 @@ check("retention: a chave de data impossível NUNCA é apagada e vem em `skipped
 rc, so, se = run("retention", "--prefix", P, "--now", str(int(NOW.timestamp())), stdin="\n".join(keys_for(hourly) + junk_keys).encode())
 check("retention (CLI): rc 0, mesma saída, e o stderr NOMEIA a chave ignorada (não é silêncio)",
       rc == 0 and so.split() == dels and junk_stem in se, "rc=%s stderr=%s" % (rc, se[-160:]))
+
+# Upload quebrado (tar.gz sem manifest) que é o PRIMEIRO carimbo do dia: ele não pode ser a âncora do "primeiro do dia", senão
+# nenhum snapshot COMPLETO daquele dia fica (o órfão nunca pode ser mantido, e o dia some da faixa de 2-14 dias).
+orphan_first = "20261011T000000Z-%012x" % 0xa01                                   # D-5, 00h: órfão, já passou da carência de 2 h
+day_complete = ["20261011T%02d0000Z-%012x" % (h, 0xb00 + h) for h in (1, 2, 3)]  # D-5, 01h/02h/03h: completos
+recent_ok = [stem(h, 0xc00 + h) for h in range(10)]                                # 10 recentes completos: o piso de 6 já está coberto
+with_orphan = keys_for(day_complete + recent_ok) + ["%s/snap/%s.tar.gz" % (P, orphan_first)]
+d_orphan = retention(with_orphan)
+d_ctrl = retention(keys_for(day_complete + recent_ok))
+kept_day = [s for s in day_complete if "%s/snap/%s.tar.gz" % (P, s) not in d_orphan]
+check("retention: controle sem o órfão — exatamente 1 snapshot completo do dia D-5 fica (o primeiro)",
+      [s for s in day_complete if "%s/snap/%s.tar.gz" % (P, s) not in d_ctrl] == [day_complete[0]], str(d_ctrl))
+check("retention: órfão como 1º carimbo do dia NÃO é âncora — o 1º snapshot COMPLETO do dia continua salvo (mesmo resultado do controle)",
+      kept_day == [day_complete[0]], "completos mantidos de D-5: %s" % kept_day)
+check("retention: o órfão velho continua sendo apagado (lixo), só que sem levar os completos junto",
+      "%s/snap/%s.tar.gz" % (P, orphan_first) in d_orphan)
+
+# Botões da retenção: é o único caminho que APAGA do backup de DR. Valor que afina a política abaixo do piso (--floor -1 mantém
+# todos MENOS o mais novo; janela negativa nada protege) é recusado no argparse (rc 2, nada na saída), nunca aplicado.
+stdin_keys = "\n".join(keys_for(hourly)).encode()
+base_args = ["retention", "--prefix", P, "--now", str(int(NOW.timestamp()))]
+bad_knobs = {"--floor -1": ["--floor", "-1"], "--floor 0": ["--floor", "0"], "--floor x": ["--floor", "x"],
+             "--keep-recent-h -1": ["--keep-recent-h", "-1"], "--keep-daily-days -1": ["--keep-daily-days", "-1"]}
+got_knobs = {k: run(*(base_args + v), stdin=stdin_keys) for k, v in bad_knobs.items()}
+check("retention (CLI): botão fora do limite (floor<1, janela<0, não-número) => rc 2 e NADA em stdout",
+      all(r[0] == 2 and not r[1].strip() for r in got_knobs.values()), repr({k: (r[0], r[1][:40]) for k, r in got_knobs.items()}))
+rc0, so0, _ = run(*(base_args + ["--keep-daily-days", "0", "--keep-recent-h", "0", "--floor", "1"]), stdin=stdin_keys)
+check("retention (CLI): os limites exatos (janelas 0, piso 1) são aceitos", rc0 == 0 and so0.strip() != "")
 
 print("=== RESULT: PASS=%d FAIL=%d ===" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
