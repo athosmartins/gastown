@@ -1,0 +1,44 @@
+# hetzner-scrape-eligible.txt — quais raspadores de imóveis (property_scrapers) podem rodar no nó Hetzner (IP alemão). Lido por scripts/hetzner-scrape-round.sh.
+#
+# Contents
+#   Sintaxe · Como esta lista foi medida · Permitidos · Bloqueados · Nunca medidos
+#
+# SINTAXE (uma por linha; a chave é o NOME DA PASTA em scrapers/, não o id do runner.py — `zap_vivareal_contagem` e `netimoveis_contagem` usam as pastas zap_vivareal e netimoveis):
+#   raspador            permite o raspador (todos os tenants)
+#   raspador:tenant     permite só aquele tenant
+#   !raspador           BLOQUEIA (vence qualquer permissão); o texto depois de `#` é o motivo mostrado a quem pedir
+#   !raspador:tenant    bloqueia só aquele tenant
+# Raspador que não aparece aqui NÃO roda no nó: "não medi" não é "libera".
+#
+# COMO FOI MEDIDO (ga-mqs133, 16/10/2026, do nó 2.31.41.222 / 2a01:4f8:c012:fa40::1, com o código implantado em ~/.property-scrapers/runtime/main):
+#   1. `hetzner-scrape-round.sh probe`: 51 endereços (home de cada site e de cada tenant ativo + as APIs), curl com UA de navegador, dos dois lados: 36 respondem 2xx igual; 6 falham igual dos dois lados (API que não
+#      aceita GET simples, wimoveis, glue-api da ZAP); 1 (netimoveis /pesquisa) dá 404 no mini e 403 no nó; 8 só respondem do mini (403 do Cloudflare no nó: chavesnamao, netimoveis, larimoveis, ciadoimovelbh, imobiliariamodelobh, nucleoleiloes, caixa).
+#   2. Rodada de verdade, com o código do launchd diário, só limitada por --limit: quem terminou com 0 erro entra em PERMITIDOS; quem tomou 403 ou estourou o tempo entra em BLOQUEADOS.
+#   Para re-medir quando o IP do servidor mudar:  scripts/hetzner-scrape-round.sh probe
+#
+# PERMITIDOS — rodada real no nó, 0 erro (itens = o --limit da medição)
+primeimoveisdeluxo      # 15 de 15
+vistaimobi              # tenant alianza: 10 (3 novos, 7 fora do escopo); as homes dos demais tenants ativos respondem igual
+oksite                  # tenant eccos: 10; homes de imotec e bos respondem igual
+luizrenato              # 10 de 10
+santoagostinho          # 10 de 10
+bonsucesso              # 10 tentados, 0 erro (9 fora do escopo)
+imoview                 # tenants decisao e valore: 20 de 20 cada (decisao em 22 s, valore em 24 s); as homes de TODOS os tenants ativos respondem igual
+quintoandar             # 10 arquivos, 0 erro (a API apigw responde igual)
+loft                    # 30 de 30 via --use-api; a API de condomínios devolve 429 após ~15 chamadas e o próprio raspador a desliga no meio da rodada (limite de taxa, não bloqueio de IP)
+silvioximenes           # 10 de 10
+anuar_donato            # 40 raspados (21 novos), 0 erro
+#
+# BLOQUEADOS — 403 do Cloudflare (ou sem resposta) vindo do IP do nó; do mini funcionam
+!chavesnamao            # home e listagem de BH: 403 "Just a moment" do nó, 200 do mini
+!netimoveis             # 403 do nó, na home e em /pesquisa; vale também para netimoveis_contagem
+!larimoveis             # 403 do nó
+!ciadoimovel            # 403 do nó
+!imobiliariamodelobh    # 403 do nó
+!leilao_nucleo          # 403 do nó
+!leilao_caixa           # 403 do nó; o próprio mini já recebe a página de captcha
+!zap_vivareal           # com o código implantado: 403 em toda chamada de listagem da glue-api, 0 arquivo em 120 s (é a maior: ~4400 s no mini); vale também para zap_vivareal_contagem
+!wimoveis               # 403 "Just a moment" até do mini no curl simples: inconclusivo, fica local
+!blow                   # usa credencial e é Node (scrape_all_bh.js): credencial não vai para o servidor alugado
+#
+# NUNCA MEDIDOS (ficam fora de propósito até alguém medir): alfenas leilao_comprei leilao_spy mybrokerbh myside provincia_imoveis sancruza terreno_livre
