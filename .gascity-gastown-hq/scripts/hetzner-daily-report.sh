@@ -12,12 +12,13 @@
 #     hetzner-daily-report) · --no-cost  não chama a API (selftest, ou sem rede). O token vem de HCLOUD_TOKEN ou do cofre (`secret Hetzner --field notes`).
 #     Variáveis: HETZNER_SERVER_LABEL (padrão projeto=ga-27oza3: os servidores contados), HETZNER_REPORT_CITY.
 # O QUE O RELATÓRIO DIZ
-#   • baterias por host (hetzner | mbp) com rc 0 / rc 1 / outro, tempo médio, mediana e máximo — o lado de MBP da sombra NÃO entra (é contado à parte);
+#   • baterias por host (hetzner | mbp) com rc 0 / rc 1 / outro, tempo médio, mediana (com quantidade par, a média dos dois do meio) e máximo — o lado de MBP da sombra (execuções E recusas) NÃO entra, é contado à parte;
 #   • recusas e fallbacks por host e motivo (inalcancavel, ram, slots, mac-only, filtro-invalido, rsync-falhou...): é a medida de "o servidor segurou?";
 #   • a sombra: mesmo rc / divergência / não rodou / estourou o tempo, e os arquivos que viraram mac-only;
 #   • o custo: preço/hora do tipo no local do servidor × horas de vida dentro da janela (estimativa; a fatura é por hora cheia), horas desde a criação e tráfego.
 # ESTADOS QUE NÃO SE CONFUNDEM: sem log ainda · log ilegível · zero execuções · custo "indisponível (motivo)" — nunca "0" no lugar de "não consegui saber".
-#   Linha do log que não dá para ler vem AVISADA ("N linha(s) ilegível(is)"), não omitida. Lista mac-only aprendida que não abre diz "sem arquivo … ou ilegível", nunca "0 arquivo(s)".
+#   Linha do log que não dá para ler vem AVISADA ("N linha(s) ilegível(is)"), não omitida — vale também para a que é JSON com ts mas que o relatório não sabe classificar
+#   (sem mode, host que não é hetzner|mbp [sem o campo = mbp], rc/secs que não são número, recusa sem motivo, marcador de sombra ou veredito desconhecido). Lista mac-only aprendida que não abre diz "sem arquivo … ou ilegível", nunca "0 arquivo(s)".
 #   Texto que não se formou (jq falhou) sai rc 4 com ALERTA e, com --mail, NADA é enviado: relatório truncado não passa por completo.
 set -o pipefail
 CITY=${HETZNER_REPORT_CITY:-${GC_CITY_PATH:-${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}}}
@@ -30,7 +31,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 hours=24; as_json=0; do_mail=0; do_cost=1
 while [ $# -gt 0 ]; do
   case "$1" in
-    --hours) hours="${2:-}"; shift 2 ;;
+    --hours) [ $# -ge 2 ] || { echo "hetzner-daily-report: --hours precisa de um valor (inteiro >= 1)" >&2; exit 2; }; hours="$2"; shift 2 ;;
     --json) as_json=1; shift ;;
     --mail) do_mail=1; shift ;;
     --no-cost) do_cost=0; shift ;;
@@ -57,20 +58,28 @@ if [ -f "$LOG" ]; then
           | {n: $n, rc0: ([$xs[] | select(.rc == 0)] | length), rc1: ([$xs[] | select(.rc == 1)] | length),
              other: ([$xs[] | select(.rc != 0 and .rc != 1)] | length),
              mean_s: (if ($s | length) > 0 then ((($s | add) / ($s | length)) | floor) else null end),
-             median_s: (if ($s | length) > 0 then ($s | sort | .[(length / 2 | floor)]) else null end),
+             median_s: (if ($s | length) > 0 then ($s | sort | length as $m | if $m % 2 == 1 then .[($m - 1) / 2] else ((.[$m / 2 - 1] + .[$m / 2]) / 2) end) else null end),
              max_s: (if ($s | length) > 0 then ($s | max) else null end)} end;
+    # uma linha SEM "host" é de antes do campo existir (= mbp); com "host", só hetzner|mbp são conhecidos
+    def host: if has("host") then .host else "mbp" end;
+    # linha com ts válido que o relatório sabe CLASSIFICAR; a que não sabe vai para `bad` (avisada), nunca se comporta como linha que não existe
+    def readable:
+      (.mode | type) == "string" and (host | . == "hetzner" or . == "mbp") and ((has("shadow") | not) or .shadow == 1)
+      and (if .mode == "preflight" then (.reason | type) == "string" else (.rc | type) == "number" and (.secs | type) == "number" end);
     [split("\n")[] | select(length > 0) | (try fromjson catch null)
       | if type == "object" and ((try (.ts | fromdateiso8601) catch null) | type) == "number" then {l: ., t: (.ts | fromdateiso8601)} else {bad: 1} end] as $e
-    | ([$e[] | select(.bad)] | length) as $bad
     | [$e[] | select(.l and .t >= $since) | .l] as $w
-    | ([$w[] | select((.mode | type) == "string" and .mode != "preflight" and .shadow != 1)]) as $runs
-    | ([$w[] | select((.mode | type) == "string" and .mode != "preflight" and .shadow == 1)] | length) as $sh
-    | ([$w[] | select(.mode == "preflight" and (.reason | type) == "string")]) as $ref
-    | {bad: $bad, shadow_mbp_side: $sh,
-       hetzner: stat([$runs[] | select((.host // "mbp") == "hetzner")]),
-       mbp: stat([$runs[] | select((.host // "mbp") == "mbp")]),
-       refusals: {hetzner: ([$ref[] | select(.host == "hetzner")] | group_by(.reason) | map({key: .[0].reason, value: length}) | from_entries),
-                  mbp: ([$ref[] | select((.host // "mbp") == "mbp")] | group_by(.reason) | map({key: .[0].reason, value: length}) | from_entries)}}
+    | [$w[] | select(readable)] as $ok
+    | ((([$e[] | select(.bad)] | length) + (($w | length) - ($ok | length)))) as $bad
+    | ([$ok[] | select(.mode != "preflight" and .shadow != 1)]) as $runs
+    | ([$ok[] | select(.mode != "preflight" and .shadow == 1)] | length) as $sh
+    | ([$ok[] | select(.mode == "preflight" and .shadow != 1)]) as $ref
+    | ([$ok[] | select(.mode == "preflight" and .shadow == 1)] | length) as $shref
+    | {bad: $bad, shadow_mbp_side: $sh, shadow_mbp_refused: $shref,
+       hetzner: stat([$runs[] | select(host == "hetzner")]),
+       mbp: stat([$runs[] | select(host == "mbp")]),
+       refusals: {hetzner: ([$ref[] | select(host == "hetzner")] | group_by(.reason) | map({key: .[0].reason, value: length}) | from_entries),
+                  mbp: ([$ref[] | select(host == "mbp")] | group_by(.reason) | map({key: .[0].reason, value: length}) | from_entries)}}
   ' "$LOG" 2>/dev/null) || runs_json='"ilegivel"'
   [ -n "$runs_json" ] || runs_json='"ilegivel"'
 fi
@@ -80,7 +89,7 @@ shadow_json='"sem log ainda"'
 if [ -f "$SHADOW_LOG" ]; then
   shadow_json=$(jq -Rs --argjson since "$since" '
     [split("\n")[] | select(length > 0) | (try fromjson catch null)
-      | if type == "object" and ((try (.ts | fromdateiso8601) catch null) | type) == "number" and (.verdict | type) == "string" then {l: ., t: (.ts | fromdateiso8601)} else {bad: 1} end] as $e
+      | if type == "object" and ((try (.ts | fromdateiso8601) catch null) | type) == "number" and (.verdict | IN("same", "diverge", "skipped", "timeout")) then {l: ., t: (.ts | fromdateiso8601)} else {bad: 1} end] as $e
     | ([$e[] | select(.bad)] | length) as $bad
     | [$e[] | select(.l and .t >= $since) | .l] as $w
     | {bad: $bad, same: ([$w[] | select(.verdict == "same")] | length), diverge: ([$w[] | select(.verdict == "diverge")] | length),
@@ -145,7 +154,7 @@ text_report() {
     (if (.runs | type) == "string" then
         "Baterias: \(if .runs == "ilegivel" then "log ilegível — não consegui contar" else "sem log ainda" end)"
      else
-        "Baterias por host: \(hline("hetzner"; .runs.hetzner))  \(hline("mbp"; .runs.mbp))" + (if .runs.shadow_mbp_side > 0 then "  [lado de MBP da sombra, fora da conta: \(.runs.shadow_mbp_side)]" else "" end),
+        "Baterias por host: \(hline("hetzner"; .runs.hetzner))  \(hline("mbp"; .runs.mbp))" + (if .runs.shadow_mbp_side + .runs.shadow_mbp_refused > 0 then "  [lado de MBP da sombra, fora da conta: \(.runs.shadow_mbp_side) execução(ões), \(.runs.shadow_mbp_refused) recusa(s)]" else "" end),
         ([tline("hetzner"; .runs.hetzner), tline("mbp"; .runs.mbp)] | if length == 0 then "Tempo por bateria: sem execuções" else "Tempo por bateria: " + join(" | ") end),
         "Recusas/fallbacks — nó: \(rline(.runs.refusals.hetzner)) | MBP: \(rline(.runs.refusals.mbp))"
         + (if .runs.bad > 0 then "\n⚠️ \(.runs.bad) linha(s) ilegível(is) no log (não contadas)" else "" end)

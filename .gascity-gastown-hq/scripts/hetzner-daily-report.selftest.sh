@@ -5,7 +5,9 @@
 #   Casos · Controle negativo
 #
 # CASOS: sem log / log ilegível / zero execuções são três respostas diferentes · contagem por host (linha antiga sem "host" = mbp) · o lado de MBP da sombra
-#   não entra na conta · janela de horas · linha truncada AVISADA · recusas por host e motivo · tempo médio/mediana/máximo · sombra (iguais, divergências, arquivos) ·
+#   (execuções E recusas) não entra na conta · janela de horas · linha truncada AVISADA, e também a que é JSON mas não dá para classificar (sem mode, host que não é
+#   hetzner/mbp, rc/secs que não são número, recusa sem motivo, marcador de sombra ou veredito desconhecido) · --hours sem valor · recusas por host e motivo ·
+#   tempo médio/mediana (par: média dos dois do meio)/máximo · sombra (iguais, divergências, arquivos) ·
 #   lista aprendida (ausente, ilegível e só-comentário são três respostas) · texto que não se forma (rc 4, nenhum mail) · custo: preço/hora × horas na janela, servidor mais velho que a janela, e CADA falha (sem hcloud, sem token, hcloud falhou, resposta que não é
 #   JSON, lista vazia, sem preço) vira "indisponível (motivo)" e nunca "€0" · --json · --mail (ok e falha) · o wrapper do order (liga/desliga/ocioso/log ilegível).
 # CONTROLE NEGATIVO: o mutante que conta o lado de sombra como execução do MBP e o que lê custo indisponível como zero TÊM de reprovar nos casos acima.
@@ -78,7 +80,7 @@ out=$(run --no-cost)
 has "hetzner=2 (rc0=1 rc1=1)" "hetzner=2 (rc0=1 rc1=1 outro=0)" "$out"
 has "linha antiga SEM host conta como mbp (mbp=1)" "mbp=1 (rc0=1 rc1=0 outro=0)" "$out"
 has "o lado de MBP da sombra fica fora da conta e é dito" "lado de MBP da sombra, fora da conta: 1" "$out"
-has "tempo médio/mediana/máximo do nó" "hetzner média 30 s · mediana 40 s · máx 40 s" "$out"
+has "tempo médio/mediana/máximo do nó (20 s e 40 s: a mediana de dois é a média dos dois, 30 — não o de cima)" "hetzner média 30 s · mediana 30 s · máx 40 s" "$out"
 hasnt "a execução de 3 dias atrás (999 s) fica fora da janela de 24 h" "999" "$out"
 has "recusas do nó por motivo" "nó: inalcancavel=1 mac-only=1" "$out"
 has "recusas do MBP por motivo (linha sem host = mbp)" "MBP: ram=1" "$out"
@@ -87,6 +89,48 @@ out=$(run --no-cost --hours 100); has "janela maior (100 h) inclui a de 3 dias" 
 out=$(run --no-cost --hours abc); rc=$?; eq "--hours inválido: rc 2" 2 "$rc"
 out=$(run --no-cost --hours 0); rc=$?; eq "--hours 0: rc 2" 2 "$rc"
 out=$(run --no-cost --bogus); rc=$?; eq "opção desconhecida: rc 2" 2 "$rc"
+# --hours como ÚLTIMO argumento travava num laço infinito (o `shift 2` falha sem consumir nada): por isso o caso roda com teto de 5 s (124 = travou)
+run_capped() {
+  local pid i; HETZNER_REPORT_CITY="$C" PATH="$T/bin:$SAFEPATH" "$REPORT" "$@" >"$T/capped.out" 2>"$T/err" & pid=$!
+  for i in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null; { wait "$pid"; } 2>/dev/null; return 124; fi
+  wait "$pid"
+}
+run_capped --no-cost --hours; rc=$?; eq "--hours sem valor (último argumento): rc 2, não trava" 2 "$rc"; has "…e diz o que faltou" "--hours precisa de um valor" "$(cat "$T/err")"
+
+echo "--- mediana"
+reset; { L "$now" 0 10 ',"host":"hetzner"'; L "$now" 0 20 ',"host":"hetzner"'; L "$now" 0 30 ',"host":"hetzner"'; L "$now" 0 100 ',"host":"hetzner"'; } > "$LOG"
+out=$(run --no-cost); has "mediana de quantidade PAR: média dos dois do meio (10 20 30 100 → 25), não o de cima (30)" "mediana 25 s" "$out"
+reset; { L "$now" 0 15 ',"host":"hetzner"'; L "$now" 0 10 ',"host":"hetzner"'; } > "$LOG"
+out=$(run --no-cost); has "mediana de dois valores é a média deles (12.5), não o maior (15)" "mediana 12.5 s" "$out"
+reset; { L "$now" 0 50 ',"host":"hetzner"'; L "$now" 0 10 ',"host":"hetzner"'; L "$now" 0 20 ',"host":"hetzner"'; } > "$LOG"
+out=$(run --no-cost); has "mediana de quantidade ÍMPAR continua sendo o do meio (10 20 50 → 20)" "mediana 20 s" "$out"
+
+echo "--- linha que não dá para classificar é AVISADA, nunca se comporta como linha que não existe"
+BADMSG="linha(s) ilegível(is) no log (não contadas)"
+reset; { L "$now" 0 5 ',"host":"hetzner"'; printf '{"ts":"%s","repo":"wa","slot":"1","rc":0,"secs":3,"host":"hetzner"}\n' "$now"; } > "$LOG"
+out=$(run --no-cost); has "ts válido mas SEM 'mode': avisada" "⚠️ 1 $BADMSG" "$out"; has "…e não vira execução (hetzner=1)" "hetzner=1 (rc0=1" "$out"
+reset; { L "$now" 0 5 ',"host":"hetzner"'; printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"host":"hetzner"}\n' "$now"; } > "$LOG"
+out=$(run --no-cost); has "recusa SEM motivo em texto: avisada (não vira 'nenhuma' calada)" "⚠️ 1 $BADMSG" "$out"
+reset; { L "$now" 0 5 ',"host":"hetzner"'; L "$now" 0 7 ',"host":"hetzner2"'; } > "$LOG"
+out=$(run --no-cost); has "host que não é hetzner nem mbp: avisado" "⚠️ 1 $BADMSG" "$out"; has "…e não entra na conta do nó (hetzner=1)" "hetzner=1 (rc0=1" "$out"; hasnt "…nem na do MBP" "mbp=1" "$out"
+reset; { L "$now" 0 5 ',"host":"hetzner"'; R "$now" ram ',"host":"hetzner2"'; } > "$LOG"
+out=$(run --no-cost); has "recusa com host desconhecido: avisada" "⚠️ 1 $BADMSG" "$out"; has "…e não entra nas recusas do MBP" "MBP: nenhuma" "$out"
+reset; { L "$now" 0 5 ',"host":"hetzner"'; L "$now" null 5 ',"host":"hetzner"'; L "$now" '"0"' 5 ',"host":"hetzner"'; } > "$LOG"
+out=$(run --no-cost); has "rc que não é número (null, \"0\"): avisado, não vira 'outro'" "⚠️ 2 $BADMSG" "$out"; has "…e a conta do nó fica só com a linha legível" "hetzner=1 (rc0=1 rc1=0 outro=0)" "$out"
+reset; { L "$now" 0 5 ',"host":"hetzner"'; L "$now" 0 '"x"' ',"host":"hetzner"'; } > "$LOG"
+out=$(run --no-cost); has "secs que não é número: avisado (a média não é de menos linhas que o 'n')" "⚠️ 1 $BADMSG" "$out"; has "…e a conta do nó fica só com a linha legível" "hetzner=1 (rc0=1" "$out"
+reset; { L "$now" 0 5 ',"host":"hetzner"'; L "$now" 0 70 ',"host":"mbp","shadow":"sim"'; } > "$LOG"
+out=$(run --no-cost); has "marcador 'shadow' que não é 1: avisado, não vira execução do MBP" "⚠️ 1 $BADMSG" "$out"; has "…e o MBP fica em 0" "mbp=0" "$out"
+j=$(run --no-cost --json); eq "--json: runs.bad conta a linha com marcador de sombra ilegível" 1 "$(printf '%s' "$j" | jq -r '.runs.bad')"
+
+echo "--- recusa do lado de MBP da sombra fica fora das recusas do MBP"
+reset; { L "$now" 0 20 ',"host":"hetzner"'; R "$now" ram ',"host":"mbp","shadow":1'; R "$now" ram ',"host":"mbp"'; } > "$LOG"
+out=$(run --no-cost); j=$(run --no-cost --json)
+has "só a recusa SEM sombra é do MBP (ram=1, não ram=2)" "MBP: ram=1" "$out"; has "…e a do lado de sombra é dita à parte, com as execuções" "fora da conta: 0 execução(ões), 1 recusa(s)" "$out"
+eq "--json: runs.shadow_mbp_refused" 1 "$(printf '%s' "$j" | jq -r '.runs.shadow_mbp_refused')"; eq "--json: recusa da sombra não entra em refusals.mbp" '{"ram":1}' "$(printf '%s' "$j" | jq -c '.runs.refusals.mbp')"
+reset; { L "$now" 0 70 ',"host":"mbp","shadow":1'; } > "$LOG"
+out=$(run --no-cost); has "execução do lado de sombra segue dita (e diz que não houve recusa)" "fora da conta: 1 execução(ões), 0 recusa(s)" "$out"
 
 echo "--- sombra e lista aprendida"
 reset; L "$now" 0 5 ',"host":"hetzner"' > "$LOG"
@@ -108,6 +152,12 @@ printf 'tests/test_x.py\n' > "$LEARN"; chmod 000 "$LEARN"; out=$(run --no-cost);
 has "lista aprendida que não abre: 'sem arquivo … ou ilegível'" "Lista mac-only aprendida: sem arquivo" "$out"; hasnt "lista aprendida ilegível NÃO vira '0 arquivo(s)'" "0 arquivo(s)" "$out"
 eq "lista aprendida ilegível: --json traz null, não 0" "null" "$(printf '%s' "$j" | jq -c '.mac_only_learned')"
 printf '# só comentário\n\n' > "$LEARN"; out=$(run --no-cost); has "lista só com comentário: 0 arquivo(s) de verdade" "Lista mac-only aprendida: 0 arquivo(s)" "$out"
+# veredito que não é um dos quatro conhecidos não é "igual" nem "divergiu": é linha que o relatório não sabe classificar, e vem avisada
+reset; L "$now" 0 5 ',"host":"hetzner"' > "$LOG"
+{ printf '{"ts":"%s","repo":"wa","verdict":"same","a_host":"hetzner","a_rc":0,"b_host":"mbp","b_rc":0,"files":"","learned":0}\n' "$now"
+  printf '{"ts":"%s","repo":"wa","verdict":"Same","a_host":"hetzner","a_rc":0,"b_host":"mbp","b_rc":0,"files":"","learned":0}\n' "$now"
+  printf '{"ts":"%s","repo":"wa","verdict":"equal","a_host":"hetzner","a_rc":0,"b_host":"mbp","b_rc":0,"files":"","learned":0}\n' "$now"; } > "$SLOG"
+out=$(run --no-cost); has "sombra: veredito fora de same/diverge/skipped/timeout é avisado" "⚠️ 2 linha(s) ilegível(is) no log da sombra (não contadas)" "$out"; has "…e só o veredito legível conta" "Sombra: igual=1 divergiu=0 não-rodou=0 estourou-o-tempo=0" "$out"
 
 echo "--- custo"
 reset; L "$now" 0 5 ',"host":"hetzner"' > "$LOG"

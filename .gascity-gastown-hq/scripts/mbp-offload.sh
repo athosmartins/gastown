@@ -58,14 +58,16 @@ recent_counts() {
   # PRECEDÊNCIA DO JQ: "A + B as $x | ..." é "(A+B) as $x" no jq 1.8.1 mas "A + (B as $x | ...)" no 1.7.1 do /usr/bin (o que o launchd,
   # de PATH mínimo, resolve) — por isso a soma de $bad vem entre parênteses; o selftest roda estes casos sob cada jq, por caminho.
   out=$(jq -Rrs --argjson since "$(( $(date +%s) - 259200 ))" '
+    # hosts conhecidos: hetzner|mbp (linha SEM "host" = mbp, de antes do campo). Outro valor não se classifica: é avisado, nunca contado como do MBP.
+    def hostok: (if has("host") then .host else "mbp" end) | . == "hetzner" or . == "mbp";
     [split("\n")[] | select(length > 0)
       | (try fromjson catch null)
       | if type == "object" and ((try (.ts | fromdateiso8601) catch null) | type) == "number"
         then {l: ., t: (.ts | fromdateiso8601)} else {bad: 1} end] as $e
     | [$e[] | select(.l and .t >= $since) | .l] as $w
-    | (([$e[] | select(.bad)] | length) + ([$w[] | select((.mode | type) != "string" or (.mode == "preflight" and (.reason | type) != "string"))] | length)) as $bad
-    | ([$w[] | select((.mode | type) == "string" and .mode != "preflight")] | length) as $runs
-    | [$w[] | select(.mode == "preflight" and (.reason | type) == "string")] as $ref
+    | (([$e[] | select(.bad)] | length) + ([$w[] | select((.mode | type) != "string" or (.mode == "preflight" and (.reason | type) != "string") or (hostok | not))] | length)) as $bad
+    | ([$w[] | select((.mode | type) == "string" and .mode != "preflight" and hostok)] | length) as $runs
+    | [$w[] | select(.mode == "preflight" and (.reason | type) == "string" and hostok)] as $ref
     | "\($runs) execuções; recusas: " + (if ($ref | length) == 0 then "nenhuma" else ($ref | group_by((if .host == "hetzner" then "hetzner:" else "" end) + .reason) | map("\(if .[0].host == "hetzner" then "hetzner:" else "" end)\(.[0].reason)=\(length)") | join(" ")) end)
       + (if $bad > 0 then "; \($bad) linha(s) ilegível(is) no log (não contadas)" else "" end)
   ' "$LOG" 2>/dev/null) || { echo "ilegível"; return; }
@@ -75,7 +77,8 @@ recent_counts() {
 
 # Total de hoje (desde a meia-noite LOCAL), do log: "<N> execuções, <M> min no MBP (livre: a, em uso: b[, sem presença registrada: c])".
 # Mesmos três estados da contagem de 72 h: log ausente → "sem log ainda"; jq falhou/relógio ilegível → "ilegível" (nunca "0
-# execuções"); lido → o total. Linha do log que não dá para ler não derruba nem some: vem avisada. Recusas do preflight não são execução.
+# execuções"); lido → o total. Linha do log que não dá para ler não derruba nem some: vem avisada (inclusive a de host que não é hetzner|mbp). Recusas do preflight não são execução.
+# São minutos de MBP LITERAIS: a execução do lado de MBP de uma sombra ("shadow":1) conta aqui, porque o MBP trabalhou de verdade (o relatório diário a tira, que mede o nó).
 # (a soma de $bad vem entre parênteses e o $r é ligado no começo da pipeline: o "A + B as $x" do jq 1.7.1 lê diferente do 1.8.1.)
 today_counts() {
   local out since
@@ -83,12 +86,15 @@ today_counts() {
   since=$(date -v0H -v0M -v0S +%s 2>/dev/null) || { echo "ilegível"; return; }
   case "$since" in ''|*[!0-9]*) echo "ilegível"; return ;; esac
   out=$(jq -Rrs --argjson since "$since" '
+    def hostok: (if has("host") then .host else "mbp" end) | . == "hetzner" or . == "mbp";
     [split("\n")[] | select(length > 0)
       | (try fromjson catch null)
       | if type == "object" and ((try (.ts | fromdateiso8601) catch null) | type) == "number" and ((.mode | type) == "string")
         then {l: ., t: (.ts | fromdateiso8601)} else {bad: 1} end] as $e
-    | ([$e[] | select(.bad)] | length) as $bad
-    | [$e[] | select(.l and .t >= $since and .l.mode != "preflight") | .l] as $all
+    | ([$e[] | select(.bad)] | length) as $bad0
+    | [$e[] | select(.l and .t >= $since and .l.mode != "preflight") | .l] as $win
+    | [$win[] | select(hostok)] as $all
+    | (($bad0 + (($win | length) - ($all | length)))) as $bad
     | [$all[] | select(.host == "hetzner")] as $nr
     | [$all[] | select(.host != "hetzner")] as $r
     | ([$r[] | select(.presence == "livre")] | length) as $livre
@@ -147,11 +153,14 @@ why_text() { # presence_why idle_s
   esac
 }
 
-# a hora em que a bandeira do nó foi ligada (o conteúdo é uma data ISO; sem ele, a hora do arquivo); vazio = desligado / não consegui ler
+# a hora em que a bandeira do nó vale como ligada = o MTIME do arquivo, nunca o texto gravado dentro dele: a janela de 24 h da sombra
+# (mbp-run.sh shadow_window_open) conta pelo mtime, e `touch` a reabre (runbook). Pelo conteúdo, depois de um touch o status seguiria dizendo
+# a hora antiga do `node on`. Vazio = desligado / mtime ilegível (quem chama mostra "?", nunca uma data inventada).
 node_since() {
   [ -f "$NODEFLAG" ] || return 0
-  local c; c=$(head -n 1 "$NODEFLAG" 2>/dev/null | tr -d '\r')
-  case "$c" in 20[0-9][0-9]-*) printf '%s' "$c" ;; *) date -u -r "$(stat -f %m "$NODEFLAG" 2>/dev/null || stat -c %Y "$NODEFLAG" 2>/dev/null)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ;; esac
+  local m; m=$(stat -f %m "$NODEFLAG" 2>/dev/null || stat -c %Y "$NODEFLAG" 2>/dev/null)
+  case "$m" in ''|*[!0-9]*) return 0 ;; esac
+  date -u -r "$m" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$m" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
 }
 node_state_text() {
   if [ -f "$NODEFLAG" ]; then echo "LIGADO desde $(node_since | grep . || echo '?') (a sombra de 24 h conta daí; desliga: mbp-offload.sh node off)"

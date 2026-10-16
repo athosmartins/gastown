@@ -613,6 +613,11 @@ MBP_CITY="$T/city" bash "$OFFL" node status >"$T/out" 2>&1; has "node status: li
 STUB_CHECK_OUT="$CK_LIVRE"; export STUB_CHECK_OUT; st > "$T/out"; has "status do MBP mostra a linha do nó" "$T/out" '^Nó Linux de testes: LIGADO desde 20'
 j=$(st --json); eq "status --json: node.flag" on "$(printf '%s' "$j" | jq -r .node.flag)"; has "status --json: node.since é uma data" <(printf '%s' "$j" | jq -r .node.since) '^20[0-9][0-9]-'
 eq "status --json: as chaves antigas continuam (aditivo)" "true" "$(printf '%s' "$j" | jq -r 'has("offload") and has("mode") and has("tasks") and has("today") and has("recent")')"
+# a janela de 24 h da sombra (mbp-run.sh shadow_window_open) conta pelo MTIME da bandeira, não pelo conteúdo: `touch` a reabre (runbook). O "desde" do
+# status tem de dizer a hora que VALE — pelo conteúdo, depois de um touch o status seguia mostrando a hora antiga do `node on`
+TZ=UTC touch -t 202610150930.00 "$NF"
+MBP_CITY="$T/city" bash "$OFFL" node status >"$T/out" 2>&1; has "node status depois de um touch: 'desde' é a hora do ARQUIVO (a que a sombra usa), não o conteúdo antigo" "$T/out" '^LIGADO desde 2026-10-15T09:30:00Z '
+j=$(st --json); eq "status --json depois de um touch: node.since é a hora do arquivo" "2026-10-15T09:30:00Z" "$(printf '%s' "$j" | jq -r .node.since)"
 unset STUB_CHECK_OUT
 MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" off >"$T/out" 2>&1; n=$((n+1)); if [ -f "$NF" ]; then echo "ok   mbp-offload.sh off NÃO desliga o nó (bandeira independente)"; else echo "FAIL o off do MBP apagou a bandeira do nó"; fails=$((fails+1)); fi
 MBP_OFFLOAD_RUN="$T/bin/fake-check" MBP_CITY="$T/city" bash "$OFFL" pause >"$T/out" 2>&1; n=$((n+1)); if [ -f "$NF" ]; then echo "ok   mbp-offload.sh pause NÃO desliga o nó"; else echo "FAIL a pausa do MBP apagou a bandeira do nó"; fails=$((fails+1)); fi
@@ -677,6 +682,11 @@ reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; pr
 eq "hoje[$L]: linha truncada é avisada" "1 execuções, 0 min no MBP (livre: 1, em uso: 0); 1 linha(s) ilegível(is) no log (não contadas)" "$(tdy)"
 reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; printf '{"ts":"ontem","repo":"wa","mode":"pytest","secs":1}\n'; echo null; } > "$J"
 eq "hoje[$L]: ts ilegível e linha que não é objeto são avisados" "1 execuções, 0 min no MBP (livre: 1, em uso: 0); 2 linha(s) ilegível(is) no log (não contadas)" "$(tdy)"
+# só hetzner|mbp (ou sem o campo = mbp) são hosts conhecidos: "hetzner2" não pode virar minuto do MBP só porque "não é hetzner"
+reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; r_line "$t_now" 60 ',"presence":"livre","host":"hetzner2"'; } > "$J"
+eq "hoje[$L]: host que não é hetzner nem mbp é avisado, não vira minuto do MBP" "1 execuções, 0 min no MBP (livre: 1, em uso: 0); 1 linha(s) ilegível(is) no log (não contadas)" "$(tdy)"
+reset; mkdir -p "$(dirname "$J")"; { r_line "$t_now" 4 ',"presence":"livre"'; r_line "$t_ayer" 60 ',"presence":"livre","host":"hetzner2"'; } > "$J"
+eq "hoje[$L]: host desconhecido de ONTEM fica fora (a janela é a de hoje)" "1 execuções, 0 min no MBP (livre: 1, em uso: 0)" "$(tdy)"
 }
 JQPIN=""; today_cases "jq do PATH"
 for cand in /usr/bin/jq /opt/homebrew/bin/jq; do
@@ -1255,6 +1265,13 @@ reset; mkdir -p "$(dirname "$J")"; { l_run; echo null; echo 42; } > "$J"
 eq "contagem[$L]: linha que não é objeto é avisada" "1 execuções; recusas: nenhuma; 2 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
 reset; mkdir -p "$(dirname "$J")"; { l_run; printf '{"ts":"%s","repo":"x"}\n' "$t_now"; printf '{"ts":"%s","mode":7}\n' "$t_now"; } > "$J"
 eq "contagem[$L]: linha com ts mas sem 'mode' em texto é avisada, não vira execução" "1 execuções; recusas: nenhuma; 2 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+# só hetzner|mbp (ou sem o campo = mbp) são hosts conhecidos: o resto é linha que não dá para classificar, avisada, não uma execução/recusa "do MBP"
+reset; mkdir -p "$(dirname "$J")"; { l_run; printf '{"ts":"%s","repo":"wa","mode":"pytest","slot":"1","rc":0,"secs":4,"nargs":2,"host":"hetzner2"}\n' "$t_now"; } > "$J"
+eq "contagem[$L]: execução com host desconhecido é avisada, não vira execução" "1 execuções; recusas: nenhuma; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; { l_run; printf '{"ts":"%s","repo":"-","mode":"preflight","slot":"-","rc":98,"secs":0,"nargs":0,"reason":"ram","host":"hetzner2"}\n' "$t_now"; } > "$J"
+eq "contagem[$L]: recusa com host desconhecido é avisada, não vira recusa do MBP" "1 execuções; recusas: nenhuma; 1 linha(s) ilegível(is) no log (não contadas)" "$(cnt)"
+reset; mkdir -p "$(dirname "$J")"; { l_run; printf '{"ts":"%s","repo":"wa","mode":"pytest","slot":"1","rc":0,"secs":4,"nargs":2,"host":"hetzner2"}\n' "$t_old"; } > "$J"
+eq "contagem[$L]: host desconhecido de 5 dias atrás fica fora da janela de 72 h" "1 execuções; recusas: nenhuma" "$(cnt)"
 }
 JQPIN=""; counts_cases "jq do PATH"
 for cand in /usr/bin/jq /opt/homebrew/bin/jq; do
