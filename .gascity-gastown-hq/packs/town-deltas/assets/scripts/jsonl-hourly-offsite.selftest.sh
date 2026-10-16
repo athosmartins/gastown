@@ -366,6 +366,11 @@ eq "pré-lock (aws ausente): rc 2, linha no log e conta como run sem snapshot" "
 eq "pré-lock: a 2ª seguida alerta e o alerta chega" "$(pushed)" 1
 new_env nostate; : > "$S/arquivo"; STATE_OVR="$S/arquivo/x" offsite
 eq "sem como gravar o estado: rc 2 e, sem contador, o alerta sai já (não fica mudo)" "$RC:$(pushed)" "2:1"
+# lock que não se cria (estado existe e não grava; lock velho que não sai) não é "outro run": rc 2 e, sem como gravar o contador, o alerta sai já; nunca rc 0 mudo
+new_env nolock; chmod 555 "$S/state"; offsite; chmod 755 "$S/state"
+eq "lock não criado (estado sem permissão de escrita): rc 2, UNKNOWN no log e o alerta sai" "$RC:$(grep -c 'UNKNOWN: não consegui criar o lock' "$S/log/offsite.log"):$(pushed)" "2:1:1"
+new_env stuck; L="$S/state/jsonl-hourly-offsite.lock.d"; mkdir "$L"; echo 99999999 > "$L/pid"; touch -t 202001010000 "$L"; chmod 555 "$S/state"; offsite; chmod 755 "$S/state"
+eq "lock velho que não sai (rm -rf falha): rc 2, UNKNOWN e o alerta sai" "$RC:$(grep -c 'UNKNOWN: não consegui pegar o lock' "$S/log/offsite.log"):$(pushed)" "2:1:1"
 new_env dead; broke; printf '{"consecutive_not_ok":0,"attempt_open":true}\n' > "$ST"; NOW_OFF=0; offsite
 eq "run anterior morto (timeout do order, kill, reboot) conta: com a falha de agora são 2 seguidas e o alerta sai" "$RC:$(pushed)" "1:1"
 NOW_OFF=900; offsite

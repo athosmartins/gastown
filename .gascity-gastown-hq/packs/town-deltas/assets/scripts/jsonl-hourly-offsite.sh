@@ -25,10 +25,10 @@
 #
 # ESTADOS (três, e o neutro é inerte): rc 0 = snapshot novo verificado, ou HEAD igual ao último verificado, objeto ainda no S3 e exporter vivo (só atualiza `checked_at`) ·
 #   rc 1 = falhou, ficou "broken" ou FONTE PARADA: o exporter não reescreve os bancos obrigatórios (mtime de <db>/issues.jsonl) há mais de JHO_STALE_SOURCE_S (6 h), ou escreve e não
-#   comita (árvore adiante de um HEAD com mais de 6 h), ou isso não foi lido => não bate o ponto (`checked_at` fica, o --status vira STALE) e conta para o alerta; HEAD novo ainda sobe,
-#   sem zerar a contagem. HEAD velho com a árvore igual NÃO é fonte parada: o exporter só comita quando o dado muda (7 intervalos > 6 h em 12 dias, até 10 h 22, com ele rodando) ·
-#   rc 2 = não deu para avaliar (sem aws/git/python3/jq, archive ilegível, pouco disco, estado sem como gravar): nada foi tentado e conta como run sem snapshot ·
-#   rc 3 = uso. Outro run em andamento (lock vivo) => rc 0 em silêncio.
+#   comita (árvore adiante de um HEAD com mais de 6 h), ou isso não foi lido => conta para o alerta e, num run de HEAD igual, não bate o ponto (`checked_at` fica, o --status vira STALE); HEAD novo
+#   ainda sobe e move latest.json (um `checked_at` novo, uma vez), sem zerar a contagem. HEAD velho com a árvore igual NÃO é fonte parada: o exporter só comita quando o dado muda (7 intervalos > 6 h em 12 dias, até 10 h 22, com ele rodando) ·
+#   rc 2 = não deu para avaliar (sem aws/git/python3/jq, archive ilegível, pouco disco, estado ou lock sem como criar/gravar): nada foi tentado e conta como run sem snapshot ·
+#   rc 3 = uso. Outro run em andamento (pid vivo no lock) => rc 0 em silêncio.
 #
 # RETENÇÃO (só no prefixo jsonl-hourly/snap/, só no formato exato de chave; depois do snapshot novo verificado):
 #   últimas JHO_KEEP_RECENT_H (48) horas + o 1º snapshot de cada dia UTC até JHO_KEEP_DAILY_DAYS (14) + os JHO_KEEP_FLOOR (6) mais novos + o apontado por
@@ -203,6 +203,7 @@ fi
 # ── lock (mkdir atômico; dono = pid; reclama se o dono morreu ou passou de LOCK_STALE_MIN) ─────────────
 mkdir -p "$STATE_DIR" || unknown "não criei $STATE_DIR"
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  [ -d "$LOCKDIR" ] || unknown "não consegui criar o lock $LOCKDIR"   # mkdir falhou e não há lock (sem permissão, disco cheio, FS só-leitura): não é "outro run", é "não sei"; rc 0 pararia upload e alerta em silêncio
   holder="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
   # sem pid ainda NÃO é dono morto: o outro run fez o mkdir e ainda não gravou o pid. Só reclama depois de 1 min.
   if [ -z "$holder" ] && [ -z "$(find "$LOCKDIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
@@ -213,7 +214,9 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
   fi
   log "lock de pid '$holder' morto ou com mais de ${LOCK_STALE_MIN} min: reclamando"
   case "$LOCKDIR" in */jsonl-hourly-offsite.lock.d) rm -rf "$LOCKDIR" ;; esac
-  mkdir "$LOCKDIR" 2>/dev/null || { log "não consegui pegar o lock"; exit 0; }
+  mkdir "$LOCKDIR" 2>/dev/null || {   # "outro run pegou antes" só com um pid VIVO e diferente do dono morto; pid vazio/ilegível ou lock que não saiu (rm -rf falhou) → não sei, conta
+    h2="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"; [ -n "$h2" ] && [ "$h2" != "$holder" ] && kill -0 "$h2" 2>/dev/null && { log "outro run reclamou o lock antes (pid $h2); saindo"; exit 0; }
+    unknown "não consegui pegar o lock $LOCKDIR"; }
 fi
 echo $$ > "$LOCKDIR/pid"
 WD="$WORKROOT/run.$$"
@@ -244,8 +247,7 @@ SHA12="${SHA:0:12}"
 STAMP="$(stamp_now)"
 STEM="$STAMP-$SHA12"
 HEAD_AGE=$(( $(now_epoch) - HEAD_EPOCH ))
-# O exporter só comita quando o dado muda: HEAD velho NÃO é exporter parado (medido: 7 intervalos > 6 h em 12 dias, até 10 h 22, com ele rodando).
-# Vivo = reescreveu os bancos obrigatórios (mtime de <db>/issues.jsonl; vale o mais velho). vazio/ilegível/ausente → não sei, e não sei não é vivo; falhou → idem.
+# HEAD velho NÃO é exporter parado: ele só comita quando o dado muda (números no cabeçalho). Vivo = reescreveu os bancos obrigatórios (mtime de <db>/issues.jsonl; vale o mais velho). vazio/ilegível/ausente → não sei, e não sei não é vivo; falhou → idem.
 SRC_WHY=""; SRC_EPOCH="$(python3 -I -c 'import os,sys;print(min(int(os.stat(os.path.join(sys.argv[1],d,"issues.jsonl")).st_mtime) for d in sys.argv[2].split(",")))' "$ARCHIVE" "$REQUIRED_DBS" 2>/dev/null)"
 case "$SRC_EPOCH" in
   ""|*[!0-9]*) SRC_WHY="não li quando o exporter escreveu os bancos obrigatórios ($REQUIRED_DBS)" ;;
