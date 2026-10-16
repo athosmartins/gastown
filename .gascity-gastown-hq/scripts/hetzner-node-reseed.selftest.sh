@@ -54,11 +54,27 @@ reset; touch "$FLAG"; rc=$(HETZNER_RESEED_RUN="$T/nao-existe.sh" w); eq "mbp-run
 if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
   reset; touch "$FLAG"; rc=$(STUB_SLEEP=6 HETZNER_RESEED_TIMEOUT_S=1 w); eq "estouro do prazo (1 s contra um seed de 6 s): FALHOU" 1 "$rc"; has "…com o rc 124" "$STUB_LOG" 'rc=124'
 else echo "SKIP estouro de prazo: sem timeout/gtimeout neste host (esse caminho NÃO foi exercitado)"; fi
+# o ALARME não desliga o nó (a bandeira segue ligada e as baterias seguem clonando espelhos da base marcada): o notify de prio 5 manda o Mayor desligar
+reset; touch "$FLAG"; STUB_RC=98 STUB_OUT='mbp-run: ALARME: dado ou segredo no destino (nó Linux:gt-remote/wa-base) — o filtro deixou passar:\n  ./.env' w >/dev/null
+has "ALARME: o notify manda desligar o nó (mbp-offload.sh node off)" "$STUB_LOG" 'NOTIFY:.*-p 5 .*mbp-offload\.sh node off'
+# sem timeout/gtimeout no PATH (o do launchd é curto): o seed roda do mesmo jeito, mas o teto de prazo perdido é DITO, não calado
+mkdir -p "$T/nobin"; for c in bash env date mkdir dirname jq tail tr cut grep cat; do p=$(command -v "$c") && ln -sf "$p" "$T/nobin/$c"; done
+BASH_BIN=$(command -v bash)
+reset; touch "$FLAG"; PATH="$T/nobin" "$BASH_BIN" "$W" >"$T/out" 2>"$T/err"; rc=$?; eq "sem timeout no PATH: o seed roda e o veredito é OK" 0 "$rc"; has "…o seed rodou" "$STUB_LOG" 'RUN:--host linux --seed wa'
+has "…e DIZ que o teto de prazo se perdeu" "$T/out" 'WARN: no timeout/gtimeout in PATH'; has "…e que só vale o prazo da order" "$T/out" "order's own timeout"
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  reset; touch "$FLAG"; rc=$(w); hasnt "com timeout no PATH: nenhum aviso de teto perdido" "$T/out" 'no timeout/gtimeout'
+fi
 
 # controle negativo: sem o reconhecimento do ALARME o caso do alarme degrada para FALHOU (prio 4)
 sed "s/grep -q 'ALARME: dado ou segredo no destino'/grep -q 'XXXX-nunca-casa'/" "$W" > "$T/mut.sh"; chmod +x "$T/mut.sh"
 n=$((n+1)); if cmp -s "$W" "$T/mut.sh"; then echo "FAIL controle: o sed não mudou nada"; fails=$((fails+1)); else
   reset; touch "$FLAG"; STUB_RC=98 STUB_OUT='ALARME: dado ou segredo no destino' w "$T/mut.sh" >/dev/null
   if grep -q 'NOTIFY:.*-p 5' "$STUB_LOG"; then echo "FAIL controle: o mutante ainda dá prio 5"; fails=$((fails+1)); else echo "ok   controle: sem o reconhecimento, o alarme vira prio 4 (e o caso do ALARME pega)"; fi; fi
+# controle negativo 2: sem o aviso o teto perdido volta a ser calado e o caso do WARN o pega
+sed 's/else say "WARN: no timeout\/gtimeout in PATH[^;]*; out=/else out=/' "$W" > "$T/mut2.sh"
+n=$((n+1)); if cmp -s "$W" "$T/mut2.sh"; then echo "FAIL controle: o sed do aviso não mudou nada"; fails=$((fails+1)); else
+  reset; touch "$FLAG"; PATH="$T/nobin" "$BASH_BIN" "$T/mut2.sh" >"$T/out" 2>"$T/err"
+  if grep -q 'no timeout/gtimeout' "$T/out"; then echo "FAIL controle: o mutante ainda avisa"; fails=$((fails+1)); else echo "ok   controle: sem o aviso o teto perdido fica calado (e o caso do WARN pega)"; fi; fi
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

@@ -786,10 +786,14 @@ shadow_finish() { # rc_do_nó arquivo_da_saída_do_nó "$@" (args originais). Es
 # node_audit: depois de semear, procura NO DESTINO (independentemente do filtro) o que não podia ter chegado: NOME de segredo/dado (a mesma lista do prod test da fatia 1, com token), arquivo > 4 MB (o scanner
 # não o lê), JWT em .json/.txt fora de tests/ (um só já é segredo) e CONTEÚDO (hetzner-pii-scan.py, o mesmo do node_guard, rodando no servidor: lista de telefones/CPFs). Achou = alarme (rc 98) e a semeadura não vale.
 # Cada leitura tem TRÊS estados e só "li tudo e não achou" é limpo: o scanner que não abre aqui, o python que falta no nó, o find que reclama, o ssh que cai = "não consegui auditar" (rc 98), nunca "nada achado".
+# Se a auditoria caiu DEPOIS de já ter achado algo, vale o que achou: é ALARME (com o aviso de que não terminou), não "não consegui auditar".
 # Medido em 16/10 na árvore real do WA (o que o filtro mandaria): zero arquivo > 4 MB, zero JWT; a regra "qualquer telefone num .json" (a conferência manual do Mayor) acharia 2 arquivos rastreados com 1 número cada
 # (um changelog e um template), então o critério de conteúdo é o do scanner (lista), não "qualquer número".
+# hash_valid: o shasum que falhou deixa o hash VAZIO, e um .freeze-hash/.sp-hash que o ssh não leu também vem vazio — "" = "" não pode virar "já batem". Só sha1 hex de 40 caracteres é hash;
+# qualquer outra coisa é "não consegui calcular" (quem chama devolve 97), nunca "bate" e nunca algo para gravar no remoto.
+hash_valid() { case "$1" in ""|*[!0-9a-f]*) return 1 ;; esac; [ "${#1}" -eq 40 ]; }
 node_audit() { # $1 = dir remoto relativo ao home
-  local out b64
+  local out b64 partial
   b64=$(base64 < "$HERE/hetzner-pii-scan.py" 2>/dev/null | tr -d '\n')
   [ -n "$b64" ] || { say "não consegui ler hetzner-pii-scan.py para auditar o CONTEÚDO no $HNAME — a semeadura não vale"; return 98; }
   out=$(rssh_s "$1" "$b64" 2>/dev/null <<'EOF'
@@ -815,11 +819,16 @@ head -20 "$E.p" | sed 's/^/AUDIT_BAD CONTEUDO /'
 echo AUDIT_DONE
 EOF
   ) || true
-  case "$out" in *AUDIT_DONE*) ;; *) say "não consegui auditar $1 no $HNAME — a semeadura não vale"; return 98 ;; esac
+  # achar vale mais que não terminar: AUDIT_BAD já impresso é vazamento ACHADO mesmo que a auditoria tenha caído depois (AUDIT_ERR, ssh) — "achei E não consegui terminar" é ALARME (prio 5), não "não consegui auditar" (prio 4).
+  # Só SEM AUDIT_BAD é que AUDIT_DONE decide: presente = li tudo e não achei (limpo), ausente = não consegui olhar (98).
   if printf '%s\n' "$out" | grep -q '^AUDIT_BAD '; then
-    say "ALARME: dado ou segredo no destino ($HNAME:$1) — o filtro e o node_guard deixaram passar (NOME · GRANDE · JWT · CONTEUDO = telefones<TAB>CPFs<TAB>caminho, só contagens):"; printf '%s\n' "$out" | grep '^AUDIT_BAD ' | sed 's/^AUDIT_BAD /  /' >&2
+    partial=""; case "$out" in *AUDIT_DONE*) ;; *) partial=" A auditoria também NÃO terminou: pode haver mais do que o abaixo." ;; esac
+    # o ALARME não desliga o nó sozinho: a bandeira segue ligada e as baterias seguem clonando (cp -a) os espelhos desta base — por isso a mensagem manda desligar
+    say "ALARME: dado ou segredo no destino ($HNAME:$1) — o filtro e o node_guard deixaram passar (NOME · GRANDE · JWT · CONTEUDO = telefones<TAB>CPFs<TAB>caminho, só contagens).$partial Desligue o nó AGORA: mbp-offload.sh node off (senão as baterias continuam clonando espelhos desta base):"
+    printf '%s\n' "$out" | grep '^AUDIT_BAD ' | sed 's/^AUDIT_BAD /  /' >&2
     return 98
   fi
+  case "$out" in *AUDIT_DONE*) ;; *) say "não consegui auditar $1 no $HNAME — a semeadura não vale"; return 98 ;; esac
   return 0
 }
 seed_node() {
@@ -845,13 +854,19 @@ seed_node() {
   if [ -n "$uvbin" ]; then freeze=$("$uvbin" pip freeze --python "$lv/bin/python" 2>/dev/null); else freeze=$("$lv/bin/python" -m pip freeze 2>/dev/null); fi
   freeze=$(printf '%s\n' "$freeze" | grep -v -E -i "${HETZNER_FREEZE_SKIP:-^(pyobjc|py2app|appnope|rumps|macholib|altgraph|modulegraph|-e |#)|@ file:|^[[:space:]]*$}" | LC_ALL=C sort)
   [ -n "$freeze" ] && [ -n "$pyver" ] || { say "não consegui ler as dependências do venv local ($lv)"; return 97; }
+  # vazio → o freeze já foi checado acima (vazio = 97); falhou/ilegível (shasum) → hash vazio = 97, nunca igual a um .freeze-hash que faltou
   hash=$(printf '%s\n' "$freeze" | shasum | awk '{print $1}')
+  hash_valid "$hash" || { say "não consegui calcular o hash do freeze (shasum falhou) — não sei se as dependências do $HNAME batem"; return 97; }
+  # vazio → o nó não tem .freeze-hash (1ª semeadura): não bate, instala; falhou/ilegível → o ssh caiu: também vem vazio, não bate, e o próximo ssh falha em 98. $hash é hex não vazio, então vazio nunca "bate"
   rhash=$("$SSH_BIN" $SSH_OPTS "$MBP_HOST" "cat gt-remote/$rv/.freeze-hash 2>/dev/null")
   if [ "$hash" = "$rhash" ]; then say "dependências do $HNAME já batem (hash ${hash:0:12})"; return 0; fi
   printf '%s\n' "$freeze" | "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "cat > gt-remote/freeze-wa.txt" || return 98
   if [ "$dry" = 1 ]; then
-    say "DRY-RUN: o que o uv instalaria no $HNAME (nada é alterado, o hash não é gravado)"
-    "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "export PATH=\$HOME/.local/bin:\$PATH; uv pip install --dry-run --python gt-remote/$rv/bin/python -r gt-remote/freeze-wa.txt 2>&1 | tail -40" || return 98
+    # a base JÁ foi semeada (rsync + auditoria) e o freeze JÁ foi enviado; o dry-run só pula a instalação e a gravação do hash
+    say "DRY-RUN: a base foi semeada e o freeze enviado ao $HNAME; abaixo o que o uv instalaria (nada é instalado e o hash não é gravado)"
+    # o `| tail -40` devolvia o status do tail: um uv que falhou (erro de resolução é para isso que o dry-run serve) saía 0. O status do uv é guardado antes e vira o do comando remoto (sem pipefail: o shell remoto pode ser sh)
+    "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "export PATH=\$HOME/.local/bin:\$PATH; o=\$(uv pip install --dry-run --python gt-remote/$rv/bin/python -r gt-remote/freeze-wa.txt 2>&1); r=\$?; printf '%s\n' \"\$o\" | tail -40; exit \$r" \
+      || { say "uv pip install --dry-run falhou no $HNAME (erro do uv, por exemplo o resolvedor não fechar com este freeze, ou o ssh caiu; veja a saída acima) — a próxima semeadura de verdade pode falhar igual"; return 98; }
     return 0
   fi
   "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "export PATH=\$HOME/.local/bin:\$PATH; set -e; test -x gt-remote/$rv/bin/python || uv venv --python $pyver gt-remote/$rv; uv pip install --python gt-remote/$rv/bin/python -r gt-remote/freeze-wa.txt; echo $hash > gt-remote/$rv/.freeze-hash" \
@@ -924,7 +939,10 @@ if [ "$mode" = seed ]; then
   sp=$(ls -d "$lv"/lib/python3.*/site-packages 2>/dev/null | head -1)
   [ -n "$sp" ] || { say "site-packages local não achado em $lv"; exit 97; }
   pyver=$(echo "$sp" | sed -n 's#.*/lib/\(python3\.[0-9]*\)/site-packages#\1#p')
+  # vazio → lista sem .dist-info dá o sha1 da lista vazia (um hash válido, que só bate com outra lista vazia); falhou/ilegível (shasum) → hash vazio = 97, nunca igual a um .sp-hash que faltou
   hash=$(ls "$sp" | grep -E '\.dist-info$' | LC_ALL=C sort | shasum | awk '{print $1}')
+  hash_valid "$hash" || { say "não consegui calcular o hash dos pacotes locais (shasum falhou) — não sei se o site-packages do MBP bate"; exit 97; }
+  # vazio → o MBP não tem .sp-hash (1ª semeadura): não bate; falhou/ilegível → ssh caiu, vem vazio, não bate, e o ssh seguinte (o do venv) falha em 98
   rhash=$("$SSH_BIN" $SSH_OPTS "$MBP_HOST" "cat gt-remote/$rv/.sp-hash 2>/dev/null")
   if [ "$hash" = "$rhash" ]; then say "site-packages do MBP já bate (hash ${hash:0:12})"
     refresh_tools

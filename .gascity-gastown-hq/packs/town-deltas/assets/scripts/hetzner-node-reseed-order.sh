@@ -16,7 +16,8 @@
 #   FALHOU  the seed returned non-zero or timed out -> ONE notify (prio 4) naming the rc and its meaning; exit 1. A failed seed means the node base/venv may be stale,
 #           and the chain still works (a stale node only costs a local re-run) — so this is a heads-up, not an emergency, EXCEPT:
 #   ALARME  the seed's audit found a secret or data file on the node (the filter let something through): notify at prio 5 and exit 1. This is the security requirement of
-#           the story (no customer data leaves the mini), so it is loud on purpose.
+#           the story (no customer data leaves the mini), so it is loud on purpose. The order does NOT turn the node off by itself (the flag stays on and batteries keep
+#           cloning mirrors from the base the audit just flagged), so the notify tells the Mayor to run `mbp-offload.sh node off`.
 # A missing mbp-run.sh is a FAILED run (exit 1, stderr), never a quiet success.
 #
 # TEST: bash scripts/hetzner-node-reseed.selftest.sh
@@ -45,8 +46,9 @@ if [ ! -f "$FLAG" ]; then say "node off (no $FLAG) — nothing to do"; record OF
 if [ ! -f "$RUN" ]; then echo "hetzner-node-reseed: mbp-run.sh not found at $RUN — nothing was seeded" >&2; exit 1; fi
 
 # --host linux --seed wa works whether or not the MacBook switch is on: the node has its own flag
+# vazio → sem timeout/gtimeout no PATH (o do launchd é curto): a run NÃO tem o teto de ${TIMEOUT_S}s e isso é DITO; só o timeout da própria order (1000 s) a limita. Não é erro: o seed roda do mesmo jeito
 if [ -n "$TO" ]; then out=$(MBP_CITY="$CITY" "$TO" "$TIMEOUT_S" bash "$RUN" --host linux --seed wa 2>&1); rc=$?
-else out=$(MBP_CITY="$CITY" bash "$RUN" --host linux --seed wa 2>&1); rc=$?; fi
+else say "WARN: no timeout/gtimeout in PATH — this run is NOT bounded by ${TIMEOUT_S}s (only the order's own timeout applies)"; out=$(MBP_CITY="$CITY" bash "$RUN" --host linux --seed wa 2>&1); rc=$?; fi
 last=$(printf '%s\n' "$out" | tail -n 3 | tr '\n' ' ' | cut -c1-300)
 
 if [ $rc -eq 0 ]; then say "seed ok: $last"; record OK 0 "$last"; say "VERDICT: OK"; exit 0; fi
@@ -57,7 +59,7 @@ case $rc in
   *) why="unexpected" ;;
 esac
 if printf '%s\n' "$out" | grep -q 'ALARME: dado ou segredo no destino'; then
-  say "ALARME — a secret or data file is on the node: $last"; record ALARME "$rc" "$last"; note 5 "ALARME: secret/data file found on the Hetzner node after seeding (rc=$rc). The rsync filter let it through — see $LOG. $last"
+  say "ALARME — a secret or data file is on the node: $last"; record ALARME "$rc" "$last"; note 5 "ALARME: secret/data file found on the Hetzner node after seeding (rc=$rc). The rsync filter let it through. TURN THE NODE OFF NOW: mbp-offload.sh node off (this order does not do it: the flag stays on and batteries keep cloning mirrors from the contaminated base). See $LOG. $last"
   say "VERDICT: ALARME"; exit 1
 fi
 say "FAILED (rc=$rc: $why): $last"; record FALHOU "$rc" "$last"; note 4 "Hetzner node reseed FAILED (rc=$rc: $why). The node may have a stale venv/base; gate and workers fall back to the MacBook/local as usual. $last"

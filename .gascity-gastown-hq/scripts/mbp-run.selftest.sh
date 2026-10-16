@@ -37,7 +37,9 @@
 #   FATIA 2: lista mac-only (glob, node id, caminho absoluto, comentário/CRLF, aprendida; ausente ou ilegível = o nó NÃO é usado) · xdist (limiar, núcleos/baterias, o -n
 #   do chamador vence, xdist ausente/ilegível) · sombra (igual, diverge por rc e por arquivo, MBP fora, MBP lento, janela de 24 h, abortada; rc de ambiente 124/137/127/97 de qualquer lado, ou saída de um lado que não abre = `skipped`, nada aprendido; a mensagem só diz "marcado" do que foi gravado).
 #   FATIA 4: semeadura (MBP_SELFTEST_ONLY=semeadura roda só esta parte): o node_guard também vale na semeadura (lista de telefones fica no mini; sem o scanner = não semeia), freeze do venv sem pacote do macOS, hash que decide reinstalar, uv que falha,
-#   dry-run, e a auditoria do destino: NOME (token incluso), arquivo > 4 MB, JWT e CONTEÚDO (lista de telefones/CPFs) = ALARME rc 98; auditoria que não consegue olhar = 98, nunca 'limpo'.
+#   dry-run (o comando remoto roda de verdade: o uv que falha dá 98, o `| tail` não engole o status), e a auditoria do destino: NOME (token incluso), arquivo > 4 MB, JWT e CONTEÚDO (lista de telefones/CPFs) = ALARME rc 98
+#   (e manda desligar o nó); auditoria que não consegue olhar = 98, nunca 'limpo'; auditoria que ACHOU e caiu antes de terminar = ALARME, não 'não consegui olhar'; hash que não se calculou (shasum falha, ou lixo)
+#   = 97, no nó e no caminho do MBP, nunca "já batem" (controle negativo: o mutante sem hash_valid volta ao defeito).
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -88,7 +90,9 @@ case "$name" in
       case "$args" in *"bash -s -- "*) sample=${args##*bash -s -- } ;; esac
       rexec 0 "$sample"
     fi ;;
-  AUDIT) if [ "${STUB_AUDIT_BROKEN:-0}" = 1 ]; then echo AUDIT_ERR; exit 3; else rexec 0 "${args##*bash -s -- }"; fi ;;
+  AUDIT) if [ "${STUB_AUDIT_BROKEN:-0}" = 1 ]; then echo AUDIT_ERR; exit 3
+         elif [ "${STUB_AUDIT_BROKEN:-0}" = 2 ]; then echo "AUDIT_BAD NOME .env"; echo AUDIT_ERR; exit 3   # achou um vazamento e CAIU antes de terminar (o find real imprime o que acha na hora, antes do erro)
+         else rexec 0 "${args##*bash -s -- }"; fi ;;
   SLOT_ACQUIRE)
     if [ "${STUB_SLOTS:-free}" = exec ]; then rexec 0; exit $?
     elif [ "${STUB_SLOTS:-free}" = full ]; then
@@ -129,6 +133,9 @@ case "$name" in
     echo "DIRECT:$args" >> "$STUB_LOG"
     case "$args" in *"cat > gt-remote/freeze-wa.txt"*) cat > "$(dirname "$STUB_LOG")/freeze-sent.txt" ;; esac
     if [ -n "${STUB_DIRECT_FAIL_ON:-}" ]; then case "$args" in *"$STUB_DIRECT_FAIL_ON"*) exit 1 ;; esac; fi
+    # STUB_DIRECT_EXEC_ON=<padrão>: o comando remoto que casa o padrão roda DE VERDADE (bash -c, HOME falso, o uv/shasum falsos do PATH) e o stub devolve o status DELE. É assim que se vê o status que o
+    # comando monta (um `| tail` que engole o do uv), e não o que um stub finge: o FAIL_ON acima falha o ssh inteiro e nunca exercita o comando.
+    if [ -n "${STUB_DIRECT_EXEC_ON:-}" ]; then case "$args" in *"$STUB_DIRECT_EXEC_ON"*) (cd "$STUB_HOME" && HOME="$STUB_HOME" bash -c "${!#}"); exit $? ;; esac; fi
     [ -z "${STUB_DIRECT_OUT:-}" ] || echo "$STUB_DIRECT_OUT"; exit "${STUB_DIRECT_RC:-0}" ;;
 esac
 exit 0
@@ -339,7 +346,7 @@ reset() { : > "$STUB_LOG"; rm -f "$STUB_REAPED" "$J" "$STUB_STATE_FILE" "$STUB_S
   rm -f "$T/city/.gc/hetzner-node.on" "$T/city/.gc/hetzner-mac-only.learned" "$T/city/.gc/logs/hetzner-shadow.jsonl" "$T"/last-script-*-hetzner.sh "$T"/last-script-*-mbp.sh "$T/freeze-sent.txt"
   unset STUB_UNREACHABLE_NODE STUB_UNREACHABLE_MBP STUB_PF_RAW_NODE STUB_NOBASE_NODE STUB_NOVENV_NODE STUB_RUN_RC_NODE STUB_RUN_RC_MBP STUB_RUN_OUT_NODE STUB_RUN_OUT_MBP STUB_RUN_SLEEP_NODE STUB_RUN_SLEEP_MBP \
     STUB_N_MEMINFO_RAW STUB_N_AVAIL_MB STUB_N_SWAPTOTAL_MB STUB_N_SWAPFREE_MB STUB_N_SWAPFREE2_MB STUB_N_PSI_MISSING STUB_N_PSI_RAW STUB_N_PSI_SOME STUB_N_PSI_FULL STUB_N_NPROC STUB_N_NPROC_FAIL STUB_N_DISK_MB STUB_N_DISK_FAIL STUB_N_DISK_RAW \
-    STUB_RSYNC_REAL STUB_DIRECT_FAIL_ON STUB_AUDIT_BROKEN HETZNER_XDIST_OFF HETZNER_XDIST_MIN_TESTS HETZNER_RSYNC_FILTER HETZNER_SEED_ROOT HETZNER_SEED_VENV HETZNER_SEED_DRYRUN HETZNER_MAX_SLOTS HETZNER_SHADOW_WAIT_S HETZNER_SHADOW_WINDOW_S HETZNER_MIN_DISK_MB HETZNER_FREEZE_SKIP HETZNER_NODE_HOST MBP_RUN_SHADOW
+    STUB_RSYNC_REAL STUB_DIRECT_FAIL_ON STUB_DIRECT_EXEC_ON STUB_UV_FAIL_DRYRUN STUB_AUDIT_BROKEN HETZNER_XDIST_OFF HETZNER_XDIST_MIN_TESTS HETZNER_RSYNC_FILTER HETZNER_SEED_ROOT HETZNER_SEED_VENV HETZNER_SEED_DRYRUN HETZNER_MAX_SLOTS HETZNER_SHADOW_WAIT_S HETZNER_SHADOW_WINDOW_S HETZNER_MIN_DISK_MB HETZNER_FREEZE_SKIP HETZNER_NODE_HOST MBP_RUN_SHADOW
   unset STUB_UNREACHABLE STUB_AVAIL_MB STUB_SWAP_MB STUB_SWAP2_MB STUB_SWAP_RAW STUB_SWAP2_RAW STUB_PRESSURE STUB_PRESSURE_FAIL STUB_VM_FAIL STUB_VM_DROP STUB_PAGE_SIZE STUB_COMP_PAGES STUB_MP_FAIL STUB_MP_PCT STUB_PF_RAW STUB_POWER STUB_BATT STUB_PMSET_FAIL STUB_PMSET_RAW STUB_SLOTS STUB_NOBASE STUB_RUN_RC STUB_RUN_OUT STUB_RSYNC_RC; }
 expect() { # nome rc_esperado rc_real [grep-no-log padrão]
   n=$((n+1))
@@ -1142,6 +1149,8 @@ SEEDVENV="$T/seedvenv"; mkdir -p "$SEEDVENV/bin"; printf '#!/usr/bin/env bash\nc
 cat > "$T/bin/uv" <<'EOF'
 #!/usr/bin/env bash
 echo "UV:$*" >> "$STUB_LOG"
+# STUB_UV_FAIL_DRYRUN=1: o resolvedor não fecha com o freeze (o motivo de existir do --dry-run)
+case "$*" in *--dry-run*) if [ "${STUB_UV_FAIL_DRYRUN:-0}" = 1 ]; then echo "error: No solution found when resolving dependencies"; exit 2; fi; echo "Would install 1 package" ;; esac
 if [ "$1 $2" = "pip freeze" ]; then printf 'requests==2.0.0\npyobjc-core==10.0\nPyObjC-framework-Cocoa==10.0\nappnope==0.1\n-e git+https://x/y#egg=y\nfoo @ file:///x\npytest==9.0.2\n\n# comentario\n'; fi
 EOF
 chmod +x "$T/bin/uv"
@@ -1161,6 +1170,28 @@ has "seed: instala com uv no venv do nó" "$STUB_LOG" 'DIRECT:.*uv pip install -
 : > "$STUB_LOG"; rc=$(STUB_RSYNC_REAL=1 STUB_DIRECT_OUT="$WANT_HASH" seed); expect "seed com o hash igual: nada a instalar" 0 "$rc"; hasnt "…sem uv pip install" "$STUB_LOG" 'uv pip install'; has "…diz que já bate" "$T/err" 'dependências do nó Linux já batem'
 : > "$STUB_LOG"; rc=$(STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_DIRECT_FAIL_ON='uv pip install' seed); expect "uv que falha: rc 98" 98 "$rc"; has "…diz que o hash NÃO foi gravado" "$T/err" 'o hash NÃO foi gravado'
 : > "$STUB_LOG"; rc=$(HETZNER_SEED_DRYRUN=1 STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada seed); expect "dry-run" 0 "$rc"; has "dry-run: usa --dry-run" "$STUB_LOG" 'uv pip install --dry-run'; hasnt "dry-run: NÃO grava o hash" "$STUB_LOG" '> gt-remote/venv-wa/\.freeze-hash'
+# hash que NÃO se calculou não é hash que bate (gate de 16/10): o shasum que falha deixa "" e o .freeze-hash que faltou no nó também é "" — "" = "" dizia "já batem" e o venv do nó parava de se atualizar sem aviso
+SHAFAIL="$T/shafail"; mkdir -p "$SHAFAIL"; printf '#!/bin/sh\nexit 1\n' > "$SHAFAIL/shasum"; chmod +x "$SHAFAIL/shasum"
+SHAJUNK="$T/shajunk"; mkdir -p "$SHAJUNK"; printf '#!/bin/sh\ncat >/dev/null\necho "shasum: lixo"\n' > "$SHAJUNK/shasum"; chmod +x "$SHAJUNK/shasum"
+: > "$STUB_LOG"; rc=$(PATH="$SHAFAIL:$PATH" STUB_RSYNC_REAL=1 seed); expect "hash do freeze que não se calculou (shasum falha) e .freeze-hash ausente no nó: 97" 97 "$rc"
+hasnt "…não diz 'já batem'" "$T/err" 'já batem'; has "…diz que não conseguiu calcular o hash" "$T/err" 'não consegui calcular o hash do freeze'; hasnt "…e não instala nada" "$STUB_LOG" 'uv pip install --python'
+: > "$STUB_LOG"; rc=$(PATH="$SHAJUNK:$PATH" STUB_RSYNC_REAL=1 seed); expect "shasum que imprime lixo (não é sha1 hex): 97" 97 "$rc"; hasnt "…e o lixo não vira .freeze-hash" "$STUB_LOG" '> gt-remote/venv-wa/\.freeze-hash'
+# controle negativo: o mutante em que hash_valid aceita tudo volta ao defeito (rc 0, "já batem") — o caso acima o pega
+sed 's/^hash_valid() { .*$/hash_valid() { return 0; }/' "$RUN" > "$MUT/mut-hashvalid.sh"; chmod +x "$MUT/mut-hashvalid.sh"
+n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-hashvalid.sh"; then echo "FAIL premissa: o mutante do hash_valid é igual ao script (o sed não casou)"; fails=$((fails+1)); else echo "ok   premissa: o mutante do hash_valid difere do script"; fi
+: > "$STUB_LOG"; PATH="$SHAFAIL:$PATH" HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 "$MUT/mut-hashvalid.sh" --host linux --seed wa >"$T/out" 2>"$T/err"; rc=$?
+n=$((n+1)); if [ "$rc" = 97 ]; then echo "FAIL controle: sem o hash_valid o seed ainda dá 97 (o caso do hash não pega nada)"; fails=$((fails+1)); else echo "ok   controle: sem o hash_valid o seed volta ao defeito (rc $rc) e o caso do hash o pega"; fi
+# o mesmo hash no caminho do MBP (semeadura sem --host linux): .sp-hash ausente + shasum falhando = "" = "" = "site-packages já bate"
+if ls -d /Users/athos/gt/whatsapp_automation/venv/lib/python3.*/site-packages >/dev/null 2>&1; then
+  : > "$STUB_LOG"; PATH="$SHAFAIL:$PATH" "$RUN" --seed wa >"$T/out" 2>"$T/err"; expect "MBP --seed: hash dos pacotes que não se calculou (shasum falha) e .sp-hash ausente: 97" 97 "$?"
+  hasnt "…não diz que o site-packages já bate" "$T/err" 'já bate'; has "…diz que não conseguiu calcular o hash" "$T/err" 'não consegui calcular o hash dos pacotes'; hasnt "…e não grava o .sp-hash" "$STUB_LOG" '> gt-remote/venv-wa/\.sp-hash'
+else echo "SKIP MBP --seed com hash que falha: venv local do WA ausente neste host (esse caminho NÃO foi exercitado)"; fi
+# dry-run: o comando remoto roda DE VERDADE (STUB_DIRECT_EXEC_ON) — o `| tail -40` devolvia o status do tail e um uv que falhou saía 0. A mensagem também não promete "nada é alterado": a base já foi semeada
+: > "$STUB_LOG"; rc=$(HETZNER_SEED_DRYRUN=1 STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_DIRECT_EXEC_ON='--dry-run' seed); expect "dry-run com o uv rodando de verdade: rc 0" 0 "$rc"
+has "…o uv rodou com --dry-run" "$STUB_LOG" 'UV:pip install --dry-run'; has "…e mostra o que ele instalaria" "$T/out" 'Would install 1 package'
+has "…diz que a base JÁ foi semeada e o freeze enviado" "$T/err" 'a base foi semeada e o freeze enviado'; hasnt "…e não diz 'nada é alterado'" "$T/err" 'nada é alterado'
+: > "$STUB_LOG"; rc=$(HETZNER_SEED_DRYRUN=1 STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_DIRECT_EXEC_ON='--dry-run' STUB_UV_FAIL_DRYRUN=1 seed); expect "dry-run com o uv falhando (erro de resolução): rc 98, o tail não esconde o status" 98 "$rc"
+has "…diz que o dry-run falhou" "$T/err" 'dry-run falhou'; has "…e ainda mostra o erro do uv" "$T/out" 'No solution found'
 HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" HETZNER_RSYNC_FILTER="$T/unsafe-filter" "$RUN" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "seed com filtro inseguro: 97 (não semeia)" 97 "$?"
 HETZNER_SEED_ROOT="$SEEDROOT" "$RUN" --host linux --seed ps >"$T/out" 2>"$T/err"; expect "seed ps no nó: 97 (o nó só tem o wa)" 97 "$?"
 HETZNER_SEED_ROOT="$T/nao-existe" HETZNER_SEED_VENV="$SEEDVENV" "$RUN" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "árvore local ausente: 97" 97 "$?"
@@ -1173,6 +1204,7 @@ sed 's/--filter=". \$NODE_FILTER" //' "$RUN" > "$MUT/mut-nofilter2.sh"; chmod +x
 find "$BASEDEST" -mindepth 1 -delete 2>/dev/null; HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada "$MUT/mut-nofilter2.sh" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "auditoria: com o filtro removido a semeadura é recusada (98)" 98 "$?"
 has "auditoria: ALARME e os caminhos" "$T/err" 'ALARME: dado ou segredo no destino'; has "…cita o .env que vazou" "$T/err" '\.env'; has "…cita o duckdb que vazou" "$T/err" 'x\.duckdb'; hasnt "…e não chega a instalar nada" "$STUB_LOG" 'uv pip install --python'
 has "…cita o token que vazou (a lista de nomes da auditoria tem token, a antiga não tinha)" "$T/err" 'pdpj_token'
+has "…manda DESLIGAR o nó (o ALARME não desliga sozinho: a bandeira segue ligada)" "$T/err" 'mbp-offload\.sh node off'; hasnt "…e esta auditoria terminou (sem o aviso de auditoria incompleta)" "$T/err" 'NÃO terminou'
 # CONTEÚDO: o mutante tira o HELD SÓ do rsync da semeadura (a linha com "$root"/; o node_guard e a verificação dele ficam intactos) e deixa a LISTA de telefones chegar ao destino; só a auditoria de conteúdo (o scanner rodando no servidor) a pega
 sed '/"\$root"\//s/--filter=". \$HELD" //' "$RUN" > "$MUT/mut-noheld.sh"; chmod +x "$MUT/mut-noheld.sh"
 n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-noheld.sh"; then echo "FAIL premissa: o mutante sem o HELD é igual ao script (o sed não casou)"; fails=$((fails+1)); else echo "ok   premissa: o mutante sem o HELD difere do script"; fi
@@ -1188,7 +1220,11 @@ find "$BASEDEST" -mindepth 1 -delete 2>/dev/null; : > "$STUB_LOG"; HETZNER_SEED_
 has "…ALARME cita GRANDE e o caminho" "$T/err" 'GRANDE lib/big\.py'
 # a auditoria que NÃO consegue olhar (ssh caiu no meio / python ausente no nó) não é "nada achado"
 find "$BASEDEST" -mindepth 1 -delete 2>/dev/null; : > "$STUB_LOG"; rc=$(STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_AUDIT_BROKEN=1 seed); expect "auditoria que não consegue olhar: 98" 98 "$rc"
-has "…diz que não conseguiu auditar" "$T/err" 'não consegui auditar'; hasnt "…e não instala nada" "$STUB_LOG" 'uv pip install --python'
+has "…diz que não conseguiu auditar" "$T/err" 'não consegui auditar'; hasnt "…e não instala nada" "$STUB_LOG" 'uv pip install --python'; hasnt "…e sem nada achado não é ALARME (prio 4, não 5)" "$T/err" 'ALARME'
+# achou um vazamento E a auditoria caiu antes de terminar: vale o que achou. É ALARME (prio 5) com o aviso de que não terminou — não "não consegui auditar" (prio 4), que jogaria o achado fora
+find "$BASEDEST" -mindepth 1 -delete 2>/dev/null; : > "$STUB_LOG"; rc=$(STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_AUDIT_BROKEN=2 seed); expect "auditoria que ACHOU e caiu antes de terminar: 98" 98 "$rc"
+has "…é ALARME, não 'não consegui auditar'" "$T/err" 'ALARME: dado ou segredo no destino'; hasnt "…e não degrada para o aviso de prio menor" "$T/err" 'não consegui auditar'; has "…cita o que achou antes de cair" "$T/err" 'NOME \.env'
+has "…avisa que a auditoria NÃO terminou" "$T/err" 'NÃO terminou'; has "…manda desligar o nó" "$T/err" 'mbp-offload\.sh node off'; hasnt "…e não instala nada" "$STUB_LOG" 'uv pip install --python'
 # o node_guard da semeadura falha FECHADO: sem o scanner (hetzner-pii-scan.py) NADA é copiado — não é "nada retido"
 cp "$RUN" "$NOSCAN/mut-noscan-seed.sh"; chmod +x "$NOSCAN/mut-noscan-seed.sh"
 find "$BASEDEST" -mindepth 1 -delete 2>/dev/null; : > "$STUB_LOG"; HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada "$NOSCAN/mut-noscan-seed.sh" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "seed sem o hetzner-pii-scan.py: 98 (não semeia)" 98 "$?"
