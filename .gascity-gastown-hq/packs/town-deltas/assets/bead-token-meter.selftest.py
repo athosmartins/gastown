@@ -1565,6 +1565,7 @@ def t_crew_cost_and_unattributed(m, W):
     ck(o["sessions"] == 2 and o["msgs"] == 6 and o["tokens"] == 6_000_000 and o["unpriced_tokens"] == 4_000_000, f"oracle-wa soma as 2 sessões: {o}")
     ck(approx(o["usd"], 8.0) and o["usd_is_floor"], f"oracle-wa: US$ 8,00 dos tokens com preço, rotulado PISO (há 4M sem preço): {o}")
     ck(mi["usd"] is None and mi["unpriced_tokens"] == 1_000_000 and not mi["usd_is_floor"], f"mila-wa só em modelo sem preço: US$ n/p (None), nunca 0: {mi}")
+    ck(mi["pct_usd"] is None and approx(mi["pct_tokens"], 100 * 1e6 / (20e6 + DOG_TOK)), f"mila-wa: sem preço o % de US$ é n/d (None), nunca 0%; o % de tokens existe: {mi['pct_usd']} {mi['pct_tokens']}")
     ck(approx(o["pct_usd"], 100 * 8 / (34 + DOG_USD)) and approx(o["pct_tokens"], 100 * 6e6 / (20e6 + DOG_TOK)), f"% de oracle-wa sobre o total da janela: {o['pct_usd']} {o['pct_tokens']}")
     ck(r["crew_unpriced_tokens"] == 5_000_000, f"JSON diz quanto do crew está sem preço: {r['crew_unpriced_tokens']}")
     u = r["unattributed"]
@@ -1583,26 +1584,50 @@ def t_crew_cost_and_unattributed(m, W):
     ck("== 1d. custo por CREW" in txt and "== 1e. sessões SEM papel atribuído" in txt, "o texto traz as duas seções novas")
     ck(txt.index("== 1d.") < txt.index("== 2. spawn OCIOSO"), "1d/1e vêm antes do spawn ocioso")
     row = [ln for ln in txt.splitlines() if ln.startswith("mila-wa")]
-    ck(len(row) == 1 and " n/p " in row[0], f"a linha do crew só com modelo sem preço mostra n/p, não 0.00: {row}")
+    ck(len(row) == 1 and " n/p " in row[0] and " n/d " in row[0], f"a linha do crew só com modelo sem preço mostra n/p e n/d, não 0.00 nem 0.0: {row}")
+    orow = [ln for ln in txt.splitlines() if ln.startswith("oracle-wa")]
+    ck(len(orow) == 1 and re.search(r"\d\.\d\+ ", orow[0]) is not None, f"o %US$ do crew com piso também leva `+`: {orow}")
     ck("ACIMA da meta de 5%" in txt and "rodaram em diretório de crew" in txt, "o texto dá o veredito e o aviso do headless em dir de crew")
 
 
 def t_unattributed_within_target_and_unpriced(m, W):
-    """Abaixo da meta: dog (desprezível) + peter-wa 40 resp (US$ 80) + 1 sem papel (home, 1 resp US$ 2) + 1 sem papel em FABLE (1M tok sem preço) => 2,4% do
-    US$ (2 de 82) e 4,8% dos tokens (2M de 42M) => DENTRO. Um sem papel
-    em modelo SEM preço não vira US$ 0 calado: os tokens aparecem à parte e o texto avisa que eles não entram no % de US$."""
+    """Abaixo da meta NO QUE TEM PREÇO: dog (desprezível) + peter-wa 40 resp (US$ 80) + 1 sem papel (home, 1 resp US$ 2) + 1 sem papel em FABLE (1M tok sem
+    preço) => 2,4% do US$ (2 de 82) e 4,8% dos tokens (2M de 42M). Mas o sem papel em modelo SEM preço não vira US$ 0 calado NEM aprova a meta: os tokens
+    aparecem à parte, o US$ é piso (`+`), a origem toda sem preço é n/p com % n/d, e o veredito é INDETERMINADO — 'dentro' só com tudo precificado."""
     w = cw_world(m, W, [(beacon_of("peter-wa"), "claude-sonnet-5-5", 40, None),
                         (user("sozinho", D + "09:00:00.000Z"), "claude-sonnet-5-5", 1, "/Users/athos"),
                         (user("sem preço", D + "09:00:00.000Z"), FABLE, 1, "/Users/athos/gt")])
     code, r = report(m, w)
     u = r["unattributed"]
-    ck(code == 0 and u["verdict"] == "dentro", f"{code} {u['verdict']} usd={u['pct_usd']} tok={u['pct_tokens']}")
+    ck(code == 0 and u["verdict"] == "indeterminado", f"token sem papel e sem preço: nem dentro nem acima: {code} {u['verdict']} usd={u['pct_usd']} tok={u['pct_tokens']}")
     ck(approx(u["pct_usd"], 100 * 2 / (82 + DOG_USD)) and approx(u["pct_tokens"], 100 * 2e6 / (42e6 + DOG_TOK)), f"%: {u['pct_usd']} {u['pct_tokens']}")
-    ck(u["unpriced_tokens"] == 1_000_000 and approx(u["usd"], 2.0), f"o sem papel em modelo sem preço: 1M tokens à parte, US$ só dos que têm preço: {u}")
+    ck(u["unpriced_tokens"] == 1_000_000 and approx(u["usd"], 2.0) and u["usd_is_floor"], f"1M tokens à parte, US$ só dos que têm preço, rotulado piso: {u}")
     ro = {x["key"]: x for x in u["by_origin"]}
-    ck(ro["headless @ gt-root"]["usd"] is None, f"a origem toda sem preço é n/p (None), não 0: {ro['headless @ gt-root']}")
+    ck(ro["headless @ gt-root"]["usd"] is None and ro["headless @ gt-root"]["pct_usd"] is None, f"a origem toda sem preço é n/p e n/d (None), não 0 nem 0%: {ro['headless @ gt-root']}")
+    ck(approx(ro["headless @ home-dir"]["pct_usd"], 100 * 2 / (82 + DOG_USD)) and not ro["headless @ home-dir"]["usd_is_floor"], f"a origem com preço segue medida: {ro['headless @ home-dir']}")
     code, txt = report_text(m, w)
-    ck("DENTRO da meta de 5%" in txt and "sem papel e sem preço" in txt, "texto: veredito + aviso do que ficou sem preço")
+    ck("INDETERMINADO frente à meta de 5%" in txt and "DENTRO" not in txt and "sem papel e sem preço" in txt, "texto: veredito indeterminado + aviso do que ficou sem preço")
+    ck(re.search(r"SEM PAPEL: \d+\.\d%\+ do US\$", txt) is not None, "o % de US$ do sem papel vem com `+` (piso) quando há token sem preço")
+    row = [ln for ln in txt.splitlines() if ln.startswith("headless @ gt-root")]
+    ck(len(row) == 1 and " n/p " in row[0] and " n/d " in row[0], f"a linha toda sem preço mostra n/p no US$ e n/d no %US$, não 0.0: {row}")
+    # TODO o sem papel sem preço (nenhum token dele tem preço): o agregado é n/p e n/d (None), não US$ 0 nem 0%, e o veredito segue indeterminado
+    w3 = cw_world(m, W / "allun", [(beacon_of("peter-wa"), "claude-sonnet-5-5", 40, None),
+                                   (user("só sem preço", D + "09:00:00.000Z"), FABLE, 1, "/Users/athos")])
+    code, r3 = report(m, w3)
+    u3 = r3["unattributed"]
+    ck(code == 0 and u3["usd"] is None and u3["pct_usd"] is None and not u3["usd_is_floor"] and u3["unpriced_tokens"] == 1_000_000,
+       f"sem papel todo sem preço: US$ e % de US$ desconhecidos (None), não 0: {code} {u3['usd']} {u3['pct_usd']} {u3['unpriced_tokens']}")
+    ck(u3["verdict"] == "indeterminado" and approx(u3["pct_tokens"], 100 * 1e6 / (41e6 + DOG_TOK)), f"2,4% dos tokens mas sem preço: indeterminado: {u3['verdict']} {u3['pct_tokens']}")
+    code, txt3 = report_text(m, w3)
+    ck("SEM PAPEL: n/d do US$" in txt3 and "n/d%" not in txt3, "o texto diz n/d (sem o '%' grudado), não 0.0%")
+    # controle: o MESMO mundo sem o sem-papel em FABLE — tudo precificado e abaixo da meta => DENTRO de verdade
+    w2 = cw_world(m, W / "ctl", [(beacon_of("peter-wa"), "claude-sonnet-5-5", 40, None),
+                                 (user("sozinho", D + "09:00:00.000Z"), "claude-sonnet-5-5", 1, "/Users/athos")])
+    code, r2 = report(m, w2)
+    u2 = r2["unattributed"]
+    ck(code == 0 and u2["verdict"] == "dentro" and u2["unpriced_tokens"] == 0 and not u2["usd_is_floor"], f"tudo precificado e < 5%: dentro: {code} {u2}")
+    code, txt2 = report_text(m, w2)
+    ck("DENTRO da meta de 5%" in txt2 and "sem papel e sem preço" not in txt2, "texto do controle: DENTRO, sem aviso de preço")
 
 
 def t_unattributed_pure_functions(m, W):
@@ -1612,6 +1637,10 @@ def t_unattributed_pure_functions(m, W):
     ck(v(None, None) == "indeterminado", "sem nenhuma medida não se aprova nada")
     ck(v(4.99, 4.99) == "dentro" and v(5.0, 0.0) == "acima" and v(0.0, 5.0) == "acima", "a meta é < 5%: 5,0 já reprova, em qualquer das duas medidas")
     ck(v(None, 3.0) == "dentro" and v(None, 7.0) == "acima" and v(7.0, None) == "acima", "uma medida só vale quando a outra falta")
+    ck(v(1.0, 1.0, unpriced_tokens=5) == "indeterminado" and v(None, 3.0, unpriced_tokens=5) == "indeterminado",
+       "token sem papel e sem preço: o US$ medido é piso, então abaixo da meta NÃO é 'dentro'")
+    ck(v(7.0, 1.0, unpriced_tokens=5) == "acima" and v(1.0, 5.0, unpriced_tokens=5) == "acima", "o que já está acima da meta continua acima, com ou sem token sem preço")
+    ck(v(1.0, 1.0, unpriced_tokens=0) == "dentro", "sem token sem preço, abaixo da meta é dentro")
     ck(m.is_unattributed("headless") and m.is_unattributed("other:x") and not m.is_unattributed("title-summary")
        and not m.is_unattributed("pregate-review") and not m.is_unattributed("crew"), "quais papéis contam como 'sem papel'")
     cases = {None: "sem-cwd", "": "sem-cwd", "/Users/athos": "home-dir", "/Users/athos/": "home-dir", "/home/x": "home-dir",
@@ -1750,7 +1779,12 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "sem papel ignora o headless": ('    return role == "headless" or role.startswith("other:")', '    return role.startswith("other:")', t_crew_cost_and_unattributed),
     "title-summary conta como sem papel": ('    return role == "headless" or role.startswith("other:")', '    return role == "headless" or role.startswith("other:") or role == "title-summary"', t_unattributed_pure_functions),
     "token sem preço do grupo some": ('        if usd is None:\n            r["unpriced"] += tt\n', '        if usd is None:\n            r["unpriced"] += 0\n', t_crew_cost_and_unattributed),
-    "grupo todo sem preço vira US$ 0": ('usd=None if r["unpriced"] and not r["usd"] else round(r["usd"], 4)', 'usd=round(r["usd"], 4)', t_crew_cost_and_unattributed),
+    "grupo todo sem preço vira US$ 0": ('usd=None if all_unpriced else round(r["usd"], 4)', 'usd=round(r["usd"], 4)', t_crew_cost_and_unattributed),
+    "grupo todo sem preço vira 0% do US$": ('pct_usd=None if all_unpriced else pct_of(r["usd"], tot_usd)', 'pct_usd=pct_of(r["usd"], tot_usd)', t_crew_cost_and_unattributed),
+    "sem papel sem preço aprova a meta": ('    return "indeterminado" if unpriced_tokens else "dentro"', '    return "dentro"', t_unattributed_pure_functions),
+    "sem papel todo sem preço vira US$ 0 no agregado": ('usd=None if un_all_unpriced else round(un_usd, 4)', 'usd=round(un_usd, 4)', t_unattributed_within_target_and_unpriced),
+    "piso do sem papel não leva `+`": ('+ ("+" if un_unp else "")', '+ ""', t_unattributed_within_target_and_unpriced),
+    "piso do %US$ do crew não leva `+`": ('pct_s = fmt_pct(r["pct_usd"]) + ("+" if r["usd_is_floor"] else "")', 'pct_s = fmt_pct(r["pct_usd"])', t_crew_cost_and_unattributed),
     "US$ piso do crew não é rotulado": ('usd_is_floor=bool(r["unpriced"] and r["usd"])', "usd_is_floor=False", t_crew_cost_and_unattributed),
     "-adhoc- vira outro crew": ('(s.get("alias") or "?").split("-adhoc-")[0] if s["role"] == "crew" else None', '(s.get("alias") or "?") if s["role"] == "crew" else None', t_crew_cost_and_unattributed),
     "o sem papel sem preço some do JSON": ('un_unp = sum(r["unpriced"] for r in unatt.values())', "un_unp = 0", t_unattributed_within_target_and_unpriced),

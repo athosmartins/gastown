@@ -1010,13 +1010,14 @@ def fmt_pct(p):
     return "  n/d" if p is None else f"{p:5.1f}"
 
 
-def unattributed_verdict(pct_usd, pct_tok, target=UNATTRIBUTED_TARGET_PCT):
-    """acima | dentro | indeterminado. Qualquer das duas medidas acima da meta reprova; sem NENHUMA medida não se aprova nada."""
+def unattributed_verdict(pct_usd, pct_tok, target=UNATTRIBUTED_TARGET_PCT, unpriced_tokens=0):
+    """acima | dentro | indeterminado. Qualquer das duas medidas acima da meta reprova; sem NENHUMA medida não se aprova nada; e token SEM papel e SEM
+    preço tem custo desconhecido: sem nada acima da meta isso é `indeterminado`, não `dentro` (o US$ medido é só um piso do que a meta pede)."""
     if pct_usd is None and pct_tok is None:
         return "indeterminado"
     if (pct_usd is not None and pct_usd >= target) or (pct_tok is not None and pct_tok >= target):
         return "acima"
-    return "dentro"
+    return "indeterminado" if unpriced_tokens else "dentro"
 
 
 def _group_rows(g, tot_usd, tot_tok):
@@ -1024,9 +1025,10 @@ def _group_rows(g, tot_usd, tot_tok):
     for k, r in sorted(g.items(), key=lambda kv: (-kv[1]["usd"], -kv[1]["tokens"], str(kv[0]))):
         if r["tokens"] == 0:
             continue
+        all_unpriced = bool(r["unpriced"] and not r["usd"])      # nenhum token do grupo tem preço: o US$ é desconhecido, não 0 — e o % dele também
         rows.append(dict(key=k, sessions=len(r["sessions"]), msgs=r["msgs"], tokens=r["tokens"], unpriced_tokens=r["unpriced"],
-                         usd=None if r["unpriced"] and not r["usd"] else round(r["usd"], 4), usd_is_floor=bool(r["unpriced"] and r["usd"]),
-                         pct_usd=pct_of(r["usd"], tot_usd), pct_tokens=pct_of(r["tokens"], tot_tok),
+                         usd=None if all_unpriced else round(r["usd"], 4), usd_is_floor=bool(r["unpriced"] and r["usd"]),
+                         pct_usd=None if all_unpriced else pct_of(r["usd"], tot_usd), pct_tokens=pct_of(r["tokens"], tot_tok),
                          models=dict(r["models"].most_common())))
     return rows
 
@@ -1035,9 +1037,10 @@ def _print_group(rows, label):
     print(f"{label:34s} {'sess':>5s} {'msgs':>7s} {'Mtok':>9s} {'Mtok s/preço':>12s} {'US$':>10s} {'%US$':>6s} {'%tok':>6s}  modelos (Mtok)")
     for r in rows:
         usd_s = fmt_usd(r["usd"], unpriced=r["usd_is_floor"])
+        pct_s = fmt_pct(r["pct_usd"]) + ("+" if r["usd_is_floor"] else "")
         mods = ", ".join(f"{k or '?'} {v / 1e6:.2f}" for k, v in r["models"].items())
         print(f"{str(r['key']):34s} {r['sessions']:5d} {r['msgs']:7d} {r['tokens'] / 1e6:9.2f} {r['unpriced_tokens'] / 1e6:12.2f} {usd_s:>10s} "
-              f"{fmt_pct(r['pct_usd']):>6s} {fmt_pct(r['pct_tokens']):>6s}  {mods}")
+              f"{pct_s:>6s} {fmt_pct(r['pct_tokens']):>6s}  {mods}")
 
 
 def section_crew_and_unattributed(flat, tot_usd, result):
@@ -1045,7 +1048,7 @@ def section_crew_and_unattributed(flat, tot_usd, result):
     Aditivo: não mexe em `role` nem nas seções 1-1c; só lê `flat`. `tot_usd` é o total precificado da seção 1 (um PISO quando há modelo sem preço)."""
     tot_tok = sum(total_tokens(c) for _s, _d, _m, _e, c, _u in flat)
     crews = _group_rows(group_usage(flat, lambda s: (s.get("alias") or "?").split("-adhoc-")[0] if s["role"] == "crew" else None), tot_usd, tot_tok)
-    print("\n== 1d. custo por CREW (sessões com beacon de crew) — `Mtok s/preço` = tokens de modelo SEM preço na tabela (o US$ da linha é piso, `+`; n/p se TODO o gasto dela é sem preço)")
+    print("\n== 1d. custo por CREW (sessões com beacon de crew) — `Mtok s/preço` = tokens de modelo SEM preço na tabela (US$ e %US$ da linha são piso, `+`; n/p e n/d se TODO o gasto dela é sem preço)")
     if crews:
         _print_group(crews, "crew")
         crew_unp = sum(r["unpriced_tokens"] for r in crews)
@@ -1062,21 +1065,26 @@ def section_crew_and_unattributed(flat, tot_usd, result):
     un_usd = sum(r["usd"] for r in unatt.values())
     un_tok = sum(r["tokens"] for r in unatt.values())
     un_unp = sum(r["unpriced"] for r in unatt.values())
-    pu, pt = pct_of(un_usd, tot_usd), pct_of(un_tok, tot_tok)
-    verdict = unattributed_verdict(pu, pt)
+    un_all_unpriced = bool(un_unp and not un_usd)     # mesma regra das linhas: sem NENHUM token com preço o US$ é desconhecido (None), não 0
+    pu, pt = (None if un_all_unpriced else pct_of(un_usd, tot_usd)), pct_of(un_tok, tot_tok)
+    verdict = unattributed_verdict(pu, pt, unpriced_tokens=un_unp)
+    verdict_txt = {"acima": "ACIMA da meta de", "dentro": "DENTRO da meta de", "indeterminado": "INDETERMINADO frente à meta de"}[verdict]
+    pu_s = "n/d" if pu is None else f"{pu:.1f}%" + ("+" if un_unp else "")         # `+` = piso: há token sem papel e sem preço fora da conta
+    pt_s = "n/d" if pt is None else f"{pt:.1f}%"
     print(f"\n== 1e. sessões SEM papel atribuído (sem beacon = `headless`, alias fora da tabela = `other:*`) por ORIGEM (cwd) — meta ga-v2qox1: < {UNATTRIBUTED_TARGET_PCT:g}%")
     if origin:
         _print_group(origin, "papel @ origem")
     else:
         print("   (nenhuma sessão sem papel na janela)")
-    print(f"   SEM PAPEL: {fmt_pct(pu).strip()}% do US$ precificado e {fmt_pct(pt).strip()}% dos tokens — {verdict.upper()} da meta de {UNATTRIBUTED_TARGET_PCT:g}%"
-          + (f"  (⚠ {un_unp / 1e6:.2f} Mtok sem papel e sem preço: não entram no % de US$)" if un_unp else ""))
+    print(f"   SEM PAPEL: {pu_s} do US$ precificado e {pt_s} dos tokens — {verdict_txt} {UNATTRIBUTED_TARGET_PCT:g}%"
+          + (f"  (⚠ {un_unp / 1e6:.2f} Mtok sem papel e sem preço: fora do % de US$ — sem preço não se afirma 'dentro')" if un_unp else ""))
     crew_dir_hl = sum(r["tokens"] for k, r in group_usage(flat, lambda s: origin_of_cwd(s.get("cwd")) if s["role"] == "headless" else None).items()
                       if k.startswith("crew-dir:"))
     if crew_dir_hl:
         print(f"   ⚠ {crew_dir_hl / 1e6:.2f} Mtok `headless` rodaram em diretório de crew (crew/<nome>): a ORIGEM é de crew, mas a sessão não tem beacon — "
               f"esse gasto NÃO está na tabela 1d e o papel dela segue `headless` (a origem é pista, não prova).")
-    result["unattributed"] = dict(target_pct=UNATTRIBUTED_TARGET_PCT, verdict=verdict, tokens=un_tok, pct_tokens=pt, usd=round(un_usd, 4), pct_usd=pu,
+    result["unattributed"] = dict(target_pct=UNATTRIBUTED_TARGET_PCT, verdict=verdict, tokens=un_tok, pct_tokens=pt,
+                                  usd=None if un_all_unpriced else round(un_usd, 4), usd_is_floor=bool(un_unp and un_usd), pct_usd=pu,
                                   unpriced_tokens=un_unp, by_role=by_role_un, by_origin=origin, headless_in_crew_dir_tokens=crew_dir_hl)
 
 
