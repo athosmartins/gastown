@@ -39,14 +39,14 @@ O prod test (`story-ga-mqs133.sh`) falha se um dos bloqueados medidos virar perm
 
 ## Como usar
 ```bash
-scripts/hetzner-scrape-round.sh check                       # bandeira, ssh, ambiente, disco do nó (chave=valor); rc 0 = pronto
+scripts/hetzner-scrape-round.sh check                       # bandeira, ssh, ambiente, disco do nó, código do rig e lista (chave=valor); rc 0 = pronto, 97 = o run recusaria
 scripts/hetzner-scrape-round.sh eligible zap_vivareal       # BLOCK <motivo>, rc 97
 scripts/hetzner-scrape-round.sh run primeimoveisdeluxo --limit 3 --stage /tmp/x      # 1 rodada em staging
 scripts/hetzner-scrape-round.sh run imoview --tenant decisao -- --finalidade venda   # argumentos do raspador vão depois de --
 scripts/hetzner-scrape-round.sh probe --out /tmp/matriz.txt # re-mede mini x nó (ver "Como re-medir")
 scripts/hetzner-scrape-round.sh bootstrap                   # prepara o ambiente do nó (idempotente)
 ```
-`run` imprime `stage=`, `files=` e `secs=`; o resultado fica em `$STAGE/<raspador>[-tenant]-<UTC>-<pid>/{shared/,scraper.log}` (padrão: `$CITY/.gc/hetzner-scrape/stage`). Cada rodada deixa uma linha em `$CITY/.gc/logs/hetzner-scrape.jsonl`. A bandeira é a mesma do nó de testes (`$CITY/.gc/hetzner-node.on`): apagar = desligar, tudo cai para o mini.
+`run` imprime `stage=`, `files=` e `secs=`; o resultado fica em `$STAGE/<raspador>[-tenant]-<UTC>-<pid>/{shared/,scraper.log}` (padrão: `$CITY/.gc/hetzner-scrape/stage`). Cada rodada deixa uma linha em `$CITY/.gc/logs/hetzner-scrape.jsonl` (`why`: `ok`, `ok-sem-arquivos`, `rc-N` quando o raspador falhou, `rc-cru-N`, ou o motivo da desistência). A bandeira é a mesma do nó de testes (`$CITY/.gc/hetzner-node.on`): apagar = desligar, tudo cai para o mini.
 
 ## Códigos de saída
 **96..99 sempre significam "rode local"** (mesma convenção do `mbp-run.sh`); o chamador nunca pode tratá-los como falha do raspador.
@@ -54,15 +54,15 @@ scripts/hetzner-scrape-round.sh bootstrap                   # prepara o ambiente
 | rc | Significa |
 |---|---|
 | 0..94 | código do raspador, propagado |
-| 95 | o raspador saiu com rc >= 96 (inclusive **124 = estourou `--timeout`**); o valor cru vai em `scraper_rc_raw=` — assim um raspador nunca "fabrica" um sinal de rode-local |
-| 97 | uso errado, nome inválido, raspador fora da lista **ou bloqueado**, código ausente, staging dentro da produção |
-| 98 | nó indisponível ou sem condição: ssh, ambiente não preparado, disco < `HETZNER_SCRAPE_MIN_DISK_MB` (3072), conteúdo reprovado pela varredura, ssh caiu no meio |
+| 95 | o raspador saiu com rc >= 95 (inclusive **124 = estourou `--timeout`**) ou o arquivo rc do nó veio ilegível; o valor cru vai SEMPRE em `scraper_rc_raw=` (`ilegivel` no segundo caso) — assim um raspador nunca "fabrica" um sinal de rode-local |
+| 97 | uso errado (inclusive opção sem valor), nome inválido, raspador fora da lista **ou bloqueado**, código ou lista de elegíveis ausente (também no `check`), staging dentro da produção |
+| 98 | nó indisponível ou sem condição: ssh, ambiente não preparado, disco < `HETZNER_SCRAPE_MIN_DISK_MB` (3072), conteúdo reprovado pela varredura, ssh caiu no meio (**se caiu ao disparar, a rodada PODE estar rodando no nó**: confira antes de rodar local, senão raspa em dobro) |
 | 99 | desligado (falta a bandeira) |
 
 ## O que vai e o que volta
 **Vai** (rsync com filtro de segurança montado por rodada; regras de segredo/dado por NOME antes de qualquer `+`, e `- *` fecha, então nome desconhecido não sai): `lib/*.py`, `config/__init__.py`, `scope.json`, os `*_tenants.json` e `scrapers/<raspador>/*.py` do raspador pedido — por caminho, nunca por extensão solta — mais, de `shared/config`, o `seen_<raspador>.json`, `seen_<raspador>_*.json` (ids de anúncios públicos) e os `<raspador>_*cache*.json` — o estado de um raspador irmão cujo nome começa por `<raspador>_` é excluído antes. **Não vai**: `.env`, credenciais, token, secret, password, cookie, session, banco, parquet, csv, `shared/data` da produção, venv, `.git` (as mesmas regras de nome valem para o código e para o estado). O **conteúdo** do que vai, código **e** estado, é varrido por `hetzner-pii-scan.py`: arquivo com lista de >=20 telefones ou >=3 CPFs derruba a rodada com rc 98 e o nó não é usado. Nenhuma credencial vai no comando; o nó não tem as do GitHub nem as do mini. O servidor é alugado: **nenhum dado de cliente, nenhum segredo**.
 
-**Volta**: `shared/data/<raspador>/<timestamp>/`, os seen/caches atualizados e `scraper.log`, para o staging. A pasta da rodada no nó (`~/gt-remote/scrape/runs/<id>`) é apagada ao fim; as de mais de 1 dia (queda de rede) o próximo `run` apaga. O raspador roda **desacoplado** no nó (`setsid nohup`, `nice 5`, `timeout`): o ssh só consulta (a cada `HETZNER_SCRAPE_POLL_S`, 20 s), então uma queda de segundos não mata uma rodada de horas; `HETZNER_SCRAPE_POLL_FAILS` (15) consultas seguidas sem resposta fazem o script desistir com rc 98. Se o nó responde mas o processo sumiu sem escrever o rc (reboot do servidor, `kill -9`), o script desiste com rc 98 depois de `--timeout` + `HETZNER_SCRAPE_GRACE_S` (900 s) em vez de consultar para sempre; a pasta fica no nó e o reaper de 1 dia a apaga.
+**Volta**: `shared/data/<raspador>/<timestamp>/`, os seen/caches atualizados e `scraper.log`, para o staging. A pasta da rodada no nó (`~/gt-remote/scrape/runs/<id>`) é apagada ao fim; as de mais de 1 dia (queda de rede) são apagadas no fim de um `run` posterior que termine (o reaper não roda se o nó nunca mais for usado com sucesso). O raspador roda **desacoplado** no nó (`setsid nohup`, `nice 5`, `timeout`): o ssh só consulta (a cada `HETZNER_SCRAPE_POLL_S`, 20 s), então uma queda de segundos não mata uma rodada de horas; `HETZNER_SCRAPE_POLL_FAILS` (15) consultas seguidas sem resposta fazem o script desistir com rc 98. Se o nó responde mas o processo sumiu sem escrever o rc (reboot do servidor, `kill -9`), o script desiste com rc 98 depois de `--timeout` + `HETZNER_SCRAPE_GRACE_S` (900 s) em vez de consultar para sempre; a pasta fica no nó e o reaper de 1 dia a apaga.
 
 ## Como preparar o nó
 `hetzner-scrape-round.sh bootstrap` (sem sudo, idempotente, ~15 s com cache do `uv`): venv em `~/gt-remote/scrape/env/venv` com `requests`, `beautifulsoup4`, `pytz` e **`playwright==1.60.0`** (a mesma versão do mini, para o mesmo chromium 1223), chromium headless, e as bibliotecas de sistema que o chromium pede **sem root** — `apt-get download` + `dpkg -x` numa pasta nossa (`env/root`) e `LD_LIBRARY_PATH` em `env/libpath.txt`. Termina lançando o chromium de verdade (`CHROMIUM_OK`) e conferindo com `ldd` que não falta biblioteca. O aviso "Host system is missing dependencies ... sudo playwright install-deps" do Playwright é esperado. Se o servidor for recriado, é só rodar `bootstrap` de novo.

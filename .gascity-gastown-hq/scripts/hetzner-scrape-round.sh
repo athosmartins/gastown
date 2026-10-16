@@ -16,8 +16,8 @@
 #   hetzner-scrape-round.sh probe [--out ARQ]             # re-mede mini x nó nos endereços do runner.py e dos tenants (ga-mqs133 passo 1); use quando o servidor ou o IP mudar
 #
 # CÓDIGOS DE SAÍDA — 96..99 significam "rode local": quem chama NUNCA trata isso como falha do raspador (mesma convenção do mbp-run.sh).
-#   0..95  código do raspador (propagado; rc >= 96 do raspador, inclusive 124 = estourou o --timeout, vira 95 e o valor cru vai na linha `scraper_rc_raw=`)
-#   97  uso errado, nome inválido, raspador fora da lista ou BLOQUEADO, código do rig ausente, staging dentro de shared/ (jamais grava na produção)
+#   0..94  código do raspador (propagado); 95 = rc >= 95 do raspador (inclusive 124 = estourou o --timeout, ou rc ilegível no nó): o valor cru vai SEMPRE na linha `scraper_rc_raw=`
+#   97  uso errado (inclusive opção sem valor), nome inválido, raspador fora da lista ou BLOQUEADO, código do rig ou lista ausente (também no `check`), staging dentro de shared/ (jamais grava na produção)
 #   98  nó indisponível ou sem condição: ssh não responde, ambiente não preparado (rode bootstrap), disco < HETZNER_SCRAPE_MIN_DISK_MB, conteúdo reprovado pela varredura, ssh caiu no meio
 #   99  desligado: falta $CITY/.gc/hetzner-node.on (a mesma bandeira do nó de testes; apagar = desligar)
 #
@@ -29,7 +29,7 @@
 # SEGURANÇA: o servidor é alugado e a fronteira de dados é a mesma do mbp-run.sh. Segredo, .env, token, banco, parquet, venv e shared/data da produção NÃO viajam (as regras de nome vêm antes de qualquer
 #   `+`, e `- *` fecha). O CONTEÚDO do que vai (código E seen/caches) é varrido por hetzner-pii-scan.py (lista de telefones/CPFs = o nó NÃO é usado, rc 98). Nenhuma credencial vai no comando; o nó não tem a do GitHub nem a do mini.
 # LIMITES: o raspador roda DESACOPLADO no nó (nohup; o ssh só consulta), então uma queda de rede de segundos não mata uma rodada de horas; passados HETZNER_SCRAPE_POLL_FAILS consultas seguidas sem resposta
-#   o script desiste com rc 98 e deixa a pasta da rodada no nó (o reaper do próximo preflight apaga as de > 1 dia). Não roda raspador com credencial (blow, leilões com login) nem o que o IP alemão não alcança.
+#   o script desiste com rc 98 e deixa a pasta da rodada no nó (o reaper, no fim de uma rodada futura que termine, apaga as de > 1 dia). Não roda raspador com credencial (blow, leilões com login) nem o que o IP alemão não alcança.
 set -o pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
@@ -60,6 +60,8 @@ rmtmp() { local d; for d in "$@"; do [ -n "$d" ] && [ -d "$d" ] && { find "$d" -
 say() { echo "hetzner-scrape-round: $*" >&2; }
 die() { local rc=$1; shift; say "$*"; exit "$rc"; }
 iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# need_val <subcomando> <opção> [valor...]: vazio → opção sem valor (último argumento), valor "" ou que começa com `-` (outra opção engolida) é USO ERRADO, rc 97; falhou/ilegível → idem. Sem isto `shift 2` com $#=1 falhava e o laço de opções girava para sempre
+need_val() { [ $# -ge 3 ] && [ -n "$3" ] && [ "${3#-}" = "$3" ] || die 97 "$1: $2 precisa de um valor"; }
 rssh() { "$SSH_BIN" $SSH_OPTS "$NODE_HOST" "$@"; }
 # rscript <args...>: o script remoto vem no stdin; os argumentos chegam como $1.. (escapados com %q: nada do que vem de fora é interpretado pelo shell do nó)
 rscript() { local q; q=$(printf '%q ' "$@"); "$SSH_BIN" $SSH_OPTS "$NODE_HOST" "bash -s -- $q"; }
@@ -127,6 +129,9 @@ cmd_check() {
   [ "$rc" -eq 0 ] || { say "$(why_of "$rc")"; return "$rc"; }
   [ "$NODE_ENV" = ok ] || { say "ambiente do nó não preparado: rode \`$(basename "$0") bootstrap\`"; return 98; }
   [ "$NODE_FREE_MB" -ge "$MIN_DISK_MB" ] || { say "disco do nó baixo: ${NODE_FREE_MB} MB livres < $MIN_DISK_MB"; return 98; }
+  # vazio → sem código do rig, ou lista sem nenhum permitido: o `run` recusaria tudo com 97, então NÃO está pronto; falhou/ilegível → idem (el=0), rc 97 como o run
+  [ -d "$PS_CODE/scrapers" ] || { say "código do rig ausente: $PS_CODE — o run recusaria (97)"; return 97; }
+  [ "$el" -ge 1 ] || { say "lista de elegíveis ilegível ou sem nenhum permitido ($ELIGIBLE) — o run recusaria (97)"; return 97; }
   return 0
 }
 
@@ -195,7 +200,7 @@ write_state_filter() { # write_state_filter <arquivo> <raspador>
 
 cmd_probe() {
   local out="" tmp rc=0 urls nodef minif
-  while [ $# -gt 0 ]; do case $1 in --out) out=${2:-}; shift 2;; *) die 97 "probe: argumento desconhecido: $1";; esac; done
+  while [ $# -gt 0 ]; do case $1 in --out) need_val probe "$@"; out=$2; shift 2;; *) die 97 "probe: argumento desconhecido: $1";; esac; done
   [ -d "$PS_CODE" ] || die 97 "código do rig ausente: $PS_CODE"
   [ -e "$NODE_FLAG" ] || die 99 "$(why_of 99)"
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/hsr-probe.XXXXXX") || die 98 "sem diretório temporário"; urls=$tmp/urls; minif=$tmp/mini; nodef=$tmp/node
@@ -233,9 +238,11 @@ PY
       print cls, "mini=" c1 "/" m1, "nó=" c2 "/" m2, u }' "$minif" "$nodef" | sort > "$tmp/table"
   cat "$tmp/table"
   echo "--- $(awk -F'\t' '{c[$1]++} END{for (k in c) printf "%s=%d ", k, c[k]; print ""}' "$tmp/table")"
-  [ -z "$out" ] || cp "$tmp/table" "$out"
+  # falhou → a tabela já foi ao stdout, mas o arquivo pedido NÃO existe: rc 97 e aviso (nunca rc 0 com --out vazio)
+  [ -z "$out" ] || cp "$tmp/table" "$out" 2>/dev/null || rc=97
   jlog probe "" 0 0 "$(wc -l < "$tmp/table" | tr -d ' ')" "$(awk -F'\t' '$1=="SO-O-NO-BLOQUEIA"{n++} END{print n+0}' "$tmp/table")-bloqueados" ""
   rmtmp "$tmp"
+  [ "$rc" -eq 0 ] || die 97 "probe: não consegui gravar --out '$out' (a tabela está acima, no stdout)"
 }
 # probe_loop: lê endereços no stdin; imprime "<http> <bytes> <marca> <url>" (marca = banner de bloqueio no corpo, ou `-`). Roda igual no mini e no nó (é copiada por declare -f).
 probe_loop() {
@@ -252,11 +259,13 @@ probe_loop() {
 }
 
 cmd_run() {
-  local sc="" tn="" limit="" to=$DEF_TIMEOUT stage_base=$STAGE_ROOT extra=() v rc=0 id t0 stage rdir remote_rel pii_list held n state_f code_f dry_d
+  local sc="" tn="" limit="" to=$DEF_TIMEOUT stage_base=$STAGE_ROOT extra=() v rc=0 id t0 stage rdir remote_rel pii_list held n state_f code_f dry_d shown why
   sc=${1:-}; [ $# -gt 0 ] && shift
   while [ $# -gt 0 ]; do
     case $1 in
-      --tenant) tn=${2:-}; shift 2;; --limit) limit=${2:-}; shift 2;; --timeout) to=${2:-}; shift 2;; --stage) stage_base=${2:-}; shift 2;;
+      --tenant|--limit|--timeout|--stage)
+        need_val run "$@"
+        case $1 in --tenant) tn=$2;; --limit) limit=$2;; --timeout) to=$2;; --stage) stage_base=$2;; esac; shift 2;;
       --) shift; extra=("$@"); break;;
       *) die 97 "run: argumento desconhecido: $1 (argumentos do raspador vão depois de --)";;
     esac
@@ -310,7 +319,8 @@ cmd_run() {
 
   # o raspador roda DESACOPLADO (setsid nohup): queda do ssh não o mata. Escreve rc em <rodada>/rc e o texto em <rodada>/scraper.log
   local sargs=(); [ -z "$tn" ] || sargs+=(--tenant "$tn"); [ -z "$limit" ] || sargs+=(--limit "$limit"); [ ${#extra[@]} -eq 0 ] || sargs+=("${extra[@]}")
-  rscript "$remote_rel" "$sc" "$to" "${sargs[@]+"${sargs[@]}"}" <<'REMOTE' || die 98 "ssh caiu ao disparar o raspador no nó"
+  # falhou → NÃO se sabe se o raspador subiu: o ssh pode ter caído depois de entregar o script. O rc 98 manda rodar local, então o log e a mensagem avisam que pode haver rodada em curso no nó (raspagem em dobro)
+  rscript "$remote_rel" "$sc" "$to" "${sargs[@]+"${sargs[@]}"}" <<'REMOTE' || { jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "disparo-incerto" "$stage"; die 98 "ssh caiu ao disparar o raspador: a rodada PODE ter começado no nó ($NODE_HOST:$remote_rel) — rodar local agora pode raspar em dobro; confira lá antes"; }
 run=$HOME/$1; sc=$2; to=$3; shift 3; d=$HOME/gt-remote/scrape/env
 cat > "$run/go.sh" <<'GO'
 cd "$(dirname "$0")" || exit 97
@@ -323,27 +333,30 @@ GO
 ( setsid nohup bash "$run/go.sh" "$sc" "$to" "$@" >/dev/null 2>&1 < /dev/null & )
 REMOTE
   say "rodada $id disparada no nó (timeout ${to}s); consulta a cada ${POLL_S}s"
-  local fails=0 raw="" r deadline=$(( $(date +%s) + to + GRACE_S ))
+  local fails=0 raw="" r deadline=$(( $(date +%s) + 10#$to + 10#$GRACE_S ))   # 10#: `--timeout 08` não é octal
   while :; do
-    [ "$(date +%s)" -le "$deadline" ] || { say "a rodada $id passou do prazo (--timeout ${to}s + ${GRACE_S}s) sem escrever o rc: o processo sumiu no nó? desisto (a pasta fica em $NODE_HOST:$remote_rel; o reaper a apaga em 1 dia)"; jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "sem-rc-no-prazo" "$stage"; exit 98; }
+    [ "$(date +%s)" -le "$deadline" ] || { say "a rodada $id passou do prazo (--timeout ${to}s + ${GRACE_S}s) sem escrever o rc: o processo sumiu no nó? desisto (a pasta fica em $NODE_HOST:$remote_rel; o reaper do fim de uma rodada futura que termine a apaga se tiver > 1 dia)"; jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "sem-rc-no-prazo" "$stage"; exit 98; }
     r=$(rssh "cat $remote_rel/rc 2>/dev/null; echo END" 2>/dev/null)
     case $r in
       *END) fails=0; raw=$(printf '%s' "$r" | head -n 1); case $raw in END) raw="";; esac; [ -z "$raw" ] || break;;
-      *) fails=$((fails + 1)); if [ "$fails" -ge "$POLL_FAILS" ]; then say "o nó não respondeu a $fails consultas seguidas: desisto (a rodada $id fica em $NODE_HOST:$remote_rel; o reaper a apaga em 1 dia)"; jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "ssh-caiu" "$stage"; exit 98; fi;;
+      *) fails=$((fails + 1)); if [ "$fails" -ge "$POLL_FAILS" ]; then say "o nó não respondeu a $fails consultas seguidas: desisto (a rodada $id fica em $NODE_HOST:$remote_rel; o reaper do fim de uma rodada futura que termine a apaga se tiver > 1 dia)"; jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "ssh-caiu" "$stage"; exit 98; fi;;
     esac
     sleep "$POLL_S"
   done
-  case $raw in ''|*[!0-9]*) raw=97;; esac
+  # vazio → não chega aqui (o laço só sai com rc não vazio); ilegível (lixo no arquivo rc) → o código do raspador é DESCONHECIDO: sai 95 com scraper_rc_raw=ilegivel, nunca 97 (uso errado) nem 0; o resultado ainda volta
+  shown=$raw; case $raw in *[!0-9]*|????*) shown=ilegivel; raw=96;; esac
 
   "$RSYNC_BIN" -a --max-size=500m -e "$SSH_BIN $SSH_OPTS" --include='/shared/' --include='/shared/data/***' --include='/shared/config/' --include='/shared/config/seen_*' --include='/shared/config/*cache*' --include='/scraper.log' --exclude='*' "$NODE_HOST:$remote_rel/" "$stage/" >/dev/null 2>&1 || { say "AVISO: o resultado não voltou inteiro (rsync de volta falhou); a rodada fica em $NODE_HOST:$remote_rel"; jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "volta-falhou" "$stage"; exit 98; }
   n=$(find "$stage/shared/data" -type f 2>/dev/null | wc -l | tr -d ' ')
   # limpeza: só a pasta DESTA rodada (id montado por nós a partir de nome validado), nunca um caminho vindo de fora
   rssh "case $remote_rel in $RBASE/runs/?*) find $remote_rel -mindepth 1 -delete; rmdir $remote_rel;; esac" >/dev/null 2>&1 || say "AVISO: a pasta da rodada no nó não foi apagada ($remote_rel)"
-  # reaper: pastas de rodadas de mais de 1 dia (queda de rede que deixou a pasta para trás)
-  rssh "find $RBASE/runs -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec sh -c 'find \"\$1\" -mindepth 1 -delete; rmdir \"\$1\"' _ {} \;" >/dev/null 2>&1
+  # reaper (roda só aqui, no fim de uma rodada que terminou): pastas de rodadas de mais de 1 dia (queda de rede que deixou a pasta para trás); vazio → nada a apagar, rc 0; falhou → aviso (não deixa lixo acumular em silêncio)
+  rssh "find $RBASE/runs -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec sh -c 'find \"\$1\" -mindepth 1 -delete; rmdir \"\$1\"' _ {} \;" >/dev/null 2>&1 || say "AVISO: o reaper das pastas de rodadas antigas falhou no nó ($NODE_HOST:$RBASE/runs)"
   echo "stage=$stage"; echo "files=$n"; echo "secs=$(( $(date +%s) - t0 ))"
-  if [ "$raw" -ge 96 ]; then echo "scraper_rc_raw=$raw"; jlog "$sc" "$tn" 95 $(( $(date +%s) - t0 )) "$n" "rc-cru-$raw" "$stage"; exit 95; fi
-  jlog "$sc" "$tn" "$raw" $(( $(date +%s) - t0 )) "$n" "$([ "$n" -ge 1 ] && echo ok || echo ok-sem-arquivos)" "$stage"
+  if [ "$raw" -ge 95 ]; then echo "scraper_rc_raw=$shown"; jlog "$sc" "$tn" 95 $(( $(date +%s) - t0 )) "$n" "rc-cru-$shown" "$stage"; exit 95; fi
+  # o porquê no log: rc != 0 do raspador nunca vira "ok" (rodada que falhou = rc-N); rc 0 sem arquivo = ok-sem-arquivos
+  if [ "$raw" -ne 0 ]; then why="rc-$raw"; elif [ "$n" -ge 1 ]; then why=ok; else why=ok-sem-arquivos; fi
+  jlog "$sc" "$tn" "$raw" $(( $(date +%s) - t0 )) "$n" "$why" "$stage"
   exit "$raw"
 }
 
