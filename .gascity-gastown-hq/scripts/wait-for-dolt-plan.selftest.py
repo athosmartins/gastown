@@ -5,8 +5,9 @@ Não lê o ~/Library/LaunchAgents, não chama launchctl.
 Contents
   Casos · Controle negativo (mutantes) · Variáveis
 
-CASOS: plano é SÓ LEITURA (checksum da pasta não muda) e a medição separa chamada de texto (echo/log/jq/comentário/aspas ≠ LÊ), lê o script executado direto e trata script citado que não existe como ILEGÍVEL · escopo (label de fora, programa na árvore de outro
-  rig, RunAtLoad=false) · plist ilegível listado · plist que o expat recusa e o plutil aceita · --apply: ProgramArguments novo exato, demais chaves e a ordem delas preservadas, o que não é
+CASOS: plano é SÓ LEITURA (checksum da pasta não muda) e a medição separa chamada de texto (echo/log/jq/comentário/aspas ≠ LÊ), lê o script executado direto e trata script citado que não existe como ILEGÍVEL · 17 formas de chamada
+  que já escaparam (timeout com opções, if/elif/while/until/else/{, `echo …; bd`, `printf … | bd`, `echo "$(bd …)"`) e 6 de texto que NÃO são chamada (inclui variável que só parece o binário) · programa do interpretador ausente com outro argumento legível = ILEGÍVEL ·
+  escopo (label de fora, programa na árvore de outro rig, RunAtLoad=false) · plist ilegível listado e divergente (--apply recusa) · plist com topo/Label estranho sem traceback · plist que o expat recusa e o plutil aceita · --apply: ProgramArguments novo exato, demais chaves e a ordem delas preservadas, o que não é
   wrap fica byte a byte igual, backup byte a byte do original, idempotente (2ª vez não embrulha de novo) · --revert devolve o original e é idempotente · RECUSAS (nada é escrito): divergência,
   wrapper ausente/não executável/com sintaxe ruim, wrap em KeepAlive, wrap sem chamada medida, label em 2 arquivos · plist symlink / com chave Program / que o plutil -lint recusa não são
   alterados · política ilegível, com decisão desconhecida ou label repetido = exit 3 · uso errado = exit 2 · --revert com plist ilegível (lista e sai 1) · wrapper embrulhado por OUTRO caminho ·
@@ -56,6 +57,36 @@ PROGRAMS = {
 for name, body in PROGRAMS.items():
     open(f"{PROG}/{name}", "w").write(body)
 open(f"{ROOT}/otherrig/scripts/x.sh", "w").write("#!/bin/bash\nbd list\n")
+open(f"{PROG}/readable.conf", "w").write("x=1\n")
+CALL_FORMS = {   # UMA chamada de verdade a bd/gc/dolt por programa: o detector tem que dizer LE (cada forma já escapou da medição uma vez; a 1ª é a do worktree-reaper.sh:498 vivo)
+    "tmo-k": 'raw="$(timeout -k "$GRACE" "$LIMIT" gc --city "${CITY:-$GT/.c}" session list --json --state all 2>/dev/null)"; rc=$?\n',
+    "tmo-s": 'x=$(timeout -s KILL 5 bd list --json)\n',
+    "tmo-long": 'timeout --kill-after=5 --foreground 10 dolt sql -q x\n',
+    "if": 'if bd show "$1" >/dev/null 2>&1; then\n  :\nfi\n',
+    "elif": 'if [ -z "$1" ]; then\n  :\nelif gc rig list >/dev/null 2>&1; then\n  :\nfi\n',
+    "while": 'while bd list --json | grep -q x; do sleep 1; done\n',
+    "until": 'until dolt sql -q "select 1" >/dev/null 2>&1; do sleep 1; done\n',
+    "else": 'if [ -z "$1" ]; then :; else bd list --json; fi\n',
+    "brace": 'f() { bd list --json; }\n',
+    "echo-semi": 'echo "go"; bd list --json\n',
+    "printf-pipe": 'printf "%s" "$body" | bd update "$id" --body-file -\n',
+    "log-and": 'log "start" && gc nudge x\n',
+    "echo-subst": 'echo "ids: $(bd list --json)"\n',
+    "var-local": '_bd="${LCA_BD:-bd}"\nout=$("$_bd" -C "$store" list --status open --json)\n',   # lifecycle-correctness-auditor.sh:379 vivo: o alias local do binário
+    "var-prefixed": '( cd "$C" && GC_CITY="$C" "$LCA_GC" mail send mayor -s x )\n',
+    "var-braced": 'if ${MY_BD_BIN} show "$1" >/dev/null; then :; fi\n',
+    "env-prefix": 'FOO=1 BAR="a b" BAZ=$HOME/x bd list --json\n',   # `VAR=x cmd` continua sendo chamada
+}
+NOT_CALLS = {   # (estado esperado, corpo): texto que cita bd/gc/dolt sem chamar continua TALVEZ, e variável que só PARECE o binário (GC_CITY, BDIR) continua NAO-ACHEI: o detector não pode virar "tudo que parece é chamada"
+    "log-then": ("TALVEZ", 'echo it was fine then bd list failed\n'),
+    "log-quoted": ("TALVEZ", 'echo "if bd list fails"; warn "while gc is down"\n'),
+    "text-var": ("TALVEZ", 'reason="until dolt answers, if bd list hangs"\n'),
+    "comment-tail": ("TALVEZ", 'df -h   # if bd list is down, then gc waits\n'),
+    "fn-arg": ("NAO-ACHEI", 'if paths=$(rig_paths "$MY_GC" 20 " "); then :; fi\n'),   # git-lock-hygiene.sh:222 vivo: $MY_GC é ARGUMENTO da função, não o comando
+    "var-not-bin": ("NAO-ACHEI", 'cd "$GC_CITY" && "$BDIR" run && "$MYGC" x && ls "$HOME_DB"\n'),
+}
+for name, body in {**{f"f-{k}": v for k, v in CALL_FORMS.items()}, **{f"n-{k}": v[1] for k, v in NOT_CALLS.items()}}.items():
+    open(f"{PROG}/{name}.sh", "w").write("#!/bin/bash\n" + body)
 
 
 def plist(d, label, args, **kw):
@@ -131,11 +162,23 @@ def prog_of(d, label):
     return load(d, label)["ProgramArguments"]
 
 
+def states(d):
+    """→ {rótulo sem o prefixo: estado medido} de todo job do escopo. Política vazia: cada job vira "NÃO CLASSIFICADO … [ESTADO gatilho]", que carrega o estado medido sem depender de decisão."""
+    out = run([], d, policy("# vazia: todo job vira NÃO CLASSIFICADO e mostra o estado medido\n"))[1]
+    return dict(re.findall(r"NÃO CLASSIFICADO \(fora da política\): com\.gascity\.(\S+) \[(\S+)", out))
+
+
+def same(got, want):
+    if got != want and os.environ.get("WFDP_DEBUG"):
+        print("   got ≠ want:", {k: (got.get(k), want.get(k)) for k in sorted(set(got) | set(want)) if got.get(k) != want.get(k)}, file=sys.stderr)
+    return got == want
+
+
 # ---- cenários (cada um devolve True = passou; a suíte e os mutantes usam as mesmas funções)
 def c_plan_readonly():
     d = fixture("plan"); before = snap(d)
-    rc, out, _ = run([], d)
-    return (rc == 0 and snap(d) == before and "medido (escopo HQ): LE=6 · TALVEZ=1 · NAO-ACHEI=1 · ILEGIVEL=2" in out and "garbage.plist" in out
+    rc, out, _ = run([], d)                          # o fixture traz o garbage.plist: ilegível = divergência (exit 1), mas o plano sai inteiro
+    return (rc == 1 and snap(d) == before and "medido (escopo HQ): LE=6 · TALVEZ=1 · NAO-ACHEI=1 · ILEGIVEL=2" in out and "garbage.plist" in out
             and out.count("A EMBRULHAR") == 4 and "com.other.f" in out.split("== FORA DO ESCOPO")[1] and "otherrig-g" in out.split("== FORA DO ESCOPO")[1]
             and "norun-h" not in out and "política: wrap=4 · isento=2 · nao-medido=4 · embrulhados hoje: 0 de 4" in out
             and "direct-p [LE]" in out and "gone-q [ILEGIVEL]" in out)
@@ -178,7 +221,7 @@ def c_refuse_divergence():
 
 
 def c_refuse_wrapper():
-    d = fixture("wr"); before = snap(d); res = []
+    d = fixture("wr", garbage=False); before = snap(d); res = []   # sem plist ilegível: ele recusaria antes (exit 1) e o preflight do wrapper (exit 4) nem seria testado
     res.append(run(["--apply"], d, wrapper=f"{T}/nao-existe.sh")[0])
     noexec = f"{T}/noexec.sh"; shutil.copy(WRAPPER, noexec); os.chmod(noexec, 0o644)
     res.append(run(["--apply"], d, wrapper=noexec)[0])
@@ -223,7 +266,7 @@ def c_usage():
 
 
 def c_skips():
-    d = fixture("sk"); real = f"{T}/real-l.plist"
+    d = fixture("sk", garbage=False); real = f"{T}/real-l.plist"
     plist(T, "com.gascity.link-l", ["/bin/bash", f"{PROG}/a.sh"], StartInterval=60); os.rename(f"{T}/com.gascity.link-l.plist", real); os.symlink(real, f"{d}/com.gascity.link-l.plist")
     plist(d, "com.gascity.prog-m", ["/bin/bash", f"{PROG}/a.sh"], Program="/bin/bash", StartInterval=60)
     plist(d, "com.gascity.lint-o", ["/bin/bash", f"{PROG}/a.sh"], StartInterval=60, Note="BROKEN")
@@ -251,7 +294,7 @@ def c_only_canary():
 
 
 def c_wrapper_gone():
-    d = fixture("gone"); w2 = f"{T}/w2.sh"; shutil.copy(WRAPPER, w2); os.chmod(w2, 0o755)
+    d = fixture("gone", garbage=False); w2 = f"{T}/w2.sh"; shutil.copy(WRAPPER, w2); os.chmod(w2, 0o755)
     rc, _, _ = run(["--apply"], d, wrapper=w2, bk=f"{T}/bk-gone")
     ok_before = run([], d, wrapper=w2)[0]
     os.rename(w2, w2 + ".gone")
@@ -260,8 +303,9 @@ def c_wrapper_gone():
 
 
 def c_revert_unreadable():
-    d = fixture("rv"); orig = {l: prog_of(d, l) for l in WRAP_LABELS}   # o fixture traz garbage.plist: ilegível, não sei se está embrulhado
+    d = fixture("rv", garbage=False); orig = {l: prog_of(d, l) for l in WRAP_LABELS}
     applied = run(["--apply"], d, bk=f"{T}/bk-rv")[0] == 0
+    open(f"{d}/garbage.plist", "wb").write(b"\x00\x01 isto nao e plist")   # só agora aparece o ilegível: não sei se está embrulhado
     rc, out, _ = run(["--revert"], d, bk=f"{T}/bk-rv2")
     return applied and rc == 1 and "NÃO LI garbage.plist" in out and "4 revertido(s)" in out and all(prog_of(d, l) == orig[l] for l in WRAP_LABELS)
 
@@ -300,6 +344,39 @@ def c_backup_safety():
             and all(hashlib.sha256(open(f"{bk}/{n}", "rb").read()).hexdigest() == before[n] for n in os.listdir(bk)))
 
 
+def c_call_forms():
+    d = f"{T}/la-forms"; os.makedirs(d)
+    for name in [f"f-{k}" for k in CALL_FORMS] + [f"n-{k}" for k in NOT_CALLS]:
+        plist(d, f"com.gascity.{name}", ["/bin/bash", f"{PROG}/{name}.sh"], StartInterval=60)
+    return same(states(d), {**{f"f-{k}": "LE" for k in CALL_FORMS}, **{f"n-{k}": v[0] for k, v in NOT_CALLS.items()}})
+
+
+def c_unread_program():
+    d = f"{T}/la-unread"; os.makedirs(d); conf = f"{PROG}/readable.conf"
+    plist(d, "com.gascity.sh-miss", ["/bin/bash", f"{PROG}/nao-existe.sh", conf], StartInterval=60)                  # o programa (args[1]) some e há OUTRO argumento legível: não sei, ≠ sem menção
+    plist(d, "com.gascity.py-miss", ["/usr/bin/python3", f"{PROG}/nao-existe.py", conf], StartInterval=60)
+    plist(d, "com.gascity.sh-ok", ["/bin/bash", f"{PROG}/n.sh", conf], StartInterval=60)                              # controle: o programa existe e não menciona → NAO-ACHEI
+    plist(d, "com.gascity.sh-data", ["/bin/bash", f"{PROG}/n.sh", f"{PROG}/dado-ausente.dat"], StartInterval=60)     # controle: argumento que não é o programa, ausente ali não conta
+    return same(states(d), {"sh-miss": "ILEGIVEL", "py-miss": "ILEGIVEL", "sh-ok": "NAO-ACHEI", "sh-data": "NAO-ACHEI"})
+
+
+def c_odd_plists():
+    d = fixture("odd", garbage=False)
+    plistlib.dump(["isto", "e", "uma", "lista"], open(f"{d}/array.plist", "wb"))                                      # topo que não é dicionário
+    plistlib.dump({"Label": 5, "RunAtLoad": True, "ProgramArguments": ["/bin/true"]}, open(f"{d}/label-int.plist", "wb"))   # Label que não é texto
+    rc, out, err = run([], d)
+    head = out.splitlines()[0]
+    return (rc == 1 and "Traceback" not in err and "2 ilegíveis" in head and "ILEGÍVEL (plist não lido, fica fora da conta): array.plist" in out
+            and "label-int.plist" in out and out.count("A EMBRULHAR") == 4 and "plist(s) não lido(s)" in out)   # os outros 4 jobs continuam planejados
+
+
+def c_unreadable_refuses_apply():
+    d = fixture("bad"); before = snap(d)                                       # o fixture traz garbage.plist: pode ser o gêmeo de um label wrap, e não sei
+    rc, out, _ = run([], d); rc2, _, err2 = run(["--apply"], d)
+    div = out.split("== DIVERGÊNCIAS")[1]
+    return rc == 1 and "(1) ==" in div and "plist(s) não lido(s) (garbage.plist)" in div and rc2 == 1 and "RECUSADO" in err2 and snap(d) == before
+
+
 SUITE = [
     (c_plan_readonly, "plano é só leitura; medição separa chamada de texto (b.sh = TALVEZ); script direto é lido; script citado e ausente = ILEGÍVEL; escopo; ilegível; plutil; contagens"),
     (c_apply_revert, "--apply exato + chaves/ordem + backup byte a byte + idempotente; --revert devolve o original e é idempotente"),
@@ -317,6 +394,10 @@ SUITE = [
     (c_wrapper_other_path, "embrulhado por OUTRO caminho do wrapper: reconhecido (não embrulha por cima), divergência, sumido = NÃO vão subir, revert tira"),
     (c_policy_vs_live, "política × vivo além do wrap: isento já embrulhado, nao-medido com LE, wrap sem gatilho de re-disparo → divergência"),
     (c_backup_safety, "backup que não dá para criar → falha por plist sem traceback; --backup-dir reaproveitado não sobrescreve o original"),
+    (c_call_forms, "17 formas de chamada (timeout com opções, if/elif/while/until/else/{, echo; bd, printf | bd, echo \"$(bd)\", $_bd/$LCA_GC) → LE; texto que só cita → TALVEZ; variável que só parece o binário → NAO-ACHEI"),
+    (c_unread_program, "programa (args[1] do interpretador) ausente com outro argumento legível → ILEGÍVEL, não NÃO ACHEI; argumento de dado ausente não conta"),
+    (c_odd_plists, "plist com topo que não é dicionário / Label que não é texto → listado como ilegível, sem traceback, o resto do plano sai"),
+    (c_unreadable_refuses_apply, "plist que não consegui ler é divergência: o plano sai 1 e --apply recusa sem escrever nada"),
 ]
 MUTANTS = [   # (nome, expressão sed, cenário)
     ("aplica-com-divergencia", "/GUARD:apply-refuses-divergence/ s/if div:/if False:/", c_refuse_divergence),
@@ -345,6 +426,17 @@ MUTANTS = [   # (nome, expressão sed, cenário)
     ("sobrescreve-backup", "/GUARD:backup-exists/ s/if os.path.exists(bak):/if False:/", c_backup_safety),
     ("falha-de-escrita-sobe-traceback", "/GUARD:write-except/ s/except Exception as e:/except ZeroDivisionError as e:/", c_backup_safety),
     ("sonda-ao-lado-nao-conferida", "/GUARD:lib-preflight/ s/returncode == 0/returncode >= 0/", c_refuse_wrapper),
+    ("timeout-so-aceita-um-token", r'/GUARD:timeout-options/ s/^_TMO = r"[^"]*"/_TMO = r"timeout\\s+\\S+\\s+"/', c_call_forms),
+    ("palavra-de-controle-nao-ancora", "/GUARD:keyword-anchors/ s/(?:then|do|else|elif|if|while|until)/(?:then|do)/", c_call_forms),
+    ("chave-nao-ancora", r'/GUARD:brace-anchor/ s/^_BRACE = r"[^"]*"/_BRACE = r"(?!)"/', c_call_forms),
+    ("linha-de-log-inteira-descartada", "/GUARD:log-split/ s/SEGSPLIT.split(code)/[code]/", c_call_forms),
+    ("log-descarta-a-substituicao", '/GUARD:log-tail/ s/seg = seg\\[m.start():\\] if m else ""/seg = ""/', c_call_forms),
+    ("log-vira-chamada", "/GUARD:log-segment/ s/if LOGCMD.match(seg):/if False:/", c_call_forms),
+    ("variavel-binario-so-os-nomes-conhecidos", r'/GUARD:var-binary/ s/^_VARBIN = r"[^"]*"/_VARBIN = r"\\$\\{?(?:BD|GC|DOLT|BD_BIN|GC_BIN|bd_bin|gc_bin)\\}?"/', c_call_forms),
+    ("argumento-vira-comando", r'/GUARD:assign-prefix/ s/^_ASSIGN = r"[^"]*"/_ASSIGN = r"\\w+=\\S*\\s+"/', c_call_forms),
+    ("interpretador-nao-nomeia-o-programa", "/GUARD:interp-script/ s/if len(args) > 1 and/if False and/", c_unread_program),
+    ("plist-estranho-derruba-o-plano", "/GUARD:scan-guard/ s/except Exception as e:/except OSError as e:/", c_odd_plists),
+    ("ilegivel-nao-e-divergencia", "/GUARD:bad-div/ s/if bad:/if False:/", c_unreadable_refuses_apply),
 ]
 
 

@@ -2,7 +2,7 @@
 """wait-for-dolt-plan.py — quais jobs do HQ recebem o wait-for-dolt.sh, medido nos plists VIVOS (ga-sh8t23.2; revisão de arquitetura 15/10).
 
 Contents
-  Para que serve · Como decide · Uso · Três estados · Códigos · Limites
+  Para que serve · Como decide · Uso · Três estados · Códigos
 
 PARA QUE SERVE
   A bead pede "a lista dos jobs que leem Dolt no boot é MEDIDA (programa de cada RunAtLoad), não adivinhada, e cada plist alterado mostra o antes/depois". Este comando lê
@@ -12,9 +12,13 @@ PARA QUE SERVE
 
 COMO DECIDE (a medição é a evidência; a decisão é da política, que o plano confere contra a medição a cada execução)
   escopo   label com.gascity.* ou com.gastown.* cujo programa NÃO vive na árvore de outro rig (esses viram bead no rig dele). RunAtLoad=true.
-  medição  LÊ = o programa tem uma CHAMADA a bd/gc/dolt (posição de comando, ou subprocess ["bd", ...]; linha de log/comentário não conta) · TALVEZ = só menção solta ·
-           NÃO ACHEI = programa legível sem menção · ILEGÍVEL = não consegui ler o programa (inclui script executado direto ou citado no `-c` que não existe). Segue o programa e os .sh/.py com caminho absoluto dentro de um `-c`; NÃO segue
-           script chamado por script (um job que lê o Dolt por dentro de outro script aparece como TALVEZ/NÃO ACHEI, e ficar sem wrapper é o comportamento de hoje).
+  medição  LÊ = o programa tem uma CHAMADA a bd/gc/dolt (posição de comando, ou subprocess ["bd", ...]; comentário e texto entre aspas não contam) · TALVEZ = só menção solta ·
+           NÃO ACHEI = programa legível sem menção · ILEGÍVEL = não consegui ler o programa (inclui script executado direto ou citado no `-c` que não existe). Segue o programa; os .sh/.py
+           com caminho absoluto dentro de um `-c`; e o script que um interpretador (bash/sh/python) recebe como 1º argumento. NÃO segue script chamado por script (um job que lê o Dolt
+           por dentro de outro script aparece como TALVEZ/NÃO ACHEI, e ficar sem wrapper é o comportamento de hoje).
+           Posição de comando = início de linha, depois de ; & | ( ` $( ! { ou das palavras de controle (if/elif/else/while/until/then/do), e depois de prefixos (timeout com suas
+           opções `-k D`/`-s S`/`--kill-after`, env, command, exec, nice, VAR=valor). O binário pode ser um alias de variável pelo NOME (termina em bd/gc/dolt: "$_gc", $GC_BIN), mas
+           variável usada como ARGUMENTO de função não é comando. Linha de log (echo/printf/log) descarta só o seu próprio segmento: `echo ok; gc ...` e `echo "$(gc ...)"` contam.
   política wrap (embrulha) · isento (precisa rodar com o Dolt fora, ou tem ato útil que não precisa dele, ou é KeepAlive) · nao-medido (sem leitura medida). Na dúvida: isento.
 
 USO   wait-for-dolt-plan.py [--dir D] [--policy F] [--wrapper W] [--timeout S] [--boot-window S] [--apply | --revert] [--backup-dir B] [--only LABEL ...]
@@ -27,9 +31,10 @@ USO   wait-for-dolt-plan.py [--dir D] [--policy F] [--wrapper W] [--timeout S] [
            conta como falha (exit 1): não sei se está embrulhado, e isso não é "nada a reverter".
   --only L restringe --apply/--revert ao label L (repetível): é o canário. Label que não existe no escopo, ou (no --apply) que a política não marca wrap, é uso errado (exit 2).
 
-TRÊS ESTADOS  plist ilegível aparece com o motivo (nunca some); programa ilegível é ILEGÍVEL (≠ NÃO ACHEI); política ilegível/duplicada → exit 3 sem plano (não chuto decisão).
+TRÊS ESTADOS  plist ilegível ou de forma estranha (topo que não é dict, Label que não é texto) aparece com o motivo (nunca some); programa ilegível é ILEGÍVEL (≠ NÃO ACHEI);
+  política ilegível/duplicada → exit 3 sem plano (não chuto decisão).
   Divergência (job do escopo fora da política · wrap sem LÊ · wrap em KeepAlive · wrap sem StartInterval/StartCalendarInterval · isento/nao-medido já embrulhado · nao-medido que mede LÊ ·
-  política cita job que não existe/é de fora · label em 2 arquivos · plist já embrulhado por OUTRO caminho do wrapper, ou cujo wrapper sumiu ou não executa) → exit 1: o plano é
+  política cita job que não existe/é de fora · label em 2 arquivos · plist que não consegui ler (pode ser o gêmeo de um label wrap) · plist já embrulhado por OUTRO caminho do wrapper, ou cujo wrapper sumiu ou não executa) → exit 1: o plano é
   impresso mas --apply recusa. "Embrulhado" = argv0 é o --wrapper ou um wait-for-dolt.sh de qualquer caminho. Rodar o plano de tempos em tempos é o detector do último caso.
 
 CÓDIGOS  0 plano/aplicação feitos, sem divergência · 1 divergência, falha ao escrever ou (--revert) plist não lido · 2 uso errado · 3 não consegui ler a entrada · 4 --apply recusado (wrapper).
@@ -54,16 +59,22 @@ SHELLS = ("bash", "sh", "zsh")
 CLIS = ("bd", "gc", "dolt")
 DECISIONS = ("wrap", "isento", "nao-medido")
 WRAPPER_NAME = "wait-for-dolt.sh"
-# chamada em posição de comando (início, ; & | ( ` $( then do !), com prefixos comuns (timeout N, env, VAR=x) e o binário por caminho ou por variável conhecida
-_CMDPOS = r"(?:^|[;&|(`]|\$\(|\bthen\b|\bdo\b|!)\s*(?:(?:timeout\s+\S+\s+|env\s+|command\s+|exec\s+|nice\s+|(?:bash|sh)\s+|\w+=\S*\s+)*)"
-_BIN = r"(?:(?:\"?\$\{?\w+\}?\"?/|[\w./-]*/)?\"?(?:bd|gc|dolt)\"?|\"?\$\{?(?:BD|GC|DOLT|BD_BIN|GC_BIN|bd_bin|gc_bin|BD_LIST_CACHED)\}?\"?)"
+# chamada em posição de comando (início, ; & | ( ` $( ! { then do else elif if while until), com prefixos comuns (timeout [opções] N, env, VAR=x) e o binário por caminho ou por variável conhecida
+_TMO = r"timeout\s+(?:(?:-[ks]\s+|--(?:kill-after|signal)\s+)\S+\s+|-\S+\s+)*\S+\s+"   # GUARD:timeout-options — `timeout -k 5 10 gc`, `-s KILL 5 bd`, `--foreground 10 dolt`: as opções vêm antes do prazo
+_KW = r"\b(?:then|do|else|elif|if|while|until)\b"   # GUARD:keyword-anchors — `if bd show …; then`, `while bd list | …; do`: o comando vem logo depois da palavra
+_BRACE = r"\{(?=\s)"   # GUARD:brace-anchor — `f() { bd list; }`; `{` colado em texto (`${GC}`) não abre grupo
+_ASSIGN = r"\w+=(?:[^\s$(`]|\$\{?\w+\}?)*\s+"   # GUARD:assign-prefix — `VAR=x cmd`; o valor não abre `$(…)`: em `x=$(fn "$MY_GC" 20)` o que vem depois do espaço é ARGUMENTO, não comando
+_CMDPOS = r"(?:^|[;&|(`]|\$\(|" + _KW + r"|" + _BRACE + r"|!)\s*(?:(?:" + _TMO + r"|env\s+|command\s+|exec\s+|nice\s+|(?:bash|sh)\s+|" + _ASSIGN + r")*)"
+_VARBIN = r"\$\{?(?i:(?:\w*_)?(?:bd|gc|dolt)(?:_bin)?)\}?"   # GUARD:var-binary — variável EXECUTADA cujo nome termina em bd/gc/dolt: $BD, $GC_BIN, $_gc, $LCA_BD (alias local do binário). $GC_CITY e $BDIR não casam
+_BIN = r"(?:(?:\"?\$\{?\w+\}?\"?/|[\w./-]*/)?\"?(?:bd|gc|dolt)\"?|\"?(?:" + _VARBIN + r"|\$\{?BD_LIST_CACHED\}?)\"?)"
 SH_STRONG = re.compile(_CMDPOS + _BIN + r"(?=\s|$)")
 LOGCMD = re.compile(r"^\s*(echo|printf|log|warn|info|die|fail|err|note|emit\w*|_log\w*|notify)\b")
+SEGSPLIT = re.compile(r";|&&|\|\|?|(?<![>&])&(?![>&])")   # separadores de comando; `2>&1` e `&>` não separam
 PY_STRONG = re.compile(r"""\[\s*["'](?:bd|gc|dolt)["']\s*[,\]]|\[\s*(?:GC|BD|GC_BIN|BD_BIN)\s*,|\bpymysql\.connect|mysql\.connector\.connect""")
 WEAK = re.compile(r"(?<![\w./$-])(?:bd|gc|dolt)(?![\w/-])")   # `.gc/logs`, `$GC_CITY`, `dolt-pid-lib.sh` não são menção
 # só ordena a EVIDÊNCIA mostrada (a linha com subcomando de verdade vence a que é texto de log); não decide LÊ
 _SUB = r"(?:list|show|update|close|query|ready|create|comment|label|config|reopen|session|mail|rig|dolt|bd|nudge|agent|events|suspend|resume|reload|supervisor|sql|status|restart)"
-SUB_SH = re.compile(r"(?:bd|gc|dolt|\$\{?(?:BD|GC|DOLT|BD_BIN|GC_BIN|bd_bin|gc_bin|BD_LIST_CACHED)\}?)\"?\s+(?:(?:-C|--city)\s+\S+\s+)*" + _SUB + r"\b")
+SUB_SH = re.compile(r"(?:bd|gc|dolt|" + _VARBIN + r"|\$\{?BD_LIST_CACHED\}?)\"?\s+(?:(?:-C|--city)\s+\S+\s+)*" + _SUB + r"\b")
 SUB_PY = re.compile(r"""(?:["'](?:bd|gc|dolt)["']|\b(?:GC|BD|GC_BIN|BD_BIN))\s*,\s*(?:["'](?:-C|--city)["']\s*,\s*[^,\]]+,\s*)*["']""" + _SUB + r"""["']|\[\s*["'](?:bd|gc|dolt)["']\s*\]\s*\+""")
 INLINE_PATH = re.compile(r"(/[\w./-]+\.(?:sh|py))\b")
 
@@ -128,6 +139,19 @@ def code_only(line):
     return "".join(out)
 
 
+def call_text(code):
+    """O que sobra de uma linha de shell (já passada por code_only) para procurar CHAMADA. Só o SEGMENTO que é comando de log (echo/printf/log/warn…) perde o texto: o resto da linha continua
+    valendo (`echo go; bd list`, `printf x | bd update`). Dentro do segmento de log só fica o que EXECUTA (`$(…)` e crase: `echo "$(bd list)"` chama). Descartar a linha toda por começar em
+    `echo` fazia `echo go; bd list` virar "não chama" — um erro de leitura apresentado como medida."""
+    keep = []
+    for seg in SEGSPLIT.split(code):   # GUARD:log-split
+        if LOGCMD.match(seg):   # GUARD:log-segment
+            m = re.search(r"\$\(|`", seg)
+            seg = seg[m.start():] if m else ""   # GUARD:log-tail
+        keep.append(seg)
+    return ";".join(keep)
+
+
 def read_text(path):
     """→ texto, ou None quando não dá para ler (ausente/sem permissão/binário). vazio → "" (arquivo vazio é legível); falhou → None, e quem chama conta como ILEGÍVEL."""
     try:
@@ -147,6 +171,9 @@ def measure(args):
     named, srcs = [], []   # named = script que o job executa direto (shebang) ou cita no `-c`: ausente/ilegível = não sei, nunca "sem menção"
     if args[0].startswith("/") and args[0].endswith((".sh", ".py")):   # GUARD:direct-exec
         named.append(args[0])
+    prog = os.path.basename(args[0])
+    if len(args) > 1 and (prog in SHELLS or re.fullmatch(r"python[\d.]*", prog)) and args[1].startswith("/"):   # GUARD:interp-script — o programa do interpretador é o args[1]: ausente = não sei, mesmo que outro argumento seja legível
+        named.append(args[1])
     if len(args) >= 3 and os.path.basename(args[0]) in SHELLS and args[1] == "-c":
         inline = " ".join(args[2:])
         srcs.append(("(inline)", inline))
@@ -171,7 +198,7 @@ def measure(args):
             if not s or s.startswith("#"):
                 continue
             code = line if py else code_only(line)   # GUARD:code-only
-            if (PY_STRONG if py else SH_STRONG).search(code) and not (not py and LOGCMD.match(code)):
+            if (PY_STRONG if py else SH_STRONG).search(code if py else call_text(code)):
                 calls += 1
                 strong = strong or f"{name}:{i}: {s[:100]}"
                 # evidência = a linha que mais parece chamada de verdade (subcomando + 2>/dev/null, $(...), || ou &&); empate → a primeira. Texto de ajuda dentro de string multilinha não tem isso.
@@ -217,40 +244,53 @@ def load_policy(path):
     return pol
 
 
+def plist_row(path, wrapper):
+    """→ linha do plist, ou None quando ele não é RunAtLoad. Plist de forma estranha (topo que não é dicionário, Label que não é texto) levanta: quem chama lista o arquivo como ilegível."""
+    d = load_plist(path)
+    if not isinstance(d, dict):
+        raise TypeError("o topo do plist não é um dicionário")
+    if d.get("RunAtLoad") is not True:
+        return None
+    label = d.get("Label") or os.path.basename(path)[:-6]
+    if not isinstance(label, str):
+        raise TypeError("Label não é texto")
+    # vazio/ilegível (sem a lista) → args=None e o job vira ILEGÍVEL no escopo; nunca "não lê Dolt"
+    args = d.get("ProgramArguments")
+    args = [str(a) for a in args] if isinstance(args, list) else None
+    row = dict(label=label, path=path, args=args, program=d.get("Program"), keepalive=bool(d.get("KeepAlive")), interval=bool(d.get("StartInterval")),
+               cal=bool(d.get("StartCalendarInterval")), link=os.path.islink(path))
+    cmd = inner(args, wrapper) if args else None
+    row["wrapped"] = is_wrapped(args, wrapper)
+    row["inner"] = cmd
+    row["scope"] = label.startswith(HQ_PREFIXES) and not OTHER_RIG.search(" ".join(args or []) + " " + str(d.get("WorkingDirectory", "")))
+    row["state"], row["evid"] = "", ""
+    if row["scope"]:
+        row["state"], row["evid"] = measure(cmd) if cmd else ("ILEGIVEL", "ProgramArguments ausente ou embrulho que não conheço")
+    return row
+
+
 def scan(dirpath, wrapper):
-    """→ (linhas RunAtLoad, ilegíveis [(arquivo, motivo)], total de plists). Pasta ilegível → OSError (exit 3): não sei ≠ pasta vazia."""
+    """→ (linhas RunAtLoad, ilegíveis [(arquivo, motivo)], total de plists). Pasta ilegível → OSError (exit 3): não sei ≠ pasta vazia. Plist que não leio OU de forma que não entendo vai para
+    os ilegíveis com o motivo, e o resto do plano sai (nunca traceback, nunca some)."""
     rows, bad, total = [], [], 0
     for fn in sorted(os.listdir(dirpath)):
         if not fn.endswith(".plist"):
             continue
         total += 1
-        path = os.path.join(dirpath, fn)
         try:
-            d = load_plist(path)
-        except Exception as e:  # noqa: BLE001
+            row = plist_row(os.path.join(dirpath, fn), wrapper)
+        except Exception as e:  # noqa: BLE001  GUARD:scan-guard
             bad.append((fn, type(e).__name__ + ": " + str(e)[:80]))
             continue
-        if d.get("RunAtLoad") is not True:
-            continue
-        label = d.get("Label") or fn[:-6]
-        # vazio/ilegível (sem a lista) → args=None e o job vira ILEGÍVEL no escopo; nunca "não lê Dolt"
-        args = d.get("ProgramArguments")
-        args = [str(a) for a in args] if isinstance(args, list) else None
-        row = dict(label=label, path=path, args=args, program=d.get("Program"), keepalive=bool(d.get("KeepAlive")), interval=bool(d.get("StartInterval")),
-                   cal=bool(d.get("StartCalendarInterval")), link=os.path.islink(path))
-        cmd = inner(args, wrapper) if args else None
-        row["wrapped"] = is_wrapped(args, wrapper)
-        row["inner"] = cmd
-        row["scope"] = label.startswith(HQ_PREFIXES) and not OTHER_RIG.search(" ".join(args or []) + " " + str(d.get("WorkingDirectory", "")))
-        row["state"], row["evid"] = "", ""
-        if row["scope"]:
-            row["state"], row["evid"] = measure(cmd) if cmd else ("ILEGIVEL", "ProgramArguments ausente ou embrulho que não conheço")
-        rows.append(row)
+        if row:
+            rows.append(row)
     return rows, bad, total
 
 
-def divergences(rows, policy, wrapper):
+def divergences(rows, policy, wrapper, bad=()):
     out = []
+    if bad:   # GUARD:bad-div — plist que não consegui ler pode ser o gêmeo de um label wrap ou um job já embrulhado: não sei ≠ "não existe", e aplicar às cegas é o erro
+        out.append(f"{len(bad)} plist(s) não lido(s) ({', '.join(fn for fn, _ in bad[:8])}{', …' if len(bad) > 8 else ''}): pode ser o gêmeo de um label wrap ou um job já embrulhado, e não sei qual — arquive ou conserte")
     wrapped = [r for r in rows if r["wrapped"]]
     for p in sorted({r["args"][0] for r in wrapped}):   # o que o launchd roda é o argv0 do PLIST, não o --wrapper deste comando
         n = sum(r["args"][0] == p for r in wrapped)
@@ -407,7 +447,7 @@ def main(argv=None):
         print(f"revert: {done} revertido(s), {fail} falha(s); backup em {backup}; NADA foi recarregado (launchctl é passo do operador)")
         return 1 if fail else 0
     show(rows, bad, total, policy, a.wrapper, a)
-    div = divergences(rows, policy, a.wrapper)
+    div = divergences(rows, policy, a.wrapper, bad)
     print(f"\n== DIVERGÊNCIAS ({len(div)}) ==")
     print("\n".join(div) if div else "(nenhuma)")
     if not a.apply:
