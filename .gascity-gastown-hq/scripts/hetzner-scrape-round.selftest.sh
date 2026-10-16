@@ -162,6 +162,12 @@ hsr -- eligible delta;                check "eligible: delta SEM tenant -> BLOCK
 printf 'echo:t1\n' > "$T/eligible.onlyten"
 hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.onlyten" -- eligible echo;       check "eligible: permissão só de tenant (echo:t1) sem tenant -> NONE, rc 97" '[ $RC -eq 97 ] && [ "$OUT" = NONE ]'
 hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.onlyten" -- eligible echo t1;    check "eligible: permissão só de tenant (echo:t1) com o tenant t1 -> ALLOW" '[ $RC -eq 0 ] && [ "$OUT" = ALLOW ]'
+# um bloqueio que não casa libera em silêncio: espaço/maiúscula são normalizados; linha malformada recusa a lista INTEIRA
+printf 'delta\n!  Delta : T9   # espaços e maiúsculas\nalpha\n' > "$T/eligible.spaced"
+printf 'alpha\n!alpha beta   # malformada: nunca casaria com nada\n' > "$T/eligible.malformed"
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.spaced" -- eligible delta t9;     check "eligible: '!  Delta : T9' (espaços e maiúsculas) ainda BLOQUEIA t9, rc 97" '[ $RC -eq 97 ] && has "^BLOCK"'
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.spaced" -- eligible delta;        check "eligible: '!  Delta : T9' também bloqueia delta sem tenant, rc 97" '[ $RC -eq 97 ] && has "^BLOCK .*t9"'
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.malformed" -- eligible alpha;     check "eligible: linha malformada ('!alpha beta') -> UNREADABLE com a linha, rc 97 (não libera em silêncio)" '[ $RC -eq 97 ] && has "^UNREADABLE .*alpha beta"'
 hsr -- eligible 'a;b';                check "eligible: nome com metacaractere é recusado, rc 97" '[ $RC -eq 97 ] && has "inválido"'
 hsr -- eligible;                      check "eligible sem argumento: rc 97" '[ $RC -eq 97 ]'
 hsr HETZNER_SCRAPE_ELIGIBLE="$T/nao-existe" -- eligible alpha; check "eligible: lista ilegível -> UNREADABLE, rc 97 (falha fechada)" '[ $RC -eq 97 ] && has "UNREADABLE"'

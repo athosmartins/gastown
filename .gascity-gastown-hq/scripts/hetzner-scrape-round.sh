@@ -81,6 +81,7 @@ loose_realpath() {
 # eligibility <raspador> [tenant]: imprime ALLOW | BLOCK <motivo> | NONE | UNREADABLE. rc 0 = pode rodar. A linha `!nome` (ou `!nome:tenant`) bloqueia e VENCE a permissão.
 # Sem tenant (tn vazio) o raspador roda TODOS os tenants ativos, então qualquer `!nome:tenant` dele bloqueia a rodada inteira (BLOCK, nomeando os tenants): o bloqueio por tenant não pode ser contornado por não dizer o tenant.
 # Permissão só de tenant (`nome:tenant`) sem tenant pedido não casa → NONE (recusa), como antes.
+# Espaço em volta de `!` e `:` e maiúsculas são normalizados; linha que mesmo assim não é `nome` ou `nome:tenant` (um `!alpha beta` nunca casaria com nada, e um bloqueio que não casa liberaria em silêncio) → UNREADABLE, rc 3: a lista INTEIRA é recusada, com a linha no stdout.
 eligibility() {
   local sc=$1 tn=${2:-} v rc
   [ -r "$ELIGIBLE" ] || { echo UNREADABLE; return 3; }
@@ -89,11 +90,14 @@ eligibility() {
       gsub(/^[ \t]+/,"",line); gsub(/[ \t]+$/,"",line); gsub(/^[ \t]+/,"",why); gsub(/[ \t]+$/,"",why)
       if (line=="") next
       neg=0; if (substr(line,1,1)=="!") { neg=1; line=substr(line,2) }
+      gsub(/[ \t]*:[ \t]*/,":",line); gsub(/^[ \t]+/,"",line); line=tolower(line)
+      if (line !~ /^[a-z][a-z0-9_]*(:[a-z0-9][a-z0-9_-]*)?$/) { bad=bad (bad=="" ? "" : ", ") "\"" line "\""; next }
       n=split(line,p,":"); name=p[1]; ten=(n>1 ? p[2] : "")
       if (name!=sc) next
       if (ten!="" && ten!=tn) { if (neg && tn=="") { tb=tb (tb=="" ? "" : ",") ten; if (twhy=="") twhy=why } next }
       if (neg) { blocked=1; bwhy=why } else allowed=1 }
-    END { if (blocked) { print "BLOCK " bwhy; exit 1 }
+    END { if (bad!="") { print "UNREADABLE linha(s) malformada(s) na lista: " bad; exit 3 }
+          if (blocked) { print "BLOCK " bwhy; exit 1 }
           if (tb!="") { print "BLOCK sem --tenant a rodada pega todos os tenants ativos e " sc " tem tenant bloqueado: " tb (twhy=="" ? "" : " (" twhy ")") " — rode com --tenant <outro>"; exit 1 }
           if (allowed) { print "ALLOW"; exit 0 } print "NONE"; exit 2 }' "$ELIGIBLE"); rc=$?
   echo "$v"; return $rc
