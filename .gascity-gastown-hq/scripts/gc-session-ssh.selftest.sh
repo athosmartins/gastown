@@ -27,7 +27,7 @@
 #   exato (sessão, is-running, start), alvo de painel =nome:, guarda de /Users/, filtro de env, exit 2 das desconhecidas, marcador de fim,
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
-#   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível; 24 mutantes).
+#   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível; 25 mutantes).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1
 set -u

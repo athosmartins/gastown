@@ -14,23 +14,28 @@ PARA QUE SERVE
 COMO DECIDE (os três estados — sei que pode / sei que não pode / não sei — e o último NÃO vira "pode")
   Território = $RCG_ROOT, senão ~/gt-remote/git. Clone próprio = o ancestral com `.git` de $CLAUDE_PROJECT_DIR (sem a variável: não há clone
   próprio, e toda escrita no território é bloqueada). Para cada `git` do comando (depois de ; && || | ( ) { das palavras reservadas if/then/else/
-  elif/do/while/until/!/function, de cd/pushd, de command/env/sudo/xargs/nohup…, de bash -c / eval / $(…) / crases / <(…) / find -exec, e do corpo
-  de um heredoc ou here-string que um shell lê) o alvo é o diretório depois dos `-C` (relativos entre si), mais --git-dir/--work-tree/GIT_DIR/
+  elif/do/while/until/!/function, de cd/pushd, de command/env/sudo/xargs/nohup…, de bash -c / eval / $(…) / crases / <(…) / find -exec|-execdir|-ok|-okdir, e do
+  corpo de um heredoc ou here-string que um shell lê) o alvo é o diretório depois dos `-C` (relativos entre si), mais --git-dir/--work-tree/GIT_DIR/
   GIT_WORK_TREE, resolvido com realpath (symlink para outro clone não escapa). Subcomando que não está na lista de LEITURA (inclusive o que não
   conheço, alias…) conta como escrita. Leitura que traz configuração capaz de rodar um programa também conta: `-c`/`--config-env` com chave que não é só
   de exibição ou identidade (alias.*, core.pager/fsmonitor/sshCommand, diff.external, filter.*…), `-p`/`--paginate`, `--exec-path`, GIT_CONFIG_*/GIT_PAGER/
   GIT_EXTERNAL_DIFF/GIT_SSH*/GIT_EDITOR… (lista fechada: chave que não conheço = não sei = escrita). Alvo no território e fora do clone próprio → bloqueia; alvo que não consigo resolver ($VAR, glob, crase,
   ~usuário) numa escrita → bloqueia, com a mensagem dizendo para usar caminho literal.
   cd/pushd só muda o diretório que EU entendo: opções -L/-P/-e/-@, `--` e UM argumento; o resto (`cd -Z x`, dois argumentos, `pushd +1`, `pushd`
-  sozinho) deixa o diretório "não sei". Lançadores que não modelo (flock, ionice, ssh, su -c, parallel, script -c, trap, watch, tmux…; a lista OPAQUE)
-  são abertos com o diretório "não sei": o git dentro deles só passa se for leitura ou com `-C <caminho absoluto>`.
+  sozinho) deixa o diretório "não sei". O mesmo vale para o que o git não deixa eu ler: opção de topo que não conheço (`git --nova VALOR -C x`: o VALOR pode ser
+  o valor da opção ou o subcomando) → diretório "não sei" e vale como escrita. Cada embrulho (command/env/sudo/xargs/nice/timeout/stdbuf…) tem a tabela das SUAS
+  opções (WOPT; `sudo -n` não é o `-n` do xargs) e só entendo o que está nela: opção que não está = não sei onde o comando começa, e o embrulho vale como
+  lançador OPACO (abaixo). `find -exec`/`-ok` rodam no diretório do find; `-execdir`/`-okdir` rodam no de CADA achado, que não sei qual é → "não sei" (git de
+  escrita ali só passa com `-C <caminho absoluto>`). `bash -c -e '…'`: o script é a primeira palavra depois do -c que não é opção. O número colado no
+  redirecionamento (`2>/dev/null`) é o descritor, não um argumento. Lançadores que não modelo (flock, ionice, ssh, su -c, parallel, script -c, trap, watch, tmux…; a lista OPAQUE)
+  são abertos com o diretório "não sei": o git dentro deles só passa se for leitura ou com `-C <caminho absoluto>`. Um embrulho com opção que não conheço vale como um deles.
   Falha do próprio guarda (exceção) → bloqueia, se o pedido cita git/file_path/notebook_path; um stdin que nem é JSON e não cita nenhum dos três
   LIBERA (lixo no stdin não derruba a sessão inteira; o Claude sempre manda JSON válido). O comando do hook é `python3 -I <este arquivo> || exit 2`,
   então travar, sumir o python ou o arquivo também sai com 2 (o hook que sai com 1 ou 127 NÃO bloqueia: seria falha aberta).
 
 CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E
   (com o settings) todo PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit é EXATAMENTE `python3 -I <este arquivo> || exit 2` (citar o arquivo
-  noutro lugar do comando não vale) e `disableAllHooks` não está ligado nele nem em <pasta>/.claude/settings[.local].json; 1 caso contrário (é o que o
+  noutro lugar do comando não vale) e sem campo que mude QUANDO ele dispara (`if`, `async`…: só type/command/timeout) e `disableAllHooks` não está ligado nele nem em <pasta>/.claude/settings[.local].json; 1 caso contrário (é o que o
   provider confere antes de abrir sessão real). Edit/Write em ~/.claude/hooks/** e ~/.claude/settings*.json também são bloqueados (o guarda não se
   desliga por engano).
 
@@ -38,8 +43,9 @@ LIMITES (é trava contra engano, não sandbox contra quem quer burlar). NÃO vej
   outras linguagens, variável que guarda o git ou o diretório, comando montado em pipe (`echo '…' | sh`), função ou alias definido em OUTRA chamada,
   CDPATH, redirecionamento de shell (`> arquivo`), `sed -i`, `rm`/`cp` no clone alheio ou nos hooks, e a configuração que JÁ está no .git/config do clone
   alheio (alias, filter, textconv, fsmonitor: uma leitura lá a executa). A lista OPAQUE é fechada: um lançador que não
-  está nela (`lockrun git …`) esconde o git numa palavra que não abro. Falso positivo que fica: git com diretório implícito atrás de um lançador da
-  lista (`flock L git commit`) bloqueia; escreva `git -C <caminho absoluto do seu clone>`. O fecho de verdade (usuário Unix por sessão) é outro
+  está nela (`lockrun git …`) esconde o git numa palavra que não abro. Falsos positivos que ficam (todos no lado fechado): git com diretório implícito atrás de um lançador da
+  lista (`flock L git commit`), de um embrulho com opção que não conheço (`sudo --nova git commit`) ou de um `-execdir`/`-okdir` bloqueia; e `git --opção-nova VALOR -C
+  <seu clone> commit` bloqueia. Escreva `git -C <caminho absoluto do seu clone>`. O fecho de verdade (usuário Unix por sessão) é outro
   trabalho; ver o runbook.
 """
 from __future__ import annotations
@@ -65,12 +71,30 @@ CFG_SAFE = re.compile(r"(?:color|advice)\.[\w.-]+|core\.(?:quotepath|abbrev|prec
 CFG_ENV = re.compile(r"GIT_(?:CONFIG\w*|EXTERNAL_DIFF|PAGER|SSH\w*|ASKPASS|EDITOR|SEQUENCE_EDITOR|PROXY_COMMAND|EXEC_PATH|TEMPLATE_DIR)|SSH_ASKPASS")  # variáveis que fazem o git rodar um programa ou ler configuração de outro lugar
 PUNCT, SEPS = set("();<>|&"), {";", "&&", "||", "|", "&", "|&", ";;"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh"}
-WRAP = {"command", "builtin", "exec", "nohup", "time", "env", "sudo", "doas", "xargs", "nice", "timeout", "stdbuf", "setsid"}
+# Embrulhos que o guarda descasca, cada um com a tabela das SUAS opções (uma tabela só para todos foi a brecha: `sudo -n` herdava o `-n` do xargs, que leva
+# argumento, e o `git` virava o argumento). Quatro listas por embrulho: sem argumento · com argumento no token SEGUINTE · valor sempre colado (`-i{}`, `--eof=x`) ·
+# muda o diretório onde o comando roda. Opção colada (`-oL`, `--x=y`) é uma palavra só. Opção que NÃO está na tabela = não sei onde o comando começa.
+WOPT = {
+    "command": ("-p -v -V", "", "", ""), "builtin": ("", "", "", ""), "nohup": ("", "", "", ""), "exec": ("-c -l", "-a", "", ""), "doas": ("-n -s", "-u -C", "", ""),
+    "time": ("-p -v -a -q --portability --verbose --append --quiet", "-f -o --format --output", "", ""),
+    "env": ("-i -0 -v --ignore-environment --null --debug", "-u -C -S -P --unset --chdir --split-string", "", "-C --chdir -S --split-string"),
+    "sudo": ("-A -b -E -e -H -i -K -k -l -n -P -S -s -V -v --askpass --background --edit --set-home --login --list --non-interactive --preserve-groups --preserve-env "
+             "--stdin --shell --validate --version --remove-timestamp --reset-timestamp",
+             "-C -c -D -g -h -p -R -r -T -t -U -u --close-from --login-class --chdir --group --host --prompt --chroot --role --command-timeout --type --other-user --user",
+             "", "-D -R --chdir --chroot"),
+    "xargs": ("-0 -o -p -r -t -x --null --open-tty --interactive --no-run-if-empty --verbose --exit --show-limits",
+              "-a -d -E -I -L -n -P -s --arg-file --delimiter --max-args --max-procs --max-chars --process-slot-var", "-e -i -l --eof --replace --max-lines", ""),
+    "nice": ("", "-n --adjustment", "", ""), "timeout": ("-v --verbose --foreground --preserve-status", "-s -k --signal --kill-after", "", ""),
+    "stdbuf": ("", "-i -o -e --input --output --error", "", ""), "setsid": ("-c -f -w --ctty --fork --wait", "", "", ""),
+}
+WRAP, SPLIT = set(WOPT), {"-S", "--split-string"}  # env -S 'git -C x commit': o valor da opção é um comando inteiro
 KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "{", "!", "coproc"}  # palavras reservadas que vêm ANTES de um comando: o git depois delas é o comando do trecho
 OPAQUE = {"flock", "ionice", "chrt", "taskset", "parallel", "su", "runuser", "ssh", "script", "trap", "watch", "unshare", "nsenter", "chroot", "setpriv", "numactl",
           "strace", "fakeroot", "systemd-run", "busybox", "dbus-run-session", "xvfb-run", "unbuffer", "caffeinate", "tmux", "screen", "expect"}  # lançadores que não modelo: lista FECHADA (ver LIMITES)
-OPT_ARG = {"-I", "-n", "-L", "-P", "-d", "-s", "-E", "-u", "-g", "-C", "-D", "--chdir"}  # opções de xargs/sudo/env que levam o valor no argumento seguinte
-ASSIGN, NUM = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S), re.compile(r"\d+[smhd]?")
+GIT_FLAG = re.compile(r"-[Phv]|--(?:no-pager|bare|no-replace-objects|no-lazy-fetch|no-optional-locks|no-advice|literal-pathspecs|glob-pathspecs|noglob-pathspecs|"
+                      r"icase-pathspecs|no-global-excludes|version|help|html-path|man-path|info-path|attr-source=.*|namespace=.*|list-cmds=.*)")  # opções de topo do git que conheço e não levam o valor no token seguinte
+ASSIGN, NUM = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S), re.compile(r"[\d.]+[smhd]?")
+FD = re.compile(r"(^|[\s;&|(])\d+(?=[<>])")  # `2>/dev/null`, `1>&2`: o número colado no redirecionamento é o descritor, não um argumento
 SHELLY = re.compile(r"[$`*?\[{]")
 PIECE = re.compile(r"&&|\|\||\|&|;;|[;&|()]|[<>]+&?")
 SUBST, BACKTICK = re.compile(r"\$S([0-9a-f]*)\$"), re.compile(r"`([^`]*)`")
@@ -160,8 +184,8 @@ def hide(cmd: str) -> str:
 
 def runs_text(seg: list) -> bool:
     """O comando do trecho executa texto que recebe (shell, eval/source, ssh/su… — OPAQUE)? vazio → não; só o COMANDO decide, não as palavras (`git commit -m "bash"` não é shell)."""
-    s = peel(seg)[1]
-    return bool(s) and os.path.basename(s[0]) in SHELLS | OPAQUE | {"eval", "source", "."}
+    _, s, _, opq = peel(seg)  # opq = embrulho com opção que não conheço: não sei o que ele roda, vale como lançador
+    return bool(s) and (opq or os.path.basename(s[0]) in SHELLS | OPAQUE | {"eval", "source", "."})
 
 
 def heredoc(m) -> str:
@@ -174,7 +198,7 @@ def heredoc(m) -> str:
 
 
 def words(cmd: str) -> list:
-    cmd = hide(CONT.sub(r"\1", HEREDOC.sub(heredoc, cmd))).replace("\n", " ; ")  # newline separa comandos; `\` + newline os junta
+    cmd = FD.sub(r"\1", hide(CONT.sub(r"\1", HEREDOC.sub(heredoc, cmd))).replace("\n", " ; "))  # newline separa comandos; `\` + newline os junta
     try:
         lx = shlex.shlex(cmd, posix=True, punctuation_chars=True)
         lx.whitespace_split, lx.commenters = True, ""
@@ -183,9 +207,43 @@ def words(cmd: str) -> list:
         return re.findall(r"[^\s;&|()]+|[;&|()]+", cmd.replace("'", "").replace('"', ""))
 
 
+def wopt(w: str, seg: list):
+    """Lê as opções do embrulho `w` no começo de `seg` (o que vem DEPOIS do nome dele): devolve (o resto, cego), ou None = há opção que não está na tabela WOPT
+    do embrulho, e então não sei onde o comando começa (a palavra seguinte pode ser o valor da opção ou o próprio comando). cego = alguma opção muda o diretório."""
+    flag, arg, joined, chd = (set(x.split()) for x in WOPT[w])  # vazio → n/a (só é chamado com w em WRAP); falhou → KeyError, e main() bloqueia o pedido que cita git
+    blind = False
+    while seg and seg[0][:1] == "-":
+        t, seg = seg[0], seg[1:]
+        if t == "--":
+            break
+        if t[:2] == "--":
+            name, eq, val = t.partition("=")
+            given = [(name, val if eq else None)]
+        elif w == "nice" and t[1:].isdigit():  # `nice -5 git …`
+            continue
+        else:  # `-nE`, `-oL`, `-I{}`: as letras uma a uma; a letra com valor leva o resto da palavra, ou a palavra seguinte se não sobrou nada
+            given = []
+            for k, ch in enumerate(t[1:]):
+                given.append(("-" + ch, t[k + 2:] or None))
+                if "-" + ch in arg | joined:
+                    break
+        for name, val in given:
+            if name not in flag | arg | joined:
+                return None
+            if name in arg and val is None:
+                val, seg = (seg[0] if seg else ""), seg[1:]
+            blind = blind or name in chd
+            if name in SPLIT:
+                seg = [val or ""] + seg
+    if w == "timeout" and seg and NUM.fullmatch(seg[0]):  # a duração é a primeira palavra sem `-`
+        seg = seg[1:]
+    return seg, blind
+
+
 def peel(seg: list):
-    """Tira atribuições (VAR=x) e embrulhos (command, env, sudo, xargs…) do começo: devolve (atribuições, o comando de verdade, cego).
-    cego = uma opção do embrulho (env -C/-S/--chdir, sudo -D) muda onde o comando roda e o guarda não a modela: o diretório vira "não sei"."""
+    """Tira atribuições (VAR=x) e embrulhos (command, env, sudo, xargs…) do começo: devolve (atribuições, o comando de verdade, cego, opaco).
+    cego = uma opção do embrulho (env -C/-S/--chdir, sudo -D) muda onde o comando roda e o guarda não a modela: o diretório vira "não sei".
+    opaco = o embrulho tem uma opção que não conheço: não sei onde o comando começa, e ele vale como lançador OPACO (seg volta começando no embrulho)."""
     env: dict = {}
     blind = False
     while seg:
@@ -193,20 +251,18 @@ def peel(seg: list):
         if m:
             env[m.group(1)], seg = m.group(2), seg[1:]
         elif os.path.basename(seg[0]) in WRAP:
-            seg = seg[1:]
-            while seg and (seg[0].startswith("-") or ASSIGN.fullmatch(seg[0]) or NUM.fullmatch(seg[0])):
-                m = ASSIGN.fullmatch(seg[0])
-                if m:  # `env GIT_DIR=x git …` também aponta o git para outro lugar
-                    env[m.group(1)] = m.group(2)
-                blind = blind or seg[0][:2] in ("-C", "-D", "-S") or seg[0].startswith(("--chdir", "--split-string"))
-                seg = seg[2:] if seg[0] in OPT_ARG else seg[1:]
+            r = wopt(os.path.basename(seg[0]), seg[1:])
+            if r is None:
+                return env, seg, blind, True
+            seg, b = r
+            blind = blind or b
         elif seg[0] in KEYWORDS:  # `if git …`, `then git …`, `{ git …`, `! git …`: o comando começa na palavra seguinte
             seg = seg[3:] if seg[0] == "coproc" and seg[2:3] == ["{"] else seg[1:]  # `coproc NOME { git …; }` tem um nome no meio
         elif seg[0] == "function":  # `function f { git …; }`: o nome vai embora, o `{` é palavra reservada
             seg = seg[2:]
         else:
             break
-    return env, seg, blind
+    return env, seg, blind, False
 
 
 def chdir(args: list, cwd, push: bool):
@@ -223,7 +279,7 @@ def chdir(args: list, cwd, push: bool):
 
 
 def git_hit(seg: list, env: dict, cwd, terr: str, own):
-    gd, wt, i = env.get("GIT_DIR"), env.get("GIT_WORK_TREE"), 1
+    gd, wt, i, lost = env.get("GIT_DIR"), env.get("GIT_WORK_TREE"), 1, False
     runs = any(CFG_ENV.fullmatch(k) for k in env)  # o git deste comando pode rodar um programa que o guarda não vê (configuração injetada): leitura deixa de valer como leitura
     while i < len(seg) and seg[i].startswith("-"):
         a = seg[i]
@@ -231,7 +287,7 @@ def git_hit(seg: list, env: dict, cwd, terr: str, own):
             cwd, i = res(seg[i + 1], cwd), i + 2
         elif a in ("-c", "--config-env") and i + 1 < len(seg):
             runs, i = runs or not CFG_SAFE.fullmatch(seg[i + 1].partition("=")[0]), i + 2
-        elif a == "--namespace" and i + 1 < len(seg):
+        elif a in ("--namespace", "--attr-source") and i + 1 < len(seg):  # valor no token seguinte: sem pular, ele viraria o subcomando e o `-C` depois dele nunca seria lido
             i += 2
         elif a.startswith("--config-env="):
             runs, i = runs or not CFG_SAFE.fullmatch(a.partition("=")[2].partition("=")[0]), i + 1
@@ -243,10 +299,14 @@ def git_hit(seg: list, env: dict, cwd, terr: str, own):
                 v, i = seg[i + 1], i + 1
             gd, wt = (v, wt) if k == "--git-dir" else (gd, v)
             i += 1
-        else:
+        else:  # opção de topo que não conheço pode levar um valor no token seguinte: não sei onde está o subcomando nem o `-C` que viria depois → diretório "não sei", e vale como escrita
+            if not GIT_FLAG.fullmatch(a):
+                lost, cwd = True, None
             i += 1
     sub, rest = (seg[i] if i < len(seg) else ""), seg[i + 1:]
-    read = is_read(sub, rest)
+    if SHELLY.search(sub):  # `git $FLAGS -C x commit`, `git "$@"`: o shell ainda expande a palavra do subcomando, e o que sair pode ser opção (um `-C`) que não leio → diretório "não sei", e vale como escrita
+        lost, cwd = True, None
+    read = not lost and is_read(sub, rest)
     if read and not runs:
         return None
     for t in [cwd] + [res(x, cwd) for x in (gd, wt) if x]:
@@ -267,7 +327,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
                 r = scan(bytes.fromhex(m.group(1)).decode(), st["cwd"], terr, own, depth + 1)
                 if r:
                     return r
-        env, seg, b = peel(seg)
+        env, seg, b, opq = peel(seg)
         blind = blind or b
         if not seg:
             st["env"].update(env)  # `GIT_DIR=x; git …`: sem saber se foi exportada, vale para os comandos seguintes
@@ -281,7 +341,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
             st["cwd"] = chdir(seg[1:], st["cwd"], c == "pushd")
         elif c == "popd":
             st["cwd"] = None
-        elif c in OPAQUE:  # não modelo o que o lançador faz com diretório e ambiente: o git de dentro (palavra solta ou texto entre aspas) vale com diretório "não sei"
+        elif c in OPAQUE or opq:  # não modelo o que o lançador faz com diretório e ambiente: o git de dentro (palavra solta ou texto entre aspas) vale com diretório "não sei"
             for j, t in enumerate(seg[1:], 1):
                 if os.path.basename(t) == "git":  # as palavras seguintes são argumentos do git (mensagem de commit…), não outro comando
                     return git_hit(seg[j:], {**st["env"], **env}, None, terr, own)
@@ -292,13 +352,18 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
         elif c in SHELLS:
             for j, t in enumerate(seg[1:-1], 1):
                 if re.fullmatch(r"-[a-z]*c[a-z]*", t):
-                    return scan(seg[j + 1], cwd, terr, own, depth + 1)
+                    script = seg[j + 1:]
+                    while len(script) > 1 and script[0][:1] in ("-", "+"):  # `bash -c -e 'cmd'`, `bash -c -- 'cmd'`: o script é a primeira palavra que não é opção
+                        stop, script = script[0] == "--", script[1:]
+                        if stop:
+                            break
+                    return scan(script[0], cwd, terr, own, depth + 1)
         elif c == "eval":
             return scan(" ".join(seg[1:]), cwd, terr, own, depth + 1)
-        elif c == "find":
+        elif c == "find" or c[:1] == "-":  # o `\;` do find fecha o trecho: um segundo `-exec …` chega aqui como PRIMEIRA palavra do trecho seguinte (ou depois de `-o`/`\)`)
             for j, t in enumerate(seg):
-                if t in ("-exec", "-execdir", "-ok", "-okdir"):
-                    r = one(seg[j + 1:], blind)
+                if t in ("-exec", "-execdir", "-ok", "-okdir"):  # -exec/-ok rodam no diretório do find; -execdir/-okdir no de CADA achado, que não sei qual é: cego
+                    r = one(seg[j + 1:], blind or t.endswith("dir"))
                     if r:
                         return r
         elif c == "git":
@@ -388,9 +453,11 @@ def selfcheck(args: list) -> int:
                     if os.path.exists(f) and json.load(open(f)).get("disableAllHooks"):
                         raise ValueError(f"{f}: disableAllHooks ligado na camada do projeto")
             for tool in ("Bash",) + tuple(TOOLS_FILE):
-                if not any((g.get("matcher") in (None, "", "*") or re.fullmatch(g["matcher"], tool)) and any(hook_re.fullmatch(h.get("command", "").strip()) for h in g.get("hooks", []))
+                # além do comando, nenhum campo que mude QUANDO o hook dispara (`if`: o hook antigo só disparava em `git -C *`; `async`…). vazio → o grupo/hook sem campo extra vale; ilegível (grupo ou hook que não é objeto) → AttributeError/TypeError, e o selfcheck falha
+                if not any((g.get("matcher") in (None, "", "*") or re.fullmatch(g["matcher"], tool)) and set(g) <= {"matcher", "hooks"}
+                           and any(hook_re.fullmatch(h.get("command", "").strip()) and h.get("type") == "command" and set(h) <= {"type", "command", "timeout"} for h in g.get("hooks", []))
                            for g in groups):
-                    raise ValueError(f"{tool}: nenhum hook PreToolUse é exatamente `python3 -I {me} || exit 2`")
+                    raise ValueError(f"{tool}: nenhum hook PreToolUse é exatamente `python3 -I {me} || exit 2` (sem `if`, async… — só type/command/timeout)")
         except (OSError, ValueError, AttributeError, KeyError, TypeError, re.error) as e:
             ok = False
             print(f"selfcheck: settings {args[0]}: {e}", file=sys.stderr)

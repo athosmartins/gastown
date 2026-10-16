@@ -9,10 +9,12 @@
 #   clone · evade — a mesma escrita embrulhada (command/env/sudo/xargs, bash -c, eval, $(…), crase, find -exec, ; && || |, heredoc) ·
 #   closed — o que não sei NÃO vira liberado (variável, glob, ~usuário, subcomando desconhecido, stdin que não é JSON e cita git/file_path; sem citar, libera) · tools — Edit/Write/MultiEdit/
 #   NotebookEdit · shell — o git atrás de palavra reservada (if/then/{/!/function), de `<(…)`, de cd/pushd com opção, de lançador que não modelo (flock/ssh/su…),
-#   de heredoc e here-string que um shell lê, de `\`+newline (e os controles que NÃO podem bloquear) · cfg — a LEITURA que traz configuração capaz de rodar programa
+#   de heredoc e here-string que um shell lê, de `\`+newline (e os controles que NÃO podem bloquear) · wrap — o mesmo defeito em find (-execdir/-okdir, um segundo
+#   -exec depois do `\;`), na tabela de opções de CADA embrulho (sudo -n, xargs -a, stdbuf -o L, timeout --signal, nice -5…; opção que não conheço = lançador opaco),
+#   nas opções de topo do git que levam valor (--attr-source) e na palavra do shell no lugar do subcomando (`git $FLAGS -C x commit`), no `bash -c -e '…'` e no descritor de `2>/dev/null` (que não é argumento) · cfg — a LEITURA que traz configuração capaz de rodar programa
 #   (`-c alias.x=…`, `--config-env`, `-p`, `--exec-path`, GIT_CONFIG_*/GIT_PAGER/GIT_EXTERNAL_DIFF…) deixa de valer como leitura no clone alheio; chave só de exibição e o próprio clone seguem livres · msg — o texto da recusa · check — --selfcheck com settings bom e com cada defeito · hook — o comando de hook de
 #   verdade (`python3 -I <guarda> || exit 2`) sai 2 se o guarda trava, some ou tem erro de sintaxe (falha fechada), e 0 se libera.
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (67 mutantes); e
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (86 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 set -u
@@ -246,6 +248,60 @@ EOF"
   b 0 "pass: continuação de linha entre -C e o subcomando de leitura" "git -C $OTH \\
 log"
 }
+g_wrap() {  # gate ga-iczduy (rodada 2): o MESMO defeito das rodadas anteriores (o que o guarda não entende vale "não é git") em find, nas opções de CADA embrulho, no git de topo e no bash -c
+  local c
+  for c in "find $T -name .git -execdir git pull \\;" "find . -name .git -okdir git add -A \\;" "find . -execdir git commit -m x ';'" "find . -execdir sh -c 'git commit -m x' \\;" \
+           "find . -execdir bash -c 'git add -A' \\;" "find . -name x -exec echo {} \\; -exec git -C $OTH commit -m x \\;" "find . \\( -name a \\) -o -exec git -C $OTH commit -m x \\;" \
+           "find . -name x -exec echo {} \\; -execdir git commit -m x \\;" "find . -name x -exec echo {} \\; -ok git -C $OTH commit -m x \\;" "find . -name x -exec sh -c 'git -C \"\$0\" commit' {} \\;" \
+           "find . -name x -exec echo {} + -exec git -C $OTH commit -m x +" "cd $OTH && find . -name x -exec git commit -m x {} \\;"; do
+    b 2 "wrap: find: $c" "$c"
+  done
+  for c in "find . -name x -execdir git log \\;" "find . -name x -execdir git -C $OWN commit {} \\;" "find . -name x -exec git commit {} \\;" "find . -name x -exec echo {} \\; -exec git status \\;" \
+           "find . -name x -exec echo {} \\; -exec git commit -m x \\;" "find . -name x -exec git -C $OTH log {} \\;" "find . -name x -execdir git -C $OTH log \\;"; do
+    b 0 "pass: wrap: find: $c" "$c"
+  done
+  for c in "sudo -n git -C $OTH commit -m x" "sudo -E git -C $OTH commit" "sudo -P git -C $OTH commit" "sudo -nE git -C $OTH commit" "sudo -u root -n git -C $OTH commit" "sudo -h host git -C $OTH commit" \
+           "sudo -p x git -C $OTH commit" "sudo -- git -C $OTH commit" "sudo -u root -- git -C $OTH commit" "sudo --user root git -C $OTH commit" "sudo --preserve-env=PATH git -C $OTH commit" \
+           "xargs -a F git -C $OTH commit" "xargs --arg-file F git -C $OTH commit" "xargs -0 -r git -C $OTH commit" "xargs -n1 git -C $OTH commit" "xargs -i{} git -C $OTH commit" \
+           "stdbuf -o L git -C $OTH commit" "stdbuf --output L git -C $OTH commit" "stdbuf -oL -eL git -C $OTH commit" "timeout --signal KILL 5 git -C $OTH commit" "timeout -k 1 5 git -C $OTH commit" \
+           "timeout 1.5 git -C $OTH commit" "nice -5 git -C $OTH commit" "nice -n 5 git -C $OTH commit" "nice --adjustment 5 git -C $OTH commit" "exec -a x git -C $OTH commit" "env - git -C $OTH commit" \
+           "env -u X git -C $OTH commit" "env -i -u X git -C $OTH commit" "env --split-string='git -C $OTH commit'" "env -S'git -C $OTH commit'" "time -p git -C $OTH commit" "time -f %e git -C $OTH commit" \
+           "setsid -f git -C $OTH commit" "doas -u x git -C $OTH commit" "command -p git -C $OTH commit" "sudo -n timeout 5 nice -n 1 git -C $OTH commit" \
+           "sudo --frobnicate x git -C $OTH commit" "xargs -Z x git -C $OTH commit" "sudo --frobnicate git commit -m x"; do
+    b 2 "wrap: embrulho: $c" "$c"
+  done
+  for c in "sudo -n git commit -m x" "sudo -nE git commit -m x" "sudo -u root -- git commit -m x" "sudo -E git -C $OWN commit" "nice -n 5 git commit -m x" "nice -5 git commit" "timeout 5 git commit -m x" \
+           "timeout -k 1 5 git commit" "timeout --signal KILL 5 git commit" "timeout 1.5 git commit" "env -i git commit -m x" "env - git commit" "env -u X git commit" "xargs -n1 git commit" \
+           "xargs -I{} git commit" "xargs -i{} git commit" "xargs -a F git commit" "stdbuf -o L git commit" "stdbuf -oL git commit" "exec -a x git commit" "time -p git commit" "setsid -f git commit" \
+           "command -p git commit" "nohup git commit" "sudo -n git -C $OTH log" "xargs -a F git -C $OTH log" "env FOO=1 git commit" "sudo --frobnicate git -C $OWN commit -m x" \
+           "sudo -i git commit -m x"; do
+    b 0 "pass: wrap: embrulho: $c" "$c"
+  done
+  for c in "git --attr-source HEAD -C $OTH commit" "git --attr-source=HEAD -C $OTH commit" "git --future-opt x -C $OTH commit" "git --future-flag commit -m x" "git -c user.name=a --future-opt x -C $OTH commit" \
+           "git --future-opt x -C $OWN commit -m x"; do  # o último é falso positivo ASSUMIDO: não sei se `x` é o valor da opção ou o subcomando, então o `-C` depois dele não vale
+    b 2 "wrap: git de topo: $c" "$c"
+  done
+  for c in "git --attr-source HEAD -C $OWN commit" "git --attr-source=HEAD commit -m x" "git --no-optional-locks -C $OTH status" "git --no-pager commit -m x" "git -P log"; do
+    b 0 "pass: wrap: git de topo: $c" "$c"
+  done
+  for c in "git \$FLAGS -C $OTH commit -m x" "git \"\$X\" -C $OTH commit -m x" "git \"\$@\"" "git \$(echo -C) $OTH commit -m x" "git * -C $OTH commit" "git -C $OTH \$SUB -m x" "git \$FLAGS commit -m x"; do
+    b 2 "wrap: palavra do shell na posição do subcomando (esconde um -C): $c" "$c"  # o último é falso positivo ASSUMIDO (não sei o que \$FLAGS vira)
+  done
+  for c in "git commit -m \"\$msg\"" "git -C $OWN commit -m \"\$msg\"" "git -C $OTH log \"\$X\"" "git -C $OTH log \$(echo -1)"; do
+    b 0 "pass: wrap: variável depois do subcomando não esconde opção de topo: $c" "$c"
+  done
+  for c in "bash -c -e 'git -C $OTH commit -m x'" "bash -c -- 'git -C $OTH commit -m x'" "sh -c +e 'git -C $OTH commit -m x'" "bash -c -x -e \"git -C $OTH push\""; do
+    b 2 "wrap: shell -c com opção depois do -c: $c" "$c"
+  done
+  b 0 "pass: wrap: bash -c -e no próprio clone" "bash -c -e 'git -C $OWN commit -m x'"
+  b 0 "pass: wrap: bash -c -- no próprio clone" "bash -c -- 'git commit -m x'"
+  for c in "cd $OWN/sub 2>/dev/null && git commit -m x" "cd $OWN/sub 2>&1 && git add -A" "git commit -m x 2>/dev/null" "git commit -m x 1>/dev/null 2>&1" "git add . 2>>$T/log" "cd $OWN 2>/dev/null; git commit -m x"; do
+    b 0 "pass: wrap: descritor do redirecionamento não é argumento: $c" "$c"
+  done
+  for c in "cd $OTH 2>/dev/null && git commit -m x" "git -C $OTH commit -m x 2>/dev/null" "git -C $OTH tag 1 >/dev/null" "git -C $OTH branch -D 2 2>&1" "cd $OTH 2>&1; git commit -m x"; do
+    b 2 "wrap: o descritor some, o argumento que é número fica: $c" "$c"
+  done
+}
 g_cfg() {  # parecer de segurança do push da rodada 1: leitura que TRAZ configuração capaz de rodar programa (alias, pager, fsmonitor…) não é leitura
   local c
   for c in "git -C $OTH -c alias.log='!git commit -m x' log" "git -C $OTH -c core.pager='sh -c x' log" "git -C $OTH -c core.fsmonitor=/tmp/x status" \
@@ -323,6 +379,26 @@ json.dump(d, open(sys.argv[1], "w"))
 EOF
     python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: hook que só cita o arquivo (\`$fake\`) → falha"
   done
+  local mod  # o comando CERTO mas com um campo que muda QUANDO o hook dispara (o cross-clone-block do mini tinha "if": "Bash(git -C *)"): conferir só o `command` deixaria passar (gate ga-iczduy, rodada 2)
+  for mod in 'h["if"] = "Bash(git -C *)"' 'h["async"] = True' 'del h["type"]' 'h["type"] = "prompt"' 'g["if"] = "Bash(git -C *)"'; do
+    settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; python3 - "$s" "$mod" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for g in d["hooks"]["PreToolUse"]:
+    h = g["hooks"][0]
+    exec(sys.argv[2])
+json.dump(d, open(sys.argv[1], "w"))
+EOF
+    python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: hook com o comando certo e \`$mod\` → falha"
+  done
+  settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; python3 - "$s" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for g in d["hooks"]["PreToolUse"]:
+    g["hooks"][0]["timeout"] = 5
+json.dump(d, open(sys.argv[1], "w"))
+EOF
+  python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; ok $? "check: \`timeout\` no hook é só prazo, não muda quando dispara → ok"
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));d["disableAllHooks"]=True;json.dump(d,open(sys.argv[1],"w"))' "$s"
   python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: disableAllHooks ligado → falha"
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; local pd="$T/proj" cl; mkdir -p "$pd/.claude"
@@ -351,7 +427,7 @@ g_hook() {  # o comando que vai no settings do servidor
   c="python3-que-nao-existe -I $P || exit 2"; sh -c "$c" <<<"$js" >/dev/null 2>&1; [ $? = 2 ]; ok $? "hook: python ausente (127) vira 2"
 }
 
-all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group cfg && g_cfg; group tools && g_tools; group msg && g_msg
+all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; group cfg && g_cfg; group tools && g_tools; group msg && g_msg
         group check && g_check; group hook && g_hook; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
@@ -373,7 +449,7 @@ echo "== $((n-fails))/$n ok =="
   mutant block "realpath (symlink)" 's/os.path.realpath(os.path.join(cwd or "\/", p))/os.path.abspath(os.path.join(cwd or "\/", p))/'
   mutant block "-C não é seguido" 's/cwd, i = res(seg\[i + 1\], cwd), i + 2/i += 2/'
   mutant evade "cd não muda o diretório" 's/st\["cwd"\] = chdir(seg\[1:\], st\["cwd"\], c == "pushd")/pass/'
-  mutant evade "bash -c não é aberto" 's/return scan(seg\[j + 1\], cwd, terr, own, depth + 1)/pass/'
+  mutant evade "bash -c não é aberto" 's/return scan(script\[0\], cwd, terr, own, depth + 1)/pass/'
   mutant evade "eval não é aberto" 's/return scan(" ".join(seg\[1:\]), cwd, terr, own, depth + 1)/pass/'
   mutant evade "\$( ) não é aberto" 's/r = scan(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], terr, own, depth + 1)/r = None/'
   mutant evade "crase não vira \$( )" 's/cmd, out, i = BACKTICK.sub(r"$(\\1)", cmd), \[\], 0/cmd, out, i = cmd, [], 0/'
@@ -395,10 +471,10 @@ echo "== $((n-fails))/$n ok =="
   mutant check "selfcheck não exige '|| exit 2'" 's/\\s+\\|\\|\\s+exit\\s+2")/.*")/'
   mutant check "selfcheck ignora disableAllHooks" 's/if s.get("disableAllHooks"):/if False:/'
   mutant check "selfcheck ignora a camada do projeto" 's/for d in args\[1:\]:/for d in []:/'
-  mutant evade "opção de env/sudo que muda o diretório não deixa o guarda cego" 's/^\( *\)blind = blind or seg\[0\]\[:2\].*/\1pass/'
+  mutant evade "opção de env/sudo que muda o diretório não deixa o guarda cego" 's/^\( *\)blind = blind or name in chd$/\1pass/'
   mutant evade "export/declare não são lidos" 's/if c in ("export", "declare", "typeset"):/if False:/'
   mutant evade "VAR=x solta não vale para o git seguinte" 's/st\["env"\].update(env)  # /pass  # /'
-  mutant evade "VAR=x depois de env/sudo é descartada" 's/env\[m.group(1)\] = m.group(2)$/pass/'
+  mutant evade "VAR=x (solta ou depois de env/sudo) é descartada" 's/env\[m.group(1)\], seg = m.group(2), seg\[1:\]/seg = seg[1:]/'
   mutant evade "env -S (comando inteiro numa palavra) não é reaberto" 's/if " " in seg\[0\]:/if False:/'
   mutant evade "remote -v add vira leitura" 's/rest in (\[\], \["-v"\]) or/rest[:1] in ([], ["-v"]) or/'
   mutant evade "--output/--lost-found em comando de leitura" 's/    if any(WRITES.match(t) for t in rest):/    if False:/'
@@ -413,11 +489,11 @@ echo "== $((n-fails))/$n ok =="
   mutant shell "pushd sem argumento vira HOME" 's/ or (push and not args) or / or (False) or /'
   mutant shell "pushd +N / opção que não conheço vira diretório" 's/ or (args and args\[0\]\[:1\] in ("-", "+")):/ or False:/'
   mutant shell "<(cmd) engole o comando como se fosse alvo de redirecionamento" 's/^\( *\)skip = False  # `<(cmd)`.*/\1pass/'
-  mutant shell "lançador que não modelo (flock/ssh/su/trap…) vira comando comum" 's/        elif c in OPAQUE:/        elif False:/'
+  mutant shell "lançador que não modelo (flock/ssh/su/trap…) vira comando comum" 's/        elif c in OPAQUE or opq:/        elif False:/'
   mutant shell "git atrás de lançador herda o diretório conhecido" 's/{\*\*st\["env"\], \*\*env}, None, terr, own)/{**st["env"], **env}, cwd, terr, own)/'
   mutant shell "texto entre aspas passado ao lançador não é aberto" 's/                if re.search(r"\\s", t):/                if False:/'
   mutant shell "heredoc para bash/ssh/sh é descartado" 's/^    if any(runs_text(s.split()) for s in .*:$/    if False:/'
-  mutant shell "todo heredoc vira script" 's/^    return bool(s) and os.path.basename(s\[0\]) in .*/    return True/'
+  mutant shell "todo heredoc vira script" 's/^    return bool(s) and (opq or .*/    return True/'
   mutant shell "here-string para bash é ignorado" 's/            if herestr and runs_text(seg):/            if False:/'
   mutant shell "continuação de linha não é juntada" 's/hide(CONT.sub(r"\\1", HEREDOC.sub(heredoc, cmd)))/hide(HEREDOC.sub(heredoc, cmd))/'
   mutant shell "barra escapada + newline vira continuação" 's/^CONT = re.compile(.*)  #/CONT = re.compile(r"()\\\\\\n")  #/'
@@ -433,9 +509,28 @@ echo "== $((n-fails))/$n ok =="
   mutant cfg "GIT_CONFIG_* / GIT_PAGER / GIT_EXTERNAL_DIFF… não contam" 's/    runs = any(CFG_ENV.fullmatch(k) for k in env)/    runs = False/'
   mutant cfg "toda chave de -c vale como segura" 's/CFG_SAFE = re.compile(r"(?:color|advice)/CFG_SAFE = re.compile(r".*|(?:color|advice)/'
   mutant cfg "nenhuma chave de -c vale como segura (os controles que passam importam)" 's/CFG_SAFE = re.compile(r"(?:color|advice)/CFG_SAFE = re.compile(r"(?!)(?:color|advice)/'
+  mutant wrap "find -execdir/-okdir rodam no diretório do find (não ficam cegos)" 's/one(seg\[j + 1:\], blind or t.endswith("dir"))/one(seg[j + 1:], blind)/'
+  mutant wrap "o segundo -exec (primeira palavra do trecho depois do \;) não é aberto" 's/        elif c == "find" or c\[:1\] == "-":/        elif c == "find":/'
+  mutant wrap "opção que não conheço de embrulho vira opção sem argumento" 's/            if name not in flag | arg | joined:/            if False:/'
+  mutant wrap "sudo -n volta a levar argumento (a tabela única de antes)" 's/"-C -c -D -g -h -p -R -r -T -t -U -u --close-from/"-n -C -c -D -g -h -p -R -r -T -t -U -u --close-from/'
+  mutant wrap "-- não encerra as opções do embrulho" 's/        if t == "--":/        if False:/'
+  mutant wrap "env -S / --split-string não reabre o comando" 's/            if name in SPLIT:/            if False:/'
+  mutant wrap "nice -5 não é lido" 's/        elif w == "nice" and t\[1:\].isdigit():/        elif False:/'
+  mutant wrap "a duração do timeout não é descascada" 's/    if w == "timeout" and seg and NUM.fullmatch(seg\[0\]):/    if False:/'
+  mutant wrap "duração decimal do timeout (1.5) não é lida" 's/re.compile(r"\[\\d.\]+\[smhd\]?")/re.compile(r"\\d+[smhd]?")/'
+  mutant wrap "git --attr-source VALOR: o valor vira subcomando" 's/elif a in ("--namespace", "--attr-source") and i + 1 < len(seg):/elif a in ("--namespace",) and i + 1 < len(seg):/'
+  mutant wrap "opção de topo do git que não conheço não deixa o diretório 'não sei'" 's/                lost, cwd = True, None/                pass/'
+  mutant wrap "toda opção de topo do git vale como conhecida" 's/^GIT_FLAG = re.compile(r"-\[Phv\]|/GIT_FLAG = re.compile(r".*|-[Phv]|/'
+  mutant wrap "bash -c com opção depois do -c" 's/while len(script) > 1 and script\[0\]\[:1\] in ("-", "+"):/while False:/'
+  mutant wrap "o descritor de 2>/dev/null conta como argumento" 's/^FD = re.compile(.*)  #/FD = re.compile(r"(?!)")  #/'
+  mutant wrap "número com espaço antes do > (argumento!) é tratado como descritor" 's/\\d+(?=\[<>\])/\\d+\\s*(?=[<>])/'
+  mutant wrap "palavra do shell na posição do subcomando do git não esconde um -C" 's/    if SHELLY.search(sub):/    if False:/'
+  mutant check "selfcheck ignora campo extra do hook (if, async…)" 's/ and set(h) <= {"type", "command", "timeout"}//'
+  mutant check "selfcheck ignora campo extra do grupo" 's/ and set(g) <= {"matcher", "hooks"}//'
+  mutant check "selfcheck não exige type=command" 's/ and h.get("type") == "command"//'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
-  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,cfg,tools,msg,check" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,cfg,tools,msg,check" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }
