@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # prod-tests/gascity/story-ga-c0939v.2.sh — prod test for ga-c0939v.2 (slice 2/4 of ga-c0939v): the JSONL dump is uploaded to S3 every hour,
-# with a manifest, and the newest snapshot is fresh.
-#
-# Contents
-#   O que prova · O que NÃO prova · Estados
+# with a manifest, and the last verification is recent.
 #
 # "Merged" is not "live": this checks the DEPLOYED script/helper/order, that `gc order list` resolves the order, whether the
 # CONTROLLER has actually fired it, and what is really in S3 right now (latest.json via `--status`, plus its manifest).
@@ -14,8 +11,6 @@
 #
 # Estados (nunca dois): ok / fail / unproven. `--status` UNKNOWN (sem credencial, S3 fora, latest.json ilegível) nunca vira PASS limpo:
 #   sem o order ter disparado é "unproven" (um deploy novo ainda não chegou ao 1º tick de 1h); depois que disparou é FAIL.
-#
-# Called by run.sh after deploy (STORY_ID=ga-c0939v.2). Exits 0 on pass.
 
 set -uo pipefail
 
@@ -73,11 +68,11 @@ fi
 out="$(JHO_AWS="$AWS_BIN" _to 120 "$SCRIPT" --status 2>&1)"; rc=$?
 printf '%s\n' "$out" | sed 's/^/    /'
 case "$rc" in
-  0) log "latest.json is fresh ✓" ;;
+  0) log "last check is recent ✓ (checked_at < 2h30; the script only moves it while the exporter writes AND commits the databases — data_as_of is when the data last CHANGED)" ;;
   1) if [[ "$FIRED" == "0" ]]; then
        _unproven "latest.json is STALE but the order has not fired yet (a manual first upload is old)"
      else
-       fail "--status: latest.json is STALE although the order fired ($FIRED time(s), or its history is unreadable) — the hourly upload is not keeping up"
+       fail "--status: latest.json is STALE although the order fired ($FIRED time(s), or its history is unreadable) — the upload is not keeping up, or the exporter stopped (log: 'fonte parada')"
      fi ;;
   2) if [[ "$FIRED" == "0" ]]; then
        _unproven "--status UNKNOWN and the order has not fired yet (no first snapshot, or S3/credentials unreadable from here)"

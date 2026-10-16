@@ -1,18 +1,11 @@
 #!/bin/bash
 # jsonl-hourly-offsite.selftest.sh (ga-c0939v) — testes do jsonl-hourly-offsite.sh e do helper jsonl_hourly.py.
 #
-# Contents
-#   Escopo · Como rodar · Stub do aws · Cenários
-#
 # ESCOPO: hermético. `aws` é um stub que guarda "objetos" num diretório temporário e valida o sha256 como o S3 valida;
 #   `notify` é um stub que anota e imita o roteador real (sem push forçado vai ao digest, rc 12 sob saída estrita; só o forçado chega ao telefone). Repositórios
 #   git, estado e logs vivem em mktemp. Nenhuma rede, bd, dolt ou credencial, nada em ~/.aws, nada do S3 real. O helper python tem a própria suíte, chamada no fim.
 # COMO RODAR: /bin/bash jsonl-hourly-offsite.selftest.sh     (rc 0 = tudo passou; última linha `=== RESULT: PASS=n FAIL=n ===`)
 #   JHO_SCRIPT=/outro/jsonl-hourly-offsite.sh  roda a suíte contra uma cópia (é como se faz o teste de mutação: quebrar um guarda e ver cair).
-# CENÁRIOS: caminho feliz e layout das chaves · HEAD e não árvore de trabalho · latest.json por último · HEAD igual (só bate o ponto) ·
-#   objeto sumido · HEAD novo · snapshot broken não avança latest.json · banco obrigatório ausente · put/head/tamanho/checksum falhando ·
-#   S3 fora do ar (rc 2) · pouco disco · archive inválido · lock vivo e lock morto · alerta (2 seguidas, no máx. 1 a cada 6 h, zera no sucesso; só conta como
-#   enviado se chegou; rc 2 antes do lock e run morto contam) · retenção (e retenção falhando) · --status · modo biblioteca.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,6 +102,7 @@ if [ "${NOTIFY_FORCE_PUSH:-}" != 1 ]; then [ "${NOTIFY_STRICT_EXIT:-}" = 1 ] && 
 echo "$*" >> "${NOTIFY_LOG%.log}.pushed"
 STUB
 chmod +x "$WORK/bin/notify"
+mkdir -p "$WORK/gitbin"; printf '#!/bin/bash\ncase " $* " in *" diff "*) [ -n "${GIT_FAIL_DIFF:-}" ] && exit 128 ;; esac\nexec %s "$@"\n' "$(command -v git)" > "$WORK/gitbin/git"; chmod +x "$WORK/gitbin/git"   # git que falha só no diff (GIT_FAIL_DIFF=1)
 # helper embrulhado (JHO_PY): repassa tudo ao real; WRAP=db_string estraga .databases do manifest, WRAP=retention_fail derruba o `retention`
 cat > "$WORK/bin/wrap.py" <<WRAP
 import json, os, subprocess, sys
@@ -142,11 +136,13 @@ new_env() { # nome — cria archive git com hq (2 issues) e wa (1), e zera bucke
 }
 commit_all() { GIT add -A >/dev/null && GIT commit -q -m "${1:-change}"; }
 NOW_OFF=0
-offsite() { # args... ; env extra via prefixo `env`; define OUT, ERR, RC
+offsite() { # args... ; env extra via prefixo `env`; define OUT, RC
+  # exporter vivo: reescreve os bancos na hora do relógio de mentira (mtime); SRC_STOP=n => parou n s depois de T0
+  python3 -I -c 'import glob,os,sys;t=int(sys.argv[1]);[os.utime(p,(t,t)) for p in glob.glob(sys.argv[2]+"/*/issues.jsonl")]' $((T0 + (${SRC_STOP:-$NOW_OFF} < NOW_OFF ? ${SRC_STOP:-$NOW_OFF} : NOW_OFF))) "$ARCH"
   OUT="$(JHO_ARCHIVE="$ARCH" JHO_STATE_DIR="${STATE_OVR:-$S/state}" JHO_LOG="$S/log/offsite.log" JHO_AWS="${AWS_BIN:-$WORK/bin/aws}" JHO_NOTIFY="${NOTIFY_BIN:-$WORK/bin/notify}" \
         STUB_DIR="$S/bucket" NOTIFY_LOG="$S/notify.log" JHO_REQUIRED_DBS="${REQ:-hq,wa}" JHO_NOW=$((T0 + NOW_OFF)) JHO_S3_TIMEOUT=60 JHO_MIN_FREE_MB=1 \
         "$SCRIPT" "$@" 2>"$S/stderr")"
-  RC=$?; ERR="$(cat "$S/stderr")"
+  RC=$?
 }
 objs()  { ( cd "$S/bucket/obj" 2>/dev/null && find . -type f | sed 's|^\./||' | sort ); }
 count_objs() { objs | grep -c "$1" || true; }
@@ -163,21 +159,15 @@ echo "bash: ${BASH_VERSION}"
 [ -x "$SCRIPT" ] && ok "script presente e executável" || { bad "script ausente: $SCRIPT"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
 check "bash -n" bash -n "$SCRIPT"
 
-# ── 0. modo biblioteca ───────────────────────────────────────────────────────────────────────────
 echo "-- 0. modo biblioteca"
 S="$WORK/lib"; mkdir -p "$S/state"
 lib() { ( export JHO_LIB=1 JHO_STATE_DIR="$S/state" JHO_LOG="$S/log" JHO_AWS="$WORK/bin/aws" STUB_DIR="$S/bucket"; . "$SCRIPT" >/dev/null 2>&1; "$@" ); }
 check "lib: funções definidas, nada executado (sem estado, sem lock, sem chamada ao aws)" bash -c "[ ! -e '$S/state/jsonl-hourly-offsite-state.json' ] && [ ! -d '$S/state/jsonl-hourly-offsite.lock.d' ] && [ ! -e '$S/bucket/calls.log' ]"
 eq "sha256_b64 do sha256 de ''" "$(lib sha256_b64 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855)" "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
 lib sizes_match 5 5 && ok "sizes_match 5 5" || bad "sizes_match 5 5"
-lib sizes_match "" "" && bad "sizes_match '' '' deveria falhar (vazio não é igual a vazio)" || ok "sizes_match '' '' falha"
-lib sizes_match 5 6 && bad "sizes_match 5 6" || ok "sizes_match 5 6 falha"
-lib sizes_match a a && bad "sizes_match a a" || ok "sizes_match a a (não numérico) falha"
-lib sizes_match "" 5 && bad "sizes_match '' 5" || ok "sizes_match '' 5 falha"
+for p in "'' ''" "5 6" "a a" "'' 5"; do eval "lib sizes_match $p" && bad "sizes_match $p deveria falhar" || ok "sizes_match $p falha"; done   # vazio não é igual a vazio; não numérico não é número
 
-# ── 1. caminho feliz ────────────────────────────────────────────────────────────────────────────
-echo "-- 1. caminho feliz (com lixo e bancos de benchmark no archive, árvore de trabalho suja)"
-new_env happy
+echo "-- 1. caminho feliz (com lixo e bancos de benchmark no archive, árvore de trabalho suja)"; new_env happy
 printf '%s' "$(tbl hq-1 hq-2)" > "$ARCH/hq.jsonl"                      # cópia legada da raiz
 echo garbage > "$ARCH/hq/issues.jsonl.tmp.123"                         # sobra de export abortado, commitada
 write_db bench_hq_copy b-1; : > "$ARCH/bench_hq_copy/config.jsonl"; : > "$ARCH/bench_hq_copy/metadata.jsonl"   # o que reprovou o 1º upload real
@@ -186,8 +176,7 @@ commit_all "com lixo"
 HEAD_SHA="$(GIT rev-parse HEAD)"
 write_db hq hq-1 hq-2 hq-3                                              # árvore de trabalho adiantada e NÃO commitada
 offsite
-eq "rc 0" "$RC" 0
-case "$OUT" in "RESULT: ok new"*) ok "RESULT: ok new" ;; *) bad "RESULT: ok new (obtido: $OUT / $ERR)" ;; esac
+eq "rc 0, RESULT: ok new" "$RC:${OUT%% key=*}" "0:RESULT: ok new"
 eq "3 objetos: snapshot, manifest, latest.json" "$(objs | wc -l | tr -d ' ')" 3
 ART="$(ARTKEY)"
 echo "$ART" | grep -Eq '^jsonl-hourly/snap/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}\.tar\.gz$' && ok "chave do snapshot no formato esperado" || bad "chave do snapshot: $ART"
@@ -219,52 +208,40 @@ eq "estado: consecutive_not_ok 0, last_success_sha = HEAD" "$(jqf '[.consecutive
 [ -z "$(ls -A "$S/state/jsonl-hourly-work" 2>/dev/null)" ] && ok "diretório de trabalho limpo ao sair" || bad "work dir ficou: $(ls "$S/state/jsonl-hourly-work")"
 FIRST_ART="$ART"
 
-# ── 2. HEAD igual: só bate o ponto ─────────────────────────────────────────────────────────────
 echo "-- 2. HEAD igual ao último verificado"
 NOW_OFF=600; offsite
-eq "rc 0" "$RC" 0
-case "$OUT" in "RESULT: ok unchanged"*) ok "RESULT: ok unchanged" ;; *) bad "esperava unchanged (obtido: $OUT / $ERR)" ;; esac
+eq "rc 0, RESULT: ok unchanged" "$RC:${OUT%% key=*}" "0:RESULT: ok unchanged"
 eq "nenhum snapshot novo (continua 1 tar.gz)" "$(count_objs '\.tar\.gz$')" 1
 eq "latest.json: checked_at andou (heartbeat)" "$(jqf .checked_at "$LJ")" "$(python3 -I -c 'import datetime,sys;print(datetime.datetime.fromtimestamp(int(sys.argv[1]),datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' $((T0 + 600)))"
 eq "latest.json: snapshot_key intacto" "$(jqf .snapshot_key "$LJ")" "$FIRST_ART"
 
-# ── 3. HEAD igual, mas o objeto sumiu do S3 ─────────────────────────────────────────────────────
 echo "-- 3. HEAD igual e objeto sumido"
 rm -f "$S/bucket/obj/$FIRST_ART" "$S/bucket/meta/$FIRST_ART"
 NOW_OFF=700; offsite
-eq "rc 0 e re-upload" "$RC:$(count_objs '\.tar\.gz$')" "0:1"
-case "$OUT" in "RESULT: ok new"*) ok "RESULT: ok new (não confiou no estado local)" ;; *) bad "esperava new (obtido: $OUT / $ERR)" ;; esac
-[ "$(ARTKEY)" != "$FIRST_ART" ] && ok "chave nova (stamp diferente)" || bad "mesma chave"
+eq "rc 0 e re-upload com chave nova (RESULT: ok new: não confiou no estado local)" "$RC:$(count_objs '\.tar\.gz$'):${OUT%% key=*}:$([ "$(ARTKEY)" != "$FIRST_ART" ] && echo newkey)" "0:1:RESULT: ok new:newkey"
 
-# ── 4. HEAD novo ─────────────────────────────────────────────────────────────────────────────────
 echo "-- 4. HEAD novo"
 write_db hq hq-1 hq-2 hq-3; commit_all "hq-3"
 NOW_OFF=1400; offsite
 eq "rc 0, RESULT new" "$RC:${OUT%% key=*}" "0:RESULT: ok new"
 eq "latest.json avançou para o snapshot novo (hq=3)" "$(jqf '[.snapshot_key == "'"$(ARTKEY)"'", .issues_per_db.hq] | join(",")' "$LJ")" "true,3"
 
-# ── 5. S3 fora do ar no head-object do ponto (não sei) ──────────────────────────────────────────
 echo "-- 5. S3 não responde (rc 2)"
 NOW_OFF=2100; PUTS_BEFORE="$(putlog | wc -l | tr -d ' ')"
 inject fail_head_generic
 offsite
-eq "rc 2" "$RC" 2
-case "$OUT" in "RESULT: unknown"*) ok "RESULT: unknown" ;; *) bad "esperava unknown (obtido: $OUT)" ;; esac
-eq "nada foi escrito" "$(putlog | wc -l | tr -d ' ')" "$PUTS_BEFORE"
-eq "estado: consecutive_not_ok 1" "$(jqf .consecutive_not_ok "$ST")" 1
+eq "rc 2, RESULT: unknown" "$RC:${OUT:0:15}" "2:RESULT: unknown"
+eq "nada foi escrito e o estado conta 1 não-ok" "$(putlog | wc -l | tr -d ' '):$(jqf .consecutive_not_ok "$ST")" "$PUTS_BEFORE:1"
 clear_inject fail_head_generic
 NOW_OFF=2200; offsite
 eq "S3 de volta: rc 0 e contador zerado" "$RC:$(jqf .consecutive_not_ok "$ST")" "0:0"
 
-# ── 6. snapshot broken não avança latest.json ──────────────────────────────────────────────────
 echo "-- 6. snapshot broken (tabela de banco obrigatório truncada)"
 GOOD_LATEST="$(jqf .snapshot_key "$LJ")"
 objs > "$S/objs.before"; PUTS_BEFORE="$(putlog | wc -l | tr -d ' ')"
 printf '{"rows":[{"id":"wa-1","title":"t"},{"id":"wa-2","ti' > "$ARCH/wa/issues.jsonl"; commit_all "wa truncado"
 NOW_OFF=3000; offsite
-eq "rc 1" "$RC" 1
-case "$OUT" in "RESULT: fail"*) ok "RESULT: fail" ;; *) bad "esperava fail (obtido: $OUT)" ;; esac
-case "$OUT" in *"NADA subiu"*) ok "a mensagem diz que nada subiu" ;; *) bad "mensagem sem 'NADA subiu': $OUT" ;; esac
+eq "rc 1, RESULT: fail, a mensagem diz que nada subiu" "$RC:${OUT:0:12}:$(printf '%s' "$OUT" | grep -c 'NADA subiu')" "1:RESULT: fail:1"
 eq "snapshot broken NÃO sobe: nenhum put novo" "$(putlog | wc -l | tr -d ' ')" "$PUTS_BEFORE"
 eq "e o conjunto de objetos no bucket é exatamente o de antes" "$(objs | diff - "$S/objs.before" >/dev/null && echo same || echo changed)" same
 grep -q 'problema: wa/issues.jsonl' "$S/log/offsite.log" && ok "o log nomeia o problema (wa/issues.jsonl), linha por linha" || bad "log sem 'problema: wa/issues.jsonl': $(tail -3 "$S/log/offsite.log")"
@@ -274,19 +251,13 @@ printf '%s' "$(tbl wa-1)" > "$ARCH/wa/issues.jsonl"; commit_all "wa ok"
 NOW_OFF=3600; offsite
 eq "arquivo consertado: rc 0, latest.json avança, contador zera" "$RC:$(jqf .consecutive_not_ok "$ST"):$([ "$(jqf .snapshot_key "$LJ")" != "$GOOD_LATEST" ] && echo moved)" "0:0:moved"
 
-# ── 7. banco obrigatório ausente (primeiro run: latest.json nem existe) ─────────────────────────
-echo "-- 7. banco obrigatório ausente"
-new_env nodb; REQ="hq,wa,fantasma"
+echo "-- 7. banco obrigatório ausente"; new_env nodb; REQ="hq,wa,fantasma"
 NOW_OFF=0; offsite
-eq "rc 1" "$RC" 1
-[ ! -e "$(LATEST)" ] && ok "latest.json não foi criado" || bad "latest.json existe depois de run broken"
-eq "nada subiu: bucket vazio, nenhum put" "$(objs | wc -l | tr -d ' '):$(putlog | wc -l | tr -d ' ')" "0:0"
+eq "rc 1, latest.json não criado, nada subiu: bucket vazio, nenhum put" "$RC:$([ -e "$(LATEST)" ] && echo has || echo none):$(objs | wc -l | tr -d ' '):$(putlog | wc -l | tr -d ' ')" "1:none:0:0"
 grep -q 'banco obrigatório fantasma ausente' "$S/log/offsite.log" && ok "o log diz qual banco obrigatório faltou" || bad "log sem o banco ausente"
 REQ=""
 
-# ── 7b. lista de bancos ignorados ──────────────────────────────────────────────────────────────
-echo "-- 7b. bancos ignorados (JHO_IGNORE_DBS)"
-new_env ign
+echo "-- 7b. bancos ignorados (JHO_IGNORE_DBS)"; new_env ign
 write_db bench_hq_copy b-1; : > "$ARCH/bench_hq_copy/config.jsonl"; : > "$ARCH/bench_hq_copy/metadata.jsonl"; commit_all "lixo"
 JHO_IGNORE_DBS="" offsite
 eq "ignore desligado de propósito (JHO_IGNORE_DBS vazio): o mesmo archive vira broken, rc 1, nada sobe" "$RC:$(objs | wc -l | tr -d ' ')" "1:0"
@@ -305,17 +276,13 @@ new_env keymm; NOW_OFF=0; offsite   # latest.json passa a apontar para OUTRO sna
 jq '.snapshot_key = "jsonl-hourly/snap/outro.tar.gz"' "$(LATEST)" > "$S/l.json" && cp "$S/l.json" "$(LATEST)"; NOW_OFF=600; offsite
 eq "latest.json de outro snapshot: não bate o ponto em cima dele, republica" "${OUT%% key=*}:$(jqf .snapshot_key "$(LATEST)" | grep -c outro)" "RESULT: ok new:0"
 
-# ── 8. falhas de upload ─────────────────────────────────────────────────────────────────────────
-echo "-- 8. falhas de upload (todas fail-closed)"
-new_env putfail; inject fail_put
+echo "-- 8. falhas de upload (todas fail-closed)"; new_env putfail; inject fail_put
 offsite
-eq "put falha: rc 1" "$RC" 1
-eq "put falha: nada no bucket, estado sem sucesso" "$(objs | wc -l | tr -d ' '):$(jqf '.last_success_sha // "none"' "$ST"):$(jqf .consecutive_not_ok "$S/state/jsonl-hourly-offsite-state.json")" "0:none:1"
+eq "put falha: rc 1, nada no bucket, estado sem sucesso" "$RC:$(objs | wc -l | tr -d ' '):$(jqf '.last_success_sha // "none"' "$ST"):$(jqf .consecutive_not_ok "$ST")" "1:0:none:1"
 clear_inject fail_put
 new_env lastfail; inject fail_put latest.json
 offsite
-eq "só latest.json falha: rc 1, artefato e manifest subiram, latest.json não existe" "$RC:$(objs | wc -l | tr -d ' '):$([ -e "$(LATEST)" ] && echo has || echo none)" "1:2:none"
-eq "e last_success não foi gravado" "$(jqf '.last_success_sha // "none"' "$S/state/jsonl-hourly-offsite-state.json")" none
+eq "só latest.json falha: rc 1, artefato e manifest subiram, latest.json não existe, last_success não gravado" "$RC:$(objs | wc -l | tr -d ' '):$([ -e "$(LATEST)" ] && echo has || echo none):$(jqf '.last_success_sha // "none"' "$ST")" "1:2:none:none"
 clear_inject fail_put; NOW_OFF=100; offsite
 eq "sem a injeção: refaz o upload (não toma o run anterior por sucesso) e fecha" "$RC:$([ -e "$(LATEST)" ] && echo has || echo none)" "0:has"
 
@@ -345,13 +312,9 @@ echo hello > "$S/body"; BAD64="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 STUB_DIR="$S/bucket" "$WORK/bin/aws" s3api put-object --bucket b --key k --body "$S/body" --checksum-sha256 "$BAD64" >/dev/null 2>&1 && bad "stub aceitou checksum errado (o stub tem que poder reprovar)" || ok "o stub recusa checksum errado, como o S3"
 [ ! -e "$S/bucket/obj/k" ] && ok "e não guarda o objeto recusado" || bad "stub guardou objeto recusado"
 
-# ── 9. pré-voo: tudo rc 2, sem tocar no S3 ──────────────────────────────────────────────────────
-echo "-- 9. pré-voo inerte"
-new_env lowdisk
+echo "-- 9. pré-voo inerte"; new_env lowdisk
 OUT="$(JHO_ARCHIVE="$ARCH" JHO_STATE_DIR="$S/state" JHO_LOG="$S/log/offsite.log" JHO_AWS="$WORK/bin/aws" JHO_NOTIFY="$WORK/bin/notify" STUB_DIR="$S/bucket" NOTIFY_LOG="$S/notify.log" JHO_MIN_FREE_MB=999999999 JHO_NOW=$T0 "$SCRIPT" 2>"$S/stderr")"; RC=$?
-eq "pouco disco: rc 2" "$RC" 2
-[ ! -e "$S/bucket/calls.log" ] && ok "pouco disco: nenhuma chamada ao aws" || bad "chamou o aws com pouco disco"
-case "$OUT" in "RESULT: unknown"*) ok "pouco disco: RESULT unknown" ;; *) bad "pouco disco: $OUT" ;; esac
+eq "pouco disco: rc 2, RESULT unknown, nenhuma chamada ao aws" "$RC:${OUT:0:15}:$([ -e "$S/bucket/calls.log" ] && echo called || echo none)" "2:RESULT: unknown:none"
 new_env notrepo; rm -rf "$ARCH/.git"; offsite
 eq "archive que não é repo git: rc 2, sem aws" "$RC:$([ -e "$S/bucket/calls.log" ] && echo called || echo none)" "2:none"
 new_env nocommit; rm -rf "$ARCH/.git"; git init -q "$ARCH"; offsite
@@ -359,14 +322,11 @@ eq "repo sem commit: rc 2, sem aws" "$RC:$([ -e "$S/bucket/calls.log" ] && echo 
 offsite --nao-existe
 eq "argumento inválido: rc 3" "$RC" 3
 
-# ── 10. lock ─────────────────────────────────────────────────────────────────────────────────────
-echo "-- 10. lock"
-new_env lock
+echo "-- 10. lock"; new_env lock
 sleep 120 & BG_PID=$!
 mkdir -p "$S/state/jsonl-hourly-offsite.lock.d"; echo "$BG_PID" > "$S/state/jsonl-hourly-offsite.lock.d/pid"
 offsite
-eq "lock com dono vivo: rc 0, silêncio, nada enviado" "$RC:$([ -e "$S/bucket/calls.log" ] && echo called || echo none)" "0:none"
-[ -d "$S/state/jsonl-hourly-offsite.lock.d" ] && [ "$(cat "$S/state/jsonl-hourly-offsite.lock.d/pid")" = "$BG_PID" ] && ok "e NÃO apagou o lock do outro run" || bad "apagou o lock de um run vivo"
+eq "lock com dono vivo: rc 0, silêncio, nada enviado, e NÃO apagou o lock do outro run" "$RC:$([ -e "$S/bucket/calls.log" ] && echo called || echo none):$([ "$(cat "$S/state/jsonl-hourly-offsite.lock.d/pid" 2>/dev/null)" = "$BG_PID" ] && echo kept || echo gone)" "0:none:kept"
 kill "$BG_PID" 2>/dev/null; wait "$BG_PID" 2>/dev/null; BG_PID=""
 offsite
 eq "lock de dono morto: reclamado, run completa" "$RC:$(count_objs '\.tar\.gz$')" "0:1"
@@ -377,9 +337,7 @@ eq "lock SEM pid e recém-criado (o outro run ainda está começando): rc 0, nad
 touch -t 202001010000 "$S/state/jsonl-hourly-offsite.lock.d"; offsite
 eq "lock sem pid e velho (mais de 1 min): reclamado, run completa" "$RC:$(count_objs '\.tar\.gz$')" "0:1"
 
-# ── 11. alerta ──────────────────────────────────────────────────────────────────────────────────
-echo "-- 11. alerta por falhas seguidas"
-new_env alert
+echo "-- 11. alerta por falhas seguidas"; new_env alert
 printf '{"rows":[{"id":"hq-1"' > "$ARCH/hq/issues.jsonl"; commit_all "quebrado"
 NOW_OFF=0; offsite;   eq "falha 1: rc 1, sem alerta" "$RC:$(wc -l < "$S/notify.log" | tr -d ' ')" "1:0"
 NOW_OFF=900; offsite; eq "falha 2: rc 1, 1 alerta" "$RC:$(wc -l < "$S/notify.log" | tr -d ' ')" "1:1"
@@ -413,9 +371,7 @@ eq "run anterior morto (timeout do order, kill, reboot) conta: com a falha de ag
 NOW_OFF=900; offsite
 eq "a tentativa fechou: o run morto não é recontado" "$(grep -c 'run anterior não terminou' "$S/log/offsite.log")" 1
 
-# ── 12. retenção ─────────────────────────────────────────────────────────────────────────────────
-echo "-- 12. retenção"
-new_env ret
+echo "-- 12. retenção"; new_env ret
 seed_stems() { python3 -I - "$S/bucket" "$T0" <<'PYEOF'
 import datetime, os, sys
 root, t0 = sys.argv[1], int(sys.argv[2])
@@ -474,19 +430,46 @@ WRAP=db_string JHO_PY="$WORK/bin/wrap.py" offsite
 eq "latest.json que não monta: rc 1 e nenhum latest.json no bucket (nem um vazio)" "$RC:$([ -e "$(LATEST)" ] && echo has || echo none)" "1:none"
 case "$OUT" in "RESULT: fail não montei latest.json"*) ok "e o RESULT diz que não montou" ;; *) bad "esperava 'fail não montei latest.json' (obtido: $OUT)" ;; esac
 
-# ── 13. --status ─────────────────────────────────────────────────────────────────────────────────
-echo "-- 13. --status"
-new_env status
+echo "-- 13. --status"; new_env status
 NOW_OFF=0; offsite
 NOW_OFF=1800; offsite --status; eq "30 min depois: rc 0, STATUS: OK" "$RC:${OUT%% *}:$(echo "$OUT" | awk '{print $2}')" "0:STATUS::OK"
-NOW_OFF=$((3 * 3600)); offsite --status; eq "3 h depois: rc 1, STALE" "$RC:$(echo "$OUT" | awk '{print $2}')" "1:STALE"
-echo "$OUT" | grep -q 'data_as_of=' && ok "STATUS diz até quando o dado enxerga" || bad "STATUS sem data_as_of: $OUT"
+NOW_OFF=$((3 * 3600)); offsite --status; eq "3 h depois: rc 1, STALE, e o STATUS diz até quando o dado enxerga" "$RC:$(echo "$OUT" | awk '{print $2}'):$(echo "$OUT" | grep -c 'data_as_of=')" "1:STALE:1"
 printf '{"snapshot_key":"x"}' > "$(LATEST)"
 offsite --status; eq "latest.json sem checked_at/data_as_of: rc 2, UNKNOWN" "$RC:$(echo "$OUT" | awk '{print $2}')" "2:UNKNOWN"
 rm -f "$(LATEST)"; offsite --status; eq "sem latest.json: rc 2, UNKNOWN" "$RC:$(echo "$OUT" | awk '{print $2}')" "2:UNKNOWN"
 inject fail_get; NOW_OFF=0; offsite --status; eq "S3 falhando na leitura: rc 2, UNKNOWN (não dá OK nem STALE)" "$RC:$(echo "$OUT" | awk '{print $2}')" "2:UNKNOWN"
+new_env fut; NOW_OFF=0; offsite; jq '.checked_at = "2999-01-01T00:00:00Z"' "$(LATEST)" > "$S/l.json" && cp "$S/l.json" "$(LATEST)"
+offsite --status; eq "checked_at no futuro: rc 2, UNKNOWN (idade negativa não é OK)" "$RC:$(echo "$OUT" | awk '{print $2}')" "2:UNKNOWN"
 
-# ── 14. helper python ────────────────────────────────────────────────────────────────────────────
+# ── 13b. fonte parada x fonte ociosa ─────────────────────────────────────────────────────────────
+# HEAD velho NÃO é exporter parado (ele só comita quando o dado muda: 7 intervalos > 6 h em 12 dias, com ele rodando); parado = não reescreve os bancos (mtime). Parado ou ilegível: sem "ponto batido".
+echo "-- 13b. fonte parada x fonte ociosa"; new_env idle; NOW_OFF=0; offsite
+NOW_OFF=$((7 * 3600)); offsite; r1="$RC:${OUT%% key=*}"; offsite --status
+eq "exporter ocioso (HEAD de 7 h, mas ele reescreve os bancos): unchanged, STATUS OK, sem alerta" "$r1:$(echo "$OUT" | awk '{print $2}'):$(pushed)" "0:RESULT: ok unchanged:OK:0"
+new_env srcdead; SRC_STOP=0; NOW_OFF=0; offsite
+NOW_OFF=$((5 * 3600)); offsite; C5="$(jqf .checked_at "$(LATEST)")"
+eq "exporter parado há 5 h (< 6 h): ainda dentro da folga, rc 0" "$RC:$(jqf .consecutive_not_ok "$ST")" "0:0"
+NOW_OFF=$((7 * 3600)); offsite
+eq "parado há 7 h: rc 1, fail fonte parada, conta 1, latest.json sem checked_at novo" "$RC:${OUT:0:25}:$(jqf .consecutive_not_ok "$ST"):$([ "$(jqf .checked_at "$(LATEST)")" = "$C5" ] && echo same)" "1:RESULT: fail fonte parada:1:same"
+NOW_OFF=$((8 * 3600)); offsite
+eq "2ª seguida: conta 2 e o alerta chega ao telefone nomeando a fonte" "$(jqf .consecutive_not_ok "$ST"):$(pushed):$(grep -c 'fonte parada' "$S/notify.pushed")" "2:1:1"
+offsite --status; eq "STATUS: STALE (o checked_at não andou)" "$RC:$(echo "$OUT" | awk '{print $2}')" "1:STALE"
+write_db hq hq-1 hq-2 hq-3; commit_all "hq-3"; NOW_OFF=$((9 * 3600)); offsite
+eq "HEAD novo com o exporter parado: o snapshot sobe, mas rc 1, fail fonte parada e a contagem não zera" "$RC:${OUT:0:25}:$(count_objs '\.tar\.gz$'):$(jqf .consecutive_not_ok "$ST")" "1:RESULT: fail fonte parada:2:3"
+unset SRC_STOP
+new_env stuckc; NOW_OFF=0; offsite; write_db hq hq-1 hq-2 hq-3   # o exporter ESCREVE (mtime novo) e não comita: árvore adiante do HEAD
+NOW_OFF=$((5 * 3600)); offsite; C5="$(jqf .checked_at "$(LATEST)")"; r1="$RC"
+NOW_OFF=$((7 * 3600)); offsite
+eq "escreve e não comita: 5 h (< 6 h) ainda ok; 7 h: rc 1, fail fonte parada, conta 1, checked_at parado" "$r1:$RC:${OUT:0:25}:$(jqf .consecutive_not_ok "$ST"):$([ "$(jqf .checked_at "$(LATEST)")" = "$C5" ] && echo same)" "0:1:RESULT: fail fonte parada:1:same"
+NOW_OFF=$((8 * 3600)); offsite
+eq "2ª seguida: conta 2 e o alerta chega ao telefone dizendo que não comita" "$(jqf .consecutive_not_ok "$ST"):$(pushed):$(grep -c 'não comita' "$S/notify.pushed")" "2:1:1"
+commit_all "hq-3"; NOW_OFF=$((9 * 3600)); offsite
+eq "o exporter volta a comitar (árvore = HEAD): snapshot novo, rc 0, conta zera" "$RC:${OUT%% key=*}:$(jqf .consecutive_not_ok "$ST")" "0:RESULT: ok new:0"
+new_env gitdiff; NOW_OFF=0; offsite; NOW_OFF=$((7 * 3600)); GIT_FAIL_DIFF=1 PATH="$WORK/gitbin:$PATH" offsite
+eq "git diff falha (HEAD de 7 h): não sei, e não sei não é vivo: rc 1, fail fonte parada" "$RC:${OUT:0:25}:$(printf '%s' "$OUT" | grep -c 'comparar a árvore')" "1:RESULT: fail fonte parada:1"
+new_env nomtime; NOW_OFF=0; offsite; rm -f "$ARCH/wa/issues.jsonl"; NOW_OFF=600; offsite
+eq "sem como ler quando o exporter escreveu (arquivo ausente): não vale como vivo, rc 1" "$RC:${OUT:0:25}" "1:RESULT: fail fonte parada"
+
 echo "-- 14. helper python (suíte própria)"
 if [ -n "${JHO_SKIP_PYSUITE:-}" ]; then
   # só para a campanha de mutantes do SHELL (a suíte python tem a campanha dela); numa rodada normal isto nunca é ligado

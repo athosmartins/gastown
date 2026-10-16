@@ -1,15 +1,12 @@
 #!/bin/bash
 # jsonl-hourly-offsite.sh (ga-c0939v) — sobe, a cada hora, o dump JSONL do jsonl-export.sh ao S3, com manifest e verificação.
 #
-# Contents
-#   Por quê · O que sobe · Garantias · Estados e códigos de saída · Retenção · Alerta · Modo --status · Costuras de teste
+# POR QUÊ: todos os backups do city eram diários (S3 04:00, DoltHub 03:30, restic 04:47) = RPO 24 h. O jsonl-export.sh já arquiva o dump de todos os bancos
+#   (medido em 14-16/10: um run a cada 27 min, mediana; máx 189) num repo git LOCAL; o espelho que existia (dolt-s3-backup.sh, `aws s3 sync --delete`) roda uma vez
+#   por noite e copia a árvore no meio de uma escrita. Meta do Athos (15/10): perder no máximo 1 h de beads. Este script é a metade "upload"; a metade "dá para
+#   restaurar" é o jsonl-hourly-restore.sh — SEM a prova de restore, um objeto no S3 não conta como RPO.
 #
-# POR QUÊ: todos os backups do city eram diários (S3 04:00, DoltHub 03:30, restic 04:47) = RPO 24 h. O jsonl-export.sh já arquiva o dump de todos os bancos a
-#   cada ~15-30 min num repo git LOCAL; o espelho que existia (dolt-s3-backup.sh, `aws s3 sync --delete`) roda uma vez por noite e copia a árvore no meio de
-#   uma escrita. Meta do Athos (15/10): perder no máximo 1 h de beads. Este script é a metade "upload"; a metade "dá para restaurar" é o
-#   jsonl-hourly-restore.sh — SEM a prova de restore, um objeto no S3 não conta como RPO.
-#
-# O QUE SOBE (medido em 16/10: ~570 MB de árvore, 122 MB gzip, ~14 s de CPU; tudo bem abaixo do limite de 5 GB do put-object)
+# O QUE SOBE (medido em 16/10: ~430 MB de árvore, ~75 MB gzip, build ~4 min com nice 15; tudo bem abaixo do limite de 5 GB do put-object)
 #   jsonl-hourly/snap/<AAAAMMDDTHHMMSSZ>-<sha12 do HEAD>.tar.gz           <db>/<tabela>.jsonl de TODOS os bancos
 #   jsonl-hourly/snap/<AAAAMMDDTHHMMSSZ>-<sha12>.manifest.json             contagens lidas DO ARTEFATO, sha256 por tabela, data_as_of
 #   jsonl-hourly/latest.json                                               ponteiro para o último snapshot que passou em TUDO; escrito por último
@@ -21,15 +18,17 @@
 #   - integridade do upload: put-object leva o sha256 calculado aqui (--checksum-sha256); o S3 recusa o objeto se os bytes
 #     que chegaram não batem, e o head-object tem que devolver o mesmo tamanho E o mesmo sha256. Sem isso, o snapshot não vira "latest".
 #   - legibilidade: as contagens do manifest vêm de LER o .tar.gz final tabela por tabela (o caminho que o restore percorre). Tabela ilegível, banco (não
-#     ignorado) sem alguma das 6 tabelas ou banco obrigatório ausente => "broken": NADA sobe (122 MB/h de snapshot inutilizável é custo e ocuparia o piso da
+#     ignorado) sem alguma das 6 tabelas ou banco obrigatório ausente => "broken": NADA sobe (75 MB/h de snapshot inutilizável é custo e ocuparia o piso da
 #     retenção), latest.json NÃO anda, os problemas vão para o log e o run sai 1. Um banco REAL quebrado também veta (fail-closed): o acoplamento é o preço de
 #     nunca anunciar como "latest" um snapshot que não restaura.
-#   - NÃO garante que o restore funcione: quem prova isso é jsonl-hourly-restore.sh, rodado de verdade (docs/runbooks/jsonl-hourly-offsite.md).
-#   - RPO real = idade do dump na captura + 60 min + duração do run (pior caso ~1h40, detalhe no order e no runbook); `data_as_of` diz até quando o snapshot enxerga.
+#   - RPO real = intervalo entre runs do exporter + 60 min + duração do run: típico ~1h35, pior medido ~4h15 (runbook). `data_as_of` é quando o dado MUDOU (cidade ociosa o envelhece).
 #
-# ESTADOS (três, e o neutro é inerte): rc 0 = snapshot novo verificado, ou HEAD igual ao último verificado cujo objeto ainda existe (só atualiza `checked_at`) ·
-#   rc 1 = falhou ou ficou "broken" · rc 2 = não deu para avaliar (sem aws/git/python3/jq, archive ilegível, pouco disco, estado sem como gravar): nada foi
-#   tentado e conta como run sem snapshot · rc 3 = uso. Outro run em andamento (lock vivo) => rc 0 em silêncio.
+# ESTADOS (três, e o neutro é inerte): rc 0 = snapshot novo verificado, ou HEAD igual ao último verificado, objeto ainda no S3 e exporter vivo (só atualiza `checked_at`) ·
+#   rc 1 = falhou, ficou "broken" ou FONTE PARADA: o exporter não reescreve os bancos obrigatórios (mtime de <db>/issues.jsonl) há mais de JHO_STALE_SOURCE_S (6 h), ou escreve e não
+#   comita (árvore adiante de um HEAD com mais de 6 h), ou isso não foi lido => não bate o ponto (`checked_at` fica, o --status vira STALE) e conta para o alerta; HEAD novo ainda sobe,
+#   sem zerar a contagem. HEAD velho com a árvore igual NÃO é fonte parada: o exporter só comita quando o dado muda (7 intervalos > 6 h em 12 dias, até 10 h 22, com ele rodando) ·
+#   rc 2 = não deu para avaliar (sem aws/git/python3/jq, archive ilegível, pouco disco, estado sem como gravar): nada foi tentado e conta como run sem snapshot ·
+#   rc 3 = uso. Outro run em andamento (lock vivo) => rc 0 em silêncio.
 #
 # RETENÇÃO (só no prefixo jsonl-hourly/snap/, só no formato exato de chave; depois do snapshot novo verificado):
 #   últimas JHO_KEEP_RECENT_H (48) horas + o 1º snapshot de cada dia UTC até JHO_KEEP_DAILY_DAYS (14) + os JHO_KEEP_FLOOR (6) mais novos + o apontado por
@@ -39,7 +38,7 @@
 #   `notify` com NOTIFY_FORCE_PUSH=1 NOTIFY_STRICT_EXIT=1 (sem o force o roteador manda esta fonte ao digest mudo: rc 0, nada no telefone). Só rc 0 conta como entregue:
 #   grava last_alert_epoch (no máx. 1 a cada JHO_ALERT_EVERY_S, 6 h) e loga "alerta enviado"; senão loga AVISO e o run seguinte tenta de novo.
 #   Sem como gravar o estado, avisa sem esperar o 2º run e, sem registro do último aviso, a cada run: nunca mudo.
-# MODO --status: lê latest.json do S3 e diz há quanto tempo o script bateu o ponto e até quando o dado enxerga (rc 0 vivo, 1 velho, 2 sem leitura).
+# MODO --status: lê latest.json do S3: há quanto tempo o script bateu o ponto (OK < 2h30 => o exporter escrevia naquela hora) e quando o dado mudou (rc 0 OK, 1 STALE, 2 sem leitura ou futuro).
 #
 # COSTURAS DE TESTE: JHO_LIB=1 só define funções; JHO_ARCHIVE, JHO_STATE_DIR, JHO_LOG, JHO_AWS, JHO_NOTIFY, JHO_NOW (epoch) apontam para fixtures.
 set -uo pipefail
@@ -73,7 +72,7 @@ REQUIRED_DBS="${JHO_REQUIRED_DBS:-hq,whatsapp_automation}"
 # artefato e não vetam o snapshot. `-` e não `:-`: JHO_IGNORE_DBS="" (vazio) desliga de propósito. Um obrigatório que case com o padrão => broken.
 IGNORE_DBS="${JHO_IGNORE_DBS-bench_*,fixdepkeys_*}"
 STATUS_MAX_CHECK_AGE_S="${JHO_STATUS_MAX_CHECK_AGE_S:-9000}"   # 2h30: dois ciclos horários + folga
-STALE_SOURCE_S="${JHO_STALE_SOURCE_S:-21600}"                  # HEAD do archive mais velho que 6 h => aviso (exporter parado ou ocioso)
+STALE_SOURCE_S="${JHO_STALE_SOURCE_S:-21600}"                  # exporter sem reescrever os bancos obrigatórios há mais de 6 h => fonte parada (medido: runs a cada 27 min, máx 189)
 # ga-tyaozh: sem isso o aws-cli embrulha o corpo num AwsChunkedWrapper que não rebobina e aborta o retry (mesma razão do dolt-s3-backup.sh)
 export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
 
@@ -168,7 +167,7 @@ MODE="run"
 case "${1:-}" in
   --status) MODE="status" ;;
   "") ;;
-  -h|--help) sed -n '2,44p' "${BASH_SOURCE[0]}"; exit 0 ;;
+  -h|--help) sed -n '2,/^set -uo/{/^set -uo/!p;}' "${BASH_SOURCE[0]}"; exit 0 ;;
   *) echo "uso: jsonl-hourly-offsite.sh [--status]" >&2; exit 3 ;;
 esac
 
@@ -195,6 +194,7 @@ import datetime,sys
 def ep(s): return int(datetime.datetime.strptime(s,"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp())
 now=int(sys.argv[3]); print(now-ep(sys.argv[1]), now-ep(sys.argv[2]))' "$checked" "$asof" "$(now_epoch)")" || { echo "STATUS: UNKNOWN datas ilegíveis"; exit 2; }
   check_age="${ages% *}"; asof_age="${ages#* }"
+  [ "$check_age" -ge 0 ] || { echo "STATUS: UNKNOWN checked_at no futuro (${check_age}s)"; exit 2; }   # idade negativa não é "recente"
   if [ "$check_age" -le "$STATUS_MAX_CHECK_AGE_S" ]; then verdict=OK; rc=0; else verdict=STALE; rc=1; fi
   echo "STATUS: $verdict checked_at=$checked (há ${check_age}s) data_as_of=$asof (há ${asof_age}s) snapshot=$(jq -r '.snapshot_key' "$tmp")"
   exit $rc
@@ -244,13 +244,28 @@ SHA12="${SHA:0:12}"
 STAMP="$(stamp_now)"
 STEM="$STAMP-$SHA12"
 HEAD_AGE=$(( $(now_epoch) - HEAD_EPOCH ))
-[ "$HEAD_AGE" -gt "$STALE_SOURCE_S" ] && log "AVISO: o HEAD do archive tem ${HEAD_AGE}s (> ${STALE_SOURCE_S}s): exporter parado, ou nada mudou desde então"
+# O exporter só comita quando o dado muda: HEAD velho NÃO é exporter parado (medido: 7 intervalos > 6 h em 12 dias, até 10 h 22, com ele rodando).
+# Vivo = reescreveu os bancos obrigatórios (mtime de <db>/issues.jsonl; vale o mais velho). vazio/ilegível/ausente → não sei, e não sei não é vivo; falhou → idem.
+SRC_WHY=""; SRC_EPOCH="$(python3 -I -c 'import os,sys;print(min(int(os.stat(os.path.join(sys.argv[1],d,"issues.jsonl")).st_mtime) for d in sys.argv[2].split(",")))' "$ARCHIVE" "$REQUIRED_DBS" 2>/dev/null)"
+case "$SRC_EPOCH" in
+  ""|*[!0-9]*) SRC_WHY="não li quando o exporter escreveu os bancos obrigatórios ($REQUIRED_DBS)" ;;
+  *) SRC_AGE=$(( $(now_epoch) - SRC_EPOCH )); [ "$SRC_AGE" -le "$STALE_SOURCE_S" ] || SRC_WHY="o exporter não reescreve os bancos obrigatórios há ${SRC_AGE}s (> ${STALE_SOURCE_S}s; HEAD de há ${HEAD_AGE}s)" ;;
+esac
+# Escrever não é comitar: com a árvore do archive ADIANTE do HEAD e o HEAD velho o exporter escreve e não comita (16/10: runs mortos em ~5 min, 16 arquivos sujos, HEAD parado há 7 h 30).
+# Árvore = HEAD é ocioso, ok. git diff: 0 igual · 1 adiante · outro (falhou) → não sei, e não sei não é vivo.
+if [ -z "$SRC_WHY" ] && [ "$HEAD_AGE" -gt "$STALE_SOURCE_S" ]; then
+  IFS=, read -r -a DBV <<< "$REQUIRED_DBS"; git -C "$ARCHIVE" diff --quiet HEAD -- "${DBV[@]}" 2>/dev/null
+  case $? in 0) ;; 1) SRC_WHY="o exporter escreve mas não comita: a árvore do archive está adiante do HEAD, que tem ${HEAD_AGE}s (> ${STALE_SOURCE_S}s)" ;; *) SRC_WHY="não consegui comparar a árvore do archive com o HEAD" ;; esac
+fi
+[ -z "$SRC_WHY" ] || log "AVISO: fonte parada: $SRC_WHY"
+fail() { log "FALHOU: $*"; register_not_ok "$*"; echo "RESULT: fail $*"; exit 1; }
 
 # ── HEAD igual ao último verificado e o objeto ainda existe: só bate o ponto ───────────────────────
 LAST_SHA="$(state_get '.last_success_sha' '')"; LAST_KEY="$(state_get '.last_success_key' '')"
 if [ "$LAST_SHA" = "$SHA" ] && [ -n "$LAST_KEY" ]; then
   s3_head "$LAST_KEY" >/dev/null; hrc=$?
   if [ $hrc -eq 0 ]; then
+    [ -z "$SRC_WHY" ] || fail "fonte parada: $SRC_WHY"   # bater o ponto diria "verificado agora"; sem checked_at novo o --status vira STALE sozinho
     LAST_STEM="$(basename "${LAST_KEY%.tar.gz}")"
     cur="$(mktemp "$WD/latest.XXXXXX")"
     # vazio/sem snapshot_key/de outro snapshot → não bate o ponto, vai para o snapshot novo; falhou/ilegível → idem (nunca reescreve um latest.json que não é o nosso)
@@ -272,7 +287,6 @@ if [ "$LAST_SHA" = "$SHA" ] && [ -n "$LAST_KEY" ]; then
 fi
 
 # ── build: git archive do HEAD -> tar.gz filtrado ──────────────────────────────────────────────────
-fail() { log "FALHOU: $*"; register_not_ok "$*"; echo "RESULT: fail $*"; exit 1; }
 log "snapshot $STEM (HEAD $SHA12, dado de há ${HEAD_AGE}s)"
 set -o pipefail
 ( git -C "$ARCHIVE" archive --format=tar "$SHA" | nice -n 15 "$TIMEOUT_BIN" "$BUILD_TIMEOUT" python3 -I "$PY" build --out "$WD/snap.tar.gz" --files-out "$WD/files.json" --ignore-db "$IGNORE_DBS" ) > "$WD/build.out" 2> "$WD/build.err" \
@@ -288,7 +302,7 @@ mrc=$?
 VERDICT="$(jq -r '.verdict' "$WD/manifest.json")"
 ART_SHA="$(jq -r '.artifact.sha256' "$WD/manifest.json")"; ART_BYTES="$(jq -r '.artifact.bytes' "$WD/manifest.json")"
 sizes_match "$ART_BYTES" "$(wc -c < "$WD/snap.tar.gz" | tr -d ' ')" || fail "bytes do manifest != bytes do arquivo"
-# broken não sobe NADA: ~122 MB por hora de um snapshot declarado inutilizável não é "cópia a mais", é custo e ruído, e ocuparia o piso da
+# broken não sobe NADA: ~75 MB por hora de um snapshot declarado inutilizável não é "cópia a mais", é custo e ruído, e ocuparia o piso da
 # retenção no lugar de um bom. Os problemas inteiros vão para o log (o alerta leva o começo); a próxima hora tenta de novo com o HEAD seguinte.
 if [ "$VERDICT" != ok ] || [ $mrc -ne 0 ]; then
   jq -r '.problems[]' "$WD/manifest.json" 2>/dev/null | while IFS= read -r pb; do log "problema: $pb"; done
@@ -307,7 +321,8 @@ jq -n --arg key "$ART" --arg mkey "$(s3key_manifest "$STEM")" --arg sha "$ART_SH
 LSHA="$(python3 -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$WD/latest.json")"
 s3_put_verified "$(s3key_latest)" "$WD/latest.json" "$LSHA" application/json || fail "upload de latest.json não verificou"
 
-state_update '.consecutive_not_ok = 0 | .attempt_open = false | .last_success_at = $t | .last_success_sha = $s | .last_success_key = $k | .last_success_bytes = $b | .last_success_data_as_of = $a' \
+ZERO='.consecutive_not_ok = 0 | '; [ -z "$SRC_WHY" ] || ZERO=""   # fonte parada: o upload valeu, mas a contagem de não-ok não zera
+state_update "$ZERO"'.attempt_open = false | .last_success_at = $t | .last_success_sha = $s | .last_success_key = $k | .last_success_bytes = $b | .last_success_data_as_of = $a' \
   --arg t "$(iso_now)" --arg s "$SHA" --arg k "$ART" --argjson b "$ART_BYTES" --arg a "$(jq -r '.data_as_of' "$WD/manifest.json")" || log "AVISO: estado não gravado"
 DUR=$(( $(now_epoch) - START ))
 log "OK $STEM: $ART_BYTES bytes, $(jq -r '[.databases | to_entries[] | .value.issues] | add' "$WD/manifest.json") issues em $(jq -r '.databases | length' "$WD/manifest.json") bancos (ignorados: $(jq -r '.ignored_dbs | join(",") | if . == "" then "nenhum" else . end' "$WD/manifest.json")), ${DUR}s"
@@ -330,5 +345,6 @@ if listing="$(s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PREFIX/snap/" 
 else
   log "AVISO: retenção pulada (list-objects-v2 falhou ou veio ilegível)"
 fi
+[ -z "$SRC_WHY" ] || fail "fonte parada: $SRC_WHY (snapshot novo subiu: key=$ART)"
 echo "RESULT: ok new key=$ART bytes=$ART_BYTES head_age_s=$HEAD_AGE dur_s=$DUR"
 exit 0
