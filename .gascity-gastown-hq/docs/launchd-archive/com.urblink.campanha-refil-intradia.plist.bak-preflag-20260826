@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  wa-wfeui — refil INTRADIÁRIO da fila de campanha.
+
+  O laço de campanha só rodava 1x/dia (20:15, com.urblink.campanha-diaria).
+  O worker drena o lote em minutos e a fila fica ociosa o resto do dia, mesmo
+  com capacidade sobrando. Este job roda o MESMO laço em mais 4 horários.
+
+  NASCE INERTE, DE PROPÓSITO. O script só faz algo se a variável
+  CAMPANHA_REFIL_INTRADIA valer 1. Enquanto ela for 0 (o default abaixo),
+  cada disparo sai imediatamente com código 0, sem abrir banco e sem rede.
+  Ligar acelera gasto Assertiva e exposição de ban, então é decisão do Athos,
+  não do agendador: trocar o 0 por 1 aqui e recarregar.
+
+  Segurança preservada por construção: reusa o mesmo caminho da rodada das
+  20:15, com o mesmo high-water-mark (se a fila ainda está cheia, a rodada
+  devolve 'ja_tem_fila' e não enfileira nada) e o mesmo orçamento de
+  enriquecimento guiado por gap.
+
+  Carregar:
+    launchctl load -w ~/Library/LaunchAgents/com.urblink.campanha-refil-intradia.plist
+  Logs: /tmp/campanha_refil_intradia.{log,err}
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.urblink.campanha-refil-intradia</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/whatsapp_automation/scripts/campanha_diaria_loop.py</string>
+    <string>--intraday</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key>
+      <integer>8</integer>
+      <key>Minute</key>
+      <integer>15</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>11</integer>
+      <key>Minute</key>
+      <integer>15</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>14</integer>
+      <key>Minute</key>
+      <integer>15</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>17</integer>
+      <key>Minute</key>
+      <integer>15</integer>
+    </dict>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/tmp/campanha_refil_intradia.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/campanha_refil_intradia.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>CAMPANHA_REFIL_INTRADIA</key>
+    <string>0</string>
+  </dict>
+</dict>
+</plist>

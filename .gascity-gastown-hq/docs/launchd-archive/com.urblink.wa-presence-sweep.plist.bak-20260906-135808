@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.urblink.wa-presence-sweep</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/athos/gt/whatsapp_automation/venv/bin/python3</string>
+        <string>/Users/athos/gt/whatsapp_automation/scripts/wa_presence_sweep.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/athos/gt/whatsapp_automation</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONPATH</key>
+        <string>/Users/athos/gt/whatsapp_automation</string>
+
+        <!-- wa-9b7br (Athos, 03/09): varredura sai do horario de envio e vai
+             pra madrugada. A janela 21h->06h CRUZA A MEIA-NOITE — quem trata
+             isso e is_active_window()/night_start() em
+             lib/wa_presence_sweep_targets.py; trocar estes numeros sem aquele
+             fix desligaria a varredura em silencio (21 <= h < 6 e sempre
+             falso). Teto 500->1500/dia aprovado por ele na mesma conversa. -->
+        <key>WA_PRESENCE_SWEEP_HOUR_START</key>
+        <string>21</string>
+        <key>WA_PRESENCE_SWEEP_HOUR_END</key>
+        <string>6</string>
+        <key>WA_PRESENCE_SWEEP_DAILY_CAP</key>
+        <string>900</string>
+        <key>WA_PRESENCE_SWEEP_BATCH_SIZE</key>
+        <string>45</string>
+    </dict>
+
+    <!-- wa-9b7br: 1800s->900s. Com 9h de janela sao 36 tiques; 36 x
+         BATCH_SIZE(45) = 1620 de teto fisico, acima do DAILY_CAP de 1500 que
+         e quem realmente limita. Carregar o volume na FREQUENCIA (mais lotes
+         pequenos) em vez de no TAMANHO do lote e a escolha mais segura contra
+         deteccao de abuso. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/gt/whatsapp_automation/logs/wa_presence_sweep.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/gt/whatsapp_automation/logs/wa_presence_sweep.err.log</string>
+</dict>
+</plist>

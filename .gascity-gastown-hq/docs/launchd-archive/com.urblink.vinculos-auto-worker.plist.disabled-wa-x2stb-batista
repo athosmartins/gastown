@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PropertyList-1.0.dtd" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.urblink.vinculos-auto-worker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/athos/gt/whatsapp_automation/launchd/vinculos-auto-worker-wrapper.sh</string>
+    </array>
+
+    <!-- wa-gydgq: teto diário local é 20 chamadas (~R$4,00); a cada 30 min dá
+         48 chances/dia de gastar 1 chamada — folga de sobra sobre o volume real
+         (medido: ~1-2 CPFs novos/dia + backlog de 69 a drenar em poucos dias),
+         sem a urgência do call-identity-worker (que reage a ligação recebida,
+         wa-cuk7o) — aqui não há SLA de latência, só "não deixar acumular". -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/gt/whatsapp_automation/logs/vinculos_auto_worker.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/gt/whatsapp_automation/logs/vinculos_auto_worker.err.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/athos/gt/whatsapp_automation</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- ~/.local/bin traz o `secret` (tokens do provedor vêm do Bitwarden,
+             nunca hardcoded); /opt/homebrew/bin traz o `flock` do lock de
+             instância. Sem este PATH pinado o launchd roda com um ambiente
+             mínimo em que os dois somem — mesmo idioma do call-identity-worker. -->
+        <key>PATH</key>
+        <string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+    </dict>
+</dict>
+</plist>

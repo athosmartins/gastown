@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.urblink.warming-engine</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/athos/gt/whatsapp_automation/venv/bin/python</string>
+		<string>/Users/athos/gt/whatsapp_automation/scripts/run_warming_engine.py</string>
+		<string>--live</string>
+		<string>--loop</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/warming_engine_err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/warming_engine.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/athos/gt/whatsapp_automation</string>
+</dict>
+</plist>

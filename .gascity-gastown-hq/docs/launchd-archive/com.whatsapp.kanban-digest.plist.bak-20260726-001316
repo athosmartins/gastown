@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whatsapp.kanban-digest</string>
+
+    <!-- wa-tdx5: runs the CANONICAL script from the repo root worktree (was a
+         hand-copied ~/.local/bin/notification_digest.py that silently drifted).
+         The script uses only stdlib + absolute paths, so no PYTHONPATH needed;
+         it does shell out to notify/notify-rich/secret/sqlite3, so ~/.local/bin
+         leads PATH (same pattern as com.whatsapp.channel-registry-sync). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/athos/gt/whatsapp_automation/scripts/notification_digest.py</string>
+        <string>--since-min</string>
+        <string>720</string>
+        <string>--send</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/athos/gt/whatsapp_automation</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+    </dict>
+
+    <!-- wa-tdx5: 2x/dia (manhã + noite, BRT) em vez de horário. O painel cobre a
+         janela de 12h (--since-min 720) e entrega SILENCIOSO (p1) — alertas
+         acionáveis chegam em tempo real pelos próprios emissores via notify
+         always-push, não dependem deste snapshot. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/kanban_digest.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/kanban_digest_err.log</string>
+</dict>
+</plist>

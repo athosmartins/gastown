@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>SWEEP_CYCLE_SEC</key>
+		<string>1800</string>
+		<key>SWEEP_MAX_CHATS</key>
+		<string>20</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.urblink.inbound-sweep</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/athos/gt/whatsapp_automation/venv/bin/python</string>
+		<string>/Users/athos/gt/whatsapp_automation/crew/oracle/daemons/inbound_sweep.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/inbound_sweep_err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/inbound_sweep.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/athos/gt/whatsapp_automation/crew/oracle</string>
+</dict>
+</plist>

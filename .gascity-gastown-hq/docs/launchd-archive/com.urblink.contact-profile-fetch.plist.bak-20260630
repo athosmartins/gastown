@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  contact_profile_fetch daemon (wa-dgxy) — wire lib/contact_profile_fetcher into
+  production: read each contact's REAL WhatsApp push-name from the on-device Info
+  screen into contact_profiles.display_name (which conversation_monitor already
+  prefers via lookup_real_display_name). Sweep + one-at-a-time-per-device,
+  lock-aware (honors the warming-engine device lock), strictly READ-ONLY on chats.
+
+  FLAG-GATED: the daemon is a no-op until chip_features `contact_profile_fetch`
+  is enabled in /Users/athos/shared/config/chip_features.json, so loading this job
+  is safe and changes nothing in production until Athos flips the switch.
+
+  Install (when Athos is ready):
+    cp daemons/launchd/com.urblink.contact-profile-fetch.plist ~/Library/LaunchAgents/
+    launchctl unload ~/Library/LaunchAgents/com.urblink.contact-profile-fetch.plist 2>/dev/null
+    launchctl load   ~/Library/LaunchAgents/com.urblink.contact-profile-fetch.plist
+  Enable the feature:
+    (edit chip_features.json: "contact_profile_fetch": {"enabled": true, ...})
+    optionally scope to safe devices: "devices": ["RXCT1013CTH", "0079807463"]
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.urblink.contact-profile-fetch</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/athos/gt/whatsapp_automation/venv/bin/python</string>
+		<string>/Users/athos/gt/whatsapp_automation/crew/oracle/daemons/contact_profile_fetch_daemon.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/contact_profile_fetch_err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/contact_profile_fetch.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/athos/gt/whatsapp_automation/crew/oracle</string>
+</dict>
+</plist>

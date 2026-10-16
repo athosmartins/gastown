@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>INBOUND_CAPTURE_POLL_SEC</key>
+		<string>30</string>
+		<key>INBOUND_CAPTURE_ADB_TIMEOUT</key>
+		<string>15</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.urblink.inbound-capture</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/athos/gt/whatsapp_automation/venv/bin/python</string>
+		<string>/Users/athos/gt/whatsapp_automation/crew/oracle/daemons/inbound_capture.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/inbound_capture_err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/inbound_capture.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/athos/gt/whatsapp_automation/crew/oracle</string>
+</dict>
+</plist>

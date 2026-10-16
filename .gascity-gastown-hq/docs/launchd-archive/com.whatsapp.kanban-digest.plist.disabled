@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whatsapp.kanban-digest</string>
+
+    <!-- wa-tdx5: runs the CANONICAL script from the repo root worktree (was a
+         hand-copied ~/.local/bin/notification_digest.py that silently drifted).
+         The script uses only stdlib + absolute paths, so no PYTHONPATH needed;
+         it does shell out to notify/notify-rich/secret/sqlite3, so ~/.local/bin
+         leads PATH (same pattern as com.whatsapp.channel-registry-sync). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/athos/gt/whatsapp_automation/scripts/notification_digest.py</string>
+        <string>--since-min</string>
+        <string>90</string>
+        <string>--send</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/athos/gt/whatsapp_automation</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+    </dict>
+
+    <!-- wa-f53j6 (2026-07-26): HORÁRIO nas horas ativas (07-23h BRT), não 2x/dia.
+         O Athos pediu o digest de hora em hora de volta — em 2x/dia o canal-resumo
+         quase morreu e todo o resto "precisava" empurrar. Janela de 90min (since-min 90)
+         cobre a hora + folga de 30min (evita gap se um run atrasar por sleep da máquina).
+         Entrega SILENCIOSA (p1) — não vibra; alertas acionáveis chegam em tempo real pela
+         allowlist do notify. Agendamento nas horas ativas pra o sono do Athos ficar quieto. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>22</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/kanban_digest.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/kanban_digest_err.log</string>
+</dict>
+</plist>

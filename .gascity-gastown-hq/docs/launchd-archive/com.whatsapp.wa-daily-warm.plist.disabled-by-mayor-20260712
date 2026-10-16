@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.whatsapp.wa-daily-warm</string>
+<key>ProgramArguments</key><array>
+  <string>/Users/athos/gt/whatsapp_automation/venv/bin/python</string>
+  <string>/Users/athos/.config/wa-warm/daily_warm.py</string>
+</array>
+<key>StartCalendarInterval</key><dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>15</integer></dict>
+<key>StandardOutPath</key><string>/Users/athos/.config/wa-warm/warm.log</string>
+<key>StandardErrorPath</key><string>/Users/athos/.config/wa-warm/warm.err.log</string>
+<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin</string></dict>
+</dict></plist>

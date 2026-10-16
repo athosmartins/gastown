@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  inbound_voice_transcriber daemon (wa-8yz7t) — transcribe INBOUND on-device voice notes.
+
+  FLAG-GATED: the daemon is a no-op until chip_features `inbound_voice_transcription`
+  is enabled in /Users/athos/shared/config/chip_features.json, so loading this job is
+  safe and changes nothing in production until Athos flips the switch.
+
+  Install (when Athos is ready):
+    cp daemons/launchd/com.urblink.inbound-voice-transcriber.plist ~/Library/LaunchAgents/
+    launchctl unload ~/Library/LaunchAgents/com.urblink.inbound-voice-transcriber.plist 2>/dev/null
+    launchctl load   ~/Library/LaunchAgents/com.urblink.inbound-voice-transcriber.plist
+  Enable the feature:
+    (edit chip_features.json: "inbound_voice_transcription": {"enabled": true, ...})
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.urblink.inbound-voice-transcriber</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/athos/gt/whatsapp_automation/venv/bin/python</string>
+		<string>/Users/athos/gt/whatsapp_automation/crew/oracle/daemons/inbound_voice_transcriber_daemon.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/inbound_voice_transcriber_err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/inbound_voice_transcriber.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/athos/gt/whatsapp_automation/crew/oracle</string>
+</dict>
+</plist>

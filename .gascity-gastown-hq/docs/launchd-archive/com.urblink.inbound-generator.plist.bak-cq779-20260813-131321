@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  inbound-generator (wa-8rp) — LIVE.
+
+  Seed file: /Users/athos/shared/config/inbound_seed_urls.txt
+  (re-read every cycle, one URL per line, # = comment).
+  Cap: INBOUND_DAILY_CAP per day (default 10).
+
+  Uses /Users/athos/gt/whatsapp_automation/venv/bin/python (has Playwright).
+  /opt/homebrew/bin/python3.11 does NOT have playwright — wrong python here
+  causes ModuleNotFoundError on form submission.
+
+  Load:
+    launchctl load ~/Library/LaunchAgents/com.urblink.inbound-generator.plist
+  Unload:
+    launchctl unload ~/Library/LaunchAgents/com.urblink.inbound-generator.plist
+  Kill switch (no reload): export INBOUND_KILL=1 (or set in EnvironmentVariables and reload)
+  Pause without unloading: flip INBOUND_DRY_RUN to "1" and reload.
+  Dashboard: http://127.0.0.1:8200/  (public: https://inbound.urblink.com.br)
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.urblink.inbound-generator</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/athos/gt/whatsapp_automation/venv/bin/python</string>
+    <string>/Users/athos/gt/whatsapp_automation/daemons/inbound_generator.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/whatsapp_automation</string>
+  <key>StandardOutPath</key>
+  <string>/tmp/inbound_generator.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/inbound_generator_err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>INBOUND_KILL</key>
+    <string>0</string>
+    <key>INBOUND_DRY_RUN</key>
+    <string>0</string>
+    <key>INBOUND_DAILY_CAP</key>
+    <string>10</string>
+    <key>INBOUND_HEADLESS</key>
+    <string>1</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>

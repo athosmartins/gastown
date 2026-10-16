@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.whatsapp.peter-deploy-watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/private/tmp/claude-501/-Users-athos-gt-whatsapp-automation-crew-peter/2f99ada3-25e8-451d-8b3b-751f0928dfd8/scratchpad/deploy_watcher.sh</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/peter_deploy_watch.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/peter_deploy_watch.err</string>
+</dict>
+</plist>

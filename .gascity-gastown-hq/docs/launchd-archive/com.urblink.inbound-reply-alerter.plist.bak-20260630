@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  inbound_reply_alerter daemon (wa-chn9f) — "never sleep on the job".
+
+  For EVERY on-device inbound reply from a real outreach contact (NOT a warming
+  chip, NOT a form-fill broker lead), this daemon CLASSIFIES (reusing the
+  notebook_classifier), generates a DRAFT (reusing response_draft_generator),
+  JUDGES it (reusing auto_send_judge / Claude), and fires a LOUD alert to Athos
+  (notify -> ntfy topic athos-claude-code-x7k9m2p4) listing who replied, the
+  inbound text, the classification + intent, and the proposed draft.
+
+  This closes the "dormindo no ponto" gap: the Whapi auto-response pipeline at
+  :8086 is blind to on-device chats, and the form-fill autocontinue silo only
+  answers form-fill leads (with the fake persona, no classify, no alert). This
+  daemon is the never-miss net for outreach replies.
+
+  SAFE POSTURE:
+   * CONFIRM mode by default — alert only, sends NOTHING.
+   * FLAG-GATED: NO-OP until chip_features `inbound_reply_alerter` is enabled in
+     /Users/athos/shared/config/chip_features.json — loading this job is safe and
+     changes nothing until the switch is flipped (after reviewing the catch-up
+     pass, which surfaces the backlog of any previously-missed replies).
+   * UNATTENDED auto-send is a SEPARATE flag (`inbound_reply_autosend`, default
+     OFF) requiring an intent allowlist + judge `aprovado` + the on-device path.
+
+  Install (when oracle/Athos are ready):
+    cp daemons/launchd/com.urblink.inbound-reply-alerter.plist ~/Library/LaunchAgents/
+    launchctl unload ~/Library/LaunchAgents/com.urblink.inbound-reply-alerter.plist 2>/dev/null
+    launchctl load   ~/Library/LaunchAgents/com.urblink.inbound-reply-alerter.plist
+  Enable the feature:
+    (edit chip_features.json: "inbound_reply_alerter": {"enabled": true, ...})
+  Dry test before activating:
+    comando exato na chave DryRunCommand abaixo — hífen duplo é ilegal dentro de comentário XML (plutil aceita, plistlib rejeita; wa-z0e2g/wa-ldpng)
+-->
+<plist version="1.0">
+<dict>
+	<key>DryRunCommand</key>
+	<string>venv/bin/python daemons/inbound_reply_alerter.py --once -v --dry-notify</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.urblink.inbound-reply-alerter</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/athos/gt/whatsapp_automation/venv/bin/python</string>
+		<string>/Users/athos/gt/whatsapp_automation/daemons/inbound_reply_alerter.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/inbound_reply_alerter_err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/inbound_reply_alerter.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/athos/gt/whatsapp_automation</string>
+</dict>
+</plist>

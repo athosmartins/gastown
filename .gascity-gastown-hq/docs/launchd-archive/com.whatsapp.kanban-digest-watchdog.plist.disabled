@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whatsapp.kanban-digest-watchdog</string>
+
+    <!-- wa-tdx5: runs the CANONICAL watchdog from the repo root worktree (was a
+         hand-copied ~/.local/bin/notify_digest_watchdog.sh). ~/.local/bin leads
+         PATH so notify + sqlite3 resolve. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/athos/gt/whatsapp_automation/scripts/notify_digest_watchdog.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/athos/gt/whatsapp_automation</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+    </dict>
+
+    <!-- wa-tdx5: checks ~20min after each 2x/dia digest (08:00 / 20:00). With
+         MAX_AGE_MIN=90 the fresh digest is ~20min old (OK); a missed run leaves
+         the last digest ~12h old (>90) → emergency push. Coupled to the digest
+         cadence above — keep both in sync. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>20</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/kanban_digest_watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/kanban_digest_watchdog_err.log</string>
+</dict>
+</plist>

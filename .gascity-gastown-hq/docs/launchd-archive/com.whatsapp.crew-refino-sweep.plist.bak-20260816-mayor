@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whatsapp.crew-refino-sweep</string>
+
+    <!-- wa-3czz2: sweep noturno demand-driven/nudge-first. Roda o script canônico
+         do repo root (stdlib-only; shella bd/gc/notify, que resolvem city+port a
+         partir do WorkingDirectory = rig root). ~/.local/bin lidera o PATH p/
+         notify/bd; /opt/homebrew/bin traz gc/python3. SEM force: o guard de
+         janela 00h-06h no próprio script cobre re-fire em wake-from-sleep. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/athos/gt/whatsapp_automation/scripts/crew_refino_sweep.py</string>
+    </array>
+
+    <!-- 1x/noite à meia-noite (BRT). Se a máquina estava dormindo, launchd dispara
+         o job perdido no wake; o guard 00h-06h do script decide se ainda roda. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>0</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/athos/gt/whatsapp_automation</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+        <key>BEADS_ACTOR</key>
+        <string>crew-refino-sweep</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/shared/logs/crew_refino_sweep_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/shared/logs/crew_refino_sweep_stderr.log</string>
+</dict>
+</plist>

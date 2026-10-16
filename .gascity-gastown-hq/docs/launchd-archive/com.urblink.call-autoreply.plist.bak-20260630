@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  call_autoreply daemon (wa-0s8ry) — missed-call auto-reply.
+
+  When a real person CALLS one of our WARMING or FORM-FILL chips (warming +
+  form-fill activity makes people call) and there is no human to answer, this
+  daemon AUTO-SENDS one WhatsApp message inviting the caller to continue the
+  conversation here — in the chip's own persona. It detects the on-device call
+  notification rows in conversation_history.db (message_text like "Ligação de voz
+  recebida" / "Ligação de voz perdida" / "(Chamada de voz perdida)", capture_source
+  notification/sweep/sweep_history), dedups so each call => at most ONE reply, and
+  sends via device_human_sender.reply_to_existing_chat (search + title-verify +
+  text only).
+
+  SAFE POSTURE:
+   * FLAG-GATED: NO-OP until chip_features `call_autoreply` is enabled in
+     /Users/athos/shared/config/chip_features.json — loading this job is safe and
+     changes nothing until the switch is flipped.
+   * LLM-ALWAYS: the reply is DeepSeek-generated; if the LLM is unavailable we SKIP
+     (never template).
+   * PERSONA-CORRECT: warming => invented person (NEVER Athos/Urblink); form-fill
+     => the buyer persona. Personas live in the editable shared/config/call_autoreply.yaml.
+   * NEVER notifies Athos — auto-replies silently (his rule for inbound/warming).
+   * OUTREACH chips are excluded (handled by inbound_reply_alerter).
+
+  Install (when oracle/Athos are ready):
+    cp daemons/launchd/com.urblink.call-autoreply.plist ~/Library/LaunchAgents/
+    launchctl unload ~/Library/LaunchAgents/com.urblink.call-autoreply.plist 2>/dev/null
+    launchctl load   ~/Library/LaunchAgents/com.urblink.call-autoreply.plist
+  Enable the feature:
+    (edit chip_features.json: "call_autoreply": {"enabled": true, ...})
+  Dry test before activating (generates, does NOT send):
+    comando exato na chave DryRunCommand abaixo — hífen duplo é ilegal dentro de comentário XML (plutil aceita, plistlib rejeita; wa-z0e2g/wa-ldpng)
+-->
+<plist version="1.0">
+<dict>
+	<key>DryRunCommand</key>
+	<string>venv/bin/python daemons/call_autoreply.py --once -v --dry-run</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.urblink.call-autoreply</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/athos/gt/whatsapp_automation/venv/bin/python</string>
+		<string>/Users/athos/gt/whatsapp_automation/daemons/call_autoreply.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/call_autoreply_err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/call_autoreply.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/athos/gt/whatsapp_automation</string>
+</dict>
+</plist>
