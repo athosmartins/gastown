@@ -12,7 +12,7 @@
 # POR QUE É SEGURO RODAR: o selftest usa ssh/rsync-de-mentira no nó e uma cidade temporária. A rodada viva é 3 anúncios públicos de um site, vai para um staging temporário (apagado ao fim) e a
 #   produção é conferida (nada do raspador mais novo que um marco) depois. Nada é instalado nem apagado no servidor além da pasta da própria rodada; nenhuma bandeira é ligada ou desligada.
 # O QUE É AVISO E NÃO FALHA: o servidor é de um teste e o Mayor o apaga ao fim. Bandeira desligada (rc 99), ssh que não responde ou ambiente não preparado (rc 98) viram AVISO — o código não
-#   depende de o servidor existir (quem chama roda local). Se o nó RESPONDE e a rodada devolve erro do raspador ou nenhum arquivo, ou escreve na produção, é FALHA.
+#   depende de o servidor existir (quem chama roda local). rc 97 da rodada viva depois de o `check` dizer pronto é FALHA (defeito do repositório, não do servidor). Se o nó RESPONDE e a rodada devolve erro do raspador ou nenhum arquivo, ou escreve na produção, é FALHA.
 #
 # Chamado por run.sh depois do deploy (STORY_ID=ga-mqs133). Sai 0 se passar.
 set -uo pipefail
@@ -104,7 +104,9 @@ $out"
 $hit"
         fi
         log "rodada viva (primeimoveisdeluxo --limit 3): $files arquivos em staging; produção conferida (veja os avisos acima se a conferência foi pulada) ✓";;
-      96|97|98|99) warn "o nó recusou a rodada viva (rc $rrc) — a cadeia cai no mini: $(printf '%s\n' "$out" | tail -n 1)";;
+      97) fail "a rodada viva foi recusada com rc 97 (uso errado/bloqueado/código ou lista ausente) DEPOIS de o check dizer que está pronto: é defeito do repositório, não do servidor:
+$(printf '%s\n' "$out" | tail -n 5)";;
+      96|98|99) warn "o nó recusou a rodada viva (rc $rrc) — a cadeia cai no mini: $(printf '%s\n' "$out" | tail -n 1)";;
       *) fail "a rodada viva no nó terminou com rc $rrc (esperado 0):
 $(printf '%s\n' "$out" | tail -n 15)";;
     esac;;
