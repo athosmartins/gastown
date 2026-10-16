@@ -185,8 +185,9 @@ bd -C "$GC_CITY_PATH" update "$ID" \
 #    the card looks fine, nobody notices (ga-yikyf: two beads stuck 3h/4h
 #    this exact way, traced to this recipe never setting the route). Pool
 #    mapping mirrors painel_visibilidade.py's _default_pool_for_store
-#    (wa-t9jbv) and quality-gate-guard.sh's _gap1_default_pool_for_city
-#    (ga-yikyf) — keep all three in sync if a new rig is ever added,
+#    (wa-t9jbv) — keep both in sync if a new rig is ever added (the third
+#    copy, quality-gate-guard.sh's _gap1_default_pool_for_city, was removed
+#    in ga-1oibsf along with the story:approved stamp it served),
 #    INCLUDING the empty-for-unrecognized fallback below: a wrong guess
 #    silently claims the bead into a pool with no context on that rig, which
 #    is the same invisible-limbo failure class this whole fix exists to
@@ -204,8 +205,7 @@ if [ -n "$POOL" ]; then
     --set-metadata "gc.routed_to=$POOL"
 else
   # Unrecognized rig (not wa/ps/HQ) — do NOT guess a route. Flag for a human
-  # instead, same as quality-gate-guard.sh's _gap1_default_pool_for_city does
-  # for the identical case.
+  # instead (a wrong route is worse than none, see the mapping note above).
   bd -C "$GC_CITY_PATH" update "$ID" \
     --add-label ctx:ready \
     --add-label exec:auto \

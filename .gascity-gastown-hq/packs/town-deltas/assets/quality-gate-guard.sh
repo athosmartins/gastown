@@ -1085,53 +1085,105 @@ _gap1_city_ready_for_branch_check() {
   return 0
 }
 
-# _gap1_default_pool_for_city <city_path> — pure. ga-yikyf: mirrors
-# painel_visibilidade.py's _default_pool_for_store (wa-t9jbv) — maps a city/
-# rig PATH (not a bare rig name — this file's own callers below hold
-# $GC_CITY/$RIGSCAN_CITY paths, not names) to the pool that self-serves it.
-# Returns empty for an unrecognized path rather than guessing, same
-# reasoning as the Python original: routing to the WRONG pool is worse than
-# leaving the bead unrouted-but-visible (a human/the existing
-# pilot-missing-route-watchdog can still find and route it by hand; a
-# misrouted bead gets silently claimed by workers who can't do the work).
-# Deliberately does NOT default unknown->gastown.dog the way
-# quality-gate-dispatcher.sh's sibling default_pool_route_for_rig() does —
-# that function only ever receives an already-known rig NAME extracted
-# elsewhere, so its default arm is unreachable in practice; this one is fed
-# raw city PATHS across a multi-rig scan where an unrecognized path is a
-# real, expected case, not a can't-happen.
-_gap1_default_pool_for_city() {
-  local city="${1%/}"
-  case "$city" in
-    */whatsapp_automation) printf 'wa-worker' ;;
-    */property_scrapers)   printf 'ps-worker' ;;
-    "$GC_CITY")             printf 'gastown.dog' ;;
-    *)                       printf '' ;;
-  esac
+# _gap1_backstop_is_parked <labels> — pure (ga-1oibsf). rc0 iff one of the space-separated <labels> is a
+# deliberate HOLD on the bead: Athos/the Mayor parked it by hand, a gate withdrew it, or it waits on a
+# decision or a dependency. A GAP-1 strip only frees the lane; it must not undo such a hold. The list is not
+# invented here — it is the union of the hold predicates the town already has, kept in sync by inspection
+# (same idiom as matching_veto_labels, defined further down):
+#   auto-refino-dispatcher.sh raw-Triagem filter (ga-268cr/ga-kuve7h) — the consumer of the story:triage this
+#     reconciler writes, so a bead it would refuse to ingest as raw must not be forced into its queue:
+#     blocked:, blocked-on:, needs-human*, pilot:held*, pool:refused:, exec:manual and ANY next-action:*
+#   context-check-dispatcher.sh context_check_is_parked (ga-ipm4/ga-7mbry): story:blocked,
+#     pilot:no-auto-dispatch (+ bare no-auto-dispatch), pilot:refused-reason:, needs:engine-window, gate:needs-human*
+#   pilot-dispatcher.sh _filter_label_vetoes / _pilot_hold_or_escalate: depends-on:, waiting-on:, story:needs-human
+#   check_source_bead_park (defined further down): gate:withdraw(:*)
+# next-action:* is a hold in full, including the *constroi|*corrige-gate|*corrige pointers the Pilot's own
+# veto lets through: this function guards what goes INTO the Triagem queue, and refino drops every
+# next-action:*. gate:needs-human:partial-delivery is a hold too although check_source_bead_park lets it
+# through: that function decides who may be REVIEWED, this one what may be re-queued, and a bead the gate
+# re-holds as partial must stay with the gate.
+_gap1_backstop_is_parked() {
+  local lbl
+  for lbl in $1; do
+    case "$lbl" in
+      needs-human*|story:blocked|story:needs-human) return 0 ;;
+      pilot:no-auto-dispatch|no-auto-dispatch|pilot:held*|pilot:refused-reason:*|needs:engine-window) return 0 ;;
+      pool:refused:*|blocked:*|blocked-on:*|depends-on:*|waiting-on:*|next-action:*|exec:manual) return 0 ;;
+      gate:needs-human|gate:needs-human:*|gate:withdraw|gate:withdraw:*) return 0 ;;
+    esac
+  done
+  return 1
 }
 
-# _gap1_ensure_lifecycle_backstop <city_path> <bead_id> — ga-bz4nsi requirement
-# 3: a GAP-1 strip (either sub-case) only ever removes story:in-flight. If the
-# bead had no OTHER lifecycle label to fall back on, that removal leaves it
-# invisible to every dispatch query all over again — trading one invisible
-# limbo for another. Bugs and tech-debt-labeled beads bypass the refino funnel
-# entirely (pilot-dispatcher.sh Tier-1: "bugs/chores/tasks... pass through
-# untouched", ga-ciyypt) and never need story:approved, so they are exempt. A
-# feature/story left with no story:approved would otherwise simply fail every
-# candidate query forever (the ps-mrfb/ps-joc0-shaped bug, mirrored here for
-# this reconciler's own release path) — so re-stamp story:approved, matching
-# the exact convention pilot-dispatcher.sh's own NEVERSTARTED release already
-# uses ("back to story:approved for re-dispatch", ga-v3z4z). No-op (and safe
-# to call unconditionally after every strip) when the bead already carries
-# story:approved or doesn't need it.
+# _gap1_backstop_has_pipeline_label <labels> — pure (ga-1oibsf). rc0 iff <labels> already puts the bead
+# somewhere in the refino/gate/delivery pipeline: any story:*, gate:* or delivery:* label, or a refino
+# marker (auto-refino:*, refino-gate:*, refino:*). Deliberately WIDER than the refino daemon's own exclusions
+# (its raw-Triagem filter drops story:*, gate:*, auto-refino:escalated, refino:policy-gap; its classifier
+# also skips delivery:*, refino-gate:* and auto-refino:refining): when in doubt the bead is left alone. A bead
+# with such a label has a place already; stamping over it would skip the review gate or re-ingest delivered work.
+_gap1_backstop_has_pipeline_label() {
+  local lbl
+  for lbl in $1; do
+    case "$lbl" in
+      story:*|gate:*|delivery:*|auto-refino:*|refino-gate:*|refino:*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# gap1_backstop_action <issue_type> <labels> — pure decision for _gap1_ensure_lifecycle_backstop (ga-1oibsf).
+# Prints exactly one of:
+#   stamp:triage          a type=feature left with no lifecycle label and no hold — put it back in the Triagem
+#   skip:type-exempt      bug/chore/task: the Pilot dispatches them with NO approval (Tier 1, ga-ciyypt), so a
+#                         leaked one needs no lifecycle label (the old approved stamp on them read as Athos's)
+#   skip:tech-debt        tech-debt label: same Tier-1 bypass
+#   skip:type-story       type=story is refino raw material by having NO story:* label, while the explicit
+#                         story:triage query is `--type feature` only: stamping it would hide it from both
+#   skip:type-not-funnel  any other or unknown type (epic, decision, "" ...): not refino input, never guessed
+#   skip:parked           a deliberate hold (_gap1_backstop_is_parked)
+#   skip:has-lifecycle    already inside the pipeline (_gap1_backstop_has_pipeline_label)
+# Checked in that order. It never answers with an approval: only Athos approves (auto-refino-dispatcher.sh
+# header), so there is no stamp:approved outcome to reach.
+gap1_backstop_action() {
+  local issue_type="$1" labels="$2" lbl
+  case "$issue_type" in bug|chore|task) echo "skip:type-exempt"; return 0 ;; esac
+  for lbl in $labels; do
+    [ "$lbl" = "tech-debt" ] && { echo "skip:tech-debt"; return 0; }
+  done
+  case "$issue_type" in
+    feature) ;;
+    story)   echo "skip:type-story"; return 0 ;;
+    *)       echo "skip:type-not-funnel"; return 0 ;;
+  esac
+  if _gap1_backstop_is_parked "$labels"; then echo "skip:parked"; return 0; fi
+  if _gap1_backstop_has_pipeline_label "$labels"; then echo "skip:has-lifecycle"; return 0; fi
+  echo "stamp:triage"
+}
+
+# _gap1_ensure_lifecycle_backstop <city_path> <bead_id> — ga-bz4nsi requirement 3, reshaped by ga-1oibsf.
+# A GAP-1 strip (either sub-case) only ever removes story:in-flight. A feature left with no lifecycle
+# label at all would then fail every Pilot candidate query forever, so it goes back to the INPUT of the funnel:
+# story:triage (the refino daemon's queue; the Pilot never dispatches it). The refino daemon's raw ingestion
+# would also adopt a label-less feature (AUTO_REFINO_INGEST_RAW_TRIAGEM=1, the default); the explicit label
+# makes that independent of the switch. It is NEVER given story:approved: only Athos approves. The first
+# version stamped story:approved, and since the Pilot dispatches chore/task with no approval (ga-ciyypt) a
+# leaked one came back as "approved by Athos", as did a bead Athos had parked by hand (approved removed,
+# in-flight still on).
+# gap1_backstop_action decides; everything it does not answer stamp:triage to is left untouched: bug/chore/
+# task/tech-debt (Tier-1 bypass), story-typed and other types, held beads and beads already in the pipeline.
+# The old gc.routed_to backfill (ga-yikyf) is gone with the approved stamp: it existed only because a bead
+# approved without a route is invisible to the Pilot, and the Triagem query needs no route.
+# No-op (and safe to call unconditionally after every strip) when there is nothing to stamp. Returns 1 when
+# the bead could not be read or the stamp could not be written; the guard runs under set -e, so callers
+# `|| true` (that also keeps errexit off inside this function: an unreadable bead must not abort the sweep).
 _gap1_ensure_lifecycle_backstop() {
   local city="$1" bead_id="$2"
-  local raw show issue_type has_approved has_tech_debt routed_to pool wrote
+  local raw show issue_type labels action
   # ga-bz4nsi third-state guard: a failed/unparseable read must NOT fall
-  # through to the same branch as "read succeeded, bead needs no approval" —
-  # that would stamp story:approved on a bead we never actually verified,
-  # possibly a bug/tech-debt/already-approved one, based on nothing. Default
-  # to inert (no write) whenever the read itself is not trustworthy.
+  # through to the same branch as "read succeeded, bead needs no stamp" —
+  # that would stamp a lifecycle label on a bead we never actually verified,
+  # possibly a bug/tech-debt/held one, based on nothing. Default to inert
+  # (no write) whenever the read itself is not trustworthy.
   raw=$(bd -C "$city" show "$bead_id" --json 2>/dev/null)
   if [ -z "$raw" ]; then
     warn "_gap1_ensure_lifecycle_backstop: bd show returned nothing for $bead_id in $city — cannot verify lifecycle state, skipping backstop (ga-bz4nsi third-state guard)"
@@ -1141,41 +1193,24 @@ _gap1_ensure_lifecycle_backstop() {
     warn "_gap1_ensure_lifecycle_backstop: $bead_id's bd show output did not parse as JSON — skipping backstop (ga-bz4nsi third-state guard)"
     return 1
   }
+  # vazio → tipo "" e gap1_backstop_action responde skip:type-not-funnel (nada é escrito); falhou/ilegível →
+  # o jq cai no mesmo "" (inerte). Um tipo que não deu para ler nunca vira "feature".
   issue_type=$(printf '%s' "$show" | jq -r '(.issue_type // .type // "")' 2>/dev/null || echo "")
-  [ "$issue_type" = "bug" ] && return 0
-  has_tech_debt=$(printf '%s' "$show" | jq -r '((.labels // []) | contains(["tech-debt"]))' 2>/dev/null || echo "false")
-  [ "$has_tech_debt" = "true" ] && return 0
-  has_approved=$(printf '%s' "$show" | jq -r '((.labels // []) | contains(["story:approved"]))' 2>/dev/null || echo "false")
-  [ "$has_approved" = "true" ] && return 0
-  warn "$bead_id has no dispatchable lifecycle label after GAP-1 release (type=$issue_type, no tech-debt label, no story:approved) — stamping story:approved so it does not fall into a new invisible limbo (ga-bz4nsi requirement 3)."
-  bd -C "$city" label add "$bead_id" "story:approved" -q 2>/dev/null || true
-  bd -C "$city" comment "$bead_id" "ga-bz4nsi GAP-1 reconciler: stamped story:approved after releasing story:in-flight — bead had no other lifecycle label and is not type=bug/tech-debt, so without this it would have gone from one invisible limbo (leaked in-flight) straight into another (no candidate query would ever find it). Self-healed." 2>/dev/null || true
-  # ga-yikyf: a story:approved stamp with no gc.routed_to is the SAME
-  # invisible limbo one label later — the Pilot only dispatches a bead whose
-  # route is filled in. Backfill it in the same pass, mirroring
-  # painel_visibilidade.py's _ensure_routed_or_pending (never overwrite an
-  # existing route; verify the write by reading it back rather than trusting
-  # the CLI's own exit code — ga-9tgos's own finding is that a write can
-  # report success while silently not persisting).
-  routed_to=$(printf '%s' "$show" | jq -r '((.metadata["gc.routed_to"]) // "")' 2>/dev/null || echo "")
-  if [ -n "$routed_to" ]; then
-    return 0
-  fi
-  pool=$(_gap1_default_pool_for_city "$city")
-  if [ -z "$pool" ]; then
-    warn "_gap1_ensure_lifecycle_backstop: $bead_id has no gc.routed_to and city '$city' maps to no known pool — flagging needs-human instead of guessing a route (ga-yikyf)"
-    bd -C "$city" label add "$bead_id" "needs-human" -q 2>/dev/null || true
-    bd -C "$city" comment "$bead_id" "ga-yikyf GAP-1 reconciler: stamped story:approved above, but this bead also has no gc.routed_to and city '$city' does not map to a known pool — flagged needs-human rather than guessing, since a wrong route is worse than none." 2>/dev/null || true
-    return 0
-  fi
-  bd -C "$city" update "$bead_id" --set-metadata "gc.routed_to=$pool" -q 2>/dev/null || true
-  wrote=$(bd -C "$city" show "$bead_id" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | ((.metadata["gc.routed_to"]) // "")' 2>/dev/null || echo "")
-  if [ "$wrote" = "$pool" ]; then
-    bd -C "$city" comment "$bead_id" "ga-yikyf GAP-1 reconciler: backfilled gc.routed_to=$pool alongside the story:approved stamp above — a bead armed without a route is invisible to the Pilot the same way one with no lifecycle label is. Verified by re-reading the field after write." 2>/dev/null || true
+  # vazio → bead sem nenhum rótulo: labels="" (legítimo, é o caso que recebe story:triage); falhou/ilegível →
+  # "labels" existe mas não é uma lista de strings: o jq sai != 0, warn e return 1 sem escrever nada.
+  # "não consegui ler os rótulos" não pode virar "não tem rótulos".
+  labels=$(printf '%s' "$show" | jq -r '(.labels // []) as $l | if ($l|type)=="array" and ($l|all(type=="string")) then ($l|join(" ")) else error("labels is not an array of strings") end' 2>/dev/null) || {
+    warn "_gap1_ensure_lifecycle_backstop: $bead_id's labels field is not a list of strings — cannot tell 'no labels' from 'unreadable', skipping backstop (ga-bz4nsi third-state guard)"
+    return 1
+  }
+  action=$(gap1_backstop_action "$issue_type" "$labels")
+  [ "$action" = "stamp:triage" ] || return 0
+  warn "$bead_id has no lifecycle label after GAP-1 release (type=$issue_type, not held, not in the pipeline) — stamping story:triage so the GAP-1 release does not leave it in a new invisible limbo; never story:approved, only Athos approves (ga-1oibsf)."
+  if bd -C "$city" label add "$bead_id" "story:triage" -q 2>/dev/null; then
+    bd -C "$city" comment "$bead_id" "ga-1oibsf GAP-1 reconciler: stamped story:triage after releasing story:in-flight — this feature had no other lifecycle label, so no Pilot candidate query would ever have found it again. story:triage is the Triagem queue, NOT an approval: only Athos approves, so this reconciler never writes story:approved. Self-healed." 2>/dev/null || true
   else
-    warn "_gap1_ensure_lifecycle_backstop: $bead_id gc.routed_to backfill to '$pool' did not verify on read-back (got '$wrote') — flagging needs-human (ga-yikyf)"
-    bd -C "$city" label add "$bead_id" "needs-human" -q 2>/dev/null || true
-    bd -C "$city" comment "$bead_id" "ga-yikyf GAP-1 reconciler: tried to backfill gc.routed_to=$pool alongside the story:approved stamp above, but the write did not verify on read-back (got '$wrote'). Bead may still be unrouted and invisible to the Pilot — flagged needs-human rather than assuming the write worked." 2>/dev/null || true
+    warn "_gap1_ensure_lifecycle_backstop: story:triage could not be written on $bead_id — it is still without a lifecycle label"
+    return 1
   fi
 }
 
@@ -6387,7 +6422,7 @@ for RIGSCAN_CITY in $RIGSCAN_PATHS; do
             warn "GAP-1: $RIGSCAN_OI_ID has no branch matching fix/$RIGSCAN_OI_ID*, feat/$RIGSCAN_OI_ID*, feature/$RIGSCAN_OI_ID*, refactor/$RIGSCAN_OI_ID*, docs/$RIGSCAN_OI_ID*, chore/$RIGSCAN_OI_ID*, test/$RIGSCAN_OI_ID*, or crew/*/$RIGSCAN_OI_ID*, no live assignee, no gate:passed, no pilot:dispatched (rig=$RIGSCAN_CITY) — never actually started, stripping story:in-flight (ga-bz4nsi)"
             bd -C "$RIGSCAN_CITY" comment "$RIGSCAN_OI_ID" "ga-bz4nsi GAP-1 reconciler: stripped orphaned story:in-flight — no fix/feat/feature/refactor/docs/chore/test/crew branch was ever found for this bead, no live assignee, no gate:passed, no pilot:dispatched. This is the never-started shape (not merged-and-forgotten): the lane slot was leaked before any build began. Self-healed." 2>/dev/null || true
             bd -C "$RIGSCAN_CITY" label remove "$RIGSCAN_OI_ID" "story:in-flight" -q 2>/dev/null || true
-            _gap1_ensure_lifecycle_backstop "$RIGSCAN_CITY" "$RIGSCAN_OI_ID"
+            _gap1_ensure_lifecycle_backstop "$RIGSCAN_CITY" "$RIGSCAN_OI_ID" || true
             ;;
           *)
             log "GAP-1: $RIGSCAN_OI_ID action=$RIGSCAN_ACTION — skip (rig=$RIGSCAN_CITY)"
@@ -6529,7 +6564,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
             warn "GAP-1: $OI_ID has no branch matching fix/$OI_ID*, feat/$OI_ID*, feature/$OI_ID*, refactor/$OI_ID*, docs/$OI_ID*, chore/$OI_ID*, test/$OI_ID*, or crew/*/$OI_ID*, no live assignee, no gate:passed, no pilot:dispatched — never actually started, stripping story:in-flight (ga-bz4nsi)"
             bd -C "$GC_CITY" comment "$OI_ID" "ga-bz4nsi GAP-1 reconciler: stripped orphaned story:in-flight — no fix/feat/feature/refactor/docs/chore/test/crew branch was ever found for this bead, no live assignee, no gate:passed, no pilot:dispatched. This is the never-started shape (not merged-and-forgotten): the lane slot was leaked before any build began. Self-healed." 2>/dev/null || true
             bd -C "$GC_CITY" label remove "$OI_ID" "story:in-flight" -q 2>/dev/null || true
-            _gap1_ensure_lifecycle_backstop "$GC_CITY" "$OI_ID"
+            _gap1_ensure_lifecycle_backstop "$GC_CITY" "$OI_ID" || true
             ;;
           *)
             log "GAP-1: $OI_ID action=$ACTION — skip"
@@ -6558,7 +6593,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
             bd -C "$GC_CITY" comment "$OI_ID" "ga-pa36 GAP-1 reconciler: stripped orphaned story:in-flight — branch tip $OI_BRANCH_SHA already merged to origin/main, no gate:passed label, no live builder. Lane slot freed." 2>/dev/null || true
           fi
           bd -C "$GC_CITY" label remove "$OI_ID" "story:in-flight" -q 2>/dev/null || true
-          _gap1_ensure_lifecycle_backstop "$GC_CITY" "$OI_ID"
+          _gap1_ensure_lifecycle_backstop "$GC_CITY" "$OI_ID" || true
           ;;
         skip:not-merged)
           log "GAP-1: $OI_ID branch tip $OI_BRANCH_SHA not yet merged — skip"
