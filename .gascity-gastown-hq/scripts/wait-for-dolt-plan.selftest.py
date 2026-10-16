@@ -9,7 +9,8 @@ CASOS: plano é SÓ LEITURA (checksum da pasta não muda) e a medição separa c
   rig, RunAtLoad=false) · plist ilegível listado · plist que o expat recusa e o plutil aceita · --apply: ProgramArguments novo exato, demais chaves e a ordem delas preservadas, o que não é
   wrap fica byte a byte igual, backup byte a byte do original, idempotente (2ª vez não embrulha de novo) · --revert devolve o original e é idempotente · RECUSAS (nada é escrito): divergência,
   wrapper ausente/não executável/com sintaxe ruim, wrap em KeepAlive, wrap sem chamada medida, label em 2 arquivos · plist symlink / com chave Program / que o plutil -lint recusa não são
-  alterados · política ilegível, com decisão desconhecida ou label repetido = exit 3 · uso errado = exit 2.
+  alterados · política ilegível, com decisão desconhecida ou label repetido = exit 3 · uso errado = exit 2 · --revert com plist ilegível (lista e sai 1) · wrapper embrulhado por OUTRO caminho ·
+  política × vivo (isento embrulhado, nao-medido que mede LÊ, wrap sem gatilho) · backup (falha de criação sem traceback; --backup-dir reaproveitado não sobrescreve) · sonda ao lado do wrapper.
 CONTROLE NEGATIVO: cada guarda (marca `GUARD:` no script) é adulterada numa cópia e o caso que a cobre TEM que passar a falhar; mutante que não muda o arquivo também falha.
 VARIÁVEIS: WFDP_UNDER_TEST (script a testar) · WFDP_NO_MUTANTS=1
 """
@@ -33,6 +34,8 @@ WRAPPER = f"{CITY}/scripts/wait-for-dolt.sh"
 os.makedirs(PROG), os.makedirs(f"{CITY}/scripts"), os.makedirs(f"{ROOT}/otherrig/scripts")
 shutil.copy(os.path.join(HERE, "wait-for-dolt.sh"), WRAPPER)
 os.chmod(WRAPPER, 0o755)
+for lib_dir in (f"{CITY}/scripts", T):   # a sonda que o wrapper carrega fica AO LADO dele (o preflight confere)
+    shutil.copy(os.path.join(HERE, "dolt-pid-lib.sh"), lib_dir)
 LENIENT = b'<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>com.gascity.lenient-k</string><key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer><key>ProgramArguments</key><array><string>/bin/bash</string><string>%s/k.sh</string></array></dict></plist>' % PROG.encode()
 open(f"{T}/lenient.xml", "wb").write(LENIENT)
 open(STUB, "w").write(f'#!/bin/sh\ncase "$1" in -convert) case "$5" in *lenient*) cat "{T}/lenient.xml" ;; *) exit 1 ;; esac ;; -lint) grep -q BROKEN "$2" && exit 1; exit 0 ;; esac\n')
@@ -62,8 +65,8 @@ def plist(d, label, args, **kw):
         plistlib.dump(data, fh, sort_keys=False)
 
 
-def fixture(name):
-    """Pasta nova de LaunchAgents falsos (uma por cenário, para um não sujar o outro)."""
+def fixture(name, garbage=True):
+    """Pasta nova de LaunchAgents falsos (uma por cenário, para um não sujar o outro). garbage=False: sem o plist ilegível (cenários do caminho limpo)."""
     d = f"{T}/la-{name}"
     os.makedirs(d)
     plist(d, "com.gascity.reaper-a", ["/bin/bash", f"{PROG}/a.sh"], StartInterval=300, EnvironmentVariables={"X": "1"}, StandardErrorPath="/tmp/a.err")
@@ -79,7 +82,8 @@ def fixture(name):
     plist(d, "com.gascity.otherrig-g", ["/bin/bash", f"{ROOT}/otherrig/scripts/x.sh"], StartInterval=60)
     plist(d, "com.gascity.norun-h", ["/bin/bash", f"{PROG}/a.sh"], RunAtLoad=False)
     open(f"{d}/com.gascity.lenient-k.plist", "wb").write(LENIENT.replace(b"<dict>", b"<dict><!-- x -- y -->", 1))
-    open(f"{d}/garbage.plist", "wb").write(b"\x00\x01 isto nao e plist")
+    if garbage:
+        open(f"{d}/garbage.plist", "wb").write(b"\x00\x01 isto nao e plist")
     return d
 
 
@@ -92,7 +96,7 @@ com.gascity.keepalive-c\tisento\tKeepAlive
 com.gascity.logonly-b\tnao-medido\tb
 com.gascity.noprog-i\tnao-medido\ti
 com.gascity.nolook-n\tnao-medido\tn
-com.gascity.direct-p\tnao-medido\tp
+com.gascity.direct-p\tisento\tp
 com.gascity.gone-q\tnao-medido\tq
 """
 WRAP_LABELS = ["reaper-a", "py-d", "inline-e", "lenient-k"]
@@ -133,12 +137,12 @@ def c_plan_readonly():
     rc, out, _ = run([], d)
     return (rc == 0 and snap(d) == before and "medido (escopo HQ): LE=6 · TALVEZ=1 · NAO-ACHEI=1 · ILEGIVEL=2" in out and "garbage.plist" in out
             and out.count("A EMBRULHAR") == 4 and "com.other.f" in out.split("== FORA DO ESCOPO")[1] and "otherrig-g" in out.split("== FORA DO ESCOPO")[1]
-            and "norun-h" not in out and "política: wrap=4 · isento=1 · nao-medido=5 · embrulhados hoje: 0 de 4" in out
+            and "norun-h" not in out and "política: wrap=4 · isento=2 · nao-medido=4 · embrulhados hoje: 0 de 4" in out
             and "direct-p [LE]" in out and "gone-q [ILEGIVEL]" in out)
 
 
 def c_apply_revert():
-    d = fixture("ar"); orig = {l: prog_of(d, l) for l in WRAP_LABELS}; keys = {l: list(load(d, l)) for l in WRAP_LABELS}; before = snap(d); bk = f"{T}/bk-ar"; pol = policy()
+    d = fixture("ar", garbage=False); orig = {l: prog_of(d, l) for l in WRAP_LABELS}; keys = {l: list(load(d, l)) for l in WRAP_LABELS}; before = snap(d); bk = f"{T}/bk-ar"; pol = policy()
     rc, out, _ = run(["--apply"], d, pol, bk=bk)
     after = snap(d)
     if rc != 0 or "4 embrulhado(s), 0 falha(s)" not in out:
@@ -180,7 +184,9 @@ def c_refuse_wrapper():
     res.append(run(["--apply"], d, wrapper=noexec)[0])
     bad = f"{T}/bad.sh"; open(bad, "w").write("#!/bin/bash\nif then fi\n"); os.chmod(bad, 0o755)
     res.append(run(["--apply"], d, wrapper=bad)[0])
-    return res == [4, 4, 4] and snap(d) == before
+    nolib = f"{T}/nolib/wait-for-dolt.sh"; os.makedirs(os.path.dirname(nolib)); shutil.copy(WRAPPER, nolib); os.chmod(nolib, 0o755)   # wrapper são, sem a sonda ao lado: todo job sairia 76
+    res.append(run(["--apply"], d, wrapper=nolib)[0])
+    return res == [4, 4, 4, 4] and snap(d) == before
 
 
 def c_wrap_keepalive():
@@ -230,7 +236,7 @@ def c_skips():
 
 
 def c_only_canary():
-    d = fixture("only"); before = snap(d); pol = policy(); one = "com.gascity.reaper-a"
+    d = fixture("only", garbage=False); before = snap(d); pol = policy(); one = "com.gascity.reaper-a"
     rc, out, _ = run(["--apply", "--only", one], d, pol, bk=f"{T}/bk-only")
     after = snap(d)
     changed = {n for n in after if after[n] != before[n]}
@@ -253,6 +259,47 @@ def c_wrapper_gone():
     return rc == 0 and ok_before == 0 and rc2 == 1 and "JÁ embrulhado(s) apontam para" in out2 and "NÃO vão subir" in out2
 
 
+def c_revert_unreadable():
+    d = fixture("rv"); orig = {l: prog_of(d, l) for l in WRAP_LABELS}   # o fixture traz garbage.plist: ilegível, não sei se está embrulhado
+    applied = run(["--apply"], d, bk=f"{T}/bk-rv")[0] == 0
+    rc, out, _ = run(["--revert"], d, bk=f"{T}/bk-rv2")
+    return applied and rc == 1 and "NÃO LI garbage.plist" in out and "4 revertido(s)" in out and all(prog_of(d, l) == orig[l] for l in WRAP_LABELS)
+
+
+def c_wrapper_other_path():
+    d = fixture("op", garbage=False); orig = {l: prog_of(d, l) for l in WRAP_LABELS}; other_dir = f"{T}/other"; other = f"{other_dir}/wait-for-dolt.sh"
+    os.makedirs(other_dir); [shutil.copy(os.path.join(HERE, f), other_dir) for f in ("wait-for-dolt.sh", "dolt-pid-lib.sh")]; os.chmod(other, 0o755)
+    applied = run(["--apply"], d, wrapper=other, bk=f"{T}/bk-op")[0] == 0
+    rc, out, _ = run([], d)                         # plano com o wrapper PADRÃO: os 4 são embrulhados (por outro caminho), não "a embrulhar"
+    rc2, _, _ = run(["--apply"], d)                  # e não se embrulha por cima
+    shutil.rmtree(other_dir)
+    rc3, out3, _ = run([], d)                        # o wrapper do outro caminho sumiu: os jobs não sobem
+    rc4, _, _ = run(["--revert"], d, bk=f"{T}/bk-op2")
+    return (applied and rc == 1 and "OUTRO caminho" in out and out.count("JÁ EMBRULHADO") == 4 and "A EMBRULHAR" not in out and rc2 == 1
+            and rc3 == 1 and "NÃO vão subir" in out3 and rc4 == 0 and all(prog_of(d, l) == orig[l] for l in WRAP_LABELS))
+
+
+def c_policy_vs_live():
+    d = fixture("pv", garbage=False); a = ["/bin/bash", f"{PROG}/a.sh"]
+    plist(d, "com.gascity.once-r", a)                                                                                              # só RunAtLoad: sem gatilho de re-disparo
+    plist(d, "com.gascity.pre-s", [WRAPPER, "--timeout", "300", "--boot-window", "900", "--"] + a, StartInterval=60)                 # já embrulhado
+    plist(d, "com.gascity.lia-t", a, StartInterval=60)                                                                             # a medição acha chamada (LE)
+    pol = policy(BASE_POLICY + "com.gascity.once-r\twrap\tr\ncom.gascity.pre-s\tisento\ts\ncom.gascity.lia-t\tnao-medido\tt\n"); before = snap(d)
+    rc, out, _ = run([], d, pol); rc2, _, _ = run(["--apply"], d, pol)
+    return (rc == 1 and "DIVERGÊNCIAS (3)" in out and "wrap sem gatilho de re-disparo: com.gascity.once-r" in out and "isento mas já embrulhado: com.gascity.pre-s" in out
+            and "nao-medido mas a medição achou chamada (LE): com.gascity.lia-t" in out and rc2 == 1 and snap(d) == before)
+
+
+def c_backup_safety():
+    d = fixture("bs", garbage=False); before = snap(d); pol = policy(); blocker = f"{T}/arquivo-no-caminho"; open(blocker, "w").write("x")
+    rc, out, err = run(["--apply"], d, pol, bk=f"{blocker}/sub")   # o backup não pode ser criado: sem traceback, falha por plist, nada escrito
+    first = rc == 1 and "Traceback" not in err and "4 falha(s)" in out and snap(d) == before
+    bk = f"{T}/bk-bs"; applied = run(["--apply"], d, pol, bk=bk)[0] == 0; wrapped = snap(d)
+    rc2, out2, _ = run(["--revert"], d, bk=bk)                     # mesmo --backup-dir: não sobrescreve o original guardado
+    return (first and applied and rc2 == 1 and "backup já existe" in out2 and snap(d) == wrapped and len(os.listdir(bk)) == 4
+            and all(hashlib.sha256(open(f"{bk}/{n}", "rb").read()).hexdigest() == before[n] for n in os.listdir(bk)))
+
+
 SUITE = [
     (c_plan_readonly, "plano é só leitura; medição separa chamada de texto (b.sh = TALVEZ); script direto é lido; script citado e ausente = ILEGÍVEL; escopo; ilegível; plutil; contagens"),
     (c_apply_revert, "--apply exato + chaves/ordem + backup byte a byte + idempotente; --revert devolve o original e é idempotente"),
@@ -266,6 +313,10 @@ SUITE = [
     (c_skips, "symlink, chave Program e plutil -lint recusado não são alterados (e o resto é)"),
     (c_only_canary, "--only: só o label pedido muda (apply e revert); label inexistente/isento = exit 2 sem escrever"),
     (c_wrapper_gone, "plist já embrulhado + wrapper sumido → divergência que diz que os jobs NÃO vão subir"),
+    (c_revert_unreadable, "--revert lista o plist que não leu (não sei se está embrulhado), sai 1 e reverte os que leu"),
+    (c_wrapper_other_path, "embrulhado por OUTRO caminho do wrapper: reconhecido (não embrulha por cima), divergência, sumido = NÃO vão subir, revert tira"),
+    (c_policy_vs_live, "política × vivo além do wrap: isento já embrulhado, nao-medido com LE, wrap sem gatilho de re-disparo → divergência"),
+    (c_backup_safety, "backup que não dá para criar → falha por plist sem traceback; --backup-dir reaproveitado não sobrescreve o original"),
 ]
 MUTANTS = [   # (nome, expressão sed, cenário)
     ("aplica-com-divergencia", "/GUARD:apply-refuses-divergence/ s/if div:/if False:/", c_refuse_divergence),
@@ -280,10 +331,20 @@ MUTANTS = [   # (nome, expressão sed, cenário)
     ("politica-repetida-passa", "/GUARD:policy-dup/ s/if parts\\[0\\].strip() in pol:/if False:/", c_policy_errors),
     ("label-duplicado-passa", "/GUARD:dup-label/ s/if len(fs) > 1:/if False:/", c_duplicate_label),
     ("only-desconhecido-passa", "/GUARD:only-unknown/ s/if .*:   # GUARD/if False:   # GUARD/", c_only_canary),
-    ("wrapper-sumido-passa", "/GUARD:wrapper-missing-div/ s/if wrapped and not (.*):/if False:/", c_wrapper_gone),
+    ("wrapper-sumido-passa", "/GUARD:wrapper-missing-div/ s/if not (.*):   # GUARD/if False:   # GUARD/", c_wrapper_gone),
     ("direto-nao-e-lido", "/GUARD:direct-exec/ s/if args\\[0\\]/if False and args[0]/", c_plan_readonly),
     ("citado-ausente-vira-sem-mencao", "/GUARD:named-missing/ s/unreadable += p in named/pass/", c_plan_readonly),
     ("revert-erra-o-corte", "/GUARD:inner-strip/ s/args.index(\"--\") + 1:/args.index(\"--\"):/", c_apply_revert),
+    ("revert-esconde-ilegivel", "/GUARD:revert-bad/ s/for fn, why in bad:/for fn, why in []:/", c_revert_unreadable),
+    ("embrulhado-so-pelo-caminho-exato", "/GUARD:wrapped-by-name/ s/or os.path.basename(args\\[0\\]) == WRAPPER_NAME//", c_wrapper_other_path),
+    ("embrulhado-so-pelo-nome", "/GUARD:wrapped-by-name/ s/args\\[0\\] == wrapper or //", c_wrapper_gone),
+    ("outro-caminho-do-wrapper-passa", "/GUARD:wrapper-other-path/ s/if p != wrapper:/if False:/", c_wrapper_other_path),
+    ("wrap-sem-gatilho-passa", "/GUARD:no-trigger/ s/elif dec == \"wrap\" and not/elif False and not/", c_policy_vs_live),
+    ("isento-embrulhado-passa", "/GUARD:iso-wrapped/ s/elif dec != \"wrap\" and/elif False and/", c_policy_vs_live),
+    ("nao-medido-com-LE-passa", "/GUARD:nm-le/ s/elif dec == \"nao-medido\" and/elif False and/", c_policy_vs_live),
+    ("sobrescreve-backup", "/GUARD:backup-exists/ s/if os.path.exists(bak):/if False:/", c_backup_safety),
+    ("falha-de-escrita-sobe-traceback", "/GUARD:write-except/ s/except Exception as e:/except ZeroDivisionError as e:/", c_backup_safety),
+    ("sonda-ao-lado-nao-conferida", "/GUARD:lib-preflight/ s/returncode == 0/returncode >= 0/", c_refuse_wrapper),
 ]
 
 

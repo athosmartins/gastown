@@ -19,17 +19,20 @@ COMO DECIDE (a medição é a evidência; a decisão é da política, que o plan
 
 USO   wait-for-dolt-plan.py [--dir D] [--policy F] [--wrapper W] [--timeout S] [--boot-window S] [--apply | --revert] [--backup-dir B] [--only LABEL ...]
   padrão: --dir ~/Library/LaunchAgents · --policy ao lado do script · --wrapper $GC_CITY_PATH/scripts/wait-for-dolt.sh · --timeout 300 · --boot-window 900.
-  --apply  grava (com backup do original) o ProgramArguments `[W, --timeout S, --boot-window B, --, <comando original>...]` nos jobs `wrap` que ainda não estão embrulhados. Recusa
-           (nada é escrito) com divergência de política, wrapper ausente/não executável/com sintaxe ruim, ou plist symlink/com chave Program. Os comentários XML do plist
-           não sobrevivem à reescrita; o backup guarda o original. NÃO recarrega o job: vale no próximo boot ou quando o operador recarregar.
-  --revert tira o prefixo de todo plist RunAtLoad embrulhado (qualquer um, não só os da política), também com backup. Idempotente.
+  --apply  grava (com backup do original) o ProgramArguments `[W, --timeout S, --boot-window B, --, <comando original>...]` nos jobs `wrap` que ainda não estão embrulhados. Recusa TUDO
+           (nada é escrito) com divergência de política ou wrapper ausente/não executável/com sintaxe ruim/sem o dolt-pid-lib.sh ao lado. Plist symlink, com chave Program, com backup
+           já existente ou que o plutil -lint recusa é pulado SÓ ELE (vira falha no resumo, exit 1) e os demais seguem. Os comentários XML do plist não sobrevivem à reescrita; o backup
+           guarda o original (um --backup-dir reaproveitado nunca sobrescreve). NÃO recarrega o job: vale no próximo boot ou quando o operador recarregar.
+  --revert tira o prefixo de todo plist RunAtLoad embrulhado (qualquer um, não só os da política), também com backup. Idempotente. Plist que não consegui ler é listado ("NÃO LI") e
+           conta como falha (exit 1): não sei se está embrulhado, e isso não é "nada a reverter".
   --only L restringe --apply/--revert ao label L (repetível): é o canário. Label que não existe no escopo, ou (no --apply) que a política não marca wrap, é uso errado (exit 2).
 
 TRÊS ESTADOS  plist ilegível aparece com o motivo (nunca some); programa ilegível é ILEGÍVEL (≠ NÃO ACHEI); política ilegível/duplicada → exit 3 sem plano (não chuto decisão).
-  Divergência (job do escopo fora da política · wrap sem LÊ · wrap em KeepAlive · política cita job que não existe/é de fora · label em 2 arquivos · plist já embrulhado cujo
-  wrapper sumiu ou não executa) → exit 1: o plano é impresso mas --apply recusa. Rodar o plano de tempos em tempos é o detector do último caso (job embrulhado que não sobe).
+  Divergência (job do escopo fora da política · wrap sem LÊ · wrap em KeepAlive · wrap sem StartInterval/StartCalendarInterval · isento/nao-medido já embrulhado · nao-medido que mede LÊ ·
+  política cita job que não existe/é de fora · label em 2 arquivos · plist já embrulhado por OUTRO caminho do wrapper, ou cujo wrapper sumiu ou não executa) → exit 1: o plano é
+  impresso mas --apply recusa. "Embrulhado" = argv0 é o --wrapper ou um wait-for-dolt.sh de qualquer caminho. Rodar o plano de tempos em tempos é o detector do último caso.
 
-CÓDIGOS  0 plano/aplicação feitos, sem divergência · 1 divergência ou falha ao escrever · 2 uso errado · 3 não consegui ler a entrada · 4 --apply recusado (wrapper).
+CÓDIGOS  0 plano/aplicação feitos, sem divergência · 1 divergência, falha ao escrever ou (--revert) plist não lido · 2 uso errado · 3 não consegui ler a entrada · 4 --apply recusado (wrapper).
 """
 from __future__ import annotations
 
@@ -50,10 +53,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SHELLS = ("bash", "sh", "zsh")
 CLIS = ("bd", "gc", "dolt")
 DECISIONS = ("wrap", "isento", "nao-medido")
+WRAPPER_NAME = "wait-for-dolt.sh"
 # chamada em posição de comando (início, ; & | ( ` $( then do !), com prefixos comuns (timeout N, env, VAR=x) e o binário por caminho ou por variável conhecida
 _CMDPOS = r"(?:^|[;&|(`]|\$\(|\bthen\b|\bdo\b|!)\s*(?:(?:timeout\s+\S+\s+|env\s+|command\s+|exec\s+|nice\s+|(?:bash|sh)\s+|\w+=\S*\s+)*)"
 _BIN = r"(?:(?:\"?\$\{?\w+\}?\"?/|[\w./-]*/)?\"?(?:bd|gc|dolt)\"?|\"?\$\{?(?:BD|GC|DOLT|BD_BIN|GC_BIN|bd_bin|gc_bin|BD_LIST_CACHED)\}?\"?)"
-SH_STRONG = re.compile(_CMDPOS + _BIN + r"(?=\s|$)(?!-)")
+SH_STRONG = re.compile(_CMDPOS + _BIN + r"(?=\s|$)")
 LOGCMD = re.compile(r"^\s*(echo|printf|log|warn|info|die|fail|err|note|emit\w*|_log\w*|notify)\b")
 PY_STRONG = re.compile(r"""\[\s*["'](?:bd|gc|dolt)["']\s*[,\]]|\[\s*(?:GC|BD|GC_BIN|BD_BIN)\s*,|\bpymysql\.connect|mysql\.connector\.connect""")
 WEAK = re.compile(r"(?<![\w./$-])(?:bd|gc|dolt)(?![\w/-])")   # `.gc/logs`, `$GC_CITY`, `dolt-pid-lib.sh` não são menção
@@ -177,7 +181,7 @@ def measure(args):
             elif not weak and WEAK.search(line):
                 weak = f"{name}:{i}: {s[:100]}"
     if strong:
-        return "LE", (best or strong) + (f"  (+{calls - 1} linhas de chamada)" if calls > 1 else "  (1 linha de chamada)")
+        return "LE", (best or strong) + (f"  (+{calls - 1} outras linhas de chamada, {calls} no total)" if calls > 1 else "  (1 linha de chamada)")
     if weak:
         return "TALVEZ", weak
     if unreadable or not srcs:
@@ -185,9 +189,14 @@ def measure(args):
     return "NAO-ACHEI", ""
 
 
+def is_wrapped(args, wrapper):
+    """Já embrulhado = argv0 é o --wrapper deste plano OU um wait-for-dolt.sh em QUALQUER caminho (outro GC_CITY_PATH, cópia de worktree já apagada). Só a igualdade de caminho dava "a embrulhar" e embrulhava por cima."""
+    return bool(args) and (args[0] == wrapper or os.path.basename(args[0]) == WRAPPER_NAME)   # GUARD:wrapped-by-name
+
+
 def inner(args, wrapper):
     """O comando original de um ProgramArguments já embrulhado (o que vem depois do `--`); não embrulhado → o próprio args. Embrulhado sem `--` → None (formato que não conheço)."""
-    if not args or args[0] != wrapper:
+    if not is_wrapped(args, wrapper):
         return args
     return args[args.index("--") + 1:] if "--" in args[1:] else None   # GUARD:inner-strip
 
@@ -230,7 +239,7 @@ def scan(dirpath, wrapper):
         row = dict(label=label, path=path, args=args, program=d.get("Program"), keepalive=bool(d.get("KeepAlive")), interval=bool(d.get("StartInterval")),
                    cal=bool(d.get("StartCalendarInterval")), link=os.path.islink(path))
         cmd = inner(args, wrapper) if args else None
-        row["wrapped"] = bool(args) and args[0] == wrapper
+        row["wrapped"] = is_wrapped(args, wrapper)
         row["inner"] = cmd
         row["scope"] = label.startswith(HQ_PREFIXES) and not OTHER_RIG.search(" ".join(args or []) + " " + str(d.get("WorkingDirectory", "")))
         row["state"], row["evid"] = "", ""
@@ -243,8 +252,12 @@ def scan(dirpath, wrapper):
 def divergences(rows, policy, wrapper):
     out = []
     wrapped = [r for r in rows if r["wrapped"]]
-    if wrapped and not (os.path.isfile(wrapper) and os.access(wrapper, os.X_OK)):   # GUARD:wrapper-missing-div
-        out.append(f"{len(wrapped)} plist(s) JÁ embrulhado(s) apontam para {wrapper}, que não existe ou não é executável: esses jobs NÃO vão subir")
+    for p in sorted({r["args"][0] for r in wrapped}):   # o que o launchd roda é o argv0 do PLIST, não o --wrapper deste comando
+        n = sum(r["args"][0] == p for r in wrapped)
+        if p != wrapper:   # GUARD:wrapper-other-path
+            out.append(f"{n} plist(s) embrulhado(s) por OUTRO caminho do wrapper: {p} (este plano usa {wrapper})")
+        if not (os.path.isfile(p) and os.access(p, os.X_OK)):   # GUARD:wrapper-missing-div
+            out.append(f"{n} plist(s) JÁ embrulhado(s) apontam para {p}, que não existe ou não é executável: esses jobs NÃO vão subir")
     live = {r["label"]: r for r in rows}
     files = {}
     for r in rows:
@@ -266,6 +279,12 @@ def divergences(rows, policy, wrapper):
             out.append(f"wrap sem leitura medida ({r['state']}): {label}")
         elif dec == "wrap" and r["keepalive"]:   # GUARD:wrap-keepalive
             out.append(f"wrap em job KeepAlive (regra: daemon relança sozinho): {label}")
+        elif dec == "wrap" and not (r["interval"] or r["cal"]):   # GUARD:no-trigger — prazo estourado (rc 75) sem gatilho só tenta de novo no próximo boot
+            out.append(f"wrap sem gatilho de re-disparo: {label}")
+        elif dec != "wrap" and r["wrapped"]:   # GUARD:iso-wrapped
+            out.append(f"{dec} mas já embrulhado: {label}")
+        elif dec == "nao-medido" and r["state"] == "LE":   # GUARD:nm-le — a premissa do nao-medido é "nenhuma chamada achada"
+            out.append(f"nao-medido mas a medição achou chamada (LE): {label}")
     return out
 
 
@@ -274,21 +293,23 @@ def new_args(wrapper, timeout, boot, cmd):
 
 
 def write_plist(row, args, backup_dir):
-    """Reescreve ProgramArguments com backup e confere o resultado; qualquer falha restaura o original. → mensagem de erro ou None."""
+    """Reescreve ProgramArguments com backup e confere o resultado. → mensagem de erro ou None. NUNCA levanta: qualquer falha (ler, criar o backup, escrever) vira erro DESTE plist e o lote segue.
+    O plist só é tocado pelo `os.replace` final (atômico): antes dele o original está intacto, e se o próprio replace falhar também."""
     path = row["path"]
     if row["link"]:   # GUARD:symlink
         return "plist é symlink (a fonte é outro arquivo); não alterei"
-    d = load_plist(path)
-    if "Program" in d:   # GUARD:program-key
-        return "tem a chave Program (o embrulho mudaria o executável); não alterei"
-    os.makedirs(backup_dir, exist_ok=True)
-    bak = os.path.join(backup_dir, os.path.basename(path))
-    shutil.copy2(path, bak)   # GUARD:backup
-    new = dict(d)
-    new["ProgramArguments"] = args
-    data = plistlib.dumps(new, sort_keys=False)
-    tmp = path + ".wfd-tmp"
+    bak, tmp = os.path.join(backup_dir, os.path.basename(path)), path + ".wfd-tmp"
     try:
+        d = load_plist(path)
+        if "Program" in d:   # GUARD:program-key
+            return "tem a chave Program (o embrulho mudaria o executável); não alterei"
+        if os.path.exists(bak):   # GUARD:backup-exists — já existe = o ORIGINAL de uma rodada anterior (--backup-dir reaproveitado); sobrescrever perderia o único backup do original
+            return f"backup já existe em {bak} (--backup-dir reaproveitado?); não alterei"
+        os.makedirs(backup_dir, exist_ok=True)
+        shutil.copy2(path, bak)   # GUARD:backup
+        new = dict(d)
+        new["ProgramArguments"] = args
+        data = plistlib.dumps(new, sort_keys=False)
         if plistlib.loads(data) != new:
             return "a releitura do plist novo não bate; não alterei"
         with open(tmp, "wb") as fh:
@@ -298,14 +319,20 @@ def write_plist(row, args, backup_dir):
         if lint.returncode != 0:   # GUARD:lint
             return "plutil -lint recusou o plist novo; não alterei"
         os.replace(tmp, path)
-    except (OSError, subprocess.SubprocessError, ValueError) as e:
-        if os.path.exists(bak):
-            shutil.copy2(bak, path)
-        return f"falha ao escrever ({type(e).__name__}): original restaurado"
+    except Exception as e:  # noqa: BLE001  GUARD:write-except
+        return f"falha ao escrever ({type(e).__name__}: {str(e)[:60]}): o plist original não foi tocado"
     finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+        try:
+            os.unlink(tmp)   # já virou o plist (ou nunca nasceu) → FileNotFoundError, nada a limpar; falhou limpar → sobra o .wfd-tmp e o resultado acima não é mascarado
+        except OSError:
+            pass
     return None
+
+
+def lib_ok(wrapper):
+    """A sonda que o wrapper carrega (dolt-pid-lib.sh AO LADO dele) lê e define dolt_server_pid? Sem ela todo job embrulhado sairia 76 (inerte) no boot. Ausente/ilegível/sem a função → returncode ≠ 0 → recuso."""
+    lib = os.path.join(os.path.dirname(wrapper), "dolt-pid-lib.sh")
+    return subprocess.run(["/bin/bash", "-c", '. "$1" && type dolt_server_pid', "_", lib], capture_output=True).returncode == 0   # GUARD:lib-preflight
 
 
 def show(rows, bad, total, policy, wrapper, a):
@@ -368,6 +395,8 @@ def main(argv=None):
             return 2
     if a.revert:
         done = fail = 0
+        for fn, why in bad:   # GUARD:revert-bad — plist que não li: não sei se está embrulhado, e isso NÃO é "nada a reverter"
+            print(f"NÃO LI {fn} — {why}: não sei se está embrulhado; confira à mão"); fail += 1
         for r in rows:
             if not r["wrapped"] or (a.only and r["label"] not in a.only):
                 continue
@@ -386,9 +415,9 @@ def main(argv=None):
     if div:   # GUARD:apply-refuses-divergence
         print("\n--apply RECUSADO: há divergência entre a política e o que está vivo (nada foi escrito).", file=sys.stderr)
         return 1
-    ok = os.path.isfile(a.wrapper) and os.access(a.wrapper, os.X_OK) and subprocess.run(["/bin/bash", "-n", a.wrapper], capture_output=True).returncode == 0
+    ok = os.path.isfile(a.wrapper) and os.access(a.wrapper, os.X_OK) and subprocess.run(["/bin/bash", "-n", a.wrapper], capture_output=True).returncode == 0 and lib_ok(a.wrapper)
     if not ok:   # GUARD:wrapper-preflight
-        print(f"\n--apply RECUSADO: wrapper {a.wrapper} ausente, não executável ou com erro de sintaxe — apontar plists para ele quebraria todos os jobs embrulhados.", file=sys.stderr)
+        print(f"\n--apply RECUSADO: wrapper {a.wrapper} ausente, não executável, com erro de sintaxe ou sem o dolt-pid-lib.sh (com dolt_server_pid) ao lado — apontar plists para ele quebraria todos os jobs embrulhados.", file=sys.stderr)
         return 4
     todo = [r for r in rows if r["scope"] and policy[r["label"]][0] == "wrap" and not r["wrapped"] and (not a.only or r["label"] in a.only)]   # GUARD:idempotent
     done = fail = 0

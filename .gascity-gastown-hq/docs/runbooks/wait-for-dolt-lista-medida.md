@@ -21,7 +21,7 @@ python3 -I $GC_CITY_PATH/scripts/wait-for-dolt-plan.py --apply --only com.gascit
 python3 -I $GC_CITY_PATH/scripts/wait-for-dolt-plan.py --revert [--only LABEL]
 ```
 
-Lê `~/Library/LaunchAgents` (o que roda, não o repositório). Nunca chama `launchctl`. Selftest: `python3 -I scripts/wait-for-dolt-plan.selftest.py` (12 cenários + 16 mutantes). Decisões em `scripts/wait-for-dolt.policy.tsv` (`label<TAB>decisão<TAB>motivo`); o plano as confere contra a medição a cada execução.
+Lê `~/Library/LaunchAgents` (o que roda, não o repositório). Nunca chama `launchctl`. Selftest: `python3 -I scripts/wait-for-dolt-plan.selftest.py` (16 cenários + 26 mutantes). Decisões em `scripts/wait-for-dolt.policy.tsv` (`label<TAB>decisão<TAB>motivo`); o plano as confere contra a medição a cada execução e vira divergência (exit 1, `--apply` recusa) quando: job fora da política; `wrap` sem chamada medida, em KeepAlive ou sem `StartInterval`/`StartCalendarInterval` (estourado o prazo, o job só tentaria de novo no próximo boot); `isento`/`nao-medido` já embrulhado; `nao-medido` que mede LÊ.
 
 * **Escopo**: label `com.gascity.*` ou `com.gastown.*`, `RunAtLoad`, programa fora da árvore de outro rig (esses viram bead no rig dele).
 * **Medição** (evidência `arquivo:linha`): LÊ = o programa CHAMA `bd`/`gc`/`dolt` (posição de comando ou `subprocess`); mensagem de log, `jq`, comentário e texto entre aspas não contam (um casamento por texto marcou o `worktree-reaper` como LÊ por causa de uma mensagem do jq; o leitor sabe distinguir aspas e agora ele é TALVEZ). TALVEZ = só menção solta; NÃO ACHEI = programa lido, sem menção; ILEGÍVEL = não consegui ler (inclui o script executado direto ou citado no `-c` que não existe: nunca vira NÃO ACHEI).
@@ -77,5 +77,6 @@ Ensaio numa CÓPIA dos plists vivos (nada vivo foi tocado): `--apply` reescreveu
 
 * A política é julgamento revisado, não verdade medida; o plano só garante que ela bate com o que está vivo. Script que chama script não é seguido.
 * O launchd só aceita o plist novo de fato no recarregamento; `plutil -lint` não prova isso.
-* Se o wrapper sumir depois de aplicado, os jobs embrulhados não sobem: o plano acusa (divergência), e o `--apply` recusa apontar para wrapper que não executa.
+* Se o wrapper sumir depois de aplicado, os jobs embrulhados não sobem: o plano acusa (divergência) pelo argv0 que está no PLIST, qualquer que seja o `--wrapper` da execução. "Embrulhado" é argv0 = `--wrapper` ou um `wait-for-dolt.sh` de qualquer caminho: outro caminho vira divergência (não se embrulha por cima; `--revert` tira). O `--apply` recusa wrapper que não executa ou sem o `dolt-pid-lib.sh` (com `dolt_server_pid`) ao lado.
+* `--revert` lista o plist que não conseguiu ler (`NÃO LI`) e sai 1: não sei se está embrulhado. `--backup-dir` reaproveitado nunca sobrescreve o backup do original (falha daquele plist: use pasta nova para o revert). Falha ao escrever/criar backup é erro do plist, sem traceback, com o original intocado.
 * Entrega: `scripts/wait-for-dolt-plan.py`, `scripts/wait-for-dolt-plan.selftest.py`, `scripts/wait-for-dolt.policy.tsv`, este runbook. Branch `feat/ga-sh8t23.4-wait-for-dolt-plan`.
