@@ -1036,7 +1036,7 @@ echo "=== S32: a step killed mid-WRITE leaves a temp file — the run reclaims i
 # that far, the test SKIPs — it never passes without having exercised the leak.
 cat > "$WORK/git-killwrite" <<'EOF'
 #!/bin/bash
-# git-killwrite: plain git, except the FIRST invocation of the step named by $KW_STEP (maintenance | gc | prune-packed) is killed the way `timeout` kills a step
+# git-killwrite: plain git, except the FIRST invocation of the step named by $KW_STEP (maintenance | gc | prune-packed | repack) is killed the way `timeout` kills a step
 # — SIGTERM to the whole git process tree — once the REAL pack-objects has written >= $KW_MIN_BYTES into its tmp_pack_*; then it exits $KW_EXIT (124 = what
 # `timeout` returns). $KW_MARK (created at the kill) makes every later call plain git, so a retry runs normally. $KW_LOG gets one line per decision.
 gd=""; for a in "$@"; do case "$a" in --git-dir=*) gd="${a#--git-dir=}" ;; esac; done
@@ -1044,6 +1044,7 @@ case "${KW_STEP:-maintenance}" in
   maintenance)  pat=" maintenance run " ;;
   gc)           pat=" gc " ;;
   prune-packed) pat=" prune-packed " ;;
+  repack)       pat=" repack " ;;      # the tail pass (S36 F2); the batches and the gc never run a bare `repack` themselves
 esac
 case " $* " in *"$pat"*) ;; *) exec git "$@" ;; esac
 [ -e "${KW_MARK:?}" ] && exec git "$@"
@@ -1516,14 +1517,23 @@ printf '%s' "$out" | grep -q "tail consolidation: 2 packs (.*, 6 objects, + 0 lo
 # D. what must survive: an unreachable object inside a PICKED pack (moved to a cruft pack — gc's two-week rule decides, not this pass), a pack with a .keep marker, and a cruft pack that already exists
 TD="$WORK/td"; tailrepo "$TD" 4; rm -f "$WORK/state.json" "$WORK/log"
 UD="$(printf 'unreachable-%s-%s' "$$" "$RANDOM" | git --git-dir="$TD/.git" hash-object -w --stdin)"
-echo "$UD" | git --git-dir="$TD/.git" pack-objects -q "$TD/.git/objects/pack/pack" >/dev/null; git --git-dir="$TD/.git" prune-packed -q
+UDP="$TD/.git/objects/pack/pack-$(echo "$UD" | git --git-dir="$TD/.git" pack-objects -q "$TD/.git/objects/pack/pack").pack"; git --git-dir="$TD/.git" prune-packed -q
+{ [ -f "$UDP" ] && [ ! -f "${UDP%.pack}.mtimes" ]; } || bad "test setup: the pack holding the unreachable object is missing or already a cruft pack: $UDP"
 KD="$(printf 'kept-%s-%s' "$$" "$RANDOM" | git --git-dir="$TD/.git" hash-object -w --stdin)"
 echo "$KD" | git --git-dir="$TD/.git" pack-objects -q "$TD/.git/objects/pack/loose" >/dev/null; git --git-dir="$TD/.git" prune-packed -q
 KEEPP="$(ls "$TD"/.git/objects/pack/loose-*.pack | head -1)"; KSUM="$(cksum < "$KEEPP")"; : > "${KEEPP%.pack}.keep"
 out="$(T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TD")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ]; } && ok "with an unreachable object and a .keep pack around, the pass still consolidates (status consolidated)" || bad "tail pass with unreachable/.keep around failed (rc=$rc status=$(last_status)): $out"
-git --git-dir="$TD/.git" cat-file -e "$UD" 2>/dev/null && ok "the unreachable object that was in a picked pack is still readable — the pass moves it to a cruft pack, it does not drop it (gc's 2-week expiry is the only thing that deletes)" || bad "the unreachable object $UD is gone after the tail pass"
+# "still readable" alone would also pass if the pass never picked that pack, so the check is on the pack: a pack's file name comes from its CONTENT, so the cruft pack that now holds the object has the SAME name as the plain pack
+# it replaced (measured: the same pack-<hash>.pack file name before and after) — what proves the pass consumed it is that it now has a .mtimes and it had none
+{ git --git-dir="$TD/.git" cat-file -e "$UD" 2>/dev/null && [ -f "${UDP%.pack}.mtimes" ]; } \
+  && ok "the unreachable object was in a pack the pass consumed and is still readable — now in a CRUFT pack (the same pack name, but with .mtimes, which it did not have): a recent unreachable object is moved, not dropped (the pass expires only what is older than 2 weeks — the rule gc uses by default)" \
+  || bad "the unreachable object $UD: readable=$(git --git-dir="$TD/.git" cat-file -e "$UD" 2>/dev/null && echo yes || echo NO) its-pack-is-now-cruft=$([ -f "${UDP%.pack}.mtimes" ] && echo yes || echo NO)"
 { [ -f "$KEEPP" ] && [ "$(cksum < "$KEEPP")" = "$KSUM" ] && git --git-dir="$TD/.git" cat-file -e "$KD" 2>/dev/null; } && ok "a pack with a .keep marker is untouched (byte-identical, its object readable)" || bad "the .keep pack was repacked or removed: $KEEPP"
+# git's own `repack -a` also leaves a .keep pack alone, so the end state above cannot tell whether the SCRIPT kept it out of the plan; the log can: 4 batch packs + the unreachable object's pack = 5 packs, 13 objects,
+# and the two it passes as --keep-pack (the base and the .keep pack) are the "2 other pack(s)"
+printf '%s' "$out" | grep -q 'tail consolidation: 5 packs (.*13 objects, + 0 loose) -> one pack.*2 other pack(s) kept untouched' \
+  && ok "the plan took 5 packs / 13 objects and left 2 packs out (the base and the .keep pack): the script itself keeps a .keep pack out, it does not lean on git to refuse it" || bad "the tail plan with a .keep pack around is wrong: $out"
 git --git-dir="$TD/.git" fsck --strict >/dev/null 2>&1 && ok "fsck --strict clean" || bad "fsck failed after the tail pass with an unreachable object"
 TD2="$WORK/td2"; mkrepo "$TD2" 8; head -c 1048576 /dev/urandom > "$TD2/ballast.bin"; git -C "$TD2" add ballast.bin && git -C "$TD2" -c maintenance.auto=false -c gc.auto=0 commit -q -m ballast
 UD2="$(printf 'cruft-%s-%s' "$$" "$RANDOM" | git --git-dir="$TD2/.git" hash-object -w --stdin)"
@@ -1533,6 +1543,24 @@ CRP="$(ls "$TD2"/.git/objects/pack/*.mtimes 2>/dev/null | head -1)"; CRP="${CRP%
 out="$(T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TD2")"; rc=$?
 { [ -f "$CRP" ] && [ -n "$CSUM" ] && [ "$(last_status)" = "consolidated" ] && [ "$rc" -eq 0 ] && [ "$(cksum < "$CRP")" = "$CSUM" ] && git --git-dir="$TD2/.git" cat-file -e "$UD2" 2>/dev/null; } \
   && ok "a cruft pack that already existed (.mtimes) is never picked: byte-identical afterwards, its unreachable object still readable" || bad "the existing cruft pack was touched or lost (cruft=${CRP:-none} rc=$rc status=$(last_status)): $out"
+# git rewrites an existing cruft pack into the same bytes, so the end state cannot tell whether the SCRIPT kept it out of the plan; the log can: 4 batch packs (12 objects), and the base + the cruft pack left out
+printf '%s' "$out" | grep -q 'tail consolidation: 4 packs (.*12 objects, + 0 loose) -> one pack.*2 other pack(s) kept untouched' \
+  && ok "the plan took the 4 batch packs / 12 objects and left 2 packs out (the base and the cruft pack): the script itself keeps a cruft pack out of the pass" || bad "the tail plan with an existing cruft pack is wrong: $out"
+
+# D3. the other side of D's rule, pinned so the wording above is a measurement and not a promise: an unreachable object whose pack is OLDER than 2 weeks is expired by the pass itself (--cruft-expiration=2.weeks.ago,
+# the rule gc applies by default) — and nothing reachable goes with it
+TD3="$WORK/td3"; tailrepo "$TD3" 4; rm -f "$WORK/state.json" "$WORK/log"
+UD3="$(printf 'ancient-%s-%s' "$$" "$RANDOM" | git --git-dir="$TD3/.git" hash-object -w --stdin)"
+UDP3="$TD3/.git/objects/pack/pack-$(echo "$UD3" | git --git-dir="$TD3/.git" pack-objects -q "$TD3/.git/objects/pack/pack").pack"; git --git-dir="$TD3/.git" prune-packed -q
+touch -t "$(date -v-21d +%Y%m%d%H%M 2>/dev/null || date -d '21 days ago' +%Y%m%d%H%M)" "$UDP3" 2>/dev/null
+HD3="$(history "$TD3")"
+if [ "$(find "$UDP3" -mtime +14 2>/dev/null | wc -l | tr -d ' ')" != 1 ]; then skip "S36 D3: could not age the pack file on this host — the expiry of an old unreachable object did NOT run"
+else
+  out="$(T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TD3")"; rc=$?
+  { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && ! git --git-dir="$TD3/.git" cat-file -e "$UD3" 2>/dev/null && [ "$(history "$TD3")" = "$HD3" ] && git --git-dir="$TD3/.git" fsck --strict >/dev/null 2>&1; } \
+    && ok "an unreachable object from a 3-week-old pack is expired by the pass (the 2-week rule), the history is identical and fsck --strict clean" \
+    || bad "old unreachable object not expired, or the pass failed (rc=$rc status=$(last_status) object-still-there=$(git --git-dir="$TD3/.git" cat-file -e "$UD3" 2>/dev/null && echo yes || echo no)): $out"
+fi
 
 # E. low disk → skipped LOUDLY and nothing written; the need is the SMALL packs (not the whole repo): the same free space that blocks the gc lets the tail through
 TE="$WORK/te"; tailrepo "$TE" 4; PCE="$(pack_count "$TE")"; rm -f "$WORK/state.json" "$WORK/log"
@@ -1544,11 +1572,13 @@ out="$(T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED_SMALL + 100 )) T_PACKS=3 run_ta
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TE")" = 2 ]; } \
   && ok "free space only just above the small packs (${NEED_SMALL}KiB + 100) and far below the whole repo (gc would need $(pack_kib "$TE")KiB+) → the tail pass runs" || bad "tail pass did not run with enough room for the small packs (rc=$rc status=$(last_status) packs=$(pack_count "$TE")): $out"
 
-# F. a git step that FAILS → failed, exit 1, nothing lost; a pass cut by its OWN cap → timeout; cut by the RUN deadline → deferred (the budget ended, nothing was shown)
-TF="$WORK/tf"; tailrepo "$TF" 4; PCF="$(pack_count "$TF")"; HF="$(history "$TF")"; rm -f "$WORK/state.json" "$WORK/log"
+# F1. how the pass CLASSIFIES its repack: one that fails → failed, exit 1; one cut by its OWN cap → timeout; one cut by the RUN deadline → deferred (the budget ended, nothing was shown).
+# git-fx stands in for the repack and acts BEFORE git runs (it sleeps, or exits 1) — so F1 proves the classification only (status, exit code, log line). It cannot prove anything about what a
+# repack leaves in the object store, or that the packs survive one: git never ran. That is F2, which kills the REAL repack.
+TF="$WORK/tf"; tailrepo "$TF" 4; rm -f "$WORK/state.json" "$WORK/log"
 out="$(FAIL_REPACK=1 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TF")"; rc=$?
-{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && [ "$(pack_count "$TF")" = "$PCF" ] && [ "$(history "$TF")" = "$HF" ]; } \
-  && ok "a repack that fails → status failed, exit 1, packs and history untouched" || bad "failing tail repack judged wrong (rc=$rc status=$(last_status) packs $PCF -> $(pack_count "$TF")): $out"
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && printf '%s' "$out" | grep -q 'tail repack failed rc=1'; } \
+  && ok "a repack that fails → status failed, exit 1, the log says 'tail repack failed rc=1' (the classification; what a dying repack leaves behind is F2)" || bad "failing tail repack judged wrong (rc=$rc status=$(last_status)): $out"
 rm -f "$WORK/state.json" "$WORK/log"
 out="$(SLOW_REPACK=1 SLOW_SLEEP=20 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=20 T_TAIL_TIMEOUT=2 run_tail "$TF")"; rc=$?
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "timeout" ] && printf '%s' "$out" | grep -q 'tail repack timed out after 2s (its own cap)'; } \
@@ -1562,7 +1592,60 @@ else
     || bad "deadline-cut tail pass judged wrong (rc=$rc status=$(last_status) streak=$(state_field "$TF" bad_streak)): $out"
   printf '%s' "$out" | grep -q 'tail repack timed out' && bad "a deadline-cut tail pass was logged as timed out: $out" || ok "no 'timed out' line for a deadline cut"
 fi
-find "$TF/.git/objects/pack" -name 'tmp_*' | grep -q . && bad "a killed tail pass left a temp file in the object store" || ok "no tmp_* left behind by the killed passes (run_step reclaimed them)"
+
+# F2. the REAL repack, killed mid-WRITE (S32's git-killwrite with KW_STEP=repack): this is where the tail pass's leak accounting is actually exercised. pack-objects is writing its tmp_pack_* when it is killed,
+# so there is something for run_step to reclaim — and the packs it was replacing must still all be there, because `repack -d` deletes them only after the new pack is complete. F1's stub cannot show either
+# (it acts before git, so no tmp_pack can exist whatever the script does). The precondition is S32's kw_leaked: if this git cleans up after itself on SIGTERM, or the write never reaches 1MB while git
+# runs, the check SKIPs — it never passes without having exercised the leak.
+tailbig() {  # tailbig <dir> <n> — tailrepo's shape (a 27-object base the object cap leaves alone + n small packs of 3 objects), but each small pack holds a new INCOMPRESSIBLE 12MB blob: a real `repack -f` over them writes long enough to be killed mid-write
+  local d="$1" n="$2" i
+  mkrepo "$d" 8
+  head -c 1048576 /dev/urandom > "$d/ballast.bin"
+  git -C "$d" add ballast.bin && git -C "$d" -c maintenance.auto=false -c gc.auto=0 commit -q -m ballast
+  git --git-dir="$d/.git" -c maintenance.auto=false repack -a -d -q
+  for i in $(seq 1 "$n"); do
+    head -c 12000000 /dev/urandom > "$d/big.bin"
+    git -C "$d" add big.bin && git -C "$d" -c maintenance.auto=false -c gc.auto=0 commit -q -m "big $i"
+    git --git-dir="$d/.git" rev-list --objects --all --unpacked | git --git-dir="$d/.git" pack-objects -q "$d/.git/objects/pack/pack" >/dev/null
+    git --git-dir="$d/.git" prune-packed -q
+  done
+}
+packs_sum() { ls "$1"/.git/objects/pack/*.pack | cksum; }      # the pack file names are content hashes: the same sum = the same packs
+if ! have_lsof; then
+  skip "S36 F2: no lsof on this host — the script cannot prove a temp file is unused, so it keeps it (S33 covers that); the real-kill reclaim checks of the tail pass did NOT run"
+else
+  # (a) killed at the pass's OWN cap (rc 124, the run budget far from over) → timeout, exit 1 — and the leak is gone, the packs are all still there
+  TK="$WORK/tk"; tailbig "$TK" 4; PSK="$(packs_sum "$TK")"; HK="$(history "$TK")"
+  T_PS="$WORK/ps-quiet" T_TAIL=300 T_TAIL_OBJS=20 T_TAIL_TIMEOUT=100 T_DEADLINE=780 kw repack 124 "$TK"
+  if ! why="$(kw_leaked)"; then skip "S36 F2 (a) $why"; else
+    { [ "$KW_RC" -eq 1 ] && [ "$(last_status)" = "timeout" ] && printf '%s' "$KW_OUT" | grep -q 'tail repack timed out after 100s (its own cap)'; } \
+      && ok "(a) the real tail repack killed mid-write at its OWN cap → status timeout, exit 1" || bad "(a) own-cap kill of the real tail repack judged wrong (rc=$KW_RC status=$(last_status)): $KW_OUT"
+    { [ "$(tmp_files "$TK")" = 0 ] && [ "$(garbage_of "$TK")" = 0 ]; } \
+      && ok "(a) ...and the tmp_pack it left is GONE (0 temp files, count-objects garbage 0): run_step reclaimed a leak that really existed" || bad "(a) the killed tail repack's leak is still on disk: $(tmp_files "$TK") temp file(s), garbage=$(garbage_of "$TK")"
+    printf '%s' "$KW_OUT" | grep -Eq "step 'repack .*ended rc=124 and left [1-9][0-9]* temp file.*removed [1-9][0-9]* of" \
+      && ok "(a) the log says what the repack left and that it was removed" || bad "(a) no reclaim line for the tail repack in the log: $KW_OUT"
+    { [ "$(packs_sum "$TK")" = "$PSK" ] && [ "$(history "$TK")" = "$HK" ] && git --git-dir="$TK/.git" fsck --strict >/dev/null 2>&1; } \
+      && ok "(a) every pack it was replacing is still there (same pack files), history identical, fsck --strict clean: a killed pass loses nothing" || bad "(a) a killed tail repack changed or damaged the repo"
+  fi
+  # (b) killed by the RUN deadline (the budget left is under the pass's own cap) → deferred, exit 0, streak 0 — and still no leak
+  TK2="$WORK/tk2"; tailbig "$TK2" 4; PSK2="$(packs_sum "$TK2")"
+  T_PS="$WORK/ps-quiet" T_TAIL=300 T_TAIL_OBJS=20 T_DEADLINE=100 T_MIN_GC=2 kw repack 124 "$TK2"
+  if ! why="$(kw_leaked)"; then skip "S36 F2 (b) $why"; else
+    { [ "$KW_RC" -eq 0 ] && [ "$(last_status)" = "deferred" ] && [ "$(state_field "$TK2" bad_streak)" = 0 ] && printf '%s' "$KW_OUT" | grep -q 'tail repack was cut by the run deadline'; } \
+      && ok "(b) the real tail repack killed mid-write by the RUN deadline → status deferred, exit 0, streak 0" || bad "(b) deadline kill of the real tail repack judged wrong (rc=$KW_RC status=$(last_status) streak=$(state_field "$TK2" bad_streak)): $KW_OUT"
+    { [ "$(tmp_files "$TK2")" = 0 ] && [ "$(garbage_of "$TK2")" = 0 ] && [ "$(packs_sum "$TK2")" = "$PSK2" ]; } \
+      && ok "(b) ...no temp file, garbage 0, same pack files" || bad "(b) leak or change after a deadline-killed tail repack: $(tmp_files "$TK2") temp file(s), garbage=$(garbage_of "$TK2")"
+  fi
+  # (c) the repack DIES mid-write (rc 1 — out of space at the disk floor is the incident) → failed, exit 1 — the same leak, another exit code
+  TK3="$WORK/tk3"; tailbig "$TK3" 4; PSK3="$(packs_sum "$TK3")"; HK3="$(history "$TK3")"
+  T_PS="$WORK/ps-quiet" T_TAIL=300 T_TAIL_OBJS=20 T_TAIL_TIMEOUT=100 T_DEADLINE=780 kw repack 1 "$TK3"
+  if ! why="$(kw_leaked)"; then skip "S36 F2 (c) $why"; else
+    { [ "$KW_RC" -eq 1 ] && [ "$(last_status)" = "failed" ] && printf '%s' "$KW_OUT" | grep -q 'tail repack failed rc=1'; } \
+      && ok "(c) the real tail repack that died mid-write (rc 1) → status failed, exit 1" || bad "(c) failed real tail repack judged wrong (rc=$KW_RC status=$(last_status)): $KW_OUT"
+    { [ "$(tmp_files "$TK3")" = 0 ] && [ "$(garbage_of "$TK3")" = 0 ] && [ "$(packs_sum "$TK3")" = "$PSK3" ] && [ "$(history "$TK3")" = "$HK3" ]; } \
+      && ok "(c) its tmp_pack is reclaimed too, the packs and history are untouched — the rule is 'a step that did not end 0', not 'a step that timed out'" || bad "(c) leak or change after a failed tail repack: $(tmp_files "$TK3") temp file(s), garbage=$(garbage_of "$TK3")"
+  fi
+fi
 
 # G. ONE REPACKER AT A TIME holds for the tail too: a foreign repack in the repo → busy, nothing started; gone → consolidates
 TG="$WORK/tg"; tailrepo "$TG" 4; PCG="$(pack_count "$TG")"; rm -f "$WORK/state.json" "$WORK/log"
@@ -1573,6 +1656,13 @@ out="$(T_TAIL=300 T_TAIL_OBJS=20 run_jac "$TG")"; rc=$?
 fg_stop_all
 out="$(T_TAIL=300 T_TAIL_OBJS=20 run_jac "$TG")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TG")" = 2 ]; } && ok "next run, process gone → consolidates" || bad "tail pass did not run after the repacker ended (rc=$rc status=$(last_status)): $out"
+# ...and CANNOT TELL is not "none" for the tail either (S35 F is the same rule for the gc): a look that fails leaves the packs alone, status busy, and the log says it could not tell
+printf '#!/bin/bash\nexit 1\n' > "$WORK/ps-cant"; chmod +x "$WORK/ps-cant"
+TG2="$WORK/tg2"; tailrepo "$TG2" 4; PCG2="$(pack_count "$TG2")"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(T_PS="$WORK/ps-cant" T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TG2")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "busy" ] && [ "$(pack_count "$TG2")" = "$PCG2" ] && printf '%s' "$out" | grep -q 'tail consolidation not started: cannot tell whether another git process is repacking'; } \
+  && ok "a ps that fails → tail NOT started: status busy, exit 0, packs unchanged, the log says it cannot tell (under doubt the inert state is: do not repack)" \
+  || bad "unanswerable look vs tail judged wrong (rc=$rc status=$(last_status) packs $PCG2 -> $(pack_count "$TG2")): $out"
 
 # H. tier 1 and the tail in ONE run: the batches drain the loose objects, then the tail merges what they made (the production flow); a failed tier 1 never lets the tail pack the backlog it left
 TH="$WORK/th"; tailrepo "$TH" 4; addcommits "$TH" 20; rm -f "$WORK/state.json" "$WORK/log"; HH="$(history "$TH")"
@@ -1593,16 +1683,93 @@ out="$(PACKFAIL_MAINT=1 T_GIT="$WORK/git-fx" T_LIMIT=100 T_TAIL=300 T_TAIL_OBJS=
   && ok "a batch that packed everything and then reported failure: the tail still runs (nothing loose is left) but the failure stays — status failed, exit 1, not laundered into consolidated" \
   || bad "failed batch + successful tail judged wrong (rc=$rc status=$(last_status) loose=$(loose_count "$TH3") packs=$(pack_count "$TH3")): $out"
 
+# H4. a pass that does NOTHING never launders a failure (header 2a): tier 1 reports failure after packing everything (PACKFAIL_MAINT, as in H3, so no backlog stops the tail from being considered), and then the tail
+# is busy / out of budget / cut by the run deadline. Each of those must leave `failed` standing: replacing it with a green status (busy, deferred) would end the run exit 0, streak 0, with a real failure only in the log.
+TH4="$WORK/th4"; tailrepo "$TH4" 4; addcommits "$TH4" 3; rm -f "$WORK/state.json" "$WORK/log"
+fg_start "$TH4" repack -d -l --geometric=2 --quiet --write-midx || bad "test setup: the stand-in repacker did not show up in ps"
+FG4="$FG_PID"
+out="$(PACKFAIL_MAINT=1 T_GIT="$WORK/git-fx" T_LIMIT=100 T_TAIL=300 T_TAIL_OBJS=40 run_jac "$TH4")"; rc=$?
+fg_stop_all
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && printf '%s' "$out" | grep -q "tail consolidation not started: pid $FG4"; } \
+  && ok "(a) tier 1 failed, then the tail finds a foreign repacker (busy): the status stays failed, exit 1 — a pass that did nothing does not turn a failure into 'busy'" \
+  || bad "failed tier 1 + busy tail judged wrong (rc=$rc status=$(last_status)): $out"
+TH5="$WORK/th5"; tailrepo "$TH5" 4; addcommits "$TH5" 3; rm -f "$WORK/state.json" "$WORK/log"
+out="$(PACKFAIL_MAINT=1 T_GIT="$WORK/git-fx" T_LIMIT=100 T_TAIL=300 T_TAIL_OBJS=40 T_MIN_GC=900 run_tail "$TH5")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && printf '%s' "$out" | grep -q 'tail consolidation deferred to the next run'; } \
+  && ok "(b) tier 1 failed, then the tail has less budget left than it needs (deferred): the status stays failed, exit 1 — not 'deferred'" \
+  || bad "failed tier 1 + no budget for the tail judged wrong (rc=$rc status=$(last_status)): $out"
+TH6="$WORK/th6"; tailrepo "$TH6" 4; addcommits "$TH6" 3; rm -f "$WORK/state.json" "$WORK/log"
+out="$(PACKFAIL_MAINT=1 SLOW_REPACK=1 SLOW_SLEEP=60 T_GIT="$WORK/git-fx" T_LIMIT=100 T_TAIL=300 T_TAIL_OBJS=40 T_DEADLINE=12 T_MIN_BATCH=1 T_MIN_GC=2 run_tail "$TH6")"; rc=$?      # T_MIN_BATCH=1: with 12s in all, tier 1 would otherwise defer its own batch and the tail would never meet a failure to launder
+if printf '%s' "$out" | grep -q 'tail consolidation deferred to the next run'; then skip "S36 H4 (c): the tail pass never started inside this test's 12s budget (host too loaded)"
+else
+  { [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && printf '%s' "$out" | grep -q 'tail repack was cut by the run deadline'; } \
+    && ok "(c) tier 1 failed, then the tail repack is cut by the RUN deadline: the status stays failed, exit 1 — not 'deferred'" \
+    || bad "failed tier 1 + deadline-cut tail judged wrong (rc=$rc status=$(last_status)): $out"
+fi
+
 # J. a pack whose .idx cannot be read as v2 is never picked: "cannot tell" is not a count (here: a v1 index, which git reads and pack_objects does not)
 TJ="$WORK/tj"; tailrepo "$TJ" 4; rm -f "$WORK/state.json" "$WORK/log"
 V1="$(ls "$TJ"/.git/objects/pack/pack-*.pack | grep -v "$(base_pack "$TJ")" | head -1)"; git --git-dir="$TJ/.git" index-pack --index-version=1 -o "$WORK/v1.idx" "$V1" >/dev/null 2>&1 && mv "$WORK/v1.idx" "${V1%.pack}.idx" || bad "test setup: could not rewrite the index of $V1 as v1"
 [ "$(od -An -tx1 -N4 "${V1%.pack}.idx" | tr -d ' \n')" != ff744f63 ] || bad "test setup: the index is still v2"
 V1SUM="$(cksum < "$V1")"; HJ="$(history "$TJ")"
-out="$(T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TJ")"; rc=$?
-{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ -f "$V1" ] && [ "$(cksum < "$V1")" = "$V1SUM" ] && [ "$(pack_count "$TJ")" = 3 ] && printf '%s' "$out" | grep -q 'tail consolidation: 3 packs'; } \
-  && ok "a pack with a v1 index (object count unreadable) stays out: 3 of the 4 small packs merged, the v1 pack and the base kept (packs 5 -> $(pack_count "$TJ"))" \
+# The object cap is set to the largest 32-bit number on purpose. A script that read the count out of a v1 index anyway would get four bytes of an object NAME (a random 32-bit number); under a small cap such a number
+# never fits, so the pack would stay out for a reason that has nothing to do with the check being tested (measured: the mutant that drops the v2 check passed this test under a cap of 20). Under 2^32-1 any number fits,
+# so the ONLY thing that keeps this pack out is that its count could not be read — and with no cap to leave it out, the base pack (27 objects) is merged too.
+out="$(T_TAIL=300 T_TAIL_OBJS=4294967295 run_tail "$TJ")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ -f "$V1" ] && [ "$(cksum < "$V1")" = "$V1SUM" ] && [ "$(pack_count "$TJ")" = 2 ] && printf '%s' "$out" | grep -q 'tail consolidation: 4 packs'; } \
+  && ok "a pack with a v1 index (object count unreadable) stays out even under a cap every number fits: the other 4 packs (base included) merged, the v1 pack byte-identical (packs 5 -> $(pack_count "$TJ"))" \
   || bad "a pack with an unreadable object count was taken or the run failed (rc=$rc status=$(last_status) packs=$(pack_count "$TJ")): $out"
 { [ "$(history "$TJ")" = "$HJ" ] && git --git-dir="$TJ/.git" fsck --strict >/dev/null 2>&1; } && ok "history identical, fsck clean" || bad "history or fsck changed by the partial tail pass"
+
+# K. what `-f` and `--depth=250` are FOR. Every fixture above holds whole-object seeds — nothing stored as a delta for the pass to recompute — so a pass WITHOUT `-f`, or with git's default depth, passed all of A-J
+# as well (measured with mutants: removing -f or --depth left S36 at 43 PASS / 0 FAIL). K1 shows the effect of -f on the shape the incident had; K0 pins the command line, `--depth=250` included.
+# K0. the command line the pass issues, as git receives it
+printf '#!/bin/bash\ncase " $* " in *" repack "*) printf "%%s\\n" "$*" >> "${ARGV_LOG:?}" ;; esac\nexec git "$@"\n' > "$WORK/git-argv"; chmod +x "$WORK/git-argv"
+TK0="$WORK/tk0"; tailrepo "$TK0" 4; rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TK0")"; rc=$?
+argv="$(cat "$WORK/argv" 2>/dev/null)"; missing=""
+for w in -a -d -l -f --window=10 --depth=250 --cruft --cruft-expiration=2.weeks.ago; do case " $argv " in *" $w "*) ;; *) missing="$missing $w" ;; esac; done
+case " $argv " in *" --keep-pack=pack-"*) ;; *) missing="$missing --keep-pack=<the base>" ;; esac
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ -z "$missing" ] && [ "$(printf '%s\n' "$argv" | grep -c .)" = 1 ]; } \
+  && ok "the tail issues ONE repack with -a -d -l -f --window=10 --depth=250 --cruft --cruft-expiration=2.weeks.ago and a --keep-pack for the pack it leaves alone (its EFFECT: -f in K1; --depth=250 has none that a selftest-sized fixture has shown — tried: versions that only append, versions edited in place, strict --window=1 chains; git kept every chain under 31 deep whatever depth was asked — so it rests on the 15/10 production measurement)" \
+  || bad "the tail's repack command line is wrong (rc=$rc status=$(last_status), missing:${missing:- none}, calls=$(printf '%s\n' "$argv" | grep -c .)): $argv"
+# K1. -f: a version stored as a delta against a POOR base. x.bin v2 (X2) sits in a batch pack deltified against y.bin (shares 60% of its bytes, so 40% of X2 is stored again, ~400KB), while its real
+# base, v1 (X1), is in ANOTHER pack, where git cannot use it. `repack -a -d` REUSES a stored delta whatever its base; only -f recomputes it. pack.threads=1: git's threaded delta search is not repeatable on a handful of objects.
+TK1="$WORK/tk1"; git init -q "$TK1"; git -C "$TK1" config pack.threads 1
+head -c 1000000 /dev/urandom > "$TK1/x.bin"
+git -C "$TK1" add x.bin && git -C "$TK1" -c maintenance.auto=false -c gc.auto=0 commit -q -m x1; K1A="$(git -C "$TK1" rev-parse HEAD)"
+printf 'Z' | dd of="$TK1/x.bin" bs=1 seek=500000 conv=notrunc 2>/dev/null
+{ head -c 600000 "$TK1/x.bin"; head -c 500000 /dev/urandom; } > "$TK1/y.bin"
+git -C "$TK1" add x.bin y.bin && git -C "$TK1" -c maintenance.auto=false -c gc.auto=0 commit -q -m x2y; K1X2="$(git -C "$TK1" rev-parse HEAD:x.bin)"
+git --git-dir="$TK1/.git" rev-list --objects "$K1A" | git --git-dir="$TK1/.git" pack-objects -q "$TK1/.git/objects/pack/pack" >/dev/null
+git --git-dir="$TK1/.git" rev-list --objects HEAD "^$K1A" | git --git-dir="$TK1/.git" pack-objects -q "$TK1/.git/objects/pack/pack" >/dev/null
+git --git-dir="$TK1/.git" prune-packed -q
+x2_stored() { local p; for p in "$TK1"/.git/objects/pack/*.idx; do git verify-pack -v "$p" 2>/dev/null; done | awk -v o="$K1X2" '$1 == o && NF >= 7 {print $4}'; }      # bytes X2 takes in its pack when it is stored as a delta; nothing when it is stored whole
+is_uint_t() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+X2B="$(x2_stored)"; HK1="$(history "$TK1")"; PK1B="$(pack_kib "$TK1")"; rm -f "$WORK/state.json" "$WORK/log"
+if ! { is_uint_t "${X2B:-}" && [ "$X2B" -ge 300000 ] && [ "$(pack_count "$TK1")" = 2 ]; }; then
+  skip "S36 K1: could not build the poor-base fixture on this git (X2 delta bytes='${X2B:-none: stored whole}', packs=$(pack_count "$TK1")) — the effect of -f did NOT run"
+else
+  out="$(T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TK1")"; rc=$?
+  PK1A="$(pack_kib "$TK1")"
+  { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TK1")" = 1 ] && [ "$PK1A" -le 1650 ]; } \
+    && ok "-f recomputes a delta stored against a poor base: size-pack ${PK1B}KiB -> ${PK1A}KiB (X2 was ${X2B} bytes as a delta of y.bin; measured 1470KiB with -f, 1863KiB without)" \
+    || bad "the pass did not shrink a poor-base delta (rc=$rc status=$(last_status) packs=$(pack_count "$TK1") size-pack ${PK1B}KiB -> ${PK1A}KiB, limit 1650KiB): $out"
+  { [ "$(history "$TK1")" = "$HK1" ] && git --git-dir="$TK1/.git" fsck --strict >/dev/null 2>&1; } && ok "history identical, fsck --strict clean" || bad "history or fsck changed by the -f pass"
+fi
+
+# L. an unreadable pack directory is "could not be listed", said in the log — not an empty list that quietly means "nothing to consolidate". (git count-objects itself carries on with packs=0 and exit 0, so the pass is reached.)
+TL="$WORK/tl"; tailrepo "$TL" 4; PSL="$(packs_sum "$TL")"; rm -f "$WORK/state.json" "$WORK/log"
+chmod 000 "$TL/.git/objects/pack"
+if [ -r "$TL/.git/objects/pack" ]; then skip "S36 L: this user can read a mode-000 directory (root?) — the unreadable-pack-directory check did NOT run"
+else
+  out="$(T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TL")"; rc=$?
+  chmod 755 "$TL/.git/objects/pack"
+  { [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'tail consolidation skipped: the pack directory of .* could not be listed' && [ "$(packs_sum "$TL")" = "$PSL" ]; } \
+    && ok "an unreadable pack directory → the log says 'could not be listed' (not silence), nothing consolidated, the packs are as they were" \
+    || bad "an unreadable pack directory was handled wrong (rc=$rc packs_same=$([ "$(packs_sum "$TL")" = "$PSL" ] && echo yes || echo NO)): $out"
+fi
+chmod 755 "$TL/.git/objects/pack" 2>/dev/null
 
 # I. the defaults that run in production
 cfg="$("$SCRIPT" --print-config)"

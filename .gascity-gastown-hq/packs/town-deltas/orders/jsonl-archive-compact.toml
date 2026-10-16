@@ -8,10 +8,13 @@
 # same 11k commits) and pushed the boot disk to its 2GB floor. The town's
 # git-maintenance-runner does not list these repos and skips below 10GB free.
 #
-# This order packs loose objects in bounded batches once they pass 256MiB, and runs one
-# consolidating gc when packs pile up (>= 8). It never shortens history — the S3 mirror copies
-# only the working tree, so the git history has no offsite copy. Full rationale, the alarm rule
-# and the failure states: header of assets/scripts/jsonl-archive-compact.sh.
+# This order packs loose objects in bounded batches once they pass 256MiB, merges the small
+# packs those batches leave into ONE pack when they hold >= 256MiB (ga-3sf9r8: `repack -f` over
+# just those packs, so the per-batch first copies of a giant file collapse; the big old pack is
+# never touched), and runs one consolidating gc when packs pile up (>= 8). It never shortens
+# history — the S3 mirror copies only the working tree, so the git history has no offsite
+# copy. Full rationale, the alarm rule and the failure states: header of
+# assets/scripts/jsonl-archive-compact.sh.
 #
 # interval 30m: at ~243MiB/h of new loose blobs the 256MiB limit is crossed about hourly; 30m
 # bounds how long a crossing goes unnoticed. timeout 900s > the script's own 780s deadline so it

@@ -58,8 +58,10 @@
 #      not by the size of the archive. A pack it grew to the cap is left alone by the next pass (it no longer fits), so history costs one seed per ~120 objects instead of one per batch.
 #      It never starts while loose bytes are still over the loose limit (`repack -a` would pack those too, an amount of work the object cap does not bound: tier 1 drains them first), nor
 #      while another git process is repacking the repo (ONE REPACKER AT A TIME, below), and it takes a pack only when it can count its objects from the .idx (cruft packs, .keep packs and
-#      packs it cannot read stay kept). Status: `consolidated` when it ended 0 and nothing before it had failed (a failure stays visible); a pass that did NOTHING (busy, cut by the run deadline,
-#      not started) never launders a failure; its own cap running out is `timeout`, a repack that ended non-zero is `failed`. The disk it needs is the small packs' size + a quarter of the loose
+#      packs it cannot read stay kept). Status: `consolidated` when it ended 0 and nothing before it had failed (the tail never overwrites a failure with a green); a pass that did NOTHING (busy,
+#      cut by the run deadline, not started) never launders a failure; its own cap running out is `timeout`, a repack that ended non-zero is `failed`. One exception, on purpose: tier 2 below judges
+#      the END state, so when the packs are still >= JAC_PACKS_LIMIT after the tail and its gc then ends 0, that gc sets `consolidated` over whatever the tail (or tier 1) left — it rewrites
+#      every pack the tail would have merged — and the tail's failure survives in the log only. The disk it needs is the small packs' size + a quarter of the loose
 #      bytes + the headroom, else `skipped-low-disk`. The pass is not adaptive: a cap that is too small for the objects it takes fails the same way every run, in the log, until JAC_TAIL_MAX_OBJECTS is lowered.
 #   2. pack count >= JAC_PACKS_LIMIT (8): one full `git gc` to consolidate. Each batch pack
 #      carries its own first full copy of every big file (batches cannot delta against earlier
