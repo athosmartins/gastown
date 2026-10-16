@@ -76,6 +76,10 @@ type gap2_free_refused_stranded    >/dev/null 2>&1 || { echo "FATAL: gap2_free_r
 type open_verdict_ids_from_json    >/dev/null 2>&1 || { echo "FATAL: open_verdict_ids_from_json not defined by guard (ga-g4m18)"; exit 1; }
 type gap2_wait_active_marker       >/dev/null 2>&1 || { echo "FATAL: gap2_wait_active_marker not defined by guard (ga-crgfa0)"; exit 1; }
 type gap2_skip_no_changes          >/dev/null 2>&1 || { echo "FATAL: gap2_skip_no_changes not defined by guard (ga-crgfa0)"; exit 1; }
+type gap2_janitor_token            >/dev/null 2>&1 || { echo "FATAL: gap2_janitor_token not defined by guard (ga-hudkhe)"; exit 1; }
+type gap2_skip_janitor_stranded    >/dev/null 2>&1 || { echo "FATAL: gap2_skip_janitor_stranded not defined by guard (ga-hudkhe)"; exit 1; }
+type gap2_labels_have_code_fail    >/dev/null 2>&1 || { echo "FATAL: gap2_labels_have_code_fail not defined by guard (ga-hudkhe)"; exit 1; }
+type gap2_release_orphan_labels    >/dev/null 2>&1 || { echo "FATAL: gap2_release_orphan_labels not defined by guard (ga-hudkhe)"; exit 1; }
 
 # ── 0. age_minutes_of must read the bead 'Z' timestamps as UTC (not local) ───
 # Regression lock for the TZ bug that made every age negative (off by the host's
@@ -878,7 +882,14 @@ echo "── 6e. gap2_arm_needs_remerge (ga-4tgga gate-feedback attempt 3: label
 
 GAP2_ARM_CALLS="$(mktemp)"
 GC_CITY=/tmp/ga-4tgga-fake-city
-bd() { printf '%s\n' "$*" >> "$GAP2_ARM_CALLS"; return 0; }
+# ga-hudkhe: the arm now reads the parent's labels first (a code-class
+# gate-sha-failed stamp turns it into a release-only arm — see 6e-bis), so the
+# mock must answer `bd show` like a parent that was never rejected.
+bd() {
+  printf '%s\n' "$*" >> "$GAP2_ARM_CALLS"
+  [ "$3" = "show" ] && printf '[{"id":"ga-fake-parent","labels":["story:in-flight","pilot:dispatched","story:approved"]}]'
+  return 0
+}
 gap2_arm_needs_remerge "ga-fake-parent" "ga-fake-sling"
 unset -f bd
 
@@ -1315,6 +1326,206 @@ grep -qF -- "comment ga-fake-parent5" "$GAP2_NOCHGRETRY_CALLS" \
   && ok "gap2_skip_no_changes retries the comment on the NEXT sweep after a failed post (self-healing preserved)" \
   || bad "gap2_skip_no_changes did not retry on the next sweep — a failed post would be lost forever"
 rm -f "$GAP2_NOCHGRETRY_CALLS"
+
+# ── 6k. gap2_arm_needs_remerge must not claim "no reviewer ever rejected" over a
+# real FAIL (ga-hudkhe: ga-c79qtf / parent ga-zri39b.3) ──────────────────────
+# The arm is the ONLY writer of gate:needs-remerge and its comment says "no
+# reviewer ever rejected this code". The parent of the live incident carried
+# gate-sha-failed:<sha>:code stamps (twice) — the claim was false and Pilot was
+# told to resubmit a SHA the gate had already failed, with the legitimate
+# gate:needs-fix state stripped. These tests record the ACTUAL bd calls.
+echo "── 6k. quality-gate-guard.sh gap2_arm_needs_remerge: gate-sha-failed on the parent forbids gate:needs-remerge (ga-hudkhe) ──"
+
+# Shared mock: `bd show` answers $GAP2_FAKE_SHOW (raw stdout) with rc $GAP2_FAKE_SHOW_RC;
+# every call is recorded. A label/comment verb can be made to fail via GAP2_FAKE_FAIL_VERB.
+GAP2_FAKE_SHOW=""; GAP2_FAKE_SHOW_RC=0; GAP2_FAKE_FAIL_VERB=""; GAP2_FAKE_CALLS=""
+_gap2_fake_bd() {
+  printf '%s\n' "$*" >> "$GAP2_FAKE_CALLS"
+  if [ "$3" = "show" ]; then printf '%s' "$GAP2_FAKE_SHOW"; return "$GAP2_FAKE_SHOW_RC"; fi
+  [ -n "$GAP2_FAKE_FAIL_VERB" ] && [ "$3 $4" = "$GAP2_FAKE_FAIL_VERB" ] && return 1
+  [ -n "$GAP2_FAKE_FAIL_VERB" ] && [ "$3" = "$GAP2_FAKE_FAIL_VERB" ] && return 1
+  return 0
+}
+
+# (1) the live shape: FAIL stamps + gate:needs-fix on the parent
+GAP2_FAKE_CALLS="$(mktemp)"; GC_CITY=/tmp/ga-hudkhe-fake-city
+GAP2_FAKE_SHOW='[{"id":"ga-fake-failed","labels":["story:in-flight","pilot:dispatched","gate:needs-fix","gate-sha-failed:140b6292a40b442341947e799b35df8537e3b8d9:code","gate-sha-failed:3bc77e52b3ff8408bf1f451b3c86489132b6adf6:code"]}]'
+bd() { _gap2_fake_bd "$@"; }
+gap2_arm_needs_remerge "ga-fake-failed" "ga-fake-sling-f" && GAP2_RC=0 || GAP2_RC=$?
+unset -f bd
+[ "$GAP2_RC" -eq 0 ] && ok "FAIL-stamped parent: gap2_arm_needs_remerge completes (rc0)" || bad "FAIL-stamped parent: rc=$GAP2_RC"
+grep -qF -- "label add ga-fake-failed gate:needs-remerge" "$GAP2_FAKE_CALLS" \
+  && bad "REGRESSION ga-hudkhe: gate:needs-remerge stamped on a parent whose gate-sha-failed proves a reviewer rejected it" \
+  || ok "FAIL-stamped parent: gate:needs-remerge is NOT stamped"
+grep -qF -- "label add" "$GAP2_FAKE_CALLS" \
+  && bad "FAIL-stamped parent: a label was ADDED — the legitimate gate:needs-fix state is the truth, nothing may be re-armed over it" \
+  || ok "FAIL-stamped parent: no label added at all (existing gate:needs-fix left to stand)"
+grep -qF -- "label remove ga-fake-failed gate:" "$GAP2_FAKE_CALLS" \
+  && bad "FAIL-stamped parent: a gate:* label was REMOVED" \
+  || ok "FAIL-stamped parent: no gate:* label removed"
+grep -qF -- "label remove ga-fake-failed story:in-flight" "$GAP2_FAKE_CALLS" && grep -qF -- "label remove ga-fake-failed pilot:dispatched" "$GAP2_FAKE_CALLS" \
+  && ok "FAIL-stamped parent: story:in-flight + pilot:dispatched ARE released (lane freed, parent not stuck in the sweep)" \
+  || bad "FAIL-stamped parent: the two orphan markers were not both released"
+GAP2_FAKE_COMMENT=$(grep -F -- "comment ga-fake-failed" "$GAP2_FAKE_CALLS" | head -1)
+[ -n "$GAP2_FAKE_COMMENT" ] && ok "FAIL-stamped parent: an explanatory comment is posted" || bad "FAIL-stamped parent: no comment"
+case "$GAP2_FAKE_COMMENT" in *"no reviewer ever rejected"*) bad "REGRESSION ga-hudkhe: the comment still says no reviewer ever rejected this code — false over a gate-sha-failed stamp" ;; *) ok "FAIL-stamped parent: the comment does NOT claim no reviewer ever rejected the code" ;; esac
+rm -f "$GAP2_FAKE_CALLS"
+
+# (2) a legacy unclassed stamp counts the same
+GAP2_FAKE_CALLS="$(mktemp)"
+GAP2_FAKE_SHOW='[{"id":"ga-fake-legacy","labels":["story:in-flight","pilot:dispatched","gate-sha-failed:140b6292a40b442341947e799b35df8537e3b8d9"]}]'
+bd() { _gap2_fake_bd "$@"; }
+gap2_arm_needs_remerge "ga-fake-legacy" "ga-fake-sling-l"
+unset -f bd
+grep -qF -- "label add ga-fake-legacy gate:needs-remerge" "$GAP2_FAKE_CALLS" \
+  && bad "legacy unclassed gate-sha-failed stamp: gate:needs-remerge was stamped" \
+  || ok "legacy unclassed gate-sha-failed stamp also forbids gate:needs-remerge"
+rm -f "$GAP2_FAKE_CALLS"
+
+# (3) NO stamp, or a hold-only stamp: the arm keeps its ga-e2n96 behavior
+for GAP2_CASE in 'none|["story:in-flight","pilot:dispatched"]' 'hold|["story:in-flight","pilot:dispatched","gate-sha-failed:aaa111:hold"]' 'empty|[]'; do
+  GAP2_CASE_NAME=${GAP2_CASE%%|*}; GAP2_CASE_LABELS=${GAP2_CASE#*|}
+  GAP2_FAKE_CALLS="$(mktemp)"
+  GAP2_FAKE_SHOW="[{\"id\":\"ga-fake-$GAP2_CASE_NAME\",\"labels\":$GAP2_CASE_LABELS}]"
+  bd() { _gap2_fake_bd "$@"; }
+  gap2_arm_needs_remerge "ga-fake-$GAP2_CASE_NAME" "ga-fake-sling-x" && GAP2_RC=0 || GAP2_RC=$?
+  unset -f bd
+  if [ "$GAP2_RC" -eq 0 ] \
+     && grep -qF -- "label add ga-fake-$GAP2_CASE_NAME gate:needs-remerge" "$GAP2_FAKE_CALLS" \
+     && grep -qF -- "label add ga-fake-$GAP2_CASE_NAME gate:needs-fix" "$GAP2_FAKE_CALLS"; then
+    ok "parent labels '$GAP2_CASE_NAME' (no code-class FAIL stamp): the arm still stamps gate:needs-fix + gate:needs-remerge (ga-e2n96 unchanged)"
+  else
+    bad "parent labels '$GAP2_CASE_NAME' (no code-class FAIL stamp): arm no longer re-arms (rc=$GAP2_RC) — the guard is too broad"
+  fi
+  rm -f "$GAP2_FAKE_CALLS"
+done
+
+# (4) falhou/ilegível → rc1 and NO write of any kind: an unreadable parent is
+# not evidence that nobody rejected it.
+_gap2_unreadable_case() {  # <name> <bd show stdout> <bd show rc>
+  GAP2_FAKE_SHOW="$2"; GAP2_FAKE_SHOW_RC="$3"; GAP2_FAKE_CALLS="$(mktemp)"
+  bd() { _gap2_fake_bd "$@"; }
+  gap2_arm_needs_remerge "ga-fake-unread" "ga-fake-sling-u" && GAP2_RC=0 || GAP2_RC=$?
+  unset -f bd
+  GAP2_WRITES=$(grep -vF -- " show " "$GAP2_FAKE_CALLS" | grep -c . || true)
+  if [ "$GAP2_RC" -ne 0 ] && [ "$GAP2_WRITES" -eq 0 ]; then
+    ok "parent unreadable ($1): rc1 and ZERO writes — stays inert, next sweep retries"
+  else
+    bad "parent unreadable ($1): rc=$GAP2_RC writes=$GAP2_WRITES — it must refuse and write nothing"
+  fi
+  rm -f "$GAP2_FAKE_CALLS"
+  GAP2_FAKE_SHOW=""; GAP2_FAKE_SHOW_RC=0
+}
+_gap2_unreadable_case "bd show fails (rc1, no output)" "" 1
+_gap2_unreadable_case "bd show prints nothing (rc0)"   "" 0
+_gap2_unreadable_case "bd show prints non-JSON"        "not json at all" 0
+_gap2_unreadable_case "bd show prints null"            "null" 0
+_gap2_unreadable_case "bd show prints []"              "[]" 0
+_gap2_unreadable_case "bd show fails but prints a stale bead" '[{"id":"ga-fake-unread","labels":[]}]' 1
+
+# (5) FAIL-stamped parent + a label remove that errors: rc1, NO comment (it would
+# claim a release that did not happen)
+GAP2_FAKE_CALLS="$(mktemp)"; GAP2_FAKE_FAIL_VERB="label remove"
+GAP2_FAKE_SHOW='[{"id":"ga-fake-rmfail","labels":["story:in-flight","pilot:dispatched","gate-sha-failed:aaa111:code"]}]'
+bd() { _gap2_fake_bd "$@"; }
+gap2_arm_needs_remerge "ga-fake-rmfail" "ga-fake-sling-r" && GAP2_RC=0 || GAP2_RC=$?
+unset -f bd
+GAP2_FAKE_FAIL_VERB=""
+if [ "$GAP2_RC" -ne 0 ] && ! grep -qF -- "comment ga-fake-rmfail" "$GAP2_FAKE_CALLS"; then
+  ok "FAIL-stamped parent, label remove errors: rc1 and no comment (a comment would claim a release that did not happen)"
+else
+  bad "FAIL-stamped parent, label remove errors: rc=$GAP2_RC / commented anyway"
+fi
+rm -f "$GAP2_FAKE_CALLS"
+
+# The caller must act on the new rc: under `set -e` a bare failing call would kill the sweep.
+grep -qE 'gap2_arm_needs_remerge "\$SC_ID" "\$SLING_ID" \\' "$GUARD" \
+  && ok "Step 0c.2 handles gap2_arm_needs_remerge's rc (|| warn) — a refusal cannot abort the sweep under set -e" \
+  || bad "Step 0c.2 calls gap2_arm_needs_remerge without handling a non-zero rc — set -e would abort the whole sweep"
+
+# ── 6l. gap2_skip_janitor_stranded (ga-hudkhe: the skip:janitor-stranded arm) ──
+# A sling closed by sling-task-janitor is not a gate pass. The arm releases the
+# parent's orphaned story:in-flight + pilot:dispatched and NOTHING else: no
+# gate:needs-remerge, no gate:* label added or removed (a real gate:needs-fix
+# stays), no merge check.
+echo "── 6l. gap2_skip_janitor_stranded (ga-hudkhe): release only the orphan markers, never re-arm ──"
+
+GAP2_FAKE_CALLS="$(mktemp)"; GAP2_FAKE_SHOW=""; GAP2_FAKE_FAIL_VERB=""
+bd() { _gap2_fake_bd "$@"; }
+gap2_skip_janitor_stranded "ga-fake-jp" "ga-c79qtf" "Orphan sling-task cleanup (sling-task-janitor" && GAP2_RC=0 || GAP2_RC=$?
+unset -f bd
+[ "$GAP2_RC" -eq 0 ] && ok "gap2_skip_janitor_stranded completes (rc0)" || bad "gap2_skip_janitor_stranded rc=$GAP2_RC"
+grep -qF -- "-C $GC_CITY label remove ga-fake-jp story:in-flight" "$GAP2_FAKE_CALLS" \
+  && ok "actually calls bd label remove ... story:in-flight" || bad "did NOT remove story:in-flight — the parent would stay invisible to Pilot behind a dead stub"
+grep -qF -- "-C $GC_CITY label remove ga-fake-jp pilot:dispatched" "$GAP2_FAKE_CALLS" \
+  && ok "actually calls bd label remove ... pilot:dispatched" || bad "did NOT remove pilot:dispatched"
+grep -qF -- "label add" "$GAP2_FAKE_CALLS" \
+  && bad "REGRESSION ga-hudkhe: a label was ADDED (gate:needs-remerge / gate:needs-fix) — a janitor-closed stub is not a gate pass" \
+  || ok "NO label added (above all never gate:needs-remerge)"
+[ "$(grep -cF -- "label remove" "$GAP2_FAKE_CALLS")" -eq 2 ] \
+  && ok "exactly TWO label removes — the parent's gate:needs-fix (a real FAIL) and every other label are untouched" \
+  || bad "unexpected number of label removes: $(grep -cF -- "label remove" "$GAP2_FAKE_CALLS")"
+grep -qF -- "label remove ga-fake-jp gate:" "$GAP2_FAKE_CALLS" \
+  && bad "a gate:* label was removed" || ok "no gate:* label removed"
+GAP2_FAKE_COMMENT=$(grep -F -- "comment ga-fake-jp" "$GAP2_FAKE_CALLS" | head -1)
+case "$GAP2_FAKE_COMMENT" in *"skip:janitor-stranded"*) ok "the parent comment names the verdict skip:janitor-stranded" ;; *) bad "comment does not say skip:janitor-stranded: '$GAP2_FAKE_COMMENT'" ;; esac
+case "$GAP2_FAKE_COMMENT" in *"ga-c79qtf"*) ok "the comment names the janitor-closed sling" ;; *) bad "comment does not name the sling" ;; esac
+case "$GAP2_FAKE_COMMENT" in *"no reviewer ever rejected"*) bad "the comment must not claim no reviewer ever rejected the code" ;; *) ok "the comment makes no 'no reviewer ever rejected' claim" ;; esac
+grep -qE -- "update .*set-metadata" "$GAP2_FAKE_CALLS" \
+  && bad "unexpected metadata write (no dedup stamp is needed: the release takes the parent out of the sweep)" \
+  || ok "no metadata write (state change, not an inert arm — the comment cannot repeat)"
+rm -f "$GAP2_FAKE_CALLS"
+
+# A label remove that errors: rc1 and NO comment (it says "cleared").
+GAP2_FAKE_CALLS="$(mktemp)"; GAP2_FAKE_FAIL_VERB="label remove"
+bd() { _gap2_fake_bd "$@"; }
+gap2_skip_janitor_stranded "ga-fake-jf" "ga-c79qtf" "Orphan sling-task cleanup (sling-task-janitor" && GAP2_RC=0 || GAP2_RC=$?
+unset -f bd
+GAP2_FAKE_FAIL_VERB=""
+[ "$GAP2_RC" -ne 0 ] && ok "label remove errors → rc1 (caller warns, parent stays selected, retried next sweep)" || bad "label remove errored but rc=$GAP2_RC"
+grep -qF -- "comment ga-fake-jf" "$GAP2_FAKE_CALLS" \
+  && bad "commented 'cleared' although the label remove failed — a comment must not promise more than the code did" \
+  || ok "label remove errors → NO comment posted"
+[ "$(grep -cF -- "label remove" "$GAP2_FAKE_CALLS")" -eq 2 ] \
+  && ok "both removes are still attempted when the first fails" || bad "second remove skipped after the first failed"
+rm -f "$GAP2_FAKE_CALLS"
+
+# A comment that errors after a good release: rc0 (the labels ARE released; the
+# parent leaves the sweep, nothing to retry).
+GAP2_FAKE_CALLS="$(mktemp)"; GAP2_FAKE_FAIL_VERB="comment"
+bd() { _gap2_fake_bd "$@"; }
+gap2_skip_janitor_stranded "ga-fake-jc" "ga-c79qtf" "Orphan sling-task cleanup (sling-task-janitor" && GAP2_RC=0 || GAP2_RC=$?
+unset -f bd
+GAP2_FAKE_FAIL_VERB=""
+[ "$GAP2_RC" -eq 0 ] && ok "comment errors after a good release → rc0 (release is what matters; best-effort audit comment)" || bad "comment failure turned a good release into rc=$GAP2_RC"
+rm -f "$GAP2_FAKE_CALLS"
+
+# The REAL case, end to end through the same pure steps the caller runs: the
+# verbatim ga-c79qtf close_reason + a parent shaped like ga-zri39b.3 (gate:needs-fix
+# + gate-sha-failed stamps). Verdict skip:janitor-stranded; replaying the arm's
+# helper adds no label and removes no gate:* label.
+GAP2_REAL_CR="Orphan sling-task cleanup (sling-task-janitor): ctx:thin dispatch stub for 'ga-zri39b' whose parent is NOT in active build and which has no live assignee. Stale orphan polluting Triagem — closed. The parent's own state drives any future dispatch; this stub is not needed."
+GAP2_REAL_TOK=$(gap2_janitor_token "$GAP2_REAL_CR" || echo ""); GAP2_REAL_FLAG=0; [ -n "$GAP2_REAL_TOK" ] && GAP2_REAL_FLAG=1
+GAP2_REAL_REF=$(gap2_refused_token "exec:auto" "story:in-flight pilot:dispatched gate:needs-fix gate-sha-failed:140b6292:code" "$GAP2_REAL_CR"); GAP2_REAL_REFF=0; [ -n "$GAP2_REAL_REF" ] && GAP2_REAL_REFF=1
+GAP2_REAL_NC=$(gap2_no_changes_token "$GAP2_REAL_CR" || echo ""); GAP2_REAL_NCF=0; [ -n "$GAP2_REAL_NC" ] && GAP2_REAL_NCF=1
+GAP2_REAL_V=$(classify_parent_gap2 1 0 1 0 1 "$GAP2_REAL_REFF" "$GAP2_REAL_NCF" "$GAP2_REAL_FLAG")
+[ "$GAP2_REAL_V" = "skip:janitor-stranded" ] \
+  && ok "REAL ga-c79qtf / ga-zri39b.3 case: verdict is skip:janitor-stranded (it was free:pass-stranded → gate:needs-remerge before ga-hudkhe)" \
+  || bad "REAL case verdict '$GAP2_REAL_V' (refused='$GAP2_REAL_REF' no-changes='$GAP2_REAL_NC' janitor='$GAP2_REAL_TOK')"
+
+# Drift guards: the caller really computes the flag, passes it, and the arm
+# really calls the helper — and the arm body itself never re-arms.
+grep -q 'gap2_janitor_token "\$SLING_CLOSE_REASON"' "$GUARD" \
+  && ok "Step 0c.2 computes the janitor token from the sling's close_reason" || bad "Step 0c.2 never calls gap2_janitor_token"
+grep -q 'classify_parent_gap2 .*"\$SLING_NO_CHANGES" "\$SLING_JANITOR_CLOSED"' "$GUARD" \
+  && ok "Step 0c.2 passes SLING_JANITOR_CLOSED as classify_parent_gap2's 8th arg" || bad "Step 0c.2 does not pass the janitor flag to classify_parent_gap2"
+grep -q 'gap2_skip_janitor_stranded "\$SC_ID" "\$SLING_ID" "\$SLING_JANITOR_TOKEN"' "$GUARD" \
+  && ok "the skip:janitor-stranded arm actually calls gap2_skip_janitor_stranded" || bad "gap2_skip_janitor_stranded is defined but the case-statement arm never calls it"
+GAP2_JANITOR_ARM=$(awk '/^      skip:janitor-stranded\)/{f=1} f{print} f&&/^        ;;/{exit}' "$GUARD")
+[ -n "$GAP2_JANITOR_ARM" ] && ok "found the skip:janitor-stranded case arm body" || bad "no skip:janitor-stranded case arm in Step 0c.2"
+printf '%s\n' "$GAP2_JANITOR_ARM" | grep -vE '^[[:space:]]*#|warn "' | grep -qE 'gap2_arm_needs_remerge|gap2_apply_pass_verdict|label add|gate:needs-remerge|gap2_free_refused_stranded' \
+  && bad "REGRESSION: the skip:janitor-stranded arm re-arms / closes / frees via another path" \
+  || ok "the skip:janitor-stranded arm code never calls the re-arm / pass / refused paths and adds no label"
 
 # ── 7. drift-guard: guard implements both GAP-1 and GAP-2 sweeps ──────────────
 echo "── 7. drift-guard: guard implements ga-pa36 GAP-1 + GAP-2 sweeps ──"
