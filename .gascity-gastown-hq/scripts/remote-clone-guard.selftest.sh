@@ -437,6 +437,52 @@ g_tools() {
   g 0 "tools: Read de arquivo do outro clone passa" Read file_path "$OTH/f.txt"
   g 0 "tools: ferramenta desconhecida passa" WebFetch url "http://x"
 }
+g_cond() {  # gate da fatia 6a (tentativa 3): a variável em que o guarda DECIDE (cwd modelado) tem de ser a mesma em que o shell AGE. cd que pode não ter rodado
+  # (depois de ||, atrás de then/else/do, em pipeline/background, ou depois de && sem a cadeia seguir) deixa o diretório "não sei" → escrita bloqueia; e `<<EOF`
+  # entre aspas é texto: não engole as linhas seguintes. Cada forma tem o caso que bloqueia E o controle que segue liberado.
+  b 2 "cond: cd <alheio> 2>/dev/null || cd <próprio>; git commit (o repro do revisor: o shell fica no alheio)" "cd $OTH 2>/dev/null || cd $OWN; git commit --allow-empty -m probe"
+  b 2 "cond: cd <alheio> && true || cd <próprio>; git commit" "cd $OTH && true || cd $OWN; git commit -m x"
+  b 2 "cond: if true; then cd <alheio>; else cd <próprio>; fi; git commit" "if true; then cd $OTH; else cd $OWN; fi; git commit -m x"
+  b 2 "cond: if false; then cd <próprio>; else cd <alheio>; fi; git commit" "if false; then cd $OWN; else cd $OTH; fi; git commit -m x"
+  b 2 "cond: true && cd <alheio>; git commit (a cadeia && não segue até o git)" "true && cd $OTH; git commit -m x"
+  b 2 "cond: cd <alheio> & git commit (background)" "cd $OTH & git commit -m x"
+  b 2 "cond: cd <alheio> | cat; git commit (pipeline)" "cd $OTH | cat; git commit -m x"
+  b 2 "cond: cd <próprio> || cd <alheio>; git commit (não sei onde estou → bloqueia)" "cd $OWN || cd $OTH; git commit -m x"
+  b 2 "cond: cd <alheio> || true; git commit" "cd $OTH || true; git commit -m x"
+  b 2 "cond: cd <próprio> || true; git commit, com cwd no alheio (se o cd falhar, o git roda no alheio)" "cd $OWN || true; git commit -m x" "$OTH"
+  b 0 "cond: if true; then cd <próprio>; git commit; fi (o cd vale dentro do próprio ramo)" "if true; then cd $OWN/sub; git commit -m x; fi"
+  b 2 "cond: if true; then cd <alheio>; git commit; fi (idem, no alheio: bloqueia)" "if true; then cd $OTH; git commit -m x; fi"
+  b 2 "cond: if true; then cd <próprio>; fi; git commit, com cwd no alheio (depois do fi não sei o ramo)" "if true; then cd $OWN; fi; git commit -m x" "$OTH"
+  b 2 "cond: while cd <alheio>; do git commit; done" "while cd $OTH; do git commit -m x; done"
+  b 2 "cond: cd <alheio> || exit 1; git commit (|| exit mantém o diretório: bloqueia)" "cd $OTH || exit 1; git commit -m x"
+  b 2 "cond: true && cd <alheio> && git commit (cadeia && mantém: bloqueia)" "true && cd $OTH && git commit -m x"
+  b 2 "cond: cd <alheio>; git commit (sequencial: controle, continua bloqueando)" "cd $OTH; git commit -m x"
+  b 0 "cond: cd <próprio> || exit 1; git commit (|| exit mantém: libera)" "cd $OWN/sub || exit 1; git commit -m x"
+  b 0 "cond: cd <próprio> || return; git commit (|| return mantém: libera)" "cd $OWN/sub || return; git commit -m x"
+  b 0 "cond: mkdir -p && cd <próprio> && git init (cadeia && mantém: libera)" "mkdir -p $OWN/sub && cd $OWN/sub && git init"
+  b 0 "cond: cd <próprio>; git commit (sequencial: controle, continua liberado)" "cd $OWN/sub; git commit -m x"
+  b 0 "cond: cd <alheio> || cd <próprio>; git log (leitura segue liberada)" "cd $OTH || cd $OWN; git log"
+  b 0 "cond: (cd <alheio> && git log); git commit (subshell volta: controle)" "(cd $OTH && git log); git commit -m x"
+  b 2 "cond: <<EOF entre aspas não engole as linhas seguintes (o repro do revisor)" "git commit -m \"doc: cat <<EOF\"
+git -C $OTH commit --allow-empty -m x
+EOF"
+  b 2 "cond: <<EOF escapado (\\<<EOF) idem" "echo \\<<EOF
+git -C $OTH commit -m x
+EOF"
+  b 0 "cond: controle — sem o <<EOF entre aspas, o mesmo texto no próprio passa" "git commit -m \"doc: cat\"
+git commit -m x
+EOF"
+  b 0 "cond: <<EOF entre aspas E um heredoc de verdade depois: só o de verdade some (corpo cita o alheio)" "echo \"<<EOF\"
+cat <<EOF
+git -C $OTH commit -m x
+EOF
+git commit -m x"
+  mkdir -p "$TERR/r/wt/nogit"
+  b 2 "cond/msg: (preparo) projeto no território sem .git" "git commit -m x" "$OWN" "$TERR/r/wt/nogit"
+  grep -qF "não tem .git" "$T/err"; ok $? "cond/msg: projeto no território sem .git até a raiz: a mensagem diz isso (não 'fora do território')"
+  b 2 "cond/msg: (preparo) projeto fora do território" "git commit -m x" "$OWN" "$OUT"
+  grep -qF "fora do território" "$T/err"; ok $? "cond/msg: projeto fora do território: a mensagem diz 'fora do território'"
+}
 g_msg() {
   b 2 "msg: (preparo)" "git -C $OTH commit -m x"
   has() { grep -qF -- "$1" "$T/err"; }
@@ -524,7 +570,7 @@ g_hook() {  # o comando que vai no settings do servidor
   c="python3-que-nao-existe -I $P || exit 2"; sh -c "$c" <<<"$js" >/dev/null 2>&1; [ $? = 2 ]; ok $? "hook: python ausente (127) vira 2"
 }
 
-all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg
+all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg; group cond && g_cond
         group check && g_check; group hook && g_hook; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
@@ -545,7 +591,10 @@ echo "== $((n-fails))/$n ok =="
   mutant pass "o próprio clone deixa de ser liberado" 's/ and not (own and inside(t, own))//'
   mutant block "realpath (symlink)" 's/os.path.realpath(os.path.join(cwd or "\/", p))/os.path.abspath(os.path.join(cwd or "\/", p))/'
   mutant block "-C não é seguido" 's/cwd, i = res(seg\[i + 1\], cwd), i + 2/i += 2/'
-  mutant evade "cd não muda o diretório" 's/st\["cwd"\] = chdir(seg\[1:\], st\["cwd"\], c == "pushd")/pass/'
+  mutant evade "cd não muda o diretório" 's/new = None if c == "popd" else chdir(seg\[1:\], st\["cwd"\], c == "pushd")/new = st["cwd"]/'
+  mutant cond "cd condicional (|| , then/else, pipeline, && sem cadeia) segue mudando o diretório" 's/            if kw or prev in ("||", "|", "|&") or term in ("|", "|&", "&") or (prev == "&&" and term != "&&"):/            if False:/'
+  mutant cond "`cd a || cd b`: o trecho depois do || não vira não-sei" 's/        if st.pop("or", False) and prev == "||" and c not in ("exit", "return"):/        if False:/'
+  mutant cond "<<EOF entre aspas volta a abrir heredoc (engole as linhas seguintes)" 's/        if quoted(cmd, m.start()):/        if False:/'
   mutant evade "bash -c não é aberto" 's/return scan(script\[0\], cwd, terr, own, depth + 1)/pass/'
   mutant evade "eval não é aberto" 's/return scan(" ".join(seg\[1:\]), cwd, terr, own, depth + 1)/pass/'
   mutant evade "\$( ) não é aberto" 's/r = scan(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], terr, own, depth + 1)/r = None/'
@@ -554,7 +603,7 @@ echo "== $((n-fails))/$n ok =="
   mutant evade "\$( ) de heredoc sem aspas é ignorado" 's/("" if m.group(2) else/("" if True else/'
   mutant evade "find -exec não é aberto" 's/if t in ("-exec", "-execdir", "-ok", "-okdir"):/if False:/'
   mutant evade "command/env/sudo/xargs não são descascados" 's/elif os.path.basename(seg\[0\]) in WRAP:/elif False:/'
-  mutant pass "corpo de heredoc é tratado como comando" 's/hide(CONT.sub(r"\\1", HEREDOC.sub(heredoc, cmd)))/hide(cmd)/'
+  mutant pass "corpo de heredoc é tratado como comando" 's/hide(CONT.sub(r"\\1", heredocs(cmd)))/hide(cmd)/'
   mutant evade "pontuação colada ); engole a próxima palavra" 's/for pc in PIECE.findall(tok):/for pc in [tok]:/'
   mutant tools "Edit/Write não são vigiados" 's/    if tool in TOOLS_FILE:/    if False:/'
   mutant closed "falha do guarda vira liberado" '/o guarda falhou/{n;s/return 2/return 0/;}'
@@ -592,7 +641,7 @@ echo "== $((n-fails))/$n ok =="
   mutant shell "heredoc para bash/ssh/sh é descartado" 's/^    if any(runs_text(s.split()) for s in .*:$/    if False:/'
   mutant shell "todo heredoc vira script" 's/^    return bool(s) and (opq or .*/    return True/'
   mutant shell "here-string para bash é ignorado" 's/            if herestr and runs_text(seg):/            if False:/'
-  mutant shell "continuação de linha não é juntada" 's/hide(CONT.sub(r"\\1", HEREDOC.sub(heredoc, cmd)))/hide(HEREDOC.sub(heredoc, cmd))/'
+  mutant shell "continuação de linha não é juntada" 's/hide(CONT.sub(r"\\1", heredocs(cmd)))/hide(heredocs(cmd))/'
   mutant shell "barra escapada + newline vira continuação" 's/^CONT = re.compile(.*)  #/CONT = re.compile(r"()\\\\\\n")  #/'
   mutant closed "branch/tag com palavra solta e sem opção de lista vira leitura" 's/        elif t.startswith("-") or not listing:/        elif t.startswith("-"):/'
   mutant closed "branch --list -d x vira leitura" 's/        elif t.startswith("-") or not listing:/        elif not listing:/'
@@ -656,7 +705,7 @@ echo "== $((n-fails))/$n ok =="
   mutant check "selfcheck não exige type=command" 's/ and h.get("type") == "command"//'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
-  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,wrap,lex,dest,cfg,tools,msg,check,cond" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }

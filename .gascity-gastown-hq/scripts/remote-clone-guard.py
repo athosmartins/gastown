@@ -22,7 +22,10 @@ COMO DECIDE (os três estados — sei que pode / sei que não pode / não sei �
   GIT_EXTERNAL_DIFF/GIT_SSH*/GIT_EDITOR… (lista fechada: chave que não conheço = não sei = escrita). Alvo no território e fora do clone próprio → bloqueia; alvo que não consigo resolver ($VAR, glob, crase,
   ~usuário) numa escrita → bloqueia, com a mensagem dizendo para usar caminho literal.
   cd/pushd só muda o diretório que EU entendo: opções -L/-P/-e/-@, `--` e UM argumento; o resto (`cd -Z x`, dois argumentos, `pushd +1`, `pushd`
-  sozinho) deixa o diretório "não sei". O mesmo vale para o que o git não deixa eu ler: opção de topo que não conheço (`git --nova VALOR -C x`: o VALOR pode ser
+  sozinho) deixa o diretório "não sei". E só um cd que COM CERTEZA rodou, e do qual o comando seguinte depende, muda o diretório: cd depois de `||`
+  ou num pipeline/background (`cd a 2>/dev/null || cd b; git …`), atrás de then/else/elif/do/while/until (`if …; then cd a; else cd b; fi; git …`), ou
+  depois de `&&` sem que a cadeia `&&` continue até o comando (`x && cd a; git …`) deixa o diretório "não sei" — o shell pode ter ido para outro lugar.
+  `cd a || exit`/`|| return` mantém (se o cd falhou, nada mais roda) e `x && cd a && git …` também (o git só roda se o cd rodou). O mesmo vale para o que o git não deixa eu ler: opção de topo que não conheço (`git --nova VALOR -C x`: o VALOR pode ser
   o valor da opção ou o subcomando) → diretório "não sei" e vale como escrita. Cada embrulho (command/env/sudo/xargs/nice/timeout/stdbuf…) tem a tabela das SUAS
   opções (WOPT; `sudo -n` não é o `-n` do xargs) e só entendo o que está nela: opção que não está = não sei onde o comando começa, e o embrulho vale como
   lançador OPACO (abaixo). `find -exec`/`-ok` rodam no diretório do find; `-execdir`/`-okdir` rodam no de CADA achado, que não sei qual é → "não sei" (git de
@@ -30,7 +33,8 @@ COMO DECIDE (os três estados — sei que pode / sei que não pode / não sei �
   redirecionamento (`2>/dev/null`) é o descritor, não um argumento.
   O que o SHELL lê como texto não é operador nem some: `;` `&` `|` `(` `)` `<` `>` entre aspas ou depois de `\` (`echo '>' && git -C x commit`, `tr -d '<>' ; git …`, o `';'` e o `\;` do find)
   são palavras, `$'…'` (com \xHH, \NNN, \uHHHH e os escapes de uma letra decodificados) e `$"…"` também, e a palavra vazia (`''`, `""`) fica no lugar (`git -C '' -C x commit`). Só
-  pontuação sem aspas é operador. Um redirecionamento leva UMA palavra como alvo (e o `$( )` dela roda); se em vez de palavra vem um operador (`git … >` sem alvo, que o shell recusa),
+  pontuação sem aspas é operador — inclusive o `<<EOF` de um heredoc: entre aspas (`git commit -m "doc: cat <<EOF"`) ou escapado ele é texto, não abre heredoc nenhum,
+  e as linhas seguintes continuam sendo comandos conferidos. Um redirecionamento leva UMA palavra como alvo (e o `$( )` dela roda); se em vez de palavra vem um operador (`git … >` sem alvo, que o shell recusa),
   o operador segue valendo e o trecho é conferido. Aspa que não fecha (ou `\` no fim): o shell recusa a linha e só roda o que veio ANTES dela, salvo se a aspa está num comentário `#`, e então o que vem DEPOIS roda;
   como o guarda não lê comentário, a aspa solta sai do texto e o resto é conferido como comando (o que vem antes dela é lido igual).
   Onde o git escreve por ARGUMENTO, sem -C/--git-dir: em worktree (add/remove/move/lock/repair), clone, init, checkout-index, submodule, archive, bundle e format-patch TODA palavra é
@@ -219,6 +223,37 @@ def heredoc(m) -> str:
     return m.group(1) + ("" if m.group(2) else "\n: " + " ".join(x.group(0) for x in SUBST.finditer(hide(m.group(4)))))
 
 
+def quoted(s: str, i: int) -> bool:
+    """O caractere s[i] é TEXTO para o shell (dentro de aspas simples ou duplas, ou escapado por `\\`)? Estado lido do começo da linha, igual ao protect()."""
+    q, k = "", 0
+    while k < i:
+        c = s[k]
+        if q == "'":
+            q = "" if c == "'" else q
+        elif c == "\\" and q != "'":
+            k += 1  # barra + o caractere seguinte são um par: se o par cobre s[i], s[i] está escapado
+        elif q == '"':
+            q = "" if c == '"' else q
+        elif c in "'\"":
+            q = c
+        k += 1
+    return bool(q) or k > i
+
+
+def heredocs(cmd: str) -> str:
+    """Cada heredoc DE VERDADE vira o que heredoc() decide. Um `<<EOF` entre aspas ou escapado é texto (`git commit -m "doc: cat <<EOF"`): não abre nada, e as
+    linhas seguintes continuam sendo comandos — o regex rodava antes do protect(), sem ver aspas, e um `EOF` solto linhas abaixo engolia tudo no meio (gate, tentativa 3)."""
+    out, pos = [], 0
+    while (m := HEREDOC.search(cmd, pos)):
+        if quoted(cmd, m.start()):
+            out.append(cmd[pos:m.start() + 1])
+            pos = m.start() + 1
+        else:
+            out.append(cmd[pos:m.start()] + heredoc(m))
+            pos = m.end()
+    return "".join(out) + cmd[pos:]
+
+
 def ansi(m) -> str:
     r"""Um escape de `$'…'`: \xHH, \NNN (octal), \uHHHH, \n, \t… O que não conheço fica como está (o bash também mantém a barra)."""
     e = m.group(1)
@@ -284,7 +319,7 @@ def words(cmd: str) -> list:
     """As palavras do comando como (texto, operador?). operador = pontuação do SHELL (`;`, `&&`, `>`, `<(`…): `';'`, `\\;`, `'>'` e `''` são palavras, e a vazia FICA (`git -C '' -C x`).
     Aspa que não fecha (ou `\\` no fim): o shell recusa a linha e só roda o que veio ANTES dela, a não ser que a aspa esteja num comentário `#` (que o guarda não lê como
     comentário) e então o que vem DEPOIS roda. A aspa solta sai do texto e o resto é conferido como comando, as duas hipóteses de uma vez; o texto antes dela é lido igual."""
-    cmd = FD.sub(r"\1", hide(CONT.sub(r"\1", HEREDOC.sub(heredoc, cmd))).replace("\n", " ; "))  # newline separa comandos; `\` + newline os junta
+    cmd = FD.sub(r"\1", hide(CONT.sub(r"\1", heredocs(cmd))).replace("\n", " ; "))  # newline separa comandos; `\` + newline os junta; heredoc só o que o shell lê como heredoc
     while True:  # termina: cada volta tira um caractere, e a próxima aspa solta só pode estar mais adiante (o que sobra de um tipo de aspa depois de tirar a solta é par ou tem uma só)
         try:
             text = protect(cmd)
@@ -433,24 +468,41 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
                     return r
         return None
 
-    def one(seg: list, blind: bool = False):
+    def one(seg: list, blind: bool = False, prev: str = "", term: str = ";"):
+        # prev/term = o operador ANTES e DEPOIS deste trecho (`&&`, `||`, `|`, `;`, `&`, `(`…): é por eles que se sabe se um cd rodou com certeza
         r = inner(seg)
         if r:
             return r
+        # bloco condicional (if/then/else/elif/do/while/until): um cd lá dentro vale para os comandos SEGUINTES DO MESMO BLOCO (`if …; then cd a; git …; fi` roda o git em a),
+        # mas ao fechar/trocar de ramo (fi/done/esac/else/elif) o diretório vira "não sei" — não se sabe qual ramo rodou. `!`/`coproc`: "não sei" na hora.
+        kw = bool(seg) and seg[0] in ("!", "coproc")
+        if seg and seg[0] in ("fi", "done", "esac", "else", "elif") and st.pop("cdblk", False):
+            st["cwd"] = None
+        blk = bool(seg) and seg[0] in ("if", "then", "else", "elif", "do", "while", "until")
         env, seg, b, opq = peel(seg)
         blind = blind or b
         if not seg:
             st["env"].update(env)  # `GIT_DIR=x; git …`: sem saber se foi exportada, vale para os comandos seguintes
             return None
         cwd, c = None if blind else st["cwd"], os.path.basename(seg[0])
+        if st.pop("or", False) and prev == "||" and c not in ("exit", "return"):
+            cwd = st["cwd"] = None  # `cd a || cd b`, `cd a || true`: depois disto o shell pode estar em a OU onde estava; só `|| exit`/`|| return` mantém (se o cd falhou, nada mais roda)
         if " " in seg[0]:  # env -S 'git -C x commit': um comando inteiro numa palavra só
             return scan(" ".join(seg), cwd, terr, own, depth + 1)
         if c in ("export", "declare", "typeset"):
             st["env"].update({m.group(1): m.group(2) for m in map(ASSIGN.fullmatch, seg[1:]) if m})
-        elif c in ("cd", "pushd"):
-            st["cwd"] = chdir(seg[1:], st["cwd"], c == "pushd")
-        elif c == "popd":
-            st["cwd"] = None
+        elif c in ("cd", "pushd", "popd"):
+            new = None if c == "popd" else chdir(seg[1:], st["cwd"], c == "pushd")
+            # o diretório só é conhecido se o cd COM CERTEZA rodou e o comando seguinte depende dele: cd depois de `||`, num pipeline ou em background, atrás de
+            # palavra reservada, ou depois de `&&` sem que a cadeia `&&` siga até o próximo comando → "não sei" (o shell pode ter ido para outro lugar). A variável
+            # em que se DECIDE (o cwd modelado) tem de ser a mesma em que se AGE (onde o git roda) — gate da fatia 6a, tentativa 3.
+            if kw or prev in ("||", "|", "|&") or term in ("|", "|&", "&") or (prev == "&&" and term != "&&"):
+                new = None
+            if blk and new is not None:
+                st["cdblk"] = True  # cd dentro de um ramo: vale até o fi/done/esac/else/elif
+            st["cwd"] = new
+            if new is not None and term == "||":
+                st["or"] = True  # o trecho seguinte decide: `|| exit` mantém, qualquer outra coisa vira "não sei"
         elif c in OPAQUE or opq:  # não modelo o que o lançador faz com diretório e ambiente: o git de dentro (palavra solta ou texto entre aspas) vale com diretório "não sei"
             for j, t in enumerate(seg[1:], 1):
                 if os.path.basename(t) == "git":  # as palavras seguintes são argumentos do git (mensagem de commit…), não outro comando
@@ -480,7 +532,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
             return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
         return None
 
-    skip, herestr = False, False
+    skip, herestr, prev = False, False, ""
     for tok, op in words(cmd) + [(";", True)]:  # o `;` do fim fecha o último trecho
         if skip and not op:  # alvo de redirecionamento: só uma PALAVRA é alvo. Operador logo depois (`git … >` sem alvo, que o shell recusa) segue como operador: engolir o `;` do fim ou o `&&` deixava o trecho sem conferir
             skip = False
@@ -496,10 +548,10 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
             skip = herestr = False  # um operador que chega com um redirecionamento esperando alvo não é o alvo
             for pc in PIECE.findall(tok):
                 if pc in SEPS or pc in ("(", ")"):
-                    r = one(seg)
+                    r = one(seg, False, prev, pc)
                     if r:
                         return r
-                    seg = []
+                    seg, prev = [], pc
                     if pc == "(":
                         stack.append(st["cwd"])
                         skip = False  # `<(cmd)` / `>(cmd)`: o `<` que vem colado no `(` não é redirecionamento de arquivo, a palavra seguinte é um comando
@@ -529,8 +581,17 @@ def message(hit, terr: str, proj) -> str:
     target, op = hit
     own = own_clone(proj, terr)
     why = (f"Alvo: {target}\n" if target else "Alvo: não consegui resolver o caminho (variável, glob, crase ou ~usuário)\n")
+    # o motivo de não ter clone próprio é dito como é: sem a variável; dentro do território mas sem `.git` até a raiz; ou fora do território
+    if own:
+        mine = own
+    elif not proj:
+        mine = "(nenhum: CLAUDE_PROJECT_DIR não definido)"
+    elif inside(os.path.realpath(proj), terr):
+        mine = "(nenhum: CLAUDE_PROJECT_DIR " + proj + " está no território " + terr + " mas não tem .git até a raiz dele)"
+    else:
+        mine = "(nenhum: CLAUDE_PROJECT_DIR " + proj + " fora do território " + terr + ")"
     return ("[HOOK BLOCK: remote-clone-guard] NÃO É CANCELAMENTO DO USUÁRIO — política automática de isolamento entre sessões.\n"
-            f"BLOQUEADO: {op} fora do seu clone.\n{why}Seu clone: {own or '(nenhum: CLAUDE_PROJECT_DIR fora do território ' + terr + ')'}\n"
+            f"BLOQUEADO: {op} fora do seu clone.\n{why}Seu clone: {mine}\n"
             "Cada sessão escreve só no PRÓPRIO worktree; o clone de outra sessão, o espelho (repo.git) e os hooks/settings do claude não são seus. Para publicar: faça "
             "commit no seu worktree e dê push da sua branch (worker/<bead>). Se o caminho tem variável ou glob, use o caminho literal.\n"
             "Leitura continua liberada: git -C <outro clone> log / status / diff / show.\n")
