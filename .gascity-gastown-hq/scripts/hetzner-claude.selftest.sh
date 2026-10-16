@@ -258,6 +258,11 @@ has "o que ficou sem remover é contado, não calado" "$PBOUT" "1 NAO removidos"
 echo "== push-bundle: o registro anterior não manda apagar através de um symlink no caminho"
 srv_reset; pb; rm -rf "$SRV/.claude/hooks"; mkdir -p "$T/elsewhere"; echo keep >"$T/elsewhere/a.sh"; ln -s "$T/elsewhere" "$SRV/.claude/hooks"
 echo 1 >"$FAKE/drop_hook"; pb; eq "push" $PBRC 0; yes "o arquivo do outro lado do symlink sobrevive" "$T/elsewhere/a.sh"; has "e é contado" "$PBOUT" "1 NAO removidos"
+echo "== push-bundle: as chaves que o próprio claude grava (tema, notificação) sobrevivem; chave alheia de verdade continua recusando"
+srv_reset; echo '{"theme":"dark","agentPushNotifEnabled":true,"enabledPlugins":{"x@y":true}}' >"$SRV/.claude/settings.json"; pb; eq "tema e notificação do claude não travam o push" $PBRC 0
+SJ=$(cat "$SRV/.claude/settings.json"); has "tema mantido" "$SJ" '"theme": "dark"'; has "notificação mantida" "$SJ" '"agentPushNotifEnabled": true'
+has "o bundle continua mandando" "$SJ" '"permissions"'; hasnt "e a chave velha dos plugins foi trocada" "$SJ" "x@y"
+srv_reset; echo '{"theme":"dark","model":"opus"}' >"$SRV/.claude/settings.json"; pb; eq "tema + chave alheia de verdade" $PBRC 1; has "msg diz a alheia" "$PBOUT" "(model)"; no "nada instalado" "$HOOK"
 echo "== push-bundle: recusas (nada pela metade)"
 srv_reset; echo '{"model":"opus"}' >"$SRV/.claude/settings.json"; pb; eq "settings do servidor com chave alheia" $PBRC 1; has "msg" "$PBOUT" "nao conhece"
 no "nada instalado" "$HOOK"; no "nem o city" "$CITYF"

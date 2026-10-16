@@ -113,6 +113,7 @@ MARKET, MARKET_REPO = "claude-plugins-official", "anthropics/claude-plugins-offi
 # instalado nem no mini. github é proibido (credencial).
 PLUGINS = ("superpowers", "security-guidance", "frontend-design")
 PLUGIN_KEYS = ("enabledPlugins", "extraKnownMarketplaces")
+OWN_KEYS = ("theme", "agentPushNotifEnabled")  # o próprio claude as grava no settings.json do servidor no 1º uso (tela e notificação, nada de permissão nem hook): o push as mantém em vez de recusar
 REMOTE_PATH = 'export PATH="$HOME/.local/bin:$PATH"; '
 # Pasta FIXA: o claude cria um projeto em ~/.claude/projects por diretório de trabalho, e um mktemp por chamada deixaria um novo a cada hora.
 PROBE_CMD = (REMOTE_PATH + f'd={shlex.quote(RHOME)}/gt-remote/probe; mkdir -p "$d" && cd "$d" || exit 125; '
@@ -567,8 +568,14 @@ def cmd_push_bundle(a) -> int:
     home_settings = os.path.join(out, "home", ".claude", "settings.json")
     merged = merged_home_settings(home_settings)
     with open(home_settings) as f:
-        allowed = sorted(set(json.load(f)) | set(PLUGIN_KEYS))
+        allowed = sorted(set(json.load(f)) | set(PLUGIN_KEYS) | set(OWN_KEYS))
     stage, q = f"{RHOME}/{BUNDLE_OUT}", shlex.quote
+    r = ssh(f"cat {q(RHOME)}/.claude/settings.json 2>/dev/null")
+    try:
+        cur = json.loads(r.out) if r.rc == 0 and r.out.strip() else {}
+    except ValueError:
+        cur = {}  # ilegível: o instalador lá embaixo recusa pelo mesmo motivo
+    merged.update({k: cur[k] for k in OWN_KEYS if isinstance(cur, dict) and k in cur and k not in merged})
     r = ssh(f"mkdir -p {q(stage)} {q(RHOME + '/gt-remote/bin')}")
     if r.rc != 0:
         die(1, f"mkdir no servidor saiu {r.rc}: {_short(r.err, 160)}")

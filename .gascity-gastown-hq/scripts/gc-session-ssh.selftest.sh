@@ -19,11 +19,16 @@
 #   guard — caminho do mini que sobra no comando/env/workdir recusa e nada abre · terr — o tmux do host existe mas não consegue olhar
 #   (socket sem permissão): is-running, list-running, process-alive, start, stop, interrupt, nudge, send-keys, peek, clear-scrollback e
 #   get-last-activity dão ERRO com o motivo, nunca "false"/"vazio"/"há vaga"/"parou"; já a sessão AUSENTE (tmux respondeu) dá rc 0 nas
-#   operações de melhor esforço (grupo live), e stop só diz que parou se a sessão sumiu (tmux falso que não derruba, grupo live).
+#   operações de melhor esforço (grupo live), e stop só diz que parou se a sessão sumiu (tmux falso que não derruba, grupo live) ·
+#   gate (ga-2hd02v.1.5) — sessão REAL só abre com `real_sessions_released_by` (texto não vazio) E com o remote-clone-guard.py do host idêntico ao do
+#   repositório E o --selfcheck dele aprovando as settings do host; sem isso exit 1 dizendo o motivo, nada aberto, nada pela metade; a sessão mínima de
+#   teste (remote-e2e-<x>, remote-test-<x>, e só ela) abre sempre; o dry-run diz qual é qual; o resto dos grupos roda COM o portão ligado e satisfeito.
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar: teto do host, nome
 #   exato (sessão, is-running, start), alvo de painel =nome:, guarda de /Users/, filtro de env, exit 2 das desconhecidas, marcador de fim,
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
-#   ausente, e o stop que não confere que a sessão sumiu (15 mutantes). Mais: contra um stub que só sai 0, quase tudo falha.
+#   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
+#   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível; 24 mutantes).
+#   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -59,8 +64,8 @@ chmod +x "$T/bin/ssh"
 
 cfg() {  # cfg CAP [TIMEOUT] [EXTRA-JSON-do-host-a]  → $T/cfg.json (host a: socket $SOCK; host b: socket ${SOCK}b, teto 1)
   jq -n --argjson cap "$1" --argjson to "${2:-25}" --argjson extra "${3:-{\}}" --arg rr "$RR" --arg rh "$RH" --arg s "$SOCK" \
-    '{default_host:"a", hosts:{a:({ssh:"fakehost",cap:$cap,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test",timeout:$to,start_timeout:$to}+$extra),
-      b:{ssh:"fakehost",cap:1,remote_root:$rr,remote_home:$rh,socket:($s+"b"),mini_home:"/Users/test"}}}' > "$T/cfg.json"
+    '{default_host:"a", hosts:{a:({ssh:"fakehost",cap:$cap,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test",timeout:$to,start_timeout:$to,real_sessions_released_by:"selftest"}+$extra),
+      b:{ssh:"fakehost",cap:1,remote_root:$rr,remote_home:$rh,socket:($s+"b"),mini_home:"/Users/test",real_sessions_released_by:"selftest"}}}' > "$T/cfg.json"
 }
 pv() {  # pv ARGS... < entrada  → RC, $T/out, $T/err
   env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" FAKE_SSH_LOG="$T/ssh.log" \
@@ -72,9 +77,15 @@ req() {  # req COMMAND [WORKDIR] [EXTRA-JSON] → JSON do start
   jq -n --arg c "$1" --arg w "${2:-$CITY/.gc/agents/dog}" --argjson x "${3:-{\}}" \
     '{work_dir:$w, command:$c, env:{GC_CITY:"'"$CITY"'", GC_AGENT:"dog-1", GC_DIR:($w)}} + $x'
 }
+GUARDF=remote-clone-guard.py
+install_host() {  # o guarda e as settings do "servidor" ($RH/.claude), como o bundle os instala; o guarda é o IRMÃO do script em teste (o que o provider confere)
+  local src; src="$(dirname "$P")/$GUARDF"; [ -f "$src" ] || src="$HERE/$GUARDF"
+  mkdir -p "$RH/.claude/hooks"; cp "$src" "$RH/.claude/hooks/$GUARDF"
+  jq -n --arg c "python3 -I $RH/.claude/hooks/$GUARDF || exit 2" '{hooks:{PreToolUse:[{matcher:"Bash",hooks:[{type:"command",command:$c}]},{matcher:"Edit|Write|MultiEdit|NotebookEdit",hooks:[{type:"command",command:$c}]}]}}' > "$RH/.claude/settings.json"
+}
 count() { tmux -L "${2:-$SOCK}" list-sessions 2>/dev/null | grep -c . ; }
 group() { [ -z "${GCSSH_ONLY:-}" ] || case ",$GCSSH_ONLY," in *",$1,"*) return 0;; *) return 1;; esac; }
-cfg 3
+cfg 3; install_host
 
 g_proto() {
   fresh; pv frobnicate x </dev/null; [ $RC = 2 ] && [ ! -s "$T/out" ] && nossh; ok $? "proto: operação desconhecida sai 2, sem saída e sem ssh"
@@ -109,6 +120,8 @@ g_dry() {
   cfg 3 25 '{"env_allow":["GC_INSTANCE_TOKEN"]}'; pv --dry-run start dog-1 < <(req "claude" | jq '.env.GC_INSTANCE_TOKEN="t0k"')
   [ "$(jq -r .env.GC_INSTANCE_TOKEN "$T/out")" = t0k ]; ok $? "dry: env_allow na config traz o token de volta (decisão explícita, não padrão)"
   cfg 3
+  pv --dry-run start remote-e2e-1 < <(req claude); [ "$(jq -r .session_kind "$T/out")" = teste ]; ok $? "dry: remote-e2e-1 é sessão de teste"
+  pv --dry-run start dog-1 < <(req claude); [ "$(jq -r .session_kind "$T/out")" = real ]; ok $? "dry: dog-1 é sessão real"
 }
 
 g_live() {
@@ -260,7 +273,57 @@ g_terr() {  # o tmux do host responde mas não consegue olhar (socket sem permis
   pv stop te-1 </dev/null
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; return 0; }
+g_gate() {  # a sessão REAL só abre com a liberação E o guarda conferido no host; a de teste abre sempre
+  local good rb nm h st
+  cfg 3; good=$(cat "$T/cfg.json"); fresh
+  # sem liberação e sem guarda no host: só a sessão de teste abre
+  echo "$good" | jq 'del(.hosts.a.real_sessions_released_by)' > "$T/cfg.json"; find "$RH/.claude" -mindepth 1 -delete 2>/dev/null
+  for nm in remote-e2e-1 remote-test-x_Y-2; do pv start $nm < <(req cat); ok $RC "gate: $nm (sessão mínima de teste) abre sem liberação e sem guarda no host (rc=$RC $(head -c 150 "$T/err"))"; pv stop $nm </dev/null; done
+  # com o guarda bom no host, mas sem liberação: a real não abre
+  install_host; fresh
+  pv start g-real < <(req cat); [ $RC = 1 ] && has "$T/err" 'real_sessions_released_by' && has "$T/err" 'g-real' && nossh && [ "$(count)" = 0 ]; ok $? "gate: sessão real SEM a chave de liberação recusa dizendo a chave, sem ssh e sem abrir (rc=$RC)"
+  for rb in '""' '"   "' 'true' '1' 'null' '[]' '{"a":1}'; do
+    echo "$good" | jq ".hosts.a.real_sessions_released_by=$rb" > "$T/cfg.json"; fresh
+    pv start g-real < <(req cat); [ $RC = 1 ] && has "$T/err" 'real_sessions_released_by' && nossh && [ "$(count)" = 0 ]; ok $? "gate: liberação $rb não é liberação (só texto não vazio), recusa sem ssh"
+  done
+  # nomes que PARECEM de teste mas não são
+  echo "$good" | jq 'del(.hosts.a.real_sessions_released_by)' > "$T/cfg.json"
+  for nm in remote-e2e- remote-e2e1 my-remote-e2e-1 remote-e2e remote-testing-1 Remote-E2E-1 remote-test remote_e2e-1 dog-remote-test-1; do
+    fresh; pv start $nm < <(req cat); [ $RC = 1 ] && has "$T/err" 'real_sessions_released_by' && nossh; ok $? "gate: '$nm' NÃO é sessão de teste (nome exato remote-e2e-<x> / remote-test-<x>) e recusa (rc=$RC)"
+  done
+  # com a liberação, o host decide
+  echo "$good" > "$T/cfg.json"
+  fresh; pv start g-ok < <(req cat); ok $RC "gate: liberada + guarda idêntico + settings aprovadas → a sessão real abre (rc=$RC $(head -c 200 "$T/err"))"
+  pv is-running g-ok </dev/null; [ "$(cat "$T/out")" = true ]; ok $? "gate: ...e está de pé"; pv stop g-ok </dev/null
+  find "$RH/.claude/hooks" -name "$GUARDF" -delete
+  fresh; pv start g-nog < <(req cat); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && [ "$(count)" = 0 ] && [ ! -e "$RR/run/g-nog.sh" ]; ok $? "gate: guarda AUSENTE no host → recusa dizendo o guarda, nada aberto, nenhum lançador (rc=$RC)"
+  install_host; printf '\n# adulterado\n' >> "$RH/.claude/hooks/$GUARDF"
+  fresh; pv start g-dif < <(req cat); [ $RC = 1 ] && has "$T/err" 'ausente ou diferente' && [ "$(count)" = 0 ]; ok $? "gate: guarda do host DIFERENTE do repositório (1 linha a mais) → recusa (rc=$RC)"
+  install_host; st="$RH/.claude/settings.json"; h=$(cat "$st")
+  local mut='sem o || exit 2 (falha aberta)@@.hooks.PreToolUse|=map(.hooks|=map(.command|=sub(" \\|\\| exit 2$";"")))
+sem o grupo de Edit/Write@@.hooks.PreToolUse|=map(select(.matcher=="Bash"))
+sem o grupo de Bash@@.hooks.PreToolUse|=map(select(.matcher!="Bash"))
+sem MultiEdit na lista@@.hooks.PreToolUse[1].matcher="Edit|Write|NotebookEdit"
+com disableAllHooks@@.disableAllHooks=true
+chamando outro guarda@@.hooks.PreToolUse|=map(.hooks|=map(.command|=sub("remote-clone-guard";"outro-guard")))
+sem hooks nenhum@@del(.hooks)'
+  while IFS= read -r ln; do
+    [ -n "$ln" ] || continue; d=${ln%%@@*}; expr=${ln#*@@}
+    printf '%s' "$h" | jq "$expr" > "$st"; fresh
+    pv start g-set < <(req cat); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host $d → o --selfcheck reprova e nada abre (rc=$RC $(head -c 120 "$T/err"))"
+  done <<< "$mut"
+  printf '{ isto não é json' > "$st"; fresh; pv start g-set < <(req cat); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host ilegíveis (JSON quebrado) → recusa"
+  rm -f "$st"; fresh; pv start g-set < <(req cat); [ $RC = 1 ] && has "$T/err" 'selfcheck' && [ "$(count)" = 0 ]; ok $? "gate: settings do host AUSENTES → recusa"
+  install_host
+  # o provider precisa do guarda do repositório para conferir o do host; sem ele não há como conferir → recusa antes de qualquer ssh
+  mkdir -p "$T/noguard"; cp "$P" "$T/noguard/gc-session-ssh"; chmod +x "$T/noguard/gc-session-ssh"; fresh
+  ( P="$T/noguard/gc-session-ssh"; pv start g-nogi < <(req cat); [ $RC = 1 ] && has "$T/err" 'não consegui ler' && nossh && [ "$(count)" = 0 ] ); ok $? "gate: sem o guarda do repositório ao lado do provider, a real recusa antes de qualquer ssh"
+  ( P="$T/noguard/gc-session-ssh"; pv start remote-e2e-9 < <(req cat); RCX=$RC; pv stop remote-e2e-9 </dev/null; exit $RCX ); ok $? "gate: ...mas a de teste abre (não depende do guarda)"
+  find "$T/noguard" -mindepth 1 -delete; rmdir "$T/noguard"
+  cfg 3; install_host
+}
+
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 all
@@ -269,7 +332,7 @@ echo "== $((n-fails))/$n ok =="
 [ -n "${GCSSH_NO_MUTANTS:-}" ] || [ -n "${GCSSH_ONLY:-}" ] || {
   echo "-- controle negativo: cada guarda removida TEM que fazer o grupo que a cobre falhar"
   mutant() {  # mutant GRUPOS DESCRIÇÃO SED-EXPR  (a cópia mutada tem que diferir do original, senão o mutante não testou nada)
-    local m="$T/mut.$RANDOM"; mkdir -p "$m"; sed -e "$3" "$P" > "$m/gc-session-ssh"; chmod +x "$m/gc-session-ssh"
+    local m="$T/mut.$RANDOM"; mkdir -p "$m"; sed -e "$3" "$P" > "$m/gc-session-ssh"; chmod +x "$m/gc-session-ssh"; cp "$(dirname "$P")/$GUARDF" "$m/$GUARDF" 2>/dev/null
     if cmp -s "$P" "$m/gc-session-ssh"; then ok 1 "mutante '$2': o sed não mudou nada (o teste do mutante está errado)"; return; fi
     local r; r=$(GCSSH_MUTANT=1 GCSSH_ONLY="$1" GCSSH_UNDER_TEST="$m/gc-session-ssh" bash "$0" 2>&1 | tail -1)
     case "$r" in "RESULT 0/"*) ok 1 "mutante '$2' NÃO foi pego ($r)";; "RESULT "*) ok 0 "mutante '$2' pego ($r)";; *) ok 1 "mutante '$2': execução sem resultado ($r)";; esac
@@ -289,9 +352,18 @@ echo "== $((n-fails))/$n ok =="
   mutant terr "has engole o erro do tmux (vira 'false')" 's/s=\$(sessions) || return 2;/s=$(sessions);/'
   mutant live "melhor esforço: sessão ausente passa a dar erro" 's/\[ "\$r" -ne 1 \] || exit 0;/true;/'
   mutant live "stop não confere que a sessão sumiu" 's/\[ \$? -eq 1 \] || { echo "sessão @NAME@ continua/true || { echo "sessão @NAME@ continua/'
+  mutant gate "sem a chave de liberação" 's/    if not cfg.released:/    if False:/'
+  mutant gate "liberação de qualquer tipo (str() em vez de só texto)" 's/rb.strip() if isinstance(rb, str) else ""/str(rb).strip() if rb is not None else ""/'
+  mutant gate "nome de teste sem o hífen (remote-e2e1 vira teste)" 's/remote-(?:e2e|test)-\[A-Za-z0-9_-\]+/remote-(?:e2e|test)[A-Za-z0-9_-]*/'
+  mutant gate "nome de teste sem âncora (my-remote-e2e-1 vira teste)" 's/if TEST_RE.fullmatch(name):/if TEST_RE.search(name):/'
+  mutant gate "sem conferir o sha do guarda" 's/\[ "\$h" = {sha} \] ||/true ||/'
+  mutant gate "sem rodar o --selfcheck" 's/o=\$(python3 -I {g} --selfcheck {st} 2>&1)/o=$(true)/'
+  mutant gate "script do host que sai 0 (a recusa vira 'abriu')" 's/exit {EX_POLICY}/exit 0/g'
+  mutant gate "guarda do repositório ilegível passa" 's/^        raise Fail(f"sessão real {name!r} recusada: não consegui ler.*$/        sha = ""/'
+  mutant dry "o dry-run diz 'teste' para tudo" 's/session_kind="teste" if TEST_RE.fullmatch(name) else "real"/session_kind="teste"/'
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }

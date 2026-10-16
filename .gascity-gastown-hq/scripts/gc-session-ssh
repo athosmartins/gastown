@@ -32,22 +32,29 @@ O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
   parece segredo (TOKEN, SECRET, PASSWORD, KEY...) não vai, a menos que o nome esteja em `env_allow` da config. check-image,
   watch-startup, run-live e qualquer operação desconhecida: exit 2 ("não suportado"), sem tocar em sessão nenhuma.
   Meta (set/get/remove-meta) fica no MINI (<estado>/meta): nada disso vai para o servidor.
+  SESSÃO REAL NÃO ABRE sem a liberação e sem o guarda de clone (ga-2hd02v.1.5, decisão Q4 do Mayor): só abre o que se chama
+  remote-e2e-<x> ou remote-test-<x> (a sessão mínima de teste). Qualquer outro nome exige (1) `real_sessions_released_by` na config do host
+  — decisão EXPLÍCITA do Mayor; ausente, vazio ou não-texto = recusa, sem ssh — e (2) conferir NO host, dentro do mesmo script do start,
+  que {remote_home}/.claude/hooks/remote-clone-guard.py é byte a byte o do repositório e que o `--selfcheck` dele aprova as settings
+  do host (hook em Bash/Edit/Write/MultiEdit/NotebookEdit, com `|| exit 2`, sem disableAllHooks); senão exit 12 do script e nada abre.
 
 CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta acima de scripts/)
   {"default_host": "hetzner", "hosts": {"hetzner": {"ssh": "hetzner-teste", "cap": 4,
      "remote_root": "/home/runner/gt-remote/bundle", "remote_home": "/home/runner"}}}
   obrigatórios: ssh (alias/destino), cap (teto de sessões deste host, contado SÓ no socket do provider, separado do teto do mini),
   remote_root (= --remote-root do remote-bundle-build.py), remote_home. opcionais: socket (gc-remote), connect_timeout (10),
-  timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home. O host vem de $GC_SSH_HOST ou default_host:
+  timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima). O host vem de $GC_SSH_HOST ou default_host:
   um segundo host (o MBP, ga-w7qwl1) é outra entrada + outra instância do provider com GC_SSH_HOST. Estado no mini:
   $GC_EXEC_STATE_DIR ou <cidade>/.gc/runtime/session-ssh, sempre em <estado>/<host>/. Não há padrão para o cap: sem ele não abre sessão.
 
 CÓDIGOS  0 ok · 1 erro (mensagem em stderr; "already exists" no start vira ErrSessionExists no engine) · 2 operação não suportada
+  (dentro do script do host, que o provider traduz em exit 1 com a mensagem: 10 teto, 11 já existe, 12 sessão real sem guarda de clone verificado)
 """
 from __future__ import annotations
 
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -65,7 +72,9 @@ ENV_OK = re.compile(r"GC_[A-Z0-9_]+|TERM|LANG|LC_[A-Z_]+|TZ")
 SECRETISH = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIVATE", re.I)
 IGNORED = ("pre_start", "session_setup", "session_setup_script", "session_live", "pack_overlay_dirs", "overlay_dir", "copy_files", "nudge")
 BEGIN, END = "@@GC-BEGIN@@", "@@GC-END@@"
-EX_CAP, EX_EXISTS = 10, 11
+EX_CAP, EX_EXISTS, EX_POLICY = 10, 11, 12
+TEST_RE = re.compile(r"remote-(?:e2e|test)-[A-Za-z0-9_-]+")  # a sessão MÍNIMA de teste: a única que abre sem a liberação e sem o guarda de clone
+GUARD = "remote-clone-guard.py"
 # o ssh leva `sh -c '<RUNNER>'` (uma string, qualquer shell de login a entende) e o script vai pela entrada padrão: não há limite de
 # argv (o prompt tem dezenas de KB) e o script lê a entrada inteira ANTES de rodar, então comando nenhum dele a come.
 RUNNER = 'umask 077; f=$(mktemp) || exit 125; cat >"$f"; sh "$f" </dev/null; rc=$?; rm -f "$f"; exit $rc'
@@ -118,6 +127,8 @@ class Cfg:
         self.ssh_opts = [str(x) for x in h.get("ssh_opts") or []]
         self.env_allow = set(h.get("env_allow") or [])
         self.mini_home = os.path.realpath(h.get("mini_home") or os.path.expanduser("~"))
+        rb = h.get("real_sessions_released_by")
+        self.released = rb.strip() if isinstance(rb, str) else ""  # só a decisão explícita do Mayor liga; ausente/vazio/não-texto = desligado
         base = os.environ.get("GC_EXEC_STATE_DIR") or os.path.join(self.city_guess, ".gc", "runtime", "session-ssh")
         self.state = os.path.join(base, re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.host)))
 
@@ -262,6 +273,24 @@ def launcher(cfg: Cfg, name: str, p: dict) -> str:
     return "\n".join(out + [f"sh -c {q(p['command'])}", "rc=$?", f'[ "$rc" -eq 0 ] || echo "saiu com $rc" >{q(exitf)}', 'exit "$rc"']) + "\n"
 
 
+def real_gate(cfg: Cfg, name: str) -> str:
+    """'' = sessão de teste (passa); senão o trecho de sh que confere o guarda de clone NO host. Sem liberação, ou sem como conferir → Fail."""
+    if TEST_RE.fullmatch(name):
+        return ""
+    if not cfg.released:
+        raise Fail(f"sessão real {name!r} recusada em {cfg.host}: falta 'real_sessions_released_by' na configuração do host (decisão explícita do "
+                   f"Mayor, ga-2hd02v.1.5); por enquanto só abrem remote-e2e-<x> e remote-test-<x>")
+    try:
+        with open(os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])), GUARD), "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+    except OSError as e:
+        raise Fail(f"sessão real {name!r} recusada: não consegui ler o {GUARD} do repositório para conferir o do host: {e}")
+    g, st = q(f"{cfg.home}/.claude/hooks/{GUARD}"), q(f"{cfg.home}/.claude/settings.json")
+    return (f'h=$( {{ sha256sum {g} || shasum -a 256 {g}; }} 2>/dev/null | cut -d" " -f1)\n'
+            f'[ "$h" = {sha} ] || {{ echo "sessão real {name} recusada: {GUARD} ausente ou diferente do repositório no host" >&2; exit {EX_POLICY}; }}\n'
+            f'o=$(python3 -I {g} --selfcheck {st} 2>&1) || {{ echo "sessão real {name} recusada: o --selfcheck do guarda reprovou as settings do host: $o" >&2; exit {EX_POLICY}; }}\n')
+
+
 def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     try:
         req = json.loads(sys.stdin.read() or "{}")
@@ -270,15 +299,16 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     if not isinstance(req, dict):
         raise Fail("start: a entrada tem que ser um objeto JSON")
     p = plan_start(cfg, name, req)
+    gate = "" if dry else real_gate(cfg, name)
     run_dir, exitf = f"{cfg.root}/run", f"{cfg.root}/run/{name}.exit"
     lpath = f"{run_dir}/{name}.sh"
     if dry:
-        print(json.dumps(dict(p, host=cfg.host, session=name, launcher=launcher(cfg, name, p).split("\n"),
+        print(json.dumps(dict(p, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", launcher=launcher(cfg, name, p).split("\n"),
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0
     body = """s=$(sessions) || exit 1
-printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
+@GATE@printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
 n=$(printf '%s\\n' "$s" | grep -c .)
 [ "$n" -lt @CAP@ ] || { echo "host @HOST@ está no teto: $n de @CAP@ sessões" >&2; exit 10; }
 mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
@@ -290,10 +320,11 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
                  "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name),
                  "@B64@": q(base64.b64encode(launcher(cfg, name, p).encode()).decode())}.items():
         body = body.replace(k, v)
+    body = body.replace("@GATE@", gate)
     with open(os.path.join(cfg.mkstate(), "lock"), "a") as lf:  # cap + criação são um passo só; entre processos do mini, um por vez
         fcntl.flock(lf, fcntl.LOCK_EX)
         rc, out, err = remote(cfg, body, cfg.start_timeout)
-    if rc == EX_CAP or rc == EX_EXISTS:
+    if rc in (EX_CAP, EX_EXISTS, EX_POLICY):
         raise Fail(err or f"start de {name} recusado em {cfg.host} (rc={rc}, sem mensagem)")
     if rc != 0:
         raise Fail(f"start em {cfg.host} falhou (rc={rc}): {err or out or 'sem mensagem'}")

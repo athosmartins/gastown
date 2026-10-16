@@ -31,6 +31,7 @@ Bead ga-2hd02v.1.1 (fatia 2 do ga-2hd02v, desenho do estudo ga-ukxa3k, aprovada 
 | `connect_timeout`, `timeout`, `start_timeout` | não (10, 25, 60 s) | prazos; o `start` leva `start_timeout` |
 | `env_allow` | não | nomes de variável com cara de segredo que PODEM ir (ver abaixo) |
 | `ssh_opts` | não | opções extras do ssh (`["-p","2222"]`) |
+| `real_sessions_released_by` | não (ausente = só `remote-e2e-<x>`/`remote-test-<x>` abrem) | decisão EXPLÍCITA do Mayor de liberar sessão real; mesmo com ela, o `start` confere no host o guarda de clone e sai 12 se faltar (ver `hetzner-hardening.md`) |
 
 O host vem de `$GC_SSH_HOST` ou de `default_host`. Estado no mini: `$GC_EXEC_STATE_DIR` ou `<cidade>/.gc/runtime/session-ssh/<host>/` (`session-ssh.log`, `lock`, `meta/`).
 
