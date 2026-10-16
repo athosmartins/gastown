@@ -40,6 +40,7 @@ case "$1 $2" in
   "s3 cp")
     case "$3" in
       */_meta/latest.json)
+        [ "${FAKE_AWS_HANG:-0}" != 1 ] || exec sleep 30   # pendurado: so o timeout do orquestrador resolve
         [ "${FAKE_LATEST_FAIL:-0}" != 1 ] || { echo "An error occurred (AccessDenied) when calling the GetObject operation" >&2; exit 1; }
         case "${FAKE_LATEST:-ok}" in
           ok) cat "$FAKE_ROOT/latest1.json" ;;
@@ -52,6 +53,7 @@ case "$1 $2" in
       *) echo x >> "$FAKE_CAP/objreads"; exit 1 ;;   # a dry-run never reads an object
     esac ;;
   "s3api list-objects-v2")
+    [ "${FAKE_LIST_HANG:-0}" != 1 ] || exec sleep 30
     [ "${FAKE_LIST_FAIL:-0}" != 1 ] || { echo "An error occurred (AccessDenied) when calling the ListObjectsV2 operation" >&2; exit 1; }
     [ "${FAKE_LIST_EMPTY:-0}" != 1 ] || { echo None; exit 0; }
     python3 -I - "$FAKE_ROOT/s3" <<'PY'
@@ -82,6 +84,7 @@ cat > "$T/bin/dolt" <<'EOF'
 #!/bin/bash
 echo "$*" >> "$FAKE_CAP/dolt.argv"
 [ "${FAKE_DOLT_DOWN:-0}" != 1 ] || { echo "connection refused" >&2; exit 1; }
+[ "${FAKE_DOLT_HANG:-0}" != 1 ] || exec sleep 30
 q=""; while [ $# -gt 0 ]; do [ "$1" = -q ] && { q="$2"; break; }; shift; done
 case "$q" in
   *"FROM dolt_log"*) printf 'COUNT(*)\n%s\n' "${FAKE_HEAD_COUNT:-1}" ;;
@@ -102,7 +105,7 @@ case "$q" in
   *) echo "fake dolt: consulta inesperada: $q" >&2; exit 1 ;;
 esac
 EOF
-# mbp-run: only --check exists in this slice. FAKE_PRESENCE chooses the answer.
+# mbp-run: only --check exists in this slice. FAKE_PRESENCE chooses the answer (pausa/ram/semp/pl1: presence=livre, mas o MBP RECUSA ou nao prova paused=0).
 cat > "$T/scripts/mbp-run.sh" <<'EOF'
 #!/bin/bash
 echo "$*" >> "$FAKE_CAP/mbprun.calls"
@@ -112,6 +115,10 @@ case "${FAKE_PRESENCE:-livre}" in
   uso) printf 'presence=uso\npresence_why=teclado\npaused=0\n' ;;
   lixo) printf 'algo=estranho\n' ;;
   vazio) ;;
+  pausa) printf 'presence=livre\npaused=1\n'; exit 99 ;;
+  ram) echo "mbp-run: RAM/swap alto — rode local"; printf 'presence=livre\npaused=0\n'; exit 98 ;;
+  semp) printf 'presence=livre\npresence_why=ocioso\n' ;;
+  pl1) printf 'presence=livre\npaused=0\npaused_local=1\n' ;;
   off) echo "mbp-run: MBP inalcançável (ssh rc=255) — rode local"; printf 'offload_flag=on\n'; exit 98 ;;
 esac
 exit 0
@@ -219,13 +226,30 @@ reset; FAKE_PRESENCE=lixo run --check;  check "$RC" 4 "saida sem presence=: rc 4
 reset; FAKE_PRESENCE=vazio run --check; check "$RC" 4 "saida vazia: rc 4 (nao e 'livre')"
 reset; FAKE_PRESENCE=off run --check;   check "$RC" 4 "MBP inalcancavel (rc 98): rc 4 (nao e 'livre')"
 has "$OUT" "inalcançável" "inalcancavel: o motivo do mbp-run aparece"
+# a presenca e independente da pausa e da saude: um MBP que RECUSA ainda imprime presence=livre
+reset; FAKE_PRESENCE=pausa run --check
+check "$RC" 4 "presence=livre mas pausado (paused=1, rc 99): rc 4"
+has "$OUT" "rc=99 presence=livre paused=1" "pausado: o motivo traz rc, presenca e pausa"
+reset; FAKE_PRESENCE=ram run --check
+check "$RC" 4 "presence=livre mas o mbp-run sai 98 (RAM/swap): rc 4"
+has "$OUT" "rc=98 presence=livre paused=0" "RAM/swap: o motivo traz o rc"
+reset; FAKE_PRESENCE=semp run --check
+check "$RC" 4 "presence=livre sem a linha paused=: rc 4 (paused ausente nao vale 0)"
+has "$OUT" "paused=?" "paused ausente: o motivo diz '?'"
+reset; FAKE_PRESENCE=pl1 run --check;   check "$RC" 4 "paused_local=1: rc 4"
+reset; run --dry-run --check;           check "$RC" 2 "--dry-run e --check juntos: rc 2 (um modo por vez)"
+reset; run --check --dry-run;           check "$RC" 2 "--check e --dry-run juntos: rc 2"
+check "$(calls mbprun.calls)" 0 "dois modos: o MBP nao foi tocado"
 
 echo "-- trava: so uma rodada por vez; estado inutilizavel nao e 'nada a fazer'"
 reset; mkdir -p "$T/state/lock"; echo $$ > "$T/state/lock/pid"; run --dry-run
 check "$RC" 0 "trava com pid vivo: rc 0 (outra rodada em curso)"
 has "$OUT" "outra rodada em curso (pid $$): nada a fazer" "trava viva: diz o pid"
+has "$OUT" "RESULT: SKIPPED db=hq rc=0" "trava viva: RESULT SKIPPED (o agendador ve que nao rodou)"
 check "$(calls aws.argv)" 0 "trava viva: nada foi lido do S3"
 check "$([ -d "$T/state/lock" ] && echo sim || echo nao)" sim "trava viva: a trava de quem roda NAO foi tocada"
+reset; mkdir -p "$T/state/lock"; echo 1 > "$T/state/lock/pid"; run --dry-run   # pid 1 vive e e de outro usuario: kill -0 da EPERM, ps -p nao
+has "$OUT" "outra rodada em curso (pid 1): nada a fazer" "trava com pid vivo de OUTRO usuario (EPERM no kill -0): continua trava"
 reset; sh -c 'exit 0' & dead=$!; wait $dead; mkdir -p "$T/state/lock"; echo "$dead" > "$T/state/lock/pid"; run --dry-run
 check "$RC" 0 "trava de pid morto: a rodada roda"
 has "$OUT" "trava de pid morto/antiga recolhida" "pid morto: a trava velha foi recolhida"
@@ -237,11 +261,41 @@ reset; mkdir -p "$T/state/lock"; touch -t 202001010000 "$T/state/lock"; run --dr
 has "$OUT" "RESULT: DRY" "trava sem pid e antiga (12 h+): recolhida e a rodada roda"
 reset; mkdir -p "$T/state/lock"; echo "lixo" > "$T/state/lock/pid"; touch -t 202001010000 "$T/state/lock"; run --dry-run
 has "$OUT" "RESULT: DRY" "pid ilegivel e trava antiga: recolhida"
+reset; mkdir -p "$T/state/lock"; echo $$ > "$T/state/lock/pid"; touch -t 202001010000 "$T/state/lock"; run --dry-run
+has "$OUT" "trava de pid morto/antiga recolhida" "trava de 12 h+ com pid VIVO (pid reaproveitado): recolhida"
+has "$OUT" "RESULT: DRY" "trava velha com pid vivo: a rodada roda"
+reset; chmod 555 "$T/state"
+if [ -w "$T/state" ]; then echo "  SKIP: estado somente-leitura (chmod 555 nao impede este usuario)"; else
+  run --dry-run
+  check "$RC" 2 "mkdir da trava falha sem trava (somente-leitura): rc 2, nao o 0 de 'nada a fazer'"
+  has "$OUT" "RESULT: UNKNOWN db=hq rc=2" "somente-leitura: RESULT UNKNOWN"
+  has "$OUT" "nao consegui criar $T/state" "somente-leitura: o motivo diz qual pasta"
+  check "$(calls aws.argv)" 0 "somente-leitura: nada foi lido do S3"
+fi
+chmod 755 "$T/state"
+reset; um=$(umask); umask 0222   # a trava nasce 0555: o mkdir passa, mas o pid nao pode ser gravado dentro dela
+if [ "$(id -u)" = 0 ]; then echo "  SKIP: pid nao gravavel (root escreve em dir 0555)"; else
+  run --dry-run
+  check "$RC" 2 "pid da trava nao gravavel: rc 2 (nao o 0 de 'nada a fazer')"
+  has "$OUT" "RESULT: UNKNOWN db=hq rc=2" "pid nao gravavel: RESULT UNKNOWN"
+  check "$([ -d "$T/state/lock" ] && echo sim || echo nao)" nao "pid nao gravavel: a trava meio criada foi apagada"
+  check "$(calls aws.argv)" 0 "pid nao gravavel: nada foi lido do S3"
+fi
+umask "$um"
 reset; : > "$T/notadir"; STATE_OVERRIDE="$T/notadir/state" run --dry-run
 check "$RC" 2 "estado que nao da para criar: rc 2 (nao o 0 de 'nada a fazer')"
 has "$OUT" "RESULT: UNKNOWN db=hq rc=2" "estado inutilizavel: RESULT UNKNOWN"
 has "$OUT" "nao consegui criar $T/notadir/state" "estado inutilizavel: o motivo diz qual pasta"
 check "$(calls aws.argv)" 0 "estado inutilizavel: nada foi lido do S3"
+
+echo "-- timeout: dolt/aws pendurado = UNKNOWN (a trava nao fica presa); sem timeout no PATH = UNKNOWN"
+reset; FAKE_DOLT_HANG=1 LABMBP_CALL_S=2 run --dry-run; chk_unknown "sem resposta em 2s (timeout): dolt" "dolt vivo pendurado" nao
+check "$(ls "$T/state")" "runs" "dolt pendurado: a trava foi liberada"
+reset; FAKE_AWS_HANG=1 LABMBP_CALL_S=2 run --dry-run;  chk_unknown "sem resposta em 2s (timeout): aws" "aws pendurado (latest.json)" nao
+reset; FAKE_LIST_HANG=1 LABMBP_CALL_S=2 run --dry-run; chk_unknown "sem resposta em 2s (timeout): aws" "aws pendurado (listagem)" sim
+reset; mkdir -p "$T/nobin"; for c in env bash cut grep date dirname cat rm mkdir sed head tail awk find ps python3 ls; do ln -sf "$(command -v $c)" "$T/nobin/$c"; done
+PATH="$T/nobin" run --dry-run; chk_unknown "sem timeout/gtimeout no PATH" "sem timeout no PATH" nao
+check "$(calls dolt.argv)" 0 "sem timeout: o dolt nem foi chamado"
 
 echo "-- argumentos"
 reset; run

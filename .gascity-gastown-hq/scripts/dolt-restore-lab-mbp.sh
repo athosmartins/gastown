@@ -28,6 +28,8 @@ MBP_RUN="${LABMBP_MBP_RUN:-$HERE/mbp-run.sh}"
 AWS="${LABMBP_AWS:-aws}"; DOLT="${LABMBP_DOLT:-dolt}"; PY="${LABMBP_PY:-python3}"
 DOLT_CFG="${LABMBP_DOLT_CFG:-$CITY/.gc/runtime/packs/dolt/dolt-config.yaml}"
 BUCKET="${LABMBP_BUCKET:-urblink-dolt-backups}"
+TMO=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)   # todo dolt/aws roda sob timeout: um dolt pendurado segurava a trava
+CALL_S="${LABMBP_CALL_S:-900}"
 
 # tudo que sai do mini rumo ao MBP (mbp-run) roda SEM nenhuma variável AWS_* do ambiente: só o aws do mini enxerga a credencial
 NOAWS=(env); for v in $(env | cut -d= -f1 | grep '^AWS_'); do NOAWS+=(-u "$v"); done
@@ -76,35 +78,43 @@ trap 'exit 143' INT TERM HUP
 
 usage() { sed -n '2,/^set -uo/p' "$0" | sed '$d' | cut -c3-; }
 
+# Uma rodada por vez. 0 = trava tomada · 1 = outra rodada em curso (WHY diz qual) · 2 = nao deu para criar a trava (NAO e "nada a fazer").
 take_lock() {
   mkdir -p "$STATE" || return 2
-  if mkdir "$STATE/lock" 2>/dev/null; then echo "$$" > "$STATE/lock/pid"; LOCKED=1; return 0; fi
-  local p; p=$(cat "$STATE/lock/pid" 2>/dev/null)
-  if isnum "$p"; then
-    if kill -0 "$p" 2>/dev/null; then log "outra rodada em curso (pid $p): nada a fazer"; return 1; fi
-  # pid vazio/ilegível ≠ morto: só recolhe a trava velha (12 h, mais que o teto de uma rodada); a recente é de quem acabou de criá-la
-  elif [ -z "$(find "$STATE/lock" -maxdepth 0 -mmin +720 2>/dev/null)" ]; then log "trava sem pid legivel e recente ($STATE/lock): nada a fazer"; return 1; fi
-  log "trava de pid morto/antiga recolhida"; rm -rf "$STATE/lock"
-  mkdir "$STATE/lock" 2>/dev/null || { log "outra rodada pegou a trava"; return 1; }
-  echo "$$" > "$STATE/lock/pid"; LOCKED=1; return 0
+  local p old
+  if ! mkdir "$STATE/lock" 2>/dev/null; then
+    [ -d "$STATE/lock" ] || return 2   # mkdir falhou e nao ha trava (EACCES/EROFS/ENOSPC): nao e "outra rodada em curso"
+    p=$(cat "$STATE/lock/pid" 2>/dev/null); old=$(find "$STATE/lock" -maxdepth 0 -mmin +720 2>/dev/null)
+    # 12 h = mais que o teto de uma rodada: a trava mais velha e de uma rodada que morreu, mesmo que o pid exista (pid reaproveitado apos reboot)
+    if [ -n "$old" ]; then :
+    elif isnum "$p"; then   # kill -0 da EPERM para pid de outro usuario: ps -p nao
+      if kill -0 "$p" 2>/dev/null || ps -p "$p" >/dev/null 2>&1; then WHY="outra rodada em curso (pid $p): nada a fazer"; return 1; fi
+    else WHY="trava sem pid legivel e recente ($STATE/lock): nada a fazer"; return 1; fi   # pid vazio/ilegivel nao e morto: e de quem acabou de criar
+    log "trava de pid morto/antiga recolhida"; rm -rf "$STATE/lock"
+    if ! mkdir "$STATE/lock" 2>/dev/null; then [ -d "$STATE/lock" ] || return 2; WHY="outra rodada pegou a trava"; return 1; fi
+  fi
+  LOCKED=1; echo "$$" > "$STATE/lock/pid" || return 2   # LOCKED antes: se o pid nao puder ser gravado, o cleanup apaga a trava
 }
 
-# --- o MBP está livre? presence=livre explícito; qualquer outra coisa (uso, vazio, inalcançável, pausa) é "não" ------------------
+# --- o MBP esta livre? So se o mbp-run --check sai 0 E diz presence=livre E paused=0. A presenca e independente da pausa e da saude (RAM/swap,
+# rc 98/99): um MBP que RECUSA ainda imprime presence=livre. Qualquer outra coisa (uso, vazio, inalcancavel, pausa, paused ausente) e "nao".
 mbp_free() {
-  local o; o=$("${NOAWS[@]}" "$MBP_RUN" --host mbp --check 2>&1)
-  if printf '%s\n' "$o" | grep -q '^presence=livre$'; then WHY=""; return 0; fi
+  local o rc pres paused; o=$("${NOAWS[@]}" "$MBP_RUN" --host mbp --check 2>&1); rc=$?
+  pres=$(printf '%s\n' "$o" | sed -n 's/^presence=//p' | head -1); paused=$(printf '%s\n' "$o" | sed -n 's/^paused=//p' | head -1)
+  if [ "$rc" -eq 0 ] && [ "$pres" = livre ] && [ "$paused" = 0 ] && ! printf '%s\n' "$o" | grep -q '^paused_local=1$'; then WHY=""; return 0; fi
   WHY=$(printf '%s\n' "$o" | grep -v -E '^[a-z_]+=' | head -1)
-  WHY="${WHY:-MBP sem presence=livre}; presence=$(printf '%s\n' "$o" | sed -n 's/^presence=//p' | head -1)"; return 1
+  WHY="${WHY:-MBP sem presence=livre}; rc=$rc presence=${pres:-?} paused=${paused:-?}"; return 1
 }
 
 # --- consulta ao banco VIVO do mini (só leitura) ---------------------------------------------------------------------------
 PORT=""
-q() { DOLT_CLI_PASSWORD='' "$DOLT" --host 127.0.0.1 --port "$PORT" --user root --no-tls --use-db "$DB" sql -r csv -q "$1"; }
+bounded() { local rc; "$TMO" -k 10 "$CALL_S" "$@"; rc=$?; [ "$rc" -ne 124 ] || echo "sem resposta em ${CALL_S}s (timeout): ${1##*/}" >&2; return "$rc"; }
+q() { DOLT_CLI_PASSWORD='' bounded "$DOLT" --host 127.0.0.1 --port "$PORT" --user root --no-tls --use-db "$DB" sql -r csv -q "$1"; }
 
 # Monta $RUN/manifest.json AS OF o head do latest.json. Deixa AS_OF, FP1 e NTAB. Falha com WHY (rc 1 = UNKNOWN).
 build_manifest() {
   local meta line n tabs sql
-  meta=$("$AWS" s3 cp "s3://$BUCKET/_meta/latest.json" - 2>"$RUN/aws.err") || { WHY="nao li _meta/latest.json: $(head -c 200 "$RUN/aws.err")"; return 1; }
+  meta=$(bounded "$AWS" s3 cp "s3://$BUCKET/_meta/latest.json" - 2>"$RUN/aws.err") || { WHY="nao li _meta/latest.json: $(head -c 200 "$RUN/aws.err")"; return 1; }
   line=$(printf '%s' "$meta" | "$PY" -I -c "$PYHELP" meta "$DB" 2>/dev/null) || { WHY="_meta/latest.json sem run_utc/head valido para $DB"; return 1; }
   FP1="${line%%$'\t'*}"; AS_OF="${line#*$'\t'}"
   PORT=$(awk '/^listener:/{f=1} f&&/port:/{print $2; exit}' "$DOLT_CFG" 2>/dev/null)
@@ -122,7 +132,7 @@ build_manifest() {
 # A lista do que vai ser enviado: key<TAB>size<TAB>etag em $RUN/listing.tsv. Deixa NOBJ e TOTAL_KB. Vazia/ilegível → falha com WHY.
 list_objects() {
   local raw
-  raw=$("$AWS" s3api list-objects-v2 --bucket "$BUCKET" --prefix "$DB/" --query 'Contents[].[Key,Size,ETag]' --output text 2>"$RUN/aws.err") \
+  raw=$(bounded "$AWS" s3api list-objects-v2 --bucket "$BUCKET" --prefix "$DB/" --query 'Contents[].[Key,Size,ETag]' --output text 2>"$RUN/aws.err") \
     || { WHY="nao consegui listar s3://$BUCKET/$DB/: $(head -c 200 "$RUN/aws.err")"; return 1; }
   printf '%s\n' "$raw" | "$PY" -I -c "$PYHELP" listing "$DB/" > "$RUN/listing.tsv" 2>/dev/null && [ -s "$RUN/listing.tsv" ] \
     || { WHY="a lista de s3://$BUCKET/$DB/ veio vazia ou fora do formato (chave fora de [A-Za-z0-9._/-], tamanho ou ETag ilegivel)"; return 1; }
@@ -137,10 +147,12 @@ finish() {  # $1 = rc final; resumo + RESULT
 }
 unknown() { VERDICT=UNKNOWN; WHY="$*"; finish 2; }
 
+setmode() { { [ "$MODE" = run ] || [ "$MODE" = "$1" ]; } || { echo "so um modo por vez (--dry-run ou --check)" >&2; exit 2; }; MODE="$1"; }
+
 main() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --dry-run) MODE=dry ;; --check) MODE=check ;;
+      --dry-run) setmode dry ;; --check) setmode check ;;
       --db) [ "$#" -ge 2 ] || { echo "--db precisa de um valor" >&2; exit 2; }; DB="$2"; shift ;;
       -h|--help|help) usage; exit 0 ;; *) echo "opcao desconhecida: $1" >&2; exit 2 ;;
     esac
@@ -150,12 +162,13 @@ main() {
   [ "$MODE" != run ] || { echo "o restore no MBP chega na fatia 3/4 (ga-3kmvyr.3); por ora: --dry-run ou --check" >&2; exit 2; }
   if [ "$MODE" = check ]; then mbp_free && { log "MBP livre"; exit 0; }; log "MBP nao livre: $WHY"; exit 4; fi
 
-  take_lock; case $? in 0) ;; 1) exit 0 ;; *) unknown "nao consegui criar $STATE" ;; esac   # 1 = outra rodada (nada a fazer); 2 = sem estado, nao e 'nada a fazer'
+  [ -n "$TMO" ] || unknown "sem timeout/gtimeout no PATH (brew install coreutils; o PATH do launchd precisa de /opt/homebrew/bin)"
+  take_lock; case $? in 0) ;; 1) VERDICT=SKIPPED; finish 0 ;; *) unknown "nao consegui criar $STATE (ou a trava dentro dela)" ;; esac   # SKIPPED: o agendador ve que nao rodou
   RUN="$STATE/runs/$(date -u +%Y%m%dT%H%M%SZ)"; OUT="$RUN/out"
   mkdir -p "$OUT" || unknown "nao consegui criar $RUN"
   build_manifest || unknown "$WHY"
   list_objects || unknown "$WHY"
-  log "manifest AS OF $AS_OF ($NTAB tabelas, run_utc=$FP1):"; cat "$RUN/manifest.json"
+  log "manifest AS OF $AS_OF ($NTAB tabelas, run_utc=$FP1):"; cat "$RUN/manifest.json"   # third-state-waiver: so exibe; build_manifest ja provou o arquivo nao-vazio
   log "lista do S3: $NOBJ objetos, ${TOTAL_KB}KB (nada foi enviado)"; VERDICT=DRY; finish 0
 }
 
