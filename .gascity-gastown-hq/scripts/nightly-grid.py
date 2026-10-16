@@ -10,27 +10,30 @@ PARA QUE SERVE
   chama launchctl load/unload, não escreve nada, não move job. Detector sem poll: roda quando alguém pede (um guarda com StartInterval seria outro bead).
 
 O QUE MOSTRA
-  Resumo (plists, ilegíveis, lidos via plutil, formato desconhecido, não carregados, RunAtLoad, calendário, StartInterval, KeepAlive) · minutos em que N ou mais jobs distintos podem começar no
+  Resumo (plists, fora do --match, ilegíveis, lidos via plutil, formato desconhecido, não carregados, RunAtLoad, calendário, StartInterval, KeepAlive, sem horário) · minutos em que N ou mais jobs distintos podem começar no
   MESMO dia da semana (`--min-collision`, padrão 3; o pico por dia, não o total de labels do minuto: jobs de seg, ter e qua são 3 labels e pico 1) · a grade
   minuto a minuto da janela (`--from`/`--to`, padrão 00:00-07:59) · o que dispara "a cada minuto" por calendário (sem Minute, com a hora quando tem Hour e só se a hora toca a janela) ·
   StartInterval por faixa · o conjunto RunAtLoad, que é o que sobe junto no boot (`--boot` lista tudo). Entrada de calendário sem a chave Hour = toda hora; sem Minute = todo minuto
   (curinga, como no launchd). Weekday/Day/Month são condicionais: entram na grade MARCADOS (`job [seg]`). Day/Month não se cruzam com o dia da semana: o job conta em todos os dias (limite superior).
+  Weekday E Day na mesma entrada: o launchd dispara se QUALQUER um casa (man launchd.plist), então vira `[seg ou dia 15]` e conta em todos os dias.
 
 TRÊS ESTADOS (o que não sei NÃO vira "não tem")
   plist ilegível aparece na saída com o motivo; calendário que não conheço, e StartInterval/RunAtLoad/KeepAlive com tipo que o launchd não documenta (`"300"` em vez de 300), aparecem em "formato que
   não conheço" com a chave; tudo é contado: nunca some, e o valor malformado não conta como se fosse válido. `launchctl list` que falha, vem sem nenhum job ou vem com byte que não é UTF-8 →
   "carregado: desconhecido": todos entram na grade e o relatório diz isso (nunca "nada carregado"). Plist em disco cujo label não está carregado fica
   numa seção própria e FORA das colisões. Pasta ilegível, `--loaded-file` ilegível (não abre ou não é UTF-8) ou `--match` que não é regex → exit 3 sem grade (não sei ≠ grade vazia);
-  filtro que não casa nada → diz isso.
+  filtro que não casa nada → diz isso. O que o `--match` deixa de fora é CONTADO (linha "Fora do --match": quantos plists, quantos com início de calendário na janela, quantos com
+  RunAtLoad, quantos não consegui avaliar, quantos em disco e não carregados), nunca silêncio: um filtro que esconde o plist errado é uma grade que mente.
 
   Plist que o expat do Python recusa mas o launchd aceita (ex.: `--x` dentro de comentário XML) é lido pelo `plutil -convert xml1` (NG_PLUTIL troca o binário) e contado
   em "lidos via plutil"; só vai para "ilegíveis" se os dois falham.
 
 USO  nightly-grid.py [--dir D] [--match REGEX] [--from HH:MM] [--to HH:MM] [--min-collision N] [--boot] [--json] [--loaded-file ARQ]
-  --match filtra pelo NOME do arquivo (padrão: gascity|whatsapp|gastown|urblink, ou seja, o que é nosso). --loaded-file lê a saída de `launchctl list` de um arquivo
+  --match filtra pelo NOME do arquivo (padrão: vazio = TODOS os plists da pasta; o que um filtro deixa de fora aparece contado). --loaded-file lê a saída de `launchctl list` de um arquivo
   (testes). NG_LAUNCHCTL troca o binário. Códigos: 0 relatório feito (mesmo com colisão: é detecção, não bloqueio) · 2 uso errado · 3 não consegui ler a entrada (pasta, --loaded-file, --match).
 
-LIMITES  só entende StartCalendarInterval (dict ou lista de dict), StartInterval, RunAtLoad e KeepAlive; WatchPaths/QueueDirectories não têm horário e ficam fora. A hora
+LIMITES  só entende StartCalendarInterval (dict ou lista de dict), StartInterval, RunAtLoad e KeepAlive; WatchPaths/QueueDirectories/StartOnMount não têm horário: ficam fora da grade
+  e são contados em "sem horário". `launchctl list` mostra o domínio do launchd em que o comando roda (o do usuário), não os outros. A hora
   do StartInterval depende de quando o job foi carregado (após o reboot noturno: todos juntos), por isso é resumo e não grade. Quanto de RAM cada job usa NÃO sai daqui.
 """
 from __future__ import annotations
@@ -62,16 +65,17 @@ def fmt(minute: int) -> str:
 
 
 def cond_text(entry: dict) -> str:
-    """Condição de uma entrada de calendário (vazio = todo dia). Chave que não é inteiro válido → ValueError (o job vai para `odd`)."""
-    out = []
+    """Condição de uma entrada de calendário (vazio = todo dia). Chave que não é inteiro válido → ValueError (o job vai para `odd`). Weekday E Day na mesma entrada: o launchd dispara se
+    QUALQUER um casa (man launchd.plist), então o texto é `seg ou dia 15`, e não `seg,dia 15`, que leria como os dois ao mesmo tempo."""
+    out = {}
     for key, lo, hi in (("Weekday", 0, 7), ("Day", 1, 31), ("Month", 1, 12)):  # (chave, mínimo, máximo)
         v = entry.get(key)  # vazio → sem restrição nessa chave; ilegível (não é inteiro na faixa) → ValueError, e o job é listado como "formato que não conheço"
         if v is None:
             continue
         if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
             raise ValueError(f"{key}={v!r}")
-        out.append(DAYS[v % 7] if key == "Weekday" else f"{'dia' if key == 'Day' else 'mês'} {v}")
-    return ",".join(out)
+        out[key] = DAYS[v % 7] if key == "Weekday" else f"{'dia' if key == 'Day' else 'mês'} {v}"
+    return ",".join(x for x in (" ou ".join(out[k] for k in ("Weekday", "Day") if k in out), out.get("Month")) if x)
 
 
 def starts(entry: dict, lo: int, hi: int):
@@ -91,7 +95,8 @@ def starts(entry: dict, lo: int, hi: int):
 
 def weekdays(cond: str) -> frozenset:
     """Dias da semana (índice em DAYS) em que uma condição vale. Sem Weekday na condição (diário, ou só Day/Month) → os 7: Day/Month não se cruza com o dia da semana aqui, e
-    contar o job em todos os dias é o limite SUPERIOR (o lado seguro para quem procura colisão)."""
+    contar o job em todos os dias é o limite SUPERIOR (o lado seguro para quem procura colisão). Weekday E Day juntos (cond_text os junta num token só, `seg ou dia 15`, que não é nome de dia): dispara
+    se QUALQUER um casa, então o dia 15 cai em qualquer dia da semana → os 7. Só um token que é nome de dia restringe."""
     return frozenset(DAYS.index(p) for p in cond.split(",") if p in DAYS) or frozenset(range(7))
 
 
@@ -123,17 +128,18 @@ def load_plist(path: str):
 
 
 def read_plists(d: str, match: str):
-    """→ (jobs, bad). vazio → pasta sem plist que case: ([], []) e o relatório diz isso; falhou (a pasta não abre) → OSError, e main sai 3 sem grade; plist
-    ilegível → vai para `bad` com o motivo, nunca some."""
-    jobs, bad = [], []
+    """→ (jobs, bad, out_jobs, out_bad): o que casa com --match e o que NÃO casa, os dois lidos: o que ficou de fora é contado no relatório (outside), nunca some. vazio → pasta sem
+    plist: ([], [], [], []) e o relatório diz isso; falhou (a pasta não abre) → OSError, e main sai 3 sem grade; plist ilegível → vai para `bad`/`out_bad` com o motivo."""
+    jobs, bad, out_jobs, out_bad = [], [], [], []
     rx = re.compile(match)  # compila ANTES de olhar a pasta: regex inválida sobe re.error (main sai 3) mesmo numa pasta sem nenhum .plist, em vez de "nenhum plist casa"
-    for name in sorted(n for n in os.listdir(d) if n.endswith(".plist") and rx.search(n)):
+    for name in sorted(n for n in os.listdir(d) if n.endswith(".plist")):
+        inside = bool(rx.search(name))
         try:
             p, via = load_plist(os.path.join(d, name))
             if not isinstance(p, dict):
                 raise ValueError("não é um dicionário")
         except Exception as e:  # noqa: BLE001 — qualquer defeito do arquivo vira linha do relatório
-            bad.append({"file": name, "why": f"{type(e).__name__}: {str(e)[:80]}"})
+            (bad if inside else out_bad).append({"file": name, "why": f"{type(e).__name__}: {str(e)[:80]}"})
             continue
         cal = p.get("StartCalendarInterval")  # vazio → sem horário de calendário; ilegível (nem dict nem lista de dict) → `odd`
         cal = [] if cal is None else [cal] if isinstance(cal, dict) else cal
@@ -141,10 +147,10 @@ def read_plists(d: str, match: str):
         # "formato que não conheço" com a chave: não sei se o launchd a honra, e "não sei" não vira "não tem". O valor malformado não conta como RunAtLoad/KeepAlive/StartInterval.
         bad_keys = [f"{k}={p[k]!r}"[:60] for k, valid in VALID.items() if k in p and not valid(p[k])]
         iv, ka = p.get("StartInterval"), p.get("KeepAlive")
-        jobs.append({"label": str(p.get("Label") or name[:-6]), "file": name, "via": via, "boot": p.get("RunAtLoad") is True, "keepalive": VALID["KeepAlive"](ka) and bool(ka),
-                     "interval": iv if VALID["StartInterval"](iv) else None, "cal": cal, "bad_keys": bad_keys,
+        (jobs if inside else out_jobs).append({"label": str(p.get("Label") or name[:-6]), "file": name, "via": via, "boot": p.get("RunAtLoad") is True, "keepalive": VALID["KeepAlive"](ka) and bool(ka),
+                     "interval": iv if VALID["StartInterval"](iv) else None, "cal": cal, "bad_keys": bad_keys, "nosched": any(k in p for k in ("WatchPaths", "QueueDirectories", "StartOnMount")),
                      "odd": not isinstance(cal, list) or not all(isinstance(e, dict) for e in cal)})
-    return jobs, bad
+    return jobs, bad, out_jobs, out_bad
 
 
 def loaded_labels(path):
@@ -169,17 +175,39 @@ def loaded_labels(path):
     return labels or None
 
 
-def build(jobs, bad, loaded, lo, hi, n):
+def cal_starts(j, lo, hi):
+    """Inícios do calendário do job INTEIRO → [(inícios, curinga)], ou None = valor que não consegui ler (o job vai para `odd`). Tudo ou nada: um job que falha na 2ª entrada não deixa a 1ª solta."""
+    try:
+        return [] if j["odd"] else [starts(e, lo, hi) for e in j["cal"]]
+    except ValueError:
+        return None
+
+
+def outside(out_jobs, out_bad, loaded, lo, hi):
+    """O que o --match deixou de fora, CONTADO (nunca silêncio). com_inicio = labels que podem rodar e têm início de calendário na janela (inclusive "a cada minuto"); runatload = quantos
+    sobem no boot; nao_avaliados = ilegíveis e calendário/chave que não conheço (não sei ≠ não tem); nao_carregados = em disco e fora do `launchctl list` (não rodam, mas
+    entram em `plists`: a soma fecha). `launchctl` desconhecido → entra tudo (limite superior, como na grade)."""
+    com, boot, unk, off = [], 0, len(out_bad), 0
+    for j in out_jobs:
+        if loaded is not None and j["label"] not in loaded:
+            off += 1
+            continue  # em disco e não carregado: não roda
+        got = cal_starts(j, lo, hi)
+        unk += 1 if j["odd"] or got is None or j["bad_keys"] else 0
+        if any(hits or wild is not None for hits, wild in got or []):
+            com.append(j["label"])
+        boot += j["boot"]
+    return {"plists": len(out_jobs) + len(out_bad), "com_inicio": sorted(set(com)), "runatload": boot, "nao_avaliados": unk, "nao_carregados": off}
+
+
+def build(jobs, bad, loaded, lo, hi, n, fora):
     seen, every, per, odd, off = collections.defaultdict(dict), [], collections.Counter(), [], []  # seen: minuto -> {label: condições ou None se algum início é diário}
     odd_why = collections.defaultdict(list)  # label -> motivos de "formato que não conheço"
     for j in jobs:
         if loaded is not None and j["label"] not in loaded:
             off.append(j["label"])
             continue
-        try:  # o calendário do job inteiro ou nada: um job que falha na 2ª entrada não deixa a 1ª solta na grade
-            got = [] if j["odd"] else [starts(e, lo, hi) for e in j["cal"]]
-        except ValueError:
-            got = None
+        got = cal_starts(j, lo, hi)
         why = (["calendário"] if j["odd"] or got is None else []) + j["bad_keys"]
         if why:
             odd.append(j["label"])
@@ -197,8 +225,8 @@ def build(jobs, bad, loaded, lo, hi, n):
     live = [j for j in jobs if j["label"] not in off]  # o formato do calendário não diz nada sobre RunAtLoad/KeepAlive/StartInterval: esses seguem contados
     boot = sorted(j["label"] for j in live if j["boot"])
     peaks = {m: day_peak(d) for m, d in seen.items()}  # colisão = pico no MESMO dia da semana, não o total de labels do minuto (jobs de dias disjuntos nunca rodam juntos)
-    return {"window": [fmt(lo), fmt(hi)], "min_collision": n, "loaded": "desconhecido" if loaded is None else "conhecido",
-            "counts": {"plists": len(jobs) + len(bad), "ilegiveis": len(bad), "formato_desconhecido": len(set(odd)), "lidos_via_plutil": sum(1 for j in jobs if j["via"] == "plutil"), "nao_carregados": len(off), "boot_runatload": len(boot),
+    return {"window": [fmt(lo), fmt(hi)], "min_collision": n, "loaded": "desconhecido" if loaded is None else "conhecido", "fora_do_match": fora,
+            "counts": {"plists": len(jobs) + len(bad), "sem_horario": sum(1 for j in jobs if j["nosched"] and j["label"] not in off), "ilegiveis": len(bad), "formato_desconhecido": len(set(odd)), "lidos_via_plutil": sum(1 for j in jobs if j["via"] == "plutil"), "nao_carregados": len(off), "boot_runatload": len(boot),
                        "calendario": sum(1 for j in live if j["cal"]), "start_interval": sum(per.values()), "keepalive": sum(1 for j in live if j["keepalive"])},
             "collisions": {fmt(m): v for m, v in sorted(grid.items()) if peaks[m] >= n}, "peak": {fmt(m): peaks[m] for m in sorted(grid)}, "grid": {fmt(m): v for m, v in sorted(grid.items())},
             "every_minute": sorted(set(every)), "periodic": dict(per), "boot": boot, "unreadable": bad, "odd": sorted(set(odd)), "odd_why": {x: odd_why[x] for x in sorted(set(odd))}, "not_loaded": sorted(off)}
@@ -207,8 +235,12 @@ def build(jobs, bad, loaded, lo, hi, n):
 def render(r, show_boot):
     c, out = r["counts"], []
     out += [f"# Grade noturna {r['window'][0]}-{r['window'][1]} (plists vivos; carregado: {r['loaded']})", "",
-            f"plists {c['plists']} · ilegíveis {c['ilegiveis']} · lidos via plutil {c['lidos_via_plutil']} · formato desconhecido {c['formato_desconhecido']} · não carregados {c['nao_carregados']} · RunAtLoad {c['boot_runatload']} · "
-            f"com calendário {c['calendario']} · StartInterval {c['start_interval']} · KeepAlive {c['keepalive']}", ""]
+            f"plists {c['plists']} · fora do --match {r['fora_do_match']['plists']} · ilegíveis {c['ilegiveis']} · lidos via plutil {c['lidos_via_plutil']} · formato desconhecido {c['formato_desconhecido']} · não carregados {c['nao_carregados']} · RunAtLoad {c['boot_runatload']} · "
+            f"com calendário {c['calendario']} · StartInterval {c['start_interval']} · KeepAlive {c['keepalive']} · sem horário (WatchPaths/QueueDirectories/StartOnMount) {c['sem_horario']}", ""]
+    f = r["fora_do_match"]
+    if f["plists"]:
+        out += [f"Fora do --match: {f['plists']} plists, que NÃO entram na grade nem nas contagens abaixo: {len(f['com_inicio'])} com início de calendário na janela, {f['runatload']} com RunAtLoad, "
+                f"{f['nao_avaliados']} que não consegui avaliar, {f['nao_carregados']} em disco e não carregados (`--match ''` os inclui).", ""]
     if r["loaded"] == "desconhecido":
         out += ["AVISO: não consegui ler `launchctl list`; todos os plists entram na grade (pode haver job que não está carregado).", ""]
     if c["plists"] == 0:
@@ -232,7 +264,7 @@ def render(r, show_boot):
 def main(argv) -> int:
     ap = argparse.ArgumentParser(description="grade noturna lida dos plists vivos do launchd (somente leitura)")
     ap.add_argument("--dir", default=os.path.expanduser("~/Library/LaunchAgents"))
-    ap.add_argument("--match", default=r"gascity|whatsapp|gastown|urblink")
+    ap.add_argument("--match", default="")
     ap.add_argument("--from", dest="lo", type=hhmm, default=0)
     ap.add_argument("--to", dest="hi", type=hhmm, default=7 * 60 + 59)
     ap.add_argument("--min-collision", type=int, default=3)
@@ -244,12 +276,12 @@ def main(argv) -> int:
         print("nightly-grid: --min-collision >= 1 e --from <= --to", file=sys.stderr)
         return 2
     try:
-        jobs, bad = read_plists(a.dir, a.match)
+        jobs, bad, out_jobs, out_bad = read_plists(a.dir, a.match)
         loaded = loaded_labels(a.loaded_file)
     except (OSError, UnicodeError, re.error) as e:  # UnicodeError: --loaded-file que não é UTF-8; sem grade, igual a pasta ilegível
         print(f"nightly-grid: não consegui ler a entrada ({type(e).__name__}: {e}); sem grade, que não é o mesmo que grade vazia", file=sys.stderr)
         return 3
-    rep = build(jobs, bad, loaded, a.lo, a.hi, a.min_collision)
+    rep = build(jobs, bad, loaded, a.lo, a.hi, a.min_collision, outside(out_jobs, out_bad, loaded, a.lo, a.hi))
     sys.stdout.write(json.dumps(rep, ensure_ascii=False, indent=1) + "\n" if a.json else render(rep, a.boot))
     return 0
 
