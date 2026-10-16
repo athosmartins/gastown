@@ -45,6 +45,10 @@ SCRAPERS = {
 }
 EOF
 echo '{"seen":["old"]}' > "$SHARED/config/seen_alpha.json"; echo '{"c":1}' > "$SHARED/config/alpha_listing_cache.json"; echo '{"seen":["beta"]}' > "$SHARED/config/seen_beta.json"
+# estado que casa o padrão de inclusão mas NÃO pode ir: nome de segredo/sessão, e o estado de OUTRO raspador cujo nome começa por `alpha_`
+mkdir -p "$CODE/scrapers/alpha_x"; echo 'print(3)' > "$CODE/scrapers/alpha_x/scraper.py"
+echo '{"seen":["tok"]}' > "$SHARED/config/seen_alpha_token.json"; echo '{"c":2}' > "$SHARED/config/alpha_session_cache.json"
+echo '{"seen":["ax"]}' > "$SHARED/config/seen_alpha_x.json"; echo '{"c":3}' > "$SHARED/config/alpha_x_listing_cache.json"
 echo '{"user":"u","pass":"p"}' > "$SHARED/config/credentials.json"; echo 'old' > "$SHARED/data/alpha/old/f.json"
 cat > "$ELIG" <<'EOF'
 # lista de teste
@@ -196,6 +200,8 @@ check "run: o que foi ao nó é só código do raspador pedido (sem .env, token,
    && ! grep -q -E "\.env|token|leads\.csv|pyc|beta|shared|seen_properties|clientes_export|dump_leads|notas|runner" "$NODEHOME/seen-tree.txt"'
 check "run: do estado só foram seen_<raspador> e o cache dele (nem seen de outro, nem credenciais)" \
   'grep -q "seen_alpha.json" "$NODEHOME/seen-state.txt" && grep -q "alpha_listing_cache.json" "$NODEHOME/seen-state.txt" && ! grep -q -E "beta|credentials" "$NODEHOME/seen-state.txt"'
+check "run: do estado NÃO foram nem nome de segredo/sessão (token, session) nem o estado do raspador irmão alpha_x, mesmo casando o padrão alpha_*" \
+  '[ -s "$NODEHOME/seen-state.txt" ] && ! grep -q -E "token|session|alpha_x" "$NODEHOME/seen-state.txt"'
 check "run: a produção (shared/) ficou byte a byte igual" '[ "$(tree_sum "$SHARED")" = "$B0" ]'
 check "run: a pasta da rodada no nó foi apagada" '[ -z "$(ls -A "$NODEHOME/gt-remote/scrape/runs")" ]'
 check "run: uma linha no log jsonl com rc 0 e o raspador" 'tail -n 1 "$CITY/.gc/logs/hetzner-scrape.jsonl" | grep -q "\"scraper\":\"alpha\".*\"rc\":0"'
@@ -215,6 +221,12 @@ C0=$(ncalls)
 hsr -- run alpha --stage "$T/stage6"
 check "run: lista de telefones no código que iria ao nó -> 98, o nó NÃO é usado (só o ssh do preflight; nenhum mkdir/rsync)" '[ $RC -eq 98 ] && has "telefones/CPFs" && [ -z "$(ls -A "$NODEHOME/gt-remote/scrape/runs")" ] && [ "$(( $(ncalls) - C0 ))" = 1 ]'
 find "$CODE/lib/leads.py" -delete
+cp "$SHARED/config/seen_alpha.json" "$T/seen_alpha.bak"
+i=1; : > "$SHARED/config/seen_alpha.json"; while [ $i -le 25 ]; do printf '"(31) 9%04d-%04d"\n' $((1000 + i * 37)) $((2000 + i * 53)) >> "$SHARED/config/seen_alpha.json"; i=$((i + 1)); done
+C0=$(ncalls)
+hsr -- run alpha --stage "$T/stage6b"
+check "run: lista de telefones no ESTADO (seen/caches) que iria ao nó -> 98, o nó NÃO é usado (mesma falha fechada do código)" '[ $RC -eq 98 ] && has "arquivo de estado com lista de telefones/CPFs" && [ -z "$(ls -A "$NODEHOME/gt-remote/scrape/runs")" ] && [ "$(( $(ncalls) - C0 ))" = 1 ]'
+cp "$T/seen_alpha.bak" "$SHARED/config/seen_alpha.json"
 hsr FAKE_SSH_DROP_POLL=1 -- run alpha --stage "$T/stage7"
 check "run: ssh que cai nas consultas -> desiste com 98 e deixa a pasta no nó" '[ $RC -eq 98 ] && has "desisto" && [ -n "$(ls -A "$NODEHOME/gt-remote/scrape/runs")" ]'
 sleep 1; find "$NODEHOME/gt-remote/scrape/runs" -mindepth 1 -delete 2>/dev/null

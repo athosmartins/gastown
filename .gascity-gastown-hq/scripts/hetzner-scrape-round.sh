@@ -27,7 +27,7 @@
 #   VOLTA  shared/data/<raspador>/<timestamp>/ e os seen/caches atualizados, para $STAGE/<id>/shared/ + scraper.log. NADA é escrito em ~/.property-scrapers/shared (a produção): quem promove o
 #          staging é a fatia seguinte (a integração no runner.py), com trava contra a rodada local do mesmo raspador.
 # SEGURANÇA: o servidor é alugado e a fronteira de dados é a mesma do mbp-run.sh. Segredo, .env, token, banco, parquet, venv e shared/data da produção NÃO viajam (as regras de nome vêm antes de qualquer
-#   `+`, e `- *` fecha). O CONTEÚDO do que vai é varrido por hetzner-pii-scan.py (lista de telefones/CPFs = o nó NÃO é usado, rc 98). Nenhuma credencial vai no comando; o nó não tem a do GitHub nem a do mini.
+#   `+`, e `- *` fecha). O CONTEÚDO do que vai (código E seen/caches) é varrido por hetzner-pii-scan.py (lista de telefones/CPFs = o nó NÃO é usado, rc 98). Nenhuma credencial vai no comando; o nó não tem a do GitHub nem a do mini.
 # LIMITES: o raspador roda DESACOPLADO no nó (nohup; o ssh só consulta), então uma queda de rede de segundos não mata uma rodada de horas; passados HETZNER_SCRAPE_POLL_FAILS consultas seguidas sem resposta
 #   o script desiste com rc 98 e deixa a pasta da rodada no nó (o reaper do próximo preflight apaga as de > 1 dia). Não roda raspador com credencial (blow, leilões com login) nem o que o IP alemão não alcança.
 set -o pipefail
@@ -165,19 +165,32 @@ REMOTE
 }
 
 # filtro do rsync do CÓDIGO: segredo/dado/binário por NOME antes de qualquer `+`; depois só o que o raspador precisa, por caminho; `- *` fecha
+# exclusões por NOME, primeiras em qualquer filtro que mande algo ao nó (código E estado): credencial/segredo/dados de cliente não viajam mesmo que uma regra `+` mais abaixo case com eles
+name_exclusions() {
+  printf '%s\n' '- .env' '- .env.*' '- *.pem' '- *.key' '- *.p12' '- *.pfx' '- *.pkl' '- *.pickle' '- *.db' '- *.sqlite*' '- *.duckdb*' '- *.parquet' '- *.csv' '- *.xlsx' '- *.gz' '- *.zip' \
+      '- *token*' '- *secret*' '- *credential*' '- *password*' '- client_secret*' '- service_account*' '- .netrc' '- .npmrc' '- .pgpass' '- *cookie*' '- *session*' '- __pycache__/' '- *.pyc' '- .git/' '- venv/' '- .venv/' '- shared/' '- logs/'
+}
 write_code_filter() { # write_code_filter <arquivo> <raspador>
   local f=$1 sc=$2 t
   {
-    printf '%s\n' '- .env' '- .env.*' '- *.pem' '- *.key' '- *.p12' '- *.pfx' '- *.pkl' '- *.pickle' '- *.db' '- *.sqlite*' '- *.duckdb*' '- *.parquet' '- *.csv' '- *.xlsx' '- *.gz' '- *.zip' \
-      '- *token*' '- *secret*' '- *credential*' '- *password*' '- client_secret*' '- service_account*' '- .netrc' '- .npmrc' '- .pgpass' '- __pycache__/' '- *.pyc' '- .git/' '- venv/' '- .venv/' '- shared/' '- logs/'
+    name_exclusions
     printf '%s\n' '+ /lib/' '+ /lib/*.py' '- /lib/**' '+ /config/' '+ /config/__init__.py' '+ /config/scope.json'
     for t in "$PS_CODE"/config/*_tenants.json; do [ -f "$t" ] && printf '+ /config/%s\n' "$(basename "$t")"; done
     printf '%s\n' '- /config/**' '+ /scrapers/' "+ /scrapers/$sc/" "+ /scrapers/$sc/*.py" '- /scrapers/**' '- *'
   } > "$f"
 }
 # filtro do estado (seen/caches): só estes nomes, sob shared/config
+# `<raspador>_*` não pode casar o estado de OUTRO raspador (ex.: loft e loft_x): para cada pasta de raspador cujo nome começa por `<raspador>_`, o estado dela é excluído antes das inclusões
 write_state_filter() { # write_state_filter <arquivo> <raspador>
-  printf '%s\n' "+ /seen_$2.json" "+ /seen_$2_*.json" "+ /$2_*cache*.json" '- *' > "$1"
+  local f=$1 sc=$2 d o
+  {
+    name_exclusions
+    for d in "$PS_CODE"/scrapers/"$sc"_*/; do
+      [ -d "$d" ] || continue
+      o=$(basename "$d"); printf '%s\n' "- /seen_${o}.json" "- /seen_${o}_*.json" "- /${o}_*cache*.json"
+    done
+    printf '%s\n' "+ /seen_$sc.json" "+ /seen_${sc}_*.json" "+ /${sc}_*cache*.json" '- *'
+  } > "$f"
 }
 
 cmd_probe() {
@@ -268,7 +281,7 @@ cmd_run() {
   mkdir -p "$stage/shared" || die 97 "não criei $stage"
   code_f=$(mktemp "${TMPDIR:-/tmp}/hsr-code.XXXXXX"); state_f=$(mktemp "${TMPDIR:-/tmp}/hsr-state.XXXXXX"); pii_list=$(mktemp "${TMPDIR:-/tmp}/hsr-list.XXXXXX")
   dry_d=$(mktemp -d "${TMPDIR:-/tmp}/hsr-dry.XXXXXX")
-  trap 'rm -f "$code_f" "$state_f" "$pii_list" "$pii_list.out"; rmtmp "$dry_d"' EXIT
+  trap 'rm -f "$code_f" "$state_f" "$pii_list" "$pii_list.out" "$pii_list.state"; rmtmp "$dry_d"' EXIT
   write_code_filter "$code_f" "$sc"; write_state_filter "$state_f" "$sc"
 
   # varredura de CONTEÚDO do que o filtro deixaria sair (falha fechada: erro da varredura ≠ "nada retido")
@@ -276,11 +289,18 @@ cmd_run() {
   [ "${PIPESTATUS[0]}" -eq 0 ] && [ -s "$pii_list" ] || die 98 "não consegui listar o que iria ao nó (rsync -n falhou) — o nó NÃO é usado"
   python3 -I "$PII_SCAN" "$PS_CODE" < "$pii_list" > "$pii_list.out" 2>/dev/null || die 98 "a varredura de conteúdo (hetzner-pii-scan.py) não terminou — o nó NÃO é usado"
   if [ -s "$pii_list.out" ]; then held=$(cut -f3 "$pii_list.out" | head -n 3 | tr '\n' ' '); die 98 "arquivo com lista de telefones/CPFs entre os que iriam ao nó ($held…) — o nó NÃO é usado"; fi
+  # o mesmo para o estado (seen/caches): mesma lista pelo filtro, mesma varredura, mesma falha fechada
+  "$RSYNC_BIN" -a -n --out-format='%n' --filter=". $state_f" "$PS_SHARED"/config/ "$dry_d"/ 2>/dev/null | grep -v '/$' > "$pii_list.state"
+  [ "${PIPESTATUS[0]}" -eq 0 ] || die 98 "não consegui listar o estado (seen/caches) que iria ao nó (rsync -n falhou) — o nó NÃO é usado"
+  if [ -s "$pii_list.state" ]; then
+    python3 -I "$PII_SCAN" "$PS_SHARED/config" < "$pii_list.state" > "$pii_list.out" 2>/dev/null || die 98 "a varredura de conteúdo do estado (hetzner-pii-scan.py) não terminou — o nó NÃO é usado"
+    if [ -s "$pii_list.out" ]; then held=$(cut -f3 "$pii_list.out" | head -n 3 | tr '\n' ' '); die 98 "arquivo de estado com lista de telefones/CPFs entre os que iriam ao nó ($held…) — o nó NÃO é usado"; fi
+  fi
 
   t0=$(date +%s)
   rssh "mkdir -p $remote_rel/rig/main $remote_rel/shared/config $remote_rel/shared/data" || die 98 "ssh caiu ao preparar a pasta da rodada"
   "$RSYNC_BIN" -a --delete --delete-excluded --filter=". $code_f" -e "$SSH_BIN $SSH_OPTS" "$PS_CODE"/ "$NODE_HOST:$remote_rel/rig/main/" >/dev/null 2>&1 || die 98 "rsync do código ao nó falhou"
-  if ls "$PS_SHARED"/config/seen_"$sc"*.json "$PS_SHARED"/config/"$sc"_*cache*.json >/dev/null 2>&1; then
+  if [ -s "$pii_list.state" ]; then
     "$RSYNC_BIN" -a --filter=". $state_f" -e "$SSH_BIN $SSH_OPTS" "$PS_SHARED"/config/ "$NODE_HOST:$remote_rel/shared/config/" >/dev/null 2>&1 || die 98 "rsync do estado (seen/caches) ao nó falhou"
   fi
 
