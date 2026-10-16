@@ -894,6 +894,13 @@ _attempt_pytest() {
   RC=0
   base=$(base_of "$repo"); rv=$(venv_of "$repo"); M="gt-remote/mirror/$repo-$SLOT"
   [ -n "$base" ] && [ -n "$rv" ] || { say "o $HNAME não tem o repo '$repo'"; fall repo-sem-no 97; return 97; }
+  # HETZNER_ISOLATE=1 (ga-9p6pte, a bateria noturna): o pytest só roda dentro de ~/gt-remote/bin/gt-iso-run (canário de rede + helper de root). vazio/0/qualquer valor que não seja o literal 1 → roda como sempre;
+  # 1 fora do nó (o MBP não tem o helper) → 97 sem rodar nada; wrapper ausente no nó → 97 pelo guard do JOBDEF. Isolamento não confirmado nunca vira "rodou sem isolar".
+  ISO=""
+  if [ "${HETZNER_ISOLATE:-0}" = 1 ]; then
+    [ "$HOSTKIND" = linux ] || { say "HETZNER_ISOLATE=1 só vale no nó Linux — nada rodou"; fall isolamento-so-no-no 97; return 97; }
+    ISO='"$HOME/gt-remote/bin/gt-iso-run" -- '   # texto literal: o $HOME é expandido no nó
+  fi
   cpcmd="cp -cR"; [ "$HOSTKIND" = linux ] && cpcmd="cp -a --reflink=auto"   # APFS clone no macOS; no Linux, cópia (reflink quando o disco deixa)
   m=$(rssh <<EOF 2>/dev/null
 # MBP:MIRROR
@@ -923,9 +930,10 @@ EOF
   qargs=$(printf '%q ' "$@")
   if [ "$HOSTKIND" = linux ]; then pathline='export PATH="$HOME/.local/bin:$PATH" PYTHONDONTWRITEBYTECODE=1'
   else pathline='export PATH=/opt/homebrew/bin:$PATH PYTHONDONTWRITEBYTECODE=1'; fi
+  [ -z "$ISO" ] || pathline="$pathline"$'\n''[ -x "$HOME/gt-remote/bin/gt-iso-run" ] || { echo "GTN-ISO: inerte wrapper-ausente (~/gt-remote/bin/gt-iso-run)"; exit 97; }'
   IFS= read -r -d '' JOBDEF <<EOF || true
 $pathline
-job() { cd "\$HOME/$M" || return 97; \$MBP_BG nice -n "\$MBP_NICE" "\$HOME/gt-remote/$rv/bin/python" -m pytest -p no:cacheprovider $qargs; }
+job() { cd "\$HOME/$M" || return 97; \$MBP_BG nice -n "\$MBP_NICE" ${ISO}"\$HOME/gt-remote/$rv/bin/python" -m pytest -p no:cacheprovider $qargs; }
 mbp_supervise job
 EOF
   shadow_start "${orig[@]}"

@@ -1,0 +1,21 @@
+# ga-9p6pte: a bateria completa de testes do WhatsApp roda toda madrugada no nó Hetzner, sem rede de saída e sem segredos, e o Mayor recebe o relatório de manhã.
+#
+# ARMADILHA DO CRON (medida em 27/08, ver engine-window-reboot-noon.toml): o cron destes orders é avaliado em UTC, não na hora local. "Por volta
+# de 02:00" local (-03) = 05:00 UTC, por isso `0 5 * * *`. O Brasil não tem horário de verão desde 2019; se voltar, este horário muda junto.
+#
+# O QUE FAZ: hetzner-nightly-tests.sh busca origin/main do WA, empurra a árvore filtrada para o nó e roda `pytest tests/ -n 14` DENTRO do helper de
+# isolamento de rede (mbp-run.sh com HETZNER_ISOLATE=1). Sem o helper de root instalado (docs/runbooks/hetzner-nightly-tests.md) a bateria NÃO roda:
+# o veredito da noite é INERTE e o relatório diz o que falta. Nunca se roda a suíte sem a prova do canário (04/10: um teste de branch antiga mandou
+# e-mail de verdade).
+#
+# timeout 10800s (3h) > o prazo do próprio script (HZN_TIMEOUT_S=7200 + busca, envio e relatório), para o script conseguir registrar o desfecho;
+# o script tem trava de instância única, então uma rodada que passe da hora não empilha com a seguinte.
+#
+# Conferir depois de um reload:  gc order show hetzner-nightly-tests          -> Source: .../packs/town-deltas/...
+#                                tail -3 $GC_CITY_PATH/.gc/logs/hetzner-nightly.jsonl   (um veredito por noite)
+[order]
+description = "Madrugada (02:00 local): pytest completo do WhatsApp no nó Hetzner, sem rede e sem segredos, com relatório ao Mayor (ga-9p6pte)"
+trigger = "cron"
+schedule = "0 5 * * *"
+exec = "bash $PACK_DIR/../../scripts/hetzner-nightly-tests.sh"
+timeout = "10800s"

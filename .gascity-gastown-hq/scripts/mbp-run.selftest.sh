@@ -878,6 +878,29 @@ has "o node_guard avisa quantos reteve" "$T/err" 'NOTE: 3 arquivo\(s\) com lista
 for okf in lib/a.py tests/test_x.py tests/ok.json tests/data/fixture.json tests/fixtures/win.jsonl contacts_auth/server.py processo_lookup/pdpj_token.py tests/test_pdpj_token_refresh.py lib/rules.yaml $OKCFG $PASSF; do n=$((n+1)); if [ -f "$DEST/$okf" ]; then echo "ok   chegou (é código/config listado/abaixo do limite): $okf"; else echo "FAIL não chegou: $okf"; fails=$((fails+1)); fi; done
 n=$((n+1)); if [ ! -e "$DEST/processo_lookup/.env.pdpj" ] && [ ! -e "$DEST/shared/logs.backup/x.out" ]; then echo "ok   --delete-excluded limpa o que uma semeadura antiga deixou (.env.pdpj e shared/logs.backup/x.out)"; else echo "FAIL o destino manteve segredo/log antigo"; fails=$((fails+1)); fi
 MUT="$T/mutdir"; mkdir -p "$MUT"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt hetzner-pii-scan.py hetzner-mac-only.txt; do ln -sf "$HERE/$mf" "$MUT/$mf"; done   # o pii-scan TEM de estar aqui: sem ele o node_guard do mutante falha fechado e nada vaza, e o controle diria que o teste não enxerga o defeito; a lista mac-only idem (ilegível = o nó não é usado)
+# HETZNER_ISOLATE=1 (ga-9p6pte, a bateria noturna): o pytest do nó só roda dentro do wrapper de isolamento; fora do nó ou sem o wrapper → 97 e NADA roda.
+# iso_obs R: roda o mbp-run R (o real ou um mutante) nos 4 cenários e deixa as observações em ISO_OBS (uma palavra por observação que se confirmou).
+iso_obs() { local R=$1 rc s; ISO_OBS=""
+  reset; date > "$NODEFLAG"; "$R" --host linux --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>&1; s=$(lastscript RUN hetzner)
+  case "$s" in *gt-iso-run*) ;; *) ISO_OBS="$ISO_OBS sem-iso:limpo";; esac                                   # sem HETZNER_ISOLATE o script não cita o wrapper
+  reset; date > "$NODEFLAG"; HETZNER_ISOLATE=1 "$R" --host linux --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>&1; s=$(lastscript RUN hetzner)
+  case "$s" in *'nice -n "$MBP_NICE" "$HOME/gt-remote/bin/gt-iso-run" -- "$HOME/gt-remote/venv-wa/bin/python" -m pytest'*) ISO_OBS="$ISO_OBS com-iso:embrulha";; esac
+  case "$s" in *'[ -x "$HOME/gt-remote/bin/gt-iso-run" ] || { echo "GTN-ISO: inerte wrapper-ausente'*'exit 97; }'*) ISO_OBS="$ISO_OBS com-iso:guard";; esac
+  reset; date > "$NODEFLAG"; HETZNER_ISOLATE=1 "$R" --host mbp --repo wa --dir "$T/wt" -- tests/test_x.py >/dev/null 2>"$T/err"; rc=$?
+  [ "$rc" = 97 ] && [ ! -e "$(lsf RUN mbp)" ] && grep -q 'só vale no nó Linux' "$T/err" && ISO_OBS="$ISO_OBS fora-do-no:97-sem-rodar"
+  reset; date > "$NODEFLAG"; HETZNER_ISOLATE=1 STUB_RUNMODE=exec "$R" --host linux --repo wa --dir "$T/wt" -- tests/test_x.py >"$T/out" 2>&1; rc=$?   # o HOME falso não tem ~/gt-remote/bin/gt-iso-run
+  [ "$rc" = 97 ] && grep -q 'GTN-ISO: inerte wrapper-ausente' "$T/out" && ISO_OBS="$ISO_OBS sem-wrapper:97"; }
+iso_obs "$RUN"
+for o in sem-iso:limpo com-iso:embrulha com-iso:guard fora-do-no:97-sem-rodar sem-wrapper:97; do
+  case " $ISO_OBS " in *" $o "*) ok "HETZNER_ISOLATE ($o)";; *) bad "HETZNER_ISOLATE ($o) — observado:$ISO_OBS";; esac; done
+# controles negativos: cada defeito do gancho tem de sumir da observação que o guarda (senão o caso não enxerga o defeito)
+iso_mut() { local nome=$1 expr=$2 perde=$3 f="$MUT/iso-mut-$1.sh"; sed "$expr" "$RUN" > "$f"; chmod +x "$f"
+  if cmp -s "$RUN" "$f"; then bad "controle $nome: o sed não mudou nada"; return; fi
+  iso_obs "$f"; case " $ISO_OBS " in *" $perde "*) bad "controle $nome: '$perde' continua observado — o caso não enxerga o defeito";; *) ok "controle $nome: o defeito faz '$perde' sumir";; esac; }
+iso_mut sem-embrulho  's/ \${ISO}"\\$HOME\/gt-remote\/\$rv/ "\\$HOME\/gt-remote\/$rv/' com-iso:embrulha
+iso_mut sem-guard     's/^  \[ -z "\$ISO" \] || pathline=.*$/  :/' com-iso:guard
+iso_mut iso-no-mbp    's/^    \[ "\$HOSTKIND" = linux \] || { say "HETZNER_ISOLATE=1.*$/    :/' fora-do-no:97-sem-rodar
+iso_mut iso-sempre    's/^  if \[ "\${HETZNER_ISOLATE:-0}" = 1 \]; then$/  if true; then/' sem-iso:limpo
 # controle negativo 1: sem o --filter, o vazamento aparece — prova que o teste enxerga o defeito
 sed 's/--filter=". \$NODE_FILTER" //' "$RUN" > "$MUT/mut-nofilter.sh"; chmod +x "$MUT/mut-nofilter.sh"
 n=$((n+1)); if cmp -s "$RUN" "$MUT/mut-nofilter.sh"; then echo "FAIL controle: o sed não mudou nada"; fails=$((fails+1)); else
