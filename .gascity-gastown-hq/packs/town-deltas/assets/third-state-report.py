@@ -264,7 +264,8 @@ def build(args, city):
     st, rows, bad, bad_ts = read_jsonl(os.path.join(gc, "quality-gate.jsonl"))
     if st != "ok" or not rows:
         why = {"absent": "o arquivo não existe", "unreadable": "o arquivo não pôde ser lido"}.get(st, "o arquivo está vazio ou sem nenhuma linha legível")
-        return ["NÃO SEI: %s (%s). Nada foi contado — isto NÃO é 0 beads nem 0%%." % (why, os.path.join(gc, "quality-gate.jsonl"))], 2
+        seen_bad = "; %d linhas ilegíveis contadas, nenhuma é um registro" % bad if bad else ""
+        return ["NÃO SEI: %s%s (%s). Nada foi contado — isto NÃO é 0 beads nem 0%%." % (why, seen_bad, os.path.join(gc, "quality-gate.jsonl"))], 2
     now = parse_ts(args.now) if args.now else datetime.datetime.now(UTC).replace(microsecond=0)
     lo = now - datetime.timedelta(days=args.days)
     vs, no_ts, other, dry = verdicts(rows)

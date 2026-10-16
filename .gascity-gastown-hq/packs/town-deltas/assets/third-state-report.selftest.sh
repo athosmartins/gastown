@@ -143,6 +143,8 @@ CASE="control: corrupted line"; mkcity corr; cp "$L" "$W/corr/.gc/quality-gate.j
 printf '{"ts":"2026-10-12T05:00:00Z","event":"dispatcher_complete","bead":"Z9","result":"FAI\n' >> "$W/corr/.gc/quality-gate.jsonl"
 printf 'xx not json at all\n' >> "$W/corr/.gc/quality-gate.jsonl"; run corr --no-classify
 chk test "$RC" -eq 0; chk has "2 linhas ilegíveis no quality-gate.jsonl"; chk has "1 têm ts legível dentro da janela"; chk has "19 vereditos reais na janela"
+CASE="control: log of only corrupted lines"; mkcity allbad; printf 'xx\n{"ts":"2026-10-12T05:00:00Z","event":"dispatcher_complete","bead":"Z9"\n' > "$W/allbad/.gc/quality-gate.jsonl"; run allbad
+chk test "$RC" -eq 2; chk has "NÃO SEI: o arquivo está vazio ou sem nenhuma linha legível; 2 linhas ilegíveis contadas"; chk test "$(grep -cE '[0-9]+% \(' "$W/out")" -eq 0
 CASE="control: empty window"; mkcity ew; v 2026-09-01T10:00:00Z E1 PASS ok r1 > "$W/ew/.gc/quality-gate.jsonl"; : > "$W/ew/.gc/e12-roster.jsonl"; run ew
 chk test "$RC" -eq 0; chk hasx '^  todos +sem dado +- +sem dado +-'; chk test "$(grep -E '^  [a-zA-Z]' "$W/out" | grep -cE '[0-9]+% \(')" -eq 0; chk has "0 vereditos reais na janela (0 beads"
 CASE="usage"; python3 "$SCRIPT" --days 0 > /dev/null 2>&1; chk test "$?" -eq 64
