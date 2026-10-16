@@ -7,7 +7,8 @@ modelo/effort é decidível — esta ferramenta é o pré-requisito (passo 0 do 
     backfill-s3  traz do arquivo permanente (S3) os transcritos que o reaper já apagou — uma vez, para o baseline histórico.
     harvest   varre os transcritos (~/.claude/projects) e grava um LEDGER durável, uma linha por sessão. O transcrito é apagado
               pelo transcript-reaper 24h depois de a sessão morrer; o ledger é o que sobrevive. Idempotente e incremental.
-    report    ledger + log do gate -> tokens e US$ por papel/modelo/effort, por bead, e por bead APROVADA.
+    report    ledger + log do gate -> tokens e US$ por papel/modelo/effort, por bead, e por bead APROVADA; por CREW (1d) e sessões SEM papel
+              abertas por origem/cwd contra a meta de 5% (1e, ga-v2qox1). Relatório DIÁRIO por crew: `report --since-days 1` (ou `--json`).
     prices    a tabela de preços em uso (e de onde veio cada número).
 
 Somente leitura sobre os transcritos e o log do gate. Só escreve ao lado do ledger (o diretório dele): `sessions.jsonl`, `sessions.jsonl.lock`
@@ -945,6 +946,140 @@ def flatten(rows, since_day):
     return out
 
 
+UNATTRIBUTED_TARGET_PCT = 5.0     # meta do ga-v2qox1: sessões SEM papel atribuído < 5% do custo
+CREW_DIR_NAMES = ("peter", "oracle", "batista", "thies", "mila", "digo")   # espelha a linha `crew` de ROLE_RES (o selftest trava a deriva entre as duas)
+
+
+def origin_of_cwd(cwd):
+    """De onde veio uma sessão pelo diretório em que ela rodou. Só NOMEIA a origem: não muda o papel da sessão nem a soma de ninguém.
+    Existe porque o papel vem do beacon `[gascity] <alias>` da 1ª mensagem — sessão sem beacon cai em `headless` e o cwd é a única pista."""
+    if not cwd:
+        return "sem-cwd"
+    p = str(cwd).rstrip("/") or "/"
+    if re.match(r"^/(?:Users|home)/[^/]+$", p):
+        return "home-dir"
+    mm = re.search(r"/crew/([^/]+)", p)
+    if mm:
+        name = mm.group(1)
+        if name.split("-")[0] in CREW_DIR_NAMES:
+            return f"crew-dir:{name.split('-')[0]}"           # crew/digo e crew/digo-wt-e94-1 (worktree dele) são do digo
+        return "crew-dir:worker-wa-*" if name.startswith("worker-") else "crew-dir:outro"
+    if "/.gc-worktrees/" in p or "/.claude/worktrees/" in p:
+        return "worktree"
+    if "/.gc/agents/" in p:
+        return "gc-agent-dir"
+    mm = re.search(r"/gt/([^/]+)", p)
+    if mm:
+        return f"rig:{mm.group(1)}"
+    return "gt-root" if p.endswith("/gt") else "outro-dir"
+
+
+def is_unattributed(role):
+    """Papel que a atribuição por beacon NÃO resolveu: sem beacon (`headless`) ou alias fora da tabela (`other:*`). `title-summary` e
+    `pregate-review` são reconhecidos pelo CONTEÚDO da sessão — têm nome, não são 'sem papel'."""
+    return role == "headless" or role.startswith("other:")
+
+
+def group_usage(flat, pick):
+    """`flat` agrupado por `pick(sessão)` (None = fora do grupo): sessões, msgs, tokens, tokens SEM preço, US$ dos tokens COM preço e tokens por
+    modelo. Token de modelo sem preço NÃO vira US$ 0: vai para `unpriced` e o US$ do grupo é um piso."""
+    g = defaultdict(lambda: dict(sessions=set(), msgs=0, tokens=0, unpriced=0, usd=0.0, models=Counter()))
+    for s, _day, model, _effort, c, usd in flat:
+        k = pick(s)
+        if k is None:
+            continue
+        tt = total_tokens(c)
+        r = g[k]
+        r["sessions"].add(s["sid"])
+        r["msgs"] += c["msgs"]
+        r["tokens"] += tt
+        r["models"][model] += tt
+        if usd is None:
+            r["unpriced"] += tt
+        else:
+            r["usd"] += usd
+    return g
+
+
+def pct_of(x, total):
+    """% de x sobre total, ou None quando não há base (total <= 0): 'não sei' não é 0%."""
+    return None if total is None or total <= 0 else 100.0 * x / total
+
+
+def fmt_pct(p):
+    return "  n/d" if p is None else f"{p:5.1f}"
+
+
+def unattributed_verdict(pct_usd, pct_tok, target=UNATTRIBUTED_TARGET_PCT):
+    """acima | dentro | indeterminado. Qualquer das duas medidas acima da meta reprova; sem NENHUMA medida não se aprova nada."""
+    if pct_usd is None and pct_tok is None:
+        return "indeterminado"
+    if (pct_usd is not None and pct_usd >= target) or (pct_tok is not None and pct_tok >= target):
+        return "acima"
+    return "dentro"
+
+
+def _group_rows(g, tot_usd, tot_tok):
+    rows = []
+    for k, r in sorted(g.items(), key=lambda kv: (-kv[1]["usd"], -kv[1]["tokens"], str(kv[0]))):
+        if r["tokens"] == 0:
+            continue
+        rows.append(dict(key=k, sessions=len(r["sessions"]), msgs=r["msgs"], tokens=r["tokens"], unpriced_tokens=r["unpriced"],
+                         usd=None if r["unpriced"] and not r["usd"] else round(r["usd"], 4), usd_is_floor=bool(r["unpriced"] and r["usd"]),
+                         pct_usd=pct_of(r["usd"], tot_usd), pct_tokens=pct_of(r["tokens"], tot_tok),
+                         models=dict(r["models"].most_common())))
+    return rows
+
+
+def _print_group(rows, label):
+    print(f"{label:34s} {'sess':>5s} {'msgs':>7s} {'Mtok':>9s} {'Mtok s/preço':>12s} {'US$':>10s} {'%US$':>6s} {'%tok':>6s}  modelos (Mtok)")
+    for r in rows:
+        usd_s = fmt_usd(r["usd"], unpriced=r["usd_is_floor"])
+        mods = ", ".join(f"{k or '?'} {v / 1e6:.2f}" for k, v in r["models"].items())
+        print(f"{str(r['key']):34s} {r['sessions']:5d} {r['msgs']:7d} {r['tokens'] / 1e6:9.2f} {r['unpriced_tokens'] / 1e6:12.2f} {usd_s:>10s} "
+              f"{fmt_pct(r['pct_usd']):>6s} {fmt_pct(r['pct_tokens']):>6s}  {mods}")
+
+
+def section_crew_and_unattributed(flat, tot_usd, result):
+    """1d: custo por CREW (alias do beacon). 1e: sessões SEM papel atribuído, abertas por origem (cwd), contra a meta do ga-v2qox1.
+    Aditivo: não mexe em `role` nem nas seções 1-1c; só lê `flat`. `tot_usd` é o total precificado da seção 1 (um PISO quando há modelo sem preço)."""
+    tot_tok = sum(total_tokens(c) for _s, _d, _m, _e, c, _u in flat)
+    crews = _group_rows(group_usage(flat, lambda s: (s.get("alias") or "?").split("-adhoc-")[0] if s["role"] == "crew" else None), tot_usd, tot_tok)
+    print("\n== 1d. custo por CREW (sessões com beacon de crew) — `Mtok s/preço` = tokens de modelo SEM preço na tabela (o US$ da linha é piso, `+`; n/p se TODO o gasto dela é sem preço)")
+    if crews:
+        _print_group(crews, "crew")
+        crew_unp = sum(r["unpriced_tokens"] for r in crews)
+        if crew_unp:
+            print(f"   ⚠ {crew_unp / 1e6:.2f} Mtok de crew em modelo SEM preço: o US$ por crew acima é piso — preencher PRICES com fonte citável (ou --assume-price, rotulado) antes de comparar crews.")
+    else:
+        print("   (nenhuma sessão de crew na janela — vazio, não custo zero)")
+    result["by_crew"] = crews
+    result["crew_unpriced_tokens"] = sum(r["unpriced_tokens"] for r in crews)
+
+    unatt = group_usage(flat, lambda s: s["role"] if is_unattributed(s["role"]) else None)
+    by_role_un = _group_rows(unatt, tot_usd, tot_tok)
+    origin = _group_rows(group_usage(flat, lambda s: f"{s['role']} @ {origin_of_cwd(s.get('cwd'))}" if is_unattributed(s["role"]) else None), tot_usd, tot_tok)
+    un_usd = sum(r["usd"] for r in unatt.values())
+    un_tok = sum(r["tokens"] for r in unatt.values())
+    un_unp = sum(r["unpriced"] for r in unatt.values())
+    pu, pt = pct_of(un_usd, tot_usd), pct_of(un_tok, tot_tok)
+    verdict = unattributed_verdict(pu, pt)
+    print(f"\n== 1e. sessões SEM papel atribuído (sem beacon = `headless`, alias fora da tabela = `other:*`) por ORIGEM (cwd) — meta ga-v2qox1: < {UNATTRIBUTED_TARGET_PCT:g}%")
+    if origin:
+        _print_group(origin, "papel @ origem")
+    else:
+        print("   (nenhuma sessão sem papel na janela)")
+    print(f"   SEM PAPEL: {fmt_pct(pu).strip()}% do US$ precificado e {fmt_pct(pt).strip()}% dos tokens — {verdict.upper()} da meta de {UNATTRIBUTED_TARGET_PCT:g}%"
+          + (f"  (⚠ {un_unp / 1e6:.2f} Mtok sem papel e sem preço: não entram no % de US$)" if un_unp else ""))
+    crew_dir_hl = sum(r["tokens"] for k, r in group_usage(flat, lambda s: origin_of_cwd(s.get("cwd")) if s["role"] == "headless" else None).items()
+                      if k.startswith("crew-dir:"))
+    if crew_dir_hl:
+        print(f"   ⚠ {crew_dir_hl / 1e6:.2f} Mtok `headless` rodaram em diretório de crew (crew/<nome>): a ORIGEM é de crew, mas a sessão não tem beacon — "
+              f"esse gasto NÃO está na tabela 1d e o papel dela segue `headless` (a origem é pista, não prova).")
+    result["unattributed"] = dict(target_pct=UNATTRIBUTED_TARGET_PCT, verdict=verdict, tokens=un_tok, pct_tokens=pt, usd=round(un_usd, 4), pct_usd=pu,
+                                  unpriced_tokens=un_unp, by_role=by_role_un, by_origin=origin, headless_in_crew_dir_tokens=crew_dir_hl)
+
+
 def fmt_usd(x, unpriced=False):
     return "n/p" if x is None else (f"{x:8.2f}" + ("+" if unpriced else " "))
 
@@ -1128,6 +1263,9 @@ def _report(a, result):
     result["context_caps"] = cap_out
     if comp_unpriced:
         print("   ⚠ a leitura de cache de modelo SEM preço (ver a nota de 1b) não entra em 1c: os US$ acima são piso, não o teto completo.")
+
+    # ---- 1d/1e. custo por crew e sessões sem papel por origem (ga-v2qox1)
+    section_crew_and_unattributed(flat, tot_usd, result)
 
     # ---- 2. spawn ocioso (sessão de pool sem nenhum claim)
     idle = defaultdict(lambda: [0, 0.0, 0, 0, 0])     # sessões, US$ dos tokens COM preço, tokens SEM preço, sessões com claim SEM timestamp, sessões com claim NÃO confirmado

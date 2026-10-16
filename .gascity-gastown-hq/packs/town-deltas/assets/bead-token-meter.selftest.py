@@ -42,6 +42,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import statistics
@@ -1506,6 +1507,131 @@ def t_assistant_record_with_user_word_is_counted(m, W):
     ck(m.scan_session(P / "-proj" / "u2.jsonl")["msgs"] == 1, "linha de usuário comum não atrapalha a contagem")
 
 
+# ---- ga-v2qox1: custo por CREW e sessões SEM papel por origem. 1 resposta = 1M tokens de entrada => sonnet-5-5 US$ 2,00, opus-5-5 US$ 4,00 (conta exata, sem arredondar)
+U_1M = dict(input_tokens=1_000_000, output_tokens=0, cache_creation_input_tokens=0, cache_read_input_tokens=0)
+FABLE = "claude-fable-5-1"      # fora da tabela PRICES de propósito: é o modelo que deixa o crew sem custo medido
+
+
+DOG_TOK, DOG_USD = 2 * 100, 2 * USD_SMALL          # o dog de mini_world: 2 respostas de U_SMALL (100 tokens) em sonnet-5-5
+
+
+def cw_session(P, sid, first, model, k, hhmm, cwd=None):
+    """Sessão cuja 1ª mensagem é `first` (beacon, ou texto sem beacon) e que tem `k` respostas de 1M tokens de `model`."""
+    t = lambda sec: f"{D}{hhmm}:{sec:02d}.000Z"
+    head = dict(first, timestamp=t(0))
+    if cwd:
+        head["cwd"] = cwd
+    recs = [head]
+    for j in range(1, k + 1):
+        recs += asst(f"{sid}-{j}", t(10 + j), usage=U_1M, model=model)
+    write_session(P, "-proj", sid, recs)
+
+
+def cw_world(m, W, sessions):
+    """1 dog de 2 respostas pequenas (DOG_TOK tokens, DOG_USD: a base atribuída, desprezível, + o log do gate com 1 PASS) + as `sessions` = (first, model, k, cwd)."""
+    w = mini_world(m, W, [dict(bead="ga-cw1", model="claude-sonnet-5-5", k=2)])
+    for i, (first, model, k, cwd) in enumerate(sessions):
+        cw_session(w["projects"], f"cw{i:03d}", first, model, k, f"09:{i:02d}", cwd)
+    harvest(m, w)
+    return w
+
+
+def beacon_of(alias):
+    return beacon(alias, D + "09:00:00.000Z")
+
+
+def t_crew_cost_and_unattributed(m, W):
+    """ga-v2qox1: o custo por crew e o que NÃO tem papel (meta < 5%) têm que sair do relatório — texto e --json — sem inventar preço.
+    Mundo: dog (DOG_TOK tok, DOG_USD: desprezível) + peter-wa 3 resp sonnet (US$ 6) + oracle-wa em 2 sessões (2 resp opus US$ 8; 4 resp FABLE sem preço, alias com
+    -adhoc- que tem que cair no MESMO crew) + mila-wa só FABLE (1 resp: US$ n/p, nunca 0) + title-summary (reconhecido pelo conteúdo, NÃO é sem papel)
+    + 4 sem papel: home-dir 5 resp (US$ 10), crew/digo 2 resp (US$ 4), worktree 1 (US$ 2), alias fora da tabela 1 (US$ 2).
+    Tokens: 20M + DOG_TOK no total, 9M sem papel (45%); US$ precificado 34 + DOG_USD, sem papel 18 (53%) => ACIMA da meta."""
+    sessions = [(beacon_of("peter-wa"), "claude-sonnet-5-5", 3, None),
+                (beacon_of("oracle-wa"), "claude-opus-5-5", 2, None),
+                (beacon_of("oracle-wa-adhoc-x7"), FABLE, 4, None),
+                (beacon_of("mila-wa"), FABLE, 1, None),
+                (user("Summarize the following user message in 5 words", D + "09:00:00.000Z"), "claude-sonnet-5-5", 1, None),
+                (user("faça isso", D + "09:00:00.000Z"), "claude-sonnet-5-5", 5, "/Users/athos"),
+                (user("faça aquilo", D + "09:00:00.000Z"), "claude-sonnet-5-5", 2, "/Users/athos/gt/whatsapp_automation/crew/digo"),
+                (user("terceiro", D + "09:00:00.000Z"), "claude-sonnet-5-5", 1, "/Users/athos/gt/.gc-worktrees/ga-x"),
+                (beacon_of("zzz-unknown"), "claude-sonnet-5-5", 1, None)]
+    w = cw_world(m, W, sessions)
+    code, r = report(m, w)
+    ck(code == 0, f"relatório sai com exit 0: {code} {r.get('error')}")
+    crews = {x["key"]: x for x in r["by_crew"]}
+    ck(set(crews) == {"peter-wa", "oracle-wa", "mila-wa"}, f"só as sessões com beacon de crew, -adhoc- no mesmo crew: {sorted(crews)}")
+    p, o, mi = crews["peter-wa"], crews["oracle-wa"], crews["mila-wa"]
+    ck(p["tokens"] == 3_000_000 and approx(p["usd"], 6.0) and p["unpriced_tokens"] == 0 and not p["usd_is_floor"], f"peter-wa: {p}")
+    ck(o["sessions"] == 2 and o["msgs"] == 6 and o["tokens"] == 6_000_000 and o["unpriced_tokens"] == 4_000_000, f"oracle-wa soma as 2 sessões: {o}")
+    ck(approx(o["usd"], 8.0) and o["usd_is_floor"], f"oracle-wa: US$ 8,00 dos tokens com preço, rotulado PISO (há 4M sem preço): {o}")
+    ck(mi["usd"] is None and mi["unpriced_tokens"] == 1_000_000 and not mi["usd_is_floor"], f"mila-wa só em modelo sem preço: US$ n/p (None), nunca 0: {mi}")
+    ck(approx(o["pct_usd"], 100 * 8 / (34 + DOG_USD)) and approx(o["pct_tokens"], 100 * 6e6 / (20e6 + DOG_TOK)), f"% de oracle-wa sobre o total da janela: {o['pct_usd']} {o['pct_tokens']}")
+    ck(r["crew_unpriced_tokens"] == 5_000_000, f"JSON diz quanto do crew está sem preço: {r['crew_unpriced_tokens']}")
+    u = r["unattributed"]
+    ck(u["tokens"] == 9_000_000 and approx(u["pct_tokens"], 100 * 9e6 / (20e6 + DOG_TOK)), f"sem papel: 9M de 20M tok: {u['tokens']} {u['pct_tokens']}")
+    ck(approx(u["usd"], 18.0) and approx(u["pct_usd"], 100 * 18 / (34 + DOG_USD)), f"sem papel: US$ 18 de 34 precificados: {u['usd']} {u['pct_usd']}")
+    ck(u["verdict"] == "acima" and u["target_pct"] == 5.0, f"53% > meta de 5%: {u['verdict']}")
+    ro = {x["key"]: x for x in u["by_origin"]}
+    ck(set(ro) == {"headless @ home-dir", "headless @ crew-dir:digo", "headless @ worktree", "other:zzz-unknown @ outro-dir"}, f"origens: {sorted(ro)}")
+    ck(ro["headless @ home-dir"]["tokens"] == 5_000_000 and approx(ro["headless @ home-dir"]["usd"], 10.0), f"home-dir: {ro['headless @ home-dir']}")
+    ck(not any("title-summary" in k for k in ro), "title-summary é reconhecido pelo conteúdo: não é 'sem papel'")
+    ck(u["headless_in_crew_dir_tokens"] == 2_000_000, f"headless que rodou em crew/<nome> é dito à parte: {u['headless_in_crew_dir_tokens']}")
+    roles = {x["role"] for x in r["by_role"]}
+    ck({"headless", "crew", "dog", "title-summary", "other:zzz-unknown"} <= roles, f"aditivo: a seção 1 por papel segue como era: {sorted(roles)}")
+    ck(approx(sum(x["usd"] for x in r["by_role"] if x["usd"] is not None), r["total_usd_priced"]), "as seções novas não mexem no total precificado")
+    code, txt = report_text(m, w)
+    ck("== 1d. custo por CREW" in txt and "== 1e. sessões SEM papel atribuído" in txt, "o texto traz as duas seções novas")
+    ck(txt.index("== 1d.") < txt.index("== 2. spawn OCIOSO"), "1d/1e vêm antes do spawn ocioso")
+    row = [ln for ln in txt.splitlines() if ln.startswith("mila-wa")]
+    ck(len(row) == 1 and " n/p " in row[0], f"a linha do crew só com modelo sem preço mostra n/p, não 0.00: {row}")
+    ck("ACIMA da meta de 5%" in txt and "rodaram em diretório de crew" in txt, "o texto dá o veredito e o aviso do headless em dir de crew")
+
+
+def t_unattributed_within_target_and_unpriced(m, W):
+    """Abaixo da meta: dog (desprezível) + peter-wa 40 resp (US$ 80) + 1 sem papel (home, 1 resp US$ 2) + 1 sem papel em FABLE (1M tok sem preço) => 2,4% do
+    US$ (2 de 82) e 4,8% dos tokens (2M de 42M) => DENTRO. Um sem papel
+    em modelo SEM preço não vira US$ 0 calado: os tokens aparecem à parte e o texto avisa que eles não entram no % de US$."""
+    w = cw_world(m, W, [(beacon_of("peter-wa"), "claude-sonnet-5-5", 40, None),
+                        (user("sozinho", D + "09:00:00.000Z"), "claude-sonnet-5-5", 1, "/Users/athos"),
+                        (user("sem preço", D + "09:00:00.000Z"), FABLE, 1, "/Users/athos/gt")])
+    code, r = report(m, w)
+    u = r["unattributed"]
+    ck(code == 0 and u["verdict"] == "dentro", f"{code} {u['verdict']} usd={u['pct_usd']} tok={u['pct_tokens']}")
+    ck(approx(u["pct_usd"], 100 * 2 / (82 + DOG_USD)) and approx(u["pct_tokens"], 100 * 2e6 / (42e6 + DOG_TOK)), f"%: {u['pct_usd']} {u['pct_tokens']}")
+    ck(u["unpriced_tokens"] == 1_000_000 and approx(u["usd"], 2.0), f"o sem papel em modelo sem preço: 1M tokens à parte, US$ só dos que têm preço: {u}")
+    ro = {x["key"]: x for x in u["by_origin"]}
+    ck(ro["headless @ gt-root"]["usd"] is None, f"a origem toda sem preço é n/p (None), não 0: {ro['headless @ gt-root']}")
+    code, txt = report_text(m, w)
+    ck("DENTRO da meta de 5%" in txt and "sem papel e sem preço" in txt, "texto: veredito + aviso do que ficou sem preço")
+
+
+def t_unattributed_pure_functions(m, W):
+    """As funções puras: a fronteira da meta (exatamente 5% NÃO é '< 5%'), 'sem base' não é 0%, e a origem pelo cwd."""
+    ck(m.pct_of(1, 0) is None and m.pct_of(1, None) is None and m.pct_of(0, 10) == 0.0 and m.pct_of(1, 4) == 25.0, "pct_of: sem base é None, não 0")
+    v = m.unattributed_verdict
+    ck(v(None, None) == "indeterminado", "sem nenhuma medida não se aprova nada")
+    ck(v(4.99, 4.99) == "dentro" and v(5.0, 0.0) == "acima" and v(0.0, 5.0) == "acima", "a meta é < 5%: 5,0 já reprova, em qualquer das duas medidas")
+    ck(v(None, 3.0) == "dentro" and v(None, 7.0) == "acima" and v(7.0, None) == "acima", "uma medida só vale quando a outra falta")
+    ck(m.is_unattributed("headless") and m.is_unattributed("other:x") and not m.is_unattributed("title-summary")
+       and not m.is_unattributed("pregate-review") and not m.is_unattributed("crew"), "quais papéis contam como 'sem papel'")
+    cases = {None: "sem-cwd", "": "sem-cwd", "/Users/athos": "home-dir", "/Users/athos/": "home-dir", "/home/x": "home-dir",
+             "/Users/athos/gt": "gt-root", "/Users/athos/gt/whatsapp_automation": "rig:whatsapp_automation",
+             "/Users/athos/gt/whatsapp_automation/daemons": "rig:whatsapp_automation",
+             "/Users/athos/gt/whatsapp_automation/crew/digo": "crew-dir:digo", "/Users/athos/gt/whatsapp_automation/crew/digo-wt-e94-1": "crew-dir:digo",
+             "/Users/athos/gt/whatsapp_automation/crew/worker-wa-xb8tv": "crew-dir:worker-wa-*",
+             "/Users/athos/gt/whatsapp_automation/crew/wt-c1ac-fix2": "crew-dir:outro", "/Users/athos/gt/whatsapp_automation/crew/mayor-wa-52q2r8": "crew-dir:outro",
+             "/Users/athos/gt/.gc-worktrees/ga-x": "worktree", "/Users/athos/gt/.gascity-gastown-hq/.gc-worktrees/feat-a": "worktree",
+             "/Users/athos/gt/.claude/worktrees/fix-b": "worktree",
+             "/Users/athos/gt/.gascity-gastown-hq/.gc/agents/dogs/gastown.dog-6": "gc-agent-dir", "/Users/athos/gt/.gascity-gastown-hq": "rig:.gascity-gastown-hq",
+             "/tmp/x": "outro-dir"}
+    bad = {k: (m.origin_of_cwd(k), want) for k, want in cases.items() if m.origin_of_cwd(k) != want}
+    ck(not bad, f"origin_of_cwd (obtido, esperado): {bad}")
+    crew_rx = [rx for rx, role in m.ROLE_RES if role == "crew"]
+    ck(len(crew_rx) == 1, "ROLE_RES tem UMA linha de crew")
+    names = set(re.match(r"\^\(([^)]*)\)-", crew_rx[0].pattern).group(1).split("|"))
+    ck(names == set(m.CREW_DIR_NAMES), f"CREW_DIR_NAMES espelha ROLE_RES (deriva = crew sem origem): {sorted(names ^ set(m.CREW_DIR_NAMES))}")
+
+
 MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "soma linhas (sem dedup)": ('if v > rec["use"][k]:\n                                rec["use"][k] = v', 'rec["use"][k] += v', t_dedup),
     "leitura de cache a preço cheio": ('"cr": 0.10}', '"cr": 1.0}', t_price),
@@ -1620,6 +1746,20 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "harvest não trata o erro do lock": ('    except LedgerLockError as e:\n        print(f"harvest: ERRO', '    except KeyError as e:\n        print(f"harvest: ERRO', t_lock_error_is_not_contention),
     "backfill-s3 não trata o erro do lock": ('    except LedgerLockError as e:\n        print(f"backfill-s3: ERRO', '    except KeyError as e:\n        print(f"backfill-s3: ERRO', t_lock_error_is_not_contention),
     "atalho de usuário pula registro de assistente": ("if is_user and not is_asst and alias is not None", "if is_user and alias is not None", t_assistant_record_with_user_word_is_counted),
+    # ---- ga-v2qox1: custo por crew + sessões sem papel por origem
+    "sem papel ignora o headless": ('    return role == "headless" or role.startswith("other:")', '    return role.startswith("other:")', t_crew_cost_and_unattributed),
+    "title-summary conta como sem papel": ('    return role == "headless" or role.startswith("other:")', '    return role == "headless" or role.startswith("other:") or role == "title-summary"', t_unattributed_pure_functions),
+    "token sem preço do grupo some": ('        if usd is None:\n            r["unpriced"] += tt\n', '        if usd is None:\n            r["unpriced"] += 0\n', t_crew_cost_and_unattributed),
+    "grupo todo sem preço vira US$ 0": ('usd=None if r["unpriced"] and not r["usd"] else round(r["usd"], 4)', 'usd=round(r["usd"], 4)', t_crew_cost_and_unattributed),
+    "US$ piso do crew não é rotulado": ('usd_is_floor=bool(r["unpriced"] and r["usd"])', "usd_is_floor=False", t_crew_cost_and_unattributed),
+    "-adhoc- vira outro crew": ('(s.get("alias") or "?").split("-adhoc-")[0] if s["role"] == "crew" else None', '(s.get("alias") or "?") if s["role"] == "crew" else None', t_crew_cost_and_unattributed),
+    "o sem papel sem preço some do JSON": ('un_unp = sum(r["unpriced"] for r in unatt.values())', "un_unp = 0", t_unattributed_within_target_and_unpriced),
+    "headless em dir de crew não é dito": ("    if crew_dir_hl:", "    if False:", t_crew_cost_and_unattributed),
+    "exatamente 5% aprova a meta de < 5%": ("(pct_usd is not None and pct_usd >= target) or (pct_tok is not None and pct_tok >= target)", "(pct_usd is not None and pct_usd > target) or (pct_tok is not None and pct_tok > target)", t_unattributed_pure_functions),
+    "sem base vira 0%": ("    return None if total is None or total <= 0 else 100.0 * x / total", "    return 0.0 if total is None or total <= 0 else 100.0 * x / total", t_unattributed_pure_functions),
+    "home-dir não é reconhecido": ('    if re.match(r"^/(?:Users|home)/[^/]+$", p):', "    if False:", t_unattributed_pure_functions),
+    "qualquer nome em crew/ é crew": ('        if name.split("-")[0] in CREW_DIR_NAMES:', "        if True:", t_unattributed_pure_functions),
+    "CREW_DIR_NAMES deriva de ROLE_RES": ('CREW_DIR_NAMES = ("peter", "oracle", "batista", "thies", "mila", "digo")', 'CREW_DIR_NAMES = ("peter", "oracle", "batista", "thies", "digo")', t_unattributed_pure_functions),
 }
 
 CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), ("preço e TTL de cache", t_price),
@@ -1654,7 +1794,10 @@ CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), (
          ("backfill-s3: a linha mais rica fica e o texto diz; a linha de schema antigo substituída vai para .replaced-<ts>", t_backfill_keeps_richer_row_and_saves_the_replaced),
          ("colheita: linha de schema antigo mais rica que o transcrito local fica; a migrada sem perda é guardada", t_harvest_keeps_richer_old_schema_row),
          ("lock do ledger: só EWOULDBLOCK/EAGAIN é contenção; ENOLCK é falha alta (harvest e backfill-s3)", t_lock_error_is_not_contention),
-         ("registro de assistente cuja linha contém \"user\" é contado, não pulado como linha de usuário", t_assistant_record_with_user_word_is_counted)]
+         ("registro de assistente cuja linha contém \"user\" é contado, não pulado como linha de usuário", t_assistant_record_with_user_word_is_counted),
+         ("ga-v2qox1: custo por crew (-adhoc- no mesmo crew, sem preço = n/p) e sessões sem papel por origem contra a meta de 5%", t_crew_cost_and_unattributed),
+         ("ga-v2qox1: sem papel dentro da meta; origem inteira sem preço é n/p e os tokens aparecem à parte", t_unattributed_within_target_and_unpriced),
+         ("ga-v2qox1: funções puras — fronteira da meta, sem base ≠ 0%, origem pelo cwd, CREW_DIR_NAMES = ROLE_RES", t_unattributed_pure_functions)]
 
 
 def run(name, fn, m):
