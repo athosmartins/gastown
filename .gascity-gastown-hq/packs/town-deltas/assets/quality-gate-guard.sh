@@ -31,11 +31,13 @@ DISPATCHING_TTL_MINUTES=30
 GATE_RUN_TTL_MINUTES=90
 MAX_RECLAIMS=3
 # ga-o57gn: a gate-run legitimately stays gate-status:running only while its
-# owning dispatcher process polls verdicts — capped at VERDICT_TIMEOUT_MINUTES
-# (dispatcher default 45). Past that, a still-running gate-run with no live
-# reviewer is a zombie (dispatcher died/OOM/credit-limited). Kept in sync with
-# the dispatcher's VERDICT_TIMEOUT_MINUTES default so the dead-reviewer sweep
-# fires right after a real run would have driven itself terminal.
+# owning dispatcher process polls verdicts. Past that, a still-running gate-run
+# with no live reviewer is a zombie (dispatcher died/OOM/credit-limited).
+# ga-7dl5vp: this 45 is NOT a copy of the dispatcher's budget (that is 22 by
+# default, scaled up to 50 by diff size, floored for heavy selftests, and may be
+# stretched by the E13 grace) — it is only the FLOOR of the per-run limit that
+# gate_run_zombie_age_minutes derives from the `verdict_timeout_minutes:` the
+# dispatcher publishes in each gate-run's description.
 GATE_VERDICT_TIMEOUT_MINUTES="${VERDICT_TIMEOUT_MINUTES:-45}"
 # Margin past verdict-timeout before the dead-reviewer sweep fires. The
 # dispatcher closes reviewer sessions (Step 9) BEFORE it stamps the gate-run
@@ -333,6 +335,88 @@ reconcile_gaterun_action() {
   echo "abort:age"
 }
 
+# gate_run_budget_minutes <description> — pure (ga-7dl5vp). The verdict budget the
+# DISPATCHER published for this run: the `verdict_timeout_minutes: <N>` line it writes
+# into the gate-run description at creation (the effective value, after diff-size
+# scaling and the heavy-selftest floor). Prints N as a plain integer, or "" when it
+# cannot be known. vazio → "" (no line: the guard's own claim-receipt beads, and runs
+# from before the field existed); falhou/ilegível → "" (non-digits, a unit suffix, an
+# empty value, or more than 6 digits — never a guessed number). "" is not 0: callers
+# must treat it as "unknown" and fall to the inert side. Leading zeros are normalised
+# (10#) so "035"/"08" are never read as octal.
+gate_run_budget_minutes() {
+  local desc="${1:-}" line v
+  [ -z "$desc" ] && { echo ""; return; }
+  line=$(printf '%s\n' "$desc" | grep -E '^verdict_timeout_minutes:' | head -1 || true)
+  [ -z "$line" ] && { echo ""; return; }
+  v=$(printf '%s' "$line" | sed -E 's/^verdict_timeout_minutes:[[:space:]]*//; s/[[:space:]]*$//')
+  case "$v" in ''|*[!0-9]*) echo ""; return ;; esac
+  [ "${#v}" -gt 6 ] && { echo ""; return; }
+  echo $(( 10#$v ))
+}
+
+# gate_run_zombie_age_minutes <description> — pure (ga-7dl5vp). How old a RUNNING
+# gate-run with no live reviewer may be before it is a zombie: the latest moment the
+# dispatcher itself can still be legitimately finishing it —
+#   budget + E13 grace + margin
+# where grace is gate_e13_grace_secs's OWN answer for that budget (same shared lib the
+# dispatcher uses, so the two cannot drift) and the margin is the merge window after
+# the reviewers close (plus the run-creation → task-sent offset, typically 2–6 min).
+# Never below GATE_ZOMBIE_AGE_MINUTES (today's limit): the derivation may only make
+# the guard LESS aggressive, never more. Budget unknown ("" from
+# gate_run_budget_minutes) → max(GATE_RUN_TTL_MINUTES, floor): without the budget we
+# cannot tell a live run from a dead one, so the dead-reviewer rule waits for the
+# hard TTL (unknown lands on the inert side).
+gate_run_zombie_age_minutes() {
+  local n grace_s grace_m z
+  n=$(gate_run_budget_minutes "${1:-}")
+  if [ -z "$n" ]; then
+    z="$GATE_RUN_TTL_MINUTES"
+    [ "$z" -lt "$GATE_ZOMBIE_AGE_MINUTES" ] && z="$GATE_ZOMBIE_AGE_MINUTES"
+    echo "$z"; return
+  fi
+  # falhou/ilegível → 0: no grace is assumed beyond what the margin covers (the
+  # dispatcher's own helper already treats junk as "no grace").
+  grace_s=$(gate_e13_grace_secs $(( n * 60 )) 0 2>/dev/null) || grace_s=0
+  case "$grace_s" in ''|*[!0-9]*) grace_s=0 ;; esac
+  grace_m=$(( (grace_s + 59) / 60 ))
+  z=$(( n + grace_m + GATE_DEAD_REVIEWER_MARGIN_MINUTES ))
+  [ "$z" -lt "$GATE_ZOMBIE_AGE_MINUTES" ] && z="$GATE_ZOMBIE_AGE_MINUTES"
+  echo "$z"
+}
+
+# gate_run_ttl_minutes <description> — pure (ga-7dl5vp). The hard age cap (abort:age,
+# which has NO liveness check) for one run: GATE_RUN_TTL_MINUTES, raised to the run's
+# own zombie limit when that is larger. Without the raise, a run whose published
+# budget makes the zombie window end past the TTL (budget > 80 on the default
+# ceiling — reachable only through the heavy-selftest env override) would be aborted
+# by the TTL before the dead-reviewer rule could ever apply.
+gate_run_ttl_minutes() {
+  local ttl="$GATE_RUN_TTL_MINUTES" z
+  z=$(gate_run_zombie_age_minutes "${1:-}")
+  [ "$z" -gt "$ttl" ] && ttl="$z"
+  echo "$ttl"
+}
+
+# confirm_gaterun_action <action> <fresh_state> — pure (ga-7dl5vp). Gate between
+# reconcile_gaterun_action's decision (made on the sweep-start snapshot) and the
+# destructive case: only a run POSITIVELY re-read as still running/claimed
+# (gaterun_fresh_state → "active") may be superseded/aborted. skip stays skip.
+#   terminal → skip:terminal   the dispatcher finished it since the snapshot
+#   gone     → skip:gone       bd answered: no such bead any more
+#   anything else (unknown, "", an unexpected token) → skip:unreadable — the read
+#   failed or is ambiguous, and "can't know" must land on the inert side.
+confirm_gaterun_action() {
+  local action="${1:-skip}" state="${2:-}"
+  [ "$action" = "skip" ] && { echo "skip"; return; }
+  case "$state" in
+    active)   echo "$action" ;;
+    terminal) echo "skip:terminal" ;;
+    gone)     echo "skip:gone" ;;
+    *)        echo "skip:unreadable" ;;
+  esac
+}
+
 # reconcile_zero_verdict_run_action <age_min> <grace_min> <marker_status>
 # Pure decision (ga-jfo7): what to do with a gate-status:running gate-run that
 # has ZERO verdict beads — it never had a dispatcher-spawned reviewer attached
@@ -476,6 +560,47 @@ verdict_parent_state_from_show() {
   labels=$(printf '%s' "$bead" | jq -r '(.labels // []) | join(" ")' 2>/dev/null)
   st=$(marker_status_from_labels "$labels")
   if [ "$(gaterun_status_terminal "$st")" = "1" ]; then echo "terminal"; else echo "active"; fi
+}
+
+# gaterun_live_state_from_show <bd-show-stdout> — pure (ga-7dl5vp). Classifies a
+# gate-run from a FRESH `bd show <run> --json` for the one question Vector B asks
+# before a destructive action: "is this run still running?". Built on
+# verdict_parent_state_from_show (terminal/gone/unknown pass straight through) but
+# with the polarity a supersede needs: that function's "active" is the reaper's
+# fail-safe (anything unrecognized → do not close a verdict), so here "active" is
+# upgraded only when the run's single gate-status label is POSITIVELY running or
+# claimed. Not closed + no gate-status label, a dual/ambiguous label set, or a value
+# outside the gate-run vocabulary → "unknown" (not a licence to act).
+#   active | terminal | gone | unknown
+gaterun_live_state_from_show() {
+  local raw="${1:-}" st bead labels
+  st=$(verdict_parent_state_from_show "$raw")
+  [ "$st" != "active" ] && { echo "$st"; return; }
+  bead=$(printf '%s' "$raw" | jq -c 'if type=="array" then .[0] else . end' 2>/dev/null) || { echo "unknown"; return; }
+  labels=$(printf '%s' "$bead" | jq -r '(.labels // []) | join(" ")' 2>/dev/null) || { echo "unknown"; return; }
+  case "$(marker_status_from_labels "$labels")" in
+    running|claimed) echo "active" ;;
+    *)               echo "unknown" ;;
+  esac
+}
+
+# gaterun_fresh_state <run-id> — live (ga-7dl5vp). Reads the run NOW, uncached, and
+# classifies it with gaterun_live_state_from_show. GATE_RUNS_JSON is a snapshot from
+# the start of the sweep and Vector B can spend minutes in its loop under Dolt
+# contention (ga-rv4u4a: 1m48s), so the run may already be terminal by the time the
+# loop reaches it. Deliberately NOT routed through scripts/bd-list-cached.sh — that
+# shim's header forbids it at a call site that decides to close/supersede.
+# vazio → `bd show` printed nothing: unknown; falhou/ilegível → non-zero exit or a
+# non-JSON body (Dolt overload text): unknown. The exit code is only ever used to
+# DEMOTE: bd exits 1 for both not-found and a query failure, so the body decides
+# terminal/gone, but a failed exit never lets "active" through.
+gaterun_fresh_state() {
+  local id="${1:-}" raw rc=0 st
+  [ -z "$id" ] && { echo "unknown"; return 0; }
+  raw=$(bd -C "$GC_CITY" show "$id" --json 2>/dev/null) || rc=$?
+  st=$(gaterun_live_state_from_show "$raw")
+  if [ "$rc" -ne 0 ] && [ "$st" = "active" ]; then st="unknown"; fi
+  echo "$st"
 }
 
 # reconcile_parked_verdict_action <age_min> <grace_min> <parent_state> — pure (ga-hwjrlq).
@@ -5250,7 +5375,7 @@ fi
 # else queries gate-status:claimed gate-run beads, so this loop is their only
 # path to ever closing (ga-f1ngu) — see the shared-prelude query above.
 
-log "Step 0b: Vector B reconcile — orphan gate-run beads, running+claimed (TTL=${GATE_RUN_TTL_MINUTES}m, zombie-age=${GATE_ZOMBIE_AGE_MINUTES}m=verdict-timeout+margin)..."
+log "Step 0b: Vector B reconcile — orphan gate-run beads, running+claimed (TTL=${GATE_RUN_TTL_MINUTES}m, zombie-age floor=${GATE_ZOMBIE_AGE_MINUTES}m; per run: published budget + E13 grace + margin, ga-7dl5vp)..."
 
 # reviewers_alive_for_run <gate_run_id> — I/O helper (ga-o57gn).
 # Sets REVIEWERS_ALIVE_RESULT (1 iff at least one of this gate-run's still-OPEN
@@ -5499,6 +5624,32 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
 
     GR_AGE=$(age_minutes_of "$GR_UPDATED" "$NOW_EPOCH")
 
+    # ga-7dl5vp: this run's own zombie limit / hard cap, from the verdict budget the
+    # dispatcher published in its description (see gate_run_zombie_age_minutes).
+    GR_BUDGET=$(gate_run_budget_minutes "$GR_DESC")
+    GR_ZOMBIE_AGE=$(gate_run_zombie_age_minutes "$GR_DESC")
+    GR_TTL=$(gate_run_ttl_minutes "$GR_DESC")
+
+    # ga-7dl5vp: GATE_RUNS_JSON is the snapshot from the start of the sweep, and this
+    # loop can spend minutes on earlier runs under Dolt contention (ga-rv4u4a: 1m48s).
+    # The dispatcher may have driven THIS run terminal meanwhile; acting on the
+    # snapshot superseded a PASSED, merged run as a "zombie" (ga-rv4u4a 14/10 13:04).
+    # Re-read it now: only a run that is still running/claimed is looked at further.
+    # A run proven terminal/gone also joins CLOSED_THIS_SWEEP_IDS so a later iteration's
+    # keep-newest dedup never cites it as "a newer running sibling" (ga-usdm6p shape);
+    # an unreadable run (unknown) does NOT — it may well be alive.
+    GR_FRESH=$(gaterun_fresh_state "$GR_ID")
+    if [ "$GR_FRESH" != "active" ]; then
+      case "$GR_FRESH" in
+        terminal|gone)
+          log "  Vector B: gate-run $GR_ID is no longer running on a fresh read (state=${GR_FRESH}; the sweep-start snapshot is stale) — leaving it alone (ga-7dl5vp)."
+          CLOSED_THIS_SWEEP_IDS="$CLOSED_THIS_SWEEP_IDS $GR_ID" ;;
+        *)
+          warn "Vector B: gate-run $GR_ID could not be re-read (state=${GR_FRESH}; bd show failed or returned an ambiguous bead) — skipping it this sweep rather than act on a stale snapshot (ga-7dl5vp)." ;;
+      esac
+      continue
+    fi
+
     # ── Dedup decision: does a NEWER, still-alive running gate-run share this
     # key? Keep-newest never supersedes the newest run, so a live re-dispatch
     # (always the newest) is safe; only the stale older siblings (guard
@@ -5629,7 +5780,7 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
     # here when the run has >=1 verdict bead — the ga-jfo7 block above already
     # handled and `continue`d past the 0-verdict-bead case.)
     REVIEWERS_ALIVE=1
-    if [ "$MARKER_ACTIVE" = "1" ] && [ "$GR_AGE" -gt "$GATE_ZOMBIE_AGE_MINUTES" ]; then
+    if [ "$MARKER_ACTIVE" = "1" ] && [ "$GR_AGE" -gt "$GR_ZOMBIE_AGE" ]; then
       # ga-dkym6 GATE-FEEDBACK (attempt 1): called directly, NEVER via $(...)
       # — see reviewers_alive_for_run's own docstring for why a command
       # substitution here would silently swallow both result globals.
@@ -5643,7 +5794,15 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
       fi
     fi
 
-    ACTION=$(reconcile_gaterun_action "$GR_AGE" "$GATE_RUN_TTL_MINUTES" "$MARKER_ACTIVE" "$GATE_ZOMBIE_AGE_MINUTES" "$REVIEWERS_ALIVE")
+    ACTION=$(reconcile_gaterun_action "$GR_AGE" "$GR_TTL" "$MARKER_ACTIVE" "$GR_ZOMBIE_AGE" "$REVIEWERS_ALIVE")
+    # ga-7dl5vp: the decision above rests on reads made up to several bd round-trips
+    # ago (marker, verdict count, reviewer sessions). Re-read the run immediately
+    # before the destructive case and act only if it is STILL running/claimed.
+    # `skip` needs no re-read (nothing destructive follows).
+    if [ "$ACTION" != "skip" ]; then
+      GR_FRESH=$(gaterun_fresh_state "$GR_ID")
+      ACTION=$(confirm_gaterun_action "$ACTION" "$GR_FRESH")
+    fi
     case "$ACTION" in
       supersede:marker)
         warn "Vector B: superseding orphan gate-run $GR_ID (age=${GR_AGE}m, marker $COMPANION_MARKER_ID is terminal/gone)"
@@ -5661,9 +5820,9 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
         close_pending_verdicts_for_run "$GR_ID" "companion marker $COMPANION_MARKER_ID is terminal/gone, ga-tmug"
         ;;
       supersede:dead-reviewers)
-        warn "Vector B: superseding ZOMBIE gate-run $GR_ID (age=${GR_AGE}m > zombie-age=${GATE_ZOMBIE_AGE_MINUTES}m [verdict-timeout ${GATE_VERDICT_TIMEOUT_MINUTES}m + margin ${GATE_DEAD_REVIEWER_MARGIN_MINUTES}m], no live reviewer — dispatcher abandoned it; ga-o57gn)"
+        warn "Vector B: superseding ZOMBIE gate-run $GR_ID (age=${GR_AGE}m > zombie-age=${GR_ZOMBIE_AGE}m [floor ${GATE_ZOMBIE_AGE_MINUTES}m; run budget ${GR_BUDGET:-unpublished}m + E13 grace + margin ${GATE_DEAD_REVIEWER_MARGIN_MINUTES}m, ga-7dl5vp], no live reviewer, run re-read still running — dispatcher abandoned it; ga-o57gn)"
         set_gate_status "$GR_ID" "superseded"
-        bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-o57gn): zombie gate-run superseded — age ${GR_AGE}m exceeds verdict-timeout+margin (${GATE_ZOMBIE_AGE_MINUTES}m) AND no live reviewer is assigned to an open verdict bead. The owning dispatcher died/was killed mid-run. Self-healed by guard." 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-o57gn): zombie gate-run superseded — age ${GR_AGE}m exceeds this run's zombie limit (${GR_ZOMBIE_AGE}m = budget ${GR_BUDGET:-unpublished}m + E13 grace + margin, floor ${GATE_ZOMBIE_AGE_MINUTES}m) AND no live reviewer is assigned to an open verdict bead. The owning dispatcher died/was killed mid-run. Self-healed by guard." 2>/dev/null || true
         bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — zombie: age>verdict-timeout, no live reviewer. Closed by guard (ga-o57gn)." 2>/dev/null || true
         CLOSED_THIS_SWEEP_IDS="$CLOSED_THIS_SWEEP_IDS $GR_ID"
         # ga-g4m18: cascade-close this run's own OPEN verdict beads — Vector B
@@ -5673,21 +5832,29 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
         close_dead_reviewer_verdicts "$GR_ID"
         ;;
       abort:age)
-        warn "Vector B: aborting gate-run $GR_ID by TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m, marker_active=${MARKER_ACTIVE})"
+        warn "Vector B: aborting gate-run $GR_ID by TTL fallback (age=${GR_AGE}m > ${GR_TTL}m, marker_active=${MARKER_ACTIVE})"
         set_gate_status "$GR_ID" "aborted"
-        bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-tmug): gate-run aborted by guard TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m; marker $COMPANION_MARKER_ID still active but run exceeded max wait)." 2>/dev/null || true
+        bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-tmug): gate-run aborted by guard TTL fallback (age=${GR_AGE}m > ${GR_TTL}m; marker $COMPANION_MARKER_ID still active but run exceeded max wait)." 2>/dev/null || true
         # ga-jhyu: CLOSE at terminal so wisp-compact reaps it.
-        bd -C "$GC_CITY" close "$GR_ID" -r "gate-run aborted (terminal) by TTL fallback (age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m). Closed by guard (ga-jhyu)." 2>/dev/null || true
+        bd -C "$GC_CITY" close "$GR_ID" -r "gate-run aborted (terminal) by TTL fallback (age=${GR_AGE}m > ${GR_TTL}m). Closed by guard (ga-jhyu)." 2>/dev/null || true
         CLOSED_THIS_SWEEP_IDS="$CLOSED_THIS_SWEEP_IDS $GR_ID"
         # ga-hgsqg: cascade-close this run's own OPEN verdict beads too — the
         # TTL fallback fires with NO reviewer-liveness check (reconcile_
         # gaterun_action's rule 3), so a live reviewer can genuinely still be
         # mid-review; its verdict can never be consumed once this run is
         # aborted regardless (see close_pending_verdicts_for_run's docstring).
-        close_pending_verdicts_for_run "$GR_ID" "aborted by guard TTL fallback, age=${GR_AGE}m > ${GATE_RUN_TTL_MINUTES}m, ga-tmug"
+        close_pending_verdicts_for_run "$GR_ID" "aborted by guard TTL fallback, age=${GR_AGE}m > ${GR_TTL}m, ga-tmug"
         ;;
       skip)
         log "  Gate-run $GR_ID active (age=${GR_AGE}m, marker_active=${MARKER_ACTIVE}, reviewers_alive=${REVIEWERS_ALIVE}) — skipping."
+        ;;
+      skip:terminal|skip:gone)
+        # ga-7dl5vp: the dispatcher finished the run while this iteration was deciding.
+        log "  Vector B: gate-run $GR_ID was about to be acted on (age=${GR_AGE}m, marker_active=${MARKER_ACTIVE}, reviewers_alive=${REVIEWERS_ALIVE}) but a fresh read shows it ${GR_FRESH} — leaving it alone (ga-7dl5vp)."
+        CLOSED_THIS_SWEEP_IDS="$CLOSED_THIS_SWEEP_IDS $GR_ID"
+        ;;
+      skip:unreadable)
+        warn "Vector B: gate-run $GR_ID was about to be acted on (age=${GR_AGE}m, marker_active=${MARKER_ACTIVE}, reviewers_alive=${REVIEWERS_ALIVE}) but the fresh re-read failed or was ambiguous (state=${GR_FRESH}) — skipping this sweep, never acting on the stale snapshot (ga-7dl5vp)."
         ;;
     esac
   done

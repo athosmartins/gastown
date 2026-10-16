@@ -292,6 +292,176 @@ eq "missing status field → treated as non-closed (fail-safe: cascade-close, do
 eq "malformed JSON → empty (fail-safe: never guess ids out of garbage)" \
    "$(open_verdict_ids_from_json 'not-json')" ""
 
+# ── 2e. ga-7dl5vp: a VALID run must never be superseded as a "zombie" ─────────
+# Live incident (ga-rv4u4a, 2026-10-14 13:04): the dispatcher stamped the run
+# gate-status:passed and closed it at ~13:02:35 (dispatcher_complete PASS
+# 13:02:38); the guard — still iterating a gate-run snapshot taken at sweep
+# start, 1m48s earlier — logged "superseding ZOMBIE ... age=58m > 55m ... no live
+# reviewer" at 13:04:29. "No live reviewer" was true only because the dispatcher
+# had already closed its reviewers while finalizing. Two defects, one class:
+#   (1) NOTHING re-read the run before the destructive branch (stale snapshot);
+#   (2) the 45+10 limit is a constant while the dispatcher publishes the REAL
+#       per-run budget (`verdict_timeout_minutes:` in the gate-run description;
+#       22 base, scaled up to 50, heavy-selftest floor up to 120) AND may keep a
+#       busy reviewer alive past it (E13 grace, gate_e13_grace_secs: up to
+#       min(budget, 30m), clamped to an 80m run ceiling). The reviewers close
+#       only AFTER that, and the run stays `running` through the merge window
+#       that follows — a window a re-read cannot see, only the limit can.
+echo "── 2e. ga-7dl5vp: per-run zombie limit + fresh re-read before acting ──"
+
+# (2) per-run limit. Pin the globals so the harness is env-independent.
+_PIN='GATE_ZOMBIE_AGE_MINUTES=55; GATE_DEAD_REVIEWER_MARGIN_MINUTES=10; GATE_RUN_TTL_MINUTES=90; unset GATE_E13_GRACE_MAX_SECS GATE_E13_CEILING_SECS; GATE_E13_OFF_FILE=/nonexistent/ga-7dl5vp-off'
+_ZA() { ( eval "$_PIN"; GATE_E13_GRACE="${E13:-1}"; gate_run_zombie_age_minutes "$1" ); }
+_TT() { ( eval "$_PIN"; GATE_E13_GRACE="${E13:-1}"; gate_run_ttl_minutes "$1" ); }
+_D() { printf 'Autonomous gate run for feat/x.\nmarker_id: ga-m\nstarted_at: 2026-10-14T15:04:06Z\nverdict_timeout_minutes: %s\n' "$1"; }
+
+eq "budget: the REAL ga-rv4u4a description line → 35"          "$(gate_run_budget_minutes "$(_D 35)")" "35"
+eq "budget: absent line → '' (unknown, not 0)"                 "$(gate_run_budget_minutes 'marker_id: ga-m')" ""
+eq "budget: empty description → ''"                            "$(gate_run_budget_minutes '')" ""
+eq "budget: non-numeric value → '' (unknown)"                  "$(gate_run_budget_minutes "$(_D abc)")" ""
+eq "budget: unit suffix '35m' → '' (strict digits only)"       "$(gate_run_budget_minutes "$(_D 35m)")" ""
+eq "budget: empty value → ''"                                  "$(gate_run_budget_minutes "$(_D '')")" ""
+eq "budget: leading zero '035' → 35 (never octal)"             "$(gate_run_budget_minutes "$(_D 035)")" "35"
+eq "budget: '08' → 8 (octal-invalid digit must not blow up)"   "$(gate_run_budget_minutes "$(_D 08)")" "8"
+eq "budget: absurd length → '' (no arithmetic overflow)"       "$(gate_run_budget_minutes "$(_D 99999999999999999999)")" ""
+eq "budget: tab separator parses"                              "$(gate_run_budget_minutes "$(printf 'verdict_timeout_minutes:\t40')")" "40"
+eq "budget: trailing whitespace trimmed"                       "$(gate_run_budget_minutes "$(printf 'verdict_timeout_minutes: 40  ')")" "40"
+eq "budget: indented line is NOT the published field → ''"     "$(gate_run_budget_minutes '  verdict_timeout_minutes: 99')" ""
+eq "budget: first occurrence wins"                             "$(gate_run_budget_minutes "$(printf 'verdict_timeout_minutes: 30\nverdict_timeout_minutes: 99')")" "30"
+
+eq "zombie-age: the incident run (budget 35): 35 + E13 grace 30 + margin 10 = 75 (was 55)" "$(_ZA "$(_D 35)")" "75"
+eq "zombie-age: base budget 22: 22+22+10=54 → floor 55"        "$(_ZA "$(_D 22)")" "55"
+eq "zombie-age: budget 25 → 25+25+10 = 60"                     "$(_ZA "$(_D 25)")" "60"
+eq "zombie-age: heavy-selftest default floor 45 → 45+30+10 = 85" "$(_ZA "$(_D 45)")" "85"
+eq "zombie-age: dispatcher cap 50: grace clamped by the 80m ceiling → 90" "$(_ZA "$(_D 50)")" "90"
+eq "zombie-age: budget 60 (20m of room) → 60+20+10 = 90"       "$(_ZA "$(_D 60)")" "90"
+eq "zombie-age: budget 80 (no room) → 90"                      "$(_ZA "$(_D 80)")" "90"
+eq "zombie-age: heavy-selftest ceiling 120 → 120+0+10 = 130"   "$(_ZA "$(_D 120)")" "130"
+eq "zombie-age: E13 grace OFF (operator) — budget 35 → 45 → floor 55" "$(E13=0 _ZA "$(_D 35)")" "55"
+eq "zombie-age: E13 grace OFF — budget 60 → 70"                "$(E13=0 _ZA "$(_D 60)")" "70"
+eq "zombie-age: budget unknown → hard TTL 90 (inert fallback, NOT the old 55)" "$(_ZA 'marker_id: ga-m')" "90"
+eq "zombie-age: garbage budget → hard TTL 90"                  "$(_ZA "$(_D abc)")" "90"
+_bad_floor=""; _bad_cover=""; _bad_mono=""; _prev=0
+for _n in $(seq 1 300); do
+  _z="$(_ZA "$(_D "$_n")")"
+  _g="$( ( eval "$_PIN"; GATE_E13_GRACE=1; gate_e13_grace_secs $(( _n * 60 )) 0 ) )"
+  [ "$_z" -ge 55 ]                                   || _bad_floor="$_bad_floor $_n"
+  [ "$_z" -ge $(( _n + (_g + 59) / 60 + 10 )) ]      || _bad_cover="$_bad_cover $_n"
+  [ "$_z" -ge "$_prev" ]                             || _bad_mono="$_bad_mono $_n"
+  _prev="$_z"
+done
+eq "zombie-age >= today's 55 for EVERY budget 1..300 (never more aggressive)"                          "${_bad_floor:-none}" "none"
+eq "zombie-age >= budget + the dispatcher's OWN E13 grace + margin for EVERY budget 1..300 (same model)" "${_bad_cover:-none}" "none"
+eq "zombie-age never decreases as the budget grows (1..300)"                                            "${_bad_mono:-none}" "none"
+
+eq "ttl: budget 35 → unchanged 90"                             "$(_TT "$(_D 35)")" "90"
+eq "ttl: budget 60 → unchanged 90"                             "$(_TT "$(_D 60)")" "90"
+eq "ttl: budget 80 (zombie 90) → 90"                           "$(_TT "$(_D 80)")" "90"
+eq "ttl: budget 81 (zombie 91) → 91 (hard cap never inside the zombie window)" "$(_TT "$(_D 81)")" "91"
+eq "ttl: budget 120 → 130"                                     "$(_TT "$(_D 120)")" "130"
+eq "ttl: unknown budget → 90"                                  "$(_TT 'marker_id: ga-m')" "90"
+_bad_ttl=""
+for _n in $(seq 1 300); do
+  _z="$(_ZA "$(_D "$_n")")"; _t="$(_TT "$(_D "$_n")")"
+  [ "$_t" -ge 90 ] && [ "$_t" -ge "$_z" ] || _bad_ttl="$_bad_ttl $_n"
+done
+eq "ttl >= 90 and >= zombie-age for EVERY budget 1..300 (abort:age never preempts the zombie window)" "${_bad_ttl:-none}" "none"
+
+# End-to-end of the pure pieces, as the loop composes them.
+_d35="$(_D 35)"; _d45="$(_D 45)"; _d120="$(_D 120)"
+eq "OLD constant would supersede a legit 58m run (the bug, locked): age 58, limit 55, reviewers closed" \
+   "$(reconcile_gaterun_action 58 90 1 55 0)" "supersede:dead-reviewers"
+eq "per-run limit: the incident run (budget 35, E13 grace used), age 58, reviewers closed for the merge → skip" \
+   "$(reconcile_gaterun_action 58 "$(_TT "$_d35")" 1 "$(_ZA "$_d35")" 0)" "skip"
+eq "per-run limit: legit 60m run on a 45m budget (heavy selftest), reviewers closed → skip" \
+   "$(reconcile_gaterun_action 60 "$(_TT "$_d45")" 1 "$(_ZA "$_d45")" 0)" "skip"
+eq "per-run limit: budget 35 run really abandoned (age 76 > 75, no reviewer) → still superseded" \
+   "$(reconcile_gaterun_action 76 "$(_TT "$_d35")" 1 "$(_ZA "$_d35")" 0)" "supersede:dead-reviewers"
+eq "budget 120 (zombie 130, ttl 130): live reviewer at age 100 → skip (the global ttl 90 would abort:age a run the dispatcher still budgets)" \
+   "$(reconcile_gaterun_action 100 "$(_TT "$_d120")" 1 "$(_ZA "$_d120")" 1)" "skip"
+eq "…and that same run past its OWN ttl (131) with a live reviewer → abort:age (hard cap intact)" \
+   "$(reconcile_gaterun_action 131 "$(_TT "$_d120")" 1 "$(_ZA "$_d120")" 1)" "abort:age"
+
+# (1) re-read. gaterun_live_state_from_show <bd show stdout> — pure.
+# Polarity note: verdict_parent_state_from_show's "active" is the REAPER's fail-safe
+# (unrecognized → do not close a verdict). A destructive SUPERSEDE needs the opposite:
+# "active" must be POSITIVELY proven (single gate-status running|claimed), anything
+# else is not a license to act.
+RUN_RUNNING='{"id":"ga-x","status":"open","labels":["gate-status:running","type:quality-gate-run"]}'
+RUN_CLAIMED='{"id":"ga-x","status":"in_progress","labels":["gate-status:claimed","type:quality-gate-run"]}'
+RUN_INCIDENT='{"id":"ga-rv4u4a","status":"closed","labels":["gate-status:passed","source-bead:ga-2hd02v","task-sent-at:1791990290","type:quality-gate-run"]}'
+RUN_STAMPED_OPEN='{"id":"ga-x","status":"open","labels":["gate-status:passed","type:quality-gate-run"]}'
+RUN_CLOSED_STALE_LABEL='{"id":"ga-x","status":"closed","labels":["gate-status:running","type:quality-gate-run"]}'
+RUN_NO_GS='{"id":"ga-x","status":"open","labels":["type:quality-gate-run"]}'
+RUN_NO_LABELS='{"id":"ga-x","status":"open"}'
+RUN_DUAL='{"id":"ga-x","status":"open","labels":["gate-status:running","gate-status:passed"]}'
+RUN_WEIRD='{"id":"ga-x","status":"open","labels":["gate-status:error"]}'
+eq "fresh: open + running → active"                             "$(gaterun_live_state_from_show "$RUN_RUNNING")" "active"
+eq "fresh: in_progress + claimed → active"                      "$(gaterun_live_state_from_show "$RUN_CLAIMED")" "active"
+eq "fresh: array-wrapped running → active"                      "$(gaterun_live_state_from_show "[$RUN_RUNNING]")" "active"
+eq "fresh: the REAL incident shape (closed, passed) → terminal" "$(gaterun_live_state_from_show "$RUN_INCIDENT")" "terminal"
+eq "fresh: stamped passed but not yet closed → terminal"        "$(gaterun_live_state_from_show "$RUN_STAMPED_OPEN")" "terminal"
+eq "fresh: closed even with a stale running label → terminal"   "$(gaterun_live_state_from_show "$RUN_CLOSED_STALE_LABEL")" "terminal"
+eq "fresh: no gate-status label at all → unknown (not active)"  "$(gaterun_live_state_from_show "$RUN_NO_GS")" "unknown"
+eq "fresh: no labels field → unknown"                           "$(gaterun_live_state_from_show "$RUN_NO_LABELS")" "unknown"
+eq "fresh: dual gate-status labels (ambiguous) → unknown"       "$(gaterun_live_state_from_show "$RUN_DUAL")" "unknown"
+eq "fresh: unrecognized gate-status value → unknown"            "$(gaterun_live_state_from_show "$RUN_WEIRD")" "unknown"
+eq "fresh: empty stdout → unknown"                              "$(gaterun_live_state_from_show '')" "unknown"
+eq "fresh: Dolt-overload text → unknown"                        "$(gaterun_live_state_from_show 'Error: dolt: connection refused')" "unknown"
+eq "fresh: JSON error envelope → unknown"                       "$(gaterun_live_state_from_show '{"error":"database is locked"}')" "unknown"
+eq "fresh: bd answered 'no issues found' → gone"                "$(gaterun_live_state_from_show '{"error":"no issues found matching the provided IDs"}')" "gone"
+eq "fresh: empty array → gone"                                  "$(gaterun_live_state_from_show '[]')" "gone"
+
+# confirm_gaterun_action <action> <fresh_state>: only a POSITIVELY active run is acted on.
+for _a in supersede:dead-reviewers supersede:marker abort:age; do
+  eq "confirm: $_a + active → unchanged"                        "$(confirm_gaterun_action "$_a" active)" "$_a"
+  eq "confirm: $_a + terminal → skip:terminal"                  "$(confirm_gaterun_action "$_a" terminal)" "skip:terminal"
+  eq "confirm: $_a + gone → skip:gone"                          "$(confirm_gaterun_action "$_a" gone)" "skip:gone"
+  eq "confirm: $_a + unknown → skip:unreadable (inert)"         "$(confirm_gaterun_action "$_a" unknown)" "skip:unreadable"
+  eq "confirm: $_a + '' → skip:unreadable"                      "$(confirm_gaterun_action "$_a" '')" "skip:unreadable"
+  eq "confirm: $_a + unexpected token → skip:unreadable"        "$(confirm_gaterun_action "$_a" 'banana')" "skip:unreadable"
+done
+eq "confirm: skip stays skip whatever the state"                "$(confirm_gaterun_action skip terminal)" "skip"
+eq "confirm: skip + unknown stays skip"                         "$(confirm_gaterun_action skip unknown)" "skip"
+
+# gaterun_fresh_state <id>: the live read. `bd` is stubbed as a shell function; the
+# call must be a plain `bd ... show <id> --json` (NOT the read-cache shim: scripts/
+# bd-list-cached.sh's header forbids it at a call site that decides to close).
+_FRESH_LOG="$(mktemp)"
+bd() { printf '%s\n' "$*" >> "$_FRESH_LOG"; printf '%s' "${FAKE_BD_OUT:-}"; return "${FAKE_BD_RC:-0}"; }
+FAKE_BD_OUT="$RUN_RUNNING"  FAKE_BD_RC=0; eq "live read: running → active"   "$(gaterun_fresh_state ga-x)" "active"
+FAKE_BD_OUT="$RUN_INCIDENT" FAKE_BD_RC=0; eq "live read: closed+passed → terminal" "$(gaterun_fresh_state ga-rv4u4a)" "terminal"
+FAKE_BD_OUT=""              FAKE_BD_RC=1; eq "live read: bd failed (rc1, empty) → unknown" "$(gaterun_fresh_state ga-x)" "unknown"
+FAKE_BD_OUT="$RUN_RUNNING"  FAKE_BD_RC=1; eq "live read: rc1 with a running-looking body → unknown (a failed exit never proves liveness)" "$(gaterun_fresh_state ga-x)" "unknown"
+FAKE_BD_OUT="$RUN_INCIDENT" FAKE_BD_RC=1; eq "live read: rc1 with a terminal body → terminal (doubt may only ever say skip)" "$(gaterun_fresh_state ga-rv4u4a)" "terminal"
+FAKE_BD_OUT='{"error":"no issues found matching the provided IDs"}' FAKE_BD_RC=1; eq "live read: bd's real not-found (rc1 + envelope) → gone" "$(gaterun_fresh_state ga-x)" "gone"
+unset -f bd
+eq "live read: every call is exactly 'bd -C <city> show <id> --json' (no -l/--limit/shim args)" \
+   "$(grep -cvE '^-C [^ ]+ show [A-Za-z0-9._-]+ --json$' "$_FRESH_LOG" | tr -d ' ')" "0"
+eq "live read: bd was actually invoked once per read (6 reads)" "$(wc -l < "$_FRESH_LOG" | tr -d ' ')" "6"
+rm -f "$_FRESH_LOG"
+FN_FRESH="$(declare -f gaterun_fresh_state)"
+case "$FN_FRESH" in *bd-list-cached*) bad "gaterun_fresh_state routes through the read-cache shim — a close/supersede decision needs a fresh read" ;; *) ok "gaterun_fresh_state bypasses the read-cache shim" ;; esac
+
+# Loop wiring (drift-guards; the loop is inline, so assert the shape that matters).
+_LOOP_FRESH_CALLS=$(grep -c 'gaterun_fresh_state "\$GR_ID"' "$GUARD" || true)
+[ "${_LOOP_FRESH_CALLS:-0}" -ge 2 ] && ok "Vector B re-reads the run at least twice (iteration top + right before acting): $_LOOP_FRESH_CALLS call sites" \
+  || bad "Vector B must call gaterun_fresh_state at the top of each iteration AND right before the destructive case (found ${_LOOP_FRESH_CALLS:-0})"
+# vazio (no match) → the bad branch below reports it; falhou → same (|| true keeps set -e/pipefail from aborting before it can)
+_L_RECON=$(grep -n 'ACTION=$(reconcile_gaterun_action' "$GUARD" | head -1 | cut -d: -f1 || true)
+_L_CONF=$(grep -n 'confirm_gaterun_action "\$ACTION"' "$GUARD" | head -1 | cut -d: -f1 || true)
+_L_CASE=$(awk -v s="${_L_RECON:-0}" 'NR>s && /case "\$ACTION" in/ {print NR; exit}' "$GUARD")
+if [ -n "$_L_RECON" ] && [ -n "$_L_CONF" ] && [ -n "$_L_CASE" ] && [ "$_L_RECON" -lt "$_L_CONF" ] && [ "$_L_CONF" -lt "$_L_CASE" ]; then
+  ok "decision is confirmed against a fresh read AFTER reconcile_gaterun_action and BEFORE the destructive case (lines $_L_RECON < $_L_CONF < $_L_CASE)"
+else
+  bad "confirm_gaterun_action is not wired between reconcile_gaterun_action and 'case \$ACTION' (recon=${_L_RECON:-?} confirm=${_L_CONF:-?} case=${_L_CASE:-?})"
+fi
+grep -q 'gate_run_zombie_age_minutes "\$GR_DESC"' "$GUARD" \
+  && ok "loop derives the zombie limit from the run's own description" || bad "loop still uses a global zombie limit"
+grep -q '\[ "\$GR_AGE" -gt "\$GR_ZOMBIE_AGE" \]' "$GUARD" \
+  && ok "reviewer-liveness gate uses the per-run limit" || bad "reviewer-liveness gate still keyed on the global GATE_ZOMBIE_AGE_MINUTES"
+unset -f _ZA _TT _D; unset _PIN
+
 # ── 3. Drift-guard: the guard still wires both vectors into the live sweep ────
 echo "── 3. drift-guard: guard implements both reconciler vectors ──"
 grep -q 'GATE_GUARD_LIB_ONLY'                "$GUARD" && ok "guard is sourceable in lib-only mode"        || bad "guard missing lib-only guard"
@@ -344,8 +514,8 @@ grep -q 'dedup_gaterun_action()'             "$GUARD" && ok "guard defines dedup
 grep -q 'GATE_VERDICT_TIMEOUT_MINUTES'       "$GUARD" && ok "guard defines verdict-timeout threshold (dead-reviewer rule)" || bad "guard missing GATE_VERDICT_TIMEOUT_MINUTES"
 grep -q 'GATE_ZOMBIE_AGE_MINUTES'            "$GUARD" && ok "guard defines verdict-timeout+margin zombie-age threshold"   || bad "guard missing GATE_ZOMBIE_AGE_MINUTES (merge-window safety margin)"
 grep -q 'reviewers_alive_for_run()'          "$GUARD" && ok "guard defines reviewers_alive_for_run helper"            || bad "guard missing reviewers_alive_for_run"
-grep -q 'reconcile_gaterun_action "$GR_AGE" "$GATE_RUN_TTL_MINUTES" "$MARKER_ACTIVE" "$GATE_ZOMBIE_AGE_MINUTES" "$REVIEWERS_ALIVE"' "$GUARD" \
-  && ok "guard wires zombie-age + reviewers_alive into reconcile call" || bad "guard not passing the dead-reviewer args"
+grep -q 'reconcile_gaterun_action "$GR_AGE" "$GR_TTL" "$MARKER_ACTIVE" "$GR_ZOMBIE_AGE" "$REVIEWERS_ALIVE"' "$GUARD" \
+  && ok "guard wires the PER-RUN zombie-age/ttl (ga-7dl5vp) + reviewers_alive into reconcile call" || bad "guard not passing the per-run dead-reviewer args"
 grep -q 'supersede:dead-reviewers)'          "$GUARD" && ok "guard handles supersede:dead-reviewers action"           || bad "guard missing dead-reviewers handler"
 grep -q 'dedup_gaterun_action "$_group_count" "$_is_newest"' "$GUARD" && ok "guard runs keep-newest dedup per gate-run" || bad "guard not calling dedup_gaterun_action in the sweep"
 grep -q 'supersede:duplicate' "$GUARD" && ok "guard supersedes stale duplicate gate-runs (dedup)" || bad "guard missing supersede:duplicate handler"
