@@ -3,13 +3,16 @@
 # relatório diário do nó (baterias por host, tempo, fallbacks, sombra, custo via hcloud), o order que o manda ao Mayor e a chave `mbp-offload.sh node on|off|status`.
 #
 # Contents
-#   O que verifica · Por que é seguro rodar · O que é aviso e não falha
+#   O que verifica · O que não verifica · Por que é seguro rodar · O que é aviso e não falha
 #
-# O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o relatório, o order e o wrapper existem e parseiam; o selftest do relatório (e do wrapper) e a seção `chave` do selftest do mbp-offload passam contra os arquivos vivos; o relatório roda de verdade na cidade viva, sem custo e só lendo o log; com hcloud e token no cofre, a linha de custo sai.
+# O QUE VERIFICA (nos arquivos IMPLANTADOS, não numa cópia): o relatório, o order e o wrapper existem e parseiam; o selftest do relatório (e do wrapper) e a seção `chave` do selftest do mbp-offload passam contra os arquivos vivos; o relatório roda de verdade na cidade viva, sem custo e só lendo o log; com hcloud e token no cofre, o relatório com custo roda e traz a linha `Custo:`.
+# O QUE NÃO VERIFICA — e não diz que verifica: o CONTEÚDO do servidor. Esta fatia só LÊ logs e pergunta o custo à API; não muda o que o rsync manda ao nó nem o que já está lá. A varredura de segurança
+#   da base e dos espelhos do nó (nome de segredo/dado, token, arquivo grande, CONTEÚDO com lista de telefones/CPFs) é da story-ga-zri39b.1.sh, e esta fatia NÃO mantém cópia dela (a cópia que
+#   existia aqui só olhava nome, só a wa-base, sem token e sem conteúdo, e nem chegava a ser chamada). Este teste PASSAR não diz nada sobre o que o servidor guarda.
 # POR QUE É SEGURO RODAR: os selftests usam stubs de ssh/rsync/python e uma cidade temporária; as leituras vivas são SÓ leitura. Nada é semeado, instalado nem apagado no servidor, e nenhuma
 #   bandeira é ligada ou desligada.
-# O QUE É AVISO E NÃO FALHA: o servidor é de um teste de 1 semana e o Mayor o apaga ao fim. Se o ssh ao nó não responde, os checks vivos dele viram AVISO (o código não depende de o
-#   servidor existir: a cadeia cai no MBP). Se o nó RESPONDE e a base dele tem segredo ou dado, é FALHA: é o requisito de segurança da bead.
+# O QUE É AVISO E NÃO FALHA: a linha `Custo: indisponível (motivo)` (API fora, sem token, servidor já apagado pelo Mayor ao fim do teste de 1 semana: o relatório diz "não consegui saber", e isso é o
+#   comportamento certo, não defeito do código) e a ausência de hcloud ou do token no cofre. O relatório que QUEBRA na rota da API (rc ≠ 0, ou saída sem nenhuma linha `Custo:`) é FALHA.
 #
 # Chamado por run.sh depois do deploy (STORY_ID=ga-zri39b.3). Sai 0 se passar.
 set -uo pipefail
@@ -17,7 +20,6 @@ set -uo pipefail
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 ASSETS="$CITY/packs/town-deltas/assets"
 BASH32=/bin/bash
-NODE_HOST="${HETZNER_NODE_HOST:-hetzner-teste}"
 TMPS=()
 cleanup() { local d; for d in "${TMPS[@]+"${TMPS[@]}"}"; do [[ -n "$d" && -d "$d" ]] && { find "$d" -mindepth 1 -delete 2>/dev/null; rmdir "$d" 2>/dev/null; }; done; }
 trap cleanup EXIT
@@ -40,24 +42,6 @@ $out"
   printf '%s\n' "$out" | grep -qE 'SELFTEST OK|RESULT: .* 0 failed' || fail "$label sem a linha final de sucesso"
   log "$label: $line ✓"
 }
-# a varredura de segurança no servidor de verdade (SÓ leitura): segredo ou dado de cliente na base do nó é FALHA; nó que não responde é AVISO
-scan_node_base() {
-  local leaks bad
-  if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$NODE_HOST" true >/dev/null 2>&1; then warn "o nó $NODE_HOST não respondeu ao ssh — checks vivos do servidor pulados (a cadeia cai no MBP)"; return 0; fi
-  leaks="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$NODE_HOST" 'cd ~/gt-remote/wa-base 2>/dev/null || { echo NOBASE; exit 0; }
-    find . \( -name ".env" -o -name ".env.*" -o -name "client_secret*.json" -o -name "credentials*.json" -o -name "*.pem" -o -name "*.key" -o -name "*.duckdb*" -o -name "*.db" -o -name "*.sqlite*" -o -name "*.parquet" -o -name "*.csv" -o -name "*.gz" -o -name "*.pkl" -o -name "*.xlsx" -o -path "./shared" -o -path "./data" -o -path "./logs" \) -print 2>/dev/null | grep -v -E "^\./\.env\.example$" | head -20; echo SCAN_DONE' 2>/dev/null)"
-  if [[ "$leaks" == *NOBASE* ]]; then warn "o nó ainda não tem ~/gt-remote/wa-base — a cadeia cai no MBP até lá"
-  elif [[ "$leaks" != *SCAN_DONE* ]]; then warn "não consegui varrer a base do nó (ssh caiu no meio): a checagem de vazamento NÃO foi feita"
-  else
-    # awk, não grep -E '^(X|)$': o grep do macOS rejeita a alternativa vazia, o erro sumia no `|| true` e a lista voltava VAZIA mesmo com vazamento
-    bad="$(printf '%s\n' "$leaks" | awk '$0 != "" && $0 != "SCAN_DONE"')"
-    [[ -z "$bad" ]] || fail "SEGURANÇA: segredo ou dado de cliente na base do nó ($NODE_HOST:~/gt-remote/wa-base):
-$bad
-(o --delete-excluded da semeadura limpa; e investigue como chegou)"
-    log "base do nó sem segredo nem dado (varredura no servidor) ✓"
-  fi
-}
-
 RUN="$CITY/scripts/mbp-run.sh"; SELFTEST="$CITY/scripts/mbp-run.selftest.sh"; OFFLOAD="$CITY/scripts/mbp-offload.sh"
 REPORT="$CITY/scripts/hetzner-daily-report.sh"; REPORT_ST="$CITY/scripts/hetzner-daily-report.selftest.sh"
 ORDER="$ASSETS/../orders/hetzner-daily-report.toml"; ORDER_SH="$ASSETS/scripts/hetzner-daily-report-order.sh"
@@ -74,10 +58,17 @@ run_suite "selftest do mbp-offload (chave do nó, status, hoje e contagens)" 100
 out="$("$BASH32" "$REPORT" --no-cost 2>&1)" || fail "hetzner-daily-report.sh --no-cost falhou na cidade viva: $out"
 printf '%s\n' "$out" | grep -q '^Baterias' || fail "o relatório vivo não tem a linha 'Baterias': $out"
 log "relatório vivo (sem custo) ✓: $(printf '%s\n' "$out" | grep '^Baterias' | head -n 1 | cut -c1-110)"
-# o custo: com hcloud e token a API responde; sem eles o relatório diz "indisponível (motivo)", nunca €0 (aviso, não falha)
+# o custo: com hcloud e token o relatório chama a API (rota que o --no-cost acima não exercita). O relatório sempre imprime UMA linha `Custo:` e sai 0: o preço, ou "indisponível (motivo)" (nunca €0).
+# vazio (sem linha `Custo:`) ou falhou (rc ≠ 0) → FALHA, o relatório quebrou; `Custo: indisponível` → aviso, a API/o servidor não responderam e o relatório disse isso; sem hcloud/token → aviso, não há o que rodar
 if command -v hcloud >/dev/null 2>&1 && secret Hetzner --field notes >/dev/null 2>&1; then
-  cost="$("$BASH32" "$REPORT" 2>&1 | grep '^Custo' | head -n 1)"
-  case "$cost" in "Custo: urblink"*|"Custo: "*) log "custo: $(printf '%s' "$cost" | cut -c1-110)" ;; *) warn "o relatório não trouxe a linha de custo" ;; esac
+  cost_out="$("$BASH32" "$REPORT" 2>&1)"; cost_rc=$?
+  [[ $cost_rc -eq 0 ]] || fail "hetzner-daily-report.sh (com custo) saiu rc=$cost_rc na cidade viva: $cost_out"
+  cost="$(printf '%s\n' "$cost_out" | grep '^Custo' | head -n 1)"
+  case "$cost" in
+    "") fail "o relatório com custo saiu 0 mas sem nenhuma linha 'Custo:': $cost_out" ;;
+    "Custo: indisponível"*) warn "custo indisponível, e o relatório disse isso: $(printf '%s' "$cost" | cut -c1-140)" ;;
+    *) log "custo: $(printf '%s' "$cost" | cut -c1-110)" ;;
+  esac
 else warn "sem hcloud ou sem o token no cofre: o custo sairia como indisponível"; fi
 
 log "PASS"
