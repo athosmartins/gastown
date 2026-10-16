@@ -19,6 +19,11 @@
 #                        taken on the source side when the backup was made. COUNTS ONLY: it is
 #                        safe to ship to any host. Restored count >= expected passes (rows
 #                        created between the count and the snapshot only add); fewer fails.
+#                        With an optional "as_of":"<32-char commit hash>" the counts were taken AS OF
+#                        that commit on the source side (ga-3kmvyr): the lab then counts the SAME
+#                        commit in the restored copy and requires EXACT equality (an immutable commit
+#                        has no "rows created later"; more is as wrong as less). A commit the restored
+#                        copy does not have is FAIL (the backup must hold it). Not with --flatten.
 #     --workdir DIR      absolute path; the script creates DIR/run-XXXXXX and removes only that
 #     --rto-seconds N    fetch+restore+count budget (default 1800); over it = SLOW, rc 3
 #     --report FILE      JSON report (counts, sizes, timings; never row contents)
@@ -76,7 +81,7 @@ T_FETCH=""; T_RESTORE=""; T_COUNT=""; T_TOTAL=""; RESTORE_KB=""; SRC_KIND=""; SR
 F_RESULT="SKIPPED"; F_WHY="nao-pedido"; F_COMMITS_BEFORE=""; F_COMMITS_AFTER=""
 F_KB_BEFORE=""; F_KB_AFTER=""; F_FLATTEN_S=""; F_GC_S=""
 TABLES_TSV=""; TABLES_TXT=""; STARTED=""; MANIFEST_OK=1; SRC_BAD=""; CLEANUP="nao-havia"; DOLT_VERSION=""
-DB=""; SOURCE=""; MANIFEST=""; WORKDIR=""; RTO=1800; REPORT=""; FLATTEN=0; GC_ARGS=""
+DB=""; SOURCE=""; MANIFEST=""; WORKDIR=""; RTO=1800; REPORT=""; FLATTEN=0; GC_ARGS=""; AS_OF=""
 REPORT_STATE="nao-pedido"; START_EPOCH=$(date +%s)
 
 log() {
@@ -165,7 +170,12 @@ _sql_int() {
   printf '%s\n' "$v"
 }
 
-_count() { _sql_int "$1" "SELECT COUNT(*) FROM \`$2\`"; }  # table name was validated by the manifest parser
+# _count <dbdir> <table> [as_of] — the table name and the hash were validated by the manifest parser. Same 0/1/2 statuses as
+# _sql_int; with a hash, a commit the copy does not have (or a table that did not exist in it) is dolt's own refusal: 1.
+_count() {
+  if [ -n "${3:-}" ]; then _sql_int "$1" "SELECT COUNT(*) FROM \`$2\` AS OF '$3'"
+  else _sql_int "$1" "SELECT COUNT(*) FROM \`$2\`"; fi
+}
 
 # _du_kb <dir> — prints the size in KB. Status 0 only when du itself finished clean: a du that hit "Permission denied"
 # on part of the tree still prints a number, and that number is the size of what it could read, not the size.
@@ -210,11 +220,14 @@ path = sys.argv[1]
 d = {}
 for a in sys.argv[2:]:
     k, _, v = a.partition("=")
-    text = k.split(".")[-1] in ("db", "host", "reason", "why", "gc_args")
+    # as_of is a commit hash: 32 digits (possible, rare) must stay text, never become an int
+    text = k.split(".")[-1] in ("db", "host", "reason", "why", "gc_args", "as_of")
     if not text and v == "":
         v = None                      # not measured (e.g. fetch_s for a file:// source), never ""
     elif not text and re.fullmatch(r"-?\d+", v):
         v = int(v)
+    if k == "as_of" and v == "":
+        v = None                      # no as_of in the manifest (the old >= rule): null, like any value not measured
     if k.startswith("flatten."):
         d.setdefault("flatten", {})[k[8:]] = v
     else:
@@ -310,7 +323,7 @@ _emit_result() {
     count_s="$T_COUNT" total_s="$T_TOTAL" restored_kb="$RESTORE_KB" timeout_bin="$TIMEOUT_CMD" \
     flatten.result="$F_RESULT" flatten.why="$F_WHY" flatten.commits_before="$F_COMMITS_BEFORE" \
     flatten.commits_after="$F_COMMITS_AFTER" flatten.kb_before="$F_KB_BEFORE" flatten.kb_after_gc="$F_KB_AFTER" \
-    flatten.flatten_s="$F_FLATTEN_S" flatten.gc_s="$F_GC_S" flatten.gc_args="$GC_ARGS" cleanup="$CLEANUP" run_dir="$leftover"; then
+    flatten.flatten_s="$F_FLATTEN_S" flatten.gc_s="$F_GC_S" flatten.gc_args="$GC_ARGS" cleanup="$CLEANUP" run_dir="$leftover" as_of="$AS_OF"; then
     REPORT_STATE="falhou"      # asked for, not written: the caller must not go looking for (or trust) a file
   fi
   printf 'RESULT: %s db=%s rc=%s total_s=%s flatten=%s cleanup=%s report=%s\n' "$vname" "$DB" "$RC" "$T_TOTAL" "$F_RESULT" "$CLEANUP" "$REPORT_STATE"
@@ -374,6 +387,13 @@ if type(m.get("db")) is not str or m["db"] != sys.argv[2]:
     sys.exit("manifest e de outro banco ou nao diz de qual: %r" % (m.get("db"),))
 if not isinstance(m.get("tables"), dict) or not m["tables"]:
     sys.exit("manifest sem tabelas (vazio nao verifica nada)")
+# `as_of` is optional. Absent → the old rule (restored >= expected). Present → it MUST be a commit hash (32 chars, dolt's
+# base32 alphabet): anything else (a branch name, a number, "", null) is an unusable manifest — never silently the loose rule,
+# which would let a typo turn an exact check into a lenient one. It goes out as the first line, "@as_of<TAB>hash".
+if "as_of" in m:
+    if type(m["as_of"]) is not str or not re.fullmatch(r"[0-9a-v]{32}", m["as_of"]):
+        sys.exit("manifest com as_of que nao e um hash de commit do dolt (32 caracteres 0-9a-v)")
+    print("@as_of\t%s" % m["as_of"])
 for k, v in m["tables"].items():
     if not re.fullmatch(r"[A-Za-z0-9_]+", k):
         sys.exit("nome de tabela invalido no manifest")
@@ -511,6 +531,16 @@ run_lab() {
   if ! _parse_manifest "$MANIFEST" "$DB" > "$RUN/expected.tsv" 2> "$RUN/manifest.err"; then
     MANIFEST_OK=0; note_rc 2 "$(head -1 "$RUN/manifest.err")"
   fi
+  # as_of from the parsed manifest. vazio (no "@as_of" line) → "" = the old rule, restored >= expected; falhou (awk could not
+  # read the file it was just written) → rc 2, never the old rule: a failed read must not loosen an exact check into a lenient one.
+  AS_OF=""
+  if [ "$MANIFEST_OK" -eq 1 ]; then
+    AS_OF=$(awk -F'\t' '$1 == "@as_of" { print $2; exit }' "$RUN/expected.tsv") \
+      || { note_rc 2 "nao consegui ler o as_of do manifest ja validado"; finish; }
+    # --flatten compares HEAD counts before/after; the counts of an as_of manifest are of an older commit, so the pair
+    # would read as "the flatten changed the data". Refused up front (before the download), not after hours of restore.
+    if [ -n "$AS_OF" ] && [ "$FLATTEN" -eq 1 ]; then note_rc 2 "manifest com as_of nao combina com --flatten (o flatten compara a contagem do HEAD)"; finish; fi
+  fi
   case "$SOURCE" in
     file://?*)
       SRC_KIND="file"; srcdir="${SOURCE#file://}"
@@ -579,13 +609,18 @@ run_lab() {
     : > "$TABLES_TSV"
     while IFS="$(printf '\t')" read -r t e; do
       [ -n "$t" ] || continue
+      [ "$t" != "@as_of" ] || continue     # the commit line, already read into $AS_OF; not a table
       ncount=$((ncount+1))
-      n=$(_count "$restored_dir" "$t"); st=$?
+      n=$(_count "$restored_dir" "$t" "$AS_OF"); st=$?
       case "$st" in
         0) printf '%s\t%s\t%s\n' "$t" "$e" "$n" >> "$TABLES_TSV"
-           [ "$n" -ge "$e" ] || note_rc 1 "tabela $t: restaurado $n < esperado $e" ;;
+           # as_of → both counts are of ONE immutable commit: equal or it is a failure, more included (nothing can have been
+           # "created later" in a commit). No as_of → the old rule, restored >= expected.
+           if [ -n "$AS_OF" ]; then [ "$n" -eq "$e" ] || note_rc 1 "tabela $t no commit $AS_OF: restaurado $n != esperado $e"
+           else [ "$n" -ge "$e" ] || note_rc 1 "tabela $t: restaurado $n < esperado $e"; fi ;;
         1) printf '%s\t%s\t\n' "$t" "$e" >> "$TABLES_TSV"
-           note_rc 1 "tabela $t ausente ou ilegivel no banco restaurado (o dolt recusou a consulta)" ;;
+           if [ -n "$AS_OF" ]; then note_rc 1 "tabela $t no commit $AS_OF: o banco restaurado nao tem esse commit, ou a tabela nao existia nele (o dolt recusou a consulta)"
+           else note_rc 1 "tabela $t ausente ou ilegivel no banco restaurado (o dolt recusou a consulta)"; fi ;;
         *) printf '%s\t%s\t\n' "$t" "$e" >> "$TABLES_TSV"
            note_rc 2 "contagem da tabela $t nao terminou ou veio ilegivel (LAB_SQL_TIMEOUT=${LAB_SQL_TIMEOUT}s): nao e veredito sobre o backup" ;;
       esac

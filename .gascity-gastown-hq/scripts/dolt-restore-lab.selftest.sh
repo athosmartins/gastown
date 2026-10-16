@@ -614,5 +614,57 @@ check "$RC" 2 "parser que nao entrega nenhuma tabela: rc 2 (zero tabelas conferi
 echo "$ERR" | grep -q 'nenhuma tabela' && ok "o motivo diz que nenhuma tabela foi conferida" || bad "motivo: $ERR"
 rm -rf "$WD"
 
+echo "── ga-3kmvyr: manifest AS OF um commit (a mesma foto dos dois lados, igualdade exata) ──"
+# the backup holds 5 commits (issues=comments=5 at HEAD); at c3 both tables had 3 rows
+C3=$(cd "$SCRATCH/fix/alpha-src" && DOLT_DISABLE_EVENT_FLUSH=1 dolt sql -q "SELECT commit_hash FROM dolt_log WHERE message='c3'" -r csv 2>/dev/null | tail -n +2 | head -1)
+[ "${#C3}" -eq 32 ] && ok "fixture: achei o hash do commit c3" || bad "fixture sem hash do c3: '$C3'"
+asof() { printf '{"schema":1,"db":"alpha","as_of":"%s","tables":{"issues":%s,"comments":%s}}\n' "$2" "$3" "$4" > "$1"; }
+tpe() { python3 -I -c 'import json,sys; print(type(json.load(open(sys.argv[1]))[sys.argv[2]]).__name__)' "$1" "$2" 2>/dev/null; }
+asof "$SCRATCH/a.ok.json" "$C3" 3 3
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/a.ok.json"
+check "$RC" 0 "as_of c3 com 3/3 (o HEAD tem 5): rc 0"
+check "$(jget "$REP" as_of)" "$C3" "o relatorio diz em qual commit conferiu"
+check "$(jget "$REP" tables.issues.restored)" 3 "e a contagem restaurada e a do commit, nao a do HEAD"
+# discriminates the old rule: HEAD has 5 >= 4, so the old script passes; at c3 the table had 3, so the exact check must not
+asof "$SCRATCH/a.more.json" "$C3" 4 3
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/a.more.json"
+check "$RC" 1 "esperado 4 no c3 mas o c3 tinha 3: rc 1 (o HEAD ter 5 nao salva)"
+echo "$ERR" | grep -q "issues no commit $C3: restaurado 3 != esperado 4" && ok "o motivo cita a tabela, o commit e os dois numeros" || bad "motivo: $ERR"
+# discriminates >=: the restored copy has MORE than expected at that commit — impossible for an immutable commit, so it is a failure
+asof "$SCRATCH/a.less.json" "$C3" 2 3
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/a.less.json"
+check "$RC" 1 "esperado 2 no c3 mas o c3 tinha 3: rc 1 (a mais tambem e erro, igualdade exata)"
+# a well-formed hash the backup does not have: the backup is MISSING a commit it must hold (dolt refuses the query)
+asof "$SCRATCH/a.absent.json" 0123456789abcdefghijklmnopqrstuv 3 3
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/a.absent.json"
+check "$RC" 1 "commit que o backup nao tem: rc 1 (nunca OK)"
+echo "$ERR" | grep -q 'nao tem esse commit' && ok "e o motivo diz que o commit nao esta no restaurado" || bad "motivo: $ERR"
+# 32 digits is a legal hash: it must stay TEXT in the report, not be read as an integer
+asof "$SCRATCH/a.digits.json" 12345678901234567890123456789012 3 3
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/a.digits.json"
+check "$(tpe "$REP" as_of)" str "as_of so de digitos continua texto no relatorio"
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/m.ok.json"
+check "$(jget "$REP" as_of)" None "manifest sem as_of: relatorio as_of null (regra antiga, restaurado >= esperado)"
+# an as_of that is not a hash is an unusable manifest (UNKNOWN), never the lenient old rule
+for bad_asof in '"main"' '"abc"' '123' '""' 'null' '"0123456789ABCDEFGHIJKLMNOPQRSTUV"' '"0123456789abcdefghijklmnopqrstuvw"'; do
+  printf '{"schema":1,"db":"alpha","as_of":%s,"tables":{"issues":3,"comments":3}}\n' "$bad_asof" > "$SCRATCH/a.bad.json"
+  lab --db alpha --source "$SRC" --manifest "$SCRATCH/a.bad.json"
+  check "$RC" 2 "as_of invalido ($bad_asof): rc 2"
+done
+echo "$ERR" | grep -q 'as_of que nao e um hash de commit' && ok "o motivo diz que o as_of nao e um hash" || bad "motivo: $ERR"
+# --flatten compares HEAD counts: with an as_of manifest it is refused before anything is fetched or restored
+lab --db alpha --source "$SRC" --manifest "$SCRATCH/a.ok.json" --flatten
+check "$RC" 2 "as_of + --flatten: rc 2"
+echo "$ERR" | grep -q 'nao combina com --flatten' && ok "e o motivo e a combinacao" || bad "motivo: $ERR"
+check "$(jget "$REP" restore_s)" None "recusado antes de restaurar (restore_s null)"
+check_clean "e nada fica no workdir"
+# an awk that fails when it reads the as_of must stop the run (rc 2): falling back to the old `>=` rule would turn an exact check
+# into a lenient one without anyone noticing (the HEAD has 5 >= 3, so the lenient rule would answer rc 0)
+mkpath "$SCRATCH/pb-awk"; ln -sf "$TO_REAL" "$SCRATCH/pb-awk/timeout"; rm -f "$SCRATCH/pb-awk/awk"
+printf '#!/bin/bash\ncase "$*" in *@as_of*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v awk)" > "$SCRATCH/pb-awk/awk"; chmod +x "$SCRATCH/pb-awk/awk"
+lab_path "$SCRATCH/pb-awk" --db alpha --source "$SRC" --manifest "$SCRATCH/a.ok.json"
+check "$RC" 2 "awk que falha ao ler o as_of: rc 2 (nunca a regra antiga, mais frouxa)"
+rm -rf "$WD"
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
