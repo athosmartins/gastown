@@ -47,7 +47,8 @@
 #                 alvo da lista pula o nó (launchd/plist, osascript, /Users, ADB). Lista ilegível = o nó NÃO é usado (inerte).
 #   SOMBRA        nas primeiras 24 h da bandeira (HETZNER_SHADOW_WINDOW_S) ~10% das baterias (HETZNER_SHADOW_PCT) rodam TAMBÉM no MBP, em paralelo;
 #                 rc diferente (ou arquivos reprovados diferentes) vai para $CITY/.gc/logs/hetzner-shadow.jsonl e os arquivos divergentes entram na
-#                 lista aprendida. Quem chamou recebe sempre o resultado do nó; a sombra só mede.
+#                 lista aprendida. Quem chamou recebe sempre o resultado do nó; a sombra só mede. rc de AMBIENTE (96..99, 124, 126/127, >=128) de um
+#                 dos lados não é veredito de teste: vira `skipped` e NADA é aprendido (a lista aprendida não expira).
 #   PARALELISMO   pytest-xdist (-n) em baterias grandes (>= HETZNER_XDIST_MIN_TESTS testes, 40), com núcleos / baterias em curso; nunca por cima de
 #                 -n, -p no:xdist, --pdb, --co, --lf... do chamador. O ganho do nó é o paralelismo: um teste só empata com o mini.
 #   LOG           toda linha de $CITY/.gc/logs/mbp-run.jsonl traz "host":"hetzner"|"mbp" (e "shadow":1 no lado de sombra do MBP).
@@ -118,6 +119,7 @@ NODE_FILTER=${HETZNER_RSYNC_FILTER:-$HERE/hetzner-rsync-filter.wa.txt}
 NODE_MAC_ONLY=${HETZNER_MAC_ONLY_LIST:-$HERE/hetzner-mac-only.txt}
 NODE_LEARNED="$CITY/.gc/hetzner-mac-only.learned"
 NODE_SHADOW_LOG="$CITY/.gc/logs/hetzner-shadow.jsonl"
+# valor fora de 0..100 (ou não numérico) volta ao padrão 10, e NÃO satura em 100: um erro de digitação (1000) não pode dobrar a carga do MBP — o lado seguro de um valor inválido é o padrão
 NODE_SHADOW_PCT=$(num_or "${HETZNER_SHADOW_PCT:-10}" 10); [ "$NODE_SHADOW_PCT" -le 100 ] || NODE_SHADOW_PCT=10
 NODE_SHADOW_WINDOW_S=$(num_or "${HETZNER_SHADOW_WINDOW_S:-86400}" 86400)   # a janela conta da hora da bandeira (touch na bandeira reabre a sombra)
 NODE_SHADOW_WAIT_S=$(num_or "${HETZNER_SHADOW_WAIT_S:-120}" 120)           # quanto esperar o lado do MBP depois que o nó terminou
@@ -719,40 +721,57 @@ shadow_log() { # veredito rc_nó rc_mbp arquivos aprendidos
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo" "$1" "$2" "${3:-null}" "$(printf '%s' "$4" | tr -d '"\\' | tr '\n' ',' | cut -c1-300)" "${5:-0}" >> "$NODE_SHADOW_LOG" 2>/dev/null \
     || say "AVISO: veredito da sombra NÃO gravado em $NODE_SHADOW_LOG"
 }
+# shadow_no_verdict <rc>: 0 quando o rc NÃO é veredito de teste e sim do ambiente: 96..99 (o wrapper não rodou), 124 (estourou o tempo), 126/127 (o shell não executou/achou o comando) e >=128 (morto por sinal).
+# Comparar um desses com o rc do outro lado ensinaria "mac-only" a partir de problema de infraestrutura, e a lista aprendida NUNCA expira: um timeout passageiro prenderia a bateria inteira no Mac.
+# vazio/ilegível (não numérico) → também "sem veredito"; o estado inerte é não aprender nada
+shadow_no_verdict() {
+  case "$1" in ''|*[!0-9]*|96|97|98|99|124|126|127) return 0 ;; esac
+  [ "$1" -ge 128 ]
+}
 shadow_finish() { # rc_do_nó arquivo_da_saída_do_nó "$@" (args originais). Espera o MBP (até NODE_SHADOW_WAIT_S), compara e aprende.
   [ -n "$SHADOW_PID" ] || return 0
-  local arc="$1" aout="$2" brc waited=0 bf af diffs="" t f learned=0; shift 2
+  local arc="$1" aout="$2" brc waited=0 bf af diffs="" t f learned=0 msg; shift 2
+  # o nó acabou por ambiente (tempo, sinal, wrapper): não há veredito de teste para comparar. Derruba a sombra sem esperar o MBP e não aprende nada.
+  if shadow_no_verdict "$arc"; then
+    shadow_kill "$SHADOW_PID"
+    shadow_log skipped "${arc:-null}" null "" 0; say "sombra: o nó terminou com rc=${arc:-vazio} (tempo, sinal ou wrapper; não é veredito de teste) — sem veredito, nada aprendido"
+    rm -f "$SHADOW_OUT"; SHADOW_OUT=""; SHADOW_PID=""; return 0
+  fi
   while kill -0 "$SHADOW_PID" 2>/dev/null && [ "$waited" -lt "$NODE_SHADOW_WAIT_S" ]; do sleep 1; waited=$((waited + 1)); done
   if kill -0 "$SHADOW_PID" 2>/dev/null; then
     shadow_kill "$SHADOW_PID"
     shadow_log timeout "$arc" null "" 0; say "sombra: o MBP não terminou em ${NODE_SHADOW_WAIT_S}s depois do nó — sem veredito"
   else
     wait "$SHADOW_PID" 2>/dev/null; brc=$?
-    case "$brc" in
-      96|97|98|99) shadow_log skipped "$arc" "$brc" "" 0; say "sombra: o MBP não rodou (rc=$brc) — sem veredito" ;;
-      *)
-        af=$(failed_files "$aout"); bf=$(failed_files "$SHADOW_OUT")
-        if [ "$arc" = "$brc" ] && [ "$af" = "$bf" ]; then shadow_log same "$arc" "$brc" "" 0
-        else
-          # arquivos que reprovam só de um lado; rc diferente sem nenhum arquivo legível → TODOS os alvos (mais arquivos no Mac, nunca menos)
-          diffs=$(printf '%s\n%s\n' "$af" "$bf" | grep -v '^$' | sort | uniq -u)
-          if [ -z "$diffs" ]; then
-            for t in "$@"; do
-              case "$t" in -*) continue ;; esac
-              f="${t%%::*}"; f="${f#"$dir"/}"
-              case "$f" in *.py) diffs="$diffs${diffs:+,}$f" ;; esac
-            done
-            diffs=$(printf '%s' "$diffs" | tr ',' '\n')
-          fi
-          if [ -n "$diffs" ]; then
-            if { printf '# %s sombra: rc nó=%s mbp=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arc" "$brc"; printf '%s\n' "$diffs"; } >> "$NODE_LEARNED" 2>/dev/null; then
-              learned=$(printf '%s\n' "$diffs" | grep -c .)
-            else say "AVISO: não consegui gravar $NODE_LEARNED — o arquivo divergente NÃO foi marcado como mac-only"; fi
-          fi
-          shadow_log diverge "$arc" "$brc" "$diffs" "$learned"
-          say "sombra: DIVERGÊNCIA (nó rc=$arc, MBP rc=$brc) — marcado como mac-only: $(printf '%s' "$diffs" | tr '\n' ' ')"
-        fi ;;
-    esac
+    if shadow_no_verdict "$brc"; then
+      shadow_log skipped "$arc" "$brc" "" 0; say "sombra: o MBP não deu veredito de teste (rc=$brc: não rodou, tempo ou sinal) — sem veredito, nada aprendido"
+    else
+      af=$(failed_files "$aout"); bf=$(failed_files "$SHADOW_OUT")
+      if [ "$arc" = "$brc" ] && [ "$af" = "$bf" ]; then shadow_log same "$arc" "$brc" "" 0
+      else
+        # arquivos que reprovam só de um lado; rc diferente sem nenhum arquivo legível → TODOS os alvos (mais arquivos no Mac, nunca menos)
+        diffs=$(printf '%s\n%s\n' "$af" "$bf" | grep -v '^$' | sort | uniq -u)
+        if [ -z "$diffs" ]; then
+          for t in "$@"; do
+            case "$t" in -*) continue ;; esac
+            f="${t%%::*}"; f="${f#"$dir"/}"
+            case "$f" in *.py) diffs="$diffs${diffs:+,}$f" ;; esac
+          done
+          diffs=$(printf '%s' "$diffs" | tr ',' '\n')
+        fi
+        if [ -n "$diffs" ]; then
+          if { printf '# %s sombra: rc nó=%s mbp=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arc" "$brc"; printf '%s\n' "$diffs"; } >> "$NODE_LEARNED" 2>/dev/null; then
+            learned=$(printf '%s\n' "$diffs" | grep -c .)
+          else say "AVISO: não consegui gravar $NODE_LEARNED — o arquivo divergente NÃO foi marcado como mac-only"; fi
+        fi
+        shadow_log diverge "$arc" "$brc" "$diffs" "$learned"
+        # a mensagem diz "marcado" SÓ do que foi gravado ($learned vem da gravação, não de $diffs): alvo que não é .py (um diretório) ou gravação que falhou não pode sair como "marcado"
+        if [ "$learned" -gt 0 ]; then msg="marcado como mac-only: $(printf '%s' "$diffs" | tr '\n' ' ')"
+        elif [ -n "$diffs" ]; then msg="NADA foi marcado como mac-only (a lista aprendida não aceitou a gravação)"
+        else msg="nada marcado como mac-only (nenhum alvo .py para aprender)"; fi
+        say "sombra: DIVERGÊNCIA (nó rc=$arc, MBP rc=$brc) — $msg"
+      fi
+    fi
   fi
   rm -f "$SHADOW_OUT"; SHADOW_OUT=""; SHADOW_PID=""
 }

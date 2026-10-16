@@ -35,7 +35,7 @@
 #   pasta liberados, o arquivo com LISTA de telefones (>=20) ou CPFs (>=3), deixa passar 3 números e cauda sintética, e SEM a varredura (hetzner-pii-scan.py) o nó NÃO é usado · arquivo que a varredura não lê, ou caminho retido com barra invertida que a regra `- /caminho` não segura (conferido por um 2º rsync -n), também: o nó NÃO é usado ·
 #   filtro ausente, vazio, fora de ordem, sem o `- *` final, sem uma regra-âncora, com `+` que inclua tudo (`+ /**`...), `!` ou `.` = o nó NÃO é usado.
 #   FATIA 2: lista mac-only (glob, node id, caminho absoluto, comentário/CRLF, aprendida; ausente ou ilegível = o nó NÃO é usado) · xdist (limiar, núcleos/baterias, o -n
-#   do chamador vence, xdist ausente/ilegível) · sombra (igual, diverge por rc e por arquivo, MBP fora, MBP lento, janela de 24 h, abortada).
+#   do chamador vence, xdist ausente/ilegível) · sombra (igual, diverge por rc e por arquivo, MBP fora, MBP lento, janela de 24 h, abortada; rc de ambiente 124/137/127/97 de qualquer lado = `skipped`, nada aprendido; a mensagem só diz "marcado" do que foi gravado).
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -1003,6 +1003,35 @@ shadow_env; export HETZNER_SHADOW_PCT=0; run -- tests/test_x.py >/dev/null; hasn
 shadow_env; STUB_UNREACHABLE_NODE=1 run -- tests/test_x.py >/dev/null; [ "$(grep -c 'HOSTCALL:mbp:RUN' "$STUB_LOG")" = 1 ] && ok "nó fora (a bateria foi ao MBP): não há o que comparar, sem sombra" || bad "sombra com o nó fora"
 [ ! -e "$SHLOG" ] && ok "…e nenhum veredito é gravado" || bad "veredito gravado sem sombra"
 shadow_env; rc=$(STUB_RUN_RC_NODE=255 run -- tests/test_x.py); expect "nó cai no meio com a sombra rodando: a bateria vai ao MBP e a sombra é abortada" 0 "$rc"; [ ! -e "$SHLOG" ] && ok "…sem veredito da sombra" || bad "veredito de uma sombra abortada"
+# rc de AMBIENTE não é veredito de teste. O nó que estoura o tempo (124), é morto por sinal (137) ou não acha o comando (127) com o MBP verde — e o MBP que faz o mesmo com o nó verde — NÃO podem virar
+# "mac-only": a lista aprendida nunca expira, então um timeout passageiro prenderia a bateria inteira no Mac (o rc de infraestrutura entrava como se fosse reprovação de teste).
+for nrc in 124 137 127; do
+  shadow_env; rc=$(STUB_RUN_RC_NODE=$nrc STUB_RUN_RC_MBP=0 run -- tests/test_x.py); expect "nó com rc de ambiente $nrc (MBP 0): quem chamou recebe o rc do nó" "$nrc" "$rc"
+  has "nó rc=$nrc: veredito 'skipped' com o rc do nó" "$SHLOG" "\"verdict\":\"skipped\",\"a_host\":\"hetzner\",\"a_rc\":$nrc,\"b_host\":\"mbp\",\"b_rc\":null"; hasnt "nó rc=$nrc: nenhum 'diverge'" "$SHLOG" '"verdict":"diverge"'
+  [ ! -e "$LEARNED" ] && ok "nó rc=$nrc: nada é aprendido" || bad "nó rc=$nrc (ambiente) ensinou mac-only: $(tr '\n' ' ' < "$LEARNED")"
+  has "nó rc=$nrc: avisa que não há veredito" "$T/err" "sombra: o nó terminou com rc=$nrc"
+done
+shadow_env; rc=$(STUB_RUN_RC_NODE=97 STUB_RUN_RC_MBP=0 run -- tests/test_x.py); expect "nó rc=97 (o cd do job falhou): cai no MBP e roda" 0 "$rc"
+has "nó rc=97: veredito 'skipped'" "$SHLOG" '"verdict":"skipped","a_host":"hetzner","a_rc":97'; [ ! -e "$LEARNED" ] && ok "nó rc=97: nada é aprendido" || bad "nó rc=97 (wrapper) ensinou mac-only"
+for brc in 124 137; do
+  shadow_env; rc=$(STUB_RUN_RC_NODE=0 STUB_RUN_RC_MBP=$brc run -- tests/test_x.py); expect "MBP com rc de ambiente $brc (nó 0): o chamador não sente" 0 "$rc"
+  has "MBP rc=$brc: veredito 'skipped' com o rc do MBP" "$SHLOG" "\"verdict\":\"skipped\",\"a_host\":\"hetzner\",\"a_rc\":0,\"b_host\":\"mbp\",\"b_rc\":$brc"
+  [ ! -e "$LEARNED" ] && ok "MBP rc=$brc: nada é aprendido" || bad "MBP rc=$brc (ambiente) ensinou mac-only: $(tr '\n' ' ' < "$LEARNED")"
+done
+# controle positivo: a exceção é SÓ para rc de ambiente — rc 2 (pytest interrompido) é veredito de teste e continua aprendendo
+shadow_env; rc=$(STUB_RUN_RC_NODE=2 STUB_RUN_RC_MBP=0 run -- tests/test_x.py); expect "nó rc=2 (pytest interrompido) é veredito de teste: o chamador recebe o 2" 2 "$rc"
+has "…e é divergência" "$SHLOG" '"verdict":"diverge","a_host":"hetzner","a_rc":2'; has "…e o arquivo é aprendido" "$LEARNED" '^tests/test_x\.py$'
+# a mensagem só diz "marcado" do que foi GRAVADO ($learned), não do que se pretendia gravar
+shadow_env; STUB_RUN_RC_NODE=0 STUB_RUN_RC_MBP=1 run -- tests >/dev/null
+has "divergência sem alvo .py (diretório): o log diz learned:0" "$SHLOG" '"verdict":"diverge".*"learned":0'; [ ! -e "$LEARNED" ] && ok "…e nada é gravado na lista aprendida" || bad "gravou na lista aprendida sem alvo .py"
+has "…e a mensagem diz que nada foi marcado" "$T/err" 'DIVERGÊNCIA \(nó rc=0, MBP rc=1\) — nada marcado como mac-only'; hasnt "…em vez de afirmar 'marcado como mac-only:'" "$T/err" 'marcado como mac-only: '
+if [ "$(id -u)" = 0 ]; then echo "skip gravação recusada da lista aprendida (root: o chmod não bloqueia a escrita; caso não executado, não contado)"
+else
+  shadow_env; printf '# lista aprendida (somente leitura)\n' > "$LEARNED"; chmod 444 "$LEARNED"
+  STUB_RUN_RC_NODE=0 STUB_RUN_RC_MBP=1 run -- tests/test_x.py >/dev/null; chmod 644 "$LEARNED"
+  has "lista aprendida recusa a gravação: o AVISO sai" "$T/err" 'AVISO: não consegui gravar'; has "…e o log diz learned:0" "$SHLOG" '"verdict":"diverge".*"learned":0'
+  has "…e a mensagem diz que NADA foi marcado" "$T/err" 'DIVERGÊNCIA \(nó rc=0, MBP rc=1\) — NADA foi marcado como mac-only'; hasnt "…nem afirma 'marcado como mac-only:' logo depois do AVISO" "$T/err" 'marcado como mac-only: '
+fi
 shadow_end
 
 
