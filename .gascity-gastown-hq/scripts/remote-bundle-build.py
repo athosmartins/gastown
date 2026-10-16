@@ -288,6 +288,8 @@ class Bundle:
                 v = [x for x in v if x not in gone]
             out[k] = v
         asks = out.pop("ask", [])
+        if not isinstance(asks, list) or (asks and not isinstance(out.get("deny", []), list)):  # forma que não conheço: converter às cegas perde a regra
+            raise Refused(f"permissions.ask ou deny em {src} não é lista: sem veredito possível")
         if asks:  # sem humano no teclado do servidor `ask` trava a sessão e vale até com --dangerously-skip-permissions; `deny` nega na hora
             out["deny"] = out.get("deny", []) + [x for x in asks if x not in out.get("deny", [])]
             self.asks_to_deny[src] = len(asks)

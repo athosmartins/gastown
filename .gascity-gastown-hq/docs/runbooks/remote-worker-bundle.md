@@ -18,7 +18,7 @@ python3 -I $S/remote-bundle-build.py build --city $GC_CITY_PATH --claude-home ~/
   --role dog --role-dir $GC_CITY_PATH/.gc/agents/dogs/gastown.dog-1 \
   --remote-root /home/runner/gt-remote/bundle --remote-home /home/runner --out OUT [--skills]
 python3 -I $S/remote-bundle-build.py verify OUT      # re-hasheia os arquivos, o bit de execução e o bundle_hash e confere com manifest.json
-bash $S/remote-bundle-build.selftest.sh              # hermético (fixtures em mktemp), 234 casos; leva de 2 a 7 min conforme a carga da máquina (medido com load 55–66)
+bash $S/remote-bundle-build.selftest.sh              # hermético (fixtures em mktemp), 236 casos; leva de 2 a 7 min conforme a carga da máquina (medido com load 55–66)
 ```
 
 Saída: `home/.claude/{settings.json,hooks/*}`, `city/settings.json`, `role/<papel>/.claude/{settings.json,skills/*}` e `manifest.json` (veredito por hook com `command` — a parte reconhecida — e `command_sha256` — do comando inteiro, o `drop` também —, `shim_needs`, chaves descartadas, sha256 de cada arquivo, `bundle_hash` sem data/hora). Códigos: 0 ok · 2 uso · 3 recusado · 4 `verify` achou diferença ou não leu o manifest, uma pasta ou um arquivo de `OUT`.

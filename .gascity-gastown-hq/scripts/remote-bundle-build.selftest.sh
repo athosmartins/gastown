@@ -346,6 +346,8 @@ jq -e '.permissions.deny == ["Bash(sudo:*)"]' "$O/city/settings.json" >/dev/null
 fresh; jq --argjson a "$ASKS" '.permissions.ask = $a | .permissions.deny = ["Bash(sudo:*)"]' "$T/f/$HS" > "$T/m.json" && cp "$T/m.json" "$T/f/$HS"; build "$T/f" "$T/f/out"; rc=$?
 [ $rc = 0 ] && jq -e '.permissions.deny == ["Bash(sudo:*)", "Bash(rm -rf:*)"]' "$T/f/out/home/.claude/settings.json" >/dev/null; ok $? "ask→deny: regra que já era deny não duplica, a ordem é a do deny e depois a do ask (rc=$rc)"
 fresh; build "$T/f" "$T/f/out"; jq -e '.asks_to_deny == {}' "$T/f/out/manifest.json" >/dev/null; ok $? "ask→deny: sem ask no mini, asks_to_deny vem vazio"
+fresh; jq '.permissions.ask = "Bash(rm -rf:*)"' "$T/f/$HS" > "$T/m.json" && cp "$T/m.json" "$T/f/$HS"
+refuses "ask que não é lista (uma string viraria uma regra deny por letra e a original sumiria)" "$T/f"; why "não é lista"
 askmut() {  # o builder sem a conversão deixa o ask passar: a checagem de cima TEM que reprovar
   fresh; jq --argjson a "$ASKS" '.permissions.ask = $a' "$T/f/$HS" > "$T/m.json" && cp "$T/m.json" "$T/f/$HS"; sed "$2" "$B" > "$T/mutant.py"
   if cmp -s "$B" "$T/mutant.py"; then ok 1 "mutante '$1': o sed não mudou nada"; return; fi
