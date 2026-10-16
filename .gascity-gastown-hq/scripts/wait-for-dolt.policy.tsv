@@ -1,0 +1,78 @@
+# wait-for-dolt.policy.tsv (ga-sh8t23.2) — decisão revisada por job do escopo HQ (label com.gascity.* / com.gastown.*, RunAtLoad, programa fora da árvore de outro rig).
+# Formato: label<TAB>decisão<TAB>motivo. Decisões: wrap (embrulha com wait-for-dolt.sh) · isento (não embrulha: precisa rodar com o Dolt fora, tem ato útil que não precisa dele, ou é KeepAlive)
+# · nao-medido (nenhuma chamada a bd/gc/dolt achada no programa; fica como hoje). Na dúvida: isento. O wait-for-dolt-plan.py confere esta lista contra os plists VIVOS a cada execução:
+# job novo fora daqui, `wrap` sem chamada medida, `wrap` em KeepAlive ou label em 2 arquivos viram DIVERGÊNCIA (exit 1) e o --apply recusa. Medido em 16/10/2026 (74 jobs no escopo).
+# Regra do `wrap`: o job só AVALIA dado de bead/sessão (varre, zela, reapa, mede fila). Sem Dolt não há o que avaliar, e uma leitura vazia ou com erro no boot é o risco que o wrapper tira.
+com.gascity.adhoc-session-reaper	wrap	reaper de sessões adhoc: lê e atualiza beads (bd update)
+com.gascity.crew-liveness-probe	wrap	cura crew presa com bead in-flight: lê e etiqueta bead (bd comment/label)
+com.gascity.engine-refusal-strip-watchdog	wrap	detecção sobre tabelas do Dolt (gc dolt sql)
+com.gascity.funnel-flow-healer	wrap	healer do fluxo refino→gate: conta beads (bd list)
+com.gascity.gate-focus-mode	wrap	conta a fila do gate (bd list) para ligar/desligar o modo foco
+com.gascity.gate-marker-missing-status-watchdog	wrap	varre markers do gate sem status (bd list)
+com.gascity.gate-merge-survival-sweep	wrap	audita merges contra o estado do bead (bd show/reopen)
+com.gascity.gate-needs-human-divergence-sweep	wrap	varre beads parados em gate:needs-human (bd, gc rig list)
+com.gascity.gate-orphaned-label-watchdog	wrap	varre beads com label gate:* sem marker (bd list)
+com.gascity.gate-pilot-soak-monitor	wrap	observador passivo do gate/Pilot (gc bd list)
+com.gascity.gate-reviewer-orphan-clear	wrap	limpa revisor órfão do gate (gc session list)
+com.gascity.gate-throughput-stall-watchdog	wrap	lê os markers do gate por bd-list-cached; o alarme de Dolt fora é de outros jobs (dolt-hang-watchdog, daemon-presence-watchdog)
+com.gascity.lifecycle-coherence-janitor	wrap	normaliza status×label de beads (bd; 29 linhas de chamada)
+com.gascity.merged-bead-janitor	wrap	fecha beads já mergeados (bd list/close; 25 linhas de chamada)
+com.gascity.pilot-missing-route-watchdog	wrap	acha beads armados sem rota e os conserta (bd list/comment)
+com.gascity.reclaim-cap-escalation-sweep	wrap	detector sobre beads reclamados (bd list)
+com.gascity.suavez-first-watch	wrap	avisa na 1ª bead em needs-approval (bd list)
+com.gascity.wisp-reaper	wrap	esvazia wisps efêmeros (bd/gc; já tem gate próprio de gc dolt status)
+com.gascity.wisp-table-reaper	wrap	drena a tabela wisps do Dolt (gc dolt status + reaper)
+com.gascity.athos-acao-guard	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.city-night-window	isento	suspende/retoma a cidade (gc suspend/resume): ciclo de vida; o mecanismo está DESLIGADO hoje
+com.gascity.config-drift-watcher	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.crew-autopin-guard	isento	mantém as crews fixadas contra drain por config-drift: guarda de ciclo de vida, tem de rodar logo no boot
+com.gascity.crew-capacity-containment	isento	contenção por pressão de RAM: o gatilho é a RAM, não o Dolt
+com.gascity.crew-pushguard-check	isento	detecta clone sem pre-push (git); o Dolt só entra no alerta por mail
+com.gascity.crew-session-dedup	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.daemon-presence-watchdog	isento	vigia os vigias: alerta daemon ausente ou em crash-loop, inclusive o Dolt
+com.gascity.dolt-gc-release-trigger	isento	gatilho de manutenção do próprio Dolt: observa/age sobre ele
+com.gascity.dolt-hang-watchdog	isento	detecta e reinicia Dolt travado: tem de rodar com o Dolt fora
+com.gascity.dolt-latency-alarm	isento	alarme de latência do Dolt: tem de rodar com o Dolt fora
+com.gascity.dolt-load-attributor	isento	atribui a carga do Dolt a quem a causa: observador do Dolt
+com.gascity.dolt-remote-peer-audit	isento	audita os peers conectados ao Dolt: observador do Dolt
+com.gascity.gate-health-monitor	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.gate-recovery-watchdog	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.inflight-reclaim-guard	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.machine-utilization-sampler	isento	amostra a máquina (ps); o Dolt entra só como enriquecimento
+com.gascity.nightly-reboot-postcheck	isento	relatório pós-reboot: diz se a cidade voltou inteira, o Dolt incluído
+com.gascity.order-exec-failure-watchdog	isento	alerta quando `order exec` falha: caminho de alarme
+com.gascity.pipeline-throughput-heartbeat	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.pool-autoscale-watchdog	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.production-stall-watchdog	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.quorum-convergence-watchdog	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.reconciler-stall-detector	isento	detecta travamento do reconciliador a partir de traces em disco: alarme
+com.gascity.supervisor	isento	é o engine (gc supervisor run); esperar o Dolt aqui criaria dependência circular. KeepAlive
+com.gascity.supervisor-config-guard	isento	guarda o supervisor e recupera spawn-outage; precisa rodar com o Dolt fora. KeepAlive
+com.gascity.throughput-stall-watchdog	isento	KeepAlive: daemon que o launchd relança sozinho; o wrapper trocaria o respawn dele por uma espera de até o prazo
+com.gascity.town-root-reconciler	isento	reconcilia a raiz da cidade (gc reload): ciclo de vida. KeepAlive
+com.gastown.disk-pressure-monitor	isento	monitor de disco: o ato (limpar/alertar) não precisa do Dolt
+com.gastown.dolt-server	isento	é o servidor Dolt: esperar por ele seria deadlock. KeepAlive
+com.gascity.bd-metrics-disable-env	nao-medido	comando direto sem arquivo de programa; nenhuma chamada a bd/gc/dolt achada
+com.gascity.cdp-tab-guard	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gascity.cloudflared-dns-reconcile	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gascity.crew-session-reset-detector	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gascity.disk-ballast-guard	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gascity.flow-ledger-collector	nao-medido	nenhuma menção a bd/gc/dolt no programa. KeepAlive
+com.gascity.git-lock-hygiene	nao-medido	só enumera rigs (gc rig list) para achar repositórios; o ato é git
+com.gascity.hetzner-mirror-sshd	nao-medido	nenhuma menção a bd/gc/dolt no programa. KeepAlive
+com.gascity.hetzner-mirror-sync	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gascity.hetzner-mirror-tunnel	nao-medido	nenhuma menção a bd/gc/dolt no programa. KeepAlive
+com.gascity.lifecycle-correctness-auditor	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gascity.production-drift-guard	nao-medido	nenhuma menção a bd/gc/dolt no programa. KeepAlive
+com.gascity.ram-owner-sampler	nao-medido	só cita `gc session list` em comentário; amostra ps
+com.gascity.skill-audit	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gascity.supervisor-restart-watchdog	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gascity.wa-beads-config-guard	nao-medido	nenhuma menção a bd/gc/dolt no programa. KeepAlive
+com.gascity.wa-root-main-guard	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gascity.worktree-reaper	nao-medido	só `command -v gc`; nenhuma chamada a bd/gc achada (a LÊ anterior era texto de mensagem jq)
+com.gastown.bw-serve	nao-medido	sem arquivo de programa legível (servidor do Bitwarden); nenhuma chamada a bd/gc/dolt achada. KeepAlive
+com.gastown.drive-pressure-monitor	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gastown.git-maintenance-runner	nao-medido	só cita gc de git em comentário; nenhuma chamada a bd/gc/dolt achada
+com.gastown.machine-health-reporter	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gastown.painel-prod-deploy-sync	nao-medido	nenhuma menção a bd/gc/dolt no programa
+com.gastown.ram-pressure-monitor	nao-medido	monitor de RAM; só cita dolt como família de processo
