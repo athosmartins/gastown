@@ -93,14 +93,16 @@ $out"
         d="$(printf '%s\n' "$out" | sed -n 's/^stage=//p' | tail -n 1)"
         [[ -n "$d" && -f "$d/scraper.log" ]] || fail "a rodada viva não devolveu o scraper.log em staging:
 $out"
-        if pgrep -f 'scrapers/primeimoveisdeluxo/scraper.py' >/dev/null 2>&1; then
+        if [[ ! -d "$PS_SHARED/config" ]]; then
+          warn "$PS_SHARED/config ilegível — a conferência de que a produção não foi tocada foi pulada (sem como verificar)"
+        elif pgrep -f 'scrapers/primeimoveisdeluxo/scraper.py' >/dev/null 2>&1; then
           warn "há uma rodada LOCAL de primeimoveisdeluxo em andamento — a conferência de que a produção não foi tocada foi pulada (o marco não distingue os dois)"
         else
           hit="$(touched_prod "$mark" primeimoveisdeluxo)"
           [[ -z "$hit" ]] || fail "SEGURANÇA: a rodada viva escreveu na produção ($PS_SHARED): a fatia 1 só grava em staging:
 $hit"
         fi
-        log "rodada viva (primeimoveisdeluxo --limit 3): $files arquivos em staging, produção intacta ✓";;
+        log "rodada viva (primeimoveisdeluxo --limit 3): $files arquivos em staging; produção conferida (veja os avisos acima se a conferência foi pulada) ✓";;
       96|97|98|99) warn "o nó recusou a rodada viva (rc $rrc) — a cadeia cai no mini: $(printf '%s\n' "$out" | tail -n 1)";;
       *) fail "a rodada viva no nó terminou com rc $rrc (esperado 0):
 $(printf '%s\n' "$out" | tail -n 15)";;
