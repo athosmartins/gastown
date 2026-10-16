@@ -58,7 +58,9 @@ trap finish EXIT
 # The generator always runs as a subprocess under /bin/bash — the real contract, not a sourced shortcut. Result: RC, ERR (stderr), $W/gen.out (stdout).
 RC=0; ERR=""
 gen() { # gen <agents dir> <e12-arms.sh> <subcommand>
-  E12_CREW_AGENTS_DIR="$1" E12_ARMS="$2" /bin/bash "$GEN" "$3" >"$W/gen.out" 2>"$W/gen.err"; RC=$?; ERR="$(cat "$W/gen.err")"
+  # E12_EXTRA_AGENTS / E12_FRAGMENT set but empty: this selftest is about the six named crews (ga-0nz1wi); the other targets of the generator
+  # (batista-ps, thies-ps, batista-lx, the fragment section — ga-57e7l0) are covered by e12-builder-coverage.selftest.sh
+  E12_CREW_AGENTS_DIR="$1" E12_ARMS="$2" E12_EXTRA_AGENTS= E12_FRAGMENT= /bin/bash "$GEN" "$3" >"$W/gen.out" 2>"$W/gen.err"; RC=$?; ERR="$(cat "$W/gen.err")"
 }
 # A copy of the six real prompts under $W/<name>/<crew>-wa/. Every scenario gets its own directory: nothing in the scratch dir is deleted.
 mkagents() { # mkagents <name> → prints the directory

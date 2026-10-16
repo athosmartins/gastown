@@ -466,6 +466,15 @@
     ],
     "show_unset": false,
     "_why": "O prompt nativo do dog recomenda `gc dolt cleanup --force` (espaço = DROP DATABASE); o aviso contra isso só existia no gt/CLAUDE.md que o dog não carrega mais."
+   },
+   "e12-write-time-doctrine": {
+    "roles": [
+     "dog",
+     "ps-worker",
+     "wa-worker"
+    ],
+    "show_unset": false,
+    "_why": "ga-57e7l0 (a): o bloco de doutrina de escrita do E12 (ga-4q2zo5) chegava ao builder SÓ como texto anexado à mensagem do Pilot, e o caminho do pool o descartava (dispatch_one abre o worker com `gc session new` pelado), o top-up (passo 2d) nunca teve mensagem e um FAIL do gate devolve a bead ao pool, onde o worker se serve sozinho: medido 16/10, 70% das beads revisadas não tinham linha no roster. O PROMPT é o único canal que cobre os três, então o texto mora aqui. O corpo é GERADO a partir do mesmo e12_block_text que o Pilot usa (`bash packs/town-deltas/assets/e12-crew-doctrine.sh write`; o selftest e o gate falham se divergir). show_unset=false: crew não tem TD_ROLE e já carrega a própria região marcada (ga-0nz1wi) — receberia o bloco em duplicata."
    }
   },
   "core_sentinels": {
@@ -557,6 +566,7 @@
    "never_cut": {
     "claudemd-carryover": "Regras de segurança que SÓ vivem aqui depois que o overlay exclui o CLAUDE.md (dados pessoais do Athos, bd reclaim cru, restart cosmético). Valem para qualquer tarefa, independente do que o texto diz.",
     "dolt-cleanup-hazards": "O prompt nativo do dog recomenda `gc dolt cleanup --force` (= DROP DATABASE) para QUALQUER tarefa; o texto da tarefa não prevê se o agente vai alcançá-lo, e o dano é irreversível.",
+    "e12-write-time-doctrine": "A doutrina de escrita é o que impede o 'não consegui ler' virar vazio (ga-57e7l0); relevância não é função do texto da tarefa — toda tarefa que ESCREVE código lê alguma coisa — e o Jev responder 'não precisa' é exatamente o buraco que a seção fecha.",
     "mbp-offload-tests": "Relevância não é função do texto: qualquer tarefa que escreva teste pode chegar a um pytest pesado, e a seção é uma linha (~0,4k tokens) — cortar economiza quase nada e deixa o worker disputando CPU no mini com o resto da cidade.",
     "research-only-channels": "Protege contra mutação irreversível pra fora (API viva de terceiros, identidade) por subagente; se a sessão vai delegar pesquisa não é função do texto da tarefa, e o estrago não desfaz.",
     "next-action-mayor-waiting": "Relevância não é função do texto: QUALQUER tarefa pode travar esperando decisão. Jev responderia ruído, e a falha (sessão invisível parada por 76 min) é a que a seção existe pra evitar."

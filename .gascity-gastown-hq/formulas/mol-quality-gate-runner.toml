@@ -648,6 +648,68 @@ fi
 # SELFTEST-EXTRACT doc-rules-lint-step2c: END
 ```
 
+**2d. E12 write-time doctrine reaches every builder (ga-57e7l0):**
+
+The doctrine block (`e12_block_text`) used to reach a builder only as text the Pilot
+appended to a dispatch MESSAGE. The pool path drops that message (a bare
+`gc session new`), pool top-up never had one, and a gate FAIL sends the bead back to
+the pool, where a worker serves itself -- measured 16/10: 70% of the beads this gate
+reviewed had no roster row at all. The PROMPT is the only channel that covers all of
+them, so the block lives in the town-deltas fragment (TD_ROLE dog / ps-worker /
+wa-worker) and in a marked region of each crew prompt that builds, all generated from
+the one source by `e12-crew-doctrine.sh`. This step keeps that true: when the diff
+touches a file that decides it (an agent prompt, the fragment, `city.toml`, the pool
+manifest, the generator or `e12-arms.sh`) it runs `check` (every target is a fresh
+render) and `coverage` (every prompt that mentions gate-done is covered; the guard
+lists the three pool roles and not the agents with no TD_ROLE; city.toml gives those
+roles to an agent). Same hard-gate `TEST_EXIT`/`TEST_OUTPUT` signal as 2b/2c:
+exit 1 = a gap, exit 2 = could not tell, and unknown is not pass. A diff that touches
+none of those files runs nothing. The branch's own generator is used when it has one
+(the tree that will exist after the merge must be consistent); otherwise the city's.
+Kill switch: `E12_COVERAGE_GATE=off` or the flag file
+`$GC_CITY_PATH/.gc/e12-coverage-gate.off` makes the step a loud no-op.
+
+```bash
+# SELFTEST-EXTRACT e12-coverage-step2d: BEGIN
+E12_COV_HQ="$WORKTREE_PATH/.gascity-gastown-hq"
+E12_COV_RE='^[.]gascity-gastown-hq/(agents/[^/]+/prompt[.]template[.]md|city[.]toml|packs/town-deltas/(template-fragments/town-deltas[.]template[.]md|assets/(e12-arms[.]sh|e12-crew-doctrine[.]sh|claude-overlays/pool-roles[.]json)))$'
+# vazio → nenhum arquivo do diff decide a cobertura = nada a rodar (passa); falhou/ilegível → o gerador sai 2 e o passo reprova (TEST_EXIT=2), nunca "cobertura ok"
+E12_COV_HIT=$(echo "$CHANGED_FILES" | grep -E "$E12_COV_RE" || true)
+if [ "${E12_COVERAGE_GATE:-}" = "off" ] || [ -f "$GC_CITY_PATH/.gc/e12-coverage-gate.off" ]; then
+  echo "NOTE: E12 coverage gate (ga-57e7l0) is switched OFF (E12_COVERAGE_GATE=off or .gc/e12-coverage-gate.off) -- not checked."
+elif [ -n "$E12_COV_HIT" ]; then
+  E12_COV_GEN="$E12_COV_HQ/packs/town-deltas/assets/e12-crew-doctrine.sh"
+  [ -f "$E12_COV_GEN" ] || E12_COV_GEN="$GC_CITY_PATH/packs/town-deltas/assets/e12-crew-doctrine.sh"
+  if [ ! -f "$E12_COV_GEN" ]; then
+    # Fail-soft, same convention as 2b/2c: a city snapshot that predates this story's own merge must not block on a check that cannot run yet.
+    echo "NOTE: e12-crew-doctrine.sh not found in the branch or the city -- E12 coverage skipped (pre-ga-57e7l0 city snapshot?)."
+  else
+    E12_COV_RC=0
+    E12_COV_OUT=""
+    for E12_COV_CMD in check coverage; do
+      E12_COV_ONE=$(E12_CREW_AGENTS_DIR="$E12_COV_HQ/agents" E12_FRAGMENT="$E12_COV_HQ/packs/town-deltas/template-fragments/town-deltas.template.md" E12_CITY_TOML="$E12_COV_HQ/city.toml" E12_ARMS="$E12_COV_HQ/packs/town-deltas/assets/e12-arms.sh" bash "$E12_COV_GEN" "$E12_COV_CMD" 2>&1)
+      E12_COV_ONE_RC=$?
+      echo "$E12_COV_ONE"
+      E12_COV_OUT="$E12_COV_OUT
+$E12_COV_ONE"
+      [ "$E12_COV_ONE_RC" -gt "$E12_COV_RC" ] && E12_COV_RC=$E12_COV_ONE_RC
+    done
+    if [ "$E12_COV_RC" -ne 0 ]; then
+      TEST_EXIT=$E12_COV_RC
+      TEST_OUTPUT="$TEST_OUTPUT
+
+E12 COVERAGE FAILED (ga-57e7l0, exit $E12_COV_RC: 1 = a gap, 2 = could not tell): a builder
+would be handed a bead without the write-time doctrine block, or the generated text
+is stale. To fix: edit the text in packs/town-deltas/assets/e12-arms.sh only, then
+run 'bash packs/town-deltas/assets/e12-crew-doctrine.sh write'; a new crew prompt
+that builds needs the marker pair and a place in E12_EXTRA_AGENTS in that script.
+$E12_COV_OUT"
+    fi
+  fi
+fi
+# SELFTEST-EXTRACT e12-coverage-step2d: END
+```
+
 **3. Handle test failure:**
 
 If `TEST_EXIT != 0`:

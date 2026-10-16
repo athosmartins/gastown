@@ -66,7 +66,7 @@ case "$rc" in
   1) fail "a crew prompt is STALE or has broken markers against e12_block_text — run 'bash $GEN write' and commit: $out" ;;
   *) fail "the crew-doctrine check could not tell (rc=$rc): $out" ;;
 esac
-log "e12-crew-doctrine.sh check: all six crew prompts carry a fresh render of e12_block_text ✓"
+log "e12-crew-doctrine.sh check: $out — the six crew prompts (and, since ga-57e7l0, every other target) carry a fresh render of e12_block_text ✓"
 
 # ── 3. each crew's template has exactly one begin and one end marker ──────────────────────────────────────────────
 for c in $CREWS; do

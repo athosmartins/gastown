@@ -12,7 +12,8 @@ marcador de uma linha; `grep -n 'td:' <este arquivo>` lista os pontos de entrada
 - Guardadas por papel (TD_ROLE; agente sem TD_ROLE recebe tudo): mockup-s3 · graph-v2-formulas ·
   engine-window-patch · nudge-permission-dialog · research-only-channels ·
   next-action-mayor-waiting · assignee-when-building · claudemd-carryover ·
-  dolt-cleanup-hazards · witness-startup
+  dolt-cleanup-hazards · e12-write-time-doctrine (GERADA por e12-crew-doctrine.sh a partir do e12_block_text; não edite o corpo à mão) ·
+  witness-startup
 */ -}}
 {{/* td:core:intro */ -}}
 ### Town Deltas (ADITIVO — não substitui operational-awareness nativo)
@@ -1046,6 +1047,15 @@ ninguém aplica.
 - **A contagem de órfãos do `gc dolt health` MENTE quando o `gc rig list` estoura os 5s** (leva 8-17s sob carga): todo banco de produção exceto `hq` (`whatsapp_automation`, `gastown`, `dc`, `lexbh`, `marketing`, `property_scrapers`) aparece como "órfão". Banco de produção nessa lista É o sintoma de sonda degradada, não de orfandade. Nunca aja só pela contagem: confira com `gc rig list --json | jq -r '.rigs[].path'` (sem limite de tempo).
 - **Porta e PID do Dolt: derive do processo vivo, nunca de arquivo ou doc** (o `~/gt/dolt-server.port` está velho): `source /Users/athos/gt/.gascity-gastown-hq/scripts/dolt-pid-lib.sh; dolt_server_pid` — verifica o executável `dolt` E um socket LISTEN; um `pgrep | head -1` pode devolver um processo-isca. O `data_dir` real está no `--config` do processo (`ps -o command= -p "$DOLT_PID"`).
 - **Nunca** apague nem edite nada dentro de um diretório `.dolt/` — inclusive `noms/LOCK` — nem faça `rm -rf` em diretório de dados do Dolt: corrompe o banco sem volta.
+
+{{ end -}}
+{{ if or (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:e12-write-time-doctrine */ -}}
+## Write-time doctrine — experiment E12 (ga-4q2zo5)
+- Why: in last week's gate reviews, 38% of the blocking findings were one mistake — a read that can come back empty or fail was handled as if both meant the same thing.
+- Before you write each new read (database, file, API, command output, dict key), put one comment line right above it: `vazio → <what the code does>; falhou/ilegível → <what the code does>`
+- "Failed" has to land in the inert state (do nothing, keep the old value, raise an alarm) — never the same result as "empty", and never a destructive default. If you cannot fill in both halves, decide first, then write the read.
+- A read that has not answered yet is a third state too (it showed up twice in UI slices this week): while it is pending, draw "Carregando…" — never the empty verdict ("Nada por aqui ainda.") — and put a timeout on the request that lands in the error state, so a read that never answers cannot leave "nobody" on the screen for good.
+- Before /gate-done, re-read every comment in your own diff and ask "does the code next to it do exactly this?" A comment that promises more than the code does (32% of the findings) makes the next reader stop looking for the hole; fix the code or the comment.
 
 {{ end -}}
 {{ if not .TD_ROLE -}}{{/* td:witness-startup */ -}}

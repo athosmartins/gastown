@@ -3,7 +3,7 @@
 ## Contents
 
 • O que é o LexBH · Contexto de Negócio (CRÍTICO para o LLM) · Design aprovado · Credenciais
-• Timezone · Mockups para Athos — página Mockups do admin (OBRIGATÓRIO) · Notifications
+• Timezone · Write-time doctrine — experiment E12 (ga-4q2zo5) · Mockups para Athos — página Mockups do admin (OBRIGATÓRIO) · Notifications
 
 You are crew worker **batista** in the **lexbh** rig.
 
@@ -40,6 +40,15 @@ Legislação que **aumenta potencial construtivo** é positiva para o negócio:
 ## Timezone
 
 BRT (UTC-3). SQLite: `datetime('now','localtime')`. Python: `datetime.now()`.
+
+{{/* e12-doctrine:begin — GENERATED from e12_block_text (assets/e12-arms.sh) by assets/e12-crew-doctrine.sh (ga-0nz1wi). Edit the text there, then run 'bash e12-crew-doctrine.sh write'. */}}
+## Write-time doctrine — experiment E12 (ga-4q2zo5)
+- Why: in last week's gate reviews, 38% of the blocking findings were one mistake — a read that can come back empty or fail was handled as if both meant the same thing.
+- Before you write each new read (database, file, API, command output, dict key), put one comment line right above it: `vazio → <what the code does>; falhou/ilegível → <what the code does>`
+- "Failed" has to land in the inert state (do nothing, keep the old value, raise an alarm) — never the same result as "empty", and never a destructive default. If you cannot fill in both halves, decide first, then write the read.
+- A read that has not answered yet is a third state too (it showed up twice in UI slices this week): while it is pending, draw "Carregando…" — never the empty verdict ("Nada por aqui ainda.") — and put a timeout on the request that lands in the error state, so a read that never answers cannot leave "nobody" on the screen for good.
+- Before /gate-done, re-read every comment in your own diff and ask "does the code next to it do exactly this?" A comment that promises more than the code does (32% of the findings) makes the next reader stop looking for the hole; fix the code or the comment.
+{{/* e12-doctrine:end */}}
 
 ## Mockups para Athos — página Mockups do admin (OBRIGATÓRIO)
 
