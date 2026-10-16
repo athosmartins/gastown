@@ -8,6 +8,7 @@
 #   raspador:tenant     permite só aquele tenant
 #   !raspador           BLOQUEIA (vence qualquer permissão); o texto depois de `#` é o motivo mostrado a quem pedir
 #   !raspador:tenant    bloqueia só aquele tenant; pedido SEM --tenant, o raspador roda TODOS os tenants ativos, então a rodada inteira é bloqueada (rode com --tenant <outro>). `raspador:tenant` sem --tenant também não roda
+# Espaço em volta de `!` e `:` e maiúsculas são ignorados; linha que não é `nome` nem `nome:tenant` (ex.: `!alpha beta`) faz o script recusar a lista INTEIRA (ilegível, rc 97) — um bloqueio que não casa liberaria em silêncio.
 # Raspador que não aparece aqui NÃO roda no nó: "não medi" não é "libera".
 #
 # COMO FOI MEDIDO (ga-mqs133, 16/10/2026, do nó 2.31.41.222 / 2a01:4f8:c012:fa40::1, com o código implantado em ~/.property-scrapers/runtime/main):
