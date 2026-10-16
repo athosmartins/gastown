@@ -139,7 +139,7 @@ s3_head() { # key
   local out rc
   out="$(s3api head-object --bucket "$BUCKET" --key "$1" --checksum-mode ENABLED --output json 2>&1)"; rc=$?
   if [ $rc -eq 0 ]; then printf '%s' "$out"; return 0; fi
-  case "$out" in *"Not Found"*|*"404"*|*NoSuchKey*) return 1 ;; esac
+  case "$out" in *"Not Found"*|*"(404)"*|*NoSuchKey*) return 1 ;; esac   # "404" solto casaria com qualquer erro que o cite (id de request, 403...)
   printf '%s' "$out" >&2; return 2
 }
 
@@ -197,6 +197,10 @@ fi
 mkdir -p "$STATE_DIR" || { echo "não criei $STATE_DIR" >&2; exit 2; }
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
   holder="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+  # sem pid ainda NÃO é dono morto: o outro run fez o mkdir e ainda não gravou o pid. Só reclama depois de 1 min.
+  if [ -z "$holder" ] && [ -z "$(find "$LOCKDIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+    log "lock sem pid e com menos de 1 min: outro run está começando; saindo"; exit 0
+  fi
   if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && [ -z "$(find "$LOCKDIR" -maxdepth 0 -mmin +"$LOCK_STALE_MIN" 2>/dev/null)" ]; then
     log "outro run em andamento (pid $holder); saindo"; exit 0
   fi
@@ -288,7 +292,8 @@ s3_put_verified "$(s3key_manifest "$STEM")" "$WD/manifest.json" "$MAN_SHA" appli
 jq -n --arg key "$ART" --arg mkey "$(s3key_manifest "$STEM")" --arg sha "$ART_SHA" --argjson bytes "$ART_BYTES" \
       --arg asof "$(jq -r '.data_as_of' "$WD/manifest.json")" --arg cap "$(jq -r '.captured_at' "$WD/manifest.json")" \
       --arg head "$SHA" --arg chk "$(iso_now)" --argjson db "$(jq -c '.databases | map_values(.issues)' "$WD/manifest.json")" \
-      '{schema:1, snapshot_key:$key, manifest_key:$mkey, sha256:$sha, bytes:$bytes, data_as_of:$asof, captured_at:$cap, checked_at:$chk, source_head:$head, issues_per_db:$db}' > "$WD/latest.json"
+      '{schema:1, snapshot_key:$key, manifest_key:$mkey, sha256:$sha, bytes:$bytes, data_as_of:$asof, captured_at:$cap, checked_at:$chk, source_head:$head, issues_per_db:$db}' > "$WD/latest.json" \
+  || fail "não montei latest.json (jq falhou): nada foi publicado como ponteiro"
 LSHA="$(python3 -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$WD/latest.json")"
 s3_put_verified "$(s3key_latest)" "$WD/latest.json" "$LSHA" application/json || fail "upload de latest.json não verificou"
 
@@ -298,18 +303,22 @@ DUR=$(( $(now_epoch) - START ))
 log "OK $STEM: $ART_BYTES bytes, $(jq -r '[.databases | to_entries[] | .value.issues] | add' "$WD/manifest.json") issues em $(jq -r '.databases | length' "$WD/manifest.json") bancos (ignorados: $(jq -r '.ignored_dbs | join(",") | if . == "" then "nenhum" else . end' "$WD/manifest.json")), ${DUR}s"
 
 # ── retenção (falha aqui é aviso: o snapshot novo já está seguro) ────────────────────────────────────
-if listing="$(s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PREFIX/snap/" --output json 2>>"$LOG")"; then
-  printf '%s' "$listing" | jq -r '.Contents[]?.Key' > "$WD/keys.txt" 2>/dev/null
-  python3 -I "$PY" retention --prefix "$PREFIX" --now "$(now_epoch)" --keep-recent-h "$KEEP_RECENT_H" --keep-daily-days "$KEEP_DAILY_DAYS" \
-    --floor "$KEEP_FLOOR" --protect "$ART" < "$WD/keys.txt" > "$WD/delete.txt" 2>>"$LOG" || : > "$WD/delete.txt"
-  ndel=0
-  while IFS= read -r k; do
-    [ -n "$k" ] || continue
-    if s3api delete-object --bucket "$BUCKET" --key "$k" >/dev/null 2>>"$LOG"; then ndel=$((ndel + 1)); else log "AVISO: não apaguei $k"; fi
-  done < "$WD/delete.txt"
-  log "retenção: $(wc -l < "$WD/keys.txt" | tr -d ' ') chaves, $ndel apagadas"
+# listagem que falhou OU veio ilegível => pula (nunca vira "0 chaves"); helper que falhou => pula, e não lê o delete.txt parcial dele.
+if listing="$(s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PREFIX/snap/" --output json 2>>"$LOG")" \
+   && printf '%s' "$listing" | jq -r '.Contents[]?.Key' > "$WD/keys.txt" 2>/dev/null; then
+  if python3 -I "$PY" retention --prefix "$PREFIX" --now "$(now_epoch)" --keep-recent-h "$KEEP_RECENT_H" --keep-daily-days "$KEEP_DAILY_DAYS" \
+       --floor "$KEEP_FLOOR" --protect "$ART" < "$WD/keys.txt" > "$WD/delete.txt" 2>>"$LOG"; then
+    ndel=0
+    while IFS= read -r k; do
+      [ -n "$k" ] || continue
+      if s3api delete-object --bucket "$BUCKET" --key "$k" >/dev/null 2>>"$LOG"; then ndel=$((ndel + 1)); else log "AVISO: não apaguei $k"; fi
+    done < "$WD/delete.txt"
+    log "retenção: $(wc -l < "$WD/keys.txt" | tr -d ' ') chaves, $ndel apagadas"
+  else
+    log "AVISO: retenção pulada (o helper falhou; nada apagado)"
+  fi
 else
-  log "AVISO: retenção pulada (list-objects-v2 falhou)"
+  log "AVISO: retenção pulada (list-objects-v2 falhou ou veio ilegível)"
 fi
 echo "RESULT: ok new key=$ART bytes=$ART_BYTES head_age_s=$HEAD_AGE dur_s=$DUR"
 exit 0

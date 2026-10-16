@@ -27,7 +27,8 @@ O RPO real é a idade do dump na captura + 60 min + a duração do run: pior cas
 - Alerta: no 2º run seguido sem snapshot novo o script manda `notify` ("Jsonl hourly offsite", prioridade 4), no máximo 1 a cada 6 h. Credencial do `aws`
   ausente no ambiente do order aparece assim, no 2º run: não inventar credencial, escalar para o Mayor.
 - Retenção (só `jsonl-hourly/snap/`, só no formato exato de chave): tudo das últimas 48 h, o primeiro snapshot de cada dia UTC por 14 dias, os 6 mais novos e o
-  apontado por `latest.json`.
+  apontado por `latest.json`. Se a listagem do S3 falha ou vem ilegível, ou o helper de retenção falha, o log traz `AVISO: retenção pulada (...)`, nada é apagado e o run
+  segue `rc 0` (o snapshot novo já está seguro): se o aviso se repetir por horas, a retenção não está rodando e o bucket só cresce.
 
 ## Custo
 ~98 MB gzip por snapshot (medido). Com a retenção acima são ~60 snapshots guardados, ordem de grandeza de 6 GB. `interval = "30m"` no order leva o pior caso

@@ -75,7 +75,7 @@ case "$op" in
     cp "$body" "$D/obj/$key"; printf '%s %s\n' "$(wc -c < "$body" | tr -d ' ')" "${cs:+$got}" > "$D/meta/$key"
     echo "$key" >> "$D/puts.log"; echo '{"ETag":"\"x\""}' ;;
   head-object)
-    injected fail_head_generic && { echo "An error occurred (403) when calling the HeadObject operation: Forbidden" >&2; exit 254; }
+    injected fail_head_generic && { echo "An error occurred (403) when calling the HeadObject operation: Forbidden (request id 4047QZ)" >&2; exit 254; }
     injected fail_head && { echo "Could not connect to the endpoint URL" >&2; exit 255; }
     [ -f "$D/obj/$key" ] || { echo "An error occurred (404) when calling the HeadObject operation: Not Found" >&2; exit 254; }
     read -r size sum < "$D/meta/$key" || true
@@ -88,6 +88,7 @@ case "$op" in
     cp "$D/obj/$key" "$outfile"; echo '{}' ;;
   list-objects-v2)
     injected fail_list && { echo "An error occurred (500) when calling the ListObjectsV2 operation: injected" >&2; exit 254; }
+    injected garbage_list && { echo "<html>not json</html>"; exit 0; }
     ( cd "$D/obj" && find . -type f 2>/dev/null | sed 's|^\./||' | sort ) | python3 -I -c '
 import json,sys
 p=sys.argv[1]; ks=[l.strip() for l in sys.stdin if l.strip().startswith(p)]
@@ -104,6 +105,16 @@ cat > "$WORK/bin/notify" <<'STUB'
 echo "$*" >> "${NOTIFY_LOG:?}"
 STUB
 chmod +x "$WORK/bin/notify"
+# helper embrulhado (JHO_PY): repassa tudo ao real; WRAP=db_string estraga .databases do manifest, WRAP=retention_fail derruba o `retention`
+cat > "$WORK/bin/wrap.py" <<WRAP
+import json, os, subprocess, sys
+REAL, mode = "$PYH", os.environ.get("WRAP", "")
+if mode == "retention_fail" and sys.argv[1] == "retention": sys.exit(1)
+if mode == "db_string" and sys.argv[1] == "manifest":
+    r = subprocess.run([sys.executable, "-I", REAL] + sys.argv[1:], capture_output=True)
+    m = json.loads(r.stdout); m["databases"] = "x"; sys.stdout.write(json.dumps(m)); sys.stderr.buffer.write(r.stderr); sys.exit(r.returncode)
+os.execv(sys.executable, [sys.executable, "-I", REAL] + sys.argv[1:])
+WRAP
 
 # ── helpers de cenário ─────────────────────────────────────────────────────────────────────────
 T0="$(date +%s)"
@@ -352,6 +363,11 @@ kill "$BG_PID" 2>/dev/null; wait "$BG_PID" 2>/dev/null; BG_PID=""
 offsite
 eq "lock de dono morto: reclamado, run completa" "$RC:$(count_objs '\.tar\.gz$')" "0:1"
 [ ! -d "$S/state/jsonl-hourly-offsite.lock.d" ] && ok "lock removido no fim" || bad "lock ficou"
+new_env lockpid; mkdir -p "$S/state/jsonl-hourly-offsite.lock.d"
+offsite
+eq "lock SEM pid e recém-criado (o outro run ainda está começando): rc 0, nada enviado, lock intacto" "$RC:$([ -e "$S/bucket/calls.log" ] && echo called || echo none):$([ -d "$S/state/jsonl-hourly-offsite.lock.d" ] && echo kept || echo gone)" "0:none:kept"
+touch -t 202001010000 "$S/state/jsonl-hourly-offsite.lock.d"; offsite
+eq "lock sem pid e velho (mais de 1 min): reclamado, run completa" "$RC:$(count_objs '\.tar\.gz$')" "0:1"
 
 # ── 11. alerta ──────────────────────────────────────────────────────────────────────────────────
 echo "-- 11. alerta por falhas seguidas"
@@ -417,6 +433,17 @@ new_env retdel; seed_stems; inject fail_delete
 offsite
 eq "delete falha: o run continua OK (rc 0), com aviso por chave" "$RC:$(grep -c 'não apaguei' "$S/log/offsite.log" | awk '{print ($1>0)?"warned":"silent"}')" "0:warned"
 clear_inject fail_delete
+new_env retjunk; seed_stems; inject garbage_list
+offsite
+eq "listagem ILEGÍVEL (não só falha): rc 0, nada apagado, e o log diz que pulou (não '0 chaves')" "$RC:$([ -e "$S/bucket/deletes.log" ] && echo deleted || echo none):$(grep -c 'retenção pulada' "$S/log/offsite.log"):$(grep -c 'retenção: ' "$S/log/offsite.log")" "0:none:1:0"
+clear_inject garbage_list
+new_env rethelp; seed_stems
+WRAP=retention_fail JHO_PY="$WORK/bin/wrap.py" offsite
+eq "helper de retenção falha: rc 0, nada apagado, e o log diz que pulou (não '0 apagadas')" "$RC:$([ -e "$S/bucket/deletes.log" ] && echo deleted || echo none):$(grep -c 'o helper falhou' "$S/log/offsite.log"):$(grep -c 'retenção: ' "$S/log/offsite.log")" "0:none:1:0"
+new_env nolatest
+WRAP=db_string JHO_PY="$WORK/bin/wrap.py" offsite
+eq "latest.json que não monta: rc 1 e nenhum latest.json no bucket (nem um vazio)" "$RC:$([ -e "$(LATEST)" ] && echo has || echo none)" "1:none"
+case "$OUT" in "RESULT: fail não montei latest.json"*) ok "e o RESULT diz que não montou" ;; *) bad "esperava 'fail não montei latest.json' (obtido: $OUT)" ;; esac
 
 # ── 13. --status ─────────────────────────────────────────────────────────────────────────────────
 echo "-- 13. --status"
