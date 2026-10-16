@@ -69,6 +69,8 @@ while [ $# -gt 0 ]; do case $1 in -o) shift 2;; -*) shift;; *) break;; esac; don
 shift   # o host
 cmd="$*"
 if [ -n "${FAKE_SSH_DROP_POLL:-}" ]; then case $cmd in "cat gt-remote/scrape/runs/"*) exit 255;; esac; fi
+if [ -n "${FAKE_SSH_DROP_LAUNCH:-}" ]; then case $cmd in "bash -s -- gt-remote/scrape/runs/"*) exit 255;; esac; fi
+if [ -n "${FAKE_RC_GARBAGE:-}" ]; then case $cmd in "cat gt-remote/scrape/runs/"*) cd "$FAKE_NODEHOME" && o=$(bash -c "$cmd"); case $o in END) echo END;; *) printf 'lixo\nEND\n';; esac; exit 0;; esac; fi   # lixo só DEPOIS de o rc de verdade existir
 cd "$FAKE_NODEHOME" || exit 255
 exec env HOME="$FAKE_NODEHOME" PATH="$FAKE_ROOT/nodebin:$PATH" bash -c "$cmd"
 EOF
@@ -132,10 +134,11 @@ export PATH="$T/minibin:$PATH"
 unset FAKE_SSH_DOWN FAKE_SSH_DROP_POLL FAKE_TIMEOUT FAKE_FREE_MB FAKE_SCRAPER_RC HETZNER_SCRAPE_STAGE HETZNER_NODE_HOST
 : > "$T/ssh.calls"
 
-OUT=""; RC=0
-hsr() { # hsr [VAR=val ...] -- args...  : roda o script sob /bin/bash (3.2 no macOS); saída + stderr em $OUT, rc em $RC
-  local envs=(); while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done; [ "${1:-}" = -- ] && shift
-  OUT=$(env TMPDIR="$T/tmp" "${envs[@]+"${envs[@]}"}" /bin/bash "$SCRIPT" "$@" 2>&1); RC=$?
+OUT=""; RC=0; CAP_S=""
+hsr() { # hsr [VAR=val ...] -- args...  : roda o script sob /bin/bash (3.2 no macOS) a partir de uma pasta descartável; saída + stderr em $OUT, rc em $RC. CAP_S=N mata a chamada após N s (rc 142): um laço que gira não trava o selftest
+  local envs=() cap=(); while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done; [ "${1:-}" = -- ] && shift
+  [ -z "$CAP_S" ] || cap=(perl -e 'alarm shift; exec @ARGV' "$CAP_S")
+  OUT=$(cd "$T/home" && env TMPDIR="$T/tmp" "${envs[@]+"${envs[@]}"}" "${cap[@]+"${cap[@]}"}" /bin/bash "$SCRIPT" "$@" 2>&1); RC=$?
 }
 ncalls() { wc -l < "$T/ssh.calls" | tr -d ' '; }
 tree_sum() { (cd "$1" && find . -type f | sort | while read -r f; do printf '%s ' "$f"; cksum < "$f"; done) | cksum; }
@@ -169,6 +172,8 @@ hsr FAKE_FREE_MB=100 -- check;        check "check: disco do nó abaixo do míni
 mv "$NODEHOME/gt-remote/scrape/env/libpath.txt" "$T/libpath.keep"
 hsr -- check;                         check "check: ambiente sem libpath -> rc 98 e manda rodar bootstrap" '[ $RC -eq 98 ] && has "node_env=missing" && has "bootstrap"'
 mv "$T/libpath.keep" "$NODEHOME/gt-remote/scrape/env/libpath.txt"
+hsr HETZNER_SCRAPE_CODE="$T/nao-existe" -- check;      check "check: código do rig ausente -> 97, não 'pronto' (o run recusaria)" '[ $RC -eq 97 ] && has "^code_dir=ausente$" && has "código do rig ausente"'
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/nao-existe" -- check;  check "check: lista de elegíveis ilegível -> 97, não 'pronto'" '[ $RC -eq 97 ] && has "^eligible_entries=0$" && has "ilegível"'
 
 # ---------- 4. run: recusas (nenhuma toca o nó) ----------
 C0=$(ncalls)
@@ -179,6 +184,13 @@ hsr -- run alpha --tenant 'x y';      check "run: tenant com espaço -> 97" '[ $
 hsr -- run alpha --limit abc;         check "run: --limit não numérico -> 97" '[ $RC -eq 97 ]'
 hsr -- run alpha --timeout 0;         check "run: --timeout 0 -> 97" '[ $RC -eq 97 ]'
 hsr -- run alpha --bogus;             check "run: argumento desconhecido -> 97" '[ $RC -eq 97 ] && has "desconhecido"'
+# opção sem valor: `shift 2` com um só argumento falhava e o laço girava para sempre (teto de 5 s: rc 142 = ficou girando)
+CAP_S=5
+for o in --tenant --limit --timeout --stage; do hsr -- run alpha $o; check "run: $o sem valor -> 97, não fica girando" '[ $RC -eq 97 ] && has "$o precisa de um valor"'; done
+hsr -- run alpha --tenant --limit 5;  check "run: opção seguida de outra opção (valor engolido) -> 97" '[ $RC -eq 97 ] && has "--tenant precisa de um valor"'
+hsr -- run alpha --stage "";          check "run: --stage vazio -> 97, não vira a pasta atual" '[ $RC -eq 97 ] && [ "$(ncalls)" = "$C0" ]'
+hsr -- probe --out;                   check "probe: --out sem valor -> 97, não fica girando" '[ $RC -eq 97 ] && has "--out precisa de um valor"'
+CAP_S=""
 B0=$(tree_sum "$SHARED")
 hsr -- run alpha --stage "$SHARED/data/stage-aqui"; check "run: staging dentro de shared/ (produção) -> 97 e nada criado lá" '[ $RC -eq 97 ] && has "produção" && [ ! -e "$SHARED/data/stage-aqui" ] && [ "$(ncalls)" = "$C0" ]'
 mkdir -p "$T/linkdest"; ln -s "$SHARED" "$T/linkdest/lk"
@@ -211,6 +223,13 @@ hsr -- run alpha --stage "$T/stage2"; check "run sem --tenant/--limit também fu
 # ---------- 6. run: código de saída do raspador ----------
 hsr FAKE_SCRAPER_RC=3 -- run alpha --stage "$T/stage3"
 check "run: rc do raspador (3) é propagado e o resultado ainda volta" '[ $RC -eq 3 ] && ls "$T"/stage3/alpha-*/shared/data/alpha/*/a.json >/dev/null 2>&1'
+check "run: rc 3 do raspador -> o log diz rc-3, nunca 'ok'" 'tail -n 1 "$CITY/.gc/logs/hetzner-scrape.jsonl" | grep -q "\"rc\":3,.*\"why\":\"rc-3\""'
+hsr FAKE_SCRAPER_RC=95 -- run alpha --stage "$T/stage4a"
+check "run: rc 95 do próprio raspador também sai 95 e COM scraper_rc_raw=95 (quem chama distingue do remapeado)" '[ $RC -eq 95 ] && has "^scraper_rc_raw=95$"'
+hsr FAKE_RC_GARBAGE=1 -- run alpha --stage "$T/stage4b"
+check "run: rc ilegível no nó -> 95 com scraper_rc_raw=ilegivel (nunca 97, de uso errado) e o resultado volta" '[ $RC -eq 95 ] && has "^scraper_rc_raw=ilegivel$" && has "^files=1$" && tail -n 1 "$CITY/.gc/logs/hetzner-scrape.jsonl" | grep -q "\"why\":\"rc-cru-ilegivel\""'
+hsr -- run alpha --timeout 08 --stage "$T/stage4c"
+check "run: --timeout com zero à esquerda (08) não é lido como octal: a rodada termina, rc 0" '[ $RC -eq 0 ] && has "^files=1$"'
 hsr FAKE_SCRAPER_RC=99 -- run alpha --stage "$T/stage4"
 check "run: rc 99 do raspador NUNCA vira 'rode local': sai 95 e o valor cru vai em scraper_rc_raw" '[ $RC -eq 95 ] && has "^scraper_rc_raw=99$"'
 hsr FAKE_TIMEOUT=1 -- run alpha --stage "$T/stage5"
@@ -235,6 +254,9 @@ hsr FAKE_SCRAPER_EMPTY=1 -- run alpha --stage "$T/stage9"
 check "run: sem estado -> AVISO de que o raspador começa sem seen (e nenhum estado foi enviado)" '[ $RC -eq 0 ] && has "AVISO: nenhum arquivo de estado" && ! has "estado \\(seen/caches\\) enviado ao nó"'
 check "run: rc 0 com zero arquivos devolvidos -> files=0 e o log diz ok-sem-arquivos (não 'ok')" 'has "^files=0$" && grep -q "\"why\":\"ok-sem-arquivos\"" "$CITY/.gc/logs/hetzner-scrape.jsonl" && ! grep -q "\"why\":\"ok\"" "$CITY/.gc/logs/hetzner-scrape.jsonl"'
 mv "$T/seen_alpha.mv" "$SHARED/config/seen_alpha.json"; mv "$T/alpha_cache.mv" "$SHARED/config/alpha_listing_cache.json"
+hsr FAKE_SSH_DROP_LAUNCH=1 -- run alpha --stage "$T/stage6c"
+check "run: ssh que cai ao disparar -> 98 avisando que a rodada PODE ter começado no nó, e o log diz disparo-incerto" '[ $RC -eq 98 ] && has "PODE ter começado" && tail -n 1 "$CITY/.gc/logs/hetzner-scrape.jsonl" | grep -q "\"why\":\"disparo-incerto\""'
+find "$NODEHOME/gt-remote/scrape/runs" -mindepth 1 -delete 2>/dev/null
 hsr FAKE_SSH_DROP_POLL=1 -- run alpha --stage "$T/stage7"
 check "run: ssh que cai nas consultas -> desiste com 98 e deixa a pasta no nó" '[ $RC -eq 98 ] && has "desisto" && [ -n "$(ls -A "$NODEHOME/gt-remote/scrape/runs")" ]'
 sleep 1; find "$NODEHOME/gt-remote/scrape/runs" -mindepth 1 -delete 2>/dev/null
@@ -252,6 +274,7 @@ check "probe: desafio de verdade num 200 só do nó -> SO-O-NO-BLOQUEIA" 'has "S
 check "probe: marca diferente num 200 e sem desafio duro -> DIFERE-VERIFICAR (um humano olha)" 'has "DIFERE-VERIFICAR.*site-c.example"'
 check "probe: 403 dos dois lados -> IGUAL-FALHA; mini falha e nó responde -> SO-O-MINI-FALHA" 'has "IGUAL-FALHA.*site-d.example" && has "SO-O-MINI-FALHA.*site-e.example"'
 check "probe: tenant inativo não é medido; --out grava a tabela; jsonl ganha a linha do probe" '! has "t2.example" && grep -q "site-a.example" "$T/probe.out" && grep -q "\"scraper\":\"probe\"" "$CITY/.gc/logs/hetzner-scrape.jsonl"'
+hsr -- probe --out "$T/sem-pasta/x.out"; check "probe: --out que não dá para gravar -> 97 (a tabela ainda sai no stdout)" '[ $RC -eq 97 ] && has "não consegui gravar --out" && has "IGUAL-OK"'
 hsr FAKE_SSH_DOWN=1 -- probe;         check "probe: nó fora -> rc 98" '[ $RC -eq 98 ]'
 rm -f "$CITY/.gc/hetzner-node.on"
 hsr -- probe;                         check "probe: sem a bandeira -> rc 99" '[ $RC -eq 99 ]'

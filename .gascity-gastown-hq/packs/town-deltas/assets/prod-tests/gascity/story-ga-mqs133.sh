@@ -28,7 +28,8 @@ log()  { echo "[prod-test:gascity ga-mqs133] $*"; }
 warn() { echo "[prod-test:gascity ga-mqs133] AVISO: $*"; }
 fail() { echo "[prod-test:gascity ga-mqs133] FAIL: $*" >&2; exit 1; }
 [[ -x "$BASH32" ]] || fail "$BASH32 não executa — não dá para checar a sintaxe no interpretador de verdade"
-tmpdir() { local d; d="$(mktemp -d "${TMPDIR:-/tmp}/mqs133-prod.XXXXXX")"; TMPS+=("$d"); printf '%s' "$d"; }
+# tmpdir: deixa a pasta em $TMPD e a registra para o cleanup. NÃO chamar dentro de $(...): o subshell perderia o TMPS+= e a pasta nunca seria apagada. mktemp que falha = FAIL (nunca um caminho vazio)
+tmpdir() { TMPD="$(mktemp -d "${TMPDIR:-/tmp}/mqs133-prod.XXXXXX")" && [[ -n "$TMPD" ]] || fail "mktemp -d falhou: sem pasta temporária"; TMPS+=("$TMPD"); }
 need() { local f; for f in "$@"; do [[ -f "$f" ]] || fail "arquivo implantado ausente: $f"; done; }
 syntax() { local f; for f in "$@"; do "$BASH32" -n "$f" || fail "$f não parseia sob $BASH32"; done; }
 # run_suite <rótulo> <mínimo de casos> <comando...>: o selftest tem de terminar com a linha "N/N ok" (todos ok) e o mínimo de casos
@@ -83,7 +84,7 @@ run_suite "selftest da rodada de raspadores no nó" 40 timeout 600 "$BASH32" "$S
 rc=0; chk="$("$BASH32" "$RUN" check 2>&1)" || rc=$?
 case "$rc" in
   0)
-    stage="$(tmpdir)"; mark="$stage/.marco"; : > "$mark"
+    tmpdir; stage="$TMPD"; mark="$stage/.marco"; : > "$mark"
     out="$(HETZNER_SCRAPE_POLL_S=5 timeout 900 "$BASH32" "$RUN" run primeimoveisdeluxo --limit 3 --timeout 600 --stage "$stage" 2>&1)"; rrc=$?
     case "$rrc" in
       0)
@@ -107,7 +108,7 @@ $hit"
       *) fail "a rodada viva no nó terminou com rc $rrc (esperado 0):
 $(printf '%s\n' "$out" | tail -n 15)";;
     esac;;
-  98|99) warn "o nó não está disponível/pronto (rc $rc: $(printf '%s\n' "$chk" | tail -n 1)) — checks vivos do servidor pulados (o mini roda a rodada)";;
+  97|98|99) warn "o nó não está disponível/pronto (rc $rc: $(printf '%s\n' "$chk" | tail -n 1)) — checks vivos do servidor pulados (o mini roda a rodada)";;
   *) fail "hetzner-scrape-round.sh check saiu com rc inesperado $rc:
 $chk";;
 esac
