@@ -64,6 +64,14 @@ done
 # 6. Os dois bounds do confirm nao podem discordar: o connect_timeout interno
 #    tem de acompanhar o SERVE_CONFIRM_TIMEOUT externo, senao o externo e enfeite.
 SRC="$(dirname "$0")/dolt-hang-watchdog.sh"
+# ga-fzt548: the live counters moved from /tmp to <city>/.gc/runtime. The "no-override" dry-run
+# guards below must watch the files the production watchdog ACTUALLY reads; pointing them at the
+# old /tmp names would keep them green forever while guarding nothing. Derived from the script
+# under test (not hardcoded) so they follow it; an empty derivation fails loudly, never silently.
+_REAL_CITY=$(sed -n 's/^CITY="\(.*\)"$/\1/p' "$SRC" 2>/dev/null | head -1)
+_REAL_RT="${_REAL_CITY:+$_REAL_CITY/.gc/runtime}"
+[ -n "$_REAL_RT" ] && ok "state dir derived from the script under test ($_REAL_RT)" \
+                   || bad "ga-fzt548: could not derive the live state dir from CITY= in the script -- the no-override guards would watch nothing"
 if [ -f "$SRC" ]; then
   grep -q 'connect_timeout=int(sys.argv\[2\])' "$SRC" \
     && ok "connect_timeout deriva do SERVE_CONFIRM_TIMEOUT (nao mais fixo em 8)" \
@@ -131,7 +139,7 @@ if [ -f "$SRC" ]; then
   # patched here alone — DOLT_WATCHDOG_CPU_PID=$$ points dolt_cpu_pct() at THIS
   # selftest's own PID, always alive for the duration of the call, so `ps` always
   # returns a real (if near-zero) reading independent of whether Dolt is running.
-  _real_veto="/tmp/dolt-hang-watchdog.cpuveto"
+  _real_veto="$_REAL_RT/dolt-hang-watchdog.cpuveto"
   _had=$([ -f "$_real_veto" ] && cat "$_real_veto" 2>/dev/null || echo "__ausente__")
   _tmpd=$(mktemp -d)
   env DOLT_WATCHDOG_DRY_RUN=1 DOLT_WATCHDOG_MAX_STRIKES=1 \
@@ -190,7 +198,7 @@ exit 1
 FAKE
   chmod +x "$_tmpd2/bin/gc"
 
-  _real_strikes="/tmp/dolt-hang-watchdog.strikes"
+  _real_strikes="$_REAL_RT/dolt-hang-watchdog.strikes"
   _snap=$([ -f "$_real_strikes" ] && cat "$_real_strikes" 2>/dev/null || echo "__ausente__")
   _restore_real_strikes() {
     if [ "$_snap" = "__ausente__" ]; then rm -f "$_real_strikes"; else echo "$_snap" > "$_real_strikes"; fi
@@ -209,7 +217,7 @@ FAKE
   _now=$([ -f "$_real_strikes" ] && cat "$_real_strikes" 2>/dev/null || echo "__ausente__")
   [ "$_snap" = "$_now" ] && ok "dry run confirmado (sem override de STRIKES_FILE) NAO tocou o contador real ($_snap)" \
                          || bad "ga-153cq regressao: dry run avancou o contador REAL de strikes de producao ($_snap -> $_now)"
-  grep -qE 'DRY-RUN: would (advance strike counter|kill -QUIT)' "$_tmpd2/l" 2>/dev/null \
+  grep -qE 'DRY-RUN: would (advance strike counter|run .gc dolt restart.|HOLD|REFUSE)' "$_tmpd2/l" 2>/dev/null \
     && ok "dry run REPORTA a simulacao de strike (nao ficou mudo)" \
     || bad "dry run nao reportou nada sobre o strike simulado — perde o valor de diagnostico"
   _restore_real_strikes
@@ -294,7 +302,7 @@ fi
 # resetting the consecutive-strike progress of a genuinely failing Dolt. Listing the
 # two overrides at each call site is how six call sites forgot them, so there is now
 # exactly ONE way to run the script in this block -- _wd() -- and it always sets every
-# scratch path (LOG, STRIKES, CPU_VETO, LASTPID, DEATH_LOG_DIR). Extra env goes in as
+# scratch path (LOG, STRIKES, CPU_VETO, RESTART_STATE, ESCALATE_STAMP, LASTPID, DEATH_LOG_DIR). Extra env goes in as
 # arguments. Nothing in this block may call `bash "$SRC"` any other way.
 #
 # The fake `log` is installed FROM THE START, not only where a case needs to control
@@ -375,6 +383,7 @@ FAKE
     env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
         DOLT_WATCHDOG_STRIKES_FILE="$_tmpd4/s" DOLT_WATCHDOG_CPU_VETO_FILE="$_tmpd4/v" \
         DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
+        DOLT_WATCHDOG_RESTART_STATE_FILE="$_tmpd4/r" DOLT_WATCHDOG_ESCALATE_STAMP_FILE="$_tmpd4/e" \
         FAKE_LOG_CALLS="$_tmpd4/logcalls" \
         "$@" bash "$SRC" >/dev/null 2>&1
   }
@@ -776,6 +785,300 @@ if [ -f "$SRC" ]; then
   fi
 else
   bad "nao achei o script ao lado — asserts do ga-wxwao nao rodaram"
+fi
+
+# ── ga-fzt548: o watchdog nao manda mais kill -QUIT, e um hang confirmado reinicia o Dolt
+# UMA vez por janela de backoff. Em 24/09 (log do proprio watchdog) ele tentou 6x em 16 min,
+# uma a cada ~3 min: o Dolt estava fora por disco cheio e o engine RECUSOU cada restart
+# (ENOSPC), entao cada ciclo era 3 strikes -> restart recusado -> 'STILL unhealthy' -> page
+# novo, sem fim. O caso A abaixo reproduz exatamente isso (restart que nao recupera).
+#
+# Os casos dinamicos abaixo rodam o script de verdade (caminho NAO-dry-run) contra um `gc`
+# falso. Isso so e seguro porque o ramo de restart nao assina mais sinal nenhum — era por
+# isso que o bloco ga-wxwao acima dizia "nao ha jeito seguro de exercitar este ramo".
+# Mesmo assim: um `pgrep` falso + GC_CITY de scratch fazem qualquer resolucao acidental de
+# PID voltar VAZIA, entao nem uma regressao futura consegue sinalizar o Dolt de producao
+# deste host. O "Dolt" sinalizavel aqui e um processo sacrificial que registra o SIGQUIT. ──
+echo
+echo "ga-fzt548: restart sem kill -QUIT, com backoff e escalada (o laco de 24/09)"
+if [ -f "$SRC" ]; then
+  # (a) drift-guards estaticos --------------------------------------------------------
+  _blk=$(awk '/^if \[ "\$DOLT_DUMP" = "1" \]; then$/{b=1} b{print} b && /^fi$/{b=0}' "$SRC")
+  _rest=$(awk '/^if \[ "\$DOLT_DUMP" = "1" \]; then$/{b=1} !b{print} b && /^fi$/{b=0}' "$SRC" | grep -v '^[[:space:]]*#')
+  if printf '%s' "$_blk" | grep -q 'kill -QUIT "\$PID"'; then
+    ok "o unico kill -QUIT que sobrou vive DENTRO do bloco opt-in DOLT_DUMP=1"
+  else
+    bad "ga-fzt548: nao achei o kill -QUIT dentro do bloco DOLT_DUMP=1 (o dump opt-in sumiu, ou o bloco mudou de forma)"
+  fi
+  if printf '%s\n' "$_rest" | grep -q 'kill -QUIT\|kill -9\|kill -KILL\|kill -TERM\|kill -SIGQUIT'; then
+    bad "ga-fzt548 regressao: ha sinal pro Dolt FORA do bloco DOLT_DUMP=1: $(printf '%s\n' "$_rest" | grep -n 'kill -QUIT\|kill -9\|kill -KILL\|kill -TERM' | head -2 | tr '\n' ' ')"
+  else
+    ok "nenhum sinal pro Dolt fora do bloco opt-in (o restart e so 'gc dolt restart')"
+  fi
+  grep -q '^DOLT_DUMP="${DOLT_DUMP:-0}"' "$SRC" && ok "DOLT_DUMP e DESLIGADO por padrao" \
+                                                 || bad "ga-fzt548: DOLT_DUMP nao tem default 0 — o dump com SIGQUIT viraria padrao"
+  if grep -E '^(STRIKES|CPU_VETO_FILE|RESTART_STATE|ESCALATE_STAMP)=' "$SRC" | grep -q '/tmp'; then
+    bad "ga-fzt548 regressao: estado que DECIDE restart voltou pra /tmp (apagado no reboot e pelo faxineiro do SO)"
+  else
+    ok "strikes / veto / historico de restart / selo de escalada moram em .gc/runtime, nao em /tmp"
+  fi
+  grep -q 'DOLT_WATCHDOG_RESTART_BACKOFF_MIN:-1800' "$SRC" && ok "piso do backoff e 1800 s (30 min)" \
+                                                           || bad "ga-fzt548: o piso do backoff nao e 1800 s"
+
+  # (b) a agenda do backoff, extraida do codigo real ---------------------------------
+  _sched=$( RESTART_BACKOFF_MIN=1800 RESTART_BACKOFF_MAX=21600
+            eval "$(sed -n '/^restart_backoff_for() {/,/^}/p' "$SRC")"
+            for _k in 1 2 3 4 5 6 20; do printf '%s ' "$(restart_backoff_for "$_k")"; done )
+  [ "$_sched" = "1800 3600 7200 14400 21600 21600 21600 " ] \
+    && ok "agenda do backoff: 30m, 1h, 2h, 4h, 6h e para (teto) — got: $_sched" \
+    || bad "ga-fzt548: agenda do backoff errada: '$_sched'"
+  _floor=$( RESTART_BACKOFF_MIN=1800 RESTART_BACKOFF_MAX=600
+            eval "$(sed -n '/^restart_backoff_for() {/,/^}/p' "$SRC")"
+            printf '%s %s' "$(restart_backoff_for 1)" "$(restart_backoff_for 4)" )
+  [ "$_floor" = "1800 1800" ] && ok "teto mal configurado (< piso) nunca baixa o intervalo abaixo de 30 min" \
+                              || bad "ga-fzt548: com MAX < MIN o intervalo caiu abaixo do piso: '$_floor'"
+
+  # (c) hang simulado, ponta a ponta -------------------------------------------------
+  _sd=$(mktemp -d)
+  mkdir -p "$_sd/bin" "$_sd/state" "$_sd/ledger" "$_sd/gc_city"
+  cat > "$_sd/bin/gc" <<'FAKE'
+#!/usr/bin/env bash
+# `gc` falso. Estado em $FAKE_DIR: `health` (up|down) e `after_restart` (o que `dolt restart` deixa).
+D="$FAKE_DIR"
+case "${1:-} ${2:-}" in
+  "dolt health")
+    if [ "$(cat "$D/health" 2>/dev/null)" = up ]; then echo '{"server":{"reachable":true}}'
+    else echo '{"server":{"reachable":false}}'; fi
+    exit 0 ;;
+  "dolt restart")
+    echo $(( $(cat "$D/restarts" 2>/dev/null || echo 0) + 1 )) > "$D/restarts"   # conta TENTATIVAS, recusadas ou nao
+    if [ -e "$D/refuse" ]; then   # o que o engine disse em 24/09, palavra por palavra
+      echo "gc dolt restart: recent Dolt log shows ENOSPC; refusing restart because it can amplify recovery writes" >&2
+      exit 1
+    fi
+    cat "$D/after_restart" > "$D/health" 2>/dev/null
+    exit 0 ;;
+esac
+exit 1
+FAKE
+  printf '#!/usr/bin/env bash\necho "$*" >> "$FAKE_DIR/notify.log"\nexit 0\n' > "$_sd/bin/notify"
+  # pgrep falso: toda resolucao de PID por varredura volta VAZIA (nunca o Dolt de producao).
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$_sd/bin/pgrep"
+  # ps/lsof falsos: so atestam que o PID SACRIFICIAL "e o dolt" e "esta em LISTEN" — as duas
+  # verificacoes que o dolt_server_pid real faz. Assim o script acha o "Dolt" pelo CAMINHO DE
+  # PRODUCAO (pidfile em $GC_CITY) e nao por um seam de teste: um sinal mandado por ele, em
+  # qualquer forma (kill -QUIT, pkill, kill -3), cai no sacrificial e o teste ve. Todo outro
+  # PID passa direto pro ps/lsof reais, entao o Dolt de verdade nunca e atestado.
+  cat > "$_sd/bin/ps" <<'FAKE'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-o" ] && [ "${2:-}" = "comm=" ] && [ "${3:-}" = "-p" ] && [ "${4:-}" = "$FAKE_DOLT_PID" ]; then echo dolt; exit 0; fi
+exec /bin/ps "$@"
+FAKE
+  cat > "$_sd/bin/lsof" <<'FAKE'
+#!/usr/bin/env bash
+case " $* " in *" -p $FAKE_DOLT_PID "*) exit 0 ;; esac
+exec /usr/sbin/lsof "$@"
+FAKE
+  # python3 falso: igual ao real, EXCETO que a chamada ao escalate_emergency.py falha enquanto
+  # existir $FAKE_DIR/escalate_fail (o push que nao saiu: o script real sai 1 nesse caso).
+  _real_py=$(command -v python3)
+  cat > "$_sd/bin/python3" <<FAKE
+#!/usr/bin/env bash
+case "\$*" in *escalate_emergency.py*) [ -e "\$FAKE_DIR/escalate_fail" ] && exit 1 ;; esac
+exec "$_real_py" "\$@"
+FAKE
+  chmod +x "$_sd/bin/gc" "$_sd/bin/notify" "$_sd/bin/pgrep" "$_sd/bin/ps" "$_sd/bin/lsof" "$_sd/bin/python3"
+
+  # O "Dolt" sinalizavel: um processo sacrificial que registra o SIGQUIT (nao da pra usar
+  # `sleep &`: job em background de shell nao-interativo ignora SIGQUIT desde a entrada).
+  cat > "$_sd/fakedolt.py" <<'PYF'
+import signal, sys, time
+marker = sys.argv[1]
+def on_quit(*_):
+    open(marker, "w").write("QUIT\n")
+    sys.exit(0)
+signal.signal(signal.SIGQUIT, on_quit)
+open(marker + ".ready", "w").write("1")
+while True:
+    time.sleep(1)
+PYF
+  python3 "$_sd/fakedolt.py" "$_sd/got_quit" >/dev/null 2>&1 &
+  _dpid=$!
+  for _i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$_sd/got_quit.ready" ] && break; sleep 0.5; done
+  _pidfile="$_sd/gc_city/.gc/runtime/packs/dolt/dolt.pid"
+  mkdir -p "$(dirname "$_pidfile")"; echo "$_dpid" > "$_pidfile"
+  _cleanup_sim() { kill -9 "$_dpid" 2>/dev/null; wait "$_dpid" 2>/dev/null; chmod -R u+rwx "$_sd" 2>/dev/null; rm -rf "$_sd"; }
+  trap _cleanup_sim EXIT
+
+  # THE one way to run the script in this block. Todo caminho de estado e escalada e scratch.
+  _sim() {
+    env PATH="$_sd/bin:$PATH" FAKE_DIR="$_sd" FAKE_DOLT_PID="$_dpid" GC_CITY="$_sd/gc_city" \
+        DOLT_WATCHDOG_LOG="$_sd/l" DOLT_WATCHDOG_STATE_DIR="$_sd/state" \
+        DOLT_WATCHDOG_STRIKES_FILE="$_sd/state/s" DOLT_WATCHDOG_CPU_VETO_FILE="$_sd/state/v" \
+        DOLT_WATCHDOG_RESTART_STATE_FILE="$_sd/state/r" DOLT_WATCHDOG_ESCALATE_STAMP_FILE="$_sd/state/e" \
+        DOLT_WATCHDOG_LASTPID_FILE="$_sd/lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_sd/deaths" \
+        DOLT_WATCHDOG_CPU_PID="$_dpid" \
+        DOLT_WATCHDOG_MAX_STRIKES=1 DOLT_WATCHDOG_PROBE_TIMEOUT=5 DOLT_WATCHDOG_SERVE_CONFIRM=2 \
+        BEADS_DOLT_PORT=1 DOLT_WATCHDOG_POST_RESTART_WAIT=0 \
+        ESCALATE_DRY_RUN=1 GC_LEDGER_DIR="$_sd/ledger" \
+        "$@" bash "$SRC" >/dev/null 2>&1
+  }
+  _reset()    { chmod -R u+rwx "$_sd/state" 2>/dev/null; rm -rf "$_sd/state" "$_sd/l" "$_sd/restarts" "$_sd/refuse" "$_sd/escalate_fail" "$_sd/notify.log" "$_sd/lastpid"; mkdir -p "$_sd/state"
+                echo down > "$_sd/health"; echo "${1:-down}" > "$_sd/after_restart"; echo "$_dpid" > "$_pidfile"; }
+  _restarts() { cat "$_sd/restarts" 2>/dev/null || echo 0; }
+  _pages()    { grep -c '\[ESCALATE\] \[DRY_RUN\]' "$_sd/l" 2>/dev/null || true; }
+  _held()     { grep -c 'HELD by backoff' "$_sd/l" 2>/dev/null || true; }
+  _alive()    { kill -0 "$_dpid" 2>/dev/null; }
+
+  # --- A. o laco de 24/09: o restart NAO recupera (o Dolt segue fora). 5 ticks seguidos. -----
+  _reset down
+  touch "$_sd/refuse"      # o engine RECUSA o restart (ENOSPC), como no log de 24/09
+  for _i in 1 2 3 4 5; do _sim; done
+  grep -q 'gc dolt restart: recent Dolt log shows ENOSPC' "$_sd/l" && grep -q 'gc dolt restart returned nonzero' "$_sd/l" \
+    && ok "A: o cenario reproduz o log de 24/09 (restart recusado por ENOSPC -> 'returned nonzero' -> 'STILL unhealthy')" \
+    || bad "A: o cenario nao reproduziu a forma do log de 24/09 — o teste nao prova o laco"
+  [ "$(_restarts)" = "1" ] && ok "A: 5 ticks de hang confirmado -> exatamente 1 tentativa de restart (antes: 5)" \
+                           || bad "A: ga-fzt548 — esperava 1 restart em 5 ticks, houve $(_restarts) (o laco de 24/09)"
+  [ "$(_held)" -ge 4 ] 2>/dev/null && ok "A: os 4 ticks seguintes ficaram SEGURADOS pelo backoff (log tem 'HELD by backoff' x$(_held))" \
+                                   || bad "A: esperava >=4 ticks segurados, achei $(_held)"
+  [ "$(_pages)" = "1" ] && ok "A: UMA escalada so (o page do 'restart nao recuperou'); os ticks segurados nao re-paginam (dedupe)" \
+                        || bad "A: esperava 1 page, houve $(_pages) — a janela spamma o humano a cada 60 s"
+  grep -q "^1 [0-9]\+$" "$_sd/state/r" 2>/dev/null && ok "A: historico gravado atomicamente ('$(cat "$_sd/state/r")')" \
+                                                   || bad "A: historico de restart ausente/malformado: '$(cat "$_sd/state/r" 2>/dev/null)'"
+  _alive && [ ! -e "$_sd/got_quit" ] && ok "A: NENHUM sinal chegou ao 'Dolt' em 5 ticks (nem SIGQUIT)" \
+                                      || bad "ga-fzt548 regressao: o 'Dolt' sacrificial recebeu sinal sem DOLT_DUMP=1"
+
+  # --- B. o restart funciona, o Dolt pendura DE NOVO 3 min depois -> segura e ESCALA. ----
+  _reset up
+  _sim                                   # tick 1: hang confirmado -> restart #1, volta saudavel
+  [ "$(_restarts)" = "1" ] && [ "$(_pages)" = "0" ] && ok "B: restart #1 recuperou -> sem page" \
+                                                    || bad "B: restart #1 deveria recuperar sem page (restarts=$(_restarts) pages=$(_pages))"
+  echo down > "$_sd/health"              # pendurou de novo
+  for _i in 1 2 3; do _sim; done
+  [ "$(_restarts)" = "1" ] && ok "B: Dolt pendurou de novo -> NAO reiniciou (1 restart na janela de 30 min)" \
+                           || bad "B: ga-fzt548 — reiniciou de novo dentro da janela (restarts=$(_restarts))"
+  [ "$(_pages)" = "1" ] && grep -q "title='Dolt hang-watchdog: restart held by backoff'" "$_sd/l" \
+    && ok "B: a escalada saiu UMA vez, classe town-halted, titulo 'restart held by backoff' (3 ticks, 1 page)" \
+    || bad "B: esperava 1 page 'restart held by backoff', houve $(_pages)"
+  grep -q 'class=town-halted' "$_sd/l" && ok "B: escalada usa a classe sancionada town-halted" || bad "B: classe errada na escalada"
+
+  # --- B2. page que FALHOU != page entregue: nao pode virar selo de dedupe (silenciaria o retry). ---
+  _reset up
+  _sim                                   # restart #1 recupera
+  echo down > "$_sd/health"; touch "$_sd/escalate_fail"
+  _sim; _sim                             # 2 ticks segurados, com o push FALHANDO
+  [ ! -e "$_sd/state/e" ] && [ "$(grep -c 'FAILED to page' "$_sd/l")" = "2" ] \
+    && ok "B2: o push falhou nos 2 ticks -> NENHUM selo gravado, e o 2o tick TENTOU de novo (falha nao silencia o retry)" \
+    || bad "B2: ga-fzt548 — page que falhou virou selo de 'humano avisado' (selo=$([ -e "$_sd/state/e" ] && echo presente || echo ausente), falhas=$(grep -c 'FAILED to page' "$_sd/l"))"
+  rm -f "$_sd/escalate_fail"
+  _sim; _sim                             # push volta: 1o tick pagina e sela, 2o tick e dedupado
+  [ -e "$_sd/state/e" ] && [ "$(_pages)" = "1" ] \
+    && ok "B2: push voltou -> pagina 1x, grava o selo, e o tick seguinte nao repete" \
+    || bad "B2: apos o push voltar esperava 1 page + selo (pages=$(_pages), selo=$([ -e "$_sd/state/e" ] && echo presente || echo ausente))"
+  # mesma regra no page 'restart nao recuperou' (ramo ja existente): falhou -> sem selo
+  _reset down; touch "$_sd/refuse" "$_sd/escalate_fail"
+  _sim
+  [ ! -e "$_sd/state/e" ] && grep -q 'page NOT stamped' "$_sd/l" \
+    && ok "B2: page 'restart nao recuperou' que falhou tambem NAO sela" \
+    || bad "B2: page 'restart nao recuperou' que falhou gravou selo"
+
+  # --- C. a janela abre: 29 min NAO, 31 min SIM; o proximo intervalo dobra. -------------
+  _reset up
+  _now=$(date +%s)
+  echo "1 $(( _now - 1740 ))" > "$_sd/state/r"        # 29 min atras
+  _sim
+  [ "$(_restarts)" = "0" ] && ok "C: 29 min depois do restart #1 -> segurado (0 novos restarts)" \
+                           || bad "C: reiniciou com so 29 min de janela"
+  echo "1 $(( _now - 1860 ))" > "$_sd/state/r"        # 31 min atras
+  echo down > "$_sd/health"
+  _sim
+  [ "$(_restarts)" = "1" ] && grep -q '^2 [0-9]\+$' "$_sd/state/r" \
+    && ok "C: 31 min depois -> restart permitido, contagem do episodio vai pra 2 ('$(cat "$_sd/state/r")')" \
+    || bad "C: janela de 30 min aberta mas o restart nao veio / contagem errada (restarts=$(_restarts) state='$(cat "$_sd/state/r")')"
+  echo down > "$_sd/health"; rm -f "$_sd/state/e"
+  _sim
+  [ "$(_restarts)" = "1" ] && grep -Eq 'HELD by backoff: 2 restart\(s\) this episode.*allowed in 3[0-9]{3}s' "$_sd/l" \
+    && ok "C: logo apos o restart #2 a janela DOBROU (segura por ~3600 s)" \
+    || bad "C: a janela nao dobrou apos o 2o restart: $(grep 'HELD' "$_sd/l" | tail -1)"
+
+  # --- D. fim de episodio: 6 h sem restart zera a contagem. ----------------------------
+  _reset up
+  echo "3 $(( $(date +%s) - 21700 ))" > "$_sd/state/r"
+  _sim
+  [ "$(_restarts)" = "1" ] && grep -q '^1 [0-9]\+$' "$_sd/state/r" \
+    && ok "D: contagem 3 com ultimo restart ha >6 h -> episodio novo (volta a '1', restart permitido)" \
+    || bad "D: episodio expirado nao zerou (restarts=$(_restarts) state='$(cat "$_sd/state/r")')"
+
+  # --- E. historico ILEGIVEL != historico VAZIO: recusa e escala (ramo inerte). ---------
+  for _case in "garbage" "" "1" "1 2 3" "x 5" "2 99999999999"; do
+    _reset up
+    printf '%s' "$_case" > "$_sd/state/r"
+    [ -n "$_case" ] && echo >> "$_sd/state/r"
+    _sim
+    if [ "$(_restarts)" = "0" ] && grep -q 'REFUSING to restart' "$_sd/l" && [ "$(_pages)" = "1" ]; then
+      ok "E: historico ilegivel ('${_case:-<vazio>}') -> NAO reinicia, escala 1x"
+    else
+      bad "E: ga-fzt548 — historico ilegivel ('${_case:-<vazio>}') virou 'sem historico' (restarts=$(_restarts) pages=$(_pages))"
+    fi
+  done
+  _reset up; mkdir "$_sd/state/r"; _sim
+  [ "$(_restarts)" = "0" ] && grep -q 'REFUSING to restart' "$_sd/l" \
+    && ok "E: historico que nao da pra LER (e um diretorio) -> NAO reinicia" \
+    || bad "E: erro de leitura do historico colapsou em 'sem historico' (restarts=$(_restarts))"
+
+  # --- F. historico nao-gravavel: sem registro o backoff nao seguraria, entao NAO reinicia. -
+  if [ "$(id -u)" = "0" ]; then
+    echo "  skip F: rodando como root (chmod nao bloqueia escrita)"
+  else
+    _reset up
+    mkdir "$_sd/state/ro"; chmod 555 "$_sd/state/ro"
+    _sim DOLT_WATCHDOG_RESTART_STATE_FILE="$_sd/state/ro/r"
+    chmod 755 "$_sd/state/ro"
+    [ "$(_restarts)" = "0" ] && grep -q 'REFUSING the restart' "$_sd/l" && [ "$(_pages)" = "1" ] \
+      && ok "F: nao consegue gravar o historico -> NAO reinicia (restart sem registro furaria o backoff) e escala" \
+      || bad "F: ga-fzt548 — reiniciou sem conseguir gravar o historico (restarts=$(_restarts) pages=$(_pages))"
+  fi
+
+  # --- G. DRY RUN: relata a decisao do gate e nao escreve NADA, nem chama o restart. -----
+  _reset up
+  _sim DOLT_WATCHDOG_DRY_RUN=1
+  [ "$(_restarts)" = "0" ] && [ ! -e "$_sd/state/r" ] && [ ! -e "$_sd/state/e" ] && [ ! -e "$_sd/state/s" ] \
+    && grep -q "DRY-RUN: would run 'gc dolt restart'" "$_sd/l" && ! grep -q 'kill -QUIT' "$_sd/l" \
+    && ok "G: dry run (sem historico) -> relata 'would run gc dolt restart', sem QUIT, sem escrever historico/selo/strikes" \
+    || bad "G: dry run mexeu em estado ou reportou errado (restarts=$(_restarts); $(tail -1 "$_sd/l"))"
+  echo "1 $(( $(date +%s) - 60 ))" > "$_sd/state/r"; _before=$(cat "$_sd/state/r")
+  _sim DOLT_WATCHDOG_DRY_RUN=1
+  [ "$(cat "$_sd/state/r")" = "$_before" ] && [ ! -e "$_sd/state/e" ] && [ "$(_pages)" = "0" ] && grep -q 'DRY-RUN: would HOLD the restart' "$_sd/l" \
+    && ok "G: dry run (janela fechada) -> relata 'would HOLD', historico intacto, NENHUMA escalada disparada" \
+    || bad "G: dry run na janela fechada escreveu/paginou (pages=$(_pages); $(tail -1 "$_sd/l"))"
+  printf 'garbage\n' > "$_sd/state/r"
+  _sim DOLT_WATCHDOG_DRY_RUN=1
+  grep -q 'DRY-RUN: would REFUSE the restart' "$_sd/l" && [ "$(cat "$_sd/state/r")" = "garbage" ] && [ "$(_pages)" = "0" ] \
+    && ok "G: dry run (historico ilegivel) -> relata 'would REFUSE', nao toca o arquivo, nao pagina" \
+    || bad "G: dry run com historico ilegivel reportou/escreveu errado"
+  _reset up; _sim DOLT_WATCHDOG_DRY_RUN=1 DOLT_DUMP=1
+  grep -q 'DOLT_DUMP=1: it would ALSO send SIGQUIT' "$_sd/l" && _alive && [ ! -e "$_sd/got_quit" ] \
+    && ok "G: dry run com DOLT_DUMP=1 AVISA que mandaria SIGQUIT — e nao manda" \
+    || bad "G: dry run com DOLT_DUMP=1 nao avisou, ou sinalizou de verdade"
+
+  # --- H. DOLT_DUMP=1 sem PID conhecido: sem chute, o restart segue sem o dump. -----------
+  _reset up
+  rm -f "$_pidfile"
+  _sim DOLT_DUMP=1
+  [ "$(_restarts)" = "1" ] && _alive && [ ! -e "$_sd/got_quit" ] && grep -q 'DOLT_DUMP=1 but the Dolt PID is unknown' "$_sd/l" \
+    && ok "H: DOLT_DUMP=1 e PID desconhecido -> nao chuta PID nenhum, restart segue sem dump" \
+    || bad "H: PID desconhecido com DOLT_DUMP=1 sinalizou alguem, ou travou o restart"
+
+  # --- I. DOLT_DUMP=1 com PID conhecido: AGORA sim o SIGQUIT chega (ultimo: mata o sacrificial). ---
+  _reset up
+  _sim DOLT_DUMP=1
+  [ "$(_restarts)" = "1" ] && [ -e "$_sd/got_quit" ] && grep -q 'DOLT_DUMP=1: sending SIGQUIT' "$_sd/l" \
+    && ok "I: DOLT_DUMP=1 -> o SIGQUIT chega ao PID (opt-in funciona) e o restart acontece em seguida" \
+    || bad "I: DOLT_DUMP=1 nao entregou o SIGQUIT (restarts=$(_restarts) quit=$([ -e "$_sd/got_quit" ] && echo sim || echo nao))"
+
+  _cleanup_sim; trap - EXIT
+else
+  bad "nao achei o script ao lado — asserts do ga-fzt548 nao rodaram"
 fi
 
 echo

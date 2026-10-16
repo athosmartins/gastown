@@ -152,8 +152,10 @@ SERVE_CONFIRM_TIMEOUT="${DOLT_LATENCY_ALARM_SERVE_CONFIRM:-12}"
 # this session's $TMPDIR (/var/folders/.../T/) differs from a launchd LaunchAgent's
 # — an ambient-env-dependent path would silently split the window state across
 # whichever context happens to invoke this tick, breaking the median's persistence
-# without any error. dolt-hang-watchdog.sh's own STRIKES file hardcodes /tmp for
-# the same reason; matching that convention here. Still overridable via the
+# without any error. dolt-hang-watchdog.sh's STRIKES file hardcoded /tmp for the same
+# reason until ga-fzt548 moved it (and its restart history) to .gc/runtime, because a
+# counter that must survive a reboot cannot live in /tmp. This state is only a rolling
+# window that is fine to lose, so /tmp stays right here. Still overridable via the
 # script's OWN dedicated var (not ambient $TMPDIR) so a selftest can point state
 # at an isolated scratch dir instead of colliding with a real deployed instance.
 STATE_DIR="${DOLT_LATENCY_ALARM_STATE_DIR:-/tmp}"

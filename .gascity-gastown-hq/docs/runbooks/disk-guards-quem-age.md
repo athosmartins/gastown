@@ -54,7 +54,7 @@ DPM não dá para auditar — `-delete` não registra arquivo (551 execuções c
 Complementares por gatilho, não três cópias:
 - `com.gastown.dolt-server` (launchd `KeepAlive`): roda `gc dolt start`, um launcher. `launchctl list` mostra sem
   PID e última saída 0 — **inferido**: na prática só sobe no login.
-- `dolt-hang-watchdog` (60 s): hang confirmado por N strikes e veto de CPU → `kill -QUIT` + `gc dolt restart`.
+- `dolt-hang-watchdog` (60 s): hang confirmado por N strikes e veto de CPU → `gc dolt restart` (o engine para o Dolt com SIGTERM; o watchdog não manda sinal nenhum). No máximo **1 restart por janela de backoff** (30 min, dobrando até 6 h); restart segurado escala ao Mayor (uma vez por hora) em vez de repetir. `DOLT_DUMP=1` religa o `kill -QUIT` pré-restart — opt-in, porque ele encerra o Dolt (ga-fzt548). Estado em `.gc/runtime/dolt-hang-watchdog.{strikes,cpuveto,restarts,escalated}`.
 - FG (`_resurrect_dolt`): Dolt confirmado fora do ar com o disco seguro → `gc dolt start`.
 
 Não verificado: se `gc dolt start` e `gc dolt restart` disparados no mesmo minuto são serializados pelo engine.

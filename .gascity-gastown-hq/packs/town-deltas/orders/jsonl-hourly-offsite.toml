@@ -1,0 +1,12 @@
+# ga-c0939v.2: sobe a cada hora o dump JSONL (jsonl-export, um run a cada 27 min em mediana) ao S3, com manifest e sha256 conferido.
+# Por quê, garantias, códigos de saída, alerta, desligar e conferir: cabeçalho de assets/scripts/jsonl-hourly-offsite.sh e docs/runbooks/jsonl-hourly-offsite.md.
+# interval 1h: pedido do Athos (15/10: perder no máximo 1 h de beads). RPO real medido (típico ~1h35, pior ~4h15; depende do exporter) e a opção interval = "30m" (decisão de produto): runbook.
+# timeout 2400s: típico ~5 min (build ~4 min, medido); o teto cobre o build (≤ 900 s) e o upload. interval (3600 s) > timeout e o script tem lock single-flight: runs não empilham.
+# Run morto pelo timeout (ou kill, ou reboot) não chega a registrar a falha: o run seguinte o conta (`attempt_open` no estado).
+# Credencial: o aws precisa estar acessível ao ambiente do order (a mesma do dolt-s3-backup.sh); sem ela o run sai fail/unknown e o alerta sai no 2º seguido.
+[order]
+description = "Hourly offsite upload of the JSONL dump archive to S3 with manifest + sha256 verification (ga-c0939v — RPO 1h for beads)"
+trigger = "cooldown"
+interval = "1h"
+timeout = "2400s"
+exec = "$PACK_DIR/assets/scripts/jsonl-hourly-offsite.sh"
