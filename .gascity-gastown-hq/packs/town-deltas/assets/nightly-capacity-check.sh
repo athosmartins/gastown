@@ -20,11 +20,14 @@
 # Decision (see needs_reboot_reason): recommend a reboot iff EITHER (a) a real
 # jetsam kill happened in the lookback window — ga-7xne1's own finding is that
 # jetsam is "the PRECURSOR signal itself," so even one is real evidence, not
-# noise — OR (b) swap used is at/above a floor AND yesterday's trend-log
-# reading was ALSO at/above that floor (i.e. it persisted across a full day
-# rather than being a transient spike that already cleared on its own) —
-# "residue that only clears on reboot," per the bead's own framing, not a
-# same-night blip.
+# noise — OR (b) swap used is at/above a floor AND the previous trend-log
+# reading was ALSO at/above that floor AND was taken on the SAME boot (i.e. it
+# persisted across a full day rather than being a transient spike that already
+# cleared on its own) — "residue that only clears on reboot," per the bead's
+# own framing, not a same-night blip. ga-idkuyz: a reading from BEFORE the last
+# reboot says nothing about residue (the swap after a boot is that night's own
+# pressure), so each trend-log line records `boot=<epoch>` and a previous line
+# from another boot — or with no readable boot — never confirms persistence.
 #
 # Also appends one dated line to a trend log every run (regardless of verdict)
 # — both the day's own audit trail and the data the weekly digest reads.
@@ -53,6 +56,16 @@ JETSAM_LOOKBACK_MIN="${NCC_JETSAM_LOOKBACK_MIN:-1440}"   # 24h
 # the real measured baselines) — deliberately conservative pending real
 # trend-log history; override via env once a few weeks of data exist.
 SWAP_FLOOR_MB="${NCC_SWAP_FLOOR_MB:-2048}"
+
+# ga-idkuyz: two kern.boottime reads count as the SAME boot when they differ by
+# at most this many seconds. macOS can nudge kern.boottime by a few seconds when
+# the wall clock is stepped (NTP, wake from sleep), and a strict == would then
+# read "another boot" every night and silently turn the swap-persistence rule
+# off forever. The compared readings are on different dates (normally ~24h
+# apart), so a real reboot between them moves the epoch by hours, not by this
+# much. Not numeric -> the default.
+BOOT_SAME_TOLERANCE_SEC="${NCC_BOOT_SAME_TOLERANCE_SEC:-300}"
+case "${BOOT_SAME_TOLERANCE_SEC}" in ''|*[!0-9]*) BOOT_SAME_TOLERANCE_SEC=300 ;; esac
 
 log() {
   mkdir -p "$(dirname "${LOG}")" 2>/dev/null
@@ -114,51 +127,95 @@ read_disk_free_gb() {
 # PURE/TESTABLE DECISION FUNCTIONS
 # ════════════════════════════════════════════════════════════════════════════
 
-# _swap_persisted_floor <today_swap_mb> <trend_log_path> <floor_mb> → 0 (true)
-# iff today's reading AND yesterday's most recent trend-log reading are both
-# >= floor_mb. Reads the trend log's own lines (format: see
-# _trend_log_line), extracting the swap_mb field from the most recent line
-# whose date differs from today's. FAIL-CLOSED-TOWARD-"NOT PERSISTED" (return
-# 1) on any missing/unparseable history — a single day's reading alone should
-# never itself trigger the persistence claim; "couldn't confirm yesterday"
-# must not silently read as "confirmed persisted."
+# _is_epoch <value> → 0 iff value is 1-12 decimal digits (a unix epoch in
+# seconds; the length cap keeps the later arithmetic from overflowing on a
+# corrupted field).
+_is_epoch() {
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 12 ]
+}
+
+# _same_boot <boot_epoch_a> <boot_epoch_b> → 0 iff both are readable epochs and
+# differ by at most BOOT_SAME_TOLERANCE_SEC. Unreadable on either side → 1
+# ("couldn't tell" is NOT "same boot"). 10# forces base 10 so a zero-padded
+# field can't be parsed as octal.
+_same_boot() {
+  _is_epoch "${1:-}" && _is_epoch "${2:-}" || return 1
+  local d=$(( 10#$1 - 10#$2 ))
+  [ "$d" -lt 0 ] && d=$(( -d ))
+  [ "$d" -le "${BOOT_SAME_TOLERANCE_SEC}" ]
+}
+
+# _swap_persisted_floor <today_swap_mb> <trend_log_path> <floor_mb> <boot_epoch>
+# → 0 (true) iff today's reading AND the most recent trend-log reading from an
+# earlier date are both >= floor_mb AND that earlier reading was taken on the
+# SAME boot as today's <boot_epoch> (ga-idkuyz). Reads the trend log's own
+# lines (format: see _trend_log_line), extracting the swap_mb and boot fields
+# from the most recent line whose date differs from today's.
+# FAIL-CLOSED-TOWARD-"NOT PERSISTED" (return 1) on any missing/unparseable
+# history — a single day's reading alone should never itself trigger the
+# persistence claim; "couldn't confirm yesterday" must not silently read as
+# "confirmed persisted." That includes a previous line with no boot field (it
+# predates ga-idkuyz, or its boot was unreadable) and a missing/unreadable
+# <boot_epoch> today: a swap number from before a reboot is no evidence of
+# residue after it, and "no boot recorded" cannot prove there was no reboot.
 _swap_persisted_floor() {
-  local today_mb="$1" trend_log="$2" floor="$3"
+  local today_mb="$1" trend_log="$2" floor="$3" boot_epoch="${4:-}"
   case "$today_mb" in ''|*[!0-9]*) return 1 ;; esac
   [ "$today_mb" -ge "$floor" ] || return 1
   [ -f "$trend_log" ] || return 1
-  local today_date yesterday_line yesterday_mb
+  local today_date yesterday_line yesterday_mb yesterday_boot
   today_date="$(date +%Y-%m-%d)"
+  # vazio → no earlier line, not persisted (return 1); falhou/ilegível → grep
+  # error reads as empty, so also not persisted (return 1).
   yesterday_line="$(grep -v "^${today_date}" "$trend_log" 2>/dev/null | tail -1)"
   [ -n "$yesterday_line" ] || return 1
+  # vazio → no swap_mb field, not persisted (return 1); falhou/ilegível →
+  # non-numeric value, not persisted (return 1).
   yesterday_mb="$(printf '%s' "$yesterday_line" | grep -oE 'swap_mb=[0-9]+' | cut -d= -f2)"
   case "$yesterday_mb" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$yesterday_mb" -ge "$floor" ]
+  [ "$yesterday_mb" -ge "$floor" ] || return 1
+  # vazio → old line with no boot field (or boot=unknown), not persisted
+  # (return 1); falhou/ilegível → non-numeric boot, not persisted (return 1).
+  # Only a readable boot within tolerance of today's counts as the same boot;
+  # _same_boot also rejects an empty/garbage <boot_epoch> for THIS run
+  # (not persisted, return 1) — "no boot read today" cannot prove "no reboot".
+  # Two boot= fields on one line yield a multi-line value, which _is_epoch
+  # rejects — ambiguous history is "can't tell", not "same boot".
+  yesterday_boot="$(printf '%s' "$yesterday_line" | grep -oE ' boot=[0-9]+' | cut -d= -f2)"
+  _same_boot "$yesterday_boot" "$boot_epoch"
 }
 
-# needs_reboot_reason <free_pct> <swap_mb> <jetsam_count> <trend_log> <floor_mb>
+# needs_reboot_reason <free_pct> <swap_mb> <jetsam_count> <trend_log> <floor_mb> [boot_epoch]
 # → prints a non-empty reason string and returns 0 iff a reboot is
 # recommended; prints nothing and returns 1 otherwise. Never touches disk
-# beyond reading trend_log (via _swap_persisted_floor).
+# beyond reading trend_log (via _swap_persisted_floor). boot_epoch (ga-idkuyz)
+# is this boot's kern.boottime; omitted/unreadable means the swap-persistence
+# branch cannot fire (jetsam still can).
 needs_reboot_reason() {
-  local free_pct="$1" swap_mb="$2" jetsam="$3" trend_log="$4" floor="$5"
+  local free_pct="$1" swap_mb="$2" jetsam="$3" trend_log="$4" floor="$5" boot_epoch="${6:-}"
   case "$jetsam" in
     ''|*[!0-9]*) : ;;
     0) : ;;
     *) printf 'jetsam killed %s process(es) in the last %sm (ga-7xne1: jetsam is the precursor signal itself, not noise)' "$jetsam" "$JETSAM_LOOKBACK_MIN"; return 0 ;;
   esac
-  if _swap_persisted_floor "$swap_mb" "$trend_log" "$floor"; then
-    printf 'swap used %sMB >= floor %sMB, and stayed there since yesterday'"'"'s reading (residue, not a same-night spike)' "$swap_mb" "$floor"
+  if _swap_persisted_floor "$swap_mb" "$trend_log" "$floor" "$boot_epoch"; then
+    printf 'swap used %sMB >= floor %sMB, and stayed there since the previous reading on this same boot (residue, not a same-night spike)' "$swap_mb" "$floor"
     return 0
   fi
   return 1
 }
 
-# _trend_log_line <date> <free_pct> <swap_mb> <jetsam> <disk_free_gb> → one
-# formatted line, key=value pairs (grep/cut-friendly, no JSON parsing needed
-# for the simple persistence check above).
+# _trend_log_line <date> <free_pct> <swap_mb> <jetsam> <disk_free_gb> [boot_epoch]
+# → one formatted line, key=value pairs (grep/cut-friendly, no JSON parsing
+# needed for the simple persistence check above). boot=<epoch> is what lets a
+# later run tell "same boot" from "rebooted since" (ga-idkuyz); a boot that
+# could not be read is written as boot=unknown — never a number, so it can
+# never match a later boot.
 _trend_log_line() {
-  printf '%s free_pct=%s swap_mb=%s jetsam=%s disk_free_gb=%s\n' "$1" "$2" "$3" "$4" "$5"
+  local boot="${6:-}"
+  _is_epoch "$boot" || boot="unknown"
+  printf '%s free_pct=%s swap_mb=%s jetsam=%s disk_free_gb=%s boot=%s\n' "$1" "$2" "$3" "$4" "$5" "$boot"
 }
 
 # _is_sunday <weekday 1-7, ISO (7=Sunday)> → 0 iff Sunday. Pure, takes the
@@ -173,19 +230,23 @@ _is_sunday() { [ "${1:-}" = "7" ]; }
 # ════════════════════════════════════════════════════════════════════════════
 
 main() {
-  local free_pct swap_mb jetsam disk_free_gb
+  local free_pct swap_mb jetsam disk_free_gb boot_epoch
   free_pct="$(read_free_pct)"; free_pct="${free_pct:-unknown}"
   swap_mb="$(read_swap_used_mb)"; swap_mb="${swap_mb:-unknown}"
   jetsam="$(read_jetsam_count)"; jetsam="${jetsam:-0}"
   disk_free_gb="$(read_disk_free_gb)"; disk_free_gb="${disk_free_gb:-unknown}"
+  # vazio → boot_epoch stays empty, logged as boot=unknown and the swap-persistence
+  # branch cannot fire; falhou/ilegível → same (a non-numeric read is reset to empty
+  # by the _is_epoch check on this line) — never a guessed boot.
+  boot_epoch="$(read_boot_epoch)"; _is_epoch "$boot_epoch" || boot_epoch=""
 
-  log "measured: free_pct=${free_pct} swap_mb=${swap_mb} jetsam=${jetsam} disk_free_gb=${disk_free_gb}"
+  log "measured: free_pct=${free_pct} swap_mb=${swap_mb} jetsam=${jetsam} disk_free_gb=${disk_free_gb} boot=${boot_epoch:-unknown}"
 
   mkdir -p "$(dirname "${TREND_LOG}")" 2>/dev/null
-  _trend_log_line "$(date +%Y-%m-%d)" "$free_pct" "$swap_mb" "$jetsam" "$disk_free_gb" >> "${TREND_LOG}"
+  _trend_log_line "$(date +%Y-%m-%d)" "$free_pct" "$swap_mb" "$jetsam" "$disk_free_gb" "$boot_epoch" >> "${TREND_LOG}"
 
   local reason
-  if reason="$(needs_reboot_reason "$free_pct" "$swap_mb" "$jetsam" "$TREND_LOG" "$SWAP_FLOOR_MB")"; then
+  if reason="$(needs_reboot_reason "$free_pct" "$swap_mb" "$jetsam" "$TREND_LOG" "$SWAP_FLOOR_MB" "$boot_epoch")"; then
     log "RECOMMEND REBOOT: ${reason}"
     local body="Checagem noturna (ga-06mt3k): ${reason}. Medido: free=${free_pct}% swap=${swap_mb}MB jetsam=${jetsam} disco_livre=${disk_free_gb}GB. Esta checagem NUNCA reinicia sozinha (sua decisao, 18/08) — se quiser aplicar, rode 'sudo reboot' quando for conveniente; se nao, ignore, ela reavalia amanha."
     "${GC}" mail send mayor -s "Capacidade: recomendo reiniciar a maquina" -m "${body}" >/dev/null 2>&1 || true
@@ -309,26 +370,27 @@ print("\n".join(bad))
     || bad "missing dir should give 0, not error/crash"
   JETSAM_REPORTS_DIR="${_ST_JETSAM_DIR_SAVED}"
 
-  echo "S2: _swap_persisted_floor — needs BOTH today AND yesterday at/above floor"
+  echo "S2: _swap_persisted_floor — needs BOTH today AND yesterday at/above floor, on the SAME boot (ga-idkuyz)"
   _ST_TREND="${_ST_ROOT}/trend.log"
-  _swap_persisted_floor 3000 "${_ST_TREND}" 2048 && bad "no trend log at all should fail-closed" || ok "missing trend log -> not persisted (fail-closed)"
-  printf '2020-01-01 free_pct=50 swap_mb=1000 jetsam=0 disk_free_gb=100\n' > "${_ST_TREND}"
-  _swap_persisted_floor 3000 "${_ST_TREND}" 2048 && bad "yesterday below floor should not count as persisted" || ok "yesterday below floor -> not persisted"
-  printf '2020-01-01 free_pct=50 swap_mb=3500 jetsam=0 disk_free_gb=100\n' > "${_ST_TREND}"
-  _swap_persisted_floor 3000 "${_ST_TREND}" 2048 && ok "today AND yesterday both above floor -> persisted" || bad "should be persisted"
-  _swap_persisted_floor 1000 "${_ST_TREND}" 2048 && bad "today below floor should not persist regardless of yesterday" || ok "today below floor -> not persisted"
+  _ST_BOOT=1760000000   # an arbitrary boot epoch shared by the "same boot" fixtures
+  _swap_persisted_floor 3000 "${_ST_TREND}" 2048 "${_ST_BOOT}" && bad "no trend log at all should fail-closed" || ok "missing trend log -> not persisted (fail-closed)"
+  printf '2020-01-01 free_pct=50 swap_mb=1000 jetsam=0 disk_free_gb=100 boot=%s\n' "${_ST_BOOT}" > "${_ST_TREND}"
+  _swap_persisted_floor 3000 "${_ST_TREND}" 2048 "${_ST_BOOT}" && bad "yesterday below floor should not count as persisted" || ok "yesterday below floor -> not persisted"
+  printf '2020-01-01 free_pct=50 swap_mb=3500 jetsam=0 disk_free_gb=100 boot=%s\n' "${_ST_BOOT}" > "${_ST_TREND}"
+  _swap_persisted_floor 3000 "${_ST_TREND}" 2048 "${_ST_BOOT}" && ok "today AND yesterday both above floor, same boot -> persisted" || bad "should be persisted"
+  _swap_persisted_floor 1000 "${_ST_TREND}" 2048 "${_ST_BOOT}" && bad "today below floor should not persist regardless of yesterday" || ok "today below floor -> not persisted"
   # today's own line in the log must be excluded from the "yesterday" lookup
-  printf '%s free_pct=50 swap_mb=9000 jetsam=0 disk_free_gb=100\n' "$(date +%Y-%m-%d)" > "${_ST_TREND}"
-  _swap_persisted_floor 3000 "${_ST_TREND}" 2048 && bad "REGRESSION: today's own line counted as 'yesterday'" || ok "today's own trend-log line excluded from yesterday lookup"
+  printf '%s free_pct=50 swap_mb=9000 jetsam=0 disk_free_gb=100 boot=%s\n' "$(date +%Y-%m-%d)" "${_ST_BOOT}" > "${_ST_TREND}"
+  _swap_persisted_floor 3000 "${_ST_TREND}" 2048 "${_ST_BOOT}" && bad "REGRESSION: today's own line counted as 'yesterday'" || ok "today's own trend-log line excluded from yesterday lookup"
 
   echo "S3: needs_reboot_reason — jetsam alone is sufficient; swap needs persistence"
-  _r="$(needs_reboot_reason 50 500 1 "${_ST_TREND}" 2048)"; _rc=$?
+  _r="$(needs_reboot_reason 50 500 1 "${_ST_TREND}" 2048 "${_ST_BOOT}")"; _rc=$?
   [ "$_rc" -eq 0 ] && [ -n "$_r" ] && ok "single jetsam kill -> recommends reboot" || bad "jetsam=1 should recommend"
-  _r="$(needs_reboot_reason 50 500 0 "/nonexistent" 2048)"; _rc=$?
+  _r="$(needs_reboot_reason 50 500 0 "/nonexistent" 2048 "${_ST_BOOT}")"; _rc=$?
   [ "$_rc" -ne 0 ] && [ -z "$_r" ] && ok "low swap, no jetsam, no history -> no recommendation" || bad "should not recommend"
-  printf '2020-01-01 free_pct=50 swap_mb=5000 jetsam=0 disk_free_gb=100\n' > "${_ST_TREND}"
-  _r="$(needs_reboot_reason 50 5000 0 "${_ST_TREND}" 2048)"; _rc=$?
-  [ "$_rc" -eq 0 ] && [ -n "$_r" ] && ok "persisted high swap -> recommends reboot" || bad "should recommend on persisted swap"
+  printf '2020-01-01 free_pct=50 swap_mb=5000 jetsam=0 disk_free_gb=100 boot=%s\n' "${_ST_BOOT}" > "${_ST_TREND}"
+  _r="$(needs_reboot_reason 50 5000 0 "${_ST_TREND}" 2048 "${_ST_BOOT}")"; _rc=$?
+  [ "$_rc" -eq 0 ] && [ -n "$_r" ] && ok "persisted high swap on the same boot -> recommends reboot" || bad "should recommend on persisted swap"
 
   echo "S4: _is_sunday"
   _is_sunday 7 && ok "7 (ISO Sunday) -> true" || bad "7 should be Sunday"
@@ -430,6 +492,120 @@ print("\n".join(bad))
   unset NCC_TEST_BOOT_EPOCH
   rm -rf "${_ST_JETSAM_DIR}"
   JETSAM_REPORTS_DIR="${_ST_JETSAM_DIR_SAVED}"
+
+  # ── ga-idkuyz: swap persistence must be measured on ONE boot ──────────────
+  # The 16/10 05:00 run recommended a reboot because swap was 4266MB "since
+  # yesterday's reading" — but the machine had rebooted at 23:41 in between, so
+  # yesterday's number belonged to a different boot and today's was the night's
+  # own post-boot pressure. Every test below drives needs_reboot_reason /
+  # main() for real; none of them go through a stub that skips the boot check.
+  # The fixtures below assume the DEFAULT tolerance (300s), so leave the parsed
+  # value alone — that also keeps a wrong default catchable — and only pin it
+  # when an env override would otherwise move the fixtures.
+  [ -z "${NCC_BOOT_SAME_TOLERANCE_SEC+x}" ] || BOOT_SAME_TOLERANCE_SEC=300
+  _ST_BOOT_OLD=1760000000
+  _ST_BOOT_NEW=$(( _ST_BOOT_OLD + 30000 ))   # a later boot than the one the previous reading saw
+
+  echo "S12: THE BUG THIS BEAD FIXED (ga-idkuyz) — previous reading high, but taken on ANOTHER boot -> no recommendation (fixture = the 16/10 incident: 4266MB both nights, rebooted in between). Fails against the pre-fix _swap_persisted_floor, which never looks at the boot."
+  printf '2020-01-01 free_pct=50 swap_mb=4266 jetsam=0 disk_free_gb=100 boot=%s\n' "${_ST_BOOT_OLD}" > "${_ST_TREND}"
+  _r="$(needs_reboot_reason 50 4266 0 "${_ST_TREND}" 2048 "${_ST_BOOT_NEW}")"; _rc=$?
+  [ "$_rc" -ne 0 ] && [ -z "$_r" ] && ok "swap high both nights but a reboot in between -> no recommendation" \
+    || bad "REGRESSION: reading from before the reboot counted as persistence: ${_r}"
+  _swap_persisted_floor 4266 "${_ST_TREND}" 2048 "${_ST_BOOT_NEW}" && bad "REGRESSION: _swap_persisted_floor ignored the boot change" \
+    || ok "_swap_persisted_floor: other boot -> not persisted"
+
+  echo "S13: same boot still recommends, and a few seconds of kern.boottime jitter does not read as a reboot"
+  _r="$(needs_reboot_reason 50 4266 0 "${_ST_TREND}" 2048 "${_ST_BOOT_OLD}")"; _rc=$?
+  [ "$_rc" -eq 0 ] && [ -n "$_r" ] && ok "same boot epoch, swap high both readings -> recommends" || bad "same boot should still recommend"
+  _r="$(needs_reboot_reason 50 4266 0 "${_ST_TREND}" 2048 "$(( _ST_BOOT_OLD + 2 ))")"; _rc=$?
+  [ "$_rc" -eq 0 ] && [ -n "$_r" ] && ok "boot epoch +2s (clock nudge) -> still the same boot -> recommends" || bad "2s boot jitter must not be read as a reboot (would switch the rule off forever)"
+  _r="$(needs_reboot_reason 50 4266 0 "${_ST_TREND}" 2048 "$(( _ST_BOOT_OLD - 2 ))")"; _rc=$?
+  [ "$_rc" -eq 0 ] && [ -n "$_r" ] && ok "boot epoch -2s -> still the same boot -> recommends" || bad "negative jitter must be tolerated too"
+  _r="$(needs_reboot_reason 50 4266 0 "${_ST_TREND}" 2048 "$(( _ST_BOOT_OLD + 3600 ))")"; _rc=$?
+  [ "$_rc" -ne 0 ] && [ -z "$_r" ] && ok "boot epoch +1h -> a different boot -> no recommendation" || bad "1h apart is a reboot, not jitter"
+
+  echo "S14: previous line with NO readable boot -> 'couldn't confirm' is not 'persisted' (fails against the pre-fix code, which recommends on swap alone)"
+  printf '2020-01-01 free_pct=50 swap_mb=5000 jetsam=0 disk_free_gb=100\n' > "${_ST_TREND}"
+  _r="$(needs_reboot_reason 50 5000 0 "${_ST_TREND}" 2048 "${_ST_BOOT_NEW}")"; _rc=$?
+  [ "$_rc" -ne 0 ] && [ -z "$_r" ] && ok "legacy line without a boot field -> no recommendation" || bad "REGRESSION: a line with no boot confirmed persistence: ${_r}"
+  printf '2020-01-01 free_pct=50 swap_mb=5000 jetsam=0 disk_free_gb=100 boot=unknown\n' > "${_ST_TREND}"
+  _r="$(needs_reboot_reason 50 5000 0 "${_ST_TREND}" 2048 "${_ST_BOOT_NEW}")"; _rc=$?
+  [ "$_rc" -ne 0 ] && [ -z "$_r" ] && ok "boot=unknown on the previous line -> no recommendation" || bad "REGRESSION: boot=unknown confirmed persistence: ${_r}"
+  printf '2020-01-01 free_pct=50 swap_mb=5000 jetsam=0 disk_free_gb=100 boot=%s boot=%s\n' "${_ST_BOOT_OLD}" "${_ST_BOOT_NEW}" > "${_ST_TREND}"
+  _r="$(needs_reboot_reason 50 5000 0 "${_ST_TREND}" 2048 "${_ST_BOOT_NEW}")"; _rc=$?
+  [ "$_rc" -ne 0 ] && [ -z "$_r" ] && ok "two boot= fields on the previous line (ambiguous) -> no recommendation" || bad "ambiguous boot history must not confirm persistence: ${_r}"
+
+  echo "S15: THIS run's boot unreadable -> the swap branch cannot fire; the jetsam branch still can"
+  printf '2020-01-01 free_pct=50 swap_mb=5000 jetsam=0 disk_free_gb=100 boot=%s\n' "${_ST_BOOT_OLD}" > "${_ST_TREND}"
+  _r="$(needs_reboot_reason 50 5000 0 "${_ST_TREND}" 2048 "")"; _rc=$?
+  [ "$_rc" -ne 0 ] && [ -z "$_r" ] && ok "empty boot today -> swap persistence not confirmed" || bad "empty boot must not confirm persistence: ${_r}"
+  _r="$(needs_reboot_reason 50 5000 0 "${_ST_TREND}" 2048)"; _rc=$?
+  [ "$_rc" -ne 0 ] && [ -z "$_r" ] && ok "boot argument omitted entirely -> swap persistence not confirmed" || bad "missing boot argument must not confirm persistence: ${_r}"
+  _r="$(needs_reboot_reason 50 5000 0 "${_ST_TREND}" 2048 "not-a-number")"; _rc=$?
+  [ "$_rc" -ne 0 ] && [ -z "$_r" ] && ok "non-numeric boot today -> swap persistence not confirmed" || bad "garbage boot must not confirm persistence: ${_r}"
+  _r="$(needs_reboot_reason 50 500 1 "${_ST_TREND}" 2048 "")"; _rc=$?
+  [ "$_rc" -eq 0 ] && [ -n "$_r" ] && ok "jetsam kill still recommends even with no readable boot (the clamp failing must not suppress a real kill)" || bad "jetsam branch must not depend on the boot read"
+
+  echo "S16: main() end-to-end — the trend log records boot=, and the 16/10 incident replays to NO reboot mail"
+  # The stub records each mail SUBJECT so the check is about the reboot
+  # recommendation specifically — on a Sunday main() also sends the weekly digest.
+  LOG="${_ST_ROOT}/s16-log"
+  _s16_mails="${_ST_ROOT}/s16-mails"
+  gc() { case "$1" in mail) printf '%s\n' "$5" >> "${_s16_mails}" ;; esac; }
+  _s16_recommended() { [ -f "${_s16_mails}" ] && grep -F "recomendo reiniciar" "${_s16_mails}" >/dev/null 2>&1; }
+
+  TREND_LOG="${_ST_ROOT}/s16a-trend.log"; rm -f "${_s16_mails}"
+  printf '2020-01-01 free_pct=40 swap_mb=4266 jetsam=0 disk_free_gb=100 boot=%s\n' "${_ST_BOOT_OLD}" > "${TREND_LOG}"
+  NCC_TEST_BOOT_EPOCH="${_ST_BOOT_NEW}" NCC_TEST_FREE_PCT=40 NCC_TEST_SWAP_MB=4266 NCC_TEST_JETSAM_COUNT=0 NCC_TEST_DISK_FREE_GB=80 main >/dev/null 2>&1
+  _s16_recommended && bad "REGRESSION: rebooted since the previous reading, yet a reboot was recommended" \
+    || ok "previous reading from another boot -> no reboot mail"
+  tail -1 "${TREND_LOG}" | grep -F " boot=${_ST_BOOT_NEW}" >/dev/null \
+    && ok "today's trend-log line records boot=${_ST_BOOT_NEW}" || bad "trend-log line is missing boot=<epoch>: $(tail -1 "${TREND_LOG}")"
+
+  TREND_LOG="${_ST_ROOT}/s16b-trend.log"; rm -f "${_s16_mails}"
+  printf '2020-01-01 free_pct=40 swap_mb=4266 jetsam=0 disk_free_gb=100 boot=%s\n' "${_ST_BOOT_NEW}" > "${TREND_LOG}"
+  NCC_TEST_BOOT_EPOCH="${_ST_BOOT_NEW}" NCC_TEST_FREE_PCT=40 NCC_TEST_SWAP_MB=4266 NCC_TEST_JETSAM_COUNT=0 NCC_TEST_DISK_FREE_GB=80 main >/dev/null 2>&1
+  _s16_recommended && ok "previous reading on the SAME boot -> reboot mail sent" || bad "same-boot persistence must still recommend"
+
+  TREND_LOG="${_ST_ROOT}/s16c-trend.log"; rm -f "${_s16_mails}"
+  printf '2020-01-01 free_pct=40 swap_mb=4266 jetsam=0 disk_free_gb=100\n' > "${TREND_LOG}"
+  NCC_TEST_BOOT_EPOCH="${_ST_BOOT_NEW}" NCC_TEST_FREE_PCT=40 NCC_TEST_SWAP_MB=4266 NCC_TEST_JETSAM_COUNT=0 NCC_TEST_DISK_FREE_GB=80 main >/dev/null 2>&1
+  _s16_recommended && bad "REGRESSION: a legacy line with no boot field confirmed persistence" \
+    || ok "previous line from before this fix (no boot field) -> no reboot mail"
+
+  TREND_LOG="${_ST_ROOT}/s16d-trend.log"; rm -f "${_s16_mails}"
+  printf '2020-01-01 free_pct=40 swap_mb=4266 jetsam=0 disk_free_gb=100 boot=%s\n' "${_ST_BOOT_NEW}" > "${TREND_LOG}"
+  NCC_TEST_BOOT_EPOCH='' NCC_TEST_FREE_PCT=40 NCC_TEST_SWAP_MB=4266 NCC_TEST_JETSAM_COUNT=0 NCC_TEST_DISK_FREE_GB=80 main >/dev/null 2>&1
+  _s16_recommended && bad "REGRESSION: unreadable boot today still confirmed persistence" \
+    || ok "boot unreadable today -> no reboot mail"
+  tail -1 "${TREND_LOG}" | grep -F " boot=unknown" >/dev/null \
+    && ok "unreadable boot is logged as boot=unknown, not fabricated" || bad "unreadable boot should be logged as boot=unknown: $(tail -1 "${TREND_LOG}")"
+  unset -f gc _s16_recommended
+
+  echo "S17: helpers and trend-log format"
+  [ "$(_trend_log_line 2026-10-16 30 4266 0 80 "${_ST_BOOT_NEW}")" = "2026-10-16 free_pct=30 swap_mb=4266 jetsam=0 disk_free_gb=80 boot=${_ST_BOOT_NEW}" ] \
+    && ok "_trend_log_line appends boot=<epoch>" || bad "_trend_log_line format wrong: $(_trend_log_line 2026-10-16 30 4266 0 80 "${_ST_BOOT_NEW}")"
+  [ "$(_trend_log_line 2026-10-16 30 4266 0 80)" = "2026-10-16 free_pct=30 swap_mb=4266 jetsam=0 disk_free_gb=80 boot=unknown" ] \
+    && ok "no boot argument -> boot=unknown" || bad "missing boot should be boot=unknown"
+  [ "$(_trend_log_line 2026-10-16 30 4266 0 80 garbage)" = "2026-10-16 free_pct=30 swap_mb=4266 jetsam=0 disk_free_gb=80 boot=unknown" ] \
+    && ok "non-numeric boot -> boot=unknown" || bad "garbage boot should be boot=unknown"
+  _same_boot 1760000000 1760000000 && ok "_same_boot: equal epochs" || bad "equal epochs are the same boot"
+  _same_boot 1760000300 1760000000 && ok "_same_boot: exactly at the tolerance is still the same boot" || bad "tolerance boundary should be inclusive"
+  _same_boot 1760000301 1760000000 && bad "one second past the tolerance is another boot" || ok "_same_boot: one second past the tolerance -> another boot"
+  _same_boot 001760000000 1760000000 && ok "_same_boot: zero-padded epoch parses as decimal, not octal" || bad "zero-padded epoch must not be parsed as octal"
+  _same_boot "" 1760000000 && bad "empty vs epoch is 'can't tell', not same" || ok "_same_boot: empty -> not the same boot"
+  _same_boot 1760000000 "" && bad "epoch vs empty is 'can't tell', not same" || ok "_same_boot: empty (right side) -> not the same boot"
+  _same_boot 99999999999999999999 99999999999999999999 && bad "over-long digit string must not be treated as an epoch" || ok "_same_boot: over-long value rejected (no overflow)"
+  # the tolerance is parsed once at load: sourced as a lib (NCC_LIB=1) with each env value
+  _tol() { NCC_LIB=1 NCC_BOOT_SAME_TOLERANCE_SEC="$1" "${BASH:-bash}" -c '. "$1"; printf %s "$BOOT_SAME_TOLERANCE_SEC"' _ "${BASH_SOURCE[0]}"; }
+  [ "$(_tol 45)" = "45" ] && ok "NCC_BOOT_SAME_TOLERANCE_SEC=45 is honored" || bad "numeric tolerance override ignored: $(_tol 45)"
+  [ "$(_tol abc)" = "300" ] && ok "non-numeric tolerance -> default 300" || bad "garbage tolerance must fall back to 300: $(_tol abc)"
+  [ "$(_tol '')" = "300" ] && ok "empty tolerance -> default 300" || bad "empty tolerance must fall back to 300: $(_tol '')"
+  unset -f _tol
+  # the weekly digest reads the same lines — the extra field must not disturb it
+  printf '2020-01-01 free_pct=60 swap_mb=1000 jetsam=0 disk_free_gb=100 boot=%s\n2020-01-02 free_pct=40 swap_mb=3000 jetsam=2 disk_free_gb=90 boot=unknown\n' "${_ST_BOOT_OLD}" > "${_ST_TREND}"
+  _digest="$(_weekly_digest "${_ST_TREND}")"
+  echo "$_digest" | grep "swap pico 3000MB, jetsam total 2, free% minimo 40%" >/dev/null && ok "weekly digest unchanged by the boot= field" || bad "digest disturbed by boot= field: $_digest"
 
   echo ""; echo "nightly-capacity-check selftest: PASS=$PASS FAIL=$FAIL"; [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 fi
