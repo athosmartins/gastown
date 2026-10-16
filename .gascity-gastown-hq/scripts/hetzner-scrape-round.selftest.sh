@@ -114,7 +114,7 @@ printf '%s\n' "$*" > "$HOME/args-last.txt"
 ( cd rig/main && find . -type f | sort ) > "$HOME/seen-tree.txt"
 ( cd shared/config 2>/dev/null && find . -type f | sort ) > "$HOME/seen-state.txt"
 mkdir -p "shared/data/$sc/2026-01-01_00h00m00s" shared/config
-echo '{"id":1}' > "shared/data/$sc/2026-01-01_00h00m00s/a.json"
+[ -n "${FAKE_SCRAPER_EMPTY:-}" ] || echo '{"id":1}' > "shared/data/$sc/2026-01-01_00h00m00s/a.json"
 echo '{"seen":["new"]}' > "shared/config/seen_$sc.json"
 echo "RESULT: 1 scraped"
 [ -z "${FAKE_SCRAPER_HANG:-}" ] || sleep 4
@@ -194,6 +194,7 @@ hsr -- run alpha --tenant t1 --limit 5 --stage "$T/stage" -- --finalidade venda
 check "run: rc 0 e imprime stage/files/secs" '[ $RC -eq 0 ] && has "^stage=.*/stage/alpha-t1-" && has "^files=1$" && has "^secs="'
 STG=$(ls -d "$T"/stage/alpha-t1-* 2>/dev/null | head -n 1)
 check "run: o resultado voltou (dados, seen atualizado, log do raspador)" '[ -f "$STG/shared/data/alpha/2026-01-01_00h00m00s/a.json" ] && grep -q new "$STG/shared/config/seen_alpha.json" && grep -q "RESULT: 1 scraped" "$STG/scraper.log"'
+check "run: o log jsonl registra 'ok' (com arquivos) e o stderr diz quantos arquivos de estado foram ao nó" 'grep -q "\"why\":\"ok\"" "$CITY/.gc/logs/hetzner-scrape.jsonl" && has "estado \\(seen/caches\\) enviado ao nó: [1-9]"'
 check "run: argumentos do raspador = --tenant --limit + os de depois do --" '[ "$(cat "$NODEHOME/args-last.txt")" = "--tenant t1 --limit 5 --finalidade venda" ]'
 check "run: o que foi ao nó é só código do raspador pedido (sem .env, token, csv, pyc, outro raspador, shared/ do rig, nem arquivo de nome desconhecido)" \
   'grep -q "./scrapers/alpha/scraper.py" "$NODEHOME/seen-tree.txt" && grep -q "./lib/util.py" "$NODEHOME/seen-tree.txt" && grep -q "./config/scope.json" "$NODEHOME/seen-tree.txt" && grep -q "./config/imoview_tenants.json" "$NODEHOME/seen-tree.txt" \
@@ -227,6 +228,13 @@ C0=$(ncalls)
 hsr -- run alpha --stage "$T/stage6b"
 check "run: lista de telefones no ESTADO (seen/caches) que iria ao nó -> 98, o nó NÃO é usado (mesma falha fechada do código)" '[ $RC -eq 98 ] && has "arquivo de estado com lista de telefones/CPFs" && [ -z "$(ls -A "$NODEHOME/gt-remote/scrape/runs")" ] && [ "$(( $(ncalls) - C0 ))" = 1 ]'
 cp "$T/seen_alpha.bak" "$SHARED/config/seen_alpha.json"
+# sem NENHUM arquivo de estado do raspador (os outros que casam o padrão são de segredo/irmão e ficam de fora) e sem nenhum resultado: o terceiro estado tem de aparecer, não virar um "ok" mudo
+mv "$SHARED/config/seen_alpha.json" "$T/seen_alpha.mv"; mv "$SHARED/config/alpha_listing_cache.json" "$T/alpha_cache.mv"
+: > "$CITY/.gc/logs/hetzner-scrape.jsonl"
+hsr FAKE_SCRAPER_EMPTY=1 -- run alpha --stage "$T/stage9"
+check "run: sem estado -> AVISO de que o raspador começa sem seen (e nenhum estado foi enviado)" '[ $RC -eq 0 ] && has "AVISO: nenhum arquivo de estado" && ! has "estado \\(seen/caches\\) enviado ao nó"'
+check "run: rc 0 com zero arquivos devolvidos -> files=0 e o log diz ok-sem-arquivos (não 'ok')" 'has "^files=0$" && grep -q "\"why\":\"ok-sem-arquivos\"" "$CITY/.gc/logs/hetzner-scrape.jsonl" && ! grep -q "\"why\":\"ok\"" "$CITY/.gc/logs/hetzner-scrape.jsonl"'
+mv "$T/seen_alpha.mv" "$SHARED/config/seen_alpha.json"; mv "$T/alpha_cache.mv" "$SHARED/config/alpha_listing_cache.json"
 hsr FAKE_SSH_DROP_POLL=1 -- run alpha --stage "$T/stage7"
 check "run: ssh que cai nas consultas -> desiste com 98 e deixa a pasta no nó" '[ $RC -eq 98 ] && has "desisto" && [ -n "$(ls -A "$NODEHOME/gt-remote/scrape/runs")" ]'
 sleep 1; find "$NODEHOME/gt-remote/scrape/runs" -mindepth 1 -delete 2>/dev/null

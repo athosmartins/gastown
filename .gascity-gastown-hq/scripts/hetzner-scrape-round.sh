@@ -164,12 +164,12 @@ REMOTE
   say "ambiente do nó pronto"
 }
 
-# filtro do rsync do CÓDIGO: segredo/dado/binário por NOME antes de qualquer `+`; depois só o que o raspador precisa, por caminho; `- *` fecha
 # exclusões por NOME, primeiras em qualquer filtro que mande algo ao nó (código E estado): credencial/segredo/dados de cliente não viajam mesmo que uma regra `+` mais abaixo case com eles
 name_exclusions() {
   printf '%s\n' '- .env' '- .env.*' '- *.pem' '- *.key' '- *.p12' '- *.pfx' '- *.pkl' '- *.pickle' '- *.db' '- *.sqlite*' '- *.duckdb*' '- *.parquet' '- *.csv' '- *.xlsx' '- *.gz' '- *.zip' \
       '- *token*' '- *secret*' '- *credential*' '- *password*' '- client_secret*' '- service_account*' '- .netrc' '- .npmrc' '- .pgpass' '- *cookie*' '- *session*' '- __pycache__/' '- *.pyc' '- .git/' '- venv/' '- .venv/' '- shared/' '- logs/'
 }
+# filtro do rsync do CÓDIGO: as exclusões por nome primeiro; depois só o que o raspador precisa, por caminho; `- *` fecha
 write_code_filter() { # write_code_filter <arquivo> <raspador>
   local f=$1 sc=$2 t
   {
@@ -244,6 +244,7 @@ probe_loop() {
     [ -n "$u" ] || continue
     o=$(mktemp)
     meta=$(curl -s -L -m 25 -A "$UA" -H 'Accept-Language: pt-BR,pt;q=0.9' -o "$o" -w '%{http_code} %{size_download}' "$u" 2>/dev/null)
+    [ -n "$meta" ] || meta="000 0"   # curl ausente ou sem saída = falha de conexão (visível na tabela), nunca uma linha com os campos deslocados
     mk=$(grep -a -o -i -E 'just a moment|captcha|access denied|attention required|px-captcha|pardon our interruption|request blocked' "$o" | head -n 1 | tr ' ' '_')
     echo "$meta ${mk:--} $u"
     rm -f "$o"
@@ -301,7 +302,10 @@ cmd_run() {
   rssh "mkdir -p $remote_rel/rig/main $remote_rel/shared/config $remote_rel/shared/data" || die 98 "ssh caiu ao preparar a pasta da rodada"
   "$RSYNC_BIN" -a --delete --delete-excluded --filter=". $code_f" -e "$SSH_BIN $SSH_OPTS" "$PS_CODE"/ "$NODE_HOST:$remote_rel/rig/main/" >/dev/null 2>&1 || die 98 "rsync do código ao nó falhou"
   if [ -s "$pii_list.state" ]; then
+    say "estado (seen/caches) enviado ao nó: $(wc -l < "$pii_list.state" | tr -d ' ') arquivo(s)"
     "$RSYNC_BIN" -a --filter=". $state_f" -e "$SSH_BIN $SSH_OPTS" "$PS_SHARED"/config/ "$NODE_HOST:$remote_rel/shared/config/" >/dev/null 2>&1 || die 98 "rsync do estado (seen/caches) ao nó falhou"
+  else
+    say "AVISO: nenhum arquivo de estado (seen/caches) de '$sc' em $PS_SHARED/config — o raspador começa SEM seen (tudo conta como novo)"
   fi
 
   # o raspador roda DESACOPLADO (setsid nohup): queda do ssh não o mata. Escreve rc em <rodada>/rc e o texto em <rodada>/scraper.log
@@ -339,7 +343,7 @@ REMOTE
   rssh "find $RBASE/runs -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec sh -c 'find \"\$1\" -mindepth 1 -delete; rmdir \"\$1\"' _ {} \;" >/dev/null 2>&1
   echo "stage=$stage"; echo "files=$n"; echo "secs=$(( $(date +%s) - t0 ))"
   if [ "$raw" -ge 96 ]; then echo "scraper_rc_raw=$raw"; jlog "$sc" "$tn" 95 $(( $(date +%s) - t0 )) "$n" "rc-cru-$raw" "$stage"; exit 95; fi
-  jlog "$sc" "$tn" "$raw" $(( $(date +%s) - t0 )) "$n" "ok" "$stage"
+  jlog "$sc" "$tn" "$raw" $(( $(date +%s) - t0 )) "$n" "$([ "$n" -ge 1 ] && echo ok || echo ok-sem-arquivos)" "$stage"
   exit "$raw"
 }
 
