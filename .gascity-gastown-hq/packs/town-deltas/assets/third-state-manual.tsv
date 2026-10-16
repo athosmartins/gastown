@@ -1,0 +1,11 @@
+# third-state-manual.tsv — manual classification of gate REJECTIONS, read by third-state-report.py (ga-57e7l0.2).
+# One row per (bead, UTC day): every reviewer FAIL of that bead on that day gets the class. A manual row wins over the label
+# root-class:error-vs-empty, because the label undercounts (gate-run ga-91m4ga, bead wa-jkr1bh.14.4, has none and is third state).
+# Columns, TAB-separated: bead  UTC-day  class (3o-estado | outro)  source. A row that does not parse is counted and shown, never applied.
+ga-2hd02v	2026-10-14	3o-estado	ga-57e7l0 "Medido": os.walk sem onerror
+wa-79wc4z	2026-10-14	3o-estado	ga-57e7l0 "Medido": falha em demandas_antigas lida como em branco
+wa-cng2n8	2026-10-14	3o-estado	ga-57e7l0 "Medido": GetZip falhou = R$ 0 medido
+wa-e8u3e5.1	2026-10-14	3o-estado	ga-57e7l0 "Medido": id ilegível = não novo; --check fresco sem execução
+wa-jkr1bh.14.4	2026-10-14	3o-estado	ga-57e7l0 "Medido": pendentes ignorado
+wa-unprab	2026-10-14	3o-estado	ga-57e7l0 "Medido": lista vazia = nenhum
+ga-m9wpnk	2026-10-14	outro	ga-57e7l0 "Medido": a 7ª reprovada, bloqueio que não é 3º estado

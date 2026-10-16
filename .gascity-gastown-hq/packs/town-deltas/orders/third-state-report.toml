@@ -1,0 +1,11 @@
+# ga-57e7l0.2 (fatia 3/3): once a day, the 7-day readout of the story's two numbers — first-attempt approval and the third-state share of
+# rejections — per delivery path and per arm. Read-only: assets/third-state-report.py reads .gc/quality-gate.jsonl, the E12 roster and
+# `bd comments` of the failed gate runs; --save leaves ONE text file (.gc/third-state-report.last.txt) plus the answered-reads cache.
+# No bead, no mail, no notify: the readout is pulled (docs/runbooks/third-state-report.md), not pushed. Exit 2 = the gate log could not be
+# read (NÃO SEI, never a 0% report); the order shows up as failed instead of as a quiet zero.
+[order]
+description = "Diário: 1ª tentativa e % de reprovações por 3º estado, por caminho e braço, janela de 7 dias — grava .gc/third-state-report.last.txt (ga-57e7l0.2)"
+trigger = "cooldown"
+interval = "24h"
+timeout = "1500s"
+exec = "$PACK_DIR/assets/third-state-report.py --save"
