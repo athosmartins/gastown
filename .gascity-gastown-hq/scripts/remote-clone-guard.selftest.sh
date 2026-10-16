@@ -4,19 +4,13 @@
 # Contents
 #   Casos · Controle negativo (mutantes) · Variáveis
 #
-# CASOS (grupos): block — escrita de git no clone ALHEIO (commit/push/merge/rebase/reset/cherry-pick/checkout/add/stash/clean/branch -D/
-#   tag -d/revert/am/apply/switch/restore/rm/mv/update-ref/fetch/pull), por -C, -C relativo, -C encadeado, ~/, --git-dir, --work-tree,
-#   GIT_DIR=, symlink do meu clone para o alheio, cwd dentro do alheio, o espelho repo.git · pass — leitura no clone alheio (log/status/
-#   diff/show/rev-parse/ls-files/blame/branch/tag -l/stash list/config --get/remote -v/worktree list), escrita no PRÓPRIO clone (cwd, -C,
-#   subpasta, cd), escrita fora do território, comando que só CITA o outro clone (echo, mensagem de commit, corpo de heredoc), subshell
-#   que volta de cd · evade — a mesma escrita embrulhada: command/env/sudo/xargs/caminho do git, bash -c, sh -c, eval, $(…), crase,
-#   find -exec, ; && || | ( ), heredoc, -c user.name · closed — o que não sei NÃO vira liberado: variável, glob, ~usuário, cd para variável,
-#   subcomando desconhecido, JSON ruim, sem CLAUDE_PROJECT_DIR, aninhamento fundo · tools — Edit/Write/MultiEdit/NotebookEdit no clone
-#   alheio bloqueiam, no próprio e fora do território liberam, Read passa · msg — a mensagem diz o alvo, o clone próprio, que não é o
-#   usuário cancelando e que leitura segue liberada · check — --selfcheck com settings bom e com cada defeito (sem Bash, sem Edit, sem
-#   `|| exit 2`, outro caminho, disableAllHooks) · hook — o comando de hook de verdade (`python3 -I <guarda> || exit 2`) sai 2 se o guarda
-#   trava, some ou tem erro de sintaxe (falha fechada), e 0 se libera.
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (28 mutantes); e
+# CASOS (grupos; o nome de cada caso diz o que ele prova): block — escrita de git no clone ALHEIO (por -C, --git-dir, GIT_DIR, ~/, symlink,
+#   cwd, o espelho repo.git) · pass — leitura no clone alheio, escrita no PRÓPRIO clone e fora do território, comando que só CITA o outro
+#   clone · evade — a mesma escrita embrulhada (command/env/sudo/xargs, bash -c, eval, $(…), crase, find -exec, ; && || |, heredoc) ·
+#   closed — o que não sei NÃO vira liberado (variável, glob, ~usuário, subcomando desconhecido, JSON ruim) · tools — Edit/Write/MultiEdit/
+#   NotebookEdit · msg — o texto da recusa · check — --selfcheck com settings bom e com cada defeito · hook — o comando de hook de
+#   verdade (`python3 -I <guarda> || exit 2`) sai 2 se o guarda trava, some ou tem erro de sintaxe (falha fechada), e 0 se libera.
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (37 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 set -u
@@ -137,6 +131,16 @@ EOF"
   b 0 "pass: \$( ) em heredoc COM aspas é texto" "cat <<'EOF'
 \$(git -C $OTH commit)
 EOF"
+  for c in "export GIT_DIR=$OTH/.git; git commit" "export GIT_WORK_TREE=$OTH && git add ." "declare -x GIT_DIR=$OTH/.git; git commit" "GIT_DIR=$OTH/.git; git commit" \
+           "env GIT_DIR=$OTH/.git git commit" "sudo GIT_DIR=$OTH/.git git commit" "env -C $OTH git commit" "env --chdir=$OTH git commit" "env -C$OTH git commit" \
+           "sudo -D $OTH git commit" "env -S 'git -C $OTH commit'" "env -C $OTH find . -exec git commit {} \\;" "git -C $OTH remote -v add x y" "git -C $OTH remote add x y" \
+           "git -C $OTH log --output=x" "git -C $OTH diff --output x" "git -C $OTH fsck --lost-found" "git -C $OTH grep --open-files-in-pager=x y"; do
+    b 2 "evade: $c" "$c"
+  done
+  for c in "export GIT_DIR=$OWN/.git; git commit" "export FOO=1; git commit" "export GIT_DIR=$OTH/.git; git log" "env -C $OTH git log" "env -C $OWN git log" "git -C $OTH remote -v" \
+           "git -C $OTH remote show origin" "git -C $OTH remote get-url origin" "git -C $OTH diff --stat" "GIT_DIR=$OTH/.git git log; git commit -m x"; do
+    b 0 "pass: $c" "$c"
+  done
   b 0 "pass: \$( ) de leitura no alheio" "echo \$(git -C $OTH log -1)"
   b 0 "pass: \$( ) que não é git" "echo \$(date) \`hostname\`"
 }
@@ -178,9 +182,13 @@ g_tools() {
     g 2 "tools: $1 no espelho" "$1" "$2" "$TERR/r/repo.git/HEAD"
     g 0 "tools: $1 no próprio clone" "$1" "$2" "$OWN/sub/f.txt"
     g 0 "tools: $1 fora do território" "$1" "$2" "$OUT/f.txt"
+    g 2 "tools: $1 em ~/.claude/hooks (desligaria o guarda)" "$1" "$2" "$HOME/.claude/hooks/remote-clone-guard.py"
+    g 2 "tools: $1 em ~/.claude/settings.json" "$1" "$2" "$HOME/.claude/settings.json"
   done
   g 2 "tools: Write sem clone próprio (sem projeto)" Write file_path "$OWN/f" "$OWN" ""
   g 2 "tools: Edit com caminho relativo e sem cwd resolvível" Edit file_path "x.txt" "" "$OWN"
+  g 0 "tools: Write em .claude/settings.json do PRÓPRIO clone passa" Write file_path "$OWN/.claude/settings.json"
+  g 0 "tools: Write em ~/.claude/projects passa" Write file_path "$HOME/.claude/projects/x.jsonl"
   g 0 "tools: Read de arquivo do outro clone passa" Read file_path "$OTH/f.txt"
   g 0 "tools: ferramenta desconhecida passa" WebFetch url "http://x"
 }
@@ -214,6 +222,14 @@ g_check() {
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; sed -i.bak "s#$P#/outro/guarda.py#" "$s"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: o hook chama outro arquivo → falha"
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));d["disableAllHooks"]=True;json.dump(d,open(sys.argv[1],"w"))' "$s"
   python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: disableAllHooks ligado → falha"
+  settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; local pd="$T/proj" cl; mkdir -p "$pd/.claude"
+  chk() { python3 -I "$P" --selfcheck "$s" "$pd" >"$T/o" 2>"$T/err"; }
+  chk; ok $? "check: pasta do projeto sem settings (camada ausente) → ok"
+  for cl in settings.json settings.local.json; do
+    echo '{"disableAllHooks": true}' > "$pd/.claude/$cl"; chk; [ $? = 1 ]; ok $? "check: projeto/$cl liga disableAllHooks → falha"
+    echo '{"permissions": {}}' > "$pd/.claude/$cl"; chk; ok $? "check: projeto/$cl sem disableAllHooks → ok"
+    echo 'lixo' > "$pd/.claude/$cl"; chk; [ $? = 1 ]; ok $? "check: projeto/$cl ilegível → falha (não sei ≠ ok)"; rm -f "$pd/.claude/$cl"
+  done
   echo '{}' > "$s"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: settings sem hooks → falha"
   echo 'não é json' > "$s"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: settings ilegível → falha"
   python3 -I "$P" --selfcheck "$T/nao-existe.json" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: settings ausente → falha"
@@ -254,8 +270,8 @@ echo "== $((n-fails))/$n ok =="
   mutant block "realpath (symlink)" 's/os.path.realpath(os.path.join(cwd or "\/", p))/os.path.abspath(os.path.join(cwd or "\/", p))/'
   mutant block "-C não é seguido" 's/cwd, i = res(seg\[i + 1\], cwd), i + 2/i += 2/'
   mutant evade "cd não muda o diretório" 's/st\["cwd"\] = res(seg\[1\] if len(seg) > 1 else "~", st\["cwd"\])/pass/'
-  mutant evade "bash -c não é aberto" 's/return scan(seg\[j + 1\], st\["cwd"\], terr, own, depth + 1)/pass/'
-  mutant evade "eval não é aberto" 's/return scan(" ".join(seg\[1:\]), st\["cwd"\], terr, own, depth + 1)/pass/'
+  mutant evade "bash -c não é aberto" 's/return scan(seg\[j + 1\], cwd, terr, own, depth + 1)/pass/'
+  mutant evade "eval não é aberto" 's/return scan(" ".join(seg\[1:\]), cwd, terr, own, depth + 1)/pass/'
   mutant evade "\$( ) não é aberto" 's/r = scan(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], terr, own, depth + 1)/r = None/'
   mutant evade "crase não vira \$( )" 's/cmd, out, i = BACKTICK.sub(r"$(\\1)", cmd), \[\], 0/cmd, out, i = cmd, [], 0/'
   mutant evade "parêntese dentro do \$( ) não é contado" 's/d + (cmd\[k\] == "(") - /d - /'
@@ -275,6 +291,15 @@ echo "== $((n-fails))/$n ok =="
   mutant check "selfcheck aceita hook que chama outro arquivo" 's/me in h.get("command", "") and/True and/'
   mutant check "selfcheck não exige '|| exit 2'" 's/ and h\["command"\].endswith("|| exit 2")//'
   mutant check "selfcheck ignora disableAllHooks" 's/if s.get("disableAllHooks"):/if False:/'
+  mutant check "selfcheck ignora a camada do projeto" 's/for d in args\[1:\]:/for d in []:/'
+  mutant evade "opção de env/sudo que muda o diretório não deixa o guarda cego" 's/^\( *\)blind = blind or seg\[0\]\[:2\].*/\1pass/'
+  mutant evade "export/declare não são lidos" 's/if c in ("export", "declare", "typeset"):/if False:/'
+  mutant evade "VAR=x solta não vale para o git seguinte" 's/st\["env"\].update(env)  # /pass  # /'
+  mutant evade "VAR=x depois de env/sudo é descartada" 's/env\[m.group(1)\] = m.group(2)$/pass/'
+  mutant evade "env -S (comando inteiro numa palavra) não é reaberto" 's/if " " in seg\[0\]:/if False:/'
+  mutant evade "remote -v add vira leitura" 's/rest in (\[\], \["-v"\]) or/rest[:1] in ([], ["-v"]) or/'
+  mutant evade "--output/--lost-found em comando de leitura" 's/    if any(WRITES.match(t) for t in rest):/    if False:/'
+  mutant tools "Edit/Write em ~\/.claude\/hooks e settings passam" 's/p is None or claude_conf(p) or (inside/p is None or (inside/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
   r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,tools,msg,check" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"

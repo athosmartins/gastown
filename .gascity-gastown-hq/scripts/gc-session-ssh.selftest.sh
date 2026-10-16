@@ -357,7 +357,7 @@ echo "== $((n-fails))/$n ok =="
   mutant gate "nome de teste sem o hífen (remote-e2e1 vira teste)" 's/remote-(?:e2e|test)-\[A-Za-z0-9_-\]+/remote-(?:e2e|test)[A-Za-z0-9_-]*/'
   mutant gate "nome de teste sem âncora (my-remote-e2e-1 vira teste)" 's/if TEST_RE.fullmatch(name):/if TEST_RE.search(name):/'
   mutant gate "sem conferir o sha do guarda" 's/\[ "\$h" = {sha} \] ||/true ||/'
-  mutant gate "sem rodar o --selfcheck" 's/o=\$(python3 -I {g} --selfcheck {st} 2>&1)/o=$(true)/'
+  mutant gate "sem rodar o --selfcheck" 's/o=\$(python3 -I {g} --selfcheck {st} {q(work_dir)} 2>&1)/o=$(true)/'
   mutant gate "script do host que sai 0 (a recusa vira 'abriu')" 's/exit {EX_POLICY}/exit 0/g'
   mutant gate "guarda do repositório ilegível passa" 's/^        raise Fail(f"sessão real {name!r} recusada: não consegui ler.*$/        sha = ""/'
   mutant dry "o dry-run diz 'teste' para tudo" 's/session_kind="teste" if TEST_RE.fullmatch(name) else "real"/session_kind="teste"/'

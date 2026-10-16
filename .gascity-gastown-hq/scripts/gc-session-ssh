@@ -36,7 +36,7 @@ O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
   remote-e2e-<x> ou remote-test-<x> (a sessão mínima de teste). Qualquer outro nome exige (1) `real_sessions_released_by` na config do host
   — decisão EXPLÍCITA do Mayor; ausente, vazio ou não-texto = recusa, sem ssh — e (2) conferir NO host, dentro do mesmo script do start,
   que {remote_home}/.claude/hooks/remote-clone-guard.py é byte a byte o do repositório e que o `--selfcheck` dele aprova as settings
-  do host (hook em Bash/Edit/Write/MultiEdit/NotebookEdit, com `|| exit 2`, sem disableAllHooks); senão exit 12 do script e nada abre.
+  do host e a pasta da sessão (hook em Bash/Edit/Write/MultiEdit/NotebookEdit, com `|| exit 2`, sem disableAllHooks em nenhuma camada); senão exit 12 do script e nada abre.
 
 CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta acima de scripts/)
   {"default_host": "hetzner", "hosts": {"hetzner": {"ssh": "hetzner-teste", "cap": 4,
@@ -273,7 +273,7 @@ def launcher(cfg: Cfg, name: str, p: dict) -> str:
     return "\n".join(out + [f"sh -c {q(p['command'])}", "rc=$?", f'[ "$rc" -eq 0 ] || echo "saiu com $rc" >{q(exitf)}', 'exit "$rc"']) + "\n"
 
 
-def real_gate(cfg: Cfg, name: str) -> str:
+def real_gate(cfg: Cfg, name: str, work_dir: str) -> str:
     """'' = sessão de teste (passa); senão o trecho de sh que confere o guarda de clone NO host. Sem liberação, ou sem como conferir → Fail."""
     if TEST_RE.fullmatch(name):
         return ""
@@ -288,7 +288,7 @@ def real_gate(cfg: Cfg, name: str) -> str:
     g, st = q(f"{cfg.home}/.claude/hooks/{GUARD}"), q(f"{cfg.home}/.claude/settings.json")
     return (f'h=$( {{ sha256sum {g} || shasum -a 256 {g}; }} 2>/dev/null | cut -d" " -f1)\n'
             f'[ "$h" = {sha} ] || {{ echo "sessão real {name} recusada: {GUARD} ausente ou diferente do repositório no host" >&2; exit {EX_POLICY}; }}\n'
-            f'o=$(python3 -I {g} --selfcheck {st} 2>&1) || {{ echo "sessão real {name} recusada: o --selfcheck do guarda reprovou as settings do host: $o" >&2; exit {EX_POLICY}; }}\n')
+            f'o=$(python3 -I {g} --selfcheck {st} {q(work_dir)} 2>&1) || {{ echo "sessão real {name} recusada: o --selfcheck do guarda reprovou as settings do host: $o" >&2; exit {EX_POLICY}; }}\n')
 
 
 def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
@@ -299,7 +299,7 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     if not isinstance(req, dict):
         raise Fail("start: a entrada tem que ser um objeto JSON")
     p = plan_start(cfg, name, req)
-    gate = "" if dry else real_gate(cfg, name)
+    gate = "" if dry else real_gate(cfg, name, p["work_dir"])
     run_dir, exitf = f"{cfg.root}/run", f"{cfg.root}/run/{name}.exit"
     lpath = f"{run_dir}/{name}.sh"
     if dry:

@@ -21,12 +21,13 @@ COMO DECIDE (os três estados — sei que pode / sei que não pode / não sei �
   Falha do próprio guarda (JSON ruim, exceção) → bloqueia: o comando do hook é `python3 -I <este arquivo> || exit 2`, então travar,
   sumir o python ou o arquivo também sai com 2 (o hook que sai com 1 ou 127 NÃO bloqueia: seria falha aberta).
 
-CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json]`: 0 se o guarda decide como deveria numa pasta de teste E (com o
-  settings) todo PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit chama ESTE arquivo com `|| exit 2` e `disableAllHooks` não está
-  ligado; 1 caso contrário (é o que o provider confere antes de abrir sessão real).
+CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E
+  (com o settings) todo PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit chama ESTE arquivo com `|| exit 2` e `disableAllHooks` não está
+  ligado nele nem em <pasta>/.claude/settings[.local].json; 1 caso contrário (é o que o provider confere antes de abrir sessão real).
+  Edit/Write em ~/.claude/hooks/** e ~/.claude/settings*.json também são bloqueados (o guarda não se desliga por engano).
 
 LIMITES (é trava contra engano, não sandbox contra quem quer burlar): script que o comando executa (`bash x.sh`), `python -c`, `source`,
-  variável que guarda o git, e redirecionamento de shell (`> arquivo`) ou `rm`/`cp` no clone alheio não são vistos. O fecho de verdade
+  variável que guarda o git, e redirecionamento de shell (`> arquivo`), `sed -i`, `rm`/`cp` no clone alheio ou nos hooks não são vistos. O fecho de verdade
   (usuário Unix por sessão) é outro trabalho; ver o runbook.
 """
 from __future__ import annotations
@@ -44,10 +45,11 @@ READ = {"log", "status", "diff", "show", "rev-parse", "rev-list", "ls-files", "l
         "check-ignore", "count-objects", "fsck", "version", "help", "var", "cherry", "range-diff", "show-branch", "annotate", ""}
 LIST_FLAGS = {"branch": {"-l", "--list", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current"},
               "tag": {"-l", "--list", "-n"}}
+WRITES = re.compile(r"--(?:output|lost-found|open-files-in-pager|ext-diff)(?:=|$)|-O")  # flag de comando de LEITURA que grava arquivo ou roda programa
 PUNCT, SEPS = set("();<>|&"), {";", "&&", "||", "|", "&", "|&", ";;"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 WRAP = {"command", "builtin", "exec", "nohup", "time", "env", "sudo", "doas", "xargs", "nice", "timeout", "stdbuf", "setsid"}
-OPT_ARG = {"-I", "-n", "-L", "-P", "-d", "-s", "-E", "-u", "-g", "-C"}  # opções de xargs/sudo/env que levam o valor no argumento seguinte
+OPT_ARG = {"-I", "-n", "-L", "-P", "-d", "-s", "-E", "-u", "-g", "-C", "-D", "--chdir"}  # opções de xargs/sudo/env que levam o valor no argumento seguinte
 ASSIGN, NUM = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S), re.compile(r"\d+[smhd]?")
 SHELLY = re.compile(r"[$`*?\[{]")
 PIECE = re.compile(r"&&|\|\||\|&|;;|[;&|()]|[<>]+&?")
@@ -81,14 +83,22 @@ def own_clone(proj, terr: str):
     return None
 
 
+def claude_conf(p: str) -> bool:
+    """Hook ou settings do claude no HOME: quem os escreve desliga este guarda (o provider só os confere na ABERTURA da sessão)."""
+    h = os.path.realpath(os.path.expanduser("~")) + "/.claude/"
+    return p.startswith(h) and bool(re.fullmatch(r"hooks/.*|settings[^/]*\.json", p[len(h):]))
+
+
 def is_read(sub: str, rest: list) -> bool:
+    if any(WRITES.match(t) for t in rest):
+        return False
     if sub in READ:
         return True
     if sub in LIST_FLAGS:
         return all(t in LIST_FLAGS[sub] for t in rest)
     first = rest[0] if rest else ""
     return ((sub == "stash" and first in ("list", "show")) or (sub == "worktree" and first == "list") or (sub == "reflog" and first in ("", "show"))
-            or (sub == "notes" and first in ("list", "show")) or (sub == "remote" and (not rest or rest[0] in ("-v", "show", "get-url")))
+            or (sub == "notes" and first in ("list", "show")) or (sub == "remote" and (rest in ([], ["-v"]) or rest[:1] in (["show"], ["get-url"]) or rest[:2] in (["-v", "show"], ["-v", "get-url"])))
             or (sub == "config" and any(t in ("--get", "--get-all", "--get-regexp", "--list", "-l") for t in rest)))
 
 
@@ -120,8 +130,10 @@ def words(cmd: str) -> list:
 
 
 def peel(seg: list):
-    """Tira atribuições (VAR=x) e embrulhos (command, env, sudo, xargs…) do começo: devolve (atribuições, o comando de verdade)."""
+    """Tira atribuições (VAR=x) e embrulhos (command, env, sudo, xargs…) do começo: devolve (atribuições, o comando de verdade, cego).
+    cego = uma opção do embrulho (env -C/-S/--chdir, sudo -D) muda onde o comando roda e o guarda não a modela: o diretório vira "não sei"."""
     env: dict = {}
+    blind = False
     while seg:
         m = ASSIGN.fullmatch(seg[0])
         if m:
@@ -129,10 +141,14 @@ def peel(seg: list):
         elif os.path.basename(seg[0]) in WRAP:
             seg = seg[1:]
             while seg and (seg[0].startswith("-") or ASSIGN.fullmatch(seg[0]) or NUM.fullmatch(seg[0])):
+                m = ASSIGN.fullmatch(seg[0])
+                if m:  # `env GIT_DIR=x git …` também aponta o git para outro lugar
+                    env[m.group(1)] = m.group(2)
+                blind = blind or seg[0][:2] in ("-C", "-D", "-S") or seg[0].startswith(("--chdir", "--split-string"))
                 seg = seg[2:] if seg[0] in OPT_ARG else seg[1:]
         else:
             break
-    return env, seg
+    return env, seg, blind
 
 
 def git_hit(seg: list, env: dict, cwd, terr: str, own):
@@ -164,36 +180,42 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
     """O 1º (alvo, operação) de escrita contra clone alheio no comando, ou None. alvo None = não consegui resolver."""
     if depth > 3:
         return None, "comando aninhado fundo demais para conferir"
-    st, stack, seg = {"cwd": cwd}, [], []
+    st, stack, seg = {"cwd": cwd, "env": {}}, [], []
 
-    def one(seg: list):
+    def one(seg: list, blind: bool = False):
         for w in seg:  # $(…) e crases dentro de qualquer palavra rodam (até no valor de VAR=…): confere o miolo
             for m in SUBST.finditer(w):
                 r = scan(bytes.fromhex(m.group(1)).decode(), st["cwd"], terr, own, depth + 1)
                 if r:
                     return r
-        env, seg = peel(seg)
+        env, seg, b = peel(seg)
+        blind = blind or b
         if not seg:
+            st["env"].update(env)  # `GIT_DIR=x; git …`: sem saber se foi exportada, vale para os comandos seguintes
             return None
-        c = os.path.basename(seg[0])
-        if c in ("cd", "pushd"):
+        cwd, c = None if blind else st["cwd"], os.path.basename(seg[0])
+        if " " in seg[0]:  # env -S 'git -C x commit': um comando inteiro numa palavra só
+            return scan(" ".join(seg), cwd, terr, own, depth + 1)
+        if c in ("export", "declare", "typeset"):
+            st["env"].update({m.group(1): m.group(2) for m in map(ASSIGN.fullmatch, seg[1:]) if m})
+        elif c in ("cd", "pushd"):
             st["cwd"] = res(seg[1] if len(seg) > 1 else "~", st["cwd"])
         elif c == "popd":
             st["cwd"] = None
         elif c in SHELLS:
             for j, t in enumerate(seg[1:-1], 1):
                 if re.fullmatch(r"-[a-z]*c[a-z]*", t):
-                    return scan(seg[j + 1], st["cwd"], terr, own, depth + 1)
+                    return scan(seg[j + 1], cwd, terr, own, depth + 1)
         elif c == "eval":
-            return scan(" ".join(seg[1:]), st["cwd"], terr, own, depth + 1)
+            return scan(" ".join(seg[1:]), cwd, terr, own, depth + 1)
         elif c == "find":
             for j, t in enumerate(seg):
                 if t in ("-exec", "-execdir", "-ok", "-okdir"):
-                    r = one(seg[j + 1:])
+                    r = one(seg[j + 1:], blind)
                     if r:
                         return r
         elif c == "git":
-            return git_hit(seg, env, st["cwd"], terr, own)
+            return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
         return None
 
     skip = False
@@ -226,8 +248,8 @@ def decide(inp: dict, terr: str, proj):
         return scan(str(ti.get("command") or ""), os.path.realpath(cwd) if cwd else None, terr, own)
     if tool in TOOLS_FILE:
         p = res(str(ti.get(TOOLS_FILE[tool]) or ""), os.path.realpath(cwd) if cwd else None, shell=False)
-        if p is None or (inside(p, terr) and not (own and inside(p, own))):
-            return p, "escrita de arquivo (" + tool + ")"
+        if p is None or claude_conf(p) or (inside(p, terr) and not (own and inside(p, own))):
+            return p, "escrita de arquivo (" + tool + ")" + (" em hook/settings do claude" if p and claude_conf(p) else "")
     return None
 
 
@@ -237,7 +259,7 @@ def message(hit, terr: str, proj) -> str:
     why = (f"Alvo: {target}\n" if target else "Alvo: não consegui resolver o caminho (variável, glob, crase ou ~usuário)\n")
     return ("[HOOK BLOCK: remote-clone-guard] NÃO É CANCELAMENTO DO USUÁRIO — política automática de isolamento entre sessões.\n"
             f"BLOQUEADO: {op} fora do seu clone.\n{why}Seu clone: {own or '(nenhum: CLAUDE_PROJECT_DIR fora do território ' + terr + ')'}\n"
-            "Cada sessão escreve só no PRÓPRIO worktree; o clone de outra sessão e o espelho (repo.git) não são seus. Para publicar: faça "
+            "Cada sessão escreve só no PRÓPRIO worktree; o clone de outra sessão, o espelho (repo.git) e os hooks/settings do claude não são seus. Para publicar: faça "
             "commit no seu worktree e dê push da sua branch (worker/<bead>). Se o caminho tem variável ou glob, use o caminho literal.\n"
             "Leitura continua liberada: git -C <outro clone> log / status / diff / show.\n")
 
@@ -267,6 +289,10 @@ def selfcheck(args: list) -> int:
             groups = (s.get("hooks") or {}).get("PreToolUse") or []
             if s.get("disableAllHooks"):
                 raise ValueError("disableAllHooks ligado")
+            for d in args[1:]:  # a camada do PROJETO (a pasta da sessão) também pode ligar disableAllHooks: ausente = nada a conferir; ilegível = falha
+                for f in (os.path.join(d, ".claude", n) for n in ("settings.json", "settings.local.json")):
+                    if os.path.exists(f) and json.load(open(f)).get("disableAllHooks"):
+                        raise ValueError(f"{f}: disableAllHooks ligado na camada do projeto")
             for tool in ("Bash",) + tuple(TOOLS_FILE):
                 if not any((g.get("matcher") in (None, "", "*") or re.fullmatch(g["matcher"], tool)) and any(me in h.get("command", "") and h["command"].endswith("|| exit 2")
                                                                               for h in g.get("hooks", [])) for g in groups):
