@@ -48,7 +48,8 @@
 #   SOMBRA        nas primeiras 24 h da bandeira (HETZNER_SHADOW_WINDOW_S) ~10% das baterias (HETZNER_SHADOW_PCT) rodam TAMBÉM no MBP, em paralelo;
 #                 rc diferente (ou arquivos reprovados diferentes) vai para $CITY/.gc/logs/hetzner-shadow.jsonl e os arquivos divergentes entram na
 #                 lista aprendida. Quem chamou recebe sempre o resultado do nó; a sombra só mede. rc de AMBIENTE (96..99, 124, 126/127, >=128) de um
-#                 dos lados não é veredito de teste: vira `skipped` e NADA é aprendido (a lista aprendida não expira).
+#                 dos lados não é veredito de teste: vira `skipped` e NADA é aprendido (a lista aprendida não expira). O mesmo vale para saída de um
+#                 dos lados que não abre: "não consegui ler" não é "nenhum arquivo reprovou".
 #   PARALELISMO   pytest-xdist (-n) em baterias grandes (>= HETZNER_XDIST_MIN_TESTS testes, 40), com núcleos / baterias em curso; nunca por cima de
 #                 -n, -p no:xdist, --pdb, --co, --lf... do chamador. O ganho do nó é o paralelismo: um teste só empata com o mini.
 #   LOG           toda linha de $CITY/.gc/logs/mbp-run.jsonl traz "host":"hetzner"|"mbp" (e "shadow":1 no lado de sombra do MBP).
@@ -745,6 +746,10 @@ shadow_finish() { # rc_do_nó arquivo_da_saída_do_nó "$@" (args originais). Es
     wait "$SHADOW_PID" 2>/dev/null; brc=$?
     if shadow_no_verdict "$brc"; then
       shadow_log skipped "$arc" "$brc" "" 0; say "sombra: o MBP não deu veredito de teste (rc=$brc: não rodou, tempo ou sinal) — sem veredito, nada aprendido"
+    elif [ ! -r "$aout" ] || [ ! -r "$SHADOW_OUT" ]; then
+      # failed_files devolve VAZIO tanto para "nenhum arquivo reprovou" quanto para "não consegui ler a saída" (arquivo apagado, disco que falhou): comparar um vazio desses com a lista do outro lado
+      # ensinaria mac-only (para sempre) a partir de um problema local. Saída que não abre = sem veredito, nada aprendido.
+      shadow_log skipped "$arc" "$brc" "" 0; say "sombra: a saída de um dos lados não pôde ser lida — sem veredito, nada aprendido"
     else
       af=$(failed_files "$aout"); bf=$(failed_files "$SHADOW_OUT")
       if [ "$arc" = "$brc" ] && [ "$af" = "$bf" ]; then shadow_log same "$arc" "$brc" "" 0

@@ -35,7 +35,7 @@
 #   pasta liberados, o arquivo com LISTA de telefones (>=20) ou CPFs (>=3), deixa passar 3 números e cauda sintética, e SEM a varredura (hetzner-pii-scan.py) o nó NÃO é usado · arquivo que a varredura não lê, ou caminho retido com barra invertida que a regra `- /caminho` não segura (conferido por um 2º rsync -n), também: o nó NÃO é usado ·
 #   filtro ausente, vazio, fora de ordem, sem o `- *` final, sem uma regra-âncora, com `+` que inclua tudo (`+ /**`...), `!` ou `.` = o nó NÃO é usado.
 #   FATIA 2: lista mac-only (glob, node id, caminho absoluto, comentário/CRLF, aprendida; ausente ou ilegível = o nó NÃO é usado) · xdist (limiar, núcleos/baterias, o -n
-#   do chamador vence, xdist ausente/ilegível) · sombra (igual, diverge por rc e por arquivo, MBP fora, MBP lento, janela de 24 h, abortada; rc de ambiente 124/137/127/97 de qualquer lado = `skipped`, nada aprendido; a mensagem só diz "marcado" do que foi gravado).
+#   do chamador vence, xdist ausente/ilegível) · sombra (igual, diverge por rc e por arquivo, MBP fora, MBP lento, janela de 24 h, abortada; rc de ambiente 124/137/127/97 de qualquer lado, ou saída de um lado que não abre = `skipped`, nada aprendido; a mensagem só diz "marcado" do que foi gravado).
 # MBP_RUN_UNDER_TEST=<script> roda a mesma bateria contra outro mbp-run.sh (ex.: o antigo, para ver os testes novos falharem).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -108,6 +108,10 @@ case "$name" in
       if [ "$host" = hetzner ]; then rc_v=${STUB_RUN_RC_NODE:-$rc_v}; out_v=${STUB_RUN_OUT_NODE:-}; slp=${STUB_RUN_SLEEP_NODE:-0}
       else rc_v=${STUB_RUN_RC_MBP:-$rc_v}; out_v=${STUB_RUN_OUT_MBP:-}; slp=${STUB_RUN_SLEEP_MBP:-0}; fi
       [ "$rc_v" = 255 ] && exit 255
+      # STUB_UNREADABLE_NODE_OUT / STUB_UNREADABLE_MBP_OUT=1: deixa ILEGÍVEL o arquivo temporário da saída do lado (simula disco que falhou / saída perdida). chmod 000 e não rm: se o `tee` ainda não tivesse
+      # aberto o arquivo, ele o RECRIARIA e o caso viraria corrida; com chmod o resultado é o mesmo nas duas ordens.
+      if [ "$host" = hetzner ] && [ "${STUB_UNREADABLE_NODE_OUT:-0}" = 1 ]; then chmod 000 "$MBP_CITY"/.gc/run/mbp-run.* 2>/dev/null; fi
+      if [ "$host" = mbp ] && [ "${STUB_UNREADABLE_MBP_OUT:-0}" = 1 ]; then chmod 000 "$MBP_CITY"/.gc/run/mbp-shadow.* 2>/dev/null; fi
       # STUB_NODE_WAIT_FOR=<arquivo>: o nó só devolve depois que esse arquivo existe (sincroniza com a sombra, sem depender de relógio); STUB_SLEEP_MARK=<prefixo>: o lado de MBP marca
       # <prefixo>.start antes de dormir e <prefixo>.end SÓ se o sono terminar (um sono interrompido por kill não marca)
       if [ "$host" = hetzner ] && [ -n "${STUB_NODE_WAIT_FOR:-}" ]; then w=0; while [ ! -e "$STUB_NODE_WAIT_FOR" ] && [ "$w" -lt 240 ]; do /bin/sleep 0.5; w=$((w + 1)); done; fi
@@ -1021,6 +1025,18 @@ done
 # controle positivo: a exceção é SÓ para rc de ambiente — rc 2 (pytest interrompido) é veredito de teste e continua aprendendo
 shadow_env; rc=$(STUB_RUN_RC_NODE=2 STUB_RUN_RC_MBP=0 run -- tests/test_x.py); expect "nó rc=2 (pytest interrompido) é veredito de teste: o chamador recebe o 2" 2 "$rc"
 has "…e é divergência" "$SHLOG" '"verdict":"diverge","a_host":"hetzner","a_rc":2'; has "…e o arquivo é aprendido" "$LEARNED" '^tests/test_x\.py$'
+# saída ILEGÍVEL não é "nenhum arquivo reprovou": failed_files devolve vazio nos dois casos, e comparar esse vazio com os arquivos reprovados do outro lado ensinaria mac-only a partir de um problema local.
+# O MBP reprova tests/test_x.py; se a saída do NÓ (ou a do MBP) não abre, é "não sei", não divergência. (Como root o chmod não bloqueia a leitura: o caso é pulado e NÃO contado.)
+if [ "$(id -u)" = 0 ]; then echo "skip saída ilegível da sombra (root: o chmod não bloqueia a leitura; caso não executado, não contado)"
+else
+  for side in NODE MBP; do
+    shadow_env; rc=$(env STUB_UNREADABLE_${side}_OUT=1 STUB_RUN_RC_NODE=0 STUB_RUN_RC_MBP=1 STUB_RUN_OUT_NODE='ok' STUB_RUN_OUT_MBP='FAILED tests/test_x.py::t - x' "$RUN" --repo wa --dir "$T/wt" -- tests/test_x.py >"$T/out" 2>"$T/err"; echo $?)
+    expect "saída do $side ilegível: o chamador recebe o rc do nó" 0 "$rc"
+    has "saída do $side ilegível: veredito 'skipped' (não 'diverge')" "$SHLOG" '"verdict":"skipped","a_host":"hetzner","a_rc":0,"b_host":"mbp","b_rc":1'; hasnt "saída do $side ilegível: nenhum 'diverge'" "$SHLOG" '"verdict":"diverge"'
+    [ ! -e "$LEARNED" ] && ok "saída do $side ilegível: nada é aprendido" || bad "saída ilegível ($side) ensinou mac-only: $(tr '\n' ' ' < "$LEARNED")"
+    has "saída do $side ilegível: avisa que não leu" "$T/err" 'sombra: a saída de um dos lados não pôde ser lida'
+  done
+fi
 # a mensagem só diz "marcado" do que foi GRAVADO ($learned), não do que se pretendia gravar
 shadow_env; STUB_RUN_RC_NODE=0 STUB_RUN_RC_MBP=1 run -- tests >/dev/null
 has "divergência sem alvo .py (diretório): o log diz learned:0" "$SHLOG" '"verdict":"diverge".*"learned":0'; [ ! -e "$LEARNED" ] && ok "…e nada é gravado na lista aprendida" || bad "gravou na lista aprendida sem alvo .py"
