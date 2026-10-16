@@ -13,7 +13,8 @@ O QUE PROVA:
      tabela ilegível vira erro (nunca contagem parcial);
   C. manifest: broken quando falta tabela, banco obrigatório ou há erro de parse;
   C2. banco ignorado (--ignore-db): sai do artefato, é NOMEADO no manifest, e nunca vale para banco obrigatório;
-  E. retention: só toca chaves no formato exato, respeita piso, janela recente, primeiro do dia e o protegido.
+  E. retention: só toca chaves no formato exato, respeita piso, janela recente, primeiro do dia e o protegido; uma chave na
+     forma exata mas com data impossível (mês 13) é ignorada, reportada e nunca apagada, sem parar a retenção das outras.
 NÃO COBRE o lado do restore (convert/extract/reconcile): a suíte dele é jsonl_hourly_restore.selftest.py (ga-c0939v.3); os blocos
   seguem o nome original A-E do commit 629fdabf1, por isso não há bloco D aqui.
 """
@@ -342,6 +343,21 @@ check("retention: uploads quebrados em sequência não ocupam o piso — os snap
 check("retention: lista vazia ou sem chave de snapshot => nada a apagar", retention([]) == [] and retention(untouched) == [])
 rc, so, _ = run("retention", "--prefix", P, "--now", str(int(NOW.timestamp())), stdin="\n".join(keys_for(hourly)).encode())
 check("retention (CLI): mesma saída que a função", rc == 0 and so.split() == dels)
+# Forma exata de snapshot, mas a data não existe (mês 13): UMA chave dessas não pode parar a retenção de todas as outras
+# (antes: ValueError, nenhuma apagada, só um traceback no log), nunca é apagada, e é REPORTADA — não some calada.
+junk_stem = "20261399T999999Z-%012x" % 7
+junk_keys = keys_for([junk_stem])
+skipped = []
+try:
+    d_junk = retention(keys_for(hourly) + junk_keys, skipped=skipped)
+except ValueError as e:
+    d_junk = "ValueError: %s" % e
+check("retention: chave de data impossível não derruba a retenção das outras (mesma saída que sem ela)", d_junk == dels, str(d_junk)[:120])
+check("retention: a chave de data impossível NUNCA é apagada e vem em `skipped`, par inteiro",
+      isinstance(d_junk, list) and not any(junk_stem in k for k in d_junk) and sorted(skipped) == sorted(junk_keys), str(skipped))
+rc, so, se = run("retention", "--prefix", P, "--now", str(int(NOW.timestamp())), stdin="\n".join(keys_for(hourly) + junk_keys).encode())
+check("retention (CLI): rc 0, mesma saída, e o stderr NOMEIA a chave ignorada (não é silêncio)",
+      rc == 0 and so.split() == dels and junk_stem in se, "rc=%s stderr=%s" % (rc, se[-160:]))
 
 print("=== RESULT: PASS=%d FAIL=%d ===" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

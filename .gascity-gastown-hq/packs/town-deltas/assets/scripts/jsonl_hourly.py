@@ -343,8 +343,10 @@ def cmd_manifest(args):
 
 
 # ── retention ─────────────────────────────────────────────────────────────────────────
-def retention_deletes(keys, prefix, now, keep_recent_s, keep_daily_days, floor, protect=None, orphan_grace_s=7200):
-    """Quais chaves apagar. Só toca chaves no formato exato <prefix>/snap/<AAAAMMDDTHHMMSSZ>-<sha12>.(tar.gz|manifest.json)."""
+def retention_deletes(keys, prefix, now, keep_recent_s, keep_daily_days, floor, protect=None, orphan_grace_s=7200, skipped=None):
+    """Quais chaves apagar. Só toca chaves no formato exato <prefix>/snap/<AAAAMMDDTHHMMSSZ>-<sha12>.(tar.gz|manifest.json).
+    Chave na forma exata cuja data não existe (mês 13) não é lida como snapshot: nunca é apagada e entra em `skipped` (lista de
+    saída, opcional) para quem chama dizer que ignorou; as outras seguem normalmente."""
     import datetime
     rx = re.compile(r"^" + re.escape(prefix) + r"/snap/(\d{8}T\d{6}Z)-([0-9a-f]{12})\.(tar\.gz|manifest\.json)$")
     stems = {}
@@ -353,7 +355,14 @@ def retention_deletes(keys, prefix, now, keep_recent_s, keep_daily_days, floor, 
         if not m:
             continue
         stem = m.group(1) + "-" + m.group(2)
-        ts = datetime.datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+        # vazio → não se aplica (a regex só deixa passar o carimbo na forma exata); ilegível (data impossível) → a chave sai do
+        # jogo, fica no S3 e é reportada em `skipped`; derrubar a execução inteira pararia a retenção de TODAS as chaves por causa de UMA.
+        try:
+            ts = datetime.datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            if skipped is not None:
+                skipped.append(k)
+            continue
         d = stems.setdefault(stem, {"ts": ts, "kinds": set()})
         d["kinds"].add(m.group(3))
     if not stems:
@@ -396,8 +405,12 @@ def cmd_retention(args):
     protect = None
     if args.protect:
         protect = re.sub(r"\.(tar\.gz|manifest\.json)$", "", args.protect.rsplit("/", 1)[-1])
-    for k in retention_deletes(keys, args.prefix, args.now, args.keep_recent_h * 3600, args.keep_daily_days, args.floor, protect):
+    skipped = []
+    for k in retention_deletes(keys, args.prefix, args.now, args.keep_recent_h * 3600, args.keep_daily_days, args.floor, protect, skipped=skipped):
         print(k)
+    if skipped:
+        # stderr, não stdout: stdout é a lista de chaves a apagar e o chamador a lê linha a linha
+        print("retention: %d chave(s) com data impossível ignoradas, NÃO apagadas: %s" % (len(skipped), ", ".join(sorted(skipped)[:5])), file=sys.stderr)
     return 0
 
 
