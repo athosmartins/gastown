@@ -476,9 +476,18 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
         # bloco condicional (if/then/else/elif/do/while/until): um cd lá dentro vale para os comandos SEGUINTES DO MESMO BLOCO (`if …; then cd a; git …; fi` roda o git em a),
         # mas ao fechar/trocar de ramo (fi/done/esac/else/elif) o diretório vira "não sei" — não se sabe qual ramo rodou. `!`/`coproc`: "não sei" na hora.
         kw = bool(seg) and seg[0] in ("!", "coproc")
+        if st.get("chain") and prev != "&&":
+            st["cwd"], st["chain"] = None, False  # a cadeia && que sustentava um cd condicional acabou (`;`, `||`, `&`, newline…): não sei se ele rodou
         if seg and seg[0] in ("fi", "done", "esac", "else", "elif") and st.pop("cdblk", False):
             st["cwd"] = None
         blk = bool(seg) and seg[0] in ("if", "then", "else", "elif", "do", "while", "until")
+        if seg[:1] == ["{"] and st.pop("func", False):
+            st["funcbody"] = True  # `f() { …`: o corpo não roda agora (e pode rodar depois, noutro diretório): cd lá dentro é "não sei"
+        if seg == ["}"]:
+            st["funcbody"] = False
+            if term == "&":
+                st["cwd"] = None  # `{ …; } &`: o grupo roda em background; o cd de dentro não vale aqui fora
+            return None
         env, seg, b, opq = peel(seg)
         blind = blind or b
         if not seg:
@@ -496,10 +505,12 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
             # o diretório só é conhecido se o cd COM CERTEZA rodou e o comando seguinte depende dele: cd depois de `||`, num pipeline ou em background, atrás de
             # palavra reservada, ou depois de `&&` sem que a cadeia `&&` siga até o próximo comando → "não sei" (o shell pode ter ido para outro lugar). A variável
             # em que se DECIDE (o cwd modelado) tem de ser a mesma em que se AGE (onde o git roda) — gate da fatia 6a, tentativa 3.
-            if kw or prev in ("||", "|", "|&") or term in ("|", "|&", "&") or (prev == "&&" and term != "&&"):
+            if kw or st.get("funcbody") or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
                 new = None
             if blk and new is not None:
                 st["cdblk"] = True  # cd dentro de um ramo: vale até o fi/done/esac/else/elif
+            if prev == "&&" and new is not None:
+                st["chain"] = True  # cd que não é o 1º da cadeia (`x && cd a && …`): vale só enquanto a cadeia && continua (ver o topo de one())
             st["cwd"] = new
             if new is not None and term == "||":
                 st["or"] = True  # o trecho seguinte decide: `|| exit` mantém, qualquer outra coisa vira "não sei"
@@ -551,12 +562,17 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
                     r = one(seg, False, prev, pc)
                     if r:
                         return r
-                    seg, prev = [], pc
                     if pc == "(":
+                        if len(seg) == 1 and not skip and seg[0] not in KEYWORDS:
+                            st["func"] = True  # `f (`: definição de função — o `{ … }` que vem a seguir é corpo que não roda agora
                         stack.append(st["cwd"])
                         skip = False  # `<(cmd)` / `>(cmd)`: o `<` que vem colado no `(` não é redirecionamento de arquivo, a palavra seguinte é um comando
-                    elif pc == ")" and stack:
-                        st["cwd"] = stack.pop()
+                    elif pc == ")":
+                        if stack:
+                            st["cwd"] = stack.pop()
+                        else:
+                            pc = "case)"  # `)` sem `(` aberto: fim de um padrão de `case` — o ramo pode nem rodar
+                    seg, prev = [], pc
                 else:
                     skip, herestr = True, pc == "<<<"  # redirecionamento: a palavra seguinte é o arquivo (ou, no here-string, o texto)
         else:

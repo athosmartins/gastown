@@ -17,7 +17,7 @@
 #   some (subgrupos: lexq aspas e `\` · lexs redirecionamento sem alvo · lexe palavra vazia · lexd `$'…'`/`$"…"` · lexu aspa ou `\` que não fecha, também num comentário `#` · lexr `$( )` do alvo
 #   de redirecionamento · lexh heredoc/`<<<`/find · lexp os controles que NÃO bloqueiam) · dest — o lugar onde o git escreve vem como ARGUMENTO, sem -C (worktree remove ../outro,
 #   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp).
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (115 mutantes); e
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (121 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 set -u
@@ -453,6 +453,18 @@ g_cond() {  # gate da fatia 6a (tentativa 3): a variável em que o guarda DECIDE
   b 0 "cond: if true; then cd <próprio>; git commit; fi (o cd vale dentro do próprio ramo)" "if true; then cd $OWN/sub; git commit -m x; fi"
   b 2 "cond: if true; then cd <alheio>; git commit; fi (idem, no alheio: bloqueia)" "if true; then cd $OTH; git commit -m x; fi"
   b 2 "cond: if true; then cd <próprio>; fi; git commit, com cwd no alheio (depois do fi não sei o ramo)" "if true; then cd $OWN; fi; git commit -m x" "$OTH"
+  # gate-fix 5: o cd que não é o 1º da cadeia vale SÓ enquanto a cadeia && continua até o git; case, função (nunca chamada) e grupo em background também não contam
+  b 2 "cond: cd <alheio>; false && cd <próprio> && true; git commit (repro do revisor: a cadeia acabou no ;)" "cd $OTH; false && cd $OWN && true; git commit --allow-empty -m INTRUDER"
+  b 2 "cond: [ -d x ] && cd <próprio> && git status; git commit, com cwd no alheio" "[ -d /tmp ] && cd $OWN && git status >/dev/null; git commit -m x" "$OTH"
+  b 2 "cond: case x in x) cd <próprio>;; esac; git commit, com cwd no alheio" "case x in x) cd $OWN;; esac; git commit -m x" "$OTH"
+  b 2 "cond: false && { cd <próprio> && true; }; git commit, com cwd no alheio" "false && { cd $OWN && true; }; git commit -m x" "$OTH"
+  b 2 "cond: { cd <próprio>; } & git commit, com cwd no alheio (grupo em background)" "{ cd $OWN; } & git commit -m x" "$OTH"
+  b 2 "cond: f() { cd <próprio>; }; git commit, com cwd no alheio (função nunca chamada)" "f() { cd $OWN; }; git commit -m x" "$OTH"
+  b 0 "cond: cd <próprio> && true; git commit (o cd é o 1º da cadeia: rodou com certeza)" "cd $OWN/sub && true; git commit -m x"
+  b 0 "cond: { cd <próprio>; }; git commit (grupo em linha, não em background)" "{ cd $OWN/sub; }; git commit -m x"
+  b 0 "cond: case x in x) git -C <alheio> log;; esac; git commit (leitura no case, commit no próprio)" "case x in x) git -C $OTH log;; esac; git commit -m x"
+  b 0 "cond: f() { git log; }; git commit (função sem cd)" "f() { git log; }; git commit -m x"
+  b 0 "cond: diff <(git -C <alheio> log) /dev/null; git commit (<( ) não é definição de função)" "diff <(git -C $OTH log) /dev/null; git commit -m x"
   b 2 "cond: while cd <alheio>; do git commit; done" "while cd $OTH; do git commit -m x; done"
   b 2 "cond: cd <alheio> || exit 1; git commit (|| exit mantém o diretório: bloqueia)" "cd $OTH || exit 1; git commit -m x"
   b 2 "cond: true && cd <alheio> && git commit (cadeia && mantém: bloqueia)" "true && cd $OTH && git commit -m x"
@@ -592,9 +604,12 @@ echo "== $((n-fails))/$n ok =="
   mutant block "realpath (symlink)" 's/os.path.realpath(os.path.join(cwd or "\/", p))/os.path.abspath(os.path.join(cwd or "\/", p))/'
   mutant block "-C não é seguido" 's/cwd, i = res(seg\[i + 1\], cwd), i + 2/i += 2/'
   mutant evade "cd não muda o diretório" 's/new = None if c == "popd" else chdir(seg\[1:\], st\["cwd"\], c == "pushd")/new = st["cwd"]/'
-  mutant cond "cd condicional (|| , then/else, pipeline, && sem cadeia) segue mudando o diretório" 's/            if kw or prev in ("||", "|", "|&") or term in ("|", "|&", "&") or (prev == "&&" and term != "&&"):/            if False:/'
+  mutant cond "cd condicional (|| , then/else, pipeline, && sem cadeia) segue mudando o diretório" 's/            if kw or st.get("funcbody") or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):/            if False:/'
   mutant cond "`cd a || cd b`: o trecho depois do || não vira não-sei" 's/        if st.pop("or", False) and prev == "||" and c not in ("exit", "return"):/        if False:/'
   mutant cond "<<EOF entre aspas volta a abrir heredoc (engole as linhas seguintes)" 's/        if quoted(cmd, m.start()):/        if False:/'
+  mutant cond "a cadeia && que sustentava o cd acaba e o diretório continua valendo" 's/        if st.get("chain") and prev != "&&":/        if False:/'
+  mutant cond "cd em padrão de case, em corpo de função ou com ;; segue mudando o diretório" 's/            if kw or st.get("funcbody") or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;")/            if kw or prev in ("||", "|", "|\&") or term in ("|", "|\&", "\&")/'
+  mutant cond "{ cd a; } & mantém o diretório do grupo em background" 's/^\( *\)if term == "&":$/\1if False:/'
   mutant evade "bash -c não é aberto" 's/return scan(script\[0\], cwd, terr, own, depth + 1)/pass/'
   mutant evade "eval não é aberto" 's/return scan(" ".join(seg\[1:\]), cwd, terr, own, depth + 1)/pass/'
   mutant evade "\$( ) não é aberto" 's/r = scan(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], terr, own, depth + 1)/r = None/'
