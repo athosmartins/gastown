@@ -839,7 +839,7 @@ reset; date > "$NODEFLAG"; "$RUN" --host linux --exec -- "$T/bin/fakecmd" >"$T/o
 reset; "$RUN" --host foo --repo wa --dir "$T/wt" -- tests/test_x.py >"$T/out" 2>"$T/err"; expect "--host inválido: 97" 97 "$?"
 reset; rc=$(nrun tests/test_x.py); expect "--host linux com a bandeira do nó desligada: 99" 99 "$rc"; hasnt "…sem chamar ninguém" "$STUB_LOG" 'HOSTCALL'
 reset; date > "$NODEFLAG"; rc=$(STUB_UNREACHABLE_NODE=1 nrun tests/test_x.py); expect "--host linux com o nó fora: 98, SEM cair no MBP" 98 "$rc"; hasnt "…o MBP não é chamado" "$STUB_LOG" 'HOSTCALL:mbp'
-reset; date > "$NODEFLAG"; rc=$("$RUN" --host linux --repo ps --dir "$T/wt" -- tests/test_x.py >/dev/null 2>"$T/err"; echo $?); expect "--host linux com repo ps: 98" 98 "$rc"; has "…e diz por quê (o nó só roda o wa)" "$T/err" 'só roda o repo wa'
+reset; date > "$NODEFLAG"; rc=$("$RUN" --host linux --repo ps --dir "$T/wt" -- tests/test_x.py >/dev/null 2>"$T/err"; echo $?); expect "--host linux com repo ps: 98" 98 "$rc"; has "…e diz por quê (o nó só roda wa e hq)" "$T/err" 'só roda os repos wa e hq'
 for hm in "--remote-pause on" "--install-tools"; do reset; date > "$NODEFLAG"; rc=$("$RUN" --host linux $hm >/dev/null 2>"$T/err"; echo $?); expect "--host linux $hm: 97 (é do MBP)" 97 "$rc"; hasnt "…nada vai ao nó nem ao MBP" "$STUB_LOG" 'HOSTCALL'; done
 reset; date > "$NODEFLAG"; rc=$(STUB_NOBASE_NODE=1 run -- tests/test_x.py); expect "base ausente no nó: cai no MBP" 0 "$rc"; has "motivo sem-base no host hetzner" "$J" '"reason":"sem-base".*"host":"hetzner"'; has "manda rodar a semeadura do nó (--host linux --seed wa)" "$T/err" 'rode: mbp-run\.sh --host linux --seed wa'; hasnt "…e não manda esperar uma fatia futura" "$T/err" 'fatia 4'
 reset; date > "$NODEFLAG"; rc=$(STUB_NOVENV_NODE=1 run -- tests/test_x.py); expect "venv ausente no nó: cai no MBP" 0 "$rc"; has "motivo sem-venv" "$J" '"reason":"sem-venv".*"host":"hetzner"'; has "…e também manda rodar a semeadura" "$T/err" 'rode: mbp-run\.sh --host linux --seed wa'
@@ -942,7 +942,7 @@ eq "NADA de dado ou segredo plantado chegou ao nó, nem arquivo de nome neutro, 
 has "o node_guard avisa quantos reteve" "$T/err" 'NOTE: 3 arquivo\(s\) com lista de telefones/CPFs ficam no mini e NÃO vão ao nó Linux'; hasnt "…e o aviso nunca traz o VALOR" "$T/err" '5531[0-9]{8}'
 for okf in lib/a.py tests/test_x.py tests/ok.json tests/data/fixture.json tests/fixtures/win.jsonl contacts_auth/server.py processo_lookup/pdpj_token.py tests/test_pdpj_token_refresh.py lib/rules.yaml $OKCFG $PASSF; do n=$((n+1)); if [ -f "$DEST/$okf" ]; then echo "ok   chegou (é código/config listado/abaixo do limite): $okf"; else echo "FAIL não chegou: $okf"; fails=$((fails+1)); fi; done
 n=$((n+1)); if [ ! -e "$DEST/processo_lookup/.env.pdpj" ] && [ ! -e "$DEST/shared/logs.backup/x.out" ]; then echo "ok   --delete-excluded limpa o que uma semeadura antiga deixou (.env.pdpj e shared/logs.backup/x.out)"; else echo "FAIL o destino manteve segredo/log antigo"; fails=$((fails+1)); fi
-MUT="$T/mutdir"; mkdir -p "$MUT"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt hetzner-pii-scan.py hetzner-mac-only.txt; do ln -sf "$HERE/$mf" "$MUT/$mf"; done   # o pii-scan TEM de estar aqui: sem ele o node_guard do mutante falha fechado e nada vaza, e o controle diria que o teste não enxerga o defeito; a lista mac-only idem (ilegível = o nó não é usado)
+MUT="$T/mutdir"; mkdir -p "$MUT"; for mf in mbp-presence.sh mbp-controle.sh hetzner-rsync-filter.wa.txt hetzner-pii-scan.py hetzner-mac-only.txt hetzner-rsync-filter.hq.txt hetzner-mac-only.hq.txt; do ln -sf "$HERE/$mf" "$MUT/$mf"; done   # o pii-scan TEM de estar aqui: sem ele o node_guard do mutante falha fechado e nada vaza, e o controle diria que o teste não enxerga o defeito; a lista mac-only idem (ilegível = o nó não é usado)
 # HETZNER_ISOLATE=1 (ga-9p6pte, a bateria noturna): o pytest do nó só roda dentro do wrapper de isolamento; fora do nó ou sem o wrapper → 97 e NADA roda.
 # iso_obs R: roda o mbp-run R (o real ou um mutante) nos 4 cenários e deixa as observações em ISO_OBS (uma palavra por observação que se confirmou).
 iso_obs() { local R=$1 rc s; ISO_OBS=""
@@ -1138,6 +1138,7 @@ else
 fi
 shadow_end
 node_seed_cases
+node_hq_cases
 }
 
 # ===== a semeadura do nó (MBP_SELFTEST_ONLY=semeadura roda só esta parte) =====
@@ -1269,6 +1270,70 @@ has "…diz que não varreu o conteúdo" "$T/err" 'não consegui varrer o conte�
 n=$((n+1)); if [ -z "$(find "$BASEDEST" -type f 2>/dev/null | head -1)" ]; then echo "ok   …e nenhum arquivo foi copiado para a base"; else echo "FAIL …a base recebeu arquivos mesmo sem a varredura"; fails=$((fails+1)); fi
 find "$BASEDEST" -mindepth 1 -delete 2>/dev/null
 reset
+}
+
+node_hq_cases() {  # ga-kz76o7: o repo hq no nó (chamada pela node_cases, depois da semeadura do wa)
+# ===== repo hq (ga-kz76o7): os selftests bash da fábrica no nó — sem venv, filtro e lista mac-only próprios, sombra no MINI, nunca no MBP =====
+echo "--- repo hq no nó (ga-kz76o7)"
+WTH="$T/wt-hq"; mkdir -p "$WTH/scripts" "$WTH/packs/town-deltas/assets" "$T/home/gt-remote/mirror/hq-1" "$T/home/gt-remote/hq-base"
+printf '#!/usr/bin/env bash\nexit "${HQ_FAKE_RC:-0}"\n' > "$WTH/scripts/x.selftest.sh"; : > "$WTH/scripts/nightly-reboot.selftest.sh"; : > "$WTH/scripts/not_a_test.sh"
+HQLEARNED="$T/city/.gc/hetzner-mac-only.hq.learned"; HQSEEDED="$T/city/.gc/hetzner-node.hq.seeded"
+hreset() { reset; rm -f "$HQLEARNED" "$HQSEEDED"; }
+hrun() { "$RUN" --repo hq --dir "$WTH" "$@" >"$T/out" 2>"$T/err"; echo $?; }
+hreset; date > "$NODEFLAG"; rc=$(hrun -- scripts/x.selftest.sh); expect "hq: selftest roda no nó" 0 "$rc"
+has "hq: log repo=hq mode=selftest host=hetzner" "$J" '"repo":"hq","mode":"selftest".*"host":"hetzner"'; hasnt "hq: o MBP nunca é chamado" "$STUB_LOG" 'HOSTCALL:mbp'; has "hq: diz onde rodou" "$T/err" 'rodou em hetzner \(nó Linux\)'
+has "hq: o job é bash <selftest>, não pytest" "$(lsf RUN hetzner)" 'nice -n "\$MBP_NICE" bash scripts/x.selftest.sh'; hasnt "hq: sem -m pytest" "$(lsf RUN hetzner)" '\-m pytest'; hasnt "hq: sem xdist (-n N)" "$(lsf RUN hetzner)" 'bash -n [0-9]'
+has "hq: identidade git fixa (selftest que cria repositório temporário)" "$(lsf RUN hetzner)" 'GIT_COMMITTER_EMAIL=gt@no'
+has "hq: o espelho parte de hq-base" "$(lsf MIRROR hetzner)" 'gt-remote/hq-base'; hasnt "hq: o MIRROR não exige venv" "$(lsf MIRROR hetzner)" 'NOVENV'
+has "hq: o rsync usa o filtro do hq" "$STUB_LOG" 'hetzner-rsync-filter\.hq\.txt'; hasnt "hq: …e não o do wa" "$STUB_LOG" 'hetzner-rsync-filter\.wa\.txt'
+hreset; date > "$NODEFLAG"; rc=$(STUB_RUN_RC_NODE=1 hrun -- scripts/x.selftest.sh); expect "hq: rc do selftest propagado (1)" 1 "$rc"; has "…e logado" "$J" '"rc":1.*"host":"hetzner"'
+hreset; rc=$(hrun -- scripts/x.selftest.sh); expect "hq com o nó desligado: 97 (o hq não existe no MBP; quem chamou roda local)" 97 "$rc"; hasnt "…sem chamar ninguém" "$STUB_LOG" 'HOSTCALL'; has "…e diz" "$T/err" 'o hq não existe no MBP — rode local'
+hreset; date > "$NODEFLAG"; rc=$(STUB_UNREACHABLE_NODE=1 hrun -- scripts/x.selftest.sh); expect "hq com o nó fora: 97, sem tentar o MBP" 97 "$rc"; hasnt "…o MBP não é chamado" "$STUB_LOG" 'HOSTCALL:mbp'; has "…recusa do nó logada" "$J" '"reason":"inalcancavel".*"host":"hetzner"'
+hreset; date > "$NODEFLAG"; rc=$(HETZNER_MAC_ONLY_LIST="$HERE/hetzner-mac-only.hq.txt" hrun -- scripts/nightly-reboot.selftest.sh); expect "hq: alvo na lista mac-only REAL do hq (nightly-reboot): 97, não vai ao nó" 97 "$rc"
+has "…recusa mac-only logada" "$J" '"reason":"mac-only".*"host":"hetzner"'; hasnt "…nada rodou no nó" "$STUB_LOG" 'HOSTCALL:hetzner:RUN'
+hreset; date > "$NODEFLAG"; rc=$(HETZNER_MAC_ONLY_LIST="$HERE/hetzner-mac-only.hq.txt" hrun -- scripts/x.selftest.sh); expect "hq: alvo fora da lista real: roda no nó" 0 "$rc"
+# a superfície do nó é estreita: só UM *.selftest.sh, relativo, existente, num worktree que é o hq
+for bad_args in "tests/test_x.py" "scripts/not_a_test.sh" "/etc/x.selftest.sh" "scripts/../x.selftest.sh" "scripts/missing.selftest.sh" ""; do
+  hreset; date > "$NODEFLAG"; rc=$(hrun -- $bad_args); expect "hq: alvo inválido '$bad_args' → 97 sem rodar" 97 "$rc"; hasnt "…nada chamado para '$bad_args'" "$STUB_LOG" 'HOSTCALL'
+done
+hreset; date > "$NODEFLAG"; rc=$("$RUN" --repo hq --dir "$T/wt" -- scripts/x.selftest.sh >/dev/null 2>"$T/err"; echo $?); expect "hq: --dir que não é o hq (sem packs/ e scripts/): 97" 97 "$rc"
+hreset; date > "$NODEFLAG"; rc=$("$RUN" --dir "$T/wt-hq-auto/.gascity-gastown-hq" -- scripts/x.selftest.sh >/dev/null 2>&1; echo $?); eq "hq: deduzido do caminho .gascity-gastown-hq (97 = deduziu hq e barrou o --dir inexistente, não 'não deduzi')" 97 "$rc"
+hreset; date > "$NODEFLAG"; "$RUN" --dir "$T/nowhere" -- scripts/x.selftest.sh >/dev/null 2>"$T/err"; has "…repo que não se deduz diz wa|ps|hq" "$T/err" 'use --repo wa\|ps\|hq'
+# filtro REAL do hq passa na conferência de forma; lista mac-only real abre
+hreset; eq "hq: o filtro real passa no filter_sane" 1 "$(HETZNER_RSYNC_FILTER="$HERE/hetzner-rsync-filter.hq.txt" pfv node_filter_ok)"
+hreset; eq "hq: a lista mac-only real abre (1 = nenhum alvo nos args vazios)" 1 "$(HETZNER_MAC_ONLY_LIST="$HERE/hetzner-mac-only.hq.txt" pfv node_mac_only_rc)"
+# sombra do hq: o outro lado é o MINI (bash local), não o MBP; divergência aprende o próprio selftest na lista aprendida DO HQ; a janela conta da semeadura
+hreset; date > "$NODEFLAG"; date > "$HQSEEDED"; rc=$(HETZNER_SHADOW_PCT=100 HETZNER_SHADOW_WAIT_S=20 hrun -- scripts/x.selftest.sh); expect "hq sombra: nó 0 e mini 0 → same" 0 "$rc"
+has "hq sombra: b_host=mini" "$SHLOG" '"repo":"hq","verdict":"same","a_host":"hetzner","a_rc":0,"b_host":"mini","b_rc":0'; hasnt "hq sombra: o MBP não entra" "$STUB_LOG" 'HOSTCALL:mbp'
+hreset; date > "$NODEFLAG"; date > "$HQSEEDED"; rc=$(HETZNER_SHADOW_PCT=100 HETZNER_SHADOW_WAIT_S=20 STUB_RUN_RC_NODE=1 hrun -- scripts/x.selftest.sh); expect "hq sombra: nó 1 e mini 0 → diverge (quem chamou recebe o do nó)" 1 "$rc"
+has "hq sombra: veredito diverge, learned:1" "$SHLOG" '"repo":"hq","verdict":"diverge","a_host":"hetzner","a_rc":1,"b_host":"mini","b_rc":0.*"learned":1'
+[ -f "$HQLEARNED" ] && has "hq sombra: aprende o selftest na lista DO HQ" "$HQLEARNED" '^scripts/x\.selftest\.sh$' || bad "hq sombra: lista aprendida do hq não foi criada"
+[ ! -e "$LEARNED" ] && ok "hq sombra: a lista aprendida do wa fica intacta" || bad "hq sombra: escreveu na lista aprendida do wa"
+rc=$(hrun -- scripts/x.selftest.sh); expect "hq: depois de aprendido, o alvo não vai mais ao nó (97, roda local)" 97 "$rc"; has "…motivo mac-only" "$J" '"reason":"mac-only"'
+hreset; date > "$NODEFLAG"; touch -t 202501010000 "$HQSEEDED"; rc=$(HETZNER_SHADOW_PCT=100 STUB_RUN_RC_NODE=1 hrun -- scripts/x.selftest.sh); expect "hq: semeadura velha = janela fechada, sem sombra" 1 "$rc"; [ ! -e "$SHLOG" ] && ok "…nenhum veredito de sombra" || bad "…sombra rodou com a janela fechada"
+# --seed hq: só no nó, pelo filtro real + varredura; cria a base e (re)abre a janela da sombra do hq; .gc nunca sai
+hreset; mkdir -p "$T/city/packs" "$T/city/scripts"; printf '#!/usr/bin/env bash\nexit 0\n' > "$T/city/scripts/s.selftest.sh"; echo '{"x":1}' > "$T/city/.gc/logs/mbp-run.jsonl"; echo secret > "$T/city/scripts/.env"
+rc=$(STUB_RSYNC_REAL=1 "$RUN" --host linux --seed hq >"$T/out" 2>"$T/err"; echo $?); expect "--host linux --seed hq: semeia" 0 "$rc"
+[ -f "$T/home/gt-remote/hq-base/scripts/s.selftest.sh" ] && ok "seed hq: o selftest chegou à base" || bad "seed hq: a base não recebeu scripts/s.selftest.sh"
+[ ! -e "$T/home/gt-remote/hq-base/.gc" ] && [ ! -e "$T/home/gt-remote/hq-base/scripts/.env" ] && ok "seed hq: .gc e .env NÃO chegam" || bad "seed hq: .gc ou .env chegaram à base"
+[ -f "$HQSEEDED" ] && ok "seed hq: carimbo da semeadura (janela da sombra do hq)" || bad "seed hq: sem carimbo"
+rm -rf "$T/city/packs" "$T/city/scripts"; rm -f "$T/city/.gc/logs/mbp-run.jsonl"
+hreset; rc=$("$RUN" --host linux --seed wa >/dev/null 2>"$T/err"; echo $?); expect "--host linux --seed wa: 97 (só o hq tem semeadura no nó)" 97 "$rc"; has "…diz" "$T/err" 'só existe para o hq'
+hreset; rc=$("$RUN" --seed hq >/dev/null 2>"$T/err"; echo $?); expect "--seed hq sem --host linux: 97" 97 "$rc"; has "…diz" "$T/err" 'use --host linux --seed hq'
+# SEGURANÇA, de verdade: rsync REAL com o filtro do hq contra uma árvore de hq com dado e segredo plantados
+WTHD="$T/wthd"; mkdir -p "$WTHD/scripts/testdata" "$WTHD/packs/town-deltas/assets/scripts" "$WTHD/docs/runbooks" "$WTHD/docs/reports/x" "$WTHD/docs/research" "$WTHD/agents/dog" "$WTHD/.beads/dolt/hq/.dolt/noms" "$WTHD/.gc/logs" "$WTHD/.gc/runtime/jsonl-archive" "$WTHD/.dolt-backup" "$WTHD/backup" "$WTHD/whatsapp_automation/lib" "$WTHD/gascity/cmd" "$WTHD/docs/pending-engine-window/a.harness"
+HQOK="scripts/a.selftest.sh scripts/b.py scripts/hetzner-mac-only.hq.txt scripts/testdata/fixture.json packs/town-deltas/assets/c.sh packs/town-deltas/assets/scripts/d.py packs/town-deltas/assets/e.template.md docs/runbooks/r.md agents/dog/agent.toml pack.toml CLAUDE.md docs/pending-engine-window/p.patch"
+HQLEAK=".beads/dolt/hq/.dolt/noms/manifest .gc/logs/mbp-run.jsonl .gc/runtime/jsonl-archive/hq.jsonl .gc/state .dolt-backup/hq.tar backup/b.sql.gz city.toml whatsapp_automation/lib/a.py gascity/cmd/main.go scripts/x.db scripts/.env scripts/token.txt scripts/dump.csv scripts/run.log scripts/out.jsonl docs/runbooks/reboot-20261016-pre.txt docs/reports/x/cost.json docs/research/leads.md docs/pending-engine-window/a.harness/sim.txt scripts/shot.png packs/town-deltas/assets/credentials.json scripts/id_rsa"
+for f in $HQOK; do mkdir -p "$WTHD/$(dirname "$f")"; echo ok > "$WTHD/$f"; done; for f in $HQLEAK; do mkdir -p "$WTHD/$(dirname "$f")"; echo secret > "$WTHD/$f"; done
+HDEST="$T/home/gt-remote/mirror/hq-1"; hreset; date > "$NODEFLAG"; find "$HDEST" -mindepth 1 -delete 2>/dev/null; mkdir -p "$HDEST/.gc"; echo old > "$HDEST/.gc/old.jsonl"
+STUB_RSYNC_REAL=1 "$RUN" --repo hq --dir "$WTHD" -- scripts/a.selftest.sh >"$T/out" 2>"$T/err"; rc=$?; expect "hq rsync real: a bateria roda no nó" 0 "$rc"
+got=""; for f in $HQLEAK; do [ -e "$HDEST/$f" ] && got="$got $f"; done; eq "hq: NADA de dado/segredo/pasta de runtime plantado chegou ao nó (lista vazia)" "" "${got# }"
+for f in $HQOK; do n=$((n+1)); if [ -f "$HDEST/$f" ]; then echo "ok   hq chegou (código/doc/config): $f"; else echo "FAIL hq não chegou: $f"; fails=$((fails+1)); fi; done
+[ ! -e "$HDEST/.gc/old.jsonl" ] && ok "hq: --delete-excluded limpa o que uma cópia antiga deixou (.gc/old.jsonl)" || bad "hq: o destino manteve .gc/old.jsonl"
+# controle negativo: sem o filtro, a árvore vaza (o teste enxerga o defeito)
+hreset; date > "$NODEFLAG"; find "$HDEST" -mindepth 1 -delete 2>/dev/null; STUB_RSYNC_REAL=1 "$MUT/mut-nofilter.sh" --repo hq --dir "$WTHD" -- scripts/a.selftest.sh >/dev/null 2>&1
+got=""; for f in $HQLEAK; do [ -e "$HDEST/$f" ] && got="$got $f"; done; n=$((n+1)); if [ -n "$got" ]; then echo "ok   controle hq: o mutante sem filtro VAZA ($(printf '%s' "$got" | wc -w | tr -d ' ') plantados)"; else echo "FAIL controle hq: o mutante sem filtro não vazou — o teste não enxerga o defeito"; fails=$((fails+1)); fi
+hreset
 }
 
 if [ -n "${MBP_SELFTEST_ONLY:-}" ]; then

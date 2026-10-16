@@ -54,6 +54,10 @@
 #   PARALELISMO   pytest-xdist (-n) em baterias grandes (>= HETZNER_XDIST_MIN_TESTS testes, 40), com núcleos / baterias em curso; nunca por cima de
 #                 -n, -p no:xdist, --pdb, --co, --lf... do chamador. O ganho do nó é o paralelismo: um teste só empata com o mini.
 #   LOG           toda linha de $CITY/.gc/logs/mbp-run.jsonl traz "host":"hetzner"|"mbp" (e "shadow":1 no lado de sombra do MBP).
+#   REPO hq       (ga-kz76o7) os selftests bash da fábrica: `mbp-run.sh --repo hq --dir <hq> -- scripts/x.selftest.sh [args]` roda `bash` no nó (sem venv), com
+#                 filtro próprio (hetzner-rsync-filter.hq.txt: só código/doc das pastas do hq; .beads .gc .dolt-backup backup nunca saem), lista mac-only própria
+#                 (hetzner-mac-only.hq.txt + $CITY/.gc/hetzner-mac-only.hq.learned) e a mesma sombra. Alvo que não é *.selftest.sh relativo ao worktree = 97, nada
+#                 roda. Base do nó: `--host linux --seed hq`. O hq NÃO vai ao MBP (97 = quem chamou roda local). ps no nó: ainda não (cai no MBP).
 #
 # PRESENÇA DO ATHOS (ga-77c1qg; decisão dele em 12/10: o MBP é o notebook de trabalho dele, o mini é o servidor)
 #   O preflight lê, NO MBP e na mesma chamada ssh, se o Athos está lá (scripts/mbp-presence.sh: tela bloqueada, ou sem teclado/mouse
@@ -121,6 +125,10 @@ NODE_FILTER=${HETZNER_RSYNC_FILTER:-$HERE/hetzner-rsync-filter.wa.txt}
 NODE_MAC_ONLY=${HETZNER_MAC_ONLY_LIST:-$HERE/hetzner-mac-only.txt}
 NODE_LEARNED="$CITY/.gc/hetzner-mac-only.learned"
 NODE_SHADOW_LOG="$CITY/.gc/logs/hetzner-shadow.jsonl"
+# filtro, lista mac-only e lista aprendida são POR REPO (wa = os nomes acima; a variável de ambiente, quando dada, vale para qualquer repo: é o que o selftest usa)
+NODE_WINDOW_ANCHOR="$NODE_FLAG"; SHADOW_BHOST=mbp   # a janela da sombra conta da hora deste arquivo; o outro lado da sombra (mbp, ou mini para o hq)
+node_files_for() { case "$1" in hq) NODE_FILTER=${HETZNER_RSYNC_FILTER:-$HERE/hetzner-rsync-filter.hq.txt}; NODE_MAC_ONLY=${HETZNER_MAC_ONLY_LIST:-$HERE/hetzner-mac-only.hq.txt}; NODE_LEARNED="$CITY/.gc/hetzner-mac-only.hq.learned"
+  NODE_HQ_SEEDED="$CITY/.gc/hetzner-node.hq.seeded"; [ -e "$NODE_HQ_SEEDED" ] && NODE_WINDOW_ANCHOR="$NODE_HQ_SEEDED"; SHADOW_BHOST=mini ;; esac; }   # hq: a sombra roda no MINI (o hq não tem MBP) e a janela conta da semeadura
 # valor fora de 0..100 (ou não numérico) volta ao padrão 10, e NÃO satura em 100: um erro de digitação (1000) não pode dobrar a carga do MBP — o lado seguro de um valor inválido é o padrão
 NODE_SHADOW_PCT=$(num_or "${HETZNER_SHADOW_PCT:-10}" 10); [ "$NODE_SHADOW_PCT" -le 100 ] || NODE_SHADOW_PCT=10
 NODE_SHADOW_WINDOW_S=$(num_or "${HETZNER_SHADOW_WINDOW_S:-86400}" 86400)   # a janela conta da hora da bandeira (touch na bandeira reabre a sombra)
@@ -178,10 +186,12 @@ done
 
 case "$host_sel" in auto|linux|mbp) ;; *) say "uso: --host linux|mbp"; exit 97 ;; esac
 # nomes na máquina remota: no MBP a base é gt-remote/whatsapp_automation e o venv gt-remote/venv; no nó Linux (montado pelo Mayor) são wa-base e venv-wa.
-# O nó só tem o wa: ps no nó Linux não existe (vazio → o chamador cai no MBP).
-base_of() { if [ "$HOSTKIND" = linux ]; then case "$1" in wa) echo wa-base ;; esac; else case "$1" in wa) echo whatsapp_automation ;; ps) echo property_scrapers ;; esac; fi; }
-venv_of() { if [ "$HOSTKIND" = linux ]; then case "$1" in wa) echo venv-wa ;; esac; else case "$1" in wa) echo venv ;; ps) echo venv-ps ;; esac; fi; }
-local_root_of() { case "$1" in wa) echo /Users/athos/gt/whatsapp_automation ;; ps) echo /Users/athos/.property-scrapers/runtime/main ;; esac; }
+# O nó tem wa e hq (hq-base, sem venv: "none" = não conferir); ps no nó Linux não existe (vazio → o chamador cai no MBP). O hq não existe no MBP (vazio → 97, roda local).
+base_of() { if [ "$HOSTKIND" = linux ]; then case "$1" in wa) echo wa-base ;; hq) echo hq-base ;; esac; else case "$1" in wa) echo whatsapp_automation ;; ps) echo property_scrapers ;; esac; fi; }
+venv_of() { if [ "$HOSTKIND" = linux ]; then case "$1" in wa) echo venv-wa ;; hq) echo none ;; esac; else case "$1" in wa) echo venv ;; ps) echo venv-ps ;; esac; fi; }
+local_root_of() { case "$1" in wa) echo /Users/athos/gt/whatsapp_automation ;; ps) echo /Users/athos/.property-scrapers/runtime/main ;; hq) echo "$CITY" ;; esac; }
+kind_of() { case "$1" in hq) echo selftest ;; *) echo pytest ;; esac; }   # pytest: <venv>/bin/python -m pytest · selftest: bash <x>.selftest.sh (o hq não tem pytest)
+KIND=pytest
 local_venv_of() { case "$1" in wa) echo /Users/athos/gt/whatsapp_automation/venv ;; ps) echo /Users/athos/.property-scrapers/runtime/main/venv ;; esac; }
 
 rssh() { "$SSH_BIN" $SSH_OPTS "$MBP_HOST" bash -s; }
@@ -616,7 +626,7 @@ mac_only_match() {
 fmtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }   # mtime em segundos; ilegível → vazio
 # janela da sombra: HETZNER_SHADOW_WINDOW_S depois da hora da bandeira. Hora ilegível = janela ABERTA (o lado que protege o veredito; custa só carga a mais)
 shadow_window_open() {
-  local t now; t=$(fmtime "$NODE_FLAG"); now=$(date +%s)
+  local t now; t=$(fmtime "$NODE_WINDOW_ANCHOR"); now=$(date +%s)
   isnum "$t" || return 0
   [ $(( now - t )) -lt "$NODE_SHADOW_WINDOW_S" ]
 }
@@ -626,7 +636,7 @@ node_wanted() {
   NODE_WHY=""
   [ "$host_sel" != mbp ] || return 1
   [ -f "$NODE_FLAG" ] || return 1
-  [ "$repo" = wa ] || { [ "$host_sel" = linux ] && say "o nó Linux só roda o repo wa (este é '$repo') — rode local"; return 1; }
+  case "$repo" in wa|hq) ;; *) [ "$host_sel" = linux ] && say "o nó Linux só roda os repos wa e hq (este é '$repo') — rode local"; return 1 ;; esac
   filter_sane || { NODE_WHY="filtro-invalido"; say "o filtro do rsync do nó ($NODE_FILTER) não abre ou não está na forma conferida pelo filter_sane (regras de segredo/dado ANTES de + /tests/***, nada que inclua tudo, \`- *\` no fim) — o nó NÃO é usado"; return 1; }
   local mo mrc
   mo=$(mac_only_match "$@"); mrc=$?
@@ -664,6 +674,7 @@ node_guard() {
 # node_xdist_n <args>: quantos workers do pytest-xdist usar (imprime N) ou nada. O ganho do nó é o paralelismo (um teste só empata com o mini). Só em bateria grande
 # (contagem de `def test_` nos alvos; ilegível = 0 = não injeta), com xdist instalado no nó, e nunca por cima de uma escolha do chamador.
 node_xdist_n() {
+  [ "$KIND" = pytest ] || return 0   # selftest bash: não há o que paralelizar com xdist
   [ "$HOSTKIND" = linux ] && [ "$NODE_XDIST_OFF" != 1 ] && [ "$(pf_get xdist)" = 1 ] || return 0
   local a f c n=0 nc occ w
   for a in "$@"; do
@@ -695,7 +706,8 @@ shadow_start() { # "$@" = args ORIGINAIS do pytest. Decide e dispara o lado de M
   [ $(( RANDOM % 100 )) -lt "$NODE_SHADOW_PCT" ] || return 0
   mkdir -p "$CITY/.gc/run" 2>/dev/null
   SHADOW_OUT=$(mktemp "$CITY/.gc/run/mbp-shadow.XXXXXX" 2>/dev/null) || { SHADOW_OUT=""; say "AVISO: sombra não iniciada (sem arquivo temporário)"; return 0; }
-  ( exec env MBP_RUN_SHADOW=1 "$HERE/$(basename "$0")" --host mbp --repo "$repo" --dir "$dir" -- "$@" >"$SHADOW_OUT" 2>&1 </dev/null ) &
+  if [ "$KIND" = selftest ]; then ( cd "$dir" && exec nice -n 10 bash "$@" >"$SHADOW_OUT" 2>&1 </dev/null ) &   # hq: o outro lado é o próprio mini (o hq não tem MBP)
+  else ( exec env MBP_RUN_SHADOW=1 "$HERE/$(basename "$0")" --host mbp --repo "$repo" --dir "$dir" -- "$@" >"$SHADOW_OUT" 2>&1 </dev/null ) & fi
   SHADOW_PID=$!
 }
 descendants() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do echo "$c"; descendants "$c"; done; }
@@ -719,8 +731,8 @@ shadow_abort() { # o nó caiu no meio: o lado de MBP da sombra não tem mais com
 }
 shadow_log() { # veredito rc_nó rc_mbp arquivos aprendidos
   mkdir -p "$(dirname "$NODE_SHADOW_LOG")" 2>/dev/null
-  printf '{"ts":"%s","repo":"%s","verdict":"%s","a_host":"hetzner","a_rc":%s,"b_host":"mbp","b_rc":%s,"files":"%s","learned":%s}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo" "$1" "$2" "${3:-null}" "$(printf '%s' "$4" | tr -d '"\\' | tr '\n' ',' | cut -c1-300)" "${5:-0}" >> "$NODE_SHADOW_LOG" 2>/dev/null \
+  printf '{"ts":"%s","repo":"%s","verdict":"%s","a_host":"hetzner","a_rc":%s,"b_host":"%s","b_rc":%s,"files":"%s","learned":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo" "$1" "$2" "$SHADOW_BHOST" "${3:-null}" "$(printf '%s' "$4" | tr -d '"\\' | tr '\n' ',' | cut -c1-300)" "${5:-0}" >> "$NODE_SHADOW_LOG" 2>/dev/null \
     || say "AVISO: veredito da sombra NÃO gravado em $NODE_SHADOW_LOG"
 }
 # shadow_no_verdict <rc>: 0 quando o rc NÃO é veredito de teste e sim do ambiente: 96..99 (o wrapper não rodou), 124 (estourou o tempo), 126/127 (o shell não executou/achou o comando) e >=128 (morto por sinal).
@@ -761,7 +773,7 @@ shadow_finish() { # rc_do_nó arquivo_da_saída_do_nó "$@" (args originais). Es
           for t in "$@"; do
             case "$t" in -*) continue ;; esac
             f="${t%%::*}"; f="${f#"$dir"/}"
-            case "$f" in *.py) diffs="$diffs${diffs:+,}$f" ;; esac
+            case "$f" in *.py|*.selftest.sh) diffs="$diffs${diffs:+,}$f" ;; esac
           done
           diffs=$(printf '%s' "$diffs" | tr ',' '\n')
         fi
@@ -931,8 +943,20 @@ fi
 # fim de cada seed: atualiza as ferramentas do MBP sem nunca falhar a semeadura por causa delas (a base é o que importa à noite)
 refresh_tools() { install_tools >/dev/null 2>&1 || say "AVISO: não atualizei ~/gt-remote/bin no MBP (gascity-mbp); rode: mbp-offload.sh install-mbp"; }
 if [ "$mode" = seed ]; then
-  case "$seed_repo" in wa|ps) ;; *) say "uso: --seed wa|ps"; exit 97 ;; esac
-  if [ "$HOSTKIND" = linux ]; then seed_node; exit $?; fi
+  case "$seed_repo" in wa|ps|hq) ;; *) say "uso: --seed wa|ps|hq"; exit 97 ;; esac
+  if [ "$HOSTKIND" = linux ] && [ "$seed_repo" != hq ]; then seed_node; exit $?; fi   # wa no nó: seed_node (ga-zri39b.4; ps ele mesmo recusa)
+  if [ "$HOSTKIND" = linux ]; then
+    # nó Linux, hq: código sem venv — o MESMO filtro e a MESMA varredura de conteúdo da execução
+    repo=hq; dir=$(local_root_of hq); node_files_for hq; base=$(base_of hq)
+    [ -d "$dir/packs" ] && [ -d "$dir/scripts" ] || { say "$dir não é o hq (sem packs/ e scripts/)"; exit 97; }
+    filter_sane || { say "o filtro do rsync do hq ($NODE_FILTER) não passa no filter_sane — não semeio"; exit 97; }
+    node_guard || { say "não consegui varrer o conteúdo do hq (hetzner-pii-scan.py) — não semeio"; exit 98; }
+    "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "mkdir -p gt-remote/$base gt-remote/mirror gt-remote/slots" || exit 98
+    "$RSYNC_BIN" -a --delete --delete-excluded --filter=". $HELD" --filter=". $NODE_FILTER" -e "$SSH_BIN $SSH_OPTS" "$dir"/ "$MBP_HOST:gt-remote/$base/" || exit 98
+    date > "$NODE_HQ_SEEDED" 2>/dev/null || say "AVISO: não gravei $NODE_HQ_SEEDED (a janela da sombra do hq segue contando da bandeira)"   # (re)abre a janela da sombra
+    say "seed hq ok (~/gt-remote/$base pelo filtro $NODE_FILTER)"; exit 0
+  fi
+  [ "$seed_repo" != hq ] || { say "--seed hq é do nó Linux: use --host linux --seed hq"; exit 97; }
   [ -e "$PAUSEFILE" ] && { say "pausado pelo Athos ($PAUSEFILE) — não semeio"; exit 99; }
   preflight || exit $?
   # com o Athos no MBP (ou sem saber), o receptor do rsync roda em prioridade de fundo: a semeadura é I/O no notebook dele
@@ -988,7 +1012,7 @@ _attempt_pytest() {
   local orig=("$@")
   preflight || { rc=$?; log_refusal; return $rc; }
   if [ "$HOSTKIND" = linux ]; then node_guard || { say "não consegui varrer o conteúdo do que iria ao $HNAME (lista do rsync ou hetzner-pii-scan.py falhou) — o nó NÃO é usado, rode local"; fall varredura-falhou 98; return 98; }; fi
-  SLOT_INFO=$(slot_info_for "$repo" pytest "$@")
+  SLOT_INFO=$(slot_info_for "$repo" "$KIND" "$@")
   OCC=1
   acquire || { rc=$?; if [ $rc -eq 96 ]; then fall slots "$rc"; else fall ssh-caiu "$rc"; fi; return $rc; }
   T0=$(date +%s)
@@ -1004,10 +1028,11 @@ _attempt_pytest() {
     ISO='"$HOME/gt-remote/bin/gt-iso-run" -- '   # texto literal: o $HOME é expandido no nó
   fi
   cpcmd="cp -cR"; [ "$HOSTKIND" = linux ] && cpcmd="cp -a --reflink=auto"   # APFS clone no macOS; no Linux, cópia (reflink quando o disco deixa)
+  venvchk='[ -x "$HOME/gt-remote/'"$rv"'/bin/python" ] || { echo NOVENV; exit 97; }'; [ "$rv" != none ] || venvchk=':'   # hq: selftest bash, sem venv a conferir
   m=$(rssh <<EOF 2>/dev/null
 # MBP:MIRROR
 B="\$HOME/gt-remote/$base"; M="\$HOME/$M"
-[ -x "\$HOME/gt-remote/$rv/bin/python" ] || { echo NOVENV; exit 97; }
+$venvchk
 [ -d "\$M" ] && { echo MIRROR_OK; exit 0; }
 [ -d "\$B" ] || { echo NOBASE; exit 97; }
 mkdir -p "\$HOME/gt-remote/mirror" && $cpcmd "\$B" "\$M" && echo MIRROR_SEEDED
@@ -1033,11 +1058,21 @@ EOF
   if [ "$HOSTKIND" = linux ]; then pathline='export PATH="$HOME/.local/bin:$PATH" PYTHONDONTWRITEBYTECODE=1'
   else pathline='export PATH=/opt/homebrew/bin:$PATH PYTHONDONTWRITEBYTECODE=1'; fi
   [ -z "$ISO" ] || pathline="$pathline"$'\n''[ -x "$HOME/gt-remote/bin/gt-iso-run" ] || { echo "GTN-ISO: inerte wrapper-ausente (~/gt-remote/bin/gt-iso-run)"; exit 97; }'
+  if [ "$KIND" = selftest ]; then
+  # hq: `bash <x>.selftest.sh` no espelho do slot; identidade git fixa porque muito selftest cria repositório temporário e o nó não tem ~/.gitconfig
+  IFS= read -r -d '' JOBDEF <<EOF || true
+$pathline
+export GIT_AUTHOR_NAME=gt GIT_AUTHOR_EMAIL=gt@no GIT_COMMITTER_NAME=gt GIT_COMMITTER_EMAIL=gt@no
+job() { cd "\$HOME/$M" || return 97; \$MBP_BG nice -n "\$MBP_NICE" ${ISO}bash $qargs; }
+mbp_supervise job
+EOF
+  else
   IFS= read -r -d '' JOBDEF <<EOF || true
 $pathline
 job() { cd "\$HOME/$M" || return 97; \$MBP_BG nice -n "\$MBP_NICE" ${ISO}"\$HOME/gt-remote/$rv/bin/python" -m pytest -p no:cacheprovider $qargs; }
 mbp_supervise job
 EOF
+  fi
   shadow_start "${orig[@]}"
   run_remote RUN "$JOBDEF"
   if [ $RC -ne 0 ] && grep -q -E 'shared/data|\.db\b|unable to open database' "$TMPOUT"; then
@@ -1045,10 +1080,10 @@ EOF
   fi
   SECS=$(( $(date +%s) - T0 ))
   if [ $RC -eq 255 ]; then
-    say "ssh caiu durante a execução — rode local"; log_run "$repo" pytest "$SLOT" 255 "$SECS" "${orig[@]}"; shadow_abort; return 98
+    say "ssh caiu durante a execução — rode local"; log_run "$repo" "$KIND" "$SLOT" 255 "$SECS" "${orig[@]}"; shadow_abort; return 98
   fi
   if [ $RC -eq 124 ]; then say "timeout de ${RUN_TIMEOUT}s"; fi
-  log_run "$repo" pytest "$SLOT" "$RC" "$SECS" "${orig[@]}"
+  log_run "$repo" "$KIND" "$SLOT" "$RC" "$SECS" "${orig[@]}"
   say "rodou em $HOSTLOG ($HNAME) slot=$SLOT secs=$SECS rc=$RC"
   shadow_finish "$RC" "$TMPOUT" "${orig[@]}"
   return $RC
@@ -1111,11 +1146,20 @@ if [ "$host_sel" = linux ] && [ $node_possible -eq 0 ]; then say "nó Linux desl
 if [ $node_possible -eq 0 ]; then mac_gates || exit $?; fi
 
 if [ -z "$repo" ]; then
-  case "$dir" in *whatsapp_automation*) repo=wa ;; *property_scrapers*|*property-scrapers*) repo=ps ;; esac
+  case "$dir" in *whatsapp_automation*) repo=wa ;; *property_scrapers*|*property-scrapers*) repo=ps ;; *gascity-gastown-hq*) repo=hq ;; esac
 fi
-case "$repo" in wa|ps) ;; *) say "não deduzi o repo de '$dir' — use --repo wa|ps"; usage; exit 97 ;; esac
-[ $# -gt 0 ] || { say "faltam os argumentos do pytest (use -- tests/test_x.py)"; exit 97; }
-[ -d "$dir/tests" ] || { say "$dir não tem tests/ — use --dir <worktree>"; exit 97; }
+case "$repo" in wa|ps|hq) ;; *) say "não deduzi o repo de '$dir' — use --repo wa|ps|hq"; usage; exit 97 ;; esac
+KIND=$(kind_of "$repo"); node_files_for "$repo"
+if [ "$KIND" = selftest ]; then
+  # hq: o alvo é UM selftest bash do próprio worktree (caminho relativo, sem "..", existente, *.selftest.sh). Qualquer outra coisa é 97 e NADA roda: a superfície do nó fica estreita.
+  [ $# -gt 0 ] || { say "faltou o selftest (use -- scripts/x.selftest.sh [args])"; exit 97; }
+  case "$1" in *.selftest.sh) ;; *) say "no repo hq o 1º argumento tem de ser um *.selftest.sh (veio '$1')"; exit 97 ;; esac
+  case "$1" in /*|*..*) say "o selftest tem de ser caminho relativo ao worktree, sem '..' (veio '$1')"; exit 97 ;; esac
+  [ -f "$dir/$1" ] && [ -d "$dir/packs" ] && [ -d "$dir/scripts" ] || { say "$dir/$1 não existe, ou $dir não é o hq (sem packs/ e scripts/) — use --dir <worktree>/.gascity-gastown-hq"; exit 97; }
+else
+  [ $# -gt 0 ] || { say "faltam os argumentos do pytest (use -- tests/test_x.py)"; exit 97; }
+  [ -d "$dir/tests" ] || { say "$dir não tem tests/ — use --dir <worktree>"; exit 97; }
+fi
 
 if [ $node_possible -eq 1 ]; then
   if node_wanted "$@"; then
@@ -1123,15 +1167,18 @@ if [ $node_possible -eq 1 ]; then
     attempt_pytest "$@"; nrc=$?
     case $nrc in 96|97|98|99) ;; *) exit $nrc ;; esac
     [ "$host_sel" != linux ] || exit $nrc
+    [ "$KIND" != selftest ] || { say "o nó Linux não rodou (rc=$nrc) e o hq não existe no MBP — rode local"; exit 97; }
     say "o nó Linux não rodou (rc=$nrc) — tentando o MBP"
   else
     # o nó estava ligado e NÃO foi usado por um motivo (filtro, lista mac-only, repo): uma linha no log, para o relatório contar os fallbacks
     if [ -n "$NODE_WHY" ]; then use_host linux; fall "$NODE_WHY" 98; fi
     [ "$host_sel" != linux ] || exit 98
+    [ "$KIND" != selftest ] || { say "o nó Linux não entra (${NODE_WHY:-motivo acima}) e o hq não existe no MBP — rode local"; exit 97; }
   fi
   use_host mbp
   mac_gates || exit $?
 fi
+[ "$KIND" != selftest ] || { say "nó Linux desligado (falta $NODE_FLAG) e o hq não existe no MBP — rode local"; exit 97; }
 use_host mbp
 attempt_pytest "$@"
 exit $?
