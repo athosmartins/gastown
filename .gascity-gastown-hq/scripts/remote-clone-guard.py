@@ -13,22 +13,31 @@ PARA QUE SERVE
 
 COMO DECIDE (os três estados — sei que pode / sei que não pode / não sei — e o último NÃO vira "pode")
   Território = $RCG_ROOT, senão ~/gt-remote/git. Clone próprio = o ancestral com `.git` de $CLAUDE_PROJECT_DIR (sem a variável: não há clone
-  próprio, e toda escrita no território é bloqueada). Para cada `git` do comando (depois de ; && || | ( ), de cd/pushd, de command/env/
-  sudo/xargs/nohup…, de bash -c / eval / $(…) / crases / find -exec) o alvo é o diretório depois dos `-C` (relativos entre si), mais
-  --git-dir/--work-tree/GIT_DIR/GIT_WORK_TREE, resolvido com realpath (symlink para outro clone não escapa). Subcomando que não está na
-  lista de LEITURA (inclusive o que não conheço, alias…) conta como escrita. Alvo no território e fora do clone próprio → bloqueia; alvo
-  que não consigo resolver ($VAR, glob, crase, ~usuário) numa escrita → bloqueia, com a mensagem dizendo para usar caminho literal.
-  Falha do próprio guarda (JSON ruim, exceção) → bloqueia: o comando do hook é `python3 -I <este arquivo> || exit 2`, então travar,
-  sumir o python ou o arquivo também sai com 2 (o hook que sai com 1 ou 127 NÃO bloqueia: seria falha aberta).
+  próprio, e toda escrita no território é bloqueada). Para cada `git` do comando (depois de ; && || | ( ) { das palavras reservadas if/then/else/
+  elif/do/while/until/!/function, de cd/pushd, de command/env/sudo/xargs/nohup…, de bash -c / eval / $(…) / crases / <(…) / find -exec, e do corpo
+  de um heredoc ou here-string que um shell lê) o alvo é o diretório depois dos `-C` (relativos entre si), mais --git-dir/--work-tree/GIT_DIR/
+  GIT_WORK_TREE, resolvido com realpath (symlink para outro clone não escapa). Subcomando que não está na lista de LEITURA (inclusive o que não
+  conheço, alias…) conta como escrita. Alvo no território e fora do clone próprio → bloqueia; alvo que não consigo resolver ($VAR, glob, crase,
+  ~usuário) numa escrita → bloqueia, com a mensagem dizendo para usar caminho literal.
+  cd/pushd só muda o diretório que EU entendo: opções -L/-P/-e/-@, `--` e UM argumento; o resto (`cd -Z x`, dois argumentos, `pushd +1`, `pushd`
+  sozinho) deixa o diretório "não sei". Lançadores que não modelo (flock, ionice, ssh, su -c, parallel, script -c, trap, watch, tmux…; a lista OPAQUE)
+  são abertos com o diretório "não sei": o git dentro deles só passa se for leitura ou com `-C <caminho absoluto>`.
+  Falha do próprio guarda (exceção) → bloqueia, se o pedido cita git/file_path/notebook_path; um stdin que nem é JSON e não cita nenhum dos três
+  LIBERA (lixo no stdin não derruba a sessão inteira; o Claude sempre manda JSON válido). O comando do hook é `python3 -I <este arquivo> || exit 2`,
+  então travar, sumir o python ou o arquivo também sai com 2 (o hook que sai com 1 ou 127 NÃO bloqueia: seria falha aberta).
 
 CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E
-  (com o settings) todo PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit chama ESTE arquivo com `|| exit 2` e `disableAllHooks` não está
-  ligado nele nem em <pasta>/.claude/settings[.local].json; 1 caso contrário (é o que o provider confere antes de abrir sessão real).
-  Edit/Write em ~/.claude/hooks/** e ~/.claude/settings*.json também são bloqueados (o guarda não se desliga por engano).
+  (com o settings) todo PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit é EXATAMENTE `python3 -I <este arquivo> || exit 2` (citar o arquivo
+  noutro lugar do comando não vale) e `disableAllHooks` não está ligado nele nem em <pasta>/.claude/settings[.local].json; 1 caso contrário (é o que o
+  provider confere antes de abrir sessão real). Edit/Write em ~/.claude/hooks/** e ~/.claude/settings*.json também são bloqueados (o guarda não se
+  desliga por engano).
 
-LIMITES (é trava contra engano, não sandbox contra quem quer burlar): script que o comando executa (`bash x.sh`), `python -c`, `source`,
-  variável que guarda o git, e redirecionamento de shell (`> arquivo`), `sed -i`, `rm`/`cp` no clone alheio ou nos hooks não são vistos. O fecho de verdade
-  (usuário Unix por sessão) é outro trabalho; ver o runbook.
+LIMITES (é trava contra engano, não sandbox contra quem quer burlar). NÃO vejo: script que o comando executa (`bash x.sh`, `source x`), `python -c` e
+  outras linguagens, variável que guarda o git ou o diretório, comando montado em pipe (`echo '…' | sh`), função ou alias definido em OUTRA chamada,
+  CDPATH, redirecionamento de shell (`> arquivo`), `sed -i`, `rm`/`cp` no clone alheio ou nos hooks. A lista OPAQUE é fechada: um lançador que não
+  está nela (`lockrun git …`) esconde o git numa palavra que não abro. Falso positivo que fica: git com diretório implícito atrás de um lançador da
+  lista (`flock L git commit`) bloqueia; escreva `git -C <caminho absoluto do seu clone>`. O fecho de verdade (usuário Unix por sessão) é outro
+  trabalho; ver o runbook.
 """
 from __future__ import annotations
 
@@ -43,18 +52,25 @@ TOOLS_FILE = {"Edit": "file_path", "Write": "file_path", "MultiEdit": "file_path
 READ = {"log", "status", "diff", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file", "blame", "describe", "shortlog",
         "grep", "show-ref", "for-each-ref", "name-rev", "merge-base", "diff-tree", "diff-index", "diff-files", "ls-remote", "whatchanged",
         "check-ignore", "count-objects", "fsck", "version", "help", "var", "cherry", "range-diff", "show-branch", "annotate", ""}
-LIST_FLAGS = {"branch": {"-l", "--list", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current"},
-              "tag": {"-l", "--list", "-n"}}
+LIST_FLAGS = {"branch": {"-l", "--list", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current", "-i", "--ignore-case", "--no-color", "--no-column"},
+              "tag": {"-l", "--list", "-i", "--ignore-case", "--no-column"}}
+LIST_VAL = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at"}  # opções que só existem em modo lista e levam um commit (junto ou no argumento seguinte)
+LIST_EQ = ("--sort=", "--format=", "--abbrev=", "--color=", "--column=")  # valor só junto da opção: separado, `--sort novo` é palavra solta e não sei o que é
+CONFIG_SCOPE = {"--local", "--global", "--system", "--worktree", "--show-origin", "--show-scope", "--includes", "--no-includes", "--name-only", "-z", "--null"}
 WRITES = re.compile(r"--(?:output|lost-found|open-files-in-pager|ext-diff)(?:=|$)|-O")  # flag de comando de LEITURA que grava arquivo ou roda programa
 PUNCT, SEPS = set("();<>|&"), {";", "&&", "||", "|", "&", "|&", ";;"}
-SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh"}
 WRAP = {"command", "builtin", "exec", "nohup", "time", "env", "sudo", "doas", "xargs", "nice", "timeout", "stdbuf", "setsid"}
+KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "{", "!", "coproc"}  # palavras reservadas que vêm ANTES de um comando: o git depois delas é o comando do trecho
+OPAQUE = {"flock", "ionice", "chrt", "taskset", "parallel", "su", "runuser", "ssh", "script", "trap", "watch", "unshare", "nsenter", "chroot", "setpriv", "numactl",
+          "strace", "fakeroot", "systemd-run", "busybox", "dbus-run-session", "xvfb-run", "unbuffer", "caffeinate", "tmux", "screen", "expect"}  # lançadores que não modelo: lista FECHADA (ver LIMITES)
 OPT_ARG = {"-I", "-n", "-L", "-P", "-d", "-s", "-E", "-u", "-g", "-C", "-D", "--chdir"}  # opções de xargs/sudo/env que levam o valor no argumento seguinte
 ASSIGN, NUM = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S), re.compile(r"\d+[smhd]?")
 SHELLY = re.compile(r"[$`*?\[{]")
 PIECE = re.compile(r"&&|\|\||\|&|;;|[;&|()]|[<>]+&?")
 SUBST, BACKTICK = re.compile(r"\$S([0-9a-f]*)\$"), re.compile(r"`([^`]*)`")
 HEREDOC = re.compile(r"(<<-?\s*(['\"]?)(\w+)\2[^\n]*)\n(.*?)\n[ \t]*\3[ \t]*(?=\n|$)", re.S)
+CONT = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")  # barra + newline com número ÍMPAR de barras: continuação de linha (com número par a última barra é a barra escapada)
 
 
 def inside(p: str, root: str) -> bool:
@@ -89,17 +105,40 @@ def claude_conf(p: str) -> bool:
     return p.startswith(h) and bool(re.fullmatch(r"hooks/.*|settings[^/]*\.json", p[len(h):]))
 
 
+def lists_only(sub: str, rest: list) -> bool:
+    """`git branch`/`git tag` que só LISTA. vazio → lista (é o que o comando sem nada faz); opção que não conheço, ou palavra solta (nome novo) sem opção
+    de lista que a faça valer como padrão → não sei, e não sei é escrita."""
+    listing, val = any(t.partition("=")[0] in LIST_VAL or t in ("-l", "--list") for t in rest), False
+    for t in rest:
+        if val:  # o commit da opção anterior; começando por `-` é outra opção escondida
+            val = False
+            if t.startswith("-"):
+                return False
+        elif t in LIST_FLAGS[sub] or t.startswith(LIST_EQ) or t.partition("=")[0] in LIST_VAL or (sub == "tag" and re.fullmatch(r"-n\d*", t)):
+            val = t in LIST_VAL
+        elif t.startswith("-") or not listing:
+            return False
+    return True
+
+
+def reads_config(rest: list) -> bool:
+    """`git config` que só LÊ: pede a chave (--get…, --list) ou dá UMA palavra só (a chave) com no máximo o escopo (--local/--global…). Duas palavras
+    é `chave valor` (grava); qualquer outra opção (--unset, --edit, --add…) grava ou abre editor."""
+    flags = [t for t in rest if t.startswith("-")]
+    return any(t in ("--get", "--get-all", "--get-regexp", "--list", "-l") for t in rest) or (len(rest) - len(flags) == 1 and all(t in CONFIG_SCOPE for t in flags))
+
+
 def is_read(sub: str, rest: list) -> bool:
     if any(WRITES.match(t) for t in rest):
         return False
     if sub in READ:
         return True
     if sub in LIST_FLAGS:
-        return all(t in LIST_FLAGS[sub] for t in rest)
+        return lists_only(sub, rest)
     first = rest[0] if rest else ""
     return ((sub == "stash" and first in ("list", "show")) or (sub == "worktree" and first == "list") or (sub == "reflog" and first in ("", "show"))
             or (sub == "notes" and first in ("list", "show")) or (sub == "remote" and (rest in ([], ["-v"]) or rest[:1] in (["show"], ["get-url"]) or rest[:2] in (["-v", "show"], ["-v", "get-url"])))
-            or (sub == "config" and any(t in ("--get", "--get-all", "--get-regexp", "--list", "-l") for t in rest)))
+            or (sub == "config" and reads_config(rest)))
 
 
 def hide(cmd: str) -> str:
@@ -114,13 +153,23 @@ def hide(cmd: str) -> str:
     return "".join(out) + cmd[i:]
 
 
+def runs_text(seg: list) -> bool:
+    """O comando do trecho executa texto que recebe (shell, eval/source, ssh/su… — OPAQUE)? vazio → não; só o COMANDO decide, não as palavras (`git commit -m "bash"` não é shell)."""
+    s = peel(seg)[1]
+    return bool(s) and os.path.basename(s[0]) in SHELLS | OPAQUE | {"eval", "source", "."}
+
+
 def heredoc(m) -> str:
-    """O corpo de um heredoc é texto (cita comandos, tem apóstrofo) e some; só o $( ) de um delimitador SEM aspas roda, e fica."""
+    """O corpo de um heredoc é texto (cita comandos, tem apóstrofo) e some; só o $( ) de um delimitador SEM aspas roda, e fica. Exceção: se quem lê é um shell
+    (`bash <<EOF`, `ssh h <<EOF`, `cat <<EOF | sh`) o corpo É o script, e fica como comandos. Quem lê = os comandos da linha onde o heredoc abre."""
+    line = m.string[m.string.rfind("\n", 0, m.start()) + 1:m.start()] + m.group(1)
+    if any(runs_text(s.split()) for s in re.split(r"[;&|(]+", line)):
+        return m.group(1) + "\n" + m.group(4)
     return m.group(1) + ("" if m.group(2) else "\n: " + " ".join(x.group(0) for x in SUBST.finditer(hide(m.group(4)))))
 
 
 def words(cmd: str) -> list:
-    cmd = hide(HEREDOC.sub(heredoc, cmd)).replace("\n", " ; ")  # newline separa comandos
+    cmd = hide(CONT.sub(r"\1", HEREDOC.sub(heredoc, cmd))).replace("\n", " ; ")  # newline separa comandos; `\` + newline os junta
     try:
         lx = shlex.shlex(cmd, posix=True, punctuation_chars=True)
         lx.whitespace_split, lx.commenters = True, ""
@@ -146,9 +195,26 @@ def peel(seg: list):
                     env[m.group(1)] = m.group(2)
                 blind = blind or seg[0][:2] in ("-C", "-D", "-S") or seg[0].startswith(("--chdir", "--split-string"))
                 seg = seg[2:] if seg[0] in OPT_ARG else seg[1:]
+        elif seg[0] in KEYWORDS:  # `if git …`, `then git …`, `{ git …`, `! git …`: o comando começa na palavra seguinte
+            seg = seg[3:] if seg[0] == "coproc" and seg[2:3] == ["{"] else seg[1:]  # `coproc NOME { git …; }` tem um nome no meio
+        elif seg[0] == "function":  # `function f { git …; }`: o nome vai embora, o `{` é palavra reservada
+            seg = seg[2:]
         else:
             break
     return env, seg, blind
+
+
+def chdir(args: list, cwd, push: bool):
+    """Diretório depois de `cd`/`pushd`, ou None = não sei. Só leio o que conheço: as opções -L/-P/-e/-@, o `--` e UM argumento. Opção que não conheço,
+    mais de um argumento (no bash o cd falha, no zsh troca texto do caminho), `-`, `pushd +N/-N` (gira a pilha) e `pushd` sem argumento (troca o topo)
+    → None. vazio (cd sem argumento) → HOME. Nunca devolve o diretório de antes por não ter entendido: isso seria "sei onde estou" sem saber."""
+    while args and re.fullmatch(r"-[LPe@]+", args[0]):
+        args = args[1:]
+    if args[:1] == ["--"]:
+        args = args[1:]
+    if len(args) > 1 or (push and not args) or (args and args[0][:1] in ("-", "+")):
+        return None
+    return res(args[0] if args else "~", cwd)
 
 
 def git_hit(seg: list, env: dict, cwd, terr: str, own):
@@ -199,9 +265,17 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
         if c in ("export", "declare", "typeset"):
             st["env"].update({m.group(1): m.group(2) for m in map(ASSIGN.fullmatch, seg[1:]) if m})
         elif c in ("cd", "pushd"):
-            st["cwd"] = res(seg[1] if len(seg) > 1 else "~", st["cwd"])
+            st["cwd"] = chdir(seg[1:], st["cwd"], c == "pushd")
         elif c == "popd":
             st["cwd"] = None
+        elif c in OPAQUE:  # não modelo o que o lançador faz com diretório e ambiente: o git de dentro (palavra solta ou texto entre aspas) vale com diretório "não sei"
+            for j, t in enumerate(seg[1:], 1):
+                if os.path.basename(t) == "git":  # as palavras seguintes são argumentos do git (mensagem de commit…), não outro comando
+                    return git_hit(seg[j:], {**st["env"], **env}, None, terr, own)
+                if re.search(r"\s", t):
+                    r = scan(t, None, terr, own, depth + 1)
+                    if r:
+                        return r
         elif c in SHELLS:
             for j, t in enumerate(seg[1:-1], 1):
                 if re.fullmatch(r"-[a-z]*c[a-z]*", t):
@@ -218,10 +292,15 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
             return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
         return None
 
-    skip = False
+    skip, herestr = False, False
     for tok in words(cmd) + [";"]:
         if skip:  # alvo de redirecionamento
             skip = False
+            if herestr and runs_text(seg):  # `bash <<< 'git -C x commit'`: a palavra é o script que o shell vai ler
+                r = scan(tok, st["cwd"], terr, own, depth + 1)
+                if r:
+                    return r
+            herestr = False
         elif set(tok) <= PUNCT:  # o shlex junta pontuação colada (`);`, `&&(`, `2>&1`): separa de novo
             for pc in PIECE.findall(tok):
                 if pc in SEPS or pc in ("(", ")"):
@@ -231,10 +310,11 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
                     seg = []
                     if pc == "(":
                         stack.append(st["cwd"])
+                        skip = False  # `<(cmd)` / `>(cmd)`: o `<` que vem colado no `(` não é redirecionamento de arquivo, a palavra seguinte é um comando
                     elif pc == ")" and stack:
                         st["cwd"] = stack.pop()
                 else:
-                    skip = True  # redirecionamento: a palavra seguinte é o arquivo
+                    skip, herestr = True, pc == "<<<"  # redirecionamento: a palavra seguinte é o arquivo (ou, no here-string, o texto)
         else:
             seg.append(tok)
     return None
@@ -284,6 +364,7 @@ def selfcheck(args: list) -> int:
                 print(f"selfcheck: {tool} {ti}: bloqueou={got}, deveria={want}", file=sys.stderr)
     if args:
         me = os.path.abspath(__file__)
+        hook_re = re.compile(r"python3\s+-I\s+" + re.escape(me) + r"\s+\|\|\s+exit\s+2")  # o comando INTEIRO; citar o arquivo (echo, #, outro && …) não vale
         try:
             s = json.load(open(args[0]))
             groups = (s.get("hooks") or {}).get("PreToolUse") or []
@@ -294,9 +375,9 @@ def selfcheck(args: list) -> int:
                     if os.path.exists(f) and json.load(open(f)).get("disableAllHooks"):
                         raise ValueError(f"{f}: disableAllHooks ligado na camada do projeto")
             for tool in ("Bash",) + tuple(TOOLS_FILE):
-                if not any((g.get("matcher") in (None, "", "*") or re.fullmatch(g["matcher"], tool)) and any(me in h.get("command", "") and h["command"].endswith("|| exit 2")
-                                                                              for h in g.get("hooks", [])) for g in groups):
-                    raise ValueError(f"{tool}: nenhum hook PreToolUse chama {me} com `|| exit 2`")
+                if not any((g.get("matcher") in (None, "", "*") or re.fullmatch(g["matcher"], tool)) and any(hook_re.fullmatch(h.get("command", "").strip()) for h in g.get("hooks", []))
+                           for g in groups):
+                    raise ValueError(f"{tool}: nenhum hook PreToolUse é exatamente `python3 -I {me} || exit 2`")
         except (OSError, ValueError, AttributeError, KeyError, TypeError, re.error) as e:
             ok = False
             print(f"selfcheck: settings {args[0]}: {e}", file=sys.stderr)

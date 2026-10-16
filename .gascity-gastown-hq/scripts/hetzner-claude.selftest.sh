@@ -20,7 +20,11 @@ cat >"$T/bin/ssh" <<'EOF'
 #!/bin/sh
 [ -f "$FAKE/ssh.stdin.on" ] && wc -c >>"$FAKE/ssh.stdin"
 [ -f "$FAKE/sleep" ] && sleep "$(cat "$FAKE/sleep")"
-[ -f "$FAKE/ssh.rc" ] && { echo "ssh: Could not resolve hostname" >&2; exit "$(cat "$FAKE/ssh.rc")"; }
+if [ -f "$FAKE/ssh.rc" ]; then  # ssh.rc.only (opcional): só falha o comando que contém este texto; sem ele, falha todos
+  if [ ! -f "$FAKE/ssh.rc.only" ] || case "$*" in *"$(cat "$FAKE/ssh.rc.only")"*) true;; *) false;; esac; then
+    echo "ssh: Could not resolve hostname" >&2; exit "$(cat "$FAKE/ssh.rc")"
+  fi
+fi
 while [ "$1" = "-o" ]; do shift 2; done
 shift
 HOME=$SRV exec sh -c "$*"
@@ -279,6 +283,20 @@ srv_reset; echo fail >"$FAKE/rsync.mode"; pb; eq "rsync falha" $PBRC 1; has "msg
 srv_reset; echo 4 >"$FAKE/verify.rc.mini"; pb; eq "verify no mini falha" $PBRC 1; has "msg" "$PBOUT" "verify (mini)"; no "nada foi staged no servidor" "$SRV/gt-remote/bundle-out"
 srv_reset; echo 4 >"$FAKE/verify.rc.server"; pb; eq "verify no servidor falha" $PBRC 1; has "msg" "$PBOUT" "verify NO SERVIDOR"; no "nada instalado" "$HOOK"
 srv_reset; echo '{"enabledPlugins":{}}' >"$FAKE/home_settings"; pb; eq "bundle já traz enabledPlugins" $PBRC 3; has "msg" "$PBOUT" "já traz"
+echo "== push-bundle: ler o settings do servidor — ausente é vazio; não conseguir ler NÃO é vazio (gate ga-iczduy)"
+# o install troca o settings.json do servidor: se a leitura falhou e o push seguir como se o arquivo não existisse, o tema/notificação do claude somem sem aviso
+for rc in 255 1 7; do
+  reset; srv_reset; echo '{"theme":"dark","enabledPlugins":{"x@y":true}}' >"$SRV/.claude/settings.json"; echo "$rc" >"$FAKE/ssh.rc"; echo ".claude/settings.json" >"$FAKE/ssh.rc.only"; pb
+  eq "leitura do settings do servidor sai $rc → recusa" $PBRC 1; has "msg diz que não leu" "$PBOUT" "settings.json do servidor"; no "nada instalado" "$HOOK"
+  eq "e o settings do servidor ficou como estava" "$(cat "$SRV/.claude/settings.json")" '{"theme":"dark","enabledPlugins":{"x@y":true}}'
+done
+reset; srv_reset; chmod 000 "$SRV/.claude/settings.json"
+if [ -r "$SRV/.claude/settings.json" ]; then ok; else  # o instalador do servidor também recusa um settings ilegível — só que DEPOIS do rsync; aqui a recusa tem que vir antes de mandar qualquer coisa
+  pb; eq "settings que existe mas o cat não lê → recusa (não é 'ausente')" $PBRC 1; has "msg" "$PBOUT" "settings.json do servidor"; no "nada instalado" "$HOOK"
+  no "e nada foi mandado ao servidor (a recusa vem antes do rsync)" "$SRV/gt-remote/bundle-out"
+fi
+chmod 644 "$SRV/.claude/settings.json"
+reset; srv_reset; rm -f "$SRV/.claude/settings.json"; pb; eq "settings ausente no servidor (1º push) = vazio, instala" $PBRC 0; yes "hook instalado" "$HOOK"
 
 echo "== install-claude (loopback)"
 printf '#!/bin/bash\necho "$@" >"$FAKE/installer.args"\n[ -f "$FAKE/installer.noop" ] || echo "$1 (Claude Code)" >"$FAKE/version"\n' >"$T/installer.sh"

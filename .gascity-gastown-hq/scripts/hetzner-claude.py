@@ -570,7 +570,13 @@ def cmd_push_bundle(a) -> int:
     with open(home_settings) as f:
         allowed = sorted(set(json.load(f)) | set(PLUGIN_KEYS) | set(OWN_KEYS))
     stage, q = f"{RHOME}/{BUNDLE_OUT}", shlex.quote
-    r = ssh(f"cat {q(RHOME)}/.claude/settings.json 2>/dev/null")
+    # vazio → arquivo ausente (o `[ -e ]` sai 3) ou sem texto: não há nada de seu a preservar; falhou/ilegível → ssh caiu (None/255), o cat não leu (1) ou
+    # qualquer outro rc: NÃO sei o que há lá, e o install troca o arquivo — recusa, em vez de mesclar como se estivesse vazio e apagar tema/notificação
+    sj = f"{q(RHOME)}/.claude/settings.json"
+    r = ssh(f"[ -e {sj} ] || exit 3; cat {sj}")
+    if r.rc not in (0, 3):
+        die(1, f"não consegui ler o settings.json do servidor (ssh rc={r.rc}{', timeout' if r.timed_out else ''}): {_short(r.err, 120)}; "
+               "recuso mesclar às cegas (nada foi instalado)")
     try:
         cur = json.loads(r.out) if r.rc == 0 and r.out.strip() else {}
     except ValueError:

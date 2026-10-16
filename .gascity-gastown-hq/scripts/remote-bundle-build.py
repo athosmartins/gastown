@@ -494,7 +494,7 @@ def main(argv: list[str]) -> int:
         print(f"remote-bundle-build: RECUSADO: não consegui gravar {out}: {e}", file=sys.stderr)
         return REFUSED
     print(f"remote-bundle-build: ok {len(manifest['files'])} arquivos{f', {bundle.skill_count} skills' if a.skills else ''}, "
-          f"hash {manifest['bundle_hash'][:12]}, shim_needs={manifest['shim_needs']}")
+          f"hash {manifest['bundle_hash'][:12]}, clone_guard={str(manifest['clone_guard']).lower()}, shim_needs={manifest['shim_needs']}")
     return 0
 
 

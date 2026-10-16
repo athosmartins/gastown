@@ -10,6 +10,7 @@ USO
   GC_SESSION=exec:<cidade>/scripts/gc-session-ssh                (ou, no híbrido, `remote_exec` — patch em docs/pending-engine-window/)
   gc-session-ssh <op> <sessão> [args]        o engine chama assim, com o JSON do start na entrada padrão
   gc-session-ssh --dry-run start <sessão> < start.json     (ou GC_SSH_DRYRUN=1) imprime o que rodaria no host e NÃO conecta
+                                                           (`would_refuse`: a recusa de política — sessão real sem liberação… — que o start de verdade daria, ou null)
 
 O QUE FAZ
   Cada operação é UM ssh (ControlMaster em ~/.ssh/cm, o mesmo do mbp-run.sh) que leva um script sh pela entrada padrão; o
@@ -299,11 +300,18 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     if not isinstance(req, dict):
         raise Fail("start: a entrada tem que ser um objeto JSON")
     p = plan_start(cfg, name, req)
-    gate = "" if dry else real_gate(cfg, name, p["work_dir"])
+    gate, would_refuse = "", None
+    if dry:  # vazio → a recusa local não dispararia (None; o sha e o --selfcheck do guarda só rodam no host, no start de verdade); falhou → o motivo, em vez de um dry-run que finge que abriria
+        try:
+            real_gate(cfg, name, p["work_dir"])
+        except Fail as e:
+            would_refuse = str(e)
+    else:
+        gate = real_gate(cfg, name, p["work_dir"])
     run_dir, exitf = f"{cfg.root}/run", f"{cfg.root}/run/{name}.exit"
     lpath = f"{run_dir}/{name}.sh"
     if dry:
-        print(json.dumps(dict(p, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", launcher=launcher(cfg, name, p).split("\n"),
+        print(json.dumps(dict(p, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, launcher=launcher(cfg, name, p).split("\n"),
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0

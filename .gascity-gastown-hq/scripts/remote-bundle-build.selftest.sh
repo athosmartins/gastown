@@ -320,12 +320,14 @@ jq -e --arg c "$GCMD" '[.hooks.PreToolUse[] | select(.matcher == "Edit|Write|Mul
 ! grep -q 'gt tap guard\|"if"' "$ST"; ok $? "swap: nem o gt nem o 'if: Bash(git -C *)' do original ficam nas settings"
 cmp -s "$GUARD" "$GF" && [ -x "$GF" ]; ok $? "swap: o guarda vai no bundle idêntico ao do repositório e executável"
 jq -e --arg c "$GCMD" '.clone_guard == true and ([.hooks[] | select(.verdict == "swap")] | length == 1) and ((.hooks[] | select(.verdict == "swap") | .replaced_by) == $c)' "$M" >/dev/null; ok $? "swap: o manifest diz clone_guard=true e, no hook, o que o substituiu (replaced_by)"
+has "$T/outp" "clone_guard=true"; ok $? "swap: a linha ok do build diz clone_guard=true (quem lê só a saída sabe que o servidor ficou com o guarda)"
 jq -e '.hooks[] | select(.verdict == "swap") | (.command | startswith("gt tap guard")) or (.command | endswith("cross-clone-block"))' "$M" >/dev/null; ok $? "swap: o manifest guarda o comando ORIGINAL reconhecido (auditável)"
 sed "s#/home/runner/.claude#$O/home/.claude#g" "$ST" > "$T/s.json"; python3 -I "$GF" --selfcheck "$T/s.json" >/dev/null 2>"$T/err"; ok $? "swap: o --selfcheck do guarda aprova as settings GERADAS (as 5 ferramentas, '|| exit 2')"
 python3 -I "$B" verify "$O"; ok $? "swap: verify do bundle com o guarda sai 0"
 fresh; jq 'del(.hooks.PreToolUse[0].hooks[0])' "$T/f/$HS" > "$T/m.json" && cp "$T/m.json" "$T/f/$HS"; build "$T/f" "$T/f/out"; rc=$?
 [ $rc = 0 ] && jq -e '.clone_guard == false' "$T/f/out/manifest.json" >/dev/null && [ ! -e "$T/f/out/home/.claude/hooks/remote-clone-guard.py" ] && ! grep -q remote-clone-guard "$T/f/out/home/.claude/settings.json"
 ok $? "swap: sem o cross-clone-block no mini não há swap nem guarda no bundle (clone_guard=false; quem decide se isso basta é o provider) (rc=$rc)"
+has "$T/outp" "clone_guard=false" && ! has "$T/outp" "clone_guard=true"; ok $? "swap: sem o hook no mini a linha ok diz clone_guard=false (o silêncio não pode parecer 'tem guarda')"
 fresh; addhook "$T/f/$HS" Stop 'gt tap guard cross-clone-block'
 refuses "cross-clone-block em outro evento que não PreToolUse (o swap seria uma guarda que não guarda)" "$T/f"
 why "só é trocado em PreToolUse"

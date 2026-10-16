@@ -122,6 +122,12 @@ g_dry() {
   cfg 3
   pv --dry-run start remote-e2e-1 < <(req claude); [ "$(jq -r .session_kind "$T/out")" = teste ]; ok $? "dry: remote-e2e-1 é sessão de teste"
   pv --dry-run start dog-1 < <(req claude); [ "$(jq -r .session_kind "$T/out")" = real ]; ok $? "dry: dog-1 é sessão real"
+  # o dry-run diz o que o start de verdade faria com a recusa de política: sessão real sem liberação NÃO pode parecer que abriria (gate ga-iczduy)
+  pv --dry-run start dog-1 < <(req claude); [ "$(jq -r .would_refuse "$T/out")" = null ]; ok $? "dry: sessão real liberada → would_refuse null"
+  jq 'del(.hosts.a.real_sessions_released_by)' "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"
+  pv --dry-run start dog-1 < <(req claude); [ $RC = 0 ] && jq -e '.would_refuse | strings | test("real_sessions_released_by")' "$T/out" >/dev/null; ok $? "dry: sessão real SEM liberação → would_refuse diz a chave que falta (rc=$RC)"
+  pv --dry-run start remote-e2e-1 < <(req claude); [ "$(jq -r .would_refuse "$T/out")" = null ]; ok $? "dry: sessão de teste sem liberação → would_refuse null (ela abre)"
+  pv start dog-1 < <(req claude); [ $RC = 1 ]; ok $? "dry: (controle) o start de verdade dessa mesma sessão recusa (rc=$RC)"; cfg 3
 }
 
 g_live() {
@@ -360,6 +366,7 @@ echo "== $((n-fails))/$n ok =="
   mutant gate "sem rodar o --selfcheck" 's/o=\$(python3 -I {g} --selfcheck {st} {q(work_dir)} 2>&1)/o=$(true)/'
   mutant gate "script do host que sai 0 (a recusa vira 'abriu')" 's/exit {EX_POLICY}/exit 0/g'
   mutant gate "guarda do repositório ilegível passa" 's/^        raise Fail(f"sessão real {name!r} recusada: não consegui ler.*$/        sha = ""/'
+  mutant dry "o dry-run não diz a recusa de política que o start daria" 's/            would_refuse = str(e)/            pass/'
   mutant dry "o dry-run diz 'teste' para tudo" 's/session_kind="teste" if TEST_RE.fullmatch(name) else "real"/session_kind="teste"/'
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"

@@ -7,10 +7,11 @@
 # CASOS (grupos; o nome de cada caso diz o que ele prova): block — escrita de git no clone ALHEIO (por -C, --git-dir, GIT_DIR, ~/, symlink,
 #   cwd, o espelho repo.git) · pass — leitura no clone alheio, escrita no PRÓPRIO clone e fora do território, comando que só CITA o outro
 #   clone · evade — a mesma escrita embrulhada (command/env/sudo/xargs, bash -c, eval, $(…), crase, find -exec, ; && || |, heredoc) ·
-#   closed — o que não sei NÃO vira liberado (variável, glob, ~usuário, subcomando desconhecido, JSON ruim) · tools — Edit/Write/MultiEdit/
-#   NotebookEdit · msg — o texto da recusa · check — --selfcheck com settings bom e com cada defeito · hook — o comando de hook de
+#   closed — o que não sei NÃO vira liberado (variável, glob, ~usuário, subcomando desconhecido, stdin que não é JSON e cita git/file_path; sem citar, libera) · tools — Edit/Write/MultiEdit/
+#   NotebookEdit · shell — o git atrás de palavra reservada (if/then/{/!/function), de `<(…)`, de cd/pushd com opção, de lançador que não modelo (flock/ssh/su…),
+#   de heredoc e here-string que um shell lê, de `\`+newline (e os controles que NÃO podem bloquear) · msg — o texto da recusa · check — --selfcheck com settings bom e com cada defeito · hook — o comando de hook de
 #   verdade (`python3 -I <guarda> || exit 2`) sai 2 se o guarda trava, some ou tem erro de sintaxe (falha fechada), e 0 se libera.
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (37 mutantes); e
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (60 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 set -u
@@ -82,6 +83,11 @@ EOF"
   b 0 "pass: stash list no alheio" "git -C $OTH stash list"
   b 0 "pass: pipeline de leitura" "git -C $OTH log | head -3"
   b 0 "pass: redirecionamento 2>&1" "git -C $OTH log 2>&1 | head"
+  for op in "branch --contains HEAD" "branch --no-contains HEAD" "branch --merged" "branch --list 'feat/*'" "branch -l 'feat/*'" "branch --points-at HEAD" "branch --sort=-committerdate" \
+            "branch --format=%(refname)" "branch -a --contains HEAD" "tag --list 'v*'" "tag -l 'v*'" "tag --contains HEAD" "tag --points-at HEAD" "tag -n5" "tag -l -n 'v*'" \
+            "config user.name" "config --local user.name" "config --global --get-all user.name"; do
+    b 0 "pass: leitura que parecia escrita (gate ga-iczduy): git -C <alheio> $op" "git -C $OTH $op"
+  done
 }
 g_evade() {
   b 2 "evade: command git" "command git -C $OTH commit"
@@ -155,6 +161,11 @@ g_closed() {
   b 2 "closed: alias (subcomando curto)" "git -C $OTH ci -m x"
   b 2 "closed: branch com argumento" "git -C $OTH branch novo"
   b 2 "closed: config sem --get" "git -C $OTH config user.name x"
+  local w
+  for w in "branch --list -d velho" "branch --list --delete velho" "branch --contains HEAD -d velho" "branch -m velho novo" "branch --sort novo" "branch --contains -D x" "tag v1" "tag -d v1" "tag -a v1 -m x" \
+           "tag --list -d v1" "tag -l -f v1" "config --unset user.name" "config --edit" "config user.name x y" "config --local user.name x" "config --global --add k v" "config -e"; do
+    b 2 "closed: continua escrita (a leitura nova não vira brecha): git -C <alheio> $w" "git -C $OTH $w"
+  done
   nest() { python3 -c 'import shlex,sys
 c = sys.argv[2]
 for _ in range(int(sys.argv[1])): c = "bash -c " + shlex.quote(c)
@@ -171,6 +182,68 @@ print(c)' "$@"; }
   b 2 "closed: projeto fora do território (sem clone próprio)" "git commit" "$OWN" "$OUT"
   run "$OWN" < <(python3 -c 'import json;print(json.dumps({"tool_name":"Bash","tool_input":{"command":"git -C '"$OTH"' commit"}}))'); [ "$RC" = 2 ]; ok $? "closed: sem cwd no JSON ainda bloqueia o alvo explícito (rc=$RC)"
   run "$OWN" < <(python3 -c 'import json;print(json.dumps({"tool_name":"Bash","tool_input":{"command":"git commit"}}))'); [ "$RC" = 2 ]; ok $? "closed: sem cwd no JSON, git sem -C é 'não sei' e bloqueia (rc=$RC)"
+}
+g_shell() {  # gate ga-iczduy (rodada 1): palavra que o guarda não entende na posição de COMANDO ou de DIRETÓRIO não pode valer "não é git" nem "diretório que conheço"
+  local c
+  for c in "if true; then git -C $OTH commit -m x; fi" "for d in $OTH; do git -C $OTH commit -m x; done" "for d in $OTH; do git -C \$d commit -m x; done" \
+           "{ git -C $OTH commit -m x; }" "! git -C $OTH commit -m x" "until git -C $OTH push; do :; done" "while git -C $OTH commit -m x; do :; done" \
+           "if false; then :; elif git -C $OTH commit -m x; then :; fi" "if true; then :; else git -C $OTH commit -m x; fi" "f() { git -C $OTH commit -m x; }; f" \
+           "function f { git -C $OTH commit -m x; }; f" "bash -c 'if true; then git -C $OTH commit -m x; fi'" "case x in x) git -C $OTH commit -m x ;; esac" \
+           "coproc git -C $OTH commit -m x" "coproc W { git -C $OTH commit -m x; }" "{ cd $OTH; git commit -m x; }" "for d in $OTH; do cd \$d; git commit -m x; done" "if true; then cd $OTH; git commit -m x; fi" \
+           "cat <(git -C $OTH commit -m x)" "tee >(git -C $OTH commit -F -)" "diff <(git -C $OTH log) <(git -C $OTH commit -m x)"; do
+    b 2 "shell: $c" "$c"
+  done
+  for c in "cd -- $OTH && git commit -m x" "cd -P $OTH && git commit -m x" "cd -L $OTH && git commit -m x" "cd -P -- $OTH && git commit -m x" "pushd -- $OTH && git commit -m x" \
+           "cd -Z $OTH && git commit -m x" "cd $OWN $OTH && git commit -m x" "pushd && git commit -m x" "pushd +1 && git commit -m x" "builtin cd -- $OTH && git commit -m x"; do
+    b 2 "shell: cd/pushd com opção ou argumento que não leio vira 'não sei': $c" "$c"
+  done
+  for c in "flock $T/l git -C $OTH commit -m x" "ionice -c3 git -C $OTH commit -m x" "chrt -i 0 git -C $OTH commit -m x" "taskset 1 git -C $OTH commit -m x" \
+           "parallel git -C $OTH commit -m x ::: a" "su runner -c 'git -C $OTH commit -m x'" "ssh localhost 'git -C $OTH commit -m x'" \
+           "script -qc 'git -C $OTH commit -m x' /dev/null" "sudo flock $T/l git -C $OTH commit -m x" "trap 'git -C $OTH commit -m x' EXIT" \
+           "flock $T/l git commit -m x" "flock $T/l git -C \$X commit -m x"; do
+    b 2 "shell: embrulho que não modelo: $c" "$c"
+  done
+  b 2 "shell: bash <<'EOF' roda o corpo" "bash <<'EOF'
+git -C $OTH commit -m x
+EOF"
+  b 2 "shell: bash -s <<EOF roda o corpo" "bash -s <<EOF
+cd $OTH
+git commit -m x
+EOF"
+  b 2 "shell: sh <<EOF roda o corpo" "sh <<EOF
+git -C $OTH push
+EOF"
+  b 2 "shell: ssh localhost <<EOF roda o corpo" "ssh localhost <<'EOF'
+git -C $OTH commit -m x
+EOF"
+  b 2 "shell: bash <<< 'texto' roda o texto (here-string)" "bash <<< 'git -C $OTH commit -m x'"
+  b 2 "shell: sh -s <<<\"cd …; git …\" roda o texto" "sh -s <<<\"cd $OTH; git commit -m x\""
+  b 2 "shell: ssh localhost <<< 'texto' roda o texto" "ssh localhost <<< 'git -C $OTH push'"
+  b 2 "shell: continuação de linha não esconde a escrita" "git -C $OTH \\
+commit -m x"
+  b 2 "shell: barra dupla + nova linha NÃO é continuação (a linha seguinte é outro comando)" "echo \\\\
+git -C $OTH commit -m x"
+  for c in "if git status; then git commit -m x; fi" "for f in a b; do git add \$f; done" "{ git commit -m x; }" "! git log" "while read l; do echo \$l; done < /dev/null" \
+           "f() { git commit -m x; }; f" "cat <(git -C $OTH log)" "diff <(git -C $OTH log) <(git log)" "if true; then cd $OWN/sub; git commit -m x; fi" \
+           "cd -- $OWN/sub && git commit -m x" "cd -P $OWN && git commit -m x" "cd -L -- $OWN; git commit -m x" "pushd -- $OWN/sub && git commit -m x" "cd && ls" \
+           "flock $T/l git -C $OWN commit -m x" "flock $T/l git -C $OTH log" "ionice -c3 git -C $OTH status" "ssh localhost 'git -C $OTH log'" "ssh localhost uptime" \
+           "su runner -c 'git -C $OTH log'" "trap 'echo oi' EXIT" "for d in a b; do echo \$d; done"; do
+    b 0 "pass: $c" "$c"
+  done
+  b 0 "pass: bash <<EOF só com leitura no alheio" "bash <<'EOF'
+git -C $OTH log
+EOF"
+  b 0 "pass: bash <<< 'texto' só com leitura no alheio" "bash <<< 'git -C $OTH log'"
+  b 0 "pass: here-string para quem não é shell continua sendo texto" "git commit -F - <<< 'git -C $OTH commit -m x'"
+  b 0 "pass: cat <<< 'texto' é só texto" "cat <<< 'git -C $OTH commit -m x'"
+  b 0 "pass: bash <<EOF que não é git" "bash <<'EOF'
+echo oi
+EOF"
+  b 0 "pass: heredoc de commit que não é shell continua sendo texto" "git commit -F - <<'EOF'
+git -C $OTH commit -m x
+EOF"
+  b 0 "pass: continuação de linha entre -C e o subcomando de leitura" "git -C $OTH \\
+log"
 }
 g_tools() {
   local t
@@ -220,6 +293,17 @@ g_check() {
   done
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; sed -i.bak 's/ || exit 2//' "$s"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: sem '|| exit 2' (falha aberta) → falha"
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; sed -i.bak "s#$P#/outro/guarda.py#" "$s"; python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: o hook chama outro arquivo → falha"
+  local fake  # o hook só vale se o comando INTEIRO é `python3 -I <este arquivo> || exit 2`: citar o arquivo em outro lugar do comando não conta
+  for fake in "echo $P || exit 2" "python3 -I /outro/guarda.py # $P || exit 2" "python3 -I /outro/guarda.py; python3 -I $P || exit 2" "python3 -I $P; true || exit 2" "python3 $P || exit 2" "python3 -I $P || exit 2; true || exit 2"; do
+    settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; python3 - "$s" "$fake" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for g in d["hooks"]["PreToolUse"]:
+    g["hooks"][0]["command"] = sys.argv[2]
+json.dump(d, open(sys.argv[1], "w"))
+EOF
+    python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: hook que só cita o arquivo (\`$fake\`) → falha"
+  done
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));d["disableAllHooks"]=True;json.dump(d,open(sys.argv[1],"w"))' "$s"
   python3 -I "$P" --selfcheck "$s" >"$T/o" 2>"$T/err"; [ $? = 1 ]; ok $? "check: disableAllHooks ligado → falha"
   settings "$s" "Bash" "Edit|Write|MultiEdit|NotebookEdit"; local pd="$T/proj" cl; mkdir -p "$pd/.claude"
@@ -248,7 +332,7 @@ g_hook() {  # o comando que vai no settings do servidor
   c="python3-que-nao-existe -I $P || exit 2"; sh -c "$c" <<<"$js" >/dev/null 2>&1; [ $? = 2 ]; ok $? "hook: python ausente (127) vira 2"
 }
 
-all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group tools && g_tools; group msg && g_msg
+all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group tools && g_tools; group msg && g_msg
         group check && g_check; group hook && g_hook; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
@@ -269,7 +353,7 @@ echo "== $((n-fails))/$n ok =="
   mutant pass "o próprio clone deixa de ser liberado" 's/ and not (own and inside(t, own))//'
   mutant block "realpath (symlink)" 's/os.path.realpath(os.path.join(cwd or "\/", p))/os.path.abspath(os.path.join(cwd or "\/", p))/'
   mutant block "-C não é seguido" 's/cwd, i = res(seg\[i + 1\], cwd), i + 2/i += 2/'
-  mutant evade "cd não muda o diretório" 's/st\["cwd"\] = res(seg\[1\] if len(seg) > 1 else "~", st\["cwd"\])/pass/'
+  mutant evade "cd não muda o diretório" 's/st\["cwd"\] = chdir(seg\[1:\], st\["cwd"\], c == "pushd")/pass/'
   mutant evade "bash -c não é aberto" 's/return scan(seg\[j + 1\], cwd, terr, own, depth + 1)/pass/'
   mutant evade "eval não é aberto" 's/return scan(" ".join(seg\[1:\]), cwd, terr, own, depth + 1)/pass/'
   mutant evade "\$( ) não é aberto" 's/r = scan(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], terr, own, depth + 1)/r = None/'
@@ -278,18 +362,18 @@ echo "== $((n-fails))/$n ok =="
   mutant evade "\$( ) de heredoc sem aspas é ignorado" 's/("" if m.group(2) else/("" if True else/'
   mutant evade "find -exec não é aberto" 's/if t in ("-exec", "-execdir", "-ok", "-okdir"):/if False:/'
   mutant evade "command/env/sudo/xargs não são descascados" 's/elif os.path.basename(seg\[0\]) in WRAP:/elif False:/'
-  mutant pass "corpo de heredoc é tratado como comando" 's/hide(HEREDOC.sub(heredoc, cmd))/hide(cmd)/'
+  mutant pass "corpo de heredoc é tratado como comando" 's/hide(CONT.sub(r"\\1", HEREDOC.sub(heredoc, cmd)))/hide(cmd)/'
   mutant evade "pontuação colada ); engole a próxima palavra" 's/for pc in PIECE.findall(tok):/for pc in [tok]:/'
   mutant tools "Edit/Write não são vigiados" 's/    if tool in TOOLS_FILE:/    if False:/'
   mutant closed "falha do guarda vira liberado" '/o guarda falhou/{n;s/return 2/return 0/;}'
   mutant block "bloqueio sai 0 em vez de 2" '/print(message(hit/{n;s/return 2/return 0/;}'
   mutant closed "sem projeto, o cwd vira clone próprio" 's/p = os.path.realpath(proj) if proj else ""/p = os.path.realpath(proj or os.getcwd())/'
   mutant evade "stash push com 'stash list' na mensagem vira leitura" 's/(sub == "stash" and first in ("list", "show"))/(sub == "stash")/'
-  mutant closed "branch com argumento vira leitura" 's/return all(t in LIST_FLAGS\[sub\] for t in rest)/return True/'
+  mutant closed "branch com argumento vira leitura" 's/return lists_only(sub, rest)/return True/'
   mutant closed "JSON ruim que cita git passa" 's/if not re.search(r"git|file_path|notebook_path", raw):/if True:/'
   mutant check "selfcheck só confere o Bash" 's/for tool in ("Bash",) + tuple(TOOLS_FILE):/for tool in ("Bash",):/'
-  mutant check "selfcheck aceita hook que chama outro arquivo" 's/me in h.get("command", "") and/True and/'
-  mutant check "selfcheck não exige '|| exit 2'" 's/ and h\["command"\].endswith("|| exit 2")//'
+  mutant check "selfcheck aceita hook que chama outro arquivo" 's/re.escape(me)/r"\\S+"/'
+  mutant check "selfcheck não exige '|| exit 2'" 's/\\s+\\|\\|\\s+exit\\s+2")/.*")/'
   mutant check "selfcheck ignora disableAllHooks" 's/if s.get("disableAllHooks"):/if False:/'
   mutant check "selfcheck ignora a camada do projeto" 's/for d in args\[1:\]:/for d in []:/'
   mutant evade "opção de env/sudo que muda o diretório não deixa o guarda cego" 's/^\( *\)blind = blind or seg\[0\]\[:2\].*/\1pass/'
@@ -300,9 +384,32 @@ echo "== $((n-fails))/$n ok =="
   mutant evade "remote -v add vira leitura" 's/rest in (\[\], \["-v"\]) or/rest[:1] in ([], ["-v"]) or/'
   mutant evade "--output/--lost-found em comando de leitura" 's/    if any(WRITES.match(t) for t in rest):/    if False:/'
   mutant tools "Edit/Write em ~\/.claude\/hooks e settings passam" 's/p is None or claude_conf(p) or (inside/p is None or (inside/'
+  mutant check "selfcheck aceita o arquivo citado no meio do comando" 's/hook_re.fullmatch(/hook_re.search(/'
+  mutant shell "palavra reservada (if/then/{/!…) esconde o git" 's/        elif seg\[0\] in KEYWORDS:/        elif False:/'
+  mutant shell "function NOME { git …; }" 's/        elif seg\[0\] == "function":/        elif False:/'
+  mutant shell "coproc NOME { git …; }" 's/seg\[3:\] if seg\[0\] == "coproc" and seg\[2:3\] == \["{"\] else seg\[1:\]/seg[1:]/'
+  mutant shell "cd -P / -L não são lidos como opção" 's/    while args and re.fullmatch(r"-\[LPe@\]+", args\[0\]):/    while False:/'
+  mutant shell "cd -- DIR não é lido" 's/    if args\[:1\] == \["--"\]:/    if False:/'
+  mutant shell "cd com dois argumentos vira o primeiro" 's/    if len(args) > 1 or /    if False or /'
+  mutant shell "pushd sem argumento vira HOME" 's/ or (push and not args) or / or (False) or /'
+  mutant shell "pushd +N / opção que não conheço vira diretório" 's/ or (args and args\[0\]\[:1\] in ("-", "+")):/ or False:/'
+  mutant shell "<(cmd) engole o comando como se fosse alvo de redirecionamento" 's/^\( *\)skip = False  # `<(cmd)`.*/\1pass/'
+  mutant shell "lançador que não modelo (flock/ssh/su/trap…) vira comando comum" 's/        elif c in OPAQUE:/        elif False:/'
+  mutant shell "git atrás de lançador herda o diretório conhecido" 's/{\*\*st\["env"\], \*\*env}, None, terr, own)/{**st["env"], **env}, cwd, terr, own)/'
+  mutant shell "texto entre aspas passado ao lançador não é aberto" 's/                if re.search(r"\\s", t):/                if False:/'
+  mutant shell "heredoc para bash/ssh/sh é descartado" 's/^    if any(runs_text(s.split()) for s in .*:$/    if False:/'
+  mutant shell "todo heredoc vira script" 's/^    return bool(s) and os.path.basename(s\[0\]) in .*/    return True/'
+  mutant shell "here-string para bash é ignorado" 's/            if herestr and runs_text(seg):/            if False:/'
+  mutant shell "continuação de linha não é juntada" 's/hide(CONT.sub(r"\\1", HEREDOC.sub(heredoc, cmd)))/hide(HEREDOC.sub(heredoc, cmd))/'
+  mutant shell "barra escapada + newline vira continuação" 's/^CONT = re.compile(.*)  #/CONT = re.compile(r"()\\\\\\n")  #/'
+  mutant closed "branch/tag com palavra solta e sem opção de lista vira leitura" 's/        elif t.startswith("-") or not listing:/        elif t.startswith("-"):/'
+  mutant closed "branch --list -d x vira leitura" 's/        elif t.startswith("-") or not listing:/        elif not listing:/'
+  mutant closed "branch --contains -D x vira leitura" 's/^            if t.startswith("-"):/            if False:/'
+  mutant closed "git config chave valor vira leitura" 's/len(rest) - len(flags) == 1 and/len(rest) - len(flags) >= 1 and/'
+  mutant closed "git config --unset chave vira leitura" 's/ and all(t in CONFIG_SCOPE for t in flags))/)/'
   echo "-- contra um stub que só sai 0 (o servidor ANTES desta fatia)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"; printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$T/stub.py"
-  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,tools,msg,check" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(RCG_MUTANT=1 RCG_ONLY="block,evade,closed,shell,tools,msg,check" RCG_UNDER_TEST="$T/stub.py" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }
