@@ -11,7 +11,22 @@
 # WHAT: probe real serve-ability via `gc dolt health` (bounded by timeout). A hung
 # server makes that hang (→ timeout) or report unreachable. Restart ONLY after
 # MAX_STRIKES consecutive failing probes (avoids false-positive restart storms on a
-# transient blip), capturing a goroutine dump first for diagnosis.
+# transient blip).
+#
+# HOW IT RESTARTS (ga-fzt548): `gc dolt restart` only — the engine stops Dolt with a
+# plain SIGTERM (SIGKILL only as its own last-resort fallback). This script sends NO
+# signal to Dolt itself. The old pre-restart `kill -QUIT` (for a goroutine dump) is
+# opt-in now: DOLT_DUMP=1. It is OFF by default because SIGQUIT is not a dump-and-
+# continue on a Go server — it terminates it — and the city's doctrine forbids it.
+#
+# AT MOST ONE RESTART PER BACKOFF WINDOW (ga-fzt548): a confirmed hang is allowed to
+# restart Dolt once; the next one is held for RESTART_BACKOFF_MIN (30 min), then
+# 2x, 4x ... up to RESTART_BACKOFF_MAX, and every held restart escalates (once per
+# ESCALATE_REPEAT) instead of looping. Measured in this script's own log on 2026-09-24:
+# 6 attempts in 16 min (13:04:47 -> 13:20:48, one every ~3 min). Dolt was down on a full
+# disk and the engine REFUSED every restart ("recent Dolt log shows ENOSPC"), so each
+# cycle was 3 strikes -> refused restart -> "STILL unhealthy" -> a fresh page, forever.
+# Retrying a restart the engine keeps refusing is not recovery, it is noise.
 #
 # Kill switch: DOLT_WATCHDOG_ENABLED=0 → probe + log only, never restart.
 set -uo pipefail
@@ -30,7 +45,13 @@ source "$_DHW_SCRIPT_DIR/dolt-pid-lib.sh"
 # sweep. "You cannot test it without risking the outage it causes" is why 87
 # restarts happened with no test ever written.
 LOG="${DOLT_WATCHDOG_LOG:-$CITY/.gc/logs/dolt-hang-watchdog.log}"
-STRIKES="${DOLT_WATCHDOG_STRIKES_FILE:-/tmp/dolt-hang-watchdog.strikes}"
+# ga-fzt548: the state that DECIDES a restart (strikes, CPU-veto counter, restart
+# history) lives under .gc/runtime, not /tmp. /tmp is wiped on reboot and by the OS's
+# periodic cleaner, so a counter kept there silently forgets — and a restart history
+# that forgets is a backoff that never holds. (LASTPID_FILE below stays in /tmp on
+# purpose: it is only the forensic PID baseline, and forgetting it at reboot is right.)
+STATE_DIR="${DOLT_WATCHDOG_STATE_DIR:-$CITY/.gc/runtime}"
+STRIKES="${DOLT_WATCHDOG_STRIKES_FILE:-$STATE_DIR/dolt-hang-watchdog.strikes}"
 MAX_STRIKES="${DOLT_WATCHDOG_MAX_STRIKES:-3}"
 PROBE_TIMEOUT="${DOLT_WATCHDOG_PROBE_TIMEOUT:-12}"
 ENABLED="${DOLT_WATCHDOG_ENABLED:-1}"
@@ -49,7 +70,24 @@ SERVE_CONFIRM_TIMEOUT="${DOLT_WATCHDOG_SERVE_CONFIRM:-25}"
 # 20% is far above idle noise and far below the 50-207% seen in real saturation.
 CPU_ALIVE_PCT="${DOLT_WATCHDOG_CPU_ALIVE_PCT:-20}"
 CPU_VETO_MAX="${DOLT_WATCHDOG_CPU_VETO_MAX:-5}"
-CPU_VETO_FILE="${DOLT_WATCHDOG_CPU_VETO_FILE:-/tmp/dolt-hang-watchdog.cpuveto}"
+CPU_VETO_FILE="${DOLT_WATCHDOG_CPU_VETO_FILE:-$STATE_DIR/dolt-hang-watchdog.cpuveto}"
+
+# ga-fzt548: restart BACKOFF + escalation (see the gate at the restart site).
+# RESTART_STATE holds "<restarts in this episode> <epoch of the last restart>";
+# ESCALATE_STAMP holds the epoch of the last escalation (dedupe only — it never gates
+# a restart). An episode ends after RESTART_RESET_AFTER seconds with no restart.
+RESTART_STATE="${DOLT_WATCHDOG_RESTART_STATE_FILE:-$STATE_DIR/dolt-hang-watchdog.restarts}"
+ESCALATE_STAMP="${DOLT_WATCHDOG_ESCALATE_STAMP_FILE:-$STATE_DIR/dolt-hang-watchdog.escalated}"
+RESTART_BACKOFF_MIN="${DOLT_WATCHDOG_RESTART_BACKOFF_MIN:-1800}"     # 30 min between restarts
+RESTART_BACKOFF_MAX="${DOLT_WATCHDOG_RESTART_BACKOFF_MAX:-21600}"    # doubling stops at 6 h
+RESTART_RESET_AFTER="${DOLT_WATCHDOG_RESTART_RESET_AFTER:-$RESTART_BACKOFF_MAX}"
+ESCALATE_REPEAT="${DOLT_WATCHDOG_ESCALATE_REPEAT:-3600}"             # re-page at most hourly
+# Seconds to let Dolt come up before the post-restart probe (test seam; 5 in production).
+POST_RESTART_WAIT="${DOLT_WATCHDOG_POST_RESTART_WAIT:-5}"
+# Opt-in goroutine dump. 1 = send SIGQUIT before the restart. ⚠️ That EXITS Dolt (Go's
+# default SIGQUIT is dump-then-terminate); it is only ever reached after a confirmed
+# hang the backoff gate has already cleared for restart. Default OFF (ga-fzt548).
+DOLT_DUMP="${DOLT_DUMP:-0}"
 # ga-153cq (gate attempt 3 FAIL, reviewer right a third time in this same file):
 # the CPU reading itself was the one remaining unmockable input. dolt_cpu_pct()
 # did a raw, unscoped process-table PID lookup with no override — so the
@@ -413,6 +451,114 @@ dolt_cpu_pct() {
   printf '%s' "${_cpu%%.*}"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ga-fzt548 — RESTART BACKOFF. A confirmed hang may restart Dolt ONCE per window.
+#
+# Why: on 2026-09-24 this script attempted a restart at 13:04, 13:08, 13:11, 13:14,
+# 13:17 and 13:20 — six times in sixteen minutes — against a Dolt that was down on a
+# full disk. `gc dolt restart` refused every one (ENOSPC guard), each attempt ended in
+# "STILL unhealthy" and a fresh page, and nothing in the script remembered it had just
+# tried. A remedy that fires every three minutes and never works is a loop, and the way
+# out is not a smarter probe: it is a ceiling on the remedy plus a human in the loop.
+#
+# The record counts restart ATTEMPTS, not successes: an attempt the engine refuses still
+# spends the window (retrying it sooner IS the 24/09 loop). A human who has fixed the
+# cause does not wait for the window — `gc dolt restart` by hand is always available.
+#
+# Window after the k-th restart of an episode: RESTART_BACKOFF_MIN * 2^(k-1), capped at
+# RESTART_BACKOFF_MAX (30 min, 1 h, 2 h, 4 h, 6 h, 6 h ...). An episode ends after
+# RESTART_RESET_AFTER seconds with no restart. A held restart is not dropped: strikes
+# stay armed, so the restart happens on the first tick after the window opens.
+
+# Seconds to hold the NEXT restart after the $1-th restart of an episode ($1 >= 1).
+restart_backoff_for() {
+  local _c="$1" _b="$RESTART_BACKOFF_MIN" _i
+  for (( _i = 1; _i < _c; _i++ )); do
+    _b=$(( _b * 2 ))
+    [ "$_b" -ge "$RESTART_BACKOFF_MAX" ] && break
+  done
+  [ "$_b" -gt "$RESTART_BACKOFF_MAX" ] && _b="$RESTART_BACKOFF_MAX"
+  [ "$_b" -lt "$RESTART_BACKOFF_MIN" ] && _b="$RESTART_BACKOFF_MIN"   # the floor is the contract
+  printf '%s' "$_b"
+}
+
+# May we restart Dolt NOW? READ-ONLY (so it is safe under DRY_RUN): it decides, the
+# caller writes. Sets, for the caller:
+#   RG_VERDICT  allow | hold | unreadable
+#   RG_COUNT    restarts so far in the current episode (0 = none / episode expired)
+#   RG_LAST     epoch of the last restart ("" = none)
+#   RG_WAIT     seconds until a restart is allowed (0 unless hold)
+# Three states, never two: NO history (allow) / history says wait (hold) / cannot tell
+# (unreadable). Unreadable is NOT "no history" — a restart is the destructive step, so
+# when the record that would stop a loop cannot be read, the answer is the inert one.
+restart_gate() {
+  local _now _raw _count _last _extra _age _backoff
+  _now=$(date +%s)
+  RG_VERDICT=allow; RG_COUNT=0; RG_LAST=""; RG_WAIT=0
+  # vazio (arquivo ausente) → nunca reiniciou: restart permitido; falhou/ilegível (existe mas não lê, está vazio, não tem exatamente "<n> <epoch>", ou o carimbo está no futuro) → INERTE: restart recusado e escalado, nunca tratado como "sem histórico"
+  [ -e "$RESTART_STATE" ] || return 0
+  _raw=$(cat "$RESTART_STATE" 2>/dev/null) || { RG_VERDICT=unreadable; return 0; }
+  read -r _count _last _extra <<< "$_raw"
+  case "$_count" in ''|*[!0-9]*) RG_VERDICT=unreadable; return 0 ;; esac
+  case "$_last"  in ''|*[!0-9]*) RG_VERDICT=unreadable; return 0 ;; esac
+  if [ -n "$_extra" ] || [ "${#_count}" -gt 9 ] || [ "${#_last}" -gt 12 ]; then RG_VERDICT=unreadable; return 0; fi
+  _count=$(( 10#$_count )); _last=$(( 10#$_last ))
+  [ "$_last" -gt "$_now" ] && { RG_VERDICT=unreadable; return 0; }   # clock stepped back / garbage
+
+  _age=$(( _now - _last ))
+  if [ "$_count" -eq 0 ] || [ "$_age" -ge "$RESTART_RESET_AFTER" ]; then return 0; fi   # no live episode
+  RG_COUNT="$_count"; RG_LAST="$_last"
+  _backoff=$(restart_backoff_for "$_count")
+  if [ "$_age" -lt "$_backoff" ]; then RG_VERDICT=hold; RG_WAIT=$(( _backoff - _age )); fi
+  return 0
+}
+
+# Persist "<count> <now>" ATOMICALLY (tmp + mv, so a kill mid-write can never leave a
+# half-written history that restart_gate would have to call unreadable). rc != 0 = NOT
+# persisted. Called BEFORE the restart is attempted, never after: a restart that gets
+# killed mid-flight (launchd, a timeout, a crash) must still count, or the very loop
+# this exists to stop can run unrecorded.
+restart_record() {
+  local _tmp="$RESTART_STATE.tmp.$$"
+  mkdir -p "$(dirname "$RESTART_STATE")" 2>/dev/null || return 1
+  if printf '%s %s\n' "$1" "$(date +%s)" > "$_tmp" 2>/dev/null && mv -f "$_tmp" "$RESTART_STATE" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$_tmp" 2>/dev/null
+  return 1
+}
+
+# Remember that a human was paged (dedupe only; it never gates a restart). Best effort:
+# a stamp that cannot be written makes the NEXT tick page again — the loud direction.
+escalation_stamp() {
+  mkdir -p "$(dirname "$ESCALATE_STAMP")" 2>/dev/null || true
+  date +%s > "$ESCALATE_STAMP" 2>/dev/null \
+    || log "WARN: could not write the escalation stamp ${ESCALATE_STAMP} — the next held tick will page again"
+}
+
+# Page ($1 = title, $2 = body) through the canonical path (mail to the Mayor + push), at
+# most once per ESCALATE_REPEAT. Without the dedupe a held restart would page every 60 s
+# for as long as the window lasts.
+restart_escalate() {
+  local _now _last
+  _now=$(date +%s)
+  # vazio (sem carimbo) → nunca escalou: escala agora; falhou/ilegível (não numérico, longo demais ou no futuro) → escala também: aqui o alarme É o estado inerte, um page a mais custa pouco e silêncio com o Dolt pendurado custa a cidade
+  _last=$(cat "$ESCALATE_STAMP" 2>/dev/null)
+  case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+  [ "${#_last}" -gt 12 ] && _last=0
+  _last=$(( 10#$_last ))
+  if [ "$_last" -le "$_now" ] && [ $(( _now - _last )) -lt "$ESCALATE_REPEAT" ]; then
+    log "escalation suppressed (already paged $(( _now - _last ))s ago, repeat every ${ESCALATE_REPEAT}s)"
+    return 0
+  fi
+  escalation_stamp
+  python3 "$CITY/scripts/escalate_emergency.py" \
+    --class town-halted \
+    --title "$1" \
+    "$2" \
+    >> "$LOG" 2>&1 || log "WARN: escalate_emergency.py call failed (non-fatal)"
+}
+
 # Runs UNCONDITIONALLY, before any health decision: a death+respawn can
 # complete well inside this watchdog's own polling interval, so probe_ok()
 # below may see a healthy server on every single run and never know a death
@@ -468,7 +614,12 @@ n=$(( $(cat "$STRIKES" 2>/dev/null || echo 0) + 1 ))
 if is_dry_run; then
   log "DRY-RUN: would advance strike counter to ${n}/${MAX_STRIKES}. Not written — on-disk value left intact."
 else
-  echo "$n" > "$STRIKES"
+  # ga-fzt548: the file moved out of /tmp, so its directory is no longer guaranteed. A
+  # strike that cannot be written never accumulates — which is the INERT outcome (no
+  # restart) but a silent one; say so instead of failing quietly.
+  mkdir -p "$(dirname "$STRIKES")" 2>/dev/null
+  echo "$n" > "$STRIKES" 2>/dev/null \
+    || log "WARN: could not write the strike counter ${STRIKES} — strikes will not accumulate, so no restart can happen until this is fixed"
 fi
 _strike_cpu="$(dolt_cpu_pct)"
 # ga-153cq: record CPU on the STRIKE path too, not only on the saturation path.
@@ -487,17 +638,19 @@ fi
 # ga-153cq — CPU VETO on the destructive step.
 #
 # Doctrine (CLAUDE.md) says NEVER kill -QUIT the Dolt PID: sent to a live server
-# it vanished on the spot and took the city down. That NEVER was written about a
-# different call site — an ad-hoc "diagnostic" against a server just confirmed
-# HEALTHY, under the false premise that SIGQUIT was non-fatal. Here it is the
-# only automated recovery for a true hang, behind 3 confirmed strikes, and the
-# author knew it exits Dolt. So the answer is not to delete the recovery path.
+# it vanished on the spot and took the city down. ga-153cq kept a pre-restart
+# SIGQUIT in this path, arguing that the restart was the only automated recovery
+# for a true hang and that SIGQUIT exits Dolt anyway. ga-fzt548 overturned that: the
+# recovery is `gc dolt restart` alone (the engine's own SIGTERM stop), SIGQUIT is
+# opt-in via DOLT_DUMP=1, and the restart itself is capped by a backoff (restart_gate).
+# The veto below is unchanged — it is still what keeps routine saturation from being
+# "confirmed" as a hang in the first place.
 #
 # But "confirmed" has to mean confirmed. Measured on the live log before this
 # change: 1,879 saturation events (health probe failed, raw SELECT 1 still
 # served — at up to 207% CPU) vs 319 strikes and 87 actual restarts. The health
 # probe failing is ROUTINE; the single thing standing between routine saturation
-# and an automatic SIGQUIT of the city's data plane is one bounded SELECT 1.
+# and an automatic restart of the city's data plane is one bounded SELECT 1.
 # When Dolt degrades hard (measured this same night: bd latency 30-74s before
 # the ga-9ae7o vendor fix, 150-257ms after), that SELECT 1 can miss its bound
 # while the server is alive and working — and the old code then killed it.
@@ -544,20 +697,64 @@ if is_dry_run; then
   if [ -n "$_cpu_now" ] && [ "$_cpu_now" -ge "$CPU_ALIVE_PCT" ] && [ "$_vetoes" -lt "$CPU_VETO_MAX" ]; then
     log "DRY-RUN: would VETO the restart — Dolt at ${_cpu_now}% CPU (>=${CPU_ALIVE_PCT}%), veto would become $(( _vetoes + 1 ))/${CPU_VETO_MAX}. No counter written, no notify sent."
   else
-    _pid_dr="$(dolt_server_pid || true)"
-    log "DRY-RUN: would kill -QUIT pid=${_pid_dr:-<none>} and run 'gc dolt restart' (strikes=${n}, cpu=${_cpu_now:-?}%, vetoes=${_vetoes}/${CPU_VETO_MAX}). Nothing signalled; strikes and veto counter left intact."
+    # ga-fzt548: the dry run reports what the BACKOFF GATE below would decide too —
+    # restart_gate is read-only, so consulting it here writes nothing.
+    restart_gate
+    _dump_dr=""
+    [ "$DOLT_DUMP" = "1" ] && _dump_dr=" DOLT_DUMP=1: it would ALSO send SIGQUIT first, which EXITS Dolt."
+    case "$RG_VERDICT" in
+      allow)
+        log "DRY-RUN: would run 'gc dolt restart' (graceful stop by the engine; this script signals nothing itself) — restart #$(( RG_COUNT + 1 )) of the episode (strikes=${n}, cpu=${_cpu_now:-?}%, vetoes=${_vetoes}/${CPU_VETO_MAX}).${_dump_dr} Nothing signalled; strikes, veto counter and restart history left intact." ;;
+      hold)
+        log "DRY-RUN: would HOLD the restart (backoff) — ${RG_COUNT} restart(s) this episode, next allowed in ${RG_WAIT}s, and would page the Mayor (at most every ${ESCALATE_REPEAT}s). Nothing signalled; nothing written." ;;
+      *)
+        log "DRY-RUN: would REFUSE the restart — the restart history ${RESTART_STATE} exists but cannot be read, so it cannot be known whether one just happened; would page the Mayor. Nothing signalled; nothing written." ;;
+    esac
   fi
   exit 0
 fi
 
 if [ -n "$_cpu_now" ] && [ "$_cpu_now" -ge "$CPU_ALIVE_PCT" ] && [ "$_vetoes" -lt "$CPU_VETO_MAX" ]; then
   _vetoes=$(( _vetoes + 1 ))
-  echo "$_vetoes" > "$CPU_VETO_FILE"
+  mkdir -p "$(dirname "$CPU_VETO_FILE")" 2>/dev/null
+  echo "$_vetoes" > "$CPU_VETO_FILE" 2>/dev/null \
+    || log "WARN: could not write the CPU-veto counter ${CPU_VETO_FILE} — the veto will not count toward exhaustion"
   log "CONFIRMED-by-strikes but Dolt is burning ${_cpu_now}% CPU (>=${CPU_ALIVE_PCT}%) — WORKING, not hung. Restart VETOED (${_vetoes}/${CPU_VETO_MAX}). Not clearing strikes."
   command -v notify >/dev/null 2>&1 && notify -p 4 -t 'Dolt hang-watchdog' \
     "Hang confirmed by probes but Dolt at ${_cpu_now}% CPU — restart vetoed (${_vetoes}/${CPU_VETO_MAX}). Saturation, not a hang." >/dev/null 2>&1 || true
   exit 0
 fi
+
+# ga-fzt548 — BACKOFF GATE (see restart_gate above). Past the veto the only question
+# left is "may we restart NOW?". Everything the veto would have said is already said;
+# a held or refused restart returns BEFORE the veto-exhausted notify below, whose text
+# ("restarting Dolt anyway") would be false for a restart that does not happen, and
+# BEFORE the veto counter is cleared (strikes and veto stay armed, so the restart fires
+# on the first tick after the window opens).
+restart_gate
+case "$RG_VERDICT" in
+  hold)
+    log "CONFIRMED Dolt hang (${n} strikes, cpu=${_cpu_now:-?}%) but the restart is HELD by backoff: ${RG_COUNT} restart(s) this episode, the last at $(_snap_fmt "$RG_LAST"); next one allowed in ${RG_WAIT}s. Strikes and veto counter kept — it restarts on its own once the window opens."
+    restart_escalate "Dolt hang-watchdog: restart held by backoff" \
+      "Dolt is confirmed hung (${n} strikes) but the watchdog already tried to restart it ${RG_COUNT}x this episode (last attempt: $(_snap_fmt "$RG_LAST"); an attempt the engine refuses counts too). It will NOT try again for another ${RG_WAIT}s (about $(( (RG_WAIT + 59) / 60 )) min) — a restart loop does not cure saturation. If the city is down and you want it NOW: 'gc dolt restart'. Investigate the load first: ${LOG}"
+    exit 0 ;;
+  unreadable)
+    log "CONFIRMED Dolt hang (${n} strikes) but the restart history ${RESTART_STATE} exists and cannot be read (empty, malformed or dated in the future) — REFUSING to restart: without it there is no telling whether a restart just happened, and that is how the 2026-09-24 loop ran. Fix or delete the file."
+    restart_escalate "Dolt hang-watchdog: restart refused (history unreadable)" \
+      "Dolt is confirmed hung (${n} strikes) but the watchdog cannot read its restart history (${RESTART_STATE}), so it cannot tell whether it just restarted Dolt and refuses to risk a loop. Inspect the file; delete it to re-arm the automatic restart, or run 'gc dolt restart' by hand."
+    exit 0 ;;
+esac
+
+# Persist the attempt BEFORE making it. If it cannot be persisted the backoff could not
+# hold next time, so the restart is refused too — the same inert answer as unreadable.
+_restart_no=$(( RG_COUNT + 1 ))
+if ! restart_record "$_restart_no"; then
+  log "WARN: could not write the restart history ${RESTART_STATE} — REFUSING the restart: an unrecorded restart is exactly how the backoff gets bypassed."
+  restart_escalate "Dolt hang-watchdog: restart refused (history not writable)" \
+    "Dolt is confirmed hung (${n} strikes) but the watchdog cannot write its restart history (${RESTART_STATE}), so it refuses to restart without a record. Fix the path's permissions, or run 'gc dolt restart' by hand."
+  exit 0
+fi
+
 if [ "$_vetoes" -ge "$CPU_VETO_MAX" ]; then
   log "CPU veto EXHAUSTED (${_vetoes}/${CPU_VETO_MAX}) at cpu=${_cpu_now:-?}% — a spin-deadlock also burns CPU, so proceeding with restart rather than never recovering."
   command -v notify >/dev/null 2>&1 && notify -p 5 -t 'Dolt hang-watchdog' \
@@ -565,26 +762,36 @@ if [ "$_vetoes" -ge "$CPU_VETO_MAX" ]; then
 fi
 rm -f "$CPU_VETO_FILE" 2>/dev/null || true
 
-log "CONFIRMED Dolt hang (${n} consecutive strikes, cpu=${_cpu_now:-?}%) — capturing goroutine dump + restarting."
-PID="$(dolt_server_pid || true)"
+log "CONFIRMED Dolt hang (${n} consecutive strikes, cpu=${_cpu_now:-?}%) — restarting via 'gc dolt restart' (restart #${_restart_no} of this episode; the next one is held for $(restart_backoff_for "$_restart_no")s)."
 
 # ga-153cq: the DRY_RUN interception lives ABOVE the veto section now (see the note
 # there). It must stay there: any dry-run gate placed at this point is already past
 # the veto counter write and both notify calls, which is exactly what failed review.
 # DOLT_WATCHDOG_DRY_RUN=1 exists because the only other way to exercise this branch
-# was to actually SIGQUIT the city's data plane — so in practice it was never
+# was to actually restart the city's data plane — so in practice it was never
 # tested, only observed after the fact, 87 times. An unrunnable safety path is an
 # unverified one.
 
-if [ -n "$PID" ]; then
-  kill -QUIT "$PID" 2>/dev/null || true   # dumps goroutines to dolt.log (also exits Dolt; restart below recovers)
-  sleep 3
+# ga-fzt548: NO signal to Dolt by default. The goroutine dump is opt-in (DOLT_DUMP=1)
+# because SIGQUIT does not dump-and-continue on a Go server, it terminates it; the
+# restart below would have done that anyway, but the doctrine forbids sending it as a
+# routine step. Dolt's own stop path (gc dolt restart) is a plain SIGTERM.
+if [ "$DOLT_DUMP" = "1" ]; then
+  # vazio (PID desconhecido) → sem dump, e sem chute de PID; falhou/ilegível → idem: o restart abaixo segue sem o dump
+  PID="$(dolt_server_pid || true)"
+  if [ -n "$PID" ]; then
+    log "DOLT_DUMP=1: sending SIGQUIT to pid ${PID} for a goroutine dump (opt-in; this EXITS Dolt — the restart below brings it back)."
+    kill -QUIT "$PID" 2>/dev/null || true   # dumps goroutines to dolt.log, then Go exits the process
+    sleep 3
+  else
+    log "DOLT_DUMP=1 but the Dolt PID is unknown — no dump taken (never guessing a PID); restarting without it."
+  fi
 fi
 ( cd "$CITY" && GC_CITY="$CITY" gc dolt restart >> "$LOG" 2>&1 ) || log "WARN: gc dolt restart returned nonzero"
-sleep 5
+sleep "$POST_RESTART_WAIT"
 if probe_ok; then
   log "Restart OK — Dolt serving again."
-  command -v notify >/dev/null 2>&1 && notify -p 4 -t 'Dolt hang-watchdog' "Restarted HUNG Dolt after ${n} strikes — now healthy" >/dev/null 2>&1 || true
+  command -v notify >/dev/null 2>&1 && notify -p 4 -t 'Dolt hang-watchdog' "Restarted HUNG Dolt after ${n} strikes (restart #${_restart_no} of this episode; next held for $(restart_backoff_for "$_restart_no")s) — now healthy" >/dev/null 2>&1 || true
 else
   log "WARN: Dolt STILL unhealthy after restart — escalating."
   # ga-wxwao (case 2): migrated from an ad-hoc `notify -p 5` call to the
@@ -603,6 +810,9 @@ else
     --title "Dolt hang-watchdog: restart did not recover" \
     "Restart attempted but Dolt STILL unhealthy after ${n} strikes — NEEDS HUMAN." \
     >> "$LOG" 2>&1 || log "WARN: escalate_emergency.py call failed (non-fatal)"
+  # ga-fzt548: this page counts for the dedupe too, or the next held tick (strikes are
+  # cleared below, so ~3 min from now) would page the same human again for the same outage.
+  escalation_stamp
 fi
 rm -f "$STRIKES"
 exit 0
