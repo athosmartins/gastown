@@ -34,12 +34,26 @@ base_commit: $BASE
 rig: $RIG
 bead_rig: $RIG
 submitted_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | grep -oE 'ga-[a-z0-9]+' | head -1)
-for L in type:quality-gate-marker gate-status:queued \
+# ga-ni22de: a NEW marker is born `gate-status:ready`, never `queued`. The guard
+# only discovers `ready`; it claims the marker, runs the vetting (E11 size cap,
+# Step 4b dedup/supersede, A/B base test, bash-3.2 check) and only THEN parks it
+# as `queued` for the dispatcher. Born `queued`, the marker skips all of that,
+# and the guard rejects it (gate-status:error) when it finds one with no
+# claim/park stamp.
+for L in type:quality-gate-marker gate-status:ready \
          "branch:$BR" "source-bead:$BEAD" "bead-rig:$RIG"; do
   bd -C "$HQ" label add "$MID" "$L" -q
 done
 bd -C "$HQ" dolt commit -m "submit $BEAD to gate"
 ```
+
+`queued` is a state the guard writes, not one a submitter writes. The only hand
+edit that touches it is re-queueing an EXISTING, already-vetted marker that went
+to `error` (`label remove gate-status:error && label add gate-status:queued`) —
+that marker already carries the guard's stamps, so it is not rejected. A marker
+the guard itself rejected as born-queued has no such stamps and must go back as
+`ready` (`label remove gate-status:error && label add gate-status:ready`), so the
+guard vets it; the rejection comment on the marker says the same.
 
 ## `-t chore`, NOT `-t task` (this line used to be wrong)
 

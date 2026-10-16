@@ -1616,7 +1616,7 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
             "DIFERENTES) — senão NÃO é órfão, é o run atual travado (outro modo de falha; não mexa).\n\n"
             "CONSERTO — DECIDA pelo estado do branch:\n"
             "  (a) Branch AINDA quer mergear (código não landou): FECHE este marker e MINTE um novo (clone da descrição, "
-            "docs/gate-marker-recipe.md) — o created_at é IMUTÁVEL: remover e re-adicionar gate-status:queued "
+            "docs/gate-marker-recipe.md; o novo nasce gate-status:ready, NUNCA queued — o guard rejeita quem nasce queued) — o created_at é IMUTÁVEL: remover e re-adicionar gate-status:queued "
             "(`bd -C . update %s --remove-label gate-status:queued` + `--add-label`) NÃO o refresca e NÃO muda a posição "
             "dele na fila (o próprio dispatcher documenta isso; um repair dog já gastou um ciclo inteiro nesse truque, "
             "ga-gsh1e). Antes de re-mintar, descubra POR QUE o dispatcher o pulou (labels do marker, created_at fora do "

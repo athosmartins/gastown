@@ -838,6 +838,47 @@ set_gate_status() {
   done
 }
 
+# gate_born_queued_ids <markers_json>
+# ga-ni22de: pure decision for the Step 0d sweep. <markers_json> is a
+# `bd list --json` ARRAY; prints, one per line, the id of every marker that was
+# BORN gate-status:queued — i.e. it never went through the guard's claim.
+# `queued` is a state only the guard writes (Step 7, after it claimed, vetted and
+# deduped the marker) or re-writes (Vector A requeue of a stuck claimed /
+# dispatching marker); a submitter writes `ready`. A marker that is `queued`
+# with NEITHER stamp the guard leaves on the way there skipped E11, Step 4b
+# dedup, the A/B base test and the bash-3.2 check — the dispatcher would run it
+# unvetted and nothing would supersede the marker it replaces.
+#   gate.state_since  = "claimed@<epoch>" (Step 2) / "dispatching@<epoch>" (the
+#                       dispatcher) — written before queued is ever reached
+#   gate.submitted_by = the author Step 5 resolved (Step 7)
+# Either one present => the marker went through the guard => NOT listed.
+# Only a marker with EXACTLY ONE gate-status:* label (queued) counts: queued next
+# to claimed is Step 7's own add-before-remove window, and 0 or 2+ labels is an
+# ambiguous marker (same reading as marker_status_from_labels) — inert, not ours
+# to judge. A closed marker, or one whose metadata is not an object, is skipped
+# for the same reason: "cannot tell" must never read as "born queued".
+# Exit status: 0 = read fine (empty output = none born queued); non-zero =
+# <markers_json> was not a JSON array — the caller must treat that as "could not
+# check", NOT as "none found".
+gate_born_queued_ids() {
+  local markers_json="$1"
+  # jq exits 0 with no output on empty input — that would read as "none found".
+  [ -n "${markers_json//[[:space:]]/}" ] || return 1
+  printf '%s\n' "$markers_json" | jq -r --arg since "$GATE_STATE_SINCE_KEY" '
+    if type != "array" then error("not an array") else . end
+    | .[]
+    | select((.status // "") != "closed")
+    | select(((.metadata // {}) | type) == "object")
+    | select((.labels // []) as $l
+        | ($l | index("gate-status:queued")) != null
+          and ($l | map(select(startswith("gate-status:"))) | length) == 1)
+    | select(((.metadata // {})[$since] // "") == "")
+    | select(((.metadata // {})["gate.submitted_by"] // "") == "")
+    | select((.id // "") != "")
+    | .id
+  ' 2>/dev/null
+}
+
 # classify_inflight_gap1 <status> <has_gate_passed> <has_live_assignee> <branch_merged>
 # Pure decision for ga-pa36 GAP-1: OPEN story:in-flight bead whose fix branch
 # was already merged to origin/main but has no gate:passed label.
@@ -6966,6 +7007,69 @@ ga-w8mvq: also cleared blocking label(s) $EXT_WAITING_LABELS — left alone, _fi
     esac
   done
 fi
+
+# ── Step 0d (ga-ni22de): refuse markers BORN gate-status:queued ───────────────
+# A submitter writes gate-status:ready (docs/gate-marker-recipe.md, gate-done.md);
+# `queued` is where THIS guard parks a marker after claiming and vetting it (Step
+# 7). The old recipe told builders to write `queued` directly — the guard never
+# discovers such a marker (Step 1 selects only `ready`), so it skipped the E11
+# size cap, the Step 4b dedup/supersede, the A/B base test and the bash-3.2 check,
+# and the "the guard supersedes the old marker" promise in the dispatcher's repair
+# text was false for it. The dispatcher then ran it unvetted. This sweep runs
+# BEFORE Step 1 (which exits when there is no ready marker) and sends every such
+# marker to gate-status:error with the reason, instead of letting it run.
+# "Born queued" = queued with neither gate.state_since nor gate.submitted_by (see
+# gate_born_queued_ids). Fail-INERT: an unreadable list, an unreadable re-check or
+# a marker the re-check does not confirm leaves the marker exactly as it was.
+# Known gap: a born-queued marker the dispatcher picks up before this sweep sees it
+# gets a gate.state_since=dispatching@… stamp and later looks vetted.
+# SELFTEST-EXTRACT born-queued-sweep: BEGIN
+reject_born_queued_marker() {
+  # The variable is named MARKER_ID (local) on purpose: the bd comment below has to
+  # keep the literal `comment "$MARKER_ID" "<prefix>` shape that the watchdog
+  # contract (ga-hp4wrx) greps for, and the global MARKER_ID is not set until Step 2.
+  local MARKER_ID="$1" _show_json _confirmed
+  # Re-read the marker through `bd show` (a different path from the `bd list` that
+  # nominated it) and require the same verdict before touching it.
+  # vazio → não confirmado, marker intacto; falhou/ilegível → idem (nunca "nasceu queued").
+  _show_json=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
+    | jq -c 'if type=="array" then . else [.] end' 2>/dev/null) || _show_json=""
+  _confirmed=$(gate_born_queued_ids "$_show_json") || _confirmed=""
+  if [ "$_confirmed" != "$MARKER_ID" ]; then
+    warn "Step 0d (ga-ni22de): $MARKER_ID was listed as born-queued but the bd show re-check did not confirm it (unreadable, restamped or relabelled) — left untouched."
+    return 0
+  fi
+  set_gate_status "$MARKER_ID" "error"
+  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: born gate-status:queued (ga-ni22de). This marker is queued but carries neither gate.state_since nor gate.submitted_by, the stamps the guard writes when it claims and parks a marker, so it never went through the guard's claim and skipped the checks on that path (E11 size cap, Step 4b duplicate supersede, A/B base test, bash-3.2 syntax). A new marker must be created as gate-status:ready (docs/gate-marker-recipe.md) — the guard only discovers ready, and it is the guard that sets queued. To resubmit this one so the guard vets it: bd -C $GC_CITY label remove $MARKER_ID gate-status:error && bd -C $GC_CITY label add $MARKER_ID gate-status:ready (do NOT label it queued again). Marker set to gate-status:error (fixable + re-submittable, not lost)." 2>/dev/null || true
+  log "Step 0d (ga-ni22de): marker $MARKER_ID was born gate-status:queued (no gate.state_since / gate.submitted_by) — set to gate-status:error."
+}
+
+BQ_OK=1
+# vazio → falha de leitura (bd list --json devolve [] quando não há nada); falhou/ilegível → Step 0d pulado, nenhum marker tocado.
+BQ_JSON=$(bd -C "$GC_CITY" list --json --all --status open --limit 0 --include-infra \
+  -l type:quality-gate-marker \
+  -l gate-status:queued \
+  2>/dev/null) || BQ_OK=0
+[ -z "$BQ_JSON" ] && BQ_OK=0
+
+if [ "$BQ_OK" = "0" ]; then
+  warn "Step 0d (ga-ni22de): queued-marker query failed or came back empty — born-queued check SKIPPED (non-fatal; distinct from '0 born-queued found')."
+elif BQ_IDS=$(gate_born_queued_ids "$BQ_JSON"); then
+  BQ_COUNT=$(printf '%s\n' "$BQ_IDS" | grep -c . || true)
+  case "$BQ_COUNT" in ''|*[!0-9]*) BQ_COUNT=0 ;; esac
+  if [ "$BQ_COUNT" -gt 0 ]; then
+    log "Step 0d (ga-ni22de): $BQ_COUNT marker(s) born gate-status:queued — rejecting."
+    printf '%s\n' "$BQ_IDS" | while IFS= read -r BQ_ID; do
+      [ -z "$BQ_ID" ] && continue
+      reject_born_queued_marker "$BQ_ID"
+    done
+  else
+    log "Step 0d (ga-ni22de): no marker born gate-status:queued."
+  fi
+else
+  warn "Step 0d (ga-ni22de): queued-marker list was not a readable JSON array — born-queued check SKIPPED (non-fatal; distinct from '0 born-queued found')."
+fi
+# SELFTEST-EXTRACT born-queued-sweep: END
 
 # ── Step 1: Find unclaimed ready-for-gate markers ─────────────────────────────
 
