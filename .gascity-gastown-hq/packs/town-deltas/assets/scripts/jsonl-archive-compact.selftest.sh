@@ -94,18 +94,26 @@ EOF
 chmod +x "$WORK/git-slow"
 # git-fx: fault injection for the steps AFTER a batch, plain git for everything else. Env controls (all optional):
 #   FM_RC=<n>      every `maintenance run` exits <n> at once and does nothing (a failed batch)
+#   PACKFAIL_MAINT=1  every `maintenance run` packs ALL the loose objects (like a batch that finished) and then exits 1 (like one that died on the way out)
 #   SLOW_GC=1      `gc` sleeps $SLOW_SLEEP seconds (default 8) before running
 #   SLOW_PRUNE=1   `prune-packed` sleeps $SLOW_SLEEP seconds before running
 #   NOOP_PRUNE=1   `prune-packed` exits 0 and removes nothing (a read-only remount, permissions: it "succeeds" without pruning)
+#   SLOW_REPACK=1  `repack` sleeps $SLOW_SLEEP seconds before running (the tail pass)
+#   FAIL_REPACK=1  `repack` exits 1 at once and does nothing (the tail pass failing)
 #   INFLOW_N=<n>   after every real `maintenance run`, <n> NEW loose objects land (an exporter commit during a batch)
 # It sleeps in the foreground, so `timeout` (which signals its whole process group) kills it like a real slow git.
 cat > "$WORK/git-fx" <<'EOF'
 #!/bin/bash
 gd=""; for a in "$@"; do case "$a" in --git-dir=*) gd="${a#*=}" ;; esac; done
 case " $* " in
-  *" maintenance run "*) [ -n "${FM_RC:-}" ] && exit "$FM_RC" ;;
+  *" maintenance run "*) [ -n "${FM_RC:-}" ] && exit "$FM_RC"
+                         if [ -n "${PACKFAIL_MAINT:-}" ] && [ -n "$gd" ]; then     # a batch that wrote its pack and pruned, then died: the work is done, the exit code says failed
+                           git --git-dir="$gd" rev-list --objects --all --unpacked | git --git-dir="$gd" pack-objects -q "$gd/objects/pack/pack" >/dev/null
+                           git --git-dir="$gd" prune-packed -q; echo "git-fx: injected failure after packing" >&2; exit 1
+                         fi ;;
   *" gc "*)              [ -n "${SLOW_GC:-}" ] && sleep "${SLOW_SLEEP:-8}" ;;
   *" prune-packed "*)    [ -n "${SLOW_PRUNE:-}" ] && sleep "${SLOW_SLEEP:-8}"; [ -n "${NOOP_PRUNE:-}" ] && exit 0 ;;
+  *" repack "*)         [ -n "${SLOW_REPACK:-}" ] && sleep "${SLOW_SLEEP:-8}"; [ -n "${FAIL_REPACK:-}" ] && { echo "git-fx: injected repack failure" >&2; exit 1; } ;;
 esac
 git "$@"; rc=$?
 case " $* " in
@@ -127,6 +135,7 @@ run_jac() {
   JAC_GIT="${T_GIT:-git}" JAC_GIT_TIMEOUT_S="${T_GIT_TIMEOUT:-300}" JAC_MAX_BATCHES="${T_MAX_BATCHES:-0}" JAC_DEADLINE_S="${T_DEADLINE:-780}" \
   JAC_MIN_BATCH_S="${T_MIN_BATCH:-}" JAC_GC_TIMEOUT_S="${T_GC_TIMEOUT:-}" JAC_MIN_GC_BUDGET_S="${T_MIN_GC:-}" \
   JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" JAC_MAIL_TIMEOUT_S="${T_MAIL_TIMEOUT:-}" \
+  JAC_TAIL_LIMIT_KIB="${T_TAIL:-0}" JAC_TAIL_MAX_OBJECTS="${T_TAIL_OBJS:-}" JAC_TAIL_TIMEOUT_S="${T_TAIL_TIMEOUT:-}" \
   JAC_LSOF="${T_LSOF:-}" JAC_RECLAIM_WAIT_S="${T_RECLAIM_WAIT:-}" JAC_PS="${T_PS:-}" JAC_PS_TIMEOUT_S="${T_PS_TIMEOUT:-}" \
   "$SCRIPT" "$@" 2>&1     # executed, not `bash $SCRIPT`: production runs the shebang (/bin/bash 3.2 on macOS), not whatever bash is first in PATH
 }
@@ -1275,7 +1284,7 @@ out="$(run_jac "$LK" --check)"; printf '%s' "$out" | grep -q 'garbage=3f/' && ok
 echo ""
 echo "=== S34: STRUCTURE — a git step only runs through run_step, so no step can skip the leak accounting ==="
 # S30 pins the places that DISCARD a failure; this pins the places that RUN a git step. The gate reported the leak for the batch, and on this host's git the gc
-# leaks the same way: three call sites, one rule, and nothing stopped a fourth from being added without it. The rule lives in ONE function (run_step: snapshot the temp
+# leaks the same way: three call sites, one rule, and nothing stopped a fourth from being added without it (the fourth, the tail repack of ga-3sf9r8, went through run_step and into the pin). The rule lives in ONE function (run_step: snapshot the temp
 # files, run the step, and after a step that did not end 0 reclaim what it left). git_arch may be called from there and nowhere else; the git seam ($GITBIN) may be used
 # nowhere but in git_arch (a step could otherwise bypass both); the only git run BARE on the repo is the read-only `count-objects`; and the set of steps that go through
 # run_step is PINNED below.
@@ -1298,8 +1307,8 @@ LS="$(lint_steps "$SCRIPT")"
 got_bare="$(printf '%s\n' "$LS" | grep '^BARE|' | cut -d'|' -f2 | sort -u | tr '\n' ',')"
 [ "$got_bare" = "count-objects," ] && ok "the only git run bare on the repo is the read-only count-objects (measure)" || bad "bare git subcommand(s) [$got_bare] — want only count-objects: a git that WRITES must go through run_step"
 got_steps="$(printf '%s\n' "$LS" | grep '^STEP|' | cut -d'|' -f2 | sed 's/ *--quiet.*$//' | tr '\n' ',')"
-want_steps="maintenance run --task=loose-objects,prune-packed,-c gc.autoDetach=false gc,"
-[ "$got_steps" = "$want_steps" ] && ok "the steps that go through run_step are exactly the pinned three (batch, prune-packed, gc)" || bad "steps differ from the pin — got [$got_steps] want [$want_steps]: read the new/removed step (does it write objects? then it can leak), then update the pin"
+want_steps="repack,maintenance run --task=loose-objects,prune-packed,-c gc.autoDetach=false gc,"      # file order: the tail pass (tier 2a) is defined above compact_repo
+[ "$got_steps" = "$want_steps" ] && ok "the steps that go through run_step are exactly the pinned four (tail repack, batch, prune-packed, gc)" || bad "steps differ from the pin — got [$got_steps] want [$want_steps]: read the new/removed step (does it write objects? then it can leak), then update the pin"
 cp "$SCRIPT" "$WORK/steps-mutant.sh"
 printf '%s\n' 'x="$(git_arch 5 repack 2>&1)"' 'run_step "$t_left" repack --quiet' 'y="$("$GITBIN" gc)"' 'git --git-dir="$R_GITDIR" repack -d' >> "$WORK/steps-mutant.sh"
 MS="$(lint_steps "$WORK/steps-mutant.sh")"
@@ -1428,6 +1437,164 @@ printf '#!/bin/bash\necho "  1 /sbin/launchd"\necho "%s /usr/bin/git repack -d -
 out="$(T_PS="$WORK/ps-dead" T_PACKS=4 run_jac "$G")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ]; } \
   && ok "a listed repacker that has exited since ps ran is neither found nor 'cannot tell': the gc runs" || bad "a vanished candidate blocked the gc: rc=$rc status=$(last_status): $out"
+
+echo ""
+
+echo "=== S36: the TAIL — small packs are consolidated by BYTES into ONE pack with the deltas recomputed; the base pack is never touched (ga-3sf9r8) ==="
+# The incident (15/10): the archive's .git was 5.2GiB and 3.84GiB of it was ONE file's history (whatsapp_automation/comments.jsonl, 59MB, 7809 versions): 384 versions (5%) were
+# stored at 10-18MB each — a compressed near-full copy — and the other 7425 cost ~1KiB each. Every batch pack (tier 1) is an island: git cannot delta across packs, so each carries its
+# own first copy ("seed") of every giant file, and the consolidators that existed reuse stored representations instead of recomputing them (git's geometric repack: no; `gc` without -f:
+# no — it shrank the repo 225MiB on 14/10, and needs the WHOLE pack size free: 5.2GiB on a disk with 1-5GiB). What does collapse N seeds into one is `repack -f` over just the small
+# packs: measured on a synthetic 58MB history, 12 versions repacked in 19s, 1 seed + 11 deltas of 5.4KiB (vs 81s for the first loose->pack conversion). The tail pass is that, by BYTES
+# (not by pack count), bounded by OBJECTS per pass (the cost is the delta search), with every other pack kept untouched. Fixture: a BASE pack (1MiB of ballast + 8 versions: 27 objects)
+# and N batch-like packs (3 objects each: commit, tree, one new full copy of the ~120KB file), the shape of the production archive in miniature.
+tailrepo() {  # tailrepo <dir> <n-small-packs>
+  local d="$1" n="$2" i
+  mkrepo "$d" 8
+  head -c 1048576 /dev/urandom > "$d/ballast.bin"
+  git -C "$d" add ballast.bin && git -C "$d" -c maintenance.auto=false -c gc.auto=0 commit -q -m ballast
+  git --git-dir="$d/.git" -c maintenance.auto=false repack -a -d -q
+  for i in $(seq 201 $((200 + n))); do addpack "$d" "$i"; done
+}
+pack_kib() { git --git-dir="$1/.git" count-objects -v 2>/dev/null | awk '/^size-pack:/{print $2}'; }
+base_pack() { ls -S "$1"/.git/objects/pack/*.pack | head -1; }       # the biggest pack: the ballast lives there
+idx_objects() { local p; for p in "$@"; do git show-index < "${p%.pack}.idx" | wc -l; done | awk '{s+=$1} END{print s+0}'; }
+# the look for another repacker answers from a stub (nothing running) except where a test needs the real ps: the host runs git of its own, and an lsof that times out under load is "cannot tell" (S35)
+printf '#!/bin/bash\necho "  1 /sbin/launchd"\n' > "$WORK/ps-quiet"; chmod +x "$WORK/ps-quiet"
+run_tail() { T_PS="${T_PS:-$WORK/ps-quiet}" run_jac "$@"; }
+
+# A. the core: 4 seed packs -> 1, base untouched, history identical, bytes down
+TA="$WORK/ta"; tailrepo "$TA" 4; rm -f "$WORK/state.json" "$WORK/log"
+BP="$(base_pack "$TA")"; BSUM="$(cksum < "$BP")"; PC0="$(pack_count "$TA")"; PK0="$(pack_kib "$TA")"; HT="$(history "$TA")"; NT="$(commits "$TA")"
+SMALL0="$(ls "$TA"/.git/objects/pack/*.pack | grep -v "$BP" | tr '\n' ' ')"; OBJ0="$(idx_objects $SMALL0)"
+out="$(T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TA")"; rc=$?
+{ [ "$PC0" = 5 ] && [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TA")" = 2 ]; } \
+  && ok "4 batch packs ($((PK0 - $(wc -c < "$BP") / 1024))KiB of them) -> ONE: packs $PC0 -> $(pack_count "$TA"), status consolidated, exit 0" \
+  || bad "tail pass wrong (packs $PC0 -> $(pack_count "$TA"), rc=$rc, status=$(last_status)): $out"
+{ [ -f "$BP" ] && [ "$(cksum < "$BP")" = "$BSUM" ]; } && ok "the base pack is byte-identical afterwards (kept, not repacked)" || bad "the base pack was touched or removed: $BP"
+{ [ "$(history "$TA")" = "$HT" ] && [ "$(commits "$TA")" = "$NT" ] && git --git-dir="$TA/.git" fsck --strict >/dev/null 2>&1; } \
+  && ok "history identical (same commit+tree ids) and fsck --strict clean" || bad "the tail pass changed or damaged history"
+PK1="$(pack_kib "$TA")"
+[ $(( PK0 - PK1 )) -ge 300 ] && ok "the 4 seeds became one: size-pack ${PK0}KiB -> ${PK1}KiB (-$((PK0 - PK1))KiB; each seed is ~125KiB here, ~100MB in production)" || bad "the tail pass did not shrink the packs enough: ${PK0}KiB -> ${PK1}KiB"
+printf '%s' "$out" | grep -q "tail consolidation: 4 packs (.*, $OBJ0 objects, + 0 loose)" \
+  && ok "the log says what it took: 4 packs and $OBJ0 objects (the count read from the .idx files equals git show-index)" || bad "tail log line wrong or object count differs from git show-index ($OBJ0): $out"
+
+# B. below the byte limit → a no-op; off (limit 0, the run_jac default) → a no-op; one small pack alone → a no-op even over the limit
+TB="$WORK/tb"; tailrepo "$TB" 4; PCB="$(pack_count "$TB")"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(T_TAIL=900 T_TAIL_OBJS=20 run_tail "$TB")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "ok" ] && [ "$(pack_count "$TB")" = "$PCB" ]; } && ok "small packs under the byte limit → untouched (status ok): the trigger is BYTES held, not how many packs" || bad "under-limit run touched the repo (packs $PCB -> $(pack_count "$TB"), status=$(last_status)): $out"
+out="$(T_TAIL=0 T_TAIL_OBJS=20 run_tail "$TB")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "ok" ] && [ "$(pack_count "$TB")" = "$PCB" ]; } && ok "limit 0 = off: untouched" || bad "limit 0 did not switch the tail off (packs $PCB -> $(pack_count "$TB")): $out"
+TB1="$WORK/tb1"; tailrepo "$TB1" 1; PCB1="$(pack_count "$TB1")"
+out="$(T_TAIL=10 T_TAIL_OBJS=20 run_tail "$TB1")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "ok" ] && [ "$(pack_count "$TB1")" = "$PCB1" ]; } && ok "ONE small pack over the limit → untouched (one pack has no seeds to merge)" || bad "single small pack was repacked (packs $PCB1 -> $(pack_count "$TB1")): $out"
+out="$(T_TAIL=abc T_TAIL_OBJS=20 run_tail "$TB")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(pack_count "$TB")" = "$PCB" ] && printf '%s' "$out" | grep -q 'tail consolidation is OFF: a JAC_TAIL_\* setting is not a number'; } \
+  && ok "a malformed limit is not 'off, quietly' and not a crash: the log says tail consolidation is OFF and why; nothing is touched" || bad "malformed JAC_TAIL_LIMIT_KIB handled wrong (rc=$rc): $out"
+
+# C. the objects-per-pass cap: 7 objects take two 3-object packs; the other two stay, and a pack that does not fit (the base: 27 objects) is never taken
+TC="$WORK/tc"; tailrepo "$TC" 4; PCC="$(pack_count "$TC")"; rm -f "$WORK/state.json" "$WORK/log"; BPC="$(base_pack "$TC")"; BSC="$(cksum < "$BPC")"
+out="$(T_TAIL=200 T_TAIL_OBJS=7 run_tail "$TC")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TC")" = $(( PCC - 1 )) ] && [ "$(cksum < "$BPC")" = "$BSC" ]; } \
+  && ok "cap of 7 objects → 2 of the 4 small packs merged (packs $PCC -> $(pack_count "$TC")), the rest and the base kept: the cost of one pass is bounded by objects" \
+  || bad "object cap not honoured (packs $PCC -> $(pack_count "$TC"), rc=$rc, status=$(last_status)): $out"
+printf '%s' "$out" | grep -q "tail consolidation: 2 packs (.*, 6 objects, + 0 loose)" && ok "the log shows 2 packs / 6 objects taken" || bad "log does not show 2 packs / 6 objects: $out"
+
+# D. what must survive: an unreachable object inside a PICKED pack (moved to a cruft pack — gc's two-week rule decides, not this pass), a pack with a .keep marker, and a cruft pack that already exists
+TD="$WORK/td"; tailrepo "$TD" 4; rm -f "$WORK/state.json" "$WORK/log"
+UD="$(printf 'unreachable-%s-%s' "$$" "$RANDOM" | git --git-dir="$TD/.git" hash-object -w --stdin)"
+echo "$UD" | git --git-dir="$TD/.git" pack-objects -q "$TD/.git/objects/pack/pack" >/dev/null; git --git-dir="$TD/.git" prune-packed -q
+KD="$(printf 'kept-%s-%s' "$$" "$RANDOM" | git --git-dir="$TD/.git" hash-object -w --stdin)"
+echo "$KD" | git --git-dir="$TD/.git" pack-objects -q "$TD/.git/objects/pack/loose" >/dev/null; git --git-dir="$TD/.git" prune-packed -q
+KEEPP="$(ls "$TD"/.git/objects/pack/loose-*.pack | head -1)"; KSUM="$(cksum < "$KEEPP")"; : > "${KEEPP%.pack}.keep"
+out="$(T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TD")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ]; } && ok "with an unreachable object and a .keep pack around, the pass still consolidates (status consolidated)" || bad "tail pass with unreachable/.keep around failed (rc=$rc status=$(last_status)): $out"
+git --git-dir="$TD/.git" cat-file -e "$UD" 2>/dev/null && ok "the unreachable object that was in a picked pack is still readable — the pass moves it to a cruft pack, it does not drop it (gc's 2-week expiry is the only thing that deletes)" || bad "the unreachable object $UD is gone after the tail pass"
+{ [ -f "$KEEPP" ] && [ "$(cksum < "$KEEPP")" = "$KSUM" ] && git --git-dir="$TD/.git" cat-file -e "$KD" 2>/dev/null; } && ok "a pack with a .keep marker is untouched (byte-identical, its object readable)" || bad "the .keep pack was repacked or removed: $KEEPP"
+git --git-dir="$TD/.git" fsck --strict >/dev/null 2>&1 && ok "fsck --strict clean" || bad "fsck failed after the tail pass with an unreachable object"
+TD2="$WORK/td2"; mkrepo "$TD2" 8; head -c 1048576 /dev/urandom > "$TD2/ballast.bin"; git -C "$TD2" add ballast.bin && git -C "$TD2" -c maintenance.auto=false -c gc.auto=0 commit -q -m ballast
+UD2="$(printf 'cruft-%s-%s' "$$" "$RANDOM" | git --git-dir="$TD2/.git" hash-object -w --stdin)"
+git --git-dir="$TD2/.git" -c maintenance.auto=false repack -a -d -q --cruft --cruft-expiration=never
+for i in 201 202 203 204; do addpack "$TD2" "$i"; done; rm -f "$WORK/state.json" "$WORK/log"
+CRP="$(ls "$TD2"/.git/objects/pack/*.mtimes 2>/dev/null | head -1)"; CRP="${CRP%.mtimes}.pack"; CSUM="$(cksum < "$CRP" 2>/dev/null)"
+out="$(T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TD2")"; rc=$?
+{ [ -f "$CRP" ] && [ -n "$CSUM" ] && [ "$(last_status)" = "consolidated" ] && [ "$rc" -eq 0 ] && [ "$(cksum < "$CRP")" = "$CSUM" ] && git --git-dir="$TD2/.git" cat-file -e "$UD2" 2>/dev/null; } \
+  && ok "a cruft pack that already existed (.mtimes) is never picked: byte-identical afterwards, its unreachable object still readable" || bad "the existing cruft pack was touched or lost (cruft=${CRP:-none} rc=$rc status=$(last_status)): $out"
+
+# E. low disk → skipped LOUDLY and nothing written; the need is the SMALL packs (not the whole repo): the same free space that blocks the gc lets the tail through
+TE="$WORK/te"; tailrepo "$TE" 4; PCE="$(pack_count "$TE")"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(T_TAIL=300 T_TAIL_OBJS=20 T_FREE=10 run_tail "$TE")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ "$(pack_count "$TE")" = "$PCE" ] && [ "$(state_field "$TE" bad_streak)" = 1 ]; } \
+  && ok "free space below the small packs' size → status skipped-low-disk, exit 1, streak 1, nothing written" || bad "low-disk tail handled wrong (rc=$rc status=$(last_status) packs $PCE -> $(pack_count "$TE")): $out"
+rm -f "$WORK/state.json" "$WORK/log"; NEED_SMALL=$(( $(pack_kib "$TE") - $(wc -c < "$(base_pack "$TE")") / 1024 ))
+out="$(T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED_SMALL + 100 )) T_PACKS=3 run_tail "$TE")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TE")" = 2 ]; } \
+  && ok "free space only just above the small packs (${NEED_SMALL}KiB + 100) and far below the whole repo (gc would need $(pack_kib "$TE")KiB+) → the tail pass runs" || bad "tail pass did not run with enough room for the small packs (rc=$rc status=$(last_status) packs=$(pack_count "$TE")): $out"
+
+# F. a git step that FAILS → failed, exit 1, nothing lost; a pass cut by its OWN cap → timeout; cut by the RUN deadline → deferred (the budget ended, nothing was shown)
+TF="$WORK/tf"; tailrepo "$TF" 4; PCF="$(pack_count "$TF")"; HF="$(history "$TF")"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(FAIL_REPACK=1 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TF")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && [ "$(pack_count "$TF")" = "$PCF" ] && [ "$(history "$TF")" = "$HF" ]; } \
+  && ok "a repack that fails → status failed, exit 1, packs and history untouched" || bad "failing tail repack judged wrong (rc=$rc status=$(last_status) packs $PCF -> $(pack_count "$TF")): $out"
+rm -f "$WORK/state.json" "$WORK/log"
+out="$(SLOW_REPACK=1 SLOW_SLEEP=20 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=20 T_TAIL_TIMEOUT=2 run_tail "$TF")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "timeout" ] && printf '%s' "$out" | grep -q 'tail repack timed out after 2s (its own cap)'; } \
+  && ok "a tail pass that runs out its OWN cap (2s of a 780s budget) → status timeout, exit 1" || bad "own-cap tail timeout judged wrong (rc=$rc status=$(last_status)): $out"
+rm -f "$WORK/state.json" "$WORK/log"
+out="$(SLOW_REPACK=1 SLOW_SLEEP=60 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=20 T_DEADLINE=12 T_MIN_GC=2 run_tail "$TF")"; rc=$?
+if printf '%s' "$out" | grep -q 'tail consolidation deferred to the next run'; then skip "the tail pass never started inside this test's 12s budget (host too loaded)"
+else
+  { [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ] && [ "$(state_field "$TF" bad_streak)" = 0 ] && printf '%s' "$out" | grep -q 'tail repack was cut by the run deadline'; } \
+    && ok "a tail pass killed by the RUN deadline → status deferred, exit 0, streak 0 (the budget ended, the pass is retried from a fresh budget)" \
+    || bad "deadline-cut tail pass judged wrong (rc=$rc status=$(last_status) streak=$(state_field "$TF" bad_streak)): $out"
+  printf '%s' "$out" | grep -q 'tail repack timed out' && bad "a deadline-cut tail pass was logged as timed out: $out" || ok "no 'timed out' line for a deadline cut"
+fi
+find "$TF/.git/objects/pack" -name 'tmp_*' | grep -q . && bad "a killed tail pass left a temp file in the object store" || ok "no tmp_* left behind by the killed passes (run_step reclaimed them)"
+
+# G. ONE REPACKER AT A TIME holds for the tail too: a foreign repack in the repo → busy, nothing started; gone → consolidates
+TG="$WORK/tg"; tailrepo "$TG" 4; PCG="$(pack_count "$TG")"; rm -f "$WORK/state.json" "$WORK/log"
+fg_start "$TG" repack -d -l --geometric=2 --quiet --write-midx || bad "test setup: the stand-in repacker did not show up in ps"
+out="$(T_TAIL=300 T_TAIL_OBJS=20 run_jac "$TG")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "busy" ] && [ "$(pack_count "$TG")" = "$PCG" ] && printf '%s' "$out" | grep -q "tail consolidation not started: pid $FG_PID"; } \
+  && ok "a repacker with its cwd in the repo → tail NOT started: status busy, exit 0, packs unchanged, the log names the process" || bad "foreign repacker vs tail judged wrong (rc=$rc status=$(last_status) packs $PCG -> $(pack_count "$TG")): $out"
+fg_stop_all
+out="$(T_TAIL=300 T_TAIL_OBJS=20 run_jac "$TG")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TG")" = 2 ]; } && ok "next run, process gone → consolidates" || bad "tail pass did not run after the repacker ended (rc=$rc status=$(last_status)): $out"
+
+# H. tier 1 and the tail in ONE run: the batches drain the loose objects, then the tail merges what they made (the production flow); a failed tier 1 never lets the tail pack the backlog it left
+TH="$WORK/th"; tailrepo "$TH" 4; addcommits "$TH" 20; rm -f "$WORK/state.json" "$WORK/log"; HH="$(history "$TH")"
+BPH="$(base_pack "$TH")"; BSH="$(cksum < "$BPH")"
+out="$(T_TAIL=300 T_TAIL_OBJS=80 run_tail "$TH")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(loose_count "$TH")" = 0 ] && [ "$(pack_count "$TH")" = 2 ] && [ "$(history "$TH")" = "$HH" ] && [ "$(cksum < "$BPH")" = "$BSH" ]; } \
+  && ok "20 new commits: tier 1 packs them in batches, the tail merges those batch packs with the 4 older ones (72 objects, under the cap of 80; the 27-object base does not fit) → 2 packs, loose 0, base untouched, status consolidated" \
+  || bad "tier 1 + tail in one run judged wrong (rc=$rc status=$(last_status) loose=$(loose_count "$TH") packs=$(pack_count "$TH")): $out"
+git --git-dir="$TH/.git" fsck --strict >/dev/null 2>&1 && ok "fsck --strict clean" || bad "fsck failed after tier 1 + tail"
+TH2="$WORK/th2"; tailrepo "$TH2" 4; addcommits "$TH2" 20; rm -f "$WORK/state.json" "$WORK/log"; PCH2="$(pack_count "$TH2")"
+out="$(FM_RC=1 T_GIT="$WORK/git-failmaint" T_TAIL=300 T_TAIL_OBJS=200 run_tail "$TH2")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && [ "$(pack_count "$TH2")" = "$PCH2" ] && printf '%s' "$out" | grep -q 'tail consolidation not started: .* still loose'; } \
+  && ok "batches failed, the backlog is still over its limit → the tail does NOT start (it would pack the loose objects with -f, unbounded by the object cap): status failed, exit 1, packs unchanged" \
+  || bad "failed tier 1 + loose backlog judged wrong (rc=$rc status=$(last_status) packs $PCH2 -> $(pack_count "$TH2")): $out"
+TH3="$WORK/th3"; tailrepo "$TH3" 4; addcommits "$TH3" 3; rm -f "$WORK/state.json" "$WORK/log"
+out="$(PACKFAIL_MAINT=1 T_GIT="$WORK/git-fx" T_LIMIT=100 T_TAIL=300 T_TAIL_OBJS=40 run_tail "$TH3")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && [ "$(loose_count "$TH3")" = 0 ] && [ "$(pack_count "$TH3")" = 2 ] && printf '%s' "$out" | grep -q 'tail consolidation: '; } \
+  && ok "a batch that packed everything and then reported failure: the tail still runs (nothing loose is left) but the failure stays — status failed, exit 1, not laundered into consolidated" \
+  || bad "failed batch + successful tail judged wrong (rc=$rc status=$(last_status) loose=$(loose_count "$TH3") packs=$(pack_count "$TH3")): $out"
+
+# J. a pack whose .idx cannot be read as v2 is never picked: "cannot tell" is not a count (here: a v1 index, which git reads and pack_objects does not)
+TJ="$WORK/tj"; tailrepo "$TJ" 4; rm -f "$WORK/state.json" "$WORK/log"
+V1="$(ls "$TJ"/.git/objects/pack/pack-*.pack | grep -v "$(base_pack "$TJ")" | head -1)"; git --git-dir="$TJ/.git" index-pack --index-version=1 -o "$WORK/v1.idx" "$V1" >/dev/null 2>&1 && mv "$WORK/v1.idx" "${V1%.pack}.idx" || bad "test setup: could not rewrite the index of $V1 as v1"
+[ "$(od -An -tx1 -N4 "${V1%.pack}.idx" | tr -d ' \n')" != ff744f63 ] || bad "test setup: the index is still v2"
+V1SUM="$(cksum < "$V1")"; HJ="$(history "$TJ")"
+out="$(T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TJ")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ -f "$V1" ] && [ "$(cksum < "$V1")" = "$V1SUM" ] && [ "$(pack_count "$TJ")" = 3 ] && printf '%s' "$out" | grep -q 'tail consolidation: 3 packs'; } \
+  && ok "a pack with a v1 index (object count unreadable) stays out: 3 of the 4 small packs merged, the v1 pack and the base kept (packs 5 -> $(pack_count "$TJ"))" \
+  || bad "a pack with an unreadable object count was taken or the run failed (rc=$rc status=$(last_status) packs=$(pack_count "$TJ")): $out"
+{ [ "$(history "$TJ")" = "$HJ" ] && git --git-dir="$TJ/.git" fsck --strict >/dev/null 2>&1; } && ok "history identical, fsck clean" || bad "history or fsck changed by the partial tail pass"
+
+# I. the defaults that run in production
+cfg="$("$SCRIPT" --print-config)"
+printf '%s' "$cfg" | grep -q 'tail_limit_kib=262144 tail_max_objects=120 tail_timeout_s=600 tail_window=10 tail_depth=250' \
+  && ok "defaults: tail_limit_kib=262144 (256MiB held by small packs), tail_max_objects=120, tail_timeout_s=600, tail_window=10, tail_depth=250" || bad "tail defaults wrong in --print-config: $cfg"
 
 echo ""
 

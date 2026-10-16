@@ -46,6 +46,21 @@
 #      keeps every batch it finished, so even a multi-GiB backlog drains instead of restarting
 #      from zero each cycle (a single full gc over the backlog throws all its work away when it
 #      times out).
+#   2a. the TAIL (ga-3sf9r8), by BYTES held by SMALL packs and not by how many packs there are: when the small packs the batches left hold >= JAC_TAIL_LIMIT_KIB (256MiB), up to
+#      JAC_TAIL_MAX_OBJECTS (120) objects of them, smallest packs first, become ONE pack with the deltas recomputed (`repack -a -d -f --depth=250 --cruft`), and every other pack — the big
+#      old one above all — is passed as --keep-pack and never read or written. MEASURED 15/10 on the real archive: .git was 5.26GiB, 3.84GiB (73%) of it ONE file's history
+#      (whatsapp_automation/comments.jsonl, 59MB x 7809 versions): 384 versions (5%) were stored at 10-18MB each — a compressed near-full copy — and the other 7425 cost ~1KiB. git cannot
+#      delta ACROSS packs, so every batch pack (tier 1: 5-40 objects) carries its own first copy ("seed") of every giant file, 80-118MB per pack; 406MiB of loose objects became +311MiB
+#      of pack (77% kept; a delta would keep ~0.1%). The consolidators this script had do not undo that: a `gc` without -f reuses the stored representations (14/10: -225MiB on 5GiB) and
+#      needs the WHOLE pack size free (~5.2GiB on a disk with 1-5GiB: skipped-low-disk 13/10 and 15/10), git's own geometric repack merges packs without recomputing a single delta (it is how
+#      a 378MB pack was born), and tier 2 only fires at 8 packs (there were 3). Repacking just the small packs with -f collapses N seeds into one (synthetic 58MB history, 12 versions:
+#      19s, 1 seed + 11 deltas of ~5KiB, vs 81s for the first loose->pack conversion), needs only the SMALL packs' size free, and its cost is bounded by objects (the delta search),
+#      not by the size of the archive. A pack it grew to the cap is left alone by the next pass (it no longer fits), so history costs one seed per ~120 objects instead of one per batch.
+#      It never starts while loose bytes are still over the loose limit (`repack -a` would pack those too, an amount of work the object cap does not bound: tier 1 drains them first), nor
+#      while another git process is repacking the repo (ONE REPACKER AT A TIME, below), and it takes a pack only when it can count its objects from the .idx (cruft packs, .keep packs and
+#      packs it cannot read stay kept). Status: `consolidated` when it ended 0 and nothing before it had failed (a failure stays visible); a pass that did NOTHING (busy, cut by the run deadline,
+#      not started) never launders a failure; its own cap running out is `timeout`, a repack that ended non-zero is `failed`. The disk it needs is the small packs' size + a quarter of the loose
+#      bytes + the headroom, else `skipped-low-disk`. The pass is not adaptive: a cap that is too small for the objects it takes fails the same way every run, in the log, until JAC_TAIL_MAX_OBJECTS is lowered.
 #   2. pack count >= JAC_PACKS_LIMIT (8): one full `git gc` to consolidate. Each batch pack
 #      carries its own first full copy of every big file (batches cannot delta against earlier
 #      packs); the gc re-deltas those against the whole history and merges the packs. The alarm judges
@@ -172,7 +187,7 @@
 # keys. Adding or removing one fails the selftest until someone has read the site and updated the pin:
 # four gate rounds each found one more discard that "the class sweep" had missed.
 # STRUCTURE (selftest S34): every place that RUNS a git step goes through run_step (LEAKS, rule 1), no git that writes runs any other way, and the set of steps is pinned the same way —
-# the gate reported the leak for the batch, and measured on this host's git the gc leaks the same way; a fourth step is one more thing that can be killed mid-write.
+# the gate reported the leak for the batch, and measured on this host's git the gc leaks the same way; the tail repack (tier 2a) is the fourth, a fifth would be one more thing that can be killed mid-write.
 #
 # TEST: bash packs/town-deltas/assets/scripts/jsonl-archive-compact.selftest.sh
 set -uo pipefail
@@ -189,6 +204,11 @@ LOOSE_LIMIT_KIB="${JAC_LOOSE_LIMIT_KIB:-262144}"     # 256MiB of loose objects t
 LOOSE_ALARM_KIB="${JAC_LOOSE_ALARM_KIB:-1048576}"    # 1GiB still loose after a run = BAD, unless the run really shrank it (a backlog draining, see ALARM)
 PACKS_LIMIT="${JAC_PACKS_LIMIT:-8}"                  # this many packs triggers the consolidating gc
 PACKS_ALARM="${JAC_PACKS_ALARM:-20}"                 # this many after a run = BAD (git's own autoPackLimit is 50)
+TAIL_LIMIT_KIB="${JAC_TAIL_LIMIT_KIB:-262144}"       # tier 2a: small packs holding this many bytes trigger the tail pass (256MiB; 0 = off)
+TAIL_MAX_OBJECTS="${JAC_TAIL_MAX_OBJECTS:-120}"      # ...which takes at most this many objects per pass: the cost of `repack -f` is the delta search, so the pass is bounded by objects
+TAIL_TIMEOUT_S="${JAC_TAIL_TIMEOUT_S:-600}"          # per tail pass (a 58MB blob costs ~1.6s per version to re-delta on this host: 120 objects is minutes at most, under load)
+TAIL_WINDOW="${JAC_TAIL_WINDOW:-10}"                 # pack-objects --window: a small window — the versions of one file are neighbours
+TAIL_DEPTH="${JAC_TAIL_DEPTH:-250}"                  # pack-objects --depth: the default (50) leaves one seed per 50 versions (~156 x 12MB on the WA comments); 250 leaves ~31
 BATCH_OBJECTS="${JAC_BATCH_OBJECTS:-60}"             # starting batch (~7 commits, ~300MiB loose); adapts, see header
 BATCH_MIN=5
 BATCH_MAX="${JAC_BATCH_MAX:-200}"
@@ -235,6 +255,7 @@ if [ "$MODE" = print ]; then
 repos=$REPOS
 loose_limit_kib=$LOOSE_LIMIT_KIB loose_alarm_kib=$LOOSE_ALARM_KIB
 packs_limit=$PACKS_LIMIT packs_alarm=$PACKS_ALARM batch_objects=$BATCH_OBJECTS batch_max=$BATCH_MAX max_batches=$MAX_BATCHES
+tail_limit_kib=$TAIL_LIMIT_KIB tail_max_objects=$TAIL_MAX_OBJECTS tail_timeout_s=$TAIL_TIMEOUT_S tail_window=$TAIL_WINDOW tail_depth=$TAIL_DEPTH
 git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S prune_timeout_s=$PRUNE_TIMEOUT_S prune_min_s=$PRUNE_MIN_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
 list_timeout_s=$LIST_TIMEOUT_S lsof_timeout_s=$LSOF_TIMEOUT_S reclaim_wait_s=$RECLAIM_WAIT_S ps_timeout_s=$PS_TIMEOUT_S
 alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S check_fresh_s=$CHECK_FRESH_S
@@ -672,6 +693,114 @@ record() {
 BAD_ANY=0
 EXISTING=0
 
+# pack_objects <x.pack> — how many objects a pack holds, read from its .idx without running git: a v2 index is the 8-byte header (ff744f63 00000002), 256 fan-out words of 4 bytes each, and the last
+# fan-out word is the total. Prints the number and returns 0. Returns 1 and prints NOTHING when the .idx is missing, short, or not v2 — "cannot tell" is never a count (tail_plan keeps such a pack out).
+pack_objects() {
+  local idx="${1%.pack}.idx" magic words
+  [ -f "$idx" ] || return 1
+  # vazio → a short file has no magic to compare, which is not the v2 magic (return 1, no number); falhou/ilegível → od failing prints nothing, the same "not v2" (return 1)
+  magic="$(od -An -tx1 -N8 "$idx" 2>/dev/null | tr -d ' \n')"
+  [ "$magic" = "ff744f6300000002" ] || return 1
+  # vazio → fewer than 4 bytes at the offset is not 4 numbers (return 1); falhou/ilegível → od failing is a return 1 as well, never a total of 0
+  words="$(od -An -tu1 -j1028 -N4 "$idx" 2>/dev/null)" || return 1
+  set -- $words
+  [ "$#" -eq 4 ] || return 1
+  is_uint "$1" && is_uint "$2" && is_uint "$3" && is_uint "$4" || return 1
+  echo $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 ))
+}
+
+# tail_plan — which packs the tail pass would take, from the object store as it is now. Sets TAIL_PICK (pack file names), TAIL_KEEP (a --keep-pack=<name> for EVERY other pack, so the pass can touch
+# nothing else), TAIL_N, TAIL_OBJ (objects in the picked packs), TAIL_KIB. Returns 1 when the pack directory cannot be listed. A pack is never picked — it stays under --keep-pack — when it is a cruft pack
+# (.mtimes: the unreachable objects waiting out gc's two weeks), carries a .keep, has an object count or a size that cannot be read, or does not fit: packs are taken smallest first (by objects)
+# while the total stays within TAIL_MAX_OBJECTS, so the big old pack — and any pack a previous pass grew to the cap — is left alone, and one pass costs a bounded delta search.
+tail_plan() {
+  local dir="$R_GITDIR/objects/pack" p b n sz sorted
+  local -a rows=()
+  TAIL_PICK=(); TAIL_KEEP=(); TAIL_N=0; TAIL_OBJ=0; TAIL_KIB=0
+  # vazio → a directory without a .pack is a repo with nothing to consolidate (the loop below sees only the literal pattern and skips it); falhou/ilegível → a directory that is missing or cannot be read and entered is "could not be listed" (return 1, the caller logs it): never an empty list
+  [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ] || return 1
+  for p in "$dir"/*.pack; do
+    [ -e "$p" ] || continue
+    b="${p##*/}"
+    if [ -e "${p%.pack}.mtimes" ] || [ -e "${p%.pack}.keep" ]; then TAIL_KEEP+=("--keep-pack=$b"); continue; fi
+    if ! n="$(pack_objects "$p")"; then TAIL_KEEP+=("--keep-pack=$b"); continue; fi
+    # vazio → no number is not a size (kept); falhou/ilegível → wc failing prints nothing, the same (kept)
+    sz="$(wc -c < "$p" 2>/dev/null | tr -d ' ')"
+    if ! is_uint "$sz"; then TAIL_KEEP+=("--keep-pack=$b"); continue; fi
+    rows+=("$n|$sz|$b")
+  done
+  if [ "${#rows[@]}" -gt 0 ]; then
+    # vazio → a sort that printed nothing leaves nothing picked (TAIL_N 0, the pass does not run); falhou/ilegível → the same: the pass runs only on packs it listed itself
+    sorted="$(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1n -k3,3)"
+    while IFS='|' read -r n sz b; do
+      [ -n "$b" ] || continue
+      if [ $(( TAIL_OBJ + n )) -le "$TAIL_MAX_OBJECTS" ]; then
+        TAIL_PICK+=("$b"); TAIL_OBJ=$(( TAIL_OBJ + n )); TAIL_KIB=$(( TAIL_KIB + (sz + 1023) / 1024 ))
+      else
+        TAIL_KEEP+=("--keep-pack=$b")
+      fi
+    done <<EOF
+$sorted
+EOF
+  fi
+  TAIL_N="${#TAIL_PICK[@]}"
+}
+
+# tail_pass <repo> — tier 2a (header): the small packs the batches left, held >= TAIL_LIMIT_KIB, become ONE pack whose deltas are recomputed (-f), by BYTES and not by how many packs there are. Obeys the same
+# rules as the consolidating gc: a step that did NOTHING (busy, cut by the run's deadline, not started) may only replace a status that is not a failure; one that finished (rc 0) is `consolidated` unless
+# something before it had failed (that failure stays visible). Inert under doubt: an unreadable pack directory, a setting that is not a number, loose objects still waiting for tier 1, or a repacker it
+# cannot rule out all mean "not started", with the reason in the log. Needs a fresh `measure` (M_LOOSE_KIB, M_LOOSE_COUNT).
+tail_pass() {
+  local repo="$1" need orc out rc t_left by_deadline
+  if [ "$TAIL_LIMIT_KIB" = 0 ]; then return 0; fi
+  if ! { is_uint "$TAIL_LIMIT_KIB" && is_uint "$TAIL_MAX_OBJECTS" && is_uint "$TAIL_TIMEOUT_S" && is_uint "$TAIL_WINDOW" && is_uint "$TAIL_DEPTH"; }; then
+    log "  tail consolidation is OFF: a JAC_TAIL_* setting is not a number (limit='$TAIL_LIMIT_KIB' objects='$TAIL_MAX_OBJECTS' timeout='$TAIL_TIMEOUT_S' window='$TAIL_WINDOW' depth='$TAIL_DEPTH') — nothing is consolidated by size until it is fixed"
+    return 0
+  fi
+  if ! tail_plan; then
+    log "  tail consolidation skipped: the pack directory of $repo could not be listed — nothing consolidated by size this run"
+    return 0
+  fi
+  if [ "$TAIL_N" -lt 2 ] || [ "$TAIL_KIB" -lt "$TAIL_LIMIT_KIB" ]; then return 0; fi
+  # `repack -a` packs every reachable loose object too, with -f, and the object cap does not bound those: tier 1 drains them in measured batches first, so a loose backlog still over its limit waits
+  if [ "$M_LOOSE_KIB" -ge "$LOOSE_LIMIT_KIB" ]; then
+    log "  tail consolidation not started: $TAIL_N small packs hold $(fmt "$TAIL_KIB") but $(fmt "$M_LOOSE_KIB") is still loose (limit $(fmt "$LOOSE_LIMIT_KIB")) — tier 1 drains that first; retried next run"
+    return 0
+  fi
+  if [ "$(remaining)" -lt "$MIN_GC_BUDGET_S" ]; then
+    bad_status "$STATUS" || STATUS="deferred"
+    log "repo=$repo $TAIL_N small packs hold $(fmt "$TAIL_KIB") but only $(remaining)s of budget left — tail consolidation deferred to the next run"
+    return 0
+  fi
+  need=$(( TAIL_KIB + M_LOOSE_KIB / 4 + HEADROOM_KIB ))      # the new pack is at most as big as the packs it replaces (those stay until it is written) plus what the loose objects pack to (tier 1's assumption: <= 1/4)
+  if disk_low "$repo" "$need"; then
+    STATUS="skipped-low-disk"
+    log "repo=$repo status=skipped-low-disk (tail) free=$(fmt "$(free_kib "$repo")") need~$(fmt "$need") small packs=$TAIL_N ($(fmt "$TAIL_KIB"))"
+    return 0
+  fi
+  # ONE REPACKER AT A TIME (header): the same check, and the same answer, as before the consolidating gc
+  other_repacker "$repo"; orc=$?
+  if [ "$orc" -eq 1 ]; then
+    bad_status "$STATUS" || STATUS="busy"
+    log "  tail consolidation not started: $OTHER_WHO is repacking $repo — two repackers at once make a pass fail with 'could not find pack' (ga-8z0hy7); retried next run"
+    return 0
+  elif [ "$orc" -ne 0 ]; then
+    bad_status "$STATUS" || STATUS="busy"
+    log "  tail consolidation not started: cannot tell whether another git process is repacking $repo (no ps or lsof, one cut at its cap or failed, or a candidate lsof gave no directory for) — under doubt it waits; retried next run"
+    return 0
+  fi
+  budget_for "$TAIL_TIMEOUT_S"
+  log "  tail consolidation: $TAIL_N packs ($(fmt "$TAIL_KIB"), $TAIL_OBJ objects, + ${M_LOOSE_COUNT:-?} loose) -> one pack, deltas recomputed; ${#TAIL_KEEP[@]} other pack(s) kept untouched"
+  run_step "$t_left" repack --quiet -a -d -l -f --window="$TAIL_WINDOW" --depth="$TAIL_DEPTH" --cruft --cruft-expiration=2.weeks.ago ${TAIL_KEEP[@]+"${TAIL_KEEP[@]}"}; out="$STEP_OUT"; rc="$STEP_RC"
+  if [ "$rc" -eq 0 ]; then bad_status "$STATUS" || STATUS="consolidated"
+  elif [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
+    # it did NOTHING useful (a killed repack keeps no packed work — and leaves a tmp_pack, which run_step has just reclaimed or the garbage measurement will report): it cannot turn a failed / stalled / timed-out / skipped tier 1 green
+    bad_status "$STATUS" || STATUS="deferred"
+    log "  tail repack was cut by the run deadline after ${t_left}s — the budget ended, not evidence the pass is too big (retried next run)"
+  elif [ "$rc" -eq 124 ]; then STATUS="timeout"; log "  tail repack timed out after ${t_left}s (its own cap)"
+  else STATUS="failed"; log "  tail repack failed rc=$rc: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"; fi
+}
+
 compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller handles is_bad via record
   local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_unpacked prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed over before_gcount before_gkib
   R_GITDIR="$repo/.git"
@@ -787,6 +916,10 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
       R_BATCH_SAVE="$R_BATCH"
     fi
   fi
+
+  # ── tier 2a: the small packs hold too many BYTES → one pack with the deltas recomputed (header). After tier 1, so the loose backlog is drained; before tier 2, so the gc below finds fewer packs ──
+  measure || STATUS="unmeasured"
+  if [ "$STATUS" != unmeasured ]; then tail_pass "$repo"; fi
 
   # ── tier 2: too many packs → one consolidating gc, only with budget to finish ──
   measure || STATUS="unmeasured"
