@@ -551,12 +551,19 @@ restart_escalate() {
     log "escalation suppressed (already paged $(( _now - _last ))s ago, repeat every ${ESCALATE_REPEAT}s)"
     return 0
   fi
-  escalation_stamp
-  python3 "$CITY/scripts/escalate_emergency.py" \
-    --class town-halted \
-    --title "$1" \
-    "$2" \
-    >> "$LOG" 2>&1 || log "WARN: escalate_emergency.py call failed (non-fatal)"
+  # The stamp means "a human was PAGED", so it is written only after the page reports
+  # success: escalate_emergency.py exits 1 when the push did not go out. A page that
+  # failed must not read as one that happened, or the retry is silenced for the whole
+  # ESCALATE_REPEAT with nobody told.
+  if python3 "$CITY/scripts/escalate_emergency.py" \
+       --class town-halted \
+       --title "$1" \
+       "$2" \
+       >> "$LOG" 2>&1; then
+    escalation_stamp
+  else
+    log "WARN: escalate_emergency.py FAILED to page — NOT stamping, so the next held tick pages again"
+  fi
 }
 
 # Runs UNCONDITIONALLY, before any health decision: a death+respawn can
@@ -805,14 +812,18 @@ else
   # exits unconditionally at line 257, well before here — see ga-153cq's
   # note above), so no separate dry-run threading is needed: by the time
   # we're here, this is a real, confirmed-still-unhealthy event.
-  python3 /Users/athos/gt/.gascity-gastown-hq/scripts/escalate_emergency.py \
-    --class town-halted \
-    --title "Dolt hang-watchdog: restart did not recover" \
-    "Restart attempted but Dolt STILL unhealthy after ${n} strikes — NEEDS HUMAN." \
-    >> "$LOG" 2>&1 || log "WARN: escalate_emergency.py call failed (non-fatal)"
-  # ga-fzt548: this page counts for the dedupe too, or the next held tick (strikes are
-  # cleared below, so ~3 min from now) would page the same human again for the same outage.
-  escalation_stamp
+  # ga-fzt548: a page that went out counts for the dedupe too, or the next held tick
+  # (strikes are cleared below, so ~3 min from now) would page the same human again for
+  # the same outage. A page that FAILED must not count — it stamps only on exit 0.
+  if python3 /Users/athos/gt/.gascity-gastown-hq/scripts/escalate_emergency.py \
+       --class town-halted \
+       --title "Dolt hang-watchdog: restart did not recover" \
+       "Restart attempted but Dolt STILL unhealthy after ${n} strikes — NEEDS HUMAN." \
+       >> "$LOG" 2>&1; then
+    escalation_stamp
+  else
+    log "WARN: escalate_emergency.py call failed (non-fatal) — page NOT stamped, a held tick will page again"
+  fi
 fi
 rm -f "$STRIKES"
 exit 0

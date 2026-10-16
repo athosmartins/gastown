@@ -879,7 +879,15 @@ FAKE
 case " $* " in *" -p $FAKE_DOLT_PID "*) exit 0 ;; esac
 exec /usr/sbin/lsof "$@"
 FAKE
-  chmod +x "$_sd/bin/gc" "$_sd/bin/notify" "$_sd/bin/pgrep" "$_sd/bin/ps" "$_sd/bin/lsof"
+  # python3 falso: igual ao real, EXCETO que a chamada ao escalate_emergency.py falha enquanto
+  # existir $FAKE_DIR/escalate_fail (o push que nao saiu: o script real sai 1 nesse caso).
+  _real_py=$(command -v python3)
+  cat > "$_sd/bin/python3" <<FAKE
+#!/usr/bin/env bash
+case "\$*" in *escalate_emergency.py*) [ -e "\$FAKE_DIR/escalate_fail" ] && exit 1 ;; esac
+exec "$_real_py" "\$@"
+FAKE
+  chmod +x "$_sd/bin/gc" "$_sd/bin/notify" "$_sd/bin/pgrep" "$_sd/bin/ps" "$_sd/bin/lsof" "$_sd/bin/python3"
 
   # O "Dolt" sinalizavel: um processo sacrificial que registra o SIGQUIT (nao da pra usar
   # `sleep &`: job em background de shell nao-interativo ignora SIGQUIT desde a entrada).
@@ -915,7 +923,7 @@ PYF
         ESCALATE_DRY_RUN=1 GC_LEDGER_DIR="$_sd/ledger" \
         "$@" bash "$SRC" >/dev/null 2>&1
   }
-  _reset()    { chmod -R u+rwx "$_sd/state" 2>/dev/null; rm -rf "$_sd/state" "$_sd/l" "$_sd/restarts" "$_sd/refuse" "$_sd/notify.log" "$_sd/lastpid"; mkdir -p "$_sd/state"
+  _reset()    { chmod -R u+rwx "$_sd/state" 2>/dev/null; rm -rf "$_sd/state" "$_sd/l" "$_sd/restarts" "$_sd/refuse" "$_sd/escalate_fail" "$_sd/notify.log" "$_sd/lastpid"; mkdir -p "$_sd/state"
                 echo down > "$_sd/health"; echo "${1:-down}" > "$_sd/after_restart"; echo "$_dpid" > "$_pidfile"; }
   _restarts() { cat "$_sd/restarts" 2>/dev/null || echo 0; }
   _pages()    { grep -c '\[ESCALATE\] \[DRY_RUN\]' "$_sd/l" 2>/dev/null || true; }
@@ -953,6 +961,26 @@ PYF
     && ok "B: a escalada saiu UMA vez, classe town-halted, titulo 'restart held by backoff' (3 ticks, 1 page)" \
     || bad "B: esperava 1 page 'restart held by backoff', houve $(_pages)"
   grep -q 'class=town-halted' "$_sd/l" && ok "B: escalada usa a classe sancionada town-halted" || bad "B: classe errada na escalada"
+
+  # --- B2. page que FALHOU != page entregue: nao pode virar selo de dedupe (silenciaria o retry). ---
+  _reset up
+  _sim                                   # restart #1 recupera
+  echo down > "$_sd/health"; touch "$_sd/escalate_fail"
+  _sim; _sim                             # 2 ticks segurados, com o push FALHANDO
+  [ ! -e "$_sd/state/e" ] && [ "$(grep -c 'FAILED to page' "$_sd/l")" = "2" ] \
+    && ok "B2: o push falhou nos 2 ticks -> NENHUM selo gravado, e o 2o tick TENTOU de novo (falha nao silencia o retry)" \
+    || bad "B2: ga-fzt548 — page que falhou virou selo de 'humano avisado' (selo=$([ -e "$_sd/state/e" ] && echo presente || echo ausente), falhas=$(grep -c 'FAILED to page' "$_sd/l"))"
+  rm -f "$_sd/escalate_fail"
+  _sim; _sim                             # push volta: 1o tick pagina e sela, 2o tick e dedupado
+  [ -e "$_sd/state/e" ] && [ "$(_pages)" = "1" ] \
+    && ok "B2: push voltou -> pagina 1x, grava o selo, e o tick seguinte nao repete" \
+    || bad "B2: apos o push voltar esperava 1 page + selo (pages=$(_pages), selo=$([ -e "$_sd/state/e" ] && echo presente || echo ausente))"
+  # mesma regra no page 'restart nao recuperou' (ramo ja existente): falhou -> sem selo
+  _reset down; touch "$_sd/refuse" "$_sd/escalate_fail"
+  _sim
+  [ ! -e "$_sd/state/e" ] && grep -q 'page NOT stamped' "$_sd/l" \
+    && ok "B2: page 'restart nao recuperou' que falhou tambem NAO sela" \
+    || bad "B2: page 'restart nao recuperou' que falhou gravou selo"
 
   # --- C. a janela abre: 29 min NAO, 31 min SIM; o proximo intervalo dobra. -------------
   _reset up
