@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.gascity.daemon-unverified-sweep — o GATILHO do vigia de `delivery:daemon-unverified` (ga-iyfe83,
+  parte 3 da ga-29ssni).
+
+  O QUE FAZ: pra cada bead fechado com o label `delivery:daemon-unverified`, decide UM de três estados
+  — CONFIRMADO (o daemon que roda o código mergeado subiu DEPOIS do merge), AINDA NÃO VISTO (subiu antes,
+  ou não está carregado) ou NÃO CONSEGUI SABER (sem sha, sem daemon identificável, ou a leitura falhou).
+  Leitura que falha NUNCA vira CONFIRMADO. Relatório em .gc/logs/daemon-unverified-sweep-AAAA-MM-DD.md.
+
+  Sem este plist o label vira só um carimbo que ninguém lê (~300 beads em 15/10): o detector existe e
+  fica sem gatilho — a mesma classe da silent-ignorance-watch. Se for remover este plist, remova o
+  script junto.
+
+  Cadência: 1x/semana, segunda 08:47.
+   - o sinal muda na escala de merges + restarts de daemon, não de minutos; diário seria o mesmo ~300 de
+     ontem;
+   - a varredura é LENTA (uma consulta de bd por bead, com retry — o Dolt estoura timeout sob load) e
+     roda em Nice 10: não é pra competir com o pipeline;
+   - 08:47 e não na hora cheia, pra não empilhar com o ruído dos jobs :00/:30; segunda de manhã porque o
+     alerta é pra ser LIDO no começo da semana do Athos.
+  RunAtLoad=false de propósito: subir a máquina / recarregar o plist não é motivo pra varrer nem alertar.
+
+  DETECTA, NÃO AGE: não reinicia daemon nenhum e não roda daemon-refresh. Quem decide restart é o
+  Mayor / dono do daemon, a partir do relatório. Notifica UMA vez, só quando aparece AINDA NÃO VISTO
+  NOVO desde a semana passada (o estado fica em .gc/logs/daemon-unverified-sweep.state.json) — não
+  repete os mesmos ~300 toda segunda. Exit 3 = alguma leitura falhou (loja, launchctl, ps, git...): o
+  relatório diz quais, e "não consegui olhar" nunca vira "não achei nada".
+
+  PATH com ~/.local/bin PRIMEIRO: é de lá que o `notify` resolve (mesma lição do silent-ignorance-watch:
+  sem isso o alerta morre engolido). `bd` e `git` vêm do PATH homebrew/sistema. /usr/bin/python3 é a
+  3.9 do sistema — o script é compatível com ela.
+
+  ESTE ARQUIVO FICA FORA DO LAUNCHD até alguém carregar:
+    cp <este arquivo> ~/Library/LaunchAgents/com.gascity.daemon-unverified-sweep.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.daemon-unverified-sweep.plist
+  Enquanto não estiver carregado, o daemon-presence-watchdog reporta PRESENCE-DRIFT para ele (é o
+  esperado — é o lembrete de que falta carregar).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gascity.daemon-unverified-sweep</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/daemon-unverified-sweep.py</string>
+        <string>--notify</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+    <!-- Weekday 1 = segunda. StartCalendarInterval (não StartInterval=604800): um StartInterval longo
+         zera a contagem a cada sleep/reboot do mini e pode nunca disparar; o calendário dispara na
+         próxima ocorrência real do relógio, e o launchd roda logo após o wake se o mini dormia. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key><integer>1</integer>
+        <key>Hour</key><integer>8</integer>
+        <key>Minute</key><integer>47</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+        <key>GC_CITY_PATH</key>
+        <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    </dict>
+
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/daemon-unverified-sweep-launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/daemon-unverified-sweep-launchd.err</string>
+</dict>
+</plist>
