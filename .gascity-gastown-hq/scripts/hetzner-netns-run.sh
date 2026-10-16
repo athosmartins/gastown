@@ -30,7 +30,9 @@ cleanup() {
 }
 fail() { echo "GTN-ISO: setup-falhou:$1" >&2; cleanup; exit 98; }
 trap 'cleanup' EXIT
-trap '[ -z "$CHILD" ] || kill -TERM "$CHILD" 2>/dev/null' TERM INT HUP
+CANCEL=""
+# TERM/INT/HUP: com o comando já rodando, repassa a ele; ainda na montagem (CHILD vazio) só marca o cancelamento, e o comando NÃO sai (conferido logo antes de lançá-lo)
+trap 'CANCEL=1; [ -z "$CHILD" ] || kill -TERM "$CHILD" 2>/dev/null' TERM INT HUP
 ip netns add "$NS" || fail netns-add
 ip -n "$NS" link set lo up || fail lo
 ip -n "$NS" link add gtn0 type dummy && ip -n "$NS" addr add 192.0.2.2/24 dev gtn0 && ip -n "$NS" link set gtn0 up \
@@ -47,10 +49,14 @@ EOF
 ip netns exec "$NS" nft list chain inet gtn out 2>/dev/null | grep -q 'reject' || fail nft-regra
 # vazio/falhou (o chamador não existe no passwd) → 98, o comando NÃO roda: sem HOME o ambiente limpo sairia diferente do testado
 HOME_U=$(getent passwd "$SUDO_UID" | cut -d: -f6); [ -n "$HOME_U" ] || fail passwd
+# cancelado durante a montagem (o sinal só é tratado entre os comandos acima) → 98, o comando NÃO roda
+[ -z "$CANCEL" ] || fail cancelado
 echo "GTN-ISO: ok ns=$NS uid=$SUDO_UID" >&2
 ip netns exec "$NS" setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups --no-new-privs --inh-caps=-all --bounding-set=-all -- \
   /usr/bin/env -i HOME="$HOME_U" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 "$@" &
 CHILD=$!
+# o sinal pode ter chegado entre o lançamento e a atribuição de CHILD: repassa agora
+[ -z "$CANCEL" ] || kill -TERM "$CHILD" 2>/dev/null
 wait "$CHILD"; rc=$?
 # a espera pode ter sido interrompida por um sinal (o trap): espera de novo para ter o rc DO comando
 while kill -0 "$CHILD" 2>/dev/null; do wait "$CHILD"; rc=$?; done

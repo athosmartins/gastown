@@ -6,8 +6,8 @@
 #
 # CASOS: quem chama (sem SUDO_UID, uid 0, sem comando → 64) · montagem na ordem certa (netns, lo, gtn0, rota, nft, setpriv, limpeza) e a regra (policy drop, lo aceito, TUDO
 #   o mais rejeitado COM contador) · o comando sai sem capacidades, com o uid do chamador e ambiente limpo, e o rc dele é o do helper · cada passo da montagem que falha →
-#   98 + `setup-falhou:<passo>` e o comando NÃO roda · contador do nft (N / 0 / ilegível `?`, nunca 0 por engano) · TERM chega ao comando e a limpeza roda · processo que sobrou no netns é morto.
-# CONTROLES NEGATIVOS: mutantes H1-H14 têm de ser REPROVADOS pelo caso correspondente (o caso falha no mutante).
+#   98 + `setup-falhou:<passo>` e o comando NÃO roda · contador do nft (N / 0 / ilegível `?`, nunca 0 por engano) · TERM chega ao comando e a limpeza roda · TERM DURANTE a montagem cancela (o comando não roda) · processo que sobrou no netns é morto.
+# CONTROLES NEGATIVOS: mutantes H1-H15 têm de ser REPROVADOS pelo caso correspondente (o caso falha no mutante).
 # O QUE NÃO PROVA: que o kernel isola com estas regras. Isso só o canário prova, no nó, com o helper instalado por root (hetzner-iso-run.sh --canary).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -19,7 +19,7 @@ cat > "$T/stubs/ip" <<'EOF'
 #!/usr/bin/env bash
 echo "ip $*" >> "$LOG"
 case "$*" in
-  "netns add "*) [ "${FAIL_STEP:-}" = netns-add ] && exit 1 ;;
+  "netns add "*) [ "${FAIL_STEP:-}" = netns-add ] && exit 1; [ "${SLOW_SETUP:-}" = 1 ] && { echo setup-started >> "$LOG"; sleep 1; } ;;
   "-n "*" link set lo up") [ "${FAIL_STEP:-}" = lo ] && exit 1 ;;
   "-n "*" link add gtn0 "*) [ "${FAIL_STEP:-}" = gtn0 ] && exit 1 ;;
   "netns pids "*) cat "$PIDS_FILE" 2>/dev/null; exit 0 ;;
@@ -79,10 +79,14 @@ case_counter() { CNT_MODE=garbage go "$1" -- true; ck "contador ilegível: ? (n�
 case_signal() { : > "$LOG"; env SLOW=1 SUDO_UID=1000 SUDO_GID=1000 GTN_TEST_ETC="$T/etc-netns" "$1" -- sleep 20 > "$OUT" 2> "$ERR" & local hp=$! i=0
   while ! grep -q '^started$' "$LOG" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -TERM "$hp" 2>/dev/null; wait "$hp"; RC=$?
   ck "TERM no helper chega ao comando" has "$LOG" '^got-term$'; ck "TERM: o helper sai com erro" test "$RC" != 0; ck "TERM: a limpeza roda" has "$LOG" '^ip netns del gtn'; }
+case_cancel() { : > "$LOG"; env SLOW_SETUP=1 SUDO_UID=1000 SUDO_GID=1000 GTN_TEST_ETC="$T/etc-netns" "$1" -- sleep 20 > "$OUT" 2> "$ERR" & local hp=$! i=0
+  while ! grep -q '^setup-started$' "$LOG" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -TERM "$hp" 2>/dev/null; wait "$hp"; RC=$?
+  ck "TERM durante a montagem: o comando NÃO roda" hasnt "$LOG" "$SP"; ck "TERM durante a montagem: sai com erro" test "$RC" != 0; ck "TERM durante a montagem: diz que cancelou" has "$ERR" '^GTN-ISO: setup-falhou:cancelado$'
+  ck "TERM durante a montagem: a limpeza roda" has "$LOG" '^ip netns del gtn'; }
 case_leftover() { sleep 60 & local sp=$!; disown "$sp" 2>/dev/null; echo "$sp" > "$PIDS_FILE"; : > "$LOG"; env SUDO_UID=1000 SUDO_GID=1000 GTN_TEST_ETC="$T/etc-netns" "$1" -- true > "$OUT" 2> "$ERR"; RC=$?; sleep 0.3
   ck "sobrou processo no netns: é morto na limpeza" dead "$sp"; kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null; }
 
-for c in ok caller setup counter signal leftover; do "case_$c" "$T/H.sh"; done
+for c in ok caller setup counter signal cancel leftover; do "case_$c" "$T/H.sh"; done
 
 M=0
 mutant() { # nome expr-sed caso
@@ -100,10 +104,11 @@ mutant H6-capacidades-no-bounding 's/ --bounding-set=-all//' ok
 mutant H7-ambiente-nao-limpo 's#/usr/bin/env -i HOME#/usr/bin/env HOME#' ok
 mutant H8-policy-accept 's/policy drop; oifname "lo" accept; counter name egress reject/policy accept; oifname "lo" accept; counter name egress reject/' ok
 mutant H9-rejeita-sem-contador 's/counter name egress reject/reject/' ok
-mutant H10-sem-trap-de-sinal "s/^trap '\[ -z \"\$CHILD\" \].*\$/true/" signal
+mutant H10-sem-trap-de-sinal "s/^trap 'CANCEL=1; .*\$/true/" signal
 mutant H11-sobra-no-netns-nao-morta 's/^  ip netns pids .*$/  true/' leftover
 mutant H12-sem-checar-quem-chamou 's/^\[ \$# -gt 0 \] && \[ "\${SUDO_UID.*$/true/' caller
 mutant H13-roda-como-root 's/--reuid="\$SUDO_UID"/--reuid=0/' ok
 mutant H14-dns-fora-da-regra 's/nameserver 192.0.2.1/nameserver 1.1.1.1/' ok
+mutant H15-cancelamento-na-montagem-engolido 's/^\[ -z "\$CANCEL" \] || fail cancelado$/true/' cancel
 echo "---"; echo "$((n-fails))/$n ok ($M mutantes)"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
