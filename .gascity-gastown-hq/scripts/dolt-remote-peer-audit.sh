@@ -30,7 +30,8 @@
 # milissegundos uma vez por dia pode passar sem ser visto. O veredito LIMPO diz "nenhuma
 # conexão não-loopback em N amostras ao longo de H horas", não "nunca existiu". A rede de
 # segurança do bind é que o erro de um cliente esquecido é ALTO (conexão recusada), e a volta
-# é GC_DOLT_HOST=0.0.0.0 + reinício (ver o runbook).
+# é o rollback normal da janela de engine (binário anterior) — ver o README do patch em
+# docs/pending-engine-window/ga-k7o6ou-dolt-bind-loopback.README.md.
 #
 # Detection-only: não muda nada no Dolt nem na rede. Custo por amostra, medido em 15/10 com a
 # máquina a load 83: ~0,17 s de CPU (a parede foi 5-8 s, fila de escalonamento). Um lsof
@@ -67,7 +68,8 @@ emit() {
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(date +%s)" "$state" "$pid" "$ports" \
     "$total" "$loop" "$selflan" "$remote" "$peers" "$why" >>"$LOG" 2>/dev/null || {
       echo "dolt-remote-peer-audit: não consegui gravar $LOG" >&2; return 1; }
-  # Teto do log: ~57 KB/dia a 60 s; só corta quando passa do limite, mantendo o fim.
+  # Teto do log: ~230 KB/dia a 60 s (linha de ~165 bytes), 20000 linhas ≈ 14 dias; só corta
+  # quando passa do limite, mantendo o fim.
   local n
   n="$(wc -l <"$LOG" 2>/dev/null | tr -d ' ')"
   if [ -n "$n" ] && [ "$n" -gt "$MAX_LINES" ] 2>/dev/null; then

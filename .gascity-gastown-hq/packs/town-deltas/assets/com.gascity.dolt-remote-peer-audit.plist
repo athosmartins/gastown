@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.dolt-remote-peer-audit</string>
+
+  <!-- Sonda de pares do Dolt (ga-k7o6ou): uma amostra por minuto de QUEM está conectado
+       na porta do Dolt, para decidir se o bind pode sair de 0.0.0.0 para 127.0.0.1 sem
+       derrubar nenhum cliente. DETECTION-ONLY: só lê (um lsof limitado a um pid) e
+       acrescenta uma linha em .gc/logs/dolt-remote-peers.jsonl. Nada é alterado no Dolt.
+
+       Veredito: `scripts/dolt-remote-peer-audit.sh report 48` (LIMPO / BLOQUEADO /
+       INSUFICIENTE; exit 0 / 1 / 2). Vale como evidência só com 48 h de cobertura.
+
+       Cadência de 60 s medida, não chutada: o custo é ~0,17 s de CPU por amostra e a
+       parede foi 5-8 s com a máquina a load 83 (15/10) — bem abaixo do intervalo, e o
+       launchd não empilha duas instâncias da mesma label; o script ainda tem lock de
+       instância única. Mais lento que isso aumentaria a chance de perder um cliente
+       que conecta por milissegundos.
+
+       APOSENTADORIA: depois que o bind em 127.0.0.1 estiver no ar e provado, esta sonda
+       perde o sentido (um cliente remoto passa a ser recusado, não visto). Descarregar com
+       `launchctl bootout` + `launchctl disable` (o instalador do deploy respeita o disable)
+       e apagar este arquivo. Não é um daemon permanente. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-remote-peer-audit.sh</string>
+    <string>sample</string>
+  </array>
+
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-remote-peer-audit-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-remote-peer-audit-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>
