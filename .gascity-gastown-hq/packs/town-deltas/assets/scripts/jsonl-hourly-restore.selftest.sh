@@ -32,7 +32,7 @@
 #  17. --disk-factor/--disk-floor-mb/--min-free-mb vazios ou inválidos: rc 3, nunca seguem com o default
 #  18. (helper de mentira via JHR_PY) saída do helper que não dá para ler não vira veredito: extract.json ilegível => rc 2 (antes `bad` vazio = "as
 #      tabelas conferem"); manifest sem `files` => rc 2; conversor que morre com traceback (sem `.error`) => rc 2, não "o dump não converteu";
-#      o `.error` do conversor continua sendo FAIL (rc 1); --report-out que não grava avisa, e o rc continua sendo o do restore
+#      o `.error` do conversor com DumpError continua FAIL (rc 1), com OSError do host (ENOSPC, EACCES...) é rc 2; --report-out que não grava avisa (rc do restore)
 #  19. bd import morto por sinal (SIGKILL/OOM, rc 137) sem dizer o motivo: rc 2 "sem veredito", não FAIL (o FAIL de import exige `.error`)
 #  20. --dump com caminho relativo (o link no diretório de trabalho apontaria para dentro dele): rc 0; 20b. --manifest com --dump avisa que é ignorado
 #  Reprovação do gate ga-15eiut (17/10; cada item abaixo reprova contra o script anterior, 27 asserções):
@@ -40,8 +40,10 @@
 #      latest.json com chave fora do padrão é dado ruim do bucket (rc 2), não uso errado (rc 3)
 #  22. a vigia e o TERM do restore matam o bd que IGNORA o TERM: o KILL vai ao grupo do `timeout`, o import não fica órfão
 #  23. bd morto por sinal com `.error` parcial (rc 137): rc 2 (a cláusula rc>=128; provada por mutante: sem ela o teste cai)
-#  24. bd recusando por memória/descritores/lock (rc 1 com `.error`): rc 2, não FAIL · 25. export que não é JSON: rc 2, sem erro de jq
-#  26. prefixo do store: hífen preservado, outro caractere vira `_`, sem `_` de sobra no fim
+#  24. bd recusando por memória/descritores/lock/permissão/E-S/disco só leitura/quota ou motivo desconhecido (rc 1 com `.error`): rc 2; só "validation failed" é FAIL
+#  25. export que não é JSON: rc 2, sem erro de jq · 26. prefixo do store: hífen preservado, outro caractere vira `_`, sem `_` de sobra no fim
+#  Reprovação do gate ga-7345xi (17/10, 3ª): 27. zero à esquerda é decimal (--disk-factor 08 / 010) e número de 10 dígitos é uso errado (rc 3)
+#  28. --report-out leva a identidade do run (banco, origem, hora) e o relatório velho é apagado se o run não chega lá · o RESULT traz manifest_checked
 #  Cada item de 11 a 16 foi provado reprovando (campanha de mutantes, 16/10): vigia desligada, FLOOR_HIT ignorado, fator 3×, ENOSPC
 #  sem tratamento, cleanup sem matar o import, import arredondado para baixo => cada um derruba pelo menos um teste, e só os dele.
 #  O 18 também (17/10): cada uma das quatro guardas removida derruba só os testes dela.
@@ -202,6 +204,7 @@ mk_bd 0; mk_dump "$T/d1" "open,closed,in_progress" "" ""
 run "$T/d1"
 check "rc 0" 0 "$(rc)"; has "RESULT: OK" "$(cat "$T/out")" "RESULT: OK"
 check "o diretório de trabalho some" 0 "$(leftover)"
+has "o resumo diz que --dump não conferiu manifest" "$(cat "$T/out")" "manifest_checked=false"
 check "nenhuma chamada de config" 0 "$(wc -l < "$T/bd-calls.log" | tr -d ' ')"
 check "o bd rodou (init, import, export)" 3 "$(wc -l < "$T/bd-env.log" | tr -d ' ')"
 check "toda chamada do bd com DOLT_DISABLE_EVENT_FLUSH=1" 0 "$(grep -vc ':1$' "$T/bd-env.log" || true)"
@@ -219,30 +222,26 @@ has "e o que foi aplicado" "$(cat "$T/err")" "aplicado: staged_ready,staged_warn
 echo "-- 2b. mesma coisa com categoria (nome:categoria)"
 mk_bd 0; mk_dump "$T/d2b" "open,done,pinned" "staged_ready:wip,done:done,pinned:frozen" ""
 run "$T/d2b"
-check "rc 0" 0 "$(rc)"
-has "a última chamada tira pinned:frozen e mantém as categorias dos outros" "$(tail -1 "$T/bd-calls.log")" "config set status.custom staged_ready:wip,done:done"
+check "rc 0" 0 "$(rc)"; has "a última chamada tira pinned:frozen e mantém as categorias dos outros" "$(tail -1 "$T/bd-calls.log")" "config set status.custom staged_ready:wip,done:done"
 hasnt "sem pinned" "$(tail -1 "$T/bd-calls.log")" "pinned"
 
 echo "-- 3. status.custom só com itens embutidos"
 mk_bd 0; mk_dump "$T/d3" "open,pinned,deferred" "pinned,deferred" ""
 run "$T/d3"
-check "rc 0" 0 "$(rc)"
-has "o log diz que não há o que configurar" "$(cat "$T/err")" "todos os itens (pinned,deferred) colidem"
+check "rc 0" 0 "$(rc)"; has "o log diz que não há o que configurar" "$(cat "$T/err")" "todos os itens (pinned,deferred) colidem"
 hasnt "nenhuma recusa vira reprovação do restore" "$(cat "$T/out")" "FAIL"
 
 echo "-- 4. types.custom sem colisão: o caminho comum não muda"
 mk_bd 0; mk_dump "$T/d4" "open,closed" "" "molecule,convoy,gate"
 run "$T/d4"
-check "rc 0" 0 "$(rc)"
-check "UMA chamada de types.custom" 1 "$(calls types.custom)"
+check "rc 0" 0 "$(rc)"; check "UMA chamada de types.custom" 1 "$(calls types.custom)"
 has "com o valor inteiro" "$(cat "$T/bd-calls.log")" "config set types.custom molecule,convoy,gate"
 hasnt "e nenhum AVISO de colisão" "$(cat "$T/err")" "colide"
 
 echo "-- 5. config recusado por outro motivo: o import segue e reprova (falha fechada)"
 mk_bd 1; mk_dump "$T/d5" "open,done" "done" ""
 run "$T/d5"
-check "rc 1" 1 "$(rc)"
-has "AVISO de config não aplicada" "$(cat "$T/err")" "config status.custom não aplicada"
+check "rc 1" 1 "$(rc)"; has "AVISO de config não aplicada" "$(cat "$T/err")" "config status.custom não aplicada"
 check "UMA tentativa só (não é colisão, não repete)" 1 "$(calls status.custom)"
 
 echo "-- 6. a linha RESULT de import reprovado traz o erro do bd"
@@ -253,8 +252,7 @@ hasnt "e não só o contador de progresso" "$(cat "$T/out")" "issues committed"
 echo "-- 7. status desconhecido sem nenhuma config"
 mk_bd 0; mk_dump "$T/d7" "open,weird" "" ""
 run "$T/d7"
-check "rc 1" 1 "$(rc)"
-has "o erro cita o status" "$(cat "$T/out")" "invalid status: weird"
+check "rc 1" 1 "$(rc)"; has "o erro cita o status" "$(cat "$T/out")" "invalid status: weird"
 
 echo "-- 8. limpeza que não consegue apagar"
 # rm de mentira só para o diretório de trabalho do restore em si (…/jsonl-hourly-restore.XXXXXX, sem subcaminho); qualquer outro rm é o de verdade
@@ -283,8 +281,7 @@ exec "$REAL_RM" "\$@"
 EOF
 mk_bd 0; mk_dump "$T/d8b" "open,closed" "" ""
 run "$T/d8b" "$T/real-bin"
-check "rc 0" 0 "$(rc)"
-check "o diretório sumiu na segunda tentativa" 0 "$(leftover)"
+check "rc 0" 0 "$(rc)"; check "o diretório sumiu na segunda tentativa" 0 "$(leftover)"
 hasnt "e não há aviso" "$(cat "$T/err")" "não consegui apagar"
 
 mk_twins() { # dir: duas issues; a gt-1 tem dois comentários idênticos (ids diferentes) e um diferente
@@ -300,8 +297,7 @@ PYEOF
 echo "-- 9. comentários idênticos que o import funde"
 mk_bd 0 merge; mk_twins "$T/d9"
 run "$T/d9"
-check "rc 0 (fusão de gêmeos é exclusão por desenho, não perda)" 0 "$(rc)"
-has "RESULT: OK" "$(cat "$T/out")" "RESULT: OK"
+check "rc 0 (fusão de gêmeos é exclusão por desenho, não perda)" 0 "$(rc)"; has "RESULT: OK" "$(cat "$T/out")" "RESULT: OK"
 has "comments restaurado/esperado 2/2" "$(cat "$T/out")" "comments=2/2"
 has "a linha RESULT conta a fusão" "$(cat "$T/out")" "dup_comments=1"
 has "o relatório mostra a exclusão" "$(cat "$T/out")" "comentários-idênticos-fundidos=1"
@@ -309,14 +305,12 @@ has "o relatório mostra a exclusão" "$(cat "$T/out")" "comentários-idênticos
 echo "-- 9b. o mesmo dump com um bd que NÃO funde"
 mk_bd 0 keep; mk_twins "$T/d9b"
 run "$T/d9b"
-check "rc 0" 0 "$(rc)"
-has "dup_comments=0" "$(cat "$T/out")" "dup_comments=0"
+check "rc 0" 0 "$(rc)"; has "dup_comments=0" "$(cat "$T/out")" "dup_comments=0"
 
 echo "-- 10. bd que perde os comentários"
 mk_bd 0 drop; mk_twins "$T/d10"
 run "$T/d10"
-check "rc 1" 1 "$(rc)"
-has "RESULT: FAIL" "$(cat "$T/out")" "RESULT: FAIL"
+check "rc 1" 1 "$(rc)"; has "RESULT: FAIL" "$(cat "$T/out")" "RESULT: FAIL"
 has "o problema diz que comentários não voltaram" "$(cat "$T/out")" "comments do dump não voltaram"
 
 mk_big_dump() { # dir, MB de descrição numa issue (para o import ficar com tamanho de verdade)
@@ -335,8 +329,7 @@ PYEOF
 echo "-- 11. o disco enche DURANTE o import: a vigia interrompe, rc 2, sem veredito"
 mk_bd 0; mk_df; mk_dump "$T/d11" "open,closed" "" ""
 run_df "$T/d11" 100000 fill --disk-floor-mb 2048
-check "rc 2 (sem veredito)" 2 "$(rc)"
-has "RESULT: UNKNOWN com o motivo" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=disco abaixo do piso durante o import"
+check "rc 2 (sem veredito)" 2 "$(rc)"; has "RESULT: UNKNOWN com o motivo" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=disco abaixo do piso durante o import"
 has "diz quanto sobrou e qual era o piso" "$(cat "$T/out")" "100 MB livres < 2048"
 has "diz que nada foi provado" "$(cat "$T/out")" "nada foi provado"
 hasnt "e nunca vira FAIL nem OK" "$(cat "$T/out")" "RESULT: FAIL"
@@ -352,16 +345,14 @@ check "rc 0" 0 "$(rc)"; has "RESULT: OK" "$(cat "$T/out")" "RESULT: OK"
 echo "-- 13. o df para de responder durante o import: sem como garantir o piso, interrompe (inerte)"
 mk_bd 0; mk_dump "$T/d13" "open,closed" "" ""
 run_df "$T/d13" 100000 breakdf --disk-floor-mb 2048
-check "rc 2" 2 "$(rc)"
-has "RESULT: UNKNOWN" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=disco abaixo do piso durante o import: ? MB livres"
+check "rc 2" 2 "$(rc)"; has "RESULT: UNKNOWN" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=disco abaixo do piso durante o import: ? MB livres"
 check "o bd import foi morto" 1 "$(gone)"
 check "o diretório de trabalho some" 0 "$(leftover)"
 
 echo "-- 14. o próprio bd recusa por falta de espaço: sem veredito, não 'o dump não reproduz'"
 mk_bd 0; mk_dump "$T/d14" "open,closed" "" ""
 run_df "$T/d14" 100000 enospc --disk-floor-mb 0
-check "rc 2" 2 "$(rc)"
-has "RESULT: UNKNOWN" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=bd import sem espaço em disco"
+check "rc 2" 2 "$(rc)"; has "RESULT: UNKNOWN" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=bd import sem espaço em disco"
 hasnt "e não FAIL" "$(cat "$T/out")" "RESULT: FAIL"
 
 echo "-- 15. a guarda de antes do import usa o fator medido (60×), não 3×"
@@ -408,6 +399,9 @@ if cmd == "extract":
 if os.environ["STUB_CONVERT"] == "crash":
     sys.stderr.write("Traceback (most recent call last):\nZeroDivisionError: boom\n")
     sys.exit(1)
+if os.environ["STUB_CONVERT"] == "oserror":
+    print('{"error": "OSError: [Errno 28] No space left on device"}')
+    sys.exit(1)
 print('{"error": "DumpError: tabela quebrada"}')
 sys.exit(1)
 STUBEOF
@@ -415,7 +409,7 @@ printf 'artefato' > "$T/art.tgz"
 ART_SHA="$(python3 -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$T/art.tgz")"
 printf '{"schema":1,"databases":{"gt":{}},"files":[{"path":"gt/issues.jsonl","bytes":1,"sha256":"x"}],"artifact":{"sha256":"%s","bytes":8}}' "$ART_SHA" > "$T/man-ok.json"
 printf '{"schema":1,"databases":{"gt":{}},"artifact":{"sha256":"%s","bytes":8}}' "$ART_SHA" > "$T/man-nofiles.json"
-run_stub() { # extract(garbage|ok)  convert(crash|error)  manifest — modo artefato, helper de mentira
+run_stub() { # extract(garbage|ok)  convert(crash|error|oserror)  manifest — modo artefato, helper de mentira
   ( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" JHR_PY="$T/stub.py" STUB_EXTRACT="$1" STUB_CONVERT="$2" "$RESTORE" --db gt --artifact "$T/art.tgz" --manifest "$3" \
       --min-free-mb 1 --disk-floor-mb 0 > "$T/out" 2> "$T/err" ); echo $? > "$T/rc"
 }
@@ -435,18 +429,25 @@ echo "-- 18b. mas o dump que o helper DIZ estar quebrado continua sendo FAIL (rc
 run_stub ok error "$T/man-ok.json"
 check "'.error' do conversor: rc 1" 1 "$(rc)"
 has "RESULT: FAIL com o motivo do helper" "$(cat "$T/out")" "RESULT: FAIL db=gt motivo=dump não converteu: {\"error\": \"DumpError: tabela quebrada\"}"
+echo "-- 18d. OSError do host (ENOSPC, EIO, EACCES, EMFILE) vem em '.error' do conversor como o erro do dump: não julga o dump, rc 2"
+run_stub ok oserror "$T/man-ok.json"
+check "ENOSPC no conversor: rc 2" 2 "$(rc)"; hasnt "e não FAIL" "$(cat "$T/out")" "RESULT: FAIL"
+has "UNKNOWN com o errno" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=o conversor esbarrou no ambiente (rc=1), não no dump: OSError: [Errno 28] No space left on device"
+if [ "$(id -u)" != 0 ]; then   # root lê qualquer arquivo: sem EACCES para provar
+  mk_dump "$T/d18d" "open,closed" "" ""; chmod 000 "$T/d18d/gt/issues.jsonl"; run "$T/d18d"; chmod 600 "$T/d18d/gt/issues.jsonl"; check "helper de verdade, tabela sem leitura (EACCES): rc 2" 2 "$(rc)"
+fi
+mk_dump "$T/d18e" "open,closed" "" ""; rm "$T/d18e/gt/issues.jsonl"; run "$T/d18e"
+check "tabela AUSENTE no dump (DumpError, é o dump): continua FAIL, rc 1" 1 "$(rc)"
 echo "-- 18c. --report-out que não grava: o veredito sai, o aviso também"
 mk_bd 0; mk_dump "$T/d18" "open,closed" "" ""
 ( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" "$RESTORE" --db gt --dump "$T/d18" --min-free-mb 1 --disk-floor-mb 0 --report-out "$T/nao-existe/r.json" > "$T/out" 2> "$T/err" ); echo $? > "$T/rc"
-check "rc 0 (o veredito é do restore, não do relatório)" 0 "$(rc)"
-has "AVISO de relatório não gravado" "$(cat "$T/err")" "AVISO: não gravei o relatório em $T/nao-existe/r.json"
+check "rc 0 (o veredito é do restore, não do relatório)" 0 "$(rc)"; has "AVISO de relatório não gravado" "$(cat "$T/err")" "AVISO: não gravei o relatório em $T/nao-existe/r.json"
 
 # Reprovação do gate ga-hwjqvp (17/10): o import que morre sem dizer o motivo e o --dump relativo
 echo "-- 19. bd import que morre sem dizer o motivo (SIGKILL/OOM, rc 137): sem veredito, não 'o dump não reproduz'"
 mk_bd 0; mk_dump "$T/d19" "open,closed" "" ""
 run_df "$T/d19" 100000 killed --disk-floor-mb 0
-check "rc 2" 2 "$(rc)"
-has "RESULT: UNKNOWN com o rc" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=bd import morreu sem dizer o motivo (rc=137)"
+check "rc 2" 2 "$(rc)"; has "RESULT: UNKNOWN com o rc" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=bd import morreu sem dizer o motivo (rc=137)"
 has "e o fim do stderr do bd" "$(cat "$T/out")" "250/9 issues committed"
 hasnt "e não FAIL" "$(cat "$T/out")" "RESULT: FAIL"
 check "o diretório de trabalho some" 0 "$(leftover)"
@@ -477,8 +478,7 @@ has "e o motivo cita a chave" "$(cat "$T/out")" "latest.json aponta para uma cha
 echo "-- 22. a vigia interrompe um bd que IGNORA o TERM: o KILL vai ao grupo inteiro, o import não fica órfão"
 mk_bd 0; mk_df; mk_dump "$T/d22" "open,closed" "" ""
 JHR_TERM_GRACE=2 run_df "$T/d22" 100000 stubborn --disk-floor-mb 2048
-check "rc 2 (sem veredito)" 2 "$(rc)"
-check "o bd import morreu de verdade (não só o timeout)" 1 "$(gone)"
+check "rc 2 (sem veredito)" 2 "$(rc)"; check "o bd import morreu de verdade (não só o timeout)" 1 "$(gone)"
 if [ "$ELAPSED" -lt 20 ]; then ok "e logo depois da tolerância, sem esperar os 60 s do bd (${ELAPSED}s)"; else no "demorou ${ELAPSED}s"; fi
 echo "-- 22b. TERM no restore com o bd ignorando o TERM: o import morre junto"
 mk_dump "$T/d22b" "open,closed" "" ""
@@ -497,11 +497,14 @@ check "rc 2" 2 "$(rc)"; has "RESULT: UNKNOWN (rc=137)" "$(cat "$T/out")" "RESULT
 
 echo "-- 24. o bd recusa por falta de memória/descritores/lock do ambiente: sem veredito, não 'o dump não reproduz'"
 mk_bd 0; mk_dump "$T/d24" "open,closed" "" ""
-for m in "fork/exec: Cannot allocate memory" "open /s/x: too many open files" "Error 1105: database is locked"; do
+for m in "fork/exec: Cannot allocate memory" "open /s/x: too many open files" "open /s/x: permission denied" "write /s/x: input/output error" "read-only file system" "disk quota exceeded" "Error 1105: database is locked"; do
   printf '%s' "$m" > "$T/import-msg"; run_df "$T/d24" 100000 envfail --disk-floor-mb 0
   check "rc 2: $m" 2 "$(rc)"
 done
 has "RESULT: UNKNOWN com o motivo do bd" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=bd import sem recurso do ambiente: Error 1105: database is locked"
+printf '%s' "motivo que ninguém viu" > "$T/import-msg"; run_df "$T/d24" 100000 envfail --disk-floor-mb 0
+check "motivo fora da lista (só 'validation failed' é FAIL): rc 2" 2 "$(rc)"
+has "e diz que não é a validação" "$(cat "$T/out")" "recusou por um motivo que não é a validação do dump (rc=1): motivo que ninguém viu"
 
 echo "-- 25. export que não é JSON: o reconcile não chega às contas => rc 2, não 'RESULT: FAIL ... dup_comments=null'"
 mk_bd 0 garbage; mk_dump "$T/d25" "open,closed" "" ""
@@ -515,6 +518,21 @@ for pf in "lex-bh:lex-bh" "lex bh:lex_bh"; do
   : > "$T/bd-init.log"; ( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" "$RESTORE" --db gt --dump "$T/d26" --prefix "${pf%%:*}" --min-free-mb 1 --disk-floor-mb 0 > "$T/out" 2> "$T/err" )
   check "--prefix '${pf%%:*}' => init -p ${pf##*:}" "-p ${pf##*:} --non-interactive" "$(tail -1 "$T/bd-init.log")"
 done
+
+echo "-- 27. zero à esquerda é decimal (08 não é octal inválido, 010 não vale 8); número de 10 dígitos é uso errado"
+mk_bd 0; mk_big_dump "$T/d27" 20
+run_df "$T/d27" 1000 normal --disk-floor-mb 0 --disk-factor 08
+check "--disk-factor 08: rc 0" 0 "$(rc)"; run_df "$T/d27" 690 normal --disk-floor-mb 0 --disk-factor 010
+check "--disk-factor 010 vale 10 (20×10+512 > 690): rc 2" 2 "$(rc)"; has "e a conta mostra 10×" "$(cat "$T/out")" "MB (10× o import"
+run_df "$T/d27" 1000 normal --disk-floor-mb 0 --disk-factor 1234567890; check "--disk-factor com 10 dígitos: rc 3" 3 "$(rc)"
+
+echo "-- 28. --report-out leva a identidade do run, e o relatório velho não sobrevive a um run que não chegou lá"
+mk_bd 0; mk_dump "$T/d28" "open,closed" "" ""; echo velho > "$T/r28.json"
+( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" "$RESTORE" --db gt --dump "$T/d28" --min-free-mb 1 --disk-floor-mb 0 --report-out "$T/r28.json" > "$T/out" 2> "$T/err" ); echo $? > "$T/rc"
+check "rc 0" 0 "$(rc)"; check "o relatório diz banco e origem do run" "gt true" "$(jq -r '"\(.run.db) \(.run.source | endswith("/d28"))"' "$T/r28.json" 2>&1)"
+mk_dump "$T/d28b" "open,closed" "" ""; rm "$T/d28b/gt/issues.jsonl"
+( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" "$RESTORE" --db gt --dump "$T/d28b" --min-free-mb 1 --disk-floor-mb 0 --report-out "$T/r28.json" > "$T/out" 2> "$T/err" ); echo $? > "$T/rc"
+check "run reprovado antes do relatório: rc 1" 1 "$(rc)"; check "e o relatório do run anterior sumiu" nao "$([ -e "$T/r28.json" ] && echo sim || echo nao)"
 
 echo
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="

@@ -16,7 +16,7 @@
 #   jsonl-hourly-restore.sh --db NAME --from-s3 [latest|jsonl-hourly/snap/<chave>.tar.gz] [opções]
 #   jsonl-hourly-restore.sh --db NAME --artifact F.tar.gz --manifest M.json [opções]
 #   jsonl-hourly-restore.sh --db NAME --dump DIR [opções]        # DIR/<db>/<tabela>.jsonl; sem manifest: as contas partem das linhas lidas
-#   opções: --work DIR (não é apagado) · --keep (não apaga o diretório de trabalho) · --report-out F.json ·
+#   opções: --work DIR (não é apagado) · --keep (não apaga o diretório de trabalho) · --report-out F.json (com banco, origem e hora do run; o velho é apagado) ·
 #           --min-free-mb N (default 3072) · --import-timeout S (default 3600) · --prefix P (prefixo do store; default = issue_prefix do dump) ·
 #           --disk-factor N (default 60: antes do import exige N × o tamanho do import de disco livre) · --disk-floor-mb N (default 2048:
 #           se o disco livre cair abaixo disso DURANTE o import, o import é interrompido)
@@ -24,7 +24,7 @@
 # CÓDIGOS DE SAÍDA (três estados; "não sei" nunca vira "ok" nem "quebrado")
 #   0  PROVADO: as contas fecham e nada diverge
 #   1  NÃO REPRODUZ: faltou/sobrou linha, algo voltou diferente, ou o artefato não é o que o manifest descreve
-#   2  não deu para concluir (sem bd/python3/aws, pouco disco, disco no piso durante o import, S3 inalcançável, import estourou o tempo...): sem veredito
+#   2  não deu para concluir (sem bd/python3/aws, pouco disco, disco no piso durante o import, S3 inalcançável, import estourou o tempo, erro de ambiente no conversor/import: permissão, E/S...): sem veredito
 #   3  uso errado
 #
 # DISCO: o store embutido cresce MUITO mais que o import (medido em 16/10, bd 1.1.0: gastown import 3 MB -> store 171 MB; whatsapp_automation
@@ -95,13 +95,15 @@ done
 case "$DB" in *[!A-Za-z0-9_.-]*|.*) die "--db com caracteres fora de [A-Za-z0-9_.-]" ;; esac
 [ -n "$MODE" ] || die "falta a origem: --from-s3, --artifact ou --dump"
 for v in "$MIN_FREE_MB" "$IMPORT_TIMEOUT" "$DISK_FACTOR" "$DISK_FLOOR_MB" "$WATCH_S" "$GRACE_S"; do   # um vazio entre inteiros não pode passar na concatenação
-  case "$v" in ""|*[!0-9]*) die "--min-free-mb, --import-timeout, --disk-factor, --disk-floor-mb, JHR_WATCH_INTERVAL e JHR_TERM_GRACE são inteiros (veio '$v')" ;; esac
+  case "$v" in ""|*[!0-9]*|??????????*) die "--min-free-mb, --import-timeout, --disk-factor, --disk-floor-mb, JHR_WATCH_INTERVAL e JHR_TERM_GRACE são inteiros de até 9 dígitos (veio '$v')" ;; esac
 done
+DISK_FACTOR=$((10#$DISK_FACTOR))   # o único que entra em $(( )): sem isto 08 é octal inválido (o script morre com rc 1) e 010 vale 8, não 10
 [ "$WATCH_S" -ge 1 ] || die "JHR_WATCH_INTERVAL tem que ser >= 1"
 [ "$MODE" = file ] && { [ -n "$ARTIFACT" ] && [ -n "$MANIFEST" ] || die "--artifact exige --manifest"; }
 # o link $WORK/dump -> $DUMP é criado depois, com o diretório de trabalho como referência: um caminho relativo apontaria para dentro dele
 [ "$MODE" = dump ] && { [ -d "$DUMP/$DB" ] || die "--dump: $DUMP/$DB não existe"; DUMP="$(cd "$DUMP" && pwd -P)" || die "--dump: não consegui resolver $DUMP"; }
 
+[ -z "$REPORT_OUT" ] || [ ! -f "$REPORT_OUT" ] || rm -f "$REPORT_OUT" 2>/dev/null   # run que morre antes do relatório não deixa o de ontem no lugar
 command -v python3 >/dev/null 2>&1 || unknown "python3 ausente"
 command -v jq >/dev/null 2>&1 || unknown "jq ausente"
 command -v "$BD" >/dev/null 2>&1 || unknown "bd ausente"
@@ -218,9 +220,13 @@ log "convertendo tabelas de $DB"
 py convert --dump "$WORK/dump" --db "$DB" --out "$WORK/import.jsonl" > "$WORK/convert.json" 2>"$WORK/convert.err"
 rc=$?
 if [ $rc -ne 0 ]; then
-  # o helper diz `.error` quando o DUMP é o problema (FAIL); sair com rc != 0 sem isso (traceback, kill) é o helper que morreu: sem veredito
-  jq -e '.error' "$WORK/convert.json" >/dev/null 2>&1 \
-    || unknown "o conversor saiu rc=$rc sem dizer o motivo: $(tail -2 "$WORK/convert.err" 2>/dev/null | tr '\n' ' ' | head -c 300)"
+  # vazio → o helper morreu (traceback, kill) sem dizer o motivo: sem veredito; falhou/ilegível → o jq não imprime nada, cai no mesmo vazio (rc 2)
+  # O helper põe em `.error` o DumpError/KeyError/ValueError do DUMP (FAIL) e também o OSError do HOST (ENOSPC, EIO, EACCES, EMFILE: "OSError: [Errno 28] ..."): este não julga o dump
+  cerr="$(jq -r '.error // empty' "$WORK/convert.json" 2>/dev/null | head -c 300)"
+  case "$cerr" in
+    "") unknown "o conversor saiu rc=$rc sem dizer o motivo: $(tail -2 "$WORK/convert.err" 2>/dev/null | tr '\n' ' ' | head -c 300)" ;;
+    OSError:*|*"[Errno "*) unknown "o conversor esbarrou no ambiente (rc=$rc), não no dump: $cerr" ;;
+  esac
   echo "RESULT: FAIL db=$DB motivo=dump não converteu: $(head -c 300 "$WORK/convert.json" | tr '\n' ' ')"; exit 1
 fi
 IMPORT_BYTES="$(wc -c < "$WORK/import.jsonl" | tr -d ' ')"
@@ -316,6 +322,8 @@ if [ $rc -ne 0 ]; then
   esac
   # rc >= 128 = morto por sinal (OOM, SIGKILL): mesmo com um .error parcial, não foi o bd que julgou o dump
   if [ -z "$why" ] || [ "$rc" -ge 128 ]; then unknown "bd import morreu sem dizer o motivo (rc=$rc): ${why:-$tailerr}"; fi
+  # as frases acima são só o ambiente já visto (permissão, E/S, disco só leitura, quota... não estão nelas): FAIL é a exceção reconhecida, o bd diz "validation failed for issue X: ..." do dump (bd 1.1.0)
+  case "$low" in *"validation failed"*) ;; *) unknown "bd import recusou por um motivo que não é a validação do dump (rc=$rc): $why" ;; esac
   echo "RESULT: FAIL db=$DB motivo=bd import rc=$rc: $why"; exit 1
 fi
 
@@ -326,18 +334,20 @@ py reconcile --db "$DB" $MAN_ARG --convert-stats "$WORK/convert.json" --imported
   >"$WORK/report.json" 2>"$WORK/reconcile.err"
 rrc=$?
 [ -s "$WORK/report.json" ] || unknown "reconcile não produziu relatório: $(head -c 300 "$WORK/reconcile.err")"
+[ "$rrc" -le 1 ] || unknown "reconcile saiu rc=$rrc (só 0 = confere e 1 = não confere são veredito; o resto é o helper que morreu)"
 # relatório sem contas (_fail do helper: {"verdict":"fail","problems":[...]} — entrada ilegível ou manifest sem contagem) = as contas não foram feitas: sem veredito
 # (antes caía em jq com erro e `RESULT: FAIL ... dup_comments=null`); vazio/ilegível → o jq -e falha e cai no mesmo unknown
 jq -e '(.table | type) == "array" and (.exclusions | type) == "object"' "$WORK/report.json" >/dev/null 2>&1 \
   || unknown "reconcile não chegou às contas: $(jq -r '.problems[0]? // empty' "$WORK/report.json" 2>/dev/null | head -c 300)"
-if [ -n "$REPORT_OUT" ]; then cp "$WORK/report.json" "$REPORT_OUT" 2>/dev/null || log "AVISO: não gravei o relatório em $REPORT_OUT (o veredito abaixo vale; o relatório está em $WORK/report.json só até o fim do run)"; fi
+# o relatório leva a identidade do run (banco, origem, hora); o de um run anterior foi apagado no início (se o rm falhou, ele fica até este gravar por cima)
+if [ -n "$REPORT_OUT" ]; then jq --arg db "$DB" --arg src "${SRC_KEY:-${ARTIFACT:-$DUMP}}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {run: {db: $db, source: $src, at: $at}}' "$WORK/report.json" > "$REPORT_OUT" 2>/dev/null || { rm -f "$REPORT_OUT" 2>/dev/null; log "AVISO: não gravei o relatório em $REPORT_OUT (o veredito abaixo vale; o relatório está em $WORK/report.json só até o fim do run)"; }; fi
 
 echo "── $DB: manifest − exclusões por desenho = esperado · restaurado ──"
 jq -r '.table[] | "  \(.table): manifest=\(.manifest) − excluídos=\(.excluded_by_design) = esperado=\(.expected) · restaurado=\(.restored) (diff \(.diff))"' "$WORK/report.json"
 jq -r '"  exclusões: tombstones=\(.exclusions.tombstones) órfãos=\(.exclusions.orphans) arestas-sem-alvo=\(.exclusions.dangling_dependencies) comentários-idênticos-fundidos=\(.exclusions.duplicate_comments_collapsed)"' "$WORK/report.json"
 jq -r 'if (.unmapped_columns|length) > 0 then "  colunas não recebidas pelo importer (linhas com valor): \(.unmapped_columns)" else empty end' "$WORK/report.json"
 jq -r '.problems[]? | "  PROBLEMA: \(.)"' "$WORK/report.json"
-SUMMARY="db=$DB import_s=$IMPORT_S import_mb=$(( IMPORT_BYTES / 1048576 )) store_mb=${STORE_MB:-?} $(jq -r '[.table[] | "\(.table)=\(.restored)/\(.expected)"] | join(" ")' "$WORK/report.json") dup_comments=$(jq -r '.exclusions.duplicate_comments_collapsed' "$WORK/report.json")"
+SUMMARY="db=$DB import_s=$IMPORT_S import_mb=$(( IMPORT_BYTES / 1048576 )) store_mb=${STORE_MB:-?} $(jq -r '[.table[] | "\(.table)=\(.restored)/\(.expected)"] | join(" ")' "$WORK/report.json") dup_comments=$(jq -r '.exclusions.duplicate_comments_collapsed' "$WORK/report.json") manifest_checked=$(jq -r '.manifest_checked | tostring' "$WORK/report.json")"
 if [ $rrc -eq 0 ]; then
   echo "RESULT: OK $SUMMARY"
   exit 0
