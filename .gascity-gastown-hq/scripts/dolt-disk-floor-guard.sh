@@ -112,10 +112,12 @@
 #                             this bead's own incident actually reached
 #                             (avail as low as 1GB), not every routine WARN dip.
 #
-#   CRITICAL_GB (default 3) — FIRST (before the photo and the levers) a `gc session
+#   CRITICAL_GB (default 3) — FIRST (started before the photo and the levers, but in
+#                             the BACKGROUND, so they never wait on it) a `gc session
 #                             nudge` to every ACTIVE dog/wa-worker/ps-worker/gate-
 #                             reviewer session: stop heavy steps now (ga-vln2py,
-#                             _nudge_pool_heavy_stop; 15-min cooldown; crews are
+#                             _nudge_pool_heavy_stop; 60 s total budget, per-target
+#                             15-min cooldown — ga-xdj2si; crews are
 #                             not nudged); then same reclaim attempts + notify ALWAYS (cooldown
 #                             bypassed unconditionally — this is the last rung
 #                             before repeating ga-vs55) + a DURABLE mail to the
@@ -2972,39 +2974,78 @@ _resurrect_dolt() {
 # ran with the disk already low and filled it; this guard only cleaned caches AFTER the fact and told the Athos
 # and the Mayor, never the sessions that were doing it. This lever is the missing "stop now": one `gc session
 # nudge` to every ACTIVE session of the pool templates in POOL_NUDGE_TEMPLATES (default dog, wa-worker, ps-worker,
-# gate-reviewer; crews are NOT nudged — a person may be attached). Default delivery (wait-idle): the text reaches
-# the session at its next idle moment, so it cannot interrupt a step already running, but it does stop the NEXT
-# heavy step. Detection-and-tell only: nothing is killed, and a step that starts anyway is not refused by this lever.
-#   - COOLDOWN (POOL_NUDGE_COOLDOWN_SECS, 900): a CRITICAL episode lasts many 5-min cycles; the same text every
-#     cycle would be noise a session learns to ignore. The stamp is written only when at least one nudge landed.
+# gate-reviewer; crews are NOT nudged — a person may be attached). Default delivery (wait-idle): the text is typed
+# into the session at its next idle moment. It only ASKS: it cannot interrupt a step that is already running, and a
+# session that ignores it, or starts a heavy step anyway, is not stopped by this lever. Detection-and-tell only:
+# nothing is killed and nothing is refused.
+#   - NEVER HOLDS THE CYCLE (ga-xdj2si). Measured with the real gc at load ~55: one nudge takes 13-41 s, so a serial
+#     loop over ~7 sessions held the CRITICAL notify, the Mayor mail and the reclaim levers back ~2 min, exactly when the
+#     disk is under 6 GB. The whole phase (session list + every nudge) therefore runs in a BACKGROUND subshell
+#     (_pool_nudge_phase), started where the foreground call used to be (the sessions are still told first, concurrently
+#     with the levers); main() joins it at the very end (_pool_nudge_join) so launchd never reaps an orphan. Both the
+#     phase and the join are bounded:
+#       * TOTAL BUDGET (POOL_NUDGE_BUDGET_SECS, 60) for list + nudges together; a nudge never gets more than what is
+#         left of it. The targets the budget did not reach are COUNTED in the summary line ("not reached (budget) N") and
+#         warned about, and left unstamped, so they go first next cycle (they are not named one by one on the log).
+#       * JOIN CAP (POOL_NUDGE_JOIN_SLACK_SECS, 10) past the budget: a phase still running then is killed and logged.
+#       * PER-NUDGE TIMEOUT (POOL_NUDGE_TIMEOUT_SECS, 15).
+#   - PER-TARGET COOLDOWN (POOL_NUDGE_COOLDOWN_SECS, 900): a CRITICAL episode lasts many 5-min cycles; the same text
+#     every cycle would be noise a session learns to ignore. The stamp is one file PER TARGET, written only when THAT
+#     target's nudge came back rc 0 - so a target that failed, timed out or was not reached keeps no stamp and is
+#     retried next cycle, while the ones already told keep their cooldown.
+#   - FOUR OUTCOMES per nudge, never folded together: told (rc 0, stamped) / delivery unknown (the timeout hit - in
+#     --delivery queue mode the text may well have arrived, so it is neither "failed" nor "told"; not stamped, so it is
+#     repeated next cycle: a repeated notice is noise, a muted one is the lever not working) / failed (any other rc) /
+#     not reached (budget).
 #   - THREE STATES for "who is there to tell": the list could not be read (gc failed/timed out, not JSON, ok=false)
-#     -> log it, send nothing, leave the stamp alone so the next cycle retries; read and EMPTY -> log "none";
-#     read and not empty -> nudge each. A failed list is never the same as "no pool sessions".
-#   - DOLT_DISK_FLOOR_POOL_NUDGE=0 switches it off (never in prod).
+#     -> log it, send nothing, stamp nothing so the next cycle retries; read and EMPTY -> log "none"; read and not
+#     empty -> nudge each. A failed list is never the same as "no pool sessions".
+#   - DOLT_DISK_FLOOR_POOL_NUDGE=0 (any value but 1) switches it off (never in prod) and logs "pool-nudge SKIP".
 POOL_NUDGE_ENABLED="${DOLT_DISK_FLOOR_POOL_NUDGE:-1}"
 POOL_NUDGE_COOLDOWN_SECS="${DOLT_DISK_FLOOR_POOL_NUDGE_COOLDOWN_SECS:-900}"
 case "$POOL_NUDGE_COOLDOWN_SECS" in ''|*[!0-9]*) POOL_NUDGE_COOLDOWN_SECS=900 ;; esac
+# a 0 or non-numeric budget/timeout/slack would mean "no limit" to `timeout` or "never wait" to the join: both fall back to the default
+POOL_NUDGE_BUDGET_SECS="${DOLT_DISK_FLOOR_POOL_NUDGE_BUDGET_SECS:-60}"
+case "$POOL_NUDGE_BUDGET_SECS" in ''|*[!0-9]*|0) POOL_NUDGE_BUDGET_SECS=60 ;; esac
+POOL_NUDGE_TIMEOUT_SECS="${DOLT_DISK_FLOOR_POOL_NUDGE_TIMEOUT_SECS:-15}"
+case "$POOL_NUDGE_TIMEOUT_SECS" in ''|*[!0-9]*|0) POOL_NUDGE_TIMEOUT_SECS=15 ;; esac
+POOL_NUDGE_JOIN_SLACK_SECS="${DOLT_DISK_FLOOR_POOL_NUDGE_JOIN_SLACK_SECS:-10}"
+case "$POOL_NUDGE_JOIN_SLACK_SECS" in ''|*[!0-9]*|0) POOL_NUDGE_JOIN_SLACK_SECS=10 ;; esac
 POOL_NUDGE_TEMPLATES="${DOLT_DISK_FLOOR_POOL_NUDGE_TEMPLATES:-gastown.dog wa-worker ps-worker gate-reviewer}"
-STATE_POOL_NUDGE_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-pool-nudge"
+STATE_POOL_NUDGE_DIR="$STATE_DIR/.dolt-disk-floor-guard.pool-nudge.d"
+_POOL_NUDGE_PID=""
+_POOL_NUDGE_DEADLINE=""
 
-_nudge_pool_heavy_stop() {
-  local avail="$1" now="$2" last list targets target msg sent=0 failed=0
-  [ "$POOL_NUDGE_ENABLED" = "1" ] || return 0
-  # vazio (no stamp yet) -> go; ilegível (not a number) -> go too: a broken stamp must never mute the stop-now notice
-  last="$(cat "$STATE_POOL_NUDGE_FILE" 2>/dev/null)" || last=""
-  if ! _cooldown_elapsed "$last" "$now" "$POOL_NUDGE_COOLDOWN_SECS"; then
-    log "pool nudge: last sent at epoch ${last}, inside the ${POOL_NUDGE_COOLDOWN_SECS}s cooldown - not repeating the stop-heavy-steps notice this cycle (ga-vln2py)"
+# _pool_nudge_stamp_file <target> -> path of that target's cooldown stamp. The name is the alias made filename-safe
+# PLUS a checksum of the raw alias, so two aliases that differ only in characters the filter rewrote (a/b vs a_b)
+# never share a stamp: a shared stamp would mute a session that was never told.
+_pool_nudge_stamp_file() {
+  local safe key
+  safe="$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+  key="$(printf '%s' "$1" | cksum | awk '{print $1}')"
+  printf '%s/%s.%s' "$STATE_POOL_NUDGE_DIR" "$safe" "$key"
+}
+
+# _pool_nudge_phase <avail> <now_epoch> <deadline_epoch> — the work, meant to run in a background subshell: it only
+# logs and writes stamps (nothing it sets is visible to main()).
+_pool_nudge_phase() {
+  local avail="$1" now="$2" deadline="$3" list targets target msg stamp last remaining t rc
+  local sent=0 failed=0 unknown=0 cooled=0 unreached=0 total=0
+  remaining=$(( deadline - $(date +%s) ))
+  t=20; [ "$remaining" -lt "$t" ] && t="$remaining"
+  if [ "$t" -lt 1 ]; then
+    log "WARN pool nudge: the ${POOL_NUDGE_BUDGET_SECS}s budget was gone before the session list was asked for - NOBODY was told to stop heavy steps this cycle; retrying next cycle (ga-xdj2si)"
     return 0
   fi
-  # vazio -> "none" below; falhou/ilegível (gc failed or hung, not JSON, ok=false) -> logged, nobody nudged, stamp untouched
+  # vazio -> "none" below; falhou/ilegível (gc failed or hung, not JSON, ok=false) -> logged, nobody nudged, no stamp
   # (`.ok != false`, not `.ok // true`: jq's // reads false as absent and would turn ok=false into healthy)
-  list="$(timeout 20 "$GC" session list --json 2>/dev/null)" || list=""
+  list="$(timeout -k 2 "$t" "$GC" session list --json 2>/dev/null </dev/null)" || list=""
   if ! printf '%s' "$list" | jq -e '(.ok != false) and ((.sessions // []) | type == "array")' >/dev/null 2>&1; then
     log "WARN pool nudge: could not read the session list (gc session list failed, timed out or answered something that is not a session list) - NOBODY was told to stop heavy steps this cycle; retrying next cycle (ga-vln2py)"
     return 0
   fi
-  # vazio -> "none" (just below); falhou/ilegível (jq died on a list it had just validated) -> logged, nobody nudged, stamp
-  # untouched - a jq failure is never the same as "no pool session is active"
+  # vazio -> "none" (just below); falhou/ilegível (jq died on a list it had just validated) -> logged, nobody nudged, no stamp
+  # - a jq failure is never the same as "no pool session is active"
   targets="$(printf '%s' "$list" | jq -r --arg tpls "$POOL_NUDGE_TEMPLATES" '($tpls | split(" ") | map(select(length > 0))) as $t | (.sessions // [])[] | select(.state == "active") | select(.template as $x | $t | index($x) != null) | (.alias // .id // empty)' 2>/dev/null)" || {
     log "WARN pool nudge: could not pick the active pool sessions out of the session list (jq failed) - NOBODY was told to stop heavy steps this cycle; retrying next cycle (ga-vln2py)"
     return 0
@@ -3016,24 +3057,84 @@ _nudge_pool_heavy_stop() {
   msg="DISK CRITICAL on the mini (${avail} GB free, floor ${FLOOR_CRITICAL_GB} GB): stop any HEAVY step now - go build/test, golangci-lint, git repack/gc, a selftest that builds fixtures or copies a database - and do not start another until the disk recovers. Light work (reading, editing, small commands) is fine. On 17/10 steps like these filled the disk and Dolt took ENOSPC (ga-vln2py). This is an automatic notice from dolt-disk-floor-guard, not a request from the Athos."
   while IFS= read -r target; do
     [ -n "$target" ] || continue
-    if timeout 15 "$GC" session nudge "$target" "$msg" >/dev/null 2>&1; then
+    total=$((total + 1))
+    stamp="$(_pool_nudge_stamp_file "$target")"
+    # vazio (no stamp for this target) -> go; ilegível (not a number) -> go too: a broken stamp must never mute the stop-now notice
+    last="$(cat "$stamp" 2>/dev/null)" || last=""
+    if ! _cooldown_elapsed "$last" "$now" "$POOL_NUDGE_COOLDOWN_SECS"; then
+      cooled=$((cooled + 1))
+      log "pool nudge: ${target} was told at epoch ${last}, inside the ${POOL_NUDGE_COOLDOWN_SECS}s cooldown - not repeating the notice to it this cycle (ga-vln2py)"
+      continue
+    fi
+    remaining=$(( deadline - $(date +%s) ))
+    if [ "$remaining" -lt 1 ]; then
+      unreached=$((unreached + 1))
+      continue
+    fi
+    t="$POOL_NUDGE_TIMEOUT_SECS"; [ "$remaining" -lt "$t" ] && t="$remaining"
+    # </dev/null: the loop's own input is the target list - a gc that read stdin would swallow the targets still to come
+    timeout -k 2 "$t" "$GC" session nudge "$target" "$msg" >/dev/null 2>&1 </dev/null
+    rc=$?
+    if [ "$rc" = "0" ]; then
       sent=$((sent + 1))
+      mkdir -p "$STATE_POOL_NUDGE_DIR" 2>/dev/null || true
+      printf '%s' "$now" > "$stamp" 2>/dev/null || log "WARN pool nudge: could not write the cooldown stamp ${stamp} - ${target} will be nudged again next cycle"
+    elif [ "$rc" = "124" ] || [ "$rc" = "137" ]; then
+      unknown=$((unknown + 1))
+      log "WARN pool nudge: the nudge to ${target} hit its ${t}s timeout - delivery unknown (the text may have been queued); not stamped, so it is repeated next cycle (ga-xdj2si)"
     else
       failed=$((failed + 1))
-      log "WARN pool nudge: could not nudge ${target} (gc session nudge failed or timed out) (ga-vln2py)"
+      log "WARN pool nudge: could not nudge ${target} (gc session nudge failed, rc=${rc}) (ga-vln2py)"
     fi
   done <<EOF
 $targets
 EOF
-  log "pool nudge: told ${sent} active pool session(s) to stop heavy steps (${failed} failed; avail=${avail}GB) (ga-vln2py)"
-  if [ "$sent" -gt 0 ]; then
-    mkdir -p "$STATE_DIR" 2>/dev/null || true
-    printf '%s' "$now" > "$STATE_POOL_NUDGE_FILE" 2>/dev/null || log "WARN pool nudge: could not write the cooldown stamp ${STATE_POOL_NUDGE_FILE} - the next cycle will nudge again"
-  fi
+  log "pool nudge: told ${sent}, delivery unknown ${unknown}, failed ${failed}, in cooldown ${cooled}, not reached (budget) ${unreached} - of ${total} active pool session(s) to stop heavy steps; avail=${avail}GB (ga-vln2py)"
+  [ "$unreached" -gt 0 ] && log "WARN pool nudge: the ${POOL_NUDGE_BUDGET_SECS}s budget ran out with ${unreached} session(s) not reached - they have no stamp and go first next cycle (ga-xdj2si)"
+  # a stamp older than a day can never matter again (the cooldown is minutes); keep the directory from growing with every alias ever seen
+  find "$STATE_POOL_NUDGE_DIR" -type f -mtime +1 -delete 2>/dev/null || true
   return 0
 }
 
-main() {
+# _nudge_pool_heavy_stop <avail> <now_epoch> — starts the phase in the BACKGROUND and returns at once (see the lever
+# header: the CRITICAL notify/mail/reclaim must never wait on a slow `gc`). Pair it with _pool_nudge_join.
+_nudge_pool_heavy_stop() {
+  local avail="$1" now="$2" deadline
+  if [ "$POOL_NUDGE_ENABLED" != "1" ]; then
+    log "pool-nudge SKIP — DOLT_DISK_FLOOR_POOL_NUDGE=${POOL_NUDGE_ENABLED} (not 1: the stop-heavy-steps notice is off) (ga-xdj2si)"
+    return 0
+  fi
+  deadline=$(( $(date +%s) + POOL_NUDGE_BUDGET_SECS ))
+  _POOL_NUDGE_DEADLINE="$deadline"
+  _pool_nudge_phase "$avail" "$now" "$deadline" >/dev/null 2>&1 </dev/null &
+  _POOL_NUDGE_PID=$!
+  return 0
+}
+
+# _pool_nudge_join — the end of the cycle waits for the background phase, but only as long as its own budget plus the
+# slack: a phase still alive then is killed and logged (the cycle must end, not hang on a lever that is only a notice).
+# A join with nothing started is a no-op. Always succeeds.
+_pool_nudge_join() {
+  local pid="$_POOL_NUDGE_PID" hard
+  _POOL_NUDGE_PID=""
+  # vazio (nothing was started: kill switch, no CRITICAL, no fork) -> nothing to wait for; ilegível (not a plain pid >= 2)
+  # -> nothing is waited on AND nothing is killed: `kill -0 0` signals this whole process group and always succeeds, so a
+  # stray 0 or 1 would loop to the cap and then `kill` the group - a join must never be able to do that
+  case "$pid" in ''|*[!0-9]*|0|1) return 0 ;; esac
+  hard=$(( ${_POOL_NUDGE_DEADLINE:-0} + POOL_NUDGE_JOIN_SLACK_SECS ))
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$(date +%s)" -ge "$hard" ]; then
+      log "WARN pool nudge: the nudge phase (pid ${pid}) is still running ${POOL_NUDGE_JOIN_SLACK_SECS}s past its ${POOL_NUDGE_BUDGET_SECS}s budget - killing it; the cycle does not wait for it (ga-xdj2si)"
+      kill "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 0.2
+  done
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
+_main_cycle() {
   local avail class now
 
   # UNLIKE the other three levers below, this runs UNCONDITIONALLY, before
@@ -3109,8 +3210,10 @@ main() {
   local was_critical=0
   [ "$class" = "CRITICAL" ] && was_critical=1
 
-  # ga-vln2py: tell the active pool sessions to stop heavy steps FIRST - before the growth photo and the reclaim
-  # levers below, which take time while a session may be about to start the step that fills the rest of the disk.
+  # ga-vln2py: START telling the active pool sessions to stop heavy steps FIRST - before the growth photo and the
+  # reclaim levers below, which take time while a session may be about to start the step that fills the rest of the
+  # disk. ga-xdj2si: the telling runs in the BACKGROUND (one nudge takes 13-41 s on a loaded mini), so this call returns
+  # at once and the notify/mail/levers below leave when they always did; main() joins the phase at the end of the cycle.
   # Keyed off the PRE-reclaim reading (was_critical) like the notify below; a reclaim that recovers the disk
   # afterwards does not take the notice back, it expires with the cooldown. Never aborts the cycle.
   if [ "$was_critical" = "1" ]; then
@@ -3353,6 +3456,15 @@ ${growth_txt}"
     fi
     _write_state "$now" "$avail"
   fi
+}
+
+# ga-xdj2si: the pool-nudge phase runs in the background from the CRITICAL branch of _main_cycle; whatever way the
+# cycle ends (one of its several early returns, or its end), the join runs here, once, and the exit code is the cycle's.
+main() {
+  _main_cycle "$@"
+  local rc=$?
+  _pool_nudge_join
+  return "$rc"
 }
 
 # ── run unless sourced as a library (selftest sources with DOLT_DISK_FLOOR_GUARD_LIB=1) ──

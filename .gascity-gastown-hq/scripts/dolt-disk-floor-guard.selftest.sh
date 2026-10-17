@@ -17,6 +17,10 @@ export DOLT_DISK_FLOOR_GUARD_LOG="/tmp/dolt-disk-floor-guard-selftest-$$.log"
 # shellcheck disable=SC1090
 . "$SCRIPT"
 
+# ga-xdj2si: the main()-wiring scenarios further down STUB _nudge_pool_heavy_stop (so they stay fast and send nothing);
+# the timing scenario N5 needs the REAL one back, so its definition is kept here, before any stub replaces it.
+REAL_NUDGE_FN="$(declare -f _nudge_pool_heavy_stop)"
+
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -2965,6 +2969,10 @@ STATE_CRITICAL_SUSTAIN_FILE="$STATE_TMP/.critical-sustain-count"
 STATE_LAST_MAIL_EPOCH_FILE="$STATE_TMP/.last-mail-epoch"
 STATE_LAST_MAIL_AVAIL_FILE="$STATE_TMP/.last-mail-avail-gb"
 STATE_CRITICAL_EPISODE_MAILED_FILE="$STATE_TMP/.critical-episode-mailed"
+# ga-xdj2si: same MUST-redirect trap. The per-target cooldown stamps of the pool nudge live in a directory that is
+# evaluated at SOURCE time against the real $STATE_DIR; scenario N5 runs the REAL nudge phase, which writes one stamp
+# per target told - without this line it would mute the real sessions' next stop-heavy-steps notice for 15 minutes.
+STATE_POOL_NUDGE_DIR="$STATE_TMP/.pool-nudge.d"
 
 # Canned avail-GB readings: main() calls _avail_gb exactly twice per cycle
 # (pre-reclaim, then post-reclaim), both via `$(...)` command substitution —
@@ -3169,6 +3177,8 @@ _reap_bloated_backup_staging() { REAP_BACKUP_STAGING_CALLS=$((REAP_BACKUP_STAGIN
 # _nudge_pool_heavy_stop is new (ga-vln2py), same reasoning as the reap stubs above: EXECUTION code (a real
 # `gc session list` + `gc session nudge` per pool session, proven in isolation by
 # dolt-disk-floor-guard.pool-nudge.selftest.sh with a fake gc) stubbed here so main()'s WIRING is what gets proven.
+# Scenario N5 (the last of the N group) swaps the REAL one back in for a moment to prove the TIMING: a slow gc must not
+# delay the CRITICAL notify or the Mayor mail.
 # The stub snapshots how far the cycle had got AT CALL TIME (no scratch reap, no growth photo yet: the sessions are
 # told FIRST) and the pre-reclaim avail main() passed; NUDGE_RC drives its return code (a failing nudge must never
 # abort the cycle).
@@ -3917,6 +3927,78 @@ else
 fi
 grep -q "_nudge_pool_heavy_stop failed (non-fatal)" "$LOG" && ok "main(): …and the failure is on the log" || bad "main(): the nudge failure left no line on the log"
 NUDGE_RC=0
+
+# Scenario N5 (ga-xdj2si, acceptance) — the REAL nudge phase with a SLOW gc must not hold back the CRITICAL notify or
+# the Mayor mail. Same CRITICAL cycle twice: once with the nudge off (the baseline: how early notify/mail leave when
+# the phase costs nothing), once with the phase on and every nudge taking N5_NUDGE_SECS. Both are measured as an
+# OFFSET from the start of their own cycle, so a loaded machine moves them together. Against the guard before the fix
+# (serial, in the foreground, no total budget) the slow run's notify leaves after every nudge, and this fails.
+echo ""
+echo "=== main(): a slow gc in the pool-nudge phase does not delay the CRITICAL notify or the Mayor mail (ga-xdj2si) ==="
+N5_DIR="$STATE_TMP/n5"; mkdir -p "$N5_DIR"
+cat > "$N5_DIR/list.json" <<'EOF'
+{"ok":true,"sessions":[
+ {"alias":"gastown.dog-1","template":"gastown.dog","state":"active"},
+ {"alias":"gastown.dog-2","template":"gastown.dog","state":"active"},
+ {"alias":"wa-worker-a","template":"wa-worker","state":"active"},
+ {"alias":"wa-worker-b","template":"wa-worker","state":"active"},
+ {"alias":"ps-worker-a","template":"ps-worker","state":"active"},
+ {"alias":"ps-worker-b","template":"ps-worker","state":"active"},
+ {"alias":"gate-reviewer-a","template":"gate-reviewer","state":"active"}
+]}
+EOF
+cat > "$N5_DIR/gc" <<'SH'
+#!/bin/sh
+# fake gc for N5: every call is stamped with its second; `session list` answers 7 ACTIVE pool sessions; every
+# `session nudge` takes $N5_NUDGE_SECS; `mail send` records the second the Mayor mail left.
+echo "$(date +%s) $*" >> "$N5_DIR/calls"
+case "$1 $2" in
+  "session list") cat "$N5_DIR/list.json" ;;
+  "session nudge") sleep "$N5_NUDGE_SECS" ;;
+  "mail send") date +%s >> "$N5_DIR/mail.t" ;;
+esac
+exit 0
+SH
+chmod +x "$N5_DIR/gc"
+export N5_DIR N5_NUDGE_SECS=4
+N5_NOTIFY_T=""
+n5_notify() { N5_NOTIFY_T="$(date +%s)"; record_notify "$@"; }
+# n5_cycle <1|0> — one CRITICAL cycle (sustain already 1, so it confirms and mails) with the nudge phase on or off;
+# leaves N5_T0/N5_T1 (cycle start/end), N5_NOTIFY_T and N5_MAIL_T (the second each left) behind.
+n5_cycle() {
+  reset_capture; seed_state "" ""; seed_critical_sustain 1
+  : > "$N5_DIR/calls"; : > "$N5_DIR/mail.t"; rm -f "$STATE_POOL_NUDGE_DIR"/* 2>/dev/null
+  N5_NOTIFY_T=""; POOL_NUDGE_ENABLED="$1"; queue_avail 2 2
+  N5_T0=$(date +%s); main; N5_T1=$(date +%s)
+  N5_MAIL_T="$(tail -n 1 "$N5_DIR/mail.t")"
+}
+n5_abs() { echo $(( $1 < 0 ? -$1 : $1 )); }
+N5_STUB_FN="$(declare -f _nudge_pool_heavy_stop)"; N5_GC="$GC"; N5_NOTIFY="$NOTIFY"
+eval "$REAL_NUDGE_FN"; GC="$N5_DIR/gc"; NOTIFY=n5_notify; POOL_NUDGE_BUDGET_SECS=8
+n5_cycle 0; n5_base_n="$N5_NOTIFY_T"; n5_base_m="$N5_MAIL_T"; n5_base_t0="$N5_T0"; n5_base_calls="$(grep -c 'session nudge' "$N5_DIR/calls")"
+n5_cycle 1; n5_calls="$(grep -c 'session nudge' "$N5_DIR/calls")"
+eval "$N5_STUB_FN"; GC="$N5_GC"; NOTIFY="$N5_NOTIFY"; POOL_NUDGE_BUDGET_SECS=60; POOL_NUDGE_ENABLED=1
+case "$n5_base_n$n5_base_m$N5_NOTIFY_T$N5_MAIL_T" in
+  *[!0-9]*|'') bad "main(): N5 did not see a notify and a Mayor mail in both cycles (baseline notify='$n5_base_n' mail='$n5_base_m'; slow notify='$N5_NOTIFY_T' mail='$N5_MAIL_T') - the timing below would prove nothing" ;;
+  *)
+    d_n="$(n5_abs $(( (N5_NOTIFY_T - N5_T0) - (n5_base_n - n5_base_t0) )))"; d_m="$(n5_abs $(( (N5_MAIL_T - N5_T0) - (n5_base_m - n5_base_t0) )))"
+    if [ "$d_n" -le 2 ] && [ "$d_m" -le 2 ]; then
+      ok "main(): with a gc that takes ${N5_NUDGE_SECS} s per nudge and 7 active pool sessions, the CRITICAL notify and the Mayor mail leave within 2 s of the no-nudge baseline (off by ${d_n} s / ${d_m} s)"
+    else
+      bad "main(): the slow nudge phase delayed the CRITICAL path (notify off by ${d_n} s, Mayor mail off by ${d_m} s against the no-nudge baseline)"
+    fi ;;
+esac
+if [ "$n5_base_calls" = "0" ] && [ "$n5_calls" -ge 1 ] && [ $((N5_T1 - N5_T0)) -ge "$N5_NUDGE_SECS" ]; then
+  ok "main(): …and the phase really ran in that window (baseline made no nudge, the slow cycle made ${n5_calls}, the cycle lasted $((N5_T1 - N5_T0)) s) - the timing above is not vacuous"
+else
+  bad "main(): N5's slow cycle did not exercise the nudge phase (baseline nudges=$n5_base_calls, slow nudges=$n5_calls, cycle lasted $((N5_T1 - N5_T0)) s)"
+fi
+# the cycle ends by joining the phase: bounded by the 8 s budget + the 10 s join slack (+ a few s of load), never the 7 x 4 s a serial loop needs
+if [ $((N5_T1 - N5_T0)) -le 22 ] && [ "$n5_calls" -lt 7 ]; then
+  ok "main(): …and the phase is bounded by its total budget: ${n5_calls} of 7 nudges started, the cycle ended after $((N5_T1 - N5_T0)) s"
+else
+  bad "main(): the nudge phase was not cut by its budget (${n5_calls} of 7 nudges started, the cycle lasted $((N5_T1 - N5_T0)) s)"
+fi
 
 rm -rf "$STATE_TMP"
 
