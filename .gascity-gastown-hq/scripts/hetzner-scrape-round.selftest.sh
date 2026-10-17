@@ -80,7 +80,9 @@ exec "$@"
 EOF
 cat > "$T/nodebin/timeout" <<'EOF'
 #!/bin/bash
+echo "$*" >> "$HOME/timeout-args.txt"
 [ -z "${FAKE_TIMEOUT:-}" ] || exit 124
+[ "${1:-}" != -k ] || shift 2
 shift; exec "$@"
 EOF
 cat > "$T/nodebin/df" <<'EOF'
@@ -98,6 +100,7 @@ for side in mini node; do
   cat > "$d/curl" <<EOF
 #!/bin/bash
 out=""; url=""
+[ $side = mini ] && [ -n "\${FAKE_MINI_DOWN:-}" ] && { echo "000 0"; exit 0; }
 while [ \$# -gt 0 ]; do case \$1 in -o) out=\$2; shift 2;; -w|-m|-A|-H) shift 2;; -*) shift;; *) url=\$1; shift;; esac; done
 line=\$(grep -F -m1 "\$url " "$T/curl.$side" 2>/dev/null)
 set -- \$line
@@ -117,6 +120,7 @@ printf '%s\n' "$*" > "$HOME/args-last.txt"
 ( cd shared/config 2>/dev/null && find . -type f | sort ) > "$HOME/seen-state.txt"
 mkdir -p "shared/data/$sc/2026-01-01_00h00m00s" shared/config
 [ -n "${FAKE_SCRAPER_EMPTY:-}" ] || echo '{"id":1}' > "shared/data/$sc/2026-01-01_00h00m00s/a.json"
+[ -z "${FAKE_BIG:-}" ] || dd if=/dev/null of="shared/data/$sc/2026-01-01_00h00m00s/big.bin" bs=1 count=0 seek=629145600 2>/dev/null   # 600 MB esparso (> --max-size)
 echo '{"seen":["new"]}' > "shared/config/seen_$sc.json"
 echo "RESULT: 1 scraped"
 [ -z "${FAKE_SCRAPER_HANG:-}" ] || sleep 4
@@ -172,6 +176,9 @@ hsr -- eligible 'a;b';                check "eligible: nome com metacaractere é
 hsr -- eligible;                      check "eligible sem argumento: rc 97" '[ $RC -eq 97 ]'
 hsr HETZNER_SCRAPE_ELIGIBLE="$T/nao-existe" -- eligible alpha; check "eligible: lista ilegível -> UNREADABLE, rc 97 (falha fechada)" '[ $RC -eq 97 ] && has "UNREADABLE"'
 hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.crlf" -- eligible alpha; check "eligible: lista com CRLF ainda permite" '[ $RC -eq 0 ]'
+# o tenant pedido passa pela MESMA validação do run: a lista é normalizada (T9 = t9) e o pedido não, então 'T9' ou 't9 ' liberava onde o run recusa
+for t in T9 "t9 " " t9" "" "t9;x"; do hsr -- eligible delta "$t"; check "eligible delta '$t' -> 97 'tenant inválido' (nunca ALLOW: o bloqueio de t9 não casaria)" '[ $RC -eq 97 ] && has "tenant inválido" && ! has "^ALLOW"'; done
+hsr -- eligible delta t1 extra;       check "eligible: argumento sobrando -> 97 (não ignorado em silêncio)" '[ $RC -eq 97 ] && has "argumentos demais"'
 
 # ---------- 3. check ----------
 hsr -- check;                         check "check: nó pronto -> rc 0, node_env=ok" '[ $RC -eq 0 ] && has "^node_env=ok$" && has "^flag=on$" && has "^eligible_entries=3$"'
@@ -184,7 +191,12 @@ mv "$NODEHOME/gt-remote/scrape/env/libpath.txt" "$T/libpath.keep"
 hsr -- check;                         check "check: ambiente sem libpath -> rc 98 e manda rodar bootstrap" '[ $RC -eq 98 ] && has "node_env=missing" && has "bootstrap"'
 mv "$T/libpath.keep" "$NODEHOME/gt-remote/scrape/env/libpath.txt"
 hsr HETZNER_SCRAPE_CODE="$T/nao-existe" -- check;      check "check: código do rig ausente -> 97, não 'pronto' (o run recusaria)" '[ $RC -eq 97 ] && has "^code_dir=ausente$" && has "código do rig ausente"'
-hsr HETZNER_SCRAPE_ELIGIBLE="$T/nao-existe" -- check;  check "check: lista de elegíveis ilegível -> 97, não 'pronto'" '[ $RC -eq 97 ] && has "^eligible_entries=0$" && has "ilegível"'
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/nao-existe" -- check;  check "check: lista de elegíveis ilegível -> 97, não 'pronto'" '[ $RC -eq 97 ] && has "^eligible_entries=ilegivel$" && has "ilegível"'
+# a mesma lista malformada: o run recusa (97), então o check tem de dizer 97 com a linha — não "pronto" com a linha contada como entrada
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.malformed" -- check;  check "check: linha malformada na lista -> 97 com a linha, eligible_entries=ilegivel (não 'pronto')" '[ $RC -eq 97 ] && has "^eligible_entries=ilegivel$" && has "alpha beta" && has "o run recusaria"'
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.malformed" -- run alpha;  check "run: a mesma lista malformada também é recusada (97), é o que o check anuncia" '[ $RC -eq 97 ] && has "ilegível"'
+printf '# só comentário\n' > "$T/eligible.vazia"
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.vazia" -- check;      check "check: lista legível mas sem nenhum permitido -> 97 'sem nenhum permitido' (≠ ilegível)" '[ $RC -eq 97 ] && has "^eligible_entries=0$" && has "sem nenhum permitido"'
 
 # ---------- 4. run: recusas (nenhuma toca o nó) ----------
 C0=$(ncalls)
@@ -239,6 +251,12 @@ check "run: a produção (shared/) ficou byte a byte igual" '[ "$(tree_sum "$SHA
 check "run: a pasta da rodada no nó foi apagada" '[ -z "$(ls -A "$NODEHOME/gt-remote/scrape/runs")" ]'
 check "run: uma linha no log jsonl com rc 0 e o raspador" 'tail -n 1 "$CITY/.gc/logs/hetzner-scrape.jsonl" | grep -q "\"scraper\":\"alpha\".*\"rc\":0"'
 hsr -- run alpha --stage "$T/stage2"; check "run sem --tenant/--limit também funciona (args vazios)" '[ $RC -eq 0 ]'
+check "run: o raspador roda sob \`timeout -k 30\` (um raspador que ignora o SIGTERM é morto, e o rc 124/137 é escrito)" 'grep -q -- "^-k 30 " "$NODEHOME/timeout-args.txt"'
+# --stage é texto livre: aspas/barra/controle no caminho não podem quebrar a linha do jsonl; e log que não grava avisa
+last_json() { tail -n 1 "$CITY/.gc/logs/hetzner-scrape.jsonl" | python3 -I -c 'import json,sys; json.loads(sys.stdin.read())'; }; ESC='st\"q'   # ESC = o pedaço do caminho como deve aparecer ESCAPADO na linha
+hsr -- run alpha --stage "$T/st\"q"; check "run: --stage com aspas -> a linha do jsonl continua JSON válido, com o caminho escapado" '[ $RC -eq 0 ] && last_json && tail -n 1 "$CITY/.gc/logs/hetzner-scrape.jsonl" | grep -F -q -- "$ESC"'
+hsr FAKE_BIG=1 -- run alpha --stage "$T/stage-big"; check "run: arquivo > 500 MB que o --max-size do rsync pulou -> a pasta da rodada FICA no nó e o AVISO diz por quê (não é apagada em silêncio)" '[ $RC -eq 0 ] && has "AVISO: a pasta da rodada no nó não foi apagada" && has "500 MB" && [ -n "$(ls -A "$NODEHOME/gt-remote/scrape/runs")" ] && [ ! -e "$T"/stage-big/alpha-*/shared/data/alpha/*/big.bin ]'; find "$NODEHOME/gt-remote/scrape/runs" -mindepth 1 -delete
+hsr HETZNER_SCRAPE_LOG="$T/eligible.crlf/x.jsonl" -- run alpha --stage "$T/stage-semlog"; check "run: log que não grava (pai é um arquivo) -> AVISO, a rodada em si segue (rc 0)" '[ $RC -eq 0 ] && has "AVISO: não consegui gravar a linha desta rodada"'
 
 # ---------- 6. run: código de saída do raspador ----------
 hsr FAKE_SCRAPER_RC=3 -- run alpha --stage "$T/stage3"
@@ -296,6 +314,10 @@ check "probe: 403 dos dois lados -> IGUAL-FALHA; mini falha e nó responde -> SO
 check "probe: tenant inativo não é medido; --out grava a tabela; jsonl ganha a linha do probe" '! has "t2.example" && grep -q "site-a.example" "$T/probe.out" && grep -q "\"scraper\":\"probe\"" "$CITY/.gc/logs/hetzner-scrape.jsonl"'
 hsr -- probe --out "$T/sem-pasta/x.out"; check "probe: --out que não dá para gravar -> 97 (a tabela ainda sai no stdout)" '[ $RC -eq 97 ] && has "não consegui gravar --out" && has "IGUAL-OK"'
 hsr FAKE_SSH_DOWN=1 -- probe;         check "probe: nó fora -> rc 98" '[ $RC -eq 98 ]'
+# a tabela decide a lista de elegíveis: sem runner.py/tenants legíveis as APIs fixas SOZINHAS pareceriam uma medição completa
+mv "$CODE/runner.py" "$T/runner.keep";  hsr -- probe;  check "probe: runner.py ilegível -> 97 'nenhum endereço', não uma tabela só das APIs fixas" '[ $RC -eq 97 ] && has "nenhum endereço" && ! has "IGUAL-"'; mv "$T/runner.keep" "$CODE/runner.py"
+mv "$CODE/config/imoview_tenants.json" "$T/ten.keep";  hsr -- probe;  check "probe: tenants ilegíveis -> 97 'nenhum endereço'" '[ $RC -eq 97 ] && has "nenhum endereço" && ! has "IGUAL-"'; mv "$T/ten.keep" "$CODE/config/imoview_tenants.json"
+hsr FAKE_MINI_DOWN=1 -- probe;        check "probe: o mini não alcança NENHUM endereço (000 em todos) -> 98 'não mediu', não uma tabela SO-O-MINI-FALHA" '[ $RC -eq 98 ] && has "o mini não mediu" && ! has "SO-O-MINI-FALHA"'
 rm -f "$CITY/.gc/hetzner-node.on"
 hsr -- probe;                         check "probe: sem a bandeira -> rc 99" '[ $RC -eq 99 ]'
 : > "$CITY/.gc/hetzner-node.on"

@@ -17,7 +17,7 @@
 #
 # CÓDIGOS DE SAÍDA — 96..99 significam "rode local": quem chama NUNCA trata isso como falha do raspador (mesma convenção do mbp-run.sh).
 #   0..94  código do raspador (propagado); 95 = rc >= 95 do raspador (inclusive 124 = estourou o --timeout, ou rc ilegível no nó): o valor cru vai SEMPRE na linha `scraper_rc_raw=`
-#   97  uso errado (inclusive opção sem valor e `--tenant` — inteiro ou abreviado — depois do `--`), nome inválido, raspador fora da lista ou BLOQUEADO (inclusive: sem --tenant, raspador com algum `!raspador:tenant`), código do rig ou lista ausente (também no `check`), staging dentro de shared/ (jamais grava na produção)
+#   97  uso errado (inclusive opção sem valor e `--tenant` — inteiro ou abreviado — depois do `--`), nome inválido, raspador fora da lista ou BLOQUEADO (inclusive: sem --tenant, raspador com algum `!raspador:tenant`), código do rig ou lista ausente, ilegível ou com linha malformada (também no `check`), tenant inválido no `eligible`, staging dentro de shared/ (jamais grava na produção)
 #   98  nó indisponível ou sem condição: ssh não responde, ambiente não preparado (rode bootstrap), disco < HETZNER_SCRAPE_MIN_DISK_MB, conteúdo reprovado pela varredura, ssh caiu no meio
 #   99  desligado: falta $CITY/.gc/hetzner-node.on (a mesma bandeira do nó de testes; apagar = desligar)
 #
@@ -29,7 +29,7 @@
 # SEGURANÇA: o servidor é alugado e a fronteira de dados é a mesma do mbp-run.sh. Segredo, .env, token, banco, parquet, venv e shared/data da produção NÃO viajam (as regras de nome vêm antes de qualquer
 #   `+`, e `- *` fecha). O CONTEÚDO do que vai (código E seen/caches) é varrido por hetzner-pii-scan.py (lista de telefones/CPFs = o nó NÃO é usado, rc 98). Nenhuma credencial vai no comando; o nó não tem a do GitHub nem a do mini.
 # LIMITES: o raspador roda DESACOPLADO no nó (nohup; o ssh só consulta), então uma queda de rede de segundos não mata uma rodada de horas; passados HETZNER_SCRAPE_POLL_FAILS consultas seguidas sem resposta
-#   o script desiste com rc 98 e deixa a pasta da rodada no nó (o reaper, no fim de uma rodada futura que termine, apaga as de > 1 dia). Não roda raspador com credencial (blow, leilões com login) nem o que o IP alemão não alcança.
+#   o script desiste com rc 98 e deixa a pasta da rodada no nó (o reaper, no fim de uma rodada futura que termine, apaga as de 2 dias ou mais). Não roda raspador com credencial (blow, leilões com login) nem o que o IP alemão não alcança.
 set -o pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
@@ -65,9 +65,10 @@ need_val() { [ $# -ge 3 ] && [ -n "$3" ] && [ "${3#-}" = "$3" ] || die 97 "$1: $
 rssh() { "$SSH_BIN" $SSH_OPTS "$NODE_HOST" "$@"; }
 # rscript <args...>: o script remoto vem no stdin; os argumentos chegam como $1.. (escapados com %q: nada do que vem de fora é interpretado pelo shell do nó)
 rscript() { local q; q=$(printf '%q ' "$@"); "$SSH_BIN" $SSH_OPTS "$NODE_HOST" "bash -s -- $q"; }
-jlog() { # jlog <raspador> <tenant> <rc> <secs> <arquivos> <porquê> <stage>
+jlog() { # jlog <raspador> <tenant> <rc> <secs> <arquivos> <porquê> <stage>; o stage vem de --stage (livre): barra e aspas escapadas, controle removido, senão a linha deixa de ser JSON
+  local st; st=$(printf '%s' "$7" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
   mkdir -p "$(dirname "$LOG")" 2>/dev/null
-  printf '{"ts":"%s","host":"hetzner","scraper":"%s","tenant":"%s","rc":%s,"secs":%s,"files":%s,"why":"%s","stage":"%s"}\n' "$(iso)" "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$LOG" 2>/dev/null
+  printf '{"ts":"%s","host":"hetzner","scraper":"%s","tenant":"%s","rc":%s,"secs":%s,"files":%s,"why":"%s","stage":"%s"}\n' "$(iso)" "$1" "$2" "$3" "$4" "$5" "$6" "$st" 2>/dev/null >> "$LOG" || say "AVISO: não consegui gravar a linha desta rodada em $LOG"
 }
 
 # loose_realpath <caminho>: caminho absoluto com symlinks resolvidos mesmo que o final ainda não exista (sobe até o 1º ancestral que existe)
@@ -126,20 +127,23 @@ REMOTE
 why_of() { case $1 in 99) echo "desligado (falta $NODE_FLAG)";; 98) echo "o nó $NODE_HOST não respondeu ao ssh (ou devolveu estado ilegível)";; *) echo "rc $1";; esac; }
 
 cmd_check() {
-  local rc=0 el=0
+  local rc=0 el=0 lint lrc
   node_state; rc=$?
   echo "flag=$([ -e "$NODE_FLAG" ] && echo on || echo off)"
   echo "node_host=$NODE_HOST"
-  [ -r "$ELIGIBLE" ] && el=$(awk '{sub(/#.*/,"")} /^[ \t]*[^ \t!]/{n++} END{print n+0}' "$ELIGIBLE")
+  # a MESMA leitura da lista que o `run` faz (eligibility, com um nome que nenhuma linha casa): rc 3 = lista ilegível OU linha malformada → o run recusa tudo, então não há contagem a mostrar (ilegivel), nunca um número que parece pronto
+  lint=$(eligibility -lista-); lrc=$?
+  if [ "$lrc" -eq 3 ]; then el=ilegivel; else el=$(awk '{sub(/#.*/,"")} /^[ \t]*[^ \t!]/{n++} END{print n+0}' "$ELIGIBLE"); fi
   echo "eligible_entries=$el"
   echo "code_dir=$([ -d "$PS_CODE/scrapers" ] && echo ok || echo ausente)"
   [ "$rc" -eq 0 ] && { echo "node_env=$NODE_ENV"; echo "node_free_mb=$NODE_FREE_MB"; echo "node_ncpu=$NODE_NCPU"; echo "node_load=$NODE_LOAD"; }
   [ "$rc" -eq 0 ] || { say "$(why_of "$rc")"; return "$rc"; }
   [ "$NODE_ENV" = ok ] || { say "ambiente do nó não preparado: rode \`$(basename "$0") bootstrap\`"; return 98; }
   [ "$NODE_FREE_MB" -ge "$MIN_DISK_MB" ] || { say "disco do nó baixo: ${NODE_FREE_MB} MB livres < $MIN_DISK_MB"; return 98; }
-  # vazio → sem código do rig, ou lista sem nenhum permitido: o `run` recusaria tudo com 97, então NÃO está pronto; falhou/ilegível → idem (el=0), rc 97 como o run
+  # vazio → sem código do rig, ou lista legível sem nenhum permitido: o `run` recusaria tudo com 97, então NÃO está pronto; falhou/ilegível (arquivo ou linha malformada, el=ilegivel) → idem, rc 97 como o run
   [ -d "$PS_CODE/scrapers" ] || { say "código do rig ausente: $PS_CODE — o run recusaria (97)"; return 97; }
-  [ "$el" -ge 1 ] || { say "lista de elegíveis ilegível ou sem nenhum permitido ($ELIGIBLE) — o run recusaria (97)"; return 97; }
+  [ "$el" != ilegivel ] || { say "lista de elegíveis ilegível ou com linha malformada ($ELIGIBLE): $lint — o run recusaria (97)"; return 97; }
+  [ "$el" -ge 1 ] || { say "lista de elegíveis sem nenhum permitido ($ELIGIBLE) — o run recusaria (97)"; return 97; }
   return 0
 }
 
@@ -212,9 +216,9 @@ cmd_probe() {
   [ -d "$PS_CODE" ] || die 97 "código do rig ausente: $PS_CODE"
   [ -e "$NODE_FLAG" ] || die 99 "$(why_of 99)"
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/hsr-probe.XXXXXX") || die 98 "sem diretório temporário"; urls=$tmp/urls; minif=$tmp/mini; nodef=$tmp/node
-  # endereços: o host de conectividade de cada raspador no runner.py + o base_url de cada tenant ativo + os endpoints de API que os raspadores chamam
-  { grep -o -E '"connectivity_host": *"[^"]+"' "$PS_CODE/runner.py" 2>/dev/null | sed -E 's/.*"([^"]+)"$/https:\/\/\1\//'
-    python3 -I - "$PS_CODE/config" <<'PY'
+  # endereços: o host de conectividade de cada raspador no runner.py + o base_url de cada tenant ativo (cada parte em arquivo próprio) + os endpoints de API que os raspadores chamam
+  grep -o -E '"connectivity_host": *"[^"]+"' "$PS_CODE/runner.py" 2>/dev/null | sed -E 's/.*"([^"]+)"$/https:\/\/\1\//' > "$tmp/homes"
+  python3 -I - "$PS_CODE/config" > "$tmp/tenants" 2>/dev/null <<'PY'
 import glob, json, sys
 for f in sorted(glob.glob(sys.argv[1] + "/*_tenants.json")):
     try:
@@ -224,16 +228,20 @@ for f in sorted(glob.glob(sys.argv[1] + "/*_tenants.json")):
     except Exception:
         pass
 PY
+  # vazio → runner.py sem hosts ou tenants sem base_url; falhou/ilegível (runner.py ou tenants ilegíveis, python3 ausente) → idem: as APIs fixas SOZINHAS pareceriam uma medição completa, e é esta tabela que decide a lista de elegíveis, então rc 97
+  [ -s "$tmp/homes" ] && [ -s "$tmp/tenants" ] || { rmtmp "$tmp"; die 97 "nenhum endereço de raspador ou de tenant para medir (runner.py/tenants ilegíveis em $PS_CODE)"; }
+  { cat "$tmp/homes" "$tmp/tenants"
     printf '%s\n' 'https://apigw.prod.quintoandar.com.br/house-listing-search/v2/search/coordinates' 'https://landscape-api.loft.com.br/listing/v3/search' 'https://glue-api.zapimoveis.com.br/v2/listings' \
       'https://www.netimoveis.com/pesquisa' 'https://www.chavesnamao.com.br/imoveis-a-venda/mg-belo-horizonte/'
   } | sort -u > "$urls"
-  [ -s "$urls" ] || { rmtmp "$tmp"; die 97 "nenhum endereço para medir (runner.py/tenants ilegíveis em $PS_CODE)"; }
   say "medindo $(wc -l < "$urls" | tr -d ' ') endereços do mini e do nó (curl com UA de navegador, sem cookie)"
   probe_loop < "$urls" > "$minif" &
   local mpid=$!
   { declare -f probe_loop; echo 'probe_loop <<"HSR_URLS_EOF"'; cat "$urls"; echo HSR_URLS_EOF; } | rssh bash -s > "$nodef" 2>/dev/null || rc=$?
-  wait "$mpid"
+  local mrc=0; wait "$mpid" || mrc=$?
   if [ "$rc" -ne 0 ] || [ ! -s "$nodef" ]; then rmtmp "$tmp"; die 98 "o nó não respondeu à medição (rc $rc)"; fi
+  # o lado do mini também precisa ter MEDIDO: laço que morreu, ou nenhum endereço com resposta (000 em todos = sem rede/curl no mini), vira "não medido" — nunca a tabela inteira como SO-O-MINI-FALHA/DIFERE-FALHA
+  if [ "$mrc" -ne 0 ] || ! awk '$1 != "000" {n++} END {exit (n > 0 ? 0 : 1)}' "$minif"; then rmtmp "$tmp"; die 98 "o mini não mediu nenhum endereço (rc $mrc; sem rede ou curl?) — a tabela não vale"; fi
   # bloqueio = o nó NÃO recebe 2xx onde o mini recebe, ou recebe uma página de desafio de verdade (just a moment, attention required...) que o mini não recebe. A palavra solta `captcha` num 200
   # (widget de formulário) não é bloqueio: só conta se a marca for a mesma nos dois lados (IGUAL-OK) ou, se diferir, vira DIFERE-VERIFICAR para um humano olhar
   awk -v OFS='\t' 'NR==FNR { mc[$4]=$1; mk[$4]=tolower($3); next }
@@ -341,7 +349,7 @@ cd "$(dirname "$0")" || exit 97
 d=$HOME/gt-remote/scrape/env
 export LD_LIBRARY_PATH=$(cat "$d/libpath.txt") PLAYWRIGHT_BROWSERS_PATH=$d/browsers PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 sc=$1; to=$2; shift 2
-nice -n 5 timeout "$to" "$d/venv/bin/python" -u "rig/main/scrapers/$sc/scraper.py" "$@" > scraper.log 2>&1
+nice -n 5 timeout -k 30 "$to" "$d/venv/bin/python" -u "rig/main/scrapers/$sc/scraper.py" "$@" > scraper.log 2>&1
 echo $? > rc.tmp && mv rc.tmp rc
 GO
 ( setsid nohup bash "$run/go.sh" "$sc" "$to" "$@" >/dev/null 2>&1 < /dev/null & )
@@ -349,11 +357,11 @@ REMOTE
   say "rodada $id disparada no nó (timeout ${to}s); consulta a cada ${POLL_S}s"
   local fails=0 raw="" r deadline=$(( $(date +%s) + 10#$to + 10#$GRACE_S ))   # 10#: `--timeout 08` não é octal
   while :; do
-    [ "$(date +%s)" -le "$deadline" ] || { say "a rodada $id passou do prazo (--timeout ${to}s + ${GRACE_S}s) sem escrever o rc: o processo sumiu no nó? desisto (a pasta fica em $NODE_HOST:$remote_rel; o reaper do fim de uma rodada futura que termine a apaga se tiver > 1 dia)"; jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "sem-rc-no-prazo" "$stage"; exit 98; }
+    [ "$(date +%s)" -le "$deadline" ] || { say "a rodada $id passou do prazo (--timeout ${to}s + ${GRACE_S}s) sem escrever o rc: o processo sumiu no nó? desisto (a pasta fica em $NODE_HOST:$remote_rel; o reaper do fim de uma rodada futura que termine a apaga se tiver 2 dias ou mais)"; jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "sem-rc-no-prazo" "$stage"; exit 98; }
     r=$(rssh "cat $remote_rel/rc 2>/dev/null; echo END" 2>/dev/null)
     case $r in
       *END) fails=0; raw=$(printf '%s' "$r" | head -n 1); case $raw in END) raw="";; esac; [ -z "$raw" ] || break;;
-      *) fails=$((fails + 1)); if [ "$fails" -ge "$POLL_FAILS" ]; then say "o nó não respondeu a $fails consultas seguidas: desisto (a rodada $id fica em $NODE_HOST:$remote_rel; o reaper do fim de uma rodada futura que termine a apaga se tiver > 1 dia)"; jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "ssh-caiu" "$stage"; exit 98; fi;;
+      *) fails=$((fails + 1)); if [ "$fails" -ge "$POLL_FAILS" ]; then say "o nó não respondeu a $fails consultas seguidas: desisto (a rodada $id fica em $NODE_HOST:$remote_rel; o reaper do fim de uma rodada futura que termine a apaga se tiver 2 dias ou mais)"; jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "ssh-caiu" "$stage"; exit 98; fi;;
     esac
     sleep "$POLL_S"
   done
@@ -362,9 +370,9 @@ REMOTE
 
   "$RSYNC_BIN" -a --max-size=500m -e "$SSH_BIN $SSH_OPTS" --include='/shared/' --include='/shared/data/***' --include='/shared/config/' --include='/shared/config/seen_*' --include='/shared/config/*cache*' --include='/scraper.log' --exclude='*' "$NODE_HOST:$remote_rel/" "$stage/" >/dev/null 2>&1 || { say "AVISO: o resultado não voltou inteiro (rsync de volta falhou); a rodada fica em $NODE_HOST:$remote_rel"; jlog "$sc" "$tn" 98 $(( $(date +%s) - t0 )) 0 "volta-falhou" "$stage"; exit 98; }
   n=$(find "$stage/shared/data" -type f 2>/dev/null | wc -l | tr -d ' ')
-  # limpeza: só a pasta DESTA rodada (id montado por nós a partir de nome validado), nunca um caminho vindo de fora
-  rssh "case $remote_rel in $RBASE/runs/?*) find $remote_rel -mindepth 1 -delete; rmdir $remote_rel;; esac" >/dev/null 2>&1 || say "AVISO: a pasta da rodada no nó não foi apagada ($remote_rel)"
-  # reaper (roda só aqui, no fim de uma rodada que terminou): pastas de rodadas de mais de 1 dia (queda de rede que deixou a pasta para trás); vazio → nada a apagar, rc 0; falhou → aviso (não deixa lixo acumular em silêncio)
+  # limpeza: só a pasta DESTA rodada (id montado por nós a partir de nome validado), nunca um caminho vindo de fora. O --max-size do rsync pula arquivo grande com rc 0: se sobrou algum > 500 MB no nó (ou o find falhou: não se sabe), a pasta FICA e o aviso diz por quê
+  rssh "case $remote_rel in $RBASE/runs/?*) b=\$(find $remote_rel -type f -size +500M) || exit 3; [ -z \"\$b\" ] || exit 3; find $remote_rel -mindepth 1 -delete; rmdir $remote_rel;; esac" >/dev/null 2>&1 || say "AVISO: a pasta da rodada no nó não foi apagada ($remote_rel): o ssh falhou, ou há arquivo > 500 MB que o --max-size do rsync não trouxe — confira lá antes de apagar"
+  # reaper (roda só aqui, no fim de uma rodada que terminou): pastas de rodadas de 2 dias ou mais (`find -mtime +1`; queda de rede que deixou a pasta para trás); vazio → nada a apagar, rc 0; falhou → aviso (não deixa lixo acumular em silêncio)
   rssh "find $RBASE/runs -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec sh -c 'find \"\$1\" -mindepth 1 -delete; rmdir \"\$1\"' _ {} \;" >/dev/null 2>&1 || say "AVISO: o reaper das pastas de rodadas antigas falhou no nó ($NODE_HOST:$RBASE/runs)"
   echo "stage=$stage"; echo "files=$n"; echo "secs=$(( $(date +%s) - t0 ))"
   if [ "$raw" -ge 95 ]; then echo "scraper_rc_raw=$shown"; jlog "$sc" "$tn" 95 $(( $(date +%s) - t0 )) "$n" "rc-cru-$shown" "$stage"; exit 95; fi
@@ -377,7 +385,12 @@ REMOTE
 cmd=${1:-}; [ $# -gt 0 ] && shift
 case $cmd in
   check) cmd_check;;
-  eligible) [ -n "${1:-}" ] || die 97 "eligible: faltou o raspador"; [[ "$1" =~ $NAME_RE ]] || die 97 "nome inválido: $1"; v=$(eligibility "$1" "${2:-}"); rc=$?; echo "$v"; [ "$rc" -eq 0 ] || exit 97;;
+  eligible)
+    [ -n "${1:-}" ] || die 97 "eligible: faltou o raspador"; [[ "$1" =~ $NAME_RE ]] || die 97 "nome inválido: $1"
+    # o tenant pedido passa pela MESMA validação do `run` (TENANT_RE, minúsculas): a lista é normalizada e o pedido não, então 'T9' ou 't9 ' nunca casaria com `!delta:t9` e o bloqueio que não casa liberaria em silêncio; tenant "" explícito e argumento sobrando também são uso errado
+    [ $# -le 2 ] || die 97 "eligible: argumentos demais (uso: eligible <raspador> [tenant])"
+    [ $# -lt 2 ] || [[ "$2" =~ $TENANT_RE ]] || die 97 "eligible: tenant inválido: '$2'"
+    v=$(eligibility "$1" "${2:-}"); rc=$?; echo "$v"; [ "$rc" -eq 0 ] || exit 97;;
   bootstrap) cmd_bootstrap;;
   run) cmd_run "$@";;
   probe) cmd_probe "$@";;
