@@ -114,6 +114,9 @@ dolt_sql() {
       [ "$STUB_SOURCE_COUNT" = "ERR" ] && return 1
       printf 'row_count\n%s\n' "$STUB_SOURCE_COUNT" ;;
     "SELECT * FROM \`wa\`.issues"*)
+      # ga-aai87v: STUB_KILL_SELF=1 is the engine's SIGKILL at the order's timeout — the exporter dies mid-export, no trap runs,
+      # and its scratch file stays wherever the exporter put it.
+      [ "${STUB_KILL_SELF:-0}" = "1" ] && kill -9 $$
       # STUB_TEST_ROWS extra rows are ones the SQL filter lets through but the
       # jq scrub (title ^test_) removes — like a real store's leftover fixtures.
       jq -n -c --argjson n "$STUB_EXPORT_ROWS" --argjson t "${STUB_TEST_ROWS:-0}" \
@@ -445,6 +448,127 @@ case "$OUT" in
   *"push:"*) bad "test setup invalid: the run did not take the plain no-changes exit (it reported a push status): $OUT" ;;
 esac
 unverified_seen "unverified, plain no-changes exit (300, source ERR)"
+
+# ── ga-aai87v: the export's scratch file never reaches the archive ───────────
+# The exporter wrote its scratch file (issues.jsonl.tmp.XXXXXX) INSIDE the archive, in the directory `git add -A -- <db>` stages. The engine's SIGKILL at the order's
+# timeout runs no trap, the file stayed, and the NEXT run's commit took it: 19 of them (16 MB) sat in the archive's HEAD and went offsite with the S3 mirror. The kill is
+# simulated for real (STUB_KILL_SELF makes the stub SIGKILL the exporter mid-export), so these cases do not depend on where the file is put.
+echo "=== ga-aai87v: the scratch issues.jsonl.tmp.* of a killed export never reaches the archive ==="
+scratch_archive() {  # scratch_archive <name> — a fresh archive with its own scratch dir
+  fresh_archive "$1"
+  E2E_TMPD="$E2E/scratch-$1"
+  export GC_JSONL_EXPORT_TMP_DIR="$E2E_TMPD"
+}
+# vazio → no scratch file under the given dirs; falhou (find could not read a dir) → the output starts with "find failed:", so a failed find is never read as "empty"
+stray_in() {
+  local out
+  out=$(find "$@" -name 'issues.jsonl.tmp.*' -not -path '*/.git/*' 2>&1) || out="find failed: $out"
+  printf '%s\n' "$out" | sed '/^$/d'
+}
+# vazio → 0 scratch files in HEAD; falhou/ilegível (HEAD or ls-tree unreadable) → prints "?", which none of the "= 0" / "= 1" assertions accept
+tracked_stray() {
+  local names
+  names=$(git -C "$ARCH" ls-tree -r --name-only HEAD 2>/dev/null) || { echo "?"; return 0; }
+  printf '%s\n' "$names" | grep -c 'issues\.jsonl\.tmp\.' || true
+}
+# vazio → archive working tree clean; falhou (git status errors) → prints "git status failed", so a broken repo is never read as clean
+dirty_tree() {
+  local out
+  out=$(git -C "$ARCH" status --porcelain 2>&1) || out="git status failed: $out"
+  printf '%s' "$out"
+}
+git_fixture()    { git -C "$ARCH" -c user.name=fixture -c user.email=fixture@localhost -c maintenance.auto=false "$@"; }
+
+# Case 1 — the real sequence: a run is SIGKILLed mid-export, the next run commits.
+scratch_archive killed
+run_export 200 200
+BASE_COMMITS=$(commits)
+export STUB_KILL_SELF=1
+run_export 201 201
+unset STUB_KILL_SELF
+[ "$RC" != "0" ] \
+  && ok "killed export: the run died mid-export (rc=$RC)" \
+  || bad "test setup invalid: the simulated SIGKILL did not stop the exporter (rc=0): $OUT"
+[ -n "$(stray_in "$ARCH" "$E2E_TMPD")" ] \
+  && ok "killed export: the dead run left its scratch file behind (the case under test exists)" \
+  || bad "test setup invalid: no scratch file anywhere after the killed run"
+[ -z "$(stray_in "$ARCH")" ] \
+  && ok "killed export: the scratch file is NOT under the archive (outside everything git add stages)" \
+  || bad "killed export: scratch file left inside the archive: $(stray_in "$ARCH" | tr '\n' ' ')"
+run_export 201 201
+[ "$(head_rows)" = "201" ] && [ "$(commits)" = "$((BASE_COMMITS + 1))" ] \
+  && ok "after a killed export: the next export commits its snapshot (201 rows, one new commit)" \
+  || bad "after a killed export: head=$(head_rows) commits $BASE_COMMITS -> $(commits), want 201 rows and +1 commit (rc=$RC): $OUT"
+[ "$(tracked_stray)" = "0" ] \
+  && ok "after a killed export: the snapshot commit holds no scratch file" \
+  || bad "after a killed export: the archive HEAD tracks $(tracked_stray) scratch file(s): $(git -C "$ARCH" ls-tree -r --name-only HEAD | grep 'issues\.jsonl\.tmp\.' | tr '\n' ' ')"
+[ -z "$(dirty_tree)" ] \
+  && ok "after a killed export: archive working tree is clean" \
+  || bad "after a killed export: archive working tree is dirty: $(dirty_tree | tr '\n' ' ')"
+
+# Case 2 — what production holds today: scratch files already in HEAD (19) and one untracked. The next snapshot commit drops them; their blobs stay in history.
+scratch_archive legacy
+run_export 200 200
+printf 'junk' > "$ARCH/wa/issues.jsonl.tmp.TRKD01"
+git_fixture add -f -- wa/issues.jsonl.tmp.TRKD01 >/dev/null 2>&1 \
+  && git_fixture commit -q -m "fixture: a scratch file already in HEAD" >/dev/null 2>&1
+printf 'junk' > "$ARCH/wa/issues.jsonl.tmp.UNTR02"
+[ "$(tracked_stray)" = "1" ] \
+  && ok "legacy leftovers: fixture has 1 scratch file in HEAD and 1 untracked" \
+  || bad "test setup invalid: tracked_stray=$(tracked_stray), want 1"
+BASE_COMMITS=$(commits)
+run_export 201 201
+[ "$(tracked_stray)" = "0" ] \
+  && ok "legacy leftovers: the next snapshot commit drops the tracked scratch file from HEAD" \
+  || bad "legacy leftovers: HEAD still tracks $(tracked_stray) scratch file(s)"
+[ -z "$(stray_in "$ARCH")" ] \
+  && ok "legacy leftovers: no scratch file left in the archive working tree (tracked or untracked)" \
+  || bad "legacy leftovers: still in the working tree: $(stray_in "$ARCH" | tr '\n' ' ')"
+[ "$(head_rows)" = "201" ] && [ "$(commits)" = "$((BASE_COMMITS + 1))" ] \
+  && ok "legacy leftovers: the real snapshot (201 rows) still commits, one new commit" \
+  || bad "legacy leftovers: head=$(head_rows) commits $BASE_COMMITS -> $(commits), want 201 rows and +1 commit (rc=$RC): $OUT"
+[ -z "$(dirty_tree)" ] \
+  && ok "legacy leftovers: archive working tree is clean" \
+  || bad "legacy leftovers: archive working tree is dirty: $(dirty_tree | tr '\n' ' ')"
+
+# Case 3 — a dead run's leftover in the scratch dir is swept once it is old enough that no live run can own it; a fresh one (a run still going) is left alone.
+scratch_archive sweep
+mkdir -p "$E2E_TMPD"
+printf 'old' > "$E2E_TMPD/issues.jsonl.tmp.OLD000"; touch -t 200001010000 "$E2E_TMPD/issues.jsonl.tmp.OLD000"
+printf 'live' > "$E2E_TMPD/issues.jsonl.tmp.LIVE00"
+run_export 200 200
+[ ! -e "$E2E_TMPD/issues.jsonl.tmp.OLD000" ] \
+  && ok "scratch sweep: a leftover older than the sweep age is removed" \
+  || bad "scratch sweep: the old leftover is still there"
+[ -e "$E2E_TMPD/issues.jsonl.tmp.LIVE00" ] \
+  && ok "scratch sweep: a fresh scratch file (a run still going) is left alone" \
+  || bad "scratch sweep: a fresh scratch file was deleted — it could belong to a live run"
+
+# Case 4 — default location (no override) is the archive's sibling, and a clean run leaves nothing in it.
+unset GC_JSONL_EXPORT_TMP_DIR
+fresh_archive defaultdir
+run_export 200 200
+DEFAULT_TMPD="$(dirname "$ARCH")/.jsonl-export-tmp"
+[ -d "$DEFAULT_TMPD" ] \
+  && ok "default scratch dir: <archive's parent>/.jsonl-export-tmp is created" \
+  || bad "default scratch dir: $DEFAULT_TMPD does not exist after a run (rc=$RC): $OUT"
+# vazio → the dir is empty (a clean run left nothing); falhou (ls cannot read it) → also empty, but the -d assertion just above already failed for a missing dir
+[ -z "$(ls -A "$DEFAULT_TMPD" 2>/dev/null)" ] \
+  && ok "default scratch dir: a clean run leaves nothing in it" \
+  || bad "default scratch dir: a clean run left: $(ls -A "$DEFAULT_TMPD" | tr '\n' ' ')"
+
+# Case 5 — the scratch dir cannot be created: the run says so and exports nothing (the archive keeps its last snapshot), instead of falling back to a path inside the archive.
+fresh_archive noscratch
+run_export 200 200
+BASE_COMMITS=$(commits)
+printf 'not a dir' > "$E2E/scratch-is-a-file"
+GC_JSONL_EXPORT_TMP_DIR="$E2E/scratch-is-a-file/sub" run_export 201 201
+[ "$RC" != "0" ] && case "$OUT" in *"cannot create the scratch dir"*) true ;; *) false ;; esac \
+  && ok "scratch dir not creatable: exits non-zero and names the scratch dir" \
+  || bad "scratch dir not creatable: rc=$RC, want non-zero with 'cannot create the scratch dir'. Output: $OUT"
+[ "$(head_rows)" = "200" ] && [ "$(commits)" = "$BASE_COMMITS" ] && [ -z "$(stray_in "$ARCH")" ] \
+  && ok "scratch dir not creatable: archive untouched (HEAD still 200 rows, no new commit, nothing written inside)" \
+  || bad "scratch dir not creatable: head=$(head_rows) commits $BASE_COMMITS -> $(commits) stray=$(stray_in "$ARCH" | tr '\n' ' ')"
 
 # ga-8z0hy7 — a commit that lands while jsonl-archive-compact.sh runs must not start git's background maintenance.
 # `git commit` runs `git maintenance run --auto --quiet --detach`; on git 2.54 that is a geometric repack which merges and deletes the loose-*.pack batch
