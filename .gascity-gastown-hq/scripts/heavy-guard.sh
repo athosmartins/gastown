@@ -54,6 +54,7 @@ HG_CITY="${GC_CITY_PATH:-${GC_CITY:-$HG_HERE/..}}"
 HG_LOG="${HEAVY_GUARD_LOG:-$HG_CITY/.gc/logs/heavy-guard.log}"
 HG_POLL="${HEAVY_GUARD_POLL_SECS:-15}"
 case "$HG_POLL" in ''|*[!0-9]*|0) HG_POLL=15 ;; esac
+[ "${#HG_POLL}" -le 9 ] || HG_POLL=15   # past int64 the cap below could not be compared: back to the default
 
 hg_log() {
   # best effort by design: the verdict was already reached, a full disk is exactly when this write fails

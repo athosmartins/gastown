@@ -160,13 +160,18 @@ EOF
   }
   mkdir -p "$W/bin2"; echo 1000000 > "$W/clk"
   printf '#!/bin/sh\n[ -n "$FAKE_CLOCK_BAD" ] && exit 1\n[ "$1" = "+%%s" ] || exec /bin/date "$@"\nn=$(cat "%s"); echo $((n+4)) > "%s"; echo $n\n' "$W/clk" "$W/clk" > "$W/bin2/date"
-  printf '#!/bin/sh\nexit 0\n' > "$W/bin2/sleep"; chmod +x "$W/bin2/date" "$W/bin2/sleep"
+  printf '#!/bin/sh\necho "$1" >> "%s"\nexit 0\n' "$W/sleeps" > "$W/bin2/sleep"; chmod +x "$W/bin2/date" "$W/bin2/sleep"
   bounded 5 env PATH="$W/bin2:$PATH" HEAVY_GUARD_LIB="$lib" DISK_FREE_OVERRIDE_MB=100 "$g" --wait-secs 08 --check 2>/dev/null; rc=$?
   check "a zero-padded --wait-secs (08) on a low disk ends with 75" 75 "$rc"
   bounded 5 env PATH="$W/bin2:$PATH" FAKE_CLOCK_BAD=1 HEAVY_GUARD_LIB="$lib" DISK_FREE_OVERRIDE_MB=100 "$g" --wait-secs 5 --check 2>/dev/null; rc=$?
   check "an unreadable clock on a low disk stops waiting: 75" 75 "$rc"
   bounded 5 env HEAVY_GUARD_LIB="$lib" DISK_FREE_OVERRIDE_MB=100 "$g" --wait-secs 1234567890 --check 2>/dev/null; rc=$?
   check "a wait of more than 9 digits is a usage error, not a 39-year wait" 64 "$rc"
+  # a poll step past int64 cannot be compared with the remaining wait: it falls back to 15 s, so no sleep is longer than that
+  : > "$W/sleeps"
+  bounded 5 env PATH="$W/bin2:$PATH" HEAVY_GUARD_POLL_SECS=99999999999999999999 HEAVY_GUARD_LIB="$lib" DISK_FREE_OVERRIDE_MB=100 "$g" --wait-secs 100 --check 2>/dev/null; rc=$?
+  check "a huge HEAVY_GUARD_POLL_SECS still ends a wait on a low disk with 75" 75 "$rc"
+  [ -s "$W/sleeps" ] && [ "$(sort -n "$W/sleeps" | tail -1)" -le 15 ] || bad "a huge HEAVY_GUARD_POLL_SECS must not lengthen the sleep step (longest: $(sort -n "$W/sleeps" | tail -1))"
 }
 
 mk_mutant() { # mk_mutant <src> <dst> <sed-expr>  — fails the selftest if the expression changed nothing
@@ -195,6 +200,7 @@ mk_mutant "$REAL_GUARD" "$M/g-nowait.sh" 's/\[ "\$now" -ge "\$deadline" \]/true/
 mk_mutant "$REAL_GUARD" "$M/g-octal.sh" 's/^wait_s=\$(( 10#\$wait_s ))$/:/' && { before=$FAIL; guard_cases "$M/g-octal.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: --wait-secs 08 read as octal"; }
 mk_mutant "$REAL_GUARD" "$M/g-noclock.sh" '/^  case "\$now" in/d' && { before=$FAIL; guard_cases "$M/g-noclock.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: an unreadable clock keeps the wait loop going"; }
 
+mk_mutant "$REAL_GUARD" "$M/g-cappoll.sh" '/^\[ "\${#HG_POLL}" -le 9 \]/d' && { before=$FAIL; guard_cases "$M/g-cappoll.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: no magnitude cap on the poll step"; }
 mk_mutant "$REAL_GUARD" "$M/g-capmin.sh" '/^\[ "\${#min}" -le 9 \]/d' && { before=$FAIL; guard_cases "$M/g-capmin.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: no magnitude cap on --min-free-mb"; }
 mk_mutant "$REAL_GUARD" "$M/g-nolog.sh" '/hg_log "REFUSED lib_unloadable/d' && { before=$FAIL; guard_cases "$M/g-nolog.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: the lib-unloadable refusal leaves no log line"; }
 mk_mutant "$REAL_GUARD" "$M/g-reread.sh" 's/^\[ -n "\$free" \] || free="?"$/free="$(disk_free_mb 2>\/dev\/null)" || free="?"/' && { before=$FAIL; guard_cases "$M/g-reread.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: the refusal shows a second reading"; }
