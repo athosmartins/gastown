@@ -317,7 +317,7 @@ try:
     _bad = os.path.join(_tmp10, "routes-corrupt.jsonl")
     with open(_bad, "w") as fh:
         fh.write("{this is not json\n")
-    _missing = os.path.join(_tmp10, "routes-missing.jsonl")
+    _missing = "/nonexistent-ga-3psuuo/routes.jsonl"  # a path that does not exist → open() raises OSError
     _mk = ["wa-foreign1", "ga-djjeq"]
     _ti = {"ga-djjeq": "fix bug wa-orig9: some title"}
     _full = frozenset({"wa-foreign1", "ga-djjeq", "wa-orig9"})
