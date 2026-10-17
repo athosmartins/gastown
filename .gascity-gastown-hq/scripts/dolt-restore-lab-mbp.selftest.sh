@@ -211,6 +211,23 @@ case "${FAKE_EXEC:-run}" in
   badslot) echo "[lab-mbp] ready slot=$FAKE_BADSLOT"; sleep 2; exit 0 ;;
 esac
 rm -rf "$SLOT"; mkdir -p "$SLOT/in" && cp -Rp "$push" "$SLOT/in/"
+# mbp-run's end-of-call cleanup is best effort ("AVISO: scratch nao foi limpo"): a slot can still hold the previous round.
+# 1 = a leftover in/lab-src · 2 = in/lab-src is a link to a folder outside the slot · 3 = a leftover that cannot be removed (in/ is read-only)
+# 4 = only a report.json (verdict OK) and a lab.log of the previous round in out/
+case "${FAKE_STALE_SLOT:-0}" in
+  1|3) mkdir -p "$SLOT/in/lab-src/oldtable"; echo old > "$SLOT/in/lab-src/oldtable/f"; [ "$FAKE_STALE_SLOT" != 3 ] || chmod 555 "$SLOT/in" ;;
+  2) mkdir -p "$FAKE_ROOT/mbp/outside"; echo keep > "$FAKE_ROOT/mbp/outside/keep.txt"; ln -s "$FAKE_ROOT/mbp/outside" "$SLOT/in/lab-src" ;;
+  4) mkdir -p "$SLOT/out"; echo "lab.log antigo" > "$SLOT/out/lab.log"
+     python3 -I - "$SLOT/in/lab-in/manifest.json" "$SLOT/out/report.json" <<'PYSTALE'
+import json, sys
+m = json.load(open(sys.argv[1]))
+json.dump({"verdict": "OK", "rc": 0, "reason": None, "as_of": m["as_of"], "total_s": 321, "source_kb": 13000000, "restored_kb": 14000000,
+           "fetch_s": None, "restore_s": 200, "count_s": 21, "tables": {k: {"expected": v, "restored": v} for k, v in m["tables"].items()}}, open(sys.argv[2], "w"))
+PYSTALE
+     ;;
+esac
+# FAKE_FIND_FAIL=1: in the MBP session of dolt-restore-lab-mbp-side.sh, the `find -mindepth` that COUNTS the leftover exits 1 (any other find call goes through to the real one)
+[ "${FAKE_FIND_FAIL:-0}" != 1 ] || { mkdir -p "$FAKE_ROOT/mbp/failbin"; printf '#!/bin/sh\ncase "$*" in *-mindepth*) exit 1 ;; esac\nexec /usr/bin/find "$@"\n' > "$FAKE_ROOT/mbp/failbin/find"; chmod +x "$FAKE_ROOT/mbp/failbin/find"; }
 printf 'lab=%s\ndolt_version=%s\nleak=%s\ndisk=%s\ndolt_run=%s\n' "${SC_LAB:-ok}" "${SC_DOLT_VER:-2.3.1}" "${SC_LEAK:-0}" "${SC_DISK:-ok}" "${SC_DOLT_RUN:-ok}" > "$FAKE_ROOT/scen"
 extra=(); [ "${SC_AWSENV:-0}" != 1 ] || extra=(AWS_PROFILE=leaky)
 for t in ps env; do rm -f "$FAKE_ROOT/home/gt-remote/lab/bin/$t"; done   # SC_BROKEN=ps|env: that tool fails (exit 1, no output) in the MBP session
@@ -226,7 +243,7 @@ if [ "${FAKE_EXEC:-run}" = die_after_ready ]; then   # the job dies (and mbp-run
   wp=$!; n=0; until [ -d "$SLOT/in/lab-src" ] || [ $n -ge 50 ]; do sleep 0.1; n=$((n+1)); done
   sleep 1.5; kill $wp 2>/dev/null; wait $wp 2>/dev/null; [ "${FAKE_KEEP_SLOT:-0}" = 1 ] || rm -rf "$SLOT"; sleep "${FAKE_STAY_S:-0}"; echo "mbp-run: ssh caiu durante a execução — rode local"; exit 98
 fi
-( cd "$SLOT" && env -i HOME="$FAKE_ROOT/home" PATH="/usr/bin:/bin:/usr/sbin:/sbin" FAKE_SCEN="$FAKE_ROOT/scen" FAKE_S3="$FAKE_ROOT/s3" FAKE_CAP="$FAKE_CAP" \
+( cd "$SLOT" && env -i HOME="$FAKE_ROOT/home" PATH="${FAKE_FIND_FAIL:+$FAKE_ROOT/mbp/failbin:}/usr/bin:/bin:/usr/sbin:/sbin" FAKE_SCEN="$FAKE_ROOT/scen" FAKE_S3="$FAKE_ROOT/s3" FAKE_CAP="$FAKE_CAP" \
     LAB_SAMPLE_S=1 LAB_POLL_S=0.2 "${extra[@]}" "$@" 2>&1 ) | cat
 rc=${PIPESTATUS[0]}
 grep -rIlF -f "$FAKE_ROOT/secret/canary.txt" "$SLOT" 2>/dev/null | grep -c . > "$FAKE_CAP/slot-canary-files"
@@ -597,6 +614,28 @@ reset; FAKE_MINI_LEAK=4 run; chmod -R u+rwx "$T/state/zz-unreadable" 2>/dev/null
 check "$RC" 0 "credencial no stage do mini E uma pasta que nao abre: o veredito fica"; has "$(summ)" "mini-higiene: arquivos-com-cara-de-credencial=1" "o achado conta 1, nao '?'"; has "$(summ)" "ALERTA" "e grita"
 reset; FAKE_MINI_LEAK=4 SC_LAB=unknown run; chmod -R u+rwx "$T/state/zz-unreadable" 2>/dev/null
 has "$(summ)" "mini-higiene: arquivos-com-cara-de-credencial=1" "lab UNKNOWN: o achado do mini tambem conta 1"; has "$(summ)" "ALERTA" "e o alerta sobe mesmo onde o '?' seria ignorado"
+
+echo "-- slot reusado com a sobra da rodada anterior (o gate achou: o mbp-run so avisa quando nao limpa o scratch)"
+# a sobra em in/lab-src faz a conferencia "exatamente a lista do S3" falhar (sobram=N) toda semana e entra na medida de disco livre; um
+# report.json velho, com o lab saindo 0 sem escrever um novo, seria lido como o resultado DESTA rodada
+reset; run
+has "$(EVD)" "src_sobra_apagada=0" "slot limpo: nada a apagar e a evidencia diz 0"
+reset; FAKE_STALE_SLOT=1 run
+check "$RC" 0 "slot com lab-src da rodada anterior: so a copia desta rodada e conferida e a rodada termina OK"; has "$OUT" "RESULT: OK" "OK de verdade"
+has "$(EVD)" "src_sobra_apagada=2" "a evidencia conta o que apagou (a pasta oldtable e o arquivo dentro dela)"; hasnt "$OUT" "sobram" "e a conferencia da copia nao reclama de sobra"
+# dolt-restore-lab-mbp-side.sh: a contagem e so evidencia: o find que falha nao impede nem esconde a limpeza, e o que nao deu para contar nunca vira "0 apagados"
+reset; FAKE_STALE_SLOT=1 FAKE_FIND_FAIL=1 run
+check "$RC" 0 "o find que conta a sobra falha: a sobra sai do mesmo jeito e a rodada termina OK"; has "$OUT" "RESULT: OK" "OK de verdade (a copia foi conferida sem a sobra)"
+has "$(EVD)" "src_sobra_apagada=?" "a contagem que nao deu fica '?'"; hasnt "$(EVD)" "src_sobra_apagada=0" "e nunca vira 0"
+reset; FAKE_STALE_SLOT=4 SC_LAB=norep run
+check "$RC" 2 "report.json OK velho no slot e o lab sai 0 sem relatorio novo: UNKNOWN, nunca o OK de outra rodada"; hasnt "$OUT" "RESULT: OK" "sem relatorio desta rodada nao ha OK"
+has "$OUT" "relatorio do MBP ausente" "diz que o relatorio faltou (o velho foi apagado antes)"
+reset; FAKE_STALE_SLOT=2 run
+check "$RC" 2 "in/lab-src e um link para fora do slot: UNKNOWN"; has "$OUT" "e um link" "diz por que"
+check "$(objreads)" 0 "nenhum objeto lido"; check "$(labran)" nao "o lab nao rodou"; check "$(cat "$T/mbp/outside/keep.txt" 2>/dev/null)" keep "o alvo do link ficou intacto (nada fora do slot foi apagado)"
+reset; FAKE_STALE_SLOT=3 run
+check "$RC" 2 "sobra que nao da para apagar: UNKNOWN, nao segue por cima de pasta que nao e provadamente nossa"; has "$OUT" "nao consegui apagar a sobra" "diz que a sobra ficou"
+check "$(objreads)" 0 "nenhum objeto lido"; check "$(labran)" nao "o lab nao rodou"
 
 echo "-- orquestrador morto no meio do envio"
 reset

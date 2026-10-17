@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""daemon-unverified-sweep.py — vigia de `delivery:daemon-unverified` (ga-iyfe83, parte 3 da ga-29ssni). FATIA 1: núcleo.
+"""daemon-unverified-sweep.py — vigia de `delivery:daemon-unverified` (ga-iyfe83, parte 3 da ga-29ssni). FATIAS 1-3: núcleo + sha/dono/periódico + relatório/aviso/plist.
 
 O PROBLEMA. O gate fecha um bead com o rótulo `delivery:daemon-unverified` quando o código mergeado pode estar
 DORMENTE: o daemon que o executa não foi (ou não pôde ser) confirmado reiniciado depois do merge. ~300 beads
@@ -10,6 +10,8 @@ O QUE ESTE VIGIA FAZ. Para cada bead fechado com o rótulo decide EXATAMENTE UM 
   CONFIRMADO          o daemon dono do código mergeado subiu DEPOIS do merge (início do processo vivo > merge).
   AINDA NÃO VISTO     subiu ANTES do merge, ou o daemon não está carregado.
   NÃO CONSEGUI SABER  sem sha de merge, sem daemon identificável, sem processo pra ler o início, ou a leitura falhou.
+                      (daemon periódico: com instância viva decide o início dela, como no KeepAlive; entre disparos,
+                      CONFIRMADO se um ciclo inteiro passou depois do merge, AINDA se ainda não passou.)
 
 Regra de ouro (E12: "vazio ≠ falhou"): NÃO CONSEGUI SABER é o estado de qualquer dúvida. Leitura que falhou
 (bd/launchctl/ps/git, timeout, saída ilegível) NUNCA vira CONFIRMADO — e também não vira "AINDA NÃO VISTO" nem
@@ -21,23 +23,41 @@ DETECTA, NÃO AGE. Não reinicia nada e não roda daemon-refresh: o Mayor / dono
 As únicas chamadas ao launchd são `launchctl list <label>` (leitura).
 
 Motivos (`reason`):
-  CONFIRMADO:  started-after-merge
-  AINDA:       started-before-merge · not-loaded
-  NCS (conteúdo, rc 0):        no-merge-sha · no-daemon · sha-not-on-disk · sha-not-in-checkout · not-keepalive ·
-                               loaded-no-pid · duplicate-label
-  NCS (leitura quebrou, rc 3): launchctl-read-failed · ps-read-failed · git-read-failed · bad-timestamp ·
-                               plist-read-failed · status-unknown · internal-error
+  CONFIRMADO:  started-after-merge · period-elapsed
+  AINDA:       started-before-merge · not-loaded · period-not-elapsed
+  NCS (conteúdo, rc 0):        no-merge-sha · no-daemon · sha-not-on-disk · sha-not-in-checkout · event-driven ·
+                               unknown-kind · loaded-no-pid · duplicate-label
+  NCS (leitura quebrou, rc 3): marker-read-failed · deps-read-failed · launchctl-read-failed · ps-read-failed ·
+                               git-read-failed · bad-timestamp · plist-read-failed · status-unknown · internal-error ·
+                               deadline-exceeded (estourou o prazo total: o que não deu tempo de olhar NÃO some, vira dúvida)
   Uma LOJA que não listou não é uma loja com zero beads: fica em `stores` (ok=false) no relatório e o rc é 3.
 
-ESCOPO DESTA FATIA (ga-iyfe83.1; o que ainda não entrou é NÃO CONSEGUI SABER com motivo, nunca CONFIRMADO):
-  - o sha do merge vem só do `close_reason` (`sha=<40hex>`); sem ele → no-merge-sha. (.2: marcador do gate.)
-  - só julga daemon KeepAlive (início do processo vivo × merge); periódico / por evento → not-keepalive. (.2)
-  - dono = o plist que roda exatamente um arquivo da entrega. (.2: closure do deploy_deps.json.)
-  - dry-run: escreve `daemon-unverified-sweep-latest.json` e imprime as contagens. (.3: relatório legível, aviso, plist.)
+COMO ACHA O SHA E O DONO (fatia 2; o que não se acha é NÃO CONSEGUI SABER com motivo, nunca CONFIRMADO):
+  - sha do merge: `sha=<40hex>` do `close_reason` do bead; sem ele, o marcador de gate PASSED do bead (label
+    `source-bead:<id>`, loja HQ). Os marcadores vêm numa consulta em lote só por execução, indexada em memória
+    (a consulta por bead passou de 45 min com o load em ~60; a em lote leva segundos). A consulta que falha é
+    `marker-read-failed`, nunca "sem marcador" (= no-merge-sha). Marcador com data ilegível é bad-timestamp.
+  - dono: o plist que roda exatamente um arquivo da entrega (ProgramArguments) OU o daemon cujo closure/assets em
+    `daemons/deploy_deps.json` inclui o arquivo (lib importada). O mapa é lido no commit do merge E no HEAD vivo
+    (união): o daemon que importava o arquivo quando ele entrou e o que o importa hoje são ambos donos.
+  - tipo do daemon: KeepAlive (início do processo vivo × merge) · periódico = StartInterval / StartCalendarInterval
+    (o launchd não sobrepõe execuções do mesmo job: COM instância viva vale o início dela × merge, igual ao KeepAlive —
+    uma instância anterior ao merge ainda é o único processo que rodou; SEM instância, entre disparos, um ciclo inteiro
+    depois do merge basta) · WatchPaths / QueueDirectories / sem gatilho conhecido = NCS (nada prova que um evento rodou
+    depois do merge).
 
 LIMITES CONHECIDOS (o relatório é uma triagem, não uma prova):
   - "subiu depois do merge" é NECESSÁRIO, não SUFICIENTE: se o checkout vivo só recebeu o código depois do merge
     (pull atrasado), um daemon que subiu entre o merge e o pull sai CONFIRMADO sem ter rodado o código novo.
+  - Periódico: "um ciclo inteiro passou" conta o relógio, não o tempo acordado; a máquina dormir no intervalo atrasa
+    o disparo e o veredito CONFIRMADO pode sair cedo. Interesse de triagem, não de prova.
+  - O mapa deploy_deps.json só existe no rig WhatsApp; nos outros, ausente = "sem mapa" (≠ ilegível = deps-read-failed).
+  - O mapa admite o que não sabe em `_asset_gaps` / `_coverage_gaps` (hoje 5 daemons com `render_template` de nome
+    dinâmico, ex.: auto_response_canary_daemon, classification_dashboard, inbound_reply_alerter) e o vigia NÃO lê essas
+    chaves: uma entrega só de template pode ter um daemon-lacuna ainda no código velho como dono INVISÍVEL, e o veredito
+    sai do(s) dono(s) estático(s) — pode dar CONFIRMADO com esse daemon-lacuna sem reiniciar.
+  - Os marcadores só são procurados na loja HQ (onde o gate grava os de todos os rigs): marcador guardado só na
+    loja do rig não é visto (no-merge-sha, NCS — nunca CONFIRMADO).
   - O sha do merge é só a PONTA da branch. Numa entrega em fast-forward com vários commits, os arquivos dos
     commits anteriores só entram na conta porque o script TAMBÉM busca commits cujo ASSUNTO cita o id do bead como
     token inteiro (janela de 30 dias antes do merge). Commit que não cita o bead no assunto e não é a ponta não é visto.
@@ -48,12 +68,29 @@ LIMITES CONHECIDOS (o relatório é uma triagem, não uma prova):
     início (NCS loaded-no-pid). O mesmo bead pode oscilar CONFIRMADO ↔ NCS conforme o instante da varredura.
   - O repo do sha é o do checkout da loja que listou o bead: sha de outro rig sai sha-not-on-disk (NCS), nunca CONFIRMADO.
 
-COMO RODA. Dry-run: escreve `daemon-unverified-sweep-latest.json` em .gc/logs e imprime uma linha com as contagens por estado.
-Saída: 0 = leu tudo · 3 = alguma leitura falhou (ver `stores` / `reason` no JSON).
-Sementes de teste: DUS_BD, DUS_LAUNCHCTL, DUS_PS, DUS_STORES, DUS_OUT_DIR, DUS_NOW…
+  - O aviso (--notify) só dispara por AINDA NÃO VISTO novo. Um vigia CEGO (leitura quebrada, rc 3) não avisa por si: aparece no
+    relatório (seção Leituras / "LEITURA INCOMPLETA"), no log do launchd e no rc — quem quiser alarme de cegueira liga no rc.
+
+COMO RODA. Escreve em .gc/logs (DUS_OUT_DIR): `daemon-unverified-sweep-latest.json` (máquina), `daemon-unverified-sweep-<AAAA-MM-DD>.md`
+(legível: contagens por estado, AINDA NÃO VISTO POR DAEMON — o que o Mayor decide reiniciar —, NÃO CONSEGUI SABER por motivo) e imprime
+uma linha com as contagens. Sem `--notify` é dry-run: NÃO avisa e NÃO toca no baseline.
+Com `--notify`: UMA notificação, só se há AINDA NÃO VISTO que ainda não foi avisado (baseline em `daemon-unverified-sweep.state.json`:
+ids já avisados). O baseline só avança se o aviso foi ENTREGUE (notify que falhou re-tenta na próxima rodada). ENTREGUE = o push foi
+aceito (o notify roda com NOTIFY_STRICT_EXIT=1 + NOTIFY_FORCE_PUSH=1: rc 0 COM a linha "Notification sent") ou ficou SEGURADO até as 7h
+(rc 10; o notify-quiet-flush empurra). Digest/teto (12), dedup (11), autodispatch (13), e-mail dropado (14), rc 0 sem a linha (kill-switch),
+timeout e rc desconhecido são NÃO entregue: o rc padrão 0 do notify cobre todos eles e não prova nada. Sai do baseline só o que
+virou CONFIRMADO; NÃO CONSEGUI SABER mantém a marca (voltar de uma leitura quebrada não é "novo"). Baseline ilegível ≠ ausente: ausente
+é a 1ª rodada; ilegível também re-avisa (melhor um aviso repetido que silêncio), mas diz alto e sai com rc 3.
+Instância única (flock em `daemon-unverified-sweep.lock`): a 2ª sai sem varrer, rc 0. Prazo total `DUS_DEADLINE` (2700 s, checado entre
+beads): o que não deu tempo vira NÃO CONSEGUI SABER `deadline-exceeded` (rc 3), nunca "terminou limpo".
+Saída: 0 = leu tudo · 3 = alguma leitura falhou / prazo estourou / aviso não entregue (ver `stores` / `reason` no JSON).
+Sementes de teste: DUS_BD, DUS_LAUNCHCTL, DUS_PS, DUS_NOTIFY, DUS_NOTIFY_TIMEOUT, DUS_STORES, DUS_OUT_DIR, DUS_NOW, DUS_DEADLINE…
+A loja HQ é a PRIMEIRA de DUS_STORES (os marcadores de gate de todos os rigs moram nela).
+Gatilho: `com.gascity.daemon-unverified-sweep.plist` (segunda 08:47). NÃO reinicia nada e NÃO roda daemon-refresh.
 """
 import argparse
 import datetime
+import fcntl
 import glob
 import json
 import os
@@ -75,8 +112,10 @@ BRANCH_WINDOW = 30 * DAY
 SHA_RE = re.compile(r"sha=([0-9a-f]{40})")
 
 # NCS cujo motivo é "a leitura quebrou" (≠ NCS de conteúdo): fazem o vigia sair com rc 3, nunca com zero.
-READ_FAILED = {"launchctl-read-failed", "ps-read-failed", "git-read-failed", "bad-timestamp", "plist-read-failed",
-               "internal-error", "status-unknown"}
+READ_FAILED = {"marker-read-failed", "deps-read-failed", "launchctl-read-failed", "ps-read-failed", "git-read-failed",
+               "bad-timestamp", "plist-read-failed", "internal-error", "status-unknown", "deadline-exceeded"}
+
+DEPS_PATH = "daemons/deploy_deps.json"      # mapa daemon → closure/assets (só o rig WhatsApp tem)
 
 
 class ReadFailed(Exception):
@@ -103,8 +142,9 @@ DEFAULT_STORES = ";".join([
 ])
 
 
-def run(cmd, timeout=None):
+def run(cmd, timeout=None, extra_env=None):
     e = dict(os.environ)
+    e.update(extra_env or {})
     e["LC_ALL"] = "C"          # `ps -o lstart=` em C: "Fri Oct 16 10:30:00 2026", independente do locale
     return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape", env=e,
                           timeout=timeout if timeout is not None else int(env("DUS_CMD_TIMEOUT", "60")))
@@ -146,15 +186,16 @@ def load_stores():
     return stores
 
 
-def bd_list(store, labels):
+def bd_list(store, labels, infra=False):
     """`bd -C <store> list --label … --all --json --limit 0` com retry. Falha sustentada → ReadFailed('bd-failed').
 
     A máquina vive com load ~70 e o Dolt estoura timeout de leitura (`i/o timeout`, `invalid connection`): UMA
-    falha não pode virar "loja sem beads" — por isso retry, e depois de esgotar, ReadFailed (≠ lista vazia)."""
+    falha não pode virar "loja sem beads" — por isso retry, e depois de esgotar, ReadFailed (≠ lista vazia).
+    `infra`: o bd 1.1.0 omite bead efêmero (INFRA) do `list` por padrão; marcador de gate antigo é efêmero."""
     cmd = [env("DUS_BD", "bd"), "-C", store, "list"]
     for l in labels:
         cmd += ["--label", l]
-    cmd += ["--all", "--json", "--limit", "0"]
+    cmd += ["--all", "--json", "--limit", "0"] + (["--include-infra"] if infra else [])
     attempts = int(env("DUS_RETRIES", "3"))
     last = ""
     for i in range(attempts):
@@ -174,14 +215,73 @@ def bd_list(store, labels):
     raise ReadFailed("bd-failed", last)
 
 
-def merge_of(bead):
-    """O sha mergeado e QUANDO desembarcou, lidos do close_reason (`sha=<40hex>`; tempo = closed_at do bead, que é >= o
-    merge: erra pro lado conservador). Sem sha ali → None (NÃO CONSEGUI SABER): esta fatia não consulta o marcador.
+class Markers:
+    """Os marcadores de gate PASSED, lidos UMA vez por execução (e só se algum bead precisar) e indexados por bead.
+
+    A consulta por bead não terminou em 45 min com o load em ~60 (170 de 314 estouraram o prazo); a em lote leva segundos.
+    Consulta que falhou fica guardada como falha (`error`) e TODO bead que depender dela sai marker-read-failed: a falha
+    não vira "bead sem marcador"."""
+
+    def __init__(self, store):
+        self.store, self.by_bead, self.error, self.seconds, self.n = store, None, None, 0.0, 0
+
+    def rows(self, bead_id):
+        if self.by_bead is None and self.error is None:
+            t0 = time.monotonic()
+            try:
+                rows = bd_list(self.store, ["type:quality-gate-marker", "gate-status:passed"], infra=True)
+                idx = {}                                  # só vira o índice se TODAS as linhas lerem (nunca um índice pela metade)
+                for m in rows:
+                    labels = m.get("labels")
+                    for l in (labels if isinstance(labels, list) else []):
+                        if isinstance(l, str) and l.startswith("source-bead:"):
+                            idx.setdefault(l[len("source-bead:"):], []).append(m)
+                self.by_bead, self.n = idx, len(rows)
+            except ReadFailed as e:
+                self.error = e.detail or e.reason
+            except (AttributeError, TypeError) as e:       # linha que não é objeto JSON
+                self.error = "marcador ilegível: %s: %s" % (type(e).__name__, e)
+            self.seconds = round(time.monotonic() - t0, 1)
+        if self.error is not None:
+            raise ReadFailed("marker-read-failed", self.error)
+        return self.by_bead.get(bead_id, [])          # leu e o bead não tem marcador: lista vazia (≠ falha, que levanta acima)
+
+    def status(self):
+        if self.by_bead is None and self.error is None:
+            return {"read": False}
+        return {"read": True, "ok": self.error is None, "error": self.error or "", "n": self.n, "seconds": self.seconds}
+
+
+def marker_merge(rows):
+    """(sha, quando, 'marker') do marcador PASSED mais recente que traz `sha=`; nenhum com sha → None.
+    Marcador com sha e data ilegível NÃO é descartado: o ilegível pode ser o re-merge mais novo, e julgar pelo antigo daria
+    CONFIRMADO falso. Ilegível → bad-timestamp (a leitura quebrou), mesmo que outro marcador esteja legível."""
+    found, bad = [], None
+    for m in rows:
+        sha = SHA_RE.search(m.get("close_reason") or "")
+        if not sha:
+            continue
+        try:
+            found.append((ts(m.get("closed_at")), sha.group(1)))
+        except ReadFailed as e:
+            bad = e
+    if bad:
+        raise bad
+    if found:
+        t, sha = max(found)                       # o último desembarque vence (re-merge)
+        return sha, t, "marker"
+    return None
+
+
+def merge_of(bead, markers):
+    """O sha mergeado e QUANDO desembarcou. 1º o `close_reason` do bead (`sha=<40hex>`; tempo = closed_at do bead, que é >=
+    o merge: erra pro lado conservador). Sem sha ali → o marcador de gate PASSED do bead. Sem nenhum → None (NÃO CONSEGUI
+    SABER: no-merge-sha). Marcador que não se conseguiu ler levanta ReadFailed — nunca é o mesmo que "sem marcador".
     Sha sem `closed_at` não é "sem sha": o sha existe e o QUANDO faltou → ts() levanta bad-timestamp (leitura que falhou)."""
     m = SHA_RE.search(bead.get("close_reason") or "")
     if m:
         return m.group(1), ts(bead.get("closed_at")), "close_reason"
-    return None
+    return marker_merge(markers.rows(bead["id"]))
 
 
 def sha_place(repo, sha):
@@ -268,8 +368,38 @@ def load_plists():
     return plists, info
 
 
-def owners_of(files, repo, plists):
-    """Labels dos daemons donos dos `files`: o plist roda exatamente esse arquivo (ProgramArguments)."""
+_deps_cache = {}
+
+
+def deps_at(repo, rev):
+    """{arquivo: {labels}} do `daemons/deploy_deps.json` (closure + assets de cada daemon) em `rev` (um sha ou HEAD).
+
+    Três respostas que não se confundem: o rig não tem o mapa em `rev` → {} (ls-tree rc 0, sem saída); tem e não leu →
+    ReadFailed('deps-read-failed'); tem e leu → o mapa. `ls-tree` separa "ausente" de "git quebrado" (o `cat-file -e` dá
+    128 pros dois). Lê do git, não do disco: edição não commitada no checkout não é o código mergeado."""
+    key = (repo, rev)
+    if key not in _deps_cache:
+        try:
+            tree = git(repo, "ls-tree", "--name-only", rev, "--", DEPS_PATH)
+            out = {}
+            if tree.strip():
+                for d in json.loads(git(repo, "show", "%s:%s" % (rev, DEPS_PATH)))["daemons"].values():
+                    closure, assets = d["closure"], d.get("assets", [])     # closure sempre existe; assets só em alguns daemons
+                    if not isinstance(closure, list) or not isinstance(assets, list):
+                        raise ValueError("closure/assets não é lista")      # string viraria "uma lib por letra": dono errado, calado
+                    for rel in closure + assets:
+                        out.setdefault(rel, set()).add(d["label"])
+            _deps_cache[key] = out
+        except ReadFailed as e:
+            raise ReadFailed("deps-read-failed", e.detail or e.reason)
+        except (ValueError, KeyError, TypeError, AttributeError) as e:      # JSON quebrado / formato que não é o esperado
+            raise ReadFailed("deps-read-failed", "%s: %s" % (type(e).__name__, e))
+    return _deps_cache[key]
+
+
+def owners_of(files, repo, plists, deps):
+    """Labels dos daemons donos dos `files`: (a) o plist roda exatamente esse arquivo (ProgramArguments); (b) o arquivo está
+    no closure/assets do daemon em `deps` (lib importada). Label do mapa SEM plist nesta máquina não é dono: não roda aqui."""
     real = os.path.realpath(repo)
     fileset = set(files)
     labels = set()
@@ -278,6 +408,8 @@ def owners_of(files, repo, plists):
             progs = {os.path.relpath(os.path.realpath(a), real) for a in pl.get("ProgramArguments", []) if a.startswith("/")}
             if progs & fileset:
                 labels.add(label)
+    for f in files:
+        labels |= {l for l in deps.get(f, ()) if l in plists}
     return sorted(labels)
 
 
@@ -303,7 +435,43 @@ def process_start(pid):
         raise ReadFailed("ps-read-failed", "lstart ilegível: %r" % out)
 
 
-def owner_state(pls, merged_at):
+def cal_period(entry):
+    """Maior vão possível entre dois disparos de UMA entrada de StartCalendarInterval (conservador: erra pra mais)."""
+    if not isinstance(entry, dict):
+        raise ReadFailed("plist-read-failed", "StartCalendarInterval ilegível: %r" % (entry,))
+    if "Month" in entry:
+        return 366 * DAY
+    if "Weekday" in entry:
+        return 7 * DAY
+    if "Day" in entry:
+        return 31 * DAY
+    if "Hour" in entry:
+        return DAY
+    if "Minute" in entry:
+        return 3600
+    # nenhuma chave de calendário conhecida: seria o MENOR período possível (60 s) e puxaria o veredito pra CONFIRMADO.
+    # O launchd tolera, mas entrada malformada é dúvida, não "dispara todo minuto".
+    raise ReadFailed("plist-read-failed", "StartCalendarInterval sem chave conhecida: %r" % (entry,))
+
+
+def period_seconds(plist):
+    """Tempo depois do qual PELO MENOS um disparo já ocorreu: o menor dos vãos (vários gatilhos só encurtam o maior vão).
+    Valor que não é número positivo não vira período: StartInterval=0 daria 'sempre decorrido' = CONFIRMADO falso."""
+    periods = []
+    if "StartInterval" in plist:
+        v = plist["StartInterval"]
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise ReadFailed("plist-read-failed", "StartInterval ilegível: %r" % (v,))
+        periods.append(v)
+    cal = plist.get("StartCalendarInterval")
+    if cal is not None:
+        periods += [cal_period(e) for e in (cal if isinstance(cal, list) else [cal])]
+    if not periods:                                      # lista vazia de StartCalendarInterval: o launchd não dispara nunca
+        raise ReadFailed("plist-read-failed", "StartCalendarInterval vazio")
+    return min(periods)
+
+
+def owner_state(pls, merged_at, now):
     plist = pls[0]
     status, pid = launchctl_pid(plist["Label"])
     if status == "not-loaded":
@@ -311,7 +479,22 @@ def owner_state(pls, merged_at):
     if len(pls) > 1:
         return NCS, "duplicate-label"       # dois arquivos com o mesmo Label: o launchd carrega um só, e qual eu não sei
     if not plist.get("KeepAlive"):
-        return NCS, "not-keepalive"         # periódico / por evento: esta fatia só julga quem vive até alguém matar
+        if "StartInterval" in plist or "StartCalendarInterval" in plist:
+            # periódico, COM instância viva: o launchd nunca sobrepõe execuções do mesmo job, então enquanto a instância que
+            # começou ANTES do merge não termina, nenhum disparo novo leu o código do disco. O relógio não diz nada aqui —
+            # decide o início DESSE processo (mesma regra do KeepAlive). Falha do ps sobe como ps-read-failed (NCS, rc 3).
+            if pid is not None:
+                if process_start(pid) > merged_at:
+                    return CONFIRMADO, "started-after-merge"
+                return AINDA, "started-before-merge"
+            # periódico, ENTRE disparos (sem PID): cada disparo é um processo novo que lê o código do disco (o sha já está no
+            # checkout vivo). Passou um ciclo inteiro desde o merge → algum disparo rodou o código novo; senão, ainda pode não.
+            if now - merged_at >= period_seconds(plist):
+                return CONFIRMADO, "period-elapsed"
+            return AINDA, "period-not-elapsed"
+        if plist.get("WatchPaths") or plist.get("QueueDirectories"):
+            return NCS, "event-driven"      # sem período: nada prova que algum evento disparou depois do merge
+        return NCS, "unknown-kind"
     if pid is None:
         return NCS, "loaded-no-pid"         # carregado e sem processo: não há início pra ler (≠ "subiu antes do merge")
     started = process_start(pid)
@@ -320,9 +503,9 @@ def owner_state(pls, merged_at):
     return AINDA, "started-before-merge"
 
 
-def classify(bead, repo, plists, unreadable):
+def classify(bead, repo, plists, unreadable, markers, now):
     try:
-        got = merge_of(bead)
+        got = merge_of(bead, markers)
     except ReadFailed as e:
         return NCS, e.reason, [], {}
     if not got:
@@ -335,11 +518,20 @@ def classify(bead, repo, plists, unreadable):
         files = delivery_files(repo, sha, bead["id"], merged_at)
     except ReadFailed as e:
         return NCS, e.reason, [], {}
-    owners = owners_of(files, repo, plists)
+    try:
+        # o mapa do commit do merge E o do HEAD vivo: o daemon que importava o arquivo quando ele entrou e o que o importa
+        # hoje são ambos donos (um dono a mais nunca melhora o veredito dos que já havia: CONFIRMADO exige todos).
+        deps = {}
+        for rev in (sha, "HEAD"):
+            for rel, labels in deps_at(repo, rev).items():
+                deps.setdefault(rel, set()).update(labels)
+    except ReadFailed as e:
+        return NCS, e.reason, [], {}
+    owners = owners_of(files, repo, plists, deps)
     results = []
     for label in owners:
         try:
-            st, why = owner_state(plists[label], merged_at)
+            st, why = owner_state(plists[label], merged_at, now)
         except ReadFailed as e:
             st, why = NCS, e.reason
         results.append((label, st, why))
@@ -356,12 +548,155 @@ def classify(bead, repo, plists, unreadable):
     return CONFIRMADO, results[0][2], labels, detail   # todos CONFIRMADO: o motivo do primeiro dono basta
 
 
+# ---- relatório, baseline, aviso -------------------------------------------
+
+def rollup(beads):
+    """Por daemon: quantos beads AINDA NÃO VISTO dependem dele — a visão acionável pra quem decide o reinício."""
+    out = {}
+    for b in beads:
+        if b["state"] != AINDA:
+            continue
+        for label, (st, why) in b["owner_states"].items():
+            if st == AINDA:                       # dono em NCS dentro de um bead AINDA não é "reiniciar este": fica de fora
+                d = out.setdefault(label, {"ainda": 0, "beads": [], "reasons": {}})
+                d["ainda"] += 1
+                d["beads"].append(b["id"])
+                d["reasons"][why] = d["reasons"].get(why, 0) + 1
+    return out
+
+
+def render_md(now, counts, reads, beads, daemons):
+    """O relatório legível. `reads` = [(ok, texto)] das leituras: uma que falhou aparece AQUI, não só no stderr do launchd."""
+    L = ["# Vigia de delivery:daemon-unverified — %s" % time.strftime("%Y-%m-%d", time.localtime(now)), "",
+         "DETECTA, NÃO AGE: nada foi reiniciado. Reiniciar é decisão do Mayor / dono do daemon, a partir deste relatório.", "",
+         "## Contagens", ""]
+    L += ["- %s: %d" % (k, counts[k]) for k in (CONFIRMADO, AINDA, NCS)]
+    L += ["- %s (tem o rótulo mas não está fechado): %d" % (OUT, counts[OUT]), "", "## Leituras", ""]
+    L += ["- %s%s" % ("" if ok else "⚠ ", text) for ok, text in reads]
+    L += ["", "## AINDA NÃO VISTO — por daemon (o que reiniciar)", ""]
+    if not daemons:
+        L += ["(nenhum)", ""]
+    for label, d in sorted(daemons.items(), key=lambda kv: (-kv[1]["ainda"], kv[0])):
+        L.append("### %s — %d bead(s) [%s]" % (label, d["ainda"], ", ".join("%s×%d" % kv for kv in sorted(d["reasons"].items()))))
+        L += ["- " + i for i in sorted(d["beads"])]
+        L.append("")
+    L += ["## NÃO CONSEGUI SABER — por motivo", ""]
+    by = {}
+    for b in beads:
+        if b["state"] == NCS:
+            by.setdefault(b["reason"], []).append(b)
+    if not by:
+        L += ["(nenhum)", ""]
+    for reason, bs in sorted(by.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        L.append("### %s — %d%s" % (reason, len(bs), "  ← LEITURA INCOMPLETA" if reason in READ_FAILED else ""))
+        L += ["- %s (%s)" % (b["id"], b["rig"]) for b in sorted(bs, key=lambda x: x["id"])]
+        L.append("")
+    L += ["## CONFIRMADO", "", ", ".join(sorted(b["id"] for b in beads if b["state"] == CONFIRMADO)) or "(nenhum)", ""]
+    return "\n".join(L)
+
+
+def write_atomic(path, text):
+    """tmp + rename: quem lê o arquivo nunca o vê pela metade."""
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+
+
+def load_state(path):
+    """(avisados, problema): `avisados` = {id: quando} dos AINDA NÃO VISTO já avisados.
+    Três respostas que não se confundem: arquivo ausente → ({}, None) = 1ª rodada, normal; lido → (o baseline, None);
+    existe e não leu / formato torto → ({}, motivo): também re-avisa tudo (melhor repetir um aviso que calar), mas o motivo sobe."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            notified = json.load(f)["notified"]
+        if not isinstance(notified, dict):
+            raise TypeError("notified não é objeto")
+        return dict(notified), None
+    except FileNotFoundError:
+        return {}, None
+    except Exception as e:
+        return {}, "%s: %s" % (type(e).__name__, e)
+
+
+def notify_text(new, counts, broken, bad_state):
+    ids = sorted(b["id"] for b in new)
+    top = {}
+    for b in new:
+        for label, (st, _why) in b["owner_states"].items():
+            if st == AINDA:
+                top[label] = top.get(label, 0) + 1
+    top_s = ", ".join("%s (%d)" % kv for kv in sorted(top.items(), key=lambda kv: (-kv[1], kv[0]))[:3])
+    head = "%d bead(s) novo(s) AINDA NÃO VISTO" % len(ids) + (": " + ", ".join(ids) if len(ids) <= 5 else "")
+    tail = []
+    if bad_state:
+        tail.append("baseline ilegível: pode repetir avisos antigos")
+    if broken:
+        tail.append("alguma leitura falhou: ver o relatório")
+    return ("%s — código mergeado que o daemon dono ainda não recarregou. Daemons: %s. Total: %d ainda não visto · %d confirmado · "
+            "%d não consegui saber.%s" % (head, top_s or "?", counts[AINDA], counts[CONFIRMADO], counts[NCS],
+                                           (" Atenção: " + "; ".join(tail) + ".") if tail else ""))
+
+
+# O contrato do `notify` (whatsapp_automation/scripts/notify, cabeçalho de policy_exit): por padrão ele sai 0 em TODO caminho que não
+# empurrou (digest, dedup, segurado até as 7h, teto, autodispatch, e-mail dropado) — rc 0 não diz "chegou". Com NOTIFY_STRICT_EXIT=1 cada
+# desfecho tem seu código; nos caminhos de política rc 0 = push aceito com 2xx. Os kill-switches ANTERIORES à política (NOTIFY_DISABLE,
+# pytest, preview, route-test) saem 0 em silêncio mesmo com a flag: por isso rc 0 só vale com a linha que o notify imprime no ramo 2xx.
+NOTIFY_SENT_MARK = "Notification sent"
+NOTIFY_HELD_RC = 10      # segurado até as 7h: a linha fica no history.db e o notify-quiet-flush (launchd) empurra às 7h
+NOTIFY_NOT_PUSHED = {11: "dedup (um push de mesmo título saiu há menos de 30 min — não dá pra saber se levava ESTES beads)",
+                     12: "caiu no digest ou no teto de pushes (nada chegou no celular)",
+                     13: "virou bead de autoconserto (sem push)", 14: "descartado (e-mail)", 1: "o transporte falhou"}
+
+
+def send_notify(text):
+    """(entregue, como). entregue=True só se o push foi aceito (rc 0 COM a linha de confirmação) ou ficou SEGURADO até as 7h (rc 10,
+    `como` diz qual). Qualquer outra coisa — rc de política, rc 0 sem a linha, timeout, notify que não abre — é NÃO entregue: o baseline
+    não avança e a próxima rodada re-tenta. Sai com NOTIFY_FORCE_PUSH=1 porque o roteador do notify manda fonte desconhecida pro digest
+    (allowlist, wa-f53j6) e sem isso nada vibraria; o silêncio 22h–7h e o teto global continuam valendo (rc 10 / 12)."""
+    cmd = [env("DUS_NOTIFY", os.path.join(HOME, ".local", "bin", "notify")), "-t", "Vigia daemon-unverified", "-p", "3", text]
+    # vazio → rc 0 sem a linha de confirmação = NÃO entregue; falhou/ilegível → timeout, OSError ou rc que não conheço = NÃO entregue
+    try:
+        r = run(cmd, timeout=int(env("DUS_NOTIFY_TIMEOUT", "60")), extra_env={"NOTIFY_STRICT_EXIT": "1", "NOTIFY_FORCE_PUSH": "1"})
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("daemon-unverified-sweep: ERRO — notify passou do prazo (DUS_NOTIFY_TIMEOUT, padrão 60 s) e foi cortado: "
+                         "pode ter saído ou não; baseline INTACTO, a próxima rodada re-tenta (pode repetir o aviso)\n")
+        return False, ""
+    except OSError as e:
+        sys.stderr.write("daemon-unverified-sweep: ERRO — notify não rodou (%s); baseline INTACTO, a próxima rodada re-tenta\n" % e)
+        return False, ""
+    if r.returncode == 0 and NOTIFY_SENT_MARK in r.stdout:
+        return True, "enviada"
+    if r.returncode == NOTIFY_HELD_RC:
+        return True, "segurada até as 7h (silêncio 22h–7h; o notify-quiet-flush empurra)"
+    if r.returncode == 0:
+        why = "saiu 0 sem a linha '%s': não empurrou (kill-switch NOTIFY_DISABLE / teste / preview?)" % NOTIFY_SENT_MARK
+    else:
+        why = "saiu %d: %s" % (r.returncode, NOTIFY_NOT_PUSHED.get(r.returncode, "código que não conheço — tratado como não entregue"))
+    sys.stderr.write("daemon-unverified-sweep: ERRO — notify %s; baseline INTACTO, a próxima rodada re-tenta\n" % why)
+    return False, ""
+
+
 def main(argv):
-    ap = argparse.ArgumentParser(description="vigia de delivery:daemon-unverified (detecta, não age)")
-    ap.parse_args(argv)
+    ap = argparse.ArgumentParser(description="vigia semanal de delivery:daemon-unverified (detecta, não age)")
+    ap.add_argument("--notify", action="store_true",
+                    help="avisa (UMA notificação) se há AINDA NÃO VISTO novo e avança o baseline; sem isto é dry-run: "
+                         "escreve o relatório e NÃO avisa nem toca no baseline")
+    args = ap.parse_args(argv)
     out_dir = env("DUS_OUT_DIR", os.path.join(CITY, ".gc", "logs"))
     os.makedirs(out_dir, exist_ok=True)
+    # Instância única: a varredura é lenta (load alto) e uma 2ª em cima da 1ª só dobra a carga no Dolt.
+    # ocupado (BlockingIOError) → sai sem varrer, rc 0, dito. Qualquer OUTRO erro de lock (ou do open) NÃO é "ocupado": sobe como
+    # traceback, rc ≠ 0, nada varrido — alto e inerte, nunca "outra instância cuida disso".
+    lock = open(os.path.join(out_dir, "daemon-unverified-sweep.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("daemon-unverified-sweep: já em execução (lock em %s) — saindo sem varrer." % out_dir)
+        return 0
+    deadline = time.monotonic() + float(env("DUS_DEADLINE", "2700"))
     stores = load_stores()
+    if not stores:                            # DUS_STORES vazio/em branco: nada foi varrido, e "nada varrido" ≠ "tudo limpo"
+        sys.stderr.write("daemon-unverified-sweep: ERRO — DUS_STORES não lista nenhuma loja; nada foi varrido\n")
     now = int(env("DUS_NOW", "0")) or int(time.time())
     try:
         plists, pinfo = load_plists()
@@ -369,6 +704,7 @@ def main(argv):
         plists, pinfo = None, {"unreadable": [], "no_label": [], "via_plutil": [], "error": e.detail}
         sys.stderr.write("daemon-unverified-sweep: ERRO — não consegui ler os plists (%s)\n" % e.detail)
     unreadable = pinfo["unreadable"]
+    markers = Markers(stores[0]["store"] if stores else "")   # HQ é a primeira loja: os marcadores de TODOS os rigs moram lá
     beads, store_status = [], {}
     for s in stores:
         try:
@@ -386,9 +722,11 @@ def main(argv):
                 state, reason, owners, detail = OUT, "not-closed", [], {}
             elif plists is None:
                 state, reason, owners, detail = NCS, "plist-read-failed", [], {}
+            elif time.monotonic() >= deadline:
+                state, reason, owners, detail = NCS, "deadline-exceeded", [], {}   # não deu tempo de olhar: dúvida, não "limpo"
             else:
                 try:
-                    state, reason, owners, detail = classify(b, s["repo"], plists, unreadable)
+                    state, reason, owners, detail = classify(b, s["repo"], plists, unreadable, markers, now)
                 except Exception as e:                                   # um bead estranho não derruba os outros
                     state, reason, owners, detail = NCS, "internal-error", [], {}
                     sys.stderr.write("daemon-unverified-sweep: bead %s: %s: %s\n" % (b.get("id"), type(e).__name__, e))
@@ -397,17 +735,57 @@ def main(argv):
     counts = {CONFIRMADO: 0, AINDA: 0, NCS: 0, OUT: 0}
     for b in beads:
         counts[b["state"]] += 1
-    report_path = os.path.join(out_dir, "daemon-unverified-sweep-latest.json")
-    with open(report_path + ".tmp", "w", encoding="utf-8") as f:
-        json.dump({"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "counts": counts,
-                   "stores": store_status, "plists": dict(pinfo, n=len(plists or {})), "beads": beads},
-                  f, ensure_ascii=False, indent=1)
-    os.replace(report_path + ".tmp", report_path)          # quem lê (a .3) nunca vê um JSON pela metade
+    daemons = rollup(beads)
+    mk = markers.status()
+    json_path = os.path.join(out_dir, "daemon-unverified-sweep-latest.json")
+    write_atomic(json_path, json.dumps({"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "counts": counts,
+                                        "stores": store_status, "markers": mk, "plists": dict(pinfo, n=len(plists or {})),
+                                        "daemons": daemons, "beads": beads}, ensure_ascii=False, indent=1))
     reasons = {b["reason"] for b in beads} | {v[1] for b in beads for v in b["owner_states"].values()}
-    broken = plists is None or any(not v["ok"] for v in store_status.values()) or bool(reasons & READ_FAILED)   # falha de dono conta mesmo sob AINDA
-    print("%s daemon-unverified-sweep: %s · relatório: %s" % (
+    broken = (plists is None or not stores or any(not v["ok"] for v in store_status.values())
+              or bool(reasons & READ_FAILED))   # falha de dono conta mesmo sob AINDA
+    reads = [(False, "NENHUMA loja configurada (DUS_STORES vazio) — nada foi varrido")] if not stores else []
+    reads += [(v["ok"], "loja %s: %s (n=%d)" % (n, "ok" if v["ok"] else "LEITURA FALHOU — " + str(v["error"])[:120], v["n"]))
+              for n, v in store_status.items()]
+    reads.append((plists is not None and not unreadable, "plists: %s" % ("%d labels lidos, %d ilegíveis" % (len(plists), len(unreadable))
+                                                                         if plists is not None else "NÃO LI os LaunchAgents — " + str(pinfo.get("error")))))
+    if mk["read"]:
+        reads.append((mk["ok"], "marcadores de gate: " + ("n=%d em %.1fs" % (mk["n"], mk["seconds"]) if mk["ok"] else "FALHOU — " + str(mk["error"])[:120])))
+    md_path = os.path.join(out_dir, "daemon-unverified-sweep-%s.md" % time.strftime("%Y-%m-%d", time.localtime(now)))
+    write_atomic(md_path, render_md(now, counts, reads, beads, daemons))
+    mk_line = "" if not mk["read"] else (" · marcadores: n=%d em %.1fs" % (mk["n"], mk["seconds"]) if mk["ok"]
+                                         else " · marcadores: FALHOU (%s)" % mk["error"])
+    print("%s daemon-unverified-sweep: %s%s · relatório: %s · json: %s" % (
         time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
-        " · ".join("%s=%d" % (k, counts[k]) for k in (CONFIRMADO, AINDA, NCS, OUT)), report_path))
+        " · ".join("%s=%d" % (k, counts[k]) for k in (CONFIRMADO, AINDA, NCS, OUT)), mk_line, md_path, json_path))
+
+    if args.notify:
+        state_path = os.path.join(out_dir, "daemon-unverified-sweep.state.json")
+        notified, bad_state = load_state(state_path)
+        if bad_state:
+            broken = True
+            sys.stderr.write("daemon-unverified-sweep: ERRO — baseline ilegível em %s (%s); tratando como 1ª rodada\n" % (state_path, bad_state))
+        new = [b for b in beads if b["state"] == AINDA and b["id"] not in notified]
+        delivered = True                                  # nada novo = nada a entregar: o baseline pode avançar
+        if new:
+            delivered, how = send_notify(notify_text(new, counts, broken, bad_state))
+            print("daemon-unverified-sweep: %d AINDA NÃO VISTO novo(s) — notificação %s" % (len(new), how if delivered else "NÃO entregue"))
+        else:
+            print("daemon-unverified-sweep: nenhum AINDA NÃO VISTO novo — sem notificação")
+        if delivered:
+            # Sai do baseline só o CONFIRMADO. NCS e o que esta rodada não viu (loja que não leu) mantêm a marca: voltar de uma
+            # leitura quebrada não é "novo". Entra o AINDA de agora.
+            confirmed = {b["id"] for b in beads if b["state"] == CONFIRMADO}
+            keep = {i: t for i, t in notified.items() if i not in confirmed}
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
+            keep.update({b["id"]: stamp for b in beads if b["state"] == AINDA and b["id"] not in keep})
+            try:
+                write_atomic(state_path, json.dumps({"notified": keep, "last_run": stamp}, ensure_ascii=False, indent=1))
+            except OSError as e:                          # avisou mas não guardou: na próxima repete o aviso — dito, rc 3
+                broken = True
+                sys.stderr.write("daemon-unverified-sweep: ERRO — não consegui gravar o baseline (%s); a próxima rodada repete o aviso\n" % e)
+        else:
+            broken = True
     return 3 if broken else 0
 
 

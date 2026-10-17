@@ -1,0 +1,138 @@
+# hetzner-rsync-filter.hq.txt — o QUE sai do hq (/Users/athos/gt/.gascity-gastown-hq, ou o .gascity-gastown-hq/ de um worktree) para o nó Linux de testes: código e doc das pastas de código, por extensão. (ga-kz76o7)
+#
+# Contents
+#   Como é lido · O que garante · Seção 1 (nega sempre) · Seção 2 (âncora + pastas da raiz) · Seção 3 (extensões de código/doc/config)
+#
+# COMO É LIDO: igual ao hetzner-rsync-filter.wa.txt — o mbp-run.sh passa `--filter=". <este arquivo>"` ao rsync, com --delete --delete-excluded; vale a PRIMEIRA regra que casa, de cima para baixo;
+#   o filter_sane confere a FORMA (as 12 âncoras de segredo/dado ANTES de `+ /tests/***`, nenhum `+` antes dela, nada que inclua tudo, `- *` no fim). O hq não tem tests/: `+ /tests/***` aqui é só a
+#   âncora que a conferência exige. Arquivo ausente/ilegível/fora da forma = o nó NÃO é usado (o hq então roda local: o MBP não tem o hq).
+# O QUE GARANTE (por NOME e PASTA): (1) nenhuma pasta de DADO do hq sai: .beads (Dolt), .gc (runtime: logs, agentes, jsonl-archive com TODAS as beads, memórias), .dolt-backup, backup, .gc-worktrees,
+#   .codex, .gemini, .playwright-mcp, logs, docs/research; (2) da raiz só saem as pastas de CÓDIGO listadas (scripts packs docs agents formulas orders commands skills config) + CLAUDE.md e pack.toml
+#   — whatsapp_automation/, gascity/, crew/, deacon/, embeddeddolt/, city.toml e o resto da raiz ficam; (3) dentro delas só extensões de código/doc/config; (4) nome de segredo ou formato de dado
+#   (Seção 1) não sai nem lá dentro; (5) dumps e relatórios de medição ficam (docs/reports, *-pre.txt, *.out.txt, *.jsonl, *.log, harness/).
+# O QUE NÃO GARANTE: o filtro nunca lê CONTEÚDO. Quem olha é o node_guard do mbp-run.sh (hetzner-pii-scan.py): arquivo com lista de telefones/CPFs fica no mini mesmo com nome e pasta liberados.
+# MEDIDO 16/10: hq rastreado = 453 selftests (178 mil linhas) + código em scripts/ (16 MB) e packs/ (20 MB); o espelho git do nó (hetzner-mirror) já nega 59 caminhos por sparse — este é o equivalente
+#   para o rsync do WORKTREE (que leva o estado não commitado do builder, como no wa).
+#
+# SEÇÃO 1 — NEGA SEMPRE, em qualquer pasta: credencial, formas de segredo e formato de dado (as mesmas do wa; as 12 âncoras do filter_sane estão aqui).
+- .env
+- .env.*
+- *.pem
+- *.key
+- *.p12
+- *.pfx
+- *.crt
+- *.p8
+- *.jks
+- *.keystore
+- *.gpg
+- *.token
+- *.pickle
+- id_rsa*
+- id_ed25519*
+- *.kdbx
+- credentials*.json
+- client_secret*.json
+- cookies*.json
+- cookies*.txt
+- *.session
+- .netrc
+- .npmrc
+- .pypirc
+- .pgpass
+- .htpasswd
+- .git-credentials
+- .aws/
+- .ssh/
+- .gnupg/
+- auth/
+- auth-*/
+- auth_*/
+- auth.bak*/
+- .*[Tt][Oo][Kk][Ee][Nn]*
+- *[Tt][Oo][Kk][Ee][Nn]*.[jyti]*
+- *[Ss][Ee][Cc][Rr][Ee][Tt]*.[jyti]*
+- *[Pp][Aa][Ss][Ss][Ww]*.[jyti]*
+# pastas de DADO do hq (as da raiz com /; as genéricas em qualquer nível) e formatos de dado/dump
+- /.beads/
+- /.gc/
+- /.gc-worktrees/
+- /.dolt-backup/
+- /backup/
+- /.codex/
+- /.gemini/
+- /.playwright-mcp/
+- /.benchmarks/
+- /.pytest_cache/
+- /.runtime/
+- /logs/
+- /docs/research/
+- /docs/reports/
+- .beads/
+- .dolt/
+- .git/
+- __pycache__/
+- node_modules/
+- venv/
+- .venv/
+- *.harness/
+- *.duckdb*
+- *.db
+- *.db-wal
+- *.db-shm
+- *.sqlite
+- *.sqlite3
+- *.csv
+- *.parquet
+- *.gz
+- *.tgz
+- *.zip
+- *.tar
+- *.jsonl
+- *.ndjson
+- *.pkl
+- *.log
+- *.out
+- *.out.txt
+- *-pre.txt
+- *.png
+- *.jpg
+- *.jpeg
+- *.pdf
+# SEÇÃO 2 — âncora da conferência (o hq não tem tests/) e as pastas da raiz que saem; o resto da raiz fica
++ /tests/***
++ /scripts/
++ /packs/
++ /docs/
++ /agents/
++ /formulas/
++ /orders/
++ /commands/
++ /skills/
++ /config/
++ /CLAUDE.md
++ /pack.toml
+- /*
+# SEÇÃO 3 — dentro das pastas liberadas: subpastas e só extensões de código, doc e config. Nome DESCONHECIDO (outra extensão) fica.
++ */
++ *.sh
++ *.bash
++ *.py
++ *.md
++ *.toml
++ *.txt
++ *.json
++ *.yaml
++ *.yml
++ *.plist
++ *.html
++ *.js
++ *.mjs
++ *.css
++ *.sql
++ *.patch
++ *.ini
++ *.cfg
++ *.conf
++ *.template
+- *

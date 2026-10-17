@@ -18,6 +18,11 @@ export DOLT_S3_BACKUP_LIB=1
 # gate, so none of them may depend on what this host's hq looks like: pin the switch off for the whole
 # file, and let the ga-a0woau blocks below turn it on explicitly, against fixtures.
 SYNC_SEED_OLDGEN=0
+# ga-sh8t23.5: the reseed's bloat gate (RESEED_MIN_BLOAT_PCT) reads the machine's real live store and staging by db
+# name. Every reseed test written before it is a statement about the nightly-reseed path, so none of them may depend
+# on how big this host's staging is tonight: pin the gate off for the whole file, and let the ga-sh8t23.5 block
+# turn it on explicitly, against fixtures.
+RESEED_MIN_BLOAT_PCT=0
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -898,6 +903,161 @@ RC=$?
 [ -e "$RESEED_MARKER_FILE" ] && bad "scenario D: RESEED_AFTER_UPLOAD=0 must skip invoking the reseed script entirely" || ok "scenario D: reseed script correctly never invoked when disabled"
 rm -f "$RESEED_MARKER_FILE" 2>/dev/null || true
 unset RESEED_MARKER_FILE
+
+# ── the reseed's bloat gate (ga-sh8t23.5) ────────────────────────────────────────────────────────────────────
+# Measured 17/10, whatsapp_automation (live 2.0GB, staging 1.96GB = 98%): the nightly reseed took the volume's free
+# space from ~5.5GB to 1.5GB for ~4 minutes — the 04:00 "disk critical" — to shrink the staging by 100MB. The gate:
+# reseed only when the staging is at least RESEED_MIN_BLOAT_PCT% of the live store; a staging that cannot be
+# measured is a third answer and keeps the nightly reseed. The reseed script itself is a stub that leaves a
+# marker, so "was it invoked" is asked of the filesystem, not of the log.
+echo "── _reseed_staging_if_enabled() bloat gate (ga-sh8t23.5) ──"
+
+cat > "$RESEED_STUB_DIR/reseed_gate.sh" <<'STUB'
+#!/bin/bash
+touch "$RESEED_MARKER_FILE"
+case "${RESEED_STUB_MODE:-ok}" in
+  disk) echo "ABORTADO: disco insuficiente. NÃO iniciando: ..."; exit 1 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$RESEED_STUB_DIR/reseed_gate.sh"
+
+G_CITY="$(mktemp -d /tmp/s3backup-selftest-gate.XXXXXX)"
+G_ROOT="$G_CITY/.dolt-backup"
+G_STATE="$(mktemp -d /tmp/s3backup-selftest-gate-state.XXXXXX)"
+# gate_mkdb <db> <live_kb> <staging_kb> — real files of real size, so `du -sk` reads real blocks.
+gate_mkdb() {
+  local d="$1" live="$2" stage="$3"
+  rm -rf "$G_CITY/.beads/dolt/$d" "$G_ROOT/$d"
+  mkdir -p "$G_CITY/.beads/dolt/$d" "$G_ROOT/$d"
+  if [ "$live" -gt 0 ]; then dd if=/dev/zero of="$G_CITY/.beads/dolt/$d/data" bs=1024 count="$live" 2>/dev/null; fi
+  if [ "$stage" -gt 0 ]; then dd if=/dev/zero of="$G_ROOT/$d/data" bs=1024 count="$stage" 2>/dev/null; fi
+}
+# gate_call <db> <min_pct> [stub-mode] — runs the wrapper against the fixture city; sets GATE_RC and GATE_RAN
+# (1 only if the reseed script was actually invoked) and leaves its log in $RESEED_TEST_LOG, notify calls in
+# $NOTIFY_STUB_CALLS.
+gate_call() {
+  local d="$1" min="$2" mode="${3:-ok}"
+  RESEED_MARKER_FILE="$(mktemp -u)"; export RESEED_MARKER_FILE
+  : > "$RESEED_TEST_LOG"; : > "$NOTIFY_STUB_CALLS"
+  CITY="$G_CITY" BACKUP_ROOT="$G_ROOT" RESEED_MIN_BLOAT_PCT="$min" RESEED_STUB_MODE="$mode" \
+    RESEED_SCRIPT="$RESEED_STUB_DIR/reseed_gate.sh" RESEED_TIMEOUT_SECS=5 RESEED_AFTER_UPLOAD=1 \
+    LOG="$RESEED_TEST_LOG" NOTIFY="$RESEED_STUB_DIR/notify" \
+    MARGIN_REFUSAL_STATE_DIR="$G_STATE" MARGIN_REFUSAL_ALARM_THRESHOLD=3 \
+    _reseed_staging_if_enabled "$d"
+  GATE_RC=$?
+  if [ -e "$RESEED_MARKER_FILE" ]; then GATE_RAN=1; else GATE_RAN=0; fi
+  rm -f "$RESEED_MARKER_FILE"; unset RESEED_MARKER_FILE
+}
+gate_pct() { CITY="$G_CITY" BACKUP_ROOT="$G_ROOT" _staging_bloat_pct "$1"; }
+
+# G0 — wiring: the shipped default is 150, and the gate sits BEFORE the reseed script is run.
+if ( unset RESEED_MIN_BLOAT_PCT; DOLT_S3_BACKUP_LIB=1; . "$SCRIPT"; [ "$RESEED_MIN_BLOAT_PCT" = "150" ] ) >/dev/null 2>&1; then
+  ok "G0: RESEED_MIN_BLOAT_PCT defaults to 150 when nothing sets it (the gate is on by default, not just available)"
+else bad "G0: RESEED_MIN_BLOAT_PCT does not default to 150 — the gate would ship off or at another threshold"; fi
+G_FN="$(declare -f _reseed_staging_if_enabled)"
+G_LEAN_POS="$(printf '%s\n' "$G_FN" | grep -n '_reseed_staging_is_lean "\$db"' | head -1 | cut -d: -f1)"
+G_RUN_POS="$(printf '%s\n' "$G_FN" | grep -n '"\$RESEED_SCRIPT" "\$db"' | head -1 | cut -d: -f1)"
+if [ -n "$G_LEAN_POS" ] && [ -n "$G_RUN_POS" ] && [ "$G_LEAN_POS" -lt "$G_RUN_POS" ]; then
+  ok "G0: _reseed_staging_if_enabled asks the gate before it runs the reseed script (lines $G_LEAN_POS < $G_RUN_POS)"
+else bad "G0: the gate is not wired ahead of the reseed script (gate line='${G_LEAN_POS:-none}', run line='${G_RUN_POS:-none}')"; fi
+
+# G1 — THE MEASURED CASE: staging at ~98% of live, threshold 150 → the reseed is NOT invoked, nothing is paged,
+# the log says why. Before the gate the same call ran the reseed script.
+gate_mkdb wadb 2000 1960
+G_PCT="$(gate_pct wadb)"
+gate_call wadb 150
+if [ "$GATE_RC" -eq 0 ] && [ "$GATE_RAN" -eq 0 ] && grep -qF "staging reseed not needed" "$RESEED_TEST_LOG" \
+   && grep -qF "staging at ${G_PCT}%" "$RESEED_TEST_LOG" && [ ! -s "$NOTIFY_STUB_CALLS" ] && [ "${G_PCT:-0}" -ge 90 ] && [ "${G_PCT:-999}" -le 100 ]; then
+  ok "G1: staging at ${G_PCT}% of live (threshold 150) → reseed NOT invoked, rc 0, logged with the measured %, no page"
+else bad "G1: rc=$GATE_RC ran=$GATE_RAN pct='${G_PCT:-?}' log=$(tr '\n' '|' < "$RESEED_TEST_LOG") notify=$(tr '\n' '|' < "$NOTIFY_STUB_CALLS")"; fi
+
+# G2 — a really bloated staging (the 09-16 shape, 300%) → the reseed runs exactly as before.
+gate_mkdb wadb 2000 6000
+gate_call wadb 150
+if [ "$GATE_RC" -eq 0 ] && [ "$GATE_RAN" -eq 1 ] && grep -qF "(>= 150%) — reseed needed" "$RESEED_TEST_LOG" && grep -qF "staging reseed OK" "$RESEED_TEST_LOG"; then
+  ok "G2: staging at 300% of live → the reseed script IS invoked and its success is logged as before"
+else bad "G2: rc=$GATE_RC ran=$GATE_RAN log=$(tr '\n' '|' < "$RESEED_TEST_LOG")"; fi
+
+# G3 — the boundary is "at least": threshold == measured % runs the reseed, threshold == measured % + 1 skips it.
+gate_mkdb wadb 2000 3000
+G_PCT="$(gate_pct wadb)"
+gate_call wadb "$G_PCT"
+G3A_RAN="$GATE_RAN"
+gate_call wadb $(( G_PCT + 1 ))
+G3B_RAN="$GATE_RAN"
+if [ -n "$G_PCT" ] && [ "$G3A_RAN" -eq 1 ] && [ "$G3B_RAN" -eq 0 ]; then
+  ok "G3: threshold == measured ${G_PCT}% → reseed runs; threshold ${G_PCT}+1 → skipped (the threshold is a minimum, inclusive)"
+else bad "G3: pct='${G_PCT:-?}' at-threshold ran=$G3A_RAN above-threshold ran=$G3B_RAN"; fi
+
+# G4 — a staging that cannot be MEASURED is neither "small" nor "bloated": the nightly reseed runs as it always did,
+# and the log says the number was missing. Three ways to be unmeasurable: no staging dir, no live dir, a live store
+# that measures 0.
+gate_mkdb wadb 2000 1960; rm -rf "$G_ROOT/wadb"
+gate_call wadb 150
+G4A_RAN="$GATE_RAN"; G4A_LOG="$(cat "$RESEED_TEST_LOG")"
+gate_mkdb wadb 2000 1960; rm -rf "$G_CITY/.beads/dolt/wadb"
+gate_call wadb 150
+G4B_RAN="$GATE_RAN"; G4B_LOG="$(cat "$RESEED_TEST_LOG")"
+gate_mkdb wadb 0 1960
+gate_call wadb 150
+G4C_RAN="$GATE_RAN"; G4C_LOG="$(cat "$RESEED_TEST_LOG")"
+if [ "$G4A_RAN" -eq 1 ] && [ "$G4B_RAN" -eq 1 ] && [ "$G4C_RAN" -eq 1 ] \
+   && printf '%s' "$G4A_LOG" | grep -qF "could not measure" && printf '%s' "$G4B_LOG" | grep -qF "could not measure" && printf '%s' "$G4C_LOG" | grep -qF "could not measure"; then
+  ok "G4: no staging dir / no live dir / live measures 0 → each is 'could not measure': the reseed still runs, and the log says so"
+else bad "G4: ran a/b/c=$G4A_RAN/$G4B_RAN/$G4C_RAN logs=[$G4A_LOG] [$G4B_LOG] [$G4C_LOG]"; fi
+
+# G4d — a partly unreadable staging: `du` exits 1 with a total that OMITS the unreadable subtree (measured: 100 for a
+# 200KB tree). That total is a guess, so it is "could not measure", never a low percentage that skips the reseed.
+gate_mkdb wadb 2000 1960
+mkdir -p "$G_ROOT/wadb/sub"; dd if=/dev/zero of="$G_ROOT/wadb/sub/x" bs=1024 count=1500 2>/dev/null; chmod 000 "$G_ROOT/wadb/sub"
+gate_call wadb 150
+chmod 755 "$G_ROOT/wadb/sub" 2>/dev/null || true
+if [ "$GATE_RAN" -eq 1 ] && grep -qF "could not measure" "$RESEED_TEST_LOG" && ! grep -qF "staging reseed not needed" "$RESEED_TEST_LOG"; then
+  ok "G4d: a staging du only half-read (exit 1, partial total) → 'could not measure', reseed runs; never read as a small %"
+else bad "G4d: ran=$GATE_RAN log=$(tr '\n' '|' < "$RESEED_TEST_LOG")"; fi
+
+# G5 — RESEED_MIN_BLOAT_PCT=0 is the old behaviour: lean staging, reseed runs, nothing measured or logged.
+gate_mkdb wadb 2000 1960
+gate_call wadb 0
+if [ "$GATE_RAN" -eq 1 ] && ! grep -qF "staging reseed not needed" "$RESEED_TEST_LOG" && ! grep -qF "could not measure" "$RESEED_TEST_LOG"; then
+  ok "G5: RESEED_MIN_BLOAT_PCT=0 → the nightly reseed runs even on a lean staging (the old behaviour is one knob away)"
+else bad "G5: ran=$GATE_RAN log=$(tr '\n' '|' < "$RESEED_TEST_LOG")"; fi
+
+# G6 — an unusable knob does not switch the gate off: it is read as 150, loudly.
+gate_mkdb wadb 2000 1960
+gate_call wadb "abc"
+G6A_RAN="$GATE_RAN"; G6A_LOG="$(cat "$RESEED_TEST_LOG")"
+gate_mkdb wadb 2000 6000
+gate_call wadb "abc"
+if [ "$G6A_RAN" -eq 0 ] && printf '%s' "$G6A_LOG" | grep -qF "is not a number — using 150" && [ "$GATE_RAN" -eq 1 ]; then
+  ok "G6: RESEED_MIN_BLOAT_PCT='abc' → treated as 150 (lean staging skipped with a log line, bloated one still reseeded)"
+else bad "G6: lean ran=$G6A_RAN bloated ran=$GATE_RAN log=[$G6A_LOG]"; fi
+
+# G7 — a night that needed no reseed breaks the margin-refusal streak. Refusal, refusal, a lean night, refusal:
+# the last one is the FIRST of a new streak ("1/3"), not the third of an old one — no page.
+rm -rf "$G_STATE"; G_STATE="$(mktemp -d /tmp/s3backup-selftest-gate-state.XXXXXX)"
+gate_mkdb wadb 2000 6000
+gate_call wadb 150 disk; gate_call wadb 150 disk
+gate_mkdb wadb 2000 1960
+gate_call wadb 150 disk
+G7_LEAN_RAN="$GATE_RAN"
+gate_mkdb wadb 2000 6000
+gate_call wadb 150 disk
+if [ "$G7_LEAN_RAN" -eq 0 ] && grep -qF "1/3 rodadas" "$RESEED_TEST_LOG" && [ ! -s "$NOTIFY_STUB_CALLS" ]; then
+  ok "G7: a lean night between two refusals resets the streak (the next refusal logs 1/3 and nothing is paged)"
+else bad "G7: lean ran=$G7_LEAN_RAN log=$(tr '\n' '|' < "$RESEED_TEST_LOG") notify=$(tr '\n' '|' < "$NOTIFY_STUB_CALLS")"; fi
+# ...and the control: three refusals with a BLOATED staging in a row still page (the gate hides no real alarm).
+rm -rf "$G_STATE"; G_STATE="$(mktemp -d /tmp/s3backup-selftest-gate-state.XXXXXX)"
+gate_mkdb wadb 2000 6000
+gate_call wadb 150 disk; gate_call wadb 150 disk; gate_call wadb 150 disk
+if [ -s "$NOTIFY_STUB_CALLS" ] && grep -qF "3 rodadas seguidas" "$NOTIFY_STUB_CALLS"; then
+  ok "G7: three consecutive refusals on a bloated staging still page (the gate does not hide a real alarm)"
+else bad "G7 control: notify=$(tr '\n' '|' < "$NOTIFY_STUB_CALLS")"; fi
+
+chmod -R u+rwx "$G_CITY" 2>/dev/null || true
+rm -rf "$G_CITY" "$G_STATE" 2>/dev/null || true
+unset -f gate_mkdb gate_call gate_pct
 
 rm -rf "$RESEED_STUB_DIR" 2>/dev/null || true
 rm -f "$NOTIFY_STUB_CALLS" "$RESEED_TEST_LOG" 2>/dev/null || true
