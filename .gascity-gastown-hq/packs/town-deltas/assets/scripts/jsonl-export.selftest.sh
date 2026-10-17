@@ -718,6 +718,37 @@ if [ "$(id -u)" -ne 0 ]; then
 else
   echo "  SKIP: unreadable-pack-dir case (running as root: chmod 000 does not block)"
 fi
+# jaw_window_left_s (the compactor's night gc is given this long): seconds to 06:00, and "no time" — rc 1, nothing printed — for a clock that cannot be read or a window that has closed
+# (never a number the caller could take for "plenty"). jaw_resources_ok's factor: 1 x is the compactor's gc, 2 x the exporter's repack; a factor that is not a number >= 1 refuses.
+lib_out() {  # lib_out <env assignments...> -- <function> [args...] — runs one lib function in a subshell with those seams; prints "rc=<n> out=<stdout>"
+  local envs=() o
+  while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  o="$(env "${envs[@]}" JAW_LOG="" bash -c '. "$1"; shift; out="$("$@")"; echo "rc=$? out=$out"' _ "$HERE/jsonl-archive-repack-window-lib.sh" "$@" 2>&1)"
+  echo "$o"
+}
+WL="$(lib_out JAW_HOUR=2 -- jaw_window_left_s)";                       [ "$WL" = "rc=0 out=14400" ] && ok "window left at 02h (only the hour known): 4h = 14400s" || bad "window left at 02h: $WL"
+WL="$(lib_out JAW_HOUR=2 JAW_SECS_OF_DAY=21500 -- jaw_window_left_s)"; [ "$WL" = "rc=0 out=100" ]   && ok "window left with the exact time of day (05:58:20): 100s — JAW_SECS_OF_DAY wins over JAW_HOUR" || bad "window left at 21500s: $WL"
+WL="$(lib_out JAW_SECS_OF_DAY=21600 -- jaw_window_left_s)";            [ "$WL" = "rc=1 out=" ]       && ok "at 06:00:00 the window is closed: rc 1, nothing printed" || bad "window left at 06:00: $WL"
+WL="$(lib_out JAW_SECS_OF_DAY=notatime -- jaw_window_left_s)";         [ "$WL" = "rc=1 out=" ]       && ok "a time of day that is not a number: rc 1 (no time), not a guess" || bad "window left, garbage seconds: $WL"
+WL="$(lib_out JAW_HOUR=25 -- jaw_window_left_s)";                      [ "$WL" = "rc=1 out=" ]       && ok "an hour that is not 0-23: rc 1" || bad "window left, hour 25: $WL"
+WL="$(lib_out JAW_HOUR=2 JAW_END_H=x -- jaw_window_left_s)";           [ "$WL" = "rc=1 out=" ]       && ok "a window end that is not a number: rc 1" || bad "window left, end 'x': $WL"
+WL="$(lib_out JAW_HOUR= JAW_SECS_OF_DAY= -- jaw_window_left_s)"
+case "$WL" in "rc=0 out="[0-9]*) [ "${WL#rc=0 out=}" -gt 0 ] && [ "${WL#rc=0 out=}" -le 21600 ] && ok "no seams: the real clock gives 1..21600s (${WL#rc=0 out=}s now)" || bad "real clock out of range: $WL" ;;
+              "rc=1 out=")   ok "no seams: the real clock is outside the window right now — rc 1, nothing printed" ;;
+              *)             bad "real clock: $WL" ;; esac
+mkpack() {  # mkpack <gitdir> <KiB> — a fake pack of that size, so the largest-pack measure has something to read
+  mkdir -p "$1/objects/pack"; dd if=/dev/zero of="$1/objects/pack/pack-x.pack" bs=1024 count="$2" 2>/dev/null
+}
+FD="$E2E/factor"; mkpack "$FD" 1024
+RF() {  # RF <free_kib> <factor-or-empty> → "rc=<n>"
+  lib_out JAW_HOUR=2 JAW_SWAP_KIB=0 -- jaw_resources_ok "$FD" "$1" "$2" | sed 's/ out=.*//'
+}
+[ "$(RF 1024 1)" = "rc=0" ] && [ "$(RF 1023 1)" = "rc=1" ] && ok "factor 1: free >= the largest pack allows (1024KiB), one KiB less refuses" || bad "factor 1 boundary: $(RF 1024 1) $(RF 1023 1)"
+[ "$(RF 1500 2)" = "rc=1" ] && [ "$(RF 2048 2)" = "rc=0" ] && ok "factor 2 (the exporter's rule): 1500KiB free is not enough for a 1024KiB pack, 2048KiB is" || bad "factor 2: $(RF 1500 2) $(RF 2048 2)"
+[ "$(RF 1500 "")" = "rc=1" ] && ok "no factor given: the default is 2 x (the exporter keeps its rule)" || bad "default factor: $(RF 1500 "")"
+for badf in 0 x -1 1.5; do
+  [ "$(RF 99999999 "$badf")" = "rc=1" ] && ok "factor '$badf' is not a number >= 1: refused, whatever the free space" || bad "factor '$badf' accepted: $(RF 99999999 "$badf")"
+done
 # A repo recreated WITHOUT the two keys (the exporter recreates it when .git goes missing; ensure_archive_pack_config runs only afterwards): the commit itself must start nothing outside the
 # window, by its own -c flags. commit_archive_snapshot lives past the library-mode return, so its text is lifted out of the script and run against a bare repo with no keys.
 keyless_commit() {  # keyless_commit <name> <JAW_HOUR> — one commit in a fresh repo with NO maintenance/gc keys; trace2 in $E2E/t2-<name>.json

@@ -12,6 +12,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACK="$(cd "$HERE/../.." && pwd)"                       # .../packs/town-deltas
 CITY_ROOT="$(cd "$PACK/../.." && pwd)"                  # .../.gascity-gastown-hq
 SCRIPT="$HERE/jsonl-archive-compact.sh"
+LIB="$HERE/jsonl-archive-repack-window-lib.sh"
 ORDER="$PACK/orders/jsonl-archive-compact.toml"
 
 PASS=0; FAIL=0; SKIP=0
@@ -129,6 +130,8 @@ chmod +x "$WORK/git-fx"
 # ga-wkoij7: the consolidating gc starts only in the night window, so the clock is a seam — JAW_HOUR=2 unless a test sets T_HOUR — and the window log goes under $WORK, never into the real city.
 # The free space the window rule reads is the same JAC_FREE_KIB as every disk test here (T_FREE, 90GB unless set); a fixture that sets T_FREE to a few KiB to exercise tier 1's or the gc's
 # own disk check must also set T_SWAP=0 (the swap headroom the window rule adds, 2GiB by default), or the window refuses first and the gc's own checks are never reached.
+# The night gc's longer cap (JAC_NIGHT_GC_MAX_S, 21600 in production) is OFF here (T_NIGHT_MAX=0) so the older tests keep their short gc caps; S38 turns it on with T_NIGHT_MAX, and T_SECS (the exact
+# time of day), T_MARGIN and T_FACTOR are its other seams.
 run_jac() {
   local repos="$1"; shift
   JAC_REPOS="$repos" JAC_STATE="${T_STATE:-$WORK/state.json}" JAC_LOG="${T_LOG:-$WORK/log}" JAC_LOCK="${T_LOCK:-$WORK/lock}" JAC_GC="${T_GC:-$WORK/gc-stub}" \
@@ -141,6 +144,7 @@ run_jac() {
   JAC_TAIL_LIMIT_KIB="${T_TAIL:-0}" JAC_TAIL_MAX_OBJECTS="${T_TAIL_OBJS:-}" JAC_TAIL_TIMEOUT_S="${T_TAIL_TIMEOUT:-}" \
   JAC_LSOF="${T_LSOF:-}" JAC_RECLAIM_WAIT_S="${T_RECLAIM_WAIT:-}" JAC_PS="${T_PS:-}" JAC_PS_TIMEOUT_S="${T_PS_TIMEOUT:-}" \
   JAW_HOUR="${T_HOUR:-2}" JAW_LOG="${T_WLOG:-$WORK/window.log}" JAW_SWAP_KIB="${T_SWAP:-}" \
+  JAW_SECS_OF_DAY="${T_SECS:-}" JAC_NIGHT_GC_MAX_S="${T_NIGHT_MAX:-0}" JAC_NIGHT_MARGIN_S="${T_MARGIN:-}" JAC_GC_PACK_FACTOR="${T_FACTOR:-}" \
   "$SCRIPT" "$@" 2>&1     # executed, not `bash $SCRIPT`: production runs the shebang (/bin/bash 3.2 on macOS), not whatever bash is first in PATH
 }
 last_status() { grep -o 'status=[a-z-]*' "$WORK/log" | tail -1 | cut -d= -f2; }
@@ -1813,11 +1817,11 @@ for hh in 4 5 6; do
     [ "$(last_status)" = "deferred" ] && [ "$(pack_count "$WB")" -ge 5 ] && ok "${hh}h does not start a gc (it would run past 06:00)" || bad "${hh}h: status=$(last_status) packs=$(pack_count "$WB"), want deferred and packs untouched"
   fi
 done
-# D. night but no room: the free space is below 2 x the largest pack + 2GiB — refused INSIDE the window, on record
+# D. night but no room: the free space is below 1 x the largest pack + 2GiB (the Mayor's rule for this gc) — refused INSIDE the window, on record
 WC="$WORK/wc"; mkwin "$WC"; PC0="$(pack_count "$WC")"; rm -f "$WORK/state.json" "$WORK/window.log"
 out="$(T_HOUR=2 T_FREE=1500000 T_PACKS=4 run_jac "$WC")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(pack_count "$WC")" = "$PC0" ] && [ "$(last_status)" = "deferred" ]; } \
-  && ok "02h but 1.4GiB free (< 2 x pack + 2GiB): no gc, status deferred" || bad "no-room handled wrong (rc=$rc packs $PC0 -> $(pack_count "$WC") status=$(last_status)): $out"
+  && ok "02h but 1.4GiB free (< 1 x pack + 2GiB): no gc, status deferred" || bad "no-room handled wrong (rc=$rc packs $PC0 -> $(pack_count "$WC") status=$(last_status)): $out"
 grep -q 'INSIDE the window' "$WORK/window.log" 2>/dev/null && grep -q 'swap' "$WORK/window.log" 2>/dev/null \
   && ok "the night's refused repack is in the window log, with the swap in use" || bad "window log lacks the in-window refusal: $(cat "$WORK/window.log" 2>/dev/null)"
 # E. a clock that cannot be read, and free space that cannot be read: no gc (the old disk guard proceeded on an unreadable df; a whole-repo repack must not)
@@ -1849,8 +1853,103 @@ LIBLESS="$WORK/libless"; mkdir -p "$LIBLESS"; cp "$SCRIPT" "$LIBLESS/jsonl-archi
 out="$("$LIBLESS/jsonl-archive-compact.sh" --print-config 2>&1)"; rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'cannot load .*jsonl-archive-repack-window-lib.sh'; } \
   && ok "no window lib next to the script: exit 1 naming the file (a gate that is silently absent would let the gc run at noon)" || bad "missing lib handled wrong (rc=$rc): $out"
-"$SCRIPT" --print-config | grep -q 'repack_window_start_h=0 repack_window_last_start_h=5 repack_swap_headroom_kib=2097152' \
-  && ok "--print-config shows the window: start 0, last start 5, swap headroom 2097152KiB" || bad "window missing from --print-config"
+"$SCRIPT" --print-config | grep -q 'repack_window_start_h=0 repack_window_last_start_h=5 repack_window_end_h=6 repack_swap_headroom_kib=2097152' \
+  && ok "--print-config shows the window: start 0, last start 5, end 6, swap headroom 2097152KiB" || bad "window missing from --print-config"
+"$SCRIPT" --print-config | grep -q 'night_gc_max_s=21600 night_margin_s=300 gc_pack_factor=1' \
+  && ok "--print-config shows the night gc: up to 21600s, stopped 300s before the window closes, room factor 1 (largest pack + 2GiB)" || bad "night gc settings missing from --print-config"
+
+echo ""
+
+echo "=== S38: the NIGHT GC is not held to 600s — it gets the window that is left, at nice 10, and the lock knows how long it may last (ga-wkoij7, Mayor 17/10) ==="
+# The consolidating gc was killed at its 600s cap three runs in a row on the 6.5GB archive (a killed gc keeps nothing); on 26/09 the same gc took 36 minutes. Inside the repack window it now gets the time left until 06:00 less a margin,
+# at most JAC_NIGHT_GC_MAX_S. The tests compress the clock: T_SECS is the time of day in seconds (21500 = 05:58:20, 100s of window left), the margin is 30s, the night cap 60s, the day cap 2s (T_GC_TIMEOUT), and the gc takes
+# 4s (SLOW_SLEEP): longer than the day cap, shorter than the night's. Any of these is overridden by prefixing the call.
+cat > "$WORK/git-nice" <<EOF
+#!/bin/bash
+case " \$* " in *" gc "*) ps -o ni= -p \$\$ | tr -d ' ' >> "$WORK/gc-nice"; sleep "\${SLOW_SLEEP:-4}" ;; esac
+exec git "\$@"
+EOF
+chmod +x "$WORK/git-nice"
+night_run() {  # night_run <repos> — see above; resets the state and the niceness record
+  rm -f "$WORK/state.json" "$WORK/gc-nice"
+  T_HOUR="${T_HOUR:-4}" T_SECS="${T_SECS-21500}" T_MARGIN="${T_MARGIN:-30}" T_NIGHT_MAX="${T_NIGHT_MAX:-60}" T_MIN_GC="${T_MIN_GC:-1}" T_GC_TIMEOUT="${T_GC_TIMEOUT:-2}" T_PACKS="${T_PACKS:-4}" T_GIT="${T_GIT:-$WORK/git-nice}" run_jac "$1"
+}
+# A. the gc takes 4s: over the day cap (2s), under the night's — it finishes, at nice 10, history untouched, the lock (with its end time) released
+WN="$WORK/n1"; mkwin "$WN"; NP0="$(pack_count "$WN")"; NH0="$(history "$WN")"
+out="$(night_run "$WN")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$NP0" -ge 5 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$WN")" -le 2 ]; } \
+  && ok "04h, 100s of window left: a 4s gc is NOT cut at the 2s day cap — consolidated (packs $NP0 -> $(pack_count "$WN"))" || bad "night gc over the day cap handled wrong (rc=$rc packs $NP0 -> $(pack_count "$WN") status=$(last_status)): $out"
+printf '%s' "$out" | grep -q 'night gc: .*the gc may run up to 1 min (not 2s)' && ok "the log says the gc got the window (up to 1 min, not 2s)" || bad "no night-gc line with its cap: $out"
+# niceness is capped by the OS (19 on Linux, 20 on macOS): +10 from here, or pegged at the cap when this session already runs niced
+NB="$(ps -o ni= -p $$ | tr -d ' ')"; NW=$(( NB + 10 )); NG="$(tail -n 1 "$WORK/gc-nice" 2>/dev/null)"
+case "$NB" in ''|*[!0-9]*) NB=x ;; esac; case "$NG" in ''|*[!0-9]*) NB=x ;; esac
+if [ "$NB" = x ] || [ "$NB" -ge 19 ]; then skip "the gc's niceness: could not read it (session '$NB', gc '$NG') or the session already runs at the OS cap, so +10 cannot be told from it"
+elif [ "$NG" = "$NW" ] || { [ "$NW" -gt 19 ] && [ "$NG" -ge 19 ]; }; then ok "the gc ran at nice +10 (niceness $NG from $NB)"
+else bad "gc niceness was '$NG', want +10 from $NB"; fi
+[ "$(history "$WN")" = "$NH0" ] && ok "history byte-identical (the night gc shortens nothing)" || bad "history changed by the night gc"
+[ ! -e "$WORK/lock" ] && ok "the lock — which now holds an end time — is released at exit" || bad "lock left behind: $(ls "$WORK/lock" 2>/dev/null | tr '\n' ' ')"
+# B. the switch: JAC_NIGHT_GC_MAX_S=0 = no extension, the gc is held to its ordinary cap as before
+WB="$WORK/n2"; mkwin "$WB"; NB0="$(pack_count "$WB")"
+out="$(T_NIGHT_MAX=0 night_run "$WB")"; rc=$?
+{ [ "$(last_status)" = "timeout" ] && [ "$(pack_count "$WB")" = "$NB0" ] && ! printf '%s' "$out" | grep -q 'night gc:'; } \
+  && printf '%s' "$out" | grep -q 'gc timed out after 2s (its own cap)' \
+  && ok "JAC_NIGHT_GC_MAX_S=0: the same 4s gc is cut at the 2s cap — status timeout, no night-gc line, packs untouched" || bad "the off switch handled wrong (rc=$rc status=$(last_status) packs $NB0 -> $(pack_count "$WB")): $out"
+# C. a gc that does not fit even the night's cap is cut there and is a `timeout` (evidence the window is not enough), not a quiet deferral
+WC2="$WORK/n3"; mkwin "$WC2"; NC0="$(pack_count "$WC2")"
+out="$(T_NIGHT_MAX=3 SLOW_SLEEP=30 night_run "$WC2")"; rc=$?
+{ [ "$(last_status)" = "timeout" ] && [ "$(pack_count "$WC2")" = "$NC0" ]; } && printf '%s' "$out" | grep -q 'gc timed out after 3s (its own cap — the night window' \
+  && ok "a gc that outlasts the night cap (3s) is cut there: status timeout, the log names the night window" || bad "gc cut at the night cap handled wrong (status=$(last_status) packs $NC0 -> $(pack_count "$WC2")): $out"
+# D. every doubt keeps the ordinary cap (the inert state), and the log says why
+ND=0
+dcase() {  # dcase <label> <log-regex> <env assignments...> — a night run that must end `timeout` at the 2s day cap, never granted the night cap
+  local label="$1" want="$2" d p0; shift 2
+  d="$WORK/nd$((++ND))"; mkwin "$d"; p0="$(pack_count "$d")"
+  out="$(eval "$* night_run \"$d\"")"
+  { [ "$(last_status)" = "timeout" ] && [ "$(pack_count "$d")" = "$p0" ] && printf '%s' "$out" | grep -qE "$want" \
+      && printf '%s' "$out" | grep -q 'gc timed out after 2s (its own cap)' && ! printf '%s' "$out" | grep -q 'the gc may run up to'; } \
+    && ok "$label" || bad "$label (status=$(last_status) packs $p0 -> $(pack_count "$d")): $(printf '%s' "$out" | grep -E 'night gc|gc timed' | tr '\n' ';')"
+}
+dcase "the time of day cannot be read → the window's length is unknown → the gc keeps its 2s cap, and the log says so" 'cannot tell how long the repack window lasts' T_SECS=notatime
+dcase "10s of window left, 30s margin → nothing left to give: the gc keeps its 2s cap" '.' T_SECS=21590
+dcase "JAC_NIGHT_GC_MAX_S is not a number → the gc keeps its 2s cap, and the log says so" 'is not a number' T_NIGHT_MAX=abc
+# E. the lock cannot record the run's end time (its directory turns read-only once the batches start) → the gc keeps its 2s cap: a long gc whose lock another tick can take is the one thing worse than a short one
+if [ "$(id -u)" -eq 0 ]; then skip "(E): running as root — a read-only lock directory does not bind it, the lock-cannot-record-the-end fixture did NOT run"; else
+cat > "$WORK/git-lockro" <<EOF
+#!/bin/bash
+case " \$* " in
+  *" maintenance run "*) chmod a-w "$WORK/lockro" ;;
+  *" gc "*)              sleep "\${SLOW_SLEEP:-4}" ;;
+esac
+exec git "\$@"
+EOF
+chmod +x "$WORK/git-lockro"
+WE2="$WORK/n5"; mkfailrepo "$WE2"; rm -rf "$WORK/lockro"     # 5 packs already (over the limit of 4 however tier 1 batches the 20 loose commits on this git) + loose objects so that a `maintenance run` happens and turns the lock read-only
+out="$(T_LOCK="$WORK/lockro" T_GIT="$WORK/git-lockro" night_run "$WE2")"; rc=$?
+chmod u+w "$WORK/lockro" 2>/dev/null; rm -f "$WORK/lockro/pid" "$WORK/lockro/until"; rmdir "$WORK/lockro" 2>/dev/null
+{ printf '%s' "$out" | grep -q 'end time cannot be recorded' && printf '%s' "$out" | grep -q 'gc timed out after 2s (its own cap)' && ! printf '%s' "$out" | grep -q 'the gc may run up to'; } \
+  && ok "(E) the lock cannot record the end time → no long gc: it keeps the 2s cap (timeout), and the log names the lock" || bad "(E) unrecordable end time handled wrong (rc=$rc status=$(last_status)): $(printf '%s' "$out" | grep -E 'night gc|gc timed|cannot be rec' | tr '\n' ';')"
+fi
+# F. the lock's end time and the 30-minute ticks: a lock older than LOCK_STALE_MIN (90m) is a hung run's — unless its holder wrote an end time that has not passed
+lockrepo l11; mkdir -p "$WORK/lockuntil"; echo "$$" > "$WORK/lockuntil/pid"; echo "$(( $(date +%s) + 3600 ))" > "$WORK/lockuntil/until"; touch -t "$OLD3H" "$WORK/lockuntil"
+out="$(T_LOCK="$WORK/lockuntil" run_jac "$L")"; rc=$?
+lock_case "(F1) lock 3h old, owner alive, its end time still ahead (a night gc at work) → NOT taken: exit 0 'in flight', repo untouched" 0 'in flight' 'stale lock|could not' 1
+[ -d "$WORK/lockuntil" ] && ok "(F1) ...and the lock is still there" || bad "(F1) the live night run's lock was removed"
+rm -f "$WORK/lockuntil/pid" "$WORK/lockuntil/until"; rmdir "$WORK/lockuntil" 2>/dev/null
+lockrepo l12; mkdir -p "$WORK/lockpast"; echo "$$" > "$WORK/lockpast/pid"; echo "$(( $(date +%s) - 3600 ))" > "$WORK/lockpast/until"; touch -t "$OLD3H" "$WORK/lockpast"
+out="$(T_LOCK="$WORK/lockpast" run_jac "$L")"; rc=$?
+lock_case "(F2) the same lock but its end time passed an hour ago (the run hung past its own budget) → reclaimed, the repo IS compacted" 0 'stale lock' 'could not|in flight' 0
+[ "$(loose_count "$L")" = 0 ] && ok "(F2) ...and the work was done" || bad "(F2) hung night run's lock not reclaimed (loose=$(loose_count "$L"))"
+lockrepo l13; mkdir -p "$WORK/lockjunk"; echo "$$" > "$WORK/lockjunk/pid"; echo "soon" > "$WORK/lockjunk/until"; touch -t "$OLD3H" "$WORK/lockjunk"
+out="$(T_LOCK="$WORK/lockjunk" run_jac "$L")"; rc=$?
+lock_case "(F3) an end time that is not a number is no end time → judged by age alone, reclaimed" 0 'stale lock' 'could not|in flight' 0
+lockrepo l14; mkdir -p "$WORK/lockdead"; echo 999999 > "$WORK/lockdead/pid"; echo "$(( $(date +%s) + 3600 ))" > "$WORK/lockdead/until"; touch -t "$OLD3H" "$WORK/lockdead"
+out="$(T_LOCK="$WORK/lockdead" run_jac "$L")"; rc=$?
+lock_case "(F4) end time ahead but the owner is DEAD (SIGKILLed by the order's timeout) → reclaimed, the end time does not keep a dead run's lock" 0 'stale lock' 'could not|in flight' 0
+# G. the longer deadline is for the gc only: the NEXT repo is back on the ordinary budget (here 3s, already spent by the gc), it does not inherit the night's hours
+WG1="$WORK/n6"; mkwin "$WG1"; WG2="$WORK/n7"; mkrepo "$WG2" 20; LG2="$(loose_count "$WG2")"
+out="$(T_DEADLINE=3 night_run "$WG1 $WG2")"; rc=$?
+{ [ "$(pack_count "$WG1")" -le 2 ] && [ "$(loose_count "$WG2")" = "$LG2" ]; } \
+  && ok "(G) the first repo's night gc ran (packs -> $(pack_count "$WG1")); the second repo got no night budget — its $LG2 loose objects wait for the next run" || bad "(G) deadline leaked into the next repo (packs1=$(pack_count "$WG1") loose2 $LG2 -> $(loose_count "$WG2")): $out"
 
 echo ""
 
@@ -1873,7 +1972,10 @@ case "$timeout_s" in *s) tsecs=${timeout_s%s} ;; *m) tsecs=$(( ${timeout_s%m} * 
 deadline="$(sed -n 's/^DEADLINE_S="\${JAC_DEADLINE_S:-\([0-9]*\)}".*/\1/p' "$SCRIPT")"
 [ "$trigger" = "cooldown" ] && ok "order: trigger cooldown" || bad "order trigger '$trigger'"
 { [ "$isecs" -gt 0 ] && [ "$isecs" -le 3600 ]; } && ok "order: interval $interval <= 1h — at ~243MiB/h of new loose blobs compaction cannot silently lag by more than about an hour" || bad "order interval '$interval' is missing or over 1h"
-{ [ "${deadline:-0}" -gt 0 ] && [ "$tsecs" -gt "${deadline:-0}" ] && [ "$isecs" -gt "$tsecs" ]; } && ok "order: timeout ${timeout_s} > script deadline ${deadline}s (it logs its own outcome) and interval > timeout (runs cannot overlap)" || bad "order timeout/interval inconsistent (interval=$isecs timeout=$tsecs deadline=${deadline:-?})"
+# the timeout covers (a) the script's own day deadline, which logs the outcome, and (b) the longest NIGHT run (ga-wkoij7): the whole repack window, 00:00-06:00, plus the cleanup after a cut gc. The interval is no longer above the
+# timeout — a tick that fires while a night gc runs finds the lock and exits 0 (S26 controls, S38 F) — so what stays pinned is that it is at most an hour.
+win_s=$(( ( $(sed -n 's/^JAW_END_H="${JAW_END_H:-\([0-9]*\)}".*/\1/p' "$LIB") - $(sed -n 's/^JAW_START_H="${JAW_START_H:-\([0-9]*\)}".*/\1/p' "$LIB") ) * 3600 ))
+{ [ "${deadline:-0}" -gt 0 ] && [ "$tsecs" -gt "${deadline:-0}" ] && [ "$win_s" -eq 21600 ] && [ "$tsecs" -gt $(( win_s + 120 )) ]; } && ok "order: timeout ${timeout_s} > script deadline ${deadline}s (it logs its own outcome) and > the ${win_s}s repack window + cleanup (a night gc can last that long)" || bad "order timeout inconsistent (interval=$isecs timeout=$tsecs deadline=${deadline:-?} window=${win_s:-?})"
 [ "$exec_line" = '$PACK_DIR/assets/scripts/jsonl-archive-compact.sh' ] && ok "order: exec points at the script" || bad "order exec is '$exec_line'"
 
 echo ""

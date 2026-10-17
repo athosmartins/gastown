@@ -17,9 +17,18 @@
 # assets/scripts/jsonl-archive-compact.sh.
 #
 # interval 30m: at ~243MiB/h of new loose blobs the 256MiB limit is crossed about hourly; 30m
-# bounds how long a crossing goes unnoticed. timeout 900s > the script's own 780s deadline so it
-# can log its outcome; interval > timeout and the script's single-flight lock keep runs from
-# stacking. selftest S11 fails if any of these drift apart, or if the interval passes 1h.
+# bounds how long a crossing goes unnoticed.
+#
+# timeout 21900s (6h05m, ga-wkoij7): by day the script ends itself at its own 780s deadline and logs its
+# outcome, long before any kill. The long timeout is for the NIGHT: inside the repack window
+# (00:00-06:00, Athos 15/10) the consolidating gc is not held to 600s — that cap killed it three runs
+# in a row on the 6.5GB archive, and a killed gc keeps nothing — it gets the time left until 06:00
+# (less 5 min), so the longest a run can last is the window (6h) plus its cleanup. Outside the
+# window nothing changes. The ticks that fire every 30m while such a gc runs do not stack: the
+# script's single-flight lock answers them "in flight" at once (exit 0), and the lock records the
+# run's end time so a gc older than the lock's 90-minute stale age is not taken from it.
+# selftest S11 fails if the timeout stops covering the script's deadline and the window, or if the
+# interval passes 1h.
 #
 # Only ONE instance exists (this pack's orders register for the city scope); the script is
 # single-flight anyway.
@@ -31,5 +40,5 @@
 description = "Compact the jsonl-archive git repos by bytes — git's auto-gc counts objects and never fires on multi-MB blobs (5GiB/day of loose hq.jsonl copies)"
 trigger = "cooldown"
 interval = "30m"
-timeout = "900s"
+timeout = "21900s"
 exec = "$PACK_DIR/assets/scripts/jsonl-archive-compact.sh"

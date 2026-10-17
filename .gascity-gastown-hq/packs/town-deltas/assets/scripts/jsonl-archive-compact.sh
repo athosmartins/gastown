@@ -122,12 +122,19 @@
 #      consolidation, it never removes it.
 # WINDOW (ga-wkoij7): on 17/10 ~10:4x the exporter's commit started git's geometric repack of the 4.4GB pack at midday (pack-objects 1.8GB of RAM, swap 5.2GB, free disk 1.4GB). Athos
 # decided (15/10) that the heavy maintenance runs only in 00:00-06:00. So the tier-2 consolidating gc — a rewrite of every pack, the other whole-repo repack of this city — starts only when
-# jaw_repack_allowed says so (jsonl-archive-repack-window-lib.sh: local hour in [0,5) AND free disk >= 2 x the largest pack + 2GiB; a clock or a df that cannot be read = no): outside that
+# jaw_repack_allowed says so (jsonl-archive-repack-window-lib.sh: local hour in [0,5) AND free disk >= JAC_GC_PACK_FACTOR (1) x the largest pack + 2GiB — the Mayor's rule for this gc; the exporter's
+# detached repack keeps 2 x; a clock or a df that cannot be read = no; disk_low below still asks for ALL the packs + headroom): outside that
 # it is `deferred` and logged with the reason, like a gc without budget — never a failure by itself, and never silent, because the pack alarm still judges the END state (>= JAC_PACKS_ALARM
 # packs = BAD whatever the status). Tier 1 (loose-objects batches) and tier 2a (the tail repack, `--keep-pack` on the big packs) are NOT gated on purpose: they are bounded by objects and by
 # pack.windowMemory, leave the big packs alone, and the loose backlog (~243MiB/h) has to be packed by day or the disk fills. A known cost of leaving tier 2a ungated: on 17/10 it
 # hit its own 600s cap at 13:13Z and 14:19Z (pack-objects paged out at ~1% CPU, 4.7GB of swap in use), so by day it can burn the cap and produce nothing; confining it to the
 # window would let the small packs pile up toward JAC_PACKS_ALARM instead — a trade-off left to the Mayor (ga-wkoij7), not decided here.
+# THE NIGHT GC IS NOT HELD TO 600s (ga-wkoij7, Mayor): the 600s cap killed this gc three runs in a row on the 6.5GB archive (9 packs, 285MiB loose), and a killed gc keeps nothing — while 26/09 the
+# same gc took 36 minutes for 6GB. So inside the window (night_gc_extend) the gc gets the time left until 06:00 less JAC_NIGHT_MARGIN_S (300s, so its cleanup and the alarm are done by 06:00),
+# at most JAC_NIGHT_GC_MAX_S (21600; 0 = no extension, the 600s cap as before); it still runs under `nice -n 10`. The run's deadline moves with it for the length of the gc only (restored right
+# after: the next repo gets what is left of the ordinary budget, i.e. none), the order's timeout is 21900s to cover it, and the lock records the run's end ($LOCK/until) so the next 30-minute
+# ticks do not take a 90-minute-old lock from a gc that is still working (lock_is_stale): they exit 0 "in flight". If the lock cannot record that end, the gc keeps its 600s cap — never a long
+# gc whose lock another run can reclaim. A gc killed at ITS night cap is `timeout` (evidence: the window is not enough), not `deferred`. By day nothing changes: 780s deadline, 900s of worst case.
 # Together they leave one window: a commit that spawned a run in the instant before this script took its lock. If that run is still going when other_repacker looks (the gc
 # starts after the batches, minutes into the run) it is seen; if it has finished it can no longer delete anything. Not covered, on purpose: a git run with --git-dir from another
 # working directory (no cwd in the repo), and one of another user — nothing in this city does either to an archive but this script.
@@ -182,8 +189,8 @@
 # the PRIMARY archive absent, no archive at all. The PRIMARY is the FIRST repo of JAC_REPOS (the one the exporter writes and dolt-s3-backup.sh
 # mirrors); a later, retired one may be gone. The only quiet exit 0 that is not a healthy end of a run is "another run holds the lock".
 #
-# CADENCE: order jsonl-archive-compact, interval 30m, timeout 900s; JAC_DEADLINE_S (780s) is
-# this script's own budget so it can log its outcome before the order's timeout fires. One
+# CADENCE: order jsonl-archive-compact, interval 30m, timeout 21900s; JAC_DEADLINE_S (780s) is
+# this script's own budget by day, so it can log its outcome long before the order's timeout fires (the 21900s is for the night gc: 6h window + 5min). One
 # instance at a time: an mkdir lock that records its owner's pid — reclaimed when the owner is dead
 # (a run SIGKILLed by the order timeout) and the lock is over a minute old (the floor covers the instant
 # between another run's mkdir and its pid write; a run that finds a younger dead lock yields to it as "in
@@ -234,8 +241,13 @@ BATCH_MIN=5
 BATCH_MAX="${JAC_BATCH_MAX:-200}"
 MAX_BATCHES="${JAC_MAX_BATCHES:-0}"                  # 0 = as many as the deadline allows
 GIT_TIMEOUT_S="${JAC_GIT_TIMEOUT_S:-300}"            # per batch
-GC_TIMEOUT_S="${JAC_GC_TIMEOUT_S:-600}"              # per consolidating gc
-DEADLINE_S="${JAC_DEADLINE_S:-780}"                  # whole run; the order's timeout is 900s
+GC_TIMEOUT_S="${JAC_GC_TIMEOUT_S:-600}"              # per consolidating gc, outside the night window (inside it: NIGHT_GC_MAX_S)
+NIGHT_GC_MAX_S="${JAC_NIGHT_GC_MAX_S:-21600}"        # the most the gc may run INSIDE the repack window (the window is 6h); 0 = never longer than GC_TIMEOUT_S
+NIGHT_MARGIN_S="${JAC_NIGHT_MARGIN_S:-300}"          # ...stopped this long before the window closes, so the cleanup after a cut gc is done by 06:00
+GC_PACK_FACTOR="${JAC_GC_PACK_FACTOR:-1}"            # free disk for the gc must be >= this x the largest pack + 2GiB (the Mayor's rule, ga-wkoij7); the exporter's own repack uses the lib's default (2)
+LOCK_GRACE_S=600                                     # a run that wrote its end time (night gc) is still alive this long after it
+DEADLINE_S="${JAC_DEADLINE_S:-780}"                  # whole run by day; the order's timeout is 21900s (a night gc lasts hours, see "THE NIGHT GC")
+DEADLINE_BASE="$DEADLINE_S"                          # night_gc_extend moves DEADLINE_S for the length of the gc and puts it back here
 MIN_BATCH_S="${JAC_MIN_BATCH_S:-30}"                 # do not START a batch with less than this left
 MIN_GC_BUDGET_S="${JAC_MIN_GC_BUDGET_S:-240}"        # do not START a gc with less than this left
 PRUNE_TIMEOUT_S="${JAC_PRUNE_TIMEOUT_S:-120}"        # per prune-packed after a batch
@@ -280,7 +292,8 @@ tail_limit_kib=$TAIL_LIMIT_KIB tail_max_objects=$TAIL_MAX_OBJECTS tail_timeout_s
 git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S prune_timeout_s=$PRUNE_TIMEOUT_S prune_min_s=$PRUNE_MIN_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
 list_timeout_s=$LIST_TIMEOUT_S lsof_timeout_s=$LSOF_TIMEOUT_S reclaim_wait_s=$RECLAIM_WAIT_S ps_timeout_s=$PS_TIMEOUT_S
 alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S check_fresh_s=$CHECK_FRESH_S
-repack_window_start_h=$JAW_START_H repack_window_last_start_h=$JAW_LAST_START_H repack_swap_headroom_kib=$JAW_SWAP_KIB repack_window_log=$JAW_LOG
+repack_window_start_h=$JAW_START_H repack_window_last_start_h=$JAW_LAST_START_H repack_window_end_h=$JAW_END_H repack_swap_headroom_kib=$JAW_SWAP_KIB repack_window_log=$JAW_LOG
+night_gc_max_s=$NIGHT_GC_MAX_S night_margin_s=$NIGHT_MARGIN_S gc_pack_factor=$GC_PACK_FACTOR
 state=$STATE log=$LOG lock=$LOCK
 EOF
   exit 0   # benign[print-config]: --print-config only prints the effective configuration — no run happened, so there is no failure for this exit to hide
@@ -341,6 +354,35 @@ budget_for() {
   [ "$t_left" -lt "$1" ] && by_deadline=1
   [ "$t_left" -ge "${2:-1}" ] || t_left="${2:-1}"
   [ "$t_left" -le "$1" ] || t_left="$1"
+}
+# night_gc_extend — called when jaw_repack_allowed said yes: the gc is not held to GC_TIMEOUT_S inside the window ("THE NIGHT GC" in the header). Sets GC_CAP (what budget_for gets): the time left until the
+# window closes, less NIGHT_MARGIN_S, at most NIGHT_GC_MAX_S. When that is longer than GC_TIMEOUT_S it also moves DEADLINE_S to now + GC_CAP + NIGHT_SLACK_S (the slack covers the looks between here and the gc, so the
+# cap — not the run's budget — is what ends it: a kill at the cap is `timeout`, evidence the window is not enough) and has the lock record that end. The caller puts DEADLINE_S back. Every doubt — a setting
+# that is not a number, a clock that cannot be read, a lock that cannot record the end — leaves GC_CAP at GC_TIMEOUT_S and DEADLINE_S alone, and the log says which: the inert state is the old cap.
+NIGHT_SLACK_S=120
+night_gc_extend() {
+  local left cap
+  GC_CAP="$GC_TIMEOUT_S"
+  if ! { is_uint "$NIGHT_GC_MAX_S" && is_uint "$NIGHT_MARGIN_S"; }; then
+    log "  night gc: JAC_NIGHT_GC_MAX_S='$NIGHT_GC_MAX_S' or JAC_NIGHT_MARGIN_S='$NIGHT_MARGIN_S' is not a number — the gc keeps its ${GC_TIMEOUT_S}s cap"
+    return 0
+  fi
+  if ! left="$(jaw_window_left_s)"; then
+    log "  night gc: cannot tell how long the repack window lasts (clock unreadable, or it closed meanwhile) — the gc keeps its ${GC_TIMEOUT_S}s cap"
+    return 0
+  fi
+  cap=$(( left - NIGHT_MARGIN_S ))
+  [ "$cap" -le "$NIGHT_GC_MAX_S" ] || cap="$NIGHT_GC_MAX_S"
+  if [ "$cap" -gt "$GC_TIMEOUT_S" ]; then    # else: NIGHT_GC_MAX_S=0 (off), or too little of the window left to give the gc more than its ordinary cap
+    DEADLINE_S=$(( $(date +%s) - START + cap + NIGHT_SLACK_S ))
+    if lock_note_until; then
+      GC_CAP="$cap"
+      log "  night gc: $(( left / 60 )) min of the repack window left — the gc may run up to $(( cap / 60 )) min (not ${GC_TIMEOUT_S}s), run deadline moved to ${DEADLINE_S}s"
+    else
+      DEADLINE_S="$DEADLINE_BASE"
+      log "  night gc: this run's end time cannot be recorded in $LOCK/until — a long gc could have its lock taken by the next tick, so the gc keeps its ${GC_TIMEOUT_S}s cap"
+    fi
+  fi
 }
 mib() { echo $(( $1 / 1024 )); }
 # fmt <kib> — "<n>MiB", or "?" when git could not say (an unknown must never read as 0)
@@ -635,7 +677,7 @@ log:     $LOG
 state:   $STATE
 Why it matters: without compaction this repo grows ~5GiB/day of loose hq.jsonl copies (ga-a3ar7h).
 No history was deleted or shortened (the only files this script removes are temp files its own killed steps left; the log says which). Check: bash $0 --check ; then the last lines of the log.
-If the log says gc timed out at its OWN cap (${GC_TIMEOUT_S}s), the repo is too big for one gc: run it by
+If the log says gc timed out at its OWN cap (${GC_TIMEOUT_S}s by day, the window's length at night), the repo is too big for one gc: run it by
 hand, without a timeout, at low priority:  nice -n 10 git --git-dir=$1/.git gc   (26/09: 36 min for a 6GB backlog)."
   out="$(_bounded "$MAIL_TIMEOUT_S" "$GCBIN" mail send mayor/ -s "ESCALATION: jsonl-archive compaction failing [HIGH]" -m "$body" 2>&1)"; rc=$?
   ALARM_ERR="$(printf '%s' "$out" | tail -n 2 | tr '\n' ' ' | cut -c1-200)"
@@ -829,7 +871,7 @@ tail_pass() {
 }
 
 compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller handles is_bad via record
-  local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_unpacked prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed over before_gcount before_gkib
+  local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_unpacked prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed over before_gcount before_gkib window_ok
   R_GITDIR="$repo/.git"
   STATUS="ok"; G_KIB=""; R_PROGRESS=0; R_BATCH_SAVE=""; R_GARBAGE_GREW=0; R_GARBAGE_BEFORE=""; R_LEAK_UNKNOWN=0
   t0="$(date +%s)"
@@ -955,7 +997,9 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
     # WINDOW (header, ga-wkoij7): the gc rewrites every pack, so it starts only in the night window and with room for it. jaw_repack_allowed logs its own reason; free_kib is passed in
     # so JAC_FREE_KIB (the seam of every disk test here) stays the one source of free space; an empty answer is read again by the lib's own df, and empty twice is "cannot read" = no gc. Not allowed = it did NOTHING, so it
     # cannot turn a failed / stalled / timed-out / unmeasured / skipped tier 1 green — the same rule as a gc without budget.
-    if ! jaw_repack_allowed "$R_GITDIR" "$(free_kib "$repo")"; then
+    GC_CAP="$GC_TIMEOUT_S"; window_ok=0
+    if jaw_repack_allowed "$R_GITDIR" "$(free_kib "$repo")" "$GC_PACK_FACTOR"; then window_ok=1; night_gc_extend; fi
+    if [ "$window_ok" -eq 0 ]; then
       bad_status "$STATUS" || STATUS="deferred"
       log "repo=$repo packs=$M_PACKS >= $PACKS_LIMIT but the repack window does not allow it now — consolidating gc deferred: $JAW_REASON (the pack alarm still judges the end state)"
     elif [ "$(remaining)" -lt "$MIN_GC_BUDGET_S" ]; then
@@ -978,14 +1022,14 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
       else
         # the same rule as a batch: a kill at gc's OWN cap says the repo is too big for one gc; a kill at the end of the RUN's budget
         # says nothing about gc (the run that crosses PACKS_LIMIT is one whose tier 1 just spent part of the budget)
-        budget_for "$GC_TIMEOUT_S"
+        budget_for "$GC_CAP"
         run_step "$t_left" -c gc.autoDetach=false gc --quiet; out="$STEP_OUT"; rc="$STEP_RC"
         if [ "$rc" -eq 0 ]; then STATUS="consolidated"
         elif [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
           # it did NOTHING useful (a killed gc keeps no packed work — and leaves a tmp_pack, which run_step has just reclaimed or the garbage measurement will report): it cannot turn a failed / stalled / timed-out / skipped tier 1 green
           bad_status "$STATUS" || STATUS="deferred"
           log "  gc was cut by the run deadline after ${t_left}s — the budget ended, not evidence the repo is too big for one gc (retried next run)"
-        elif [ "$rc" -eq 124 ]; then STATUS="timeout"; log "  gc timed out after ${t_left}s (its own cap)"
+        elif [ "$rc" -eq 124 ]; then STATUS="timeout"; log "  gc timed out after ${t_left}s (its own cap$([ "$GC_CAP" -gt "$GC_TIMEOUT_S" ] && echo ' — the night window, so a gc that big cannot finish in one night'))"
         elif printf '%s' "$out" | grep -q 'already running'; then
           # it did NOTHING: it cannot turn a failed / stalled / timed-out / unmeasured / skipped tier 1 into a green "busy"
           bad_status "$STATUS" || STATUS="busy"
@@ -994,6 +1038,7 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
       fi
     fi
   fi
+  DEADLINE_S="$DEADLINE_BASE"   # the night gc's longer deadline (night_gc_extend) was for the gc only: what follows — the next repo — is back on the ordinary budget
 
   measure || STATUS="unmeasured"
   if is_uint "$M_LOOSE_KIB" && [ "$M_LOOSE_KIB" -lt "$before_loose" ]; then
@@ -1038,6 +1083,16 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
 # instance whose interval (30m) exceeds its timeout (900s), so it needs a manual run racing a tick — and what two runs can then do to one repo is
 # limited by git's own locks: a second gc is refused (gc.pid, selftest S8) and a second `maintenance run` skips its task (maintenance.lock).
 lock_owner_alive() { local p; p="$(cat "$LOCK/pid" 2>/dev/null)"; is_uint "$p" && kill -0 "$p" 2>/dev/null; }
+# lock_note_until — the holder writes the epoch at which its own budget ends (START + DEADLINE_S), so a run that is allowed to last hours (the night gc) is not taken for a hung one when the lock gets
+# LOCK_STALE_MIN old. rc 1 when it cannot be written: the caller then does not take the long budget.
+lock_note_until() { printf '%s\n' "$(( START + DEADLINE_S ))" > "$LOCK/until" 2>/dev/null; }
+# lock_within_budget — rc 0 only when the holder wrote an end time and it has not passed (LOCK_GRACE_S of slack for the work after the deadline). No file, an unreadable one or a non-number is rc 1:
+# the lock is then judged by age alone, exactly as before the night gc existed.
+lock_within_budget() {
+  local u
+  u="$(cat "$LOCK/until" 2>/dev/null)"
+  is_uint "$u" && [ "$(date +%s)" -le $(( u + LOCK_GRACE_S )) ]
+}
 lock_older_than() {  # lock_older_than <minutes> — 0 = older, 1 = not older, 2 = could not tell (find failed): never "not older"
   local o
   o="$(find "$LOCK" -maxdepth 0 -mmin +"$1" 2>/dev/null)" || return 2
@@ -1047,7 +1102,8 @@ lock_older_than() {  # lock_older_than <minutes> — 0 = older, 1 = not older, 2
 lock_is_stale() {
   local old_hung old_dead
   lock_older_than "$LOCK_STALE_MIN"; old_hung=$?
-  if [ "$old_hung" -eq 0 ]; then return 0; fi
+  # old for a hung run — unless its holder said it may last this long (the night gc) and its own end time has not passed: then it is judged by its owner pid alone (dead = reclaim, alive = in flight)
+  if [ "$old_hung" -eq 0 ] && ! lock_within_budget; then return 0; fi
   if ! lock_owner_alive; then
     lock_older_than 1; old_dead=$?
     if [ "$old_dead" -eq 0 ]; then return 0; fi
@@ -1058,7 +1114,7 @@ lock_is_stale() {
 }
 # lock_release — 0 = the lock is gone (removed, or already gone), 1 = it is still there. What matters is the existence check on the last line.
 # benign[lock-release]: the rm/rmdir errors are discarded because this function's own result is whether the lock still exists, tested right after them
-lock_release() { rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null; [ ! -e "$LOCK" ] && [ ! -L "$LOCK" ]; }
+lock_release() { rm -f "$LOCK/pid" "$LOCK/until" 2>/dev/null; rmdir "$LOCK" 2>/dev/null; [ ! -e "$LOCK" ] && [ ! -L "$LOCK" ]; }
 release_at_exit() { lock_release || log "WARNING: could not remove the lock $LOCK at exit — the next run reclaims it once this pid is gone, and fails loudly if that fails too"; }
 take_lock() {  # returns 0 holding the lock; every other outcome EXITS, as above
   local err st

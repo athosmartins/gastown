@@ -20,10 +20,19 @@
 # night's repack that did not happen) also go to $JAW_LOG with a local timestamp and the swap in use, so "why did it not repack last night" has an answer. An outside-the-window refusal is
 # the normal state of 20 hours a day, and is not written there.
 #
-# Seams: JAW_HOUR (0-23) stands in for the clock; the free space is the 2nd argument of jaw_repack_allowed, or JAW_FREE_KIB, or df.
+# THE ROOM FACTOR (3rd argument of jaw_repack_allowed, default JAW_PACK_FACTOR = 2): the exporter's detached geometric repack keeps the rule above (2 x). The compactor's consolidating gc passes 1 —
+# free >= the largest pack + 2GiB, the Mayor's rule for it (ga-wkoij7) — because it has a second, tighter guard of its own (disk_low: free >= ALL the packs + headroom) that decides the real room.
+#
+# HOW LONG THE WINDOW LASTS (jaw_window_left_s): the seconds until JAW_END_H (06:00). The compactor gives its night gc that long (less a margin) instead of the 600s cap that killed it three runs in a
+# row on the 6.5GB archive; a clock that cannot be read, or a window that is already closed, is "no time", never "plenty".
+#
+# Seams: JAW_HOUR (0-23) stands in for the clock, JAW_SECS_OF_DAY (0-86399) for the exact time of day (JAW_HOUR alone means HH:00:00); the free space is the 2nd argument of jaw_repack_allowed, or
+# JAW_FREE_KIB, or df.
 
 JAW_START_H="${JAW_START_H:-0}"
 JAW_LAST_START_H="${JAW_LAST_START_H:-5}"
+JAW_END_H="${JAW_END_H:-6}"
+JAW_PACK_FACTOR="${JAW_PACK_FACTOR:-2}"
 JAW_SWAP_KIB="${JAW_SWAP_KIB:-2097152}"
 JAW_LOG_MAX_LINES=2000
 JAW_REASON=""
@@ -60,6 +69,27 @@ jaw_window_open() {
   return 1
 }
 
+# jaw_window_left_s — the seconds from now until the window closes (JAW_END_H:00:00 local), or nothing and rc 1 when the clock cannot be read or the window is already closed.
+jaw_window_left_s() {
+  local s hh mm ss left
+  if [ -n "${JAW_SECS_OF_DAY:-}" ]; then
+    s="$JAW_SECS_OF_DAY"; _jaw_uint "$s" || return 1
+  elif [ -n "${JAW_HOUR:-}" ]; then
+    hh="$(jaw_hour)" || return 1; s=$(( hh * 3600 ))
+  else
+    # vazio → `date` printed nothing: the fields are not numbers, rc 1; falhou → the same
+    IFS=: read -r hh mm ss <<EOF
+$(date +%H:%M:%S 2>/dev/null)
+EOF
+    _jaw_uint "$hh" && _jaw_uint "$mm" && _jaw_uint "$ss" || return 1
+    s=$(( 10#$hh * 3600 + 10#$mm * 60 + 10#$ss ))
+  fi
+  _jaw_uint "$JAW_END_H" || return 1
+  left=$(( JAW_END_H * 3600 - s ))
+  [ "$left" -gt 0 ] || return 1
+  echo "$left"
+}
+
 # jaw_largest_pack_kib <gitdir> — KiB of the biggest *.pack under <gitdir>/objects/pack: 0 when the directory is readable and holds no pack (a young repo), rc 1 when the directory is missing or
 # cannot be read, or when a pack exists and cannot be measured — a glob over a directory that is not there expands to nothing, and "nothing" must not be read as "no pack".
 jaw_largest_pack_kib() {
@@ -91,9 +121,14 @@ jaw_swap_used() {
   if [ -n "$s" ]; then echo "used=$s"; else echo "unknown"; fi
 }
 
-# jaw_resources_ok <gitdir> [free_kib] — rc 0 when the free disk covers 2 x the largest pack + JAW_SWAP_KIB; else rc 1 with JAW_REASON. An unreadable pack size or free space is rc 1.
+# jaw_resources_ok <gitdir> [free_kib] [factor] — rc 0 when the free disk covers <factor> (default JAW_PACK_FACTOR, 2) x the largest pack + JAW_SWAP_KIB; else rc 1 with JAW_REASON. An unreadable pack
+# size, free space or factor is rc 1.
 jaw_resources_ok() {
-  local gd="$1" free="${2:-}" big need
+  local gd="$1" free="${2:-}" factor="${3:-$JAW_PACK_FACTOR}" big need
+  if ! _jaw_uint "$factor" || [ "$factor" -lt 1 ]; then
+    JAW_REASON="the pack factor '$factor' is not a number >= 1 — no repack (under doubt)"
+    return 1
+  fi
   if ! big="$(jaw_largest_pack_kib "$gd")"; then
     JAW_REASON="the largest pack under $gd cannot be measured — no repack (under doubt)"
     return 1
@@ -103,12 +138,12 @@ jaw_resources_ok() {
     JAW_REASON="free disk cannot be read (got '${free:-nothing}') — no repack (under doubt)"
     return 1
   fi
-  need=$(( big * 2 + JAW_SWAP_KIB ))
+  need=$(( big * factor + JAW_SWAP_KIB ))
   if [ "$free" -lt "$need" ]; then
-    JAW_REASON="free disk ${free}KiB < ${need}KiB needed (2 x largest pack ${big}KiB + ${JAW_SWAP_KIB}KiB swap headroom)"
+    JAW_REASON="free disk ${free}KiB < ${need}KiB needed (${factor} x largest pack ${big}KiB + ${JAW_SWAP_KIB}KiB swap headroom)"
     return 1
   fi
-  JAW_REASON="free disk ${free}KiB >= ${need}KiB needed (2 x largest pack ${big}KiB + ${JAW_SWAP_KIB}KiB swap headroom)"
+  JAW_REASON="free disk ${free}KiB >= ${need}KiB needed (${factor} x largest pack ${big}KiB + ${JAW_SWAP_KIB}KiB swap headroom)"
   return 0
 }
 
@@ -126,14 +161,14 @@ jaw_log() {
   return 0
 }
 
-# jaw_repack_allowed <gitdir> [free_kib] — the whole rule. rc 0 = a whole-repo repack may start now; rc 1 = it may not. JAW_REASON says why either way (a variable: call this directly, not in $(...)).
+# jaw_repack_allowed <gitdir> [free_kib] [factor] — the whole rule. rc 0 = a whole-repo repack may start now; rc 1 = it may not. JAW_REASON says why either way (a variable: call this directly, not in $(...)).
 jaw_repack_allowed() {
-  local gd="$1" free="${2:-}"
+  local gd="$1" free="${2:-}" factor="${3:-}"
   if ! jaw_window_open; then
     jaw_log 0 "repack NOT allowed: $JAW_REASON"
     return 1
   fi
-  if ! jaw_resources_ok "$gd" "$free"; then
+  if ! jaw_resources_ok "$gd" "$free" "$factor"; then
     jaw_log 1 "repack NOT allowed, INSIDE the window: $JAW_REASON; swap $(jaw_swap_used)"
     return 1
   fi
