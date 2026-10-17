@@ -524,6 +524,57 @@ git commit -m x"
   b 2 "cond/msg: (preparo) projeto fora do território" "git commit -m x" "$OWN" "$OUT"
   grep -qF "fora do território" "$T/err"; ok $? "cond/msg: projeto fora do território: a mensagem diz 'fora do território'"
 }
+g_ctx() {  # gate da fatia 6a (tentativa 7, ga-37bwre): o trecho aninhado ($( ), crase, bash -c, eval, env -S) começa com o contexto de fora — variáveis e
+  # funções desta chamada —, nunca do zero; função cujo fim não acho roda; heredoc só some para leitor de DADOS conhecido; falha do guarda num Bash bloqueia
+  b 2 "ctx: GIT_DIR=<alheio> bash -c 'git commit'" "GIT_DIR=$OTH/.git bash -c 'git commit -m x'"
+  b 2 "ctx: GIT_WORK_TREE=<alheio> sh -c 'git add .'" "GIT_WORK_TREE=$OTH sh -c 'git add .'"
+  b 2 "ctx: env GIT_DIR=<alheio> bash -c 'git commit'" "env GIT_DIR=$OTH/.git bash -c 'git commit -m x'"
+  b 2 "ctx: GIT_DIR=<alheio> eval git commit" "GIT_DIR=$OTH/.git eval git commit -m x"
+  b 2 "ctx: export GIT_DIR=<alheio>; eval 'git commit'" "export GIT_DIR=$OTH/.git; eval 'git commit -m x'"
+  b 2 "ctx: export GIT_DIR=<alheio>; echo \$(git commit)" "export GIT_DIR=$OTH/.git; echo \$(git commit -m x)"
+  b 2 "ctx: GIT_DIR=<alheio>; echo crase git commit" "GIT_DIR=$OTH/.git; echo \`git commit -m x\`"
+  b 2 "ctx: GIT_DIR=<alheio> env -S 'git commit'" "GIT_DIR=$OTH/.git env -S 'git commit -m x'"
+  b 2 "ctx: f() { git -C <alheio> commit; }; echo \$(f)" "f() { git -C $OTH commit; }; echo \$(f)"
+  b 2 "ctx: f() { git -C <alheio> commit; }; eval f" "f() { git -C $OTH commit; }; eval f"
+  b 2 "ctx: f() { git -C <alheio> commit; }; export -f f; bash -c f" "f() { git -C $OTH commit; }; export -f f; bash -c f"
+  b 2 "ctx: f() { … '{' …; git -C <alheio> commit; }; f (o fim da função não fecha)" "f() { :; echo '{'; git -C $OTH commit; }; f"
+  b 2 "ctx: idem com newlines" "f() {
+:
+echo '{'
+git -C $OTH commit
+}
+f"
+  b 2 "ctx: sh<<EOF (sem espaço)" "sh<<EOF
+git -C $OTH commit -m x
+EOF"
+  b 2 "ctx: bash<<'EOF'" "bash<<'EOF'
+git -C $OTH commit -m x
+EOF"
+  b 2 "ctx: <<EOF bash (redirecionamento primeiro)" "<<EOF bash
+git -C $OTH commit -m x
+EOF"
+  b 2 "ctx: 0<<EOF sh" "0<<EOF sh
+git -C $OTH commit -m x
+EOF"
+  b 2 "ctx: 2>/dev/null sh <<EOF" "2>/dev/null sh <<EOF
+git -C $OTH commit -m x
+EOF"
+  b 2 "ctx: python3 <<EOF (leitor que não está em DATA: o corpo é conferido)" "python3 <<EOF
+git -C $OTH commit -m x
+EOF"
+  b 2 "ctx: \$'\\UFFFFFFFF' + glob + g''it, cwd fora do território (o guarda não pode cair)" "echo \$'\\UFFFFFFFF'; cd g?*/r/wt/other && g''it commit -m x" "$HOME/gt-remote"
+  run "$OWN" < <(printf '{"tool_name":"Bash","cwd":"%s","tool_input":["g%sit commit"]}' "$OWN" "''")
+  [ "$RC" = 2 ]; ok $? "ctx: Bash cujo tool_input não é objeto e não cita 'git': o guarda cai e BLOQUEIA (rc=$RC)"
+  b 0 "ctx: controle — \$'\\UFFFFFFFF'; git commit no próprio (o escape não derruba o guarda)" "echo \$'\\UFFFFFFFF'; git commit -m x"
+  b 0 "ctx: controle — \"cat\" <<'EOF' cita o alheio (leitor entre aspas segue sendo dado)" "\"cat\" <<'EOF'
+git -C $OTH commit -m x
+EOF"
+  b 0 "ctx: controle — export FOO=1; bash -c 'git commit' no próprio" "export FOO=1; bash -c 'git commit -m x'"
+  b 0 "ctx: controle — GIT_DIR=<próprio> bash -c 'git commit'" "GIT_DIR=$OWN/.git bash -c 'git commit -m x'"
+  b 0 "ctx: controle — f() { git log; }; eval f; git commit" "f() { git -C $OTH log; }; eval f; git commit -m x"
+  b 0 "ctx: controle — f() { … '{' …; git commit; }; f no próprio, cwd absoluto" "f() { :; echo '{'; git -C $OWN commit; }; f"
+}
+
 g_msg() {
   b 2 "msg: (preparo)" "git -C $OTH commit -m x"
   has() { grep -qF -- "$1" "$T/err"; }
@@ -611,7 +662,7 @@ g_hook() {  # o comando que vai no settings do servidor
   c="python3-que-nao-existe -I $P || exit 2"; sh -c "$c" <<<"$js" >/dev/null 2>&1; [ $? = 2 ]; ok $? "hook: python ausente (127) vira 2"
 }
 
-all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg; group cond && g_cond
+all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg; group cond && g_cond; group ctx && g_ctx
         group check && g_check; group hook && g_hook; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
@@ -642,9 +693,9 @@ echo "== $((n-fails))/$n ok =="
   mutant cond "a cadeia && que sustentava o cd acaba e o diretório continua valendo" 's/        if st.get("chain") and prev != "&&":/        if False:/'
   mutant cond "cd em padrão de case ou com ;; segue mudando o diretório" 's/            if kw or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;")/            if kw or prev in ("||", "|", "|\&") or term in ("|", "|\&", "\&")/'
   mutant cond "{ cd a; } & mantém o diretório do grupo em background" 's/^\( *\)if term == "&":$/\1if False:/'
-  mutant evade "bash -c não é aberto" 's/return scan(script\[0\], cwd, terr, own, depth + 1)/pass/'
-  mutant evade "eval não é aberto" 's/return scan(" ".join(seg\[1:\]), cwd, terr, own, depth + 1)/pass/'
-  mutant evade "\$( ) não é aberto" 's/r = scan(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], terr, own, depth + 1)/r = None/'
+  mutant evade "bash -c não é aberto" 's/return sub(script\[0\], cwd, env)/pass/'
+  mutant evade "eval não é aberto" 's/return sub(" ".join(seg\[1:\]), cwd, env)/pass/'
+  mutant evade "\$( ) não é aberto" 's/r = sub(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], {})/r = None/'
   mutant evade "crase não vira \$( )" 's/cmd, out, i = BACKTICK.sub(r"$(\\1)", cmd), \[\], 0/cmd, out, i = cmd, [], 0/'
   mutant evade "parêntese dentro do \$( ) não é contado" 's/d + (cmd\[k\] == "(") - /d - /'
   mutant evade "\$( ) de heredoc sem aspas é ignorado" 's/("" if m.group(2) else/("" if True else/'
@@ -658,7 +709,7 @@ echo "== $((n-fails))/$n ok =="
   mutant closed "sem projeto, o cwd vira clone próprio" 's/p = os.path.realpath(proj) if proj else ""/p = os.path.realpath(proj or os.getcwd())/'
   mutant evade "stash push com 'stash list' na mensagem vira leitura" 's/(sub == "stash" and first in ("list", "show"))/(sub == "stash")/'
   mutant closed "branch com argumento vira leitura" 's/return lists_only(sub, rest)/return True/'
-  mutant closed "JSON ruim que cita git passa" 's/if not re.search(r"git|file_path|notebook_path", raw):/if True:/'
+  mutant closed "JSON ruim que cita git passa" 's/ and not re.search(r"git|file_path|notebook_path", raw):/:/'
   mutant check "selfcheck só confere o Bash" 's/for tool in ("Bash",) + tuple(TOOLS_FILE):/for tool in ("Bash",):/'
   mutant check "selfcheck aceita hook que chama outro arquivo" 's/re.escape(me)/r"\\S+"/'
   mutant check "selfcheck não exige '|| exit 2'" 's/\\s+\\|\\|\\s+exit\\s+2")/.*")/'
@@ -685,11 +736,19 @@ echo "== $((n-fails))/$n ok =="
   mutant shell "lançador que não modelo (flock/ssh/su/trap…) vira comando comum" 's/        elif c in OPAQUE or opq:/        elif False:/'
   mutant shell "git atrás de lançador herda o diretório conhecido" 's/{\*\*st\["env"\], \*\*env}, None, terr, own)/{**st["env"], **env}, cwd, terr, own)/'
   mutant shell "texto entre aspas passado ao lançador não é aberto" 's/                if re.search(r"\\s", t):/                if False:/'
-  mutant shell "heredoc para bash/ssh/sh é descartado" 's/^        if any(runs_text(s.split()) for s in .*:$/        if False:/'
+  mutant shell "heredoc para bash/ssh/sh é descartado" 's/^        if not all(data_reader(s) for s in .*:$/        if False:/'
   mutant shell "todo heredoc vira script" 's/^    return bool(s) and (opq or .*/    return True/'
   mutant shell "here-string para bash é ignorado" 's/            if herestr and runs_text(seg):/            if False:/'
   mutant shell "continuação de linha não é juntada" 's/hide(CONT.sub(r"\\1", heredocs(cmd)))/hide(heredocs(cmd))/'
   mutant shell "barra escapada + newline vira continuação" 's/^CONT = re.compile(.*)  #/CONT = re.compile(r"()\\\\\\n")  #/'
+  mutant ctx "trecho aninhado começa sem as variáveis de fora" 's/return scan(text, cwd, terr, own, depth + 1, {\*\*st\["env"\], \*\*env}, st\["funcs"\])/return scan(text, cwd, terr, own, depth + 1, {}, st["funcs"])/'
+  mutant ctx "trecho aninhado começa sem as funções de fora" 's/"funcs": {} if funcs is None else funcs}/"funcs": {}}/'
+  mutant ctx "função cujo fim não fecha nunca roda" 's/    if st.get("fdepth"):  # o fim da função/    if False:  # o fim da função/'
+  mutant ctx "heredoc volta a sumir para qualquer leitor que não é shell" 's/    return not opq and (not seg or os.path.basename(seg\[0\]) in DATA)/    return not opq and (not seg or os.path.basename(seg[0]) not in SHELLS)/'
+  mutant ctx "redirecionamento colado esconde o shell do heredoc" 's/REDIR.sub(" ", cmd\[/(cmd[/'
+  mutant ctx "leitor entre aspas deixa de ser lido como palavra" 's/peel(shlex.split(s))/peel(s.split())/'
+  mutant ctx "escape \\U grande derruba o guarda" 's/chr(min(int(e\[1:\], 16), 0x10FFFF))/chr(int(e[1:], 16))/'
+  mutant ctx "falha do guarda num Bash sem a palavra git libera" 's/if not (isinstance(inp, dict) and inp.get("tool_name") in {"Bash", \*TOOLS_FILE}) and not re.search/if not re.search/'
   mutant closed "branch/tag com palavra solta e sem opção de lista vira leitura" 's/        elif t.startswith("-") or not listing:/        elif t.startswith("-"):/'
   mutant closed "branch --list -d x vira leitura" 's/        elif t.startswith("-") or not listing:/        elif not listing:/'
   mutant closed "branch --contains -D x vira leitura" 's/^            if t.startswith("-"):/            if False:/'
