@@ -101,6 +101,7 @@ for side in mini node; do
 #!/bin/bash
 out=""; url=""
 [ $side = mini ] && [ -n "\${FAKE_MINI_DOWN:-}" ] && { echo "000 0"; exit 0; }
+[ $side = node ] && [ -n "\${FAKE_NODE_DOWN:-}" ] && { echo "000 0"; exit 0; }
 while [ \$# -gt 0 ]; do case \$1 in -o) out=\$2; shift 2;; -w|-m|-A|-H) shift 2;; -*) shift;; *) url=\$1; shift;; esac; done
 line=\$(grep -F -m1 "\$url " "$T/curl.$side" 2>/dev/null)
 set -- \$line
@@ -194,8 +195,10 @@ hsr HETZNER_SCRAPE_CODE="$T/nao-existe" -- check;      check "check: código do 
 hsr HETZNER_SCRAPE_ELIGIBLE="$T/nao-existe" -- check;  check "check: lista de elegíveis ilegível -> 97, não 'pronto'" '[ $RC -eq 97 ] && has "^eligible_entries=ilegivel$" && has "ilegível"'
 # a mesma lista malformada: o run recusa (97), então o check tem de dizer 97 com a linha — não "pronto" com a linha contada como entrada
 hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.malformed" -- check;  check "check: linha malformada na lista -> 97 com a linha, eligible_entries=ilegivel (não 'pronto')" '[ $RC -eq 97 ] && has "^eligible_entries=ilegivel$" && has "alpha beta" && has "o run recusaria"'
-hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.malformed" -- run alpha;  check "run: a mesma lista malformada também é recusada (97), é o que o check anuncia" '[ $RC -eq 97 ] && has "ilegível"'
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.malformed" -- run alpha;  check "run: a mesma lista malformada também é recusada (97) e mostra a linha ofensora, como o check" '[ $RC -eq 97 ] && has "ilegível" && has "alpha beta"'
 printf '# só comentário\n' > "$T/eligible.vazia"
+printf '# só comentário\r\n\r\n   \r\n' > "$T/eligible.crlf-vazia"
+hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.crlf-vazia" -- check;  check "check: lista CRLF só com comentário e linha em branco -> eligible_entries=0 e 97 (a linha '\\r' não é um permitido)" '[ $RC -eq 97 ] && has "^eligible_entries=0$" && has "sem nenhum permitido"'
 hsr HETZNER_SCRAPE_ELIGIBLE="$T/eligible.vazia" -- check;      check "check: lista legível mas sem nenhum permitido -> 97 'sem nenhum permitido' (≠ ilegível)" '[ $RC -eq 97 ] && has "^eligible_entries=0$" && has "sem nenhum permitido"'
 
 # ---------- 4. run: recusas (nenhuma toca o nó) ----------
@@ -317,6 +320,13 @@ hsr FAKE_SSH_DOWN=1 -- probe;         check "probe: nó fora -> rc 98" '[ $RC -e
 # a tabela decide a lista de elegíveis: sem runner.py/tenants legíveis as APIs fixas SOZINHAS pareceriam uma medição completa
 mv "$CODE/runner.py" "$T/runner.keep";  hsr -- probe;  check "probe: runner.py ilegível -> 97 'nenhum endereço', não uma tabela só das APIs fixas" '[ $RC -eq 97 ] && has "nenhum endereço" && ! has "IGUAL-"'; mv "$T/runner.keep" "$CODE/runner.py"
 mv "$CODE/config/imoview_tenants.json" "$T/ten.keep";  hsr -- probe;  check "probe: tenants ilegíveis -> 97 'nenhum endereço'" '[ $RC -eq 97 ] && has "nenhum endereço" && ! has "IGUAL-"'; mv "$T/ten.keep" "$CODE/config/imoview_tenants.json"
+# UM *_tenants.json ruim ao lado de um bom: o probe INTEIRO recusa nomeando o arquivo — pular em silêncio tiraria os tenants dele da tabela que decide a lista
+echo 'notjson garbage' > "$CODE/config/oksite_tenants.json"
+hsr -- probe;                         check "probe: um tenants file corrompido (e outro bom) -> 97 nomeando o arquivo, nenhuma tabela" '[ $RC -eq 97 ] && has "oksite_tenants.json: JSONDecodeError" && ! has "IGUAL-" && ! has "medindo"'
+echo '[{"slug":"t3","active":true,"base_url":"https://t3.example"}, 7]' > "$CODE/config/oksite_tenants.json"
+hsr -- probe;                         check "probe: entrada que não é objeto no meio de um tenants file -> 97 (não descarta o resto do arquivo em silêncio)" '[ $RC -eq 97 ] && has "oksite_tenants.json: AttributeError" && ! has "t3.example"'
+rm -f "$CODE/config/oksite_tenants.json"
+hsr FAKE_NODE_DOWN=1 -- probe;        check "probe: o nó não alcança NENHUM endereço (000 em todos) -> 98 'não mediu', não uma tabela SO-O-NO-BLOQUEIA" '[ $RC -eq 98 ] && has "o nó não mediu" && ! has "SO-O-NO-BLOQUEIA"'
 hsr FAKE_MINI_DOWN=1 -- probe;        check "probe: o mini não alcança NENHUM endereço (000 em todos) -> 98 'não mediu', não uma tabela SO-O-MINI-FALHA" '[ $RC -eq 98 ] && has "o mini não mediu" && ! has "SO-O-MINI-FALHA"'
 rm -f "$CITY/.gc/hetzner-node.on"
 hsr -- probe;                         check "probe: sem a bandeira -> rc 99" '[ $RC -eq 99 ]'

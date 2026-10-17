@@ -17,8 +17,8 @@
 #
 # CÓDIGOS DE SAÍDA — 96..99 significam "rode local": quem chama NUNCA trata isso como falha do raspador (mesma convenção do mbp-run.sh).
 #   0..94  código do raspador (propagado); 95 = rc >= 95 do raspador (inclusive 124 = estourou o --timeout, ou rc ilegível no nó): o valor cru vai SEMPRE na linha `scraper_rc_raw=`
-#   97  uso errado (inclusive opção sem valor e `--tenant` — inteiro ou abreviado — depois do `--`), nome inválido, raspador fora da lista ou BLOQUEADO (inclusive: sem --tenant, raspador com algum `!raspador:tenant`), código do rig ou lista ausente, ilegível ou com linha malformada (também no `check`), tenant inválido no `eligible`, staging dentro de shared/ (jamais grava na produção)
-#   98  nó indisponível ou sem condição: ssh não responde, ambiente não preparado (rode bootstrap), disco < HETZNER_SCRAPE_MIN_DISK_MB, conteúdo reprovado pela varredura, ssh caiu no meio
+#   97  uso errado (inclusive opção sem valor e `--tenant` — inteiro ou abreviado — depois do `--`), nome inválido, raspador fora da lista ou BLOQUEADO (inclusive: sem --tenant, raspador com algum `!raspador:tenant`), código do rig ou lista ausente, ilegível ou com linha malformada (também no `check`), tenant inválido no `eligible`, staging dentro de shared/ (jamais grava na produção), `probe` sem endereço para medir ou com algum *_tenants.json ilegível
+#   98  nó indisponível ou sem condição: ssh não responde, ambiente não preparado (rode bootstrap), disco < HETZNER_SCRAPE_MIN_DISK_MB, conteúdo reprovado pela varredura, ssh caiu no meio, `probe` em que o mini ou o nó não mediu nenhum endereço (000 em todos)
 #   99  desligado: falta $CITY/.gc/hetzner-node.on (a mesma bandeira do nó de testes; apagar = desligar)
 #
 # O QUE VAI, O QUE VOLTA
@@ -133,7 +133,7 @@ cmd_check() {
   echo "node_host=$NODE_HOST"
   # a MESMA leitura da lista que o `run` faz (eligibility, com um nome que nenhuma linha casa): rc 3 = lista ilegível OU linha malformada → o run recusa tudo, então não há contagem a mostrar (ilegivel), nunca um número que parece pronto
   lint=$(eligibility -lista-); lrc=$?
-  if [ "$lrc" -eq 3 ]; then el=ilegivel; else el=$(awk '{sub(/#.*/,"")} /^[ \t]*[^ \t!]/{n++} END{print n+0}' "$ELIGIBLE"); fi
+  if [ "$lrc" -eq 3 ]; then el=ilegivel; else el=$(awk '{sub(/#.*/,""); gsub(/\r/,"")} /^[ \t]*[^ \t!]/{n++} END{print n+0}' "$ELIGIBLE"); fi
   echo "eligible_entries=$el"
   echo "code_dir=$([ -d "$PS_CODE/scrapers" ] && echo ok || echo ausente)"
   [ "$rc" -eq 0 ] && { echo "node_env=$NODE_ENV"; echo "node_free_mb=$NODE_FREE_MB"; echo "node_ncpu=$NODE_NCPU"; echo "node_load=$NODE_LOAD"; }
@@ -211,24 +211,28 @@ write_state_filter() { # write_state_filter <arquivo> <raspador>
 }
 
 cmd_probe() {
-  local out="" tmp rc=0 urls nodef minif
+  local out="" tmp rc=0 urls nodef minif err
   while [ $# -gt 0 ]; do case $1 in --out) need_val probe "$@"; out=$2; shift 2;; *) die 97 "probe: argumento desconhecido: $1";; esac; done
   [ -d "$PS_CODE" ] || die 97 "código do rig ausente: $PS_CODE"
   [ -e "$NODE_FLAG" ] || die 99 "$(why_of 99)"
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/hsr-probe.XXXXXX") || die 98 "sem diretório temporário"; urls=$tmp/urls; minif=$tmp/mini; nodef=$tmp/node
   # endereços: o host de conectividade de cada raspador no runner.py + o base_url de cada tenant ativo (cada parte em arquivo próprio) + os endpoints de API que os raspadores chamam
   grep -o -E '"connectivity_host": *"[^"]+"' "$PS_CODE/runner.py" 2>/dev/null | sed -E 's/.*"([^"]+)"$/https:\/\/\1\//' > "$tmp/homes"
-  python3 -I - "$PS_CODE/config" > "$tmp/tenants" 2>/dev/null <<'PY'
+  # vazio → nenhum *_tenants.json ou nenhum tenant ativo com base_url (cai no guard `-s` abaixo); falhou/ilegível → UM arquivo que não parseia, ou com entrada que não é objeto, ou python3 ausente: sai != 0 com os nomes no stderr e o probe INTEIRO recusa (rc 97). Pular o arquivo em silêncio tiraria os tenants dele da tabela que decide a lista de elegíveis
+  python3 -I - "$PS_CODE/config" > "$tmp/tenants" 2> "$tmp/tenants.err" <<'PY' || { err=$(head -c 300 "$tmp/tenants.err" | tr '\n' ' '); rmtmp "$tmp"; die 97 "não consegui ler todos os *_tenants.json (${err:-python3 saiu sem mensagem}) — a tabela decide a lista de elegíveis e sairia sem os tenants que faltam"; }
 import glob, json, sys
+bad = []
 for f in sorted(glob.glob(sys.argv[1] + "/*_tenants.json")):
     try:
         for t in json.load(open(f)):
             if t.get("active", True) and t.get("base_url"):
                 print(t["base_url"].rstrip("/") + "/")
-    except Exception:
-        pass
+    except Exception as e:
+        bad.append("%s: %s" % (f.rsplit("/", 1)[-1], type(e).__name__))
+if bad:
+    sys.exit("; ".join(bad))
 PY
-  # vazio → runner.py sem hosts ou tenants sem base_url; falhou/ilegível (runner.py ou tenants ilegíveis, python3 ausente) → idem: as APIs fixas SOZINHAS pareceriam uma medição completa, e é esta tabela que decide a lista de elegíveis, então rc 97
+  # vazio → runner.py sem hosts ou tenants sem base_url; falhou/ilegível (runner.py ilegível) → idem: as APIs fixas SOZINHAS pareceriam uma medição completa, e é esta tabela que decide a lista de elegíveis, então rc 97
   [ -s "$tmp/homes" ] && [ -s "$tmp/tenants" ] || { rmtmp "$tmp"; die 97 "nenhum endereço de raspador ou de tenant para medir (runner.py/tenants ilegíveis em $PS_CODE)"; }
   { cat "$tmp/homes" "$tmp/tenants"
     printf '%s\n' 'https://apigw.prod.quintoandar.com.br/house-listing-search/v2/search/coordinates' 'https://landscape-api.loft.com.br/listing/v3/search' 'https://glue-api.zapimoveis.com.br/v2/listings' \
@@ -240,6 +244,8 @@ PY
   { declare -f probe_loop; echo 'probe_loop <<"HSR_URLS_EOF"'; cat "$urls"; echo HSR_URLS_EOF; } | rssh bash -s > "$nodef" 2>/dev/null || rc=$?
   local mrc=0; wait "$mpid" || mrc=$?
   if [ "$rc" -ne 0 ] || [ ! -s "$nodef" ]; then rmtmp "$tmp"; die 98 "o nó não respondeu à medição (rc $rc)"; fi
+  # o lado do nó também precisa ter MEDIDO. vazio → nenhuma linha com resposta (000 em todos = sem curl ou sem rede no nó): "não medido", rc 98; falhou/ilegível (arquivo ilegível, awk falhou) → idem rc 98 — nunca a tabela inteira como SO-O-NO-BLOQUEIA ("o Cloudflare barra o nó")
+  awk '$1 != "000" {n++} END {exit (n > 0 ? 0 : 1)}' "$nodef" || { rmtmp "$tmp"; die 98 "o nó não mediu nenhum endereço (000 em todos; sem curl ou sem rede?) — a tabela não vale"; }
   # o lado do mini também precisa ter MEDIDO: laço que morreu, ou nenhum endereço com resposta (000 em todos = sem rede/curl no mini), vira "não medido" — nunca a tabela inteira como SO-O-MINI-FALHA/DIFERE-FALHA
   if [ "$mrc" -ne 0 ] || ! awk '$1 != "000" {n++} END {exit (n > 0 ? 0 : 1)}' "$minif"; then rmtmp "$tmp"; die 98 "o mini não mediu nenhum endereço (rc $mrc; sem rede ou curl?) — a tabela não vale"; fi
   # bloqueio = o nó NÃO recebe 2xx onde o mini recebe, ou recebe uma página de desafio de verdade (just a moment, attention required...) que o mini não recebe. A palavra solta `captcha` num 200
@@ -297,7 +303,7 @@ cmd_run() {
   [ -z "$limit" ] || [ "$(num_or "$limit" x)" != x ] || die 97 "run: --limit não é número: '$limit'"
   [ "$(num_or "$to" x)" != x ] && [ "$to" -ge 1 ] || die 97 "run: --timeout inválido: '$to'"
   v=$(eligibility "$sc" "$tn"); rc=$?
-  case $rc in 0) ;; 1) die 97 "'$sc' está BLOQUEADO para o nó: ${v#BLOCK } — rode local";; 2) die 97 "'$sc' não está em $(basename "$ELIGIBLE") (só roda no nó o que foi medido): rode local";; *) die 97 "lista de elegíveis ilegível ($ELIGIBLE): rode local";; esac
+  case $rc in 0) ;; 1) die 97 "'$sc' está BLOQUEADO para o nó: ${v#BLOCK } — rode local";; 2) die 97 "'$sc' não está em $(basename "$ELIGIBLE") (só roda no nó o que foi medido): rode local";; *) die 97 "lista de elegíveis ilegível ($ELIGIBLE): $v — rode local";; esac
   [ -d "$PS_CODE/scrapers/$sc" ] || die 97 "código do raspador ausente: $PS_CODE/scrapers/$sc"
   # o staging é resolvido (symlinks inclusive) ANTES de ser criado: recusar depois de um mkdir -p já teria escrito dentro da produção
   case $stage_base in ..|*/..|*/../*) die 97 "o staging ($stage_base) não pode ter '..' no caminho";; esac
