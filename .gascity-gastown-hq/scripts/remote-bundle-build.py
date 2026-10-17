@@ -8,8 +8,10 @@ Contents
 
 USO
   remote-bundle-build.py build --city C --claude-home ~/.claude --role dog --role-dir C/.gc/agents/dogs/gastown.dog-1 \
-      --remote-root /home/runner/gt-remote/bundle --remote-home /home/runner --out OUT [--skills]
-  remote-bundle-build.py verify OUT          # re-hasheia os arquivos e confere com o manifest (inclui o bit de execução, lido do modo, e o
+      --remote-root /home/runner/gt-remote/bundle --remote-home /home/runner --out OUT [--skills [--exclude-skill NOME]...]
+      (--skills deixa de fora, POR NOME, as de SKILLS_NOT_ON_SERVER (3, CPF/CNPJ) e SKILLS_MINI_ONLY (3, caminho do mini); --exclude-skill acrescenta nomes; o manifest lista `excluded_skills` e,
+       para nome que não existe em skills/, `excluded_skills_missing` + aviso no stderr — a guarda de CPF/CNPJ continua valendo para as demais)
+  remote-bundle-build.py verify OUT         # re-hasheia os arquivos e confere com o manifest (inclui o bit de execução, lido do modo, e o
                                           bundle_hash; pasta ou arquivo ilegível, symlink no lugar de arquivo e arquivo a mais são diferença, não "limpo")
 
 O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
@@ -119,6 +121,14 @@ SECRETS = [
     ("telefone BR", re.compile(r"(?<![0-9A-Za-z])(?:(?:\+?55[\s-]?)?\(?[1-9][1-9]\)?[\s-]?(?:9\d{4}|[2-5]\d{3})[\s-]\d{4}"
                                r"|(?:\+?55)?[1-9][1-9]9\d{8})(?![0-9A-Za-z])")),
 ]
+# Skills que NÃO vão ao servidor, por NOME (ga-2hd02v.1.5.2; decisão do Mayor, Q3): trazem valores em formato de CPF/CNPJ (consulta a cartório,
+# prefeitura e TST) e o servidor não guarda dado de pessoa. A guarda de CPF/CNPJ de SECRETS NÃO é afrouxada por isso: uma 4ª skill com o mesmo formato recusa.
+SKILLS_NOT_ON_SERVER = ("censec-inventario-extrajudicial", "cnd-municipal-pbh", "cnd-trabalhista-cndt")
+# MEDIDO em 17/10 com as 18 skills do dog (o builder para na 1ª recusa, então a bead só conhecia as 3 de cima): outras 3 recusam, cada uma por UMA linha com caminho do mini
+# (/Users/athos/gt/...: o daemon de anúncios do WA, o publicar_mockup.py, uma cópia da browser-control). São skills do WA que só funcionam com o mini; a guarda de /Users/ NÃO é afrouxada.
+# Voltam ao servidor tirando o nome daqui quando a skill deixar de citar o mini (o aviso de nome inexistente denuncia lista velha).
+SKILLS_MINI_ONLY = ("corrigir-imovel-do-anuncio", "rea-scraper-first", "wa-worker-session-protocol")
+SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # nome exato de pasta em skills/: sem barra, sem glob
 DATA_SUFFIX = {".db", ".duckdb", ".sqlite", ".sqlite3", ".csv", ".parquet", ".gz", ".zip", ".tar", ".xlsx", ".pem", ".key"}
 DATA_NAMES = {"settings.local.json", ".credentials.json", ".env"}
 MAX_FILE = 512 * 1024
@@ -141,6 +151,8 @@ class Bundle:
         self.dropped_keys: dict[str, list[str]] = {}
         self.dropped_rules: dict[str, int] = {}
         self.skill_count = 0
+        self.excluded: list[str] = []          # skills que existiam em skills/ e ficaram de fora, por nome
+        self.excluded_missing: list[str] = []  # nomes de exclusão que NÃO existem em skills/ (renomeada? removida?)
 
     def rewrite(self, s: str) -> str:
         for old, new in self.rules:  # fronteira nos dois lados: gt-backup, gt2 e /xx/Users/... não são o caminho; sobram e a guarda de /Users/ recusa
@@ -271,7 +283,17 @@ class Bundle:
         if not sdir.is_dir():
             raise Refused(f"--skills pedido mas {sdir} não existe")
         self.skill_count = 0
-        for link in sorted(sdir.iterdir()):
+        entries = sorted(sdir.iterdir())
+        skip = set(SKILLS_NOT_ON_SERVER) | set(SKILLS_MINI_ONLY) | set(self.a.exclude_skill)
+        self.excluded = []  # preenchido no próprio laço, onde se decide: o manifest lista o que FOI pulado, não o que uma 2ª conta acha que seria
+        self.excluded_missing = sorted(skip - {e.name for e in entries})
+        for name in self.excluded_missing:  # antes do laço: uma skill renomeada recusa pelo CPF logo abaixo, e o aviso do nome velho tem de aparecer junto
+            print(f"remote-bundle-build: AVISO: skill excluída por nome não existe em {sdir}: {name} (renomeada? a de nome novo NÃO está excluída: "
+                  f"se tiver valor em formato de CPF/CNPJ o build recusa)", file=sys.stderr)
+        for link in entries:
+            if link.name in skip:  # por NOME e antes de resolver: o que não vai ao servidor não é lido, nem barrado por conteúdo
+                self.excluded.append(link.name)
+                continue
             real = link.resolve()
             if not real.is_dir() or self.city not in real.parents:
                 raise Refused(f"skill {link.name}: aponta para fora da cidade ou não é diretório ({real})")
@@ -310,6 +332,7 @@ class Bundle:
                 "hooks": self.hooks, "shim_needs": sorted(self.shim_needs),
                 "dropped_keys": {k: sorted(set(v)) for k, v in sorted(self.dropped_keys.items())},
                 "dropped_rules": dict(sorted(self.dropped_rules.items())),
+                "excluded_skills": self.excluded, "excluded_skills_missing": self.excluded_missing,
                 "files": {rel: {"sha256": hashlib.sha256(d).hexdigest(), "exec": ex} for rel, (d, ex) in sorted(self.files.items())},
                 "bundle_hash": listing_hash({rel: (hashlib.sha256(d).hexdigest(), ex) for rel, (d, ex) in self.files.items()})}
 
@@ -434,11 +457,17 @@ def main(argv: list[str]) -> int:
     b.add_argument("--mini-home", default=str(Path.home()))
     b.add_argument("--out", required=True)
     b.add_argument("--skills", action="store_true")
+    b.add_argument("--exclude-skill", action="append", default=[], metavar="NOME")
     v = sub.add_parser("verify")
     v.add_argument("dir")
     a = ap.parse_args(argv)
     if a.cmd == "verify":
         return verify(Path(a.dir))
+    if a.exclude_skill and not a.skills:  # flag que não faz nada em silêncio é pior que erro de uso
+        ap.error("--exclude-skill só vale com --skills")
+    for name in a.exclude_skill:
+        if not SKILL_NAME.fullmatch(name):
+            ap.error(f"--exclude-skill {name!r}: é o NOME exato de uma pasta em skills/ (sem barra nem glob)")
     try:
         bundle = Bundle(a)
         manifest = bundle.build()
@@ -460,7 +489,8 @@ def main(argv: list[str]) -> int:
     except OSError as e:  # a entrada estava boa; o que falhou foi gravar — a mensagem não pode culpar a entrada
         print(f"remote-bundle-build: RECUSADO: não consegui gravar {out}: {e}", file=sys.stderr)
         return REFUSED
-    print(f"remote-bundle-build: ok {len(manifest['files'])} arquivos{f', {bundle.skill_count} skills' if a.skills else ''}, "
+    skills_note = f", {bundle.skill_count} skills ({len(bundle.excluded)} excluídas por nome)" if a.skills else ""
+    print(f"remote-bundle-build: ok {len(manifest['files'])} arquivos{skills_note}, "
           f"hash {manifest['bundle_hash'][:12]}, shim_needs={manifest['shim_needs']}")
     return 0
 
