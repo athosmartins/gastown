@@ -1945,6 +1945,12 @@ lock_case "(F3) an end time that is not a number is no end time → judged by ag
 lockrepo l14; mkdir -p "$WORK/lockdead"; echo 999999 > "$WORK/lockdead/pid"; echo "$(( $(date +%s) + 3600 ))" > "$WORK/lockdead/until"; touch -t "$OLD3H" "$WORK/lockdead"
 out="$(T_LOCK="$WORK/lockdead" run_jac "$L")"; rc=$?
 lock_case "(F4) end time ahead but the owner is DEAD (SIGKILLed by the order's timeout) → reclaimed, the end time does not keep a dead run's lock" 0 'stale lock' 'could not|in flight' 0
+if [ "$(id -u)" -eq 0 ]; then skip "(F5): running as root — chmod 000 does not make the end time unreadable for it, the unreadable-end-time fixture did NOT run"; else
+lockrepo l15; mkdir -p "$WORK/lockunread"; echo "$$" > "$WORK/lockunread/pid"; echo "$(( $(date +%s) + 3600 ))" > "$WORK/lockunread/until"; chmod 000 "$WORK/lockunread/until"; touch -t "$OLD3H" "$WORK/lockunread"
+out="$(T_LOCK="$WORK/lockunread" run_jac "$L")"; rc=$?
+lock_case "(F5) an end time that cannot be READ is no end time → judged by age alone (3h, owner alive = hung), reclaimed — the way it was before the night gc" 0 'stale lock' 'could not|in flight' 0
+chmod u+rw "$WORK/lockunread/until" 2>/dev/null; rm -f "$WORK/lockunread/until"; rmdir "$WORK/lockunread" 2>/dev/null
+fi
 # G. the longer deadline is for the gc only: the NEXT repo is back on the ordinary budget (here 3s, already spent by the gc), it does not inherit the night's hours
 WG1="$WORK/n6"; mkwin "$WG1"; WG2="$WORK/n7"; mkrepo "$WG2" 20; LG2="$(loose_count "$WG2")"
 out="$(T_DEADLINE=3 night_run "$WG1 $WG2")"; rc=$?
