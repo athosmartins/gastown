@@ -57,6 +57,7 @@ AWS="${JHO_AWS:-aws}"
 BD="${JHR_BD:-bd}"
 DF="${JHR_DF:-df}"                       # só o selftest troca (disco que enche sem encher o disco de verdade)
 WATCH_S="${JHR_WATCH_INTERVAL:-5}"       # idem: intervalo da vigia de disco durante o import
+GRACE_S="${JHR_TERM_GRACE:-15}"          # idem: segundos entre o TERM e o KILL do import interrompido pela vigia
 S3_TIMEOUT="${JHO_S3_TIMEOUT:-1200}"
 export AWS_REQUEST_CHECKSUM_CALCULATION=when_required   # ga-tyaozh (mesma razão do dolt-s3-backup.sh)
 
@@ -67,21 +68,24 @@ log()  { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&2; }
 die()  { echo "jsonl-hourly-restore: $*" >&2; exit 3; }
 unknown() { echo "RESULT: UNKNOWN db=${DB} motivo=$*"; exit 2; }
 
+# Opção com valor: `shift 2` com UM argumento restante falha sem deslocar (bash) e o laço girava para sempre (medido: rc=124 do timeout, CPU a 100%);
+# valor que começa com `--` é a próxima opção, não o valor (`--db --keep` daria DB=--keep). Vale para TODA opção com valor, não só a que foi citada.
+needval() { [ $# -ge 2 ] || die "$1 exige um valor"; case "$2" in --*) die "$1 exige um valor (veio a opção $2)" ;; esac; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --db) DB="${2:-}"; shift 2 ;;
-    --from-s3) MODE=s3; SRC_KEY="${2:-latest}"; shift 2 ;;
-    --artifact) MODE=file; ARTIFACT="${2:-}"; shift 2 ;;
-    --manifest) MANIFEST="${2:-}"; shift 2 ;;
-    --dump) MODE=dump; DUMP="${2:-}"; shift 2 ;;
-    --work) WORK_ARG="${2:-}"; shift 2 ;;
+    --db) needval "$@"; DB="$2"; shift 2 ;;
+    --from-s3) MODE=s3; SRC_KEY=latest; shift; case "${1:-}" in ""|--*) ;; *) SRC_KEY="$1"; shift ;; esac ;;   # valor opcional: sem ele (ou com outra opção no lugar) é `latest`
+    --artifact) needval "$@"; MODE=file; ARTIFACT="$2"; shift 2 ;;
+    --manifest) needval "$@"; MANIFEST="$2"; shift 2 ;;
+    --dump) needval "$@"; MODE=dump; DUMP="$2"; shift 2 ;;
+    --work) needval "$@"; WORK_ARG="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
-    --report-out) REPORT_OUT="${2:-}"; shift 2 ;;
-    --min-free-mb) MIN_FREE_MB="${2:-}"; shift 2 ;;
-    --import-timeout) IMPORT_TIMEOUT="${2:-}"; shift 2 ;;
-    --prefix) PREFIX_ARG="${2:-}"; shift 2 ;;
-    --disk-factor) DISK_FACTOR="${2:-}"; shift 2 ;;
-    --disk-floor-mb) DISK_FLOOR_MB="${2:-}"; shift 2 ;;
+    --report-out) needval "$@"; REPORT_OUT="$2"; shift 2 ;;
+    --min-free-mb) needval "$@"; MIN_FREE_MB="$2"; shift 2 ;;
+    --import-timeout) needval "$@"; IMPORT_TIMEOUT="$2"; shift 2 ;;
+    --prefix) needval "$@"; PREFIX_ARG="$2"; shift 2 ;;
+    --disk-factor) needval "$@"; DISK_FACTOR="$2"; shift 2 ;;
+    --disk-floor-mb) needval "$@"; DISK_FLOOR_MB="$2"; shift 2 ;;
     -h|--help) sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed '$d'; exit 0 ;;
     *) die "opção desconhecida: $1" ;;
   esac
@@ -90,8 +94,8 @@ done
 [ -n "$DB" ] || die "falta --db"
 case "$DB" in *[!A-Za-z0-9_.-]*|.*) die "--db com caracteres fora de [A-Za-z0-9_.-]" ;; esac
 [ -n "$MODE" ] || die "falta a origem: --from-s3, --artifact ou --dump"
-for v in "$MIN_FREE_MB" "$IMPORT_TIMEOUT" "$DISK_FACTOR" "$DISK_FLOOR_MB" "$WATCH_S"; do   # um vazio entre inteiros não pode passar na concatenação
-  case "$v" in ""|*[!0-9]*) die "--min-free-mb, --import-timeout, --disk-factor, --disk-floor-mb e JHR_WATCH_INTERVAL são inteiros (veio '$v')" ;; esac
+for v in "$MIN_FREE_MB" "$IMPORT_TIMEOUT" "$DISK_FACTOR" "$DISK_FLOOR_MB" "$WATCH_S" "$GRACE_S"; do   # um vazio entre inteiros não pode passar na concatenação
+  case "$v" in ""|*[!0-9]*) die "--min-free-mb, --import-timeout, --disk-factor, --disk-floor-mb, JHR_WATCH_INTERVAL e JHR_TERM_GRACE são inteiros (veio '$v')" ;; esac
 done
 [ "$WATCH_S" -ge 1 ] || die "JHR_WATCH_INTERVAL tem que ser >= 1"
 [ "$MODE" = file ] && { [ -n "$ARTIFACT" ] && [ -n "$MANIFEST" ] || die "--artifact exige --manifest"; }
@@ -117,10 +121,14 @@ else
 fi
 WORK="$(cd "$WORK" && pwd -P)"
 IMP_PID=""
+# O import roda sob `timeout`, que se põe num grupo de processos próprio (pgid = pid dele) e repassa o TERM, mas o KILL não: sinalizar só o PID do
+# timeout deixava o `bd import` órfão, vivo e ainda crescendo o store depois do "interrompido". Sinal para o grupo inteiro (e para o PID, se o grupo não existir).
+stop_import() { kill -s "$1" -- "-$IMP_PID" "$IMP_PID" 2>/dev/null; }
+import_alive() { kill -0 "$IMP_PID" 2>/dev/null || kill -0 -- "-$IMP_PID" 2>/dev/null; }   # o timeout pode já ter saído e deixado o bd no grupo
 cleanup() {
   # o import roda em segundo plano (vigia de disco) e job em segundo plano de shell não interativo IGNORA Ctrl-C: sem isto, abortar o
   # restore apagaria o store por baixo de um `bd import` ainda vivo
-  if [ -n "$IMP_PID" ] && kill -0 "$IMP_PID" 2>/dev/null; then kill -TERM "$IMP_PID" 2>/dev/null; sleep 2; kill -KILL "$IMP_PID" 2>/dev/null; fi
+  if [ -n "$IMP_PID" ] && import_alive; then stop_import TERM; sleep 2; import_alive && stop_import KILL; fi
   if [ "$OWN_WORK" = 1 ] && [ "$KEEP" = 0 ]; then
     case "$WORK" in
       */jsonl-hourly-restore.*)
@@ -161,8 +169,11 @@ s3get() { # key dest
 if [ "$MODE" = s3 ]; then
   if [ "$SRC_KEY" = latest ]; then
     s3get "$S3_PREFIX/latest.json" "$WORK/latest.json" || unknown "S3: não li $S3_PREFIX/latest.json ($(tail -1 "$WORK/aws.err" 2>/dev/null))"
-    SRC_KEY="$(jq -r '.snapshot_key // empty' "$WORK/latest.json")"
+    # vazio → latest.json sem chave: sem veredito; falhou/ilegível → o jq não imprime nada, cai no mesmo vazio (rc 2), nunca numa chave inventada
+    SRC_KEY="$(jq -r '.snapshot_key // empty' "$WORK/latest.json" 2>/dev/null)"
     [ -n "$SRC_KEY" ] || unknown "latest.json sem snapshot_key"
+    # a chave veio do BUCKET, não do operador: fora do padrão é dado ruim lá, não uso errado aqui (o `die` abaixo fica para a chave digitada)
+    case "$SRC_KEY" in "$S3_PREFIX"/snap/*.tar.gz) ;; *) unknown "latest.json aponta para uma chave fora de $S3_PREFIX/snap/*.tar.gz: $SRC_KEY" ;; esac
   fi
   case "$SRC_KEY" in "$S3_PREFIX"/snap/*.tar.gz) ;; *) die "chave fora de $S3_PREFIX/snap/*.tar.gz: $SRC_KEY" ;; esac
   MANIFEST="$WORK/manifest.json"; ARTIFACT="$WORK/snapshot.tar.gz"
@@ -221,7 +232,8 @@ need=$(( IMPORT_MB * DISK_FACTOR + 512 ))
 # ── 3. store descartável + import ───────────────────────────────────────────────────────
 PREFIX="${PREFIX_ARG:-$(jq -r '.config.issue_prefix // empty' "$WORK/convert.json")}"
 [ -n "$PREFIX" ] || PREFIX="$DB"
-case "$PREFIX" in *[!A-Za-z0-9_]*) PREFIX="$(echo "$PREFIX" | tr -c 'A-Za-z0-9_' '_')" ;; esac
+# o bd 1.1.0 aceita hífen no prefixo (medido: lex-bh); printf, não echo: o \n do echo virava um `_` de sobra (lex-bh -> lex_bh_)
+case "$PREFIX" in *[!A-Za-z0-9_-]*) PREFIX="$(printf '%s' "$PREFIX" | tr -c 'A-Za-z0-9_-' '_')" ;; esac
 sbd() { ( cd "$WORK/store" && env -i HOME="$WORK/home" PATH="$PATH" TMPDIR="$WORK/tmp" BD_NON_INTERACTIVE=1 BEADS_DOLT_AUTO_START=0 DOLT_DISABLE_EVENT_FLUSH=1 "$BD" "$@" ); }
 log "bd init (embutido) prefixo=$PREFIX"
 sbd init -p "$PREFIX" --non-interactive >"$WORK/init.out" 2>&1 || unknown "bd init falhou: $(tail -2 "$WORK/init.out" | tr '\n' ' ')"
@@ -275,9 +287,9 @@ while kill -0 "$IMP_PID" 2>/dev/null; do
   cur="$(free_mb "$WORK")"
   if [ -z "$cur" ] || [ "$cur" -lt "$DISK_FLOOR_MB" ]; then
     FLOOR_HIT=1; LOW_FREE="${cur:-?}"
-    kill -TERM "$IMP_PID" 2>/dev/null
-    t=0; while [ "$t" -lt 15 ] && kill -0 "$IMP_PID" 2>/dev/null; do sleep 1; t=$((t + 1)); done
-    kill -0 "$IMP_PID" 2>/dev/null && kill -KILL "$IMP_PID" 2>/dev/null
+    stop_import TERM
+    t=0; while [ "$t" -lt "$GRACE_S" ] && import_alive; do sleep 1; t=$((t + 1)); done
+    import_alive && stop_import KILL
     break
   fi
 done
@@ -296,8 +308,12 @@ if [ $rc -ne 0 ]; then
   # vazio → o bd não disse o motivo; falhou/ilegível → o mesmo vazio: sem veredito (rc 2), nunca "o dump não reproduz"
   why="$(jq -r '.error // empty' "$WORK/import.result.json" 2>/dev/null | head -c 400)"
   tailerr="$(tail -3 "$WORK/import.err" 2>/dev/null | tr '\n' ' ' | head -c 400)"
-  # disco cheio pelo próprio bd não é "o dump não reproduz": é falta de veredito
-  case "$why$tailerr" in *"No space left"*|*"no space left"*) unknown "bd import sem espaço em disco: ${why:-$tailerr}" ;; esac
+  # disco cheio, memória, descritores ou lock do ambiente não são "o dump não reproduz": são falta de veredito (o bd diz o motivo em .error, rc 1, como diria de um dump ruim)
+  low="$(printf '%s %s' "$why" "$tailerr" | tr 'A-Z' 'a-z')"
+  case "$low" in
+    *"no space left"*) unknown "bd import sem espaço em disco: ${why:-$tailerr}" ;;
+    *"cannot allocate memory"*|*"out of memory"*|*"too many open files"*|*"database is locked"*|*"resource temporarily unavailable"*) unknown "bd import sem recurso do ambiente: ${why:-$tailerr}" ;;
+  esac
   # rc >= 128 = morto por sinal (OOM, SIGKILL): mesmo com um .error parcial, não foi o bd que julgou o dump
   if [ -z "$why" ] || [ "$rc" -ge 128 ]; then unknown "bd import morreu sem dizer o motivo (rc=$rc): ${why:-$tailerr}"; fi
   echo "RESULT: FAIL db=$DB motivo=bd import rc=$rc: $why"; exit 1
@@ -310,6 +326,10 @@ py reconcile --db "$DB" $MAN_ARG --convert-stats "$WORK/convert.json" --imported
   >"$WORK/report.json" 2>"$WORK/reconcile.err"
 rrc=$?
 [ -s "$WORK/report.json" ] || unknown "reconcile não produziu relatório: $(head -c 300 "$WORK/reconcile.err")"
+# relatório sem contas (_fail do helper: {"verdict":"fail","problems":[...]} — entrada ilegível ou manifest sem contagem) = as contas não foram feitas: sem veredito
+# (antes caía em jq com erro e `RESULT: FAIL ... dup_comments=null`); vazio/ilegível → o jq -e falha e cai no mesmo unknown
+jq -e '(.table | type) == "array" and (.exclusions | type) == "object"' "$WORK/report.json" >/dev/null 2>&1 \
+  || unknown "reconcile não chegou às contas: $(jq -r '.problems[0]? // empty' "$WORK/report.json" 2>/dev/null | head -c 300)"
 if [ -n "$REPORT_OUT" ]; then cp "$WORK/report.json" "$REPORT_OUT" 2>/dev/null || log "AVISO: não gravei o relatório em $REPORT_OUT (o veredito abaixo vale; o relatório está em $WORK/report.json só até o fim do run)"; fi
 
 echo "── $DB: manifest − exclusões por desenho = esperado · restaurado ──"

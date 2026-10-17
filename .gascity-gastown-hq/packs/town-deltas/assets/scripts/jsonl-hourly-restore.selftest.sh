@@ -35,6 +35,13 @@
 #      o `.error` do conversor continua sendo FAIL (rc 1); --report-out que não grava avisa, e o rc continua sendo o do restore
 #  19. bd import morto por sinal (SIGKILL/OOM, rc 137) sem dizer o motivo: rc 2 "sem veredito", não FAIL (o FAIL de import exige `.error`)
 #  20. --dump com caminho relativo (o link no diretório de trabalho apontaria para dentro dele): rc 0; 20b. --manifest com --dump avisa que é ignorado
+#  Reprovação do gate ga-15eiut (17/10; cada item abaixo reprova contra o script anterior, 27 asserções):
+#  21. opção com valor como ÚLTIMO argumento (ou seguida de outra opção) é rc 3 em segundos, não laço infinito (rc 124); `--from-s3` sem valor é `latest`;
+#      latest.json com chave fora do padrão é dado ruim do bucket (rc 2), não uso errado (rc 3)
+#  22. a vigia e o TERM do restore matam o bd que IGNORA o TERM: o KILL vai ao grupo do `timeout`, o import não fica órfão
+#  23. bd morto por sinal com `.error` parcial (rc 137): rc 2 (a cláusula rc>=128; provada por mutante: sem ela o teste cai)
+#  24. bd recusando por memória/descritores/lock (rc 1 com `.error`): rc 2, não FAIL · 25. export que não é JSON: rc 2, sem erro de jq
+#  26. prefixo do store: hífen preservado, outro caractere vira `_`, sem `_` de sobra no fim
 #  Cada item de 11 a 16 foi provado reprovando (campanha de mutantes, 16/10): vigia desligada, FLOOR_HIT ignorado, fator 3×, ENOSPC
 #  sem tratamento, cleanup sem matar o import, import arredondado para baixo => cada um derruba pelo menos um teste, e só os dele.
 #  O 18 também (17/10): cada uma das quatro guardas removida derruba só os testes dela.
@@ -70,7 +77,7 @@ hasnt() {
 }
 
 # bd de mentira: o comportamento vai escrito dentro dele, porque o restore o chama com `env -i` (nenhuma variável do teste chega lá)
-mk_bd() { # rejeita_config_por_outro_motivo(0|1)  comentarios(keep|merge|drop: o que o export devolve dos comentários)
+mk_bd() { # rejeita_config_por_outro_motivo(0|1)  comentarios(keep|merge|drop|garbage: o que o export devolve dos comentários)
   cat > "$T/bin/bd" <<EOF
 #!/bin/bash
 LOGF="$T/bd-calls.log"; REJECT_OTHER=$1; COMMENTS=${2:-keep}
@@ -78,7 +85,7 @@ BUILTIN=" open in_progress blocked deferred closed pinned hooked "
 cmd="\${1:-}"; shift || true
 echo "\$cmd:\${DOLT_DISABLE_EVENT_FLUSH:-unset}" >> "$T/bd-env.log"
 case "\$cmd" in
-  init) mkdir -p .beads; exit 0 ;;
+  init) mkdir -p .beads; echo "\$*" >> "$T/bd-init.log"; exit 0 ;;
   config)
     [ "\${1:-}" = set ] || exit 0
     key="\$2"; val="\$3"
@@ -97,7 +104,8 @@ case "\$cmd" in
   import)
     # modo do import lido em tempo de execução (o restore chama o bd com env -i): fill = o disco enche e o import fica pendurado,
     # breakdf = o df passa a falhar, hang = pendurado sem mexer no disco, slow = 3 s, enospc = o próprio bd recusa por falta de espaço,
-    # killed = o bd leva SIGKILL (OOM) no meio, sem JSON em stdout: só o contador de progresso em stderr
+    # killed = o bd leva SIGKILL (OOM) no meio, sem JSON em stdout: só o contador de progresso em stderr, killederr = idem mas COM um .error parcial,
+    # stubborn = enche o disco e IGNORA o TERM (só o KILL pára), envfail = recusa com a mensagem de $T/import-msg (rc 1, como diria de um dump ruim)
     case "\$(cat "$T/import-mode" 2>/dev/null)" in
       fill) echo \$\$ > "$T/bd-import.pid"; echo 100 > "$T/free-mb"; exec sleep 40 ;;
       breakdf) echo \$\$ > "$T/bd-import.pid"; : > "$T/df-broken"; exec sleep 40 ;;
@@ -105,6 +113,9 @@ case "\$cmd" in
       slow) sleep 3 ;;
       enospc) printf '{"error":"import failed: write /s/.beads/journal.idx: no space left on device","schema_version":1}\n'; echo "bd import: 250/9 issues committed" >&2; exit 1 ;;
       killed) echo "bd import: 250/9 issues committed" >&2; kill -9 \$\$ ;;
+      killederr) printf '{"error":"import failed: boom","schema_version":1}\n'; echo "bd import: 250/9 issues committed" >&2; kill -9 \$\$ ;;
+      stubborn) echo \$\$ > "$T/bd-import.pid"; echo 100 > "$T/free-mb"; trap '' TERM; while [ \$SECONDS -lt 60 ]; do sleep 1; done; exit 0 ;;
+      envfail) printf '{"error":"%s","schema_version":1}\n' "\$(cat "$T/import-msg")"; exit 1 ;;
     esac
     f=""; for a in "\$@"; do case "\$a" in --*) ;; *) f="\$a" ;; esac; done
     custom=",\$(sed 's/:[a-z]*//g' .beads/status.custom 2>/dev/null),"
@@ -123,6 +134,7 @@ case "\$cmd" in
     case "\$COMMENTS" in
       merge) jq -c 'if .comments then .comments |= unique_by([.author, .text, .created_at]) else . end' .beads/imported.jsonl ;;
       drop) jq -c 'del(.comments)' .beads/imported.jsonl ;;
+      garbage) echo 'isto não é json' ;;
       *) cat .beads/imported.jsonl ;;
     esac
     exit 0 ;;
@@ -178,7 +190,8 @@ run_df() { # dump  mb_livres_no_início  modo_do_import  [opções extras do res
 }
 gone() { # o pid do import de mentira morreu? (1 = sim, 0 = ainda vivo, ? = nunca nasceu)
   [ -s "$T/bd-import.pid" ] || { echo "?"; return; }
-  if kill -0 "$(cat "$T/bd-import.pid")" 2>/dev/null; then echo 0; else echo 1; fi
+  # zumbi (Z) = morto, só falta o pai/launchd colher: `kill -0` o dá por vivo e, com a máquina carregada, reprovava um import que o KILL do grupo matou
+  case "$(ps -o stat= -p "$(cat "$T/bd-import.pid")" 2>/dev/null | tr -d ' ')" in ""|Z*) echo 1 ;; *) echo 0 ;; esac
 }
 rc() { cat "$T/rc"; }
 leftover() { find "$T/tmp" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' '; }
@@ -445,6 +458,63 @@ check "rc 0" 0 "$(rc)"; has "RESULT: OK" "$(cat "$T/out")" "RESULT: OK"
 echo "-- 20b. --manifest junto com --dump: ignorado, e o log diz"
 ( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" "$RESTORE" --db gt --dump "$T/d20" --manifest "$T/nao-existe.json" --min-free-mb 1 --disk-floor-mb 0 > "$T/out" 2> "$T/err" ); echo $? > "$T/rc"
 check "rc 0" 0 "$(rc)"; has "AVISO de manifest ignorado" "$(cat "$T/err")" "AVISO: --manifest é ignorado com --dump"
+
+# Reprovação do gate ga-15eiut (17/10): opção com valor como ÚLTIMO argumento girava para sempre (`shift 2` sem deslocar); a vigia matava só o `timeout`
+echo "-- 21. opção com valor sem o valor (última, ou seguida de outra opção): rc 3 em segundos, nunca laço infinito"
+mk_bd 0; mk_dump "$T/d21" "open,closed" "" ""
+for opt in --db --artifact --manifest --dump --work --report-out --min-free-mb --import-timeout --prefix --disk-factor --disk-floor-mb; do
+  ( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" timeout 10 "$RESTORE" --db gt --keep "$opt" > "$T/out" 2> "$T/err" ); check "$opt como último argumento: rc 3" 3 "$?"
+done
+( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" timeout 10 "$RESTORE" --db gt --dump "$T/d21" --prefix --keep --min-free-mb 1 --disk-floor-mb 0 > "$T/out" 2> "$T/err" )
+check "--prefix --keep: o valor não é a próxima opção (rc 3, não prefixo '--keep')" 3 "$?"
+mkdir -p "$T/aws-bin"; printf '#!/bin/bash\necho "{\\"snapshot_key\\":\\"outro/x.tar.gz\\"}" > "${@: -1}"\n' > "$T/aws-bin/aws"; chmod +x "$T/aws-bin/aws"
+for pos in "--from-s3" "--from-s3 --min-free-mb 1 --disk-floor-mb 0"; do   # --from-s3 sem valor = latest, no fim ou no meio
+  ( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" JHO_AWS="$T/aws-bin/aws" timeout 10 "$RESTORE" --db gt $pos > "$T/out" 2> "$T/err" )
+  check "$pos sem valor: rc 2 (latest.json com chave estranha é dado ruim do bucket, não uso errado)" 2 "$?"
+done
+has "e o motivo cita a chave" "$(cat "$T/out")" "latest.json aponta para uma chave fora de jsonl-hourly/snap/*.tar.gz: outro/x.tar.gz"
+
+echo "-- 22. a vigia interrompe um bd que IGNORA o TERM: o KILL vai ao grupo inteiro, o import não fica órfão"
+mk_bd 0; mk_df; mk_dump "$T/d22" "open,closed" "" ""
+JHR_TERM_GRACE=2 run_df "$T/d22" 100000 stubborn --disk-floor-mb 2048
+check "rc 2 (sem veredito)" 2 "$(rc)"
+check "o bd import morreu de verdade (não só o timeout)" 1 "$(gone)"
+if [ "$ELAPSED" -lt 20 ]; then ok "e logo depois da tolerância, sem esperar os 60 s do bd (${ELAPSED}s)"; else no "demorou ${ELAPSED}s"; fi
+echo "-- 22b. TERM no restore com o bd ignorando o TERM: o import morre junto"
+mk_dump "$T/d22b" "open,closed" "" ""
+rm -f "$T/bd-import.pid"; echo stubborn > "$T/import-mode"
+TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" "$RESTORE" --db gt --dump "$T/d22b" --min-free-mb 1 --disk-floor-mb 0 > "$T/out" 2> "$T/err" &
+RP=$!
+for _ in $(seq 1 100); do [ -s "$T/bd-import.pid" ] && break; sleep 0.2; done
+kill -TERM "$RP" 2>/dev/null; wait "$RP"; echo $? > "$T/rc"
+check "rc 143" 143 "$(rc)"; check "o bd import morreu junto" 1 "$(gone)"
+echo normal > "$T/import-mode"
+
+echo "-- 23. bd import morto por sinal COM .error parcial (rc 137): sem veredito, o bd não julgou o dump"
+mk_bd 0; mk_dump "$T/d23" "open,closed" "" ""
+run_df "$T/d23" 100000 killederr --disk-floor-mb 0
+check "rc 2" 2 "$(rc)"; has "RESULT: UNKNOWN (rc=137)" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=bd import morreu sem dizer o motivo (rc=137)"
+
+echo "-- 24. o bd recusa por falta de memória/descritores/lock do ambiente: sem veredito, não 'o dump não reproduz'"
+mk_bd 0; mk_dump "$T/d24" "open,closed" "" ""
+for m in "fork/exec: Cannot allocate memory" "open /s/x: too many open files" "Error 1105: database is locked"; do
+  printf '%s' "$m" > "$T/import-msg"; run_df "$T/d24" 100000 envfail --disk-floor-mb 0
+  check "rc 2: $m" 2 "$(rc)"
+done
+has "RESULT: UNKNOWN com o motivo do bd" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=bd import sem recurso do ambiente: Error 1105: database is locked"
+
+echo "-- 25. export que não é JSON: o reconcile não chega às contas => rc 2, não 'RESULT: FAIL ... dup_comments=null'"
+mk_bd 0 garbage; mk_dump "$T/d25" "open,closed" "" ""
+echo normal > "$T/import-mode"; run "$T/d25"
+check "rc 2" 2 "$(rc)"; has "RESULT: UNKNOWN com o problema" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=reconcile não chegou às contas: entrada da prova ilegível"
+hasnt "sem erro de jq" "$(cat "$T/err")" "jq:"
+
+echo "-- 26. prefixo do store: hífen é preservado (o bd aceita), outro caractere vira _ sem um _ de sobra no fim"
+mk_bd 0; mk_dump "$T/d26" "open,closed" "" ""
+for pf in "lex-bh:lex-bh" "lex bh:lex_bh"; do
+  : > "$T/bd-init.log"; ( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" "$RESTORE" --db gt --dump "$T/d26" --prefix "${pf%%:*}" --min-free-mb 1 --disk-floor-mb 0 > "$T/out" 2> "$T/err" )
+  check "--prefix '${pf%%:*}' => init -p ${pf##*:}" "-p ${pf##*:} --non-interactive" "$(tail -1 "$T/bd-init.log")"
+done
 
 echo
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
