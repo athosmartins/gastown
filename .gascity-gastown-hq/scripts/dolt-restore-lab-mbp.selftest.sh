@@ -297,10 +297,10 @@ reset() {
   mkdir -p "$T/state" "$T/cap" "$T/tmp" "$T/mbp" "$T/city/.gc/run" "$T/city/.gc/logs" "$T/city/.gc/runtime/packs/dolt"
   printf 'listener:\n  port: 4242\n' > "$T/city/.gc/runtime/packs/dolt/dolt-config.yaml"
 }
-# envrun [args] — FAKE_*/LABMBP_* come from the caller's environment prefix. The mini HAS an AWS credential (the canary).
+# envrun [args] — FAKE_*/LABMBP_* come from the caller's environment prefix. MBP_SSH is the fake ssh unless the caller sets its own (the real-mbp-run section passes a probe stub). The mini HAS an AWS credential (the canary).
 envrun() {
   env LABMBP_CITY="$T/city" LABMBP_STATE="${STATE_OVERRIDE:-$T/state}" LABMBP_AWS="$T/bin/aws" LABMBP_DOLT="$T/bin/dolt" LABMBP_NOTIFY="$T/bin/notify" \
-      MBP_SSH="$T/bin/ssh" MBP_HOST=fake@mbp LABMBP_SSH_OPTS="-o Fake=1" LABMBP_POLL_S=0.2 LABMBP_RETRY_S=0.2 LABMBP_NOW_HOUR="${LABMBP_NOW_HOUR:-0}" LABMBP_STREAM_S="${LABMBP_STREAM_S:-120}" \
+      MBP_SSH="${MBP_SSH:-$T/bin/ssh}" MBP_HOST=fake@mbp LABMBP_SSH_OPTS="-o Fake=1" LABMBP_POLL_S=0.2 LABMBP_RETRY_S=0.2 LABMBP_NOW_HOUR="${LABMBP_NOW_HOUR:-0}" LABMBP_STREAM_S="${LABMBP_STREAM_S:-120}" \
       AWS_ACCESS_KEY_ID="$(sed -n 1p "$T/secret/canary.txt")" AWS_SECRET_ACCESS_KEY="$(sed -n 2p "$T/secret/canary.txt")" AWS_SESSION_TOKEN="$(sed -n 3p "$T/secret/canary.txt")" \
       TMPDIR="$T/tmp" FAKE_CAP="$T/cap" FAKE_ROOT="$T" "${LABMBP_TEST_BASH:-bash}" "$T/scripts/dolt-restore-lab-mbp.sh" "$@"
 }
