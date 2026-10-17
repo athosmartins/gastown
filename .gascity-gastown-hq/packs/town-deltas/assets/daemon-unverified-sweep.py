@@ -10,7 +10,8 @@ O QUE ESTE VIGIA FAZ. Para cada bead fechado com o rótulo decide EXATAMENTE UM 
   CONFIRMADO          o daemon dono do código mergeado subiu DEPOIS do merge (início do processo vivo > merge).
   AINDA NÃO VISTO     subiu ANTES do merge, ou o daemon não está carregado.
   NÃO CONSEGUI SABER  sem sha de merge, sem daemon identificável, sem processo pra ler o início, ou a leitura falhou.
-                      (daemon periódico: CONFIRMADO se um ciclo inteiro passou depois do merge, AINDA se ainda não passou.)
+                      (daemon periódico: com instância viva decide o início dela, como no KeepAlive; entre disparos,
+                      CONFIRMADO se um ciclo inteiro passou depois do merge, AINDA se ainda não passou.)
 
 Regra de ouro (E12: "vazio ≠ falhou"): NÃO CONSEGUI SABER é o estado de qualquer dúvida. Leitura que falhou
 (bd/launchctl/ps/git, timeout, saída ilegível) NUNCA vira CONFIRMADO — e também não vira "AINDA NÃO VISTO" nem
@@ -39,8 +40,10 @@ COMO ACHA O SHA E O DONO (fatia 2; o que não se acha é NÃO CONSEGUI SABER com
     `daemons/deploy_deps.json` inclui o arquivo (lib importada). O mapa é lido no commit do merge E no HEAD vivo
     (união): o daemon que importava o arquivo quando ele entrou e o que o importa hoje são ambos donos.
   - tipo do daemon: KeepAlive (início do processo vivo × merge) · periódico = StartInterval / StartCalendarInterval
-    (cada disparo é um processo novo; um ciclo inteiro depois do merge basta) · WatchPaths / QueueDirectories /
-    sem gatilho conhecido = NCS (nada prova que um evento rodou depois do merge).
+    (o launchd não sobrepõe execuções do mesmo job: COM instância viva vale o início dela × merge, igual ao KeepAlive —
+    uma instância anterior ao merge ainda é o único processo que rodou; SEM instância, entre disparos, um ciclo inteiro
+    depois do merge basta) · WatchPaths / QueueDirectories / sem gatilho conhecido = NCS (nada prova que um evento rodou
+    depois do merge).
   - dry-run: escreve `daemon-unverified-sweep-latest.json` e imprime as contagens. (.3: relatório legível, aviso, plist.)
 
 LIMITES CONHECIDOS (o relatório é uma triagem, não uma prova):
@@ -49,6 +52,10 @@ LIMITES CONHECIDOS (o relatório é uma triagem, não uma prova):
   - Periódico: "um ciclo inteiro passou" conta o relógio, não o tempo acordado; a máquina dormir no intervalo atrasa
     o disparo e o veredito CONFIRMADO pode sair cedo. Interesse de triagem, não de prova.
   - O mapa deploy_deps.json só existe no rig WhatsApp; nos outros, ausente = "sem mapa" (≠ ilegível = deps-read-failed).
+  - O mapa admite o que não sabe em `_asset_gaps` / `_coverage_gaps` (hoje 5 daemons com `render_template` de nome
+    dinâmico, ex.: auto_response_canary_daemon, classification_dashboard, inbound_reply_alerter) e o vigia NÃO lê essas
+    chaves: uma entrega só de template pode ter um daemon-lacuna ainda no código velho como dono INVISÍVEL, e o veredito
+    sai do(s) dono(s) estático(s) — pode dar CONFIRMADO com esse daemon-lacuna sem reiniciar.
   - Os marcadores só são procurados na loja HQ (onde o gate grava os de todos os rigs): marcador guardado só na
     loja do rig não é visto (no-merge-sha, NCS — nunca CONFIRMADO).
   - O sha do merge é só a PONTA da branch. Numa entrega em fast-forward com vários commits, os arquivos dos
@@ -425,7 +432,9 @@ def cal_period(entry):
         return DAY
     if "Minute" in entry:
         return 3600
-    return 60
+    # nenhuma chave de calendário conhecida: seria o MENOR período possível (60 s) e puxaria o veredito pra CONFIRMADO.
+    # O launchd tolera, mas entrada malformada é dúvida, não "dispara todo minuto".
+    raise ReadFailed("plist-read-failed", "StartCalendarInterval sem chave conhecida: %r" % (entry,))
 
 
 def period_seconds(plist):
@@ -454,8 +463,15 @@ def owner_state(pls, merged_at, now):
         return NCS, "duplicate-label"       # dois arquivos com o mesmo Label: o launchd carrega um só, e qual eu não sei
     if not plist.get("KeepAlive"):
         if "StartInterval" in plist or "StartCalendarInterval" in plist:
-            # periódico: cada disparo é um processo novo que lê o código do disco (o sha já está no checkout vivo). Passou um
-            # ciclo inteiro desde o merge → algum disparo rodou o código novo; senão, ainda pode não ter rodado.
+            # periódico, COM instância viva: o launchd nunca sobrepõe execuções do mesmo job, então enquanto a instância que
+            # começou ANTES do merge não termina, nenhum disparo novo leu o código do disco. O relógio não diz nada aqui —
+            # decide o início DESSE processo (mesma regra do KeepAlive). Falha do ps sobe como ps-read-failed (NCS, rc 3).
+            if pid is not None:
+                if process_start(pid) > merged_at:
+                    return CONFIRMADO, "started-after-merge"
+                return AINDA, "started-before-merge"
+            # periódico, ENTRE disparos (sem PID): cada disparo é um processo novo que lê o código do disco (o sha já está no
+            # checkout vivo). Passou um ciclo inteiro desde o merge → algum disparo rodou o código novo; senão, ainda pode não.
             if now - merged_at >= period_seconds(plist):
                 return CONFIRMADO, "period-elapsed"
             return AINDA, "period-not-elapsed"
@@ -521,6 +537,8 @@ def main(argv):
     out_dir = env("DUS_OUT_DIR", os.path.join(CITY, ".gc", "logs"))
     os.makedirs(out_dir, exist_ok=True)
     stores = load_stores()
+    if not stores:                            # DUS_STORES vazio/em branco: nada foi varrido, e "nada varrido" ≠ "tudo limpo"
+        sys.stderr.write("daemon-unverified-sweep: ERRO — DUS_STORES não lista nenhuma loja; nada foi varrido\n")
     now = int(env("DUS_NOW", "0")) or int(time.time())
     try:
         plists, pinfo = load_plists()
@@ -528,7 +546,7 @@ def main(argv):
         plists, pinfo = None, {"unreadable": [], "no_label": [], "via_plutil": [], "error": e.detail}
         sys.stderr.write("daemon-unverified-sweep: ERRO — não consegui ler os plists (%s)\n" % e.detail)
     unreadable = pinfo["unreadable"]
-    markers = Markers(stores[0]["store"])         # HQ é a primeira loja: os marcadores de TODOS os rigs moram lá
+    markers = Markers(stores[0]["store"] if stores else "")   # HQ é a primeira loja: os marcadores de TODOS os rigs moram lá
     beads, store_status = [], {}
     for s in stores:
         try:
@@ -565,7 +583,8 @@ def main(argv):
                   f, ensure_ascii=False, indent=1)
     os.replace(report_path + ".tmp", report_path)          # quem lê (a .3) nunca vê um JSON pela metade
     reasons = {b["reason"] for b in beads} | {v[1] for b in beads for v in b["owner_states"].values()}
-    broken = plists is None or any(not v["ok"] for v in store_status.values()) or bool(reasons & READ_FAILED)   # falha de dono conta mesmo sob AINDA
+    broken = (plists is None or not stores or any(not v["ok"] for v in store_status.values())
+              or bool(reasons & READ_FAILED))   # falha de dono conta mesmo sob AINDA
     mk = markers.status()
     mk_line = "" if not mk["read"] else (" · marcadores: n=%d em %.1fs" % (mk["n"], mk["seconds"]) if mk["ok"]
                                          else " · marcadores: FALHOU (%s)" % mk["error"])

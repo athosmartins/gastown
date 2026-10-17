@@ -650,11 +650,52 @@ class SweepTest(unittest.TestCase):
         w = self.w
         self.periodic_world(StartInterval=H)
         for keys in ({"StartInterval": 0}, {"StartInterval": -5}, {"StartInterval": True}, {"StartInterval": "3600"},
-                     {"StartCalendarInterval": []}, {"StartCalendarInterval": ["x"]}):
+                     {"StartCalendarInterval": []}, {"StartCalendarInterval": ["x"]},
+                     # entrada sem NENHUMA chave de calendário conhecida seria o menor período (60 s) = CONFIRMADO fácil
+                     {"StartCalendarInterval": {}}, {"StartCalendarInterval": {"Bogus": 1}},
+                     {"StartCalendarInterval": [{"Hour": 3}, {"Bogus": 1}]}):
             w.plist("com.test.job", "bin/job.sh", **keys)
             r = w.run()
             self.verdict("ga-ppp777", NCS, "plist-read-failed")
             self.assertEqual(r.returncode, 3, (keys, r.stderr))
+
+    def test_periodico_com_instancia_viva_decide_o_inicio_do_processo_nao_o_relogio(self):
+        w = self.w
+        self.periodic_world(StartInterval=H)                               # o período (1h) já passou há muito: o relógio diria CONFIRMADO
+        pid = w.next_pid()
+        w.loaded("com.test.job", pid=pid, start=T0 + 4 * D)                # instância que começou 1 dia ANTES do merge, ainda viva
+        r = w.run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.verdict("ga-ppp777", AINDA, "started-before-merge")           # o launchd não sobrepõe: nenhum disparo novo leu o código
+        self.assertEqual(w.state_of("ga-ppp777")["owner_states"]["com.test.job"], [AINDA, "started-before-merge"])
+        w.plist("com.test.job", "bin/job.sh", StartCalendarInterval={"Hour": 3})   # idem por calendário
+        w.run()
+        self.verdict("ga-ppp777", AINDA, "started-before-merge")
+        w.proc_start(pid, T0 + 7 * D)                                      # a mesma cena com a instância começando DEPOIS do merge
+        w.run()
+        self.verdict("ga-ppp777", CONFIRMADO, "started-after-merge")
+        w.plist("com.test.job", "bin/job.sh", StartInterval=30 * D)        # período longo (não passou): instância pós-merge basta
+        w.run()
+        self.verdict("ga-ppp777", CONFIRMADO, "started-after-merge")
+
+    def test_periodico_com_instancia_viva_e_ps_que_falha_nao_vira_confirmado(self):
+        w = self.w
+        self.periodic_world(StartInterval=H)
+        w.loaded("com.test.job", pid=w.next_pid())                         # tem PID, mas o ps não responde
+        r = w.run()
+        self.verdict("ga-ppp777", NCS, "ps-read-failed")                   # nem period-elapsed nem AINDA
+        self.assertEqual(r.returncode, 3, r.stderr)
+
+    def test_dus_stores_vazio_nao_morre_e_nao_diz_tudo_limpo(self):
+        w = self.w
+        self.periodic_world(StartInterval=H)
+        for blank in ("", "  ", ";"):
+            r = w.run(extra_env={"DUS_STORES": blank})
+            self.assertEqual(r.returncode, 3, (blank, r.stderr))           # nada varrido ≠ varrido e limpo
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("nenhuma loja", r.stderr)
+            rep = w.report()
+            self.assertEqual((rep["stores"], rep["beads"]), ({}, []))
 
     def test_daemon_por_evento_ou_de_tipo_desconhecido_nao_da_pra_saber(self):
         w = self.w
