@@ -108,6 +108,23 @@ EOF
   rm -f "$W/ran"; echo 0 > "$W/dfn"
   PATH="$W/bin:$PATH" DISK_HEADROOM_PATH=/ HEAVY_GUARD_POLL_SECS=1 FAKE_DF_RECOVER_AT=999 run --wait-secs 2 -- sh -c 'touch "$1"' _ "$W/ran" 2>/dev/null; rc=$?
   check "a disk that never recovers is refused after the wait" 75 "$rc"; [ ! -e "$W/ran" ] || bad "wait: ran although the disk never recovered"
+  # a zero-padded wait ("08" is invalid OCTAL to $(( ))) and an unreadable clock must both END on a low disk, not spin:
+  # a fake clock (+4 s per read) and a no-op sleep make the wait instant; `bounded` kills a guard that does not end
+  bounded() { # bounded <secs> <cmd...>: the command's rc, or 124 when it was still running after <secs> (it is killed)
+    local p i=0 n=$(( $1 * 10 )); shift; "$@" & p=$!
+    while kill -0 "$p" 2>/dev/null && [ "$i" -lt "$n" ]; do sleep 0.1; i=$((i+1)); done
+    if kill -0 "$p" 2>/dev/null; then kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; return 124; fi
+    wait "$p"
+  }
+  mkdir -p "$W/bin2"; echo 1000000 > "$W/clk"
+  printf '#!/bin/sh\n[ -n "$FAKE_CLOCK_BAD" ] && exit 1\n[ "$1" = "+%%s" ] || exec /bin/date "$@"\nn=$(cat "%s"); echo $((n+4)) > "%s"; echo $n\n' "$W/clk" "$W/clk" > "$W/bin2/date"
+  printf '#!/bin/sh\nexit 0\n' > "$W/bin2/sleep"; chmod +x "$W/bin2/date" "$W/bin2/sleep"
+  bounded 5 env PATH="$W/bin2:$PATH" HEAVY_GUARD_LIB="$lib" DISK_FREE_OVERRIDE_MB=100 "$g" --wait-secs 08 --check 2>/dev/null; rc=$?
+  check "a zero-padded --wait-secs (08) on a low disk ends with 75" 75 "$rc"
+  bounded 5 env PATH="$W/bin2:$PATH" FAKE_CLOCK_BAD=1 HEAVY_GUARD_LIB="$lib" DISK_FREE_OVERRIDE_MB=100 "$g" --wait-secs 5 --check 2>/dev/null; rc=$?
+  check "an unreadable clock on a low disk stops waiting: 75" 75 "$rc"
+  bounded 5 env HEAVY_GUARD_LIB="$lib" DISK_FREE_OVERRIDE_MB=100 "$g" --wait-secs 1234567890 --check 2>/dev/null; rc=$?
+  check "a wait of more than 9 digits is a usage error, not a 39-year wait" 64 "$rc"
 }
 
 mk_mutant() { # mk_mutant <src> <dst> <sed-expr>  — fails the selftest if the expression changed nothing
@@ -130,6 +147,8 @@ mk_mutant "$REAL_GUARD" "$M/g-run.sh" 's/exit 75/exec "$@"/' && { before=$FAIL; 
 mk_mutant "$REAL_GUARD" "$M/g-local.sh" 's/exit 75/exit 97/' && { before=$FAIL; guard_cases "$M/g-local.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: refusal uses the run-local rc 97"; }
 mk_mutant "$REAL_GUARD" "$M/g-open.sh" 's/^    exit 76$/    exec "$@"/' && { before=$FAIL; guard_cases "$M/g-open.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: unknown disk runs the command (fail open)"; }
 mk_mutant "$REAL_GUARD" "$M/g-nowait.sh" 's/\[ "\$now" -ge "\$deadline" \]/true/' && { before=$FAIL; guard_cases "$M/g-nowait.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: never waits"; }
+mk_mutant "$REAL_GUARD" "$M/g-octal.sh" 's/^wait_s=\$(( 10#\$wait_s ))$/:/' && { before=$FAIL; guard_cases "$M/g-octal.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: --wait-secs 08 read as octal"; }
+mk_mutant "$REAL_GUARD" "$M/g-noclock.sh" '/^  case "\$now" in/d' && { before=$FAIL; guard_cases "$M/g-noclock.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: an unreadable clock keeps the wait loop going"; }
 
 echo "heavy-guard selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

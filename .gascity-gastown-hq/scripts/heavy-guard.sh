@@ -81,16 +81,25 @@ done
 [ -n "$min" ] || min="$DISK_HEAVY_MIN_MB"
 case "$min" in ''|*[!0-9]*) echo "heavy-guard: --min-free-mb must be a whole number of MB (got '$min')" >&2; exit 64 ;; esac
 case "$wait_s" in ''|*[!0-9]*) echo "heavy-guard: --wait-secs must be a whole number of seconds (got '$wait_s')" >&2; exit 64 ;; esac
+[ "${#wait_s}" -le 9 ] || { echo "heavy-guard: --wait-secs takes at most 9 digits (got '$wait_s')" >&2; exit 64; }
+# base 10 on purpose: "08" and "09" pass the digits check above but are invalid OCTAL to $(( )), which used to leave the
+# deadline empty and the low-disk loop below spinning for ever
+wait_s=$(( 10#$wait_s ))
 if [ "$mode" = run ] && [ $# -eq 0 ]; then
   echo "heavy-guard: no command given (usage: heavy-guard.sh [opts] -- <command> [args...], or --check)" >&2
   exit 64
 fi
 
-deadline=$(( $(date +%s) + wait_s ))
+# vazio/falhou/ilegível → no clock, so no deadline can be made: do not wait at all (one reading, then the verdict)
+t0=$(date +%s 2>/dev/null)
+case "$t0" in ''|*[!0-9]*) t0=0; wait_s=0 ;; esac
+deadline=$(( t0 + wait_s ))
 while :; do
   state="$(disk_headroom_state "$min")"
   [ "$state" = ok ] && break
-  now=$(date +%s)
+  now=$(date +%s 2>/dev/null)
+  # vazio/falhou/ilegível → the wait cannot be bounded: stop waiting, the verdict is taken on the reading just made
+  case "$now" in ''|*[!0-9]*) break ;; esac
   # unknown is not worth waiting on: a reading that cannot be taken now will not fix itself in 15 s
   if [ "$state" != low ] || [ "$now" -ge "$deadline" ]; then break; fi
   step=$(( deadline - now )); [ "$step" -gt "$HG_POLL" ] && step="$HG_POLL"
