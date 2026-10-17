@@ -291,6 +291,62 @@ r=$(classify_parent_gap2 1 0 1 0 1 1 1); [ "$r" = "free:refused-stranded" ] && o
 r=$(classify_parent_gap2 1 0 1 0 0 0 1); [ "$r" = "skip:active-sling" ] && ok "no-changes but sling still OPEN (not closed) → skip:active-sling (nothing to reconcile yet)" || bad "no-changes-but-open got '$r'"
 r=$(classify_parent_gap2 1 1 1 0 1 0 1); [ "$r" = "skip:live-assignee" ] && ok "live assignee still short-circuits even with a no-changes sling" || bad "live-assignee-with-no-changes got '$r'"
 
+# ── gap2_janitor_token <sling_close_reason> — ga-hudkhe ───────────────────────
+# THE BUG (live, ga-c79qtf / parent ga-zri39b.3): sling-task-janitor.py closes an
+# orphan dispatch stub because its parent is not in active build — nobody built
+# or reviewed anything — and GAP-2 read "closed, no gate:needs-fix" as a gate
+# PASS, ending in gate:needs-remerge on a parent a reviewer had rejected. The
+# discriminator is the close_reason prefix the janitor always writes. Fixtures:
+# the VERBATIM ga-c79qtf close_reason, the two suffixed variants the script
+# emits (ga-0jcit, ga-mf0gb), and negatives that must NOT match — a real PASS
+# close_reason, a worker prose that merely MENTIONS the janitor (ga-zuhlzr
+# anchoring lesson), and an empty reason.
+echo "gap2_janitor_token: sling-task-janitor close_reason prefix (ga-hudkhe)"
+JANITOR_REAL="Orphan sling-task cleanup (sling-task-janitor): ctx:thin dispatch stub for 'ga-zri39b' whose parent is NOT in active build and which has no live assignee. Stale orphan polluting Triagem — closed. The parent's own state drives any future dispatch; this stub is not needed."
+r=$(gap2_janitor_token "$JANITOR_REAL"); [ "$r" = "Orphan sling-task cleanup (sling-task-janitor" ] && ok "real ga-c79qtf close_reason (verbatim) → janitor token" || bad "ga-c79qtf close_reason got '$r'"
+r=$(gap2_janitor_token "Orphan sling-task cleanup (sling-task-janitor, ga-0jcit): stub for 'ga-x' whose parent refused"); [ "$r" = "Orphan sling-task cleanup (sling-task-janitor" ] && ok "ga-0jcit variant (', ga-xxxxx' inside the parens) → janitor token" || bad "ga-0jcit variant got '$r'"
+r=$(gap2_janitor_token "Orphan sling-task cleanup (sling-task-janitor, ga-mf0gb): stub for 'ga-x' whose parent is closed"); [ "$r" = "Orphan sling-task cleanup (sling-task-janitor" ] && ok "ga-mf0gb variant → janitor token" || bad "ga-mf0gb variant got '$r'"
+r=$(gap2_janitor_token $'\n   \n  '"$JANITOR_REAL"); [ "$r" = "Orphan sling-task cleanup (sling-task-janitor" ] && ok "leading blank lines + indentation before the prefix → still the first non-blank line, matched; token has no leading whitespace" || bad "leading-blank got '$r'"
+r=$(gap2_janitor_token "Quality gate PASSED — branch fix/ga-nnp5b-nightly-reboot-retry-window merged to gascity/main (sha=a0b8335a2da382de12975adfa18052d5e14c3c00, gate_run=ga-jwo5r). Closed by autonomous dispatcher (ga-esbg)."); [ "$r" = "" ] && ok "real PASS close_reason (verbatim, ga-nnp5b) → empty, a genuine pass is never read as a janitor close" || bad "REGRESSION: false-positive on a real pass got '$r'"
+r=$(gap2_janitor_token "Closed as duplicate of ga-x1; not the Orphan sling-task cleanup (sling-task-janitor): that stub is a different bead"); [ "$r" = "" ] && ok "prose that MENTIONS the janitor mid-line → empty (anchored at the start, ga-zuhlzr lesson)" || bad "REGRESSION: mention read as a janitor close, got '$r'"
+r=$(gap2_janitor_token $'Closed as duplicate of ga-x1.\n'"$JANITOR_REAL"); [ "$r" = "" ] && ok "janitor prefix only on a LATER line → empty (only the first non-blank line counts)" || bad "REGRESSION: later-line prefix read as a janitor close, got '$r'"
+r=$(gap2_janitor_token "no-changes: nada pra construir"); [ "$r" = "" ] && ok "no-changes close_reason → empty (a different signal, gap2_no_changes_token owns it)" || bad "no-changes got '$r'"
+r=$(gap2_janitor_token ""); [ "$r" = "" ] && ok "empty close_reason → empty, no crash" || bad "empty input got '$r'"
+
+# ── classify_parent_gap2 sling_janitor_closed (ga-hudkhe) ─────────────────────
+# `skip:janitor-stranded` sits AFTER sling_refused and BEFORE sling_no_changes.
+# The "OLD-CODE SHAPE" line is the bug itself: with the 8th arg absent the same
+# inputs still route to free:pass-stranded — which on a bug/task parent without
+# an active marker or merge ends in gap2_arm_needs_remerge.
+echo "classify_parent_gap2: a janitor-closed sling must not be read as gate-passed"
+r=$(classify_parent_gap2 1 0 1 0 1 0 0 1); [ "$r" = "skip:janitor-stranded" ] && ok "ga-hudkhe FIX: sling closed by the janitor → skip:janitor-stranded, NOT free:pass-stranded" || bad "janitor-fix got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 1 0 0);   [ "$r" = "free:pass-stranded" ] && ok "OLD-CODE SHAPE: same inputs, 8th arg omitted → free:pass-stranded (the path that stamped needs-remerge; old callers stay backward-compatible)" || bad "old-code-shape got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 1 0 0 0); [ "$r" = "free:pass-stranded" ] && ok "explicitly NOT janitor-closed (8th arg 0) → free:pass-stranded unchanged (genuine passes still reconcile)" || bad "explicit-not-janitor got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 1 1 0 1); [ "$r" = "free:refused-stranded" ] && ok "explicit pool:refused beats the janitor signal (more specific; checked first)" || bad "refused-beats-janitor got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 1 0 1 1); [ "$r" = "skip:janitor-stranded" ] && ok "janitor beats no-changes when both present (who closed the sling outranks what its text contains)" || bad "janitor-beats-no-changes got '$r'"
+r=$(classify_parent_gap2 1 0 1 1 1 0 0 1); [ "$r" = "free:fail-stranded" ] && ok "a genuine gate-FAIL on the sling beats the janitor signal — never swallow a real rejection" || bad "fail-beats-janitor got '$r'"
+r=$(classify_parent_gap2 1 0 1 0 0 0 0 1); [ "$r" = "skip:active-sling" ] && ok "janitor text but sling still OPEN → skip:active-sling (nothing terminal to reconcile)" || bad "janitor-but-open got '$r'"
+r=$(classify_parent_gap2 1 1 1 0 1 0 0 1); [ "$r" = "skip:live-assignee" ] && ok "live assignee still short-circuits even with a janitor-closed sling" || bad "live-assignee-with-janitor got '$r'"
+r=$(classify_parent_gap2 0 0 1 0 1 0 0 1); [ "$r" = "skip:not-dispatched" ] && ok "not pilot:dispatched still short-circuits even with a janitor-closed sling" || bad "not-dispatched-with-janitor got '$r'"
+r=$(classify_parent_gap2 1 0 0 0 1 0 0 1); [ "$r" = "skip:no-sling" ] && ok "no sling found still short-circuits" || bad "no-sling-with-janitor got '$r'"
+# End to end on the real fixture: token → flag → verdict.
+JT=$(gap2_janitor_token "$JANITOR_REAL"); JF=0; [ -n "$JT" ] && JF=1
+r=$(classify_parent_gap2 1 0 1 0 1 0 0 "$JF"); [ "$r" = "skip:janitor-stranded" ] && ok "real ga-c79qtf close_reason → token → verdict skip:janitor-stranded (never free:pass-stranded → needs-remerge)" || bad "end-to-end real case got '$r'"
+
+# ── gap2_labels_have_code_fail <labels> — ga-hudkhe ───────────────────────────
+# gap2_arm_needs_remerge's "no reviewer ever rejected this code" is only true
+# when no code-class gate-sha-failed stamp exists. Mirrors the dispatcher's
+# class rules: code / legacy-unclassed / unknown class block; hold does not.
+echo "gap2_labels_have_code_fail: does a reviewer rejection stamp exist? (ga-hudkhe)"
+r=$(gap2_labels_have_code_fail "area:infra gate-sha-failed:140b6292a40b442341947e799b35df8537e3b8d9:code gate:needs-fix"); [ "$r" = "yes" ] && ok "code-class stamp (real ga-zri39b.3 shape) → yes" || bad "code-class got '$r'"
+r=$(gap2_labels_have_code_fail "gate-sha-failed:140b6292a40b442341947e799b35df8537e3b8d9"); [ "$r" = "yes" ] && ok "legacy unclassed stamp → yes (class unrecoverable, defaults to the blocking side)" || bad "legacy got '$r'"
+r=$(gap2_labels_have_code_fail "gate-sha-failed:140b6292a40b442341947e799b35df8537e3b8d9:zzz"); [ "$r" = "yes" ] && ok "unknown class → yes (unknown defaults to blocking, like the dispatcher)" || bad "unknown-class got '$r'"
+r=$(gap2_labels_have_code_fail "gate-sha-failed:aaa:hold gate-sha-failed:bbb:code"); [ "$r" = "yes" ] && ok "hold stamp AND a code stamp → yes (the code stamp counts)" || bad "hold+code got '$r'"
+r=$(gap2_labels_have_code_fail "gate-sha-failed:aaa:hold story:in-flight"); [ "$r" = "no" ] && ok "hold-only stamp → no (verdict was PASS, only an admin refusal; the code was never rejected)" || bad "hold-only got '$r'"
+r=$(gap2_labels_have_code_fail "story:in-flight pilot:dispatched gate:needs-fix"); [ "$r" = "no" ] && ok "no stamp (gate:needs-fix alone is not proof) → no" || bad "no-stamp got '$r'"
+r=$(gap2_labels_have_code_fail ""); [ "$r" = "no" ] && ok "empty label set → no, no crash" || bad "empty got '$r'"
+r=$(gap2_labels_have_code_fail "xgate-sha-failed:aaa:code"); [ "$r" = "no" ] && ok "label that merely CONTAINS the prefix mid-string → no (anchored)" || bad "mid-string got '$r'"
+
 # ── classify_gap2_bugtask_verdict <merge_verified> <has_untracked_marker> — ga-6ync4: sling-passed ≠ parent-fix-merged ─
 echo "classify_gap2_bugtask_verdict: a passed+closed sling must NOT alone close the parent"
 r=$(classify_gap2_bugtask_verdict 1); [ "$r" = "close:merge-verified" ] && ok "merged (branch/content evidence found) → close:merge-verified" || bad "merged got '$r'"

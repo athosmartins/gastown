@@ -27,6 +27,9 @@
 #      pre-existing path).
 #   7. Drift guard: source still returns None (not `continue`) on non-zero
 #      returncode, and the docstring's fail-safe contract line is intact.
+#  10. (ga-3psuuo) The sling back-reference `bd show` runs against HQ: foreign-
+#      prefix ids (wa-/ps-/…) must never reach it (each one made Dolt full-scan
+#      `LOWER(title) LIKE` over the whole hq); routes-read failure → no filtering.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -273,6 +276,75 @@ try:
             len(_missing), len(_captured_cmds), _missing))
 finally:
     m.subprocess.run = orig
+
+# ── Scenario 10 (ga-3psuuo): the sling back-reference `bd show` runs against HQ,
+# and bd resolves an id locally BEFORE routing by prefix — a foreign-prefix id
+# (wa-/ps-/…) makes Dolt full-scan `LOWER(title) LIKE` over the whole hq (~0.4 s
+# each, per cycle). Only HQ-prefix ids can be a sling bead, so only those may
+# reach that `bd show`. The prefix comes from routes.jsonl; when that read FAILS
+# (missing / corrupt) the guard must land on the inert state: no filtering (every
+# id still looked up — costlier, never less protective). ──
+print("Scenario 10 (ga-3psuuo): foreign-prefix ids never reach HQ's `bd show`; routes-read failure → no filtering")
+import os, tempfile
+_tmp10 = tempfile.mkdtemp(prefix="irg-s10-")
+_orig_routes = getattr(m, "_HQ_ROUTES_PATH", None)  # absent on pre-ga-3psuuo code → assertions fail, no crash
+
+def _run_s10(routes_path, markers, titles):
+    """Run list_gate_active_source_beads() with a stubbed bd; return (result, [bd show id lists])."""
+    shown = []
+    def fake(cmd, capture_output=True, text=True, timeout=20):
+        if cmd[:2] == ["bd", "show"]:
+            ids = [a for a in cmd[2:] if a != "--json"]
+            shown.append(ids)
+            return FakeResult(0, json.dumps([{"id": i, "title": titles.get(i, "")} for i in ids]))
+        gate_lbl = [a for a in cmd if a.startswith("gate-status:")]
+        beads = markers if gate_lbl == ["gate-status:queued"] else []
+        return FakeResult(0, json.dumps(
+            [{"labels": ["type:quality-gate-marker", "source-bead:%s" % b]} for b in beads]))
+    m._HQ_ROUTES_PATH = routes_path
+    prev = m.subprocess.run
+    m.subprocess.run = fake
+    try:
+        return m.list_gate_active_source_beads(), shown
+    finally:
+        m.subprocess.run = prev
+        m._HQ_ROUTES_PATH = _orig_routes
+
+try:
+    _good = os.path.join(_tmp10, "routes.jsonl")
+    with open(_good, "w") as fh:
+        fh.write('{"prefix":"ga","path":"."}\n{"prefix":"wa","path":"../whatsapp_automation"}\n')
+    _bad = os.path.join(_tmp10, "routes-corrupt.jsonl")
+    with open(_bad, "w") as fh:
+        fh.write("{this is not json\n")
+    _missing = "/nonexistent-ga-3psuuo/routes.jsonl"  # a path that does not exist → open() raises OSError
+    _mk = ["wa-foreign1", "ga-djjeq"]
+    _ti = {"ga-djjeq": "fix bug wa-orig9: some title"}
+    _full = frozenset({"wa-foreign1", "ga-djjeq", "wa-orig9"})
+
+    res, shown = _run_s10(_good, _mk, _ti)
+    if shown == [["ga-djjeq"]] and res == _full:
+        ok("routes readable → `bd show` gets only the HQ id; foreign id kept in the gate-active set")
+    else:
+        bad("REGRESSION (ga-3psuuo): foreign id reached HQ's `bd show` or result wrong — "
+            "bd show ids=%r result=%r" % (shown, res))
+
+    res, shown = _run_s10(_good, ["wa-foreign1"], {})
+    if shown == [] and res == frozenset({"wa-foreign1"}):
+        ok("only foreign ids → no `bd show` at all")
+    else:
+        bad("only-foreign case still called `bd show`: ids=%r result=%r" % (shown, res))
+
+    for label, path in (("routes file missing", _missing), ("routes file corrupt", _bad)):
+        res, shown = _run_s10(path, _mk, _ti)
+        if shown == [["ga-djjeq", "wa-foreign1"]] and res == _full:
+            ok("%s → inert: no filtering (every id looked up), original still resolved" % label)
+        else:
+            bad("%s did not land on the inert state: bd show ids=%r result=%r" % (label, shown, res))
+finally:
+    m._HQ_ROUTES_PATH = _orig_routes
+    import shutil
+    shutil.rmtree(_tmp10, ignore_errors=True)
 
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))

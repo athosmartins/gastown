@@ -82,6 +82,7 @@
 - .git
 - .repo.git
 - .worktrees
+- .gc-worktrees
 - .viewer-deploy-clone
 - .playwright-mcp
 - .claude

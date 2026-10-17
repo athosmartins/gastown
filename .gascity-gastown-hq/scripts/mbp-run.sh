@@ -19,8 +19,9 @@
 #   mbp-run.sh --check               # imprime a saúde do MBP (preflight, com a presença do Athos e as tarefas em curso) e sai
 #   mbp-run.sh --remote-pause on|off # grava/remove ~/gt-remote/PAUSE no MBP (a chave "pausar até eu liberar"; quem chama é o mbp-offload.sh)
 #   mbp-run.sh --install-tools       # copia mbp-presence.sh e mbp-controle.sh (como `gascity-mbp`) para ~/gt-remote/bin/ no MBP
-#   mbp-run.sh --host linux|mbp ...  # fixa UM host (sem a cadeia): vale para --check, e é como o shadow roda o lado do MBP
+#   mbp-run.sh --host linux|mbp ...  # fixa UM host (sem a cadeia): vale para --check e --seed, e é como o shadow roda o lado do MBP
 #        --host linux --check          saúde do nó Linux (preflight + bandeira + janela da sombra)
+#        --host linux --seed wa        (re)semeia a base do nó pelo filtro de segurança + node_guard (conteúdo), audita o destino (nome, conteúdo, JWT) e reinstala as dependências se o freeze mudou
 #
 # CÓDIGOS DE SAÍDA — qualquer 96..99 significa "rode local": quem chama NUNCA trata isso como falha de teste.
 #   0..95  código do pytest/comando remoto (propagado)
@@ -781,6 +782,104 @@ shadow_finish() { # rc_do_nó arquivo_da_saída_do_nó "$@" (args originais). Es
   rm -f "$SHADOW_OUT"; SHADOW_OUT=""; SHADOW_PID=""
 }
 
+# ---- sementes do nó Linux: base filtrada + dependências (freeze do venv do mini, sem os pacotes do macOS) ----------------------------
+# node_audit: depois de semear, procura NO DESTINO (independentemente do filtro) o que não podia ter chegado: NOME de segredo/dado (a mesma lista do prod test da fatia 1, com token), arquivo > 4 MB (o scanner
+# não o lê), JWT em .json/.txt fora de tests/ (um só já é segredo) e CONTEÚDO (hetzner-pii-scan.py, o mesmo do node_guard, rodando no servidor: lista de telefones/CPFs). Achou = alarme (rc 98) e a semeadura não vale.
+# Cada leitura tem TRÊS estados e só "li tudo e não achou" é limpo: o scanner que não abre aqui, o python que falta no nó, o find que reclama, o ssh que cai = "não consegui auditar" (rc 98), nunca "nada achado".
+# Se a auditoria caiu DEPOIS de já ter achado algo, vale o que achou: é ALARME (com o aviso de que não terminou), não "não consegui auditar". Vale para os quatro achados: NOME/GRANDE/JWT saem na hora; o CONTEUDO (o scanner só devolve ao fim)
+# é impresso pelo script remoto ANTES dos AUDIT_ERR, só com contagem >= 0 (linha -1/-1 = arquivo não lido = "não sei", nunca achado).
+# Medido em 16/10 na árvore real do WA (o que o filtro mandaria): zero arquivo > 4 MB, zero JWT; a regra "qualquer telefone num .json" (a conferência manual do Mayor) acharia 2 arquivos rastreados com 1 número cada
+# (um changelog e um template), então o critério de conteúdo é o do scanner (lista), não "qualquer número".
+# hash_valid: o shasum que falhou deixa o hash VAZIO, e um .freeze-hash/.sp-hash que o ssh não leu também vem vazio — "" = "" não pode virar "já batem". Só sha1 hex de 40 caracteres é hash;
+# qualquer outra coisa é "não consegui calcular" (quem chama devolve 97), nunca "bate" e nunca algo para gravar no remoto.
+hash_valid() { case "$1" in ""|*[!0-9a-f]*) return 1 ;; esac; [ "${#1}" -eq 40 ]; }
+node_audit() { # $1 = dir remoto relativo ao home
+  local out b64 partial
+  b64=$(base64 < "$HERE/hetzner-pii-scan.py" 2>/dev/null | tr -d '\n')
+  [ -n "$b64" ] || { say "não consegui ler hetzner-pii-scan.py para auditar o CONTEÚDO no $HNAME — a semeadura não vale"; return 98; }
+  out=$(rssh_s "$1" "$b64" 2>/dev/null <<'EOF'
+# MBP:AUDIT
+cd "$HOME/$1" 2>/dev/null || { echo AUDIT_ERR; exit 3; }
+E=$(mktemp) || { echo AUDIT_ERR; exit 3; }
+trap 'rm -f "$E" "$E.p"' EXIT
+find . \( -name '.env' -o -name '.env.*' -o -name '*.pem' -o -name '*.key' -o -name '*.p12' -o -name '*.pfx' -o -name 'id_rsa*' -o -name 'id_ed25519*' -o -name '*.kdbx' \
+  -o -name 'credentials*.json' -o -name 'client_secret*.json' -o -name 'cookies*.json' -o -name '*.session' -o -name '*.duckdb*' -o -name '*.db' -o -name '*.db-*' \
+  -o -name '*.sqlite*' -o -name '*.parquet' -o -name '*.wal' -o -name '*.gz' -o -name '*.pkl' -o -name '*.xlsx' -o -name '*.csv' -o -path './shared' -o -path './shared/*' \
+  -o -path './data/*' -o -path './logs/*' \
+  -o -iname '.*token*' -o -iname '*token' -o -iname '*token*.json' -o -iname '*token*.txt' -o -iname '*token*.yaml' -o -iname '*token*.yml' -o -iname '*token*.ini' \
+  -o -name '.netrc' -o -name '.npmrc' -o -name '.pgpass' -o -iname 'secrets*.json' -o -iname 'secret*.y*ml' -o -iname 'service_account*.json' -o -name '*.keystore' -o -name '*.pickle' \) \
+  -print 2>"$E" | sed 's#^\./##' | grep -v -E '^\.env\.example$' | head -20 | sed 's/^/AUDIT_BAD NOME /'
+find . -type f -size +4096k -print 2>>"$E" | sed 's#^\./##' | head -20 | sed 's/^/AUDIT_BAD GRANDE /'
+find . -type f \( -name '*.json' -o -name '*.txt' \) ! -path './tests/*' ! -name '*.example.json' -size -4097k \
+  -exec grep -lE 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' {} + 2>>"$E" | sed 's#^\./##' | head -20 | sed 's/^/AUDIT_BAD JWT /'
+find . -type f -size -4097k -print 2>>"$E" | sed 's#^\./##' \
+  | python3 -I -c 'import base64,sys; c=base64.b64decode(sys.argv[1]).decode(); sys.argv=["x"]+sys.argv[2:]; exec(c)' "$2" . > "$E.p" 2>>"$E"
+rc=$?
+# o que o scanner JÁ achou sai ANTES de qualquer AUDIT_ERR: um arquivo ilegível (o scanner devolve rc 3) ou qualquer stderr do find/grep não pode jogar fora a lista de telefones que ele achou (achado + "não terminei" é ALARME, não "não consegui auditar").
+# Só linha com contagem >= 0 é achado; "-1<TAB>-1<TAB>caminho" é arquivo NÃO lido = não sei, e virar AUDIT_BAD seria o colapso oposto (o rc 3 abaixo já o trata como "não terminei").
+# vazio → "$E.p" sem linha de contagem = nada achado ainda (o AUDIT_DONE abaixo só sai se tudo foi lido); falhou/ilegível → grep sem saída aqui, e o AUDIT_ERR logo abaixo diz que não terminou
+grep -E '^[0-9]+[[:space:]]' "$E.p" 2>/dev/null | head -20 | sed 's/^/AUDIT_BAD CONTEUDO /'
+[ "$rc" -eq 0 ] || { echo AUDIT_ERR; exit 3; }
+[ -s "$E" ] && { echo AUDIT_ERR; exit 3; }
+echo AUDIT_DONE
+EOF
+  ) || true
+  # achar vale mais que não terminar: AUDIT_BAD já impresso é vazamento ACHADO mesmo que a auditoria tenha caído depois (AUDIT_ERR, ssh) — "achei E não consegui terminar" é ALARME (prio 5), não "não consegui auditar" (prio 4).
+  # Só SEM AUDIT_BAD é que AUDIT_DONE decide: presente = li tudo e não achei (limpo), ausente = não consegui olhar (98).
+  if printf '%s\n' "$out" | grep -q '^AUDIT_BAD '; then
+    partial=""; case "$out" in *AUDIT_DONE*) ;; *) partial=" A auditoria também NÃO terminou: pode haver mais do que o abaixo." ;; esac
+    # o ALARME não desliga o nó sozinho: a bandeira segue ligada e as baterias seguem clonando (cp -a) os espelhos desta base — por isso a mensagem manda desligar
+    say "ALARME: dado ou segredo no destino ($HNAME:$1) — o filtro e o node_guard deixaram passar (NOME · GRANDE · JWT · CONTEUDO = telefones<TAB>CPFs<TAB>caminho, só contagens).$partial Desligue o nó AGORA: mbp-offload.sh node off (senão as baterias continuam clonando espelhos desta base):"
+    printf '%s\n' "$out" | grep '^AUDIT_BAD ' | sed 's/^AUDIT_BAD /  /' >&2
+    return 98
+  fi
+  case "$out" in *AUDIT_DONE*) ;; *) say "não consegui auditar $1 no $HNAME — a semeadura não vale"; return 98 ;; esac
+  return 0
+}
+seed_node() {
+  local root base rv lv pyver uvbin freeze hash rhash dry="${HETZNER_SEED_DRYRUN:-0}"
+  [ "$seed_repo" = wa ] || { say "o nó Linux só tem o wa (--seed wa)"; return 97; }
+  filter_sane || { say "o filtro do rsync do nó ($NODE_FILTER) não abre ou não tem a ordem de segurança — não semeio"; return 97; }
+  preflight || return $?
+  root=${HETZNER_SEED_ROOT:-$(local_root_of wa)}; base=$(base_of wa); rv=$(venv_of wa); lv=${HETZNER_SEED_VENV:-$(local_venv_of wa)}   # HETZNER_SEED_*: só o selftest troca
+  [ -d "$root" ] || { say "árvore local $root ausente"; return 97; }
+  # a semeadura leva à base o MESMO que o pytest leva ao espelho: o filtro olha NOME e pasta, o node_guard olha o CONTEÚDO (lista de telefones/CPFs fica no mini). Sem ele a base ganharia o que o
+  # espelho nunca recebe, e `cp -a` a clonaria para cada espelho. Falha fechada: não varreu = não semeia (rc 98), nunca "nada retido".
+  dir="$root"
+  node_guard || { say "não consegui varrer o conteúdo do que iria ao $HNAME (lista do rsync ou hetzner-pii-scan.py falhou) — não semeio"; return 98; }
+  say "semeando $HNAME:~/gt-remote/$base a partir de $root (filtro $NODE_FILTER, --delete-excluded)"
+  "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "mkdir -p gt-remote/$base gt-remote/mirror gt-remote/slots" || return 98
+  "$RSYNC_BIN" -a --delete --delete-excluded --filter=". $HELD" --filter=". $NODE_FILTER" -e "$SSH_BIN $SSH_OPTS" "$root"/ "$MBP_HOST:gt-remote/$base/" || return 98
+  node_audit "gt-remote/$base" || return 98
+  # dependências: o freeze do venv do mini, sem o que só existe no macOS (pyobjc, py2app, appnope...) e sem instalação local (-e / @ file:). Linux aarch64 não tem essas rodas.
+  # Cada leitura tem três estados: ferramenta ausente / freeze vazio → "não consegui ler" (rc 97, nunca "sem dependências").
+  uvbin=$(command -v uv 2>/dev/null || { [ -x "$HOME/.local/bin/uv" ] && echo "$HOME/.local/bin/uv"; })
+  [ -x "$lv/bin/python" ] || { say "python local do venv ausente: $lv/bin/python"; return 97; }
+  pyver=$("$lv/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
+  if [ -n "$uvbin" ]; then freeze=$("$uvbin" pip freeze --python "$lv/bin/python" 2>/dev/null); else freeze=$("$lv/bin/python" -m pip freeze 2>/dev/null); fi
+  freeze=$(printf '%s\n' "$freeze" | grep -v -E -i "${HETZNER_FREEZE_SKIP:-^(pyobjc|py2app|appnope|rumps|macholib|altgraph|modulegraph|-e |#)|@ file:|^[[:space:]]*$}" | LC_ALL=C sort)
+  [ -n "$freeze" ] && [ -n "$pyver" ] || { say "não consegui ler as dependências do venv local ($lv)"; return 97; }
+  # vazio → o freeze já foi checado acima (vazio = 97); falhou/ilegível (shasum) → hash vazio = 97, nunca igual a um .freeze-hash que faltou
+  hash=$(printf '%s\n' "$freeze" | shasum | awk '{print $1}')
+  hash_valid "$hash" || { say "não consegui calcular o hash do freeze (shasum falhou) — não sei se as dependências do $HNAME batem"; return 97; }
+  # vazio → o nó não tem .freeze-hash (1ª semeadura): não bate, instala; falhou/ilegível → o ssh caiu: também vem vazio, não bate, e o próximo ssh falha em 98. $hash é hex não vazio, então vazio nunca "bate"
+  rhash=$("$SSH_BIN" $SSH_OPTS "$MBP_HOST" "cat gt-remote/$rv/.freeze-hash 2>/dev/null")
+  if [ "$hash" = "$rhash" ]; then say "dependências do $HNAME já batem (hash ${hash:0:12})"; return 0; fi
+  printf '%s\n' "$freeze" | "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "cat > gt-remote/freeze-wa.txt" || return 98
+  if [ "$dry" = 1 ]; then
+    # a base JÁ foi semeada (rsync + auditoria) e o freeze JÁ foi enviado; o dry-run só pula a instalação e a gravação do hash
+    say "DRY-RUN: a base foi semeada e o freeze enviado ao $HNAME; abaixo o que o uv instalaria (nada é instalado e o hash não é gravado)"
+    # o `| tail -40` devolvia o status do tail: um uv que falhou (erro de resolução é para isso que o dry-run serve) saía 0. O status do uv é guardado antes e vira o do comando remoto (sem pipefail: o shell remoto pode ser sh)
+    "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "export PATH=\$HOME/.local/bin:\$PATH; o=\$(uv pip install --dry-run --python gt-remote/$rv/bin/python -r gt-remote/freeze-wa.txt 2>&1); r=\$?; printf '%s\n' \"\$o\" | tail -40; exit \$r" \
+      || { say "uv pip install --dry-run falhou no $HNAME (erro do uv, por exemplo o resolvedor não fechar com este freeze, ou o ssh caiu; veja a saída acima) — a próxima semeadura de verdade pode falhar igual"; return 98; }
+    return 0
+  fi
+  "$SSH_BIN" $SSH_OPTS "$MBP_HOST" "export PATH=\$HOME/.local/bin:\$PATH; set -e; test -x gt-remote/$rv/bin/python || uv venv --python $pyver gt-remote/$rv; uv pip install --python gt-remote/$rv/bin/python -r gt-remote/freeze-wa.txt; echo $hash > gt-remote/$rv/.freeze-hash" \
+    || { say "uv pip install falhou no $HNAME — o hash NÃO foi gravado (a próxima semeadura tenta de novo)"; return 98; }
+  say "dependências do $HNAME atualizadas (hash $hash)"
+  return 0
+}
+
 # ---- seed / check -----------------------------------------------------------------------------------------------
 # --host linux fixa o nó nos modos que olham UM host (--check, --seed); sem --host, esses modos continuam sendo do MBP como sempre foram.
 case "$host_sel:$mode" in linux:remote_pause|linux:install_tools) say "--host linux não vale para --$(echo "$mode" | tr _ -): a pausa e as ferramentas são do MBP"; exit 97 ;; esac
@@ -833,7 +932,7 @@ fi
 refresh_tools() { install_tools >/dev/null 2>&1 || say "AVISO: não atualizei ~/gt-remote/bin no MBP (gascity-mbp); rode: mbp-offload.sh install-mbp"; }
 if [ "$mode" = seed ]; then
   case "$seed_repo" in wa|ps) ;; *) say "uso: --seed wa|ps"; exit 97 ;; esac
-  if [ "$HOSTKIND" = linux ]; then say "a semeadura do nó Linux ainda não existe (fatia 4 da ga-zri39b)"; exit 97; fi
+  if [ "$HOSTKIND" = linux ]; then seed_node; exit $?; fi
   [ -e "$PAUSEFILE" ] && { say "pausado pelo Athos ($PAUSEFILE) — não semeio"; exit 99; }
   preflight || exit $?
   # com o Athos no MBP (ou sem saber), o receptor do rsync roda em prioridade de fundo: a semeadura é I/O no notebook dele
@@ -845,7 +944,10 @@ if [ "$mode" = seed ]; then
   sp=$(ls -d "$lv"/lib/python3.*/site-packages 2>/dev/null | head -1)
   [ -n "$sp" ] || { say "site-packages local não achado em $lv"; exit 97; }
   pyver=$(echo "$sp" | sed -n 's#.*/lib/\(python3\.[0-9]*\)/site-packages#\1#p')
+  # vazio → lista sem .dist-info dá o sha1 da lista vazia (um hash válido, que só bate com outra lista vazia); falhou/ilegível (shasum) → hash vazio = 97, nunca igual a um .sp-hash que faltou
   hash=$(ls "$sp" | grep -E '\.dist-info$' | LC_ALL=C sort | shasum | awk '{print $1}')
+  hash_valid "$hash" || { say "não consegui calcular o hash dos pacotes locais (shasum falhou) — não sei se o site-packages do MBP bate"; exit 97; }
+  # vazio → o MBP não tem .sp-hash (1ª semeadura): não bate; falhou/ilegível → ssh caiu, vem vazio, não bate, e o ssh seguinte (o do venv) falha em 98
   rhash=$("$SSH_BIN" $SSH_OPTS "$MBP_HOST" "cat gt-remote/$rv/.sp-hash 2>/dev/null")
   if [ "$hash" = "$rhash" ]; then say "site-packages do MBP já bate (hash ${hash:0:12})"
     refresh_tools
@@ -912,8 +1014,8 @@ mkdir -p "\$HOME/gt-remote/mirror" && $cpcmd "\$B" "\$M" && echo MIRROR_SEEDED
 EOF
   ); mrc=$?
   case "$m" in
-    *NOBASE*) say "base ~/gt-remote/$base ausente no $HNAME — $([ "$HOSTKIND" = linux ] && echo 'o Mayor monta a base do nó à mão (a semeadura é a fatia 4 da ga-zri39b)' || echo "rode: mbp-run.sh --seed $repo")"; fall sem-base 97; return 97 ;;
-    *NOVENV*) say "venv ~/gt-remote/$rv ausente no $HNAME — $([ "$HOSTKIND" = linux ] && echo 'o Mayor monta o venv do nó à mão (a semeadura é a fatia 4 da ga-zri39b)' || echo "rode: mbp-run.sh --seed $repo")"; fall sem-venv 97; return 97 ;;
+    *NOBASE*) say "base ~/gt-remote/$base ausente no $HNAME — $([ "$HOSTKIND" = linux ] && echo 'rode: mbp-run.sh --host linux --seed wa (ou espere o order hetzner-node-reseed, 05:55)' || echo "rode: mbp-run.sh --seed $repo")"; fall sem-base 97; return 97 ;;
+    *NOVENV*) say "venv ~/gt-remote/$rv ausente no $HNAME — $([ "$HOSTKIND" = linux ] && echo 'rode: mbp-run.sh --host linux --seed wa (ou espere o order hetzner-node-reseed, 05:55)' || echo "rode: mbp-run.sh --seed $repo")"; fall sem-venv 97; return 97 ;;
     *MIRROR_*) ;;
     *) [ $mrc -eq 255 ] && { say "ssh caiu ao preparar o espelho"; fall ssh-caiu 98; return 98; }; say "espelho falhou: $m"; fall espelho-falhou 98; return 98 ;;
   esac

@@ -1214,7 +1214,7 @@ _gap1_ensure_lifecycle_backstop() {
   fi
 }
 
-# classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused] [sling_no_changes]
+# classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused] [sling_no_changes] [sling_janitor_closed]
 # Pure decision for ga-pa36 GAP-2: parent story/bug retains story:in-flight after
 # the gate ran on a sling/work bead (Pilot-dispatched path) and that bead is terminal.
 # sling_needs_fix: 1 if sling bead has gate:needs-fix or gate:needs-human (gate FAILED).
@@ -1253,15 +1253,37 @@ _gap1_ensure_lifecycle_backstop() {
 #   a "free" — per the bug's own acceptance criterion, "na duvida, NAO FECHAR":
 #   the safest default when a done-signal cannot be trusted is to touch
 #   nothing at all, not to guess which labels to clear.
-# Returns: free:fail-stranded | free:refused-stranded | free:pass-stranded | skip:not-dispatched | skip:live-assignee | skip:no-sling | skip:active-sling | skip:no-changes-stranded
+# sling_janitor_closed (ga-hudkhe, optional, defaults to 0 — old 7-arg callers
+#   unchanged): 1 if the sling's close_reason says sling-task-janitor.py closed
+#   it as an orphan stub (see gap2_janitor_token). That is a FOURTH way a sling
+#   reaches "closed, no gate:needs-fix" — alongside a gate PASS, a refusal and
+#   a no-changes close — and the only one in which no builder and no reviewer
+#   ever touched the sling: the janitor closes the stub because the PARENT is
+#   not in active build, not because anyone judged any code. The OLD bug read
+#   it as a pass: it fell through to free:pass-stranded, which on a bug/task
+#   parent with no active marker and no merge ends in gap2_arm_needs_remerge —
+#   stamping gate:needs-remerge ("no reviewer ever rejected this code", false
+#   when a reviewer did) and resubmitting a SHA the gate had already failed
+#   (measured live: ga-c79qtf, parent ga-zri39b.3). The parent's own labels —
+#   a real gate:needs-fix from a FAIL included — are the truth about its state,
+#   and the stub says nothing about them. Checked only once sling_refused is
+#   ruled out (an explicit refusal is the more specific signal) and BEFORE
+#   sling_no_changes (none of the janitor's three reasons contains a no-delivery
+#   phrase today; the order is so that WHO closed the sling still outranks a
+#   keyword scan of its prose if a variant ever quotes one).
+#   Verdict is skip, never free: it writes no gate:* label (above all never
+#   gate:needs-remerge) and removes none; gap2_skip_janitor_stranded only
+#   releases the parent's orphaned story:in-flight/pilot:dispatched.
+# Returns: free:fail-stranded | free:refused-stranded | free:pass-stranded | skip:not-dispatched | skip:live-assignee | skip:no-sling | skip:active-sling | skip:janitor-stranded | skip:no-changes-stranded
 classify_parent_gap2() {
-  local has_pilot_dispatched="$1" has_live_assignee="$2" sling_found="$3" sling_needs_fix="$4" sling_closed="$5" sling_refused="${6:-0}" sling_no_changes="${7:-0}"
+  local has_pilot_dispatched="$1" has_live_assignee="$2" sling_found="$3" sling_needs_fix="$4" sling_closed="$5" sling_refused="${6:-0}" sling_no_changes="${7:-0}" sling_janitor_closed="${8:-0}"
   [ "$has_pilot_dispatched" != "1" ] && { echo "skip:not-dispatched"; return; }
   [ "$has_live_assignee" = "1" ]     && { echo "skip:live-assignee"; return; }
   [ "$sling_found" != "1" ]          && { echo "skip:no-sling"; return; }
   [ "$sling_needs_fix" = "1" ]       && { echo "free:fail-stranded"; return; }
   [ "$sling_closed" != "1" ]         && { echo "skip:active-sling"; return; }
   [ "$sling_refused" = "1" ]         && { echo "free:refused-stranded"; return; }
+  [ "$sling_janitor_closed" = "1" ]  && { echo "skip:janitor-stranded"; return; }
   [ "$sling_no_changes" = "1" ]      && { echo "skip:no-changes-stranded"; return; }
   echo "free:pass-stranded"
 }
@@ -1722,6 +1744,37 @@ gap2_no_changes_token() {
   printf '%s' "$sling_close_reason" | grep -ioE 'no-changes|no[- ]action|nada pra construir|sem acao|sem ação|sem açao|sem acão' | head -1
 }
 
+# gap2_janitor_token <sling_close_reason> — pure text scan (ga-hudkhe). Echoes
+# "Orphan sling-task cleanup (sling-task-janitor" when sling-task-janitor.py is
+# what closed the sling, "" otherwise. Every close_reason that script writes
+# opens with that prefix, with or without a ", ga-xxxxx" suffix inside the
+# parentheses (scripts/sling-task-janitor.py: the generic one, ga-0jcit,
+# ga-mf0gb) — the prefix up to "sling-task-janitor" is the whole contract, so a
+# new variant that keeps it is read without touching this function.
+# Why it matters: the janitor closes a dispatch stub because its PARENT is not
+# in active build, not because any code was built or reviewed — "closed, no
+# gate:needs-fix" is therefore NOT a pass here (see classify_parent_gap2's
+# sling_janitor_closed). The OLD GAP-2 read it as one and, on a parent with a
+# real FAIL on record, stamped gate:needs-remerge (ga-c79qtf / ga-zri39b.3).
+# ANCHORED like gap2_refused_token's close_reason tier (ga-zuhlzr), not a
+# substring scan: a close_reason is prose, and a worker explaining a different
+# close may MENTION the janitor ("closed instead of the Orphan sling-task
+# cleanup (sling-task-janitor ...)") without the janitor having closed
+# anything. Only the FIRST non-blank line, with leading whitespace aside, may
+# open with the prefix. Pure ASCII, so no locale dependence (see
+# gap2_no_changes_token, ga-hr44j).
+# vazio → "" (no close_reason, or one that is not the janitor's: GAP-2 carries
+# on to the old arms, unchanged); falhou/ilegível → "" too, never a guessed
+# token — a guessed one would skip a real pass-close and leave the parent
+# stranded behind a genuinely finished sling, while "" only ever restores the
+# pre-ga-hudkhe behavior.
+gap2_janitor_token() {
+  local sling_close_reason="$1" first tok=""
+  first=$(printf '%s\n' "$sling_close_reason" | sed -n '/[^[:space:]]/{p;q;}')
+  tok=$(printf '%s\n' "$first" | grep -oE '^[[:space:]]*Orphan sling-task cleanup \(sling-task-janitor' | head -1 || echo "")
+  printf '%s' "${tok#"${tok%%[![:space:]]*}"}"
+}
+
 # gap2_free_refused_stranded <bead_id> <sling_id> <refused_token> — ga-eu75w:
 # the refused-parallel to gap2_arm_needs_remerge() below. A sling that closed
 # via an explicit worker refusal never reached a real gate review, so the OLD
@@ -1760,6 +1813,53 @@ gap2_free_refused_stranded() {
   bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-eu75w): sling bead $sling_id closed via an explicit worker refusal ($refused_token), not a gate review — no branch or gate-run ever existed for this attempt, so gate:needs-fix/needs-remerge/queued/failed would have asserted a review outcome that never happened (the exact false state gate-orphaned-label-watchdog.sh kept flagging forever). Those labels are now removed; story:in-flight + pilot:dispatched cleared; $refused_token stamped on this bead so pilot-dispatcher.sh's _filter_candidates (ga-y8qh) excludes it from re-dispatch instead of walking a fresh builder into the same refusal. gate:needs-human* labels, if any, are left untouched." 2>/dev/null || true
 }
 
+# gap2_labels_have_code_fail <space_joined_labels> — pure (no IO, set -e safe),
+# ga-hudkhe. Prints "yes" iff the label set carries a gate-sha-failed stamp that
+# records a real reviewer rejection: the "code" class (gate-sha-failed:<sha>:code),
+# the pre-ga-4cy2t LEGACY unclassed stamp (gate-sha-failed:<sha>), or any class
+# this function does not know — an unknown class defaults to the blocking side,
+# the same doctrine as quality-gate-dispatcher.sh's gate_labels_have_sha_fail.
+# A "hold"-class stamp (gate-sha-failed:<sha>:hold) does NOT count: there the
+# verdict was PASS and only an administrative refusal downgraded it, so the code
+# itself was never rejected and "no reviewer ever rejected this code" is still true.
+# Not tied to one SHA on purpose — the question is "did a reviewer ever reject
+# code on this bead", and a stamp for an older SHA still answers yes.
+# vazio → "no" (no labels, or none of them a gate-sha-failed stamp);
+# falhou/ilegível → there is no read here to fail: the labels arrive as an argument
+# and gap2_arm_needs_remerge, the only caller, has already refused to continue on
+# an unreadable parent.
+gap2_labels_have_code_fail() {
+  local hits
+  hits=$(printf '%s\n' "$1" | tr ' ' '\n' | grep '^gate-sha-failed:' | grep -v ':hold$' || true)
+  if [ -n "$hits" ]; then printf 'yes'; else printf 'no'; fi
+}
+
+# gap2_release_orphan_labels <bead_id> — rc0 iff the release landed.
+# Strips story:in-flight + pilot:dispatched and nothing else: the two markers a
+# dead dispatch leaves behind, which every Pilot dispatch query excludes on, so
+# a parent that keeps them is invisible to Pilot while no builder exists.
+# ONE bd call carries both labels (comma-separated), never two calls. Step 0c.2
+# re-selects a parent only while it holds BOTH labels (`bd list -l story:in-flight`
+# then a pilot:dispatched filter), so with two calls a failure on just one of them
+# would drop the parent out of the sweep with the other label still on it — and
+# every Pilot dispatch query excludes on either one. That half state gets no
+# comment and no retry, while the callers' warn text says "will retry next sweep"
+# (gate-fix 1, ga-hudkhe). `bd label remove <id> a,b` runs the whole label list of
+# one call inside ONE transaction (vendored beads v1.1.0: processBatchLabelOperation
+# in cmd/bd/label.go, labelMutateProxied in cmd/bd/label_proxied_server.go — one
+# transactHonoringAutoCommit / uow.RunTx per invocation), so an error rolls the call
+# back as a whole: rc1 here means NEITHER label was removed, the parent keeps both,
+# is selected again next sweep, and the retry promise is true. Checked live
+# (2026-10-17, throwaway labels on a bead of ours): `a,b` removes both in one call,
+# and a label that is already absent is a no-op with rc0 — so rc1 is a real bd
+# failure, never "already gone". The selftest section 6m asserts the post-STATE
+# (parent still selected, labels intact) with a bd that applies a call all-or-nothing.
+# The caller decides what a failure means; the one thing it must not do is comment
+# that the labels were cleared.
+gap2_release_orphan_labels() {
+  bd -C "$GC_CITY" label remove "$1" "story:in-flight,pilot:dispatched" -q 2>/dev/null
+}
+
 # gap2_arm_needs_remerge <bead_id> <sling_id> — ga-4tgga: the genuine
 # "abandoned, needs resubmit" outcome (classify_gap2_bugtask_verdict's
 # default `*)` case, after the race-guard recheck finds no active marker).
@@ -1780,12 +1880,39 @@ gap2_free_refused_stranded() {
 # the code delivers is worse than no comment, because it tells the next
 # reader to stop looking here (Mayor, 2026-08-06). Strip both BEFORE
 # re-arming, mirroring the close:* arms exactly.
+# ga-hudkhe: the "no reviewer ever rejected this code" premise below is a CLAIM
+# about the parent, and until now nothing checked it — the arm stamped
+# gate:needs-remerge (and said so in the comment) on a parent whose gate-sha-failed
+# stamp proves a reviewer DID reject it (ga-c79qtf / ga-zri39b.3), telling Pilot
+# to resubmit an already-failed SHA. The parent's labels are read FIRST and a
+# code-class FAIL stamp turns the arm into a release-only one: no needs-remerge,
+# no claim of an unrejected commit. rc1 = the labels could not be read (nothing
+# written, see the read's own comment) or, on the FAIL-stamp path, a label remove
+# errored (no comment posted); the caller logs it and the next sweep retries.
 gap2_arm_needs_remerge() {
-  local bead_id="$1" sling_id="$2"
-  bd -C "$GC_CITY" label remove "$bead_id" "story:in-flight"  -q 2>/dev/null || true
-  bd -C "$GC_CITY" label remove "$bead_id" "pilot:dispatched" -q 2>/dev/null || true
+  local bead_id="$1" sling_id="$2" out labels
+  # vazio → the bead has no labels at all: "ok:" with nothing after it, no FAIL
+  # stamp, the arm carries on as it always did. falhou/ilegível → `bd show`
+  # errors, prints nothing, or prints something jq cannot read as a bead: rc1
+  # BEFORE any write — an unreadable parent is not evidence of an unrejected
+  # commit, and stamping needs-remerge on it would be exactly that claim. The
+  # parent stays story:in-flight + pilot:dispatched (inert), so the next sweep
+  # selects it again and retries. The "ok:" sentinel is what tells an empty
+  # label set apart from no output at all.
+  out=$(bd -C "$GC_CITY" show "$bead_id" --json 2>/dev/null \
+    | jq -r '(if type=="array" then .[0] else . end) | select(type=="object") | "ok:" + ((.labels // []) | join(" "))' 2>/dev/null) || return 1
+  case "$out" in ok:*) labels=${out#ok:} ;; *) return 1 ;; esac
+  if [ "$(gap2_labels_have_code_fail "$labels")" = "yes" ]; then
+    # rc1 here = a label remove errored: the comment below would claim a release
+    # that did not happen, so it is not posted and the next sweep retries.
+    gap2_release_orphan_labels "$bead_id" || return 1
+    bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-hudkhe): sling bead $sling_id gate-passed+closed, but no independent evidence the parent's own fix ($bead_id) is merged into origin/main was found — AND this bead carries a gate-sha-failed stamp, so a reviewer DID reject code on it. gate:needs-remerge (the \"nothing is broken, resubmit\" signal) is therefore NOT set: resubmitting would put an already-rejected SHA back through the review that failed it. story:in-flight + pilot:dispatched cleared; every other label left exactly as it was (any gate:needs-fix from that FAIL stays, so the next dispatch sees a rejection rather than a resubmit signal)." 2>/dev/null || true
+    return 0
+  fi
+  gap2_release_orphan_labels "$bead_id" || true
   # ga-e2n96: this arm is a PURE re-merge signal — no reviewer ever rejected
-  # $bead_id's code, the sling already gate-passed. Reusing bare
+  # $bead_id's code (the gap2_labels_have_code_fail check above is what makes
+  # that true here, ga-hudkhe), the sling already gate-passed. Reusing bare
   # gate:needs-fix for this made it indistinguishable from a real reviewer
   # rejection to the Pilot dispatcher (and every other consumer of the
   # label), which then dispatched a builder with a completely empty brief.
@@ -1863,6 +1990,36 @@ gap2_skip_no_changes() {
   if bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-hr44j): sling bead $sling_id closed with a no-delivery close_reason (matched \"$no_changes_token\") — a sling closing this way means the worker found nothing to build, which is the opposite of a completed review, not a variant of one. Leaving story:in-flight/pilot:dispatched/all labels untouched rather than closing or re-arming (na duvida, nao fechar); will re-check next sweep in case a later sling terminates differently. (comment deduped per sling — ga-crgfa0)" 2>/dev/null; then
     bd -C "$GC_CITY" update "$bead_id" --set-metadata "gap2.no_changes_announced=$state" -q 2>/dev/null || true
   fi
+}
+
+# gap2_skip_janitor_stranded <bead_id> <sling_id> <janitor_token> — ga-hudkhe:
+# the skip:janitor-stranded arm. The sling was closed by sling-task-janitor, an
+# orphan-stub cleanup that judged nothing about any code (see gap2_janitor_token),
+# so this arm neither re-arms the parent (no gate:needs-remerge) nor reads the
+# close as a pass. The parent's own labels are the truth about its state: a
+# gate:needs-fix from a real FAIL stays, and so do all other gate:* labels — only
+# the story:in-flight + pilot:dispatched the dead dispatch left behind are
+# released, through gap2_release_orphan_labels (the helper gap2_arm_needs_remerge
+# releases with too), so the parent is not invisible to Pilot behind a stub that
+# no longer exists.
+# No dedup stamp, unlike gap2_skip_no_changes just above: that arm touches no
+# label, so it re-enters every sweep and needs one; this one changes state —
+# dropping pilot:dispatched takes the parent out of this sweep's candidate set
+# (GAP2_IDS selects on it), so the comment cannot repeat. If a label remove
+# fails the function returns 1 WITHOUT commenting (the comment says the markers
+# were cleared; it must not promise more than the code did) and the parent is
+# retried next sweep — which holds because the release is one all-or-nothing bd
+# call (see gap2_release_orphan_labels): a failed call leaves BOTH labels on, so
+# the parent is still selected. pilot.dispatched_at / pilot.sling_bead
+# metadata is left in place on purpose (Pilot's own NEVERSTARTED release clears
+# it; this arm is scoped to the two labels): pilot-dispatcher.sh reads leftover
+# pilot.* metadata as Pilot's OWN dispatch fingerprint and does not let it block
+# a re-dispatch.
+# No log() call here — see gap2_wait_active_marker's doc-comment above.
+gap2_skip_janitor_stranded() {
+  local bead_id="$1" sling_id="$2" janitor_token="$3"
+  gap2_release_orphan_labels "$bead_id" || return 1
+  bd -C "$GC_CITY" comment "$bead_id" "ga-pa36 GAP-2 reconciler (ga-hudkhe): skip:janitor-stranded — sling bead $sling_id was closed by sling-task-janitor (close_reason opens with \"$janitor_token\"), an orphan-stub cleanup: nobody built or reviewed anything on it, so its closing says nothing about this parent's code and is NOT read as gate-passed. gate:needs-remerge not set, no merge check run, no gate:* label touched (a gate:needs-fix from a real FAIL stays — the parent's own labels are the truth). Cleared only the orphaned story:in-flight + pilot:dispatched so the parent is not left invisible to Pilot behind a stub that no longer exists." 2>/dev/null || true
 }
 
 # _gate_passed_on_bead <gc_city> <bead_id> — rc0 iff the bead's labels, READ NOW, carry gate:passed.
@@ -6658,6 +6815,8 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
     SLING_REFUSED_TOKEN=""
     SLING_NO_CHANGES=0
     SLING_NO_CHANGES_TOKEN=""
+    SLING_JANITOR_CLOSED=0
+    SLING_JANITOR_TOKEN=""
 
     if [ -n "$SLING_ID" ] && [ "$SLING_ID" != "null" ]; then
       SLING_FOUND=1
@@ -6688,9 +6847,18 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
         SLING_NO_CHANGES_TOKEN=$(gap2_no_changes_token "$SLING_CLOSE_REASON" || echo "")
         [ -n "$SLING_NO_CHANGES_TOKEN" ] && SLING_NO_CHANGES=1 || true
       fi
+
+      # ga-hudkhe: a sling closed by sling-task-janitor was never built or
+      # reviewed — see gap2_janitor_token's doc-comment. Read from the same
+      # SLING_CLOSE_REASON as the two tokens above; "" (nothing read, or not the
+      # janitor's text) leaves SLING_JANITOR_CLOSED=0 and the old arms unchanged.
+      # Not gated on SLING_REFUSED: classify_parent_gap2 already ranks an
+      # explicit refusal above it.
+      SLING_JANITOR_TOKEN=$(gap2_janitor_token "$SLING_CLOSE_REASON" || echo "")
+      [ -n "$SLING_JANITOR_TOKEN" ] && SLING_JANITOR_CLOSED=1 || true
     fi
 
-    ACTION=$(classify_parent_gap2 "1" "$HAS_SC_ASSIGNEE" "$SLING_FOUND" "$SLING_NEEDS_FIX" "$SLING_CLOSED" "$SLING_REFUSED" "$SLING_NO_CHANGES")
+    ACTION=$(classify_parent_gap2 "1" "$HAS_SC_ASSIGNEE" "$SLING_FOUND" "$SLING_NEEDS_FIX" "$SLING_CLOSED" "$SLING_REFUSED" "$SLING_NO_CHANGES" "$SLING_JANITOR_CLOSED")
 
     case "$ACTION" in
       free:fail-stranded)
@@ -6730,6 +6898,18 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
         # changed since the last sweep — see gap2_skip_no_changes doc-comment.
         GAP2_PREV_NO_CHANGES_STATE=$(echo "$SC_SHOW" | jq -r '.metadata["gap2.no_changes_announced"] // ""' 2>/dev/null || echo "")
         gap2_skip_no_changes "$SC_ID" "$SLING_ID" "$SLING_NO_CHANGES_TOKEN" "$GAP2_PREV_NO_CHANGES_STATE"
+        ;;
+      skip:janitor-stranded)
+        # ga-hudkhe: sling closed by sling-task-janitor (orphan stub), not by a
+        # gate PASS — the old fall-through to free:pass-stranded ended in
+        # gap2_arm_needs_remerge and stamped gate:needs-remerge on a parent that a
+        # reviewer had rejected (ga-c79qtf / ga-zri39b.3). No gate:* label is
+        # written or removed here; only the orphaned story:in-flight +
+        # pilot:dispatched are released (gap2_skip_janitor_stranded). A failed
+        # release posts nothing and the parent, still selected, is retried.
+        warn "GAP-2: $SC_ID sling $SLING_ID was closed by sling-task-janitor (\"$SLING_JANITOR_TOKEN\") — NOT a gate pass; no gate:needs-remerge, gate:* labels untouched, releasing only story:in-flight/pilot:dispatched"
+        gap2_skip_janitor_stranded "$SC_ID" "$SLING_ID" "$SLING_JANITOR_TOKEN" \
+          || warn "GAP-2: $SC_ID janitor-stranded release failed (a bd label remove errored) — nothing commented; will retry next sweep"
         ;;
       free:pass-stranded)
         warn "GAP-2: $SC_ID stranded (sling $SLING_ID closed/passed) — freeing lane"
@@ -6922,12 +7102,16 @@ Propagated from $SLING_ID: $GATE_FEEDBACK" 2>/dev/null || true
               log "GAP-2: $SC_ID — active marker ($GAP2_RECHECK_HIT) appeared during merge-search — waiting instead of re-arming (race guard)"
               bd -C "$GC_CITY" comment "$SC_ID" "ga-pa36 GAP-2 reconciler: sling bead $SLING_ID gate-passed+closed; an active quality-gate-marker ($GAP2_RECHECK_HIT) for the parent's own fix appeared while this sweep was verifying merge state — treating as in-flight, not abandoned. No labels changed. (ga-4tgga)" 2>/dev/null || true
             else
-              warn "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed but parent's own fix NOT verified in origin/main (ga-6ync4 — sling-passed is a signal, not proof) — NOT marking gate:passed/closing; re-arming gate:needs-fix + gate:needs-remerge"
+              warn "GAP-2: $SC_ID sling $SLING_ID gate-passed+closed but parent's own fix NOT verified in origin/main (ga-6ync4 — sling-passed is a signal, not proof) — NOT marking gate:passed/closing; re-arming gate:needs-fix + gate:needs-remerge (release only, no needs-remerge, if the bead carries a code-class gate-sha-failed stamp — ga-hudkhe)"
               # ga-4tgga gate-feedback (attempt 2, blocking): extracted to
               # gap2_arm_needs_remerge() (lib region above) so this arm's
               # label-remove calls are independently unit-testable — see
               # that function's doc-comment for why.
-              gap2_arm_needs_remerge "$SC_ID" "$SLING_ID"
+              # ga-hudkhe: rc1 = the parent's labels could not be read, or a label
+              # remove errored: no gate:* label was re-armed and no comment was
+              # posted; the parent is still selected and the next sweep retries.
+              gap2_arm_needs_remerge "$SC_ID" "$SLING_ID" \
+                || warn "GAP-2: $SC_ID gap2_arm_needs_remerge did not complete (parent labels unreadable, or a label remove errored) — nothing re-armed; will retry next sweep"
             fi
             ;;
         esac

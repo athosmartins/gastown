@@ -779,6 +779,39 @@ discard_staged_archive_outputs() {
     done
 }
 
+# purge_stray_export_tmp — leftovers of exports killed under the old layout, when the scratch file lived inside the archive (ga-aai87v): 19 sit in the archive's HEAD, more may be
+# untracked in the working tree. They are never archive content (the snapshot is <db>/issues.jsonl). Unstage and delete them so the commit that carries this run's snapshot also drops
+# them from HEAD (their blobs stay in git history). Runs inside $ARCHIVE_REPO, before `git add`, and only when this run has a snapshot to commit.
+purge_stray_export_tmp() {
+    local tracked f dropped=0
+
+    # vazio → no scratch file in the index, nothing to unstage; falhou → warn and leave the index alone (the `git add` exclude keeps them from being re-added)
+    if tracked=$(git ls-files -- ':(glob)*/issues.jsonl.tmp.*'); then
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if git rm -q --cached --ignore-unmatch -- "$f"; then
+                dropped=$((dropped + 1))
+            else
+                echo "jsonl-export: could not unstage the stray scratch file $f" >&2
+            fi
+        done <<EOF
+$tracked
+EOF
+    else
+        echo "jsonl-export: could not list tracked scratch files (git ls-files failed); leaving them for the next run" >&2
+    fi
+
+    # vazio → nothing left in the working tree; falhou (rm) → warn: the file stays untracked and the `git add` exclude keeps it out of the commit
+    for f in "$ARCHIVE_REPO"/*/issues.jsonl.tmp.*; do
+        [ -e "$f" ] || continue
+        rm -f -- "$f" || echo "jsonl-export: could not remove the stray scratch file $f" >&2
+    done
+
+    if [ "$dropped" -gt 0 ]; then
+        echo "jsonl-export: dropped $dropped stray scratch file(s) (issues.jsonl.tmp.*) from the archive (ga-aai87v)"
+    fi
+}
+
 # State file for tracking consecutive push failures.
 STATE_FILE="$PACK_STATE_DIR/jsonl-export-state.json"
 
@@ -850,6 +883,24 @@ if [ ! -d "$ARCHIVE_REPO/.git" ]; then
     git -C "$ARCHIVE_REPO" init -q 2>/dev/null || true
 fi
 ensure_archive_pack_config "$ARCHIVE_REPO"
+
+# Where the issues export's scratch file lives (ga-aai87v). It used to be mktemp'd INSIDE $ARCHIVE_REPO/<db>/ — the directory `git add -A -- <db>` stages — and the engine's SIGKILL at
+# the order's timeout (no trap runs) left it there for the NEXT run's commit: 19 of them (16 MB) reached the archive's HEAD, a 25 MB one was next, and the S3 mirror copies the working
+# tree. Outside the archive a dead run's leftover is just a file nobody stages. A sibling of the archive (same parent, so the same filesystem unless the archive itself is a mount
+# point) keeps the final `mv` into place a rename.
+EXPORT_TMP_DIR="${GC_JSONL_EXPORT_TMP_DIR:-$(dirname "$ARCHIVE_REPO")/.jsonl-export-tmp}"
+# A dead run's scratch file is swept once it is older than this many minutes. Keep it far above the order's timeout (jsonl-export.toml), so a sweep can never take the file of a run
+# that is still going; the price of a long age is only the disk a killed run's file holds meanwhile.
+EXPORT_TMP_SWEEP_MIN=240
+# falhou → exit 1 before anything is exported: the archive keeps its last snapshot (never a fallback to a path inside the archive)
+if ! mkdir -p "$EXPORT_TMP_DIR"; then
+    echo "jsonl-export: cannot create the scratch dir $EXPORT_TMP_DIR — nothing exported this run" >&2
+    exit 1
+fi
+# vazio → nothing to sweep; falhou → warn and carry on (a leftover outside the archive costs disk, never a commit)
+if ! find "$EXPORT_TMP_DIR" -maxdepth 1 -type f -name 'issues.jsonl.tmp.*' -mmin +"$EXPORT_TMP_SWEEP_MIN" -delete; then
+    echo "jsonl-export: could not sweep old scratch files in $EXPORT_TMP_DIR" >&2
+fi
 
 # Build scrub filter for the issues table.
 SCRUB_FILTER=""
@@ -1028,8 +1079,16 @@ while IFS= read -r DB; do
     # partial-export gate below reports it.
     SOURCE_BEFORE=$(read_source_issue_count "$DB" || true)
 
-    # Step 1: Export issues table.
-    ISSUE_EXPORT_TMP=$(mktemp "$DB_DIR/issues.jsonl.tmp.XXXXXX")
+    # Step 1: Export issues table. The scratch file lives in $EXPORT_TMP_DIR, never under $DB_DIR (ga-aai87v).
+    # falhou (mktemp) → this DB is not exported this run and its previous snapshot is restored, like every other failed step below
+    if ! ISSUE_EXPORT_TMP=$(mktemp "$EXPORT_TMP_DIR/issues.jsonl.tmp.XXXXXX"); then
+        echo "jsonl-export: cannot create the scratch file for $DB in $EXPORT_TMP_DIR" >&2
+        discard_failed_db_outputs "$DB"
+        FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
+        FAILED_DBS="${FAILED_DBS}$DB
+"
+        continue
+    fi
     if ! dolt_sql -r json -q "SELECT * FROM \`$DB\`.issues $SCRUB_FILTER" > "$ISSUE_EXPORT_TMP" 2>/dev/null; then
         rm -f "$ISSUE_EXPORT_TMP"
         discard_failed_db_outputs "$DB"
@@ -1205,7 +1264,9 @@ EOF
 
 cd "$ARCHIVE_REPO"
 if [ "${#STAGE_PATHS[@]}" -gt 0 ]; then
-    if ! git add -A -- "${STAGE_PATHS[@]}"; then
+    purge_stray_export_tmp
+    # The exclude holds even if the purge above could not remove one: a scratch file is never staged (ga-aai87v).
+    if ! git add -A -- "${STAGE_PATHS[@]}" ':(exclude,glob)**/issues.jsonl.tmp.*'; then
         discard_staged_archive_outputs
         echo "jsonl-export: staging archive outputs failed" >&2
         exit 1

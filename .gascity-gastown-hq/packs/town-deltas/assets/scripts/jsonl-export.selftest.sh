@@ -114,6 +114,9 @@ dolt_sql() {
       [ "$STUB_SOURCE_COUNT" = "ERR" ] && return 1
       printf 'row_count\n%s\n' "$STUB_SOURCE_COUNT" ;;
     "SELECT * FROM \`wa\`.issues"*)
+      # ga-aai87v: STUB_KILL_SELF=1 is the engine's SIGKILL at the order's timeout — the exporter dies mid-export, no trap runs,
+      # and its scratch file stays wherever the exporter put it.
+      [ "${STUB_KILL_SELF:-0}" = "1" ] && kill -9 $$
       # STUB_TEST_ROWS extra rows are ones the SQL filter lets through but the
       # jq scrub (title ^test_) removes — like a real store's leftover fixtures.
       jq -n -c --argjson n "$STUB_EXPORT_ROWS" --argjson t "${STUB_TEST_ROWS:-0}" \
@@ -446,6 +449,127 @@ case "$OUT" in
 esac
 unverified_seen "unverified, plain no-changes exit (300, source ERR)"
 
+# ── ga-aai87v: the export's scratch file never reaches the archive ───────────
+# The exporter wrote its scratch file (issues.jsonl.tmp.XXXXXX) INSIDE the archive, in the directory `git add -A -- <db>` stages. The engine's SIGKILL at the order's
+# timeout runs no trap, the file stayed, and the NEXT run's commit took it: 19 of them (16 MB) sat in the archive's HEAD and went offsite with the S3 mirror. The kill is
+# simulated for real (STUB_KILL_SELF makes the stub SIGKILL the exporter mid-export), so these cases do not depend on where the file is put.
+echo "=== ga-aai87v: the scratch issues.jsonl.tmp.* of a killed export never reaches the archive ==="
+scratch_archive() {  # scratch_archive <name> — a fresh archive with its own scratch dir
+  fresh_archive "$1"
+  E2E_TMPD="$E2E/scratch-$1"
+  export GC_JSONL_EXPORT_TMP_DIR="$E2E_TMPD"
+}
+# vazio → no scratch file under the given dirs; falhou (find could not read a dir) → the output starts with "find failed:", so a failed find is never read as "empty"
+stray_in() {
+  local out
+  out=$(find "$@" -name 'issues.jsonl.tmp.*' -not -path '*/.git/*' 2>&1) || out="find failed: $out"
+  printf '%s\n' "$out" | sed '/^$/d'
+}
+# vazio → 0 scratch files in HEAD; falhou/ilegível (HEAD or ls-tree unreadable) → prints "?", which none of the "= 0" / "= 1" assertions accept
+tracked_stray() {
+  local names
+  names=$(git -C "$ARCH" ls-tree -r --name-only HEAD 2>/dev/null) || { echo "?"; return 0; }
+  printf '%s\n' "$names" | grep -c 'issues\.jsonl\.tmp\.' || true
+}
+# vazio → archive working tree clean; falhou (git status errors) → prints "git status failed", so a broken repo is never read as clean
+dirty_tree() {
+  local out
+  out=$(git -C "$ARCH" status --porcelain 2>&1) || out="git status failed: $out"
+  printf '%s' "$out"
+}
+git_fixture()    { git -C "$ARCH" -c user.name=fixture -c user.email=fixture@localhost -c maintenance.auto=false "$@"; }
+
+# Case 1 — the real sequence: a run is SIGKILLed mid-export, the next run commits.
+scratch_archive killed
+run_export 200 200
+BASE_COMMITS=$(commits)
+export STUB_KILL_SELF=1
+run_export 201 201
+unset STUB_KILL_SELF
+[ "$RC" != "0" ] \
+  && ok "killed export: the run died mid-export (rc=$RC)" \
+  || bad "test setup invalid: the simulated SIGKILL did not stop the exporter (rc=0): $OUT"
+[ -n "$(stray_in "$ARCH" "$E2E_TMPD")" ] \
+  && ok "killed export: the dead run left its scratch file behind (the case under test exists)" \
+  || bad "test setup invalid: no scratch file anywhere after the killed run"
+[ -z "$(stray_in "$ARCH")" ] \
+  && ok "killed export: the scratch file is NOT under the archive (outside everything git add stages)" \
+  || bad "killed export: scratch file left inside the archive: $(stray_in "$ARCH" | tr '\n' ' ')"
+run_export 201 201
+[ "$(head_rows)" = "201" ] && [ "$(commits)" = "$((BASE_COMMITS + 1))" ] \
+  && ok "after a killed export: the next export commits its snapshot (201 rows, one new commit)" \
+  || bad "after a killed export: head=$(head_rows) commits $BASE_COMMITS -> $(commits), want 201 rows and +1 commit (rc=$RC): $OUT"
+[ "$(tracked_stray)" = "0" ] \
+  && ok "after a killed export: the snapshot commit holds no scratch file" \
+  || bad "after a killed export: the archive HEAD tracks $(tracked_stray) scratch file(s): $(git -C "$ARCH" ls-tree -r --name-only HEAD | grep 'issues\.jsonl\.tmp\.' | tr '\n' ' ')"
+[ -z "$(dirty_tree)" ] \
+  && ok "after a killed export: archive working tree is clean" \
+  || bad "after a killed export: archive working tree is dirty: $(dirty_tree | tr '\n' ' ')"
+
+# Case 2 — what production holds today: scratch files already in HEAD (19) and one untracked. The next snapshot commit drops them; their blobs stay in history.
+scratch_archive legacy
+run_export 200 200
+printf 'junk' > "$ARCH/wa/issues.jsonl.tmp.TRKD01"
+git_fixture add -f -- wa/issues.jsonl.tmp.TRKD01 >/dev/null 2>&1 \
+  && git_fixture commit -q -m "fixture: a scratch file already in HEAD" >/dev/null 2>&1
+printf 'junk' > "$ARCH/wa/issues.jsonl.tmp.UNTR02"
+[ "$(tracked_stray)" = "1" ] \
+  && ok "legacy leftovers: fixture has 1 scratch file in HEAD and 1 untracked" \
+  || bad "test setup invalid: tracked_stray=$(tracked_stray), want 1"
+BASE_COMMITS=$(commits)
+run_export 201 201
+[ "$(tracked_stray)" = "0" ] \
+  && ok "legacy leftovers: the next snapshot commit drops the tracked scratch file from HEAD" \
+  || bad "legacy leftovers: HEAD still tracks $(tracked_stray) scratch file(s)"
+[ -z "$(stray_in "$ARCH")" ] \
+  && ok "legacy leftovers: no scratch file left in the archive working tree (tracked or untracked)" \
+  || bad "legacy leftovers: still in the working tree: $(stray_in "$ARCH" | tr '\n' ' ')"
+[ "$(head_rows)" = "201" ] && [ "$(commits)" = "$((BASE_COMMITS + 1))" ] \
+  && ok "legacy leftovers: the real snapshot (201 rows) still commits, one new commit" \
+  || bad "legacy leftovers: head=$(head_rows) commits $BASE_COMMITS -> $(commits), want 201 rows and +1 commit (rc=$RC): $OUT"
+[ -z "$(dirty_tree)" ] \
+  && ok "legacy leftovers: archive working tree is clean" \
+  || bad "legacy leftovers: archive working tree is dirty: $(dirty_tree | tr '\n' ' ')"
+
+# Case 3 — a dead run's leftover in the scratch dir is swept once it is old enough that no live run can own it; a fresh one (a run still going) is left alone.
+scratch_archive sweep
+mkdir -p "$E2E_TMPD"
+printf 'old' > "$E2E_TMPD/issues.jsonl.tmp.OLD000"; touch -t 200001010000 "$E2E_TMPD/issues.jsonl.tmp.OLD000"
+printf 'live' > "$E2E_TMPD/issues.jsonl.tmp.LIVE00"
+run_export 200 200
+[ ! -e "$E2E_TMPD/issues.jsonl.tmp.OLD000" ] \
+  && ok "scratch sweep: a leftover older than the sweep age is removed" \
+  || bad "scratch sweep: the old leftover is still there"
+[ -e "$E2E_TMPD/issues.jsonl.tmp.LIVE00" ] \
+  && ok "scratch sweep: a fresh scratch file (a run still going) is left alone" \
+  || bad "scratch sweep: a fresh scratch file was deleted — it could belong to a live run"
+
+# Case 4 — default location (no override) is the archive's sibling, and a clean run leaves nothing in it.
+unset GC_JSONL_EXPORT_TMP_DIR
+fresh_archive defaultdir
+run_export 200 200
+DEFAULT_TMPD="$(dirname "$ARCH")/.jsonl-export-tmp"
+[ -d "$DEFAULT_TMPD" ] \
+  && ok "default scratch dir: <archive's parent>/.jsonl-export-tmp is created" \
+  || bad "default scratch dir: $DEFAULT_TMPD does not exist after a run (rc=$RC): $OUT"
+# vazio → the dir is empty (a clean run left nothing); falhou (ls cannot read it) → also empty, but the -d assertion just above already failed for a missing dir
+[ -z "$(ls -A "$DEFAULT_TMPD" 2>/dev/null)" ] \
+  && ok "default scratch dir: a clean run leaves nothing in it" \
+  || bad "default scratch dir: a clean run left: $(ls -A "$DEFAULT_TMPD" | tr '\n' ' ')"
+
+# Case 5 — the scratch dir cannot be created: the run says so and exports nothing (the archive keeps its last snapshot), instead of falling back to a path inside the archive.
+fresh_archive noscratch
+run_export 200 200
+BASE_COMMITS=$(commits)
+printf 'not a dir' > "$E2E/scratch-is-a-file"
+GC_JSONL_EXPORT_TMP_DIR="$E2E/scratch-is-a-file/sub" run_export 201 201
+[ "$RC" != "0" ] && case "$OUT" in *"cannot create the scratch dir"*) true ;; *) false ;; esac \
+  && ok "scratch dir not creatable: exits non-zero and names the scratch dir" \
+  || bad "scratch dir not creatable: rc=$RC, want non-zero with 'cannot create the scratch dir'. Output: $OUT"
+[ "$(head_rows)" = "200" ] && [ "$(commits)" = "$BASE_COMMITS" ] && [ -z "$(stray_in "$ARCH")" ] \
+  && ok "scratch dir not creatable: archive untouched (HEAD still 200 rows, no new commit, nothing written inside)" \
+  || bad "scratch dir not creatable: head=$(head_rows) commits $BASE_COMMITS -> $(commits) stray=$(stray_in "$ARCH" | tr '\n' ' ')"
+
 # ga-8z0hy7 — a commit that lands while jsonl-archive-compact.sh runs must not start git's background maintenance.
 # `git commit` runs `git maintenance run --auto --quiet --detach`; on git 2.54 that is a geometric repack which merges and deletes the loose-*.pack batch
 # packs, for 19+ minutes and with no lock file, and a compactor gc that is running meanwhile dies with "could not find pack 'loose-....pack'". trace2 logs the
@@ -509,6 +633,60 @@ lock_paths_agree() {  # lock_paths_agree <label> <city dir> <runtime dir or ""> 
 }
 lock_paths_agree "runtime dir given (GC_CITY_RUNTIME_DIR, as the supervisor sets it)" "$E2E/city-x" "$E2E/runtime-x"
 lock_paths_agree "no runtime dir given (derived from the city)" "$E2E/city-y" ""
+
+echo "=== ga-48e0du: the order declares a timeout the run fits in — and one that cannot stack ==="
+# With no `timeout` the engine kills an exec order at 300 s (orders.Order.TimeoutOrDefault; see mol-dog-reaper.toml, ga-x2fj8h). The exporter commits ONLY after every database has been
+# exported (the one commit_archive_snapshot after the loop), so a run killed before that leaves the files written and NOTHING committed: on 2026-10-16 the archive HEAD froze at 12:08:15Z while
+# eight runs in a row were killed at 5m02s-5m06s (`gc order history jsonl-export`; the last run that finished took 4m07s, so the ceiling was already 82% used). The data did not grow
+# (hq/issues.jsonl 71.39 -> 71.97 MB between the last commit and the fix); the host load did (84 on 10 cores). A run now needs about 6-8 minutes — an ESTIMATE from file mtimes, not a stopwatch.
+# The script has no single-flight lock, so the timeout must also stay under the 15 m interval: two exports in one git working tree is the ga-fxrrav failure.
+ORDER_TOML="$HERE/../../orders/jsonl-export.toml"
+order_field() {  # order_field <file> <key> — the value of `key = "..."` on a non-comment line (a `# key = ...` line does not count)
+  # vazio → prints nothing (the caller turns that into "not declared"); falhou/ilegível → the caller checks the file is readable BEFORE calling, so nothing here is read from a missing file
+  grep -E "^[[:space:]]*$2[[:space:]]*=" "$1" | head -1 | sed -E 's/^[^=]*=[[:space:]]*"?([0-9a-z]*)"?.*$/\1/'
+}
+dur_s() {  # dur_s <Ns|Nm|Nh> — seconds on stdout; returns 1 (prints nothing) for empty or anything that is not one plain duration
+  # 10# on purpose: a leading zero ("0840s") is decimal here, not an octal error in $(( ))
+  case "$1" in ''|*[!0-9smh]*) return 1 ;; esac
+  local n="${1%[smh]}" u="${1: -1}"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  case "$u" in s) echo $((10#$n)) ;; m) echo $((10#$n * 60)) ;; h) echo $((10#$n * 3600)) ;; *) return 1 ;; esac
+}
+order_timeout_verdict() {  # order_timeout_verdict <order toml> — "ok", or the reason it is not. Every doubt is a reason: nothing here defaults to ok.
+  local f="$1" t i ts is
+  [ -r "$f" ] || { echo "cannot read $f"; return 0; }
+  t="$(order_field "$f" timeout)"; i="$(order_field "$f" interval)"
+  [ -n "$t" ] || { echo "no timeout declared: the engine's 300 s default applies"; return 0; }
+  ts="$(dur_s "$t")" || { echo "timeout '$t' is not one plain Ns/Nm/Nh duration"; return 0; }
+  is="$(dur_s "$i")" || { echo "interval '$i' unreadable: cannot tell whether runs can stack"; return 0; }
+  [ "$ts" -ge 600 ] || { echo "timeout ${ts}s is under 600 s: a run needs about 6-8 min"; return 0; }
+  [ "$ts" -lt "$is" ] || { echo "timeout ${ts}s is not under the ${is}s interval and the script has no lock: two exports could overlap"; return 0; }
+  echo ok
+}
+v="$(order_timeout_verdict "$ORDER_TOML")"
+[ "$v" = ok ] && ok "jsonl-export.toml: timeout declared, at least 600 s, and under the interval" || bad "jsonl-export.toml: $v"
+# the check bites: each of these order files must be refused for its own reason, and only the sound ones pass
+mk_order() {  # mk_order <name> <interval value or ""> <timeout line or ""> — writes $WORK/order-<name>.toml and prints its path
+  { printf '[order]\nexec = "x"\ntrigger = "cooldown"\n'; [ -n "$2" ] && printf 'interval = "%s"\n' "$2"; [ -n "$3" ] && printf '%s\n' "$3"; } > "$WORK/order-$1.toml"
+  printf '%s' "$WORK/order-$1.toml"
+}
+expect_verdict() {  # expect_verdict <label> <file> <"ok" | substring of the reason>
+  local got; got="$(order_timeout_verdict "$2")"
+  if [ "$3" = ok ]; then [ "$got" = ok ] && ok "$1 -> ok" || bad "$1 -> '$got', wanted ok"
+  else case "$got" in *"$3"*) ok "$1 -> refused ($3)" ;; *) bad "$1 -> '$got', wanted a refusal naming '$3'" ;; esac; fi
+}
+expect_verdict "no timeout line"                          "$(mk_order none 15m '')"                                         "no timeout declared"
+expect_verdict "only a commented-out timeout"             "$(mk_order commented 15m '# timeout = "840s"')"                  "no timeout declared"
+expect_verdict "timeout 300s (the engine default)"        "$(mk_order t300 15m 'timeout = "300s"')"                         "under 600"
+expect_verdict "timeout equal to the interval"            "$(mk_order teq 15m 'timeout = "900s"')"                          "not under"
+expect_verdict "timeout above the interval"               "$(mk_order t1800 15m 'timeout = "1800s"')"                       "not under"
+expect_verdict "timeout 'ten' (not a duration)"           "$(mk_order tten 15m 'timeout = "ten"')"                          "not one plain"
+expect_verdict "timeout 1h30m (compound, not accepted)"   "$(mk_order tcomp 15m 'timeout = "1h30m"')"                       "not one plain"
+expect_verdict "no interval at all"                       "$(mk_order noint '' 'timeout = "840s"')"                         "interval '' unreadable"
+expect_verdict "order file missing"                       "$WORK/order-does-not-exist.toml"                                 "cannot read"
+expect_verdict "timeout 840s"                             "$(mk_order t840 15m 'timeout = "840s"')"                         ok
+expect_verdict "timeout 14m, trailing comment"            "$(mk_order t14m 15m 'timeout = "14m"   # headroom, see the header')" ok
+expect_verdict "timeout 0840s (leading zero is decimal)"  "$(mk_order t0840 15m 'timeout = "0840s"')"                       ok
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

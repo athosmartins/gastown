@@ -1681,6 +1681,51 @@ def list_suspended_agents():
 # bug/story it was dispatched to fix. See list_gate_active_source_beads() below.
 _SLING_TITLE_RE = re.compile(r'^(?:fix bug|build story)\s+(\S+):')
 
+# ga-3psuuo: the HQ store's own bead-id prefix, read from the city routing table
+# (the row whose path is "."). `bd show <id>` resolves an id against the LOCAL store
+# first and only then routes by prefix, so asking HQ about a wa-/ps-/ma-/lx-/gt- id
+# makes Dolt full-scan `LOWER(title) LIKE '%<id>%'` over the whole hq (~0.4 s each,
+# one per foreign id per cycle) before it finds the id lives in a rig store.
+_HQ_ROUTES_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".beads", "routes.jsonl")
+
+
+def _hq_id_prefix(routes_path=None):
+    """Return HQ's own id prefix (e.g. "ga"), or None when it cannot be determined.
+
+    None means "cannot filter": the caller keeps the pre-ga-3psuuo behaviour (look
+    up every id) — costlier, but never less protective.
+    """
+    # vazio (no "." row / empty file) → None; falhou/ilegível (missing file, bad
+    # JSON line, non-string/empty prefix) → None as well. Both land on "não filtra"
+    # (the old behaviour), an inert state: it can only cost a scan, never drop a
+    # gate-active bead from the protected set.
+    try:
+        with open(routes_path or _HQ_ROUTES_PATH) as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("path") == ".":
+                    pfx = row.get("prefix")
+                    return pfx if isinstance(pfx, str) and pfx else None
+    except (OSError, ValueError):  # ValueError: UnicodeDecodeError on a non-text file
+        return None
+    return None
+
+
+def _sling_lookup_ids(source_beads, hq_prefix):
+    """Source-bead ids worth a `bd show` for the sling → original back-reference.
+
+    A sling bead is always created in HQ, so only an HQ-prefix id can be one;
+    foreign-prefix ids (rig-native beads gated directly) have no sling title to
+    resolve and are left out. hq_prefix None → cannot tell → every id (old behaviour).
+    """
+    if hq_prefix is None:
+        return sorted(source_beads)
+    return sorted(i for i in source_beads if i.startswith(hq_prefix + "-"))
+
 
 def list_gate_active_source_beads():
     """Return set of source-bead IDs that currently have an active gate marker
@@ -1774,10 +1819,23 @@ def list_gate_active_source_beads():
     # ga-lrglm: resolve sling → original-bug back-references. Best-effort/fail-open —
     # a lookup failure here must never turn into a whole-cycle fail-safe skip; it just
     # means this cycle stays as protective as it was before this back-reference existed.
-    if active_source_beads:
+    # ga-3psuuo: only HQ-prefix ids go to this HQ `bd show` — a foreign id costs a
+    # full title scan of the hq store each cycle (see _HQ_ROUTES_PATH above).
+    # vazio (no HQ-prefix id) → no `bd show` at all; falhou (the call below errors,
+    # times out or returns junk) → keep the directly-active set, as before.
+    _hq_pfx = _hq_id_prefix()
+    if _hq_pfx is None:
+        # Not silent: the guard is correct without the filter, only slower, so this goes
+        # to the launchd log (not emit() — no push notification for a degraded-but-safe mode).
+        print("[INFLIGHT-RECLAIM] WARN: HQ id prefix unknown (routes.jsonl unreadable or "
+              "without a '.' row) — sling back-reference looks up every source-bead id "
+              "(slower: foreign ids cost HQ a title scan each; protection unchanged)",
+              flush=True)
+    _lookup_ids = _sling_lookup_ids(active_source_beads, _hq_pfx)
+    if _lookup_ids:
         try:
             result = subprocess.run(
-                ["bd", "show", *sorted(active_source_beads), "--json"],
+                ["bd", "show", *_lookup_ids, "--json"],
                 capture_output=True, text=True, timeout=20)
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)
@@ -5619,6 +5677,124 @@ def _selftest():
         _sb11 = list_gate_active_source_beads()
         check("SB-11 (ga-vfk8al): gate-status:running on type:quality-gate-run → source bead is gate-active",
               _sb11 == frozenset({"ga-runA"}), f"got={_sb11!r}")
+
+        # --- SB-12..SB-16 (ga-3psuuo): the sling back-reference `bd show` runs
+        # against HQ's store, and `bd` resolves an id locally BEFORE it routes by
+        # prefix: an id that is not an HQ bead (wa-/ps-/…) makes Dolt full-scan
+        # `LOWER(title) LIKE '%<id>%'` over the whole hq (~0.4 s each, every cycle,
+        # per foreign id). A sling bead is always created in HQ, so only HQ-prefix
+        # ids can be one — foreign ids must never reach that `bd show`. ---
+        global _HQ_ROUTES_PATH
+        _orig_routes_path = _HQ_ROUTES_PATH
+        _sbtmp = _tempfile.mkdtemp(prefix="irg-sb-")  # section 2's _tmpdir is already gone
+        _routes_ok = os.path.join(_sbtmp, "routes-ok.jsonl")
+        with open(_routes_ok, "w") as _fh:
+            _fh.write('{"prefix":"ga","path":"."}\n{"prefix":"wa","path":"../whatsapp_automation"}\n')
+
+        def _recording_stub(markers, titles, **kw):
+            inner = _stub_bd(markers, titles, **kw)
+            shown = []
+
+            def _run(cmd, **kw2):
+                if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "bd" and cmd[1] == "show":
+                    shown.append([a for a in cmd[2:] if a != "--json"])
+                return inner(cmd, **kw2)
+            return _run, shown
+
+        try:
+            _HQ_ROUTES_PATH = _routes_ok
+
+            # SB-12: mixed HQ + foreign ids → bd show gets ONLY the HQ id; the
+            # foreign ids stay in the result (they are still gate-active).
+            subprocess.run, _shown12 = _recording_stub(
+                {"gate-status:queued": [
+                    ["source-bead:wa-foreign1", "type:quality-gate-marker"],
+                    ["source-bead:ps-foreign2", "type:quality-gate-marker"],
+                    ["source-bead:ga-djjeq", "type:quality-gate-marker"],
+                ]},
+                {"ga-djjeq": "fix bug wa-orig9: some title"},
+            )
+            _sb12 = list_gate_active_source_beads()
+            check("SB-12 (ga-3psuuo): foreign-prefix ids never reach HQ's `bd show` (only the HQ id does)",
+                  _shown12 == [["ga-djjeq"]], f"bd show argv ids={_shown12!r}")
+            check("SB-12b (ga-3psuuo): result still holds foreign ids + sling id + resolved original",
+                  _sb12 == frozenset({"wa-foreign1", "ps-foreign2", "ga-djjeq", "wa-orig9"}),
+                  f"got={_sb12!r}")
+
+            # SB-13: only foreign ids → no `bd show` at all, result unchanged.
+            subprocess.run, _shown13 = _recording_stub(
+                {"gate-status:queued": [["source-bead:wa-foreign1", "type:quality-gate-marker"]]},
+                {},
+            )
+            _sb13 = list_gate_active_source_beads()
+            check("SB-13 (ga-3psuuo): only foreign ids → `bd show` is not called at all",
+                  _shown13 == [] and _sb13 == frozenset({"wa-foreign1"}),
+                  f"bd show calls={_shown13!r} got={_sb13!r}")
+
+            # SB-14: a look-alike prefix (gaz-) is NOT the HQ prefix ("ga-" needs the dash).
+            subprocess.run, _shown14 = _recording_stub(
+                {"gate-status:queued": [
+                    ["source-bead:gaz-lookalike", "type:quality-gate-marker"],
+                    ["source-bead:ga-iyfe83.1", "type:quality-gate-marker"],
+                ]},
+                {"ga-iyfe83.1": "no sling convention here"},
+            )
+            list_gate_active_source_beads()
+            check("SB-14 (ga-3psuuo): look-alike prefix gaz- is filtered; dotted HQ child id ga-iyfe83.1 is kept",
+                  _shown14 == [["ga-iyfe83.1"]], f"bd show argv ids={_shown14!r}")
+
+            # SB-15: HQ prefix unknown (routes file missing) → cannot filter →
+            # keeps the pre-ga-3psuuo behaviour (ask about every id): costlier,
+            # never less protective. Resolution of the sling's original still works.
+            _HQ_ROUTES_PATH = os.path.join(_sbtmp, "routes-missing.jsonl")
+            subprocess.run, _shown15 = _recording_stub(
+                {"gate-status:queued": [
+                    ["source-bead:wa-foreign1", "type:quality-gate-marker"],
+                    ["source-bead:ga-djjeq", "type:quality-gate-marker"],
+                ]},
+                {"ga-djjeq": "fix bug wa-orig9: some title"},
+            )
+            import io as _io
+            import contextlib as _ctx
+            _buf15 = _io.StringIO()
+            with _ctx.redirect_stdout(_buf15):
+                _sb15 = list_gate_active_source_beads()
+            check("SB-15 (ga-3psuuo): routes unreadable → no filtering (every id still looked up), original still resolved",
+                  _shown15 == [["ga-djjeq", "wa-foreign1"]]
+                  and _sb15 == frozenset({"wa-foreign1", "ga-djjeq", "wa-orig9"}),
+                  f"bd show argv ids={_shown15!r} got={_sb15!r}")
+            check("SB-15b (ga-3psuuo): the degraded mode is visible in the log, not silent",
+                  "HQ id prefix unknown" in _buf15.getvalue(), f"stdout={_buf15.getvalue()!r}")
+
+            # SB-16: _hq_id_prefix() reader — vazio/ilegível/ausente all → None
+            # (= "não filtra", the conservative state), valid "." row → its prefix.
+            def _routes_file(name, text):
+                p = os.path.join(_sbtmp, name)
+                with open(p, "w") as fh:
+                    fh.write(text)
+                return p
+            check("SB-16a (ga-3psuuo): _hq_id_prefix reads the '.' row of routes.jsonl",
+                  _hq_id_prefix(_routes_ok) == "ga", f"got={_hq_id_prefix(_routes_ok)!r}")
+            check("SB-16b (ga-3psuuo): garbage lines are skipped, the '.' row still found",
+                  _hq_id_prefix(_routes_file("r-garbage.jsonl",
+                                             'not json\n[1,2]\n{"prefix":"ga","path":"."}\n')) == "ga")
+            check("SB-16c (ga-3psuuo): no '.' row → None",
+                  _hq_id_prefix(_routes_file("r-norow.jsonl", '{"prefix":"wa","path":"../x"}\n')) is None)
+            check("SB-16d (ga-3psuuo): empty file → None",
+                  _hq_id_prefix(_routes_file("r-empty.jsonl", "")) is None)
+            check("SB-16e (ga-3psuuo): missing file → None",
+                  _hq_id_prefix(os.path.join(_sbtmp, "r-nope.jsonl")) is None)
+            _bin16 = os.path.join(_sbtmp, "r-binary.jsonl")
+            with open(_bin16, "wb") as fh:
+                fh.write(b"\xff\xfe\x00\x80 not utf-8 \xc3\x28\n")
+            check("SB-16g (ga-3psuuo): non-UTF-8 file (UnicodeDecodeError) → None, does not raise",
+                  _hq_id_prefix(_bin16) is None)
+            check("SB-16f (ga-3psuuo): '.' row with empty/non-string prefix → None",
+                  _hq_id_prefix(_routes_file("r-badpfx.jsonl", '{"prefix":"","path":"."}\n')) is None
+                  and _hq_id_prefix(_routes_file("r-badpfx2.jsonl", '{"prefix":7,"path":"."}\n')) is None)
+        finally:
+            _HQ_ROUTES_PATH = _orig_routes_path
+            _shutil.rmtree(_sbtmp, ignore_errors=True)
     finally:
         subprocess.run = _orig_run_sb
 

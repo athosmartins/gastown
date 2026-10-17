@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.dolt-restore-lab-mbp</string>
+
+  <!-- ga-3kmvyr: weekly REAL restore drill of the hq S3 backup, on the MBP
+       (Athos' 15/10 decision: beads data does not go to the Hetzner).
+       The mini orchestrates (scripts/dolt-restore-lab-mbp.sh): AS OF manifest,
+       S3 listing, push to the MBP, then the mini READS each object from S3 with
+       its own credential and streams it over ssh into the MBP slot (no AWS
+       credential reaches the MBP, nothing is written to the mini's disk), lab on
+       the local copy, pull, verdict, notify.
+       Saturday, 00:00-06:00 window: the 04:00 s3-backup is the only writer of
+       the bucket and a 3.5 h worst-case job started at 02:20 can still overlap
+       it, which the script already handles (run_utc fingerprint: a FAIL while
+       latest.json moved is downgraded to UNKNOWN). Three tries, 00:20, 01:20
+       and 02:20: the MBP must be presence=livre (screen locked/idle, ga-77c1qg
+       policy — never while the Athos is using it). Before 02:00 a busy/asleep
+       MBP DEFERS (rc 4, no notify, the next try runs); from 02:00 on it becomes
+       UNKNOWN (notify) — the last window of the night, silence would hide it.
+       A try that already got a final answer (OK/FAIL/SLOW) in the last 6 days
+       skips itself, so only the first try that finds the MBP free does the
+       work. RunAtLoad is false: a restore drill is never a boot side effect. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-restore-lab-mbp.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Weekday</key><integer>6</integer>
+      <key>Hour</key><integer>0</integer>
+      <key>Minute</key><integer>20</integer>
+    </dict>
+    <dict>
+      <key>Weekday</key><integer>6</integer>
+      <key>Hour</key><integer>1</integer>
+      <key>Minute</key><integer>20</integer>
+    </dict>
+    <dict>
+      <key>Weekday</key><integer>6</integer>
+      <key>Hour</key><integer>2</integer>
+      <key>Minute</key><integer>20</integer>
+    </dict>
+  </array>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-restore-lab-mbp-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-restore-lab-mbp-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>
