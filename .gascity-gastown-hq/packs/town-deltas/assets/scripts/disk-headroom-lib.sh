@@ -9,13 +9,13 @@
 # WHY. 17/10 12:40-12:56 the mini's disk went to ~0 while three agents were INSIDE heavy steps (a git repack,
 # a selftest copying hq.jsonl, `go build` + golangci-lint). Dolt got ENOSPC writing its journal and the whole
 # city lost its data plane for ~16 min. Nothing stopped a session that was ALREADY open from starting a heavy
-# step with the disk at the end. This lib plus scripts/heavy-guard.sh is the piece that stops it; the pieces that
-# stop NEW work (the Pilot sweep: ga-ydaslo; the pool probes: ga-09hfgh) are separate slices of ga-vln2py.
+# step with the disk at the end. This lib plus scripts/heavy-guard.sh is the piece that stops it; the pool probes
+# (ga-09hfgh) stop NEW work with it, and the Pilot sweep (ga-ydaslo) is a separate slice of ga-vln2py.
 #
 # THE TWO FLOORS (free MB on the volume that holds the swapfiles and the Dolt data):
 #   DISK_NEW_WORK_MIN_MB  5120 (5 GB)  the floor for STARTING new work, and the default floor of
-#                                      disk_headroom_state. Its readers are the Pilot sweep (ga-ydaslo) and the pool
-#                                      probes (ga-09hfgh), separate slices of ga-vln2py; heavy-guard.sh passes its own.
+#                                      disk_headroom_state. Its readers are the pool probes (ga-09hfgh) and, in a
+#                                      separate slice of ga-vln2py, the Pilot sweep (ga-ydaslo); heavy-guard.sh passes its own.
 #   DISK_HEAVY_MIN_MB     6144 (6 GB)  below it a heavy step (go build/test, golangci-lint, a selftest with
 #                                      mutants, a copy of a database) does not start on this machine —
 #                                      scripts/heavy-guard.sh refuses or waits. Higher than the first on
@@ -30,15 +30,20 @@
 # made is `unknown`, never "plenty". The edges also refuse more than 9 digits (a reading, a floor in the env, the
 # guard's --min-free-mb), so that case is rare by construction; the comparison stays three-way for what slips by.
 # What a caller does with `unknown` is the caller's decision and is NOT the same as `ok`:
-#   - heavy-guard.sh, the only caller in this slice, fails CLOSED (refuses): it guards ONE step whose failure mode
-#     is ENOSPC on the database;
-#   - a gate on NEW work (the later slices) is meant to fail OPEN and say so on its log: a df hiccup must not stop
-#     the city, and one more session is a small risk. Each of those slices carries its own test for it.
+#   - heavy-guard.sh fails CLOSED (refuses): it guards ONE step whose failure mode is ENOSPC on the database;
+#   - a gate on NEW work (the pool probes) fails OPEN and says so on its log: a df hiccup must not stop the city, and
+#     one more session is a small risk. Each of those callers carries its own test for it.
 #
 # SEAMS. DISK_FREE_OVERRIDE_MB pins the reading in selftests (a number = that many MB; any other non-empty value
 # = "unreadable", so the unknown path is testable). DISK_HEADROOM_PATH picks the volume (default
 # /private/var/vm — the same path the Pilot's swap-exhausted arm reads — else /). DISK_HEADROOM_ENABLED=0 makes
 # every state `ok` (kill switch; never set in prod).
+
+# What a low disk holds back from a pool probe (stdin: a JSON array of beads; prints the array without them). A STORY
+# — a bead the Pilot routed to a builder — carries no gc.kind; the city's own formula work (shutdown dance, reaper,
+# jsonl export: gc.kind=workflow) does, and that is exactly the work that has to keep running to get out of a low-disk
+# hole. One definition, read by the dog probe (pool-probe.sh); the wa/ps worker probes serve only stories and just answer [].
+DISK_HOLD_NEW_STORIES_JQ='[ .[] | select((.metadata["gc.kind"] // "") != "") ]'
 
 DISK_NEW_WORK_MIN_MB="${DISK_NEW_WORK_MIN_MB:-5120}"
 DISK_HEAVY_MIN_MB="${DISK_HEAVY_MIN_MB:-6144}"

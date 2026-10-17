@@ -646,7 +646,8 @@ probe_pick() {
   [ -n "$_line" ] || return 1
   printf '%s' "$3" > "$WORK/stores/probe.json"
   ( PATH="$SANDBOX_PATH"; PROBE_STORE=probe; GC_CITY_PATH="${PROBE_CITY:-$ROOT}"; GATE_FOCUS_ACTIVE_OVERRIDE=0
-    export PROBE_STORE GC_CITY_PATH GATE_FOCUS_ACTIVE_OVERRIDE
+    DISK_FREE_OVERRIDE_MB=100000   # ga-vln2py: the block also holds new beads back on a low disk; ORDER is the subject here
+    export PROBE_STORE GC_CITY_PATH GATE_FOCUS_ACTIVE_OVERRIDE DISK_FREE_OVERRIDE_MB
     bash -c "$_line" 2>"$WORK/probe.err" ) | jq -r '.[0].id // ""'
 }
 # brake_gate_for <template> <pool> -> counted | off | unreadable: what the DISPATCHER's own _topup_worker_probe_migrated

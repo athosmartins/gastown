@@ -409,6 +409,17 @@ if [ "$GATE_FOCUS_PROBE" = "1" ] && [ -n "$PS_CAND" ]; then
   # WARN path below says so (and Step 1b3 applies the same focus filter).
   PS_CAND="$(printf '%s' "$PS_CAND" | jq -c 'map(select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo")))' 2>/dev/null)" || PS_CAND=""
 fi
+# ga-vln2py (P0, 17/10): DISK FLOOR. With the free disk under the new-work floor (disk-headroom-lib.sh, 5 GB) there is NO new
+# bead for you: a builder started on a disk that low is what filled it on 17/10 and took Dolt down (ENOSPC on the journal).
+# Answer [] like the focus mode does: that is a real "nothing for you" - drain, and do NOT look for a bead by another route
+# (Step 1b3 holds back too). Only the disk reading decides; a disk that cannot be read ("unknown") holds NOTHING back (fail
+# open: a df hiccup must not starve the pool) and says so below - it is not a confirmation that the disk is fine.
+DISK_HEADROOM_PROBE="$(. "${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/disk-headroom-lib.sh" 2>/dev/null && disk_headroom_state)"
+case "$DISK_HEADROOM_PROBE" in
+  low) [ -n "$PS_CAND" ] && PS_CAND="[]" ;;
+  ok) ;;
+  *) echo "WARN disk floor (Step 1b2): the free disk could not be read (disk-headroom-lib.sh) - new beads are NOT held back; this is not a confirmation that the disk is fine." >&2 ;;
+esac
 PS_LIB="${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/work-order.sh"
 PS_PICK=""
 if [ -z "$PS_CAND" ]; then
@@ -481,7 +492,7 @@ printf '%s\n' "$PS_PICK"
 # decision — this file's own drift history means a Step 1b2 fix is never
 # assumed to reach here automatically).
 # Regression coverage: pool-probe-next-action-family.selftest.sh.
-export GATE_FOCUS_PROBE="$(. "${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/gate-focus-lib.sh" 2>/dev/null && gate_focus_active)"; {{ .RoutedPoolQuery }} | jq -c '[.[] | select((.labels // []) | map(select(. == "delivery:pending-restart")) | length == 0) | select(((.labels // []) | map(select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))) | length) == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | (if (env.GATE_FOCUS_PROBE // "") == "1" then map(select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo"))) else . end)'
+export GATE_FOCUS_PROBE="$(. "${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/gate-focus-lib.sh" 2>/dev/null && gate_focus_active)"; export DISK_HEADROOM_PROBE="$(. "${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/disk-headroom-lib.sh" 2>/dev/null && disk_headroom_state)"; {{ .RoutedPoolQuery }} | jq -c '[.[] | select((.labels // []) | map(select(. == "delivery:pending-restart")) | length == 0) | select(((.labels // []) | map(select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))) | length) == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | (if (env.GATE_FOCUS_PROBE // "") == "1" then map(select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo"))) else . end) | (if (env.DISK_HEADROOM_PROBE // "") == "low" then [] else . end)'
 
 # Step 1c: ONLY if Steps 1a / 1b / 1b2 / 1b3 are ALL empty — no work — drain and exit.
 gc runtime drain-ack && exit

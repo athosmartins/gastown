@@ -24,17 +24,17 @@ Uma fonte só: `packs/town-deltas/assets/scripts/disk-headroom-lib.sh` (MB livre
 | Piso | Valor | Abaixo dele |
 |---|---|---|
 | `DISK_HEAVY_MIN_MB` | 6144 (6 GB) | passo pesado não começa nesta máquina (`heavy-guard.sh` recusa) |
-| `DISK_NEW_WORK_MIN_MB` | 5120 (5 GB) | nada NOVO deve começar. Quem lê este piso: o Pilot (ga-ydaslo) e as sondas do pool (ga-09hfgh), fatias próprias; o `heavy-guard.sh` não lê (usa o seu) |
+| `DISK_NEW_WORK_MIN_MB` | 5120 (5 GB) | nada NOVO deve começar. Quem lê este piso: as sondas do pool (peça 3, ga-09hfgh) e, em outra fatia, o Pilot (ga-ydaslo); o `heavy-guard.sh` não lê (usa o seu) |
 
 O de passo pesado é mais alto de propósito: um passo precisa de folga para TERMINAR, o despacho só precisa de espaço para começar. Três estados, nunca dois: `ok`, `low`, `unknown` (df falhou ou não é número). O `heavy-guard.sh` falha FECHADO em `unknown` (o passo guardado falha por ENOSPC no banco). Quem decide sobre trabalho NOVO (fatias seguintes) deve falhar ABERTO e dizer isso no log: um soluço do df não pode parar a cidade.
 
 ## Quem faz o quê (4 peças, entregues em fatias)
 
-Esta fatia entrega só a peça 1; as outras três estão em beads próprias.
+Esta fatia entrega a peça 3, em cima da peça 1 (ga-vln2py, o guarda); as outras duas estão em beads próprias.
 
-1. **`scripts/heavy-guard.sh`** (esta fatia, ga-vln2py) — o guarda de passo pesado (abaixo). Já chamado por `jsonl-archive-compact.selftest.sh`; o texto do gate (`gate-review-task.lib.sh`, parágrafo HQ SELFTESTS) e a doutrina (`town-deltas.template.md`) mandam rodar localmente por ele a bateria que o `mbp-run.sh` devolveu com 96..99.
+1. **`scripts/heavy-guard.sh`** (ga-vln2py) — o guarda de passo pesado (abaixo). Já chamado por `jsonl-archive-compact.selftest.sh`; o texto do gate (`gate-review-task.lib.sh`, parágrafo HQ SELFTESTS) e a doutrina (`town-deltas.template.md`) mandam rodar localmente por ele a bateria que o `mbp-run.sh` devolveu com 96..99.
 2. **Pilot** — com < 5 GB o sweep pausa. Outra fatia: ga-ydaslo (o estado é o da bead).
-3. **Sondas de pool** (dog, wa-worker, ps-worker) — com < 5 GB não entregam bead nova. Outra fatia: ga-09hfgh (o estado é o da bead).
+3. **Sondas de pool** (esta fatia, ga-09hfgh) — `scripts/pool-probe.sh` (dog: com < 5 GB segura só a bead de HISTÓRIA da camada 1, sem `gc.kind`; trabalho de fórmula do próprio dog — shutdown dance, reaper — segue) e os blocos Step 1b2/1b3 de `agents/wa-worker` e `agents/ps-worker` (`[]`). `[]` por disco baixo é um "nada para você" de verdade: drene, não procure bead por outro caminho. Leitura ilegível = a sonda responde como antes e deixa uma linha no log (falha ABERTA: um soluço do df não pode secar o pool).
 4. **`dolt-disk-floor-guard.sh`** — no CRITICAL, nudge "pare passos pesados" às sessões ativas do pool. Outra fatia, independente desta: ga-vln2py.3 (o estado é o da bead; quem é avisado, o cooldown e o interruptor estão no cabeçalho do próprio script). (O alerta CRITICAL pelo `notify` com `NOTIFY_FORCE_PUSH=1`, independente do Dolt, além do mail do Mayor, já existe desde a ga-ff6t9.)
 
 ## heavy-guard.sh: uso e códigos de saída
@@ -79,7 +79,7 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 
 | Interruptor | Efeito | Uso |
 |---|---|---|
-| `DISK_HEADROOM_ENABLED=0` | toda leitura da lib vira `ok` (hoje: o guarda). O guarda avisa no stderr ("NOTE: ... bypassed") e grava `BYPASS` no log quando deixa passar por este interruptor ou por `DISK_FREE_OVERRIDE_MB` | nunca em produção |
+| `DISK_HEADROOM_ENABLED=0` | toda leitura da lib vira `ok` (guarda e sondas). O guarda avisa no stderr ("NOTE: ... bypassed") e grava `BYPASS` no log quando deixa passar por este interruptor ou por `DISK_FREE_OVERRIDE_MB` | nunca em produção |
 | `DISK_FREE_OVERRIDE_MB=<n>` | fixa a leitura (n = MB; não numérico = ilegível) | selftests |
 | `DISK_NEW_WORK_MIN_MB` / `DISK_HEAVY_MIN_MB` | ajusta os pisos (valor não numérico volta ao padrão) | só com decisão registrada |
 
@@ -87,7 +87,8 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 
 - Guarda: `scripts/heavy-guard.sh --check --what teste; echo rc=$?` (0 com folga; `DISK_FREE_OVERRIDE_MB=3000` dá 75).
 - Recusas e bypass: `tail $GC_CITY_PATH/.gc/logs/heavy-guard.log` (`REFUSED ...` / `BYPASS ...`; uma linha `BYPASS` fora de selftest = um `export` esquecido).
-- Bateria: `scripts/heavy-guard.selftest.sh`.
+- Sonda do dog: `DISK_FREE_OVERRIDE_MB=3000 sh packs/town-deltas/assets/scripts/pool-probe.sh gastown.dog` (só história some; exit 0 e nada no stderr). Leitura ilegível: `grep 'free disk unreadable' $GC_CITY_PATH/.gc/logs/pool-probe.log`.
+- Baterias: `scripts/heavy-guard.selftest.sh`, `packs/town-deltas/assets/pool-probe-disk-floor.selftest.sh` e a seção 11 de `scripts/pool-probe.selftest.sh`.
 
 ## Limites conhecidos
 
@@ -95,4 +96,5 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 - `go build` e `golangci-lint` não têm destino remoto hoje; com disco baixo eles esperam.
 - O parágrafo do gate sobre baterias do hq (`gate_hq_selftest_rules`) só sai com o nó ligado (`.gc/hetzner-node.on`); com o nó desligado o revisor não recebe a instrução do guarda por ali (o pool recebe pela seção `hq-selftest-node`, sempre).
 - Uma sessão que JÁ está dentro de um passo quando o disco cai não é interrompida por esta fatia.
+- A sonda longa `sh -c '…'` que o ENGINE renderiza no prompt do dog não passa pelo hold (só o `pool-probe.sh` passa; é ele que a doutrina manda usar desde a ga-witezg). O risco são as beads já roteadas ao dog (por qualquer caminho) enquanto ele usa a sonda longa.
 - A leitura é do volume do swap/Dolt (`/private/var/vm`, senão `/`). Um disco externo/montagem separada não conta.
