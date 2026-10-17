@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """daemon-unverified-sweep.selftest.py — selftest do vigia semanal de delivery:daemon-unverified (ga-iyfe83).
 
-Roda o vigia DE VERDADE (subprocess) contra um mundo falso mas fiel:
-  - um repo git real, em tmpdir (sha, diff-tree e is-ancestor são do git, não de mock);
-  - `bd`, `launchctl` e `ps` falsos, em tmpdir, que gravam cada chamada;
-  - um LaunchAgents falso com plists de verdade (plistlib).
-
-O que este arquivo protege é a regra de TRÊS estados que nunca colapsam:
-  CONFIRMADO · AINDA NÃO VISTO · NÃO CONSEGUI SABER
-e, acima de tudo, que "leitura falhou" NUNCA vira CONFIRMADO.
+Roda o vigia DE VERDADE (subprocess) num mundo falso mas fiel: repo git real, `bd`/`launchctl`/`ps` falsos que gravam
+cada chamada (o `bd` respeita --all e --limit) e um LaunchAgents com plists de verdade.
+Protege a regra de TRÊS estados que nunca colapsam (CONFIRMADO · AINDA NÃO VISTO · NÃO CONSEGUI SABER) e, acima de
+tudo, que "leitura falhou" NUNCA vira CONFIRMADO.
 
 Uso:  python3 daemon-unverified-sweep.selftest.py        (rc 0 = tudo verde)
 """
@@ -48,27 +44,24 @@ if argv[:1] == ["-C"]:
 if not argv or argv[0] != "list":
     sys.stderr.write("fake bd: so sei 'list'\n"); sys.exit(2)
 labels = [argv[i + 1] for i, a in enumerate(argv) if a == "--label" and i + 1 < len(argv)]
-key = None
-for l in labels:
-    if l.startswith("source-bead:"):
-        key = ("markers", l.split(":", 1)[1])
-if key is None and "delivery:daemon-unverified" in labels:
-    key = ("stores", "du")
-if key is None:
+if "delivery:daemon-unverified" not in labels:
     sys.stderr.write("fake bd: consulta inesperada %%r\n" %% (labels,)); sys.exit(2)
-tag = key[1]
-# falha injetada: sempre (fail/<store>__<tag>) ou as N primeiras chamadas (flaky/<store>__<tag>)
-failp = os.path.join(fake, "fail", store + "__" + tag)
+# falha injetada: sempre (fail/<store>) ou as N primeiras chamadas (flaky/<store>)
+failp = os.path.join(fake, "fail", store)
 if os.path.exists(failp):
     sys.stderr.write("[mysql] i/o timeout\nError: search count issues: invalid connection\n"); sys.exit(1)
-flakyp = os.path.join(fake, "flaky", store + "__" + tag)
+flakyp = os.path.join(fake, "flaky", store)
 if os.path.exists(flakyp):
     n = int(open(flakyp).read().strip() or "0")
     if n > 0:
         open(flakyp, "w").write(str(n - 1))
         sys.stderr.write("Error: invalid connection\n"); sys.exit(1)
-datap = os.path.join(fake, key[0], store + "__" + tag + ".json")
-print(open(datap).read() if os.path.exists(datap) else "[]")
+datap = os.path.join(fake, "stores", store + ".json")
+data = json.load(open(datap)) if os.path.exists(datap) else []
+if "--all" not in argv:                      # `bd list` sem --all não traz os fechados
+    data = [b for b in data if b.get("status") != "closed"]
+lim = argv[argv.index("--limit") + 1] if "--limit" in argv else "50"
+print(json.dumps(data if lim == "0" else data[:int(lim)]))   # sem `--limit 0` o bd corta em 50 (ga-21kmp)
 '''
 
 FAKE_LAUNCHCTL = r'''#!%(py)s
@@ -112,7 +105,7 @@ class World:
     def __init__(self):
         self.tmp = tempfile.mkdtemp(prefix="dus-selftest-")
         self.fake = os.path.join(self.tmp, "fake")
-        for sub in ("stores", "markers", "launchctl", "ps", "fail", "flaky"):
+        for sub in ("stores", "launchctl", "ps", "fail", "flaky"):
             os.makedirs(os.path.join(self.fake, sub))
         self.bin = os.path.join(self.tmp, "bin")
         os.makedirs(self.bin)
@@ -133,7 +126,6 @@ class World:
         self.env_extra = {}
         self._pid = 1000
 
-    # ---- git -------------------------------------------------------------
     def git(self, *args):
         r = subprocess.run(["git", "-C", self.repo, "-c", "user.name=t", "-c", "user.email=t@t", *args],
                            capture_output=True, text=True)
@@ -150,7 +142,6 @@ class World:
         self.git("commit", "-q", "-m", msg)
         return self.git("rev-parse", "HEAD")
 
-    # ---- launchd ---------------------------------------------------------
     def plist(self, label, program_rel, **keys):
         d = {"Label": label, "ProgramArguments": ["/bin/bash", os.path.join(self.repo, program_rel)]}
         d.update(keys)
@@ -176,7 +167,6 @@ class World:
         self._pid += 1
         return self._pid
 
-    # ---- bd --------------------------------------------------------------
     def bead(self, bid, rig="hq", close_reason="", closed_at=T0, status="closed", title=None):
         self.beads[rig].append({
             "id": bid, "title": title or ("bead " + bid), "status": status,
@@ -185,17 +175,16 @@ class World:
             "labels": ["delivery:daemon-unverified"],
         })
 
-    def fail(self, store, tag):
-        open(os.path.join(self.fake, "fail", "%s__%s" % (os.path.basename(getattr(self, store + "_store")), tag)), "w").close()
+    def fail(self, store):
+        open(os.path.join(self.fake, "fail", os.path.basename(getattr(self, store + "_store"))), "w").close()
 
-    def flaky(self, store, tag, n):
-        with open(os.path.join(self.fake, "flaky", "%s__%s" % (os.path.basename(getattr(self, store + "_store")), tag)), "w") as f:
+    def flaky(self, store, n):
+        with open(os.path.join(self.fake, "flaky", os.path.basename(getattr(self, store + "_store"))), "w") as f:
             f.write(str(n))
 
-    # ---- execução --------------------------------------------------------
     def run(self, *flags, now=T0 + 10 * D, extra_env=None):
         for key, store in (("hq", self.hq_store), ("rig", self.rig_store)):
-            with open(os.path.join(self.fake, "stores", os.path.basename(store) + "__du.json"), "w") as f:
+            with open(os.path.join(self.fake, "stores", os.path.basename(store) + ".json"), "w") as f:
                 json.dump(self.beads[key], f)
         env = dict(os.environ)
         env.update({
@@ -209,6 +198,8 @@ class World:
         env.update(extra_env or {})
         r = subprocess.run([sys.executable, SWEEP, *flags], capture_output=True, text=True, env=env, timeout=120)
         self.last = r
+        calls = self.calls("launchctl")                 # em QUALQUER teste: só LÊ o launchd, nada de kickstart / bootout / unload / kill
+        assert all(c.startswith("list ") for c in calls), calls
         return r
 
     def report(self):
@@ -237,6 +228,13 @@ class SweepTest(unittest.TestCase):
         self.w = World()
         self.addCleanup(self.w.cleanup)
 
+    def verdict(self, bid, state, reason=None):
+        b = self.w.state_of(bid)
+        self.assertEqual(b["state"], state, b)
+        if reason:
+            self.assertEqual(b["reason"], reason, b)
+        return b
+
     def daemon_world(self, keepalive=True, merge_at=T0 + 5 * D):
         """Um daemon KeepAlive 'svc' dono de bin/svc.sh, e uma entrega mergeada em `merge_at`."""
         w = self.w
@@ -246,51 +244,48 @@ class SweepTest(unittest.TestCase):
         w.bead("ga-aaa111", close_reason="Quality gate PASSED — merged (sha=%s, gate_run=ga-r1). Closed." % sha, closed_at=merge_at)
         return sha
 
-    # ---- os três estados -------------------------------------------------
     def test_confirmado_quando_o_daemon_subiu_depois_do_merge(self):
         w = self.w
         self.daemon_world(merge_at=T0 + 5 * D)
         w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 6 * D)       # subiu 1 dia DEPOIS do merge
         r = w.run()
         self.assertEqual(r.returncode, 0, r.stderr)
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], CONFIRMADO, b)
+        self.verdict("ga-aaa111", CONFIRMADO)
         self.assertEqual(w.report()["counts"][CONFIRMADO], 1)
+        w.beads["hq"][0]["closed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(T0 + 5 * D)) + ".5Z"   # com fração também lê
+        w.run()
+        self.verdict("ga-aaa111", CONFIRMADO)
 
     def test_ainda_nao_visto_quando_o_daemon_subiu_antes_do_merge(self):
         w = self.w
         self.daemon_world(merge_at=T0 + 5 * D)
         w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 4 * D)       # subiu 1 dia ANTES do merge
         w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], AINDA, b)
+        self.verdict("ga-aaa111", AINDA)
 
     def test_ainda_nao_visto_quando_o_daemon_nao_esta_carregado(self):
         w = self.w
         self.daemon_world()                                                # plist existe; launchctl não acha o serviço
         w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], AINDA, b)
-        self.assertEqual(b["reason"], "not-loaded", b)
+        self.verdict("ga-aaa111", AINDA, "not-loaded")
 
-    def test_ainda_nao_visto_quando_daemon_keepalive_carregado_sem_processo(self):
+    def test_ncs_quando_daemon_keepalive_carregado_sem_processo(self):
         w = self.w
         self.daemon_world()
-        w.loaded("com.test.svc")                                           # carregado, mas sem PID
+        w.loaded("com.test.svc")                                           # carregado, sem PID: o início não se lê
         w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], AINDA, b)
-        self.assertEqual(b["reason"], "loaded-no-pid", b)
+        self.verdict("ga-aaa111", NCS, "loaded-no-pid")                    # nem AINDA nem CONFIRMADO (run-to-completion oscila)
 
-    # ---- NÃO CONSEGUI SABER: o que não dá pra afirmar --------------------
-    def test_ncs_quando_o_close_reason_nao_traz_sha(self):
+    def test_ncs_quando_o_close_reason_nao_traz_sha_ou_o_sha_nao_esta_no_disco(self):
         w = self.w
         self.daemon_world()
+        w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)
         w.beads["hq"][0]["close_reason"] = "Story DELIVERED — story:done. DAEMON LIVENESS NOT VERIFIED"
         w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], NCS, b)
-        self.assertEqual(b["reason"], "no-merge-sha", b)
+        self.verdict("ga-aaa111", NCS, "no-merge-sha")
+        w.beads["hq"][0]["close_reason"] = "PASSED (sha=%s)" % ("ab" * 20)
+        w.run()
+        self.verdict("ga-aaa111", NCS, "sha-not-on-disk")
 
     def test_ncs_quando_nenhum_daemon_e_dono_do_codigo_mergeado(self):
         w = self.w
@@ -300,26 +295,21 @@ class SweepTest(unittest.TestCase):
         w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)
         w.bead("ga-bbb222", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
         w.run()
-        b = w.state_of("ga-bbb222")
-        self.assertEqual(b["state"], NCS, b)
-        self.assertEqual(b["reason"], "no-daemon", b)
+        self.verdict("ga-bbb222", NCS, "no-daemon")
 
-    def test_ncs_quando_o_sha_nao_esta_no_disco(self):
+    def test_sha_que_existe_mas_nao_esta_no_checkout_vivo_tem_motivo_proprio(self):
         w = self.w
         self.daemon_world()
+        w.git("checkout", "-q", "-b", "atras", "HEAD~1")                   # o checkout vivo está atrás do merge
         w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)
-        w.beads["hq"][0]["close_reason"] = "PASSED (sha=%s)" % ("ab" * 20)
         w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], NCS, b)
-        self.assertEqual(b["reason"], "sha-not-on-disk", b)
+        self.verdict("ga-aaa111", NCS, "sha-not-in-checkout")              # ≠ sha-not-on-disk: o sha existe, o código não está lá
 
-    # ---- "leitura falhou" NUNCA vira CONFIRMADO --------------------------
     def test_listagem_da_loja_que_falha_so_uma_vez_e_recuperada_pelo_retry(self):
         w = self.w
         self.daemon_world()
         w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)
-        w.flaky("hq", "du", 1)                                              # o Dolt estoura timeout UMA vez
+        w.flaky("hq", 1)                                              # o Dolt estoura timeout UMA vez
         r = w.run()
         self.assertEqual(r.returncode, 0, r.stderr)                         # e a loja NÃO vira "falhou" nem "zero beads"
         self.assertEqual(w.state_of("ga-aaa111")["state"], CONFIRMADO)
@@ -330,9 +320,7 @@ class SweepTest(unittest.TestCase):
         w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)
         open(os.path.join(w.fake, "launchctl", "com.test.svc.fail"), "w").close()
         r = w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], NCS, b)
-        self.assertEqual(b["reason"], "launchctl-read-failed", b)          # ≠ not-loaded: erro NÃO é "não carregado"
+        self.verdict("ga-aaa111", NCS, "launchctl-read-failed")          # ≠ not-loaded: erro NÃO é "não carregado"
         self.assertNotEqual(r.returncode, 0)
 
     def test_leitura_do_ps_falhou_nao_vira_confirmado(self):
@@ -341,10 +329,12 @@ class SweepTest(unittest.TestCase):
         pid = w.next_pid()
         w.loaded("com.test.svc", pid=pid)                                  # tem PID, mas o ps não responde
         r = w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], NCS, b)
-        self.assertEqual(b["reason"], "ps-read-failed", b)
+        self.verdict("ga-aaa111", NCS, "ps-read-failed")
         self.assertNotEqual(r.returncode, 0)
+        with open(os.path.join(w.fake, "ps", str(pid)), "w") as f:         # e com o lstart ilegível, também
+            f.write("ontem à tarde\n")
+        w.run()
+        self.verdict("ga-aaa111", NCS, "ps-read-failed")
 
     def test_repo_git_quebrado_nao_vira_sha_fora_do_disco_nem_confirmado(self):
         w = self.w
@@ -353,9 +343,7 @@ class SweepTest(unittest.TestCase):
         with open(os.path.join(w.repo, ".git", "HEAD"), "w") as f:         # o git responde 128 pra QUALQUER pergunta
             f.write("garbage\n")
         r = w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], NCS, b)
-        self.assertEqual(b["reason"], "git-read-failed", b)                # ≠ sha-not-on-disk: git quebrado NÃO é "sha ausente"
+        self.verdict("ga-aaa111", NCS, "git-read-failed")                # ≠ sha-not-on-disk: git quebrado NÃO é "sha ausente"
         self.assertNotEqual(r.returncode, 0, "leitura de git que falha tem que falhar ALTO (rc != 0)")
 
     def test_objeto_ilegivel_na_leitura_dos_arquivos_da_entrega_nao_vira_confirmado(self):
@@ -367,12 +355,9 @@ class SweepTest(unittest.TestCase):
         os.chmod(obj, 0o644)
         os.unlink(obj)
         r = w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], NCS, b)
-        self.assertEqual(b["reason"], "git-read-failed", b)
+        self.verdict("ga-aaa111", NCS, "git-read-failed")
         self.assertNotEqual(r.returncode, 0)
 
-    # ---- vários donos: precedência AINDA > NCS > CONFIRMADO ---------------
     def two_owner_world(self):
         w = self.w
         w.commit({"bin/a.sh": "a1\n", "bin/b.sh": "b1\n"}, "feat: a e b")
@@ -381,15 +366,18 @@ class SweepTest(unittest.TestCase):
         w.plist("com.test.b", "bin/b.sh", KeepAlive=True)
         w.bead("ga-ddd444", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
 
-    def test_um_dono_sem_reinicio_basta_para_ainda_nao_visto(self):
+    def test_confirmado_exige_todos_os_donos_confirmados(self):
         w = self.w
         self.two_owner_world()
         w.loaded("com.test.a", pid=w.next_pid(), start=T0 + 6 * D)         # a reiniciou
-        w.loaded("com.test.b", pid=w.next_pid(), start=T0 + 4 * D)         # b NÃO
+        pb = w.next_pid()
+        w.loaded("com.test.b", pid=pb, start=T0 + 4 * D)                    # b NÃO: um dono sem reinício basta pra AINDA
         w.run()
-        b = w.state_of("ga-ddd444")
-        self.assertEqual(b["state"], AINDA, b)
+        b = self.verdict("ga-ddd444", AINDA)
         self.assertEqual(sorted(b["owners"]), ["com.test.a", "com.test.b"])
+        w.proc_start(pb, T0 + 6 * D)                                        # agora b também: só então CONFIRMADO
+        w.run()
+        self.verdict("ga-ddd444", CONFIRMADO)
 
     def test_dono_que_nao_se_sabe_nao_deixa_o_outro_confirmar(self):
         w = self.w
@@ -398,8 +386,7 @@ class SweepTest(unittest.TestCase):
         w.loaded("com.test.b", pid=w.next_pid(), start=T0 + 6 * D)
         open(os.path.join(w.fake, "launchctl", "com.test.b.fail"), "w").close()
         w.run()
-        b = w.state_of("ga-ddd444")
-        self.assertEqual(b["state"], NCS, b)
+        self.verdict("ga-ddd444", NCS)
 
     def test_dono_sem_reinicio_e_outro_que_nao_se_sabe_fica_ainda_nao_visto(self):
         w = self.w
@@ -407,26 +394,18 @@ class SweepTest(unittest.TestCase):
         w.loaded("com.test.a", pid=w.next_pid(), start=T0 + 4 * D)         # a NÃO reiniciou: isso eu sei, com certeza
         w.loaded("com.test.b", pid=w.next_pid(), start=T0 + 6 * D)
         open(os.path.join(w.fake, "launchctl", "com.test.b.fail"), "w").close()   # b eu não consegui ler
-        w.run()
+        r = w.run()
         b = w.state_of("ga-ddd444")
         self.assertEqual(b["state"], AINDA, b)                             # o que se sabe (a) não some por causa do que não se sabe (b)
         self.assertEqual(b["owner_states"]["com.test.b"], [NCS, "launchctl-read-failed"], b)   # e a falha de b continua visível
-
-    def test_confirmado_exige_todos_os_donos_confirmados(self):
-        w = self.w
-        self.two_owner_world()
-        w.loaded("com.test.a", pid=w.next_pid(), start=T0 + 6 * D)
-        w.loaded("com.test.b", pid=w.next_pid(), start=T0 + 6 * D)
-        w.run()
-        self.assertEqual(w.state_of("ga-ddd444")["state"], CONFIRMADO)
+        self.assertEqual(r.returncode, 3, r.stderr)                         # ... e conta no rc (o veredito AINDA não a esconde)
 
     def test_daemon_que_nao_e_keepalive_nao_da_pra_saber_nesta_fatia(self):
         w = self.w
         self.daemon_world(keepalive=False)                                  # plist sem KeepAlive (periódico / por evento)
         w.loaded("com.test.svc")
         w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual((b["state"], b["reason"]), (NCS, "not-keepalive"), b)   # nunca CONFIRMADO só porque carregou
+        self.verdict("ga-aaa111", NCS, "not-keepalive")   # nunca CONFIRMADO só porque carregou
 
     def test_sha_no_close_reason_mas_bead_sem_closed_at_nao_e_no_merge_sha(self):
         w = self.w
@@ -434,11 +413,9 @@ class SweepTest(unittest.TestCase):
         w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)
         w.bead("ga-lll333", close_reason="PASSED (sha=%s)" % sha, closed_at=None)   # sabe o sha, não sabe QUANDO
         r = w.run()
-        b = w.state_of("ga-lll333")
-        self.assertEqual((b["state"], b["reason"]), (NCS, "bad-timestamp"), b)       # ≠ no-merge-sha ("não há sha")
+        self.verdict("ga-lll333", NCS, "bad-timestamp")       # ≠ no-merge-sha ("não há sha")
         self.assertNotEqual(r.returncode, 0)                                        # leitura que faltou conta como falha
 
-    # ---- entrega em fast-forward com vários commits -------------------------
     def test_commit_anterior_do_mesmo_bead_tambem_conta_para_os_donos(self):
         w = self.w
         w.commit({"bin/a.sh": "a1\n", "bin/b.sh": "b1\n"}, "feat: a e b")
@@ -454,7 +431,30 @@ class SweepTest(unittest.TestCase):
         self.assertEqual(b["state"], AINDA, "só a ponta do ff foi vista: falso CONFIRMADO — %s" % (b,))
         self.assertIn("com.test.b", b["owners"])
 
-    # ---- robustez: um bead estranho nunca derruba a varredura nem vira CONFIRMADO ----
+    def test_commit_de_outro_bead_nao_da_dono_ao_bead(self):
+        w = self.w                              # só o ASSUNTO que cita o id inteiro vale: corpo, prefixo e filho não
+        w.commit({"bin/a.sh": "1\n", "bin/b.sh": "1\n", "bin/c.sh": "1\n"}, "feat: a, b e c")
+        w.commit({"bin/a.sh": "2\n"}, "fix(ga-nnn50): irmão de prefixo")
+        w.commit({"bin/b.sh": "2\n"}, "fix(ga-nnn5.2): filho")
+        w.commit({"bin/c.sh": "2\n"}, "fix(ga-zzz9): outro\n\nver ga-nnn5, que mexeu em outra coisa")
+        sha = w.commit({"docs/n.md": "doc\n"}, "docs(ga-nnn5): notas")
+        for x in "abc":
+            w.plist("com.test." + x, "bin/%s.sh" % x, KeepAlive=True)
+            w.loaded("com.test." + x, pid=w.next_pid(), start=T0 + 9 * D)   # todos subiram DEPOIS: vazar um dono daria CONFIRMADO
+        w.bead("ga-nnn5", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
+        w.run()
+        self.verdict("ga-nnn5", NCS, "no-daemon")
+
+    def test_arquivo_com_acento_no_nome_acha_o_dono(self):
+        w = self.w
+        w.commit({"bin/café.sh": "v1\n"}, "feat: café")
+        sha = w.commit({"bin/café.sh": "v2\n"}, "fix(ga-ccc333): café v2")
+        w.plist("com.test.cafe", "bin/café.sh", KeepAlive=True)
+        w.loaded("com.test.cafe", pid=w.next_pid(), start=T0 + 4 * D)      # subiu ANTES do merge
+        w.bead("ga-ccc333", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
+        w.run()
+        self.verdict("ga-ccc333", AINDA)                                   # sem -z o git cita "caf\303\251.sh" e o dono se perdia
+
     def test_closed_at_ilegivel_vira_nao_consegui_saber_e_os_outros_beads_seguem(self):
         w = self.w
         sha = self.daemon_world()
@@ -462,8 +462,7 @@ class SweepTest(unittest.TestCase):
         w.bead("ga-jjj000", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
         w.beads["hq"][-1]["closed_at"] = "ontem à tarde"
         r = w.run()
-        bad = w.state_of("ga-jjj000")
-        self.assertEqual((bad["state"], bad["reason"]), (NCS, "bad-timestamp"), bad)
+        self.verdict("ga-jjj000", NCS, "bad-timestamp")
         self.assertEqual(w.state_of("ga-aaa111")["state"], CONFIRMADO)          # o vizinho não foi perdido
         self.assertNotEqual(r.returncode, 0)
 
@@ -500,15 +499,33 @@ class SweepTest(unittest.TestCase):
             f.write("isto não é um plist")
         w.bead("ga-kkk111", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
         r = w.run()
-        b = w.state_of("ga-kkk111")
-        self.assertEqual((b["state"], b["reason"]), (NCS, "plist-read-failed"), b)   # ≠ no-daemon
+        self.verdict("ga-kkk111", NCS, "plist-read-failed")   # ≠ no-daemon
         self.assertNotEqual(r.returncode, 0)
+
+    def test_launchagents_que_nao_le_nao_vira_nenhum_daemon(self):
+        w = self.w
+        self.daemon_world()
+        shutil.rmtree(w.la)                                                 # vazio ≠ falhou: sem plists não dá pra dizer "no-daemon"
+        r = w.run()
+        self.verdict("ga-aaa111", NCS, "plist-read-failed")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertLessEqual({"unreadable", "no_label", "via_plutil"}, set(w.report()["plists"]))   # mantém as chaves (a .3 lê)
+        w.beads["hq"].clear()                                               # ... e sem bead nenhum pra julgar a falha também conta
+        self.assertEqual(w.run().returncode, 3)
+
+    def test_label_duplicado_em_dois_plists_nao_deixa_um_deles_calado(self):
+        w = self.w
+        self.daemon_world()
+        w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)
+        shutil.copy(os.path.join(w.la, "com.test.svc.plist"), os.path.join(w.la, "copia.plist"))   # mesmo Label, outro arquivo
+        w.run()
+        self.verdict("ga-aaa111", NCS, "duplicate-label")                   # o launchd carrega UM deles; qual, não sei
 
     def test_loja_ilegivel_falha_alto_e_nao_vira_zero(self):
         w = self.w
         self.daemon_world()
         w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)
-        w.fail("rig", "du")                                                     # a listagem da loja do rig quebra sempre
+        w.fail("rig")                                                     # a listagem da loja do rig quebra sempre
         r = w.run()
         self.assertEqual(r.returncode, 3, r.stderr)
         stores = w.report()["stores"]
@@ -516,16 +533,6 @@ class SweepTest(unittest.TestCase):
         self.assertFalse(stores["rig"]["ok"])
         self.assertIn("rig", r.stderr)
         self.assertEqual(w.state_of("ga-aaa111")["state"], CONFIRMADO)          # a outra loja segue
-
-    def test_nunca_reinicia_nada_so_le_o_launchd(self):
-        w = self.w
-        self.two_owner_world()
-        w.loaded("com.test.a", pid=w.next_pid(), start=T0 + 4 * D)
-        w.loaded("com.test.b", pid=w.next_pid(), start=T0 + 4 * D)
-        w.run()
-        calls = w.calls("launchctl")
-        self.assertTrue(calls)
-        self.assertTrue(all(c.startswith("list ") for c in calls), calls)       # nada de kickstart/bootout/unload/kill
 
     def stale_world(self, n=1, first=1):
         """n beads AINDA NÃO VISTO (mesmo daemon, subiu antes do merge)."""
@@ -537,51 +544,35 @@ class SweepTest(unittest.TestCase):
             w.bead("ga-stale%02d" % i, close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
         return sha
 
-    # ---- operação: log, formatos de data ------------------------------------------
     def test_stdout_resume_as_contagens_por_estado_e_aponta_o_json(self):
         w = self.w
         self.stale_world(n=2)
         r = w.run()
         self.assertRegex(r.stdout, r"CONFIRMADO=0 · AINDA NÃO VISTO=2 · NÃO CONSEGUI SABER=0")
         self.assertIn("daemon-unverified-sweep-latest.json", r.stdout)
+        self.assertEqual(w.report()["generated_at"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 + 10 * D)))
+        self.assertEqual(os.listdir(w.out), ["daemon-unverified-sweep-latest.json"])   # escrita atômica: nenhum .tmp sobra
 
-    def test_closed_at_com_fracao_de_segundo_e_lido(self):
+    def test_loja_com_mais_de_50_beads_nao_e_cortada(self):
         w = self.w
-        self.daemon_world(merge_at=T0 + 5 * D)
-        w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 6 * D)
-        w.beads["hq"][0]["closed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(T0 + 5 * D)) + ".5Z"
+        self.stale_world(n=51)                                              # o bd corta em 50 sem `--limit 0` (ga-21kmp)
         w.run()
-        self.assertEqual(w.state_of("ga-aaa111")["state"], CONFIRMADO)
+        self.assertEqual(w.report()["counts"][AINDA], 51)
 
-    # ---- escopo ----------------------------------------------------------------
     def test_bead_sem_status_nao_vira_fora_de_escopo_nem_confirmado(self):
         w = self.w
         w.bead("ga-mmm444", status=None, closed_at=None)                    # a leitura não trouxe o status: não sei se fechou
         r = w.run()
-        b = w.state_of("ga-mmm444")
-        self.assertEqual((b["state"], b["reason"]), (NCS, "status-unknown"), b)   # ≠ "não fechado" (FORA DE ESCOPO)
+        self.verdict("ga-mmm444", NCS, "status-unknown")   # ≠ "não fechado" (FORA DE ESCOPO)
         self.assertNotEqual(r.returncode, 0)
 
     def test_bead_nao_fechado_fica_fora_de_escopo_e_nao_conta_nos_tres_estados(self):
         w = self.w
         w.bead("ga-hhh888", status="open", closed_at=None)
         w.run()
-        b = w.state_of("ga-hhh888")
-        self.assertEqual(b["state"], OUT, b)
+        self.verdict("ga-hhh888", OUT)
         counts = w.report()["counts"]
         self.assertEqual((counts[CONFIRMADO], counts[AINDA], counts[NCS], counts[OUT]), (0, 0, 0, 1))
-
-    def test_ps_com_saida_ilegivel_nao_vira_confirmado(self):
-        w = self.w
-        self.daemon_world()
-        pid = w.next_pid()
-        w.loaded("com.test.svc", pid=pid)
-        with open(os.path.join(w.fake, "ps", str(pid)), "w") as f:
-            f.write("ontem à tarde\n")
-        w.run()
-        b = w.state_of("ga-aaa111")
-        self.assertEqual(b["state"], NCS, b)
-        self.assertEqual(b["reason"], "ps-read-failed", b)
 
 
 if __name__ == "__main__":

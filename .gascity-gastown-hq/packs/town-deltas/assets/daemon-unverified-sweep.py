@@ -8,8 +8,8 @@ carregam o rótulo e NADA o lia — o rótulo era um lembrete que ninguém consu
 O QUE ESTE VIGIA FAZ. Para cada bead fechado com o rótulo decide EXATAMENTE UM de três estados, que nunca colapsam:
 
   CONFIRMADO          o daemon dono do código mergeado subiu DEPOIS do merge (início do processo vivo > merge).
-  AINDA NÃO VISTO     subiu ANTES do merge, ou o daemon não está carregado / não tem processo.
-  NÃO CONSEGUI SABER  sem sha de merge, sem daemon identificável, ou a leitura falhou.
+  AINDA NÃO VISTO     subiu ANTES do merge, ou o daemon não está carregado.
+  NÃO CONSEGUI SABER  sem sha de merge, sem daemon identificável, sem processo pra ler o início, ou a leitura falhou.
 
 Regra de ouro (E12: "vazio ≠ falhou"): NÃO CONSEGUI SABER é o estado de qualquer dúvida. Leitura que falhou
 (bd/launchctl/ps/git, timeout, saída ilegível) NUNCA vira CONFIRMADO — e também não vira "AINDA NÃO VISTO" nem
@@ -22,8 +22,9 @@ As únicas chamadas ao launchd são `launchctl list <label>` (leitura).
 
 Motivos (`reason`):
   CONFIRMADO:  started-after-merge
-  AINDA:       started-before-merge · not-loaded · loaded-no-pid
-  NCS (conteúdo, rc 0):        no-merge-sha · no-daemon · sha-not-on-disk · not-keepalive
+  AINDA:       started-before-merge · not-loaded
+  NCS (conteúdo, rc 0):        no-merge-sha · no-daemon · sha-not-on-disk · sha-not-in-checkout · not-keepalive ·
+                               loaded-no-pid · duplicate-label
   NCS (leitura quebrou, rc 3): launchctl-read-failed · ps-read-failed · git-read-failed · bad-timestamp ·
                                plist-read-failed · status-unknown · internal-error
   Uma LOJA que não listou não é uma loja com zero beads: fica em `stores` (ok=false) no relatório e o rc é 3.
@@ -38,10 +39,14 @@ LIMITES CONHECIDOS (o relatório é uma triagem, não uma prova):
   - "subiu depois do merge" é NECESSÁRIO, não SUFICIENTE: se o checkout vivo só recebeu o código depois do merge
     (pull atrasado), um daemon que subiu entre o merge e o pull sai CONFIRMADO sem ter rodado o código novo.
   - O sha do merge é só a PONTA da branch. Numa entrega em fast-forward com vários commits, os arquivos dos
-    commits anteriores só entram na conta porque o script TAMBÉM busca commits cuja mensagem cita o id do bead
-    (janela de 30 dias antes do merge). Commit que não cita o bead e não é a ponta não é visto.
+    commits anteriores só entram na conta porque o script TAMBÉM busca commits cujo ASSUNTO cita o id do bead como
+    token inteiro (janela de 30 dias antes do merge). Commit que não cita o bead no assunto e não é a ponta não é visto.
   - O dono é achado pelo caminho ABSOLUTO do arquivo em `ProgramArguments`. Plist que roda o arquivo por `Program`, ou
-    dentro de `bash -c "…"`, não é visto como dono (hoje: nenhum `Program` e um só KeepAlive com `-c`, o dolt-server).
+    dentro de `bash -c "…"`, não é visto como dono (hoje: com.athos.verify-pessoas-ref-fix tem `Program` e nenhum
+    `ProgramArguments`; o único KeepAlive com `-c` é o dolt-server).
+  - KeepAlive que roda até terminar (ex.: voicebot-campaign-run) fica sem PID entre execuções: sem processo não se lê o
+    início (NCS loaded-no-pid). O mesmo bead pode oscilar CONFIRMADO ↔ NCS conforme o instante da varredura.
+  - O repo do sha é o do checkout da loja que listou o bead: sha de outro rig sai sha-not-on-disk (NCS), nunca CONFIRMADO.
 
 COMO RODA. Dry-run: escreve `daemon-unverified-sweep-latest.json` em .gc/logs e imprime uma linha com as contagens por estado.
 Saída: 0 = leu tudo · 3 = alguma leitura falhou (ver `stores` / `reason` no JSON).
@@ -101,8 +106,16 @@ DEFAULT_STORES = ";".join([
 def run(cmd, timeout=None):
     e = dict(os.environ)
     e["LC_ALL"] = "C"          # `ps -o lstart=` em C: "Fri Oct 16 10:30:00 2026", independente do locale
-    return subprocess.run(cmd, capture_output=True, text=True, env=e,
+    return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape", env=e,
                           timeout=timeout if timeout is not None else int(env("DUS_CMD_TIMEOUT", "60")))
+
+
+def read(cmd, reason):
+    """Uma leitura externa. Timeout / binário que não abre → ReadFailed(reason): resposta que faltou ≠ resposta vazia."""
+    try:
+        return run(cmd)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise ReadFailed(reason, str(e))
 
 
 def parse_iso(s):
@@ -132,8 +145,6 @@ def load_stores():
             stores.append({"name": name, "store": store, "repo": repo})
     return stores
 
-
-# ---- leituras com retry ---------------------------------------------------
 
 def bd_list(store, labels):
     """`bd -C <store> list --label … --all --json --limit 0` com retry. Falha sustentada → ReadFailed('bd-failed').
@@ -173,58 +184,50 @@ def merge_of(bead):
     return None
 
 
-# ---- git ------------------------------------------------------------------
-
-def sha_on_disk(repo, sha):
-    try:
-        # `cat-file -e` dá 128 tanto pra sha ausente quanto pra repo quebrado; `rev-parse --verify --quiet` dá 1 só
-        # pro ausente. Repo quebrado é leitura que falhou (git-read-failed), não "sha fora do disco".
-        c = run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", sha + "^{commit}"])
-        if c.returncode == 1:
-            return False
-        if c.returncode != 0:
-            raise ReadFailed("git-read-failed", c.stderr.strip()[-200:] or "rev-parse rc=%d" % c.returncode)
-        a = run(["git", "-C", repo, "merge-base", "--is-ancestor", sha, "HEAD"])
-    except (subprocess.TimeoutExpired, OSError) as e:
-        raise ReadFailed("git-read-failed", str(e))
-    if a.returncode == 0:
-        return True
-    if a.returncode == 1:
-        return False
+def sha_place(repo, sha):
+    """'in-checkout' | 'not-in-checkout' (o sha existe no repo mas não é ancestral do HEAD vivo: pull atrasado) |
+    'not-on-disk'. `cat-file -e` dá 128 pra sha ausente E pra repo quebrado; `rev-parse --verify --quiet` dá 1 só pro
+    ausente. Repo quebrado é leitura que falhou (git-read-failed), não "sha fora do disco"."""
+    c = read(["git", "-C", repo, "rev-parse", "--verify", "--quiet", sha + "^{commit}"], "git-read-failed")
+    if c.returncode == 1:
+        return "not-on-disk"
+    if c.returncode != 0:
+        raise ReadFailed("git-read-failed", c.stderr.strip()[-200:] or "rev-parse rc=%d" % c.returncode)
+    a = read(["git", "-C", repo, "merge-base", "--is-ancestor", sha, "HEAD"], "git-read-failed")
+    if a.returncode in (0, 1):
+        return "in-checkout" if a.returncode == 0 else "not-in-checkout"
     raise ReadFailed("git-read-failed", a.stderr.strip()[-200:])
 
 
-def changed_files(repo, sha):
-    try:
-        r = run(["git", "-C", repo, "diff-tree", "-r", "--name-only", "--no-commit-id", "-m", "--first-parent", sha])
-    except (subprocess.TimeoutExpired, OSError) as e:
-        raise ReadFailed("git-read-failed", str(e))
+def git(repo, *args):
+    """stdout do git; rc != 0 → ReadFailed (git que falhou ≠ saída vazia = "nenhum arquivo / nenhum commit")."""
+    r = read(["git", "-C", repo, *args], "git-read-failed")
     if r.returncode != 0:
         raise ReadFailed("git-read-failed", r.stderr.strip()[-200:])
-    return [x for x in r.stdout.splitlines() if x]
+    return r.stdout
+
+
+def changed_files(repo, sha):
+    out = git(repo, "diff-tree", "-r", "--name-only", "-z", "--no-commit-id", "-m", "--first-parent", sha)
+    return [x for x in out.split("\0") if x]            # -z: nome com acento / tab não vem entre aspas
 
 
 def delivery_files(repo, sha, bead_id, merged_at):
-    """Arquivos da ENTREGA: os da ponta (`sha`) + os dos outros commits que citam o bead.
+    """Arquivos da ENTREGA: os da ponta (`sha`) + os dos outros commits do bead.
 
     O gate mergeia em fast-forward: `sha` é só a PONTA da branch, e olhar só o diff dela perde os donos dos commits
-    anteriores — o erro perigoso (falso CONFIRMADO). Cada commit cita o id do bead (convenção `fix(ga-xxx): …`);
-    mais arquivos só acrescentam donos, o que empurra pra AINDA/NCS — nunca pra CONFIRMADO."""
+    anteriores — o erro perigoso (falso CONFIRMADO). Commit do bead = o ASSUNTO cita o id como token inteiro
+    (`ga-x1` ≠ `ga-x11` ≠ o filho `ga-x1.2`); menção no corpo de commit de OUTRO bead não vale. O casamento tem que
+    ser exato porque os arquivos a mais podem dar dono (e veredito) a um bead cuja ponta só tocou doc ou teste."""
     files = set(changed_files(repo, sha))
-    try:
-        r = run(["git", "-C", repo, "log", "--fixed-strings", "--grep=" + bead_id, "--format=%H",
-                 "--since=%d" % (merged_at - BRANCH_WINDOW), sha])
-    except (subprocess.TimeoutExpired, OSError) as e:
-        raise ReadFailed("git-read-failed", str(e))
-    if r.returncode != 0:
-        raise ReadFailed("git-read-failed", r.stderr.strip()[-200:])
-    for c in r.stdout.split():
-        if c != sha:
+    log = git(repo, "log", "--fixed-strings", "--grep=" + bead_id, "--format=%H %s", "--since=%d" % (merged_at - BRANCH_WINDOW), sha)
+    cites = re.compile(r"(?<![\w-])%s(?![\w-]|\.\d)" % re.escape(bead_id))
+    for line in log.split("\n"):
+        c, _, subject = line.partition(" ")
+        if c != sha and cites.search(subject):
             files |= set(changed_files(repo, c))
     return sorted(files)
 
-
-# ---- donos (daemons) ------------------------------------------------------
 
 def read_plist(path):
     """(plist, via_plutil). O expat do python é estrito (recusa `--` dentro de comentário XML, que o launchd e o plutil
@@ -240,10 +243,15 @@ def read_plist(path):
 
 
 def load_plists():
-    """({label: plist}, {"unreadable", "no_label", "via_plutil": [arquivos]}). Plist que não lê NÃO some em silêncio: vira
-    dúvida (plist-read-failed). Plist lido mas sem Label não é daemon (o launchd não o carrega): fica listado à parte."""
+    """({label: [plist, …]}, {"unreadable", "no_label", "via_plutil": [arquivos]}). Plist que não lê NÃO some em silêncio:
+    vira dúvida (plist-read-failed). Plist lido mas sem Label não é daemon (o launchd não o carrega): fica listado à
+    parte. Dois arquivos com o mesmo Label ficam os dois (o launchd carrega um só). Nenhum *.plist (pasta que não existe
+    ou não abre) é leitura que falhou, não "nenhum daemon": ReadFailed."""
     plists, info = {}, {"unreadable": [], "no_label": [], "via_plutil": []}
-    for p in sorted(glob.glob(os.path.join(env("DUS_LAUNCH_AGENTS_DIR", os.path.join(HOME, "Library", "LaunchAgents")), "*.plist"))):
+    files = sorted(glob.glob(os.path.join(env("DUS_LAUNCH_AGENTS_DIR", os.path.join(HOME, "Library", "LaunchAgents")), "*.plist")))
+    if not files:
+        raise ReadFailed("plist-read-failed", "nenhum *.plist em DUS_LAUNCH_AGENTS_DIR / ~/Library/LaunchAgents")
+    for p in files:
         name = os.path.basename(p)
         try:
             pl, via_plutil = read_plist(p)
@@ -254,7 +262,7 @@ def load_plists():
         if via_plutil:
             info["via_plutil"].append(name)
         if isinstance(label, str):
-            plists[label] = pl
+            plists.setdefault(label, []).append(pl)
         else:
             info["no_label"].append(name)
     return plists, info
@@ -265,19 +273,17 @@ def owners_of(files, repo, plists):
     real = os.path.realpath(repo)
     fileset = set(files)
     labels = set()
-    for label, pl in plists.items():
-        progs = {os.path.relpath(os.path.realpath(a), real) for a in pl.get("ProgramArguments", []) if a.startswith("/")}
-        if progs & fileset:
-            labels.add(label)
+    for label, pls in plists.items():
+        for pl in pls:
+            progs = {os.path.relpath(os.path.realpath(a), real) for a in pl.get("ProgramArguments", []) if a.startswith("/")}
+            if progs & fileset:
+                labels.add(label)
     return sorted(labels)
 
 
 def launchctl_pid(label):
     """('not-loaded', None) | ('loaded', pid|None). Erro de leitura → ReadFailed (≠ not-loaded)."""
-    try:
-        r = run([env("DUS_LAUNCHCTL", "launchctl"), "list", label])
-    except (subprocess.TimeoutExpired, OSError) as e:
-        raise ReadFailed("launchctl-read-failed", str(e))
+    r = read([env("DUS_LAUNCHCTL", "launchctl"), "list", label], "launchctl-read-failed")
     if r.returncode == 0 and '"Label"' in r.stdout:
         m = re.search(r'"PID"\s*=\s*(\d+);', r.stdout)
         return "loaded", (m.group(1) if m else None)
@@ -287,10 +293,7 @@ def launchctl_pid(label):
 
 
 def process_start(pid):
-    try:
-        r = run([env("DUS_PS", "ps"), "-o", "lstart=", "-p", pid])
-    except (subprocess.TimeoutExpired, OSError) as e:
-        raise ReadFailed("ps-read-failed", str(e))
+    r = read([env("DUS_PS", "ps"), "-o", "lstart=", "-p", pid], "ps-read-failed")
     out = r.stdout.strip()
     if r.returncode != 0 or not out:
         raise ReadFailed("ps-read-failed", "ps rc=%d, sem saída (processo sumiu?)" % r.returncode)
@@ -300,22 +303,22 @@ def process_start(pid):
         raise ReadFailed("ps-read-failed", "lstart ilegível: %r" % out)
 
 
-def owner_state(plist, merged_at):
-    label = plist["Label"]
-    status, pid = launchctl_pid(label)
+def owner_state(pls, merged_at):
+    plist = pls[0]
+    status, pid = launchctl_pid(plist["Label"])
     if status == "not-loaded":
         return AINDA, "not-loaded"
+    if len(pls) > 1:
+        return NCS, "duplicate-label"       # dois arquivos com o mesmo Label: o launchd carrega um só, e qual eu não sei
     if not plist.get("KeepAlive"):
         return NCS, "not-keepalive"         # periódico / por evento: esta fatia só julga quem vive até alguém matar
     if pid is None:
-        return AINDA, "loaded-no-pid"
+        return NCS, "loaded-no-pid"         # carregado e sem processo: não há início pra ler (≠ "subiu antes do merge")
     started = process_start(pid)
     if started > merged_at:
         return CONFIRMADO, "started-after-merge"
     return AINDA, "started-before-merge"
 
-
-# ---- classificação --------------------------------------------------------
 
 def classify(bead, repo, plists, unreadable):
     try:
@@ -326,8 +329,9 @@ def classify(bead, repo, plists, unreadable):
         return NCS, "no-merge-sha", [], {}
     sha, merged_at, _src = got
     try:
-        if not sha_on_disk(repo, sha):
-            return NCS, "sha-not-on-disk", [], {}
+        place = sha_place(repo, sha)
+        if place != "in-checkout":
+            return NCS, "sha-" + place, [], {}
         files = delivery_files(repo, sha, bead["id"], merged_at)
     except ReadFailed as e:
         return NCS, e.reason, [], {}
@@ -359,7 +363,11 @@ def main(argv):
     os.makedirs(out_dir, exist_ok=True)
     stores = load_stores()
     now = int(env("DUS_NOW", "0")) or int(time.time())
-    plists, pinfo = load_plists()
+    try:
+        plists, pinfo = load_plists()
+    except ReadFailed as e:                   # sem LaunchAgents lido, "nenhum daemon é dono" não é uma resposta
+        plists, pinfo = None, {"unreadable": [], "no_label": [], "via_plutil": [], "error": e.detail}
+        sys.stderr.write("daemon-unverified-sweep: ERRO — não consegui ler os plists (%s)\n" % e.detail)
     unreadable = pinfo["unreadable"]
     beads, store_status = [], {}
     for s in stores:
@@ -376,6 +384,8 @@ def main(argv):
                 state, reason, owners, detail = NCS, "status-unknown", [], {}
             elif b["status"] != "closed":
                 state, reason, owners, detail = OUT, "not-closed", [], {}
+            elif plists is None:
+                state, reason, owners, detail = NCS, "plist-read-failed", [], {}
             else:
                 try:
                     state, reason, owners, detail = classify(b, s["repo"], plists, unreadable)
@@ -388,10 +398,13 @@ def main(argv):
     for b in beads:
         counts[b["state"]] += 1
     report_path = os.path.join(out_dir, "daemon-unverified-sweep-latest.json")
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump({"counts": counts, "stores": store_status, "plists": dict(pinfo, n=len(plists)), "beads": beads},
+    with open(report_path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump({"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "counts": counts,
+                   "stores": store_status, "plists": dict(pinfo, n=len(plists or {})), "beads": beads},
                   f, ensure_ascii=False, indent=1)
-    broken = any(not v["ok"] for v in store_status.values()) or any(b["reason"] in READ_FAILED for b in beads)
+    os.replace(report_path + ".tmp", report_path)          # quem lê (a .3) nunca vê um JSON pela metade
+    reasons = {b["reason"] for b in beads} | {v[1] for b in beads for v in b["owner_states"].values()}
+    broken = plists is None or any(not v["ok"] for v in store_status.values()) or bool(reasons & READ_FAILED)   # falha de dono conta mesmo sob AINDA
     print("%s daemon-unverified-sweep: %s · relatório: %s" % (
         time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
         " · ".join("%s=%d" % (k, counts[k]) for k in (CONFIRMADO, AINDA, NCS, OUT)), report_path))
