@@ -203,7 +203,8 @@ while [ $# -gt 0 ]; do case "$1" in --push) push="$2"; shift 2 ;; --pull) pull="
 echo "modes: dir=$(stat -f %Lp "$push") parent=$(stat -f %Lp "$(dirname "$push")")" >> "$FAKE_CAP/modes"
 SLOT="$FAKE_ROOT/mbp/gt-remote/exec/1"
 case "${FAKE_EXEC:-run}" in
-  refuse98) echo "mbp-run: MBP em uso — rode local"; exit 98 ;;
+  refuse98) [ "${FAKE_ATTEMPT_STUCK:-0}" != 1 ] || { rm -f "$FAKE_ROOT/state/last-attempt" && mkdir "$FAKE_ROOT/state/last-attempt"; }   # rm -f nao apaga diretorio: o marcador "nao sai"
+            echo "mbp-run: MBP em uso — rode local"; exit 98 ;;
   noready) sleep "${FAKE_NOREADY_S:-4}"; exit 0 ;;
   badslot) echo "[lab-mbp] ready slot=$FAKE_BADSLOT"; sleep 2; exit 0 ;;
 esac
@@ -493,6 +494,13 @@ check "$RC" 2 "02h (ultima janela): adiar vira UNKNOWN"; check "$(calls notify.l
 reset; FAKE_EXEC=refuse98 LABMBP_NOW_HOUR=0 run
 check "$RC" 4 "mbp-run recusa (98) antes do ready: adiado"; check "$(objreads)" 0 "recusa: nenhum objeto lido"; check "$(tmpleft)" 0 "recusa: stage apagado"
 reset; FAKE_EXEC=refuse98 LABMBP_NOW_HOUR=2 run; check "$RC" 2 "mbp-run recusa na ultima janela: UNKNOWN"
+# a recusa DEPOIS do launch e antes do ready nao e uma rodada que comecou: a janela seguinte da mesma noite tem de poder tentar
+reset; FAKE_EXEC=refuse98 LABMBP_NOW_HOUR=0 run
+check "$([ -e "$T/state/last-attempt" ] && echo sim || echo nao)" nao "recusa antes do ready: sem last-attempt (a rodada nao comecou)"
+run   # sem reset: o mesmo estado, a janela seguinte (FAKE_EXEC volta ao padrao)
+check "$RC" 0 "a janela seguinte roda de verdade (as 12 h do last-attempt nao a pulam)"; has "$OUT" "RESULT: OK" "e termina OK"; hasnt "$OUT" "RESULT: SKIPPED" "e nao e pulada"
+reset; FAKE_EXEC=refuse98 FAKE_ATTEMPT_STUCK=1 LABMBP_NOW_HOUR=0 run
+check "$RC" 2 "recusa e o last-attempt nao sai: UNKNOWN, nao o adiamento mudo"; has "$OUT" "nao consegui apagar" "diz que o marcador ficou"; check "$(calls notify.log)" 1 "e avisa"
 reset; FAKE_EXEC=drop run
 check "$RC" 2 "mbp-run cai (98) DEPOIS do ready e do envio: UNKNOWN (nao adiado)"; has "$OUT" "caiu ou estourou" "diz que caiu no meio"; check "$(lastfinal)" nao "sem last-final"
 reset; FAKE_EXEC=killparent run

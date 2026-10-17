@@ -397,7 +397,12 @@ main() {
   MBPRC=$(cat "$STAGE/mbprc" 2>/dev/null); isnum "$MBPRC" || MBPRC="?"
   rm -rf "$STAGE/lab-in"      # o stage não guarda nada que precise sobreviver ao job
   if [ ! -e "$STAGE/slot" ]; then
-    case "$MBPRC" in 96|97|98|99) defer "mbp-run recusou antes de a rodada comecar (rc=$MBPRC): $(tail -1 "$OUT/lab.stream" 2>/dev/null)" ;; esac
+    # recusa antes de o job comecar: a rodada NAO comecou, e o last-attempt (12 h) pularia a proxima janela da noite. Marcador que nao sai = rc 2, nunca o "pulada" mudo
+    case "$MBPRC" in 96|97|98|99)
+      rm -f "$STATE/last-attempt" 2>/dev/null
+      [ ! -e "$STATE/last-attempt" ] || unknown "mbp-run recusou (rc=$MBPRC) e nao consegui apagar $STATE/last-attempt: a proxima janela seria pulada pelas 12 h"
+      defer "mbp-run recusou antes de a rodada comecar (rc=$MBPRC): $(tail -1 "$OUT/lab.stream" 2>/dev/null)" ;;
+    esac
   fi
   if [ "$STREAM_OK" -eq 1 ]; then
     classify "$MBPRC"
