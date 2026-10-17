@@ -1318,7 +1318,7 @@ rc=$(STUB_RSYNC_REAL=1 "$RUN" --host linux --seed hq >"$T/out" 2>"$T/err"; echo 
 [ ! -e "$T/home/gt-remote/hq-base/.gc" ] && [ ! -e "$T/home/gt-remote/hq-base/scripts/.env" ] && ok "seed hq: .gc e .env NÃO chegam" || bad "seed hq: .gc ou .env chegaram à base"
 [ -f "$HQSEEDED" ] && ok "seed hq: carimbo da semeadura (janela da sombra do hq)" || bad "seed hq: sem carimbo"
 rm -rf "$T/city/packs" "$T/city/scripts"; rm -f "$T/city/.gc/logs/mbp-run.jsonl"
-hreset; rc=$("$RUN" --host linux --seed wa >/dev/null 2>"$T/err"; echo $?); expect "--host linux --seed wa: 97 (só o hq tem semeadura no nó)" 97 "$rc"; has "…diz" "$T/err" 'só existe para o hq'
+hreset; rc=$("$RUN" --host linux --seed ps >/dev/null 2>"$T/err"; echo $?); expect "--host linux --seed ps: 97 (no nó só wa — seed_node, ga-zri39b.4 — e hq)" 97 "$rc"; has "…diz" "$T/err" 'o nó Linux só tem o wa'
 hreset; rc=$("$RUN" --seed hq >/dev/null 2>"$T/err"; echo $?); expect "--seed hq sem --host linux: 97" 97 "$rc"; has "…diz" "$T/err" 'use --host linux --seed hq'
 # SEGURANÇA, de verdade: rsync REAL com o filtro do hq contra uma árvore de hq com dado e segredo plantados
 WTHD="$T/wthd"; mkdir -p "$WTHD/scripts/testdata" "$WTHD/packs/town-deltas/assets/scripts" "$WTHD/docs/runbooks" "$WTHD/docs/reports/x" "$WTHD/docs/research" "$WTHD/agents/dog" "$WTHD/.beads/dolt/hq/.dolt/noms" "$WTHD/.gc/logs" "$WTHD/.gc/runtime/jsonl-archive" "$WTHD/.dolt-backup" "$WTHD/backup" "$WTHD/whatsapp_automation/lib" "$WTHD/gascity/cmd" "$WTHD/docs/pending-engine-window/a.harness"
