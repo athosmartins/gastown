@@ -67,7 +67,7 @@ ASSIGN, NUM = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S), re.compile(r"[\d.]+[smhd
 FD = re.compile(r"(^|[\s;&|(])\d+(?=[<>])")  # `2>/dev/null`, `1>&2`: o número colado no redirecionamento é o descritor, não um argumento
 SHELLY = re.compile(r"[$`*?\[{]")
 PIECE = re.compile(r"&&|\|\||\|&|;;|[;&|()]|[<>]+&?")
-SUBST, BACKTICK = re.compile(r"\$S([0-9a-f]*)\$"), re.compile(r"`([^`]*)`")
+SUBST = re.compile(r"\$S([0-9a-f]*)\$")
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([^\s'\"<>|&;()]+)\2")  # o delimitador é a palavra INTEIRA (END-OF-FILE, EOF.txt), não só \w+
 PROT = {c: chr(0xF0000 + ord(c)) for c in "();<>|&'"}  # `;<>…` entre aspas ou depois de `\` é TEXTO: antes do shlex (que tira as aspas) vira um caractere de uso privado, e só depois volta (ver protect)
 UNPROT = str.maketrans({v: k for k, v in PROT.items()})
@@ -146,16 +146,69 @@ def is_read(sub: str, rest: list) -> bool:
             or (sub == "config" and reads_config(rest)))
 
 
+def quotes(s: str, k: int, q: str):
+    """Um passo do leitor de aspas do shell: (próximo índice, estado) a partir de s[k] no estado q ("" fora, "'" simples, '"' dupla, "$'" ANSI-C)."""
+    c = s[k]
+    if q == "'":
+        return k + 1, ("" if c == "'" else q)
+    if c == "\\" and q != "'":
+        return k + 2, q  # barra + o caractere seguinte: o par é texto (fora de aspas simples)
+    if q:
+        return k + 1, ("" if c == q[-1] else q)
+    return (k + 2, "$'") if s.startswith("$'", k) else (k + 1, c if c in "'\"" else "")
+
+
+def body_end(s: str, j: int) -> int:
+    """Índice do `)` que fecha o `$(` cujo miolo começa em s[j], ou len(s). Parêntese entre aspas ou escapado não conta, nem os de um `case … esac`."""
+    d, q, k, cs = 1, "", j, 0
+    while k < len(s):
+        c, w = s[k], re.match(r"(case|esac)\b", s[k:]) if not q and (k == 0 or not (s[k - 1].isalnum() or s[k - 1] in "_-")) else None
+        if w:
+            cs = max(0, cs + (1 if w.group(1) == "case" else -1))
+        elif not q and not cs and c in "()":
+            d += 1 if c == "(" else -1
+            if not d:
+                return k
+        k, q = quotes(s, k, q)
+    return len(s)
+
+
 def hide(cmd: str) -> str:
-    """Cada $( ) e crase vira UMA palavra opaca `$S<hex do miolo>$`: o shlex não as abre, e `one` confere o miolo no diretório certo."""
-    cmd, out, i = BACKTICK.sub(r"$(\1)", cmd), [], 0
-    while (j := cmd.find("$(", i)) >= 0:
-        d, k = 1, j + 2
-        while k < len(cmd) and d:
-            d, k = d + (cmd[k] == "(") - (cmd[k] == ")"), k + 1
-        out += [cmd[i:j], "$S" + cmd[j + 2:k - (d == 0)].encode().hex() + "$"]
-        i = k
+    """Cada $( ) e crase que o SHELL expande vira UMA palavra opaca `$S<hex do miolo>$`: o shlex não as abre, e `one` confere o miolo no diretório certo.
+    Entre aspas simples, em $'…' ou escapado (`\\$(`) é texto: fica, e o shell aninhado que o recebe (bash -c, eval) o confere já sem as aspas de fora."""
+    out, i, k, q = [], 0, 0, ""
+    while k < len(cmd):
+        if q not in ("'", "$'") and (cmd.startswith("$(", k) or cmd[k] == "`"):
+            if cmd[k] == "`":
+                e = k + 1
+                while e < len(cmd) and cmd[e] != "`":
+                    e += 2 if cmd[e] == "\\" else 1
+                body, nxt = cmd[k + 1:e], e + 1
+            else:
+                e = body_end(cmd, k + 2)
+                body, nxt = cmd[k + 2:e], e + 1
+            out += [cmd[i:k], "$S" + body.encode().hex() + "$"]
+            i = k = min(nxt, len(cmd))
+            continue
+        k, q = quotes(cmd, k, q)
     return "".join(out) + cmd[i:]
+
+
+def decomment(cmd: str) -> str:
+    r"""`#` que começa palavra, fora de aspas, abre comentário até o fim da linha: ali aspa, crase e `\` são TEXTO para o shell. Viram espaço — as palavras
+    do comentário seguem conferidas (lado fechado), mas não pareiam com a aspa de um `-m 'msg'` adiante nem juntam a linha seguinte."""
+    out, k, q = list(cmd), 0, ""
+    while k < len(cmd):
+        if not q and cmd[k] == "#" and (k == 0 or cmd[k - 1] in " \t\n;&|()"):
+            e = cmd.find("\n", k)
+            e = len(cmd) if e < 0 else e
+            for j in range(k, e):
+                if cmd[j] in "'\"`\\":
+                    out[j] = " "
+            k = e
+            continue
+        k, q = quotes(cmd, k, q)
+    return "".join(out)
 
 
 def runs_text(seg: list) -> bool:
@@ -262,7 +315,7 @@ def protect(cmd: str) -> str:
             q = "" if c == '"' else q
             out.append(c if c == '"' else PROT.get(c, c))
         elif c == "\\" and i + 1 < len(cmd):  # dentro de aspas duplas ou fora: barra + o caractere seguinte é um par só
-            out += [c, PROT.get(cmd[i + 1], cmd[i + 1])]
+            out += [cmd[i + 1]] if q == '"' and cmd[i + 1] in "$`" else [c, PROT.get(cmd[i + 1], cmd[i + 1])]  # em "…", `\$`/`\`` perdem a barra (o shlex a manteria; o bash não)
             i += 1
         elif q:
             out.append(c)  # barra solta no fim, dentro de aspas duplas: o laço acaba com a aspa aberta
@@ -295,7 +348,7 @@ def words(cmd: str) -> list:
     """As palavras do comando como (texto, operador?). operador = pontuação do SHELL (`;`, `&&`, `>`, `<(`…): `';'`, `\\;`, `'>'` e `''` são palavras, e a vazia FICA (`git -C '' -C x`).
     Aspa que não fecha (ou `\\` no fim): o shell recusa a linha e só roda o que veio ANTES dela, a não ser que a aspa esteja num comentário `#` (que o guarda não lê como
     comentário) e então o que vem DEPOIS roda. A aspa solta sai do texto e o resto é conferido como comando, as duas hipóteses de uma vez; o texto antes dela é lido igual."""
-    cmd = FD.sub(r"\1", hide(CONT.sub(r"\1", heredocs(cmd))).replace("\n", " ; "))  # newline separa comandos; `\` + newline os junta; heredoc só o que o shell lê como heredoc
+    cmd = FD.sub(r"\1", hide(CONT.sub(r"\1", decomment(heredocs(cmd)))).replace("\n", " ; "))  # newline separa comandos; `\` + newline os junta; heredoc só o que o shell lê como heredoc
     while True:  # termina: cada volta tira um caractere, e a próxima aspa solta só pode estar mais adiante (o que sobra de um tipo de aspa depois de tirar a solta é par ou tem uma só)
         try:
             text = protect(cmd)
@@ -448,7 +501,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     return r
         return None
 
-    def one(seg: list, blind: bool = False, prev: str = "", term: str = ";"):  # prev/term = o operador antes e depois do trecho: dizem se um cd rodou com certeza
+    def one(seg: list, blind: bool = False, prev: str = "", term: str = ";", ext: bool = False):  # ext = trecho que um programa externo roda (find -exec): cd ali não muda o shell; prev/term = o operador antes e depois do trecho: dizem se um cd rodou com certeza
         r = inner(seg)
         if r:
             return r
@@ -477,10 +530,12 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             if term == "&":
                 st["cwd"] = None  # `{ …; } &`: o grupo roda em background; o cd de dentro não vale aqui fora
             return None
+        w0 = [os.path.basename(x) for x in seg]
         env, seg, b, opq = peel(seg)
-        blind = blind or b
+        blind, wrapped = blind or b, any(x in WRAP for x in w0[:len(w0) - len(seg)])  # wrapped: `env cd x` roda o cd como PROGRAMA — o shell fica onde estava
+        unsure = kw or blk or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&")  # o trecho pode não ter rodado
         if not seg:
-            st["env"].update(env)  # `GIT_DIR=x; git …`: sem saber se foi exportada, vale para os comandos seguintes
+            st["env"].update({k: "$?" if unsure else v for k, v in env.items()})  # `GIT_DIR=x; git …` vale p/ os seguintes; `true || GIT_DIR=x` = "não sei" ($ → não resolve)
             return None
         cwd, c = None if blind else st["cwd"], os.path.basename(seg[0])
         if st.pop("or", False) and prev == "||" and c not in ("exit", "return"):
@@ -488,10 +543,10 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         if " " in seg[0]:  # env -S 'git -C x commit': um comando inteiro numa palavra só
             return sub(" ".join(seg), cwd, env)
         if c in ("export", "declare", "typeset"):
-            st["env"].update({m.group(1): m.group(2) for m in map(ASSIGN.fullmatch, seg[1:]) if m})
+            st["env"].update({m.group(1): "$?" if unsure else m.group(2) for m in map(ASSIGN.fullmatch, seg[1:]) if m})
         elif c in ("cd", "pushd", "popd"):
             new = None if c == "popd" else chdir(seg[1:], st["cwd"], c == "pushd")
-            if kw or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
+            if kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
                 new = None
             if blk and new is not None:
                 st["cdblk"] = True  # cd dentro de um ramo: vale até o fi/done/esac/else/elif
@@ -522,7 +577,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         elif c == "find":  # o `\;` e o `\(` do find são palavras (words() não os toma por operador do shell): todos os `-exec` do find estão neste trecho
             for j, t in enumerate(seg):
                 if t in ("-exec", "-execdir", "-ok", "-okdir"):  # -exec/-ok rodam no diretório do find; -execdir/-okdir no de CADA achado, que não sei qual é: cego
-                    r = one(seg[j + 1:], blind or t.endswith("dir"))
+                    r = one(seg[j + 1:], blind or t.endswith("dir"), ext=True)
                     if r:
                         return r
         elif c in st.get("funcs", {}) and c not in st.setdefault("calling", set()):  # chamada de função definida nesta chamada: o corpo roda AGORA, neste cwd
