@@ -117,7 +117,9 @@ EOF
 cat > "$T/bin/dolt" <<'EOF'
 #!/bin/bash
 echo "$*" >> "$FAKE_CAP/dolt.argv"
-[ "${1:-}" = version ] && { [ "${FAKE_DOLT_VER_HANG:-0}" != 1 ] || { trap 'touch "$FAKE_CAP/hang.term"; exit 143' TERM; sleep 30 >/dev/null 2>&1 </dev/null & wait $!; }; echo "dolt version 2.3.1"; exit 0; }
+[ "${1:-}" = version ] && { [ "${FAKE_DOLT_VER_HANG:-0}" != 1 ] || { trap 'touch "$FAKE_CAP/hang.term"; exit 143' TERM; sleep 30 >/dev/null 2>&1 </dev/null & wait $!; }
+  case "$([ -z "${FAKE_SCEN:-}" ] || sed -n 's/^dolt_run=//p' "$FAKE_SCEN")" in fail) echo "exec format error" >&2; exit 1 ;; empty) exit 0 ;; other) echo "dolt version 9.9.9"; exit 0 ;; esac   # the copy on the MBP
+  echo "dolt version 2.3.1"; exit 0; }
 [ "${FAKE_DOLT_DOWN:-0}" != 1 ] || { echo "connection refused" >&2; exit 1; }
 [ "${FAKE_DOLT_HANG:-0}" != 1 ] || exec sleep 30
 q=""; while [ $# -gt 0 ]; do [ "$1" = -q ] && { q="$2"; break; }; shift; done
@@ -209,10 +211,11 @@ case "${FAKE_EXEC:-run}" in
   badslot) echo "[lab-mbp] ready slot=$FAKE_BADSLOT"; sleep 2; exit 0 ;;
 esac
 rm -rf "$SLOT"; mkdir -p "$SLOT/in" && cp -Rp "$push" "$SLOT/in/"
-printf 'lab=%s\ndolt_version=%s\nleak=%s\ndisk=%s\n' "${SC_LAB:-ok}" "${SC_DOLT_VER:-2.3.1}" "${SC_LEAK:-0}" "${SC_DISK:-ok}" > "$FAKE_ROOT/scen"
+printf 'lab=%s\ndolt_version=%s\nleak=%s\ndisk=%s\ndolt_run=%s\n' "${SC_LAB:-ok}" "${SC_DOLT_VER:-2.3.1}" "${SC_LEAK:-0}" "${SC_DISK:-ok}" "${SC_DOLT_RUN:-ok}" > "$FAKE_ROOT/scen"
 extra=(); [ "${SC_AWSENV:-0}" != 1 ] || extra=(AWS_PROFILE=leaky)
 for t in ps env; do rm -f "$FAKE_ROOT/home/gt-remote/lab/bin/$t"; done   # SC_BROKEN=ps|env: that tool fails (exit 1, no output) in the MBP session
 [ -z "${SC_BROKEN:-}" ] || { printf '#!/bin/sh\nexit 1\n' > "$FAKE_ROOT/home/gt-remote/lab/bin/$SC_BROKEN"; chmod +x "$FAKE_ROOT/home/gt-remote/lab/bin/$SC_BROKEN"; }
+[ "${SC_PSFLAKY:-0}" != 1 ] || { printf '#!/bin/sh\ncase "$*" in *axww*) [ -e "$FAKE_CAP/ps.failed1" ] || { : > "$FAKE_CAP/ps.failed1"; exit 1; } ;; esac\nexec /bin/ps "$@"\n' > "$FAKE_ROOT/home/gt-remote/lab/bin/ps"; chmod +x "$FAKE_ROOT/home/gt-remote/lab/bin/ps"; }   # SC_PSFLAKY=1: the sampler's FIRST ps call fails, every later one works — always 1 failed + >=1 clean sample (the sampler takes the first and the last no matter how slow the machine is; a flake by call count shifted with the number of samples and sometimes failed ALL of them)
 [ "${FAKE_MINI_LEAK:-0}" != 1 ] || echo "AWS_SECRET_ACCESS_KEY=whatever" > "$(dirname "$push")/stray.txt"
 [ "${FAKE_MINI_LEAK:-0}" != 3 ] || { mkdir "$FAKE_ROOT/state/zz-unreadable" && chmod 000 "$FAKE_ROOT/state/zz-unreadable"; }
 [ "${FAKE_MINI_LEAK:-0}" != 2 ] || echo '{"cmd":"AWS_ACCESS_KEY_ID=whatever"}' > "$FAKE_ROOT/city/.gc/logs/mbp-run.jsonl"
@@ -492,6 +495,8 @@ for pr in uso lixo off; do
   check "$(calls notify.log)" 0 "adiado nao dispara notify"
 done
 reset; FAKE_PRESENCE=uso LABMBP_NOW_HOUR=1 run; check "$RC" 4 "01h ainda adia"
+reset; FAKE_PRESENCE=uso LABMBP_NOW_HOUR=5 run; check "$RC" 2 "05h ainda e a janela da noite: adiar vira UNKNOWN"
+reset; FAKE_PRESENCE=uso LABMBP_NOW_HOUR=14 run; check "$RC" 4 "14h (rodada manual de dia) nao e a ultima janela: ADIADO"; check "$(calls notify.log)" 0 "e nao notifica"
 reset; FAKE_PRESENCE=uso LABMBP_NOW_HOUR=2 run
 check "$RC" 2 "02h (ultima janela): adiar vira UNKNOWN"; check "$(calls notify.log)" 1 "e dispara notify"; has "$OUT" "adiado ate a ultima janela" "diz por que"
 reset; FAKE_EXEC=refuse98 LABMBP_NOW_HOUR=0 run
@@ -538,7 +543,7 @@ check "$RC" 2 "disco do MBP ilegivel: UNKNOWN, nunca OK"; has "$OUT" "nao conseg
 # the wrapper alone, in a slot of its own (no mbp-run, no orchestrator): wrun [env VAR=...] ARGS → WOUT, WRC
 wrun() {
   rm -rf "$T/wslot" "$T/wrc"; mkdir -p "$T/wslot"; printf 'lab=ok\ndolt_version=2.3.1\nleak=0\ndisk=ok\n' > "$T/scen"
-  ( cd "$T/wslot" && env -i HOME="${WHOME:-$T/home}" PATH="${WPATH:-/usr/bin:/bin}" LAB_BREW_BIN="${WBREW:-/nonexistent}" FAKE_SCEN="$T/scen" LAB_POLL_S=0.2 \
+  ( cd "$T/wslot" && ${WPRE:-:} && env -i HOME="${WHOME:-$T/home}" PATH="${WPATH:-/usr/bin:/bin}" LAB_BREW_BIN="${WBREW:-/nonexistent}" FAKE_SCEN="$T/scen" LAB_POLL_S=0.2 \
       /bin/bash "$T/scripts/dolt-restore-lab-mbp-side.sh" --db hq --dolt-version 2.3.1 --rto-seconds 3600 --src-kb 100 "$@" > "$T/wout" 2>&1; echo $? > "$T/wrc" ) &
   local n=0; until [ -e "$T/wrc" ] || [ $n -ge 100 ]; do sleep 0.2; n=$((n+1)); done
   [ -e "$T/wrc" ] || { touch "$T/wslot/stream.failed"; until [ -e "$T/wrc" ]; do sleep 0.2; done; }   # a wrapper that never gives up is told to stop
@@ -553,12 +558,19 @@ for tool in dolt python3 timeout; do   # a PATH of system tools WITHOUT $tool, a
 done
 wrun --stream-wait-s 1
 check "$WRC" 2 "wrapper: o mini nunca manda o fim do envio: UNKNOWN pelo teto de espera"; has "$WOUT" "nao terminou o envio em 1s" "diz o teto"
+WPRE='touch stream.failed' wrun --stream-wait-s 1
+check "$WRC" 2 "slot reusado com stream.failed velho: UNKNOWN so pelo teto"; has "$WOUT" "nao terminou o envio em 1s" "o wrapper esperou o envio desta rodada"; hasnt "$WOUT" "stream.failed" "e nao deu o envio velho como falha desta"
 
 echo "-- higiene detecta credencial"
 reset; SC_BROKEN=env run
 check "$RC" 0 "env quebrado no MBP: o veredito do restore fica"; has "$(summ)" "aws_env_vars=?" "a contagem fica '?', nunca 0"; has "$(summ)" "ALERTA" "e a prova nao medida avisa"; check "$(calls notify.log)" 1 "notify"
 reset; SC_BROKEN=ps run
 check "$RC" 0 "ps quebrado no MBP: o veredito do restore fica"; has "$(summ)" "ps_acertos=?" "sem nenhuma amostra de ps, os acertos ficam '?', nunca 0"; has "$(summ)" "ALERTA" "e a prova nao medida avisa"; check "$(calls notify.log)" 1 "notify"
+reset; SC_PSFLAKY=1 run
+EVD() { cat "$T"/state/runs/*/out/evidence.txt 2>/dev/null; }   # the wrapper's evidence, pulled back with out/
+check "$RC" 0 "ps falha em algumas amostras e as outras nao acham nada: o veredito fica"; has "$(EVD)" "argv_samples_falhas=1" "o cenario e PARCIAL de verdade: 1 amostra falhou"; hasnt "$(EVD)" "argv_samples=0 " "e ao menos uma amostra limpa (senao seria o caso 'ps quebrado', ja coberto acima)"; has "$(summ)" "ps_acertos=?" "zero parcial nao e zero: fica '?'"; has "$(summ)" "ALERTA" "e a prova incompleta avisa"; check "$(calls notify.log)" 1 "notify"
+reset; SC_PSFLAKY=1 SC_LEAK=1 run
+has "$(EVD)" "argv_samples_falhas=1" "ps falhou em 1 amostra e as outras rodaram"; check "$(summ | grep -c 'ps_acertos=[1-9]')" 1 "ps falha em algumas amostras mas uma achou a credencial: o achado conta"; has "$(summ)" "ALERTA" "e grita"
 reset; SC_AWSENV=1 run
 check "$RC" 0 "variavel AWS_* na sessao remota nao muda o veredito do restore"; has "$(summ)" "aws_env_vars=1" "a contagem aparece"; has "$(summ)" "ALERTA" "mas o resumo grita"; check "$(calls notify.log)" 1 "e dispara notify mesmo com OK"
 reset; SC_LEAK=1 run
@@ -967,6 +979,16 @@ check "$([ -e "$T/state/last-attempt" ] && echo sim || echo nao)" nao "--dry-run
 reset; run --install-dolt
 check "$RC" 0 "--install-dolt: rc 0"; has "$OUT" "dolt version 2.3.1" "instala e mostra a versao"; check "$([ -x "$T/home/gt-remote/lab/bin/dolt" ] && echo sim)" sim "o dolt do mini foi copiado para ~/gt-remote/lab/bin"
 check "$(grep -c -E '^AWS_' "$T"/cap/mbprun.env.* | awk -F: '{s+=$2} END{print s+0}')" 0 "--install-dolt tambem roda sem AWS_*"
+has "$OUT" "mesma versao do mini" "e diz que conferiu a versao com a do mini"
+# o dolt copiado que NAO roda: `... version | head -1` devolvia o rc do head (0) e o passo dizia sucesso (gate ga-qbxlln)
+reset; SC_DOLT_RUN=fail run --install-dolt
+check "$RC" 1 "dolt copiado nao roda: --install-dolt FALHA"; has "$OUT" "o dolt copiado NAO roda: exec format error" "o erro do dolt aparece"; hasnt "$OUT" "mesma versao do mini" "e nao diz que instalou"
+reset; SC_DOLT_RUN=empty run --install-dolt
+check "$RC" 2 "dolt copiado sai 0 sem dizer a versao: UNKNOWN"; has "$OUT" "nao provei que o dolt do MBP roda" "diz o que faltou"; hasnt "$OUT" "mesma versao do mini" "e nao diz que instalou"
+reset; SC_DOLT_RUN=other run --install-dolt
+check "$RC" 1 "dolt do MBP com versao diferente da do mini: FAIL"; has "$OUT" "o dolt do MBP e 9.9.9 e o do mini e 2.3.1" "diz as duas versoes"
+reset; FAKE_DOLT_VER_HANG=1 LABMBP_CALL_S=2 run --install-dolt
+check "$RC" 2 "versao do dolt do mini ilegivel: UNKNOWN"; has "$OUT" "nao consegui ler a versao do dolt do mini" "diz o que faltou"; check "$(execs)" 0 "e o MBP nao foi tocado"
 
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"

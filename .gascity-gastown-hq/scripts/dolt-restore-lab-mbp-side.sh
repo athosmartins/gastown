@@ -74,6 +74,7 @@ command -v caffeinate >/dev/null 2>&1 && { caffeinate -i -s -w $$ >/dev/null 2>&
 
 # --- the handshake. The caller reads the slot path from this line and starts the stream; it ends with stream.done / stream.failed.
 mkdir -p "$SRC" || die "nao consegui criar $SRC"
+rm -f "$SLOT/stream.done" "$SLOT/stream.failed"   # sobra de um slot reusado: so o fim do envio DESTA rodada (escrito depois do "ready") vale
 say "ready slot=$SLOT"
 DEADLINE=$(( $(date +%s) + WAIT_S ))
 while [ ! -e "$SLOT/stream.done" ]; do
@@ -122,8 +123,10 @@ LABRC=${PIPESTATUS[0]}
 # scripts (which name the variables in comments) are not scanned; `work` is the lab's own scratch.
 sample >> "$SAMPLES"; kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null
 # a sample that could not read `ps` is a "?" line: it is not counted as a clean sample; no clean sample at all → hits "?"
+# some samples failed and the others found nothing → "0" would claim a scan that did not happen → "?" too (a hit > 0 stands: achar vale mais que nao terminar)
 NS=$(grep -c '^[0-9]' "$SAMPLES" 2>/dev/null); NH=$(awk '/^[0-9]+$/ { s += $1 } END { print s + 0 }' "$SAMPLES" 2>/dev/null); NQ=$(grep -c '^?' "$SAMPLES" 2>/dev/null)
-[ "${NS:-0}" -gt 0 ] 2>/dev/null && ev "argv_samples=$NS argv_hits=$NH argv_samples_falhas=${NQ:-0}" || ev "argv_samples=0 argv_hits=? argv_samples_falhas=${NQ:-?}"
+if [ "${NS:-0}" -gt 0 ] 2>/dev/null; then ev "argv_samples=$NS argv_hits=$({ [ "${NQ:-0}" -gt 0 ] && [ "$NH" -eq 0 ]; } && echo '?' || echo "$NH") argv_samples_falhas=${NQ:-0}"
+else ev "argv_samples=0 argv_hits=? argv_samples_falhas=${NQ:-?}"; fi
 rm -f "$SAMPLES"
 HITS=$(grep -rIlE --exclude='*.sh' --exclude-dir=lab-src "$SHAPE" "$SLOT/in" "$SLOT/out" 2>/dev/null); GST=$?
 # achou vale mais que não terminar: grep sai 2 também quando ACHOU e um arquivo não abriu (BSD e ugrep, medido), então acerto na saída é

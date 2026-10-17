@@ -36,7 +36,7 @@
 #
 # VEREDITO  vem do report.json do lab, conferido com o rc do mbp-run (divergência = UNKNOWN). Relatório ausente = UNKNOWN.
 #   0 OK · 1 FAIL · 2 UNKNOWN · 3 SLOW (as mesmas palavras do lab) · 4 ADIADO (MBP em uso/inalcançável/pausado ANTES de começar;
-#   a próxima janela tenta de novo). Às LABMBP_FINAL_HOUR h (2) em diante o adiamento vira UNKNOWN: última janela da noite.
+#   a próxima janela tenta de novo). Das LABMBP_FINAL_HOUR h (2) até antes de LABMBP_NIGHT_END (6) o adiamento vira UNKNOWN: última janela da noite; fora dela (rodada manual de dia) segue ADIADO.
 #   notify só em rc 1/2/3 (e se a higiene achar credencial onde ela não pode estar). O RTO (LABMBP_RTO_S) vale para restore+contagem; o
 #   tempo do envio mini→MBP (stream_s) é medido à parte: é o do relay, maior que o de uma busca direta do S3.
 #
@@ -64,7 +64,7 @@ RTO="${LABMBP_RTO_S:-3600}"                  # orçamento restore+contagem; pass
 JOB_TIMEOUT="${LABMBP_JOB_TIMEOUT_S:-12600}" # teto do mbp-run para envio+restore+contagem (o slot dele envelhece em 4 h)
 STREAM_S="${LABMBP_STREAM_S:-7200}"          # teto do envio (o wrapper espera o mesmo tanto); READY_S = espera pelo "ready" do wrapper
 READY_S="${LABMBP_READY_S:-900}"; POLL_S="${LABMBP_POLL_S:-1}"; RETRY_S="${LABMBP_RETRY_S:-2}"; MARGIN="${LABMBP_MARGIN_PCT:-400}"
-RECENT_DAYS="${LABMBP_RECENT_DAYS:-6}"; FINAL_HOUR="${LABMBP_FINAL_HOUR:-2}"
+RECENT_DAYS="${LABMBP_RECENT_DAYS:-6}"; FINAL_HOUR="${LABMBP_FINAL_HOUR:-2}"; NIGHT_END="${LABMBP_NIGHT_END:-6}"
 SHAPE='[A]KIA[0-9A-Z]{16}|[A]SIA[0-9A-Z]{16}|[A]WS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)=|[a]ws_(access_key_id|secret_access_key|session_token)'
 # tudo que sai do mini rumo ao MBP (mbp-run, ssh) roda SEM nenhuma variável AWS_* do ambiente: só o aws do mini enxerga a credencial
 NOAWS=(env); for v in $(env | cut -d= -f1 | grep '^AWS_'); do NOAWS+=(-u "$v"); done
@@ -316,15 +316,25 @@ finish() {  # $1 = rc final; resumo + RESULT + notify
 unknown() { VERDICT=UNKNOWN; WHY="$*"; finish 2; }
 defer() {  # antes de começar: na última janela da noite vira UNKNOWN (adiar para sempre seria esconder o problema)
   local h; h=$(date +%H); h=$((10#${LABMBP_NOW_HOUR:-$h}))
-  if [ "$h" -ge "$FINAL_HOUR" ]; then unknown "adiado ate a ultima janela e nao rodou: $*"; fi
+  if [ "$h" -ge "$FINAL_HOUR" ] && [ "$h" -lt "$NIGHT_END" ]; then unknown "adiado ate a ultima janela e nao rodou: $*"; fi
   VERDICT=ADIADO; WHY="$*"; finish 4
 }
 
 install_dolt() {
-  local d; d=$(mktemp -d "${TMPDIR:-/tmp}/lab-dolt.XXXXXX") || exit 2; STAGE="$d"
+  local d want out rc have; d=$(mktemp -d "${TMPDIR:-/tmp}/lab-dolt.XXXXXX") || exit 2; STAGE="$d"
+  # vazio → exit 2 (nao sei que versao o MBP deve ter); falhou/pendurado → idem
+  want=$(bounded "$DOLT" version 2>/dev/null | head -1 | awk '{print $3}')
+  [ -n "$want" ] || { log "nao consegui ler a versao do dolt do mini"; exit 2; }
   mkdir "$d/lab-bin" && cp -L "$(command -v "$DOLT")" "$d/lab-bin/dolt" && chmod 755 "$d/lab-bin/dolt" || { log "nao consegui copiar o dolt do mini"; exit 2; }
-  "${NOAWS[@]}" "$MBP_RUN" --exec --push "$d/lab-bin" -- sh -c 'mkdir -p "$HOME/gt-remote/lab/bin" && cp in/lab-bin/dolt "$HOME/gt-remote/lab/bin/dolt" && chmod 755 "$HOME/gt-remote/lab/bin/dolt" && "$HOME/gt-remote/lab/bin/dolt" version | head -1'
-  exit $?
+  # o `version` do dolt copiado NAO vai num pipe (o rc do `head` mascararia um dolt que nao roda): o rc dele e o do comando remoto
+  # vazio (rc 0 sem linha de versao) → exit 2; falhou (rc != 0, do mbp-run ou do dolt) → esse mesmo rc, e o texto do erro aparece
+  out=$("${NOAWS[@]}" "$MBP_RUN" --exec --push "$d/lab-bin" -- sh -c 'mkdir -p "$HOME/gt-remote/lab/bin" && cp in/lab-bin/dolt "$HOME/gt-remote/lab/bin/dolt" && chmod 755 "$HOME/gt-remote/lab/bin/dolt" || exit 1; v=$("$HOME/gt-remote/lab/bin/dolt" version 2>&1) || { echo "o dolt copiado NAO roda: $v"; exit 1; }; echo "$v" | sed -n 1p' 2>&1); rc=$?
+  printf '%s\n' "$out"
+  [ "$rc" -eq 0 ] || { log "--install-dolt: o MBP respondeu rc=$rc; o dolt NAO ficou verificado"; exit "$rc"; }
+  have=$(printf '%s\n' "$out" | sed -n 's/.*dolt version \([0-9][^ ]*\).*/\1/p' | tail -1)
+  [ -n "$have" ] || { log "--install-dolt: rc 0 mas sem linha 'dolt version X' no retorno; nao provei que o dolt do MBP roda"; exit 2; }
+  [ "$have" = "$want" ] || { log "--install-dolt: o dolt do MBP e $have e o do mini e $want"; exit 1; }
+  log "dolt $have instalado em ~/gt-remote/lab/bin do MBP e rodando (mesma versao do mini)"; exit 0
 }
 
 # Lança o job no MBP em segundo plano e junta as saídas: a linha "ready" vira $STAGE/slot; o rc do mbp-run vira $STAGE/mbprc.
