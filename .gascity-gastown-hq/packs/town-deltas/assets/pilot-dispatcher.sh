@@ -2453,15 +2453,16 @@ _pilot_disk_floor() {
   PILOT_DISK_FLOOR_DETAIL=""
   [ "$PILOT_DISK_FLOOR_ENABLED" = "1" ] || return 1
   PILOT_DISK_FLOOR_STATE="unknown"
-  # vazio/falhou/ilegível (the library file is absent, or loads without defining the reader) → "unknown", fail-open, never "low"
-  if [ ! -r "$PILOT_DISK_LIB" ] || ! . "$PILOT_DISK_LIB" 2>/dev/null || ! type disk_headroom_state >/dev/null 2>&1; then
+  # vazio/falhou/ilegível (the library file is absent, or loads without defining a reader) → "unknown", fail-open, never "low"
+  if [ ! -r "$PILOT_DISK_LIB" ] || ! . "$PILOT_DISK_LIB" 2>/dev/null || ! type disk_free_mb >/dev/null 2>&1 || ! type disk_state_of >/dev/null 2>&1; then
     PILOT_DISK_FLOOR_DETAIL="library unreadable: ${PILOT_DISK_LIB}"
     return 1
   fi
   local _ov="${PILOT_DISK_FREE_OVERRIDE_MB:-${DISK_FREE_OVERRIDE_MB:-}}" _st _free=""
-  # vazio/falhou/ilegível → "unknown" (disk_headroom_state says so itself); a reading under the floor → "low"
-  _st="$(DISK_FREE_OVERRIDE_MB="$_ov" disk_headroom_state "$DISK_NEW_WORK_MIN_MB")" || _st="unknown"
+  # ONE read feeds the verdict AND the log line: a disk hovering at the floor must not be decided on one df and printed from a second.
+  # vazio/falhou/ilegível → _free stays "" and disk_state_of answers "unknown" for it; a reading under the floor → "low"
   _free="$(DISK_FREE_OVERRIDE_MB="$_ov" disk_free_mb)" || _free=""
+  _st="$(disk_state_of "$_free" "$DISK_NEW_WORK_MIN_MB")" || _st="unknown"
   case "$_st" in ok|low) ;; *) _st="unknown" ;; esac
   PILOT_DISK_FLOOR_STATE="$_st"
   PILOT_DISK_FLOOR_DETAIL="disk_free=${_free:-?}MB floor=${DISK_NEW_WORK_MIN_MB}MB"

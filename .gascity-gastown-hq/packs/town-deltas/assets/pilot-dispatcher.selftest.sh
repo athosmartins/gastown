@@ -5453,7 +5453,7 @@ fi
 
 echo "Scenario 20d-disk-d: PILOT_DISK_FLOOR_ENABLED=0 → the kill switch restores the old behaviour"
 LOG20DDD="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "" "" "" "" 0)"
-if echo "$LOG20DDD" | grep "Lane picks — small: tt-cx" >/dev/null && ! echo "$LOG20DDD" | grep "Disk floor\|Disk free UNREADABLE" >/dev/null; then
+if echo "$LOG20DDD" | grep "Lane picks — small: tt-cx" >/dev/null && ! echo "$LOG20DDD" | grep -E "Disk floor|Disk free UNREADABLE" >/dev/null; then
   ok "kill switch off → dispatches on a 3000 MB disk and says nothing about it (off is not blind)"
 else
   bad "kill switch off still paused or logged about the disk"
@@ -5470,6 +5470,37 @@ if echo "$LOG20DDE" | grep "Disk free UNREADABLE" >/dev/null; then
   ok "…and the blind reading is on the record, apart from 'the disk is fine'"
 else
   bad "an unreadable disk left no 'Disk free UNREADABLE' line — blind and fine look the same"
+fi
+
+echo "Scenario 20d-disk-f: ONE disk read feeds the verdict AND the log line (a disk hovering at the floor is not decided on one df and printed from another)"
+# A wrapper library answers the FIRST read 4000 MB (under the 5120 floor) and every later read 5300 MB (above it). A gate that reads
+# twice decides "low" and prints 5300; one that reads once decides "low" and prints 4000. The counter lives in a file because the
+# reads happen inside $(...) subshells.
+HOVER20DF="$WORK/disk20df"; mkdir -p "$HOVER20DF"; rm -f "$HOVER20DF/n"
+cat > "$HOVER20DF/lib.sh" <<'HOVER_LIB_EOF'
+. "$REAL_DISK_LIB"
+disk_free_mb() {
+  _hv_n=$(cat "$HOVER_DIR/n" 2>/dev/null || echo 0); _hv_n=$((_hv_n + 1)); echo "$_hv_n" > "$HOVER_DIR/n"
+  if [ "$_hv_n" = 1 ]; then printf '4000'; else printf '5300'; fi
+}
+HOVER_LIB_EOF
+# vazio (the function is not in the dispatcher) → bad, never ok; falhou/ilegível (awk prints nothing) → the same empty value, the same bad
+FN20DF="$(awk '/^_pilot_disk_floor\(\) *\{/ {f=1} f {print} f && /^}$/ {exit}' "$DISPATCHER")"
+if [ -z "$FN20DF" ]; then
+  bad "_pilot_disk_floor not found in $DISPATCHER (cannot test the single read)"
+else
+  OUT20DF="$(
+    export REAL_DISK_LIB="$SELF_DIR/scripts/disk-headroom-lib.sh" HOVER_DIR="$HOVER20DF"
+    PILOT_DISK_LIB="$HOVER20DF/lib.sh" PILOT_DISK_FLOOR_ENABLED=1 DISK_NEW_WORK_MIN_MB=5120 PILOT_DISK_FREE_OVERRIDE_MB="" DISK_FREE_OVERRIDE_MB=""
+    eval "$FN20DF"
+    _pilot_disk_floor; _rc=$?
+    echo "rc=$_rc state=$PILOT_DISK_FLOOR_STATE detail=$PILOT_DISK_FLOOR_DETAIL reads=$(cat "$HOVER_DIR/n" 2>/dev/null || echo none)"
+  )"
+  if [ "$OUT20DF" = "rc=0 state=low detail=disk_free=4000MB floor=5120MB reads=1" ]; then
+    ok "one read: the verdict (low) and the logged number (4000 MB) come from the same reading"
+  else
+    bad "the verdict and the logged number do not come from one read (got: $OUT20DF)"
+  fi
 fi
 
 echo "Scenario 20e: drift-guard — PILOT_CTX_READY_QUERIES defaults to 1 and is env-gated"
