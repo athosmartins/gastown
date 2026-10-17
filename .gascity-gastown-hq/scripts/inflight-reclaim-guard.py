@@ -1823,7 +1823,15 @@ def list_gate_active_source_beads():
     # full title scan of the hq store each cycle (see _HQ_ROUTES_PATH above).
     # vazio (no HQ-prefix id) → no `bd show` at all; falhou (the call below errors,
     # times out or returns junk) → keep the directly-active set, as before.
-    _lookup_ids = _sling_lookup_ids(active_source_beads, _hq_id_prefix())
+    _hq_pfx = _hq_id_prefix()
+    if _hq_pfx is None:
+        # Not silent: the guard is correct without the filter, only slower, so this goes
+        # to the launchd log (not emit() — no push notification for a degraded-but-safe mode).
+        print("[INFLIGHT-RECLAIM] WARN: HQ id prefix unknown (routes.jsonl unreadable or "
+              "without a '.' row) — sling back-reference looks up every source-bead id "
+              "(slower: foreign ids cost HQ a title scan each; protection unchanged)",
+              flush=True)
+    _lookup_ids = _sling_lookup_ids(active_source_beads, _hq_pfx)
     if _lookup_ids:
         try:
             result = subprocess.run(
@@ -5746,11 +5754,17 @@ def _selftest():
                 ]},
                 {"ga-djjeq": "fix bug wa-orig9: some title"},
             )
-            _sb15 = list_gate_active_source_beads()
+            import io as _io
+            import contextlib as _ctx
+            _buf15 = _io.StringIO()
+            with _ctx.redirect_stdout(_buf15):
+                _sb15 = list_gate_active_source_beads()
             check("SB-15 (ga-3psuuo): routes unreadable → no filtering (every id still looked up), original still resolved",
                   _shown15 == [["ga-djjeq", "wa-foreign1"]]
                   and _sb15 == frozenset({"wa-foreign1", "ga-djjeq", "wa-orig9"}),
                   f"bd show argv ids={_shown15!r} got={_sb15!r}")
+            check("SB-15b (ga-3psuuo): the degraded mode is visible in the log, not silent",
+                  "HQ id prefix unknown" in _buf15.getvalue(), f"stdout={_buf15.getvalue()!r}")
 
             # SB-16: _hq_id_prefix() reader — vazio/ilegível/ausente all → None
             # (= "não filtra", the conservative state), valid "." row → its prefix.
