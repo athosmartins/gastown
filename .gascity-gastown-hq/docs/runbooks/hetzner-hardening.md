@@ -4,6 +4,7 @@
 
 • O que esta fatia é · O guarda de clone (como decide, o que não cobre) · Como o guarda decide (regra completa) · A trava no provider e como liberar
 • `rm -rf` sem humano no teclado (MEDIDO) · Prova real no servidor (MEDIDO) · Instalação e como repetir
+• Fatia 6b: skills que ficam fora do servidor, por nome · Auditoria do servidor (como repetir, resultado de 17/10, o que decidir)
 • Achados que a 6c precisa tratar
 
 Bead ga-2hd02v.1.5 (decisão Q4 do Mayor: sessão remota só é liberada depois que existir um substituto do `gt tap guard cross-clone-block`), fatia **6a** (ga-2hd02v.1.5.1) de 3. Repartida de antemão na Epic Split Convention para caber no teto do gate (E11): 6b (.1.5.2) = skills com CPF/CNPJ fora + auditoria de segredo/dado; 6c (.1.5.3) = hooks `keep` no Linux, latência dos hooks gc, sessão ponta a ponta. **Esta fatia não libera sessão real.** Ela entrega a trava; liberar é decisão explícita do Mayor. Fora desta fatia: usuário Unix por sessão (sem bead) e, do `remote-worker-bundle.md`, tudo além do que ela mediu (guarda, `ask`).
@@ -100,6 +101,46 @@ bash $S/remote-clone-guard.selftest.sh; bash $S/remote-bundle-build.selftest.sh;
 ```
 
 **Defeito corrigido junto**: o `push-bundle` recusava o `settings.json` do servidor assim que o claude gravava `theme`/`agentPushNotifEnabled` (chave alheia ao bundle). `hetzner-claude.py` agora preserva `theme` e `agentPushNotifEnabled` do próprio servidor (`OWN_KEYS`) e continua recusando qualquer outra chave alheia (caso no `hetzner-claude.selftest.sh`, 256 casos).
+
+## Fatia 6b: skills que ficam fora do servidor, por nome
+
+`remote-bundle-build.py build --skills` deixa de fora, **POR NOME** (igualdade, antes de ler a skill), 6 das 18 skills do dog, e termina 0 com 12 (MEDIDO 17/10 no papel `gastown.dog-1`; antes recusava na 1ª). O manifest lista `excluded_skills` (o que FOI pulado) e `excluded_skills_missing` (nome pedido que não existe em `skills/`, com `AVISO` no stderr: skill renomeada recusa pelo conteúdo e o nome velho avisa). `--exclude-skill NOME` acrescenta; sem `--skills`, ou com nome que não é pasta exata, é erro de uso (2).
+
+| lista | skills | por quê |
+|---|---|---|
+| `SKILLS_NOT_ON_SERVER` (decisão do Mayor, Q3) | `censec-inventario-extrajudicial`, `cnd-municipal-pbh`, `cnd-trabalhista-cndt` | valor em formato de CPF/CNPJ (1, 3 e 1 linhas) |
+| `SKILLS_MINI_ONLY` (**MEDIDO, não estava na bead**) | `corrigir-imovel-do-anuncio`, `rea-scraper-first`, `wa-worker-session-protocol` | UMA linha cada com caminho do mini (`/Users/athos/gt/...`: daemon de anúncios do WA, `publicar_mockup.py`, cópia da `browser-control`); só funcionam com o mini |
+
+A bead só conhecia as 3 primeiras porque o builder para na 1ª recusa. **As guardas de CPF/CNPJ e de `/Users/` não foram afrouxadas**: uma 4ª skill com CPF, com CNPJ ou com caminho do mini ainda recusa o build (casos e mutantes no selftest). Para uma skill voltar: tirar o nome da lista quando ela deixar de citar o mini.
+
+## Auditoria do servidor (repetível)
+
+`bash scripts/hetzner-audit.sh` (no mini; só lê o servidor por ssh; o único arquivo que cria lá é um `mktemp` que sai no `trap`). Cinco verificações, cada uma `LIMPO | ACHADO | NAO-CONSEGUI`; o terceiro estado **nunca** vira limpo; saída 0 limpo · 1 algum achado (vale mesmo que outra verificação tenha caído) · 3 nada achado mas algo não lido. Selftest: `bash scripts/hetzner-audit.selftest.sh` (79/79, 5 mutantes).
+
+| verificação | como | reaproveita |
+|---|---|---|
+| `processo` | nenhum `claude auth login` em execução | — |
+| `credenciais` | só 3 arquivos, modo 600 e dono `runner`; qualquer outro com chave privada/token **por conteúdo**, ou loja conhecida (`.netrc`, `.git-credentials`, `.aws`…), é achado | — |
+| `github-e-espelho` | o `scan` que o servidor já tem | `hetzner-remote-git.sh scan` |
+| `dados` | NOME · GRANDE · JWT · CONTEÚDO (telefones/CPFs) em todo diretório de topo do home e em cada filho de `gt-remote/` que não é ferramenta; diretório novo é auditado | **`node_audit`** da semeadura, via `mbp-run.sh --host linux --audit-node DIR[::maxdepth=N\|::prune=a:b/c]` (os padrões de `find` vivem só lá; ganhou um argumento opcional, sem ele a semeadura é a mesma) |
+| `backup-de-bead` | `.dolt`, `.dolt-backup`, `issues.jsonl`, `beads*.jsonl`, `.beads` com algo além de lock | — |
+
+**As credenciais são 3, não 2**: o login do claude (`~/.claude/.credentials.json`), a chave do atalho ssh→mini (`~/.ssh/mini_shim_ed25519`) **e a chave do espelho git** (`~/gt-remote/keys/gt_mirror`, criada na fatia 4: lê só o espelho do mini, nenhum GitHub). A bead citava 2; a 3ª é por desenho e está na lista `CRED_ALLOW` com esse motivo — se o Mayor não a quer, é tirá-la da lista e o achado aparece.
+
+**Resultado de 17/10, 14:13Z, em `urblink-teste-1`** (ssh `hetzner-teste`, 85 s): `processo` LIMPO · `credenciais` LIMPO (3 de 3, modo 600) · `backup-de-bead` LIMPO (`.beads` só tem `eventkit.lock`) · `github-e-espelho` LIMPO (35.667 pares blob/caminho conferidos, "scan credenciais: limpo") · **`dados` ACHADO, 41 itens em 4 grupos**. O `claude auth login` esquecido (pid 370419): **não existe mais** (`ps -p 370419` vazio às 14:14Z; o servidor não reiniciou desde 13/10 15:02, então foi encerrado de fato) e nenhum processo `claude` roda; a credencial segue `600 runner`, última escrita 16/10 01:57Z.
+
+Os 4 grupos de `dados`, medidos (só nomes, tamanhos e contagens; nenhum valor lido):
+
+* **`~/shared/data/*.db`** — sobra de teste de 13/10 18:24:59 (arquivo criado e preenchido em 0,3 s). `conversation_history.db` e `queue.db` com 0 linhas, `construtoras.db` com 0 bytes, **`demand_assignments.db` com 32 linhas: 13 em `demands` (colunas `empresa`, `regiao`, `preco_ref`, `comissao`, `disposicao_pagar`… = perfil de demanda das construtoras, dado comercial de cliente) e 19 em `outreach_config`** (todas com o carimbo da criação). **É o único achado que bate com "dado de cliente".**
+* **`~/.voicebot-cost.db`** (16 KB, 1 linha em `voicebot_cost_guard_state`) — estado de guarda de custo, não dado de lead.
+* **`~/.whatsapp-automation/logs/` e `~/.gastown/logs/`** — 5 logs, 4 vazios; `itbi_drive_bridge.log` tem 126 linhas (8 KB). O scanner de CONTEÚDO (telefones/CPFs) não achou lista; o conteúdo do log não foi lido.
+* **`~/gt-remote/traco-bim/estatico/`** — 14 arquivos SQLite e `lotes_bh.geojson` (~1,1 GB; `SEMENTE` diz `lotes=296986`, 14/10 19:20): cadastro de lotes e camadas da PBH, carga de **outra bead** em uso agora (há `runs/athos-82286-…` de hoje). Pelos nomes é dado municipal, não de lead/cliente, mas a procedência não foi verificada.
+
+`~/.duckdb` (76 MB) é aceito sozinho só enquanto tem **apenas** `*.duckdb_extension`/`.info` (conferido a cada rodada). Fora do `dados` limpo: `wa-base`, `hq-base`, `mirror`, `slots`, `scrape`, `.claude` (sem `plugins`, `downloads`, `cache` e o venv de `security/`), `.config`, `.beads`, `logs`.
+
+**O que esta fatia NÃO fez:** apagar. O servidor é compartilhado com o ga-zri39b e remover é decisão de quem manda nele. Para zerar o único achado de cliente: `ssh hetzner-teste 'rm -r ~/shared ~/.voicebot-cost.db ~/.whatsapp-automation/logs ~/.gastown/logs'` (tudo regenerável por teste); o `traco-bim` pede uma decisão separada (aceitar como dado público, com quem decidiu citado, ou tirar do servidor).
+
+**Limites.** Não lê por conteúdo `.git`/`repo.git`, `venv*`, `site-packages`, `node_modules`, `~/.cache`, `~/.local/share/claude` nem `tests/`, `fixtures/`, `*.selftest.*`, `test_*` (tokens falsos por desenho: 10 de 10 achados da 1ª rodada eram isso). Chave sem cabeçalho PEM e token de formato novo passam pela busca de conteúdo. A lista de diretórios vem do servidor a cada rodada; um nome com espaço ou caractere fora de `[A-Za-z0-9_./-]` derruba o `dados` para NAO-CONSEGUI (lado fechado).
 
 ## Achados que a 6c precisa tratar
 

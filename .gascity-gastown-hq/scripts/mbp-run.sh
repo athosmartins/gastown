@@ -163,7 +163,7 @@ usage() { sed -n '2,/^[^#]/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//' >&2; }   # só 
 
 repo=""; dir="$PWD"; mode=pytest; seed_repo=""
 pause_arg=""; host_sel=auto
-pushes=(); pulls=(); envs=(); keep=0
+pushes=(); pulls=(); envs=(); keep=0; audit_dirs=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --host) host_sel="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
@@ -174,6 +174,7 @@ while [ $# -gt 0 ]; do
     --check) mode=check; shift ;;
     --remote-pause) mode=remote_pause; pause_arg="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
     --install-tools) mode=install_tools; shift ;;
+    --audit-node) mode=audit_node; audit_dirs+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
     --push) pushes+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
     --pull) pulls+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
     --env) envs+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
@@ -805,26 +806,34 @@ shadow_finish() { # rc_do_nó arquivo_da_saída_do_nó "$@" (args originais). Es
 # hash_valid: o shasum que falhou deixa o hash VAZIO, e um .freeze-hash/.sp-hash que o ssh não leu também vem vazio — "" = "" não pode virar "já batem". Só sha1 hex de 40 caracteres é hash;
 # qualquer outra coisa é "não consegui calcular" (quem chama devolve 97), nunca "bate" e nunca algo para gravar no remoto.
 hash_valid() { case "$1" in ""|*[!0-9a-f]*) return 1 ;; esac; [ "${#1}" -eq 40 ]; }
-node_audit() { # $1 = dir remoto relativo ao home
+node_audit() { # $1 = dir remoto relativo ao home · $2 (opcional) = UMA palavra sem espaço que o script remoto vira prefixo do find: maxdepth=N | prune=a:b/c (relativos a $1); vazio = a semeadura, sem mudança
   local out b64 partial
+  AUDIT_STATE=NAO-CONSEGUI   # o que o --audit-node lê: só ACHADO e LIMPO são afirmados abaixo; tudo o mais fica "não consegui"
   b64=$(base64 < "$HERE/hetzner-pii-scan.py" 2>/dev/null | tr -d '\n')
   [ -n "$b64" ] || { say "não consegui ler hetzner-pii-scan.py para auditar o CONTEÚDO no $HNAME — a semeadura não vale"; return 98; }
-  out=$(rssh_s "$1" "$b64" 2>/dev/null <<'EOF'
+  out=$(rssh_s "$1" "$b64" ${2:+"$2"} 2>/dev/null <<'EOF'
 # MBP:AUDIT
+set -f
 cd "$HOME/$1" 2>/dev/null || { echo AUDIT_ERR; exit 3; }
+P=(); case "${3:-}" in
+  "") ;;
+  maxdepth=[0-9]) P=(-maxdepth "${3#maxdepth=}") ;;
+  prune=*) IFS=: read -r -a PD <<< "${3#prune=}"; for d in "${PD[@]}"; do P+=(-path "./$d" -prune -o); done ;;
+  *) echo AUDIT_ERR; exit 3 ;;   # palavra que não conheço: não audita "parcialmente"
+esac
 E=$(mktemp) || { echo AUDIT_ERR; exit 3; }
 trap 'rm -f "$E" "$E.p"' EXIT
-find . \( -name '.env' -o -name '.env.*' -o -name '*.pem' -o -name '*.key' -o -name '*.p12' -o -name '*.pfx' -o -name 'id_rsa*' -o -name 'id_ed25519*' -o -name '*.kdbx' \
+find . "${P[@]}" \( -name '.env' -o -name '.env.*' -o -name '*.pem' -o -name '*.key' -o -name '*.p12' -o -name '*.pfx' -o -name 'id_rsa*' -o -name 'id_ed25519*' -o -name '*.kdbx' \
   -o -name 'credentials*.json' -o -name 'client_secret*.json' -o -name 'cookies*.json' -o -name '*.session' -o -name '*.duckdb*' -o -name '*.db' -o -name '*.db-*' \
   -o -name '*.sqlite*' -o -name '*.parquet' -o -name '*.wal' -o -name '*.gz' -o -name '*.pkl' -o -name '*.xlsx' -o -name '*.csv' -o -path './shared' -o -path './shared/*' \
   -o -path './data/*' -o -path './logs/*' \
   -o -iname '.*token*' -o -iname '*token' -o -iname '*token*.json' -o -iname '*token*.txt' -o -iname '*token*.yaml' -o -iname '*token*.yml' -o -iname '*token*.ini' \
   -o -name '.netrc' -o -name '.npmrc' -o -name '.pgpass' -o -iname 'secrets*.json' -o -iname 'secret*.y*ml' -o -iname 'service_account*.json' -o -name '*.keystore' -o -name '*.pickle' \) \
   -print 2>"$E" | sed 's#^\./##' | grep -v -E '^\.env\.example$' | head -20 | sed 's/^/AUDIT_BAD NOME /'
-find . -type f -size +4096k -print 2>>"$E" | sed 's#^\./##' | head -20 | sed 's/^/AUDIT_BAD GRANDE /'
-find . -type f \( -name '*.json' -o -name '*.txt' \) ! -path './tests/*' ! -name '*.example.json' -size -4097k \
+find . "${P[@]}" -type f -size +4096k -print 2>>"$E" | sed 's#^\./##' | head -20 | sed 's/^/AUDIT_BAD GRANDE /'
+find . "${P[@]}" -type f \( -name '*.json' -o -name '*.txt' \) ! -path './tests/*' ! -name '*.example.json' -size -4097k \
   -exec grep -lE 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' {} + 2>>"$E" | sed 's#^\./##' | head -20 | sed 's/^/AUDIT_BAD JWT /'
-find . -type f -size -4097k -print 2>>"$E" | sed 's#^\./##' \
+find . "${P[@]}" -type f -size -4097k -print 2>>"$E" | sed 's#^\./##' \
   | python3 -I -c 'import base64,sys; c=base64.b64decode(sys.argv[1]).decode(); sys.argv=["x"]+sys.argv[2:]; exec(c)' "$2" . > "$E.p" 2>>"$E"
 rc=$?
 # o que o scanner JÁ achou sai ANTES de qualquer AUDIT_ERR: um arquivo ilegível (o scanner devolve rc 3) ou qualquer stderr do find/grep não pode jogar fora a lista de telefones que ele achou (achado + "não terminei" é ALARME, não "não consegui auditar").
@@ -843,9 +852,11 @@ EOF
     # o ALARME não desliga o nó sozinho: a bandeira segue ligada e as baterias seguem clonando (cp -a) os espelhos desta base — por isso a mensagem manda desligar
     say "ALARME: dado ou segredo no destino ($HNAME:$1) — o filtro e o node_guard deixaram passar (NOME · GRANDE · JWT · CONTEUDO = telefones<TAB>CPFs<TAB>caminho, só contagens).$partial Desligue o nó AGORA: mbp-offload.sh node off (senão as baterias continuam clonando espelhos desta base):"
     printf '%s\n' "$out" | grep '^AUDIT_BAD ' | sed 's/^AUDIT_BAD /  /' >&2
+    AUDIT_STATE=ACHADO
     return 98
   fi
   case "$out" in *AUDIT_DONE*) ;; *) say "não consegui auditar $1 no $HNAME — a semeadura não vale"; return 98 ;; esac
+  AUDIT_STATE=LIMPO
   return 0
 }
 seed_node() {
@@ -909,6 +920,23 @@ if [ "$mode" = check ]; then
     echo "node_shadow_window_open=$([ -f "$NODE_FLAG" ] && { shadow_window_open && echo 1 || echo 0; } || echo -)"   # sem bandeira não há janela
   fi
   exit $rc
+fi
+
+# ---- auditoria do nó (ga-2hd02v.1.5.2): o node_audit da semeadura, pasta a pasta, com o veredito de cada uma em stdout: AUDIT-NODE <LIMPO|ACHADO|NAO-CONSEGUI> <pasta>.
+# Quem chama (hetzner-audit.sh) lê essas linhas; "98" sozinho não diz se achou ou se não conseguiu olhar, e os dois não podem virar o mesmo valor.
+#   --audit-node DIR[::maxdepth=N | ::prune=a:b/c]  DIR relativo ao home do nó · o que vem depois de :: o script remoto vira prefixo do find (só olhar; nada executa). Sai 0 só se TODAS limpas.
+if [ "$mode" = audit_node ]; then
+  [ "$HOSTKIND" = linux ] || { say "--audit-node é do nó Linux: use --host linux"; exit 97; }
+  [ "${#audit_dirs[@]}" -gt 0 ] || { say "uso: --host linux --audit-node DIR[::maxdepth=N|::prune=a:b] [--audit-node ...]"; exit 97; }
+  arc=0; AUDIT_FA_RE='^(maxdepth=[0-9]|prune=[A-Za-z0-9_./-]+(:[A-Za-z0-9_./-]+)*)$'
+  for spec in "${audit_dirs[@]}"; do
+    d="${spec%%::*}"; fa=""; [ "$spec" = "$d" ] || fa="${spec#*::}"
+    case "$d" in ""|/*|*..*|*[!A-Za-z0-9_./-]*) say "--audit-node '$spec': a pasta é relativa ao home, sem .. e só [A-Za-z0-9_./-]"; exit 97 ;; esac
+    [[ -z "$fa" || ( "$fa" =~ $AUDIT_FA_RE && "$fa" != *..* ) ]] || { say "--audit-node '$spec': depois de :: só maxdepth=N ou prune=a:b/c (relativos à pasta, sem ..)"; exit 97; }
+    node_audit "$d" "$fa" || arc=98
+    printf 'AUDIT-NODE %s %s\n' "${AUDIT_STATE:-NAO-CONSEGUI}" "$d"
+  done
+  exit $arc
 fi
 
 # ---- a chave "pausar até eu liberar" do lado do MBP (~/gt-remote/PAUSE); quem chama é o mbp-offload.sh ----------------
