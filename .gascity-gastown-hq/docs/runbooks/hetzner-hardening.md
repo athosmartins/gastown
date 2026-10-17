@@ -45,19 +45,15 @@ Texto que antes ficava no topo do `remote-clone-guard.py` (saiu de lá para cabe
 
 ## A trava no provider e como liberar
 
-> **Fatia 6a-ii (ga-2hd02v.1.5.8) — ainda NÃO neste merge.** A 6a foi fatiada no gate-fix 8 (teto E11): esta fatia entrega só o guarda, dormente (nada o instala). O código descrito aqui (`gc-session-ssh`, `remote-bundle-build.py`, `hetzner-claude.py`) está na branch `wip/ga-2hd02v.1.5.1-completa` e entra pela .1.5.8.
-
 
 `gc-session-ssh start` só abre sem liberação o que se chama `remote-e2e-<x>` ou `remote-test-<x>` (a sessão mínima de teste). Qualquer outro nome:
 
 1. precisa de `real_sessions_released_by` (texto não vazio) na entrada do host em `.gc/session-ssh.json` — **decisão explícita do Mayor**; ausente, vazio ou não-texto = recusa sem abrir ssh;
 2. e, **no host, dentro do mesmo script do start**, o `sha256` de `<remote_home>/.claude/hooks/remote-clone-guard.py` tem que ser igual ao do guarda irmão do provider **e** `python3 -I <guarda> --selfcheck <remote_home>/.claude/settings.json <pasta da sessão>` tem que aprovar; senão o script sai 12 e nada abre (o provider devolve erro, exit 1, com o motivo).
 
-Para liberar: pôr `"real_sessions_released_by": "<quem decidiu, quando>"` na entrada do host. Para travar de novo: tirar a chave. O `--dry-run` mostra `session_kind` "teste" ou "real". Selftest do provider **182 de 182** (156 casos + 25 mutantes pegos + o controle contra um stub).
+Para liberar: pôr `"real_sessions_released_by": "<quem decidiu, quando>"` na entrada do host. Para travar de novo: tirar a chave. O `--dry-run` mostra `session_kind` "teste" ou "real". Selftest do provider **277 de 277** (229 casos + 47 mutantes pegos + o controle contra um stub).
 
 ## `rm -rf` sem humano no teclado
-
-> **Fatia 6a-ii (ga-2hd02v.1.5.8) — ainda NÃO neste merge.** A 6a foi fatiada no gate-fix 8 (teto E11): esta fatia entrega só o guarda, dormente (nada o instala). O código descrito aqui (`gc-session-ssh`, `remote-bundle-build.py`, `hetzner-claude.py`) está na branch `wip/ga-2hd02v.1.5.1-completa` e entra pela .1.5.8.
 
 
 Regra `ask` vale **até com `--dangerously-skip-permissions`** e `deny` é avaliado antes de `ask`. No servidor ninguém aperta a tecla.
@@ -89,8 +85,6 @@ Mesmo claude, `--dangerously-skip-permissions`, `CLAUDE_PROJECT_DIR` = worktree 
 | Write em `…/wt/own/probe-5.txt` | criado |
 
 ## Instalação e como repetir
-
-> **Fatia 6a-ii (ga-2hd02v.1.5.8) — ainda NÃO neste merge.** A 6a foi fatiada no gate-fix 8 (teto E11): esta fatia entrega só o guarda, dormente (nada o instala). O código descrito aqui (`gc-session-ssh`, `remote-bundle-build.py`, `hetzner-claude.py`) está na branch `wip/ga-2hd02v.1.5.1-completa` e entra pela .1.5.8.
 
 
 ```bash

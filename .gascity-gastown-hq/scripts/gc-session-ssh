@@ -10,6 +10,8 @@ USO
   GC_SESSION=exec:<cidade>/scripts/gc-session-ssh                (ou, no híbrido, `remote_exec` — patch em docs/pending-engine-window/)
   gc-session-ssh <op> <sessão> [args]        o engine chama assim, com o JSON do start na entrada padrão
   gc-session-ssh --dry-run start <sessão> < start.json     (ou GC_SSH_DRYRUN=1) imprime o que rodaria no host e NÃO conecta
+                                                           (`would_refuse`: a recusa LOCAL de política — sessão real sem liberação… — que o start de verdade daria; null = nenhuma recusa
+                                                           local, NÃO "o start vai ser aceito": o sha e o --selfcheck do guarda só rodam no host, no start de verdade)
   gc-session-ssh gate <host>      (não é do protocolo do engine) o veredito de um start AGORA nesse host, sem abrir nada: JSON, exit 0/1
 
 O QUE FAZ
@@ -45,23 +47,30 @@ O QUE NÃO FAZ (cada item é de outra fatia ou é recusa de propósito)
   parece segredo (TOKEN, SECRET, PASSWORD, KEY...) não vai, a menos que o nome esteja em `env_allow` da config. check-image,
   watch-startup, run-live e qualquer operação desconhecida: exit 2 ("não suportado"), sem tocar em sessão nenhuma.
   Meta (set/get/remove-meta) fica no MINI (<estado>/meta): nada disso vai para o servidor.
+  SESSÃO REAL NÃO ABRE sem a liberação e sem o guarda de clone (ga-2hd02v.1.5, decisão Q4 do Mayor): só abre o que se chama
+  remote-e2e-<x> ou remote-test-<x> (a sessão mínima de teste). Qualquer outro nome exige (1) `real_sessions_released_by` na config do host
+  — decisão EXPLÍCITA do Mayor; ausente, vazio ou não-texto = recusa, sem ssh — e (2) conferir NO host, dentro do mesmo script do start,
+  que {remote_home}/.claude/hooks/remote-clone-guard.py é byte a byte o do repositório e que o `--selfcheck` dele aprova as settings
+  do host e a pasta da sessão (hook em Bash/Edit/Write/MultiEdit/NotebookEdit, com `|| exit 2`, sem disableAllHooks em nenhuma camada); senão exit 12 do script e nada abre.
 
 CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta acima de scripts/)
   {"default_host": "hetzner", "hosts": {"hetzner": {"ssh": "hetzner-teste", "cap": 4,
      "remote_root": "/home/runner/gt-remote/bundle", "remote_home": "/home/runner"}}}
   obrigatórios: ssh (alias/destino), cap (teto de sessões deste host, contado SÓ no socket do provider, separado do teto do mini),
   remote_root (= --remote-root do remote-bundle-build.py), remote_home. opcionais: socket (gc-remote), connect_timeout (10),
-  timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home. Só para o notebook (MBP): path_extra [] (dirs
+  timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima). Só para o notebook (MBP): path_extra [] (dirs
   absolutos à frente do PATH do ssh sem login: /opt/homebrew/bin), presence_gate (true), gate_cmd ([lista]), presence_lib (padrão
   <remote_home>/gt-remote/bin/mbp-presence.sh), watch_s (5), sleeps (true). Estado no mini:
   $GC_EXEC_STATE_DIR ou <cidade>/.gc/runtime/session-ssh, sempre em <estado>/<host>/. Não há padrão para o cap: sem ele não abre sessão.
 
 CÓDIGOS  0 ok · 1 erro (mensagem em stderr; "already exists" no start vira ErrSessionExists no engine) · 2 operação não suportada
+  (dentro do script do host, que o provider traduz em exit 1 com a mensagem: 10 teto, 11 já existe, 12 recusa de política no host: sessão real sem guarda de clone verificado, ou host de presença sem a biblioteca)
 """
 from __future__ import annotations
 
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -80,7 +89,9 @@ ENV_OK = re.compile(r"GC_[A-Z0-9_]+|TERM|LANG|LC_[A-Z_]+|TZ")
 SECRETISH = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIVATE", re.I)
 IGNORED = ("pre_start", "session_setup", "session_setup_script", "session_live", "pack_overlay_dirs", "overlay_dir", "copy_files", "nudge")
 BEGIN, END = "@@GC-BEGIN@@", "@@GC-END@@"
-EX_CAP, EX_EXISTS = 10, 11
+EX_CAP, EX_EXISTS, EX_POLICY = 10, 11, 12
+TEST_RE = re.compile(r"remote-(?:e2e|test)-[A-Za-z0-9_-]+")  # a sessão MÍNIMA de teste: a única que abre sem a liberação e sem o guarda de clone
+GUARD = "remote-clone-guard.py"
 # o ssh leva `sh -c '<RUNNER>'` (uma string, qualquer shell de login a entende) e o script vai pela entrada padrão: não há limite de
 # argv (o prompt tem dezenas de KB) e o script lê a entrada inteira ANTES de rodar, então comando nenhum dele a come.
 RUNNER = 'umask 077; f=$(mktemp) || exit 125; cat >"$f"; sh "$f" </dev/null; rc=$?; rm -f "$f"; exit $rc'
@@ -158,6 +169,8 @@ class Cfg:
         if not isinstance(self.gate_cmd, list) or not all(isinstance(x, str) and x for x in self.gate_cmd):
             raise Fail(f"host {self.host}: 'gate_cmd' tem que ser uma lista de textos")
         self.watch_s = self.num(h, "watch_s", 5)
+        rb = h.get("real_sessions_released_by")
+        self.released = rb.strip() if isinstance(rb, str) else ""  # só a decisão explícita do Mayor liga; ausente/vazio/não-texto = desligado
         base = os.environ.get("GC_EXEC_STATE_DIR") or os.path.join(self.city_guess, ".gc", "runtime", "session-ssh")
         self.state = os.path.join(base, re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.host)))
 
@@ -400,6 +413,24 @@ def op_gate(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     return 0 if v["ok"] else 1
 
 
+def real_gate(cfg: Cfg, name: str, work_dir: str) -> str:
+    """'' = sessão de teste (passa); senão o trecho de sh que confere o guarda de clone NO host. Sem liberação, ou sem como conferir → Fail."""
+    if TEST_RE.fullmatch(name):
+        return ""
+    if not cfg.released:
+        raise Fail(f"sessão real {name!r} recusada em {cfg.host}: falta 'real_sessions_released_by' na configuração do host (decisão explícita do "
+                   f"Mayor, ga-2hd02v.1.5); por enquanto só abrem remote-e2e-<x> e remote-test-<x>")
+    try:
+        with open(os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])), GUARD), "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+    except OSError as e:
+        raise Fail(f"sessão real {name!r} recusada: não consegui ler o {GUARD} do repositório para conferir o do host: {e}")
+    g, st = q(f"{cfg.home}/.claude/hooks/{GUARD}"), q(f"{cfg.home}/.claude/settings.json")
+    return (f'h=$( {{ sha256sum {g} || shasum -a 256 {g}; }} 2>/dev/null | cut -d" " -f1)\n'
+            f'[ "$h" = {sha} ] || {{ echo "sessão real {name} recusada: {GUARD} ausente ou diferente do repositório no host" >&2; exit {EX_POLICY}; }}\n'
+            f'o=$(python3 -I {g} --selfcheck {st} {q(work_dir)} 2>&1) || {{ echo "sessão real {name} recusada: o --selfcheck do guarda reprovou as settings do host: $o" >&2; exit {EX_POLICY}; }}\n')
+
+
 def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     try:
         req = json.loads(sys.stdin.read() or "{}")
@@ -409,6 +440,14 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
         raise Fail("start: a entrada tem que ser um objeto JSON")
     p = plan_start(cfg, name, req)
     cap = cfg.cap
+    gate, would_refuse = "", None  # `gate` = o trecho de sh do guarda de clone (sessão real); `cfg.gate` = a regra de presença do MBP — duas regras, as DUAS valem
+    if dry:  # vazio → a recusa local não dispararia (None; o sha e o --selfcheck do guarda só rodam no host, no start de verdade); falhou → o motivo, em vez de um dry-run que finge que abriria
+        try:
+            real_gate(cfg, name, p["work_dir"])
+        except Fail as e:
+            would_refuse = str(e)
+    else:
+        gate = real_gate(cfg, name, p["work_dir"])  # política local primeiro: sessão real sem liberação nem chega a consultar a presença
     if cfg.gate and not dry:  # regra de presença: a cada start, na hora (é o que faz "o Athos voltou → nada novo" valer já na próxima tentativa)
         g = gate_check(cfg)
         if not g["ok"]:
@@ -418,13 +457,13 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     run_dir, exitf = f"{cfg.root}/run", f"{cfg.root}/run/{name}.exit"
     lpath = f"{run_dir}/{name}.sh"
     if dry:
-        print(json.dumps(dict(p, host=cfg.host, session=name, launcher=launcher(cfg, name, p).split("\n"),
+        print(json.dumps(dict(p, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, launcher=launcher(cfg, name, p).split("\n"),
                               gate=cfg.gate_cmd if cfg.gate else None, path_extra=cfg.path_extra,
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0
     body = """s=$(sessions) || exit 1
-printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
+@GATE@printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
 n=$(printf '%s\\n' "$s" | grep -c .)
 [ "$n" -lt @CAP@ ] || { echo "host @HOST@ está no teto: $n de @CAP@ sessões" >&2; exit 10; }
 @PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
@@ -438,6 +477,7 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
                  "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name),
                  "@B64@": q(base64.b64encode(launcher(cfg, name, p).encode()).decode())}.items():
         body = body.replace(k, v)
+    body = body.replace("@GATE@", gate)
     with open(os.path.join(cfg.mkstate(), "lock"), "a") as lf:  # cap + criação são um passo só; entre processos do mini, um por vez
         fcntl.flock(lf, fcntl.LOCK_EX)
         # registra ANTES do ssh: um start ambíguo (ssh cai ou estoura o tempo depois do script já ter rodado no host) deixa o registro,
@@ -446,7 +486,7 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
         rc, out, err = remote(cfg, body, cfg.start_timeout)
         if rc not in (0, EX_EXISTS):
             cfg.mark(name, False)
-    if rc == EX_CAP or rc == EX_EXISTS:
+    if rc in (EX_CAP, EX_EXISTS, EX_POLICY):
         if rc == EX_CAP:
             cfg.event("refused", name, reason="teto do host")
         raise Fail(err or f"start de {name} recusado em {cfg.host} (rc={rc}, sem mensagem)")

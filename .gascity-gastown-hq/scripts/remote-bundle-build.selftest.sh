@@ -35,15 +35,21 @@
 #   mini ficam de fora com --skills (rc 0, manifest `excluded_skills`, nada delas no bundle, nenhum CPF/CNPJ); 4ª skill com CPF / CNPJ / caminho do mini AINDA recusa; nome por igualdade
 #   (a renomeada recusa pelo conteúdo e o nome velho AVISA); nome que não existe avisa e vai para `excluded_skills_missing`; --exclude-skill acrescenta; sem --skills ou com nome que não
 #   é pasta exata (barra, glob, vazio) é erro de uso (2); só excluídas = 0 entregues recusa.
+#   SWAP (ga-2hd02v.1.5): o cross-clone-block do mini vira o remote-clone-guard.py em Bash E em Edit|Write|MultiEdit|NotebookEdit, com `|| exit 2`,
+#   sem o `if` do original; o guarda vai no bundle idêntico ao do repositório e executável; o --selfcheck do guarda aprova as settings geradas;
+#   sem o hook no mini não há swap nem guarda (clone_guard=false); swap fora de PreToolUse, guarda ilegível e guarda com CPF ou /Users/ recusam.
 # CONTROLE NEGATIVO: a tabela POLICY perde a linha de um hook (sed) e o mesmo build TEM que passar a recusar — keep (filter-bash-output.sh)
 #   e drop (gt tap guard cross-clone-block, home-scan-guard, ntfy-on-stop.sh). Skills: sem a exclusão por nome as 3 com CPF/CNPJ recusam; exclusão por substring deixaria a renomeada
 #   passar; sem as linhas de CPF/CNPJ de SECRETS a 4ª skill passaria.
+#   Swap: o builder sem uma peça do swap (`|| exit 2`, o grupo
+#   Edit|Write, o arquivo do guarda, a troca em si) gera settings que o --selfcheck do guarda reprova.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 B="${BUNDLE_BUILD_UNDER_TEST:-$HERE/remote-bundle-build.py}"
 T=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/bundle-selftest.XXXXXX")" && pwd -P)
 trap 'chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 fails=0; n=0
+GUARD=$HERE/remote-clone-guard.py
 ok() { n=$((n+1)); if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; fails=$((fails+1)); fi; }
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 why() { has "$T/err" "$1"; ok $? "  a mensagem diz '$1'"; }
@@ -64,7 +70,7 @@ fixture() {  # fixture DIR — cidade + ~/.claude + papel "dog" com os mesmos ti
   cat > "$h/settings.json" <<EOF
 {"statusLine": {"command": "$h/statusline.sh"}, "model": "opus",
  "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "~/.claude/hooks/ntfy-on-stop.sh"}]}],
-           "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "$d/home/.local/bin/gt tap guard cross-clone-block"}, {"type": "command", "command": "~/.claude/hooks/filter-bash-output.sh"}]}]},
+           "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "$d/home/.local/bin/gt tap guard cross-clone-block", "if": "Bash(git -C *)"}, {"type": "command", "command": "~/.claude/hooks/filter-bash-output.sh"}]}]},
  "permissions": {"allow": ["Bash(git:*)", "Bash(launchctl:*)"], "additionalDirectories": ["$d/gt"]}}
 EOF
   cat > "$c/.gc/settings.json" <<EOF
@@ -86,7 +92,7 @@ EOF
 build() {  # build DIR OUT [extra...] — rc do builder; stderr em $T/err
   local d=$1 o=$2; shift 2
   python3 -I "$B" build --city "$d/gt/.gascity-gastown-hq" --claude-home "$d/home/.claude" --mini-home "$d/home" --role dog \
-    --role-dir "$d/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --out "$o" "$@" 2>"$T/err" >"$T/outp"
+    --role-dir "$d/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$o" "$@" 2>"$T/err" >"$T/outp"
 }
 refuses() {  # refuses NOME DIR [extra...] — exit 3, mensagem, e nada deixado para trás
   local name=$1 d=$2; shift 2; wipe "$d/out"; build "$d" "$d/out" "$@"; local rc=$?
@@ -299,7 +305,7 @@ why "o veredito veio de"
 fresh; for f in 'gt tap guard cross-clone-block' '~/.local/bin/gt tap guard cross-clone-block' '$HOME/.local/bin/gt tap guard cross-clone-block'; do addhook "$T/f/$HS" PreToolUse "$f"; done
 addhook "$T/f/$HS" Stop '$HOME/.claude/hooks/ntfy-on-stop.sh'; addhook "$T/f/$HS" Stop "$T/f/home/.claude/hooks/ntfy-on-stop.sh"; build "$T/f" "$T/f/out"; rc=$?
 [ $rc = 0 ] && jq -e '[.hooks[] | select(.token == "gt tap guard cross-clone-block")] | length == 4' "$T/f/out/manifest.json" >/dev/null \
-  && ! grep -rqiE 'ntfy|cross-clone' "$T/f/out/home"; ok $? "as formas reais do drop (gt nu, ~/.local/bin, \$HOME, caminho absoluto) continuam sendo descartadas (rc=$rc)"
+  && ! grep -rqiE 'ntfy|gt tap guard' "$T/f/out/home/.claude/settings.json" "$T/f/out/city"; ok $? "as formas reais do cross-clone-block (gt nu, ~/.local/bin, \$HOME, caminho absoluto) e as do drop continuam reconhecidas: ntfy sai e o gt é trocado (rc=$rc)"
 
 fresh; build "$T/f" "$T/f/out"; M=$T/f/out/manifest.json
 jq -e '.hooks | length > 0 and all(.command_sha256 | test("^[0-9a-f]{64}$"))' "$M" >/dev/null; ok $? "todo hook do manifest (drop inclusive) guarda o sha256 do comando"
@@ -310,6 +316,67 @@ ok $? "command é só a parte RECONHECIDA do wrapper (prefixo com o caminho do m
 [ "$(jq -r '.hooks[] | select(.token == "ntfy-on-stop.sh") | .command' "$M")" = '~/.claude/hooks/ntfy-on-stop.sh' ]; ok $? "command de um drop de script é o comando inteiro"
 grep -qF '/Users/' "$M"; [ $? = 1 ]; ok $? "nenhum /Users/ no manifest"
 python3 -I "$B" verify "$T/f/out"; ok $? "verify do bundle com command_sha256 no manifest sai 0"
+
+# --- swap (ga-2hd02v.1.5): o cross-clone-block do mini NÃO some — vira o remote-clone-guard.py, em Bash e em Edit/Write ---
+GCMD='python3 -I /home/runner/.claude/hooks/remote-clone-guard.py || exit 2'
+fresh; build "$T/f" "$T/f/out"; rc=$?; O=$T/f/out; M=$O/manifest.json; ST=$O/home/.claude/settings.json; GF=$O/home/.claude/hooks/remote-clone-guard.py
+[ $rc = 0 ] && jq -e --arg c "$GCMD" '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[].command] | index($c) != null' "$ST" >/dev/null; ok $? "swap: o hook Bash do cross-clone-block virou o guarda do servidor, com '|| exit 2' (rc=$rc)"
+jq -e --arg c "$GCMD" '[.hooks.PreToolUse[] | select(.matcher == "Edit|Write|MultiEdit|NotebookEdit") | .hooks[].command] == [$c]' "$ST" >/dev/null; ok $? "swap: Edit|Write|MultiEdit|NotebookEdit chamam o guarda, uma vez"
+! grep -q 'gt tap guard\|"if"' "$ST"; ok $? "swap: nem o gt nem o 'if: Bash(git -C *)' do original ficam nas settings"
+cmp -s "$GUARD" "$GF" && [ -x "$GF" ]; ok $? "swap: o guarda vai no bundle idêntico ao do repositório e executável"
+jq -e --arg c "$GCMD" '.clone_guard == true and ([.hooks[] | select(.verdict == "swap")] | length == 1) and ((.hooks[] | select(.verdict == "swap") | .replaced_by) == $c)' "$M" >/dev/null; ok $? "swap: o manifest diz clone_guard=true e, no hook, o que o substituiu (replaced_by)"
+has "$T/outp" "clone_guard=true"; ok $? "swap: a linha ok do build diz clone_guard=true (quem lê só a saída sabe que o servidor ficou com o guarda)"
+jq -e '.hooks[] | select(.verdict == "swap") | (.command | startswith("gt tap guard")) or (.command | endswith("cross-clone-block"))' "$M" >/dev/null; ok $? "swap: o manifest guarda o comando ORIGINAL reconhecido (auditável)"
+sed "s#/home/runner/.claude#$O/home/.claude#g" "$ST" > "$T/s.json"; python3 -I "$GF" --selfcheck "$T/s.json" >/dev/null 2>"$T/err"; ok $? "swap: o --selfcheck do guarda aprova as settings GERADAS (as 5 ferramentas, '|| exit 2')"
+python3 -I "$B" verify "$O"; ok $? "swap: verify do bundle com o guarda sai 0"
+fresh; jq 'del(.hooks.PreToolUse[0].hooks[0])' "$T/f/$HS" > "$T/m.json" && cp "$T/m.json" "$T/f/$HS"; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && jq -e '.clone_guard == false' "$T/f/out/manifest.json" >/dev/null && [ ! -e "$T/f/out/home/.claude/hooks/remote-clone-guard.py" ] && ! grep -q remote-clone-guard "$T/f/out/home/.claude/settings.json"
+ok $? "swap: sem o cross-clone-block no mini não há swap nem guarda no bundle (clone_guard=false; quem decide se isso basta é o provider) (rc=$rc)"
+has "$T/outp" "clone_guard=false" && ! has "$T/outp" "clone_guard=true"; ok $? "swap: sem o hook no mini a linha ok diz clone_guard=false (o silêncio não pode parecer 'tem guarda')"
+fresh; addhook "$T/f/$HS" Stop 'gt tap guard cross-clone-block'
+refuses "cross-clone-block em outro evento que não PreToolUse (o swap seria uma guarda que não guarda)" "$T/f"
+why "só é trocado em PreToolUse"
+fresh; refuses "guarda ilegível (--clone-guard aponta para arquivo que não existe)" "$T/f" --clone-guard "$T/nao-existe.py"
+cp "$GUARD" "$T/g.py"; printf '# cliente %s.%s.%s-%s\n' 111 222 333 44 >> "$T/g.py"
+fresh; refuses "guarda com CPF dentro" "$T/f" --clone-guard "$T/g.py"
+why "parece conter CPF"
+cp "$GUARD" "$T/g.py"; printf '# %s\n' "/Users/fulano/x" >> "$T/g.py"
+fresh; refuses "guarda com /Users/ dentro" "$T/f" --clone-guard "$T/g.py"
+why "caminho do mini"
+# --- ask vira deny (ga-2hd02v.1.5): no servidor ninguém aperta a tecla, e `ask` vale até com --dangerously-skip-permissions (MEDIDO lá: o rm -rf fica parado)
+ASKS='["Bash(rm -rf:*)", "Bash(sudo:*)"]'
+fresh; jq --argjson a "$ASKS" '.permissions.ask = $a' "$T/f/$HS" > "$T/m.json" && cp "$T/m.json" "$T/f/$HS"; build "$T/f" "$T/f/out"; rc=$?; O=$T/f/out
+[ $rc = 0 ] && jq -e '(.permissions | has("ask") | not) and ((.permissions.deny | index("Bash(rm -rf:*)")) != null) and ((.permissions.deny | index("Bash(sudo:*)")) != null)' "$O/home/.claude/settings.json" >/dev/null; ok $? "ask→deny: as regras ask do user saem como deny e a chave ask some (rc=$rc)"
+! find "$O" -name 'settings*.json' -exec jq -e '.permissions | has("ask")' {} \; 2>/dev/null | grep -q true; ok $? "ask→deny: nenhum settings do bundle (home, city, papel) ficou com a chave ask"
+jq -e '.asks_to_deny == {"user": 2}' "$O/manifest.json" >/dev/null; ok $? "ask→deny: o manifest conta por camada (asks_to_deny = {user: 2})"
+jq -e '.permissions.deny == ["Bash(sudo:*)"]' "$O/city/settings.json" >/dev/null; ok $? "ask→deny: a camada city (que já tinha deny) não é tocada"
+fresh; jq --argjson a "$ASKS" '.permissions.ask = $a | .permissions.deny = ["Bash(sudo:*)"]' "$T/f/$HS" > "$T/m.json" && cp "$T/m.json" "$T/f/$HS"; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && jq -e '.permissions.deny == ["Bash(sudo:*)", "Bash(rm -rf:*)"]' "$T/f/out/home/.claude/settings.json" >/dev/null; ok $? "ask→deny: regra que já era deny não duplica, a ordem é a do deny e depois a do ask (rc=$rc)"
+fresh; build "$T/f" "$T/f/out"; jq -e '.asks_to_deny == {}' "$T/f/out/manifest.json" >/dev/null; ok $? "ask→deny: sem ask no mini, asks_to_deny vem vazio"
+fresh; jq '.permissions.ask = "Bash(rm -rf:*)"' "$T/f/$HS" > "$T/m.json" && cp "$T/m.json" "$T/f/$HS"
+refuses "ask que não é lista (uma string viraria uma regra deny por letra e a original sumiria)" "$T/f"; why "não é lista"
+askmut() {  # o builder sem a conversão deixa o ask passar: a checagem de cima TEM que reprovar
+  fresh; jq --argjson a "$ASKS" '.permissions.ask = $a' "$T/f/$HS" > "$T/m.json" && cp "$T/m.json" "$T/f/$HS"; sed "$2" "$B" > "$T/mutant.py"
+  if cmp -s "$B" "$T/mutant.py"; then ok 1 "mutante '$1': o sed não mudou nada"; return; fi
+  wipe "$T/f/mut"; python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
+    --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" 2>/dev/null
+  if [ $? != 0 ]; then ok 0 "mutante '$1' pego (o build recusou)"; return; fi
+  jq -e '.permissions | has("ask")' "$T/f/mut/home/.claude/settings.json" >/dev/null; ok $? "mutante '$1' pego: o ask passou para o bundle"
+}
+askmut "sem a conversão ask→deny" 's/asks = out.pop("ask", \[\])/asks = []/'
+swapmut() {  # swapmut DESCRIÇÃO SED — o builder sem uma peça do swap gera settings/bundle que o --selfcheck do guarda TEM que reprovar
+  fresh; sed "$2" "$B" > "$T/mutant.py"
+  if cmp -s "$B" "$T/mutant.py"; then ok 1 "mutante '$1': o sed não mudou nada"; return; fi
+  wipe "$T/f/mut"; python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
+    --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" 2>/dev/null
+  if [ $? != 0 ]; then ok 0 "mutante '$1' pego (o build recusou)"; return; fi
+  sed "s#/home/runner/.claude#$T/f/mut/home/.claude#g" "$T/f/mut/home/.claude/settings.json" > "$T/s.json"
+  python3 -I "$T/f/mut/home/.claude/hooks/remote-clone-guard.py" --selfcheck "$T/s.json" >/dev/null 2>&1; [ $? != 0 ]; ok $? "mutante '$1' pego pelo --selfcheck do guarda"
+}
+swapmut "sem '|| exit 2' (falha aberta)" 's/ || exit 2"}/"}/'
+swapmut "sem o grupo Edit|Write" 's/if self.swaps > swaps:/if False:/'
+swapmut "sem o arquivo do guarda no bundle" 's/^        if self.swaps:$/        if False:/'
+swapmut "sem a troca (o gt do mini segue nas settings)" 's/if v == "swap":/if False:/'
 
 fresh; python3 - "$B" "$T/mutant.py" <<'PYEOF'
 import sys
@@ -478,20 +545,20 @@ else echo "SKIP  verify com arquivo ilegível: este usuário lê tudo (root)"; f
 # --- controle negativo: sem a linha da tabela de um hook, o builder tem que recusar o mesmo build ---
 fresh; sed '/"filter-bash-output.sh", "keep"/d' "$B" > "$T/mutant.py"
 python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
-  --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --out "$T/f/mut" 2>/dev/null
+  --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" 2>/dev/null
 [ $? = 3 ]; ok $? "controle negativo: sem a linha de filter-bash-output.sh na POLICY o build é recusado"
-for row in '"gt tap guard cross-clone-block", "drop"' '"home-scan-guard", "drop"' '"ntfy-on-stop.sh", "drop"'; do
+for row in '"gt tap guard cross-clone-block", "swap"' '"home-scan-guard", "drop"' '"ntfy-on-stop.sh", "drop"'; do
   fresh; grep -qF "$row" "$B"; ok $? "  a POLICY tem a linha $row (o sed abaixo não é um no-op)"
   grep -vF "$row" "$B" > "$T/mutant.py"
   python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
-    --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --out "$T/f/mut" 2>/dev/null
+    --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" 2>/dev/null
   [ $? = 3 ]; ok $? "controle negativo: sem a linha $row o build é recusado"
 done
 
 # controle negativo das skills por NOME: cada mutante estraga UMA guarda e o caso que a cobre tem de ver a diferença
 mutate_build() {  # mutate_build MUTANTE.py — o mesmo build do fixture atual, com o builder mutado; rc em $?
   python3 -I "$1" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
-    --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --out "$T/f/mut" --skills 2>/dev/null
+    --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" --skills 2>/dev/null
 }
 fresh; for s in $NOT3; do addskill "$s" "doc $CPF e $CNPJ"; done
 grep -qF 'if link.name in skip:' "$B"; ok $? "  o builder tem a linha da exclusão por nome (o sed abaixo não é um no-op)"

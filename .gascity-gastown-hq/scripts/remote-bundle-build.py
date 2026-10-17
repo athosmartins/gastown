@@ -16,6 +16,10 @@ USO
 
 O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
   keep  — o script é portável (bash/jq/python3, sem nada de macOS) e é copiado para home/.claude/hooks/;
+  swap  — o hook do mini não serve no servidor mas NÃO pode sumir: `gt tap guard cross-clone-block` (usa o binário gt e o layout de clones
+          do mini) entra como `python3 -I {remote_home}/.claude/hooks/remote-clone-guard.py || exit 2` — em PreToolUse para Bash e também
+          para Edit|Write|MultiEdit|NotebookEdit — e o remote-clone-guard.py vai junto (ga-2hd02v.1.5). `|| exit 2` porque hook que sai 1 ou
+          127 (python3 ausente, arquivo apagado) falha ABERTO. O `if: Bash(git -C *)` do original não se repete: o guarda decide por dentro;
   shim  — o comando só chama `gc` (handoff, prime, nudge drain, mail check) e fica como está: no servidor `gc` é o
           atalho ssh→mini (fatia seguinte). É comparado INTEIRO, sem strip nem normalização (SHIM_RE.fullmatch): o PATH é o
           literal que o gc injeta, variável só GC_*, argumentos sem caractere de controle nem ; & | ` $ ( ) < >, e o
@@ -23,10 +27,13 @@ O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
           subcomando e os argumentos, exatamente como são enviados;
   drop  — não se aplica no servidor (TCC do macOS, FUSE, ntfy com tópico privado, experimento de log local...). Só some o hook que a
           POLICY classificou: o trecho do comando escolhe a linha, mas o comando INTEIRO tem que ter a forma dele — script em
-          ~/.claude/hooks/<nome do token>, `gt tap guard cross-clone-block` (gt com ~/.local/bin/ opcional) ou o PREFIXO do wrapper
+          ~/.claude/hooks/<nome do token>, `gt tap guard cross-clone-block` (swap; gt com ~/.local/bin/ opcional) ou o PREFIXO do wrapper
           `: <marcador>; P='<cidade>/scripts/<marcador>.sh'; [ -f "$P" ] || ` (a cauda do wrapper é gerada e não é lida: o manifest guarda o
           sha256 do comando inteiro). Guarda irmã (`gt tap guard dangerous-command`) ou comando com algo a mais NÃO é descartado: recusa.
   Chaves de settings fora da lista de portáveis (modelo, statusLine, plugins...) são descartadas e registradas.
+  Regra `ask` de permissão vira `deny` (ga-2hd02v.1.5): no servidor não há quem aperte a tecla, e `ask` explícita vale MESMO com
+  --dangerously-skip-permissions — MEDIDO lá: `rm -rf` com só o `ask` fica parado num "Do you want to proceed?" sem fim; com `deny` é negado na hora.
+  A contagem por camada vai em manifest.json → asks_to_deny.
   Só é lido o que está nomeado aqui: settings.local.json NUNCA entra (guarda permissões e segredos de sessões).
 
 POR QUE FALHA EM VEZ DE COPIAR (três estados: sei que serve / sei que não serve / não sei — o último não vira "serve"):
@@ -80,7 +87,7 @@ POLICY = [
     ("fuse-avoidance.sh", "drop", "CloudStorage/Mobile Documents não existem no servidor"),
     ("ntfy-prompt-submit.sh", "drop", "tópico ntfy privado + CLI notify; o servidor não guarda segredo"),
     ("ntfy-on-stop.sh", "drop", "idem ntfy-prompt-submit.sh"),
-    ("gt tap guard cross-clone-block", "drop", "usa o binário gt e o layout de clones do mini; GAP: reescrever p/ clones do servidor"),
+    ("gt tap guard cross-clone-block", "swap", "usa o binário gt e o layout de clones do mini: no servidor vale o remote-clone-guard.py (território ~/gt-remote/git)"),
     ("enforce-multiple-choice-question.sh", "keep", "regra 1 do Athos vale em qualquer host (jq, falha aberta)"),
     ("enforce-mail-mcq-on-send.sh", "keep", "idem, no canal gc mail send (jq+python3, falha aberta)"),
     ("filter-bash-output.sh", "keep", "poupa tokens da cota compartilhada (jq)"),
@@ -91,6 +98,7 @@ POLICY = [
 # drop em forma de wrapper: `: <marcador>; P='<cidade>/scripts/<marcador>.sh'; [ -f "$P" ] || <cauda gerada>` (home-scan-guard-activate.sh, overlays).
 # O prefixo é conferido; a cauda é gerada e não é lida: o manifest guarda o sha256 do comando inteiro para ela ser auditável.
 WRAPPERS = {"home-scan-guard", "cut-output-shadow"}
+GUARD, FILE_TOOLS = "remote-clone-guard.py", "Edit|Write|MultiEdit|NotebookEdit"
 # O shim é comparado INTEIRO (fullmatch, sem strip nem normalização): o que o builder decide é a string que vai para o servidor.
 # O PATH é o literal que o gc injeta, não "qualquer coisa entre aspas"; variável só GC_*; nada de caractere de controle (newline = 2º comando).
 GC_PATH = 'export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH" && '
@@ -150,9 +158,11 @@ class Bundle:
         self.shim_needs: set[str] = set()
         self.dropped_keys: dict[str, list[str]] = {}
         self.dropped_rules: dict[str, int] = {}
+        self.asks_to_deny: dict[str, int] = {}
         self.skill_count = 0
         self.excluded: list[str] = []          # skills que existiam em skills/ e ficaram de fora, por nome
         self.excluded_missing: list[str] = []  # nomes de exclusão que NÃO existem em skills/ (renomeada? removida?)
+        self.swaps = 0
 
     def rewrite(self, s: str) -> str:
         for old, new in self.rules:  # fronteira nos dois lados: gt-backup, gt2 e /xx/Users/... não são o caminho; sobram e a guarda de /Users/ recusa
@@ -210,13 +220,19 @@ class Bundle:
             m = re.fullmatch(r"(?:(?:~|\$HOME|%s)/\.local/bin/)?%s" % (re.escape(self.home), re.escape(token)), cmd)
             if not m:
                 raise Refused(f"hook {verdict} em {src}/{event} não é só `{token}` (com ~/.local/bin/ opcional): {cmd[:100]!r}")
+            if event != "PreToolUse":  # o guarda só tem sentido ANTES da chamada; em outro evento o swap seria uma guarda que não guarda
+                raise Refused(f"hook swap em {src}/{event}: {token!r} só é trocado em PreToolUse")
         else:  # linha da POLICY sem forma de comando conhecida: não sei o que ela classifica
             raise Refused(f"POLICY: a linha {token!r} ({verdict}) não tem forma de comando conhecida em hook_verdict")
         # `command` é só a parte RECONHECIDA (o resto de um wrapper não é lido) e `command_sha256` é do comando inteiro: o que foi
         # descartado fica auditável sem o manifest carregar texto que nenhuma forma conferiu
         self.hooks.append({"source": src, "event": event, "matcher": matcher, "verdict": verdict, "token": token, "reason": why,
-                           "command": self.rewrite(m.group(0)), "command_sha256": hashlib.sha256(cmd.encode()).hexdigest()})
+                           "command": self.rewrite(m.group(0)), "command_sha256": hashlib.sha256(cmd.encode()).hexdigest(),
+                           **({"replaced_by": self.guard_hook()["command"]} if verdict == "swap" else {})})
         return verdict
+
+    def guard_hook(self) -> dict:
+        return {"type": "command", "command": f"python3 -I {self.a.remote_home}/.claude/hooks/{GUARD} || exit 2"}
 
     def keep_script(self, name: str) -> None:
         p = Path(self.a.claude_home) / "hooks" / name
@@ -249,16 +265,23 @@ class Bundle:
     def filter_hooks(self, src: str, hooks: dict) -> dict:
         out: dict = {}
         for event, groups in hooks.items():
-            kept_groups = []
+            kept_groups, swaps = [], self.swaps
             for g in groups:
                 if not isinstance(g, dict) or not isinstance(g.get("hooks"), list):
                     raise Refused(f"grupo de hooks em {src}/{event} sem a lista `hooks` (forma plana?): sem veredito possível")
-                kept = [h for h in g["hooks"]
-                        if h.get("type") != "command" or self.hook_verdict(src, event, g.get("matcher"), h.get("command", "")) != "drop"]
+                kept = []
+                for h in g["hooks"]:
+                    v = self.hook_verdict(src, event, g.get("matcher"), h.get("command", "")) if h.get("type") == "command" else "keep"
+                    if v == "swap":
+                        h, self.swaps = self.guard_hook(), self.swaps + 1
+                    if v != "drop":
+                        kept.append(h)
                 if any(h.get("type") != "command" for h in g["hooks"]):
                     raise Refused(f"hook que não é `command` em {src}/{event}: sem veredito possível")
                 if kept:
                     kept_groups.append({**g, "hooks": json.loads(self.rewrite(json.dumps(kept)))})
+            if self.swaps > swaps:  # o gt vigiava só `git -C` no Bash; o guarda vigia também a escrita de arquivo no clone alheio
+                kept_groups.append({"matcher": FILE_TOOLS, "hooks": [self.guard_hook()]})
             if kept_groups:
                 out[event] = kept_groups
         return out
@@ -276,6 +299,12 @@ class Bundle:
                     self.dropped_rules[f"{src}.{k}"] = len(gone)
                 v = [x for x in v if x not in gone]
             out[k] = v
+        asks = out.pop("ask", [])
+        if not isinstance(asks, list) or (asks and not isinstance(out.get("deny", []), list)):  # forma que não conheço: converter às cegas perde a regra
+            raise Refused(f"permissions.ask ou deny em {src} não é lista: sem veredito possível")
+        if asks:  # sem humano no teclado do servidor `ask` trava a sessão e vale até com --dangerously-skip-permissions; `deny` nega na hora
+            out["deny"] = out.get("deny", []) + [x for x in asks if x not in out.get("deny", [])]
+            self.asks_to_deny[src] = len(asks)
         return out
 
     def skills(self, role: str, role_dir: Path) -> None:
@@ -324,15 +353,18 @@ class Bundle:
                                        f"role/{a.role}/.claude/settings.json")):
             out = self.settings(src, kind, path)
             self.add(dest, (json.dumps(out, indent=2, sort_keys=True) + "\n").encode())
+        if self.swaps:
+            self.add(f"home/.claude/hooks/{GUARD}", Path(a.clone_guard).read_bytes(), ex=True)
         if a.skills:
             self.skills(a.role, Path(a.role_dir))
         return {"version": 1, "remote_root": a.remote_root, "remote_home": a.remote_home, "role": a.role,
                 "install": {"home/.claude": a.remote_home + "/.claude", "city/settings.json": a.remote_root + "/city/settings.json",
                             f"role/{a.role}/.claude": "<diretório de trabalho da sessão>/.claude"},
-                "hooks": self.hooks, "shim_needs": sorted(self.shim_needs),
+                "hooks": self.hooks, "shim_needs": sorted(self.shim_needs), "clone_guard": self.swaps > 0,
                 "dropped_keys": {k: sorted(set(v)) for k, v in sorted(self.dropped_keys.items())},
                 "dropped_rules": dict(sorted(self.dropped_rules.items())),
                 "excluded_skills": self.excluded, "excluded_skills_missing": self.excluded_missing,
+                "asks_to_deny": dict(sorted(self.asks_to_deny.items())),
                 "files": {rel: {"sha256": hashlib.sha256(d).hexdigest(), "exec": ex} for rel, (d, ex) in sorted(self.files.items())},
                 "bundle_hash": listing_hash({rel: (hashlib.sha256(d).hexdigest(), ex) for rel, (d, ex) in self.files.items()})}
 
@@ -458,6 +490,7 @@ def main(argv: list[str]) -> int:
     b.add_argument("--out", required=True)
     b.add_argument("--skills", action="store_true")
     b.add_argument("--exclude-skill", action="append", default=[], metavar="NOME")
+    b.add_argument("--clone-guard", default=str(Path(__file__).resolve().parent / GUARD))  # o guarda que o swap leva; ilegível → recusa
     v = sub.add_parser("verify")
     v.add_argument("dir")
     a = ap.parse_args(argv)
@@ -491,7 +524,7 @@ def main(argv: list[str]) -> int:
         return REFUSED
     skills_note = f", {bundle.skill_count} skills ({len(bundle.excluded)} excluídas por nome)" if a.skills else ""
     print(f"remote-bundle-build: ok {len(manifest['files'])} arquivos{skills_note}, "
-          f"hash {manifest['bundle_hash'][:12]}, shim_needs={manifest['shim_needs']}")
+          f"hash {manifest['bundle_hash'][:12]}, clone_guard={str(manifest['clone_guard']).lower()}, shim_needs={manifest['shim_needs']}")
     return 0
 
 

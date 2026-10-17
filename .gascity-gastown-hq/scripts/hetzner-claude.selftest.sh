@@ -20,7 +20,11 @@ cat >"$T/bin/ssh" <<'EOF'
 #!/bin/sh
 [ -f "$FAKE/ssh.stdin.on" ] && wc -c >>"$FAKE/ssh.stdin"
 [ -f "$FAKE/sleep" ] && sleep "$(cat "$FAKE/sleep")"
-[ -f "$FAKE/ssh.rc" ] && { echo "ssh: Could not resolve hostname" >&2; exit "$(cat "$FAKE/ssh.rc")"; }
+if [ -f "$FAKE/ssh.rc" ]; then  # ssh.rc.only (opcional): só falha o comando que contém este texto; sem ele, falha todos
+  if [ ! -f "$FAKE/ssh.rc.only" ] || case "$*" in *"$(cat "$FAKE/ssh.rc.only")"*) true;; *) false;; esac; then
+    echo "ssh: Could not resolve hostname" >&2; exit "$(cat "$FAKE/ssh.rc")"
+  fi
+fi
 while [ "$1" = "-o" ]; do shift 2; done
 shift
 HOME=$SRV exec sh -c "$*"
@@ -109,8 +113,9 @@ if rd("bad_dest"):  # entrada só no manifesto (sem arquivo): só passa se o ver
 json.dump({"version": 1, "bundle_hash": bh(files), "files": files}, open(out + "/manifest.json", "w"))
 EOF
 chmod +x "$T/bin/"* "$SRV/.local/bin/claude"
-pass=0; fail=0
+pass=0; fail=0; skip=0
 ok() { pass=$((pass + 1)); }
+skipped() { skip=$((skip + 1)); echo "SKIP: $1"; }  # caso que não pôde rodar aqui: aparece e conta à parte, nunca como ok
 bad() { fail=$((fail + 1)); echo "FAIL: $1"; [ -z "${HZC_FAILFAST:-}" ] || exit 1; }
 eq() { if [ "$2" = "$3" ]; then ok; else bad "$1 (obtido '$2', esperado '$3')"; fi; }
 has() { if printf '%s' "$2" | grep -qF -- "$3"; then ok; else bad "$1 (não achei '$3' em: $2)"; fi; }
@@ -208,7 +213,7 @@ reset; : >"$T/afile"; export HETZNER_STATE_DIR=$T/afile; g "pasta de estado inut
 reset; mkdir "$SF"; g "gravação impossível (o arquivo de estado é uma pasta) nunca é ok" 1 "erro interno"; eq "mediu: a falha é na gravação, não na trava" "$(calls auth)" 1
 eq "e não deixou .tmp para trás" "$(ls "$STATE" | grep -c '\.tmp$')" 0; rmdir "$SF"
 # o aviso não pode depender de uma gravação que pode falhar: gravação falhando = nenhum aviso; ele sai na 1ª chamada que gravar
-if [ "$(id -u)" = 0 ]; then echo "SKIP (root ignora chmod): aviso com a gravação falhando"; else
+if [ "$(id -u)" = 0 ]; then skipped "root ignora chmod: aviso com a gravação falhando"; else
   reset; g . 0 ok; setauth "$AUTH_OFF" 1; age checked -1000; chmod 555 "$STATE"
   g "gravação falha: bloqueia" 1 "erro interno"; g "de novo" 1 "erro interno"; g "e de novo" 1 "erro interno"; chmod 755 "$STATE"
   eq "3 chamadas com a gravação falhando = 0 avisos" "$(notifys)" 0
@@ -258,6 +263,11 @@ has "o que ficou sem remover é contado, não calado" "$PBOUT" "1 NAO removidos"
 echo "== push-bundle: o registro anterior não manda apagar através de um symlink no caminho"
 srv_reset; pb; rm -rf "$SRV/.claude/hooks"; mkdir -p "$T/elsewhere"; echo keep >"$T/elsewhere/a.sh"; ln -s "$T/elsewhere" "$SRV/.claude/hooks"
 echo 1 >"$FAKE/drop_hook"; pb; eq "push" $PBRC 0; yes "o arquivo do outro lado do symlink sobrevive" "$T/elsewhere/a.sh"; has "e é contado" "$PBOUT" "1 NAO removidos"
+echo "== push-bundle: as chaves que o próprio claude grava (tema, notificação) sobrevivem; chave alheia de verdade continua recusando"
+srv_reset; echo '{"theme":"dark","agentPushNotifEnabled":true,"enabledPlugins":{"x@y":true}}' >"$SRV/.claude/settings.json"; pb; eq "tema e notificação do claude não travam o push" $PBRC 0
+SJ=$(cat "$SRV/.claude/settings.json"); has "tema mantido" "$SJ" '"theme": "dark"'; has "notificação mantida" "$SJ" '"agentPushNotifEnabled": true'
+has "o bundle continua mandando" "$SJ" '"permissions"'; hasnt "e a chave velha dos plugins foi trocada" "$SJ" "x@y"
+srv_reset; echo '{"theme":"dark","model":"opus"}' >"$SRV/.claude/settings.json"; pb; eq "tema + chave alheia de verdade" $PBRC 1; has "msg diz a alheia" "$PBOUT" "(model)"; no "nada instalado" "$HOOK"
 echo "== push-bundle: recusas (nada pela metade)"
 srv_reset; echo '{"model":"opus"}' >"$SRV/.claude/settings.json"; pb; eq "settings do servidor com chave alheia" $PBRC 1; has "msg" "$PBOUT" "nao conhece"
 no "nada instalado" "$HOOK"; no "nem o city" "$CITYF"
@@ -274,6 +284,26 @@ srv_reset; echo fail >"$FAKE/rsync.mode"; pb; eq "rsync falha" $PBRC 1; has "msg
 srv_reset; echo 4 >"$FAKE/verify.rc.mini"; pb; eq "verify no mini falha" $PBRC 1; has "msg" "$PBOUT" "verify (mini)"; no "nada foi staged no servidor" "$SRV/gt-remote/bundle-out"
 srv_reset; echo 4 >"$FAKE/verify.rc.server"; pb; eq "verify no servidor falha" $PBRC 1; has "msg" "$PBOUT" "verify NO SERVIDOR"; no "nada instalado" "$HOOK"
 srv_reset; echo '{"enabledPlugins":{}}' >"$FAKE/home_settings"; pb; eq "bundle já traz enabledPlugins" $PBRC 3; has "msg" "$PBOUT" "já traz"
+echo "== push-bundle: ler o settings do servidor — ausente é vazio; não conseguir ler NÃO é vazio (gate ga-iczduy)"
+# o install troca o settings.json do servidor: se a leitura falhou e o push seguir como se o arquivo não existisse, o tema/notificação do claude somem sem aviso
+for rc in 255 1 7; do
+  reset; srv_reset; echo '{"theme":"dark","enabledPlugins":{"x@y":true}}' >"$SRV/.claude/settings.json"; echo "$rc" >"$FAKE/ssh.rc"; echo ".claude/settings.json" >"$FAKE/ssh.rc.only"; pb
+  eq "leitura do settings do servidor sai $rc → recusa" $PBRC 1; has "msg diz que não leu" "$PBOUT" "settings.json do servidor"; no "nada instalado" "$HOOK"
+  eq "e o settings do servidor ficou como estava" "$(cat "$SRV/.claude/settings.json")" '{"theme":"dark","enabledPlugins":{"x@y":true}}'
+done
+reset; srv_reset; chmod 000 "$SRV/.claude/settings.json"
+if [ -r "$SRV/.claude/settings.json" ]; then skipped "chmod 000 não tirou a leitura (root?): settings ilegível no servidor"; else  # o instalador do servidor também recusa um settings ilegível — só que DEPOIS do rsync; aqui a recusa tem que vir antes de mandar qualquer coisa
+  pb; eq "settings que existe mas o cat não lê → recusa (não é 'ausente')" $PBRC 1; has "msg" "$PBOUT" "settings.json do servidor"; no "nada instalado" "$HOOK"
+  no "e nada foi mandado ao servidor (a recusa vem antes do rsync)" "$SRV/gt-remote/bundle-out"
+fi
+chmod 644 "$SRV/.claude/settings.json"
+reset; srv_reset; rm -f "$SRV/.claude/settings.json"; pb; eq "settings ausente no servidor (1º push) = vazio, instala" $PBRC 0; yes "hook instalado" "$HOOK"
+# gate-fix 4 (third-state): texto que não é JSON não é "vazio" — nem no servidor, nem no bundle
+reset; srv_reset; printf 'notjson garbage {' >"$SRV/.claude/settings.json"; pb
+eq "settings do servidor existe mas não é JSON → recusa (não vira {})" $PBRC 1; has "msg" "$PBOUT" "não é JSON"; no "nada instalado" "$HOOK"
+eq "e o settings do servidor ficou como estava" "$(cat "$SRV/.claude/settings.json")" 'notjson garbage {'
+reset; srv_reset; printf 'notjson garbage {' >"$FAKE/home_settings"; pb
+[ "$PBRC" != 0 ]; eq "home settings do bundle não é JSON → não instala (rc=$PBRC)" $? 0; no "nada instalado" "$HOOK"
 
 echo "== install-claude (loopback)"
 printf '#!/bin/bash\necho "$@" >"$FAKE/installer.args"\n[ -f "$FAKE/installer.noop" ] || echo "$1 (Claude Code)" >"$FAKE/version"\n' >"$T/installer.sh"
@@ -317,7 +347,7 @@ if [ "$(uname)" = Darwin ]; then
   echo 20261014170000Z >"$FAKE/mdat"; out=$(python3 -I "$S" fingerprint --compare "$T/fp"); eq "mdat mudou sozinho: não decide" $? 0; has "diz que só informa" "$out" "não decide"
   rm -f "$FAKE/mdat"; out=$(python3 -I "$S" fingerprint --compare "$T/fp"); eq "keychain ilegível: não decide" $? 0
   if grep -qE -- ' -[gw]( |$)' "$FAKE/security.args"; then bad "pediu o segredo ao Keychain (-g/-w)"; else ok; fi
-else echo "SKIP (só o macOS tem Keychain): mdat que anda sozinho, keychain ilegível, nunca pedir o segredo (-g/-w)"; fi
+else skipped "só o macOS tem Keychain: mdat que anda sozinho, keychain ilegível, nunca pedir o segredo (-g/-w)"; fi
 echo '{bad' >"$HOME/.claude.json"; out=$(python3 -I "$S" fingerprint --compare "$T/fp"); eq "oauthAccount ilegível não é igual" $? 3; has "msg" "$out" "NÃO SEI"
 python3 -I "$S" fingerprint --save "$T/fp2" >/dev/null 2>&1; eq "não grava um 'antes' desconhecido" $? 3
 eq "e não deixa arquivo" "$([ -e "$T/fp2" ] && echo existe || echo nao)" nao
@@ -351,5 +381,5 @@ except subprocess.TimeoutExpired: print("PENDUROU"); sys.exit(124)
 print(r.stdout, end=""); sys.exit(r.returncode)' "$@"; }
 out=$(hang python3 -I "$S" leak-scan "$T/scan/fifo"); eq "FIFO na árvore não pendura e não conta como lido" $? 3; has "diz o motivo" "$out" "não é arquivo comum"
 chmod 000 "$T/scan/lock"; out=$(python3 -I "$S" leak-scan "$T/scan/lock"); eq "pasta ilegível não é 'limpo'" $? 3; has "msg" "$out" "NÃO CONSEGUI LER"; chmod 755 "$T/scan/lock"
-echo "hetzner-claude.selftest: $pass ok, $fail falhas"
+echo "hetzner-claude.selftest: $pass ok, $fail falhas, $skip pulados"
 [ "$fail" = 0 ]
