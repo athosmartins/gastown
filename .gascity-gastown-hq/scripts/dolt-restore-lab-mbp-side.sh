@@ -118,7 +118,7 @@ bash "$STAGE/dolt-restore-lab.sh" run --db "$DB" --source "file://$SRC" --manife
   --workdir "$SLOT/work" --report "$OUT/report.json" --rto-seconds "$RTO" 2>&1 | tee "$OUT/lab.log"
 LABRC=${PIPESTATUS[0]}
 
-# --- hygiene evidence. vazio (no sample taken) → "?", never 0; falhou (grep could not scan) → "?". `lab-src` (the backup) and the shell
+# --- hygiene evidence. vazio (no sample taken) → "?", never 0; falhou (grep could not scan and found nothing) → "?". `lab-src` (the backup) and the shell
 # scripts (which name the variables in comments) are not scanned; `work` is the lab's own scratch.
 sample >> "$SAMPLES"; kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null
 # a sample that could not read `ps` is a "?" line: it is not counted as a clean sample; no clean sample at all → hits "?"
@@ -126,6 +126,9 @@ NS=$(grep -c '^[0-9]' "$SAMPLES" 2>/dev/null); NH=$(awk '/^[0-9]+$/ { s += $1 } 
 [ "${NS:-0}" -gt 0 ] 2>/dev/null && ev "argv_samples=$NS argv_hits=$NH argv_samples_falhas=${NQ:-0}" || ev "argv_samples=0 argv_hits=? argv_samples_falhas=${NQ:-?}"
 rm -f "$SAMPLES"
 HITS=$(grep -rIlE --exclude='*.sh' --exclude-dir=lab-src "$SHAPE" "$SLOT/in" "$SLOT/out" 2>/dev/null); GST=$?
-case "$GST" in 0) ev "slot_files_with_credential=$(printf '%s\n' "$HITS" | grep -c .)" ;; 1) ev "slot_files_with_credential=0" ;; *) ev "slot_files_with_credential=?" ;; esac
+# achou vale mais que não terminar: grep sai 2 também quando ACHOU e um arquivo não abriu (BSD e ugrep, medido), então acerto na saída é
+# credencial ACHADA, qualquer que seja o rc. Só "nenhum acerto" é que separa 1 (varreu, zero) de 2+ (não consegui varrer → "?").
+if [ -n "$HITS" ]; then ev "slot_files_with_credential=$(printf '%s\n' "$HITS" | grep -c .)"
+else case "$GST" in 1) ev "slot_files_with_credential=0" ;; *) ev "slot_files_with_credential=?" ;; esac; fi
 ev "lab_rc=$LABRC"
 exit "$LABRC"

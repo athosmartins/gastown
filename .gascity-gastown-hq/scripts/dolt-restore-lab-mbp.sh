@@ -279,7 +279,10 @@ mini_hygiene() {  # → HY_FILES (contagem ou "?")
   [ "$#" -gt 0 ] || { HY_FILES="?"; return; }
   # só caminhos que existem: grep sai 2 por um caminho ausente mesmo achando acerto em outro, e isso viraria "?"
   hits=$(grep -rIlE --exclude='*.sh' "$SHAPE" "$@" 2>/dev/null); st=$?
-  case "$st" in 0) HY_FILES=$(printf '%s\n' "$hits" | grep -c .) ;; 1) HY_FILES=0 ;; *) HY_FILES="?" ;; esac
+  # achou vale mais que não terminar: grep sai 2 também quando ACHOU e um arquivo não abriu, então acerto na saída é credencial ACHADA, qualquer que seja o rc.
+  # Sem acerto nenhum: 1 = varreu e deu zero; 2+ = não consegui varrer → "?".
+  if [ -n "$hits" ]; then HY_FILES=$(printf '%s\n' "$hits" | grep -c .)
+  else case "$st" in 1) HY_FILES=0 ;; *) HY_FILES="?" ;; esac; fi
 }
 
 # --- classifica o resultado. $1 = rc do mbp-run. Deixa VERDICT FINAL_RC WHY e as medidas. -----------------------------------

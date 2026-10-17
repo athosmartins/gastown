@@ -216,6 +216,8 @@ for t in ps env; do rm -f "$FAKE_ROOT/home/gt-remote/lab/bin/$t"; done   # SC_BR
 [ "${FAKE_MINI_LEAK:-0}" != 1 ] || echo "AWS_SECRET_ACCESS_KEY=whatever" > "$(dirname "$push")/stray.txt"
 [ "${FAKE_MINI_LEAK:-0}" != 3 ] || { mkdir "$FAKE_ROOT/state/zz-unreadable" && chmod 000 "$FAKE_ROOT/state/zz-unreadable"; }
 [ "${FAKE_MINI_LEAK:-0}" != 2 ] || echo '{"cmd":"AWS_ACCESS_KEY_ID=whatever"}' > "$FAKE_ROOT/city/.gc/logs/mbp-run.jsonl"
+# 4 = ACHOU e uma pasta nao abre: o grep sai 2 com o acerto na saida (o "achar vale mais que nao terminar")
+[ "${FAKE_MINI_LEAK:-0}" != 4 ] || { echo "AWS_SECRET_ACCESS_KEY=whatever" > "$(dirname "$push")/stray.txt"; mkdir "$FAKE_ROOT/state/zz-unreadable" && chmod 000 "$FAKE_ROOT/state/zz-unreadable"; }
 if [ "${FAKE_EXEC:-run}" = die_after_ready ]; then   # the job dies (and mbp-run wipes the slot) while the mini is still sending
   ( cd "$SLOT" && exec env -i HOME="$FAKE_ROOT/home" PATH="/usr/bin:/bin:/usr/sbin:/sbin" FAKE_SCEN="$FAKE_ROOT/scen" LAB_POLL_S=0.2 "$@" 2>&1 ) &
   wp=$!; n=0; until [ -d "$SLOT/in/lab-src" ] || [ $n -ge 50 ]; do sleep 0.1; n=$((n+1)); done
@@ -248,6 +250,7 @@ fi
 [ "$(sc leak)" != 2 ] || { mkdir -p out; echo "AWS_SECRET_ACCESS_KEY=abc" > out/oops.txt; }
 [ "$(sc leak)" != 3 ] || { echo "aws_access_key_id = abc" > in/note.txt; }
 [ "$(sc leak)" != 4 ] || { mkdir -p in/locked; chmod 000 in/locked; }
+[ "$(sc leak)" != 5 ] || { echo "aws_access_key_id = abc" > in/note.txt; mkdir -p in/locked; chmod 000 in/locked; }   # ACHOU e uma pasta nao abre: grep sai 2 com o acerto na saida
 sleep 2
 mode=$(sc lab)
 [ "$mode" != norep ] || exit 0
@@ -566,6 +569,11 @@ reset; SC_LEAK=3 run
 has "$(summ)" "ALERTA" "credencial gravada em in/ do slot do MBP: ALERTA"
 reset; SC_LEAK=4 run
 check "$RC" 0 "grep do slot nao consegue ler uma pasta: o veredito fica"; has "$(summ)" "arquivos-com-credencial=?" "a contagem fica '?', nunca 0"; has "$(summ)" "ALERTA" "e a prova nao medida avisa"; check "$(calls notify.log)" 1 "notify"
+# ACHOU e uma pasta nao abriu: o achado nunca vira "nao consegui saber". Com lab UNKNOWN o '?' e ignorado, entao so o numero faz o alerta subir.
+reset; SC_LEAK=5 run
+check "$RC" 0 "credencial no slot E uma pasta que nao abre: o veredito fica"; has "$(summ)" "arquivos-com-credencial=1" "o achado conta 1, nao '?'"; has "$(summ)" "ALERTA" "e grita"
+reset; SC_LEAK=5 SC_LAB=unknown run
+has "$(summ)" "arquivos-com-credencial=1" "lab UNKNOWN: o achado tambem conta 1"; has "$(summ)" "ALERTA" "e o alerta sobe mesmo onde o '?' seria ignorado"
 reset; FAKE_MINI_LEAK=1 run
 check "$RC" 0 "arquivo com cara de credencial no stage do mini nao muda o veredito"; has "$(summ)" "mini-higiene: arquivos-com-cara-de-credencial=1" "o grep do mini achou"; has "$(summ)" "ALERTA" "e grita"
 reset; FAKE_MINI_LEAK=2 run
@@ -573,6 +581,10 @@ has "$(summ)" "mini-higiene: arquivos-com-cara-de-credencial=1" "credencial no l
 reset; FAKE_MINI_LEAK=3 run; chmod -R u+rwx "$T/state/zz-unreadable" 2>/dev/null
 check "$RC" 0 "grep do mini nao consegue ler uma pasta: o veredito fica"; has "$(summ)" "mini-higiene: arquivos-com-cara-de-credencial=?" "a contagem fica '?', nunca 0"
 has "$(summ)" "ALERTA" "e a prova nao medida avisa"; check "$(calls notify.log)" 1 "notify"
+reset; FAKE_MINI_LEAK=4 run; chmod -R u+rwx "$T/state/zz-unreadable" 2>/dev/null
+check "$RC" 0 "credencial no stage do mini E uma pasta que nao abre: o veredito fica"; has "$(summ)" "mini-higiene: arquivos-com-cara-de-credencial=1" "o achado conta 1, nao '?'"; has "$(summ)" "ALERTA" "e grita"
+reset; FAKE_MINI_LEAK=4 SC_LAB=unknown run; chmod -R u+rwx "$T/state/zz-unreadable" 2>/dev/null
+has "$(summ)" "mini-higiene: arquivos-com-cara-de-credencial=1" "lab UNKNOWN: o achado do mini tambem conta 1"; has "$(summ)" "ALERTA" "e o alerta sobe mesmo onde o '?' seria ignorado"
 
 echo "-- orquestrador morto no meio do envio"
 reset
