@@ -1,7 +1,7 @@
 # hetzner-scrape-eligible.txt — quais raspadores de imóveis (property_scrapers) podem rodar no nó Hetzner (IP alemão). Lido por scripts/hetzner-scrape-round.sh.
 #
 # Contents
-#   Sintaxe · Como esta lista foi medida · Permitidos · Bloqueados · Nunca medidos
+#   Sintaxe · Como esta lista foi medida · Permitidos · Bloqueados · Bloqueado por custo · Nunca medidos
 #
 # SINTAXE (uma por linha; a chave é o NOME DA PASTA em scrapers/, não o id do runner.py — `zap_vivareal_contagem` e `netimoveis_contagem` usam as pastas zap_vivareal e netimoveis):
 #   raspador            permite o raspador (todos os tenants)
@@ -15,17 +15,18 @@
 #   1. `hetzner-scrape-round.sh probe`: 51 endereços (home de cada site e de cada tenant ativo + as APIs), curl com UA de navegador, dos dois lados: 36 respondem 2xx igual; 6 falham igual dos dois lados (API que não
 #      aceita GET simples, wimoveis, glue-api da ZAP); 1 (netimoveis /pesquisa) dá 404 no mini e 403 no nó; 8 só respondem do mini (403 do Cloudflare no nó: chavesnamao, netimoveis, larimoveis, ciadoimovelbh, imobiliariamodelobh, nucleoleiloes, caixa).
 #   2. Rodada de verdade, com o código do launchd diário, só limitada por --limit: quem terminou com 0 erro entra em PERMITIDOS; quem tomou 403 ou estourou o tempo entra em BLOQUEADOS.
+#   3. Escala cheia (ga-qeqxsb, 17/10/2026): os 11 liberados SEM --limit, em paralelo, com os argumentos do runner.py diário, em staging; comparados arquivo a arquivo com o snapshot do mini do mesmo dia. 10 ficam (≥ 97%
+#      dos anúncios do mini em 9 deles e 0 bloqueio de IP nos 10; o imoview ficou em 89% porque o tenant valore levou HTTP 500, e deu 100% com o valore re-rodado sozinho); quintoandar saiu (ver BLOQUEADOS). Tabela completa: docs/runbooks/hetzner-scrape-round.md, seção "Rodada em escala cheia".
 #   Para re-medir quando o IP do servidor mudar:  scripts/hetzner-scrape-round.sh probe
 #
-# PERMITIDOS — rodada real no nó, 0 erro (itens = o --limit da medição)
+# PERMITIDOS — rodada real no nó, 0 erro (itens = o --limit da medição de 16/10; a rodada sem --limit de 17/10 está no runbook)
 primeimoveisdeluxo      # 15 de 15
 vistaimobi              # tenant alianza: 10 (3 novos, 7 fora do escopo); as homes dos demais tenants ativos respondem igual
 oksite                  # tenant eccos: 10; homes de imotec e bos respondem igual
 luizrenato              # 10 de 10
 santoagostinho          # 10 de 10
 bonsucesso              # 10 tentados, 0 erro (9 fora do escopo)
-imoview                 # tenants decisao e valore: 20 de 20 cada (decisao em 22 s, valore em 24 s); as homes de TODOS os tenants ativos respondem igual
-quintoandar             # 10 arquivos, 0 erro (a API apigw responde igual)
+imoview                 # tenants decisao e valore: 20 de 20 cada (decisao em 22 s, valore em 24 s); as homes de TODOS os tenants ativos respondem igual. Escala cheia: 10 de 11 tenants idênticos ao mini; valore levou HTTP 500 na rodada em paralelo (0 arquivo, rc 0 do raspador!) e sozinho deu 546 de 546
 loft                    # 30 de 30 via --use-api; a API de condomínios devolve 429 após ~15 chamadas e o próprio raspador a desliga no meio da rodada (limite de taxa, não bloqueio de IP)
 silvioximenes           # 10 de 10
 anuar_donato            # 40 raspados (21 novos), 0 erro
@@ -41,5 +42,8 @@ anuar_donato            # 40 raspados (21 novos), 0 erro
 !zap_vivareal           # com o código implantado: 403 em toda chamada de listagem da glue-api, 0 arquivo em 120 s (é a maior: ~4400 s no mini); vale também para zap_vivareal_contagem
 !wimoveis               # 403 "Just a moment" até do mini no curl simples: inconclusivo, fica local
 !blow                   # usa credencial e é Node (scrape_all_bh.js): credencial não vai para o servidor alugado
+#
+# BLOQUEADO POR CUSTO, NÃO POR IP — o site responde ao nó (0 erro 403/429), mas rodar lá não compensa
+!quintoandar            # escala cheia 17/10: 3146 s no nó contra ~193 s no mini (16x) e 25 erros 503 (o mini teve 1 erro de anúncio). Sem o snapshot anterior (o nó não recebe shared/data) o raspador não usa a API em lote (chamadas=0 contra 49) e relê 4881 páginas uma a uma. O runner já o veta (NODE_VETO)
 #
 # NUNCA MEDIDOS (ficam fora de propósito até alguém medir): alfenas leilao_comprei leilao_spy mybrokerbh myside provincia_imoveis sancruza terreno_livre
