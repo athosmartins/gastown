@@ -53,6 +53,31 @@ mark() {
   case " $unreadable " in *" $1 "*) ;; *) unreadable="$unreadable $1" ;; esac
 }
 
+# ga-vln2py (P0): DISK FLOOR. With the free disk under the new-work floor (disk-headroom-lib.sh, 5 GB) this probe hands
+# out no NEW STORY from tier 1: a builder started on a disk that low is what filled it on 17/10 and took Dolt down.
+# The city's own formula work (gc.kind set; tiers 2 and 3) still flows - it is what gets the city out of the hole.
+# This is the one place where the answer deliberately differs from the engine's probe, and only while the disk is low:
+# with the disk fine (or unreadable) stdout, the bd calls and the exit code are byte-for-byte the engine's.
+# `[]` from the hold is a real "nothing for you": drain, do not look for a story by another route.
+# Three states: low -> hold; ok -> as before; unknown (lib missing/corrupt, df unreadable) -> as before (fail OPEN: a df
+# hiccup must not starve the pool) with a line in the pool-probe log. The lib is read in a subshell so a corrupt copy
+# cannot kill the probe. DISK_FREE_OVERRIDE_MB pins the reading (selftests).
+disk_lib="${POOL_PROBE_DISK_LIB:-$(dirname "$0")/disk-headroom-lib.sh}"
+# vazio/falhou/ilegível -> disk_state stays "unknown" (answer unchanged, fail-open, logged); never "low"
+disk_state=$( ( . "$disk_lib" && disk_headroom_state "$DISK_NEW_WORK_MIN_MB" ) 2>/dev/null )
+case "$disk_state" in ok|low) ;; *) disk_state=unknown ;; esac
+# vazio/falhou/ilegível -> empty text; only read when the disk is low, where an empty text makes tier 1 answer nothing
+disk_hold_jq=""
+[ "$disk_state" = low ] && disk_hold_jq=$( ( . "$disk_lib" && printf "%s" "$DISK_HOLD_NEW_STORIES_JQ" ) 2>/dev/null )
+
+pp_log() {
+  # best effort: the answer is already decided and a full disk is exactly when this write fails
+  pp_f="${POOL_PROBE_LOG:-${GC_CITY_PATH:-${GC_CITY:-.}}/.gc/logs/pool-probe.log}"
+  mkdir -p "$(dirname "$pp_f")" 2>/dev/null || return 0
+  printf "%s pool-probe[%s]: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$target" "$*" >> "$pp_f" 2>/dev/null || true
+}
+[ "$disk_state" = unknown ] && pp_log "free disk unreadable (lib=$disk_lib) - fail-open, new stories not held back (ga-vln2py)"
+
 # The veto filter every tier ends with (the engine's poolDemandLabelFilterJQ). The engine pastes the
 # same 655-byte program into all three tiers; it is one variable here. Prefix families (bd's
 # --exclude-label is exact, so these cannot be flags), an unexpired pilot hold, EPIC-titled beads.
@@ -102,6 +127,19 @@ t1_raw=$(bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude
   --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" \
   --exclude-label "gate:reviewing" --json --sort oldest --limit=20 2>/dev/null) || mark 1
 t1_kept=$(printf "%s" "$t1_raw" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null) || mark 1
+if [ "$disk_state" = low ]; then
+  # vazio/falhou/ilegível (no hold text, or jq failed) -> tier 1 answers NOTHING (inert) and is marked unreadable, like any
+  # tier that could not be read: if tiers 2 and 3 find nothing either, the exit-3 line on stderr says so. A hold that could
+  # not be applied is never read as "no work" and never as "go ahead"
+  if [ -n "$disk_hold_jq" ] && t1_held=$(printf "%s" "$t1_kept" | jq -c "$disk_hold_jq" 2>/dev/null); then
+    n_before=$(printf "%s" "$t1_kept" | jq length 2>/dev/null); n_after=$(printf "%s" "$t1_held" | jq length 2>/dev/null)
+    pp_log "free disk under the floor - tier 1 held back $(( ${n_before:-0} - ${n_after:-0} )) new story/stories (ga-vln2py)"
+    t1_kept="$t1_held"
+  else
+    mark 1; t1_kept="[]"
+    pp_log "free disk under the floor but the hold could not be applied (lib or jq) - tier 1 answers nothing (ga-vln2py)"
+  fi
+fi
 r=$(printf "%s" "$t1_kept" | drop_molecules_in_flight | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null)
 found "$r"
 

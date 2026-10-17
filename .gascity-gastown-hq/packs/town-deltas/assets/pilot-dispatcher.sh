@@ -391,6 +391,23 @@ PILOT_SWAP_FREE_OVERRIDE_MB="${PILOT_SWAP_FREE_OVERRIDE_MB:-}"
 PILOT_DISK_FREE_OVERRIDE_MB="${PILOT_DISK_FREE_OVERRIDE_MB:-}"
 PILOT_KERN_PRESSURE_OVERRIDE="${PILOT_KERN_PRESSURE_OVERRIDE:-}"
 
+# ── ga-vln2py (P0, 17/10): DISK FLOOR — a HARD pause on NEW dispatch ──────────────────────────────
+# Free disk below DISK_NEW_WORK_MIN_MB (5120 = 5 GB, packs/town-deltas/assets/scripts/disk-headroom-lib.sh — the one
+# number the Pilot and the pool probes share) → dispatch nothing this sweep, whatever the swap says.
+# Why a separate gate and not a fourth arm of the memory predicate above: that predicate counts the disk only
+# together with LOW FREE SWAP (< 512 MB AND disk < 4 GB) and only feeds the cross-stage YIELD, which also needs a
+# congested Gate. On 17/10 swap sat at 3-4.5 GB, the Gate was not the thing waiting, and the disk still went to
+# ~0 under three agent steps (a repack, a selftest copy of hq.jsonl, go build + golangci-lint): Dolt took ENOSPC
+# on its journal and the city had no data plane for ~16 min. Full PAUSE, same shape as the RAM-pressure gate:
+# nothing is mutated, the candidates are re-picked by a later sweep once the disk is back above the floor.
+# In-flight builders are untouched (dolt-disk-floor-guard.sh nudges them at CRITICAL).
+# FAIL-OPEN, but not silent: a disk that cannot be read ("unknown") dispatches as before and says so on the log —
+# a df hiccup must not stop the city (heavy-guard.sh is the one that fails CLOSED, per step).
+# PILOT_DISK_FLOOR_ENABLED=0 is the kill switch (never in prod). The reading is pinned in selftests with
+# PILOT_DISK_FREE_OVERRIDE_MB (the same seam the memory arm uses) or DISK_FREE_OVERRIDE_MB.
+PILOT_DISK_FLOOR_ENABLED="${PILOT_DISK_FLOOR_ENABLED:-1}"
+PILOT_DISK_LIB="${PILOT_DISK_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/scripts/disk-headroom-lib.sh}"
+
 # ── Stale in-flight slot correction (ga-rk5va adversarial constraint c) ────────
 # A story:in-flight bead normally occupies a builder slot. But a session can hang
 # (the 16h-stuck-session bug) — zero state-transitions for hours while the bead
@@ -2421,6 +2438,34 @@ _pilot_memory_tight() {
   PILOT_MEM_TIGHT_DETAIL="swap_used=${_used:-?}MB swap_free=${_free:-?}MB disk_free=${_disk:-n/a}MB pressure=${_lvl:-?}"
   PILOT_MEM_TIGHT_REASON="$_reason"
   [ -n "$_reason" ] && return 0
+  return 1
+}
+
+# ── ga-vln2py: the DISK FLOOR gate's reader (see the config header above) ──────────────────────────
+# _pilot_disk_floor — return 0 (free disk BELOW the new-work floor: pause dispatch) / 1 (anything else).
+# Sets PILOT_DISK_FLOOR_STATE ("ok" | "low" | "unknown" | "off") and PILOT_DISK_FLOOR_DETAIL (the reading, for
+# the log). Called DIRECTLY, never in $(...), so the globals survive — the shape of _pilot_memory_tight.
+# THREE states, and only a real reading under the floor returns 0: "unknown" (the library cannot be loaded, df
+# prints nothing or something that is not a number) returns 1 — fail-open — with the state named so the caller
+# can log it apart from "ok"; "off" is the kill switch.
+_pilot_disk_floor() {
+  PILOT_DISK_FLOOR_STATE="off"
+  PILOT_DISK_FLOOR_DETAIL=""
+  [ "$PILOT_DISK_FLOOR_ENABLED" = "1" ] || return 1
+  PILOT_DISK_FLOOR_STATE="unknown"
+  # vazio/falhou/ilegível (the library file is absent, or loads without defining the reader) → "unknown", fail-open, never "low"
+  if [ ! -r "$PILOT_DISK_LIB" ] || ! . "$PILOT_DISK_LIB" 2>/dev/null || ! type disk_headroom_state >/dev/null 2>&1; then
+    PILOT_DISK_FLOOR_DETAIL="library unreadable: ${PILOT_DISK_LIB}"
+    return 1
+  fi
+  local _ov="${PILOT_DISK_FREE_OVERRIDE_MB:-${DISK_FREE_OVERRIDE_MB:-}}" _st _free=""
+  # vazio/falhou/ilegível → "unknown" (disk_headroom_state says so itself); a reading under the floor → "low"
+  _st="$(DISK_FREE_OVERRIDE_MB="$_ov" disk_headroom_state "$DISK_NEW_WORK_MIN_MB")" || _st="unknown"
+  _free="$(DISK_FREE_OVERRIDE_MB="$_ov" disk_free_mb)" || _free=""
+  case "$_st" in ok|low) ;; *) _st="unknown" ;; esac
+  PILOT_DISK_FLOOR_STATE="$_st"
+  PILOT_DISK_FLOOR_DETAIL="disk_free=${_free:-?}MB floor=${DISK_NEW_WORK_MIN_MB}MB"
+  [ "$_st" = "low" ] && return 0
   return 1
 }
 
@@ -5385,6 +5430,22 @@ elif [ "$(_pilot_ram_pressure_unreadable)" = "1" ]; then
   # header above) but "couldn't tell" must stay VISIBLE, not collapse silently
   # into the same log-silence as "confirmed clear" on a state-mutating path.
   log "RAM-pressure signal UNREADABLE (stale/corrupt ${PILOT_RAM_LEVEL_FILE}) — fail-open, dispatch proceeding normally this sweep (ga-m2gqb)."
+fi
+
+# ── ga-vln2py: DISK FLOOR — PAUSE dispatch when the free disk is under the new-work floor ───────────
+# See the config header (PILOT_DISK_FLOOR_ENABLED) for the why. Same full-PAUSE shape as the RAM-pressure gate
+# above. No push per sweep: a sweep runs every few minutes and the alarm already belongs to
+# dolt-disk-floor-guard.sh (WARN/CRITICAL with its own cooldowns); this gate only holds the door.
+if _pilot_disk_floor; then
+  warn "Disk floor (${PILOT_DISK_FLOOR_DETAIL}) — PAUSING all dispatch this sweep: a new builder on a disk this low is what filled it on 17/10 and took Dolt down (ENOSPC on the hq journal). Stories stay queued; dispatch resumes on its own once a later sweep reads the disk above the floor (ga-vln2py)."
+  _pilot_write_sweep_pause_state 1 "disk-floor" "Disk floor: ${PILOT_DISK_FLOOR_DETAIL}"
+  # The reason text inside the parens stays CONSTANT on purpose: approved-state-reconciler.py files an unknown
+  # pause reason under its own text, and a changing number in it would be a new "reason" every sweep.
+  log "=== Pilot sweep complete: dispatched=0 (paused: disk floor) ==="
+  exit 0
+elif [ "$PILOT_DISK_FLOOR_STATE" = "unknown" ]; then
+  # Third state kept VISIBLE: "could not read the disk" is not "the disk is fine" (ga-vln2py).
+  log "Disk free UNREADABLE (${PILOT_DISK_FLOOR_DETAIL:-df gave no usable number}) — fail-open, dispatch proceeding normally this sweep; this is NOT a confirmation that the disk is fine (ga-vln2py)."
 fi
 
 # ── ga-a2v0bz: drain window — no NEW dispatch admitted from 23:00 until the nightly reboot ─

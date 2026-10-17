@@ -47,6 +47,7 @@ check "cita o mbp-run.sh DA cidade, com --repo hq e o --dir do hq dentro do work
 check "uma bateria por chamada, caminho relativo, sem .." "$(has "One battery per call, the path relative to that directory and without .. in it" "$PARA")"
 check "rc 96 a 99 = rode local, e NÃO é falha" "$([ "$(has "Exit 96 to 99" "$PARA")$(has "NOT a failure" "$PARA")" = 11 ] && echo 1 || echo 0)"
 check "rc != 0 do nó: rodar a mesma bateria aqui antes de chamar de defeito" "$(has "run the same battery here before you call it a defect" "$PARA")"
+check "rc 96-99 = rodar local PELO guarda de disco (heavy-guard.sh), e recusa 75/76 NÃO se contorna (ga-vln2py)" "$([ "$(has "\"$C/scripts/heavy-guard.sh\" --what X -- bash scripts/X.selftest.sh" "$PARA")$(has "refuses with exit 75" "$PARA")$(has "do NOT run the battery here by another route" "$PARA")" = 111 ] && echo 1 || echo 0)"
 check "explica por quê: o nó só recebe código/doc/config (nunca .beads, .gc, Dolt, backup)" "$(has "never .beads, .gc, Dolt data or backups" "$PARA")"
 check "quem decide o que fica no mini é o wrapper (97); não adivinhar" "$([ "$(has "it answers 97" "$PARA")$(has "do not guess" "$PARA")" = 11 ] && echo 1 || echo 0)"
 check "bateria curta (< 60 s) roda aqui, com o custo da ida e volta (~1 min) dito como medido" "$([ "$(has "The round trip adds" "$PARA")$(has "a battery under about 60 s runs here" "$PARA")$(has "measured 55 to 78 s" "$PARA")" = 111 ] && echo 1 || echo 0)"

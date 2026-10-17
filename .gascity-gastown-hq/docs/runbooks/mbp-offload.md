@@ -79,7 +79,7 @@ scripts/mbp-run.sh --exec --push /caminho/app.asar --pull out.json:/scratch/ -- 
 scripts/mbp-run.sh --check       # saúde do MBP
 scripts/mbp-run.sh --seed wa|ps  # (re)semeia base + site-packages (com checagem de hash)
 ```
-Quem chama trata rc 96..99 como "rode local", nunca como teste reprovado.
+Quem chama trata rc 96..99 como "rode local", nunca como teste reprovado. **O "rode local" de uma bateria PESADA passa pelo guarda de disco** (`scripts/heavy-guard.sh --what X -- bash scripts/X.selftest.sh`): com < 6 GB livres no mini ele recusa com 75/76, e isso não é licença para rodar por outro caminho (ga-vln2py; `docs/runbooks/disk-trabalho-pesado.md`).
 
 Os workers de pool (wa-worker e ps-worker) recebem essa regra no preâmbulo: seção guardada `mbp-offload-tests` do fragment `town-deltas` (ga-yvs19w), registrada em `doctrine.guarded` do `pool-roles.json` com `show_unset: false` — Mayor, crews, dog e revisores não a recebem. Com a chave desligada o `mbp-run.sh` sai 99 e o worker roda local, então a linha é segura mesmo com o offload off.
 

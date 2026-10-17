@@ -586,6 +586,7 @@ run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -609,6 +610,7 @@ run_step0() { # FAKE_STALE_JSON
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -638,6 +640,7 @@ run_neverstarted() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -670,6 +673,7 @@ run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT FAKE_SUPPRESS_LANE
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -698,6 +702,7 @@ run_real_dispatch_escalate() { # FAKE_ESCALATE_AFTER_SHOWS
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -732,6 +737,7 @@ run_real_dispatch_noauto() { # FAKE_NOAUTO_AFTER_SHOWS [FAKE_NOAUTO_LABEL]
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -782,6 +788,7 @@ run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRA
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -816,6 +823,7 @@ run_dispatch_remerge() { # $1=label  $2=PILOT_TEST_REMERGE_BEADS  $3=PILOT_TEST_
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -840,6 +848,7 @@ run_dispatch_remerge_with_feedback() { # $1=label
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -866,6 +875,7 @@ run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)  
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -903,6 +913,7 @@ run_capacity() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -942,6 +953,7 @@ run_lanefull() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -979,15 +991,19 @@ run_lanefull() {
 #   $9 = PILOT_KERN_PRESSURE_OVERRIDE  (ga-9e446u: kernel memory-pressure level 1/2/4)
 #  $10 = PILOT_SWAP_FREE_OVERRIDE_MB   (ga-9e446u: free swap, MB; "" = no reading. With $7
 #                                       and $9 also set, NO memory reading is blind)
+#  $11 = PILOT_DISK_FLOOR_ENABLED      (ga-vln2py: default 1; 0 = the disk-floor kill switch).
+#  The free disk is pinned for EVERY run at 100000 MB (a low-disk host must not turn these scenarios red);
+#  a scenario picks its own reading with PILOT_TEST_DISK_FREE_MB=<MB|unreadable> in front of the call.
 run_ctxready() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
-  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl" "$FIXCITY/.gc/pilot-sweep-pause-state.json"
   reset_state
   env -i \
     DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -1003,6 +1019,8 @@ run_ctxready() {
     PILOT_MEMORY_TIGHT_ENABLED="${8:-1}" \
     PILOT_KERN_PRESSURE_OVERRIDE="${9:-}" \
     PILOT_SWAP_FREE_OVERRIDE_MB="${10:-}" \
+    PILOT_DISK_FLOOR_ENABLED="${11:-1}" \
+    PILOT_SWEEP_PAUSE_STATE_FILE="$FIXCITY/.gc/pilot-sweep-pause-state.json" \
     FAKE_INFLIGHT_JSON="${6:-[]}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
@@ -1027,6 +1045,7 @@ run_emit() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -2540,6 +2559,7 @@ run_remerge_real() { # $1=PILOT_TEST_REMERGE_BEADS  $2=PILOT_TEST_REMERGE_UNKNOW
     PATH="$RMG_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -2759,6 +2779,7 @@ LOG10C="$(env -i \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -2999,6 +3020,7 @@ run_quota() { # $1=PILOT_QUOTA_OVERRIDE  $2=PILOT_QUOTA_ETA_OVERRIDE
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -3616,6 +3638,7 @@ echo "Scenario 16i: PILOT_NEVERSTARTED_MINUTES=0 disables the detector"
 env -i PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" HOME="$HOME" DRY_RUN=1 \
 DRAIN_WINDOW_OVERRIDE="OPEN" \
 PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
   PILOT_CITY_OVERRIDE="$FIXCITY" PILOT_TEST_STATE="$STATE" \
   PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
   PILOT_NEVERSTARTED_MINUTES=0 FAKE_NEVERSTARTED_JSON="$NS_REL" \
@@ -3912,6 +3935,7 @@ run_capacity_reuse() { # $1=PILOT_REUSE_SESSION  $2=FAKE_BUGS_JSON  $3=FAKE_SESS
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -5107,6 +5131,7 @@ env -i \
   DRAIN_WINDOW_OVERRIDE="OPEN" \
   PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" HOME="$HOME" DRY_RUN=1 \
   PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+  DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
   PILOT_CITY_OVERRIDE="$FIXCITY" PILOT_TEST_STATE="$STATE" \
   PILOT_DOLT_LATENCY_OVERRIDE_MS=100 PILOT_DOLT_CPU_OVERRIDE=10 \
   PILOT_DISPATCHABLE_FILE="/this/path/does/not/exist/and/cannot/be/made/x.json" \
@@ -5384,6 +5409,69 @@ else
 fi
 
 # ── Scenario 20e: drift-guard — ctx:ready default flipped to 1 and stays env-gated
+# ── ga-vln2py: the DISK FLOOR gate — a hard pause on NEW dispatch, whatever the swap says ───────────────
+# The 17/10 shape: swap healthy (4.9 GB used, 3 GB free), Gate empty, the disk at the end. The memory arm never
+# fired (it needs low FREE SWAP and a congested Gate); the Pilot kept opening builders. Every call below uses
+# gate-congested=0 on purpose, so a pause can only come from the disk gate, never from the cross-stage yield.
+echo "Scenario 20d-disk-a: free disk 3000 MB (< 5120 floor), swap and Gate fine → the WHOLE sweep pauses, nothing is dispatched"
+LOG20DDA_OK="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "")"
+if echo "$LOG20DDA_OK" | grep "Lane picks — small: tt-cx" >/dev/null && ! echo "$LOG20DDA_OK" | grep "Disk floor" >/dev/null; then
+  ok "baseline: the same fixture on a 100000 MB disk dispatches and never mentions the disk floor"
+else
+  bad "baseline broke — the same fixture with a roomy disk no longer dispatches (or mentions the disk floor): the scenarios below prove nothing"
+fi
+LOG20DDA="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "")"
+if echo "$LOG20DDA" | grep "Disk floor (disk_free=3000MB floor=5120MB)" >/dev/null; then
+  ok "a disk under the floor is on the record with the reading and the floor"
+else
+  bad "no 'Disk floor (disk_free=3000MB floor=5120MB)' line on a 3000 MB disk — the Pilot did not see the disk"
+fi
+if echo "$LOG20DDA" | grep "dispatched=0 (paused: disk floor)" >/dev/null && ! echo "$LOG20DDA" | grep "Lane picks" >/dev/null; then
+  ok "sweep ends 'dispatched=0 (paused: disk floor)' and picks no lane"
+else
+  bad "the sweep kept going on a 3000 MB disk (no 'dispatched=0 (paused: disk floor)' / a 'Lane picks' line is present)"
+fi
+if [ "$(jq -r '[.active, .reason] | join("/")' "$FIXCITY/.gc/pilot-sweep-pause-state.json" 2>/dev/null)" = "true/disk-floor" ]; then
+  ok "the pause state says active/disk-floor, so the painel and the reconciler can explain the wait"
+else
+  bad "pause state is not true/disk-floor: '$(cat "$FIXCITY/.gc/pilot-sweep-pause-state.json" 2>/dev/null)'"
+fi
+
+echo "Scenario 20d-disk-b: the floor is a MINIMUM — exactly 5120 MB dispatches, 5119 MB pauses"
+LOG20DDB1="$(PILOT_TEST_DISK_FREE_MB=5120 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "")"
+LOG20DDB2="$(PILOT_TEST_DISK_FREE_MB=5119 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "")"
+if echo "$LOG20DDB1" | grep "Lane picks — small: tt-cx" >/dev/null; then ok "5120 MB (exactly the floor) dispatches"; else bad "5120 MB paused — the floor is a minimum, not a margin"; fi
+if echo "$LOG20DDB2" | grep "dispatched=0 (paused: disk floor)" >/dev/null; then ok "5119 MB pauses"; else bad "5119 MB did not pause"; fi
+
+echo "Scenario 20d-disk-c: the incident shape — healthy memory readings (4.9 GB swap used, 3 GB free, pressure 1) and a 3000 MB disk → STILL pauses"
+LOG20DDC="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" 4900 1 1 3000)"
+if echo "$LOG20DDC" | grep "dispatched=0 (paused: disk floor)" >/dev/null; then
+  ok "swap fine + disk low pauses (the memory arm needs LOW free swap too; this gate does not)"
+else
+  bad "swap fine + disk low did not pause — the 17/10 hole is still open"
+fi
+
+echo "Scenario 20d-disk-d: PILOT_DISK_FLOOR_ENABLED=0 → the kill switch restores the old behaviour"
+LOG20DDD="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "" "" "" "" 0)"
+if echo "$LOG20DDD" | grep "Lane picks — small: tt-cx" >/dev/null && ! echo "$LOG20DDD" | grep "Disk floor\|Disk free UNREADABLE" >/dev/null; then
+  ok "kill switch off → dispatches on a 3000 MB disk and says nothing about it (off is not blind)"
+else
+  bad "kill switch off still paused or logged about the disk"
+fi
+
+echo "Scenario 20d-disk-e: the disk reading is unreadable → fail-OPEN (dispatches) but NOT SILENT"
+LOG20DDE="$(PILOT_TEST_DISK_FREE_MB=unreadable run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "")"
+if echo "$LOG20DDE" | grep "Lane picks — small: tt-cx" >/dev/null && ! echo "$LOG20DDE" | grep "paused: disk floor" >/dev/null; then
+  ok "an unreadable disk does not stop the city"
+else
+  bad "an unreadable disk reading paused the Pilot (or stopped the lane picks) — it must fail open"
+fi
+if echo "$LOG20DDE" | grep "Disk free UNREADABLE" >/dev/null; then
+  ok "…and the blind reading is on the record, apart from 'the disk is fine'"
+else
+  bad "an unreadable disk left no 'Disk free UNREADABLE' line — blind and fine look the same"
+fi
+
 echo "Scenario 20e: drift-guard — PILOT_CTX_READY_QUERIES defaults to 1 and is env-gated"
 has "$DISPATCHER" 'PILOT_CTX_READY_QUERIES="\$\{PILOT_CTX_READY_QUERIES:-1\}"' \
   "ctx:ready knob defaults to 1 (ON) and remains overridable via env"
@@ -6525,6 +6613,7 @@ run_wa_rig_tier2() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -6615,6 +6704,7 @@ run_rig_tier1() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -6766,6 +6856,7 @@ run_hq_tier2() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -7086,6 +7177,7 @@ run_capq_dispatch() {
     PATH="$CAPQ_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -7896,6 +7988,7 @@ run_topup_scenario() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN="${3:-1}" \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -8013,6 +8106,7 @@ run_topup_candidates_scenario() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN="0" \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -8224,6 +8318,7 @@ run_topup_rig_scenario() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN="${3:-1}" \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -8409,6 +8504,7 @@ run_ps_worker_dispatch() {
     PATH="$PS_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -8486,6 +8582,7 @@ run_lx_pool_dispatch() {
     PATH="$LX_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -8557,6 +8654,7 @@ run_ps_worker_dispatch_own_guard() {
     PATH="$PS_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -9358,6 +9456,7 @@ run_y1m40() {
     PATH="$_y_pre$SHIMBIN:/usr/bin:/bin:/usr/local/bin:$Y1M40_TO_OK" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -9389,6 +9488,7 @@ run_y1m40_stall() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN=0 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \
@@ -10353,6 +10453,7 @@ run_ram() { # $1=PILOT_RAM_PRESSURE_OVERRIDE
     PILOT_DOLT_CPU_OVERRIDE=10 \
     PILOT_RAM_PRESSURE_OVERRIDE="$1" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     FAKE_BLOCKED_IDS="" \
     FAKE_BUGS_JSON='[{"id":"tt-ram","title":"ram fixture bug","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
@@ -10633,6 +10734,7 @@ run_lanefull_topup() {
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRY_RUN="${3:-0}" \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
     PILOT_TEST_STATE="$STATE" \

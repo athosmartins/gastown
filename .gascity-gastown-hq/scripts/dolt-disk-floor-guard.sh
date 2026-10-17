@@ -112,7 +112,11 @@
 #                             this bead's own incident actually reached
 #                             (avail as low as 1GB), not every routine WARN dip.
 #
-#   CRITICAL_GB (default 3) — same reclaim attempts + notify ALWAYS (cooldown
+#   CRITICAL_GB (default 3) — FIRST (before the photo and the levers) a `gc session
+#                             nudge` to every ACTIVE dog/wa-worker/ps-worker/gate-
+#                             reviewer session: stop heavy steps now (ga-vln2py,
+#                             _nudge_pool_heavy_stop; 15-min cooldown; crews are
+#                             not nudged); then same reclaim attempts + notify ALWAYS (cooldown
 #                             bypassed unconditionally — this is the last rung
 #                             before repeating ga-vs55) + a DURABLE mail to the
 #                             Mayor once CRITICAL_MAIL_SUSTAIN (default 2)
@@ -2963,6 +2967,72 @@ _resurrect_dolt() {
   return 1
 }
 
+# ── ga-vln2py (P0): at CRITICAL, tell the active POOL sessions to stop heavy steps ─────────────────────
+# 17/10 12:40-12:56: three pool/agent steps (a git repack, a selftest copying hq.jsonl, go build + golangci-lint)
+# ran with the disk already low and filled it; this guard only cleaned caches AFTER the fact and told the Athos
+# and the Mayor, never the sessions that were doing it. This lever is the missing "stop now": one `gc session
+# nudge` to every ACTIVE session of the pool templates in POOL_NUDGE_TEMPLATES (default dog, wa-worker, ps-worker,
+# gate-reviewer; crews are NOT nudged — a person may be attached). Default delivery (wait-idle): the text reaches
+# the session at its next idle moment, so it cannot interrupt a step already running, but it does stop the NEXT
+# heavy step; heavy-guard.sh is what refuses one that starts anyway. Detection-and-tell only: nothing is killed.
+#   - COOLDOWN (POOL_NUDGE_COOLDOWN_SECS, 900): a CRITICAL episode lasts many 5-min cycles; the same text every
+#     cycle would be noise a session learns to ignore. The stamp is written only when at least one nudge landed.
+#   - THREE STATES for "who is there to tell": the list could not be read (gc failed/timed out, not JSON, ok=false)
+#     -> log it, send nothing, leave the stamp alone so the next cycle retries; read and EMPTY -> log "none";
+#     read and not empty -> nudge each. A failed list is never the same as "no pool sessions".
+#   - DOLT_DISK_FLOOR_POOL_NUDGE=0 switches it off (never in prod).
+POOL_NUDGE_ENABLED="${DOLT_DISK_FLOOR_POOL_NUDGE:-1}"
+POOL_NUDGE_COOLDOWN_SECS="${DOLT_DISK_FLOOR_POOL_NUDGE_COOLDOWN_SECS:-900}"
+case "$POOL_NUDGE_COOLDOWN_SECS" in ''|*[!0-9]*) POOL_NUDGE_COOLDOWN_SECS=900 ;; esac
+POOL_NUDGE_TEMPLATES="${DOLT_DISK_FLOOR_POOL_NUDGE_TEMPLATES:-gastown.dog wa-worker ps-worker gate-reviewer}"
+STATE_POOL_NUDGE_FILE="$STATE_DIR/.dolt-disk-floor-guard.last-pool-nudge"
+
+_nudge_pool_heavy_stop() {
+  local avail="$1" now="$2" last list targets target msg sent=0 failed=0
+  [ "$POOL_NUDGE_ENABLED" = "1" ] || return 0
+  # vazio (no stamp yet) -> go; ilegível (not a number) -> go too: a broken stamp must never mute the stop-now notice
+  last="$(cat "$STATE_POOL_NUDGE_FILE" 2>/dev/null)" || last=""
+  if ! _cooldown_elapsed "$last" "$now" "$POOL_NUDGE_COOLDOWN_SECS"; then
+    log "pool nudge: last sent at epoch ${last}, inside the ${POOL_NUDGE_COOLDOWN_SECS}s cooldown - not repeating the stop-heavy-steps notice this cycle (ga-vln2py)"
+    return 0
+  fi
+  # vazio -> "none" below; falhou/ilegível (gc failed or hung, not JSON, ok=false) -> logged, nobody nudged, stamp untouched
+  # (`.ok != false`, not `.ok // true`: jq's // reads false as absent and would turn ok=false into healthy)
+  list="$(timeout 20 "$GC" session list --json 2>/dev/null)" || list=""
+  if ! printf '%s' "$list" | jq -e '(.ok != false) and ((.sessions // []) | type == "array")' >/dev/null 2>&1; then
+    log "WARN pool nudge: could not read the session list (gc session list failed, timed out or answered something that is not a session list) - NOBODY was told to stop heavy steps this cycle; retrying next cycle (ga-vln2py)"
+    return 0
+  fi
+  # vazio -> "none" (just below); falhou/ilegível (jq died on a list it had just validated) -> logged, nobody nudged, stamp
+  # untouched - a jq failure is never the same as "no pool session is active"
+  targets="$(printf '%s' "$list" | jq -r --arg tpls "$POOL_NUDGE_TEMPLATES" '($tpls | split(" ") | map(select(length > 0))) as $t | (.sessions // [])[] | select(.state == "active") | select(.template as $x | $t | index($x) != null) | (.alias // .id // empty)' 2>/dev/null)" || {
+    log "WARN pool nudge: could not pick the active pool sessions out of the session list (jq failed) - NOBODY was told to stop heavy steps this cycle; retrying next cycle (ga-vln2py)"
+    return 0
+  }
+  if [ -z "$targets" ]; then
+    log "pool nudge: no active session of [${POOL_NUDGE_TEMPLATES}] to tell (ga-vln2py)"
+    return 0
+  fi
+  msg="DISK CRITICAL on the mini (${avail} GB free, floor ${FLOOR_CRITICAL_GB} GB): stop any HEAVY step now - go build/test, golangci-lint, git repack/gc, a selftest that builds fixtures or copies a database - and do not start another until the disk recovers. Check with: ${CITY}/scripts/heavy-guard.sh --check (it refuses under 6 GB). Light work (reading, editing, small commands) is fine. On 17/10 steps like these filled the disk and Dolt took ENOSPC (ga-vln2py). This is an automatic notice from dolt-disk-floor-guard, not a request from the Athos."
+  while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    if timeout 15 "$GC" session nudge "$target" "$msg" >/dev/null 2>&1; then
+      sent=$((sent + 1))
+    else
+      failed=$((failed + 1))
+      log "WARN pool nudge: could not nudge ${target} (gc session nudge failed or timed out) (ga-vln2py)"
+    fi
+  done <<EOF
+$targets
+EOF
+  log "pool nudge: told ${sent} active pool session(s) to stop heavy steps (${failed} failed; avail=${avail}GB) (ga-vln2py)"
+  if [ "$sent" -gt 0 ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf '%s' "$now" > "$STATE_POOL_NUDGE_FILE" 2>/dev/null || log "WARN pool nudge: could not write the cooldown stamp ${STATE_POOL_NUDGE_FILE} - the next cycle will nudge again"
+  fi
+  return 0
+}
+
 main() {
   local avail class now
 
@@ -3038,6 +3108,14 @@ main() {
   # mail-Mayor alert entirely).
   local was_critical=0
   [ "$class" = "CRITICAL" ] && was_critical=1
+
+  # ga-vln2py: tell the active pool sessions to stop heavy steps FIRST - before the growth photo and the reclaim
+  # levers below, which take time while a session may be about to start the step that fills the rest of the disk.
+  # Keyed off the PRE-reclaim reading (was_critical) like the notify below; a reclaim that recovers the disk
+  # afterwards does not take the notice back, it expires with the cooldown. Never aborts the cycle.
+  if [ "$was_critical" = "1" ]; then
+    _nudge_pool_heavy_stop "$avail" "$now" || log "WARN: _nudge_pool_heavy_stop failed (non-fatal)"
+  fi
 
   # ga-sfj3i.3: snapshot avail BEFORE the three floor-triggered levers run,
   # so their combined effect can be measured (reclaimed_gb below) instead of

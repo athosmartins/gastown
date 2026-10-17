@@ -3166,6 +3166,15 @@ REAP_BACKUP_STAGING_CALLS=0
 REAP_BACKUP_STAGING_LAST_ARG=""
 _reap_bloated_backup_staging() { REAP_BACKUP_STAGING_CALLS=$((REAP_BACKUP_STAGING_CALLS+1)); REAP_BACKUP_STAGING_LAST_ARG="${1:-}"; }
 
+# _nudge_pool_heavy_stop is new (ga-vln2py), same reasoning as the reap stubs above: EXECUTION code (a real
+# `gc session list` + `gc session nudge` per pool session, proven in isolation by
+# dolt-disk-floor-guard.pool-nudge.selftest.sh with a fake gc) stubbed here so main()'s WIRING is what gets proven.
+# The stub snapshots how far the cycle had got AT CALL TIME (no scratch reap, no growth photo yet: the sessions are
+# told FIRST) and the pre-reclaim avail main() passed; NUDGE_RC drives its return code (a failing nudge must never
+# abort the cycle).
+NUDGE_CALLS=0; NUDGE_LAST_AVAIL=""; NUDGE_LAST_NOW=""; NUDGE_AT_CALL=""; NUDGE_RC=0
+_nudge_pool_heavy_stop() { NUDGE_CALLS=$((NUDGE_CALLS+1)); NUDGE_LAST_AVAIL="${1:-}"; NUDGE_LAST_NOW="${2:-}"; NUDGE_AT_CALL="reap=$REAP_CALLS/photo=$GROWTH_PHOTO_CALLS"; return "$NUDGE_RC"; }
+
 NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""
 record_notify() {
   NOTIFY_CALLS=$((NOTIFY_CALLS+1))
@@ -3208,7 +3217,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_ORPHAN_TEST_DOLT_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; GROWTH_PHOTO_CALLS=0; GROWTH_PHOTO_LAST_CLASS=""; GROWTH_PHOTO_LAST_AVAIL=""; GROWTH_PHOTO_REAP_AT_CALL=""; GROWTH_BASELINE_CALLS=0; rm -f "$(_growth_episode_file)";
+reset_capture() { NUDGE_CALLS=0; NUDGE_LAST_AVAIL=""; NUDGE_LAST_NOW=""; NUDGE_AT_CALL=""; NUDGE_RC=0; NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_ORPHAN_TEST_DOLT_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; GROWTH_PHOTO_CALLS=0; GROWTH_PHOTO_LAST_CLASS=""; GROWTH_PHOTO_LAST_AVAIL=""; GROWTH_PHOTO_REAP_AT_CALL=""; GROWTH_BASELINE_CALLS=0; rm -f "$(_growth_episode_file)";
   # ga-4f4opx: clear the mail-debounce/recovery state too, so every scenario
   # starts with a clean slate by default (no leftover "already mailed this
   # avail" or "episode already mailed" from whichever scenario ran before
@@ -3862,6 +3871,52 @@ case "$GC_MAIL_LAST_BODY" in
   *"WHAT GREW (ga-ond0fa)"*"no disk-growth photo recorded for this episode"*) ok "main(): with no photo this episode the mail says so explicitly instead of omitting the section" ;;
   *) bad "main(): mail body should state that no growth photo exists: $(printf '%s' "$GC_MAIL_LAST_BODY" | tail -c 400)" ;;
 esac
+
+echo ""
+echo "=== main(): CRITICAL tells the active pool sessions to stop heavy steps (ga-vln2py) ==="
+# Scenario N1 — a CRITICAL cycle (even one the reclaim then recovers) calls the nudge ONCE, with the PRE-reclaim
+# avail, and BEFORE the growth photo and the reclaim levers (the sessions are told first).
+reset_capture; seed_state "" ""
+queue_avail 2 20
+main
+if [ "$NUDGE_CALLS" = "1" ] && [ "$NUDGE_LAST_AVAIL" = "2" ]; then
+  ok "main(): a CRITICAL cycle calls _nudge_pool_heavy_stop once with the pre-reclaim avail (2), even though the reclaim then recovers it"
+else
+  bad "main(): expected 1 nudge with avail=2 on a CRITICAL cycle, got NUDGE_CALLS=$NUDGE_CALLS NUDGE_LAST_AVAIL='$NUDGE_LAST_AVAIL'"
+fi
+if [ "$NUDGE_AT_CALL" = "reap=0/photo=0" ]; then
+  ok "main(): …and it ran BEFORE the growth photo and the reclaim levers (reap=0/photo=0 at call time)"
+else
+  bad "main(): the nudge must run before the photo and the levers, got '$NUDGE_AT_CALL'"
+fi
+case "$NUDGE_LAST_NOW" in ''|*[!0-9]*) bad "main(): the nudge did not get the cycle's epoch as \$2 (got '$NUDGE_LAST_NOW')" ;; *) ok "main(): the nudge gets the cycle's epoch (for its cooldown)" ;; esac
+
+# Scenario N2 — WARN-only (never CRITICAL): nobody is told to stop. Reuses scenario C's readings.
+reset_capture; seed_state "" ""
+past_epoch=$(( $(date +%s) - 100 ))
+seed_state "$past_epoch" 6
+queue_avail 6 6
+main
+[ "$NUDGE_CALLS" = "0" ] && ok "main(): a WARN-only cycle does not nudge the pool (the stop-now notice is a CRITICAL lever)" || bad "main(): a WARN-only cycle nudged the pool ($NUDGE_CALLS call(s))"
+
+# Scenario N3 — comfortably above the floor on the first read: nothing.
+reset_capture; seed_state "" ""
+queue_avail 20
+main
+[ "$NUDGE_CALLS" = "0" ] && ok "main(): avail above the floor never nudges the pool" || bad "main(): a healthy-disk cycle nudged the pool ($NUDGE_CALLS call(s))"
+
+# Scenario N4 — the nudge failing must not abort the cycle: the CRITICAL notify and the reclaim still happen.
+reset_capture; seed_state "" ""
+NUDGE_RC=1
+queue_avail 2 2
+main
+if [ "$NUDGE_CALLS" = "1" ] && [ "$NOTIFY_CALLS" = "1" ] && [ "$REAP_CALLS" = "1" ]; then
+  ok "main(): a failing nudge (rc 1) is logged and the cycle carries on — CRITICAL notify and the reclaim levers still run"
+else
+  bad "main(): a failing nudge broke the cycle (nudge=$NUDGE_CALLS notify=$NOTIFY_CALLS reap=$REAP_CALLS)"
+fi
+grep -q "_nudge_pool_heavy_stop failed (non-fatal)" "$LOG" && ok "main(): …and the failure is on the log" || bad "main(): the nudge failure left no line on the log"
+NUDGE_RC=0
 
 rm -rf "$STATE_TMP"
 

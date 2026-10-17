@@ -243,7 +243,9 @@ that takes more than about 60 s on this loaded machine, run it on the Linux test
   "$_city/scripts/mbp-run.sh" --repo hq --dir <your-worktree>/.gascity-gastown-hq -- scripts/X.selftest.sh
 One battery per call, the path relative to that directory and without .. in it. Exit 96 to 99 means the server did not run it (switched off,
 unhealthy, no free slot, a battery that must stay on this machine, or the server base is not seeded): that is NOT a failure, run the same
-battery here with bash. Exit 0 to 95 is the battery own exit code. When it is not 0, run the same battery here before you call it a defect:
+battery here, through the disk guard: "$_city/scripts/heavy-guard.sh" --what X -- bash scripts/X.selftest.sh . The guard refuses with exit 75 (or 76)
+when under 6 GB of disk is free, because a heavy step on a full disk took Dolt down on 17/10: then do NOT run the battery here by another route,
+say in your review that it could not be run and why. Exit 0 to 95 is the battery own exit code. When it is not 0, run the same battery here before you call it a defect:
 the server receives only code, docs and config (never .beads, .gc, Dolt data or backups), so a battery that needs them fails there for a
 reason that is not this diff. The wrapper decides which batteries stay on this machine (it answers 97), so do not guess. The round trip adds
 about a minute (copy and scan; measured 55 to 78 s at load 70), so a battery under about 60 s runs here. Run it the way you run any long

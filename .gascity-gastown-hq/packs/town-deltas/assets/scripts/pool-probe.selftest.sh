@@ -34,6 +34,7 @@ command -v python3 >/dev/null 2>&1 || { echo "FATAL: python3 required"; exit 1; 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/pool-probe-selftest.XXXXXX")"
 trap '[ -n "${TMP:-}" ] && [ -d "$TMP" ] && rm -rf -- "$TMP"' EXIT
 FAKE="$TMP/bin"; FIX="$TMP/fix"; mkdir -p "$FAKE" "$FIX"
+GOOD_LIB="$SELF_DIR/disk-headroom-lib.sh"
 
 # ---- the engine's probe: unwrap `sh -c '<body>' -- <target>` exactly as the shell would ----------------
 golden_line="$(cat "$GOLDEN")"
@@ -80,7 +81,7 @@ run_both() {
   : > "$TMP/gold.log"; : > "$TMP/mine.log"
   local g m g_rc m_rc
   g="$(BD_LOG="$TMP/gold.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN="$ORIGIN" sh -c "$body" -- "$@" 2>"$TMP/gold.err")"; g_rc=$?
-  m="$(BD_LOG="$TMP/mine.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN="$ORIGIN" sh "$PROBE" "$@" 2>"$TMP/mine.err")"; m_rc=$?
+  m="$(BD_LOG="$TMP/mine.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN="$ORIGIN" DISK_FREE_OVERRIDE_MB=100000 POOL_PROBE_LOG="$TMP/pp.log" sh "$PROBE" "$@" 2>"$TMP/mine.err")"; m_rc=$?
   local gids
   gids="$(printf '%s' "$g" | jq -r 'if type == "array" then map(.id) | join(",") else "?" end' 2>/dev/null)"
   [ -z "$g" ] && gids="(no output)"
@@ -275,6 +276,62 @@ if [ "$LIVE" = 1 ]; then
 else
   skip "--live drift check not requested"
 fi
+
+echo "== 11. ga-vln2py: free disk under the floor -> tier 1 holds back new STORIES (no gc.kind); workflow beads and tiers 2/3 keep flowing"
+# The engine's probe knows nothing of disks, so these run the script alone. dprobe <disk> [VAR=val...] -> D_OUT D_RC D_ERR.
+dprobe() {
+  local disk="$1"; shift
+  : > "$TMP/pp.log"
+  D_OUT="$(env BD_LOG="$TMP/disk.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN=ephemeral DISK_FREE_OVERRIDE_MB="$disk" POOL_PROBE_LOG="$TMP/pp.log" "$@" sh "${DPROBE:-$PROBE}" gastown.dog 2>"$TMP/disk.err")"; D_RC=$?
+  D_ERR="$(cat "$TMP/disk.err")"
+  D_IDS="$(printf '%s' "$D_OUT" | jq -r 'if type == "array" then map(.id) | join(",") else "?" end' 2>/dev/null)"; [ "$D_IDS" = "" ] && D_IDS="-"
+}
+reset_fix
+cat > "$FIX/tier1.json" <<'EOF'
+[
+ {"id":"st-old","updated_at":"2026-01-01T00:00:00Z","labels":["story:approved"],"metadata":{"gc.routed_to":"gastown.dog"}},
+ {"id":"wf-new","updated_at":"2026-01-05T00:00:00Z","labels":[],"metadata":{"gc.routed_to":"gastown.dog","gc.kind":"workflow"}}
+]
+EOF
+dprobe 100000;  eq "roomy disk: the oldest bead (a story) is handed out, as before" "$D_IDS" "st-old"
+dprobe 5120;    eq "exactly the floor (5120 MB) is not low" "$D_IDS" "st-old"
+dprobe 5119;    eq "one MB under the floor: the story is held back, the workflow bead flows" "$D_IDS" "wf-new"
+eq "…without a word on stderr (a hold is an answer, not a doubt)" "$D_ERR" ""
+eq "…and exit 0" "$D_RC" "0"
+grep -q 'held back 1 new story' "$TMP/pp.log" && ok "the hold is on the record in the pool-probe log" || bad "no 'held back 1 new story' line in the pool-probe log"
+dprobe 3000 DISK_HEADROOM_ENABLED=0; eq "kill switch DISK_HEADROOM_ENABLED=0 -> as before even on a low reading" "$D_IDS" "st-old"
+cat > "$FIX/tier1.json" <<'EOF'
+[{"id":"st-only","updated_at":"2026-01-01T00:00:00Z","labels":[],"metadata":{"gc.routed_to":"gastown.dog"}}]
+EOF
+dprobe 3000
+eq "only stories waiting + low disk: []" "$D_OUT" "[]"
+eq "…exit 0 and silent: a real 'nothing for you', the dog drains" "$D_RC:$D_ERR" "0:"
+cat > "$FIX/legacy.json" <<'EOF'
+[{"id":"lg-1","updated_at":"2026-01-01T00:00:00Z","labels":[],"metadata":{"gc.run_target":"gastown.dog","gc.kind":"workflow"}}]
+EOF
+dprobe 3000;    eq "low disk: tier 2 (legacy workflow) still answers when tier 1 has only stories" "$D_IDS" "lg-1"
+rm -f "$FIX/legacy.json"
+dprobe garbage; eq "unreadable disk: fail OPEN, the story is handed out" "$D_IDS" "st-only"
+grep -q 'free disk unreadable' "$TMP/pp.log" && ok "…and the blind reading is on the record (not the same as 'disk fine')" || bad "unreadable disk left no line in the pool-probe log"
+dprobe 3000 POOL_PROBE_DISK_LIB=/nonexistent-lib; eq "lib missing: unknown -> fail OPEN (the story is handed out)" "$D_IDS" "st-only"
+printf 'disk_headroom_state() { if then fi\n' > "$TMP/corrupt-lib.sh"
+dprobe 3000 POOL_PROBE_DISK_LIB="$TMP/corrupt-lib.sh"; eq "lib with a syntax error: the probe survives and fails OPEN" "$D_IDS:$D_RC" "st-only:0"
+printf 'DISK_NEW_WORK_MIN_MB=1\ndisk_headroom_state() { printf low; }\n' > "$TMP/nohold-lib.sh"
+dprobe 3000 POOL_PROBE_DISK_LIB="$TMP/nohold-lib.sh"
+eq "low but the hold text is unavailable: nothing handed out, tier 1 flagged, exit 3 (loud, not 'no work')" "$D_OUT:$D_RC" "[]:3"
+case "$D_ERR" in *"tier(s) 1 unreadable"*) ok "…and stderr says tier 1 was unreadable" ;; *) bad "…stderr lacks 'tier(s) 1 unreadable': $D_ERR" ;; esac
+# mutants of the script: each must change at least one answer above (a hold that never fires, a hold that fails closed)
+sed 's/\[ "\$disk_state" = low \]; then$/[ "$disk_state" = never ]; then/' "$PROBE" > "$TMP/pp-nohold.sh"
+cmp -s "$PROBE" "$TMP/pp-nohold.sh" && bad "mutant 'hold never fires' did not change the script"
+cp "$PROBE" "$TMP/pp-hold-copy.sh"
+DPROBE="$TMP/pp-nohold.sh" POOL_PROBE_DISK_LIB="$GOOD_LIB" dprobe 3000 POOL_PROBE_DISK_LIB="$GOOD_LIB"
+[ "$D_IDS" = "st-only" ] && ok "mutant 'hold never fires' is killed: the low-disk answer ([]) differs" || bad "mutant 'hold never fires' survived"
+sed 's/^case "\$disk_state" in ok|low) ;; \*) disk_state=unknown ;; esac$/case "$disk_state" in ok|low) ;; *) disk_state=low ;; esac/' "$PROBE" > "$TMP/pp-failclosed.sh"
+cmp -s "$PROBE" "$TMP/pp-failclosed.sh" && bad "mutant 'unknown becomes low' did not change the script"
+DPROBE="$TMP/pp-failclosed.sh" dprobe garbage POOL_PROBE_DISK_LIB="$GOOD_LIB"
+[ "$D_IDS" != "st-only" ] && ok "mutant 'unknown becomes low' is killed: the fail-open answer differs" || bad "mutant 'unknown becomes low' survived"
+DPROBE=""
+reset_fix
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
