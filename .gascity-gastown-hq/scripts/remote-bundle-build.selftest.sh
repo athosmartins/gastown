@@ -450,6 +450,11 @@ for bad in '../ok-skill' 'ok-*' 'a/b' ''; do
 done
 
 # --- "não consegui ler" não é "não tem nada": pasta ilegível dentro de skill e dentro de OUT (os.walk e rglob engoliam o erro) ---
+# a PRÓPRIA skills/ ilegível: a lista de skills não vira "nenhuma skill" nem "todas liberadas" — recusa (3) dizendo que a entrada não abriu, e nada é escrito (ga-2hd02v.1.5.2: `sorted(sdir.iterdir())`)
+fresh; SD=$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills
+if lock "$SD"; then
+  refuses "skills/ ilegível (chmod 000): recusa, não 'sem skills'" "$T/f" --skills; why "entrada ilegível"; chmod 755 "$SD"
+else echo "SKIP  skills/ ilegível: este usuário lê tudo (root)"; fi
 S=$T/f/gt/.gascity-gastown-hq/skills/ok-skill
 fresh; mkdir -p "$S/refs/deep"; echo '# ref' > "$S/refs/deep/ref.md"; echo '# topo' > "$S/refs/topo.md"
 if lock "$S/refs/deep"; then
