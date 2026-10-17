@@ -1,0 +1,199 @@
+#!/bin/bash
+# dolt-restore-lab-mbp.sh (ga-3kmvyr) — the weekly REAL restore drill of the S3 backup: the mini orchestrates, the MBP restores.
+#
+# Contents
+#   Por quê · Uso · Manifest · Estado
+#
+# POR QUÊ: o flatten do hq (ga-2895yv, irreversível) depende de provar que o backup do S3 VOLTA. O laboratório (dolt-restore-lab.sh)
+#   faz o restore; este script o põe no MBP (decisão do Athos 15/10: dado de beads não vai para o Hetzner) e confere o resultado
+#   contra um manifest contado no MESMO commit que o restaurado. ESTA FATIA (2/4, ga-3kmvyr.2) é a metade do mini, só leitura: o
+#   manifest AS OF e a lista dos objetos do S3. O envio ao MBP e o restore chegam na fatia 3/4 (ga-3kmvyr.3).
+#
+# USO   dolt-restore-lab-mbp.sh --dry-run [--db NAME]   monta o manifest AS OF e lista os objetos do S3 (só leitura no mini); sem MBP
+#       dolt-restore-lab-mbp.sh --check                 o MBP está livre? (mbp-run.sh --check); sai 0 se livre, 4 se não
+#
+#   MANIFEST  _meta/latest.json diz o `head` do hq que está GARANTIDO dentro do backup (o backup lê o head ANTES do sync). A contagem de
+#             cada tabela é `SELECT COUNT(*) … AS OF '<head>'` no banco vivo; o lab exige IGUALDADE no restaurado. head ausente no
+#             vivo = UNKNOWN, nunca OK.
+#   LISTA     os objetos do prefixo <db>/ do bucket: key<TAB>size<TAB>etag. Chave fora de [A-Za-z0-9._/-], com "..", fora do prefixo,
+#             tamanho ou ETag ilegível, lista vazia ou que soma 0 bytes = UNKNOWN (nada é enviado a lugar nenhum).
+#
+# ESTADO  $STATE/lock (+ lock.reclaim, o mutex de quem recolhe uma trava velha) · $STATE/runs/<UTC>-<pid>/ (manifest.json, listing.tsv, orchestrator.log)
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CITY="${LABMBP_CITY:-/Users/athos/gt/.gascity-gastown-hq}"
+STATE="${LABMBP_STATE:-$CITY/.gc/dolt-restore-lab-mbp}"
+MBP_RUN="${LABMBP_MBP_RUN:-$HERE/mbp-run.sh}"
+AWS="${LABMBP_AWS:-aws}"; DOLT="${LABMBP_DOLT:-dolt}"; PY="${LABMBP_PY:-python3}"
+DOLT_CFG="${LABMBP_DOLT_CFG:-$CITY/.gc/runtime/packs/dolt/dolt-config.yaml}"
+BUCKET="${LABMBP_BUCKET:-urblink-dolt-backups}"
+TMO=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)   # todo dolt/aws roda sob timeout: um dolt pendurado segurava a trava
+CALL_S="${LABMBP_CALL_S:-900}"
+
+# tudo que sai do mini rumo ao MBP (mbp-run) roda SEM nenhuma variável AWS_* do ambiente: só o aws do mini enxerga a credencial
+NOAWS=(env); for v in $(env | cut -d= -f1 | grep '^AWS_'); do NOAWS+=(-u "$v"); done
+DB="hq"; MODE=run; LOCKED=0; RECL=0; WHY=""; RUN=""; OUT=""
+NOBJ="?"; TOTAL_KB="?"
+
+log() { printf '%s [lab-mbp] %s\n' "$(date '+%F %T')" "$*"; [ -z "$RUN" ] || printf '%s %s\n' "$(date '+%T')" "$*" >> "$RUN/orchestrator.log"; }
+isnum() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# Formas conferidas AQUI, na variavel que e usada (a do SQL), e nao so no ajudante: listas explicitas, sem faixa — a faixa a-v depende do locale no bash 3.2.
+ishead() { case "${1:-}" in ''|*[!0123456789abcdefghijklmnopqrstuv]*) return 1 ;; esac; [ "${#1}" -eq 32 ]; }
+isutc() { case "${1:-}" in ''|*[!0123456789TZ:-]*) return 1 ;; esac; [ "${#1}" -eq 20 ]; }
+
+# Um ajudante Python só (JSON/CSV sem jq). Qualquer exceção sai com status != 0: quem chama trata como "ilegível".
+read -r -d '' PYHELP <<'PY' || true
+import csv, json, re, sys
+mode = sys.argv[1]
+# tudo que vem do S3 e NAO CONFIAVEL: so ASCII, ancorado no fim com \Z ($ aceitaria um \n final; \d e str.isdigit() aceitam digitos Unicode)
+H = re.compile(r"[0-9a-v]{32}\Z"); N = re.compile(r"[A-Za-z0-9_]+\Z"); D = re.compile(r"[0-9]+\Z")
+U = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+if mode == "meta":                      # stdin = latest.json; argv[2] = db  → run_utc<TAB>head (a linha e partida no TAB: nenhum campo pode ter um)
+    d = json.load(sys.stdin); ru = d["run_utc"]; hd = d["databases"][sys.argv[2]]["head"]
+    assert isinstance(ru, str) and U.match(ru) and isinstance(hd, str) and H.match(hd)
+    print("%s\t%s" % (ru, hd))
+elif mode == "union":                   # stdin = SHOW FULL TABLES AS OF (csv); argv[2] = head → um SELECT com a contagem de cada tabela
+    assert H.match(sys.argv[2]); names = []
+    for r in list(csv.reader(sys.stdin))[1:]:
+        if r[1] == "BASE TABLE":
+            assert N.match(r[0]); names.append(r[0])
+    assert names
+    print(" UNION ALL ".join("SELECT '%s' AS t, COUNT(*) AS n FROM `%s` AS OF '%s'" % (n, n, sys.argv[2]) for n in names))
+elif mode == "manifest":                # stdin = t,n (csv); argv[2] = db, argv[3] = head
+    t = {}
+    for r in list(csv.reader(sys.stdin))[1:]:
+        assert N.match(r[0]) and D.match(r[1]); t[r[0]] = int(r[1])
+    assert t and H.match(sys.argv[3])
+    print(json.dumps({"schema": 1, "db": sys.argv[2], "as_of": sys.argv[3], "tables": t}, sort_keys=True))
+elif mode == "listing":                 # stdin = `s3api list-objects-v2 --output text` (key, size, "etag"); argv[2] = prefix ("hq/") → key<TAB>size<TAB>etag
+    K = re.compile(r"[A-Za-z0-9._/-]+\Z"); E = re.compile(r"[0-9a-f]{32}(-[0-9]+)?\Z"); rows = []
+    for ln in sys.stdin.read().splitlines():
+        k, s, e = ln.split("\t"); e = e.strip('"')
+        assert K.match(k) and k.startswith(sys.argv[2]) and ".." not in k.split("/") and D.match(s) and E.match(e)
+        rows.append("%s\t%s\t%s" % (k, s, e))
+    assert rows
+    print("\n".join(rows))
+PY
+
+cleanup() { [ "$LOCKED" -eq 0 ] || rm -rf "$STATE/lock"; [ "$RECL" -eq 0 ] || rmdir "$STATE/lock.reclaim" 2>/dev/null; }
+trap cleanup EXIT
+# SIGTERM/INT/HUP: o bash so roda este trap quando o filho em primeiro plano (dolt/aws sob timeout) termina, entao um kill espera ate CALL_S;
+# um kill -9 nao roda trap nenhum e deixa a trava para o proximo recolher (pid morto) — nada fica preso para sempre.
+trap 'exit 143' INT TERM HUP
+
+usage() { sed -n '2,/^set -uo/p' "$0" | sed '$d' | cut -c3-; }
+
+# A trava existente pode ser recolhida? 0 = sim (sumiu, pid morto ou velha) · 1 = nao (WHY diz por que). Le o estado de AGORA, nao um valor guardado.
+lock_stale() {
+  local p; p=$(cat "$STATE/lock/pid" 2>/dev/null)
+  [ -d "$STATE/lock" ] || return 0
+  # 12 h = mais que o teto de uma rodada: a trava mais velha e de uma rodada que morreu, mesmo que o pid exista (pid reaproveitado apos reboot)
+  [ -z "$(find "$STATE/lock" -maxdepth 0 -mmin +720 2>/dev/null)" ] || return 0
+  if isnum "$p"; then   # kill -0 da EPERM para pid de outro usuario: ps -p nao
+    if kill -0 "$p" 2>/dev/null || ps -p "$p" >/dev/null 2>&1; then WHY="outra rodada em curso (pid $p): nada a fazer"; return 1; fi
+    return 0
+  fi
+  WHY="trava sem pid legivel e recente ($STATE/lock): nada a fazer"; return 1   # pid vazio/ilegivel nao e morto: e de quem acabou de criar
+}
+
+# Uma rodada por vez. 0 = trava tomada · 1 = outra rodada em curso (WHY diz qual) · 2 = nao deu para criar a trava (NAO e "nada a fazer").
+# Recolher trava velha e o unico passo que apaga a trava de OUTRA rodada: um recolhedor por vez (mutex lock.reclaim), velhice conferida DE NOVO la dentro.
+take_lock() {
+  mkdir -p "$STATE" || return 2
+  local m="$STATE/lock.reclaim" rc=0
+  if ! mkdir "$STATE/lock" 2>/dev/null; then
+    [ -d "$STATE/lock" ] || return 2   # mkdir falhou e nao ha trava (EACCES/EROFS/ENOSPC): nao e "outra rodada em curso"
+    lock_stale || return 1
+    [ -z "$(find "$m" -maxdepth 0 -mmin +10 2>/dev/null)" ] || rmdir "$m" 2>/dev/null || [ ! -d "$m" ] || return 2   # mutex de 10 min+ = de quem morreu dentro dele (ms); que nao sai = rc 2. Dois recolhedores quebrando o MESMO mutex morto juntos ainda se atropelam: dupla falha rara
+    mkdir "$m" 2>/dev/null || { [ -d "$m" ] || return 2; WHY="outra rodada esta recolhendo a trava velha: nada a fazer"; return 1; }; RECL=1   # sem mutex NEM dir: erro, nao "outra rodada"
+    if lock_stale; then log "trava de pid morto/antiga recolhida"
+      if ! rm -rf "$STATE/lock" 2>/dev/null; then WHY="nao consegui apagar a trava velha $STATE/lock"; rc=2   # trava velha que nao sai nao e "outra rodada pegou"
+      elif mkdir "$STATE/lock" 2>/dev/null; then LOCKED=1; echo "$$" > "$STATE/lock/pid" || rc=2   # LOCKED antes: pid que nao grava, o cleanup apaga a trava
+      elif [ -d "$STATE/lock" ]; then WHY="outra rodada pegou a trava"; rc=1; else rc=2; fi
+    else rc=1; fi
+    rmdir "$m" 2>/dev/null; RECL=0; return "$rc"
+  fi
+  LOCKED=1; echo "$$" > "$STATE/lock/pid" || return 2
+}
+
+# --- o MBP esta livre? So se o mbp-run --check sai 0 E CADA chave abaixo esta na saida com o valor de "livre": presence=livre paused=0 paused_local=0
+# offload_flag=on. A presenca e independente da pausa e da saude (um MBP que RECUSA ainda imprime presence=livre) e o offload desligado
+# (mbp-offload off => o --exec sai 99) so aparece na linha offload_flag=, nunca no rc. Linha ausente/vazia/outra = nao provada = "nao".
+mbp_free() {
+  local o rc kv k v seen="" bad=0 nl=$'\n'; o=$("${NOAWS[@]}" "$MBP_RUN" --host mbp --check 2>&1); rc=$?
+  for kv in presence=livre paused=0 paused_local=0 offload_flag=on; do   # sem pipe: um grep -q que sai cedo faz o printf morrer de SIGPIPE e o `!` le "ausente"
+    k=${kv%%=*}; v=$nl$o$nl; case "$v" in *"$nl$k="*) v=${v#*"$nl$k="}; v=${v%%"$nl"*} ;; *) v="?" ;; esac   # 1a linha k=...; ausente = ?
+    seen="$seen $k=$v"; [ "$v" = "${kv#*=}" ] || bad=1
+  done
+  if [ "$rc" -eq 0 ] && [ "$bad" -eq 0 ]; then WHY=""; return 0; fi
+  WHY=$(printf '%s\n' "$o" | grep -v -E '^[a-z_]+=' | head -1); WHY="${WHY:-MBP nao provou estar livre}; rc=$rc$seen"; return 1
+}
+
+# --- consulta ao banco VIVO do mini (só leitura) ---------------------------------------------------------------------------
+PORT=""
+bounded() { local rc; "$TMO" -k 10 "$CALL_S" "$@"; rc=$?; [ "$rc" -ne 124 ] || echo "sem resposta em ${CALL_S}s (timeout): ${1##*/}" >&2; return "$rc"; }
+q() { DOLT_CLI_PASSWORD='' bounded "$DOLT" --host 127.0.0.1 --port "$PORT" --user root --no-tls --use-db "$DB" sql -r csv -q "$1"; }
+
+# Monta $RUN/manifest.json AS OF o head do latest.json. Deixa AS_OF, FP1 e NTAB. Falha com WHY (rc 1 = UNKNOWN).
+build_manifest() {
+  local meta line n tabs sql cnt
+  meta=$(bounded "$AWS" s3 cp "s3://$BUCKET/_meta/latest.json" - 2>"$RUN/aws.err") || { WHY="nao li _meta/latest.json: $(head -c 200 "$RUN/aws.err")"; return 1; }
+  line=$(printf '%s' "$meta" | "$PY" -I -c "$PYHELP" meta "$DB" 2>/dev/null) || { WHY="_meta/latest.json sem run_utc/head valido para $DB"; return 1; }
+  FP1="${line%%$'\t'*}"; AS_OF="${line#*$'\t'}"
+  # o que decide e o que age sao a mesma variavel: AS_OF vai DENTRO do SQL, entao e conferido aqui, mesmo que o ajudante tenha aprovado
+  ishead "$AS_OF" && isutc "$FP1" || { WHY="_meta/latest.json sem run_utc/head valido para $DB (forma inesperada)"; return 1; }
+  PORT=$(awk '/^listener:/{f=1; next} f && /^[^ \t#]/{exit} f && /^[ \t]+port:/{print $2; exit}' "$DOLT_CFG" 2>/dev/null)   # so a porta do bloco listener:
+  isnum "$PORT" || { WHY="porta do dolt ilegivel em $DOLT_CFG"; return 1; }
+  n=$(q "SELECT COUNT(*) FROM dolt_log WHERE commit_hash = '$AS_OF'" 2>"$RUN/dolt.err" | tail -1)
+  isnum "$n" || { WHY="nao consegui perguntar ao dolt vivo se o commit existe: $(head -c 200 "$RUN/dolt.err")"; return 1; }
+  [ "$n" -ge 1 ] || { WHY="o commit $AS_OF do latest.json NAO existe no banco vivo (reescrito/flatten?): sem manifest exato, sem veredito"; return 1; }
+  tabs=$(q "SHOW FULL TABLES AS OF '$AS_OF'" 2>"$RUN/dolt.err") || { WHY="SHOW TABLES AS OF falhou: $(head -c 200 "$RUN/dolt.err")"; return 1; }
+  sql=$(printf '%s\n' "$tabs" | "$PY" -I -c "$PYHELP" union "$AS_OF" 2>/dev/null) || { WHY="lista de tabelas vazia ou com nome fora de [A-Za-z0-9_]"; return 1; }
+  cnt=$(q "$sql" 2>"$RUN/dolt.err") && printf '%s\n' "$cnt" | "$PY" -I -c "$PYHELP" manifest "$DB" "$AS_OF" > "$RUN/manifest.json" 2>/dev/null \
+    && [ -s "$RUN/manifest.json" ] || { rm -f "$RUN/manifest.json"; WHY="contagem AS OF falhou: $(head -c 200 "$RUN/dolt.err")"; return 1; }   # dolt que morre no meio: nenhum manifest parcial fica com cara de valido
+  NTAB=$("$PY" -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["tables"]))' "$RUN/manifest.json" 2>/dev/null) || NTAB="?"
+}
+
+# A lista do que vai ser enviado: key<TAB>size<TAB>etag em $RUN/listing.tsv. Deixa NOBJ e TOTAL_KB. Vazia/ilegível → falha com WHY.
+list_objects() {
+  local raw
+  raw=$(bounded "$AWS" s3api list-objects-v2 --bucket "$BUCKET" --prefix "$DB/" --query 'Contents[].[Key,Size,ETag]' --output text 2>"$RUN/aws.err") \
+    || { WHY="nao consegui listar s3://$BUCKET/$DB/: $(head -c 200 "$RUN/aws.err")"; return 1; }
+  printf '%s\n' "$raw" | "$PY" -I -c "$PYHELP" listing "$DB/" > "$RUN/listing.tsv" 2>/dev/null && [ -s "$RUN/listing.tsv" ] \
+    || { WHY="a lista de s3://$BUCKET/$DB/ veio vazia ou fora do formato (chave fora de [A-Za-z0-9._/-], tamanho ou ETag ilegivel)"; return 1; }
+  NOBJ=$(grep -c . "$RUN/listing.tsv"); TOTAL_KB=$(awk -F'\t' '{ s += $2 } END { printf "%d", (s + 1023) / 1024 }' "$RUN/listing.tsv")
+  isnum "$TOTAL_KB" && [ "$TOTAL_KB" -gt 0 ] || { WHY="a lista de s3://$BUCKET/$DB/ soma 0 bytes"; return 1; }
+}
+
+finish() {  # $1 = rc final; resumo + RESULT
+  log "RESULT: ${VERDICT:-UNKNOWN} db=$DB rc=$1 as_of=${AS_OF:-?} tabelas=${NTAB:-?} objetos=$NOBJ run=${RUN:-?}"; [ -z "$WHY" ] || log "motivo: $WHY"; exit "$1"
+}
+unknown() { VERDICT=UNKNOWN; WHY="$*"; finish 2; }
+
+setmode() { { [ "$MODE" = run ] || [ "$MODE" = "$1" ]; } || { echo "so um modo por vez (--dry-run ou --check)" >&2; exit 2; }; MODE="$1"; }
+
+main() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) setmode dry ;; --check) setmode check ;;
+      --db) [ "$#" -ge 2 ] || { echo "--db precisa de um valor" >&2; exit 2; }; DB="$2"; shift ;;
+      -h|--help|help) usage; exit 0 ;; *) echo "opcao desconhecida: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+  case "$DB" in ''|*[!A-Za-z0-9_]*) echo "--db invalido: $DB" >&2; exit 2 ;; esac
+  [ "$MODE" != run ] || { echo "o restore no MBP chega na fatia 3/4 (ga-3kmvyr.3); por ora: --dry-run ou --check" >&2; exit 2; }
+  if [ "$MODE" = check ]; then mbp_free && { log "MBP livre"; exit 0; }; log "MBP nao livre: $WHY"; exit 4; fi
+
+  [ -n "$TMO" ] || unknown "sem timeout/gtimeout no PATH (brew install coreutils; o PATH do launchd precisa de /opt/homebrew/bin)"
+  take_lock; case $? in 0) ;; 1) VERDICT=SKIPPED; finish 0 ;; *) unknown "${WHY:-nao consegui criar $STATE (ou a trava dentro dela)}" ;; esac   # SKIPPED: o agendador ve que nao rodou
+  RUN="$STATE/runs/$(date -u +%Y%m%dT%H%M%SZ)-$$"; OUT="$RUN/out"   # com o pid: duas rodadas no mesmo segundo (trava recolhida) nao dividem a pasta
+  { mkdir -p "$STATE/runs" && mkdir "$RUN" && mkdir "$OUT"; } || unknown "nao consegui criar $RUN"
+  build_manifest || unknown "$WHY"
+  list_objects || unknown "$WHY"
+  log "manifest AS OF $AS_OF ($NTAB tabelas, run_utc=$FP1):"; cat "$RUN/manifest.json"   # third-state-waiver: so exibe; build_manifest ja provou o arquivo nao-vazio
+  log "lista do S3: $NOBJ objetos, ${TOTAL_KB}KB (nada foi enviado)"; VERDICT=DRY; finish 0
+}
+
+if [ "${LABMBP_LIB:-0}" != "1" ]; then main "$@"; fi
