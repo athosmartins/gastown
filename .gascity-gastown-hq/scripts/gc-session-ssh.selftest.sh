@@ -47,11 +47,13 @@ cat > "$T/bin/ssh" <<'EOF'
 [ -z "${FAKE_SSH_HANG:-}" ] || exec sleep 30
 while [ $# -gt 0 ]; do case "$1" in -o) shift 2;; -*) shift;; *) break;; esac; done
 [ -z "${FAKE_SSH_FAIL_HOST:-}" ] || [ "$FAKE_SSH_FAIL_HOST" != "$1" ] || { echo "ssh: connect to host $1 port 22: Operation timed out" >&2; exit 255; }
+[ -z "${FAKE_SSH_CUT_HOST:-}" ] || [ "$FAKE_SSH_CUT_HOST" != "$1" ] || FAKE_SSH_CUT=1
 shift
 [ -z "${FAKE_SSH_NOISE:-}" ] || echo "bashrc: bem-vindo ao servidor"
 if [ -n "${FAKE_SSH_JUNK:-}" ]; then cat >/dev/null; echo "saida sem marcadores"; exit 0; fi
 [ -z "${FAKE_SSH_TIMES:-}" ] || echo "B $$ $(python3 -c 'import time;print(time.time())')" >> "$FAKE_SSH_TIMES"
 if [ -n "${FAKE_SSH_CUT:-}" ]; then sh -c "$*" | grep -v '@@GC-END@@'; exit 0; fi
+if [ -n "${FAKE_SSH_RAN_255:-}" ]; then sh -c "$*" >/dev/null 2>&1; echo "Connection reset by peer" >&2; exit 255; fi  # o script RODOU no host, a conexão caiu depois
 sh -c "$*"; rc=$?
 [ -z "${FAKE_SSH_TIMES:-}" ] || echo "E $$ $(python3 -c 'import time;print(time.time())')" >> "$FAKE_SSH_TIMES"
 exit $rc
@@ -335,6 +337,7 @@ g_mbp() {
   # --- o teto é o menor entre o do host e o slot_cap da checagem ---
   pv stop w-remote-m-2 </dev/null; pv stop w-remote-m-1 </dev/null; mode slot1; pv start w-remote-m-1 < <(req cat); pv start w-remote-m-2 < <(req cat)
   [ $RC = 1 ] && has "$T/err" 'teto' && [ "$(count x "${SOCK}m")" = 1 ]; ok $? "mbp: cap 2 no host, slot_cap 1 na checagem → a 2ª sessão não abre (vale o menor)"
+  [ ! -e "$T/state/m/running/w-remote-m-2" ]; ok $? "mbp: start que o host recusou com clareza (teto) não fica no registro de sessões nossas"
   # --- gate <host>: o veredito de um start agora, sem abrir nada ---
   mode livre; fresh; pv gate m </dev/null; [ $RC = 0 ] && [ "$(jq -r .ok "$T/out")" = true ] && [ "$(jq -r .slot_cap "$T/out")" = 3 ] && [ "$(jq -r .cap "$T/out")" = 2 ]; ok $? "mbp: gate m com o Athos fora → ok, exit 0, com o slot_cap e o cap"
   mode uso; pv gate m </dev/null; [ $RC = 1 ] && [ "$(jq -r .ok "$T/out")" = false ] && jq -r .reason "$T/out" | grep -q 'Athos está no MBP'; ok $? "mbp: gate m com o Athos usando → exit 1 e o motivo"
@@ -353,6 +356,12 @@ g_mbp() {
   pv stop w-a-1 </dev/null
   FAKE_SSH_FAIL_HOST=fakehost pv list-running w- </dev/null; [ $RC = 1 ] && has "$T/err" fakehost; ok $? "mbp: o host que NÃO dorme, fora do ar e sem sessão registrada, continua sendo erro (nunca lista vazia)"
   mode livre; pv start w-remote-m-4 < <(req cat); tmux -L "${SOCK}m" kill-session -t =w-remote-m-4 2>/dev/null; pv list-running w- </dev/null; [ ! -e "$T/state/m/running/w-remote-m-4" ]; ok $? "mbp: sessão que o host já não tem sai do registro quando o host responde (o registro se corrige sozinho)"
+  touch -t 203001010000 "$T/state/m/running/w-remote-m-7"; pv list-running w- </dev/null; [ -e "$T/state/m/running/w-remote-m-7" ]; ok $? "mbp: registro mais novo que a pergunta (start em curso) não é apagado pelo list-running"
+  rm -f "$T/state/m/running/w-remote-m-7"
+  FAKE_SSH_CUT_HOST=fakembp pv list-running w- </dev/null; [ $RC = 1 ] && has "$T/err" 'sem marcadores'; ok $? "mbp: notebook que RESPONDEU cortado, mesmo sem sessão registrada, é erro (só 'não respondeu' sai da lista) (rc=$RC)"
+  mode livre; FAKE_SSH_RAN_255=1 pv start w-remote-m-6 < <(req cat); [ $RC = 1 ] && [ -e "$T/state/m/running/w-remote-m-6" ]; ok $? "mbp: start ambíguo (o script rodou, o ssh caiu depois) fica no registro (rc=$RC)"
+  FAKE_SSH_FAIL_HOST=fakembp pv list-running w- </dev/null; [ $RC = 1 ]; ok $? "mbp: ...e com o notebook fora do ar o list-running diz 'não sei' (erro), não 'nada nosso lá'"
+  pv stop w-remote-m-6 </dev/null
   # --- PATH extra do host ---
   pv start w-remote-m-5 < <(req "sh -c 'echo \$PATH > $T/path.out; exec cat'"); sleep 0.5
   case "$(cat "$T/path.out" 2>/dev/null)" in "$T/extra:"*) true;; *) false;; esac; ok $? "mbp: o PATH da sessão começa pelo path_extra do host (Homebrew do MBP)"
@@ -388,9 +397,12 @@ g_mbp() {
     cfgm '{"presence_gate":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'presence_gate'" && nossh; ok $? "mbp: presence_gate=$v (não é true/false) recusa a config, sem ssh (rc=$RC)"
   done
   cfgm '{"sleeps":"talvez"}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'sleeps'"; ok $? "mbp: sleeps que não é booleano recusa a config"
+  cfgm '{"presence_gate":false}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" 'exige presence_gate'; ok $? "mbp: notebook (sleeps) sem a regra de presença recusa a config"
   cfgm '{"gate_cmd":"mbp-run.sh --check"}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gate_cmd'"; ok $? "mbp: gate_cmd em texto (não lista) recusa a config"
   cfgm; jq 'del(.default_host)' "$T/cfg.json" > "$T/cfg.nd" && mv "$T/cfg.nd" "$T/cfg.json"; setup_mbp; mode livre
   pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = m ]; ok $? "mbp: sem default_host o nome da sessão ainda escolhe o host (rc=$RC $(head -c 120 "$T/err"))"
+  cfgm; pv --dry-run start dog-remote-1 < <(req cat); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = a ]; ok $? "mbp: <papel>-remote-<n> (número do pool, a forma do patch do engine) vai ao default_host, não pede o host '1' (rc=$RC $(head -c 120 "$T/err"))"
+  jq 'del(.default_host)' "$T/cfg.json" > "$T/cfg.nd" && mv "$T/cfg.nd" "$T/cfg.json"
   pv start w-remote-m-1 < <(req cat); pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-remote-m-1; ok $? "mbp: sem default_host o list-running ainda junta os hosts (rc=$RC $(head -c 120 "$T/err"))"
   pv stop w-remote-m-1 </dev/null
   cfg 3
@@ -431,7 +443,13 @@ echo "== $((n-fails))/$n ok =="
   mutant mbp "PATH extra do host" 's/"".join(d + ":" for d in cfg.path_extra)/""/'
   mutant mbp "host que dorme sempre ignorado no list-running" 's/if cfg.sleeps and not cfg.known():/if cfg.sleeps:/'
   mutant mbp "host que NÃO dorme também ignorado no list-running" 's/if cfg.sleeps and not cfg.known():/if not cfg.known():/'
-  mutant mbp "registro de sessões nunca marcado" 's/^                open(os.path.join(self.mkstate("running"), name), "a").close()/                pass/'
+  mutant mbp "registro de sessões nunca marcado" 's/^                open(f, "a").close()/                pass/'
+  mutant mbp "list-running engole qualquer falha de host que dorme" 's/except Unreachable as e:  #/except Fail as e:  #/'
+  mutant mbp "registro só depois do start confirmado" 's/^        cfg.mark(name, True)$/        pass/'
+  mutant mbp "recusa clara do host não limpa o registro" 's/^            cfg.mark(name, False)$/            pass/'
+  mutant mbp "list-running apaga registro mais novo que a pergunta" 's/ and os.stat(os.path.join(run_d, m)).st_mtime < t0//'
+  mutant mbp "notebook sem regra de presença aceito" 's/if self.sleeps and not self.gate:/if False:/'
+  mutant mbp "número do pool lido como host" 's/if m and m.group(1).isdigit():/if False:/'
   mutant dry "filtro de env" 's/ or (SECRETISH.search(k) and k not in cfg.env_allow)//;s/not ENV_OK.fullmatch(k)/False/'
   mutant proto "exit 2 das desconhecidas" 's/        return 2$/        return 0/'
   mutant down "marcador de fim" 's/if BEGIN not in lines or END not in lines:/if BEGIN not in lines:/'

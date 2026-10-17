@@ -29,7 +29,8 @@ O QUE FAZ
 VÁRIOS HOSTS E O MBP (ga-w7qwl1)  O host de uma sessão vem de $GC_SSH_HOST, senão do que o NOME pede (`<papel>-remote-<host>-…`, o mesmo
   `-remote-` do remote_match do híbrido), senão de default_host; nome que pede host fora da config recusa. list-running junta TODOS os hosts
   (ou só o de $GC_SSH_HOST); host que não responde é erro — salvo um host `sleeps` (notebook) sem nenhuma sessão nossa registrada em
-  <estado>/<host>/running/, que só sai da lista. Host com `presence_gate` (o MBP, notebook de trabalho do Athos): a CADA start roda
+  <estado>/<host>/running/, que só sai da lista ("não responde" = ssh 255 ou tempo esgotado; resposta truncada ou tmux ilegível seguem
+  erro). O registro nasce ANTES do ssh do start (start ambíguo fica registrado) e só uma recusa clara do host o apaga. Host com `presence_gate` (o MBP, notebook de trabalho do Athos): a CADA start roda
   `gate_cmd` (padrão: scripts/mbp-run.sh --check, a mesma regra do mbp-offload) e só abre com evidência POSITIVA de "Athos fora e MBP
   saudável" — em uso, pausa, bandeira desligada, sem saúde, resposta ilegível ou que não roda: recusa, sem ssh. O teto efetivo é o menor
   entre `cap` e o slot_cap da checagem (RAM). A sessão nasce em nice 10 com um vigia ao lado (biblioteca de presença do host, instalada por
@@ -67,6 +68,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 NAME_RE = re.compile(r"[A-Za-z0-9_-]+")  # o mesmo conjunto que o tmux local aceita (validSessionNameRe do engine): vai para shell
@@ -100,6 +102,10 @@ q = shlex.quote
 
 class Fail(Exception):
     """Erro esperado: a mensagem vai para stderr, exit 1 (o engine a mostra no erro da operação)."""
+
+
+class Unreachable(Fail):
+    """O host não respondeu (ssh 255 ou tempo esgotado): a ÚNICA falha que um host `sleeps` pode tirar da lista em silêncio."""
 
 
 def load_config() -> tuple:
@@ -145,6 +151,8 @@ class Cfg:
             if k in h and not isinstance(h[k], bool):
                 raise Fail(f"host {self.host}: '{k}' tem que ser true ou false ({h[k]!r})")
         self.gate, self.sleeps = h.get("presence_gate", False), h.get("sleeps", False)
+        if self.sleeps and not self.gate:  # notebook sem a regra de presença abriria sessão com o Athos no teclado
+            raise Fail(f"host {self.host}: 'sleeps' (notebook) exige presence_gate true")
         self.plib = self.need(h, "presence_lib", PATH_RE, self.home + "/gt-remote/bin/mbp-presence.sh")
         self.gate_cmd = h.get("gate_cmd") or [os.path.join(self.city_guess, "scripts", "mbp-run.sh"), "--check"]
         if not isinstance(self.gate_cmd, list) or not all(isinstance(x, str) and x for x in self.gate_cmd):
@@ -155,6 +163,8 @@ class Cfg:
 
     def host_of(self, session: str) -> str:
         m = re.search(r"-remote-([A-Za-z0-9_]+)", session or "")
+        if m and m.group(1).isdigit():  # <papel>-remote-<n>: o número é o índice do pool, não um host → $GC_SSH_HOST/default_host
+            return ""
         if m and m.group(1) not in self.names:
             raise Fail(f"sessão {session}: o nome pede o host {m.group(1)!r}, que não está na config ({', '.join(self.names) or 'sem hosts'})")
         return m.group(1) if m else ""
@@ -197,7 +207,9 @@ class Cfg:
         """Sessões que ESTE provider abriu e ainda não parou, no mini: é o que separa "host fora do ar, sem nada nosso lá" de "não sei"."""
         try:
             if on:
-                open(os.path.join(self.mkstate("running"), name), "a").close()
+                f = os.path.join(self.mkstate("running"), name)
+                open(f, "a").close()
+                os.utime(f)  # a idade do registro decide o acerto do list-running
             else:
                 os.unlink(os.path.join(self.state, "running", name))
         except OSError:
@@ -237,12 +249,12 @@ def remote(cfg: Cfg, body: str, timeout: int = 0, dry: bool = False) -> tuple:
     try:
         p = subprocess.run(argv, input=script.encode(), capture_output=True, timeout=t)
     except subprocess.TimeoutExpired:
-        raise Fail(f"host {cfg.host} ({cfg.ssh}) não respondeu em {t}s por ssh")
+        raise Unreachable(f"host {cfg.host} ({cfg.ssh}) não respondeu em {t}s por ssh")
     except OSError as e:
         raise Fail(f"não consegui rodar ssh: {e}")
     err = p.stderr.decode("utf-8", "replace").strip()
     if p.returncode == 255:
-        raise Fail(f"ssh para o host {cfg.host} ({cfg.ssh}) falhou: {err or 'sem mensagem'}")
+        raise Unreachable(f"ssh para o host {cfg.host} ({cfg.ssh}) falhou: {err or 'sem mensagem'}")
     lines = p.stdout.decode("utf-8", "replace").split("\n")
     if BEGIN not in lines or END not in lines:
         raise Fail(f"resposta de {cfg.host} sem marcadores (rc={p.returncode}): {err or 'sem mensagem'}")
@@ -428,7 +440,12 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
         body = body.replace(k, v)
     with open(os.path.join(cfg.mkstate(), "lock"), "a") as lf:  # cap + criação são um passo só; entre processos do mini, um por vez
         fcntl.flock(lf, fcntl.LOCK_EX)
+        # registra ANTES do ssh: um start ambíguo (ssh cai ou estoura o tempo depois do script já ter rodado no host) deixa o registro,
+        # e o list-running com o host fora do ar diz "não sei" em vez de "nada nosso lá"; só uma recusa clara do host o apaga
+        cfg.mark(name, True)
         rc, out, err = remote(cfg, body, cfg.start_timeout)
+        if rc not in (0, EX_EXISTS):
+            cfg.mark(name, False)
     if rc == EX_CAP or rc == EX_EXISTS:
         if rc == EX_CAP:
             cfg.event("refused", name, reason="teto do host")
@@ -436,7 +453,6 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
     if rc != 0:
         raise Fail(f"start em {cfg.host} falhou (rc={rc}): {err or out or 'sem mensagem'}")
     cfg.event("started", name)
-    cfg.mark(name, True)
     cfg.log(f"start {name} ok" + (f" ignored={','.join(p['ignored'])}" if p["ignored"] else "") +
             (f" env_dropped={','.join(p['env_dropped'])}" if p["env_dropped"] else ""))
     return 0
@@ -518,13 +534,17 @@ def op_list_running(prefix: str, dry: bool) -> int:
     bad = []
     for h in hosts:
         cfg = Cfg(host=h)
+        t0 = time.time()
         try:
             _, out, _ = run(cfg, "list-running", "sessions", dry)
-        except Fail as e:
+        except Unreachable as e:  # só "não respondeu"; resposta truncada, tmux ilegível ou ssh que nem roda continuam erro
             if cfg.sleeps and not cfg.known():
                 cfg.log(f"list-running: host sem resposta e sem sessão nossa registrada, não conta: {e}")
             else:
                 bad.append(str(e))
+            continue
+        except Fail as e:
+            bad.append(str(e))
             continue
         live = [x for x in out.split("\n") if x]
         for x in live:
@@ -532,8 +552,9 @@ def op_list_running(prefix: str, dry: bool) -> int:
                 print(x)
         if not dry:  # o host respondeu: o registro de sessões abertas volta a ser o que o host de fato tem
             try:
-                for m in os.listdir(os.path.join(cfg.state, "running")):
-                    if m not in live:
+                run_d = os.path.join(cfg.state, "running")
+                for m in os.listdir(run_d):  # registro mais novo que a pergunta = start em curso que a lista não podia ver: fica
+                    if m not in live and os.stat(os.path.join(run_d, m)).st_mtime < t0:
                         cfg.mark(m, False)
             except OSError:
                 pass  # sem registro legível não há o que acertar; o próximo start o refaz
