@@ -39,7 +39,7 @@ mkcity() {  # mkcity DIR
     w session.woke 2026-10-14T23:00:00-03:00        wa-worker-remote-mbp-1     # remoto: NÃO conta no mini
     w session.woke 2026-10-13T22:00:00-03:00        auto-refiner-adhoc-z       # noite 13, outros
     w bead.updated  2026-10-15T01:30:00-03:00       wa-worker-adhoc-9          # outro tipo de evento: ignorado
-    echo 'isto nao e json mas diz "session.woke"'                              # ilegível
+    echo 'notjson garbage mas diz "session.woke"'                              # ilegível (JSON corrompido: a leitura falha e a linha é pulada)
   } > "$c/.gc/events.jsonl"
   e() { printf '{"ts":"%s","host":"%s","session":"%s","event":"%s"%s}\n' "$1" "$2" "$3" "$4" "${5:+,\"reason\":\"$5\"}"; }
   {
