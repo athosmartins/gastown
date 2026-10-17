@@ -126,6 +126,8 @@ EOF
 chmod +x "$WORK/git-fx"
 
 # run_jac <repo...> [-- --check]: the script under test, sealed off from the real world.
+# ga-wkoij7: the consolidating gc starts only in the night window, so the clock is a seam — JAW_HOUR=2 unless a test sets T_HOUR — and the window log goes under $WORK, never into the real city.
+# The free space the window rule reads is the same JAC_FREE_KIB as every disk test here (T_FREE, 90GB unless set).
 run_jac() {
   local repos="$1"; shift
   JAC_REPOS="$repos" JAC_STATE="${T_STATE:-$WORK/state.json}" JAC_LOG="${T_LOG:-$WORK/log}" JAC_LOCK="${T_LOCK:-$WORK/lock}" JAC_GC="${T_GC:-$WORK/gc-stub}" \
@@ -137,6 +139,7 @@ run_jac() {
   JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" JAC_MAIL_TIMEOUT_S="${T_MAIL_TIMEOUT:-}" \
   JAC_TAIL_LIMIT_KIB="${T_TAIL:-0}" JAC_TAIL_MAX_OBJECTS="${T_TAIL_OBJS:-}" JAC_TAIL_TIMEOUT_S="${T_TAIL_TIMEOUT:-}" \
   JAC_LSOF="${T_LSOF:-}" JAC_RECLAIM_WAIT_S="${T_RECLAIM_WAIT:-}" JAC_PS="${T_PS:-}" JAC_PS_TIMEOUT_S="${T_PS_TIMEOUT:-}" \
+  JAW_HOUR="${T_HOUR:-2}" JAW_LOG="${T_WLOG:-$WORK/window.log}" \
   "$SCRIPT" "$@" 2>&1     # executed, not `bash $SCRIPT`: production runs the shebang (/bin/bash 3.2 on macOS), not whatever bash is first in PATH
 }
 last_status() { grep -o 'status=[a-z-]*' "$WORK/log" | tail -1 | cut -d= -f2; }
@@ -881,6 +884,7 @@ echo "=== S28: the prod test tells 'cannot measure' from 'over the alarm', and d
 PROD="$PACK/assets/prod-tests/gascity/story-ga-a3ar7h.sh"
 FC="$WORK/fakecity"; mkdir -p "$FC/packs/town-deltas/assets/scripts" "$FC/packs/town-deltas/orders" "$FC/.gc/logs" "$WORK/gcsb/bin"
 cp "$SCRIPT" "$FC/packs/town-deltas/assets/scripts/jsonl-archive-compact.sh"; cp "$ORDER" "$FC/packs/town-deltas/orders/jsonl-archive-compact.toml"
+cp "$HERE/jsonl-archive-repack-window-lib.sh" "$FC/packs/town-deltas/assets/scripts/jsonl-archive-repack-window-lib.sh"   # ga-wkoij7: the compactor sources it
 cat > "$WORK/gcsb/bin/gc" <<EOF
 #!/bin/bash
 case " \$* " in
@@ -1775,6 +1779,77 @@ chmod 755 "$TL/.git/objects/pack" 2>/dev/null
 cfg="$("$SCRIPT" --print-config)"
 printf '%s' "$cfg" | grep -q 'tail_limit_kib=262144 tail_max_objects=120 tail_timeout_s=600 tail_window=10 tail_depth=250' \
   && ok "defaults: tail_limit_kib=262144 (256MiB held by small packs), tail_max_objects=120, tail_timeout_s=600, tail_window=10, tail_depth=250" || bad "tail defaults wrong in --print-config: $cfg"
+
+echo ""
+
+echo "=== S37: the REPACK WINDOW — the consolidating gc starts only at 00:00-04:59 with room on the disk; the bounded tiers run all day (ga-wkoij7) ==="
+# 17/10 ~10:4x a plain exporter commit started git's geometric repack of a 4.4GB pack at midday (swap 5.2GB, free disk 1.4GB); Athos allows heavy maintenance only in 00:00-06:00. The gc of tier 2 rewrites
+# every pack, so it asks jaw_repack_allowed (jsonl-archive-repack-window-lib.sh). T_HOUR is the clock, T_FREE the free space; the swap headroom (2GiB) is in the need, so 'room' here is the 90GB default.
+mkwin() { local d="$1"; mkrepo "$d" 1; for i in 2 3 4 5 6; do addpack "$d" "$i"; done; }
+# A. noon: packs over the limit, plenty of disk — the gc does NOT run, and that is a deferral, not a failure
+WA="$WORK/wa"; mkwin "$WA"; PA0="$(pack_count "$WA")"; HA="$(history "$WA")"; rm -f "$WORK/state.json" "$WORK/window.log"
+out="$(T_HOUR=12 T_PACKS=4 run_jac "$WA")"; rc=$?
+{ [ "$PA0" -ge 5 ] && [ "$rc" -eq 0 ] && [ "$(pack_count "$WA")" = "$PA0" ] && [ "$(last_status)" = "deferred" ]; } \
+  && ok "12h, packs $PA0 >= limit 4, 90GB free: the gc is not started — packs unchanged, status deferred, exit 0" \
+  || bad "noon gc handled wrong (rc=$rc packs $PA0 -> $(pack_count "$WA") status=$(last_status)): $out"
+printf '%s' "$out" | grep -q 'repack window is closed' && printf '%s' "$out" | grep -q 'outside the start window' \
+  && ok "the log says the window is closed and why (outside the start window)" || bad "no window-closed line with its reason: $out"
+[ "$(history "$WA")" = "$HA" ] && ok "history untouched" || bad "history changed by a run that did not repack"
+[ ! -e "$WORK/window.log" ] && ok "an outside-the-window refusal is not written to the window log" || bad "window log written for a noon refusal: $(cat "$WORK/window.log")"
+# B. night, same repo: the gc runs, and the window log records that it was allowed
+rm -f "$WORK/state.json"
+out="$(T_HOUR=2 T_PACKS=4 run_jac "$WA")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$WA")" -le 2 ]; } \
+  && ok "02h, same repo: consolidated (packs $PA0 -> $(pack_count "$WA"))" || bad "night gc handled wrong (rc=$rc packs=$(pack_count "$WA") status=$(last_status)): $out"
+grep -q 'repack allowed' "$WORK/window.log" 2>/dev/null && ok "the allowed repack is on record in the window log" || bad "no 'repack allowed' in the window log"
+# C. the window boundaries: 04h starts, 05h and 06h do not
+for hh in 4 5 6; do
+  WB="$WORK/wb$hh"; mkwin "$WB"; rm -f "$WORK/state.json"
+  T_HOUR="$hh" T_PACKS=4 run_jac "$WB" >/dev/null
+  if [ "$hh" = 4 ]; then
+    [ "$(last_status)" = "consolidated" ] && ok "04h (the last hour to start) consolidates" || bad "04h: status=$(last_status), want consolidated"
+  else
+    [ "$(last_status)" = "deferred" ] && [ "$(pack_count "$WB")" -ge 5 ] && ok "${hh}h does not start a gc (it would run past 06:00)" || bad "${hh}h: status=$(last_status) packs=$(pack_count "$WB"), want deferred and packs untouched"
+  fi
+done
+# D. night but no room: the free space is below 2 x the largest pack + 2GiB — refused INSIDE the window, on record
+WC="$WORK/wc"; mkwin "$WC"; PC0="$(pack_count "$WC")"; rm -f "$WORK/state.json" "$WORK/window.log"
+out="$(T_HOUR=2 T_FREE=1500000 T_PACKS=4 run_jac "$WC")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(pack_count "$WC")" = "$PC0" ] && [ "$(last_status)" = "deferred" ]; } \
+  && ok "02h but 1.4GiB free (< 2 x pack + 2GiB): no gc, status deferred" || bad "no-room handled wrong (rc=$rc packs $PC0 -> $(pack_count "$WC") status=$(last_status)): $out"
+grep -q 'INSIDE the window' "$WORK/window.log" 2>/dev/null && grep -q 'swap' "$WORK/window.log" 2>/dev/null \
+  && ok "the night's refused repack is in the window log, with the swap in use" || bad "window log lacks the in-window refusal: $(cat "$WORK/window.log" 2>/dev/null)"
+# E. a clock that cannot be read, and free space that cannot be read: no gc (the old disk guard proceeded on an unreadable df; a whole-repo repack must not)
+WD="$WORK/wd"; mkwin "$WD"; PD0="$(pack_count "$WD")"; rm -f "$WORK/state.json"
+out="$(T_HOUR=xx T_PACKS=4 run_jac "$WD")"
+{ [ "$(pack_count "$WD")" = "$PD0" ] && [ "$(last_status)" = "deferred" ] && printf '%s' "$out" | grep -q 'hour cannot be read'; } \
+  && ok "an unreadable clock: no gc, and the log says so" || bad "unreadable clock handled wrong (packs $PD0 -> $(pack_count "$WD") status=$(last_status)): $out"
+rm -f "$WORK/state.json"
+out="$(T_HOUR=2 T_FREE=notanumber T_PACKS=4 run_jac "$WD")"
+{ [ "$(pack_count "$WD")" = "$PD0" ] && [ "$(last_status)" = "deferred" ] && printf '%s' "$out" | grep -q 'free disk cannot be read'; } \
+  && ok "unreadable free space: no gc (under doubt the inert state), and the log says so" || bad "unreadable free space handled wrong (packs $PD0 -> $(pack_count "$WD") status=$(last_status)): $out"
+# F. a deferral launders nothing: a failed tier 1 stays failed (exit 1) when the gc is deferred by the window, and a repo that stays over the pack alarm is BAD whatever the status
+WE="$WORK/we"; mkfailrepo "$WE"; rm -f "$WORK/state.json"
+out="$(FM_RC=1 T_GIT="$WORK/git-failmaint" T_HOUR=12 T_PACKS=3 run_jac "$WE")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ]; } \
+  && ok "tier 1 failed, gc deferred by the window (did nothing) → status stays failed, exit 1" || bad "failed tier 1 + closed window judged wrong (rc=$rc status=$(last_status)): $out"
+WF="$WORK/wf"; mkwin "$WF"; rm -f "$WORK/state.json"
+out="$(T_HOUR=12 T_PACKS=4 T_PACKS_ALARM=5 run_jac "$WF")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "deferred" ]; } \
+  && ok "gc deferred all day and packs at the alarm size → BAD (exit 1): a deferral is not silent" || bad "alarm over a deferred gc judged wrong (rc=$rc status=$(last_status) packs=$(pack_count "$WF")): $out"
+# G. the bounded tier 1 is NOT gated: by day, loose objects over the limit are still packed in batches (~243MiB/h of loose blobs must not wait for the night)
+WG="$WORK/wg"; mkrepo "$WG" 20; LG="$(loose_count "$WG")"; rm -f "$WORK/state.json"
+out="$(T_HOUR=12 run_jac "$WG")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$LG" -gt 0 ] && [ "$(loose_count "$WG")" = 0 ]; } \
+  && ok "12h: tier 1 still drains the loose backlog ($LG -> $(loose_count "$WG") loose objects) — the window gates only the whole-repo repack" \
+  || bad "tier 1 by day handled wrong (rc=$rc loose $LG -> $(loose_count "$WG")): $out"
+# H. the lib is not optional, and the config shows the window
+LIBLESS="$WORK/libless"; mkdir -p "$LIBLESS"; cp "$SCRIPT" "$LIBLESS/jsonl-archive-compact.sh"
+out="$("$LIBLESS/jsonl-archive-compact.sh" --print-config 2>&1)"; rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'cannot load .*jsonl-archive-repack-window-lib.sh'; } \
+  && ok "no window lib next to the script: exit 1 naming the file (a gate that is silently absent would let the gc run at noon)" || bad "missing lib handled wrong (rc=$rc): $out"
+"$SCRIPT" --print-config | grep -q 'repack_window_start_h=0 repack_window_last_start_h=5 repack_swap_headroom_kib=2097152' \
+  && ok "--print-config shows the window: start 0, last start 5, swap headroom 2097152KiB" || bad "window missing from --print-config"
 
 echo ""
 
