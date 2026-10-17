@@ -84,7 +84,9 @@ clear_lock() { rm -rf "$LOCK_DIR" "$LOCK_DIR".reaping.* 2>/dev/null || true; }
 # $1 (optional): PILOT_LOCK_MAX_AGE override (seconds).
 run_dispatch() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  # ga-ydaslo: the Pilot's disk-floor gate reads the HOST's df; pinned (selftest-disk-pin-class.selftest.sh keeps every run site pinned).
   env -i \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
@@ -161,7 +163,9 @@ touch -t 200001010000 "$LOCK_HB" 2>/dev/null || true
 SHARED_LOG="$FIXCITY/.gc/logs/pilot-dispatcher.log"
 : > "$SHARED_LOG"
 run_race() {
+  # ga-ydaslo: disk reading pinned, as in run_dispatch above.
   env -i \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" TMPDIR="$FIXTMP" DRY_RUN=1 \

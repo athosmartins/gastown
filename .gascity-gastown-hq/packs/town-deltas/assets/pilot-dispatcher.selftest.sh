@@ -5503,6 +5503,28 @@ else
   fi
 fi
 
+echo "Scenario 20d-disk-g: a library that is PRESENT BUT BROKEN is 'unknown' on the log — not a silent dead Pilot"
+# On /bin/bash 3.2 (what launchd runs) a syntax error in a SOURCED file ends the whole shell: exit 2, no output, no sweep. The gate
+# probes the library in a subshell first. Run under /bin/bash with set -euo pipefail, like the dispatcher; "survived" is printed only
+# if the shell lived through the call.
+CORR20DG="$WORK/disk20dg"; mkdir -p "$CORR20DG"
+printf 'disk_free_mb() { if then fi\n' > "$CORR20DG/corrupt.sh"
+printf '# loads fine, defines no reader\n:\n' > "$CORR20DG/noreader.sh"
+for LIB20DG in corrupt noreader; do
+  # vazio (no function extracted) → bad, never ok; falhou (the shell died) → no "survived" line, so bad
+  if [ -z "$FN20DF" ]; then bad "_pilot_disk_floor not found in $DISPATCHER (cannot test the $LIB20DG library)"; continue; fi
+  OUT20DG="$(/bin/bash -c 'set -euo pipefail; eval "$1"; PILOT_DISK_LIB="$2"; PILOT_DISK_FLOOR_ENABLED=1; DISK_NEW_WORK_MIN_MB=5120
+    _rc=0; _pilot_disk_floor || _rc=$?
+    echo "survived rc=$_rc state=$PILOT_DISK_FLOOR_STATE"
+    case "$PILOT_DISK_FLOOR_DETAIL" in "library unreadable or does not load: "*) echo detail-names-the-library ;; esac' _ "$FN20DF" "$CORR20DG/$LIB20DG.sh" 2>&1)"
+  if [ "$OUT20DG" = "survived rc=1 state=unknown
+detail-names-the-library" ]; then
+    ok "a $LIB20DG library → unknown (fail-open), the Pilot lives through it and the detail names the library"
+  else
+    bad "a $LIB20DG library killed the shell or was not reported as unknown (got: '$OUT20DG')"
+  fi
+done
+
 echo "Scenario 20e: drift-guard — PILOT_CTX_READY_QUERIES defaults to 1 and is env-gated"
 has "$DISPATCHER" 'PILOT_CTX_READY_QUERIES="\$\{PILOT_CTX_READY_QUERIES:-1\}"' \
   "ctx:ready knob defaults to 1 (ON) and remains overridable via env"

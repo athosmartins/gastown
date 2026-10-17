@@ -148,7 +148,10 @@ chmod +x "$SHIMBIN/notify"
 run_dispatch() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  # ga-ydaslo: the Pilot's disk-floor gate reads the HOST's df; pinned, or this suite goes red whenever the mini is under 5 GB
+  # (selftest-disk-pin-class.selftest.sh keeps every run site pinned).
   env -i \
+    DISK_FREE_OVERRIDE_MB="${PILOT_TEST_DISK_FREE_MB:-100000}" \
     DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \

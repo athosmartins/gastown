@@ -119,6 +119,7 @@ packs/town-deltas/assets/quiet-hours-check.selftest.sh
 packs/town-deltas/assets/quorum-convergence-watchdog.selftest.sh
 packs/town-deltas/assets/reaper-selftest-path-leak.selftest.sh
 packs/town-deltas/assets/refino-gate-dispatcher.selftest.sh
+packs/town-deltas/assets/selftest-disk-pin-class.selftest.sh
 packs/town-deltas/assets/selftest-drain-pin-class.selftest.sh
 packs/town-deltas/assets/selftest-path-sandbox-class.selftest.sh
 packs/town-deltas/assets/session-new-bounded.selftest.sh

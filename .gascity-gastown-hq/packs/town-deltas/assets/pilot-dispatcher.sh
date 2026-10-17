@@ -2453,9 +2453,12 @@ _pilot_disk_floor() {
   PILOT_DISK_FLOOR_DETAIL=""
   [ "$PILOT_DISK_FLOOR_ENABLED" = "1" ] || return 1
   PILOT_DISK_FLOOR_STATE="unknown"
-  # vazio/falhou/ilegível (the library file is absent, or loads without defining a reader) → "unknown", fail-open, never "low"
-  if [ ! -r "$PILOT_DISK_LIB" ] || ! . "$PILOT_DISK_LIB" 2>/dev/null || ! type disk_free_mb >/dev/null 2>&1 || ! type disk_state_of >/dev/null 2>&1; then
-    PILOT_DISK_FLOOR_DETAIL="library unreadable: ${PILOT_DISK_LIB}"
+  # vazio/falhou/ilegível (the library file is absent, does not load, or loads without defining a reader) → "unknown",
+  # fail-open and on the log, never "low". The first `.` is a PROBE in a subshell: on /bin/bash 3.2 (what launchd runs) a syntax
+  # error in a sourced file ends the whole shell, `2>/dev/null` and `if !` notwithstanding (exit 2, no output, no sweep) —
+  # in a subshell it ends only the probe, and a corrupt library becomes this line instead of a silent dead Pilot.
+  if [ ! -r "$PILOT_DISK_LIB" ] || ! ( . "$PILOT_DISK_LIB" ) >/dev/null 2>&1 || ! . "$PILOT_DISK_LIB" 2>/dev/null || ! type disk_free_mb >/dev/null 2>&1 || ! type disk_state_of >/dev/null 2>&1; then
+    PILOT_DISK_FLOOR_DETAIL="library unreadable or does not load: ${PILOT_DISK_LIB}"
     return 1
   fi
   local _ov="${PILOT_DISK_FREE_OVERRIDE_MB:-${DISK_FREE_OVERRIDE_MB:-}}" _st _free=""
