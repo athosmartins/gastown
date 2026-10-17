@@ -501,7 +501,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     return r
         return None
 
-    def one(seg: list, blind: bool = False, prev: str = "", term: str = ";"):  # prev/term = o operador antes e depois do trecho: dizem se um cd rodou com certeza
+    def one(seg: list, blind: bool = False, prev: str = "", term: str = ";", ext: bool = False):  # ext = trecho que um programa roda (find -exec): cd ali não muda o shell; prev/term = o operador antes e depois do trecho: dizem se um cd rodou com certeza
         r = inner(seg)
         if r:
             return r
@@ -546,7 +546,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             st["env"].update({m.group(1): "$?" if unsure else m.group(2) for m in map(ASSIGN.fullmatch, seg[1:]) if m})
         elif c in ("cd", "pushd", "popd"):
             new = None if c == "popd" else chdir(seg[1:], st["cwd"], c == "pushd")
-            if kw or wrapped or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
+            if kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
                 new = None
             if blk and new is not None:
                 st["cdblk"] = True  # cd dentro de um ramo: vale até o fi/done/esac/else/elif
@@ -577,7 +577,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         elif c == "find":  # o `\;` e o `\(` do find são palavras (words() não os toma por operador do shell): todos os `-exec` do find estão neste trecho
             for j, t in enumerate(seg):
                 if t in ("-exec", "-execdir", "-ok", "-okdir"):  # -exec/-ok rodam no diretório do find; -execdir/-okdir no de CADA achado, que não sei qual é: cego
-                    r = one(seg[j + 1:], blind or t.endswith("dir"))
+                    r = one(seg[j + 1:], blind or t.endswith("dir"), ext=True)
                     if r:
                         return r
         elif c in st.get("funcs", {}) and c not in st.setdefault("calling", set()):  # chamada de função definida nesta chamada: o corpo roda AGORA, neste cwd

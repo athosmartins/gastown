@@ -599,6 +599,7 @@ git -C $OTH commit -m x"
   b 2 "ctx: GIT_DIR=<alheio>; false && GIT_DIR=<próprio>; export GIT_DIR; git commit" "GIT_DIR=$OTH/.git; false && GIT_DIR=$OWN/.git; export GIT_DIR; git commit -m x"
   b 2 "ctx: cd <alheio>; env cd <próprio>; git commit (env roda o cd como programa)" "cd $OTH; env cd $OWN; git commit -m x"
   b 2 "ctx: cd <alheio>; find <próprio> -exec cd <próprio> \; ; git commit (o cd do find é programa: o shell fica no alheio)" "cd $OTH; find $OWN -maxdepth 0 -exec cd $OWN \; ; git commit -m x"
+  b 2 "ctx: cd <alheio>; find <próprio> -exec cd <próprio> ; git commit (o ; do shell corta o find: ele falha e o cd não roda)" "cd $OTH; find $OWN -maxdepth 0 -exec cd $OWN ; git commit -m x"
   b 0 "ctx: controle — '# it's fine' + git commit -m 'msg' no próprio" "# it's fine
 git commit -m 'msg'"
   b 0 "ctx: controle — git commit -m \"custa \\\$5\" no próprio" "git commit -m \"custa \\\$5\""
@@ -917,7 +918,8 @@ echo "== $((n-fails))/$n ok =="
   mutant ctx "em aspas duplas \\\$ e \\\` mantêm a barra" 's/out += \[cmd\[i + 1\]\] if q == .* else \[c, PROT.get/out += [c, PROT.get/'
   mutant ctx "VAR= depois de || vale como certa" 's/{k: "\$?" if unsure else v for/{k: v for/'
   mutant ctx "export depois de || vale como certo" 's/{m.group(1): "\$?" if unsure else m.group(2) for/{m.group(1): m.group(2) for/'
-  mutant ctx "env cd muda o diretório do shell" 's/if kw or wrapped or prev in/if kw or prev in/'
+  mutant ctx "env cd muda o diretório do shell" 's/if kw or wrapped or ext or/if kw or ext or/'
+  mutant ctx "find -exec cd (sem terminador) muda o diretório do shell" 's/if kw or wrapped or ext or/if kw or wrapped or/'
   mutant closed "branch/tag com palavra solta e sem opção de lista vira leitura" 's/        elif t.startswith("-") or not listing:/        elif t.startswith("-"):/'
   mutant closed "branch --list -d x vira leitura" 's/        elif t.startswith("-") or not listing:/        elif not listing:/'
   mutant closed "branch --contains -D x vira leitura" 's/^            if t.startswith("-"):/            if False:/'
