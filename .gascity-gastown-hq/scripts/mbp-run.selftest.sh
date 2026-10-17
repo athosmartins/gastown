@@ -1270,6 +1270,29 @@ has "…diz que não varreu o conteúdo" "$T/err" 'não consegui varrer o conte�
 n=$((n+1)); if [ -z "$(find "$BASEDEST" -type f 2>/dev/null | head -1)" ]; then echo "ok   …e nenhum arquivo foi copiado para a base"; else echo "FAIL …a base recebeu arquivos mesmo sem a varredura"; fails=$((fails+1)); fi
 find "$BASEDEST" -mindepth 1 -delete 2>/dev/null
 reset
+
+# ===== --audit-node (ga-2hd02v.1.5.2): o node_audit da semeadura, pasta a pasta, com o veredito de cada uma no stdout (a auditoria RODA de verdade no HOME falso) =====
+echo "--- --audit-node (ga-2hd02v.1.5.2)"
+AN="$T/home"; mkdir -p "$AN/an-limpa/src" "$AN/an-achada" "$AN/an-venv/venv/lib" "$AN/an-topo/sub"
+echo code > "$AN/an-limpa/src/a.py"; : > "$AN/an-achada/leak.db"; : > "$AN/an-venv/venv/lib/cacert.pem"; echo x > "$AN/an-venv/ok.py"; : > "$AN/an-topo/.env"; : > "$AN/an-topo/sub/x.db"
+an() { "$RUN" --host linux "$@" >"$T/out" 2>"$T/err"; echo $?; }
+reset; rc=$(an --audit-node an-limpa); expect "audit-node: pasta limpa" 0 "$rc"; has "…e o stdout diz LIMPO" "$T/out" '^AUDIT-NODE LIMPO an-limpa$'
+rc=$(an --audit-node an-achada); expect "audit-node: pasta com .db é ACHADO" 98 "$rc"; has "…ACHADO no stdout" "$T/out" '^AUDIT-NODE ACHADO an-achada$'; has "…e o caminho no stderr" "$T/err" 'NOME leak\.db'
+rc=$(STUB_AUDIT_BROKEN=1 an --audit-node an-limpa); expect "audit-node: auditoria que não consegue olhar" 98 "$rc"; has "…diz NAO-CONSEGUI (nem LIMPO, nem ACHADO)" "$T/out" '^AUDIT-NODE NAO-CONSEGUI an-limpa$'
+rc=$(an --audit-node an-limpa --audit-node an-achada); expect "audit-node: duas pastas, uma achada → 98" 98 "$rc"; has "…a limpa continua LIMPO" "$T/out" '^AUDIT-NODE LIMPO an-limpa$'; has "…e a outra ACHADO" "$T/out" '^AUDIT-NODE ACHADO an-achada$'
+rc=$(an --audit-node an-ausente); expect "audit-node: pasta que não existe é NAO-CONSEGUI, nunca LIMPO" 98 "$rc"; has "…no stdout" "$T/out" '^AUDIT-NODE NAO-CONSEGUI an-ausente$'
+rc=$(an --audit-node an-venv); expect "audit-node: sem poda o cacert.pem de um venv é achado" 98 "$rc"; has "…cita o .pem" "$T/err" 'NOME venv/lib/cacert\.pem'
+rc=$(an --audit-node 'an-venv::prune=venv'); expect "audit-node: prune=venv tira o venv e o resto segue limpo" 0 "$rc"
+rc=$(an --audit-node 'an-topo::maxdepth=1'); expect "audit-node: maxdepth=1 vê o .env do topo" 98 "$rc"; has "…cita o .env" "$T/err" 'NOME \.env'; hasnt "…mas não desce até sub/x.db" "$T/err" 'x\.db'
+rc=$(an --audit-node an-topo); expect "audit-node: sem maxdepth vê também o sub/x.db" 98 "$rc"; has "…cita o x.db" "$T/err" 'x\.db'
+for bad in 'an-limpa::-delete' 'an-limpa::prune=../x' 'an-limpa::maxdepth=99' 'an-limpa::prune=a b' '../x' '/etc' 'an limpa' ''; do
+  rc=$(an --audit-node "$bad"); expect "audit-node: argumento '$bad' é recusado (uso, 97) e nada roda" 97 "$rc"
+done
+n=$((n+1)); if ! grep -q 'HOSTCALL:hetzner:AUDIT' "$STUB_LOG"; then echo "ok   …e nenhuma auditoria chegou ao servidor"; else echo "FAIL …uma auditoria rodou com argumento inválido"; fails=$((fails+1)); fi
+rc=$("$RUN" --audit-node an-limpa >"$T/out" 2>"$T/err"; echo $?); expect "audit-node: sem --host linux (o MBP) é recusado" 97 "$rc"
+rc=$(an); expect "audit-node: sem nenhuma pasta é uso (97)" 97 "$rc"
+# a semeadura (node_audit SEM o 2º argumento) segue coberta pelos casos de auditoria acima: o script real roda sem o 3º argumento e esses casos continuam passando
+reset; rc=$(an --audit-node an-limpa); has "audit-node: o script de auditoria chegou ao nó" "$STUB_LOG" 'HOSTCALL:hetzner:AUDIT'
 }
 
 node_hq_cases() {  # ga-kz76o7: o repo hq no nó (chamada pela node_cases, depois da semeadura do wa)
