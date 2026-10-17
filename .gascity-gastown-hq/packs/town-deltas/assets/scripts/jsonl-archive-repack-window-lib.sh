@@ -33,6 +33,7 @@ _jaw_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 # jaw_hour — the local hour 0-23 as a plain decimal (no leading zero: "08" is not octal here), or nothing and rc 1 when the clock gives anything else.
 jaw_hour() {
   local h
+  # vazio → `date` printed nothing: not a number, rc 1 (closed); falhou → the same
   if [ -n "${JAW_HOUR:-}" ]; then h="$JAW_HOUR"; else h="$(date +%H 2>/dev/null)"; fi
   _jaw_uint "$h" || return 1
   h=$((10#$h))
@@ -59,11 +60,15 @@ jaw_window_open() {
   return 1
 }
 
-# jaw_largest_pack_kib <gitdir> — KiB of the biggest *.pack under <gitdir>/objects/pack: 0 when there is no pack at all (a young repo), rc 1 when one exists and cannot be measured.
+# jaw_largest_pack_kib <gitdir> — KiB of the biggest *.pack under <gitdir>/objects/pack: 0 when the directory is readable and holds no pack (a young repo), rc 1 when the directory is missing or
+# cannot be read, or when a pack exists and cannot be measured — a glob over a directory that is not there expands to nothing, and "nothing" must not be read as "no pack".
 jaw_largest_pack_kib() {
   local p kib max=0
+  # falhou → a missing or unreadable directory is rc 1 (unknown size), never the empty glob below that would answer 0
+  [ -d "$1/objects/pack" ] && [ -r "$1/objects/pack" ] && [ -x "$1/objects/pack" ] || return 1
   for p in "$1"/objects/pack/*.pack; do
     [ -e "$p" ] || continue
+    # vazio → du printed nothing: not a number, rc 1 (the size is unknown, never 0); falhou → the same
     kib="$(du -k "$p" 2>/dev/null | awk '{print $1}')"
     _jaw_uint "$kib" || return 1
     [ "$kib" -gt "$max" ] && max="$kib"
@@ -74,12 +79,14 @@ jaw_largest_pack_kib() {
 # jaw_free_kib <path> — free KiB on the filesystem holding <path>; empty when df says nothing usable.
 jaw_free_kib() {
   if [ -n "${JAW_FREE_KIB:-}" ]; then echo "$JAW_FREE_KIB"; return 0; fi
+  # vazio → empty output, which jaw_resources_ok reads as "cannot be read" = no repack; falhou → the same
   df -k "$1" 2>/dev/null | awk 'NR==2 {print $4}'
 }
 
 # jaw_swap_used — what the host says about swap, for the log only (the rule does not depend on it): "used=4092.44M" or "unknown".
 jaw_swap_used() {
   local s
+  # vazio → "unknown" (the swap is only logged, the rule never reads it); falhou → the same
   s="$(sysctl -n vm.swapusage 2>/dev/null | sed -n 's/.*used = \([0-9.]*[KMG]\).*/\1/p')"
   if [ -n "$s" ]; then echo "used=$s"; else echo "unknown"; fi
 }

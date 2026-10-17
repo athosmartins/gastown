@@ -692,6 +692,32 @@ window_case win-h05 5 99999999
 [ "$(maint_spawns "$E2E/t2-win-h05.json")" -eq 0 ] \
   && ok "05h (a repack started now would run past 06:00): refused" \
   || bad "05h: spawns=$(maint_spawns "$E2E/t2-win-h05.json"), want 0: $OUT"
+# The pack directory is the third state of "how big is the biggest pack": no pack in a readable directory = a young repo (size 0, allowed); a directory that is missing or cannot be read =
+# unknown (refused). Reading the unknown as 0 would pass the room check for a repo whose biggest pack is 4.5GiB.
+pack_dir_case() {  # pack_dir_case <name> <mode> — jaw_repack_allowed at 02h with 95GB free on a gitdir whose objects/pack is <ok|missing|unreadable>; prints "allowed: …" or "refused: …"
+  local gd="$E2E/packdir-$1"
+  mkdir -p "$gd/objects"
+  case "$2" in
+    ok)         mkdir -p "$gd/objects/pack" ;;
+    unreadable) mkdir -p "$gd/objects/pack" && chmod 000 "$gd/objects/pack" ;;
+  esac
+  (
+    . "$HERE/jsonl-archive-repack-window-lib.sh"
+    JAW_HOUR=2 JAW_FREE_KIB=99999999 JAW_LOG=""
+    if jaw_repack_allowed "$gd" >/dev/null; then echo "allowed: $JAW_REASON"; else echo "refused: $JAW_REASON"; fi
+  ) 2>&1
+  chmod 755 "$gd/objects/pack" 2>/dev/null   # so the sandbox cleanup can remove it
+}
+PD_OUT="$(pack_dir_case ok ok)"
+case "$PD_OUT" in "allowed:"*) ok "an empty, readable objects/pack (a young repo): size 0, the repack is allowed" ;; *) bad "empty readable pack dir: $PD_OUT" ;; esac
+PD_OUT="$(pack_dir_case missing missing)"
+case "$PD_OUT" in "refused:"*"cannot be measured"*) ok "no objects/pack at all: the biggest pack cannot be measured, the repack is refused (not read as 0)" ;; *) bad "missing pack dir: $PD_OUT" ;; esac
+if [ "$(id -u)" -ne 0 ]; then
+  PD_OUT="$(pack_dir_case unreadable unreadable)"
+  case "$PD_OUT" in "refused:"*"cannot be measured"*) ok "an objects/pack that cannot be read: refused (not read as 0)" ;; *) bad "unreadable pack dir: $PD_OUT" ;; esac
+else
+  echo "  SKIP: unreadable-pack-dir case (running as root: chmod 000 does not block)"
+fi
 # A repo recreated WITHOUT the two keys (the exporter recreates it when .git goes missing; ensure_archive_pack_config runs only afterwards): the commit itself must start nothing outside the
 # window, by its own -c flags. commit_archive_snapshot lives past the library-mode return, so its text is lifted out of the script and run against a bare repo with no keys.
 keyless_commit() {  # keyless_commit <name> <JAW_HOUR> — one commit in a fresh repo with NO maintenance/gc keys; trace2 in $E2E/t2-<name>.json

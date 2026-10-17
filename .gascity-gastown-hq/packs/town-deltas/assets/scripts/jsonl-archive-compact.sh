@@ -118,13 +118,16 @@
 #      its cap, a candidate lsof gave no answer for) = the gc is not started either — under doubt the inert state — and the log says so. The END state still judges the run: a
 #      repo that stays over the pack alarm is BAD whatever the status, so a gc that is deferred forever is not silent.
 #   2. The exporter, whose commits are what spawn that run, commits with maintenance.auto=false while this script's lock is held (jsonl-export.sh, commit_archive_snapshot): no
-#      new background repack can start during a compaction run. It resumes the moment the run ends, so git's consolidation is only delayed, never removed.
+#      new background repack can start during a compaction run. When the run ends the exporter goes back to the window rule (WINDOW below), so this lock only delays git's
+#      consolidation, it never removes it.
 # WINDOW (ga-wkoij7): on 17/10 ~10:4x the exporter's commit started git's geometric repack of the 4.4GB pack at midday (pack-objects 1.8GB of RAM, swap 5.2GB, free disk 1.4GB). Athos
 # decided (15/10) that the heavy maintenance runs only in 00:00-06:00. So the tier-2 consolidating gc — a rewrite of every pack, the other whole-repo repack of this city — starts only when
 # jaw_repack_allowed says so (jsonl-archive-repack-window-lib.sh: local hour in [0,5) AND free disk >= 2 x the largest pack + 2GiB; a clock or a df that cannot be read = no): outside that
 # it is `deferred` and logged with the reason, like a gc without budget — never a failure by itself, and never silent, because the pack alarm still judges the END state (>= JAC_PACKS_ALARM
 # packs = BAD whatever the status). Tier 1 (loose-objects batches) and tier 2a (the tail repack, `--keep-pack` on the big packs) are NOT gated on purpose: they are bounded by objects and by
-# pack.windowMemory, never read the biggest pack, and the loose backlog (~243MiB/h) has to be packed by day or the disk fills.
+# pack.windowMemory, leave the big packs alone, and the loose backlog (~243MiB/h) has to be packed by day or the disk fills. A known cost of leaving tier 2a ungated: on 17/10 it
+# hit its own 600s cap at 13:13Z and 14:19Z (pack-objects paged out at ~1% CPU, 4.7GB of swap in use), so by day it can burn the cap and produce nothing; confining it to the
+# window would let the small packs pile up toward JAC_PACKS_ALARM instead — a trade-off left to the Mayor (ga-wkoij7), not decided here.
 # Together they leave one window: a commit that spawned a run in the instant before this script took its lock. If that run is still going when other_repacker looks (the gc
 # starts after the batches, minutes into the run) it is seen; if it has finished it can no longer delete anything. Not covered, on purpose: a git run with --git-dir from another
 # working directory (no cwd in the repo), and one of another user — nothing in this city does either to an archive but this script.
@@ -950,11 +953,11 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
   if [ "$STATUS" != unmeasured ] && [ "$M_PACKS" -ge "$PACKS_LIMIT" ]; then
     need=$(( M_PACK_KIB + HEADROOM_KIB ))
     # WINDOW (header, ga-wkoij7): the gc rewrites every pack, so it starts only in the night window and with room for it. jaw_repack_allowed logs its own reason; free_kib is passed in
-    # so JAC_FREE_KIB (the seam of every disk test here) stays the one source of free space, and an empty answer from df is "cannot read" = no gc. Not allowed = it did NOTHING, so it
+    # so JAC_FREE_KIB (the seam of every disk test here) stays the one source of free space; an empty answer is read again by the lib's own df, and empty twice is "cannot read" = no gc. Not allowed = it did NOTHING, so it
     # cannot turn a failed / stalled / timed-out / unmeasured / skipped tier 1 green — the same rule as a gc without budget.
     if ! jaw_repack_allowed "$R_GITDIR" "$(free_kib "$repo")"; then
       bad_status "$STATUS" || STATUS="deferred"
-      log "repo=$repo packs=$M_PACKS >= $PACKS_LIMIT but the repack window is closed — consolidating gc deferred: $JAW_REASON (the pack alarm still judges the end state)"
+      log "repo=$repo packs=$M_PACKS >= $PACKS_LIMIT but the repack window does not allow it now — consolidating gc deferred: $JAW_REASON (the pack alarm still judges the end state)"
     elif [ "$(remaining)" -lt "$MIN_GC_BUDGET_S" ]; then
       bad_status "$STATUS" || STATUS="deferred"
       log "repo=$repo packs=$M_PACKS >= $PACKS_LIMIT but only $(remaining)s of budget left — gc deferred to the next run"
