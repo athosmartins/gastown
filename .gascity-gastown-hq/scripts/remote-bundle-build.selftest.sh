@@ -31,9 +31,13 @@
 #   mesmo comando, wrapper com o marcador sem o `P=` / com `P=` fora da cidade / com dois marcadores recusam; as formas reais do drop
 #   (gt nu, ~/.local/bin, $HOME, caminho absoluto) seguem descartadas; o manifest guarda `command` e `command_sha256` de cada hook (drop
 #   inclusive) e nenhum /Users/ · verify: symlink no lugar de arquivo, bit de execução lido do modo (os.access forçado a False), pastas de
-#   OUT 0755 com umask 077 · as recusas que só afirmavam exit 3 agora afirmam o motivo.
+#   OUT 0755 com umask 077 · as recusas que só afirmavam exit 3 agora afirmam o motivo · SKILLS FORA DO SERVIDOR POR NOME (ga-2hd02v.1.5.2): as 3 com CPF/CNPJ e as 3 com caminho do
+#   mini ficam de fora com --skills (rc 0, manifest `excluded_skills`, nada delas no bundle, nenhum CPF/CNPJ); 4ª skill com CPF / CNPJ / caminho do mini AINDA recusa; nome por igualdade
+#   (a renomeada recusa pelo conteúdo e o nome velho AVISA); nome que não existe avisa e vai para `excluded_skills_missing`; --exclude-skill acrescenta; sem --skills ou com nome que não
+#   é pasta exata (barra, glob, vazio) é erro de uso (2); só excluídas = 0 entregues recusa.
 # CONTROLE NEGATIVO: a tabela POLICY perde a linha de um hook (sed) e o mesmo build TEM que passar a recusar — keep (filter-bash-output.sh)
-#   e drop (gt tap guard cross-clone-block, home-scan-guard, ntfy-on-stop.sh).
+#   e drop (gt tap guard cross-clone-block, home-scan-guard, ntfy-on-stop.sh). Skills: sem a exclusão por nome as 3 com CPF/CNPJ recusam; exclusão por substring deixaria a renomeada
+#   passar; sem as linhas de CPF/CNPJ de SECRETS a 4ª skill passaria.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 B="${BUNDLE_BUILD_UNDER_TEST:-$HERE/remote-bundle-build.py}"
@@ -411,6 +415,40 @@ fresh; mkdir -p "$T/f/gt/.gascity-gastown-hq/skills/vazia"; ln -s "$T/f/gt/.gasc
 refuses "skill que é pasta sem nenhum arquivo (não conta como entregue)" "$T/f" --skills
 why "diretório sem nenhum arquivo"
 
+# --- skills que ficam fora do servidor POR NOME (ga-2hd02v.1.5.2): 3 com CPF/CNPJ (decisão do Mayor) + 3 com caminho do mini (medido em 17/10); a guarda de conteúdo NÃO é afrouxada ---
+CPF=$(printf '%s.%s.%s-%s' 111 222 333 44); CNPJ=$(printf '%s.%s.%s/%s-%s' 11 222 333 0001 44)
+NOT3="censec-inventario-extrajudicial cnd-municipal-pbh cnd-trabalhista-cndt"; MINI3="corrigir-imovel-do-anuncio rea-scraper-first wa-worker-session-protocol"
+WANT6='["censec-inventario-extrajudicial","cnd-municipal-pbh","cnd-trabalhista-cndt","corrigir-imovel-do-anuncio","rea-scraper-first","wa-worker-session-protocol"]'
+addskill() {  # addskill NOME [TEXTO] — skill na cidade + o link no papel
+  local c=$T/f/gt/.gascity-gastown-hq; mkdir -p "$c/skills/$1"; printf '%s\n' "${2:-# skill}" > "$c/skills/$1/SKILL.md"; ln -sfn "$c/skills/$1" "$c/.gc/agents/dog/.claude/skills/$1"
+}
+SK=$T/f/out/role/dog/.claude/skills
+fresh; for s in $NOT3; do addskill "$s" "doc $CPF e $CNPJ"; done; for s in $MINI3; do addskill "$s" "veja /Users/athos/gt/x"; done
+build "$T/f" "$T/f/out" --skills; rc=$?; [ $rc = 0 ]; ok $? "as 6 (3 com CPF/CNPJ, 3 com caminho do mini) + 1 boa: --skills termina 0 (rc=$rc)"
+has "$T/outp" "1 skills (6 excluídas por nome)"; ok $? "  a linha final conta 1 entregue e 6 excluídas"
+jq -e --argjson want "$WANT6" '.excluded_skills == $want and .excluded_skills_missing == []' "$T/f/out/manifest.json" >/dev/null; ok $? "  o manifest lista as 6 em excluded_skills (ordem estável) e nenhuma como ausente"
+gone=0; for s in $NOT3 $MINI3; do [ -e "$SK/$s" ] && gone=1; done; [ $gone = 0 ] && [ -f "$SK/ok-skill/SKILL.md" ]; ok $? "  nenhum arquivo das excluídas no bundle; a skill boa segue lá"
+grep -rqF -e "$CPF" -e "$CNPJ" "$T/f/out"; [ $? = 1 ]; ok $? "  nenhum CPF/CNPJ no bundle"
+! has "$T/err" AVISO; ok $? "  sem aviso quando todos os nomes existem"
+python3 -I "$B" verify "$T/f/out"; ok $? "  verify do bundle com skills excluídas sai 0"
+fresh; addskill quarta-skill "cliente $CPF"; refuses "4ª skill com CPF (as excluídas não abrem exceção para ela): a guarda NÃO foi afrouxada" "$T/f" --skills; why "quarta-skill/SKILL.md: parece conter CPF"
+fresh; addskill quarta-skill "empresa $CNPJ"; refuses "4ª skill com CNPJ" "$T/f" --skills; why "quarta-skill/SKILL.md: parece conter CNPJ"
+fresh; addskill quarta-skill "veja /Users/athos/gt/x"; refuses "4ª skill com caminho do mini: a guarda de /Users/ NÃO foi afrouxada" "$T/f" --skills; why "caminho do mini"
+fresh; addskill cnd-municipal-pbh-v2 "empresa $CNPJ"; refuses "skill excluída que mudou de nome (a nova NÃO está excluída; exclusão é por nome exato, não por prefixo)" "$T/f" --skills
+why "cnd-municipal-pbh-v2/SKILL.md: parece conter CNPJ"; why "cnd-municipal-pbh (renomeada?"
+fresh; build "$T/f" "$T/f/out" --skills; rc=$?; [ $rc = 0 ] && [ "$(grep -c 'AVISO: skill excluída por nome não existe' "$T/err")" = 6 ]; ok $? "nome excluído que não existe em skills/ AVISA (6 avisos, um por nome) e o build segue (rc=$rc)"
+jq -e '.excluded_skills == [] and (.excluded_skills_missing | length) == 6' "$T/f/out/manifest.json" >/dev/null; ok $? "  o manifest guarda os nomes ausentes em excluded_skills_missing (excluded_skills fica vazio)"
+fresh; addskill extra-skill "ok"; build "$T/f" "$T/f/out" --skills --exclude-skill extra-skill; rc=$?
+[ $rc = 0 ] && [ ! -e "$SK/extra-skill" ] && [ -f "$SK/ok-skill/SKILL.md" ] && jq -e '.excluded_skills == ["extra-skill"]' "$T/f/out/manifest.json" >/dev/null; ok $? "--exclude-skill NOME acrescenta uma exclusão (rc=$rc)"
+fresh; mkdir -p "$T/f/fora"; ln -sfn "$T/f/fora" "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/cnd-municipal-pbh"; build "$T/f" "$T/f/out" --skills; rc=$?
+[ $rc = 0 ] && jq -e '.excluded_skills == ["cnd-municipal-pbh"]' "$T/f/out/manifest.json" >/dev/null; ok $? "excluída é decidida pelo NOME antes de resolver: não é lida, nem barrada pela fronteira da cidade (rc=$rc)"
+fresh; rm "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog/.claude/skills/ok-skill"; addskill censec-inventario-extrajudicial "x $CPF"
+refuses "só há skill excluída: entregaria 0 (pedido ≠ entregue)" "$T/f" --skills; why "não tem nenhuma skill"
+fresh; wipe "$T/f/out"; build "$T/f" "$T/f/out" --exclude-skill ok-skill; rc=$?; [ $rc = 2 ] && [ ! -e "$T/f/out" ]; ok $? "--exclude-skill sem --skills é erro de uso (2), não flag que não faz nada (rc=$rc)"; why "--exclude-skill só vale com --skills"
+for bad in '../ok-skill' 'ok-*' 'a/b' ''; do
+  build "$T/f" "$T/f/out" --skills --exclude-skill "$bad"; rc=$?; [ $rc = 2 ] && [ ! -e "$T/f/out" ]; ok $? "--exclude-skill '$bad' (não é nome exato de pasta) → uso (2) (rc=$rc)"; why "NOME exato"
+done
+
 # --- "não consegui ler" não é "não tem nada": pasta ilegível dentro de skill e dentro de OUT (os.walk e rglob engoliam o erro) ---
 S=$T/f/gt/.gascity-gastown-hq/skills/ok-skill
 fresh; mkdir -p "$S/refs/deep"; echo '# ref' > "$S/refs/deep/ref.md"; echo '# topo' > "$S/refs/topo.md"
@@ -444,6 +482,23 @@ for row in '"gt tap guard cross-clone-block", "drop"' '"home-scan-guard", "drop"
     --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --out "$T/f/mut" 2>/dev/null
   [ $? = 3 ]; ok $? "controle negativo: sem a linha $row o build é recusado"
 done
+
+# controle negativo das skills por NOME: cada mutante estraga UMA guarda e o caso que a cobre tem de ver a diferença
+mutate_build() {  # mutate_build MUTANTE.py — o mesmo build do fixture atual, com o builder mutado; rc em $?
+  python3 -I "$1" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
+    --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --out "$T/f/mut" --skills 2>/dev/null
+}
+fresh; for s in $NOT3; do addskill "$s" "doc $CPF e $CNPJ"; done
+grep -qF 'if link.name in skip:' "$B"; ok $? "  o builder tem a linha da exclusão por nome (o sed abaixo não é um no-op)"
+sed 's/if link.name in skip:/if False:/' "$B" > "$T/mutant.py"; mutate_build "$T/mutant.py"
+[ $? = 3 ]; ok $? "controle negativo: sem a exclusão por nome as 3 skills com CPF/CNPJ recusam o build (é a exclusão que o deixa passar)"
+fresh; addskill cnd-municipal-pbh-v2 "empresa $CNPJ"
+sed 's/if link.name in skip:/if any(s in link.name for s in skip):/' "$B" > "$T/mutant.py"; wipe "$T/f/mut"; mutate_build "$T/mutant.py"
+[ $? = 0 ]; ok $? "controle negativo: exclusão por substring deixaria a skill RENOMEADA (com CNPJ) fora em silêncio — o caso 'mudou de nome' vê a diferença"
+fresh; addskill quarta-skill "cliente $CPF e $CNPJ"
+grep -c '^    ("CPF", re.compile\|^    ("CNPJ", re.compile' "$B" | grep -qx 2; ok $? "  SECRETS tem as linhas de CPF e CNPJ (o grep abaixo não é um no-op)"
+grep -v '^    ("CPF", re.compile\|^    ("CNPJ", re.compile' "$B" > "$T/mutant.py"; wipe "$T/f/mut"; mutate_build "$T/mutant.py"
+[ $? = 0 ]; ok $? "controle negativo: sem as linhas de CPF/CNPJ a 4ª skill passaria — os casos de 4ª skill pegam o afrouxamento"
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
