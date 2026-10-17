@@ -893,15 +893,30 @@ bd() {
 gap2_arm_needs_remerge "ga-fake-parent" "ga-fake-sling"
 unset -f bd
 
+# _gap2_remove_calls <calls_file> <bead> — one output line per recorded
+# `label remove <bead> <labels>` call: that call's (comma-separated) label
+# argument. Anchored on the field positions the mock records (`-C <city> label
+# remove <bead> <labels> ...`), so a comment body that merely MENTIONS "label
+# remove" is never read as a call. ga-hudkhe gate-fix 1: the release is ONE call
+# carrying both labels, so the tests count calls and read the label set from them
+# instead of looking for one call per label.
+_gap2_remove_calls() { awk -v b="$2" '$3=="label" && $4=="remove" && $5==b { print $6 }' "$1"; }
+
 # Fixed-string matches (grep -F), deliberately — no regex metachars/anchors
 # (e.g. \b) whose support varies by grep implementation across environments
 # this selftest might run under.
-grep -qF -- "-C $GC_CITY label remove ga-fake-parent story:in-flight" "$GAP2_ARM_CALLS" \
-  && ok "gap2_arm_needs_remerge actually calls bd label remove ... story:in-flight (not just claims to in the comment)" \
-  || bad "gap2_arm_needs_remerge did NOT call bd label remove story:in-flight — bead would be permanently stranded (ga-4tgga attempt 2 regression)"
-grep -qF -- "-C $GC_CITY label remove ga-fake-parent pilot:dispatched" "$GAP2_ARM_CALLS" \
-  && ok "gap2_arm_needs_remerge actually calls bd label remove ... pilot:dispatched (not just claims to in the comment)" \
-  || bad "gap2_arm_needs_remerge did NOT call bd label remove pilot:dispatched — bead would be permanently stranded (ga-4tgga attempt 2 regression)"
+GAP2_ARM_REMOVES=$(_gap2_remove_calls "$GAP2_ARM_CALLS" ga-fake-parent)
+[ "$(printf '%s\n' "$GAP2_ARM_REMOVES" | grep -c .)" -eq 1 ] \
+  && ok "gap2_arm_needs_remerge releases with exactly ONE bd label remove call (ga-hudkhe gate-fix 1: all-or-nothing, cannot half-apply)" \
+  || bad "gap2_arm_needs_remerge made $(printf '%s\n' "$GAP2_ARM_REMOVES" | grep -c .) label-remove calls (want exactly 1) — two calls can half-apply and strand the parent behind a 'will retry' warn"
+case ",$GAP2_ARM_REMOVES," in
+  *,story:in-flight,*) ok "gap2_arm_needs_remerge actually calls bd label remove ... story:in-flight (not just claims to in the comment)" ;;
+  *) bad "gap2_arm_needs_remerge did NOT call bd label remove story:in-flight — bead would be permanently stranded (ga-4tgga attempt 2 regression)" ;;
+esac
+case ",$GAP2_ARM_REMOVES," in
+  *,pilot:dispatched,*) ok "gap2_arm_needs_remerge actually calls bd label remove ... pilot:dispatched (not just claims to in the comment)" ;;
+  *) bad "gap2_arm_needs_remerge did NOT call bd label remove pilot:dispatched — bead would be permanently stranded (ga-4tgga attempt 2 regression)" ;;
+esac
 grep -qF -- "-C $GC_CITY label add ga-fake-parent gate:needs-fix" "$GAP2_ARM_CALLS" \
   && ok "gap2_arm_needs_remerge still sets gate:needs-fix (unchanged legacy consumer path)" \
   || bad "gap2_arm_needs_remerge dropped gate:needs-fix — legacy consumers would stop seeing this bead"
@@ -914,8 +929,10 @@ grep -qF -- "comment ga-fake-parent" "$GAP2_ARM_CALLS" \
 
 # Ordering: the removes must land BEFORE the adds (mirrors close:merge-verified
 # / close:untracked-delivery exactly) — strip old status before re-arming new.
-GAP2_ARM_REMOVE_LINE=$(grep -nF -- "label remove ga-fake-parent pilot:dispatched" "$GAP2_ARM_CALLS" | head -1 | cut -d: -f1)
-GAP2_ARM_ADD_LINE=$(grep -nF -- "label add ga-fake-parent gate:needs-fix" "$GAP2_ARM_CALLS" | head -1 | cut -d: -f1)
+# (`|| true`: this file runs under set -e/pipefail and a missing call must reach the
+# `bad` below, not abort the whole selftest at the assignment.)
+GAP2_ARM_REMOVE_LINE=$(grep -nF -- "label remove ga-fake-parent story:in-flight,pilot:dispatched" "$GAP2_ARM_CALLS" | head -1 | cut -d: -f1 || true)
+GAP2_ARM_ADD_LINE=$(grep -nF -- "label add ga-fake-parent gate:needs-fix" "$GAP2_ARM_CALLS" | head -1 | cut -d: -f1 || true)
 if [ -n "$GAP2_ARM_REMOVE_LINE" ] && [ -n "$GAP2_ARM_ADD_LINE" ] && [ "$GAP2_ARM_REMOVE_LINE" -lt "$GAP2_ARM_ADD_LINE" ]; then
   ok "gap2_arm_needs_remerge removes old status labels BEFORE adding new ones"
 else
@@ -1363,9 +1380,10 @@ grep -qF -- "label add" "$GAP2_FAKE_CALLS" \
 grep -qF -- "label remove ga-fake-failed gate:" "$GAP2_FAKE_CALLS" \
   && bad "FAIL-stamped parent: a gate:* label was REMOVED" \
   || ok "FAIL-stamped parent: no gate:* label removed"
-grep -qF -- "label remove ga-fake-failed story:in-flight" "$GAP2_FAKE_CALLS" && grep -qF -- "label remove ga-fake-failed pilot:dispatched" "$GAP2_FAKE_CALLS" \
-  && ok "FAIL-stamped parent: story:in-flight + pilot:dispatched ARE released (lane freed, parent not stuck in the sweep)" \
-  || bad "FAIL-stamped parent: the two orphan markers were not both released"
+GAP2_FAKE_REMOVES=$(_gap2_remove_calls "$GAP2_FAKE_CALLS" ga-fake-failed)
+[ "$GAP2_FAKE_REMOVES" = "story:in-flight,pilot:dispatched" ] \
+  && ok "FAIL-stamped parent: story:in-flight + pilot:dispatched ARE released, in ONE call (lane freed, parent not stuck in the sweep, cannot half-apply)" \
+  || bad "FAIL-stamped parent: the release is not exactly one 'story:in-flight,pilot:dispatched' call — got: $(printf '%s' "$GAP2_FAKE_REMOVES" | tr '\n' ' ')"
 GAP2_FAKE_COMMENT=$(grep -F -- "comment ga-fake-failed" "$GAP2_FAKE_CALLS" | head -1)
 [ -n "$GAP2_FAKE_COMMENT" ] && ok "FAIL-stamped parent: an explanatory comment is posted" || bad "FAIL-stamped parent: no comment"
 case "$GAP2_FAKE_COMMENT" in *"no reviewer ever rejected"*) bad "REGRESSION ga-hudkhe: the comment still says no reviewer ever rejected this code — false over a gate-sha-failed stamp" ;; *) ok "FAIL-stamped parent: the comment does NOT claim no reviewer ever rejected the code" ;; esac
@@ -1455,16 +1473,21 @@ bd() { _gap2_fake_bd "$@"; }
 gap2_skip_janitor_stranded "ga-fake-jp" "ga-c79qtf" "Orphan sling-task cleanup (sling-task-janitor" && GAP2_RC=0 || GAP2_RC=$?
 unset -f bd
 [ "$GAP2_RC" -eq 0 ] && ok "gap2_skip_janitor_stranded completes (rc0)" || bad "gap2_skip_janitor_stranded rc=$GAP2_RC"
-grep -qF -- "-C $GC_CITY label remove ga-fake-jp story:in-flight" "$GAP2_FAKE_CALLS" \
-  && ok "actually calls bd label remove ... story:in-flight" || bad "did NOT remove story:in-flight — the parent would stay invisible to Pilot behind a dead stub"
-grep -qF -- "-C $GC_CITY label remove ga-fake-jp pilot:dispatched" "$GAP2_FAKE_CALLS" \
-  && ok "actually calls bd label remove ... pilot:dispatched" || bad "did NOT remove pilot:dispatched"
+GAP2_FAKE_REMOVES=$(_gap2_remove_calls "$GAP2_FAKE_CALLS" ga-fake-jp)
+case ",$GAP2_FAKE_REMOVES," in
+  *,story:in-flight,*) ok "actually calls bd label remove ... story:in-flight" ;;
+  *) bad "did NOT remove story:in-flight — the parent would stay invisible to Pilot behind a dead stub" ;;
+esac
+case ",$GAP2_FAKE_REMOVES," in
+  *,pilot:dispatched,*) ok "actually calls bd label remove ... pilot:dispatched" ;;
+  *) bad "did NOT remove pilot:dispatched" ;;
+esac
 grep -qF -- "label add" "$GAP2_FAKE_CALLS" \
   && bad "REGRESSION ga-hudkhe: a label was ADDED (gate:needs-remerge / gate:needs-fix) — a janitor-closed stub is not a gate pass" \
   || ok "NO label added (above all never gate:needs-remerge)"
-[ "$(grep -cF -- "label remove" "$GAP2_FAKE_CALLS")" -eq 2 ] \
-  && ok "exactly TWO label removes — the parent's gate:needs-fix (a real FAIL) and every other label are untouched" \
-  || bad "unexpected number of label removes: $(grep -cF -- "label remove" "$GAP2_FAKE_CALLS")"
+[ "$GAP2_FAKE_REMOVES" = "story:in-flight,pilot:dispatched" ] \
+  && ok "exactly ONE label remove carrying exactly those two labels — the parent's gate:needs-fix (a real FAIL) and every other label are untouched, and the release cannot half-apply" \
+  || bad "unexpected label removes (want one 'story:in-flight,pilot:dispatched'): $(printf '%s' "$GAP2_FAKE_REMOVES" | tr '\n' ' ')"
 grep -qF -- "label remove ga-fake-jp gate:" "$GAP2_FAKE_CALLS" \
   && bad "a gate:* label was removed" || ok "no gate:* label removed"
 GAP2_FAKE_COMMENT=$(grep -F -- "comment ga-fake-jp" "$GAP2_FAKE_CALLS" | head -1)
@@ -1476,18 +1499,22 @@ grep -qE -- "update .*set-metadata" "$GAP2_FAKE_CALLS" \
   || ok "no metadata write (state change, not an inert arm — the comment cannot repeat)"
 rm -f "$GAP2_FAKE_CALLS"
 
-# A label remove that errors: rc1 and NO comment (it says "cleared").
+# A label remove that errors: rc1 and NO comment (it says "cleared"). This test
+# only covers the rc and the comment; that the parent really IS selected again
+# next sweep is a claim about the post-STATE and is asserted in 6m, against a
+# stateful bd (a recorder like this one cannot see what a failed call left behind).
 GAP2_FAKE_CALLS="$(mktemp)"; GAP2_FAKE_FAIL_VERB="label remove"
 bd() { _gap2_fake_bd "$@"; }
 gap2_skip_janitor_stranded "ga-fake-jf" "ga-c79qtf" "Orphan sling-task cleanup (sling-task-janitor" && GAP2_RC=0 || GAP2_RC=$?
 unset -f bd
 GAP2_FAKE_FAIL_VERB=""
-[ "$GAP2_RC" -ne 0 ] && ok "label remove errors → rc1 (caller warns, parent stays selected, retried next sweep)" || bad "label remove errored but rc=$GAP2_RC"
+[ "$GAP2_RC" -ne 0 ] && ok "label remove errors → rc1 (the caller turns that into a warn)" || bad "label remove errored but rc=$GAP2_RC"
 grep -qF -- "comment ga-fake-jf" "$GAP2_FAKE_CALLS" \
   && bad "commented 'cleared' although the label remove failed — a comment must not promise more than the code did" \
   || ok "label remove errors → NO comment posted"
-[ "$(grep -cF -- "label remove" "$GAP2_FAKE_CALLS")" -eq 2 ] \
-  && ok "both removes are still attempted when the first fails" || bad "second remove skipped after the first failed"
+[ "$(_gap2_remove_calls "$GAP2_FAKE_CALLS" ga-fake-jf | grep -c .)" -eq 1 ] \
+  && ok "the release is ONE bd call even when it fails (no second call that could land on its own)" \
+  || bad "the failed release made $(_gap2_remove_calls "$GAP2_FAKE_CALLS" ga-fake-jf | grep -c .) label-remove calls — a second call can half-apply"
 rm -f "$GAP2_FAKE_CALLS"
 
 # A comment that errors after a good release: rc0 (the labels ARE released; the
@@ -1526,6 +1553,118 @@ GAP2_JANITOR_ARM=$(awk '/^      skip:janitor-stranded\)/{f=1} f{print} f&&/^    
 printf '%s\n' "$GAP2_JANITOR_ARM" | grep -vE '^[[:space:]]*#|warn "' | grep -qE 'gap2_arm_needs_remerge|gap2_apply_pass_verdict|label add|gate:needs-remerge|gap2_free_refused_stranded' \
   && bad "REGRESSION: the skip:janitor-stranded arm re-arms / closes / frees via another path" \
   || ok "the skip:janitor-stranded arm code never calls the re-arm / pass / refused paths and adds no label"
+
+# ── 6m. the release is all-or-nothing in the STATE, not only in the rc ───────
+# (ga-hudkhe gate-fix 1). Both arms that call gap2_release_orphan_labels end a
+# failed release with "no comment, will retry next sweep". That promise is a claim
+# about what the parent looks like AFTER the failed call: Step 0c.2 re-selects a
+# parent only while it still holds BOTH story:in-flight AND pilot:dispatched, so a
+# release that removed one label and failed on the other would drop the parent out
+# of the sweep (nothing retries it) while the label left behind still hides it from
+# every Pilot dispatch query. The recorder mocks above cannot see that — they only
+# record calls — so this mock keeps the parent's label set and applies a
+# `label remove` the way bd does: ONE call is ONE patch, and a call that errors
+# applies none of it. The fault is injected by LABEL (any remove whose list names
+# it errors), not by verb, so it hits whichever call carries that label: with the
+# old two-call release, failing pilot:dispatched left the parent holding only
+# pilot:dispatched (the exact stranding GAP-2 exists to undo).
+echo "── 6m. a failed release leaves the parent exactly as it was — selected again, never half-released (ga-hudkhe gate-fix 1) ──"
+
+GAP2_ST_LABELS=""; GAP2_ST_FAIL_LABEL=""; GAP2_ST_CALLS="$(mktemp)"
+_gap2_stateful_bd() {
+  printf '%s\n' "$*" >> "$GAP2_ST_CALLS"
+  local l keep=""
+  case "$3" in
+    show)
+      # one bead, labels = the current state (a pipe subshell reads, never writes, the state)
+      printf '%s\n' $GAP2_ST_LABELS | jq -R . | jq -sc '[{id: "ga-fake-st", labels: .}]'
+      return 0 ;;
+    label)
+      case "$4" in
+        remove)
+          if [ -n "$GAP2_ST_FAIL_LABEL" ]; then
+            case ",$6," in *",$GAP2_ST_FAIL_LABEL,"*) return 1 ;; esac
+          fi
+          for l in $GAP2_ST_LABELS; do
+            case ",$6," in *",$l,"*) ;; *) keep="$keep $l" ;; esac
+          done
+          GAP2_ST_LABELS=${keep# }
+          return 0 ;;
+        add) GAP2_ST_LABELS="$GAP2_ST_LABELS $6"; return 0 ;;
+      esac ;;
+  esac
+  return 0
+}
+# _gap2_st_run <fail_label> <labels> <fn> [args…] — runs one arm against the stateful
+# bd; GAP2_RC / GAP2_ST_LABELS / GAP2_ST_CALLS are what the assertions read.
+_gap2_st_run() {
+  GAP2_ST_FAIL_LABEL="$1"; GAP2_ST_LABELS="$2"; shift 2
+  : > "$GAP2_ST_CALLS"
+  bd() { _gap2_stateful_bd "$@"; }
+  "$@" && GAP2_RC=0 || GAP2_RC=$?
+  unset -f bd
+}
+# Step 0c.2's two candidate filters, as a predicate on the label set (quality-gate-guard.sh:
+# `bd list -l story:in-flight`, then the pilot:dispatched filter).
+_gap2_st_selected() { case " $GAP2_ST_LABELS " in *" story:in-flight "*) case " $GAP2_ST_LABELS " in *" pilot:dispatched "*) return 0 ;; esac ;; esac; return 1; }
+_gap2_st_has() { case " $GAP2_ST_LABELS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+GAP2_ST_START="story:in-flight pilot:dispatched gate:needs-fix gate-sha-failed:abc123:code story:approved"
+GAP2_ST_JTOK="Orphan sling-task cleanup (sling-task-janitor"
+
+for GAP2_ST_FAILING in "pilot:dispatched" "story:in-flight"; do
+  for GAP2_ST_ARM in janitor needs-remerge; do
+    GAP2_ST_TAG="$GAP2_ST_ARM arm, the remove naming $GAP2_ST_FAILING errors"
+    case "$GAP2_ST_ARM" in
+      janitor)       _gap2_st_run "$GAP2_ST_FAILING" "$GAP2_ST_START" gap2_skip_janitor_stranded "ga-fake-st" "ga-c79qtf" "$GAP2_ST_JTOK" ;;
+      needs-remerge) _gap2_st_run "$GAP2_ST_FAILING" "$GAP2_ST_START" gap2_arm_needs_remerge "ga-fake-st" "ga-fake-sling-st" ;;
+    esac
+    [ "$GAP2_RC" -ne 0 ] && ok "$GAP2_ST_TAG → rc1 (the caller's warn)" || bad "$GAP2_ST_TAG → rc=$GAP2_RC, the failure was swallowed"
+    grep -qF -- " comment ga-fake-st" "$GAP2_ST_CALLS" \
+      && bad "$GAP2_ST_TAG → a comment was posted although the release failed (it says 'cleared')" \
+      || ok "$GAP2_ST_TAG → NO comment"
+    [ "$GAP2_ST_LABELS" = "$GAP2_ST_START" ] \
+      && ok "$GAP2_ST_TAG → the parent's labels are exactly as before (nothing half-applied)" \
+      || bad "$GAP2_ST_TAG → HALF STATE: labels now '$GAP2_ST_LABELS' (were '$GAP2_ST_START') — one label gone, the other still hides the parent from Pilot"
+    _gap2_st_selected \
+      && ok "$GAP2_ST_TAG → the parent is selected again next sweep (the 'will retry' promise holds)" \
+      || bad "$GAP2_ST_TAG → the parent is NOT re-selected next sweep: no retry, no comment — stranded with '$GAP2_ST_LABELS'"
+  done
+done
+
+# The retry itself: the fault clears, the next sweep selects the parent, and the release
+# lands — both labels gone, every gate:* label and the FAIL stamp still there, one comment.
+for GAP2_ST_ARM in janitor needs-remerge; do
+  case "$GAP2_ST_ARM" in
+    janitor)       _gap2_st_run "pilot:dispatched" "$GAP2_ST_START" gap2_skip_janitor_stranded "ga-fake-st" "ga-c79qtf" "$GAP2_ST_JTOK" ;;
+    needs-remerge) _gap2_st_run "pilot:dispatched" "$GAP2_ST_START" gap2_arm_needs_remerge "ga-fake-st" "ga-fake-sling-st" ;;
+  esac
+  GAP2_ST_AFTER_FAIL="$GAP2_ST_LABELS"
+  if _gap2_st_selected; then
+    # same state carried into the second sweep, fault gone
+    case "$GAP2_ST_ARM" in
+      janitor)       _gap2_st_run "" "$GAP2_ST_AFTER_FAIL" gap2_skip_janitor_stranded "ga-fake-st" "ga-c79qtf" "$GAP2_ST_JTOK" ;;
+      needs-remerge) _gap2_st_run "" "$GAP2_ST_AFTER_FAIL" gap2_arm_needs_remerge "ga-fake-st" "ga-fake-sling-st" ;;
+    esac
+    [ "$GAP2_RC" -eq 0 ] && ok "$GAP2_ST_ARM arm, retry sweep after a failed release → rc0" || bad "$GAP2_ST_ARM arm, retry sweep rc=$GAP2_RC"
+    { ! _gap2_st_has story:in-flight && ! _gap2_st_has pilot:dispatched; } \
+      && ok "$GAP2_ST_ARM arm, retry sweep → story:in-flight and pilot:dispatched are both gone (parent leaves the sweep, visible to Pilot)" \
+      || bad "$GAP2_ST_ARM arm, retry sweep → still holds '$GAP2_ST_LABELS'"
+    { _gap2_st_has gate:needs-fix && _gap2_st_has gate-sha-failed:abc123:code && _gap2_st_has story:approved; } \
+      && ok "$GAP2_ST_ARM arm, retry sweep → gate:needs-fix, the FAIL stamp and story:approved are untouched" \
+      || bad "$GAP2_ST_ARM arm, retry sweep → the FAIL state was damaged: '$GAP2_ST_LABELS'"
+    _gap2_st_has gate:needs-remerge \
+      && bad "$GAP2_ST_ARM arm, retry sweep → gate:needs-remerge was stamped over a real FAIL (ga-hudkhe regression)" \
+      || ok "$GAP2_ST_ARM arm, retry sweep → no gate:needs-remerge"
+    [ "$(grep -cF -- " comment ga-fake-st" "$GAP2_ST_CALLS")" -eq 1 ] \
+      && ok "$GAP2_ST_ARM arm, retry sweep → exactly one comment, posted only now that the release landed" \
+      || bad "$GAP2_ST_ARM arm, retry sweep → $(grep -cF -- " comment ga-fake-st" "$GAP2_ST_CALLS") comments (want 1)"
+  else
+    bad "$GAP2_ST_ARM arm: no retry sweep to run — the parent was not re-selected after the failed release ('$GAP2_ST_AFTER_FAIL')"
+  fi
+done
+rm -f "$GAP2_ST_CALLS"
+GAP2_ST_FAIL_LABEL=""
 
 # ── 7. drift-guard: guard implements both GAP-1 and GAP-2 sweeps ──────────────
 echo "── 7. drift-guard: guard implements ga-pa36 GAP-1 + GAP-2 sweeps ──"

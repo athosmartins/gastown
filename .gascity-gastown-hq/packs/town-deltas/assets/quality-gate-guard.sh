@@ -1834,19 +1834,30 @@ gap2_labels_have_code_fail() {
   if [ -n "$hits" ]; then printf 'yes'; else printf 'no'; fi
 }
 
-# gap2_release_orphan_labels <bead_id> — rc0 iff BOTH label removes succeeded.
+# gap2_release_orphan_labels <bead_id> — rc0 iff the release landed.
 # Strips story:in-flight + pilot:dispatched and nothing else: the two markers a
 # dead dispatch leaves behind, which every Pilot dispatch query excludes on, so
-# a parent that keeps them is invisible to Pilot while no builder exists. Both
-# removes are always attempted (one failing must not leave the other undone).
-# `bd label remove` of an absent label is rc0 (checked live), so rc1 means a
-# real bd failure, never "already gone". The caller decides what a failure
-# means; the one thing it must not do is comment that the labels were cleared.
+# a parent that keeps them is invisible to Pilot while no builder exists.
+# ONE bd call carries both labels (comma-separated), never two calls. Step 0c.2
+# re-selects a parent only while it holds BOTH labels (`bd list -l story:in-flight`
+# then a pilot:dispatched filter), so with two calls a failure on just one of them
+# would drop the parent out of the sweep with the other label still on it — and
+# every Pilot dispatch query excludes on either one. That half state gets no
+# comment and no retry, while the callers' warn text says "will retry next sweep"
+# (gate-fix 1, ga-hudkhe). `bd label remove <id> a,b` runs the whole label list of
+# one call inside ONE transaction (vendored beads v1.1.0: processBatchLabelOperation
+# in cmd/bd/label.go, labelMutateProxied in cmd/bd/label_proxied_server.go — one
+# transactHonoringAutoCommit / uow.RunTx per invocation), so an error rolls the call
+# back as a whole: rc1 here means NEITHER label was removed, the parent keeps both,
+# is selected again next sweep, and the retry promise is true. Checked live
+# (2026-10-17, throwaway labels on a bead of ours): `a,b` removes both in one call,
+# and a label that is already absent is a no-op with rc0 — so rc1 is a real bd
+# failure, never "already gone". The selftest section 6m asserts the post-STATE
+# (parent still selected, labels intact) with a bd that applies a call all-or-nothing.
+# The caller decides what a failure means; the one thing it must not do is comment
+# that the labels were cleared.
 gap2_release_orphan_labels() {
-  local bead_id="$1" rc=0
-  bd -C "$GC_CITY" label remove "$bead_id" "story:in-flight"  -q 2>/dev/null || rc=1
-  bd -C "$GC_CITY" label remove "$bead_id" "pilot:dispatched" -q 2>/dev/null || rc=1
-  return $rc
+  bd -C "$GC_CITY" label remove "$1" "story:in-flight,pilot:dispatched" -q 2>/dev/null
 }
 
 # gap2_arm_needs_remerge <bead_id> <sling_id> — ga-4tgga: the genuine
@@ -1996,8 +2007,10 @@ gap2_skip_no_changes() {
 # dropping pilot:dispatched takes the parent out of this sweep's candidate set
 # (GAP2_IDS selects on it), so the comment cannot repeat. If a label remove
 # fails the function returns 1 WITHOUT commenting (the comment says the markers
-# were cleared; it must not promise more than the code did) and the parent,
-# still selected, is retried next sweep. pilot.dispatched_at / pilot.sling_bead
+# were cleared; it must not promise more than the code did) and the parent is
+# retried next sweep — which holds because the release is one all-or-nothing bd
+# call (see gap2_release_orphan_labels): a failed call leaves BOTH labels on, so
+# the parent is still selected. pilot.dispatched_at / pilot.sling_bead
 # metadata is left in place on purpose (Pilot's own NEVERSTARTED release clears
 # it; this arm is scoped to the two labels): pilot-dispatcher.sh reads leftover
 # pilot.* metadata as Pilot's OWN dispatch fingerprint and does not let it block
