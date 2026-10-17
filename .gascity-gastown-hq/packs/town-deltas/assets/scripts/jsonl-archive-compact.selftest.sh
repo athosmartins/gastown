@@ -1951,6 +1951,18 @@ out="$(T_LOCK="$WORK/lockunread" run_jac "$L")"; rc=$?
 lock_case "(F5) an end time that cannot be READ is no end time → judged by age alone (3h, owner alive = hung), reclaimed — the way it was before the night gc" 0 'stale lock' 'could not|in flight' 0
 chmod u+rw "$WORK/lockunread/until" 2>/dev/null; rm -f "$WORK/lockunread/until"; rmdir "$WORK/lockunread" 2>/dev/null
 fi
+# (F6) the same read failing as a COMMAND: cat exits 1 for the end time (and only for it — the owner's pid is read as usual), whoever the user is
+mkdir -p "$WORK/catshim"
+cat > "$WORK/catshim/cat" <<'EOF'
+#!/bin/bash
+case "$*" in *until*) echo "cat: injected failure" >&2; exit 1 ;; esac
+exec /bin/cat "$@"
+EOF
+chmod +x "$WORK/catshim/cat"
+lockrepo l16; mkdir -p "$WORK/lockcatfail"; echo "$$" > "$WORK/lockcatfail/pid"; echo "$(( $(date +%s) + 3600 ))" > "$WORK/lockcatfail/until"; touch -t "$OLD3H" "$WORK/lockcatfail"
+out="$(PATH="$WORK/catshim:$PATH" T_LOCK="$WORK/lockcatfail" run_jac "$L")"; rc=$?
+lock_case "(F6) reading the end time fails (cat exits 1) while it is still ahead → no end time known → judged by age alone, reclaimed" 0 'stale lock' 'could not|in flight' 0
+rm -f "$WORK/lockcatfail/pid" "$WORK/lockcatfail/until"; rmdir "$WORK/lockcatfail" 2>/dev/null
 # G. the longer deadline is for the gc only: the NEXT repo is back on the ordinary budget (here 3s, already spent by the gc), it does not inherit the night's hours
 WG1="$WORK/n6"; mkwin "$WG1"; WG2="$WORK/n7"; mkrepo "$WG2" 20; LG2="$(loose_count "$WG2")"
 out="$(T_DEADLINE=3 night_run "$WG1 $WG2")"; rc=$?
