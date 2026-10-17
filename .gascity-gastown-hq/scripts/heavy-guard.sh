@@ -42,8 +42,9 @@
 # frees caches at CRITICAL; telling the open pool sessions to stop their heavy steps is a separate slice (ga-vln2py.3).
 # Nothing here stops NEW work either (the Pilot sweep: ga-ydaslo; the pool probes: ga-09hfgh).
 #
-# Every refusal is appended to $HEAVY_GUARD_LOG (default $GC_CITY_PATH/.gc/logs/heavy-guard.log), best effort: a log
-# that cannot be written never changes the verdict.
+# Every refusal (including "cannot load the lib") and every bypass (DISK_HEADROOM_ENABLED=0 / a pinned
+# DISK_FREE_OVERRIDE_MB let a step through unchecked; stderr says so too) is appended to $HEAVY_GUARD_LOG (default
+# $GC_CITY_PATH/.gc/logs/heavy-guard.log), best effort: a log that cannot be written never changes the verdict.
 #
 # Seams (selftests): DISK_FREE_OVERRIDE_MB pins the reading; HEAVY_GUARD_POLL_SECS (default 15) is the wait step.
 
@@ -61,8 +62,9 @@ hg_log() {
 }
 
 # vazio (lib absent/empty) → cannot decide → UNKNOWN (76); falhou/ilegível → the same, never "go ahead"
-if [ ! -r "$HG_LIB" ] || ! . "$HG_LIB" 2>/dev/null || ! type disk_headroom_state >/dev/null 2>&1; then
+if [ ! -r "$HG_LIB" ] || ! . "$HG_LIB" 2>/dev/null || ! type disk_headroom_state disk_state_of disk_free_mb >/dev/null 2>&1; then
   echo "heavy-guard: cannot load $HG_LIB — no way to read the disk, so the step is refused (rc 76). Deploy fault: tell the Mayor." >&2
+  hg_log "REFUSED lib_unloadable=$HG_LIB rc=76"
   exit 76
 fi
 
@@ -80,6 +82,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$min" ] || min="$DISK_HEAVY_MIN_MB"
 case "$min" in ''|*[!0-9]*) echo "heavy-guard: --min-free-mb must be a whole number of MB (got '$min')" >&2; exit 64 ;; esac
+[ "${#min}" -le 9 ] || { echo "heavy-guard: --min-free-mb takes at most 9 digits (got '$min'): a floor past what [ -lt ] can compare would read as plenty" >&2; exit 64; }
 case "$wait_s" in ''|*[!0-9]*) echo "heavy-guard: --wait-secs must be a whole number of seconds (got '$wait_s')" >&2; exit 64 ;; esac
 [ "${#wait_s}" -le 9 ] || { echo "heavy-guard: --wait-secs takes at most 9 digits (got '$wait_s')" >&2; exit 64; }
 # base 10 on purpose: "08" and "09" pass the digits check above but are invalid OCTAL to $(( )), which used to leave the
@@ -95,7 +98,10 @@ t0=$(date +%s 2>/dev/null)
 case "$t0" in ''|*[!0-9]*) t0=0; wait_s=0 ;; esac
 deadline=$(( t0 + wait_s ))
 while :; do
-  state="$(disk_headroom_state "$min")"
+  # ONE reading per pass: the verdict and the number shown in the refusal both come from this df, never from two
+  # vazio/falhou/ilegível → free="" → state "unknown" (rc 76 below)
+  free="$(disk_free_mb 2>/dev/null)" || free=""
+  state="$(disk_state_of "$free" "$min")"
   [ "$state" = ok ] && break
   now=$(date +%s 2>/dev/null)
   # vazio/falhou/ilegível → the wait cannot be bounded: stop waiting, the verdict is taken on the reading just made
@@ -107,9 +113,14 @@ while :; do
 done
 
 # vazio/falhou/ilegível -> "?" in the message only; the VERDICT below comes from $state, never from this number
-free="$(disk_free_mb 2>/dev/null)" || free="?"
+[ -n "$free" ] || free="?"
 case "$state" in
   ok)
+    # a pinned reading or the kill switch lets the step through WITHOUT looking at the disk: visible, never silent
+    if [ "${DISK_HEADROOM_ENABLED:-1}" = "0" ] || [ -n "${DISK_FREE_OVERRIDE_MB:-}" ]; then
+      echo "heavy-guard: NOTE: '$what' goes ahead with the disk check bypassed (DISK_HEADROOM_ENABLED=0 or DISK_FREE_OVERRIDE_MB set in this environment) — meant for selftests only" >&2
+      hg_log "BYPASS what='$what' DISK_HEADROOM_ENABLED=${DISK_HEADROOM_ENABLED:-} DISK_FREE_OVERRIDE_MB=${DISK_FREE_OVERRIDE_MB:-}"
+    fi
     [ "$mode" = check ] && exit 0
     exec "$@"
     ;;

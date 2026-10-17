@@ -25,7 +25,10 @@
 #   ok       a reading, and it is at or above the floor (or the lib is switched off)
 #   low      a reading, and it is below the floor
 #   unknown  no reading (df failed, printed nothing, or printed something that is not a number), or a floor
-#            that is not a number
+#            that is not a number, or one `[ -lt ]` cannot compare (a digit string past int64)
+# `[` has three outcomes (true, false, could not compare) and only "false" means ok: a comparison that could not be
+# made is `unknown`, never "plenty". The edges also refuse more than 9 digits (a reading, a floor in the env, the
+# guard's --min-free-mb), so that case is rare by construction; the comparison stays three-way for what slips by.
 # What a caller does with `unknown` is the caller's decision and is NOT the same as `ok`:
 #   - heavy-guard.sh, the only caller in this slice, fails CLOSED (refuses): it guards ONE step whose failure mode
 #     is ENOSPC on the database;
@@ -39,14 +42,18 @@
 
 DISK_NEW_WORK_MIN_MB="${DISK_NEW_WORK_MIN_MB:-5120}"
 DISK_HEAVY_MIN_MB="${DISK_HEAVY_MIN_MB:-6144}"
+# empty / not a number / more than 9 digits -> the default (a floor must be a number `[ -lt ]` can compare)
 case "$DISK_NEW_WORK_MIN_MB" in ''|*[!0-9]*) DISK_NEW_WORK_MIN_MB=5120 ;; esac
 case "$DISK_HEAVY_MIN_MB" in ''|*[!0-9]*) DISK_HEAVY_MIN_MB=6144 ;; esac
+[ "${#DISK_NEW_WORK_MIN_MB}" -le 9 ] || DISK_NEW_WORK_MIN_MB=5120
+[ "${#DISK_HEAVY_MIN_MB}" -le 9 ] || DISK_HEAVY_MIN_MB=6144
 
 # disk_free_mb — free MB as an integer on stdout and rc 0; rc 1 and NO stdout when it cannot be read.
 disk_free_mb() {
   _dh_o="${DISK_FREE_OVERRIDE_MB:-}"
   if [ -n "$_dh_o" ]; then
     case "$_dh_o" in *[!0-9]*) return 1 ;; esac
+    [ "${#_dh_o}" -le 9 ] || return 1
     printf '%s' "$_dh_o"
     return 0
   fi
@@ -57,18 +64,33 @@ disk_free_mb() {
   # vazio → unreadable (rc 1, no number); falhou/ilegível → unreadable too, never 0 MB and never "plenty"
   _dh_v=$(df -Pm "$_dh_p" 2>/dev/null | awk 'NR==2 {print $4}') || _dh_v=""
   case "$_dh_v" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#_dh_v}" -le 9 ] || return 1
   printf '%s' "$_dh_v"
   return 0
 }
 
-# disk_headroom_state [min_mb] — prints ok | low | unknown (always rc 0, so $(...) is safe under set -e).
-# min_mb defaults to the new-work floor; heavy callers pass "$DISK_HEAVY_MIN_MB".
-disk_headroom_state() {
-  _dh_min="${1:-$DISK_NEW_WORK_MIN_MB}"
-  case "$_dh_min" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+# disk_state_of <free_mb> <min_mb> — the ONE comparison: prints ok | low | unknown from two numbers already read, so a
+# caller that also PRINTS the number (heavy-guard.sh) shows the very reading the verdict came from. Always rc 0.
+disk_state_of() {
+  _dh_f="${1:-}"; _dh_min="${2:-}"
   if [ "${DISK_HEADROOM_ENABLED:-1}" = "0" ]; then printf 'ok'; return 0; fi
-  # vazio/falhou/ilegível → "unknown" (disk_free_mb returned 1); a reading below the floor → "low"
-  _dh_f=$(disk_free_mb) || { printf 'unknown'; return 0; }
-  if [ "$_dh_f" -lt "$_dh_min" ]; then printf 'low'; else printf 'ok'; fi
+  # vazio/falhou/ilegível → "unknown": a missing reading or floor, anything that is not all digits
+  case "$_dh_f" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+  case "$_dh_min" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+  # `[` has THREE outcomes (0 true, 1 false, 2 could not compare); only 1 means "not below the floor"
+  _dh_rc=0
+  [ "$_dh_f" -lt "$_dh_min" ] 2>/dev/null || _dh_rc=$?
+  case "$_dh_rc" in 0) printf 'low' ;; 1) printf 'ok' ;; *) printf 'unknown' ;; esac
+  return 0
+}
+
+# disk_headroom_state [min_mb] — reads the disk and prints ok | low | unknown (always rc 0, so $(...) is safe under
+# set -e). min_mb defaults to the new-work floor; heavy callers pass "$DISK_HEAVY_MIN_MB".
+disk_headroom_state() {
+  _dh_m="${1:-$DISK_NEW_WORK_MIN_MB}"
+  if [ "${DISK_HEADROOM_ENABLED:-1}" = "0" ]; then printf 'ok'; return 0; fi
+  # vazio/falhou/ilegível → "unknown" (disk_free_mb returned 1, no number); a number goes to the one comparison
+  _dh_r=$(disk_free_mb) || _dh_r=""
+  disk_state_of "$_dh_r" "$_dh_m"
   return 0
 }

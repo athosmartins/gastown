@@ -577,7 +577,7 @@
     "dolt-cleanup-hazards": "O prompt nativo do dog recomenda `gc dolt cleanup --force` (= DROP DATABASE) para QUALQUER tarefa; o texto da tarefa não prevê se o agente vai alcançá-lo, e o dano é irreversível.",
     "e12-write-time-doctrine": "A doutrina de escrita é o que impede o 'não consegui ler' virar vazio (ga-57e7l0); relevância não é função do texto da tarefa — toda tarefa que ESCREVE código lê alguma coisa — e o Jev responder 'não precisa' é exatamente o buraco que a seção fecha.",
     "mbp-offload-tests": "Relevância não é função do texto: qualquer tarefa que escreva teste pode chegar a um pytest pesado, e a seção é uma linha (~0,4k tokens) — cortar economiza quase nada e deixa o worker disputando CPU no mini com o resto da cidade.",
-    "hq-selftest-node": "Relevância não é função do texto: qualquer tarefa que mexa em scripts/ ou packs/ do hq pode acabar numa bateria *.selftest.sh pesada, e a seção é um parágrafo curto — o Jev dispensá-la devolve a carga ao mini (load 45-60) com o nó parado.",
+    "hq-selftest-node": "Relevância não é função do texto: qualquer tarefa que mexa em scripts/ ou packs/ do hq pode acabar numa bateria *.selftest.sh pesada, e a seção é curta (dois parágrafos, ~2,5k chars desde a ga-vln2py) — o Jev dispensá-la devolve a carga ao mini (load 45-60) com o nó parado.",
     "research-only-channels": "Protege contra mutação irreversível pra fora (API viva de terceiros, identidade) por subagente; se a sessão vai delegar pesquisa não é função do texto da tarefa, e o estrago não desfaz.",
     "next-action-mayor-waiting": "Relevância não é função do texto: QUALQUER tarefa pode travar esperando decisão. Jev responderia ruído, e a falha (sessão invisível parada por 76 min) é a que a seção existe pra evitar."
    },

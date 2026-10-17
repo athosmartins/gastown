@@ -48,8 +48,8 @@ heavy-guard.sh --check [--min-free-mb N] [--wait-secs S] [--what RÓTULO]
 |---|---|---|
 | (o do comando) | rodou | — |
 | 75 | disco abaixo do piso (6 GB), mesmo depois da espera | NÃO rode por outro caminho. Selftest do hq: `mbp-run.sh --repo hq` (nó Linux). `go build`/lint não vão ao nó hoje. Ou espere e tente de novo; se não voltar, avise o Mayor |
-| 76 | não consegui ler o disco (df falhou, ou a lib não carregou) | o passo também é recusado; tente de novo; se persistir, avise o Mayor |
-| 64 | uso errado | corrija a chamada |
+| 76 | não consegui ler o disco (df falhou, leitura com mais de 9 dígitos, ou a lib não carregou: esta última também vai ao log) | o passo também é recusado; tente de novo; se persistir, avise o Mayor |
+| 64 | uso errado (inclui `--min-free-mb` ou `--wait-secs` com mais de 9 dígitos: acima do que `[ -lt ]` compara, um piso assim valeria "folga") | corrija a chamada |
 
 75/76 ficam FORA da faixa 96..99 do `mbp-run.sh` ("rode local") de propósito: uma recusa nunca pode ser lida como licença para rodar aqui. Cada recusa vai (melhor esforço) para `$GC_CITY_PATH/.gc/logs/heavy-guard.log`.
 
@@ -60,7 +60,8 @@ O repo do beads (onde o `golangci-lint` do pre-commit rodou na hora do incidente
 ```sh
 # ga-vln2py: sem golangci-lint nem go build com o disco do mini abaixo do piso
 GUARD="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}/scripts/heavy-guard.sh"
-if [ -x "$GUARD" ]; then "$GUARD" --check --what "pre-commit golangci-lint" || exit $?; fi
+if [ -x "$GUARD" ]; then "$GUARD" --check --what "pre-commit golangci-lint" || exit $?
+else echo "pre-commit: disco NÃO checado ($GUARD ausente)" >&2; fi
 ```
 
 ```yaml
@@ -78,19 +79,20 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 
 | Interruptor | Efeito | Uso |
 |---|---|---|
-| `DISK_HEADROOM_ENABLED=0` | toda leitura da lib vira `ok` (hoje: o guarda) | nunca em produção |
+| `DISK_HEADROOM_ENABLED=0` | toda leitura da lib vira `ok` (hoje: o guarda). O guarda avisa no stderr ("NOTE: ... bypassed") e grava `BYPASS` no log quando deixa passar por este interruptor ou por `DISK_FREE_OVERRIDE_MB` | nunca em produção |
 | `DISK_FREE_OVERRIDE_MB=<n>` | fixa a leitura (n = MB; não numérico = ilegível) | selftests |
 | `DISK_NEW_WORK_MIN_MB` / `DISK_HEAVY_MIN_MB` | ajusta os pisos (valor não numérico volta ao padrão) | só com decisão registrada |
 
 ## Como conferir que está vivo
 
 - Guarda: `scripts/heavy-guard.sh --check --what teste; echo rc=$?` (0 com folga; `DISK_FREE_OVERRIDE_MB=3000` dá 75).
-- Recusas: `tail $GC_CITY_PATH/.gc/logs/heavy-guard.log`.
+- Recusas e bypass: `tail $GC_CITY_PATH/.gc/logs/heavy-guard.log` (`REFUSED ...` / `BYPASS ...`; uma linha `BYPASS` fora de selftest = um `export` esquecido).
 - Bateria: `scripts/heavy-guard.selftest.sh`.
 
 ## Limites conhecidos
 
 - O guarda só protege quem o chama. Hoje: o selftest do jsonl-archive, o fallback local das baterias (por doutrina) e o gate. O pre-commit do beads depende do trecho acima ser aplicado naquele repo.
 - `go build` e `golangci-lint` não têm destino remoto hoje; com disco baixo eles esperam.
+- O parágrafo do gate sobre baterias do hq (`gate_hq_selftest_rules`) só sai com o nó ligado (`.gc/hetzner-node.on`); com o nó desligado o revisor não recebe a instrução do guarda por ali (o pool recebe pela seção `hq-selftest-node`, sempre).
 - Uma sessão que JÁ está dentro de um passo quando o disco cai não é interrompida por esta fatia.
 - A leitura é do volume do swap/Dolt (`/private/var/vm`, senão `/`). Um disco externo/montagem separada não conta.

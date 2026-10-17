@@ -32,6 +32,19 @@ lib_cases() {
   [ "$(st abc x 5120)" = unknown ]   || bad "lib: a non-numeric reading must be unknown, never ok"
   [ "$(st 8000 x '')" = ok ]         || bad "lib: an empty floor argument means the default (5120), 8000 is ok"
   [ "$(st 8000 x 12x)" = unknown ]   || bad "lib: a floor that is not a number must be unknown"
+  # a digit string past int64 is a number `[ -lt ]` cannot compare (rc 2): that is "unknown", never the else-arm "ok"
+  [ "$(st 8000 x 99999999999999999999)" = unknown ] || bad "lib: a 20-digit floor must be unknown (the comparison could not be made)"
+  [ "$(st 99999999999999999999 x 5120)" = unknown ] || bad "lib: a 20-digit reading must be unknown, not ok"
+  s="$( DISK_FREE_OVERRIDE_MB=99999999999999999999 sh -c '. "$1"; disk_free_mb; echo "rc=$?"' _ "$lib" )"
+  [ "$s" = "rc=1" ]                  || bad "lib: disk_free_mb of a 20-digit reading must print nothing and return 1 (got '$s')"
+  s="$( DISK_FREE_OVERRIDE_MB=1234567890 sh -c '. "$1"; disk_free_mb; echo "rc=$?"' _ "$lib" )"
+  [ "$s" = "rc=1" ]                  || bad "lib: disk_free_mb refuses a reading of more than 9 digits (got '$s')"
+  s="$( DISK_FREE_OVERRIDE_MB=123456789 sh -c '. "$1"; disk_free_mb' _ "$lib" )"
+  [ "$s" = 123456789 ]               || bad "lib: a 9-digit reading is still a reading (got '$s')"
+  s="$( DISK_HEAVY_MIN_MB=99999999999999999999 DISK_NEW_WORK_MIN_MB=1234567890 sh -c '. "$1"; echo "$DISK_NEW_WORK_MIN_MB/$DISK_HEAVY_MIN_MB"' _ "$lib" )"
+  [ "$s" = "5120/6144" ]             || bad "lib: a floor of more than 9 digits in the env must fall back to the default (got '$s')"
+  s="$( DISK_HEADROOM_ENABLED=0 sh -c '. "$1"; disk_state_of 1 99999' _ "$lib" )"
+  [ "$s" = ok ]                      || bad "lib: disk_state_of honours the kill switch (got '$s')"
   s="$( DISK_HEADROOM_PATH=/nonexistent-dir-vln2py sh -c '. "$1"; disk_headroom_state 5120' _ "$lib" )"
   [ "$s" = unknown ]                 || bad "lib: df failing on the path must be unknown (got '$s')"
   s="$( DISK_HEADROOM_PATH=/ sh -c '. "$1"; disk_headroom_state 1' _ "$lib" )"
@@ -48,6 +61,8 @@ lib_cases() {
   if command -v dash >/dev/null 2>&1; then
     s="$( DISK_FREE_OVERRIDE_MB=1 dash -c '. "$1"; disk_headroom_state 5120' _ "$lib" )"
     [ "$s" = low ] || bad "lib: must work under dash (POSIX sh), got '$s'"
+    s="$( DISK_FREE_OVERRIDE_MB=8000 dash -c '. "$1"; disk_headroom_state 99999999999999999999' _ "$lib" )"
+    [ "$s" = unknown ] || bad "lib: dash says 'Illegal number' (rc 2) on a 20-digit floor: must be unknown, got '$s'"
   fi
 }
 
@@ -70,24 +85,36 @@ guard_cases() {
   [ ! -e "$W/ran" ] || bad "guard unknown: the command RAN with no reading of the disk"
   grep -q 'could not be read' "$W/err" || bad "guard unknown: stderr must say the disk could not be read"
   # (the exact 75/76 checks above are also what keeps a refusal out of mbp-run's 96..99 "run it local" band)
-  DISK_FREE_OVERRIDE_MB=20000 run --check; rc=$?;           check "--check ok" 0 "$rc"
+  DISK_FREE_OVERRIDE_MB=20000 run --check 2>/dev/null; rc=$?;  check "--check ok" 0 "$rc"
   DISK_FREE_OVERRIDE_MB=3000 run --check 2>/dev/null; rc=$?;  check "--check low" 75 "$rc"
   DISK_FREE_OVERRIDE_MB=x run --check 2>/dev/null; rc=$?;     check "--check unknown" 76 "$rc"
-  DISK_FREE_OVERRIDE_MB=4000 run --min-free-mb 3000 --check; rc=$?;          check "custom floor below the reading" 0 "$rc"
+  DISK_FREE_OVERRIDE_MB=4000 run --min-free-mb 3000 --check 2>/dev/null; rc=$?;  check "custom floor below the reading" 0 "$rc"
   DISK_FREE_OVERRIDE_MB=6143 run --check 2>/dev/null; rc=$?;  check "one MB under the default heavy floor (6144)" 75 "$rc"
-  DISK_FREE_OVERRIDE_MB=6144 run --check; rc=$?;              check "exactly the default heavy floor" 0 "$rc"
+  DISK_FREE_OVERRIDE_MB=6144 run --check 2>/dev/null; rc=$?;  check "exactly the default heavy floor" 0 "$rc"
   # arguments reach the command intact, spaces included
-  out="$(DISK_FREE_OVERRIDE_MB=20000 run -- sh -c 'printf "%s|" "$@"' _ "a b" "c")"
+  out="$(DISK_FREE_OVERRIDE_MB=20000 run -- sh -c 'printf "%s|" "$@"' _ "a b" "c" 2>/dev/null)"
   [ "$out" = "a b|c|" ] || bad "guard: arguments must reach the command intact (got '$out')"
   # usage errors
   run 2>/dev/null; rc=$?;                                   check "no command and no --check" 64 "$rc"
   run --bogus 2>/dev/null; rc=$?;                           check "unknown option" 64 "$rc"
   run --min-free-mb abc --check 2>/dev/null; rc=$?;         check "non-numeric floor" 64 "$rc"
   run --wait-secs -1 --check 2>/dev/null; rc=$?;            check "non-numeric wait" 64 "$rc"
-  # lib missing -> cannot decide -> refuse (76), never run
-  rm -f "$W/ran"
+  # a floor past what [ -lt ] can compare is a usage error (it used to read as "plenty": rc 0 with 100 MB free)
+  DISK_FREE_OVERRIDE_MB=100 run --min-free-mb 9223372036854775808 --check 2>/dev/null; rc=$?
+  check "a 19-digit floor (past int64) is a usage error, not a go-ahead" 64 "$rc"
+  DISK_FREE_OVERRIDE_MB=100 run --min-free-mb 99999999999999999999 --check 2>/dev/null; rc=$?
+  check "a 20-digit floor is a usage error" 64 "$rc"
+  DISK_FREE_OVERRIDE_MB=99999999999999999999 run --check 2>/dev/null; rc=$?
+  check "a 20-digit reading is unreadable: 76, not a go-ahead" 76 "$rc"
+  # lib missing -> cannot decide -> refuse (76), never run, and the refusal is in the log the runbook points at
+  rm -f "$W/ran"; : > "$HEAVY_GUARD_LOG"
   HEAVY_GUARD_LIB=/nonexistent-lib "$g" -- sh -c 'touch "$1"' _ "$W/ran" 2>/dev/null; rc=$?
   check "missing lib refuses" 76 "$rc"; [ ! -e "$W/ran" ] || bad "missing lib: the command RAN"
+  grep -q 'REFUSED lib_unloadable=/nonexistent-lib rc=76' "$HEAVY_GUARD_LOG" || bad "missing lib: refusal not in the log ($(cat "$HEAVY_GUARD_LOG"))"
+  # a lib from before disk_state_of existed cannot decide either: refused, not run
+  printf 'disk_free_mb() { printf 20000; }\ndisk_headroom_state() { printf ok; }\n' > "$W/lib-old.sh"
+  rm -f "$W/ran"; HEAVY_GUARD_LIB="$W/lib-old.sh" "$g" -- sh -c 'touch "$1"' _ "$W/ran" 2>/dev/null; rc=$?
+  check "a lib without disk_state_of refuses" 76 "$rc"; [ ! -e "$W/ran" ] || bad "old lib: the command RAN"
   # a log that cannot be written must not change the verdict
   : > "$W/afile"
   DISK_FREE_OVERRIDE_MB=100 HEAVY_GUARD_LOG="$W/afile/sub/log" run --check 2>/dev/null; rc=$?
@@ -110,6 +137,21 @@ EOF
   check "a disk that never recovers is refused after the wait" 75 "$rc"; [ ! -e "$W/ran" ] || bad "wait: ran although the disk never recovered"
   # a zero-padded wait ("08" is invalid OCTAL to $(( ))) and an unreadable clock must both END on a low disk, not spin:
   # a fake clock (+4 s per read) and a no-op sleep make the wait instant; `bounded` kills a guard that does not end
+  # the number shown in a refusal is the reading the verdict came from (a df whose answer changes per call: 2000 then 9000)
+  echo 0 > "$W/dfn"; : > "$HEAVY_GUARD_LOG"
+  PATH="$W/bin:$PATH" DISK_HEADROOM_PATH=/ FAKE_DF_RECOVER_AT=1 run --check 2>"$W/err"; rc=$?
+  check "refusal on the first reading of a changing df" 75 "$rc"
+  grep -q '2000 MB free' "$W/err" && grep -q 'free_mb=2000 ' "$HEAVY_GUARD_LOG" || bad "refusal shows another reading than the one decided on ($(cat "$W/err") | $(cat "$HEAVY_GUARD_LOG"))"
+  # a pinned reading / the kill switch let a step through unchecked: stderr and the log say so; a real reading says nothing
+  : > "$HEAVY_GUARD_LOG"
+  DISK_FREE_OVERRIDE_MB=20000 run --what pinned --check 2>"$W/err"; rc=$?
+  check "a pinned reading above the floor goes ahead" 0 "$rc"
+  grep -q 'NOTE.*pinned.*bypassed' "$W/err" || bad "bypass: stderr must say the check was bypassed ($(cat "$W/err"))"
+  grep -q "BYPASS what='pinned'" "$HEAVY_GUARD_LOG" || bad "bypass: not in the log ($(cat "$HEAVY_GUARD_LOG"))"
+  : > "$HEAVY_GUARD_LOG"; echo 0 > "$W/dfn"
+  PATH="$W/bin:$PATH" DISK_HEADROOM_PATH=/ FAKE_DF_RECOVER_AT=0 run --what real --check 2>"$W/err"; rc=$?
+  check "a real reading above the floor goes ahead" 0 "$rc"
+  [ ! -s "$W/err" ] && ! grep -q BYPASS "$HEAVY_GUARD_LOG" || bad "a real reading must not claim a bypass ($(cat "$W/err") | $(cat "$HEAVY_GUARD_LOG"))"
   bounded() { # bounded <secs> <cmd...>: the command's rc, or 124 when it was still running after <secs> (it is killed)
     local p i=0 n=$(( $1 * 10 )); shift; "$@" & p=$!
     while kill -0 "$p" 2>/dev/null && [ "$i" -lt "$n" ]; do sleep 0.1; i=$((i+1)); done
@@ -142,13 +184,22 @@ M="$W/mut"; mkdir -p "$M"
 mk_mutant "$REAL_LIB" "$M/lib-le.sh" 's/-lt "\$_dh_min"/-le "$_dh_min"/' && { before=$FAIL; lib_cases "$M/lib-le.sh" >/dev/null; survive "lib: -lt became -le"; }
 mk_mutant "$REAL_LIB" "$M/lib-gt.sh" 's/-lt "\$_dh_min"/-gt "$_dh_min"/' && { before=$FAIL; lib_cases "$M/lib-gt.sh" >/dev/null; survive "lib: comparison inverted"; }
 mk_mutant "$REAL_LIB" "$M/lib-unk.sh" "s/\*\[!0-9\]\*) return 1 ;; esac\$/*[!0-9]*) printf 0; return 0 ;; esac/" && { before=$FAIL; lib_cases "$M/lib-unk.sh" >/dev/null; survive "lib: unreadable collapses to 0 MB"; }
-mk_mutant "$REAL_LIB" "$M/lib-ok.sh" "s/{ printf 'unknown'; return 0; }/{ printf 'ok'; return 0; }/" && { before=$FAIL; lib_cases "$M/lib-ok.sh" >/dev/null; survive "lib: unknown collapses to ok"; }
+mk_mutant "$REAL_LIB" "$M/lib-ok.sh" "s/''|\*\[!0-9\]\*) printf 'unknown'; return 0 ;; esac/''|*[!0-9]*) printf 'ok'; return 0 ;; esac/" && { before=$FAIL; lib_cases "$M/lib-ok.sh" >/dev/null; survive "lib: unknown collapses to ok"; }
+mk_mutant "$REAL_LIB" "$M/lib-else.sh" "s/\*) printf 'unknown' ;; esac/*) printf 'ok' ;; esac/" && { before=$FAIL; lib_cases "$M/lib-else.sh" >/dev/null; survive "lib: a comparison that could not be made reads as ok"; }
+mk_mutant "$REAL_LIB" "$M/lib-capr.sh" '/^ *\[ "\${#_dh_[ov]}" -le 9 \] || return 1$/d' && { before=$FAIL; lib_cases "$M/lib-capr.sh" >/dev/null; survive "lib: no magnitude cap on the reading"; }
+mk_mutant "$REAL_LIB" "$M/lib-cape.sh" '/^\[ "\${#DISK_[A-Z_]*}" -le 9 \]/d' && { before=$FAIL; lib_cases "$M/lib-cape.sh" >/dev/null; survive "lib: no magnitude cap on the env floors"; }
 mk_mutant "$REAL_GUARD" "$M/g-run.sh" 's/exit 75/exec "$@"/' && { before=$FAIL; guard_cases "$M/g-run.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: low runs the command anyway"; }
 mk_mutant "$REAL_GUARD" "$M/g-local.sh" 's/exit 75/exit 97/' && { before=$FAIL; guard_cases "$M/g-local.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: refusal uses the run-local rc 97"; }
 mk_mutant "$REAL_GUARD" "$M/g-open.sh" 's/^    exit 76$/    exec "$@"/' && { before=$FAIL; guard_cases "$M/g-open.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: unknown disk runs the command (fail open)"; }
 mk_mutant "$REAL_GUARD" "$M/g-nowait.sh" 's/\[ "\$now" -ge "\$deadline" \]/true/' && { before=$FAIL; guard_cases "$M/g-nowait.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: never waits"; }
 mk_mutant "$REAL_GUARD" "$M/g-octal.sh" 's/^wait_s=\$(( 10#\$wait_s ))$/:/' && { before=$FAIL; guard_cases "$M/g-octal.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: --wait-secs 08 read as octal"; }
 mk_mutant "$REAL_GUARD" "$M/g-noclock.sh" '/^  case "\$now" in/d' && { before=$FAIL; guard_cases "$M/g-noclock.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: an unreadable clock keeps the wait loop going"; }
+
+mk_mutant "$REAL_GUARD" "$M/g-capmin.sh" '/^\[ "\${#min}" -le 9 \]/d' && { before=$FAIL; guard_cases "$M/g-capmin.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: no magnitude cap on --min-free-mb"; }
+mk_mutant "$REAL_GUARD" "$M/g-nolog.sh" '/hg_log "REFUSED lib_unloadable/d' && { before=$FAIL; guard_cases "$M/g-nolog.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: the lib-unloadable refusal leaves no log line"; }
+mk_mutant "$REAL_GUARD" "$M/g-reread.sh" 's/^\[ -n "\$free" \] || free="?"$/free="$(disk_free_mb 2>\/dev\/null)" || free="?"/' && { before=$FAIL; guard_cases "$M/g-reread.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: the refusal shows a second reading"; }
+mk_mutant "$REAL_GUARD" "$M/g-nonote.sh" '/goes ahead with the disk check bypassed/d' && { before=$FAIL; guard_cases "$M/g-nonote.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: a bypass is silent on stderr"; }
+mk_mutant "$REAL_GUARD" "$M/g-nobylog.sh" '/hg_log "BYPASS/d' && { before=$FAIL; guard_cases "$M/g-nobylog.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: a bypass leaves no log line"; }
 
 echo "heavy-guard selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
