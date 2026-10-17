@@ -75,13 +75,16 @@ COMO RODA. Escreve em .gc/logs (DUS_OUT_DIR): `daemon-unverified-sweep-latest.js
 (legível: contagens por estado, AINDA NÃO VISTO POR DAEMON — o que o Mayor decide reiniciar —, NÃO CONSEGUI SABER por motivo) e imprime
 uma linha com as contagens. Sem `--notify` é dry-run: NÃO avisa e NÃO toca no baseline.
 Com `--notify`: UMA notificação, só se há AINDA NÃO VISTO que ainda não foi avisado (baseline em `daemon-unverified-sweep.state.json`:
-ids já avisados). O baseline só avança se o aviso foi ENTREGUE (notify que falhou re-tenta na próxima rodada). Sai do baseline só o que
+ids já avisados). O baseline só avança se o aviso foi ENTREGUE (notify que falhou re-tenta na próxima rodada). ENTREGUE = o push foi
+aceito (o notify roda com NOTIFY_STRICT_EXIT=1 + NOTIFY_FORCE_PUSH=1: rc 0 COM a linha "Notification sent") ou ficou SEGURADO até as 7h
+(rc 10; o notify-quiet-flush empurra). Digest/teto (12), dedup (11), autodispatch (13), e-mail dropado (14), rc 0 sem a linha (kill-switch),
+timeout e rc desconhecido são NÃO entregue: o rc padrão 0 do notify cobre todos eles e não prova nada. Sai do baseline só o que
 virou CONFIRMADO; NÃO CONSEGUI SABER mantém a marca (voltar de uma leitura quebrada não é "novo"). Baseline ilegível ≠ ausente: ausente
 é a 1ª rodada; ilegível também re-avisa (melhor um aviso repetido que silêncio), mas diz alto e sai com rc 3.
 Instância única (flock em `daemon-unverified-sweep.lock`): a 2ª sai sem varrer, rc 0. Prazo total `DUS_DEADLINE` (2700 s, checado entre
 beads): o que não deu tempo vira NÃO CONSEGUI SABER `deadline-exceeded` (rc 3), nunca "terminou limpo".
 Saída: 0 = leu tudo · 3 = alguma leitura falhou / prazo estourou / aviso não entregue (ver `stores` / `reason` no JSON).
-Sementes de teste: DUS_BD, DUS_LAUNCHCTL, DUS_PS, DUS_NOTIFY, DUS_STORES, DUS_OUT_DIR, DUS_NOW, DUS_DEADLINE…
+Sementes de teste: DUS_BD, DUS_LAUNCHCTL, DUS_PS, DUS_NOTIFY, DUS_NOTIFY_TIMEOUT, DUS_STORES, DUS_OUT_DIR, DUS_NOW, DUS_DEADLINE…
 A loja HQ é a PRIMEIRA de DUS_STORES (os marcadores de gate de todos os rigs moram nela).
 Gatilho: `com.gascity.daemon-unverified-sweep.plist` (segunda 08:47). NÃO reinicia nada e NÃO roda daemon-refresh.
 """
@@ -139,8 +142,9 @@ DEFAULT_STORES = ";".join([
 ])
 
 
-def run(cmd, timeout=None):
+def run(cmd, timeout=None, extra_env=None):
     e = dict(os.environ)
+    e.update(extra_env or {})
     e["LC_ALL"] = "C"          # `ps -o lstart=` em C: "Fri Oct 16 10:30:00 2026", independente do locale
     return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape", env=e,
                           timeout=timeout if timeout is not None else int(env("DUS_CMD_TIMEOUT", "60")))
@@ -633,18 +637,43 @@ def notify_text(new, counts, broken, bad_state):
                                            (" Atenção: " + "; ".join(tail) + ".") if tail else ""))
 
 
+# O contrato do `notify` (whatsapp_automation/scripts/notify, cabeçalho de policy_exit): por padrão ele sai 0 em TODO caminho que não
+# empurrou (digest, dedup, segurado até as 7h, teto, autodispatch, e-mail dropado) — rc 0 não diz "chegou". Com NOTIFY_STRICT_EXIT=1 cada
+# desfecho tem seu código; nos caminhos de política rc 0 = push aceito com 2xx. Os kill-switches ANTERIORES à política (NOTIFY_DISABLE,
+# pytest, preview, route-test) saem 0 em silêncio mesmo com a flag: por isso rc 0 só vale com a linha que o notify imprime no ramo 2xx.
+NOTIFY_SENT_MARK = "Notification sent"
+NOTIFY_HELD_RC = 10      # segurado até as 7h: a linha fica no history.db e o notify-quiet-flush (launchd) empurra às 7h
+NOTIFY_NOT_PUSHED = {11: "dedup (um push de mesmo título saiu há menos de 30 min — não dá pra saber se levava ESTES beads)",
+                     12: "caiu no digest ou no teto de pushes (nada chegou no celular)",
+                     13: "virou bead de autoconserto (sem push)", 14: "descartado (e-mail)", 1: "o transporte falhou"}
+
+
 def send_notify(text):
-    """True só se o notify RODOU e saiu 0. Qualquer outra coisa = não foi entregue (o baseline não avança)."""
+    """(entregue, como). entregue=True só se o push foi aceito (rc 0 COM a linha de confirmação) ou ficou SEGURADO até as 7h (rc 10,
+    `como` diz qual). Qualquer outra coisa — rc de política, rc 0 sem a linha, timeout, notify que não abre — é NÃO entregue: o baseline
+    não avança e a próxima rodada re-tenta. Sai com NOTIFY_FORCE_PUSH=1 porque o roteador do notify manda fonte desconhecida pro digest
+    (allowlist, wa-f53j6) e sem isso nada vibraria; o silêncio 22h–7h e o teto global continuam valendo (rc 10 / 12)."""
+    cmd = [env("DUS_NOTIFY", os.path.join(HOME, ".local", "bin", "notify")), "-t", "Vigia daemon-unverified", "-p", "3", text]
+    # vazio → rc 0 sem a linha de confirmação = NÃO entregue; falhou/ilegível → timeout, OSError ou rc que não conheço = NÃO entregue
     try:
-        r = run([env("DUS_NOTIFY", os.path.join(HOME, ".local", "bin", "notify")), "-t", "Vigia daemon-unverified", "-p", "3", text],
-                timeout=60)
-    except (subprocess.TimeoutExpired, OSError) as e:
+        r = run(cmd, timeout=int(env("DUS_NOTIFY_TIMEOUT", "60")), extra_env={"NOTIFY_STRICT_EXIT": "1", "NOTIFY_FORCE_PUSH": "1"})
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("daemon-unverified-sweep: ERRO — notify passou do prazo (DUS_NOTIFY_TIMEOUT, padrão 60 s) e foi cortado: "
+                         "pode ter saído ou não; baseline INTACTO, a próxima rodada re-tenta (pode repetir o aviso)\n")
+        return False, ""
+    except OSError as e:
         sys.stderr.write("daemon-unverified-sweep: ERRO — notify não rodou (%s); baseline INTACTO, a próxima rodada re-tenta\n" % e)
-        return False
-    if r.returncode != 0:
-        sys.stderr.write("daemon-unverified-sweep: ERRO — notify saiu %d; baseline INTACTO, a próxima rodada re-tenta\n" % r.returncode)
-        return False
-    return True
+        return False, ""
+    if r.returncode == 0 and NOTIFY_SENT_MARK in r.stdout:
+        return True, "enviada"
+    if r.returncode == NOTIFY_HELD_RC:
+        return True, "segurada até as 7h (silêncio 22h–7h; o notify-quiet-flush empurra)"
+    if r.returncode == 0:
+        why = "saiu 0 sem a linha '%s': não empurrou (kill-switch NOTIFY_DISABLE / teste / preview?)" % NOTIFY_SENT_MARK
+    else:
+        why = "saiu %d: %s" % (r.returncode, NOTIFY_NOT_PUSHED.get(r.returncode, "código que não conheço — tratado como não entregue"))
+    sys.stderr.write("daemon-unverified-sweep: ERRO — notify %s; baseline INTACTO, a próxima rodada re-tenta\n" % why)
+    return False, ""
 
 
 def main(argv):
@@ -739,8 +768,8 @@ def main(argv):
         new = [b for b in beads if b["state"] == AINDA and b["id"] not in notified]
         delivered = True                                  # nada novo = nada a entregar: o baseline pode avançar
         if new:
-            delivered = send_notify(notify_text(new, counts, broken, bad_state))
-            print("daemon-unverified-sweep: %d AINDA NÃO VISTO novo(s) — notificação %s" % (len(new), "enviada" if delivered else "NÃO entregue"))
+            delivered, how = send_notify(notify_text(new, counts, broken, bad_state))
+            print("daemon-unverified-sweep: %d AINDA NÃO VISTO novo(s) — notificação %s" % (len(new), how if delivered else "NÃO entregue"))
         else:
             print("daemon-unverified-sweep: nenhum AINDA NÃO VISTO novo — sem notificação")
         if delivered:

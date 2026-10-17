@@ -103,12 +103,33 @@ sys.stdout.write(open(p).read())
 
 
 FAKE_NOTIFY = r'''#!%(py)s
+# Fiel ao contrato do notify real (whatsapp_automation/scripts/notify, policy_exit): SEM NOTIFY_STRICT_EXIT=1 todo caminho que nao
+# empurrou sai 0; COM ele sai 10 segurado, 11 dedup, 12 digest/teto, 13 autodispatch, 14 dropado. Sem NOTIFY_FORCE_PUSH uma fonte
+# desconhecida cai no digest (allowlist). `notify.mode` escolhe o desfecho: push (padrao), silent (kill-switch: rc 0 mudo), held,
+# dedup, digest, autodispatch, dropped.
 import os, sys
 fake = os.environ["DUS_FAKE_DIR"]
+msg = sys.argv[-1]
 with open(os.path.join(fake, "notify.calls"), "a") as f:
     f.write("\x1f".join(sys.argv[1:]) + "\n")
+with open(os.path.join(fake, "notify.env"), "a") as f:
+    f.write("STRICT=" + os.environ.get("NOTIFY_STRICT_EXIT", "") + " FORCE=" + os.environ.get("NOTIFY_FORCE_PUSH", "") + "\n")
 if os.path.exists(os.path.join(fake, "notify.fail")):
     sys.stderr.write("notify: ntfy fora do ar\n"); sys.exit(1)
+mode = "push"
+if os.path.exists(os.path.join(fake, "notify.mode")):
+    mode = open(os.path.join(fake, "notify.mode")).read().strip()
+if mode == "push" and not os.environ.get("NOTIFY_FORCE_PUSH"):
+    mode = "digest"
+if mode == "push":
+    print("Notification sent: " + msg); sys.exit(0)
+if mode == "silent":
+    sys.exit(0)
+text, code = {"held": ("Segurado ate as 7h (silencio 22h-7h, wa-hlyupm)", 10), "dedup": ("Deduped (same subject within 30min)", 11),
+              "digest": ("Logged for digest (infra mirror off)", 12), "autodispatch": ("Autodispatch: bead de investigacao", 13),
+              "dropped": ("Dropped (email nunca vai pro ntfy)", 14)}[mode]
+print(text)
+sys.exit(code if os.environ.get("NOTIFY_STRICT_EXIT") == "1" else 0)
 '''
 
 
@@ -132,7 +153,7 @@ class World:
         _exe(os.path.join(self.bin, "launchctl"), FAKE_LAUNCHCTL)
         _exe(os.path.join(self.bin, "ps"), FAKE_PS)
         _exe(os.path.join(self.bin, "notify"), FAKE_NOTIFY)
-        self.la =os.path.join(self.tmp, "LaunchAgents")
+        self.la = os.path.join(self.tmp, "LaunchAgents")
         os.makedirs(self.la)
         self.out = os.path.join(self.tmp, "logs")
         self.hq_store = os.path.join(self.tmp, "hq")
@@ -1008,6 +1029,67 @@ class SweepTest(unittest.TestCase):
         self.assertEqual(len(self.msgs()), 2)                        # a tentativa que falhou + a que entregou
         self.assertIn("ga-stale01", self.state()["notified"])
 
+    def set_notify_mode(self, mode):
+        with open(os.path.join(self.w.fake, "notify.mode"), "w") as f:
+            f.write(mode)
+
+    def test_notify_e_chamado_com_saida_estrita_e_push_forcado(self):
+        # ga-iyfe83.3 gate-fix 1: o rc 0 padrao do notify cobre digest/dedup/segurado/teto; so STRICT_EXIT diz o desfecho e so
+        # FORCE_PUSH tira a fonte desconhecida do digest. O plist nao poe nenhum dos dois: a chamada tem que por.
+        w = self.w
+        self.stale_world(n=1)
+        self.assertEqual(w.run("--notify").returncode, 0, w.last.stderr)
+        with open(os.path.join(w.fake, "notify.env")) as f:
+            self.assertEqual(f.read().splitlines(), ["STRICT=1 FORCE=1"])
+
+    def test_notify_que_nao_empurrou_nao_avanca_o_baseline_nem_diz_enviada(self):
+        # o notify real sai 0 em digest/dedup/teto (e, sem a flag estrita, em todos os de politica): cada desfecho abaixo e NAO entregue,
+        # qualquer que seja o rc, e o aviso so avanca o baseline quando um push de verdade saiu.
+        w = self.w
+        self.stale_world(n=2)
+        for mode, rc_notify in (("digest", 12), ("dedup", 11), ("autodispatch", 13), ("dropped", 14), ("silent", 0)):
+            with self.subTest(mode=mode):
+                self.set_notify_mode(mode)
+                r = w.run("--notify")
+                self.assertEqual(r.returncode, 3, r.stderr)
+                self.assertIn("baseline INTACTO", r.stderr)
+                self.assertIn("NÃO entregue", r.stdout)
+                self.assertNotIn("enviada", r.stdout)
+                self.assertIn("saiu %d" % rc_notify if rc_notify else "sem a linha", r.stderr)
+                self.assertFalse(os.path.exists(self.state_path()))
+        self.set_notify_mode("push")
+        r = w.run("--notify")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("enviada", r.stdout)
+        self.assertEqual(sorted(self.state()["notified"]), ["ga-stale01", "ga-stale02"])
+
+    def test_notify_segurado_ate_as_7h_conta_como_entregue_e_diz_que_foi_segurado(self):
+        # rc 10: o notify gravou a linha no history.db e o notify-quiet-flush (launchd) empurra as 7h; re-avisar so duplicaria.
+        w = self.w
+        self.stale_world(n=2)
+        self.set_notify_mode("held")
+        r = w.run("--notify")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("segurada até as 7h", r.stdout)
+        self.assertNotIn("enviada", r.stdout)
+        self.assertEqual(sorted(self.state()["notified"]), ["ga-stale01", "ga-stale02"])
+        self.assertEqual(w.run("--notify").returncode, 0)
+        self.assertEqual(len(self.msgs()), 1)
+
+    def test_notify_que_estoura_o_prazo_nao_e_dado_como_nao_rodou(self):
+        # o notify pode ter saido: a mensagem nao pode afirmar o contrario (a tentativa se repete e pode duplicar)
+        w = self.w
+        self.stale_world(n=1)
+        slow = os.path.join(w.tmp, "bin", "notify-lento")
+        with open(slow, "w") as f:
+            f.write("#!/bin/sh\nexec sleep 30\n")
+        os.chmod(slow, 0o755)
+        r = w.run("--notify", extra_env={"DUS_NOTIFY": slow, "DUS_NOTIFY_TIMEOUT": "1"})
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("pode ter saído ou não", r.stderr)
+        self.assertNotIn("não rodou", r.stderr)
+        self.assertFalse(os.path.exists(self.state_path()))
+
     def test_baseline_ilegivel_nao_e_baseline_ausente_dito_alto_e_re_avisa_uma_vez(self):
         w = self.w
         self.stale_world(n=2)
@@ -1151,6 +1233,20 @@ MUTANTS = [
     ("baseline-que-nao-grava-nao-quebra-o-rc", "                broken = True\n                sys.stderr.write(\"daemon-unverified-sweep: ERRO — não consegui gravar",
      "                sys.stderr.write(\"daemon-unverified-sweep: ERRO — não consegui gravar",
      ["test_baseline_que_nao_grava_e_dito_e_o_aviso_se_repete"]),
+    ("notify-sem-saida-estrita", '{"NOTIFY_STRICT_EXIT": "1", "NOTIFY_FORCE_PUSH": "1"}', '{"NOTIFY_FORCE_PUSH": "1"}',
+     ["test_notify_e_chamado_com_saida_estrita_e_push_forcado"]),
+    ("notify-sem-push-forcado", '{"NOTIFY_STRICT_EXIT": "1", "NOTIFY_FORCE_PUSH": "1"}', '{"NOTIFY_STRICT_EXIT": "1"}',
+     ["test_notify_e_chamado_com_saida_estrita_e_push_forcado", "test_primeira_rodada_avisa_uma_vez_e_grava_o_baseline"]),
+    ("rc-0-sem-a-linha-de-confirmacao-vale", "if r.returncode == 0 and NOTIFY_SENT_MARK in r.stdout:", "if r.returncode == 0:",
+     ["test_notify_que_nao_empurrou_nao_avanca_o_baseline_nem_diz_enviada"]),
+    ("digest-vale-como-entregue", "if r.returncode == NOTIFY_HELD_RC:", "if r.returncode in (NOTIFY_HELD_RC, 12):",
+     ["test_notify_que_nao_empurrou_nao_avanca_o_baseline_nem_diz_enviada"]),
+    ("dedup-vale-como-entregue", "if r.returncode == NOTIFY_HELD_RC:", "if r.returncode in (NOTIFY_HELD_RC, 11):",
+     ["test_notify_que_nao_empurrou_nao_avanca_o_baseline_nem_diz_enviada"]),
+    ("segurado-nao-conta-como-entregue", "if r.returncode == NOTIFY_HELD_RC:", "if False:",
+     ["test_notify_segurado_ate_as_7h_conta_como_entregue_e_diz_que_foi_segurado"]),
+    ("timeout-vira-nao-rodou", "pode ter saído ou não; baseline INTACTO", "notify não rodou; baseline INTACTO",
+     ["test_notify_que_estoura_o_prazo_nao_e_dado_como_nao_rodou"]),
     ("relatorio-sem-daemon", 'd = out.setdefault(label, {"ainda": 0, "beads": [], "reasons": {}})', 'd = {"ainda": 0, "beads": [], "reasons": {}}',
      ["test_relatorio_md_traz_contagens_por_estado_e_por_daemon"]),
     ("relatorio-esconde-leitura-que-falhou", '"" if ok else "⚠ "', '""',
