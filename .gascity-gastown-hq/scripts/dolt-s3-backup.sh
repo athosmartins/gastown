@@ -131,6 +131,16 @@ RESEED_HQ_MIN_BUDGET_SECS="${RESEED_HQ_MIN_BUDGET_SECS:-300}"
 RESEED_HQ_DEADLINE_SKIP_STATE_DIR="${RESEED_HQ_DEADLINE_SKIP_STATE_DIR:-$CITY/.gc/logs/.dolt-reseed-hq-deadline-skips}"
 RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD="${RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD:-3}"
 RESEED_AFTER_UPLOAD="${RESEED_AFTER_UPLOAD:-1}"
+# ga-sh8t23.5: the nightly reseed only runs once the staging has BLOATED — at least this % of the live store's
+# size on disk (150 = 1.5x). It used to run every night, and every night it costs ~2x the live size in disk for a
+# few minutes (a fresh backup plus the verification restore, both on the data volume) and leaves a ~1x `.old`
+# behind. Measured 17/10 on whatsapp_automation (live 2.0GB, job-ram-probe-20261017.jsonl): the free space of the
+# volume went ~5550MB -> 1499MB (min at 04:08:07, under 3GB for 230s) — the "Dolt disk-floor CRITICAL" of every
+# 04:00 — to turn a 2.0G staging into a 1.9G one. In the 10 nights since 03/10 that finished (dolt-backup-reseed.log)
+# it never reclaimed more than ~15%, and on 17/10 every db's staging sat at 7-98% of its live store; the growth the
+# reseed exists for (09-16: 190% to 300%, Dolt crashed twice on "no space left on device") is far above 150.
+# 0 turns the gate off: reseed every night, as before.
+RESEED_MIN_BLOAT_PCT="${RESEED_MIN_BLOAT_PCT:-150}"
 # ga-gqllbc: an EPHEMERAL db (dolt-backup-ephemeral-lib.sh; default hq) never keeps its local staging.
 # It is built from scratch by the server-free offline sync each night, uploaded, S3 is PROVEN
 # identical + restorable, and only then is the staging deleted (_eph_release_after_success). Its
@@ -1052,6 +1062,10 @@ _eph_release_after_success() {
 # 2026-09-16). Athos authorized reducing the local copy (AskUserQuestion,
 # Mayor session, 2026-09-16) with S3 already confirmed intact.
 #
+# ga-sh8t23.5: it does not run EVERY night any more. It runs when the staging measures at least
+# RESEED_MIN_BLOAT_PCT% of the live store (_reseed_staging_is_lean decides, and logs which way); a lean staging
+# has nothing to give back, and the run's ~2x-live disk peak was the 04:00 "disk critical".
+#
 # Deliberately reuses dolt-backup-reseed.sh instead of a new delete-after-
 # verify path: it is the already-hardened, adversarially-reviewed mechanism
 # for exactly this problem (fresh backup in a new dir -> RESTORE it -> compare
@@ -1130,9 +1144,61 @@ _reseed_budget_secs_for() {
   echo "$budget"
 }
 
+# _staging_bloat_pct <db> — ga-sh8t23.5: how big <db>'s local staging is next to its live store, as an integer
+# percent (staging_kb * 100 / live_kb, both `du -sk` — the same measure dolt-backup-reseed.sh sizes its own
+# preflight with), on stdout, rc 0. rc 1 and NOTHING on stdout when either side cannot be established: no staging
+# dir, a du that fails or only partly succeeds (a total that omits an unreadable subtree is a guess), a live store
+# that measures 0 or is not a number. "Could not measure" is a third answer, not "small": the caller has no number,
+# so it has nothing to compare and must not use this to skip anything.
+_staging_bloat_pct() {
+  local db="$1" live_kb stage_kb
+  # vazio/falhou → rc 1 sem saída (nunca um número inventado); o chamador trata como "não sei", não como "enxuto"
+  live_kb="$(du -sk "$CITY/.beads/dolt/$db" 2>/dev/null)" || return 1
+  stage_kb="$(du -sk "$BACKUP_ROOT/$db" 2>/dev/null)" || return 1
+  live_kb="${live_kb%%[[:space:]]*}"; stage_kb="${stage_kb%%[[:space:]]*}"
+  case "$live_kb" in ''|*[!0-9]*) return 1 ;; esac
+  case "$stage_kb" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$live_kb" -gt 0 ] || return 1
+  echo $(( stage_kb * 100 / live_kb ))
+}
+
+# _reseed_staging_is_lean <db> — ga-sh8t23.5: rc 0 = tonight's reseed of <db> is NOT needed, because the staging was
+# measured and is under RESEED_MIN_BLOAT_PCT% of the live store (nothing to reclaim; see the knob's comment for why
+# the peak is not worth paying for that). rc 1 = run the reseed, for any other reason:
+#   bloated      → measured at or over the threshold: the case the reseed exists for, unchanged (logged);
+#   unmeasurable → no number to compare (logged): the reseed runs as it always did (its own preflight keeps it fail-closed
+#                  against disk and data). Skipping on a guess would let the append-only staging grow unwatched,
+#                  which is what crashed Dolt on 09-16;
+#   gate off     → RESEED_MIN_BLOAT_PCT=0 (nothing is measured, nothing is logged).
+# An unusable knob (not a number) is read as the default 150, with a log line — it does not switch the gate off.
+_reseed_staging_is_lean() {
+  local db="$1" pct min="$RESEED_MIN_BLOAT_PCT"
+  case "$min" in
+    ''|*[!0-9]*) log "$db: RESEED_MIN_BLOAT_PCT='$min' is not a number — using 150"; min=150 ;;
+  esac
+  [ "$min" -gt 0 ] || return 1
+  # vazio/falhou → sem número: segue o reseed de sempre (rc 1), dito no log; só um número medido dispensa
+  if ! pct="$(_staging_bloat_pct "$db")"; then
+    log "$db: staging reseed: could not measure the staging against the live store — reseed runs as before"
+    return 1
+  fi
+  if [ "$pct" -lt "$min" ]; then
+    log "$db: staging reseed not needed — staging at ${pct}% of the live store (< ${min}%): nothing to reclaim, so no ~2x-live disk peak tonight (ga-sh8t23.5)"
+    return 0
+  fi
+  log "$db: staging at ${pct}% of the live store (>= ${min}%) — reseed needed"
+  return 1
+}
+
 _reseed_staging_if_enabled() {
   local db="$1"
   [ "$RESEED_AFTER_UPLOAD" = "1" ] || return 0
+  if _reseed_staging_is_lean "$db"; then
+    # A night that needed no reseed is not a night one was refused: it breaks the margin-refusal streak, so an alarm
+    # never claims "N consecutive refusals" across a stretch in which the staging was fine.
+    _margin_refusal_reset "$db"
+    return 0
+  fi
   local timeout_secs
   timeout_secs="$(_reseed_budget_secs_for "$db")"
   if [ "$timeout_secs" -le 0 ]; then
