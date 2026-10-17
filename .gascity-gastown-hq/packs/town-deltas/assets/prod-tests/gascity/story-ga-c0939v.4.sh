@@ -61,7 +61,8 @@ case "$rc" in
   0) case "$out" in *"RESULT: OK db=smoke"*"issues=3/3"*"labels=1/1"*"dependencies=1/1"*"comments=1/1"*) log "restore with the real bd: accounts close (3 issues, 1 label, 1 dependency, 1 comment) ✓" ;;
        *) fail "restore rc 0 but the RESULT line does not show the expected counts" ;; esac ;;
   1) fail "restore did NOT reproduce the synthetic dump with the real bd: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')" ;;
-  2|124) _unproven "smoke restore had no verdict (rc=$rc: $(tail -1 "$T/err" 2>/dev/null | head -c 200))" ;;
+  2|124) why="$(printf '%s\n' "$out" | sed -n 's/^RESULT: UNKNOWN //p' | head -1 | head -c 300)"   # vazio (rc 124: o timeout externo matou antes da linha RESULT) → última linha do log
+         _unproven "smoke restore had no verdict (rc=$rc: ${why:-$(tail -1 "$T/err" 2>/dev/null | head -c 200)})" ;;
   *) fail "restore exited $rc (unexpected): $(tail -2 "$T/err" 2>/dev/null | tr '\n' ' ')" ;;
 esac
 log "NOTE: smoke only. The round against the real S3 snapshot is in docs/runbooks/jsonl-hourly-offsite.md (Provar o restore)"

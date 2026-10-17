@@ -95,7 +95,8 @@ for v in "$MIN_FREE_MB" "$IMPORT_TIMEOUT" "$DISK_FACTOR" "$DISK_FLOOR_MB" "$WATC
 done
 [ "$WATCH_S" -ge 1 ] || die "JHR_WATCH_INTERVAL tem que ser >= 1"
 [ "$MODE" = file ] && { [ -n "$ARTIFACT" ] && [ -n "$MANIFEST" ] || die "--artifact exige --manifest"; }
-[ "$MODE" = dump ] && { [ -d "$DUMP/$DB" ] || die "--dump: $DUMP/$DB não existe"; }
+# o link $WORK/dump -> $DUMP é criado depois, com o diretório de trabalho como referência: um caminho relativo apontaria para dentro dele
+[ "$MODE" = dump ] && { [ -d "$DUMP/$DB" ] || die "--dump: $DUMP/$DB não existe"; DUMP="$(cd "$DUMP" && pwd -P)" || die "--dump: não consegui resolver $DUMP"; }
 
 command -v python3 >/dev/null 2>&1 || unknown "python3 ausente"
 command -v jq >/dev/null 2>&1 || unknown "jq ausente"
@@ -172,6 +173,7 @@ fi
 
 MAN_ARG=""
 if [ "$MODE" = dump ]; then
+  [ -z "$MANIFEST" ] || log "AVISO: --manifest é ignorado com --dump (o reconcile roda sem manifest)"
   rm -rf "$WORK/dump"; ln -s "$DUMP" "$WORK/dump" 2>/dev/null || unknown "não consegui ligar $DUMP"
 else
   jq -e '.schema == 1 and (.databases | type == "object") and (.files | type == "array")' "$MANIFEST" >/dev/null 2>&1 || unknown "manifest ilegível ou de outro schema: $MANIFEST"
@@ -291,10 +293,13 @@ fi
 if [ $rc -eq 124 ]; then unknown "bd import passou de ${IMPORT_TIMEOUT}s"; fi
 if [ $rc -ne 0 ]; then
   # o motivo real vem em .error do JSON de stdout (--json); o stderr do bd só tem o contador de progresso ("250/2560 issues committed")
+  # vazio → o bd não disse o motivo; falhou/ilegível → o mesmo vazio: sem veredito (rc 2), nunca "o dump não reproduz"
   why="$(jq -r '.error // empty' "$WORK/import.result.json" 2>/dev/null | head -c 400)"
-  [ -n "$why" ] || why="$(tail -3 "$WORK/import.err" | tr '\n' ' ' | head -c 400)"
+  tailerr="$(tail -3 "$WORK/import.err" 2>/dev/null | tr '\n' ' ' | head -c 400)"
   # disco cheio pelo próprio bd não é "o dump não reproduz": é falta de veredito
-  case "$why$(tail -3 "$WORK/import.err" 2>/dev/null)" in *"No space left"*|*"no space left"*) unknown "bd import sem espaço em disco: $why" ;; esac
+  case "$why$tailerr" in *"No space left"*|*"no space left"*) unknown "bd import sem espaço em disco: ${why:-$tailerr}" ;; esac
+  # rc >= 128 = morto por sinal (OOM, SIGKILL): mesmo com um .error parcial, não foi o bd que julgou o dump
+  if [ -z "$why" ] || [ "$rc" -ge 128 ]; then unknown "bd import morreu sem dizer o motivo (rc=$rc): ${why:-$tailerr}"; fi
   echo "RESULT: FAIL db=$DB motivo=bd import rc=$rc: $why"; exit 1
 fi
 

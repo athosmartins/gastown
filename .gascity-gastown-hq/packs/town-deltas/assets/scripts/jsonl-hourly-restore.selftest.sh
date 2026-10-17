@@ -33,6 +33,8 @@
 #  18. (helper de mentira via JHR_PY) saída do helper que não dá para ler não vira veredito: extract.json ilegível => rc 2 (antes `bad` vazio = "as
 #      tabelas conferem"); manifest sem `files` => rc 2; conversor que morre com traceback (sem `.error`) => rc 2, não "o dump não converteu";
 #      o `.error` do conversor continua sendo FAIL (rc 1); --report-out que não grava avisa, e o rc continua sendo o do restore
+#  19. bd import morto por sinal (SIGKILL/OOM, rc 137) sem dizer o motivo: rc 2 "sem veredito", não FAIL (o FAIL de import exige `.error`)
+#  20. --dump com caminho relativo (o link no diretório de trabalho apontaria para dentro dele): rc 0; 20b. --manifest com --dump avisa que é ignorado
 #  Cada item de 11 a 16 foi provado reprovando (campanha de mutantes, 16/10): vigia desligada, FLOOR_HIT ignorado, fator 3×, ENOSPC
 #  sem tratamento, cleanup sem matar o import, import arredondado para baixo => cada um derruba pelo menos um teste, e só os dele.
 #  O 18 também (17/10): cada uma das quatro guardas removida derruba só os testes dela.
@@ -45,6 +47,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESTORE="${JHR_SCRIPT:-$HERE/jsonl-hourly-restore.sh}"
 [ -f "$RESTORE" ] || { echo "não achei $RESTORE" >&2; exit 2; }
+RESTORE="$(cd "$(dirname "$RESTORE")" && pwd)/$(basename "$RESTORE")"   # o teste 20 muda de diretório
 for t in python3 jq; do command -v "$t" >/dev/null 2>&1 || { echo "falta $t" >&2; exit 2; }; done
 command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 || { echo "falta timeout (GNU)" >&2; exit 2; }
 
@@ -93,13 +96,15 @@ case "\$cmd" in
     mkdir -p .beads; echo "\$val" > ".beads/\$key"; echo "Set \$key = \$val"; exit 0 ;;
   import)
     # modo do import lido em tempo de execução (o restore chama o bd com env -i): fill = o disco enche e o import fica pendurado,
-    # breakdf = o df passa a falhar, hang = pendurado sem mexer no disco, slow = 3 s, enospc = o próprio bd recusa por falta de espaço
+    # breakdf = o df passa a falhar, hang = pendurado sem mexer no disco, slow = 3 s, enospc = o próprio bd recusa por falta de espaço,
+    # killed = o bd leva SIGKILL (OOM) no meio, sem JSON em stdout: só o contador de progresso em stderr
     case "\$(cat "$T/import-mode" 2>/dev/null)" in
       fill) echo \$\$ > "$T/bd-import.pid"; echo 100 > "$T/free-mb"; exec sleep 40 ;;
       breakdf) echo \$\$ > "$T/bd-import.pid"; : > "$T/df-broken"; exec sleep 40 ;;
       hang) echo \$\$ > "$T/bd-import.pid"; exec sleep 40 ;;
       slow) sleep 3 ;;
       enospc) printf '{"error":"import failed: write /s/.beads/journal.idx: no space left on device","schema_version":1}\n'; echo "bd import: 250/9 issues committed" >&2; exit 1 ;;
+      killed) echo "bd import: 250/9 issues committed" >&2; kill -9 \$\$ ;;
     esac
     f=""; for a in "\$@"; do case "\$a" in --*) ;; *) f="\$a" ;; esac; done
     custom=",\$(sed 's/:[a-z]*//g' .beads/status.custom 2>/dev/null),"
@@ -422,6 +427,24 @@ mk_bd 0; mk_dump "$T/d18" "open,closed" "" ""
 ( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" "$RESTORE" --db gt --dump "$T/d18" --min-free-mb 1 --disk-floor-mb 0 --report-out "$T/nao-existe/r.json" > "$T/out" 2> "$T/err" ); echo $? > "$T/rc"
 check "rc 0 (o veredito é do restore, não do relatório)" 0 "$(rc)"
 has "AVISO de relatório não gravado" "$(cat "$T/err")" "AVISO: não gravei o relatório em $T/nao-existe/r.json"
+
+# Reprovação do gate ga-hwjqvp (17/10): o import que morre sem dizer o motivo e o --dump relativo
+echo "-- 19. bd import que morre sem dizer o motivo (SIGKILL/OOM, rc 137): sem veredito, não 'o dump não reproduz'"
+mk_bd 0; mk_dump "$T/d19" "open,closed" "" ""
+run_df "$T/d19" 100000 killed --disk-floor-mb 0
+check "rc 2" 2 "$(rc)"
+has "RESULT: UNKNOWN com o rc" "$(cat "$T/out")" "RESULT: UNKNOWN db=gt motivo=bd import morreu sem dizer o motivo (rc=137)"
+has "e o fim do stderr do bd" "$(cat "$T/out")" "250/9 issues committed"
+hasnt "e não FAIL" "$(cat "$T/out")" "RESULT: FAIL"
+check "o diretório de trabalho some" 0 "$(leftover)"
+echo "-- 20. --dump com caminho relativo (o link no diretório de trabalho resolveria contra o próprio diretório de trabalho)"
+mk_bd 0; mk_dump "$T/d20" "open,closed" "" ""
+echo normal > "$T/import-mode"   # run() não mexe no modo do import: sem isto sobraria o `killed` do 19
+( cd "$T" && run d20 )
+check "rc 0" 0 "$(rc)"; has "RESULT: OK" "$(cat "$T/out")" "RESULT: OK"
+echo "-- 20b. --manifest junto com --dump: ignorado, e o log diz"
+( TMPDIR="$T/tmp" JHR_BD="$T/bin/bd" "$RESTORE" --db gt --dump "$T/d20" --manifest "$T/nao-existe.json" --min-free-mb 1 --disk-floor-mb 0 > "$T/out" 2> "$T/err" ); echo $? > "$T/rc"
+check "rc 0" 0 "$(rc)"; has "AVISO de manifest ignorado" "$(cat "$T/err")" "AVISO: --manifest é ignorado com --dump"
 
 echo
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
