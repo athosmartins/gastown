@@ -29,7 +29,20 @@ ensure_archive_pack_config() {
     git -C "$repo" config pack.threads 2
     git -C "$repo" config pack.windowMemory 256m
     git -C "$repo" config pack.deltaCacheSize 64m
+    # ga-wkoij7: a plain `git commit` here must start NO background maintenance. On 17/10 ~10:4x it ran `git maintenance run --auto --detach` (a geometric repack of
+    # a 4.4GB pack: 1.8GB of RAM, swap 5.2GB, free disk 1.4GB) at midday. The Mayor set these two keys by hand in the live repo; like the three above they would vanish
+    # with a recreated repo, so they are written here on every run. The one repack that is wanted — 00:00-06:00, with room on the disk — is asked for explicitly by
+    # commit_archive_snapshot (`-c maintenance.auto=true` on that one commit; measured on git 2.54 to repack even with both keys set here).
+    git -C "$repo" config maintenance.auto false
+    git -C "$repo" config gc.auto 0
 }
+
+# The window and the room a whole-repo repack needs (ga-wkoij7). Sourced before the library-mode return so the selftest reaches the same functions the run uses.
+# (-r first: bash 3.2 ends a non-interactive shell at a `.` of a missing file before any `||` or `if !` can answer, and the message below is the one that names the cause)
+if ! { [ -r "$SCRIPT_DIR/jsonl-archive-repack-window-lib.sh" ] && . "$SCRIPT_DIR/jsonl-archive-repack-window-lib.sh"; }; then
+    echo "jsonl-export: cannot load $SCRIPT_DIR/jsonl-archive-repack-window-lib.sh — without it no commit knows whether a repack may start" >&2
+    exit 1
+fi
 
 # Library mode: `JSONL_EXPORT_LIB=1 source jsonl-export.sh` defines the pure
 # function above and returns before dolt-target.sh is sourced — no live Dolt
@@ -84,6 +97,8 @@ ARCHIVE_REPO="${GC_JSONL_ARCHIVE_REPO:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}
 # The single-flight lock of jsonl-archive-compact.sh (same default path as its LOCK; JAC_LOCK is its test seam, honoured here so one fixture can point both at one
 # directory). commit_archive_snapshot reads it: while a compaction run is in flight, a commit here must not start git's own background maintenance (ga-8z0hy7).
 COMPACT_LOCK="${JAC_LOCK:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/jsonl-archive-compact.lock}"
+# Where the repack window writes the decisions that matter (an allowed repack, a refusal inside the window); see jsonl-archive-repack-window-lib.sh.
+JAW_LOG="${JAW_LOG:-$CITY/.gc/logs/jsonl-archive-repack-window.log}"
 # Re-log the archive mode at least this often (seconds) even without a mode
 # transition, so operators who missed the first line still see the current
 # configuration. Default one week.
@@ -704,7 +719,7 @@ ESCALATION
 # git 2.54 that is a geometric repack that merges and DELETES the loose-*.pack batch packs the compactor made — 19+ minutes of it under this host's load, with no lock file
 # (git's goes with the forking parent). Started while the compactor's consolidating gc runs, it makes the gc die with "could not find pack 'loose-....pack'" (ga-8z0hy7;
 # header of jsonl-archive-compact.sh, ONE REPACKER AT A TIME). So a commit that lands during a compaction run commits with maintenance.auto=false, and the next commit after
-# the run starts git's consolidation as before — it is delayed, never switched off. The lock is the compactor's own: a directory holding its owner's pid. No directory = not in
+# the run goes back to the window rule of commit_archive_snapshot (ga-wkoij7) — this lock only delays git's consolidation, it never switches it off. The lock is the compactor's own: a directory holding its owner's pid. No directory = not in
 # flight. A directory whose owner is dead (a run SIGKILLed by the order's timeout; the compactor itself reclaims it on its next run) is not in flight either — otherwise a
 # compactor that never runs again would keep git's consolidation off for good. (`kill -0` fails the same way for a live process of ANOTHER user; both orders run as one user here,
 # so a failure means dead.) A directory with no readable pid (the instant between its mkdir and its pid write, or a pid file
@@ -717,23 +732,32 @@ compaction_in_flight() {
     kill -0 "$owner" 2>/dev/null
 }
 
+# commit_archive_snapshot — `git commit` of the staged snapshot, with git's background maintenance decided HERE and never left to git (ga-wkoij7). Three cases:
+#   - a compaction run is in flight (compaction_in_flight): maintenance.auto=false — ga-8z0hy7, above;
+#   - the repack window is open and the disk has room (jaw_repack_allowed): maintenance.auto=true on this one commit — git's geometric repack is the consolidation that works here.
+#     Athos's window is 00:00-06:00 (15/10); a commit may START it until 04:59 only — a technical choice, not his: the repack takes 19+ minutes and, detached, cannot be stopped when
+#     the window closes (see jsonl-archive-repack-window-lib.sh);
+#   - anything else — the rest of the day, no room, the clock or the disk unreadable: maintenance.auto=false and gc.auto=0, so the commit starts nothing even in a repo recreated
+#     without the keys ensure_archive_pack_config writes.
+# The first case is checked first so a compaction run never has a second repacker started under it, window or not.
 commit_archive_snapshot() {
     local message="$1"
     local context="$2"
-    local maint="on"
+    local maint="off"
 
     if compaction_in_flight; then
-        maint="off"
         echo "jsonl-export: a compaction run is in flight — $context commit starts no background maintenance (ga-8z0hy7)"
+    elif jaw_repack_allowed "$ARCHIVE_REPO/.git"; then
+        maint="window"   # a refusal is already logged, with its reason, by jaw_repack_allowed
     fi
 
     # Two spellings, not one with an optional -c: an empty argument array is an unbound variable under `set -u` on /bin/bash 3.2.
-    if [ "$maint" = off ]; then
+    if [ "$maint" = window ]; then
         if ! GIT_AUTHOR_NAME="Gas Town Daemon" \
             GIT_AUTHOR_EMAIL="daemon@gastown.local" \
             GIT_COMMITTER_NAME="Gas Town Daemon" \
             GIT_COMMITTER_EMAIL="daemon@gastown.local" \
-            git -c maintenance.auto=false commit -q -m "$message"; then
+            git -c maintenance.auto=true commit -q -m "$message"; then
             echo "jsonl-export: $context commit failed" >&2
             return 1
         fi
@@ -741,7 +765,7 @@ commit_archive_snapshot() {
         GIT_AUTHOR_EMAIL="daemon@gastown.local" \
         GIT_COMMITTER_NAME="Gas Town Daemon" \
         GIT_COMMITTER_EMAIL="daemon@gastown.local" \
-        git commit -q -m "$message"; then
+        git -c maintenance.auto=false -c gc.auto=0 commit -q -m "$message"; then
         echo "jsonl-export: $context commit failed" >&2
         return 1
     fi

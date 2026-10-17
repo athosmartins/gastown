@@ -93,6 +93,28 @@ threads3=$(git -C "$EXISTING_REPO" config --get pack.threads 2>/dev/null || echo
   && ok "idempotent: pack.threads still = 2 after repeated calls" \
   || bad "idempotent: pack.threads = '$threads3' after repeated calls, want '2'"
 
+# ── ga-wkoij7: the repo is born (and a pre-existing one gains it) with NO background maintenance: a plain commit must not start a geometric repack at noon ──
+# vazio → the key is not set (MISSING, and the assertion fails); falhou (git config cannot read) → also MISSING, same failure
+ma=$(git -C "$FRESH_REPO" config --get maintenance.auto 2>/dev/null || echo "MISSING")
+ga=$(git -C "$FRESH_REPO" config --get gc.auto 2>/dev/null || echo "MISSING")
+[ "$ma" = "false" ] \
+  && ok "fresh repo: maintenance.auto = false (ga-wkoij7)" \
+  || bad "fresh repo: maintenance.auto = '$ma', want 'false'"
+[ "$ga" = "0" ] \
+  && ok "fresh repo: gc.auto = 0 (ga-wkoij7)" \
+  || bad "fresh repo: gc.auto = '$ga', want '0'"
+git -C "$EXISTING_REPO" config maintenance.auto true     # an operator (or git) left the old value: the next run must put it back
+git -C "$EXISTING_REPO" config gc.auto 6700
+lib_call ensure_archive_pack_config "$EXISTING_REPO"
+ma2=$(git -C "$EXISTING_REPO" config --get maintenance.auto 2>/dev/null || echo "MISSING")
+ga2=$(git -C "$EXISTING_REPO" config --get gc.auto 2>/dev/null || echo "MISSING")
+[ "$ma2" = "false" ] && [ "$ga2" = "0" ] \
+  && ok "pre-existing repo with the git defaults: the next run sets maintenance.auto=false and gc.auto=0 in place" \
+  || bad "pre-existing repo: maintenance.auto='$ma2' gc.auto='$ga2', want false/0"
+[ "$(git -C "$EXISTING_REPO" config --get-all maintenance.auto | wc -l | tr -d ' ')" = "1" ] \
+  && ok "maintenance.auto stays a single value (replaced, not added)" \
+  || bad "maintenance.auto has several values after repeated calls"
+
 # ── ga-fxrrav: a SHORT export must not replace the previous snapshot ────────
 # Runs the WHOLE script (not lib mode) against a stub dolt-target.sh and a stub
 # `gc`, so no live Dolt, mail or nudge is touched. The stub `dolt_sql` answers
@@ -101,6 +123,7 @@ threads3=$(git -C "$EXISTING_REPO" config --get pack.threads 2>/dev/null || echo
 E2E="$WORK/e2e"
 mkdir -p "$E2E/scripts" "$E2E/bin" "$E2E/city" "$E2E/state"
 cp "$SCRIPT" "$E2E/scripts/jsonl-export.sh"
+cp "$HERE/jsonl-archive-repack-window-lib.sh" "$E2E/scripts/jsonl-archive-repack-window-lib.sh"   # ga-wkoij7: sourced by the exporter at start
 cat > "$E2E/scripts/dolt-target.sh" <<'STUB'
 dolt_sql() {
   local q=""
@@ -586,11 +609,14 @@ maint_case() {  # maint_case <name> — one fresh archive, one export (its first
 DEAD_PID="$(sh -c 'echo $$')"      # a pid that was alive a moment ago and is gone now
 kill -0 "$DEAD_PID" 2>/dev/null && DEAD_PID=999999
 
+# ga-wkoij7: a commit starts git's maintenance only inside the night window with room on the disk. The lock cases below pin the compaction-lock logic alone, so the window is held OPEN
+# with room (the clock and the free space are seams); the window's own cases follow them.
+export JAW_HOUR=2 JAW_FREE_KIB=99999999
 export JAC_LOCK="$E2E/lock-absent"
 maint_case nolock
 [ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-nolock.json")" -ge 1 ] \
-  && ok "no compaction lock: the commit starts git's background maintenance as before (consolidation is not switched off)" \
-  || bad "no lock: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-nolock.json") — want 1 commit and a maintenance run started: $OUT"
+  && ok "no compaction lock, window open with room: the commit starts git's background maintenance (consolidation is not switched off)" \
+  || bad "no lock, window open: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-nolock.json") — want 1 commit and a maintenance run started: $OUT"
 
 export JAC_LOCK="$E2E/lock-live"; mkdir -p "$JAC_LOCK"; echo "$$" > "$JAC_LOCK/pid"
 maint_case live
@@ -617,6 +643,84 @@ maint_case junk
   && ok "a pid file that holds no number counts as in flight as well" \
   || bad "junk-pid lock: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-junk.json") — want 1 commit and 0 maintenance runs started: $OUT"
 unset JAC_LOCK
+
+# ga-wkoij7 — outside the night window, or without room for a repack, a commit starts NO background maintenance even with no compactor running. The repo the exporter works on already
+# carries maintenance.auto=false (ensure_archive_pack_config), so the open-window cases below prove that `-c maintenance.auto=true` on the commit beats it; the closed cases are
+# proven twice — on that repo, and (keyless_commit, further down) on a repo that does not carry the keys.
+echo "=== ga-wkoij7: a commit starts git's repack only in the 00:00-04:59 start window with room on the disk ==="
+export JAC_LOCK="$E2E/lock-absent"
+WIN_LOG="$E2E/city/.gc/logs/jsonl-archive-repack-window.log"
+window_case() {  # window_case <name> <JAW_HOUR> <JAW_FREE_KIB> — one fresh archive, one export, the window seams as given; trace2 in $E2E/t2-<name>.json
+  rm -f "$WIN_LOG"
+  JAW_HOUR="$2" JAW_FREE_KIB="$3" maint_case "$1"
+}
+window_case win-open 2 99999999
+[ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-win-open.json")" -ge 1 ] \
+  && ok "02h with 95GB free: the commit starts git's maintenance (maintenance.auto=true on that commit, over the repo's own false)" \
+  || bad "02h, room: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-win-open.json") — want 1 commit and a maintenance run: $OUT"
+grep -q 'repack allowed' "$WIN_LOG" 2>/dev/null \
+  && ok "the allowed repack is on record in the window log" \
+  || bad "no 'repack allowed' line in $WIN_LOG"
+window_case win-noon 12 99999999
+[ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-win-noon.json")" -eq 0 ] \
+  && ok "12h with room: the commit is made and starts NO background maintenance (the incident of 17/10)" \
+  || bad "12h: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-win-noon.json") — want 1 commit and 0 maintenance runs: $OUT"
+case "$OUT" in *"outside the start window"*) ok "the run says why (outside the start window)" ;; *) bad "no 'outside the start window' line: $OUT" ;; esac
+[ ! -e "$WIN_LOG" ] \
+  && ok "an outside-the-window refusal (20 hours a day) is not written to the window log" \
+  || bad "the window log was written for an outside-the-window refusal: $(cat "$WIN_LOG")"
+window_case win-noroom 2 1000
+[ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-win-noroom.json")" -eq 0 ] \
+  && ok "02h but 1000KiB free: the commit is made and starts NO background maintenance" \
+  || bad "02h, no room: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-win-noroom.json") — want 1 commit and 0 maintenance runs: $OUT"
+grep -q 'INSIDE the window' "$WIN_LOG" 2>/dev/null \
+  && ok "the night's refused repack is on record in the window log (why it did not run)" \
+  || bad "no 'INSIDE the window' line in $WIN_LOG"
+window_case win-nofree 2 abc
+[ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-win-nofree.json")" -eq 0 ] && case "$OUT" in *"cannot be read"*) true ;; *) false ;; esac \
+  && ok "free space that cannot be read: no repack, and the run says it cannot read it (under doubt, inert)" \
+  || bad "unreadable free space: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-win-nofree.json") — want 1 commit, 0 runs, 'cannot be read': $OUT"
+window_case win-noclock xx 99999999
+[ "$(commits)" = "1" ] && [ "$(maint_spawns "$E2E/t2-win-noclock.json")" -eq 0 ] \
+  && ok "a clock that cannot be read: no repack" \
+  || bad "unreadable clock: commits=$(commits) spawns=$(maint_spawns "$E2E/t2-win-noclock.json") — want 1 commit and 0 maintenance runs: $OUT"
+window_case win-h04 4 99999999
+[ "$(maint_spawns "$E2E/t2-win-h04.json")" -ge 1 ] \
+  && ok "04h (last hour to start): allowed" \
+  || bad "04h: spawns=$(maint_spawns "$E2E/t2-win-h04.json"), want >= 1: $OUT"
+window_case win-h05 5 99999999
+[ "$(maint_spawns "$E2E/t2-win-h05.json")" -eq 0 ] \
+  && ok "05h (a repack started now would run past 06:00): refused" \
+  || bad "05h: spawns=$(maint_spawns "$E2E/t2-win-h05.json"), want 0: $OUT"
+# A repo recreated WITHOUT the two keys (the exporter recreates it when .git goes missing; ensure_archive_pack_config runs only afterwards): the commit itself must start nothing outside the
+# window, by its own -c flags. commit_archive_snapshot lives past the library-mode return, so its text is lifted out of the script and run against a bare repo with no keys.
+keyless_commit() {  # keyless_commit <name> <JAW_HOUR> — one commit in a fresh repo with NO maintenance/gc keys; trace2 in $E2E/t2-<name>.json
+  local kr="$E2E/keyless-$1"
+  mkdir -p "$kr" && git -C "$kr" init -q && : > "$E2E/t2-$1.json"
+  printf 'x\n' > "$kr/f.txt" && git -C "$kr" add f.txt
+  (
+    . "$HERE/jsonl-archive-repack-window-lib.sh"
+    eval "$(sed -n '/^compaction_in_flight() {/,/^}/p;/^commit_archive_snapshot() {/,/^}/p' "$SCRIPT")"
+    COMPACT_LOCK="$E2E/lock-absent"; ARCHIVE_REPO="$kr"; JAW_LOG=""
+    cd "$kr" && JAW_HOUR="$2" JAW_FREE_KIB=99999999 GIT_TRACE2_EVENT="$E2E/t2-$1.json" commit_archive_snapshot "keyless" "selftest"
+  ) >/dev/null 2>&1
+}
+keyless_commit keyless-open 2
+[ "$(git -C "$E2E/keyless-keyless-open" rev-list --count HEAD 2>/dev/null)" = "1" ] && [ "$(maint_spawns "$E2E/t2-keyless-open.json")" -ge 1 ] \
+  && ok "keyless repo, 02h: the commit starts maintenance (the spawn detector sees it)" \
+  || bad "keyless repo, 02h: commits=$(git -C "$E2E/keyless-keyless-open" rev-list --count HEAD 2>/dev/null) spawns=$(maint_spawns "$E2E/t2-keyless-open.json") — want 1 and >= 1"
+keyless_commit keyless-noon 12
+[ "$(git -C "$E2E/keyless-keyless-noon" rev-list --count HEAD 2>/dev/null)" = "1" ] && [ "$(maint_spawns "$E2E/t2-keyless-noon.json")" -eq 0 ] \
+  && ok "keyless repo, 12h: the commit starts NO maintenance on its own flags (git's default would have)" \
+  || bad "keyless repo, 12h: commits=$(git -C "$E2E/keyless-keyless-noon" rev-list --count HEAD 2>/dev/null) spawns=$(maint_spawns "$E2E/t2-keyless-noon.json") — want 1 and 0"
+unset JAC_LOCK JAW_HOUR JAW_FREE_KIB
+
+# the lib is not optional: an exporter that cannot load it must stop, not commit with a gate that is silently absent
+mkdir -p "$E2E/scripts-nolib"; cp "$SCRIPT" "$E2E/scripts-nolib/jsonl-export.sh"
+NOLIB_OUT="$(PATH="$SANDBOX_PATH" GC_CITY="$E2E/city" bash "$E2E/scripts-nolib/jsonl-export.sh" 2>&1)"; NOLIB_RC=$?
+[ "$NOLIB_RC" -ne 0 ] && case "$NOLIB_OUT" in *"cannot load"*"jsonl-archive-repack-window-lib.sh"*) true ;; *) false ;; esac \
+  && ok "no window lib next to the exporter: it exits non-zero and names the missing file" \
+  || bad "no lib: rc=$NOLIB_RC, want non-zero with 'cannot load ...jsonl-archive-repack-window-lib.sh': $NOLIB_OUT"
 
 # The cases above point BOTH scripts at one directory with JAC_LOCK, so nothing in them would notice the two DEFAULTS drifting apart — and then the exporter would look for a lock the
 # compactor never takes, and every commit would start the background repack again with all of the above still green. So: the same environment, the default path each one derives.

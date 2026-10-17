@@ -110,8 +110,8 @@
 # run lasts 19+ minutes under this host's load (one was alive for 19:00 when it was looked at, another started 30 minutes later), and while it runs there is NO
 # objects/maintenance.lock: git's lock file belongs to the process that forks the detached child, and goes with it when that parent exits (reproduced on a scratch repo too) —
 # so neither `maintenance run` nor `git gc` (gc.pid only) is kept out by it. That run is also the consolidation that actually works here (this gc timed out at its 600s cap 17
-# times in the log, on a 4GiB repo), so it must not be switched off (maintenance.auto=false would leave a gc that cannot finish as the only consolidator). The rule instead:
-# never two repackers at once, from both sides.
+# times in the log, on a 4GiB repo), so it must not be switched off for good — and since ga-wkoij7 it is not: it is confined to the 00:00-04:59 start window with room on the disk
+# (WINDOW below), where the exporter still asks for it. The rule against the two colliding: never two repackers at once, from both sides.
 #   1. This script, before it starts the consolidating gc, looks for another git process repacking the repo (other_repacker: ps for this user's git maintenance/repack/gc/
 #      pack-objects/... processes, then lsof for the working directory of each — a detached run keeps the directory of the commit that spawned it). Found = the gc is NOT started: status `busy`
 #      (a failed/stalled/timed-out/unmeasured/skipped state is never replaced by it, same rule as a busy gc.pid), the log names the process. Cannot tell (no ps/lsof, either cut at
@@ -119,6 +119,12 @@
 #      repo that stays over the pack alarm is BAD whatever the status, so a gc that is deferred forever is not silent.
 #   2. The exporter, whose commits are what spawn that run, commits with maintenance.auto=false while this script's lock is held (jsonl-export.sh, commit_archive_snapshot): no
 #      new background repack can start during a compaction run. It resumes the moment the run ends, so git's consolidation is only delayed, never removed.
+# WINDOW (ga-wkoij7): on 17/10 ~10:4x the exporter's commit started git's geometric repack of the 4.4GB pack at midday (pack-objects 1.8GB of RAM, swap 5.2GB, free disk 1.4GB). Athos
+# decided (15/10) that the heavy maintenance runs only in 00:00-06:00. So the tier-2 consolidating gc — a rewrite of every pack, the other whole-repo repack of this city — starts only when
+# jaw_repack_allowed says so (jsonl-archive-repack-window-lib.sh: local hour in [0,5) AND free disk >= 2 x the largest pack + 2GiB; a clock or a df that cannot be read = no): outside that
+# it is `deferred` and logged with the reason, like a gc without budget — never a failure by itself, and never silent, because the pack alarm still judges the END state (>= JAC_PACKS_ALARM
+# packs = BAD whatever the status). Tier 1 (loose-objects batches) and tier 2a (the tail repack, `--keep-pack` on the big packs) are NOT gated on purpose: they are bounded by objects and by
+# pack.windowMemory, never read the biggest pack, and the loose backlog (~243MiB/h) has to be packed by day or the disk fills.
 # Together they leave one window: a commit that spawned a run in the instant before this script took its lock. If that run is still going when other_repacker looks (the gc
 # starts after the batches, minutes into the run) it is seen; if it has finished it can no longer delete anything. Not covered, on purpose: a git run with --git-dir from another
 # working directory (no cwd in the repo), and one of another user — nothing in this city does either to an archive but this script.
@@ -197,6 +203,15 @@ set -uo pipefail
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 RUNTIME="${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}"
 
+# The repack window and the room a whole-repo repack needs (ga-wkoij7), shared with jsonl-export.sh so the two cannot disagree. Failing to load it is a failure, not "no gate":
+# a gate that is silently absent would let the gc run at noon again.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# (-r first: bash 3.2 ends a non-interactive shell at a `.` of a missing file before any `||` or `if !` can answer, and the message below is the one that names the cause)
+if ! { [ -r "$SCRIPT_DIR/jsonl-archive-repack-window-lib.sh" ] && . "$SCRIPT_DIR/jsonl-archive-repack-window-lib.sh"; }; then
+  echo "jsonl-archive-compact: cannot load $SCRIPT_DIR/jsonl-archive-repack-window-lib.sh — without it the consolidating gc cannot tell whether it may start" >&2
+  exit 1
+fi
+
 # The two archives. maintenance/ is the one dolt-s3-backup.sh mirrors offsite and the one the
 # per-rig mol-dog-jsonl instances write; town-deltas/ is the city-scope instance's and is being
 # retired by ga-7sxdmb (left in place, no longer written) — a missing repo is fine as long as
@@ -240,6 +255,7 @@ CHECK_FRESH_S="${JAC_CHECK_FRESH_S:-7200}"           # --check trusts the order'
 LOCK="${JAC_LOCK:-$RUNTIME/jsonl-archive-compact.lock}"
 STATE="${JAC_STATE:-$RUNTIME/packs/town-deltas/jsonl-archive-compact-state.json}"
 LOG="${JAC_LOG:-$CITY/.gc/logs/jsonl-archive-compact.log}"
+JAW_LOG="${JAW_LOG:-$CITY/.gc/logs/jsonl-archive-repack-window.log}"   # the repack window's own decisions (ga-wkoij7); the lib writes it, this log keeps the run's line
 GCBIN="${JAC_GC:-gc}"
 GITBIN="${JAC_GIT:-git}"                             # test seam: a wrapper that can slow a batch down
 LOG_MAX_LINES=4000
@@ -261,6 +277,7 @@ tail_limit_kib=$TAIL_LIMIT_KIB tail_max_objects=$TAIL_MAX_OBJECTS tail_timeout_s
 git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S prune_timeout_s=$PRUNE_TIMEOUT_S prune_min_s=$PRUNE_MIN_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
 list_timeout_s=$LIST_TIMEOUT_S lsof_timeout_s=$LSOF_TIMEOUT_S reclaim_wait_s=$RECLAIM_WAIT_S ps_timeout_s=$PS_TIMEOUT_S
 alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S check_fresh_s=$CHECK_FRESH_S
+repack_window_start_h=$JAW_START_H repack_window_last_start_h=$JAW_LAST_START_H repack_swap_headroom_kib=$JAW_SWAP_KIB repack_window_log=$JAW_LOG
 state=$STATE log=$LOG lock=$LOCK
 EOF
   exit 0   # benign[print-config]: --print-config only prints the effective configuration — no run happened, so there is no failure for this exit to hide
@@ -932,7 +949,13 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
   measure || STATUS="unmeasured"
   if [ "$STATUS" != unmeasured ] && [ "$M_PACKS" -ge "$PACKS_LIMIT" ]; then
     need=$(( M_PACK_KIB + HEADROOM_KIB ))
-    if [ "$(remaining)" -lt "$MIN_GC_BUDGET_S" ]; then
+    # WINDOW (header, ga-wkoij7): the gc rewrites every pack, so it starts only in the night window and with room for it. jaw_repack_allowed logs its own reason; free_kib is passed in
+    # so JAC_FREE_KIB (the seam of every disk test here) stays the one source of free space, and an empty answer from df is "cannot read" = no gc. Not allowed = it did NOTHING, so it
+    # cannot turn a failed / stalled / timed-out / unmeasured / skipped tier 1 green — the same rule as a gc without budget.
+    if ! jaw_repack_allowed "$R_GITDIR" "$(free_kib "$repo")"; then
+      bad_status "$STATUS" || STATUS="deferred"
+      log "repo=$repo packs=$M_PACKS >= $PACKS_LIMIT but the repack window is closed — consolidating gc deferred: $JAW_REASON (the pack alarm still judges the end state)"
+    elif [ "$(remaining)" -lt "$MIN_GC_BUDGET_S" ]; then
       bad_status "$STATUS" || STATUS="deferred"
       log "repo=$repo packs=$M_PACKS >= $PACKS_LIMIT but only $(remaining)s of budget left — gc deferred to the next run"
     elif disk_low "$repo" "$need"; then
