@@ -786,7 +786,8 @@ shadow_finish() { # rc_do_nó arquivo_da_saída_do_nó "$@" (args originais). Es
 # node_audit: depois de semear, procura NO DESTINO (independentemente do filtro) o que não podia ter chegado: NOME de segredo/dado (a mesma lista do prod test da fatia 1, com token), arquivo > 4 MB (o scanner
 # não o lê), JWT em .json/.txt fora de tests/ (um só já é segredo) e CONTEÚDO (hetzner-pii-scan.py, o mesmo do node_guard, rodando no servidor: lista de telefones/CPFs). Achou = alarme (rc 98) e a semeadura não vale.
 # Cada leitura tem TRÊS estados e só "li tudo e não achou" é limpo: o scanner que não abre aqui, o python que falta no nó, o find que reclama, o ssh que cai = "não consegui auditar" (rc 98), nunca "nada achado".
-# Se a auditoria caiu DEPOIS de já ter achado algo, vale o que achou: é ALARME (com o aviso de que não terminou), não "não consegui auditar".
+# Se a auditoria caiu DEPOIS de já ter achado algo, vale o que achou: é ALARME (com o aviso de que não terminou), não "não consegui auditar". Vale para os quatro achados: NOME/GRANDE/JWT saem na hora; o CONTEUDO (o scanner só devolve ao fim)
+# é impresso pelo script remoto ANTES dos AUDIT_ERR, só com contagem >= 0 (linha -1/-1 = arquivo não lido = "não sei", nunca achado).
 # Medido em 16/10 na árvore real do WA (o que o filtro mandaria): zero arquivo > 4 MB, zero JWT; a regra "qualquer telefone num .json" (a conferência manual do Mayor) acharia 2 arquivos rastreados com 1 número cada
 # (um changelog e um template), então o critério de conteúdo é o do scanner (lista), não "qualquer número".
 # hash_valid: o shasum que falhou deixa o hash VAZIO, e um .freeze-hash/.sp-hash que o ssh não leu também vem vazio — "" = "" não pode virar "já batem". Só sha1 hex de 40 caracteres é hash;
@@ -813,9 +814,13 @@ find . -type f \( -name '*.json' -o -name '*.txt' \) ! -path './tests/*' ! -name
   -exec grep -lE 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' {} + 2>>"$E" | sed 's#^\./##' | head -20 | sed 's/^/AUDIT_BAD JWT /'
 find . -type f -size -4097k -print 2>>"$E" | sed 's#^\./##' \
   | python3 -I -c 'import base64,sys; c=base64.b64decode(sys.argv[1]).decode(); sys.argv=["x"]+sys.argv[2:]; exec(c)' "$2" . > "$E.p" 2>>"$E"
-[ $? -eq 0 ] || { echo AUDIT_ERR; exit 3; }
+rc=$?
+# o que o scanner JÁ achou sai ANTES de qualquer AUDIT_ERR: um arquivo ilegível (o scanner devolve rc 3) ou qualquer stderr do find/grep não pode jogar fora a lista de telefones que ele achou (achado + "não terminei" é ALARME, não "não consegui auditar").
+# Só linha com contagem >= 0 é achado; "-1<TAB>-1<TAB>caminho" é arquivo NÃO lido = não sei, e virar AUDIT_BAD seria o colapso oposto (o rc 3 abaixo já o trata como "não terminei").
+# vazio → "$E.p" sem linha de contagem = nada achado ainda (o AUDIT_DONE abaixo só sai se tudo foi lido); falhou/ilegível → grep sem saída aqui, e o AUDIT_ERR logo abaixo diz que não terminou
+grep -E '^[0-9]+[[:space:]]' "$E.p" 2>/dev/null | head -20 | sed 's/^/AUDIT_BAD CONTEUDO /'
+[ "$rc" -eq 0 ] || { echo AUDIT_ERR; exit 3; }
 [ -s "$E" ] && { echo AUDIT_ERR; exit 3; }
-head -20 "$E.p" | sed 's/^/AUDIT_BAD CONTEUDO /'
 echo AUDIT_DONE
 EOF
   ) || true

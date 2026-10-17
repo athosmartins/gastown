@@ -6,7 +6,7 @@
 #
 # CASOS: bandeira do nó ausente = OFF, calado e sem rodar nada · bandeira ligada roda `mbp-run.sh --host linux --seed wa` com a cidade certa, mesmo com a chave do MBP DESLIGADA
 #   (o nó é independente) · rc 0 = OK sem notify · rc 98/97/124 = FALHOU com UM notify prio 4 que diz o rc e o que ele quer dizer · saída com "ALARME: dado ou segredo no destino"
-#   = ALARME com notify prio 5 · mbp-run.sh ausente é falha (rc 1), não sucesso calado · notify ausente é AVISADO, o veredito não muda · estouro de prazo (se há `timeout`).
+#   = ALARME com notify prio 5 · mbp-run.sh ausente é falha (rc 1, FALHOU com linha no jsonl e notify prio 4), não sucesso calado · notify ausente é AVISADO, o veredito não muda · estouro de prazo (se há `timeout`).
 # CONTROLE NEGATIVO: o mutante sem o reconhecimento do ALARME vira FALHOU (prio 4) e o caso do alarme o pega.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -51,6 +51,7 @@ reset; touch "$FLAG"; rc=$(STUB_RC=98 STUB_OUT='mbp-run: ALARME: dado ou segredo
 reset; touch "$FLAG"; rc=$(STUB_RC=98 STUB_NOTIFY_RC=1 w); eq "notify que falha: o veredito continua FALHOU (rc 1)" 1 "$rc"; has "…e a falha do notify é DITA" "$T/out" 'WARN: notify failed'
 reset; touch "$FLAG"; rc=$(STUB_RC=98 HETZNER_RESEED_NOTIFY="$T/nao-existe" w); eq "notify ausente: rc 1" 1 "$rc"; has "…e avisa" "$T/out" 'notify not found'
 reset; touch "$FLAG"; rc=$(HETZNER_RESEED_RUN="$T/nao-existe.sh" w); eq "mbp-run.sh ausente: rc 1 (não é sucesso calado)" 1 "$rc"; has "…diz qual" "$T/err" 'mbp-run.sh not found'; hasnt "…e não finge OK" "$T/out" 'VERDICT: OK'
+has "…veredito FALHOU (não só stderr)" "$T/out" 'VERDICT: FALHOU'; has "…grava a linha FALHOU com o motivo" "$LOG" '"verdict":"FALHOU","rc":1,"detail":"mbp-run.sh not found'; has "…e UM notify prio 4" "$STUB_LOG" 'NOTIFY:.*-p 4 .*mbp-run\.sh not found'; eq "…um só notify" 1 "$(grep -c NOTIFY: "$STUB_LOG")"
 if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
   reset; touch "$FLAG"; rc=$(STUB_SLEEP=6 HETZNER_RESEED_TIMEOUT_S=1 w); eq "estouro do prazo (1 s contra um seed de 6 s): FALHOU" 1 "$rc"; has "…com o rc 124" "$STUB_LOG" 'rc=124'
 else echo "SKIP estouro de prazo: sem timeout/gtimeout neste host (esse caminho NÃO foi exercitado)"; fi

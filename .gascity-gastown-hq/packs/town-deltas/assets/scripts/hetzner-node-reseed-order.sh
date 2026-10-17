@@ -18,7 +18,7 @@
 #   ALARME  the seed's audit found a secret or data file on the node (the filter let something through): notify at prio 5 and exit 1. This is the security requirement of
 #           the story (no customer data leaves the mini), so it is loud on purpose. The order does NOT turn the node off by itself (the flag stays on and batteries keep
 #           cloning mirrors from the base the audit just flagged), so the notify tells the Mayor to run `mbp-offload.sh node off`.
-# A missing mbp-run.sh is a FAILED run (exit 1, stderr), never a quiet success.
+# A missing mbp-run.sh is a FAILED run (FALHOU: exit 1, stderr line, jsonl line and ONE prio-4 notify like any other failed seed), never a quiet success.
 #
 # TEST: bash scripts/hetzner-node-reseed.selftest.sh
 set -uo pipefail
@@ -43,7 +43,11 @@ note() { # prio message — a failed notify is said, never swallowed
 }
 
 if [ ! -f "$FLAG" ]; then say "node off (no $FLAG) — nothing to do"; record OFF 0; say "VERDICT: OFF"; exit 0; fi
-if [ ! -f "$RUN" ]; then echo "hetzner-node-reseed: mbp-run.sh not found at $RUN — nothing was seeded" >&2; exit 1; fi
+if [ ! -f "$RUN" ]; then
+  msg="mbp-run.sh not found at $RUN — nothing was seeded"
+  echo "hetzner-node-reseed: $msg" >&2; record FALHOU 1 "$msg"; note 4 "Hetzner node reseed FAILED: $msg. The node base/venv is not being refreshed; gate and workers fall back to the MacBook/local as usual."
+  say "VERDICT: FALHOU"; exit 1
+fi
 
 # --host linux --seed wa works whether or not the MacBook switch is on: the node has its own flag
 # vazio → sem timeout/gtimeout no PATH (o do launchd é curto): a run NÃO tem o teto de ${TIMEOUT_S}s e isso é DITO; só o timeout da própria order (1000 s) a limita. Não é erro: o seed roda do mesmo jeito

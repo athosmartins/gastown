@@ -92,7 +92,13 @@ case "$name" in
     fi ;;
   AUDIT) if [ "${STUB_AUDIT_BROKEN:-0}" = 1 ]; then echo AUDIT_ERR; exit 3
          elif [ "${STUB_AUDIT_BROKEN:-0}" = 2 ]; then echo "AUDIT_BAD NOME .env"; echo AUDIT_ERR; exit 3   # achou um vazamento e CAIU antes de terminar (o find real imprime o que acha na hora, antes do erro)
-         else rexec 0 "${args##*bash -s -- }"; fi ;;
+         else
+           # STUB_AUDIT_UNREADABLE=<arquivo> / STUB_AUDIT_UNREADABLE_DIR=<pasta> (relativos ao HOME falso): o destino ganha, antes da auditoria REAL, um arquivo/pasta que o usuário não consegue ler (chmod 000) — o scanner devolve
+           # rc 3 para o arquivo e o find reclama (stderr) da pasta. É o "achei E não consegui terminar" de verdade, sem enlatar a saída da auditoria.
+           if [ -n "${STUB_AUDIT_UNREADABLE:-}" ]; then mkdir -p "$(dirname "$STUB_HOME/$STUB_AUDIT_UNREADABLE")"; echo x > "$STUB_HOME/$STUB_AUDIT_UNREADABLE"; chmod 000 "$STUB_HOME/$STUB_AUDIT_UNREADABLE"; fi
+           if [ -n "${STUB_AUDIT_UNREADABLE_DIR:-}" ]; then mkdir -p "$STUB_HOME/$STUB_AUDIT_UNREADABLE_DIR"; chmod 000 "$STUB_HOME/$STUB_AUDIT_UNREADABLE_DIR"; fi
+           rexec 0 "${args##*bash -s -- }"
+         fi ;;
   SLOT_ACQUIRE)
     if [ "${STUB_SLOTS:-free}" = exec ]; then rexec 0; exit $?
     elif [ "${STUB_SLOTS:-free}" = full ]; then
@@ -346,7 +352,7 @@ reset() { : > "$STUB_LOG"; rm -f "$STUB_REAPED" "$J" "$STUB_STATE_FILE" "$STUB_S
   rm -f "$T/city/.gc/hetzner-node.on" "$T/city/.gc/hetzner-mac-only.learned" "$T/city/.gc/logs/hetzner-shadow.jsonl" "$T"/last-script-*-hetzner.sh "$T"/last-script-*-mbp.sh "$T/freeze-sent.txt"
   unset STUB_UNREACHABLE_NODE STUB_UNREACHABLE_MBP STUB_PF_RAW_NODE STUB_NOBASE_NODE STUB_NOVENV_NODE STUB_RUN_RC_NODE STUB_RUN_RC_MBP STUB_RUN_OUT_NODE STUB_RUN_OUT_MBP STUB_RUN_SLEEP_NODE STUB_RUN_SLEEP_MBP \
     STUB_N_MEMINFO_RAW STUB_N_AVAIL_MB STUB_N_SWAPTOTAL_MB STUB_N_SWAPFREE_MB STUB_N_SWAPFREE2_MB STUB_N_PSI_MISSING STUB_N_PSI_RAW STUB_N_PSI_SOME STUB_N_PSI_FULL STUB_N_NPROC STUB_N_NPROC_FAIL STUB_N_DISK_MB STUB_N_DISK_FAIL STUB_N_DISK_RAW \
-    STUB_RSYNC_REAL STUB_DIRECT_FAIL_ON STUB_DIRECT_EXEC_ON STUB_UV_FAIL_DRYRUN STUB_AUDIT_BROKEN HETZNER_XDIST_OFF HETZNER_XDIST_MIN_TESTS HETZNER_RSYNC_FILTER HETZNER_SEED_ROOT HETZNER_SEED_VENV HETZNER_SEED_DRYRUN HETZNER_MAX_SLOTS HETZNER_SHADOW_WAIT_S HETZNER_SHADOW_WINDOW_S HETZNER_MIN_DISK_MB HETZNER_FREEZE_SKIP HETZNER_NODE_HOST MBP_RUN_SHADOW
+    STUB_RSYNC_REAL STUB_DIRECT_FAIL_ON STUB_DIRECT_EXEC_ON STUB_UV_FAIL_DRYRUN STUB_AUDIT_BROKEN STUB_AUDIT_UNREADABLE STUB_AUDIT_UNREADABLE_DIR HETZNER_XDIST_OFF HETZNER_XDIST_MIN_TESTS HETZNER_RSYNC_FILTER HETZNER_SEED_ROOT HETZNER_SEED_VENV HETZNER_SEED_DRYRUN HETZNER_MAX_SLOTS HETZNER_SHADOW_WAIT_S HETZNER_SHADOW_WINDOW_S HETZNER_MIN_DISK_MB HETZNER_FREEZE_SKIP HETZNER_NODE_HOST MBP_RUN_SHADOW
   unset STUB_UNREACHABLE STUB_AVAIL_MB STUB_SWAP_MB STUB_SWAP2_MB STUB_SWAP_RAW STUB_SWAP2_RAW STUB_PRESSURE STUB_PRESSURE_FAIL STUB_VM_FAIL STUB_VM_DROP STUB_PAGE_SIZE STUB_COMP_PAGES STUB_MP_FAIL STUB_MP_PCT STUB_PF_RAW STUB_POWER STUB_BATT STUB_PMSET_FAIL STUB_PMSET_RAW STUB_SLOTS STUB_NOBASE STUB_RUN_RC STUB_RUN_OUT STUB_RSYNC_RC; }
 expect() { # nome rc_esperado rc_real [grep-no-log padrão]
   n=$((n+1))
@@ -1225,6 +1231,37 @@ has "…diz que não conseguiu auditar" "$T/err" 'não consegui auditar'; hasnt 
 find "$BASEDEST" -mindepth 1 -delete 2>/dev/null; : > "$STUB_LOG"; rc=$(STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_AUDIT_BROKEN=2 seed); expect "auditoria que ACHOU e caiu antes de terminar: 98" 98 "$rc"
 has "…é ALARME, não 'não consegui auditar'" "$T/err" 'ALARME: dado ou segredo no destino'; hasnt "…e não degrada para o aviso de prio menor" "$T/err" 'não consegui auditar'; has "…cita o que achou antes de cair" "$T/err" 'NOME \.env'
 has "…avisa que a auditoria NÃO terminou" "$T/err" 'NÃO terminou'; has "…manda desligar o nó" "$T/err" 'mbp-offload\.sh node off'; hasnt "…e não instala nada" "$STUB_LOG" 'uv pip install --python'
+# gate-fix 2 (ga-n653mm): achou a LISTA de telefones (CONTEUDO) E a auditoria não conseguiu ler um arquivo/pasta. A auditoria aqui é a REAL (o script remoto + o hetzner-pii-scan.py, sem enlatar a saída):
+# o scanner devolve rc 3 para o arquivo ilegível e o find reclama no stderr da pasta ilegível — as duas saídas viravam AUDIT_ERR ANTES de imprimir o que o scanner já tinha achado, e a lista de leads no servidor saía como
+# "não consegui auditar" (prio 4, sem ALARME e sem a instrução de desligar o nó). O mutante noheld deixa a lista chegar ao destino; STUB_AUDIT_UNREADABLE* põe o ilegível lá dentro, antes da auditoria.
+UNR_FILE=gt-remote/wa-base/lib/ilegivel.py; UNR_DIR=gt-remote/wa-base/pasta-ilegivel
+clean_dest() { chmod 755 "$STUB_HOME/$UNR_DIR" 2>/dev/null; chmod 644 "$STUB_HOME/$UNR_FILE" 2>/dev/null; find "$BASEDEST" -mindepth 1 -delete 2>/dev/null; : > "$STUB_LOG"; }
+alarm_found_and_unfinished() { # $1 = rótulo do caso
+  has "$1: é ALARME (achou), não 'não consegui auditar'" "$T/err" 'ALARME: dado ou segredo no destino'; hasnt "$1: e não degrada para o aviso de prio menor" "$T/err" 'não consegui auditar'
+  has "$1: avisa que a auditoria NÃO terminou" "$T/err" 'NÃO terminou'; has "$1: manda desligar o nó" "$T/err" 'mbp-offload\.sh node off'; hasnt "$1: e não instala nada" "$STUB_LOG" 'uv pip install --python'
+}
+clean_dest; HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_AUDIT_UNREADABLE="$UNR_FILE" "$MUT/mut-noheld.sh" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "auditoria REAL: lista achada + arquivo ilegível (rc 3 do scanner) → 98" 98 "$?"
+if [ -e "$BASEDEST/lib/ilegivel.py" ] && [ ! -r "$BASEDEST/lib/ilegivel.py" ]; then ok "premissa: o arquivo ilegível existe no destino e este usuário não o lê"; else bad "premissa: o arquivo do destino não ficou ilegível (rodando como root? o caso abaixo não prova nada)"; fi
+alarm_found_and_unfinished "lista + arquivo ilegível"; has "…cita CONTEUDO, as contagens e o caminho da lista" "$T/err" 'CONTEUDO [0-9]+[[:space:]]+0[[:space:]]+lib/leads_list\.py'; hasnt "…nunca o valor do telefone" "$T/err" '55319'
+hasnt "…e o arquivo que NÃO se leu não vira achado (-1/-1 é 'não sei', não AUDIT_BAD)" "$T/err" 'ilegivel\.py'
+clean_dest; HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_AUDIT_UNREADABLE_DIR="$UNR_DIR" "$MUT/mut-noheld.sh" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "auditoria REAL: lista achada + pasta ilegível (stderr do find, scanner rc 0) → 98" 98 "$?"
+if [ -d "$BASEDEST/pasta-ilegivel" ] && [ ! -r "$BASEDEST/pasta-ilegivel" ]; then ok "premissa: a pasta ilegível existe no destino e este usuário não a lê"; else bad "premissa: a pasta do destino não ficou ilegível (rodando como root?)"; fi
+alarm_found_and_unfinished "lista + pasta ilegível"; has "…cita CONTEUDO, as contagens e o caminho da lista" "$T/err" 'CONTEUDO [0-9]+[[:space:]]+0[[:space:]]+lib/leads_list\.py'
+# o irmão que já imprimia na hora (NOME): continua valendo com a auditoria real caindo depois
+clean_dest; HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_AUDIT_UNREADABLE="$UNR_FILE" "$MUT/mut-nofilter2.sh" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "auditoria REAL: segredo por NOME achado + arquivo ilegível → 98" 98 "$?"
+alarm_found_and_unfinished "NOME + arquivo ilegível"; has "…cita o .env que vazou" "$T/err" 'NOME \.env'
+# controle: sem nada achado, o ilegível continua sendo "não sei" (98, prio 4) — o -1/-1 não pode virar ALARME
+clean_dest; HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_AUDIT_UNREADABLE="$UNR_FILE" "$RUN" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "auditoria REAL: nada achado + arquivo ilegível → 98" 98 "$?"
+has "…é 'não consegui auditar'" "$T/err" 'não consegui auditar'; hasnt "…e sem achado não é ALARME (prio 4, não 5)" "$T/err" 'ALARME'; hasnt "…e não instala nada" "$STUB_LOG" 'uv pip install --python'
+# mutante (controle negativo): a ordem ANTIGA — o CONTEUDO só sai depois dos dois AUDIT_ERR — joga a lista achada fora; o caso "lista + arquivo ilegível" acima tem de ver o defeito
+OLDPRINT='head -20 "$E.p" | sed '"'"'s/^/AUDIT_BAD CONTEUDO /'"'"
+awk -v pr="$OLDPRINT" 'index($0, "grep -E \047^[0-9]+[[:space:]]\047 \"$E.p\"") == 1 { next } { print } $0 == "[ -s \"$E\" ] && { echo AUDIT_ERR; exit 3; }" { print pr }' "$MUT/mut-noheld.sh" > "$MUT/mut-oldorder.sh"; chmod +x "$MUT/mut-oldorder.sh"
+n=$((n+1)); if cmp -s "$MUT/mut-noheld.sh" "$MUT/mut-oldorder.sh"; then echo "FAIL premissa: o mutante da ordem antiga é igual ao noheld (o awk não casou)"; fails=$((fails+1)); else echo "ok   premissa: o mutante da ordem antiga difere do script"; fi
+clean_dest; HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_AUDIT_UNREADABLE="$UNR_FILE" "$MUT/mut-oldorder.sh" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "controle (ordem antiga): lista + arquivo ilegível ainda recusa (98)" 98 "$?"
+has "controle (ordem antiga): o defeito aparece — o achado vira 'não consegui auditar'" "$T/err" 'não consegui auditar'; hasnt "controle (ordem antiga): e não há ALARME" "$T/err" 'ALARME'
+clean_dest; HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada STUB_AUDIT_UNREADABLE_DIR="$UNR_DIR" "$MUT/mut-oldorder.sh" --host linux --seed wa >"$T/out" 2>"$T/err"
+has "controle (ordem antiga): a pasta ilegível também esconde o achado" "$T/err" 'não consegui auditar'; hasnt "controle (ordem antiga): e não há ALARME (pasta)" "$T/err" 'ALARME'
+clean_dest
 # o node_guard da semeadura falha FECHADO: sem o scanner (hetzner-pii-scan.py) NADA é copiado — não é "nada retido"
 cp "$RUN" "$NOSCAN/mut-noscan-seed.sh"; chmod +x "$NOSCAN/mut-noscan-seed.sh"
 find "$BASEDEST" -mindepth 1 -delete 2>/dev/null; : > "$STUB_LOG"; HETZNER_SEED_ROOT="$SEEDROOT" HETZNER_SEED_VENV="$SEEDVENV" STUB_RSYNC_REAL=1 STUB_DIRECT_OUT=nada "$NOSCAN/mut-noscan-seed.sh" --host linux --seed wa >"$T/out" 2>"$T/err"; expect "seed sem o hetzner-pii-scan.py: 98 (não semeia)" 98 "$?"
