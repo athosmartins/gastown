@@ -7,25 +7,32 @@ Contents
 PARA QUE SERVE
   O `ram-owner-sampler` (5 min) agrupa por NOME DE PROCESSO: não diz de qual job do launchd é cada MB e perde o que dura menos que o passo. A fatia .3 só move um horário com a pegada
   medida do job (label → processo → pico de RSS). Este comando amostra a janela, soma o RSS da ÁRVORE de cada job (o processo que o launchd iniciou e seus filhos) e grava UMA linha por
-  amostra, com swap, % livre e disco livre. `--summary` lê os arquivos e imprime a tabela, o pico simultâneo e os saltos de swap com quem cresceu nos 60 s antes. SÓ LEITURA do sistema: ps, launchctl list,
+  amostra, com swap, % livre e disco livre. `--summary` lê os arquivos e imprime a tabela, o pico simultâneo e os saltos de swap com quem cresceu nos 60 s antes (só entre amostras que de fato
+  foram seguidas no tempo: ver BURACOS). SÓ LEITURA do sistema: ps, launchctl list,
   sysctl, memory_pressure. A única escrita é o arquivo de saída (com teto de tamanho e piso de disco: o disco do mini vive a 98 %, a ferramenta não pode piorá-lo).
 
 COMO MEDE
   `launchctl list` dá label → PID dos jobs rodando; `ps` dá a árvore (ppid). RSS do job = soma da raiz e dos descendentes, cada pid UMA vez. O nome do processo é o do `ram_owner_lib.label()`,
-  o MESMO do sampler (dá para casar com o histórico dele). Custo de uma amostra ≈ 0,2 s (um ps de ~650 linhas); vai gravado em `dt_ms`. Instância única por arquivo (flock).
+  o MESMO do sampler (dá para casar com o histórico dele). Custo de uma amostra: mediana 0,8 s e máx 4,3 s na noite de 17/10 (máquina saturada, load 45-58; não medi em máquina folgada), gravado em `dt_ms`;
+  o passo real sai no resumo. Instância única por arquivo (flock).
 
 TRÊS ESTADOS (o que não sei NÃO vira zero)
   `ps` que falha ou vem vazio → `ps_ok:false`, sem RSS total e sem jobs (uma máquina sempre tem processos: tabela vazia é "não li"). `launchctl list` que falha ou vem sem nenhuma linha →
-  `lc_ok:false`: o RSS total fica, mas SEM atribuição a job. Swap/% livre/disco livre que não li → `null`. Job que acabou entre o launchctl e o ps some da amostra (não vira 0 MB). No resumo, amostras
-  assim e linhas ilegíveis são CONTADAS e ditas; arquivo que não abre ou sem nenhuma amostra → exit 3 (não sei ≠ nada rodou).
+  `lc_ok:false`: o RSS total fica, mas SEM atribuição a job. Swap/% livre/disco livre que não li → `null`. Job que o launchctl lista mas o ps (lido ANTES dele) ainda não tem, por ter nascido entre
+  as duas leituras, some da amostra (não vira 0 MB). No resumo, amostras assim e linhas ilegíveis são CONTADAS e ditas; arquivo que não abre ou sem nenhuma amostra → exit 3 (não sei ≠ nada rodou).
+
+BURACOS  Duas amostras SEGUIDAS NO ARQUIVO não são necessariamente seguidas no tempo: o probe pode ter parado, a máquina dormido, ou o resumo juntar noites (de 05:10 a 03:30 do dia seguinte são 22 h).
+  `--summary` só trata um par como adjacente se os dois pontos estão a no máximo `--max-gap` s um do outro (padrão: 3 x o passo mediano). Par mais distante NÃO vira "salto de swap" nem "queda de
+  disco", e uma janela de 60 s que cruza um buraco NÃO atribui o salto a ninguém ("sem atribuição"); os buracos e os pares que deixaram de ser avaliados são CONTADOS e ditos no relatório.
 
 USO
   job-ram-probe.py [--start HH:MM] [--until HH:MM | --duration S | --ticks N] [--interval S] [--out ARQ] [--max-mb N] [--min-free-gb N] [--check-every N] [--fixture-dir D]
-  job-ram-probe.py --summary ARQ... [--swap-step MB] [--big-mb MB] [--disk-step MB]
+  job-ram-probe.py --summary ARQ... [--swap-step MB] [--big-mb MB] [--disk-step MB] [--max-gap S] [--top N]
   Com --start espera até a hora (local); se já estiver dentro de [start, until] começa agora. Códigos: 0 · 2 uso errado · 3 não consegui ler/nenhuma amostra · 4 outra instância
-  no mesmo arquivo · 5 arquivo passou do teto · 6 disco abaixo do piso. Teste: `bash scripts/job-ram-probe.selftest.sh`.
+  no mesmo arquivo · 5 arquivo passou do teto · 6 disco abaixo do piso. Gravação que não deixou nenhuma amostra também sai com 3 (nada gravado não é sucesso). A tabela do resumo mostra os
+  `--top` maiores jobs (padrão 40; 0 = todos) e diz quantos ficaram de fora. Teste: `bash scripts/job-ram-probe.selftest.sh`.
 
-LIMITES  Job que dura menos que o passo (5 s) pode passar entre duas amostras. Processo que se desanexa do job (reparent para o launchd) sai da árvore. A soma de RSS conta página compartilhada
+LIMITES  Job que dura menos que o passo (5 s) pode passar entre duas amostras; o que acaba entre a leitura do ps e a do launchctl não é atribuído. Processo que se desanexa do job (reparent para o launchd) sai da árvore. A soma de RSS conta página compartilhada
   uma vez por processo (superestima árvores com vários processos do mesmo binário). RSS é o residente: memória já enviada ao swap não aparece nele, por isso o salto de swap é lido à parte.
   A causa de um salto é INDÍCIO (quem cresceu nos 60 s antes), não prova.
 """
@@ -50,6 +57,7 @@ import ram_owner_lib as lib  # noqa: E402  (ps_snapshot, swap_usage, mem_free_pc
 PERSISTENT = 0.9  # visto em >= 90 % das amostras válidas = daemon (KeepAlive), não job da janela
 LOOKBACK = 60     # s antes de um salto de swap em que se procura quem cresceu
 GROW_KB = 50 * 1024
+GAP_FACTOR = 3    # duas amostras só são "seguidas" se o passo entre elas for <= GAP_FACTOR x o passo mediano (ou --max-gap)
 
 
 def launchd_pids(fixture=None):
@@ -87,7 +95,7 @@ def job_trees(tbl, roots):
         kids[p["ppid"]].append(pid)
     out, seen = {}, set()
     for label, root in roots.items():
-        if root not in tbl:  # o job acabou entre o launchctl e o ps: some desta amostra (não vira 0 MB) [guard:vanished]
+        if root not in tbl:  # o launchctl (lido DEPOIS do ps) vê um job que o ps ainda não tinha: nasceu entre as duas leituras; some desta amostra (não vira 0 MB) [guard:vanished]
             continue
         stack, tot, n, top = [root], 0, 0, (-1, "?")
         while stack:
@@ -205,6 +213,9 @@ def record(a):
                 return 6
             if not a.fixture_dir and not (a.ticks is not None and n >= a.ticks):
                 time.sleep(max(0.0, a.interval - (time.time() - t0)))
+    if n == 0:  # a janela acabou antes da 1ª amostra (ex.: a máquina dormiu até depois do fim): arquivo vazio não é sucesso [guard:none-written]
+        print(f"job-ram-probe: nenhuma amostra gravada em {out} (a janela acabou antes da primeira)", file=sys.stderr)
+        return 3
     return 0
 
 
@@ -234,11 +245,42 @@ def mb(kb):
     return f"{kb / 1024:.0f}"
 
 
-def grew(recs, tss, b):
-    """Top 3 labels que mais cresceram (pico nos LOOKBACK s até `b` menos o RSS antes da janela). None = não sei (alguma amostra sem ps ou sem launchctl)."""
+def dur(s):
+    s = int(s)
+    return f"{s} s" if s < 120 else (f"{s // 60} min" if s < 7200 else f"{s // 3600} h {s % 3600 // 60:02d} min")
+
+
+def gap_limit(recs, override):
+    """Maior passo entre duas amostras que ainda as faz "seguidas". --max-gap manda; senão GAP_FACTOR x o passo mediano entre instantes DISTINTOS (arquivo repetido não zera o passo).
+    vazio → 0 (sem nenhum par com passo positivo não há o que medir: só amostras no mesmo instante contam como seguidas); falhou → não há leitura que falhe aqui."""
+    if override is not None:
+        return override
+    pos = [b["ts"] - a["ts"] for a, b in zip(recs, recs[1:]) if b["ts"] > a["ts"]]
+    return GAP_FACTOR * statistics.median(pos) if pos else 0
+
+
+def moves(rs, key, sign, thr, limit):
+    """Pares de leituras SEGUIDAS de `key` em `rs` (só amostras que têm a leitura) cuja variação, no sentido `sign` (+1 subiu, -1 caiu), chega a `thr`.
+    Só vale par com os dois pontos a no máximo `limit` s: o mais distante é um buraco (probe parado, máquina dormindo, pausa entre noites), não um evento que alguém viu.
+    → (pares que valem, nº de pares longe demais para avaliar, quantos destes variaram >= thr: sei que mudou, não QUANDO)."""
+    ev, far, far_big = [], 0, 0
+    for a, b in zip(rs, rs[1:]):
+        d = sign * (b[key] - a[key])
+        if b["ts"] - a["ts"] > limit:  # [guard:gap-moves]
+            far += 1
+            far_big += d >= thr
+        elif d >= thr:
+            ev.append((a, b))
+    return ev, far, far_big
+
+
+def grew(recs, tss, b, limit):
+    """Top 3 labels que mais cresceram (pico nos LOOKBACK s até `b` menos o RSS antes da janela). None = não sei (alguma amostra sem ps ou sem launchctl, ou um buraco na janela)."""
     j = bisect.bisect_right(tss, b["ts"] - LOOKBACK) - 1
     win = [r for r in recs[max(j, 0):] if r["ts"] <= b["ts"]]
     if j < 0 or any(not (r.get("ps_ok") and r.get("lc_ok")) for r in win):  # [guard:unknown]
+        return None
+    if any(y["ts"] - x["ts"] > limit for x, y in zip(win, win[1:])):  # buraco entre a base e `b`: a base pode ter horas de idade e o pico, ter caído no buraco [guard:gap-base]
         return None
     base = recs[j]["jobs"]
     peak = {}
@@ -250,16 +292,24 @@ def grew(recs, tss, b):
     return sorted(gr, reverse=True)[:3]
 
 
-def summarize(recs, bad, swap_step, big_mb, disk_step):
+def summarize(recs, bad, swap_step, big_mb, disk_step, max_gap=None, top=40):
     ok = [r for r in recs if r.get("ps_ok") and r.get("lc_ok")]
     no_ps = sum(1 for r in recs if not r.get("ps_ok"))
     no_lc = sum(1 for r in recs if not r.get("lc_ok"))
-    steps = [b["ts"] - a["ts"] for a, b in zip(recs, recs[1:])]
+    pos = [b["ts"] - a["ts"] for a, b in zip(recs, recs[1:]) if b["ts"] > a["ts"]]
+    limit = gap_limit(recs, max_gap)
+    holes = [(a, b) for a, b in zip(recs, recs[1:]) if b["ts"] - a["ts"] > limit]
+    # arquivos de mais de um dia levam a data: sem ela, "04:00..04:20" de uma noite se confunde com "04:00..04:45" de outra
+    at = (lambda ts: time.strftime("%d/%m %H:%M:%S", time.localtime(ts))) if len({time.strftime("%Y%m%d", time.localtime(r["ts"])) for r in recs}) > 1 else clock
     dts = [r["dt_ms"] for r in recs if isinstance(r.get("dt_ms"), int)]
-    L = [f"# job-ram-probe: {len(ok)} amostras com atribuição de {len(recs)} ({clock(recs[0]['ts'])}-{clock(recs[-1]['ts'])}) · passo mediano {statistics.median(steps) if steps else 0:.0f} s · "
+    L = [f"# job-ram-probe: {len(ok)} amostras com atribuição de {len(recs)} ({at(recs[0]['ts'])}-{at(recs[-1]['ts'])}) · passo mediano {statistics.median(pos) if pos else 0:.0f} s · "
          f"custo da amostra: mediana {statistics.median(dts) if dts else 0:.0f} ms, máx {max(dts) if dts else 0} ms"]
     if no_ps or no_lc or bad:
         L.append(f"AVISO: {no_ps} amostras sem ps, {no_lc} sem launchctl (essas NÃO atribuem RAM a job), {bad} linhas ilegíveis: o que não li não está nas tabelas abaixo.")
+    if holes:
+        ha, hb = max(holes, key=lambda h: h[1]["ts"] - h[0]["ts"])
+        L.append(f"AVISO: {len(holes)} buraco(s) entre amostras seguidas (passo > {limit:.0f} s), somando {dur(sum(y['ts'] - x['ts'] for x, y in holes))}; o maior: {dur(hb['ts'] - ha['ts'])}, de {at(ha['ts'])} a {at(hb['ts'])}. "
+                 "Par que cruza um buraco NÃO vira salto de swap nem queda de disco, e salto com buraco nos 60 s antes fica sem atribuição.")
     seen = collections.defaultdict(list)
     for r in ok:
         for lab, v in r["jobs"].items():
@@ -273,38 +323,43 @@ def summarize(recs, bad, swap_step, big_mb, disk_step):
           f"* swap usado: {min(sw):.0f}..{max(sw):.0f} MB ({len(recs) - len(sw)} amostras sem leitura)" if sw else "* swap usado: sem nenhuma leitura",
           f"* % livre: {min(fr)}..{max(fr)}" if fr else "* % livre: sem nenhuma leitura",
           f"* RSS total: {min(tot) / 1048576:.1f}..{max(tot) / 1048576:.1f} GB" if tot else "* RSS total: sem nenhuma leitura"]
+    far_note = lambda far, far_big, step: (f" (+ {far} par(es) de leituras a mais de {limit:.0f} s um do outro, NÃO avaliados; variação >= {step:.0f} MB em {far_big}: sei que mudou, não quando)" if far else "")
     sr = [r for r in recs if r.get("swap_used_mb") is not None]
     tss = [r["ts"] for r in recs]
-    jumps = [(a, b) for a, b in zip(sr, sr[1:]) if b["swap_used_mb"] - a["swap_used_mb"] >= swap_step]
-    L.append(f"* saltos de swap >= {swap_step:.0f} MB entre amostras seguidas: {len(jumps)}")
+    jumps, far, far_big = moves(sr, "swap_used_mb", 1, swap_step, limit)
+    L.append(f"* saltos de swap >= {swap_step:.0f} MB entre amostras seguidas: {len(jumps)}{far_note(far, far_big, swap_step)}")
     for a, b in jumps:
-        g = grew(recs, tss, b)
-        who = "sem atribuição (sem amostra de base 60 s antes, ou amostra sem ps/launchctl na janela)" if g is None else ("; ".join(f"{lab} +{mb(d)} MB{' (novo)' if new else ''} [{name}]" for d, lab, name, new in g) or "ninguém cresceu >= 50 MB")
-        L.append(f"  - {clock(b['ts'])}  {a['swap_used_mb']:.0f} -> {b['swap_used_mb']:.0f} MB (+{b['swap_used_mb'] - a['swap_used_mb']:.0f}, em {b['ts'] - a['ts']} s)  nos {LOOKBACK} s antes: {who}")
+        g = grew(recs, tss, b, limit)
+        who = "sem atribuição (sem amostra de base 60 s antes, buraco na janela, ou amostra sem ps/launchctl na janela)" if g is None else ("; ".join(f"{lab} +{mb(d)} MB{' (novo)' if new else ''} [{name}]" for d, lab, name, new in g) or "ninguém cresceu >= 50 MB")
+        L.append(f"  - {at(b['ts'])}  {a['swap_used_mb']:.0f} -> {b['swap_used_mb']:.0f} MB (+{b['swap_used_mb'] - a['swap_used_mb']:.0f}, em {b['ts'] - a['ts']} s)  nos {LOOKBACK} s antes: {who}")
     dk = [r for r in recs if r.get("disk_free_mb") is not None]
     L += ["", "## Disco (volume do arquivo de saída)",
           f"* livre: {min(r['disk_free_mb'] for r in dk)}..{max(r['disk_free_mb'] for r in dk)} MB ({len(recs) - len(dk)} amostras sem leitura)" if dk else "* livre: sem nenhuma leitura (arquivo sem o campo, ou statvfs falhou)"]
-    drops = [(a, b) for a, b in zip(dk, dk[1:]) if a["disk_free_mb"] - b["disk_free_mb"] >= disk_step]
-    L.append(f"* quedas >= {disk_step:.0f} MB entre amostras seguidas: {len(drops)}")
+    drops, dfar, dfar_big = moves(dk, "disk_free_mb", -1, disk_step, limit)
+    L.append(f"* quedas >= {disk_step:.0f} MB entre amostras seguidas: {len(drops)}{far_note(dfar, dfar_big, disk_step)}")
     for a, b in drops:
         run = sorted(((v[0], lab) for lab, v in b["jobs"].items() if lab in win), reverse=True)[:4]
         who = "sem atribuição (amostra sem ps/launchctl)" if not (b.get("ps_ok") and b.get("lc_ok")) else (", ".join(f"{lab} ({mb(kb)} MB)" for kb, lab in run) or "nenhum job da janela rodando")
-        L.append(f"  - {clock(b['ts'])}  {a['disk_free_mb']} -> {b['disk_free_mb']} MB (-{a['disk_free_mb'] - b['disk_free_mb']}, em {b['ts'] - a['ts']} s)  jobs da janela rodando (maiores): {who}")
+        L.append(f"  - {at(b['ts'])}  {a['disk_free_mb']} -> {b['disk_free_mb']} MB (-{a['disk_free_mb'] - b['disk_free_mb']}, em {b['ts'] - a['ts']} s)  jobs da janela rodando (maiores por RSS; presença, NÃO escrita em disco medida): {who}")
     if not ok:  # nenhuma amostra atribuiu RAM a job: sem tabela de jobs (não sei ≠ nenhum job rodou)
         return "\n".join(L + ["", "## Jobs: nenhuma amostra com ps E launchctl válidos; sem tabela de jobs (não sei ≠ nenhum job rodou)."])
     L += ["", f"## Jobs da janela (não persistentes: {len(win)}), por pico da árvore", "| label | pico MB | às | processo de maior RSS | visto (início..fim) | amostras |", "|---|---|---|---|---|---|"]
-    for lab, s in sorted(win.items(), key=lambda kv: -max(x[1] for x in kv[1]))[:40]:
+    rows = sorted(win.items(), key=lambda kv: -max(x[1] for x in kv[1]))
+    shown = rows if top == 0 else rows[:top]
+    for lab, s in shown:
         ts, kb, name = max(s, key=lambda x: x[1])
-        L.append(f"| {lab} | {mb(kb)} | {clock(ts)} | {name} | {clock(s[0][0])}..{clock(s[-1][0])} | {len(s)} |")
+        L.append(f"| {lab} | {mb(kb)} | {at(ts)} | {name} | {at(s[0][0])}..{at(s[-1][0])} | {len(s)} |")
+    if len(shown) < len(rows):  # [guard:top]
+        L.append(f"(mostrando {len(shown)} de {len(rows)} labels, os de maior pico; o menor mostrado tem {mb(max(x[1] for x in shown[-1][1]))} MB. Label que não está aqui NÃO é label que não apareceu: `--top 0` mostra todos.)")
     if not win:
         L.append("(nenhum job não persistente apareceu nas amostras com atribuição)")
     sim = [(sum(v[0] for lab, v in r["jobs"].items() if lab in win), r) for r in ok]
     if sim:
-        top, r = max(sim, key=lambda x: x[0])
+        top_sum, r = max(sim, key=lambda x: x[0])
         big = lambda rr: sorted(lab for lab, v in rr["jobs"].items() if lab in win and v[0] >= big_mb * 1024)
         many = sum(1 for _, rr in sim if len(big(rr)) >= 2)
         L += ["", f"## Simultaneidade dos jobs da janela (\"de pico\" = árvore >= {big_mb:.0f} MB)",
-              f"* maior soma de uma amostra: {mb(top)} MB às {clock(r['ts'])} ({len(big(r))} jobs de pico: {', '.join(big(r)) or 'nenhum'})",
+              f"* maior soma de uma amostra: {mb(top_sum)} MB às {at(r['ts'])} ({len(big(r))} jobs de pico: {', '.join(big(r)) or 'nenhum'})",
               f"* amostras com 2 ou mais jobs de pico ao mesmo tempo: {many} de {len(sim)}"]
     dsum = sorted(((max(x[1] for x in seen[lab]), lab) for lab in daemons), reverse=True)
     L += ["", f"## Persistentes (visto em >= {PERSISTENT * 100:.0f} % das amostras): {len(daemons)} labels, soma dos picos {mb(sum(k for k, _ in dsum))} MB; maiores:"]
@@ -328,8 +383,13 @@ def main(argv=None):
     ap.add_argument("--swap-step", type=float, default=200.0)
     ap.add_argument("--big-mb", type=float, default=150.0)
     ap.add_argument("--disk-step", type=float, default=300.0)
+    ap.add_argument("--max-gap", type=float, help="s: maior passo entre duas amostras que ainda as faz seguidas (padrão: 3 x o passo mediano)")
+    ap.add_argument("--top", type=int, default=40, help="linhas da tabela de jobs (0 = todas)")
     a = ap.parse_args(argv)
     if a.summary:
+        if (a.max_gap is not None and a.max_gap <= 0) or a.top < 0:
+            print("job-ram-probe: uso errado (--max-gap > 0; --top >= 0)", file=sys.stderr)
+            return 2
         try:
             recs, bad = load(a.summary)
         except (OSError, ValueError) as e:  # ValueError: byte que não é UTF-8
@@ -338,10 +398,12 @@ def main(argv=None):
         if not recs:  # [guard:empty]
             print(f"job-ram-probe: nenhuma amostra legível ({bad} linhas ilegíveis); sem relatório (não sei ≠ nada rodou)", file=sys.stderr)
             return 3
-        print(summarize(recs, bad, a.swap_step, a.big_mb, a.disk_step))
+        print(summarize(recs, bad, a.swap_step, a.big_mb, a.disk_step, a.max_gap, a.top))
         return 0
-    if a.interval < 1 or a.max_mb <= 0 or a.check_every < 1 or (a.duration is None and a.until is None and a.ticks is None):
-        print("job-ram-probe: uso errado (--interval >= 1; informe --until, --duration ou --ticks; ou use --summary)", file=sys.stderr)
+    # --ticks 0 / --duration 0 gravariam nada e sairiam 0; --duration junto de --until deixava um calar o outro: os dois são uso errado [guard:usage]
+    if (a.interval < 1 or a.max_mb <= 0 or a.check_every < 1 or (a.duration is None and a.until is None and a.ticks is None)
+            or (a.ticks is not None and a.ticks < 1) or (a.duration is not None and (a.duration <= 0 or a.until is not None))):
+        print("job-ram-probe: uso errado (--interval >= 1; --ticks >= 1; --duration > 0 e não junto de --until; informe --until, --duration ou --ticks; ou use --summary)", file=sys.stderr)
         return 2
     return record(a)
 

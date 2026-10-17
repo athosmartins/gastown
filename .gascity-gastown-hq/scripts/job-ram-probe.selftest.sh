@@ -5,9 +5,11 @@
 #   Casos · Controle negativo (mutantes) · Variáveis
 #
 # CASOS: soma da árvore (raiz + filhos, cada pid uma vez; ciclo termina) · nome do processo de maior RSS · job parado (PID "-") fora · OS TRÊS ESTADOS: ps vazio = ps_ok:false e total null (não 0),
-#   launchctl só com cabeçalho / ausente / com byte não-UTF-8 = lc_ok:false e SEM jobs (não "nenhum job rodando"), job que sumiu entre o launchctl e o ps não vira 0 MB, swap/% livre não lidos = null ·
+#   launchctl só com cabeçalho / ausente / com byte não-UTF-8 = lc_ok:false e SEM jobs (não "nenhum job rodando"), job que o launchctl lista e o ps (lido antes) ainda não tem não vira 0 MB, swap/% livre não lidos = null ·
 #   resumo: job da janela × persistente, pico e hora, simultaneidade, saltos de swap com quem cresceu nos 60 s antes (e "sem atribuição" quando a janela tem amostra sem ps/launchctl), amostras
-#   falhas e linhas ilegíveis CONTADAS, arquivo vazio/ausente/não-UTF-8 = exit 3 · plano de horário (antes, dentro, depois, atravessando a meia-noite) · teto de tamanho (exit 5) · piso de disco (exit 6,
+#   falhas e linhas ilegíveis CONTADAS, arquivo vazio/ausente/não-UTF-8 = exit 3 · BURACOS: duas noites a 22,5 h uma da outra NÃO viram salto de swap nem queda de disco (a reprodução do reviewer), buraco dentro
+#   dos 60 s antes de um salto = sem atribuição, buraco contado e dito, --max-gap, arquivo repetido não zera o limite, data nos horários de arquivo de vários dias, --top e o aviso de truncamento ·
+#   --ticks 0 / --duration 0 / --duration com --until = exit 2, janela sem nenhuma amostra = exit 3 · plano de horário (antes, dentro, depois, atravessando a meia-noite) · teto de tamanho (exit 5) · piso de disco (exit 6,
 #   no início e no meio) · instância única (exit 4) · uso errado (exit 2) · fumaça no sistema real.
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e a suíte TEM que passar a falhar.
 # VARIÁVEIS: JRP_UNDER_TEST (script a testar) · JRP_NO_MUTANTS=1
@@ -42,15 +44,15 @@ printf '%s\n' "$LC_OK" > "$FX/1.launchctl"; printf '512.5 45 7000\n' > "$FX/1.me
 : > "$FX/2.ps"                                                              # 2: ps vazio
 printf 'PID%sStatus%sLabel\n' "$tb" "$tb" > "$FX/3.launchctl"               # 3: launchctl só com o cabeçalho
 rm -f "$FX/4.launchctl"                                                     # 4: launchctl ausente
-printf '%s\n999%s0%scom.test.gone\n' "$LC_OK" "$tb" "$tb" > "$FX/5.launchctl"  # 5: um job que o ps já não tem
+printf '%s\n999%s0%scom.test.gone\n' "$LC_OK" "$tb" "$tb" > "$FX/5.launchctl"  # 5: um job que o launchctl lista e o ps (lido antes) ainda não tinha
 printf -- '- - -\n' > "$FX/6.mem"; rm -f "$FX/7.mem"                        # 6: não li swap, % livre nem disco; 7: arquivo ausente
 printf '512.5 45\n' > "$FX/2.mem"                                           # 2: arquivo no formato antigo (sem o campo de disco)
 printf 'PID%sStatus%sLabel\n-%s0%scom.test.\xff\xfe\n' "$tb" "$tb" "$tb" "$tb" > "$FX/8.launchctl"  # 8: byte que não é UTF-8
 
 # ---- noite fabricada: 100 amostras de 5 s a partir de 04:00:00 (UTC) ----
-python3 -I - "$T/night.jsonl" "$T/night-a.jsonl" "$T/night-b.jsonl" <<'EOF'
+python3 -I - "$T/night.jsonl" "$T/night-a.jsonl" "$T/night-b.jsonl" "$T/gap-a.jsonl" "$T/gap-b.jsonl" "$T/hole.jsonl" <<'EOF'
 import json, sys
-out, oa, ob = sys.argv[1:4]
+out, oa, ob, ga, gb, ho = sys.argv[1:7]
 base = 1704081600  # 2024-01-01 04:00:00 UTC
 recs = []
 for i in range(100):
@@ -67,6 +69,13 @@ for i in range(100):
 lines = [json.dumps(r) for r in recs]
 open(out, "w").write("\n".join(lines[:30] + ["isto nao e json", ""] + lines[30:]) + "\n")
 open(oa, "w").write("\n".join(lines[:50]) + "\n"); open(ob, "w").write("\n".join(lines[50:]) + "\n")
+# buracos. gap-a/gap-b: duas noites de 10 amostras, a 2ª começa 22,5 h depois da 1ª; swap 1000 -> 1300 e disco 8000 -> 6000 só aparecem ENTRE as noites, e o job 'innocent' fica constante em 200 MB na noite 2.
+# hole: 30 amostras de 5 s com um buraco de 50 s (i = 20..28 faltam); o salto de swap (i = 29 -> 30) é entre amostras vizinhas, mas a base de 60 s antes cruza o buraco, e 'grower' só existe depois dele.
+mk = lambda ts, swap, disk, jobs: {"ts": ts, "ps_ok": True, "lc_ok": True, "swap_used_mb": swap, "free_pct": 50, "disk_free_mb": disk, "total_rss_kb": 8000000, "jobs": jobs, "dt_ms": 200}
+wr = lambda path, rs: open(path, "w").write("".join(json.dumps(r) + "\n" for r in rs))
+wr(ga, [mk(base + 5 * i, 1000.0, 8000, {}) for i in range(10)])
+wr(gb, [mk(base + 81000 + 5 * i, 1300.0, 6000, {"com.test.innocent": [204800, 1, "innocent_proc", 204800]}) for i in range(10)])
+wr(ho, [mk(base + 5 * i, 1000.0 if i < 30 else 1500.0, 8000, {"com.test.grower": [512000, 1, "grower_proc", 512000]} if i >= 29 else {}) for i in range(40) if not 20 <= i <= 28])
 EOF
 
 rec() {  # rec ARQ N EXPR DESCRIÇÃO — a N-ésima linha (a partir de 0) do JSONL vira `r`; EXPR tem que ser verdadeira. O eval roda SÓ a asserção escrita neste arquivo, nunca dado externo
@@ -87,7 +96,7 @@ run_all() {
   rec "$T/o.jsonl" 2 'r["ps_ok"] is False and r["total_rss_kb"] is None and r["jobs"] == {} and r["lc_ok"] is True' "ps vazio: ps_ok false, total null (NÃO 0) e nenhum job"
   rec "$T/o.jsonl" 3 'r["lc_ok"] is False and r["jobs"] == {} and r["total_rss_kb"] == 101400 and r["ps_ok"] is True' "launchctl só com cabeçalho: lc_ok false e SEM jobs (não 'nenhum job rodando'); o total fica"
   rec "$T/o.jsonl" 4 'r["lc_ok"] is False and r["jobs"] == {}' "launchctl ausente: lc_ok false"
-  rec "$T/o.jsonl" 5 '"com.test.gone" not in r["jobs"] and "com.test.jobA" in r["jobs"]' "job que sumiu entre o launchctl e o ps não vira 0 MB nem derruba os outros"
+  rec "$T/o.jsonl" 5 '"com.test.gone" not in r["jobs"] and "com.test.jobA" in r["jobs"]' "job que o launchctl lista e o ps (lido antes) ainda não tinha não vira 0 MB nem derruba os outros"
   rec "$T/o.jsonl" 6 'r["swap_used_mb"] is None and r["free_pct"] is None and r["disk_free_mb"] is None and r["jobs"]' "swap, % livre e disco não lidos ('- - -'): null (NÃO 0), e o resto da amostra segue"
   rec "$T/o.jsonl" 0 'r["disk_free_mb"] == 7000' "disco livre lido (3º campo do arquivo de memória)"
   rec "$T/o.jsonl" 2 'r["disk_free_mb"] is None and r["swap_used_mb"] == 512.5' "arquivo de memória no formato antigo (2 campos): disco null, o resto lido"
@@ -108,11 +117,28 @@ run_all() {
   grep -q '04:01:10  1100 -> 1500 MB (+400, em 5 s)  nos 60 s antes: com.test.spe +900 MB (novo) \[build_spe\]; com.test.other +400 MB (novo) \[other_proc\]$' "$T/s"; ok $? "salto de swap: quem cresceu nos 60 s antes, do que mais para o que menos, 'novo' quando não existia"
   ! grep -q 'com.test.small +' "$T/s"; ok $? "quem cresceu menos que 50 MB não entra na lista de suspeitos"
   grep -q '^\* livre: 4000..8000 MB (0 amostras sem leitura)' "$T/s" && grep -q '^\* quedas >= 300 MB entre amostras seguidas: 3' "$T/s"; ok $? "disco: faixa e 3 quedas"
-  grep -q '04:00:50  8000 -> 6800 MB (-1200, em 5 s)  jobs da janela rodando (maiores): com.test.spe (300 MB)$' "$T/s"; ok $? "queda de disco com o job da janela que estava rodando (o daemon persistente não entra)"
-  grep -q '04:03:20  6800 -> 5000 MB (-1800, em 5 s)  jobs da janela rodando (maiores): nenhum job da janela rodando$' "$T/s"; ok $? "queda de disco sem job da janela rodando diz isso"
-  grep -q '04:05:50  5000 -> 4000 MB (-1000, em 5 s)  jobs da janela rodando (maiores): sem atribuição' "$T/s"; ok $? "queda de disco numa amostra sem launchctl: 'sem atribuição', não 'nenhum job rodando'"
+  grep -q '04:00:50  8000 -> 6800 MB (-1200, em 5 s)  jobs da janela rodando (maiores por RSS; presença, NÃO escrita em disco medida): com.test.spe (300 MB)$' "$T/s"; ok $? "queda de disco com o job da janela que estava rodando (o daemon persistente não entra)"
+  grep -q '04:03:20  6800 -> 5000 MB (-1800, em 5 s)  jobs da janela rodando (maiores por RSS; presença, NÃO escrita em disco medida): nenhum job da janela rodando$' "$T/s"; ok $? "queda de disco sem job da janela rodando diz isso"
+  grep -q '04:05:50  5000 -> 4000 MB (-1000, em 5 s)  jobs da janela rodando (maiores por RSS; presença, NÃO escrita em disco medida): sem atribuição' "$T/s"; ok $? "queda de disco numa amostra sem launchctl: 'sem atribuição', não 'nenhum job rodando'"
   grep -q '04:06:00  1500 -> 2000 MB (+500, em 5 s)  nos 60 s antes: sem atribuição' "$T/s"; ok $? "salto com amostra sem launchctl na janela de 60 s: 'sem atribuição', não 'ninguém cresceu'"
   jrp --summary "$T/night-a.jsonl" "$T/night-b.jsonl" > "$T/s2" 2>/dev/null; grep -q '^| com.test.spe | 900 | 04:01:10 | build_spe |' "$T/s2" && grep -q 'swap usado: 1000..2000 MB' "$T/s2"; ok $? "dois arquivos entram juntos, ordenados por hora"
+  # buracos: a noite 1 acaba em 04:00:45 e a noite 2 começa 22,5 h depois (80955 s)
+  jrp --summary "$T/gap-a.jsonl" "$T/gap-b.jsonl" > "$T/g" 2>"$T/e"; RC=$?
+  [ "$RC" = 0 ] && grep -q '^AVISO: 1 buraco(s) entre amostras seguidas (passo > 15 s), somando 22 h 29 min; o maior: 22 h 29 min, de 01/01 04:00:45 a 02/01 02:30:00\.' "$T/g"; ok $? "duas noites a 22,5 h: o buraco é contado e dito, com o tamanho e as datas (rc=$RC)"
+  grep -q '^\* saltos de swap >= 200 MB entre amostras seguidas: 0 (+ 1 par(es) de leituras a mais de 15 s um do outro, NÃO avaliados; variação >= 200 MB em 1: sei que mudou, não quando)$' "$T/g"; ok $? "swap 1000 -> 1300 ENTRE as noites não é um salto: 0 saltos, e o par não avaliado é contado (não some)"
+  grep -q '^\* quedas >= 300 MB entre amostras seguidas: 0 (+ 1 par(es) de leituras a mais de 15 s um do outro, NÃO avaliados; variação >= 300 MB em 1: sei que mudou, não quando)$' "$T/g"; ok $? "disco 8000 -> 6000 ENTRE as noites não é uma queda: 0 quedas, par não avaliado contado"
+  ! grep -q '^  - ' "$T/g"; ok $? "nenhum evento inventado nem culpado nomeado ('innocent' não aparece como causa de salto algum)"
+  grep -q '^| com.test.innocent | 200 | 02/01 02:30:00 | innocent_proc | 02/01 02:30:00\.\.02/01 02:30:45 | 10 |$' "$T/g" && grep -q '^# job-ram-probe: 20 amostras com atribuição de 20 (01/01 04:00:00-02/01 02:30:45)' "$T/g"; ok $? "arquivo de mais de um dia: os horários levam a data (cabeçalho, 'às' e 'visto')"
+  jrp --summary "$T/gap-a.jsonl" "$T/gap-b.jsonl" --max-gap 100000 > "$T/g2" 2>/dev/null; grep -q '^\* saltos de swap >= 200 MB entre amostras seguidas: 1$' "$T/g2" && grep -q '+300, em 80955 s' "$T/g2" && ! grep -q '^AVISO: [0-9]* buraco' "$T/g2"; ok $? "--max-gap grande o bastante: o par vira evento e não há aviso de buraco (a opção manda)"
+  jrp --summary "$T/hole.jsonl" > "$T/h" 2>/dev/null; grep -q '^AVISO: 1 buraco(s) entre amostras seguidas (passo > 15 s), somando 50 s; o maior: 50 s, de 04:01:35 a 04:02:25\.' "$T/h" && grep -q '^\* saltos de swap >= 200 MB entre amostras seguidas: 1 (+ 1 par(es) de leituras a mais de 15 s um do outro, NÃO avaliados; variação >= 200 MB em 0:' "$T/h"; ok $? "buraco de 50 s: dito; o salto entre amostras vizinhas continua sendo salto, e o par que cruza o buraco é contado (sem variação)"
+  grep -q '^  - 04:02:30  1000 -> 1500 MB (+500, em 5 s)  nos 60 s antes: sem atribuição (sem amostra de base 60 s antes, buraco na janela' "$T/h" && ! grep -q 'com.test.grower +' "$T/h"; ok $? "base de 60 s antes cruza o buraco: 'sem atribuição', não o 'grower' que só existe depois dele"
+  jrp --summary "$T/night.jsonl" "$T/night.jsonl" > "$T/d" 2>/dev/null; ! grep -q '^AVISO: [0-9]* buraco' "$T/d" && grep -q 'passo mediano 5 s' "$T/d" && grep -q 'saltos de swap >= 200 MB entre amostras seguidas: 2$' "$T/d"; ok $? "o mesmo arquivo duas vezes (passos de 0 s) não zera o limite: sem buracos, passo mediano 5 s, os mesmos 2 saltos"
+  # a tabela de jobs e o corte --top
+  ! grep -q 'mostrando' "$T/s"; ok $? "tabela inteira (3 jobs <= 40): nenhum aviso de corte"
+  jrp --summary "$T/night.jsonl" --top 2 > "$T/t" 2>/dev/null; grep -q '^(mostrando 2 de 3 labels, os de maior pico; o menor mostrado tem 400 MB\. Label que não está aqui NÃO é label que não apareceu' "$T/t" && ! grep -q '^| com.test.small |' "$T/t"; ok $? "--top 2: a tabela corta e DIZ 'mostrando 2 de 3' (label ausente não é label que não apareceu)"
+  jrp --summary "$T/night.jsonl" --top 0 > "$T/t0" 2>/dev/null; grep -q '^| com.test.small |' "$T/t0" && ! grep -q 'mostrando' "$T/t0"; ok $? "--top 0 mostra todos os jobs, sem aviso de corte"
+  jrp --summary "$T/night.jsonl" --max-gap 0 >/dev/null 2>"$T/e"; RC=$?; [ "$RC" = 2 ]; ok $? "--max-gap 0: exit 2 (rc=$RC)"
+  jrp --summary "$T/night.jsonl" --top -1 >/dev/null 2>"$T/e"; RC=$?; [ "$RC" = 2 ]; ok $? "--top -1: exit 2 (rc=$RC)"
   # os três estados do resumo
   : > "$T/vazio.jsonl"; jrp --summary "$T/vazio.jsonl" >"$T/o" 2>"$T/e"; RC=$?; [ "$RC" = 3 ] && [ ! -s "$T/o" ] && ! grep -q Traceback "$T/e"; ok $? "arquivo vazio: exit 3 sem relatório (não sei ≠ nada rodou) (rc=$RC)"
   printf 'lixo\n{"a":1}\n[1]\n' > "$T/lixo.jsonl"; jrp --summary "$T/lixo.jsonl" >"$T/o" 2>"$T/e"; RC=$?; [ "$RC" = 3 ] && grep -q '3 linhas ilegíveis' "$T/e"; ok $? "só linhas que não são amostra: exit 3 e diz quantas (rc=$RC)"
@@ -169,6 +195,18 @@ EOF
   jrp --ticks 1 --interval 0.5 --out "$T/x.jsonl" >/dev/null 2>&1; RC=$?; [ "$RC" = 2 ]; ok $? "--interval abaixo de 1 s: exit 2 (rc=$RC)"
   jrp --ticks 1 --start 25:00 --out "$T/x.jsonl" >/dev/null 2>&1; RC=$?; [ "$RC" = 2 ]; ok $? "hora inválida: exit 2 (rc=$RC)"
   jrp --ticks 1 --check-every 0 --out "$T/x.jsonl" >/dev/null 2>&1; RC=$?; [ "$RC" = 2 ]; ok $? "--check-every 0: exit 2 (rc=$RC)"
+  jrp --ticks 0 --out "$T/x0.jsonl" >/dev/null 2>"$T/e"; RC=$?; [ "$RC" = 2 ] && [ ! -e "$T/x0.jsonl" ]; ok $? "--ticks 0: exit 2 e NENHUM arquivo criado (antes saía 0 em silêncio com o arquivo vazio) (rc=$RC)"
+  jrp --duration 0 --out "$T/x1.jsonl" >/dev/null 2>&1; RC=$?; [ "$RC" = 2 ] && [ ! -e "$T/x1.jsonl" ]; ok $? "--duration 0: exit 2 e nenhum arquivo (rc=$RC)"
+  jrp --duration 5 --until 05:00 --out "$T/x2.jsonl" >/dev/null 2>&1; RC=$?; [ "$RC" = 2 ] && [ ! -e "$T/x2.jsonl" ]; ok $? "--duration junto de --until: exit 2 (antes um calava o outro) (rc=$RC)"
+  python3 -I - "$P" "$FX" "$T/nada.jsonl" "$T/nada.err" <<'EOF'
+import argparse, contextlib, importlib.util, sys
+spec = importlib.util.spec_from_file_location("jrp", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+a = argparse.Namespace(out=sys.argv[3], min_free_gb=1.0, start=None, until=None, duration=0.0, ticks=None, interval=1.0, max_mb=40.0, check_every=12, fixture_dir=sys.argv[2])
+with open(sys.argv[4], "w") as err, contextlib.redirect_stderr(err):
+    rc = m.record(a)
+sys.exit(0 if (rc, open(sys.argv[3]).read()) == (3, "") and "nenhuma amostra gravada" in open(sys.argv[4]).read() else 1)
+EOF
+  ok $? "janela que acaba antes da 1ª amostra: exit 3 e a mensagem, não 0 com o arquivo vazio"
   # --- caminho ao vivo com sysctl que falha e memory_pressure lento (ps e launchctl são os de verdade): só ele cobre a leitura real de swap e o custo medido ---
   mkdir -p "$T/stubbin"; printf '#!/bin/sh\nexit 1\n' > "$T/stubbin/sysctl"; printf '#!/bin/sh\nsleep 0.4\n' > "$T/stubbin/memory_pressure"; chmod +x "$T/stubbin/sysctl" "$T/stubbin/memory_pressure"
   PATH="$T/stubbin:$PATH" jrp --ticks 1 --interval 1 --out "$T/stub.jsonl" >/dev/null 2>&1
@@ -199,7 +237,7 @@ echo "== $((n-fails))/$n ok =="
   }
   mutant "launchctl sem job nenhum vira 'nenhum job rodando'" 's/    return pids if rows else None/    return pids/'
   mutant "ps vazio vira ps_ok true" 's/    ps_ok = bool(tbl) .*$/    ps_ok = True/'
-  mutant "job que sumiu entre o launchctl e o ps vira 0 MB" 's/        if root not in tbl: .*$/        if False:/'
+  mutant "job que o launchctl lista e o ps (lido antes) ainda não tem vira 0 MB" 's/        if root not in tbl: .*$/        if False:/'
   mutant "ciclo na árvore não termina" 's/            if pid in seen or pid not in tbl: .*$/            if pid not in tbl:/'
   mutant "launchctl com byte não-UTF-8 vira traceback" 's/    except (OSError, ValueError, subprocess.SubprocessError):/    except (OSError, subprocess.SubprocessError):/'
   mutant "linha ilegível some sem ser contada" 's/                    bad += 1 .*$/                    pass/'
@@ -217,6 +255,13 @@ echo "== $((n-fails))/$n ok =="
   mutant "queda de disco numa amostra sem launchctl vira 'nenhum job rodando'" 's/ if not (b.get("ps_ok") and b.get("lc_ok")) else (/ if False else (/'
   mutant "swap não lido vira 0" 's/swap, free, disk = lib.swap_usage()\[0\], /swap, free, disk = lib.swap_usage()[0] or 0, /'
   mutant "custo da amostra não é gravado" 's/    rec\["dt_ms"\] = int((time.time() - t0) \* 1000)/    rec["dt_ms"] = 0/'
+  mutant "par separado por um buraco vira salto de swap / queda de disco" 's/        if b\["ts"\] - a\["ts"\] > limit:  # \[guard:gap-moves\]/        if False:/'
+  mutant "base de 60 s antes velha (buraco na janela) vira atribuição" 's/    if any(y\["ts"\] - x\["ts"\] > limit for x, y in zip(win, win\[1:\])): .*$/    if False:/'
+  mutant "buraco não é contado nem dito" 's/^    if holes:$/    if False:/'
+  mutant "passo de 0 s (arquivo repetido) entra na mediana e zera o limite" 's/ for a, b in zip(recs, recs\[1:\]) if b\["ts"\] > a\["ts"\]\]/ for a, b in zip(recs, recs[1:])]/'
+  mutant "tabela cortada em --top sem dizer" 's/^    if len(shown) < len(rows):  # \[guard:top\]/    if False:/'
+  mutant "--ticks 0 / --duration 0 / --duration com --until passam" 's/^            or (a.ticks is not None and a.ticks < 1) or (a.duration is not None and (a.duration <= 0 or a.until is not None))):/            ):/'
+  mutant "janela sem nenhuma amostra sai com 0" 's/^    if n == 0:  # a janela acabou .*$/    if False:/'
   echo "== mutantes: $((n-fails))/$n ok no total =="
 }
 [ "$fails" = 0 ]
