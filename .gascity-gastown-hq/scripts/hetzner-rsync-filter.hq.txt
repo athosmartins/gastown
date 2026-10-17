@@ -1,14 +1,14 @@
 # hetzner-rsync-filter.hq.txt — o QUE sai do hq (/Users/athos/gt/.gascity-gastown-hq, ou o .gascity-gastown-hq/ de um worktree) para o nó Linux de testes: código e doc das pastas de código, por extensão. (ga-kz76o7)
 #
 # Contents
-#   Como é lido · O que garante · Seção 1 (nega sempre) · Seção 2 (âncora + pastas da raiz) · Seção 3 (extensões de código/doc/config)
+#   Como é lido · O que garante · Seção 1 (nega sempre) · Seção 2 (âncora + pastas da raiz) · Seção 3 (extensões de código/doc/config) · Seção 4 (executáveis sem extensão, por caminho exato)
 #
 # COMO É LIDO: igual ao hetzner-rsync-filter.wa.txt — o mbp-run.sh passa `--filter=". <este arquivo>"` ao rsync, com --delete --delete-excluded; vale a PRIMEIRA regra que casa, de cima para baixo;
 #   o filter_sane confere a FORMA (as 12 âncoras de segredo/dado ANTES de `+ /tests/***`, nenhum `+` antes dela, nada que inclua tudo, `- *` no fim). O hq não tem tests/: `+ /tests/***` aqui é só a
 #   âncora que a conferência exige. Arquivo ausente/ilegível/fora da forma = o nó NÃO é usado (o hq então roda local: o MBP não tem o hq).
 # O QUE GARANTE (por NOME e PASTA): (1) nenhuma pasta de DADO do hq sai: .beads (Dolt), .gc (runtime: logs, agentes, jsonl-archive com TODAS as beads, memórias), .dolt-backup, backup, .gc-worktrees,
 #   .codex, .gemini, .playwright-mcp, logs, docs/research; (2) da raiz só saem as pastas de CÓDIGO listadas (scripts packs docs agents formulas orders commands skills config) + CLAUDE.md e pack.toml
-#   — whatsapp_automation/, gascity/, crew/, deacon/, embeddeddolt/, city.toml e o resto da raiz ficam; (3) dentro delas só extensões de código/doc/config; (4) nome de segredo ou formato de dado
+#   — whatsapp_automation/, gascity/, crew/, deacon/, embeddeddolt/, city.toml e o resto da raiz ficam; (3) dentro delas só extensões de código/doc/config, mais os executáveis SEM extensão da Seção 4, um por um, por caminho exato; (4) nome de segredo ou formato de dado
 #   (Seção 1) não sai nem lá dentro; (5) dumps e relatórios de medição ficam (docs/reports, *-pre.txt, *.out.txt, *.jsonl, *.log, harness/).
 # O QUE NÃO GARANTE: o filtro nunca lê CONTEÚDO. Quem olha é o node_guard do mbp-run.sh (hetzner-pii-scan.py): arquivo com lista de telefones/CPFs fica no mini mesmo com nome e pasta liberados.
 # MEDIDO 16/10: hq rastreado = 453 selftests (178 mil linhas) + código em scripts/ (16 MB) e packs/ (20 MB); o espelho git do nó (hetzner-mirror) já nega 59 caminhos por sparse — este é o equivalente
@@ -135,4 +135,12 @@
 + *.cfg
 + *.conf
 + *.template
+# SEÇÃO 4 — executável SEM extensão que o selftest chama (ga-q9vyyn): a Seção 3 só deixa passar extensão, então `scripts/gc-session-ssh` ficava no mini e a bateria dele reprovava no nó com rc 127
+#   ('No such file or directory') em 143 de 182 casos — falso FAIL, o código estava certo. Entra por CAMINHO exato e ancorado (o mesmo nome em outra pasta continua de fora), NUNCA `+ /scripts/*`
+#   (o filter_sane recusa `+` de nome-curinga sem ponto). Arquivo rastreado novo sem extensão: ponha a linha aqui (ou dispense-o no mbp-run.selftest.sh, com o motivo) — o selftest lê `git ls-files` e reprova se ele ficar de fora.
++ /scripts/gc-session-ssh
++ /scripts/recall
++ /scripts/pytest-shim/bin/pytest
++ /scripts/pytest-shim/bin/python
++ /scripts/pytest-shim/bin/python3
 - *

@@ -58,6 +58,9 @@
 #                 filtro próprio (hetzner-rsync-filter.hq.txt: só código/doc das pastas do hq; .beads .gc .dolt-backup backup nunca saem), lista mac-only própria
 #                 (hetzner-mac-only.hq.txt + $CITY/.gc/hetzner-mac-only.hq.learned) e a mesma sombra. Alvo que não é *.selftest.sh relativo ao worktree = 97, nada
 #                 roda. Base do nó: `--host linux --seed hq`. O hq NÃO vai ao MBP (97 = quem chamou roda local). ps no nó: ainda não (cai no MBP).
+#                 AMBIENTE (ga-q9vyyn): selftest que reprova com "No such file or directory" num caminho DENTRO do espelho que EXISTE no worktree (o filtro não o levou: executável sem
+#                 extensão, por ex.) devolve 97 + "AMBIENTE: …", não o rc da bateria; o log leva rc 97 e a recusa `ambiente-espelho`, e a sombra não aprende nada. Executável sem extensão
+#                 entra no filtro do hq por caminho exato (Seção 4 de hetzner-rsync-filter.hq.txt; o filter_sane recusa `+` de nome-curinga sem ponto). Só vale para o hq (selftest).
 #
 # PRESENÇA DO ATHOS (ga-77c1qg; decisão dele em 12/10: o MBP é o notebook de trabalho dele, o mini é o servidor)
 #   O preflight lê, NO MBP e na mesma chamada ssh, se o Athos está lá (scripts/mbp-presence.sh: tela bloqueada, ou sem teclado/mouse
@@ -588,7 +591,9 @@ trap 'exit 130' INT TERM HUP
 # de verdade, no selftest e no prod test): (1) abre e não é vazio, (2) `+ /tests/***` existe, (3) as 12 regras-âncora de cada classe (.env, .netrc, client_secret, dotfile de
 # token, token/secret com extensão de dado, .pickle, *.duckdb/.db/.csv/.parquet/.gz) vêm ANTES dela — o rsync usa a primeira regra que casa, e quem inclui tests/ primeiro deixa passar
 # um *.duckdb plantado lá dentro —, (4) nenhum `+` antes dela e nenhum `+` que inclua tudo (`+ *`, `+ **`, `+ /*`, `+ /**`, `+ **/**`...) em lugar nenhum, só regras `- x`/`+ x` (um `!`, que
-# zera a lista, ou um `.`/`:`, que traz outro arquivo, não passam), (5) a ÚLTIMA regra é `- *` (sem ela, nome desconhecido sai). rc 0 = vale · 1 = não.
+# zera a lista, ou um `.`/`:`, que traz outro arquivo, não passam), (5) a ÚLTIMA regra é `- *` (sem ela, nome desconhecido sai), (6) nenhum `+` cujo NOME (o último pedaço do caminho)
+# seja curinga e não tenha ponto (`+ /scripts/*`, `+ /scripts/**`, `+ /scripts/rec*`): isso abre a pasta para todo nome sem extensão (ga-q9vyyn). Extensão (`+ *.py`, `+ /lib/**.json`), pasta (`+ */`) e
+# caminho exato (`+ /scripts/recall`) passam. rc 0 = vale · 1 = não.
 filter_sane() {
   [ -f "$NODE_FILTER" ] && [ -r "$NODE_FILTER" ] && [ -s "$NODE_FILTER" ] || return 1
   awk '
@@ -599,6 +604,7 @@ filter_sane() {
     line !~ /^[-+] / { bad = 1 }
     line ~ /^\+ [*\/]+$/ && line != "+ */" { bad = 1 }
     line == "+ /tests/***" { if (!tests) tests = NR; next }
+    line ~ /^\+ / { nm = line; sub(/^\+ /, "", nm); sub(/.*\//, "", nm); if ((index(nm, "*") || index(nm, "?") || index(nm, "[")) && !index(nm, ".")) bad = 1 }
     !tests && line ~ /^\+/ { bad = 1 }
     !tests && (line in want) { seen[line] = 1 }
     END { n = 0; for (k in seen) n++; exit !(tests && !bad && n == nwant && last == "- *") }' "$NODE_FILTER"
@@ -623,6 +629,25 @@ mac_only_match() {
     done
   done
   return 1
+}
+# mirror_gap <saída do nó> <espelho relativo ao home do nó, ex. gt-remote/mirror/hq-1> <worktree>: o selftest pediu ao espelho um arquivo que o espelho não tem. Procura "No such file or directory" com caminho
+# DENTRO do espelho e imprime, um por linha, os que EXISTEM no worktree: o worktree tem e o espelho não, então o filtro (ou o node_guard) não o levou — AMBIENTE, e o rc da bateria não diz nada do código
+# (gc-session-ssh: 143 de 182 casos com rc 127 no nó, verde no mini; ga-q9vyyn). Caminho que também falta no worktree é o teste exercitando o erro, ou um defeito de verdade: fica como veredito.
+# rc 0 = há arquivo faltando (impresso) · 1 = nenhum · 2 = a saída não abriu, ou a extração dos caminhos falhou (não dá para saber: quem chama NÃO reclassifica o rc, só avisa).
+mirror_gap() {
+  local out="$1" mir="$2" wt="$3" lines grc rels rel miss=""
+  [ -f "$out" ] && [ -r "$out" ] || return 2
+  lines=$(grep -F 'No such file or directory' "$out" 2>/dev/null); grc=$?
+  case $grc in 0) ;; 1) return 1 ;; *) return 2 ;; esac   # 1 = a saída abriu e não tem a frase (vazio); outro = o grep não leu (ilegível)
+  # vazio → nenhum caminho do espelho na saída (rels vazio, rc 1 abaixo); falhou → sed/sort deram erro (pipefail): "não sei" (rc 2), nunca o mesmo "nenhum" em silêncio
+  rels=$(printf '%s\n' "$lines" | sed -n "s#.*$mir/\([^[:space:]'\":,()]*\).*#\1#p" | sort -u) || return 2
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    case "$rel" in *..*) continue ;; esac   # nunca segue ".." para fora do worktree
+    if [ -e "$wt/$rel" ]; then miss="$miss$rel"$'\n'; fi   # -e segue symlink: symlink cujo alvo existe no worktree conta; symlink pendente (alvo ausente também aqui) não conta
+  done <<<"$rels"
+  [ -n "$miss" ] || return 1
+  printf '%s' "$miss"
 }
 fmtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }   # mtime em segundos; ilegível → vazio
 # janela da sombra: HETZNER_SHADOW_WINDOW_S depois da hora da bandeira. Hora ilegível = janela ABERTA (o lado que protege o veredito; custa só carga a mais)
@@ -1037,7 +1062,7 @@ attempt_pytest() {
   return $rc
 }
 _attempt_pytest() {
-  local base rv M m mrc rrc xn cpcmd pathline JOBDEF rc SECS
+  local base rv M m mrc rrc xn cpcmd pathline JOBDEF rc SECS gap grc
   local orig=("$@")
   preflight || { rc=$?; log_refusal; return $rc; }
   if [ "$HOSTKIND" = linux ]; then node_guard || { say "não consegui varrer o conteúdo do que iria ao $HNAME (lista do rsync ou hetzner-pii-scan.py falhou) — o nó NÃO é usado, rode local"; fall varredura-falhou 98; return 98; }; fi
@@ -1112,6 +1137,18 @@ EOF
     say "ssh caiu durante a execução — rode local"; log_run "$repo" "$KIND" "$SLOT" 255 "$SECS" "${orig[@]}"; shadow_abort; return 98
   fi
   if [ $RC -eq 124 ]; then say "timeout de ${RUN_TIMEOUT}s"; fi
+  # AMBIENTE, não veredito (ga-q9vyyn): selftest do hq que reprova porque o espelho do nó não tem um arquivo que o worktree tem. O hq não existe no MBP, então a saída é 97 ("rode local", dos códigos 96..99),
+  # nunca o rc da bateria; o log leva o 97 e o motivo `ambiente-espelho`. Só reclassifica rc de teste (1..123, 125..127): 0 passou, 124 é tempo e >=128 é sinal, que já não são veredito. Saída que não abre, ou cuja extração falha, NÃO reclassifica (avisa e deixa o rc).
+  if [ "$KIND" = selftest ] && [ $RC -ne 0 ] && [ $RC -ne 124 ] && [ $RC -lt 128 ]; then
+    gap=$(mirror_gap "$TMPOUT" "$M" "$dir"); grc=$?
+    case $grc in
+      0) say "AMBIENTE: o espelho do $HNAME não tem $(printf '%s' "$gap" | grep -c .) arquivo(s) que existem no worktree ($(printf '%s' "$gap" | head -3 | tr '\n' ' ')) — o filtro ($NODE_FILTER) não os levou; o rc=$RC desta bateria NÃO é veredito do código — rode local"
+         log_run "$repo" "$KIND" "$SLOT" 97 "$SECS" "${orig[@]}"; fall ambiente-espelho 97
+         shadow_finish 97 "$TMPOUT" "${orig[@]}"; return 97 ;;
+      1) ;;
+      *) say "AVISO: não consegui conferir a saída do nó (não abriu, ou a extração dos caminhos falhou) para ver se faltou arquivo no espelho — o rc=$RC fica como veredito" ;;
+    esac
+  fi
   log_run "$repo" "$KIND" "$SLOT" "$RC" "$SECS" "${orig[@]}"
   say "rodou em $HOSTLOG ($HNAME) slot=$SLOT secs=$SECS rc=$RC"
   shadow_finish "$RC" "$TMPOUT" "${orig[@]}"
