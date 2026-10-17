@@ -26,6 +26,12 @@
 # (the gate, never the builder's text mode), the MBP offload flag is on, the wrapper is executable and .gc/gate-pytest.off is absent —
 # so with the switch off the task is byte-identical to before. It only tests files; no bd, no gc, no network.
 #
+# A FOURTH optional piece (ga-075h15): gate_hq_selftest_rules <gc_city> prints the HQ SELFTESTS paragraph that sends the heavy
+# scripts/*.selftest.sh batteries of the HQ tree to the Linux test server through scripts/mbp-run.sh --repo hq. Same contract as the
+# TEST WRAPPER: nothing unless gc_city is given (the gate, never the builder text mode), the node flag is on, the script is executable
+# and .gc/gate-hq-selftest.off is absent, so with the switch off the task is byte-identical to before. It is appended right after the
+# TEST WRAPPER paragraph and, like it, the task-rapida body does not carry it.
+#
 # ONE optional switch picks the judging text (ga-dzzqvw): ${GATE_REVIEW_PROMPT_MODE:-}. "task-rapida" renders the short body of the fast
 # lane for a small task; empty, unset or any other value renders the full body below, byte for byte as before. Only the gate sets it
 # (from the task-rapida lane decision); the builder pre-gate run never does. The short body does not carry the TEST WRAPPER paragraph: it
@@ -216,11 +222,41 @@ moment. Its last line reads gate-pytest: ran=mbp rc=0 secs=11 ...
 WRAP
 }
 
+# gate_hq_selftest_rules <gc_city> — the HQ SELFTESTS paragraph, or nothing (ga-075h15).
+# Empty city, the Linux test server flag (.gc/hetzner-node.on) absent, scripts/mbp-run.sh missing or not executable, or the
+# .gc/gate-hq-selftest.off switch present all print nothing. The node flag is the only leg that matters here: the hq repo has no MacBook
+# leg (mbp-run.sh answers 97 when the node cannot run it), so without the node there is nothing to offload to. The node flag that cannot be
+# read counts as off, the inert answer, so the reviewer is told exactly what it was told before this existed. The reverse holds for the
+# .gc/gate-hq-selftest.off kill switch: one that cannot be read counts as absent and the paragraph prints. That is harmless on purpose, the
+# paragraph only advises and mbp-run.sh itself answers 97 whenever the node cannot run the battery.
+# The list of batteries that must stay on this machine lives in scripts/hetzner-mac-only.hq.txt and is read by mbp-run.sh, never copied here.
+gate_hq_selftest_rules() {
+  local _city="${1:-}"
+  [ -n "$_city" ] || return 0
+  [ -f "$_city/.gc/hetzner-node.on" ] || return 0
+  [ -f "$_city/.gc/gate-hq-selftest.off" ] && return 0
+  [ -x "$_city/scripts/mbp-run.sh" ] || return 0
+  cat <<HQST
+
+HQ SELFTESTS (heavy factory batteries): when the diff is in the HQ tree (.gascity-gastown-hq) and you run a scripts/*.selftest.sh battery
+that takes more than about 60 s on this loaded machine, run it on the Linux test server instead:
+  "$_city/scripts/mbp-run.sh" --repo hq --dir <your-worktree>/.gascity-gastown-hq -- scripts/X.selftest.sh
+One battery per call, the path relative to that directory and without .. in it. Exit 96 to 99 means the server did not run it (switched off,
+unhealthy, no free slot, a battery that must stay on this machine, or the server base is not seeded): that is NOT a failure, run the same
+battery here with bash. Exit 0 to 95 is the battery own exit code. When it is not 0, run the same battery here before you call it a defect:
+the server receives only code, docs and config (never .beads, .gc, Dolt data or backups), so a battery that needs them fails there for a
+reason that is not this diff. The wrapper decides which batteries stay on this machine (it answers 97), so do not guess. The round trip adds
+about a minute (copy and scan; measured 55 to 78 s at load 70), so a battery under about 60 s runs here. Run it the way you run any long
+test (background, poll the log).
+HQST
+}
+
 # _gate_review_task_body — the judging text. Reads the caller-declared locals of gate_render_review_task
 # (dynamic scope), named exactly as the dispatcher always named them so this text is the original heredoc.
 _gate_review_task_body() {
-  local _GATE_TW=""
+  local _GATE_TW="" _GATE_HQ=""
   _GATE_TW=$(gate_test_wrapper_rules "${GC_CITY:-}")
+  _GATE_HQ=$(gate_hq_selftest_rules "${GC_CITY:-}")
   cat <<TASK
 QUALITY GATE REVIEW — You are reviewer $i of $REQUIRED_REVIEWERS for branch: $BRANCH
 Author (EXCLUDED from reviewing): $AUTHOR
@@ -305,7 +341,7 @@ it to hit: a run killed by your own cap while it was passing is a run paid for n
 anything longer in the background (run_in_background or nohup) and poll it; do not restart a
 run your own cap killed, and do not run the whole tests/ directory. A test that is already
 red on the reviewed base for the SAME test id is pre-existing: report it as non-blocking; a
-failing test blocks only when this diff made it fail.${_GATE_TW}
+failing test blocks only when this diff made it fail.${_GATE_TW}${_GATE_HQ}
 TASK
 }
 

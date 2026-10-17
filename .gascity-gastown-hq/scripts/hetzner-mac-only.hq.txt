@@ -219,3 +219,8 @@ scripts/transcript-reaper.selftest.sh
 scripts/wait-for-dolt.selftest.sh
 scripts/wisp-reaper.selftest.sh
 scripts/worktree-reaper.selftest.sh
+# --- acrescentadas em 17/10 (ga-075h15), medidas ao mandar as baterias afetadas pelo nó: reprovam lá por AMBIENTE e passam no mini (rc 0). O nó não tem city.toml nem o binário `gc` (fora do filtro). ---
+#     e12-builder-coverage: "FATAL: generator/arms/fragment/city.toml not found" · pool-preamble-build: "FATAL: city.toml não encontrado" · template-fragment-lint-guard: roda `gc lint`.
+packs/town-deltas/assets/e12-builder-coverage.selftest.sh
+packs/town-deltas/assets/pool-preamble-build.selftest.sh
+packs/town-deltas/assets/template-fragment-lint-guard.selftest.sh

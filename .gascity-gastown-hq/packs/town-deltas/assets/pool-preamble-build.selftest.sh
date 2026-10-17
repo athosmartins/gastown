@@ -351,6 +351,15 @@ old='{{ if or (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:mbp
 open(p,"w",encoding="utf-8").write(s.replace(old,'{{ if or (not .TD_ROLE) (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:mbp-offload-tests */ -}}',1))
 EOF
 expect_fail "linha do mbp-run.sh vaza para agente sem TD_ROLE (Mayor/crews) — a guarda do fragment diverge do manifesto" "diverge do manifesto"
+reset_tree; python3 - "$T/packs/town-deltas/template-fragments/town-deltas.template.md" <<'EOF'
+import sys
+p=sys.argv[1]; s=open(p,encoding="utf-8").read()
+# ga-075h15: o parágrafo do hq no nó é só dos 3 construtores de pool (dog, wa-worker, ps-worker); Mayor/crews (sem TD_ROLE) ficam byte-idênticos.
+# Alarga a guarda no fragment pra incluir agente SEM TD_ROLE — o manifesto continua dizendo show_unset=false. Asserta que mutou.
+old='{{ if or (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:hq-selftest-node */ -}}'; assert old in s, "mutação não aplicou: formato da guarda mudou"
+open(p,"w",encoding="utf-8").write(s.replace(old,'{{ if or (not .TD_ROLE) (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:hq-selftest-node */ -}}',1))
+EOF
+expect_fail "parágrafo do hq no nó vaza para agente sem TD_ROLE (Mayor/crews) — a guarda do fragment diverge do manifesto" "diverge do manifesto"
 reset_tree; sed -i.bak 's/Verifique o ARTEFATO, nunca o relato/Verifique o resultado/' "$T/packs/town-deltas/template-fragments/town-deltas.template.md"
 expect_fail "núcleo perde 'verificação de artefato'" "NÚCLEO: sentinela 'verificacao-de-artefato'"
 reset_tree; python3 - "$T/packs/town-deltas/template-fragments/town-deltas.template.md" <<'EOF'
@@ -653,7 +662,9 @@ def render(root, name):
 
 make_city(work / "real", real_packs=True, with_env=True)
 errs = []
-MBP_NEEDLE = '"$GC_CITY_PATH/scripts/mbp-run.sh"'
+# O needle do pytest é o comando --repo wa da seção mbp-offload-tests: o mbp-run.sh em si também aparece na seção do hq (ga-075h15), que o dog recebe.
+MBP_NEEDLE = '"$GC_CITY_PATH/scripts/mbp-run.sh" --repo wa -- tests/test_x.py'
+HQ_NEEDLE = '--repo hq --dir <seu-worktree>/.gascity-gastown-hq -- scripts/X.selftest.sh'
 for name, role in cases:
     out = render(work / "real", name)
     # REFERÊNCIA: o MESMO motor renderizando o fragment já sem guardas e sem as seções escondidas deste papel (sem env)
@@ -667,6 +678,9 @@ for name, role in cases:
     # Worker novo LISTA a regra do mbp-run.sh; Mayor/crews (sem TD_ROLE), dog e revisor não a recebem.
     want_mbp = role in ("wa-worker", "ps-worker")
     if (MBP_NEEDLE in out) != want_mbp: errs.append(f"{name}: regra do mbp-run.sh {'AUSENTE (todo worker de pool deve listá-la)' if want_mbp else 'VAZOU (só wa-worker/ps-worker a recebem)'}")
+    # ga-075h15: o parágrafo do hq no nó é dos 3 construtores de pool; Mayor/crews (sem TD_ROLE) e revisor (recebe no texto da tarefa) não o recebem.
+    want_hq = role in ("dog", "wa-worker", "ps-worker")
+    if (HQ_NEEDLE in out) != want_hq: errs.append(f"{name}: parágrafo do hq no nó {'AUSENTE (dog/wa-worker/ps-worker devem listá-lo)' if want_hq else 'VAZOU (só dog/wa-worker/ps-worker o recebem)'}")
     for b in blocks:
         if b["cond"] is None: continue
         should = ppb.receives(m["doctrine"]["guarded"][b["id"]], role)
