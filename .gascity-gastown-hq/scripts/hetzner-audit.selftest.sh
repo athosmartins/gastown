@@ -74,6 +74,7 @@ rcis() { [ "$rc" = "$1" ]; ok $? "  saída $1 (rc=$rc)"; }
 allbut() { local c; for c in "$@"; do [ "$(st "$c")" = LIMPO ] || return 1; done; }
 
 mk; run; is processo LIMPO "servidor limpo: processo"; is credenciais LIMPO "  credenciais"; is backup-de-bead LIMPO "  backup-de-bead"; is github-e-espelho LIMPO "  github-e-espelho"; is dados LIMPO "  dados"
+dets dados "NÃO auditados por dados: .cache .local .duckdb .ssh (topo) e gt-remote/{bin,bundle,bundle-out,git,keys,venv-wa}"
 rcis 0; printf '%s\n' "$out" | grep -q '^AUDITORIA RESULTADO LIMPO (achados=0 nao-consegui=0 limpos=5)'; ok $? "  RESULTADO LIMPO (0/0/5)"
 dets credenciais ".claude/.credentials.json .ssh/mini_shim_ed25519 gt-remote/keys/gt_mirror"
 

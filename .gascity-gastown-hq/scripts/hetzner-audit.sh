@@ -10,8 +10,8 @@
 #                     citava 2), com modo 600 e dono do usuário; qualquer outro arquivo com chave privada ou token (por CONTEÚDO, não por nome) ou loja
 #                     de credencial conhecida (.netrc, .git-credentials, .aws...) é achado.
 #   github-e-espelho  `hetzner-remote-git.sh scan` NO servidor (o que já existia: credencial do GitHub no host + dado negado no espelho git). Não é refeito aqui.
-#   dados             o node_audit da semeadura (mbp-run.sh --host linux --audit-node): NOME · GRANDE · JWT · CONTEÚDO (telefones/CPFs) em todo diretório de topo do home
-#                     e em cada pasta de gt-remote/ que não é ferramenta. Os padrões do find vivem SÓ lá; aqui só se escolhe ONDE olhar. Diretório novo = auditado.
+#   dados             o node_audit da semeadura (mbp-run.sh --host linux --audit-node): NOME · GRANDE · JWT · CONTEÚDO (telefones/CPFs) no topo do home (só os arquivos soltos, maxdepth 1)
+#                     e em cada diretório de topo e filho de gt-remote/ EXCETO os de SKIP_NOTE (a linha LIMPO diz o que ficou de fora). Os padrões do find vivem SÓ lá; aqui só se escolhe ONDE olhar. Diretório novo = auditado.
 #   backup-de-bead    .dolt, .dolt-backup, issues.jsonl, beads*.jsonl, e .beads com algo além de lock.
 #
 # TRÊS ESTADOS: achei / li tudo e não achei / não consegui ler (ssh caiu, comando ausente, pasta ilegível, saída que não reconheço). O último NUNCA vira LIMPO.
@@ -29,6 +29,7 @@ CRED_ALLOW=(".claude/.credentials.json:login do claude" ".ssh/mini_shim_ed25519:
 SKIP_TOP=" .cache .local .duckdb .ssh gt-remote "          # topo do home que NÃO é auditado por pasta: caches de ferramenta (o .duckdb tem verificação própria), .ssh (credenciais) e gt-remote (por filho)
 SKIP_GT=" bin bundle bundle-out git keys venv-wa "         # filhos de gt-remote sem dado: ferramentas, bundle, espelho (scan), chaves (credenciais), venv
 GT_PRUNE="prune=venv:env:.git:__pycache__"
+SKIP_NOTE=".cache .local .duckdb .ssh (topo) e gt-remote/{bin,bundle,bundle-out,git,keys,venv-wa}"   # o que SKIP_TOP/SKIP_GT deixam de fora: a linha LIMPO do dados o repete, para o "limpo" não parecer maior que a cobertura
 n_bad=0; n_cant=0; n_ok=0
 emit() { # estado verificação detalhe
   case "$1" in ACHADO) n_bad=$((n_bad+1)) ;; NAO-CONSEGUI) n_cant=$((n_cant+1)) ;; *) n_ok=$((n_ok+1)) ;; esac
@@ -134,7 +135,7 @@ audit_dados() {
     emit ACHADO dados "$(printf '%s\n' "$found" | grep -c .) achados em: $(printf '%s\n' "$found" | sed 's/: .*//' | sort -u | tr '\n' ' ')"
     printf '%s\n' "$found" | sed 's/^/AUDITORIA DETALHE dados: /'   # um por linha: lista longa não cabe numa só
   elif [ "$states" != "$n_dirs" ] || printf '%s\n' "$N" | grep -q '^AUDIT-NODE NAO-CONSEGUI'; then emit NAO-CONSEGUI dados "node_audit leu $states de $n_dirs pastas (rc=$n_rc)"
-  else emit LIMPO dados "$n_dirs pastas pelo node_audit (topo do home com maxdepth=1 + cada diretório de topo e filho de gt-remote que não é ferramenta)"; fi
+  else emit LIMPO dados "$n_dirs pastas pelo node_audit (topo do home com maxdepth=1 + cada diretório de topo e filho de gt-remote). NÃO auditados por dados: $SKIP_NOTE"; fi
 }
 audit_dados
 
