@@ -1273,6 +1273,8 @@ reset
 
 # ===== --audit-node (ga-2hd02v.1.5.2): o node_audit da semeadura, pasta a pasta, com o veredito de cada uma no stdout (a auditoria RODA de verdade no HOME falso) =====
 echo "--- --audit-node (ga-2hd02v.1.5.2)"
+# o arquivo tem de CARREGAR sob o /bin/bash do sistema (3.2 no macOS): um `case` dentro de $( <<'EOF' ) quebrava o parser dele e o mbp-run.sh INTEIRO deixava de rodar (achado pelo caso "sem uv e sem pip", que usa o PATH mínimo)
+/bin/bash -n "$RUN" 2>"$T/err"; expect "mbp-run.sh carrega sob /bin/bash -n (3.2 no macOS)" 0 "$?"
 AN="$T/home"; mkdir -p "$AN/an-limpa/src" "$AN/an-achada" "$AN/an-venv/venv/lib" "$AN/an-topo/sub"
 echo code > "$AN/an-limpa/src/a.py"; : > "$AN/an-achada/leak.db"; : > "$AN/an-venv/venv/lib/cacert.pem"; echo x > "$AN/an-venv/ok.py"; : > "$AN/an-topo/.env"; : > "$AN/an-topo/sub/x.db"
 an() { "$RUN" --host linux "$@" >"$T/out" 2>"$T/err"; echo $?; }
@@ -1285,12 +1287,12 @@ rc=$(an --audit-node an-venv); expect "audit-node: sem poda o cacert.pem de um v
 rc=$(an --audit-node 'an-venv::prune=venv'); expect "audit-node: prune=venv tira o venv e o resto segue limpo" 0 "$rc"
 rc=$(an --audit-node 'an-topo::maxdepth=1'); expect "audit-node: maxdepth=1 vê o .env do topo" 98 "$rc"; has "…cita o .env" "$T/err" 'NOME \.env'; hasnt "…mas não desce até sub/x.db" "$T/err" 'x\.db'
 rc=$(an --audit-node an-topo); expect "audit-node: sem maxdepth vê também o sub/x.db" 98 "$rc"; has "…cita o x.db" "$T/err" 'x\.db'
+reset   # zera o log do stub: a checagem logo depois do laço só vale se NENHUMA auditoria rodou desde aqui
 for bad in 'an-limpa::-delete' 'an-limpa::prune=../x' 'an-limpa::maxdepth=99' 'an-limpa::prune=a b' '../x' '/etc' 'an limpa' ''; do
   rc=$(an --audit-node "$bad"); expect "audit-node: argumento '$bad' é recusado (uso, 97) e nada roda" 97 "$rc"
 done
 n=$((n+1)); if ! grep -q 'HOSTCALL:hetzner:AUDIT' "$STUB_LOG"; then echo "ok   …e nenhuma auditoria chegou ao servidor"; else echo "FAIL …uma auditoria rodou com argumento inválido"; fails=$((fails+1)); fi
-rc=$("$RUN" --audit-node an-limpa >"$T/out" 2>"$T/err"; echo $?); expect "audit-node: sem --host linux (o MBP) é recusado" 97 "$rc"
-rc=$(an); expect "audit-node: sem nenhuma pasta é uso (97)" 97 "$rc"
+rc=$("$RUN" --audit-node an-limpa >"$T/out" 2>"$T/err"; echo $?); expect "audit-node: sem --host linux (o MBP) é recusado" 97 "$rc"; has "…pelo motivo certo (a mensagem do modo, não a flag desconhecida)" "$T/err" "audit-node é do nó Linux"
 # a semeadura (node_audit SEM o 2º argumento) segue coberta pelos casos de auditoria acima: o script real roda sem o 3º argumento e esses casos continuam passando
 reset; rc=$(an --audit-node an-limpa); has "audit-node: o script de auditoria chegou ao nó" "$STUB_LOG" 'HOSTCALL:hetzner:AUDIT'
 }

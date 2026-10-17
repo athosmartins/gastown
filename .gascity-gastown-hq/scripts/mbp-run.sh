@@ -815,12 +815,14 @@ node_audit() { # $1 = dir remoto relativo ao home · $2 (opcional) = UMA palavra
 # MBP:AUDIT
 set -f
 cd "$HOME/$1" 2>/dev/null || { echo AUDIT_ERR; exit 3; }
-P=(); case "${3:-}" in
-  "") ;;
-  maxdepth=[0-9]) P=(-maxdepth "${3#maxdepth=}") ;;
-  prune=*) IFS=: read -r -a PD <<< "${3#prune=}"; for d in "${PD[@]}"; do P+=(-path "./$d" -prune -o); done ;;
-  *) echo AUDIT_ERR; exit 3 ;;   # palavra que não conheço: não audita "parcialmente"
-esac
+# SEM `case` aqui: este corpo está dentro de $( <<'EOF' ), e o `)` de um padrão de case sem par quebra o parser do bash 3.2 do macOS (o /bin/bash) — o arquivo INTEIRO deixa de carregar
+P=(); w=${3:-}
+if [ -n "$w" ]; then
+  if [ "${w%%=*}" = maxdepth ] && [ "${#w}" -eq 10 ] && [ "${w#maxdepth=}" -ge 0 ] 2>/dev/null; then P=(-maxdepth "${w#maxdepth=}")
+  elif [ "${w%%=*}" = prune ] && [ "${#w}" -gt 6 ]; then IFS=: read -r -a PD <<< "${w#prune=}"; for d in "${PD[@]}"; do P+=(-path "./$d" -prune -o); done
+  else echo AUDIT_ERR; exit 3   # palavra que não conheço: não audita "parcialmente"
+  fi
+fi
 E=$(mktemp) || { echo AUDIT_ERR; exit 3; }
 trap 'rm -f "$E" "$E.p"' EXIT
 find . "${P[@]}" \( -name '.env' -o -name '.env.*' -o -name '*.pem' -o -name '*.key' -o -name '*.p12' -o -name '*.pfx' -o -name 'id_rsa*' -o -name 'id_ed25519*' -o -name '*.kdbx' \
@@ -924,10 +926,9 @@ fi
 
 # ---- auditoria do nó (ga-2hd02v.1.5.2): o node_audit da semeadura, pasta a pasta, com o veredito de cada uma em stdout: AUDIT-NODE <LIMPO|ACHADO|NAO-CONSEGUI> <pasta>.
 # Quem chama (hetzner-audit.sh) lê essas linhas; "98" sozinho não diz se achou ou se não conseguiu olhar, e os dois não podem virar o mesmo valor.
-#   --audit-node DIR[::maxdepth=N | ::prune=a:b/c]  DIR relativo ao home do nó · o que vem depois de :: o script remoto vira prefixo do find (só olhar; nada executa). Sai 0 só se TODAS limpas.
+#   --audit-node DIR[::maxdepth=N | ::prune=a:b/c]  DIR relativo ao home do nó · o que vem depois de :: só escolhe ONDE o find olha (gramática fechada; o argumento nunca vira comando). Sai 0 só se TODAS limpas.
 if [ "$mode" = audit_node ]; then
   [ "$HOSTKIND" = linux ] || { say "--audit-node é do nó Linux: use --host linux"; exit 97; }
-  [ "${#audit_dirs[@]}" -gt 0 ] || { say "uso: --host linux --audit-node DIR[::maxdepth=N|::prune=a:b] [--audit-node ...]"; exit 97; }
   arc=0; AUDIT_FA_RE='^(maxdepth=[0-9]|prune=[A-Za-z0-9_./-]+(:[A-Za-z0-9_./-]+)*)$'
   for spec in "${audit_dirs[@]}"; do
     d="${spec%%::*}"; fa=""; [ "$spec" = "$d" ] || fa="${spec#*::}"
