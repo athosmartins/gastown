@@ -582,6 +582,159 @@ EOF"
   b 0 "ctx: controle — GIT_DIR=<próprio> bash -c 'git commit'" "GIT_DIR=$OWN/.git bash -c 'git commit -m x'"
   b 0 "ctx: controle — f() { git log; }; eval f; git commit" "f() { git -C $OTH log; }; eval f; git commit -m x"
   b 0 "ctx: controle — f() { … '{' …; git commit; }; f no próprio, cwd absoluto" "f() { :; echo '{'; git -C $OWN commit; }; f"
+  # gate-fix 8 (gate ga-36d3ic, fuzzer diferencial do revisor): aspa de COMENTÁRIO não pareia; $( )/crase só no nível que o shell expande; atribuição
+  # que pode não ter rodado = "não sei"; cd atrás de lançador externo não muda o shell
+  b 2 "ctx: '# Don't forget' + git -C <alheio> commit -m 'msg' (a aspa do comentário engolia o git)" "# Don't forget
+git -C $OTH commit -m 'msg'"
+  b 2 "ctx: '# say \"hi' + git -C <alheio> commit -m \"x\" (gêmea com aspa dupla)" "# say \"hi
+git -C $OTH commit -m \"x\""
+  b 2 "ctx: comentário terminando em \\ não junta a linha seguinte" "git status # trailing \\
+git -C $OTH commit -m x"
+  b 2 "ctx: bash -c \"x=\\\$(git -C \\\"../other\\\" commit)\" (o \$( ) escapado roda no bash de dentro)" "bash -c \"x=\\\$(git -C \\\"../other\\\" commit -m y)\""
+  b 2 "ctx: eval \"echo \\\$(git -C \\\"../other\\\" commit)\"" "eval \"echo \\\$(git -C \\\"../other\\\" commit -m m)\""
+  b 2 "ctx: bash -c 'x=\$(git -C '\"'\"'../other'\"'\"' commit)' (o \$( ) entre aspas simples roda no bash de dentro)" "bash -c 'x=\$(git -C '\"'\"'../other'\"'\"' commit -m y)'"
+  b 2 "ctx: eval \"echo \\\`git -C <alheio> commit\\\`\" (crase escapada em aspas duplas)" "eval \"echo \\\`git -C $OTH commit -m x\\\`\""
+  b 2 "ctx: \$(case a in a) git --git-dir=<alheio> commit;; esac) (o ) do case não fecha o \$( ))" "echo \$(case a in a) git --git-dir=$OTH/.git commit -m x;; esac)"
+  b 2 "ctx: export GIT_DIR=<alheio>; true || export GIT_DIR=<próprio>; git commit" "export GIT_DIR=$OTH/.git; true || export GIT_DIR=$OWN/.git; git commit -m x"
+  b 2 "ctx: GIT_DIR=<alheio>; false && GIT_DIR=<próprio>; export GIT_DIR; git commit" "GIT_DIR=$OTH/.git; false && GIT_DIR=$OWN/.git; export GIT_DIR; git commit -m x"
+  b 2 "ctx: cd <alheio>; env cd <próprio>; git commit (env roda o cd como programa)" "cd $OTH; env cd $OWN; git commit -m x"
+  b 2 "ctx: cd <alheio>; find <próprio> -exec cd <próprio> \; ; git commit (o cd do find é programa: o shell fica no alheio)" "cd $OTH; find $OWN -maxdepth 0 -exec cd $OWN \; ; git commit -m x"
+  b 0 "ctx: controle — '# it's fine' + git commit -m 'msg' no próprio" "# it's fine
+git commit -m 'msg'"
+  b 0 "ctx: controle — git commit -m \"custa \\\$5\" no próprio" "git commit -m \"custa \\\$5\""
+  b 0 "ctx: controle — git commit -m 'a # b' (# entre aspas não é comentário)" "git commit -m 'a # b'"
+  b 0 "ctx: controle — export GIT_DIR=<próprio>; git commit (atribuição certa)" "export GIT_DIR=$OWN/.git; git commit -m x"
+}
+
+g_fuzz() {  # fuzzer diferencial (gate ga-36d3ic, sugestão do revisor): o bash REAL com um git falso que registra onde escreveria é a verdade; o guarda
+  # tem de bloquear toda escrita no alheio. Semente fixa (reproduzível). RCG_FUZZ_N muda o tamanho (padrão 200).
+  cat > "$T/fuzz.py" <<'FUZZEOF'
+#!/usr/bin/env python3
+"""Fuzzer diferencial do remote-clone-guard: o bash REAL (com um git falso que registra onde escreveria) é a verdade;
+o guarda tem de bloquear (rc 2) todo comando em que o bash escreveria no clone ALHEIO. Uso: rcg_fuzz.py GUARDA [N] [SEED]."""
+import json, os, random, shlex, shutil, subprocess, sys, tempfile
+
+GUARD = sys.argv[1]
+N = int(sys.argv[2]) if len(sys.argv) > 2 else 400
+rnd = random.Random(int(sys.argv[3]) if len(sys.argv) > 3 else 7)
+READ = {"log", "status", "diff", "show", "rev-parse"}
+
+t = os.path.realpath(tempfile.mkdtemp(prefix="rcgfz."))
+terr = t + "/terr"; own = terr + "/r/wt/own"; oth = terr + "/r/wt/other"; shim = t + "/bin"; log = t + "/git.log"
+for d in (own, oth, shim, t + "/home"):
+    os.makedirs(d)
+for d in (own, oth):
+    open(d + "/.git", "w").close()
+with open(shim + "/git", "w") as f:  # o git falso: resolve o alvo como o git faria (-C em sequência, --git-dir/--work-tree, GIT_DIR/GIT_WORK_TREE) e registra
+    f.write(f"""#!/usr/bin/env python3
+import os, sys
+a = sys.argv[1:]; cwd = os.getcwd(); gd = os.environ.get("GIT_DIR"); wt = os.environ.get("GIT_WORK_TREE")
+while a and a[0].startswith("-"):
+    x = a.pop(0)
+    if x == "-C" and a: cwd = os.path.join(cwd, a.pop(0))
+    elif x.startswith("--git-dir"): gd = x.split("=", 1)[1] if "=" in x else a.pop(0)
+    elif x.startswith("--work-tree"): wt = x.split("=", 1)[1] if "=" in x else a.pop(0)
+    elif x == "-c" and a: a.pop(0)
+sub = a[0] if a else ""
+tgt = os.path.dirname(os.path.join(cwd, gd)) if gd else (os.path.join(cwd, wt) if wt else cwd)
+open({log!r}, "a").write(sub + "\\t" + os.path.realpath(tgt) + "\\n")
+""")
+os.chmod(shim + "/git", 0o755)
+
+
+def q(s):  # um estilo de aspas ao acaso para entregar o texto a um shell
+    k = rnd.randrange(3)
+    if k == 0:
+        return shlex.quote(s)
+    if k == 1:
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
+    return "$'" + s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'"
+
+
+def core(tgt):
+    p = rnd.choice([tgt, "../" + os.path.basename(tgt)])
+    pq = rnd.choice([p, "'" + p + "'", '"' + p + '"'])
+    m = rnd.choice(["-m x", "-m 'msg'", '-m "m s g"', "-m \"it's\""])
+    op = rnd.choice([f"commit {m}", "push origin HEAD", "reset --hard", "add ."])
+    return rnd.choice([f"git -C {pq} {op}", f"git --git-dir={p}/.git {op}", f"GIT_DIR={p}/.git git {op}", f"cd {pq} && git {op}", f"cd {pq}; git {op}"])
+
+
+def wrap(c, depth):
+    for _ in range(depth):
+        k = rnd.randrange(10)
+        c = [lambda: f"bash -c {q(c)}", lambda: f"sh -c {q(c)}", lambda: f"eval {q(c)}", lambda: f"x=$({c})", lambda: f"echo `{c}`",
+             lambda: f'echo "$({c})"', lambda: f"env {c}", lambda: f"command {c}", lambda: f"case a in a) {c};; esac",
+             lambda: f"timeout 5 {c}"][k]()
+    return c
+
+
+def prefix():
+    return rnd.choice(["", "# Don't forget\n", '# say "hi\n', "# trailing \\\n", "git status # it's\n", "true && ", "echo ok; ",
+                       "# a 'b' c\n", "cat <<EOF\nit's data\nEOF\n"])
+
+
+def case(tgt):
+    k = rnd.randrange(10)
+    if k == 6:
+        w = rnd.choice(["env cd", "timeout 5 cd", "command cd", "nohup cd"])
+        return f"cd {oth}; {w} {own}; git commit -m x", oth
+    if k == 7:
+        return f"cd {oth}; find {own} -maxdepth 0 -exec cd {{}} \\; ; git commit -m x", oth
+    if k == 8:
+        return f"echo $(case a in a) {core(tgt)};; esac)", tgt
+    if k == 9:
+        return rnd.choice([f"if true; then export GIT_DIR={tgt}/.git; fi; git commit -m x", f"export GIT_DIR={oth}/.git; false && export GIT_DIR={own}/.git; git commit -m x"]), tgt
+    if k == 0:
+        return f"export GIT_DIR={oth}/.git; true || export GIT_DIR={own}/.git; git commit -m x", oth
+    if k == 1:
+        return f"bash <<EOF\n{core(tgt)}\nEOF", tgt
+    return prefix() + wrap(core(tgt), rnd.randrange(3)), tgt
+
+
+def bash_truth(cmd):
+    open(log, "w").close()
+    env = {"PATH": shim + ":/usr/bin:/bin", "HOME": t + "/home"}
+    try:
+        subprocess.run(["bash", "-c", cmd], cwd=own, env=env, capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    hits = [l.split("\t") for l in open(log).read().splitlines() if "\t" in l]
+    return any(s not in READ and (p == oth or p.startswith(oth + "/")) for s, p in hits)
+
+
+def guard_rc(cmd):
+    inp = json.dumps({"tool_name": "Bash", "cwd": own, "tool_input": {"command": cmd}})
+    r = subprocess.run(["python3", "-I", GUARD], input=inp, text=True, capture_output=True,
+                       env={**os.environ, "RCG_ROOT": terr, "CLAUDE_PROJECT_DIR": own})
+    return r.returncode
+
+
+if guard_rc(f"git -C {own} commit -m x") != 0 or guard_rc(f"git -C {oth} commit -m x") != 2:  # o guarda tem de RODAR: arquivo ausente/erro sai 2 e contaria como "bloqueou"
+    print("fuzz: o guarda não passou no controle (próprio=0, alheio=2) — nada medido"); sys.exit(2)
+bypass, fp, wrote, fps = [], 0, 0, []
+for i in range(N):
+    tgt = rnd.choice([oth, oth, own])
+    cmd, _ = case(tgt)
+    truth = bash_truth(cmd)
+    rc = guard_rc(cmd)
+    if truth:
+        wrote += 1
+        if rc != 2:
+            bypass.append(cmd)
+    elif rc == 2 and tgt == own:
+        fp += 1
+        fps.append(cmd)
+print(f"fuzz: {N} comandos, {wrote} escreveriam no alheio (bash real), BYPASS={len(bypass)}, bloqueio no próprio={fp}")
+for c in bypass[:12]:
+    print("BYPASS:", repr(c.replace(t, "T"))[:220])
+for c in fps[:int(os.environ.get("FZ_FP", "0"))]:
+    print("FP:", repr(c.replace(t, "T"))[:200])
+shutil.rmtree(t, ignore_errors=True)
+sys.exit(1 if bypass else 0)
+FUZZEOF
+  local out; out=$(TMPDIR="$T" python3 -I "$T/fuzz.py" "$P" "${RCG_FUZZ_N:-200}" 7 2>&1); local rc=$?
+  echo "$out" | head -6
+  [ "$rc" = 0 ]; ok $? "fuzz: nenhum bypass do guarda contra o bash real (${RCG_FUZZ_N:-200} comandos, semente 7)"
 }
 
 g_msg() {
@@ -671,7 +824,7 @@ g_hook() {  # o comando que vai no settings do servidor
   c="python3-que-nao-existe -I $P || exit 2"; sh -c "$c" <<<"$js" >/dev/null 2>&1; [ $? = 2 ]; ok $? "hook: python ausente (127) vira 2"
 }
 
-all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg; group cond && g_cond; group ctx && g_ctx
+all() { group block && g_block; group pass && g_pass; group evade && g_evade; group closed && g_closed; group shell && g_shell; group wrap && g_wrap; g_lex; g_dest; group cfg && g_cfg; group tools && g_tools; group msg && g_msg; group cond && g_cond; group ctx && g_ctx; group fuzz && g_fuzz
         group check && g_check; group hook && g_hook; return 0; }
 
 if [ -n "${RCG_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
@@ -705,7 +858,7 @@ echo "== $((n-fails))/$n ok =="
   mutant evade "bash -c não é aberto" 's/return sub(script\[0\], cwd, env)/pass/'
   mutant evade "eval não é aberto" 's/return sub(" ".join(seg\[1:\]), cwd, env)/pass/'
   mutant evade "\$( ) não é aberto" 's/r = sub(bytes.fromhex(m.group(1)).decode(), st\["cwd"\], {})/r = None/'
-  mutant evade "crase não vira \$( )" 's/cmd, out, i = BACKTICK.sub(r"$(\\1)", cmd), \[\], 0/cmd, out, i = cmd, [], 0/'
+  mutant evade "crase não vira \$( )" 's/(cmd.startswith("\$(", k) or cmd\[k\] == "`")/cmd.startswith("$(", k)/'
   mutant evade "parêntese dentro do \$( ) não é contado" 's/d + (cmd\[k\] == "(") - /d - /'
   mutant evade "\$( ) de heredoc sem aspas é ignorado" 's/("" if m.group(2) else/("" if True else/'
   mutant evade "find -exec não é aberto" 's/if t in ("-exec", "-execdir", "-ok", "-okdir"):/if False:/'
@@ -758,6 +911,13 @@ echo "== $((n-fails))/$n ok =="
   mutant ctx "leitor entre aspas deixa de ser lido como palavra" 's/peel(shlex.split(s))/peel(s.split())/'
   mutant ctx "escape \\U grande derruba o guarda" 's/chr(min(int(e\[1:\], 16), 0x10FFFF))/chr(int(e[1:], 16))/'
   mutant ctx "falha do guarda num Bash sem a palavra git libera" 's/if not (isinstance(inp, dict) and inp.get("tool_name") in {"Bash", \*TOOLS_FILE}) and not re.search/if not re.search/'
+  mutant ctx "aspa de comentário volta a parear com a da linha seguinte" 's/        if not q and cmd\[k\] == "#" and (k == 0 or cmd\[k - 1\] in " \\t\\n;&|()"):/        if False:/'
+  mutant ctx "\$( ) entre aspas simples/escapado volta a ser extraído no nível de fora" 's/        if q not in (.*) and (cmd.startswith("\$(", k) or cmd\[k\] == "`"):/        if (cmd.startswith("$(", k) or cmd[k] == "`"):/'
+  mutant ctx "o ) do case fecha o \$( )" 's/            cs = max(0, cs + (1 if w.group(1) == "case" else -1))/            pass/'
+  mutant ctx "em aspas duplas \\\$ e \\\` mantêm a barra" 's/out += \[cmd\[i + 1\]\] if q == .* else \[c, PROT.get/out += [c, PROT.get/'
+  mutant ctx "VAR= depois de || vale como certa" 's/{k: "\$?" if unsure else v for/{k: v for/'
+  mutant ctx "export depois de || vale como certo" 's/{m.group(1): "\$?" if unsure else m.group(2) for/{m.group(1): m.group(2) for/'
+  mutant ctx "env cd muda o diretório do shell" 's/if kw or wrapped or prev in/if kw or prev in/'
   mutant closed "branch/tag com palavra solta e sem opção de lista vira leitura" 's/        elif t.startswith("-") or not listing:/        elif t.startswith("-"):/'
   mutant closed "branch --list -d x vira leitura" 's/        elif t.startswith("-") or not listing:/        elif not listing:/'
   mutant closed "branch --contains -D x vira leitura" 's/^            if t.startswith("-"):/            if False:/'

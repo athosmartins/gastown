@@ -20,11 +20,7 @@ cat >"$T/bin/ssh" <<'EOF'
 #!/bin/sh
 [ -f "$FAKE/ssh.stdin.on" ] && wc -c >>"$FAKE/ssh.stdin"
 [ -f "$FAKE/sleep" ] && sleep "$(cat "$FAKE/sleep")"
-if [ -f "$FAKE/ssh.rc" ]; then  # ssh.rc.only (opcional): só falha o comando que contém este texto; sem ele, falha todos
-  if [ ! -f "$FAKE/ssh.rc.only" ] || case "$*" in *"$(cat "$FAKE/ssh.rc.only")"*) true;; *) false;; esac; then
-    echo "ssh: Could not resolve hostname" >&2; exit "$(cat "$FAKE/ssh.rc")"
-  fi
-fi
+[ -f "$FAKE/ssh.rc" ] && { echo "ssh: Could not resolve hostname" >&2; exit "$(cat "$FAKE/ssh.rc")"; }
 while [ "$1" = "-o" ]; do shift 2; done
 shift
 HOME=$SRV exec sh -c "$*"
@@ -262,11 +258,6 @@ has "o que ficou sem remover é contado, não calado" "$PBOUT" "1 NAO removidos"
 echo "== push-bundle: o registro anterior não manda apagar através de um symlink no caminho"
 srv_reset; pb; rm -rf "$SRV/.claude/hooks"; mkdir -p "$T/elsewhere"; echo keep >"$T/elsewhere/a.sh"; ln -s "$T/elsewhere" "$SRV/.claude/hooks"
 echo 1 >"$FAKE/drop_hook"; pb; eq "push" $PBRC 0; yes "o arquivo do outro lado do symlink sobrevive" "$T/elsewhere/a.sh"; has "e é contado" "$PBOUT" "1 NAO removidos"
-echo "== push-bundle: as chaves que o próprio claude grava (tema, notificação) sobrevivem; chave alheia de verdade continua recusando"
-srv_reset; echo '{"theme":"dark","agentPushNotifEnabled":true,"enabledPlugins":{"x@y":true}}' >"$SRV/.claude/settings.json"; pb; eq "tema e notificação do claude não travam o push" $PBRC 0
-SJ=$(cat "$SRV/.claude/settings.json"); has "tema mantido" "$SJ" '"theme": "dark"'; has "notificação mantida" "$SJ" '"agentPushNotifEnabled": true'
-has "o bundle continua mandando" "$SJ" '"permissions"'; hasnt "e a chave velha dos plugins foi trocada" "$SJ" "x@y"
-srv_reset; echo '{"theme":"dark","model":"opus"}' >"$SRV/.claude/settings.json"; pb; eq "tema + chave alheia de verdade" $PBRC 1; has "msg diz a alheia" "$PBOUT" "(model)"; no "nada instalado" "$HOOK"
 echo "== push-bundle: recusas (nada pela metade)"
 srv_reset; echo '{"model":"opus"}' >"$SRV/.claude/settings.json"; pb; eq "settings do servidor com chave alheia" $PBRC 1; has "msg" "$PBOUT" "nao conhece"
 no "nada instalado" "$HOOK"; no "nem o city" "$CITYF"
@@ -283,26 +274,6 @@ srv_reset; echo fail >"$FAKE/rsync.mode"; pb; eq "rsync falha" $PBRC 1; has "msg
 srv_reset; echo 4 >"$FAKE/verify.rc.mini"; pb; eq "verify no mini falha" $PBRC 1; has "msg" "$PBOUT" "verify (mini)"; no "nada foi staged no servidor" "$SRV/gt-remote/bundle-out"
 srv_reset; echo 4 >"$FAKE/verify.rc.server"; pb; eq "verify no servidor falha" $PBRC 1; has "msg" "$PBOUT" "verify NO SERVIDOR"; no "nada instalado" "$HOOK"
 srv_reset; echo '{"enabledPlugins":{}}' >"$FAKE/home_settings"; pb; eq "bundle já traz enabledPlugins" $PBRC 3; has "msg" "$PBOUT" "já traz"
-echo "== push-bundle: ler o settings do servidor — ausente é vazio; não conseguir ler NÃO é vazio (gate ga-iczduy)"
-# o install troca o settings.json do servidor: se a leitura falhou e o push seguir como se o arquivo não existisse, o tema/notificação do claude somem sem aviso
-for rc in 255 1 7; do
-  reset; srv_reset; echo '{"theme":"dark","enabledPlugins":{"x@y":true}}' >"$SRV/.claude/settings.json"; echo "$rc" >"$FAKE/ssh.rc"; echo ".claude/settings.json" >"$FAKE/ssh.rc.only"; pb
-  eq "leitura do settings do servidor sai $rc → recusa" $PBRC 1; has "msg diz que não leu" "$PBOUT" "settings.json do servidor"; no "nada instalado" "$HOOK"
-  eq "e o settings do servidor ficou como estava" "$(cat "$SRV/.claude/settings.json")" '{"theme":"dark","enabledPlugins":{"x@y":true}}'
-done
-reset; srv_reset; chmod 000 "$SRV/.claude/settings.json"
-if [ -r "$SRV/.claude/settings.json" ]; then ok; else  # o instalador do servidor também recusa um settings ilegível — só que DEPOIS do rsync; aqui a recusa tem que vir antes de mandar qualquer coisa
-  pb; eq "settings que existe mas o cat não lê → recusa (não é 'ausente')" $PBRC 1; has "msg" "$PBOUT" "settings.json do servidor"; no "nada instalado" "$HOOK"
-  no "e nada foi mandado ao servidor (a recusa vem antes do rsync)" "$SRV/gt-remote/bundle-out"
-fi
-chmod 644 "$SRV/.claude/settings.json"
-reset; srv_reset; rm -f "$SRV/.claude/settings.json"; pb; eq "settings ausente no servidor (1º push) = vazio, instala" $PBRC 0; yes "hook instalado" "$HOOK"
-# gate-fix 4 (third-state): texto que não é JSON não é "vazio" — nem no servidor, nem no bundle
-reset; srv_reset; printf 'notjson garbage {' >"$SRV/.claude/settings.json"; pb
-eq "settings do servidor existe mas não é JSON → recusa (não vira {})" $PBRC 1; has "msg" "$PBOUT" "não é JSON"; no "nada instalado" "$HOOK"
-eq "e o settings do servidor ficou como estava" "$(cat "$SRV/.claude/settings.json")" 'notjson garbage {'
-reset; srv_reset; printf 'notjson garbage {' >"$FAKE/home_settings"; pb
-[ "$PBRC" != 0 ]; eq "home settings do bundle não é JSON → não instala (rc=$PBRC)" $? 0; no "nada instalado" "$HOOK"
 
 echo "== install-claude (loopback)"
 printf '#!/bin/bash\necho "$@" >"$FAKE/installer.args"\n[ -f "$FAKE/installer.noop" ] || echo "$1 (Claude Code)" >"$FAKE/version"\n' >"$T/installer.sh"

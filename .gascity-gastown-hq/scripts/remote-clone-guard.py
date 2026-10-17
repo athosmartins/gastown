@@ -346,8 +346,8 @@ def protect(cmd: str) -> str:
 
 def words(cmd: str) -> list:
     """As palavras do comando como (texto, operador?). operador = pontuação do SHELL (`;`, `&&`, `>`, `<(`…): `';'`, `\\;`, `'>'` e `''` são palavras, e a vazia FICA (`git -C '' -C x`).
-    Aspa que não fecha (ou `\\` no fim): o shell recusa a linha e só roda o que veio ANTES dela, a não ser que a aspa esteja num comentário `#` (que o guarda não lê como
-    comentário) e então o que vem DEPOIS roda. A aspa solta sai do texto e o resto é conferido como comando, as duas hipóteses de uma vez; o texto antes dela é lido igual."""
+    Aspa ou crase de COMENTÁRIO não conta (decomment). Aspa que ainda não fecha (ou `\\` no fim): o shell recusaria a linha; o guarda tira a aspa que o leitor
+    deu como solta (a última aberta) e confere o resto como comando — UMA hipótese, a do lado fechado: mais texto vira comando, nenhum vira palavra entre aspas."""
     cmd = FD.sub(r"\1", hide(CONT.sub(r"\1", decomment(heredocs(cmd)))).replace("\n", " ; "))  # newline separa comandos; `\` + newline os junta; heredoc só o que o shell lê como heredoc
     while True:  # termina: cada volta tira um caractere, e a próxima aspa solta só pode estar mais adiante (o que sobra de um tipo de aspa depois de tirar a solta é par ou tem uma só)
         try:
@@ -501,7 +501,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
                     return r
         return None
 
-    def one(seg: list, blind: bool = False, prev: str = "", term: str = ";", ext: bool = False):  # ext = trecho que um programa externo roda (find -exec): cd ali não muda o shell; prev/term = o operador antes e depois do trecho: dizem se um cd rodou com certeza
+    def one(seg: list, blind: bool = False, prev: str = "", term: str = ";"):  # prev/term = o operador antes e depois do trecho: dizem se um cd rodou com certeza
         r = inner(seg)
         if r:
             return r
@@ -546,7 +546,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
             st["env"].update({m.group(1): "$?" if unsure else m.group(2) for m in map(ASSIGN.fullmatch, seg[1:]) if m})
         elif c in ("cd", "pushd", "popd"):
             new = None if c == "popd" else chdir(seg[1:], st["cwd"], c == "pushd")
-            if kw or wrapped or ext or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
+            if kw or wrapped or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
                 new = None
             if blk and new is not None:
                 st["cdblk"] = True  # cd dentro de um ramo: vale até o fi/done/esac/else/elif
@@ -577,7 +577,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0, env=None, funcs=None):
         elif c == "find":  # o `\;` e o `\(` do find são palavras (words() não os toma por operador do shell): todos os `-exec` do find estão neste trecho
             for j, t in enumerate(seg):
                 if t in ("-exec", "-execdir", "-ok", "-okdir"):  # -exec/-ok rodam no diretório do find; -execdir/-okdir no de CADA achado, que não sei qual é: cego
-                    r = one(seg[j + 1:], blind or t.endswith("dir"), ext=True)
+                    r = one(seg[j + 1:], blind or t.endswith("dir"))
                     if r:
                         return r
         elif c in st.get("funcs", {}) and c not in st.setdefault("calling", set()):  # chamada de função definida nesta chamada: o corpo roda AGORA, neste cwd
