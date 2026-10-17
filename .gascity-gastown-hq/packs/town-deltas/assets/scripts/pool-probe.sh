@@ -55,7 +55,9 @@ mark() {
 
 # ga-vln2py (P0): DISK FLOOR. With the free disk under the new-work floor (disk-headroom-lib.sh, 5 GB) this probe hands
 # out no NEW STORY from tier 1: a builder started on a disk that low is what filled it on 17/10 and took Dolt down.
-# The city's own formula work (gc.kind set; tiers 2 and 3) still flows - it is what gets the city out of the hole.
+# The city's own formula work still flows - it is what gets the city out of the hole: order molecules and their steps
+# (the stale-db cleanup: type molecule / step, gc.pool_demand, gc.step_ref - no gc.kind), gc.kind work, and tiers 2 and 3.
+# What counts as a story is ONE definition, DISK_HOLD_NEW_STORIES_JQ in the lib; a shape it does not recognise flows.
 # This is the one place where the answer deliberately differs from the engine's probe, and only while the disk is low:
 # with the disk fine (or unreadable) stdout, the bd calls and the exit code are byte-for-byte the engine's.
 # `[]` from the hold is a real "nothing for you": drain, do not look for a story by another route.

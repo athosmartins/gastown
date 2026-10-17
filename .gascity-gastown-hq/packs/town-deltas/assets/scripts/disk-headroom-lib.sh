@@ -39,11 +39,17 @@
 # /private/var/vm — the same path the Pilot's swap-exhausted arm reads — else /). DISK_HEADROOM_ENABLED=0 makes
 # every state `ok` (kill switch; never set in prod).
 
-# What a low disk holds back from a pool probe (stdin: a JSON array of beads; prints the array without them). A STORY
-# — a bead the Pilot routed to a builder — carries no gc.kind; the city's own formula work (shutdown dance, reaper,
-# jsonl export: gc.kind=workflow) does, and that is exactly the work that has to keep running to get out of a low-disk
-# hole. One definition, read by the dog probe (pool-probe.sh); the wa/ps worker probes serve only stories and just answer [].
-DISK_HOLD_NEW_STORIES_JQ='[ .[] | select((.metadata["gc.kind"] // "") != "") ]'
+# What a low disk holds back from a pool probe (stdin: a JSON array of beads; prints the array without them). It holds
+# back a STORY: a bead of a story type (task, bug, feature, chore, epic, spike) that carries NONE of the marks the city's
+# own formula work carries (gc.kind, gc.step_ref, gc.pool_demand). Formula work is what has to keep running to get out
+# of a low-disk hole, and it does NOT always have a gc.kind: measured on the dog pool 17/10 (1684 beads), the stale-db
+# cleanup molecule (type molecule, gc.pool_demand=order) and its steps (type step / task with gc.step_ref) are the
+# bulk of it and carry none. So the rule leans to LET THROUGH: a type it does not know (molecule, step, wisp, an empty
+# one) or any one formula mark flows, exactly as it did before this lib; only a positively recognised story is held.
+# One definition, read by the dog probe (pool-probe.sh). The wa/ps worker probes answer [] without it: measured the
+# same day, the 1125 beads routed to wa-worker and the 51 to ps-worker are all story types with none of the marks (and
+# no order in the town config routes there). If that ever changes, those two probes must use this filter instead.
+DISK_HOLD_NEW_STORIES_JQ='[ .[] | select( (((.issue_type // "") as $t | ["task","bug","feature","chore","epic","spike"] | any(. == $t)) | not) or ((.metadata["gc.kind"] // "") != "") or ((.metadata["gc.step_ref"] // "") != "") or ((.metadata["gc.pool_demand"] // "") != "") ) ]'
 
 DISK_NEW_WORK_MIN_MB="${DISK_NEW_WORK_MIN_MB:-5120}"
 DISK_HEAVY_MIN_MB="${DISK_HEAVY_MIN_MB:-6144}"

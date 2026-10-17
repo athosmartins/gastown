@@ -277,20 +277,20 @@ else
   skip "--live drift check not requested"
 fi
 
-echo "== 11. ga-vln2py: free disk under the floor -> tier 1 holds back new STORIES (no gc.kind); workflow beads and tiers 2/3 keep flowing"
+echo "== 11. ga-vln2py: free disk under the floor -> tier 1 holds back new STORIES; formula work (molecules, steps, gc.kind) and tiers 2/3 keep flowing"
 # The engine's probe knows nothing of disks, so these run the script alone. dprobe <disk> [VAR=val...] -> D_OUT D_RC D_ERR.
 dprobe() {
   local disk="$1"; shift
   : > "$TMP/pp.log"
-  D_OUT="$(env BD_LOG="$TMP/disk.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN=ephemeral DISK_FREE_OVERRIDE_MB="$disk" POOL_PROBE_LOG="$TMP/pp.log" "$@" sh "${DPROBE:-$PROBE}" gastown.dog 2>"$TMP/disk.err")"; D_RC=$?
+  D_OUT="$(env BD_LOG="$TMP/disk.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN=ephemeral DISK_FREE_OVERRIDE_MB="$disk" POOL_PROBE_LOG="$TMP/pp.log" "$@" sh "${DPROBE:-$PROBE}" gastown.dog 2>"$TMP/disk.err" </dev/null)"; D_RC=$?
   D_ERR="$(cat "$TMP/disk.err")"
   D_IDS="$(printf '%s' "$D_OUT" | jq -r 'if type == "array" then map(.id) | join(",") else "?" end' 2>/dev/null)"; [ "$D_IDS" = "" ] && D_IDS="-"
 }
 reset_fix
 cat > "$FIX/tier1.json" <<'EOF'
 [
- {"id":"st-old","updated_at":"2026-01-01T00:00:00Z","labels":["story:approved"],"metadata":{"gc.routed_to":"gastown.dog"}},
- {"id":"wf-new","updated_at":"2026-01-05T00:00:00Z","labels":[],"metadata":{"gc.routed_to":"gastown.dog","gc.kind":"workflow"}}
+ {"id":"st-old","issue_type":"bug","updated_at":"2026-01-01T00:00:00Z","labels":["story:approved"],"metadata":{"gc.routed_to":"gastown.dog"}},
+ {"id":"wf-new","issue_type":"task","updated_at":"2026-01-05T00:00:00Z","labels":["order-run:digest-generate"],"metadata":{"gc.routed_to":"gastown.dog","gc.kind":"workflow","gc.pool_demand":"order"}}
 ]
 EOF
 dprobe 100000;  eq "roomy disk: the oldest bead (a story) is handed out, as before" "$D_IDS" "st-old"
@@ -301,7 +301,7 @@ eq "…and exit 0" "$D_RC" "0"
 grep -q 'held back 1 new story' "$TMP/pp.log" && ok "the hold is on the record in the pool-probe log" || bad "no 'held back 1 new story' line in the pool-probe log"
 dprobe 3000 DISK_HEADROOM_ENABLED=0; eq "kill switch DISK_HEADROOM_ENABLED=0 -> as before even on a low reading" "$D_IDS" "st-old"
 cat > "$FIX/tier1.json" <<'EOF'
-[{"id":"st-only","updated_at":"2026-01-01T00:00:00Z","labels":[],"metadata":{"gc.routed_to":"gastown.dog"}}]
+[{"id":"st-only","issue_type":"task","updated_at":"2026-01-01T00:00:00Z","labels":[],"metadata":{"gc.routed_to":"gastown.dog"}}]
 EOF
 dprobe 3000
 eq "only stories waiting + low disk: []" "$D_OUT" "[]"
@@ -311,6 +311,66 @@ cat > "$FIX/legacy.json" <<'EOF'
 EOF
 dprobe 3000;    eq "low disk: tier 2 (legacy workflow) still answers when tier 1 has only stories" "$D_IDS" "lg-1"
 rm -f "$FIX/legacy.json"
+
+# The SHAPES of the real dog beads, copied from live ones on 17/10 (the gate measured 1683 of them): on a low disk the
+# order molecule / step of the stale-db cleanup carry NO gc.kind and must still flow; only a bead of a story type with
+# none of the formula marks is held; a type the classifier does not know flows (it leans to let work through).
+# expect|id|issue_type ("-" = no such key)|labels|metadata
+SHAPE_TABLE='flow|mol-stale|molecule|["order-run:mol-dog-stale-db"]|{"gc.pool_demand":"order","gc.routed_to":"gastown.dog","gc.var.max_orphans_for_sql":"20"}
+flow|step-stale|step|[]|{"gc.routed_to":"gastown.dog","gc.step_ref":"mol-dog-stale-db.cleanup"}
+flow|task-step|task|[]|{"gc.root_bead_id":"ga-uctnin","gc.routed_to":"gastown.dog","gc.step_ref":"mol-digest-generate.collect-data"}
+flow|digest|task|["order-run:digest-generate"]|{"gc.formula_contract":"graph.v2","gc.kind":"workflow","gc.pool_demand":"order","gc.routed_to":"gastown.dog"}
+flow|kind-only|task|[]|{"gc.kind":"workflow","gc.routed_to":"gastown.dog"}
+flow|order-only|task|[]|{"gc.pool_demand":"order","gc.routed_to":"gastown.dog"}
+flow|unknown-type|wisp|[]|{"gc.routed_to":"gastown.dog"}
+flow|empty-type||[]|{"gc.routed_to":"gastown.dog"}
+flow|no-type-key|-|[]|{"gc.routed_to":"gastown.dog"}
+hold|story-bug|bug|["story:approved"]|{"gc.routed_to":"gastown.dog"}
+hold|story-task|task|["ctx:ready","story:approved"]|{"gc.routed_to":"gastown.dog"}
+hold|pilot-sling|task|[]|{"gc.routed_to":"gastown.dog","pilot.sling_for":"dc-4v71"}
+hold|story-feature|feature|[]|{"gc.routed_to":"gastown.dog"}
+hold|story-chore|chore|[]|{"gc.routed_to":"gastown.dog"}
+hold|story-epic|epic|[]|{"gc.routed_to":"gastown.dog"}
+hold|story-spike|spike|[]|{"gc.routed_to":"gastown.dog"}'
+# shape_misses <lib> -> the ids whose answer at 3000 MB was not the expected one (empty = every shape went where it should)
+shape_misses() {
+  local miss="" expect id type labels meta tj want
+  while IFS='|' read -r expect id type labels meta; do
+    [ -n "$id" ] || continue
+    if [ "$type" = "-" ]; then tj=""; else tj="\"issue_type\":\"$type\","; fi
+    printf '[{"id":"%s",%s"updated_at":"2026-01-01T00:00:00Z","labels":%s,"metadata":%s}]' "$id" "$tj" "$labels" "$meta" > "$FIX/tier1.json"
+    dprobe 3000 POOL_PROBE_DISK_LIB="$1"
+    if [ "$expect" = flow ]; then want="$id"; else want="-"; fi
+    [ "$D_IDS:$D_RC" = "$want:0" ] || miss="$miss $id"
+  done <<EOF
+$SHAPE_TABLE
+EOF
+  printf '%s' "$miss"
+}
+miss="$(shape_misses "$GOOD_LIB")"
+eq "low disk, real dog shapes: the stale-db molecule/step and every formula mark flow, every story type is held (misses: none)" "${miss:-none}" "none"
+# mutants of the classifier (the lib): each must send at least one real shape the wrong way
+mutate_lib() { # <out> <literal old> <literal new>: the lib with ONE literal replaced (no such literal = not a mutant = loud)
+  python3 -I -c 'import sys; s=open(sys.argv[1]).read(); assert s.count(sys.argv[3])==1, "mutation site not found"; open(sys.argv[2],"w").write(s.replace(sys.argv[3], sys.argv[4]))' "${MUT_SRC:-$GOOD_LIB}" "$1" "$2" "$3" \
+    || bad "mutation site not found in the lib: $2"
+}
+TYPE_CLAUSE='(((.issue_type // "") as $t | ["task","bug","feature","chore","epic","spike"] | any(. == $t)) | not) or '
+# kindonly = the rule this slice first shipped (anything without a gc.kind is a story): three clauses gone
+mutate_lib "$TMP/lib-m-k1.sh" "$TYPE_CLAUSE" ''
+MUT_SRC="$TMP/lib-m-k1.sh" mutate_lib "$TMP/lib-m-k2.sh" ' or ((.metadata["gc.step_ref"] // "") != "")' ''
+MUT_SRC="$TMP/lib-m-k2.sh" mutate_lib "$TMP/lib-m-kindonly.sh" ' or ((.metadata["gc.pool_demand"] // "") != "")' ''
+mutate_lib "$TMP/lib-m-notype.sh" "$TYPE_CLAUSE" ''
+mutate_lib "$TMP/lib-m-nostep.sh" ' or ((.metadata["gc.step_ref"] // "") != "")' ''
+mutate_lib "$TMP/lib-m-noorder.sh" ' or ((.metadata["gc.pool_demand"] // "") != "")' ''
+mutate_lib "$TMP/lib-m-nokind.sh" ' or ((.metadata["gc.kind"] // "") != "")' ''
+mutate_lib "$TMP/lib-m-nospike.sh" '"epic","spike"]' '"epic"]'
+for m in kindonly notype nostep noorder nokind nospike; do
+  miss="$(shape_misses "$TMP/lib-m-$m.sh")"
+  [ -n "$miss" ] && ok "classifier mutant '$m' is killed (sends$miss the wrong way)" || bad "classifier mutant '$m' SURVIVED: every real shape still went where it should"
+done
+cat > "$FIX/tier1.json" <<'EOF'
+[{"id":"st-only","issue_type":"task","updated_at":"2026-01-01T00:00:00Z","labels":[],"metadata":{"gc.routed_to":"gastown.dog"}}]
+EOF
 dprobe garbage; eq "unreadable disk: fail OPEN, the story is handed out" "$D_IDS" "st-only"
 grep -q 'free disk unreadable' "$TMP/pp.log" && ok "…and the blind reading is on the record (not the same as 'disk fine')" || bad "unreadable disk left no line in the pool-probe log"
 dprobe 3000 POOL_PROBE_DISK_LIB=/nonexistent-lib; eq "lib missing: unknown -> fail OPEN (the story is handed out)" "$D_IDS" "st-only"
@@ -320,6 +380,14 @@ printf 'DISK_NEW_WORK_MIN_MB=1\ndisk_headroom_state() { printf low; }\n' > "$TMP
 dprobe 3000 POOL_PROBE_DISK_LIB="$TMP/nohold-lib.sh"
 eq "low but the hold text is unavailable: nothing handed out, tier 1 flagged, exit 3 (loud, not 'no work')" "$D_OUT:$D_RC" "[]:3"
 case "$D_ERR" in *"tier(s) 1 unreadable"*) ok "…and stderr says tier 1 was unreadable" ;; *) bad "…stderr lacks 'tier(s) 1 unreadable': $D_ERR" ;; esac
+# a bead the classifier cannot read (metadata is not an object): the hold program fails -> the same loud inert answer, never a story handed out
+printf '[{"id":"odd","issue_type":"task","updated_at":"2026-01-01T00:00:00Z","labels":[],"metadata":"not-an-object"}]' > "$FIX/tier1.json"
+dprobe 3000 POOL_PROBE_DISK_LIB="$GOOD_LIB"
+eq "low disk + a bead the hold program cannot read: nothing handed out, tier 1 flagged, exit 3" "$D_OUT:$D_RC" "[]:3"
+grep -q 'hold could not be applied' "$TMP/pp.log" && ok "…and the failed hold is on the record" || bad "the failed hold left no line in the pool-probe log"
+cat > "$FIX/tier1.json" <<'EOF'
+[{"id":"st-only","issue_type":"task","updated_at":"2026-01-01T00:00:00Z","labels":[],"metadata":{"gc.routed_to":"gastown.dog"}}]
+EOF
 # mutants of the script: each must change at least one answer above (a hold that never fires, a hold that fails closed)
 sed 's/\[ "\$disk_state" = low \]; then$/[ "$disk_state" = never ]; then/' "$PROBE" > "$TMP/pp-nohold.sh"
 cmp -s "$PROBE" "$TMP/pp-nohold.sh" && bad "mutant 'hold never fires' did not change the script"
