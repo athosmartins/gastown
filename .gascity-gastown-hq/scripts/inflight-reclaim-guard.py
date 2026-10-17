@@ -1710,7 +1710,7 @@ def _hq_id_prefix(routes_path=None):
                 if isinstance(row, dict) and row.get("path") == ".":
                     pfx = row.get("prefix")
                     return pfx if isinstance(pfx, str) and pfx else None
-    except OSError:
+    except (OSError, ValueError):  # ValueError: UnicodeDecodeError on a non-text file
         return None
     return None
 
@@ -5784,6 +5784,11 @@ def _selftest():
                   _hq_id_prefix(_routes_file("r-empty.jsonl", "")) is None)
             check("SB-16e (ga-3psuuo): missing file → None",
                   _hq_id_prefix(os.path.join(_sbtmp, "r-nope.jsonl")) is None)
+            _bin16 = os.path.join(_sbtmp, "r-binary.jsonl")
+            with open(_bin16, "wb") as fh:
+                fh.write(b"\xff\xfe\x00\x80 not utf-8 \xc3\x28\n")
+            check("SB-16g (ga-3psuuo): non-UTF-8 file (UnicodeDecodeError) → None, does not raise",
+                  _hq_id_prefix(_bin16) is None)
             check("SB-16f (ga-3psuuo): '.' row with empty/non-string prefix → None",
                   _hq_id_prefix(_routes_file("r-badpfx.jsonl", '{"prefix":"","path":"."}\n')) is None
                   and _hq_id_prefix(_routes_file("r-badpfx2.jsonl", '{"prefix":7,"path":"."}\n')) is None)
