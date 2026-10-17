@@ -37,6 +37,26 @@ say() { printf '[lab-mbp] %s\n' "$*"; }
 die() { say "UNKNOWN: $*"; ev "wrapper_refused=$*"; exit 2; }
 isnum() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
+# --- what an earlier call left in this slot (ga-3kmvyr.5). The slot is exclusive to this call (mbp-run takes it with an atomic mkdir under
+# ~/gt-remote/slots/N), so anything already in in/lab-src, out/report.json or out/lab.log is NOT from this round; mbp-run only WARNS when
+# its end-of-call cleanup fails ("scratch nao foi limpo"). Left alone it (a) fails the exact-listing check below with sobram=N every round,
+# (b) is counted by the free-disk measurement, and (c) an old report.json is pulled back and read as the result of THIS round when the lab
+# exits 0 without writing a new one. So it goes first, before any of the wrapper's own refusals (die) can leave it behind. Not provably ours (a link in the path) or
+# a leftover that will not go → UNKNOWN (rc 2): never carry on over a folder we could not clear.
+rm -f "$OUT/report.json" "$OUT/lab.log"
+{ [ ! -e "$OUT/report.json" ] && [ ! -e "$OUT/lab.log" ]; } || die "nao consegui apagar o relatorio ou o log de uma rodada anterior em $OUT"
+[ ! -L "$SLOT/in" ] && [ ! -L "$SRC" ] || die "$SLOT/in ou $SRC e um link: nao apago nem escrevo no que pode estar fora do slot"
+if [ -e "$SRC" ]; then
+  chmod -R u+rwx "$SRC" 2>/dev/null   # a leftover folder without permission would stop the rm (and the count)
+  # the count is evidence only: a find that fails is "?", never 0 (the removal goes on and is checked on its own below)
+  if STALE=$(find "$SRC" -mindepth 1 2>/dev/null | wc -l | tr -d ' ') && isnum "$STALE"; then :; else STALE="?"; fi
+  rm -rf "$SRC"
+  [ ! -e "$SRC" ] || die "nao consegui apagar a sobra de uma rodada anterior em $SRC"
+  ev "src_sobra_apagada=$STALE"
+else
+  ev "src_sobra_apagada=0"
+fi
+
 [ -n "$DB" ] && [ -n "$WANT_DOLT" ] || die "faltou --db ou --dolt-version"
 for n in "$RTO" "$SRC_KB" "$MARGIN" "$WAIT_S"; do isnum "$n" && [ "$n" -gt 0 ] || die "--rto-seconds, --src-kb, --margin-pct e --stream-wait-s precisam de inteiro > 0"; done
 # the tool the lab installs by hand lives in ~/gt-remote/lab/bin (the exact dolt of the mini); brew's after it
