@@ -31,7 +31,7 @@
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); 47 mutantes no total.
+#   registro de sessões do list-running); 51 mutantes no total (os 4 últimos: o lançador de pool do mini que vira claude no host, e as 3 bordas dessa regra).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1
 set -u
@@ -102,13 +102,19 @@ g_proto() {
 
 g_dry() {
   local pool="$CITY/packs/town-deltas/assets/scripts/claude-ctxcap-ab.sh --settings '{\"remoteControlAtStartup\":false}' --model sonnet --strict-mcp-config --dangerously-skip-permissions --effort xhigh --settings $CITY/.gc/settings.json --session-id 1a9a7c40-03ef-4caa-8412-df9368f6a538"
-  local wpool="$RR/city/packs/town-deltas/assets/scripts/claude-ctxcap-ab.sh --settings '{\"remoteControlAtStartup\":false}' --model sonnet --strict-mcp-config --dangerously-skip-permissions --effort xhigh --settings $RR/city/settings.json --session-id 1a9a7c40-03ef-4caa-8412-df9368f6a538"
+  local wpool="claude --settings '{\"remoteControlAtStartup\":false}' --model sonnet --strict-mcp-config --dangerously-skip-permissions --effort xhigh --settings $RR/city/settings.json --session-id 1a9a7c40-03ef-4caa-8412-df9368f6a538"
   local crew="claude --remote-control --model opus --dangerously-skip-permissions --effort high --settings $CITY/.gc/settings.json --session-id 77d574bf-bb7f-4ae1-be33-6f72cf73b68a"
   local wcrew="claude --remote-control --model opus --dangerously-skip-permissions --effort high --settings $RR/city/settings.json --session-id 77d574bf-bb7f-4ae1-be33-6f72cf73b68a"
   fresh; pv --dry-run start dog-1 < <(req "$pool"); local got; got=$(jq -r .command "$T/out" 2>/dev/null)
-  [ $RC = 0 ] && [ "$got" = "$wpool" ]; ok $? "dry: comando do pool = o local com a cidade e o --settings reescritos (mesmos itens, mesma ordem)"
+  [ $RC = 0 ] && [ "$got" = "$wpool" ]; ok $? "dry: comando do pool = o local com a cidade e o --settings reescritos (mesmos itens, mesma ordem), e o lançador do mini vira claude no host"
   has "$T/out" '--dangerously-skip-permissions' && has "$T/out" '--model sonnet' && has "$T/out" 'remoteControlAtStartup'; ok $? "dry: --dangerously-skip-permissions, --model e o --settings inline do pool presentes"
   ! echo "$got" | grep -q -- '--remote-control'; ok $? "dry: pool não ganha --remote-control que não pediu"
+  fresh; pv --dry-run start dog-1 < <(req "$CITY/packs/town-deltas/assets/scripts/claude-lowprio.sh --x"); [ "$(jq -r .command "$T/out")" = "claude --x" ]; ok $? "dry: o lançador claude-lowprio.sh também vira claude no host"
+  for c in "$CITY/packs/town-deltas/assets/scripts/claude-ctxcap-ab.sh.bak --x|$RR/city/packs/town-deltas/assets/scripts/claude-ctxcap-ab.sh.bak --x" \
+           "$CITY/packs/outro/assets/scripts/claude-ctxcap-ab.sh --x|$RR/city/packs/outro/assets/scripts/claude-ctxcap-ab.sh --x" \
+           "env X=1 $CITY/packs/town-deltas/assets/scripts/claude-ctxcap-ab.sh --x|env X=1 $RR/city/packs/town-deltas/assets/scripts/claude-ctxcap-ab.sh --x"; do
+    fresh; pv --dry-run start dog-1 < <(req "${c%%|*}"); [ "$(jq -r .command "$T/out")" = "${c##*|}" ]; ok $? "dry: parecido com o lançador, mas não é: fica como veio (${c%%|*})"
+  done
   fresh; pv --dry-run start thies-wa < <(req "$crew"); got=$(jq -r .command "$T/out")
   [ "$got" = "$wcrew" ] && echo "$got" | grep -q -- '--remote-control'; ok $? "dry: sessão com --remote-control leva --remote-control"
   echo "$got" | grep -q -- "--settings $RR/city/settings.json"; ok $? "dry: --settings aponta para o arquivo que o bundle instala ($RR/city/settings.json)"
@@ -528,6 +534,10 @@ echo "== $((n-fails))/$n ok =="
   mutant mbp "list-running apaga registro mais novo que a pergunta" 's/ and os.stat(os.path.join(run_d, m)).st_mtime < t0//'
   mutant mbp "notebook sem regra de presença aceito" 's/if self.sleeps and not self.gate:/if False:/'
   mutant mbp "número do pool lido como host" 's/if m and m.group(1).isdigit():/if False:/'
+  mutant dry "lançador de pool do mini não vira claude" 's/^    command = re.sub(.*$/    command = m.map(req.get("command") or "")/'
+  mutant dry "lançador de pool: sem a âncora do começo (env X=1 <lançador> também vira)" 's/re.sub("^" + /re.sub("" + /'
+  mutant dry "lançador de pool: sem a fronteira do fim (<lançador>.bak também vira)" 's/ + r"(?=\\s|\$)", "claude"/ + "", "claude"/'
+  mutant dry "lançador de pool: de qualquer pasta de packs (packs/outro também vira)" 's#^POOL_WRAPPER = "/packs/town-deltas/assets/scripts/#POOL_WRAPPER = "/packs/[^ ]*/#'
   mutant dry "filtro de env" 's/ or (SECRETISH.search(k) and k not in cfg.env_allow)//;s/not ENV_OK.fullmatch(k)/False/'
   mutant proto "exit 2 das desconhecidas" 's/        return 2$/        return 0/'
   mutant down "marcador de fim" 's/if BEGIN not in lines or END not in lines:/if BEGIN not in lines:/'

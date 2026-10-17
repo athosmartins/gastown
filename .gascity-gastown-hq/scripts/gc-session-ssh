@@ -21,7 +21,8 @@ O QUE FAZ
   start: confere o teto do host (`cap`) e a existência NO MESMO script que abre a sessão, sob flock no mini; reescreve os caminhos do
   mini para os do host com as MESMAS regras do remote-bundle-build.py (cidade → <remote_root>/city, ~/gt → <remote_root>/work, home →
   remote_home, e <cidade>/.gc/settings.json → <remote_root>/city/settings.json, onde o bundle o instala); passa o comando como veio
-  (--settings, --dangerously-skip-permissions, --model, --remote-control...) mais o prompt de partida (prompt_suffix/prompt_flag do
+  (--settings, --dangerously-skip-permissions, --model, --remote-control...; o lançador de pool do mini, claude-ctxcap-ab.sh ou claude-lowprio.sh,
+  que não existe no host, vira `claude`) mais o prompt de partida (prompt_suffix/prompt_flag do
   JSON do start — campos que o patch do engine acrescenta); grava tudo num lançador temporário que se apaga ao rodar.
   Falha de ssh = erro visível (stderr, exit 1, linha em <estado>/session-ssh.log) e nada pela metade; o mini não é tocado.
   "Não sei" nunca vira resposta: se o ssh responde mas o tmux do host não consegue olhar (ex.: socket sem permissão), as operações sobre
@@ -92,6 +93,11 @@ BEGIN, END = "@@GC-BEGIN@@", "@@GC-END@@"
 EX_CAP, EX_EXISTS, EX_POLICY = 10, 11, 12
 TEST_RE = re.compile(r"remote-(?:e2e|test)-[A-Za-z0-9_-]+")  # a sessão MÍNIMA de teste: a única que abre sem a liberação e sem o guarda de clone
 GUARD = "remote-clone-guard.py"
+# Lançadores de pool do MINI: claude-lowprio.sh baixa a prioridade (renice) e carrega o A/B de --effort; claude-ctxcap-ab.sh carrega o A/B de --autocompact
+# (os dois A/B são inertes sem o .conf na cidade); ambos dão exec no claude. O bundle não leva <cidade>/packs, então o caminho reescrito apontaria para
+# um arquivo que NÃO existe no host e o lançador derrubaria a sessão com "comando não encontrado" (ga-2hd02v.1.5.3, ponto em aberto 1): no host o
+# comando começa direto no `claude`, e a sessão remota fica FORA desses dois A/B (e do claude-lowprio.log).
+POOL_WRAPPER = "/packs/town-deltas/assets/scripts/claude-(?:ctxcap-ab|lowprio)\\.sh"
 # o ssh leva `sh -c '<RUNNER>'` (uma string, qualquer shell de login a entende) e o script vai pela entrada padrão: não há limite de
 # argv (o prompt tem dezenas de KB) e o script lê a entrada inteira ANTES de rodar, então comando nenhum dele a come.
 RUNNER = 'umask 077; f=$(mktemp) || exit 125; cat >"$f"; sh "$f" </dev/null; rc=$?; rm -f "$f"; exit $rc'
@@ -322,7 +328,7 @@ def plan_start(cfg: Cfg, name: str, req: dict) -> dict:
             raise Fail(f"start: '{k}' tem que ser texto")
     m = Mapper(cfg, env_in.get("GC_CITY") or os.environ.get("GC_CITY") or cfg.city_guess)
     workdir = m.map(req.get("work_dir") or "") or cfg.home
-    command = m.map(req.get("command") or "")
+    command = re.sub("^" + re.escape(cfg.root + "/city") + POOL_WRAPPER + r"(?=\s|$)", "claude", m.map(req.get("command") or ""))
     if not command.strip():
         raise Fail("start sem command")
     env, dropped = {}, []
