@@ -2,7 +2,7 @@
 """daemon-unverified-sweep.selftest.py — selftest do vigia semanal de delivery:daemon-unverified (ga-iyfe83).
 
 Roda o vigia DE VERDADE (subprocess) num mundo falso mas fiel: repo git real, `bd`/`launchctl`/`ps` falsos que gravam
-cada chamada (o `bd` respeita --all e --limit) e um LaunchAgents com plists de verdade.
+cada chamada (o `bd` respeita --label, --all, --limit e --include-infra) e um LaunchAgents com plists de verdade.
 Protege a regra de TRÊS estados que nunca colapsam (CONFIRMADO · AINDA NÃO VISTO · NÃO CONSEGUI SABER) e, acima de
 tudo, que "leitura falhou" NUNCA vira CONFIRMADO.
 
@@ -44,10 +44,11 @@ if argv[:1] == ["-C"]:
 if not argv or argv[0] != "list":
     sys.stderr.write("fake bd: so sei 'list'\n"); sys.exit(2)
 labels = [argv[i + 1] for i, a in enumerate(argv) if a == "--label" and i + 1 < len(argv)]
-if "delivery:daemon-unverified" not in labels:
+marker_q = "type:quality-gate-marker" in labels
+if "delivery:daemon-unverified" not in labels and not marker_q:
     sys.stderr.write("fake bd: consulta inesperada %%r\n" %% (labels,)); sys.exit(2)
-# falha injetada: sempre (fail/<store>) ou as N primeiras chamadas (flaky/<store>)
-failp = os.path.join(fake, "fail", store)
+# falha injetada: sempre (fail/<store>, fail/<store>.markers p/ a consulta de marcadores) ou as N primeiras (flaky/<store>)
+failp = os.path.join(fake, "fail", store + (".markers" if marker_q else ""))
 if os.path.exists(failp):
     sys.stderr.write("[mysql] i/o timeout\nError: search count issues: invalid connection\n"); sys.exit(1)
 flakyp = os.path.join(fake, "flaky", store)
@@ -56,10 +57,16 @@ if os.path.exists(flakyp):
     if n > 0:
         open(flakyp, "w").write(str(n - 1))
         sys.stderr.write("Error: invalid connection\n"); sys.exit(1)
+rawp = os.path.join(fake, "markers.raw")           # resposta crua (JSON torto) pra consulta de marcadores
+if marker_q and os.path.exists(rawp):
+    sys.stdout.write(open(rawp).read()); sys.exit(0)
 datap = os.path.join(fake, "stores", store + ".json")
 data = json.load(open(datap)) if os.path.exists(datap) else []
+data = [b for b in data if all(l in b.get("labels", []) for l in labels)]      # --label repetido = E
 if "--all" not in argv:                      # `bd list` sem --all não traz os fechados
     data = [b for b in data if b.get("status") != "closed"]
+if "--include-infra" not in argv:            # o bd 1.1.0 omite o bead efêmero (o marcador de gate velho é um)
+    data = [b for b in data if not b.get("ephemeral")]
 lim = argv[argv.index("--limit") + 1] if "--limit" in argv else "50"
 print(json.dumps(data if lim == "0" else data[:int(lim)]))   # sem `--limit 0` o bd corta em 50 (ga-21kmp)
 '''
@@ -123,6 +130,7 @@ class World:
         os.makedirs(self.repo)
         self.git("init", "-q", "-b", "main")
         self.beads = {"hq": [], "rig": []}
+        self.markers = []                          # marcadores de gate: moram na loja HQ, de qualquer rig
         self.env_extra = {}
         self._pid = 1000
 
@@ -175,8 +183,22 @@ class World:
             "labels": ["delivery:daemon-unverified"],
         })
 
+    def marker(self, bead_id, sha=None, closed_at=T0, passed=True, close_reason=None):
+        reason = close_reason if close_reason is not None else "Gate marker terminal: PASSED (branch b merged sha=%s)" % sha
+        self.markers.append({
+            "id": "ga-mk%03d" % len(self.markers), "status": "closed", "ephemeral": True, "close_reason": reason,
+            "closed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(closed_at)) if closed_at else None,
+            "labels": ["type:quality-gate-marker", "gate-status:passed" if passed else "gate-status:failed",
+                       "source-bead:" + bead_id]})
+
+    def marker_calls(self):
+        return [c for c in self.calls("bd") if "type:quality-gate-marker" in c]
+
     def fail(self, store):
         open(os.path.join(self.fake, "fail", os.path.basename(getattr(self, store + "_store"))), "w").close()
+
+    def fail_markers(self):
+        open(os.path.join(self.fake, "fail", os.path.basename(self.hq_store) + ".markers"), "w").close()
 
     def flaky(self, store, n):
         with open(os.path.join(self.fake, "flaky", os.path.basename(getattr(self, store + "_store"))), "w") as f:
@@ -185,7 +207,7 @@ class World:
     def run(self, *flags, now=T0 + 10 * D, extra_env=None):
         for key, store in (("hq", self.hq_store), ("rig", self.rig_store)):
             with open(os.path.join(self.fake, "stores", os.path.basename(store) + ".json"), "w") as f:
-                json.dump(self.beads[key], f)
+                json.dump(self.beads[key] + (self.markers if key == "hq" else []), f)
         env = dict(os.environ)
         env.update({
             "DUS_FAKE_DIR": self.fake, "DUS_BD": os.path.join(self.bin, "bd"),
@@ -400,12 +422,249 @@ class SweepTest(unittest.TestCase):
         self.assertEqual(b["owner_states"]["com.test.b"], [NCS, "launchctl-read-failed"], b)   # e a falha de b continua visível
         self.assertEqual(r.returncode, 3, r.stderr)                         # ... e conta no rc (o veredito AINDA não a esconde)
 
-    def test_daemon_que_nao_e_keepalive_nao_da_pra_saber_nesta_fatia(self):
+    # ---- fatia 2: sha pelo marcador do gate -------------------------------------------------------------------------
+
+    def marker_world(self, started):
+        """Dono 'svc'; o bead fechou SEM sha no close_reason (o gate fechou depois: closed_at T0+9D); o marcador
+        diz que o merge foi em T0+5D. O daemon sobe em `started`."""
         w = self.w
-        self.daemon_world(keepalive=False)                                  # plist sem KeepAlive (periódico / por evento)
-        w.loaded("com.test.svc")
+        sha = self.daemon_world(merge_at=T0 + 9 * D)
+        w.beads["hq"][0]["close_reason"] = "Story DELIVERED — story:done. DAEMON LIVENESS NOT VERIFIED"
+        w.marker("ga-aaa111", sha, closed_at=T0 + 5 * D)
+        w.loaded("com.test.svc", pid=w.next_pid(), start=started)
+        return sha
+
+    def test_sha_pelo_marcador_vale_a_hora_do_marcador_nos_tres_estados(self):
+        w = self.w
+        self.marker_world(started=T0 + 6 * D)             # depois do merge (T0+5D), ANTES do closed_at do bead (T0+9D)
+        r = w.run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.verdict("ga-aaa111", CONFIRMADO, "started-after-merge")      # a hora do bead daria AINDA: o merge é a do marcador
+        w.proc_start(str(w._pid), T0 + 4 * D)
         w.run()
-        self.verdict("ga-aaa111", NCS, "not-keepalive")   # nunca CONFIRMADO só porque carregou
+        self.verdict("ga-aaa111", AINDA, "started-before-merge")
+        w.markers.clear()                                                  # sem marcador (e sem sha no bead): não sei
+        w.run()
+        self.verdict("ga-aaa111", NCS, "no-merge-sha")
+
+    def test_marcador_mais_recente_vence_o_re_merge_em_qualquer_ordem(self):
+        w = self.w
+        sha = self.marker_world(started=T0 + 6 * D)
+        w.markers.clear()
+        w.marker("ga-aaa111", "ab" * 20, closed_at=T0 + 3 * D)             # o merge antigo (sha que não está no disco)
+        w.marker("ga-aaa111", sha, closed_at=T0 + 5 * D)                   # o re-merge, mais novo
+        w.run()
+        self.verdict("ga-aaa111", CONFIRMADO)
+        w.markers.reverse()                                                # a ordem da listagem não decide
+        w.run()
+        self.verdict("ga-aaa111", CONFIRMADO)
+
+    def test_marcador_com_data_ilegivel_nao_e_ignorado_nem_vira_confirmado(self):
+        w = self.w
+        sha = self.marker_world(started=T0 + 6 * D)
+        w.marker("ga-aaa111", sha, closed_at=T0 + 8 * D)                   # pode ser o re-merge mais novo: sem data, não julgo
+        w.markers[-1]["closed_at"] = "ontem à tarde"
+        r = w.run()
+        self.verdict("ga-aaa111", NCS, "bad-timestamp")                    # mesmo havendo outro marcador legível
+        self.assertEqual(r.returncode, 3, r.stderr)
+
+    def test_marcador_sem_sha_ou_de_gate_reprovado_nao_da_sha(self):
+        w = self.w
+        sha = self.marker_world(started=T0 + 6 * D)
+        w.markers.clear()
+        w.marker("ga-aaa111", closed_at=T0 + 5 * D, close_reason="Gate marker terminal: PASSED (sem sha aqui)")
+        w.marker("ga-aaa111", sha, closed_at=T0 + 5 * D, passed=False)    # reprovado: o código NÃO entrou
+        w.run()
+        self.verdict("ga-aaa111", NCS, "no-merge-sha")
+
+    def test_consulta_de_marcadores_que_falha_nao_vira_bead_sem_marcador(self):
+        w = self.w
+        self.marker_world(started=T0 + 6 * D)
+        for i in (1, 2):
+            w.bead("ga-mk-bead%d" % i, rig="rig" if i == 2 else "hq", close_reason="sem sha", closed_at=T0 + 5 * D)
+        w.fail_markers()
+        r = w.run()
+        for bid in ("ga-aaa111", "ga-mk-bead1", "ga-mk-bead2"):
+            self.verdict(bid, NCS, "marker-read-failed")                  # ≠ no-merge-sha
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertEqual(len(w.marker_calls()), 3, w.marker_calls())      # 3 tentativas da UMA consulta, não 3 por bead
+        mk = w.report()["markers"]
+        self.assertEqual((mk["read"], mk["ok"]), (True, False))
+        self.assertIn("marcadores: FALHOU", r.stdout)
+
+    def test_resposta_torta_na_consulta_de_marcadores_tambem_e_leitura_que_falhou(self):
+        w = self.w
+        self.marker_world(started=T0 + 6 * D)
+        for raw in ('{"nao": "lista"}', '["texto"]', "isto nao e json"):
+            with open(os.path.join(w.fake, "markers.raw"), "w") as f:
+                f.write(raw)
+            r = w.run()
+            self.verdict("ga-aaa111", NCS, "marker-read-failed")
+            self.assertEqual(r.returncode, 3, (raw, r.stderr))
+
+    def test_uma_unica_consulta_de_marcadores_por_execucao_e_so_se_precisa(self):
+        w = self.w
+        sha = self.marker_world(started=T0 + 6 * D)
+        for i in (1, 2):
+            bid = "ga-mk-bead%d" % i
+            w.bead(bid, rig="rig" if i == 2 else "hq", close_reason="sem sha", closed_at=T0 + 5 * D)
+            w.marker(bid, sha, closed_at=T0 + 5 * D)
+        r = w.run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = w.marker_calls()
+        self.assertEqual(len(calls), 1, calls)                             # 3 beads, 2 lojas, UMA consulta
+        for part in ("-C " + w.hq_store, "--label gate-status:passed", "--all", "--limit 0", "--include-infra"):
+            self.assertIn(part, calls[0])                                  # na loja HQ, sem corte e com os efêmeros
+        mk = w.report()["markers"]
+        self.assertEqual((mk["read"], mk["ok"], mk["n"]), (True, True, 3))
+        self.assertIsInstance(mk["seconds"], float)
+        self.assertRegex(r.stdout, r"marcadores: n=3 em [0-9.]+s")
+        self.assertEqual([w.state_of(b)["state"] for b in ("ga-mk-bead1", "ga-mk-bead2")], [CONFIRMADO] * 2)
+        w.markers.clear()
+        w.beads["hq"][:] = [b for b in w.beads["hq"] if b["id"] == "ga-aaa111"]
+        w.beads["hq"][0]["close_reason"] = "PASSED (sha=%s)" % sha        # nenhum bead precisa do marcador: nenhuma consulta
+        w.beads["rig"].clear()
+        os.unlink(os.path.join(w.fake, "bd.calls"))
+        r = w.run()
+        self.assertEqual(w.marker_calls(), [])
+        self.assertEqual(w.report()["markers"], {"read": False})
+        self.assertNotIn("marcadores:", r.stdout)
+
+    # ---- fatia 2: dono pelo closure do deploy_deps.json -------------------------------------------------------------
+
+    def deps_map(self, **daemons):
+        return json.dumps({"_generated_by": "t", "daemons": {k: {"label": k, "closure": v, "assets": [], "n": len(v), "port": 0}
+                                                              for k, v in daemons.items()}})
+
+    def deps_world(self, started, map_at_merge="com.test.svc"):
+        """svc roda bin/svc.sh; o merge mexeu só em lib/util.py (que svc importa, segundo o mapa)."""
+        w = self.w
+        files = {"bin/svc.sh": "echo\n", "lib/util.py": "v1\n"}
+        if map_at_merge:
+            files["daemons/deploy_deps.json"] = self.deps_map(**{map_at_merge: ["bin/svc.sh", "lib/util.py"]})
+        w.commit(files, "feat: svc + lib")
+        sha = w.commit({"lib/util.py": "v2\n"}, "fix(ga-eee555): lib v2")
+        w.plist("com.test.svc", "bin/svc.sh", KeepAlive=True)
+        w.bead("ga-eee555", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
+        w.loaded("com.test.svc", pid=w.next_pid(), start=started)
+        return sha
+
+    def test_arquivo_de_lib_no_closure_do_mapa_da_dono_ao_daemon_nos_tres_estados(self):
+        w = self.w
+        self.deps_world(started=T0 + 6 * D)
+        r = w.run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        b = self.verdict("ga-eee555", CONFIRMADO)
+        self.assertEqual(b["owners"], ["com.test.svc"])
+        w.proc_start(str(w._pid), T0 + 4 * D)
+        w.run()
+        self.verdict("ga-eee555", AINDA)
+        w.plist("com.test.outro", "bin/outro.sh", KeepAlive=True)         # (uma pasta de LaunchAgents vazia seria plist-read-failed)
+        os.unlink(os.path.join(w.la, "com.test.svc.plist"))               # sem o plist o label do mapa não é dono
+        w.run()
+        self.verdict("ga-eee555", NCS, "no-daemon")
+
+    def test_rig_sem_mapa_nao_e_leitura_que_falhou(self):
+        w = self.w
+        self.deps_world(started=T0 + 6 * D, map_at_merge=None)
+        r = w.run()
+        self.verdict("ga-eee555", NCS, "no-daemon")                       # ≠ deps-read-failed: não ter o mapa é normal
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_dono_pelo_mapa_do_merge_ou_pelo_do_head_conta_nos_dois_casos(self):
+        w = self.w
+        self.deps_world(started=T0 + 4 * D)
+        w.commit({"daemons/deploy_deps.json": self.deps_map(**{"com.test.outro": ["x.py"]})}, "chore: mapa novo sem a lib")
+        w.run()
+        self.verdict("ga-eee555", AINDA)                                  # só o mapa do sha tem a lib: o dono não some
+        w2 = World()                                                       # e o inverso: o mapa só do HEAD (rig que ganhou o mapa depois)
+        self.addCleanup(w2.cleanup)
+        self.w = w2
+        self.deps_world(started=T0 + 4 * D, map_at_merge=None)
+        w2.commit({"daemons/deploy_deps.json": self.deps_map(**{"com.test.svc": ["lib/util.py"]})}, "chore: mapa")
+        w2.run()
+        self.verdict("ga-eee555", AINDA)
+
+    def test_label_do_mapa_sem_plist_nao_vira_dono_nem_erro(self):
+        w = self.w
+        self.deps_world(started=T0 + 6 * D)
+        w.commit({"daemons/deploy_deps.json": self.deps_map(**{"com.test.svc": ["lib/util.py"], "com.test.fantasma": ["lib/util.py"]})})
+        r = w.run()
+        b = self.verdict("ga-eee555", CONFIRMADO)
+        self.assertEqual(b["owners"], ["com.test.svc"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_mapa_ilegivel_nao_vira_sem_dono_nem_confirmado(self):
+        w = self.w
+        self.deps_world(started=T0 + 6 * D)                                # sem a falha: CONFIRMADO
+        for bad in ("{ isto nao e json", '{"daemons": []}', '{"daemons": {"a": {"closure": ["x"]}}}', '{"daemons": {"a": {"label": "a", "closure": [["x"]]}}}',
+                    '{"daemons": {"a": {"label": "a"}}}', '{"daemons": {"a": {"label": "a", "closure": "lib/util.py"}}}'):
+            w.commit({"daemons/deploy_deps.json": bad}, "chore: mapa quebrado")
+            r = w.run()
+            self.verdict("ga-eee555", NCS, "deps-read-failed")
+            self.assertEqual(r.returncode, 3, (bad, r.stderr))
+
+    # ---- fatia 2: daemon periódico (StartInterval / StartCalendarInterval) e por evento -----------------------------
+
+    def periodic_world(self, **plist_keys):
+        """Job 'job' (sem KeepAlive), carregado e sem PID entre disparos; merge em T0+5D, agora = T0+10D (5 dias depois)."""
+        w = self.w
+        w.commit({"bin/job.sh": "v1\n"}, "feat: job")
+        sha = w.commit({"bin/job.sh": "v2\n"}, "fix(ga-ppp777): job v2")
+        w.plist("com.test.job", "bin/job.sh", **plist_keys)
+        w.loaded("com.test.job")
+        w.bead("ga-ppp777", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
+
+    def test_periodico_confirma_so_quando_um_periodo_inteiro_ja_passou_desde_o_merge(self):
+        w = self.w
+        self.periodic_world(StartInterval=5 * D)                           # exatamente 5 dias = o tempo desde o merge
+        r = w.run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.verdict("ga-ppp777", CONFIRMADO, "period-elapsed")            # o limite é inclusivo
+        w.plist("com.test.job", "bin/job.sh", StartInterval=5 * D + 1)
+        w.run()
+        self.verdict("ga-ppp777", AINDA, "period-not-elapsed")
+        w.plist("com.test.job", "bin/job.sh", StartInterval=H)
+        w.run()
+        self.verdict("ga-ppp777", CONFIRMADO, "period-elapsed")
+        os.unlink(os.path.join(w.fake, "launchctl", "com.test.job"))       # periódico que nem está carregado
+        w.run()
+        self.verdict("ga-ppp777", AINDA, "not-loaded")
+
+    def test_periodico_por_calendario_usa_o_maior_vao_da_entrada_e_o_menor_entre_entradas(self):
+        w = self.w
+        self.periodic_world(StartInterval=H)
+        casos = [({"Minute": 30}, CONFIRMADO), ({"Hour": 3, "Minute": 0}, CONFIRMADO), ({"Weekday": 1, "Hour": 3}, AINDA),
+                 ({"Day": 1, "Hour": 3}, AINDA), ({"Month": 12, "Day": 1}, AINDA),
+                 ([{"Weekday": 1, "Hour": 3}, {"Hour": 9}], CONFIRMADO),    # o diário dispara a cada dia: o menor vão vale
+                 ([{"Weekday": 1}, {"Weekday": 4}], AINDA)]                 # vãos de 7 dias (conservador): 5 dias não bastam
+        for cal, want in casos:
+            w.plist("com.test.job", "bin/job.sh", StartCalendarInterval=cal)
+            w.run()
+            self.verdict("ga-ppp777", want)
+        w.plist("com.test.job", "bin/job.sh", StartInterval=7 * D, StartCalendarInterval={"Hour": 3})   # os dois: o menor
+        w.run()
+        self.verdict("ga-ppp777", CONFIRMADO, "period-elapsed")
+
+    def test_periodo_que_nao_se_le_nao_vira_periodo_zero_nem_confirmado(self):
+        w = self.w
+        self.periodic_world(StartInterval=H)
+        for keys in ({"StartInterval": 0}, {"StartInterval": -5}, {"StartInterval": True}, {"StartInterval": "3600"},
+                     {"StartCalendarInterval": []}, {"StartCalendarInterval": ["x"]}):
+            w.plist("com.test.job", "bin/job.sh", **keys)
+            r = w.run()
+            self.verdict("ga-ppp777", NCS, "plist-read-failed")
+            self.assertEqual(r.returncode, 3, (keys, r.stderr))
+
+    def test_daemon_por_evento_ou_de_tipo_desconhecido_nao_da_pra_saber(self):
+        w = self.w
+        self.periodic_world(WatchPaths=["/tmp/x"])
+        for keys, why in (({"WatchPaths": ["/tmp/x"]}, "event-driven"), ({"QueueDirectories": ["/tmp/q"]}, "event-driven"),
+                          ({"RunAtLoad": True}, "unknown-kind")):
+            w.plist("com.test.job", "bin/job.sh", **keys)
+            r = w.run()
+            self.verdict("ga-ppp777", NCS, why)                            # nunca CONFIRMADO só porque está carregado
+            self.assertEqual(r.returncode, 0, r.stderr)                    # é NCS de conteúdo, não leitura que falhou
 
     def test_sha_no_close_reason_mas_bead_sem_closed_at_nao_e_no_merge_sha(self):
         w = self.w
