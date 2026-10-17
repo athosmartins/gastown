@@ -340,6 +340,9 @@ g_mbp() {
   mode uso; pv gate m </dev/null; [ $RC = 1 ] && [ "$(jq -r .ok "$T/out")" = false ] && jq -r .reason "$T/out" | grep -q 'Athos está no MBP'; ok $? "mbp: gate m com o Athos usando → exit 1 e o motivo"
   pv gate a </dev/null; [ $RC = 0 ] && jq -r .reason "$T/out" | grep -q 'não tem regra de presença'; ok $? "mbp: gate de um host sem regra de presença → ok (o servidor Linux não depende do Athos)"
   pv gate zz </dev/null; [ $RC = 1 ]; ok $? "mbp: gate de host desconhecido → exit 1"
+  pv gate "" </dev/null; [ $RC = 2 ] && has "$T/err" 'falta o host'; ok $? "mbp: gate com host VAZIO → exit 2 (uso), não o veredito do default_host (gate ga-ie7fcr)"
+  mode livre; pv --dry-run gate m </dev/null; [ $RC = 2 ] && [ "$(jq -r .ok "$T/out")" = null ]; ok $? "mbp: gate em dry-run num host com presença → exit 2 e ok=null (não 'libera')"
+  mode livre; GC_SSH_DRYRUN=1 pv gate m </dev/null; [ $RC = 2 ]; ok $? "mbp: GC_SSH_DRYRUN=1 vazado → gate exit 2, não 'sempre libera'"
   [ "$(count x "${SOCK}m")" = 1 ]; ok $? "mbp: gate não abre nem fecha nenhuma sessão"
   # --- list-running: todos os hosts; o notebook dormindo não derruba a lista ---
   pv stop w-remote-m-1 </dev/null; pv start w-a-1 < <(req cat); mode livre; pv start w-remote-m-3 < <(req cat)
@@ -417,6 +420,8 @@ echo "== $((n-fails))/$n ok =="
   mutant mbp "presence_gate fora de true/false aceito" 's/if k in h and not isinstance(h\[k\], bool):/if False:/'
   mutant mbp "list-running exige default_host" 's/^    cfg_hosts = load_config()\[2\].get("hosts")$/    cfg_hosts = Cfg().names/'
   mutant mbp "sem regra de presença no start" 's/if cfg.gate and not dry:/if False:/'
+  mutant mbp "gate com host vazio avalia o default_host" 's/        if op == "gate" and not arg:  #/        if False:  #/'
+  mutant mbp "gate em dry-run libera" 's/    if cfg.gate and dry:/    if False:/'
   mutant mbp "presença ilegível passa (só 'uso' explícito recusa)" 's/if kv.get("presence") != "livre":/if kv.get("presence") == "uso":/'
   mutant mbp "pausa local ignorada" 's/if kv.get("paused") != "0" or kv.get("paused_local") != "0":/if kv.get("paused") != "0":/'
   mutant mbp "rc 99 (pausa/bandeira) não reconhecido" 's/if r.returncode == 99:/if False:/'

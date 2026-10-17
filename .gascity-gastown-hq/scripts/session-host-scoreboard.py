@@ -42,6 +42,9 @@ NIGHT_FROM, NIGHT_TO = 20, 8  # horas locais
 
 
 def role(name: str) -> str:
+    """O papel pelo nome da sessão SEM o qualificador: o motor escreve `gastown.dog-2` (pack.) e `whatsapp_automation/claude-…` (rig/);
+    sem tirar o prefixo, metade dos construtores do mini caía em "outros" (gate ga-ie7fcr: 164 gastown.dog-N num dia)."""
+    name = re.split(r"[./]", name)[-1] if re.match(r"^[\w-]+[./]", name) else name
     for r in REVIEWERS:
         if name == r or name.startswith(r + "-"):
             return "revisor"
