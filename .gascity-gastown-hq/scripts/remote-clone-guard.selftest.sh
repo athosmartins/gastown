@@ -469,6 +469,9 @@ g_cond() {  # gate da fatia 6a (tentativa 3): a variável em que o guarda DECIDE
   b 2 "cond: '# <<EOF' é comentário, a linha seguinte roda" "echo hi # <<EOF
 git -C $OTH commit -m x
 EOF"
+  b 2 "cond: 'cat /dev/null # <<EOF' — leitor de dados, mas o <<EOF é comentário: a linha seguinte roda" "cat /dev/null # <<EOF
+git -C $OTH commit -m x
+EOF"
   b 2 "cond: <<EOF dentro de \$(( )) não abre heredoc" "echo \$((1<<2))
 git -C $OTH commit -m x
 EOF"
@@ -563,10 +566,16 @@ EOF"
 git -C $OTH commit -m x
 EOF"
   b 2 "ctx: \$'\\UFFFFFFFF' + glob + g''it, cwd fora do território (o guarda não pode cair)" "echo \$'\\UFFFFFFFF'; cd g?*/r/wt/other && g''it commit -m x" "$HOME/gt-remote"
-  run "$OWN" < <(printf '{"tool_name":"Bash","cwd":"%s","tool_input":["g%sit commit"]}' "$OWN" "''")
+  run "$OWN" < <(printf '{"tool_name":"Bash","cwd":"%s","tool_input":["g%sit commit"]}' "$HOME" "''")
   [ "$RC" = 2 ]; ok $? "ctx: Bash cujo tool_input não é objeto e não cita 'git': o guarda cai e BLOQUEIA (rc=$RC)"
   b 0 "ctx: controle — \$'\\UFFFFFFFF'; git commit no próprio (o escape não derruba o guarda)" "echo \$'\\UFFFFFFFF'; git commit -m x"
   b 0 "ctx: controle — \"cat\" <<'EOF' cita o alheio (leitor entre aspas segue sendo dado)" "\"cat\" <<'EOF'
+git -C $OTH commit -m x
+EOF"
+  b 0 "ctx: controle — cat<<'EOF' (colado) cita o alheio: segue sendo dado" "cat<<'EOF'
+git -C $OTH commit -m x
+EOF"
+  b 0 "ctx: controle — 2>/dev/null cat <<'EOF' cita o alheio: segue sendo dado" "2>/dev/null cat <<'EOF'
 git -C $OTH commit -m x
 EOF"
   b 0 "ctx: controle — export FOO=1; bash -c 'git commit' no próprio" "export FOO=1; bash -c 'git commit -m x'"
@@ -786,7 +795,7 @@ echo "== $((n-fails))/$n ok =="
   mutant lexe "a palavra vazia vale como operador" 's/(t.translate(UNPROT), bool(t) and set(t)/(t.translate(UNPROT), set(t)/'
   mutant lexd "\$'…' não é aberto (o \$ fica e o git vira \$git)" "s/elif c == \"\\\$\" and cmd\[i + 1:i + 2\] == \"'\":/elif False:/"
   mutant lexd "\$\"…\" não perde o \$" "s/elif c == \"\\\$\" and cmd\[i + 1:i + 2\] == '\"':/elif False:/"
-  mutant lexd "escape hexadecimal de \$'…' não é decodificado" 's/return chr(int(e\[1:\], 16))/return m.group(0)/'
+  mutant lexd "escape hexadecimal de \$'…' não é decodificado" 's/return chr(min(int(e\[1:\], 16), 0x10FFFF))/return m.group(0)/'
   mutant lexd "escape octal de \$'…' não é decodificado" 's/return chr(int(e, 8) & 255)/return m.group(0)/'
   mutant lexd "aspa escapada dentro de \$'…' (\\') fecha o \$'…'" 's/j += 2 if cmd\[j\] == "\\\\" else 1/j += 1/'
   mutant lexd "\$S<hex>\$ de um \$( ) colado numa aspa perde o \$ final" 's/elif c == "\$" and (m := SUBST.match(cmd, i)):/elif False:/'

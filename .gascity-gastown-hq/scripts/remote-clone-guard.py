@@ -40,7 +40,7 @@ CFG_ENV = re.compile(r"GIT_(?:CONFIG\w*|EXTERNAL_DIFF|PAGER|SSH\w*|ASKPASS|EDITO
 PUNCT, SEPS = set("();<>|&"), {";", "&&", "||", "|", "&", "|&", ";;"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh"}
 DATA = {"cat", "tee", "git", "gh", "bd", "gc", "jq", "grep", "head", "tail", "wc", "sort", "uniq", "tr", "cut", "base64", "diff", "read", "mapfile", "true", ":"}  # leitores de heredoc que tratam o corpo como DADO; quem não está aqui pode executá-lo
-REDIR = re.compile(r"(?<![\w$])\d*(?:<<-?|<>|>>|>&|<&|>\||[<>])[ \t]*(?:'[^']*'|\"[^\"]*\"|[^\s;&|()<>'\"]+)?")  # `sh<<EOF`, `<<EOF bash`, `2>/dev/null sh <<EOF`: sem os redirecionamentos sobra o comando
+REDIR = re.compile(r"(?:(?<![\w$])\d+)?(?:<<-?|<>|>>|>&|<&|>\||[<>])[ \t]*(?:'[^']*'|\"[^\"]*\"|[^\s;&|()<>'\"]+)?")  # `sh<<EOF`, `<<EOF bash`, `2>/dev/null sh <<EOF`: sem os redirecionamentos sobra o comando
 # Embrulhos que o guarda descasca, cada um com a tabela das SUAS opções (uma tabela só para todos foi a brecha: `sudo -n` herdava o `-n` do xargs, que leva
 # argumento, e o `git` virava o argumento). Quatro listas por embrulho: sem argumento · com argumento no token SEGUINTE · valor sempre colado (`-i{}`, `--eof=x`) ·
 # muda o diretório onde o comando roda. Opção colada (`-oL`, `--x=y`) é uma palavra só. Opção que NÃO está na tabela = não sei onde o comando começa.
