@@ -11,57 +11,31 @@ PARA QUE SERVE
   é bloqueada com uma mensagem clara. Leitura (log/status/diff/show…) e escrita no próprio clone seguem livres. Vale sob
   `--dangerously-skip-permissions`: um hook que sai com 2 bloqueia a chamada em qualquer modo (medido no servidor, ver o runbook).
 
-COMO DECIDE (os três estados — sei que pode / sei que não pode / não sei — e o último NÃO vira "pode")
-  Território = $RCG_ROOT, senão ~/gt-remote/git. Clone próprio = o ancestral com `.git` de $CLAUDE_PROJECT_DIR (sem a variável: não há clone
-  próprio, e toda escrita no território é bloqueada). Para cada `git` do comando (depois de ; && || | ( ) { das palavras reservadas if/then/else/
-  elif/do/while/until/!/function, de cd/pushd, de command/env/sudo/xargs/nohup…, de bash -c / eval / $(…) / crases / <(…) / find -exec|-execdir|-ok|-okdir, e do
-  corpo de um heredoc ou here-string que um shell lê) o alvo é o diretório depois dos `-C` (relativos entre si), mais --git-dir/--work-tree/GIT_DIR/
-  GIT_WORK_TREE, resolvido com realpath (symlink para outro clone não escapa). Subcomando que não está na lista de LEITURA (inclusive o que não
-  conheço, alias…) conta como escrita. Leitura que traz configuração capaz de rodar um programa também conta: `-c`/`--config-env` com chave que não é só
-  de exibição ou identidade (alias.*, core.pager/fsmonitor/sshCommand, diff.external, filter.*…), `-p`/`--paginate`, `--exec-path`, GIT_CONFIG_*/GIT_PAGER/
-  GIT_EXTERNAL_DIFF/GIT_SSH*/GIT_EDITOR… (lista fechada: chave que não conheço = não sei = escrita). Alvo no território e fora do clone próprio → bloqueia; alvo que não consigo resolver ($VAR, glob, crase,
-  ~usuário) numa escrita → bloqueia, com a mensagem dizendo para usar caminho literal.
-  cd/pushd só muda o diretório que EU entendo: opções -L/-P/-e/-@, `--` e UM argumento; o resto (`cd -Z x`, dois argumentos, `pushd +1`, `pushd`
-  sozinho) deixa o diretório "não sei". E só um cd que COM CERTEZA rodou muda o diretório: cd depois de `||`, num pipeline/background, num ramo de if/case ou
-  função, ou no meio de uma cadeia `&&` que não segue até o git (`cd a 2>/dev/null || cd b; git …`, `x && cd a; git …`) deixa "não sei"; `cd a || exit` e
-  `x && cd a && git …` mantêm (o git só roda se o cd rodou). O mesmo vale para o que o git não deixa eu ler: opção de topo que não conheço (`git --nova VALOR -C x`: o VALOR pode ser
-  o valor da opção ou o subcomando) → diretório "não sei" e vale como escrita. Cada embrulho (command/env/sudo/xargs/nice/timeout/stdbuf…) tem a tabela das SUAS
-  opções (WOPT; `sudo -n` não é o `-n` do xargs) e só entendo o que está nela: opção que não está = não sei onde o comando começa, e o embrulho vale como
-  lançador OPACO (abaixo). `find -exec`/`-ok` rodam no diretório do find; `-execdir`/`-okdir` rodam no de CADA achado, que não sei qual é → "não sei" (git de
-  escrita ali só passa com `-C <caminho absoluto>`). `bash -c -e '…'`: o script é a primeira palavra depois do -c que não é opção. O número colado no
-  redirecionamento (`2>/dev/null`) é o descritor, não um argumento.
-  O que o SHELL lê como texto não é operador nem some: `;` `&` `|` `(` `)` `<` `>` entre aspas ou depois de `\` (`echo '>' && git -C x commit`, `tr -d '<>' ; git …`, o `';'` e o `\;` do find)
-  são palavras, `$'…'` (com \xHH, \NNN, \uHHHH e os escapes de uma letra decodificados) e `$"…"` também, e a palavra vazia (`''`, `""`) fica no lugar (`git -C '' -C x commit`). Só
-  pontuação sem aspas é operador — inclusive o `<<EOF` de um heredoc: entre aspas ou escapado ele é texto, e as linhas seguintes continuam sendo comandos. Um redirecionamento leva UMA palavra como alvo (e o `$( )` dela roda); se em vez de palavra vem um operador (`git … >` sem alvo, que o shell recusa),
-  o operador segue valendo e o trecho é conferido. Aspa que não fecha (ou `\` no fim): o shell recusa a linha e só roda o que veio ANTES dela, salvo se a aspa está num comentário `#`, e então o que vem DEPOIS roda;
-  como o guarda não lê comentário, a aspa solta sai do texto e o resto é conferido como comando (o que vem antes dela é lido igual).
-  Onde o git escreve por ARGUMENTO, sem -C/--git-dir: em worktree (add/remove/move/lock/repair), clone, init, checkout-index, submodule, archive, bundle e format-patch TODA palavra é
-  tratada como caminho (também o valor de `--opção=valor` e o `-oVALOR` colado), e em QUALQUER subcomando o valor de --output/--prefix/--separate-git-dir/--lost-found/--file/--template
-  (junto ou no token seguinte); resolvido como o `-C` (URL `https://…` não é caminho). Lançadores que não modelo (flock, ionice, ssh, su -c, parallel, script -c, trap, watch, tmux…; a lista OPAQUE)
-  são abertos com o diretório "não sei": o git dentro deles só passa se for leitura ou com `-C <caminho absoluto>`. Um embrulho com opção que não conheço vale como um deles.
-  Falha do próprio guarda (exceção) → bloqueia, se o pedido cita git/file_path/notebook_path; um stdin que nem é JSON e não cita nenhum dos três
-  LIBERA (lixo no stdin não derruba a sessão inteira; o Claude sempre manda JSON válido). O comando do hook é `python3 -I <este arquivo> || exit 2`,
-  então travar, sumir o python ou o arquivo também sai com 2 (o hook que sai com 1 ou 127 NÃO bloqueia: seria falha aberta).
+COMO DECIDE (os três estados — sei que pode / sei que não pode / não sei — e o último NÃO vira "pode"; detalhe e medições: docs/runbooks/hetzner-hardening.md)
+  Território = $RCG_ROOT, senão ~/gt-remote/git. Clone próprio = o ancestral com `.git` de $CLAUDE_PROJECT_DIR (sem a variável, toda escrita no território bloqueia).
+  Para cada `git` do comando (atrás de ; && || | ( ) {, de if/then/else/do/while/!/function, cd/pushd, command/env/sudo/xargs…, bash -c / eval / $(…) / crases / <(…),
+  find -exec, heredoc ou here-string que um shell lê) o alvo = diretório dos `-C` + --git-dir/--work-tree/GIT_DIR/GIT_WORK_TREE, resolvido com realpath; também
+  o destino por ARGUMENTO (worktree/clone/init/checkout-index/submodule/archive/bundle/format-patch: toda palavra; --output/--prefix/--file… em qualquer subcomando).
+  Subcomando fora da lista de LEITURA (alias, desconhecido) = escrita; leitura com configuração que roda programa (-c alias.*/core.pager…, -p, --exec-path, GIT_CONFIG_*/
+  GIT_PAGER/GIT_SSH*…; lista fechada) = escrita. Alvo no território fora do clone próprio → bloqueia; alvo que não resolvo ($VAR, glob, crase, ~usuário) numa escrita → bloqueia.
+  "Não sei" (e escrita ali bloqueia): cd/pushd com opção/forma que não entendo; cd que pode não ter rodado (depois de ||, em pipeline/background, em ramo de if/case,
+  no meio de cadeia && que não segue até o git) ou cujo diretório não existe; corpo de função roda no cwd da CHAMADA; opção de topo do git que não conheço; embrulho
+  com opção fora da tabela WOPT; lançador que não modelo (OPAQUE: flock, ssh, su, tmux…); find -execdir/-okdir. O que o SHELL lê como texto não é operador nem some:
+  pontuação entre aspas/escapada, `$'…'`, `$"…"`, palavra vazia, `<<EOF` entre aspas, em comentário ou em $(( )); heredoc de verdade some só até a linha que é
+  exatamente o delimitador (sem terminador nada some); aspa que não fecha sai do texto e o resto é conferido. Comentário `#` não é lido: o que vem depois é conferido.
+  Falha do próprio guarda (exceção) → bloqueia se o pedido cita git/file_path/notebook_path; stdin que nem é JSON e não cita nenhum LIBERA. O hook é
+  `python3 -I <este arquivo> || exit 2`: travar, sumir o python ou o arquivo também sai com 2.
 
-CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E
-  (com o settings) todo PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit é EXATAMENTE `python3 -I <este arquivo> || exit 2` (citar o arquivo
-  noutro lugar do comando não vale) e sem campo que mude QUANDO ele dispara (`if`, `async`…: só type/command/timeout) e `disableAllHooks` não está ligado nele nem em <pasta>/.claude/settings[.local].json; 1 caso contrário (é o que o
-  provider confere antes de abrir sessão real). Edit/Write em ~/.claude/hooks/** e ~/.claude/settings*.json também são bloqueados (o guarda não se
-  desliga por engano).
+CÓDIGOS: 0 liberado · 2 bloqueado. `--selfcheck [settings.json [pasta-do-projeto…]]`: 0 se o guarda decide como deveria numa pasta de teste E (com o settings) todo
+  PreToolUse de Bash/Edit/Write/MultiEdit/NotebookEdit é EXATAMENTE `python3 -I <este arquivo> || exit 2`, sem campo que mude QUANDO dispara (só type/command/timeout) e
+  sem `disableAllHooks` nele nem em <pasta>/.claude/settings[.local].json; 1 caso contrário (o provider confere antes de abrir sessão real). Edit/Write em ~/.claude/hooks/** e ~/.claude/settings*.json bloqueiam.
 
-LIMITES (é trava contra engano, não sandbox contra quem quer burlar). NÃO vejo: script que o comando executa (`bash x.sh`, `source x`), `python -c` e
-  outras linguagens, variável que guarda o git ou o diretório, comando montado em pipe (`echo '…' | sh`), função ou alias definido em OUTRA chamada,
-  CDPATH, redirecionamento de shell (`> arquivo`), `sed -i`, `rm`/`cp` no clone alheio ou nos hooks, e a configuração que JÁ está no .git/config do clone
-  alheio (alias, filter, textconv, fsmonitor: uma leitura lá a executa). A lista OPAQUE é fechada: um lançador que não
-  está nela (`lockrun git …`) esconde o git numa palavra que não abro. Falsos positivos que ficam (todos no lado fechado): git com diretório implícito atrás de um lançador da
-  lista (`flock L git commit`), de um embrulho com opção que não conheço (`sudo --nova git commit`) ou de um `-execdir`/`-okdir` bloqueia; e `git --opção-nova VALOR -C
-  <seu clone> commit` bloqueia; e, nos subcomandos de destino, TODA palavra vale como caminho: `git clone <clone alheio> <seu clone>/sub` e `git submodule add <caminho
-  no alheio> …` bloqueiam mesmo só LENDO do alheio. Escreva `git -C <caminho absoluto do seu clone>`.
-  Comentário `#` não é lido: o que vem depois dele é conferido como comando (`git status # depois; git -C <alheio> commit` bloqueia; um apóstrofo nele é só um caractere solto).
-  Destino que só vem em opção ou subcomando que a lista DEST/PATHOPT não tem (`config -f <arquivo>`, `fast-import --export-marks=…`, `pack-objects <base>`, `unpack-objects`…) NÃO é conferido:
-  rodado do clone próprio, passa. Também não vejo QUAL ref o git escreve, só ONDE ele roda: do clone PRÓPRIO, `git push origin --delete worker/<outra sessão>` (ou `:worker/<outra>`,
-  `push --force … HEAD:worker/<outra>`), `branch -D`, `update-ref`, `worktree prune` e `gc --prune=now` mexem no estado COMPARTILHADO (o espelho repo.git) sem citar o caminho do alheio.
-  `$'…'` só tem os escapes acima decodificados (`\cX` e o que não conheço ficam como estão). O fecho de verdade (usuário Unix por sessão, permissão por branch no remoto) é outro
+LIMITES (é trava contra engano, não sandbox). NÃO vejo: script que o comando executa (`bash x.sh`, `source`), `python -c`, variável que guarda o git ou o diretório,
+  comando montado em pipe (`echo … | sh`), função/alias de OUTRA chamada, CDPATH, `> arquivo`, `sed -i`/`rm`/`cp` no alheio, configuração já gravada no .git/config do
+  alheio, QUAL ref o git escreve (do clone próprio, `push --delete worker/<outra>`, `branch -D`, `update-ref`, `worktree prune` mexem no espelho compartilhado), e
+  destino em opção/subcomando fora de DEST/PATHOPT (`config -f`, `fast-import --export-marks`). Falsos positivos (lado fechado): git atrás de lançador OPACO,
+  de embrulho com opção desconhecida, de -execdir, de `git --opção-nova VALOR`, e `git clone <alheio> <próprio>/sub` (toda palavra de DEST é caminho) bloqueiam —
+  escreva `git -C <caminho absoluto do seu clone>`. `$'…'` só decodifica os escapes conhecidos. O fecho de verdade (usuário Unix por sessão, permissão por branch) é outro trabalho.
   trabalho; ver o runbook.
 """
 from __future__ import annotations
@@ -114,7 +88,7 @@ FD = re.compile(r"(^|[\s;&|(])\d+(?=[<>])")  # `2>/dev/null`, `1>&2`: o número 
 SHELLY = re.compile(r"[$`*?\[{]")
 PIECE = re.compile(r"&&|\|\||\|&|;;|[;&|()]|[<>]+&?")
 SUBST, BACKTICK = re.compile(r"\$S([0-9a-f]*)\$"), re.compile(r"`([^`]*)`")
-HEREDOC = re.compile(r"(?<!<)(<<-?\s*(['\"]?)(\w+)\2[^\n]*)\n(.*?)\n[ \t]*\3[ \t]*(?=\n|$)", re.S)
+HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([^\s'\"<>|&;()]+)\2")  # o delimitador é a palavra INTEIRA (END-OF-FILE, EOF.txt), não só \w+
 PROT = {c: chr(0xF0000 + ord(c)) for c in "();<>|&'"}  # `;<>…` entre aspas ou depois de `\` é TEXTO: antes do shlex (que tira as aspas) vira um caractere de uso privado, e só depois volta (ver protect)
 UNPROT = str.maketrans({v: k for k, v in PROT.items()})
 ANSI = re.compile(r"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c.|.)", re.S)  # os escapes de `$'…'`
@@ -212,42 +186,60 @@ def runs_text(seg: list) -> bool:
     return bool(s) and (opq or os.path.basename(s[0]) in SHELLS | OPAQUE | {"eval", "source", "."})
 
 
-def heredoc(m) -> str:
-    """O corpo de um heredoc é texto (cita comandos, tem apóstrofo) e some; só o $( ) de um delimitador SEM aspas roda, e fica. Exceção: se quem lê é um shell
-    (`bash <<EOF`, `ssh h <<EOF`, `cat <<EOF | sh`) o corpo É o script, e fica como comandos. Quem lê = os comandos da linha onde o heredoc abre."""
-    line = m.string[m.string.rfind("\n", 0, m.start()) + 1:m.start()] + m.group(1)
-    if any(runs_text(s.split()) for s in re.split(r"[;&|(]+", line)):
-        return m.group(1) + "\n" + m.group(4)
-    return m.group(1) + ("" if m.group(2) else "\n: " + " ".join(x.group(0) for x in SUBST.finditer(hide(m.group(4)))))
-
-
-def quoted(s: str, i: int) -> bool:
-    """O caractere s[i] é TEXTO para o shell (dentro de aspas simples ou duplas, ou escapado por `\\`)? Estado lido do começo da linha, igual ao protect()."""
-    q, k = "", 0
+def opener_ok(s: str, i: int) -> bool:
+    """O `<<` em s[i] abre heredoc para o SHELL? Não entre aspas/escapado, depois de `#` de comentário, nem dentro de `$( )`/`$(( ))` na linha; na dúvida, não."""
+    q, k, cm, dp = "", 0, False, 0
     while k < i:
         c = s[k]
-        if q == "'":
+        if c == "\n":
+            cm, dp = False, 0
+        elif q == "'":
             q = "" if c == "'" else q
         elif c == "\\" and q != "'":
-            k += 1  # barra + o caractere seguinte são um par: se o par cobre s[i], s[i] está escapado
+            k += 1  # barra + o caractere seguinte são um par: se o par cobre s[i], o `<` está escapado (k passa de i)
         elif q == '"':
             q = "" if c == '"' else q
+        elif cm:
+            pass
         elif c in "'\"":
             q = c
+        elif c == "#" and (k == 0 or s[k - 1] in " \t;&|("):
+            cm = True
+        elif c == "(" and k and s[k - 1] in "$(":
+            dp += 1
+        elif c == ")" and dp:
+            dp -= 1
         k += 1
-    return bool(q) or k > i
+    return not q and not cm and not dp and k == i
 
 
 def heredocs(cmd: str) -> str:
-    """Cada heredoc DE VERDADE vira o que heredoc() decide; `<<EOF` entre aspas ou escapado é texto (antes, um `EOF` solto linhas abaixo engolia tudo no meio)."""
+    """Corpo de heredoc DE VERDADE some até a linha que é EXATAMENTE o delimitador (sem terminador nada some); o $( ) de delimitador sem aspas fica; se um shell lê (`bash <<EOF`), o corpo fica."""
     out, pos = [], 0
     while (m := HEREDOC.search(cmd, pos)):
-        if quoted(cmd, m.start()):
+        eol = cmd.find("\n", m.end())
+        if not opener_ok(cmd, m.start()) or eol < 0:
             out.append(cmd[pos:m.start() + 1])
             pos = m.start() + 1
-        else:
-            out.append(cmd[pos:m.start()] + heredoc(m))
+            continue
+        j, end = eol + 1, None
+        while end is None and j <= len(cmd):
+            nl = cmd.find("\n", j)
+            line = cmd[j:nl if nl >= 0 else len(cmd)]
+            if (line.lstrip("\t") if m.group(1) else line) == m.group(3):
+                end = (j, nl if nl >= 0 else len(cmd))
+            j = nl + 1 if nl >= 0 else len(cmd) + 1
+        if end is None:
+            out.append(cmd[pos:m.end()])
             pos = m.end()
+            continue
+        opener, body = cmd[m.start():eol], cmd[eol + 1:max(end[0] - 1, eol + 1)]
+        if any(runs_text(s.split()) for s in re.split(r"[;&|(]+", cmd[cmd.rfind("\n", 0, m.start()) + 1:eol])):
+            repl = opener + "\n" + body
+        else:
+            repl = opener + ("" if m.group(2) else "\n: " + " ".join(x.group(0) for x in SUBST.finditer(hide(body))))
+        out.append(cmd[pos:m.start()] + repl)
+        pos = end[1]
     return "".join(out) + cmd[pos:]
 
 
@@ -396,7 +388,8 @@ def chdir(args: list, cwd, push: bool):
         args = args[1:]
     if len(args) > 1 or (push and not args) or (args and args[0][:1] in ("-", "+")):
         return None
-    return res(args[0] if args else "~", cwd)
+    p = res(args[0] if args else "~", cwd)
+    return p if p is None or os.path.isdir(p) else None  # diretório que não existe na hora do hook: o cd FALHA e o shell fica onde estava → "não sei"
 
 
 def dests(sub: str, rest: list) -> list:
@@ -469,17 +462,28 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
         r = inner(seg)
         if r:
             return r
-        # ramo de if/while (then/else/do…): o cd vale para o resto do MESMO ramo e vira "não sei" ao fechar/trocar de ramo (fi/done/esac/else/elif); `!`/`coproc`: "não sei" na hora
         kw = bool(seg) and seg[0] in ("!", "coproc")
         if st.get("chain") and prev != "&&":
             st["cwd"], st["chain"] = None, False  # a cadeia && que sustentava um cd condicional acabou (`;`, `||`, `&`, newline…): não sei se ele rodou
         if seg and seg[0] in ("fi", "done", "esac", "else", "elif") and st.pop("cdblk", False):
             st["cwd"] = None
         blk = bool(seg) and seg[0] in ("if", "then", "else", "elif", "do", "while", "until")
-        if seg[:1] == ["{"] and st.pop("func", False):
-            st["funcbody"] = True  # `f() { …`: o corpo não roda agora (e pode rodar depois, noutro diretório): cd lá dentro é "não sei"
+        if st.get("fdepth"):  # dentro de `f() { … }`: o corpo NÃO roda agora — guardo os trechos e confiro na CHAMADA, no cwd de lá (um git ali roda onde `f` for chamada)
+            st["fdepth"] += seg.count("{") - seg.count("}")
+            if seg != ["}"]:
+                st["funcs"].setdefault(st["fname"], []).append((seg, prev, term))
+            elif not st["fdepth"] and term == "&":
+                st["cwd"] = None
+            return None
+        if seg[:1] == ["{"] and st.pop("func", False) or seg[:1] == ["function"] and seg[2:3] == ["{"]:
+            if seg[0] == "function":
+                st["fname"], seg = seg[1], seg[2:]
+            st["fdepth"], st["funcs"] = 1, st.get("funcs", {})
+            st["funcs"].setdefault(st["fname"], [])
+            if seg[1:]:
+                st["funcs"][st["fname"]].append((seg[1:], prev, term))
+            return None
         if seg == ["}"]:
-            st["funcbody"] = False
             if term == "&":
                 st["cwd"] = None  # `{ …; } &`: o grupo roda em background; o cd de dentro não vale aqui fora
             return None
@@ -497,8 +501,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
             st["env"].update({m.group(1): m.group(2) for m in map(ASSIGN.fullmatch, seg[1:]) if m})
         elif c in ("cd", "pushd", "popd"):
             new = None if c == "popd" else chdir(seg[1:], st["cwd"], c == "pushd")
-            # só um cd que COM CERTEZA rodou muda o diretório: a variável em que se DECIDE (cwd modelado) tem de ser a mesma em que se AGE (onde o git roda)
-            if kw or st.get("funcbody") or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
+            if kw or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):
                 new = None
             if blk and new is not None:
                 st["cdblk"] = True  # cd dentro de um ramo: vale até o fi/done/esac/else/elif
@@ -532,6 +535,15 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
                     r = one(seg[j + 1:], blind or t.endswith("dir"))
                     if r:
                         return r
+        elif c in st.get("funcs", {}) and c not in st.setdefault("calling", set()):  # chamada de função definida nesta chamada: o corpo roda AGORA, neste cwd
+            st["calling"].add(c)
+            try:
+                for s, p, t in st["funcs"][c]:
+                    r = one(list(s), blind, p, t)
+                    if r:
+                        return r
+            finally:
+                st["calling"].discard(c)
         elif c == "git":
             return git_hit(seg, {**st["env"], **env}, cwd, terr, own)
         return None
@@ -557,7 +569,7 @@ def scan(cmd: str, cwd, terr: str, own, depth: int = 0):
                         return r
                     if pc == "(":
                         if len(seg) == 1 and not skip and seg[0] not in KEYWORDS:
-                            st["func"] = True  # `f (`: definição de função — o `{ … }` que vem a seguir é corpo que não roda agora
+                            st["func"], st["fname"] = True, seg[0]  # `f (`: definição de função — o `{ … }` que vem a seguir é corpo que não roda agora
                         stack.append(st["cwd"])
                         skip = False  # `<(cmd)` / `>(cmd)`: o `<` que vem colado no `(` não é redirecionamento de arquivo, a palavra seguinte é um comando
                     elif pc == ")":
@@ -590,7 +602,6 @@ def message(hit, terr: str, proj) -> str:
     target, op = hit
     own = own_clone(proj, terr)
     why = (f"Alvo: {target}\n" if target else "Alvo: não consegui resolver o caminho (variável, glob, crase ou ~usuário)\n")
-    # o motivo de não ter clone próprio é dito como é: sem a variável; dentro do território mas sem `.git` até a raiz; ou fora do território
     mine = own or ("(nenhum: CLAUDE_PROJECT_DIR não definido)" if not proj else "(nenhum: CLAUDE_PROJECT_DIR " + proj
                    + (" está no território " + terr + " mas não tem .git até a raiz dele)" if inside(os.path.realpath(proj), terr) else " fora do território " + terr + ")"))
     return ("[HOOK BLOCK: remote-clone-guard] NÃO É CANCELAMENTO DO USUÁRIO — política automática de isolamento entre sessões.\n"

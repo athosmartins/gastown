@@ -17,7 +17,7 @@
 #   some (subgrupos: lexq aspas e `\` · lexs redirecionamento sem alvo · lexe palavra vazia · lexd `$'…'`/`$"…"` · lexu aspa ou `\` que não fecha, também num comentário `#` · lexr `$( )` do alvo
 #   de redirecionamento · lexh heredoc/`<<<`/find · lexp os controles que NÃO bloqueiam) · dest — o lugar onde o git escreve vem como ARGUMENTO, sem -C (worktree remove ../outro,
 #   clone/init <outro>/x, checkout-index --prefix=…; subgrupos destb e destp).
-# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (121 mutantes); e
+# CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar (125 mutantes); e
 #   contra um stub que só sai 0 (o servidor ANTES desta fatia: o hook do mini era `drop` e nada o substituía), quase tudo falha.
 # VARIÁVEIS: RCG_UNDER_TEST (guarda a testar) · RCG_ONLY (grupos, vírgula) · RCG_NO_MUTANTS=1
 set -u
@@ -465,6 +465,35 @@ g_cond() {  # gate da fatia 6a (tentativa 3): a variável em que o guarda DECIDE
   b 0 "cond: case x in x) git -C <alheio> log;; esac; git commit (leitura no case, commit no próprio)" "case x in x) git -C $OTH log;; esac; git commit -m x"
   b 0 "cond: f() { git log; }; git commit (função sem cd)" "f() { git log; }; git commit -m x"
   b 0 "cond: diff <(git -C <alheio> log) /dev/null; git commit (<( ) não é definição de função)" "diff <(git -C $OTH log) /dev/null; git commit -m x"
+  # gate-fix 6: o que o shell executa não some — opener de heredoc em comentário ou em $(( )), delimitador com '-'/'.', heredoc sem terminador; git em corpo de função roda no cwd da CHAMADA; cd para diretório que não existe FALHA
+  b 2 "cond: '# <<EOF' é comentário, a linha seguinte roda" "echo hi # <<EOF
+git -C $OTH commit -m x
+EOF"
+  b 2 "cond: <<EOF dentro de \$(( )) não abre heredoc" "echo \$((1<<2))
+git -C $OTH commit -m x
+EOF"
+  b 2 "cond: delimitador END-OF-FILE: o heredoc acaba em END-OF-FILE, não em END" "cat <<END-OF-FILE
+x
+END-OF-FILE
+git -C $OTH commit -m x
+END"
+  b 2 "cond: delimitador EOF.txt idem" "cat <<EOF.txt
+x
+EOF.txt
+git -C $OTH commit -m x
+EOF"
+  b 2 "cond: heredoc sem terminador: nada some" "cat <<EOF
+git -C $OTH commit -m x"
+  b 0 "cond: heredoc de verdade com delimitador END-OF-FILE: o corpo some" "cat <<END-OF-FILE
+git -C $OTH commit -m x
+END-OF-FILE"
+  b 0 "cond: <<- com terminador indentado por tab" "cat <<-EOF
+git -C $OTH commit -m x
+	EOF"
+  b 2 "cond: f() { git commit; }; cd <alheio>; f (o corpo roda no cwd da chamada)" "f() { git commit -m x; }; cd $OTH; f"
+  b 2 "cond: function f { git commit; }; (cd <alheio>; f)" "function f { git commit -m x; }; (cd $OTH; f)"
+  b 2 "cond: cd <próprio>/nao-existe; git commit, com cwd no alheio (o cd falha, o shell fica no alheio)" "cd $OWN/nao-existe; git commit -m x" "$OTH"
+  b 2 "cond: cd <próprio>/arquivo (não é diretório); git commit, com cwd no alheio" "cd $OWN/.git; git commit -m x" "$OTH"
   b 2 "cond: while cd <alheio>; do git commit; done" "while cd $OTH; do git commit -m x; done"
   b 2 "cond: cd <alheio> || exit 1; git commit (|| exit mantém o diretório: bloqueia)" "cd $OTH || exit 1; git commit -m x"
   b 2 "cond: true && cd <alheio> && git commit (cadeia && mantém: bloqueia)" "true && cd $OTH && git commit -m x"
@@ -604,11 +633,14 @@ echo "== $((n-fails))/$n ok =="
   mutant block "realpath (symlink)" 's/os.path.realpath(os.path.join(cwd or "\/", p))/os.path.abspath(os.path.join(cwd or "\/", p))/'
   mutant block "-C não é seguido" 's/cwd, i = res(seg\[i + 1\], cwd), i + 2/i += 2/'
   mutant evade "cd não muda o diretório" 's/new = None if c == "popd" else chdir(seg\[1:\], st\["cwd"\], c == "pushd")/new = st["cwd"]/'
-  mutant cond "cd condicional (|| , then/else, pipeline, && sem cadeia) segue mudando o diretório" 's/            if kw or st.get("funcbody") or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):/            if False:/'
+  mutant cond "cd condicional (|| , then/else, pipeline, && sem cadeia) segue mudando o diretório" 's/            if kw or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;") or (prev == "&&" and term != "&&"):/            if False:/'
   mutant cond "`cd a || cd b`: o trecho depois do || não vira não-sei" 's/        if st.pop("or", False) and prev == "||" and c not in ("exit", "return"):/        if False:/'
-  mutant cond "<<EOF entre aspas volta a abrir heredoc (engole as linhas seguintes)" 's/        if quoted(cmd, m.start()):/        if False:/'
+  mutant cond "<<EOF entre aspas/comentário volta a abrir heredoc (engole as linhas seguintes)" 's/        if not opener_ok(cmd, m.start()) or eol < 0:/        if eol < 0:/'
+  mutant cond "'# <<EOF' deixa de ser comentário" 's/        elif c == "#" and (k == 0 or s\[k - 1\] in " \\t;&|("):/        elif False:/'
+  mutant cond "git em corpo de função julgado no cwd da definição" 's/^        if st.get("fdepth"):  # dentro de/        if False:  # dentro de/'
+  mutant cond "cd para diretório inexistente vale como se tivesse rodado" 's/    return p if p is None or os.path.isdir(p) else None/    return p/'
   mutant cond "a cadeia && que sustentava o cd acaba e o diretório continua valendo" 's/        if st.get("chain") and prev != "&&":/        if False:/'
-  mutant cond "cd em padrão de case, em corpo de função ou com ;; segue mudando o diretório" 's/            if kw or st.get("funcbody") or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;")/            if kw or prev in ("||", "|", "|\&") or term in ("|", "|\&", "\&")/'
+  mutant cond "cd em padrão de case ou com ;; segue mudando o diretório" 's/            if kw or prev in ("||", "|", "|&", "case)") or term in ("|", "|&", "&", ";;")/            if kw or prev in ("||", "|", "|\&") or term in ("|", "|\&", "\&")/'
   mutant cond "{ cd a; } & mantém o diretório do grupo em background" 's/^\( *\)if term == "&":$/\1if False:/'
   mutant evade "bash -c não é aberto" 's/return scan(script\[0\], cwd, terr, own, depth + 1)/pass/'
   mutant evade "eval não é aberto" 's/return scan(" ".join(seg\[1:\]), cwd, terr, own, depth + 1)/pass/'
