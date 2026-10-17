@@ -4,6 +4,7 @@
 * Como ler a saída (e o que cada estado quer dizer)
 * Retrato medido em 16/10/2026 18:11 (-03)
 * O que a amostragem de RAM diz e o que NÃO diz
+* Medindo a pegada de RAM por job (`job-ram-probe.py`, ga-sh8t23.3)
 * Achados que a grade mostrou de graça
 * Limites · Como isto vira prova das fatias .2 e .3
 
@@ -77,6 +78,20 @@ Fonte: `.gc/ram-owner-samples.jsonl` (`ram-owner-sampler`, uma amostra a cada ~5
 * Na janela o RSS total fica em **7,5 a 11,4 GB**; nas outras 907 amostras, em 7,3 a 16,8 GB: a janela não é a hora mais pesada do dia. O `dolt` sozinho: 1,07 a 2,65 GB na janela (0 a 2,98 fora). Swap usado: 3,0 a 7,4 GB na janela (0 a 8,0 GB fora); memória livre 35 a 75% na janela (16 a 70% fora). O volume de dados está com 5,1 GB livres e 98% cheio (`df` às 18:1x de hoje); que o swap pese nesse mesmo volume e por isso a RAM vire "disk critical" é **inferência** minha: não medi arquivo de swap.
 * Donos não-Dolt na janela (maior RSS de cada nome): `sweep_street_view_age_bh` 920 MB (04:11; **provavelmente** o `sv-age-refresh` das 04:10, mas o nome do processo não é o label do launchd: inferência, não prova), Chrome helper 797 MB (04:15), `compile` 751 MB, `gate-pytest` 741 MB, `clang` 606 MB, `git pack-objects` 508 MB (1,2 GB em outra hora). Dos 6 jobs das 04:00, o maior RSS amostrado em TODAS as amostras (qualquer hora) foi `build_spe_alert` 222 MB, `sweep_pbh` 212 MB, `dolt-s3-backup` 41 MB e `drive-cleanup` 30 MB (nome de processo ≈ job: **provável**, não provado). `pipedrive-status-deadman` e `claude-history-backup` **não têm medida**: nenhum nome de processo seguro para atribuir a eles (o `backup` de 52 MB é genérico demais). Sem medida não é "zero". Nenhum dos medidos chega perto dos 4,5 GB que a bead cita para o `spe-alert-build` "até ontem": ou o pico foi corrigido, ou durou menos que o intervalo de 5 min e a amostra o perdeu. Os dados de hoje não decidem entre as duas.
 * **Não dá para** atribuir RAM a um job do launchd: o amostrador agrupa por NOME DE PROCESSO. **Não dá para** ver job que dura menos que 5 min. **Não dá para** concluir "o pico das 04:00 é o de maior RAM" com 41 amostras em 3 noites. Por isso a fatia .3 começa MEDINDO a pegada de cada job (label → processo → pico de RSS) e só depois move horário.
+
+## Medindo a pegada de RAM por job (`job-ram-probe.py`, ga-sh8t23.3)
+
+O `ram-owner-sampler` agrupa por NOME DE PROCESSO a cada 5 min; a decisão de mover um horário precisa de **label do launchd → processo → pico de RSS**. `scripts/job-ram-probe.py` amostra de 5 em 5 s, soma o RSS da ÁRVORE de cada job (o processo que o launchd iniciou e os filhos; `launchctl list` dá label → PID, `ps` dá a árvore) e grava uma linha por amostra com swap, % livre e disco livre. Só lê o sistema; a única escrita é o arquivo de saída (teto de tamanho, piso de disco de 1 GB, instância única por arquivo).
+
+```bash
+python3 -I $GC_CITY_PATH/scripts/job-ram-probe.py --start 03:30 --until 05:10 --out $GC_CITY_PATH/.gc/job-ram-probe-AAAAMMDD.jsonl   # uma noite (hora local)
+python3 -I $GC_CITY_PATH/scripts/job-ram-probe.py --summary $GC_CITY_PATH/.gc/job-ram-probe-*.jsonl                                    # tabela + simultaneidade + saltos de swap
+bash scripts/job-ram-probe.selftest.sh                                                                                                  # hermético, com mutantes por guarda
+```
+
+* O resumo traz: jobs da janela por pico da árvore (com o processo de maior RSS e quando), soma simultânea (`--big-mb`, padrão 150 MB = "de pico"), **saltos de swap** (`--swap-step`, 200 MB) com quem cresceu nos 60 s antes, quedas de disco (`--disk-step`, 300 MB) com os jobs rodando, e os persistentes (daemons KeepAlive) à parte.
+* Três estados: `ps` ou `launchctl` que falham saem como `ps_ok:false`/`lc_ok:false` (RSS sem atribuição; **não** vira "nenhum job"), swap/% livre/disco que não li ficam `null` (não 0), linha ilegível é contada, arquivo vazio dá exit 3. Códigos: 0 · 2 uso · 3 não consegui ler/sem amostra · 4 outra instância · 5 teto de tamanho · 6 disco abaixo do piso.
+* **Limites**: job que dura menos que 5 s pode passar entre duas amostras; processo que se desanexa do job sai da árvore; a soma de RSS conta página compartilhada uma vez por processo (superestima); RSS é o residente (o que já foi pro swap não aparece nele, por isso o salto de swap é lido à parte); a causa de um salto é INDÍCIO. Com a máquina saturada (load 90 após o boot de 17/10) uma amostra custou 1,4 s (mediana; `dt_ms` vem gravado), o que não é o passo de 5 s mas o aproxima: o resumo diz o passo mediano real.
 
 ## Achados que a grade mostrou de graça
 
