@@ -127,7 +127,8 @@ chmod +x "$WORK/git-fx"
 
 # run_jac <repo...> [-- --check]: the script under test, sealed off from the real world.
 # ga-wkoij7: the consolidating gc starts only in the night window, so the clock is a seam — JAW_HOUR=2 unless a test sets T_HOUR — and the window log goes under $WORK, never into the real city.
-# The free space the window rule reads is the same JAC_FREE_KIB as every disk test here (T_FREE, 90GB unless set).
+# The free space the window rule reads is the same JAC_FREE_KIB as every disk test here (T_FREE, 90GB unless set); a fixture that sets T_FREE to a few KiB to exercise tier 1's or the gc's
+# own disk check must also set T_SWAP=0 (the swap headroom the window rule adds, 2GiB by default), or the window refuses first and the gc's own checks are never reached.
 run_jac() {
   local repos="$1"; shift
   JAC_REPOS="$repos" JAC_STATE="${T_STATE:-$WORK/state.json}" JAC_LOG="${T_LOG:-$WORK/log}" JAC_LOCK="${T_LOCK:-$WORK/lock}" JAC_GC="${T_GC:-$WORK/gc-stub}" \
@@ -139,7 +140,7 @@ run_jac() {
   JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" JAC_MAIL_TIMEOUT_S="${T_MAIL_TIMEOUT:-}" \
   JAC_TAIL_LIMIT_KIB="${T_TAIL:-0}" JAC_TAIL_MAX_OBJECTS="${T_TAIL_OBJS:-}" JAC_TAIL_TIMEOUT_S="${T_TAIL_TIMEOUT:-}" \
   JAC_LSOF="${T_LSOF:-}" JAC_RECLAIM_WAIT_S="${T_RECLAIM_WAIT:-}" JAC_PS="${T_PS:-}" JAC_PS_TIMEOUT_S="${T_PS_TIMEOUT:-}" \
-  JAW_HOUR="${T_HOUR:-2}" JAW_LOG="${T_WLOG:-$WORK/window.log}" \
+  JAW_HOUR="${T_HOUR:-2}" JAW_LOG="${T_WLOG:-$WORK/window.log}" JAW_SWAP_KIB="${T_SWAP:-}" \
   "$SCRIPT" "$@" 2>&1     # executed, not `bash $SCRIPT`: production runs the shebang (/bin/bash 3.2 on macOS), not whatever bash is first in PATH
 }
 last_status() { grep -o 'status=[a-z-]*' "$WORK/log" | tail -1 | cut -d= -f2; }
@@ -485,7 +486,7 @@ W3="$WORK/w3"; mkrepo "$W3" 1; for i in 2 3 4 5; do addpack "$W3" "$i"; done; ad
 rm -f "$WORK/state.json"; echo "$$ $(hostname)" > "$W3/.git/gc.pid"
 need1=$(( $(loose_kib "$W3") / 4 )); need2="$(git --git-dir="$W3/.git" count-objects -v | awk '/^size-pack:/{print $2}')"; free3=$(( (need1 + need2) / 2 ))
 if [ "$need2" -lt "$free3" ] && [ "$free3" -lt "$need1" ]; then
-  out="$(T_FREE="$free3" T_PACKS=3 run_jac "$W3")"; rc=$?
+  out="$(T_FREE="$free3" T_SWAP=0 T_PACKS=3 run_jac "$W3")"; rc=$?
   { [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && printf '%s' "$out" | grep -q 'already running'; } \
     && ok "tier 1 skipped for low disk, gc busy (did nothing) → status stays skipped-low-disk, exit 1 (busy does not launder it either)" \
     || bad "skipped-low-disk + busy gc judged wrong (rc=$rc status=$(last_status)): $out"
@@ -1792,8 +1793,8 @@ out="$(T_HOUR=12 T_PACKS=4 run_jac "$WA")"; rc=$?
 { [ "$PA0" -ge 5 ] && [ "$rc" -eq 0 ] && [ "$(pack_count "$WA")" = "$PA0" ] && [ "$(last_status)" = "deferred" ]; } \
   && ok "12h, packs $PA0 >= limit 4, 90GB free: the gc is not started — packs unchanged, status deferred, exit 0" \
   || bad "noon gc handled wrong (rc=$rc packs $PA0 -> $(pack_count "$WA") status=$(last_status)): $out"
-printf '%s' "$out" | grep -q 'repack window is closed' && printf '%s' "$out" | grep -q 'outside the start window' \
-  && ok "the log says the window is closed and why (outside the start window)" || bad "no window-closed line with its reason: $out"
+printf '%s' "$out" | grep -q 'repack window does not allow it now' && printf '%s' "$out" | grep -q 'outside the start window' \
+  && ok "the log says the window does not allow it and why (outside the start window)" || bad "no window-refusal line with its reason: $out"
 [ "$(history "$WA")" = "$HA" ] && ok "history untouched" || bad "history changed by a run that did not repack"
 [ ! -e "$WORK/window.log" ] && ok "an outside-the-window refusal is not written to the window log" || bad "window log written for a noon refusal: $(cat "$WORK/window.log")"
 # B. night, same repo: the gc runs, and the window log records that it was allowed
@@ -1832,7 +1833,7 @@ out="$(T_HOUR=2 T_FREE=notanumber T_PACKS=4 run_jac "$WD")"
 WE="$WORK/we"; mkfailrepo "$WE"; rm -f "$WORK/state.json"
 out="$(FM_RC=1 T_GIT="$WORK/git-failmaint" T_HOUR=12 T_PACKS=3 run_jac "$WE")"; rc=$?
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ]; } \
-  && ok "tier 1 failed, gc deferred by the window (did nothing) → status stays failed, exit 1" || bad "failed tier 1 + closed window judged wrong (rc=$rc status=$(last_status)): $out"
+  && ok "tier 1 failed, gc deferred by the window (did nothing) → status stays failed, exit 1" || bad "failed tier 1 + window refusal judged wrong (rc=$rc status=$(last_status)): $out"
 WF="$WORK/wf"; mkwin "$WF"; rm -f "$WORK/state.json"
 out="$(T_HOUR=12 T_PACKS=4 T_PACKS_ALARM=5 run_jac "$WF")"; rc=$?
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "deferred" ]; } \
