@@ -29,7 +29,7 @@ mkcity() {  # mkcity DIR
   w() { printf '{"seq":1,"type":"%s","ts":"%s","actor":"gc","subject":"%s"}\n' "$1" "$2" "$3"; }
   {
     w session.woke 2026-10-14T23:10:00.379098-03:00 wa-worker-adhoc-1          # noite 14, construtor
-    w session.woke 2026-10-15T03:00:00.64447-03:00  dog-abc                    # 5 dígitos de fração; noite 14 (depois da meia-noite)
+    w session.woke 2026-10-15T03:00:00.64447-03:00  gastown.dog-2              # nome REAL do motor (pack.): construtor; 5 dígitos de fração; noite 14 (depois da meia-noite)
     w session.woke 2026-10-15T07:59:59-03:00        gate-reviewer-adhoc-x      # noite 14, último segundo
     w session.woke 2026-10-15T01:00:00-03:00        refino-gate-reviewer-adhoc-y   # revisor, não "outros"
     w session.woke 2026-10-15T08:00:00-03:00        wa-worker-adhoc-dia        # de dia: fora

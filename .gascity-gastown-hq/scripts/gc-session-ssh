@@ -377,9 +377,13 @@ def gate_check(cfg: Cfg) -> dict:
 
 
 def op_gate(cfg: Cfg, name: str, args: list, dry: bool) -> int:
-    """`gate <host>`: o veredito de um start AGORA, sem abrir nada (para o teto/escala do pool): JSON, exit 0 libera, 1 recusa."""
-    v = gate_check(cfg) if cfg.gate and not dry else {"host": cfg.host, "ok": True, "slot_cap": None,
-                                                       "reason": "dry-run: não consultei" if cfg.gate else "este host não tem regra de presença"}
+    """`gate <host>`: o veredito de um start AGORA, sem abrir nada (para o teto/escala do pool): JSON, exit 0 libera, 1 recusa,
+    2 = não consultei (dry-run num host com regra de presença: um GC_SSH_DRYRUN vazado num pool não pode virar "sempre libera")."""
+    if cfg.gate and dry:
+        print(json.dumps({"host": cfg.host, "ok": None, "slot_cap": None, "cap": cfg.cap, "reason": "dry-run: não consultei a presença"},
+                         ensure_ascii=False, sort_keys=True))
+        return 2
+    v = gate_check(cfg) if cfg.gate else {"host": cfg.host, "ok": True, "slot_cap": None, "reason": "este host não tem regra de presença"}
     print(json.dumps(dict(v, cap=cfg.cap), ensure_ascii=False, sort_keys=True))
     return 0 if v["ok"] else 1
 
@@ -629,6 +633,9 @@ def main(argv: list) -> int:
             return op_list_running(arg, dry)
         if op not in NAMELESS:
             check_name(arg)
+        if op == "gate" and not arg:  # `gate "$H"` com H vazio: avaliar o default_host e dizer "libera" seria decidir sobre OUTRO host (gate ga-ie7fcr)
+            sys.stderr.write("gc-session-ssh gate: falta o host (uso: gate <host>)\n")
+            return 2
         cfg = Cfg(host=arg if op == "gate" else "", session="" if op == "gate" else arg)
         return OPS[op](cfg, arg, rest[1:], dry)
     except Fail as e:
