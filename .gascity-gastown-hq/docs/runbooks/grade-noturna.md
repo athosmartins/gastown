@@ -5,6 +5,7 @@
 * Retrato medido em 16/10/2026 18:11 (-03)
 * O que a amostragem de RAM diz e o que NÃO diz
 * Medindo a pegada de RAM por job (`job-ram-probe.py`, ga-sh8t23.3)
+* Medição da noite de 17/10/2026 (noite 1 de 3) e o que ela decide
 * Achados que a grade mostrou de graça
 * Limites · Como isto vira prova das fatias .2 e .3
 
@@ -92,6 +93,25 @@ bash scripts/job-ram-probe.selftest.sh                                          
 * O resumo traz: jobs da janela por pico da árvore (com o processo de maior RSS e quando), soma simultânea (`--big-mb`, padrão 150 MB = "de pico"), **saltos de swap** (`--swap-step`, 200 MB) com quem cresceu nos 60 s antes, quedas de disco (`--disk-step`, 300 MB) com os jobs rodando, e os persistentes (daemons KeepAlive) à parte.
 * Três estados: `ps` ou `launchctl` que falham saem como `ps_ok:false`/`lc_ok:false` (RSS sem atribuição; **não** vira "nenhum job"), swap/% livre/disco que não li ficam `null` (não 0), linha ilegível é contada, arquivo vazio dá exit 3. Códigos: 0 · 2 uso · 3 não consegui ler/sem amostra · 4 outra instância · 5 teto de tamanho · 6 disco abaixo do piso.
 * **Limites**: job que dura menos que 5 s pode passar entre duas amostras; processo que se desanexa do job sai da árvore; a soma de RSS conta página compartilhada uma vez por processo (superestima); RSS é o residente (o que já foi pro swap não aparece nele, por isso o salto de swap é lido à parte); a causa de um salto é INDÍCIO. Com a máquina saturada (load 90 após o boot de 17/10) uma amostra custou 1,4 s (mediana; `dt_ms` vem gravado), o que não é o passo de 5 s mas o aproxima: o resumo diz o passo mediano real.
+
+## Medição da noite de 17/10/2026 (noite 1 de 3) e o que ela decide
+
+Probe de 03:30 a 05:10 (-03), 1176 amostras, passo mediano 5 s, custo mediano de uma amostra 835 ms (máx 4,3 s, máquina saturada pós-boot: load 58), **todas** com ps e launchctl lidos (0 sem atribuição). Arquivo: `.gc/job-ram-probe-20261017.jsonl`. **É uma noite**: a bead pede >= 3; as noites 18 e 19 serão gravadas pelo mesmo `.gc/job-ram-probe-run/loop.sh` e a conclusão abaixo vale até elas a contradizerem.
+
+| job das 04:00 | processo de maior RSS | pico da árvore | visto (duração) | decisão |
+|---|---|---|---|---|
+| `dolt-s3-backup` (HQ) | `dolt` | 433 MB às 04:01:23 | 04:00:06-04:11:16 (11 min) | fica; o problema dele é DISCO (abaixo) |
+| `spe-alert-build` (WA) | `build_spe_alert` | 363 MB às 04:44:47 (mediana 55 MB, p90 91 MB; picos curtos de 182 às 04:00, 307 às 04:28 e 363 às 04:44) | 04:00:06-04:45:08 (45 min) | fica |
+| `claude-history-backup` (`~/.claude/backup`, sem git) | 1 processo sem nome resolvido (102 MB) + um que lê `history.jsonl` | 104 MB às 04:00:42 | 3 min | fica |
+| `drive-cleanup` (`~/.gastown`, 3º repositório) | `drive-cleanup.py` | 44 MB | 04:00:06-04:53:03 (53 min) | fica |
+| `pipedrive-status-deadman` (WA) | bash + `sqlite3` | **não amostrado** (dura menos que 5 s; o log do job registra a execução das 04:00). `/usr/bin/time -l` numa execução à mão: 0,09 s, 7 MB (maior processo, não soma) | < 5 s | fica (exceção de produto: mover 04:00 -> 04:20 atrasa o aviso em 20 min para ganhar 7 MB) |
+| `pbh-edificacao-pipeline` (WA) | — | **sem medida**: 0 de 1176 amostras (dura menos que 5 s ou não casou com o launchctl no instante; o log está vazio desde 29/08). Não é zero | ? | fica (não tenho número para justificar mover) |
+
+* **Os seis juntos nunca passam de 549 MB** (maior soma simultânea, 04:01:23). Swap de 04:00 a 04:12: 2672 -> 2805 MB (+133 MB). A pegada de RAM do lote das 04:00 NÃO é o pico da madrugada nesta noite.
+* **Quem tem pico de RAM na janela 03:50-04:50.** O limiar do probe (150 MB) não serve para esta pergunta: cada `gc` custa 150-200 MB e ele marca 60 dos 61 minutos. Com **>= 400 MB** ("de pico"): 41 minutos com ao menos 1 job e **15 minutos com 2 ou mais** (11 das 717 amostras de 5 s). Os donos são `city-health-sentinel` (`claude`, 560-880 MB, 17 minutos), `suavez-first-watch` (400-640 MB, 17 min) e `sv-age-refresh` (`build_street_view_age_layer`, até 960 MB, 04:10-04:25, 15 min); aparecem também `pilot` (799 MB às 04:31), `cadastro-dolt-coverage` (533), `lot-docs-index-daily` (442) e `lot-ficha-extra-projetos` (412). **Só o minuto 04:01 envolve um job das 04:00** (`dolt-s3-backup` 433 + `city-health-sentinel` 881). Os dois maiores são jobs de intervalo (StartInterval): espalhar o relógio das 04:00 não os toca.
+* **Swap.** Três saltos de 200 MB ou mais na janela (04:24:37, 04:24:42, 04:33:53): indícios de `painel-visibilidade` (daemon), `city-health-sentinel` e `git pack-objects`; nenhum dos seis. No amostrador de 5 min houve +2,2 GB de swap em janelas entre 03:49 e 04:18 de 14, 15 e 16/10: ele não atribui, e sessões de worker estavam entre os maiores donos; esta noite o lote das 04:00 não mexeu no swap.
+* **Disco: aqui está o "disk critical".** Livre < 3 GB em duas janelas: **04:04:37-04:08:27 (235 s, mínimo 1499 MB)** e 04:23:10-04:23:56 (mínimo 2705 MB). A primeira é a fase `whatsapp_automation` do `dolt-s3-backup`: o log dele registra o reseed de 04:03:52 a 04:08:41 com "preciso ~4933MB (250%), livre 5535MB" (margem de ~600 MB antes do piso de 1 GB). A segunda coincide com o `sv-age-refresh` (indício, não prova: o probe mede o livre do volume, não escrita por job). O `dolt-disk-floor-guard` já estava abaixo do piso de 8 GB (livre 5 GB) e o reclaim dele às 04:03:50 não ganhou nada ("ZERO GAIN"). Mover os OUTROS cinco jobs não muda essa queda: ela é do próprio reseed (o reseed diário veio de ga-jz7gg).
+* **Conclusão desta noite:** nenhum horário muda por RAM. O que a medição aponta para o critério "disk critical zero por 7 dias" é o reseed diário da `whatsapp_automation` (e, depois dele, o `sv-age-refresh`), não o relógio das 04:00. Pendências: noites 18 e 19 (`--summary` sobre os 3 arquivos depois das 05:10 de 19/10) e a decisão sobre o reseed (bead à parte). O `claude-history-backup` fica fora da conta de "5 jobs" da bead: são 6.
 
 ## Achados que a grade mostrou de graça
 
