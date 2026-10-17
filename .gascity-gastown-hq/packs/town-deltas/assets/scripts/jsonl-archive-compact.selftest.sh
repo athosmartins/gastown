@@ -15,6 +15,12 @@ SCRIPT="$HERE/jsonl-archive-compact.sh"
 LIB="$HERE/jsonl-archive-repack-window-lib.sh"
 ORDER="$PACK/orders/jsonl-archive-compact.toml"
 
+# ga-vln2py (P0, 17/10): this battery builds git repos with multi-MB blobs under /tmp (the 12 MB "big loose" fixture, the
+# S35 loops); on 17/10 a copy of hq.jsonl made this way took the mini's disk to ~295 MB free, and Dolt took ENOSPC. It does
+# not start with the disk under the heavy floor: heavy-guard.sh answers 75 (low) / 76 (unreadable) and nothing is built.
+# A missing guard is a broken tree, so it is loud (127), not skipped.
+"$CITY_ROOT/scripts/heavy-guard.sh" --check --what "jsonl-archive-compact.selftest.sh" || exit $?
+
 PASS=0; FAIL=0; SKIP=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
