@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""daemon-unverified-sweep.py — vigia de `delivery:daemon-unverified` (ga-iyfe83, parte 3 da ga-29ssni). FATIAS 1-2: núcleo + sha/dono/periódico.
+"""daemon-unverified-sweep.py — vigia de `delivery:daemon-unverified` (ga-iyfe83, parte 3 da ga-29ssni). FATIAS 1-3: núcleo + sha/dono/periódico + relatório/aviso/plist.
 
 O PROBLEMA. O gate fecha um bead com o rótulo `delivery:daemon-unverified` quando o código mergeado pode estar
 DORMENTE: o daemon que o executa não foi (ou não pôde ser) confirmado reiniciado depois do merge. ~300 beads
@@ -28,7 +28,8 @@ Motivos (`reason`):
   NCS (conteúdo, rc 0):        no-merge-sha · no-daemon · sha-not-on-disk · sha-not-in-checkout · event-driven ·
                                unknown-kind · loaded-no-pid · duplicate-label
   NCS (leitura quebrou, rc 3): marker-read-failed · deps-read-failed · launchctl-read-failed · ps-read-failed ·
-                               git-read-failed · bad-timestamp · plist-read-failed · status-unknown · internal-error
+                               git-read-failed · bad-timestamp · plist-read-failed · status-unknown · internal-error ·
+                               deadline-exceeded (estourou o prazo total: o que não deu tempo de olhar NÃO some, vira dúvida)
   Uma LOJA que não listou não é uma loja com zero beads: fica em `stores` (ok=false) no relatório e o rc é 3.
 
 COMO ACHA O SHA E O DONO (fatia 2; o que não se acha é NÃO CONSEGUI SABER com motivo, nunca CONFIRMADO):
@@ -44,7 +45,6 @@ COMO ACHA O SHA E O DONO (fatia 2; o que não se acha é NÃO CONSEGUI SABER com
     uma instância anterior ao merge ainda é o único processo que rodou; SEM instância, entre disparos, um ciclo inteiro
     depois do merge basta) · WatchPaths / QueueDirectories / sem gatilho conhecido = NCS (nada prova que um evento rodou
     depois do merge).
-  - dry-run: escreve `daemon-unverified-sweep-latest.json` e imprime as contagens. (.3: relatório legível, aviso, plist.)
 
 LIMITES CONHECIDOS (o relatório é uma triagem, não uma prova):
   - "subiu depois do merge" é NECESSÁRIO, não SUFICIENTE: se o checkout vivo só recebeu o código depois do merge
@@ -68,13 +68,26 @@ LIMITES CONHECIDOS (o relatório é uma triagem, não uma prova):
     início (NCS loaded-no-pid). O mesmo bead pode oscilar CONFIRMADO ↔ NCS conforme o instante da varredura.
   - O repo do sha é o do checkout da loja que listou o bead: sha de outro rig sai sha-not-on-disk (NCS), nunca CONFIRMADO.
 
-COMO RODA. Dry-run: escreve `daemon-unverified-sweep-latest.json` em .gc/logs e imprime uma linha com as contagens por estado.
-Saída: 0 = leu tudo · 3 = alguma leitura falhou (ver `stores` / `reason` no JSON).
-Sementes de teste: DUS_BD, DUS_LAUNCHCTL, DUS_PS, DUS_STORES, DUS_OUT_DIR, DUS_NOW…
+  - O aviso (--notify) só dispara por AINDA NÃO VISTO novo. Um vigia CEGO (leitura quebrada, rc 3) não avisa por si: aparece no
+    relatório (seção Leituras / "LEITURA INCOMPLETA"), no log do launchd e no rc — quem quiser alarme de cegueira liga no rc.
+
+COMO RODA. Escreve em .gc/logs (DUS_OUT_DIR): `daemon-unverified-sweep-latest.json` (máquina), `daemon-unverified-sweep-<AAAA-MM-DD>.md`
+(legível: contagens por estado, AINDA NÃO VISTO POR DAEMON — o que o Mayor decide reiniciar —, NÃO CONSEGUI SABER por motivo) e imprime
+uma linha com as contagens. Sem `--notify` é dry-run: NÃO avisa e NÃO toca no baseline.
+Com `--notify`: UMA notificação, só se há AINDA NÃO VISTO que ainda não foi avisado (baseline em `daemon-unverified-sweep.state.json`:
+ids já avisados). O baseline só avança se o aviso foi ENTREGUE (notify que falhou re-tenta na próxima rodada). Sai do baseline só o que
+virou CONFIRMADO; NÃO CONSEGUI SABER mantém a marca (voltar de uma leitura quebrada não é "novo"). Baseline ilegível ≠ ausente: ausente
+é a 1ª rodada; ilegível também re-avisa (melhor um aviso repetido que silêncio), mas diz alto e sai com rc 3.
+Instância única (flock em `daemon-unverified-sweep.lock`): a 2ª sai sem varrer, rc 0. Prazo total `DUS_DEADLINE` (2700 s, checado entre
+beads): o que não deu tempo vira NÃO CONSEGUI SABER `deadline-exceeded` (rc 3), nunca "terminou limpo".
+Saída: 0 = leu tudo · 3 = alguma leitura falhou / prazo estourou / aviso não entregue (ver `stores` / `reason` no JSON).
+Sementes de teste: DUS_BD, DUS_LAUNCHCTL, DUS_PS, DUS_NOTIFY, DUS_STORES, DUS_OUT_DIR, DUS_NOW, DUS_DEADLINE…
 A loja HQ é a PRIMEIRA de DUS_STORES (os marcadores de gate de todos os rigs moram nela).
+Gatilho: `com.gascity.daemon-unverified-sweep.plist` (segunda 08:47). NÃO reinicia nada e NÃO roda daemon-refresh.
 """
 import argparse
 import datetime
+import fcntl
 import glob
 import json
 import os
@@ -97,7 +110,7 @@ SHA_RE = re.compile(r"sha=([0-9a-f]{40})")
 
 # NCS cujo motivo é "a leitura quebrou" (≠ NCS de conteúdo): fazem o vigia sair com rc 3, nunca com zero.
 READ_FAILED = {"marker-read-failed", "deps-read-failed", "launchctl-read-failed", "ps-read-failed", "git-read-failed",
-               "bad-timestamp", "plist-read-failed", "internal-error", "status-unknown"}
+               "bad-timestamp", "plist-read-failed", "internal-error", "status-unknown", "deadline-exceeded"}
 
 DEPS_PATH = "daemons/deploy_deps.json"      # mapa daemon → closure/assets (só o rig WhatsApp tem)
 
@@ -531,11 +544,127 @@ def classify(bead, repo, plists, unreadable, markers, now):
     return CONFIRMADO, results[0][2], labels, detail   # todos CONFIRMADO: o motivo do primeiro dono basta
 
 
+# ---- relatório, baseline, aviso -------------------------------------------
+
+def rollup(beads):
+    """Por daemon: quantos beads AINDA NÃO VISTO dependem dele — a visão acionável pra quem decide o reinício."""
+    out = {}
+    for b in beads:
+        if b["state"] != AINDA:
+            continue
+        for label, (st, why) in b["owner_states"].items():
+            if st == AINDA:                       # dono em NCS dentro de um bead AINDA não é "reiniciar este": fica de fora
+                d = out.setdefault(label, {"ainda": 0, "beads": [], "reasons": {}})
+                d["ainda"] += 1
+                d["beads"].append(b["id"])
+                d["reasons"][why] = d["reasons"].get(why, 0) + 1
+    return out
+
+
+def render_md(now, counts, reads, beads, daemons):
+    """O relatório legível. `reads` = [(ok, texto)] das leituras: uma que falhou aparece AQUI, não só no stderr do launchd."""
+    L = ["# Vigia de delivery:daemon-unverified — %s" % time.strftime("%Y-%m-%d", time.localtime(now)), "",
+         "DETECTA, NÃO AGE: nada foi reiniciado. Reiniciar é decisão do Mayor / dono do daemon, a partir deste relatório.", "",
+         "## Contagens", ""]
+    L += ["- %s: %d" % (k, counts[k]) for k in (CONFIRMADO, AINDA, NCS)]
+    L += ["- %s (tem o rótulo mas não está fechado): %d" % (OUT, counts[OUT]), "", "## Leituras", ""]
+    L += ["- %s%s" % ("" if ok else "⚠ ", text) for ok, text in reads]
+    L += ["", "## AINDA NÃO VISTO — por daemon (o que reiniciar)", ""]
+    if not daemons:
+        L += ["(nenhum)", ""]
+    for label, d in sorted(daemons.items(), key=lambda kv: (-kv[1]["ainda"], kv[0])):
+        L.append("### %s — %d bead(s) [%s]" % (label, d["ainda"], ", ".join("%s×%d" % kv for kv in sorted(d["reasons"].items()))))
+        L += ["- " + i for i in sorted(d["beads"])]
+        L.append("")
+    L += ["## NÃO CONSEGUI SABER — por motivo", ""]
+    by = {}
+    for b in beads:
+        if b["state"] == NCS:
+            by.setdefault(b["reason"], []).append(b)
+    if not by:
+        L += ["(nenhum)", ""]
+    for reason, bs in sorted(by.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        L.append("### %s — %d%s" % (reason, len(bs), "  ← LEITURA INCOMPLETA" if reason in READ_FAILED else ""))
+        L += ["- %s (%s)" % (b["id"], b["rig"]) for b in sorted(bs, key=lambda x: x["id"])]
+        L.append("")
+    L += ["## CONFIRMADO", "", ", ".join(sorted(b["id"] for b in beads if b["state"] == CONFIRMADO)) or "(nenhum)", ""]
+    return "\n".join(L)
+
+
+def write_atomic(path, text):
+    """tmp + rename: quem lê o arquivo nunca o vê pela metade."""
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+
+
+def load_state(path):
+    """(avisados, problema): `avisados` = {id: quando} dos AINDA NÃO VISTO já avisados.
+    Três respostas que não se confundem: arquivo ausente → ({}, None) = 1ª rodada, normal; lido → (o baseline, None);
+    existe e não leu / formato torto → ({}, motivo): também re-avisa tudo (melhor repetir um aviso que calar), mas o motivo sobe."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            notified = json.load(f)["notified"]
+        if not isinstance(notified, dict):
+            raise TypeError("notified não é objeto")
+        return dict(notified), None
+    except FileNotFoundError:
+        return {}, None
+    except Exception as e:
+        return {}, "%s: %s" % (type(e).__name__, e)
+
+
+def notify_text(new, counts, broken, bad_state):
+    ids = sorted(b["id"] for b in new)
+    top = {}
+    for b in new:
+        for label, (st, _why) in b["owner_states"].items():
+            if st == AINDA:
+                top[label] = top.get(label, 0) + 1
+    top_s = ", ".join("%s (%d)" % kv for kv in sorted(top.items(), key=lambda kv: (-kv[1], kv[0]))[:3])
+    head = "%d bead(s) novo(s) AINDA NÃO VISTO" % len(ids) + (": " + ", ".join(ids) if len(ids) <= 5 else "")
+    tail = []
+    if bad_state:
+        tail.append("baseline ilegível: pode repetir avisos antigos")
+    if broken:
+        tail.append("alguma leitura falhou: ver o relatório")
+    return ("%s — código mergeado que o daemon dono ainda não recarregou. Daemons: %s. Total: %d ainda não visto · %d confirmado · "
+            "%d não consegui saber.%s" % (head, top_s or "?", counts[AINDA], counts[CONFIRMADO], counts[NCS],
+                                           (" Atenção: " + "; ".join(tail) + ".") if tail else ""))
+
+
+def send_notify(text):
+    """True só se o notify RODOU e saiu 0. Qualquer outra coisa = não foi entregue (o baseline não avança)."""
+    try:
+        r = run([env("DUS_NOTIFY", os.path.join(HOME, ".local", "bin", "notify")), "-t", "Vigia daemon-unverified", "-p", "3", text],
+                timeout=60)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        sys.stderr.write("daemon-unverified-sweep: ERRO — notify não rodou (%s); baseline INTACTO, a próxima rodada re-tenta\n" % e)
+        return False
+    if r.returncode != 0:
+        sys.stderr.write("daemon-unverified-sweep: ERRO — notify saiu %d; baseline INTACTO, a próxima rodada re-tenta\n" % r.returncode)
+        return False
+    return True
+
+
 def main(argv):
-    ap = argparse.ArgumentParser(description="vigia de delivery:daemon-unverified (detecta, não age)")
-    ap.parse_args(argv)
+    ap = argparse.ArgumentParser(description="vigia semanal de delivery:daemon-unverified (detecta, não age)")
+    ap.add_argument("--notify", action="store_true",
+                    help="avisa (UMA notificação) se há AINDA NÃO VISTO novo e avança o baseline; sem isto é dry-run: "
+                         "escreve o relatório e NÃO avisa nem toca no baseline")
+    args = ap.parse_args(argv)
     out_dir = env("DUS_OUT_DIR", os.path.join(CITY, ".gc", "logs"))
     os.makedirs(out_dir, exist_ok=True)
+    # Instância única: a varredura é lenta (load alto) e uma 2ª em cima da 1ª só dobra a carga no Dolt.
+    # ocupado (BlockingIOError) → sai sem varrer, rc 0, dito. Qualquer OUTRO erro de lock (ou do open) NÃO é "ocupado": sobe como
+    # traceback, rc ≠ 0, nada varrido — alto e inerte, nunca "outra instância cuida disso".
+    lock = open(os.path.join(out_dir, "daemon-unverified-sweep.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("daemon-unverified-sweep: já em execução (lock em %s) — saindo sem varrer." % out_dir)
+        return 0
+    deadline = time.monotonic() + float(env("DUS_DEADLINE", "2700"))
     stores = load_stores()
     if not stores:                            # DUS_STORES vazio/em branco: nada foi varrido, e "nada varrido" ≠ "tudo limpo"
         sys.stderr.write("daemon-unverified-sweep: ERRO — DUS_STORES não lista nenhuma loja; nada foi varrido\n")
@@ -564,6 +693,8 @@ def main(argv):
                 state, reason, owners, detail = OUT, "not-closed", [], {}
             elif plists is None:
                 state, reason, owners, detail = NCS, "plist-read-failed", [], {}
+            elif time.monotonic() >= deadline:
+                state, reason, owners, detail = NCS, "deadline-exceeded", [], {}   # não deu tempo de olhar: dúvida, não "limpo"
             else:
                 try:
                     state, reason, owners, detail = classify(b, s["repo"], plists, unreadable, markers, now)
@@ -575,22 +706,57 @@ def main(argv):
     counts = {CONFIRMADO: 0, AINDA: 0, NCS: 0, OUT: 0}
     for b in beads:
         counts[b["state"]] += 1
-    report_path = os.path.join(out_dir, "daemon-unverified-sweep-latest.json")
-    with open(report_path + ".tmp", "w", encoding="utf-8") as f:
-        json.dump({"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "counts": counts,
-                   "stores": store_status, "markers": markers.status(), "plists": dict(pinfo, n=len(plists or {})),
-                   "beads": beads},
-                  f, ensure_ascii=False, indent=1)
-    os.replace(report_path + ".tmp", report_path)          # quem lê (a .3) nunca vê um JSON pela metade
+    daemons = rollup(beads)
+    mk = markers.status()
+    json_path = os.path.join(out_dir, "daemon-unverified-sweep-latest.json")
+    write_atomic(json_path, json.dumps({"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "counts": counts,
+                                        "stores": store_status, "markers": mk, "plists": dict(pinfo, n=len(plists or {})),
+                                        "daemons": daemons, "beads": beads}, ensure_ascii=False, indent=1))
     reasons = {b["reason"] for b in beads} | {v[1] for b in beads for v in b["owner_states"].values()}
     broken = (plists is None or not stores or any(not v["ok"] for v in store_status.values())
               or bool(reasons & READ_FAILED))   # falha de dono conta mesmo sob AINDA
-    mk = markers.status()
+    reads = [(False, "NENHUMA loja configurada (DUS_STORES vazio) — nada foi varrido")] if not stores else []
+    reads += [(v["ok"], "loja %s: %s (n=%d)" % (n, "ok" if v["ok"] else "LEITURA FALHOU — " + str(v["error"])[:120], v["n"]))
+              for n, v in store_status.items()]
+    reads.append((plists is not None and not unreadable, "plists: %s" % ("%d labels lidos, %d ilegíveis" % (len(plists), len(unreadable))
+                                                                         if plists is not None else "NÃO LI os LaunchAgents — " + str(pinfo.get("error")))))
+    if mk["read"]:
+        reads.append((mk["ok"], "marcadores de gate: " + ("n=%d em %.1fs" % (mk["n"], mk["seconds"]) if mk["ok"] else "FALHOU — " + str(mk["error"])[:120])))
+    md_path = os.path.join(out_dir, "daemon-unverified-sweep-%s.md" % time.strftime("%Y-%m-%d", time.localtime(now)))
+    write_atomic(md_path, render_md(now, counts, reads, beads, daemons))
     mk_line = "" if not mk["read"] else (" · marcadores: n=%d em %.1fs" % (mk["n"], mk["seconds"]) if mk["ok"]
                                          else " · marcadores: FALHOU (%s)" % mk["error"])
-    print("%s daemon-unverified-sweep: %s%s · relatório: %s" % (
+    print("%s daemon-unverified-sweep: %s%s · relatório: %s · json: %s" % (
         time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
-        " · ".join("%s=%d" % (k, counts[k]) for k in (CONFIRMADO, AINDA, NCS, OUT)), mk_line, report_path))
+        " · ".join("%s=%d" % (k, counts[k]) for k in (CONFIRMADO, AINDA, NCS, OUT)), mk_line, md_path, json_path))
+
+    if args.notify:
+        state_path = os.path.join(out_dir, "daemon-unverified-sweep.state.json")
+        notified, bad_state = load_state(state_path)
+        if bad_state:
+            broken = True
+            sys.stderr.write("daemon-unverified-sweep: ERRO — baseline ilegível em %s (%s); tratando como 1ª rodada\n" % (state_path, bad_state))
+        new = [b for b in beads if b["state"] == AINDA and b["id"] not in notified]
+        delivered = True                                  # nada novo = nada a entregar: o baseline pode avançar
+        if new:
+            delivered = send_notify(notify_text(new, counts, broken, bad_state))
+            print("daemon-unverified-sweep: %d AINDA NÃO VISTO novo(s) — notificação %s" % (len(new), "enviada" if delivered else "NÃO entregue"))
+        else:
+            print("daemon-unverified-sweep: nenhum AINDA NÃO VISTO novo — sem notificação")
+        if delivered:
+            # Sai do baseline só o CONFIRMADO. NCS e o que esta rodada não viu (loja que não leu) mantêm a marca: voltar de uma
+            # leitura quebrada não é "novo". Entra o AINDA de agora.
+            confirmed = {b["id"] for b in beads if b["state"] == CONFIRMADO}
+            keep = {i: t for i, t in notified.items() if i not in confirmed}
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
+            keep.update({b["id"]: stamp for b in beads if b["state"] == AINDA and b["id"] not in keep})
+            try:
+                write_atomic(state_path, json.dumps({"notified": keep, "last_run": stamp}, ensure_ascii=False, indent=1))
+            except OSError as e:                          # avisou mas não guardou: na próxima repete o aviso — dito, rc 3
+                broken = True
+                sys.stderr.write("daemon-unverified-sweep: ERRO — não consegui gravar o baseline (%s); a próxima rodada repete o aviso\n" % e)
+        else:
+            broken = True
     return 3 if broken else 0
 
 

@@ -11,6 +11,7 @@ Uso:  python3 daemon-unverified-sweep.selftest.py        (rc 0 = tudo verde)
 import json
 import os
 import plistlib
+import re
 import shutil
 import stat
 import subprocess
@@ -20,7 +21,8 @@ import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SWEEP = os.environ.get("DUS_SWEEP_UNDER_TEST", os.path.join(HERE, "daemon-unverified-sweep.py"))
+PRISTINE = os.path.join(HERE, "daemon-unverified-sweep.py")
+SWEEP = os.environ.get("DUS_SWEEP_UNDER_TEST", PRISTINE)
 
 T0 = 1_790_000_000          # "agora" fixo do mundo falso (DUS_NOW)
 H = 3600
@@ -100,6 +102,16 @@ sys.stdout.write(open(p).read())
 '''
 
 
+FAKE_NOTIFY = r'''#!%(py)s
+import os, sys
+fake = os.environ["DUS_FAKE_DIR"]
+with open(os.path.join(fake, "notify.calls"), "a") as f:
+    f.write("\x1f".join(sys.argv[1:]) + "\n")
+if os.path.exists(os.path.join(fake, "notify.fail")):
+    sys.stderr.write("notify: ntfy fora do ar\n"); sys.exit(1)
+'''
+
+
 def _exe(path, body):
     with open(path, "w") as f:
         f.write(body % {"py": sys.executable})
@@ -119,7 +131,8 @@ class World:
         _exe(os.path.join(self.bin, "bd"), FAKE_BD)
         _exe(os.path.join(self.bin, "launchctl"), FAKE_LAUNCHCTL)
         _exe(os.path.join(self.bin, "ps"), FAKE_PS)
-        self.la = os.path.join(self.tmp, "LaunchAgents")
+        _exe(os.path.join(self.bin, "notify"), FAKE_NOTIFY)
+        self.la =os.path.join(self.tmp, "LaunchAgents")
         os.makedirs(self.la)
         self.out = os.path.join(self.tmp, "logs")
         self.hq_store = os.path.join(self.tmp, "hq")
@@ -212,7 +225,7 @@ class World:
         env.update({
             "DUS_FAKE_DIR": self.fake, "DUS_BD": os.path.join(self.bin, "bd"),
             "DUS_LAUNCHCTL": os.path.join(self.bin, "launchctl"), "DUS_PS": os.path.join(self.bin, "ps"),
-            "DUS_LAUNCH_AGENTS_DIR": self.la,
+            "DUS_NOTIFY": os.path.join(self.bin, "notify"), "DUS_LAUNCH_AGENTS_DIR": self.la,
             "DUS_OUT_DIR": self.out, "DUS_NOW": str(now), "DUS_RETRY_SLEEP": "0", "DUS_RETRIES": "3",
             "DUS_STORES": "hq|%s|%s;rig|%s|%s" % (self.hq_store, self.repo, self.rig_store, self.repo),
         })
@@ -844,14 +857,15 @@ class SweepTest(unittest.TestCase):
             w.bead("ga-stale%02d" % i, close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
         return sha
 
-    def test_stdout_resume_as_contagens_por_estado_e_aponta_o_json(self):
+    def test_stdout_resume_as_contagens_por_estado_e_aponta_o_relatorio_e_o_json(self):
         w = self.w
         self.stale_world(n=2)
         r = w.run()
         self.assertRegex(r.stdout, r"CONFIRMADO=0 · AINDA NÃO VISTO=2 · NÃO CONSEGUI SABER=0")
+        self.assertRegex(r.stdout, r"relatório: \S+daemon-unverified-sweep-\d{4}-\d{2}-\d{2}\.md")
         self.assertIn("daemon-unverified-sweep-latest.json", r.stdout)
         self.assertEqual(w.report()["generated_at"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 + 10 * D)))
-        self.assertEqual(os.listdir(w.out), ["daemon-unverified-sweep-latest.json"])   # escrita atômica: nenhum .tmp sobra
+        self.assertEqual([f for f in os.listdir(w.out) if f.endswith(".tmp")], [])      # escrita atômica: nenhum .tmp sobra
 
     def test_loja_com_mais_de_50_beads_nao_e_cortada(self):
         w = self.w
@@ -873,6 +887,309 @@ class SweepTest(unittest.TestCase):
         self.verdict("ga-hhh888", OUT)
         counts = w.report()["counts"]
         self.assertEqual((counts[CONFIRMADO], counts[AINDA], counts[NCS], counts[OUT]), (0, 0, 0, 1))
+
+
+    # ---- fatia 3: relatório legível, baseline, aviso único, lock, prazo, plist -----------------------------------
+    def md(self):
+        files = [f for f in os.listdir(self.w.out) if f.startswith("daemon-unverified-sweep-") and f.endswith(".md")]
+        self.assertEqual(len(files), 1, files)
+        with open(os.path.join(self.w.out, files[0]), encoding="utf-8") as f:
+            return f.read()
+
+    def msgs(self):
+        return [c.split("\x1f")[-1] for c in self.w.calls("notify")]
+
+    def state_path(self):
+        return os.path.join(self.w.out, "daemon-unverified-sweep.state.json")
+
+    def state(self):
+        with open(self.state_path(), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_relatorio_md_traz_contagens_por_estado_e_por_daemon(self):
+        w = self.w
+        self.stale_world(n=3)
+        w.bead("ga-open01", status="open", closed_at=None)
+        w.run()
+        text = self.md()
+        for want in ("AINDA NÃO VISTO: 3", "CONFIRMADO: 0", "NÃO CONSEGUI SABER: 0", "(tem o rótulo mas não está fechado): 1",
+                     "### com.test.svc — 3 bead(s) [started-before-merge×3]"):
+            self.assertIn(want, text)
+        for i in (1, 2, 3):
+            self.assertIn("- ga-stale%02d" % i, text)                # por daemon: o que o Mayor precisa pra decidir o reinício
+        roll = w.report()["daemons"]["com.test.svc"]
+        self.assertEqual((roll["ainda"], sorted(roll["beads"])), (3, ["ga-stale01", "ga-stale02", "ga-stale03"]))
+
+    def test_relatorio_md_mostra_a_leitura_que_falhou_nao_so_o_stderr(self):
+        w = self.w
+        self.daemon_world()
+        w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)
+        w.fail("rig")
+        self.assertEqual(w.run().returncode, 3)
+        self.assertIn("- ⚠ loja rig: LEITURA FALHOU", self.md())
+        self.assertIn("- loja hq: ok", self.md())
+        open(os.path.join(w.fake, "launchctl", "com.test.svc.fail"), "w").close()
+        w.run()
+        self.assertIn("### launchctl-read-failed — 1  ← LEITURA INCOMPLETA", self.md())    # NCS de leitura quebrada ≠ NCS de conteúdo
+
+    def test_primeira_rodada_avisa_uma_vez_e_grava_o_baseline(self):
+        w = self.w
+        self.stale_world(n=12)
+        r = w.run("--notify")
+        self.assertEqual(r.returncode, 0, r.stderr)                  # baseline ausente = 1ª rodada normal, não é erro
+        self.assertEqual(len(self.msgs()), 1, "UMA notificação, não uma por bead")
+        argv = w.calls("notify")[0].split("\x1f")
+        self.assertEqual(argv[:4], ["-t", "Vigia daemon-unverified", "-p", "3"])
+        msg = self.msgs()[0]
+        self.assertIn("12 bead(s) novo(s)", msg)
+        self.assertIn("com.test.svc (12)", msg)
+        self.assertLess(len(msg), 1000)
+        self.assertNotIn("ga-stale01", msg)                          # com muitos, o aviso resume e o relatório lista
+        self.assertEqual(sorted(self.state()["notified"]), ["ga-stale%02d" % i for i in range(1, 13)])
+
+    def test_segunda_rodada_sem_novidade_fica_calada(self):
+        w = self.w
+        self.stale_world(n=2)
+        w.run("--notify")
+        before = self.state()["notified"]
+        self.assertEqual(w.run("--notify").returncode, 0)
+        self.assertEqual(len(self.msgs()), 1)
+        self.assertEqual(self.state()["notified"], before)           # e o carimbo de quando foi avisado não é reescrito
+
+    def test_so_o_novo_ainda_nao_visto_dispara_novo_aviso(self):
+        w = self.w
+        sha = self.stale_world(n=2)
+        w.run("--notify")
+        w.bead("ga-stale99", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 6 * D)
+        w.run("--notify")
+        self.assertEqual(len(self.msgs()), 2)
+        self.assertIn("ga-stale99", self.msgs()[1])
+        self.assertNotIn("ga-stale01", self.msgs()[1])               # os antigos não são repetidos
+        self.assertEqual(sorted(self.state()["notified"]), ["ga-stale01", "ga-stale02", "ga-stale99"])
+
+    def test_sem_flag_notify_e_dry_run_nao_avisa_nem_toca_no_baseline(self):
+        w = self.w
+        sha = self.stale_world(n=2)
+        w.run()
+        self.assertEqual(self.msgs(), [])
+        self.assertFalse(os.path.exists(self.state_path()))
+        self.md()                                                    # mas o relatório sai
+        w.run("--notify")
+        with open(self.state_path(), "rb") as f:
+            baseline = f.read()
+        w.bead("ga-stale99", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 6 * D)
+        w.run()                                                      # há novidade, mas sem a flag é dry-run
+        self.assertEqual(len(self.msgs()), 1)
+        with open(self.state_path(), "rb") as f:
+            self.assertEqual(f.read(), baseline)
+
+    def test_so_confirmado_nao_avisa(self):
+        w = self.w
+        self.daemon_world()
+        w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)
+        self.assertEqual(w.run("--notify").returncode, 0)
+        self.assertEqual(self.msgs(), [])
+        self.assertEqual(self.state()["notified"], {})
+
+    def test_notify_que_falha_nao_avanca_o_baseline_e_a_proxima_rodada_re_tenta(self):
+        w = self.w
+        self.stale_world(n=2)
+        open(os.path.join(w.fake, "notify.fail"), "w").close()
+        r = w.run("--notify")                                        # notify roda e sai 1
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("baseline INTACTO", r.stderr)
+        self.assertFalse(os.path.exists(self.state_path()))
+        r = w.run("--notify", extra_env={"DUS_NOTIFY": os.path.join(w.tmp, "nao-existe")})   # notify nem abre
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertFalse(os.path.exists(self.state_path()))
+        os.remove(os.path.join(w.fake, "notify.fail"))
+        r = w.run("--notify")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.msgs()), 2)                        # a tentativa que falhou + a que entregou
+        self.assertIn("ga-stale01", self.state()["notified"])
+
+    def test_baseline_ilegivel_nao_e_baseline_ausente_dito_alto_e_re_avisa_uma_vez(self):
+        w = self.w
+        self.stale_world(n=2)
+        os.makedirs(w.out)
+        for i, bad in enumerate(("{ lixo", '{"notified": ["ga-stale01"]}'), 1):    # JSON torto · formato que não é o esperado
+            with open(self.state_path(), "w") as f:
+                f.write(bad)
+            r = w.run("--notify")
+            self.assertEqual(r.returncode, 3, r.stderr)
+            self.assertIn("baseline ilegível", r.stderr)
+            self.assertEqual(len(self.msgs()), i)                    # re-avisa (melhor repetir que calar)…
+            self.assertIn("baseline ilegível", self.msgs()[-1])      # …e o aviso diz que pode ser repetição
+            self.assertEqual(sorted(self.state()["notified"]), ["ga-stale01", "ga-stale02"])   # regrava um baseline são
+        self.assertEqual(w.run("--notify").returncode, 0)
+        self.assertEqual(len(self.msgs()), 2)
+
+    def test_baseline_que_nao_grava_e_dito_e_o_aviso_se_repete(self):
+        w = self.w
+        self.stale_world(n=1)
+        os.makedirs(os.path.join(w.out, "daemon-unverified-sweep.state.json.tmp"))     # o rename atômico não tem onde escrever
+        r = w.run("--notify")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("não consegui gravar o baseline", r.stderr)
+        self.assertEqual(len(self.msgs()), 1)
+        self.assertFalse(os.path.exists(self.state_path()))
+        os.rmdir(os.path.join(w.out, "daemon-unverified-sweep.state.json.tmp"))
+        self.assertEqual(w.run("--notify").returncode, 0)
+        self.assertEqual(len(self.msgs()), 2)                        # avisou de novo: o baseline nunca avançou
+
+    def test_confirmado_sai_do_baseline_e_se_voltar_a_ainda_nao_visto_e_novo(self):
+        w = self.w
+        self.stale_world(n=1)
+        w.run("--notify")
+        w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 9 * D)      # o daemon reiniciou depois do merge
+        w.run("--notify")
+        self.assertEqual(w.state_of("ga-stale01")["state"], CONFIRMADO)
+        self.assertEqual(self.state()["notified"], {})
+        w.loaded("com.test.svc", pid=w.next_pid(), start=T0 + 4 * D)      # e voltou a um processo anterior ao merge
+        w.run("--notify")
+        self.assertEqual(len(self.msgs()), 2)
+
+    def test_nao_consegui_saber_e_loja_que_nao_leu_mantem_a_marca_no_baseline(self):
+        w = self.w
+        sha = self.stale_world(n=1)
+        w.bead("ga-rig001", rig="rig", close_reason="PASSED (sha=%s)" % sha, closed_at=T0 + 5 * D)
+        w.run("--notify")
+        self.assertEqual(sorted(self.state()["notified"]), ["ga-rig001", "ga-stale01"])
+        w.fail("rig")                                                # semana 2: a loja do rig não lista
+        self.assertEqual(w.run("--notify").returncode, 3)
+        self.assertEqual(sorted(self.state()["notified"]), ["ga-rig001", "ga-stale01"])   # sumir da leitura não é "resolvido"
+        os.remove(os.path.join(w.fake, "fail", os.path.basename(w.rig_store)))
+        open(os.path.join(w.fake, "launchctl", "com.test.svc.fail"), "w").close()         # semana 3: o launchctl quebra
+        self.assertEqual(w.run("--notify").returncode, 3)
+        self.assertEqual(w.state_of("ga-stale01")["state"], NCS)
+        self.assertEqual(sorted(self.state()["notified"]), ["ga-rig001", "ga-stale01"])
+        os.remove(os.path.join(w.fake, "launchctl", "com.test.svc.fail"))                 # semana 4: tudo volta a AINDA
+        self.assertEqual(w.run("--notify").returncode, 0)
+        self.assertEqual(len(self.msgs()), 1, "voltar de uma leitura quebrada não é 'novo'")
+
+    def test_prazo_estourado_vira_nao_consegui_saber_nunca_limpo_e_nao_apaga_o_baseline(self):
+        w = self.w
+        self.stale_world(n=2)
+        w.run("--notify")
+        r = w.run("--notify", extra_env={"DUS_DEADLINE": "0"})       # não deu tempo de olhar nenhum
+        self.assertEqual(r.returncode, 3)
+        for i in (1, 2):
+            b = w.state_of("ga-stale%02d" % i)
+            self.assertEqual((b["state"], b["reason"]), (NCS, "deadline-exceeded"), b)
+        self.assertEqual(w.report()["counts"][CONFIRMADO], 0)
+        self.assertIn("### deadline-exceeded — 2  ← LEITURA INCOMPLETA", self.md())
+        self.assertEqual(sorted(self.state()["notified"]), ["ga-stale01", "ga-stale02"])
+        self.assertEqual(w.run("--notify").returncode, 0)
+        self.assertEqual(len(self.msgs()), 1)
+
+    def test_segunda_instancia_simultanea_sai_sem_varrer_e_sem_mexer_em_nada(self):
+        import fcntl
+        w = self.w
+        self.stale_world(n=1)
+        os.makedirs(w.out)
+        with open(os.path.join(w.out, "daemon-unverified-sweep.lock"), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            r = w.run("--notify")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("já em execução", r.stdout)
+        self.assertEqual(w.calls("bd"), [], "quem não pegou o lock não pode nem consultar o bd")
+        self.assertEqual(self.msgs(), [])
+        self.assertEqual(os.listdir(w.out), ["daemon-unverified-sweep.lock"])
+        self.assertEqual(w.run("--notify").returncode, 0)            # solto o lock, a próxima varre
+        self.assertEqual(len(self.msgs()), 1)
+
+    def test_plist_do_gatilho_e_semanal_nao_reinicia_nada_e_nao_dispara_ao_carregar(self):
+        path = os.path.join(HERE, "com.gascity.daemon-unverified-sweep.plist")
+        with open(path, "rb") as f:
+            raw = f.read()
+        pl = plistlib.loads(raw)                                     # expat estrito: `--` dentro de comentário XML não passa
+        self.assertEqual(pl["Label"], "com.gascity.daemon-unverified-sweep")
+        args = pl["ProgramArguments"]
+        self.assertEqual(args[0], "/usr/bin/python3")
+        self.assertTrue(args[-2].endswith("/packs/town-deltas/assets/daemon-unverified-sweep.py"), args)
+        self.assertTrue(os.path.exists(os.path.join(HERE, "daemon-unverified-sweep.py")))
+        self.assertEqual(args[-1], "--notify")                       # sem a flag seria dry-run: nunca avisaria
+        self.assertIs(pl["RunAtLoad"], False)
+        self.assertNotIn("KeepAlive", pl)                            # job de calendário, não daemon
+        self.assertNotIn("StartInterval", pl)                        # um intervalo de 7 dias zera a cada sleep / reboot
+        self.assertEqual(pl["StartCalendarInterval"], {"Weekday": 1, "Hour": 8, "Minute": 47})
+        self.assertTrue(pl["EnvironmentVariables"]["PATH"].startswith("/Users/athos/.local/bin:"))   # de lá saem o notify e o bd
+        body = re.sub(r"<!--.*?-->", "", raw.decode("utf-8"), flags=re.S)      # o comentário pode CITAR daemon-refresh; o comando não
+        for verb in ("daemon-refresh", "kickstart", "bootout", "launchctl", "unload"):
+            self.assertNotIn(verb, body)
+        if shutil.which("plutil"):
+            r = subprocess.run(["plutil", "-lint", path], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
+# (nome, trecho do script, troca, testes de SweepTest que TÊM que reprovar contra o mutante)
+MUTANTS = [
+    ("lock-nao-trava", "fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)", "pass",
+     ["test_segunda_instancia_simultanea_sai_sem_varrer_e_sem_mexer_em_nada"]),
+    ("baseline-avanca-mesmo-sem-entrega", "        if delivered:\n            # Sai do baseline", "        if True:\n            # Sai do baseline",
+     ["test_notify_que_falha_nao_avanca_o_baseline_e_a_proxima_rodada_re_tenta"]),
+    ("dry-run-avisa-e-grava", "    if args.notify:\n", "    if True:\n",
+     ["test_sem_flag_notify_e_dry_run_nao_avisa_nem_toca_no_baseline"]),
+    ("ignora-o-baseline", 'b["state"] == AINDA and b["id"] not in notified]', 'b["state"] == AINDA]',
+     ["test_segunda_rodada_sem_novidade_fica_calada"]),
+    ("so-o-ainda-fica-no-baseline", "keep = {i: t for i, t in notified.items() if i not in confirmed}",
+     'keep = {i: t for i, t in notified.items() if i in {b["id"] for b in beads if b["state"] == AINDA}}',
+     ["test_nao_consegui_saber_e_loja_que_nao_leu_mantem_a_marca_no_baseline"]),
+    ("confirmado-nunca-sai-do-baseline", "keep = {i: t for i, t in notified.items() if i not in confirmed}", "keep = dict(notified)",
+     ["test_confirmado_sai_do_baseline_e_se_voltar_a_ainda_nao_visto_e_novo"]),
+    ("prazo-ignorado", "elif time.monotonic() >= deadline:", "elif False:",
+     ["test_prazo_estourado_vira_nao_consegui_saber_nunca_limpo_e_nao_apaga_o_baseline"]),
+    ("prazo-nao-quebra-o-rc", '"status-unknown", "deadline-exceeded"}', '"status-unknown"}',
+     ["test_prazo_estourado_vira_nao_consegui_saber_nunca_limpo_e_nao_apaga_o_baseline"]),
+    ("baseline-ilegivel-calado", 'return {}, "%s: %s" % (type(e).__name__, e)', "return {}, None",
+     ["test_baseline_ilegivel_nao_e_baseline_ausente_dito_alto_e_re_avisa_uma_vez"]),
+    ("baseline-ausente-vira-erro", "except FileNotFoundError:\n        return {}, None", 'except FileNotFoundError:\n        return {}, "ausente"',
+     ["test_primeira_rodada_avisa_uma_vez_e_grava_o_baseline"]),
+    ("notify-falho-nao-quebra-o-rc", "        else:\n            broken = True\n    return 3 if broken else 0",
+     "        else:\n            pass\n    return 3 if broken else 0",
+     ["test_notify_que_falha_nao_avanca_o_baseline_e_a_proxima_rodada_re_tenta"]),
+    ("baseline-que-nao-grava-nao-quebra-o-rc", "                broken = True\n                sys.stderr.write(\"daemon-unverified-sweep: ERRO — não consegui gravar",
+     "                sys.stderr.write(\"daemon-unverified-sweep: ERRO — não consegui gravar",
+     ["test_baseline_que_nao_grava_e_dito_e_o_aviso_se_repete"]),
+    ("relatorio-sem-daemon", 'd = out.setdefault(label, {"ainda": 0, "beads": [], "reasons": {}})', 'd = {"ainda": 0, "beads": [], "reasons": {}}',
+     ["test_relatorio_md_traz_contagens_por_estado_e_por_daemon"]),
+    ("relatorio-esconde-leitura-que-falhou", '"" if ok else "⚠ "', '""',
+     ["test_relatorio_md_mostra_a_leitura_que_falhou_nao_so_o_stderr"]),
+]
+
+
+@unittest.skipIf(os.environ.get("DUS_SWEEP_UNDER_TEST"), "rodando contra um mutante: não aninha")
+class MutantTest(unittest.TestCase):
+    """Cada guarda da .3 tem um mutante que o selftest MATA: teste que só passa não prova nada. Cada mutante é o script de verdade
+    com UMA troca de texto (o trecho tem que existir exatamente uma vez — se o código mudar, isto avisa em vez de calar), rodado
+    contra os testes que o guardam via DUS_SWEEP_UNDER_TEST. O controle roda os mesmos testes no script de verdade e passa."""
+
+    def child(self, script, names):
+        env = dict(os.environ, DUS_SWEEP_UNDER_TEST=script)
+        r = subprocess.run([sys.executable, "-B", os.path.abspath(__file__)] + ["SweepTest." + n for n in names],
+                           capture_output=True, text=True, env=env, timeout=900)
+        return r.returncode, r.stdout + r.stderr
+
+    def test_controle_os_testes_dos_mutantes_passam_no_script_de_verdade(self):
+        rc, out = self.child(PRISTINE, sorted({n for m in MUTANTS for n in m[3]}))
+        self.assertEqual(rc, 0, out[-3000:])
+
+    def test_cada_mutante_morre(self):
+        with open(PRISTINE, encoding="utf-8") as f:
+            src = f.read()
+        tmp = tempfile.mkdtemp(prefix="dus-mutants-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        for name, old, new, names in MUTANTS:
+            with self.subTest(mutante=name):
+                self.assertEqual(src.count(old), 1, "o trecho do mutante %r não existe exatamente uma vez no script" % name)
+                mutated = src.replace(old, new)
+                compile(mutated, name, "exec")                       # mutante inválido mataria qualquer teste: não prova nada
+                path = os.path.join(tmp, name + ".py")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(mutated)
+                rc, out = self.child(path, names)
+                self.assertNotEqual(rc, 0, "o mutante %r SOBREVIVEU: nenhum teste reprovou" % name)
+                self.assertIn("FAILED", out, "o mutante %r não reprovou por asserção:\n%s" % (name, out[-1500:]))
 
 
 if __name__ == "__main__":

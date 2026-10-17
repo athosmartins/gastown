@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.gascity.daemon-unverified-sweep — o GATILHO do vigia de `delivery:daemon-unverified` (ga-iyfe83.3,
+  parte 3 da ga-29ssni). O script é daemon-unverified-sweep.py (neste mesmo diretório).
+
+  O QUE FAZ: pra cada bead fechado com o rótulo `delivery:daemon-unverified` (o código foi mergeado, mas a
+  liveness do daemon dono NÃO foi confirmada), decide UM de três estados: CONFIRMADO (o daemon subiu DEPOIS
+  do merge), AINDA NÃO VISTO (subiu antes, ou não está carregado) ou NÃO CONSEGUI SABER (sem sha, sem daemon
+  identificável, ou a leitura falhou — e leitura que falha NUNCA vira CONFIRMADO). Escreve o relatório legível
+  em .gc/logs/daemon-unverified-sweep-AAAA-MM-DD.md e avisa UMA vez, só quando aparece AINDA NÃO VISTO que
+  ainda não tinha sido avisado (baseline em .gc/logs/daemon-unverified-sweep.state.json).
+
+  DETECTA, NÃO AGE: não reinicia daemon nenhum e não roda daemon-refresh. Quem decide reiniciar é o Mayor / o
+  dono do daemon, a partir do relatório. Sem este gatilho o detector existe e não roda — a mesma classe do
+  rótulo que ninguém lia (~300 beads). Se remover este plist, remova o script junto.
+
+  CADÊNCIA: segunda 08:47, 1x por semana.
+   - o sinal muda na escala de merges + reinícios de daemon, não de minutos; diário repetiria o mesmo ~300;
+   - 08:47 e não na hora cheia, pra não empilhar com o ruído dos jobs :00/:30; segunda de manhã porque o
+     aviso é pra ser LIDO no começo da semana;
+   - StartCalendarInterval e não StartInterval=604800: um intervalo longo zera a contagem a cada sleep ou
+     reboot do mini e pode nunca disparar; o calendário dispara na próxima ocorrência real do relógio (e o
+     launchd roda logo após o wake se o mini dormia na hora);
+   - a varredura é lenta (consulta ao Dolt com retry; o load da máquina estoura timeout), por isso Nice 10 e
+     LowPriorityIO: não compete com o pipeline. O script tem instância única (flock) e prazo total de 45 min.
+  RunAtLoad=false de propósito: subir a máquina ou recarregar o plist não é motivo pra varrer nem avisar (o
+  kickstart do deploy, descrito acima, é a única execução fora do calendário, e é proposital).
+
+  EXIT 3 = alguma leitura falhou (loja, launchctl, ps, git, prazo): o relatório diz qual. "Não consegui olhar"
+  nunca vira "não achei nada". O log do launchd (daemon-unverified-sweep-launchd.out e .err, em .gc/logs)
+  guarda a linha de cada execução.
+
+  PATH com ~/.local/bin PRIMEIRO: é de lá que saem o `notify` e o `bd`; sem isso o aviso morre engolido.
+  O `bd -C <loja>` acha o servidor Dolt pelo .beads da própria loja, sem variável de ambiente (medido num
+  ambiente limpo), então este plist NÃO fixa porta de Dolt. /usr/bin/python3 é a 3.9 do sistema; o script é
+  compatível com ela. O `-I` isola o Python do ambiente do usuário.
+
+  COMO ENTRA NO LAUNCHD: o merge sozinho não carrega nada. O deploy_cmd do rig gascity
+  (delivery-runbooks.toml) puxa o main e roda scripts/skill-integrity-install.sh, cuja
+  scan_and_install_new_plists (ga-7ryjey) instala todo com.gascity.*.plist novo de packs/town-deltas/assets
+  que ainda não esteja carregado: copia para ~/Library/LaunchAgents (a cópia carregada mora lá; é de lá que o
+  daemon-presence-watchdog espera achar este Label), faz bootstrap e kickstart. Ou seja: a PRIMEIRA execução
+  acontece no deploy, não na segunda seguinte, e com a flag de aviso ela avisa a 1ª rodada inteira, uma vez.
+  Se o deploy não rodou, o plist não está carregado e o daemon-presence-watchdog reporta PRESENCE-DRIFT para
+  ele; à mão:
+    cp <este arquivo> ~/Library/LaunchAgents/com.gascity.daemon-unverified-sweep.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.daemon-unverified-sweep.plist
+  O caminho do script abaixo é o do checkout principal: só existe depois do merge ser puxado para lá.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gascity.daemon-unverified-sweep</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>-I</string>
+        <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/daemon-unverified-sweep.py</string>
+        <string>--notify</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+    <!-- Weekday 1 = segunda-feira. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>47</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/athos/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/athos</string>
+        <key>GC_CITY_PATH</key>
+        <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    </dict>
+
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/daemon-unverified-sweep-launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/daemon-unverified-sweep-launchd.err</string>
+</dict>
+</plist>
