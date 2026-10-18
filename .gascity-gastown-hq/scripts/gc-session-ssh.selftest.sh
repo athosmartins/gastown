@@ -30,7 +30,7 @@
 #   extensions.worktreeConfig: o core.bare sai do config compartilhado e o commit do worktree continua funcionando, autor = a sessão), modo 600 e o resto do arquivo preservados, idempotente, uma identidade por
 #   worktree; pasta ausente / comum, ~/.claude.json ausente / ilegível (intacto, byte a byte) / com forma estranha, config.worktree travado, identidade que o git não lê de volta → exit 1 com o motivo, nenhum
 #   lançador, a pasta ausente não vira diretório; dry-run mostra o `prepare`; worktree_prepare explícito nos dois sentidos, padrão LIGADO no servidor e DESLIGADO no host de presença (notebook), não-booleano recusa sem ssh.
-#   wt (ga-2hd02v.1.7) — o start cria o worktree da sessão (wt-add) e o stop o recolhe (wt-rm) SÓ quando nada se perde: papel mapeado em `worktree_rigs` abre DENTRO do worktree do wt-add (com identidade e
+#   wt (ga-2hd02v.1.7 e 1.8) — o start cria o worktree da sessão (wt-add) e o stop o recolhe (wt-rm) SÓ quando nada se perde: papel mapeado em `worktree_rigs` abre DENTRO do worktree do wt-add (com identidade e
 #   confiança), o guarda de clone olha o worktree JÁ criado, wt-add / preparo / guarda que falham deixam o host como estava, teto e 'já existe' recusam ANTES de criar; o stop recolhe o limpo e publicado e MANTÉM
 #   o sujo, o não publicado e o que o git não consegue ler (e nunca muda o rc do stop); papel sem mapa e host sem a chave = como antes; nomes que o engine gera (dog-remote-<cauda>, dog-remote-adhoc-<10>) não são
 #   pedido de host (host fora da config no meio do nome segue recusando); o identity_pattern do runbook casa com eles e só com eles; contrato com o hetzner-remote-git.sh de verdade (caminhos e formatos).
@@ -39,7 +39,7 @@
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); 83 mutantes no total (os 19 últimos, grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine).
+#   registro de sessões do list-running); 90 mutantes no total (os 26 últimos, grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1
 set -u
@@ -67,6 +67,7 @@ while [ $# -gt 0 ]; do case "$1" in -o) shift 2;; -*) shift;; *) break;; esac; d
 [ -z "${FAKE_SSH_CUT_HOST:-}" ] || [ "$FAKE_SSH_CUT_HOST" != "$1" ] || FAKE_SSH_CUT=1
 shift
 [ -z "${FAKE_SSH_NOISE:-}" ] || echo "bashrc: bem-vindo ao servidor"
+[ -z "${FAKE_SSH_DELAY:-}" ] || sleep "$FAKE_SSH_DELAY"  # ssh lento: o comando só roda depois de N s
 if [ -n "${FAKE_SSH_JUNK:-}" ]; then cat >/dev/null; echo "saida sem marcadores"; exit 0; fi
 [ -z "${FAKE_SSH_TIMES:-}" ] || echo "B $$ $(python3 -c 'import time;print(time.time())')" >> "$FAKE_SSH_TIMES"
 if [ -n "${FAKE_SSH_CUT:-}" ]; then sh -c "$*" | grep -v '@@GC-END@@'; exit 0; fi
@@ -565,7 +566,9 @@ install_rg() {  # um hetzner-remote-git.sh falso com o contrato do verdadeiro (G
 sub=${1:-}; rig=${2:-}; bead=${3:-}; r="$GT_REMOTE_GIT/$rig/repo.git"; p="$GT_REMOTE_GIT/$rig/wt/$bead"
 echo "$sub $rig $bead GR=$GT_REMOTE_GIT" >> "${FAKE_RG_LOG:-/dev/null}"
 case "$sub" in
-  wt-add) [ "${FAKE_RG_FAIL:-}" != add ] || { echo "hetzner-remote-git: wt-add falhou (de propósito)" >&2; exit 3; }
+  wt-add) if [ "${FAKE_RG_FAIL:-}" = addpartial ]; then  # o worktree sai criado e o checkout esparso morre (como o die 3 do script verdadeiro)
+            git -C "$r" worktree add -q --no-checkout -b "worker/$bead" "$p" refs/remotes/origin/main >&2; echo "hetzner-remote-git: checkout esparso falhou em $p (de propósito)" >&2; exit 3; fi
+          [ "${FAKE_RG_FAIL:-}" != add ] || { echo "hetzner-remote-git: wt-add falhou (de propósito)" >&2; exit 3; }
           [ ! -e "$p" ] || { echo "wt-add: $p já existe"; exit 0; }
           git -C "$r" worktree add -q -b "worker/$bead" "$p" refs/remotes/origin/main >&2 || exit 3
           echo "{\"bead\":\"$bead\",\"pull\":\"ok\"}";;
@@ -656,6 +659,21 @@ bad = [x for x in yes if not rx.fullmatch(x)] + [x for x in no if rx.fullmatch(x
 print("fora do esperado:", bad, file=sys.stderr) if bad else None
 sys.exit(1 if bad else 0)
 PY
+  # --- 1.8: acabamentos do veredito do gate da 1.7 ---
+  cfg 3 2 "$base"; wtmirror; pv start dog-remote-gafloor01 < <(req cat "$eng"); ok $RC "wt: (1.8) start com prazo de config 2 s abre (vale o piso de 150 s) (rc=$RC $(head -c 160 "$T/err"))"
+  FAKE_SSH_DELAY=4 pv stop dog-remote-gafloor01 </dev/null; [ $RC = 0 ] && [ "$(count)" = 0 ] && evwt dog-remote-gafloor01 removed; ok $? "wt: ...e o stop de sessão com worktree também leva piso de prazo: ssh lento (4 s) com prazo de config 2 s ainda termina, recolhe e sai 0 (rc=$RC $(head -c 160 "$T/err"))"
+  FAKE_SSH_DELAY=4 pv stop wa-worker-remote-gafloor02 </dev/null; [ $RC = 1 ] && has "$T/err" 'não respondeu'; ok $? "wt: ...e o stop de papel SEM worktree segue com o prazo da config (estoura em 2 s e diz o host): o piso é só de quem recolhe worktree (rc=$RC)"
+  cfg 3 25 '{"worktree_prepare":false}'; mkdir -p "$RH/plain"; pv start dog-remote-UPPER1 < <(req cat "$RH/plain"); ok $RC "wt: (sessão aberta ANTES de existir o mapa, com nome que não serve de nome de worktree) abre (rc=$RC)"
+  cfg 3 25 "$base"; pv stop dog-remote-UPPER1 </dev/null; [ $RC = 0 ] && [ "$(count)" = 0 ] && has "$T/state/a/session-ssh.log" 'stop dog-remote-UPPER1' && has "$T/state/a/session-ssh.log" 'sem recolhimento'; ok $? "wt: ...com o mapa ligado, o stop dela DERRUBA a sessão do mesmo jeito (sem recolher worktree) e o log diz por quê — nome impróprio nunca impede o stop (rc=$RC $(head -c 160 "$T/err"))"
+  wtmirror; w=$(WTD dog-remote-gapartial1); FAKE_RG_FAIL=addpartial pv start dog-remote-gapartial1 < <(req cat "$eng")
+  [ $RC = 1 ] && sess_zero dog-remote-gapartial1 && [ ! -e "$w" ] && [ -z "$(git -C "$RGREPO" rev-parse -q --verify refs/heads/worker/dog-remote-gapartial1 2>/dev/null)" ]; ok $? "wt: wt-add que morre DEPOIS de criar o worktree (checkout esparso) → o start desfaz o que criou: nem pasta nem branch sobram, e o retry da mesma bead não bate em 'incompleto' (rc=$RC)"
+  wtmirror; w=$(WTD dog-remote-gapre0001); git -C "$RGREPO" worktree add -q -b worker/dog-remote-gapre0001 "$w" refs/remotes/origin/main; echo guardado > "$w/precioso.txt"; FAKE_RG_FAIL=add pv start dog-remote-gapre0001 < <(req cat "$eng")
+  [ $RC = 1 ] && [ -f "$w/precioso.txt" ] && [ -n "$(git -C "$RGREPO" rev-parse -q --verify refs/heads/worker/dog-remote-gapre0001 2>/dev/null)" ]; ok $? "wt: wt-add que falha numa pasta que JÁ existia antes do start NÃO a desfaz (o desfazer é só do que este start criou) (rc=$RC)"
+  wtmirror; pv start dog-remote-gawarn001 < <(req cat "$eng"); ok $RC "wt: (sessão para o aviso do git) abre (rc=$RC)"; w=$(WTD dog-remote-gawarn001); mkdir -p "$T/home/.local/bin"; v=$(command -v git)
+  printf '#!/bin/sh\ncase "$*" in *"status --porcelain"*) echo "warning: aviso inofensivo do git" >&2;; esac\nexec %s "$@"\n' "$v" > "$T/home/.local/bin/git"; chmod +x "$T/home/.local/bin/git"
+  pv stop dog-remote-gawarn001 </dev/null; [ $RC = 0 ] && [ ! -e "$w" ] && evwt dog-remote-gawarn001 removed; ok $? "wt: aviso do git em stderr (rc 0) NÃO vira 'há alteração não commitada': a decisão lê só o stdout do git status e o worktree limpo é recolhido (rc=$RC)"
+  find "$T/home/.local/bin" -name git -delete
+  [ -n "$(sed -n 's/.*\(gracefulStopAll\).*/\1/p' "$HERE/../docs/runbooks/hetzner-hardening.md" | head -1)" ] && [ -n "$(sed -n 's/.*\(gracefulStopAll\).*/\1/p' "$doc" | head -1)" ]; ok $? "wt: os dois runbooks avisam que trocar [session] provider para hybrid derruba TODAS as sessões em execução (gracefulStopAll) — não existe 'recarga suave' para elas"
   # --- contrato com o script de verdade: o caminho que o provider calcula é o que o hetzner-remote-git.sh monta ---
   grep -qF 'GR=${GT_REMOTE_GIT:-$HOME/gt-remote/git}' "$HERE/hetzner-remote-git.sh" && grep -qF 'path="$GR/$RIG/wt/$bead"' "$HERE/hetzner-remote-git.sh" && grep -qF 'g() { git -C "$GR/$RIG/repo.git" "$@"; }' "$HERE/hetzner-remote-git.sh"; ok $? "wt: contrato: <git>/<rig>/wt/<sessão> e <git>/<rig>/repo.git são o que o hetzner-remote-git.sh monta"
   grep -qF "RE_RIG='^[a-z][a-z0-9_-]{0,40}\$'; RE_BEAD='^[a-z0-9][a-z0-9._-]{0,60}\$'" "$HERE/hetzner-remote-git.sh"; ok $? "wt: contrato: os formatos de rig e de nome de worktree que o provider valida são os do script"
@@ -749,7 +767,7 @@ echo "== $((n-fails))/$n ok =="
   mutant wt "start que falha depois do wt-add não recolhe o worktree" 's/            + "trap .*$/            + "")/'
   mutant wt "stop recolhe mesmo com alteração não commitada" '/\[ -z "\$wst" \] ||/d'
   mutant wt "stop recolhe mesmo com commit que o origin não tem" 's/\[ "\$wpub" -eq 1 \] ||/true ||/'
-  mutant wt "git que não lê o worktree vira 'limpo'" 's/wst=\$(git -C @WT@ status --porcelain 2>&1) ||.*$/wst=$(git -C @WT@ status --porcelain 2>\/dev\/null) || :/;s/wh=\$(git -C @WT@ rev-parse HEAD 2>\/dev\/null) ||.*$/wh=$(git -C @WT@ rev-parse HEAD 2>\/dev\/null) || :/'
+  mutant wt "git que não lê o worktree vira 'limpo'" 's/wst=\$(git -C @WT@ status --porcelain 2>\/dev\/null) ||.*$/wst=$(git -C @WT@ status --porcelain 2>\/dev\/null) || :/;s/wh=\$(git -C @WT@ rev-parse HEAD 2>\/dev\/null) ||.*$/wh=$(git -C @WT@ rev-parse HEAD 2>\/dev\/null) || :/'
   mutant wt "wt-rm que falha derruba o stop" 's/wtclean\\nexit 0"/wtclean"/;s/echo "WT kept wt-rm falhou: \$(printf %s "\$wo" | tail -n 1)"; return 0;/exit 1;/'
   mutant wt "stop sem GT_REMOTE_GIT no wt-rm" 's/wo=\$(GT_REMOTE_GIT=@GR@ @BIN@ wt-rm/wo=$(@BIN@ wt-rm/'
   mutant wt "o branch publicado fica no repositório" '/\[ -z "\$wb" \] || git -C @REPO@ update-ref -d/d'
@@ -759,6 +777,13 @@ echo "== $((n-fails))/$n ok =="
   mutant wt "cauda de bead lida como pedido de host" 's/if m.group(2) == "" or m.group(1) == "adhoc":/if m.group(1) == "adhoc":/'
   mutant wt "adhoc lido como pedido de host" 's/if m.group(2) == "" or m.group(1) == "adhoc":/if m.group(2) == "":/'
   mutant wt "pedido de host no meio do nome vira cauda (host errado cai no padrão)" 's/if m.group(2) == "" or m.group(1) == "adhoc":/if True:/'
+  mutant wt "stop com worktree sem o piso de prazo" 's/max(cfg.timeout, WT_STOP_FLOOR) if wt else 0)/0)/'
+  mutant wt "stop com nome impróprio para worktree falha em vez de derrubar a sessão" 's/    except Fail as e:  # stop: nome/    except OSError as e:  # stop: nome/'
+  mutant wt "wt-add que morre no meio não é desfeito" 's/ || wtundo; echo/ || true; echo/'
+  mutant wt "o desfazer pega até a pasta que já existia antes do start" 's/\[ \\"\$wpre\\" -eq 1 \] || wtundo;/wtundo;/'
+  mutant wt "o desfazer não tira o branch novo" 's/\[ "\$wub" = "\$wum" \] \&\& git/false \&\& git/'
+  mutant wt "o desfazer não chama o wt-rm" 's/^  GT_REMOTE_GIT=@GR@ @BIN@ wt-rm @RIG@ @NAME@ >\/dev\/null 2>\&1$/  :/'
+  mutant wt "aviso do git em stderr vira 'alteração não commitada'" 's/status --porcelain 2>\/dev\/null) || { echo "WT kept o git não leu/status --porcelain 2>\&1) || { echo "WT kept o git não leu/'
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
   r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"

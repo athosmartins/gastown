@@ -226,7 +226,9 @@ Decisão do Mayor (18/10, opção 1 da ga-2hd02v.1.6). **Nada disto está vivo**
 
 **O que falta ligar (passos 3 e 4 da ga-2hd02v.1.6, em janela de config viva, cada um reversível):**
 
-1. `.gc/session-ssh.json`, host `hetzner`: acrescentar `"worktree_rigs": {"dog": "gascity"}` (o `start` já ganha o piso de 150 s sozinho para estas sessões).
+1. `.gc/session-ssh.json`, host `hetzner`: acrescentar `"worktree_rigs": {"dog": "gascity"}` (o `start` ganha sozinho um piso de 150 s e o `stop` de 90 s, só para estas sessões).
 2. `~/.gastown/remote-shim.json` no mini: `identity_pattern` = a linha `IDENTITY_PATTERN=` do `gc-session-ssh.md` (hoje o valor vivo é o estreito do passo 2 da 1.6, que recusa o nome de sessão do engine).
-3. `[session] provider = "hybrid"`, `remote_match = "-remote-"`, `remote_exec` no `city.toml` (`gc-session-ssh.md`, "Como ligar"), e `gc reload --soft` com prova de que as sessões locais seguiram vivas.
+3. `[session] provider = "hybrid"`, `remote_match = "-remote-"`, `remote_exec` no `city.toml` (`gc-session-ssh.md`, "Como ligar"). **Isto NÃO é uma recarga suave para as sessões:** trocar o provider de tmux padrão para `hybrid` faz o engine rodar `gracefulStopAll` em TODAS as sessões em execução antes de trocar (Mayor, crews, revisores em revisão). Faça dentro de uma janela do engine, que já derruba as sessões, ou numa janela própria combinada com o Mayor e com a fila do gate vazia; antes e depois, compare `gc session list`.
 4. Atribuir uma bead real ao `dog-remote-1`, nudge, e provar: `gc prime` rodou, hooks gc ok, `bd`/`gc` pelo atalho, commit e push pelo espelho, `gate-done`.
+
+**Deriva medida em 18/10 (não é desta fatia).** O `hetzner-remote-git.sh` instalado no nó (15 677 B, de 15/10) é de uma revisão ANTERIOR à do repositório (17 055 B): faltam as correções posteriores do gate da fatia 4 (varredura `scan` mais estrita com `--diff-filter=d` e recusa de nome com quebra de linha, `wt-add` que recusa checkout incompleto, `status` por prefixos do clone). O contrato que o provider usa (`wt-add`/`wt-rm`, caminhos, `GT_REMOTE_GIT`) é o mesmo nas duas, então a fatia 7 funciona com a instalada; reinstalar é com quem cuida do nó (compartilhado com a ga-zri39b).

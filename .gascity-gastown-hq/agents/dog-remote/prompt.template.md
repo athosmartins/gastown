@@ -38,7 +38,7 @@ Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `g
 3. `git push origin HEAD` leva o branch ao espelho do mini, que só aceita `worker/*` e `crew/*`. Merge é do gate, nunca seu.
 4. Bead de código: ao terminar, rode `gate-done` e deixe um `bd comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho.
 5. Bead que pede só uma medição ou um relato: `bd close <id> --reason "<resultado>"`.
-6. Depois disso, termine o turno. A sessão ociosa se encerra sozinha em 15 minutos e o worktree é recolhido se estiver limpo e publicado; trabalho não publicado fica guardado, nunca é apagado.
+6. Depois disso, termine o turno. A sessão ociosa se encerra sozinha em 15 minutos e o worktree só é recolhido se estiver limpo e com todo commit publicado: commit não publicado e arquivo novo ou alterado ficam guardados e o worktree é mantido. Arquivos que o git ignora (build, cache) não contam e somem junto quando ele é recolhido.
 
 ## Sem bead
 

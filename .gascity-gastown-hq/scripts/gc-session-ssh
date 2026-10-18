@@ -33,7 +33,8 @@ O QUE FAZ
   WORKTREE DO PROVIDER (ga-2hd02v.1.7, decisão do Mayor 18/10): sessão `<papel>-remote-…` com o papel em `worktree_rigs` (papel → rig) abre num worktree que o PRÓPRIO start cria, `<remote_home>/gt-remote/git/<rig>/wt/<sessão>`
   (o work_dir do template é ignorado): depois do teto e da existência roda o `hetzner-remote-git.sh wt-add` e SÓ ENTÃO o guarda de clone (que olha o checkout) e o preparo; start que falha depois do wt-add recolhe o que criou.
   O stop derruba a sessão e recolhe o worktree (wt-rm) SÓ se estiver limpo e com todo commit já no origin/main do espelho ou na ref da sessão; qualquer dúvida mantém, e o resultado (removed | kept <motivo> | none)
-  vai para o evento `stopped` e o log — nunca para o rc do stop. Sem `worktree_rigs` nada disto existe. O nome da sessão vira o do worktree e do branch worker/<nome> (minúsculas). Nomes que o ENGINE gera
+  vai para o evento `stopped` e o log — nunca para o rc do stop (que leva um piso de prazo de 90 s, e nome impróprio para worktree não o impede: derruba a sessão sem recolher). wt-add que morre no meio de um worktree
+  que o próprio start criou é desfeito (pasta e branch novo); o de uma pasta que já existia antes não. Sem `worktree_rigs` nada disto existe. O nome da sessão vira o do worktree e do branch worker/<nome> (minúsculas). Nomes que o ENGINE gera
   (`<modelo>-<cauda da bead>`, `<modelo>-adhoc-<10>`) não são pedido de host. Falha de ssh = erro visível (stderr, exit 1, linha em <estado>/session-ssh.log) e nada pela metade; o mini não é tocado.
   "Não sei" nunca vira resposta: se o ssh responde mas o tmux do host não consegue olhar (ex.: socket sem permissão), as operações sobre
   sessões (todas, menos attach, que entrega o terminal ao tmux do host) saem com erro e o motivo — nunca `false`, lista vazia ou "há vaga". Sessão que não existe (tmux respondeu) segue o contrato do exec: stop,
@@ -162,13 +163,14 @@ RIG_RE = re.compile(r"[a-z][a-z0-9_-]{0,40}")
 WT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,60}")  # o nome da sessão vira o nome do worktree e o do branch worker/<nome>
 ROLE_RE = re.compile(r"[a-z][a-z0-9-]*")
 WT_START_FLOOR = 150  # o wt-add puxa o espelho antes de criar o worktree: os 60 s padrão do start não bastam (o engine espera 180 s, [session] startup_timeout)
+WT_STOP_FLOOR = 90  # o stop com worktree também roda git status + wt-rm (du + worktree remove): os 25 s padrão podem estourar com o nó ou o disco ocupados (não medido), e um estouro chega depois da sessão já ter caído
 # Recolhe o worktree da sessão SÓ se nada se perde (limpo, e todo commit já está no main do origin ou na ref da sessão no espelho). Imprime `WT removed`, `WT kept <motivo>` ou `WT none`
 # e NUNCA devolve erro: o stop não falha por causa dele, e o start que falhou depois do wt-add o usa no EXIT. Dúvida (git ilegível, ref ausente) = MANTÉM.
 # Os nomes de variável levam o prefixo w para não pisar nas do PRELUDE (o sh não tem escopo de função). @WT@ pasta, @REPO@ repo.git, @BRREF@ refs/heads/worker/<n>, @BRNAME@ worker/<n>.
 WTCLEAN_SH = r"""wtclean() {
   [ -e @WT@ ] || { echo "WT none"; return 0; }
-  # vazio → nada a perder; falhou (o git não lê o worktree) → MANTÉM: "não consegui saber" nunca vira "limpo"
-  wst=$(git -C @WT@ status --porcelain 2>&1) || { echo "WT kept o git não leu o worktree"; return 0; }
+  # vazio → nada a perder; falhou (o git não lê o worktree) → MANTÉM: "não consegui saber" nunca vira "limpo"; só o stdout decide (aviso do git em stderr com rc 0 não é alteração)
+  wst=$(git -C @WT@ status --porcelain 2>/dev/null) || { echo "WT kept o git não leu o worktree"; return 0; }
   [ -z "$wst" ] || { echo "WT kept há alteração não commitada"; return 0; }
   # HEAD ilegível → MANTÉM; branch da sessão ausente (rc 1) → só o HEAD conta; ilegível (rc > 1) → MANTÉM
   wh=$(git -C @WT@ rev-parse HEAD 2>/dev/null) || { echo "WT kept não li o HEAD"; return 0; }
@@ -190,6 +192,14 @@ WTCLEAN_SH = r"""wtclean() {
   wo=$(GT_REMOTE_GIT=@GR@ @BIN@ wt-rm @RIG@ @NAME@ 2>&1) || { echo "WT kept wt-rm falhou: $(printf %s "$wo" | tail -n 1)"; return 0; }
   [ -z "$wb" ] || git -C @REPO@ update-ref -d @BRREF@ "$wb" 2>/dev/null
   echo "WT removed"
+}
+"""
+# Desfaz o que ESTE start criou e só isso (a pasta não existia antes do wt-add): o wt-add que morre depois do `worktree add` (checkout esparso) deixa uma árvore sem checkout + um branch
+# novo, e o wtclean a MANTERIA (lê como suja). O branch só sai se ainda está no commit de base (nada de trabalho nele); ausente, ilegível ou com commit → fica. Mesmos @-valores do WTCLEAN_SH.
+WTUNDO_SH = r"""wtundo() {
+  GT_REMOTE_GIT=@GR@ @BIN@ wt-rm @RIG@ @NAME@ >/dev/null 2>&1
+  wub=$(git -C @REPO@ rev-parse -q --verify @BRREF@ 2>/dev/null) && wum=$(git -C @REPO@ rev-parse -q --verify refs/remotes/origin/main 2>/dev/null) && [ "$wub" = "$wum" ] && git -C @REPO@ update-ref -d @BRREF@ "$wub" 2>/dev/null
+  return 0
 }
 """
 # o ssh leva `sh -c '<RUNNER>'` (uma string, qualquer shell de login a entende) e o script vai pela entrada padrão: não há limite de
@@ -578,17 +588,23 @@ def managed_worktree(cfg: Cfg, name: str) -> dict:
             "bin": f"{cfg.home}/gt-remote/bin/hetzner-remote-git.sh"}
 
 
+def wt_fill(tmpl: str, wt: dict, name: str) -> str:
+    """Um trecho de sh do host (WTCLEAN_SH, WTUNDO_SH) com os valores desta sessão."""
+    return (tmpl.replace("@WT@", q(wt["path"])).replace("@REPO@", q(wt["repo"])).replace("@BRREF@", q("refs/heads/" + wt["branch"])).replace("@BRNAME@", q(wt["branch"]))
+            .replace("@GR@", q(wt["git"])).replace("@BIN@", q(wt["bin"])).replace("@RIG@", q(wt["rig"])).replace("@NAME@", q(name)))
+
+
 def wtclean_sh(wt: dict, name: str) -> str:
     """A função `wtclean` do host (WTCLEAN_SH) com os valores desta sessão."""
-    return (WTCLEAN_SH.replace("@WT@", q(wt["path"])).replace("@REPO@", q(wt["repo"])).replace("@BRREF@", q("refs/heads/" + wt["branch"])).replace("@BRNAME@", q(wt["branch"]))
-            .replace("@GR@", q(wt["git"])).replace("@BIN@", q(wt["bin"])).replace("@RIG@", q(wt["rig"])).replace("@NAME@", q(name)))
+    return wt_fill(WTCLEAN_SH, wt, name)
 
 
 def wtadd_sh(wt: dict, name: str) -> str:
     """O wt-add NO MESMO script do start, depois do teto e da existência e ANTES do guarda de clone (que olha o checkout: com a pasta ainda ausente ele aprovaria sem ver o disableAllHooks que vem no repositório).
-    Se o start falhar daqui em diante, o EXIT recolhe o worktree que ele criou (wtclean mantém o que tiver trabalho)."""
-    return (wtclean_sh(wt, name)
-            + f"GT_REMOTE_GIT={q(wt['git'])} {q(wt['bin'])} wt-add {q(wt['rig'])} {q(name)} || {{ echo \"worktree da sessão {name} recusado: o wt-add de {wt['rig']} falhou (mensagem acima)\" >&2; exit {EX_PREP}; }}\n"
+    Se o start falhar daqui em diante, o EXIT recolhe o worktree que ele criou (wtclean mantém o que tiver trabalho); o wt-add que morre no meio de um worktree que ESTE start criou é desfeito por wtundo."""
+    return (wtclean_sh(wt, name) + wt_fill(WTUNDO_SH, wt, name)
+            + f"wpre=0; [ -e {q(wt['path'])} ] && wpre=1\n"
+            + f"GT_REMOTE_GIT={q(wt['git'])} {q(wt['bin'])} wt-add {q(wt['rig'])} {q(name)} || {{ [ \"$wpre\" -eq 1 ] || wtundo; echo \"worktree da sessão {name} recusado: o wt-add de {wt['rig']} falhou (mensagem acima)\" >&2; exit {EX_PREP}; }}\n"
             + "trap '[ \"$?\" -eq 0 ] || wtclean >&2' EXIT\n")
 
 
@@ -679,10 +695,14 @@ T kill-session -t @TGT@ 2>/dev/null
 if [ -n "$pids" ]; then kill -TERM $pids 2>/dev/null; sleep 1; kill -KILL $pids 2>/dev/null; fi
 rm -f @RUN@/@NAME@.sh @RUN@/@NAME@.exit
 has @NAME@; [ $? -eq 1 ] || { echo "sessão @NAME@ continua aberta depois do stop" >&2; exit 1; }""".replace("@TGT@", tgt(name)).replace("@PTGT@", ptgt(name)).replace("@RUN@", q(cfg.root + "/run")).replace("@NAME@", name)
-    wt = managed_worktree(cfg, name)
+    try:
+        wt = managed_worktree(cfg, name)
+    except Fail as e:  # stop: nome que não serve de nome de worktree (sessão aberta antes do mapa existir) nunca impede o stop: derruba a sessão e só não recolhe
+        wt = {}
+        cfg.log(f"stop {name}: sem recolhimento de worktree ({e})")
     if wt:  # só chega aqui com a sessão já fora (a conferência acima sai 1 se não): então recolhe o worktree, e o resultado NUNCA muda o rc do stop
         body += "\n" + wtclean_sh(wt, name) + "wtclean\nexit 0"
-    _, out, _ = run(cfg, "stop", body, dry)
+    _, out, _ = run(cfg, "stop", body, dry, max(cfg.timeout, WT_STOP_FLOOR) if wt else 0)
     if not dry:
         meta_clear(cfg, name)
         verdict = ([ln[3:] for ln in out.splitlines() if ln.startswith("WT ")] or ["sem resposta do recolhimento"])[-1] if wt else ""  # vazio (sem WT) → "sem resposta", nunca "removed"
