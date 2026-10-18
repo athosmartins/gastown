@@ -9,7 +9,7 @@
 # CASOS: config do spool (extra, relativo, prazo fora de 5-3600 → 78) · pasta do spool com modo largo → 78 · sem pump.alive / velho → 75 na hora, nada gravado ·
 #   cadeia inteira (cliente → spool → puxador → ssh falso → agente → wrapper → bd falso → resposta): saída, rc, stderr e stdin passam; recusa do wrapper (77),
 #   identidade fora do padrão, texto com $()/crase/aspas inteiro e nada executado · 6 pedidos em paralelo · pedido torto no spool → o agente responde 78 ·
-#   prazo: pedido que ninguém pegou é RETIRADO e dá 75 (nada rodou); pedido pego e sem resposta dá 125 (pode ter rodado) · stdin > 1 MB → 2 sem gravar ·
+#   prazo: pedido que ninguém pegou é RETIRADO e dá 75 (nada rodou); pedido pego e sem resposta dá 125 (pode ter rodado) · stdin > 1 MB → 2 sem gravar · a entrada lida até o EOF (produtor lento, pausa no meio) ou nada (pipe mudo: 75 sem gravar; só `bd --stdin` e os hooks do gc leem) ·
 #   o log do puxador não tem argv · cut() do puxador · puxador: um só (ensure idempotente), status, stop, sai sozinho sem sessão registrada, e não toca
 #   o MBP sem sessão · leituras que FALHAM (resposta corrompida ou ilegível → 125; stdin que não lê → 2; config, registro de sessões, pid, log e lock do
 #   puxador; listdir/open do agente): o estado é o inerte e a falha aparece
@@ -43,11 +43,12 @@ EOF
 export GC_SSH_CONFIG="$T/session-ssh.json" GC_EXEC_STATE_DIR="$STATE" GC_SSH_BIN="$SB/ssh"
 touch "$STATE/mbp/running/remote-test-remote-mbp-1"   # uma sessão registrada: é o que mantém o puxador de pé
 
-shim() {  # shim TOOL ARG... → RC, $T/out, $T/err (ambiente da sessão no "MBP": identidade e um segredo plantado que NÃO pode ir)
+shim() {  # shim TOOL ARG... → RC, $T/out, $T/err (ambiente da sessão no "MBP": identidade e um segredo plantado que NÃO pode ir). Entrada: $STDIN_CMD (um produtor, num pipe) ou $STDIN_FILE ou /dev/null
   local tool=$1; shift
+  if [ -n "${STDIN_CMD:-}" ]; then exec 7< <(eval "$STDIN_CMD"); else exec 7< "${STDIN_FILE:-/dev/null}"; fi
   env -i HOME="$HOME" USER="$USER" PATH="$T/shimbin:/usr/bin:/bin" REMOTE_SHIM_CONF="${SHIM_CONF:-$SHIMCONF}" GC_ALIAS="${SID_ALIAS:-gastown.dog-1}" GC_AGENT="${SID_ALIAS:-gastown.dog-1}" \
-    GC_SESSION_NAME=dog-gavycydh GC_SESSION_ID=ga-vycydh AWS_SECRET_ACCESS_KEY=SEGREDO-PLANTADO-9 "$T/shimbin/$tool" "$@" > "$T/out" 2> "$T/err" < "${STDIN_FILE:-/dev/null}"
-  RC=$?
+    GC_SESSION_NAME=dog-gavycydh GC_SESSION_ID=ga-vycydh AWS_SECRET_ACCESS_KEY=SEGREDO-PLANTADO-9 "$T/shimbin/$tool" "$@" > "$T/out" 2> "$T/err" <&7
+  RC=$?; exec 7<&-
 }
 mkdir -p "$T/shimbin"; python3 -I "$S" install --bin-dir "$T/shimbin" --apply >/dev/null 2>&1
 printf 'texto vindo do stdin' > "$T/stdin.txt"
@@ -66,6 +67,9 @@ for c in '{"transport":"spool","spool_dir":"relativo/x"}' '{"transport":"spool",
          '{"transport":"spool","spool_dir":"'"$SPOOL"'","timeout_s":3601}' '{"transport":"spool","spool_dir":"'"$SPOOL"'","timeout_s":true}' '{"transport":"carrier-pigeon","spool_dir":"'"$SPOOL"'"}'; do
   printf '%s' "$c" > "$T/bad.json"; SHIM_CONF="$T/bad.json" shim bd show ga-1
   [ "$RC" = 78 ] && has "$T/err" "config ausente ou ruim"; ok $? "config recusada (78): $(printf '%s' "$c" | cut -c1-70)"
+done
+for v in 0 601 '"60"' true 1.5; do  # stdin_eof_s: inteiro de 1 a 600 (true é int para o python: tem que ser recusado também)
+  printf '{"transport":"spool","spool_dir":"%s","stdin_eof_s":%s}' "$SPOOL" "$v" > "$T/bad.json"; SHIM_CONF="$T/bad.json" shim bd show ga-1; [ "$RC" = 78 ] && has "$T/err" "config ausente ou ruim"; ok $? "stdin_eof_s=$v recusado (78)"
 done
 printf '{"transport":"spool","spool_dir":"%s"}' "$SPOOL" > "$T/ok.json"; b=$(calls); up
 SHIM_CONF="$T/ok.json" shim bd show ga-1; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1))  ]; ok $? "config só com transport+spool_dir vale (timeout_s padrão 330)"
@@ -192,6 +196,33 @@ head -c 1048577 /dev/zero > "$T/big.bin"; alive; STDIN_FILE="$T/big.bin" shim bd
 b=$(calls); alive   # entrada aberta só para ESCRITA (0>): o select diz "pronto" e o read dá EBADF (uma pasta nem chega lá: o python se recusa a subir)
 env -i HOME="$HOME" USER="$USER" PATH="$T/shimbin:/usr/bin:/bin" REMOTE_SHIM_CONF="$SHIMCONF" GC_ALIAS=gastown.dog-1 GC_AGENT=gastown.dog-1 "$T/shimbin/bd" comment ga-1 --stdin > "$T/out" 2> "$T/err" 0> "$T/so-escrita"; RC=$?
 [ "$RC" = 2 ] && has "$T/err" "não consegui ler a entrada padrão" && [ -z "$(ls "$SPOOL/req" | grep -v '^$')" ] && [ "$(calls)" = "$b" ]; ok $? "entrada padrão que falha ao ler (EBADF): 2, nada gravado, nada rodou; não manda a entrada pela metade"
+# --- a entrada padrão é lida INTEIRA (até o EOF) ou o comando não roda: silêncio de um pipe aberto não é "acabou" (o hook do claude e o `bd comment --stdin` de uma sessão vêm de pipes)
+sbody() {  # sbody CONF TOOL ARG... → RC, $GOT (a entrada que o pedido levou, decodificada; vazio se nenhum pedido foi gravado). Sem puxador: o "mini" é este teste, que lê req/ e planta a resposta
+  rm -f "$SPOOL/req/"* "$SPOOL/resp/"* "$SPOOL/claimed/"* "$T/sb.rc"; alive; GOT=; local f=; ( SHIM_CONF=$1 shim "${@:2}"; echo "$RC" > "$T/sb.rc" ) & local sb=$!
+  for _ in $(seq 1 200); do f=$(ls "$SPOOL/req" 2>/dev/null | grep '\.json$' | head -1); { [ -n "$f" ] || [ -e "$T/sb.rc" ]; } && break; sleep 0.1; done
+  [ -n "$f" ] && { GOT=$(python3 -I -c 'import base64,json,sys; sys.stdout.write(base64.b64decode(json.load(open(sys.argv[1]))["stdin_b64"]).decode())' "$SPOOL/req/$f")
+    printf '{"id":"%s","rc":0,"stdout_b64":"","stderr_b64":""}' "${f%.json}" > "$SPOOL/resp/$f"; }
+  wait $sb; RC=$(cat "$T/sb.rc")
+}
+printf '{"transport":"spool","spool_dir":"%s","timeout_s":5,"stdin_eof_s":2}' "$SPOOL" > "$T/eof2.json"
+STDIN_CMD='sleep 1.5; printf "texto lento"' sbody "$SHIMCONF" bd comment ga-1 --stdin
+[ "$RC" = 0 ] && [ "$GOT" = "texto lento" ]; ok $? "bd comment --stdin com produtor lento (1,5 s antes do primeiro byte): o texto vai inteiro"
+STDIN_CMD='printf "parte1 "; sleep 3; printf "parte2"' sbody "$SHIMCONF" bd comment ga-1 --stdin
+[ "$RC" = 0 ] && [ "$GOT" = "parte1 parte2" ]; ok $? "bd comment --stdin com pausa de 3 s no meio: espera o EOF, nada cortado"
+STDIN_CMD='sleep 1; printf "{\"hook\":\"SessionStart\"}"' sbody "$SHIMCONF" gc prime --hook
+[ "$RC" = 0 ] && [ "$GOT" = '{"hook":"SessionStart"}' ]; ok $? "gc prime --hook: o JSON do hook que chega depois de 1 s vai inteiro"
+STDIN_CMD='printf "lixo no pipe"' sbody "$SHIMCONF" bd show ga-1
+[ "$RC" = 0 ] && [ -z "$GOT" ]; ok $? "bd show (não lê a entrada): o pedido leva entrada vazia, sem ler o que haja no pipe"
+t0=$(date +%s); STDIN_CMD='sleep 6' sbody "$SHIMCONF" bd show ga-1; t1=$(date +%s)
+[ "$RC" = 0 ] && [ -z "$GOT" ] && [ $((t1-t0)) -lt 4 ]; ok $? "bd show com pipe aberto e mudo: não espera por ele e roda"
+STDIN_CMD='printf "lixo no pipe"' sbody "$SHIMCONF" gc mail inbox
+[ "$RC" = 0 ] && [ -z "$GOT" ]; ok $? "gc mail inbox (não lê a entrada): entrada vazia também; só os hooks do gc levam a entrada"
+t0=$(date +%s); STDIN_CMD='sleep 8' sbody "$T/eof2.json" bd comment ga-1 --stdin; t1=$(date +%s)
+[ "$RC" = 75 ] && has "$T/err" "não terminou" && [ -z "$GOT" ] && [ -z "$(ls "$SPOOL/req" | grep -v '^$')" ] && [ $((t1-t0)) -ge 2 ]; ok $? "bd comment --stdin com pipe aberto e mudo: sem EOF em stdin_eof_s → 75 e NADA gravado no spool (não comenta vazio)"
+STDIN_CMD='sleep 8' sbody "$T/eof2.json" gc prime --hook
+[ "$RC" = 75 ] && has "$T/err" "não terminou" && [ -z "$GOT" ] && [ -z "$(ls "$SPOOL/req" | grep -v '^$')" ]; ok $? "gc prime --hook com pipe aberto e mudo: o mesmo, 75 sem gravar (não vira hook sem entrada)"
+STDIN_CMD='printf "metade"; sleep 8' sbody "$T/eof2.json" bd comment ga-1 --stdin
+[ "$RC" = 75 ] && [ -z "$GOT" ] && [ -z "$(ls "$SPOOL/req" | grep -v '^$')" ]; ok $? "bd comment --stdin que escreve e não fecha: 75, o que veio não é enviado (nada de comentário pela metade)"
 fi
 
 if want pump; then

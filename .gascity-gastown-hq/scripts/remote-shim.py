@@ -21,12 +21,14 @@ TRANSPORTE POR PUXADA (`"transport": "spool"`, o do MBP — ga-w7qwl1.1)
   que ele já usa para o MBP): roda o pedido no wrapper de sempre (mesma lista permitida) e devolve stdout, stderr e o código de saída, que
   este lado repete. Sem o mini puxando (o puxador toca `pump.alive` a cada ida e volta) o pedido nem é enviado: sai 75 na hora, não pendura o hook.
   Pedido que o mini já pegou e não respondeu no prazo sai 125 (pode ter rodado; não repita às cegas); pedido que ninguém pegou é retirado e sai 75.
+  A entrada padrão só é lida de quem a lê (`bd ... --stdin` e os hooks do gc) e INTEIRA, até o EOF: sem EOF em `stdin_eof_s` s (pipe aberto e mudo) sai 75 sem
+  enviar nada, em vez de tomar o silêncio por "acabou" e rodar um `bd comment --stdin` vazio ou cortado. Os outros comandos levam entrada vazia.
 
 CONFIG (JSON em $REMOTE_SHIM_CONF, senão `remote-shim.json` ao lado do script instalado, se existir, senão ~/.config/remote-shim/shim.json):
   {"host": "127.0.0.1", "port": 2222, "user": "athos", "identity_file": "/home/runner/.ssh/mini_shim_ed25519",
    "known_hosts_file": "/home/runner/.ssh/mini_shim_known_hosts", "control_dir": "/home/runner/.cache/remote-shim", "connect_timeout": 10}
   `host`, `user`, `identity_file` e `known_hosts_file` são obrigatórios; o resto tem padrão. Config ausente ou ruim → exit 78 e NENHUM ssh.
-  Por puxada: {"transport": "spool", "spool_dir": "/Users/athos/gt-remote/shim", "timeout_s": 330}  (timeout_s 5-3600; padrão 330, acima dos 300 s do wrapper)
+  Por puxada: {"transport": "spool", "spool_dir": "/Users/athos/gt-remote/shim", "timeout_s": 330}  (timeout_s 5-3600, padrão 330, acima dos 300 s do wrapper; stdin_eof_s 1-600, padrão 60)
 
 INSTALAR (nada é gravado sem --apply):
   remote-shim.py install --bin-dir /home/runner/.local/bin [--apply]   # copia este arquivo para <bin-dir>/remote-shim e liga bd, gc, gate-done a ele
@@ -56,10 +58,13 @@ TOOLS = ("bd", "gc", "gate-done")
 FORWARD_ENV = ("GC_AGENT", "GC_ALIAS", "GC_HOOK_EVENT_NAME", "GC_MANAGED_SESSION_HOOK", "GC_SESSION_NAME",
                "GC_SESSION_ORIGIN", "GC_TEMPLATE")
 CONF_KEYS = {"host", "port", "user", "identity_file", "known_hosts_file", "control_dir", "connect_timeout"}
-SPOOL_KEYS = {"transport", "spool_dir", "timeout_s"}
+SPOOL_KEYS = {"transport", "spool_dir", "timeout_s", "stdin_eof_s"}
 SPOOL_ID = re.compile(r"[0-9]{13}-[0-9]{1,10}-[0-9a-f]{8}")  # o puxador (remote-shim-pump.py) confere o MESMO formato
 ALIVE_MAX_S = 60   # o puxador toca pump.alive a cada ida e volta (no máximo ~15 s); mais velho que isto = ninguém está puxando
 MAX_STDIN = 1_000_000
+# Quem na lista do wrapper LÊ a entrada: `bd ... --stdin` (o texto) e estes hooks do gc (o JSON da sessão). Comando novo que a leia TEM que entrar aqui (esquecê-lo dá entrada vazia: inerte).
+HOOK_STDIN = {("prime", "--hook"), ("handoff", "--auto"), ("nudge", "drain"), ("mail", "check")}
+STDIN_EOF_S = 60   # quanto esperar o FIM da entrada (EOF) de um comando que a lê; padrão, o `stdin_eof_s` da config troca
 
 
 def need(cond: bool) -> None:  # no lugar de assert: `python -O` apaga assert, e uma validação que some com uma flag não é guarda
@@ -89,6 +94,8 @@ def load_conf() -> dict:
             need(not (set(c) - SPOOL_KEYS) and isinstance(c.get("spool_dir"), str) and os.path.isabs(c["spool_dir"]))
             c = {"timeout_s": 330, **c}
             need(type(c["timeout_s"]) is int and 5 <= c["timeout_s"] <= 3600)
+            c = {"stdin_eof_s": STDIN_EOF_S, **c}
+            need(type(c["stdin_eof_s"]) is int and 1 <= c["stdin_eof_s"] <= 600)
             return c
         need("transport" not in c or c["transport"] == "ssh")
         c = {k: v for k, v in c.items() if k != "transport"}
@@ -104,29 +111,37 @@ def load_conf() -> dict:
     return c
 
 
-def read_stdin() -> bytes:
-    """A entrada padrão do comando, sem pendurar: tty, /dev/null, arquivo e pipe que fecha dão o que há; pipe aberto e mudo (ninguém escreve em 0,3 s) dá vazio."""
+def wants_stdin(tool: str, argv: list) -> bool:
+    """O comando lê a entrada padrão? Só então ela é lida; para os outros o pedido leva entrada vazia, sem ler nada (um pipe aberto e mudo não pendura nem vira texto)."""
+    if tool == "bd":
+        return "--stdin" in argv
+    return tool == "gc" and tuple(argv[:2]) in HOOK_STDIN
+
+
+def read_stdin(wait_s: int, explicit: bool) -> bytes:
+    """A entrada padrão INTEIRA, até o EOF, ou nada: sem EOF em `wait_s` segundos ou leitura que falha → sai (75 / 2) SEM enviar. Silêncio não é fim: um comando que muda
+    estado (`bd comment --stdin`) nunca roda com a entrada vazia ou cortada só porque o produtor demorou. Entrada fechada e /dev/null são vazias de verdade (EOF); num terminal só um hook dispensa a leitura (vazio)."""
     try:
         fd = sys.stdin.fileno()
-        if os.isatty(fd):
+        if os.isatty(fd) and not explicit:  # hook rodado à mão num terminal: não há JSON a esperar
             return b""
-    except (OSError, ValueError):  # entrada fechada
+    except (OSError, ValueError):  # entrada fechada: vazia de verdade
         return b""
-    chunks, total, first = [], 0, True
+    chunks, total, t0 = [], 0, time.monotonic()
     while True:
         try:
-            if select.select([fd], [], [], 0.3 if first else 2.0)[0] == []:  # o claude escreve o JSON do hook de uma vez e fecha: silêncio = ninguém vai escrever
-                break
+            left = wait_s - (time.monotonic() - t0)
+            if left <= 0 or select.select([fd], [], [], left)[0] == []:
+                die(f"a entrada padrão não terminou (sem EOF) em {wait_s} s; nada foi enviado e nada rodou", 75)
             b = os.read(fd, 65536)
         except OSError as e:  # entrada que falha no meio: mandar o que já veio seria rodar o comando com a entrada pela metade
             die(f"não consegui ler a entrada padrão ({e.strerror}); nada foi enviado", 2)
         if not b:
-            break
-        first, total = False, total + len(b)
+            return b"".join(chunks)
+        total += len(b)
         chunks.append(b)
         if total > MAX_STDIN:
             die(f"entrada padrão maior que {MAX_STDIN} bytes", 2)
-    return b"".join(chunks)
 
 
 def spool_poll(path: str):
@@ -140,7 +155,7 @@ def spool_poll(path: str):
         die("resposta do mini ilegível; o pedido pode ter rodado — não repita às cegas", 125)
 
 
-def spool_request(c: dict, cmd: str) -> None:
+def spool_request(c: dict, cmd: str, tool: str, argv: list) -> None:
     sp = c["spool_dir"]
     try:  # o spool é do dono e de mais ninguém: outro usuário da máquina que pudesse escrever aqui mandaria pedidos com a identidade das sessões
         os.makedirs(sp, mode=0o700, exist_ok=True)
@@ -156,7 +171,7 @@ def spool_request(c: dict, cmd: str) -> None:
         age = None
     if age is None or age > ALIVE_MAX_S:  # sem o mini puxando o pedido ficaria parado até o prazo e travaria o hook: falha na hora, e nada rodou
         die("o mini não está puxando pedidos (pump.alive " + ("ausente" if age is None else f"parado há {int(age)} s") + "); nada foi enviado", 75)
-    stdin = read_stdin()
+    stdin = read_stdin(c["stdin_eof_s"], tool == "bd") if wants_stdin(tool, argv) else b""
     rid = f"{int(time.time() * 1000)}-{os.getpid()}-{os.urandom(4).hex()}"
     doc = json.dumps({"v": 1, "id": rid, "cmd": cmd, "stdin_b64": base64.b64encode(stdin).decode()}, separators=(",", ":"))
     tmp, req, rsp = f"{sp}/req/.{rid}.tmp", f"{sp}/req/{rid}.json", f"{sp}/resp/{rid}.json"
@@ -212,7 +227,7 @@ def request(tool: str) -> None:
     if len(cmd) > MAX_CMD:
         die("pedido grande demais para o ssh (texto longo: use --stdin)", 2)
     if c.get("transport") == "spool":
-        spool_request(c, cmd)  # não volta: sai com o código do comando
+        spool_request(c, cmd, tool, sys.argv[1:])  # não volta: sai com o código do comando
     try:
         os.makedirs(c["control_dir"], mode=0o700, exist_ok=True)
     except OSError as e:  # sem a pasta o ControlPath não existe; e um crash sairia 1, que o `gc mail check` usa para "caixa vazia"

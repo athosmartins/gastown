@@ -97,6 +97,14 @@ MUTANTS = [
     ("spool-id-da-resposta", "p", ' and r.get("id") == rid)', ")", r"id de dentro"),
     ("spool-stdin-sem-teto", "p", "        if total > MAX_STDIN:", "        if False:", r"acima de 1 MB"),
     ("stdin-erro-calado", "p", '            die(f"não consegui ler a entrada padrão ({e.strerror}); nada foi enviado", 2)', "            break", r"entrada padrão que falha ao ler"),
+    # --- a entrada padrão: lida até o EOF, só por quem a lê; silêncio não é fim (gate de ga-w7qwl1.1.1)
+    ("stdin-mudo-vira-fim", "p", '                die(f"a entrada padrão não terminou (sem EOF) em {wait_s} s; nada foi enviado e nada rodou", 75)', '                return b"".join(chunks)', r"pipe aberto e mudo|escreve e não fecha"),
+    ("stdin-bd-nunca-le", "p", '        return "--stdin" in argv', "        return False", r"stdin passa|produtor lento|pausa de 3 s"),
+    ("stdin-bd-sempre-le", "p", '        return "--stdin" in argv', "        return True", r"bd show \(não lê a entrada\)|bd show com pipe aberto e mudo"),
+    ("stdin-hook-nao-le", "p", '    return tool == "gc" and tuple(argv[:2]) in HOOK_STDIN', "    return False", r"gc prime --hook: o JSON"),
+    ("stdin-gc-sempre-le", "p", '    return tool == "gc" and tuple(argv[:2]) in HOOK_STDIN', '    return tool == "gc"', r"gc mail inbox \(não lê a entrada\)"),
+    ("stdin-eof-sem-faixa", "p", 'need(type(c["stdin_eof_s"]) is int and 1 <= c["stdin_eof_s"] <= 600)', 'need(type(c["stdin_eof_s"]) is int)', r"stdin_eof_s=(0|601) recusado"),
+    ("stdin-eof-aceita-bool", "p", 'need(type(c["stdin_eof_s"]) is int and 1 <= c["stdin_eof_s"] <= 600)', 'need(isinstance(c["stdin_eof_s"], int) and 1 <= c["stdin_eof_s"] <= 600)', r"stdin_eof_s=true recusado"),
     ("resposta-ilegivel-vira-nada", "p", 'die("resposta do mini ilegível; o pedido pode ter rodado — não repita às cegas", 125)', "return None", r"resposta corrompida no spool"),
     # --- o puxador e o agente do MBP (ga-w7qwl1.1)
     ("agente-spool-largo", "u", "or st.st_mode & 0o077:", "or False:", r"modo largo"),
