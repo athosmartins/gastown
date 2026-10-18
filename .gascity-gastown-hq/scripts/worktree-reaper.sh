@@ -1024,7 +1024,7 @@ _worktree_dirty_only_generated() {
     if printf '%s' "$p" | grep -Eq -- "$GENERATED_RE"; then n=$((n+1)); continue; fi
     if [ "$p" = ".gascity-gastown-hq/pack.toml" ] && cmp -s "$wt/$p" "$GT/$p" 2>/dev/null; then n=$((n+1)); continue; fi
     rm -f "$tmp"; return 1
-  done <"$tmp"
+  done <"$tmp"   # third-state-waiver: $tmp was written one line up and its exit code checked; a vanished file reads as no entries, n stays 0 and the tree is NOT dirty-only-generated (inert)
   rm -f "$tmp"
   [ "$n" -ge 1 ]
 }
@@ -1049,7 +1049,7 @@ _reap_dirty_generated_only() {
     END { printf "%s%s", (listed ? "listed" : "foreign"), (locked ? " locked" : "") }')"
   [ "$st" = "listed" ] || return 1
   [ -n "$br" ] || br="$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null)"
-  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"; [ -n "$head" ] || return 1
+  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"; [ -n "$head" ] || return 1   # third-state-waiver: an unreadable HEAD is an empty head and the same line returns 1 before any proof or remove (inert)
   _worktree_op_in_progress "$wt" && return 1
   _worktree_dirty_only_generated "$wt" || return 1
   if _worktree_head_merged "$repo" "$wt"; then proof="ancestor"

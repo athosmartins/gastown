@@ -1840,6 +1840,29 @@ if dg_wt dg_l && dg_br dg_l && [ -e "$TMP/dg_l/.gc-worktrees/$DG_ID-build/t.txt"
   ok "ga-he2c1u (l): dry-run logs would_reap, removes nothing and never tries the --force path"
 else bad "ga-he2c1u (l): dry-run — wt=$(dg_wt dg_l && echo y || echo n) would=$(events dg_l would_reap) reaped=$(events dg_l reaped_dirty_generated_only) failed=$(events dg_l dirty_generated_reap_failed)"; fi
 
+# (n) the town repo does NOT list the tree (an engine worktree parked under the town's .gc-worktrees belongs to ANOTHER
+# repo; `git -C $GT worktree list` cannot vouch for it): kept, files intact, and no --force even attempted
+mk_dg_town dg_n "$DG_GEN"
+git -C "$TMP/dg_n" worktree remove --force ".gc-worktrees/$DG_ID-build" >/dev/null 2>&1   # free the path, then re-home it under another repo
+git init -q -b main "$TMP/dg_n_other" >/dev/null 2>&1
+( cd "$TMP/dg_n_other" && echo o > o.txt && git add o.txt && git commit -qm o && git worktree add -q "$TMP/dg_n/.gc-worktrees/$DG_ID-build" -b "fix/$DG_ID-build" \
+  && cd "$TMP/dg_n/.gc-worktrees/$DG_ID-build" && eval "$DG_GEN" ) >/dev/null 2>&1
+pe_age "$TMP/dg_n/.gc-worktrees/$DG_ID-build" 3
+run_dg dg_n "$DG_CLOSED"
+if [ -e "$TMP/dg_n/.gc-worktrees/$DG_ID-build/o.txt" ] && [ -e "$TMP/dg_n/.gc-worktrees/$DG_ID-build/.pce-full.out" ] \
+   && [ "$(events dg_n reaped_dirty_generated_only)" = "0" ] && [ "$(events dg_n dirty_generated_reap_failed)" = "0" ]; then
+  ok "ga-he2c1u (n): a tree the town repo does not list → KEPT, files intact, no --force attempted"
+else bad "ga-he2c1u (n): foreign tree — o.txt=$([ -e "$TMP/dg_n/.gc-worktrees/$DG_ID-build/o.txt" ] && echo y || echo n) reaped=$(events dg_n reaped_dirty_generated_only) failed=$(events dg_n dirty_generated_reap_failed)"; fi
+
+# (o) DETACHED HEAD (symbolic-ref cannot name a branch): delivered by ancestry, so it is still reaped; no branch is
+# touched or invented, and the commit stays in main
+mk_dg_town dg_o "git checkout -q --detach && $DG_GEN"
+run_dg dg_o "$DG_CLOSED"
+dg_wt dg_o && bad "ga-he2c1u (o): detached delivered tree of a closed bead NOT reaped" || ok "ga-he2c1u (o): detached delivered tree of a closed bead REAPED"
+[ "$(events dg_o reaped_dirty_generated_only)" = "1" ] && dg_br dg_o && [ "$(git -C "$TMP/dg_o" branch --list | wc -l | tr -d ' ')" = "2" ] \
+  && ok "ga-he2c1u (o): the reap is logged once and no branch was deleted or created" \
+  || bad "ga-he2c1u (o): detached reap — events=$(events dg_o reaped_dirty_generated_only) branches=$(git -C "$TMP/dg_o" branch --list | wc -l | tr -d ' ')"
+
 # (m) the generated list is overridable (WORKTREE_REAPER_GENERATED_RE): narrowed to match nothing, the same tree is kept
 mk_dg_town dg_m "$DG_GEN"
 run_dg dg_m "$DG_CLOSED" WORKTREE_REAPER_GENERATED_RE='^nothing-matches$'
