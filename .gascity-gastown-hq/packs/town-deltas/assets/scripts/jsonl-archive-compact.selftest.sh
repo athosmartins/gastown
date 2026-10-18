@@ -1789,7 +1789,7 @@ chmod 755 "$TL/.git/objects/pack" 2>/dev/null
 
 # M. ga-q8z86s — the tail pass must not run into its OWN cap every run, and must not start with the disk under Dolt's CRITICAL floor.
 # The incident (18/10): at the default 120-object cap the pass was killed at its 600s cap EVERY run (nothing it wrote survives a kill, so the next run met the same packs and the same cap), each time leaving
-# ~800MB of temp pack behind, on a disk already under the floor where Dolt turns CRITICAL — the 17/10 ENOSPC (ga-vln2py) was exactly that. Two fail-closed ends:
+# ~800MB of temp pack behind, on a disk already under the floor where Dolt turns CRITICAL — the same shape as the 17/10 ENOSPC (ga-vln2py: a heavy step started on a disk already near its end). Two fail-closed ends:
 #   (1) the cap adapts: a cut by the pass's own cap (not the run's deadline) lowers the NEXT pass to half of what the cut one carried, floored at JAC_TAIL_MIN_OBJECTS; a pass that was fast while the cap held a pack out doubles it back;
 #       a cap so low that no two packs fit is retried larger after JAC_TAIL_RETRY_S (the byte trigger scales with the cap, so a halved cap can still start);
 #   (2) the pass does not start unless free − need stays above Dolt's CRITICAL class (dolt-disk-floor-guard.sh: critical = floor(free GiB) <= 3, so 4 GiB must remain), or when it cannot read the free space or the floor.
