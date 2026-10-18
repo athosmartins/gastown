@@ -640,11 +640,12 @@ pyc_log | grep -q "pycache-reap: $PYC_TMP/empty — nothing older than 30min to 
 
 # 10. The time budget: the root after the budget is used up waits for the next run.
 mkdir -p "$PYC_TMP/r1" "$PYC_TMP/r2"
-_pycache_measure_root() { sleep 2; echo "0 0 0"; }
+# date +%s has 1s granularity: a 1s budget can be gone before the first root even starts. 3s budget, 4s "measure".
+_pycache_measure_root() { sleep 4; echo "0 0 0"; }
 rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
-PYCACHE_REAP_ROOTS="$PYC_TMP/r1:$PYC_TMP/r2" PYCACHE_REAP_TIMEOUT_SECS=1 _reap_pycache
+PYCACHE_REAP_ROOTS="$PYC_TMP/r1:$PYC_TMP/r2" PYCACHE_REAP_TIMEOUT_SECS=3 _reap_pycache
 pyc_restore_fns
-pyc_log | grep -q "time budget (1s) used up before $PYC_TMP/r2" && ok "_reap_pycache: the time budget stops the walk and names the root left for the next run" || bad "_reap_pycache: budget exhaustion is not reported: $(pyc_log | grep 'pycache-reap' | tr '\n' '|')"
+pyc_log | grep -q "time budget (3s) used up before $PYC_TMP/r2" && ok "_reap_pycache: the time budget stops the walk and names the root left for the next run" || bad "_reap_pycache: budget exhaustion is not reported: $(pyc_log | grep 'pycache-reap' | tr '\n' '|')"
 
 # 11. Root discovery: rigs are the ~/gt/<dir> that have a .beads; the worktree dirs come with them.
 mkdir -p "$PYC_TMP/town/rigA/.beads" "$PYC_TMP/town/notrig" "$PYC_TMP/town/city"
