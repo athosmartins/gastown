@@ -20,14 +20,18 @@ O QUE A PROVA CONFERE (os critérios do ga-w7qwl1.1; cada linha vira PASS/FAIL n
       arquivos do lançador, processos; depois a pasta de teste e a marca de confiança no ~/.claude.json são removidas e conferidas)
   (b) com a PAUSA do Athos ligada (o mesmo arquivo ~/gt-remote/PAUSE, com a marca desta rodada) o vigia — biblioteca de presença de verdade — rebaixa a árvore da
       sessão: nice/pri de CADA processo antes e depois, sem matar ninguém; a pausa desta rodada é desligada no fim e o rebaixamento não volta
-  (c) de dentro da sessão: `bd show` e `bd comment` de uma bead de teste chegam ao mini pelo atalho com lista de permissões (cliente → spool → puxador do mini →
-      wrapper); os hooks gc do city disparam; o MBP não ganha credencial de bd/Dolt nem chave (varredura antes/depois)
+  (c) de dentro da sessão: o passo 1 do prompt MEDE o que a ferramenta Bash resolve (`command -v` e `type -a` de bd, gc, gate-done e dolt, mais o PATH) e a saída é lida na
+      transcrição do claude no MBP (a tela esconde a saída de Bash terminado): bd, gc e gate-done têm de ser o link de shim-bin, dolt recusado pelo atalho (rc 77) ou
+      inalcançável, e o PATH começar no atalho sem ~/.local/bin nem ~/go/bin; sem a medição inteira a prova REPROVA. Depois `bd show` e `bd comment` de uma bead de teste
+      chegam ao mini pelo atalho com lista de permissões (cliente → spool → puxador do mini → wrapper); os hooks gc do city disparam; o MBP não ganha credencial de
+      bd/Dolt nem chave (varredura antes/depois). A sessão abre com o zdot LIMPO do bundle (ZDOTDIR + PATH explícito, ga-w7qwl1.1.5): o bd/dolt do usuário não entra.
   (d) um branch de teste comitado no MBP chega ao origin DIRETO do MBP (credencial que o MBP já tem; nenhuma nova) e aparece no mini; varredura: nenhum dado de lead
       (o clone é raso, sem blobs e sem checkout fora de mbp-proof/) nem segredo novo no MBP depois
   (e) o bundle está instalado e CONFERIDO no MBP (verify lá) e a sessão roda `claude` com o --settings do bundle até o prompt de partida
 
 O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
-  install: gt-remote/bundle (o OUT do builder, igual ao que o verify confere), gt-remote/shim-bin (cliente do atalho), gt-remote/shim (spool 0700),
+  install: gt-remote/bundle (o OUT do builder com --session-path, zdot/ incluído, igual ao que o verify confere), gt-remote/shim-bin (cliente do atalho; links bd, gc,
+           gate-done e dolt, este recusado), gt-remote/shim (spool 0700),
            gt-remote/bin/remote-bundle-build.py. Nada em ~/.claude, ~/.config nem ~/.ssh.
   e2e:     gt-remote/proof/<rodada> (clone raso, sem blobs; apagado no fim), uma entrada em ~/.claude.json (projects[<pasta>], a mesma que o claude gravaria ao aceitar
            a confiança; REMOVIDA no fim), gt-remote/PAUSE (só a desta rodada; só removida se a primeira linha ainda for a marca dela), gt-remote/bundle/run (apagada se
@@ -36,7 +40,7 @@ O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
 CÓDIGOS  0 tudo passou · 1 alguma prova reprovou, ou recusei instalar (config do wrapper alheia/ilegível, builder ou verify falhou) · 2 uso · 3 não consegui começar (pré-condição: MBP não livre, tmux aberto ou sem resposta) · 4 interrompida: o Athos voltou ao MBP (nada mais foi medido; a sessão é parada)
 CONFIGURAÇÃO (ambiente)  MBP_PROOF_SSH (athos@athoss-macbook-pro.local) · MBP_PROOF_HOME (/Users/athos: o home no MBP) · MBP_PROOF_SESSION (remote-test-remote-mbp-1) ·
   MBP_PROOF_POLL (10: segundos entre olhadas) · MBP_PROOF_WATCH_CYCLE (5: o watch_s do provider) · MBP_PROOF_SHIM_WAIT (60: quanto esperar o atalho) · GC_SSH_BIN (o ssh, como no provider) · GC_CITY_PATH · só o selftest troca: MBP_PROOF_PROV, MBP_PROOF_PUMP,
-  MBP_PROOF_PATHX, MBP_PROOF_SHIM_CLIENT, MBP_PROOF_BUILDER
+  MBP_PROOF_PATHX, MBP_PROOF_SHIM_CLIENT, MBP_PROOF_BUILDER, MBP_PROOF_SESSION_PATH (o PATH explícito da sessão), MBP_PROOF_CLAUDE (o caminho absoluto do claude no MBP)
 """
 from __future__ import annotations
 
@@ -73,6 +77,11 @@ PAUSE = MGT + "/PAUSE"
 HOST = "mbp"
 SOCKET = "gc-remote"
 PATHX = os.environ["MBP_PROOF_PATHX"].split(":") if os.environ.get("MBP_PROOF_PATHX") else [SHIMBIN, "/opt/homebrew/bin", MHOME + "/.local/bin"]  # o atalho PRIMEIRO; o resto é o que o provider já usa
+# PATH da SESSÃO (ga-w7qwl1.1.5): o do provider acima serve ao ssh/tmux; o claude roda só com ESTE (o atalho, depois as pastas fixas do sistema; nada de ~/.local/bin nem ~/go/bin).
+# A MESMA lista vai ao builder (--session-path) e ao provider (session_env.path): o lançador recusa o zdot do bundle que não a tenha.
+SESSION_PATH = os.environ["MBP_PROOF_SESSION_PATH"].split(":") if os.environ.get("MBP_PROOF_SESSION_PATH") else [SHIMBIN, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+CLAUDE_BIN = os.environ.get("MBP_PROOF_CLAUDE") or MHOME + "/.local/bin/claude"  # com PATH explícito o `claude` do comando vira este caminho absoluto (pré-condição abaixo confere que existe)
+TOOLS = ("bd", "gc", "gate-done")  # os que a sessão tem de resolver para o atalho; `dolt` tem de ser recusado por ele (ou nem existir)
 WRAPPER_CFG = os.path.join(MINI_HOME, ".gastown", "remote-shim-mbp.json")
 SESSION_RE = re.compile(r"remote-test-remote-mbp-[0-9]{1,3}")
 BEAD_RE = re.compile(r"[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}")
@@ -89,20 +98,65 @@ FORBIDDEN = [r"\.beads", r"\.dolt", r".*\.sqlite3?", r".*\.db", r".*\.csv", r".*
 
 PROMPT = """This is a minimal end-to-end check of a worker running on a laptop. Do exactly the steps below, one Bash call each, in order. Do not ask questions, \
 do not edit any other file. If a step fails, still run the remaining steps, then finish with: FAILED step <n>.
-1. command -v bd gc
+1. (a measurement: copy this command exactly) {measure}
 2. bd show {bead} --json
 3. bd comment {bead} "{name}: sessao remota no MBP {run} leu esta bead"
 4. mkdir -p mbp-proof && echo "mbp-proof {run}" > mbp-proof/{run}.txt && git add mbp-proof/{run}.txt && git commit -m "chore(mbp-proof): {run} (sem dado, descartavel)"
 5. git push origin HEAD:refs/heads/worker/{run}
 6. echo E2E-$((6*7))-OK
+When all steps are done, reply with the output of step 6 and nothing else (the terminal hides the output of finished Bash calls; only your reply stays on screen).
 """
-NUDGE = "Run exactly this one Bash command and nothing else: echo NUDGE-$((5*5))-OK"
+NUDGE = "Run exactly this one Bash command, then reply with its output and nothing else: echo NUDGE-$((5*5))-OK"
+
+
+def measure_cmd(run: str) -> str:
+    """O passo 1 do prompt: DENTRO da sessão, o que cada ferramenta resolve de verdade (zsh do Bash tool: `command -v` e `type -a` enxergam função, alias e PATH) e se o `dolt` é
+    recusado. A saída é lida na transcrição do claude no MBP (a tela esconde a saída de Bash terminado); os marcadores MEAS/MEASEND provam que a saída está inteira."""
+    return (f"echo MEAS-{run}; for t in bd gc gate-done dolt; do echo \"CMDV $t $(command -v $t)\"; done; type -a bd gc gate-done dolt | sed 's/^/TYPEA /'; "
+            f"dolt --version >/dev/null 2>&1; echo \"DOLTRC $?\"; echo \"PATHV $PATH\"; echo MEASEND-{run}")
+
+
+def resolution_verdict(out, run: str, shimbin: str, home: str) -> tuple:
+    """(ok, detalhe). `out`: a saída do passo 1 como a ferramenta Bash a devolveu ao claude, ou None (sem medição). Só diz "resolve para o atalho" com a medição INTEIRA e
+    legível: sem ela, sem um marcador, sem uma linha de ferramenta ou com número ilegível é reprovação ("sem medição"), nunca "ok". bd, gc e gate-done: `command -v` e a primeira
+    linha de `type -a` são o link de shim-bin (função/alias/outro PATH reprovam). dolt: link recusado (rc 77) ou inalcançável (nada em `command -v`, rc 127); qualquer outro rc =
+    há um dolt de verdade na sessão. PATH: o atalho em primeiro e nem ~/.local/bin nem ~/go/bin entre as pastas."""
+    if not isinstance(out, str):
+        return False, "sem medição (a saída do passo 1 não foi lida)"
+    lines = out.split("\n")
+    try:
+        body = lines[lines.index(f"MEAS-{run}") + 1:lines.index(f"MEASEND-{run}")]
+    except ValueError:
+        return False, "sem medição (falta o marcador de início ou de fim: saída cortada ou comando alterado)"
+    cmdv, typea, rc, pathv = {}, {}, None, None
+    for l in body:
+        w = l.split(None, 2)
+        if w[:1] == ["CMDV"] and len(w) >= 2 and w[1] not in cmdv:
+            cmdv[w[1]] = w[2].strip() if len(w) > 2 else ""
+        elif w[:1] == ["TYPEA"] and len(w) >= 2:
+            typea.setdefault(w[1], l.split(None, 1)[1].strip())  # só a PRIMEIRA linha de cada ferramenta: é a que roda
+        elif w[:1] == ["DOLTRC"] and len(w) == 2 and w[1].isdigit():
+            rc = int(w[1])
+        elif l.startswith("PATHV "):
+            pathv = l[6:]
+    want = set(TOOLS) | {"dolt"}
+    if set(cmdv) != want or rc is None or pathv is None:
+        return False, f"sem medição (faltam linhas: command -v de {sorted(want - set(cmdv))}, DOLTRC {rc}, PATHV {pathv is not None})"
+    bad = [f"{t} resolve para {cmdv[t] or '(nada)'!r}, type -a: {typea.get(t, '(nada)')!r}" for t in TOOLS
+           if cmdv[t] != f"{shimbin}/{t}" or typea.get(t) != f"{t} is {shimbin}/{t}"]
+    refused = cmdv["dolt"] == f"{shimbin}/dolt" and typea.get("dolt") == f"dolt is {shimbin}/dolt" and rc == 77
+    if not (refused or (cmdv["dolt"] == "" and rc == 127)):
+        bad.append(f"dolt alcançável: command -v {cmdv['dolt']!r}, type -a {typea.get('dolt')!r}, rc {rc} (esperado link recusado rc 77, ou nada e rc 127)")
+    dirs = pathv.split(":")
+    if dirs[0] != shimbin or {home + "/.local/bin", home + "/go/bin"} & set(dirs):
+        bad.append(f"PATH da ferramenta Bash: {pathv[:200]!r} (atalho primeiro, sem ~/.local/bin nem ~/go/bin)")
+    return not bad, "; ".join(bad) or f"bd, gc e gate-done → {shimbin}; dolt {'recusado pelo atalho (rc 77)' if refused else 'inalcançável'}; PATH {pathv[:240]}"
 
 
 def host_block() -> dict:
     """O bloco `mbp` de session-ssh.json que a prova usa (a config VIVA só tem o servidor; a do MBP é decisão da fatia 3 e das janelas do engine)."""
     return {"ssh": SSH_TARGET, "cap": 2, "remote_root": BUNDLE, "remote_home": MHOME, "mini_home": MINI_HOME, "path_extra": PATHX,
-            "presence_gate": True, "sleeps": True,
+            "presence_gate": True, "sleeps": True, "session_env": {"path": SESSION_PATH, "claude": CLAUDE_BIN},
             "shim": {"spool_dir": SPOOL, "wrapper_config": WRAPPER_CFG, "idle_exit_s": 90, "poll_s": 2}}
 
 
@@ -125,7 +179,7 @@ def start_request(bead: str, model: str, run: str, workdir: str) -> dict:
     env = {k: SESSION for k in ("GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME", "GC_TEMPLATE")}
     env.update(GC_SESSION_ORIGIN="ephemeral", GC_CITY=CITY, GC_CITY_PATH=CITY, LANG="en_US.UTF-8", TERM="xterm-256color")
     return {"command": cmd, "work_dir": workdir, "env": env, "prompt_flag": "",
-            "prompt_suffix": shlex.quote(PROMPT.format(bead=bead, name=SESSION, run=run))}
+            "prompt_suffix": shlex.quote(PROMPT.format(bead=bead, name=SESSION, run=run, measure=measure_cmd(run)))}
 
 
 def new_run() -> str:
@@ -251,7 +305,14 @@ try:
         out["shim_sha"] = hashlib.sha256(f.read()).hexdigest()
 except OSError:
     pass
-out["links"] = {n: (os.readlink(C["shimbin"] + "/" + n) if os.path.islink(C["shimbin"] + "/" + n) else None) for n in ("bd", "gc", "gate-done")}
+out["links"] = {n: (os.readlink(C["shimbin"] + "/" + n) if os.path.islink(C["shimbin"] + "/" + n) else None) for n in ("bd", "gc", "gate-done", "dolt")}
+out["claude_ok"] = os.path.isfile(C["claude"]) and os.access(C["claude"], os.X_OK)  # o claude da sessão roda por este caminho absoluto (PATH explícito); falso → a pré-condição reprova
+out["session_path"] = None  # manifest ausente/ilegível/sem session_path (bundle sem zdot) → None e a pré-condição reprova; nunca "igual ao esperado"
+try:
+    with open(C["bundle"] + "/manifest.json") as f:
+        out["session_path"] = json.load(f).get("session_path")
+except (OSError, ValueError, AttributeError):
+    pass
 out["client_conf"] = None
 try:
     with open(C["shimbin"] + "/remote-shim.json") as f:
@@ -512,6 +573,31 @@ for f in glob.glob(os.path.expanduser("~/.claude/projects/*%s*/*.jsonl") % sys.a
 print(json.dumps({"rows": rows, "unreadable": bad}))
 '''
 
+MEASURE = r'''
+import glob, json, os, sys
+C = json.loads(sys.argv[1])
+uses, calls, bad = {}, [], 0  # nenhuma transcrição → calls [] (o chamador reprova: sem medição); linha ilegível → CONTADA e mostrada, nunca ignorada em silêncio
+for f in sorted(glob.glob(os.path.expanduser("~/.claude/projects/*%s*/*.jsonl") % C["run"])):
+    for line in open(f, errors="replace"):
+        try:
+            o = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        c = (o.get("message") or {}).get("content") if o.get("type") in ("assistant", "user") else None  # as linhas api-request-blob repetem o texto: só valem as da conversa
+        for x in c if isinstance(c, list) else []:
+            if not isinstance(x, dict):
+                continue
+            cmd = (x.get("input") or {}).get("command") if x.get("type") == "tool_use" and x.get("name") == "Bash" else None
+            if isinstance(cmd, str) and C["marker"] in cmd:
+                uses[x.get("id")] = cmd
+            elif x.get("type") == "tool_result" and x.get("tool_use_id") in uses:
+                r = o.get("toolUseResult")
+                out = r["stdout"] if isinstance(r, dict) and isinstance(r.get("stdout"), str) else x.get("content")  # sem stdout nem texto → não é saída (o chamador reprova)
+                calls.append({"cmd": uses[x["tool_use_id"]], "out": out if isinstance(out, str) else None})
+print(json.dumps({"calls": calls, "unreadable": bad}))
+'''
+
 
 class Aborted(Exception):
     """O Athos voltou ao MBP no meio da prova: nada mais é medido."""
@@ -575,7 +661,7 @@ class Proof:
 
     def snap(self, workdir: str = "") -> dict:
         return self.rpy(SNAP, {"home": MHOME, "gt": MGT, "bundle": BUNDLE, "shimbin": SHIMBIN, "spool": SPOOL, "proofs": PROOFS, "socket": SOCKET,
-                               "path_extra": PATHX, "plib": f"{MBIN}/mbp-presence.sh", "pause": PAUSE, "workdir": workdir})
+                               "path_extra": PATHX, "plib": f"{MBIN}/mbp-presence.sh", "pause": PAUSE, "workdir": workdir, "claude": CLAUDE_BIN})
 
     def free(self) -> tuple:
         g = self.prov("gate", HOST, timeout=90)
@@ -630,16 +716,22 @@ class Proof:
             bad.append("gt-remote/bundle/run não está vazia: " + ",".join(s["run_dir"]))
         if not s["claude_json"]["ok"]:
             bad.append("~/.claude.json ilegível: o claude do MBP nunca rodou aqui?")
-        shadow = {n: p for n, p in s["bins_hook"].items() if p and not p.startswith(SHIMBIN + "/")}
+        # os hooks do city só chamam `gc` e põem ~/go/bin e ~/.local/bin à frente do PATH da sessão: só um `gc` de verdade ali esconderia o atalho. O `bd`/`dolt` do usuário NÃO
+        # entra aqui (ga-w7qwl1.1.5): a ferramenta Bash da sessão usa o PATH explícito do zdot, e quem prova isso é a medição de DENTRO da sessão (evidence).
+        shadow = {n: p for n, p in s["bins_hook"].items() if n == "gc" and p and not p.startswith(SHIMBIN + "/")}
         if shadow:
             bad.append("no PATH dos hooks (~/go/bin e ~/.local/bin à frente) existe " + ", ".join(f"{n}={p}" for n, p in shadow.items()) + ": esconderia o atalho")
+        if not s["claude_ok"]:
+            bad.append(f"o claude do MBP não está em {CLAUDE_BIN} (a sessão o roda por este caminho absoluto: o PATH dela é explícito)")
+        if s["session_path"] != SESSION_PATH:
+            bad.append(f"o bundle instalado não leva o ambiente limpo da sessão (manifest.session_path {s['session_path']!r}, esperado {SESSION_PATH}): rode `mbp-proof install --apply`")
         self.created.update(proofs_new=s["proofs"] is None, run_new=s["run_dir"] is None, socket_new=not s["tmux_socket"])
         # o bundle e o cliente instalados e conferidos NO MBP (critério e)
         v = self.rsh(f"python3 -I {shlex.quote(MBIN + '/remote-bundle-build.py')} verify {shlex.quote(BUNDLE)}")
         self.check("bundle instalado em gt-remote/bundle e conferido NO MBP (verify lá)", v.returncode == 0, (v.stdout + v.stderr).decode("utf-8", "replace").strip()[:200])
         lk = s["links"]
         same = s["shim_sha"] == sha256_file(SHIM_CLIENT)
-        self.check("cliente do atalho instalado em shim-bin (bd, gc, gate-done) e igual ao do repositório", same and all(lk.get(n) == "remote-shim" for n in lk),
+        self.check("cliente do atalho instalado em shim-bin (bd, gc, gate-done, e dolt que ele recusa) e igual ao do repositório", same and all(lk.get(n) == "remote-shim" for n in lk),
                    f"links {lk}, sha {'igual' if same else 'DIFERENTE'}")
         self.check("config do cliente é a da puxada (sem host, usuário nem chave) e o spool é 0700", s["client_conf"] == client_config() and s["spool_mode"] == "0o700",
                    f"{s['client_conf']} · spool {s['spool_mode']}")
@@ -703,9 +795,20 @@ class Proof:
         self.check(f"{what} no prazo", False, f"{secs}s; tela:\n{seen[-1200:]}")
         return seen
 
-    def evidence(self, screen: str) -> None:
-        ok = all(f"{SHIMBIN}/{n}" in screen for n in ("bd", "gc"))
-        self.check("(c) na sessão, `bd` e `gc` resolvem para o atalho (nenhum bd/gc real escondendo)", ok, "tela sem os dois caminhos de shim-bin" if not ok else "")
+    def resolution(self) -> None:
+        """(c) O que a sessão resolve de verdade, medido POR ELA (passo 1 do prompt) e lido da transcrição do claude no MBP: a tela esconde a saída de Bash terminado. Sem a
+        medição inteira (transcrição que não abre, comando alterado, saída cortada) a prova REPROVA; "sem medição" não é "resolve para o atalho"."""
+        m = self.rpy(MEASURE, {"run": self.run, "marker": f"MEAS-{self.run}"})
+        want = measure_cmd(self.run)
+        calls = [] if "_erro" in m else [x for x in m["calls"] if x["cmd"].strip() == want and isinstance(x["out"], str) and f"MEASEND-{self.run}" in x["out"]]
+        out = calls[-1]["out"] if calls else None
+        ok, why = resolution_verdict(out, self.run, SHIMBIN, MHOME)
+        seen = f"não li a transcrição ({m['_erro']})" if "_erro" in m else f"{len(m['calls'])} chamada(s) Bash com o marcador, {len(calls)} igual(is) ao comando pedido, {m['unreadable']} linha(s) ilegível(is)"
+        self.say("(c) saída do passo 1, de dentro da sessão: " + (json.dumps(out)[:1200] if out is not None else "nenhuma"))
+        self.check("(c) na sessão (medido por ela): bd, gc e gate-done resolvem para o atalho, dolt é recusado ou inalcançável e o PATH da ferramenta Bash começa no atalho", ok, f"{why} · {seen}")
+
+    def evidence(self) -> None:
+        self.resolution()
         c = subprocess.run(["bd", "comments", self.a.bead, "--json"], capture_output=True, cwd=CITY, timeout=180)
         self.check("(c) o comentário da sessão está na bead, no mini", c.returncode == 0 and self.run in c.stdout.decode("utf-8", "replace"), f"bd comments rc {c.returncode}")
         g = self.rpy(GITSEE, {"workdir": self.wd, "run": self.run, "url": self.url, "path_extra": PATHX}, timeout=200)
@@ -892,7 +995,7 @@ class Proof:
                 if MARK in screen:
                     self.check("(e) a sessão rodou `claude` com o --settings do bundle e executou o prompt de partida até o fim", True)
                     time.sleep(min(5, POLL))
-                    self.evidence(self.out(self.prov("peek", SESSION, "400")))
+                    self.evidence()
                     self.peek_nudge()
                     self.watchdog()
                 self.say("--- tela final ---\n" + self.out(self.prov("peek", SESSION, "60"))[-2000:])
@@ -947,8 +1050,9 @@ def cmd_plan(a: argparse.Namespace) -> int:
     bad = []
     if d["would_refuse"]:
         bad.append("o provider recusaria: " + d["would_refuse"])
-    if not d["command"].startswith("claude "):
-        bad.append("o comando não começa em `claude` (o lançador de pool não foi reescrito)")
+    # com session_env o provider reescreve `claude` para o caminho absoluto; qualquer outro começo = lançador de pool não reescrito
+    if not d["command"].startswith(CLAUDE_BIN + " "):
+        bad.append(f"o comando não começa em {CLAUDE_BIN} (o lançador de pool não foi reescrito)")
     if f"--settings {BUNDLE}/city/settings.json" not in d["command"]:
         bad.append("o --settings do city não aponta para o bundle do MBP")
     for b in bad:
@@ -974,9 +1078,9 @@ def cmd_install(a: argparse.Namespace) -> int:
     out = f"{CITY}/.gc/runtime/mbp-proof/bundle-out"
     stage_id = time.strftime("%Y%m%d%H%M%S", time.gmtime())
     role_dir = os.path.join(CITY, ".gc", "agents", "dogs", "gastown.dog-1")
-    plan = [f"construir o bundle com o builder (--remote-root {BUNDLE} --remote-home {BUNDLE}/home, sem --skills) em {out} e conferi-lo aqui",
+    plan = [f"construir o bundle com o builder (--remote-root {BUNDLE} --remote-home {BUNDLE}/home, sem --skills, --session-path {':'.join(SESSION_PATH)}: o zdot do bundle) em {out} e conferi-lo aqui",
             f"enviar por tar/ssh para {MGT}/bundle.new.{stage_id}, conferir LÁ (verify + bundle_hash) e trocar por {BUNDLE} (a pasta run/ do provider é preservada)",
-            f"instalar o cliente do atalho em {SHIMBIN} (bd, gc, gate-done → remote-shim) e remote-shim.json = {json.dumps(client_config())}",
+            f"instalar o cliente do atalho em {SHIMBIN} (bd, gc, gate-done → remote-shim; dolt → remote-shim, que o RECUSA) e remote-shim.json = {json.dumps(client_config())}",
             f"criar o spool {SPOOL} (0700) e levar remote-bundle-build.py para {MBIN}", f"gravar {WRAPPER_CFG} no mini"]
     print("\n".join(("" if a.apply else "[dry-run] ") + f"{i}. {x}" for i, x in enumerate(plan, 1)))
     if not a.apply:
@@ -1012,7 +1116,7 @@ def cmd_install(a: argparse.Namespace) -> int:
         pr.say(f"NAO INSTALEI: {WRAPPER_CFG} já existe e é diferente do que a prova grava; confira à mão (não sobrescrevo) antes de repetir")
         return 1
     steps = [[sys.executable, "-I", BUILDER, "build", "--city", CITY, "--claude-home", os.path.expanduser("~/.claude"), "--role", "dog", "--role-dir", role_dir,
-              "--remote-root", BUNDLE, "--remote-home", BUNDLE + "/home", "--out", out],
+              "--remote-root", BUNDLE, "--remote-home", BUNDLE + "/home", "--session-path", ":".join(SESSION_PATH), "--out", out],
              [sys.executable, "-I", BUILDER, "verify", out]]
     for st in steps:
         r = subprocess.run(st, capture_output=True, text=True)
@@ -1052,7 +1156,7 @@ def cmd_install(a: argparse.Namespace) -> int:
     v = pr.rsh(f"python3 -I {q(MBIN + '/remote-bundle-build.py')} verify {q(BUNDLE)}")
     pr.check("(e) bundle instalado em gt-remote/bundle e conferido NO MBP", v.returncode == 0, v.stderr.decode()[:200])
     with open(SHIM_CLIENT, "rb") as f:
-        r = pr.rsh(f"mkdir -p {q(SHIMBIN)} && t=$(mktemp) && cat > \"$t\" && python3 -I \"$t\" install --bin-dir {q(SHIMBIN)} --apply; rc=$?; rm -f \"$t\"; exit $rc", f.read())
+        r = pr.rsh(f"mkdir -p {q(SHIMBIN)} && t=$(mktemp) && cat > \"$t\" && python3 -I \"$t\" install --bin-dir {q(SHIMBIN)} --refuse-dolt --apply; rc=$?; rm -f \"$t\"; exit $rc", f.read())
     pr.say(f"cliente do atalho: rc {r.returncode} {(r.stdout + r.stderr).decode()[-200:]}")
     r2 = pr.rsh(f"printf %s {q(json.dumps(client_config()))} > {q(SHIMBIN + '/remote-shim.json')} && mkdir -p {q(SPOOL)} && chmod 700 {q(SPOOL)}")
     pr.say(f"remote-shim.json + spool: rc {r2.returncode}")
@@ -1060,7 +1164,7 @@ def cmd_install(a: argparse.Namespace) -> int:
     with open(WRAPPER_CFG, "w") as f:
         f.write(wc)
     s = pr.snap()
-    pr.check("cliente do atalho em shim-bin igual ao do repositório, links bd/gc/gate-done e config da puxada", r.returncode == 0 and r2.returncode == 0 and "_erro" not in s
+    pr.check("cliente do atalho em shim-bin igual ao do repositório, links bd/gc/gate-done/dolt e config da puxada", r.returncode == 0 and r2.returncode == 0 and "_erro" not in s
              and s["shim_sha"] == sha256_file(SHIM_CLIENT) and all(v == "remote-shim" for v in s["links"].values()) and s["client_conf"] == client_config() and s["spool_mode"] == "0o700")
     bad = [n for n, ok in pr.checks if not ok]
     pr.say(f"INSTALAÇÃO {'OK' if not bad else 'COM FALHA: ' + str(bad)}; bundle_hash {want[:12]}")

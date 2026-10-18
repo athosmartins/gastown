@@ -708,5 +708,103 @@ jq -e '.pinned_env != null' "$T/f/mut/manifest.json" >/dev/null 2>&1; [ $? != 0 
 sed '/self.hooks\[-1\]\["timeout"\] = t/d' "$B" > "$T/mutant.py"; wipe "$T/f/mut"; mutate_build "$T/mutant.py"
 jq -e '[.hooks[] | select(.timeout != null) | .token] | length == 2' "$T/f/mut/manifest.json" >/dev/null 2>&1; [ $? != 0 ]; ok $? "controle negativo: sem registrar o timeout no manifest o auditável some — o caso do manifest pega"
 
+# ---- SESSION-PATH / zdot (ga-w7qwl1.1.5): o shell da ferramenta Bash da sessão tem PATH explícito e não acha o bd/dolt do usuário
+SPO=/home/runner/shim-bin:/usr/bin:/bin
+zdot_good() {  # zdot_good OUT — 0 só se o bundle tem os 4 arquivos do zdot com o PATH pedido, no manifest (com sha) e o verify fecha
+  local o=$1
+  [ "$(jq -r '[.files | keys[] | select(startswith("zdot/"))] | length' "$o/manifest.json")" = 4 ] || return 1
+  [ "$(jq -c .session_path "$o/manifest.json")" = '["/home/runner/shim-bin","/usr/bin","/bin"]' ] || return 1
+  [ "$(jq -r '.install.zdot' "$o/manifest.json")" = /home/runner/rr/zdot ] || return 1
+  local f; for f in .zshenv .zprofile .zshrc env.sh; do grep -qxF "export PATH='$SPO'" "$o/zdot/$f" || return 1; done  # um por um: grep -q com vários arquivos basta um bater
+  python3 -I "$B" verify "$o" >/dev/null 2>&1
+}
+fresh; wipe "$T/f/out"; build "$T/f" "$T/f/out" --session-path "$SPO"; rc=$?; { [ $rc = 0 ] && zdot_good "$T/f/out"; }
+ok $? "zdot: --session-path gera os 4 arquivos, o manifest guarda o PATH e o sha deles, install.zdot aponta para a raiz, verify sai 0 (rc=$rc)"
+fresh; wipe "$T/f/out"; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && [ ! -e "$T/f/out/zdot" ] && [ "$(jq -c .session_path "$T/f/out/manifest.json")" = null ] && [ "$(jq -r '.install | has("zdot")' "$T/f/out/manifest.json")" = false ]
+ok $? "zdot: sem --session-path não há zdot e o manifest diz session_path=null (3º estado: o chamador vê que NÃO foi pedido)"
+wipe "$T/f/out"; build "$T/f" "$T/f/out" --session-path "$SPO"; H1=$(hash_of "$T/f/out"); wipe "$T/f/out"; build "$T/f" "$T/f/out" --session-path "$SPO"
+[ -n "$H1" ] && [ "$H1" = "$(hash_of "$T/f/out")" ]; ok $? "zdot: mesma entrada, mesmo bundle_hash"
+python3 -I "$B" build --help 2>&1 | grep -qF -- --session-path; ok $? "  o builder expõe --session-path (o loop de recusas abaixo não é um no-op)"
+for bad in /opt/foreign/bin:/usr/bin /home/runner/.local/bin:/usr/bin /home/other/go/bin:/usr/bin /home/runner/x/../y:/usr/bin bin:/usr/bin "/usr/bin::/bin" \
+           "/usr/bin:/home/runner/a'b" '/usr/bin:/home/runner/$HOME' "/usr/bin:/usr/bin" "" "/home/runner/shim bin:/usr/bin"; do
+  fresh; refuses "zdot: --session-path '$bad' recusa (pasta que não é do sistema nem de gt-remote/, relativa, vazia, repetida ou com aspa/\$/espaço)" "$T/f" --session-path "$bad"
+done
+# no MBP a pasta-mãe é gt-remote/ (não o home): ~/go/bin e ~/.local/bin do Athos ficam FORA, o atalho e o Homebrew entram, e o /Users/ do destino não é "sobra do mini"
+for bad in /Users/athos/go/bin:/usr/bin /Users/athos/.local/bin:/usr/bin /Users/athos/gt-remote/../go/bin:/usr/bin; do
+  fresh; wipe "$T/f/out"; mbp_build "$B" "$T/f" "$T/f/out" --session-path "$bad"; rc=$?
+  [ $rc = 3 ] && has "$T/err" RECUSADO && [ ! -e "$T/f/out" ]; ok $? "zdot MBP: --session-path '$bad' recusa (rc=$rc)"
+done
+fresh; wipe "$T/f/out"; mbp_build "$B" "$T/f" "$T/f/out" --session-path /Users/athos/gt-remote/shim-bin:/opt/homebrew/bin:/usr/bin:/bin; rc=$?
+{ [ $rc = 0 ] && grep -qxF "export PATH='/Users/athos/gt-remote/shim-bin:/opt/homebrew/bin:/usr/bin:/bin'" "$T/f/out/zdot/env.sh" && python3 -I "$B" verify "$T/f/out" >/dev/null 2>&1; }
+ok $? "zdot MBP: o PATH com o atalho em /Users/athos/gt-remote/ e o Homebrew entra (o /Users/ do destino não é sobra do mini) (rc=$rc)"
+# controle negativo: cada peça tirada do builder tem que reprovar o caso que ela segura
+ZD_OLD='self.session_dirs = self.zdot(a.session_path) if a.session_path is not None else None'
+pymut "$B" "$T/mutant.py" "$ZD_OLD" 'self.session_dirs = a.session_path.split(":") if a.session_path is not None else None'; ok $? "  o builder chama self.zdot (o mutante abaixo não é um no-op)"
+fresh; wipe "$T/f/out"; mutate_bp() { python3 -I "$1" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
+  --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" --session-path "$SPO" 2>/dev/null; }
+mutate_bp "$T/mutant.py"; zdot_good "$T/f/mut"; [ $? != 0 ]; ok $? "controle negativo: sem o passo que gera o zdot o bundle do MBP sai SEM zdot (zdot_good reprova)"
+VAL_OLD='or not (d in SYS_DIRS or under):'
+pymut "$B" "$T/mutant.py" "$VAL_OLD" 'or False:'; ok $? "  o builder valida as pastas do PATH (o mutante abaixo não é um no-op)"
+fresh; wipe "$T/f/mut"; python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
+  --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" --session-path /opt/foreign/bin:/usr/bin >/dev/null 2>&1
+[ $? = 0 ]; ok $? "controle negativo: sem a validação das pastas um PATH com pasta alheia passa (a recusa acima é dela)"
+DOT_OLD='any(c.startswith(".") for c in d.split("/")) or '
+pymut "$B" "$T/mutant.py" "$DOT_OLD" ''; ok $? "  o builder recusa componente com ponto (o mutante abaixo não é um no-op)"
+fresh; wipe "$T/f/mut"; python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
+  --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/mut" --session-path /home/runner/.local/bin:/usr/bin >/dev/null 2>&1
+[ $? = 0 ]; ok $? "controle negativo: sem a recusa de componente com ponto o ~/.local/bin do usuário entraria no PATH da sessão"
+# o zdot é do bundle: arquivo alterado ou faltando reprova o verify
+fresh; wipe "$T/f/out"; build "$T/f" "$T/f/out" --session-path "$SPO"; echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$T/f/out/zdot/.zshrc"
+python3 -I "$B" verify "$T/f/out" >/dev/null 2>&1; [ $? = 4 ]; ok $? "zdot: .zshrc editado depois do build → verify sai 4"
+fresh; wipe "$T/f/out"; build "$T/f" "$T/f/out" --session-path "$SPO"; find "$T/f/out/zdot/env.sh" -delete
+python3 -I "$B" verify "$T/f/out" >/dev/null 2>&1; [ $? = 4 ]; ok $? "zdot: env.sh apagado → verify sai 4"
+
+# ---- a MESMA sequência de comandos do claude 2.1.302 (medida no mini: snapshot && env.sh && eval CMD), com um zsh de verdade e um HOME de mentira cujo ~/.zshrc prepende
+# ~/.local/bin e define uma função bd. O que está provado: o zdot NESTE bundle faz a sessão resolver bd/gc para o atalho; o que NÃO está: o claude do MBP (versão não medida).
+if command -v zsh >/dev/null 2>&1; then
+  ZR=$T/zr; ZB=$ZR/gt-remote/bundle; ZSH_SP=$ZR/gt-remote/shim-bin:/usr/bin:/bin; ZH=$ZR/home
+  mkdir -p "$ZH/.local/bin" "$ZR/gt-remote/shim-bin"; : > "$ZR/empty.sh"
+  for t in bd gc gate-done; do printf '#!/bin/sh\necho SHIM-%s\n' "$t" > "$ZR/gt-remote/shim-bin/$t"; chmod +x "$ZR/gt-remote/shim-bin/$t"; done
+  printf '#!/bin/sh\necho USER-BD\n' > "$ZH/.local/bin/bd"; chmod +x "$ZH/.local/bin/bd"
+  printf 'export PATH="$HOME/.local/bin:$PATH"\n[ -n "${ZT_FUNC:-}" ] && bd() { echo FUNC-BD; }\n:\n' > "$ZH/.zshrc"
+  zbundle() {  # zbundle BUILDER OUT — o build do MBP de verdade (raiz sob gt-remote/), com o PATH explícito da sessão
+    MBR=$ZB mbp_build "$1" "$T/f" "$2" --session-path "$ZSH_SP"
+  }
+  zrun() {  # zrun ZDOT ENVF VARIANTE FUNC — stdout: "bd" executado e `command -v bd gc gate-done`; VARIANTE: inherited = PATH do processo do claude (macOS), after-rc = PATH como o shell o tem depois do ~/.zshrc (o que outras versões/Windows fazem)
+    local zd=$1 envf=$2 var=$3 fn=$4 snap=$ZR/snap.sh
+    : > "$ZR/cwd"; : > "$snap"
+    env -i HOME="$ZH" ZDOTDIR="$zd" PATH="$ZSH_SP" ZT_FUNC="$fn" zsh -c -l 'source "$HOME/.zshrc" < /dev/null; echo "unalias -a 2>/dev/null || true" >| "$1"
+      typeset +f | grep -vE "^_[^_]" | while read func; do typeset -f "$func" >> "$1"; done
+      if [ "$2" = after-rc ]; then printf "export PATH=%q\n" "$PATH" >> "$1"; else printf "export PATH=%q\n" "$3" >> "$1"; fi' zsh "$snap" "$var" "$ZSH_SP" >/dev/null 2>&1
+    [ -s "$snap" ] || return 90  # snapshot que não saiu: 3º estado, não "PATH limpo"
+    env -i HOME="$ZH" ZDOTDIR="$zd" PATH="$ZSH_SP" ZT_FUNC="$fn" zsh -c -l 'source "$1" 2>/dev/null || true && source "$2" && eval "$3" && pwd -P >| "$4"' zsh "$snap" "$envf" 'bd; command -v bd gc gate-done' "$ZR/cwd" 2>/dev/null
+  }
+  WANT=$(printf 'SHIM-bd\n%s/gt-remote/shim-bin/bd\n%s/gt-remote/shim-bin/gc\n%s/gt-remote/shim-bin/gate-done' "$ZR" "$ZR" "$ZR")
+  fresh; wipe "$ZR/out"; zbundle "$B" "$ZR/out"; rc=$?; ok $rc "zsh: build do MBP com o PATH explícito sai 0 (rc=$rc)"; [ $rc = 0 ] || cat "$T/err" >&2
+  for var in inherited after-rc; do for fn in "" 1; do
+    got=$(zrun "$ZR/out/zdot" "$ZR/out/zdot/env.sh" $var "$fn"); rc=$?
+    [ $rc = 0 ] && [ "$got" = "$WANT" ] && [ -s "$ZR/cwd" ]; ok $? "zsh: com o zdot a sessão ($var, função bd do usuário=${fn:-não}) resolve bd/gc/gate-done para o atalho e o comando termina 0 (rc=$rc)"
+  done; done
+  got=$(zrun "$ZR/out/zdot" "$ZR/empty.sh" after-rc ""); [ "$got" = "$WANT" ]; [ $? != 0 ]
+  ok $? "controle negativo: sem o env.sh (só ZDOTDIR) o PATH como o shell o tem depois do ~/.zshrc devolve o bd do USUÁRIO — a emulação enxerga a diferença"
+  got=$(zrun "$ZR/out/zdot" "$ZR/empty.sh" inherited 1); [ "$got" = "$WANT" ]; [ $? != 0 ]
+  ok $? "controle negativo: sem o env.sh a função bd do ~/.zshrc entra no snapshot e vence o PATH"
+  got=$(zrun "$ZR/nenhum-zdot" "$ZR/empty.sh" after-rc ""); [ "$got" = "$WANT" ]; [ $? != 0 ]
+  ok $? "controle negativo: sem ZDOTDIR nem env.sh (o provider de antes) o bd do usuário vence"
+  ZT_OLD='unset -f bd gc gate-done dolt 2>/dev/null || :\n'
+  pymut "$B" "$T/mutant.py" "$ZT_OLD" ''; ok $? "  o builder tem o unset -f no env.sh (o mutante abaixo não é um no-op)"
+  wipe "$ZR/mut"; MBR=$ZB mbp_build "$T/mutant.py" "$T/f" "$ZR/mut" --session-path "$ZSH_SP"
+  got=$(zrun "$ZR/mut/zdot" "$ZR/mut/zdot/env.sh" inherited 1); [ "$got" = "$WANT" ]; [ $? != 0 ]
+  ok $? "controle negativo: env.sh sem o unset -f deixa a função bd do usuário vencer"
+  ZE_OLD='ZDOT_ENV_TAIL = "unalias bd gc gate-done dolt 2>/dev/null || :\nunset -f bd gc gate-done dolt 2>/dev/null || :\n:\n"'
+  pymut "$B" "$T/mutant.py" "$ZE_OLD" 'ZDOT_ENV_TAIL = "unalias bd gc gate-done dolt 2>/dev/null\n"'; ok $? "  o builder tem a cauda do env.sh (o mutante abaixo não é um no-op)"
+  wipe "$ZR/mut"; MBR=$ZB mbp_build "$T/mutant.py" "$T/f" "$ZR/mut" --session-path "$ZSH_SP"
+  got=$(zrun "$ZR/mut/zdot" "$ZR/mut/zdot/env.sh" inherited ""); rc=$?
+  [ $rc != 0 ] && [ -z "$got" ]; ok $? "controle negativo: env.sh que sai ≠ 0 quebra a cadeia '&&' do claude — o comando nem roda (sem saída) em vez de rodar com o PATH errado (rc=$rc)"
+else
+  echo "SKIP zsh ausente neste nó: a emulação da sequência de comandos do claude NÃO rodou (o zdot foi só verificado por conteúdo, não por comportamento)"
+fi
+
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

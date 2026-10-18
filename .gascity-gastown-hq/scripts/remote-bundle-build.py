@@ -8,7 +8,8 @@ Contents
 
 USO
   remote-bundle-build.py build --city C --claude-home ~/.claude --role dog --role-dir C/.gc/agents/dogs/gastown.dog-1 \
-      --remote-root /home/runner/gt-remote/bundle --remote-home /home/runner --out OUT [--skills [--exclude-skill NOME]...]
+      --remote-root /home/runner/gt-remote/bundle --remote-home /home/runner --out OUT [--skills [--exclude-skill NOME]...] [--session-path DIR:DIR...]
+      (--session-path leva o ambiente de shell LIMPO da sessão em OUT/zdot/ — ver abaixo; sem a opção o bundle não tem zdot e nada muda)
       (--skills deixa de fora, POR NOME, as de SKILLS_NOT_ON_SERVER (3, CPF/CNPJ) e SKILLS_MINI_ONLY (3, caminho do mini); --exclude-skill acrescenta nomes; o manifest lista `excluded_skills` e,
        para nome que não existe em skills/, `excluded_skills_missing` + aviso no stderr — a guarda de CPF/CNPJ continua valendo para as demais)
   remote-bundle-build.py verify OUT         # re-hasheia os arquivos e confere com o manifest (inclui o bit de execução, lido do modo, e o
@@ -35,6 +36,10 @@ O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
   (p95 23 s MEDIDO); um prazo MAIOR que o mini já tenha fica (nunca encurta) e prazo ilegível recusa; `gc prime` e `gc handoff` ficam como estão; (2) o settings de USUÁRIO
   do bundle fixa `env.DISABLE_AUTOUPDATER=1` (o claude do servidor sobe por push-bundle, não sozinho no meio de uma sessão). O manifest registra os dois: `timeout` no hook e
   `pinned_env` (o que o builder FIXOU, separado do que veio do mini).
+  zdot/ (só com --session-path, ga-w7qwl1.1.5; é o que o launcher aponta em ZDOTDIR e CLAUDE_ENV_FILE): `.zshenv`, `.zprofile` e `.zshrc` só fixam o PATH
+          EXPLÍCITO da sessão (atalho primeiro, depois só pastas fixas do sistema — nunca ~/.local/bin nem ~/go/bin do usuário) e `env.sh` repete o PATH e dá
+          `unalias`/`unset -f` em bd gc gate-done dolt: o claude carrega funções e aliases do ~/.zshrc real no snapshot do shell, e o env.sh roda DEPOIS dele a cada comando.
+          Cada pasta do PATH tem que ser uma das fixas do sistema (SYS_DIRS) ou ficar sob a pasta-mãe de --remote-root (gt-remote/); outra coisa → exit 3.
   Chaves de settings fora da lista de portáveis (modelo, statusLine, plugins...) são descartadas e registradas.
   Regra `ask` de permissão vira `deny` (ga-2hd02v.1.5): no servidor não há quem aperte a tecla, e `ask` explícita vale MESMO com
   --dangerously-skip-permissions — MEDIDO lá: `rm -rf` com só o `ask` fica parado num "Do you want to proceed?" sem fim; com `deny` é negado na hora.
@@ -48,7 +53,7 @@ POR QUE FALHA EM VEZ DE COPIAR (três estados: sei que serve / sei que não serv
   symlink de skill que sai da cidade, pasta ilegível dentro de uma skill, `--skills` com a pasta vazia, ou qualquer `/Users/` sobrando no que seria enviado
   → exit 3 e NADA é escrito.
 
-SAÍDA (OUT/): home/.claude/{settings.json,hooks/*} → {remote_home}/.claude/ · city/settings.json → arquivo de --settings ·
+SAÍDA (OUT/): home/.claude/{settings.json,hooks/*} → {remote_home}/.claude/ · city/settings.json → arquivo de --settings · zdot/* (com --session-path) → ZDOTDIR ·
   role/<papel>/.claude/{settings.json,skills/*} → .claude/ do diretório de trabalho da sessão · manifest.json (veredito
   por hook com `command` (a parte reconhecida) e `command_sha256` (do comando inteiro, drop inclusive), shim_needs, chaves descartadas, contagem de regras de permissão descartadas, sha256 de cada arquivo, bundle_hash — sem data/hora: mesma entrada, mesmo hash).
 
@@ -151,6 +156,12 @@ SKILLS_NOT_ON_SERVER = ("censec-inventario-extrajudicial", "cnd-municipal-pbh", 
 # Voltam ao servidor tirando o nome daqui quando a skill deixar de citar o mini (o aviso de nome inexistente denuncia lista velha).
 SKILLS_MINI_ONLY = ("corrigir-imovel-do-anuncio", "rea-scraper-first", "wa-worker-session-protocol")
 SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # nome exato de pasta em skills/: sem barra, sem glob
+# PATH explícito da sessão (ga-w7qwl1.1.5): o shell da ferramenta Bash do claude NÃO pode achar o bd/dolt do usuário. Só entram pastas fixas do sistema e as de gt-remote/.
+SYS_DIRS = ("/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+SESSION_DIR_RE = re.compile(r"/[A-Za-z0-9_./+-]+")  # vai entre aspas simples num arquivo de shell: sem espaço, aspa nem $
+ZDOT_HEAD = "# gerado por remote-bundle-build.py --session-path (ga-w7qwl1.1.5): PATH explícito da sessão; nada do HOME do usuário\n"
+# env.sh roda DEPOIS do snapshot do claude, ligado por `&&` ao comando: o último comando tem que sair 0 (`:`), e unalias de nome inexistente sai 1 (`|| :`)
+ZDOT_ENV_TAIL = "unalias bd gc gate-done dolt 2>/dev/null || :\nunset -f bd gc gate-done dolt 2>/dev/null || :\n:\n"
 DATA_SUFFIX = {".db", ".duckdb", ".sqlite", ".sqlite3", ".csv", ".parquet", ".gz", ".zip", ".tar", ".xlsx", ".pem", ".key"}
 DATA_NAMES = {"settings.local.json", ".credentials.json", ".env"}
 MAX_FILE = 512 * 1024
@@ -189,7 +200,7 @@ class Bundle:
         rx = "|".join(re.escape(o) for o in sorted(first, key=len, reverse=True))
         return re.sub(r"(?<![\w.-])(?:" + rx + r")(?![\w.-])", lambda m: first[m.group(0)], s)
 
-    def add(self, rel: str, data: bytes, ex: bool = False) -> None:
+    def add(self, rel: str, data: bytes, ex: bool = False, allow: tuple = ()) -> None:
         name = Path(rel).name
         if name in DATA_NAMES or name.startswith(".env") or Path(rel).suffix.lower() in DATA_SUFFIX:
             raise Refused(f"{rel}: arquivo de dado/segredo não entra no bundle")
@@ -204,6 +215,8 @@ class Bundle:
         # o destino pode ele mesmo começar em /Users/ (o MBP: /Users/athos/gt-remote/bundle): o que fica sob a raiz do bundle é o destino, não sobra do mini;
         # qualquer outro /Users/ continua recusando (vazio → nada a tirar e a guarda é a de sempre; o destino do servidor não tem /Users/).
         # Fronteira nos DOIS lados, como em rewrite(): /xx/Users/athos/gt-remote/bundle não é a raiz (tirá-la deixaria "/xx" e a guarda passaria)
+        for d in allow:  # os destinos já validados (PATH da sessão em gt-remote/) são o destino, não sobra do mini
+            text = text.replace(d, "")
         if "/Users/" in re.sub(r"(?<![\w.-])" + re.escape(self.a.remote_root.rstrip("/")) + r"(?![\w.-])", "", text):
             raise Refused(f"{rel}: caminho do mini (/Users/...) sobrando")
         self.files[rel] = (data, ex)
@@ -388,8 +401,25 @@ class Bundle:
         if not self.skill_count:  # pedido ≠ entregue: "ok 3 arquivos" com --skills não pode esconder que nenhuma skill foi
             raise Refused(f"--skills pedido mas {sdir} não tem nenhuma skill: entregaria 0")
 
+    def zdot(self, session_path: str) -> list:
+        """zdot/ com o PATH explícito. Vazio/mal formado/pasta fora das permitidas → Refused (nada é escrito): PATH que não sei se é limpo não vira "limpo"."""
+        dirs = session_path.split(":")
+        base = os.path.dirname(self.a.remote_root.rstrip("/"))
+        for d in dirs:
+            under = base not in ("", "/") and d.startswith(base + "/")
+            if not SESSION_DIR_RE.fullmatch(d) or any(c.startswith(".") for c in d.split("/")) or not (d in SYS_DIRS or under):  # ".": ".." e ~/.local/bin, ~/.cargo/bin...
+                raise Refused(f"--session-path: {d!r} não é pasta fixa do sistema nem fica sob {base or '?'}/ (ficaria o bd/dolt do usuário no PATH da sessão)")
+        if len(set(dirs)) != len(dirs):
+            raise Refused(f"--session-path: pasta repetida em {session_path!r}")
+        line = f"export PATH='{session_path}'\n"
+        for n in (".zshenv", ".zprofile", ".zshrc"):
+            self.add(f"zdot/{n}", (ZDOT_HEAD + line).encode(), allow=tuple(dirs))
+        self.add("zdot/env.sh", (ZDOT_HEAD + line + ZDOT_ENV_TAIL).encode(), allow=tuple(dirs))
+        return dirs
+
     def build(self) -> dict:
         a = self.a
+        self.session_dirs = self.zdot(a.session_path) if a.session_path is not None else None
         for src, kind, path, dest in (("user", "user", Path(a.claude_home) / "settings.json", "home/.claude/settings.json"),
                                       ("city", "city", self.city / ".gc" / "settings.json", "city/settings.json"),
                                       (f"role:{a.role}", "role", Path(a.role_dir) / ".claude" / "settings.json",
@@ -402,7 +432,8 @@ class Bundle:
             self.skills(a.role, Path(a.role_dir))
         return {"version": 1, "remote_root": a.remote_root, "remote_home": a.remote_home, "role": a.role,
                 "install": {"home/.claude": a.remote_home + "/.claude", "city/settings.json": a.remote_root + "/city/settings.json",
-                            f"role/{a.role}/.claude": "<diretório de trabalho da sessão>/.claude"},
+                            f"role/{a.role}/.claude": "<diretório de trabalho da sessão>/.claude", **({"zdot": a.remote_root + "/zdot"} if self.session_dirs else {})},
+                "session_path": self.session_dirs,
                 "hooks": self.hooks, "shim_needs": sorted(self.shim_needs), "clone_guard": self.swaps > 0,
                 "dropped_keys": {k: sorted(set(v)) for k, v in sorted(self.dropped_keys.items())},
                 "dropped_rules": dict(sorted(self.dropped_rules.items())),
@@ -534,6 +565,7 @@ def main(argv: list[str]) -> int:
     b.add_argument("--out", required=True)
     b.add_argument("--skills", action="store_true")
     b.add_argument("--exclude-skill", action="append", default=[], metavar="NOME")
+    b.add_argument("--session-path", default=None, metavar="DIR:DIR")  # o PATH explícito da sessão (zdot/); vazio = sem zdot
     b.add_argument("--clone-guard", default=str(Path(__file__).resolve().parent / GUARD))  # o guarda que o swap leva; ilegível → recusa
     v = sub.add_parser("verify")
     v.add_argument("dir")

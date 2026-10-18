@@ -90,6 +90,21 @@ if [ ! -w "$SRV/ro" ]; then
 else skip "pasta não protegida (rodando como root: chmod não impede)"; fi
 chmod 700 "$SRV/ro"
 
+echo "== dolt recusado (ga-w7qwl1.1.5): o atalho que ocupa o nome no PATH da sessão do MBP"
+[ ! -e "$SRV/bin/dolt" ] && [ ! -L "$SRV/bin/dolt" ]; ok $? "install sem --refuse-dolt NÃO liga o dolt (o servidor não muda)"
+python3 -I "$S" install --bin-dir "$SRV/bin" --refuse-dolt > "$T/out" 2>&1; RC=$?
+[ "$RC" = 0 ] && has "$T/out" "/dolt -> remote-shim" && [ ! -L "$SRV/bin/dolt" ]; ok $? "install --refuse-dolt sem --apply: o plano mostra o dolt e nada é gravado"
+python3 -I "$S" install --bin-dir "$SRV/bin" --refuse-dolt --apply > "$T/out" 2>&1; RC=$?
+[ "$RC" = 0 ] && [ "$(readlink "$SRV/bin/dolt")" = remote-shim ] && [ "$(readlink "$SRV/bin/bd")" = remote-shim ]; ok $? "install --refuse-dolt --apply liga também o dolt ao shim"
+python3 -I "$S" install --bin-dir "$SRV/bin" --refuse-dolt --apply >/dev/null 2>&1; ok $? "  ...e de novo é idempotente"
+mkdir -p "$SRV/bin2"; printf '#!/bin/sh\necho "dolt alheio"\n' > "$SRV/bin2/dolt"; chmod +x "$SRV/bin2/dolt"
+python3 -I "$S" install --bin-dir "$SRV/bin2" --refuse-dolt --apply > "$T/out" 2> "$T/err"; RC=$?
+[ "$RC" = 3 ] && has "$T/err" "não sobrescrevo" && [ ! -e "$SRV/bin2/bd" ] && [ ! -e "$SRV/bin2/remote-shim" ] && [ "$("$SRV/bin2/dolt")" = "dolt alheio" ]; ok $? "install --refuse-dolt: não sobrescreve um dolt alheio (nada é ligado)"
+rm -f "$SRV/fakebin/ssh_args.txt"
+b=$(calls); shim dolt sql -q "select 1"; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && [ ! -e "$SRV/fakebin/ssh_args.txt" ] && has "$T/err" "não existe nesta sessão"; ok $? "dolt pelo shim: 77, nenhum ssh e nenhum comando no mini"
+SHIM_CONF="$SRV/nao-existe.json" shim dolt version; [ "$RC" = 77 ] && [ ! -e "$SRV/fakebin/ssh_args.txt" ]; ok $? "dolt recusa sem ler a config do shim (config ausente não vira 78: o dolt nunca fala com o mini)"
+STDIN_FILE="$T/stdin.txt" shim dolt sql; [ "$RC" = 77 ] && [ ! -e "$SRV/fakebin/ssh_args.txt" ]; ok $? "dolt com entrada padrão: também 77 sem ssh (nada do stdin sai da máquina)"
+
 echo "== contrato com a fatia 1: todo shim_needs do bundle passa pela lista"
 BD="$T/bundle"; mkdir -p "$BD/city/.gc" "$BD/home/.claude" "$BD/role/.claude"
 printf '{}' > "$BD/home/.claude/settings.json"; printf '{}' > "$BD/role/.claude/settings.json"

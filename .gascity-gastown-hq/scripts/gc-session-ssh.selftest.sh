@@ -305,10 +305,10 @@ g_terr() {  # o tmux do host responde mas não consegue olhar (socket sem permis
 # ---------- mbp: o MBP como host (ga-w7qwl1) — regra de presença no start, host pelo nome da sessão, vigia de prioridade, eventos ----------
 cfgm() {  # cfgm [EXTRA-JSON-do-host-m]  → $T/cfg.json com a (padrão, sem regra), m (o "MBP": presença, PATH extra, dorme) e h (home em /Users, só dry-run)
   mkdir -p "$T/extra" "$T/lib"
-  jq -n --argjson extra "${1:-{\}}" --arg rr "$RR" --arg rh "$RH" --arg s "$SOCK" --arg chk "$T/bin/fake-check" --arg lib "$T/lib/presence.sh" --arg ex "$T/extra" \
+  jq -n --argjson extra "${1:-{\}}" --arg rr "$RR" --arg rh "$RH" --arg s "$SOCK" --arg chk "$T/bin/fake-check" --arg lib "$T/lib/presence.sh" --arg ex "$T/extra" --arg sb "$T/shim-bin" --arg cl "$T/claude" \
     '{default_host:"a", hosts:{a:{ssh:"fakehost",cap:3,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false},
       m:({ssh:"fakembp",cap:2,remote_root:$rr,remote_home:$rh,socket:($s+"m"),mini_home:"/Users/test",presence_gate:true,sleeps:true,watch_s:1,
-         gate_cmd:[$chk],presence_lib:$lib,path_extra:[$ex],real_sessions_released_by:"selftest"}+$extra),
+         gate_cmd:[$chk],presence_lib:$lib,path_extra:[$ex],session_env:{path:[$sb,"/usr/bin","/bin"],claude:$cl},real_sessions_released_by:"selftest"}+$extra),
       h:{ssh:"fakehost",cap:1,remote_root:"/Users/athos/gt-remote/bundle",remote_home:"/Users/athos",socket:($s+"h"),mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false}}}' > "$T/cfg.json"
 }
 setup_mbp() {
@@ -335,6 +335,10 @@ EOF
   # biblioteca de presença falsa (o modo vem de $T/pres.mode, a pausa de $T/pres.pause): as mesmas variáveis da mbp-presence.sh de verdade
   printf 'presence_eval() { PR_MODE=$(cat "%s/pres.mode" 2>/dev/null || echo uso); PR_PAUSED=0; [ -e "%s/pres.pause" ] && PR_PAUSED=1; return 0; }\n' "$T" "$T" > "$T/lib/presence.sh"
   echo livre > "$T/pres.mode"; rm -f "$T/pres.pause"
+  zdot_put "$T/shim-bin:/usr/bin:/bin"
+}
+zdot_put() {  # zdot_put PATH — os 4 arquivos que o remote-bundle-build.py --session-path instala em <raiz>/zdot (a linha do PATH é a que o provider confere)
+  mkdir -p "$RR/zdot" "$T/shim-bin"; for f in .zshenv .zprofile .zshrc env.sh; do printf "export PATH='%s'\n" "$1" > "$RR/zdot/$f"; done
 }
 mode() { echo "$1" > "$T/chk.mode"; }
 nicen() { ps -o nice= -p "$1" 2>/dev/null | tr -d ' '; }
@@ -350,6 +354,11 @@ g_mbp() {
   jq -r '.launcher[]' "$T/out" | grep -q '^nice -n 10 sh -c '; ok $? "mbp: a sessão do MBP nasce em nice 10"
   jq -r '.launcher[]' "$T/out" | grep -q 'taskpolicy -b -p'; ok $? "mbp: o lançador leva o vigia que rebaixa a árvore (renice 19 + taskpolicy -b)"
   nossh; ok $? "mbp: dry-run não conecta nem consulta a presença"
+  [ "$(jq -r '.session_env | "\(.path) \(.claude) \(.zdot)"' "$T/out")" = "$T/shim-bin:/usr/bin:/bin $T/claude $RR/zdot" ] && [ "$(jq -r .command "$T/out")" = "$T/claude --x" ]
+  ok $? "mbp: o dry-run mostra a session_env e o claude do comando vira o caminho absoluto"
+  L=$(jq -r '.launcher[]' "$T/out"); w=$(printf '%s\n' "$L" | grep -n '^bash -c' | cut -d: -f1); e=$(printf '%s\n' "$L" | grep -n '^export PATH=' | cut -d: -f1); r=$(printf '%s\n' "$L" | grep -n '^nice -n 10 sh -c' | cut -d: -f1)
+  printf '%s\n' "$L" | grep -qxF "export ZDOTDIR=$RR/zdot" && printf '%s\n' "$L" | grep -qxF "export CLAUDE_ENV_FILE=$RR/zdot/env.sh" && printf '%s\n' "$L" | grep -qxF "export PATH=$T/shim-bin:/usr/bin:/bin" && [ "${w:-9}" -lt "${e:-0}" ] && [ "${e:-9}" -lt "${r:-0}" ]
+  ok $? "mbp: o lançador exporta ZDOTDIR, CLAUDE_ENV_FILE e o PATH explícito DEPOIS do vigia (que usa o PATH do host) e ANTES do comando"
   pv --dry-run start w-1 < <(req "claude --x"); [ "$(jq -r .host "$T/out")" = a ] && [ "$(jq -r .gate "$T/out")" = null ] && ! jq -r '.launcher[]' "$T/out" | grep -q 'taskpolicy\|^nice '; ok $? "mbp: nome sem -remote- continua no host padrão, sem regra de presença nem vigia (o servidor Linux não muda)"
   pv --dry-run start w-remote-zz-1 < <(req "claude"); [ $RC = 1 ] && has "$T/err" "'zz'" && nossh; ok $? "mbp: nome que pede um host que a config não tem recusa dizendo qual, sem ssh"
   GC_SSH_HOST=a pv --dry-run start w-remote-m-1 < <(req "claude"); [ "$(jq -r .host "$T/out")" = a ]; ok $? "mbp: \$GC_SSH_HOST (decisão explícita de quem opera) vale mais que o nome"
@@ -401,8 +410,10 @@ g_mbp() {
   FAKE_SSH_FAIL_HOST=fakembp pv list-running w- </dev/null; [ $RC = 1 ]; ok $? "mbp: ...e com o notebook fora do ar o list-running diz 'não sei' (erro), não 'nada nosso lá'"
   pv stop w-remote-m-6 </dev/null
   # --- PATH extra do host ---
-  pv start w-remote-m-5 < <(req "sh -c 'echo \$PATH > $T/path.out; exec cat'"); sleep 0.5
-  case "$(cat "$T/path.out" 2>/dev/null)" in "$T/extra:"*) true;; *) false;; esac; ok $? "mbp: o PATH da sessão começa pelo path_extra do host (Homebrew do MBP)"
+  pv start w-remote-m-5 < <(req "sh -c 'echo \$PATH > $T/path.out; echo \$ZDOTDIR \$CLAUDE_ENV_FILE > $T/zd.out; exec cat'"); sleep 0.5
+  [ "$(cat "$T/path.out" 2>/dev/null)" = "$T/shim-bin:/usr/bin:/bin" ]; ok $? "mbp: o PATH da sessão é EXATAMENTE o da session_env (atalho + pastas do sistema), sem o PATH do ssh nem ~/.local/bin"
+  [ "$(cat "$T/zd.out" 2>/dev/null)" = "$RR/zdot $RR/zdot/env.sh" ]; ok $? "mbp: a sessão leva ZDOTDIR=<raiz>/zdot e CLAUDE_ENV_FILE=<raiz>/zdot/env.sh"
+  case "$(tmux -L "${SOCK}m" show-environment -g PATH 2>&1)" in "PATH=$T/extra:"*) true;; *) false;; esac; ok $? "mbp: o PATH do HOST (tmux, ps, renice) segue começando pelo path_extra (Homebrew do MBP)"
   pv stop w-remote-m-5 </dev/null
   # --- vigia: o Athos volta (ou pausa) com a sessão rodando → a árvore cai para prioridade de fundo, uma vez, e a sessão NÃO é morta ---
   # `renice`/`taskpolicy` falsos no PATH do "host" só registram o pid: o nice real não serve de prova aqui (quem roda o teste pode já
@@ -423,6 +434,14 @@ g_mbp() {
   for i in $(seq 1 40); do grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log" && break; sleep 0.25; done
   grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log"; ok $? "mbp: a pausa do Athos (arquivo de pausa) também rebaixa a sessão em curso"
   pv stop w-remote-m-7 </dev/null; rm -f "$T/pres.pause" "$T/home/.local/bin/renice" "$T/home/.local/bin/taskpolicy"
+  # --- o ambiente da sessão é do bundle: sem ele (ou de outro PATH) a sessão NÃO abre; e o comando tem que existir no PATH da SESSÃO ---
+  mode livre; mv "$RR/zdot" "$RR/zdot.off"; fresh; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'zdot ausente ou com PATH diferente' && [ "$(count x "${SOCK}m")" = 0 ]
+  ok $? "mbp: sem o zdot do bundle no host o start recusa dizendo por quê e nada fica aberto (rc=$RC)"
+  mv "$RR/zdot.off" "$RR/zdot"; zdot_put "/usr/local/bin:/usr/bin:/bin"; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'zdot ausente ou com PATH diferente' && [ "$(count x "${SOCK}m")" = 0 ]
+  ok $? "mbp: zdot com PATH diferente do da session_env (bundle de outra lista) → recusa, nada aberto (rc=$RC)"
+  zdot_put "$T/shim-bin:/usr/bin:/bin"; printf '#!/bin/sh\nexit 0\n' > "$T/extra/so-no-host"; chmod +x "$T/extra/so-no-host"
+  pv start w-remote-m-9 < <(req so-no-host); [ $RC = 1 ] && has "$T/err" 'comando não encontrado' && [ "$(count x "${SOCK}m")" = 0 ]
+  ok $? "mbp: comando que só existe no PATH do host (path_extra) não existe para a sessão: 127, nada aberto (rc=$RC)"
   # --- sem a biblioteca de presença no host não há vigia, então não há sessão ---
   mv "$T/lib/presence.sh" "$T/lib/presence.sh.off"; fresh; pv start w-remote-m-8 < <(req cat); [ $RC = 1 ] && has "$T/err" 'biblioteca de presença' && [ "$(count x "${SOCK}m")" = 0 ]; ok $? "mbp: sem a biblioteca de presença no host o start recusa (uma sessão sem vigia não abre) (rc=$RC)"
   mv "$T/lib/presence.sh.off" "$T/lib/presence.sh"
@@ -436,6 +455,12 @@ g_mbp() {
   done
   cfgm '{"sleeps":"talvez"}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'sleeps'"; ok $? "mbp: sleeps que não é booleano recusa a config"
   cfgm '{"presence_gate":false}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" 'exige presence_gate'; ok $? "mbp: notebook (sleeps) sem a regra de presença recusa a config"
+  cfgm '{"session_env":null}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'session_env' é obrigatório" && nossh; ok $? "mbp: notebook (sleeps) sem session_env recusa a config, sem ssh (rc=$RC)"
+  for v in '"/usr/bin"' '{}' '{"path":[],"claude":"/c"}' '{"path":["/usr/bin"]}' '{"path":["/usr/bin"],"claude":"c"}' '{"path":["/usr/bin","/usr/bin"],"claude":"/c"}' \
+           '{"path":["/home/x/.local/bin"],"claude":"/c"}' '{"path":["/a/../b"],"claude":"/c"}' '{"path":["bin"],"claude":"/c"}' '{"path":["/usr/bin"],"claude":"/c","extra":1}' '{"path":"/usr/bin","claude":"/c"}'; do
+    cfgm '{"session_env":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "session_env" && nossh; ok $? "mbp: session_env $v recusa a config (nunca vira 'sem ambiente'), sem ssh (rc=$RC)"
+  done
+  cfgm; pv --dry-run start w-1 < <(req cat); [ $RC = 0 ] && [ "$(jq -r .session_env "$T/out")" = null ]; ok $? "mbp: host que NÃO dorme segue sem session_env (nada muda para o servidor) (rc=$RC)"
   cfgm '{"gate_cmd":"mbp-run.sh --check"}'; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gate_cmd'"; ok $? "mbp: gate_cmd em texto (não lista) recusa a config"
   cfgm; jq 'del(.default_host)' "$T/cfg.json" > "$T/cfg.nd" && mv "$T/cfg.nd" "$T/cfg.json"; setup_mbp; mode livre
   pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = m ]; ok $? "mbp: sem default_host o nome da sessão ainda escolhe o host (rc=$RC $(head -c 120 "$T/err"))"
@@ -712,6 +737,15 @@ echo "== $((n-fails))/$n ok =="
   mutant mbp "slot_cap da checagem ignorado" 's/cap = min(cap, g\["slot_cap"\])/pass/'
   mutant mbp "host pelo nome da sessão" 's/return m.group(1) if m else ""/return ""/'
   mutant mbp "sem vigia de prioridade" 's/^    if cfg.gate:$/    if False:/'
+  mutant mbp "sem conferir o zdot do bundle" 's/^    if cfg.spath:  # o zdot do bundle/    if False:  # o zdot do bundle/'
+  mutant mbp "sem ZDOTDIR no lançador" 's/out += \[f"export ZDOTDIR={q(cfg.zdot)}", /out += [/'
+  mutant mbp "sem CLAUDE_ENV_FILE no lançador" "s/f\"export CLAUDE_ENV_FILE={q(cfg.zdot + '\/env.sh')}\", //"
+  mutant mbp "sem o PATH explícito no lançador" 's/, f"export PATH={q(cfg.spath)}"\]/]/'
+  mutant mbp "claude sem o caminho absoluto" 's/^    if cfg.claude_bin:  #/    if False:  #/'
+  mutant mbp "comando conferido no PATH do host, não no da sessão" 's/(PATH={q(cfg.spath)}; {look})" if cfg.spath else look/{look}" if cfg.spath else look/'
+  mutant mbp "notebook sem session_env aceito" 's/^            if self.sleeps:$/            if False:/'
+  mutant mbp "session_env com pasta oculta/repetida aceito" 's/if len(set(dirs)) != len(dirs) or any(c.startswith(".") for d in dirs for c in d.split("\/")):/if False:/'
+  mutant mbp "session_env mal formado aceito" 's/if not isinstance(v, dict) or set(v) != {"path", "claude"} or not isinstance(v\["path"\], list) or not v\["path"\]:/if not isinstance(v, dict):/'
   mutant mbp "PATH extra do host" 's/"".join(d + ":" for d in cfg.path_extra)/""/'
   mutant mbp "host que dorme sempre ignorado no list-running" 's/if cfg.sleeps and not cfg.known():/if cfg.sleeps:/'
   mutant mbp "host que NÃO dorme também ignorado no list-running" 's/if cfg.sleeps and not cfg.known():/if not cfg.known():/'

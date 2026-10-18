@@ -50,7 +50,7 @@ SRV="$T/srv"; MINI="$T/mini"; CITY="$T/city"; GOLD="$T/golden"; export SRV CITY 
 ROLE="$CITY/.gc/agents/dogs/gastown.dog-1"
 export HOME="$MINI" GC_CITY_PATH="$CITY" GC_SSH_BIN="$T/bin/ssh" MBP_PROOF_HOME="$SRV" MBP_PROOF_SSH="fake@mbp" MBP_PROOF_POLL=0.2 MBP_PROOF_SHIM_WAIT=3 MBP_PROOF_WATCH_CYCLE=0.3 \
   MBP_PROOF_PROV="$T/fakeprov" MBP_PROOF_PUMP="$T/fakepump.py" MBP_PROOF_SHIM_CLIENT="$T/fake-remote-shim.py" MBP_PROOF_BUILDER="$BUILDER" \
-  MBP_PROOF_PATHX="$SRV/gt-remote/shim-bin:$SRV/fakebin"
+  MBP_PROOF_PATHX="$SRV/gt-remote/shim-bin:$SRV/fakebin" MBP_PROOF_SESSION_PATH="$SRV/gt-remote/shim-bin:/usr/bin:/bin" MBP_PROOF_CLAUDE="$SRV/fakebin/claude"  # (a sessão só enxerga o atalho e o sistema; o claude vai por caminho absoluto)
 
 if [ -z "${MBPT_T:-}" ]; then
 mkdir -p "$T/bin" "$T/seed" "$MINI/.claude/hooks" "$CITY/.gc/agents/dogs/gastown.dog-1/.claude" "$FAKE_STATE"
@@ -63,6 +63,7 @@ shift
 cmd=$1
 if [ -n "${FAKE_UPLOAD_FAIL:-}" ]; then case $cmd in *"cat > "*"remote-bundle-build.py"*) cat > /dev/null; echo "cat: cannot write: Read-only file system" >&2; exit 1;; esac; fi
 if [ "${FAKE_MODE:-}" = snapfail ]; then case $cmd in *proofs_new*) touch "$FAKE_STATE/cleaned";; *'"plib"'*) [ ! -e "$FAKE_STATE/cleaned" ] || { cat > /dev/null; echo "snap: boom" >&2; exit 1; };; esac; fi  # a leitura DEPOIS da limpeza falha
+[ "${FAKE_MODE:-}" != measurefail ] || case $cmd in *'"marker"'*) cat > /dev/null; echo "measure: boom" >&2; exit 1;; esac  # a leitura da transcrição (a medição de dentro da sessão) falha
 [ "${FAKE_MODE:-}" != lostpause ] || case $cmd in *'"mode": "on"'*) HOME="$SRV" TMUX_TMPDIR="$SRV/tmp" ON_MBP=1 PATH="$SRV/fakebin:/usr/bin:/bin" sh -c "$cmd" > /dev/null; echo "client_loop: send disconnect: Broken pipe" >&2; exit 255;; esac  # a pausa É criada no MBP, mas a resposta se perde
 HOME="$SRV" TMUX_TMPDIR="$SRV/tmp" ON_MBP=1 PATH="$SRV/fakebin:/usr/bin:/bin" sh -c "$cmd"; rc=$?
 if [ -n "${FAKE_TAMPER:-}" ]; then case $cmd in *"; tar -C "*" -xf -") d=${cmd##*tar -C }; d=${d% -xf -}; echo adulterado > "$d/injetado.txt";; esac; fi
@@ -92,12 +93,14 @@ if sys.argv[1:2] == ["install"]:
     os.makedirs(d, exist_ok=True)
     dst = os.path.join(d, "remote-shim")
     shutil.copyfile(sys.argv[0], dst); os.chmod(dst, 0o755)
-    for n in ("bd", "gc", "gate-done"):
+    for n in ("bd", "gc", "gate-done") + (("dolt",) if "--refuse-dolt" in sys.argv else ()):
         p = os.path.join(d, n)
         if os.path.lexists(p):
             os.unlink(p)
         os.symlink("remote-shim", p)
     print("instalado"); sys.exit(0)
+if me == "dolt":
+    sys.stderr.write("remote-shim: `dolt` não existe nesta sessão (o MBP não ganha credencial de bd/Dolt)\n"); sys.exit(77)
 if not os.environ.get("GC_SESSION_NAME", "").startswith("remote-test-remote-mbp-"):
     sys.stderr.write("remote-shim: recusado: identidade fora do padrão\n"); sys.exit(77)
 if os.environ.get("FAKE_SHIM_DEAD"):
@@ -126,6 +129,32 @@ S="$FAKE_STATE"; echo "$*" >> "$S/provcalls"; op=${1:-}; shift
 NAME=remote-test-remote-mbp-1; G="$SRV/gt-remote"; BUNDLE="$G/bundle"; PAUSE="$G/PAUSE"; SOCK="$SRV/tmp/tmux-$(id -u)/gc-remote"; mode=${FAKE_MODE:-ok}
 kids() { ps -axo pid=,ppid= | awk -v r="$1" '{p[$1]=$2} END{for(i in p){q=i;n=0;while(q>1&&n<64){if(q==r){print i;break};q=p[q];n++}}}'; }
 killtree() { local k; k=$(kids "$1"); [ -n "$k" ] || return 0; kill -TERM $k 2>/dev/null; sleep 0.3; kill -KILL $k 2>/dev/null; return 0; }
+measure() {  # o passo 1 do prompt: o "modelo" copia o comando do pedido de start, a ferramenta Bash o roda (bash aqui, zsh no MBP) e o claude grava o uso e o resultado na transcrição
+  local cmd out p="$PATH" pre= ub="$T/ub-$mode"
+  cmd=$(python3 -I -c 'import json,shlex,sys; s=shlex.split(json.load(open(sys.argv[1]))["prompt_suffix"])[0]; print([l for l in s.split("\n") if l.startswith("1. (a measurement")][0].split("exactly) ",1)[1], end="")' "$S/startreq") || return
+  mkdir -p "$ub"
+  case $mode in
+    userbd) printf '#!/bin/sh\nexit 0\n' > "$ub/bd"; chmod +x "$ub/bd"; p="$ub:$p";;                 # o bd do usuário à frente de tudo (o que o .zshrc dele faria sem o ZDOTDIR limpo)
+    realdolt) printf '#!/bin/sh\nexit 0\n' > "$ub/dolt"; chmod +x "$ub/dolt"; p="$ub:$p";;           # um dolt de verdade alcançável
+    fnbd) pre='bd() { :; }; ';;                                                                       # uma função bd que entrou no snapshot do claude
+    pathhome) p="$p:$HOME/.local/bin";;                                                               # o atalho segue primeiro, mas ~/.local/bin está no PATH
+    pathfirst) p="/usr/bin:$p";;                                                                      # o atalho não é a primeira pasta
+    altered) cmd="$cmd # alterado pelo modelo";;
+  esac
+  out=$(PATH="$p" bash -c "$pre$cmd" 2> /dev/null)
+  [ $mode != cutout ] || out=$(printf '%s\n' "$out" | sed '/^MEASEND-/d')
+  python3 -I -c '
+import json, sys
+t, cmd, out, mode = sys.argv[1:5]
+res = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tu1", "content": out}]}, "toolUseResult": {"stdout": out, "stderr": "", "interrupted": False}}
+if mode in ("contentonly", "contentlist"):
+    del res["toolUseResult"]
+if mode == "contentlist":
+    res["message"]["content"][0]["content"] = [{"type": "text", "text": out}]
+use = {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "tu1", "name": "Bash", "input": {"command": cmd}}]}}
+blob = {"type": "api-request-blob", "message": {"content": [{"type": "tool_use", "id": "tu1", "name": "Bash", "input": {"command": cmd + " # copia no pedido da API"}}]}}  # a isca: só as linhas da conversa valem
+open(t, "a").write("".join(json.dumps(r) + "\n" for r in (use, blob, res)))' "$t" "$cmd" "$out" "$mode"
+}
 agent() {  # a "sessão": os 6 passos do prompt, com o modo de falha pedido
   local wd=$1 run=$2 idopt= d t
   cd "$wd" || return
@@ -136,7 +165,8 @@ agent() {  # a "sessão": os 6 passos do prompt, com o modo de falha pedido
     die) echo "claude: morreu" > "$S/screen"; killtree "$(cat "$S/panepid")"; return;;
     hang) echo "pensando..." > "$S/screen"; return;;
   esac
-  { echo '$ command -v bd gc'; command -v bd gc; } >> "$S/screen"
+  d="$SRV/.claude/projects/-fake-$run"; mkdir -p "$d"; t="$d/s.jsonl"
+  [ $mode = nomeasure ] || measure
   bd show ga-x --json > /dev/null
   [ $mode = nocomment ] || bd comment ga-x "$NAME: sessao remota no MBP $run leu esta bead"
   [ $mode != wrongid ] || idopt="-c user.name=outro -c user.email=outro@x.invalid"
@@ -156,7 +186,6 @@ agent() {  # a "sessão": os 6 passos do prompt, com o modo de falha pedido
     sshkey) echo "chave" > "$SRV/.ssh/id_ed25519";;
     transcriptsecret) mkdir -p "$SRV/.claude/projects/-fake-$run"; printf 'ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$SRV/.claude/projects/-fake-$run/vazou.txt";;
   esac
-  d="$SRV/.claude/projects/-fake-$run"; mkdir -p "$d"; t="$d/s.jsonl"
   hk() { printf '{"attachment":{"type":"hook_success","hookEvent":"%s","command":"%s","durationMs":%s,"exitCode":%s}}\n' "$1" "$2" "$3" "$4" >> "$t"; }
   [ $mode != gctimeout ] || echo '{"attachment":{"type":"hook_cancelled","hookEvent":"UserPromptSubmit","command":"export PATH=x && gc mail check --inject","durationMs":30512,"timedOut":true,"timeoutMs":30000}}' >> "$t"
   [ $mode != gcfail ] || hk UserPromptSubmit 'export PATH=x && gc mail check --inject' 700 1
@@ -292,9 +321,51 @@ assert M.family(r,2)=={2,3,4}'; ok $? "unit: family — o processo e todos os de
   c startreq && { py 'r=M.start_request("ga-w7qwl1.1","haiku","mbp-20260101-000000","/w/x")
 assert r["work_dir"]=="/w/x" and r["prompt_flag"]=="" and all(r["env"][k]==M.SESSION for k in ("GC_ALIAS","GC_AGENT","GC_SESSION_NAME","GC_TEMPLATE")), r["env"]
 assert r["command"].rstrip().endswith("--settings "+M.CITY+"/.gc/settings.json") and "--model haiku" in r["command"]
-assert "ga-w7qwl1.1" in r["prompt_suffix"] and "mbp-20260101-000000" in r["prompt_suffix"] and "E2E-$((6*7))-OK" in r["prompt_suffix"] and "E2E-42-OK" not in r["prompt_suffix"]'; ok $? "unit: o pedido de start — identidade da sessão de teste, o --settings do city por ÚLTIMO, e o prompt só tem a conta (o número só aparece se o comando rodou)"; }
+assert "ga-w7qwl1.1" in r["prompt_suffix"] and "mbp-20260101-000000" in r["prompt_suffix"] and "E2E-$((6*7))-OK" in r["prompt_suffix"] and "E2E-42-OK" not in r["prompt_suffix"]
+assert M.measure_cmd("mbp-20260101-000000") in r["prompt_suffix"] or "MEAS-mbp-20260101-000000" in r["prompt_suffix"], r["prompt_suffix"][:300]'; ok $? "unit: o pedido de start — identidade da sessão de teste, o --settings do city por ÚLTIMO, e o prompt só tem a conta (o número só aparece se o comando rodou) e o passo 1 de medição"; }
   c hostblock && { py 'h=M.host_block(); assert h["shim"]["spool_dir"]==M.SPOOL and h["path_extra"][0]==M.SHIMBIN and h["remote_root"]==M.BUNDLE and h["remote_home"]==M.MHOME
-assert M.client_config()=={"transport":"spool","spool_dir":M.SPOOL,"timeout_s":330}'; ok $? "unit: o bloco do host mbp — o atalho PRIMEIRO no PATH; a config do cliente é só a puxada (sem host, usuário nem chave)"; }
+assert M.client_config()=={"transport":"spool","spool_dir":M.SPOOL,"timeout_s":330}
+se=h["session_env"]; assert se=={"path":M.SESSION_PATH,"claude":M.CLAUDE_BIN} and se["path"][0]==M.SHIMBIN and se["claude"].startswith("/"), se'; ok $? "unit: o bloco do host mbp — o atalho PRIMEIRO no PATH; session_env leva o PATH explícito (atalho primeiro) e o claude por caminho absoluto; a config do cliente é só a puxada (sem host, usuário nem chave)"; }
+  c sessionpath && { MBP_PROOF_SESSION_PATH= MBP_PROOF_CLAUDE= py 'import os
+assert M.SESSION_PATH==[M.SHIMBIN,"/opt/homebrew/bin","/usr/local/bin","/usr/bin","/bin","/usr/sbin","/sbin"], M.SESSION_PATH
+assert not any(d.startswith(M.MHOME) and d!=M.SHIMBIN for d in M.SESSION_PATH) and M.CLAUDE_BIN==M.MHOME+"/.local/bin/claude", M.CLAUDE_BIN'; ok $? "unit: o PATH explícito padrão da sessão — o atalho primeiro, só pastas do sistema e do Homebrew, nem ~/.local/bin nem ~/go/bin; o claude por caminho absoluto"; }
+  RV='sb="/m/gt-remote/shim-bin"; hm="/m"; run="mbp-1"
+def mk(cv=None, ta=None, rc="77", path=None, begin=True, end=True, extra=()):
+    c={"bd":sb+"/bd","gc":sb+"/gc","gate-done":sb+"/gate-done","dolt":sb+"/dolt"}; c.update(cv or {})
+    t={k:(k+" is "+v if v else k+" not found") for k,v in c.items()}; t.update(ta or {})
+    L=(["MEAS-"+run] if begin else [])+["CMDV %s %s" % (k,v) for k,v in c.items()]+["TYPEA "+t[k] for k in c]+list(extra)+(["DOLTRC "+rc] if rc is not None else [])+(["PATHV "+(sb+":/usr/bin:/bin" if path is None else path)] if path is not False else [])+(["MEASEND-"+run] if end else [])
+    return "\n".join(L)+"\n"
+V=lambda o: M.resolution_verdict(o,run,sb,hm)'
+  c verdict-ok && { py "$RV"'
+ok,why=V(mk()); assert ok and "rc 77" in why, why
+ok,why=V(mk(cv={"dolt":""}, rc="127")); assert ok and "inalcançável" in why, why'; ok $? "unit: resolution_verdict — bd, gc e gate-done no atalho e dolt recusado (rc 77) ou inalcançável (nada e rc 127) passam"; }
+  c verdict-bad && { py "$RV"'
+for o in (None, 7, "", mk(begin=False), mk(end=False), mk(rc=None), mk(rc="x"), mk(path=False), "MEAS-mbp-1\nMEASEND-mbp-1\n", mk().replace("mbp-1","mbp-2")):
+    ok,why=V(o); assert not ok and why.startswith("sem medição"), (o,why)
+ok,why=V(mk().replace("CMDV gc "+sb+"/gc\n","")); assert not ok and "faltam linhas" in why, why'; ok $? "unit: resolution_verdict — sem medição (nada lido, sem marcador, linha faltando, número ilegível, outra rodada) reprova como \"sem medição\", nunca como \"resolve para o atalho\""; }
+  c verdict-tool && { py "$RV"'
+for cv,ta,needle in (({"bd":"/m/.local/bin/bd"},{},"bd resolve"), ({"gc":"gc"},{"gc":"gc is a shell function"},"gc resolve"), ({}, {"gate-done":"gate-done is /m/.local/bin/gate-done"},"gate-done resolve"),
+                     ({"bd":""},{},"(nada)")):
+    ok,why=V(mk(cv=cv,ta=ta)); assert not ok and needle in why, (cv,ta,why)
+ok,why=V(mk(extra=("TYPEA bd is /m/.local/bin/bd",))); assert ok, why
+o=mk().replace("TYPEA bd is "+sb+"/bd\n","TYPEA bd is /m/.local/bin/bd\nTYPEA bd is "+sb+"/bd\n"); ok,why=V(o); assert not ok and "bd resolve" in why, why'; ok $? "unit: resolution_verdict — bd que resolve fora do atalho, função/alias e gate-done fora do atalho reprovam; só a PRIMEIRA linha do type -a decide (a que roda)"; }
+  c verdict-dolt && { py "$RV"'
+for kw in (dict(rc="0"), dict(rc="1"), dict(cv={"dolt":"/opt/homebrew/bin/dolt"},rc="0"), dict(cv={"dolt":""},rc="0"), dict(cv={"dolt":""},rc="77"), dict(cv={"dolt":sb+"/dolt"},rc="127")):
+    ok,why=V(mk(**kw)); assert not ok and "dolt alcançável" in why, (kw,why)'; ok $? "unit: resolution_verdict — dolt de verdade, link que não recusa (rc ≠ 77) e rc que não bate com o que se vê reprovam"; }
+  c verdict-path && { py "$RV"'
+for pth in ("/usr/bin:"+"/m/gt-remote/shim-bin", sb+":/m/.local/bin:/usr/bin", sb+":/usr/bin:/m/go/bin", "/m/.local/bin:"+sb):
+    ok,why=V(mk(path=pth)); assert not ok and "PATH da ferramenta Bash" in why, (pth,why)
+ok,why=V(mk(path=sb+":/opt/homebrew/bin:/usr/bin:/bin")); assert ok, why'; ok $? "unit: resolution_verdict — o PATH da ferramenta Bash tem o atalho em primeiro e nem ~/.local/bin nem ~/go/bin"; }
+  c measure-cmd && { mkdir -p "$T/mc/sb"; for t in bd gc gate-done; do printf '#!/bin/sh\nexit 0\n' > "$T/mc/sb/$t"; done; printf '#!/bin/sh\nexit 77\n' > "$T/mc/sb/dolt"; chmod +x "$T/mc/sb/"*
+    MCD="$T/mc" py 'import os,subprocess
+d=os.environ["MCD"]+"/sb"; run="mbp-9"; cmd=M.measure_cmd(run)
+assert run in cmd and "$((" not in cmd and "type -a bd gc gate-done dolt" in cmd
+def go(sh,path): return subprocess.run([sh,"-c",cmd],capture_output=True,text=True,env={"PATH":path,"HOME":"/nonexistent"}).stdout
+for sh in ("bash","zsh"):
+    if subprocess.run(["sh","-c","command -v "+sh],capture_output=True).returncode: continue
+    ok,why=M.resolution_verdict(go(sh,d+":/usr/bin:/bin"),run,d,"/nonexistent"); assert ok, (sh,why)
+    os.rename(d+"/dolt",d+"/dolt.off"); ok,why=M.resolution_verdict(go(sh,d+":/usr/bin:/bin"),run,d,"/nonexistent"); os.rename(d+"/dolt.off",d+"/dolt"); assert ok and "inalcançável" in why, (sh,why)
+    ok,why=M.resolution_verdict(go(sh,"/usr/bin:/bin"),run,d,"/nonexistent"); assert not ok and "bd resolve" in why, (sh,why)'; ok $? "unit: measure_cmd — o comando do passo 1 rodado de verdade (bash, e zsh quando existe) dá uma saída que o veredito entende: atalho + dolt recusado ou ausente passam, PATH sem o atalho reprova"; }
   c identity && { py 'import re
 rx=re.compile(M.wrapper_config()["identity_pattern"])
 assert rx.fullmatch("remote-test-remote-mbp-1") and rx.fullmatch("remote-test-remote-mbp-123")
@@ -387,6 +458,9 @@ g_install() {
     [ -d "$SRV/gt-remote/bundle/run" ] && [ -z "$(ls "$SRV/gt-remote/bundle/run")" ]; ok $? "install: a pasta run/ do provider foi preservada na troca"
     [ -z "$(ls "$SRV/gt-remote" | grep -E 'bundle\.(new|old)')" ]; ok $? "install: não sobra bundle.new.* nem bundle.old.* em gt-remote"
     [ "$(sha "$SRV/gt-remote/shim-bin/remote-shim")" = "$(sha "$T/fake-remote-shim.py")" ] && [ "$(readlink "$SRV/gt-remote/shim-bin/bd")" = remote-shim ] && [ "$(readlink "$SRV/gt-remote/shim-bin/gc")" = remote-shim ] && [ "$(readlink "$SRV/gt-remote/shim-bin/gate-done")" = remote-shim ]; ok $? "install: cliente do atalho igual ao do repositório e links bd/gc/gate-done em shim-bin"
+    [ "$(readlink "$SRV/gt-remote/shim-bin/dolt")" = remote-shim ] && ( export PATH="$SRV/gt-remote/shim-bin:/usr/bin:/bin"; dolt --version > /dev/null 2>&1; [ $? = 77 ] ); ok $? "install: o cliente foi instalado com --refuse-dolt: shim-bin/dolt existe e o atalho o recusa (rc 77)"
+    sp="$SRV/gt-remote/shim-bin:/usr/bin:/bin"; z="$SRV/gt-remote/bundle/zdot"
+    python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1]+"/gt-remote/bundle/manifest.json")); assert d["session_path"]==sys.argv[2].split(":"), d.get("session_path")' "$SRV" "$sp" && has "$z/.zshenv" "export PATH='$sp'" && has "$z/.zprofile" "export PATH='$sp'" && has "$z/.zshrc" "export PATH='$sp'" && [ -f "$z/env.sh" ]; ok $? "install: o bundle leva o zdot (.zshenv, .zprofile, .zshrc e env.sh) com o PATH explícito da sessão, e o manifest registra session_path"
     python3 -I -c 'import json,sys,os; d=json.load(open(sys.argv[1]+"/gt-remote/shim-bin/remote-shim.json")); assert d=={"transport":"spool","spool_dir":sys.argv[1]+"/gt-remote/shim","timeout_s":330}, d; assert oct(os.stat(sys.argv[1]+"/gt-remote/shim").st_mode&0o777)=="0o700"' "$SRV"; ok $? "install: remote-shim.json é só a puxada (sem host nem chave) e o spool é 0700"
     python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["identity_pattern"]=="^remote-test-remote-mbp-[0-9]{1,3}$" and d["gate_done_bin"] is None and d["city"]==sys.argv[2], d' "$MINI/.gastown/remote-shim-mbp.json" "$CITY"; ok $? "install: a config do wrapper no mini só aceita a sessão de teste e não tem gate-done"
     [ "$(dsig "$SRV/.claude" "$SRV/.ssh")" = "$own" ] && [ ! -e "$SRV/.config" ]; ok $? "install: nada em ~/.claude, ~/.ssh nem ~/.config do MBP"
@@ -426,18 +500,24 @@ fail1() {  # fail1 CASO MODO "FAIL ..." DESCRIÇÃO [args] — o modo reprova S�
   c "$name" || return 0
   FAKE_MODE=$mode ep "$@"; [ $RC = 1 ] && has "$T/out" "$want" && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: $desc (rc=$RC)"
 }
+meas1() {  # meas1 CASO MODO DETALHE DESCRIÇÃO — a medição de dentro da sessão reprova (c) (e só ela), com o detalhe pedido na MESMA linha
+  local name=$1 mode=$2 want=$3 desc=$4
+  c "$name" || return 0
+  FAKE_MODE=$mode ep; [ $RC = 1 ] && grep -F "FAIL (c) na sessão (medido por ela)" "$T/out" | grep -qF -- "$want" && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: $desc (rc=$RC)"
+}
 g_e2e() {
   c ok && { FAKE_MODE=ok ep
     r=$(sed -n 's/.*MBP-PROOF PASSOU: \([0-9]*\) de \([0-9]*\) provas.*/\1 \2/p' "$T/out"); set -- $r
     [ $RC = 0 ] && [ -n "${1:-}" ] && [ "${1:-x}" = "${2:-y}" ] && [ "${1:-0}" -ge 20 ] && ! grep -q '^[0-9:]* FAIL' "$T/out"; ok $? "e2e: sessão completa → todas as provas passam (${1:-?} de ${2:-?}), nenhuma reprovada, saída 0 (rc=$RC)"
     for want in "PASS bundle instalado em gt-remote/bundle e conferido NO MBP" "PASS cliente do atalho instalado em shim-bin" "PASS atalho bd do MBP chega ao mini" "PASS clone sem dado" "PASS start pelo provider" \
-      'PASS (e) a sessão rodou `claude` com o --settings do bundle' "PASS (c) na sessão, \`bd\` e \`gc\` resolvem para o atalho" "PASS (c) o comentário da sessão está na bead, no mini" "PASS (d) commit no MBP, com a identidade da sessão" \
+      'PASS (e) a sessão rodou `claude` com o --settings do bundle' "PASS (c) na sessão (medido por ela): bd, gc e gate-done resolvem para o atalho, dolt é recusado ou inalcançável" "PASS (c) o comentário da sessão está na bead, no mini" "PASS (d) commit no MBP, com a identidade da sessão" \
       "PASS (d) clone continua sem dado depois do commit" "PASS (d) o branch chegou ao origin DIRETO do MBP" "PASS (d) o branch aparece no mini" "PASS (c) hooks gc do city" "PASS (a) peek mostra a tela" "PASS (a) nudge entregue" \
       "PASS (a) a sessão respondeu ao nudge" "PASS (b) o vigia (biblioteca de presença de verdade) está de pé" "PASS (b) pausa do Athos ligada" "PASS (b) com a pausa ligada o gate do provider recusa" \
       "PASS (b) o vigia rebaixou a árvore da sessão" "PASS (b) a sessão NÃO foi morta" "PASS (b) pausa desta rodada desligada" "PASS (b) sem a pausa o rebaixamento NÃO volta a subir" "PASS (a) sessão parada pelo provider" \
       "PASS (a) o stop deixa o MBP limpo" "PASS (d) varredura (antes de apagar a pasta de teste)" "PASS (a) pasta de teste, marca de confiança" "PASS (c)(d) varredura depois"; do
       has "$T/out" "$want"; ok $? "e2e: ${want#PASS }"
     done
+    grep -F "PASS (c) na sessão (medido por ela)" "$T/out" | grep -qF "dolt recusado pelo atalho (rc 77)"; ok $? "e2e: a medição de dentro da sessão mostra bd, gc e gate-done no atalho e o dolt recusado pelo atalho (rc 77)"
     run=$(sed -n 's/.*mbp-proof \(mbp-[0-9]*-[0-9]*\) ·.*/\1/p' "$T/out" | head -1)
     sha=$(git -C "$T/origin.git" rev-parse "refs/heads/worker/$run" 2>/dev/null); [ -n "$sha" ] && [ "$(git -C "$T/origin.git" diff --name-only "$(git -C "$T/origin.git" rev-parse HEAD)" "$sha")" = "mbp-proof/$run.txt" ]; ok $? "e2e: no origin só existe o branch worker/<rodada> com UM arquivo novo, mbp-proof/<rodada>.txt (rodada ${run:-?})"
     [ -z "$(git -C "$T/origin.git" for-each-ref refs/heads/evil)" ]; ok $? "e2e: nenhum outro branch no origin"
@@ -460,6 +540,17 @@ g_e2e() {
   fail1 nocomment nocomment "FAIL (c) o comentário da sessão está na bead" "sem comentário na bead → reprova"
   fail1 nogchooks nogchooks "FAIL (c) hooks gc do city" "transcrição SEM os hooks gc do city (o --settings do bundle não carregou) → reprova"
   fail1 gcfail gcfail "FAIL (c) hooks gc do city" "hook gc que sai ≠ 0 na sessão → reprova"
+  meas1 meas-userbd userbd "bd resolve para" "o bd do usuário à frente do atalho na sessão → (c) reprova nomeando o bd (o que o .zshrc dele faria sem o ZDOTDIR limpo)"
+  meas1 meas-fnbd fnbd "bd resolve para 'bd'" "uma função bd na sessão (snapshot do claude) → (c) reprova: command -v e type -a enxergam função"
+  meas1 meas-realdolt realdolt "dolt alcançável" "um dolt de verdade alcançável na sessão → (c) reprova (o MBP não ganha Dolt)"
+  meas1 meas-pathhome pathhome "PATH da ferramenta Bash" "~/.local/bin no PATH da ferramenta Bash (com o atalho ainda primeiro) → (c) reprova"
+  meas1 meas-pathfirst pathfirst "PATH da ferramenta Bash" "o atalho fora do começo do PATH → (c) reprova"
+  meas1 meas-none nomeasure "sem medição (a saída do passo 1 não foi lida)" "a sessão nunca roda o passo 1 → \"sem medição\", NÃO \"resolve para o atalho\" → (c) reprova"
+  meas1 meas-altered altered "sem medição (a saída do passo 1 não foi lida)" "o modelo altera o comando do passo 1 → a saída não vale (só o comando pedido, igual) → (c) reprova"
+  meas1 meas-cutout cutout "sem medição (a saída do passo 1 não foi lida)" "saída do passo 1 cortada (sem o marcador de fim) → (c) reprova"
+  meas1 meas-contentlist contentlist "sem medição (a saída do passo 1 não foi lida)" "resultado da ferramenta sem stdout e com conteúdo em blocos (não é texto) → (c) reprova em vez de adivinhar"
+  meas1 meas-readfail measurefail "não li a transcrição" "a leitura da transcrição no MBP falha → (c) reprova e diz que não leu (terceiro estado)"
+  c meas-contentonly && { FAKE_MODE=contentonly ep; [ $RC = 0 ] && has "$T/out" "PASS (c) na sessão (medido por ela)"; ok $? "e2e: resultado só com o texto em content (sem toolUseResult) também vale (rc=$RC)"; }
   fail1 badline badline "FAIL (c) hooks gc do city" "linha ilegível na transcrição → reprova (uma linha perdida pode ser o hook que falhou)"
   c gctimeout && { FAKE_MODE=gctimeout ep; [ $RC = 0 ] && has "$T/out" "PASS (c) hooks gc do city"; ok $? "e2e: hook gc cancelado pelo prazo do claude não derruba a prova (rc=$RC)"; }
   fail1 nonudge nonudge "FAIL (a) nudge entregue" "nudge que o provider não entrega → reprova"
@@ -492,8 +583,18 @@ g_e2e() {
   c flag && { FAKE_GATE=flag ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ]; ok $? "e2e: bandeira mbp-offload desligada → não começa (rc=$RC)"; }
   c sshdead && { FAKE_SSH_DEAD=1 ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "não consegui ler o estado do MBP"; ok $? "e2e: ssh fora → não começa, saída 3 (rc=$RC)"; }
   c shimdead && { FAKE_SHIM_DEAD=1 ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "NAO CONSEGUI começar: o atalho não chega ao mini"; ok $? "e2e: o atalho não chega ao mini → não começa, saída 3 (rc=$RC)"; }
-  c shadow && { e2e_fixture; mkdir -p "$SRV/.local/bin"; printf '#!/bin/sh\n' > "$SRV/.local/bin/bd"; chmod +x "$SRV/.local/bin/bd"
-    python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "esconderia o atalho"; ok $? "e2e: um bd REAL em ~/.local/bin esconderia o atalho nos hooks → não começa, saída 3 (rc=$RC)"; }
+  c shadow && { e2e_fixture; mkdir -p "$SRV/.local/bin"; printf '#!/bin/sh\n' > "$SRV/.local/bin/gc"; chmod +x "$SRV/.local/bin/gc"
+    python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "esconderia o atalho" && has "$T/out" "gc="; ok $? "e2e: um gc REAL em ~/.local/bin esconderia o atalho nos hooks (que só chamam gc) → não começa, saída 3 (rc=$RC)"; }
+  c userbd-start && { e2e_fixture; mkdir -p "$SRV/.local/bin" "$SRV/go/bin"; for t in bd dolt; do printf '#!/bin/sh\n' > "$SRV/.local/bin/$t"; chmod +x "$SRV/.local/bin/$t"; done; cp "$SRV/.local/bin/bd" "$SRV/go/bin/bd"
+    python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 0 ] && [ "$(calls start)" = 1 ] && ! has "$T/out" "esconderia o atalho" && has "$T/out" "PASS (c) na sessão (medido por ela)"; ok $? "e2e: o bd/dolt do usuário em ~/.local/bin e ~/go/bin NÃO impedem mais o início (a sessão tem PATH explícito e quem prova é a medição de dentro dela) (rc=$RC)"; }
+  c noclaude && { e2e_fixture; MBP_PROOF_CLAUDE="$SRV/fakebin/claude-que-nao-existe" python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "o claude do MBP não está em $SRV/fakebin/claude-que-nao-existe"; ok $? "e2e: o claude não está no caminho absoluto que a sessão usa → não começa, saída 3 (rc=$RC)"; }
+  c nozdot && { e2e_fixture; python3 -I -c 'import json,sys; p=sys.argv[1]+"/gt-remote/bundle/manifest.json"; d=json.load(open(p)); d.pop("session_path"); json.dump(d,open(p,"w"))' "$SRV"
+    python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; r1=$?; c1=$(calls start)
+    e2e_fixture; python3 -I -c 'import json,sys; p=sys.argv[1]+"/gt-remote/bundle/manifest.json"; d=json.load(open(p)); d["session_path"]=d["session_path"][::-1]; json.dump(d,open(p,"w"))' "$SRV"
+    python3 -I "$P" e2e --repo-url "$URL" > "$T/out2" 2> "$T/err"; r2=$?; c2=$(calls start)
+    e2e_fixture; echo "isto nao e json" > "$SRV/gt-remote/bundle/manifest.json"
+    python3 -I "$P" e2e --repo-url "$URL" > "$T/out3" 2> "$T/err"; r3=$?; c3=$(calls start)
+    [ $r1 = 3 ] && [ $r2 = 3 ] && [ $r3 = 3 ] && [ "$c1$c2$c3" = 000 ] && has "$T/out" "não leva o ambiente limpo da sessão" && has "$T/out2" "não leva o ambiente limpo da sessão" && has "$T/out3" "não leva o ambiente limpo da sessão"; ok $? "e2e: bundle sem session_path, com outra ordem de PATH ou com manifest ilegível → não começa (nunca \"igual ao esperado\"), saída 3 (rc=$r1/$r2/$r3)"; }
   c nopresence && { e2e_fixture; find "$SRV/gt-remote/bin/mbp-presence.sh" -delete; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sem a biblioteca de presença"; ok $? "e2e: sem a biblioteca de presença no MBP → não começa (rc=$RC)"; }
   c swappause && { FAKE_MODE=swappause ep; [ $RC = 1 ] && has "$T/out" "a pausa NÃO é desta rodada" && [ "$(cat "$SRV/gt-remote/PAUSE")" = "origem=athos desde=2026-10-18T10:00:00" ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: o Athos troca a pausa por uma dele depois da da prova → a prova NÃO a remove (nem no fim), reprova (b) e a pausa DELE fica como estava (rc=$RC)"; }
   c lostpause && { FAKE_MODE=lostpause ep; [ $RC = 1 ] && has "$T/out" "FAIL (b) pausa do Athos ligada" && [ ! -e "$SRV/gt-remote/PAUSE" ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: a resposta do \"ligar a pausa\" se perde DEPOIS de o arquivo ser criado → reprova (b), mas tenta o \"desligar\": nenhuma pausa da prova fica no MBP (rc=$RC)"; }
@@ -582,7 +683,7 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e ok "a sessão não é parada no fim" $'        if self.started:\n            try:' $'        if False:\n            try:'
   mutant e2e swappause "a pausa é removida sem conferir de quem é" 'self.rpy(PAUSE_PY, {"pause": PAUSE, "mark": f"origem=mbp-proof:{self.run}", "mode": "off"})' 'self.rpy(PAUSE_PY, {"pause": PAUSE, "mark": "origem=", "mode": "off"})'
   mutant e2e lostpause "resposta perdida do \"ligar a pausa\" vira \"não criei nada\"" 'self.paused_by_us = "_erro" in p or bool(p.get("ok"))' 'self.paused_by_us = bool(p.get("ok"))'
-  mutant e2e shadow "um bd real escondendo o atalho passa" '        if shadow:' '        if False:'
+  mutant e2e shadow "um gc real escondendo o atalho passa" '        if shadow:' '        if False:'
   mutant e2e badjson "~/.claude.json ilegível passa" '        if not s["claude_json"]["ok"]:' '        if False:'
   mutant e2e badclaudejson "~/.claude.json ilegível depois da limpeza passa por limpo" ' or not post["claude_json"]["ok"]' ''
   mutant e2e gitblobs,gitstatus "git que falha vira saída vazia (status limpo, 0 blobs)" 'return r.stdout.strip() if r.returncode == 0 else None' 'return r.stdout.strip()'
@@ -590,6 +691,29 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e githead "git rev-parse que falha deixa a prova começar" 'ok=head.returncode == 0 and len(head.stdout.strip()) == 40,' 'ok=True,'
   mutant e2e psnice "nice ilegível da sessão vira 0" 'rows.append(dict(row, ni=int(row["ni"]), pri=int(row["pri"])))' 'rows.append(dict(row, ni=0, pri=0))'
   mutant e2e snapwalk "os.walk engole o erro de listagem" 'os.walk(root, followlinks=False, onerror=lambda e: sys.exit("não consegui listar " + str(e.filename)))' 'os.walk(root, followlinks=False)'
+  mutant unit hostblock "o bloco do host perde o session_env" ' "session_env": {"path": SESSION_PATH, "claude": CLAUDE_BIN},' ''
+  mutant unit startreq "o prompt perde o passo 1 de medição" '1. (a measurement: copy this command exactly) {measure}' '1. true'
+  mutant unit verdict-bad "veredito aceita medição sem linhas" 'if set(cmdv) != want or rc is None or pathv is None:' 'if False:'
+  mutant unit verdict-bad "veredito aceita saída que não é texto" 'if not isinstance(out, str):' 'if False:'
+  mutant unit verdict-bad "veredito não exige o marcador de fim" 'lines.index(f"MEASEND-{run}")' 'len(lines)'
+  mutant unit verdict-tool "veredito não confere bd, gc e gate-done" 'if cmdv[t] != f"{shimbin}/{t}" or typea.get(t) != f"{t} is {shimbin}/{t}"]' 'if False]'
+  mutant unit verdict-tool "veredito só olha o command -v (função/alias passam)" ' or typea.get(t) != f"{t} is {shimbin}/{t}"]' ']'
+  mutant unit verdict-tool "veredito olha a última linha do type -a em vez da primeira" 'typea.setdefault(w[1], l.split(None, 1)[1].strip())' 'typea[w[1]] = l.split(None, 1)[1].strip()'
+  mutant unit verdict-dolt "veredito aceita dolt alcançável" 'if not (refused or (cmdv["dolt"] == "" and rc == 127)):' 'if False:'
+  mutant unit verdict-dolt "veredito aceita link do dolt que não recusa" '== f"dolt is {shimbin}/dolt" and rc == 77' '== f"dolt is {shimbin}/dolt"'
+  mutant unit verdict-path "veredito não olha onde o atalho está no PATH" 'if dirs[0] != shimbin or {home + "/.local/bin", home + "/go/bin"} & set(dirs):' 'if {home + "/.local/bin", home + "/go/bin"} & set(dirs):'
+  mutant unit verdict-path "veredito aceita ~/.local/bin e ~/go/bin no PATH" 'if dirs[0] != shimbin or {home + "/.local/bin", home + "/go/bin"} & set(dirs):' 'if dirs[0] != shimbin:'
+  mutant e2e userbd-start "um bd do usuário volta a barrar o início" 'if n == "gc" and p and' 'if p and'
+  mutant e2e noclaude "o claude fora do caminho absoluto passa" 'if not s["claude_ok"]:' 'if False:'
+  mutant e2e nozdot "o bundle sem o ambiente limpo passa" 'if s["session_path"] != SESSION_PATH:' 'if False:'
+  mutant e2e meas-userbd,meas-fnbd,meas-realdolt,meas-pathhome,meas-pathfirst,meas-none "a medição de dentro da sessão não decide" 'ok, why = resolution_verdict(out, self.run, SHIMBIN, MHOME)' 'ok, why = True, "x"'
+  mutant e2e meas-altered "o comando alterado pelo modelo vale" 'if x["cmd"].strip() == want and ' 'if '
+  mutant e2e meas-cutout "a saída cortada vale" ' and f"MEASEND-{self.run}" in x["out"]]' ']'
+  mutant e2e meas-contentlist "resultado que não é texto vale" 'isinstance(x["out"], str) and ' ''
+  mutant e2e meas-none "sem medição vira texto vazio" 'out = calls[-1]["out"] if calls else None' 'out = calls[-1]["out"] if calls else ""'
+  mutant e2e ok "a leitura da transcrição aceita linhas que não são da conversa" 'if o.get("type") in ("assistant", "user") else None' 'if True else None'
+  mutant install inst-ok "o install esquece o --session-path" '"--session-path", ":".join(SESSION_PATH), ' ''
+  mutant install inst-ok "o install esquece o --refuse-dolt" ' --refuse-dolt --apply' ' --apply'
   echo "== final: $((n-fails))/$n ok, $skipped sem rodar =="
 }
 [ "$fails" = 0 ]

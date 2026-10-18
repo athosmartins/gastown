@@ -31,11 +31,13 @@ CONFIG (JSON em $REMOTE_SHIM_CONF, senão `remote-shim.json` ao lado do script i
   Por puxada: {"transport": "spool", "spool_dir": "/Users/athos/gt-remote/shim", "timeout_s": 330}  (timeout_s 5-3600, padrão 330, acima dos 300 s do wrapper; stdin_eof_s 1-600, padrão 60)
 
 INSTALAR (nada é gravado sem --apply):
-  remote-shim.py install --bin-dir /home/runner/.local/bin [--apply]   # copia este arquivo para <bin-dir>/remote-shim e liga bd, gc, gate-done a ele
+  remote-shim.py install --bin-dir /home/runner/.local/bin [--apply] [--refuse-dolt]   # copia este arquivo para <bin-dir>/remote-shim e liga bd, gc, gate-done a ele
   Não sobrescreve um `bd`/`gc`/`gate-done` que já exista e não seja o nosso (exit 3).
+  `--refuse-dolt` (o MBP, ga-w7qwl1.1.5) liga também `dolt` ao mesmo arquivo: quem o chama leva 77 na hora, sem config, sem spool, sem ssh. Serve para a sessão
+  não achar o `dolt` do usuário mais atrás no PATH; o MBP não ganha credencial de bd/Dolt. Sem a opção nada muda (o servidor não leva esse atalho).
 
 CÓDIGOS: o do comando remoto (o ssh passa o código dele adiante) · 255 ssh não conseguiu falar com o mini · 78 config ausente ou ruim (ou pasta da conexão que não dá para criar) ·
-  77 pedido recusado pelo wrapper no mini · 2 uso · 3 install recusado · 127 não achei o ssh · só na puxada: 75 nada rodou (o mini não puxa, ou ninguém pegou o pedido
+  77 pedido recusado (pelo wrapper no mini, ou aqui mesmo: o `dolt` ligado por --refuse-dolt) · 2 uso · 3 install recusado · 127 não achei o ssh · só na puxada: 75 nada rodou (o mini não puxa, ou ninguém pegou o pedido
   a tempo) · 125 o mini pegou o pedido e não devolveu a resposta (pode ter rodado).
 """
 from __future__ import annotations
@@ -54,6 +56,7 @@ from pathlib import Path
 PROTO = "rs1"
 MAX_CMD = 200_000
 TOOLS = ("bd", "gc", "gate-done")
+REFUSED_TOOLS = ("dolt",)  # atalhos que só RECUSAM (install --refuse-dolt): o nome ocupa o PATH do atalho para a sessão não achar o do usuário
 # O mesmo conjunto de nomes que o wrapper aceita (ENV_VAL): o selftest compara os dois. GC_SESSION_ID fica de fora de propósito (o wrapper o recusa).
 FORWARD_ENV = ("GC_AGENT", "GC_ALIAS", "GC_HOOK_EVENT_NAME", "GC_MANAGED_SESSION_HOOK", "GC_SESSION_NAME",
                "GC_SESSION_ORIGIN", "GC_TEMPLATE")
@@ -248,11 +251,12 @@ def request(tool: str) -> None:
         die(f"não consegui executar o ssh: {e.strerror}", 127)
 
 
-def install(bin_dir: str, apply: bool) -> int:
+def install(bin_dir: str, apply: bool, refuse: bool = False) -> int:
     d, me = Path(bin_dir), Path(os.path.realpath(__file__))
     dest = d / "remote-shim"
-    plan = [f"copiar {me} -> {dest}"] + [f"ligar {d / t} -> remote-shim" for t in TOOLS]
-    for t in TOOLS:
+    links = TOOLS + (REFUSED_TOOLS if refuse else ())
+    plan = [f"copiar {me} -> {dest}"] + [f"ligar {d / t} -> remote-shim" for t in links]
+    for t in links:
         p = d / t
         if (p.exists() or p.is_symlink()) and not (p.is_symlink() and os.readlink(p) == "remote-shim"):
             print(f"remote-shim install: RECUSADO: {p} já existe e não é o nosso atalho; não sobrescrevo", file=sys.stderr)
@@ -264,7 +268,7 @@ def install(bin_dir: str, apply: bool) -> int:
     d.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(me, dest)
     dest.chmod(0o755)
-    for t in TOOLS:
+    for t in links:
         if not (d / t).is_symlink():
             os.symlink("remote-shim", d / t)
     return 0
@@ -274,17 +278,20 @@ def main(argv: list[str]) -> int:
     name = os.path.basename(sys.argv[0])
     if name in TOOLS:
         request(name)  # não volta: ou execvp, ou sai
+    if name in REFUSED_TOOLS:
+        die(f"`{name}` não existe nesta sessão: o MBP não ganha credencial de bd/Dolt (use `bd`, que passa pelo atalho)", 77)
     ap = argparse.ArgumentParser(prog="remote-shim.py", description=__doc__.split("Contents")[0].strip())
     sub = ap.add_subparsers(dest="cmd", required=True)
     i = sub.add_parser("install")
     i.add_argument("--bin-dir", required=True)
     i.add_argument("--apply", action="store_true")
+    i.add_argument("--refuse-dolt", action="store_true")
     sub.add_parser("forward-env")
     a = ap.parse_args(argv)
     if a.cmd == "forward-env":
         print("\n".join(FORWARD_ENV))
         return 0
-    return install(a.bin_dir, a.apply)
+    return install(a.bin_dir, a.apply, a.refuse_dolt)
 
 
 if __name__ == "__main__":

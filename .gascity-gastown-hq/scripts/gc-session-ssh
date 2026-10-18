@@ -73,7 +73,11 @@ CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta 
   timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima), worktree_prepare (true/false; padrão true, e false num host
   com presence_gate: preparo do worktree no start, ver acima; texto no lugar de true/false é erro de configuração), worktree_rigs ({"dog": "gascity"}: papel → rig dos worktrees que o provider cria e recolhe; ausente = nenhum). Só para o notebook (MBP): path_extra [] (dirs
   absolutos à frente do PATH do ssh sem login: /opt/homebrew/bin), presence_gate (true), gate_cmd ([lista]), presence_lib (padrão
-  <remote_home>/gt-remote/bin/mbp-presence.sh), watch_s (5), sleeps (true). Estado no mini:
+  <remote_home>/gt-remote/bin/mbp-presence.sh), watch_s (5), sleeps (true), session_env ({"path": [pastas], "claude": "/abs/claude"}; OBRIGATÓRIO em
+  host que dorme, ga-w7qwl1.1.5: o claude da sessão roda com ZDOTDIR=<remote_root>/zdot e CLAUDE_ENV_FILE=<remote_root>/zdot/env.sh do bundle
+  (remote-bundle-build.py --session-path, a MESMA lista) e com PATH = só essas pastas — o shell da ferramenta Bash NÃO acha o bd/dolt do usuário;
+  zdot ausente ou com PATH diferente do da config → a sessão não abre (exit 126, motivo no .exit); `claude` do comando vira o caminho absoluto).
+  Estado no mini:
   $GC_EXEC_STATE_DIR ou <cidade>/.gc/runtime/session-ssh, sempre em <estado>/<host>/. Não há padrão para o cap: sem ele não abre sessão.
 
 CÓDIGOS  0 ok · 1 erro (mensagem em stderr; "already exists" no start vira ErrSessionExists no engine) · 2 operação não suportada
@@ -279,6 +283,7 @@ class Cfg:
         self.gate, self.sleeps = h.get("presence_gate", False), h.get("sleeps", False)
         if self.sleeps and not self.gate:  # notebook sem a regra de presença abriria sessão com o Athos no teclado
             raise Fail(f"host {self.host}: 'sleeps' (notebook) exige presence_gate true")
+        self.spath, self.claude_bin, self.zdot = self.session_env(h)
         self.plib = self.need(h, "presence_lib", PATH_RE, self.home + "/gt-remote/bin/mbp-presence.sh")
         self.gate_cmd = h.get("gate_cmd") or [os.path.join(self.city_guess, "scripts", "mbp-run.sh"), "--check"]
         if not isinstance(self.gate_cmd, list) or not all(isinstance(x, str) and x for x in self.gate_cmd):
@@ -299,6 +304,20 @@ class Cfg:
         self.wt_rigs = wr
         base = os.environ.get("GC_EXEC_STATE_DIR") or os.path.join(self.city_guess, ".gc", "runtime", "session-ssh")
         self.state = os.path.join(base, re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.host)))
+
+    def session_env(self, h: dict) -> tuple:
+        """(PATH, claude, zdot) da sessão ou ("", "", ""). Ausente só vale para host que NÃO dorme; mal formado nunca vira "ausente" (recusa a config)."""
+        v = h.get("session_env")
+        if v is None:  # vazio → sem ambiente de sessão: o notebook não pode abrir assim (o PATH do usuário ficaria à frente do atalho)
+            if self.sleeps:
+                raise Fail(f"host {self.host}: 'session_env' é obrigatório num host que dorme (notebook): sem ele a sessão enxerga o bd/dolt do usuário")
+            return "", "", ""
+        if not isinstance(v, dict) or set(v) != {"path", "claude"} or not isinstance(v["path"], list) or not v["path"]:  # falhou → recusa
+            raise Fail(f"host {self.host}: 'session_env' tem que ser {{\"path\": [pastas], \"claude\": \"/caminho\"}} ({v!r})")
+        dirs = [self.need({"session_env": d}, "session_env", PATH_RE) for d in v["path"]]  # o nome da chave vai na mensagem de recusa
+        if len(set(dirs)) != len(dirs) or any(c.startswith(".") for d in dirs for c in d.split("/")):  # ".local/bin", ".." e repetida não são PATH explícito
+            raise Fail(f"host {self.host}: 'session_env.path' repetido ou com pasta oculta/'..' ({dirs})")
+        return ":".join(dirs), self.need({"session_env.claude": v["claude"]}, "session_env.claude", PATH_RE), self.root + "/zdot"
 
     def host_of(self, session: str) -> str:
         m = re.search(r"-remote-([A-Za-z0-9_]+)(-|$)", session or "")
@@ -453,6 +472,8 @@ def plan_start(cfg: Cfg, name: str, req: dict) -> dict:
     m = Mapper(cfg, env_in.get("GC_CITY") or os.environ.get("GC_CITY") or cfg.city_guess)
     workdir = m.map(req.get("work_dir") or "") or cfg.home
     command = re.sub("^" + re.escape(cfg.root + "/city") + POOL_WRAPPER + r"(?=\s|$)", "claude", m.map(req.get("command") or ""))
+    if cfg.claude_bin:  # o PATH da sessão é explícito e não tem a pasta do claude do usuário: o comando leva o caminho absoluto
+        command = re.sub(r"^claude(?=\s|$)", lambda _m: cfg.claude_bin, command)
     if not command.strip():
         raise Fail("start sem command")
     env, dropped = {}, []
@@ -495,10 +516,17 @@ def launcher(cfg: Cfg, name: str, p: dict) -> str:
         first = ""
     out = ["#!/bin/sh", 'rm -f -- "$0"', f"cd {q(p['work_dir'])} || exit 1"]
     out += [f"unset {k}" if v == "" else f"export {k}={q(v)}" for k, v in p["env"].items()]
+    if cfg.spath:  # o zdot do bundle tem que ser o desta config (mesmo PATH): senão o claude abriria com o shell do usuário, em silêncio
+        want = "export PATH='" + cfg.spath + "'"  # a linha que o remote-bundle-build.py --session-path grava nos 4 arquivos
+        out.append(f'for f in .zshenv .zprofile .zshrc env.sh; do grep -qxF {q(want)} {q(cfg.zdot)}/"$f" 2>/dev/null || '
+                   f'{{ echo "zdot ausente ou com PATH diferente da config: "{q(cfg.zdot)}"/$f" >{q(exitf)}; exit 126; }}; done')
     if first and "=" not in first and first not in ("env", "exec"):
-        out.append(f'command -v {q(first)} >/dev/null 2>&1 || {{ echo "comando não encontrado: "{q(first)} >{q(exitf)}; exit 127; }}')
-    if cfg.gate:
+        look = f"command -v {q(first)} >/dev/null 2>&1"
+        out.append(f'{f"(PATH={q(cfg.spath)}; {look})" if cfg.spath else look} || {{ echo "comando não encontrado: "{q(first)} >{q(exitf)}; exit 127; }}')
+    if cfg.gate:  # o vigia nasce ANTES do PATH explícito: usa o do host (ps/renice/taskpolicy), não o da sessão
         out.append(f"bash -c {q(WATCH)} _ {q(cfg.plib)} $$ {cfg.watch_s} </dev/null >/dev/null 2>&1 &")
+    if cfg.spath:
+        out += [f"export ZDOTDIR={q(cfg.zdot)}", f"export CLAUDE_ENV_FILE={q(cfg.zdot + '/env.sh')}", f"export PATH={q(cfg.spath)}"]
     run_cmd = f"{'nice -n 10 ' if cfg.gate else ''}sh -c {q(p['command'])}"  # notebook do Athos: começa em nice 10 (mbp-run.sh, modo livre)
     return "\n".join(out + [run_cmd, "rc=$?", f'[ "$rc" -eq 0 ] || echo "saiu com $rc" >{q(exitf)}', 'exit "$rc"']) + "\n"
 
@@ -647,6 +675,7 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
         print(json.dumps(dict(p, **wtd, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, launcher=launcher(cfg, name, p).split("\n"),
                               prepare=({"git_user": name, "git_email": f"{name}@gastown.invalid", "trust_file": f"{cfg.home}/.claude.json", "work_dir": p["work_dir"]} if cfg.prepare else None),
                               gate=cfg.gate_cmd if cfg.gate else None, path_extra=cfg.path_extra,
+                              session_env={"path": cfg.spath, "claude": cfg.claude_bin, "zdot": cfg.zdot} if cfg.spath else None,
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0

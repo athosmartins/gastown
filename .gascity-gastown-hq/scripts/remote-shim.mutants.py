@@ -124,6 +124,9 @@ MUTANTS = [
     ("puxador-serve-flock-erro-vira-ja-roda", "u", "        except BlockingIOError:\n            print(", "        except OSError:\n            print(", r"flock que FALHA"),
     ("puxador-put-ok-zero-e-entrega", "u", 'pout.split() == [b"ok", b"1"]', 'pout.startswith(b"ok")', r"flock que FALHA"),
     ("agente-open-pedido-crash", "u", "            except (OSError, ValueError) as e:\n                write_resp(rid, 78,", "            except ValueError as e:\n                write_resp(rid, 78,", r"leitura do spool que FALHA"),
+    ("dolt-nao-recusa", "s", '    if name in REFUSED_TOOLS:\n        die(', '    if False:\n        die(', r"dolt pelo shim"),
+    ("dolt-ligado-sem-pedir", "s", "links = TOOLS + (REFUSED_TOOLS if refuse else ())", "links = TOOLS + REFUSED_TOOLS", r"sem --refuse-dolt"),
+    ("dolt-vira-pedido", "s", '    if name in REFUSED_TOOLS:\n        die(', '    if name in REFUSED_TOOLS:\n        request(name)\n    if False:\n        die(', r"dolt pelo shim"),
     ("known-hosts-opcional", "s", 'need(os.path.isfile(c["identity_file"]) and os.path.isfile(c["known_hosts_file"]))', "need(True)", r"config do shim ruim|known_hosts_file ausente"),
 ]
 
