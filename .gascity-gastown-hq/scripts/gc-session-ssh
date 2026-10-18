@@ -28,9 +28,13 @@ O QUE FAZ
   (1) a identidade git POR WORKTREE (`git config --worktree user.name <sessão>` e `user.email <sessão>@gastown.invalid`; num espelho BARE liga extensions.worktreeConfig e move o
   core.bare para o config.worktree, senão o commit dos worktrees quebra; lê de volta e confere que a identidade que o git LÊ é a da sessão) e (2) a confiança da pasta em
   {remote_home}/.claude.json (hasTrustDialogAccepted + hasCompletedProjectOnboarding do work_dir, troca atômica, modo mantido, lido de volta; arquivo ausente ou ilegível = nada é gravado).
-  A pasta tem que EXISTIR e ser um worktree git (o start não a cria: quem cria é o wt-add). Qualquer falha = exit 13 do script, start falha dizendo o motivo, nada abre e nenhum lançador
+  A pasta tem que EXISTIR e ser um worktree git (o start não a cria: quem cria é o wt-add — chamado pelo PRÓPRIO provider nos papéis de `worktree_rigs`, parágrafo seguinte). Qualquer falha = exit 13 do script, start falha dizendo o motivo, nada abre e nenhum lançador
   fica — a sessão nunca abre "meio pronta". Liga por padrão; o notebook do Athos (presence_gate) tem a identidade e a confiança DELE e fica de fora (padrão desligado).
-  Falha de ssh = erro visível (stderr, exit 1, linha em <estado>/session-ssh.log) e nada pela metade; o mini não é tocado.
+  WORKTREE DO PROVIDER (ga-2hd02v.1.7, decisão do Mayor 18/10): sessão `<papel>-remote-…` com o papel em `worktree_rigs` (papel → rig) abre num worktree que o PRÓPRIO start cria, `<remote_home>/gt-remote/git/<rig>/wt/<sessão>`
+  (o work_dir do template é ignorado): depois do teto e da existência roda o `hetzner-remote-git.sh wt-add` e SÓ ENTÃO o guarda de clone (que olha o checkout) e o preparo; start que falha depois do wt-add recolhe o que criou.
+  O stop derruba a sessão e recolhe o worktree (wt-rm) SÓ se estiver limpo e com todo commit já no origin/main do espelho ou na ref da sessão; qualquer dúvida mantém, e o resultado (removed | kept <motivo> | none)
+  vai para o evento `stopped` e o log — nunca para o rc do stop. Sem `worktree_rigs` nada disto existe. O nome da sessão vira o do worktree e do branch worker/<nome> (minúsculas). Nomes que o ENGINE gera
+  (`<modelo>-<cauda da bead>`, `<modelo>-adhoc-<10>`) não são pedido de host. Falha de ssh = erro visível (stderr, exit 1, linha em <estado>/session-ssh.log) e nada pela metade; o mini não é tocado.
   "Não sei" nunca vira resposta: se o ssh responde mas o tmux do host não consegue olhar (ex.: socket sem permissão), as operações sobre
   sessões (todas, menos attach, que entrega o terminal ao tmux do host) saem com erro e o motivo — nunca `false`, lista vazia ou "há vaga". Sessão que não existe (tmux respondeu) segue o contrato do exec: stop,
   interrupt, nudge, send-keys, clear-scrollback e get-last-activity saem 0 sem fazer nada; `stop` só sai 0 se a sessão sumiu.
@@ -66,14 +70,14 @@ CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta 
   obrigatórios: ssh (alias/destino), cap (teto de sessões deste host, contado SÓ no socket do provider, separado do teto do mini),
   remote_root (= --remote-root do remote-bundle-build.py), remote_home. opcionais: socket (gc-remote), connect_timeout (10),
   timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima), worktree_prepare (true/false; padrão true, e false num host
-  com presence_gate: preparo do worktree no start, ver acima; texto no lugar de true/false é erro de configuração). Só para o notebook (MBP): path_extra [] (dirs
+  com presence_gate: preparo do worktree no start, ver acima; texto no lugar de true/false é erro de configuração), worktree_rigs ({"dog": "gascity"}: papel → rig dos worktrees que o provider cria e recolhe; ausente = nenhum). Só para o notebook (MBP): path_extra [] (dirs
   absolutos à frente do PATH do ssh sem login: /opt/homebrew/bin), presence_gate (true), gate_cmd ([lista]), presence_lib (padrão
   <remote_home>/gt-remote/bin/mbp-presence.sh), watch_s (5), sleeps (true). Estado no mini:
   $GC_EXEC_STATE_DIR ou <cidade>/.gc/runtime/session-ssh, sempre em <estado>/<host>/. Não há padrão para o cap: sem ele não abre sessão.
 
 CÓDIGOS  0 ok · 1 erro (mensagem em stderr; "already exists" no start vira ErrSessionExists no engine) · 2 operação não suportada
   (dentro do script do host, que o provider traduz em exit 1 com a mensagem: 10 teto, 11 já existe, 12 recusa de política no host: sessão real sem guarda de clone verificado, ou host de presença sem a biblioteca,
-  13 o preparo do worktree falhou: pasta que não é worktree git, identidade git ou confiança da pasta que não foi gravada)
+  13 o worktree da sessão não ficou pronto: wt-add que falhou, pasta que não é worktree git, identidade git ou confiança da pasta que não foi gravada)
 """
 from __future__ import annotations
 
@@ -151,6 +155,42 @@ except Exception as e:
     print(f"{p}: {type(e).__name__}: {e}", file=sys.stderr)
     sys.exit(1)
 PY
+"""
+# Worktree DA SESSÃO, criado e recolhido pelo provider (ga-2hd02v.1.7, decisão do Mayor 18/10): para o papel que a config mapeia em `worktree_rigs`, o start roda o `wt-add` do
+# hetzner-remote-git.sh e o stop o `wt-rm`. Os dois formatos abaixo são OS DO SCRIPT (RE_RIG, RE_BEAD); o selftest confere o texto dele.
+RIG_RE = re.compile(r"[a-z][a-z0-9_-]{0,40}")
+WT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,60}")  # o nome da sessão vira o nome do worktree e o do branch worker/<nome>
+ROLE_RE = re.compile(r"[a-z][a-z0-9-]*")
+WT_START_FLOOR = 150  # o wt-add puxa o espelho antes de criar o worktree: os 60 s padrão do start não bastam (o engine espera 180 s, [session] startup_timeout)
+# Recolhe o worktree da sessão SÓ se nada se perde (limpo, e todo commit já está no main do origin ou na ref da sessão no espelho). Imprime `WT removed`, `WT kept <motivo>` ou `WT none`
+# e NUNCA devolve erro: o stop não falha por causa dele, e o start que falhou depois do wt-add o usa no EXIT. Dúvida (git ilegível, ref ausente) = MANTÉM.
+# Os nomes de variável levam o prefixo w para não pisar nas do PRELUDE (o sh não tem escopo de função). @WT@ pasta, @REPO@ repo.git, @BRREF@ refs/heads/worker/<n>, @BRNAME@ worker/<n>.
+WTCLEAN_SH = r"""wtclean() {
+  [ -e @WT@ ] || { echo "WT none"; return 0; }
+  # vazio → nada a perder; falhou (o git não lê o worktree) → MANTÉM: "não consegui saber" nunca vira "limpo"
+  wst=$(git -C @WT@ status --porcelain 2>&1) || { echo "WT kept o git não leu o worktree"; return 0; }
+  [ -z "$wst" ] || { echo "WT kept há alteração não commitada"; return 0; }
+  # HEAD ilegível → MANTÉM; branch da sessão ausente (rc 1) → só o HEAD conta; ilegível (rc > 1) → MANTÉM
+  wh=$(git -C @WT@ rev-parse HEAD 2>/dev/null) || { echo "WT kept não li o HEAD"; return 0; }
+  wb=$(git -C @REPO@ rev-parse -q --verify @BRREF@ 2>/dev/null); wrc=$?
+  [ "$wrc" -le 1 ] || { echo "WT kept não li o branch da sessão"; return 0; }
+  for wc in "$wh" "$wb"; do
+    [ -n "$wc" ] || continue
+    # no main do origin (0) = publicado; fora dele (1) → só se o espelho tem o MESMO commit na ref da sessão; qualquer outro código (ref ausente, repositório ilegível) → MANTÉM
+    git -C @REPO@ merge-base --is-ancestor "$wc" refs/remotes/origin/main 2>/dev/null; wr=$?
+    if [ "$wr" -ne 0 ]; then
+      [ "$wr" -eq 1 ] || { echo "WT kept não consegui conferir a publicação"; return 0; }
+      wpub=0
+      for wref in refs/remotes/origin/@BRNAME@ refs/gt/published/@BRNAME@; do
+        wo=$(git -C @REPO@ rev-parse -q --verify "$wref" 2>/dev/null) && [ "$wo" = "$wc" ] && wpub=1
+      done
+      [ "$wpub" -eq 1 ] || { echo "WT kept commit que o origin não tem"; return 0; }
+    fi
+  done
+  wo=$(GT_REMOTE_GIT=@GR@ @BIN@ wt-rm @RIG@ @NAME@ 2>&1) || { echo "WT kept wt-rm falhou: $(printf %s "$wo" | tail -n 1)"; return 0; }
+  [ -z "$wb" ] || git -C @REPO@ update-ref -d @BRREF@ "$wb" 2>/dev/null
+  echo "WT removed"
+}
 """
 # o ssh leva `sh -c '<RUNNER>'` (uma string, qualquer shell de login a entende) e o script vai pela entrada padrão: não há limite de
 # argv (o prompt tem dezenas de KB) e o script lê a entrada inteira ANTES de rodar, então comando nenhum dele a come.
@@ -237,14 +277,23 @@ class Cfg:
         if "worktree_prepare" in h and not isinstance(h["worktree_prepare"], bool):
             raise Fail(f"host {self.host}: 'worktree_prepare' tem que ser true ou false ({h['worktree_prepare']!r})")
         self.prepare = h.get("worktree_prepare", not self.gate)
+        # papel → rig dos worktrees que o PROVIDER cria no start e recolhe no stop (ga-2hd02v.1.7): ausente → {} e nenhuma sessão ganha worktree (tudo como sempre foi); forma errada → recusa, nunca "ausente"
+        wr = h.get("worktree_rigs", {})
+        if not isinstance(wr, dict) or not all(isinstance(k, str) and ROLE_RE.fullmatch(k) and isinstance(v, str) and RIG_RE.fullmatch(v) for k, v in wr.items()):
+            raise Fail(f"host {self.host}: 'worktree_rigs' tem que ser um objeto papel → rig, ex.: {{'dog': 'gascity'}} (papel [a-z][a-z0-9-]*, rig no formato do hetzner-remote-git.sh) ({wr!r})")
+        self.wt_rigs = wr
         base = os.environ.get("GC_EXEC_STATE_DIR") or os.path.join(self.city_guess, ".gc", "runtime", "session-ssh")
         self.state = os.path.join(base, re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.host)))
 
     def host_of(self, session: str) -> str:
-        m = re.search(r"-remote-([A-Za-z0-9_]+)", session or "")
+        m = re.search(r"-remote-([A-Za-z0-9_]+)(-|$)", session or "")
         if m and m.group(1).isdigit():  # <papel>-remote-<n>: o número é o índice do pool, não um host → $GC_SSH_HOST/default_host
             return ""
         if m and m.group(1) not in self.names:
+            # O engine NOMEIA a sessão de pool <modelo>-<cauda da bead> (dog-remote-gapxi4ls) ou <modelo>-adhoc-<10> (names.go: ReadableAutoSessionName, GenerateAdhocExplicitName):
+            # a cauda no FIM do nome, ou `adhoc`, não pede host. Pedido de host é o documentado, <papel>-remote-<host>-<n>, e host fora da config continua recusando.
+            if m.group(2) == "" or m.group(1) == "adhoc":
+                return ""
             raise Fail(f"sessão {session}: o nome pede o host {m.group(1)!r}, que não está na config ({', '.join(self.names) or 'sem hosts'})")
         return m.group(1) if m else ""
 
@@ -516,6 +565,33 @@ def prepare_script(cfg: Cfg) -> str:
     return PREPARE_SH.replace("@TRUSTFILE@", q(f"{cfg.home}/.claude.json")).replace("@EXPREP@", str(EX_PREP))
 
 
+def managed_worktree(cfg: Cfg, name: str) -> dict:
+    """{} = a sessão NÃO ganha worktree do provider (sem `-remote-` no nome, ou papel fora de `worktree_rigs`: tudo como sempre foi); senão onde ele fica e o que o start e o stop precisam."""
+    m = re.match(r"(.+?)-remote-", name)
+    rig = cfg.wt_rigs.get(m.group(1)) if m else None  # vazio (sem papel, papel sem mapa) → {}; config mal formada já recusou no Cfg
+    if not rig:
+        return {}
+    if not WT_NAME_RE.fullmatch(name):
+        raise Fail(f"sessão {name!r}: o nome vira o do worktree e do branch worker/<nome> e tem que casar [a-z0-9][a-z0-9._-]{{0,60}} (minúsculas) — o papel {m.group(1)!r} tem worktree do provider")
+    gr = f"{cfg.home}/gt-remote/git"  # o padrão do hetzner-remote-git.sh (GT_REMOTE_GIT), passado explícito nas chamadas
+    return {"rig": rig, "git": gr, "path": f"{gr}/{rig}/wt/{name}", "repo": f"{gr}/{rig}/repo.git", "branch": f"worker/{name}",
+            "bin": f"{cfg.home}/gt-remote/bin/hetzner-remote-git.sh"}
+
+
+def wtclean_sh(wt: dict, name: str) -> str:
+    """A função `wtclean` do host (WTCLEAN_SH) com os valores desta sessão."""
+    return (WTCLEAN_SH.replace("@WT@", q(wt["path"])).replace("@REPO@", q(wt["repo"])).replace("@BRREF@", q("refs/heads/" + wt["branch"])).replace("@BRNAME@", q(wt["branch"]))
+            .replace("@GR@", q(wt["git"])).replace("@BIN@", q(wt["bin"])).replace("@RIG@", q(wt["rig"])).replace("@NAME@", q(name)))
+
+
+def wtadd_sh(wt: dict, name: str) -> str:
+    """O wt-add NO MESMO script do start, depois do teto e da existência e ANTES do guarda de clone (que olha o checkout: com a pasta ainda ausente ele aprovaria sem ver o disableAllHooks que vem no repositório).
+    Se o start falhar daqui em diante, o EXIT recolhe o worktree que ele criou (wtclean mantém o que tiver trabalho)."""
+    return (wtclean_sh(wt, name)
+            + f"GT_REMOTE_GIT={q(wt['git'])} {q(wt['bin'])} wt-add {q(wt['rig'])} {q(name)} || {{ echo \"worktree da sessão {name} recusado: o wt-add de {wt['rig']} falhou (mensagem acima)\" >&2; exit {EX_PREP}; }}\n"
+            + "trap '[ \"$?\" -eq 0 ] || wtclean >&2' EXIT\n")
+
+
 def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     try:
         req = json.loads(sys.stdin.read() or "{}")
@@ -524,6 +600,10 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     if not isinstance(req, dict):
         raise Fail("start: a entrada tem que ser um objeto JSON")
     p = plan_start(cfg, name, req)
+    wt = managed_worktree(cfg, name)
+    if wt:
+        p["work_dir"] = wt["path"]  # a pasta do template não existe no host e não é o worktree: a sessão abre no que o wt-add cria
+    start_timeout = max(cfg.start_timeout, WT_START_FLOOR) if wt else cfg.start_timeout  # o wt-add puxa o espelho antes de criar: sessão com worktree do provider nunca tem menos que o piso
     cap = cfg.cap
     gate, would_refuse = "", None  # `gate` = o trecho de sh do guarda de clone (sessão real); `cfg.gate` = a regra de presença do MBP — duas regras, as DUAS valem
     if dry:  # vazio → a recusa local não dispararia (None; o sha e o --selfcheck do guarda só rodam no host, no start de verdade); falhou → o motivo, em vez de um dry-run que finge que abriria
@@ -542,34 +622,35 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     run_dir, exitf = f"{cfg.root}/run", f"{cfg.root}/run/{name}.exit"
     lpath = f"{run_dir}/{name}.sh"
     if dry:
-        print(json.dumps(dict(p, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, launcher=launcher(cfg, name, p).split("\n"),
+        wtd = {"worktree": {"rig": wt["rig"], "path": wt["path"], "add": f"{wt['bin']} wt-add {wt['rig']} {name}", "rm": f"{wt['bin']} wt-rm {wt['rig']} {name}", "start_timeout": start_timeout}} if wt else {}
+        print(json.dumps(dict(p, **wtd, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, launcher=launcher(cfg, name, p).split("\n"),
                               prepare=({"git_user": name, "git_email": f"{name}@gastown.invalid", "trust_file": f"{cfg.home}/.claude.json", "work_dir": p["work_dir"]} if cfg.prepare else None),
                               gate=cfg.gate_cmd if cfg.gate else None, path_extra=cfg.path_extra,
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0
     body = """s=$(sessions) || exit 1
-@GATE@printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
+@GATE0@printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
 n=$(printf '%s\\n' "$s" | grep -c .)
 [ "$n" -lt @CAP@ ] || { echo "host @HOST@ está no teto: $n de @CAP@ sessões" >&2; exit 10; }
-@PREP@@PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
+@WTADD@@GATE1@@PREP@@PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
 rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1
 T new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" || { rm -f @LAUNCH@; exit 1; }
 sleep 1
 T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@; exit 1; }"""
     plib = f'[ -r {q(cfg.plib)} ] || {{ echo "host @HOST@: sem a biblioteca de presença ({cfg.plib}); rode mbp-offload.sh install-mbp" >&2; exit 12; }}\n' if cfg.gate else ""
-    body = body.replace("@PLIBCHECK@", plib).replace("@PREP@", prepare_script(cfg))
+    body = body.replace("@PLIBCHECK@", plib).replace("@PREP@", prepare_script(cfg)).replace("@WTADD@", wtadd_sh(wt, name) if wt else "")
     for k, v in {"@NAME@": q(name), "@CAP@": str(cap), "@HOST@": q(cfg.host), "@RUN@": q(run_dir), "@WORKDIR@": q(p["work_dir"]),
                  "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name),
                  "@B64@": q(base64.b64encode(launcher(cfg, name, p).encode()).decode())}.items():
         body = body.replace(k, v)
-    body = body.replace("@GATE@", gate)
+    body = body.replace("@GATE0@", "" if wt else gate).replace("@GATE1@", gate if wt else "")  # sessão com worktree do provider: o guarda de clone vem DEPOIS do wt-add
     with open(os.path.join(cfg.mkstate(), "lock"), "a") as lf:  # cap + criação são um passo só; entre processos do mini, um por vez
         fcntl.flock(lf, fcntl.LOCK_EX)
         # registra ANTES do ssh: um start ambíguo (ssh cai ou estoura o tempo depois do script já ter rodado no host) deixa o registro,
         # e o list-running com o host fora do ar diz "não sei" em vez de "nada nosso lá"; só uma recusa clara do host o apaga
         cfg.mark(name, True)
-        rc, out, err = remote(cfg, body, cfg.start_timeout)
+        rc, out, err = remote(cfg, body, start_timeout)
         if rc not in (0, EX_EXISTS):
             cfg.mark(name, False)
     if rc in (EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP):
@@ -583,7 +664,7 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
     cfg.event("started", name)
     if cfg.shim:
         shim_pump(cfg)
-    cfg.log(f"start {name} ok" + (f" ignored={','.join(p['ignored'])}" if p["ignored"] else "") +
+    cfg.log(f"start {name} ok" + (f" worktree={out.strip()[:200]}" if wt and out.strip() else "") + (f" ignored={','.join(p['ignored'])}" if p["ignored"] else "") +
             (f" env_dropped={','.join(p['env_dropped'])}" if p["env_dropped"] else ""))
     return 0
 
@@ -598,10 +679,16 @@ T kill-session -t @TGT@ 2>/dev/null
 if [ -n "$pids" ]; then kill -TERM $pids 2>/dev/null; sleep 1; kill -KILL $pids 2>/dev/null; fi
 rm -f @RUN@/@NAME@.sh @RUN@/@NAME@.exit
 has @NAME@; [ $? -eq 1 ] || { echo "sessão @NAME@ continua aberta depois do stop" >&2; exit 1; }""".replace("@TGT@", tgt(name)).replace("@PTGT@", ptgt(name)).replace("@RUN@", q(cfg.root + "/run")).replace("@NAME@", name)
-    run(cfg, "stop", body, dry)
+    wt = managed_worktree(cfg, name)
+    if wt:  # só chega aqui com a sessão já fora (a conferência acima sai 1 se não): então recolhe o worktree, e o resultado NUNCA muda o rc do stop
+        body += "\n" + wtclean_sh(wt, name) + "wtclean\nexit 0"
+    _, out, _ = run(cfg, "stop", body, dry)
     if not dry:
         meta_clear(cfg, name)
-        cfg.event("stopped", name)
+        verdict = ([ln[3:] for ln in out.splitlines() if ln.startswith("WT ")] or ["sem resposta do recolhimento"])[-1] if wt else ""  # vazio (sem WT) → "sem resposta", nunca "removed"
+        cfg.event("stopped", name, **({"worktree": verdict} if wt else {}))
+        if wt:
+            cfg.log(f"stop {name} worktree: {verdict}")
         cfg.mark(name, False)
     return 0
 

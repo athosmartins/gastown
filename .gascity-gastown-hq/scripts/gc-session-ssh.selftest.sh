@@ -30,18 +30,22 @@
 #   extensions.worktreeConfig: o core.bare sai do config compartilhado e o commit do worktree continua funcionando, autor = a sessão), modo 600 e o resto do arquivo preservados, idempotente, uma identidade por
 #   worktree; pasta ausente / comum, ~/.claude.json ausente / ilegível (intacto, byte a byte) / com forma estranha, config.worktree travado, identidade que o git não lê de volta → exit 1 com o motivo, nenhum
 #   lançador, a pasta ausente não vira diretório; dry-run mostra o `prepare`; worktree_prepare explícito nos dois sentidos, padrão LIGADO no servidor e DESLIGADO no host de presença (notebook), não-booleano recusa sem ssh.
+#   wt (ga-2hd02v.1.7) — o start cria o worktree da sessão (wt-add) e o stop o recolhe (wt-rm) SÓ quando nada se perde: papel mapeado em `worktree_rigs` abre DENTRO do worktree do wt-add (com identidade e
+#   confiança), o guarda de clone olha o worktree JÁ criado, wt-add / preparo / guarda que falham deixam o host como estava, teto e 'já existe' recusam ANTES de criar; o stop recolhe o limpo e publicado e MANTÉM
+#   o sujo, o não publicado e o que o git não consegue ler (e nunca muda o rc do stop); papel sem mapa e host sem a chave = como antes; nomes que o engine gera (dog-remote-<cauda>, dog-remote-adhoc-<10>) não são
+#   pedido de host (host fora da config no meio do nome segue recusando); o identity_pattern do runbook casa com eles e só com eles; contrato com o hetzner-remote-git.sh de verdade (caminhos e formatos).
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar: teto do host, nome
 #   exato (sessão, is-running, start), alvo de painel =nome:, guarda de /Users/, filtro de env, exit 2 das desconhecidas, marcador de fim,
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); 51 mutantes no total (os 4 últimos: o lançador de pool do mini que vira claude no host, e as 3 bordas dessa regra).
+#   registro de sessões do list-running); 83 mutantes no total (os 19 últimos, grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${GCSSH_UNDER_TEST:-$HERE/gc-session-ssh}"
-for v in $(env | sed -n 's/^\(GC_[A-Za-z0-9_]*\)=.*/\1/p') TMUX TMUX_PANE GC_SSH_HOST; do unset "$v"; done  # o "servidor" é esta máquina: nada do ambiente de quem roda (ex.: GC_INSTANCE_TOKEN) pode vazar para as sessões de teste
+for v in $(env | sed -n 's/^\(GC_[A-Za-z0-9_]*\)=.*/\1/p') TMUX TMUX_PANE GC_SSH_HOST GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL; do unset "$v"; done  # + a identidade git do ambiente: o runner do nó exporta GIT_AUTHOR_*=gt, que vence o config do worktree e fazia o teste 'autor certo' do grupo prep reprovar no Linux (medido 18/10)  # o "servidor" é esta máquina: nada do ambiente de quem roda (ex.: GC_INSTANCE_TOKEN) pode vazar para as sessões de teste
 T=$(cd "$(mktemp -d /tmp/gcs.XXXXXX)" && pwd -P)  # curto: o caminho do socket do tmux tem limite de ~100 caracteres
 SOCK="gct$$"
 export TMUX_TMPDIR="$T/tmux"; mkdir -p "$TMUX_TMPDIR" "$T/bin" "$T/home" "$T/remote/home" "$T/state"
@@ -551,7 +555,114 @@ g_prep() {
   cfg 3; install_host
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group mbp && g_mbp; return 0; }
+# --- wt (ga-2hd02v.1.7): o start cria o worktree da sessão (wt-add) e o stop o recolhe (wt-rm) SÓ quando nada se perde; nomes de sessão que o ENGINE gera ---
+RGBIN="$RH/gt-remote/bin/hetzner-remote-git.sh"; RGREPO="$RH/gt-remote/git/gascity/repo.git"; export FAKE_RG_LOG="$T/rg.log"
+install_rg() {  # um hetzner-remote-git.sh falso com o contrato do verdadeiro (GT_REMOTE_GIT + <sub> <rig> <bead>; branch worker/<bead> sobre origin/main), sem pull nem espelho; FAKE_RG_FAIL=add|rm faz falhar
+  mkdir -p "$RH/gt-remote/bin"
+  cat > "$RGBIN" <<'EOF'
+#!/bin/sh
+[ -n "${GT_REMOTE_GIT:-}" ] || { echo "fake hetzner-remote-git: GT_REMOTE_GIT não veio" >&2; exit 3; }
+sub=${1:-}; rig=${2:-}; bead=${3:-}; r="$GT_REMOTE_GIT/$rig/repo.git"; p="$GT_REMOTE_GIT/$rig/wt/$bead"
+echo "$sub $rig $bead GR=$GT_REMOTE_GIT" >> "${FAKE_RG_LOG:-/dev/null}"
+case "$sub" in
+  wt-add) [ "${FAKE_RG_FAIL:-}" != add ] || { echo "hetzner-remote-git: wt-add falhou (de propósito)" >&2; exit 3; }
+          [ ! -e "$p" ] || { echo "wt-add: $p já existe"; exit 0; }
+          git -C "$r" worktree add -q -b "worker/$bead" "$p" refs/remotes/origin/main >&2 || exit 3
+          echo "{\"bead\":\"$bead\",\"pull\":\"ok\"}";;
+  wt-rm)  [ "${FAKE_RG_FAIL:-}" != rm ] || { echo "hetzner-remote-git: não removi (de propósito)" >&2; exit 3; }
+          git -C "$r" worktree remove --force "$p" >&2 && git -C "$r" worktree prune && echo "wt-rm: $bead removido";;
+  *) exit 2;;
+esac
+EOF
+  chmod +x "$RGBIN"
+}
+wtmirror() {  # wtmirror [CONTEÚDO de .claude/settings.json no commit] → o espelho do servidor com refs/remotes/origin/main (de onde o wt-add verdadeiro parte) + o script falso
+  mkmirror; local br g=$RGREPO
+  if [ -n "${1:-}" ]; then
+    mkdir -p "$T/seed/s/.claude"; printf '%s' "$1" > "$T/seed/s/.claude/settings.json"; br=$(git -C "$T/seed/s" symbolic-ref --short HEAD)
+    git -C "$T/seed/s" add -A && git -C "$T/seed/s" -c user.name=seed -c user.email=seed@x commit -q -m cfg && git -C "$T/seed/s" push -q "$g" "HEAD:refs/heads/$br"
+  fi
+  git -C "$g" update-ref refs/remotes/origin/main "$(git -C "$g" rev-parse HEAD)"; install_rg; : > "$T/rg.log"
+}
+g_wt() {
+  local n1=dog-remote-gapxi4ls n2=dog-remote-adhoc-0fc28155dd n3=dog-remote-gabroken1 n4=dog-remote-gawtrmfail w nm v ev="$T/state/a/events.jsonl" eng="$CITY/.gc/agents/dogs/dog-remote-1"
+  local base='{"worktree_prepare":true,"worktree_rigs":{"dog":"gascity"}}'
+  evwt() { jq -e -s --arg s "$1" --arg v "$2" 'map(select(.session==$s and .event=="stopped")) | last | .worktree | startswith($v)' "$ev" >/dev/null 2>&1; }  # evwt SESSÃO removed|kept|none: o último 'stopped' dela diz o que houve com o worktree
+  tmux -L "$SOCK" kill-server 2>/dev/null; cfg 3 25 "$base"; install_host; wtmirror
+  # --- dry-run ---
+  fresh; pv --dry-run start $n1 < <(req cat "$eng"); w=$(WTD $n1)
+  [ $RC = 0 ] && [ "$(jq -r .work_dir "$T/out")" = "$w" ] && jq -e --arg w "$w" '.worktree.rig == "gascity" and .worktree.path == $w and (.worktree.add | endswith("wt-add gascity '$n1'"))' "$T/out" >/dev/null; ok $? "wt: dry-run de sessão de pool (dog-remote-<cauda>) mostra o wt-add, o rig e a pasta do wt-add — e ignora o work_dir do template"
+  nossh; ok $? "wt: ...sem conectar"
+  [ "$(jq -r .worktree.start_timeout "$T/out")" = 150 ]; ok $? "wt: ...e o prazo do start sobe ao piso de 150 s (a config pedia 25 s: o wt-add puxa o espelho antes de criar)"
+  cfg 3 400 "$base"; fresh; pv --dry-run start $n1 < <(req cat "$eng"); [ "$(jq -r .worktree.start_timeout "$T/out")" = 400 ]; ok $? "wt: ...e prazo de config MAIOR que o piso vale (400 s)"; cfg 3 25 "$base"
+  fresh; pv --dry-run start wa-worker-remote-gaabc12 < <(req cat "$eng"); [ $RC = 0 ] && jq -e 'has("worktree") | not' "$T/out" >/dev/null && [ "$(jq -r .work_dir "$T/out")" = "$RR/city/.gc/agents/dogs/dog-remote-1" ]; ok $? "wt: dry-run de papel SEM mapa não traz 'worktree' e mantém o work_dir de sempre"
+  # --- start: cria o worktree, abre dentro dele ---
+  fresh; pv start $n1 < <(req cat "$eng"); ok $RC "wt: start de sessão de pool com papel mapeado abre (rc=$RC $(head -c 250 "$T/err"))"
+  [ "$(git -C "$w" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] && has "$T/rg.log" "wt-add gascity $n1 GR=$RH/gt-remote/git"; ok $? "wt: ...o worktree veio do wt-add, em <home>/gt-remote/git/<rig>/wt/<sessão>, com GT_REMOTE_GIT apontando o mesmo lugar"
+  v=$(tmux -L "$SOCK" display-message -p -t "=$n1:" '#{pane_current_path}' 2>/dev/null); [ -n "$v" ] && [ "$v" = "$(cd "$w" 2>/dev/null && pwd -P)" ]; ok $? "wt: ...e a sessão abriu DENTRO dele (não no work_dir do template)"
+  [ "$(count)" = 1 ] && [ ! -e "$RR/city/.gc/agents/dogs/dog-remote-1" ]; ok $? "wt: ...e a pasta do template não virou diretório no host"
+  [ "$(git -C "$w" config --get user.name)" = "$n1" ] && jq -e --arg w "$w" '.projects[$w].hasTrustDialogAccepted == true' "$RH/.claude.json" >/dev/null; ok $? "wt: ...com a identidade git e a confiança da pasta gravadas (o preparo roda DEPOIS do wt-add)"
+  : > "$T/rg.log"; fresh; pv start $n1 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'already exists' && [ -d "$w" ] && [ ! -s "$T/rg.log" ]; ok $? "wt: start de sessão que já existe é recusado SEM chamar o wt-add nem o wt-rm: o worktree dela fica (rc=$RC)"
+  # --- stop: limpo e sem nada a publicar → recolhe ---
+  v=$(git -C "$RGREPO" rev-parse -q --verify "refs/heads/worker/$n1" 2>/dev/null); [ -n "$v" ]; ok $? "wt: (antes do stop o branch worker/<sessão> existe)"
+  : > "$T/rg.log"; pv stop $n1 </dev/null; [ $RC = 0 ] && [ "$(count)" = 0 ] && [ -d "$RH/gt-remote/git/gascity/wt" ] && [ ! -e "$w" ]; ok $? "wt: stop com o worktree limpo e sem nada a publicar derruba a sessão e recolhe o worktree (rc=$RC)"
+  has "$T/rg.log" "wt-rm gascity $n1" && evwt $n1 removed; ok $? "wt: ...pelo wt-rm, e o evento 'stopped' diz worktree=removed"
+  [ -z "$(git -C "$RGREPO" rev-parse -q --verify "refs/heads/worker/$n1" 2>/dev/null)" ]; ok $? "wt: ...e o branch worker/<sessão> (nada nele que o origin não tenha) sai junto"
+  # --- stop: onde há risco de perder trabalho, MANTÉM ---
+  pv start $n2 < <(req cat "$eng"); ok $RC "wt: (segunda sessão, nome adhoc do engine) abre (rc=$RC $(head -c 200 "$T/err"))"; w=$(WTD $n2); echo x > "$w/novo.txt"
+  : > "$T/rg.log"; pv stop $n2 </dev/null; [ $RC = 0 ] && [ "$(count)" = 0 ] && [ -f "$w/novo.txt" ] && ! has "$T/rg.log" wt-rm && evwt $n2 kept; ok $? "wt: stop com arquivo novo no worktree derruba a sessão e MANTÉM o worktree (sem wt-rm; o arquivo continua) (rc=$RC)"
+  rm -f "$w/novo.txt"; git -C "$w" commit -q --allow-empty -m wip; : > "$T/rg.log"; pv stop $n2 </dev/null
+  [ $RC = 0 ] && [ -d "$w" ] && ! has "$T/rg.log" wt-rm && evwt $n2 kept; ok $? "wt: stop com commit que o origin não tem MANTÉM o worktree (rc=$RC)"
+  git -C "$RGREPO" update-ref "refs/remotes/origin/worker/$n2" "$(git -C "$w" rev-parse HEAD)"; : > "$T/rg.log"; pv stop $n2 </dev/null
+  [ $RC = 0 ] && [ ! -e "$w" ] && has "$T/rg.log" "wt-rm gascity $n2" && evwt $n2 removed; ok $? "wt: ...e depois que o origin tem o commit, o MESMO stop (repetido: idempotente) recolhe o worktree (rc=$RC)"
+  pv start $n3 < <(req cat "$eng"); w=$(WTD $n3); printf 'gitdir: /nao/existe\n' > "$w/.git"; : > "$T/rg.log"; pv stop $n3 </dev/null
+  [ $RC = 0 ] && [ -d "$w" ] && ! has "$T/rg.log" wt-rm && evwt $n3 kept; ok $? "wt: git que NÃO consegue ler o worktree → MANTÉM (não consegui saber nunca vira 'limpo') (rc=$RC)"
+  pv start $n4 < <(req cat "$eng"); w=$(WTD $n4); : > "$T/rg.log"; FAKE_RG_FAIL=rm pv stop $n4 </dev/null
+  [ $RC = 0 ] && [ "$(count)" = 0 ] && [ -d "$w" ] && evwt $n4 kept; ok $? "wt: wt-rm que falha NÃO derruba o stop: a sessão parou, o worktree fica e o evento diz kept (rc=$RC $(head -c 200 "$T/err"))"
+  pv stop dog-remote-gaghost0 </dev/null; [ $RC = 0 ] && evwt dog-remote-gaghost0 none; ok $? "wt: stop de sessão que nunca teve worktree sai 0 e o evento diz none (rc=$RC)"
+  : > "$T/rg.log"; pv stop wa-worker-remote-gaabc12 </dev/null; [ $RC = 0 ] && [ ! -s "$T/rg.log" ]; ok $? "wt: stop de papel SEM mapa não toca no wt-rm (como antes) (rc=$RC)"
+  pv --dry-run stop wa-worker-remote-gaabc12 </dev/null; ! has "$T/out" wtclean; ok $? "wt: ...e o script do stop dele não leva o recolhimento"
+  # --- start que falha depois de criar o worktree: desfaz; antes de criar: não cria ---
+  wtmirror; w=$(WTD dog-remote-gaaddfail); FAKE_RG_FAIL=add pv start dog-remote-gaaddfail < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'wt-add' && sess_zero dog-remote-gaaddfail && [ ! -e "$w" ]; ok $? "wt: wt-add que falha derruba o start dizendo qual: nada aberto, nenhum worktree (rc=$RC)"
+  cfg 3 25 '{"worktree_prepare":false,"worktree_rigs":{"dog":"gascity"}}'; wtmirror; w=$(WTD dog-remote-gaaddfail2); FAKE_RG_FAIL=add pv start dog-remote-gaaddfail2 < <(req cat "$eng")
+  [ $RC = 1 ] && has "$T/err" 'wt-add' && sess_zero dog-remote-gaaddfail2 && [ ! -e "$w" ]; ok $? "wt: ...e MESMO sem o preparo (worktree_prepare=false, onde nada mais confere a pasta) o wt-add que falha derruba o start: a pasta não vira um diretório comum com a sessão dentro (rc=$RC)"; cfg 3 25 "$base"
+  wtmirror '{"disableAllHooks":true}'; w=$(WTD dog-remote-gaguard01); pv start dog-remote-gaguard01 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'disableAllHooks' && sess_zero dog-remote-gaguard01; ok $? "wt: o guarda de clone olha o worktree JÁ criado: disableAllHooks que vem no checkout recusa a sessão real (rc=$RC $(head -c 200 "$T/err"))"
+  [ ! -e "$w" ] && has "$T/rg.log" "wt-rm gascity dog-remote-gaguard01"; ok $? "wt: ...e o worktree que o start tinha criado é desfeito (wt-rm)"
+  wtmirror; w=$(WTD dog-remote-gaprep001); cp "$RH/.claude.json" "$T/claude.ok"; printf '{ nao e json' > "$RH/.claude.json"; pv start dog-remote-gaprep001 < <(req cat "$eng")
+  [ $RC = 1 ] && has "$T/err" 'confiança da pasta' && sess_zero dog-remote-gaprep001 && [ ! -e "$w" ] && has "$T/rg.log" "wt-rm gascity dog-remote-gaprep001"; ok $? "wt: preparo que falha depois do wt-add (confiança da pasta) derruba o start e desfaz o worktree (rc=$RC)"; cp "$T/claude.ok" "$RH/.claude.json"
+  cfg 1 25 "$base"; wtmirror; pv start dog-remote-gacap0001 < <(req cat "$eng"); ok $RC "wt: (teto 1) primeira sessão abre"; : > "$T/rg.log"; pv start dog-remote-gacap0002 < <(req cat "$eng")
+  [ $RC = 1 ] && has "$T/err" 'no teto' && ! has "$T/rg.log" "dog-remote-gacap0002" && [ ! -e "$(WTD dog-remote-gacap0002)" ]; ok $? "wt: host no teto recusa ANTES de criar o worktree (nenhum wt-add) (rc=$RC)"; pv stop dog-remote-gacap0001 </dev/null
+  # --- sem a chave / papel sem mapa / nome impróprio / chave inválida: como hoje, ou recusa sem ssh ---
+  cfg 3 25 '{"worktree_prepare":true}'; wtmirror; pv start dog-remote-gaplain01 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'não existe' && ! has "$T/rg.log" wt-add; ok $? "wt: SEM worktree_rigs o start é o de hoje (a pasta tem que existir) e não chama o wt-add (rc=$RC)"
+  cfg 3 25 "$base"; pv start wa-worker-remote-gaplain02 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'não existe' && ! has "$T/rg.log" wt-add; ok $? "wt: papel que não está no mapa (wa-worker) também é o de hoje (rc=$RC)"
+  fresh; pv start dog-remote-GAUP < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'worktree' && nossh; ok $? "wt: nome que não serve de nome de worktree (maiúscula) recusa SEM ssh (rc=$RC)"
+  for v in '{"dog":"Bad Rig"}' '["dog"]' '{"dog":1}' '"dog"' '{"Dog":"gascity"}' '{"dog":"gascity/x"}'; do
+    cfg 3 25 "$base"; jq ".hosts.a.worktree_rigs=$v" "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"; fresh; pv start dog-remote-gacf0001 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" "'worktree_rigs'" && nossh; ok $? "wt: worktree_rigs=$v → config recusada dizendo a chave, sem ssh (rc=$RC)"
+  done
+  # --- nomes que o ENGINE gera: <modelo>-<cauda-da-bead> e <modelo>-adhoc-<10>; o pedido de host continua recusando host desconhecido ---
+  cfg 3 25 "$base"
+  for nm in dog-remote-gapxi4ls dog-remote-adhoc-0fc28155dd dog-remote-1 w-remote-zzz; do fresh; pv --dry-run start $nm < <(req cat "$eng"); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = a ]; ok $? "wt: nome '$nm' → host padrão (cauda de bead / adhoc / número / fim de nome), não pedido de host (rc=$RC $(head -c 160 "$T/err"))"; done
+  fresh; pv --dry-run start w-remote-zzz-1 < <(req cat "$eng"); [ $RC = 1 ] && has "$T/err" 'zzz' && nossh; ok $? "wt: 'w-remote-zzz-1' (host pedido fora da config) continua recusando (rc=$RC)"
+  fresh; pv --dry-run start w-remote-b-1 < <(req cat "$eng"); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = b ]; ok $? "wt: 'w-remote-b-1' (host da config) continua indo para esse host (rc=$RC)"
+  # --- identidade do atalho: o identity_pattern do runbook casa com o que o engine gera para o dog-remote, e só com isso ---
+  local doc="$HERE/../docs/runbooks/gc-session-ssh.md" rx; rx=$(sed -n 's/^IDENTITY_PATTERN=//p' "$doc" 2>/dev/null)
+  [ "$(printf '%s\n' "$rx" | grep -c .)" = 1 ]; ok $? "wt: o runbook traz UM identity_pattern canônico (linha IDENTITY_PATTERN=…)"
+  python3 -I - "$rx" <<'PY'; ok $? "wt: o identity_pattern casa com alias/template/sessão que o engine gera (dog-remote-1, dog-remote, dog-remote-gapxi4ls, dog-remote-adhoc-…) e recusa os locais, os de outro papel e as misturas"
+import re, sys
+rx = re.compile(sys.argv[1])  # vazio ou inválido → o programa cai (rc ≠ 0) e o teste reprova
+yes = ["remote-e2e-1", "dog-remote", "dog-remote-1", "dog-remote-gapxi4ls", "dog-remote-adhoc-0fc28155dd", "gate-reviewer-remote-2", "gate-reviewer-remote-adhoc-48ac5cece9", "wa-worker-remote-adhoc-1254849098", "wa-worker-remote-gawisp79e1"]
+no = ["gastown.dog-4", "dog-gapxi4ls", "gastown.mayor", "dog", "mayor-remote-1", "dog-remote-", "dog-remote-a", "dog-remote-adhoc-", "dog-remote-adhoc-12345678901", "dog-remote-gapxi4ls-x", "dog-remote/../x", "x-dog-remote-1", "remote-e2e-2"]
+bad = [x for x in yes if not rx.fullmatch(x)] + [x for x in no if rx.fullmatch(x)]
+print("fora do esperado:", bad, file=sys.stderr) if bad else None
+sys.exit(1 if bad else 0)
+PY
+  # --- contrato com o script de verdade: o caminho que o provider calcula é o que o hetzner-remote-git.sh monta ---
+  grep -qF 'GR=${GT_REMOTE_GIT:-$HOME/gt-remote/git}' "$HERE/hetzner-remote-git.sh" && grep -qF 'path="$GR/$RIG/wt/$bead"' "$HERE/hetzner-remote-git.sh" && grep -qF 'g() { git -C "$GR/$RIG/repo.git" "$@"; }' "$HERE/hetzner-remote-git.sh"; ok $? "wt: contrato: <git>/<rig>/wt/<sessão> e <git>/<rig>/repo.git são o que o hetzner-remote-git.sh monta"
+  grep -qF "RE_RIG='^[a-z][a-z0-9_-]{0,40}\$'; RE_BEAD='^[a-z0-9][a-z0-9._-]{0,60}\$'" "$HERE/hetzner-remote-git.sh"; ok $? "wt: contrato: os formatos de rig e de nome de worktree que o provider valida são os do script"
+  cfg 3; install_host
+}
+
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 all
@@ -629,9 +740,28 @@ echo "== $((n-fails))/$n ok =="
   mutant prep "o dry-run não diz o preparo" 's/prepare=({"git_user": name,.*$/prepare=None,/'
   mutant dry "o dry-run não diz a recusa de política que o start daria" 's/            would_refuse = str(e)/            pass/'
   mutant dry "o dry-run diz 'teste' para tudo" 's/session_kind="teste" if TEST_RE.fullmatch(name) else "real"/session_kind="teste"/'
+  mutant wt "o start não chama o wt-add" 's/\.replace("@WTADD@", wtadd_sh(wt, name) if wt else "")/.replace("@WTADD@", "")/'
+  mutant wt "wt-add que falha não derruba o start" 's/; exit {EX_PREP}; }}\\n"/; true; }}\\n"/'
+  mutant wt "wt-add sem GT_REMOTE_GIT (o script cairia no HOME dele)" 's/GT_REMOTE_GIT={q(wt\[.git.\])} {q(wt/{q(wt/'
+  mutant wt "sem o piso do prazo do start" 's/start_timeout = max(cfg.start_timeout, WT_START_FLOOR) if wt else cfg.start_timeout/start_timeout = cfg.start_timeout/'
+  mutant wt "o work_dir do template vale no lugar do worktree" 's/        p\["work_dir"\] = wt\["path"\].*$/        pass/'
+  mutant wt "guarda de clone ANTES do wt-add (aprova a pasta ausente)" 's/replace("@GATE0@", "" if wt else gate).replace("@GATE1@", gate if wt else "")/replace("@GATE0@", gate).replace("@GATE1@", "")/'
+  mutant wt "start que falha depois do wt-add não recolhe o worktree" 's/            + "trap .*$/            + "")/'
+  mutant wt "stop recolhe mesmo com alteração não commitada" '/\[ -z "\$wst" \] ||/d'
+  mutant wt "stop recolhe mesmo com commit que o origin não tem" 's/\[ "\$wpub" -eq 1 \] ||/true ||/'
+  mutant wt "git que não lê o worktree vira 'limpo'" 's/wst=\$(git -C @WT@ status --porcelain 2>&1) ||.*$/wst=$(git -C @WT@ status --porcelain 2>\/dev\/null) || :/;s/wh=\$(git -C @WT@ rev-parse HEAD 2>\/dev\/null) ||.*$/wh=$(git -C @WT@ rev-parse HEAD 2>\/dev\/null) || :/'
+  mutant wt "wt-rm que falha derruba o stop" 's/wtclean\\nexit 0"/wtclean"/;s/echo "WT kept wt-rm falhou: \$(printf %s "\$wo" | tail -n 1)"; return 0;/exit 1;/'
+  mutant wt "stop sem GT_REMOTE_GIT no wt-rm" 's/wo=\$(GT_REMOTE_GIT=@GR@ @BIN@ wt-rm/wo=$(@BIN@ wt-rm/'
+  mutant wt "o branch publicado fica no repositório" '/\[ -z "\$wb" \] || git -C @REPO@ update-ref -d/d'
+  mutant wt "papel fora do mapa também ganha worktree" 's/rig = cfg.wt_rigs.get(m.group(1)) if m else None/rig = next(iter(cfg.wt_rigs.values()), None) if m else None/'
+  mutant wt "nome impróprio para worktree aceito" 's/    if not WT_NAME_RE.fullmatch(name):/    if False:/'
+  mutant wt "worktree_rigs de qualquer forma aceito" 's/        if not isinstance(wr, dict) or not all(.*$/        if False:/'
+  mutant wt "cauda de bead lida como pedido de host" 's/if m.group(2) == "" or m.group(1) == "adhoc":/if m.group(1) == "adhoc":/'
+  mutant wt "adhoc lido como pedido de host" 's/if m.group(2) == "" or m.group(1) == "adhoc":/if m.group(2) == "":/'
+  mutant wt "pedido de host no meio do nome vira cauda (host errado cai no padrão)" 's/if m.group(2) == "" or m.group(1) == "adhoc":/if True:/'
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }

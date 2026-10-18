@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que esta fatia é — e o que não é · Como ligar (config, city.toml, janela do engine) · Operações
+• O que esta fatia é — e o que não é · Como ligar (config, city.toml, janela do engine) · Operações (preparo do worktree · **worktree da sessão: o provider cria e recolhe, e a identidade do atalho (ga-2hd02v.1.7)** · o comando do `start`)
 • Teto do host · **O MBP como host (ga-w7qwl1)** · Quando o ssh não responde · Medido, inferido, não testado · Pontos em aberto · Limites
 
 Bead ga-2hd02v.1.1 (fatia 2 do ga-2hd02v, desenho do estudo ga-ukxa3k, aprovada por Athos em 14/10 18:42). **Entrega duas peças:** (1) `scripts/gc-session-ssh`, o provider no protocolo `exec:` do engine, que abre as sessões de pool num host remoto por ssh com a mesma interface das locais; (2) um patch do engine, `docs/pending-engine-window/ga-2hd02v-hybrid-remote-exec.patch`, que deixa o provider híbrido usar esse script como lado remoto. **O patch NÃO está aplicado**: nada foi compilado, trocado nem reiniciado em produção. Sem o patch o script já funciona sozinho (`GC_SESSION=exec:<cidade>/scripts/gc-session-ssh` serve um teste isolado), mas só o patch deixa a cidade rodar sessões locais e remotas juntas.
@@ -79,9 +79,34 @@ Decisão do Mayor (17/10): sessão real não abre sem identidade git e sem a pas
 1. **Identidade git por worktree**: `git config --worktree user.name <sessão>` e `user.email <sessão>@gastown.invalid` (o autor dos commits da sessão remota é o nome dela). Num espelho BARE sem `extensions.worktreeConfig` o passo liga a extensão e move o `core.bare` do config compartilhado para o `config.worktree` do principal (sem isso o commit dos worktrees quebra); o `wt-add` já deixa isso certo, o passo é a rede de segurança. Depois **lê de volta**: o `user.name`/`user.email` que o git LÊ no worktree tem de ser os da sessão (outra camada de config que os sobreponha reprova).
 2. **Confiança da pasta**: `projects[<work_dir>].hasTrustDialogAccepted` e `hasCompletedProjectOnboarding` em `{remote_home}/.claude.json`, troca atômica (arquivo temporário + `os.replace`), modo do arquivo mantido, lido de volta. Arquivo ausente, ilegível ou com forma que não conheço (`projects` que não é objeto): **nada é gravado** e o start falha (nunca um arquivo novo no lugar do login do claude). O claude também regrava esse arquivo, então uma gravação perdida numa corrida é possível — por isso a leitura de volta; o efeito seria a sessão parar no diálogo de confiança, que o `hetzner-proof.py e2e` reconhece e não responde.
 
-A pasta (`work_dir` já reescrito) **tem de existir e ser um worktree git**: o start não a cria (quem cria é o `hetzner-remote-git.sh wt-add`) e uma pasta comum recusa. Qualquer falha sai **exit 13** do script do host, o provider falha o `start` com `preparo da sessão <nome> recusado: <motivo>` e nada abre (nenhum lançador, nenhuma sessão, a pasta ausente não vira diretório comum). A identidade vem antes da confiança: com a identidade falhando a confiança nem é tocada.
+A pasta (`work_dir` já reescrito) **tem de existir e ser um worktree git**: o start não a cria (quem cria é o `hetzner-remote-git.sh wt-add` — chamado pelo próprio provider só nos papéis de `worktree_rigs`, seção seguinte) e uma pasta comum recusa. Qualquer falha sai **exit 13** do script do host, o provider falha o `start` com `preparo da sessão <nome> recusado: <motivo>` e nada abre (nenhum lançador, nenhuma sessão, a pasta ausente não vira diretório comum). A identidade vem antes da confiança: com a identidade falhando a confiança nem é tocada.
 
 **Padrão e exceção.** Liga em todo host, menos nos de `presence_gate` (o MBP, notebook do Athos, que tem a identidade e a confiança DELE e que o provider não escreve); `worktree_prepare` explícito vale nos dois sentidos. `--dry-run start` mostra o que gravaria em `prepare` (`git_user`, `git_email`, `trust_file`, `work_dir`; `null` se o host não prepara). Selftest: grupo `prep` (41 casos) e 12 mutantes.
+
+### Worktree da sessão: o provider cria no `start` e recolhe no `stop` (ga-2hd02v.1.7)
+
+Decisão do Mayor (18/10, opção 1 da ga-2hd02v.1.6): o `start` do provider não parava de falhar com exit 13 porque nada chamava o `wt-add`. Agora, **por host e por papel**, o provider cria o worktree da sessão e o recolhe quando ela para. Sem a chave, nada muda.
+
+```json
+"hetzner": {..., "worktree_rigs": {"dog": "gascity"}}
+```
+
+`worktree_rigs` é papel → rig (rig no formato do `hetzner-remote-git.sh`; forma errada recusa a configuração inteira do host, sem ssh). Ganha worktree a sessão cujo nome é `<papel>-remote-…` com o papel no mapa; `wa-worker`, `gate-reviewer` e o resto ficam como estão até alguém acrescentá-los.
+
+* **Onde.** `<remote_home>/gt-remote/git/<rig>/wt/<sessão>` (o caminho do `wt-add`, com `GT_REMOTE_GIT` passado explícito). O `work_dir` do template (`<cidade>/.gc/agents/dogs/…`) é ignorado: não existe no host e não é o worktree. O nome da sessão vira o nome do worktree e do branch `worker/<sessão>`, então tem de casar `[a-z0-9][a-z0-9._-]{0,60}` (o formato do script); maiúscula ou `_` recusa sem abrir ssh.
+* **A ordem no script do `start`** (um só ssh, sob o `flock`): já existe (exit 11) → teto (10) → **`wt-add`** → guarda de clone da sessão real (12) → preparo de identidade e confiança (13) → abre. O guarda vem **depois** do `wt-add` de propósito: o `--selfcheck` dele olha `.claude/settings*.json` DENTRO da pasta, e com a pasta ainda ausente aprovaria sem ver um `disableAllHooks` que venha no repositório. `wt-add` que falha sai **13** dizendo qual. Se o start falhar depois do `wt-add`, o `EXIT` do script recolhe o worktree que ele criou (mesma regra do `stop`). O `wt-add` puxa o espelho antes de criar, então o start ganha um piso de 150 s (`start_timeout` menor que isso é elevado só para estas sessões, e o dry-run mostra o prazo; o engine espera 180 s em `[session] startup_timeout`). Limite: o start segura o `flock` do mini durante o `wt-add`, então outro start espera por ele — com `max_active_sessions = 1` no `dog-remote` não aparece, mas ao subir o teto de papéis com worktree isto conta.
+* **O `stop`** derruba a sessão como sempre e SÓ DEPOIS tenta recolher o worktree, pelo `wt-rm`, **se nada se perde**: o worktree está limpo (`git status --porcelain` vazio) e HEAD e o branch da sessão já estão no `origin/main` do espelho ou iguais a `origin/worker/<sessão>` / `refs/gt/published/worker/<sessão>` (a mesma definição de "publicada" do `hetzner-remote-git.sh status`). Recolhido, o branch local sai junto. **Qualquer dúvida mantém**: git que não lê o worktree ou o branch, ref ausente, `wt-rm` que falha. O resultado nunca muda o rc do `stop`; fica em `<estado>/<host>/events.jsonl` (`stopped.worktree` = `removed` | `kept <motivo>` | `none`) e no `session-ssh.log`. Worktree mantido não some sozinho: `hetzner-remote-git.sh status <rig>` lista o que está PENDENTE, e quem olhar e decidir descartar usa `wt-rm`.
+* **Nomes que o engine gera (achado da 1.7).** Uma sessão de pool se chama `<modelo>-<cauda da bead>` (`dog-remote-gapxi4ls`) ou `<modelo>-adhoc-<10>` (`dog-remote-adhoc-0fc28155dd`) — nunca `<papel>-remote-<n>` (fonte do engine: `internal/session/names.go`, `ReadableAutoSessionName` e `GenerateAdhocExplicitName`). O `host_of` do provider lia a cauda como pedido de host e recusava. Regra agora: no meio do nome (`…-remote-<x>-…`) `<x>` é pedido de host e continua recusando host fora da config; no FIM do nome, ou `adhoc`, é a cauda do engine e vale o host padrão. Custo: `…-remote-<host>` sem número depois, com host digitado errado, cai no host padrão em vez de recusar — o MBP só abre com o nome exato do host na config.
+
+**Identidade do atalho `bd`/`gc`.** O `remote-shim-wrapper` exige que `GC_ALIAS`, `GC_AGENT`, `GC_SESSION_NAME` e `GC_TEMPLATE` casem **todos** com o `identity_pattern` da config dele (`~/.gastown/remote-shim.json` no mini). Para as sessões remotas de pool, o valor é este (o selftest do provider lê esta linha e a prova contra os nomes reais; o que está gravado ao vivo precisa ser igual a ela):
+
+```text
+IDENTITY_PATTERN=^(remote-e2e-1|(dog|gate-reviewer|wa-worker)-remote(-([0-9]{1,3}|adhoc-[A-Za-z0-9]{10}|[A-Za-z0-9]{3,12}))?)$
+```
+
+Casa com alias `dog-remote-1`, template `dog-remote`, sessão `dog-remote-gapxi4ls` ou `dog-remote-adhoc-…`; recusa `gastown.dog-4`, `dog-gapxi4ls`, `gastown.mayor` e as misturas (alias remoto com nome de sessão local).
+
+Selftest: grupo `wt` e os mutantes dele em `gc-session-ssh.selftest.sh`.
 
 ### O comando do `start` é o mesmo do local
 

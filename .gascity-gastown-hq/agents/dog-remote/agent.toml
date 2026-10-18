@@ -1,0 +1,24 @@
+# dog-remote: o dog que roda no servidor Hetzner (ga-2hd02v.1.7; Athos 18/10: "Hetzner 24/7"; liberação do Mayor na ga-2hd02v.1.6).
+#
+# Contents
+#   O que é · Por que 1 só · O que o provider faz com este arquivo · Como a bead chega · O que NÃO tem aqui
+#
+# O QUE É: um dog de pool (headless, sonnet) cujo nome de sessão contém `-remote-`. É esse trecho que o `remote_match` do provider híbrido ([session] provider = "hybrid") usa para mandar
+#   a sessão ao host remoto (scripts/gc-session-ssh) em vez do tmux do mini. O engine nomeia a sessão `dog-remote-<cauda da bead>` ou `dog-remote-adhoc-<10>` (internal/session/names.go);
+#   o provider e o identity_pattern do atalho já aceitam esses nomes (docs/runbooks/gc-session-ssh.md, "Worktree da sessão").
+# POR QUE 1 SÓ: é o primeiro degrau da liberação (a 1.6 prova um dog remoto com 1 bead real antes de abrir gate-reviewer e wa-worker). Subir o teto é decisão do Mayor depois de medir.
+# O QUE O PROVIDER FAZ COM ESTE ARQUIVO: ignora `work_dir` (a pasta <cidade>/.gc/agents/dogs/… não existe no host) e abre a sessão num worktree git novo do rig `gascity`, criado pelo wt-add no
+#   start e recolhido no stop quando está limpo e publicado (config do host: "worktree_rigs": {"dog": "gascity"}). `pre_start` não existe aqui de propósito: o provider não o executa no host.
+# COMO A BEAD CHEGA: JÁ ATRIBUÍDA. O atalho bd/gc do servidor não deixa passar `bd ready`, `bd query`, `bd update --claim` nem `gc runtime drain-ack` (allowlist em scripts/remote-shim-wrapper.py),
+#   então este dog não sonda o pool nem reivindica sozinho: quem despacha atribui a bead ao alias da sessão e ela a acha por `bd list --status in_progress --assignee`. Alargar a allowlist é
+#   decisão de segurança à parte. Ver prompt.template.md.
+# O QUE NÃO TEM AQUI: Dolt, a árvore da cidade, credencial do GitHub, dado de lead/cliente. O push vai só ao espelho do mini.
+# literal, sem {{.AgentBase}}: com no máximo 1 sessão não há instância a distinguir, e a pasta só existe para o engine (o provider a troca pelo worktree)
+work_dir = ".gc/agents/dogs/dog-remote"
+min_active_sessions = 0
+max_active_sessions = 1
+# Sem `gc runtime drain-ack` no atalho, quem encerra a sessão ociosa é este prazo (o stop do provider recolhe o worktree se nada se perde). Curto de propósito: o slot é 1.
+idle_timeout = "15m"
+wake_mode = "fresh"
+model = "sonnet"
+provider = "claude-headless"

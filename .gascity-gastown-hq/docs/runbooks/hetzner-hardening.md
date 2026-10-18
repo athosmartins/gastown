@@ -2,11 +2,12 @@
 
 ## Contents
 
-• O que esta fatia é · O guarda de clone (como decide, o que não cobre) · Como o guarda decide (regra completa) · A trava no provider e como liberar
-• `rm -rf` sem humano no teclado (MEDIDO) · Prova real no servidor (MEDIDO) · Instalação e como repetir
-• Fatia 6b: skills que ficam fora do servidor, por nome · Auditoria do servidor (como repetir, resultado de 17/10, o que decidir)
-• Fatia 6c (MEDIDO 17/10): hooks `keep` no Linux · latência dos hooks gc · sessão remota mínima de ponta a ponta · achados e o que decidir
-• Fatia 6d (MEDIDO 18/10, antes da sessão REAL): prazo de 120 s nos hooks gc do bundle · claude sem autoupdate · o start grava identidade git e confiança da pasta · e2e com 20 prompts
+• O guarda de clone · Como o guarda decide · A trava no provider e como liberar
+• `rm -rf` sem humano no teclado · Prova real no servidor (MEDIDO) · Instalação e como repetir
+• Fatia 6b: skills que ficam fora do servidor, por nome · Auditoria do servidor (repetível)
+• Fatia 6c: hooks no Linux, latência dos hooks gc e a sessão mínima de ponta a ponta (MEDIDO 17/10)
+• Fatia 6d: o que faltava antes da sessão REAL (ga-2hd02v.1.5.9, MEDIDO 18/10)
+• Fatia 7: o provider cria o worktree da sessão, nomes do engine e o template `dog-remote` (ga-2hd02v.1.7)
 
 Bead ga-2hd02v.1.5 (decisão Q4 do Mayor: sessão remota só é liberada depois que existir um substituto do `gt tap guard cross-clone-block`), fatia **6a** (ga-2hd02v.1.5.1) de 3. Repartida de antemão na Epic Split Convention para caber no teto do gate (E11): 6b (.1.5.2) = skills com CPF/CNPJ fora + auditoria de segredo/dado; 6c (.1.5.3) = hooks `keep` no Linux, latência dos hooks gc, sessão ponta a ponta (entregue: ver "Fatia 6c" no fim). **Esta fatia não libera sessão real.** Ela entrega a trava; liberar é decisão explícita do Mayor. Fora desta fatia: usuário Unix por sessão (sem bead) e, do `remote-worker-bundle.md`, tudo além do que ela mediu (guarda, `ask`).
 
@@ -207,3 +208,25 @@ Leitura honesta: (a) nenhum hook gc foi cancelado em 60 prompts nas 3 rodadas. N
 **O que ficou como estava, de propósito.** As branches de teste continuam no origin (item 5, decisão do Mayor): às 4 de 17/10 somam-se `worker/remote-e2e-20261018-062407`, `worker/remote-e2e-20261018-063441` e `worker/remote-e2e-20261018-144643` (esta da rodada 3, a do driver final) (um arquivo de texto sem dado cada; limpeza pelos comandos da seção da 6c, nos três lugares). O worktree de teste de cada rodada foi removido do servidor pelo driver.
 
 **Para repetir:** `bash scripts/gc-session-ssh.selftest.sh` (grupo `prep`: 41 casos; 12 mutantes), `bash scripts/remote-bundle-build.selftest.sh`, `bash scripts/hetzner-proof.selftest.sh` (e2e: 53 casos; rodou no nó, 115/115 com mutantes) — as duas primeiras são da lista mac-only do nó e, com o disco do mini abaixo de 6 GB, o `heavy-guard.sh` recusa as baterias com mutantes (rc 75): rode-as com `heavy-guard.sh --wait-secs N -- bash scripts/…` quando o disco voltar. Depois: `push-bundle` e `hetzner-proof.py e2e --prompts 20`.
+
+## Fatia 7: o provider cria o worktree da sessão, nomes do engine e o template `dog-remote` (ga-2hd02v.1.7)
+
+Decisão do Mayor (18/10, opção 1 da ga-2hd02v.1.6). **Nada disto está vivo**: é código, template e doc; a config da cidade, o provider `hybrid` e o binário seguem como estavam.
+
+**Por que existe.** Ao tentar o passo 3 da 1.6 (virar o provider para `hybrid`), três coisas impediam a primeira sessão real: (1) o `start` do provider sai 13 se a pasta não existe e nada chama o `wt-add`; (2) o engine nomeia sessão de pool `dog-remote-<cauda da bead>` ou `dog-remote-adhoc-<10>`, nunca `dog-remote-<n>` (`internal/session/names.go`), e o provider lia a cauda como pedido de host e recusava, enquanto o `identity_pattern` do atalho também a recusaria; (3) a allowlist do atalho não tem `bd ready`, `bd query`, `bd update --claim` nem `gc runtime drain-ack`, então um dog remoto não sonda o pool nem reivindica sozinho.
+
+| o quê | como ficou | onde |
+|---|---|---|
+| worktree da sessão | `"worktree_rigs": {"dog": "gascity"}` no host: o `start` roda o `wt-add` (antes do guarda de clone, que precisa ver o checkout) e o `stop` o `wt-rm` só se nada se perde; dúvida mantém | `gc-session-ssh.md`, "Worktree da sessão" |
+| nomes do engine | cauda no FIM do nome, ou `adhoc`, não é pedido de host; `…-remote-<host>-<n>` segue pedindo host e recusa host fora da config | idem |
+| identidade do atalho | `identity_pattern` canônico numa linha do runbook (`IDENTITY_PATTERN=`), provado pelo selftest contra os nomes reais | idem |
+| template | `agents/dog-remote` (máx 1, `idle_timeout` 15 min), prompt próprio que só usa o que o atalho deixa passar; listado na regra estrita do `pool-prompt-skill-mention.selftest.sh` | `agents/dog-remote/` |
+
+**Como a bead chega ao dog remoto.** Já **atribuída** ao alias da sessão; ele a acha por `bd list --status in_progress --assignee "$GC_ALIAS"`. Quem despacha atribui e manda um nudge. Alargar a allowlist (para ele sondar o pool e reivindicar) é decisão de segurança à parte, com revisão; não entrou aqui.
+
+**O que falta ligar (passos 3 e 4 da ga-2hd02v.1.6, em janela de config viva, cada um reversível):**
+
+1. `.gc/session-ssh.json`, host `hetzner`: acrescentar `"worktree_rigs": {"dog": "gascity"}` (o `start` já ganha o piso de 150 s sozinho para estas sessões).
+2. `~/.gastown/remote-shim.json` no mini: `identity_pattern` = a linha `IDENTITY_PATTERN=` do `gc-session-ssh.md` (hoje o valor vivo é o estreito do passo 2 da 1.6, que recusa o nome de sessão do engine).
+3. `[session] provider = "hybrid"`, `remote_match = "-remote-"`, `remote_exec` no `city.toml` (`gc-session-ssh.md`, "Como ligar"), e `gc reload --soft` com prova de que as sessões locais seguiram vivas.
+4. Atribuir uma bead real ao `dog-remote-1`, nudge, e provar: `gc prime` rodou, hooks gc ok, `bd`/`gc` pelo atalho, commit e push pelo espelho, `gate-done`.
