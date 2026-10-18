@@ -24,6 +24,12 @@ O QUE FAZ
   (--settings, --dangerously-skip-permissions, --model, --remote-control...; o lançador de pool do mini, claude-ctxcap-ab.sh ou claude-lowprio.sh,
   que não existe no host, vira `claude`) mais o prompt de partida (prompt_suffix/prompt_flag do
   JSON do start — campos que o patch do engine acrescenta); grava tudo num lançador temporário que se apaga ao rodar.
+  PREPARO DO WORKTREE (ga-2hd02v.1.5.9, decisão do Mayor 17/10): no MESMO script, depois do teto e da existência e antes de criar qualquer coisa, o start grava no host
+  (1) a identidade git POR WORKTREE (`git config --worktree user.name <sessão>` e `user.email <sessão>@gastown.invalid`; num espelho BARE liga extensions.worktreeConfig e move o
+  core.bare para o config.worktree, senão o commit dos worktrees quebra; lê de volta e confere que a identidade que o git LÊ é a da sessão) e (2) a confiança da pasta em
+  {remote_home}/.claude.json (hasTrustDialogAccepted + hasCompletedProjectOnboarding do work_dir, troca atômica, modo mantido, lido de volta; arquivo ausente ou ilegível = nada é gravado).
+  A pasta tem que EXISTIR e ser um worktree git (o start não a cria: quem cria é o wt-add). Qualquer falha = exit 13 do script, start falha dizendo o motivo, nada abre e nenhum lançador
+  fica — a sessão nunca abre "meio pronta". Liga por padrão; o notebook do Athos (presence_gate) tem a identidade e a confiança DELE e fica de fora (padrão desligado).
   Falha de ssh = erro visível (stderr, exit 1, linha em <estado>/session-ssh.log) e nada pela metade; o mini não é tocado.
   "Não sei" nunca vira resposta: se o ssh responde mas o tmux do host não consegue olhar (ex.: socket sem permissão), as operações sobre
   sessões (todas, menos attach, que entrega o terminal ao tmux do host) saem com erro e o motivo — nunca `false`, lista vazia ou "há vaga". Sessão que não existe (tmux respondeu) segue o contrato do exec: stop,
@@ -59,13 +65,15 @@ CONFIGURAÇÃO  $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (cidade = pasta 
      "remote_root": "/home/runner/gt-remote/bundle", "remote_home": "/home/runner"}}}
   obrigatórios: ssh (alias/destino), cap (teto de sessões deste host, contado SÓ no socket do provider, separado do teto do mini),
   remote_root (= --remote-root do remote-bundle-build.py), remote_home. opcionais: socket (gc-remote), connect_timeout (10),
-  timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima). Só para o notebook (MBP): path_extra [] (dirs
+  timeout (25) e start_timeout (60) em segundos, ssh_opts [], env_allow [], mini_home, real_sessions_released_by (ver acima), worktree_prepare (true/false; padrão true, e false num host
+  com presence_gate: preparo do worktree no start, ver acima; texto no lugar de true/false é erro de configuração). Só para o notebook (MBP): path_extra [] (dirs
   absolutos à frente do PATH do ssh sem login: /opt/homebrew/bin), presence_gate (true), gate_cmd ([lista]), presence_lib (padrão
   <remote_home>/gt-remote/bin/mbp-presence.sh), watch_s (5), sleeps (true). Estado no mini:
   $GC_EXEC_STATE_DIR ou <cidade>/.gc/runtime/session-ssh, sempre em <estado>/<host>/. Não há padrão para o cap: sem ele não abre sessão.
 
 CÓDIGOS  0 ok · 1 erro (mensagem em stderr; "already exists" no start vira ErrSessionExists no engine) · 2 operação não suportada
-  (dentro do script do host, que o provider traduz em exit 1 com a mensagem: 10 teto, 11 já existe, 12 recusa de política no host: sessão real sem guarda de clone verificado, ou host de presença sem a biblioteca)
+  (dentro do script do host, que o provider traduz em exit 1 com a mensagem: 10 teto, 11 já existe, 12 recusa de política no host: sessão real sem guarda de clone verificado, ou host de presença sem a biblioteca,
+  13 o preparo do worktree falhou: pasta que não é worktree git, identidade git ou confiança da pasta que não foi gravada)
 """
 from __future__ import annotations
 
@@ -90,7 +98,7 @@ ENV_OK = re.compile(r"GC_[A-Z0-9_]+|TERM|LANG|LC_[A-Z_]+|TZ")
 SECRETISH = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIVATE", re.I)
 IGNORED = ("pre_start", "session_setup", "session_setup_script", "session_live", "pack_overlay_dirs", "overlay_dir", "copy_files", "nudge")
 BEGIN, END = "@@GC-BEGIN@@", "@@GC-END@@"
-EX_CAP, EX_EXISTS, EX_POLICY = 10, 11, 12
+EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP = 10, 11, 12, 13
 TEST_RE = re.compile(r"remote-(?:e2e|test)-[A-Za-z0-9_-]+")  # a sessão MÍNIMA de teste: a única que abre sem a liberação e sem o guarda de clone
 GUARD = "remote-clone-guard.py"
 # Lançadores de pool do MINI: claude-lowprio.sh baixa a prioridade (renice) e carrega o A/B de --effort; claude-ctxcap-ab.sh carrega o A/B de --autocompact
@@ -98,6 +106,52 @@ GUARD = "remote-clone-guard.py"
 # um arquivo que NÃO existe no host e o lançador derrubaria a sessão com "comando não encontrado" (ga-2hd02v.1.5.3, ponto em aberto 1): no host o
 # comando começa direto no `claude`, e a sessão remota fica FORA desses dois A/B (e do claude-lowprio.log).
 POOL_WRAPPER = "/packs/town-deltas/assets/scripts/claude-(?:ctxcap-ab|lowprio)\\.sh"
+# Preparo da pasta da sessão NO START (ga-2hd02v.1.5.9, decisão do Mayor 17/10): o servidor não tem identidade git e o claude não pré-confia a pasta (o diálogo
+# "confiar nesta pasta" seguraria a sessão), então o start grava as DUAS coisas por worktree e, se qualquer uma falhar, o start falha — a sessão nunca abre "meio pronta".
+# O código nasceu no PREPARE do hetzner-proof.py e2e (medido 17/10, 3 sessões reais sem diálogo); aquele passo agora só cria o worktree e deixa o resto para o start.
+# Roda dentro do mesmo script do start, depois do teto e da existência e ANTES de criar qualquer coisa. @NAME@ = a sessão (= autor dos commits), @WORKDIR@ = a pasta,
+# @TRUSTFILE@ = o ~/.claude.json do host. sh puro (dash): o ssh roda `sh`, não bash.
+PREPARE_SH = r"""W=@WORKDIR@; N=@NAME@; TF=@TRUSTFILE@
+pfail() { echo "preparo da sessão $N recusado: $1" >&2; exit @EXPREP@; }
+command -v git >/dev/null 2>&1 || pfail "git não está instalado no host"
+command -v python3 >/dev/null 2>&1 || pfail "python3 não está instalado no host"
+[ -d "$W" ] || pfail "$W não existe: a pasta da sessão tem que ser um worktree git já criado (wt-add)"
+# vazio (não diz "true") → recusa "não é um worktree git"; falhou (git ausente do repositório, pasta ilegível) → a mesma recusa: nenhum dos dois abre a sessão
+[ "$(git -C "$W" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] || pfail "$W não é um worktree git"
+C=$(cd "$W" && cd "$(git rev-parse --git-common-dir)" && pwd -P) || pfail "não achei o repositório de $W"
+# vazio (rc 1, chave ausente) → liga a extensão; falhou (rc > 1: config ilegível) → recusa, nunca "ausente"
+x=$(git -C "$C" config --get extensions.worktreeConfig); rc=$?; [ "$rc" -le 1 ] || pfail "não consegui ler extensions.worktreeConfig de $C"
+if [ "$x" != true ]; then  # ligado à mão num repo BARE, o core.bare compartilhado quebra o commit em todo worktree: ele vai para o config.worktree do principal
+  git -C "$C" config extensions.worktreeConfig true || pfail "não consegui ligar extensions.worktreeConfig em $C"
+  # vazio (rc 1, sem core.bare) → repositório comum, nada a mover; falhou (rc > 1) → recusa; true → move
+  b=$(git -C "$C" config --bool --get core.bare); rc=$?; [ "$rc" -le 1 ] || pfail "não consegui ler core.bare de $C"
+  if [ "$b" = true ]; then
+    { git -C "$C" config --worktree core.bare true && git -C "$C" config --unset core.bare; } || pfail "não consegui mover core.bare para o config.worktree de $C"
+  fi
+fi
+git -C "$W" config --worktree user.name "$N" && git -C "$W" config --worktree user.email "$N@gastown.invalid" || pfail "não consegui gravar a identidade git em $W"
+# vazio ou falhou (não lê nome/e-mail) → o teste de igualdade falha e a recusa sai; só a identidade EXATA da sessão passa
+[ "$(git -C "$W" config --get user.name)" = "$N" ] && [ "$(git -C "$W" config --get user.email)" = "$N@gastown.invalid" ] || pfail "a identidade git não ficou valendo em $W (outra camada de config a sobrepõe?)"
+python3 -I - "$TF" "$W" <<'PY' || pfail "não consegui gravar a confiança da pasta em $TF (ver a mensagem acima)"
+import json, os, sys, tempfile
+p, w = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(p))  # vazio ({}) → entra só o projeto da sessão; ausente/ilegível/forma estranha → o erro cai no except: nada é gravado, o start falha, nunca um arquivo novo no lugar do login do claude
+    pr = d.setdefault("projects", {}).setdefault(w, {})
+    pr.update(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)
+    pr.setdefault("allowedTools", [])
+    fd, t = tempfile.mkstemp(dir=os.path.dirname(p))
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f)
+    os.chmod(t, os.stat(p).st_mode & 0o777)
+    os.replace(t, p)
+    back = json.load(open(p))["projects"][w]  # lê de volta: o claude também regrava este arquivo, e gravação perdida não pode passar por feita
+    assert back["hasTrustDialogAccepted"] is True and back["hasCompletedProjectOnboarding"] is True
+except Exception as e:
+    print(f"{p}: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+"""
 # o ssh leva `sh -c '<RUNNER>'` (uma string, qualquer shell de login a entende) e o script vai pela entrada padrão: não há limite de
 # argv (o prompt tem dezenas de KB) e o script lê a entrada inteira ANTES de rodar, então comando nenhum dele a come.
 RUNNER = 'umask 077; f=$(mktemp) || exit 125; cat >"$f"; sh "$f" </dev/null; rc=$?; rm -f "$f"; exit $rc'
@@ -178,6 +232,11 @@ class Cfg:
         self.shim = isinstance(h.get("shim"), dict)  # bloco `shim` = o mini PUXA os pedidos de bd/gc das sessões (remote-shim-pump.py); sem ele, nada muda
         rb = h.get("real_sessions_released_by")
         self.released = rb.strip() if isinstance(rb, str) else ""  # só a decisão explícita do Mayor liga; ausente/vazio/não-texto = desligado
+        # preparo do worktree no start (identidade git + confiança da pasta): LIGADO por padrão; o notebook do Athos (presence_gate) tem a identidade e a confiança DELE,
+        # que o provider não escreve. `worktree_prepare` explícito vale nos dois sentidos; texto no lugar de true/false não desliga em silêncio (como presence_gate).
+        if "worktree_prepare" in h and not isinstance(h["worktree_prepare"], bool):
+            raise Fail(f"host {self.host}: 'worktree_prepare' tem que ser true ou false ({h['worktree_prepare']!r})")
+        self.prepare = h.get("worktree_prepare", not self.gate)
         base = os.environ.get("GC_EXEC_STATE_DIR") or os.path.join(self.city_guess, ".gc", "runtime", "session-ssh")
         self.state = os.path.join(base, re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.host)))
 
@@ -450,6 +509,13 @@ def shim_pump(cfg: Cfg) -> None:
         cfg.log(f"shim-pump ensure não rodou: {e}")
 
 
+def prepare_script(cfg: Cfg) -> str:
+    """'' = este host não prepara (notebook do Athos); senão o trecho de sh do PREPARE_SH com os marcadores do start ainda por substituir."""
+    if not cfg.prepare:
+        return ""
+    return PREPARE_SH.replace("@TRUSTFILE@", q(f"{cfg.home}/.claude.json")).replace("@EXPREP@", str(EX_PREP))
+
+
 def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     try:
         req = json.loads(sys.stdin.read() or "{}")
@@ -477,6 +543,7 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     lpath = f"{run_dir}/{name}.sh"
     if dry:
         print(json.dumps(dict(p, host=cfg.host, session=name, session_kind="teste" if TEST_RE.fullmatch(name) else "real", would_refuse=would_refuse, launcher=launcher(cfg, name, p).split("\n"),
+                              prepare=({"git_user": name, "git_email": f"{name}@gastown.invalid", "trust_file": f"{cfg.home}/.claude.json", "work_dir": p["work_dir"]} if cfg.prepare else None),
                               gate=cfg.gate_cmd if cfg.gate else None, path_extra=cfg.path_extra,
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
@@ -485,13 +552,13 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
 @GATE@printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
 n=$(printf '%s\\n' "$s" | grep -c .)
 [ "$n" -lt @CAP@ ] || { echo "host @HOST@ está no teto: $n de @CAP@ sessões" >&2; exit 10; }
-@PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
+@PREP@@PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
 rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1
 T new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" || { rm -f @LAUNCH@; exit 1; }
 sleep 1
 T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@; exit 1; }"""
     plib = f'[ -r {q(cfg.plib)} ] || {{ echo "host @HOST@: sem a biblioteca de presença ({cfg.plib}); rode mbp-offload.sh install-mbp" >&2; exit 12; }}\n' if cfg.gate else ""
-    body = body.replace("@PLIBCHECK@", plib)
+    body = body.replace("@PLIBCHECK@", plib).replace("@PREP@", prepare_script(cfg))
     for k, v in {"@NAME@": q(name), "@CAP@": str(cap), "@HOST@": q(cfg.host), "@RUN@": q(run_dir), "@WORKDIR@": q(p["work_dir"]),
                  "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name),
                  "@B64@": q(base64.b64encode(launcher(cfg, name, p).encode()).decode())}.items():
@@ -505,9 +572,11 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
         rc, out, err = remote(cfg, body, cfg.start_timeout)
         if rc not in (0, EX_EXISTS):
             cfg.mark(name, False)
-    if rc in (EX_CAP, EX_EXISTS, EX_POLICY):
+    if rc in (EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP):
         if rc == EX_CAP:
             cfg.event("refused", name, reason="teto do host")
+        if rc == EX_PREP:
+            cfg.log(f"start {name} recusado: preparo do worktree falhou: {err[:300]}")
         raise Fail(err or f"start de {name} recusado em {cfg.host} (rc={rc}, sem mensagem)")
     if rc != 0:
         raise Fail(f"start em {cfg.host} falhou (rc={rc}): {err or out or 'sem mensagem'}")

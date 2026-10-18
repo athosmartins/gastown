@@ -11,6 +11,9 @@
 #   falha ou estoura o prazo, ssh fora, o hook rápido medido por si (não herda o tempo do lento) · e2e — sessão de ponta a ponta contra um provider falso com modos de falha (sem push, sem comentário, sem handoff,
 #   sha diferente, identidade de outro autor, transcrição sem os hooks gc, hook com erro, hook gc cancelado pelo prazo do claude, linha ilegível, erro no meio, diálogo, sessão que morre, que trava), sem gate, sem atalho, sem worktree, pull do espelho com erro, --bead/--model com cara de comando, sessão velha: cada prova reprova sozinha, o diálogo NUNCA é
 #   respondido e a sessão é parada em todo caminho
+#   ga-2hd02v.1.5.9 (no grupo e2e): o PREPARE do driver só cria o worktree e o provider falso GRAVA a identidade e a confiança no start (como o de verdade) — o driver as CONFERE por fora (modos notrust, noident, prepfail);
+#   o claude do servidor não pode mudar de versão nem de .last-update-result.json durante a sessão (modo autoupdate; versão ilegível antes = não começa); --prompts N manda N prompts à mesma sessão e prova que todos
+#   foram respondidos, que cada um deixou o seu registro de hook (sem registro não há como dizer que nenhum foi cancelado) e que nenhum hook gc de UserPromptSubmit foi cancelado ou saiu ≠ 0 (modos pcancel, pfail, pnoreply, pnudgefail, pnorows, pmissone; --prompts fora de 0..100 = uso); leituras que FALHAM nunca viram "gravado"/"nenhum cancelado": ~/.claude.json ilegível/ausente depois do start (badjson, nojson) e transcrição ilegível ANTES/DEPOIS dos prompts (FAKE_HOOKLOG_FAIL_FROM=2/3) → a prova reprova "não consegui ler".
 # CONTROLE NEGATIVO: cada guarda é apagada do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar.
 # VARIÁVEIS: HPROOF_UNDER_TEST (script a testar) · HPROOF_ONLY (grupos separados por vírgula; ou o argumento --only=a,b) · HPROOF_NO_MUTANTS=1 (ou --no-mutants) · HPROOF_DEBUG=1 (ou --debug: mostra a saída do driver em cada caso do e2e) · HPROOF_REAL_HOOKS (padrão ~/.claude/hooks)
 set -u
@@ -35,6 +38,14 @@ cat > "$T/bin/ssh" <<'EOF'
 [ -z "${FAKE_SSH_DEAD:-}" ] || { echo "ssh: connect to host fake port 22: Connection refused" >&2; exit 255; }
 while [ "${1#-}" != "$1" ]; do case $1 in -o) shift 2;; *) shift;; esac; done
 shift
+# FAKE_HOOKLOG_FAIL_FROM=N: a leitura da transcrição (o script HOOKLOG, o único que traz a palavra "unreadable") falha da N-ésima chamada em diante (1 = a do evidence, 2 = a de ANTES dos prompts, 3 = a de DEPOIS).
+# O driver manda o script pela ENTRADA (não pelos argumentos): só com a variável posta a entrada é lida inteira, olhada e devolvida ao comando por um arquivo (sem ela, nada muda: a entrada segue direto).
+if [ -n "${FAKE_HOOKLOG_FAIL_FROM:-}" ]; then
+  in=$(cat); printf '%s\n' "$in" > "$FAKE_STATE/ssh.in"
+  case "$in" in *unreadable*) n=$(cat "$FAKE_STATE/hooklog.n" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$FAKE_STATE/hooklog.n"
+    [ "$n" -lt "$FAKE_HOOKLOG_FAIL_FROM" ] || { echo "ssh: falha falsa na leitura da transcrição (chamada $n)" >&2; exit 255; };; esac
+  exec < "$FAKE_STATE/ssh.in"
+fi
 [ -z "${FAKE_JQ_BAD:-}" ] || PATH="$FAKE_JQ_BAD:$PATH"
 HOME="$SRV" PATH="$SRV/.local/bin:$PATH" exec sh -c "$1"
 EOF
@@ -83,6 +94,8 @@ session() {  # a "sessão" do servidor: os 7 passos do prompt, com o modo de fal
   esac
   bd show ga-x --json > /dev/null; [ $mode = nocomment ] || bd comment ga-x "remote-e2e-1: sessao remota minima $run leu esta bead"
   idopt=; [ $mode != wrongid ] || idopt="-c user.name=outro -c user.email=outro@x.invalid"
+  [ $mode != noident ] || idopt="-c user.name=remote-e2e-1 -c user.email=remote-e2e-1@gastown.invalid"  # (o start não gravou a identidade: a sessão comita com -c, o autor sai certo mas NADA ficou no worktree)
+  [ $mode != autoupdate ] || { echo 2.1.303 > "$HOME/.claude-version"; printf '{"outcome":"success","to":"2.1.303"}\n' > "$HOME/.claude/.last-update-result.json"; }
   mkdir -p e2e; echo "remote-e2e $run" > "e2e/$run.txt"; git add "e2e/$run.txt"; git $idopt commit -q -m "chore(remote-e2e): $run" || { echo "commit falhou" > "$S/pane"; return; }
   [ $mode = nopush ] || git push -q origin HEAD 2>/dev/null
   [ $mode != shamismatch ] || git commit -q --amend -m "outra mensagem"
@@ -104,11 +117,38 @@ case "$op" in
   is-running) [ -f "$S/running" ] && echo true || echo false;;
   peek) cat "$S/pane" 2>/dev/null;;
   stop) rm -f "$S/running";;
-  start) req=$(cat); : > "$S/pane"; touch "$S/running"
-         wt=$(printf '%s' "$req" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["work_dir"])'); ( session "$wt" "$(basename "$wt")" ) > /dev/null 2>&1 &;;
+  start) req=$(cat); : > "$S/pane"
+         wt=$(printf '%s' "$req" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["work_dir"])')
+         [ "${FAKE_MODE:-}" != prepfail ] || { echo "preparo da sessão remote-e2e-1 recusado: falso" >&2; exit 1; }
+         # o START do provider de verdade grava a identidade git do worktree e a confiança da pasta ANTES de abrir a sessão (ga-2hd02v.1.5.9)
+         [ "${FAKE_MODE:-}" = noident ] || { git -C "$wt" config user.name remote-e2e-1; git -C "$wt" config user.email remote-e2e-1@gastown.invalid; }
+         # (notrust: a entrada da pasta existe mas SEM a confiança — é o que o driver tem de pegar pelo valor, não só pela entrada que falta; o claude consome hasCompletedProjectOnboarding sozinho, por isso a fake grava só hasTrustDialogAccepted)
+         HOME="$SRV" python3 -I -c 'import json,os,sys; p=os.path.expanduser("~/.claude.json"); d=json.load(open(p)); d.setdefault("projects",{})[sys.argv[1]]={"hasTrustDialogAccepted":sys.argv[2]=="1","allowedTools":[]}; json.dump(d,open(p,"w"))' "$wt" "$([ "${FAKE_MODE:-}" = notrust ] && echo 0 || echo 1)"
+         # badjson / nojson: o ~/.claude.json do servidor fica ILEGÍVEL / AUSENTE depois do start (o claude também o regrava): o driver não pode dar a confiança por gravada
+         [ "${FAKE_MODE:-}" != badjson ] || printf '{ isto nao e json' > "$SRV/.claude.json"
+         [ "${FAKE_MODE:-}" != nojson ] || rm -f "$SRV/.claude.json"
+         [ "${FAKE_MODE:-}" != noperm ] || chmod 000 "$SRV/.claude.json"  # existe mas sem permissão de leitura (quem é root lê tudo: o caso é pulado lá)
+         touch "$S/running"
+         ( session "$wt" "$(basename "$wt")" ) > /dev/null 2>&1 &;;
+  nudge) txt=$(cat); i=$(printf '%s' "$txt" | sed -n 's/.*Compute 1000+\([0-9]*\) .*/\1/p')
+         [ "${FAKE_MODE:-}" != pnudgefail ] || { echo "nudge: falha falsa" >&2; exit 1; }
+         [ "${FAKE_MODE:-}" = pnoreply ] && [ "$i" = 2 ] && exit 0  # o 3º prompt (i = 2) nunca é respondido
+         echo "PONG$((1000+i))" >> "$S/pane"
+         for t in "$SRV"/.claude/projects/-fake-*/s.jsonl; do :; done
+         row() { printf '{"attachment":{"type":"%s","hookEvent":"UserPromptSubmit","command":"export PATH=x && gc nudge drain --inject","durationMs":%s,"exitCode":%s%s}}\n' "$1" "$2" "$3" "$4" >> "$t"; }
+         if [ "${FAKE_MODE:-}" = pcancel ] && [ "$i" = 1 ]; then row hook_cancelled 30500 null ',"timedOut":true,"timeoutMs":30000'
+         elif [ "${FAKE_MODE:-}" = pfail ] && [ "$i" = 1 ]; then row hook_success 700 1 ''
+         elif [ "${FAKE_MODE:-}" = pnorows ] || { [ "${FAKE_MODE:-}" = pmissone ] && [ "$i" = 1 ]; }; then :  # a sessão RESPONDEU, mas o prompt não deixou registro de hook (os hooks podem nem ter rodado)
+         else row hook_success 900 0 ''; fi;;
 esac
 EOF
-chmod +x "$T/bin/"* "$SRV/gt-remote/bin/hetzner-remote-git.sh" "$T/fakeprov"; cp "$T/bin/bd" "$T/bin/gc" "$SRV/.local/bin/"
+chmod +x "$T/bin/"* "$SRV/gt-remote/bin/hetzner-remote-git.sh" "$T/fakeprov"; cat > "$SRV/.local/bin/claude" <<'EOF'
+#!/bin/sh
+[ -z "${FAKE_CLAUDE_FAIL:-}" ] || { echo "claude: falha falsa" >&2; exit 1; }
+echo "$(cat "$HOME/.claude-version" 2>/dev/null) (Claude Code)"
+EOF
+chmod +x "$SRV/.local/bin/claude"
+cp "$T/bin/bd" "$T/bin/gc" "$SRV/.local/bin/"
 export PATH="$T/bin:$PATH"
 
 # ---------------------------------------------------------------- unit
@@ -181,14 +221,15 @@ e2e_fixture() {  # estado limpo a cada caso: sessão, comentários, mail, origin
   git -C "$SRV/gt-remote/git/gascity/repo.git" remote set-url origin "$T/origin.git"
   git init -q --bare "$CITY/.gc/hetzner-mirror/repos/gascity.git"; git -C "$CITY/.gc/hetzner-mirror/repos/gascity.git" config remote.origin.url "$T/origin.git"
   printf '{"projects":{}}\n' > "$SRV/.claude.json"; printf '{}\n{}\n' > "$SRV/.claude/usage-analytics.jsonl"
+  echo 2.1.302 > "$SRV/.claude-version"; printf '{"outcome":"success"}\n' > "$SRV/.claude/.last-update-result.json"
 }
 ep() { sleep 1; e2e_fixture; HOME="$MINI" GC_CITY_PATH="$CITY" HETZNER_PROOF_PROV="$T/fakeprov" HETZNER_PROOF_GATE="$T/fakegate.py" HETZNER_REMOTE_HOME="$SRV" HETZNER_PROOF_POLL=0.3 python3 -I "$P" e2e --timeout "${TMO:-30}" "$@" > "$T/out" 2> "$T/err"; RC=$?; [ -z "${HPROOF_DEBUG:-}" ] || { cat "$T/out" "$T/err" >&2; }; }
 calls() { grep -c "^$1" "$FAKE_STATE/provcalls" 2> /dev/null || true; }
 g_e2e() {
-  FAKE_MODE=ok ep; [ $RC = 0 ] && has "$T/out" "E2E PASSOU: 10 de 10 provas"; ok $? "e2e: sessão completa → 10 de 10 provas, saída 0 (rc=$RC)"
+  FAKE_MODE=ok ep; [ $RC = 0 ] && has "$T/out" "E2E PASSOU: 12 de 12 provas"; ok $? "e2e: sessão completa → 12 de 12 provas, saída 0 (rc=$RC)"
   has "$T/out" "PASS a branch chegou ao origin, com o mesmo sha do servidor"; ok $? "e2e: o sha da branch no origin é o do commit do servidor"
   [ "$(calls stop)" -ge 1 ] && [ ! -e "$FAKE_STATE/running" ]; ok $? "e2e: a sessão foi parada pelo provider no fim"
-  python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); p=[k for k,v in d["projects"].items() if v.get("hasTrustDialogAccepted")]; assert len(p)==1 and "/wt/remote-e2e-" in p[0]' "$SRV/.claude.json"; ok $? "e2e: a pasta do worktree foi pré-confiada em ~/.claude.json (e só ela)"
+  python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); p=[k for k,v in d["projects"].items() if v.get("hasTrustDialogAccepted")]; assert len(p)==1 and "/wt/remote-e2e-" in p[0]' "$SRV/.claude.json"; ok $? "e2e: a pasta do worktree foi pré-confiada em ~/.claude.json pelo START (e só ela)"
   [ ! -d "$SRV/gt-remote/git/gascity/wt" ] || [ -z "$(ls "$SRV/gt-remote/git/gascity/wt")" ]; ok $? "e2e: o worktree é removido no fim"
   FAKE_MODE=ok ep --keep; [ -n "$(ls "$SRV/gt-remote/git/gascity/wt")" ]; ok $? "e2e: --keep deixa o worktree"
   FAKE_MODE=nopush ep; [ $RC = 1 ] && has "$T/out" "FAIL a branch chegou ao origin"; ok $? "e2e: sem push → a prova da branch reprova, saída 1 (rc=$RC)"
@@ -215,6 +256,33 @@ g_e2e() {
   FAKE_WT_FAIL=1 ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ]; ok $? "e2e: worktree que não saiu → não começa, saída 3 (rc=$RC)"
   FAKE_WT_PULL=erro ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ]; ok $? "e2e: o pull do espelho falhou (worktree sairia de um main velho) → não começa, saída 3 (rc=$RC)"
   FAKE_SSH_DEAD=1 ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ]; ok $? "e2e: ssh fora → não começa, saída 3 (rc=$RC)"
+  FAKE_MODE=ok ep
+  has "$T/out" "PASS o START gravou a identidade git do worktree e a confiança da pasta" && has "$T/out" "PASS claude do servidor NÃO se atualizou durante a sessão"; ok $? "e2e: o driver CONFERE por fora o que o start gravou e que a versão do claude não mudou"
+  has "$T/out" "worktree criado (identidade git e pasta pré-confiada ficam para o START do provider)"; ok $? "e2e: o PREPARE do driver só cria o worktree (a identidade e a confiança não são mais dele)"
+  FAKE_MODE=notrust ep; [ $RC = 1 ] && has "$T/out" "FAIL o START gravou a identidade git do worktree e a confiança da pasta"; ok $? "e2e: o start NÃO gravou a confiança da pasta → a prova reprova (rc=$RC)"
+  FAKE_MODE=noident ep; [ $RC = 1 ] && has "$T/out" "FAIL o START gravou a identidade git do worktree e a confiança da pasta" && has "$T/out" "PASS commit no worktree do servidor, com a identidade da sessão"; ok $? "e2e: o start NÃO gravou a identidade (a sessão comitou com -c, autor certo mas nada no worktree) → só a prova do start reprova (rc=$RC)"
+  FAKE_MODE=prepfail ep; [ $RC = 1 ] && has "$T/out" "FAIL start pelo provider" && has "$T/out" "preparo da sessão remote-e2e-1 recusado"; ok $? "e2e: o start recusa o preparo → a prova do start reprova com a mensagem do provider e nada roda (rc=$RC)"
+  FAKE_MODE=autoupdate ep; [ $RC = 1 ] && has "$T/out" "FAIL claude do servidor NÃO se atualizou durante a sessão" && has "$T/out" "2.1.302"; ok $? "e2e: o claude do servidor se atualiza no meio da sessão → a prova da versão reprova dizendo antes e depois (rc=$RC)"
+  FAKE_CLAUDE_FAIL=1 ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ]; ok $? "e2e: não consigo ler a versão do claude ANTES → não começa, saída 3 (versão desconhecida não vira 'estável') (rc=$RC)"
+  FAKE_MODE=ok ep --prompts 3 --prompt-timeout 5; [ $RC = 0 ] && has "$T/out" "E2E PASSOU: 14 de 14 provas" && has "$T/out" "PASS 3 prompts respondidos pela sessão remota" && [ "$(calls nudge)" = 3 ]; ok $? "e2e: --prompts 3 → 3 nudges, 3 respostas, 14 de 14 provas (rc=$RC)"
+  has "$T/out" "PASS 3 prompts: nenhum hook gc de UserPromptSubmit cancelado pelo prazo nem com erro"; ok $? "e2e: ...e nenhum hook gc de UserPromptSubmit cancelado nem com erro nos 3 prompts"
+  FAKE_MODE=pcancel ep --prompts 3 --prompt-timeout 5; [ $RC = 1 ] && has "$T/out" "FAIL 3 prompts: nenhum hook gc de UserPromptSubmit cancelado pelo prazo nem com erro" && has "$T/out" "hook_cancelled"; ok $? "e2e: um hook gc cancelado pelo prazo num dos prompts → a prova reprova (os prompts foram respondidos, o hook não) (rc=$RC)"
+  FAKE_MODE=pfail ep --prompts 3 --prompt-timeout 5; [ $RC = 1 ] && has "$T/out" "FAIL 3 prompts: nenhum hook gc de UserPromptSubmit cancelado pelo prazo nem com erro"; ok $? "e2e: um hook gc com saída ≠ 0 num dos prompts → reprova (rc=$RC)"
+  FAKE_MODE=pnorows ep --prompts 3 --prompt-timeout 5; [ $RC = 1 ] && has "$T/out" "PASS 3 prompts respondidos pela sessão remota" && has "$T/out" "FAIL 3 prompts: nenhum hook gc de UserPromptSubmit cancelado pelo prazo nem com erro" && has "$T/out" "0 novos"; ok $? "e2e: os 3 prompts foram respondidos mas NENHUM deixou registro de hook → reprova (sem registro não há como dizer que nenhum foi cancelado) (rc=$RC)"
+  FAKE_MODE=pmissone ep --prompts 3 --prompt-timeout 5; [ $RC = 1 ] && has "$T/out" "FAIL 3 prompts: nenhum hook gc de UserPromptSubmit cancelado pelo prazo nem com erro" && has "$T/out" "2 novos"; ok $? "e2e: um dos 3 prompts não deixou registro (2 novos de 3 esperados) → reprova (rc=$RC)"
+  # leituras que FALHAM (ga-2hd02v.1.5.9): "não consegui ler" nunca vira "gravado" nem "nenhum cancelado" — a prova reprova
+  FAKE_MODE=badjson ep; [ $RC = 1 ] && has "$T/out" "FAIL o START gravou a identidade git do worktree e a confiança da pasta"; ok $? "e2e: o ~/.claude.json do servidor está ILEGÍVEL depois do start → a prova do start reprova, não a dá por gravada (rc=$RC)"
+  FAKE_MODE=nojson ep; [ $RC = 1 ] && has "$T/out" "FAIL o START gravou a identidade git do worktree e a confiança da pasta"; ok $? "e2e: o ~/.claude.json do servidor está AUSENTE depois do start → a prova do start reprova (rc=$RC)"
+  if [ "$(id -u)" = 0 ]; then echo "SKIP  e2e: ~/.claude.json sem permissão de leitura: este usuário lê tudo (root)"; else
+    FAKE_MODE=noperm ep; _rc=$RC; chmod 600 "$SRV/.claude.json" 2> /dev/null  # devolve a permissão ANTES de qualquer outro caso: o e2e_fixture regrava este arquivo
+    [ $_rc = 1 ] && has "$T/out" "FAIL o START gravou a identidade git do worktree e a confiança da pasta"; ok $? "e2e: o ~/.claude.json do servidor existe mas NÃO pode ser lido (chmod 000) → a prova do start reprova (rc=$_rc)"
+  fi
+  FAKE_MODE=ok FAKE_HOOKLOG_FAIL_FROM=2 ep --prompts 3 --prompt-timeout 5; [ $RC = 1 ] && has "$T/out" "FAIL 3 prompts: hooks gc de UserPromptSubmit lidos na transcrição" && has "$T/out" "ANTES dos prompts" && [ "$(calls nudge)" = 0 ]; ok $? "e2e: a transcrição não pôde ser lida ANTES dos prompts → nenhum prompt é mandado e a prova reprova (rc=$RC, nudges=$(calls nudge))"
+  FAKE_MODE=ok FAKE_HOOKLOG_FAIL_FROM=3 ep --prompts 3 --prompt-timeout 5; [ $RC = 1 ] && has "$T/out" "FAIL 3 prompts: hooks gc de UserPromptSubmit lidos na transcrição" && has "$T/out" "DEPOIS dos prompts" && [ "$(calls nudge)" = 3 ]; ok $? "e2e: a transcrição não pôde ser lida DEPOIS dos prompts → a prova reprova com 'não consegui ler', nunca 'nenhum cancelado' (rc=$RC)"
+  FAKE_MODE=pnoreply ep --prompts 3 --prompt-timeout 2; [ $RC = 1 ] && has "$T/out" "FAIL 3 prompts respondidos pela sessão remota" && has "$T/out" "2 de 3"; ok $? "e2e: o 3º prompt não é respondido no prazo → para ali e reprova com a contagem (2 de 3) (rc=$RC)"
+  FAKE_MODE=pnudgefail ep --prompts 3 --prompt-timeout 2; [ $RC = 1 ] && has "$T/out" "nudge falhou" && has "$T/out" "FAIL 3 prompts respondidos pela sessão remota"; ok $? "e2e: o nudge falha → o prompt NÃO conta como respondido e a prova reprova (rc=$RC)"
+  FAKE_MODE=ok ep --prompts 101; [ $RC = 2 ] && [ ! -e "$FAKE_STATE/provcalls" ]; ok $? "e2e: --prompts 101 → erro de uso 2 antes de tocar no servidor (rc=$RC)"
+  FAKE_MODE=ok ep --prompts -1; [ $RC = 2 ]; ok $? "e2e: --prompts -1 → erro de uso 2 (rc=$RC)"
   e2e_fixture; touch "$FAKE_STATE/running"; sleep 1
   HOME="$MINI" GC_CITY_PATH="$CITY" HETZNER_PROOF_PROV="$T/fakeprov" HETZNER_PROOF_GATE="$T/fakegate.py" HETZNER_REMOTE_HOME="$SRV" HETZNER_PROOF_POLL=0.3 FAKE_MODE=ok python3 -I "$P" e2e --timeout 30 > "$T/out" 2> "$T/err"; RC=$?
   [ $RC = 0 ] && [ "$(grep -n '^stop' "$FAKE_STATE/provcalls" | head -1 | cut -d: -f1)" -lt "$(grep -n '^start' "$FAKE_STATE/provcalls" | head -1 | cut -d: -f1)" ]; ok $? "e2e: sobra de sessão 'remote-e2e-1' é parada ANTES de abrir a nova (rc=$RC)"
@@ -245,7 +313,17 @@ echo "== $((n-fails))/$n ok =="
   mutant e2e "handoff conta mail de antes da rodada" 's/x.get("created_at", "") >= self.t0/True/'
   mutant e2e "hook de log sem comparar a contagem" 's/int(n.group(1)) > self.analytics0/True/'
   mutant e2e "diálogo ignorado" 's/if any(d in seen for d in DIALOGS):/if False:/'
-  mutant e2e "worktreeConfig ligado à mão sem mover o core.bare (o commit do worktree quebra)" 's/  git -C "$R\/repo.git" config --worktree core.bare true \&\& git -C "$R\/repo.git" config --unset core.bare/  true/'
+  mutant e2e "o driver não confere o que o start gravou (confiança)" "s/ and '\"trust\": true' in o2//"
+  mutant e2e "o driver não confere o que o start gravou (identidade)" 's/ident = o2.splitlines()\[:2\] == \[ALIAS, f"{ALIAS}@gastown.invalid"\]/ident = True/'
+  mutant e2e "versão do claude depois não é comparada com a de antes" 's/ver1 is not None and ver1 == self.ver0,/True,/'
+  mutant e2e "versão do claude desconhecida antes da sessão não impede de começar" 's/ and self.ver0 is not None//'
+  mutant e2e "prompt contado como respondido sem ver a resposta" 's/                got = want in self.out(self.prov("peek", ALIAS, "250"))/                got = True/'
+  mutant e2e "hook gc cancelado/com erro nos prompts não reprova" 's/        broke = \[r for r in ups if not (r\["kind"\] == "hook_success" and r\["rc"\] == 0)\]/        broke = []/'
+  mutant e2e "nudge que falha segue como se tivesse ido" 's/            if p.returncode != 0:/            if False:/'
+  mutant e2e "--prompts sem limite" 's/    if a.cmd == "e2e" and not 0 <= a.prompts <= 100:/    if False:/'
+  mutant e2e "prompt respondido sem registro de hook passa (só 'nenhum cancelado')" 's/ and new >= answered,$/,/'
+  mutant e2e "registros novos contados sem descontar os que já existiam (o da partida cobre o que falta)" 's/new = len(ups) - len(before\[0\])/new = len(ups)/'
+  mutant e2e "leitura da transcrição que falha vira lista vazia (0 registros) em vez de 'não consegui ler'" '/não consegui ler os hooks da transcrição/{n;s/return None/return [], 0/;}'
   mutant e2e "hook gc cancelado pelo prazo vira 'ok' em silêncio" 's/f"cancelado pelo prazo de {r\[.timeout.\]} ms" if r\["timeout"\] else "ok"/"ok" if True else "ok"/'
   mutant e2e "hook gc com erro passa como cancelado" 's/all(out(r) == "ok" or r\["timeout"\] for r in gc)/True/'
   mutant e2e "argumentos que vão ao shell remoto sem validar" 's/        if not re.fullmatch(rx, v):/        if False:/'

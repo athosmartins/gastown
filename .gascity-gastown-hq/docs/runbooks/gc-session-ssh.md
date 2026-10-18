@@ -31,6 +31,7 @@ Bead ga-2hd02v.1.1 (fatia 2 do ga-2hd02v, desenho do estudo ga-ukxa3k, aprovada 
 | `connect_timeout`, `timeout`, `start_timeout` | não (10, 25, 60 s) | prazos; o `start` leva `start_timeout` |
 | `env_allow` | não | nomes de variável com cara de segredo que PODEM ir (ver abaixo) |
 | `ssh_opts` | não | opções extras do ssh (`["-p","2222"]`) |
+| `worktree_prepare` | não (`true`; `false` num host com `presence_gate`) | liga o **preparo do worktree no `start`** (identidade git + confiança da pasta, ver “Preparo do worktree”); texto no lugar de `true`/`false` é erro de configuração |
 | `real_sessions_released_by` | não (ausente = só `remote-e2e-<x>`/`remote-test-<x>` abrem) | decisão EXPLÍCITA do Mayor de liberar sessão real; mesmo com ela, o `start` confere no host o guarda de clone e sai 12 se faltar (ver `hetzner-hardening.md`) |
 
 O host vem de `$GC_SSH_HOST` ou de `default_host`. Estado no mini: `$GC_EXEC_STATE_DIR` ou `<cidade>/.gc/runtime/session-ssh/<host>/` (`session-ssh.log`, `lock`, `meta/`).
@@ -70,6 +71,17 @@ Cada operação é **um ssh** (ControlMaster em `~/.ssh/cm`, o mesmo do `mbp-run
 | `set-meta`, `get-meta`, `remove-meta` | ficam **no mini** (`<estado>/meta`); nada de meta vai para o servidor |
 | `attach` | `ssh -t … tmux attach` |
 | `check-image`, `copy-to`, `watch-startup`, `run-live` e qualquer operação desconhecida | **exit 2 (“não suportado”)**, sem abrir ssh, sem ler a entrada, sem tocar em sessão |
+
+### Preparo do worktree no `start` (ga-2hd02v.1.5.9)
+
+Decisão do Mayor (17/10): sessão real não abre sem identidade git e sem a pasta confiada, e não abre "meio pronta". No MESMO script do `start`, depois do teto e da existência e **antes** de criar qualquer coisa, o provider grava no host:
+
+1. **Identidade git por worktree**: `git config --worktree user.name <sessão>` e `user.email <sessão>@gastown.invalid` (o autor dos commits da sessão remota é o nome dela). Num espelho BARE sem `extensions.worktreeConfig` o passo liga a extensão e move o `core.bare` do config compartilhado para o `config.worktree` do principal (sem isso o commit dos worktrees quebra); o `wt-add` já deixa isso certo, o passo é a rede de segurança. Depois **lê de volta**: o `user.name`/`user.email` que o git LÊ no worktree tem de ser os da sessão (outra camada de config que os sobreponha reprova).
+2. **Confiança da pasta**: `projects[<work_dir>].hasTrustDialogAccepted` e `hasCompletedProjectOnboarding` em `{remote_home}/.claude.json`, troca atômica (arquivo temporário + `os.replace`), modo do arquivo mantido, lido de volta. Arquivo ausente, ilegível ou com forma que não conheço (`projects` que não é objeto): **nada é gravado** e o start falha (nunca um arquivo novo no lugar do login do claude). O claude também regrava esse arquivo, então uma gravação perdida numa corrida é possível — por isso a leitura de volta; o efeito seria a sessão parar no diálogo de confiança, que o `hetzner-proof.py e2e` reconhece e não responde.
+
+A pasta (`work_dir` já reescrito) **tem de existir e ser um worktree git**: o start não a cria (quem cria é o `hetzner-remote-git.sh wt-add`) e uma pasta comum recusa. Qualquer falha sai **exit 13** do script do host, o provider falha o `start` com `preparo da sessão <nome> recusado: <motivo>` e nada abre (nenhum lançador, nenhuma sessão, a pasta ausente não vira diretório comum). A identidade vem antes da confiança: com a identidade falhando a confiança nem é tocada.
+
+**Padrão e exceção.** Liga em todo host, menos nos de `presence_gate` (o MBP, notebook do Athos, que tem a identidade e a confiança DELE e que o provider não escreve); `worktree_prepare` explícito vale nos dois sentidos. `--dry-run start` mostra o que gravaria em `prepare` (`git_user`, `git_email`, `trust_file`, `work_dir`; `null` se o host não prepara). Selftest: grupo `prep` (41 casos) e 12 mutantes.
 
 ### O comando do `start` é o mesmo do local
 

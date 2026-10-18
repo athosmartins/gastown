@@ -41,12 +41,17 @@
 #   DESTINO EM /Users/ (o MBP, ga-w7qwl1.1): com --remote-root /Users/athos/gt-remote/bundle e --remote-home <raiz>/home o build sai 0, todo /Users/ do
 #   bundle fica sob a raiz, nada é reescrito duas vezes (o home do mini é prefixo do destino), o guarda de clone aponta para o home DO BUNDLE, verify sai 0; /Users/ de outro
 #   usuário, vizinho da raiz (…bundlex), a raiz precedida de outro caminho (/xx/Users/…) e outro caminho do mesmo usuário fora da raiz seguem recusando; o bundle do servidor tem o mesmo hash de antes.
+#   PRAZO E AUTOUPDATE (ga-2hd02v.1.5.9): os 2 hooks gc de UserPromptSubmit (nudge drain, mail check) saem com timeout 120 e SÓ eles (nem handoff/prime, nem o mesmo mail check em Stop, nem gc prime dentro de
+#   UserPromptSubmit); prazo MAIOR do mini fica, MENOR sobe, ilegível (texto, true, 0, -5) recusa; os settings do mini (entrada) não são tocados; o settings de USUÁRIO fixa env.DISABLE_AUTOUPDATER=1 (e só ele: city e
+#   papel não), preserva as outras chaves do env, `env` que não é objeto recusa; o manifest guarda `timeout` por hook e `pinned_env`. Mutantes: sem a chamada, sem a condição do evento, sem o filtro dos 2 tokens, sem o max(),
+#   sem a validação, sem o env.update, fixação em toda camada, sem o campo do manifest, sem o timeout do manifest.
 # CONTROLE NEGATIVO: a tabela POLICY perde a linha de um hook (sed) e o mesmo build TEM que passar a recusar — keep (filter-bash-output.sh)
 #   e drop (gt tap guard cross-clone-block, home-scan-guard, ntfy-on-stop.sh). Skills: sem a exclusão por nome as 3 com CPF/CNPJ recusam; exclusão por substring deixaria a renomeada
 #   passar; sem as linhas de CPF/CNPJ de SECRETS a 4ª skill passaria. MBP: sem a guarda que reconhece a raiz do destino o build recusa tudo; reescrita em sequência
 #   ou reescrever o hook do guarda de novo corrompe o caminho do destino.
 #   Swap: o builder sem uma peça do swap (`|| exit 2`, o grupo
 #   Edit|Write, o arquivo do guarda, a troca em si) gera settings que o --selfcheck do guarda reprova.
+# VARIÁVEIS: BUNDLE_BUILD_UNDER_TEST (builder a testar) · BUNDLE_NO_MUTANTS=1 (só os casos, sem o controle negativo; o resumo diz "sem mutantes").
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 B="${BUNDLE_BUILD_UNDER_TEST:-$HERE/remote-bundle-build.py}"
@@ -546,6 +551,38 @@ if lock "$T/f/out/$KS"; then
   [ $rc = 4 ] && ! has "$T/err" Traceback; ok $? "verify com arquivo do manifest ilegível sai 4 com mensagem, sem traceback (rc=$rc)"
 else echo "SKIP  verify com arquivo ilegível: este usuário lê tudo (root)"; fi
 
+# --- prazo dos 2 hooks gc de UserPromptSubmit e claude sem autoupdate, SÓ no bundle (ga-2hd02v.1.5.9; decisões do Mayor 17/10) ---
+# CSA/USA = caminho ABSOLUTO. Não reusar os nomes CS/US: CS é RELATIVO a $T/f (definido acima) e os casos do MBP abaixo usam "$T/f/$CS"; um CS absoluto aqui faz o sed deles errar o arquivo em silêncio e o build "recusado" sair 0
+CSA=$T/f/gt/.gascity-gastown-hq/.gc/settings.json; USA=$T/f/home/.claude/settings.json
+edit() { jq "$2" "$1" > "$1.new" && mv "$1.new" "$1"; }  # edit ARQUIVO PROGRAMA-JQ — muda a fixture no lugar
+GCP='export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && '
+fresh; cp "$CSA" "$T/cs.orig"; cp "$USA" "$T/us.orig"; build "$T/f" "$T/f/out"; rc=$?; O=$T/f/out
+[ $rc = 0 ] && jq -e '[.hooks.UserPromptSubmit[].hooks[] | .timeout] == [120,120]' "$O/city/settings.json" >/dev/null; ok $? "UserPromptSubmit: os 2 hooks gc (nudge drain, mail check) saem com timeout 120 no bundle (rc=$rc)"
+has "$O/city/settings.json" 'gc nudge drain --inject"' && has "$O/city/settings.json" 'gc mail check --inject"'; ok $? "  o comando do shim segue VERBATIM (o prazo é um campo à parte)"
+jq -e '[.hooks.PreCompact[].hooks[], .hooks.SessionStart[].hooks[]] | all(has("timeout") | not)' "$O/city/settings.json" >/dev/null; ok $? "  gc handoff (PreCompact) e gc prime (SessionStart) ficam SEM timeout: só os 2 de UserPromptSubmit mudam"
+jq -e '[.hooks[] | select(.timeout != null) | .token] | sort == ["gc mail check","gc nudge drain"]' "$O/manifest.json" >/dev/null; ok $? "  o manifest registra o timeout só nos 2 hooks que o ganharam"
+cmp -s "$CSA" "$T/cs.orig" && cmp -s "$USA" "$T/us.orig"; ok $? "  os settings do mini (entrada) não foram tocados: o prazo vale só no bundle"
+jq -e '.env == {"DISABLE_AUTOUPDATER":"1"}' "$O/home/.claude/settings.json" >/dev/null; ok $? "settings de USUÁRIO do bundle fixa DISABLE_AUTOUPDATER=1 em env (o claude do servidor sobe por push-bundle, não sozinho)"
+grep -q DISABLE_AUTOUPDATER "$O/city/settings.json" "$O/role/dog/.claude/settings.json"; [ $? = 1 ]; ok $? "  a fixação fica SÓ no settings de usuário (o do city e o do papel não ganham o env)"
+jq -e '.pinned_env == {"home/.claude/settings.json": {"DISABLE_AUTOUPDATER": "1"}}' "$O/manifest.json" >/dev/null; ok $? "  o manifest diz o que o builder FIXOU (pinned_env), separado do que veio do mini"
+python3 -I "$B" verify "$O"; ok $? "  verify do bundle com prazo e env fixo sai 0"
+fresh; edit "$USA" '.env = {"ENABLE_TOOL_SEARCH":"auto:5","DISABLE_AUTOUPDATER":"0"}'; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && jq -e '.env == {"ENABLE_TOOL_SEARCH":"auto:5","DISABLE_AUTOUPDATER":"1"}' "$T/f/out/home/.claude/settings.json" >/dev/null; ok $? "env do mini com outras chaves e DISABLE_AUTOUPDATER=0: as outras ficam, a fixação vale (rc=$rc)"
+fresh; edit "$USA" '.env = ["x"]'; refuses "env do usuário que não é objeto: sem como fixar o autoupdate" "$T/f"; why "não é um objeto"
+fresh; edit "$CSA" '.hooks.UserPromptSubmit[0].hooks[0].timeout = 300'; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && jq -e '[.hooks.UserPromptSubmit[].hooks[] | .timeout] == [300,120]' "$T/f/out/city/settings.json" >/dev/null && jq -e '[.hooks[] | select(.token=="gc nudge drain") | .timeout] == [300]' "$T/f/out/manifest.json" >/dev/null; ok $? "prazo MAIOR que 120 que o mini já tinha fica (nunca encurta), e o manifest guarda o 300 (rc=$rc)"
+fresh; edit "$CSA" '.hooks.UserPromptSubmit[0].hooks[0].timeout = 10'; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && jq -e '[.hooks.UserPromptSubmit[].hooks[] | .timeout] == [120,120]' "$T/f/out/city/settings.json" >/dev/null; ok $? "prazo MENOR (10) que o mini tinha sobe para 120 (rc=$rc)"
+for bad in '"abc"' 'true' '0' '-5'; do
+  fresh; edit "$CSA" ".hooks.UserPromptSubmit[0].hooks[0].timeout = $bad"; refuses "timeout $bad no hook de origem (não é número de segundos > 0): não sei ler o prazo, recusa" "$T/f"; why "não é um número de segundos"
+done
+EXTRA_HOOKS=".hooks.Stop = [{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"${GCP}gc mail check --inject\"}]}] | .hooks.UserPromptSubmit[0].hooks += [{\"type\":\"command\",\"command\":\"${GCP}gc prime --hook\"}]"
+fresh; edit "$CSA" "$EXTRA_HOOKS"; build "$T/f" "$T/f/out"; rc=$?
+[ $rc = 0 ] && jq -e '[.hooks.Stop[].hooks[] | has("timeout")] == [false]' "$T/f/out/city/settings.json" >/dev/null; ok $? "o MESMO gc mail check em outro evento (Stop) NÃO ganha prazo: o que decide é o evento UserPromptSubmit (rc=$rc)"
+jq -e '[.hooks.UserPromptSubmit[].hooks[] | select(.command | endswith("gc prime --hook")) | has("timeout")] == [false]' "$T/f/out/city/settings.json" >/dev/null; ok $? "  gc prime dentro de UserPromptSubmit também NÃO ganha: só os 2 tokens decididos (nudge drain, mail check)"
+# BUNDLE_NO_MUTANTS=1: só os casos (sem o controle negativo, que reconstrói o builder mutado dezenas de vezes e conta como passo pesado no heavy-guard.sh)
+[ -z "${BUNDLE_NO_MUTANTS:-}" ] || { echo "--- (sem controle negativo: BUNDLE_NO_MUTANTS)"; echo "$((n-fails))/$n ok"; [ $fails -eq 0 ] && { echo "SELFTEST OK (sem mutantes)"; exit 0; }; echo "SELFTEST FALHOU ($fails)"; exit 1; }
+
 # --- controle negativo: sem a linha da tabela de um hook, o builder tem que recusar o mesmo build ---
 fresh; sed '/"filter-bash-output.sh", "keep"/d' "$B" > "$T/mutant.py"
 python3 -I "$T/mutant.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
@@ -646,6 +683,30 @@ pymut "$T/mutant2.py" "$T/mutant3.py" "$W_OLD" 'kept_groups.append({**g, "hooks"
 wipe "$T/f/out"; python3 -I "$T/mutant2.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
   --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/out" 2>/dev/null
 [ -n "$H_NEW" ] && [ "$H_NEW" = "$(hash_of "$T/f/out")" ]; ok $? "servidor: o bundle do Hetzner tem o MESMO hash com o builder novo e com o anterior (reescrita de uma passada não muda o destino sem /Users/)"
+# controle negativo: cada mutante estraga UMA peça; o caso que a cobre TEM que ver a diferença (o mutante recusa ou o bundle sai errado)
+mut_ok() {  # mut_ok NOME SED-EXPR PROGRAMA-JQ(o bundle BOM satisfaz) ARQUIVO-do-bundle TRECHO-que-o-sed-muda
+  local name=$1 expr=$2 prog=$3 file=$4
+  grep -qF -- "$5" "$B"; ok $? "  o builder tem '$5' (o sed abaixo não é um no-op)"
+  sed "$expr" "$B" > "$T/mutant.py"; wipe "$T/f/mut"; mutate_build "$T/mutant.py"; local rc=$?
+  { [ $rc != 0 ] || ! jq -e "$prog" "$T/f/mut/$file" >/dev/null 2>&1; }; ok $? "controle negativo: $name"
+}
+GOOD='([.hooks.UserPromptSubmit[].hooks[] | select(.command|test("nudge drain|mail check")) | .timeout] == [120,120]) and ([.hooks.Stop[].hooks[] | has("timeout")] == [false]) and ([.hooks.UserPromptSubmit[].hooks[] | select(.command|endswith("prime --hook")) | has("timeout")] == [false])'
+fresh; edit "$CSA" "$EXTRA_HOOKS"
+mut_ok "sem a chamada do prazo os hooks ficam sem timeout" 's/h = self.ups_timeout(src, event, h)/pass/' "$GOOD" city/settings.json 'h = self.ups_timeout(src, event, h)'
+mut_ok "sem a condição do evento, o mail check de Stop ganharia prazo" 's/ and event == "UserPromptSubmit"//' "$GOOD" city/settings.json ' and event == "UserPromptSubmit"'
+mut_ok "sem o filtro dos 2 tokens, o gc prime de UserPromptSubmit ganharia prazo" 's/ and self.hooks\[-1\]\["token"\] in UPS_SHIM_TOKENS//' "$GOOD" city/settings.json ' and self.hooks[-1]["token"] in UPS_SHIM_TOKENS'
+fresh; edit "$CSA" '.hooks.UserPromptSubmit[0].hooks[0].timeout = 300'
+mut_ok "sem o max() o prazo do mini (300) seria encurtado para 120" 's/t = max(cur or 0, UPS_SHIM_TIMEOUT)/t = UPS_SHIM_TIMEOUT/' '[.hooks.UserPromptSubmit[].hooks[] | .timeout] == [300,120]' city/settings.json 't = max(cur or 0, UPS_SHIM_TIMEOUT)'
+fresh; edit "$CSA" '.hooks.UserPromptSubmit[0].hooks[0].timeout = true'
+sed '/if cur is not None and (isinstance(cur, bool)/c\        if False:' "$B" > "$T/mutant.py"; wipe "$T/f/mut"; mutate_build "$T/mutant.py"
+[ $? = 0 ]; ok $? "controle negativo: sem a validação do prazo de origem, timeout=true (bool) passaria como se fosse 1 — o caso do prazo inválido pega"
+fresh
+mut_ok "sem o env.update o claude do servidor voltaria a se atualizar sozinho" 's/env.update(PINNED_ENV)/pass/' '.env.DISABLE_AUTOUPDATER == "1"' home/.claude/settings.json 'env.update(PINNED_ENV)'
+mut_ok "fixando o env em TODA camada, o city também ganharia DISABLE_AUTOUPDATER" 's/if kind == "user":  # o claude lê/if True:  # o claude lê/' '.env.DISABLE_AUTOUPDATER == null' city/settings.json 'if kind == "user":  # o claude lê'
+sed '/"pinned_env": dict(sorted(self.pinned_env.items())),/d' "$B" > "$T/mutant.py"; wipe "$T/f/mut"; mutate_build "$T/mutant.py"
+jq -e '.pinned_env != null' "$T/f/mut/manifest.json" >/dev/null 2>&1; [ $? != 0 ]; ok $? "controle negativo: sem o campo no manifest o pinned_env some — o caso do manifest pega"
+sed '/self.hooks\[-1\]\["timeout"\] = t/d' "$B" > "$T/mutant.py"; wipe "$T/f/mut"; mutate_build "$T/mutant.py"
+jq -e '[.hooks[] | select(.timeout != null) | .token] | length == 2' "$T/f/mut/manifest.json" >/dev/null 2>&1; [ $? != 0 ]; ok $? "controle negativo: sem registrar o timeout no manifest o auditável some — o caso do manifest pega"
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

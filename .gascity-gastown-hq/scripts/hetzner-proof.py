@@ -15,10 +15,13 @@ SUBCOMANDOS
                             por prompt, o piso do atalho (um pedido que o wrapper recusa: ida e volta sem rodar o gc) e a carga do mini; mais M
                             prompts de CONTROLE com os mesmos hooks direto no mini, sem atalho (separa o custo do atalho do custo do gc).
 
-  e2e [--bead ID] [--model M]  a sessão remota MÍNIMA de ponta a ponta, pelo provider (gc-session-ssh start/peek/stop), com o pedido que o engine
-                            mandaria: worktree no servidor (espelho), pasta pré-confiada, `remote-e2e-1` lê uma bead, comenta, comita, empurra pelo
+  e2e [--bead ID] [--model M] [--prompts N]  a sessão remota MÍNIMA de ponta a ponta, pelo provider (gc-session-ssh start/peek/stop), com o pedido que o engine
+                            mandaria: o driver só cria o worktree no servidor (espelho); a identidade git e a confiança da pasta são do START do provider
+                            (ga-2hd02v.1.5.9: o driver as confere depois, por fora). `remote-e2e-1` lê uma bead, comenta, comita, empurra pelo
                             espelho, pede o handoff e termina; depois confere CADA prova por fora (comentário na bead, commit no servidor, branch no
-                            origin com o mesmo sha, mail do handoff, hooks de filtro/log rodando, sessão parada). Nunca responde a diálogo desconhecido.
+                            origin com o mesmo sha, mail do handoff, hooks de filtro/log rodando, versão do claude do servidor igual antes e depois,
+                            sessão parada). Nunca responde a diálogo desconhecido. Com --prompts N, depois dos passos manda N prompts curtos à MESMA sessão
+                            (provider nudge) e prova que todos foram respondidos, que cada um deixou um registro novo de hook gc na transcrição (sem registro não há como dizer que nenhum foi cancelado) e que nenhum hook gc de UserPromptSubmit foi cancelado ou falhou.
 
 CÓDIGOS  0 tudo igual / medido · 1 diferença, caso mal escrito ou hook que falhou · 2 uso · 3 não consegui rodar/ler um dos lados (nunca vira "igual")
 CONFIGURAÇÃO (ambiente)  HETZNER_SSH_HOST (hetzner-teste) · HETZNER_PROOF_ALIAS (remote-e2e-1: a identidade que o wrapper do mini aceita)
@@ -362,28 +365,18 @@ print(json.dumps({"rows": rows, "unreadable": bad}))
 PREPARE = r"""set -e
 R=$HOME/gt-remote/git/gascity; W=$R/wt/$1
 $HOME/gt-remote/bin/hetzner-remote-git.sh wt-add gascity "$1"
-if [ "$(git -C "$R/repo.git" config --get extensions.worktreeConfig)" != true ]; then  # o sparse-checkout do wt-add já liga isto direito; ligado à mão num repo BARE, o core.bare compartilhado quebra o commit em todo worktree
-  git -C "$R/repo.git" config extensions.worktreeConfig true
-  git -C "$R/repo.git" config --worktree core.bare true && git -C "$R/repo.git" config --unset core.bare
-fi
-git -C "$W" config --worktree user.name "$2"
-git -C "$W" config --worktree user.email "$2@gastown.invalid"
-python3 -I - "$W" <<'PY'
-import json, os, sys, tempfile
-p = os.path.expanduser("~/.claude.json")
-d = json.load(open(p))  # ilegível: o erro derruba o passo e NADA é gravado
-pr = d.setdefault("projects", {}).setdefault(sys.argv[1], {})
-pr.update(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)
-pr.setdefault("allowedTools", [])
-fd, t = tempfile.mkstemp(dir=os.path.dirname(p))
-with os.fdopen(fd, "w") as f:
-    json.dump(d, f)
-os.chmod(t, os.stat(p).st_mode & 0o777)
-os.replace(t, p)
-PY
 echo "HEAD $(git -C "$W" rev-parse HEAD)"
 echo "ANALYTICS $(wc -l < $HOME/.claude/usage-analytics.jsonl 2>/dev/null || echo 0)"
 """
+# Identidade git e confiança da pasta NÃO são gravadas pelo driver — são do start do provider (ga-2hd02v.1.5.9). A prova de que o start as gravou é o commit com o autor
+# certo, a leitura de `git config` + STATE depois da sessão (abaixo, em evidence) e a sessão que sobe sem diálogo de confiança.
+STATE = r"""import json, os, sys
+d = json.load(open(os.path.expanduser("~/.claude.json")))  # ausente/ilegível: o programa cai (rc ≠ 0) e a prova reprova dizendo que NÃO consegui ler
+pr = d["projects"][sys.argv[1]]  # sem entrada da pasta: KeyError e o mesmo
+# só hasTrustDialogAccepted PERSISTE: o claude consome hasCompletedProjectOnboarding sozinho (MEDIDO 18/10: some depois da 1ª sessão em todos os worktrees, os 4 de 17/10 e o novo)
+print(json.dumps({"trust": pr.get("hasTrustDialogAccepted") is True}))
+"""
+VERSION = 'export PATH="$HOME/.local/bin:$PATH"; claude --version; echo "UPDATE $(cksum "$HOME/.claude/.last-update-result.json" 2>/dev/null | tr " " "-")"'
 IDENT = " ".join(f"{k}={ALIAS}" for k in ("GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME", "GC_TEMPLATE"))
 
 
@@ -397,7 +390,7 @@ class E2E:
         self.f = open(path, "a")
         self.env = dict(os.environ, GC_SSH_CONFIG=os.environ.get("GC_SSH_CONFIG") or f"{CITY}/.gc/session-ssh.json",
                         GC_EXEC_STATE_DIR=os.environ.get("GC_EXEC_STATE_DIR") or f"{CITY}/.gc/runtime/session-ssh", HETZNER_STATE_DIR=f"{CITY}/.gc")
-        self.started, self.mail = False, []
+        self.started, self.mail, self.ver0 = False, [], None
         self.t0 = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.say(f"e2e {self.run} · log {path} · carga do mini {os.getloadavg()[0]:.1f}")
 
@@ -432,11 +425,22 @@ class E2E:
         if ALIAS in left.split():  # sobra de uma rodada anterior: o nome é reservado a esta prova
             self.say(f"sobrou a sessão {ALIAS}: parando")
             self.prov("stop", ALIAS)
-        return g.returncode == 0 and rc == 0 and '"id"' in o
+        # vazio/ilegível (sem versão) → ver0 None e a pré-condição falha: "antes" desconhecido nunca vira "igual depois"
+        vrc, vo, ve = self.ssh(VERSION)
+        self.ver0 = self.version(vo) if vrc == 0 else None
+        self.say(f"claude do servidor ANTES da sessão: {self.ver0!r}")
+        return g.returncode == 0 and rc == 0 and '"id"' in o and self.ver0 is not None
+
+    @staticmethod
+    def version(o: str):
+        """(versão do claude, hash do .last-update-result.json) da saída de VERSION; faltou uma das duas linhas → None (nunca '' comparado com '')."""
+        m = re.search(r"^(\d+\.\d+\.\d+)\b.*$", o, re.M)
+        u = re.search(r"^UPDATE\s*(\S*)$", o, re.M)
+        return (m.group(1), u.group(1)) if m and u else None
 
     def prepare(self) -> bool:
-        rc, o, e = self.ssh(PREPARE.replace("$1", self.run).replace("$2", ALIAS))
-        self.say(f"worktree + identidade git + pasta pré-confiada: rc {rc}\n{(o + e).strip()[-600:]}")
+        rc, o, e = self.ssh(PREPARE.replace("$1", self.run))
+        self.say(f"worktree criado (identidade git e pasta pré-confiada ficam para o START do provider): rc {rc}\n{(o + e).strip()[-600:]}")
         # vazio/ilegível (sem a linha HEAD ou ANALYTICS) → None e o passo devolve False: nada começa; nunca "0 linhas" por omissão
         m = re.search(r"^HEAD (\w+)$", o, re.M)
         n = re.search(r"^ANALYTICS\s+(\d+)$", o, re.M)
@@ -502,6 +506,15 @@ class E2E:
             msgs = None
         self.mail = [x["id"] for x in msgs or []]
         self.check("handoff registrado no mini (mail do handoff para a sessão)", bool(msgs), f"{self.mail}" if msgs is not None else f"não consegui ler: bd query rc {mm.returncode}")
+        # vazio/ssh que falhou/JSON ilegível → a prova reprova ("não consegui ler"); nunca "gravado" por omissão
+        rc2, o2, e2 = self.ssh(f"git -C {self.wt} config --get user.name; git -C {self.wt} config --get user.email; python3 -I - {self.wt} <<'PY'\n{STATE}\nPY")
+        ident = o2.splitlines()[:2] == [ALIAS, f"{ALIAS}@gastown.invalid"]
+        self.check("o START gravou a identidade git do worktree e a confiança da pasta (o driver só criou o worktree)",
+                   rc2 == 0 and ident and '"trust": true' in o2, f"rc {rc2} · {o2.strip()[:160]!r} {e2.strip()[:120]}")
+        vrc, vo, ve = self.ssh(VERSION)
+        ver1 = self.version(vo) if vrc == 0 else None
+        self.check("claude do servidor NÃO se atualizou durante a sessão (versão e .last-update-result.json iguais)", ver1 is not None and ver1 == self.ver0,
+                   f"antes {self.ver0} · depois {ver1}" if ver1 else f"não consegui ler: rc {vrc} {ve.strip()[:120]}")
         n = re.search(r"ANALYTICS\s+(\d+)", o)
         self.check("hook de log (PostToolUse) rodou no servidor", bool(n) and self.analytics0 is not None and int(n.group(1)) > self.analytics0, f"{self.analytics0} → {n and n.group(1)} linhas")
         rc, o, e = self.ssh(f"python3 -I - {self.run} <<'PY'\n{HOOKLOG}\nPY")
@@ -529,6 +542,57 @@ class E2E:
         keep = [r for r in rows if ".claude/hooks/" in r["cmd"]]
         self.check("hooks keep rodaram na sessão real, todos com saída 0, transcrição toda legível", bool(keep) and all(r["kind"] == "hook_success" and r["rc"] == 0 for r in keep) and unreadable == 0,
                    f"{len(keep)} execuções, {min(ms(keep), default=0)}–{max(ms(keep), default=0)} ms, {unreadable} linhas ilegíveis")
+
+    def prompts(self) -> None:
+        """N prompts curtos à MESMA sessão (provider nudge). Cada um dispara os hooks de UserPromptSubmit; a prova é: todos respondidos (a resposta é PONG<1000+i>, que
+        o prompt não traz: só aparece na tela se o modelo calculou) e, na transcrição, nenhum hook gc de UserPromptSubmit cancelado pelo prazo nem com erro."""
+        n, answered = self.a.prompts, 0
+        # antes: os registros que já existem (o prompt de partida deixou os dele); falhou/ilegível → nada é medido e a prova reprova "não consegui ler"
+        before = self.ups_log()
+        if before is None:
+            self.check(f"{n} prompts: hooks gc de UserPromptSubmit lidos na transcrição", False, "não consegui ler a transcrição ANTES dos prompts")
+            return
+        for i in range(n):
+            want = f"PONG{1000 + i}"
+            # nudge que falhou (rc ≠ 0) ou resposta que não veio no prazo → o prompt NÃO conta como respondido e a prova reprova com a contagem; nunca "respondido" por omissão
+            p = self.prov("nudge", ALIAS, stdin=f"Compute 1000+{i} and reply with exactly the word PONG immediately followed by that number, nothing else.")
+            if p.returncode != 0:
+                self.say(f"prompt {i}: nudge falhou (rc {p.returncode}): {self.out(p)[:200]}")
+                break
+            end, got = time.time() + self.a.prompt_timeout, False
+            while time.time() < end and not got:
+                time.sleep(POLL)
+                got = want in self.out(self.prov("peek", ALIAS, "250"))
+            self.say(f"prompt {i + 1}/{n}: {'respondido' if got else 'SEM resposta no prazo'} ({want})")
+            if not got:
+                break
+            answered += 1
+        time.sleep(min(5, POLL))
+        # depois: falhou/ilegível → a prova reprova "não consegui ler"; vazio (nenhum registro NOVO) → NÃO é "nenhum hook cancelado": cada prompt respondido tem de ter deixado o seu registro
+        # (MEDIDO 18/10: o `gc nudge drain` deixa um por prompt), senão os hooks podem nem ter rodado e a prova passaria sem ter visto nada
+        after = self.ups_log()
+        if after is None:
+            self.check(f"{n} prompts: hooks gc de UserPromptSubmit lidos na transcrição", False, "não consegui ler a transcrição DEPOIS dos prompts")
+            return
+        ups, bad_lines = after
+        new = len(ups) - len(before[0])
+        broke = [r for r in ups if not (r["kind"] == "hook_success" and r["rc"] == 0)]
+        slowest = max((r["ms"] or 0 for r in ups), default=0)
+        self.check(f"{n} prompts respondidos pela sessão remota", answered == n, f"{answered} de {n}")
+        self.check(f"{n} prompts: nenhum hook gc de UserPromptSubmit cancelado pelo prazo nem com erro (transcrição toda legível, um registro novo por prompt)",
+                   not broke and bad_lines == 0 and answered == n and new >= answered,
+                   f"{len(ups)} registros ({new} novos, ao menos {answered} esperados), o mais lento {slowest} ms, {len(broke)} cancelados/com erro {[(r['kind'], r['rc'], r['timeout']) for r in broke][:4]}, {bad_lines} linhas ilegíveis")
+
+    def ups_log(self):
+        """(registros dos hooks gc de UserPromptSubmit, linhas ilegíveis) da transcrição do servidor. Vazio → lista vazia (quem chama compara com o que ESPERA); falhou/ilegível (ssh, JSON) → None, nunca uma lista vazia."""
+        rc, o, e = self.ssh(f"python3 -I - {self.run} <<'PY'\n{HOOKLOG}\nPY")
+        try:
+            doc = json.loads(o) if rc == 0 else None
+            rows, bad_lines = doc["rows"], doc["unreadable"]
+        except (ValueError, KeyError, TypeError):
+            self.say(f"não consegui ler os hooks da transcrição: rc {rc} {e[:120]}")
+            return None
+        return [r for r in rows if r["event"] == "UserPromptSubmit" and " gc " in r["cmd"]], bad_lines
 
     def finish(self) -> None:
         if self.started:
@@ -565,6 +629,8 @@ class E2E:
                     self.check("sessão terminou os 7 passos", True)
                     time.sleep(min(5, POLL))
                     self.evidence()  # (uma exceção aqui — timeout do ssh/bd/git — cai no except do go() como prova que reprova)
+                    if self.a.prompts:
+                        self.prompts()
                 self.say("--- tela final ---\n" + tela[-2500:])
         except (OSError, subprocess.SubprocessError) as e:  # ssh/provider/bd que não responde no prazo: "não consegui" é falha visível, nunca prova que passou
             self.check("execução até o fim sem interrupção", False, f"{type(e).__name__}: {e}")
@@ -602,11 +668,17 @@ def main(argv: list) -> int:
     e.add_argument("--bead", default="ga-2hd02v.1.5.3", type=_arg(r"[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}", "id de bead"))
     e.add_argument("--model", default="haiku", type=_arg(r"[A-Za-z0-9._-]{1,40}", "modelo"))
     e.add_argument("--timeout", type=int, default=900)
+    e.add_argument("--prompts", type=int, default=0, help="N prompts curtos à mesma sessão depois dos passos (0 = só os 7 passos)")
+    e.add_argument("--prompt-timeout", type=int, default=300, help="segundos de espera pela resposta de CADA um dos --prompts")
     e.add_argument("--log", default="")
     e.add_argument("--keep", action="store_true", help="não remove o worktree do servidor no fim")
     a = ap.parse_args(argv)
     if a.cmd == "latency" and not 1 <= a.prompts <= 200:
         ap.error("--prompts tem que ir de 1 a 200")
+    if a.cmd == "e2e" and not 0 <= a.prompts <= 100:
+        ap.error("--prompts tem que ir de 0 a 100")
+    if a.cmd == "e2e" and not 1 <= a.prompt_timeout <= 3600:
+        ap.error("--prompt-timeout tem que ir de 1 a 3600")
     return {"hooks": cmd_hooks, "latency": cmd_latency, "e2e": cmd_e2e}[a.cmd](a)
 
 

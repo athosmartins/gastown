@@ -26,6 +26,10 @@
 #   mbp (ga-w7qwl1) — host de presença (notebook que dorme): `presence_gate`/`sleeps`/`path_extra` validados na config; start só abre com a regra de
 #   presença livre (pausa, bandeira, slot_cap e vigia de prioridade), a política local do guarda de clone vale ANTES dela; list-running tolera host
 #   que dorme e mantém o registro de sessões; recusa clara do host limpa o registro; /Users/ de outro home recusa.
+#   prep (ga-2hd02v.1.5.9) — o start grava a identidade git POR worktree e a confiança da pasta em ~/.claude.json do host, e qualquer falha derruba o start sem abrir nada: espelho BARE (sem
+#   extensions.worktreeConfig: o core.bare sai do config compartilhado e o commit do worktree continua funcionando, autor = a sessão), modo 600 e o resto do arquivo preservados, idempotente, uma identidade por
+#   worktree; pasta ausente / comum, ~/.claude.json ausente / ilegível (intacto, byte a byte) / com forma estranha, config.worktree travado, identidade que o git não lê de volta → exit 1 com o motivo, nenhum
+#   lançador, a pasta ausente não vira diretório; dry-run mostra o `prepare`; worktree_prepare explícito nos dois sentidos, padrão LIGADO no servidor e DESLIGADO no host de presença (notebook), não-booleano recusa sem ssh.
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e o grupo que a cobre TEM que passar a falhar: teto do host, nome
 #   exato (sessão, is-running, start), alvo de painel =nome:, guarda de /Users/, filtro de env, exit 2 das desconhecidas, marcador de fim,
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
@@ -71,8 +75,8 @@ chmod +x "$T/bin/ssh"
 
 cfg() {  # cfg CAP [TIMEOUT] [EXTRA-JSON-do-host-a]  → $T/cfg.json (host a: socket $SOCK; host b: socket ${SOCK}b, teto 1)
   jq -n --argjson cap "$1" --argjson to "${2:-25}" --argjson extra "${3:-{\}}" --arg rr "$RR" --arg rh "$RH" --arg s "$SOCK" \
-    '{default_host:"a", hosts:{a:({ssh:"fakehost",cap:$cap,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test",timeout:$to,start_timeout:$to,real_sessions_released_by:"selftest"}+$extra),
-      b:{ssh:"fakehost",cap:1,remote_root:$rr,remote_home:$rh,socket:($s+"b"),mini_home:"/Users/test",real_sessions_released_by:"selftest"}}}' > "$T/cfg.json"
+    '{default_host:"a", hosts:{a:({ssh:"fakehost",cap:$cap,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test",timeout:$to,start_timeout:$to,real_sessions_released_by:"selftest",worktree_prepare:false}+$extra),
+      b:{ssh:"fakehost",cap:1,remote_root:$rr,remote_home:$rh,socket:($s+"b"),mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false}}}' > "$T/cfg.json"
 }
 pv() {  # pv ARGS... < entrada  → RC, $T/out, $T/err
   env HOME="$T/home" GC_SSH_CONFIG="$T/cfg.json" GC_SSH_BIN="$T/bin/ssh" GC_EXEC_STATE_DIR="$T/state" FAKE_SSH_LOG="$T/ssh.log" \
@@ -297,10 +301,10 @@ g_terr() {  # o tmux do host responde mas não consegue olhar (socket sem permis
 cfgm() {  # cfgm [EXTRA-JSON-do-host-m]  → $T/cfg.json com a (padrão, sem regra), m (o "MBP": presença, PATH extra, dorme) e h (home em /Users, só dry-run)
   mkdir -p "$T/extra" "$T/lib"
   jq -n --argjson extra "${1:-{\}}" --arg rr "$RR" --arg rh "$RH" --arg s "$SOCK" --arg chk "$T/bin/fake-check" --arg lib "$T/lib/presence.sh" --arg ex "$T/extra" \
-    '{default_host:"a", hosts:{a:{ssh:"fakehost",cap:3,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test",real_sessions_released_by:"selftest"},
+    '{default_host:"a", hosts:{a:{ssh:"fakehost",cap:3,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false},
       m:({ssh:"fakembp",cap:2,remote_root:$rr,remote_home:$rh,socket:($s+"m"),mini_home:"/Users/test",presence_gate:true,sleeps:true,watch_s:1,
          gate_cmd:[$chk],presence_lib:$lib,path_extra:[$ex],real_sessions_released_by:"selftest"}+$extra),
-      h:{ssh:"fakehost",cap:1,remote_root:"/Users/athos/gt-remote/bundle",remote_home:"/Users/athos",socket:($s+"h"),mini_home:"/Users/test",real_sessions_released_by:"selftest"}}}' > "$T/cfg.json"
+      h:{ssh:"fakehost",cap:1,remote_root:"/Users/athos/gt-remote/bundle",remote_home:"/Users/athos",socket:($s+"h"),mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false}}}' > "$T/cfg.json"
 }
 setup_mbp() {
   mkdir -p "$T/lib" "$T/extra"
@@ -492,7 +496,62 @@ sem hooks nenhum@@del(.hooks)'
   cfg 3; install_host
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group mbp && g_mbp; return 0; }
+# --- prep (ga-2hd02v.1.5.9): o start grava a identidade git e a confiança da pasta POR WORKTREE; qualquer falha = o start falha e nada abre ---
+mkmirror() {  # mkmirror — espelho BARE do servidor (<home>/gt-remote/git/gascity/repo.git) com 1 commit e nenhum worktree; ~/.claude.json do host com a conta e um projeto alheio
+  local g=$RH/gt-remote/git/gascity; find "$RH/gt-remote" -mindepth 1 -delete 2>/dev/null; find "$T/seed" -mindepth 1 -delete 2>/dev/null; mkdir -p "$g" "$T/seed"
+  git init -q "$T/seed/s" && git -C "$T/seed/s" -c user.name=seed -c user.email=seed@x commit -q --allow-empty -m seed && git clone -q --bare "$T/seed/s" "$g/repo.git"
+  printf '{"userID":"u-123","projects":{"/alheio":{"hasTrustDialogAccepted":false,"keep":1}}}' > "$RH/.claude.json"; chmod 600 "$RH/.claude.json"
+}
+wtadd() { git -C "$RH/gt-remote/git/gascity/repo.git" worktree add -q --detach "../wt/$1" >/dev/null 2>&1; }  # wtadd NOME → $RH/gt-remote/git/gascity/wt/NOME
+WTD() { echo "$RH/gt-remote/git/gascity/wt/$1"; }
+sess_zero() { [ "$(count)" = 0 ] && [ ! -e "$RR/run/$1.sh" ]; }  # nada aberto e nenhum lançador deixado
+g_prep() {
+  local nm=remote-e2e-1 w
+  cfg 3 25 '{"worktree_prepare":true}'; install_host; mkmirror; wtadd s1; w=$(WTD s1); fresh
+  pv start $nm < <(req cat "$w"); ok $RC "prep: start numa pasta que é worktree do espelho BARE abre (rc=$RC $(head -c 250 "$T/err"))"
+  [ "$(git -C "$w" config --get user.name)" = "$nm" ] && [ "$(git -C "$w" config --get user.email)" = "$nm@gastown.invalid" ]; ok $? "prep: ...com a identidade git da sessão (user.name = o nome da sessão, e-mail @gastown.invalid) valendo no worktree"
+  git -C "$w" commit -q --allow-empty -m "da sessão" 2>"$T/gerr"; [ "$(git -C "$w" log -1 --format='%an <%ae>')" = "$nm <$nm@gastown.invalid>" ]; ok $? "prep: ...e um commit feito DENTRO do worktree sai com o autor certo (o espelho bare não quebra o commit: $(head -c 120 "$T/gerr"))"
+  jq -e --arg w "$w" '.projects[$w] == {"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true,"allowedTools":[]}' "$RH/.claude.json" >/dev/null; ok $? "prep: ...e a pasta pré-confiada em ~/.claude.json do host (sem diálogo de confiança)"
+  jq -e '.userID == "u-123" and .projects["/alheio"] == {"hasTrustDialogAccepted":false,"keep":1}' "$RH/.claude.json" >/dev/null; ok $? "prep: ...sem mexer no resto do arquivo (conta, projeto alheio com a confiança dele)"
+  [ "$(python3 -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$RH/.claude.json")" = 0o600 ]; ok $? "prep: ...e o modo 600 do ~/.claude.json se mantém (a troca atômica não afrouxa o arquivo da conta)"
+  local rg=$RH/gt-remote/git/gascity/repo.git
+  [ -z "$(git config --file "$rg/config" --get core.bare)" ] && [ "$(git config --file "$rg/config.worktree" --get core.bare)" = true ] && [ "$(git config --file "$rg/config" --get extensions.worktreeConfig)" = true ]; ok $? "prep: ...o core.bare do espelho saiu do config compartilhado e foi para o config.worktree (extensions.worktreeConfig ligado), senão o commit dos worktrees quebraria"
+  pv is-running $nm </dev/null; [ "$(cat "$T/out")" = true ]; ok $? "prep: ...e a sessão está de pé"; pv stop $nm </dev/null
+  # reinício: idempotente, não duplica nada
+  fresh; pv start $nm < <(req cat "$w"); ok $RC "prep: segundo start do mesmo worktree (idempotente) abre (rc=$RC)"; pv stop $nm </dev/null
+  jq -e --arg w "$w" '(.projects | length) == 2' "$RH/.claude.json" >/dev/null; ok $? "prep: ...e o ~/.claude.json não ganhou entrada duplicada"
+  # a identidade é POR worktree: a segunda sessão não herda nem muda a primeira
+  wtadd s2; fresh; pv start prep-two < <(req cat "$(WTD s2)"); ok $RC "prep: segunda sessão em OUTRO worktree abre (rc=$RC)"; pv stop prep-two </dev/null
+  [ "$(git -C "$(WTD s2)" config --get user.name)" = prep-two ] && [ "$(git -C "$w" config --get user.name)" = "$nm" ]; ok $? "prep: ...cada worktree guarda a identidade da SUA sessão (a do s1 continua remote-e2e-1)"
+  # --- falhas: o start falha, nada abre, nenhum lançador, e a mensagem diz o motivo ---
+  fresh; pv start prep-no < <(req cat "$RH/gt-remote/git/gascity/wt/nao-existe"); [ $RC = 1 ] && has "$T/err" 'preparo da sessão prep-no recusado' && has "$T/err" 'não existe'; ok $? "prep: pasta que NÃO existe → start falha dizendo que tem de ser um worktree já criado (rc=$RC)"
+  sess_zero prep-no; ok $? "prep: ...nada aberto e a pasta NÃO foi criada pelo start" ; [ ! -e "$RH/gt-remote/git/gascity/wt/nao-existe" ]; ok $? "prep: ...(a pasta ausente não vira diretório comum)"
+  mkdir -p "$RH/plain"; fresh; pv start prep-pl < <(req cat "$RH/plain"); [ $RC = 1 ] && has "$T/err" 'não é um worktree git'; ok $? "prep: pasta comum (não git) → start falha: sessão não abre sem identidade (rc=$RC)"; sess_zero prep-pl; ok $? "prep: ...nada aberto"
+  wtadd s3; mv "$RH/.claude.json" "$T/claude.bak"; fresh; pv start prep-nj < <(req cat "$(WTD s3)"); [ $RC = 1 ] && has "$T/err" 'confiança da pasta' && [ ! -e "$RH/.claude.json" ]; ok $? "prep: ~/.claude.json AUSENTE → start falha e NÃO cria um arquivo no lugar do login do claude (rc=$RC)"; sess_zero prep-nj; ok $? "prep: ...nada aberto"
+  printf '{ isto não é json' > "$RH/.claude.json"; cp "$RH/.claude.json" "$T/claude.bad"; fresh; pv start prep-bj < <(req cat "$(WTD s3)"); [ $RC = 1 ] && has "$T/err" 'confiança da pasta' && cmp -s "$RH/.claude.json" "$T/claude.bad"; ok $? "prep: ~/.claude.json ILEGÍVEL → start falha e o arquivo fica byte a byte como estava (rc=$RC)"; sess_zero prep-bj; ok $? "prep: ...nada aberto"
+  printf '{"projects":["x"]}' > "$RH/.claude.json"; fresh; pv start prep-bl < <(req cat "$(WTD s3)"); [ $RC = 1 ] && has "$T/err" 'confiança da pasta'; ok $? "prep: ~/.claude.json com forma que não conheço (projects como lista) → start falha (rc=$RC)"; sess_zero prep-bl; ok $? "prep: ...nada aberto"
+  cp "$T/claude.bak" "$RH/.claude.json"
+  wtadd s4; : > "$RH/gt-remote/git/gascity/repo.git/worktrees/s4/config.worktree.lock"; fresh; pv start prep-lk < <(req cat "$(WTD s4)"); [ $RC = 1 ] && has "$T/err" 'identidade git'; ok $? "prep: identidade que o git não consegue gravar (config.worktree travado) → start falha (rc=$RC)"; sess_zero prep-lk; ok $? "prep: ...nada aberto"
+  jq -e --arg w "$(WTD s4)" '.projects[$w] == null' "$RH/.claude.json" >/dev/null; ok $? "prep: ...e a confiança NÃO foi gravada (a identidade vem antes: sem ela nada mais acontece)"
+  # a identidade gravada tem que ser a que VALE: um git que lê outra coisa derruba o start
+  wtadd s5; mkdir -p "$T/home/.local/bin"; real=$(command -v git)
+  printf '#!/bin/sh\ncase "$*" in *"config --get user.name"*) echo outra-pessoa; exit 0;; esac\nexec %s "$@"\n' "$real" > "$T/home/.local/bin/git"; chmod +x "$T/home/.local/bin/git"
+  fresh; pv start prep-ot < <(req cat "$(WTD s5)"); [ $RC = 1 ] && has "$T/err" 'não ficou valendo'; ok $? "prep: identidade gravada mas que não é a que o git LÊ (outra camada a sobrepõe) → start falha (rc=$RC)"; sess_zero prep-ot; ok $? "prep: ...nada aberto"
+  find "$T/home/.local/bin" -name git -delete
+  # --- dry-run e configuração ---
+  fresh; pv --dry-run start $nm < <(req cat "$w"); [ $RC = 0 ] && jq -e --arg w "$w" --arg n "$nm" --arg tf "$RH/.claude.json" '.prepare == {"git_user":$n,"git_email":($n+"@gastown.invalid"),"trust_file":$tf,"work_dir":$w}' "$T/out" >/dev/null; ok $? "prep: dry-run diz o que gravaria (identidade, e-mail, arquivo de confiança, pasta)"; nossh; ok $? "prep: ...sem conectar"
+  cfg 3 25 '{"worktree_prepare":false}'; fresh; pv start prep-off < <(req cat "$RH/plain"); ok $RC "prep: worktree_prepare=false → pasta comum abre (o notebook do Athos tem identidade e confiança dele) (rc=$RC)"; pv stop prep-off </dev/null
+  [ "$(git -C "$RH/plain" config --get user.name 2>/dev/null)" != prep-off ]; ok $? "prep: ...e nenhuma identidade foi gravada"
+  cfg 3; jq 'del(.hosts.a.worktree_prepare)' "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"; fresh; pv start prep-df < <(req cat "$RH/plain"); [ $RC = 1 ] && has "$T/err" 'não é um worktree git'; ok $? "prep: SEM a chave num host sem regra de presença o preparo vale (padrão LIGADO: servidor nunca abre sem identidade) (rc=$RC)"
+  setup_mbp; cfgm; fresh; pv --dry-run start w-remote-m-0 < <(req cat "$RH/plain"); [ $RC = 0 ] && [ "$(jq -r .host "$T/out")" = m ] && jq -e '.prepare == null' "$T/out" >/dev/null; ok $? "prep: SEM a chave num host de presença (notebook do Athos) o padrão é DESLIGADO (dry-run: prepare nulo)"
+  cfgm '{"worktree_prepare":true}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat "$RH/plain"); [ $RC = 0 ] && jq -e '.prepare != null' "$T/out" >/dev/null; ok $? "prep: ...e worktree_prepare=true no notebook liga (a chave explícita vale nos dois sentidos)"
+  for v in '"false"' '"true"' '0' '1' 'null' '[]'; do
+    cfg 3; jq ".hosts.a.worktree_prepare=$v" "$T/cfg.json" > "$T/cfg2.json" && mv "$T/cfg2.json" "$T/cfg.json"; fresh; pv start prep-cf < <(req cat "$RH/plain"); [ $RC = 1 ] && has "$T/err" "'worktree_prepare'" && nossh; ok $? "prep: worktree_prepare=$v não é true/false → config recusada dizendo a chave, sem ssh (rc=$RC)"
+  done
+  cfg 3; install_host
+}
+
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group mbp && g_mbp; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 all
@@ -555,11 +614,24 @@ echo "== $((n-fails))/$n ok =="
   mutant gate "sem rodar o --selfcheck" 's/o=\$(python3 -I {g} --selfcheck {st} {q(work_dir)} 2>&1)/o=$(true)/'
   mutant gate "script do host que sai 0 (a recusa vira 'abriu')" 's/exit {EX_POLICY}/exit 0/g'
   mutant gate "guarda do repositório ilegível passa" 's/^        raise Fail(f"sessão real {name!r} recusada: não consegui ler.*$/        sha = ""/'
+  mutant prep "sem o preparo no start" 's/\.replace("@PREP@", prepare_script(cfg))/.replace("@PREP@", "")/'
+  mutant prep "sem gravar a identidade git" 's/^git -C "\$W" config --worktree user.name "\$N" \&\& git -C "\$W" config --worktree user.email "\$N@gastown.invalid" || pfail/true || pfail/'
+  mutant prep "sem conferir que a identidade gravada é a que vale" 's/^\[ "\$(git -C "\$W" config --get user.name)" = "\$N" \] \&\& \[ "\$(git -C "\$W" config --get user.email)" = "\$N@gastown.invalid" \] || pfail/true || pfail/'
+  mutant prep "core.bare não sai do config compartilhado (o commit do worktree quebra)" 's/ \&\& git -C "\$C" config --unset core.bare;/;/'
+  mutant prep "sem conferir que a pasta é worktree git" 's/^\[ "\$(git -C "\$W" rev-parse --is-inside-work-tree 2>\/dev\/null)" = true \] || pfail/true || pfail/'
+  mutant prep "pasta ausente não recusa (o mkdir do start a criaria)" 's/^\[ -d "\$W" \] || pfail/true || pfail/'
+  mutant prep "sem gravar a confiança da pasta" 's/pr.update(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)/pr.update(hasCompletedProjectOnboarding=True)/;s/ and back\["hasTrustDialogAccepted"\] is True//'
+  mutant prep "~/.claude.json ausente/ilegível vira {} e é regravado" 's/^    d = json.load(open(p))  #/    d = {}  #/'  # âncora no CÓDIGO, não no texto do comentário (reescrito, o padrão antigo deixou de casar e o mutante virou no-op)
+  mutant prep "a recusa do preparo sai 0 (o start 'abriu' sem sessão)" 's/exit @EXPREP@/exit 0/'
+  mutant prep "preparo desligado por padrão" 's/self.prepare = h.get("worktree_prepare", not self.gate)/self.prepare = h.get("worktree_prepare", False)/'
+  mutant prep "preparo ligado por padrão também no notebook" 's/self.prepare = h.get("worktree_prepare", not self.gate)/self.prepare = h.get("worktree_prepare", True)/'
+  mutant prep "worktree_prepare fora de true/false aceito" 's/if "worktree_prepare" in h and not isinstance(h\["worktree_prepare"\], bool):/if False:/'
+  mutant prep "o dry-run não diz o preparo" 's/prepare=({"git_user": name,.*$/prepare=None,/'
   mutant dry "o dry-run não diz a recusa de política que o start daria" 's/            would_refuse = str(e)/            pass/'
   mutant dry "o dry-run diz 'teste' para tudo" 's/session_kind="teste" if TEST_RE.fullmatch(name) else "real"/session_kind="teste"/'
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }

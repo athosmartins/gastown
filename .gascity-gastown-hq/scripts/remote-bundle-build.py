@@ -30,6 +30,11 @@ O QUE ENTRA (cada hook tem UM veredito, na tabela POLICY):
           ~/.claude/hooks/<nome do token>, `gt tap guard cross-clone-block` (swap; gt com ~/.local/bin/ opcional) ou o PREFIXO do wrapper
           `: <marcador>; P='<cidade>/scripts/<marcador>.sh'; [ -f "$P" ] || ` (a cauda do wrapper é gerada e não é lida: o manifest guarda o
           sha256 do comando inteiro). Guarda irmã (`gt tap guard dangerous-command`) ou comando com algo a mais NÃO é descartado: recusa.
+  Dois ajustes SÓ do bundle (ga-2hd02v.1.5.9, decisões do Mayor 17/10; o settings do mini nunca é tocado): (1) os 2 hooks gc de UserPromptSubmit (`gc nudge drain`,
+  `gc mail check`) ganham `"timeout": 120` (segundos) — o claude cancela hook de prompt em 30 s e o `mail check` do servidor, que vai ao mini por ssh, chega a 30 s
+  (p95 23 s MEDIDO); um prazo MAIOR que o mini já tenha fica (nunca encurta) e prazo ilegível recusa; `gc prime` e `gc handoff` ficam como estão; (2) o settings de USUÁRIO
+  do bundle fixa `env.DISABLE_AUTOUPDATER=1` (o claude do servidor sobe por push-bundle, não sozinho no meio de uma sessão). O manifest registra os dois: `timeout` no hook e
+  `pinned_env` (o que o builder FIXOU, separado do que veio do mini).
   Chaves de settings fora da lista de portáveis (modelo, statusLine, plugins...) são descartadas e registradas.
   Regra `ask` de permissão vira `deny` (ga-2hd02v.1.5): no servidor não há quem aperte a tecla, e `ask` explícita vale MESMO com
   --dangerously-skip-permissions — MEDIDO lá: `rm -rf` com só o `ask` fica parado num "Do you want to proceed?" sem fim; com `deny` é negado na hora.
@@ -104,6 +109,15 @@ GUARD, FILE_TOOLS = "remote-clone-guard.py", "Edit|Write|MultiEdit|NotebookEdit"
 GC_PATH = 'export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH" && '
 SHIM_RE = re.compile("(?:" + re.escape(GC_PATH) + r")?(?:GC_[A-Z_]+=[\w-]+ )*gc (handoff|prime|nudge drain|mail check)"
                      r"((?: [^\x00-\x1f\x7f;&|`$()<>]*)?)")
+# Prazo dos 2 hooks gc de UserPromptSubmit NO BUNDLE do servidor (ga-2hd02v.1.5.9, decisão do Mayor 17/10): o claude cancela hook de prompt em 30 s
+# e o `gc mail check` / `gc nudge drain` do servidor vão ao mini por ssh (MEDIDO: mail check p95 23 s, máx 30 s; nas últimas 60 transcrições de dog do mini,
+# 148 cancelamentos de mail check e 38 de nudge drain). `timeout` é em SEGUNDOS no settings do claude. Só estes dois tokens e só em UserPromptSubmit:
+# `gc prime` (SessionStart) e `gc handoff` (PreCompact) ficam como estão, e o settings do mini nunca é tocado — o prazo vale só no bundle.
+UPS_SHIM_TOKENS = ("gc nudge drain", "gc mail check")
+UPS_SHIM_TIMEOUT = 120
+# O claude do servidor se atualizava sozinho no início da 1ª sessão (2.1.301 → 2.1.302, MEDIDO 17/10) e o symlink troca com sessão abrindo. A versão sobe por
+# push-bundle, acompanhando a do mini; este env fica no settings de USUÁRIO do bundle (o que vai para {remote_home}/.claude/settings.json).
+PINNED_ENV = {"DISABLE_AUTOUPDATER": "1"}
 
 USER_KEYS = {"$schema", "cleanupPeriodDays", "env", "permissions", "hooks", "skipDangerousModePermissionPrompt",
              "skipAutoPermissionPrompt"}
@@ -163,6 +177,7 @@ class Bundle:
         self.excluded: list[str] = []          # skills que existiam em skills/ e ficaram de fora, por nome
         self.excluded_missing: list[str] = []  # nomes de exclusão que NÃO existem em skills/ (renomeada? removida?)
         self.swaps = 0
+        self.pinned_env: dict[str, dict] = {}  # arquivo do bundle → env que o builder FIXOU (não veio do mini)
 
     def rewrite(self, s: str) -> str:
         # UMA passada só: o texto que uma regra escreve nunca é reescrito por outra (num destino que contém o home do mini, como o do MBP —
@@ -268,6 +283,12 @@ class Bundle:
                 out[k] = json.loads(self.rewrite(json.dumps(v)))
         if not out.get("hooks"):
             out.pop("hooks", None)
+        if kind == "user":  # o claude lê ~/.claude/settings.json do servidor em toda sessão; é ali que o env fixo vale para todas
+            env = out.setdefault("env", {})  # vazio (o mini não tem env) → {} e entra só a fixação; ilegível (não é objeto) → recusa, nunca sobrescreve
+            if not isinstance(env, dict):
+                raise Refused(f"`env` em {src} não é um objeto: sem como fixar {sorted(PINNED_ENV)}")
+            env.update(PINNED_ENV)
+            self.pinned_env["home/.claude/settings.json"] = dict(PINNED_ENV)
         return out
 
     def filter_hooks(self, src: str, hooks: dict) -> dict:
@@ -284,6 +305,8 @@ class Bundle:
                         h, self.swaps = self.guard_hook(), self.swaps + 1  # já está no DESTINO: não passa pela reescrita (o destino do MBP contém o home do mini)
                     elif v != "drop":
                         h = json.loads(self.rewrite(json.dumps(h)))
+                    if v == "shim" and event == "UserPromptSubmit" and self.hooks[-1]["token"] in UPS_SHIM_TOKENS:
+                        h = self.ups_timeout(src, event, h)
                     if v != "drop":
                         kept.append(h)
                 if any(h.get("type") != "command" for h in g["hooks"]):
@@ -295,6 +318,16 @@ class Bundle:
             if kept_groups:
                 out[event] = kept_groups
         return out
+
+    def ups_timeout(self, src: str, event: str, h: dict) -> dict:
+        """Põe o prazo de UPS_SHIM_TIMEOUT s no hook; um prazo MAIOR que o mini já tenha fica (nunca encurta); forma que não conheço recusa."""
+        cur = h.get("timeout")
+        # ausente → só o prazo novo; falhou/ilegível (texto, bool, <= 0, nan) → recusa: "não sei ler o prazo" não vira "sem prazo" nem 120
+        if cur is not None and (isinstance(cur, bool) or not isinstance(cur, (int, float)) or not cur > 0):
+            raise Refused(f"hook gc em {src}/{event} tem `timeout` que não é um número de segundos > 0 ({cur!r}): sem veredito possível")
+        t = max(cur or 0, UPS_SHIM_TIMEOUT)
+        self.hooks[-1]["timeout"] = t
+        return {**h, "timeout": t}
 
     def filter_permissions(self, src: str, perms: dict) -> dict:
         out: dict = {}
@@ -375,6 +408,7 @@ class Bundle:
                 "dropped_rules": dict(sorted(self.dropped_rules.items())),
                 "excluded_skills": self.excluded, "excluded_skills_missing": self.excluded_missing,
                 "asks_to_deny": dict(sorted(self.asks_to_deny.items())),
+                "pinned_env": dict(sorted(self.pinned_env.items())),
                 "files": {rel: {"sha256": hashlib.sha256(d).hexdigest(), "exec": ex} for rel, (d, ex) in sorted(self.files.items())},
                 "bundle_hash": listing_hash({rel: (hashlib.sha256(d).hexdigest(), ex) for rel, (d, ex) in self.files.items()})}
 
