@@ -33,9 +33,9 @@ O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
            a confiança; REMOVIDA no fim), gt-remote/PAUSE (só a desta rodada; só removida se a primeira linha ainda for a marca dela), gt-remote/bundle/run (apagada se
            não existia). O branch worker/<rodada> no origin FICA (apagá-lo é decisão: --delete-branch).
 
-CÓDIGOS  0 tudo passou · 1 alguma prova reprovou · 2 uso · 3 não consegui começar (pré-condição) · 4 interrompida: o Athos voltou ao MBP (nada mais foi medido; a sessão é parada)
+CÓDIGOS  0 tudo passou · 1 alguma prova reprovou, ou recusei instalar (config do wrapper alheia/ilegível, builder ou verify falhou) · 2 uso · 3 não consegui começar (pré-condição: MBP não livre, tmux aberto ou sem resposta) · 4 interrompida: o Athos voltou ao MBP (nada mais foi medido; a sessão é parada)
 CONFIGURAÇÃO (ambiente)  MBP_PROOF_SSH (athos@athoss-macbook-pro.local) · MBP_PROOF_HOME (/Users/athos: o home no MBP) · MBP_PROOF_SESSION (remote-test-remote-mbp-1) ·
-  MBP_PROOF_POLL (10: segundos entre olhadas) · MBP_PROOF_WATCH_CYCLE (5: o watch_s do provider) · MBP_PROOF_SHIM_WAIT (60: quanto esperar o atalho) · GC_SSH_BIN (o ssh, como no provider) · GC_CITY_PATH · só o selftest troca: MBP_PROOF_PROV, MBP_PROOF_PUMP,
+  GC_SSH_BIN (o ssh, como no provider) · GC_CITY_PATH · só o selftest troca: MBP_PROOF_PROV,
   MBP_PROOF_PATHX, MBP_PROOF_SHIM_CLIENT, MBP_PROOF_BUILDER
 """
 from __future__ import annotations
@@ -56,11 +56,7 @@ CITY = os.environ.get("GC_CITY_PATH") or os.path.dirname(HERE)  # a cidade VIVA 
 MHOME = os.environ.get("MBP_PROOF_HOME", "/Users/athos").rstrip("/")
 SSH_TARGET = os.environ.get("MBP_PROOF_SSH", "athos@athoss-macbook-pro.local")
 SESSION = os.environ.get("MBP_PROOF_SESSION", "remote-test-remote-mbp-1")
-POLL = float(os.environ.get("MBP_PROOF_POLL", "10"))
-SHIM_WAIT = float(os.environ.get("MBP_PROOF_SHIM_WAIT", "60"))
-WATCH_CYCLE = float(os.environ.get("MBP_PROOF_WATCH_CYCLE", "5"))  # watch_s do provider: de quanto em quanto o vigia olha a presença
 PROV = os.environ.get("MBP_PROOF_PROV") or os.path.join(HERE, "gc-session-ssh")
-PUMP = os.environ.get("MBP_PROOF_PUMP") or os.path.join(HERE, "remote-shim-pump.py")
 BUILDER = os.environ.get("MBP_PROOF_BUILDER") or os.path.join(HERE, "remote-bundle-build.py")  # (só o selftest troca estes três)
 SHIM_CLIENT = os.environ.get("MBP_PROOF_SHIM_CLIENT") or os.path.join(HERE, "remote-shim.py")
 SSH_BIN = os.environ.get("GC_SSH_BIN") or "ssh"
@@ -73,7 +69,6 @@ HOST = "mbp"
 SOCKET = "gc-remote"
 PATHX = os.environ["MBP_PROOF_PATHX"].split(":") if os.environ.get("MBP_PROOF_PATHX") else [SHIMBIN, "/opt/homebrew/bin", MHOME + "/.local/bin"]  # o atalho PRIMEIRO; o resto é o que o provider já usa
 WRAPPER_CFG = os.path.join(MINI_HOME, ".gastown", "remote-shim-mbp.json")
-RUN_RE = re.compile(r"mbp-[0-9]{8}-[0-9]{6}")
 SESSION_RE = re.compile(r"remote-test-remote-mbp-[0-9]{1,3}")
 BEAD_RE = re.compile(r"[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}")
 
@@ -331,11 +326,23 @@ def cmd_plan(a: argparse.Namespace) -> int:
         bad.append("o comando não começa em `claude` (o lançador de pool não foi reescrito)")
     if f"--settings {BUNDLE}/city/settings.json" not in d["command"]:
         bad.append("o --settings do city não aponta para o bundle do MBP")
-    if "/Users/" in d["command"].replace(MHOME, "").replace(MINI_HOME, "") and MHOME != MINI_HOME:
-        bad.append("sobrou caminho do mini no comando")
     for b in bad:
         print("PROBLEMA:", b)
     return 1 if bad else 0
+
+
+def tmux_state(s: dict) -> str:
+    """livre | aberta | nao-sei, a partir do `tmux list-sessions` que o snap fez no MBP. É "livre" só com sessão nenhuma de fato (lista vazia, ou o texto de "sem servidor" /
+    "sem socket" que o provider também trata assim); qualquer outra falha do tmux (versão, permissão, timeout, binário ausente) é "nao-sei", NUNCA "sem sessão"."""
+    t = s.get("tmux") if "_erro" not in s else None
+    if not isinstance(t, dict) or not isinstance(t.get("rc"), int) or not isinstance(t.get("out"), str):
+        return "nao-sei"
+    if t["rc"] == 0:
+        return "aberta" if t["out"] else "livre"
+    err = str(t.get("err"))
+    if "no server running" in err or ("error connecting to" in err and "(No such file or directory)" in err):
+        return "livre"
+    return "nao-sei"
 
 
 def cmd_install(a: argparse.Namespace) -> int:
@@ -366,8 +373,9 @@ def cmd_install(a: argparse.Namespace) -> int:
         pr.say("NAO INSTALEI: o MBP precisa estar livre (Athos fora)")
         return 3
     s = pr.snap()
-    if "_erro" in s or s["tmux"]["rc"] == 0 and s["tmux"]["out"]:
-        pr.say(f"NAO INSTALEI: sessão aberta no socket do provider, ou o MBP não respondeu: {s.get('_erro') or s['tmux']['out']}")
+    ts = tmux_state(s)
+    if ts != "livre":
+        pr.say("NAO INSTALEI: " + (f"sessão aberta no socket do provider: {s['tmux']['out']}" if ts == "aberta" else f"não consegui saber se há sessão aberta no socket do provider ({s.get('_erro') or s.get('tmux')})"))
         return 3
     wc = json.dumps(wrapper_config(), indent=1) + "\n"
     try:

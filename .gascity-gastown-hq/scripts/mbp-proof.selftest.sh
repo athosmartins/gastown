@@ -49,8 +49,8 @@ py() { python3 -I -c 'import importlib.machinery as m,sys; M=m.SourceFileLoader(
 
 SRV="$T/srv"; MINI="$T/mini"; CITY="$T/city"; GOLD="$T/golden"; export SRV CITY FAKE_STATE="$T/state" T
 ROLE="$CITY/.gc/agents/dogs/gastown.dog-1"
-export HOME="$MINI" GC_CITY_PATH="$CITY" GC_SSH_BIN="$T/bin/ssh" MBP_PROOF_HOME="$SRV" MBP_PROOF_SSH="fake@mbp" MBP_PROOF_POLL=0.2 MBP_PROOF_SHIM_WAIT=3 MBP_PROOF_WATCH_CYCLE=0.3 \
-  MBP_PROOF_PROV="$T/fakeprov" MBP_PROOF_PUMP="$T/fakepump.py" MBP_PROOF_SHIM_CLIENT="$T/fake-remote-shim.py" MBP_PROOF_BUILDER="$BUILDER" \
+export HOME="$MINI" GC_CITY_PATH="$CITY" GC_SSH_BIN="$T/bin/ssh" MBP_PROOF_HOME="$SRV" MBP_PROOF_SSH="fake@mbp" \
+  MBP_PROOF_PROV="$T/fakeprov" MBP_PROOF_SHIM_CLIENT="$T/fake-remote-shim.py" MBP_PROOF_BUILDER="$BUILDER" \
   MBP_PROOF_PATHX="$SRV/gt-remote/shim-bin:$SRV/fakebin"
 
 if [ -z "${MBPT_T:-}" ]; then
@@ -92,10 +92,9 @@ NAME=remote-test-remote-mbp-1; G="$SRV/gt-remote"; BUNDLE="$G/bundle"; PAUSE="$G
 case "$op" in
   gate)
     if [ -e "$PAUSE" ]; then
-      [ $mode != swappause ] || [ -f "$S/swapped" ] || { echo "origem=athos desde=2026-10-18T10:00:00" > "$PAUSE"; touch "$S/swapped"; }   # o Athos pausa de verdade, por cima da marca da prova
       echo '{"ok":false,"reason":"pausa do Athos ativa"}'; exit 1
     fi
-    g=${FAKE_GATE:-free}; [ ! -f "$S/started" ] || [ -z "${FAKE_GATE_AFTER_START:-}" ] || g=$FAKE_GATE_AFTER_START
+    g=${FAKE_GATE:-free}
     case $g in
       free) echo '{"ok":true,"reason":"livre","cap":2,"slot_cap":2}';;
       athos) echo '{"ok":false,"reason":"Athos está no MBP (presença=mbp)"}'; exit 1;;
@@ -113,7 +112,9 @@ cat > "$T/fake/tmux" <<'EOF'
 S="$FAKE_STATE"
 [ "$1" != -L ] || shift 2
 case "$1" in
-  list-sessions) if [ -f "$S/running" ]; then echo remote-test-remote-mbp-1; exit 0; fi; echo "no server running" >&2; exit 1;;
+  list-sessions)
+    case "${FAKE_TMUX:-}" in mismatch) echo "protocol version mismatch (client 8, server 7)" >&2; exit 1;; nosock) echo "error connecting to /tmp/tmux-501/gc-remote (No such file or directory)" >&2; exit 1;; esac
+    if [ -f "$S/running" ]; then echo remote-test-remote-mbp-1; exit 0; fi; echo "no server running" >&2; exit 1;;
   list-panes) if [ -f "$S/running" ]; then cat "$S/panepid"; exit 0; fi; echo "can't find session" >&2; exit 1;;
 esac
 exit 1
@@ -169,6 +170,12 @@ rx=re.compile(M.wrapper_config()["identity_pattern"])
 assert rx.fullmatch("remote-test-remote-mbp-1") and rx.fullmatch("remote-test-remote-mbp-123")
 assert not any(rx.fullmatch(x) for x in ("remote-test-remote-mbp-1234","remote-e2e-1","gastown.dog-1","remote-test-remote-mbp-1; x","remote-mbp-1","gastown.mayor"))
 assert M.wrapper_config()["gate_done_bin"] is None'; ok $? "unit: a identidade do wrapper do MBP aceita SÓ a sessão de teste (sessão real é da fatia 3)"; }
+  c tmuxstate && { py 'T=lambda rc,out="",err="": {"tmux":{"rc":rc,"out":out,"err":err}}
+want={"livre":[T(1,"","no server running on /tmp/x"),T(1,"","error connecting to /tmp/x (No such file or directory)"),T(0,"")],
+ "aberta":[T(0,"remote-test-remote-mbp-1")],
+ "nao-sei":[T(1,"","protocol version mismatch"),T(1,"","error connecting to /tmp/x (Permission denied)"),T(127,"","[Errno 2] tmux"),T(1),{"_erro":"ssh"},{"tmux":None},{},{"tmux":{"rc":None,"out":"","err":""}}]}
+for k,v in want.items():
+    for s in v: assert M.tmux_state(s)==k,(k,s)'; ok $? "unit: tmux_state — só lista vazia ou \"sem servidor\"/\"sem socket\" é livre; falha de outro tipo, rc 127, erro do ssh e leitura sem forma são \"não sei\""; }
 }
 
 # ---------------------------------------------------------------- cli
@@ -198,7 +205,7 @@ g_install() {
     python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["identity_pattern"]=="^remote-test-remote-mbp-[0-9]{1,3}$" and d["gate_done_bin"] is None and d["city"]==sys.argv[2], d' "$MINI/.gastown/remote-shim-mbp.json" "$CITY"; ok $? "install: a config do wrapper no mini só aceita a sessão de teste e não tem gate-done"
     [ "$(dsig "$SRV/.claude" "$SRV/.ssh")" = "$own" ] && [ ! -e "$SRV/.config" ]; ok $? "install: nada em ~/.claude, ~/.ssh nem ~/.config do MBP"
     [ "$(sha "$SRV/gt-remote/bin/remote-bundle-build.py")" = "$(sha "$BUILDER")" ]; ok $? "install: o builder em gt-remote/bin é o do repositório"
-    first=$(cat "$SRV/gt-remote/bundle/manifest.json"); inst
+    first=$(cat "$SRV/gt-remote/bundle/manifest.json"); proof install --apply > "$T/out" 2> "$T/err"; RC=$?
     [ $RC = 0 ] && [ "$(cat "$SRV/gt-remote/bundle/manifest.json")" = "$first" ] && [ -d "$SRV/gt-remote/bundle/run" ] && has "$T/out" "INSTALAÇÃO OK"; ok $? "install: repetir é inofensivo (mesmo bundle, run/ preservada) (rc=$RC)"
   }
   c inst-wrapper && { srv_skeleton; world_reset; mkdir -p "$MINI/.gastown"; echo '{"city": "outra"}' > "$MINI/.gastown/remote-shim-mbp.json"; before=$(dsig "$SRV"); proof install --apply > "$T/out" 2> "$T/err"; RC=$?
@@ -215,6 +222,9 @@ g_install() {
     [ $RC = 1 ] && has "$T/out" "envio do builder" && [ ! -e "$SRV/gt-remote/bundle" ] && [ ! -e "$MINI/.gastown/remote-shim-mbp.json" ]; ok $? "install: o envio do builder ao MBP sai rc != 0 → 1, bundle não trocado, nada gravado no mini (rc=$RC)"; }
   c inst-wrapper-dir && { srv_skeleton; world_reset; mkdir -p "$MINI/.gastown/remote-shim-mbp.json"; before=$(dsig "$SRV"); proof install --apply > "$T/out" 2> "$T/err"; RC=$?
     [ $RC = 1 ] && has "$T/out" "não consigo ler" && ! has "$T/err" "Traceback" && [ "$(dsig "$SRV")" = "$before" ] && [ -d "$MINI/.gastown/remote-shim-mbp.json" ]; ok $? "install: config do wrapper ilegível (OSError: o caminho é uma pasta) → recusa sem Traceback, não toca no MBP (rc=$RC)"; }
+  c inst-tmux-unknown && { srv_skeleton; world_reset; touch "$FAKE_STATE/running"; before=$(dsig "$SRV"); FAKE_TMUX=mismatch proof install --apply > "$T/out" 2> "$T/err"; RC=$?
+    [ $RC = 3 ] && has "$T/out" "não consegui saber" && [ "$(dsig "$SRV")" = "$before" ] && [ ! -e "$MINI/.gastown/remote-shim-mbp.json" ]; ok $? "install: tmux que falha por outro motivo (versão do servidor ≠ cliente) com uma sessão ABERTA → 3, \"não sei\" não é \"sem sessão\", MBP e mini intactos (rc=$RC)"
+    srv_skeleton; FAKE_TMUX=nosock inst; [ $RC = 0 ] && has "$T/out" "INSTALAÇÃO OK"; ok $? "install: socket que não existe (error connecting to … No such file or directory) é \"sem sessão\", como no provider: instala (rc=$RC)"; }
   c inst-session && { srv_skeleton; world_reset; touch "$FAKE_STATE/running"; proof install --apply > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && has "$T/out" "sessão aberta"; ok $? "install: sessão aberta no socket do provider → 3 (rc=$RC)"; }
 }
 
@@ -240,9 +250,13 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
     r=$(MBPT_MUTANT=1 MBPT_T="$T" MBPT_ONLY="$1" MBPT_CASES="$2" MBPT_UNDER_TEST="$m/mbp-proof.py" bash "$0" 2>&1 | tail -1)
     case "$r" in "RESULT 0/0") ok 1 "mutante '$3': nenhum caso rodou ($r)";; "RESULT 0/"*) ok 1 "mutante '$3' NÃO foi pego ($r)";; "RESULT "*) ok 0 "mutante '$3' pego ($r)";; *) ok 1 "mutante '$3': execução sem resultado ($r)";; esac
   }
+  mutant unit tmuxstate "tmux_state devolve livre para a falha que não conhece" '        return "livre"
+    return "nao-sei"' '        return "livre"
+    return "livre"'
   mutant cli cli-dry "install sem --apply conecta" '    if not a.apply:
         print("[dry-run] nada foi gravado' '    if False:
         print("[dry-run] nada foi gravado'
+  mutant install inst-tmux-unknown "tmux que falha vira \"sem sessão\"" '    if ts != "livre":' '    if ts == "aberta":'
   mutant install inst-wrapper "config do wrapper diferente é sobrescrita" 'if have is not None and have != wc:' 'if False:'
   mutant install inst-wrapper-dir "config do wrapper ilegível estoura em vez de recusar" 'have = open(WRAPPER_CFG).read() if os.path.exists(WRAPPER_CFG) else None
     except OSError as e:' 'have = open(WRAPPER_CFG).read() if os.path.exists(WRAPPER_CFG) else None
