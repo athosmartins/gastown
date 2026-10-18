@@ -74,7 +74,6 @@ HOST = "mbp"
 SOCKET = "gc-remote"
 PATHX = os.environ["MBP_PROOF_PATHX"].split(":") if os.environ.get("MBP_PROOF_PATHX") else [SHIMBIN, "/opt/homebrew/bin", MHOME + "/.local/bin"]  # o atalho PRIMEIRO; o resto é o que o provider já usa
 WRAPPER_CFG = os.path.join(MINI_HOME, ".gastown", "remote-shim-mbp.json")
-RUN_RE = re.compile(r"mbp-[0-9]{8}-[0-9]{6}")
 SESSION_RE = re.compile(r"remote-test-remote-mbp-[0-9]{1,3}")
 BEAD_RE = re.compile(r"[a-z]{2,8}-[a-z0-9]{2,16}(\.[0-9]{1,4}){0,3}")
 MARK, NMARK = "E2E-42-OK", "NUDGE-25-OK"  # o prompt só traz `$((6*7))`/`$((5*5))`: ver o número na tela quer dizer que o comando RODOU, não que o texto foi ecoado
@@ -460,18 +459,17 @@ print(json.dumps(res))
 '''
 
 SWEEP = r'''
-import glob, json, os, re, sys
+import errno, glob, json, os, re, sys
 C = json.loads(sys.argv[1])
 rx = [re.compile(x) for x in C["secret_rx"]]
 fb = [re.compile(x) for x in C["forbidden"]]
-hits, forb, scanned = [], [], 0
+hits, forb, unv, scanned = [], [], [], 0  # unv: o que NÃO deu para ler — "não sei" nunca vira "limpo"
 roots = list(C["roots"])
 for g in C.get("globs", []):
     roots += sorted(glob.glob(g))  # a transcrição que o claude gravou no ~/.claude/projects do MBP para esta rodada
 for root in roots:
-    if not os.path.isdir(root):
-        continue
-    for d, dirs, names in os.walk(root, followlinks=False):
+    # pasta ausente (ENOENT) = nada ali; qualquer outro erro (sem permissão, não é pasta) = "não sei": vai para unv
+    for d, dirs, names in os.walk(root, followlinks=False, onerror=lambda e: e.errno == errno.ENOENT or unv.append(e.filename)):
         if os.sep + ".git" + os.sep + "objects" in d + os.sep or d.endswith(os.sep + ".git" + os.sep + "objects"):
             dirs[:] = []
             continue
@@ -484,16 +482,20 @@ for root in roots:
                 continue
             try:
                 if os.path.getsize(p) > 3000000:
+                    unv.append(p + " (>3MB)")
                     continue
                 with open(p, "rb") as f:
                     data = f.read().decode("utf-8", "replace")
             except OSError:
+                unv.append(p)
                 continue
             scanned += 1
             for x in rx:
                 if x.pattern not in C.get("skip", {}).get(p, []) and x.search(data):
                     hits.append([p, x.pattern[:40]])
-print(json.dumps({"hits": hits, "forbidden": forb, "scanned": scanned}))
+if not scanned:
+    unv.append("nenhum arquivo lido")  # varredura vazia não prova nada
+print(json.dumps({"hits": hits, "forbidden": forb, "scanned": scanned, "unverified": unv}))
 '''
 
 HOOKLOG = r'''
@@ -533,9 +535,8 @@ class Proof:
         with open(self.cfg_path, "w") as f:
             json.dump({"default_host": HOST, "hosts": {HOST: host_block()}}, f, indent=1)
         self.env = dict(os.environ, GC_SSH_CONFIG=self.cfg_path, GC_EXEC_STATE_DIR=f"{base}/state", GC_SSH_HOST=HOST)
-        self.started, self.paused_by_us, self.url, self.pre, self.tree0, self.sha, self.head0 = False, False, "", None, [], "", ""
+        self.started, self.paused_by_us, self.url, self.pre, self.sha, self.head0 = False, False, "", None, "", ""
         self.created = {"proofs_new": False, "run_new": False, "socket_new": False}
-        self.t0 = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.say(f"mbp-proof {self.run} · sessão {SESSION} · log {path} · config do provider {self.cfg_path}")
 
     # ---- infraestrutura
@@ -636,9 +637,7 @@ class Proof:
         shadow = {n: p for n, p in s["bins_hook"].items() if p and not p.startswith(SHIMBIN + "/")}
         if shadow:
             bad.append("no PATH dos hooks (~/go/bin e ~/.local/bin à frente) existe " + ", ".join(f"{n}={p}" for n, p in shadow.items()) + ": esconderia o atalho")
-        self.created["proofs_new"] = s["proofs"] is None
-        self.created["run_new"] = s["run_dir"] is None
-        self.created["socket_new"] = not s["tmux_socket"]
+        self.created.update(proofs_new=s["proofs"] is None, run_new=s["run_dir"] is None, socket_new=not s["tmux_socket"])
         # o bundle e o cliente instalados e conferidos NO MBP (critério e)
         v = self.rsh(f"python3 -I {shlex.quote(MBIN + '/remote-bundle-build.py')} verify {shlex.quote(BUNDLE)}")
         self.check("bundle instalado em gt-remote/bundle e conferido NO MBP (verify lá)", v.returncode == 0, (v.stdout + v.stderr).decode("utf-8", "replace").strip()[:200])
@@ -710,17 +709,15 @@ class Proof:
         return seen
 
     def evidence(self, screen: str) -> None:
-        a = self.a
         ok = all(f"{SHIMBIN}/{n}" in screen for n in ("bd", "gc"))
         self.check("(c) na sessão, `bd` e `gc` resolvem para o atalho (nenhum bd/gc real escondendo)", ok, "tela sem os dois caminhos de shim-bin" if not ok else "")
-        c = subprocess.run(["bd", "comments", a.bead, "--json"], capture_output=True, cwd=CITY, timeout=180)
+        c = subprocess.run(["bd", "comments", self.a.bead, "--json"], capture_output=True, cwd=CITY, timeout=180)
         self.check("(c) o comentário da sessão está na bead, no mini", c.returncode == 0 and self.run in c.stdout.decode("utf-8", "replace"), f"bd comments rc {c.returncode}")
         g = self.rpy(GITSEE, {"workdir": self.wd, "run": self.run, "url": self.url, "path_extra": PATHX}, timeout=200)
         if "_erro" in g:
             self.check("(d) li o commit da sessão no MBP", False, g["_erro"])
             return
-        sha = (re.match(r"^(\w{40})\|", g["log"]) or [None, ""])[1]
-        self.sha = sha
+        sha = self.sha = (re.match(r"^(\w{40})\|", g["log"]) or [None, ""])[1]
         self.check("(d) commit no MBP, com a identidade da sessão, só do arquivo de teste", bool(sha) and sha != self.head0 and f"|{SESSION}|" in g["log"] and self.run in g["log"]
                    and g["changed"] == [f"mbp-proof/{self.run}.txt"] and g["status"] == "", f"{g['log']} · mudou {g['changed']} · status {g['status']!r}")
         self.check("(d) clone continua sem dado depois do commit: 1 blob (o do teste) e só o arquivo de teste no checkout", g["blobs"] <= 1 and g["wtfiles"] == [f"mbp-proof/{self.run}.txt"],
@@ -765,7 +762,7 @@ class Proof:
                     break
             if ok:
                 got = subprocess.run(["git", "-C", tmp, "rev-parse", "refs/heads/probe"], capture_output=True, text=True).stdout.strip()
-                lt = subprocess.run(["git", "-C", tmp, "ls-tree", f"refs/heads/probe", f"mbp-proof/{self.run}.txt"], capture_output=True, text=True).stdout.split()
+                lt = subprocess.run(["git", "-C", tmp, "ls-tree", "refs/heads/probe", f"mbp-proof/{self.run}.txt"], capture_output=True, text=True).stdout.split()
                 blob = lt[2] if len(lt) >= 3 else ""
         except (OSError, subprocess.SubprocessError):
             ok = False
@@ -791,7 +788,6 @@ class Proof:
         self.still_free("a pausa")
         t0 = self.tree()
         rows0 = t0.get("rows") or []
-        self.tree0 = rows0
         if "_erro" in t0 or not rows0:
             self.check("(b) li a árvore de processos da sessão antes da pausa", False, str(t0.get("_erro") or t0)[:200])
             return
@@ -805,14 +801,11 @@ class Proof:
             return
         g = self.prov("gate", HOST, timeout=90)
         self.check("(b) com a pausa ligada o gate do provider recusa sessão nova", g.returncode == 1 and "paus" in self.out(g).lower(), self.out(g)[:160])
-        end, last, ok = time.time() + 60, {}, False
-        while time.time() < end:
+        end, last, ok, rows, why = time.time() + 60, {}, False, [], "a árvore não foi lida"
+        while time.time() < end and not ok:
             time.sleep(min(2, POLL))
             last = self.tree()
             ok, rows, why = judge_tree(rows0, last.get("rows") or [], t0["watcher"])
-            if ok:
-                break
-        ok, rows, why = judge_tree(rows0, last.get("rows") or [], t0["watcher"])
         for pid, comm, n0, n1, p0, p1 in rows:
             self.say(f"(b) pid {pid:>6} {comm[:40]:40} nice {n0:>3} → {n1:>3}  pri {p0:>3} → {p1:>3}")
         self.check("(b) o vigia rebaixou a árvore da sessão (nice >= 19 em TODO processo comparável que tinha folga, e nenhum com a prioridade devolvida)", ok, why)
@@ -853,7 +846,7 @@ class Proof:
                 sw = self.rpy(SWEEP, {"roots": [self.wd, SPOOL, SHIMBIN, BUNDLE], "globs": [f"{MHOME}/.claude/projects/*{self.run}*"], "secret_rx": SECRET_RX, "forbidden": FORBIDDEN,
                                     "skip": {f"{BUNDLE}/manifest.json": [SECRET_KV]}})
                 self.check("(d) varredura (antes de apagar a pasta de teste): nenhum segredo e nenhum arquivo de dado/credencial no clone, no spool, no atalho, no bundle nem na transcrição da sessão",
-                           "_erro" not in sw and not sw["hits"] and not sw["forbidden"], f"{sw.get('scanned')} arquivos lidos · segredos {sw.get('hits')} · proibidos {sw.get('forbidden')}" if "_erro" not in sw else sw["_erro"])
+                           "_erro" not in sw and not sw["hits"] and not sw["forbidden"] and not sw["unverified"], f"{sw.get('scanned')} arquivos lidos · segredos {sw.get('hits')} · proibidos {sw.get('forbidden')} · sem verificar {sw.get('unverified')}" if "_erro" not in sw else sw["_erro"])
         if self.a.delete_branch and self.url and self.sha:
             d = self.rsh(f"cd {shlex.quote(self.wd)} && git push origin --delete worker/{self.run}", timeout=120)
             self.say(f"branch worker/{self.run} apagado no origin: rc {d.returncode} {(d.stdout + d.stderr).decode('utf-8', 'replace').strip()[:160]}")
@@ -864,8 +857,7 @@ class Proof:
             self.say(f"limpeza no MBP: {json.dumps(c, ensure_ascii=False)[:400]}")
             self.check("(a) pasta de teste, marca de confiança no ~/.claude.json e diretórios criados pela prova removidos", bool(c.get("ok")), json.dumps(c, ensure_ascii=False)[:200])
             post = self.snap(self.wd)
-            if "_erro" not in post and self.pre is not None:
-                self.compare(self.pre, post)
+            self.compare(self.pre, post) if "_erro" not in post else self.check("(c)(d) varredura depois: li o estado do MBP", False, post["_erro"])  # sem leitura não há "nada novo"
         elif self.a.keep:
             self.say(f"--keep: a pasta de teste {self.wd} e a marca de confiança FICAM no MBP")
 

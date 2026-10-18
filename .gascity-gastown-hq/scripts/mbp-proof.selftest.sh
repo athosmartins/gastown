@@ -8,15 +8,11 @@
 #
 # GRUPOS: unit — judge_tree (todo processo com folga tem de ser rebaixado, e ao menos um tinha folga), PAUSE/CLEAN/SWEEP rodados de verdade, pedido de start, identidade, padrões de segredo ·
 #   cli — argumento com cara de comando, sessão real, install sem --apply (nada conecta), plan contra o dry-run do provider (pula sem scripts/gc-session-ssh, p.ex. no nó Linux) ·
-#   install — instalação com o builder real: bundle conferido LÁ, run/ preservada, cliente + links + config, spool 0700, nada em ~/.claude nem ~/.ssh, config do wrapper
-#   diferente = não sobrescreve, transferência adulterada = reprova sem trocar, ssh fora / MBP não livre = 3 ·
-#   e2e — a prova inteira (a–e) contra o MBP falso, com modos de falha: cada prova reprova sozinha, o diálogo NUNCA é respondido, a sessão é parada em todo caminho,
-#   a pausa do Athos nunca é removida por nós, e o MBP volta ao que era (arquivos, ~/.claude.json, ~/.ssh, spool, bundle)
+#   install — instalação com o builder real: bundle conferido LÁ, run/ preservada, cliente + links + config, spool 0700, nada em ~/.claude nem ~/.ssh, config do wrapper diferente = não sobrescreve, transferência adulterada = reprova sem trocar, ssh fora / MBP não livre = 3 ·
+#   e2e — a prova inteira (a–e) contra o MBP falso, com modos de falha: cada prova reprova sozinha, o diálogo NUNCA é respondido, a sessão é parada em todo caminho, a pausa do Athos nunca é removida por nós, e o MBP volta ao que era (arquivos, ~/.claude.json, ~/.ssh, spool, bundle)
 # CONTROLE NEGATIVO: cada guarda é trocada numa cópia (python, uma ocorrência exata) e os casos que a cobrem TÊM que passar a falhar.
-# VARIÁVEIS: MBPT_UNDER_TEST (script a testar) · MBPT_ONLY (grupos separados por vírgula; ou --only=a,b) · MBPT_CASES (casos; ou --cases=a,b) · MBPT_NO_MUTANTS=1 (ou --no-mutants) ·
-#   MBPT_DEBUG=1 (ou --debug: mostra a saída do driver em cada e2e)
-# O QUE NÃO PROVA: o MBP de verdade (macOS, tmux, claude, a biblioteca de presença, o git/ssh com a credencial dele) — isso é o `e2e` ao vivo. Aqui o vigia falso olha o arquivo
-#   PAUSE e dá `renice`; a árvore de processos, o ps, o nice e o julgamento são reais.
+# VARIÁVEIS: MBPT_UNDER_TEST (script a testar) · MBPT_ONLY (grupos separados por vírgula; ou --only=a,b) · MBPT_CASES (casos; ou --cases=a,b) · MBPT_NO_MUTANTS=1 (ou --no-mutants) · MBPT_DEBUG=1 (ou --debug: mostra a saída do driver em cada e2e)
+# O QUE NÃO PROVA: o MBP de verdade (macOS, tmux, claude, a biblioteca de presença, o git/ssh com a credencial dele) — isso é o `e2e` ao vivo. Aqui o vigia falso olha o arquivo PAUSE e dá `renice`; a árvore de processos, o ps, o nice e o julgamento são reais.
 set -u
 for a in "$@"; do case "$a" in --no-mutants) MBPT_NO_MUTANTS=1;; --debug) MBPT_DEBUG=1;; --only=*) MBPT_ONLY="${a#--only=}";; --cases=*) MBPT_CASES="${a#--cases=}";; esac; done  # (o nó Linux repassa argumentos, não ambiente)
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -66,6 +62,7 @@ while [ "${1#-}" != "$1" ]; do case $1 in -o) shift 2;; *) shift;; esac; done
 shift
 cmd=$1
 if [ -n "${FAKE_UPLOAD_FAIL:-}" ]; then case $cmd in *"cat > "*"remote-bundle-build.py"*) cat > /dev/null; echo "cat: cannot write: Read-only file system" >&2; exit 1;; esac; fi
+if [ "${FAKE_MODE:-}" = snapfail ]; then case $cmd in *proofs_new*) touch "$FAKE_STATE/cleaned";; *'"plib"'*) [ ! -e "$FAKE_STATE/cleaned" ] || { cat > /dev/null; echo "snap: boom" >&2; exit 1; };; esac; fi  # a leitura DEPOIS da limpeza falha
 HOME="$SRV" TMUX_TMPDIR="$SRV/tmp" ON_MBP=1 PATH="$SRV/fakebin:/usr/bin:/bin" sh -c "$cmd"; rc=$?
 if [ -n "${FAKE_TAMPER:-}" ]; then case $cmd in *"; tar -C "*" -xf -") d=${cmd##*tar -C }; d=${d% -xf -}; echo adulterado > "$d/injetado.txt";; esac; fi
 exit $rc
@@ -152,6 +149,7 @@ agent() {  # a "sessão": os 6 passos do prompt, com o modo de falha pedido
   case $mode in
     secret) printf 'token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$G/shim/vazou.txt";;
     leadfile) echo "joao@example.com" > "$wd/leads.csv";;
+    bigfile) head -c 3100000 /dev/zero > "$wd/grande.bin";;
     credleak) echo "https://u:pppppppp@github.com" > "$SRV/.git-credentials";;
     sshkey) echo "chave" > "$SRV/.ssh/id_ed25519";;
     transcriptsecret) mkdir -p "$SRV/.claude/projects/-fake-$run"; printf 'ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$SRV/.claude/projects/-fake-$run/vazou.txt";;
@@ -268,9 +266,9 @@ g_unit() {
   J='b=[dict(pid=10,ppid=1,ni=0,pri=31,comm="pane"),dict(pid=11,ppid=10,ni=10,pri=41,comm="claude"),dict(pid=12,ppid=10,ni=0,pri=31,comm="PRESENCE_LIB_ONLY"),dict(pid=13,ppid=12,ni=0,pri=31,comm="sleep")]
 a=[dict(r,ni=19 if r["pid"] in (10,11) else r["ni"]) for r in b]'
   c judge-ok && { py "$J"'
-ok,rows,why=M.judge_tree(b,a,12); assert ok and [r[0] for r in rows]==[10,11] and why=="", (ok,rows,why)'; ok $? "unit: judge_tree — todos os processos comparáveis rebaixados (19 e acima do que eram); o vigia e o filho dele (sleep) ficam de fora"; }
-  c judge-nowatcher && { py "$J"'
-assert M.judge_tree(b,a,0)[0] is False'; ok $? "unit: judge_tree — sem o vigia identificado não há o que julgar (reprova)"; }
+ok,rows,why=M.judge_tree(b,a,12); assert ok and [r[0] for r in rows]==[10,11] and why=="", (ok,rows,why)
+assert M.judge_tree(b,a,0)[0] is False
+b.append(dict(pid=14,ppid=10,ni=0,pri=31,comm="git")); assert M.judge_tree(b,a,12)[0] is True'; ok $? "unit: judge_tree — todos os processos comparáveis rebaixados (19 e acima do que eram); o vigia e o filho dele (sleep) ficam de fora; sem o vigia identificado não há o que julgar (reprova); processo passageiro que sumiu não conta contra (o chamador confere à parte que a sessão não morreu)"; }
   c judge-one && { py "$J"'
 a[1]["ni"]=10
 ok,rows,why=M.judge_tree(b,a,12); assert not ok and "11" in why, (ok,why)'; ok $? "unit: judge_tree — UM processo sem rebaixar reprova e é nomeado"; }
@@ -286,9 +284,6 @@ ok,rows,why=M.judge_tree(b,a,12); assert not ok and "11" in why, (ok,why)'; ok $
   c judge-none && { py "$J"'
 a=[dict(r,pid=r["pid"]+100,ppid=r["ppid"]+100 if r["ppid"]>1 else 1) for r in a]
 ok,rows,why=M.judge_tree(b,a,112); assert not ok and "nada a comparar" in why, (ok,why)'; ok $? "unit: judge_tree — nenhum processo existe antes e depois: nada a comparar (reprova, não passa em silêncio)"; }
-  c judge-gone && { py "$J"'
-b.append(dict(pid=14,ppid=10,ni=0,pri=31,comm="git"))
-assert M.judge_tree(b,a,12)[0] is True'; ok $? "unit: judge_tree — processo passageiro que sumiu não conta contra (o chamador confere à parte que a sessão não morreu)"; }
   c family && { py 'r=[dict(pid=2,ppid=1),dict(pid=3,ppid=2),dict(pid=4,ppid=3),dict(pid=5,ppid=1)]
 assert M.family(r,2)=={2,3,4}'; ok $? "unit: family — o processo e todos os descendentes, nada além"; }
   c startreq && { py 'r=M.start_request("ga-w7qwl1.1","haiku","mbp-20260101-000000","/w/x")
@@ -345,7 +340,10 @@ r=run(); assert r["ok"]'; ok $? "unit: CLEAN — recusa pasta fora do padrão; a
     UD="$T/u3" py 'import subprocess,json,os
 U=os.environ["UD"]
 def run(roots,globs=[]): return json.loads(subprocess.run(["python3","-I","-",json.dumps({"roots":roots,"globs":globs,"secret_rx":M.SECRET_RX,"forbidden":M.FORBIDDEN})],input=M.SWEEP.encode(),capture_output=True).stdout.decode().strip().split("\n")[-1])
-r=run([U+"/ok"]); assert len(r["hits"])==1 and r["hits"][0][0].endswith("leak.txt") and r["forbidden"]==[U+"/ok/.env"], r
+r=run([U+"/ok"]); assert len(r["hits"])==1 and r["hits"][0][0].endswith("leak.txt") and r["forbidden"]==[U+"/ok/.env"] and r["unverified"]==[], r
+os.makedirs(U+"/big"); open(U+"/big/b.bin","wb").write(b"x"*3000001); r=run([U+"/big"]); assert r["unverified"][0]==U+"/big/b.bin (>3MB)", r
+import socket; os.makedirs(U+"/sk"); os.chdir(U+"/sk"); open("a.txt","w").write("limpo"); socket.socket(socket.AF_UNIX).bind("x.sock"); r=run([U+"/sk"]); assert r["unverified"]==[U+"/sk/x.sock"], r
+r=run([U+"/nao-existe"]); assert r["unverified"]==["nenhum arquivo lido"], r; r=run([U+"/ok/a.txt"]); assert r["unverified"][0]==U+"/ok/a.txt", r
 r=run([U+"/g"]); assert r["hits"]==[] and r["forbidden"]==[], r
 r=run([U+"/nao-existe"],[U+"/glob*"]); assert len(r["hits"])==1 and r["hits"][0][0].endswith("t.jsonl"), r
 os.makedirs(U+"/m")
@@ -355,7 +353,7 @@ def runs(roots,skip): return json.loads(subprocess.run(["python3","-I","-",json.
 r=runs([U+"/m"],{}); assert sorted(h[0].rsplit("/",1)[1] for h in r["hits"])==["manifest.json","outro.json"], r
 r=runs([U+"/m"],{U+"/m/manifest.json":[M.SECRET_KV]}); assert [h[0].rsplit("/",1)[1] for h in r["hits"]]==["outro.json"], r
 open(U+"/m/manifest.json","w").write("{\"x\": \"ghp_"+"d"*36+"\"}")
-r=runs([U+"/m"],{U+"/m/manifest.json":[M.SECRET_KV]}); assert "manifest.json" in [h[0].rsplit("/",1)[1] for h in r["hits"]], r'; ok $? "unit: SWEEP — acha segredo e arquivo proibido, não lê dentro de .git/objects, varre também a transcrição (glob), e só dispensa o padrão genérico \"token\": no manifest do bundle (um segredo de verdade nele ainda reprova)"; }
+r=runs([U+"/m"],{U+"/m/manifest.json":[M.SECRET_KV]}); assert "manifest.json" in [h[0].rsplit("/",1)[1] for h in r["hits"]], r'; ok $? "unit: SWEEP — acha segredo e arquivo proibido, lista o que não deu para ler (arquivo >3MB, socket, raiz que não é pasta, varredura vazia; pasta ausente não conta), não lê dentro de .git/objects, varre também a transcrição (glob), e só dispensa o padrão genérico \"token\": no manifest do bundle (um segredo de verdade nele ainda reprova)"; }
 }
 
 # ---------------------------------------------------------------- cli
@@ -472,8 +470,10 @@ g_e2e() {
   fail1 secret secret "FAIL (d) varredura (antes de apagar a pasta de teste)" "segredo no spool → a varredura reprova"
   fail1 transcriptsecret transcriptsecret "FAIL (d) varredura (antes de apagar a pasta de teste)" "segredo na transcrição da sessão → a varredura reprova"
   fail1 leadfile leadfile "FAIL (d) varredura (antes de apagar a pasta de teste)" "arquivo de dado (leads.csv) no clone → a varredura reprova"
+  fail1 bigfile bigfile "FAIL (d) varredura (antes de apagar a pasta de teste)" "arquivo de 3,1 MB no clone (grande demais para ler) → a varredura reprova em vez de passar sem olhar"
   fail1 credleak credleak "FAIL (c)(d) varredura depois" "credencial git nova em ~/.git-credentials → a comparação antes/depois reprova"
   fail1 sshkey sshkey "FAIL (c)(d) varredura depois" "chave nova em ~/.ssh → a comparação antes/depois reprova"
+  fail1 snapfail snapfail "FAIL (c)(d) varredura depois: li o estado do MBP" "leitura do MBP que falha depois da limpeza → reprova (sem leitura não há \"nada novo\")"
   c dialog && { FAKE_MODE=dialog ep; [ $RC = 1 ] && has "$T/out" "FAIL (e) a sessão rodou" && has "$T/out" "trust this folder" && has "$T/out" "sessão andou sem diálogo" && [ "$(calls nudge)" = 0 ] && ! grep -q 'send-keys' "$FAKE_STATE/provcalls" && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: diálogo de primeira execução → reprova mostrando a tela, NUNCA é respondido (nenhum nudge/send-keys) e a sessão é parada (rc=$RC)"; }
   fail1 die die "FAIL (e) a sessão rodou" "sessão que morre antes do fim → reprova com a tela"
   fail1 hang hang "FAIL (e) a sessão rodou" "sessão que trava → reprova no prazo e é parada" --timeout 5
@@ -565,8 +565,14 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e leavesocket "o socket sobrando não conta" ' and not s["tmux_socket"] and s["run_dir"]' ' and s["run_dir"]'
   mutant e2e leavefile "o arquivo do lançador sobrando não conta" 'and s["run_dir"] in (None, []) and s["procs"] == [])' 'and s["procs"] == [])'
   mutant e2e leaveproc "processo sobrando não conta" ' and s["procs"] == [])' ')'
+  mutant unit sweeppy "arquivo grande demais some da varredura" 'unv.append(p + " (>3MB)")' 'pass'
+  mutant unit sweeppy "arquivo que não abre some da varredura" '                unv.append(p)' '                pass'
+  mutant unit sweeppy "erro ao descer na pasta some da varredura" 'e.errno == errno.ENOENT or unv.append(e.filename)' 'True'
+  mutant unit sweeppy "varredura vazia passa" 'if not scanned:' 'if False:'
   mutant unit sweeppy "o manifest do bundle dispensa TODOS os padrões" 'x.pattern not in C.get("skip", {}).get(p, [])' 'p not in C.get("skip", {})'
   mutant e2e ok "a varredura reprova o manifest do bundle (campo token do hook)" '"skip": {f"{BUNDLE}/manifest.json": [SECRET_KV]}})' '"skip": {}})'
+  mutant e2e snapfail "estado ilegível depois da limpeza passa em branco" 'else self.check("(c)(d) varredura depois: li o estado do MBP", False, post["_erro"])' 'else None'
+  mutant e2e bigfile "o veredito ignora o que não deu para ler" ' and not sw["unverified"], f"' ', f"'
   mutant e2e secret "a varredura não olha segredo" '"_erro" not in sw and not sw["hits"] and not sw["forbidden"]' '"_erro" not in sw and not sw["forbidden"]'
   mutant e2e sshkey "a comparação antes/depois ignora ~/.ssh e credenciais" 'for k in ("ssh_dir", "creds", "links", "client_conf", "shim_sha"):' 'for k in ("links", "client_conf", "shim_sha"):'
   mutant e2e dialog "o diálogo é ignorado" '            if any(d in seen for d in DIALOGS):' '            if False:'
