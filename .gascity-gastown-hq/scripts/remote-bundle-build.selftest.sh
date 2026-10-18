@@ -38,9 +38,13 @@
 #   SWAP (ga-2hd02v.1.5): o cross-clone-block do mini vira o remote-clone-guard.py em Bash E em Edit|Write|MultiEdit|NotebookEdit, com `|| exit 2`,
 #   sem o `if` do original; o guarda vai no bundle idêntico ao do repositório e executável; o --selfcheck do guarda aprova as settings geradas;
 #   sem o hook no mini não há swap nem guarda (clone_guard=false); swap fora de PreToolUse, guarda ilegível e guarda com CPF ou /Users/ recusam.
+#   DESTINO EM /Users/ (o MBP, ga-w7qwl1.1): com --remote-root /Users/athos/gt-remote/bundle e --remote-home <raiz>/home o build sai 0, todo /Users/ do
+#   bundle fica sob a raiz, nada é reescrito duas vezes (o home do mini é prefixo do destino), o guarda de clone aponta para o home DO BUNDLE, verify sai 0; /Users/ de outro
+#   usuário, vizinho da raiz (…bundlex), a raiz precedida de outro caminho (/xx/Users/…) e outro caminho do mesmo usuário fora da raiz seguem recusando; o bundle do servidor tem o mesmo hash de antes.
 # CONTROLE NEGATIVO: a tabela POLICY perde a linha de um hook (sed) e o mesmo build TEM que passar a recusar — keep (filter-bash-output.sh)
 #   e drop (gt tap guard cross-clone-block, home-scan-guard, ntfy-on-stop.sh). Skills: sem a exclusão por nome as 3 com CPF/CNPJ recusam; exclusão por substring deixaria a renomeada
-#   passar; sem as linhas de CPF/CNPJ de SECRETS a 4ª skill passaria.
+#   passar; sem as linhas de CPF/CNPJ de SECRETS a 4ª skill passaria. MBP: sem a guarda que reconhece a raiz do destino o build recusa tudo; reescrita em sequência
+#   ou reescrever o hook do guarda de novo corrompe o caminho do destino.
 #   Swap: o builder sem uma peça do swap (`|| exit 2`, o grupo
 #   Edit|Write, o arquivo do guarda, a troca em si) gera settings que o --selfcheck do guarda reprova.
 set -u
@@ -571,6 +575,77 @@ fresh; addskill quarta-skill "cliente $CPF e $CNPJ"
 grep -c '^    ("CPF", re.compile\|^    ("CNPJ", re.compile' "$B" | grep -qx 2; ok $? "  SECRETS tem as linhas de CPF e CNPJ (o grep abaixo não é um no-op)"
 grep -v '^    ("CPF", re.compile\|^    ("CNPJ", re.compile' "$B" > "$T/mutant.py"; wipe "$T/f/mut"; mutate_build "$T/mutant.py"
 [ $? = 0 ]; ok $? "controle negativo: sem as linhas de CPF/CNPJ a 4ª skill passaria — os casos de 4ª skill pegam o afrouxamento"
+
+# ---- DESTINO EM /Users/ (o MBP, ga-w7qwl1.1): a raiz do bundle e o "home" do bundle ficam sob /Users/athos/gt-remote/bundle, que CONTÉM o home do mini
+MB=/Users/athos/gt-remote/bundle
+mbp_build() {  # mbp_build BUILDER DIR OUT [extra...] — o build do MBP: home do bundle DENTRO da raiz (não toca no ~/.claude do notebook)
+  local b=$1 d=$2 o=$3; shift 3
+  python3 -I "$b" build --city "$d/gt/.gascity-gastown-hq" --claude-home "$d/home/.claude" --mini-home "$d/home" --role dog \
+    --role-dir "$d/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root "${MBR:-$MB}" --remote-home "${MBR:-$MB}/home" --clone-guard "$GUARD" --out "$o" "$@" 2>"$T/err" >"$T/outp"
+}
+mbp_good() {  # mbp_good OUT — 0 só se o bundle do MBP está certo: todo /Users/ sob a raiz, nada reescrito duas vezes, o guarda aponta para o home do bundle
+  local o=$1 r=${MBR:-$MB}
+  grep -rhoE '/Users/[^" ;]*' "$o" | grep -vE "^$r(/|\$)" >/dev/null; [ $? = 1 ] || return 1
+  grep -rqF "$r/home/gt-remote" "$o"; [ $? = 1 ] || return 1
+  grep -qF "python3 -I $r/home/.claude/hooks/remote-clone-guard.py || exit 2" "$o/home/.claude/settings.json" || return 1
+  grep -qF "\"$r/work\"" "$o/home/.claude/settings.json" || return 1
+  [ "$(jq -r '.install["home/.claude"]' "$o/manifest.json")" = "$r/home/.claude" ]
+}
+fresh; mbp_build "$B" "$T/f" "$T/f/out"; rc=$?
+ok $rc "MBP: build com destino em /Users/ sai 0"; [ $rc = 0 ] || cat "$T/err" >&2
+mbp_good "$T/f/out"; ok $? "MBP: todo /Users/ do bundle está sob a raiz, nada reescrito duas vezes, o guarda aponta para o home do bundle"
+python3 -I "$B" verify "$T/f/out" >/dev/null 2>&1; ok $? "MBP: verify do bundle sai 0"
+fresh; sed -i.bak 's#"A": "1"#"A": "/Users/fulano/x"#' "$T/f/$CS"; wipe "$T/f/out"; mbp_build "$B" "$T/f" "$T/f/out"; rc=$?
+[ $rc = 3 ] && has "$T/err" "sobrando" && [ ! -e "$T/f/out" ]; ok $? "MBP: /Users/ de OUTRO usuário continua recusando (rc=$rc)"
+fresh; sed -i.bak "s#\"A\": \"1\"#\"A\": \"${MB}x/y\"#" "$T/f/$CS"; wipe "$T/f/out"; mbp_build "$B" "$T/f" "$T/f/out"; rc=$?
+[ $rc = 3 ] && has "$T/err" "sobrando" && [ ! -e "$T/f/out" ]; ok $? "MBP: vizinho da raiz (${MB}x) NÃO é a raiz: fronteira, recusa (rc=$rc)"
+fresh; sed -i.bak "s#\"A\": \"1\"#\"A\": \"/Users/athos/gt-remote/bin/x\"#" "$T/f/$CS"; wipe "$T/f/out"; mbp_build "$B" "$T/f" "$T/f/out"; rc=$?
+[ $rc = 3 ] && has "$T/err" "sobrando"; ok $? "MBP: outro caminho do mesmo usuário (fora da raiz) recusa (rc=$rc)"
+fresh; sed -i.bak "s#\"A\": \"1\"#\"A\": \"/xx${MB}/y\"#" "$T/f/$CS"; wipe "$T/f/out"; mbp_build "$B" "$T/f" "$T/f/out"; rc=$?
+[ $rc = 3 ] && has "$T/err" "sobrando" && [ ! -e "$T/f/out" ]; ok $? "MBP: a raiz precedida de outro caminho (/xx${MB}) NÃO é a raiz: fronteira à esquerda, recusa (rc=$rc)"
+# a reescrita devolve settings/hook como JSON: uma raiz com aspas (destino sem /Users/, onde a guarda do /Users/ não chega primeiro) quebra esse JSON e a leitura de volta falha — tem que recusar com a mensagem e sem deixar nada, não gerar bundle torto
+MBR='/home/run"ner/rr'; fresh; wipe "$T/f/out"; mbp_build "$B" "$T/f" "$T/f/out"; rc=$?; unset MBR
+[ $rc = 3 ] && has "$T/err" "entrada ilegível" && ! has "$T/err" Traceback && [ ! -e "$T/f/out" ] && [ -z "$(ls -d "$T"/f/out.tmp.* 2>/dev/null)" ]
+ok $? "MBP: JSON corrupt na leitura de volta (a raiz do destino tem aspas): recusa 'entrada ilegível' (rc=$rc), sem traceback e sem bundle algum"
+# controle negativo: cada peça tirada do builder tem que fazer o bundle do MBP reprovar
+pymut() {  # pymut ORIGINAL DESTINO OLD NEW — troca UM trecho exato (e confirma que ele existia: o mutante não é um no-op)
+  python3 -I - "$1" "$2" "$3" "$4" <<'PY'
+import sys
+src, dst, old, new = sys.argv[1:]
+s = open(src).read()
+if s.count(old) != 1:
+    sys.exit(7)
+open(dst, "w").write(s.replace(old, new))
+PY
+}
+G_OLD='re.sub(r"(?<![\w.-])" + re.escape(self.a.remote_root.rstrip("/")) + r"(?![\w.-])", "", text)'
+pymut "$B" "$T/mutant.py" "$G_OLD" 'text'; ok $? "  o builder tem a guarda que tira a raiz do destino (o mutante abaixo não é um no-op)"
+fresh; wipe "$T/f/out"; mbp_build "$T/mutant.py" "$T/f" "$T/f/out"; [ $? = 3 ]; ok $? "controle negativo: sem a guarda que reconhece a raiz do destino o build do MBP recusa tudo"
+G_NOLEFT='re.sub(re.escape(self.a.remote_root.rstrip("/")) + r"(?![\w.-])", "", text)'
+pymut "$B" "$T/mutant.py" "$G_OLD" "$G_NOLEFT"
+fresh; sed -i.bak "s#\"A\": \"1\"#\"A\": \"/xx${MB}/y\"#" "$T/f/$CS"; wipe "$T/f/out"; mbp_build "$T/mutant.py" "$T/f" "$T/f/out"; [ $? = 0 ]
+ok $? "controle negativo: sem a fronteira à esquerda a raiz precedida de outro caminho (/xx${MB}) passaria"
+R_OLD='return re.sub(r"(?<![\w.-])(?:" + rx + r")(?![\w.-])", lambda m: first[m.group(0)], s)'
+R_NEW=$'for o, n in self.rules:\n            s = re.sub(r"(?<![\\w.-])" + re.escape(o) + r"(?![\\w.-])", lambda _m, n=n: n, s)\n        return s'
+pymut "$B" "$T/mutant.py" "$R_OLD" "$R_NEW"; ok $? "  o builder tem a reescrita de uma passada (o mutante abaixo não é um no-op)"
+MBR=$T/f/home/gt-remote/bundle  # destino SOB o home do mini (a fixture não tem /Users/): é a forma que expõe a reescrita em dobro
+fresh; wipe "$T/f/out"; mbp_build "$B" "$T/f" "$T/f/out"; rc=$?; { [ $rc = 0 ] && mbp_good "$T/f/out"; }
+ok $? "MBP: com o destino SOB o home do mini o build bom não escreve nada duas vezes"
+pymut "$B" "$T/mutant.py" "$R_OLD" "$R_NEW"
+fresh; wipe "$T/f/out"; mbp_build "$T/mutant.py" "$T/f" "$T/f/out"; rc=$?; { [ $rc = 0 ] && mbp_good "$T/f/out"; }; [ $? != 0 ]
+ok $? "controle negativo: a reescrita em sequência escreve o destino DUAS vezes (o home do mini é prefixo do destino)"
+W_OLD='kept_groups.append({**g, "hooks": kept})'
+pymut "$B" "$T/mutant.py" "$W_OLD" 'kept_groups.append({**g, "hooks": json.loads(self.rewrite(json.dumps(kept)))})'; ok $? "  o builder entrega os hooks já reescritos (o mutante abaixo não é um no-op)"
+fresh; wipe "$T/f/out"; mbp_build "$T/mutant.py" "$T/f" "$T/f/out"; rc=$?; { [ $rc = 0 ] && mbp_good "$T/f/out"; }; [ $? != 0 ]
+ok $? "controle negativo: reescrever de novo o hook do guarda (já no destino) o corrompe"
+unset MBR
+# o destino do servidor (sem /Users/) segue igual: o mesmo build do Hetzner, com a guarda nova, tem o mesmo hash do builder SEM as duas mudanças (a guarda velha, a reescrita em sequência e o hook reescrito de novo)
+fresh; build "$T/f" "$T/f/out"; H_NEW=$(hash_of "$T/f/out")
+pymut "$B" "$T/mutant.py" "$G_OLD" 'text' >/dev/null; pymut "$T/mutant.py" "$T/mutant2.py" "$R_OLD" "$R_NEW" >/dev/null
+pymut "$T/mutant2.py" "$T/mutant3.py" "$W_OLD" 'kept_groups.append({**g, "hooks": json.loads(self.rewrite(json.dumps(kept)))})' >/dev/null; mv "$T/mutant3.py" "$T/mutant2.py"
+wipe "$T/f/out"; python3 -I "$T/mutant2.py" build --city "$T/f/gt/.gascity-gastown-hq" --claude-home "$T/f/home/.claude" --mini-home "$T/f/home" --role dog \
+  --role-dir "$T/f/gt/.gascity-gastown-hq/.gc/agents/dog" --remote-root /home/runner/rr --remote-home /home/runner --clone-guard "$GUARD" --out "$T/f/out" 2>/dev/null
+[ -n "$H_NEW" ] && [ "$H_NEW" = "$(hash_of "$T/f/out")" ]; ok $? "servidor: o bundle do Hetzner tem o MESMO hash com o builder novo e com o anterior (reescrita de uma passada não muda o destino sem /Users/)"
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

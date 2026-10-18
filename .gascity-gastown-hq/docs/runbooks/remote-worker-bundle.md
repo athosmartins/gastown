@@ -4,7 +4,7 @@
 
 • O que esta fatia é — e o que não é · Como rodar (build / verify)
 • Vereditos por hook (medidos no mini de verdade) · O que foi medido, o que foi inferido, o que foi contrariado por medição, o que não foi testado
-• O 1º uso real recusou as skills · Pontos em aberto para as próximas fatias · Limites do builder
+• O 1º uso real recusou as skills · **O bundle no MBP (ga-w7qwl1.1)** · Pontos em aberto para as próximas fatias · Limites do builder
 
 Bead ga-2hd02v (feature; desenho escolhido no estudo ga-ukxa3k). **Esta é a fatia 1: o spike do bundle de settings/hooks**, porque o plano manda começar por ele. Só ela foi feita: o Mayor segurou o resto em 2026-10-14T01:42Z, comentário no ga-2hd02v ("P0→P2 … só a 1ª fatia de cada", decisão do Athos por AskUserQuestion). As fatias seguintes estão no bead de continuação (`pilot:no-auto-dispatch`), não aqui.
 
@@ -78,6 +78,22 @@ Chaves de settings fora da lista de portáveis saem e ficam registradas em `mani
 ## O 1º uso real recusou as skills
 
 `build --skills` contra as 18 skills do dog **saiu 3** (guarda funcionando): o texto de 3 skills tem 5 valores no formato de CPF/CNPJ (`censec-inventario-extrajudicial` 1, `cnd-municipal-pbh` 3, `cnd-trabalhista-cndt` 1). Nenhum é zero/dígito repetido/`123456789…`, então não parecem placeholders. Não sei se são fixtures, CNPJs públicos ou dado de cliente — e "não sei" não vira "pode enviar". **Não afrouxei o regex.** Os dígitos não foram impressos em lugar nenhum desta sessão. Antes de enviar skills: um humano olha esses 5 valores e (a) o texto da skill é limpo, ou (b) o valor entra numa lista de exceção por arquivo+hash. O build sem `--skills` não é afetado. (Um dos arquivos, o `SKILL.md` do censec, não é versionado no git.)
+
+## O bundle no MBP (ga-w7qwl1.1)
+
+O destino do MBP é `/Users/athos/gt-remote/bundle`, **dentro** do home do Athos, e o home da sessão é a pasta `home/` do próprio bundle:
+
+```bash
+python3 -I $S/remote-bundle-build.py build --city $GC_CITY_PATH --claude-home ~/.claude \
+  --role dog --role-dir $GC_CITY_PATH/.gc/agents/dogs/gastown.dog-1 \
+  --remote-root /Users/athos/gt-remote/bundle --remote-home /Users/athos/gt-remote/bundle/home --out OUT   # nunca --skills no MBP
+```
+
+Quem monta, leva (tar sobre o ssh do provider), confere LÁ (`verify` com o builder que foi junto, e o `bundle_hash`) e troca é `python3 -I scripts/mbp-proof.py install --apply` (sem `--apply` só mostra o plano). A troca preserva a `run/` do provider; um `verify` que reprova NO MBP deixa o bundle vivo como estava e a pasta nova para inspeção. **Não use `hetzner-claude.py push-bundle` para o MBP.**
+
+* **Nada vai para o `~/.claude`, `~/.config` nem `~/.ssh` do Athos.** O que a sessão de teste carrega vem do `--settings <bundle>/city/settings.json` (só os hooks `gc`, que passam pelo atalho) com o login do próprio `claude` do Athos e `--strict-mcp-config`. A camada `home/.claude/…` do bundle existe no disco mas **não está ativa**: ativá-la (e o guarda de clone `remote-clone-guard.py`, que o provider exige em `{remote_home}/.claude/hooks/` antes de abrir sessão REAL) é ponto em aberto da fatia 3. Enquanto isso o provider só abre `remote-test-…`/`remote-e2e-…` no MBP.
+* **Mudança no builder para este destino** (o destino tem o home do mini dentro): (1) `rewrite()` passou a UMA passada, regra mais longa primeiro — antes a regra do home reescrevia de novo o que a da cidade tinha acabado de escrever (`/Users/athos/gt-remote/bundle/city` virava `…/bundle/home/…`); (2) a guarda de `/Users/` sobrando ignora a raiz do bundle (o destino; fronteira nos dois lados, então `…/bundlex` e `/xx/Users/…/bundle` não contam), e continua recusando qualquer outro `/Users/`; (3) o hook `swap` (guarda de clone) já nasce no destino e não passa de novo pela reescrita. Para o destino do servidor (`/home/runner/…`) nada muda. Selftest: casos novos em `remote-bundle-build.selftest.sh` — **só uma rodada parcial (17 de 17 dos casos novos, dos quais 10 reprovam contra o builder anterior) foi feita; a rodada INTEIRA do selftest do builder (lista `mac-only`: não vai ao nó Linux) ainda não, porque o disco ficou abaixo do piso do `heavy-guard` (6144 MB) durante esta fatia.** Rode-a antes de dar o builder por conferido: `scripts/heavy-guard.sh --what builder-selftest -- scripts/remote-bundle-build.selftest.sh`.
+* **Pasta `run/`.** É do provider (os lançadores das sessões). `verify` aceita uma `run/` **vazia**; arquivo dentro dela é "sobra" (exit 4). Por isso o `mbp-proof` confere, depois do `stop`, que `run/` ficou sem arquivo da sessão.
 
 ## Pontos em aberto para as próximas fatias
 
