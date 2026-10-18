@@ -1930,6 +1930,33 @@ else
     && ok "M12 drift guard: the guard still rounds the free space DOWN to whole GiB" || bad "M12 the guard's _avail_gb no longer rounds down to whole GiB — re-derive the tail's floor + 1 GiB margin"
 fi
 
+# M13. the two reads of the remembered cap and cut time FAIL (jq exits non-zero on exactly those queries; everything else goes to the real jq): the pass lands in the INERT state, not in "never cut" and not in "cut long ago"
+# vazio/falhou → the cap read failing starts the pass at the FLOOR (the cheap pass; with the floor at 2 no 3-object pack fits, so nothing is repacked) and the state keeps the cap it has; the cut-time read failing
+# starts the retry clock and does not double the cap. Neither is read as "never cut" (the configured max) or as "cut 6h ago" (a doubled cap).
+mkdir -p "$WORK/jqshim3"; REAL_JQ="$(command -v jq)"
+cat > "$WORK/jqshim3/jq" <<EOF
+#!/bin/bash
+case "\$*" in
+  *"tail_objects // empty"*) case ",\${JQ_FAIL_TAIL:-}," in *",cap,"*) echo "jq: forced failure (selftest)" >&2; exit 5 ;; esac ;;
+  *"tail_cut_epoch // empty"*) case ",\${JQ_FAIL_TAIL:-}," in *",cut,"*) echo "jq: forced failure (selftest)" >&2; exit 5 ;; esac ;;
+esac
+exec "$REAL_JQ" "\$@"
+EOF
+chmod +x "$WORK/jqshim3/jq"
+TM13="$WORK/tm13"; tailrepo "$TM13" 4; PS13="$(packs_sum "$TM13")"; tm_seed "$TM13" 6 "$(date +%s)"; rm -f "$WORK/log"
+out="$(PATH="$WORK/jqshim3:$PATH" JQ_FAIL_TAIL=cap T_TAIL=300 T_TAIL_OBJS=12 T_TAIL_MIN=2 run_tail "$TM13")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(packs_sum "$TM13")" = "$PS13" ] && [ "$(state_field "$TM13" tail_objects)" = 6 ] && printf '%s' "$out" | grep -q 'remembered tail object cap of .* could not be read — the pass starts from the floor (2 objects)' \
+    && printf '%s' "$out" | grep -q 'held back by its object cap: 2 objects' && ! printf '%s' "$out" | grep -q 'tail consolidation: [0-9]'; } \
+  && ok "M13 the read of the remembered cap fails (jq exit 5) → the pass starts from the floor (2), repacks nothing, says why in the log, and the state keeps the cap it had (6)" || bad "M13 a failed read of the cap was not inert (rc=$rc tail_objects=$(state_field "$TM13" tail_objects)): $out"
+tm_seed "$TM13" 2 "$(( $(date +%s) - 30000 ))"; rm -f "$WORK/log"
+out="$(PATH="$WORK/jqshim3:$PATH" JQ_FAIL_TAIL=cut T_TAIL=300 T_TAIL_OBJS=12 T_TAIL_MIN=2 run_tail "$TM13")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(packs_sum "$TM13")" = "$PS13" ] && [ "$(state_field "$TM13" tail_objects)" = 2 ] && ! printf '%s' "$out" | grep -q 'tail object cap 2 ->' && [ "$(tm_epoch "$TM13")" -ge "$(( $(date +%s) - 120 ))" ] 2>/dev/null; } \
+  && ok "M13 the read of the cut time fails (jq exit 5) with a cut 30000s ago on record → no doubling (cap stays 2), nothing repacked, the retry clock starts now" || bad "M13 a failed read of the cut time was read as 'cut long ago' (tail_objects=$(state_field "$TM13" tail_objects) epoch=$(tm_epoch "$TM13")): $out"
+rm -f "$WORK/log"
+out="$(T_TAIL=300 T_TAIL_OBJS=12 T_TAIL_MIN=2 T_TAIL_RETRY=0 run_tail "$TM13")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(state_field "$TM13" tail_objects)" = 4 ] && printf '%s' "$out" | grep -q 'tail object cap 2 -> 4 (0s since the last cut'; } \
+  && ok "M13 control: the same state with the real jq and the retry time at 0 → the cap IS doubled (2 -> 4): the stop above is the failed read, not the fixture" || bad "M13 control: the cap was not doubled with a readable cut time (tail_objects=$(state_field "$TM13" tail_objects)): $out"
+
 # I. the defaults that run in production
 cfg="$("$SCRIPT" --print-config)"
 printf '%s' "$cfg" | grep -q 'tail_limit_kib=262144 tail_max_objects=120 tail_timeout_s=600 tail_window=10 tail_depth=250' \
