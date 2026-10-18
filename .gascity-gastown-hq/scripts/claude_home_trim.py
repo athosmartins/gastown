@@ -28,21 +28,25 @@ cut freed 2.3 GB. This is that cut, as a lever the disk-floor guard can call.
 ## Safety
 A folder of file-history is only deleted when ALL of these hold, and the answer to each
 has three states (has / has not / could not find out) — "could not find out" always keeps
-the folder:
+the folder AND ends the part INCOMPLETE (exit 1), never "OK":
 - the name is a session UUID and the entry is a real directory (never a symlink);
 - the newest mtime of the folder and of everything in it is older than the age;
 - it is not the caller's own session (CLAUDE_CODE_SESSION_ID);
 - `gc session list --json` answered and its session_key set does not contain it (a
-  failed or malformed answer keeps EVERY folder, never reads as "nobody is alive");
+  failed or malformed answer keeps EVERY folder, never reads as "nobody is alive"; neither
+  does a non-empty list in which no entry has a session_key — a renamed field);
 - no transcript projects/*/<session-id>.jsonl was written within the age either (a
   session that is open but only talking, not editing, keeps its transcript fresh; this
   also protects a live session `gc session list` lists without a session_key — 3 of 20 on
-  2026-10-18).
+  2026-10-18). A project dir that cannot be searched counts as "could not find out".
 history.jsonl is only cut when it is a regular file, the cut point is a line break
-that really exists in the last KEEP bytes, and the file did not shrink under us.
-The cut copies the lines appended while it ran; what it cannot close is the few
-microseconds between the last size check and the ftruncate, where a line appended in
-that gap is lost. history.jsonl is Claude Code's prompt-recall list (up-arrow). The only
+that really exists in the last KEEP bytes, the path still names the file we hold, and the
+file did not shrink under us.
+The cut copies the lines appended while it ran, for at most COPYBACK_MAX_ROUNDS rounds.
+Two losses are left: the few microseconds between the last size check and the ftruncate,
+where a line appended in that gap is lost without a trace; and a writer that outruns all
+the rounds, which is counted and reported ("DROPPED n byte(s)", state "lossy", exit 1).
+history.jsonl is Claude Code's prompt-recall list (up-arrow). The only
 other reader found is the daily 04:00 com.athos.claude-history-backup, which `cp`s it to S3:
 after a cut that copy holds only the kept part, while the session transcripts (the real
 record, ~/.claude/projects) are synced separately and are not touched here. One lost line
@@ -58,11 +62,12 @@ real caller (dolt-disk-floor-guard.sh, _trim_claude_home) sets it; a test that f
 point at a fixture cannot cut the real files.
 
 ## Exit code
-0 = every part ran (nothing to do counts). 1 = a part failed or had to be skipped because
-something it needs to be sure of could not be read; the lines above say which.
+0 = every part ran (nothing to do counts; a home that does not exist counts). 1 = a part
+failed, lost lines, or had to be skipped or keep something because a thing it needs to be
+sure of could not be read (including the home itself, or a home that is not a directory);
+the lines above say which.
 """
 import errno
-import glob
 import json
 import os
 import re
@@ -78,6 +83,7 @@ SESSION_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 GC_LIST_TIMEOUT_SECS = 60
+COPYBACK_MAX_ROUNDS = 8
 
 # part states. OK_STATES are the ones that do not make the run INCOMPLETE.
 OK_STATES = {"absent", "under", "rotated", "none-old", "pruned", "dry-run"}
@@ -203,18 +209,27 @@ def rotate_history(path, max_bytes, keep_bytes, dry_run):
         # (SIGKILL cannot be blocked; the window is the time of one 40 MB write, a fraction of a second).
         blocked = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
         old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+        dropped = 0  # bytes seen at the end of the file that the copy-back did not carry over
         try:
             _pwrite_all(fd, kept, 0)
             total = len(kept)
             seen = size0  # bytes [0, seen) of the original file are accounted for
-            for _ in range(8):
+            rounds = 0
+            while True:
                 cur = os.fstat(fd).st_size
                 if cur <= seen:
+                    break
+                if rounds >= COPYBACK_MAX_ROUNDS:
+                    # The file is still growing after the last round. The head is already
+                    # overwritten, so the tail must go (a stale stretch in the middle is worse);
+                    # what is dropped is counted here and reported below, never silent.
+                    dropped = cur - seen
                     break
                 extra = _pread_all(fd, cur - seen, seen)
                 _pwrite_all(fd, extra, total)
                 total += len(extra)
                 seen = cur
+                rounds += 1
             os.ftruncate(fd, total)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
@@ -222,6 +237,13 @@ def rotate_history(path, max_bytes, keep_bytes, dry_run):
             "history: CUT %s from %d MB to %d MB, freed≈%d MB (same inode, cut at a line break)"
             % (path, mb(seen), mb(total), mb(seen - total))
         )
+        if dropped:
+            log(
+                "history: DROPPED %d byte(s) appended while the copy-back was still catching up "
+                "(the file kept growing for %d rounds); those lines are gone from %s"
+                % (dropped, COPYBACK_MAX_ROUNDS, path)
+            )
+            return "lossy", seen - total
         return "rotated", seen - total
     except OSError as exc:
         log(
@@ -263,11 +285,26 @@ def fetch_live_keys(gc_bin):
         log("file-history: ABORT — `.sessions` is not an array")
         return None
     keys = set()
+    keyless = 0
     for entry in sessions:
-        if isinstance(entry, dict):
-            key = entry.get("session_key")
-            if isinstance(key, str) and key:
-                keys.add(key)
+        key = entry.get("session_key") if isinstance(entry, dict) else None
+        if isinstance(key, str) and key:
+            keys.add(key)
+        else:
+            keyless += 1
+    if sessions and not keys:
+        # Every entry without a key is what a renamed field would look like, and it would read as
+        # a valid "nobody is alive" — so a non-empty list that yields no key is not believed.
+        log(
+            "file-history: ABORT — `gc session list --json` lists %d session(s) and none has a "
+            "session_key (did the field change?); liveness not established" % len(sessions)
+        )
+        return None
+    if keyless:
+        log(
+            "file-history: %d of %d listed session(s) have no session_key; their folders are "
+            "protected by the transcript check only" % (keyless, len(sessions))
+        )
     return keys
 
 
@@ -290,6 +327,7 @@ def _raise(exc):
 
 def tree_bytes(path):
     """Allocated bytes under path (best effort; only used for the freed figure)."""
+    # vazio → 0 bytes; falhou/ilegível → that entry counts 0: this is a measurement for the log, never an input to a keep/delete decision
     total = 0
     for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
         for name in filenames:
@@ -298,6 +336,31 @@ def tree_bytes(path):
             except OSError:
                 pass
     return total
+
+
+def transcript_recent(projects, project_dirs, name, now, min_age_secs):
+    """Three-state look at projects/*/<name>.jsonl → (recent, unknown).
+    recent  — a transcript of the session was written within the age.
+    unknown — somewhere a transcript could be, it could not be read (a project dir that cannot
+              be searched, a transcript that cannot be stat'ed). The caller keeps the folder and
+              reports the part as INCOMPLETE; glob.glob would have swallowed that error and
+              answered "no transcript", which is the answer that deletes the folder.
+    (False, 0) means every project dir answered and none holds a fresh transcript."""
+    recent = False
+    unknown = 0
+    for project in project_dirs:
+        candidate = os.path.join(projects, project, name + ".jsonl")
+        # vazio → no such transcript in this project dir (ENOENT, or the entry is not a directory): nothing to protect here; falhou/ilegível → any other error is unknown, the folder is kept and the part is INCOMPLETE
+        try:
+            mtime = os.lstat(candidate).st_mtime
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            unknown += 1
+            continue
+        if now - mtime < min_age_secs:  # also true for a future mtime: never stale
+            recent = True
+    return recent, unknown
 
 
 def prune_file_history(home, min_age_secs, now, dry_run, gc_bin, self_sid):
@@ -319,12 +382,15 @@ def prune_file_history(home, min_age_secs, now, dry_run, gc_bin, self_sid):
 
     old = []  # (name, path, age_secs) — old enough, not yet checked for liveness
     spared = {"young": 0, "unreadable": 0, "not-a-session-dir": 0}
+    unsure = 0  # folders kept because something about them could not be read: the part ends INCOMPLETE
     for name in names:
         path = os.path.join(root, name)
         try:
             st = os.lstat(path)
-        except OSError:
+        except OSError as exc:
             spared["unreadable"] += 1
+            unsure += 1
+            log("file-history: %s KEPT — cannot read it (%s), so its age is unknown" % (name, exc))
             continue
         if not stat.S_ISDIR(st.st_mode) or not SESSION_ID_RE.match(name):
             spared["not-a-session-dir"] += 1
@@ -332,6 +398,8 @@ def prune_file_history(home, min_age_secs, now, dry_run, gc_bin, self_sid):
         newest = newest_mtime(path)
         if newest is None:
             spared["unreadable"] += 1
+            unsure += 1
+            log("file-history: %s KEPT — part of it cannot be read, so its age is unknown" % name)
             continue
         age = now - newest
         if age < min_age_secs:  # also true for a future mtime (negative age): never stale
@@ -345,13 +413,16 @@ def prune_file_history(home, min_age_secs, now, dry_run, gc_bin, self_sid):
             "unreadable=%d, not-a-session-dir=%d)"
             % (len(names), min_age_secs // 86400, spared["young"], spared["unreadable"], spared["not-a-session-dir"])
         )
-        return "none-old", 0
+        return ("failed" if unsure else "none-old"), 0
 
     projects = os.path.join(home, "projects")
-    if not os.path.isdir(projects):
+    # vazio → projects/ exists and has no entries: no transcript can be fresh, an empty list is a real answer; falhou/ilegível → absent or cannot be listed: ABORT, nothing deleted
+    try:
+        project_dirs = sorted(os.listdir(projects))
+    except OSError as exc:
         log(
-            "file-history: ABORT — %s is not a directory, so recent transcripts cannot be "
-            "checked; %d old folder(s) kept" % (projects, len(old))
+            "file-history: ABORT — cannot list %s (%s), so recent transcripts cannot be "
+            "checked; %d old folder(s) kept" % (projects, exc, len(old))
         )
         return "failed", 0
     live = fetch_live_keys(gc_bin)
@@ -369,13 +440,14 @@ def prune_file_history(home, min_age_secs, now, dry_run, gc_bin, self_sid):
         if name in live:
             log("file-history: %s SPARED (listed by gc session list)" % name)
             continue
-        recent = False
-        for transcript in glob.glob(os.path.join(glob.escape(projects), "*", name + ".jsonl")):
-            try:
-                if now - os.lstat(transcript).st_mtime < min_age_secs:
-                    recent = True
-            except OSError:
-                recent = True  # cannot read it: assume it is fresh
+        recent, unknown = transcript_recent(projects, project_dirs, name, now, min_age_secs)
+        if unknown:
+            unsure += 1
+            log(
+                "file-history: %s KEPT — %d place(s) that could hold its transcript could not be "
+                "read, so it cannot be shown idle" % (name, unknown)
+            )
+            continue
         if recent:
             log("file-history: %s SPARED (its transcript was written within the last %d days)" % (name, min_age_secs // 86400))
             continue
@@ -394,10 +466,11 @@ def prune_file_history(home, min_age_secs, now, dry_run, gc_bin, self_sid):
             deleted += 1
             freed += size
             log("file-history: DELETED %s (%d MB, idle %d days)" % (name, mb(size), int(age) // 86400))
-    if dry_run:
-        return "dry-run", 0
-    log("file-history: deleted=%d failed=%d freed≈%d MB" % (deleted, failed, mb(freed)))
-    return ("failed" if failed else "pruned"), freed
+    if not dry_run:
+        log("file-history: deleted=%d failed=%d kept-unsure=%d freed≈%d MB" % (deleted, failed, unsure, mb(freed)))
+    if failed or unsure:
+        return "failed", freed
+    return ("dry-run", 0) if dry_run else ("pruned", freed)
 
 
 # ─── 3. report-only ──────────────────────────────────────────────────────────
@@ -425,9 +498,18 @@ def main():
     if os.path.realpath(home) == os.path.realpath(REAL_DEFAULT_HOME) and os.environ.get("CLAUDE_HOME_TRIM_PROD") != "1":
         log("SENTINEL: the home is the real %s and CLAUDE_HOME_TRIM_PROD=1 is not set — forcing a dry-run" % REAL_DEFAULT_HOME)
         dry_run = True
-    if not os.path.isdir(home):
-        log("home %s is not a directory — nothing to do" % home)
+    # vazio → the home does not exist: nothing to trim, exit 0; falhou/ilegível → it cannot be stat'ed or is not a directory: nothing was trimmed, exit 1 so the guard logs INCOMPLETE
+    try:
+        home_st = os.stat(home)
+    except FileNotFoundError:
+        log("home %s does not exist — nothing to do" % home)
         return 0
+    except OSError as exc:
+        log("home %s cannot be read (%s) — nothing was trimmed" % (home, exc))
+        return 1
+    if not stat.S_ISDIR(home_st.st_mode):
+        log("home %s is not a directory — nothing was trimmed" % home)
+        return 1
 
     max_bytes = cfg_int("CLAUDE_HOME_TRIM_HISTORY_MAX_BYTES", 100 * 1048576)
     keep_bytes = cfg_int("CLAUDE_HOME_TRIM_HISTORY_KEEP_BYTES", 40 * 1048576)

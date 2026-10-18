@@ -3258,7 +3258,7 @@ _trim_claude_home() {
     bound=180
   fi
   local now last=""; now=$(date +%s)
-  # vazio → no state file: the lever never ran, run now; falhou/ilegível → an unreadable or garbled state counts as never ran (the script is fail-safe on its own and the cooldown is only a rate limit)
+  # vazio → no state file: the lever never ran, run now; falhou/ilegível → an unreadable file or non-numeric content counts as never ran (the script is fail-safe on its own and the cooldown is only a rate limit); a digits-only epoch in the FUTURE (clock stepped back) reads as "ran recently" through the shared _cooldown_elapsed and waits for the clock to catch up — that delays this lever, it never makes it destructive
   [ -f "$STATE_CLAUDE_HOME_TRIM_FILE" ] && last="$(cat "$STATE_CLAUDE_HOME_TRIM_FILE" 2>/dev/null)"
   if ! _cooldown_elapsed "$last" "$now" "$cooldown"; then
     log "claude-home-trim SKIP — ran within the last ${cooldown}s (cooldown)"
