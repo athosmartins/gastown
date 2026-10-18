@@ -120,6 +120,9 @@ MUTANTS = [
     ("puxador-stop-cego", "u", "            return 1\n        os.kill(pid, signal.SIGTERM)", "            return 0\n        os.kill(pid, signal.SIGTERM)", r"lock preso e pid ilegível"),
     ("puxador-lock-ilegivel-vira-nao", "u", "    except FileNotFoundError:\n        return False  # a pasta de estado nem existe", "    except OSError:\n        return False  # a pasta de estado nem existe", r"o lock não abre"),
     ("puxador-registro-ilegivel-vazio", "u", '            return True  # não consegui ler: não sei, e "não sei" mantém o puxador de pé', "            return False", r"registro de sessões que não lê"),
+    ("puxador-flock-erro-vira-ocupado", "u", "    except BlockingIOError:\n        return True  # outro processo segura o flock", "    except OSError:\n        return True  # outro processo segura o flock", r"flock que FALHA"),
+    ("puxador-serve-flock-erro-vira-ja-roda", "u", "        except BlockingIOError:\n            print(", "        except OSError:\n            print(", r"flock que FALHA"),
+    ("puxador-put-ok-zero-e-entrega", "u", 'pout.split() == [b"ok", b"1"]', 'pout.startswith(b"ok")', r"flock que FALHA"),
     ("agente-open-pedido-crash", "u", "            except (OSError, ValueError) as e:\n                write_resp(rid, 78,", "            except ValueError as e:\n                write_resp(rid, 78,", r"leitura do spool que FALHA"),
     ("known-hosts-opcional", "s", 'need(os.path.isfile(c["identity_file"]) and os.path.isfile(c["known_hosts_file"]))', "need(True)", r"config do shim ruim|known_hosts_file ausente"),
 ]

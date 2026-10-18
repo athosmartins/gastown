@@ -2,16 +2,14 @@
 # remote-shim-spool.selftest.sh — hermético: o transporte POR PUXADA do atalho (remote-shim.py com "transport":"spool" + remote-shim-pump.py + o wrapper
 # de verdade, ga-w7qwl1.1). O "MBP" é uma pasta em mktemp, o "ssh" é um falso que roda o comando remoto aqui (num zsh, o shell de login do MBP) e bd/gc/gate-done
 # são os falsos do lib. Nada conecta em máquina nenhuma.
-#
 # Contents
 #   Casos · Variáveis
-#
 # CASOS: config do spool (extra, relativo, prazo fora de 5-3600 → 78; pasta com modo largo → 78) · sem pump.alive / velho → 75 na hora, nada gravado ·
 #   cadeia inteira (cliente → spool → puxador → ssh falso → agente → wrapper → bd falso): saída, rc, stderr e stdin passam; recusa do wrapper (77), identidade
 #   fora do padrão, texto com $()/crase/aspas inteiro e nada executado · 6 em paralelo · pedido torto → 78 · prazo: não pego → RETIRADO e 75 (nada rodou); pego e
 #   sem resposta → 125 · stdin > 1 MB → 2 sem gravar · entrada lida até o EOF (produtor lento) ou nada (pipe mudo: 75 sem gravar; só `bd --stdin` e os hooks do gc
 #   leem); entrada fechada (<&-) é vazia; saída fechada (>&-) mantém o rc · log do puxador sem argv · puxador: um só, status, stop, sai sozinho sem sessão, não toca
-#   o MBP sem sessão · leituras que FALHAM (resposta corrompida → 125; stdin que não lê → 2; config, registro, pid, log, lock, listdir/open): estado inerte e a falha aparece
+#   o MBP sem sessão · leituras que FALHAM (resposta corrompida → 125; stdin que não lê → 2; config, registro, pid, log, lock e o flock que falha, put que não entrega, listdir/open): estado inerte e a falha aparece
 # VARIÁVEIS: SPOOL_ONLY=<grupos separados por vírgula: conf,perm,alive,chain,par,forge,tmo,pump> · FAILFAST=1 (do lib)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -232,8 +230,7 @@ n1=$(wc -l < "$SIDE" | tr -d ' '); sleep 3; n2=$(wc -l < "$SIDE" | tr -d ' ')
 touch "$STATE/mbp/running/remote-test-remote-mbp-1"; pump ensure --host mbp; sleep 1.5
 pump status --host mbp | head -1 | grep -q "rodando=sim"; ok $? "ensure com sessão registrada sobe o puxador"
 b=$(calls); alive; shim bd show ga-1; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "e ele atende"
-pump stop --host mbp | grep -q "encerrado"; ok $? "stop encerra"
-pump status --host mbp | head -1 | grep -q "rodando=nao"; ok $? "status depois do stop: não roda"
+pump stop --host mbp | grep -q "encerrado" && pump status --host mbp | head -1 | grep -q "rodando=nao"; ok $? "stop encerra, e o status depois do stop diz que não roda"
 pump stop --host mbp >/dev/null 2>&1; rm -f "$STATE/mbp/shim-pump."*
 chmod 755 "$SPOOL"; touch "$STATE/mbp/running/remote-test-remote-mbp-1"; pump ensure --host mbp; sleep 2.5; pump stop --host mbp >/dev/null 2>&1; chmod 700 "$SPOOL"
 grep -q "get falhou rc=78" "$STATE/mbp/shim-pump.log"; ok $? "agente: spool com modo largo no MBP → 78, o puxador não puxa nada"
@@ -274,6 +271,25 @@ up; p0=$(pstat | sed -n 's/.* pid=\([0-9]*\).*/\1/p'); printf 'garbage' > "$STAT
 pump stop --host mbp > "$T/pe.out" 2>&1; rc=$?; st=$(pstat); printf '%s' "$p0" > "$STATE/mbp/shim-pump.pid"   # o pid volta ANTES de qualquer conclusão: o trap do EXIT tem que conseguir encerrar o puxador mesmo se o stop acima falhar
 [ "$rc" = 1 ] && grep -q "não consegui ler o pid" "$T/pe.out" && printf '%s' "$st" | grep -q "rodando=sim"; ok $? "puxador: lock preso e pid ilegível (garbage) → stop recusa encerrar às cegas (rc 1, avisa) e o puxador segue de pé"
 pump stop --host mbp | grep -q "encerrado"; ok $? "puxador: com o pid de volta, o mesmo stop encerra"
+python3 -I - "$PUMP" <<'PYEOF'; ok $? "puxador: o flock que FALHA (ENOLCK) não é 'ocupado' (held() diz que não sabe, serve() sai ≠ 0 sem pid) e o put que devolve ok 0 não é entrega (NÃO CONFIRMADA no log)"
+import errno, importlib.util, os, sys
+s = importlib.util.spec_from_file_location("pump", sys.argv[1]); m = importlib.util.module_from_spec(s); sys.modules["pump"] = m; s.loader.exec_module(m)
+cfg = m.Cfg("mbp"); os.makedirs(cfg.state, exist_ok=True)
+def busy(*a): raise BlockingIOError(errno.EWOULDBLOCK, "busy")
+def boom(*a): raise OSError(errno.ENOLCK, "No locks available")
+m.fcntl.flock = boom
+try: m.held(cfg); raise AssertionError("held() afirmou algo sem saber")
+except SystemExit as e: assert "não sei" in str(e), e
+assert m.Pump(cfg).serve() == 1 and not os.path.exists(cfg.state + "/shim-pump.pid")
+m.fcntl.flock = busy
+assert m.held(cfg) is True and m.Pump(cfg).serve() == 0
+def put_log(replies):
+    it, log = iter(replies), cfg.state + "/shim-pump.log"
+    open(log, "w").close(); p = m.Pump(cfg); p.inflight = 1
+    p.run_wrapper = lambda c, i: (0, b"", b""); p.ssh_run = lambda *a, **k: next(it)
+    p.job("1700000000400-1-dddddddd", "x", b""); return open(log).read()
+assert "put=NÃO CONFIRMADA" in put_log([(0, b"ok 0\n", b"")]) and "put=NÃO CONFIRMADA" in put_log([(255, b"", b"x"), (0, b"ok 0\n", b"")])
+PYEOF
 python3 -I - "$PUMP" "$T/agent-spool" <<'PYEOF'; ok $? "agente: leitura do spool que FALHA (PermissionError em listdir e em open) → sai ≠ 0 sem pegar nada / responde 78 sem entregar o pedido"
 import importlib.util, json, os, subprocess, sys
 s = importlib.util.spec_from_file_location("pump", sys.argv[1]); m = importlib.util.module_from_spec(s); sys.modules["pump"] = m; s.loader.exec_module(m)

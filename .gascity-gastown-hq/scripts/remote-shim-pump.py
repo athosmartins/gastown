@@ -2,17 +2,11 @@
 """remote-shim-pump.py — o mini PUXA os pedidos de bd/gc das sessões do MBP (ga-w7qwl1.1). Sem segredo novo no MBP.
 
 ## Contents
-- Por quê
 - Como funciona
 - Uso
 - Limites e o que o puxador nunca faz
 
-POR QUÊ
-  O MBP não pode ganhar credencial de bd/Dolt nem chave nova ("nenhum segredo novo"). O modelo do Hetzner (chave ssh restrita do servidor
-  para o mini) pede uma chave nova no lado de quem chama. Aqui é o contrário: o MBP não tem como chamar o mini; o MINI, que já tem
-  ssh para o MBP (a mesma conexão do provedor), vai buscar os pedidos. O que cruza o ssh é só o protocolo rs1 do remote-shim.
-
-COMO FUNCIONA
+COMO FUNCIONA  (por que o mini puxa em vez do MBP chamar: docs/runbooks/remote-shim.md — o MBP não ganha chave nem credencial nova)
   sessão no MBP -> `bd`/`gc` = remote-shim.py (transport "spool") grava req/<id>.json em <spool_dir> (0700) e espera resp/<id>.json
   mini: este puxador -> ssh -> "agente" (um trecho de Python que este arquivo carrega; NADA fica gravado no MBP) ->
         get:  move req/ -> claimed/ (rename: um pedido é pego uma vez só) e devolve uma linha JSON por pedido
@@ -30,8 +24,7 @@ USO  (host e caminhos vêm de `hosts.<host>.shim` em session-ssh.json: spool_dir
 LIMITES E O QUE O PUXADOR NUNCA FAZ
   - só roda enquanto <estado>/<host>/running/ tem sessão nossa; sem sessão, sai depois de idle_exit_s (padrão 90 s) e o MBP não é mais tocado
   - não grava nada no MBP fora do spool; não guarda nem repassa argv no log (só ts, host, id, rc, tamanhos, duração)
-  - pedido: cmd até 200000 caracteres, entrada padrão até 1 MiB; resposta: stdout e stderr até 8 MiB cada (corta com marca)
-  - não repete pedido que o wrapper já iniciou; o cliente é quem decide (rc 125 = pode ter rodado)
+  - pedido: cmd até 200000 caracteres, entrada padrão até 1 MiB; resposta: stdout e stderr até 8 MiB cada (corta com marca); não repete pedido que o wrapper já iniciou (rc 125 = pode ter rodado: o cliente decide)
   - ssh falhando: espera 2^n s (até 60 s) e tenta de novo; o MBP dormindo/fora não derruba nada, só deixa os pedidos sem resposta (rc 75/125)
 """
 from __future__ import annotations
@@ -61,7 +54,7 @@ WRAPPER_LIMIT_S = 420  # acima do timeout_s padrão (300) do wrapper: se estoura
 
 # O agente que roda NO MBP. Vai por `python3 -I -c` (base64 na linha de comando); nada fica gravado lá. Só mexe dentro do spool.
 AGENT = r'''
-import json, os, re, sys, time
+import base64, json, os, re, sys, time
 sp, mode = sys.argv[1], sys.argv[2]
 ID = re.compile(r"[0-9]{13}-[0-9]{1,10}-[0-9a-f]{8}")
 MAXREQ, KEEP_S, ALIVE_EVERY_S = 1500000, 900, 10
@@ -92,9 +85,7 @@ def write_resp(rid, rc, out, err):
         f.write(json.dumps({"id": rid, "rc": rc, "stdout_b64": out, "stderr_b64": err}, separators=(",", ":")))
     os.rename(tmp, sp + "/resp/" + rid + ".json")
 
-def b64(s):
-    import base64
-    return base64.b64encode(s.encode()).decode()
+b64 = lambda s: base64.b64encode(s.encode()).decode()  # noqa: E731
 
 if mode == "get":
     mx = max(1, min(16, int(sys.argv[3])))
@@ -272,8 +263,11 @@ class Pump:
             put = "?"
             for i in range(3):  # a resposta é do pedido que JÁ rodou: perdê-la por um solavanco do ssh faria o cliente esperar até o prazo
                 prc, pout, perr = self.ssh_run("put", stdin=line, timeout=60)
-                if prc == 0 and pout.startswith(b"ok"):
+                if prc == 0 and pout.split() == [b"ok", b"1"]:
                     put = "ok"
+                    break
+                if prc == 0 and pout.split() == [b"ok", b"0"]:  # o agente rodou mas não entregou: o pedido não estava em claimed/ (repetir não o traz de volta)
+                    put = "NÃO CONFIRMADA (ok 0: o pedido não estava em claimed/; se uma tentativa anterior caiu, ela pode ter entregue)"
                     break
                 put = f"falhou rc={prc}"
                 time.sleep(2 ** i)
@@ -291,9 +285,12 @@ class Pump:
         lock = open(os.path.join(cfg.state, "shim-pump.lock"), "a")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except BlockingIOError:
             print("remote-shim-pump: já há um puxador rodando")
             return 0
+        except OSError as e:  # o flock FALHOU (ENOLCK…): isso não é "já há um"; sem o lock não subo, e o motivo fica no stderr do puxador
+            print(f"remote-shim-pump: não consegui travar o lock ({e.strerror}); não subo às cegas", file=sys.stderr)
+            return 1
         pidf = os.path.join(cfg.state, "shim-pump.pid")
         with open(pidf, "w") as f:
             f.write(str(os.getpid()))
@@ -382,8 +379,10 @@ def held(cfg: Cfg) -> bool:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(f, fcntl.LOCK_UN)
         return False
-    except OSError:
-        return True
+    except BlockingIOError:
+        return True  # outro processo segura o flock: é o puxador vivo
+    except OSError as e:  # ENOLCK, EBADF…: o flock falhou, o lock não está "ocupado"
+        raise SystemExit(f"remote-shim-pump: não consegui testar o lock ({e.strerror}); não sei se há puxador rodando e não vou adivinhar")
     finally:
         f.close()
 
