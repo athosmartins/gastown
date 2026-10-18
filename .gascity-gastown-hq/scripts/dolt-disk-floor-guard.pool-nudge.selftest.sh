@@ -20,7 +20,7 @@ trap '[ -n "${W:-}" ] && [ -d "$W" ] && rm -rf -- "$W"' EXIT
 PASS=0; FAIL=0
 # every `p` the suite prints on the real guard; the completeness guard below is an equality, so a check that silently
 # stops running (or a new one nobody counted) fails the suite instead of passing unnoticed.
-EXPECTED_CHECKS=24
+EXPECTED_CHECKS=25
 
 cat > "$W/gc" <<'SH'
 #!/bin/sh
@@ -101,6 +101,9 @@ suite() {
 
     reset; mkdir -p "$STATE_POOL_NUDGE_DIR"; printf 'not-a-number' > "$(_pool_nudge_stamp_file gastown.dog-1)"; run 2 "$NOW"
     case "$(nudged)" in *gastown.dog-1*) p "a garbage stamp never mutes a target (fail open on the cooldown)" ;; *) f "garbage stamp muted the notice" ;; esac
+    # an UNREADABLE stamp (cat fails, not just garbage): the same inert-for-the-notice answer - told anyway - and the write that follows says it failed
+    reset; mkdir -p "$STATE_POOL_NUDGE_DIR"; sf="$(_pool_nudge_stamp_file gastown.dog-1)"; printf '1' > "$sf"; chmod 000 "$sf"; run 2 "$NOW"; chmod 600 "$sf" 2>/dev/null
+    case "$(nudged)" in *gastown.dog-1*) log_has "could not write the cooldown stamp" && p "an unreadable stamp (permissions) never mutes a target either, and the stamp that cannot be rewritten is logged" || f "unreadable stamp: told, but the failed stamp write was silent" ;; *) f "unreadable stamp muted the notice" ;; esac
 
     reset; touch "$FW/list-fail"; run 2 "$NOW"
     if [ -z "$(nudged)" ] && [ "$(stamps)" = "0" ] && log_has "could not read the session list"; then p "gc session list failing: nobody nudged, NO stamp (retry next cycle), and the log says it could not read - not 'no sessions'"; else f "list failure mishandled (nudged='$(nudged)' stamps=$(stamps) log=$(tr '\n' '|' < "$FW/log"))"; fi
@@ -211,6 +214,7 @@ mutant "gc inherits the loop stdin and can eat the target list" '/session nudge 
 mutant "the join does not wait for the phase" 's/^  while kill -0 "\$pid" 2>\/dev\/null; do/  while false; do/'
 mutant "the join accepts any pid (0 signals the whole process group)" "s/  case \"\\\$pid\" in ''|\\*\\[!0-9\\]\\*|0|1) return 0 ;; esac/  :/"
 mutant "the kill switch is silent" 's/    log "pool-nudge SKIP/    : "pool-nudge SKIP/'
+mutant "an unreadable cooldown stamp mutes the target" 's/last="\$(cat "\$stamp" 2>\/dev\/null)" || last=""/last="$(cat "$stamp" 2>\/dev\/null)" || last="$now"/'
 wait
 for r in $MUT_RES; do
   line="$(cat "$r" 2>/dev/null)"; [ -n "$line" ] || line="FAIL:  mutant result missing ($r)"
