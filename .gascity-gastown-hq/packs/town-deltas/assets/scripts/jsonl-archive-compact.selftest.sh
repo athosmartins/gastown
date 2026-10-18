@@ -148,6 +148,7 @@ run_jac() {
   JAC_MIN_BATCH_S="${T_MIN_BATCH:-}" JAC_GC_TIMEOUT_S="${T_GC_TIMEOUT:-}" JAC_MIN_GC_BUDGET_S="${T_MIN_GC:-}" \
   JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" JAC_MAIL_TIMEOUT_S="${T_MAIL_TIMEOUT:-}" \
   JAC_TAIL_LIMIT_KIB="${T_TAIL:-0}" JAC_TAIL_MAX_OBJECTS="${T_TAIL_OBJS:-}" JAC_TAIL_TIMEOUT_S="${T_TAIL_TIMEOUT:-}" \
+  JAC_TAIL_MIN_OBJECTS="${T_TAIL_MIN:-}" JAC_TAIL_RETRY_S="${T_TAIL_RETRY:-}" DOLT_DISK_FLOOR_CRITICAL_GB="${T_CRIT:-}" \
   JAC_LSOF="${T_LSOF:-}" JAC_RECLAIM_WAIT_S="${T_RECLAIM_WAIT:-}" JAC_PS="${T_PS:-}" JAC_PS_TIMEOUT_S="${T_PS_TIMEOUT:-}" \
   JAW_HOUR="${T_HOUR:-2}" JAW_LOG="${T_WLOG:-$WORK/window.log}" JAW_SWAP_KIB="${T_SWAP:-}" \
   JAW_SECS_OF_DAY="${T_SECS:-}" JAC_NIGHT_GC_MAX_S="${T_NIGHT_MAX:-0}" JAC_NIGHT_MARGIN_S="${T_MARGIN:-}" JAC_GC_PACK_FACTOR="${T_FACTOR:-}" \
@@ -1583,9 +1584,9 @@ out="$(T_TAIL=300 T_TAIL_OBJS=20 T_FREE=10 run_tail "$TE")"; rc=$?
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ "$(pack_count "$TE")" = "$PCE" ] && [ "$(state_field "$TE" bad_streak)" = 1 ]; } \
   && ok "free space below the small packs' size → status skipped-low-disk, exit 1, streak 1, nothing written" || bad "low-disk tail handled wrong (rc=$rc status=$(last_status) packs $PCE -> $(pack_count "$TE")): $out"
 rm -f "$WORK/state.json" "$WORK/log"; NEED_SMALL=$(( $(pack_kib "$TE") - $(wc -c < "$(base_pack "$TE")") / 1024 ))
-out="$(T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED_SMALL + 100 )) T_PACKS=3 run_tail "$TE")"; rc=$?
+out="$(T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED_SMALL + 100 + 4 * 1048576 )) T_PACKS=3 run_tail "$TE")"; rc=$?
 { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TE")" = 2 ]; } \
-  && ok "free space only just above the small packs (${NEED_SMALL}KiB + 100) and far below the whole repo (gc would need $(pack_kib "$TE")KiB+) → the tail pass runs" || bad "tail pass did not run with enough room for the small packs (rc=$rc status=$(last_status) packs=$(pack_count "$TE")): $out"
+  && ok "free space only just above the small packs plus Dolt's floor (${NEED_SMALL}KiB + 100 + 4GiB) and far below the whole repo (gc would need $(pack_kib "$TE")KiB+) → the tail pass runs" || bad "tail pass did not run with enough room for the small packs (rc=$rc status=$(last_status) packs=$(pack_count "$TE")): $out"
 
 # F1. how the pass CLASSIFIES its repack: one that fails → failed, exit 1; one cut by its OWN cap → timeout; one cut by the RUN deadline → deferred (the budget ended, nothing was shown).
 # git-fx stands in for the repack and acts BEFORE git runs (it sleeps, or exits 1) — so F1 proves the classification only (status, exit code, log line). It cannot prove anything about what a
@@ -1785,6 +1786,149 @@ else
     || bad "an unreadable pack directory was handled wrong (rc=$rc packs_same=$([ "$(packs_sum "$TL")" = "$PSL" ] && echo yes || echo NO)): $out"
 fi
 chmod 755 "$TL/.git/objects/pack" 2>/dev/null
+
+# M. ga-q8z86s — the tail pass must not run into its OWN cap every run, and must not start with the disk under Dolt's CRITICAL floor.
+# The incident (18/10): at the default 120-object cap the pass was killed at its 600s cap EVERY run (nothing it wrote survives a kill, so the next run met the same packs and the same cap), each time leaving
+# ~800MB of temp pack behind, on a disk already under the floor where Dolt turns CRITICAL — the 17/10 ENOSPC (ga-vln2py) was exactly that. Two fail-closed ends:
+#   (1) the cap adapts: a cut by the pass's own cap (not the run's deadline) lowers the NEXT pass to half of what the cut one carried, floored at JAC_TAIL_MIN_OBJECTS; a pass that was fast while the cap held a pack out doubles it back;
+#       a cap so low that no two packs fit is retried larger after JAC_TAIL_RETRY_S (the byte trigger scales with the cap, so a halved cap can still start);
+#   (2) the pass does not start unless free − need stays above Dolt's CRITICAL class (dolt-disk-floor-guard.sh: critical = floor(free GiB) <= 3, so 4 GiB must remain), or when it cannot read the free space or the floor.
+# Every scenario below uses the fixture of A: a 27-object base and 4 batch-like packs of 3 objects (12 objects, ~500KiB). T_TAIL_MIN=2 lets the cap go below the production floor of 15, which these fixtures would never reach.
+tail_need_kib() {   # what the pass will count as the size of the small packs (every pack but the base, each rounded UP to KiB — the same sum tail_plan makes), loose objects being 0 in these fixtures
+  local d="$1" b p; b="$(base_pack "$d")"
+  for p in "$d"/.git/objects/pack/*.pack; do [ "$p" = "$b" ] || wc -c < "$p"; done | awk '{s += int(($1 + 1023) / 1024)} END {print s + 0}'
+}
+tm_epoch() { jq -r --arg r "$1" '.[$r].tail_cut_epoch // "none"' "$WORK/state.json" 2>/dev/null; }
+tm_seed() {   # tm_seed <repo> <tail_objects> [<cut_epoch>] — the state a previous run would have left
+  if [ -n "${3:-}" ]; then printf '{"%s":{"tail_objects":%s,"tail_cut_epoch":%s}}\n' "$1" "$2" "$3" > "$WORK/state.json"
+  else printf '{"%s":{"tail_objects":%s}}\n' "$1" "$2" > "$WORK/state.json"; fi
+}
+# M1. cut by its own cap → the next pass takes half; the state remembers it
+TM="$WORK/tm"; tailrepo "$TM" 4; PSM="$(packs_sum "$TM")"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(SLOW_REPACK=1 SLOW_SLEEP=20 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=12 T_TAIL_MIN=2 T_TAIL_TIMEOUT=2 run_tail "$TM")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "timeout" ] && [ "$(state_field "$TM" tail_objects)" = 6 ] && printf '%s' "$out" | grep -q 'it carried 12 objects; the next pass takes at most 6 (half of that'; } \
+  && ok "M1 a pass of 12 objects cut by its OWN cap (cap 12) → status timeout, and the state remembers a cap of 6 (half)" || bad "M1 own-cap cut did not halve the cap (rc=$rc status=$(last_status) tail_objects=$(state_field "$TM" tail_objects)): $out"
+case "$(tm_epoch "$TM")" in ''|none|*[!0-9]*) bad "M1 the cut time was not recorded (tail_cut_epoch=$(tm_epoch "$TM"))" ;; *) ok "M1 ...and WHEN it was cut (tail_cut_epoch is a number: the retry clock)" ;; esac
+[ "$(packs_sum "$TM")" = "$PSM" ] && ok "M1 ...no pack touched" || bad "M1 the packs changed under a cut pass"
+# M2. the next run uses it: 6 objects = two packs, it starts at the scaled trigger (300 * 6/12 = 150KiB; the two packs hold ~250KiB, which the unscaled 300KiB would NOT reach), and being fast while the cap left a pack out it doubles the cap back
+out="$(T_TAIL=300 T_TAIL_OBJS=12 T_TAIL_MIN=2 run_tail "$TM")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$TM")" = 4 ] && printf '%s' "$out" | grep -q 'tail consolidation: 2 packs (.*, 6 objects, + 0 loose) -> one pack.*object cap 6 (max 12)'; } \
+  && ok "M2 the next run takes at most 6 objects: 2 of the 4 batch packs merged (packs 5 -> $(pack_count "$TM")), the log says 'object cap 6 (max 12)'" || bad "M2 the run after the cut did not use the halved cap (rc=$rc status=$(last_status) packs=$(pack_count "$TM")): $out"
+{ printf '%s' "$out" | grep -q 'tail object cap 6 -> 12 (the pass took' && [ "$(state_field "$TM" tail_objects)" = 12 ]; } \
+  && ok "M2 ...the pass was fast and the cap had left a pack out → it grows back (6 -> 12, remembered in the state)" || bad "M2 no growth after a fast pass (tail_objects=$(state_field "$TM" tail_objects)): $out"
+# M3. a pass that is cut again does not repeat itself: 12 → 6 → 3 objects carried
+TM3="$WORK/tm3"; tailrepo "$TM3" 4; rm -f "$WORK/state.json" "$WORK/log"
+out1="$(SLOW_REPACK=1 SLOW_SLEEP=20 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=12 T_TAIL_MIN=2 T_TAIL_TIMEOUT=2 run_tail "$TM3")"
+out2="$(SLOW_REPACK=1 SLOW_SLEEP=20 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=12 T_TAIL_MIN=2 T_TAIL_TIMEOUT=2 run_tail "$TM3")"
+{ printf '%s' "$out1" | grep -q 'it carried 12 objects' && printf '%s' "$out2" | grep -q 'it carried 6 objects' && [ "$(state_field "$TM3" tail_objects)" = 3 ]; } \
+  && ok "M3 cut twice → the passes carried 12 then 6 objects and the cap stands at 3: a pass that is always cut never repeats identically" || bad "M3 the second cut did not shrink the pass (tail_objects=$(state_field "$TM3" tail_objects)): $out1 // $out2"
+# M4. the floor: the cap does not go below JAC_TAIL_MIN_OBJECTS (15 by default) — and when it is already there the log says the next pass can only repeat
+TM4="$WORK/tm4"; tailrepo "$TM4" 4; rm -f "$WORK/state.json" "$WORK/log"
+out="$(SLOW_REPACK=1 SLOW_SLEEP=20 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=26 T_TAIL_TIMEOUT=2 run_tail "$TM4")"
+{ [ "$(state_field "$TM4" tail_objects)" = 15 ] && printf '%s' "$out" | grep -q 'it carried 12 objects; the next pass takes at most 15 (half of that, never below the floor of 15)'; } \
+  && ok "M4 a cut of a 12-object pass at cap 26 → half would be 6, the floor is 15 → the next cap is 15 (never below the floor)" || bad "M4 the floor did not hold (tail_objects=$(state_field "$TM4" tail_objects)): $out"
+rm -f "$WORK/state.json" "$WORK/log"
+out="$(SLOW_REPACK=1 SLOW_SLEEP=20 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=12 T_TAIL_TIMEOUT=2 run_tail "$TM4")"
+{ [ "$(last_status)" = "timeout" ] && [ "$(state_field "$TM4" tail_objects)" = null ] && printf '%s' "$out" | grep -q 'the cap is already at its floor (12)'; } \
+  && ok "M4 with the floor at the cap (default 15 is above max 12 → floor 12) the cut says so ('already at its floor'), the state keeps no lower cap, status stays timeout" || bad "M4 a cut at the floor judged wrong (status=$(last_status) tail_objects=$(state_field "$TM4" tail_objects)): $out"
+# M5. a SLOW pass does not grow the cap: it took more than a quarter of its budget (2s sleep of a 4s cap, 8 >= 4)
+TM5="$WORK/tm5"; tailrepo "$TM5" 4; tm_seed "$TM5" 6 "$(date +%s)"; rm -f "$WORK/log"
+out="$(SLOW_REPACK=1 SLOW_SLEEP=2 T_GIT="$WORK/git-fx" T_TAIL=300 T_TAIL_OBJS=12 T_TAIL_MIN=2 T_TAIL_TIMEOUT=4 run_tail "$TM5")"
+if [ "$(last_status)" != "consolidated" ]; then skip "S36 M5: the 2s-slow pass did not finish inside its 4s cap on this host (status=$(last_status)) — the no-growth-after-a-slow-pass check did NOT run"
+else
+  { [ "$(state_field "$TM5" tail_objects)" = 6 ] && ! printf '%s' "$out" | grep -q 'tail object cap 6 ->'; } \
+    && ok "M5 a pass that used more than a quarter of its budget leaves the cap where it is (6): growth needs a FAST pass" || bad "M5 the cap grew after a slow pass (tail_objects=$(state_field "$TM5" tail_objects)): $out"
+fi
+# M6. a cap so low that no two packs fit: held back (said in the log), not retried before JAC_TAIL_RETRY_S, and then larger
+TM6="$WORK/tm6"; tailrepo "$TM6" 4; PSM6="$(packs_sum "$TM6")"; tm_seed "$TM6" 2 "$(date +%s)"; rm -f "$WORK/log"
+out="$(T_TAIL=300 T_TAIL_OBJS=26 T_TAIL_MIN=2 run_tail "$TM6")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(packs_sum "$TM6")" = "$PSM6" ] && [ "$(state_field "$TM6" tail_objects)" = 2 ] && printf '%s' "$out" | grep -q 'tail consolidation held back by its object cap: 2 objects' && ! printf '%s' "$out" | grep -q 'tail consolidation: [0-9]'; } \
+  && ok "M6 cap 2 (no 3-object pack fits), cut just now: held back — the log names the cap, nothing is repacked, the cap stays 2 until the retry time" || bad "M6 a held-back pass judged wrong (rc=$rc tail_objects=$(state_field "$TM6" tail_objects)): $out"
+tm_seed "$TM6" 2 "$(( $(date +%s) - 30000 ))"; rm -f "$WORK/log"
+out="$(T_TAIL=300 T_TAIL_OBJS=26 T_TAIL_MIN=2 run_tail "$TM6")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(state_field "$TM6" tail_objects)" = 4 ] && printf '%s' "$out" | grep -q 'tail object cap 2 -> 4 (21600s since the last cut' && [ "$(packs_sum "$TM6")" = "$PSM6" ]; } \
+  && ok "M6 30000s after the cut (retry 21600s) the cap is doubled 2 -> 4 and remembered (one 3-object pack still fits alone: nothing to merge yet, nothing repacked)" || bad "M6 the retry after the retry time did not double the cap (tail_objects=$(state_field "$TM6" tail_objects)): $out"
+[ "$(tm_epoch "$TM6")" -ge "$(( $(date +%s) - 120 ))" ] 2>/dev/null && ok "M6 ...and the retry clock restarted (tail_cut_epoch is now)" || bad "M6 the retry clock was not restarted (tail_cut_epoch=$(tm_epoch "$TM6"))"
+rm -f "$WORK/log"
+out="$(T_TAIL=300 T_TAIL_OBJS=26 T_TAIL_MIN=2 T_TAIL_RETRY=0 run_tail "$TM6")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && printf '%s' "$out" | grep -q 'tail object cap 4 -> 8 (0s since the last cut' && printf '%s' "$out" | grep -q 'tail consolidation: 2 packs'; } \
+  && ok "M6 with the retry time at 0 the next run doubles 4 -> 8 and the pass then runs on 2 packs: a dormant cap climbs back to a working one" || bad "M6 the dormant cap did not climb back (rc=$rc status=$(last_status) tail_objects=$(state_field "$TM6" tail_objects)): $out"
+# M7. no cut time on record (a state written before this field, or edited): the clock starts, the cap is NOT doubled — under doubt the cheap pass stays
+TM7="$WORK/tm7"; tailrepo "$TM7" 4; tm_seed "$TM7" 2; rm -f "$WORK/log"
+out="$(T_TAIL=300 T_TAIL_OBJS=26 T_TAIL_MIN=2 T_TAIL_RETRY=0 run_tail "$TM7")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(state_field "$TM7" tail_objects)" = 2 ] && [ "$(tm_epoch "$TM7")" -ge "$(( $(date +%s) - 120 ))" ] 2>/dev/null && ! printf '%s' "$out" | grep -q 'tail object cap 2 ->'; } \
+  && ok "M7 a small cap with NO cut time on record: not doubled (even with retry 0), the clock starts now (tail_cut_epoch written)" || bad "M7 a missing cut time was read as 'long ago' (tail_objects=$(state_field "$TM7" tail_objects) epoch=$(tm_epoch "$TM7")): $out"
+# ...a remembered cap that is not a number is dropped (load_state says so) and an unreadable state entry never makes the cap LARGER than the floor
+TM8="$WORK/tm8"; tailrepo "$TM8" 4; printf '{"%s":{"tail_objects":"abc","tail_cut_epoch":-5}}\n' "$TM8" > "$WORK/state.json"; rm -f "$WORK/log"
+out="$(T_TAIL=300 T_TAIL_OBJS=26 T_TAIL_MIN=2 run_tail "$TM8")"; rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'field(s) .*tail_objects.*tail_cut_epoch.* are not non-negative whole numbers' && printf '%s' "$out" | grep -q 'object cap 26 (max 26)'; } \
+  && ok "M8 a remembered cap/cut time that is not a number is dropped with a line in the log and read as unset (cap = the configured max)" || bad "M8 a corrupt remembered cap was handled wrong (rc=$rc): $out"
+# M9. DISK (1): free − need must stay above Dolt's CRITICAL class → skipped-low-disk, exit 1, and git is NEVER asked to repack
+TD9="$WORK/td9"; tailrepo "$TD9" 4; PS9="$(packs_sum "$TD9")"; NEED9="$(tail_need_kib "$TD9")"
+repack_calls() { [ -s "$WORK/argv" ] && grep -c . "$WORK/argv" || echo 0; }
+rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 4 * 1048576 - 50 )) run_tail "$TD9")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ "$(repack_calls)" = 0 ] && [ "$(packs_sum "$TD9")" = "$PS9" ] && [ "$(state_field "$TD9" bad_streak)" = 1 ] && printf '%s' "$out" | grep -q 'status=skipped-low-disk (tail) .*Dolt.s CRITICAL class'; } \
+  && ok "M9 free − need = 4GiB − 50KiB (the free GiB would round DOWN to 3 = Dolt's CRITICAL class) → skipped-low-disk, exit 1, streak 1, NO git repack was called, packs unchanged" || bad "M9 a pass that would leave the disk CRITICAL was not stopped (rc=$rc status=$(last_status) repack calls=$(repack_calls)): $out"
+# the control: a hair more room (free − need >= 4GiB) → the same fixture runs, and git IS asked to repack once
+rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 4 * 1048576 + 100 )) run_tail "$TD9")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(repack_calls)" = 1 ] && [ "$(pack_count "$TD9")" = 2 ]; } \
+  && ok "M9 control: free − need = 4GiB + 50KiB → the pass runs (one repack call, packs 5 -> $(pack_count "$TD9")): the stop above is the floor, not the fixture" || bad "M9 control: a roomy disk did not run the pass (rc=$rc status=$(last_status) repack calls=$(repack_calls) packs=$(pack_count "$TD9")): $out"
+# the floor is the guard's setting, not a constant: DOLT_DISK_FLOOR_CRITICAL_GB=0 → only 1GiB must remain
+TD9B="$WORK/td9b"; tailrepo "$TD9B" 4; PS9B="$(packs_sum "$TD9B")"; rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(T_CRIT=0 ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 1048576 - 50 )) run_tail "$TD9B")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ "$(repack_calls)" = 0 ] && [ "$(packs_sum "$TD9B")" = "$PS9B" ]; } \
+  && ok "M9 DOLT_DISK_FLOOR_CRITICAL_GB=0: free − need = 1GiB − 50KiB is still CRITICAL (floor of the free GiB = 0) → skipped, no repack" || bad "M9 the critical floor setting is not honoured at 0 (rc=$rc status=$(last_status) repack calls=$(repack_calls)): $out"
+rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+out="$(T_CRIT=0 ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_FREE=$(( NEED9 + 1048576 + 100 )) run_tail "$TD9B")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(repack_calls)" = 1 ]; } \
+  && ok "M9 DOLT_DISK_FLOOR_CRITICAL_GB=0 and 1GiB + 100KiB left → the pass runs" || bad "M9 critical floor 0: the pass did not run with 1GiB left (rc=$rc status=$(last_status) repack calls=$(repack_calls)): $out"
+# M10. DISK (2): a floor or a free-space reading that cannot be read is not 'plenty' — the pass does not start, and says so in the words of a low disk
+m10() {  # m10 <what is unreadable> <T_CRIT> <T_FREE>
+  local what="$1" d="$WORK/td10-$((++M10N))" out rc
+  tailrepo "$d" 4; local ps; ps="$(packs_sum "$d")"; rm -f "$WORK/state.json" "$WORK/log" "$WORK/argv"
+  out="$(ARGV_LOG="$WORK/argv" T_GIT="$WORK/git-argv" T_TAIL=300 T_TAIL_OBJS=20 T_CRIT="$2" T_FREE="$3" run_tail "$d")"; rc=$?
+  { [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ "$(repack_calls)" = 0 ] && [ "$(packs_sum "$d")" = "$ps" ] && printf '%s' "$out" | grep -q 'cannot tell whether the pass would leave the disk above Dolt'; } \
+    && ok "M10 $what → skipped-low-disk, exit 1, no repack, the log says it cannot tell" || bad "M10 $what was read as 'plenty' or crashed (rc=$rc status=$(last_status) repack calls=$(repack_calls)): $out"
+}
+M10N=0
+m10 "a critical floor that is not a number (abc)" abc 90000000
+m10 "a critical floor of more than 9 digits" 12345678901 90000000
+m10 "a free-space reading that is not a number" "" notanumber
+# M11. the new settings are checked like the others: a JAC_TAIL_MIN_OBJECTS / JAC_TAIL_RETRY_S that is not a number, or a limit/objects too long to scale, keeps the pass OFF with the reason in the log
+TM11="$WORK/tm11"; tailrepo "$TM11" 4; PS11="$(packs_sum "$TM11")"
+for kv in 'JAC_TAIL_MIN_OBJECTS:abc:' 'JAC_TAIL_RETRY_S::abc'; do
+  IFS=: read -r name tmin tretry <<<"$kv"
+  rm -f "$WORK/state.json" "$WORK/log"
+  out="$(T_TAIL_MIN="$tmin" T_TAIL_RETRY="$tretry" T_TAIL=300 T_TAIL_OBJS=20 run_tail "$TM11")"; rc=$?
+  { [ "$rc" -eq 0 ] && [ "$(packs_sum "$TM11")" = "$PS11" ] && printf '%s' "$out" | grep -q 'tail consolidation is OFF: a JAC_TAIL_\* setting is not a number'; } \
+    && ok "M11 a non-numeric $name → the tail stays OFF, the log says why, packs untouched" || bad "M11 a non-numeric $name was not caught (rc=$rc): $out"
+done
+rm -f "$WORK/state.json" "$WORK/log"
+out="$(T_TAIL=123456789 T_TAIL_OBJS=20 run_tail "$TM11")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(packs_sum "$TM11")" = "$PS11" ] && printf '%s' "$out" | grep -q 'tail consolidation is OFF: .*too long to scale safely'; } \
+  && ok "M11 a byte limit of 9 digits (the scaling would risk overflow) → OFF with the reason, not a wrapped-around number" || bad "M11 an over-long limit was not refused (rc=$rc): $out"
+# M12. the floor is not a constant of this file: it is the one dolt-disk-floor-guard.sh uses. --print-config shows it, and a drift guard compares its default with the guard's own line
+cfg="$(env -u DOLT_DISK_FLOOR_CRITICAL_GB "$SCRIPT" --print-config)"
+printf '%s' "$cfg" | grep -q 'tail_min_objects=15 tail_retry_s=21600 dolt_critical_gb=3' \
+  && ok "M12 defaults: tail_min_objects=15 tail_retry_s=21600 dolt_critical_gb=3 (--print-config)" || bad "M12 new defaults wrong in --print-config: $cfg"
+out="$(DOLT_DISK_FLOOR_CRITICAL_GB=7 "$SCRIPT" --print-config)"
+printf '%s' "$out" | grep -q 'dolt_critical_gb=7' && ok "M12 DOLT_DISK_FLOOR_CRITICAL_GB is the setting the pass reads (7 shows up)" || bad "M12 DOLT_DISK_FLOOR_CRITICAL_GB not honoured: $out"
+GUARD="$CITY_ROOT/scripts/dolt-disk-floor-guard.sh"
+if [ ! -f "$GUARD" ]; then skip "S36 M12: $GUARD is not in this tree — the drift check of the CRITICAL default did NOT run"
+else
+  gdef="$(sed -n 's/^FLOOR_CRITICAL_GB="${DOLT_DISK_FLOOR_CRITICAL_GB:-\([0-9][0-9]*\)}".*/\1/p' "$GUARD" | head -1)"
+  mine="$(printf '%s' "$cfg" | sed -n 's/.*dolt_critical_gb=\([0-9]*\).*/\1/p' | head -1)"
+  if [ -z "$gdef" ]; then bad "M12 the guard no longer has a 'FLOOR_CRITICAL_GB=\"\${DOLT_DISK_FLOOR_CRITICAL_GB:-N}\"' line to compare with — the tail's floor can no longer be checked against it ($GUARD)"
+  elif [ "$gdef" = "$mine" ]; then ok "M12 drift guard: the tail's default Dolt CRITICAL floor ($mine GiB) is the guard's own ($gdef)"
+  else bad "M12 DRIFT: dolt-disk-floor-guard.sh calls the disk CRITICAL at <= ${gdef} GiB, this script assumes ${mine} GiB"; fi
+  # ...and the rule the margin is built on: CRITICAL is "free GiB rounded down <= the floor" (so floor + 1 GiB must remain)
+  grep -q 'if \[ "\$avail" -le "\$crit" \]; then echo "CRITICAL"' "$GUARD" \
+    && ok "M12 drift guard: the guard still reads CRITICAL as 'free GiB <= floor' (the tail leaves floor + 1 GiB)" || bad "M12 the guard's _floor_class no longer reads 'avail -le crit' for CRITICAL — the tail's floor + 1 GiB margin must be re-derived"
+  grep -q 'echo \$(( kb / 1024 / 1024 ))' "$GUARD" \
+    && ok "M12 drift guard: the guard still rounds the free space DOWN to whole GiB" || bad "M12 the guard's _avail_gb no longer rounds down to whole GiB — re-derive the tail's floor + 1 GiB margin"
+fi
 
 # I. the defaults that run in production
 cfg="$("$SCRIPT" --print-config)"

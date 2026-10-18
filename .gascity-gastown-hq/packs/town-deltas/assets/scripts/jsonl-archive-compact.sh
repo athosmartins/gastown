@@ -62,7 +62,17 @@
 #      cut by the run deadline, not started) never launders a failure; its own cap running out is `timeout`, a repack that ended non-zero is `failed`. One exception, on purpose: tier 2 below judges
 #      the END state, so when the packs are still >= JAC_PACKS_LIMIT after the tail and its gc then ends 0, that gc sets `consolidated` over whatever the tail (or tier 1) left — it rewrites
 #      every pack the tail would have merged — and the tail's failure survives in the log only. The disk it needs is the small packs' size + a quarter of the loose
-#      bytes + the headroom, else `skipped-low-disk`. The pass is not adaptive: a cap that is too small for the objects it takes fails the same way every run, in the log, until JAC_TAIL_MAX_OBJECTS is lowered.
+#      bytes + the headroom, else `skipped-low-disk`; and what is left AFTER the pass (free − that need) must still be outside Dolt's CRITICAL class (ga-q8z86s): dolt-disk-floor-guard calls the disk
+#      critical when the free GiB, rounded down, is <= DOLT_DISK_FLOOR_CRITICAL_GB (3), so the pass needs free − need >= (that + 1) GiB. This script reads the same variable with the same default (a
+#      selftest compares the default with the guard's); a free-space reading or a floor that is not a number is `skipped-low-disk` too — the pass does not start on a disk it cannot judge. 17/10
+#      the pass wrote ~800MB of temp files every run with the disk under that floor, and Dolt took ENOSPC.
+#      The pass ADAPTS (ga-q8z86s). Its object cap is per repo, kept in the state file next to tier 1's batch size (`tail_objects`, at most JAC_TAIL_MAX_OBJECTS). A pass cut by its OWN cap (600s;
+#      not by the run's deadline) writes nothing — a killed repack keeps no packed work — so repeating it unchanged is the same 600s and the same temp files again, every run, for nothing: the next
+#      pass takes at most HALF the objects the cut one took (never below JAC_TAIL_MIN_OBJECTS, 15; at that floor it can only repeat, and the log says so). A pass that finished in under a
+#      quarter of its budget while the cap kept a pack out that the configured cap would have taken doubles the cap again, up to JAC_TAIL_MAX_OBJECTS — tier 1's rule. The byte trigger scales with the
+#      cap (JAC_TAIL_LIMIT_KIB at the full cap), because a half-size pass holds about half the bytes and would otherwise never start, and so never grow back. A lowered cap can still leave NO two
+#      packs that fit (similar packs, each over half the cap): then the pass waits, with the reason in the log each run, and the cap is doubled once JAC_TAIL_RETRY_S (6h) has passed since the cut
+#      (`tail_cut_epoch`) — a slow spell that has gone is retried at most that often, and a host that stays slow costs one cut per that interval instead of one per run.
 #   2. pack count >= JAC_PACKS_LIMIT (8): one full `git gc` to consolidate. Each batch pack
 #      carries its own first full copy of every big file (batches cannot delta against earlier
 #      packs); the gc re-deltas those against the whole history and merges the packs. The alarm judges
@@ -236,6 +246,9 @@ TAIL_MAX_OBJECTS="${JAC_TAIL_MAX_OBJECTS:-120}"      # ...which takes at most th
 TAIL_TIMEOUT_S="${JAC_TAIL_TIMEOUT_S:-600}"          # per tail pass (a 58MB blob costs ~1.6s per version to re-delta on this host: 120 objects is minutes at most, under load)
 TAIL_WINDOW="${JAC_TAIL_WINDOW:-10}"                 # pack-objects --window: a small window — the versions of one file are neighbours
 TAIL_DEPTH="${JAC_TAIL_DEPTH:-250}"                  # pack-objects --depth: the default (50) leaves one seed per 50 versions (~156 x 12MB on the WA comments); 250 leaves ~31
+TAIL_MIN_OBJECTS="${JAC_TAIL_MIN_OBJECTS:-15}"       # the floor of the adaptive object cap: a cut pass is followed by one with half its objects, never fewer than this (or than the configured max, if that is lower)
+TAIL_RETRY_S="${JAC_TAIL_RETRY_S:-21600}"            # a cap lowered by a cut that leaves no two packs to merge is doubled once this long has passed since the cut (6h)
+DOLT_CRIT_GB="${DOLT_DISK_FLOOR_CRITICAL_GB:-3}"     # Dolt's CRITICAL disk class (dolt-disk-floor-guard.sh: free whole GiB <= this): the tail pass must leave the disk above it. Same variable, same default as the guard (a selftest compares them)
 BATCH_OBJECTS="${JAC_BATCH_OBJECTS:-60}"             # starting batch (~7 commits, ~300MiB loose); adapts, see header
 BATCH_MIN=5
 BATCH_MAX="${JAC_BATCH_MAX:-200}"
@@ -289,6 +302,7 @@ repos=$REPOS
 loose_limit_kib=$LOOSE_LIMIT_KIB loose_alarm_kib=$LOOSE_ALARM_KIB
 packs_limit=$PACKS_LIMIT packs_alarm=$PACKS_ALARM batch_objects=$BATCH_OBJECTS batch_max=$BATCH_MAX max_batches=$MAX_BATCHES
 tail_limit_kib=$TAIL_LIMIT_KIB tail_max_objects=$TAIL_MAX_OBJECTS tail_timeout_s=$TAIL_TIMEOUT_S tail_window=$TAIL_WINDOW tail_depth=$TAIL_DEPTH
+tail_min_objects=$TAIL_MIN_OBJECTS tail_retry_s=$TAIL_RETRY_S dolt_critical_gb=$DOLT_CRIT_GB
 git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S prune_timeout_s=$PRUNE_TIMEOUT_S prune_min_s=$PRUNE_MIN_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
 list_timeout_s=$LIST_TIMEOUT_S lsof_timeout_s=$LSOF_TIMEOUT_S reclaim_wait_s=$RECLAIM_WAIT_S ps_timeout_s=$PS_TIMEOUT_S
 alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S check_fresh_s=$CHECK_FRESH_S
@@ -613,7 +627,7 @@ load_state() {
   # before/after, the rule that suppresses the alarm). loose_kib may also be null: a run that could not measure records that.
   local bad_fields
   bad_fields="$(jq -r --arg r "$1" 'def badnum: (.value | type) != "number" or .value < 0 or .value != (.value | floor);
-      def bad: ((.key | IN("bad_streak","last_alert_epoch","batch_objects")) and badnum) or (.key == "loose_kib" and .value != null and badnum);
+      def bad: ((.key | IN("bad_streak","last_alert_epoch","batch_objects","tail_objects","tail_cut_epoch")) and badnum) or (.key == "loose_kib" and .value != null and badnum);
       (.[$r] // {}) | to_entries | map(select(bad)) | map(.key) | join(",")' <<<"$STATE_JSON" 2>/dev/null)" || bad_fields="?"
   if [ -n "$bad_fields" ]; then
     case "$ENTRY_LOGGED" in
@@ -622,7 +636,7 @@ load_state() {
          log "  state entry for $1: field(s) $bad_fields are not non-negative whole numbers (or could not be checked) — dropped, read as unset" ;;
     esac
     STATE_JSON="$(jq --arg r "$1" 'def badnum: (.value | type) != "number" or .value < 0 or .value != (.value | floor);
-        def bad: ((.key | IN("bad_streak","last_alert_epoch","batch_objects")) and badnum) or (.key == "loose_kib" and .value != null and badnum);
+        def bad: ((.key | IN("bad_streak","last_alert_epoch","batch_objects","tail_objects","tail_cut_epoch")) and badnum) or (.key == "loose_kib" and .value != null and badnum);
         .[$r] |= with_entries(select(bad | not))' <<<"$STATE_JSON" 2>/dev/null)" \
       || STATE_JSON="$(jq --arg r "$1" '.[$r] = {}' <<<"$(state_json)")"
   fi
@@ -693,11 +707,13 @@ hand, without a timeout, at low priority:  nice -n 10 git --git-dir=$1/.git gc  
 write_state() {
   local repo="$1" state="$2" status="$3" streak="$4" last="$5" now="$6" new jrc
   new="$(jq --arg r "$repo" --arg st "$status" --argjson streak "$streak" --argjson last "$last" --argjson now "$now" \
-        --arg lk "$M_LOOSE_KIB" --arg lc "$M_LOOSE_COUNT" --arg pk "$M_PACKS" --arg pks "$M_PACK_KIB" --arg g "${G_KIB:-}" --arg bo "${R_BATCH_SAVE:-}" \
+        --arg lk "$M_LOOSE_KIB" --arg lc "$M_LOOSE_COUNT" --arg pk "$M_PACKS" --arg pks "$M_PACK_KIB" --arg g "${G_KIB:-}" --arg bo "${R_BATCH_SAVE:-}" --arg to "${R_TAIL_SAVE:-}" --arg tc "${R_TAIL_CUT_SAVE:-}" \
         --arg gf "$M_GARBAGE_COUNT" --arg gk "$M_GARBAGE_KIB" \
         'def n($x): (try ($x | tonumber) catch null);
          .[$r] = ((.[$r] // {}) + {last_run_epoch:$now, status:$st, loose_kib:n($lk), loose_objects:n($lc), packs:n($pk), pack_kib:n($pks), gitdir_kib:n($g), garbage_files:n($gf), garbage_kib:n($gk), bad_streak:$streak, last_alert_epoch:$last})
-         | if n($bo) != null then .[$r].batch_objects = n($bo) else . end' <<<"$state" 2>&1)"; jrc=$?
+         | if n($bo) != null then .[$r].batch_objects = n($bo) else . end
+         | if n($to) != null then .[$r].tail_objects = n($to) else . end
+         | if n($tc) != null then .[$r].tail_cut_epoch = n($tc) else . end' <<<"$state" 2>&1)"; jrc=$?
   if [ "$jrc" -ne 0 ] || ! jq -e 'type == "object"' <<<"$new" >/dev/null 2>&1; then
     log "  state update FAILED ($repo): jq rc=$jrc: $(printf '%s' "$new" | tail -n 2 | tr '\n' ' ' | cut -c1-200) — the bad-run streak cannot advance and no alarm mail can go out until the state can be written"
     return 1
@@ -773,14 +789,15 @@ pack_objects() {
   echo $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 ))
 }
 
-# tail_plan — which packs the tail pass would take, from the object store as it is now. Sets TAIL_PICK (pack file names), TAIL_KEEP (a --keep-pack=<name> for EVERY other pack, so the pass can touch
-# nothing else), TAIL_N, TAIL_OBJ (objects in the picked packs), TAIL_KIB. Returns 1 when the pack directory cannot be listed. A pack is never picked — it stays under --keep-pack — when it is a cruft pack
+# tail_plan <cap> — which packs the tail pass would take within <cap> objects, from the object store as it is now. Sets TAIL_PICK (pack file names), TAIL_KEEP (a --keep-pack=<name> for EVERY other pack, so the pass can touch
+# nothing else), TAIL_N, TAIL_OBJ (objects in the picked packs), TAIL_KIB, and TAIL_CAPPED (1 = a pack was left out only because of <cap>: the configured TAIL_MAX_OBJECTS would still have taken it at that point of the walk;
+# always 0 when <cap> is the configured max). Returns 1 when the pack directory cannot be listed (TAIL_N is then 0). A pack is never picked — it stays under --keep-pack — when it is a cruft pack
 # (.mtimes: the unreachable objects waiting out gc's two weeks), carries a .keep, has an object count or a size that cannot be read, or does not fit: packs are taken smallest first (by objects)
-# while the total stays within TAIL_MAX_OBJECTS, so the big old pack — and any pack a previous pass grew to the cap — is left alone, and one pass costs a bounded delta search.
+# while the total stays within <cap>, so the big old pack — and any pack a previous pass grew to the cap — is left alone, and one pass costs a bounded delta search.
 tail_plan() {
-  local dir="$R_GITDIR/objects/pack" p b n sz sorted
+  local cap="$1" dir="$R_GITDIR/objects/pack" p b n sz sorted
   local -a rows=()
-  TAIL_PICK=(); TAIL_KEEP=(); TAIL_N=0; TAIL_OBJ=0; TAIL_KIB=0
+  TAIL_PICK=(); TAIL_KEEP=(); TAIL_N=0; TAIL_OBJ=0; TAIL_KIB=0; TAIL_CAPPED=0
   # vazio → a directory without a .pack is a repo with nothing to consolidate (the loop below sees only the literal pattern and skips it); falhou/ilegível → a directory that is missing or cannot be read and entered is "could not be listed" (return 1, the caller logs it): never an empty list
   [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ] || return 1
   for p in "$dir"/*.pack; do
@@ -798,10 +815,11 @@ tail_plan() {
     sorted="$(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1n -k3,3)"
     while IFS='|' read -r n sz b; do
       [ -n "$b" ] || continue
-      if [ $(( TAIL_OBJ + n )) -le "$TAIL_MAX_OBJECTS" ]; then
+      if [ $(( TAIL_OBJ + n )) -le "$cap" ]; then
         TAIL_PICK+=("$b"); TAIL_OBJ=$(( TAIL_OBJ + n )); TAIL_KIB=$(( TAIL_KIB + (sz + 1023) / 1024 ))
       else
         TAIL_KEEP+=("--keep-pack=$b")
+        if [ $(( TAIL_OBJ + n )) -le "$TAIL_MAX_OBJECTS" ]; then TAIL_CAPPED=1; fi
       fi
     done <<EOF
 $sorted
@@ -810,15 +828,72 @@ EOF
   TAIL_N="${#TAIL_PICK[@]}"
 }
 
-# tail_pass <repo> — tier 2a (header): the small packs the batches left, held >= TAIL_LIMIT_KIB, become ONE pack whose deltas are recomputed (-f), by BYTES and not by how many packs there are. Obeys the same
+# tail_floor — the least the adaptive object cap goes to: TAIL_MIN_OBJECTS, or the configured max when that is lower (the cap is never above the max, so the floor is never above it either).
+tail_floor() { if [ "$TAIL_MIN_OBJECTS" -le "$TAIL_MAX_OBJECTS" ]; then echo "$TAIL_MIN_OBJECTS"; else echo "$TAIL_MAX_OBJECTS"; fi; }
+
+# tail_limit_for <cap> — the byte trigger of a pass capped at <cap> objects: TAIL_LIMIT_KIB at the configured max, in proportion below it (at least 1KiB). A pass on half the cap holds about half the bytes, so the
+# unscaled trigger would never be reached by it again: it would never start, and so never grow back. (The limit has at most 8 digits and the cap at most 10 — tail_pass checks — so the product stays under 10^18.)
+tail_limit_for() {
+  local lim="$TAIL_LIMIT_KIB"
+  if [ "$TAIL_MAX_OBJECTS" -gt 0 ]; then lim=$(( TAIL_LIMIT_KIB * $1 / TAIL_MAX_OBJECTS )); fi
+  [ "$lim" -ge 1 ] || lim=1
+  echo "$lim"
+}
+
+# tail_grow <why> — doubles the cap (at most TAIL_MAX_OBJECTS) and has the state remember it. Callers decide WHEN; this only moves the number.
+tail_grow() {
+  local was="$R_TAIL"
+  R_TAIL=$(( R_TAIL * 2 ))
+  [ "$R_TAIL" -le "$TAIL_MAX_OBJECTS" ] || R_TAIL="$TAIL_MAX_OBJECTS"
+  R_TAIL_SAVE="$R_TAIL"
+  log "  tail object cap $was -> $R_TAIL ($1)"
+}
+
+# tail_retry_due — 0 when the cap a cut lowered may be doubled again: TAIL_RETRY_S have passed since the cut. vazio → no cut time on record (a state edited by hand, or written before this field existed): the clock starts now
+# and the answer is no; falhou/ilegível → a cut time that is not a number, or lies in the future: the same, no. Under doubt the cap stays small (the cheap pass is the inert one).
+tail_retry_due() {
+  local now age
+  now="$(date +%s)"
+  if is_uint "$R_TAIL_CUT" && [ "$R_TAIL_CUT" -le "$now" ]; then
+    age=$(( now - R_TAIL_CUT ))
+    [ "$age" -ge "$TAIL_RETRY_S" ]
+    return
+  fi
+  R_TAIL_CUT="$now"; R_TAIL_CUT_SAVE="$now"
+  return 1
+}
+
+# tail_unstick — the plan at R_TAIL is not due. When the cap is the reason (the configured max would have run it), say so, and once TAIL_RETRY_S have passed since the last cut double the cap and plan again.
+# 0 = the cap was doubled and TAIL_* describe the plan at the new cap (the caller judges it again); 1 = nothing changed (not held back by the cap, or too soon to retry) and TAIL_* describe the plan at R_TAIL.
+# Needs the plan at R_TAIL (TAIL_CAPPED). A listing that fails leaves TAIL_N at 0, which is "not due".
+tail_unstick() {
+  local m_n m_kib
+  [ "$TAIL_CAPPED" -eq 1 ] || return 1
+  tail_plan "$TAIL_MAX_OBJECTS" || return 1
+  m_n="$TAIL_N"; m_kib="$TAIL_KIB"
+  tail_plan "$R_TAIL" || return 1
+  if [ "$m_n" -lt 2 ] || [ "$m_kib" -lt "$TAIL_LIMIT_KIB" ]; then return 1; fi
+  log "  tail consolidation held back by its object cap: $R_TAIL objects (lowered after a pass was cut; configured max $TAIL_MAX_OBJECTS) leave no 2 packs to merge, while the cap of $TAIL_MAX_OBJECTS would take $m_n packs ($(fmt "$m_kib")) — the cap is retried larger ${TAIL_RETRY_S}s after the last cut"
+  if tail_retry_due; then
+    tail_grow "${TAIL_RETRY_S}s since the last cut and no pass could run since — trying a larger cap"
+    R_TAIL_CUT_SAVE="$(date +%s)"; R_TAIL_CUT="$R_TAIL_CUT_SAVE"
+    tail_plan "$R_TAIL" || return 1
+    return 0
+  fi
+  return 1
+}
+
+# tail_pass <repo> — tier 2a (header): the small packs the batches left, held >= TAIL_LIMIT_KIB (scaled to the object cap), become ONE pack whose deltas are recomputed (-f), by BYTES and not by how many packs there are. Obeys the same
 # rules as the consolidating gc: a step that did NOTHING (busy, cut by the run's deadline, not started) may only replace a status that is not a failure; one that finished (rc 0) is `consolidated` unless
-# something before it had failed (that failure stays visible). Inert under doubt: an unreadable pack directory, a setting that is not a number, loose objects still waiting for tier 1, or a repacker it
-# cannot rule out all mean "not started", with the reason in the log. Needs a fresh `measure` (M_LOOSE_KIB, M_LOOSE_COUNT).
+# something before it had failed (that failure stays visible). Inert under doubt: an unreadable pack directory, a setting that is not a number, loose objects still waiting for tier 1, a repacker it
+# cannot rule out, and a disk it cannot show would stay above Dolt's CRITICAL class all mean "not started", with the reason in the log. Needs a fresh `measure` (M_LOOSE_KIB, M_LOOSE_COUNT) and the repo's entry
+# in STATE_JSON (load_state). Sets R_TAIL (the object cap of this pass), and R_TAIL_SAVE / R_TAIL_CUT_SAVE when the state must remember a change (write_state).
 tail_pass() {
-  local repo="$1" need orc out rc t_left by_deadline
+  local repo="$1" need orc out rc t_left by_deadline b0 took lim fl fr floor_kib next jrc after
   if [ "$TAIL_LIMIT_KIB" = 0 ]; then return 0; fi
-  if ! { is_uint "$TAIL_LIMIT_KIB" && is_uint "$TAIL_MAX_OBJECTS" && is_uint "$TAIL_TIMEOUT_S" && is_uint "$TAIL_WINDOW" && is_uint "$TAIL_DEPTH"; }; then
-    log "  tail consolidation is OFF: a JAC_TAIL_* setting is not a number (limit='$TAIL_LIMIT_KIB' objects='$TAIL_MAX_OBJECTS' timeout='$TAIL_TIMEOUT_S' window='$TAIL_WINDOW' depth='$TAIL_DEPTH') — nothing is consolidated by size until it is fixed"
+  if ! { is_uint "$TAIL_LIMIT_KIB" && is_uint "$TAIL_MAX_OBJECTS" && is_uint "$TAIL_TIMEOUT_S" && is_uint "$TAIL_WINDOW" && is_uint "$TAIL_DEPTH" && is_uint "$TAIL_MIN_OBJECTS" && is_uint "$TAIL_RETRY_S" \
+         && [ "${#TAIL_LIMIT_KIB}" -le 8 ] && [ "${#TAIL_MAX_OBJECTS}" -le 10 ]; }; then
+    log "  tail consolidation is OFF: a JAC_TAIL_* setting is not a number, or is too long to scale safely (limit over 8 digits, objects over 10) (limit='$TAIL_LIMIT_KIB' objects='$TAIL_MAX_OBJECTS' timeout='$TAIL_TIMEOUT_S' window='$TAIL_WINDOW' depth='$TAIL_DEPTH' min_objects='$TAIL_MIN_OBJECTS' retry_s='$TAIL_RETRY_S') — nothing is consolidated by size until it is fixed"
     return 0
   fi
   # the pass also reads three settings it does not own: `[ n -ge abc ]` ends 2, which an `if` takes as FALSE, so a loose limit it cannot read would read as "no loose backlog" and the pass would start (measured: packs 5 -> 2)
@@ -826,11 +901,29 @@ tail_pass() {
     log "  tail consolidation is OFF: a setting it depends on is not a number (loose_limit_kib='$LOOSE_LIMIT_KIB' headroom_kib='$HEADROOM_KIB' min_gc_budget_s='$MIN_GC_BUDGET_S') — nothing is consolidated by size until it is fixed"
     return 0
   fi
-  if ! tail_plan; then
+  # the object cap this repo's passes are on. vazio → nothing remembered (never cut, or a first run): the configured max; falhou/ilegível → a remembered value that cannot be read (jq failed, or it is not a whole number)
+  # is not "never cut": the floor, the cheap pass, which grows back by itself if it is fast
+  fl="$(tail_floor)"
+  R_TAIL="$(jq -r --arg r "$repo" '.[$r].tail_objects // empty' <<<"$STATE_JSON" 2>/dev/null)"; jrc=$?
+  if [ "$jrc" -ne 0 ]; then R_TAIL="$fl"; log "  the remembered tail object cap of $repo could not be read — the pass starts from the floor ($fl objects)"
+  elif [ -z "$R_TAIL" ]; then R_TAIL="$TAIL_MAX_OBJECTS"
+  elif is_uint "$R_TAIL"; then
+    [ "$R_TAIL" -ge "$fl" ] || R_TAIL="$fl"
+    [ "$R_TAIL" -le "$TAIL_MAX_OBJECTS" ] || R_TAIL="$TAIL_MAX_OBJECTS"
+  else R_TAIL="$fl"; log "  the remembered tail object cap of $repo is not a whole number — the pass starts from the floor ($fl objects)"; fi
+  # vazio/falhou/ilegível → no cut time on record: tail_retry_due starts the clock and answers no
+  R_TAIL_CUT="$(jq -r --arg r "$repo" '.[$r].tail_cut_epoch // empty' <<<"$STATE_JSON" 2>/dev/null)"; is_uint "$R_TAIL_CUT" || R_TAIL_CUT=""
+  if ! tail_plan "$R_TAIL"; then
     log "  tail consolidation skipped: the pack directory of $repo could not be listed — nothing consolidated by size this run"
     return 0
   fi
-  if [ "$TAIL_N" -lt 2 ] || [ "$TAIL_KIB" -lt "$TAIL_LIMIT_KIB" ]; then return 0; fi
+  lim="$(tail_limit_for "$R_TAIL")"
+  if [ "$TAIL_N" -lt 2 ] || [ "$TAIL_KIB" -lt "$lim" ]; then
+    # not due at this cap. If the cap is the reason, tail_unstick says so and may double it; then the plan is judged again
+    tail_unstick || return 0
+    lim="$(tail_limit_for "$R_TAIL")"
+    if [ "$TAIL_N" -lt 2 ] || [ "$TAIL_KIB" -lt "$lim" ]; then return 0; fi
+  fi
   # `repack -a` packs every reachable loose object too, with -f, and the object cap does not bound those: tier 1 drains them in measured batches first, so a loose backlog still over its limit waits
   if [ "$M_LOOSE_KIB" -ge "$LOOSE_LIMIT_KIB" ]; then
     log "  tail consolidation not started: $TAIL_N small packs hold $(fmt "$TAIL_KIB") but $(fmt "$M_LOOSE_KIB") is still loose (limit $(fmt "$LOOSE_LIMIT_KIB")) — tier 1 drains that first; retried next run"
@@ -842,9 +935,20 @@ tail_pass() {
     return 0
   fi
   need=$(( TAIL_KIB + M_LOOSE_KIB / 4 + HEADROOM_KIB ))      # the new pack is at most as big as the packs it replaces (those stay until it is written) plus what the loose objects pack to (tier 1's assumption: <= 1/4)
-  if disk_low "$repo" "$need"; then
-    STATUS="skipped-low-disk"
-    log "repo=$repo status=skipped-low-disk (tail) free=$(fmt "$(free_kib "$repo")") need~$(fmt "$need") small packs=$TAIL_N ($(fmt "$TAIL_KIB"))"
+  # The disk: free − need must stay OUTSIDE Dolt's CRITICAL class. dolt-disk-floor-guard calls the disk critical when the free GiB, rounded DOWN, is <= DOLT_DISK_FLOOR_CRITICAL_GB, so free − need must be at least
+  # (that + 1) GiB. vazio → free space that df did not give is not "plenty" and not "nothing": the pass does not start; falhou/ilegível → a free-space reading or a floor that is not a number (or has more than 9
+  # digits) is the same: it does not start, and says why in the same words as a disk that is low (ga-q8z86s; the other tiers still proceed on an unreadable df, this one writes ~800MB of temp files and does not).
+  fr="$(free_kib "$repo")"
+  if ! { is_uint "$fr" && is_uint "$DOLT_CRIT_GB" && [ "${#DOLT_CRIT_GB}" -le 9 ]; }; then
+    bad_status "$STATUS" || STATUS="skipped-low-disk"      # a failure tier 1 left stays the status (header 2a: a pass that did nothing replaces only a status that is not a failure)
+    log "repo=$repo status=skipped-low-disk (tail) free='${fr:-nothing}' dolt_critical_gb='$DOLT_CRIT_GB' — cannot tell whether the pass would leave the disk above Dolt's CRITICAL floor, so it does not start; small packs=$TAIL_N ($(fmt "$TAIL_KIB"))"
+    return 0
+  fi
+  floor_kib=$(( (DOLT_CRIT_GB + 1) * 1048576 ))
+  if [ "$fr" -lt $(( need + floor_kib )) ]; then
+    bad_status "$STATUS" || STATUS="skipped-low-disk"
+    after="below zero"; if [ "$fr" -ge "$need" ]; then after="$(fmt $(( fr - need )))"; fi
+    log "repo=$repo status=skipped-low-disk (tail) free=$(fmt "$fr") need~$(fmt "$need") — free after the pass would be $after, and Dolt's CRITICAL class is a free disk of ${DOLT_CRIT_GB}GiB or less (the pass needs $(fmt "$floor_kib") left) small packs=$TAIL_N ($(fmt "$TAIL_KIB"))"
     return 0
   fi
   # ONE REPACKER AT A TIME (header): the same check, and the same answer, as before the consolidating gc
@@ -859,21 +963,39 @@ tail_pass() {
     return 0
   fi
   budget_for "$TAIL_TIMEOUT_S"
-  log "  tail consolidation: $TAIL_N packs ($(fmt "$TAIL_KIB"), $TAIL_OBJ objects, + ${M_LOOSE_COUNT:-?} loose) -> one pack, deltas recomputed; ${#TAIL_KEEP[@]} other pack(s) kept untouched"
+  log "  tail consolidation: $TAIL_N packs ($(fmt "$TAIL_KIB"), $TAIL_OBJ objects, + ${M_LOOSE_COUNT:-?} loose) -> one pack, deltas recomputed; ${#TAIL_KEEP[@]} other pack(s) kept untouched; object cap $R_TAIL (max $TAIL_MAX_OBJECTS)"
+  b0="$(date +%s)"
   run_step "$t_left" repack --quiet -a -d -l -f --window="$TAIL_WINDOW" --depth="$TAIL_DEPTH" --cruft --cruft-expiration=2.weeks.ago ${TAIL_KEEP[@]+"${TAIL_KEEP[@]}"}; out="$STEP_OUT"; rc="$STEP_RC"
-  if [ "$rc" -eq 0 ]; then bad_status "$STATUS" || STATUS="consolidated"
+  took=$(( $(date +%s) - b0 ))
+  if [ "$rc" -eq 0 ]; then
+    bad_status "$STATUS" || STATUS="consolidated"
+    # tier 1's rule: a pass that used under a quarter of its budget while the cap kept a pack out that the configured max would have taken says the cap is tighter than the host needs
+    if [ "$TAIL_CAPPED" -eq 1 ] && [ $(( took * 4 )) -lt "$t_left" ]; then tail_grow "the pass took ${took}s of its ${t_left}s and the cap left a pack out"; fi
   elif [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
     # it did NOTHING useful (a killed repack keeps no packed work — and leaves a tmp_pack, which run_step has just reclaimed or the garbage measurement will report): it cannot turn a failed / stalled / timed-out / skipped tier 1 green
     bad_status "$STATUS" || STATUS="deferred"
-    log "  tail repack was cut by the run deadline after ${t_left}s — the budget ended, not evidence the pass is too big (retried next run)"
-  elif [ "$rc" -eq 124 ]; then STATUS="timeout"; log "  tail repack timed out after ${t_left}s (its own cap)"
+    log "  tail repack was cut by the run deadline after ${t_left}s — the budget ended, not evidence the pass is too big (retried next run, same cap)"
+  elif [ "$rc" -eq 124 ]; then
+    # its OWN cap ran out: this many objects do not fit in the budget on this host, and the same pass would be cut the same way next run (ga-q8z86s). The next one takes half of what this one carried
+    # (not half the cap: a cap of 120 over a pass of 40 would otherwise repeat that pass twice more), and the state remembers when it happened for tail_retry_due
+    STATUS="timeout"
+    next=$(( TAIL_OBJ / 2 ))
+    [ "$next" -ge "$fl" ] || next="$fl"
+    [ "$next" -le "$R_TAIL" ] || next="$R_TAIL"
+    R_TAIL_CUT="$(date +%s)"; R_TAIL_CUT_SAVE="$R_TAIL_CUT"
+    if [ "$next" -lt "$R_TAIL" ]; then
+      R_TAIL="$next"; R_TAIL_SAVE="$next"
+      log "  tail repack timed out after ${t_left}s (its own cap) — it carried $TAIL_OBJ objects; the next pass takes at most $next (half of that, never below the floor of $fl)"
+    else
+      log "  tail repack timed out after ${t_left}s (its own cap) — it carried $TAIL_OBJ objects and the cap is already at its floor ($fl): the next pass can only repeat this one"
+    fi
   else STATUS="failed"; log "  tail repack failed rc=$rc: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"; fi
 }
 
 compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller handles is_bad via record
   local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_unpacked prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed over before_gcount before_gkib window_ok
   R_GITDIR="$repo/.git"
-  STATUS="ok"; G_KIB=""; R_PROGRESS=0; R_BATCH_SAVE=""; R_GARBAGE_GREW=0; R_GARBAGE_BEFORE=""; R_LEAK_UNKNOWN=0
+  STATUS="ok"; G_KIB=""; R_PROGRESS=0; R_BATCH_SAVE=""; R_TAIL_SAVE=""; R_TAIL_CUT_SAVE=""; R_GARBAGE_GREW=0; R_GARBAGE_BEFORE=""; R_LEAK_UNKNOWN=0
   t0="$(date +%s)"
   load_state "$repo"
   saved="$(jq -r --arg r "$repo" '.[$r].batch_objects // empty' <<<"$STATE_JSON" 2>/dev/null)"
