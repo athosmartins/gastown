@@ -3097,8 +3097,28 @@ _reap_pycache() {
         break
         ;;
       *)
-        log "pycache-reap: ${root} — DELETE PARTIAL (find/rm exited rc=${drc}, see the lines above): ${files} file(s) (≈$((bytes/1048576))MB) were eligible; a freed figure is NOT claimed"
-        incomplete=$((incomplete+1))
+        # find exits non-zero for an unreadable subdirectory too, even when every file it could
+        # see was removed - so the exit status alone cannot tell "rm failed" from "part of the tree
+        # is unreadable". Measure again and let what is STILL THERE decide.
+        left=$(( deadline - $(date +%s) )); [ "$left" -lt 30 ] && left=30
+        m="$(_pycache_measure_root "$left" "$root" "$mins")"
+        arr=($m)
+        # vazio → the re-measure counts 0 file(s): everything eligible is gone, DELETED; falhou/ilegível → the left-over is unknown, so no freed figure is claimed and the root counts as unfinished
+        if _pycache_isnum "${arr[0]:-}" && _pycache_isnum "${arr[1]:-}" && _pycache_isnum "${arr[2]:-}" && [ "${arr[2]}" -ne 124 ]; then
+          local rest_files="${arr[0]}" rest_bytes="${arr[1]}" freed_here=0
+          [ "$bytes" -gt "$rest_bytes" ] && freed_here=$((bytes - rest_bytes))
+          total_files=$((total_files + files - rest_files))
+          freed_b=$((freed_b + freed_here))
+          if [ "$rest_files" -eq 0 ]; then
+            log "pycache-reap: ${root} — DELETED ${files} file(s), freed≈$((freed_here/1048576))MB (find exited rc=${drc} on the way - an unreadable part of the tree, or a file that vanished - and a re-measure finds nothing left to take)${note}"
+          else
+            log "pycache-reap: ${root} — DELETE PARTIAL (find/rm exited rc=${drc}, see the lines above): ${rest_files} of ${files} file(s) (≈$((rest_bytes/1048576))MB) are still there after the delete; freed≈$((freed_here/1048576))MB (sized before minus after)${note}"
+            incomplete=$((incomplete+1))
+          fi
+        else
+          log "pycache-reap: ${root} — DELETE PARTIAL (find/rm exited rc=${drc}, see the lines above) and the re-measure is unreadable ('${m}'): ${files} file(s) (≈$((bytes/1048576))MB) were eligible; a freed figure is NOT claimed"
+          incomplete=$((incomplete+1))
+        fi
         ;;
     esac
   done < <(printf '%s\n' "$roots")

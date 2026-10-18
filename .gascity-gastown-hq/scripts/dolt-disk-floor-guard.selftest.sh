@@ -469,6 +469,189 @@ _reap_go_build_orphans "/nonexistent/path/$$/go-build-tmp-does-not-exist"
 ok "_reap_go_build_orphans: nonexistent root skips cleanly (no crash — this line only runs if it didn't)"
 
 echo ""
+echo "=== _reap_pycache (ga-0z7kdz): real find walk, hermetic fixture ==="
+# Every path below lives in a throwaway root: PYCACHE_REAP_ROOTS points the lever at it and the
+# state file is redirected, so nothing of this host's rigs is read or deleted. The 'old' files
+# are 2h old (the lever takes only files untouched for 30min); the 'fresh' ones are not.
+PYC_TMP="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-pyc.XXXXXX)"
+PYC_OLD_TS="$(date -v-2H '+%Y%m%d%H%M.%S' 2>/dev/null || date -d '-2 hours' '+%Y%m%d%H%M.%S')"
+PYC_ROOT="$PYC_TMP/rig"
+PYC_SAVE_ENABLED="$ENABLED"; PYC_SAVE_CITY="$CITY"
+PYC_REAL_MEASURE="$(declare -f _pycache_measure_root)"
+PYC_REAL_DELETE="$(declare -f _pycache_delete_root)"
+PYCACHE_REAP_ROOTS="$PYC_ROOT"
+STATE_PYCACHE_REAP_FILE="$PYC_TMP/state"
+pyc_old()   { mkdir -p "$(dirname "$1")"; printf '%s' "${2:-payload}" > "$1"; touch -t "$PYC_OLD_TS" "$1"; }
+pyc_fresh() { mkdir -p "$(dirname "$1")"; printf 'fresh' > "$1"; }
+pyc_log_mark() { PYC_LOG_FROM=$(( $(wc -l < "$LOG") + 1 )); }
+pyc_log()      { tail -n +"$PYC_LOG_FROM" "$LOG"; }
+pyc_restore_fns() { eval "$PYC_REAL_MEASURE"; eval "$PYC_REAL_DELETE"; }
+
+# The files the lever must take, and the ones it must leave.
+PYC_GONE=(
+  "$PYC_ROOT/crew/x/tests/__pycache__/a.cpython-311.pyc"
+  "$PYC_ROOT/daemons/__pycache__/d.cpython-311.pyc"
+  "$PYC_ROOT/crew/x/.pytest_cache/v/cache/lastfailed"
+  "$PYC_ROOT/crew/x/.pytest_cache/v/cache/nodeids"
+)
+PYC_KEPT=(
+  "$PYC_ROOT/crew/x/tests/__pycache__/fresh.cpython-311.pyc"   # modified just now
+  "$PYC_ROOT/crew/x/.pytest_cache/v/cache/fresh-entry"         # modified just now
+  "$PYC_ROOT/crew/x/tests/__pycache__/cache.nbi"               # shares __pycache__ but is not bytecode
+  "$PYC_ROOT/crew/x/a.py"
+  "$PYC_ROOT/crew/x/Makefile"                                  # no extension, next to the .py
+  "$PYC_ROOT/crew/x/legacy.pyc"                                # outside __pycache__
+  "$PYC_ROOT/crew/x/foo__pycache__/z.pyc"                      # the name only ends in __pycache__
+  "$PYC_ROOT/crew/x/notpycache/x.pyc"
+  "$PYC_ROOT/venv/lib/__pycache__/v.pyc"
+  "$PYC_ROOT/crew/x/venv/lib/__pycache__/n.pyc"                # pruned at depth, not only at the top
+  "$PYC_ROOT/.venv/lib/__pycache__/v.pyc"
+  "$PYC_ROOT/.git/x/__pycache__/g.pyc"
+  "$PYC_ROOT/.beads/__pycache__/b.pyc"
+  "$PYC_ROOT/.dolt/__pycache__/d.pyc"
+  "$PYC_ROOT/node_modules/p/__pycache__/n.pyc"
+)
+pyc_build_fixture() {
+  chmod -R u+rwx "$PYC_ROOT" 2>/dev/null
+  rm -rf "$PYC_ROOT"
+  mkdir -p "$PYC_ROOT/daemons/__pycache__"
+  head -c 3145728 /dev/zero > "$PYC_ROOT/daemons/__pycache__/d.cpython-311.pyc"
+  touch -t "$PYC_OLD_TS" "$PYC_ROOT/daemons/__pycache__/d.cpython-311.pyc"
+  local f
+  for f in "${PYC_GONE[@]}" "${PYC_KEPT[@]}"; do
+    case "$f" in
+      */d.cpython-311.pyc) ;;                                  # already made (3MB)
+      */fresh.cpython-311.pyc|*/fresh-entry) pyc_fresh "$f" ;;
+      *) pyc_old "$f" ;;
+    esac
+  done
+  mkdir -p "$PYC_ROOT/crew/x/__pycache__"
+  ln -s ../a.py "$PYC_ROOT/crew/x/__pycache__/link.pyc"
+}
+pyc_check_set() { # <label> — GONE gone, KEPT (and the symlink + its target) present
+  local label="$1" f missing_gone="" present_kept=""
+  for f in "${PYC_GONE[@]}"; do [ -e "$f" ] && missing_gone="$missing_gone ${f#$PYC_ROOT/}"; done
+  for f in "${PYC_KEPT[@]}"; do [ -e "$f" ] || present_kept="$present_kept ${f#$PYC_ROOT/}"; done
+  [ -L "$PYC_ROOT/crew/x/__pycache__/link.pyc" ] || present_kept="$present_kept crew/x/__pycache__/link.pyc(symlink)"
+  [ -z "$missing_gone" ] && ok "$label: the 4 candidates (2 .pyc under __pycache__, 2 files under .pytest_cache) are DELETED" || bad "$label: still present:$missing_gone"
+  [ -z "$present_kept" ] && ok "$label: every file that is not a stale pycache file SURVIVED (.py, extensionless, nbi, legacy .pyc, fresh files, symlink, venv/.git/.beads/.dolt/node_modules)" || bad "$label: wrongly removed:$present_kept"
+}
+
+# 1. The main run.
+pyc_build_fixture; rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+_reap_pycache
+pyc_check_set "_reap_pycache"
+pyc_log | grep -q "DELETED 4 file(s), freed≈3MB" && ok "_reap_pycache: logs the files and the MB freed (4 file(s), ≈3MB)" || bad "_reap_pycache: the DELETED line with 4 file(s) and ≈3MB is missing: $(pyc_log | grep 'pycache-reap' | tr '\n' '|')"
+pyc_log | grep -q "pycache-reap OK — roots=1 scanned=1 deleted=4 file(s), freed≈3MB" && ok "_reap_pycache: the summary line says OK with the totals" || bad "_reap_pycache: the OK summary line is missing"
+[ -s "$STATE_PYCACHE_REAP_FILE" ] && ok "_reap_pycache: the cooldown state file was written" || bad "_reap_pycache: no state file after a run"
+
+# 2. Cooldown: a second run right away takes nothing; once the state is gone it takes it.
+pyc_old "$PYC_ROOT/crew/x/tests/__pycache__/again.cpython-311.pyc"; pyc_log_mark
+_reap_pycache
+if [ -e "$PYC_ROOT/crew/x/tests/__pycache__/again.cpython-311.pyc" ] && pyc_log | grep -q "pycache-reap SKIP — ran within the last"; then
+  ok "_reap_pycache: inside the cooldown a new stale file is left alone and the SKIP is logged"
+else
+  bad "_reap_pycache: the cooldown did not hold"
+fi
+rm -f "$STATE_PYCACHE_REAP_FILE"; _reap_pycache
+[ ! -e "$PYC_ROOT/crew/x/tests/__pycache__/again.cpython-311.pyc" ] && ok "_reap_pycache: with the cooldown over, the same file is taken" || bad "_reap_pycache: still present after the cooldown elapsed"
+
+# 3. An age the lever cannot read must make it do NOTHING (a '0' would take files a running pytest writes).
+for v in abc 0 "" -5 1.5; do
+  pyc_old "$PYC_ROOT/crew/x/tests/__pycache__/guard.cpython-311.pyc"; rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+  PYCACHE_REAP_MIN_AGE_MIN="$v" _reap_pycache
+  if [ -e "$PYC_ROOT/crew/x/tests/__pycache__/guard.cpython-311.pyc" ] && pyc_log | grep -q "is not a positive integer"; then
+    ok "_reap_pycache: MIN_AGE_MIN='$v' → SKIP, nothing deleted, reason logged"
+  else
+    bad "_reap_pycache: MIN_AGE_MIN='$v' did not skip safely"
+  fi
+done
+
+# 4. Notify-only mode.
+ENABLED=0; rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+_reap_pycache
+ENABLED="$PYC_SAVE_ENABLED"
+if [ -e "$PYC_ROOT/crew/x/tests/__pycache__/guard.cpython-311.pyc" ] && pyc_log | grep -q "pycache-reap SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0"; then
+  ok "_reap_pycache: ENABLED=0 → SKIP, nothing deleted"
+else
+  bad "_reap_pycache: ENABLED=0 did not stop the lever"
+fi
+
+# 5. A symlinked root is never descended.
+ln -s "$PYC_ROOT" "$PYC_TMP/rootlink"; rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+PYCACHE_REAP_ROOTS="$PYC_TMP/rootlink" _reap_pycache
+if [ -e "$PYC_ROOT/crew/x/tests/__pycache__/guard.cpython-311.pyc" ] && pyc_log | grep -q "SPARED (a symlinked root is never descended)"; then
+  ok "_reap_pycache: a symlinked root is SPARED"
+else
+  bad "_reap_pycache: a symlinked root was descended or not logged"
+fi
+
+# 6. A part of the tree that cannot be read: the rest is still reaped, the log says the figures are a floor.
+pyc_build_fixture; pyc_old "$PYC_ROOT/crew/locked/__pycache__/l.pyc"; chmod 000 "$PYC_ROOT/crew/locked"
+rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+_reap_pycache
+chmod 755 "$PYC_ROOT/crew/locked"
+pyc_check_set "_reap_pycache (unreadable subdir)"
+[ -e "$PYC_ROOT/crew/locked/__pycache__/l.pyc" ] && ok "_reap_pycache: the file in the unreadable dir is left (it could not be seen)" || bad "_reap_pycache: the file in the unreadable dir vanished?"
+pyc_log | grep -q "find exited rc=.*while measuring" && ok "_reap_pycache: a find that could not read everything is said so on the log (figures are a floor)" || bad "_reap_pycache: no mention of the partial scan on the log"
+pyc_log | grep -q "DELETED 4 file(s), freed≈3MB (find exited rc=" && ! pyc_log | grep -q "DELETE PARTIAL" && pyc_log | grep -q "pycache-reap OK" && ok "_reap_pycache: find's rc≠0 from an unreadable dir is NOT reported as a failed delete - a re-measure shows nothing left, so 4 file(s)/≈3MB DELETED and the run is OK" || bad "_reap_pycache: an unreadable subdir turned a complete reap into a failure: $(pyc_log | grep 'pycache-reap' | tr '\n' '|')"
+
+# 7. A scan result that cannot be read, or that timed out, deletes NOTHING in that root.
+pyc_build_fixture
+_pycache_measure_root() { echo "banana"; }
+rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+_reap_pycache
+pyc_restore_fns
+n=0; for f in "${PYC_GONE[@]}"; do [ -e "$f" ] && n=$((n+1)); done
+[ "$n" = "4" ] && pyc_log | grep -q "SPARED (the scan result is unreadable: 'banana'); nothing deleted there" && ok "_reap_pycache: an unreadable scan result → the root is SPARED, nothing deleted (failed ≠ empty)" || bad "_reap_pycache: unreadable scan result did not leave the root untouched (still present: $n of 4)"
+_pycache_measure_root() { echo "5 100 124"; }
+rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+_reap_pycache
+pyc_restore_fns
+n=0; for f in "${PYC_GONE[@]}"; do [ -e "$f" ] && n=$((n+1)); done
+[ "$n" = "4" ] && pyc_log | grep -q "TIMED OUT while measuring" && ok "_reap_pycache: a measuring pass that timed out (rc 124) deletes nothing" || bad "_reap_pycache: a timed-out measure still deleted (still present: $n of 4)"
+
+# 8. A delete that fails (nothing removed) is PARTIAL, and the freed figure comes from a re-measure, not from hope.
+_pycache_delete_root() { return 1; }
+rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+_reap_pycache
+pyc_restore_fns
+if pyc_log | grep -q "DELETE PARTIAL" && pyc_log | grep -q "4 of 4 file(s)" && pyc_log | grep -q "freed≈0MB" && ! pyc_log | grep -q "pycache-reap OK"; then
+  ok "_reap_pycache: a delete that removed nothing is PARTIAL (4 of 4 still there), claims ≈0MB, and the run is not reported OK"
+else
+  bad "_reap_pycache: a failing delete was reported as success: $(pyc_log | grep 'pycache-reap' | tr '\n' '|')"
+fi
+
+# 9. Nothing to take, and a missing root.
+mkdir -p "$PYC_TMP/empty"; rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+PYCACHE_REAP_ROOTS="$PYC_TMP/empty:$PYC_TMP/not-there" _reap_pycache
+pyc_log | grep -q "pycache-reap: $PYC_TMP/empty — nothing older than 30min to delete" && pyc_log | grep -q "not-there — not a directory, skipped" && ok "_reap_pycache: an empty root says so, a missing root is skipped, neither is an error" || bad "_reap_pycache: empty/missing root handling is wrong: $(pyc_log | grep 'pycache-reap' | tr '\n' '|')"
+
+# 10. The time budget: the root after the budget is used up waits for the next run.
+mkdir -p "$PYC_TMP/r1" "$PYC_TMP/r2"
+_pycache_measure_root() { sleep 2; echo "0 0 0"; }
+rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+PYCACHE_REAP_ROOTS="$PYC_TMP/r1:$PYC_TMP/r2" PYCACHE_REAP_TIMEOUT_SECS=1 _reap_pycache
+pyc_restore_fns
+pyc_log | grep -q "time budget (1s) used up before $PYC_TMP/r2" && ok "_reap_pycache: the time budget stops the walk and names the root left for the next run" || bad "_reap_pycache: budget exhaustion is not reported: $(pyc_log | grep 'pycache-reap' | tr '\n' '|')"
+
+# 11. Root discovery: rigs are the ~/gt/<dir> that have a .beads; the worktree dirs come with them.
+mkdir -p "$PYC_TMP/town/rigA/.beads" "$PYC_TMP/town/notrig" "$PYC_TMP/town/city"
+CITY="$PYC_TMP/town/city"; PYCACHE_REAP_ROOTS=""
+roots="$(_pycache_reap_roots)"
+CITY="$PYC_SAVE_CITY"; PYCACHE_REAP_ROOTS="$PYC_ROOT"
+if printf '%s\n' "$roots" | grep -qx "$PYC_TMP/town/rigA" && ! printf '%s\n' "$roots" | grep -qx "$PYC_TMP/town/notrig" \
+   && printf '%s\n' "$roots" | grep -qx "$PYC_TMP/town/city/.gc-worktrees" && printf '%s\n' "$roots" | grep -qx "$PYC_TMP/town/.gc-worktrees" \
+   && ! printf '%s\n' "$roots" | grep -qx "$PYC_TMP/town"; then
+  ok "_pycache_reap_roots: rig dirs (with .beads) + the city/town worktree dirs; a non-rig dir and the town root itself are NOT roots"
+else
+  bad "_pycache_reap_roots: wrong root list: $(printf '%s' "$roots" | tr '\n' '|')"
+fi
+
+PYCACHE_REAP_ROOTS=""; STATE_PYCACHE_REAP_FILE="$STATE_DIR/.dolt-disk-floor-guard.pycache-reap-last"
+chmod -R u+rwx "$PYC_TMP" 2>/dev/null; rm -rf "$PYC_TMP"
+
+echo ""
 echo "=== _code_sign_clone_root / _code_sign_clone_dir_in_use / _should_reap_code_sign_clone_dir (ga-nkqook) ==="
 # ── hermetic lsof shim for the code_sign_clone checks below (ga-mv896u) ────
 # `_code_sign_clone_dir_in_use` and `_reap_code_sign_clone_orphans` run
@@ -3176,6 +3359,13 @@ REAP_BACKUP_STAGING_CALLS=0
 REAP_BACKUP_STAGING_LAST_ARG=""
 _reap_bloated_backup_staging() { REAP_BACKUP_STAGING_CALLS=$((REAP_BACKUP_STAGING_CALLS+1)); REAP_BACKUP_STAGING_LAST_ARG="${1:-}"; }
 
+# _reap_pycache is new (ga-0z7kdz), same reasoning as the other reap stubs: EXECUTION code (a real find walk
+# + stat + rm over the rigs' checkouts, proven in isolation with a hermetic fixture earlier in this file)
+# stubbed as a no-op here so main()'s WIRING is what gets proven - and so a main() scenario can never walk,
+# let alone delete in, this host's real rigs. No arg: the cooldown and the age live inside the function.
+REAP_PYCACHE_CALLS=0
+_reap_pycache() { REAP_PYCACHE_CALLS=$((REAP_PYCACHE_CALLS+1)); }
+
 # _nudge_pool_heavy_stop is new (ga-vln2py), same reasoning as the reap stubs above: EXECUTION code (a real
 # `gc session list` + `gc session nudge` per pool session, proven in isolation by
 # dolt-disk-floor-guard.pool-nudge.selftest.sh with a fake gc) stubbed here so main()'s WIRING is what gets proven.
@@ -3229,7 +3419,7 @@ record_gc() {
 # shellcheck disable=SC2034  # read by main() in the sourced script
 GC=record_gc
 
-reset_capture() { NUDGE_CALLS=0; NUDGE_LAST_AVAIL=""; NUDGE_LAST_NOW=""; NUDGE_AT_CALL=""; NUDGE_RC=0; NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_ORPHAN_TEST_DOLT_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; GROWTH_PHOTO_CALLS=0; GROWTH_PHOTO_LAST_CLASS=""; GROWTH_PHOTO_LAST_AVAIL=""; GROWTH_PHOTO_REAP_AT_CALL=""; GROWTH_BASELINE_CALLS=0; rm -f "$(_growth_episode_file)";
+reset_capture() { NUDGE_CALLS=0; NUDGE_LAST_AVAIL=""; NUDGE_LAST_NOW=""; NUDGE_AT_CALL=""; NUDGE_RC=0; NOTIFY_CALLS=0; NOTIFY_LAST_PRIO=""; NOTIFY_LAST_MSG=""; NOTIFY_LAST_FORCE_PUSH=""; GC_MAIL_CALLS=0; GC_MAIL_LAST_BODY=""; REAP_CALLS=0; REAP_LAST_ARG=""; REAP_TRANSCRIPT_CALLS=0; REAP_LOGS_CALLS=0; REAP_HF_CALLS=0; REAP_HF_LAST_ARG=""; REAP_GOCACHE_CALLS=0; REAP_GOCACHE_LAST_ARG=""; REAP_GO_BUILD_CALLS=0; REAP_CODE_SIGN_CLONE_CALLS=0; REAP_BASH_EDIT_DIFF_CALLS=0; REAP_ORPHAN_TEST_DOLT_CALLS=0; REAP_BACKUP_RESIDUE_CALLS=0; REAP_BACKUP_STAGING_CALLS=0; REAP_BACKUP_STAGING_LAST_ARG=""; REAP_PYCACHE_CALLS=0; RESURRECT_CALLS=0; RESURRECT_LAST_AVAIL=""; RESURRECT_LAST_CLASS=""; RESURRECT_PROBE_RC=0; GROWTH_PHOTO_CALLS=0; GROWTH_PHOTO_LAST_CLASS=""; GROWTH_PHOTO_LAST_AVAIL=""; GROWTH_PHOTO_REAP_AT_CALL=""; GROWTH_BASELINE_CALLS=0; rm -f "$(_growth_episode_file)";
   # ga-4f4opx: clear the mail-debounce/recovery state too, so every scenario
   # starts with a clean slate by default (no leftover "already mailed this
   # avail" or "episode already mailed" from whichever scenario ran before
@@ -3604,10 +3794,10 @@ echo "=== main(): scratchpad + transcript reap integration (ga-02pnu, ga-t1ub9) 
 reset_capture; seed_state "" ""
 queue_avail 2 20
 main
-if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ] && [ "$REAP_BASH_EDIT_DIFF_CALLS" = "1" ] && [ "$REAP_ORPHAN_TEST_DOLT_CALLS" = "1" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "1" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "1" ]; then
-  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, _reap_code_sign_clone_orphans, _reap_bash_edit_diff_orphans, _reap_orphan_test_dolt_processes, _reap_backup_residue, AND _reap_bloated_backup_staging each invoked exactly once alongside _safe_reclaim"
+if [ "$REAP_CALLS" = "1" ] && [ "$REAP_TRANSCRIPT_CALLS" = "1" ] && [ "$REAP_LOGS_CALLS" = "1" ] && [ "$REAP_HF_CALLS" = "1" ] && [ "$REAP_GOCACHE_CALLS" = "1" ] && [ "$REAP_GO_BUILD_CALLS" = "1" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "1" ] && [ "$REAP_BASH_EDIT_DIFF_CALLS" = "1" ] && [ "$REAP_ORPHAN_TEST_DOLT_CALLS" = "1" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "1" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "1" ] && [ "$REAP_PYCACHE_CALLS" = "1" ]; then
+  ok "main(): _reap_dead_scratch, _reap_dead_transcripts, _reap_growing_logs, _reap_hf_cache, _reap_gocache, _reap_go_build_orphans, _reap_code_sign_clone_orphans, _reap_bash_edit_diff_orphans, _reap_orphan_test_dolt_processes, _reap_backup_residue, _reap_pycache, AND _reap_bloated_backup_staging each invoked exactly once alongside _safe_reclaim"
 else
-  bad "main(): expected all eleven reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BASH_EDIT_DIFF_CALLS=$REAP_BASH_EDIT_DIFF_CALLS REAP_ORPHAN_TEST_DOLT_CALLS=$REAP_ORPHAN_TEST_DOLT_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
+  bad "main(): expected all twelve reap levers called once, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_LOGS_CALLS=$REAP_LOGS_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BASH_EDIT_DIFF_CALLS=$REAP_BASH_EDIT_DIFF_CALLS REAP_ORPHAN_TEST_DOLT_CALLS=$REAP_ORPHAN_TEST_DOLT_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS REAP_PYCACHE_CALLS=$REAP_PYCACHE_CALLS"
 fi
 if [ "$REAP_LAST_ARG" = "1" ]; then
   ok "main(): CRITICAL cycle (even after reclaim recovers it to NONE) passes was_critical=1 to _reap_dead_scratch (ga-rjhfz pressure plumbing)"
@@ -3667,8 +3857,8 @@ VM_LOG_PRE_COUNT=$(grep -c "vm_swap_gb=" "$LOG" 2>/dev/null || echo 0)
 reset_capture; seed_state "" ""
 queue_avail 20
 main
-if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ] && [ "$REAP_BASH_EDIT_DIFF_CALLS" = "0" ] && [ "$REAP_ORPHAN_TEST_DOLT_CALLS" = "0" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "0" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "0" ]; then
-  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/bash-edit-diff/orphan-test-dolt/backup-residue/backup-staging reapers"
+if [ "$REAP_CALLS" = "0" ] && [ "$REAP_TRANSCRIPT_CALLS" = "0" ] && [ "$REAP_HF_CALLS" = "0" ] && [ "$REAP_GOCACHE_CALLS" = "0" ] && [ "$REAP_GO_BUILD_CALLS" = "0" ] && [ "$REAP_CODE_SIGN_CLONE_CALLS" = "0" ] && [ "$REAP_BASH_EDIT_DIFF_CALLS" = "0" ] && [ "$REAP_ORPHAN_TEST_DOLT_CALLS" = "0" ] && [ "$REAP_BACKUP_RESIDUE_CALLS" = "0" ] && [ "$REAP_BACKUP_STAGING_CALLS" = "0" ] && [ "$REAP_PYCACHE_CALLS" = "0" ]; then
+  ok "main(): avail above floor on first read never invokes the scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/bash-edit-diff/orphan-test-dolt/backup-residue/backup-staging/pycache reapers"
 else
   bad "main(): expected zero scratch/transcript/hf-cache/gocache/go-build/code-sign-clone/bash-edit-diff/orphan-test-dolt/backup-residue/backup-staging reap calls when floor never breached, got REAP_CALLS=$REAP_CALLS REAP_TRANSCRIPT_CALLS=$REAP_TRANSCRIPT_CALLS REAP_HF_CALLS=$REAP_HF_CALLS REAP_GOCACHE_CALLS=$REAP_GOCACHE_CALLS REAP_GO_BUILD_CALLS=$REAP_GO_BUILD_CALLS REAP_CODE_SIGN_CLONE_CALLS=$REAP_CODE_SIGN_CLONE_CALLS REAP_BASH_EDIT_DIFF_CALLS=$REAP_BASH_EDIT_DIFF_CALLS REAP_ORPHAN_TEST_DOLT_CALLS=$REAP_ORPHAN_TEST_DOLT_CALLS REAP_BACKUP_RESIDUE_CALLS=$REAP_BACKUP_RESIDUE_CALLS REAP_BACKUP_STAGING_CALLS=$REAP_BACKUP_STAGING_CALLS"
 fi
