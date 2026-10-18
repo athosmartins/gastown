@@ -6,13 +6,12 @@
 # Contents
 #   Casos · Variáveis
 #
-# CASOS: config do spool (extra, relativo, prazo fora de 5-3600 → 78) · pasta do spool com modo largo → 78 · sem pump.alive / velho → 75 na hora, nada gravado ·
-#   cadeia inteira (cliente → spool → puxador → ssh falso → agente → wrapper → bd falso → resposta): saída, rc, stderr e stdin passam; recusa do wrapper (77),
-#   identidade fora do padrão, texto com $()/crase/aspas inteiro e nada executado · 6 pedidos em paralelo · pedido torto no spool → o agente responde 78 ·
-#   prazo: pedido que ninguém pegou é RETIRADO e dá 75 (nada rodou); pedido pego e sem resposta dá 125 (pode ter rodado) · stdin > 1 MB → 2 sem gravar · a entrada lida até o EOF (produtor lento, pausa no meio) ou nada (pipe mudo: 75 sem gravar; só `bd --stdin` e os hooks do gc leem) ·
-#   o log do puxador não tem argv · cut() do puxador · puxador: um só (ensure idempotente), status, stop, sai sozinho sem sessão registrada, e não toca
-#   o MBP sem sessão · leituras que FALHAM (resposta corrompida ou ilegível → 125; stdin que não lê → 2; config, registro de sessões, pid, log e lock do
-#   puxador; listdir/open do agente): o estado é o inerte e a falha aparece
+# CASOS: config do spool (extra, relativo, prazo fora de 5-3600 → 78; pasta com modo largo → 78) · sem pump.alive / velho → 75 na hora, nada gravado ·
+#   cadeia inteira (cliente → spool → puxador → ssh falso → agente → wrapper → bd falso): saída, rc, stderr e stdin passam; recusa do wrapper (77), identidade
+#   fora do padrão, texto com $()/crase/aspas inteiro e nada executado · 6 em paralelo · pedido torto → 78 · prazo: não pego → RETIRADO e 75 (nada rodou); pego e
+#   sem resposta → 125 · stdin > 1 MB → 2 sem gravar · entrada lida até o EOF (produtor lento) ou nada (pipe mudo: 75 sem gravar; só `bd --stdin` e os hooks do gc
+#   leem); entrada fechada (<&-) é vazia; saída fechada (>&-) mantém o rc · log do puxador sem argv · puxador: um só, status, stop, sai sozinho sem sessão, não toca
+#   o MBP sem sessão · leituras que FALHAM (resposta corrompida → 125; stdin que não lê → 2; config, registro, pid, log, lock, listdir/open): estado inerte e a falha aparece
 # VARIÁVEIS: SPOOL_ONLY=<grupos separados por vírgula: conf,perm,alive,chain,par,forge,tmo,pump> · FAILFAST=1 (do lib)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -46,9 +45,10 @@ touch "$STATE/mbp/running/remote-test-remote-mbp-1"   # uma sessão registrada: 
 shim() {  # shim TOOL ARG... → RC, $T/out, $T/err (ambiente da sessão no "MBP": identidade e um segredo plantado que NÃO pode ir). Entrada: $STDIN_CMD (um produtor, num pipe) ou $STDIN_FILE ou /dev/null
   local tool=$1; shift
   if [ -n "${STDIN_CMD:-}" ]; then exec 7< <(eval "$STDIN_CMD"); else exec 7< "${STDIN_FILE:-/dev/null}"; fi
+  if [ -n "${OUT_DEAD:-}" ]; then exec 8> >(true); sleep 0.3; else exec 8> "$T/out"; fi   # OUT_DEAD: a saída é um pipe cujo leitor já saiu. STDIN_FD=-: a entrada fechada (<&-)
   env -i HOME="$HOME" USER="$USER" PATH="$T/shimbin:/usr/bin:/bin" REMOTE_SHIM_CONF="${SHIM_CONF:-$SHIMCONF}" GC_ALIAS="${SID_ALIAS:-gastown.dog-1}" GC_AGENT="${SID_ALIAS:-gastown.dog-1}" \
-    GC_SESSION_NAME=dog-gavycydh GC_SESSION_ID=ga-vycydh AWS_SECRET_ACCESS_KEY=SEGREDO-PLANTADO-9 "$T/shimbin/$tool" "$@" > "$T/out" 2> "$T/err" <&7
-  RC=$?; exec 7<&-
+    GC_SESSION_NAME=dog-gavycydh GC_SESSION_ID=ga-vycydh AWS_SECRET_ACCESS_KEY=SEGREDO-PLANTADO-9 "$T/shimbin/$tool" "$@" >&8 2> "$T/err" <&"${STDIN_FD:-7}"
+  RC=$?; exec 7<&- 8>&-
 }
 mkdir -p "$T/shimbin"; python3 -I "$S" install --bin-dir "$T/shimbin" --apply >/dev/null 2>&1
 printf 'texto vindo do stdin' > "$T/stdin.txt"
@@ -79,8 +79,7 @@ beside() {  # beside [VAR=valor…] → RC, $T/out, $T/err: o atalho instalado e
   env -i HOME="$T/nohome" USER="$USER" PATH="$BB:/usr/bin:/bin" GC_ALIAS=gastown.dog-1 GC_AGENT=gastown.dog-1 "$@" "$BB/bd" show ga-1 > "$T/out" 2> "$T/err" < /dev/null; RC=$?
 }
 beside; [ "$RC" = 78 ] && has "$T/err" "$T/nohome/.config/remote-shim/shim.json"; ok $? "sem variável, sem arquivo ao lado e sem ~/.config: 78 dizendo o caminho padrão"
-cp "$T/ok.json" "$BB/remote-shim.json"; b=$(calls); beside; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "remote-shim.json ao lado do script vale sem variável nenhuma (e o HOME não tem config)"
-[ ! -e "$T/nohome/.config" ]; ok $? "o atalho não cria nada no HOME (nenhum ~/.config)"
+cp "$T/ok.json" "$BB/remote-shim.json"; b=$(calls); beside; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ] && [ ! -e "$T/nohome/.config" ]; ok $? "remote-shim.json ao lado do script vale sem variável nenhuma (o HOME não tem config e o atalho não cria nenhum ~/.config)"
 printf '{"transport":"spool","spool_dir":"relativo"}' > "$BB/remote-shim.json"; beside; [ "$RC" = 78 ] && has "$T/err" "$BB/remote-shim.json"; ok $? "arquivo ao lado ruim: 78 dizendo ESSE caminho (não cai no padrão em silêncio)"
 b=$(calls); beside REMOTE_SHIM_CONF="$T/ok.json"; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "REMOTE_SHIM_CONF vale mais que o arquivo ao lado"
 rm -f "$BB/remote-shim.json"; ln -s "$T/ok.json" "$BB/remote-shim.json"; b=$(calls); beside; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "arquivo ao lado que é link: lê o conteúdo do alvo"
@@ -126,24 +125,17 @@ shim bd comment ga-1 $'linha1\n$(touch '"$T"'/PWNED-shell) `touch '"$T"'/PWNED-s
 shim bd comment ga-1 "$(python3 -I -c 'print("ção ✓ ñ " * 40)')"; [ "$RC" = 0 ] && lastis "ção ✓ ñ"; ok $? "UTF-8 inteiro"
 shim bd show ga-1 --json; ! grep -q "SEGREDO-PLANTADO" "$FB/calls.log" "$T/out" "$T/err" "$LOGF"; ok $? "segredo plantado no ambiente da sessão não vai nem para o bd nem para o log do wrapper"
 awk -F'\t' '$2=="?" && $3=="gastown.dog-1" && $4=="ok"' "$LOGF" | grep -q .; ok $? "o log de auditoria do wrapper registrou o pedido (cliente \"?\": não houve ssh de entrada)"
-! grep -qE 'ga-1|SEGREDO|show|eyJ0b29s|[A-Za-z0-9_=-]{40,}' "$STATE/mbp/shim-pump.log"; ok $? "o log do puxador não guarda argv (nem em base64: o pedido vai como PROTO+base64, e eyJ0b29s é o começo do JSON codificado)"
-grep -qE 'id=[0-9]{13}-[0-9]+-[0-9a-f]{8} rc=0 .* put=ok' "$STATE/mbp/shim-pump.log"; ok $? "o log do puxador tem id, rc, tamanhos, duração e o resultado do put"
-[ -z "$(ls "$SPOOL/req" "$SPOOL/claimed" | grep -v '^$' | grep -v ':$')" ]; ok $? "nada sobra em req/ nem claimed/ depois dos pedidos"
-[ -z "$(ls "$SPOOL/resp" | grep -v '^$')" ]; ok $? "o cliente apaga a resposta que leu"
-grep -q "ControlPath" "$SIDE" && grep -q "BatchMode=yes" "$SIDE"; ok $? "o puxador usa o ssh no mesmo molde do provedor (BatchMode, ControlPath)"
-! grep -qE 'IdentityFile|-i ' "$SIDE"; ok $? "nenhuma chave nova: o ssh do puxador não leva -i nem IdentityFile"
-python3 -I - "$S" "$PUMP" <<'PYEOF'; ok $? "o formato do id do cliente é o que o agente aceita"
-import importlib.util, re, sys
+! grep -qE 'ga-1|SEGREDO|show|eyJ0b29s|[A-Za-z0-9_=-]{40,}' "$STATE/mbp/shim-pump.log" && grep -qE 'id=[0-9]{13}-[0-9]+-[0-9a-f]{8} rc=0 .* put=ok' "$STATE/mbp/shim-pump.log"; ok $? "o log do puxador tem id, rc, tamanhos e o resultado do put, e não guarda argv (nem em base64: o pedido vai como PROTO+base64, eyJ0b29s é o começo do JSON codificado)"
+[ -z "$(ls "$SPOOL/req" "$SPOOL/claimed" "$SPOOL/resp" | grep -v '^$' | grep -v ':$')" ]; ok $? "nada sobra em req/, claimed/ nem resp/ depois dos pedidos (o cliente apaga a resposta que leu)"
+grep -q "ControlPath" "$SIDE" && grep -q "BatchMode=yes" "$SIDE" && ! grep -qE 'IdentityFile|-i ' "$SIDE"; ok $? "o puxador usa o ssh no molde do provedor (BatchMode, ControlPath) e sem chave nova (nem -i nem IdentityFile)"
+python3 -I - "$S" "$PUMP" <<'PYEOF'; ok $? "o formato do id do cliente é o que o agente aceita; cut(): resposta acima de 8 MiB é cortada com marca, abaixo disso passa inteira"
+import importlib.util, sys
 def load(n, p):
     s = importlib.util.spec_from_file_location(n, p); m = importlib.util.module_from_spec(s); sys.modules[n] = m; s.loader.exec_module(m); return m
 c = load("rs", sys.argv[1]); p = load("pump", sys.argv[2])
 assert c.SPOOL_ID.pattern == p.SPOOL_ID.pattern, (c.SPOOL_ID.pattern, p.SPOOL_ID.pattern)
-PYEOF
-python3 -I - "$PUMP" <<'PYEOF'; ok $? "cut(): resposta acima de 8 MiB é cortada com marca; abaixo disso passa inteira"
-import importlib.util, sys
-s = importlib.util.spec_from_file_location("pump", sys.argv[1]); m = importlib.util.module_from_spec(s); sys.modules["pump"] = m; s.loader.exec_module(m)
-big = b"x" * (9 << 20); r = m.Pump.cut(big)
-assert len(r) < (8 << 20) + 100 and r.endswith(b"8 MiB ...]\n") and m.Pump.cut(b"abc") == b"abc"
+r = p.Pump.cut(b"x" * (9 << 20))
+assert len(r) < (8 << 20) + 100 and r.endswith(b"8 MiB ...]\n") and p.Pump.cut(b"abc") == b"abc"
 PYEOF
 fi
 
@@ -163,8 +155,7 @@ printf '{"v":1,"id":"%s","cmd":"rs1 x","stdin_b64":""}' "$i3" > "$SPOOL/req/nome
 for _ in $(seq 1 60); do [ -e "$SPOOL/resp/$i1.json" ] && [ -e "$SPOOL/resp/$i2.json" ] && break; sleep 0.25; done
 python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["rc"]==78 and d["id"]==sys.argv[2], d' "$SPOOL/resp/$i1.json" "$i1"; ok $? "JSON ilegível: o agente responde 78 (nada chega ao wrapper)"
 python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["rc"]==78 and d["id"]==sys.argv[2], d' "$SPOOL/resp/$i2.json" "$i2"; ok $? "id de dentro diferente do nome do arquivo: 78"
-sleep 1; [ ! -e "$SPOOL/req/nome-que-nao-e-id.json" ] && [ ! -e "$SPOOL/resp/nome-que-nao-e-id.json" ]; ok $? "arquivo com nome que não é id: apagado, sem resposta"
-[ "$b" = "$(calls)" ]; ok $? "nenhum deles chegou ao bd/gc falso"
+sleep 1; [ ! -e "$SPOOL/req/nome-que-nao-e-id.json" ] && [ ! -e "$SPOOL/resp/nome-que-nao-e-id.json" ] && [ "$b" = "$(calls)" ]; ok $? "arquivo com nome que não é id: apagado, sem resposta; nenhum dos três pedidos tortos chegou ao bd/gc falso"
 fi
 
 if want tmo; then
@@ -201,7 +192,7 @@ sbody() {  # sbody CONF TOOL ARG... → RC, $GOT (a entrada que o pedido levou, 
   rm -f "$SPOOL/req/"* "$SPOOL/resp/"* "$SPOOL/claimed/"* "$T/sb.rc"; alive; GOT=; local f=; ( SHIM_CONF=$1 shim "${@:2}"; echo "$RC" > "$T/sb.rc" ) & local sb=$!
   for _ in $(seq 1 200); do f=$(ls "$SPOOL/req" 2>/dev/null | grep '\.json$' | head -1); { [ -n "$f" ] || [ -e "$T/sb.rc" ]; } && break; sleep 0.1; done
   [ -n "$f" ] && { GOT=$(python3 -I -c 'import base64,json,sys; sys.stdout.write(base64.b64decode(json.load(open(sys.argv[1]))["stdin_b64"]).decode())' "$SPOOL/req/$f")
-    printf '{"id":"%s","rc":0,"stdout_b64":"","stderr_b64":""}' "${f%.json}" > "$SPOOL/resp/$f"; }
+    printf '{"id":"%s","rc":0,"stdout_b64":"%s","stderr_b64":""}' "${f%.json}" "${SB_OUT:-}" > "$SPOOL/resp/$f"; }
   wait $sb; RC=$(cat "$T/sb.rc")
 }
 printf '{"transport":"spool","spool_dir":"%s","timeout_s":5,"stdin_eof_s":2}' "$SPOOL" > "$T/eof2.json"
@@ -223,6 +214,10 @@ STDIN_CMD='sleep 8' sbody "$T/eof2.json" gc prime --hook
 [ "$RC" = 75 ] && has "$T/err" "não terminou" && [ -z "$GOT" ] && [ -z "$(ls "$SPOOL/req" | grep -v '^$')" ]; ok $? "gc prime --hook com pipe aberto e mudo: o mesmo, 75 sem gravar (não vira hook sem entrada)"
 STDIN_CMD='printf "metade"; sleep 8' sbody "$T/eof2.json" bd comment ga-1 --stdin
 [ "$RC" = 75 ] && [ -z "$GOT" ] && [ -z "$(ls "$SPOOL/req" | grep -v '^$')" ]; ok $? "bd comment --stdin que escreve e não fecha: 75, o que veio não é enviado (nada de comentário pela metade)"
+for c in "gc mail check" "bd comment ga-1 --stdin"; do STDIN_FD=- sbody "$SHIMCONF" $c
+  [ "$RC" = 0 ] && [ -z "$GOT" ] && ! has "$T/err" Traceback; ok $? "$c com a entrada fechada (<&-): vazia como /dev/null, o pedido vai e o código é o do mini (0), não um traceback com 1 (\"caixa vazia\")"; done
+OUT_DEAD=1 SB_OUT=eA== sbody "$SHIMCONF" gc mail check
+[ "$RC" = 0 ]; ok $? "resposta com a saída fechada (pipe sem leitor): o código do comando sai intacto (0), nem 1 nem 120"
 fi
 
 if want pump; then

@@ -125,7 +125,7 @@ def read_stdin(wait_s: int, explicit: bool) -> bytes:
         fd = sys.stdin.fileno()
         if os.isatty(fd) and not explicit:  # hook rodado à mão num terminal: não há JSON a esperar
             return b""
-    except (OSError, ValueError):  # entrada fechada: vazia de verdade
+    except (AttributeError, OSError, ValueError):  # entrada fechada (`<&-`: o python deixa sys.stdin = None): vazia de verdade, como /dev/null e como no ssh
         return b""
     chunks, total, t0 = [], 0, time.monotonic()
     while True:
@@ -212,11 +212,13 @@ def spool_request(c: dict, cmd: str, tool: str, argv: list) -> None:
         os.unlink(rsp)
     except OSError:
         pass  # a faxina do puxador leva o que sobrar
-    sys.stdout.buffer.write(out)
-    sys.stdout.buffer.flush()
-    sys.stderr.buffer.write(err)
-    sys.stderr.buffer.flush()
-    sys.exit(rc)
+    for stream, data in ((sys.stdout, out), (sys.stderr, err)):  # a resposta já é conhecida: quem fechou a saída não troca o código do comando (o 0 de `gc mail check`, "tem correio", viraria o 1 de "caixa vazia")
+        try:
+            stream.buffer.write(data)
+            stream.buffer.flush()
+        except (AttributeError, OSError, ValueError):  # saída fechada (`>&-`) ou pipe sem leitor: o que não coube é descartado
+            pass
+    os._exit(rc)  # não sys.exit: o flush final do python sobre o pipe quebrado trocaria o código por 120
 
 
 def request(tool: str) -> None:
