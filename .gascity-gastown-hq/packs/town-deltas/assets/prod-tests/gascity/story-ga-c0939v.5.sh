@@ -34,7 +34,10 @@ row="$(grep -E '^\| hq \| 0 \| [0-9]+/[0-9]+ \|' "$RUNBOOK" | head -1)"
 nums="$(printf '%s' "$row" | sed -E 's/^\| hq \| 0 \| ([0-9]+)\/([0-9]+) \|.*/\1 \2/')"
 [[ "${nums% *}" =~ ^[0-9]+$ && "${nums% *}" == "${nums#* }" ]] || fail "the hq row's issues cell is not restored == expected: '${nums}'"
 grep -q 'Restore provado" vale agora para gastown e whatsapp_automation (17/10) e hq (18/10)' "$RUNBOOK" || fail "runbook does not state that the restore proof now covers hq"
-if grep -q '\*\*hq NÃO está provado' "$RUNBOOK"; then fail "runbook still says hq is NOT proven"; fi
+# três estados: rc 0 = ainda diz "NÃO provado" (FAIL) · rc 1 = não diz (segue) · rc >= 2 = não consegui ler (FAIL, nunca "não diz")
+grep -q '\*\*hq NÃO está provado' "$RUNBOOK"; _g=$?
+[[ "$_g" -ne 0 ]] || fail "runbook still says hq is NOT proven"
+[[ "$_g" -eq 1 ]] || fail "could not read the runbook to check for the stale 'hq NÃO está provado' claim (grep rc $_g)"
 log "runbook has an hq rc 0 row with issues restored == expected (${nums% *}) and states the scope of the claim ✓"
 
 log "PASS"
