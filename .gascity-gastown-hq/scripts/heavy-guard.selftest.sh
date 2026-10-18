@@ -174,12 +174,86 @@ EOF
   [ -s "$W/sleeps" ] && [ "$(sort -n "$W/sleeps" | tail -1)" -le 15 ] || bad "a huge HEAVY_GUARD_POLL_SECS must not lengthen the sleep step (longest: $(sort -n "$W/sleeps" | tail -1))"
 }
 
+# ── lookup cases (ga-g9ptej): the guard run from places that have NO packs/ next to it ───────────────────────
+# HEAVY_GUARD_LIB is never set here (lg unsets it): the lookup itself is what is under test. Each layout is a
+# copy of the guard under test, so a mutant of the guard goes through exactly the same places as the real one.
+LK="$W/lk"; LK_REL=packs/town-deltas/assets/scripts
+mkdir -p "$LK/city/$LK_REL" "$LK/badcity/$LK_REL" "$LK/emptycity"
+cp "$REAL_LIB" "$LK/city/$LK_REL/disk-headroom-lib.sh"
+printf 'disk_free_mb() { printf 20000; }\ndisk_headroom_state() { printf ok; }\n' > "$LK/lib-old.sh"   # from before disk_state_of existed
+cp "$LK/lib-old.sh" "$LK/badcity/$LK_REL/disk-headroom-lib.sh"
+LK_CAN_HIDE=0   # 1 once a chmod 000 file proved unreadable here (as root it stays readable: that case is skipped)
+lookup_cases() { # lookup_cases <guard>
+  local g="$1" rc L f
+  lk_layout() { # lk_layout <dir> <lib-source|->: <dir>/scripts/heavy-guard.sh and, unless "-", the lib at <dir>/packs/...
+    mkdir -p "$1/scripts"; cp -f "$g" "$1/scripts/heavy-guard.sh"
+    [ "$2" = - ] && return 0
+    mkdir -p "$1/$LK_REL"; chmod 644 "$1/$LK_REL/disk-headroom-lib.sh" 2>/dev/null; cp -f "$2" "$1/$LK_REL/disk-headroom-lib.sh"
+  }
+  lg() { env -u HEAVY_GUARD_LIB -u GC_CITY -u GC_CITY_PATH "$@"; }   # a clean slate: each case sets what it needs
+  # (a) the copy the deployment really runs (.gc/scripts/heavy-guard.sh): nothing beside it, the lib only in the city
+  lk_layout "$LK/hq/.gc" -; L="$LK/hq/.gc/scripts/heavy-guard.sh"
+  lg GC_CITY_PATH="$LK/city" DISK_FREE_OVERRIDE_MB=20000 "$L" --check 2>/dev/null; rc=$?
+  check "lookup: the .gc/scripts copy finds the lib through GC_CITY_PATH (ok disk)" 0 "$rc"
+  lg GC_CITY_PATH="$LK/city" DISK_FREE_OVERRIDE_MB=3000 "$L" --check 2>/dev/null; rc=$?
+  check "lookup: the .gc/scripts copy on a low disk is 75, never 76 with the lib present" 75 "$rc"
+  rm -f "$W/ran"
+  lg GC_CITY_PATH="$LK/city" DISK_FREE_OVERRIDE_MB=20000 "$L" --what t -- sh -c 'touch "$1"; exit 7' _ "$W/ran" 2>/dev/null; rc=$?
+  check "lookup: the .gc/scripts copy runs the command and propagates its rc" 7 "$rc"; [ -e "$W/ran" ] || bad "lookup: the command did not run from the .gc/scripts copy"
+  lg GC_CITY="$LK/city" DISK_FREE_OVERRIDE_MB=20000 "$L" --check 2>/dev/null; rc=$?
+  check "lookup: GC_CITY is honoured when GC_CITY_PATH is not set" 0 "$rc"
+  # (b) the lib exists nowhere on the list: fail CLOSED (76), the command never runs, and the refusal says where it looked
+  rm -f "$W/ran"; : > "$HEAVY_GUARD_LOG"
+  lg GC_CITY_PATH="$LK/emptycity" DISK_FREE_OVERRIDE_MB=20000 "$L" -- sh -c 'touch "$1"' _ "$W/ran" 2>"$W/err"; rc=$?
+  check "lookup: no lib anywhere refuses with 76" 76 "$rc"; [ ! -e "$W/ran" ] || bad "lookup: the command RAN with no lib anywhere"
+  grep -q "search order:.*$LK/emptycity/$LK_REL" "$W/err" || bad "lookup: stderr must list the places looked at ($(cat "$W/err"))"
+  grep -q "REFUSED lib_unloadable=.* rc=76 search_order=.*$LK/emptycity/$LK_REL" "$HEAVY_GUARD_LOG" || bad "lookup: the refusal log must list the places looked at ($(cat "$HEAVY_GUARD_LOG"))"
+  lg DISK_FREE_OVERRIDE_MB=20000 "$L" --check 2>/dev/null; rc=$?
+  check "lookup: no GC_CITY_PATH/GC_CITY and nothing beside the script refuses with 76" 76 "$rc"
+  # (c) the script reached through a symlink (relative, absolute, a chain): the lib sits next to the REAL script only
+  lk_layout "$LK/realhq" "$REAL_LIB"; mkdir -p "$LK/linkrel" "$LK/linkabs" "$LK/linkchain"
+  ln -sf ../realhq/scripts/heavy-guard.sh "$LK/linkrel/heavy-guard.sh"
+  ln -sf "$LK/realhq/scripts/heavy-guard.sh" "$LK/linkabs/heavy-guard.sh"
+  ln -sf ../linkrel/heavy-guard.sh "$LK/linkchain/heavy-guard.sh"
+  for L in "$LK/linkrel" "$LK/linkabs" "$LK/linkchain"; do
+    lg GC_CITY_PATH="$LK/emptycity" DISK_FREE_OVERRIDE_MB=20000 "$L/heavy-guard.sh" --check 2>/dev/null; rc=$?
+    check "lookup: a symlinked script finds the lib next to the real script ($(basename "$L"))" 0 "$rc"
+  done
+  # (d) precedence: the lib next to the script beats the city's, with or without a city
+  lk_layout "$LK/nearfirst" "$REAL_LIB"
+  lg GC_CITY_PATH="$LK/badcity" DISK_FREE_OVERRIDE_MB=20000 "$LK/nearfirst/scripts/heavy-guard.sh" --check 2>/dev/null; rc=$?
+  check "lookup: the lib next to the script wins over the city's" 0 "$rc"
+  lg DISK_FREE_OVERRIDE_MB=20000 "$LK/nearfirst/scripts/heavy-guard.sh" --check 2>/dev/null; rc=$?
+  check "lookup: the lib next to the script is enough without any city variable" 0 "$rc"
+  # (e) HEAVY_GUARD_LIB is exactly that file: a missing one is 76 even though the city has a good lib
+  rm -f "$W/ran"
+  lg GC_CITY_PATH="$LK/city" HEAVY_GUARD_LIB=/nonexistent-lib DISK_FREE_OVERRIDE_MB=20000 "$LK/hq/.gc/scripts/heavy-guard.sh" -- sh -c 'touch "$1"' _ "$W/ran" 2>/dev/null; rc=$?
+  check "lookup: HEAVY_GUARD_LIB set to a missing file does not fall through to the city's lib" 76 "$rc"; [ ! -e "$W/ran" ] || bad "lookup: the command RAN although HEAVY_GUARD_LIB was missing"
+  # (f) readable but unable to decide is NOT 'absent': refused, never skipped for the city's good copy
+  rm -f "$W/ran"; lk_layout "$LK/badnear" "$LK/lib-old.sh"
+  lg GC_CITY_PATH="$LK/city" DISK_FREE_OVERRIDE_MB=20000 "$LK/badnear/scripts/heavy-guard.sh" -- sh -c 'touch "$1"' _ "$W/ran" 2>/dev/null; rc=$?
+  check "lookup: a readable lib that cannot decide is refused (76), not skipped" 76 "$rc"; [ ! -e "$W/ran" ] || bad "lookup: the command RAN on a lib that cannot decide"
+  # (g) missing or unreadable IS 'absent': a directory with the lib's name, a chmod 000 file -> the next candidate
+  mkdir -p "$LK/dirnear/scripts" "$LK/dirnear/$LK_REL/disk-headroom-lib.sh"; cp -f "$g" "$LK/dirnear/scripts/heavy-guard.sh"
+  lg GC_CITY_PATH="$LK/city" DISK_FREE_OVERRIDE_MB=20000 "$LK/dirnear/scripts/heavy-guard.sh" --check 2>/dev/null; rc=$?
+  check "lookup: a directory with the lib's name counts as absent, the city's lib is used" 0 "$rc"
+  lk_layout "$LK/hidden" "$REAL_LIB"; f="$LK/hidden/$LK_REL/disk-headroom-lib.sh"; chmod 000 "$f" 2>/dev/null
+  if [ -r "$f" ]; then LK_CAN_HIDE=0; else
+    LK_CAN_HIDE=1
+    lg GC_CITY_PATH="$LK/city" DISK_FREE_OVERRIDE_MB=20000 "$LK/hidden/scripts/heavy-guard.sh" --check 2>/dev/null; rc=$?
+    check "lookup: an unreadable lib counts as absent, the city's lib is used" 0 "$rc"
+  fi
+}
+
 mk_mutant() { # mk_mutant <src> <dst> <sed-expr>  — fails the selftest if the expression changed nothing
-  sed "$3" "$1" > "$2"; cmp -s "$1" "$2" && { bad "mutant '$3' did not change $(basename "$1")"; return 1; }; return 0
+  # sed > file leaves mode 644, and the guard mutants are EXECUTED: without +x every one of them died with rc 126 (permission
+  # denied) whatever it changed, so no mutant proved anything
+  sed "$3" "$1" > "$2"; chmod +x "$2"; cmp -s "$1" "$2" && { bad "mutant '$3' did not change $(basename "$1")"; return 1; }; return 0
 }
 
 before=$FAIL; lib_cases "$REAL_LIB";                      [ "$FAIL" -eq "$before" ] || echo "(lib cases failed on the real lib)"
 before=$FAIL; guard_cases "$REAL_GUARD" "$REAL_LIB";      [ "$FAIL" -eq "$before" ] || echo "(guard cases failed on the real files)"
+before=$FAIL; lookup_cases "$REAL_GUARD";                 [ "$FAIL" -eq "$before" ] || echo "(lookup cases failed on the real guard)"
 
 # mutants: each must make at least one case fail
 survive() { # survive <name> -- the FAIL counter must have grown since $before
@@ -206,6 +280,23 @@ mk_mutant "$REAL_GUARD" "$M/g-nolog.sh" '/hg_log "REFUSED lib_unloadable/d' && {
 mk_mutant "$REAL_GUARD" "$M/g-reread.sh" 's/^\[ -n "\$free" \] || free="?"$/free="$(disk_free_mb 2>\/dev\/null)" || free="?"/' && { before=$FAIL; guard_cases "$M/g-reread.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: the refusal shows a second reading"; }
 mk_mutant "$REAL_GUARD" "$M/g-nonote.sh" '/goes ahead with the disk check bypassed/d' && { before=$FAIL; guard_cases "$M/g-nonote.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: a bypass is silent on stderr"; }
 mk_mutant "$REAL_GUARD" "$M/g-nobylog.sh" '/hg_log "BYPASS/d' && { before=$FAIL; guard_cases "$M/g-nobylog.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: a bypass leaves no log line"; }
+
+# lookup mutants (ga-g9ptej): each one removes or bends one rule of the lib lookup
+lkm() { # lkm <file> <name> <sed-expr>
+  mk_mutant "$REAL_GUARD" "$M/$1.sh" "$3" && { before=$FAIL; lookup_cases "$M/$1.sh" >/dev/null 2>&1; survive "$2"; }
+}
+lkm l-nocity  "lookup: the city candidate is gone"                    's#HG_CANDS+=("\$HG_CITY_ROOT/\$HG_LIB_REL")#:#'
+lkm l-noreal  "lookup: the symlink-resolved candidate is gone"        's#HG_CANDS+=("\$HG_REAL/\.\./\$HG_LIB_REL")#:#'
+lkm l-nofollow "lookup: symlinks are not followed"                    's#while \[ -L "\$p" \]; do#while false; do#'
+lkm l-relink  "lookup: a relative link target is read against the cwd" 's#\*) p="\$(dirname "\$p")/\$t" ;;#*) p="$t" ;;#'
+lkm l-nocityvar "lookup: GC_CITY is ignored"                          's#\${GC_CITY_PATH:-\${GC_CITY:-}}#${GC_CITY_PATH:-}#'
+lkm l-nonear  "lookup: the candidate next to the script is gone"      's#^HG_CANDS=("\$HG_HERE/\.\./\$HG_LIB_REL")$#HG_CANDS=()#'
+lkm l-override "lookup: HEAVY_GUARD_LIB falls through to the search"  's#^if \[ -z "\$HG_LIB" \]; then$#if true; then#'
+lkm l-skipbad "lookup: a lib that cannot decide is skipped"           's#\[ -f "\$hg_c" \] && \[ -r "\$hg_c" \]#[ -f "$hg_c" ] \&\& [ -r "$hg_c" ] \&\& grep -q disk_state_of "$hg_c"#'
+lkm l-nofile  "lookup: a directory is taken for the lib"              's#\[ -f "\$hg_c" \] && ##'
+lkm l-nomsg   "lookup: the refusal does not list the places looked"   's#\${HG_LOOKED:+ (search order: \$HG_LOOKED)}##'
+lkm l-nolog   "lookup: the refusal log does not list the places"      's#\${HG_LOOKED:+ search_order=\$HG_LOOKED}##'
+[ "$LK_CAN_HIDE" = 1 ] && lkm l-noread "lookup: an unreadable lib is taken for the lib" 's# && \[ -r "\$hg_c" \]##'
 
 echo "heavy-guard selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -2,7 +2,7 @@
 # heavy-guard.sh (ga-vln2py, P0) — keep a HEAVY step from starting on the mini while the disk is near the floor.
 #
 # ## Contents
-#   Why · Usage · Exit codes · What counts as heavy · Where it is wired · Not covered
+#   Why · Usage · Exit codes · What counts as heavy · Where it is wired · Lib lookup · Not covered
 #
 # WHY. 17/10 12:40-12:56 three agent steps (a git repack, a selftest copying hq.jsonl, `go build` + golangci-lint of
 # the beads repo) ran with the disk already low and filled it: Dolt took ENOSPC writing its journal and the data
@@ -38,6 +38,18 @@
 # (gate-review-task.lib.sh) tell agents to use it; docs/runbooks/disk-trabalho-pesado.md has the pre-commit snippet
 # for the beads repo (that repo is not ours to edit from here).
 #
+# LIB LOOKUP (ga-g9ptej). The script needs packs/town-deltas/assets/scripts/disk-headroom-lib.sh and is also run from
+# a COPY (.gc/scripts/heavy-guard.sh, re-synced at every boot) that has no packs/ next to it: there the old lookup
+# (only <script dir>/../packs/...) always ended in rc 76 and a WA worker parked thinking it was a deploy fault.
+# Without HEAVY_GUARD_LIB the first READABLE file among these wins:
+#   1. <script dir>/../packs/town-deltas/assets/scripts/disk-headroom-lib.sh
+#   2. the same path relative to the script's directory with symlinks followed (a symlinked heavy-guard.sh)
+#   3. $GC_CITY_PATH (else $GC_CITY)/packs/town-deltas/assets/scripts/disk-headroom-lib.sh
+# A candidate that is missing or cannot be read is "not there": the next one is tried. A file that IS readable but
+# cannot decide (cannot be sourced, or lacks disk_state_of) is NOT skipped: the step is refused, because falling
+# through to another copy would hide a stale or broken lib. Nothing readable anywhere stays rc 76 (fail CLOSED),
+# and the refusal lists every place that was looked at. HEAVY_GUARD_LIB set means exactly that file and no other.
+#
 # NOT COVERED. A session that is ALREADY inside a step when the disk falls is not interrupted. dolt-disk-floor-guard.sh
 # frees caches at CRITICAL; telling the open pool sessions to stop their heavy steps is a separate slice (ga-vln2py.3).
 # Nothing here stops NEW work either (the Pilot sweep: ga-ydaslo; the pool probes: ga-09hfgh).
@@ -49,7 +61,41 @@
 # Seams (selftests): DISK_FREE_OVERRIDE_MB pins the reading; HEAVY_GUARD_POLL_SECS (default 15) is the wait step.
 
 HG_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HG_LIB="${HEAVY_GUARD_LIB:-$HG_HERE/../packs/town-deltas/assets/scripts/disk-headroom-lib.sh}"
+HG_LIB_REL="packs/town-deltas/assets/scripts/disk-headroom-lib.sh"
+
+hg_real_dir() {
+  # the directory this script really lives in, symlinks followed (macOS readlink has no -f we can rely on)
+  local p="${BASH_SOURCE[0]}" t n=0
+  # vazio → not a symlink, p stays as is; falhou/ilegível (readlink fails, empty target, >40 hops) → prints nothing: no such candidate, never a guessed one
+  while [ -L "$p" ]; do
+    n=$((n+1)); [ "$n" -le 40 ] || return 0
+    t="$(readlink "$p" 2>/dev/null)" || return 0
+    [ -n "$t" ] || return 0
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+  done
+  # vazio/falhou (the directory cannot be entered) → prints nothing: no such candidate
+  ( cd -P "$(dirname "$p")" 2>/dev/null && pwd -P )
+}
+
+# candidates, in the order of "LIB LOOKUP" in the header: next to the script, next to the real script, in the city
+HG_CANDS=("$HG_HERE/../$HG_LIB_REL")
+# vazio → the script is not a symlink or its target could not be followed → no second candidate; falhou → the same, the others are still tried
+HG_REAL="$(hg_real_dir)"
+[ -z "$HG_REAL" ] || [ "$HG_REAL" = "$HG_HERE" ] || HG_CANDS+=("$HG_REAL/../$HG_LIB_REL")
+# vazio (neither GC_CITY_PATH nor GC_CITY is set) → no city candidate; falhou cannot happen here (an env read)
+HG_CITY_ROOT="${GC_CITY_PATH:-${GC_CITY:-}}"
+[ -z "$HG_CITY_ROOT" ] || HG_CANDS+=("$HG_CITY_ROOT/$HG_LIB_REL")
+
+HG_LIB="${HEAVY_GUARD_LIB:-}"; HG_LOOKED=""
+if [ -z "$HG_LIB" ]; then
+  # no file readable among the candidates → HG_LIB stays the first one: the name the refusal below gives
+  HG_LIB="${HG_CANDS[0]}"
+  for hg_c in "${HG_CANDS[@]}"; do HG_LOOKED="${HG_LOOKED:+$HG_LOOKED, }$hg_c"; done
+  for hg_c in "${HG_CANDS[@]}"; do
+    # vazio (no such file) → next candidate; falhou/ilegível (exists, cannot be read) → "not there" too: next candidate, and with none left the refusal (76) below
+    if [ -f "$hg_c" ] && [ -r "$hg_c" ]; then HG_LIB="$hg_c"; break; fi
+  done
+fi
 HG_CITY="${GC_CITY_PATH:-${GC_CITY:-$HG_HERE/..}}"
 HG_LOG="${HEAVY_GUARD_LOG:-$HG_CITY/.gc/logs/heavy-guard.log}"
 HG_POLL="${HEAVY_GUARD_POLL_SECS:-15}"
@@ -64,8 +110,8 @@ hg_log() {
 
 # vazio (lib absent/empty) → cannot decide → UNKNOWN (76); falhou/ilegível → the same, never "go ahead"
 if [ ! -r "$HG_LIB" ] || ! . "$HG_LIB" 2>/dev/null || ! type disk_headroom_state disk_state_of disk_free_mb >/dev/null 2>&1; then
-  echo "heavy-guard: cannot load $HG_LIB — no way to read the disk, so the step is refused (rc 76). Deploy fault: tell the Mayor." >&2
-  hg_log "REFUSED lib_unloadable=$HG_LIB rc=76"
+  echo "heavy-guard: cannot load $HG_LIB${HG_LOOKED:+ (search order: $HG_LOOKED)} — no way to read the disk, so the step is refused (rc 76). Deploy fault: tell the Mayor." >&2
+  hg_log "REFUSED lib_unloadable=$HG_LIB rc=76${HG_LOOKED:+ search_order=$HG_LOOKED}"
   exit 76
 fi
 
