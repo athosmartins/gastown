@@ -2986,13 +2986,24 @@ _resurrect_dolt() {
 #     phase and the join are bounded:
 #       * TOTAL BUDGET (POOL_NUDGE_BUDGET_SECS, 60) for list + nudges together; a nudge never gets more than what is
 #         left of it. The targets the budget did not reach are COUNTED in the summary line ("not reached (budget) N") and
-#         warned about, and left unstamped, so they go first next cycle (they are not named one by one on the log).
+#         warned about (they are not named one by one on the log); see ROTATION for who goes first next cycle.
 #       * JOIN CAP (POOL_NUDGE_JOIN_SLACK_SECS, 10) past the budget: a phase still running then is killed and logged.
 #       * PER-NUDGE TIMEOUT (POOL_NUDGE_TIMEOUT_SECS, 15).
+#   - ROTATION (ga-xdj2si, gate attempt 1). The stamp below is "who was told", so a target whose nudge timed out or failed,
+#     and a target the budget did not reach, are both unstamped - and with the session-list order fixed, the same slow head
+#     targets would be tried first EVERY cycle, spend the same budget, and the sessions behind them would never be told.
+#     So each target also has an ATTEMPT marker (one file per target, same name as its stamp, in the sibling directory
+#     "<pool-nudge dir>.attempt"; value = the cycle epoch), written just BEFORE its nudge starts whatever comes back (told /
+#     delivery unknown / failed, even a nudge the join later kills) and NEVER for a target the cooldown skipped or the budget
+#     did not reach. Targets are nudged never-attempted first (list order), then the OLDEST attempt first: the sessions a
+#     cycle did not reach go ahead of the slow ones it tried, and over cycles every active session gets its turn. A marker
+#     that is missing, unreadable or not a number counts as "never attempted" (it goes first - a broken marker never pushes a
+#     target back); a marker that cannot be written is logged and its target keeps its place; a sort that fails is logged
+#     and the targets go out in list order (never "nobody").
 #   - PER-TARGET COOLDOWN (POOL_NUDGE_COOLDOWN_SECS, 900): a CRITICAL episode lasts many 5-min cycles; the same text
 #     every cycle would be noise a session learns to ignore. The stamp is one file PER TARGET, written only when THAT
 #     target's nudge came back rc 0 - so a target that failed, timed out or was not reached keeps no stamp and is
-#     retried next cycle, while the ones already told keep their cooldown.
+#     tried again next cycle (in rotation order), while the ones already told keep their cooldown.
 #   - FOUR OUTCOMES per nudge, never folded together: told (rc 0, stamped) / delivery unknown (the timeout hit - in
 #     --delivery queue mode the text may well have arrived, so it is neither "failed" nor "told"; not stamped, so it is
 #     repeated next cycle: a repeated notice is noise, a muted one is the lever not working) / failed (any other rc) /
@@ -3026,10 +3037,37 @@ _pool_nudge_stamp_file() {
   printf '%s/%s.%s' "$STATE_POOL_NUDGE_DIR" "$safe" "$key"
 }
 
+# _pool_nudge_attempt_file <target> -> path of that target's ATTEMPT marker (ga-xdj2si): the same file name as its cooldown
+# stamp, in a sibling directory (so the stamps stay "who was told" and nothing else). Derived from $STATE_POOL_NUDGE_DIR at
+# CALL time, so whoever redirects that variable (the selftests do) redirects the markers with it.
+_pool_nudge_attempt_file() {
+  local s
+  s="$(_pool_nudge_stamp_file "$1")"
+  printf '%s.attempt/%s' "$STATE_POOL_NUDGE_DIR" "${s##*/}"
+}
+
+# _pool_nudge_order — stdin: the targets, one per line; stdout: the same targets, NEVER-ATTEMPTED first (list order), then
+# the target with the OLDEST attempt marker first. This is the rotation that keeps a slow head from spending the budget
+# every cycle while the sessions behind it are never told (ga-xdj2si, gate attempt 1). Ties keep the list order (the line
+# number is the second sort key, so the result does not depend on the stability of the local `sort`).
+_pool_nudge_order() {
+  local target at n=0 tab
+  tab="$(printf '\t')"
+  while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    n=$((n + 1))
+    # vazio (no marker yet) -> 0 = never attempted, goes first; ilegível (cat fails, or not a number) -> 0 too: a broken
+    # marker must never push its target to the BACK of the line
+    at="$(cat "$(_pool_nudge_attempt_file "$target")" 2>/dev/null)" || at=""
+    case "$at" in ''|*[!0-9]*) at=0 ;; esac
+    printf '%s\t%s\t%s\n' "$at" "$n" "$target"
+  done | sort -t "$tab" -k1,1n -k2,2n | cut -f3-
+}
+
 # _pool_nudge_phase <avail> <now_epoch> <deadline_epoch> — the work, meant to run in a background subshell: it only
-# logs and writes stamps (nothing it sets is visible to main()).
+# logs and writes cooldown stamps and attempt markers (nothing it sets is visible to main()).
 _pool_nudge_phase() {
-  local avail="$1" now="$2" deadline="$3" list targets target msg stamp last remaining t rc
+  local avail="$1" now="$2" deadline="$3" list targets ordered target msg stamp attempt last remaining t rc
   local sent=0 failed=0 unknown=0 cooled=0 unreached=0 total=0
   remaining=$(( deadline - $(date +%s) ))
   t=20; [ "$remaining" -lt "$t" ] && t="$remaining"
@@ -3054,6 +3092,15 @@ _pool_nudge_phase() {
     log "pool nudge: no active session of [${POOL_NUDGE_TEMPLATES}] to tell (ga-vln2py)"
     return 0
   fi
+  # the rotation (ga-xdj2si): never-attempted targets first, then the oldest attempt first. vazio (the order came back empty
+  # although there ARE targets) -> the sort/cut died: logged, and the targets go out in session-list order - never nobody
+  ordered="$(printf '%s\n' "$targets" | _pool_nudge_order)"
+  if [ -n "$ordered" ]; then
+    targets="$ordered"
+  else
+    log "WARN pool nudge: could not order the targets by their last attempt (sort failed) - nudging them in session-list order this cycle; a slow head may keep its place until the next cycle (ga-xdj2si)"
+  fi
+  mkdir -p "${STATE_POOL_NUDGE_DIR}.attempt" 2>/dev/null || true  # a directory that cannot be made shows up as the marker write failing, logged below
   msg="DISK CRITICAL on the mini (${avail} GB free, floor ${FLOOR_CRITICAL_GB} GB): stop any HEAVY step now - go build/test, golangci-lint, git repack/gc, a selftest that builds fixtures or copies a database - and do not start another until the disk recovers. Light work (reading, editing, small commands) is fine. On 17/10 steps like these filled the disk and Dolt took ENOSPC (ga-vln2py). This is an automatic notice from dolt-disk-floor-guard, not a request from the Athos."
   while IFS= read -r target; do
     [ -n "$target" ] || continue
@@ -3072,6 +3119,11 @@ _pool_nudge_phase() {
       continue
     fi
     t="$POOL_NUDGE_TIMEOUT_SECS"; [ "$remaining" -lt "$t" ] && t="$remaining"
+    # the ATTEMPT marker is written BEFORE the nudge starts, whatever comes back (told / delivery unknown / failed - even a
+    # nudge the join later kills): a target that has been tried moves behind the ones that have not. falhou (cannot write) ->
+    # logged; the nudge still goes out, and this target keeps its place in the order until the marker can be written
+    attempt="$(_pool_nudge_attempt_file "$target")"
+    printf '%s' "$now" > "$attempt" 2>/dev/null || log "WARN pool nudge: could not write the attempt marker ${attempt} - ${target} keeps its place in the rotation (a slow session may be tried first again next cycle) (ga-xdj2si)"
     # </dev/null: the loop's own input is the target list - a gc that read stdin would swallow the targets still to come
     timeout -k 2 "$t" "$GC" session nudge "$target" "$msg" >/dev/null 2>&1 </dev/null
     rc=$?
@@ -3090,9 +3142,10 @@ _pool_nudge_phase() {
 $targets
 EOF
   log "pool nudge: told ${sent}, delivery unknown ${unknown}, failed ${failed}, in cooldown ${cooled}, not reached (budget) ${unreached} - of ${total} active pool session(s) to stop heavy steps; avail=${avail}GB (ga-vln2py)"
-  [ "$unreached" -gt 0 ] && log "WARN pool nudge: the ${POOL_NUDGE_BUDGET_SECS}s budget ran out with ${unreached} session(s) not reached - they have no stamp and go first next cycle (ga-xdj2si)"
-  # a stamp older than a day can never matter again (the cooldown is minutes); keep the directory from growing with every alias ever seen
-  find "$STATE_POOL_NUDGE_DIR" -type f -mtime +1 -delete 2>/dev/null || true
+  [ "$unreached" -gt 0 ] && log "WARN pool nudge: the ${POOL_NUDGE_BUDGET_SECS}s budget ran out with ${unreached} session(s) not reached - they carry no attempt marker, so next cycle they are nudged AHEAD of the sessions tried this cycle (never-attempted first, then oldest attempt first) (ga-xdj2si)"
+  # a stamp or marker 48 h old or more (find -mtime +1 = two full days) can never matter again (the cooldown is minutes; an old
+  # marker only means "never attempted", which sorts first anyway); keep the directories from growing with every alias ever seen
+  find "$STATE_POOL_NUDGE_DIR" "${STATE_POOL_NUDGE_DIR}.attempt" -type f -mtime +1 -delete 2>/dev/null || true
   return 0
 }
 

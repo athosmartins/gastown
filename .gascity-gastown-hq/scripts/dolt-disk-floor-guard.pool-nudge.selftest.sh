@@ -9,8 +9,9 @@
 # listed or nudged. The suite runs against the real guard and then against MUTANTS of it (each one reintroduces a bug
 # this lever had or could have: a session that is not active gets nudged; a list that could not be read is taken for
 # "no pool sessions"; a nudge that did not land is stamped as told; a timeout is counted as a failure; the phase blocks
-# its caller; there is no total budget; `gc` can read the target list; the join does not wait) - each must make the
-# suite fail.
+# its caller; there is no total budget; `gc` can read the target list; the join does not wait; the targets keep the
+# session-list order every cycle, so slow heads starve the rest - the blocker of the first gate run; a garbage attempt
+# marker sends its target to the back; a failed ordering tells nobody) - each must make the suite fail.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REAL="$HERE/dolt-disk-floor-guard.sh"
@@ -20,7 +21,7 @@ trap '[ -n "${W:-}" ] && [ -d "$W" ] && rm -rf -- "$W"' EXIT
 PASS=0; FAIL=0
 # every `p` the suite prints on the real guard; the completeness guard below is an equality, so a check that silently
 # stops running (or a new one nobody counted) fails the suite instead of passing unnoticed.
-EXPECTED_CHECKS=25
+EXPECTED_CHECKS=33
 
 cat > "$W/gc" <<'SH'
 #!/bin/sh
@@ -75,7 +76,7 @@ suite() {
     reset() {
       : > "$FW/gc.calls"; : > "$FW/log"
       rm -f "$FW/list-fail" "$FW/nudge-fail" "$FW/nudge-fail-all" "$FW/nudge-sleep" "$FW/nudge-hang" "$FW/gc-reads-stdin" "$FW/last-msg"
-      rm -f "$STATE_POOL_NUDGE_DIR"/* 2>/dev/null
+      rm -f "$STATE_POOL_NUDGE_DIR"/* "${STATE_POOL_NUDGE_DIR}.attempt"/* 2>/dev/null
       cp "$W/list-full.json" "$FW/list.json"
       POOL_NUDGE_ENABLED=1; POOL_NUDGE_BUDGET_SECS=60; POOL_NUDGE_TIMEOUT_SECS=15; POOL_NUDGE_JOIN_SLACK_SECS=10
       POOL_NUDGE_TEMPLATES="gastown.dog wa-worker ps-worker gate-reviewer"
@@ -84,6 +85,14 @@ suite() {
     log_has() { grep -q -- "$1" "$FW/log"; }
     stamp_of() { cat "$(_pool_nudge_stamp_file "$1")" 2>/dev/null; }
     stamps() { ls "$STATE_POOL_NUDGE_DIR" 2>/dev/null | wc -l | tr -d ' '; }
+    # the ATTEMPT marker (ga-xdj2si, gate attempt 1): one file per target, same name as its cooldown stamp, in a sibling
+    # directory - kept apart so `stamps` above still counts only the targets that were TOLD
+    attempt_path() { local s; s="$(_pool_nudge_stamp_file "$1")"; printf '%s.attempt/%s' "$STATE_POOL_NUDGE_DIR" "${s##*/}"; }
+    attempt_of() { cat "$(attempt_path "$1")" 2>/dev/null; }
+    attempts() { ls "${STATE_POOL_NUDGE_DIR}.attempt" 2>/dev/null | wc -l | tr -d ' '; }
+    seed_attempt() { mkdir -p "${STATE_POOL_NUDGE_DIR}.attempt"; printf '%s' "$2" > "$(attempt_path "$1")"; }
+    # the targets in the order their nudge STARTED (the fake gc records each call as it begins)
+    nudge_order() { grep '^session nudge ' "$FW/gc.calls" | awk '{print $3}' | tr '\n' ' '; }
     # the guard under test runs the nudges in the background; the join is what a finished cycle does at its end
     run() { _nudge_pool_heavy_stop "$@"; _pool_nudge_join; }
 
@@ -96,6 +105,8 @@ suite() {
 
     : > "$FW/gc.calls"; run 2 $((NOW + 300))
     [ -z "$(nudged)" ] && log_has "inside the 900s cooldown" && p "inside the cooldown (300 s later): nobody is nudged again, and the log says why" || f "nudged again inside the cooldown: '$(nudged)'"
+    # the ATTEMPT marker counts attempts, not visits: a target the cooldown skipped was not tried, so its place in the rotation must not move
+    [ "$(attempt_of gastown.dog-1)" = "$NOW" ] && [ "$(attempt_of wa-worker-x)" = "$NOW" ] && p "a target skipped by the cooldown keeps its old attempt marker (it was visited, not attempted)" || f "cooldown-skipped targets had their attempt marker moved: dog-1='$(attempt_of gastown.dog-1)' wa-worker-x='$(attempt_of wa-worker-x)' (wanted $NOW)"
     run 2 $((NOW + 900))
     [ "$(nudged)" = "$ALL6" ] && p "cooldown elapsed (900 s): the notice goes out again, to everybody" || f "no full nudge after the cooldown elapsed: '$(nudged)'"
 
@@ -142,6 +153,40 @@ suite() {
       p "a nudge that timed out is 'delivery unknown', not one of the 'failed'; it is not stamped, so it is retried"
     else f "timeout mishandled: log=$(tr '\n' '|' < "$FW/log")"; fi
 
+    # gate attempt 1 of ga-xdj2si (the blocker): the budget cut and the timeout leave NO cooldown stamp, so without a rotation the
+    # same slow head targets are tried first EVERY cycle, spend the same budget, and the targets behind them are never told.
+    # Two heads (dog-1, dog-2) hang past the timeout and eat the whole 4 s budget; the four healthy sessions behind them
+    # were not reached. The NEXT cycle must reach those four first, ahead of the heads.
+    reset; printf 'gastown.dog-1\ngastown.dog-2\n' > "$FW/nudge-hang"; POOL_NUDGE_BUDGET_SECS=4; POOL_NUDGE_TIMEOUT_SECS=2
+    run 2 "$NOW"; c1="$(nudge_order)"
+    : > "$FW/gc.calls"; run 2 $((NOW + 300)); c2="$(nudge_order)"
+    set -- $c2; head4="${1:-} ${2:-} ${3:-} ${4:-}"
+    told4=0; for t in wa-worker-x ps-worker-w gate-reviewer-z ga-f1; do [ "$(stamp_of "$t")" = "$((NOW + 300))" ] && told4=$((told4 + 1)); done
+    if [ "$c1" = "gastown.dog-1 gastown.dog-2 " ] && [ "$head4" = "wa-worker-x ps-worker-w gate-reviewer-z ga-f1" ] && [ "$told4" = "4" ]; then
+      p "rotation: cycle 1 spends the whole budget on the two slow heads; cycle 2 nudges the four it did not reach FIRST and tells all four"
+    else f "starvation: cycle 1 nudged '$c1' (wanted both heads only), cycle 2 started '$c2' (wanted the four unreached first), $told4 of 4 healthy targets told in cycle 2"; fi
+
+    # the rule itself, without any waiting: never-attempted first (list order), then the OLDEST attempt first
+    reset; seed_attempt gastown.dog-1 $((NOW - 100)); seed_attempt gastown.dog-2 $((NOW - 200)); run 2 "$NOW"
+    [ "$(nudge_order)" = "wa-worker-x ps-worker-w gate-reviewer-z ga-f1 gastown.dog-2 gastown.dog-1 " ] && p "order: never-attempted targets first (list order), then the oldest attempt first" || f "wrong order: '$(nudge_order)' (wanted the four never-attempted, then dog-2 (older), then dog-1)"
+
+    # a marker that is not a number, or cannot be read, is "never attempted": goes FIRST - a broken marker must never push a target to the back
+    reset; seed_attempt wa-worker-x 'not-a-number'; seed_attempt gastown.dog-1 $((NOW - 100)); seed_attempt gastown.dog-2 $((NOW - 200)); run 2 "$NOW"
+    [ "$(nudge_order)" = "wa-worker-x ps-worker-w gate-reviewer-z ga-f1 gastown.dog-2 gastown.dog-1 " ] && p "a garbage attempt marker counts as never attempted (goes first), not as a recent attempt" || f "garbage marker misplaced the target: '$(nudge_order)'"
+    reset; seed_attempt wa-worker-x 1; seed_attempt gastown.dog-1 $((NOW - 100)); seed_attempt gastown.dog-2 $((NOW - 200)); chmod 000 "$(attempt_path wa-worker-x)"; run 2 "$NOW"; chmod 600 "$(attempt_path wa-worker-x)" 2>/dev/null
+    if [ "$(nudge_order)" = "wa-worker-x ps-worker-w gate-reviewer-z ga-f1 gastown.dog-2 gastown.dog-1 " ] && log_has "could not write the attempt marker"; then
+      p "an UNREADABLE attempt marker counts as never attempted too, the target is still told, and the marker that cannot be rewritten is logged"
+    else f "unreadable marker mishandled: order='$(nudge_order)' log=$(tr '\n' '|' < "$FW/log")"; fi
+
+    # the sort that orders the targets failing is a third state: logged, and the notice goes out in the session-list order - never "nobody"
+    reset; sort() { return 5; }; run 2 "$NOW"; unset -f sort
+    [ "$(nudge_order)" = "gastown.dog-1 gastown.dog-2 wa-worker-x ps-worker-w gate-reviewer-z ga-f1 " ] && log_has "could not order" && p "a sort that fails is logged and the targets are nudged in list order - ordering failing never means nobody is told" || f "failed ordering mishandled: order='$(nudge_order)' log=$(tr '\n' '|' < "$FW/log")"
+
+    # the marker is written for EVERY attempt, whatever came back: told, delivery unknown (timeout), failed
+    reset; printf 'gastown.dog-2\n' > "$FW/nudge-fail"; printf 'gastown.dog-1\n' > "$FW/nudge-hang"; POOL_NUDGE_TIMEOUT_SECS=1; run 2 "$NOW"
+    marked=0; for t in $ALL6; do [ "$(attempt_of "$t")" = "$NOW" ] && marked=$((marked + 1)); done
+    [ "$marked" = "6" ] && [ "$(attempts)" = "6" ] && p "every attempt leaves its marker with the cycle epoch - the one told, the one that timed out (dog-1) and the one that failed (dog-2) alike" || f "attempt markers wrong: $marked of 6 hold $NOW, $(attempts) files"
+
     # item 4: a gc that reads its stdin must not swallow the rest of the target list
     reset; touch "$FW/gc-reads-stdin"; run 2 "$NOW"
     [ "$(nudged)" = "$ALL6" ] && p "a gc that reads stdin does not eat the remaining targets (gc runs with </dev/null)" || f "stdin-hungry gc swallowed targets: '$(nudged)' (wanted '$ALL6')"
@@ -157,6 +202,8 @@ suite() {
       p "the total budget (3 s) cuts the phase: $calls of 6 nudges started, the rest logged 'not reached' and left unstamped; the join was back after $((t2 - t0)) s"
     else f "budget not honoured (join back after $((t2 - t0)) s, $calls nudges started, stamps=$(stamps), log=$(tr '\n' '|' < "$FW/log"))"; fi
     log_has "pool nudge: told" && p "after the join the phase has finished and said so (no summary line is left pending behind the cycle)" || f "no summary line after the join"
+    # the targets the budget did not reach get NO attempt marker - that is what puts them first next cycle
+    [ "$(attempts)" = "$calls" ] && p "attempt markers == nudges started ($calls): a target the budget did not reach is not marked, so it goes first next cycle" || f "$(attempts) attempt markers for $calls nudges started"
 
     # the join cannot wait forever on a phase that hung: it kills it past budget + slack and says so (the phase is faked as a sleeper)
     reset; POOL_NUDGE_BUDGET_SECS=1; POOL_NUDGE_JOIN_SLACK_SECS=1
@@ -215,6 +262,14 @@ mutant "the join does not wait for the phase" 's/^  while kill -0 "\$pid" 2>\/de
 mutant "the join accepts any pid (0 signals the whole process group)" "s/  case \"\\\$pid\" in ''|\\*\\[!0-9\\]\\*|0|1) return 0 ;; esac/  :/"
 mutant "the kill switch is silent" 's/    log "pool-nudge SKIP/    : "pool-nudge SKIP/'
 mutant "an unreadable cooldown stamp mutes the target" 's/last="\$(cat "\$stamp" 2>\/dev\/null)" || last=""/last="$(cat "$stamp" 2>\/dev\/null)" || last="$now"/'
+# the rotation (ga-xdj2si, gate attempt 1): each of these reintroduces the starvation or a variant of it
+mutant "no rotation: the targets keep the session-list order every cycle" 's#| sort -t "\$tab" -k1,1n -k2,2n | cut -f3-#| cut -f3-#'
+mutant "the rotation is backwards: the NEWEST attempt goes first" 's#-k1,1n -k2,2n#-k1,1nr -k2,2n#'
+mutant_perl "the attempt marker is written only when the nudge landed (the slow ones never move back)" 's#\n    printf \x27%s\x27 "\$now" > "\$attempt" 2>/dev/null \|\| log "WARN pool nudge: could not write the attempt marker[^\n]*##; s#(      sent=\$\(\(sent \+ 1\)\)\n)#$1      printf \x27%s\x27 "\$now" > "\$attempt" 2>/dev/null\n#'
+mutant_perl "a garbage attempt marker is taken for a recent attempt (the target goes to the back)" 's#case "\$at" in \x27\x27\|\*\[!0-9\]\*\) at=0 ;; esac#case "\$at" in \x27\x27) at=0 ;; *[!0-9]*) at=9999999999 ;; esac#'
+mutant_perl "a failed ordering is taken for no targets (nobody is told)" 's#if \[ -n "\$ordered" \]; then\n    targets="\$ordered"\n  else#targets="\$ordered"\n  if false; then\n    :\n  else#'
+mutant "a target skipped by the cooldown gets its attempt marker moved" 's#      cooled=\$((cooled + 1))#      cooled=$((cooled + 1)); mkdir -p "${STATE_POOL_NUDGE_DIR}.attempt"; printf "%s" "$now" > "$(_pool_nudge_attempt_file "$target")"#'
+mutant "a target the budget did not reach gets an attempt marker (so it does NOT go first)" 's#      unreached=\$((unreached + 1))#      unreached=$((unreached + 1)); mkdir -p "${STATE_POOL_NUDGE_DIR}.attempt"; printf "%s" "$now" > "$(_pool_nudge_attempt_file "$target")"#'
 wait
 for r in $MUT_RES; do
   line="$(cat "$r" 2>/dev/null)"; [ -n "$line" ] || line="FAIL:  mutant result missing ($r)"

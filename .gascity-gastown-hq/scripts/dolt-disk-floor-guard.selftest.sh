@@ -2972,6 +2972,8 @@ STATE_CRITICAL_EPISODE_MAILED_FILE="$STATE_TMP/.critical-episode-mailed"
 # ga-xdj2si: same MUST-redirect trap. The per-target cooldown stamps of the pool nudge live in a directory that is
 # evaluated at SOURCE time against the real $STATE_DIR; scenario N5 runs the REAL nudge phase, which writes one stamp
 # per target told - without this line it would mute the real sessions' next stop-heavy-steps notice for 15 minutes.
+# The per-target ATTEMPT markers (the rotation) live in "${STATE_POOL_NUDGE_DIR}.attempt", derived from this variable at
+# call time, so this one line redirects them too.
 STATE_POOL_NUDGE_DIR="$STATE_TMP/.pool-nudge.d"
 
 # Canned avail-GB readings: main() calls _avail_gb exactly twice per cycle
