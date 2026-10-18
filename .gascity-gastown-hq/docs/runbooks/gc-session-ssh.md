@@ -111,6 +111,7 @@ O teto é **por host e contado à parte do teto do mini**: a contagem é `tmux -
 | `gate_cmd` | lista; padrão `<cidade>/scripts/mbp-run.sh --check`, o MESMO veredito do `mbp-offload.sh` (bandeira, pausa, presença, saúde, `slot_cap`) |
 | `presence_lib` | padrão `<remote_home>/gt-remote/bin/mbp-presence.sh` (instalada por `mbp-offload.sh install-mbp`); sem ela o `start` recusa |
 | `watch_s` | intervalo do vigia, 5 s |
+| `shim` | bloco opcional `{"spool_dir", "wrapper_config", "idle_exit_s", "poll_s"}`: depois de um `start` que abriu, o provider sobe o puxador do mini (`remote-shim-pump.py ensure --host H`, idempotente, best-effort: falhar só vai para o log, porque a sessão já abriu; sem o puxador os `bd`/`gc` dela falham na hora com rc 75, sem enviar nada). Sem o bloco nada muda. O `path_extra` desse host leva o `shim-bin` (os `bd`/`gc`/`gate-done` que são o cliente do atalho) **PRIMEIRO**, para o atalho esconder qualquer `bd` real do PATH |
 | `sleeps` | o host pode estar fora do ar sem que isso seja anormal (ver `list-running`) |
 
 **Qual host.** `$GC_SSH_HOST` > o que o nome da sessão pede (`<papel>-remote-<host>-<n>`, ex.: `wa-worker-remote-mbp-1`; é o mesmo `-remote-` do `remote_match` do híbrido) > `default_host`. Nome que pede um host fora da config recusa dizendo qual. Assim o servidor e o MBP convivem sob UM `remote_exec`.

@@ -33,9 +33,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SELFTEST = {"w": HERE / "remote-shim.selftest.sh", "s": HERE / "remote-shim-client.selftest.sh"}  # cada mutante roda no selftest do arquivo que ele altera
-TARGET = {"w": HERE / "remote-shim-wrapper.py", "s": HERE / "remote-shim.py"}
-ENVVAR = {"w": "WRAPPER_UNDER_TEST", "s": "SHIM_UNDER_TEST"}
+SELFTEST = {"w": HERE / "remote-shim.selftest.sh", "s": HERE / "remote-shim-client.selftest.sh",  # cada mutante roda no selftest do arquivo que ele altera
+            "p": HERE / "remote-shim-spool.selftest.sh", "u": HERE / "remote-shim-spool.selftest.sh"}
+TARGET = {"w": HERE / "remote-shim-wrapper.py", "s": HERE / "remote-shim.py", "p": HERE / "remote-shim.py", "u": HERE / "remote-shim-pump.py"}
+ENVVAR = {"w": "WRAPPER_UNDER_TEST", "s": "SHIM_UNDER_TEST", "p": "SHIM_UNDER_TEST", "u": "PUMP_UNDER_TEST"}
+# w = wrapper · s = shim, transporte ssh · p = shim, transporte por puxada (spool) · u = o puxador do mini e o agente que ele carrega ao MBP
 
 MUTANTS = [
     # --- wrapper: a tabela e o parser de argumentos
@@ -83,6 +85,25 @@ MUTANTS = [
     ("agente-encaminhado", "s", 'o("ForwardAgent=no")', 'o("ForwardAgent=yes")', r"ForwardAgent"),
     ("install-sobrescreve", "s", 'if (p.exists() or p.is_symlink()) and not (p.is_symlink() and os.readlink(p) == "remote-shim"):', "if False:", r"não sobrescreve"),
     ("pasta-da-conexao-sem-erro", "s", 'die(f"não consegui criar a pasta da conexão multiplexada ({c[\'control_dir\']}): {e.strerror}", 78)', "pass", r"pasta da conexão"),
+    # --- shim: transporte por puxada (spool) — ga-w7qwl1.1
+    ("spool-chave-extra", "p", 'need(not (set(c) - SPOOL_KEYS) and isinstance(c.get("spool_dir"), str)', 'need(isinstance(c.get("spool_dir"), str)', r"config recusada"),
+    ("spool-prazo-sem-faixa", "p", '5 <= c["timeout_s"] <= 3600', 'c["timeout_s"] > 0', r"config recusada"),
+    ("spool-modo-largo", "p", " and not st.st_mode & 0o077)", ")", r"modo 0755"),
+    ("spool-link-simbolico", "p", "st = os.lstat(sp)\n        need(os.path.isdir(sp) and not os.path.islink(sp) and st.st_uid", "st = os.stat(sp)\n        need(os.path.isdir(sp) and st.st_uid", r"link simbólico"),  # a guarda é lstat+islink JUNTOS: tirar só o islink é mutante EQUIVALENTE (o modo 0777 do link já recusa)
+    ("spool-sem-pump-alive", "p", "if age is None or age > ALIVE_MAX_S:", "if False:", r"sem pump.alive"),
+    ("spool-alive-velho", "p", "if age is None or age > ALIVE_MAX_S:", "if age is None:", r"pump.alive velho"),
+    ("spool-prazo-nao-retira", "p", "                os.unlink(req)  # ainda parado no spool", "                pass  # ainda parado no spool", r"ninguém pegou"),
+    ("spool-pego-vira-75", "p", "pode ter rodado — não repita às cegas\", 125)\n                break", "pode ter rodado — não repita às cegas\", 75)\n                break", r"pedido pego e sem resposta"),
+    ("spool-id-da-resposta", "p", ' and r.get("id") == rid)', ")", r"id de dentro"),
+    ("spool-stdin-sem-teto", "p", "        if total > MAX_STDIN:", "        if False:", r"acima de 1 MB"),
+    # --- o puxador e o agente do MBP (ga-w7qwl1.1)
+    ("agente-spool-largo", "u", "or st.st_mode & 0o077:", "or False:", r"modo largo"),
+    ("agente-nome-sem-id", "u", "            if not ID.fullmatch(rid):\n                try: os.unlink", "            if False:\n                try: os.unlink", r"nome que não é id"),
+    ("agente-id-de-dentro", "u", 'isinstance(d, dict) and d.get("id") == rid and', "isinstance(d, dict) and", r"id de dentro diferente"),
+    ("agente-put-sem-pego", "u", ' or not os.path.exists(sp + "/claimed/" + rid + ".json"): continue', ": continue", r"put de um id que NINGUÉM pegou"),
+    ("puxador-nunca-ocioso", "u", "if time.time() - idle_since > cfg.idle_s:", "if False:", r"sai sozinho"),
+    ("puxador-sem-corte", "u", "return b if len(b) <= MAX_OUT else b[:MAX_OUT] +", "return b if True else b[:MAX_OUT] +", r"cut\(\)"),
+    ("puxador-argv-no-log", "u", 'self.cfg.log(f"id={rid} rc={rc} out=', 'self.cfg.log(f"cmd={cmd[:80]} id={rid} rc={rc} out=', r"não guarda argv"),  # `cmd` = PROTO + o argv em base64: o vazamento é em base64, não em texto puro (o caso tem que ver isso)
     ("known-hosts-opcional", "s", 'need(os.path.isfile(c["identity_file"]) and os.path.isfile(c["known_hosts_file"]))', "need(True)", r"config do shim ruim|known_hosts_file ausente"),
 ]
 
@@ -98,6 +119,13 @@ def run_one(m, tmp: Path, timeout: int):
     mutant.write_text(src.replace(old, new, 1))
     mutant.chmod(0o755)
     env = {**os.environ, "FAILFAST": "1", ENVVAR[which]: str(mutant), "TMPDIR": str(d)}
+    if which in ("p", "u"):  # o puxador procura o wrapper AO LADO de si (HERE) e o selftest conta puxadores pelo caminho: cada mutante leva o seu puxador e um link para o wrapper de verdade
+        pump = mutant if which == "u" else d / "remote-shim-pump.py"
+        if which == "p":
+            pump.write_text((HERE / "remote-shim-pump.py").read_text())
+            pump.chmod(0o755)
+        (d / "remote-shim-wrapper.py").symlink_to(HERE / "remote-shim-wrapper.py")
+        env["PUMP_UNDER_TEST"] = str(pump)
     p = subprocess.Popen(["bash", str(SELFTEST[which])], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
         out, _ = p.communicate(timeout=timeout)
