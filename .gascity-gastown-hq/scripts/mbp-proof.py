@@ -597,7 +597,6 @@ class Proof:
             return
         raise Aborted(f"antes de {stage}: {why}")
 
-    # ---- pré-condições
     def preconditions(self) -> bool:
         ok, why = self.free()
         self.say(f"gate do MBP (a regra do Athos, a mesma do start): {'livre' if ok else 'NÃO livre'} — {why}")
@@ -662,7 +661,6 @@ class Proof:
             time.sleep(min(3, POLL))
         return self.check("atalho bd do MBP chega ao mini (cliente → spool → puxador → wrapper), com a identidade da sessão de teste", '"id"' in o, o[:100].replace("\n", " ") or "sem saída")
 
-    # ---- a sessão
     def prepare(self) -> bool:
         urls = [self.a.repo_url] if self.a.repo_url else self.default_urls()
         r = self.rpy(PREPARE, {"home": MHOME, "run": self.run, "workdir": self.wd, "session": SESSION, "urls": urls, "path_extra": PATHX}, timeout=480)
@@ -789,12 +787,12 @@ class Proof:
             self.check("(b) li a árvore de processos da sessão antes da pausa", False, str(t0.get("_erro") or t0)[:200])
             return
         self.say("(b) árvore ANTES da pausa (pid ppid nice pri processo): " + " | ".join(f"{r['pid']} {r['ppid']} {r['ni']} {r['pri']} {r['comm'][:40]}" for r in rows0))
-        if not self.check("(b) o vigia (biblioteca de presença de verdade) está de pé na árvore da sessão", bool(t0["watcher"]), "sem processo com PRESENCE_LIB_ONLY sob o painel"):
+        if not self.check("(b) o vigia (biblioteca de presença de verdade) está de pé na árvore da sessão", bool(t0["watcher"]), "" if t0["watcher"] else "sem processo com PRESENCE_LIB_ONLY sob o painel"):
             return
         mark = f"origem=mbp-proof:{self.run}"
         p = self.rpy(PAUSE_PY, {"pause": PAUSE, "mark": mark, "mode": "on"})
-        self.paused_by_us = bool(p.get("ok"))
-        if not self.check("(b) pausa do Athos ligada (o arquivo gt-remote/PAUSE, com a marca desta rodada)", self.paused_by_us, str(p.get("why") or p.get("first") or p.get("_erro"))[:160]):
+        self.paused_by_us = "_erro" in p or bool(p.get("ok"))  # resposta perdida: a pausa pode ter sido criada; o "off" só tira arquivo com a marca desta rodada
+        if not self.check("(b) pausa do Athos ligada (o arquivo gt-remote/PAUSE, com a marca desta rodada)", bool(p.get("ok")), str(p.get("why") or p.get("first") or p.get("_erro"))[:160]):
             return
         g = self.prov("gate", HOST, timeout=90)
         self.check("(b) com a pausa ligada o gate do provider recusa sessão nova", g.returncode == 1 and "paus" in self.out(g).lower(), self.out(g)[:160])
@@ -820,7 +818,6 @@ class Proof:
         ok2, _, why2 = judge_tree(rows0, t2.get("rows") or [], t0["watcher"])
         self.check("(b) sem a pausa o rebaixamento NÃO volta a subir (continua >= 19)", ok2, why2)
 
-    # ---- fim
     def finish(self, aborted: str = "") -> None:
         if self.paused_by_us:
             off = self.rpy(PAUSE_PY, {"pause": PAUSE, "mark": f"origem=mbp-proof:{self.run}", "mode": "off"})
@@ -829,10 +826,9 @@ class Proof:
         if self.started:
             try:
                 p = self.prov("stop", SESSION)
-                lst = self.out(self.prov("list-running", "remote-test"))
-                self.check("(a) sessão parada pelo provider e fora da lista", p.returncode == 0 and SESSION not in lst.split(), self.out(p)[:200] or lst[:120])
+                self.check("(a) sessão parada pelo provider (o que ficou no MBP é conferido logo abaixo, direto por ssh)", p.returncode == 0, self.out(p)[:200])
             except (OSError, subprocess.SubprocessError) as e:
-                self.check("(a) sessão parada pelo provider e fora da lista", False, f"não consegui parar/conferir: {type(e).__name__}: {e}")
+                self.check("(a) sessão parada pelo provider (o que ficou no MBP é conferido logo abaixo, direto por ssh)", False, f"não consegui parar: {type(e).__name__}: {e}")
             s = self.snap(self.wd)
             if "_erro" in s:
                 self.check("(a) li o estado do MBP depois do stop", False, s["_erro"])

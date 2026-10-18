@@ -63,6 +63,7 @@ shift
 cmd=$1
 if [ -n "${FAKE_UPLOAD_FAIL:-}" ]; then case $cmd in *"cat > "*"remote-bundle-build.py"*) cat > /dev/null; echo "cat: cannot write: Read-only file system" >&2; exit 1;; esac; fi
 if [ "${FAKE_MODE:-}" = snapfail ]; then case $cmd in *proofs_new*) touch "$FAKE_STATE/cleaned";; *'"plib"'*) [ ! -e "$FAKE_STATE/cleaned" ] || { cat > /dev/null; echo "snap: boom" >&2; exit 1; };; esac; fi  # a leitura DEPOIS da limpeza falha
+[ "${FAKE_MODE:-}" != lostpause ] || case $cmd in *'"mode": "on"'*) HOME="$SRV" TMUX_TMPDIR="$SRV/tmp" ON_MBP=1 PATH="$SRV/fakebin:/usr/bin:/bin" sh -c "$cmd" > /dev/null; echo "client_loop: send disconnect: Broken pipe" >&2; exit 255;; esac  # a pausa É criada no MBP, mas a resposta se perde
 HOME="$SRV" TMUX_TMPDIR="$SRV/tmp" ON_MBP=1 PATH="$SRV/fakebin:/usr/bin:/bin" sh -c "$cmd"; rc=$?
 if [ -n "${FAKE_TAMPER:-}" ]; then case $cmd in *"; tar -C "*" -xf -") d=${cmd##*tar -C }; d=${d% -xf -}; echo adulterado > "$d/injetado.txt";; esac; fi
 exit $rc
@@ -445,7 +446,7 @@ g_e2e() {
     python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "mbp-proof mbp-" in d["prompt_suffix"] and d["env"]["GC_SESSION_NAME"]=="remote-test-remote-mbp-1", d' "$FAKE_STATE/startreq"; ok $? "e2e: o provider recebeu o pedido com a identidade da sessão de teste e o prompt de partida"
     python3 -I -c 'import json,sys; assert json.load(open(sys.argv[1]+"/.claude.json"))==json.load(open(sys.argv[2]+"/.claude.json"))' "$SRV" "$GOLD"; ok $? "e2e: ~/.claude.json do MBP voltou ao que era (a marca de confiança da pasta de teste saiu)"
     [ ! -e "$SRV/gt-remote/PAUSE" ] && [ ! -e "$SRV/gt-remote/proof" ] && [ ! -e "$SRV/gt-remote/bundle/run" ] && [ ! -e "$SRV/tmp/tmux-$(id -u)/gc-remote" ]; ok $? "e2e: sem PAUSE, sem gt-remote/proof, sem bundle/run e sem socket do tmux depois"
-    [ "$(cd "$SRV" && find . -type f -not -path './.claude/projects/*' | sort | cksum)" = "$(cd "$GOLD" && find . -type f | sort | cksum)" ]; ok $? "e2e: a lista de arquivos do MBP é a da instalação (a transcrição do claude é a única novidade)"
+    [ "$(cd "$SRV" && find . -type f -not -path './.claude/projects/*' -not -path './Library/Caches/*' | sort | cksum)" = "$(cd "$GOLD" && find . -type f -not -path './Library/Caches/*' | sort | cksum)" ]; ok $? "e2e: a lista de arquivos do MBP é a da instalação (a transcrição do claude é a única novidade; o cache de bytecode do python no macOS não conta)"
     [ "$(dsig "$SRV/.ssh")" = "$(dsig "$GOLD/.ssh")" ] && [ "$(dsig "$SRV/gt-remote/bundle" "$SRV/gt-remote/shim-bin")" = "$(dsig "$GOLD/gt-remote/bundle" "$GOLD/gt-remote/shim-bin")" ]; ok $? "e2e: ~/.ssh, o bundle e o atalho ficaram byte a byte iguais"
     ! grep -rq "LEAD-DATA-9981" "$SRV"; ok $? "e2e: o dado de lead do origin NÃO existe em lugar nenhum do MBP"
   }
@@ -495,6 +496,7 @@ g_e2e() {
     python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "esconderia o atalho"; ok $? "e2e: um bd REAL em ~/.local/bin esconderia o atalho nos hooks → não começa, saída 3 (rc=$RC)"; }
   c nopresence && { e2e_fixture; find "$SRV/gt-remote/bin/mbp-presence.sh" -delete; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sem a biblioteca de presença"; ok $? "e2e: sem a biblioteca de presença no MBP → não começa (rc=$RC)"; }
   c swappause && { FAKE_MODE=swappause ep; [ $RC = 1 ] && has "$T/out" "a pausa NÃO é desta rodada" && [ "$(cat "$SRV/gt-remote/PAUSE")" = "origem=athos desde=2026-10-18T10:00:00" ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: o Athos troca a pausa por uma dele depois da da prova → a prova NÃO a remove (nem no fim), reprova (b) e a pausa DELE fica como estava (rc=$RC)"; }
+  c lostpause && { FAKE_MODE=lostpause ep; [ $RC = 1 ] && has "$T/out" "FAIL (b) pausa do Athos ligada" && [ ! -e "$SRV/gt-remote/PAUSE" ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: a resposta do \"ligar a pausa\" se perde DEPOIS de o arquivo ser criado → reprova (b), mas tenta o \"desligar\": nenhuma pausa da prova fica no MBP (rc=$RC)"; }
   c badjson && { e2e_fixture; echo "isto nao e json" > "$SRV/.claude.json"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "nunca rodou aqui" && [ "$(cat "$SRV/.claude.json")" = "isto nao e json" ]; ok $? "e2e: ~/.claude.json ilegível → não começa e não o reescreve (rc=$RC)"; }
   c gitblobs && { FAKE_GITFAIL=cat-file FAKE_MODE=ok ep; [ $RC = 1 ] && has "$T/out" "FAIL clone sem dado" && has "$T/out" "FAIL (d) clone continua sem dado"; ok $? "e2e: git cat-file que falha (no clone e depois do commit) → NÃO é \"0 blobs\": as duas provas de \"clone sem dado\" reprovam (rc=$RC)"; }
   c githead && { FAKE_GITFAIL="rev-parse HEAD" FAKE_MODE=ok ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "o MBP não preparou a pasta de teste"; ok $? "e2e: git rev-parse HEAD que falha → sem o commit de partida a prova não começa (rc=$RC)"; }
@@ -579,6 +581,7 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e dialog "o diálogo é ignorado" '            if any(d in seen for d in DIALOGS):' '            if False:'
   mutant e2e ok "a sessão não é parada no fim" $'        if self.started:\n            try:' $'        if False:\n            try:'
   mutant e2e swappause "a pausa é removida sem conferir de quem é" 'self.rpy(PAUSE_PY, {"pause": PAUSE, "mark": f"origem=mbp-proof:{self.run}", "mode": "off"})' 'self.rpy(PAUSE_PY, {"pause": PAUSE, "mark": "origem=", "mode": "off"})'
+  mutant e2e lostpause "resposta perdida do \"ligar a pausa\" vira \"não criei nada\"" 'self.paused_by_us = "_erro" in p or bool(p.get("ok"))' 'self.paused_by_us = bool(p.get("ok"))'
   mutant e2e shadow "um bd real escondendo o atalho passa" '        if shadow:' '        if False:'
   mutant e2e badjson "~/.claude.json ilegível passa" '        if not s["claude_json"]["ok"]:' '        if False:'
   mutant e2e badclaudejson "~/.claude.json ilegível depois da limpeza passa por limpo" ' or not post["claude_json"]["ok"]' ''
