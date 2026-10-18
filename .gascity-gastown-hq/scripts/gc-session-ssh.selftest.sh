@@ -671,8 +671,8 @@ PY
   [ $RC = 1 ] && [ -f "$w/precioso.txt" ] && [ -n "$(git -C "$RGREPO" rev-parse -q --verify refs/heads/worker/dog-remote-gapre0001 2>/dev/null)" ]; ok $? "wt: wt-add que falha numa pasta que JÁ existia antes do start NÃO a desfaz (o desfazer é só do que este start criou) (rc=$RC)"
   wtmirror; pv start dog-remote-gawarn001 < <(req cat "$eng"); ok $RC "wt: (sessão para o aviso do git) abre (rc=$RC)"; w=$(WTD dog-remote-gawarn001); mkdir -p "$T/home/.local/bin"; v=$(command -v git)
   printf '#!/bin/sh\ncase "$*" in *"status --porcelain"*) echo "warning: aviso inofensivo do git" >&2;; esac\nexec %s "$@"\n' "$v" > "$T/home/.local/bin/git"; chmod +x "$T/home/.local/bin/git"
-  pv stop dog-remote-gawarn001 </dev/null; [ $RC = 0 ] && [ ! -e "$w" ] && evwt dog-remote-gawarn001 removed; ok $? "wt: aviso do git em stderr (rc 0) NÃO vira 'há alteração não commitada': a decisão lê só o stdout do git status e o worktree limpo é recolhido (rc=$RC)"
-  find "$T/home/.local/bin" -name git -delete
+  : > "$T/rg.log"; pv stop dog-remote-gawarn001 </dev/null; [ $RC = 0 ] && [ -d "$w" ] && ! has "$T/rg.log" wt-rm && evwt dog-remote-gawarn001 kept && has "$ev" 'avisou'; ok $? "wt: git que AVISA em stderr ao ler o worktree (rc 0: pode não ter olhado parte da árvore) → o worktree é MANTIDO, com o motivo 'avisou' e não 'alteração': 'não consegui saber' nunca vira 'limpo' (rc=$RC)"
+  find "$T/home/.local/bin" -name git -delete; pv stop dog-remote-gawarn001 </dev/null; [ $RC = 0 ] && [ ! -e "$w" ] && evwt dog-remote-gawarn001 removed; ok $? "wt: ...e sem o aviso o MESMO stop (repetido) recolhe o worktree limpo (rc=$RC)"
   [ -n "$(sed -n 's/.*\(gracefulStopAll\).*/\1/p' "$HERE/../docs/runbooks/hetzner-hardening.md" | head -1)" ] && [ -n "$(sed -n 's/.*\(gracefulStopAll\).*/\1/p' "$doc" | head -1)" ]; ok $? "wt: os dois runbooks avisam que trocar [session] provider para hybrid derruba TODAS as sessões em execução (gracefulStopAll) — não existe 'recarga suave' para elas"
   # --- contrato com o script de verdade: o caminho que o provider calcula é o que o hetzner-remote-git.sh monta ---
   grep -qF 'GR=${GT_REMOTE_GIT:-$HOME/gt-remote/git}' "$HERE/hetzner-remote-git.sh" && grep -qF 'path="$GR/$RIG/wt/$bead"' "$HERE/hetzner-remote-git.sh" && grep -qF 'g() { git -C "$GR/$RIG/repo.git" "$@"; }' "$HERE/hetzner-remote-git.sh"; ok $? "wt: contrato: <git>/<rig>/wt/<sessão> e <git>/<rig>/repo.git são o que o hetzner-remote-git.sh monta"
@@ -767,7 +767,7 @@ echo "== $((n-fails))/$n ok =="
   mutant wt "start que falha depois do wt-add não recolhe o worktree" 's/            + "trap .*$/            + "")/'
   mutant wt "stop recolhe mesmo com alteração não commitada" '/\[ -z "\$wst" \] ||/d'
   mutant wt "stop recolhe mesmo com commit que o origin não tem" 's/\[ "\$wpub" -eq 1 \] ||/true ||/'
-  mutant wt "git que não lê o worktree vira 'limpo'" 's/wst=\$(git -C @WT@ status --porcelain 2>\/dev\/null) ||.*$/wst=$(git -C @WT@ status --porcelain 2>\/dev\/null) || :/;s/wh=\$(git -C @WT@ rev-parse HEAD 2>\/dev\/null) ||.*$/wh=$(git -C @WT@ rev-parse HEAD 2>\/dev\/null) || :/'
+  mutant wt "git que não lê o worktree vira 'limpo'" 's/wst=\$(git -C @WT@ status --porcelain 2>"\$wse") ||.*$/wst=$(git -C @WT@ status --porcelain 2>\/dev\/null) || :/;s/wh=\$(git -C @WT@ rev-parse HEAD 2>\/dev\/null) ||.*$/wh=$(git -C @WT@ rev-parse HEAD 2>\/dev\/null) || :/'
   mutant wt "wt-rm que falha derruba o stop" 's/wtclean\\nexit 0"/wtclean"/;s/echo "WT kept wt-rm falhou: \$(printf %s "\$wo" | tail -n 1)"; return 0;/exit 1;/'
   mutant wt "stop sem GT_REMOTE_GIT no wt-rm" 's/wo=\$(GT_REMOTE_GIT=@GR@ @BIN@ wt-rm/wo=$(@BIN@ wt-rm/'
   mutant wt "o branch publicado fica no repositório" '/\[ -z "\$wb" \] || git -C @REPO@ update-ref -d/d'
@@ -783,7 +783,7 @@ echo "== $((n-fails))/$n ok =="
   mutant wt "o desfazer pega até a pasta que já existia antes do start" 's/\[ \\"\$wpre\\" -eq 1 \] || wtundo;/wtundo;/'
   mutant wt "o desfazer não tira o branch novo" 's/\[ "\$wub" = "\$wum" \] \&\& git/false \&\& git/'
   mutant wt "o desfazer não chama o wt-rm" 's/^  GT_REMOTE_GIT=@GR@ @BIN@ wt-rm @RIG@ @NAME@ >\/dev\/null 2>\&1$/  :/'
-  mutant wt "aviso do git em stderr vira 'alteração não commitada'" 's/status --porcelain 2>\/dev\/null) || { echo "WT kept o git não leu/status --porcelain 2>\&1) || { echo "WT kept o git não leu/'
+  mutant wt "aviso do git em stderr é jogado fora (parte da árvore não lida vira 'limpo')" 's/status --porcelain 2>"\$wse"/status --porcelain 2>\/dev\/null/'
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
   r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"

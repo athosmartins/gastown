@@ -165,13 +165,18 @@ ROLE_RE = re.compile(r"[a-z][a-z0-9-]*")
 WT_START_FLOOR = 150  # o wt-add puxa o espelho antes de criar o worktree: os 60 s padrão do start não bastam (o engine espera 180 s, [session] startup_timeout)
 WT_STOP_FLOOR = 90  # o stop com worktree também roda git status + wt-rm (du + worktree remove): os 25 s padrão podem estourar com o nó ou o disco ocupados (não medido), e um estouro chega depois da sessão já ter caído
 # Recolhe o worktree da sessão SÓ se nada se perde (limpo, e todo commit já está no main do origin ou na ref da sessão no espelho). Imprime `WT removed`, `WT kept <motivo>` ou `WT none`
-# e NUNCA devolve erro: o stop não falha por causa dele, e o start que falhou depois do wt-add o usa no EXIT. Dúvida (git ilegível, ref ausente) = MANTÉM.
+# e NUNCA devolve erro (o wtclean cria um arquivo temporário para o stderr do git e o apaga): o stop não falha por causa dele, e o start que falhou depois do wt-add o usa no EXIT. Dúvida (git ilegível, ref ausente) = MANTÉM.
 # Os nomes de variável levam o prefixo w para não pisar nas do PRELUDE (o sh não tem escopo de função). @WT@ pasta, @REPO@ repo.git, @BRREF@ refs/heads/worker/<n>, @BRNAME@ worker/<n>.
 WTCLEAN_SH = r"""wtclean() {
+  wse=$(mktemp) || { echo "WT kept sem arquivo temporário para ler o que o git diz"; return 0; }
+  wtclean_body; rm -f "$wse"; return 0
+}
+wtclean_body() {
   [ -e @WT@ ] || { echo "WT none"; return 0; }
-  # vazio → nada a perder; falhou (o git não lê o worktree) → MANTÉM: "não consegui saber" nunca vira "limpo"; só o stdout decide (aviso do git em stderr com rc 0 não é alteração)
-  wst=$(git -C @WT@ status --porcelain 2>/dev/null) || { echo "WT kept o git não leu o worktree"; return 0; }
+  # vazio e sem aviso → nada a perder; falhou (o git não lê o worktree) → MANTÉM; AVISO do git em stderr com rc 0 também MANTÉM: ele pode não ter olhado parte da árvore, e "não consegui saber" nunca vira "limpo"
+  wst=$(git -C @WT@ status --porcelain 2>"$wse") || { echo "WT kept o git não leu o worktree"; return 0; }
   [ -z "$wst" ] || { echo "WT kept há alteração não commitada"; return 0; }
+  [ ! -s "$wse" ] || { echo "WT kept o git avisou ao ler o worktree: $(head -n 1 "$wse" | cut -c1-120)"; return 0; }
   # HEAD ilegível → MANTÉM; branch da sessão ausente (rc 1) → só o HEAD conta; ilegível (rc > 1) → MANTÉM
   wh=$(git -C @WT@ rev-parse HEAD 2>/dev/null) || { echo "WT kept não li o HEAD"; return 0; }
   wb=$(git -C @REPO@ rev-parse -q --verify @BRREF@ 2>/dev/null); wrc=$?
