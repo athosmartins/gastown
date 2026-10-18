@@ -118,8 +118,8 @@ def read_stdin() -> bytes:
             if select.select([fd], [], [], 0.3 if first else 2.0)[0] == []:  # o claude escreve o JSON do hook de uma vez e fecha: silêncio = ninguém vai escrever
                 break
             b = os.read(fd, 65536)
-        except OSError:
-            break
+        except OSError as e:  # entrada que falha no meio: mandar o que já veio seria rodar o comando com a entrada pela metade
+            die(f"não consegui ler a entrada padrão ({e.strerror}); nada foi enviado", 2)
         if not b:
             break
         first, total = False, total + len(b)

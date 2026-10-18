@@ -11,7 +11,8 @@
 #   identidade fora do padrão, texto com $()/crase/aspas inteiro e nada executado · 6 pedidos em paralelo · pedido torto no spool → o agente responde 78 ·
 #   prazo: pedido que ninguém pegou é RETIRADO e dá 75 (nada rodou); pedido pego e sem resposta dá 125 (pode ter rodado) · stdin > 1 MB → 2 sem gravar ·
 #   o log do puxador não tem argv · cut() do puxador · puxador: um só (ensure idempotente), status, stop, sai sozinho sem sessão registrada, e não toca
-#   o MBP sem sessão
+#   o MBP sem sessão · leituras que FALHAM (resposta corrompida ou ilegível → 125; stdin que não lê → 2; config, registro de sessões, pid, log e lock do
+#   puxador; listdir/open do agente): o estado é o inerte e a falha aparece
 # VARIÁVEIS: SPOOL_ONLY=<grupos separados por vírgula: conf,perm,alive,chain,par,forge,tmo,pump> · FAILFAST=1 (do lib)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -165,10 +166,17 @@ fi
 if want tmo; then
 echo "== prazo"
 pump stop --host mbp >/dev/null 2>&1
-alive; ( SHIM_CONF="$SHIMCONF" shim bd show ga-1; echo "$RC" > "$T/forged.rc" ) & FG=$!
-for _ in $(seq 1 50); do f=$(ls "$SPOOL/req" 2>/dev/null | grep '\.json$' | head -1); [ -n "$f" ] && break; sleep 0.1; done
-rid=${f%.json}; printf '{"id":"1700000000000-1-00000000","rc":0,"stdout_b64":"%s","stderr_b64":""}' "$(printf 'RESPOSTA-FALSA' | base64)" > "$SPOOL/resp/$rid.json"
-wait $FG; [ "$(cat "$T/forged.rc")" = 125 ] && ! has "$T/out" "RESPOSTA-FALSA"; ok $? "resposta cujo id de dentro não é o do pedido: 125, a saída não é usada"
+forge() {  # forge PLANTA: roda um bd show no cliente (sem puxador) e, quando o pedido aparece em req/, chama a função PLANTA (vê $rid) para pôr a "resposta" → RC, $T/out, $T/err
+  rm -f "$SPOOL/req/"* "$SPOOL/resp/"* "$SPOOL/claimed/"*; alive; ( SHIM_CONF="$SHIMCONF" shim bd show ga-1; echo "$RC" > "$T/forged.rc" ) & local fg=$! f
+  for _ in $(seq 1 50); do f=$(ls "$SPOOL/req" 2>/dev/null | grep '\.json$' | head -1); [ -n "$f" ] && break; sleep 0.1; done
+  rid=${f%.json}; "$1"; wait $fg; RC=$(cat "$T/forged.rc")
+}
+plant_forged() { printf '{"id":"1700000000000-1-00000000","rc":0,"stdout_b64":"%s","stderr_b64":""}' "$(printf 'RESPOSTA-FALSA' | base64)" > "$SPOOL/resp/$rid.json"; }
+plant_garbage() { printf 'isto nao e json{{{' > "$SPOOL/resp/$rid.json"; }
+plant_dir() { mkdir -p "$SPOOL/resp/$rid.json"; }
+forge plant_forged; [ "$RC" = 125 ] && ! has "$T/out" "RESPOSTA-FALSA"; ok $? "resposta cujo id de dentro não é o do pedido: 125, a saída não é usada"
+forge plant_garbage; [ "$RC" = 125 ] && has "$T/err" "ilegível" && ! has "$T/out" "FAKE-bd-OUT"; ok $? "resposta corrompida no spool (JSON ilegível): 125, o pedido pode ter rodado; não repete e não inventa saída"
+forge plant_dir; rmdir "$SPOOL/resp/$rid.json"; [ "$RC" = 125 ] && has "$T/err" "ilegível"; ok $? "resposta que não abre (IsADirectoryError): 125, o mesmo"
 rm -f "$SPOOL/req/"* "$SPOOL/resp/"* "$SPOOL/claimed/"*
 alive; printf '{"transport":"spool","spool_dir":"%s","timeout_s":5}' "$SPOOL" > "$T/short.json"; b=$(calls); t0=$(date +%s)
 SHIM_CONF="$T/short.json" shim bd show ga-1; t1=$(date +%s)
@@ -181,6 +189,9 @@ SHIM_CONF="$T/short.json" shim bd show ga-1; t1=$(date +%s); wait $CL 2>/dev/nul
 b=$(calls)
 head -c 1048577 /dev/zero > "$T/big.bin"; alive; STDIN_FILE="$T/big.bin" shim bd comment ga-1 --stdin
 [ "$RC" = 2 ] && has "$T/err" "maior que" && [ -z "$(ls "$SPOOL/req" | grep -v '^$')" ]; ok $? "entrada padrão acima de 1 MB: 2, nada gravado"
+b=$(calls); alive   # entrada aberta só para ESCRITA (0>): o select diz "pronto" e o read dá EBADF (uma pasta nem chega lá: o python se recusa a subir)
+env -i HOME="$HOME" USER="$USER" PATH="$T/shimbin:/usr/bin:/bin" REMOTE_SHIM_CONF="$SHIMCONF" GC_ALIAS=gastown.dog-1 GC_AGENT=gastown.dog-1 "$T/shimbin/bd" comment ga-1 --stdin > "$T/out" 2> "$T/err" 0> "$T/so-escrita"; RC=$?
+[ "$RC" = 2 ] && has "$T/err" "não consegui ler a entrada padrão" && [ -z "$(ls "$SPOOL/req" | grep -v '^$')" ] && [ "$(calls)" = "$b" ]; ok $? "entrada padrão que falha ao ler (EBADF): 2, nada gravado, nada rodou; não manda a entrada pela metade"
 fi
 
 if want pump; then
@@ -217,6 +228,38 @@ assert put(b).returncode == 0 and not os.path.exists(sp + "/resp/" + b + ".json"
 PYEOF
 FAKE_SSH_FAIL=1 pump ensure --host mbp; sleep 3; pump stop --host mbp >/dev/null 2>&1
 grep -q "get falhou rc=255" "$STATE/mbp/shim-pump.log"; ok $? "ssh falhando: o puxador registra e espera em vez de girar (não cai)"
+# leituras do puxador que FALHAM: o estado é o inerte (não sobe, não mata, não afirma o que não sabe) e a falha aparece
+rm -f "$STATE/mbp/shim-pump."*; pstat() { pump status --host mbp | head -1; }
+GC_SSH_CONFIG="$T/nao-existe.json" pump ensure --host mbp > "$T/pe.out" 2>&1; rc=$?
+[ "$rc" != 0 ] && grep -q "configuração ilegível" "$T/pe.out" && pstat | grep -q "rodando=nao"; ok $? "puxador: configuração ausente (FileNotFoundError) → recusa visível, nenhum puxador sobe"
+printf 'garbage{{{' > "$T/corrompida.json"; GC_SSH_CONFIG="$T/corrompida.json" pump status --host mbp > "$T/pe.out" 2>&1; rc=$?
+[ "$rc" != 0 ] && grep -q "configuração ilegível" "$T/pe.out"; ok $? "puxador: configuração corrompida → recusa visível, não inventa estado"
+rm -rf "$STATE/mbp/running"; : > "$STATE/mbp/running"
+pstat | grep -q "sessoes_registradas=sim"; ok $? "puxador: registro de sessões que não lê (NotADirectoryError) conta como sessão viva, não como vazio"
+rm -f "$STATE/mbp/running"; pstat | grep -q "sessoes_registradas=nao"; ok $? "puxador: registro que não existe → nenhuma sessão registrada"
+mkdir -p "$STATE/mbp/running"; touch "$STATE/mbp/running/remote-test-remote-mbp-1"
+[ "$(pump status --host mbp | wc -l | tr -d ' ')" = 1 ]; ok $? "puxador: status de quem nunca rodou (sem log) é uma linha só, sem aviso"
+mkdir "$STATE/mbp/shim-pump.log"; pump status --host mbp > "$T/pe.out" 2>&1; rc=$?
+[ "$rc" = 0 ] && head -1 "$T/pe.out" | grep -q "rodando=nao" && grep -q "log do puxador ilegível" "$T/pe.out"; ok $? "puxador: status com o log ilegível (IsADirectoryError) segue informando e AVISA que o rabo do log não veio"
+rmdir "$STATE/mbp/shim-pump.log"
+: > "$T/state-arquivo"; GC_EXEC_STATE_DIR="$T/state-arquivo" pump status --host mbp > "$T/pe.out" 2>&1; rc=$?
+[ "$rc" != 0 ] && grep -q "não consegui abrir o lock" "$T/pe.out" && ! grep -q "rodando=nao" "$T/pe.out"; ok $? "puxador: o lock não abre (NotADirectoryError) → não afirma que não há puxador, diz que não sabe"
+up; p0=$(pstat | sed -n 's/.* pid=\([0-9]*\).*/\1/p'); printf 'garbage' > "$STATE/mbp/shim-pump.pid"
+pump stop --host mbp > "$T/pe.out" 2>&1; rc=$?; st=$(pstat); printf '%s' "$p0" > "$STATE/mbp/shim-pump.pid"   # o pid volta ANTES de qualquer conclusão: o trap do EXIT tem que conseguir encerrar o puxador mesmo se o stop acima falhar
+[ "$rc" = 1 ] && grep -q "não consegui ler o pid" "$T/pe.out" && printf '%s' "$st" | grep -q "rodando=sim"; ok $? "puxador: lock preso e pid ilegível (garbage) → stop recusa encerrar às cegas (rc 1, avisa) e o puxador segue de pé"
+pump stop --host mbp | grep -q "encerrado"; ok $? "puxador: com o pid de volta, o mesmo stop encerra"
+python3 -I - "$PUMP" "$T/agent-spool" <<'PYEOF'; ok $? "agente: leitura do spool que FALHA (PermissionError em listdir e em open) → sai ≠ 0 sem pegar nada / responde 78 sem entregar o pedido"
+import importlib.util, json, os, subprocess, sys
+s = importlib.util.spec_from_file_location("pump", sys.argv[1]); m = importlib.util.module_from_spec(s); sys.modules["pump"] = m; s.loader.exec_module(m)
+sp, rid = sys.argv[2], "1700000000300-1-cccccccc"; os.makedirs(sp, 0o700, exist_ok=True); os.chmod(sp, 0o700); os.makedirs(sp + "/req", 0o700, exist_ok=True)
+with open(sp + "/req/" + rid + ".json", "w") as f: json.dump({"v": 1, "id": rid, "cmd": "rs1 x", "stdin_b64": ""}, f)
+def get(prelude): return subprocess.run([sys.executable, "-I", "-c", prelude + m.AGENT, sp, "get", "1", "1"], capture_output=True, timeout=30)
+r = get("import os\ndef _boom(*a, **k): raise PermissionError(13, 'injetado')\nos.listdir = _boom\n")
+assert r.returncode != 0 and b"PermissionError" in r.stderr and r.stdout == b"" and os.path.exists(sp + "/req/" + rid + ".json") and not os.listdir(sp + "/claimed"), r
+r = get("import builtins\n_o = builtins.open\ndef _f(p, *a, **k):\n    if '/claimed/' in str(p): raise PermissionError(13, 'injetado')\n    return _o(p, *a, **k)\nbuiltins.open = _f\n")
+d = json.load(open(sp + "/resp/" + rid + ".json"))
+assert r.returncode == 0 and r.stdout == b"" and d["rc"] == 78 and not os.listdir(sp + "/claimed") and not os.path.exists(sp + "/req/" + rid + ".json"), (r, d)
+PYEOF
 fi
 
 echo

@@ -374,8 +374,10 @@ def held(cfg: Cfg) -> bool:
     """O puxador segura o flock enquanto vive (o pid sozinho pode ser de um processo que morreu e foi reaproveitado)."""
     try:
         f = open(os.path.join(cfg.state, "shim-pump.lock"), "a")
-    except OSError:
-        return False
+    except FileNotFoundError:
+        return False  # a pasta de estado nem existe: o puxador nunca rodou aqui
+    except OSError as e:
+        raise SystemExit(f"remote-shim-pump: não consegui abrir o lock ({e.strerror}); não sei se há puxador rodando e não vou adivinhar")
     try:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(f, fcntl.LOCK_UN)
@@ -398,14 +400,19 @@ def main(argv: list) -> int:
         print(f"host={cfg.host} rodando={'sim' if held(cfg) else 'nao'} pid={pid_of(cfg) or '-'} sessoes_registradas={'sim' if cfg.registry_busy() else 'nao'}")
         try:
             print("".join(open(os.path.join(cfg.state, "shim-pump.log")).readlines()[-5:]), end="")
-        except OSError:
-            pass
+        except FileNotFoundError:
+            pass  # nunca rodou: não há rabo de log a mostrar
+        except OSError as e:
+            print(f"log do puxador ilegível ({e.strerror})")
         return 0
     if a.cmd == "stop":
-        pid = pid_of(cfg)
-        if not pid or not held(cfg):
+        if not held(cfg):
             print("remote-shim-pump: não há puxador rodando")
             return 0
+        pid = pid_of(cfg)
+        if not pid:
+            print("remote-shim-pump: o lock está preso (há um puxador), mas não consegui ler o pid dele; não encerro às cegas", file=sys.stderr)
+            return 1
         os.kill(pid, signal.SIGTERM)
         for _ in range(100):
             if not held(cfg):

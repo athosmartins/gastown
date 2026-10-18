@@ -96,6 +96,8 @@ MUTANTS = [
     ("spool-pego-vira-75", "p", "pode ter rodado — não repita às cegas\", 125)\n                break", "pode ter rodado — não repita às cegas\", 75)\n                break", r"pedido pego e sem resposta"),
     ("spool-id-da-resposta", "p", ' and r.get("id") == rid)', ")", r"id de dentro"),
     ("spool-stdin-sem-teto", "p", "        if total > MAX_STDIN:", "        if False:", r"acima de 1 MB"),
+    ("stdin-erro-calado", "p", '            die(f"não consegui ler a entrada padrão ({e.strerror}); nada foi enviado", 2)', "            break", r"entrada padrão que falha ao ler"),
+    ("resposta-ilegivel-vira-nada", "p", 'die("resposta do mini ilegível; o pedido pode ter rodado — não repita às cegas", 125)', "return None", r"resposta corrompida no spool"),
     # --- o puxador e o agente do MBP (ga-w7qwl1.1)
     ("agente-spool-largo", "u", "or st.st_mode & 0o077:", "or False:", r"modo largo"),
     ("agente-nome-sem-id", "u", "            if not ID.fullmatch(rid):\n                try: os.unlink", "            if False:\n                try: os.unlink", r"nome que não é id"),
@@ -104,6 +106,10 @@ MUTANTS = [
     ("puxador-nunca-ocioso", "u", "if time.time() - idle_since > cfg.idle_s:", "if False:", r"sai sozinho"),
     ("puxador-sem-corte", "u", "return b if len(b) <= MAX_OUT else b[:MAX_OUT] +", "return b if True else b[:MAX_OUT] +", r"cut\(\)"),
     ("puxador-argv-no-log", "u", 'self.cfg.log(f"id={rid} rc={rc} out=', 'self.cfg.log(f"cmd={cmd[:80]} id={rid} rc={rc} out=', r"não guarda argv"),  # `cmd` = PROTO + o argv em base64: o vazamento é em base64, não em texto puro (o caso tem que ver isso)
+    ("puxador-stop-cego", "u", "            return 1\n        os.kill(pid, signal.SIGTERM)", "            return 0\n        os.kill(pid, signal.SIGTERM)", r"lock preso e pid ilegível"),
+    ("puxador-lock-ilegivel-vira-nao", "u", "    except FileNotFoundError:\n        return False  # a pasta de estado nem existe", "    except OSError:\n        return False  # a pasta de estado nem existe", r"o lock não abre"),
+    ("puxador-registro-ilegivel-vazio", "u", '            return True  # não consegui ler: não sei, e "não sei" mantém o puxador de pé', "            return False", r"registro de sessões que não lê"),
+    ("agente-open-pedido-crash", "u", "            except (OSError, ValueError) as e:\n                write_resp(rid, 78,", "            except ValueError as e:\n                write_resp(rid, 78,", r"leitura do spool que FALHA"),
     ("known-hosts-opcional", "s", 'need(os.path.isfile(c["identity_file"]) and os.path.isfile(c["known_hosts_file"]))', "need(True)", r"config do shim ruim|known_hosts_file ausente"),
 ]
 
@@ -122,7 +128,7 @@ def run_one(m, tmp: Path, timeout: int):
     if which in ("p", "u"):  # o puxador procura o wrapper AO LADO de si (HERE) e o selftest conta puxadores pelo caminho: cada mutante leva o seu puxador e um link para o wrapper de verdade
         pump = mutant if which == "u" else d / "remote-shim-pump.py"
         if which == "p":
-            pump.write_text((HERE / "remote-shim-pump.py").read_text())
+            pump.write_text((HERE / "remote-shim-pump.py").read_text())  # third-state-waiver: fonte irmão no repositório; se faltar, o list(ex.map) re-levanta e a campanha sai ≠ 0, nunca vira "mutante morto"
             pump.chmod(0o755)
         (d / "remote-shim-wrapper.py").symlink_to(HERE / "remote-shim-wrapper.py")
         env["PUMP_UNDER_TEST"] = str(pump)
