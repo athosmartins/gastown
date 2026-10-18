@@ -2923,7 +2923,8 @@ _reap_bloated_backup_staging() {
 #   * regular files named *.pyc whose path has a __pycache__ component (never a legacy
 #     sourceless .pyc beside a .py; never a numba .nbi/.nbc cache that shares the directory);
 #   * regular files under a .pytest_cache directory.
-# A .py, a file with no extension, a symlink and every directory stay. venv/.venv/.git/.beads/
+# A .py, any file with no extension that is not inside a .pytest_cache, a symlink and every
+# directory stay. venv/.venv/.git/.beads/
 # .dolt/node_modules are pruned (not descended). Only files unmodified for MIN_AGE_MIN minutes
 # (-mmin +N) are taken, so a pytest that is writing right now is never raced. The root checkout of
 # a rig with live daemons IS in scope (Mayor, comment of 2026-10-18 on ga-0z7kdz): a daemon has
@@ -2939,8 +2940,9 @@ _reap_bloated_backup_staging() {
 # (-delete is avoided on purpose: it implies -depth, which makes -prune ineffective). The MB
 # figure is therefore measured BEFORE the delete and is approximate. Only when find/rm exit
 # non-zero (find does so for any unreadable subdirectory, even when everything it could see was
-# removed) a third pass measures what is still there, and the freed figure becomes before minus after. /usr/bin/find is explicit so
-# the lever and its selftest use the same BSD find whatever the caller's shell defines as `find`.
+# removed) a third pass measures what is still there, and the freed figure becomes before minus
+# after. /usr/bin/find and /usr/bin/stat are explicit so the lever and its selftest use the same
+# BSD tools whatever the caller's shell or PATH puts first (a GNU `stat -f` means something else).
 _pycache_isnum() {
   case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
   return 0
@@ -2989,7 +2991,7 @@ _pycache_measure_root() {
   local tmo="$1" root="$2" mins="$3"
   # vazio → "0 0 0": the scan ran and nothing is eligible; falhou/ilegível → find's exit status is the 3rd field (never folded into "0 files") and the caller treats a missing or non-numeric field as "unknown, delete nothing here"
   {
-    _pycache_run "$tmo" "$root" "$mins" -exec stat -f %z {} + 2>>"$LOG" \
+    _pycache_run "$tmo" "$root" "$mins" -exec /usr/bin/stat -f %z {} + 2>>"$LOG" \
       | awk '{ n++; s += $1 } END { printf "%d %d", n + 0, s + 0 }'
     echo " ${PIPESTATUS[0]}"
   }
@@ -3050,7 +3052,7 @@ _reap_pycache() {
 
   local deadline=$(( now + budget ))
   local root m files bytes mrc drc left note
-  local seen=0 scanned=0 incomplete=0 total_files=0 freed_b=0
+  local seen=0 scanned=0 incomplete=0 partial=0 total_files=0 freed_b=0
   while IFS= read -r root; do
     [ -n "$root" ] || continue
     seen=$((seen+1))
@@ -3085,6 +3087,7 @@ _reap_pycache() {
     scanned=$((scanned+1))
     note=""
     if [ "$mrc" -ne 0 ]; then
+      partial=$((partial+1))
       note=" (find exited rc=${mrc} while measuring: part of the tree could not be read, or a file vanished mid-scan - the figures are a floor)"
     fi
     if [ "$files" -eq 0 ]; then
@@ -3119,9 +3122,10 @@ _reap_pycache() {
         _pycache_parse "$m"
         # vazio → the re-measure counts 0 file(s): everything eligible is gone, DELETED; falhou/ilegível → the left-over is unknown, so no freed figure is claimed and the root counts as unfinished
         if _pycache_isnum "$PC_FILES" && _pycache_isnum "$PC_BYTES" && _pycache_isnum "$PC_RC" && [ "$PC_RC" -ne 124 ]; then
-          local rest_files="$PC_FILES" rest_bytes="$PC_BYTES" freed_here=0
+          local rest_files="$PC_FILES" rest_bytes="$PC_BYTES" freed_here=0 gone_here=0
           [ "$bytes" -gt "$rest_bytes" ] && freed_here=$((bytes - rest_bytes))
-          total_files=$((total_files + files - rest_files))
+          [ "$files" -gt "$rest_files" ] && gone_here=$((files - rest_files))   # files that appeared meanwhile must not make this negative
+          total_files=$((total_files + gone_here))
           freed_b=$((freed_b + freed_here))
           if [ "$rest_files" -eq 0 ]; then
             log "pycache-reap: ${root} — DELETED ${files} file(s), freed≈$((freed_here/1048576))MB (find exited rc=${drc} on the way - an unreadable part of the tree, or a file that vanished - and a re-measure finds nothing left to take)${note}"
@@ -3140,7 +3144,7 @@ _reap_pycache() {
   if [ "$incomplete" -gt 0 ]; then
     log "pycache-reap: roots=${seen} scanned=${scanned} deleted=${total_files} file(s), freed≈$((freed_b/1048576))MB from the roots that finished; ${incomplete} root(s) did not finish (see above)"
   else
-    log "pycache-reap OK — roots=${seen} scanned=${scanned} deleted=${total_files} file(s), freed≈$((freed_b/1048576))MB"
+    log "pycache-reap OK — roots=${seen} scanned=${scanned} deleted=${total_files} file(s), freed≈$((freed_b/1048576))MB$([ "$partial" -gt 0 ] && printf '; %s root(s) had parts find could not read, so the figures are a floor (see above)' "$partial")"
   fi
 }
 

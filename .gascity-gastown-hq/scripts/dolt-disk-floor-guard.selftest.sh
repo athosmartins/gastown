@@ -596,6 +596,7 @@ chmod 755 "$PYC_ROOT/crew/locked"
 pyc_check_set "_reap_pycache (unreadable subdir)"
 [ -e "$PYC_ROOT/crew/locked/__pycache__/l.pyc" ] && ok "_reap_pycache: the file in the unreadable dir is left (it could not be seen)" || bad "_reap_pycache: the file in the unreadable dir vanished?"
 pyc_log | grep -q "find exited rc=.*while measuring" && ok "_reap_pycache: a find that could not read everything is said so on the log (figures are a floor)" || bad "_reap_pycache: no mention of the partial scan on the log"
+pyc_log | grep -q "pycache-reap OK .*1 root(s) had parts find could not read" && ok "_reap_pycache: the OK summary still says that a root had parts find could not read (a partial scan is not reported as a clean one)" || bad "_reap_pycache: the summary hides the partial scan: $(pyc_log | grep 'pycache-reap OK' | tr '\n' '|')"
 pyc_log | grep -q "DELETED 4 file(s), freed≈3MB (find exited rc=" && ! pyc_log | grep -q "DELETE PARTIAL" && pyc_log | grep -q "pycache-reap OK" && ok "_reap_pycache: find's rc≠0 from an unreadable dir is NOT reported as a failed delete - a re-measure shows nothing left, so 4 file(s)/≈3MB DELETED and the run is OK" || bad "_reap_pycache: an unreadable subdir turned a complete reap into a failure: $(pyc_log | grep 'pycache-reap' | tr '\n' '|')"
 
 # 7. A scan result that cannot be read, or that timed out, deletes NOTHING in that root.
@@ -655,13 +656,14 @@ if printf '%s\n' "$pyc_roots" | grep -qx "$PYC_TMP/town/rigA" && ! printf '%s\n'
    && ! printf '%s\n' "$pyc_roots" | grep -qx "$PYC_TMP/town"; then
   ok "_pycache_reap_roots: rig dirs (with .beads) + the city/town worktree dirs; a non-rig dir and the town root itself are NOT roots"
 else
-  bad "_pycache_reap_roots: wrong root list: $(printf '%s' "$roots" | tr '\n' '|')"
+  bad "_pycache_reap_roots: wrong root list: $(printf '%s' "$pyc_roots" | tr '\n' '|')"
 fi
 
 # A scenario that aborts half way (an arithmetic error in the lever kills the loop around it, for example)
-# prints fewer PASS lines and NO FAIL line. Count them: the block has 26 assertions.
+# prints fewer PASS lines and NO FAIL line. Count them: the block has 27 assertions.
 PYC_RAN=$((PASS+FAIL-PYC_ASSERT_BASE))
-[ "$PYC_RAN" = "26" ] && ok "_reap_pycache: all 26 assertions of this block ran (none was skipped by an abort)" || bad "_reap_pycache: only $PYC_RAN of the 26 assertions ran - a scenario aborted"
+[ "$PYC_RAN" = "27" ] && ok "_reap_pycache: all 27 assertions of this block ran (none was skipped by an abort)" || bad "_reap_pycache: only $PYC_RAN of the 27 assertions ran - a scenario aborted"
+# shellcheck disable=SC2034  # read by _pycache_reap_roots / _reap_pycache in the sourced script
 PYCACHE_REAP_ROOTS=""; STATE_PYCACHE_REAP_FILE="$STATE_DIR/.dolt-disk-floor-guard.pycache-reap-last"
 chmod -R u+rwx "$PYC_TMP" 2>/dev/null; rm -rf "$PYC_TMP"
 
