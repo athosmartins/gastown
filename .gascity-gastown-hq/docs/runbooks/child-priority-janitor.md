@@ -69,6 +69,11 @@ python3 scripts/child-priority-janitor.py --selftest    # 39 casos
 ```
 Cobre, entre outros, os três casos pedidos na issue: filho P2 de pai P0 → P0; follow-up → intacto; pai com prioridade ilegível → intacto (fail-closed). Prioridade 0 é tratada de forma explícita (0 é falso em Python: `if prio:` perderia todos os pais P0). A suíte foi mutacionada (14 mutantes + 1 achado de lacuna, `ptarget != cur`, que ganhou o caso "filho sob intermediário mais urgente"): cada mutante reprova o selftest; o único sobrevivente conhecido (`want != cur` no laço principal) é equivalente, porque `target()` nunca devolve valor maior que o atual.
 
+```bash
+bash scripts/child-priority-janitor.selftest.sh         # 17 casos, com `bd`/`gc`/`notify` de mentira
+```
+O `--selftest` troca todo I/O por função falsa e nunca roda o código que chama `bd`/`gc` e lê o que eles imprimem; o `.selftest.sh` roda o janitor de verdade contra executáveis de mentira que FALHAM (rc 1, lixo, saída vazia, binário ausente, timeout, `update` que sai 0 e não grava, releitura ilegível) e confere que ele fica inerte: nenhum `bd update`, nenhum comentário, loja ilegível pulada e contada, rc 1. Nove mutantes (tirar o teste de rc, aceitar lixo ou vazio como "sem filhos", tirar a releitura, deixar a exceção subir, tirar o kill-switch ou o dry-run) reprovam esse teste.
+
 Em produção, a prova é a releitura: depois de um sweep, `bd show <id> --json | jq .priority` no filho tem que ser o do pai, e o comentário do janitor está no bead.
 
 ## Números medidos (18/10/2026)
