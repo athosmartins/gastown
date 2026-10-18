@@ -2997,9 +2997,16 @@ _resurrect_dolt() {
 #     delivery unknown / failed, even a nudge the join later kills) and NEVER for a target the cooldown skipped or the budget
 #     did not reach. Targets are nudged never-attempted first (list order), then the OLDEST attempt first: the sessions a
 #     cycle did not reach go ahead of the slow ones it tried, and over cycles every active session gets its turn. A marker
-#     that is missing, unreadable or not a number counts as "never attempted" (it goes first - a broken marker never pushes a
-#     target back); a marker that cannot be written is logged and its target keeps its place; a sort that fails is logged
-#     and the targets go out in list order (never "nobody").
+#     that is missing, unreadable or not a number counts as "never attempted" (it goes first: a broken marker can make its target
+#     be tried early, never skipped); a marker that cannot be written is logged and its target keeps its place; a sort that
+#     fails is logged and the targets go out in list order (never "nobody"). The single-file stamp of the pre-ga-xdj2si guard
+#     (.dolt-disk-floor-guard.last-pool-nudge) is no longer read: the first CRITICAL cycle after the upgrade may repeat the
+#     notice once to a session that was told minutes earlier.
+#   - THE JOIN IS HONEST (ga-xdj2si, gate attempt 2). The phase runs detached (stdout to /dev/null, stderr to the log), so
+#     its death used to leave nothing at all: 0 nudges, 0 log lines, rc 0 - where the old foreground call printed "unbound
+#     variable" on the cycle's stderr. The join now reads the phase's own exit status (`wait`) and logs a WARN for a phase
+#     that ended non-zero (other than the kill it did itself) and for a pid that is not a child of this cycle; it signals only
+#     a pid that `jobs -p` lists as this shell's own live job.
 #   - PER-TARGET COOLDOWN (POOL_NUDGE_COOLDOWN_SECS, 900): a CRITICAL episode lasts many 5-min cycles; the same text
 #     every cycle would be noise a session learns to ignore. The stamp is one file PER TARGET, written only when THAT
 #     target's nudge came back rc 0 - so a target that failed, timed out or was not reached keeps no stamp and is
@@ -3013,15 +3020,19 @@ _resurrect_dolt() {
 #     empty -> nudge each. A failed list is never the same as "no pool sessions".
 #   - DOLT_DISK_FLOOR_POOL_NUDGE=0 (any value but 1) switches it off (never in prod) and logs "pool-nudge SKIP".
 POOL_NUDGE_ENABLED="${DOLT_DISK_FLOOR_POOL_NUDGE:-1}"
-POOL_NUDGE_COOLDOWN_SECS="${DOLT_DISK_FLOOR_POOL_NUDGE_COOLDOWN_SECS:-900}"
-case "$POOL_NUDGE_COOLDOWN_SECS" in ''|*[!0-9]*) POOL_NUDGE_COOLDOWN_SECS=900 ;; esac
-# a 0 or non-numeric budget/timeout/slack would mean "no limit" to `timeout` or "never wait" to the join: both fall back to the default
-POOL_NUDGE_BUDGET_SECS="${DOLT_DISK_FLOOR_POOL_NUDGE_BUDGET_SECS:-60}"
-case "$POOL_NUDGE_BUDGET_SECS" in ''|*[!0-9]*|0) POOL_NUDGE_BUDGET_SECS=60 ;; esac
-POOL_NUDGE_TIMEOUT_SECS="${DOLT_DISK_FLOOR_POOL_NUDGE_TIMEOUT_SECS:-15}"
-case "$POOL_NUDGE_TIMEOUT_SECS" in ''|*[!0-9]*|0) POOL_NUDGE_TIMEOUT_SECS=15 ;; esac
-POOL_NUDGE_JOIN_SLACK_SECS="${DOLT_DISK_FLOOR_POOL_NUDGE_JOIN_SLACK_SECS:-10}"
-case "$POOL_NUDGE_JOIN_SLACK_SECS" in ''|*[!0-9]*|0) POOL_NUDGE_JOIN_SLACK_SECS=10 ;; esac
+# _pool_nudge_num <value> <default> <min> -> the value as a plain BASE-10 integer >= min, else the default. vazio / not digits /
+# 8+ digits -> the default (a 0 budget or timeout would mean "no limit" to `timeout` or "never wait" to the join); 10# so a
+# value written "08" or "09" is eight and nine, not an octal error that aborts the cycle under `set -u` (ga-xdj2si)
+_pool_nudge_num() {
+  local v="$1" d="$2" min="$3"
+  case "$v" in ''|*[!0-9]*|????????*) printf '%s' "$d"; return 0 ;; esac
+  v=$((10#$v))
+  if [ "$v" -ge "$min" ]; then printf '%s' "$v"; else printf '%s' "$d"; fi
+}
+POOL_NUDGE_COOLDOWN_SECS="$(_pool_nudge_num "${DOLT_DISK_FLOOR_POOL_NUDGE_COOLDOWN_SECS:-900}" 900 0)"
+POOL_NUDGE_BUDGET_SECS="$(_pool_nudge_num "${DOLT_DISK_FLOOR_POOL_NUDGE_BUDGET_SECS:-60}" 60 1)"
+POOL_NUDGE_TIMEOUT_SECS="$(_pool_nudge_num "${DOLT_DISK_FLOOR_POOL_NUDGE_TIMEOUT_SECS:-15}" 15 1)"
+POOL_NUDGE_JOIN_SLACK_SECS="$(_pool_nudge_num "${DOLT_DISK_FLOOR_POOL_NUDGE_JOIN_SLACK_SECS:-10}" 10 1)"
 POOL_NUDGE_TEMPLATES="${DOLT_DISK_FLOOR_POOL_NUDGE_TEMPLATES:-gastown.dog wa-worker ps-worker gate-reviewer}"
 STATE_POOL_NUDGE_DIR="$STATE_DIR/.dolt-disk-floor-guard.pool-nudge.d"
 _POOL_NUDGE_PID=""
@@ -3057,7 +3068,7 @@ _pool_nudge_order() {
     [ -n "$target" ] || continue
     n=$((n + 1))
     # vazio (no marker yet) -> 0 = never attempted, goes first; ilegível (cat fails, or not a number) -> 0 too: a broken
-    # marker must never push its target to the BACK of the line
+    # marker makes its target tried EARLY, never skipped
     at="$(cat "$(_pool_nudge_attempt_file "$target")" 2>/dev/null)" || at=""
     case "$at" in ''|*[!0-9]*) at=0 ;; esac
     printf '%s\t%s\t%s\n' "$at" "$n" "$target"
@@ -3152,38 +3163,58 @@ EOF
 # _nudge_pool_heavy_stop <avail> <now_epoch> — starts the phase in the BACKGROUND and returns at once (see the lever
 # header: the CRITICAL notify/mail/reclaim must never wait on a slow `gc`). Pair it with _pool_nudge_join.
 _nudge_pool_heavy_stop() {
-  local avail="$1" now="$2" deadline
+  local avail="$1" now="$2" deadline errlog
   if [ "$POOL_NUDGE_ENABLED" != "1" ]; then
     log "pool-nudge SKIP — DOLT_DISK_FLOOR_POOL_NUDGE=${POOL_NUDGE_ENABLED} (not 1: the stop-heavy-steps notice is off) (ga-xdj2si)"
     return 0
   fi
   deadline=$(( $(date +%s) + POOL_NUDGE_BUDGET_SECS ))
   _POOL_NUDGE_DEADLINE="$deadline"
-  _pool_nudge_phase "$avail" "$now" "$deadline" >/dev/null 2>&1 </dev/null &
+  _POOL_NUDGE_PID=""
+  # the phase's stderr goes to the guard's log, so an abort inside it (an unbound variable under `set -u`, a command that is
+  # not there) leaves a trace - it used to vanish into /dev/null. vazio -> n/a; falhou (the log cannot be appended to) -> /dev/null:
+  # then log() itself cannot write either, and the join's exit-status WARN is all that is left to try
+  errlog=/dev/null
+  { : >>"$LOG"; } 2>/dev/null && errlog="$LOG"
+  _pool_nudge_phase "$avail" "$now" "$deadline" >/dev/null 2>>"$errlog" </dev/null &
   _POOL_NUDGE_PID=$!
   return 0
 }
 
 # _pool_nudge_join — the end of the cycle waits for the background phase, but only as long as its own budget plus the
 # slack: a phase still alive then is killed and logged (the cycle must end, not hang on a lever that is only a notice).
-# A join with nothing started is a no-op. Always succeeds.
+# It also reads HOW the phase ended: a phase that died non-zero, or a pid that is not a child of this cycle, is logged - a
+# lever that did not run is never reported as one that did (ga-xdj2si). A join with nothing started is a no-op. Always succeeds.
 _pool_nudge_join() {
-  local pid="$_POOL_NUDGE_PID" hard
+  local pid="$_POOL_NUDGE_PID" hard killed=0 prc own
   _POOL_NUDGE_PID=""
   # vazio (nothing was started: kill switch, no CRITICAL, no fork) -> nothing to wait for; ilegível (not a plain pid >= 2)
   # -> nothing is waited on AND nothing is killed: `kill -0 0` signals this whole process group and always succeeds, so a
   # stray 0 or 1 would loop to the cap and then `kill` the group - a join must never be able to do that
   case "$pid" in ''|*[!0-9]*|0|1) return 0 ;; esac
   hard=$(( ${_POOL_NUDGE_DEADLINE:-0} + POOL_NUDGE_JOIN_SLACK_SECS ))
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ "$(date +%s)" -ge "$hard" ]; then
-      log "WARN pool nudge: the nudge phase (pid ${pid}) is still running ${POOL_NUDGE_JOIN_SLACK_SECS}s past its ${POOL_NUDGE_BUDGET_SECS}s budget - killing it; the cycle does not wait for it (ga-xdj2si)"
-      kill "$pid" 2>/dev/null || true
-      break
-    fi
-    sleep 0.2
-  done
-  wait "$pid" 2>/dev/null || true
+  # only a pid that `jobs -p` lists as a live job of THIS shell is ever waited on in a loop or signalled. vazio (the phase is
+  # already gone, or the pid was never ours) -> no loop and no kill; the `wait` below says which of the two it was. falhou
+  # (jobs itself fails) -> the same as vazio. `$(...)` keeps jobs' bookkeeping out of this shell's own job table
+  own="$(jobs -p 2>/dev/null)" || own=""
+  if printf '%s\n' "$own" | grep -qx "$pid"; then
+    while kill -0 "$pid" 2>/dev/null; do
+      if [ "$(date +%s)" -ge "$hard" ]; then
+        log "WARN pool nudge: the nudge phase (pid ${pid}) is still running ${POOL_NUDGE_JOIN_SLACK_SECS}s past its ${POOL_NUDGE_BUDGET_SECS}s budget - killing it; the cycle does not wait for it (ga-xdj2si)"
+        kill "$pid" 2>/dev/null || true
+        killed=1
+        break
+      fi
+      sleep 0.2
+    done
+  fi
+  wait "$pid" 2>/dev/null
+  prc=$?
+  if [ "$prc" = "127" ]; then
+    log "WARN pool nudge: pid ${pid} is not a child of this cycle (wait: rc 127) - the nudge phase did not start, or its outcome cannot be read; nobody can be said to have been told to stop heavy steps this cycle (ga-xdj2si)"
+  elif [ "$prc" != "0" ] && [ "$killed" = "0" ]; then
+    log "WARN pool nudge: the nudge phase (pid ${pid}) ended with rc=${prc} instead of 0 - it died part-way: some or all of the active pool sessions may NOT have been told to stop heavy steps this cycle; its stderr, if any, is just above (ga-xdj2si)"
+  fi
   return 0
 }
 

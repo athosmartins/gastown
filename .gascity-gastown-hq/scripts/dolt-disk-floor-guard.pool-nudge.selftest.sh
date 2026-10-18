@@ -11,7 +11,11 @@
 # "no pool sessions"; a nudge that did not land is stamped as told; a timeout is counted as a failure; the phase blocks
 # its caller; there is no total budget; `gc` can read the target list; the join does not wait; the targets keep the
 # session-list order every cycle, so slow heads starve the rest - the blocker of the first gate run; a garbage attempt
-# marker sends its target to the back; a failed ordering tells nobody) - each must make the suite fail.
+# marker sends its target to the back; a failed ordering tells nobody; and, from the second gate run: a phase that dies
+# leaves no trace - its stderr is thrown away and the join does not read its exit status; a join that signals a pid that
+# is not its own job; a join that kills a phase it already reported as killed twice; a "08" in a knob read as octal)
+# - each must make the suite fail. Every suite run (the real guard and each mutant) starts with its own `$!`, so the
+# mutants that run side by side cannot lend each other a pid.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REAL="$HERE/dolt-disk-floor-guard.sh"
@@ -21,7 +25,7 @@ trap '[ -n "${W:-}" ] && [ -d "$W" ] && rm -rf -- "$W"' EXIT
 PASS=0; FAIL=0
 # every `p` the suite prints on the real guard; the completeness guard below is an equality, so a check that silently
 # stops running (or a new one nobody counted) fails the suite instead of passing unnoticed.
-EXPECTED_CHECKS=33
+EXPECTED_CHECKS=36
 
 cat > "$W/gc" <<'SH'
 #!/bin/sh
@@ -65,6 +69,9 @@ suite() {
   local guard="$1" S FWD
   S="$(mktemp -d "$W/state.XXXXXX")"; FWD="$(mktemp -d "$W/fw.XXXXXX")"
   (
+    # this suite's own `$!`: a subshell inherits the last background pid of whoever started it - for a mutant that is a
+    # SIBLING mutant's suite - and a mutant that loses the `&` would then wait on and kill that sibling (gate attempt 2)
+    : & wait $!
     export FW="$FWD" DOLT_DISK_FLOOR_GUARD_LIB=1 DOLT_DISK_FLOOR_GUARD_LOG="$FWD/log" DOLT_DISK_FLOOR_STATE_DIR="$S" GC_BIN="$W/gc"
     export DOLT_DISK_FLOOR_POOL_NUDGE_COOLDOWN_SECS=900
     # shellcheck disable=SC1090
@@ -155,11 +162,13 @@ suite() {
 
     # gate attempt 1 of ga-xdj2si (the blocker): the budget cut and the timeout leave NO cooldown stamp, so without a rotation the
     # same slow head targets are tried first EVERY cycle, spend the same budget, and the targets behind them are never told.
-    # Two heads (dog-1, dog-2) hang past the timeout and eat the whole 4 s budget; the four healthy sessions behind them
+    # Two heads (dog-1, dog-2) hang past the timeout and eat the whole 8 s budget (2 x the 4 s timeout, so one slow spawn on a loaded box
+    # still lets the second head start); the four healthy sessions behind them
     # were not reached. The NEXT cycle must reach those four first, ahead of the heads.
-    reset; printf 'gastown.dog-1\ngastown.dog-2\n' > "$FW/nudge-hang"; POOL_NUDGE_BUDGET_SECS=4; POOL_NUDGE_TIMEOUT_SECS=2
+    reset; printf 'gastown.dog-1\ngastown.dog-2\n' > "$FW/nudge-hang"; POOL_NUDGE_BUDGET_SECS=8; POOL_NUDGE_TIMEOUT_SECS=4
     run 2 "$NOW"; c1="$(nudge_order)"
-    : > "$FW/gc.calls"; run 2 $((NOW + 300)); c2="$(nudge_order)"
+    # cycle 2 only has to prove the ORDER: a roomy budget, so a loaded machine cannot cut the four healthy nudges short
+    : > "$FW/gc.calls"; POOL_NUDGE_BUDGET_SECS=30; run 2 $((NOW + 300)); c2="$(nudge_order)"
     set -- $c2; head4="${1:-} ${2:-} ${3:-} ${4:-}"
     told4=0; for t in wa-worker-x ps-worker-w gate-reviewer-z ga-f1; do [ "$(stamp_of "$t")" = "$((NOW + 300))" ] && told4=$((told4 + 1)); done
     if [ "$c1" = "gastown.dog-1 gastown.dog-2 " ] && [ "$head4" = "wa-worker-x ps-worker-w gate-reviewer-z ga-f1" ] && [ "$told4" = "4" ]; then
@@ -194,7 +203,7 @@ suite() {
     # item 1 - the lever must not hold its caller: 6 targets x 1 s of nudging, the caller must get control back at once
     reset; echo 1 > "$FW/nudge-sleep"; POOL_NUDGE_BUDGET_SECS=3
     t0=$(date +%s); _nudge_pool_heavy_stop 2 "$NOW"; t1=$(date +%s)
-    [ $((t1 - t0)) -le 1 ] && p "the nudge phase does not block its caller: control is back within 1 s although nudging all 6 targets would take 6 s" || f "the caller was held $((t1 - t0)) s by the nudge phase (6 targets x 1 s)"
+    [ $((t1 - t0)) -le 2 ] && p "the nudge phase does not block its caller: control is back within 2 s although nudging all 6 targets would take 6 s (3 s of budget)" || f "the caller was held $((t1 - t0)) s by the nudge phase (6 targets x 1 s)"
     # ... and the phase has a TOTAL budget: past it the rest are logged as not reached, unstamped, and the join returns on time
     _pool_nudge_join; t2=$(date +%s)
     calls="$(grep -c '^session nudge ' "$FW/gc.calls")"
@@ -209,7 +218,7 @@ suite() {
     reset; POOL_NUDGE_BUDGET_SECS=1; POOL_NUDGE_JOIN_SLACK_SECS=1
     _pool_nudge_phase() { exec sleep 30; }
     t0=$(date +%s); run 2 "$NOW"; t1=$(date +%s)
-    [ $((t1 - t0)) -le 5 ] && log_has "still running" && p "a hung phase is killed by the join past budget + slack (back after $((t1 - t0)) s), logged, the cycle goes on" || f "join waited $((t1 - t0)) s on a hung phase / did not log it"
+    [ $((t1 - t0)) -le 5 ] && log_has "still running" && ! log_has "ended with rc" && p "a hung phase is killed by the join past budget + slack (back after $((t1 - t0)) s), logged ONCE as a kill (not also as a phase that died), the cycle goes on" || f "join waited $((t1 - t0)) s on a hung phase / did not log it / logged the kill as a death too: $(tr '\n' '|' < "$FW/log")"
     unset -f _pool_nudge_phase
     # shellcheck disable=SC1090
     . "$guard"
@@ -221,7 +230,32 @@ suite() {
     : > "$FW/kill.calls"; kill() { echo "$*" >> "$FW/kill.calls"; kc=$((${kc:-0} + 1)); [ "$kc" -le 3 ]; }
     for bad in 0 1 abc; do kc=0; _POOL_NUDGE_PID="$bad"; _POOL_NUDGE_DEADLINE=1; _pool_nudge_join; done
     unset -f kill
-    [ ! -s "$FW/kill.calls" ] && p "a join handed a pid that is not a plain pid >= 2 (0, 1, text) neither waits nor kills - never a signal to the whole process group" || f "join signalled on a bogus pid: $(tr '\n' '|' < "$FW/kill.calls")"
+    [ ! -s "$FW/kill.calls" ] && ! log_has "WARN pool nudge" && p "a join handed a pid that is not a plain pid >= 2 (0, 1, text) neither waits, nor kills, nor even looks at it - never a signal to the whole process group" || f "join acted on a bogus pid: kills=$(tr '\n' '|' < "$FW/kill.calls") log=$(tr '\n' '|' < "$FW/log")"
+
+    # gate attempt 2 of ga-xdj2si (blocker 1): a pid that is a live process but NOT a job of this shell - what the `$!` of a
+    # sibling is, to a join - must never be waited on in a loop or signalled; the join says it is not its child and moves on.
+    # The foreign process is a detached sleeper (its parent is gone), alive until this check ends.
+    reset; : > "$FW/log"
+    fp="$(sh -c 'sleep 30 >/dev/null 2>&1 </dev/null & echo $!')"
+    _POOL_NUDGE_PID="$fp"; _POOL_NUDGE_DEADLINE=1; POOL_NUDGE_JOIN_SLACK_SECS=1
+    t0=$(date +%s); _pool_nudge_join; t1=$(date +%s)
+    if command kill -0 "$fp" 2>/dev/null && [ $((t1 - t0)) -le 3 ] && log_has "is not a child of this cycle" && ! log_has "still running"; then
+      p "a join handed a live pid that is not its own job leaves that process alone (no wait loop, no kill) and logs that it is not its child"
+    else f "foreign pid mishandled: alive=$(command kill -0 "$fp" 2>/dev/null && echo yes || echo NO) join took $((t1 - t0)) s log=$(tr '\n' '|' < "$FW/log")"; fi
+    command kill "$fp" 2>/dev/null
+
+    # gate attempt 2 (blocker 2, the third state): a phase that DIES part-way must leave a trace. FLOOR_CRITICAL_GB unset makes
+    # the phase abort under `set -u` at the message, after it read the list and before the first nudge: 0 nudges. The old guard
+    # printed nothing for it (stderr to /dev/null, `wait || true`): 0 nudges, 0 stderr bytes, 0 log lines, rc 0.
+    reset; fcg="$FLOOR_CRITICAL_GB"; unset FLOOR_CRITICAL_GB; run 2 "$NOW"; FLOOR_CRITICAL_GB="$fcg"
+    if [ -z "$(nudged)" ] && [ "$(stamps)" = "0" ] && log_has "unbound variable" && log_has "ended with rc=[1-9]" && ! log_has "pool nudge: told"; then
+      p "a phase that aborts before it nudges anybody is VISIBLE: its own error is in the log, and the join logs that it ended non-zero - no 'told' summary is invented"
+    else f "a dying phase left no trace: nudged='$(nudged)' log=$(tr '\n' '|' < "$FW/log")"; fi
+
+    # gate attempt 2 (non-blocking): a knob written "08" is eight, not an octal error; 0, text and absurdly long numbers fall back
+    got="$(export DOLT_DISK_FLOOR_POOL_NUDGE_BUDGET_SECS=08 DOLT_DISK_FLOOR_POOL_NUDGE_TIMEOUT_SECS=009 DOLT_DISK_FLOOR_POOL_NUDGE_JOIN_SLACK_SECS=0 DOLT_DISK_FLOOR_POOL_NUDGE_COOLDOWN_SECS=0123456789; . "$guard"; echo "$POOL_NUDGE_BUDGET_SECS $POOL_NUDGE_TIMEOUT_SECS $POOL_NUDGE_JOIN_SLACK_SECS $POOL_NUDGE_COOLDOWN_SECS")"
+    got2="$(export DOLT_DISK_FLOOR_POOL_NUDGE_BUDGET_SECS=00 DOLT_DISK_FLOOR_POOL_NUDGE_TIMEOUT_SECS=x1 DOLT_DISK_FLOOR_POOL_NUDGE_COOLDOWN_SECS=000; . "$guard"; echo "$POOL_NUDGE_BUDGET_SECS $POOL_NUDGE_TIMEOUT_SECS $POOL_NUDGE_COOLDOWN_SECS")"
+    [ "$got" = "8 9 10 900" ] && [ "$got2" = "60 15 0" ] && p "the numeric knobs are base 10 (08 -> 8, 009 -> 9), a zero budget/timeout/slack or text falls back to the default, a long number too, and a zero cooldown is allowed" || f "knobs wrong: '$got' (wanted '8 9 10 900'), '$got2' (wanted '60 15 0')"
   ) 2>&1
 }
 
@@ -255,10 +289,10 @@ mutant "an unreadable list is taken for no pool sessions" 's/  if ! printf .%s. 
 mutant_perl "a jq failure on the extraction is taken for no pool sessions" 's/\|\| \{\n    log "WARN pool nudge: could not pick[^\n]*\n    return 0\n  \}/|| targets=""/'
 mutant "a nudge that did not land is stamped as told" 's/    if \[ "\$rc" = "0" \]; then/    if true; then/'
 mutant "a timed-out nudge is counted among the failures" 's/    elif \[ "\$rc" = "124" \] || \[ "\$rc" = "137" \]; then/    elif false; then/'
-mutant "the nudge phase runs in the foreground and holds its caller" 's/^\(  _pool_nudge_phase "\$avail" "\$now" "\$deadline" >\/dev\/null 2>&1 <\/dev\/null\) &$/\1/'
+mutant "the nudge phase runs in the foreground and holds its caller" 's/^\(  _pool_nudge_phase "\$avail" "\$now" "\$deadline" >\/dev\/null 2>>"\$errlog" <\/dev\/null\) &$/\1/'
 mutant "the phase has no total budget" 's/    if \[ "\$remaining" -lt 1 \]; then/    if false; then/'
 mutant "gc inherits the loop stdin and can eat the target list" '/session nudge "\$target"/s/ <\/dev\/null//'
-mutant "the join does not wait for the phase" 's/^  while kill -0 "\$pid" 2>\/dev\/null; do/  while false; do/'
+mutant "the join has no hard cap: it waits for as long as the phase runs" 's/^    while kill -0 "\$pid" 2>\/dev\/null; do/    while false; do/'
 mutant "the join accepts any pid (0 signals the whole process group)" "s/  case \"\\\$pid\" in ''|\\*\\[!0-9\\]\\*|0|1) return 0 ;; esac/  :/"
 mutant "the kill switch is silent" 's/    log "pool-nudge SKIP/    : "pool-nudge SKIP/'
 mutant "an unreadable cooldown stamp mutes the target" 's/last="\$(cat "\$stamp" 2>\/dev\/null)" || last=""/last="$(cat "$stamp" 2>\/dev\/null)" || last="$now"/'
@@ -270,6 +304,14 @@ mutant_perl "a garbage attempt marker is taken for a recent attempt (the target 
 mutant_perl "a failed ordering is taken for no targets (nobody is told)" 's#if \[ -n "\$ordered" \]; then\n    targets="\$ordered"\n  else#targets="\$ordered"\n  if false; then\n    :\n  else#'
 mutant "a target skipped by the cooldown gets its attempt marker moved" 's#      cooled=\$((cooled + 1))#      cooled=$((cooled + 1)); mkdir -p "${STATE_POOL_NUDGE_DIR}.attempt"; printf "%s" "$now" > "$(_pool_nudge_attempt_file "$target")"#'
 mutant "a target the budget did not reach gets an attempt marker (so it does NOT go first)" 's#      unreached=\$((unreached + 1))#      unreached=$((unreached + 1)); mkdir -p "${STATE_POOL_NUDGE_DIR}.attempt"; printf "%s" "$now" > "$(_pool_nudge_attempt_file "$target")"#'
+# the third state of the phase (gate attempt 2): a phase that dies must be visible, and the join must only touch its own job
+mutant "the phase's stderr is thrown away (an abort leaves no trace)" 's#^\(  _pool_nudge_phase "\$avail" "\$now" "\$deadline" >/dev/null \)2>>"\$errlog"#\12>/dev/null#'
+mutant "the join does not read how the phase ended" 's/^  prc=\$?$/  prc=0/'
+mutant "the join signals a pid that is not its own job" 's/^  if printf .%s\\n. "\$own" | grep -qx "\$pid"; then$/  if true; then/'
+mutant "a pid that is not a child of the cycle is not reported" 's/^  if \[ "\$prc" = "127" \]; then$/  if false; then/'
+mutant "the join's own kill is reported again as a phase that died" 's/^        killed=1$/        killed=0/'
+mutant "a knob written 08 stays octal" 's/^  v=\$((10#\$v))$/  v=$v/'
+mutant "a zero budget/timeout/slack is accepted (no limit)" 's/^  if \[ "\$v" -ge "\$min" \]; then printf/  if true; then printf/'
 wait
 for r in $MUT_RES; do
   line="$(cat "$r" 2>/dev/null)"; [ -n "$line" ] || line="FAIL:  mutant result missing ($r)"
