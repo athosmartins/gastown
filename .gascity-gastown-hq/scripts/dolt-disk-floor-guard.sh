@@ -3321,7 +3321,10 @@ _resurrect_dolt() {
 #   - THREE STATES for "who is there to tell": the list could not be read (gc failed/timed out, not JSON, ok=false)
 #     -> log it, send nothing, stamp nothing so the next cycle retries; read and EMPTY -> log "none"; read and not
 #     empty -> nudge each. A failed list is never the same as "no pool sessions".
-#   - DOLT_DISK_FLOOR_POOL_NUDGE=0 (any value but 1) switches it off (never in prod) and logs "pool-nudge SKIP".
+#   - DOLT_DISK_FLOOR_POOL_NUDGE=1 is on and =0 is the off switch (never in prod); =0 logs "pool-nudge SKIP". Any OTHER value
+#     (true, on, yes, 01...) is not one the switch knows: it stays OFF too (a missed notice is the inert side, and a guess at
+#     what was meant could send a notice nobody asked for), but it logs "WARN pool-nudge SKIP ... not a value this switch
+#     knows", so whoever wrote "true" meaning "on" sees on the log that it did not take (ga-t86g6f).
 POOL_NUDGE_ENABLED="${DOLT_DISK_FLOOR_POOL_NUDGE:-1}"
 # _pool_nudge_num <value> <default> <min> -> the value as a plain BASE-10 integer >= min, else the default. vazio / not digits /
 # 8+ digits -> the default (a 0 budget or timeout would mean "no limit" to `timeout` or "never wait" to the join); 10# so a
@@ -3468,7 +3471,13 @@ EOF
 _nudge_pool_heavy_stop() {
   local avail="$1" now="$2" deadline errlog
   if [ "$POOL_NUDGE_ENABLED" != "1" ]; then
-    log "pool-nudge SKIP — DOLT_DISK_FLOOR_POOL_NUDGE=${POOL_NUDGE_ENABLED} (not 1: the stop-heavy-steps notice is off) (ga-xdj2si)"
+    # 0 is the documented off switch; anything else is a value the switch does not know. Both skip the phase (same inert
+    # outcome); only the log line tells them apart, so a "true" that was meant as "on" is not mistaken for a deliberate off
+    if [ "$POOL_NUDGE_ENABLED" = "0" ]; then
+      log "pool-nudge SKIP — DOLT_DISK_FLOOR_POOL_NUDGE=0 (the stop-heavy-steps notice is switched off) (ga-xdj2si)"
+    else
+      log "WARN pool-nudge SKIP — DOLT_DISK_FLOOR_POOL_NUDGE='${POOL_NUDGE_ENABLED}' is not a value this switch knows (1 = on, 0 = off): treated as OFF, so NOBODY was told to stop heavy steps this cycle (ga-t86g6f)"
+    fi
     return 0
   fi
   deadline=$(( $(date +%s) + POOL_NUDGE_BUDGET_SECS ))

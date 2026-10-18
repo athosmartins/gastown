@@ -25,7 +25,7 @@ trap '[ -n "${W:-}" ] && [ -d "$W" ] && rm -rf -- "$W"' EXIT
 PASS=0; FAIL=0
 # every `p` the suite prints on the real guard; the completeness guard below is an equality, so a check that silently
 # stops running (or a new one nobody counted) fails the suite instead of passing unnoticed.
-EXPECTED_CHECKS=36
+EXPECTED_CHECKS=37
 
 cat > "$W/gc" <<'SH'
 #!/bin/sh
@@ -151,6 +151,15 @@ suite() {
 
     reset; DOLT_DISK_FLOOR_POOL_NUDGE=0; POOL_NUDGE_ENABLED=0; run 2 "$NOW"
     [ -z "$(nudged)" ] && [ ! -s "$FW/gc.calls" ] && log_has "pool-nudge SKIP" && p "the kill switch: no gc call at all, and it says SKIP on the log like the other levers" || f "kill switch mishandled (calls=$(wc -l < "$FW/gc.calls") log=$(tr '\n' '|' < "$FW/log"))"
+    # ga-t86g6f: only 1 is on and only 0 is the documented off. "true"/"on"/"yes" switch the notice off too (inert side), but the
+    # log has to say the value was not recognised - and an explicit 0 must NOT be reported that way, or the warning means nothing
+    reset; POOL_NUDGE_ENABLED=true; run 2 "$NOW"
+    if [ -z "$(nudged)" ] && [ ! -s "$FW/gc.calls" ] && log_has "WARN pool-nudge SKIP" && log_has "'true' is not a value this switch knows"; then
+      reset; POOL_NUDGE_ENABLED=0; run 2 "$NOW"
+      if log_has "pool-nudge SKIP" && ! log_has "not a value this switch knows"; then
+        p "a switch value that is neither 1 nor 0 ('true') is off AND is logged as not recognised; an explicit 0 is not reported that way"
+      else f "an explicit 0 was reported as an unrecognised value: $(tr '\n' '|' < "$FW/log")"; fi
+    else f "an unrecognised switch value was quiet or still nudged: nudged='$(nudged)' log=$(tr '\n' '|' < "$FW/log")"; fi
     reset; POOL_NUDGE_TEMPLATES="thies-wa"; run 2 "$NOW"
     [ "$(nudged)" = "thies-wa " ] && p "the template list is data (DOLT_DISK_FLOOR_POOL_NUDGE_TEMPLATES): only what it names is nudged" || f "template filter ignored: '$(nudged)'"
 
@@ -295,6 +304,8 @@ mutant "gc inherits the loop stdin and can eat the target list" '/session nudge 
 mutant "the join has no hard cap: it waits for as long as the phase runs" 's/^    while kill -0 "\$pid" 2>\/dev\/null; do/    while false; do/'
 mutant "the join accepts any pid (0 signals the whole process group)" "s/  case \"\\\$pid\" in ''|\\*\\[!0-9\\]\\*|0|1) return 0 ;; esac/  :/"
 mutant "the kill switch is silent" 's/    log "pool-nudge SKIP/    : "pool-nudge SKIP/'
+mutant "an unrecognised switch value is as quiet as a deliberate 0" 's/    if \[ "\$POOL_NUDGE_ENABLED" = "0" \]; then/    if true; then/'
+mutant "a deliberate 0 is reported as an unrecognised value" 's/    if \[ "\$POOL_NUDGE_ENABLED" = "0" \]; then/    if false; then/'
 mutant "an unreadable cooldown stamp mutes the target" 's/last="\$(cat "\$stamp" 2>\/dev\/null)" || last=""/last="$(cat "$stamp" 2>\/dev\/null)" || last="$now"/'
 # the rotation (ga-xdj2si, gate attempt 1): each of these reintroduces the starvation or a variant of it
 mutant "no rotation: the targets keep the session-list order every cycle" 's#| sort -t "\$tab" -k1,1n -k2,2n | cut -f3-#| cut -f3-#'
