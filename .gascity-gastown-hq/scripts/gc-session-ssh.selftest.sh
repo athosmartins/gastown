@@ -39,7 +39,7 @@
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); 90 mutantes no total (os 26 últimos, grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine).
+#   registro de sessões do list-running); 99 mutantes no total (26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1
 set -u
@@ -736,7 +736,7 @@ echo "== $((n-fails))/$n ok =="
   mutant mbp "rc 99 (pausa/bandeira) não reconhecido" 's/if r.returncode == 99:/if False:/'
   mutant mbp "slot_cap da checagem ignorado" 's/cap = min(cap, g\["slot_cap"\])/pass/'
   mutant mbp "host pelo nome da sessão" 's/return m.group(1) if m else ""/return ""/'
-  mutant mbp "sem vigia de prioridade" 's/^    if cfg.gate:$/    if False:/'
+  mutant mbp "sem vigia de prioridade" 's/^    if cfg.gate:  # o vigia nasce.*$/    if False:/'
   mutant mbp "sem conferir o zdot do bundle" 's/^    if cfg.spath:  # o zdot do bundle/    if False:  # o zdot do bundle/'
   mutant mbp "sem ZDOTDIR no lançador" 's/out += \[f"export ZDOTDIR={q(cfg.zdot)}", /out += [/'
   mutant mbp "sem CLAUDE_ENV_FILE no lançador" "s/f\"export CLAUDE_ENV_FILE={q(cfg.zdot + '\/env.sh')}\", //"
