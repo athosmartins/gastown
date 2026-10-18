@@ -498,6 +498,10 @@ PYC_GONE=(
 PYC_KEPT=(
   "$PYC_ROOT/crew/x/tests/__pycache__/fresh.cpython-311.pyc"   # modified just now
   "$PYC_ROOT/crew/x/.pytest_cache/v/cache/fresh-entry"         # modified just now
+  "$PYC_ROOT/crew/x/.pytest_cache/.gitignore"                  # pytest writes these three ONCE, when it creates the
+  "$PYC_ROOT/crew/x/.pytest_cache/README.md"                   # directory, and never again while it exists: taking them
+  "$PYC_ROOT/crew/x/.pytest_cache/CACHEDIR.TAG"                # leaves .pytest_cache untracked in git (gate finding 18/10)
+  "$PYC_ROOT/crew/x/.pytest_cache/d/plugin-store"              # the d/ store of plugins, not pytest's v/ value store
   "$PYC_ROOT/crew/x/tests/__pycache__/cache.nbi"               # shares __pycache__ but is not bytecode
   "$PYC_ROOT/crew/x/a.py"
   "$PYC_ROOT/crew/x/Makefile"                                  # no extension, next to the .py
@@ -535,8 +539,8 @@ pyc_check_set() { # <label> — GONE gone, KEPT (and the symlink + its target) p
   for f in "${PYC_GONE[@]}"; do [ -e "$f" ] && missing_gone="$missing_gone ${f#$PYC_ROOT/}"; done
   for f in "${PYC_KEPT[@]}"; do [ -e "$f" ] || present_kept="$present_kept ${f#$PYC_ROOT/}"; done
   [ -L "$PYC_ROOT/crew/x/__pycache__/link.pyc" ] || present_kept="$present_kept crew/x/__pycache__/link.pyc(symlink)"
-  [ -z "$missing_gone" ] && ok "$label: the 4 candidates (2 .pyc under __pycache__, 2 files under .pytest_cache) are DELETED" || bad "$label: still present:$missing_gone"
-  [ -z "$present_kept" ] && ok "$label: every file that is not a stale pycache file SURVIVED (.py, extensionless, nbi, legacy .pyc, fresh files, symlink, venv/.git/.beads/.dolt/node_modules)" || bad "$label: wrongly removed:$present_kept"
+  [ -z "$missing_gone" ] && ok "$label: the 4 candidates (2 .pyc under __pycache__, 2 files under .pytest_cache/v) are DELETED" || bad "$label: still present:$missing_gone"
+  [ -z "$present_kept" ] && ok "$label: every file that is not a stale pycache file SURVIVED (.py, extensionless, nbi, legacy .pyc, fresh files, symlink, pytest's one-time .gitignore/README.md/CACHEDIR.TAG, d/, venv/.git/.beads/.dolt/node_modules)" || bad "$label: wrongly removed:$present_kept"
 }
 
 # 1. The main run.
@@ -557,6 +561,12 @@ else
 fi
 rm -f "$STATE_PYCACHE_REAP_FILE"; _reap_pycache
 [ ! -e "$PYC_ROOT/crew/x/tests/__pycache__/again.cpython-311.pyc" ] && ok "_reap_pycache: with the cooldown over, the same file is taken" || bad "_reap_pycache: still present after the cooldown elapsed"
+
+# 2b. A state file that cannot be written (ENOSPC is the condition this guard serves) is LOGGED, not swallowed.
+mkdir -p "$PYC_TMP/statedir"; STATE_PYCACHE_REAP_FILE="$PYC_TMP/statedir"; pyc_log_mark
+_reap_pycache
+STATE_PYCACHE_REAP_FILE="$PYC_TMP/state"
+pyc_log | grep -q "pycache-reap WARN — could not write the state file" && ok "_reap_pycache: a state file that cannot be written is reported (the cooldown and the resume point are not silently lost)" || bad "_reap_pycache: a failed state write left no line on the log"
 
 # 3. An age the lever cannot read must make it do NOTHING (a '0' would take files a running pytest writes).
 for pyc_v in abc 0 "" -5 1.5; do
@@ -622,6 +632,16 @@ pyc_restore_fns
 pyc_n=0; for pyc_f in "${PYC_GONE[@]}"; do [ -e "$pyc_f" ] && pyc_n=$((pyc_n+1)); done
 [ "$pyc_n" = "4" ] && pyc_log | grep -q "SPARED (the scan result is unreadable: '4 100 0 junk')" && ok "_reap_pycache: a scan result with a 4th field is unreadable → SPARED, nothing deleted" || bad "_reap_pycache: a malformed (4-field) scan result was acted on (still present: $pyc_n of 4)"
 
+# 7c. One or two fields are as unreadable as four: the split alone would repeat the last field ("5" -> 5 5 5).
+for pyc_v in "5" "5 100"; do
+  _pycache_measure_root() { echo "$pyc_v"; }
+  rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+  _reap_pycache
+  pyc_restore_fns
+  pyc_n=0; for pyc_f in "${PYC_GONE[@]}"; do [ -e "$pyc_f" ] && pyc_n=$((pyc_n+1)); done
+  [ "$pyc_n" = "4" ] && pyc_log | grep -q "SPARED (the scan result is unreadable: '$pyc_v')" && ok "_reap_pycache: a scan result of '$pyc_v' (too few fields) is unreadable → SPARED, nothing deleted" || bad "_reap_pycache: a short scan result '$pyc_v' was acted on (still present: $pyc_n of 4)"
+done
+
 # 8. A delete that fails (nothing removed) is PARTIAL, and the freed figure comes from a re-measure, not from hope.
 _pycache_delete_root() { return 1; }
 rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
@@ -647,6 +667,23 @@ PYCACHE_REAP_ROOTS="$PYC_TMP/r1:$PYC_TMP/r2" PYCACHE_REAP_TIMEOUT_SECS=3 _reap_p
 pyc_restore_fns
 pyc_log | grep -q "time budget (3s) used up before $PYC_TMP/r2" && ok "_reap_pycache: the time budget stops the walk and names the root left for the next run" || bad "_reap_pycache: budget exhaustion is not reported: $(pyc_log | grep 'pycache-reap' | tr '\n' '|')"
 
+# 10b. Where a run was cut off is remembered: the next run starts there and wraps around, and a complete run resets it.
+mkdir -p "$PYC_TMP/r3"
+_pycache_measure_root() { sleep 4; echo "0 0 0"; }
+rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+PYCACHE_REAP_ROOTS="$PYC_TMP/r1:$PYC_TMP/r2:$PYC_TMP/r3" PYCACHE_REAP_TIMEOUT_SECS=3 _reap_pycache
+pyc_restore_fns
+[ "$(cut -d' ' -f2 "$STATE_PYCACHE_REAP_FILE")" = "1" ] && pyc_log | grep -q "used up before $PYC_TMP/r2 — it and the 1 root(s) after it wait" && ok "_reap_pycache: a run cut off before the 2nd of 3 roots records resume index 1 and says 2 roots wait" || bad "_reap_pycache: the cut-off run did not record its resume point: state='$(cat "$STATE_PYCACHE_REAP_FILE" 2>/dev/null)'"
+echo "$(( $(date +%s) - 4000 )) 1" > "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+PYCACHE_REAP_ROOTS="$PYC_TMP/r1:$PYC_TMP/r2:$PYC_TMP/r3" _reap_pycache
+pyc_order="$(pyc_log | grep -o "$PYC_TMP/r[123] — nothing older" | sed 's#.*/\(r[123]\) .*#\1#' | tr '\n' ' ')"
+[ "$pyc_order" = "r2 r3 r1 " ] && ok "_reap_pycache: the next run starts at the saved root and wraps around (r2 r3 r1)" || bad "_reap_pycache: the walk did not resume where the last run was cut (order: '$pyc_order')"
+[ "$(cut -d' ' -f2 "$STATE_PYCACHE_REAP_FILE")" = "0" ] && ok "_reap_pycache: a run that reaches every root resets the resume point to 0" || bad "_reap_pycache: the resume point was not reset: state='$(cat "$STATE_PYCACHE_REAP_FILE" 2>/dev/null)'"
+echo "$(( $(date +%s) - 4000 )) 99" > "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+PYCACHE_REAP_ROOTS="$PYC_TMP/r1:$PYC_TMP/r2:$PYC_TMP/r3" _reap_pycache
+pyc_order="$(pyc_log | grep -o "$PYC_TMP/r[123] — nothing older" | sed 's#.*/\(r[123]\) .*#\1#' | tr '\n' ' ')"
+[ "$pyc_order" = "r1 r2 r3 " ] && ok "_reap_pycache: a resume point past the end of the list (a rig went away) starts from the top" || bad "_reap_pycache: a stale resume point was not discarded (order: '$pyc_order')"
+
 # 11. Root discovery: rigs are the ~/gt/<dir> that have a .beads; the worktree dirs come with them.
 mkdir -p "$PYC_TMP/town/rigA/.beads" "$PYC_TMP/town/notrig" "$PYC_TMP/town/city"
 CITY="$PYC_TMP/town/city"; PYCACHE_REAP_ROOTS=""
@@ -661,9 +698,33 @@ else
 fi
 
 # A scenario that aborts half way (an arithmetic error in the lever kills the loop around it, for example)
-# prints fewer PASS lines and NO FAIL line. Count them: the block has 27 assertions.
+# prints fewer PASS lines and NO FAIL line. Count them: the block has 34 assertions.
 PYC_RAN=$((PASS+FAIL-PYC_ASSERT_BASE))
-[ "$PYC_RAN" = "27" ] && ok "_reap_pycache: all 27 assertions of this block ran (none was skipped by an abort)" || bad "_reap_pycache: only $PYC_RAN of the 27 assertions ran - a scenario aborted"
+[ "$PYC_RAN" = "34" ] && ok "_reap_pycache: all 34 assertions of this block ran (none was skipped by an abort)" || bad "_reap_pycache: only $PYC_RAN of the 34 assertions ran - a scenario aborted"
+# 13. The finding of the gate (18/10), with a REAL pytest instead of a hand-made fixture: pytest writes
+# .gitignore / README.md / CACHEDIR.TAG once, when it creates .pytest_cache, and not again while the
+# directory exists. After a reap, a second pytest run must still leave .pytest_cache ignored by git.
+# Needs pytest and git; without them it says SKIP on the output (not counted, but never silent).
+if python3 -m pytest --version >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+  PYC_RT="$PYC_TMP/realpytest"; mkdir -p "$PYC_RT"
+  : > "$PYC_RT/pytest.ini"
+  printf 'def test_a():\n    assert True\n' > "$PYC_RT/test_a.py"
+  pyc_pytest_untracked() { ( cd "$PYC_RT" && git status --porcelain 2>/dev/null | grep -c 'pytest_cache' || true ); }
+  ( cd "$PYC_RT" && git init -q . 2>/dev/null; python3 -m pytest -q test_a.py >/dev/null 2>&1 )
+  if [ -f "$PYC_RT/.pytest_cache/.gitignore" ] && [ "$(pyc_pytest_untracked)" = "0" ]; then
+    /usr/bin/find "$PYC_RT/.pytest_cache" "$PYC_RT/__pycache__" -type f -exec touch -t "$PYC_OLD_TS" {} + 2>/dev/null
+    rm -f "$STATE_PYCACHE_REAP_FILE"; PYCACHE_REAP_ROOTS="$PYC_RT" _reap_pycache
+    ( cd "$PYC_RT" && python3 -m pytest -q test_a.py >/dev/null 2>&1 )
+    [ -e "$PYC_RT/.pytest_cache/.gitignore" ] && ok "real pytest: pytest's one-time .gitignore/README.md/CACHEDIR.TAG survive the reap" || bad "real pytest: the reap took pytest's one-time .gitignore"
+    [ "$(pyc_pytest_untracked)" = "0" ] && ok "real pytest: after reap + a second pytest run, git still ignores .pytest_cache (the cache is not left untracked)" || bad "real pytest: .pytest_cache shows in git status after reap + a second pytest run: $(cd "$PYC_RT" && git status --porcelain | tr '\n' '|')"
+    [ "$( ( cd "$PYC_RT" && git add -A -n 2>/dev/null | grep -c 'pytest_cache' || true ) )" = "0" ] && ok "real pytest: git add -A would not stage any .pytest_cache file" || bad "real pytest: git add -A would stage .pytest_cache files"
+  else
+    echo "  SKIP: real pytest check - the first pytest run did not leave a self-ignoring .pytest_cache here (pytest too old or no git)"
+  fi
+else
+  echo "  SKIP: real pytest check - python3 -m pytest or git is not available on this host"
+fi
+
 # shellcheck disable=SC2034  # read by _pycache_reap_roots / _reap_pycache in the sourced script
 PYCACHE_REAP_ROOTS=""; STATE_PYCACHE_REAP_FILE="$STATE_DIR/.dolt-disk-floor-guard.pycache-reap-last"
 chmod -R u+rwx "$PYC_TMP" 2>/dev/null; rm -rf "$PYC_TMP"
