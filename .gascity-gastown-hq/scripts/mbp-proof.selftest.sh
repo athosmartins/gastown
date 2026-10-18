@@ -149,6 +149,7 @@ agent() {  # a "sessão": os 6 passos do prompt, com o modo de falha pedido
   case $mode in
     secret) printf 'token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$G/shim/vazou.txt";;
     leadfile) echo "joao@example.com" > "$wd/leads.csv";;
+    badclaudejson) echo "isto nao e json" > "$SRV/.claude.json";;
     bigfile) head -c 3100000 /dev/zero > "$wd/grande.bin";;
     credleak) echo "https://u:pppppppp@github.com" > "$SRV/.git-credentials";;
     sshkey) echo "chave" > "$SRV/.ssh/id_ed25519";;
@@ -242,6 +243,7 @@ srv_skeleton() {  # o "MBP" antes da instalação: o que o Athos já tem (claude
   find "$SRV" -mindepth 1 -delete 2> /dev/null; mkdir -p "$SRV/fakebin" "$SRV/tmp" "$SRV/gt-remote/bin" "$SRV/.ssh" "$SRV/.claude"
   cp "$T/fake/tmux" "$T/fake/claude" "$SRV/fakebin/"
   for t in python3 git; do [ -x "/usr/bin/$t" ] || [ -x "/bin/$t" ] || ln -s "$(command -v $t)" "$SRV/fakebin/$t"; done
+  find "$SRV/fakebin/git" -delete 2> /dev/null; printf '#!/bin/sh\n[ -z "${FAKE_GITFAIL:-}" ] || case " $* " in *" $FAKE_GITFAIL "*) echo "git: boom" >&2; exit 128;; esac\nexec %s "$@"\n' "$(command -v git)" > "$SRV/fakebin/git"; chmod +x "$SRV/fakebin/git"; rp=$(command -v ps); printf '#!/bin/sh\ncase "$*" in *nice=*) [ -z "${FAKE_PSNICE:-}" ] || { %s "$@" | sed "s/^\\( *[0-9]* *[0-9]* *\\)[-0-9]*/\\1-/"; exit 0; };; esac\nexec %s "$@"\n' "$rp" "$rp" > "$SRV/fakebin/ps"; chmod +x "$SRV/fakebin/ps"  # git que falha só no subcomando pedido (FAKE_GITFAIL); ps que não dá o nice (FAKE_PSNICE), como o "-" das tarefas de tempo real no nó Linux
   printf '#!/bin/sh\n' > "$SRV/gt-remote/bin/mbp-presence.sh"
   printf '{"projects": {}, "numStartups": 3}\n' > "$SRV/.claude.json"
   echo "github.com ssh-ed25519 AAAAfake" > "$SRV/.ssh/known_hosts"; echo "ssh-ed25519 AAAAfake athos@mbp" > "$SRV/.ssh/authorized_keys"
@@ -473,6 +475,9 @@ g_e2e() {
   fail1 bigfile bigfile "FAIL (d) varredura (antes de apagar a pasta de teste)" "arquivo de 3,1 MB no clone (grande demais para ler) → a varredura reprova em vez de passar sem olhar"
   fail1 credleak credleak "FAIL (c)(d) varredura depois" "credencial git nova em ~/.git-credentials → a comparação antes/depois reprova"
   fail1 sshkey sshkey "FAIL (c)(d) varredura depois" "chave nova em ~/.ssh → a comparação antes/depois reprova"
+  FAKE_PSNICE=1 fail1 psnice ok "FAIL (b) li a árvore de processos da sessão antes da pausa" "nice ilegível num processo da sessão → NÃO é nice 0: a leitura da árvore reprova (o de processo alheio não conta: o nó Linux tem tarefas com \"-\")"
+  fail1 badclaudejson badclaudejson "FAIL (c)(d) varredura depois" "~/.claude.json ilegível depois da limpeza → NÃO é \"sem marca de confiança\": a comparação antes/depois reprova"
+  FAKE_GITFAIL=status fail1 gitstatus ok "FAIL (d) commit no MBP, com a identidade da sessão" "git status que falha → NÃO é \"árvore limpa\": a prova do commit reprova"
   fail1 snapfail snapfail "FAIL (c)(d) varredura depois: li o estado do MBP" "leitura do MBP que falha depois da limpeza → reprova (sem leitura não há \"nada novo\")"
   c dialog && { FAKE_MODE=dialog ep; [ $RC = 1 ] && has "$T/out" "FAIL (e) a sessão rodou" && has "$T/out" "trust this folder" && has "$T/out" "sessão andou sem diálogo" && [ "$(calls nudge)" = 0 ] && ! grep -q 'send-keys' "$FAKE_STATE/provcalls" && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: diálogo de primeira execução → reprova mostrando a tela, NUNCA é respondido (nenhum nudge/send-keys) e a sessão é parada (rc=$RC)"; }
   fail1 die die "FAIL (e) a sessão rodou" "sessão que morre antes do fim → reprova com a tela"
@@ -491,6 +496,9 @@ g_e2e() {
   c nopresence && { e2e_fixture; find "$SRV/gt-remote/bin/mbp-presence.sh" -delete; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sem a biblioteca de presença"; ok $? "e2e: sem a biblioteca de presença no MBP → não começa (rc=$RC)"; }
   c swappause && { FAKE_MODE=swappause ep; [ $RC = 1 ] && has "$T/out" "a pausa NÃO é desta rodada" && [ "$(cat "$SRV/gt-remote/PAUSE")" = "origem=athos desde=2026-10-18T10:00:00" ] && [ "$(calls stop)" -ge 1 ]; ok $? "e2e: o Athos troca a pausa por uma dele depois da da prova → a prova NÃO a remove (nem no fim), reprova (b) e a pausa DELE fica como estava (rc=$RC)"; }
   c badjson && { e2e_fixture; echo "isto nao e json" > "$SRV/.claude.json"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "nunca rodou aqui" && [ "$(cat "$SRV/.claude.json")" = "isto nao e json" ]; ok $? "e2e: ~/.claude.json ilegível → não começa e não o reescreve (rc=$RC)"; }
+  c gitblobs && { FAKE_GITFAIL=cat-file FAKE_MODE=ok ep; [ $RC = 1 ] && has "$T/out" "FAIL clone sem dado" && has "$T/out" "FAIL (d) clone continua sem dado"; ok $? "e2e: git cat-file que falha (no clone e depois do commit) → NÃO é \"0 blobs\": as duas provas de \"clone sem dado\" reprovam (rc=$RC)"; }
+  c githead && { FAKE_GITFAIL="rev-parse HEAD" FAKE_MODE=ok ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "o MBP não preparou a pasta de teste"; ok $? "e2e: git rev-parse HEAD que falha → sem o commit de partida a prova não começa (rc=$RC)"; }
+  c snapwalk && { e2e_fixture; find "$SRV/gt-remote/shim-bin" -delete; : > "$SRV/gt-remote/shim-bin"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "não consegui ler o estado do MBP"; ok $? "e2e: shim-bin que não dá para varrer (é um arquivo) → NÃO é \"pasta vazia\": não começa, saída 3 (rc=$RC)"; }
   c staleproof && { e2e_fixture; mkdir -p "$SRV/gt-remote/proof/velho"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sobrou algo em gt-remote/proof" && [ -d "$SRV/gt-remote/proof/velho" ]; ok $? "e2e: sobra de uma rodada anterior em gt-remote/proof → não começa e não apaga o que não é dela (rc=$RC)"; }
   c stalesocket && { e2e_fixture; mkdir -p "$SRV/tmp/tmux-$(id -u)"; : > "$SRV/tmp/tmux-$(id -u)/gc-remote"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sobrou um socket do tmux"; ok $? "e2e: socket do tmux sobrando sem servidor → não começa (a prova mede que o stop não deixa socket) (rc=$RC)"; }
   c foreignrun && { e2e_fixture; mkdir -p "$SRV/gt-remote/bundle/run"; echo x > "$SRV/gt-remote/bundle/run/outra.sh"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && [ -f "$SRV/gt-remote/bundle/run/outra.sh" ]; ok $? "e2e: run/ com arquivo de outra sessão → não começa (e o verify do bundle também reprova) e o arquivo fica (rc=$RC)"; }
@@ -543,12 +551,7 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant install inst-tamper "verify no MBP ignorado" 'if v.returncode != 0 or got != want:' 'if False:'
   mutant install inst-ok "a troca perde run/" '[ ! -d "$B/run" ] || mv "$B/run" "$N/run"\n' ''
   mutant install inst-ok "o spool não vira 0700" ' && chmod 700 {q(SPOOL)}' ''
-  mutant e2e athos "o gate do MBP é ignorado" '        g = self.prov("gate", HOST, timeout=90)
-        try:
-            v = json.loads' '        return True, "livre"
-        g = self.prov("gate", HOST, timeout=90)
-        try:
-            v = json.loads'
+  mutant e2e athos "o gate do MBP é ignorado" 'return g.returncode == 0, v.get("reason") or self.out(g)[:160]' 'return True, "livre"'
   mutant e2e athosback "still_free nunca aborta" '        raise Aborted(f"antes de {stage}: {why}")' '        return'
   mutant e2e ok "o clone traz blobs" '"--no-checkout", "--depth", "1", "--filter=blob:none", ' '"--no-checkout", "--depth", "1", '
   mutant e2e evilpush "o hook de pre-push deixa passar qualquer ref" '[ "$rref" = "refs/heads/worker/%s" ] ||' 'true ||'
@@ -557,9 +560,7 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e nocomment "o comentário da bead não é conferido" 'and self.run in c.stdout.decode("utf-8", "replace")' 'and True'
   mutant e2e nogchooks "os hooks gc não precisam ter disparado" 'bool(prime) and any("nudge drain" in r["cmd"] for r in ups)' 'True'
   mutant e2e badline "linha ilegível da transcrição não conta" ' and unreadable == 0' ''
-  mutant e2e nowatch "o vigia que não rebaixa passa" 'ok, rows, why = judge_tree(rows0, last.get("rows") or [], t0["watcher"])
-        for pid' 'ok, rows, why = True, [], ""
-        for pid'
+  mutant e2e nowatch "o vigia que não rebaixa passa" 'ok, rows, why = judge_tree(rows0, last.get("rows") or [], t0["watcher"])' 'ok, rows, why = True, [], ""'
   mutant e2e killcore "sessão morta pelo vigia passa" 'and bool(core) and not gone,' 'and True,'
   mutant e2e nonudgeanswer "a resposta ao nudge não é conferida" '(rodou o comando pedido)", NMARK in seen)' '(rodou o comando pedido)", True)'
   mutant e2e leavesocket "o socket sobrando não conta" ' and not s["tmux_socket"] and s["run_dir"]' ' and s["run_dir"]'
@@ -576,12 +577,16 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e secret "a varredura não olha segredo" '"_erro" not in sw and not sw["hits"] and not sw["forbidden"]' '"_erro" not in sw and not sw["forbidden"]'
   mutant e2e sshkey "a comparação antes/depois ignora ~/.ssh e credenciais" 'for k in ("ssh_dir", "creds", "links", "client_conf", "shim_sha"):' 'for k in ("links", "client_conf", "shim_sha"):'
   mutant e2e dialog "o diálogo é ignorado" '            if any(d in seen for d in DIALOGS):' '            if False:'
-  mutant e2e ok "a sessão não é parada no fim" '        if self.started:
-            try:' '        if False:
-            try:'
+  mutant e2e ok "a sessão não é parada no fim" $'        if self.started:\n            try:' $'        if False:\n            try:'
   mutant e2e swappause "a pausa é removida sem conferir de quem é" 'self.rpy(PAUSE_PY, {"pause": PAUSE, "mark": f"origem=mbp-proof:{self.run}", "mode": "off"})' 'self.rpy(PAUSE_PY, {"pause": PAUSE, "mark": "origem=", "mode": "off"})'
   mutant e2e shadow "um bd real escondendo o atalho passa" '        if shadow:' '        if False:'
   mutant e2e badjson "~/.claude.json ilegível passa" '        if not s["claude_json"]["ok"]:' '        if False:'
+  mutant e2e badclaudejson "~/.claude.json ilegível depois da limpeza passa por limpo" ' or not post["claude_json"]["ok"]' ''
+  mutant e2e gitblobs,gitstatus "git que falha vira saída vazia (status limpo, 0 blobs)" 'return r.stdout.strip() if r.returncode == 0 else None' 'return r.stdout.strip()'
+  mutant e2e gitblobs "o clone lê git que falhou como 0 blobs" ' if objs.returncode == 0 else None,' ','
+  mutant e2e githead "git rev-parse que falha deixa a prova começar" 'ok=head.returncode == 0 and len(head.stdout.strip()) == 40,' 'ok=True,'
+  mutant e2e psnice "nice ilegível da sessão vira 0" 'rows.append(dict(row, ni=int(row["ni"]), pri=int(row["pri"])))' 'rows.append(dict(row, ni=0, pri=0))'
+  mutant e2e snapwalk "os.walk engole o erro de listagem" 'os.walk(root, followlinks=False, onerror=lambda e: sys.exit("não consegui listar " + str(e.filename)))' 'os.walk(root, followlinks=False)'
   echo "== final: $((n-fails))/$n ok, $skipped sem rodar =="
 }
 [ "$fails" = 0 ]

@@ -191,7 +191,7 @@ def walk(root, cap=4000):
     if not os.path.lexists(root):
         return None
     rows, trunc = {}, False
-    for d, dirs, names in os.walk(root, followlinks=False):
+    for d, dirs, names in os.walk(root, followlinks=False, onerror=lambda e: sys.exit("não consegui listar " + str(e.filename))):  # pasta que não deu para listar ESTOURA (o chamador reprova), não vira "vazia"
         for x in dirs:
             rows[os.path.relpath(os.path.join(d, x), root) + "/"] = "link" if os.path.islink(os.path.join(d, x)) else "dir"
         for n in sorted(names):
@@ -333,10 +333,10 @@ with os.fdopen(fd, "w") as f:
     json.dump(cj, f)
 os.chmod(t, os.stat(p).st_mode & 0o777)
 os.replace(t, p)
-head = git("-C", wd, "rev-parse", "HEAD").stdout.strip()
-objs = git("-C", wd, "cat-file", "--batch-all-objects", "--batch-check").stdout.split("\n")
-res.update(ok=True, head=head, blobs=sum(1 for l in objs if " blob " in l),
-           wtfiles=sorted(os.path.relpath(os.path.join(d, n), wd) for d, ds, ns in os.walk(wd) if ".git" not in d.split(os.sep) for n in ns))
+head, objs = git("-C", wd, "rev-parse", "HEAD"), git("-C", wd, "cat-file", "--batch-all-objects", "--batch-check")
+res.update(ok=head.returncode == 0 and len(head.stdout.strip()) == 40, head=head.stdout.strip(),  # git que falha: sem commit de partida a prova não começa; blobs None (não 0) reprova
+           blobs=sum(1 for l in objs.stdout.split("\n") if " blob " in l) if objs.returncode == 0 else None,
+           wtfiles=sorted(os.path.relpath(os.path.join(d, n), wd) for d, ds, ns in os.walk(wd, onerror=lambda e: sys.exit("não consegui listar " + str(e.filename))) if ".git" not in d.split(os.sep) for n in ns))
 print(json.dumps(res))
 '''
 
@@ -344,18 +344,15 @@ GITSEE = r'''
 import json, os, subprocess, sys
 C = json.loads(sys.argv[1])
 env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=15", PATH=":".join(C["path_extra"] + [os.environ.get("PATH", "")]))
-def git(*a):
-    return subprocess.run(["git", "-C", C["workdir"]] + list(a), env=env, capture_output=True, text=True, timeout=120)
-out = {}
-out["log"] = git("log", "-1", "--format=%H|%an|%s").stdout.strip()
-out["branch"] = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-out["status"] = git("status", "--porcelain").stdout.strip()
-out["changed"] = [l for l in git("diff", "--name-only", "HEAD~1", "HEAD").stdout.split("\n") if l]
-r = git("ls-remote", C["url"], "refs/heads/worker/" + C["run"])
-out["remote_sha"] = r.stdout.split("\t")[0] if r.returncode == 0 else ""
-objs = git("cat-file", "--batch-all-objects", "--batch-check").stdout.split("\n")
-out["blobs"] = sum(1 for l in objs if " blob " in l)
-out["wtfiles"] = sorted(os.path.relpath(os.path.join(d, n), C["workdir"]) for d, ds, ns in os.walk(C["workdir"]) if ".git" not in d.split(os.sep) for n in ns)
+def git(*a):  # a saída, ou None se o git falhou: "não sei" não vira "vazio" (status limpo, 0 blobs) — o chamador reprova None
+    r = subprocess.run(["git", "-C", C["workdir"]] + list(a), env=env, capture_output=True, text=True, timeout=120)
+    return r.stdout.strip() if r.returncode == 0 else None
+objs = git("cat-file", "--batch-all-objects", "--batch-check")
+out = {"log": git("log", "-1", "--format=%H|%an|%s") or "", "status": git("status", "--porcelain"),
+       "changed": [l for l in (git("diff", "--name-only", "HEAD~1", "HEAD") or "").split("\n") if l],
+       "remote_sha": (git("ls-remote", C["url"], "refs/heads/worker/" + C["run"]) or "").split("\t")[0],
+       "blobs": None if objs is None else sum(1 for l in objs.split("\n") if " blob " in l),
+       "wtfiles": sorted(os.path.relpath(os.path.join(d, n), C["workdir"]) for d, ds, ns in os.walk(C["workdir"], onerror=lambda e: sys.exit("não consegui listar " + str(e.filename))) if ".git" not in d.split(os.sep) for n in ns)}
 print(json.dumps(out))
 '''
 
@@ -372,13 +369,13 @@ if pane:
     for l in ps:
         f = l.split(None, 5)
         if len(f) >= 5 and f[0].isdigit() and f[1].isdigit():
-            allp[int(f[0])] = {"pid": int(f[0]), "ppid": int(f[1]), "ni": int(f[2]) if f[2].lstrip("-").isdigit() else 0, "pri": int(f[3]) if f[3].lstrip("-").isdigit() else 0,
+            allp[int(f[0])] = {"pid": int(f[0]), "ppid": int(f[1]), "ni": f[2], "pri": f[3],
                                "stat": f[4], "comm": (f[5] if len(f) > 5 else "")[:600]}
     for pid, row in allp.items():
         q, hops = pid, 0
         while q and q != 1 and hops < 64:
             if q == pane:
-                rows.append(row)
+                rows.append(dict(row, ni=int(row["ni"]), pri=int(row["pri"])))  # só quem é da sessão: nice/pri ilegível DELE estoura (não vira 0); o de processo alheio ("-" no nó Linux) não conta
                 break
             q = allp.get(q, {}).get("ppid", 0)
             hops += 1
@@ -720,7 +717,7 @@ class Proof:
         sha = self.sha = (re.match(r"^(\w{40})\|", g["log"]) or [None, ""])[1]
         self.check("(d) commit no MBP, com a identidade da sessão, só do arquivo de teste", bool(sha) and sha != self.head0 and f"|{SESSION}|" in g["log"] and self.run in g["log"]
                    and g["changed"] == [f"mbp-proof/{self.run}.txt"] and g["status"] == "", f"{g['log']} · mudou {g['changed']} · status {g['status']!r}")
-        self.check("(d) clone continua sem dado depois do commit: 1 blob (o do teste) e só o arquivo de teste no checkout", g["blobs"] <= 1 and g["wtfiles"] == [f"mbp-proof/{self.run}.txt"],
+        self.check("(d) clone continua sem dado depois do commit: 1 blob (o do teste) e só o arquivo de teste no checkout", g["blobs"] in (0, 1) and g["wtfiles"] == [f"mbp-proof/{self.run}.txt"],
                    f"{g['blobs']} blobs, arquivos {g['wtfiles']}")
         got = ""
         for _ in range(12):
@@ -873,7 +870,7 @@ class Proof:
             d.append(f"sobra no spool {post['spool']}")
         if post["bins"] != pre["bins"]:
             d.append("ferramentas no PATH mudaram")
-        if post["proofs"] not in (None, []) or post["claude_json"]["trusted"] or post["pause"] or post["tmux_socket"] or post["run_dir"] not in (None, pre["run_dir"]):
+        if post["proofs"] not in (None, []) or post["claude_json"]["trusted"] or not post["claude_json"]["ok"] or post["pause"] or post["tmux_socket"] or post["run_dir"] not in (None, pre["run_dir"]):
             d.append(f"sobras: proof {post['proofs']} confiança {post['claude_json']['trusted']} pausa {post['pause']} socket {post['tmux_socket']} run {post['run_dir']}")
         top_new = sorted(set(post["gt_top"]) - set(pre["gt_top"]))
         if top_new:
