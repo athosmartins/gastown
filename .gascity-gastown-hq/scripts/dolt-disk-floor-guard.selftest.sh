@@ -773,6 +773,28 @@ CLAUDE_HOME_TRIM_COOLDOWN_SECS=abc; rm -f "$STATE_CLAUDE_HOME_TRIM_FILE"; cht_ru
 CLAUDE_HOME_TRIM_COOLDOWN_SECS="$CHT_SAVE_COOLDOWN"
 { [ "$(cht_runs)" = 4 ] && grep -q "COOLDOWN_SECS='abc' is not a positive integer, using 3600" "$CHT_TMP/guard.log" && grep -q "ran within the last 3600s" "$CHT_TMP/guard.log"; } \
   && ok "_trim_claude_home: a non-numeric cooldown falls back to 3600 and says so" || bad "_trim_claude_home: bad cooldown handled wrongly — runs=$(cht_runs) $(cht_log)"
+# an UNREADABLE state (a fresh epoch inside, mode 000): the cooldown cannot be known, so it counts as never ran and the
+# lever runs (the script is fail-safe on its own; the cooldown is only a rate limit) — and the write that follows fails
+# loudly instead of the lever pretending the cooldown was recorded
+date +%s > "$STATE_CLAUDE_HOME_TRIM_FILE"; chmod 000 "$STATE_CLAUDE_HOME_TRIM_FILE"
+if [ -r "$STATE_CLAUDE_HOME_TRIM_FILE" ]; then
+  ok "_trim_claude_home: unreadable state — skipped (this user can read a mode-000 file, e.g. root)"
+else
+  cht_run
+  { [ "$(cht_runs)" = 5 ] && grep -q "WARN — could not write the state file" "$CHT_TMP/guard.log" && ! grep -q "SKIP — ran within" "$CHT_TMP/guard.log"; } \
+    && ok "_trim_claude_home: an unreadable state counts as never ran (the lever runs) and the failed state write is a visible WARN" \
+    || bad "_trim_claude_home: unreadable state handled wrongly — runs=$(cht_runs) $(cht_log)"
+fi
+chmod 600 "$STATE_CLAUDE_HOME_TRIM_FILE"
+# the read command itself failing (cat exits 1 with no output, a fresh epoch on disk): same inert answer — it runs, it does not SKIP
+CHT_BEFORE="$(cht_runs)"
+date +%s > "$STATE_CLAUDE_HOME_TRIM_FILE"
+cat() { return 1; }
+cht_run
+unset -f cat
+{ [ "$(cht_runs)" = "$((CHT_BEFORE + 1))" ] && ! grep -q "SKIP — ran within" "$CHT_TMP/guard.log"; } \
+  && ok "_trim_claude_home: a failing state read (cat exits 1) counts as never ran — the lever runs, no cooldown SKIP" \
+  || bad "_trim_claude_home: a failing state read was taken for a recent run — runs=$(cht_runs) (was $CHT_BEFORE) $(cht_log)"
 
 # (c) kill switch and missing script
 rm -f "$CHT_CAP" "$STATE_CLAUDE_HOME_TRIM_FILE"
