@@ -730,6 +730,94 @@ PYCACHE_REAP_ROOTS=""; STATE_PYCACHE_REAP_FILE="$STATE_DIR/.dolt-disk-floor-guar
 chmod -R u+rwx "$PYC_TMP" 2>/dev/null; rm -rf "$PYC_TMP"
 
 echo ""
+echo "=== _trim_claude_home (ga-mnznp8): wiring, sentinel, cooldown, timeout vs failure ==="
+# Hermetic like the transcript lever's tests: CITY is reassigned to a disposable dir holding a STUB
+# claude_home_trim.py that only records what it was called with, so the real script, the real
+# ~/.claude and the real `gc` are never touched. The state file and the log are redirected too.
+# The last scenario runs the REAL script through the guard, but only against a fixture home.
+CHT_TMP="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-cht.XXXXXX)"
+mkdir -p "$CHT_TMP/scripts"
+export CHT_CAP="$CHT_TMP/capture.txt"
+CHT_SAVE_CITY="$CITY"; CHT_SAVE_LOG="$LOG"; CHT_SAVE_STATE="$STATE_CLAUDE_HOME_TRIM_FILE"
+CHT_SAVE_ENABLED="$ENABLED"; CHT_SAVE_GC="$GC"
+CHT_SAVE_COOLDOWN="$CLAUDE_HOME_TRIM_COOLDOWN_SECS"; CHT_SAVE_BOUND="$CLAUDE_HOME_TRIM_TIMEOUT_SECS"
+STATE_CLAUDE_HOME_TRIM_FILE="$CHT_TMP/state"
+cht_stub() { printf '%s\n' "import os, sys, time" "$1" > "$CHT_TMP/scripts/claude_home_trim.py"; }
+cht_run()  { CITY="$CHT_TMP"; LOG="$CHT_TMP/guard.log"; : > "$LOG"; _trim_claude_home; CITY="$CHT_SAVE_CITY"; LOG="$CHT_SAVE_LOG"; }
+cht_runs() { [ -f "$CHT_CAP" ] && grep -c . "$CHT_CAP" || echo 0; }
+cht_log()  { tr '\n' ';' < "$CHT_TMP/guard.log" | cut -c1-200; }
+
+# (a) the real caller sets the production opt-in and hands over its own gc
+cht_stub 'open(os.environ["CHT_CAP"], "a").write("PROD=%s GC=%s\n" % (os.environ.get("CLAUDE_HOME_TRIM_PROD", "unset"), os.environ.get("CLAUDE_HOME_TRIM_GC_BIN", "unset")))'
+rm -f "$CHT_CAP" "$STATE_CLAUDE_HOME_TRIM_FILE"
+cht_run
+if grep -qx "PROD=1 GC=$GC" "$CHT_CAP" 2>/dev/null; then
+  ok "_trim_claude_home: sets CLAUDE_HOME_TRIM_PROD=1 and passes the guard's own gc (production opt-in wired)"
+else
+  bad "_trim_claude_home: PROD/GC not handed to the script — the real launchd path would dry-run forever (got: $(cat "$CHT_CAP" 2>/dev/null || echo 'capture file missing'))"
+fi
+grep -q "claude-home-trim OK (.*bound=180s)" "$CHT_TMP/guard.log" \
+  && ok "_trim_claude_home: a clean run logs OK and the default bound is 180s" || bad "_trim_claude_home: no OK/bound=180s line — $(cht_log)"
+grep -Eq '^[0-9]+$' "$STATE_CLAUDE_HOME_TRIM_FILE" 2>/dev/null \
+  && ok "_trim_claude_home: the cooldown state (an epoch) was written" || bad "_trim_claude_home: no epoch in the state file"
+
+# (b) cooldown: the second call is skipped (default 3600s), and runs again once the state is gone or garbled
+cht_run
+{ [ "$(cht_runs)" = 1 ] && grep -q "SKIP — ran within the last 3600s (cooldown)" "$CHT_TMP/guard.log"; } \
+  && ok "_trim_claude_home: inside the cooldown (default 3600s) the script is not run and the SKIP is logged" || bad "_trim_claude_home: cooldown did not hold — runs=$(cht_runs) $(cht_log)"
+rm -f "$STATE_CLAUDE_HOME_TRIM_FILE"; cht_run
+[ "$(cht_runs)" = 2 ] && ok "_trim_claude_home: with the state gone it runs again" || bad "_trim_claude_home: did not run after the state was removed (runs=$(cht_runs))"
+echo "garbage" > "$STATE_CLAUDE_HOME_TRIM_FILE"; cht_run
+[ "$(cht_runs)" = 3 ] && ok "_trim_claude_home: a garbled state counts as never ran" || bad "_trim_claude_home: a garbled state blocked the lever (runs=$(cht_runs))"
+CLAUDE_HOME_TRIM_COOLDOWN_SECS=abc; rm -f "$STATE_CLAUDE_HOME_TRIM_FILE"; cht_run; cht_run
+CLAUDE_HOME_TRIM_COOLDOWN_SECS="$CHT_SAVE_COOLDOWN"
+{ [ "$(cht_runs)" = 4 ] && grep -q "COOLDOWN_SECS='abc' is not a positive integer, using 3600" "$CHT_TMP/guard.log" && grep -q "ran within the last 3600s" "$CHT_TMP/guard.log"; } \
+  && ok "_trim_claude_home: a non-numeric cooldown falls back to 3600 and says so" || bad "_trim_claude_home: bad cooldown handled wrongly — runs=$(cht_runs) $(cht_log)"
+
+# (c) kill switch and missing script
+rm -f "$CHT_CAP" "$STATE_CLAUDE_HOME_TRIM_FILE"
+ENABLED=0; cht_run; ENABLED="$CHT_SAVE_ENABLED"
+{ [ "$(cht_runs)" = 0 ] && grep -q "SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0" "$CHT_TMP/guard.log"; } \
+  && ok "_trim_claude_home: ENABLED=0 → SKIP, script not run" || bad "_trim_claude_home: kill switch did not stop it — runs=$(cht_runs) $(cht_log)"
+mv "$CHT_TMP/scripts/claude_home_trim.py" "$CHT_TMP/scripts/claude_home_trim.py.off"; cht_run
+mv "$CHT_TMP/scripts/claude_home_trim.py.off" "$CHT_TMP/scripts/claude_home_trim.py"
+grep -q "SKIP — .*claude_home_trim.py not found" "$CHT_TMP/guard.log" \
+  && ok "_trim_claude_home: a missing script is a logged SKIP, not a crash" || bad "_trim_claude_home: missing script not reported — $(cht_log)"
+
+# (d) a run killed by the bound is TIMED OUT; a quick nonzero exit is FAILED — the two must not read alike
+cht_stub 'time.sleep(5)'
+rm -f "$STATE_CLAUDE_HOME_TRIM_FILE"; CLAUDE_HOME_TRIM_TIMEOUT_SECS=1; cht_run; CLAUDE_HOME_TRIM_TIMEOUT_SECS="$CHT_SAVE_BOUND"
+{ grep -q "claude-home-trim TIMED OUT" "$CHT_TMP/guard.log" && ! grep -q "FAILED" "$CHT_TMP/guard.log"; } \
+  && ok "_trim_claude_home: a run killed by the bound logs TIMED OUT (not FAILED)" || bad "_trim_claude_home: timeout misreported — $(cht_log)"
+cht_stub 'sys.exit(1)'
+rm -f "$STATE_CLAUDE_HOME_TRIM_FILE"; cht_run
+{ grep -q "claude-home-trim FAILED or INCOMPLETE after .*(exit 1)" "$CHT_TMP/guard.log" && ! grep -q "TIMED OUT" "$CHT_TMP/guard.log"; } \
+  && ok "_trim_claude_home: exit 1 (a part was skipped) logs FAILED or INCOMPLETE (not TIMED OUT, not OK)" || bad "_trim_claude_home: failure misreported — $(cht_log)"
+
+# (e) the lever is called from the cycle, after the pycache lever
+CHT_BODY="$(declare -f _main_cycle)"
+echo "$CHT_BODY" | grep -qx '    _trim_claude_home;' \
+  && ok "_main_cycle calls _trim_claude_home" || bad "_main_cycle does not call _trim_claude_home — the lever would never run"
+
+# (f) end to end: the REAL script, through the guard, against a fixture home only
+cp "$HERE/claude_home_trim.py" "$CHT_TMP/scripts/claude_home_trim.py"
+CHT_HOME="$CHT_TMP/claude-home"; mkdir -p "$CHT_HOME/projects" "$CHT_HOME/file-history/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" "$CHT_HOME/file-history/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+awk 'BEGIN{for(i=1;i<=4000;i++) printf "line-%06d some prompt text padding padding\n", i}' > "$CHT_HOME/history.jsonl"
+echo snap > "$CHT_HOME/file-history/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/x@v1"; echo snap > "$CHT_HOME/file-history/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/x@v1"
+CHT_OLD="$(date -v-10d +%Y%m%d%H%M 2>/dev/null || date -d '10 days ago' +%Y%m%d%H%M)"
+touch -t "$CHT_OLD" "$CHT_HOME/file-history/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/x@v1" "$CHT_HOME/file-history/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+printf '#!/bin/bash\necho "{\\"sessions\\":[]}"\n' > "$CHT_TMP/fake-gc"; chmod +x "$CHT_TMP/fake-gc"
+rm -f "$STATE_CLAUDE_HOME_TRIM_FILE"
+GC="$CHT_TMP/fake-gc" CLAUDE_HOME_TRIM_HOME="$CHT_HOME" CLAUDE_HOME_TRIM_HISTORY_MAX_BYTES=100000 CLAUDE_HOME_TRIM_HISTORY_KEEP_BYTES=40000 cht_run
+{ [ "$(wc -c < "$CHT_HOME/history.jsonl")" -le 40000 ] && [ ! -e "$CHT_HOME/file-history/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" ] && [ -e "$CHT_HOME/file-history/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" ] \
+  && grep -q "claude-home-trim OK" "$CHT_TMP/guard.log"; } \
+  && ok "_trim_claude_home end to end: the real script, called by the guard, cuts history.jsonl and deletes only the old idle folder" \
+  || bad "_trim_claude_home end to end: size=$(wc -c < "$CHT_HOME/history.jsonl") A=$([ -e "$CHT_HOME/file-history/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" ] && echo kept || echo gone) $(cht_log)"
+
+STATE_CLAUDE_HOME_TRIM_FILE="$CHT_SAVE_STATE"; CITY="$CHT_SAVE_CITY"; LOG="$CHT_SAVE_LOG"; ENABLED="$CHT_SAVE_ENABLED"; GC="$CHT_SAVE_GC"
+rm -rf "$CHT_TMP"; unset CHT_CAP
+
+echo ""
 echo "=== _code_sign_clone_root / _code_sign_clone_dir_in_use / _should_reap_code_sign_clone_dir (ga-nkqook) ==="
 # ── hermetic lsof shim for the code_sign_clone checks below (ga-mv896u) ────
 # `_code_sign_clone_dir_in_use` and `_reap_code_sign_clone_orphans` run

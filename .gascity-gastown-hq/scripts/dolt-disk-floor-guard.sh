@@ -112,6 +112,16 @@
 #                             this bead's own incident actually reached
 #                             (avail as low as 1GB), not every routine WARN dip.
 #
+#                             _trim_claude_home (ga-mnznp8) runs at WARN and CRITICAL,
+#                             at most once an hour: ~/.claude/history.jsonl (1.55GB on
+#                             2026-10-18, one line per prompt of ~20 sessions)
+#                             is cut to its last 40MB once it passes 100MB, in
+#                             the SAME inode so the sessions holding it open
+#                             keep appending; file-history folders idle 3 days
+#                             and not belonging to a live session are deleted;
+#                             usage-analytics.jsonl and credit-cache-updater.log
+#                             are only MEASURED (see claude_home_trim.py).
+#
 #   CRITICAL_GB (default 3) — FIRST (started before the photo and the levers, but in
 #                             the BACKGROUND, so they never wait on it) a `gc session
 #                             nudge` to every ACTIVE dog/wa-worker/ps-worker/gate-
@@ -490,6 +500,17 @@ PYCACHE_REAP_COOLDOWN_SECS="${DOLT_DISK_FLOOR_PYCACHE_REAP_COOLDOWN_SECS:-1800}"
 PYCACHE_REAP_TIMEOUT_SECS="${DOLT_DISK_FLOOR_PYCACHE_REAP_TIMEOUT_SECS:-180}"
 PYCACHE_REAP_ROOTS="${DOLT_DISK_FLOOR_PYCACHE_REAP_ROOTS:-}"
 STATE_PYCACHE_REAP_FILE="$STATE_DIR/.dolt-disk-floor-guard.pycache-reap-last"
+
+# ga-mnznp8: claude-home-trim lever (see _trim_claude_home). The limits themselves (history.jsonl cut
+# at 100 MB keeping the last 40 MB; file-history folders idle for 3 days) live in claude_home_trim.py
+# next to the logic that needs them; these are only this guard's own rate limit and bound. The pass is
+# cheap when there is nothing to do (MEASURED 2026-10-18: 0.2 s with 106 young folders) and bounded by
+# `gc session list` (up to 60 s inside the script) when old folders do exist, so 180 s is the bound.
+# COOLDOWN: history.jsonl grows ~3.3 MB/h, so checking it every 5 min cycle only adds `gc` load while
+# Dolt is already under pressure.
+CLAUDE_HOME_TRIM_COOLDOWN_SECS="${DOLT_DISK_FLOOR_CLAUDE_HOME_TRIM_COOLDOWN_SECS:-3600}"
+CLAUDE_HOME_TRIM_TIMEOUT_SECS="${DOLT_DISK_FLOOR_CLAUDE_HOME_TRIM_TIMEOUT_SECS:-180}"
+STATE_CLAUDE_HOME_TRIM_FILE="$STATE_DIR/.dolt-disk-floor-guard.claude-home-trim-last"
 
 # ga-ond0fa: DISK-GROWTH PHOTO — see the header's DISK-GROWTH PHOTO paragraph for
 # the incident and the design. Read-only diagnostic (never a reclaim lever), so
@@ -3201,6 +3222,62 @@ _reap_pycache() {
   fi
 }
 
+# _trim_claude_home — reclaim lever (ga-mnznp8): ~/.claude/history.jsonl and ~/.claude/file-history,
+# which nothing rotates. 2026-10-18: 1.55 GB and 1.58 GB of a mini sitting at 409-554 MB free; the manual cut
+# freed 2.3 GB. Delegates to the standalone, independently-selftested claude_home_trim.py for the same reason as
+# the transcript lever: its safety logic (cut history.jsonl in the SAME inode so the ~20 sessions holding it open
+# keep appending; never delete the file-history of a session that is alive or cannot be shown dead) is tested in
+# isolation rather than inlined in this file. The script also MEASURES usage-analytics.jsonl and
+# credit-cache-updater.log and trims neither: their writers are the thing to fix.
+#
+# CLAUDE_HOME_TRIM_PROD=1: this function is the ONLY real caller. Without it the script's production sentinel
+# turns a run on the real ~/.claude into a dry-run (same ga-h565g/ga-lfj05 idea as the transcript lever), so a
+# test that forgets to point it at a fixture cannot cut the real files.
+#
+# The cooldown is stamped BEFORE the run: a run that fails or wedges costs one attempt per cooldown, not one per
+# 5-minute cycle (each attempt that finds old folders asks `gc session list`, which is slow while Dolt is warm).
+# Exit 0 = every part ran; exit 1 = a part was skipped because something it needs to be sure of could not be
+# read (its lines in $LOG say which); 124 = the bound. Best-effort: never blocks the other levers.
+_trim_claude_home() {
+  if [ "$ENABLED" != "1" ]; then
+    log "claude-home-trim SKIP — DOLT_DISK_FLOOR_GUARD_ENABLED=0 (notify-only mode)"
+    return
+  fi
+  local trimmer="$CITY/scripts/claude_home_trim.py"
+  if [ ! -f "$trimmer" ]; then
+    log "claude-home-trim SKIP — $trimmer not found"
+    return
+  fi
+  local cooldown="$CLAUDE_HOME_TRIM_COOLDOWN_SECS" bound="$CLAUDE_HOME_TRIM_TIMEOUT_SECS"
+  if ! _pycache_posint "$cooldown"; then
+    log "claude-home-trim WARN — COOLDOWN_SECS='${cooldown}' is not a positive integer, using 3600"
+    cooldown=3600
+  fi
+  if ! _pycache_posint "$bound"; then
+    log "claude-home-trim WARN — TIMEOUT_SECS='${bound}' is not a positive integer, using 180"
+    bound=180
+  fi
+  local now last=""; now=$(date +%s)
+  # vazio → no state file: the lever never ran, run now; falhou/ilegível → an unreadable or garbled state counts as never ran (the script is fail-safe on its own and the cooldown is only a rate limit)
+  [ -f "$STATE_CLAUDE_HOME_TRIM_FILE" ] && last="$(cat "$STATE_CLAUDE_HOME_TRIM_FILE" 2>/dev/null)"
+  if ! _cooldown_elapsed "$last" "$now" "$cooldown"; then
+    log "claude-home-trim SKIP — ran within the last ${cooldown}s (cooldown)"
+    return
+  fi
+  if ! { echo "$now" > "$STATE_CLAUDE_HOME_TRIM_FILE"; } 2>/dev/null; then
+    log "claude-home-trim WARN — could not write the state file ($STATE_CLAUDE_HOME_TRIM_FILE): the cooldown is not recorded, so the next cycle runs it again"
+  fi
+  log "claude-home-trim: running history.jsonl rotation + file-history prune …"
+  local rc=0 elapsed
+  CLAUDE_HOME_TRIM_PROD=1 CLAUDE_HOME_TRIM_GC_BIN="$GC" timeout "$bound" python3 -I "$trimmer" >> "$LOG" 2>&1 || rc=$?
+  elapsed=$(( $(date +%s) - now ))
+  case "$rc" in
+    0)   log "claude-home-trim OK (${elapsed}s, bound=${bound}s)" ;;
+    124) log "claude-home-trim TIMED OUT after ${elapsed}s (bound=${bound}s) — the pass did NOT run to completion; raise DOLT_DISK_FLOOR_CLAUDE_HOME_TRIM_TIMEOUT_SECS if this repeats" ;;
+    *)   log "claude-home-trim FAILED or INCOMPLETE after ${elapsed}s (exit ${rc}) — see the claude-home-trim lines above" ;;
+  esac
+}
+
 # _resurrect_dolt <avail_gb> <class> — last-resort auto-respawn for a Dolt
 # sql-server CONFIRMED down while disk headroom is safe. Caller (main) has
 # already run _should_resurrect's gate; this function does the actual work.
@@ -3633,6 +3710,7 @@ _main_cycle() {
   _reap_hf_cache "$was_critical"
   _reap_gocache "$was_critical"
   _reap_pycache
+  _trim_claude_home
   _reap_go_build_orphans
   _reap_code_sign_clone_orphans
   _reap_bash_edit_diff_orphans
