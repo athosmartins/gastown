@@ -71,8 +71,8 @@
 #      pass takes at most HALF the objects the cut one took (never below JAC_TAIL_MIN_OBJECTS, 15; at that floor it can only repeat, and the log says so). A pass that finished in under a
 #      quarter of its budget while the cap kept a pack out that the configured cap would have taken doubles the cap again, up to JAC_TAIL_MAX_OBJECTS — tier 1's rule. The byte trigger scales with the
 #      cap (JAC_TAIL_LIMIT_KIB at the full cap), because a half-size pass holds about half the bytes and would otherwise never start, and so never grow back. A lowered cap can still leave NO two
-#      packs that fit (similar packs, each over half the cap): then the pass waits, with the reason in the log each run, and the cap is doubled once JAC_TAIL_RETRY_S (6h) has passed since the cut
-#      (`tail_cut_epoch`) — a slow spell that has gone is retried at most that often, and a host that stays slow costs one cut per that interval instead of one per run.
+#      packs that fit (similar packs, each over half the cap): then the pass waits, with the reason in the log each run, and the cap is doubled once JAC_TAIL_RETRY_S (6h) has passed since the last cut
+#      (`tail_cut_epoch`) — a slow spell that has gone is retried, and a host that stays slow costs one cut per that interval from this retry, not one per run (at the floor itself a cut pass can only repeat, as said above).
 #   2. pack count >= JAC_PACKS_LIMIT (8): one full `git gc` to consolidate. Each batch pack
 #      carries its own first full copy of every big file (batches cannot delta against earlier
 #      packs); the gc re-deltas those against the whole history and merges the packs. The alarm judges
@@ -873,7 +873,7 @@ tail_unstick() {
   m_n="$TAIL_N"; m_kib="$TAIL_KIB"
   tail_plan "$R_TAIL" || return 1
   if [ "$m_n" -lt 2 ] || [ "$m_kib" -lt "$TAIL_LIMIT_KIB" ]; then return 1; fi
-  log "  tail consolidation held back by its object cap: $R_TAIL objects (lowered after a pass was cut; configured max $TAIL_MAX_OBJECTS) leave no 2 packs to merge, while the cap of $TAIL_MAX_OBJECTS would take $m_n packs ($(fmt "$m_kib")) — the cap is retried larger ${TAIL_RETRY_S}s after the last cut"
+  log "  tail consolidation held back by its object cap: $R_TAIL objects (lowered after a pass was cut; configured max $TAIL_MAX_OBJECTS) take only $TAIL_N pack(s) ($(fmt "$TAIL_KIB")), too little to start, while the cap of $TAIL_MAX_OBJECTS would take $m_n packs ($(fmt "$m_kib")) — the cap is retried larger ${TAIL_RETRY_S}s after the last cut"
   if tail_retry_due; then
     tail_grow "${TAIL_RETRY_S}s since the last cut and no pass could run since — trying a larger cap"
     R_TAIL_CUT_SAVE="$(date +%s)"; R_TAIL_CUT="$R_TAIL_CUT_SAVE"
@@ -920,7 +920,7 @@ tail_pass() {
   lim="$(tail_limit_for "$R_TAIL")"
   if [ "$TAIL_N" -lt 2 ] || [ "$TAIL_KIB" -lt "$lim" ]; then
     # not due at this cap. If the cap is the reason, tail_unstick says so and may double it; then the plan is judged again
-    tail_unstick || return 0
+    if ! tail_unstick; then return 0; fi      # 1 = the plan stays as it is and is not due (tail_unstick's answer, not a failure)
     lim="$(tail_limit_for "$R_TAIL")"
     if [ "$TAIL_N" -lt 2 ] || [ "$TAIL_KIB" -lt "$lim" ]; then return 0; fi
   fi
@@ -937,7 +937,7 @@ tail_pass() {
   need=$(( TAIL_KIB + M_LOOSE_KIB / 4 + HEADROOM_KIB ))      # the new pack is at most as big as the packs it replaces (those stay until it is written) plus what the loose objects pack to (tier 1's assumption: <= 1/4)
   # The disk: free − need must stay OUTSIDE Dolt's CRITICAL class. dolt-disk-floor-guard calls the disk critical when the free GiB, rounded DOWN, is <= DOLT_DISK_FLOOR_CRITICAL_GB, so free − need must be at least
   # (that + 1) GiB. vazio → free space that df did not give is not "plenty" and not "nothing": the pass does not start; falhou/ilegível → a free-space reading or a floor that is not a number (or has more than 9
-  # digits) is the same: it does not start, and says why in the same words as a disk that is low (ga-q8z86s; the other tiers still proceed on an unreadable df, this one writes ~800MB of temp files and does not).
+  # digits) is the same: it does not start, and says why in the same words as a disk that is low (free_kib reads the volume that holds the repo, which in production is the one that holds Dolt's data; ga-q8z86s; the other tiers still proceed on an unreadable df, this one writes ~800MB of temp files and does not).
   fr="$(free_kib "$repo")"
   if ! { is_uint "$fr" && is_uint "$DOLT_CRIT_GB" && [ "${#DOLT_CRIT_GB}" -le 9 ]; }; then
     bad_status "$STATUS" || STATUS="skipped-low-disk"      # a failure tier 1 left stays the status (header 2a: a pass that did nothing replaces only a status that is not a failure)
@@ -977,7 +977,7 @@ tail_pass() {
     log "  tail repack was cut by the run deadline after ${t_left}s — the budget ended, not evidence the pass is too big (retried next run, same cap)"
   elif [ "$rc" -eq 124 ]; then
     # its OWN cap ran out: this many objects do not fit in the budget on this host, and the same pass would be cut the same way next run (ga-q8z86s). The next one takes half of what this one carried
-    # (not half the cap: a cap of 120 over a pass of 40 would otherwise repeat that pass twice more), and the state remembers when it happened for tail_retry_due
+    # (not half the cap: a cap of 120 over a pass of 40 would otherwise repeat that pass once more at 60), and the state remembers when it happened for tail_retry_due
     STATUS="timeout"
     next=$(( TAIL_OBJ / 2 ))
     [ "$next" -ge "$fl" ] || next="$fl"
