@@ -49,6 +49,11 @@
 # single-flight lock of its own (the compactor has one; this exporter takes none), so a timeout above the
 # interval would let the next tick start a second export in the same git working tree — the concurrent-export
 # failure of ga-fxrrav. If a run ever needs more than 14 min, give the script a lock FIRST, then raise this.
+#
+# ga-j2f5v5: the order still fires every 15 min whatever the disk; the SCRIPT decides whether that tick exports. With the free disk under 5 GB it exports at most once an hour, and in Dolt's CRITICAL class
+# (free GiB, rounded down, <= 3) only when the last export is more than 3 h old; a disk it cannot read, or a missing/garbled last_export_at, means it exports. A skipped tick exits 0, asks Dolt nothing and
+# writes `skipped-low-disk (cadência estendida)` to .gc/logs/jsonl-export.log — so a `gc order history jsonl-export` full of runs does not mean a full of exports. 3 h + this interval + this timeout stays
+# under the 6 h "fonte parada" alarm of jsonl-hourly-offsite.sh (jsonl-export.selftest.sh compares them).
 # jsonl-export.selftest.sh (ga-48e0du) fails if `timeout` is missing, under 600 s, or not under `interval`.
 [order]
 description = "Export Dolt databases to JSONL git archive (ga-7sxdmb — replaces mol-dog-jsonl)"

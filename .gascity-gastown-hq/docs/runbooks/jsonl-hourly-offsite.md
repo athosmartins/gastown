@@ -7,6 +7,7 @@ A cada hora o order `jsonl-hourly-offsite` roda `assets/scripts/jsonl-hourly-off
 tabela por tabela, sobe para `s3://urblink-dolt-backups/jsonl-hourly/` e só então move `latest.json`. Meta do Athos (15/10): perder no máximo 1 h de beads.
 RPO real = intervalo entre runs do `jsonl-export` + 60 min + duração do run. Medido em 48 h (78 runs, 14-16/10): intervalo mediana 27 min, p90 73, máx 189 =>
 típico ~1h35, p90 ~2h20, pior medido ~4h15. **Só este order não entrega 1 h**: o gargalo é a cadência do exporter (decisão de produto).
+Com o disco do mini baixo o exporter se espaça de propósito (ga-j2f5v5): abaixo de 5 GB livres exporta no máximo 1 vez por hora, e na classe CRÍTICA do Dolt (GiB livres, arredondado para baixo, <= 3) só com o último export > 3 h; então o RPO sobe até ~3 h + 15 min + 60 min nesse caso. `skipped-low-disk (cadência estendida)` em `.gc/logs/jsonl-export.log` é isso, não defeito; disco ilegível ou `last_export_at` ilegível exporta normalmente.
 Que o restore funciona se prova com `jsonl-hourly-restore.sh` (seção "Provar o restore"): sem essa rodada, um snapshot fresco no S3 é upload verificado, não RPO provado.
 
 ## Ver o estado

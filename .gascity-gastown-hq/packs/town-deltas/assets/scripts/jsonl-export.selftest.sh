@@ -124,15 +124,17 @@ E2E="$WORK/e2e"
 mkdir -p "$E2E/scripts" "$E2E/bin" "$E2E/city" "$E2E/state"
 cp "$SCRIPT" "$E2E/scripts/jsonl-export.sh"
 cp "$HERE/jsonl-archive-repack-window-lib.sh" "$E2E/scripts/jsonl-archive-repack-window-lib.sh"   # ga-wkoij7: sourced by the exporter at start
+cp "$HERE/disk-headroom-lib.sh" "$E2E/scripts/disk-headroom-lib.sh"   # ga-j2f5v5: the one reader of the free disk, sourced by the exporter at start
 cat > "$E2E/scripts/dolt-target.sh" <<'STUB'
 dolt_sql() {
   local q=""
+  [ -z "${E2E_DOLT_CALLS:-}" ] || printf "call\n" >> "$E2E_DOLT_CALLS"   # ga-j2f5v5: a skipped tick must not ask Dolt anything
   while [ $# -gt 0 ]; do
     case "$1" in -q) q="$2"; shift ;; esac
     shift
   done
   case "$q" in
-    "SHOW DATABASES") printf 'Database\nwa\n' ;;
+    "SHOW DATABASES") if [ "${STUB_NO_DBS:-0}" = "1" ]; then printf 'Database\n'; else printf 'Database\nwa\n'; fi ;;
     "SELECT COUNT(*)"*)
       [ "$STUB_SOURCE_COUNT" = "ERR" ] && return 1
       printf 'row_count\n%s\n' "$STUB_SOURCE_COUNT" ;;
@@ -162,13 +164,18 @@ chmod +x "$E2E/bin/gc"
 # $PATH would send that mail for real. Here "command not found" is the only outcome.
 . "$HERE/../selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/../selftest-sandbox-path.lib.sh" >&2; exit 2; }
 sandbox_path_init "$E2E" git jq || exit 2   # git: the archive repo; jq: row scrub; dolt is the stubbed dolt-target.sh, gc the stub above
+# ga-j2f5v5: the exporter now reads the free disk. The reading is PINNED here (100 GB) for every case that is not about the disk, so a host with a low disk (this one, often) does not skip the cases below;
+# the disk cases set E2E_DISK_MB / E2E_NOW per call. Exported, so the runs that do not go through run_export (default-archive case) get the same pin.
+export DISK_FREE_OVERRIDE_MB=102400
 
 ARCH="$E2E/archive"
 OUT=""
 run_export() {  # run_export <export-rows> <source-count|ERR> [scrubbed-away-rows]
   : > "$E2E/gc.log"
+  : > "$E2E/dolt-calls.log"
   OUT=$(
     E2E_GC_LOG="$E2E/gc.log" STUB_EXPORT_ROWS="$1" STUB_SOURCE_COUNT="$2" STUB_TEST_ROWS="${3:-0}" \
+    DISK_FREE_OVERRIDE_MB="${E2E_DISK_MB:-102400}" JEX_NOW_EPOCH="${E2E_NOW:-}" E2E_DOLT_CALLS="$E2E/dolt-calls.log" \
     PATH="$SANDBOX_PATH" GC_CITY="$E2E/city" GC_PACK_STATE_DIR="${E2E_STATE:-$E2E/state}" \
     GC_JSONL_ARCHIVE_REPO="$ARCH" \
     bash "$E2E/scripts/jsonl-export.sh" 2>&1
@@ -848,6 +855,243 @@ expect_verdict "order file missing"                       "$WORK/order-does-not-
 expect_verdict "timeout 840s"                             "$(mk_order t840 15m 'timeout = "840s"')"                         ok
 expect_verdict "timeout 14m, trailing comment"            "$(mk_order t14m 15m 'timeout = "14m"   # headroom, see the header')" ok
 expect_verdict "timeout 0840s (leading zero is decimal)"  "$(mk_order t0840 15m 'timeout = "0840s"')"                       ok
+
+# ── ga-j2f5v5: the export's cadence follows the disk ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# Measured 18/10: every 15-min run rewrote ~400 MB of JSONL, dipped the disk ~700 MB and kept a new loose blob per changed file, with the disk already under Dolt's CRITICAL floor. Now a low disk spaces the run out
+# (1 h under 5 GB, 3 h in Dolt's CRITICAL class), says so in the log, and a disk that cannot be read does NOT stop the export (it is the backup). The disk and the clock are pinned (E2E_DISK_MB / E2E_NOW), so the
+# result does not depend on the host's real free space.
+echo "=== ga-j2f5v5: a low disk spaces the export out; an unreadable disk does not ==="
+T0=1792320000            # a fixed instant; the exporter's clock is JEX_NOW_EPOCH = T0 + the case's offset
+JEX_TLOG="$E2E/city/.gc/logs/jsonl-export.log"
+iso_of() { jq -nr --argjson e "$1" '$e | todate'; }
+# vazio → "none" (no state file, or no last_export_at in it); falhou/ilegível (the file is there and jq cannot read it) → "?", which no assertion below accepts
+stamp()  { local f="$E2E_STATE/jsonl-export-state.json"; [ -e "$f" ] || { echo none; return 0; }; jq -r '.last_export_at // "none"' "$f" 2>/dev/null || echo "?"; }
+dolt_calls() { wc -l < "$E2E/dolt-calls.log" 2>/dev/null | tr -d ' '; }
+cad() {  # cad <disk MB|word> <seconds after T0> <rows> — one run on that disk at that instant; the source agrees with the rows
+  E2E_DISK_MB="$1" E2E_NOW=$((T0 + $2)) run_export "$3" "$3"
+}
+is_skip() { case "$OUT" in *"skipped-low-disk (cadência estendida)"*) return 0 ;; *) return 1 ;; esac; }
+yn() { if "$@"; then echo yes; else echo no; fi; }
+reset_tlog() { mkdir -p "$(dirname "$JEX_TLOG")"; : > "$JEX_TLOG"; }
+
+# the verdict itself, boundary by boundary (pure: lib mode, no run). The default floors: new work 5120 MB, Dolt CRITICAL = free GiB rounded down <= 3, i.e. under 4096 MB; 1 h and 3 h.
+vt() {  # vt <label> <want: prefix of the verdict line> <free> <last> <now> [env assignments...]
+  local label="$1" want="$2" got; shift 2
+  got="$(env "${@:4}" bash -c 'export JSONL_EXPORT_LIB=1; . "$0" >/dev/null 2>&1; jex_cadence_verdict "$1" "$2" "$3"' "$SCRIPT" "$1" "$2" "$3")"
+  case "$got" in "$want"*) ok "verdict: $label -> $got" ;; *) bad "verdict: $label -> '$got', want '$want...'" ;; esac
+}
+N=$T0
+vt "plenty of disk (10 GB), stamp a second old"            "run|disk-ok"                   10240 $((N-1))     $N
+vt "exactly the new-work floor (5120 MB) is not low"        "run|disk-ok"                   5120  $((N-1))     $N
+vt "5119 MB, 59 min 59 s since the last export"             "skip|tier=low "                5119  $((N-3599))  $N
+vt "5119 MB, exactly 1 h since the last export"             "run|due-low"                   5119  $((N-3600))  $N
+vt "4096 MB is NOT Dolt-critical (free GiB = 4): low tier"  "skip|tier=low "                4096  $((N-100))   $N
+vt "4095 MB IS Dolt-critical (free GiB rounds down to 3)"   "skip|tier=critical "           4095  $((N-3601))  $N
+vt "critical, 2 h 59 min 59 s since the last export"        "skip|tier=critical "           4095  $((N-10799)) $N
+vt "critical, exactly 3 h since the last export"            "run|due-critical"              4095  $((N-10800)) $N
+vt "disk unreadable (empty) with a fresh stamp"             "run|disk-unreadable"           ""    $((N-5))     $N
+vt "disk unreadable (not a number) with a fresh stamp"      "run|disk-unreadable"           "n/a" $((N-5))     $N
+vt "low disk, never stamped"                                "run|no-last-export"            2048  ""           $N
+vt "low disk, stamp is not a number"                        "run|last-export-unreadable"    2048  "yesterday"  $N
+vt "low disk, stamp of 20 digits (would wrap the arithmetic)" "run|last-export-unreadable"  2048  "99999999999999999999" $N
+vt "low disk, stamp in the future"                          "run|last-export-in-the-future" 2048  $((N+50))    $N
+vt "low disk, the clock cannot be read"                     "run|clock-unreadable"          2048  100         ""
+vt "kill switch DISK_HEADROOM_ENABLED=0 at 100 MB"          "run|disk-ok"                   100   $((N-1))     $N DISK_HEADROOM_ENABLED=0
+vt "1 h interval set to 0 turns the low tier off"           "run|due-low"                   5000  $((N-1))     $N JEX_LOW_DISK_INTERVAL_S=0
+vt "DOLT_DISK_FLOOR_CRITICAL_GB=1: 3000 MB is only low"     "skip|tier=low "                3000  $((N-100))   $N DOLT_DISK_FLOOR_CRITICAL_GB=1
+vt "DOLT_DISK_FLOOR_CRITICAL_GB=1: 2000 MB is critical"     "skip|tier=critical "           2000  $((N-4000))  $N DOLT_DISK_FLOOR_CRITICAL_GB=1
+vt "DOLT_DISK_FLOOR_CRITICAL_GB=08 is eight, not an octal error" "skip|tier=critical "     9000  $((N-4000))  $N DOLT_DISK_FLOOR_CRITICAL_GB=08
+vt "DOLT_DISK_FLOOR_CRITICAL_GB=lots falls back to 3"       "skip|tier=low "                4096  $((N-100))   $N DOLT_DISK_FLOOR_CRITICAL_GB=lots
+
+# 4 GB (the Mayor's case): the 2nd run inside the hour is a skip, and a skip touches NOTHING — no Dolt call, no commit, no new stamp
+fresh_archive disk4g; reset_tlog
+cad 4096 0 200
+[ "$(head_rows)" = "200" ] && [ "$(stamp)" = "$(iso_of $T0)" ] \
+  && ok "4 GB, first run: exports (200 rows) and stamps last_export_at = $(iso_of $T0)" \
+  || bad "4 GB, first run: head=$(head_rows) stamp=$(stamp), want 200 and $(iso_of $T0) (rc=$RC): $OUT"
+C4=$(commits)
+cad 4096 900 250
+if is_skip && [ "$RC" = "0" ] && [ "$(dolt_calls)" = "0" ] && [ "$(head_rows)" = "200" ] && [ "$(commits)" = "$C4" ] && [ "$(stamp)" = "$(iso_of $T0)" ]; then
+  ok "4 GB, 15 min later (source now has 250): skipped, rc 0, no Dolt call, archive still 200 rows, no commit, stamp untouched"
+else
+  bad "4 GB, 15 min later: skip=$(yn is_skip) rc=$RC dolt_calls=$(dolt_calls) head=$(head_rows) commits $C4 -> $(commits) stamp=$(stamp): $OUT"
+fi
+grep -q 'skipped-low-disk (cadência estendida) — tier=low free=4096MB' "$JEX_TLOG" \
+  && ok "4 GB skip: the log file says 'skipped-low-disk (cadência estendida)' with the tier and the reading" \
+  || bad "4 GB skip: nothing in $JEX_TLOG: $(tr '\n' '|' < "$JEX_TLOG" 2>&1)"
+cad 4096 3599 250
+{ is_skip && [ "$(head_rows)" = "200" ]; } && ok "4 GB, 59 min 59 s later: still a skip" || bad "4 GB, 59 min 59 s later: skip=$(yn is_skip) head=$(head_rows): $OUT"
+cad 4096 3600 250
+if ! is_skip && [ "$(head_rows)" = "250" ] && [ "$(stamp)" = "$(iso_of $((T0 + 3600)))" ] && [ "$(commits)" = "$((C4 + 1))" ]; then
+  ok "4 GB, exactly 1 h later: exports (250 rows, one new commit) and the stamp moves to $(iso_of $((T0 + 3600)))"
+else
+  bad "4 GB, exactly 1 h later: skip=$(yn is_skip) head=$(head_rows) stamp=$(stamp) commits $C4 -> $(commits) (rc=$RC): $OUT"
+fi
+
+# 2 GB (Dolt's CRITICAL class): the hour is NOT enough, 3 h is
+fresh_archive disk2g; reset_tlog
+cad 2048 0 200
+C2=$(commits)
+cad 2048 3600 210
+{ is_skip && [ "$(head_rows)" = "200" ] && [ "$(dolt_calls)" = "0" ]; } \
+  && ok "2 GB, 1 h later: skipped (the low-disk hour has passed, Dolt's 3 h has not)" \
+  || bad "2 GB, 1 h later: skip=$(yn is_skip) head=$(head_rows) dolt_calls=$(dolt_calls): $OUT"
+cad 2048 10799 210
+{ is_skip && [ "$(head_rows)" = "200" ]; } && ok "2 GB, 2 h 59 min 59 s later: still a skip" || bad "2 GB, 2 h 59 min 59 s later: skip=$(yn is_skip) head=$(head_rows): $OUT"
+cad 2048 10800 210
+{ ! is_skip && [ "$(head_rows)" = "210" ] && [ "$(commits)" = "$((C2 + 1))" ]; } \
+  && ok "2 GB, exactly 3 h later: exports (210 rows, one new commit)" \
+  || bad "2 GB, exactly 3 h later: skip=$(yn is_skip) head=$(head_rows) commits $C2 -> $(commits) (rc=$RC): $OUT"
+grep -q 'tier=critical free=2048MB' "$JEX_TLOG" && grep -q 'run (due-critical) free=2048MB' "$JEX_TLOG" \
+  && ok "2 GB: the log names the tier of the skips and the run that was due" \
+  || bad "2 GB: the log lacks the critical skip or the due run: $(tr '\n' '|' < "$JEX_TLOG")"
+
+# a df that cannot be read: the export RUNS, every time (it is the backup) — and says why
+fresh_archive dfbroken; reset_tlog
+cad broken 0 200
+cad broken 60 210
+{ ! is_skip && [ "$(head_rows)" = "210" ]; } \
+  && ok "df unreadable: both runs export (second one a minute after the first, 210 rows)" \
+  || bad "df unreadable: skip=$(yn is_skip) head=$(head_rows) (rc=$RC): $OUT"
+grep -q 'run (disk-unreadable) free=unreadableMB' "$JEX_TLOG" \
+  && ok "df unreadable: the log says 'run (disk-unreadable)'" \
+  || bad "df unreadable: the log does not say why it ran: $(tr '\n' '|' < "$JEX_TLOG")"
+
+# control: plenty of disk exports on every tick, and writes no line to the log
+fresh_archive disk10g; reset_tlog
+cad 10240 0 200; cad 10240 1 210; cad 10240 2 220
+{ ! is_skip && [ "$(head_rows)" = "220" ] && [ "$(commits)" = "3" ]; } \
+  && ok "control, 10 GB: three runs in three seconds all export (220 rows, 3 commits)" \
+  || bad "control, 10 GB: skip=$(yn is_skip) head=$(head_rows) commits=$(commits) (rc=$RC): $OUT"
+[ ! -s "$JEX_TLOG" ] && ok "control, 10 GB: a healthy disk leaves the cadence log empty" || bad "control, 10 GB: the log has lines: $(tr '\n' '|' < "$JEX_TLOG")"
+
+# a stamp nobody can trust never blocks the export: garbage, and a stamp from the future
+fresh_archive badstamp; reset_tlog
+printf '{"last_export_at":"yesterday"}\n' > "$E2E_STATE/jsonl-export-state.json"
+cad 2048 0 200
+{ ! is_skip && [ "$(head_rows)" = "200" ] && [ "$(stamp)" = "$(iso_of $T0)" ]; } \
+  && ok "garbage last_export_at at 2 GB: exports and replaces it with a valid stamp" \
+  || bad "garbage last_export_at: skip=$(yn is_skip) head=$(head_rows) stamp=$(stamp) (rc=$RC): $OUT"
+printf '{"last_export_at":"%s"}\n' "$(iso_of $((T0 + 99999)))" > "$E2E_STATE/jsonl-export-state.json"
+cad 2048 900 210
+{ ! is_skip && [ "$(head_rows)" = "210" ] && [ "$(stamp)" = "$(iso_of $((T0 + 900)))" ]; } \
+  && ok "last_export_at in the future at 2 GB: exports and replaces it" \
+  || bad "future last_export_at: skip=$(yn is_skip) head=$(head_rows) stamp=$(stamp) (rc=$RC): $OUT"
+
+# a tick that exports nothing (Dolt lists no database) does not use up the hour
+fresh_archive nodbs; reset_tlog
+export STUB_NO_DBS=1
+cad 2048 0 200
+unset STUB_NO_DBS
+{ [ "$RC" = "0" ] && [ "$(stamp)" = "none" ]; } \
+  && ok "no database to export: exits 0 and leaves last_export_at unset" \
+  || bad "no database to export: rc=$RC stamp=$(stamp): $OUT"
+cad 2048 60 200
+{ ! is_skip && [ "$(head_rows)" = "200" ]; } \
+  && ok "…so the next tick (a minute later, 2 GB) still exports" \
+  || bad "after a tick with no database: skip=$(yn is_skip) head=$(head_rows) (rc=$RC): $OUT"
+
+# a run the engine kills mid-export cost the disk all the same: it counts, and it does not wedge the exporter for good
+fresh_archive killcounts; reset_tlog
+export STUB_KILL_SELF=1
+cad 2048 0 200
+unset STUB_KILL_SELF
+{ [ "$RC" != "0" ] && [ "$(stamp)" = "$(iso_of $T0)" ]; } \
+  && ok "killed mid-export at 2 GB: the run died (rc=$RC) and had already stamped last_export_at" \
+  || bad "killed mid-export: rc=$RC stamp=$(stamp), want a death and $(iso_of $T0): $OUT"
+cad 2048 900 200
+{ is_skip && [ "$(dolt_calls)" = "0" ]; } \
+  && ok "…the next tick (15 min later) is a skip: a killed export is not retried every tick" \
+  || bad "after a killed export: skip=$(yn is_skip) dolt_calls=$(dolt_calls): $OUT"
+cad 2048 10800 200
+{ ! is_skip && [ "$(head_rows)" = "200" ]; } \
+  && ok "…and 3 h after it the export runs and archives (200 rows)" \
+  || bad "3 h after a killed export: skip=$(yn is_skip) head=$(head_rows) (rc=$RC): $OUT"
+
+# a skipped tick still delivers the pending spike alert (it is retried BEFORE the cadence is decided)
+fresh_archive alertskip; reset_tlog
+cad 2048 0 200
+jq -c '.pending_spike_alerts = {wa: {database: "wa", prev_count: 1000, current_count: 500, delta: 50, threshold: 20}}' "$E2E_STATE/jsonl-export-state.json" > "$E2E_STATE/s.tmp" && mv "$E2E_STATE/s.tmp" "$E2E_STATE/jsonl-export-state.json"
+cad 2048 900 200
+{ is_skip && [ "$(mailed)" = "1" ] && [ "$(jq -r '.pending_spike_alerts // "cleared"' "$E2E_STATE/jsonl-export-state.json")" = "cleared" ] && [ "$(stamp)" = "$(iso_of $T0)" ]; } \
+  && ok "skipped tick: the pending spike alert is still mailed once and cleared; the stamp stays" \
+  || bad "skipped tick with a pending alert: skip=$(yn is_skip) mails=$(mailed) alerts=$(jq -c '.pending_spike_alerts // "cleared"' "$E2E_STATE/jsonl-export-state.json") stamp=$(stamp): $OUT"
+
+# the log is bounded: 1100 old lines + one skip leave a short file that ends with the skip
+fresh_archive logtrim; reset_tlog
+cad 2048 0 200
+i=0; while [ $i -lt 1100 ]; do echo "2026-10-17T00:00:00Z old line $i"; i=$((i + 1)); done > "$JEX_TLOG"
+cad 2048 900 200
+n=$(wc -l < "$JEX_TLOG" | tr -d ' ')
+{ is_skip && [ "$n" -le 305 ] && [ "$n" -ge 2 ] && tail -n 1 "$JEX_TLOG" | grep -q 'skipped-low-disk'; } \
+  && ok "log trimmed: 1100 old lines + a skip leave $n lines, the last one the skip" \
+  || bad "log trim: skip=$(yn is_skip) lines=$n last='$(tail -n 1 "$JEX_TLOG")'"
+
+# the stamp cannot be built (jq fails on exactly that rewrite): the state file is left AS IT WAS — never replaced by an empty answer — and the run still exports
+fresh_archive stampfail; reset_tlog
+printf '{"sentinel_key":"kept","pending_spike_alerts":{"wa":{"database":"wa","prev_count":1000,"current_count":500,"delta":50,"threshold":20}}}\n' > "$E2E_STATE/jsonl-export-state.json"
+STATE_BEFORE="$(jq -S -c . "$E2E_STATE/jsonl-export-state.json")"
+REAL_JQ="$(command -v jq)"
+printf '#!/bin/sh\nif [ "${STUB_JQ_FAIL_STAMP:-0}" = 1 ]; then for a in "$@"; do case "$a" in *"last_export_at = \\$t"*) exit 5 ;; esac; done; fi\nexec "%s" "$@"\n' "$REAL_JQ" > "$E2E/bin/jq"
+chmod +x "$E2E/bin/jq"
+export STUB_JQ_FAIL_STAMP=1
+cad 4096 0 200
+unset STUB_JQ_FAIL_STAMP
+# falhou/ilegível (the file is not a JSON object any more) → "UNREADABLE", which the assertion below does not accept
+STATE_AFTER="$(jq -c '{sentinel: .sentinel_key, stamp: (.last_export_at // "none")}' "$E2E_STATE/jsonl-export-state.json" 2>/dev/null || echo UNREADABLE)"
+rm -f "$E2E/bin/jq"
+# (the run itself rewrites last_logged_mode, pending_archive_push and resets consecutive_push_failures, so the state is not compared whole: a key nothing in the exporter touches must survive, and there must be no stamp)
+{ [ "$RC" = "0" ] && [ "$(head_rows)" = "200" ] && [ "$STATE_AFTER" = '{"sentinel":"kept","stamp":"none"}' ]; } \
+  && ok "stamp cannot be built: the run still exports (200 rows), the state keeps its other keys and gets no last_export_at (not blanked)" \
+  || bad "stamp cannot be built: rc=$RC head=$(head_rows) state_after=$STATE_AFTER stamp=$(stamp) (before: $STATE_BEFORE): $OUT"
+case "$OUT" in *"could not build the updated state, last_export_at not stamped"*"could not stamp last_export_at"*) ok "stamp cannot be built: both warnings reach stderr" ;; *) bad "stamp cannot be built: warnings missing: $OUT" ;; esac
+
+# the guard's lib missing next to the exporter: the run still exports (a backup that cannot find its guard runs), and says so
+mkdir -p "$E2E/scripts-nodisk" "$E2E/city-nodisk" "$E2E/state-nodisk"
+cp "$SCRIPT" "$E2E/scripts-nodisk/jsonl-export.sh"
+cp "$HERE/jsonl-archive-repack-window-lib.sh" "$E2E/scripts-nodisk/"
+cp "$E2E/scripts/dolt-target.sh" "$E2E/scripts-nodisk/"
+nodisk_run() {  # nodisk_run <rows> — exporter without disk-headroom-lib.sh, on a 2 GB reading and a pinned clock (which the guard could not use anyway)
+  : > "$E2E/gc.log"
+  OUT=$(E2E_GC_LOG="$E2E/gc.log" STUB_EXPORT_ROWS="$1" STUB_SOURCE_COUNT="$1" STUB_TEST_ROWS=0 DISK_FREE_OVERRIDE_MB=2048 JEX_NOW_EPOCH=$T0 \
+    PATH="$SANDBOX_PATH" GC_CITY="$E2E/city-nodisk" GC_PACK_STATE_DIR="$E2E/state-nodisk" GC_JSONL_ARCHIVE_REPO="$E2E/archive-nodisk" \
+    bash "$E2E/scripts-nodisk/jsonl-export.sh" 2>&1)
+  RC=$?
+}
+nodisk_run 200; nodisk_run 210
+ARCH="$E2E/archive-nodisk"
+{ [ "$RC" = "0" ] && [ "$(head_rows)" = "210" ] && case "$OUT" in *"disk-headroom-lib.sh could not be loaded"*"exports"*) true ;; *) false ;; esac; } \
+  && ok "no disk lib next to the exporter: both runs export (210 rows) and each says the cadence guard is OFF" \
+  || bad "no disk lib: rc=$RC head=$(head_rows): $OUT"
+
+# the alarm that watches the exporter (jsonl-hourly-offsite.sh: "fonte parada" = no <db>/issues.jsonl rewrite for JHO_STALE_SOURCE_S) must stay quiet through the longest skip. That is 3 h (the critical
+# interval) + one tick (the order interval, 15 min) + one run (the order timeout, 840 s). Read from the files, so a change to either side shows up here.
+OFFSITE="$HERE/jsonl-hourly-offsite.sh"
+stale_def="$(sed -n 's/^STALE_SOURCE_S="${JHO_STALE_SOURCE_S:-\([0-9][0-9]*\)}".*/\1/p' "$OFFSITE" 2>/dev/null | head -1)"
+crit_def="$(sed -n 's/^JEX_CRITICAL_DISK_INTERVAL_S="${JEX_CRITICAL_DISK_INTERVAL_S:-\([0-9][0-9]*\)}"$/\1/p' "$SCRIPT" | head -1)"
+low_def="$(sed -n 's/^JEX_LOW_DISK_INTERVAL_S="${JEX_LOW_DISK_INTERVAL_S:-\([0-9][0-9]*\)}"$/\1/p' "$SCRIPT" | head -1)"
+ord_int="$(dur_s "$(order_field "$ORDER_TOML" interval)")" || ord_int=""
+ord_to="$(dur_s "$(order_field "$ORDER_TOML" timeout)")" || ord_to=""
+if [ -z "$stale_def" ] || [ -z "$crit_def" ] || [ -z "$low_def" ] || [ -z "$ord_int" ] || [ -z "$ord_to" ]; then
+  bad "offsite alarm check cannot read its inputs: JHO_STALE_SOURCE_S='$stale_def' critical='$crit_def' low='$low_def' order interval='$ord_int' timeout='$ord_to' — the comparison is not made, and not assumed"
+else
+  worst=$((crit_def + ord_int + ord_to))
+  [ "$worst" -lt "$stale_def" ] \
+    && ok "longest skip (critical ${crit_def}s + tick ${ord_int}s + run ${ord_to}s = ${worst}s) is under the offsite 'fonte parada' alarm (${stale_def}s)" \
+    || bad "longest skip ${worst}s is NOT under the offsite alarm ${stale_def}s: the cadence guard would raise 'fonte parada'"
+  [ "$low_def" -lt "$crit_def" ] && [ "$low_def" -gt "$ord_int" ] \
+    && ok "intervals are ordered: tick ${ord_int}s < low-disk ${low_def}s < critical ${crit_def}s" \
+    || bad "intervals out of order: tick ${ord_int}s, low ${low_def}s, critical ${crit_def}s"
+fi
+# the CRITICAL class is the guard's own: same variable, same default (jsonl-archive-compact.sh does the same check)
+GUARD="$HERE/../../../../scripts/dolt-disk-floor-guard.sh"
+gdef="$(sed -n 's/^FLOOR_CRITICAL_GB="${DOLT_DISK_FLOOR_CRITICAL_GB:-\([0-9][0-9]*\)}".*/\1/p' "$GUARD" 2>/dev/null | head -1)"
+edef="$(sed -n 's/^JEX_DOLT_CRITICAL_GB="${DOLT_DISK_FLOOR_CRITICAL_GB:-\([0-9][0-9]*\)}"$/\1/p' "$SCRIPT" | head -1)"
+if [ -z "$gdef" ] || [ -z "$edef" ]; then
+  bad "Dolt CRITICAL default: cannot read both sides (guard='$gdef' exporter='$edef' from $GUARD) — the exporter's floor can no longer be checked against the guard's"
+else
+  [ "$gdef" = "$edef" ] && ok "Dolt CRITICAL default: exporter ${edef} GiB = dolt-disk-floor-guard.sh ${gdef} GiB (same variable, same default)" || bad "Dolt CRITICAL default drifted: exporter ${edef} GiB vs guard ${gdef} GiB"
+fi
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

@@ -44,6 +44,70 @@ if ! { [ -r "$SCRIPT_DIR/jsonl-archive-repack-window-lib.sh" ] && . "$SCRIPT_DIR
     exit 1
 fi
 
+# The export's cadence follows the disk (ga-j2f5v5). Every run rewrites hq/comments.jsonl (~276 MB), hq/issues.jsonl (~73 MB), the flat hq.jsonl and the whatsapp_automation files, and `git add` keeps a
+# new loose blob of each file that changed. Measured 18/10 03:50-09:46Z: the disk dips ~700 MB on every run and comes back, and the archive's packed side grew +860 MiB in 6 h; with the disk under Dolt's
+# CRITICAL floor, one more swapfile (+1 GB) in the middle of a dip is all it takes for ENOSPC on Dolt's journal, as on 15/10 and 17/10. So with a low disk the run is spaced out, and says so:
+#   free >= DISK_NEW_WORK_MIN_MB (5 GiB) ................................. every tick, as before
+#   free below it, Dolt's disk class not CRITICAL ........................ at most once per JEX_LOW_DISK_INTERVAL_S (1 h)
+#   free whole GiB <= DOLT_DISK_FLOOR_CRITICAL_GB (3), i.e. under 4096 MB  only when the last export is JEX_CRITICAL_DISK_INTERVAL_S (3 h) old
+# The CRITICAL line is dolt-disk-floor-guard.sh's own (same variable, same default, "free GiB rounded down <= N"; jsonl-archive-compact.sh reads it the same way), not a third reading of "3 GB".
+# "Last export" is last_export_at in the state file, stamped when a run enters the heavy part (databases listed, nothing exported yet): a run the engine kills at its timeout cost the disk all the same, so it counts.
+# THREE answers about the disk, never two: it has room (run), it is low (space the run), it cannot be read (RUN). The export is the backup: a df hiccup, a missing or unreadable last_export_at, a stamp in the
+# future or a clock that will not answer must never make it stop in silence, so every doubt is "run" and the reason is in the log. So the export is never held back for more than JEX_CRITICAL_DISK_INTERVAL_S after the last stamp (plus the tick that finds it due); the offsite
+# alarm for a stopped exporter (jsonl-hourly-offsite.sh, JHO_STALE_SOURCE_S = 6 h) stays quiet inside that — the selftest compares the two defaults.
+JEX_LOW_DISK_INTERVAL_S="${JEX_LOW_DISK_INTERVAL_S:-3600}"
+JEX_CRITICAL_DISK_INTERVAL_S="${JEX_CRITICAL_DISK_INTERVAL_S:-10800}"
+JEX_DOLT_CRITICAL_GB="${DOLT_DISK_FLOOR_CRITICAL_GB:-3}"
+# empty / not a number / more than 9 digits -> the default (a value `[ -ge ]` and $(( )) can take; the arithmetic below also forces base 10, so "08" is eight and not an octal error)
+case "$JEX_LOW_DISK_INTERVAL_S" in ''|*[!0-9]*) JEX_LOW_DISK_INTERVAL_S=3600 ;; esac
+case "$JEX_CRITICAL_DISK_INTERVAL_S" in ''|*[!0-9]*) JEX_CRITICAL_DISK_INTERVAL_S=10800 ;; esac
+case "$JEX_DOLT_CRITICAL_GB" in ''|*[!0-9]*) JEX_DOLT_CRITICAL_GB=3 ;; esac
+[ "${#JEX_LOW_DISK_INTERVAL_S}" -le 9 ] || JEX_LOW_DISK_INTERVAL_S=3600
+[ "${#JEX_CRITICAL_DISK_INTERVAL_S}" -le 9 ] || JEX_CRITICAL_DISK_INTERVAL_S=10800
+[ "${#JEX_DOLT_CRITICAL_GB}" -le 9 ] || JEX_DOLT_CRITICAL_GB=3
+
+# The ONE reader of "how much disk is left" (disk-headroom-lib.sh). Unlike the repack-window lib above, a missing lib does not stop the run: this guard only ever SPACES the export, and a backup that cannot
+# find its guard must still run (main section: it says so on stderr and in the log). -r first: bash 3.2 ends a non-interactive shell at a `.` of a missing file before any `||` can answer.
+JEX_DISK_LIB_OK=0
+if [ -r "$SCRIPT_DIR/disk-headroom-lib.sh" ] && . "$SCRIPT_DIR/disk-headroom-lib.sh" 2>/dev/null && type disk_free_mb disk_state_of >/dev/null 2>&1; then
+    JEX_DISK_LIB_OK=1
+fi
+
+# jex_cadence_verdict <free_mb> <last_export_epoch> <now_epoch> — pure: prints one line and returns 0 (safe under set -e).
+#   run|<why>      export now. why: disk-ok · disk-unreadable · clock-unreadable · no-last-export · last-export-unreadable · last-export-in-the-future · due-low · due-critical
+#   skip|<detail>  space it out; detail is the line for the log (tier, the reading, the age, the interval, the wait left)
+# free_mb "" or not a number = the disk could not be read. last_export_epoch "" = never stamped; a non-number = a stamp that could not be read.
+jex_cadence_verdict() {
+    local free="${1:-}" last="${2:-}" now="${3:-}" crit_mb st_new st_crit tier min_s age
+    crit_mb=$(( 10#$JEX_DOLT_CRITICAL_GB * 1024 + 1024 ))   # free GiB rounded down <= N  <=>  free MB < (N+1) * 1024
+    # disk_state_of answers ok | low | unknown from the very reading we print; "low" there means "below that floor". vazio/falhou/ilegível → unknown → run
+    st_new=$(disk_state_of "$free" "$DISK_NEW_WORK_MIN_MB")
+    st_crit=$(disk_state_of "$free" "$crit_mb")
+    case "$st_new$st_crit" in
+        *unknown*) echo "run|disk-unreadable"; return 0 ;;
+    esac
+    if [ "$st_crit" = "low" ]; then
+        tier=critical; min_s="$JEX_CRITICAL_DISK_INTERVAL_S"
+    elif [ "$st_new" = "low" ]; then
+        tier=low; min_s="$JEX_LOW_DISK_INTERVAL_S"
+    else
+        echo "run|disk-ok"; return 0
+    fi
+    # the disk is low: now only the clock and the last stamp decide, and any doubt about them is "run"
+    case "$now" in ''|*[!0-9]*) echo "run|clock-unreadable"; return 0 ;; esac
+    [ "${#now}" -le 12 ] || { echo "run|clock-unreadable"; return 0; }
+    case "$last" in
+        '') echo "run|no-last-export"; return 0 ;;
+        *[!0-9]*) echo "run|last-export-unreadable"; return 0 ;;
+    esac
+    [ "${#last}" -le 12 ] || { echo "run|last-export-unreadable"; return 0; }
+    age=$(( 10#$now - 10#$last ))
+    if [ "$age" -lt 0 ]; then echo "run|last-export-in-the-future"; return 0; fi
+    if [ "$age" -ge "$min_s" ]; then echo "run|due-$tier"; return 0; fi
+    echo "skip|tier=$tier free=${free}MB last_export_age=${age}s min_interval=${min_s}s next_due_in=$(( min_s - age ))s"
+    return 0
+}
+
 # Library mode: `JSONL_EXPORT_LIB=1 source jsonl-export.sh` defines the pure
 # function above and returns before dolt-target.sh is sourced — no live Dolt
 # server, port resolution, or GC_CITY_PATH is ever required. Used by
@@ -851,6 +915,76 @@ mkdir -p "$(dirname "$STATE_FILE")"
 log_archive_mode_if_needed
 retry_pending_spike_alert
 
+# The disk-aware cadence (ga-j2f5v5; the rule and the reasons are above jex_cadence_verdict). Decided here, before any Dolt query, so a skipped tick costs one df and one state read and sends no DOG_DONE nudge;
+# the pending spike alert above is retried on every tick, skipped or not. last_export_at is stamped later (jex_stamp_export_start), only once a run is really about to export.
+JEX_LOG="${JEX_LOG:-$CITY/.gc/logs/jsonl-export.log}"
+
+# jex_log <text> — one dated line in $JEX_LOG, trimmed to its last 300 lines once it passes 1000. falhou → a warning on stderr and the run goes on: the log is the trace, never a precondition of the export.
+jex_log() {
+    local n
+    if ! { mkdir -p "$(dirname "$JEX_LOG")" && printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$JEX_LOG"; } 2>/dev/null; then
+        echo "jsonl-export: could not write the log $JEX_LOG" >&2
+        return 0
+    fi
+    # vazio/ilegível → no count, no trim (the file only grows by a line a tick until the next readable count)
+    n=$(wc -l < "$JEX_LOG" 2>/dev/null | tr -d ' ') || n=""
+    case "$n" in ''|*[!0-9]*) return 0 ;; esac
+    if [ "$n" -gt 1000 ]; then
+        if tail -n 300 "$JEX_LOG" > "$JEX_LOG.tmp.$$" 2>/dev/null; then
+            mv -f "$JEX_LOG.tmp.$$" "$JEX_LOG" 2>/dev/null || rm -f "$JEX_LOG.tmp.$$"
+        else
+            rm -f "$JEX_LOG.tmp.$$"
+        fi
+    fi
+    return 0
+}
+
+# The clock: JEX_NOW_EPOCH pins it in selftests. vazio/ilegível → "" and, on a low disk, the verdict says run (clock-unreadable).
+JEX_NOW="${JEX_NOW_EPOCH:-}"
+case "$JEX_NOW" in ''|*[!0-9]*) JEX_NOW="$(date +%s 2>/dev/null)" || JEX_NOW="" ;; esac
+case "$JEX_NOW" in *[!0-9]*) JEX_NOW="" ;; esac
+
+JEX_DECISION="run|guard-off"
+JEX_FREE=""
+if [ "$JEX_DISK_LIB_OK" = "1" ]; then
+    # vazio → the disk could not be read (""), the verdict is run; falhou → same
+    JEX_FREE="$(disk_free_mb)" || JEX_FREE=""
+    # vazio → never stamped ("" → run); falhou/ilegível (state, jq or the date unreadable) → "unreadable" → run, with that reason in the log
+    JEX_LAST_ISO="$(read_state_json | jq -r '.last_export_at // empty' 2>/dev/null)" || JEX_LAST_ISO="unreadable"
+    JEX_LAST=""
+    if [ -n "$JEX_LAST_ISO" ]; then
+        JEX_LAST="$(jq -nr --arg t "$JEX_LAST_ISO" '$t | fromdateiso8601 | floor | tostring' 2>/dev/null)" || JEX_LAST="unreadable"
+    fi
+    JEX_DECISION="$(jex_cadence_verdict "$JEX_FREE" "$JEX_LAST" "$JEX_NOW")"
+else
+    echo "jsonl-export: $SCRIPT_DIR/disk-headroom-lib.sh could not be loaded — the disk-aware cadence is OFF and this run exports (ga-j2f5v5)" >&2
+    jex_log "run (guard-off) — disk-headroom-lib.sh could not be loaded from $SCRIPT_DIR"
+fi
+JEX_VERDICT="${JEX_DECISION%%|*}"
+JEX_WHY="${JEX_DECISION#*|}"
+if [ "$JEX_VERDICT" = "skip" ]; then
+    echo "jsonl-export: skipped-low-disk (cadência estendida) — $JEX_WHY"
+    jex_log "skipped-low-disk (cadência estendida) — $JEX_WHY"
+    exit 0
+fi
+case "$JEX_WHY" in
+    disk-ok|guard-off) ;;
+    *) jex_log "run ($JEX_WHY) free=${JEX_FREE:-unreadable}MB" ;;
+esac
+
+# jex_stamp_export_start — last_export_at = the instant this run DECIDED to export (JEX_NOW, not the moment the state is written), so the cadence is counted from tick to tick. Called once the databases are listed
+# and before the first export, never earlier: a tick that finds Dolt down or no database exports nothing and must not use up the hour. falhou → rc 1 and the caller warns: with no stamp the next tick simply
+# runs (the verdict's "no-last-export"), it never skips on a guess.
+jex_stamp_export_start() {
+    local iso updated
+    iso="$(jq -nr --argjson e "${JEX_NOW:-x}" '$e | todate' 2>/dev/null)" || iso=""
+    [ -n "$iso" ] || { echo "jsonl-export: no clock reading, last_export_at not stamped" >&2; return 1; }
+    # falhou/vazio (jq cannot rewrite the state) → nothing is written: an empty answer must never replace the state file, which also holds pending_spike_alerts and the push counters
+    updated="$(read_state_json | jq -c --arg t "$iso" '.last_export_at = $t' 2>/dev/null)" || updated=""
+    [ -n "$updated" ] || { echo "jsonl-export: could not build the updated state, last_export_at not stamped" >&2; return 1; }
+    write_state_json "$updated"
+}
+
 is_user_database() {
     case "$1" in
         information_schema|mysql|dolt_cluster|performance_schema|sys|__gc_probe|benchdb|testdb_*|beads_pt*|beads_vr*|beads_test_bench_*|doctest_*|doctortest_*)
@@ -1075,6 +1209,11 @@ should_halt_for_jsonl_spike() {
 
     return 0
 }
+
+# From here the run exports: spend this tick's slot of the disk-aware cadence (ga-j2f5v5). A stamp that cannot be written is a warning, not a stop — the next tick then runs instead of guessing.
+if [ "$JEX_DISK_LIB_OK" = "1" ] && ! jex_stamp_export_start; then
+    echo "jsonl-export: could not stamp last_export_at; the next tick will not be spaced out" >&2
+fi
 
 while IFS= read -r DB; do
     [ -z "$DB" ] && continue
