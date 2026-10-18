@@ -40,7 +40,7 @@ extract_fn()    { awk -v n="$2" '$0 ~ "^"n"\\(\\) \\{" {f=1} f {print} f && /^\}
 
 CAP_BODY="$(extract_block "$DISPATCHER" cap-branch)"
 [ -n "$CAP_BODY" ] || { echo "FATAL: SELFTEST-EXTRACT cap-branch not found in $DISPATCHER" >&2; exit 2; }
-for fn in gate_fail_assignee_action resolve_recycled_author; do
+for fn in gate_fail_assignee_action resolve_recycled_author gate_render_reasons; do
   body="$(extract_fn "$DISPATCHER" "$fn")"
   [ -n "$body" ] || { echo "FATAL: could not extract $fn from $DISPATCHER" >&2; exit 2; }
   eval "$body"

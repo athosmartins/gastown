@@ -57,6 +57,8 @@ load fn gate_fail_pool_read_facts
 load fn gate_fail_pool_veto_reasons
 load fn gate_fail_redispatch_verified
 load fn gate_fail_settle_deferred_mayor_wake
+load fn gate_render_reasons   # the cap-escalation-mail block renders FAIL_REASONS with it (ga-lxm9se)
+load fn gate_reasons_escape   # ... and the reviewer-comment producers escape with it
 # The veto lists live in a sibling lib the dispatcher sources (gate round 3, blocking 2). Run the LIVE load
 # block, pointed at the lib next to the dispatcher under test — the same `[ -r ]`-guarded source, not a copy.
 _GATE_VETO_LIB_DIR="${GATE_VETO_LIB_DIR_UNDER_TEST:-$(dirname "$DISPATCHER")/scripts}"
@@ -412,7 +414,7 @@ NAF_CALLS=0; notify_author_with_fallback() { NAF_CALLS=$((NAF_CALLS+1)); return 
 CAP_ERR="$(mktemp "${TMPDIR:-/tmp}/gate-defer-cap-err.XXXXXX")"; trap 'rm -f "$CAP_ERR"' EXIT
 run_cap() {  # run_cap <SRC_LABELS as read when the FAIL began>; shell errors from the live block land in $CAP_ERR
   SRC_LABELS="$1"; _NH_STATUS="armed"; GATE_FIX_CAP=3; BRANCH="story/x"; RIG="gascity"; GATE_RUN_ID="ga-run"
-  FAIL_REASONS="reason"; NOTIFY_AUTHOR="wa-worker"; AUTHOR="mayor"; NAF_CALLS=0
+  FAIL_REASONS="${CAP_FAIL_REASONS:-reason}"; NOTIFY_AUTHOR="wa-worker"; AUTHOR="mayor"; NAF_CALLS=0
   eval "$CAP_BODY" 2>"$CAP_ERR"
 }
 reset; run_cap "gate:fix-attempt:3 gate:needs-fix"
@@ -422,6 +424,17 @@ eq "no needs-human yet, mail sent => flag set, one Mayor mail, author notified" 
 # fail on any shell error the live block printed (an unbound variable under set -u lands here).
 case "$MAIL_BODIES" in *"failed the quality gate 4 times"*) ok "the escalation body carries the real attempt count (GATE_FIX_CAP+1 = 4)" ;; *) bad "escalation body is empty/wrong: [$MAIL_BODIES]" ;; esac
 eq "the live cap block printed no shell error (e.g. an unbound variable)" "$(cat "$CAP_ERR")" ""
+# ga-lxm9se: a reviewer who quoted the regex \b put a raw 0x08 into this very mail (ga-wisp-28dtr0 / ga-wisp-glliyp), and a raw control
+# byte in a wisp makes the readers' JSON parse fail. The producer escapes the reviewer's words, the live block renders them and drops
+# any raw control byte that reached the reasons some other way (a pasted terminal capture).
+_BSB=$'\x08'; _ESCB=$'\x1b'
+reset; CAP_FAIL_REASONS="Reviewer 1 FAIL: $(gate_reasons_escape 'the pattern \bword\b and \d+ is wrong')\nReviewer 2 FAIL: $(gate_reasons_escape 'colour \x1b[0m and a \n in the sample')\nPasted capture: ok${_BSB}${_BSB}done ${_ESCB}[0m\n"
+run_cap "gate:fix-attempt:3 gate:needs-fix"; unset CAP_FAIL_REASONS
+case "$MAIL_BODIES" in *'the pattern \bword\b and \d+ is wrong'*) ok "a reviewer's \\b and \\d reach the Mayor's mail as written" ;; *) bad "the reviewer's words were rewritten in the mail: [$MAIL_BODIES]" ;; esac
+case "$MAIL_BODIES" in *'colour \x1b[0m and a \n in the sample'*) ok "and so do \\x1b and a \\n inside the reviewer's sample (not a line break)" ;; *) bad "the second reviewer's words were rewritten in the mail: [$MAIL_BODIES]" ;; esac
+case "$MAIL_BODIES" in *$'\x08'*|*$'\x1b'*) bad "the Mayor's mail carries a raw control byte (0x08/ESC)" ;; *) ok "the Mayor's mail carries no raw BS or ESC" ;; esac
+case "$MAIL_BODIES" in *'Pasted capture: okdone [0m'*) ok "and the text around a dropped control byte is kept" ;; *) bad "the pasted capture was not rendered as okdone [0m: [$MAIL_BODIES]" ;; esac
+eq "the live cap block printed no shell error with reviewer text in the reasons" "$(cat "$CAP_ERR")" ""
 reset; FAIL_RECIPIENTS="mail:mayor"; run_cap "gate:fix-attempt:3 gate:needs-fix"
 eq "no needs-human yet, mail FAILED => flag NOT set (nobody was paged)" "$GATE_FAIL_CAP_ESCALATED" "0"
 case "$WARN_LINES" in *"Could not mail Mayor escalation"*"NOT suppressed"*) ok "and the failure is warned, saying the deferred page is not suppressed" ;; *) bad "no warn line: [$WARN_LINES]" ;; esac

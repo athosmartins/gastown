@@ -12,7 +12,7 @@
 #      which keeps today's behavior = retry), gate_push_reject_detail (the hook's words, no git boilerplate), and — gate-fix,
 #      after the first review — the three things that stop one refusal from being read as a deterministic one: a hook that
 #      says its refusal is transient (the live .githooks/pre-push does, on a network blip) is never "hook";
-#      gate_push_hook_confirmed (the same words twice in a row); gate_push_hook_feedback (no absolute, echo -e safe);
+#      gate_push_hook_confirmed (the same words twice in a row); gate_push_hook_feedback (no absolute, safe to render with gate_render_reasons);
 #   3. the dispatcher's LIVE classification block (SELFTEST-EXTRACT push-reject-class) run under /bin/bash 3.2 with
 #      `set -euo pipefail`: a hook gives failed_push_hook_rejected — also a VERBOSE one whose capture is past 8 KB — a race, a
 #      transient refusal and an EMPTY capture give failed_push_race, and the log says what git said;
@@ -122,10 +122,10 @@ eq "first sighting (no previous)    → once"      "$(gate_push_hook_confirmed '
 eq "different words (cause moving)  → once"      "$(gate_push_hook_confirmed 'BLOCKED: x' 'BLOCKED: y')" once
 eq "words, then none                → once"      "$(gate_push_hook_confirmed 'BLOCKED: x' '')" once
 eq "no words twice (two unknowns)   → once, never 'the same words'" "$(gate_push_hook_confirmed '' '')" once
-# gate_push_hook_feedback: what the author reads. FAIL_REASONS goes through `echo -e` downstream.
+# gate_push_hook_feedback: what the author reads. FAIL_REASONS goes through gate_render_reasons downstream (never `echo -e`, ga-lxm9se).
 fb=$(gate_push_hook_feedback fix/x main 'path C:\new\tab and \n kept')
-shown=$(echo -e "$fb")
-case "$shown" in *'C:\new\tab and \n kept'*) ok "feedback: a backslash sequence in the hook's words survives echo -e as written" ;; *) bad "feedback: echo -e rewrote the hook's words: [$shown]" ;; esac
+shown=$(gate_render_reasons "$fb")
+case "$shown" in *'C:\new\tab and \n kept'*) ok "feedback: a backslash sequence in the hook's words survives the renderer as written" ;; *) bad "feedback: the renderer rewrote the hook's words: [$shown]" ;; esac
 case "$fb" in *"REFUSED BY A HOOK"*"two consecutive attempts"*) ok "feedback names the hook and says the refusal was seen twice" ;; *) bad "feedback lost the hook / two-attempt wording" ;; esac
 case "$fb" in *"will be refused the same way"*) bad "feedback still asserts an absolute ('will be refused the same way')" ;; *) ok "feedback does not promise more than was observed" ;; esac
 case "$(gate_push_hook_feedback fix/x main '')" in *"<no hook output was captured>"*) ok "feedback with no words says so (does not print an empty quote)" ;; *) bad "feedback with no words prints nothing where the hook's words go" ;; esac

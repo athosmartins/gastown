@@ -236,6 +236,18 @@ reset_fix; touch "$FIX/ephemeral.fail"
 WANT_RC=3 WANT_ERR='tier\(s\) 3 unreadable' run_both "bd query failing -> [] but says tier 3 was unreadable (exit 3)" "-" gastown.dog
 reset_fix; printf 'garbage' > "$FIX/ephemeral.raw"
 WANT_RC=3 WANT_ERR='tier\(s\) 3 unreadable' run_both "bd query answer is not JSON -> [] but says so (exit 3)" "-" gastown.dog
+# ga-lxm9se: the shape "unreadable" really had. Not garbage: a well-formed answer with ONE raw control byte (0x08) inside a string,
+# which is what a quoted `\b` run through `echo -e` left in two mail wisps. jq refuses the whole document, so the bead that is waiting
+# is invisible, and the engine's own probe turns that into `[]` = "no work". The script must say it could not read.
+reset_fix; printf '[{"id":"t1-bs","updated_at":"2026-01-01T00:00:00Z","description":"the regex \010 here","labels":[]}]' > "$FIX/tier1.raw"
+WANT_RC=3 WANT_ERR='tier\(s\) 1 unreadable' run_both "tier 1: a raw 0x08 inside a string -> [] but says tier 1 was unreadable (exit 3), never a silent no-work" "-" gastown.dog
+reset_fix; printf '[{"id":"lg-bs","description":"the regex \010 here","metadata":{"gc.run_target":"gastown.dog","gc.kind":"workflow"},"labels":[]}]' > "$FIX/legacy.raw"
+WANT_RC=3 WANT_ERR='tier\(s\) 2 unreadable' run_both "tier 2: a raw 0x08 inside a string -> [] but says tier 2 was unreadable (exit 3)" "-" gastown.dog
+reset_fix; printf '[{"id":"e-bs","created_at":"2026-01-01T00:00:00Z","description":"the regex \010 here","metadata":{"gc.routed_to":"gastown.dog"},"labels":[]}]' > "$FIX/ephemeral.raw"
+WANT_RC=3 WANT_ERR='tier\(s\) 3 unreadable' run_both "tier 3: a raw 0x08 inside a string -> [] but says tier 3 was unreadable (exit 3)" "-" gastown.dog
+# the control: the same beads with the byte ESCAPED (\b in JSON, what bd itself writes) are read and picked as usual
+reset_fix; printf '%s' '[{"id":"e-bs","created_at":"2026-01-01T00:00:00Z","description":"the regex \b here","metadata":{"gc.routed_to":"gastown.dog"},"labels":[]}]' > "$FIX/ephemeral.json"
+run_both "control: the same bead with the byte escaped (\\b in the JSON) is picked, nothing on stderr" "e-bs" gastown.dog
 reset_fix
 echo '[{"id":"m-fail","updated_at":"2026-01-01T00:00:00Z","metadata":{"molecule_id":"M5"},"labels":[]}]' > "$FIX/tier1.json"
 touch "$FIX/children-M5.fail"

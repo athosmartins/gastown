@@ -1687,9 +1687,47 @@ gate_push_hook_confirmed() {
   if [ -n "${1:-}" ] && [ "${1:-}" = "${2:-}" ]; then printf 'confirmed'; else printf 'once'; fi
 }
 
+# ── ga-lxm9se: FAIL_REASONS / INTEGRITY_MSG are rendered by gate_render_reasons, never by `echo -e` ──
+# The dispatcher builds these strings with ONE escape of its own: the two characters backslash-n, its line break (and `\\` for a
+# backslash that belongs to someone else's words). `echo -e` also expanded every OTHER sequence in them — and most of the text is
+# somebody else's words (a reviewer's comment, a hook's output). A reviewer quoting the regex `\b` wrote a raw 0x08 byte into the
+# Mayor's mail wisps (ga-wisp-28dtr0 / ga-wisp-glliyp), `\c` would have cut the text there, `\x1b` writes ESC. A raw control byte
+# inside a JSON string is invalid JSON for jq 1.8 and python's json. bd 1.1.0 escapes it when it prints, so the reader failure
+# ga-lxm9se reported was NOT reproduced on those two wisps; the byte was wrong text in a mail either way.
+#
+# gate_reasons_escape <text> — the writer's half of this pair; it is defined next to gate_collect_verdicts, inside the block the
+# selftests extract, because that is where most of the text it protects is appended (see there).
+
+# gate_render_reasons <text> — pure. What the reader sees: `\n` becomes a line break, `\\` becomes one backslash, every other
+# backslash sequence stays exactly as written. Control bytes other than tab, newline and carriage return are dropped (a pasted
+# terminal capture carries ESC and BS; they mean nothing in a mail and a strict JSON reader refuses them). Reads the
+# text from the argument and prints it with one trailing newline, as `echo -e` did; callers use it inside $( ) or before head.
+gate_render_reasons() {
+  printf '%s\n' "${1-}" | awk '{
+    out = ""; n = length($0)
+    for (i = 1; i <= n; i++) {
+      c = substr($0, i, 1)
+      if (c == "\\" && i < n) {
+        d = substr($0, i + 1, 1)
+        if (d == "\\") { out = out "\\"; i++; continue }
+        if (d == "n")  { out = out "\n"; i++; continue }
+      }
+      out = out c
+    }
+    print out
+  }' | LC_ALL=C tr -d '\000-\010\013\014\016-\037'
+}
+
+# gate_suite_tail <file> — the last 60 lines of a test-suite log, without its control bytes. The tail goes into FAIL_REASONS, and the
+# full-suite regression path prints FAIL_REASONS as it is (not through gate_render_reasons) in a mail body and a bead comment; a
+# suite's colour codes and progress bars are ESC and BS.
+gate_suite_tail() {
+  { tail -60 "${1:-/dev/null}" 2>/dev/null | LC_ALL=C tr -d '\000-\010\013\014\016-\037'; } || true
+}
+
 # gate_push_hook_feedback <branch> <default-branch> <detail> — pure. The FAIL text for a CONFIRMED hook refusal. FAIL_REASONS is
-# rendered with `echo -e` downstream, which would turn a backslash sequence in the hook's own words into a newline or a tab: the
-# backslashes are doubled so the words reach the author as the hook wrote them.
+# rendered by gate_render_reasons downstream, which reads `\n` as a line break and `\\` as a backslash: the hook's own backslashes
+# are doubled (gate_reasons_escape) so the words reach the author as the hook wrote them.
 gate_push_hook_feedback() {
   local detail
   detail=$(printf '%s' "${3:-}" | sed 's/\\/\\\\/g')
@@ -9899,7 +9937,7 @@ The reviewers APPROVED commit ${BRANCH_SHA:0:12} — only the merge failed — a
             # additions relative to pre-merge main, the file was completely dropped.
             if [ "$BRANCH_ADDITIONS" -gt 0 ] && [ "$MERGED_ADDITIONS" = "0" ]; then
               INTEGRITY_FAIL=1
-              INTEGRITY_MSG="${INTEGRITY_MSG}File $f: branch had $BRANCH_ADDITIONS additions but merged main has 0 (DROPPED).\n"
+              INTEGRITY_MSG="${INTEGRITY_MSG}File $(gate_reasons_escape "$f"): branch had $BRANCH_ADDITIONS additions but merged main has 0 (DROPPED).\n"
               log "  INTEGRITY FAIL: $f — branch additions not in merged main"
             fi
           done <<< "$BRANCH_CHANGED_FILES"
@@ -9926,7 +9964,7 @@ The reviewers APPROVED commit ${BRANCH_SHA:0:12} — only the merge failed — a
         REVERT_STATUS=$([ "$REVERT_OK" = "1" ] && echo "REVERTED (main restored to $MAIN_HEAD_SHA)" || echo "REVERT FAILED — manual fix required")
         FAIL_REASONS="Post-merge integrity check failed: merge silently dropped branch changes.
 Files with dropped changes:
-$(echo -e "$INTEGRITY_MSG")
+$(gate_render_reasons "$INTEGRITY_MSG")
 Revert status: $REVERT_STATUS
 Author must inspect conflict resolution and rebase + resubmit."
 
@@ -9934,7 +9972,7 @@ Author must inspect conflict resolution and rebase + resubmit."
         if [ -n "$BEAD_ID" ]; then
           bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:integrity-fail" -q 2>/dev/null || true
           bd -C "$BEAD_CITY" comment "$BEAD_ID" "GATE INTEGRITY FAIL: the merge of branch $BRANCH silently dropped your changes (conflict resolved to main's side).
-$(echo -e "$INTEGRITY_MSG")
+$(gate_render_reasons "$INTEGRITY_MSG")
 Revert: $REVERT_STATUS
 Action required: rebase $BRANCH onto current main, resolve conflicts explicitly, and re-submit via /gate-done." 2>/dev/null || true
         fi
@@ -11139,7 +11177,7 @@ Tier: $TIER  Reviewers required: $REQUIRED_REVIEWERS
 Elapsed: ${ELAPSED_S}s
 
 Blocking reasons:
-$(echo -e "$FAIL_REASONS")" 2>/dev/null || true
+$(gate_render_reasons "$FAIL_REASONS")" 2>/dev/null || true
     # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
     bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: FAILED (branch $BRANCH). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
     # ga-9ophv2: a closed run leaves no open parecer behind. Step 9 tries to close the reviewer sessions, but that is
@@ -11179,7 +11217,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
   # SELFTEST-EXTRACT nudge-call-site-1: BEGIN
   if [ -n "$NOTIFY_AUTHOR" ]; then
     nudge_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
-      "QUALITY GATE FAILED for branch $BRANCH. Blocking reasons: $(echo -e "$FAIL_REASONS" | head -3). Gate run: $GATE_RUN_ID. Fix the issues and re-run /gate-done when ready." \
+      "QUALITY GATE FAILED for branch $BRANCH. Blocking reasons: $(gate_render_reasons "$FAIL_REASONS" | head -3). Gate run: $GATE_RUN_ID. Fix the issues and re-run /gate-done when ready." \
       "Gate FAIL nudge for $BEAD_ID (branch $BRANCH, gate_run $GATE_RUN_ID)" || true
   fi
   # SELFTEST-EXTRACT nudge-call-site-1: END
@@ -11258,7 +11296,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
     #     (prefix "GATE-FEEDBACK") so the Pilot can surface it to the re-dispatched
     #     builder verbatim.
     bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'GATE-FEEDBACK (gate_run=%s branch=%s): quality gate FAILED. Fix THESE specific blocking issues, then run /gate-done to re-gate.\n\n%s' \
-      "$GATE_RUN_ID" "$BRANCH" "$(echo -e "$FAIL_REASONS")")" \
+      "$GATE_RUN_ID" "$BRANCH" "$(gate_render_reasons "$FAIL_REASONS")")" \
       2>/dev/null || warn "Could not attach gate feedback to source bead $BEAD_ID"
     bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
     if [ -n "$BRANCH_SHA" ]; then
@@ -11465,7 +11503,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         if gc --city "$GC_CITY" mail send mayor \
           -s "$_NH_MAIL_SUBJ" \
           -m "$(printf 'Source bead %s failed the quality gate %s times. %s\n\nBranch: %s\nRig: %s\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene.' \
-            "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$(gate_needs_human_clause "$_NH_STATUS")" "$BRANCH" "$RIG" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
+            "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$(gate_needs_human_clause "$_NH_STATUS")" "$BRANCH" "$RIG" "$GATE_RUN_ID" "$(gate_render_reasons "$FAIL_REASONS")")" \
           2>/dev/null; then
           GATE_FAIL_CAP_ESCALATED=1
         else
@@ -11480,7 +11518,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         notify_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
           "$_NH_MAIL_SUBJ" \
           "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. %s\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
-            "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$(gate_needs_human_clause "$_NH_STATUS")" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
+            "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$(gate_needs_human_clause "$_NH_STATUS")" "$GATE_RUN_ID" "$(gate_render_reasons "$FAIL_REASONS")")" \
           "gate-fix-cap escalation on $BEAD_ID (armed=$_NH_STATUS)" || true
       else
         # gate:needs-human was already on the source bead when this FAIL began. That does NOT prove
@@ -11864,7 +11902,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     REASON="quorum_${REQUIRED_REVIEWERS}_of_${REQUIRED_REVIEWERS}_independent_sessions"
   fi
 else
-  REASON=$(echo -e "$FAIL_REASONS" | head -1 | tr '\n' ' ' | cut -c1-200)
+  REASON=$(gate_render_reasons "$FAIL_REASONS" | head -1 | tr '\n' ' ' | cut -c1-200)
 fi
 
 jq -c -n \
@@ -12256,7 +12294,7 @@ gate_full_suite_check() {
   case "$GATE_FS_VERDICT" in
     regression)
       GATE_FS_DETAIL="ga-3wgx8: full test suite is RED on this branch (exit $branch_rc) but GREEN on $default_branch_ref — this branch introduces a regression outside its own diff. Suite output (tail):
-$(tail -60 "$branch_log" 2>/dev/null)"
+$(gate_suite_tail "$branch_log")"
       ;;
     preexisting-debt)
       GATE_FS_DETAIL="ga-3wgx8: full suite red on BOTH this branch (exit $branch_rc) and $default_branch_ref (exit $main_rc) — pre-existing debt, not this branch's regression; not blocking."
@@ -12751,6 +12789,14 @@ gate_check_verdict_identity_link() {
 }
 # SELFTEST-EXTRACT gate-verdict-identity-link-fn: END
 # SELFTEST-EXTRACT gate-collect-verdicts-fn: BEGIN
+# gate_reasons_escape <text> — pure. Another person's words, ready to be appended to FAIL_REASONS: each backslash doubled, so
+# gate_render_reasons gives them back exactly as written (a `\n` in a reviewer's code sample stays two characters, not a line break).
+# It lives INSIDE this extracted block on purpose: gate_collect_verdicts calls it, and every selftest that extracts the collect
+# function would otherwise need to be taught about a second block (a missing helper is "command not found" inside $( ), which
+# does not trip errexit). Callers outside this block (gate_finalize_run) run long after this definition is parsed.
+gate_reasons_escape() {
+  printf '%s' "${1-}" | sed 's/\\/\\\\/g'
+}
 gate_collect_verdicts() {
   VERDICTS_RECEIVED=0
   ANY_FAIL=0
@@ -12891,7 +12937,7 @@ gate_collect_verdicts() {
           warn "Reviewer $((j+1)) (bead $VB) closed verdict:FAIL with no parseable reason — counting as INCONCLUSIVE FAIL (fail-safe)."
           FAIL_COMMENT="INCONCLUSIVE — verdict:FAIL with empty/unparseable reason (raw bead $VB; see forensics log above)"
         fi
-        FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $FAIL_COMMENT\n"
+        FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $(gate_reasons_escape "$FAIL_COMMENT")\n"
         GATE_E5_FAIL_IDX+=("$((j+1))"); GATE_E5_FAIL_TXT+=("$FAIL_COMMENT")
       else
         # ga-86l90a8 (thies): the reviewer writes `label add verdict:PASS` THEN
@@ -12973,7 +13019,7 @@ gate_collect_verdicts() {
             _judged_fails=$((_judged_fails + 1))
             if [ "$_e5x" = "1" ]; then GATE_E5_EXTRA_VERDICT="FAIL"; fi   # ga-syxaki (E5): a rescued FAIL is a DELIVERED FAIL — it is in FAIL_REASONS and in the union below, so the log must say so
             log "  Reviewer $((j+1)) (bead $VB) closed WITHOUT a verdict:FAIL label but its verdict COMMENT is an explicit FAIL — counting as a real reviewer rejection (ga-w7pm55, mirror of the ga-86l90a8 PASS rescue). comment=$(printf '%s' "$FAIL_COMMENT" | tr '\n' ' ' | cut -c1-200)"
-            FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $FAIL_COMMENT\n"
+            FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $(gate_reasons_escape "$FAIL_COMMENT")\n"
             GATE_E5_FAIL_IDX+=("$((j+1))"); GATE_E5_FAIL_TXT+=("$FAIL_COMMENT")
           elif [ "$FAIL_COMMENT_UNREADABLE" = "1" ]; then
             _judged_fails=$((_judged_fails + 1))

@@ -48,6 +48,9 @@ extract_block() {
     | sed '1d;$d'
 }
 
+# The call-site snippets render FAIL_REASONS with gate_render_reasons (ga-lxm9se); it is a top-level function, not a block.
+extract_fn() { awk -v n="$2" '$0 ~ "^"n"\\(\\) \\{" {f=1} f {print} f && /^\}/ {exit}' "$1"; }
+
 BLOCK="$(extract_block "$DISPATCHER" "nudge-author-with-fallback")"
 if [ -z "$BLOCK" ]; then
   echo "FATAL: SELFTEST-EXTRACT nudge-author-with-fallback block not found in $DISPATCHER" >&2
@@ -255,6 +258,7 @@ CALL_SITE_2="$(extract_block "$DISPATCHER" "nudge-call-site-2")"
 errexit_survives() {
   local snippet="$1" out rc
   out="$(printf '%s\n' \
+    "$(extract_fn "$DISPATCHER" gate_render_reasons)" \
     'nudge_author_with_fallback() { return 1; }' \
     'NOTIFY_AUTHOR="batista"; BEAD_ID="lx-dnw"; AUTHOR="some-author"' \
     'BRANCH="crew/batista/lx-dnw"; FAIL_REASONS="reason"; GATE_RUN_ID="gr1"' \
@@ -263,6 +267,9 @@ errexit_survives() {
     'echo MARKER_REACHED' \
     | bash -euo pipefail 2>&1)"
   rc=$?
+  # A helper the snippet calls but this harness forgot to define fails inside a $( ), which errexit does not see:
+  # "ran to completion" would then be true of a snippet that never rendered anything (ga-lxm9se).
+  case "$out" in *"command not found"*) return 1 ;; esac
   [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep "MARKER_REACHED" >/dev/null
 }
 
