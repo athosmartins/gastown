@@ -190,7 +190,7 @@ agent() {  # a "sessão": os 6 passos do prompt, com o modo de falha pedido
   [ $mode != gctimeout ] || echo '{"attachment":{"type":"hook_cancelled","hookEvent":"UserPromptSubmit","command":"export PATH=x && gc mail check --inject","durationMs":30512,"timedOut":true,"timeoutMs":30000}}' >> "$t"
   [ $mode != gcfail ] || hk UserPromptSubmit 'export PATH=x && gc mail check --inject' 700 1
   [ $mode = nogchooks ] || { hk SessionStart 'export PATH=x && GC_MANAGED_SESSION_HOOK=1 gc prime --hook' 2100 0; hk UserPromptSubmit 'export PATH=x && gc nudge drain --inject' 900 0; }
-  [ $mode != badline ] || echo 'isto nao e json' >> "$t"
+  [ $mode != badline ] || echo 'garbage: isto nao e json' >> "$t"
   [ $mode != foreignpause ] || echo "origem=athos desde=2026-10-18T10:00:00" > "$PAUSE"
   echo "E2E-42-OK" >> "$S/screen"
 }
@@ -592,7 +592,7 @@ g_e2e() {
     python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; r1=$?; c1=$(calls start)
     e2e_fixture; python3 -I -c 'import json,sys; p=sys.argv[1]+"/gt-remote/bundle/manifest.json"; d=json.load(open(p)); d["session_path"]=d["session_path"][::-1]; json.dump(d,open(p,"w"))' "$SRV"
     python3 -I "$P" e2e --repo-url "$URL" > "$T/out2" 2> "$T/err"; r2=$?; c2=$(calls start)
-    e2e_fixture; echo "isto nao e json" > "$SRV/gt-remote/bundle/manifest.json"
+    e2e_fixture; echo "garbage: isto nao e json" > "$SRV/gt-remote/bundle/manifest.json"
     python3 -I "$P" e2e --repo-url "$URL" > "$T/out3" 2> "$T/err"; r3=$?; c3=$(calls start)
     [ $r1 = 3 ] && [ $r2 = 3 ] && [ $r3 = 3 ] && [ "$c1$c2$c3" = 000 ] && has "$T/out" "não leva o ambiente limpo da sessão" && has "$T/out2" "não leva o ambiente limpo da sessão" && has "$T/out3" "não leva o ambiente limpo da sessão"; ok $? "e2e: bundle sem session_path, com outra ordem de PATH ou com manifest ilegível → não começa (nunca \"igual ao esperado\"), saída 3 (rc=$r1/$r2/$r3)"; }
   c nopresence && { e2e_fixture; find "$SRV/gt-remote/bin/mbp-presence.sh" -delete; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sem a biblioteca de presença"; ok $? "e2e: sem a biblioteca de presença no MBP → não começa (rc=$RC)"; }

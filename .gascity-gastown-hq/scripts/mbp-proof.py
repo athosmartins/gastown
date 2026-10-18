@@ -575,7 +575,7 @@ print(json.dumps({"rows": rows, "unreadable": bad}))
 
 MEASURE = r'''
 import glob, json, os, sys
-C = json.loads(sys.argv[1])
+C = json.loads(sys.argv[1])  # third-state-waiver: argumento montado por este mesmo script com json.dumps, não vem de fora
 uses, calls, bad = {}, [], 0  # nenhuma transcrição → calls [] (o chamador reprova: sem medição); linha ilegível → CONTADA e mostrada, nunca ignorada em silêncio
 for f in sorted(glob.glob(os.path.expanduser("~/.claude/projects/*%s*/*.jsonl") % C["run"])):
     for line in open(f, errors="replace"):
