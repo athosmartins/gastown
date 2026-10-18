@@ -178,7 +178,12 @@ for name in LONGLIVED:
     check(got == EXPECT_LONGLIVED[name], f"delta de '{name}' == o que a tabela papel x MCP manda (3 chaves, servidores exatos)",
           f"faltando={sorted(EXPECT_LONGLIVED[name] - got)} a-mais={sorted(got - EXPECT_LONGLIVED[name])}")
 rev_json = jread(OVERLAYS / "pool-reviewer/.claude/settings.json")
-check(len(rev_json["skillOverrides"]) == 94, "modelo bate com o incidente: pool-reviewer tem 94 skillOverrides (o numero que o Mayor mediu no arquivo vazado)", str(len(rev_json["skillOverrides"])))
+# O Mayor mediu 94 skillOverrides no arquivo vazado. O numero e GERADO (pool-preamble-build.py): cada skill nova no universo soma uma
+# linha `off` ao overlay (ga-ttl3y2: 94 -> 95). Fixar a igualdade reprovava este teste a cada skill nova sem o guard ter mudado
+# (ga-3d92n2); o 94 do incidente fica como PISO, e o modelo e comparado com a contagem do proprio overlay (bloco B).
+INCIDENT_SKILL_OVERRIDES = 94
+N_REV_SKILLS = len(rev_json["skillOverrides"])
+check(N_REV_SKILLS >= INCIDENT_SKILL_OVERRIDES, f"modelo bate com o incidente: pool-reviewer tem pelo menos os {INCIDENT_SKILL_OVERRIDES} skillOverrides que o Mayor mediu no arquivo vazado (cresce com skill nova)", str(N_REV_SKILLS))
 
 # ================================================================== A. controle positivo
 section("A. controle positivo: revisor na raiz com o overlay base")
@@ -196,8 +201,8 @@ section("B. replay do incidente: revisor na raiz com pool-reviewer")
 c = new_city(); spawn(c, c, "pool-reviewer")
 for rel in (".claude/settings.json", ".gc/settings.json"):
     d = jread(c / rel)
-    check(d.get("skillOverrides", {}).get("gate-done") == "off" and d.get("autoMemoryEnabled") is False and len(d.get("skillOverrides", {})) == 94 and "Agent" in d["permissions"]["deny"],
-          f"modelo reproduz o incidente em {rel}: gate-done off, memoria off, 94 skillOverrides, deny Agent")
+    check(d.get("skillOverrides", {}).get("gate-done") == "off" and d.get("autoMemoryEnabled") is False and len(d.get("skillOverrides", {})) == N_REV_SKILLS and "Agent" in d["permissions"]["deny"],
+          f"modelo reproduz o incidente em {rel}: gate-done off, memoria off, todos os {N_REV_SKILLS} skillOverrides do overlay, deny Agent")
 rc, j, r = run(c, CFG_CLEAN)
 check(rc == 1, "guard: rc 1 (vazamento)", f"rc={rc} {r.stdout[:300]}")
 check(files_hit(j) == [".claude/settings.json", ".gc/settings.json"], "guard reporta OS DOIS arquivos contaminados", str(files_hit(j)))
@@ -424,7 +429,18 @@ section("J. hook comum (home-scan-guard) registrado direto na raiz, fora de qual
 # com vazamento de papel. O fix (ga-9bgxwi) poe a MESMA folha no overlay base 'pool': ela deixa de ser delta de
 # NENHUM papel, e o guard para de apontar pra ela.
 c = new_city()
-common_hooks = jread(OVERLAYS / "pool-dog/.claude/settings.json")["hooks"]
+# O registro universal deste caso e SO o hook home-scan-guard. O overlay pool-dog carrega tambem OUTROS hooks comuns aos papeis de pool
+# (cut-output-shadow, ga-wk0qi2: PostToolUse e PostToolUseFailure) que NAO estao no overlay base — esses SAO delta de papel, e o guard
+# acerta em aponta-los se aparecerem na raiz (controle abaixo). Mesclar o bloco `hooks` INTEIRO do pool-dog plantava um vazamento real
+# e esperava rc 0 (ga-3d92n2). O filtro e por marcador, entao um hook de papel novo no futuro nao reabre isto.
+def hooks_marked(marker):
+    dog_hooks = jread(OVERLAYS / "pool-dog/.claude/settings.json")["hooks"]
+    got = {cat: [e for e in arr if marker in json.dumps(e)] for cat, arr in dog_hooks.items()}
+    return {cat: es for cat, es in got.items() if es}
+common_hooks = hooks_marked("home-scan-guard")
+shadow_hooks = hooks_marked("cut-output-shadow")
+# vazio != filtrou certo: sem o hook na fixture o caso abaixo passaria sem provar nada (rc 0 de uma raiz sem hook algum)
+check(bool(common_hooks) and bool(shadow_hooks), "fixture do J: o overlay pool-dog traz o hook home-scan-guard E o cut-output-shadow (senao os casos abaixo nao provam nada)", f"hsg={sorted(common_hooks)} shadow={sorted(shadow_hooks)}")
 root = merge(jread(c / ".claude/settings.json"), {"hooks": common_hooks})
 jwrite(c / ".claude/settings.json", root); install_claude(c)
 rc, j, r = run(c, CFG_CLEAN)
@@ -440,6 +456,15 @@ rc, j, r = run(c2, CFG_CLEAN)
 check(rc == 1 and files_hit(j) == [".claude/settings.json", ".gc/settings.json"], "controle: folha de papel real (deny Agent) na raiz JUNTO com o hook comum continua vazamento nos dois arquivos", f"rc={rc} {files_hit(j)}")
 art = [f for f in (j or {"findings": []})["findings"] if f["kind"] == "artifact-contaminated"]
 check(bool(art) and all(f["sources"] == ["pool-reviewer"] for f in art), "fonte apontada e SO pool-reviewer (unico papel que nega Agent), o hook comum nao polui a atribuicao", str([f["sources"] for f in art]))
+# controle: hook que e SO dos papeis de pool (cut-output-shadow, fora do overlay base) na raiz continua vazamento — filtrar o home-scan-guard
+# acima nao virou um jeito de o guard deixar passar hook de papel.
+c3 = new_city()
+jwrite(c3 / ".claude/settings.json", merge(jread(c3 / ".claude/settings.json"), {"hooks": shadow_hooks})); install_claude(c3)
+rc, j, r = run(c3, CFG_CLEAN)
+POOL_ROLES = {"pool-dog", "pool-wa-worker", "pool-ps-worker", "pool-reviewer"}
+art = [f for f in (j or {"findings": []})["findings"] if f["kind"] == "artifact-contaminated"]
+check(rc == 1 and files_hit(j) == [".claude/settings.json", ".gc/settings.json"], "controle: hook de papel (cut-output-shadow, fora do base) na raiz E vazamento nos dois arquivos", f"rc={rc} {files_hit(j)}")
+check(bool(art) and all(set(f["sources"]) <= POOL_ROLES for f in art), "fonte apontada e um papel de pool (so eles registram o cut-output-shadow), nunca o base nem um longlived", str([f["sources"] for f in art]))
 
 # ================================================================== L. cidade viva (somente leitura)
 section("L. cidade viva: o guard le a cidade real (--no-alarm --no-lock, somente leitura)")
