@@ -481,8 +481,9 @@ STATE_RESEED_TRIGGER_DIR="$STATE_DIR/.dolt-disk-floor-guard.reseed-attempt"
 # ga-0z7kdz: pycache-reap lever (see _reap_pycache). MIN_AGE_MIN is the safety knob, not a
 # tuning knob: only files NOT modified for this many minutes are touched, so a pytest or a
 # python import that is writing right now is never raced. It must be a positive integer;
-# anything else makes the lever skip (0 would mean "everything"). COOLDOWN matches the age:
-# a run that follows within MIN_AGE_MIN of the last finds nothing new. ROOTS (colon-separated)
+# anything else makes the lever skip (0 would mean "everything"). COOLDOWN matches the age: a run
+# sooner than MIN_AGE_MIN after the last could only take the files that crossed the age line in
+# between, which is not worth another walk of every rig. ROOTS (colon-separated)
 # replaces the derived rig list - used by the selftest, never set in production.
 PYCACHE_REAP_MIN_AGE_MIN="${DOLT_DISK_FLOOR_PYCACHE_REAP_MIN_AGE_MIN:-30}"
 PYCACHE_REAP_COOLDOWN_SECS="${DOLT_DISK_FLOOR_PYCACHE_REAP_COOLDOWN_SECS:-1800}"
@@ -2936,7 +2937,9 @@ _reap_bloated_backup_staging() {
 #
 # Two passes per root: a read-only `stat` pass sizes the candidates, then `rm -f` removes them
 # (-delete is avoided on purpose: it implies -depth, which makes -prune ineffective). The MB
-# figure is therefore measured BEFORE the delete and is approximate. /usr/bin/find is explicit so
+# figure is therefore measured BEFORE the delete and is approximate. Only when find/rm exit
+# non-zero (find does so for any unreadable subdirectory, even when everything it could see was
+# removed) a third pass measures what is still there, and the freed figure becomes before minus after. /usr/bin/find is explicit so
 # the lever and its selftest use the same BSD find whatever the caller's shell defines as `find`.
 _pycache_isnum() {
   case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
@@ -2957,7 +2960,7 @@ _pycache_reap_roots() {
   fi
   town="$(dirname "$CITY")"
   {
-    # vazio → the glob matches no rig and the caller logs SKIP, nothing is scanned; falhou/ilegível → a dir whose .beads cannot be tested simply drops out of the list (a root is never guessed in)
+    # vazio → no rig dir has a .beads, so no rig is listed (the three worktree roots below still are, and the caller skips one that does not exist); falhou/ilegível → a dir whose .beads cannot be tested simply drops out of the list (a root is never guessed in)
     for d in "$town"/*/; do
       [ -d "${d}.beads" ] && echo "${d%/}"
     done
@@ -2990,6 +2993,17 @@ _pycache_measure_root() {
       | awk '{ n++; s += $1 } END { printf "%d %d", n + 0, s + 0 }'
     echo " ${PIPESTATUS[0]}"
   }
+}
+
+# _pycache_parse "<files> <bytes> <rc>" → sets PC_FILES PC_BYTES PC_RC. Exactly three space-separated
+# fields; a fourth field, a missing one or text leaves a field that is not a number, and the caller
+# treats that as "scan result unreadable".
+_pycache_parse() {
+  local m="${1:-}" rest
+  PC_FILES="${m%% *}"
+  rest="${m#* }"
+  PC_BYTES="${rest%% *}"
+  PC_RC="${rest#* }"
 }
 
 _pycache_delete_root() {
@@ -3035,7 +3049,7 @@ _reap_pycache() {
   echo "$now" > "$STATE_PYCACHE_REAP_FILE" 2>/dev/null || true
 
   local deadline=$(( now + budget ))
-  local root m arr files bytes mrc drc left note
+  local root m files bytes mrc drc left note
   local seen=0 scanned=0 incomplete=0 total_files=0 freed_b=0
   while IFS= read -r root; do
     [ -n "$root" ] || continue
@@ -3056,8 +3070,8 @@ _reap_pycache() {
     fi
 
     m="$(_pycache_measure_root "$left" "$root" "$mins")"
-    arr=($m)
-    files="${arr[0]:-}"; bytes="${arr[1]:-}"; mrc="${arr[2]:-}"
+    _pycache_parse "$m"
+    files="$PC_FILES"; bytes="$PC_BYTES"; mrc="$PC_RC"
     if ! _pycache_isnum "$files" || ! _pycache_isnum "$bytes" || ! _pycache_isnum "$mrc"; then
       log "pycache-reap: ${root} — SPARED (the scan result is unreadable: '${m}'); nothing deleted there"
       incomplete=$((incomplete+1))
@@ -3102,10 +3116,10 @@ _reap_pycache() {
         # is unreadable". Measure again and let what is STILL THERE decide.
         left=$(( deadline - $(date +%s) )); [ "$left" -lt 30 ] && left=30
         m="$(_pycache_measure_root "$left" "$root" "$mins")"
-        arr=($m)
+        _pycache_parse "$m"
         # vazio → the re-measure counts 0 file(s): everything eligible is gone, DELETED; falhou/ilegível → the left-over is unknown, so no freed figure is claimed and the root counts as unfinished
-        if _pycache_isnum "${arr[0]:-}" && _pycache_isnum "${arr[1]:-}" && _pycache_isnum "${arr[2]:-}" && [ "${arr[2]}" -ne 124 ]; then
-          local rest_files="${arr[0]}" rest_bytes="${arr[1]}" freed_here=0
+        if _pycache_isnum "$PC_FILES" && _pycache_isnum "$PC_BYTES" && _pycache_isnum "$PC_RC" && [ "$PC_RC" -ne 124 ]; then
+          local rest_files="$PC_FILES" rest_bytes="$PC_BYTES" freed_here=0
           [ "$bytes" -gt "$rest_bytes" ] && freed_here=$((bytes - rest_bytes))
           total_files=$((total_files + files - rest_files))
           freed_b=$((freed_b + freed_here))

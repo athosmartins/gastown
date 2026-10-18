@@ -477,6 +477,7 @@ PYC_TMP="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-pyc.XXXXXX)"
 PYC_OLD_TS="$(date -v-2H '+%Y%m%d%H%M.%S' 2>/dev/null || date -d '-2 hours' '+%Y%m%d%H%M.%S')"
 PYC_ROOT="$PYC_TMP/rig"
 PYC_SAVE_ENABLED="$ENABLED"; PYC_SAVE_CITY="$CITY"
+PYC_ASSERT_BASE=$((PASS+FAIL))
 PYC_REAL_MEASURE="$(declare -f _pycache_measure_root)"
 PYC_REAL_DELETE="$(declare -f _pycache_delete_root)"
 PYCACHE_REAP_ROOTS="$PYC_ROOT"
@@ -527,6 +528,7 @@ pyc_build_fixture() {
   done
   mkdir -p "$PYC_ROOT/crew/x/__pycache__"
   ln -s ../a.py "$PYC_ROOT/crew/x/__pycache__/link.pyc"
+  touch -h -t "$PYC_OLD_TS" "$PYC_ROOT/crew/x/__pycache__/link.pyc"   # old: only -type f may spare it
 }
 pyc_check_set() { # <label> — GONE gone, KEPT (and the symlink + its target) present
   local label="$1" f missing_gone="" present_kept=""
@@ -557,13 +559,13 @@ rm -f "$STATE_PYCACHE_REAP_FILE"; _reap_pycache
 [ ! -e "$PYC_ROOT/crew/x/tests/__pycache__/again.cpython-311.pyc" ] && ok "_reap_pycache: with the cooldown over, the same file is taken" || bad "_reap_pycache: still present after the cooldown elapsed"
 
 # 3. An age the lever cannot read must make it do NOTHING (a '0' would take files a running pytest writes).
-for v in abc 0 "" -5 1.5; do
+for pyc_v in abc 0 "" -5 1.5; do
   pyc_old "$PYC_ROOT/crew/x/tests/__pycache__/guard.cpython-311.pyc"; rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
-  PYCACHE_REAP_MIN_AGE_MIN="$v" _reap_pycache
+  PYCACHE_REAP_MIN_AGE_MIN="$pyc_v" _reap_pycache
   if [ -e "$PYC_ROOT/crew/x/tests/__pycache__/guard.cpython-311.pyc" ] && pyc_log | grep -q "is not a positive integer"; then
-    ok "_reap_pycache: MIN_AGE_MIN='$v' → SKIP, nothing deleted, reason logged"
+    ok "_reap_pycache: MIN_AGE_MIN='$pyc_v' → SKIP, nothing deleted, reason logged"
   else
-    bad "_reap_pycache: MIN_AGE_MIN='$v' did not skip safely"
+    bad "_reap_pycache: MIN_AGE_MIN='$pyc_v' did not skip safely"
   fi
 done
 
@@ -602,14 +604,22 @@ _pycache_measure_root() { echo "banana"; }
 rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
 _reap_pycache
 pyc_restore_fns
-n=0; for f in "${PYC_GONE[@]}"; do [ -e "$f" ] && n=$((n+1)); done
-[ "$n" = "4" ] && pyc_log | grep -q "SPARED (the scan result is unreadable: 'banana'); nothing deleted there" && ok "_reap_pycache: an unreadable scan result → the root is SPARED, nothing deleted (failed ≠ empty)" || bad "_reap_pycache: unreadable scan result did not leave the root untouched (still present: $n of 4)"
+pyc_n=0; for pyc_f in "${PYC_GONE[@]}"; do [ -e "$pyc_f" ] && pyc_n=$((pyc_n+1)); done
+[ "$pyc_n" = "4" ] && pyc_log | grep -q "SPARED (the scan result is unreadable: 'banana'); nothing deleted there" && ok "_reap_pycache: an unreadable scan result → the root is SPARED, nothing deleted (failed ≠ empty)" || bad "_reap_pycache: unreadable scan result did not leave the root untouched (still present: $pyc_n of 4)"
 _pycache_measure_root() { echo "5 100 124"; }
 rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
 _reap_pycache
 pyc_restore_fns
-n=0; for f in "${PYC_GONE[@]}"; do [ -e "$f" ] && n=$((n+1)); done
-[ "$n" = "4" ] && pyc_log | grep -q "TIMED OUT while measuring" && ok "_reap_pycache: a measuring pass that timed out (rc 124) deletes nothing" || bad "_reap_pycache: a timed-out measure still deleted (still present: $n of 4)"
+pyc_n=0; for pyc_f in "${PYC_GONE[@]}"; do [ -e "$pyc_f" ] && pyc_n=$((pyc_n+1)); done
+[ "$pyc_n" = "4" ] && pyc_log | grep -q "TIMED OUT while measuring" && ok "_reap_pycache: a measuring pass that timed out (rc 124) deletes nothing" || bad "_reap_pycache: a timed-out measure still deleted (still present: $pyc_n of 4)"
+
+# 7b. Exactly three fields: a fourth one is a result the lever does not understand, so it deletes nothing.
+_pycache_measure_root() { echo "4 100 0 junk"; }
+rm -f "$STATE_PYCACHE_REAP_FILE"; pyc_log_mark
+_reap_pycache
+pyc_restore_fns
+pyc_n=0; for pyc_f in "${PYC_GONE[@]}"; do [ -e "$pyc_f" ] && pyc_n=$((pyc_n+1)); done
+[ "$pyc_n" = "4" ] && pyc_log | grep -q "SPARED (the scan result is unreadable: '4 100 0 junk')" && ok "_reap_pycache: a scan result with a 4th field is unreadable → SPARED, nothing deleted" || bad "_reap_pycache: a malformed (4-field) scan result was acted on (still present: $pyc_n of 4)"
 
 # 8. A delete that fails (nothing removed) is PARTIAL, and the freed figure comes from a re-measure, not from hope.
 _pycache_delete_root() { return 1; }
@@ -638,16 +648,20 @@ pyc_log | grep -q "time budget (1s) used up before $PYC_TMP/r2" && ok "_reap_pyc
 # 11. Root discovery: rigs are the ~/gt/<dir> that have a .beads; the worktree dirs come with them.
 mkdir -p "$PYC_TMP/town/rigA/.beads" "$PYC_TMP/town/notrig" "$PYC_TMP/town/city"
 CITY="$PYC_TMP/town/city"; PYCACHE_REAP_ROOTS=""
-roots="$(_pycache_reap_roots)"
+pyc_roots="$(_pycache_reap_roots)"
 CITY="$PYC_SAVE_CITY"; PYCACHE_REAP_ROOTS="$PYC_ROOT"
-if printf '%s\n' "$roots" | grep -qx "$PYC_TMP/town/rigA" && ! printf '%s\n' "$roots" | grep -qx "$PYC_TMP/town/notrig" \
-   && printf '%s\n' "$roots" | grep -qx "$PYC_TMP/town/city/.gc-worktrees" && printf '%s\n' "$roots" | grep -qx "$PYC_TMP/town/.gc-worktrees" \
-   && ! printf '%s\n' "$roots" | grep -qx "$PYC_TMP/town"; then
+if printf '%s\n' "$pyc_roots" | grep -qx "$PYC_TMP/town/rigA" && ! printf '%s\n' "$pyc_roots" | grep -qx "$PYC_TMP/town/notrig" \
+   && printf '%s\n' "$pyc_roots" | grep -qx "$PYC_TMP/town/city/.gc-worktrees" && printf '%s\n' "$pyc_roots" | grep -qx "$PYC_TMP/town/.gc-worktrees" \
+   && ! printf '%s\n' "$pyc_roots" | grep -qx "$PYC_TMP/town"; then
   ok "_pycache_reap_roots: rig dirs (with .beads) + the city/town worktree dirs; a non-rig dir and the town root itself are NOT roots"
 else
   bad "_pycache_reap_roots: wrong root list: $(printf '%s' "$roots" | tr '\n' '|')"
 fi
 
+# A scenario that aborts half way (an arithmetic error in the lever kills the loop around it, for example)
+# prints fewer PASS lines and NO FAIL line. Count them: the block has 26 assertions.
+PYC_RAN=$((PASS+FAIL-PYC_ASSERT_BASE))
+[ "$PYC_RAN" = "26" ] && ok "_reap_pycache: all 26 assertions of this block ran (none was skipped by an abort)" || bad "_reap_pycache: only $PYC_RAN of the 26 assertions ran - a scenario aborted"
 PYCACHE_REAP_ROOTS=""; STATE_PYCACHE_REAP_FILE="$STATE_DIR/.dolt-disk-floor-guard.pycache-reap-last"
 chmod -R u+rwx "$PYC_TMP" 2>/dev/null; rm -rf "$PYC_TMP"
 
