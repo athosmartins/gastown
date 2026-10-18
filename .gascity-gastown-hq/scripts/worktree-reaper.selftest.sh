@@ -18,6 +18,10 @@
 # verdict other than exactly 'unparseable' is KEPT; ga-yw18yk: a branch that never shipped is still reaped (tree only,
 # branch kept, detached HEAD parked on rescue/) when every bead the tree is named for is CLOSED long enough, and kept
 # for every state that is not that (open, young, unknown, unreadable, lookup failed, op in progress, dirty, in use);
+# ga-he2c1u: an UNLOCKED, delivered tree whose bead(s) are closed long enough and which is dirty with nothing but generated
+# files (.gc/system, run markers, caches) is removed with a single --force by loop 1 — and kept for any other dirt (a modified or
+# staged tracked file, an untracked source file, an edited pack.toml), an open/young/unknown bead, an unshipped commit, a live
+# process, a lock (no -f -f there), the dry-run, and a narrowed list;
 # the SIGTERM guard kills a crew claude proc
 # but never a supervisor/pilot; kill is default-OFF; the feature has a kill-switch + dry-run.
 # Process probes are faked so it's hermetic. Exit 0 iff all hold.
@@ -1706,6 +1710,140 @@ git -C "$BCTOWN" worktree list --porcelain 2>/dev/null | grep -E "/\.gc-worktree
   || ok "ga-yw18yk (m): loop-1 (legacy path-glob) also reaps a locked worktree of a closed bead"
 git -C "$BCTOWN" rev-parse --verify -q refs/heads/fix/ga-bc3xyz-build >/dev/null 2>&1 \
   && ok "ga-yw18yk (m): loop-1 keeps the (unmerged) branch" || bad "ga-yw18yk (m): loop-1 deleted an unmerged branch"
+
+# ══ ga-he2c1u: a DELIVERED tree of a CLOSED bead that is dirty with nothing but GENERATED files ═══
+# The plain `worktree remove` refuses any dirt, so such a tree (bead closed + merged + a copy of .gc/system and a few
+# run markers) was skipped on every sweep, silently, and stayed on a disk that was down to 2 GiB. Loop 1 now removes it
+# with a single --force iff EVERY proof holds; each scenario below breaks exactly one of them (or the generated-only
+# claim itself) and must KEEP the tree, its files and its lock.
+echo "── ga-he2c1u: dirty-only-generated tree of a closed bead, delivered → reaped; any other dirt or missing proof → kept ──"
+DG_ID="ga-dg1xyz"
+DG_GEN='mkdir -p .gc/system/packs/bd && echo s > .gc/system/packs/bd/pack.toml && echo o > .pce-full.out && mkdir -p __pycache__ && echo b > __pycache__/m.cpython-313.pyc && mkdir -p .gascity-gastown-hq && cp ../../.gascity-gastown-hq/pack.toml .gascity-gastown-hq/pack.toml'
+# mk_dg_town <name> [<setup run inside the worktree>] [<setup run in the town after it>] [<age in hours>] — a town repo $TMP/<name>
+# (origin/main set) with the city's pack.toml at .gascity-gastown-hq/pack.toml and ONE worktree .gc-worktrees/ga-dg1xyz-build on
+# branch fix/ga-dg1xyz-build at main (so: delivered by ancestry), <age> (default 3) hours old.
+mk_dg_town() {
+  local name="$1" extra="${2:-}" post="${3:-}" town="$TMP/$1"
+  mkdir -p "$town/.gc-worktrees" "$town/.gascity-gastown-hq"; git init -q --bare "$TMP/$name.git"; git init -q -b main "$town"
+  ( cd "$town" || exit 1
+    git remote add origin "$TMP/$name.git"; echo t > t.txt; git add t.txt; git commit -qm t
+    echo "city pack" > .gascity-gastown-hq/pack.toml
+    git push -q origin main; git fetch -q origin; git remote set-head origin main 2>/dev/null || true
+    git worktree add -q ".gc-worktrees/$DG_ID-build" -b "fix/$DG_ID-build" main
+    [ -z "$extra" ] || ( cd ".gc-worktrees/$DG_ID-build" && eval "$extra" )
+    [ -z "$post" ] || eval "$post"
+  ) >/dev/null 2>&1
+  pe_age "$town/.gc-worktrees/$DG_ID-build" "${4:-3}"
+}
+run_dg() { # run_dg <name> <beads-json-array> [ENV=val ...]
+  local name="$1" beads="$2"; shift 2
+  printf '%s' "$beads" > "$TMP/$name.beads.json"
+  env WORKTREE_REAPER_GT="$TMP/$name" WORKTREE_REAPER_LOG="$TMP/$name.jsonl" WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+    WORKTREE_REAPER_FAKE_LSOF="$TMP/bc_nolsof.txt" WORKTREE_REAPER_FAKE_BEADS="$TMP/$name.beads.json" "$@" bash "$REAPER" >/dev/null 2>&1
+}
+dg_wt() { git -C "$TMP/$1" worktree list --porcelain 2>/dev/null | grep -E "/\.gc-worktrees/$DG_ID-build\$" >/dev/null; }
+dg_br() { git -C "$TMP/$1" rev-parse --verify -q "refs/heads/fix/$DG_ID-build" >/dev/null 2>&1; }
+dg_kept() { # dg_kept <name> <label> — tree, its files and the branch intact; nothing reaped on this path
+  if dg_wt "$1" && dg_br "$1" && [ -e "$TMP/$1/.gc-worktrees/$DG_ID-build/t.txt" ] && [ "$(events "$1" reaped_dirty_generated_only)" = "0" ]; then
+    ok "ga-he2c1u: $2 → KEPT (tree + branch intact, nothing reaped on the generated-only path)"
+  else bad "ga-he2c1u: $2 → NOT kept (wt=$(dg_wt "$1" && echo y || echo n) br=$(dg_br "$1" && echo y || echo n) reaped_ev=$(events "$1" reaped_dirty_generated_only))"; fi
+}
+DG_CLOSED="[$(bc_bead "$DG_ID" closed 10)]"
+
+# (a) the measured gap: closed 10h ago, HEAD in main, dirty with .gc/system + a run marker + a bytecode cache + the city's pack.toml copy
+mk_dg_town dg_a "$DG_GEN"
+run_dg dg_a "$DG_CLOSED"
+dg_wt dg_a && bad "ga-he2c1u (a): delivered tree of a closed bead, dirty only with generated files, NOT reaped — the criterion still cannot retire it" \
+           || ok "ga-he2c1u (a): delivered tree of a closed bead, dirty only with generated files, REAPED"
+[ ! -e "$TMP/dg_a/.gc-worktrees/$DG_ID-build" ] && ok "ga-he2c1u (a): the directory is gone (git removed it, not a rm -rf)" \
+  || bad "ga-he2c1u (a): the worktree is unregistered but its directory is still on disk"
+dg_br dg_a && ok "ga-he2c1u (a): the branch survives (only the tree goes)" || bad "ga-he2c1u (a): the branch was lost"
+grep '"event":"reaped_dirty_generated_only"' "$TMP/dg_a.jsonl" 2>/dev/null | grep -F "\"verdict\":\"ancestor bead_closed $DG_ID\"" >/dev/null \
+  && ok "ga-he2c1u (a): its own event, and the verdict names the delivery proof and the closed bead" \
+  || bad "ga-he2c1u (a): no reaped_dirty_generated_only event with the proof + bead: $(grep dirty_generated "$TMP/dg_a.jsonl" 2>/dev/null | head -1)"
+
+# (b) the same, plus ONE untracked file nobody generated → kept, file intact
+mk_dg_town dg_b "$DG_GEN; echo 'echo mine' > mine.sh"
+run_dg dg_b "$DG_CLOSED"
+dg_kept dg_b "generated files + one untracked source file"
+[ -e "$TMP/dg_b/.gc-worktrees/$DG_ID-build/mine.sh" ] && ok "ga-he2c1u (b): the untracked source file is still there" || bad "ga-he2c1u (b): the untracked source file was destroyed"
+
+# (c) a TRACKED file modified, plus generated files → kept
+mk_dg_town dg_c "$DG_GEN; echo edit >> t.txt"
+run_dg dg_c "$DG_CLOSED"
+dg_kept dg_c "generated files + a modified tracked file"
+
+# (c2) a path that LOOKS generated but is staged (tracked) → kept: a tracked file is somebody's
+mk_dg_town dg_c2 "$DG_GEN; echo keep > .pce-staged.out; git add .pce-staged.out"
+run_dg dg_c2 "$DG_CLOSED"
+dg_kept dg_c2 "a staged file whose path matches the generated list"
+
+# (d) bead still open → kept
+mk_dg_town dg_d "$DG_GEN"
+run_dg dg_d "[$(bc_bead "$DG_ID" open)]"
+dg_kept dg_d "bead open"
+
+# (e) bead closed, but only 1h ago (< 6h) → kept
+mk_dg_town dg_e "$DG_GEN"
+run_dg dg_e "[$(bc_bead "$DG_ID" closed 1)]"
+dg_kept dg_e "bead closed only 1h ago"
+
+# (f) the bead lookup knows no such bead (the seam's empty answer) → kept: nothing says the work is over
+mk_dg_town dg_f "$DG_GEN"
+run_dg dg_f "[]"
+dg_kept dg_f "no bead found for the tree's name"
+
+# (g) HEAD carries a commit main lacks (neither delivery proof) → kept
+mk_dg_town dg_g "echo w > w.txt && git add w.txt && git commit -qm w && $DG_GEN"
+run_dg dg_g "$DG_CLOSED"
+dg_kept dg_g "an unshipped commit"
+
+# (h) a live process has the tree as its cwd → kept
+mk_dg_town dg_h "$DG_GEN"
+(cd "$TMP/dg_h/.gc-worktrees/$DG_ID-build" && pwd -P) > "$TMP/dg_h.lsof"   # realpath, like the reaper's $d (TMP sits behind /var → /private/var)
+run_dg dg_h "$DG_CLOSED" WORKTREE_REAPER_FAKE_LSOF="$TMP/dg_h.lsof"
+dg_kept dg_h "a live process in the tree"
+
+# (h2) the same for a PATCH-EQUIVALENT tree: Loop 1 only checks "in use" up front for an ancestor-merged HEAD, so here the
+# new path's own check is the only thing between a live process and the --force
+mk_dg_town dg_h2 "echo p > p.txt && git add p.txt && git commit -qm p && $DG_GEN" "git cherry-pick -x fix/$DG_ID-build && git push -q origin main && git fetch -q origin"
+(cd "$TMP/dg_h2/.gc-worktrees/$DG_ID-build" && pwd -P) > "$TMP/dg_h2.lsof"
+run_dg dg_h2 "$DG_CLOSED" WORKTREE_REAPER_FAKE_LSOF="$TMP/dg_h2.lsof"
+dg_kept dg_h2 "a live process in a patch-equivalent tree"
+
+# (i) LOCKED → never --force'd by this path (locks keep their own contract); the lock survives
+mk_dg_town dg_i "$DG_GEN; git worktree lock --reason 'ga-dg1xyz active build' ."
+run_dg dg_i "$DG_CLOSED"
+dg_kept dg_i "locked tree"
+git -C "$TMP/dg_i" worktree list --porcelain 2>/dev/null | grep -q '^locked' && ok "ga-he2c1u (i): the lock is still in place" || bad "ga-he2c1u (i): the lock was dropped"
+# git would refuse the --force on a locked tree by itself; the point of looking first is that the refusal costs no event per sweep
+[ "$(events dg_i dirty_generated_reap_failed)" = "0" ] && ok "ga-he2c1u (i): a locked tree never even reaches the --force (no dirty_generated_reap_failed)" \
+  || bad "ga-he2c1u (i): the --force was attempted on a locked tree ($(events dg_i dirty_generated_reap_failed) dirty_generated_reap_failed)"
+
+# (j) the city's pack.toml copy was EDITED → not generated → kept
+mk_dg_town dg_j "$DG_GEN; echo local-edit >> .gascity-gastown-hq/pack.toml"
+run_dg dg_j "$DG_CLOSED"
+dg_kept dg_j "a pack.toml that differs from the city's"
+
+# (k) delivered by an EQUIVALENT PATCH (the gate re-anchored it: HEAD is not an ancestor of main) → reaped, verdict says so
+mk_dg_town dg_k "echo p > p.txt && git add p.txt && git commit -qm p && $DG_GEN" "git cherry-pick -x fix/$DG_ID-build && git push -q origin main && git fetch -q origin"
+run_dg dg_k "$DG_CLOSED"
+dg_wt dg_k && bad "ga-he2c1u (k): patch-equivalent delivered tree of a closed bead NOT reaped" || ok "ga-he2c1u (k): patch-equivalent delivered tree of a closed bead REAPED"
+grep '"event":"reaped_dirty_generated_only"' "$TMP/dg_k.jsonl" 2>/dev/null | grep -F '"verdict":"patch_equivalent bead_closed' >/dev/null \
+  && ok "ga-he2c1u (k): the verdict says patch_equivalent" || bad "ga-he2c1u (k): verdict does not name the patch-equivalence proof: $(grep dirty_generated "$TMP/dg_k.jsonl" 2>/dev/null | head -1)"
+
+# (l) dry-run (ENABLED=0): Loop 1 logs its own would_reap and removes nothing — the --force path is never reached
+mk_dg_town dg_l "$DG_GEN"
+run_dg dg_l "$DG_CLOSED" WORKTREE_REAPER_ENABLED=0
+if dg_wt dg_l && dg_br dg_l && [ -e "$TMP/dg_l/.gc-worktrees/$DG_ID-build/t.txt" ] && [ "$(events dg_l would_reap)" = "1" ] \
+   && [ "$(events dg_l reaped_dirty_generated_only)" = "0" ] && [ "$(events dg_l dirty_generated_reap_failed)" = "0" ]; then
+  ok "ga-he2c1u (l): dry-run logs would_reap, removes nothing and never tries the --force path"
+else bad "ga-he2c1u (l): dry-run — wt=$(dg_wt dg_l && echo y || echo n) would=$(events dg_l would_reap) reaped=$(events dg_l reaped_dirty_generated_only) failed=$(events dg_l dirty_generated_reap_failed)"; fi
+
+# (m) the generated list is overridable (WORKTREE_REAPER_GENERATED_RE): narrowed to match nothing, the same tree is kept
+mk_dg_town dg_m "$DG_GEN"
+run_dg dg_m "$DG_CLOSED" WORKTREE_REAPER_GENERATED_RE='^nothing-matches$'
+dg_kept dg_m "WORKTREE_REAPER_GENERATED_RE narrowed to match nothing"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"

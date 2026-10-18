@@ -27,6 +27,10 @@
 # genuinely low. Branch deletion is merged-only. Kill switch: WORKTREE_REAPER_ENABLED=0.
 # The one exception to "WITHOUT --force" is a LOCKED worktree (`remove -f -f`); it is reaped only
 # under the LOCK CONTRACT stated at ZOMBIE-LOCK DETECTION below, never because of its age alone.
+# A second, narrower exception (ga-he2c1u, town .gc-worktrees roots only): an UNLOCKED tree dirty with nothing but generated
+# files (GENERATED_RE: caches, .gc/system, run markers) whose HEAD is already in origin/<default>, with every bead it is
+# named for CLOSED long enough and no process in it, is removed with a single --force (_reap_dirty_generated_only).
+# Any other dirt — a modified tracked file, an untracked source file — still refuses, as before.
 set -uo pipefail
 GT="${WORKTREE_REAPER_GT:-/Users/athos/gt}"   # overridable for the selftest (temp repo)
 # ga-t14of: .gc-worktrees accumulates under MULTIPLE physical roots in practice — the
@@ -88,6 +92,13 @@ BEAD_LOOKUP_TIMEOUT="${WORKTREE_REAPER_BEAD_LOOKUP_TIMEOUT:-20}"
 case "$BEAD_LOOKUP_TIMEOUT" in ''|*[!0-9]*) BEAD_LOOKUP_TIMEOUT=20 ;; esac
 [ "$BEAD_LOOKUP_TIMEOUT" -ge 1 ] || BEAD_LOOKUP_TIMEOUT=20          # timeout(1) treats 0 as "no bound at all"
 BEAD_LOOKUP_KILL_GRACE=5
+# ga-he2c1u: what a worktree accretes by itself and nobody wrote — bytecode and test caches, macOS litter, the `gc`
+# runtime materialisation (.gc/system, .gc/site.toml) and the run markers a selftest leaves at the tree root (.pce-*).
+# Matched (ERE) against the path `git status` prints, relative to the repo root. A tree dirty with NOTHING BUT these
+# may be removed with --force (see _reap_dirty_generated_only). The city's own untracked pack.toml, which the tree
+# carries a copy of, counts only while it is byte-identical to the city's (checked at the call, not matched here).
+GENERATED_RE='(^|/)(__pycache__|\.pytest_cache)(/|$)|\.pyc$|(^|/)\.DS_Store$|(^|/)\.gc/(system/|site\.toml$)|^\.pce-[A-Za-z0-9._-]+$'
+[ -z "${WORKTREE_REAPER_GENERATED_RE:-}" ] || GENERATED_RE="$WORKTREE_REAPER_GENERATED_RE"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # _json_esc <text> — make free text safe to interpolate into a hand-built JSON log line
@@ -996,6 +1007,68 @@ _reap_or_log_unparseable_lock() {
   return 1
 }
 
+# _worktree_dirty_only_generated <wt> — ga-he2c1u: 0 iff the tree is dirty with NOTHING BUT generated files: every
+# `git status` entry is UNTRACKED (`??`) and its path matches GENERATED_RE (or is the city's pack.toml, byte-identical
+# to the city's). Everything else is 1: a tracked file modified/staged/deleted/renamed/conflicted (even one whose path
+# looks generated — a tracked file is somebody's), an untracked file the list does not name, a status that could not
+# be read (its exit code is checked, not its silence), and a tree that is not dirty at all (the plain remove was then
+# refused for some other reason — a lock, a permission — and forcing would be a guess).
+_worktree_dirty_only_generated() {
+  local wt="$1" tmp rc n=0 ent p
+  tmp="$(mktemp 2>/dev/null)" || return 1
+  git -C "$wt" status --porcelain=v1 -z --untracked-files=all >"$tmp" 2>/dev/null; rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$tmp"; return 1; fi
+  while IFS= read -r -d '' ent; do
+    case "$ent" in '?? '*) : ;; *) rm -f "$tmp"; return 1 ;; esac
+    p="${ent#\?\? }"
+    if printf '%s' "$p" | grep -Eq -- "$GENERATED_RE"; then n=$((n+1)); continue; fi
+    if [ "$p" = ".gascity-gastown-hq/pack.toml" ] && cmp -s "$wt/$p" "$GT/$p" 2>/dev/null; then n=$((n+1)); continue; fi
+    rm -f "$tmp"; return 1
+  done <"$tmp"
+  rm -f "$tmp"
+  [ "$n" -ge 1 ]
+}
+
+# _reap_dirty_generated_only <repo> <wt> <br> <age_h> <label> — ga-he2c1u: the plain `worktree remove` was refused
+# because the tree is dirty. If it is dirty with nothing but generated files (_worktree_dirty_only_generated), its
+# content is already in origin/<default> (an ancestor of it, or every commit there as an equivalent patch — the same two
+# proofs as the locked path), no live process has it as a cwd, and every bead it is named for is CLOSED for
+# BEAD_CLOSED_HOURS (_bead_closed_proof), nothing the tree holds is anyone's work: remove it with a SINGLE --force
+# (git's own word for "dirty is fine"; a LOCKED tree still refuses it and never gets `-f -f` here — locks belong to
+# the zombie/unparseable paths). Without this such a tree was refused on every sweep and counted as skipped_dirty,
+# silently: bead closed + merged + `.gc/system` copy was enough to keep 165 files of a delivered branch on disk forever.
+# Returns 0 iff it reaped. Anything short of every proof, and a tree this repo does not list (an engine worktree
+# under the town's .gc-worktrees belongs to another repo), is 1 with no event: the caller's skipped_dirty already
+# counts it, and an event per refused tree per sweep would drown the log (the same reason the plain path is silent).
+# A DETACHED tree needs no rescue branch: the delivery proof already says its HEAD is in origin/<default>.
+_reap_dirty_generated_only() {
+  local repo="$1" wt="$2" br="$3" age="$4" label="$5" head st proof="" del_proof="" verdict
+  st="$(git -C "$repo" worktree list --porcelain 2>/dev/null | awk -v p="$wt" '
+    $1=="worktree" { c=$2; if (c==p) listed=1 }
+    $1=="locked"   { if (c==p) locked=1 }
+    END { printf "%s%s", (listed ? "listed" : "foreign"), (locked ? " locked" : "") }')"
+  [ "$st" = "listed" ] || return 1
+  [ -n "$br" ] || br="$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null)"
+  head="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"; [ -n "$head" ] || return 1
+  _worktree_op_in_progress "$wt" && return 1
+  _worktree_dirty_only_generated "$wt" || return 1
+  if _worktree_head_merged "$repo" "$wt"; then proof="ancestor"
+  elif _ref_patch_equivalent "$repo" "$head"; then proof="patch_equivalent"; del_proof="patch_equivalent"
+  else return 1; fi
+  _worktree_in_use "$wt" && return 1
+  _bead_closed_proof "$repo" "$wt" "$br" || return 1
+  verdict="$proof bead_closed $_BC_PROOF_IDS"
+  # Dry-run never gets here (Loop 1 logs would_reap and moves on before any remove is tried); a --force still checks.
+  [ "$ENABLED" = "1" ] || return 1
+  if git -C "$repo" worktree remove --force "$wt" 2>/dev/null; then
+    _log_lock_event reaped_dirty_generated_only "$repo" "$wt" "$br" "$age" "$label" "$verdict"
+    delete_merged_local_branch "$repo" "$br" "$del_proof"
+    return 0
+  fi
+  _log_lock_event dirty_generated_reap_failed "$repo" "$wt" "$br" "$age" "$label" "$verdict"
+  return 1
+}
+
 # ── reap_pool_worktrees <repo> — enumerate a repo's worktrees via `git worktree list`
 # (catches the pool worktrees at $GT/worker-* and <rig>/crew/worker-* that the path-glob
 # loop below MISSES) and reap stale + CLEAN ones, deleting their merged orphan branch.
@@ -1146,6 +1219,9 @@ for WT_DIR in $WT_DIRS; do
     if git -C "$GT" worktree remove "$d" 2>/dev/null; then
       reaped=$((reaped+1))
       printf '{"ts":"%s","event":"reaped","wt":"%s","age_h":%s,"mode":"%s","merged":%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" >> "$LOG" 2>/dev/null
+    elif _reap_dirty_generated_only "$GT" "$d" "" "$age" "town"; then
+      # ga-he2c1u: refused only because of generated files, delivered, bead closed — see the function
+      reaped=$((reaped+1))
     elif [ "$ZOMBIE_LOCK_ENABLED" = "1" ] && \
          lock_reason="$(git -C "$GT" worktree list --porcelain 2>/dev/null | awk -v p="$d" '$1=="worktree"{c=$2} $1=="locked"{ if(c==p){ $1=""; sub(/^ /,""); if ($0=="") $0="(no reason)"; print; exit } }')" && \
          [ -n "$lock_reason" ]; then
