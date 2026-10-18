@@ -165,9 +165,14 @@ class Bundle:
         self.swaps = 0
 
     def rewrite(self, s: str) -> str:
-        for old, new in self.rules:  # fronteira nos dois lados: gt-backup, gt2 e /xx/Users/... não são o caminho; sobram e a guarda de /Users/ recusa
-            s = re.sub(r"(?<![\w.-])" + re.escape(old) + r"(?![\w.-])", lambda _m, new=new: new, s)
-        return s
+        # UMA passada só: o texto que uma regra escreve nunca é reescrito por outra (num destino que contém o home do mini, como o do MBP —
+        # /Users/athos/gt-remote/bundle/... — a regra do home reescreveria de novo o que a da cidade acabou de escrever). Mais longa primeiro;
+        # entre iguais vale a 1ª. Fronteira nos dois lados: gt-backup, gt2 e /xx/Users/... não são o caminho; sobram e a guarda de /Users/ recusa
+        first = {}
+        for old, new in self.rules:
+            first.setdefault(old, new)
+        rx = "|".join(re.escape(o) for o in sorted(first, key=len, reverse=True))
+        return re.sub(r"(?<![\w.-])(?:" + rx + r")(?![\w.-])", lambda m: first[m.group(0)], s)
 
     def add(self, rel: str, data: bytes, ex: bool = False) -> None:
         name = Path(rel).name
@@ -181,7 +186,9 @@ class Bundle:
         for what, rx in SECRETS:
             if rx.search(text):
                 raise Refused(f"{rel}: parece conter {what}")
-        if "/Users/" in text:
+        # o destino pode ele mesmo começar em /Users/ (o MBP: /Users/athos/gt-remote/bundle): o que fica sob a raiz do bundle é o destino, não sobra do mini;
+        # qualquer outro /Users/ continua recusando (vazio → nada a tirar e a guarda é a de sempre; o destino do servidor não tem /Users/)
+        if "/Users/" in re.sub(re.escape(self.a.remote_root.rstrip("/")) + r"(?![\w.-])", "", text):
             raise Refused(f"{rel}: caminho do mini (/Users/...) sobrando")
         self.files[rel] = (data, ex)
 
@@ -273,13 +280,15 @@ class Bundle:
                 for h in g["hooks"]:
                     v = self.hook_verdict(src, event, g.get("matcher"), h.get("command", "")) if h.get("type") == "command" else "keep"
                     if v == "swap":
-                        h, self.swaps = self.guard_hook(), self.swaps + 1
+                        h, self.swaps = self.guard_hook(), self.swaps + 1  # já está no DESTINO: não passa pela reescrita (o destino do MBP contém o home do mini)
+                    elif v != "drop":
+                        h = json.loads(self.rewrite(json.dumps(h)))
                     if v != "drop":
                         kept.append(h)
                 if any(h.get("type") != "command" for h in g["hooks"]):
                     raise Refused(f"hook que não é `command` em {src}/{event}: sem veredito possível")
                 if kept:
-                    kept_groups.append({**g, "hooks": json.loads(self.rewrite(json.dumps(kept)))})
+                    kept_groups.append({**g, "hooks": kept})
             if self.swaps > swaps:  # o gt vigiava só `git -C` no Bash; o guarda vigia também a escrita de arquivo no clone alheio
                 kept_groups.append({"matcher": FILE_TOOLS, "hooks": [self.guard_hook()]})
             if kept_groups:

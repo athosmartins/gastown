@@ -175,6 +175,7 @@ class Cfg:
         if not isinstance(self.gate_cmd, list) or not all(isinstance(x, str) and x for x in self.gate_cmd):
             raise Fail(f"host {self.host}: 'gate_cmd' tem que ser uma lista de textos")
         self.watch_s = self.num(h, "watch_s", 5)
+        self.shim = isinstance(h.get("shim"), dict)  # bloco `shim` = o mini PUXA os pedidos de bd/gc das sessões (remote-shim-pump.py); sem ele, nada muda
         rb = h.get("real_sessions_released_by")
         self.released = rb.strip() if isinstance(rb, str) else ""  # só a decisão explícita do Mayor liga; ausente/vazio/não-texto = desligado
         base = os.environ.get("GC_EXEC_STATE_DIR") or os.path.join(self.city_guess, ".gc", "runtime", "session-ssh")
@@ -437,6 +438,18 @@ def real_gate(cfg: Cfg, name: str, work_dir: str) -> str:
             f'o=$(python3 -I {g} --selfcheck {st} {q(work_dir)} 2>&1) || {{ echo "sessão real {name} recusada: o --selfcheck do guarda reprovou as settings do host: $o" >&2; exit {EX_POLICY}; }}\n')
 
 
+def shim_pump(cfg: Cfg) -> None:
+    """Sobe o puxador de pedidos do MBP (idempotente: se já há um, não faz nada). Best-effort: a sessão já abriu, e sem o puxador só
+    os atalhos bd/gc dela falham na hora (rc 75, nada enviado) — por isso falhar aqui não desfaz o start, só fica no log."""
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(os.path.dirname(os.path.realpath(__file__)), "remote-shim-pump.py"), "ensure", "--host", cfg.host],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+        if r.returncode != 0:
+            cfg.log(f"shim-pump ensure falhou rc={r.returncode}: {r.stderr.decode(errors='replace').strip()[:160]}")
+    except (OSError, subprocess.SubprocessError) as e:
+        cfg.log(f"shim-pump ensure não rodou: {e}")
+
+
 def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
     try:
         req = json.loads(sys.stdin.read() or "{}")
@@ -499,6 +512,8 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
     if rc != 0:
         raise Fail(f"start em {cfg.host} falhou (rc={rc}): {err or out or 'sem mensagem'}")
     cfg.event("started", name)
+    if cfg.shim:
+        shim_pump(cfg)
     cfg.log(f"start {name} ok" + (f" ignored={','.join(p['ignored'])}" if p["ignored"] else "") +
             (f" env_dropped={','.join(p['env_dropped'])}" if p["env_dropped"] else ""))
     return 0
