@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.child-priority-janitor</string>
+
+  <!-- Child-Priority Janitor (2026-10-18, ga-p7hymz). A slice is born with the priority of its
+       parent or lower, never lower than the parent's.
+
+       PROBLEM: `bd create --parent` does not inherit the parent's priority (default P2) and
+       slicers forget `-p`. 4 cuts of ga-w7qwl1.1 (P0) were born P2, and the Pilot, which orders
+       by priority, treated P0 work as P2.
+
+       OPERATION per sweep (MAX_PER_SWEEP cap): in every store (HQ + rigs), an open / hooked /
+       in_progress / blocked child whose parent is MORE urgent is raised to the parent's priority
+       (or the grandparent's, when the parent is itself still to be raised), stamped
+       gc.prio_inherited, then re-read to confirm, then commented. RAISE ONLY and ONCE per bead:
+       a child more urgent than its parent is never lowered, and a human who lowers it afterwards
+       is not fought.
+
+       LEFT ALONE: label followup:nonblocking / priority:pinned, a title saying "não-bloqueante" /
+       "non-blocking", a parent that is closed, missing or has an unreadable priority (fail-closed).
+
+       KILL-SWITCH: CHILD_PRIORITY_JANITOR_ENABLED=0 -> no-op.
+       DRY-RUN: CHILD_PRIORITY_JANITOR_DRY_RUN=1 (lists what it WOULD raise, writes nothing).
+       CADENCE: StartInterval=297 (~5min), above the measured run of ~22 s (7 candidates on all
+       stores); jittered off the 300 s / 318 s tiers to decorrelate the Dolt connect-storm.
+       No KeepAlive. Single instance (flock).
+
+       NOT LOADED BY MERGING THIS FILE. Mergeado != vivo: load it (launchctl bootstrap) and register
+       it in daemon-presence-watchdog.sh together, in the same change; see
+       docs/runbooks/child-priority-janitor.md. Run it with DRY_RUN=1 first. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/child-priority-janitor.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>297</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/child-priority-janitor.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/child-priority-janitor.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>CHILD_PRIORITY_JANITOR_ENABLED</key>
+    <string>1</string>
+    <key>CHILD_PRIORITY_JANITOR_DRY_RUN</key>
+    <string>0</string>
+    <key>CHILD_PRIORITY_JANITOR_MAX_PER_SWEEP</key>
+    <string>15</string>
+    <key>BD_ACTOR</key>
+    <string>automation</string>
+  </dict>
+</dict>
+</plist>

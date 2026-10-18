@@ -316,6 +316,11 @@ qualquer outro bead o label não mexe na ordem e a lib fica calada). Bead sem a 
 `labels` (o `bd` a omite quando não há nenhum) é "não tem", não "ilegível". Não use
 pra "urgente" em geral: o que não é dano a cliente agora segue a ordem normal.
 
+**Fatia nasce com a prioridade do pai (ga-p7hymz).** `bd create --parent` NÃO herda a prioridade
+(nasce P2) e a ordem acima é por prioridade: 4 cortes de uma P0 foram tratados como P2. Fatie com
+`bd create --parent <pai> -t <tipo do pai> -p <prio do pai>`. `child-priority-janitor` sobe, uma vez só,
+a fatia aberta mais baixa que o pai; não mexe em `followup:nonblocking` nem em `priority:pinned`.
+
 {{/* td:core:gate-focus */ -}}
 ### Modo foco no gate — quando o gargalo é a revisão, ninguém constrói bead nova (ga-kqa08j)
 
