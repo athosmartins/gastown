@@ -487,6 +487,92 @@ has "--help diz que o verde do MBP pode passar vazio" "$T/help" 'passar VAZIO'; 
 for why in mbp-saida-nao-gravada mbp-saida-vazia mbp-saida-ilegivel saida-sem-resumo; do has "--help traz o motivo $why" "$T/help" "$why"; done
 hasnt "--help não chama o verde sem pulados de ÚNICA coisa aceita (o caso parcial também aceita)" "$T/help" 'ÚNICA coisa aceita'
 
+# 15 OS IDS NO LOG (ga-kqg1gi): a linha mbp+local diz QUAIS testes reprovaram no MBP e passaram aqui (red_ids) e QUAIS pularam no MBP (skip). Sem isso o placar só sabe
+#    CONTAR o vermelho falso e o pulo (52 e 64 corridas na semana de 11/10) e ninguém consegue dizer qual teste/fixture/pacote do nó é o culpado.
+#    É telemetria: nenhum destes campos muda o rc nem o que roda aqui. Campo ausente = a linha não tem o que dizer (o motivo está em `detail`).
+if command -v python3 >/dev/null 2>&1; then
+  # a linha é JSON montado à mão no bash: o `has` vê texto, só o parser vê se o JSON é válido e o que cada campo vale (a ÚLTIMA linha do log)
+  jvalid() { n=$((n+1)); if python3 -I -c 'import json,sys
+for l in open(sys.argv[1]): json.loads(l)' "$2" 2>/dev/null; then echo "ok   $1"; else echo "FAIL $1: o log não é JSON válido ($2): $(tail -1 "$2" 2>/dev/null | cut -c1-300)"; fails=$((fails+1)); fi; }
+  # o eval roda SÓ as expressões escritas neste arquivo (o 3º argumento do jpy); nada que veio do log ou da saída do MBP chega nele
+  jpy() { n=$((n+1)); if python3 -I -c 'import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+r=rows[-1]
+sys.exit(0 if eval(sys.argv[2]) else 1)' "$2" "$3" 2>/dev/null; then echo "ok   $1"; else echo "FAIL $1: ($3) é falso em $2: $(tail -1 "$2" 2>/dev/null | cut -c1-300)"; fails=$((fails+1)); fi; }
+
+  # 15a o vermelho do MBP que PASSA isolado aqui: os ids vão para o log, o detail segue igual
+  reset; mbp_red; rc=$(STUB_LOCAL_RCS="0 0" run -- tests/test_a.py tests/test_b.py -q); expect "15a: vermelho que passa isolado e no comando inteiro" 0 "$rc"
+  jvalid "15a: a linha do log é JSON válido" "$LOG"
+  jpy "15a: red_ids traz os ids que reprovaram no MBP e passaram aqui" "$LOG" 'r["red_ids"]==["tests/test_a.py::test_x","tests/test_b.py"]'
+  jpy "15a: red_n conta os ids" "$LOG" 'r["red_n"]==2'
+  has "15a: o detail segue dizendo isolado-passou;inteiro-rc=0" "$LOG" 'isolado-passou;inteiro-rc=0'
+  jpy "15a: sem pulados, sem campos de skip" "$LOG" '"skip" not in r and "skip_n" not in r'
+  # 15b passou isolado mas o comando inteiro reprova aqui (ordem, -x): os ids são do mesmo jeito os que passaram isolados; o inteiro-rc fica no detail para quem cruza
+  reset; mbp_red; rc=$(STUB_LOCAL_RCS="0 1" run -- tests/test_a.py tests/test_b.py -x -q); expect "15b: passa isolado, o inteiro reprova" 1 "$rc"
+  jpy "15b: red_ids presente" "$LOG" 'r["red_ids"]==["tests/test_a.py::test_x","tests/test_b.py"] and r["red_n"]==2'; has "15b: o detail diz inteiro-rc=1" "$LOG" 'isolado-passou;inteiro-rc=1'
+  # 15c o vermelho que o rerun daqui CONFIRMA não é vermelho falso: os ids não entram (não se sabe QUAL dos ids reprovou aqui, e é vermelho real)
+  reset; mbp_red; rc=$(STUB_LOCAL_RCS=1 run -- tests/test_a.py tests/test_b.py -q); expect "15c: vermelho confirmado aqui" 1 "$rc"
+  jpy "15c: confirmado → sem red_ids" "$LOG" '"red_ids" not in r and "red_n" not in r'; has "15c: o detail diz local-confirmou" "$LOG" 'local-confirmou'
+  reset; mbp_red; rc=$(STUB_LOCAL_RCS=3 run -- tests/test_a.py tests/test_b.py -q); expect "15c: rerun daqui morre (rc 3)" 3 "$rc"; jpy "15c: rc 3 aqui → sem red_ids" "$LOG" '"red_ids" not in r'
+  # 15d não sei quais passaram aqui (muitos, id fora dos alvos, ids que não se reconhecem, sem ids): nada é afirmado — o detail diz por quê
+  reset; { for i in $(seq 1 51); do echo "FAILED tests/test_a.py::t$i - x"; done; echo "51 failed in 1s"; } > "$T/mbp.out"; export STUB_MBP_OUT="$T/mbp.out" STUB_MBP_RC=1
+  rc=$(STUB_LOCAL_RCS="0" run -- tests/test_a.py -q); expect "15d: 51 reprovados" 0 "$rc"; jpy "15d: muitos → sem red_ids" "$LOG" '"red_ids" not in r and "red_n" not in r'; has "15d: muitos no detail" "$LOG" 'muitos'
+  reset; mbp_out "FAILED tests/outro.py::test_x - boom" "1 failed in 0.9s"; export STUB_MBP_RC=1
+  rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "15d: id fora dos alvos" 0 "$rc"; jpy "15d: fora dos alvos → sem red_ids" "$LOG" '"red_ids" not in r'; has "15d: ids-fora-dos-alvos no detail" "$LOG" 'ids-fora-dos-alvos'
+  reset; mbp_red; rc=$(STUB_LOCAL_RCS="4 0" run -- tests/test_a.py tests/test_b.py -q); expect "15d: ids que não se reconhecem aqui (rc 4)" 0 "$rc"; jpy "15d: ids-ilegiveis → sem red_ids" "$LOG" '"red_ids" not in r'
+  reset; mbp_out "1 failed in 0.5s"; export STUB_MBP_RC=1; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py -q); expect "15d: rc 1 sem linhas FAILED" 0 "$rc"; jpy "15d: sem-ids → sem red_ids" "$LOG" '"red_ids" not in r'
+  # 15e lista longa: o log guarda no máximo 20 ids (a linha tem de caber numa gravação só) e red_n diz quantos eram de verdade
+  reset; { for i in $(seq 1 25); do echo "FAILED tests/test_a.py::t$i - x"; done; echo "25 failed in 1s"; } > "$T/mbp.out"; export STUB_MBP_OUT="$T/mbp.out" STUB_MBP_RC=1
+  rc=$(STUB_LOCAL_RCS="0 0" run -- tests/test_a.py -q); expect "15e: 25 reprovados passam isolados" 0 "$rc"
+  jpy "15e: 20 ids no log" "$LOG" 'len(r["red_ids"])==20'; jpy "15e: red_n diz 25" "$LOG" 'r["red_n"]==25'; jvalid "15e: JSON válido" "$LOG"
+  # 15f id enorme: cada id é cortado em 120 caracteres e a linha inteira fica abaixo de 4096 bytes (o limite de uma gravação do stdio)
+  reset; { for i in $(seq 1 40); do printf 'FAILED tests/test_a.py::test_%s_%s - x\n' "$i" "$(awk 'BEGIN{for(i=0;i<300;i++) printf "z"}')"; done; echo "40 failed in 1s"; } > "$T/mbp.out"; export STUB_MBP_OUT="$T/mbp.out" STUB_MBP_RC=1
+  rc=$(STUB_LOCAL_RCS="0 0" run -- tests/test_a.py -q); expect "15f: 40 ids de 300 caracteres" 0 "$rc"
+  jpy "15f: cada id tem no máximo 120 caracteres" "$LOG" 'len(r["red_ids"])>0 and all(len(x)<=120 for x in r["red_ids"])'; jpy "15f: a linha cabe em 4096 bytes" "$LOG" 'len(open(sys.argv[1],"rb").read().splitlines()[-1])<4096'
+  jpy "15f: red_n diz 40" "$LOG" 'r["red_n"]==40'
+  # 15g aspas, barra, espaço e byte não-ASCII no id: o JSON continua válido (aspas e barra caem como no detail; o resto do id fica reconhecível)
+  reset; mbp_out 'FAILED tests/test_a.py::test_q[a"b\c é d] - boom' "1 failed in 0.9s"; export STUB_MBP_RC=1
+  rc=$(STUB_LOCAL_RCS="0 0" run -- tests/test_a.py -q); expect "15g: id com aspas, barra e acento" 0 "$rc"
+  jvalid "15g: JSON válido" "$LOG"; jpy "15g: o id sai só com ASCII imprimível, sem aspas nem barra" "$LOG" 'r["red_ids"]==["tests/test_a.py::test_q[abc  d]"]'
+  unset STUB_MBP_RC
+
+  # 15h pulados no MBP: cada linha SKIPPED vai ao log como "[n] arquivo:linha: motivo", e skip_n é o total
+  reset; mbp_out "SKIPPED [2] tests/test_b.py:9: sem dado" "3 passed, 2 skipped in 1.0s"
+  rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "15h: pulados no MBP" 0 "$rc"
+  jvalid "15h: JSON válido" "$LOG"; jpy "15h: skip traz a linha SKIPPED" "$LOG" 'r["skip"]==["[2] tests/test_b.py:9: sem dado"]'; jpy "15h: skip_n é 2" "$LOG" 'r["skip_n"]==2'
+  has "15h: o detail segue dizendo skips-no-mbp:2" "$LOG" 'skips-no-mbp:2'; jpy "15h: sem red_ids" "$LOG" '"red_ids" not in r and "red_n" not in r'
+  # 15i o MOTIVO vai junto: é ele que separa o pulo por desenho (só macOS) do que o nó resolve (pacote que falta). Ordem e texto do pytest, sem reescrever.
+  reset; mbp_out "SKIPPED [1] tests/test_b.py:9: requires macOS (darwin only)" "SKIPPED [3] tests/test_a.py:4: could not import 'fitz': No module named 'fitz'" "5 passed, 4 skipped in 1.0s"
+  rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "15i: dois motivos de pulo" 0 "$rc"
+  jpy "15i: os dois motivos vão como o pytest os imprimiu" "$LOG" 'r["skip"]==["[1] tests/test_b.py:9: requires macOS (darwin only)","[3] tests/test_a.py:4: could not import '"'"'fitz'"'"': No module named '"'"'fitz'"'"'"]'
+  jpy "15i: skip_n é o total do resumo (4)" "$LOG" 'r["skip_n"]==4'
+  # 15j skip que vem de um helper (fora dos alvos): continua pulado no MBP, continua no log
+  reset; mbp_out "SKIPPED [2] tests/helpers.py:3: sem dado" "2 skipped in 0.1s"; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "15j: skip de helper" 0 "$rc"
+  jpy "15j: o skip do helper está no log" "$LOG" 'r["skip"]==["[2] tests/helpers.py:3: sem dado"] and r["skip_n"]==2'; has "15j: o detail diz skips-fora-dos-alvos" "$LOG" 'skips-fora-dos-alvos'
+  # 15k sob -qq não há linha-resumo: skip_n vem da soma das linhas SKIPPED
+  reset; mbp_out ".s" "SKIPPED [1] tests/test_b.py:9: x"; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -qq); expect "15k: -qq com um pulado" 0 "$rc"
+  jpy "15k: skip_n vem da soma das linhas" "$LOG" 'r["skip_n"]==1 and r["skip"]==["[1] tests/test_b.py:9: x"]'
+  # 15l o resumo diz que pulou e NÃO há linha para listar (--no-summary): o total é dito, a lista não é inventada
+  reset; mbp_out "= 1 passed, 2 skipped in 0.1s ="; rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py --no-summary); expect "15l: resumo sem linhas SKIPPED" 0 "$rc"
+  jpy "15l: skip_n 2 e nenhuma lista" "$LOG" 'r["skip_n"]==2 and "skip" not in r'
+  # 15m a leitura das linhas SKIPPED para o log FALHA (grep com erro) — só ela, a contagem do rc 0 continua lendo: o rc e o que roda aqui não mudam, o total sai, a lista não
+  reset; mbp_out "SKIPPED [1] tests/test_b.py:9: x" "1 passed, 1 skipped in 0.1s"
+  rc=$(PATH="$T/shadow-grep:$PATH" STUB_GREP_FAIL='[0-9]+\] ' STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "15m: grep da lista SKIPPED falhou" 0 "$rc"
+  has_local "15m: o arquivo que pulou segue rodando aqui" "$STUB_LOG" 'arg:tests/test_b.py$'; has "15m: o detail segue skips-no-mbp:1" "$LOG" 'skips-no-mbp:1'
+  jvalid "15m: JSON válido"  "$LOG"; jpy "15m: total sem lista (a falha de leitura não vira lista vazia nem inventada)" "$LOG" 'r["skip_n"]==1 and "skip" not in r'
+  # 15n 25 linhas SKIPPED de 300 caracteres: no máximo 20 entradas de até 120 caracteres; skip_n diz 25
+  reset; { for i in $(seq 1 25); do printf 'SKIPPED [1] tests/test_b.py:%s: %s\n' "$i" "$(awk 'BEGIN{for(i=0;i<300;i++) printf "m"}')"; done; echo "25 skipped in 1s"; } > "$T/mbp.out"; export STUB_MBP_OUT="$T/mbp.out"
+  rc=$(STUB_LOCAL_RCS=0 run -- tests/test_a.py tests/test_b.py -q); expect "15n: 25 pulados" 0 "$rc"
+  jpy "15n: 20 entradas de até 120 caracteres" "$LOG" 'len(r["skip"])==20 and all(len(x)<=120 for x in r["skip"])'; jpy "15n: skip_n diz 25" "$LOG" 'r["skip_n"]==25'; jpy "15n: a linha cabe em 4096 bytes" "$LOG" 'len(open(sys.argv[1],"rb").read().splitlines()[-1])<4096'
+  # 15o verde limpo: a linha é a de sempre, sem campo novo
+  reset; mbp_out "2 passed in 1.0s"; rc=$(run -- tests/test_a.py tests/test_b.py -q); expect "15o: verde limpo" 0 "$rc"
+  jpy "15o: nenhum campo novo" "$LOG" 'not ({"red_ids","red_n","skip","skip_n"} & set(r))'; has "15o: a linha segue terminando em ntargets" "$LOG" '"ntargets":2\}$'
+  # 15p o cabeçalho (--help) diz os campos novos
+  "$GP" --help > "$T/help" 2>&1; has "15p: --help traz red_ids" "$T/help" 'red_ids'; has "15p: --help traz skip_n" "$T/help" 'skip_n'
+else
+  echo "SKIP caso 15 (ids no log): este ambiente não tem python3 para ler o JSON — nada foi medido (os casos acima seguem valendo)"
+fi
+
 # controle negativo A: sem a confirmação local, o caso "vermelho" PASSARIA pelo rc do MBP — o teste 4 tem de enxergar isso
 reset; mbp_red
 sed 's|run_local ${flags\[@\]+"${flags\[@\]}"} "${conf\[@\]}"; RC=\$?|RC=1|' "$GP" > "$T/mutA.sh"; chmod +x "$T/mutA.sh"

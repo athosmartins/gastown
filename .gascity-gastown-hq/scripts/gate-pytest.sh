@@ -59,6 +59,13 @@
 #   apague para religar. Cada execução acrescenta uma linha em $CITY/.gc/logs/gate-pytest.jsonl (ts, sessão, repo, ran, motivo,
 #   segundos no MBP/aqui, rc) — é o insumo do antes×depois por sessão de revisor. Se a linha não puder ser gravada, a saída traz um
 #   AVISO (o rc do revisor não muda): uma execução fora do log é dita, não some da contagem em silêncio.
+#   QUAIS testes, nas linhas mbp+local (ga-kqg1gi; sem isso o placar só sabe CONTAR o vermelho falso e o pulo, não dizer qual teste ou pacote do nó é o culpado):
+#   `red_ids` (até 20 node ids, cada um cortado em 120 caracteres, só ASCII imprimível, sem aspas nem barra) e `red_n` (quantos eram) quando o MBP reprovou e os ids PASSARAM
+#   isolados aqui (`isolado-passou`); `skip` (até 20 linhas SKIPPED como o pytest as imprimiu, motivo incluído: é ele que separa o pulo por desenho, só macOS, do que o nó
+#   resolve, pacote que falta) e `skip_n` (o total) quando algo pulou no MBP. É só telemetria: nenhum campo muda o rc nem o que roda aqui. Campo ausente = a linha não sabe
+#   dizer (o motivo está em `detail`): vermelho que o rerun daqui CONFIRMA não grava ids (é vermelho real, e não se sabe qual dos ids reprovou aqui). Sem linhas SKIPPED
+#   para listar (--no-summary) ou com a leitura delas falhando, sai só `skip_n`: nunca uma lista inventada nem `[]`. `skip` é o que o pytest IMPRIMIU, e pode ser parcial
+#   (teto de 20; resumo que diz mais pulados do que as linhas listam): `skip_n` é o total do resumo (ou a soma dos [n] das linhas quando o resumo não traz o número: sob -qq não há resumo).
 #   Ajustes por ambiente: GATE_PYTEST_MBP_TIMEOUT_S (420), GATE_PYTEST_PY (python3), GATE_PYTEST_FORCE_LOCAL_LIST,
 #   GATE_PYTEST_MBP_RUN, GATE_PYTEST_CITY.
 #   Outro chamador (o atalho de pytest dos workers, scripts/pytest-shim/, ga-fl2nek) usa a MESMA política com a chave, o log, o
@@ -248,6 +255,7 @@ fi
 
 # ---- execução ---------------------------------------------------------------------------------------------------------
 T_START=$(date +%s); MBP_SECS=0; LOCAL_SECS=0; RAN=local; RC=0; DETAIL=""; GREEN_MBP=0; GREEN_PARTIAL=0
+LOG_EXTRA=""   # campos extras da linha do log (red_ids/red_n, skip/skip_n): atribuído aqui para que nada do ambiente entre na linha
 # sem arquivo temporário não dá para ler a saída do MBP (vermelho/pulado): então não vai ao MBP — roda aqui, como hoje.
 OUT=$(mktemp "${TMPDIR:-/tmp}/gate-pytest.XXXXXX") || { OUT=""; [ -n "$LOCAL_REASON" ] || LOCAL_REASON="mktemp-falhou"; }
 trap '[ -n "$OUT" ] && rm -f "$OUT"' EXIT
@@ -279,6 +287,24 @@ is_target_file() {   # <caminho que o pytest imprimiu>: é o ARQUIVO de um dos a
   local t
   for t in ${mbp_targets[@]+"${mbp_targets[@]}"}; do [ "${t%%::*}" = "$1" ] && return 0; done
   return 1
+}
+# ---- os ids para o log (ga-kqg1gi) ------------------------------------------------------------------------------------------
+# A linha do log é JSON montado à mão: um byte fora do ASCII imprimível, uma aspa ou uma barra num id/motivo de pulo quebra a linha inteira (e some da contagem).
+json_clip() { printf '%s' "$1" | LC_ALL=C tr -cd ' -~' | tr -d '"\\' | cut -c1-120; }   # <texto> → ASCII imprimível, sem aspas nem barra, no máximo 120 caracteres
+# json_list <máx> <prefixo a tirar> <itens, um por linha> → ["a","b"] com no máximo <máx> itens. Nenhum item sobrou (lista vazia, ou tudo caiu na limpeza) → NADA impresso e rc 1:
+# o chamador omite o campo, porque `[]` leria-se como "nenhum teste" quando o que houve foi "não consegui dizer".
+json_list() {
+  local max=$1 strip=$2 list=$3 out="" k=0 it
+  while IFS= read -r it; do
+    [ $k -lt "$max" ] || break
+    it=$(json_clip "${it#"$strip"}")
+    [ -n "$it" ] || continue
+    out="${out}${out:+,}\"$it\""; k=$((k+1))
+  done <<EOF
+$list
+EOF
+  [ -n "$out" ] || return 1
+  printf '[%s]' "$out"
 }
 # o comando inteiro "aqui" da parte que ia ao MBP: sem divisão é EXATAMENTE o que o revisor escreveu
 run_local_mbp_part() { if [ $SPLIT -eq 1 ]; then run_local ${flags[@]+"${flags[@]}"} "${mbp_targets[@]}"; else run_local "$@"; fi; }
@@ -358,6 +384,12 @@ else
         done < "$OUT"
         [ -n "$sk_bad" ] || { [ "${sk_sum:-0}" -le "$sk_listed" ] || sk_bad="skips-nao-contados"; }
         sk_note="${sk_bad:-skips-no-mbp}:${sk_sum:-$sk_listed}"
+        # O que pulou, para o LOG (ga-kqg1gi): as linhas SKIPPED como o pytest as imprimiu. Telemetria pura: nada daqui muda o rc nem o que roda.
+        #   vazio (rc 1: o resumo diz que pulou e não há linha, --no-summary) → só skip_n, sem lista; falhou/ilegível (rc >= 2, ou nenhuma linha sobrou depois da limpeza) →
+        #   idem: o total sai e a lista NÃO é inventada nem vira `[]` (que leria-se como "nenhum pulado listado").
+        SK_LOG_LIST=$(grep -a -E '^SKIPPED \[[0-9]+\] ' "$OUT"); g_skl=$?
+        if [ $g_skl -eq 0 ]; then SK_JSON=$(json_list 20 "SKIPPED " "$SK_LOG_LIST") && LOG_EXTRA=",\"skip\":$SK_JSON"; fi
+        LOG_EXTRA="$LOG_EXTRA,\"skip_n\":${sk_sum:-$sk_listed}"
         if [ -n "$sk_bad" ]; then
           say "${sk_sum:-$sk_listed} teste(s) pularam no MBP e não sei de qual dos alvos cada um é (${sk_bad#skips-}) — todos os alvos rodam aqui"
         else
@@ -421,7 +453,12 @@ EOF
           #   "Não sei" não vira verde: o comando inteiro roda aqui (o que o revisor rodava antes do wrapper) e o rc DELE é o que vale.
           0) say "AVISO: $nids teste(s) reprovaram no MBP e passaram aqui isolados — isso não prova que o vermelho é do ambiente (um -x/--maxfail parou o MBP no 1º vermelho; falha de ordem; teste pulado) — o comando inteiro roda aqui, e o resultado dele é o que vale"
              run_local_mbp_part "$@"; RC=$?
-             DETAIL="mbp-vermelho:$nids;isolado-passou;inteiro-rc=$RC" ;;
+             DETAIL="mbp-vermelho:$nids;isolado-passou;inteiro-rc=$RC"
+             # QUAIS foram, para o log (ga-kqg1gi): são os ids que reprovaram no MBP e PASSARAM aqui isolados — o vermelho falso que o placar conta. Só os deste ramo: no
+             #   `local-confirmou` o vermelho é real e não se sabe qual dos ids reprovou aqui. Reaproveita $ids (já lido acima, nids > 0 neste ramo), então não há leitura nova.
+             #   vazio → não acontece (nids > 0); ilegível (nenhum id sobrou depois da limpeza) → sem red_ids, e red_n fica: o log diz menos, nunca uma lista vazia.
+             RED_JSON=$(json_list 20 "" "$ids") && LOG_EXTRA=",\"red_ids\":$RED_JSON"
+             LOG_EXTRA="$LOG_EXTRA,\"red_n\":$nids" ;;
           1) DETAIL="mbp-vermelho:$nids;local-confirmou" ;;
           # 2 interrompido, 3 erro interno, 137 morto por sinal...: o rc vale (não é verde), mas o aqui NÃO confirmou o vermelho
           *) DETAIL="mbp-vermelho:$nids;local-rc=$RC" ;;
@@ -457,9 +494,9 @@ if [ $GREEN_MBP -eq 1 ] && [ "$RC" = 0 ]; then
 fi
 # O log é o insumo do antes×depois: uma linha que não foi gravada some da contagem. O rc do revisor não depende dele (nunca falha por
 # causa do log), mas a falta é DITA na saída, não engolida — quem lê "execuções: N" sabe que pode faltar uma.
-LOG_LINE=$(printf '{"ts":"%s","session":"%s","repo":"%s","ran":"%s","rc":%s,"secs":%s,"mbp_secs":%s,"local_secs":%s,"detail":"%s","ntargets":%s}' \
+LOG_LINE=$(printf '{"ts":"%s","session":"%s","repo":"%s","ran":"%s","rc":%s,"secs":%s,"mbp_secs":%s,"local_secs":%s,"detail":"%s"%s,"ntargets":%s}' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${GC_SESSION_NAME:-}" "${repo:--}" "$RAN" "$RC" "$SECS" "$MBP_SECS" "$LOCAL_SECS" \
-  "$(printf '%s' "$DETAIL" | tr -d '"\\' | tr '\n' ' ' | cut -c1-200)" "${#targets[@]}")
+  "$(printf '%s' "$DETAIL" | tr -d '"\\' | tr '\n' ' ' | cut -c1-200)" "$LOG_EXTRA" "${#targets[@]}")
 { mkdir -p "$(dirname "$LOG")" && printf '%s\n' "$LOG_LINE" >> "$LOG"; } 2>/dev/null \
   || say "AVISO: não consegui gravar $LOG — esta execução não entra no antes×depois (o resultado abaixo não muda)"
 say "ran=$RAN rc=$RC secs=$SECS mbp_secs=$MBP_SECS local_secs=$LOCAL_SECS motivo=${DETAIL:--}"
