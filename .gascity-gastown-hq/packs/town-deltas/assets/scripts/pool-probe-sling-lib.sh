@@ -63,6 +63,9 @@ drop_slings_for_taken_stories() {
   # vazio -> no wisp in this answer, nothing to look up (no bd show, no gc call); falhou/ilegível (the answer is not JSON) -> the same: it goes on exactly as it would without this filter
   if [ -z "$pairs" ]; then printf "%s" "$cands"; return 0; fi
   now_s=$(date +%s)
+  # The loop below is the body of a $( ) command substitution, so each of its two case statements writes a leading paren on every
+  # pattern: bash 3.2 (the macOS /bin/bash) reads the closing paren of an unparenthesized pattern as the end of the substitution and
+  # fails at the first double semicolon (gate guard ga-7dx2vw). Keep it that way when adding a pattern.
   drop_ids=$(printf "%s\n" "$pairs" | {
     roster_read=""; roster=null
     while IFS="$(printf '\t')" read -r wid story; do
@@ -74,15 +77,15 @@ drop_slings_for_taken_stories() {
         if [ -z "$roster_read" ]; then
           # vazio/falhou/ilegível -> roster stays null: only a live lease can prove "in hand" then
           roster=$(read_roster) || roster=null
-          case "$roster" in "["*) ;; *) roster=null ;; esac
+          case "$roster" in ("["*) ;; (*) roster=null ;; esac
           roster_read=1
         fi
         verdict=$(printf "%s" "$story_json" | jq -r --argjson now "$now_s" --argjson roster "$roster" "$STORY_HAND_JQ" 2>/dev/null) || verdict=unreadable
       fi
       case "$verdict" in
-        hand)      printf "%s\n" "$wid" ;;
-        free|dead) ;;
-        *)         echo "pool-probe: could not tell whether story $story of sling $wid is in hand (bd show or the session roster unreadable) - kept $wid" >&2 ;;
+        (hand)      printf "%s\n" "$wid" ;;
+        (free|dead) ;;
+        (*)         echo "pool-probe: could not tell whether story $story of sling $wid is in hand (bd show or the session roster unreadable) - kept $wid" >&2 ;;
       esac
     done
   })
