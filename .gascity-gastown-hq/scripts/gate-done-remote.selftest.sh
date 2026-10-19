@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gate-done-remote.selftest.sh — prova hermética de scripts/gate-done-remote.py (ga-2hd02v.1.13): cidade, origin e espelho FALSOS em tmp, `bd`/`gc` falsos,
 # e o commands/gate-done.md DE VERDADE (a fonte única que o executável reaproveita: se ele mudar de forma, este teste quebra). Uma seção final roda a cadeia
-# pelo remote-shim-wrapper.py real (ambiente montado do zero, cwd = cidade) e outra mata 5 mutantes. Nada toca a cidade nem o origin de verdade.
+# pelo remote-shim-wrapper.py real (ambiente montado do zero, cwd = cidade) e outra mata 6 mutantes. Nada toca a cidade nem o origin de verdade.
 # Uso: bash scripts/gate-done-remote.selftest.sh   (FAILFAST=1 para no 1º caso que reprova)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
