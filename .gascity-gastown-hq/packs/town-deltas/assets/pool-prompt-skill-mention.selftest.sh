@@ -34,7 +34,7 @@ ROOT="${POOL_PROMPT_REPO_ROOT:-$SELF_DIR/../../../..}"
 CITY_DIR="${POOL_PROMPT_CITY_DIR:-$ROOT/.gascity-gastown-hq}"
 AGENTS_DIR="${POOL_PROMPT_AGENTS_DIR:-$SELF_DIR/../../../agents}"
 # Unattended pool agents: nobody is at the keyboard to notice a misfire, and each one holds a slot.
-POOL_TEMPLATES="${POOL_PROMPT_POOL_TEMPLATES:-wa-worker ps-worker gemini-worker dog-remote}"
+POOL_TEMPLATES="${POOL_PROMPT_POOL_TEMPLATES:-wa-worker ps-worker gemini-worker dog-remote wa-worker-remote}"
 
 PASS=0
 FAIL=0
