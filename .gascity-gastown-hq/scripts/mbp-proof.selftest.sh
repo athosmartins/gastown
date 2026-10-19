@@ -184,6 +184,9 @@ agent() {  # a "sessão": os 6 passos do prompt, com o modo de falha pedido
     bigfile) head -c 3100000 /dev/zero > "$wd/grande.bin";;
     credleak) echo "https://u:pppppppp@github.com" > "$SRV/.git-credentials";;
     sshkey) echo "chave" > "$SRV/.ssh/id_ed25519";;
+    secretb64) mkdir -p "$G/shim/resp"; python3 -I -c 'import base64,json,sys; open(sys.argv[1]+"/resp/1-1-aaaaaaaa.json","w").write(json.dumps({"id":"1-1-aaaaaaaa","rc":0,"stdout_b64":base64.b64encode(b"token ghp_"+b"a"*40).decode(),"stderr_b64":""}))' "$G/shim";;
+    secretcmd) mkdir -p "$G/shim/req"; python3 -I -c 'import base64,json,sys; p=json.dumps({"tool":"bd","argv":["comment","ga-x","ghp_"+"a"*40],"env":{}},separators=(",",":")); open(sys.argv[1]+"/req/1-1-bbbbbbbb.json","w").write(json.dumps({"v":1,"id":"1-1-bbbbbbbb","cmd":"rs1 "+base64.urlsafe_b64encode(p.encode()).decode().rstrip("="),"stdin_b64":""}))' "$G/shim";;
+    badb64) mkdir -p "$G/shim/req"; echo '{"v":1,"id":"1-1-cccccccc","cmd":"rs1 e30","stdin_b64":"@@@"}' > "$G/shim/req/1-1-cccccccc.json";;
     transcriptsecret) mkdir -p "$SRV/.claude/projects/-fake-$run"; printf 'ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$SRV/.claude/projects/-fake-$run/vazou.txt";;
   esac
   hk() { printf '{"attachment":{"type":"hook_success","hookEvent":"%s","command":"%s","durationMs":%s,"exitCode":%s}}\n' "$1" "$2" "$3" "$4" >> "$t"; }
@@ -234,8 +237,8 @@ EOS
   stop) [ $mode != stopfail ] || { echo "stop: falha falsa" >&2; exit 1; }
         if [ -f "$S/panepid" ] && [ $mode != leaveproc ] && [ $mode != stopfail ]; then killtree "$(cat "$S/panepid")"; fi
         [ $mode = leavefile ] || rm -f "$BUNDLE/run/$NAME.sh"
-        [ $mode = leavesocket ] || rm -f "$SOCK"
-        rm -f "$S/running";;
+        [ $mode != cleansock ] || rm -f "$SOCK"   # o tmux de verdade (medido, 3.7c) deixa o ARQUIVO do socket quando a última sessão morre e o servidor sai; `cleansock` é um stop que o remove
+        [ $mode = leavesession ] || rm -f "$S/running";;   # `leavesession`: o stop que NÃO derruba a sessão (o tmux ainda a lista)
 esac
 exit 0
 EOF
@@ -428,6 +431,31 @@ r=runs([U+"/m"],{}); assert sorted(h[0].rsplit("/",1)[1] for h in r["hits"])==["
 r=runs([U+"/m"],{U+"/m/manifest.json":[M.SECRET_KV]}); assert [h[0].rsplit("/",1)[1] for h in r["hits"]]==["outro.json"], r
 open(U+"/m/manifest.json","w").write("{\"x\": \"ghp_"+"d"*36+"\"}")
 r=runs([U+"/m"],{U+"/m/manifest.json":[M.SECRET_KV]}); assert "manifest.json" in [h[0].rsplit("/",1)[1] for h in r["hits"]], r'; ok $? "unit: SWEEP — acha segredo e arquivo proibido, lista o que não deu para ler (arquivo >3MB, socket, raiz que não é pasta, varredura vazia; pasta ausente não conta), não lê dentro de .git/objects, varre também a transcrição (glob), e só dispensa o padrão genérico \"token\": no manifest do bundle (um segredo de verdade nele ainda reprova)"; }
+  c sweepb64 && { mkdir -p "$T/u4/sp"
+    UD="$T/u4" py 'import subprocess,json,os,base64
+U=os.environ["UD"]
+def run(roots): return json.loads(subprocess.run(["python3","-I","-",json.dumps({"roots":roots,"globs":[],"secret_rx":M.SECRET_RX,"forbidden":M.FORBIDDEN})],input=M.SWEEP.encode(),capture_output=True).stdout.decode().strip().split("\n")[-1])
+b=lambda t: base64.b64encode(t).decode()
+SEC=b"token ghp_"+b"e"*36; f=U+"/sp/x.json"
+def put(d): open(f,"w").write(d if isinstance(d,str) else json.dumps(d))
+put({"id":"1","rc":0,"stdout_b64":b(b"tudo bem\n"),"stderr_b64":"","cmd":"rs1 "+base64.urlsafe_b64encode(b"{}").decode().rstrip("=")})
+r=run([U+"/sp"]); assert r["hits"]==[] and r["unverified"]==[] and r["scanned"]==1, r
+import re; assert not any(re.search(x,b(SEC)) for x in M.SECRET_RX), "o texto cru do base64 não casa com padrão nenhum: sem decodificar a varredura é cega"
+for campo in ("stdin_b64","stdout_b64","stderr_b64"):
+    d={"id":"1","rc":0,"stdin_b64":"","stdout_b64":"","stderr_b64":""}; d[campo]=b(SEC); put(d)
+    r=run([U+"/sp"]); assert [h[0] for h in r["hits"]]==[f+"#/"+campo] and r["unverified"]==[], (campo, r)
+payload=json.dumps({"tool":"bd","argv":["comment","ga-x","ghp_"+"e"*36],"env":{}},separators=(",",":")).encode()
+put({"v":1,"id":"1","cmd":"rs1 "+base64.urlsafe_b64encode(payload).decode().rstrip("="),"stdin_b64":""})
+r=run([U+"/sp"]); assert [h[0] for h in r["hits"]]==[f+"#/cmd"] and r["unverified"]==[], r
+put({"id":"1","rc":0,"stdout_b64":"@@@","stderr_b64":""}); r=run([U+"/sp"]); assert r["hits"]==[] and r["unverified"]==[f+"#/stdout_b64 (base64 que não decodifica)"], r
+put({"id":"1","rc":0,"stdout_b64":"abcde","stderr_b64":""}); r=run([U+"/sp"]); assert len(r["unverified"])==1, r
+put({"id":"1","rc":0,"stdout_b64":7,"stderr_b64":""}); r=run([U+"/sp"]); assert len(r["unverified"])==1, r
+put({"v":1,"id":"1","cmd":"rs1 !!!!","stdin_b64":""}); r=run([U+"/sp"]); assert r["unverified"]==[f+"#/cmd (base64 que não decodifica)"], r
+put("{\"id\":\"1\",\"stdout_b64\":\""+b(SEC)[:20]); r=run([U+"/sp"]); assert r["hits"]==[] and len(r["unverified"])==1 and "JSON não abre" in r["unverified"][0], r
+put("#!/usr/bin/env python3\nrequest = {\"stdin_b64\": 1}\n"); r=run([U+"/sp"]); assert r["hits"]==[] and r["unverified"]==[], r
+put([{"stdout_b64":b(SEC)}]); r=run([U+"/sp"]); assert [h[0] for h in r["hits"]]==[f+"#/0/stdout_b64"], r
+put({"stdout_b64":b(SEC)}); sk=json.dumps({"roots":[U+"/sp"],"globs":[],"secret_rx":M.SECRET_RX,"forbidden":M.FORBIDDEN,"skip":{f:[M.SECRET_RX[0]]}})
+r=json.loads(subprocess.run(["python3","-I","-",sk],input=M.SWEEP.encode(),capture_output=True).stdout.decode().strip().split("\n")[-1]); assert r["hits"]==[], r'; ok $? "unit: SWEEP — olha DENTRO do base64 do spool: segredo em stdin_b64/stdout_b64/stderr_b64 e no cmd (rs1 + base64 url-safe) é achado e dito em qual campo; campo que não decodifica, que não é texto, ou JSON cortado vira \"sem verificar\" (terceiro estado); arquivo que não é JSON não conta; o que não tem segredo continua limpo"; }
 }
 
 # ---------------------------------------------------------------- cli
@@ -557,11 +585,16 @@ g_e2e() {
   fail1 nonudgeanswer nonudgeanswer "FAIL (a) a sessão respondeu ao nudge" "nudge entregue mas a sessão não age → reprova no prazo (TMO)"
   fail1 nowatch nowatch "FAIL (b) o vigia rebaixou a árvore" "vigia que não rebaixa → (b) reprova"
   fail1 killcore killcore "FAIL (b) a sessão NÃO foi morta" "vigia que MATA o claude da sessão → (b) reprova nomeando os pids"
-  fail1 leavesocket leavesocket "FAIL (a) o stop deixa o MBP limpo" "stop que deixa o socket do tmux → reprova"
+  c leavesocket && { FAKE_MODE=ok ep; [ $RC = 0 ] && grep -F "PASS (a) o stop deixa o MBP limpo" "$T/out" | grep -qF "socket True"; ok $? "e2e: o stop deixa o ARQUIVO do socket (é o que o tmux de verdade faz: sem servidor, é inerte) → (a) passa, e o socket que a prova criou é removido na limpeza (rc=$RC)"; }
+  c cleansock && { FAKE_MODE=cleansock ep; [ $RC = 0 ] && grep -F "PASS (a) o stop deixa o MBP limpo" "$T/out" | grep -qF "socket False"; ok $? "e2e: o stop que também remove o socket → (a) passa do mesmo jeito (rc=$RC)"; }
+  fail1 leavesession leavesession "FAIL (a) o stop deixa o MBP limpo" "stop que não derruba a sessão (o tmux ainda a lista) → (a) reprova"
   fail1 leavefile leavefile "FAIL (a) o stop deixa o MBP limpo" "stop que deixa o arquivo do lançador em run/ → reprova"
   fail1 leaveproc leaveproc "FAIL (a) o stop deixa o MBP limpo" "stop que deixa processos da sessão → reprova"
   fail1 stopfail stopfail "FAIL (a) sessão parada pelo provider" "stop que falha → reprova"
   fail1 secret secret "FAIL (d) varredura (antes de apagar a pasta de teste)" "segredo no spool → a varredura reprova"
+  fail1 secretb64 secretb64 "FAIL (d) varredura (antes de apagar a pasta de teste)" "segredo dentro do stdout_b64 de uma resposta do spool (base64) → a varredura reprova"
+  fail1 secretcmd secretcmd "FAIL (d) varredura (antes de apagar a pasta de teste)" "segredo dentro do cmd (rs1 + base64 url-safe) de um pedido do spool → a varredura reprova"
+  fail1 badb64 badb64 "FAIL (d) varredura (antes de apagar a pasta de teste)" "campo base64 do spool que não decodifica → \"não sei\": a varredura reprova em vez de dar limpo"
   fail1 transcriptsecret transcriptsecret "FAIL (d) varredura (antes de apagar a pasta de teste)" "segredo na transcrição da sessão → a varredura reprova"
   fail1 leadfile leadfile "FAIL (d) varredura (antes de apagar a pasta de teste)" "arquivo de dado (leads.csv) no clone → a varredura reprova"
   fail1 bigfile bigfile "FAIL (d) varredura (antes de apagar a pasta de teste)" "arquivo de 3,1 MB no clone (grande demais para ler) → a varredura reprova em vez de passar sem olhar"
@@ -603,7 +636,9 @@ g_e2e() {
   c githead && { FAKE_GITFAIL="rev-parse HEAD" FAKE_MODE=ok ep; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "o MBP não preparou a pasta de teste"; ok $? "e2e: git rev-parse HEAD que falha → sem o commit de partida a prova não começa (rc=$RC)"; }
   c snapwalk && { e2e_fixture; find "$SRV/gt-remote/shim-bin" -delete; : > "$SRV/gt-remote/shim-bin"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "não consegui ler o estado do MBP"; ok $? "e2e: shim-bin que não dá para varrer (é um arquivo) → NÃO é \"pasta vazia\": não começa, saída 3 (rc=$RC)"; }
   c staleproof && { e2e_fixture; mkdir -p "$SRV/gt-remote/proof/velho"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sobrou algo em gt-remote/proof" && [ -d "$SRV/gt-remote/proof/velho" ]; ok $? "e2e: sobra de uma rodada anterior em gt-remote/proof → não começa e não apaga o que não é dela (rc=$RC)"; }
-  c stalesocket && { e2e_fixture; mkdir -p "$SRV/tmp/tmux-$(id -u)"; : > "$SRV/tmp/tmux-$(id -u)/gc-remote"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "sobrou um socket do tmux"; ok $? "e2e: socket do tmux sobrando sem servidor → não começa (a prova mede que o stop não deixa socket) (rc=$RC)"; }
+  c stalesocket && { e2e_fixture; mkdir -p "$SRV/tmp/tmux-$(id -u)"; : > "$SRV/tmp/tmux-$(id -u)/gc-remote"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; kill_leftovers
+    [ $RC = 0 ] && [ "$(calls start)" = 1 ] && [ -e "$SRV/tmp/tmux-$(id -u)/gc-remote" ] && has "$T/out" "PASS (c)(d) varredura depois"; ok $? "e2e: arquivo de socket do tmux que já estava lá, sem servidor, é inerte → a prova começa, passa, e NÃO apaga o socket que não é dela (rc=$RC)"; }
+  c livesocket && { e2e_fixture; mkdir -p "$SRV/tmp/tmux-$(id -u)"; : > "$SRV/tmp/tmux-$(id -u)/gc-remote"; touch "$FAKE_STATE/running"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "já há sessões no socket do provider"; ok $? "e2e: socket com sessão aberta de verdade → não começa (rc=$RC)"; }
   c foreignrun && { e2e_fixture; mkdir -p "$SRV/gt-remote/bundle/run"; echo x > "$SRV/gt-remote/bundle/run/outra.sh"; python3 -I "$P" e2e --repo-url "$URL" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && [ -f "$SRV/gt-remote/bundle/run/outra.sh" ]; ok $? "e2e: run/ com arquivo de outra sessão → não começa (e o verify do bundle também reprova) e o arquivo fica (rc=$RC)"; }
   c badrepo && { e2e_fixture; python3 -I "$P" e2e --repo-url "file:///nao/existe/aqui.git" > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 3 ] && [ "$(calls start)" = 0 ] && has "$T/out" "nenhuma URL do origin respondeu" && [ ! -e "$SRV/gt-remote/proof" ]; ok $? "e2e: o MBP não alcança o origin com a credencial que já tem → não começa, nada criado (rc=$RC)"; }
 }
@@ -666,9 +701,18 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   mutant e2e nowatch "o vigia que não rebaixa passa" 'ok, rows, why = judge_tree(rows0, last.get("rows") or [], t0["watcher"])' 'ok, rows, why = True, [], ""'
   mutant e2e killcore "sessão morta pelo vigia passa" 'and bool(core) and not gone,' 'and True,'
   mutant e2e nonudgeanswer "a resposta ao nudge não é conferida" '(rodou o comando pedido)", NMARK in seen)' '(rodou o comando pedido)", True)'
-  mutant e2e leavesocket "o socket sobrando não conta" ' and not s["tmux_socket"] and s["run_dir"]' ' and s["run_dir"]'
+  mutant e2e leavesession "o (a) não olha se a sessão ainda existe" 'clean = (tmux_state(s) == "livre" and ' 'clean = ('
+  mutant e2e ok,leavesocket "o (a) volta a exigir que o arquivo do socket suma" 'clean = (tmux_state(s) == "livre" and ' 'clean = (tmux_state(s) == "livre" and not s["tmux_socket"] and '
+  mutant e2e ok,leavesocket "a limpeza não remove o socket que a prova criou" 'if C["socket_new"] and os.path.exists(sock):' 'if False:'
+  mutant e2e livesocket "sessão aberta no socket do provider não impede a prova" '        if ts == "aberta":' '        if False:'
+  mutant e2e stalesocket "o antes/depois acusa o socket que já existia" '(post["tmux_socket"] and not pre["tmux_socket"])' 'post["tmux_socket"]'
   mutant e2e leavefile "o arquivo do lançador sobrando não conta" 'and s["run_dir"] in (None, []) and s["procs"] == [])' 'and s["procs"] == [])'
   mutant e2e leaveproc "processo sobrando não conta" ' and s["procs"] == [])' ')'
+  mutant unit sweepb64 "SWEEP não decodifica os campos *_b64" '            if key.endswith("_b64"):' '            if False:'
+  mutant unit sweepb64 "SWEEP não decodifica o cmd rs1" '            elif key == "cmd" and isinstance(v, str) and v.startswith("rs1 "):' '            elif False:'
+  mutant unit sweepb64 "SWEEP perde o que não decodificou" '            unv += badb' '            pass'
+  mutant unit sweepb64 "SWEEP dá limpo para o JSON que não abre" 'return got, ["%s (tem campo em base64 mas o JSON não abre)" % p]' 'return got, bad'
+  mutant unit sweepb64 "SWEEP procura base64 também em arquivo que não é JSON" 'if not data.lstrip().startswith(("{", "[")) or not any(m in data for m in B64_MARK):' 'if not any(m in data for m in B64_MARK):'
   mutant unit sweeppy "arquivo grande demais some da varredura" 'unv.append(p + " (>3MB)")' 'pass'
   mutant unit sweeppy "arquivo que não abre some da varredura" '                unv.append(p)' '                pass'
   mutant unit sweeppy "erro ao descer na pasta some da varredura" 'e.errno == errno.ENOENT or unv.append(e.filename)' 'True'

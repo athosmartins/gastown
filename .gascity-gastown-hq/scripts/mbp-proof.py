@@ -16,8 +16,9 @@ SUBCOMANDOS
   e2e [--bead ID] [--model M] [--timeout S] [--keep] [--delete-branch]   a prova (a–e) com o MBP livre; ver abaixo.
 
 O QUE A PROVA CONFERE (os critérios do ga-w7qwl1.1; cada linha vira PASS/FAIL no log, nunca "passou" por omissão)
-  (a) a sessão `remote-test-remote-mbp-1` abre pelo provider, responde ao peek (ver tela) e ao nudge, e o stop deixa o MBP limpo (sessão, socket do tmux,
-      arquivos do lançador, processos; depois a pasta de teste e a marca de confiança no ~/.claude.json são removidas e conferidas)
+  (a) a sessão `remote-test-remote-mbp-1` abre pelo provider, responde ao peek (ver tela) e ao nudge, e o stop deixa o MBP limpo (nenhuma sessão e
+      nenhum servidor do tmux respondendo, arquivos do lançador, processos; o ARQUIVO do socket que o tmux deixa quando a última sessão morre é inerte e não conta: o que a
+      prova criou é removido no fim e o que já existia fica; depois a pasta de teste e a marca de confiança no ~/.claude.json são removidas e conferidas)
   (b) com a PAUSA do Athos ligada (o mesmo arquivo ~/gt-remote/PAUSE, com a marca desta rodada) o vigia — biblioteca de presença de verdade — rebaixa a árvore da
       sessão: nice/pri de CADA processo antes e depois, sem matar ninguém; a pausa desta rodada é desligada no fim e o rebaixamento não volta
   (c) de dentro da sessão: o passo 1 do prompt MEDE o que a ferramenta Bash resolve (`command -v` e `type -a` de bd, gc, gate-done e dolt, mais o PATH) e a saída é lida na
@@ -26,7 +27,8 @@ O QUE A PROVA CONFERE (os critérios do ga-w7qwl1.1; cada linha vira PASS/FAIL n
       chegam ao mini pelo atalho com lista de permissões (cliente → spool → puxador do mini → wrapper); os hooks gc do city disparam; o MBP não ganha credencial de
       bd/Dolt nem chave (varredura antes/depois). A sessão abre com o zdot LIMPO do bundle (ZDOTDIR + PATH explícito, ga-w7qwl1.1.5): o bd/dolt do usuário não entra.
   (d) um branch de teste comitado no MBP chega ao origin DIRETO do MBP (credencial que o MBP já tem; nenhuma nova) e aparece no mini; varredura: nenhum dado de lead
-      (o clone é raso, sem blobs e sem checkout fora de mbp-proof/) nem segredo novo no MBP depois
+      (o clone é raso, sem blobs e sem checkout fora de mbp-proof/) nem segredo novo no MBP depois; a varredura olha também DENTRO do base64 do
+      spool (stdin_b64/stdout_b64/stderr_b64 e o cmd `rs1 <base64>`), e o que não decodifica é "sem verificar", que reprova
   (e) o bundle está instalado e CONFERIDO no MBP (verify lá) e a sessão roda `claude` com o --settings do bundle até o prompt de partida
 
 O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
@@ -517,11 +519,49 @@ print(json.dumps(res))
 '''
 
 SWEEP = r'''
-import errno, glob, json, os, re, sys
+import base64, errno, glob, json, os, re, sys
 C = json.loads(sys.argv[1])
 rx = [re.compile(x) for x in C["secret_rx"]]
 fb = [re.compile(x) for x in C["forbidden"]]
 hits, forb, unv, scanned = [], [], [], 0  # unv: o que NÃO deu para ler — "não sei" nunca vira "limpo"
+B64_MARK = ('_b64"', '"rs1 ')
+
+
+def b64_texts(p, data):
+    """O spool leva o conteúdo em base64 (stdin_b64, stdout_b64, stderr_b64) e o `cmd` como `rs1 <base64 url-safe>`: um segredo ali dentro não casa com padrão nenhum do
+    texto cru. Devolve ([(campo, texto decodificado)], [o que não deu para decodificar]): campo que não decodifica é "não sei", nunca "limpo"."""
+    got, bad = [], []
+    if not data.lstrip().startswith(("{", "[")) or not any(m in data for m in B64_MARK):
+        return got, bad
+    try:
+        doc = json.loads(data)
+    except (ValueError, RecursionError):
+        return got, ["%s (tem campo em base64 mas o JSON não abre)" % p]
+    todo = [("", doc)]
+    while todo:
+        path, v = todo.pop()
+        if isinstance(v, dict):
+            todo += [(path + "/" + str(k), x) for k, x in v.items()]
+        elif isinstance(v, list):
+            todo += [(path + "/" + str(i), x) for i, x in enumerate(v)]
+        else:
+            key = path.rsplit("/", 1)[-1]
+            if key.endswith("_b64"):
+                kind = "std"
+            elif key == "cmd" and isinstance(v, str) and v.startswith("rs1 "):
+                kind = "url"
+            else:
+                continue
+            try:
+                if not isinstance(v, str):
+                    raise ValueError("não é texto")
+                b = v if kind == "std" else v[4:].translate(str.maketrans("-_", "+/"))
+                got.append((path, base64.b64decode(b + "=" * (-len(b) % 4), validate=True).decode("utf-8", "replace")))
+            except ValueError:
+                bad.append("%s#%s (base64 que não decodifica)" % (p, path))
+    return got, bad
+
+
 roots = list(C["roots"])
 for g in C.get("globs", []):
     roots += sorted(glob.glob(g))  # a transcrição que o claude gravou no ~/.claude/projects do MBP para esta rodada
@@ -548,9 +588,13 @@ for root in roots:
                 unv.append(p)
                 continue
             scanned += 1
+            texts, badb = b64_texts(p, data)
+            unv += badb
             for x in rx:
-                if x.pattern not in C.get("skip", {}).get(p, []) and x.search(data):
-                    hits.append([p, x.pattern[:40]])
+                if x.pattern not in C.get("skip", {}).get(p, []):
+                    if x.search(data):
+                        hits.append([p, x.pattern[:40]])
+                    hits += [[p + "#" + f, x.pattern[:40]] for f, t in texts if x.search(t)]
 if not scanned:
     unv.append("nenhum arquivo lido")  # varredura vazia não prova nada
 print(json.dumps({"hits": hits, "forbidden": forb, "scanned": scanned, "unverified": unv}))
@@ -706,8 +750,6 @@ class Proof:
             bad.append("já há sessões no socket do provider: " + s["tmux"]["out"].replace("\n", ","))
         elif ts == "nao-sei":
             bad.append(f"não consegui saber se há sessão aberta no socket do provider (socket {s['tmux_socket']}): {s.get('tmux')}")
-        elif s["tmux_socket"] and s["tmux"]["rc"] != 0:
-            bad.append("sobrou um socket do tmux do provider sem servidor (limpe à mão antes: a prova mede que o stop não deixa socket)")
         if s["pause"]:
             bad.append("já existe uma pausa em gt-remote/PAUSE (o gate deveria ter recusado)")
         if s["proofs"]:
@@ -936,8 +978,9 @@ class Proof:
             if "_erro" in s:
                 self.check("(a) li o estado do MBP depois do stop", False, s["_erro"])
             else:
-                clean = (tmux_state(s) == "livre" and not s["tmux_socket"] and s["run_dir"] in (None, []) and s["procs"] == [])
-                self.check("(a) o stop deixa o MBP limpo: nenhuma sessão, sem socket do tmux, sem arquivo do lançador em run/, nenhum processo da sessão nem o vigia", clean,
+                # o tmux deixa o ARQUIVO do socket quando a última sessão morre e o servidor sai (medido, 3.7c): sem servidor respondendo ele é inerte e uma sessão nova sobe por cima
+                clean = (tmux_state(s) == "livre" and s["run_dir"] in (None, []) and s["procs"] == [])
+                self.check("(a) o stop deixa o MBP limpo: nenhuma sessão e nenhum servidor do tmux respondendo, sem arquivo do lançador em run/, nenhum processo da sessão nem o vigia", clean,
                            f"tmux {s['tmux']} · socket {s['tmux_socket']} · run {s['run_dir']} · processos {s['procs']}")
                 sw = self.rpy(SWEEP, {"roots": [self.wd, SPOOL, SHIMBIN, BUNDLE], "globs": [f"{MHOME}/.claude/projects/*{self.run}*"], "secret_rx": SECRET_RX, "forbidden": FORBIDDEN,
                                     "skip": {f"{BUNDLE}/manifest.json": [SECRET_KV]}})
@@ -969,7 +1012,7 @@ class Proof:
             d.append(f"sobra no spool {post['spool']}")
         if post["bins"] != pre["bins"]:
             d.append("ferramentas no PATH mudaram")
-        if post["proofs"] not in (None, []) or post["claude_json"]["trusted"] or not post["claude_json"]["ok"] or post["pause"] or post["tmux_socket"] or post["run_dir"] not in (None, pre["run_dir"]):
+        if post["proofs"] not in (None, []) or post["claude_json"]["trusted"] or not post["claude_json"]["ok"] or post["pause"] or (post["tmux_socket"] and not pre["tmux_socket"]) or post["run_dir"] not in (None, pre["run_dir"]):
             d.append(f"sobras: proof {post['proofs']} confiança {post['claude_json']['trusted']} pausa {post['pause']} socket {post['tmux_socket']} run {post['run_dir']}")
         top_new = sorted(set(post["gt_top"]) - set(pre["gt_top"]))
         if top_new:
