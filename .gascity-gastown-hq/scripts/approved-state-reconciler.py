@@ -1021,6 +1021,59 @@ def _tail(path, n):
         return []
 
 
+# ga-iis05u: how many lines BEFORE the LOG_TAIL window the cap-evidence reader may reach back to
+# find the start line of the sweep the window begins inside. A sweep logs a line per candidate
+# it walks (a P0/P1 the pool probe refused once made the Pilot cede 157 P2+ beads to it for ~9h,
+# a cession line each per sweep: ga-qmfm8r), so a sweep can outgrow LOG_TAIL; past this bound the
+# reading is declared cut instead of growing without limit.
+_CAP_WINDOW_GROW_MAX = 60000
+
+
+def _tail_whole_sweep(path, n):
+    """(lines, cut): the last `n` lines of the Pilot log, GROWN backwards to the
+    "=== Pilot sweep start" line of the sweep the window begins inside (ga-iis05u).
+
+    Why: _pilot_cap_evidence reads the log as "start ... cap lines ... complete" blocks, and the
+    Pilot logs a bead's cession line in WALK order, so the bead at the FRONT of the queue owns
+    the first line of its sweep: the first one a plain readlines()[-n:] drops when the sweep is
+    longer than the window. The complete line still arrives, the verdict reads "walked every
+    candidate", and the bead whose line was cut reads as positively "not held at the cap": a
+    starving alarm for a P2 the Pilot ceded on purpose. That is the shape of the 5 mails about
+    wa-vp3yqi (P2, 525 min); that THIS window cut is what happened on 16/10 is not measured (it
+    needs the live pilot-dispatcher.log), only reproduced in --selftest. "Its line is out of
+    view" is not "it was not there".
+
+    cut is True iff the reading STILL begins inside a sweep whose start it does not hold (no start
+    line within _CAP_WINDOW_GROW_MAX lines back, or the log was rotated mid-sweep): the caller must
+    not take that first completed sweep as proof of a full walk. A reading of the whole file, or one
+    that begins at a start line, is never cut. Unreadable file -> ([], False): no lines is already
+    the caller's "cannot tell".
+    """
+    # vazio → ([], False); falhou/ilegível → ([], False): both reach the caller as "no lines" = cannot tell
+    try:
+        with open(path, errors="replace") as f:
+            everything = f.readlines()
+    except Exception:
+        return [], False
+    first = len(everything) - n if len(everything) > n else 0
+    if first == 0:
+        return everything, False          # the window IS the file: nothing was cut off
+    for line in everything[first:]:
+        if _PILOT_SWEEP_START_RE.search(line):
+            return everything[first:], False    # begins at a sweep boundary
+        if _PILOT_SWEEP_RE.search(line):
+            break                               # a COMPLETE before any START: begins inside a sweep
+    else:
+        return everything[first:], False        # no sweep marker at all: no completed sweep to judge
+    stop = first - _CAP_WINDOW_GROW_MAX if first > _CAP_WINDOW_GROW_MAX else 0
+    i = first - 1
+    while i >= stop:
+        if _PILOT_SWEEP_START_RE.search(everything[i]):
+            return everything[i:], False
+        i -= 1
+    return everything[first:], True
+
+
 def _is_pilot_alive(now):
     """True iff the Pilot logged a sweep-complete within PILOT_ALIVE_WINDOW_MIN.
 
@@ -1817,13 +1870,16 @@ def _pilot_cap_evidence(now):
     fresh forever) — and for a sweep-complete line that is undatable or future-dated,
     which can never be the proof of a full walk.
     """
+    # vazio → None (cannot tell); falhou/ilegível → ([], False) → None too, never "nothing capped";
+    # a window that still begins inside a sweep (head_cut) → that first sweep cannot prove a full walk
     if _read_pilot_log_lines is not None:
-        lines = _read_pilot_log_lines()   # test seam (shared with _is_pilot_alive)
+        lines, head_cut = _read_pilot_log_lines(), False   # test seam (shared with _is_pilot_alive)
     else:
-        lines = _tail(PILOT_LOG, LOG_TAIL)
+        lines, head_cut = _tail_whole_sweep(PILOT_LOG, LOG_TAIL)
     if not lines:
         return None
 
+    saw_start = False     # a sweep start line has been seen in the reading
     kept = {}        # evidence carried by COMPLETED evaluating sweeps
     running = {}     # cap lines logged since the last completed sweep (one still running)
     running_cut = False   # a lane loop logged "stopping ... loop", or the dispatch phase was
@@ -1842,6 +1898,7 @@ def _pilot_cap_evidence(now):
 
     for line in lines:
         if _PILOT_SWEEP_START_RE.search(line):
+            saw_start = True
             # Whatever is still in `running` belongs to a sweep that never completed (a
             # normal sweep's complete line has already emptied it). It walked an unknown
             # part of its pool: fold it in as a NON-exhaustive block — its cap lines stay
@@ -1858,6 +1915,15 @@ def _pilot_cap_evidence(now):
                 _PILOT_SWEEP_WALK_RE.search(line), running_cut,
                 t is not None and (t - now) <= _CAP_EVIDENCE_FUTURE_SKEW_SEC,
                 running_cut_why)
+            if walked and head_cut and not saw_start:
+                # ga-iis05u: the reading begins INSIDE this sweep and its start line is out of
+                # reach, so the candidates it walked first (the front of the queue) are not in
+                # view: it cannot prove "walked every candidate". Non-exhaustive = it adds, never erases.
+                walked, why = False, (
+                    "the Pilot log window (the last %d lines) begins inside the Pilot's newest "
+                    "completed sweep and its start line is out of reach — the candidates that "
+                    "sweep walked first are not in view" % LOG_TAIL)
+            saw_start = True    # only the FIRST completed sweep of a cut reading lost its head
             if walked:
                 kept = running          # a FULL WALK supersedes whatever older sweeps said
             else:
@@ -8264,6 +8330,79 @@ def _selftest():
         _ok("(ga-9ekn2l-w): 7 non-walk classes + running-only + stale-walk keep evidence "
             "and read UNMEASURED; the control full walk supersedes and reads measured, "
             "also right after a cut-short or an aborted sweep")
+
+    # ── ga-iis05u: a sweep LONGER than the LOG_TAIL window ──
+    print("\nScenario (ga-iis05u): the REAL wa-vp3yqi cession line (a P2 ceded to a P1 behind "
+          "wa-worker 2/2) is the FIRST line of a sweep that outgrows the LOG_TAIL window. The "
+          "reader grows the window back to the sweep's start line, so the Pilot's own statement "
+          "of why the bead waits is still seen (capacity wait, no starving alarm); when the start "
+          "is out of reach the sweep reads UNMEASURED, never 'walked every candidate'")
+    import tempfile as _tf_i5
+
+    def _i5_line(t, text):
+        return (time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(t))
+                + " [pilot-dispatcher] " + text + "\n")
+
+    def _i5_log(n_filler):
+        out = [_i5_line(NOW - 600, "=== Pilot sweep start (DRY_RUN=0) ==="),
+               _i5_line(NOW - 599, "ga-5fn5p3: wa-vp3yqi P2 cedida a P0/P1 de whatsapp_automation "
+                                   "(P1 wa-hut4l5.4 waits behind wa-worker 2/2) — not claimed, no "
+                                   "writes this sweep; stays story:approved and is re-evaluated "
+                                   "every sweep.")]
+        out += [_i5_line(NOW - 598, "  [small] wa-fill%04d P2 — some candidate title" % k)
+                for k in range(n_filler)]
+        out.append(_i5_line(NOW - 30, "=== Pilot sweep complete: dispatched=0 (small_slots=3 "
+                                      "big_slots=1 dolt_saturated_at_start=0) ==="))
+        return out
+
+    _i5_saved = (globals()["PILOT_LOG"], globals()["LOG_TAIL"],
+                 globals()["_CAP_WINDOW_GROW_MAX"], _read_pilot_log_lines)
+    _i5_problems = []
+    try:
+        _read_pilot_log_lines = None     # the REAL window (_tail_whole_sweep), not the seam
+        globals()["LOG_TAIL"] = 40
+        with _tf_i5.TemporaryDirectory() as _i5_dir:
+            globals()["PILOT_LOG"] = os.path.join(_i5_dir, "pilot-dispatcher.log")
+
+            def _i5_read(lines, grow_max=_i5_saved[2]):
+                with open(globals()["PILOT_LOG"], "w") as _f:
+                    _f.writelines(lines)
+                globals()["_CAP_WINDOW_GROW_MAX"] = grow_max
+                return _pilot_cap_evidence(NOW)
+
+            _i5_ctl = _i5_read(_i5_log(10))                 # 14 lines: the sweep fits the window
+            if not (_i5_ctl is not None and _i5_ctl.walked_all
+                    and (_i5_ctl.get("wa-vp3yqi") or {}).get("ceded_to") == "wa-hut4l5.4"):
+                _i5_problems.append("control (sweep fits the window): got %r walked_all=%r" % (
+                    _i5_ctl, getattr(_i5_ctl, "walked_all", None)))
+            _i5_big = _i5_read(_i5_log(100))                # 104 lines > the 40-line window
+            if not (_i5_big is not None and _i5_big.walked_all
+                    and (_i5_big.get("wa-vp3yqi") or {}).get("ceded_to") == "wa-hut4l5.4"):
+                _i5_problems.append("sweep longer than the window: want the front bead's "
+                                    "cession seen and walked_all, got keys=%r walked_all=%r" % (
+                                    list(_i5_big or {}), getattr(_i5_big, "walked_all", None)))
+            _i5_far = _i5_read(_i5_log(100), grow_max=20)   # start line 100+ lines back: out of reach
+            if not (_i5_far is not None and "wa-vp3yqi" not in _i5_far and not _i5_far.walked_all
+                    and "begins inside" in _i5_far.why):
+                _i5_problems.append("start out of reach: want UNMEASURED naming the window, got "
+                                    "keys=%r walked_all=%r why=%r" % (
+                                    list(_i5_far or {}), getattr(_i5_far, "walked_all", None),
+                                    getattr(_i5_far, "why", None)))
+            _i5_all = _i5_log(100)
+            _i5_rot = _i5_read(_i5_all[1:2] + _i5_all[-1:])  # 2 lines: starts mid-sweep, shorter than the window
+            if not (_i5_rot is not None and _i5_rot.walked_all):
+                _i5_problems.append("short rotated log (nothing cut by the window) must keep "
+                                    "reading as before: got %r walked_all=%r" % (
+                                    _i5_rot, getattr(_i5_rot, "walked_all", None)))
+    finally:
+        globals()["PILOT_LOG"], globals()["LOG_TAIL"], globals()["_CAP_WINDOW_GROW_MAX"] = (
+            _i5_saved[0], _i5_saved[1], _i5_saved[2])
+        _read_pilot_log_lines = _i5_saved[3]
+    if _i5_problems:
+        _bad("(ga-iis05u)", "; ".join(_i5_problems))
+    else:
+        _ok("(ga-iis05u): control + a sweep longer than the window keep the front bead's "
+            "cession line; start out of reach reads UNMEASURED; a short rotated log is unchanged")
 
     # ── ga-i2uwym: a sweep whose dispatch phase was HALTED / DEFERRED did not walk everyone ──
     print("\nScenario (ga-i2uwym-a): the REAL 2026-10-06 07:11 sweep, verbatim — its dispatch "
