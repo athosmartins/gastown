@@ -56,6 +56,14 @@ MUTANTS = [
     # ga-6auslu: o nó NÃO grava rótulo de veredito (forjaria PASS: o bd não confere dono no `label add`). Uma regra `bd label` — o alargamento óbvio — tem que reprovar o 1º caso por chave.
     ("rotulo-do-veredito-passa", "w", '    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}),\n',
      '    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}),\n    Rule("bd", ["label"], [("word", 1, 1), ("id", 1, 1), ("word", 1, 1)], {}),\n', r"rótulo do veredito: bd label remove"),
+    # ga-2hd02v.1.18: `gate-done <bead> <ref> <sha>`: a regra, o formato do sha e do ref (o executável confere o resto) e a recusa que diz a forma
+    ("gate-done-3-args-sem-regra", "w", '    Rule("gate-done", [], [("id", 1, 1), ("ref", 1, 1), ("sha", 1, 1)], hint="gate-done <bead> <ref> <sha>, ou gate-done sem argumento"),\n', "", r"gate-done <bead> <ref> <sha>"),
+    ("gate-done-sha-prefixo", "w", '"sha": _fm(r"[0-9a-f]{40}")', '"sha": _fm(r"[0-9a-f]{4,40}")', r"gate-done com sha curto"),
+    ("gate-done-sha-maiusculo", "w", '"sha": _fm(r"[0-9a-f]{40}")', '"sha": _fm(r"[0-9a-fA-F]{40}")', r"gate-done com sha em maiúsculas"),
+    ("gate-done-ref-dotdot", "w", 'and ".." not in s and "//" not in s', 'and "//" not in s', r"gate-done com ref que o git recusaria"),
+    ("gate-done-ref-lock", "w", 'not s.endswith(("/", ".", ".lock"))', 'not s.endswith(("/", "."))', r"gate-done com ref terminando em \.lock"),
+    ("gate-done-ref-dois-pontos", "w", 're.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", s)', 're.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", s)', r"gate-done com ref com ':'"),
+    ("gate-done-sem-a-forma-na-recusa", "w", 'hint="gate-done <bead> <ref> <sha>, ou gate-done sem argumento"', 'hint=""', r"gate-done com 1 argumento"),
     ("identidade-sessao-solta", "w", '("GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME", "GC_TEMPLATE")', '("GC_ALIAS", "GC_AGENT")', r"GC_SESSION_NAME do Mayor"),
     ("session-id-atravessa", "w", '"GC_SESSION_NAME": _IDENT, "GC_TEMPLATE": _IDENT,', '"GC_SESSION_NAME": _IDENT, "GC_SESSION_ID": _IDENT, "GC_TEMPLATE": _IDENT,', r"GC_SESSION_ID não atravessa"),
     ("nudge-alvo-livre", "w", 'if r.words == ("session", "nudge") and not (cfg["nudge_re"] and cfg["nudge_re"].fullmatch(pos[0])):', "if False:", r"alvo fora do nudge_pattern"),
