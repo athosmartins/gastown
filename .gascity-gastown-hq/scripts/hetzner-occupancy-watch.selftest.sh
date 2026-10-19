@@ -9,7 +9,8 @@
 # CONTROLE NEGATIVO: cada mutante (um trecho literal do script trocado, que tem de existir UMA vez) TEM de reprovar o grupo que o pega; mutante que passa = teste que não pega o bug. Só roda sem argumento e com o script de verdade.
 #   Cada mutante roda em segundo plano com o PRÓPRIO diretório temporário e para no 1º caso que reprova (o resto do grupo não diz nada de novo): sem isso eram ~80 grupos inteiros em série, mais de 10 min.
 # COMO RODAR: hetzner-occupancy-watch.selftest.sh [grupo ...]   (sem argumento: todos os grupos e o controle negativo). HETZNER_OCC_UNDER_TEST=<script> roda a suíte contra outra cópia.
-#   HOCC_JOBS=N mutantes ao mesmo tempo (padrão 4; 1 = em série) · HOCC_NO_MUTANTS=1 pula o controle negativo (183 dos 237 casos, ~20 s no Linux). Tudo: ~80 s no Linux; no mini, sob carga, ~7 min (medido pelo gate em 19/10).
+#   HOCC_JOBS=N mutantes ao mesmo tempo (padrão 4; 1 = em série) · HOCC_NO_MUTANTS=1 pula o controle negativo (183 dos 238 casos, ~20 s no Linux) · HOCC_SLOW_START=N faz o python do vigia levar N s para subir, como o mini sob carga (com HOCC_NO_MUTANTS=1).
+#   Tudo: ~80 s no Linux (carga ~12; ~115 s a carga ~20); no mini, sob carga, ~7 min (medido pelo gate em 19/10). RELÓGIO: nenhum caso mede o tempo de parede do vigia (no mini sob carga só subir o python leva segundos): a ordem das duas instâncias é por EVENTO (await) e o único prazo, o do run_cmd, é medido dentro do python.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCH="${HETZNER_OCC_UNDER_TEST:-$HERE/hetzner-occupancy-watch.py}"
@@ -45,13 +46,14 @@ last_line() { tail -n 1 "$1" > "$T/last.json" 2>/dev/null; }
 # ---- stubs ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 cat > "$T/bin/gc" <<'EOF'
 #!/usr/bin/env bash
-# gc de mentira: `session list --json` devolve $STUB_GC_FILE (ou falha com $STUB_GC_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar); o resto (`mail send` inclusive: esta fatia não manda mail) é PROIBIDO (rc 99, marcado)
+# gc de mentira: `session list --json` devolve $STUB_GC_FILE (ou falha com $STUB_GC_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar; com $STUB_GC_HOLD fica PRESO, avisando em hold.in, até o teste criar hold.go); o resto (`mail send` inclusive: esta fatia não manda mail) é PROIBIDO (rc 99, marcado)
 echo "gc $*" >> "$STUB_DIR/gc.calls"
 args=("$@")
 if [ "${args[0]:-}" = "--city" ]; then args=("${args[@]:2}"); fi
 case "${args[0]:-} ${args[1]:-}" in
   "session list")
     [ -n "${STUB_GC_SLEEP:-}" ] && sleep "$STUB_GC_SLEEP"
+    [ -n "${STUB_GC_HOLD:-}" ] && { echo in > "$STUB_DIR/hold.in"; i=0; while [ ! -e "$STUB_DIR/hold.go" ] && [ "$i" -lt 900 ]; do sleep 0.1; i=$((i+1)); done; }   # o teto (~90 s) só impede um teste morto de deixar isto vivo
     if [ "${STUB_GC_RC:-0}" != 0 ]; then echo "gc: erro injetado" >&2; [ -n "${STUB_OUTFAIL:-}" ] && [ -n "${STUB_GC_FILE:-}" ] && cat "$STUB_GC_FILE"; exit "$STUB_GC_RC"; fi
     [ -n "${STUB_GC_FILE:-}" ] && cat "$STUB_GC_FILE"
     exit 0 ;;
@@ -72,7 +74,9 @@ for b in bd dolt; do   # o vigia NUNCA deve chamar bd nem dolt (só gc session l
 done
 # python3 de mentira (só o W() o vê: o PATH dele começa em $T/bin). O python do sistema do macOS (CLT 3.9) grava o bytecode em $HOME/Library/Caches/com.apple.python se o ambiente não manda parar; o do Linux não grava em HOME nenhum.
 # Foi por isso que a suíte passava no Linux e reprovava no mini (gate ga-ztz9yn, "e nada no HOME"): este reproduz o padrão do macOS em qualquer sistema, e o controle no fim do grupo saida prova que ele suja o HOME.
-printf '#!/usr/bin/env bash\n: "${PYTHONPYCACHEPREFIX=$HOME/Library/Caches/com.apple.python}"; export PYTHONPYCACHEPREFIX\nexec %q "$@"\n' "$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin sh -c 'command -v python3')" > "$T/bin/python3"
+# HOCC_SLOW_START=N: o wrapper dorme N s antes de subir o python, como o mini sob carga (load ~50 em 10 núcleos): prova que nenhum caso depende de o vigia subir rápido. Com os mutantes demora; use HOCC_NO_MUTANTS=1 ou um grupo.
+SLOW="${HOCC_SLOW_START:-0}"; case "$SLOW" in ''|*[!0-9]*) echo "HOCC_SLOW_START inválido: '$SLOW' (segundos inteiros)" >&2; exit 2 ;; esac
+printf '#!/usr/bin/env bash\n%s: "${PYTHONPYCACHEPREFIX=$HOME/Library/Caches/com.apple.python}"; export PYTHONPYCACHEPREFIX\nexec %q "$@"\n' "$([ "$SLOW" = 0 ] || echo "sleep $SLOW; ")" "$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin sh -c 'command -v python3')" > "$T/bin/python3"
 chmod +x "$T/bin/"*
 
 # ---- ambiente do cenário -------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -125,6 +129,7 @@ tick() {   # tick <segundos> <centinúcleos> : avança o relógio, "gasta" CPU n
 }
 reading() { jv "$WOUT" "$1"; }          # campo da leitura que o --print acabou de imprimir
 state_f() { jv "$C/.gc/hetzner-occupancy.state.json" "$1"; }
+await() { local i=0; while [ ! -s "$1" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i+1)); done; [ -s "$1" ]; }   # espera o arquivo ter conteúdo: rc 0 no 1º instante em que o evento acontece; ~30 s é só a paciência do teste (chegar lá já é a falha), não um prazo que o vigia tenha de cumprir
 
 # ============================================================================================================================================================================
 g_cfg() {
@@ -229,10 +234,15 @@ g_sess() {
   fresh; tick 900 5 >/dev/null; sessions_are "$SJ_REMOTE"; STUB_GC_RC=1; STUB_OUTFAIL=1; tick 900 5
   eq "gc sai com erro MAS já imprimiu o JSON completo: NÃO lida (o rc sozinho recusa)" false "$(reading sessoes.lido)"; eq "... motivo" gc-falhou "$(reading sessoes.motivo)"
   fresh; tick 900 5 >/dev/null; STUB_GC_SLEEP=6
-  SECONDS=0; NOW=$((NOW + 900)); W HETZNER_OCC_GC_TIMEOUT_S=1 -- --print; local gtook=$SECONDS
+  NOW=$((NOW + 900)); W HETZNER_OCC_GC_TIMEOUT_S=1 -- --print
   eq "gc que trava: NÃO lida" false "$(reading sessoes.lido)"; eq "... motivo" gc-timeout "$(reading sessoes.motivo)"
-  check "... e o vigia não espera o gc inteiro (voltou em ${gtook}s, < 5)" "$([ "$gtook" -lt 5 ] && echo 1 || echo 0)"
   STUB_GC_SLEEP=""
+  # run_cmd mata o GRUPO inteiro e volta logo, sem esperar o neto que segura o pipe. Era o "voltou em < 5 s" dos casos de gc e ssh que travam, que contava também a subida do python (no mini sob carga ela sozinha passa de 4 s); aqui o relógio fica DENTRO do python, só ao redor da chamada: com o killpg ~1 s, sem ele 1 s + os 5 do communicate = 6 s, corte em 4 s.
+  eq "run_cmd: o timeout mata o grupo e volta logo (sem o killpg leva 6 s)" ok "$(python3 -I -c 'import importlib.util as u, sys, time
+sys.dont_write_bytecode = True
+s = u.spec_from_file_location("occ", sys.argv[1]); m = u.module_from_spec(s); s.loader.exec_module(m)
+t = time.monotonic(); r = m.run_cmd(["bash", "-c", "sleep 8 & wait"], 1); d = time.monotonic() - t
+print("ok" if r[3] == "timeout" and d < 4 else "FALHOU: %r em %.1f s" % (r, d))' "$WATCH" 2>&1 | tail -n 1)"
   # o vocabulário de estados (= bead_state.LIVE/DEAD_SESSION_STATES), 1 sessão em cada: só active e awake contam, e nenhum estado dormente vira "ilegível"
   fresh; tick 900 5 >/dev/null; sessions_are '{"sessions":[{"session_name":"dog-remote-a","state":"active"},{"session_name":"dog-remote-b","state":"awake"},{"session_name":"dog-remote-c","state":"asleep"},{"session_name":"dog-remote-d","state":"drained"},{"session_name":"dog-remote-e","state":"closed"},{"session_name":"dog-remote-f","state":"archived"},{"session_name":"dog-remote-g","state":"quarantined"},{"session_name":"dog-remote-h","state":"failed-create"}]}'; tick 900 5
   eq "os 8 estados do vocabulário: só active e awake contam" 2 "$(reading sessoes.ativas)"; eq "... e nenhum estado dormente vira ilegível" null "$(reading sessoes.ilegiveis)"
@@ -319,9 +329,8 @@ g_cpu() {
 
   echo "--- cpu: ssh trava / forma da chamada"
   fresh; tick 900 5 >/dev/null; STUB_SSH_SLEEP=6
-  SECONDS=0; NOW=$((NOW + 900)); W HETZNER_OCC_SSH_TIMEOUT_S=1 -- --print; local took=$SECONDS
+  NOW=$((NOW + 900)); W HETZNER_OCC_SSH_TIMEOUT_S=1 -- --print
   eq "ssh que trava: NÃO lida" false "$(reading cpu.lido)"; eq "... motivo" ssh-timeout "$(reading cpu.motivo)"
-  check "... e o vigia não espera o ssh inteiro (voltou em ${took}s, < 5)" "$([ "$took" -lt 5 ] && echo 1 || echo 0)"
   STUB_SSH_SLEEP=""
   fresh; tick 900 5 >/dev/null
   local call; call=$(tail -n 1 "$T/stub/ssh.calls")
@@ -394,12 +403,16 @@ g_saida() {
   echo "--- saida: instância única"
   fresh; tick 900 5 >/dev/null
   NOW=$((NOW + 900)); statfile "$T/stat.txt" "$((CB + 1000))" "$((CI + 1000))" 16; STUB_SSH_FILE="$T/stat.txt"
-  ( STUB_GC_SLEEP=3 WOUT="$T/out1.json" WERR="$T/err1" W -- --print ) &
-  local bg=$!; sleep 1
-  SECONDS=0; WOUT="$T/out2.json" WERR="$T/err2" W -- --print; local took2=$SECONDS
-  eq "2ª instância com a 1ª rodando: sai 0" 0 "$RC"; check "... na hora (${took2}s), sem esperar a 1ª" "$([ "$took2" -lt 2 ] && echo 1 || echo 0)"
+  # Por evento, sem relógio (o "sleep 1" e o "a 2ª volta em < 2 s" de antes reprovaram um vigia certo no mini sob carga, 19/10): a 1ª instância fica PRESA dentro do gc (já com o lock) até o teste soltá-la, e a 2ª só sobe depois que a 1ª avisou que está lá. Prova-se a ORDEM: a 2ª sai com a 1ª ainda presa.
+  ( WOUT="$T/out1.json" WERR="$T/err1" W STUB_GC_HOLD=1 -- --print ) &
+  local bg=$!; await "$T/stub/hold.in"; local in1=$?
+  ( WOUT="$T/out2.json" WERR="$T/err2" W -- --print; echo "$RC" > "$T/stub/rc2" ) &   # rc2 e hold.* ficam em $T/stub, que o fresh() esvazia: um rc2 de uma rodada anterior faria o await passar sem a 2ª ter saído
+  local bg2=$!; await "$T/stub/rc2"; local out2=$?
+  : > "$T/stub/hold.go"; wait "$bg" "$bg2"   # solta a 1ª (e a 2ª, se um lock bloqueante a prendeu) ANTES de conferir: nada fica vivo se um caso reprovar
+  check "1ª instância: chegou ao gc e ficou presa lá, com o lock" "$((in1 == 0))"
+  check "2ª instância: saiu com a 1ª ainda presa (não esperou o lock)" "$((out2 == 0))"
+  eq "... e sai 0" 0 "$(cat "$T/stub/rc2" 2>/dev/null)"
   has "... e diz por quê no stderr" "outra instância" "$(cat "$T/err2")"
-  wait "$bg"
   eq "só a 1ª gravou (2 linhas no JSONL: a semente e a 1ª)" 2 "$(wc -l < "$C/.gc/hetzner-occupancy.jsonl" | tr -d ' ')"
 
   echo "--- saida: crash e falha de gravação (traceback à vista, rc 3)"
@@ -472,6 +485,8 @@ g_mutantes() {
   [ -z "${HETZNER_OCC_UNDER_TEST:-}" ] || { bad "controle negativo: só roda contra o script de verdade (HETZNER_OCC_UNDER_TEST está definido)"; return; }
   # o controle do controle: troca um trecho por ELE MESMO (script igual) e roda TODOS os grupos sob o mesmo esquema (subshell, diretório próprio, bad() que sai). Tem de PASSAR; vai primeiro por ser o mais longo.
   mutante identidade "$GROUPS_ALL" $'LIVE = frozenset({"active", "awake"})' $'LIVE = frozenset({"active", "awake"})' passa
+  # o lock bloqueante prende a 2ª instância até a paciência do teste acabar (~30 s, ver await): sai cedo para esses 30 s correrem junto com os outros mutantes e não no fim
+  mutante lock-bloqueante "saida" $'fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)' $'fcntl.flock(fd, fcntl.LOCK_EX)'
   mutante gc-falha-vira-zero "sess" $'r["detalhe"] = _oneline(err)\n        return r' $'r["detalhe"] = _oneline(err)\n        r.update(lido=True, ativas=0)\n        return r'
   mutante rc-ignorado "sess cpu" $'return prefix + "-falhou" if (why or rc != 0) else None' $'return prefix + "-falhou" if why else None'
   mutante saida-vazia-vira-zero "sess" $'r["motivo"] = "json-ilegivel" if out.strip() else "saida-vazia"' $'r.update(lido=True, ativas=0)'
@@ -486,6 +501,7 @@ g_mutantes() {
   mutante vocabulario-deriva-do-bead-state "sess" $'"quarantined", "failed-create"})' $'"quarantined", "failed-create", "paused"})'
   mutante template-sozinho-nao-conta "sess" $'for k in ("session_name", "name", "template"):' $'for k in ("session_name", "name"):'
   mutante gc-sem-timeout "sess" $'run_cmd([c.gc_bin, "--city", c.city, "session", "list", "--json"], c.gc_timeout_s)' $'run_cmd([c.gc_bin, "--city", c.city, "session", "list", "--json"], 600)'
+  mutante sem-killpg "sess" $'os.killpg(p.pid, signal.SIGKILL)' $'p.kill()'
   mutante gc-sem-city "saida" $'[c.gc_bin, "--city", c.city, "session", "list", "--json"]' $'[c.gc_bin, "session", "list", "--json"]'
   mutante falha-apaga-o-baseline "cpu" $'"cpu": new_base or (st.get("cpu") if _baseline_ok(st.get("cpu")) else None),' $'"cpu": new_base,'
   mutante janela-curta-troca-o-baseline "cpu" $'cpu["motivo"] = "janela-curta"\n        return cpu, None, None' $'cpu["motivo"] = "janela-curta"\n        return cpu, now_b, None'
@@ -522,7 +538,6 @@ g_mutantes() {
   mutante ts-hora-utc-sufixo-local "saida" $'"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))' $'"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + time.strftime("%z", time.localtime(now))'
   mutante corrompido-nao-guarda-a-copia "saida" $'os.replace(path, dest)' $'pass'
   mutante sem-instancia-unica "saida" $'if not dry and take_lock(c.gc_dir) is None:' $'if False:'
-  mutante lock-bloqueante "saida" $'fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)' $'fcntl.flock(fd, fcntl.LOCK_EX)'
   mutante dry-run-grava "saida" $'    if not dry:\n        write_atomic(state_path' $'    if True:\n        write_atomic(state_path'
   mutante falha-de-gravacao-sai-0 "saida" $'return e.rc' $'return 0'
   mutante crash-sem-traceback "saida" $'traceback.print_exc()' $'pass'
