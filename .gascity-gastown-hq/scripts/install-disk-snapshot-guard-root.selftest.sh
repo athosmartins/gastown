@@ -14,13 +14,14 @@
 #   (DSG_ROOT_PFX) faz o papel de "/", o uid de quem roda faz o papel do root (DSG_ROOT_UID, DSG_OWNER) e launchctl,
 #   PlistBuddy e plutil são stubs de bash (DSG_LAUNCHCTL, DSG_PLISTBUDDY, DSG_PLUTIL). O instalador só aceita esses ganchos
 #   sem root; por isso este selftest RECUSA rodar como root (como root o instalador mexeria nos caminhos de verdade).
-#   O resultado é conferido por um oráculo próprio (ls -ldn, cmp, leitura do plist falso), nunca pelo --check do instalador:
-#   seria circular.
+#   O que foi instalado é conferido por um oráculo próprio (ls -ldn, cmp, leitura do plist falso), não pelo --check do instalador
+#   (seria circular); o --check entra só como ALVO dos casos de adulteração, onde é ele que tem de reprovar.
 #
 # MUTANTES: o mesmo núcleo de casos roda contra cópias do instalador com UMA proteção desligada por vez; cada mutante tem de
 #   ser pego (algum caso reprova). Um mutante que sobrevive quer dizer que o núcleo não enxerga aquela proteção.
 #
-# SAÍDA: "Results: N passed, M failed"; exit 0 só com M = 0. Roda em ~15 s, só bash/awk/sed/cmp/ls (bash 3.2 do mini inclusive).
+# SAÍDA: "Results: N passed, M failed"; exit 0 só com M = 0. Roda em ~35 s (a maior parte são os mutantes), só com as
+#   ferramentas padrão do macOS e do Linux (bash 3.2 do mini inclusive). Sem o instalador ao lado ele sai 1 na hora.
 
 set -uo pipefail
 export LC_ALL=C
@@ -194,6 +195,17 @@ new_world() {
 }
 # run_inst [args do instalador]: T_UID (uid que conta como root) e EXTRA_ENV (VAR=valor sem espaço) vêm do caso
 run_inst() {
+  local pin="" auto="1"
+  # instalar exige --expect-sha256: junto automaticamente o hash da fonte de AGORA, salvo --check, hash explícito ou NO_PIN=1
+  case " $* " in
+    (*" --check "*|*" --expect-sha256 "*) auto="0" ;;
+  esac
+  if [ "${NO_PIN:-0}" = "1" ]; then auto="0"; fi
+  if [ "$auto" = "1" ]; then
+    # vazio/falhou → hash de zeros: o instalador recusa por hash e o caso reprova, nunca instala "sem hash"
+    pin=$(sha_of "$REPO/scripts/disk-snapshot-guard.sh") || pin="0000000000000000000000000000000000000000000000000000000000000000"
+    set -- "$@" --expect-sha256 "$pin"
+  fi
   # vazio → OUT vazio e o caso reprova ao comparar rc/texto; falhou/ilegível → RC guarda o código real do instalador
   OUT=$(env DSG_ROOT_PFX="$ROOT" DSG_ROOT_UID="${T_UID:-$MY_UID}" DSG_OWNER="$MY_OWNER" \
         DSG_LAUNCHCTL="$STUBS/launchctl" DSG_PLISTBUDDY="$STUBS/PlistBuddy" DSG_PLUTIL="$STUBS/plutil" \
@@ -242,8 +254,13 @@ c_happy() {
   # vazio → nenhum backup (reprova); falhou/ilegível → ls ≠ 0 também reprova
   BK=$(ls "$PROG_D"/"$LABEL".plist.orig-* 2>/dev/null | head -n 1) || BK=""
   if [ -n "$BK" ] && cmp -s "$BK" "$W/plist.before"; then ok "o plist original ficou guardado ao lado da cópia"; else bad "sem backup fiel do plist original (BK='$BK')"; fi
-  LEFT=$(ls -A "$PROG_D" 2>/dev/null | grep -c '^\.' || true)
-  if [ "$LEFT" = "0" ]; then ok "nenhum temporário ficou na pasta do root"; else bad "ficaram $LEFT temporários na pasta do root"; fi
+  # vazio → a pasta nem tem a cópia, reprova; falhou/ilegível → ls ≠ 0 reprova também, nunca vira "sem sobras"
+  if LIST=$(ls -A "$PROG_D" 2>/dev/null) && [ -n "$LIST" ]; then
+    LEFT=$(printf '%s\n' "$LIST" | grep -c '^\.' || true)
+    if [ "$LEFT" = "0" ]; then ok "nenhum temporário ficou na pasta do root"; else bad "ficaram $LEFT temporários na pasta do root: $LIST"; fi
+  else
+    bad "não consegui listar a pasta do root ($PROG_D) para procurar temporários"
+  fi
   if [ "$(sed -n '1p;2p' "$ST/calls.log" | cut -d' ' -f1 | tr '\n' ' ')" = "bootout bootstrap " ]; then ok "bootout vem antes de bootstrap"; else bad "ordem do launchctl: $(cut -d' ' -f1 "$ST/calls.log" | tr '\n' ' ')"; fi
   run_inst --check
   expect_rc 0 "--check depois de instalar"
@@ -252,7 +269,9 @@ c_happy() {
 c_idempotent() {
   echo "== segunda instalação"
   install_good
+  # vazio → 0 backups, e a pré-condição abaixo reprova; falhou/ilegível → ls ≠ 0 vira 0 também e reprova do mesmo jeito
   N1=$(ls "$PROG_D"/"$LABEL".plist.orig-* 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$N1" = "0" ]; then bad "pré-condição: nenhum backup do plist antes da 2ª instalação"; fi
   run_inst
   expect_rc 0 "reinstalar não quebra"
   expect_out "já aponta para" "o plist já apontava: nada a trocar"
@@ -362,6 +381,25 @@ c_pin() {
     echo "  (pulado: sem shasum/sha256sum neste sistema — os casos com o hash certo não foram medidos)"
   fi
 }
+c_pin_required() {
+  echo "== instalar sem --expect-sha256"
+  new_world; NO_PIN=1 run_inst
+  expect_rc 2 "sem o hash o instalador não instala (o root lê um arquivo de pasta do athos)"
+  expect_out "instalar exige --expect-sha256" "e diz que o hash é obrigatório"
+  assert_untouched "sem hash"
+}
+c_staging_private() {
+  echo "== a cópia nasce privada e só abre depois do hash"
+  # vazio → o número fica vazio e o caso reprova; falhou/ilegível → idem: sem a linha não provo a ordem
+  L_STAGE=$(grep -n -F 'stage_copy "$SRC" "$tmp_copy" 0700' "$INSTALLER" | head -n 1 | cut -d: -f1)
+  L_SHA=$(grep -n -F '[ "$copy_sha" = "$PIN" ]' "$INSTALLER" | head -n 1 | cut -d: -f1)
+  L_OPEN=$(grep -n -F 'chmod 0755 "$tmp_copy"' "$INSTALLER" | head -n 1 | cut -d: -f1)
+  if [ -n "$L_STAGE" ] && [ -n "$L_SHA" ] && [ -n "$L_OPEN" ] && [ "$L_STAGE" -lt "$L_SHA" ] && [ "$L_SHA" -lt "$L_OPEN" ]; then
+    ok "ordem no instalador: copia 0700 (linha $L_STAGE) → confere o hash (linha $L_SHA) → abre para 0755 (linha $L_OPEN)"
+  else
+    bad "a cópia não nasce 0700 / não abre só depois do hash (stage='$L_STAGE' hash='$L_SHA' abre='$L_OPEN')"
+  fi
+}
 c_boot_reject() {
   echo "== o launchd recusa o plist novo"
   new_world; EXTRA_ENV="FAKE_BOOT_REJECT=$WANT_ARG1" run_inst
@@ -425,6 +463,8 @@ c_launchd_unreadable() {
 
 suite_core() {
   c_happy
+  c_pin_required
+  c_staging_private
   c_not_root
   c_chain_group
   c_libexec_loose
@@ -486,7 +526,9 @@ suite_extra
 
 if [ "$SKIP_MUT" = "0" ]; then
   echo "== mutantes"
-  mutant "copia-0777" 'stage_copy "$SRC" "$tmp_copy" 0755' 'stage_copy "$SRC" "$tmp_copy" 0777'
+  mutant "copia-0777" 'chmod 0755 "$tmp_copy"' 'chmod 0777 "$tmp_copy"'
+  mutant "copia-nasce-aberta" 'stage_copy "$SRC" "$tmp_copy" 0700' 'stage_copy "$SRC" "$tmp_copy" 0755'
+  mutant "hash-opcional" 'if [ "$MODE" = "install" ] && [ -z "$PIN" ]; then' 'if false; then'
   mutant "plist-nao-editado" '(*/"$GUARD_NAME") needs_edit=1 ;;' '(*/"$GUARD_NAME") needs_edit=0 ;;'
   mutant "escrita-de-grupo-ignorada" '[ "${1:5:1}" = "w" ] || [ "${1:8:1}" = "w" ]' 'false'
   mutant "sem-volta-do-plist" 'if restore_original; then' 'if false; then'
