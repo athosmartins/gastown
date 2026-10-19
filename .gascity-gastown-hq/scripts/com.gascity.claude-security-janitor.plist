@@ -12,16 +12,20 @@
        in the user temp dir (381 dirs / 797 MB on 19/10) whenever its SDK probe timed out under load.
 
        OPERATION per run: (a) delete state files older than 3 days; (b) delete pip-{unpack,metadata,
-       install,ephem-wheel-cache,build-tracker}-* dirs older than 2 h when no pip process is alive.
+       install,ephem-wheel-cache,build-tracker}-* dirs older than 2 h when no pip process is alive;
+       (c) ask the python that sg-python.sh picks whether claude_agent_sdk is still importable and, if
+       not, send ONE notify alarm (repeat every 6 h) with the repair command. Detection only: it never
+       installs anything.
 
-       LEFT ALONE: anything it cannot prove stale. A directory it cannot list or a ps that does not answer
-       = nothing deleted (exit 1, visible in the log and in `launchctl print`). Symlinks and look-alike names are never touched.
+       LEFT ALONE: anything it cannot prove stale. A directory it cannot list, a ps that does not answer,
+       a probe that times out = nothing deleted / not read as "SDK missing" (exit 1, visible in the log
+       and in `launchctl print`). Symlinks and look-alike names are never touched.
 
        KILL-SWITCH: CLAUDE_SECURITY_JANITOR_ENABLED=0 -> no-op. DRY-RUN: CLAUDE_SECURITY_JANITOR_DRY_RUN=1
        (or `claude-security-janitor.py --dry-run` by hand: nothing deleted, nothing sent, no state written).
        CLAUDE_SECURITY_JANITOR_PROD=1 below is what lets it act on the REAL ~/.claude/security and the real
        user temp dir; without it those targets are only ever a dry run.
-       CADENCE: StartInterval=3593 (~1 h), far above the measured run (<= 5.6 s wall on 19/10 at load 44,
+       CADENCE: StartInterval=3593 (~1 h), far above the measured run (5.6 s wall on 19/10 at load 44,
        dry run on the real directories); off the round hour to decorrelate from other hourly jobs.
        No KeepAlive. Single instance (flock). Nice 10 + low-priority IO: the mini lives at load 40-60.
 

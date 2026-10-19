@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # claude-security-janitor.selftest.sh — drives the REAL claude-security-janitor.py (ga-j4r9o8).
 #
-# Everything runs in a scratch tree: a fake HOME / ~/.claude/security / user temp dir / city state
-# and a stub `ps`. Nothing reaches the live city or the real ~/.claude. The stub is made to FAIL —
-# ps non-zero or empty, an unlistable dir — and the janitor must land in the INERT state: nothing
-# deleted, "could not tell" never read as "nothing there".
+# Everything runs in a scratch tree: a fake HOME / ~/.claude/security / user temp dir / city state,
+# and stub `ps`, `notify` and "python interpreters" (shell scripts that print what a real probe
+# would). Nothing reaches the live city, the real ~/.claude or the real notifier. The stubs are made
+# to FAIL — ps non-zero or empty, an unlistable dir, a probe that hangs / prints garbage / exits 1, a
+# notify that exits 1 — and the janitor must land in the INERT state: nothing deleted, "could not
+# tell" never read as "missing" or "nothing there", a failed notify never recorded as sent.
 #
-# A first block (python, in-process) covers what a subprocess cannot reach: a file rewritten
+# A second block (python, in-process) covers what a subprocess cannot reach: a file rewritten
 # between the listing and the unlink, an unlink that fails, a listing that dies half way, an rmtree
-# that leaves the dir, a post-delete look that fails, and the pip-liveness rules line by line.
+# that leaves the dir, a post-delete look that fails, and the pip-liveness / interpreter-selection
+# rules line by line.
 #
 # CSJ_MUTANTS=1 additionally re-runs this whole battery against deliberately broken copies of the
 # janitor and requires every one of them to FAIL it (a test that only passes proves nothing).
@@ -23,7 +26,8 @@ W="$(mktemp -d "${TMPDIR:-/tmp}/csj-selftest.XXXXXX")"
 trap 'chmod -R u+rwx "$W" 2>/dev/null; rm -rf "$W"' EXIT
 export PYTHONDONTWRITEBYTECODE=1
 export HOME="$W/home"
-SEC="$HOME/.claude/security"; TMP="$W/tmp"; RT="$W/rt"; LOCK="$RT/lock"
+SEC="$HOME/.claude/security"; TMP="$W/tmp"; RT="$W/rt"; STATE="$RT/state.json"; LOCK="$RT/lock"
+NCALLS="$W/notify.calls"; export STUB_NOTIFY_CALLS="$NCALLS"
 H=3600; D=86400; STALE=$((3*D)); PIPAGE=$((2*H))
 PASS=0; FAIL=0; OUT=""; RC=0
 ok()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
@@ -46,7 +50,20 @@ case "${STUB_PS_MODE:-ok}" in
   rc1)   echo "/sbin/launchd"; exit 1 ;;
 esac
 STUB
-chmod +x "$W/ps"
+cat > "$W/notify" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "$STUB_NOTIFY_CALLS"
+exit "${STUB_NOTIFY_RC:-0}"
+STUB
+mkpy() { printf '#!/bin/sh\n%s\n' "$2" > "$W/$1"; }
+mkpy py-present 'echo "3.13 True"'
+mkpy py-absent  'echo "3.13 False"'
+mkpy py-old     'echo "3.9 False"'
+mkpy py-old-sdk 'echo "3.9 True"'
+mkpy py-garbage 'echo "hello"'
+mkpy py-rc1     'exit 1'
+mkpy py-hang    'exec sleep 300'
+chmod +x "$W/ps" "$W/notify" "$W"/py-*
 
 # Fixture builder: lines "<kind> <age_secs> <path>"; kinds f (file), d (dir with a nested file),
 # e (empty dir), l (symlink, path is "link=>target"). Ages are relative to now.
@@ -77,9 +94,22 @@ for line in sys.stdin:
         os.symlink(target, link)
         os.utime(link, (t, t), follow_symlinks=False)
 PYEOF
+# State seeding: "key=age:SECS" stores now-SECS, "key=int:N" stores N.
+cat > "$W/seed.py" <<'PYEOF'
+import json, os, sys, time
+out = {}
+for a in sys.argv[2:]:
+    k, v = a.split("=", 1)
+    kind, val = v.split(":", 1)
+    out[k] = (time.time() - float(val)) if kind == "age" else int(val)
+os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)
+json.dump(out, open(sys.argv[1], "w"))
+PYEOF
 mk() { "$PY" "$W/mk.py"; }
+seed() { "$PY" "$W/seed.py" "$STATE" "$@"; }
+jget() { "$PY" -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print("<none>" if v is None else v)' "$STATE" "$1"; }
 
-reset() { rm -rf "$SEC" "$TMP" "$RT" "$W/outside"; mkdir -p "$SEC" "$TMP" "$RT"; }
+reset() { rm -rf "$SEC" "$TMP" "$RT" "$W/outside"; mkdir -p "$SEC" "$TMP" "$RT"; : > "$NCALLS"; }
 # run_jan [VAR=val ...] [-- args]   → OUT, RC. Every path is a fixture; nothing real is reachable.
 run_jan() {
   local envs=() args=()
@@ -87,7 +117,8 @@ run_jan() {
     case "$1" in --) shift; args=("$@"); break ;; *) envs+=("$1"); shift ;; esac
   done
   OUT=$(env CLAUDE_SECURITY_JANITOR_DIR="$SEC" CLAUDE_SECURITY_JANITOR_TMPDIR="$TMP" \
-        CLAUDE_SECURITY_JANITOR_LOCK="$LOCK" CLAUDE_SECURITY_JANITOR_PS_BIN="$W/ps" \
+        CLAUDE_SECURITY_JANITOR_STATE="$STATE" CLAUDE_SECURITY_JANITOR_LOCK="$LOCK" CLAUDE_SECURITY_JANITOR_PS_BIN="$W/ps" \
+        CLAUDE_SECURITY_JANITOR_NOTIFY_BIN="$W/notify" CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-present" \
         ${envs[@]+"${envs[@]}"} "$PY" "$JAN" ${args[@]+"${args[@]}"} 2>&1); RC=$?
 }
 exists()     { [ -e "$1" ] || [ -L "$1" ]; }
@@ -96,6 +127,8 @@ chk_gone()   { if exists "$1"; then nope "$2 (still there: $1)"; else ok "$2"; f
 chk_rc()     { if [ "$RC" -eq "$1" ]; then ok "$2"; else nope "$2 (rc=$RC, want $1)"; fi; }
 chk_out()    { if printf '%s' "$OUT" | grep -qE -- "$1"; then ok "$2"; else nope "$2 (no match: $1)"; fi; }
 chk_noout()  { if printf '%s' "$OUT" | grep -qE -- "$1"; then nope "$2 (unexpected match: $1)"; else ok "$2"; fi; }
+ncalls()     { wc -l < "$NCALLS" | tr -d ' '; }
+chk_calls()  { if [ "$(ncalls)" -eq "$1" ]; then ok "$2"; else nope "$2 (notify calls=$(ncalls), want $1: $(cat "$NCALLS" | head -3))"; fi; }
 
 fixture_mixed() {
   reset
@@ -252,6 +285,27 @@ os.environ.pop("STUB_PS_MODE", None)
 got, why = m.pip_alive(os.path.join(W, "no-such-ps"))
 check("pip_alive: ps binary missing → could not tell (None)", got is None, (got, why))
 
+# interpreter selection (same walk as sg-python.sh)
+def v(cands, to=3):
+    return m.check_sdk(cands, (3, 10), to)[0]
+P = lambda n: os.path.join(W, n)
+check("select: first usable interpreter decides — absent before present → missing", v([P("py-absent"), P("py-present")]) == "missing")
+check("select: an interpreter that is not installed is skipped", v([P("nope"), P("py-present")]) == "present")
+check("select: too old (even with the SDK) is skipped, the next decides", v([P("py-old-sdk"), P("py-absent")]) == "missing")
+check("select: only too-old interpreters → missing", v([P("py-old")]) == "missing")
+check("select: nothing installed at all → missing", v([P("nope1"), P("nope2")]) == "missing")
+check("select: a failing candidate then one lacking the SDK → unknown", v([P("py-rc1"), P("py-absent")]) == "unknown")
+check("select: a failing candidate then one WITH the SDK → present", v([P("py-rc1"), P("py-present")]) == "present")
+check("select: only a failing candidate → unknown", v([P("py-garbage")]) == "unknown")
+check("select: a hanging candidate is cut off by the timeout → unknown", v([P("py-hang")], 2) == "unknown")
+
+# corrupt alarm state reads as 'none sent yet' with a note
+p = os.path.join(newdir(), "s.json"); open(p, "w").write("{not json")
+data, note = m.read_alarm_state(p)
+check("alarm state: corrupt file → {} plus a note", data == {} and "unreadable" in note, (data, note))
+p2 = os.path.join(newdir(), "s.json"); open(p2, "w").write("[1,2]")
+data, note = m.read_alarm_state(p2)
+check("alarm state: not an object → {} plus a note", data == {} and "not an object" in note, (data, note))
 sys.exit(1 if bad else 0)
 PYEOF
 UNIT_OUT=$("$PY" "$W/unit.py" "$JAN" "$W/ps" "$W" 2>&1)
@@ -288,7 +342,10 @@ for k in pip-other-abc pip-unpack- notpip-unpack-abc pip-unpack-has.dot pip-unpa
   chk_exists "$TMP/$k" "pip: non-matching '$k' kept even when old"
 done
 chk_exists "$W/outside/pipdir/keep" "pip: the symlinked dir's content kept (symlink not followed)"
-chk_out "summary: state-files=pruned pip-debris=pruned exit=0" "baseline: summary line"
+chk_calls 0 "baseline: SDK present → no notify"
+[ ! -f "$STATE" ] && ok "baseline: SDK present → no alarm state written" || nope "baseline: state file written"
+chk_out "sdk: present" "baseline: reports the SDK present"
+chk_out "summary: state-files=pruned pip-debris=pruned sdk-check=present exit=0" "baseline: summary line"
 
 # ══ 2. a live pip protects every old dir (not an error); ps that cannot answer protects them too ═
 fixture_mixed
@@ -311,10 +368,12 @@ chk_rc 0 "ps is not asked when no dir is old enough (a broken ps cannot fail a n
 
 # ══ 3. dry run, kill switch, bad limit, single instance ════════════════════════════════════════
 fixture_mixed
-run_jan -- --dry-run
+run_jan CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-absent" -- --dry-run
 chk_exists "$SEC/security_warnings_state_aaa.json" "dry-run: state file kept"
 chk_exists "$TMP/pip-unpack-abc123" "dry-run: pip dir kept"
 chk_out "DRY-RUN would delete" "dry-run: says what it would do"
+chk_calls 0 "dry-run: SDK missing but nothing sent"
+[ ! -f "$STATE" ] && ok "dry-run: no alarm state written" || nope "dry-run: wrote alarm state"
 fixture_mixed
 run_jan CLAUDE_SECURITY_JANITOR_ENABLED=0
 chk_rc 0 "kill switch: exit 0"
@@ -367,9 +426,55 @@ run_jan CLAUDE_SECURITY_JANITOR_REAL_DIR="$SEC" CLAUDE_SECURITY_JANITOR_REAL_TMP
 chk_gone "$SEC/security_warnings_state_aaa.json" "sentinel: PROD=1 → state file deleted"
 chk_gone "$TMP/pip-unpack-abc123" "sentinel: PROD=1 → pip dir deleted"
 
+# ══ 6. SDK check + alarm policy ════════════════════════════════════════════════════════════════
+reset
+run_jan CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-absent"
+chk_rc 1 "sdk missing: exit 1"
+chk_calls 1 "sdk missing: one notify"
+grep -q -- '-p 4' "$NCALLS" && grep -q 'claude_agent_sdk sumiu' "$NCALLS" && grep -q "$W/py-absent -m pip install --break-system-packages claude-agent-sdk" "$NCALLS" \
+  && ok "sdk missing: priority 4, title, and the exact repair command for the interpreter" || nope "sdk missing: notify args wrong: $(cat "$NCALLS")"
+[ "$(jget last_alarm_missing)" != "<none>" ] && ok "sdk missing: alarm recorded" || nope "sdk missing: alarm not recorded"
+seed last_alarm_missing=age:$H
+: > "$NCALLS"; run_jan CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-absent"
+chk_calls 0 "sdk missing, alarmed 1 h ago: no repeat inside the 6 h window"
+chk_rc 1 "sdk missing, suppressed: still exit 1 (it IS missing)"
+seed last_alarm_missing=age:$((7*H))
+: > "$NCALLS"; run_jan CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-absent"
+chk_calls 1 "sdk missing, alarmed 7 h ago: repeats"
+reset
+run_jan CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-absent" STUB_NOTIFY_RC=1
+chk_rc 1 "notify fails: exit 1"
+chk_out "NOTIFY FAILED" "notify fails: said so"
+[ -f "$STATE" ] && [ "$(jget last_alarm_missing)" != "<none>" ] && nope "notify fails: recorded as SENT" || ok "notify fails: NOT recorded as sent"
+: > "$NCALLS"; run_jan CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-absent"
+chk_calls 1 "after a failed notify the next run sends it"
+seed last_alarm_missing=age:$H unknown_streak=int:2
+: > "$NCALLS"; run_jan CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-present"
+chk_rc 0 "sdk back: exit 0"
+chk_calls 0 "sdk back: no notify"
+[ "$(cat "$STATE")" = "{}" ] && ok "sdk back: alarm state cleared" || nope "sdk back: state is $(cat "$STATE")"
+reset
+run_jan CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-hang" CLAUDE_SECURITY_JANITOR_PROBE_TIMEOUT_SECS=3
+chk_rc 1 "probe hangs: exit 1"
+chk_out "sdk: UNKNOWN \(1 in a row\)" "probe hangs: UNKNOWN, not MISSING"
+chk_noout "sdk: MISSING" "probe hangs: never read as missing"
+chk_calls 0 "probe hangs once: no alarm yet (needs 3 in a row)"
+[ "$(jget unknown_streak)" = "1" ] && ok "probe hangs: streak counted" || nope "probe hangs: streak=$(jget unknown_streak)"
+seed unknown_streak=int:2
+run_jan CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-garbage"
+chk_calls 1 "3rd unknown in a row (garbage output): alarms"
+grep -q 'nao consegui checar' "$NCALLS" && ok "3rd unknown: its own text, not the 'sumiu' alarm" || nope "3rd unknown: wrong text: $(cat "$NCALLS")"
+reset
+run_jan CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-rc1 $W/py-absent"
+chk_noout "sdk: MISSING" "an earlier candidate failing + a later one lacking the SDK: UNKNOWN, not MISSING"
+reset
+mkdir -p "$W/fakesite/claude_agent_sdk" && : > "$W/fakesite/claude_agent_sdk/__init__.py"
+run_jan PYTHONPATH="$W/fakesite" CLAUDE_SECURITY_JANITOR_PYTHONS="$PY" CLAUDE_SECURITY_JANITOR_MIN_PY=3.0
+chk_out "sdk: present" "real interpreter + a package on PYTHONPATH: find_spec says present"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 
-# ══ 6. mutants: each must fail this battery ═════════════════════════════════════════════════════
+# ══ 8. mutants: each must fail this battery ═════════════════════════════════════════════════════
 if [ "${CSJ_MUTANTS:-0}" = "1" ] && [ "$FAIL" -eq 0 ]; then
   cat > "$W/mutate.py" <<'PYEOF'
 import sys
@@ -384,20 +489,26 @@ M = {
                           '        return False, ""'),
  "unlistable-as-empty": ('        return "unreadable", "cannot list %s: %s" % (sec_dir, e)',
                          '        return "none-old", "cannot list %s: %s" % (sec_dir, e)'),
+ "probe-failure-as-missing": ('        if got is None:\n            failures.append("%s: %s" % (path, why))\n            continue',
+                              '        if got is None:\n            got = (3, 13, False)'),
+ "failed-notify-as-sent": ('    try:\n        r = subprocess.run(\n            [notify_bin, "-t", title, "-p", "4", body],',
+                           '    return True\n    try:\n        r = subprocess.run(\n            [notify_bin, "-t", title, "-p", "4", body],'),
  "pip-match-not-anchored": ("            if rx.match(line):", "            if re.search(rx.pattern.lstrip(\"^\"), line):"),
  "symlink-followed": ("        if not stat.S_ISREG(st.st_mode):", "        if False:"),
  "sentinel-dropped": ("        dry1 = dry_all or (sec_real_target and not prod)", "        dry1 = dry_all"),
  "unlink-without-recheck": ("        if st2.st_mtime != st.st_mtime or st2.st_ino != st.st_ino:", "        if False:"),
  "partial-rmtree-as-deleted": ("        else:\n            partial += 1\n", "        else:\n            deleted += 1\n"),
+ "repeat-alarm-every-run": ("        due = not isinstance(last, (int, float)) or now - last >= repeat\n        log(\"sdk: MISSING",
+                            "        due = True\n        log(\"sdk: MISSING"),
 }
 old, new = M[name]
 assert s.count(old) == 1, "mutation %s: pattern found %d times" % (name, s.count(old))
 open(dst, "w").write(s.replace(old, new))
 PYEOF
   SURV=0
-  for mut in state-age-inverted pip-age-inverted ps-failure-as-no-pip unlistable-as-empty \
-             pip-match-not-anchored symlink-followed sentinel-dropped unlink-without-recheck \
-             partial-rmtree-as-deleted; do
+  for mut in state-age-inverted pip-age-inverted ps-failure-as-no-pip unlistable-as-empty probe-failure-as-missing \
+             failed-notify-as-sent pip-match-not-anchored symlink-followed sentinel-dropped unlink-without-recheck \
+             partial-rmtree-as-deleted repeat-alarm-every-run; do
     "$PY" "$W/mutate.py" "$mut" "$JAN" "$W/mutant-$mut.py" || { echo "FAIL - mutant $mut: could not be built"; SURV=$((SURV+1)); continue; }
     # A mutant that does not even parse would "fail" the battery for the wrong reason: refuse it.
     "$PY" -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$W/mutant-$mut.py" 2>/dev/null \

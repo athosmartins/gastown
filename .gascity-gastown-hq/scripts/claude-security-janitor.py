@@ -7,7 +7,6 @@
 - Safety
 - Switches
 - Exit code
-- Not here
 
 ## Why
 On 2026-10-19 the official `security-guidance` plugin (2.0.14) was costing the mini ~1.5 GB
@@ -28,6 +27,12 @@ sweeps those after 30 days (`cleanup_old_state_files`): ~10,000 files, ~55 MB/da
 2. pip debris — delete `pip-{unpack,metadata,install,ephem-wheel-cache,build-tracker}-*`
    directories in the user temp dir (`getconf DARWIN_USER_TEMP_DIR`, the TMPDIR the hook's
    pip runs in) when older than PIP_MAX_AGE (2 h) AND no pip process is alive.
+3. SDK check (detection only) — pick the interpreter the way `sg-python.sh` does (first of
+   python3.13 .. python3.10, then python3, python, that runs and is >= 3.10) and ask it the
+   hook's own question, `importlib.util.find_spec("claude_agent_sdk")`. If the SDK is gone
+   (a `brew upgrade` of python3.13 wipes its site-packages) it sends a `notify` alarm with the
+   repair command, at most once per ALARM_REPEAT (6 h) while it stays gone. It never installs
+   anything: a pip run under load is exactly what started the loop.
 
 ## Safety
 Every read has three outcomes — has / has not / could not find out — and "could not find
@@ -46,6 +51,10 @@ out" lands in the inert state, never in "nothing there" and never in a delete:
   matches). A live pip keeps everything and is NOT an error (it retries next hour). After
   rmtree the path is looked at again: ENOENT = deleted; still there = PARTIAL; any other
   error = UNVERIFIED (both INCOMPLETE);
+- SDK check: a probe that times out, exits non-zero or prints something unparseable is
+  "could not tell" (it never reads as "SDK missing"); "unknown" alarms only after
+  UNKNOWN_AFTER (3) consecutive runs and with its own text. A `notify` that fails is NOT
+  recorded as sent, so the next run retries;
 - one instance at a time (flock); the loser exits 0;
 - PRODUCTION SENTINEL (same ga-h565g idea as claude_home_trim.py): a target that resolves to
   the real ~/.claude/security or the real user temp dir is only ever a dry run unless
@@ -54,23 +63,24 @@ out" lands in the inert state, never in "nothing there" and never in a delete:
 
 ## Switches
 CLAUDE_SECURITY_JANITOR_DIR (default /Users/athos/.claude/security), _TMPDIR (default
-`getconf DARWIN_USER_TEMP_DIR`), _STATE_MAX_AGE_SECS, _PIP_MAX_AGE_SECS, _PS_BIN (ps), _LOCK
-(single-instance lock, default <city>/.gc/runtime/claude-security-janitor.lock), _ENABLED=0
-(no-op), _DRY_RUN=1 or --dry-run (report only: nothing deleted), _PROD=1 (see above).
+`getconf DARWIN_USER_TEMP_DIR`), _STATE_MAX_AGE_SECS, _PIP_MAX_AGE_SECS, _ALARM_REPEAT_SECS,
+_UNKNOWN_AFTER, _PYTHONS (space-separated names or paths, default
+"python3.13 python3.12 python3.11 python3.10 python3 python"), _MIN_PY ("3.10"), _PS_BIN (ps),
+_NOTIFY_BIN (~/.local/bin/notify), _PROBE_TIMEOUT_SECS (60), _STATE (alarm state, default
+<city>/.gc/runtime/claude-security-janitor.state.json), _LOCK (single-instance lock, default
+<city>/.gc/runtime/claude-security-janitor.lock), _ENABLED=0 (no-op), _DRY_RUN=1 or
+--dry-run (report only: nothing deleted, nothing sent, no state written), _PROD=1 (see above).
 Test seams for the production sentinel: _REAL_DIR and _REAL_TMPDIR say which path counts as "the
 real one" (defaults: the constants above / getconf), so the selftest can declare a fixture real.
 
 ## Exit code
 0 = every part ran (nothing to do counts; another instance holding the lock counts).
-1 = a part was INCOMPLETE (could not read / could not confirm a delete / a bad limit); the lines
-above say which.
-
-## Not here
-The check that the hook's python still has claude_agent_sdk (and its notify alarm), from the same
-bead, ships as a separate slice on top of this one.
+1 = a part was INCOMPLETE (could not read / could not confirm a delete / a bad limit), the
+SDK is missing or could not be checked, or a notify failed; the lines above say which.
 """
 import errno
 import fcntl
+import json
 import os
 import re
 import shutil
@@ -96,7 +106,16 @@ PIP_LIVE_RES = [
     re.compile(r"^" + _PY + r"\s+" + _PY_OPTS + r"-[A-Za-z]*m\s+(?:pip|ensurepip)(?:\s|$)"),
     re.compile(r"^" + _PY + r"\s+" + _PY_OPTS + r"\S*ensure_agent_sdk\.py(?:\s|$)"),
 ]
+# What the hook asks (ensure_agent_sdk.py: find_spec, no import) plus the version, one process.
+PROBE_CODE = (
+    "import sys, importlib.util as u; "
+    'print("%d.%d %s" % (sys.version_info[0], sys.version_info[1], '
+    'u.find_spec("claude_agent_sdk") is not None))'
+)
+PROBE_OUT_RE = re.compile(r"^(\d+)\.(\d+) (True|False)$")
+PROBE_TIMEOUT_SECS = 60
 PS_TIMEOUT_SECS = 30
+NOTIFY_TIMEOUT_SECS = 30
 
 # part states. OK_STATES are the ones that do not make the run INCOMPLETE.
 OK_STATES = {"absent", "none-old", "pruned", "dry-run", "pip-live"}
@@ -333,6 +352,169 @@ def sweep_pip(tmp_dir, max_age, now, dry, ps_bin):
     return "pruned", "deleted=%d dir(s) (%s); %s" % (deleted, human(freed), tail)
 
 
+# ── 3. SDK check ────────────────────────────────────────────────────────────────────────────
+
+
+def resolve_python(cand):
+    if "/" in cand:
+        return cand if os.path.isfile(cand) and os.access(cand, os.X_OK) else None
+    return shutil.which(cand)
+
+
+def probe_python(path, timeout):
+    """Returns ((major, minor, has_sdk), None) or (None, why)."""
+    # vazio (no output) -> (None, why); falhou/ilegivel (timeout, rc != 0, unparseable) -> (None, why).
+    # A probe that did not answer is never "SDK missing".
+    try:
+        r = subprocess.run(
+            [path, "-c", PROBE_CODE], capture_output=True, text=True, timeout=timeout,
+            env=dict(os.environ, PYTHONUTF8="1"),
+        )
+    except subprocess.TimeoutExpired:
+        return None, "timed out after %d s" % timeout
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, "cannot run: %s" % e
+    m = PROBE_OUT_RE.match(r.stdout.strip())
+    if r.returncode != 0 or not m:
+        return None, "rc=%s, output %r" % (r.returncode, r.stdout.strip()[:60])
+    return (int(m.group(1)), int(m.group(2)), m.group(3) == "True"), None
+
+
+def parse_min_py(raw):
+    m = re.fullmatch(r"(\d+)\.(\d+)", raw)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def check_sdk(candidates, min_py, probe_timeout=PROBE_TIMEOUT_SECS):
+    """Returns (verdict, interpreter, detail); verdict is present | missing | unknown.
+    Same walk as sg-python.sh: the first interpreter that answers and is new enough decides."""
+    failures = []
+    older = []
+    for cand in candidates:
+        path = resolve_python(cand)
+        if path is None:
+            continue  # not installed: not a failure, sg-python skips it too
+        got, why = probe_python(path, probe_timeout)
+        if got is None:
+            failures.append("%s: %s" % (path, why))
+            continue
+        major, minor, has_sdk = got
+        if (major, minor) < min_py:
+            older.append("%s is %d.%d" % (path, major, minor))
+            continue
+        if has_sdk:
+            return "present", path, "find_spec(claude_agent_sdk) found it in %d.%d" % (major, minor)
+        if failures:
+            return "unknown", path, "%s lacks the SDK but an earlier candidate did not answer (%s)" % (
+                path, "; ".join(failures))
+        return "missing", path, "find_spec(claude_agent_sdk) found nothing in %s (%d.%d)" % (
+            path, major, minor)
+    if failures:
+        return "unknown", "", "no interpreter answered: %s" % "; ".join(failures)
+    return "missing", "", "no python >= %d.%d on PATH (%s)" % (
+        min_py[0], min_py[1], "; ".join(older) if older else "none found")
+
+
+def read_alarm_state(path):
+    """Returns (dict, note). A state file that is absent or unreadable reads as 'no alarm sent
+    yet': the worst outcome is one extra notification, never a lost alarm."""
+    # vazio (absent) -> {}; falhou/ilegivel (corrupt, not an object, unreadable) -> {} plus a note.
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}, ""
+    except (OSError, ValueError) as e:
+        return {}, "alarm state %s unreadable (%s): treating as no alarm sent yet" % (path, e)
+    if not isinstance(data, dict):
+        return {}, "alarm state %s is not an object: treating as no alarm sent yet" % path
+    return data, ""
+
+
+def write_alarm_state(path, data):
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def send_notify(notify_bin, title, body):
+    """True only when notify exited 0. Anything else = NOT sent."""
+    try:
+        r = subprocess.run(
+            [notify_bin, "-t", title, "-p", "4", body],
+            capture_output=True, text=True, timeout=NOTIFY_TIMEOUT_SECS,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log("NOTIFY FAILED (%s): %s" % (notify_bin, e))
+        return False
+    if r.returncode != 0:
+        log("NOTIFY FAILED (%s): rc=%s %s" % (notify_bin, r.returncode, r.stderr.strip()[:120]))
+        return False
+    return True
+
+
+def handle_sdk(verdict, interp, detail, now, dry, state_path, notify_bin, repeat, unknown_after):
+    """Applies the alarm policy. Returns True when this part is OK."""
+    state, note = read_alarm_state(state_path)
+    if note:
+        log(note)
+    new = dict(state)
+    ok = verdict == "present"
+
+    if verdict == "present":
+        new = {}
+        log("sdk: present — %s" % detail)
+    elif verdict == "missing":
+        last = state.get("last_alarm_missing")
+        due = not isinstance(last, (int, float)) or now - last >= repeat
+        log("sdk: MISSING — %s" % detail)
+        fix = ("%s -m pip install --break-system-packages claude-agent-sdk" % interp
+               if interp else "brew install python@3.13 e instalar claude-agent-sdk nele")
+        if not due:
+            log("sdk: alarm already sent %d s ago (repeat every %d s)" % (now - last, repeat))
+        elif dry:
+            log("sdk: DRY-RUN would notify (repair: %s)" % fix)
+        elif send_notify(
+            notify_bin,
+            "claude_agent_sdk sumiu do python do hook",
+            "O plugin security-guidance volta a reinstalar o venv a cada sessao (pip sem cache, "
+            "~800 MB/dia em pip-*). %s Conserto: %s (ga-j4r9o8)" % (detail, fix),
+        ):
+            new["last_alarm_missing"] = now
+        else:
+            ok = False
+        new["unknown_streak"] = 0
+    else:  # unknown
+        streak = state.get("unknown_streak")
+        streak = (streak if isinstance(streak, int) and streak >= 0 else 0) + 1
+        new["unknown_streak"] = streak
+        log("sdk: UNKNOWN (%d in a row) — %s" % (streak, detail))
+        last = state.get("last_alarm_unknown")
+        due = not isinstance(last, (int, float)) or now - last >= repeat
+        if streak >= unknown_after and due:
+            if dry:
+                log("sdk: DRY-RUN would notify (could not check)")
+            elif send_notify(
+                notify_bin,
+                "nao consegui checar o claude_agent_sdk",
+                "%d rodadas seguidas sem conseguir perguntar ao python do hook se o "
+                "claude_agent_sdk existe: %s (ga-j4r9o8)" % (streak, detail),
+            ):
+                new["last_alarm_unknown"] = now
+            else:
+                ok = False
+
+    if not dry and new != state:
+        try:
+            os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            write_alarm_state(state_path, new)
+        except OSError as e:
+            log("cannot write alarm state %s: %s (a repeat alarm is possible)" % (state_path, e))
+            ok = False
+    return ok
+
+
 # ── main ────────────────────────────────────────────────────────────────────────────────────
 
 
@@ -361,8 +543,10 @@ def main(argv):
     dry_all = "--dry-run" in argv or env("CLAUDE_SECURITY_JANITOR_DRY_RUN", "0") == "1"
     prod = env("CLAUDE_SECURITY_JANITOR_PROD", "0") == "1"
     city = env("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
-    lock_path = env("CLAUDE_SECURITY_JANITOR_LOCK", "") or os.path.join(
-        city, ".gc", "runtime", "claude-security-janitor.lock")
+    runtime = os.path.join(city, ".gc", "runtime")
+    lock_path = env("CLAUDE_SECURITY_JANITOR_LOCK", "") or os.path.join(runtime, "claude-security-janitor.lock")
+    state_path = env("CLAUDE_SECURITY_JANITOR_STATE", "") or os.path.join(
+        runtime, "claude-security-janitor.state.json")
 
     real_sec = env("CLAUDE_SECURITY_JANITOR_REAL_DIR", "") or REAL_SECURITY_DIR
     sec_dir = env("CLAUDE_SECURITY_JANITOR_DIR", "") or real_sec
@@ -387,7 +571,14 @@ def main(argv):
     now = time.time()
     state_age = cfg_int("CLAUDE_SECURITY_JANITOR_STATE_MAX_AGE_SECS", 3 * 86400)
     pip_age = cfg_int("CLAUDE_SECURITY_JANITOR_PIP_MAX_AGE_SECS", 2 * 3600)
+    repeat = cfg_int("CLAUDE_SECURITY_JANITOR_ALARM_REPEAT_SECS", 6 * 3600)
+    unknown_after = cfg_int("CLAUDE_SECURITY_JANITOR_UNKNOWN_AFTER", 3)
+    probe_timeout = cfg_int("CLAUDE_SECURITY_JANITOR_PROBE_TIMEOUT_SECS", PROBE_TIMEOUT_SECS)
+    min_py = parse_min_py(env("CLAUDE_SECURITY_JANITOR_MIN_PY", "3.10"))
+    pythons = (env("CLAUDE_SECURITY_JANITOR_PYTHONS", "") or
+               "python3.13 python3.12 python3.11 python3.10 python3 python").split()
     ps_bin = env("CLAUDE_SECURITY_JANITOR_PS_BIN", "ps")
+    notify_bin = env("CLAUDE_SECURITY_JANITOR_NOTIFY_BIN", "/Users/athos/.local/bin/notify")
 
     rc = 0
     results = []
@@ -422,6 +613,22 @@ def main(argv):
         if dry2 and not dry_all:
             log("pip-debris: target is the real %s and CLAUDE_SECURITY_JANITOR_PROD != 1: dry run" % tmp_dir)
         run_part("pip-debris", lambda: sweep_pip(tmp_dir, pip_age, now, dry2, ps_bin))
+
+    # 3. SDK check
+    if min_py is None or repeat is None or unknown_after is None or probe_timeout is None:
+        log("sdk-check: incomplete — bad MIN_PY / ALARM_REPEAT_SECS / UNKNOWN_AFTER / PROBE_TIMEOUT_SECS, skipped")
+        results.append("sdk-check=incomplete")
+        rc = 1
+    else:
+        try:
+            verdict, interp, detail = check_sdk(pythons, min_py, probe_timeout)
+            ok = handle_sdk(verdict, interp, detail, now, dry_all, state_path, notify_bin, repeat, unknown_after)
+        except Exception as e:
+            verdict, ok = "crashed", False
+            log("sdk-check: crashed: %r" % (e,))
+        results.append("sdk-check=%s" % verdict)
+        if not ok:
+            rc = 1
 
     log("summary: %s exit=%d" % (" ".join(results), rc))
     os.close(lock_fd)
