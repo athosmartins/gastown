@@ -2,7 +2,7 @@
 
 ## Contents
 
-• Onde você está · Como pegar a bead · O que o atalho deixa passar · Trabalhar e entregar · Sem bead · O que nunca fazer
+• Onde você está · Como pegar a bead · O que o atalho deixa passar · Trabalhar e entregar · Conserto de uma branch que o gate já revisou · Sem bead · O que nunca fazer
 
 > **Recuperação**: depois de compactar, limpar ou reiniciar, rode `gc prime` (o atalho deixa passar).
 
@@ -35,10 +35,20 @@ Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `g
 
 1. Trabalhe no diretório atual. Registre o andamento com `bd comment <id> "..."`.
 2. Os commits saem com o autor `<seu nome de sessão>@gastown.invalid`; não mude a identidade git.
-3. `git push origin HEAD` leva o branch ao espelho do mini, que só aceita `worker/*` e `crew/*`. Merge é do gate, nunca seu.
+3. `git push origin HEAD` leva o branch ao espelho do mini, que só aceita `worker/*` e `crew/*`. Merge é do gate, nunca seu. O espelho pergunta ao origin, na hora do push, se ele já tem uma ponta desse branch que o seu push não contém (o gate reescreve branch): se tem, o push volta **recusado** com `o origin tem <sha>`; se o origin não respondeu, o push entra com um `AVISO` dizendo que não deu para conferir. Leia a mensagem: repetir o mesmo push não resolve.
 4. Bead de código: ao terminar (com o `git push origin HEAD` já feito), rode `gate-done` e deixe um `bd comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho. Ele submete o que o ESPELHO tem em `worker/<seu nome de sessão>` (não vê o seu HEAD) e imprime `submetido: … @ <sha>`: compare com `git rev-parse HEAD`; se diferir, empurre de novo e rode `gate-done` outra vez. Ao terminar ele solta a bead do seu alias (ela some de `bd list --assignee "$GC_ALIAS"`: é o esperado, não trabalhe de novo).
 5. Bead que pede só uma medição ou um relato: `bd close <id> --reason "<resultado>"`.
 6. Depois disso, termine o turno. A sessão ociosa se encerra sozinha em 15 minutos e o worktree só é recolhido se estiver limpo e com todo commit publicado: commit não publicado e arquivo novo ou alterado ficam guardados e o worktree é mantido. Arquivos que o git ignora (build, cache) não contam e somem junto quando ele é recolhido.
+
+## Conserto de uma branch que o gate já revisou
+
+O gate rebaseia a branch no origin (`fix/<bead>-<resumo>`): o sha que ele revisou pode ser OUTRO que o da sua cópia (a do worktree ou a de um pull antigo). Consertar sobre a cópia velha dá um push que o origin não aceita, e o conserto se perde. Por isso, nesta bead:
+
+1. Antes do primeiro commit, traga o origin pelo espelho: `git fetch origin`. Se o espelho recusar (`pedido recusado`: o filtro de dados mudou) ou disser `em atualização`, espere um minuto e repita; `~/gt-remote/bin/hetzner-remote-git.sh pull gascity` renova o filtro e busca.
+2. Compare `git rev-parse origin/<branch>` com o sha que a bead diz ter sido revisado. Diferente? O espelho ainda não trouxe a ponta nova (ele busca o origin a cada 5 min): espere e repita o fetch; **não** conserte sobre a cópia velha.
+3. Comece de `origin/<branch>` (`git reset --hard origin/<branch>` no seu worktree limpo), conserte, `git push origin HEAD`, `gate-done`.
+4. `git push` com `recusado … o origin tem <sha>` ou `AVISO … o origin tem <sha>` = o origin mudou a branch por baixo de você. Não force e não repita: `git fetch origin` (o espelho já está trazendo essa ponta), refaça o conserto sobre `origin/<branch>` e empurre de novo. Se o git recusar o novo push como `non-fast-forward` (o espelho guarda uma ponta sua que o origin não aceita) ou o espelho disser `reescreve histórico`, não use `git pull` nem force: empurre com outro nome (`git push origin HEAD:worker/<seu nome de sessão>-2`) e **não rode `gate-done`**: ele só lê `worker/<seu nome de sessão>`, que ali guarda a ponta velha, e submeteria o sha errado. Deixe a bead aberta com um `bd comment` que diga o nome do branch e o sha empurrados e que `worker/<seu nome de sessão>` está velho; a entrega desse caso é do Mayor.
+5. `hetzner-remote-git.sh status gascity` mostra `PENDENTE e DIVERGE de origin/<branch>` quando o seu branch e o do origin se separaram: é o mesmo aviso, a qualquer hora.
 
 ## Sem bead
 

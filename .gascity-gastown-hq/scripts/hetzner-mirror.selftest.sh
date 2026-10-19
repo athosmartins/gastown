@@ -320,6 +320,42 @@ OUT=$(srv status wa); has 'feat/zz: PENDENTE' "servidor status: branch de prefix
 mv "$O.off" "$O"; rc_is 0 "origin de volta: sync publica" "$M" sync wa; [ "$(gx "$O" rev-parse refs/heads/worker/ga-t1)" = "$LATE" ] && ok "origin de volta: a branch chegou, sem perder nada" || bad "origin de volta: não chegou"
 rc_is 0 "status: limpo depois de publicar" "$M" status wa; rc_is 0 "pull: servidor puxa" srv pull wa; OUT=$(srv status wa); has 'worker/ga-t1: publicada no origin' "servidor status: agora publicada"; has 'sem trabalho novo' "servidor status: branch sem commit novo não é pendente"
 
+# ── M. o origin reescreveu a branch (o gate rebaseia): o dog que conserta sobre a ponta velha é AVISADO, nada é publicado em silêncio, e o espelho traz a ponta nova (ga-jgxgn6) ───────────────
+# o caso de 19/10 (ga-2hd02v.1.12): o gate rebaseou fix/... no origin; o dog consertou sobre a ponta velha e empurrou; o espelho não publicou (não é fast-forward) e não avisou ninguém
+gate_rewrite() { local br=$1 tag=$2; ( cd "$W" && git fetch -q origin "refs/heads/$br" && git checkout -q -B "gate-$tag" FETCH_HEAD~1 && echo "gate $tag" > "lib/gate-$tag.py" && git add "lib/gate-$tag.py" && git commit -qm "gate rebase $tag" && git push -q -f origin "gate-$tag:refs/heads/$br"; git checkout -q main ) > /dev/null 2>&1; gx "$O" rev-parse "refs/heads/$br"; }   # o "gate": reescreve a branch no origin (mesmo pai, commit novo) e imprime a ponta nova
+REW=$(gate_rewrite worker/ga-t1 a); [ -n "$REW" ] && [ "$REW" != "$LATE" ] && ! gx "$O" merge-base --is-ancestor "$LATE" "$REW" && ok "gate: o origin tem a branch REESCRITA (a ponta que o dog tem não é ancestral dela)" || bad "fixture: a reescrita do gate não saiu como devia" "$REW"
+( cd "$WT" && echo stale-fix >> lib/a.py && git commit -qam "fix on the old tip" ); STALE=$(gx "$WT" rev-parse HEAD)
+OUT=$(push origin worker/ga-t1); has 'o origin tem' "reescrita: o push feito sobre a ponta velha é RECUSADO na hora (não é aceito em silêncio)"; has "$REW" "reescrita: a mensagem traz o sha que o origin tem (o que o gate revisou)"; has 'Rebase sobre origin/worker/ga-t1' "reescrita: diz o que fazer"
+[ "$(gx "$MR" rev-parse refs/heads/worker/ga-t1)" != "$STALE" ] && ok "reescrita: o espelho NÃO guardou o push condenado (não nasce ponta morta; a ponta é a de antes ou a do gate, se o sync da recusa já rodou)" || bad "reescrita: o espelho guardou o push" "$(gx "$MR" rev-parse refs/heads/worker/ga-t1)"
+[ "$(gx "$O" rev-parse refs/heads/worker/ga-t1)" = "$REW" ] && ok "reescrita: o origin segue com a ponta do gate (nada foi publicado por cima)" || bad "reescrita: o origin mudou" "$(gx "$O" rev-parse refs/heads/worker/ga-t1)"
+wait_for 90 "[ \"\$(git -C '$MR' rev-parse -q --verify refs/heads/worker/ga-t1)\" = '$REW' ]" && ok "reescrita: o espelho trouxe a ponta do gate e alinhou a branch (sync em segundo plano, disparado pela recusa)" || bad "reescrita: o espelho não alinhou a branch à ponta do gate" "$(tail -n 5 "$T/mh/publish.log")"
+rc_is 0 "reescrita: o servidor puxa" srv pull wa; has 'resultado=ok' "reescrita: pull ok"
+[ "$(gx "$SR" rev-parse -q --verify refs/remotes/origin/worker/ga-t1)" = "$REW" ] && ok "reescrita: o servidor vê origin/worker/ga-t1 = o sha que o gate revisou" || bad "reescrita: o servidor não vê a ponta do gate" "$(gx "$SR" rev-parse -q --verify refs/remotes/origin/worker/ga-t1)"
+( cd "$WT" && git reset -q --hard refs/remotes/origin/worker/ga-t1 && echo fix >> lib/a.py && git commit -qam "fix on the gate tip" ); FIX=$(gx "$WT" rev-parse HEAD)
+OUT=$(push origin worker/ga-t1); hasnt 'recusado' "reescrita: o conserto feito sobre a ponta do gate entra (fast-forward)"; hasnt 'AVISO' "reescrita: e sem aviso nenhum"
+wait_for 60 "[ \"\$(git -C '$O' rev-parse refs/heads/worker/ga-t1)\" = '$FIX' ]" && ok "reescrita: o conserto chegou ao origin sobre a ponta do gate" || bad "reescrita: o conserto não chegou ao origin" "$(tail -n 5 "$T/mh/publish.log")"
+# o post-receive sozinho (o origin pode mudar ENTRE o pre e o post: chamada direta, com a ponta velha como "push aceito"): avisa no stderr do push e não finge que publica
+N0=$(grep -c 'sync wa: ok' "$T/mh/publish.log")
+OUT=$( cd "$MR" && printf '%s %s %s\n' "$FIX" "$LATE" refs/heads/worker/ga-t1 | GIT_DIR=. "$MR/hooks/post-receive" 2>&1 ); RCP=$?
+[ $RCP = 0 ] && ok "post-receive: com a ponta do origin fora do push, sai 0 (o push já foi aceito)" || bad "post-receive: rc=$RCP" "$OUT"; has 'AVISO' "post-receive: AVISA que a publicação será recusada"; has "o origin tem $FIX" "post-receive: diz o sha que o origin tem"; has 'NÃO será publicado' "post-receive: não finge que a publicação segue em segundo plano"; hasnt 'segue em segundo plano' "post-receive: sem a frase tranquilizadora"
+wait_for 90 "[ \$(grep -c 'sync wa: ok' '$T/mh/publish.log') -gt $N0 ]" && ok "post-receive: o aviso dispara o sync que traz a ponta do origin" || bad "post-receive: o sync não rodou" "$(tail -n 5 "$T/mh/publish.log")"
+# o caso de verdade, ponta a ponta: o origin está mudo na hora do push (o hook não consegue perguntar e aceita), o gate reescreve depois, e o publish recusado tem de ser DITO (log, status), nunca calado
+sleep 2; mv "$O" "$O.off"; ( cd "$WT" && echo late2 >> lib/a.py && git commit -qam "fix while origin is mute" ); DEAD=$(gx "$WT" rev-parse HEAD)
+OUT=$(push origin worker/ga-t1); has 'não consegui conferir' "origin mudo: o push é aceito e o hook diz que NÃO conferiu ('não sei' não vira 'ok')"; [ "$(gx "$MR" rev-parse refs/heads/worker/ga-t1)" = "$DEAD" ] && ok "origin mudo: o espelho aceitou o push (o estado de antes)" || bad "origin mudo: o espelho não aceitou" "$OUT"
+wait_for 30 "[ -n \"\$(git -C '$MR' config gtmirror.lastpublisherror)\" ]" && ok "origin mudo: a publicação falha e o erro fica registrado" || bad "origin mudo: sem erro registrado" "$(tail -n 3 "$T/mh/publish.log")"
+mv "$O.off" "$O"; REW2=$(gate_rewrite worker/ga-t1 b); [ -n "$REW2" ] && [ "$REW2" != "$FIX" ] && ! gx "$O" merge-base --is-ancestor "$FIX" "$REW2" && ok "gate: reescreveu de novo enquanto o dog consertava sobre a ponta velha" || bad "fixture: 2ª reescrita" "$REW2"
+rc_is 1 "publish recusado por não ser fast-forward: sync sai com rc 1 (visível)" "$M" sync wa; has "o origin tem $REW2" "publish recusado: o motivo diz o sha que o origin tem, não só 'rejected'"; has 'Rebase sobre origin/worker/ga-t1' "publish recusado: diz o que fazer"
+[ "$(gx "$O" rev-parse refs/heads/worker/ga-t1)" = "$REW2" ] && ok "publish recusado: nada foi publicado em silêncio (o origin segue com a ponta do gate)" || bad "publish recusado: o origin mudou" "$(gx "$O" rev-parse refs/heads/worker/ga-t1)"
+rc_is 1 "status: a branch condenada é pendente (rc 1)" "$M" status wa; has 'worker/ga-t1' "status: lista a branch"; has "o origin tem $REW2" "status: lastpublisherror traz o motivo e o sha do origin"
+# a saída para quem caiu nisso: refazer sobre a ponta do origin e empurrar com OUTRO nome (a mesma ainda guarda a ponta morta); a recusa diz isso
+rc_is 0 "o servidor puxa a ponta do gate" srv pull wa; OUT=$(srv status wa); has 'worker/ga-t1: PENDENTE e DIVERGE de origin/worker/ga-t1' "servidor status: diz que o branch DIVERGE do origin (não só PENDENTE)"
+( cd "$WT" && git reset -q --hard refs/remotes/origin/worker/ga-t1 && echo v2 >> lib/a.py && git commit -qam v2 )
+OUT=$(push origin worker/ga-t1); has 'non-fast-forward' "ponta morta: o refeito com o mesmo nome é recusado já no cliente (o espelho guarda a ponta velha)"
+OUT=$(push -f origin worker/ga-t1); has 'reescreve histórico' "ponta morta: com force o espelho recusa a reescrita"; has 'git fetch origin' "ponta morta: a recusa manda trazer o origin e refazer sobre ele"
+OUT=$(push origin HEAD:refs/heads/worker/ga-t1-v2); hasnt 'recusado' "ponta morta: com outro nome o refeito entra"
+wait_for 60 "[ \"\$(git -C '$O' rev-parse -q --verify refs/heads/worker/ga-t1-v2)\" = \"\$(git -C '$WT' rev-parse HEAD)\" ]" && ok "ponta morta: o refeito chegou ao origin" || bad "ponta morta: o refeito não chegou ao origin" "$(tail -n 5 "$T/mh/publish.log")"
+( cd "$WT" && git reset -q --hard "$REW2" )
+
 # ── L. remover worktree libera espaço; tudo limpo no fim ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
 rc_is 0 "wt-rm: remove o worktree" srv wt-rm wa ga-t1; has 'liberou' "wt-rm: informa o espaço liberado"; [ ! -e "$WT" ] && ok "wt-rm: o diretório sumiu" || bad "wt-rm: diretório ficou"
 rc_is 2 "wt-rm: de novo → erro (não finge que removeu)" srv wt-rm wa ga-t1; rc_is 0 "scan final: limpo" srv scan wa

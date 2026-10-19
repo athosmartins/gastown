@@ -81,6 +81,9 @@ cmd_status() {
     for b in $(g for-each-ref --format='%(refname:strip=2)' $pre); do s=$(g rev-parse "refs/heads/$b"); o=$(g rev-parse -q --verify "refs/remotes/origin/$b" 2>/dev/null || true); p=$(g rev-parse -q --verify "refs/gt/published/$b" 2>/dev/null || true)
       if [ "$s" = "$o" ] || [ "$s" = "$p" ]; then echo "  $b: publicada no origin"
       elif g merge-base --is-ancestor "$s" refs/remotes/origin/main 2>/dev/null; then echo "  $b: sem trabalho novo (já está no main)"
+      # pendente que o origin NÃO vai aceitar (ga-jgxgn6): o origin/<b> que este clone tem (o do último pull) e a ponta daqui divergem, cada uma com commit que a outra não tem (o gate reescreveu a branch). "Aguarde o mini publicar" seria mentira
+      # vazio → sem origin/<b> neste clone: nada a dizer, cai no texto de pendente · merge-base com erro (rc ≠ 1) → idem: só o rc 1 dos DOIS lados é divergência
+      elif [ -n "$o" ] && { g merge-base --is-ancestor "$o" "$s" 2>/dev/null; [ $? = 1 ]; } && { g merge-base --is-ancestor "$s" "$o" 2>/dev/null; [ $? = 1 ]; }; then echo "  $b: PENDENTE e DIVERGE de origin/$b (${o:0:7}): o mini não vai publicar; refaça o trabalho sobre origin/$b (rode pull) e empurre com OUTRO nome se o espelho recusar por reescrita"
       else echo "  $b: PENDENTE (empurre ao espelho ou aguarde o mini publicar)"; fi; done; done
 }
 
