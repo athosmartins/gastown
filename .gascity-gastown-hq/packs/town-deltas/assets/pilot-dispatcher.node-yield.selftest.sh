@@ -14,8 +14,8 @@
 #   cede para wa-worker/ps-worker e para JSON que não se lê · os três pontos de chamada existem, na ordem: yield pré-claim → yield pós-claim → gancho do nó → "o nó não ficou com a bead → cede".
 # COMO RODA: as funções e as linhas de configuração são extraídas VERBATIM do dispatcher (awk/grep) e rodam num shell filho sob `set -euo pipefail`; `python3` é um falso no PATH do filho (PATH sem gc/bd
 #   reais: selftest-sandbox-path.lib.sh) e conta as consultas. Contra um dispatcher sem as funções o arquivo se recusa a começar — o vermelho honesto.
-# CONTROLE NEGATIVO: cada guarda desligada numa cópia do dispatcher (NY_NO_MUTANTS=1 pula): shadow isenta · sem teto de effective · veredito vazio isenta · consulta a cada bead · sem o filtro de veto ·
-#   sem o filtro de alvo/cidade · wa-worker passa no pré-claim · a mesma bead conta duas vezes.
+# CONTROLE NEGATIVO: cada guarda desligada numa cópia do dispatcher (NY_NO_MUTANTS=1 pula): sem teto de effective · consulta a cada bead · sem o filtro de veto · sem o filtro de alvo/cidade ·
+#   wa-worker passa no pré-claim · a mesma bead conta duas vezes (6 mutantes). As guardas "só em on" e "veredito é node" são redundantes entre si e com o _pilot_node_first_shadow: sem mutante (ver o fim do arquivo).
 # Variáveis: PILOT_DISPATCHER_PATH · NY_NO_MUTANTS=1
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -164,9 +164,9 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
     local r; r=$(NY_MUTANT=1 PILOT_DISPATCHER_PATH="$m" bash "$0" 2>&1 | tail -1)
     case "$r" in "RESULT 0/"*) bad "mutante '$1' NÃO foi pego ($r)" ;; "RESULT "*) ok "mutante '$1' pego ($r)" ;; *) bad "mutante '$1': sem resultado ($r)" ;; esac
   }
-  mutant "shadow também isenta" '  [ "$PILOT_NODE_FIRST" = "on" ] || return 1' '  :'
+  # Sem mutante para `[ "$PILOT_NODE_FIRST" = "on" ] || return 1` nem para `[ "$_PNY_VERDICT" = "node" ] || return 1`: são guardas REDUNDANTES (em shadow o próprio _pilot_node_first_shadow deixa
+  # _PNF_VERDICT vazio; veredito vazio ou unknown deixa _PNY_EFFECTIVE vazio, que a checagem de effective barra). Desligar uma só dá um mutante equivalente, que nenhum teste pode pegar (medido: 2 sobreviveram).
   mutant "sem o teto de effective" '  [ "$_PNY_GRANTED_N" -lt "$_PNY_EFFECTIVE" ] || return 1' '  :'
-  mutant "veredito vazio isenta" '  [ "$_PNY_VERDICT" = "node" ] || return 1' '  [ "$_PNY_VERDICT" != "local" ] || return 1'
   mutant "consulta a cada bead" '  if [ "$_PNY_ASKED" != "1" ]; then' '  if true; then'
   mutant "sem o filtro de veto" '  [ -z "$(_pilot_node_first_veto "$_ne_labels")" ] || return 1' '  :'
   mutant "sem o filtro de alvo/cidade" '  { [ "$_ne_target" = "gastown.dog" ] && [ "$_ne_native" = "0" ]; } || return 1' '  :'
