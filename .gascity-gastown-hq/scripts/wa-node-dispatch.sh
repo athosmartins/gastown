@@ -8,11 +8,14 @@
 #       wa-node-dispatch.sh apply   <bead> [--basis label|any] [--dry-run]
 #       wa-node-dispatch.sh release <bead>                          depois da entrega: solta o dono e a rota
 #       --store DIR  pasta do store da bead (default: o que routes.jsonl diz para o prefixo do id)
-# SAÍDA: 0 feito (check: "roda no nó") · 10 fica no mini · 11 não consegui ler/decidir · 12 não elegível agora (bead já tem dono/rota, slot do nó ocupado) · 13 escrita não confirmada
-#   (desfeita) · 2 uso. Em dúvida o código é 10-13, nunca 0: o chamador que não entende um código trata como "fica no mini".
+# SAÍDA: 0 feito (check: "roda no nó") · 10 fica no mini · 11 não consegui ler/decidir · 12 não elegível agora (bead já tem dono/rota, INCLUSIVE a que já é do nó; slot do nó ocupado; corrida perdida) ·
+#   13 escrita não confirmada: a conferência reprovou (a mensagem diz se a atribuição foi desfeita ou não) OU o bd update falhou (rc ≠ 0 e ≠ 13) e a releitura não achou nada nosso — mas uma escrita morta por prazo
+#   ainda pode entrar, então nada está garantido e o Pilot segura a bead e relê na próxima varredura · 2 uso. Em dúvida o código é 10-13, nunca 0; a única exceção é a releitura PROVAR o estado (o bd update disse
+#   que falhou e a releitura confere a bead inteira do nó = 0, anotado no log). O Pilot lê 10/11/12 como "fica no mini" só para a bead que ELE leu como não-do-nó; a que já é do nó ele segura (2) sem olhar o rc.
 # O QUE FAZ (apply): relê a bead → exige aberta, sem dono e sem rota → classifica (scripts/wa-node-classify.py, na MESMA leitura; o exit code só vale se o JSON concorda — falha, saída ilegível ou código e veredito que discordam = 11, nunca 0) → exige o slot do nó livre (nenhuma bead em andamento do alias
 #   e nenhuma sessão do template) → UMA escrita com comparação atômica (bd update --if-assignee '' --if-status open: quem chegou antes vence, rc 13 do bd) que atribui ao alias, põe
-#   em andamento e carimba gc.routed_to → relê e confere → comenta. Falha na conferência desfaz. `release` só mexe em bead que é do alias E da rota.
+#   em andamento e carimba gc.routed_to → relê e confere → comenta. Falha na conferência desfaz. A escrita que o bd diz ter falhado (rc ≠ 0 e ≠ 13) cai na MESMA releitura: o rc de um update que não respondeu não diz o estado.
+#   `release` só mexe em bead que é do alias E da rota.
 # O QUE NÃO FAZ: não cria sessão. A receita provada na ga-2hd02v.1.6 (dog-remote) é "atribuir e deixar o pool criar"; `gc session new` à mão em template remoto roteado gera duas sessões e o
 #   crew-session-dedup derruba uma. Não mexe no city.toml, no config do host nem no Pilot. Não escreve dado da bead em lugar nenhum além do comentário curto (id, veredito, motivos).
 # Env (teste): GC_CITY, WA_NODE_BD (bd), WA_NODE_GC (gc), WA_NODE_CLASSIFY, WA_NODE_PY, WA_NODE_ALIAS (wa-worker-remote-1), WA_NODE_ROUTE_TEMPLATE (wa-worker-remote), WA_NODE_LOG, WA_NODE_TIMEOUT (20 s), WA_NODE_SESSION_TIMEOUT (60 s, só para `gc session list`).
@@ -106,7 +109,8 @@ apply)
   if [ "$dry" = 1 ]; then jlog apply "$id" 0 "dry-run: iria para $ALIAS ($b)"; say "dry-run: $id iria para $ALIAS (base=$b); nada foi escrito"; printf '%s\n' "$out"; exit 0; fi
   T "$BD" -C "$store" update "$id" --if-assignee "" --if-status open --assignee "$ALIAS" --status in_progress --set-metadata "gc.routed_to=$ROUTE" -q >/dev/null 2>&1; w=$?
   if [ "$w" = 13 ]; then jlog apply "$id" 12 "perdeu-a-corrida"; die 12 "$id mudou entre a leitura e a escrita (bd rc 13) — não mexo"; fi
-  [ "$w" = 0 ] || { jlog apply "$id" 13 "escrita-falhou rc=$w"; die 13 "bd update falhou (rc=$w) — nada garantido; confira $id"; }
+  # w ≠ 0 e ≠ 13 (prazo estourado, processo morto, bd fora): o rc de um update que não respondeu NÃO diz o estado, o servidor pode ter gravado (ga-9636op, gate-fix 1). Quem diz é a releitura, a MESMA conferência de
+  # baixo: confere = a escrita pegou e só a resposta se perdeu (segue como sucesso); algo nosso = desfaz; nada nosso = 13 "nada garantido", porque uma escrita morta por prazo ainda pode entrar e só uma releitura posterior resolve.
   A=$(bead_json "$store" "$id") || A=""
   if [ "$(printf '%s' "$A" | jq -r '.assignee // ""' 2>/dev/null)" != "$ALIAS" ] || [ "$(printf '%s' "$A" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null)" != "$ROUTE" ] || [ "$(printf '%s' "$A" | jq -r '.status // ""' 2>/dev/null)" != in_progress ]; then
     # o desfazer também é uma escrita que pode falhar, e o rc dele não diz o estado (a comparação atômica reprova, de propósito, quando a escrita nem pegou e a bead nunca foi nossa): relê, e o log e a
@@ -115,15 +119,20 @@ apply)
     A=$(bead_json "$store" "$id") || A=""
     u=NAO-desfeito
     if [ -n "$A" ] && [ "$(printf '%s' "$A" | jq -r '.assignee // ""' 2>/dev/null)" != "$ALIAS" ] && [ "$(printf '%s' "$A" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null)" != "$ROUTE" ]; then u=desfeito; else say "ATENÇÃO: não consegui desfazer a atribuição de $id — confira à mão"; fi
+    if [ "$w" != 0 ]; then   # o bd disse que a escrita falhou: "nada nosso" na releitura não prova que ela não vai entrar, então a mensagem e o log NÃO dizem "desfeita"
+      [ "$u" = desfeito ] && { jlog apply "$id" 13 "escrita-falhou-sem-nada-nosso rc=$w"; die 13 "bd update falhou (rc=$w) e a releitura não mostra nada nosso em $id — uma escrita que estourou o prazo pode ainda entrar: nada garantido (o Pilot segura a bead e relê)"; }
+      jlog apply "$id" 13 "escrita-falhou-NAO-desfeito rc=$w"; die 13 "bd update falhou (rc=$w) e não consegui confirmar nem desfazer a atribuição de $id — NÃO desfeita: confira à mão"
+    fi
     jlog apply "$id" 13 "conferencia-falhou-$u"; [ "$u" = desfeito ] && die 13 "não consegui confirmar a atribuição de $id — desfeita"; die 13 "não consegui confirmar a atribuição de $id — NÃO desfeita: confira à mão"
   fi
   T "$BD" -C "$store" comment "$id" "nó (ga-2hd02v.1.10): atribuída a $ALIAS, rota $ROUTE — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O pool cria a sessão; sem gc session new à mão (a duplicata é derrubada pelo dedup). Ao fim da entrega: wa-node-dispatch.sh release $id." >/dev/null 2>&1 || say "aviso: comentário em $id não gravado"
-  jlog apply "$id" 0 "despachada para $ALIAS ($b)"; say "$id → $ALIAS ($ROUTE), base=$b"; printf '%s\n' "$out"; exit 0 ;;
+  wn=""; [ "$w" = 0 ] || wn=" [bd update rc=$w, a releitura confere]"   # o rc do bd mentiu (resposta perdida): fica no log
+  jlog apply "$id" 0 "despachada para $ALIAS ($b)$wn"; say "$id → $ALIAS ($ROUTE), base=$b$wn"; printf '%s\n' "$out"; exit 0 ;;
 
 release)
   as=$(printf '%s' "$B" | jq -r '.assignee // ""'); rt=$(printf '%s' "$B" | jq -r '.metadata["gc.routed_to"] // ""')
   [ "$as" = "$ALIAS" ] && [ "$rt" = "$ROUTE" ] || { jlog release "$id" 12 "nao-e-do-no assignee=$as rota=$rt"; die 12 "$id não é do $ALIAS com a rota $ROUTE (assignee=${as:-—} rota=${rt:-—}) — não solto"; }
-  T "$BD" -C "$store" update "$id" --if-assignee "$ALIAS" --assignee "" --unset-metadata gc.routed_to -q >/dev/null 2>&1 || { jlog release "$id" 13 "escrita-falhou"; die 13 "bd update falhou ao soltar $id"; }
+  T "$BD" -C "$store" update "$id" --if-assignee "$ALIAS" --assignee "" --unset-metadata gc.routed_to -q >/dev/null 2>&1 || { jlog release "$id" 13 "escrita-falhou"; die 13 "bd update falhou ao soltar $id — nada garantido (um update morto por prazo pode ter gravado); confira"; }
   A=$(bead_json "$store" "$id") || A=""
   { [ -n "$A" ] && [ -z "$(printf '%s' "$A" | jq -r '.assignee // ""')" ] && [ -z "$(printf '%s' "$A" | jq -r '.metadata["gc.routed_to"] // ""')" ]; } || { jlog release "$id" 13 "conferencia-falhou"; die 13 "não consegui confirmar que $id foi solta — confira à mão"; }
   T "$BD" -C "$store" comment "$id" "nó (ga-2hd02v.1.10): dono $ALIAS e rota $ROUTE soltos após a entrega (evita sessão nova a cada 15 min até o merge)." >/dev/null 2>&1 || true
