@@ -37,6 +37,17 @@
 #    15h. stuck_execution: turn=external skipped by turn alone, turn=mayor not
 #    15i. stuck_execution: model unavailable/raising/verdict-less → label fallback
 #         preserved (a model with no verdict is "don't know", not "executing")
+#   GATE QUEUE (ga-z5311j — in_progress but waiting for review is not a stall):
+#    15j. in_progress + gate:queued + OPEN marker, 13h → None (replay of ga-gm5rv5)
+#    15k. same bead, lookup answered [] → still flagged (residual label alone silences nothing)
+#    15l. lookup FAILS (rc / garbage / empty body / no answer) → labeled bead out of the
+#         alarm but called "marker não verificado", unlabeled bead still flagged
+#    15m. marker keyed on the SLING bead (pilot.sling_bead) counts for the story (ga-lrglm)
+#    15n. waiting bead listed apart, stuck sibling still flagged; waiting-only → None + log
+#    15o. HQ git identity test@example.com → "sem dono"; real owners still shown
+#    15p. lazy + bounded: no gate query on the healthy path, 2 queries however many stale
+#    15q. _gate_active_source_beads classification table (marker vs run, active vs terminal)
+#    15r. the 61st open marker is still found (--limit 0, no silent 50-row cut)
 #   REGRESSION:
 #    16. mail-send failure → not counted, ntfy still fires, retry next tick
 #    17. detect() pure, returns the three dimensions when each fires
@@ -492,6 +503,249 @@ for fn in (None, boom, (lambda b: {}), (lambda b: None)):
     assert r is not None and 'ga-plain' in r and 'ga-excl' not in r, (fn, r)
 print('OK_FAIL_OPEN_FALLBACK')
 " "OK_FAIL_OPEN_FALLBACK"
+
+# --- ga-z5311j: a bead waiting in the gate's review queue is not an execution stall --
+# Live false alarms (07/10, mails ga-wisp-xc05d / ga-wisp-dbeju): ga-bwtrrf, ga-nqjgf0,
+# ga-gm5rv5, ga-pa3c6h ... "parado há 9h/13h" — all four sat in_progress with an OPEN
+# gate-status:queued marker, i.e. in the gate's review queue (depth 25-30 that day), and
+# the REMEDY text (shutdown-dance / kill / re-dispatch) would have been wrong and
+# destructive for them. stuck_execution() used to make ONE call (the bd list) and never
+# looked at the gate at all.
+# Shared fixture for 15j-15r. fake_sh answers the three queries stuck_execution() can
+# make and imitates the two bd behaviours that silently under-report a gate lookup in
+# production: gate markers/runs are INFRA beads, hidden unless --include-infra is passed
+# (ga-vm20x), and a list without --limit 0 is cut at 50 rows with no sign in the JSON
+# (ga-21kmp). A failing lookup is a tuple spec: ("none",) sh() answered nothing,
+# ("rc", n) bd exited n, ("raw", text) rc 0 with a body that is not a JSON array.
+GATE_HARNESS='
+import json, time
+NOW = time.time()
+def _age(h):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - h * 3600))
+class _R:
+    def __init__(self, out, rc=0):
+        self.stdout, self.returncode, self.stderr = out, rc, ""
+def _reply(spec):
+    if isinstance(spec, list):
+        return _R(json.dumps(spec))
+    if spec[0] == "none":
+        return None
+    if spec[0] == "rc":
+        return _R("", spec[1])
+    if spec[0] == "raw":
+        return _R(spec[1])
+    raise AssertionError(spec)
+CALLS = []
+def make_sh(in_progress, markers=None, runs=None):
+    del CALLS[:]
+    def rows_of(spec, args):
+        spec = [] if spec is None else spec
+        if not isinstance(spec, list):
+            return spec
+        if "--include-infra" not in args:
+            return []
+        lim = args[args.index("--limit") + 1] if "--limit" in args else "50"
+        return spec if lim == "0" else spec[:int(lim)]
+    def fake_sh(args, timeout=20):
+        CALLS.append(list(args))
+        a = " ".join(args)
+        if "type:quality-gate-marker" in a:
+            return _reply(rows_of(markers, args))
+        if "type:quality-gate-run" in a:
+            return _reply(rows_of(runs, args))
+        if "in_progress" in a:
+            return _reply(in_progress)
+        return _reply([])
+    return fake_sh
+def marker(src, *statuses):
+    return {"id": "mk-" + src, "status": "open",
+            "labels": ["type:quality-gate-marker", "source-bead:" + src] + ["gate-status:" + s for s in statuses]}
+def gate_run(src, *statuses):
+    return {"id": "run-" + src, "status": "open",
+            "labels": ["type:quality-gate-run", "source-bead:" + src] + ["gate-status:" + s for s in statuses]}
+def bead(i, hours, labels=(), assignee="", owner="test@example.com", meta=None):
+    d = {"id": i, "status": "in_progress", "assignee": assignee, "owner": owner,
+         "updated_at": _age(hours), "labels": list(labels)}
+    if meta:
+        d["metadata"] = meta
+    return d
+'
+
+# --- 15j. in_progress + gate:queued + OPEN marker → None (the replay) --------
+run_test "stuck_execution: in_progress + gate:queued + OPEN marker, 13h → None (waiting in the gate queue, replay of ga-gm5rv5)" "
+$HARNESS
+$GATE_HARNESS
+m.sh = make_sh([bead('ga-gm5rv5', 13, ['gate:queued','story:in-flight'])],
+               markers=[marker('ga-gm5rv5', 'queued')])
+r = m.stuck_execution(NOW)
+print('R=%r' % r)
+assert r is None, r
+print('OK_GATE_QUEUE_NOT_STUCK')
+" "OK_GATE_QUEUE_NOT_STUCK"
+
+# --- 15k. negative control: lookup answered [] → a residual label alone silences nothing --
+# derive() documents the same rule: a caller that resolved the marker overrides the
+# label in BOTH directions (a closed marker unlocks a leftover gate:queued, ga-zltsr).
+run_test "stuck_execution: same bead, gate lookup answered [] (nobody at the gate) → still flagged" "
+$HARNESS
+$GATE_HARNESS
+m.sh = make_sh([bead('ga-gm5rv5', 13, ['gate:queued'])], markers=[], runs=[])
+r = m.stuck_execution(NOW)
+print('R=%r' % r)
+assert r is not None and 'ga-gm5rv5' in r, r
+print('OK_RESIDUAL_LABEL_STILL_FLAGS')
+" "OK_RESIDUAL_LABEL_STILL_FLAGS"
+
+# --- 15l. the lookup FAILING is its own state — neither empty nor found -------
+# found → out of the alarm, listed apart; empty ([] confirmed) → flagged (15k); failed →
+# the canonical derive() fallback (no marker verdict → the gate:* label decides): a
+# labeled bead stays out of the alarm but is listed as "marker não verificado"; a bead
+# with no gate label at all is still flagged. rc != 0, a body that is not a JSON array,
+# an EMPTY body (bd prints [] when nothing matches) and no answer at all are all failures.
+run_test "stuck_execution: gate lookup FAILS → labeled bead listed as marker não verificado, unlabeled bead still flagged" "
+$HARNESS
+$GATE_HARNESS
+labeled = bead('ga-labeled', 13, ['gate:queued'])
+plain = bead('ga-plain', 13, ['lane:small'])
+shapes = [('marker rc=1', dict(markers=('rc', 1))),
+          ('marker garbage', dict(markers=('raw', 'not json at all'))),
+          ('marker empty body', dict(markers=('raw', ''))),
+          ('marker no answer', dict(markers=('none',))),
+          ('marker object not array', dict(markers=('raw', '{}'))),
+          ('run rc=1', dict(markers=[], runs=('rc', 1))),
+          ('run garbage', dict(markers=[], runs=('raw', '{oops')))]
+for name, kw in shapes:
+    m.sh = make_sh([labeled, plain], **kw)
+    r = m.stuck_execution(NOW)
+    print('%s -> %r' % (name, r))
+    assert r is not None, name
+    head, sep, tail = r.partition('aguardando revisão')
+    assert 'ga-plain' in head and 'ga-labeled' not in head, (name, r)
+    assert 'ga-labeled' in tail and 'marker não verificado' in tail, (name, r)
+print('OK_LOOKUP_FAILURE_IS_ITS_OWN_STATE')
+" "OK_LOOKUP_FAILURE_IS_ITS_OWN_STATE"
+
+# --- 15m. marker keyed on the SLING bead (ga-lrglm wrapper dispatch) ----------
+run_test "stuck_execution: marker keyed on the SLING bead (pilot.sling_bead) counts for the story; an unrelated marker does not" "
+$HARNESS
+$GATE_HARNESS
+story = bead('ga-story', 13, ['gate:queued'], meta={'pilot.sling_bead': 'ga-sling9'})
+m.sh = make_sh([story], markers=[marker('ga-sling9', 'queued')])
+r = m.stuck_execution(NOW)
+print('KEYED_ON_SLING=%r' % r)
+assert r is None, r
+m.sh = make_sh([story], markers=[marker('ga-someone-else', 'queued')])
+r = m.stuck_execution(NOW)
+print('UNRELATED=%r' % r)
+assert r is not None and 'ga-story' in r, r
+print('OK_SLING_KEYED_MARKER')
+" "OK_SLING_KEYED_MARKER"
+
+# --- 15n. per-bead, not a blanket mute: waiting listed apart, stuck sibling flagged --
+run_test "stuck_execution: gate-waiting bead listed apart, genuinely stuck sibling still flagged" "
+$HARNESS
+$GATE_HARNESS
+m.sh = make_sh([bead('ga-waiting', 13, ['gate:queued']), bead('ga-realstuck', 9, ['lane:small'], assignee='dog-b')],
+               markers=[marker('ga-waiting', 'queued')])
+r = m.stuck_execution(NOW)
+print('R=%r' % r)
+assert r is not None, r
+head, sep, tail = r.partition('aguardando revisão')
+assert sep and 'ga-realstuck' in head and 'ga-waiting' not in head, r
+assert 'ga-waiting' in tail and 'ga-realstuck' not in tail, r
+print('OK_MIXED_WAITING_AND_STUCK')
+" "OK_MIXED_WAITING_AND_STUCK"
+
+run_test "stuck_execution: waiting-only set returns None but the bead is logged apart as aguardando revisão" "
+$HARNESS
+$GATE_HARNESS
+import contextlib, io
+m.sh = make_sh([bead('ga-gm5rv5', 13, ['gate:queued'])], markers=[marker('ga-gm5rv5', 'queued')])
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    r = m.stuck_execution(NOW)
+out = buf.getvalue()
+print('LOG=%r' % out)
+assert r is None, r
+assert 'aguardando revisão' in out and 'ga-gm5rv5' in out and 'há 13h' in out, out
+print('OK_WAITING_LOGGED_APART')
+" "OK_WAITING_LOGGED_APART"
+
+# --- 15o. the HQ git identity is not an owner ---------------------------------
+# bd stamps `owner` with the git user.email of the clone that ran `bd create`; for the
+# HQ that is test@example.com — not a person or a session (the mails read
+# "ga-gm5rv5 (owner=test@example.com) parado há 13h"). Real owners stay visible.
+run_test "stuck_execution: the HQ git identity (test@example.com) is not an owner → sem dono; real owners still shown" "
+$HARNESS
+$GATE_HARNESS
+def reason_for(**kw):
+    m.sh = make_sh([bead('ga-o', 13, **kw)], markers=[], runs=[])
+    return m.stuck_execution(NOW)
+r = reason_for(assignee='', owner='test@example.com')
+print('NO_ASSIGNEE=%r' % r)
+assert 'ga-o (sem dono) parado há 13h' in r and 'test@example.com' not in r, r
+r = reason_for(assignee='dog-1', owner='test@example.com')
+print('WITH_ASSIGNEE=%r' % r)
+assert 'ga-o (assignee=dog-1) parado há 13h' in r and 'test@example.com' not in r, r
+r = reason_for(assignee='', owner='athosmartins@gmail.com')
+print('REAL_OWNER=%r' % r)
+assert 'ga-o (owner=athosmartins@gmail.com) parado há 13h' in r, r
+print('OK_PLACEHOLDER_OWNER_IS_SEM_DONO')
+" "OK_PLACEHOLDER_OWNER_IS_SEM_DONO"
+
+# --- 15p. poll cost: lazy and bounded -----------------------------------------
+# A detector costs a poll (ga-y0g5x): the healthy path must not touch the gate at all, and
+# a sweep with many stale beads must read the gate ONCE (bulk), not once per bead.
+run_test "stuck_execution: no gate query on the healthy path; stale beads cost exactly one marker + one run query, however many" "
+$HARNESS
+$GATE_HARNESS
+def gate_calls():
+    return [c for c in CALLS if any('quality-gate' in x for x in c)]
+m.sh = make_sh([bead('ga-fresh', 1, ['gate:queued']), bead('ga-athos', 13, ['next-action:athos'])])
+assert m.stuck_execution(NOW) is None
+assert gate_calls() == [], gate_calls()
+stale = [bead('ga-s%d' % i, 13, ['lane:small'], assignee='dog-%d' % i) for i in range(6)]
+m.sh = make_sh(stale, markers=[], runs=[])
+r = m.stuck_execution(NOW)
+assert r is not None
+kinds = sorted(('marker' if any('quality-gate-marker' in x for x in c) else 'run') for c in gate_calls())
+print('GATE_QUERIES=%r' % kinds)
+assert kinds == ['marker', 'run'], kinds
+print('OK_GATE_LOOKUP_IS_LAZY_AND_BOUNDED')
+" "OK_GATE_LOOKUP_IS_LAZY_AND_BOUNDED"
+
+# --- 15q. what counts as "in the gate queue" ----------------------------------
+# Same active vocabulary as pilot-dispatcher's _beadid_has_active_gate_artifact and
+# inflight-reclaim-guard's list_gate_active_source_beads (marker: ready/claimed/queued/
+# dispatching/reviewing; run: running/claimed), plus the guard's fail-safe: a marker with no
+# gate-status label at all reads as active. needs-rebase / error and the terminal pairs
+# do not (the gate stepped back onto an external actor — not "waiting for review").
+run_test "_gate_active_source_beads: active marker/run states and a label-less marker count; needs-rebase, error and terminal ones do not" "
+$HARNESS
+$GATE_HARNESS
+mk = [marker('ga-a', 'queued'), marker('ga-b', 'needs-rebase'), marker('ga-c', 'reviewing'),
+      marker('ga-d'), marker('ga-e', 'needs-rebase', 'superseded'), marker('ga-f', 'queued', 'dispatching'),
+      marker('ga-g', 'ready'), marker('ga-h', 'claimed'), marker('ga-i', 'dispatching'), marker('ga-j', 'error')]
+rn = [gate_run('ga-k', 'running'), gate_run('ga-l', 'passed'), gate_run('ga-n', 'superseded'), gate_run('ga-o', 'claimed')]
+m.sh = make_sh([], markers=mk, runs=rn)
+got = m._gate_active_source_beads()
+print('GOT=%r' % sorted(got))
+want = {'ga-a','ga-c','ga-d','ga-f','ga-g','ga-h','ga-i','ga-k','ga-o'}
+assert got == want, sorted(got ^ want)
+print('OK_GATE_ACTIVE_CLASSIFICATION')
+" "OK_GATE_ACTIVE_CLASSIFICATION"
+
+# --- 15r. no silent 50-row cut (ga-21kmp) -------------------------------------
+run_test "stuck_execution: the bead whose marker is the 61st open marker is still found (--limit 0)" "
+$HARNESS
+$GATE_HARNESS
+others = [marker('ga-x%d' % i, 'queued') for i in range(60)]
+m.sh = make_sh([bead('ga-gm5rv5', 13, ['gate:queued'])], markers=others + [marker('ga-gm5rv5', 'queued')])
+r = m.stuck_execution(NOW)
+print('R=%r' % r)
+assert r is None, r
+print('OK_NO_SILENT_TRUNCATION')
+" "OK_NO_SILENT_TRUNCATION"
 
 # --- 16. mail-send failure → not counted, ntfy fires, retry ------------------
 run_test "mail-send failure → not counted, ntfy fires (retry next tick)" "

@@ -39,7 +39,7 @@ DESIGN — mirrors pipeline-throughput-heartbeat.py's proven safety machinery:
   • Kill-switch: PROD_STALL_WATCHDOG_ENABLED=0 → no-op.
   • Reads git (per-rig, reliable across rigs — `bd -C` is NOT) + dispatcher logs +
     `bd list` from the HQ subdir + `gc session list` (runtime, not Dolt). It uses
-    `bd` only for stuck-execution/demand reads, with short timeouts and fail-open.
+    `bd` only for stuck-execution/demand/gate-queue reads, with short timeouts and fail-open.
 
 DETECTION DIMENSIONS:
   1. DEPLOY-BLOCK — for each rig root, `git -C <root> rev-list --count
@@ -56,7 +56,10 @@ DETECTION DIMENSIONS:
      awaiting the Athos (ga-teljci). If that model is unavailable it falls back to
      skipping beads labeled story:awaiting-external-merge or
      pilot:no-auto-dispatch — they already declare they're not
-     dispatchable/actionable here (ga-e5tn8).
+     dispatchable/actionable here (ga-e5tn8). A bead waiting in the gate's
+     review queue is not an execution stall either — it is the gate's turn
+     (an OPEN active marker/run names it): left out of the alarm and listed
+     apart as "aguardando revisão no gate" (ga-z5311j).
 
 Recovers silently; silence = healthy. Never crashes the loop.
 """
@@ -82,6 +85,15 @@ try:
     from bead_state import derive as _CANONICAL_STATE_FN  # type: ignore
 except Exception:
     _CANONICAL_STATE_FN = None
+
+# ga-z5311j: the canonical gate-queue label vocabulary (gate:queued / gate:reviewing /
+# gate:needs-rebase). Used ONLY as the fallback when the gate itself could not be read —
+# see _in_gate_queue(). Imported apart from derive() above so a bead_state without
+# GATE_ACTIVE never takes the whole canonical model down with it.
+try:
+    from bead_state import GATE_ACTIVE as _GATE_LABELS  # type: ignore
+except Exception:
+    _GATE_LABELS = frozenset({"gate:queued", "gate:reviewing", "gate:needs-rebase"})
 
 # ── paths / identities ───────────────────────────────────────────────────────
 CITY = os.environ.get("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
@@ -109,6 +121,7 @@ STUCK_EXEC_SEC = int(os.environ.get("PROD_STALL_STUCK_SEC", "28800"))   # 8h in_
 CONFIRM_TICKS = int(os.environ.get("PROD_STALL_CONFIRM_TICKS", "2"))    # consecutive before escalate
 ESCALATE_COOLDOWN_SEC = int(os.environ.get("PROD_STALL_COOLDOWN_SEC", "10800"))  # per-dim, 3h
 GIT_FETCH_TIMEOUT = int(os.environ.get("PROD_STALL_FETCH_TIMEOUT", "30"))
+GATE_LOOKUP_TIMEOUT = int(os.environ.get("PROD_STALL_GATE_LOOKUP_TIMEOUT", "25"))  # per bd list of a gate artifact type
 MAYOR_ADDR = os.environ.get("PROD_STALL_MAYOR_ADDR", "mayor")
 
 # imp14: flow-authority advisory file path (shared with TSW, the elected authority).
@@ -409,6 +422,120 @@ def _canonical_turn_is_elsewhere(bead: dict):
         return None
 
 
+# ga-z5311j: bd stamps `owner` with the git user.email of the clone that ran `bd create`;
+# in the HQ that is a placeholder identity (test@example.com) — not a person and not a
+# session. Printing it as the party holding the stuck slot sent the Mayor looking for
+# someone to peek/kill who does not exist (07/10 mails: "ga-gm5rv5 (owner=test@example.com)").
+PLACEHOLDER_OWNERS = frozenset({"test@example.com"})
+
+# ga-z5311j: a bead can sit in_progress for hours, untouched, and be perfectly healthy
+# because it is WAITING IN THE GATE'S REVIEW QUEUE (depth 25-30 on 07/10, waits of 9-13h
+# were real). That is the gate's turn, not an executor's, and this dimension's REMEDY
+# (shutdown-dance / kill / re-dispatch) would be wrong and destructive for it.
+# "In the queue" is only believed with evidence: an OPEN type:quality-gate-marker or
+# type:quality-gate-run in an active gate-status that names the bead (or its
+# pilot.sling_bead — a wrapper dispatch keys the marker on the sling bead, ga-lrglm).
+# A gate:queued label on its own is NOT evidence: a closed marker with a leftover label
+# is exactly a bead nobody is working (ga-zltsr), so that case still alarms.
+# Active vocabulary = pilot-dispatcher.sh::_beadid_has_active_gate_artifact and
+# inflight-reclaim-guard.py::list_gate_active_source_beads; the guard's fail-safe is
+# kept too (quality-gate-guard.sh::marker_active_from_labels): a marker with no
+# gate-status label at all reads as active.
+GATE_MARKER_ACTIVE = frozenset({"ready", "claimed", "queued", "dispatching", "reviewing", "running"})
+GATE_RUN_TERMINAL = frozenset({"superseded", "aborted", "passed", "failed"})
+
+
+def _parse_bd_array(raw):
+    """Strict reader for a `bd list --json` body: the parsed list, or None when the body
+    cannot be trusted. Unlike parse_bd_json() (fail-open: unreadable → []), an empty
+    body, junk, or a JSON value that is not an array is NOT "nothing matched" — bd
+    prints `[]` for that (quality-gate-guard.sh::verdict_count_from_query's contract).
+    A trailing non-JSON summary line after the array is tolerated, same as parse_bd_json."""
+    if not raw or not raw.strip():
+        return None
+    try:
+        d, _end = json.JSONDecoder().raw_decode(raw.lstrip())
+    except Exception:
+        return None
+    return d if isinstance(d, list) else None
+
+
+def _gate_artifact_active(art, is_run):
+    """Is this OPEN gate marker/run in an active gate-status? Mirrors the canonical
+    classifiers (see the vocabulary note above): a marker is active when it carries no
+    gate-status label at all or any of GATE_MARKER_ACTIVE (a mid-transition marker with
+    two labels counts if either is active; needs-rebase / error / terminal ones do not —
+    the gate stepped back onto an external actor, it is not "waiting for review"); a run
+    is active unless it carries at least one gate-status and every one of them is
+    terminal (a run with no gate-status label at all reads as active, same fail-safe)."""
+    # vazio (sem labels / labels []) → statuses=[]: o fail-safe de cada tipo decide (ativo);
+    # ilegível (labels que não é lista) → idem, nunca levanta
+    raw = art.get("labels")
+    statuses = [str(l).split(":", 1)[1] for l in raw
+                if str(l).startswith("gate-status:")] if isinstance(raw, list) else []
+    if is_run:
+        return not (statuses and all(s in GATE_RUN_TERMINAL for s in statuses))
+    return not statuses or any(s in GATE_MARKER_ACTIVE for s in statuses)
+
+
+def _gate_active_source_beads():
+    """frozenset of the source-bead ids that have an OPEN gate marker/run in an active
+    gate-status, or None when the gate could not be read ("não sei"). Two bulk reads (one
+    per artifact type), never one per bead: --include-infra because gate markers/runs are
+    INFRA beads that bd hides by default (ga-vm20x), --limit 0 because bd silently cuts a
+    list at 50 rows (ga-21kmp). A frozenset — even an empty one — is a CONFIRMED answer;
+    None is the third state and must never be read as "nobody is at the gate"."""
+    active = set()
+    for gate_type, is_run in (("type:quality-gate-marker", False), ("type:quality-gate-run", True)):
+        # vazio ([] confirmado, rc 0) → ninguém desse tipo no gate: nada entra em `active`;
+        # falhou/ilegível (sh() sem resposta, rc != 0, corpo vazio ou que não é array JSON) →
+        # devolve None já aqui, sem terminar o outro tipo: nunca vira [] confirmado
+        r = sh([BD, "list", "--include-infra", "--label", gate_type, "--status", "open",
+                "--json", "--limit", "0"], timeout=GATE_LOOKUP_TIMEOUT)
+        if not r or r.returncode != 0:
+            return None
+        arts = _parse_bd_array(r.stdout)
+        if arts is None:
+            return None
+        for art in arts:
+            if not isinstance(art, dict) or not _gate_artifact_active(art, is_run):
+                continue
+            # vazio (sem labels / sem source-bead:) → o artefato não aponta bead nenhuma e não
+            # entra; ilegível (labels que não é lista) → idem
+            labels = art.get("labels")
+            for l in (labels if isinstance(labels, list) else []):
+                if str(l).startswith("source-bead:"):
+                    active.add(str(l)[len("source-bead:"):])
+    return frozenset(active)
+
+
+def _in_gate_queue(bead, gate_sources):
+    """Three-way verdict for a stale bead: True = confirmed in the gate queue (an active
+    artifact names the bead or its pilot.sling_bead); False = confirmed NOT in it (the gate
+    was read and nothing names the bead — a leftover gate:* label decides nothing); None =
+    the gate could not be read (gate_sources is None)."""
+    if gate_sources is None:
+        return None
+    ids = {bead.get("id")}
+    # vazio (sem metadata / sem pilot.sling_bead) → só o id da própria bead; ilegível
+    # (metadata que não é dict, sling que não é string) → idem
+    meta = bead.get("metadata")
+    sling = meta.get("pilot.sling_bead") if isinstance(meta, dict) else None
+    if isinstance(sling, str) and sling.strip():
+        ids.add(sling.strip())
+    return bool(ids & gate_sources)
+
+
+def _has_gate_label(bead):
+    """Does the bead itself carry a gate-queue label? Only consulted when the gate could
+    not be read: the same label heuristic bead_state.derive() falls back to when its
+    caller did not resolve gate_active."""
+    # vazio (sem labels) → False; ilegível (labels que não é lista) → False: sem prova, a
+    # bead segue sob o teste de idade
+    raw = bead.get("labels")
+    return isinstance(raw, list) and any(isinstance(l, str) and l in _GATE_LABELS for l in raw)
+
+
 # ── DIMENSION 3: stuck-execution ──────────────────────────────────────────────
 def stuck_execution(now=None):
     """Return a reason string if any in_progress bead has updated_at older than
@@ -417,7 +544,18 @@ def stuck_execution(now=None):
     state is parked / awaiting_athos (or whose turn is the Athos's or external) are
     skipped regardless of age — see ga-teljci; when the canonical model is
     unavailable, beads carrying a STUCK_EXEC_EXCLUDE_LABELS label are skipped
-    instead — see ga-e5tn8."""
+    instead — see ga-e5tn8.
+
+    ga-z5311j: a stale bead waiting in the gate's review queue is not an execution stall
+    either — it is the gate's turn. It is left out of the alarm and listed apart
+    ("aguardando revisão no gate"): in the reason when other beads do alarm, in the log
+    when none does. The gate is read lazily (only once a bead is already stale; one
+    marker query + one run query per sweep) and the answer has three outcomes —
+    confirmed in the queue → listed apart; confirmed NOT in it (gate read, nothing
+    names the bead) → a leftover gate:* label decides nothing and the bead still
+    alarms; gate unreadable → the bead's own gate:* label decides, as bead_state.derive()
+    does when its caller did not resolve gate_active, the bead is listed as "marker não
+    verificado" and a DEGRADED line goes to the log."""
     now = now if now is not None else time.time()
     r = sh([BD, "list", "--status", "in_progress", "--json", "--limit", "0"], timeout=25)
     if not r or r.returncode != 0:
@@ -425,7 +563,8 @@ def stuck_execution(now=None):
     beads = parse_bd_json(r.stdout)
     if not beads:
         return None
-    stuck = []
+    stuck, waiting = [], []
+    gate_sources, gate_read = None, False  # the gate is read once per sweep, and only for a bead already stale
     for b in beads:
         if not isinstance(b, dict):
             continue
@@ -439,23 +578,52 @@ def stuck_execution(now=None):
             continue  # can't age it → don't flag (fail-safe)
         age = now - e
         if age > STUCK_EXEC_SEC:
+            if not gate_read:
+                gate_sources, gate_read = _gate_active_source_beads(), True
+                if gate_sources is None:
+                    print("[prod-stall] DEGRADED stuck-exec-gate-lookup: fila do gate ilegível "
+                          "(bd list de marker/run falhou, estourou o tempo ou veio ilegível) — beads "
+                          "com label gate:* ficam fora do alarme como 'marker não verificado'; as "
+                          "sem label seguem sob o teste de idade", flush=True)
+            in_queue = _in_gate_queue(b, gate_sources)
+            if in_queue is True or (in_queue is None and _has_gate_label(b)):
+                waiting.append("%s (há %dh%s)" % (b.get("id", "?"), int(age // 3600),
+                                                  "" if in_queue else ", marker não verificado"))
+                continue
             # ga-5r96t: assignee is who's actually holding the stuck slot (the
             # thing "gc session peek/kill" can act on) — owner is just who
             # created the bead, often a human with no session to peek/kill.
+            # vazio (assignee e owner ausentes) → "?"; owner placeholder do HQ → "sem dono"
+            # (ga-z5311j), nunca o e-mail de teste como se fosse alguém
             assignee, owner = b.get("assignee"), b.get("owner")
+            placeholder_owner = isinstance(owner, str) and owner in PLACEHOLDER_OWNERS
+            if placeholder_owner:
+                owner = None
             if assignee:
                 label = "assignee=%s" % assignee
                 if owner and owner != assignee:
                     label += " (owner=%s)" % owner
             elif owner:
                 label = "owner=%s" % owner
+            elif placeholder_owner:
+                label = "sem dono"
             else:
                 label = "?"
             stuck.append("%s (%s) parado há %dh" % (b.get("id", "?"), label, int(age // 3600)))
+    if waiting:
+        print("[prod-stall] stuck-exec: %d bead(s) aguardando revisão no gate (fora do alarme): %s"
+              % (len(waiting), "; ".join(waiting)), flush=True)
     if not stuck:
         return None
-    return ("bead(s) in_progress sem update há >%dh — atribuídos mas sem progresso: %s"
-            % (STUCK_EXEC_SEC // 3600, "; ".join(stuck)))
+    reason = ("bead(s) in_progress sem update há >%dh — atribuídos mas sem progresso: %s"
+              % (STUCK_EXEC_SEC // 3600, "; ".join(stuck)))
+    if waiting:
+        shown = waiting[:5]
+        reason += (" | aguardando revisão no gate (fila do gate, fora do alarme — não aplicar o "
+                   "remédio a elas): %s%s" % ("; ".join(shown),
+                                              " (+%d)" % (len(waiting) - len(shown))
+                                              if len(waiting) > len(shown) else ""))
+    return reason
 
 
 # ── escalation: Mayor mail (durable, an agent that ACTS) + Athos ntfy ─────────
@@ -486,6 +654,8 @@ REMEDY = {
         "3. kickstart supervisor + quality-gate-dispatcher; confirme 'Gate PASSED'."),
     "stuck-exec": (
         "REMÉDIO (stuck-exec):\n"
+        "0. Bead citada em 'aguardando revisão no gate' está na FILA DO GATE (vez do gate, "
+        "não do executor): NÃO aplique os passos abaixo a ela (ga-z5311j).\n"
         "1. gc session peek <owner/sessão> — confirme se está realmente parado.\n"
         "2. Shutdown-dance (3 nudges) ou kill pra liberar o slot; re-despache o bead.\n"
         "3. Se for misroute, circuit-break + reassine o dono correto."),
