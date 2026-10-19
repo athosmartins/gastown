@@ -57,6 +57,9 @@ BEAD_RE = re.compile(r"[a-z]{2,8}-[a-z0-9]{2,16}(?:\.[0-9]{1,4}){0,3}")  # o id 
 MARKER_RE = re.compile(r"^Marker created: (\S+)\s*$", re.M)
 SHA_RE = re.compile(r"[0-9a-f]{40}")  # o sha que o dog diz: inteiro, para a conferência com o espelho ser igualdade e não prefixo
 USAGE = "gate-done <bead> <ref> <sha>   (ou `gate-done` sem argumento: a ÚNICA bead in_progress do alias, de worker/<sessão>)"
+FIX_LABEL = "gate:needs-fix"  # o que o dispatcher põe na bead-fonte quando o gate reprova: a "volta do gate"
+ROUTE = "dog-remote"  # gc.routed_to do pool remoto: só uma volta do gate roteada para ele pode ser submetida sem assignee
+BARE_ROLE_RE = re.compile(r"(?:dog|gate-reviewer|wa-worker)-remote")  # nome de sessão SEM cauda: pelo IDENTITY_PATTERN (gc-session-ssh.md) `<papel>-remote-<1-3 dígitos>` TAMBÉM é nome válido de sessão
 TIMEOUT_CMD = 120  # um bd/git que pendura não segura a submissão para sempre (o wrapper também corta tudo em timeout_s)
 SCRIPT_RAN = [False]  # vira True quando os blocos do gate-done.md começam: daí em diante um erro NÃO é "nada foi escrito" (marcador pode existir)
 
@@ -123,19 +126,52 @@ def check_ref(raw: str, sess: str, bid: str) -> str:
     fixed = re.fullmatch(rf"fix/{re.escape(bid)}(?:-[A-Za-z0-9._-]{{1,80}})?", name)
     if not (mine or fixed):
         raise Stop(f"{raw[:80]!r} está fora do que esta sessão pode submeter (worker/{sess} ou worker/{sess}-N, ou fix/{bid} / fix/{bid}-<resumo>)")
+    if mine and not fixed and name != f"worker/{sess}" and BARE_ROLE_RE.fullmatch(sess):  # `-N` só é inequívoco se `<sessão>-N` NÃO for ele mesmo nome de sessão (revisão lateral, ga-2hd02v.1.18)
+        raise Stop(f"{name!r}: a sessão {sess!r} não tem cauda, então worker/{sess}-N pode ser o branch principal de OUTRA sessão ({sess}-N é nome válido): empurre fix/{bid}-<resumo> e submeta esse ref")
     if run(["git", "check-ref-format", f"refs/heads/{name}"]).returncode != 0:
         raise Stop(f"{name!r} não é um nome de branch válido")
     return name
 
 
+def last_delivery(city: str, bid: str) -> dict:
+    """O marcador MAIS NOVO da bead (a última entrega ao gate), de qualquer status: os fechados contam. Lista vazia → Stop (nunca foi entregue: não há volta do gate);
+    marcador sem created_at → Stop (não sei qual é o mais novo); leitura que falha/ilegível → Stop do bd_json. Nunca 'não achei' = 'pode'."""
+    rows = bd_json(city, ["list", "--all", "--label", "type:quality-gate-marker", "--label", f"source-bead:{bid}", "--json", "--limit", "0"], f"os marcadores de {bid}")
+    if not isinstance(rows, list) or not all(isinstance(x, dict) and isinstance(x.get("created_at"), str) and x["created_at"] for x in rows):
+        raise Stop(f"marcadores de {bid}: resposta do bd com forma inesperada (sem created_at?)")
+    if not rows:
+        raise Stop(f"{bid} nunca foi entregue ao gate (nenhum marcador source-bead:{bid}): não há volta do gate para submeter")
+    return max(rows, key=lambda x: (x["created_at"], str(x.get("id", ""))))
+
+
+def delivered_by(marker: dict, alias: str) -> bool:
+    """A entrega é deste alias? `gate.submitted_by` (congelado pelo gate-done.md: assignee→created_by→owner) OU a linha `author:` da descrição (o GC_ALIAS de quem rodou o
+    gate-done): numa volta do gate a bead não tem assignee, então a 2ª entrega congela o CRIADOR em submitted_by e só o `author:` guarda o alias."""
+    meta, desc = marker.get("metadata"), marker.get("description")
+    by = meta.get("gate.submitted_by") if isinstance(meta, dict) else None
+    m = re.search(r"^author: (\S+)\s*$", desc if isinstance(desc, str) else "", re.M)
+    return alias in {by, m.group(1) if m else None}
+
+
 def named_bead(city: str, alias: str, bid: str) -> dict:
-    """A bead que o dog NOMEOU: vale se está in_progress com o assignee = alias. Ausente ou com leitura que falha/ilegível → Stop (bd_json), nunca 'pode'."""
+    """A bead que o dog NOMEOU. Vale em dois casos: (A) in_progress com assignee = alias; (B) volta do gate: sem assignee, `gate:needs-fix`, gc.routed_to = dog-remote e a
+    última entrega (marcador mais novo) é deste alias. Ausente, forma outra, ou leitura que falha/ilegível → Stop (bd_json), nunca 'pode'."""
     bead = first(bd_json(city, ["show", bid, "--json"], f"a bead {bid}"))
     if not isinstance(bead, dict) or bead.get("id") != bid:
         raise Stop(f"a bead {bid}: resposta do bd com forma inesperada")
     if bead.get("status") == "in_progress" and bead.get("assignee") == alias:
         return bead
-    raise Stop(f"{bid} não é uma bead in_progress atribuída a {alias} (status={bead.get('status')!r}, assignee={bead.get('assignee')!r}): não submeto bead alheia")
+    labels, meta = bead.get("labels"), bead.get("metadata")
+    back = (bead.get("status") in ("open", "in_progress") and not bead.get("assignee") and isinstance(labels, list) and FIX_LABEL in labels
+            and isinstance(meta, dict) and meta.get("gc.routed_to") == ROUTE)
+    if not back:
+        raise Stop(f"{bid} não é uma bead in_progress atribuída a {alias} (status={bead.get('status')!r}, assignee={bead.get('assignee')!r}) nem uma volta do gate "
+                   f"(sem assignee, com {FIX_LABEL} e gc.routed_to={ROUTE}): não submeto bead alheia")
+    last = last_delivery(city, bid)
+    if not delivered_by(last, alias):
+        who = (last.get("metadata") or {}).get("gate.submitted_by") if isinstance(last.get("metadata"), dict) else None
+        raise Stop(f"a última entrega de {bid} (marcador {last.get('id')}, submitted_by={who!r}) não foi de {alias}: não submeto o conserto de outra sessão")
+    return bead
 
 
 def mirror_sha(mirror: str, src: str) -> str:
