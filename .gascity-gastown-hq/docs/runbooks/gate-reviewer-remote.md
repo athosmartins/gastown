@@ -2,7 +2,7 @@
 
 ## Contents
 
-O que é · Desenho · Escritas do revisor × allowlist do atalho · Ligar · Provar · Diferenças conhecidas (revisor do nó × local) · Medido, inferido, não testado
+O que é · Desenho · Escritas do revisor × allowlist do atalho (ga-6auslu, pré-condição iii do degrau b da 1.6) · Ligar · Provar · Diferenças conhecidas (revisor do nó × local) · Medido, inferido, não testado
 
 Bead ga-2hd02v.1.9 (filha da ga-2hd02v.1). Mayor, 19/10: construir e provar no nó com sessão de teste ou dry-run **já**; a ATIVAÇÃO viva (flag, config do host) só depois do flip da 1.6 provado. **A 1.6 estava aberta quando esta fatia terminou: tudo aqui está pronto e INERTE.**
 

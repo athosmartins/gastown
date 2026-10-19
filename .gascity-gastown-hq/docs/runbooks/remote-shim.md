@@ -3,7 +3,7 @@
 ## Contents
 
 • O que esta fatia é — e o que não é · Como funciona · Lista permitida
-• Como instalar (passos de quem tem a chave — nada foi instalado) · Medido, inferido, não testado
+• Como instalar no mini (passos de quem decide — nada disto foi feito) · Medido, inferido, não testado
 • **O atalho no MBP: transporte por puxada (ga-w7qwl1.1)** · **gate-done no mini (ga-2hd02v.1.13)** · Pontos em aberto · Limites
 
 Bead ga-2hd02v.1.2.1 (fatia 3a do servidor Hetzner: divisão técnica de ga-2hd02v.1.2, que deu 1.326 linhas e o teto do gate é 1.000; desenho do estudo ga-ukxa3k; decisão do Mayor em 14/10: a lista cresce em EXATAMENTE `gc prime --hook`, `gc handoff --auto` e `gc nudge drain --inject`). Regra do Athos que vale aqui: nenhum dado de lead/cliente nem backup de bead sai do mini. Esta versão acrescenta o lado do servidor (o programa instalado como `bd`/`gc`/`gate-done` lá e a prova da cadeia inteira), fatia 3b, ga-2hd02v.1.2.2.

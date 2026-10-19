@@ -3,7 +3,7 @@
 ## Contents
 
 • Onde você está · Seu papel: revisor do gate · Mandatory dimension: THE THIRD STATE · Como pegar a tarefa
-• O que o atalho deixa passar · Entregar o veredito · Somente leitura · Verificação de caminho · O que nunca fazer
+• O que o atalho deixa passar · Entregar o veredito · Somente leitura · Verificação de caminho: diretório de trabalho ≠ raiz do git · O que nunca fazer
 
 > **Recuperação**: depois de compactar, limpar ou reiniciar, rode `gc prime --hook` (o atalho deixa passar) e refaça o passo 1 de "Como pegar a tarefa".
 
