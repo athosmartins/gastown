@@ -54,10 +54,31 @@ PRELUDE='warn(){ echo "WARN $*" >&2; }
 log(){ echo "LOG $*" >&2; }
 timeout(){ shift; "$@"; }'
 
-# decide <modo|-> <id> <store> <alvo> [rc] [dry]  → imprime o rc da função; deixa FAKE_LOG e o jsonl em $T
+# bd falso do gancho (ga-9636op, gate-fix 1): só entende `bd -C <loja> show <id> --json`; anota a chamada em $FAKE_BD_LOG e devolve o conteúdo de
+# $FAKE_BEAD, ou falha com $FAKE_BD_RC. Qualquer outro verbo é um erro do teste: o gancho só LÊ a bead.
+mkdir -p "$T/bin"
+cat > "$T/bin/bd" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FAKE_BD_LOG:-/dev/null}"
+[ "${FAKE_BD_RC:-0}" = 0 ] || exit "$FAKE_BD_RC"
+[ "$3" = show ] || { echo "bd falso: verbo inesperado '$3' (o gancho só lê)" >&2; exit 64; }
+[ -n "${FAKE_BEAD:-}" ] && [ -f "$FAKE_BEAD" ] && cat "$FAKE_BEAD"
+exit 0
+EOF
+chmod +x "$T/bin/bd"
+export PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bdcalls"
+# bead <arquivo> <status> <assignee> <rota> [id] — grava o JSON da bead falsa (o formato de `bd show --json`: um array com um objeto)
+bead() {
+  jq -cn --arg id "${5:-$ID}" --arg s "$2" --arg a "$3" --arg r "$4" '[{id:$id,status:$s,assignee:$a,metadata:(if $r=="" then {} else {"gc.routed_to":$r} end)}]' > "$1"
+}
+ID=wa-abc12
+bead "$T/bead.free.json" open "" ""
+export FAKE_BEAD="$T/bead.free.json"     # padrão: bead livre (nada do nó); os casos da bead do nó trocam FAKE_BEAD
+
+# decide <modo|-> <id> <store> <alvo> [rc] [dry]  → imprime o rc da função; deixa FAKE_LOG, FAKE_BD_LOG e o jsonl em $T
 decide() {
   local mode="$1" id="$2" store="$3" tgt="$4" rc="${5:-0}" dry="${6:-0}"
-  : > "$T/calls"; : > "$T/err"; rm -f "$T/city/.gc/wa-node-route.jsonl"
+  : > "$T/calls"; : > "$T/bdcalls"; : > "$T/err"; rm -f "$T/city/.gc/wa-node-route.jsonl"
   if [ "$mode" = "-" ]; then
     env -u PILOT_WA_NODE_ROUTE GC_CITY="$T/city" PILOT_WA_NODE_SCRIPTS="${SCRIPTS_DIR:-$T/scripts}" FAKE_LOG="$T/calls" FAKE_RC="$rc" DRY_RUN="$dry" \
       bash -c "$PRELUDE"$'\n'"$FN"$'\n''_pilot_wa_node_decide "$@"; echo "rc=$?"' _ "$id" "$store" "$tgt" 2>"$T/err" | tail -1
@@ -131,6 +152,56 @@ mkdir -p "$T/semx"; cp "$T/scripts/wa-node-dispatch.sh" "$T/semx/"; chmod -x "$T
 SCRIPTS_DIR="$T/semx"; decide auto $ID $ST wa-worker 0 > "$T/r"; r=$(cat "$T/r")
 [ "$r" = "rc=1" ] && grep -q 'não está executável' "$T/err" && ok "script sem permissão de execução: rc 1 e o aviso" || fail "script sem x → $r / $(cat "$T/err")"
 SCRIPTS_DIR=""
+
+# --- ga-9636op (gate-fix 1): bead que JÁ é do nó nunca segue o caminho do pool do mini ---
+# O apply sai 12 ("não está livre") para a bead que já é do nó, e 12 lido como "nada escrito" fazia o despacho carimbar gc.routed_to=wa-worker por cima da rota do nó e
+# criar sessão do mini: a bead nas duas filas, uma varredura depois. O gancho lê a bead ele mesmo (três estados) ANTES de chamar o script, qualquer que seja o rc dele:
+# do nó → 2 (segura); não consegui ler → 2; lida e não é do nó → segue como antes. Em shadow e off nada muda.
+bead "$T/bead.node-both.json"  in_progress wa-worker-remote-1 wa-worker-remote
+bead "$T/bead.node-asg.json"   in_progress wa-worker-remote-1 ""
+bead "$T/bead.node-asg-open.json" open wa-worker-remote-1 ""
+bead "$T/bead.node-route.json" open "" wa-worker-remote
+bead "$T/bead.pool-route.json" open "" wa-worker
+bead "$T/bead.crew.json"       in_progress mila-wa ""
+bead "$T/bead.pool-sess.json"  in_progress wa-worker-1 wa-worker
+bead "$T/bead.outro-id.json"   in_progress wa-worker-remote-1 wa-worker-remote wa-zzzzz
+: > "$T/bead.vazio.json"; echo 'isto não é json' > "$T/bead.lixo.json"; echo '[]' > "$T/bead.lista-vazia.json"; echo 'null' > "$T/bead.null.json"
+for m in label auto; do
+  for f in node-both node-asg node-asg-open node-route; do
+    export FAKE_BEAD="$T/bead.$f.json"
+    for c in 12 0 1 10 11 13 126 127; do
+      r=$(decide $m $ID $ST wa-worker $c)
+      [ "$r" = "rc=2" ] && [ "$(ncalls)" = 0 ] && ok "$m: bead $f (já é do nó), rc $c do script → 2 (segura) e o script nem roda" || fail "$m bead $f rc=$c → $r calls=$(ncalls)"
+    done
+    grep -q 'já é do nó' "$T/err" && ok "$m: bead $f: o aviso diz que a bead já é do nó" || fail "$m bead $f: aviso: $(cat "$T/err")"
+  done
+  # não consegui ler = não sei se é do nó = segura (2); nunca "livre"
+  export FAKE_BD_RC=1; r=$(decide $m $ID $ST wa-worker 12); unset FAKE_BD_RC
+  [ "$r" = "rc=2" ] && [ "$(ncalls)" = 0 ] && grep -q 'não consegui reler' "$T/err" && ok "$m: bd falhou na leitura → 2 (segura), o script não roda e o aviso diz por quê" || fail "$m bd falha → $r calls=$(ncalls) err=$(cat "$T/err")"
+  for f in vazio lixo lista-vazia null outro-id; do
+    export FAKE_BEAD="$T/bead.$f.json"; r=$(decide $m $ID $ST wa-worker 12)
+    [ "$r" = "rc=2" ] && [ "$(ncalls)" = 0 ] && ok "$m: leitura '$f' não é a bead pedida → 2 (segura), nunca 'livre'" || fail "$m leitura $f → $r calls=$(ncalls)"
+  done
+  # lida e que NÃO é do nó: o caminho de sempre (o script roda e o rc dele manda); inclui as parecidas que não podem ser tomadas por do nó
+  for f in free pool-route crew pool-sess; do
+    export FAKE_BEAD="$T/bead.$f.json"
+    r=$(decide $m $ID $ST wa-worker 12); [ "$r" = "rc=1" ] && [ "$(ncalls)" = 1 ] && ok "$m: bead $f (não é do nó), rc 12 do script → 1 (fica no mini) e o script rodou" || fail "$m bead $f rc=12 → $r calls=$(ncalls)"
+    r=$(decide $m $ID $ST wa-worker 0);  [ "$r" = "rc=0" ] && ok "$m: bead $f (não é do nó), rc 0 do script → 0 (foi para o nó)" || fail "$m bead $f rc=0 → $r"
+    r=$(decide $m $ID $ST wa-worker 13); [ "$r" = "rc=2" ] && ok "$m: bead $f (não é do nó), rc 13 do script → 2 (escrita incerta)" || fail "$m bead $f rc=13 → $r"
+  done
+  export FAKE_BEAD="$T/bead.free.json"
+  decide $m $ID $ST wa-worker 0 >/dev/null
+  grep -q "^-C $ST show $ID --json\$" "$T/bdcalls" && [ "$(wc -l < "$T/bdcalls" | tr -d ' ')" = 1 ] && ok "$m: o gancho lê a bead UMA vez, na loja certa" || fail "$m: leituras: $(cat "$T/bdcalls")"
+done
+# shadow nunca muda o despacho, nem para a bead do nó; off não lê nada
+export FAKE_BEAD="$T/bead.node-both.json"
+r=$(decide shadow $ID $ST wa-worker 12); [ "$r" = "rc=1" ] && [ "$(ncalls)" = 1 ] && calls | grep -q '^check ' && ok "shadow com bead do nó: ainda rc 1 e só 'check' (a sombra não segura nada)" || fail "shadow bead do nó → $r / $(calls)"
+r=$(decide - $ID $ST wa-worker 12); [ "$r" = "rc=1" ] && [ "$(ncalls)" = 0 ] && [ ! -s "$T/bdcalls" ] && ok "off com bead do nó: rc 1, nada chamado e nenhuma leitura" || fail "off bead do nó → $r calls=$(ncalls) bd=$(cat "$T/bdcalls")"
+export FAKE_BEAD="$T/bead.free.json"
+# script ausente + bead do nó: a bead do nó é segurada MESMO assim (o script ausente dizia 1 = mini)
+export FAKE_BEAD="$T/bead.node-both.json"; SCRIPTS_DIR="$T/nada"; decide auto $ID $ST wa-worker 0 > "$T/r"; r=$(cat "$T/r"); SCRIPTS_DIR=""
+[ "$r" = "rc=2" ] && ok "script ausente + bead do nó: 2 (segura), não 1 (o caminho do pool carimbaria o mini por cima)" || fail "script ausente + bead do nó → $r"
+export FAKE_BEAD="$T/bead.free.json"
 
 # --- dry-run: nunca escreve ---
 r=$(decide auto $ID $ST wa-worker 0 1)
