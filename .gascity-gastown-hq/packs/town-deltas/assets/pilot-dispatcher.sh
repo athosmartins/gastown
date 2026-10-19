@@ -403,8 +403,12 @@ PILOT_KERN_PRESSURE_OVERRIDE="${PILOT_KERN_PRESSURE_OVERRIDE:-}"
 # In-flight builders are untouched (telling them to stop at CRITICAL is a separate slice of ga-vln2py, ga-vln2py.3).
 # FAIL-OPEN, but not silent: a disk that cannot be read ("unknown") dispatches as before and says so on the log —
 # a df hiccup must not stop the city (heavy-guard.sh is the one that fails CLOSED, per step).
-# PILOT_DISK_FLOOR_ENABLED=0 is the kill switch (never in prod). The reading is pinned in selftests with
+# PILOT_DISK_FLOOR_ENABLED=0 is the kill switch (never in prod). ONLY the exact string 0 turns the gate off: 1 is on, and any
+# other word (true, yes, on, 01, false) keeps it ON and says on the log that the value is neither 0 nor 1 (ga-nyug12: the gate used
+# to be on only for the string 1, so those spellings turned a P0 gate off without a trace). The reading is pinned in selftests with
 # PILOT_DISK_FREE_OVERRIDE_MB (the same seam the memory arm uses) or DISK_FREE_OVERRIDE_MB.
+# Two more environment variables bend this gate through the shared reader and used to leave no trace: DISK_HEADROOM_ENABLED=0 (every
+# reading is "ok") and DISK_NEW_WORK_MIN_MB (the floor, anything but 5120). Either one leaves a WARN line on every sweep (ga-nyug12).
 PILOT_DISK_FLOOR_ENABLED="${PILOT_DISK_FLOOR_ENABLED:-1}"
 PILOT_DISK_LIB="${PILOT_DISK_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/scripts/disk-headroom-lib.sh}"
 
@@ -2443,15 +2447,27 @@ _pilot_memory_tight() {
 
 # ── ga-vln2py: the DISK FLOOR gate's reader (see the config header above) ──────────────────────────
 # _pilot_disk_floor — return 0 (free disk BELOW the new-work floor: pause dispatch) / 1 (anything else).
-# Sets PILOT_DISK_FLOOR_STATE ("ok" | "low" | "unknown" | "off") and PILOT_DISK_FLOOR_DETAIL (the reading, for
-# the log). Called DIRECTLY, never in $(...), so the globals survive — the shape of _pilot_memory_tight.
+# Sets PILOT_DISK_FLOOR_STATE ("ok" | "low" | "unknown" | "off"), PILOT_DISK_FLOOR_DETAIL (the reading, for
+# the log) and PILOT_DISK_FLOOR_NOTE (what the ENVIRONMENT did to the gate, "" in a default run; the caller logs it, ga-nyug12).
+# Called DIRECTLY, never in $(...), so the globals survive — the shape of _pilot_memory_tight.
 # THREE states, and only a real reading under the floor returns 0: "unknown" (the library cannot be loaded, df
 # prints nothing or something that is not a number) returns 1 — fail-open — with the state named so the caller
 # can log it apart from "ok"; "off" is the kill switch.
 _pilot_disk_floor() {
   PILOT_DISK_FLOOR_STATE="off"
   PILOT_DISK_FLOOR_DETAIL=""
-  [ "$PILOT_DISK_FLOOR_ENABLED" = "1" ] || return 1
+  PILOT_DISK_FLOOR_NOTE=""
+  # vazio (the config default turned it into 1) → on; 0 → off, silent (the operator asked for it); 1 → on; falhou/ilegível (any other
+  # word) → ON as well, with the value named: the protective direction for a gate that keeps Dolt from ENOSPC, never a silent off.
+  case "$PILOT_DISK_FLOOR_ENABLED" in
+    0) return 1 ;;
+    1) ;;
+    *) PILOT_DISK_FLOOR_NOTE="PILOT_DISK_FLOOR_ENABLED='${PILOT_DISK_FLOOR_ENABLED}' is neither 0 nor 1 — the disk gate stays ON (only 0 turns it off)" ;;
+  esac
+  # vazio → not 0 → not off (the lib makes the same test: only the string 0 switches it off); nothing here can fail to read
+  if [ "${DISK_HEADROOM_ENABLED:-1}" = "0" ]; then
+    PILOT_DISK_FLOOR_NOTE="${PILOT_DISK_FLOOR_NOTE:+$PILOT_DISK_FLOOR_NOTE; }DISK_HEADROOM_ENABLED=0 is set in the environment, so every disk reading counts as ok and this gate can never pause"
+  fi
   PILOT_DISK_FLOOR_STATE="unknown"
   # vazio/falhou/ilegível (the library file is absent, does not load, or loads without defining a reader) → "unknown",
   # fail-open and on the log, never "low". The first `.` is a PROBE in a subshell: on /bin/bash 3.2 (what launchd runs) a syntax
@@ -2460,6 +2476,12 @@ _pilot_disk_floor() {
   if [ ! -r "$PILOT_DISK_LIB" ] || ! ( . "$PILOT_DISK_LIB" ) >/dev/null 2>&1 || ! . "$PILOT_DISK_LIB" 2>/dev/null || ! type disk_free_mb >/dev/null 2>&1 || ! type disk_state_of >/dev/null 2>&1; then
     PILOT_DISK_FLOOR_DETAIL="library unreadable or does not load: ${PILOT_DISK_LIB}"
     return 1
+  fi
+  # The lib has just normalised the floor (empty / not a number / more than 9 digits → 5120), so what is left in
+  # DISK_NEW_WORK_MIN_MB is the floor IN FORCE. vazio/falhou/ilegível → 5120 → no note; a number other than 5120 can only have
+  # come from the environment.
+  if [ "$DISK_NEW_WORK_MIN_MB" != "5120" ]; then
+    PILOT_DISK_FLOOR_NOTE="${PILOT_DISK_FLOOR_NOTE:+$PILOT_DISK_FLOOR_NOTE; }DISK_NEW_WORK_MIN_MB=${DISK_NEW_WORK_MIN_MB} is set in the environment, so the floor in force is ${DISK_NEW_WORK_MIN_MB} MB, not the default 5120"
   fi
   local _ov="${PILOT_DISK_FREE_OVERRIDE_MB:-${DISK_FREE_OVERRIDE_MB:-}}" _st _free=""
   # ONE read feeds the verdict AND the log line: a disk hovering at the floor must not be decided on one df and printed from a second.
@@ -5440,7 +5462,15 @@ fi
 # See the config header (PILOT_DISK_FLOOR_ENABLED) for the why. Same full-PAUSE shape as the RAM-pressure gate
 # above. No push per sweep: a sweep runs every few minutes and the alarm already belongs to
 # dolt-disk-floor-guard.sh (WARN/CRITICAL with its own cooldowns); this gate only holds the door.
-if _pilot_disk_floor; then
+# `|| rc=$?`: the reader answers 1 for "no pause", and the dispatcher runs under set -e.
+_disk_floor_rc=0
+_pilot_disk_floor || _disk_floor_rc=$?
+# What the environment did to the gate (an off-spelling kept ON, DISK_HEADROOM_ENABLED=0, a floor other than 5120) is said BEFORE the
+# verdict, on dispatch and on pause alike: a gate bent by a variable must not look like a gate that is merely fine (ga-nyug12).
+if [ -n "$PILOT_DISK_FLOOR_NOTE" ]; then
+  warn "Disk floor gate bent by the environment — ${PILOT_DISK_FLOOR_NOTE} (never in production; ga-nyug12)."
+fi
+if [ "$_disk_floor_rc" -eq 0 ]; then
   warn "Disk floor (${PILOT_DISK_FLOOR_DETAIL}) — PAUSING all dispatch this sweep: a new builder on a disk this low is what filled it on 17/10 and took Dolt down (ENOSPC on the hq journal). Stories stay queued; dispatch resumes on its own once a later sweep reads the disk above the floor (ga-vln2py)."
   _pilot_write_sweep_pause_state 1 "disk-floor" "Disk floor: ${PILOT_DISK_FLOOR_DETAIL}"
   # The reason text inside the parens stays CONSTANT on purpose: approved-state-reconciler.py files an unknown

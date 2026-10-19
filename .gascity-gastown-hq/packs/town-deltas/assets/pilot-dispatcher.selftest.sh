@@ -992,6 +992,8 @@ run_lanefull() {
 #  $10 = PILOT_SWAP_FREE_OVERRIDE_MB   (ga-9e446u: free swap, MB; "" = no reading. With $7
 #                                       and $9 also set, NO memory reading is blind)
 #  $11 = PILOT_DISK_FLOOR_ENABLED      (ga-vln2py: default 1; 0 = the disk-floor kill switch).
+#  $12 = DISK_HEADROOM_ENABLED         (ga-nyug12: "" = unset; 0 = the shared disk reader's kill switch)
+#  $13 = DISK_NEW_WORK_MIN_MB          (ga-nyug12: "" = unset = the 5120 default; a number = a floor from the environment)
 #  The free disk is pinned for EVERY run at 100000 MB (a low-disk host must not turn these scenarios red);
 #  a scenario picks its own reading with PILOT_TEST_DISK_FREE_MB=<MB|unreadable> in front of the call.
 run_ctxready() {
@@ -1020,6 +1022,8 @@ run_ctxready() {
     PILOT_KERN_PRESSURE_OVERRIDE="${9:-}" \
     PILOT_SWAP_FREE_OVERRIDE_MB="${10:-}" \
     PILOT_DISK_FLOOR_ENABLED="${11:-1}" \
+    DISK_HEADROOM_ENABLED="${12:-}" \
+    DISK_NEW_WORK_MIN_MB="${13:-}" \
     PILOT_SWEEP_PAUSE_STATE_FILE="$FIXCITY/.gc/pilot-sweep-pause-state.json" \
     FAKE_INFLIGHT_JSON="${6:-[]}" \
     FAKE_BLOCKED_IDS="" \
@@ -5524,6 +5528,73 @@ detail-names-the-library" ]; then
     bad "a $LIB20DG library killed the shell or was not reported as unknown (got: '$OUT20DG')"
   fi
 done
+
+echo "Scenario 20d-disk-h (ga-nyug12 item 6): a floor that comes from the ENVIRONMENT (or DISK_HEADROOM_ENABLED=0) leaves a line in the log"
+# A disk gate that was switched off through the shared reader's env (DISK_HEADROOM_ENABLED=0) or bent to 0/2000 MB (DISK_NEW_WORK_MIN_MB) used
+# to leave no trace at all: PILOT_DISK_FLOOR_ENABLED=0 is the only switch the log never needed to mention (scenario d). The default run stays quiet.
+LOG20DDH0="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "")"
+if echo "$LOG20DDH0" | grep "dispatched=0 (paused: disk floor)" >/dev/null && ! echo "$LOG20DDH0" | grep "environment" >/dev/null; then
+  ok "default env + 3000 MB: pauses and the log carries no 'environment' line (nothing to report in a default run)"
+else
+  bad "default env + 3000 MB: did not pause, or the log mentions the environment for no reason"
+fi
+LOG20DDH1="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "" "" "" "" 1 0)"
+if echo "$LOG20DDH1" | grep "Lane picks — small: tt-cx" >/dev/null && echo "$LOG20DDH1" | grep "DISK_HEADROOM_ENABLED=0" >/dev/null; then
+  ok "DISK_HEADROOM_ENABLED=0: the gate never fires (dispatches on 3000 MB) AND the log says why"
+else
+  bad "DISK_HEADROOM_ENABLED=0 left no 'DISK_HEADROOM_ENABLED=0' line in the log (dispatching: $(echo "$LOG20DDH1" | grep -c 'Lane picks'))"
+fi
+LOG20DDH2="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "" "" "" "" 1 "" 0)"
+if echo "$LOG20DDH2" | grep "Lane picks — small: tt-cx" >/dev/null && echo "$LOG20DDH2" | grep "DISK_NEW_WORK_MIN_MB" >/dev/null; then
+  ok "DISK_NEW_WORK_MIN_MB=0: the gate can never be low AND the log names the variable"
+else
+  bad "DISK_NEW_WORK_MIN_MB=0 left no 'DISK_NEW_WORK_MIN_MB' line in the log"
+fi
+LOG20DDH3="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "" "" "" "" 1 "" 2000)"
+if echo "$LOG20DDH3" | grep "Lane picks — small: tt-cx" >/dev/null && echo "$LOG20DDH3" | grep "DISK_NEW_WORK_MIN_MB" | grep "2000" | grep "5120" >/dev/null; then
+  ok "DISK_NEW_WORK_MIN_MB=2000: the line carries the floor in force (2000) and the default it replaces (5120)"
+else
+  bad "DISK_NEW_WORK_MIN_MB=2000 did not log the floor in force and the default"
+fi
+LOG20DDH4="$(PILOT_TEST_DISK_FREE_MB=1500 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "" "" "" "" 1 "" 2000)"
+if echo "$LOG20DDH4" | grep "dispatched=0 (paused: disk floor)" >/dev/null && echo "$LOG20DDH4" | grep "DISK_NEW_WORK_MIN_MB" >/dev/null; then
+  ok "…and a pause under that bent floor also carries the line (the operator sees why the number is not 5120)"
+else
+  bad "a pause under DISK_NEW_WORK_MIN_MB=2000 did not carry the 'DISK_NEW_WORK_MIN_MB' line"
+fi
+LOG20DDH5="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "" "" "" "" 1 "" 5120)"
+if echo "$LOG20DDH5" | grep "dispatched=0 (paused: disk floor)" >/dev/null && ! echo "$LOG20DDH5" | grep "environment" >/dev/null; then
+  ok "DISK_NEW_WORK_MIN_MB=5120 (the default, set explicitly): pauses and says nothing"
+else
+  bad "DISK_NEW_WORK_MIN_MB=5120 changed the answer or logged as if the floor were bent"
+fi
+LOG20DDH6="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "" "" "" "" 0 0 0)"
+if echo "$LOG20DDH6" | grep "Lane picks — small: tt-cx" >/dev/null && ! echo "$LOG20DDH6" | grep -E "environment|Disk floor" >/dev/null; then
+  ok "PILOT_DISK_FLOOR_ENABLED=0 stays silent even with the env overrides present (the gate is off on purpose, scenario d)"
+else
+  bad "PILOT_DISK_FLOOR_ENABLED=0 + env overrides logged about the disk gate"
+fi
+
+echo "Scenario 20d-disk-i (ga-nyug12 item 7): PILOT_DISK_FLOOR_ENABLED — only 0 turns the gate off; any other word keeps it ON and is named"
+for VAL20DDI in true yes on 01 false; do
+  LOG20DDI="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "" "" "" "" "$VAL20DDI")"
+  if echo "$LOG20DDI" | grep "dispatched=0 (paused: disk floor)" >/dev/null && ! echo "$LOG20DDI" | grep "Lane picks" >/dev/null; then
+    ok "PILOT_DISK_FLOOR_ENABLED=$VAL20DDI: the gate stays ON (pauses on 3000 MB), it is not turned off by a spelling"
+  else
+    bad "PILOT_DISK_FLOOR_ENABLED=$VAL20DDI turned the disk gate off silently (dispatching: $(echo "$LOG20DDI" | grep -c 'Lane picks'))"
+  fi
+  if echo "$LOG20DDI" | grep "PILOT_DISK_FLOOR_ENABLED" | grep "neither 0 nor 1" >/dev/null; then
+    ok "…and the log names the value that is neither 0 nor 1 ($VAL20DDI)"
+  else
+    bad "PILOT_DISK_FLOOR_ENABLED=$VAL20DDI left no 'neither 0 nor 1' line in the log"
+  fi
+done
+LOG20DDI1="$(PILOT_TEST_DISK_FREE_MB=3000 run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" "" "" "" "" 1)"
+if echo "$LOG20DDI1" | grep "dispatched=0 (paused: disk floor)" >/dev/null && ! echo "$LOG20DDI1" | grep "neither 0 nor 1" >/dev/null; then
+  ok "PILOT_DISK_FLOOR_ENABLED=1: pauses and stays quiet about the spelling"
+else
+  bad "PILOT_DISK_FLOOR_ENABLED=1 logged about the spelling or did not pause"
+fi
 
 echo "Scenario 20e: drift-guard — PILOT_CTX_READY_QUERIES defaults to 1 and is env-gated"
 has "$DISPATCHER" 'PILOT_CTX_READY_QUERIES="\$\{PILOT_CTX_READY_QUERIES:-1\}"' \

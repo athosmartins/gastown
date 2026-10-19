@@ -61,6 +61,10 @@ mark() {
 # This is the one place where the answer deliberately differs from the engine's probe, and only while the disk is low:
 # with the disk fine (or unreadable) stdout, the bd calls and the exit code are byte-for-byte the engine's.
 # `[]` from the hold is a real "nothing for you": drain, do not look for a story by another route.
+# The hold runs AFTER the engine's --limit=20 window (ga-nyug12): 20 stories older than a formula bead would fill the window,
+# the hold would empty it and `[]` would say "drain" while formula work waits outside. So when the disk is low, the window was
+# full and the hold removed everything, tier 1 is asked ONE more time with --limit=0 (the only extra bd call, only on that path);
+# if that second read fails the tier is unreadable (exit 3), never "no work".
 # Three states: low -> hold; ok -> as before; unknown (lib missing/corrupt, df unreadable) -> as before (fail OPEN: a df
 # hiccup must not starve the pool) with a line in the pool-probe log. The lib is read in a subshell so a corrupt copy
 # cannot kill the probe. DISK_FREE_OVERRIDE_MB pins the reading (selftests).
@@ -118,16 +122,19 @@ found() {
 # Tier 1: unassigned beads routed to <target> (the exact --exclude-label list is the engine's
 # bdReadyPoolDemandExcludeLabelArgs, in the engine's order), oldest first, then the veto filter,
 # the molecule check, and the oldest-updated one.
-t1_raw=$(bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic \
-  --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" \
-  --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" \
-  --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" \
-  --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" \
-  --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" \
-  --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" \
-  --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" \
-  --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" \
-  --exclude-label "gate:reviewing" --json --sort oldest --limit=20 2>/dev/null) || mark 1
+t1_fetch() { # $1 = --limit: the engine asks for 20; the disk hold may ask again with 0 (= unlimited, see above)
+  bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic \
+    --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" \
+    --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" \
+    --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" \
+    --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" \
+    --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" \
+    --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" \
+    --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" \
+    --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" \
+    --exclude-label "gate:reviewing" --json --sort oldest --limit="$1" 2>/dev/null
+}
+t1_raw=$(t1_fetch 20) || mark 1
 t1_kept=$(printf "%s" "$t1_raw" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null) || mark 1
 if [ "$disk_state" = low ]; then
   # vazio/falhou/ilegível (no hold text, or jq failed) -> tier 1 answers NOTHING (inert) and is marked unreadable, like any
@@ -137,6 +144,22 @@ if [ "$disk_state" = low ]; then
     n_before=$(printf "%s" "$t1_kept" | jq length 2>/dev/null); n_after=$(printf "%s" "$t1_held" | jq length 2>/dev/null)
     pp_log "free disk under the floor - tier 1 held back $(( ${n_before:-0} - ${n_after:-0} )) new story/stories (ga-vln2py)"
     t1_kept="$t1_held"
+    # vazio/falhou/ilegível (the window size cannot be read) -> counts as 0: no refetch, the answer stays what the hold left
+    n_window=$(printf "%s" "$t1_raw" | jq length 2>/dev/null)
+    if [ "${n_before:-0}" -gt 0 ] && [ "${n_after:-0}" -eq 0 ] && [ "${n_window:-0}" -ge 20 ]; then
+      # vazio/falhou/ilegível (bd failed, the answer is empty or not JSON, or the hold cannot read it) -> tier 1 is marked
+      # unreadable and answers NOTHING (inert; exit 3 if tiers 2 and 3 find nothing either); a valid [] is a real "nothing"
+      if t1_all=$(t1_fetch 0) \
+        && t1_all_kept=$(printf "%s" "$t1_all" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null) \
+        && t1_all_held=$(printf "%s" "$t1_all_kept" | jq -c "$disk_hold_jq" 2>/dev/null) && [ -n "$t1_all_held" ]; then
+        n_all=$(printf "%s" "$t1_all_kept" | jq length 2>/dev/null); n_all_held=$(printf "%s" "$t1_all_held" | jq length 2>/dev/null)
+        pp_log "free disk under the floor, the --limit=20 window held nothing but new stories - tier 1 refetched without a limit: $(( ${n_all:-0} - ${n_all_held:-0} )) new story/stories held back, ${n_all_held:-0} left (ga-nyug12)"
+        t1_kept="$t1_all_held"
+      else
+        mark 1; t1_kept="[]"
+        pp_log "free disk under the floor, the --limit=20 window held nothing but new stories and the unlimited refetch could not be read - tier 1 answers nothing (ga-nyug12)"
+      fi
+    fi
   else
     mark 1; t1_kept="[]"
     pp_log "free disk under the floor but the hold could not be applied (lib or jq) - tier 1 answers nothing (ga-vln2py)"

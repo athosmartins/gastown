@@ -49,6 +49,9 @@
 # One definition, read by the dog probe (pool-probe.sh). The wa/ps worker probes answer [] without it: measured the
 # same day, the 1125 beads routed to wa-worker and the 51 to ps-worker are all story types with none of the marks (and
 # no order in the town config routes there). If that ever changes, those two probes must use this filter instead.
+# That [] has no exception for the FIX class either (gate:needs-fix, gate:fix-attempt:*, origem:auto-healer-notify,
+# impacto:dano-ao-vivo - the focus-mode set), same as the Pilot's full pause: a fix bead held there is named in a NOTE on
+# stderr (Step 1b2 of both prompts) and the Mayor decides whether it runs on a low disk (ga-nyug12).
 DISK_HOLD_NEW_STORIES_JQ='[ .[] | select( (((.issue_type // "") as $t | ["task","bug","feature","chore","epic","spike"] | any(. == $t)) | not) or ((.metadata["gc.kind"] // "") != "") or ((.metadata["gc.step_ref"] // "") != "") or ((.metadata["gc.pool_demand"] // "") != "") ) ]'
 
 DISK_NEW_WORK_MIN_MB="${DISK_NEW_WORK_MIN_MB:-5120}"

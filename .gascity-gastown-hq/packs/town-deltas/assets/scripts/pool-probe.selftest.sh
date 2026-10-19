@@ -61,8 +61,17 @@ case "$1 $2 $3" in
   *) echo "fake bd: unexpected call: $*" >&2; exit 2 ;;
 esac
 [ -f "$BD_FIX/$key.fail" ] && exit 1
+# --limit=N (ga-nyug12): read off argv only for the scenarios that ask for it. $key.honour-limit makes the fake cut the
+# fixture to N like the real bd (0 = unlimited); $key.limit0.fail / $key.limit0.raw script the answer to the unlimited call.
+lim=""; for a in "$@"; do case "$a" in --limit=*) lim="${a#--limit=}" ;; esac; done
+if [ "$lim" = 0 ]; then
+  [ -f "$BD_FIX/$key.limit0.fail" ] && exit 1
+  [ -f "$BD_FIX/$key.limit0.raw" ] && { cat "$BD_FIX/$key.limit0.raw"; exit 0; }
+fi
 if [ -f "$BD_FIX/$key.raw" ]; then cat "$BD_FIX/$key.raw"
-elif [ -f "$BD_FIX/$key.json" ]; then cat "$BD_FIX/$key.json"
+elif [ -f "$BD_FIX/$key.json" ]; then
+  if [ -f "$BD_FIX/$key.honour-limit" ] && [ -n "$lim" ]; then jq -c --argjson n "$lim" 'if $n > 0 then .[0:$n] else . end' "$BD_FIX/$key.json"
+  else cat "$BD_FIX/$key.json"; fi
 else printf '[]'; fi
 EOF
 chmod +x "$FAKE/bd"
@@ -400,6 +409,67 @@ grep -q 'hold could not be applied' "$TMP/pp.log" && ok "…and the failed hold 
 cat > "$FIX/tier1.json" <<'EOF'
 [{"id":"st-only","issue_type":"task","updated_at":"2026-01-01T00:00:00Z","labels":[],"metadata":{"gc.routed_to":"gastown.dog"}}]
 EOF
+# ga-nyug12 (item 1): the hold runs AFTER the engine's --limit=20 window. 20 stories older than a formula bead fill the window,
+# the hold empties it, and tier 1 used to answer `[]` exit 0 ("drain") while formula work waited outside the window. Now: low
+# disk + a full window + the hold removed everything -> ONE unlimited refetch (--limit=0), the same veto and hold over the whole
+# list; a refetch that cannot be read is tier 1 unreadable (exit 3), never "no work". The fake bd honours --limit here.
+mk_window() { # <stories> <formula 0|1> [story label] -> tier1.json, oldest first like `bd --sort oldest`, cut by --limit
+  jq -n -c --argjson s "$1" --argjson f "$2" --arg lbl "${3:-}" '
+    [range(0; $s) | . as $i | ("2026-01-01T00:" + ($i | tostring | if length < 2 then "0" + . else . end) + ":00Z") as $ts
+      | {id: ("st-" + ($i + 100 | tostring)), issue_type: "task", created_at: $ts, updated_at: $ts,
+         labels: (if $lbl == "" then [] else [$lbl] end), metadata: {"gc.routed_to": "gastown.dog"}}]
+    + (if $f == 1 then [{id: "mol-late", issue_type: "molecule", created_at: "2026-01-02T00:00:00Z", updated_at: "2026-01-02T00:00:00Z",
+         labels: ["order-run:mol-dog-stale-db"], metadata: {"gc.routed_to": "gastown.dog", "gc.pool_demand": "order"}}] else [] end)' > "$FIX/tier1.json"
+  : > "$FIX/tier1.honour-limit"
+}
+t1_calls() { grep -a 'gc\.routed_to=gastown\.dog' "$TMP/disk.log" | wc -l | tr -d ' '; }
+t1_unlimited() { grep -a 'gc\.routed_to=gastown\.dog' "$TMP/disk.log" | grep -a -c -e '--limit=0' || true; }
+win() { : > "$TMP/disk.log"; dprobe "$@"; } # a dprobe with a fresh bd log
+reset_fix; mk_window 20 1
+win 3000
+eq "window full of stories + a formula bead outside it, low disk: the formula bead is handed out (not [])" "$D_IDS:$D_RC" "mol-late:0"
+eq "…silent on stderr, and tier 1 was asked twice: the 20-window, then ONE unlimited refetch" "$D_ERR|$(t1_calls)|$(t1_unlimited)" "|2|1"
+grep -q 'refetch' "$TMP/pp.log" && ok "…and the refetch is on the record in the pool-probe log" || bad "the refetch left no line in the pool-probe log"
+win 100000
+eq "same window, roomy disk: the oldest story as before, one tier-1 call, no refetch" "$D_IDS|$(t1_calls)|$(t1_unlimited)" "st-100|1|0"
+mk_window 19 1; win 3000
+eq "window full (19 stories + the formula bead) but the hold left a bead: no refetch" "$D_IDS|$(t1_calls)|$(t1_unlimited)" "mol-late|1|0"
+mk_window 5 0; win 3000
+eq "window NOT full, hold empties it: [] exit 0 silent, no refetch (nothing waits outside)" "$D_OUT:$D_RC:$D_ERR|$(t1_calls)" "[]:0:|1"
+mk_window 20 0; win 3000
+eq "window full of stories and nothing else exists: the refetch finds the same, a real [] exit 0 silent" "$D_OUT:$D_RC:$D_ERR|$(t1_calls)|$(t1_unlimited)" "[]:0:|2|1"
+mk_window 25 0; win 3000
+eq "25 stories, no formula bead: [] exit 0, still ONE refetch (no loop)" "$D_OUT:$D_RC|$(t1_calls)|$(t1_unlimited)" "[]:0|2|1"
+mk_window 20 1 "pool:refused"; win 3000
+eq "window full but the VETO emptied it (not the hold): as the engine answers, [] and no refetch" "$D_OUT:$D_RC|$(t1_calls)" "[]:0|1"
+mk_window 20 1; : > "$FIX/tier1.limit0.fail"; win 3000
+eq "refetch fails: [] exit 3, never a quiet drain" "$D_OUT:$D_RC" "[]:3"
+case "$D_ERR" in *"tier(s) 1 unreadable"*) ok "…and stderr says tier 1 was unreadable" ;; *) bad "…stderr lacks 'tier(s) 1 unreadable': $D_ERR" ;; esac
+rm -f "$FIX/tier1.limit0.fail"; printf 'not json' > "$FIX/tier1.limit0.raw"; win 3000
+eq "refetch answers something that is not JSON: [] exit 3" "$D_OUT:$D_RC" "[]:3"
+rm -f "$FIX/tier1.limit0.raw"
+# mutants of the refetch: each must flip one of the answers above (a mutant that changes nothing is itself a failure)
+refetch_mutant() { # <name> <sed expr> <scenario: ok|fail> <want "ids:rc|calls" that the CORRECT script does NOT give>
+  sed "$2" "$PROBE" > "$TMP/pp-m-$1.sh"
+  cmp -s "$PROBE" "$TMP/pp-m-$1.sh" && { bad "refetch mutant '$1' did not change the script"; return; }
+  rm -f "$FIX/tier1.limit0.fail"
+  case "$3" in
+    ok)     mk_window 20 1 ;;
+    veto)   mk_window 20 1 "pool:refused" ;;
+    fail)   mk_window 20 1; : > "$FIX/tier1.limit0.fail" ;;
+  esac
+  DPROBE="$TMP/pp-m-$1.sh" win 3000 POOL_PROBE_DISK_LIB="$GOOD_LIB"
+  [ "$D_IDS:$D_RC|$(t1_calls)" != "$4" ] && ok "refetch mutant '$1' is killed (answers $D_IDS:$D_RC after $(t1_calls) tier-1 call(s))" || bad "refetch mutant '$1' SURVIVED"
+}
+refetch_mutant never-refetches 's/-ge 20 \]; then$/-ge 99999 ]; then/' ok "mol-late:0|2"
+refetch_mutant ignores-the-refetch 's/^        t1_kept="\$t1_all_held"$/        t1_kept="$t1_kept"/' ok "mol-late:0|2"
+refetch_mutant unreadable-refetch-is-nothing 's/^        mark 1; t1_kept="\[\]"$/        t1_kept="[]"/' fail "-:3|2"
+refetch_mutant refetches-after-a-veto 's/\[ "\${n_before:-0}" -gt 0 \] \&\& //' veto "-:0|1"
+rm -f "$FIX/tier1.limit0.fail"
+cat > "$FIX/tier1.json" <<'EOF'
+[{"id":"st-only","issue_type":"task","updated_at":"2026-01-01T00:00:00Z","labels":[],"metadata":{"gc.routed_to":"gastown.dog"}}]
+EOF
+rm -f "$FIX/tier1.honour-limit"
 # mutants of the script: each must change at least one answer above (a hold that never fires, a hold that fails closed)
 sed 's/\[ "\$disk_state" = low \]; then$/[ "$disk_state" = never ]; then/' "$PROBE" > "$TMP/pp-nohold.sh"
 cmp -s "$PROBE" "$TMP/pp-nohold.sh" && bad "mutant 'hold never fires' did not change the script"

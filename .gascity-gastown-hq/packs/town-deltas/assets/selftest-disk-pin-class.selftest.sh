@@ -9,9 +9,11 @@
 # nothing to do with the code under test. The mini IS under 5 GB most days, and that is where the gate runs.
 #
 # THE RULE, per RUN SITE (not per file — a file-level pin does not reach an `env -i` block, which scrubs the environment):
-#   a RUN SITE is a non-comment command (continuation lines joined) that executes pilot-dispatcher.sh: `bash|sh [flags] <path>`
-#   where <path> is a literal …pilot-dispatcher.sh or "$VAR" with VAR assigned such a path in the same file. `bash -n` is a syntax
-#   check, not a run. It must be one of
+#   a RUN SITE is a non-comment command (continuation lines joined) that executes pilot-dispatcher.sh: `bash|sh [options] <path>`
+#   where <path> is a literal …pilot-dispatcher.sh or "$VAR" with VAR assigned such a path in the same file, and [options] are short
+#   flags (-e, -ex), `-o NAME` / `+o NAME` / `-O NAME`, `--rcfile|--init-file FILE` and any other --long-option (--norc, --noprofile,
+#   --posix), and a bare `--` (ga-nyug12: the first grammar knew only `-[a-zA-Z]+`, so `bash --norc "$DISPATCHER"` was invisible). `bash -n` is a syntax
+#   check, not a run, behind any of those options too. It must be one of
 #     - inside an `env -i` that names DISK_FREE_OVERRIDE_MB=<value> or PILOT_DISK_FREE_OVERRIDE_MB=<value> or PILOT_DISK_FLOOR_ENABLED=0
 #     - not in an `env -i`: with the pin inline, or an `export …` of one on an EARLIER line of the same file
 #   There is no "sandboxed HOME" way out (unlike the drain signal): df reads the host whatever HOME says.
@@ -19,7 +21,9 @@
 # WHAT THIS GUARD DOES NOT SEE (said, not pretended): a dispatcher run through another spelling (`"$X"` as the command, `exec`,
 # `xargs`, a copy under another name, a variable assembled in two steps) is not recognised; a pin whose VALUE is wrong is not judged,
 # only that a non-empty one is named. Suites that only EXTRACT functions from the dispatcher (`sed -n '/^fn() {/,/^}/p'`) never
-# reach the gate and are rightly not asked for a pin. Only pilot-dispatcher.sh reads the disk, so only it is scanned.
+# reach the gate and are rightly not asked for a pin. Only pilot-dispatcher.sh reads the disk, so only it is scanned. The option
+# grammar stops at the first thing it does not know (an option spelled some other way than the ones listed above), and a run site
+# behind it passes unseen; the fixtures long-opt-*, o-option-*, rcfile-*, init-file-* and end-of-options-* hold what IS covered.
 #
 #   A  the detector on fixtures: each leaky shape is caught, each safe shape is let through
 #   B  the real tree: no unpinned run site, AND the scan is not vacuous (it still sees the suites that run the dispatcher)
@@ -54,11 +58,11 @@ function pinned(s) {
 }
 function check(L, start,   v, hit) {
   L = L " "                       # leading space comes from the join, trailing one is added: no ^ / $ inside regex groups (BSD awk)
-  if (L ~ /[ \t\/(;&|`](bash|sh)[ \t]+-[a-zA-Z]*n[a-zA-Z]*[ \t]/) return   # syntax check, not a run
+  if (L ~ ("[ \t/(;&|`](bash|sh)[ \t]+" OPT "-[a-zA-Z]*n[a-zA-Z]*[ \t]")) return   # syntax check, not a run
   hit = 0
   if (L ~ RUN_LIT) hit = 1
   else for (v in vars) {
-    if (L ~ ("[ \t/(;&|`](bash|sh)[ \t]+(-[a-zA-Z]+[ \t]+)*\"?[$][{]?" v "[^A-Za-z0-9_]")) { hit = 1; break }
+    if (L ~ ("[ \t/(;&|`](bash|sh)[ \t]+" OPT "\"?[$][{]?" v "[^A-Za-z0-9_]")) { hit = 1; break }
   }
   if (!hit) return
   if (L ~ /[ \t(;&|`]env[ \t]+-i[ \t]/) {
@@ -70,7 +74,10 @@ function check(L, start,   v, hit) {
 }
 BEGIN {
   DISP = "pilot-dispatcher[.]sh"
-  RUN_LIT = "[ \t/(;&|`](bash|sh)[ \t]+(-[a-zA-Z]+[ \t]+)*\"?[^ \t\"]*" DISP
+  # What may stand between the shell and the script (ga-nyug12): short flags (-e, -ex), -o/+o/-O/+O NAME, --rcfile/--init-file FILE
+  # (the two long options that take an argument), any other --long-option, and a bare -- (end of options). Zero or more, each followed by blanks.
+  OPT = "(-[a-zA-Z]+[ \t]+|[-+][oO][ \t]+[a-zA-Z_]+[ \t]+|--(rcfile|init-file)[ \t]+[^ \t]+[ \t]+|--[a-zA-Z][a-zA-Z-]*[ \t]+|--[ \t]+)*"
+  RUN_LIT = "[ \t/(;&|`](bash|sh)[ \t]+" OPT "\"?[^ \t\"]*" DISP
 }
 FNR == NR {                                            # pass 1: dispatcher variables + the file-level export pin
   if ($0 ~ /^[ \t]*#/) next
@@ -208,6 +215,53 @@ mkfx other-dispatcher.selftest.sh <<'FXEOF'
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
 env -i HOME="$HOME" bash "$DISPATCHER" >/dev/null 2>&1 || true
 FXEOF
+# ga-nyug12 (item 8): options between the shell and the script. The first grammar knew `-[a-zA-Z]+` only, so every one of these
+# was a run site the guard never saw (a false "clean").
+mkfx long-opt-unpinned.selftest.sh <<'FXEOF'
+DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+env -i HOME="$HOME" bash --norc "$DISPATCHER" >/dev/null 2>&1 || true
+FXEOF
+mkfx long-opts-pinned.selftest.sh <<'FXEOF'
+DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+env -i DISK_FREE_OVERRIDE_MB=100000 HOME="$HOME" bash --noprofile --norc "$DISPATCHER" >/dev/null 2>&1 || true
+FXEOF
+mkfx long-opt-inherits.selftest.sh <<'FXEOF'
+DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+DRY_RUN=1 bash --posix "$DISPATCHER" >/dev/null 2>&1
+FXEOF
+mkfx long-opt-literal-path.selftest.sh <<'FXEOF'
+env -i HOME="$HOME" sh --norc "$SELF_DIR/pilot-dispatcher.sh" >/dev/null 2>&1 || true
+FXEOF
+mkfx o-option-unpinned.selftest.sh <<'FXEOF'
+DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+env -i HOME="$HOME" bash -o pipefail "$DISPATCHER" >/dev/null 2>&1 || true
+FXEOF
+mkfx big-o-option-unpinned.selftest.sh <<'FXEOF'
+DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+env -i HOME="$HOME" bash -O extglob -e "$DISPATCHER" >/dev/null 2>&1 || true
+FXEOF
+mkfx rcfile-unpinned.selftest.sh <<'FXEOF'
+DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+env -i HOME="$HOME" bash --rcfile /dev/null "$DISPATCHER" >/dev/null 2>&1 || true
+FXEOF
+mkfx init-file-unpinned.selftest.sh <<'FXEOF'
+DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+env -i HOME="$HOME" bash --noprofile --init-file "$SB/rc" "$DISPATCHER" >/dev/null 2>&1 || true
+FXEOF
+mkfx end-of-options-unpinned.selftest.sh <<'FXEOF'
+DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+env -i HOME="$HOME" bash --norc -- "$DISPATCHER" >/dev/null 2>&1 || true
+FXEOF
+mkfx long-opt-syntax-check.selftest.sh <<'FXEOF'
+DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+if bash --norc -n "$DISPATCHER" 2>/dev/null; then echo parses; fi
+FXEOF
+mkfx long-opt-other-script.selftest.sh <<'FXEOF'
+DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+env -i HOME="$HOME" bash --norc "$SELF_DIR/other-script.sh" >/dev/null 2>&1 || true
+bash --version >/dev/null 2>&1
+grep -c foo "$DISPATCHER"
+FXEOF
 
 verdict_of() { scan_file "$FX/$1" | awk -F'|' '{print $4}' | tr '\n' ' ' | sed 's/ $//'; }
 expect() { # <fixture> <expected verdict list> <label>
@@ -232,6 +286,17 @@ expect syntax-check-only.selftest.sh           ""                               
 expect extraction-only.selftest.sh             ""                                    "sed/awk/grep over the dispatcher is not a run"
 expect comment-only.selftest.sh                ""                                    "a run site inside a comment is ignored"
 expect other-dispatcher.selftest.sh            ""                                    "a dispatcher that does not read the disk is not asked for a pin"
+expect long-opt-unpinned.selftest.sh            "LEAK-env-i-unpinned"                 "a long option (bash --norc \"\$X\") is still a run site: env -i + no pin is a LEAK"
+expect long-opts-pinned.selftest.sh             "ok-env-pin"                          "two long options (--noprofile --norc) + a pin is let through"
+expect long-opt-inherits.selftest.sh            "LEAK-inherits-env-no-earlier-export" "bash --posix \"\$X\" with no export is a LEAK"
+expect long-opt-literal-path.selftest.sh        "LEAK-env-i-unpinned"                 "a long option before a literal …pilot-dispatcher.sh path is a run site"
+expect o-option-unpinned.selftest.sh            "LEAK-env-i-unpinned"                 "-o NAME (bash -o pipefail \"\$X\"): the option's argument is not mistaken for the script"
+expect big-o-option-unpinned.selftest.sh        "LEAK-env-i-unpinned"                 "-O NAME followed by another flag is still a run site"
+expect rcfile-unpinned.selftest.sh              "LEAK-env-i-unpinned"                 "--rcfile FILE: the option's argument is not mistaken for the script"
+expect init-file-unpinned.selftest.sh           "LEAK-env-i-unpinned"                 "--init-file FILE after another long option is still a run site"
+expect end-of-options-unpinned.selftest.sh   "LEAK-env-i-unpinned"                 "-- (end of options) between the flags and the script is still a run site"
+expect long-opt-syntax-check.selftest.sh        ""                                    "bash --norc -n is a syntax check even behind a long option"
+expect long-opt-other-script.selftest.sh        ""                                    "a long option before some OTHER script, bash --version and a grep over the dispatcher are not run sites"
 
 # ── B: the real tree ────────────────────────────────────────────────────────────────────────────────────
 echo "B  real tree"

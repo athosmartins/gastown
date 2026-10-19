@@ -10,6 +10,10 @@
 # run on its own. Three states, never two: low holds back, ok does not, and a disk that cannot be read (unknown) holds
 # NOTHING back but says so on stderr — it must not be mistaken for "the disk is fine", nor stop the pool.
 # Two textual MUTANTS of the block (the hold never fires; an unknown disk fails closed) must each be caught.
+# ga-nyug12: the low-disk hold is silent for ordinary beads, but a bead of the FIX class (gate:needs-fix, gate:fix-attempt:*,
+# origem:auto-healer-notify, impacto:dano-ao-vivo - the focus-mode set) held back by it gets a NOTE on stderr naming it and the
+# Mayor nudge (the answer stays [] - drain); a third mutant (the NOTE dropped) must be caught. Step 1b3 stays silent on an
+# unknown disk ON PURPOSE (1b2 ran first in the same turn and warned) - its comment says so and a check pins the sentence.
 #
 # Exit 0 iff every scenario, for both files, behaves as expected.
 set -uo pipefail
@@ -52,6 +56,8 @@ SH
 chmod +x "$WORK/bin/bd"
 FIXTURE='[{"id":"p1-bead","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","labels":[]},{"id":"p2-bead","priority":2,"issue_type":"task","created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","labels":[]}]'
 printf '%s' "$FIXTURE" > "$WORK/fixture.json"
+FIX_FIXTURE='[{"id":"fix-1","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","labels":["gate:needs-fix"]},{"id":"live-2","priority":2,"issue_type":"task","created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","labels":["impacto:dano-ao-vivo"]},{"id":"plain-3","priority":3,"issue_type":"task","created_at":"2026-01-03T00:00:00Z","updated_at":"2026-01-03T00:00:00Z","labels":[]}]'
+printf '%s' "$FIX_FIXTURE" > "$WORK/fixture-fix.json"
 
 # run_block <block-file> <disk-env...> — OUT / ERR
 run_block() {
@@ -101,6 +107,18 @@ check_template() {
   [ "$OUT" != "[]" ] && case "$ERR" in *"pool query printed nothing"*) true ;; *) false ;; esac \
     && ok "$label: failed query + low disk -> still the 'query printed nothing' WARN, never a fake []" || bad "$label: failed query + low disk read as 'nothing for you' (stdout: ${OUT:0:80}; stderr: ${ERR:0:200})"
 
+  # ga-nyug12 (item 2): a fix-class bead held by the low disk is named on stderr, with the Mayor nudge; the answer is still []
+  run_block "$blk" DISK_FREE_OVERRIDE_MB=3000 WA_FIXTURE="$WORK/fixture-fix.json"
+  [ "$OUT" = "[]" ] && ok "$label: fix-class beads + disk 3000 MB -> still [] (the hold has no exception)" || bad "$label: fix-class beads + low disk did not answer [] (stdout: ${OUT:0:160})"
+  case "$ERR" in *"NOTE disk floor (Step 1b2)"*"fix-1"*"live-2"*"gc session nudge mayor"*) ok "$label: …with a NOTE naming the held fix/live-damage beads and the Mayor nudge" ;; *) bad "$label: fix-class beads held by the low disk left no NOTE on stderr: ${ERR:0:300}" ;; esac
+  case "$ERR" in *plain-3*) bad "$label: the NOTE names a bead that is not fix-class: ${ERR:0:300}" ;; *) ok "$label: …and does not name the ordinary bead" ;; esac
+  run_block "$blk" DISK_FREE_OVERRIDE_MB=3000 WA_FIXTURE="$WORK/fixture-fix.json" GATE_FOCUS_ACTIVE_OVERRIDE=1
+  case "$ERR" in *"NOTE disk floor (Step 1b2)"*"fix-1"*) ok "$label: focus mode on + low disk -> the same NOTE" ;; *) bad "$label: focus mode + low disk left no NOTE: ${ERR:0:300}" ;; esac
+  run_block "$blk" DISK_FREE_OVERRIDE_MB=100000 WA_FIXTURE="$WORK/fixture-fix.json"; got="$(first_id)"
+  [ "$got:$ERR" = "fix-1:" ] && ok "$label: roomy disk + fix-class beads -> served, silent (no NOTE without a hold)" || bad "$label: roomy disk answered '$got' / stderr '${ERR:0:200}'"
+  run_block "$blk" DISK_FREE_OVERRIDE_MB=garbage WA_FIXTURE="$WORK/fixture-fix.json"; got="$(first_id)"
+  case "$ERR" in *"NOTE disk floor"*) bad "$label: unreadable disk wrote the held-back NOTE although nothing was held: ${ERR:0:200}" ;; *"free disk could not be read"*) [ "$got" = "fix-1" ] && ok "$label: unreadable disk + fix-class beads -> served with the WARN only, no NOTE" || bad "$label: unreadable disk answered '$got'" ;; *) bad "$label: unreadable disk left no WARN: ${ERR:0:200}" ;; esac
+
   # Step 1b3: the program after the Go-rendered query
   if prog="$(extract_fallback_postfilter_jq "$tpl")"; then
     got="$(printf '[{"id":"x","labels":[]}]' | DISK_HEADROOM_PROBE=low jq -c "$prog" 2>&1)"
@@ -109,9 +127,14 @@ check_template() {
     [ "$got" = '[{"id":"x","labels":[]}]' ] && ok "$label: Step 1b3 post-filter with ok -> unchanged" || bad "$label: Step 1b3 post-filter changed the answer on an ok disk: $got"
     got="$(printf '[{"id":"x","labels":[]}]' | env -u DISK_HEADROOM_PROBE jq -c "$prog" 2>&1)"
     [ "$got" = '[{"id":"x","labels":[]}]' ] && ok "$label: Step 1b3 post-filter with the variable unset -> unchanged (fail open)" || bad "$label: Step 1b3 post-filter failed with the variable unset: $got"
+    got="$(printf '[{"id":"x","labels":[]}]' | DISK_HEADROOM_PROBE=unknown jq -c "$prog" 2>&1)"
+    [ "$got" = '[{"id":"x","labels":[]}]' ] && ok "$label: Step 1b3 post-filter with the disk 'unknown' -> unchanged and silent (1b2 warned already)" || bad "$label: Step 1b3 post-filter changed or spoke on an unknown disk: $got"
   else
     bad "$label: could not extract the Step 1b3 post-filter (line shape changed?)"
   fi
+  # ga-nyug12 (item 5): the 1b3 line says nothing on an unknown disk; that is right only because 1b2 ran first in the same turn, and the comment above it must say so
+  sect="$(awk '/^# Step 1b3/ { f = 1 } f && /^export GATE_FOCUS_PROBE=/ { exit } f' "$tpl")"
+  case "$sect" in *"silent on purpose"*"same turn"*) ok "$label: the Step 1b3 comment says why an unknown disk is silent there (on purpose; 1b2 warned in the same turn)" ;; *) bad "$label: the Step 1b3 comment does not explain the silence on an unknown disk" ;; esac
   grep -E '^export GATE_FOCUS_PROBE=.*export DISK_HEADROOM_PROBE="\$\(\. .*disk-headroom-lib\.sh" 2>/dev/null && disk_headroom_state\)"; \{\{ \.RoutedPoolQuery \}\}' "$tpl" >/dev/null \
     && ok "$label: Step 1b3 reads the disk BEFORE the query pipeline" || bad "$label: Step 1b3 does not export DISK_HEADROOM_PROBE ahead of the Go-rendered query"
 
@@ -120,6 +143,10 @@ check_template() {
   cmp -s "$blk" "$WORK/$pfx.mut-nohold.sh" && bad "$label: mutant 'the hold never fires' did not change the block"
   run_block "$WORK/$pfx.mut-nohold.sh" DISK_FREE_OVERRIDE_MB=3000
   [ "$OUT" != "[]" ] && ok "$label: mutant 'the hold never fires' is caught (the low-disk answer is no longer [])" || bad "$label: mutant 'the hold never fires' SURVIVED"
+  sed 's/^    \[ -n "\$'"$pfx"'_FIX_HELD" \] && echo "NOTE disk floor.*$/    :/' "$blk" > "$WORK/$pfx.mut-nonote.sh"
+  cmp -s "$blk" "$WORK/$pfx.mut-nonote.sh" && bad "$label: mutant 'the NOTE is dropped' did not change the block"
+  run_block "$WORK/$pfx.mut-nonote.sh" DISK_FREE_OVERRIDE_MB=3000 WA_FIXTURE="$WORK/fixture-fix.json"
+  case "$ERR" in *"NOTE disk floor"*) bad "$label: mutant 'the NOTE is dropped' SURVIVED" ;; *) ok "$label: mutant 'the NOTE is dropped' is caught (a held fix-class bead would be silent again)" ;; esac
   sed 's/^  \*) echo "WARN disk floor (Step 1b2): the free disk could not be read.*$/  *) '"$pfx"'_CAND="[]" ;;/' "$blk" > "$WORK/$pfx.mut-closed.sh"
   cmp -s "$blk" "$WORK/$pfx.mut-closed.sh" && bad "$label: mutant 'unknown fails closed' did not change the block"
   run_block "$WORK/$pfx.mut-closed.sh" DISK_FREE_OVERRIDE_MB=garbage
