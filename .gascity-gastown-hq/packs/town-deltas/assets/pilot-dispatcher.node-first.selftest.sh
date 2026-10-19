@@ -27,6 +27,8 @@ bad() { FAIL=$((FAIL+1)); echo "  ✗ $*"; [ -z "${NF_MUTANT:-}" ] || { echo "RE
 fn_src() { awk -v n="$1" '$0 ~ "^"n"\\(\\) *\\{"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
 FUNC="$(fn_src _pilot_node_first_shadow)"
 [ -n "$FUNC" ] || { echo "FATAL: _pilot_node_first_shadow() not found in $DISPATCHER (ga-2hd02v.1.11 not applied)" >&2; exit 2; }
+FUNC_VETO="$(fn_src _pilot_node_first_veto)"
+[ -n "$FUNC_VETO" ] || { echo "FATAL: _pilot_node_first_veto() not found in $DISPATCHER (ga-2hd02v.1.14 not applied)" >&2; exit 2; }
 DEFAULT_LINE="$(grep -E '^PILOT_NODE_FIRST="' "$DISPATCHER" | head -1)"
 VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
 [ -n "$DEFAULT_LINE" ] && [ -n "$VETO_LINE" ] || { echo "FATAL: PILOT_NODE_FIRST config lines not found in $DISPATCHER" >&2; exit 2; }
@@ -65,10 +67,12 @@ run_nf() {
     PILOT_NODE_CAPACITY_BIN="$WORK/fake-capacity.py"
     PILOT_NODE_FIRST_LOG="${NF_LOG:-$LOG}"
     DRY_RUN="${NF_DRY:-0}"
-    eval "$FUNC"
+    eval "$FUNC_VETO"; eval "$FUNC"
     # BARE, sem `if`/`||`: em contexto condicional o bash desliga o errexit dentro do corpo e esconderia um comando que aborta.
+    # NF_TWICE: uma 1ª chamada que deixa o veredito em _PNF_* e uma 2ª, com os argumentos de NF_TARGET2, para provar que o resultado de uma bead não vaza para a seguinte.
+    if [ -n "${NF_TWICE:-}" ]; then _pilot_node_first_shadow "story-0" "gastown.dog" "0" "story:approved"; fi
     _pilot_node_first_shadow "story-1" "${NF_TARGET:-gastown.dog}" "${NF_NATIVE:-0}" "${NF_LABELS:-story:approved,exec:auto}"
-    echo "rc=$?"
+    echo "rc=$?${NF_SHOW:+ v=${_PNF_VERDICT-?} e=${_PNF_EFFECTIVE-?}}"
   ) 2>&1 | tail -1
 }
 
@@ -79,7 +83,11 @@ r=$(NF_USE_DEFAULTS=1 NF_MODE= run_nf); calls_n=$(calls)
 case "$DEFAULT_LINE" in *':-off}"'*) ok "a linha de configuração diz :-off" ;; *) bad "o padrão da linha de configuração não é off: $DEFAULT_LINE" ;; esac
 reset; oracle 0 '{"verdict":"node","reason":"free_slot"}'
 r=$(NF_MODE=off run_nf); [ "$r" = "rc=0" ] && [ "$(calls)" = 0 ] && [ ! -e "$LOG" ] && ok "off: não chama o oráculo e não grava" || bad "off não é inerte (r=$r calls=$(calls))"
-r=$(NF_MODE=on run_nf); [ "$r" = "rc=0" ] && [ "$(calls)" = 0 ] && grep -q "WARN.*PILOT_NODE_FIRST='on' não existe" "$LINES" && ok "'on' não existe: vale off e avisa" || bad "valor desconhecido não foi tratado como off com aviso (r=$r)"
+for v in yes ON 1 true; do
+  reset; oracle 0 '{"verdict":"node","reason":"free_slot","effective":3}'
+  r=$(NF_MODE=$v NF_SHOW=1 run_nf); [ "$r" = "rc=0 v= e=" ] && [ "$(calls)" = 0 ] && [ ! -e "$LOG" ] && grep -q "WARN.*PILOT_NODE_FIRST='$v' não existe (valores: off | shadow | on)" "$LINES" \
+    && ok "'$v' não é um valor: vale off, avisa os valores certos e não deixa veredito" || bad "valor desconhecido '$v' não foi tratado como off com aviso (r=$r)"
+done
 r=$(NF_DRY=1 run_nf); [ "$r" = "rc=0" ] && [ "$(calls)" = 0 ] && [ ! -e "$LOG" ] && grep -q "DRY_RUN" "$LINES" && ok "DRY_RUN: não consulta o nó (a consulta mede e grava estado)" || bad "DRY_RUN consultou ou gravou (r=$r)"
 
 echo "── quem entra"
@@ -121,6 +129,45 @@ r=$(NF_LOG="$WORK/ro/sub/shadow.jsonl" run_nf)
 [ "$r" = "rc=0" ] && grep -q "WARN.*não consegui gravar a decisão-sombra" "$LINES" && ok "log que não grava: avisa e devolve 0" || bad "log não gravável derrubou ou não avisou (r=$r)"
 chmod 755 "$WORK/ro"
 
+echo "── PILOT_NODE_FIRST=on (ga-2hd02v.1.14): o veredito sai da função — e só 'node' com exit 0, JSON e número de vagas de acordo"
+reset; oracle 0 '{"verdict":"node","reason":"free_slot","ceiling":3,"active":1,"effective":3}'
+r=$(NF_MODE=on NF_SHOW=1 run_nf)
+[ "$r" = "rc=0 v=node e=3" ] && [ "$(calls)" = 1 ] && [ "$(rec .verdict)" = node ] && [ "$(rec .shadow)" = false ] && [ "$(rec .effective)" = 3 ] \
+  && ok "on + node/0: consulta uma vez, deixa v=node e=3 para o dispatch_one e registra shadow=false" || bad "on + node não deixou o veredito (r=$r calls=$(calls) rec=$(rec -c .))"
+grep -q "LOG.*VAI ao nó" "$LINES" && ! grep -q "IRIA ao nó" "$LINES" && ok "on: o log diz que VAI ao nó (a frase de 'IRIA' é só da sombra)" || bad "log de node em modo on errado: $(cat "$LINES" 2>/dev/null)"
+reset; oracle 1 '{"verdict":"local","reason":"node_full"}'; r=$(NF_MODE=on NF_SHOW=1 run_nf)
+[ "$r" = "rc=0 v=local e=" ] && [ "$(rec .verdict)" = local ] && ok "on + local/1: v=local, sem vagas — o dispatch_one segue no mini" || bad "on + local deixou '$r'"
+reset; oracle 2 '{"verdict":"unknown","reason":"reading_stale"}'; r=$(NF_MODE=on NF_SHOW=1 run_nf)
+[ "$r" = "rc=0 v=unknown e=" ] && ok "on + unknown/2: v=unknown, nunca node" || bad "on + unknown deixou '$r'"
+reset; oracle 1 '{"verdict":"node","reason":"free_slot","effective":3}'; r=$(NF_MODE=on NF_SHOW=1 run_nf)
+[ "$r" = "rc=0 v=unknown e=" ] && [ "$(rec .reason)" = "oraculo_incoerente(rc=1,verdict=node)" ] && ok "on: JSON diz node mas exit 1 → v=unknown (a contradição nunca leva a bead ao nó)" || bad "node com exit 1 em modo on deixou '$r'"
+reset; oracle 0 'isto nao e json'; r=$(NF_MODE=on NF_SHOW=1 run_nf); [ "$r" = "rc=0 v=unknown e=" ] && ok "on: saída ilegível → v=unknown" || bad "saída ilegível em modo on deixou '$r'"
+reset; r=$(NF_MODE=on NF_SHOW=1 run_nf); [ "$r" = "rc=0 v=unknown e=" ] && ok "on: oráculo que nem roda (rc 127) → v=unknown, sem abortar sob set -e" || bad "oráculo ausente em modo on deixou '$r'"
+for eff in '' ',"effective":0' ',"effective":"x"' ',"effective":-1' ',"effective":2.5' ',"effective":null' ',"effective":""'; do
+  reset; oracle 0 "{\"verdict\":\"node\",\"reason\":\"free_slot\"$eff}"; r=$(NF_MODE=on NF_SHOW=1 run_nf)
+  [ "$r" = "rc=0 v=unknown e=" ] && [ "$(rec .verdict)" = unknown ] && [ "$(rec .reason)" = oraculo_sem_effective ] && ok "on: node sem número de vagas utilizável (${eff:-campo ausente}) → v=unknown (sem effective não há alias a escolher)" || bad "node com effective ${eff:-ausente} deixou '$r' / '$(rec .reason)'"
+done
+reset; oracle 0 '{"verdict":"node","reason":"free_slot","effective":3}'
+r=$(NF_MODE=shadow NF_SHOW=1 run_nf); [ "$r" = "rc=0 v= e=" ] && [ "$(rec .shadow)" = true ] && ok "shadow: registra mas NÃO deixa veredito para o despacho (só o modo on leva ao nó)" || bad "shadow deixou veredito: '$r'"
+r=$(NF_MODE=on NF_TARGET=wa-worker NF_SHOW=1 run_nf); [ "$r" = "rc=0 v= e=" ] && ok "on: pool que não é gastown.dog → sem veredito" || bad "on + wa-worker deixou '$r'"
+r=$(NF_MODE=on NF_NATIVE=1 NF_SHOW=1 run_nf);        [ "$r" = "rc=0 v= e=" ] && ok "on: bead rig-native (WA/PS, dado de cliente) → sem veredito" || bad "on + rig-native deixou '$r'"
+for lab in node:never needs:engine-window exec:manual; do
+  reset; oracle 0 '{"verdict":"node","reason":"free_slot","effective":3}'
+  r=$(NF_MODE=on NF_LABELS="story:approved,$lab" NF_SHOW=1 run_nf)
+  [ "$r" = "rc=0 v=local e=" ] && [ "$(calls)" = 0 ] && ok "on: rótulo de veto $lab → v=local sem consultar o nó (fica no mini)" || bad "veto $lab em modo on deixou '$r' calls=$(calls)"
+done
+reset; oracle 0 '{"verdict":"node","reason":"free_slot","effective":3}'
+r=$(NF_MODE=on NF_TWICE=1 NF_TARGET=wa-worker NF_SHOW=1 run_nf); [ "$r" = "rc=0 v= e=" ] && ok "o veredito de uma bead não vaza para a seguinte (a 2ª, de wa-worker, volta a v= e=)" || bad "veredito vazou para a bead seguinte: '$r'"
+reset; oracle 0 '{"verdict":"node","reason":"free_slot","effective":3}'
+r=$(NF_MODE=on NF_TWICE=1 NF_DRY=1 NF_SHOW=1 run_nf); [ "$r" = "rc=0 v= e=" ] && ok "e o DRY_RUN também limpa o veredito" || bad "veredito vazou para o DRY_RUN: '$r'"
+reset; oracle 0 '{"verdict":"node","reason":"free_slot","effective":3}'
+r=$(NF_MODE=on NF_DRY=1 NF_SHOW=1 run_nf)
+[ "$r" = "rc=0 v= e=" ] && [ "$(calls)" = 0 ] && [ ! -e "$LOG" ] && grep -q "LOG.*node-first (on): DRY_RUN" "$LINES" && grep -q "dog-remote-<n>" "$LINES" && grep -q "bd update .*--assignee dog-remote-<n>" "$LINES" \
+  && grep -q "gc session new dog-remote --alias dog-remote-<n> --no-attach" "$LINES" && grep -q "gc session nudge dog-remote-<n>" "$LINES" && grep -q "mini" "$LINES" \
+  && ok "on + DRY_RUN: não consulta nem grava, e mostra o plano (alias dog-remote-<n>, assign, sessão, nudge, falha → mini)" || bad "DRY_RUN em modo on: r=$r calls=$(calls) linhas=$(cat "$LINES" 2>/dev/null | tr '\n' '|')"
+reset; r=$(NF_MODE=on NF_DRY=1 NF_TARGET=wa-worker NF_SHOW=1 run_nf); ! grep -q "dog-remote-<n>" "$LINES" && ok "on + DRY_RUN de bead que não é de dog: sem plano de nó" || bad "DRY_RUN de wa-worker mostrou plano de nó"
+reset; r=$(NF_MODE=on NF_DRY=1 NF_LABELS="story:approved,node:never" NF_SHOW=1 run_nf); grep -q "veto:node:never" "$LINES" && ! grep -q "dog-remote-<n>" "$LINES" && ok "on + DRY_RUN de bead vetada: diz que fica no mini, sem plano de nó" || bad "DRY_RUN de bead vetada: $(cat "$LINES" | tr '\n' '|')"
+
 echo "── a chamada no dispatch_one"
 ncalls=$(grep -c '^  _pilot_node_first_shadow "\$STORY_ID" "\$_SLING_TARGET" "\$_IS_RIG_NATIVE" "\$STORY_LABELS" || true$' "$DISPATCHER")
 l_native=$(grep -n '^  \[ "\$STORY_BEAD_CITY" != "\$GC_CITY" \] && _IS_RIG_NATIVE=1$' "$DISPATCHER" | head -1 | cut -d: -f1)
@@ -147,9 +194,16 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   export PATH_ORIG="$PATH"
   mutant "sem a checagem de coerência rc×veredito" '      node:0|local:1|unknown:2) : ;;' '      node:*|local:*|unknown:*) : ;;'
   mutant "off consulta mesmo assim" '    off) return 0 ;;' '    off) : ;;'
-  mutant "veto por substring" '*",$_nf_l,"*) _nf_v="local"' '*"$_nf_l"*) _nf_v="local"'
+  mutant "veto por substring" '*",$_nfv_l,"*) printf' '*"$_nfv_l"*) printf'
   mutant "sem o filtro de pool" '  if [ "$_nf_target" != "gastown.dog" ] || [ "$_nf_native" != "0" ]; then return 0; fi' '  :'
   mutant "padrão vira shadow" 'PILOT_NODE_FIRST="${PILOT_NODE_FIRST:-off}"' 'PILOT_NODE_FIRST="${PILOT_NODE_FIRST:-shadow}"'
+  # ga-2hd02v.1.14 — o modo on
+  mutant "on aceita node sem número de vagas" "case \"\$_nf_eff\" in ''|*[!0-9]*|0*) _nf_why" "case \"\$_nf_eff\" in NUNCA) _nf_why"
+  mutant "shadow também deixa veredito para o despacho" $'  if [ "$PILOT_NODE_FIRST" = "on" ]; then\n    _PNF_VERDICT="$_nf_v"' $'  if :; then\n    _PNF_VERDICT="$_nf_v"'
+  mutant "o veredito vaza para a bead seguinte" $'  _PNF_VERDICT=""; _PNF_EFFECTIVE=""\n' ''
+  mutant "DRY_RUN consulta o nó em modo on" $'  if [ "${DRY_RUN:-0}" = "1" ]; then\n    if [ "$PILOT_NODE_FIRST" = "on" ]' $'  if false; then\n    if [ "$PILOT_NODE_FIRST" = "on" ]'
+  mutant "on registra shadow=true" 'on) _nf_sh=false; _nf_tag="on" ;;' 'on) _nf_sh=true; _nf_tag="on" ;;'
+  mutant "valor desconhecido segue como se existisse" 'não existe (valores: off | shadow | on); tratado como off" >&2; return 0 ;;' 'não existe (valores: off | shadow | on); tratado como off" >&2 ;;'
 fi
 echo "── $PASS ok, $FAIL falhas"
 [ "$FAIL" = 0 ]

@@ -390,9 +390,10 @@ PILOT_SWAP_USED_OVERRIDE_MB="${PILOT_SWAP_USED_OVERRIDE_MB:-}"
 PILOT_SWAP_FREE_OVERRIDE_MB="${PILOT_SWAP_FREE_OVERRIDE_MB:-}"
 PILOT_DISK_FREE_OVERRIDE_MB="${PILOT_DISK_FREE_OVERRIDE_MB:-}"
 PILOT_KERN_PRESSURE_OVERRIDE="${PILOT_KERN_PRESSURE_OVERRIDE:-}"
-# ga-2hd02v.1.11: "nó primeiro" no MODO SOMBRA. off (padrão) | shadow. shadow só CONSULTA scripts/hetzner-capacity.py (veredito node|local|unknown) para cada bead de
-# dog do HQ e REGISTRA o que o Pilot faria; o despacho segue exatamente como sempre foi. Não existe valor "on": levar a bead ao nó (atribuir ao alias dog-remote-<n>,
-# abrir a sessão) é outra fatia (docs/runbooks/hetzner-capacity.md). Valor desconhecido = off, com aviso.
+# ga-2hd02v.1.11 / .1.14: "nó primeiro". off (padrão) | shadow | on. shadow só CONSULTA scripts/hetzner-capacity.py (veredito node|local|unknown) para cada bead de
+# dog do HQ e REGISTRA o que o Pilot faria; o despacho segue exatamente como sempre foi. on (ga-2hd02v.1.14) FAZ: com veredito node, o Pilot atribui a bead ao alias
+# dog-remote-<n> (n <= effective do oráculo), abre a sessão e avisa; qualquer falha devolve a bead e ela segue no mini. Quem liga o `on` é o Mayor, depois da sombra medida
+# (docs/runbooks/hetzner-capacity.md, "Ligar e desligar o nó primeiro"). Valor desconhecido = off, com aviso.
 PILOT_NODE_FIRST="${PILOT_NODE_FIRST:-off}"
 PILOT_NODE_FIRST_VETO_LABELS="${PILOT_NODE_FIRST_VETO_LABELS:-node:never needs:engine-window exec:manual}"
 PILOT_NODE_CAPACITY_BIN="${PILOT_NODE_CAPACITY_BIN:-$GC_CITY/scripts/hetzner-capacity.py}"
@@ -11730,22 +11731,55 @@ _e12_doctrine_block() {
   return 0
 }
 
-# _pilot_node_first_shadow <story_id> <sling_target> <is_rig_native> <labels_csv> — ga-2hd02v.1.11, MODO SOMBRA.
-# Pergunta ao oráculo do nó (hetzner-capacity.py verdict) para onde esta bead iria e GRAVA a resposta em $PILOT_NODE_FIRST_LOG; NUNCA muda o despacho: devolve 0 o que
-# quer que aconteça (consulta que falha, JSON ruim, log que não grava). Só a bead de dog do HQ entra (pool gastown.dog, bead da própria cidade) e só sem rótulo de veto.
-# Só "node" no JSON, com exit 0, conta como "iria ao nó"; qualquer outra coisa (mini, não sei, prazo, oráculo ausente) fica registrada como o que foi e NUNCA como "node".
+# _pilot_node_first_veto <labels_csv> — ga-2hd02v.1.14: o 1º rótulo de PILOT_NODE_FIRST_VETO_LABELS que a bead traz (token inteiro: `node:never-ever` NÃO é `node:never`), ou nada.
+# Sempre devolve 0. Existe para o veredito e o plano de DRY_RUN lerem o MESMO veto: dois lugares com listas diferentes é a divergência que o ga-3lsy1 já nomeou.
+_pilot_node_first_veto() {
+  local _nfv_labels="$1" _nfv_l
+  for _nfv_l in $PILOT_NODE_FIRST_VETO_LABELS; do
+    case ",$_nfv_labels," in *",$_nfv_l,"*) printf '%s' "$_nfv_l"; return 0 ;; esac
+  done
+  return 0
+}
+
+# _pilot_node_first_shadow <story_id> <sling_target> <is_rig_native> <labels_csv> — ga-2hd02v.1.11 (SOMBRA) e ga-2hd02v.1.14 (on).
+# Pergunta ao oráculo do nó (hetzner-capacity.py verdict) para onde esta bead iria e GRAVA a resposta em $PILOT_NODE_FIRST_LOG. Em `shadow` NUNCA muda o despacho. Em `on` ainda
+# não muda nada aqui: deixa o veredito em _PNF_VERDICT/_PNF_EFFECTIVE e é o dispatch_one quem leva a bead ao nó (_pilot_node_first_dispatch). Devolve 0 o que quer que aconteça
+# (consulta que falha, JSON ruim, log que não grava). Só a bead de dog do HQ entra (pool gastown.dog, bead da própria cidade) e só sem rótulo de veto.
+# Só "node" no JSON, com exit 0, conta como "iria/vai ao nó"; qualquer outra coisa (mini, não sei, prazo, oráculo ausente) fica registrada como o que foi e NUNCA como "node". Em `on`
+# o "node" ainda precisa trazer `effective` inteiro > 0: sem o número de vagas não há alias dog-remote-<n> a escolher, e isso é "unknown", não "node".
+# Em DRY_RUN não consulta (a consulta mede o nó e grava estado) e, em `on`, imprime o plano. _PNF_* é zerado a cada chamada: o veredito de uma bead não vaza para a seguinte.
+_PNF_VERDICT=""      # saída, só em `on`: node | local | unknown; vazio = esta bead não foi consultada (fora do pool, DRY_RUN, off/shadow)
+_PNF_EFFECTIVE=""    # saída, só em `on` com _PNF_VERDICT=node: quantas sessões remotas o oráculo deixa ter agora (inteiro > 0)
 _pilot_node_first_shadow() {
-  local _nf_id="$1" _nf_target="$2" _nf_native="$3" _nf_labels="$4" _nf_out="" _nf_rc=0 _nf_v="" _nf_why="" _nf_l _nf_rec=""
+  local _nf_id="$1" _nf_target="$2" _nf_native="$3" _nf_labels="$4" _nf_out="" _nf_rc=0 _nf_v="" _nf_why="" _nf_l="" _nf_rec="" _nf_eff="" _nf_sh=true _nf_tag="sombra"
+  _PNF_VERDICT=""; _PNF_EFFECTIVE=""
   case "$PILOT_NODE_FIRST" in
     off) return 0 ;;
     shadow) : ;;
-    *) warn "ga-2hd02v.1.11: PILOT_NODE_FIRST='$PILOT_NODE_FIRST' não existe (valores: off | shadow); tratado como off" >&2; return 0 ;;
+    on) _nf_sh=false; _nf_tag="on" ;;
+    *) warn "ga-2hd02v.1.11: PILOT_NODE_FIRST='$PILOT_NODE_FIRST' não existe (valores: off | shadow | on); tratado como off" >&2; return 0 ;;
   esac
-  if [ "${DRY_RUN:-0}" = "1" ]; then log "  node-first (sombra): DRY_RUN — não consulto o nó (a consulta mede o nó e grava estado)"; return 0; fi
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    if [ "$PILOT_NODE_FIRST" = "on" ] && [ "$_nf_target" = "gastown.dog" ] && [ "$_nf_native" = "0" ]; then
+      _nf_l=$(_pilot_node_first_veto "$_nf_labels")
+      if [ -n "$_nf_l" ]; then
+        log "  node-first (on): DRY_RUN — $_nf_id ficaria no mini (veto:$_nf_l)"
+      else
+        log "  node-first (on): DRY_RUN — não consulto o nó (a consulta mede o nó e grava estado). Se o oráculo disser node, o plano para $_nf_id é:"
+        log "    1. escolher o 1º alias livre dog-remote-<n> (n <= effective do oráculo), olhando gc session list"
+        log "    2. bd update $_nf_id --assignee dog-remote-<n> --status in_progress"
+        log "    3. gc session new dog-remote --alias dog-remote-<n> --no-attach   (gc session wake se o alias dorme)"
+        log "    4. gc session nudge dog-remote-<n> <aviso>"
+        log "    falha em qualquer passo (ou oráculo que não diz node): a atribuição é desfeita e a bead segue no mini — nunca fica presa no nó"
+      fi
+    else
+      log "  node-first (sombra): DRY_RUN — não consulto o nó (a consulta mede o nó e grava estado)"
+    fi
+    return 0
+  fi
   if [ "$_nf_target" != "gastown.dog" ] || [ "$_nf_native" != "0" ]; then return 0; fi
-  for _nf_l in $PILOT_NODE_FIRST_VETO_LABELS; do
-    case ",$_nf_labels," in *",$_nf_l,"*) _nf_v="local"; _nf_why="veto:$_nf_l" ;; esac
-  done
+  _nf_l=$(_pilot_node_first_veto "$_nf_labels")
+  if [ -n "$_nf_l" ]; then _nf_v="local"; _nf_why="veto:$_nf_l"; fi
   if [ -z "$_nf_v" ]; then
     # vazio (sem stdout) → "unknown"; falhou (rc 1 = mini, 2 = não sei, 124 = prazo, outro = não rodou) → fica como o que foi, nunca "node"
     _nf_out=$(timeout 40 python3 -I "$PILOT_NODE_CAPACITY_BIN" --json verdict 2>/dev/null </dev/null) || _nf_rc=$?
@@ -11757,19 +11791,145 @@ _pilot_node_first_shadow() {
       :*) _nf_why="oraculo_sem_resposta(rc=$_nf_rc)"; _nf_v="unknown" ;;
       *) _nf_why="oraculo_incoerente(rc=$_nf_rc,verdict=$_nf_v)"; _nf_v="unknown" ;;
     esac
+    if [ "$PILOT_NODE_FIRST" = "on" ] && [ "$_nf_v" = "node" ]; then
+      # vazio/ilegível (campo ausente, null, texto, 0, negativo, fração) → "unknown": um "node" sem número de vagas não dá alias a escolher
+      _nf_eff=$(printf '%s' "$_nf_out" | jq -r '.effective // empty' 2>/dev/null) || _nf_eff=""
+      case "$_nf_eff" in ''|*[!0-9]*|0*) _nf_why="oraculo_sem_effective"; _nf_v="unknown"; _nf_eff="" ;; esac
+    fi
+  fi
+  if [ "$PILOT_NODE_FIRST" = "on" ]; then
+    _PNF_VERDICT="$_nf_v"
+    if [ "$_nf_v" = "node" ]; then _PNF_EFFECTIVE="$_nf_eff"; fi
   fi
   [ -n "$_nf_out" ] || _nf_out='{}'
-  _nf_rec=$(printf '%s' "$_nf_out" | jq -c --arg id "$_nf_id" --arg v "$_nf_v" --arg r "$_nf_why" --argjson ts "$(date +%s)" \
-    '(if type == "object" then . else {} end) + {story: $id, ts: $ts, shadow: true, verdict: $v, reason: $r}' 2>/dev/null) \
-    || _nf_rec=$(jq -cn --arg id "$_nf_id" --arg v "$_nf_v" --arg r "$_nf_why" --argjson ts "$(date +%s)" '{story: $id, ts: $ts, shadow: true, verdict: $v, reason: $r}')
+  _nf_rec=$(printf '%s' "$_nf_out" | jq -c --arg id "$_nf_id" --arg v "$_nf_v" --arg r "$_nf_why" --arg m "$PILOT_NODE_FIRST" --argjson sh "$_nf_sh" --argjson ts "$(date +%s)" \
+    '(if type == "object" then . else {} end) + {story: $id, ts: $ts, shadow: $sh, mode: $m, verdict: $v, reason: $r}' 2>/dev/null) \
+    || _nf_rec=$(jq -cn --arg id "$_nf_id" --arg v "$_nf_v" --arg r "$_nf_why" --arg m "$PILOT_NODE_FIRST" --argjson sh "$_nf_sh" --argjson ts "$(date +%s)" '{story: $id, ts: $ts, shadow: $sh, mode: $m, verdict: $v, reason: $r}')
   mkdir -p "$(dirname "$PILOT_NODE_FIRST_LOG")" 2>/dev/null || true
   printf '%s\n' "$_nf_rec" >> "$PILOT_NODE_FIRST_LOG" 2>/dev/null \
     || warn "ga-2hd02v.1.11: não consegui gravar a decisão-sombra de $_nf_id em $PILOT_NODE_FIRST_LOG" >&2
   case "$_nf_v" in
-    node) log "  node-first (sombra): $_nf_id IRIA ao nó (hoje vai ao mini: o despacho ao nó ainda não existe)" ;;
-    local) log "  node-first (sombra): $_nf_id ficaria no mini ($_nf_why)" ;;
-    *) log "  node-first (sombra): $_nf_id ficaria no mini — não sei se o nó pode ($_nf_why)" ;;
+    node)
+      if [ "$PILOT_NODE_FIRST" = "on" ]; then log "  node-first (on): $_nf_id VAI ao nó (effective=$_nf_eff)"
+      else log "  node-first (sombra): $_nf_id IRIA ao nó (hoje vai ao mini: o modo shadow só registra)"; fi ;;
+    local) log "  node-first ($_nf_tag): $_nf_id ficaria no mini ($_nf_why)" ;;
+    *) log "  node-first ($_nf_tag): $_nf_id ficaria no mini — não sei se o nó pode ($_nf_why)" ;;
   esac
+  return 0
+}
+
+# _pilot_node_pick_alias <effective> — ga-2hd02v.1.14: escolhe o alias dog-remote-<n> (n <= effective) a que a bead vai, lendo `gc session list`.
+# Devolve 0 com _PNF_ALIAS e _PNF_ALIAS_STATE (new = nenhuma sessão tem o alias, abre-se uma; asleep = a sessão dog-remote dorme e é ACORDADA em vez de criar outra) ou 1 sem alias:
+# teto cheio, lista de sessões ilegível ou effective que não é inteiro > 0 — e quem chamou manda a bead ao mini sem ter escrito nada.
+# As vagas contam por TEMPLATE (dog-remote, fora closed e asleep), não só por alias: uma sessão sem alias também gasta vaga. Estado que não conheço conta como ocupado. Alias preso por sessão
+# de OUTRO template nunca é escolhido (a bead iria a quem não é o dog do nó).
+_pilot_node_pick_alias() {
+  local _pk_eff="${1:-}" _pk_json="" _pk_pick=""
+  _PNF_ALIAS=""; _PNF_ALIAS_STATE=""
+  # vazio/ilegível (vazio, não-número, 0, fração, mais de 3 dígitos) → sem alias: sem teto numérico não há o que respeitar, e sem teto não se despacha
+  case "$_pk_eff" in ''|*[!0-9]*|0*) return 1 ;; esac
+  [ "${#_pk_eff}" -le 3 ] || return 1
+  # vazio/falhou (rc≠0, sem saída, não JSON, ok:false) → sem alias: lista que não deu para ler NÃO é "sem sessões" — seria escolher dog-remote-1 às cegas, por cima de uma sessão que talvez já o ocupe
+  _pk_json=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || return 1
+  # sem o array .sessions (ou não-array) → sem alias: `.sessions[]?` sobre um não-array dá "zero sessões", que é exatamente a leitura errada acima
+  printf '%s' "$_pk_json" | jq -e '.sessions | type == "array"' >/dev/null 2>&1 || return 1
+  # vazio = nenhum alias livre dentro do teto (→ sem alias); jq que falha → sem alias
+  _pk_pick=$(printf '%s' "$_pk_json" | jq -r --argjson eff "$_pk_eff" '
+    [.sessions[] | select(type == "object" and .closed != true)] as $live
+    | ([$live[] | select(.template == "dog-remote" and .state != "asleep")] | length) as $occ
+    | if $occ >= $eff then empty
+      else ([range(1; $eff + 1)
+             | "dog-remote-\(.)" as $a
+             | [$live[] | select(.alias == $a)] as $h
+             | if ($h | length) == 0 then "\($a) new"
+               elif ($h | all(.template == "dog-remote" and .state == "asleep")) then "\($a) asleep"
+               else empty end] | first // empty)
+      end' 2>/dev/null) || return 1
+  [ -n "$_pk_pick" ] || return 1
+  _PNF_ALIAS="${_pk_pick%% *}"; _PNF_ALIAS_STATE="${_pk_pick#* }"
+  return 0
+}
+
+# _pilot_node_first_rollback <bead_id> <bead_city> <alias> <session_touched 0|1> — ga-2hd02v.1.14: desfaz o despacho ao nó. Devolve 0 SÓ quando a releitura da bead mostra o estado de antes
+# (sem dono, open); 1 quando não dá para confirmar (a bead pode ainda estar com o alias, com outro dono, ou ilegível).
+# Ordem: 1º fecha a sessão (se chegou a tocar nela), só depois solta a bead — uma sessão viva com a bead solta a acharia pelo GC_ALIAS e o mini a construiria também. O close que falha avisa alto
+# mas NÃO impede soltar a bead: a bead nunca fica presa no nó. A soltura é UMA escrita guardada (--if-assignee <alias>: só solta se o dono ainda é o alias, nunca pisa em quem pegou a bead depois;
+# rc 13 e rc 1 caem os dois na releitura, que é quem decide) e confirmada lendo o estado, não deduzida do exit code.
+_pilot_node_first_rollback() {
+  local _rb_id="$1" _rb_city="$2" _rb_alias="$3" _rb_sess="${4:-0}" _rb_json="" _rb_state="" _rb_asg="" _rb_st=""
+  if [ "$_rb_sess" = "1" ]; then
+    timeout 20 gc --city "$GC_CITY" session close "$_rb_alias" >/dev/null 2>&1 \
+      || warn "ga-2hd02v.1.14: não consegui fechar a sessão $_rb_alias ao desfazer o despacho de $_rb_id (esperado se ela nem chegou a nascer) — solto a bead mesmo assim: ela nunca fica presa no nó"
+  fi
+  timeout 15 bd -C "$_rb_city" update "$_rb_id" --if-assignee "$_rb_alias" --assignee "" --status open -q >/dev/null 2>&1 || true
+  # vazio/falhou/ilegível (rc≠0, sem saída, JSON ruim, bead sem status) → NÃO confirmado → devolve 1 (a bead pode estar com o alias: mandá-la ao mini a deixaria construída duas vezes)
+  _rb_json=$(timeout 15 bd -C "$_rb_city" show "$_rb_id" --json 2>/dev/null) || _rb_json=""
+  _rb_state=$(printf '%s' "$_rb_json" | jq -r 'if type == "array" then .[0] else . end | if type == "object" and (.status | type == "string") then "\(.assignee // "")|\(.status)" else empty end' 2>/dev/null) || _rb_state=""
+  if [ -z "$_rb_state" ]; then
+    warn "ga-2hd02v.1.14: não consegui ler $_rb_id para confirmar o desfazer do despacho ao nó (alias $_rb_alias) — NÃO mando a bead ao mini; o claim fica para o TTL"
+    return 1
+  fi
+  _rb_asg="${_rb_state%%|*}"; _rb_st="${_rb_state#*|}"
+  if [ -z "$_rb_asg" ] && [ "$_rb_st" = "open" ]; then return 0; fi
+  warn "ga-2hd02v.1.14: o desfazer do despacho de $_rb_id ao nó (alias $_rb_alias) não se confirmou — a bead está com assignee='${_rb_asg:-}' status='$_rb_st'; NÃO mando ao mini (podia ser construída duas vezes); o claim fica para o TTL"
+  return 1
+}
+
+# _pilot_node_first_dispatch <bead_id> <bead_city> <title> <effective> — ga-2hd02v.1.14: leva a bead de dog ao nó (PILOT_NODE_FIRST=on, veredito node). Sempre devolve 0 e deixa o resultado em
+# _PNF_RESULT (node = a bead está com o alias e a sessão avisada · mini = nada ficou escrito, siga o despacho normal · stuck = o desfazer não se confirmou, NÃO siga para o mini) e
+# _PNF_ALIAS (o alias em node/stuck; vazio em mini). Ordem: escolher alias → atribuir → abrir/acordar a sessão → avisar. QUALQUER falha desfaz (_pilot_node_first_rollback) e a bead segue no
+# mini com o estado de antes: o nó é uma otimização, nunca um lugar onde a bead possa ficar presa. Uma sessão lenta (prazo ou >= PILOT_SLOW_SPAWN_SECS) gasta o orçamento de spawn do sweep.
+_PNF_RESULT=""        # saída: node | mini | stuck
+_PNF_ALIAS=""         # saída: dog-remote-<n> (node/stuck); vazio em mini
+_PNF_ALIAS_STATE=""   # interno de _pilot_node_pick_alias: new | asleep
+_pilot_node_first_dispatch() {
+  local _nd_id="$1" _nd_city="$2" _nd_title="$3" _nd_eff="${4:-}" _nd_alias="" _nd_state="" _nd_rc=0 _nd_t0=0 _nd_msg="" _nd_step="" _nd_sess=0
+  _PNF_RESULT="mini"; _PNF_ALIAS=""
+  if _pilot_slow_spawn_budget_spent; then
+    log "  node-first (on): $_nd_id fica no mini — uma sessão lenta já gastou o orçamento de spawn deste sweep (uma por sweep)"
+    return 0
+  fi
+  if ! _pilot_node_pick_alias "$_nd_eff"; then
+    log "  node-first (on): $_nd_id fica no mini — sem alias dog-remote-<n> livre dentro de effective='${_nd_eff:-?}' (teto cheio, lista de sessões ilegível ou effective inválido)"
+    return 0
+  fi
+  _nd_alias="$_PNF_ALIAS"; _nd_state="$_PNF_ALIAS_STATE"
+  # 1. atribuir: a sessão já nasce com a bead no nome dela (o dog do nó a acha por `bd list --assignee $GC_ALIAS`; o atalho do nó recusa `bd update --claim`)
+  timeout 15 bd -C "$_nd_city" update "$_nd_id" --assignee "$_nd_alias" --status in_progress -q >/dev/null 2>&1 || _nd_rc=$?
+  [ "$_nd_rc" -eq 0 ] || _nd_step="a atribuição falhou (rc=$_nd_rc)"
+  # 2. abrir (alias livre) ou acordar (alias dormindo) a sessão
+  if [ -z "$_nd_step" ]; then
+    _nd_sess=1; _nd_rc=0; _nd_t0=$SECONDS
+    if [ "$_nd_state" = "asleep" ]; then
+      timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session wake "$_nd_alias" >/dev/null 2>&1 || _nd_rc=$?
+    else
+      timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session new dog-remote --alias "$_nd_alias" --no-attach \
+        --title-hint "build $_nd_id: $_nd_title" >/dev/null 2>&1 || _nd_rc=$?
+    fi
+    _pilot_note_spawn_timing "$_nd_rc" "$_nd_t0"
+    if [ "$_nd_rc" -ne 0 ]; then
+      _nd_step="a sessão ($_nd_state) não abriu (rc=$_nd_rc)"
+      if [ "$_nd_rc" = "124" ]; then _nd_step="$_nd_step — estourou o prazo: ela pode ter nascido"; fi
+    fi
+  fi
+  # 3. avisar
+  if [ -z "$_nd_step" ]; then
+    _nd_msg="Bead nova para você: $_nd_id — $_nd_title. Ela já está atribuída ao seu alias (GC_ALIAS=$_nd_alias): ache com 'bd list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o protocolo do dog."
+    _nd_rc=0
+    timeout 15 gc --city "$GC_CITY" session nudge "$_nd_alias" "$_nd_msg" >/dev/null 2>&1 || _nd_rc=$?
+    [ "$_nd_rc" -eq 0 ] || _nd_step="o aviso falhou (rc=$_nd_rc)"
+  fi
+  if [ -n "$_nd_step" ]; then
+    warn "ga-2hd02v.1.14: node-first (on): $_nd_id → $_nd_alias: $_nd_step — desfaço o despacho e a bead segue no mini"
+    if _pilot_node_first_rollback "$_nd_id" "$_nd_city" "$_nd_alias" "$_nd_sess"; then
+      _PNF_RESULT="mini"; _PNF_ALIAS=""
+    else
+      _PNF_RESULT="stuck"; _PNF_ALIAS="$_nd_alias"
+    fi
+    return 0
+  fi
+  _PNF_RESULT="node"; _PNF_ALIAS="$_nd_alias"
+  log "  node-first (on): $_nd_id foi ao nó — alias $_nd_alias (${_nd_state}, effective=$_nd_eff)"
   return 0
 }
 
@@ -13439,6 +13599,21 @@ TASK
     return 1
   fi
 
+  # ── ga-2hd02v.1.14: PILOT_NODE_FIRST=on — leva a bead de dog ao nó Hetzner ─────
+  # Só com o interruptor ligado, o oráculo dizendo node (a consulta lá em cima) e fora do DRY_RUN (ali o plano já foi impresso). Fica DEPOIS de todas as guardas e da releitura ga-88g2:
+  # atribuir a bead e abrir a sessão são ações visíveis, e a guarda que recusa a bead tem que ter falado antes. mini = nada ficou escrito → segue o despacho normal logo abaixo, com o claim
+  # intacto; node = o ramo `elif _PNF_RESULT = node` da cadeia abaixo faz o resto (marca in-flight etc.); stuck = o desfazer não se confirmou, a bead pode estar com o alias → NÃO segue
+  # para o mini (seria construída duas vezes): o claim fica para o TTL.
+  _PNF_RESULT=""; _PNF_ALIAS=""
+  if [ "$DRY_RUN" != "1" ] && [ "$PILOT_NODE_FIRST" = "on" ] && [ "${_PNF_VERDICT:-}" = "node" ]; then
+    _pilot_node_first_dispatch "$STORY_ID" "$STORY_BEAD_CITY" "$STORY_TITLE" "${_PNF_EFFECTIVE:-}"
+    if [ "$_PNF_RESULT" = "stuck" ]; then
+      warn "ga-2hd02v.1.14: $STORY_ID ficou entre o nó e o mini — o desfazer do despacho a ${_PNF_ALIAS:-?} não se confirmou. Deixo o claim para o TTL em vez de despachar ao mini por cima."
+      DISPATCH_RESULT="node_rollback_unconfirmed"
+      return 1
+    fi
+  fi
+
   # ── Dispatch via gc sling (HQ beads) or bd assign (rig-native beads) ─────────
   # ga-ov3gow: DISPATCH_RESULT is NOT local (it used to be): every `DISPATCH_RESULT=...; return 1` below
   # is a reason the caller never saw, so a queue / failed spawn / guard refusal left no trace anywhere.
@@ -13475,6 +13650,13 @@ TASK
     log "  WOULD: bd comment $STORY_ID 'Pilot dispatched builder $BUILDER_TARGET at $NOW'"
     SLING_BEAD_ID="DRY_RUN_NO_SLING"
     DISPATCH_RESULT="dry_run"
+  elif [ "${_PNF_RESULT:-}" = "node" ]; then
+    # ga-2hd02v.1.14: _pilot_node_first_dispatch já atribuiu a bead ao alias dog-remote-<n>, abriu/acordou a sessão e a avisou. Aqui só o que o resto do despacho lê: a própria bead é o
+    # "sling bead" (como no rig-native: o TTL e o inflight-reclaim-guard acompanham o builder pelo assignee, e o alias bate com o `alias` da sessão em gc session list) e o resultado.
+    bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --set-metadata "pilot.sling_bead=$STORY_ID" -q 2>/dev/null || true
+    SLING_BEAD_ID="$STORY_ID"
+    DISPATCH_RESULT="node_ok"
+    log "Dispatch complete (node): bead=$STORY_ID alias=$_PNF_ALIAS (ga-2hd02v.1.14)"
   elif [ "$_IS_RIG_NATIVE" = "1" ]; then
     # ── ga-mfeip: rig-native dispatch path — bd assign + nudge ─────────────────
     # The bead lives in the rig's own Dolt DB. Cross-store sling is refused, so
@@ -14288,6 +14470,11 @@ Sling task bead: $SLING_BEAD_ID
 Builder doctrine: implement → /gate-done → autonomous gate+delivery → story:done.
 No human review required.
 No-diff deliverable (mockup, report, data-op, verified-live/no-changes finding)? Never exit with the bead in_progress: acceptance already met by the artifact itself → bd close --reason citing it. Missing an Athos decision → park it (next-action:athos-decide label + athos.acao metadata) and release the claim."
+    fi
+
+    if [ "${_PNF_RESULT:-}" = "node" ]; then
+      DISPATCH_COMMENT="$DISPATCH_COMMENT
+Nó Hetzner (PILOT_NODE_FIRST=on, ga-2hd02v.1.14): a bead está atribuída ao alias $_PNF_ALIAS e a sessão foi avisada — é ele quem a constrói; o mini não a pega."
     fi
 
     # ga-798p6w (E9): empty unless the planner experiment is on AND this bead is in the plan arm — the comment is then unchanged.

@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que esta fatia é — e o que não é · Estado: o que está vivo · Como usar (comandos) · Os degraus e os limites (e por quê) · O veredito · Como ligar a sombra do Pilot · Como ler a sombra · Subir os tetos fixos · O que falta para o "nó primeiro" de verdade · Medido, inferido, não testado · Limites
+• O que esta fatia é — e o que não é · Estado: o que está vivo · Como usar (comandos) · Os degraus e os limites (e por quê) · O veredito · Como ligar a sombra do Pilot · Como ler a sombra · Ligar e desligar o nó primeiro (`on`) · Subir os tetos fixos · O que falta para o "nó primeiro" de verdade · Medido, inferido, não testado · Limites
 
 Bead ga-2hd02v.1.11 (fatia da ga-2hd02v.1; objetivo do Athos: o mini para de entrar em swap, o Hetzner pago trabalha 24/7). **Entrega duas peças, em duas fatias** (a ga-2hd02v.1.11 foi recusada 3x pelo teto de tamanho do gate): (1) `scripts/hetzner-capacity.py` — fatia A, ga-5yp4n1, **tem que estar no main antes desta** — que mede o nó e responde "quantas sessões ele aguenta agora" (um teto que sobe em degraus 1→3→6→10 só com evidência, e desce sozinho) e "esta bead vai ao nó ou fica no mini" (`verdict`); (2) o **modo sombra** do Pilot (`PILOT_NODE_FIRST=shadow`) — fatia B, ga-elvr8e, esta —, que consulta o veredito para cada bead de dog do HQ e **registra** o que faria, sem mudar o despacho.
 
@@ -10,11 +10,11 @@ Bead ga-2hd02v.1.11 (fatia da ga-2hd02v.1; objetivo do Athos: o mini para de ent
 
 **É** a decisão, com número medido: quando o nó pode receber trabalho, e quanto. **Não é** o envio: nada aqui atribui bead a `dog-remote-<n>`, abre sessão ou toca em `city.toml`, `agents/` ou `.gc/session-ssh.json`. O dog remoto não reivindica sozinho (o atalho nega `bd ready`, `bd query`, `bd update --claim`, `gc runtime drain-ack`), então quem leva a bead ao nó precisa atribuí-la ao alias e abrir a sessão — isso é a **ga-2hd02v.1.14**, que depende desta e da ga-2hd02v.1.13 (gate-done a partir do nó).
 
-Por isso o modo `on` **não existe**: um `PILOT_NODE_FIRST=on` que só registrasse prometeria um envio que não acontece. Valor desconhecido vale `off` e avisa.
+O modo `on` **não existia nesta fatia** (um `on` que só registrasse prometeria um envio que não acontece); ele veio na **ga-2hd02v.1.14** e está descrito em "Ligar e desligar o nó primeiro (`on`)". Valor desconhecido vale `off` e avisa.
 
 ## Estado: o que está vivo
 
-**Nada.** Mergeado ≠ vivo. Depois do merge: o Pilot roda com `PILOT_NODE_FIRST` ausente = `off` (a função sai na primeira linha, nenhuma consulta, nenhum arquivo). `hetzner-capacity.py` só roda se alguém o chamar; nenhum plist novo foi criado (decisão: detector com custo de poll só nasce com medição de uma execução e lock, e aqui o "relógio" é quem chama `verdict`/`step`).
+**Nada.** Mergeado ≠ vivo (vale também para o `on` da ga-2hd02v.1.14: o código do envio existe, a chave está desligada). Depois do merge: o Pilot roda com `PILOT_NODE_FIRST` ausente = `off` (a função sai na primeira linha, nenhuma consulta, nenhum arquivo). `hetzner-capacity.py` só roda se alguém o chamar; nenhum plist novo foi criado (decisão: detector com custo de poll só nasce com medição de uma execução e lock, e aqui o "relógio" é quem chama `verdict`/`step`).
 
 ## Como usar (comandos)
 
@@ -86,6 +86,42 @@ jq -s 'group_by(.verdict+":"+.reason) | map({k: .[0].verdict+":"+.[0].reason, n:
 
 Leia com `status` ao lado: se quase tudo é `local gate_done_off`, o gargalo é a 1.13, não o nó.
 
+## Ligar e desligar o nó primeiro (`on`)
+
+Bead ga-2hd02v.1.14. **Ligar é do Mayor**, depois das pré-condições abaixo; o merge entrega a chave em `off`. `PILOT_NODE_FIRST` = `off` (padrão) | `shadow` (só registra) | `on` (leva a bead ao nó).
+
+**Pré-condições para `on`** (o Mayor confere, nesta ordem):
+
+1. `shadow` rodando **≥ 2 h** com **≥ 20 decisões** no `node-first-shadow.jsonl`, e a proporção `node`/`mini` lida (seção anterior): se quase tudo é `mini gate_done_off`, o `on` não tem o que despachar.
+2. `scripts/hetzner-capacity.py status` mostra degrau ≥ 1, `gate_done_bin` ligado (ga-2hd02v.1.13) e o nó sem `pause.json`.
+As beads com `node:never`, `needs:engine-window` ou `exec:manual` ficam no mini também com `on` (o mesmo veto da sombra, sem consulta).
+
+**O que o Pilot faz** com `on`, por bead de dog do HQ (pool `gastown.dog`, nunca WA/PS — essas são da ga-2hd02v.1.10), quando o oráculo diz `node` (exit 0, JSON `node`, `effective` inteiro > 0):
+
+1. escolhe o 1º alias `dog-remote-<n>` livre com `n ≤ effective` (lê `gc session list --json`; alias dormindo é **acordado**, não duplicado; vaga conta por template, não só por alias);
+2. `bd update <bead> --assignee dog-remote-<n> --status in_progress` (o atalho do nó nega `bd update --claim`, então a bead já chega atribuída e o dog a acha com `bd list --status in_progress --assignee "$GC_ALIAS"`);
+3. `gc session new dog-remote --alias dog-remote-<n> --no-attach` (ou `session wake`), dentro de `PILOT_SPAWN_TIMEOUT_SECS`; uma sessão lenta gasta o orçamento de spawn do sweep, como no caminho do mini;
+4. `gc session nudge dog-remote-<n>` com o aviso, e grava `pilot.sling_bead`. Resultado do despacho: **`node_ok`**.
+
+O alias remoto já conta como **builder vivo** para o `inflight-reclaim-guard` e para o TTL (o alias casa com id/name/alias da sessão e o `last_active` é fresco); a bateria trava isso. Sem sessão viva ou sem sinal de vida, o reclaim solta a bead no TTL de sempre (25 min).
+
+**Falha em qualquer passo = a bead vai ao mini.** O Pilot fecha a sessão (se chegou a tocá-la) e só depois solta a bead com uma escrita guardada (`bd update --if-assignee dog-remote-<n> --assignee "" --status open`: nunca pisa em quem pegou a bead depois), e **confirma lendo a bead** (sem dono e `open`). Confirmado → segue o despacho normal ao mini. **Não confirmado** (bead ilegível, com outro dono, ou ainda `in_progress`) → o Pilot **não** manda ao mini (a bead poderia ser construída duas vezes), deixa o claim para o TTL (30 min) e conta **`node_rollback_unconfirmed`**, que aparece em `failed_other` do evento `pilot_sweep`, de propósito: é falha, não política.
+
+**Como ler:**
+
+```bash
+# nos logs do Pilot: o que foi ao nó e o que voltou
+grep -E "node-first \(on\)|Dispatch complete \(node\)|ga-2hd02v.1.14" "$GC_CITY_PATH/.gc/logs/pilot-dispatcher.log" | tail -40
+# beads hoje no nó
+bd list --status in_progress --json --limit 0 | jq -r '.[] | select((.assignee // "") | test("^dog-remote-[0-9]+$")) | "\(.id) \(.assignee)"'
+```
+
+Se `node_rollback_unconfirmed` aparecer, olhe a bead (`bd show <id>`): se ainda estiver atribuída a `dog-remote-<n>` sem sessão viva, `bd update <id> --assignee "" --status open` a devolve ao pool; se o dono for outro, não mexa.
+
+**Desligar** (na hora, sem perder nada): tire `PILOT_NODE_FIRST` do plist (volta a `off`) ou ponha `shadow`, e `launchctl bootout` + `bootstrap`. Beads já no nó **terminam lá** ou voltam pelo reclaim no TTL; o Pilot não puxa de volta bead em andamento. Para travar só o envio sem reiniciar o Pilot: `scripts/hetzner-capacity.py pause --reason <texto>` (próximo veredito já diz `mini paused`).
+
+**`DRY_RUN=1`** com `on` não consulta o nó (a consulta mede e grava estado) e imprime o plano de 4 passos por bead de dog (ou o veto que a deixa no mini); nada é escrito.
+
 ## Subir os tetos fixos
 
 O degrau é o teto de **operação**; o limite duro são dois números fixos que hoje estão baixos: `cap` do host em `.gc/session-ssh.json` (4) e `max_active_sessions` em `agents/dog-remote/agent.toml` (1). O veredito usa o **menor** entre o degrau e o `cap`, então com `cap` 4 o degrau 6 e 10 não adiantam. Suba os dois **só quando o degrau chegar lá** (`status` mostra), em janela de config viva e com backup ao lado; o `cap` vale no próximo start (conferido no código: cada operação do provider é um processo novo que lê o JSON de novo); o `max_active_sessions` é do engine e **não foi testado aqui** se vale sem recarga, então confira antes de contar com ele.
@@ -93,14 +129,15 @@ O degrau é o teto de **operação**; o limite duro são dois números fixos que
 ## O que falta para o "nó primeiro" de verdade
 
 1. **ga-2hd02v.1.13** no ar (`gate_done_bin` ligado).
-2. **ga-2hd02v.1.14**: o valor `on` do Pilot — atribuir a bead ao alias `dog-remote-<n>` livre, abrir a sessão, nudge, e fazer o reclaim-guard tratar o alias remoto como builder vivo; qualquer falha devolve a bead ao mini.
-3. A sombra rodando ≥ 24 h, lida.
+2. **ga-2hd02v.1.14** (entregue, desligado): o valor `on` do Pilot, descrito acima.
+3. A sombra rodando ≥ 2 h com ≥ 20 decisões (pré-condição do `on`), lida; ≥ 24 h é o ideal.
+4. A decisão do Mayor de ligar `on`. Não testado até aqui com o Pilot vivo: ver abaixo.
 
 ## Medido, inferido, não testado
 
 **Medido (19/10, 03:5x −03, contra o nó vivo, só leitura):** `read` devolveu CPU livre 64,9–65,0 %, RAM disponível 93,8–94,3 %, 16 núcleos, 1 sessão (o `dog-remote-1`); `vmstat 2 2` e `free -m` no próprio nó deram RAM 93,8 % e ocioso instantâneo 74 %, coerentes (o número do script é o mais conservador por desenho). O nó **não tem swap** (`SwapTotal 0`). Bateria `scripts/hetzner-capacity.selftest.sh` no nó (`mbp-run.sh --repo hq`): 68 s, contra 5 min 39 s no mini sob load 60–70; os mutantes da bateria reprovam todos.
 **Inferido:** os limiares de CPU e RAM (35/10 % e 40/20 %) e a janela de 30 min; que uma sessão `claude` ociosa pesa pouco na CPU do nó.
-**Não testado:** uma sessão real com carga de build no nó; o custo do `verdict` dentro de uma varredura real do Pilot sob load 60+; `PILOT_NODE_FIRST=shadow` no Pilot vivo; os degraus 6 e 10.
+**Não testado:** `PILOT_NODE_FIRST=on` no Pilot vivo (a ga-2hd02v.1.14 foi provada com a bateria `pilot-dispatcher.node-dispatch.selftest.sh` e seus mutantes, sem `gc` nem `bd` reais); uma sessão real com carga de build no nó; o custo do `verdict` dentro de uma varredura real do Pilot sob load 60+; `PILOT_NODE_FIRST=shadow` no Pilot vivo; os degraus 6 e 10.
 
 ## Limites
 

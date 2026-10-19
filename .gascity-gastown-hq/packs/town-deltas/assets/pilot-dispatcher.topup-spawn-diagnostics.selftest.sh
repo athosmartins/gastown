@@ -310,13 +310,13 @@ fi
 has_call "late failure" && ok "the slow failure's real stderr is still captured and logged" \
   || bad "the slow failure's stderr text was lost"
 
-echo "Scenario L: drift-guard — no spawn call site keeps the old 60 s literal; all four use the 150 s budget"
+echo "Scenario L: drift-guard — no spawn call site keeps the old 60 s literal; all six use the 150 s budget"
 _old60=$(grep -c 'timeout "\${PILOT_SPAWN_TIMEOUT_SECS:-60}"' "$DISPATCHER" 2>/dev/null); _old60="${_old60:-0}"
 _new150=$(grep -c 'timeout "\${PILOT_SPAWN_TIMEOUT_SECS:-150}"' "$DISPATCHER" 2>/dev/null); _new150="${_new150:-0}"
-if [ "$_old60" = "0" ] && [ "$_new150" = "4" ]; then
-  ok "4 spawn calls (2 in _pilot_topup_spawn + wa/ps arms of dispatch_one) on the 150 s default, none on 60 s"
+if [ "$_old60" = "0" ] && [ "$_new150" = "6" ]; then
+  ok "6 spawn calls (2 in _pilot_topup_spawn + wa/ps arms of dispatch_one + new/wake in _pilot_node_first_dispatch, ga-2hd02v.1.14) on the 150 s default, none on 60 s"
 else
-  bad "spawn budget drift: $_old60 call(s) still on the 60 s default, $_new150 on 150 s (want 0 and 4) — a spawn site that kept 60 s is killed before it finishes under load"
+  bad "spawn budget drift: $_old60 call(s) still on the 60 s default, $_new150 on 150 s (want 0 and 6) — a spawn site that kept 60 s is killed before it finishes under load"
 fi
 
 echo "Scenario M: _pilot_slow_spawn_deferred_for — the PRE-claim twin defers ONLY a candidate already committed to a pool that would spawn, and only once the budget is spent"

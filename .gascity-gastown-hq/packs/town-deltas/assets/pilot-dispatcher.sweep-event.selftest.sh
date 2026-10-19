@@ -314,7 +314,7 @@ fi
 # B4 — drift guard. A new DISPATCH_RESULT literal that is not classified would silently land in
 # failed_other: a BENIGN new state (e.g. another kind of queue) would then read as a Pilot failure on
 # the painel. Adding a result now means classifying it in _pilot_sweep_emit AND listing it here.
-KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow remerge_branch_lookup_unknown hq_pool_store_blind pool_store_unknown priority_yield "
+KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow remerge_branch_lookup_unknown hq_pool_store_blind pool_store_unknown priority_yield node_ok node_rollback_unconfirmed "
 # (rig_native_pool_count_unreadable, ga-oa004t: the session count could not be READ, so the spawn was not
 #  attempted — a FAULT, deliberately left in failed_other and NOT in a *_queued bucket: a dead `session list`
 #  is not a busy pool, and filing it as saturation would hide it from the Step 5 stall gate.)
@@ -323,6 +323,9 @@ KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queue
 #  NOTHING and the sweep moved on. Same call as above, on purpose: it stays in failed_other, because that is
 #  the ONLY place a PERMANENT unknown is visible (the bead keeps its labels and is retried every sweep, with no
 #  label/comment of its own). A guard bucket would read as "a policy refused it" and hide a broken lookup.)
+# (node_ok / node_rollback_unconfirmed, ga-2hd02v.1.14: PILOT_NODE_FIRST=on. node_ok is rc 0 -> "dispatched" (the bead went to a dog-remote alias and the session was nudged). node_rollback_unconfirmed
+#  is rc 1: the node dispatch failed AND the undo could not be read back, so the Pilot dispatched NOTHING and left the claim for the TTL. Deliberately left in failed_other - a FAULT, not a policy:
+#  a guard bucket would hide a bead that may still be assigned to the node while the Pilot cannot tell.)
 # (priority_yield, ga-5fn5p3: a P2..P4 bead CEDED to a P0/P1 waiting behind a full pool. Nothing failed and nothing was
 #  refused by a guard — it is deferred BY POLICY and re-evaluated next sweep — so it has its OWN bucket, yielded_priority:
 #  in failed_other it would read as a Pilot fault, in refused_by_guard as a guard that fired.)
