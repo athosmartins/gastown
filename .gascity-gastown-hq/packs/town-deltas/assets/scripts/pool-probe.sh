@@ -144,8 +144,9 @@ if [ "$disk_state" = low ]; then
     n_before=$(printf "%s" "$t1_kept" | jq length 2>/dev/null); n_after=$(printf "%s" "$t1_held" | jq length 2>/dev/null)
     pp_log "free disk under the floor - tier 1 held back $(( ${n_before:-0} - ${n_after:-0} )) new story/stories (ga-vln2py)"
     t1_kept="$t1_held"
-    # vazio/falhou/ilegível (the window size cannot be read) -> counts as 0: no refetch, the answer stays what the hold left
-    n_window=$(printf "%s" "$t1_raw" | jq length 2>/dev/null)
+    # vazio/falhou/ilegível (the window size cannot be read) -> tier 1 is marked unreadable and counts as 0: no refetch, never a
+    # silent "the window was not full" (t1_raw already went through jq above, so this read failing means jq itself is gone)
+    n_window=$(printf "%s" "$t1_raw" | jq length 2>/dev/null) || mark 1
     if [ "${n_before:-0}" -gt 0 ] && [ "${n_after:-0}" -eq 0 ] && [ "${n_window:-0}" -ge 20 ]; then
       # vazio/falhou/ilegível (bd failed, the answer is empty or not JSON, or the hold cannot read it) -> tier 1 is marked
       # unreadable and answers NOTHING (inert; exit 3 if tiers 2 and 3 find nothing either); a valid [] is a real "nothing"
