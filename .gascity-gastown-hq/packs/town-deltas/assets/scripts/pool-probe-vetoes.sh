@@ -25,6 +25,14 @@
 # (delivery:pending-restart) is invisible to `all` and over-reported by `any` for a dog bead. The question
 # is about one named pool, so it gets that pool's list, not a summary of the others.
 #
+# A text reader, ga-d3b5yr: scripts/approved-state-reconciler.py does not source this file, it READS it (it runs
+# under launchd with no bash or jq in the loop) and takes the four POOL_VETO_{EXACT,PREFIX}_{DOG,WA} assignments
+# below — each on ONE line, single-quoted JSON, assigned exactly once. Keep that shape. It reads the UNION (the
+# `any` list): a label some pool refuses means "parked, not starving", so its "dispatch failing" alarm skips the
+# bead. It holds itself to pool_veto_cfg any in scripts/test_approved_state_reconciler.py: run that file after
+# editing a list here. A shape it cannot read is logged once (WARN ga-d3b5yr) and the labels that live only in
+# these lists alarm again, as before.
+#
 # What is snapshotted, and where each snapshot comes from (read 2026-09-26, not remembered):
 #   DOG     the gastown.dog probe = the engine's bdReadyPoolDemandExcludeLabelArgs (exact labels) +
 #           poolDemandLabelFilterJQ (prefix families). The LIVE binary is gc-1.1.1-engwin0919.
