@@ -260,7 +260,12 @@ nlines="$(printf '%s\n' "$TB" | grep -c .)"
 case "$TB" in *'vazio → <what the code does>; falhou/ilegível → <what the code does>'*) ok "gives the exact comment line to write: 'vazio → …; falhou/ilegível → …'" ;; *) bad "comment-line format missing" ;; esac
 case "$TB" in *"Before you write each new read"*"database"*"file"*"API"*"command"*"dict key"*) ok "says WHEN: before each new read, and names the kinds (database, file, API, command, dict key)" ;; *) bad "when/kinds missing" ;; esac
 case "$TB" in *"inert"*"never the same result as"*) ok "says 'failed' must be the inert state and not the same result as 'empty'" ;; *) bad "inert-state clause missing" ;; esac
-case "$TB" in *"Before /gate-done"*"does the code next to it do exactly this?"*) ok "says to re-read every comment in the diff before /gate-done with the question" ;; *) bad "re-read clause missing" ;; esac
+case "$TB" in *"Before you run the gate-done skill"*"does the code next to it do exactly this?"*) ok "says to re-read every comment in the diff before running the gate-done skill, with the question" ;; *) bad "re-read clause missing" ;; esac
+# ga-wmylcp (class ga-7nxfa1): e12-crew-doctrine.sh stamps this text into crew prompts and the town-deltas fragment, i.e. into the BOOT prompt, where Claude Code
+# reads a "/<skill>" token as a skill mention and the fresh worker runs that skill with no bead. pool-prompt-skill-mention.selftest.sh sees it in the copies, but
+# nothing runs that per diff; this is the same left-edge rule (strict: a backticked token counts) at the one source. "falhou/ilegível", "and/or" and paths pass.
+SLASH_RE='(^|[^[:alnum:]_/.~-])/[A-Za-z]'
+printf '%s\n' "$TB" | grep -E -q "$SLASH_RE" && bad "block has a word that starts with a slash (a skill mention at boot, ga-7nxfa1): $(printf '%s\n' "$TB" | grep -E -o "${SLASH_RE}[A-Za-z0-9._-]*" | head -2 | tr '\n' ' ')" || ok "no word in the block starts with a slash: nothing in it can be read as a skill mention at boot"
 case "$TB" in *"38%"*) ok "gives the why (the measured 38%)" ;; *) bad "no why" ;; esac
 printf '%s\n' "$TB" | grep -E -q 'CRITICAL|MUST|NEVER|ALWAYS|NUNCA|SEMPRE|!!' && bad "block shouts (all-caps rule words) — the guide for these models says to give the reason instead" || ok "no shouting: reasons, not capital letters"
 case "$TB" in *'$('*|*'${'*) bad "block holds shell expansion syntax" ;; *) ok "no shell expansion syntax in the block" ;; esac
