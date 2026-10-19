@@ -1611,40 +1611,90 @@ GCSTUB20
   unset _rg_lbl _rg_line _rg_file _rg_max _rg_disp
 
   echo "Scenario 22c (ga-p7hymz.1): real default covers child-priority-janitor, and the heartbeat file is the one launchd writes"
-  # Mesma classe da 22b: a entrada só vale se (a) o rótulo está em DPW_HEARTBEAT com limite numérico, (b) está em
-  # DPW_CRITICAL (o laço só itera sobre ele) e (c) o arquivo que o watchdog lê é o StandardOutPath do plist — nome
-  # divergente = "arquivo ausente" para sempre, que `_log_age` trata como "sem veredito" (silêncio, nunca alarme).
-  # Quem não consegue ler o plist REPROVA (não passa em branco): ler vazio ou falhar nunca vira "ok".
+  # Mesma classe da 22b: a entrada só vale se (a) o rótulo tem entrada com arquivo + limite numérico, (b) está em
+  # DPW_CRITICAL (o laço só itera sobre ele), (c) o limite é > 2x o StartInterval do plist (um ciclo perdido não pode
+  # disparar kickstart) e <= 3000 s, e (d) o arquivo que o watchdog lê é o StandardOutPath do plist — nome divergente =
+  # "arquivo ausente" para sempre, que `_log_age` trata como "sem veredito" (silêncio, nunca alarme).
+  # A prova mora numa função para a 22d poder alimentá-la com entradas que FALHAM. Três estados no plist: ilegível
+  # (arquivo ausente/sem permissão) → BAD "unreadable"; lido mas sem a chave → BAD "not found"; lido com a chave →
+  # confere. Nenhum dos dois primeiros vira OK: reprova, que é o estado inerte de uma checagem.
+  # args: <plist> <linha "label|arquivo|max"> <lista DPW_CRITICAL>. Imprime "OK ..."/"BAD ..." por prova; rc 1 se houver BAD.
+  _dpw_janitor_wiring() {
+    local w_plist="$1" w_line="$2" w_crit="$3" w_lbl="com.gascity.child-priority-janitor" w_rc=0
+    local w_file w_max w_int w_out
+    w_file="$(printf '%s' "$w_line" | awk -F'|' '{print $2}')"
+    w_max="$(printf '%s' "$w_line" | awk -F'|' '{print $3}')"
+    if [ -n "$w_line" ]; then echo "OK DPW_HEARTBEAT default covers $w_lbl ($w_line)"; else echo "BAD DPW_HEARTBEAT default MISSING an entry for $w_lbl"; w_rc=1; fi
+    case "$w_max" in ''|*[!0-9]*) echo "BAD $w_lbl heartbeat threshold is not numeric ([$w_max])"; w_rc=1 ;; *) echo "OK $w_lbl heartbeat threshold is numeric ($w_max s)" ;; esac
+    case " $w_crit " in
+      *" $w_lbl "*) echo "OK $w_lbl is also in DPW_CRITICAL (heartbeat entry is reachable)" ;;
+      *) echo "BAD $w_lbl has a heartbeat entry but is NOT in DPW_CRITICAL (dead config)"; w_rc=1 ;;
+    esac
+    if [ ! -r "$w_plist" ]; then
+      echo "BAD plist unreadable or missing ($w_plist) — cannot prove the threshold nor the heartbeat file"
+      return 1
+    fi
+    # vazio → w_int/w_out vazios e reprovam abaixo ("not found"); falhou (sed/awk com rc != 0) → saída vazia, mesmo caminho: reprova
+    w_int="$(sed -n 's|.*<key>StartInterval</key><integer>\([0-9][0-9]*\)</integer>.*|\1|p' "$w_plist" 2>/dev/null | head -1)"
+    w_out="$(awk '/<key>StandardOutPath<\/key>/{getline; gsub(/.*<string>|<\/string>.*/,""); print; exit}' "$w_plist" 2>/dev/null)"
+    case "$w_int" in
+      ''|*[!0-9]*) echo "BAD StartInterval not found in $w_plist ([$w_int]) — cannot prove the threshold"; w_rc=1 ;;
+      *)
+        if [ "${w_max:-0}" -gt $(( w_int * 2 )) ] 2>/dev/null && [ "${w_max:-99999}" -le 3000 ] 2>/dev/null; then
+          echo "OK $w_lbl threshold ${w_max}s is > 2x StartInterval (${w_int}s) and <= 3000 s"
+        else
+          echo "BAD $w_lbl threshold ${w_max}s is not in (2x StartInterval ${w_int}s, 3000 s]"; w_rc=1
+        fi ;;
+    esac
+    if [ -n "$w_out" ] && [ "$(basename "$w_out")" = "$(basename "$w_file")" ]; then
+      echo "OK plist StandardOutPath ($(basename "$w_out")) is the same file the watchdog reads"
+    else
+      echo "BAD plist StandardOutPath ([$w_out]) does not match the heartbeat file ([$w_file]) — the watchdog would read a file launchd never writes"; w_rc=1
+    fi
+    return $w_rc
+  }
   _cp_lbl="com.gascity.child-priority-janitor"
   _cp_line="$(printf '%s\n' "$_REAL_DEFAULT_HEARTBEAT" | awk -F'|' -v l="$_cp_lbl" '$1==l{print; exit}')"
-  _cp_file="$(printf '%s' "$_cp_line" | awk -F'|' '{print $2}')"
-  _cp_max="$(printf '%s' "$_cp_line" | awk -F'|' '{print $3}')"
   _cp_plist="$(cd "$(dirname "$0")" && pwd)/$_cp_lbl.plist"
-  # vazio/ausente → _cp_int e _cp_out ficam vazios e as checagens abaixo REPROVAM; falhou/ilegível → idem (2>/dev/null só cala o erro, o valor vazio reprova)
-  _cp_int="$(sed -n 's|.*<key>StartInterval</key><integer>\([0-9][0-9]*\)</integer>.*|\1|p' "$_cp_plist" 2>/dev/null | head -1)"
-  _cp_out="$(awk '/<key>StandardOutPath<\/key>/{getline; gsub(/.*<string>|<\/string>.*/,""); print; exit}' "$_cp_plist" 2>/dev/null)"
-  if [ -n "$_cp_line" ]; then ok "DPW_HEARTBEAT default covers $_cp_lbl ($_cp_line)"; else bad "DPW_HEARTBEAT default MISSING an entry for $_cp_lbl"; fi
-  case "$_cp_max" in ''|*[!0-9]*) bad "$_cp_lbl heartbeat threshold is not numeric ([$_cp_max])" ;; *) ok "$_cp_lbl heartbeat threshold is numeric ($_cp_max s)" ;; esac
-  case " $_REAL_DEFAULT_CRITICAL " in
-    *" $_cp_lbl "*) ok "$_cp_lbl is also in DPW_CRITICAL (heartbeat entry is reachable)" ;;
-    *) bad "$_cp_lbl has a heartbeat entry but is NOT in DPW_CRITICAL (dead config)" ;;
-  esac
-  case "$_cp_int" in
-    ''|*[!0-9]*) bad "$_cp_lbl StartInterval unreadable from $_cp_plist ([$_cp_int]) — cannot prove the threshold" ;;
-    *)
-      # mais que 2x o StartInterval (um ciclo perdido não pode disparar kickstart) e ainda um limite que pega pendurão
-      if [ "${_cp_max:-0}" -gt $(( _cp_int * 2 )) ] 2>/dev/null && [ "${_cp_max:-99999}" -le 3000 ] 2>/dev/null; then
-        ok "$_cp_lbl threshold ${_cp_max}s is > 2x StartInterval (${_cp_int}s) and <= 3000 s"
-      else
-        bad "$_cp_lbl threshold ${_cp_max}s is not in (2x StartInterval ${_cp_int}s, 3000 s]"
-      fi ;;
-  esac
-  if [ -n "$_cp_out" ] && [ "$(basename "$_cp_out")" = "$(basename "$_cp_file")" ]; then
-    ok "plist StandardOutPath ($(basename "$_cp_out")) is the same file the watchdog reads"
+  _cp_out="$(_dpw_janitor_wiring "$_cp_plist" "$_cp_line" "$_REAL_DEFAULT_CRITICAL")"
+  _cp_rc=$?
+  while IFS= read -r _cp_l; do
+    case "$_cp_l" in OK\ *) ok "${_cp_l#OK }" ;; BAD\ *) bad "${_cp_l#BAD }" ;; esac
+  done <<EOF_CP
+$_cp_out
+EOF_CP
+  [ "$_cp_rc" -eq 0 ] && ok "real default + real plist: wiring proven (rc 0)" || bad "real default + real plist: wiring NOT proven (rc $_cp_rc)"
+
+  echo "Scenario 22d (ga-p7hymz.1): a plist that cannot be read, or a wiring that does not match, REPROVA (never passes blank)"
+  # Injeção de falha na leitura do plist e nas entradas: cada caso tem de dar rc != 0 — se algum desse rc 0 a 22c
+  # passaria em branco justo quando não consegue ler.
+  _cp_crit="$_REAL_DEFAULT_CRITICAL"
+  _dpw_janitor_wiring "$TMP/nonexistent-janitor.plist" "$_cp_line" "$_cp_crit" >"$TMP/cp-missing.out" 2>&1 \
+    && bad "missing plist passed (rc 0)" || ok "missing plist → rc != 0"
+  grep -q "^BAD plist unreadable or missing" "$TMP/cp-missing.out" \
+    && ok "missing plist says 'unreadable or missing' (not 'not found')" || bad "missing plist gave the wrong reason: $(cat "$TMP/cp-missing.out")"
+  cp "$_cp_plist" "$TMP/janitor-noperm.plist" && chmod 000 "$TMP/janitor-noperm.plist"
+  if [ -r "$TMP/janitor-noperm.plist" ]; then
+    echo "  - skip: plist still readable after chmod 000 (running as root?) — unreadable-by-permission case not exercised"
   else
-    bad "plist StandardOutPath ([$_cp_out]) does not match the heartbeat file ([$_cp_file]) — the watchdog would read a file launchd never writes"
+    _dpw_janitor_wiring "$TMP/janitor-noperm.plist" "$_cp_line" "$_cp_crit" >/dev/null 2>&1 \
+      && bad "unreadable (chmod 000) plist passed (rc 0)" || ok "unreadable (chmod 000) plist → rc != 0"
   fi
-  unset _cp_lbl _cp_line _cp_file _cp_max _cp_plist _cp_int _cp_out
+  chmod 600 "$TMP/janitor-noperm.plist" 2>/dev/null || true
+  : > "$TMP/janitor-empty.plist"
+  _dpw_janitor_wiring "$TMP/janitor-empty.plist" "$_cp_line" "$_cp_crit" >"$TMP/cp-empty.out" 2>&1 \
+    && bad "empty plist passed (rc 0)" || ok "empty plist → rc != 0"
+  grep -q "^BAD StartInterval not found" "$TMP/cp-empty.out" \
+    && ok "empty plist says 'not found' (read ok, key absent — a different state from unreadable)" || bad "empty plist gave the wrong reason: $(cat "$TMP/cp-empty.out")"
+  _dpw_janitor_wiring "$_cp_plist" "" "$_cp_crit" >/dev/null 2>&1 \
+    && bad "missing heartbeat entry passed (rc 0)" || ok "missing heartbeat entry → rc != 0"
+  _dpw_janitor_wiring "$_cp_plist" "$_cp_lbl|/x/some-other-file.out|900" "$_cp_crit" >/dev/null 2>&1 \
+    && bad "heartbeat file != plist StandardOutPath passed (rc 0)" || ok "heartbeat file != plist StandardOutPath → rc != 0"
+  _dpw_janitor_wiring "$_cp_plist" "$_cp_lbl|/x/child-priority-janitor.out|500" "$_cp_crit" >/dev/null 2>&1 \
+    && bad "threshold 500 s (< 2x StartInterval) passed (rc 0)" || ok "threshold 500 s (< 2x StartInterval) → rc != 0"
+  _dpw_janitor_wiring "$_cp_plist" "$_cp_line" "com.gascity.pilot" >/dev/null 2>&1 \
+    && bad "label absent from DPW_CRITICAL passed (rc 0)" || ok "label absent from DPW_CRITICAL → rc != 0"
+  unset _cp_lbl _cp_line _cp_plist _cp_out _cp_rc _cp_l _cp_crit
 
   echo "Scenario 23 (ga-g92h): _exit_class distinguishes OOM-killed (137) from a real failure"
   # Provenance checks off (matches the imp17 block's own convention above) --
