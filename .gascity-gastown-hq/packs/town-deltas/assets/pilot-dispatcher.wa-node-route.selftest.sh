@@ -27,7 +27,8 @@ DISPATCHER="${WA_NODE_ROUTE_SELFTEST_FILE:-$SELF_DIR/pilot-dispatcher.sh}"
 PASS=0
 FAIL=0
 ok()   { echo "  ok   $*"; PASS=$((PASS+1)); }
-fail() { echo "  FAIL $*"; FAIL=$((FAIL+1)); }
+# Rodando como mutante (WA_NODE_ROUTE_SELFTEST_FILE) o primeiro FAIL já diz "morto": sai na hora. O selftest inteiro roda uma vez por mutante e, sem isto, estourava o teto de 120 s do revisor do gate.
+fail() { echo "  FAIL $*"; FAIL=$((FAIL+1)); [ -z "${WA_NODE_ROUTE_SELFTEST_FILE:-}" ] || exit 1; }
 check() { # check <descrição> <comando…>  — passa se o comando sai 0
   local d="$1"; shift
   if "$@" >/dev/null 2>&1; then ok "$d"; else fail "$d"; fi
@@ -164,7 +165,7 @@ bead "$T/bead.node-route.json" open "" wa-worker-remote
 bead "$T/bead.pool-route.json" open "" wa-worker
 bead "$T/bead.crew.json"       in_progress mila-wa ""
 bead "$T/bead.pool-sess.json"  in_progress wa-worker-1 wa-worker
-bead "$T/bead.outro-id.json"   in_progress wa-worker-remote-1 wa-worker-remote wa-zzzzz
+bead "$T/bead.outro-id.json"   open "" "" wa-zzzzz   # livre e de OUTRO id: sem a conferência do id o gancho a leria como "lida e não é do nó" (1), e o certo é 2 (não é a bead pedida)
 : > "$T/bead.vazio.json"; echo 'isto não é json' > "$T/bead.lixo.json"; echo '[]' > "$T/bead.lista-vazia.json"; echo 'null' > "$T/bead.null.json"
 for m in label auto; do
   for f in node-both node-asg node-asg-open node-route; do
@@ -207,6 +208,15 @@ export FAKE_BEAD="$T/bead.free.json"
 r=$(decide auto $ID $ST wa-worker 0 1)
 [ "$r" = "rc=1" ] && calls | grep -q "^apply $ID --store $ST --basis any --dry-run\$" && ok "DRY_RUN=1: 'apply … --dry-run' e rc 1 (nada vai ao nó)" || fail "dry-run: $r / $(calls)"
 r=$(decide shadow $ID $ST wa-worker 0 1); [ "$r" = "rc=1" ] && calls | grep -q '^check ' && ok "DRY_RUN=1 em shadow: ainda só 'check'" || fail "dry shadow: $r / $(calls)"
+# o log "WOULD route" é só do rc 0 do `apply --dry-run` (o gate achou que ele saía também para 10/11/12, onde o script disse "não iria")
+for m in label auto; do
+  r=$(decide $m $ID $ST wa-worker 0 1)
+  [ "$r" = "rc=1" ] && grep -q "WOULD route $ID to the node" "$T/err" && ok "$m + DRY_RUN=1, rc 0 do apply --dry-run: o log diz WOULD route e nada vai ao nó (rc 1)" || fail "$m dry rc=0: $r / $(cat "$T/err")"
+  for c in 10 11 12 13 2 1 99; do
+    r=$(decide $m $ID $ST wa-worker $c 1)
+    [ "$r" = "rc=1" ] && ! grep -q 'WOULD route' "$T/err" && grep -q "would NOT go to the node (wa-node-dispatch.sh rc=$c;" "$T/err" && ok "$m + DRY_RUN=1, rc $c: o log NÃO diz WOULD route e diz o rc" || fail "$m dry rc=$c: $r / $(cat "$T/err")"
+  done
+done
 
 echo
 echo "=== B. a fiação no despacho ==="
@@ -266,7 +276,17 @@ open(p, "w", encoding="utf-8").write(s)
   mutate sem-filtro-id    's = s.replace("  case \"$_id\" in wa-*) ;; *) return 1 ;; esac\n", "", 1)'
   mutate label-vira-any   's = s.replace("  [ \"$_mode\" = label ] && _basis=label\n", "", 1)'
   mutate dry-escreve      's = s.replace(" --basis \"$_basis\" --dry-run", " --basis \"$_basis\"", 1)'
-  mutate dry-devolve-0    's = s.replace("(rc=$_rc, dry-run: nothing written)\"\n    return 1", "(rc=$_rc, dry-run: nothing written)\"\n    return 0", 1)'
+  mutate dry-devolve-0    's = s.replace("nothing written)\"; fi\n    return 1\n  fi\n  case", "nothing written)\"; fi\n    return 0\n  fi\n  case", 1)'
+  mutate would-route-sempre 's = s.replace("if [ \"$_rc\" = 0 ]; then log \"  ga-2hd02v.1.10: WOULD route", "if true; then log \"  ga-2hd02v.1.10: WOULD route", 1)'
+  # a leitura da bead ANTES do script (gate-fix 1, ga-9636op): cada peça dela tem de ser necessária
+  mutate sem-leitura      's = s.replace("  if [ \"$_mode\" != shadow ]; then\n    # três estados", "  if false; then\n    # três estados", 1)'
+  mutate shadow-tambem-segura 's = s.replace("  if [ \"$_mode\" != shadow ]; then\n    # três estados", "  if true; then\n    # três estados", 1)'
+  mutate no-vira-other    's = s.replace("then \"node\" else \"other\" end", "then \"other\" else \"other\" end", 1)'
+  mutate ilegivel-vira-livre 's = s.replace("a próxima varredura relê\"; return 2 ;;\n    esac", "a próxima varredura relê\" ;;\n    esac", 1)'
+  mutate so-dono          's = s.replace("or ((.metadata[\"gc.routed_to\"] // \"\") | startswith(\"wa-worker-remote\"))", "or false", 1)'
+  mutate so-rota          's = s.replace("(((.assignee // \"\") | startswith(\"wa-worker-remote\")) or", "(false or", 1)'
+  mutate prefixo-largo    's = s.replace("startswith(\"wa-worker-remote\")) or ((.metadata", "startswith(\"wa-worker\")) or ((.metadata", 1); s = s.replace("| startswith(\"wa-worker-remote\"))) then \"node\"", "| startswith(\"wa-worker\"))) then \"node\"", 1)'
+  mutate outro-id-vale    's = s.replace("select(type==\"object\" and .id == $id)", "select(type==\"object\")", 1)'
   mutate sem-script       's = s.replace("  if [ ! -x \"$_dir/wa-node-dispatch.sh\" ]; then", "  if false; then", 1)'
   mutate braco-fora-de-ordem 's = s.replace("      wa-worker-remote)\n", "      wa-worker-remoteX)\n", 1)'
   mutate braco-cria-sessao 's = s.replace("no spawn here, the pool creates the session\"\n", "no spawn here, the pool creates the session\"\n        gc --city \"$GC_CITY\" session new wa-worker-remote --no-attach\n", 1)'
