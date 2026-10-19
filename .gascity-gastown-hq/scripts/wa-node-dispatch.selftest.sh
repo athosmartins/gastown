@@ -37,6 +37,7 @@ cmd, rest = a[0], a[1:]
 def save(): json.dump(st, open(os.environ["STUB_STATE"], "w"))
 if cmd == "show":
     if os.environ.get("STUB_FAIL_SHOW"): sys.exit(1)
+    if os.environ.get("STUB_FAIL_SHOW_AFTER_UPDATE") and any("|update|" in l for l in open(os.environ["STUB_CALLS"])): sys.exit(1)   # a releitura depois da escrita falha (a primeira leitura passou)
     b = st.get(rest[0])
     if os.environ.get("STUB_SHOW_OTHER"): b = dict(b, id="wa-other")
     if b is None: sys.exit(1)
@@ -62,17 +63,18 @@ if cmd == "update":
         elif k == "--unset-metadata": unsets.append(v)
     rc = int(os.environ.get("STUB_UPDATE_RC", "0"))
     if rc: sys.exit(rc)
+    land = 0 if unsets else int(os.environ.get("STUB_LAND_RC", "0"))   # a escrita PEGA e só então o processo sai com este código (prazo estourado, morto): a resposta se perdeu; nunca vale para o desfazer
     if unsets and os.environ.get("STUB_UNDO_RC"): sys.exit(int(os.environ["STUB_UNDO_RC"]))   # só o desfazer leva --unset-metadata
     if ifa is not None and (b.get("assignee") or "") != ifa: sys.exit(13)
     if ifs is not None and b.get("status") != ifs: sys.exit(13)
     if os.environ.get("STUB_PARTIAL_UPDATE"):   # pegou só o dono (e a rota): o status não muda, a conferência reprova e a bead fica suja; o desfazer limpa dono e rota
         b["assignee"] = sets.get("assignee", b.get("assignee"))
         for u in unsets: b.get("metadata", {}).pop(u, None)
-        save(); sys.exit(0)
+        save(); sys.exit(land)
     if os.environ.get("STUB_NOOP_UPDATE"): sys.exit(0)
     b.update(sets)
     for u in unsets: b.get("metadata", {}).pop(u, None)
-    save(); sys.exit(0)
+    save(); sys.exit(land)
 sys.exit(1)
 PYEOF
 cat > "$T/gc" <<'SHEOF'
@@ -103,7 +105,7 @@ fresh() { # fresh [extra json mesclado na wa-t1]
   printf '{"wa-t1":{"id":"wa-t1","title":"t","status":"open","assignee":"","metadata":{}},"ga-x":{"id":"ga-x","title":"t","status":"open","assignee":"","metadata":{}}}' > "$STATE"
   if [ -n "${1:-}" ]; then jq -c --argjson m "$1" '."wa-t1" += $m' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; fi
   : > "$CALLS"; : > "$GCCALLS"; : > "$CITY/.gc/wa-node-route.jsonl"; echo '{"ok":true,"sessions":[]}' > "$SESS"; cls "$NODE_TEXT" 0
-  unset STUB_FAIL_SHOW STUB_SHOW_OTHER STUB_FAIL_LIST STUB_LIST_GARBAGE STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_PARTIAL_UPDATE STUB_UNDO_RC STUB_FAIL_GC STUB_GC_SLEEP
+  unset STUB_FAIL_SHOW STUB_SHOW_OTHER STUB_FAIL_LIST STUB_LIST_GARBAGE STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_PARTIAL_UPDATE STUB_UNDO_RC STUB_FAIL_GC STUB_GC_SLEEP STUB_LAND_RC STUB_FAIL_SHOW_AFTER_UPDATE
 }
 SCRIPT="$REAL"; OUT=""; RC=0; MUT_NAME=""; MUT_M=""
 d() { OUT=$("$SCRIPT" "$@" 2>&1); RC=$?; }                       # roda e guarda saída + rc
@@ -192,6 +194,31 @@ fresh; export STUB_PARTIAL_UPDATE=1 STUB_UNDO_RC=1; d apply wa-t1; expect_rc "ap
 [ "$(bead '."wa-t1".assignee')" = wa-worker-remote-1 ] && ok "apply: (confirmação do cenário) a bead ficou atribuída ao nó" || bad "apply: cenário errado, bead: $(jq -c '."wa-t1"' "$STATE")"
 printf '%s' "$OUT" | grep -q 'NÃO desfeita' && ok "apply: desfazer que falhou NÃO é anunciado como desfeito (mensagem)" || bad "apply: a mensagem mente sobre o desfazer: $OUT"
 [ "$(jq -r 'select(.event=="apply") | .detail' "$CITY/.gc/wa-node-route.jsonl" | tail -n 1)" = "conferencia-falhou-NAO-desfeito" ] && ok "apply: desfazer que falhou NÃO é anunciado como desfeito (log)" || bad "apply: o log mente sobre o desfazer: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+# ---- escrita que o bd diz ter FALHADO (rc ≠ 0 e ≠ 13: prazo estourado, morto, bd fora) — ga-9636op, gate-fix 1. O rc de um update morto por prazo NÃO diz o estado (o servidor pode ter gravado): quem diz é a releitura.
+#      Antes o ramo morria às cegas (13 "nada garantido") sem reler e sem desfazer: uma escrita que pegou deixava a bead atribuída ao nó sem que ninguém soubesse, e o Pilot, uma varredura depois, a lia como "livre".
+#      Agora: a releitura confere (o rc mentiu) = segue como sucesso; algo nosso = desfaz como na conferência; nada nosso = 13 "nada garantido" (um update morto por prazo pode ainda entrar: o Pilot segura a bead e relê).
+fresh; export STUB_UPDATE_RC=124; d apply wa-t1
+expect_rc "apply: bd update morto por prazo (124) que não gravou nada -> 13" 13
+tail -n 1 "$CALLS" | grep -q '^-C|[^|]*|show|' && ok "apply: depois da escrita que falhou, a ÚLTIMA chamada ao bd é uma releitura (show)" || bad "apply: sem releitura depois da escrita que falhou: $(tail -n 1 "$CALLS")"
+[ -z "$(bead '."wa-t1".assignee')" ] && ok "apply: escrita que não gravou: a bead continua livre" || bad "apply: bead: $(jq -c '."wa-t1"' "$STATE")"
+printf '%s' "$OUT" | grep -q 'pode ainda entrar' && ok "apply: escrita que falhou sem nada nosso na releitura: a mensagem diz que uma escrita morta por prazo pode ainda entrar" || bad "apply: mensagem: $OUT"
+printf '%s' "$OUT" | grep -q 'desfeita' && bad "apply: escrita que nem pegou não é 'desfeita' (a mensagem mente: $OUT)" || ok "apply: escrita que falhou não é anunciada como 'desfeita'"
+[ "$(jq -r 'select(.event=="apply") | .detail' "$CITY/.gc/wa-node-route.jsonl" | tail -n 1)" = "escrita-falhou-sem-nada-nosso rc=124" ] && ok "apply: o log diz escrita-falhou-sem-nada-nosso e o rc do bd" || bad "apply: log: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+# a escrita PEGOU por inteiro e só a resposta se perdeu (prazo, processo morto): a releitura confere, então é um sucesso — 0, e sem desfazer o que pegou
+fresh; export STUB_LAND_RC=124; d apply wa-t1; expect_rc "apply: escrita que gravou tudo e o bd saiu 124 (resposta perdida) -> 0 (a releitura confere)" 0
+[ "$(bead '."wa-t1".assignee')" = wa-worker-remote-1 ] && [ "$(bead '."wa-t1".status')" = in_progress ] && [ "$(bead '."wa-t1".metadata["gc.routed_to"]')" = wa-worker-remote ] && ok "apply: resposta perdida: a bead fica do nó (dono, status e rota)" || bad "apply: estado: $(jq -c '."wa-t1"' "$STATE")"
+[ "$(grep -c '|update|' "$CALLS")" = 1 ] && ok "apply: resposta perdida: UMA escrita só, sem desfazer o que pegou" || bad "apply: escritas: $(grep -c '|update|' "$CALLS")"
+[ "$(bead '."wa-t1".comments | length')" = 1 ] && ok "apply: resposta perdida: deixa o comentário como num sucesso" || bad "apply: comentários: $(bead '."wa-t1".comments')"
+[ "$(jq -r 'select(.event=="apply") | (.rc|tostring) + " " + .detail' "$CITY/.gc/wa-node-route.jsonl" | tail -n 1)" = "0 despachada para wa-worker-remote-1 (text) [bd update rc=124, a releitura confere]" ] && ok "apply: resposta perdida: o log diz que o rc do bd foi 124 e que a releitura conferiu" || bad "apply: log: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+# pegou SÓ O DONO e o bd saiu 137: a conferência reprova e o desfazer limpa (antes: 13 às cegas e a bead ficava atribuída ao nó)
+fresh; export STUB_LAND_RC=137 STUB_PARTIAL_UPDATE=1; d apply wa-t1; expect_rc "apply: escrita que pegou só o dono e o bd saiu 137 -> 13" 13
+[ -z "$(bead '."wa-t1".assignee')" ] && grep '|update|' "$CALLS" | tail -n 1 | grep -q -- '--if-assignee|wa-worker-remote-1|--assignee||' && ok "apply: ...e o desfazer limpou o dono (a bead não fica atribuída ao nó)" || bad "apply: depois do 137 a bead: $(jq -c '."wa-t1"' "$STATE")"
+# pegou só o dono, o bd saiu 124 e o desfazer também falha: a bead FICA do nó, e nada anuncia "desfeita"
+fresh; export STUB_LAND_RC=124 STUB_PARTIAL_UPDATE=1 STUB_UNDO_RC=1; d apply wa-t1; expect_rc "apply: pegou só o dono, bd saiu 124 e o desfazer falha -> 13" 13
+[ "$(bead '."wa-t1".assignee')" = wa-worker-remote-1 ] && printf '%s' "$OUT" | grep -q 'NÃO desfeita' && [ "$(jq -r 'select(.event=="apply") | .detail' "$CITY/.gc/wa-node-route.jsonl" | tail -n 1)" = "escrita-falhou-NAO-desfeito rc=124" ] && ok "apply: ...a bead segue atribuída ao nó e a mensagem e o log dizem NÃO desfeita" || bad "apply: estado/mensagem/log: $(jq -c '."wa-t1"' "$STATE") / $OUT / $(tail -n 1 "$CITY/.gc/wa-node-route.jsonl")"
+# a escrita gravou por inteiro, mas a releitura TAMBÉM falha: não dá para dizer que a bead está solta (nem que é do nó): 13 e "NÃO desfeita", nunca "desfeita"
+fresh; export STUB_LAND_RC=124 STUB_FAIL_SHOW_AFTER_UPDATE=1; d apply wa-t1; expect_rc "apply: escrita gravou, bd saiu 124 e a releitura falha -> 13" 13
+printf '%s' "$OUT" | grep -q 'NÃO desfeita' && ok "apply: releitura ilegível depois da escrita: a mensagem não diz 'desfeita'" || bad "apply: mensagem: $OUT"
 # ---- leitura da bead e do store
 fresh; export STUB_FAIL_SHOW=1;  d apply wa-t1; expect_rc "bead ilegível -> 11 sem escrita" 11 w0
 fresh; export STUB_SHOW_OTHER=1; d apply wa-t1; expect_rc "show devolve outro id -> 11 sem escrita" 11 w0
