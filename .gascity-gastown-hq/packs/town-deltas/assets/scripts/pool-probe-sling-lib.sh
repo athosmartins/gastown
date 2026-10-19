@@ -13,8 +13,9 @@
 # (_filter_candidates, ga-nimyz) and it defers the wisp of a reused session (ga-i58em), but this probe is a snapshot of the
 # engine's and reads neither: on 16/10 an idle dog took the wisp ga-ue9qgi while dog-2 was building its story, and spent a
 # whole session finding out and closing the duplicate. So every tier drops a candidate with pilot.sling_for whose story is
-# IN HAND: not closed, with an assignee that is a live session (not closed in `gc session list`, and not a drained -adhoc-
-# worker that went asleep: it will never resume that build) or a bd lease (lease_expires_at) that has not run out.
+# IN HAND: the story is not closed, it has an assignee, and that assignee is a live session (not closed in `gc session list`,
+# and not a drained -adhoc- worker that went asleep: it will never resume that build) or the story's bd lease
+# (lease_expires_at) has not run out.
 # Three states, never two:
 #   in hand                      -> dropped: a second builder duplicates a live build
 #   free (no assignee, closed) or provably dead (roster read, assignee not in it, no live lease)
@@ -59,7 +60,7 @@ read_roster() {
 drop_slings_for_taken_stories() {
   cands=$(cat)
   pairs=$(printf "%s" "$cands" | jq -r '.[] | select(((.metadata["pilot.sling_for"] // "") | type == "string") and ((.metadata["pilot.sling_for"] // "") | test("\\S"))) | [.id, (.metadata["pilot.sling_for"] | gsub("^\\s+|\\s+$"; ""))] | @tsv' 2>/dev/null)
-  # vazio -> no wisp in this answer, nothing to look up (no bd show, no gc call); falhou/ilegível -> the same: the answer goes on unchanged (the tier's own read was marked above)
+  # vazio -> no wisp in this answer, nothing to look up (no bd show, no gc call); falhou/ilegível (the answer is not JSON) -> the same: it goes on exactly as it would without this filter
   if [ -z "$pairs" ]; then printf "%s" "$cands"; return 0; fi
   now_s=$(date +%s)
   drop_ids=$(printf "%s\n" "$pairs" | {
