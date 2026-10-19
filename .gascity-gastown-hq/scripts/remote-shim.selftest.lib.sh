@@ -41,6 +41,7 @@ LOG="$D/calls.log"; [ "${BD_READONLY-}" = true ] && LOG="$D/reads.log"
   for a in "$@"; do a=${a//$'\n'/\\n}; printf '[%s]' "$a"; done; printf '\n'; } >> "$LOG"
 if [ "$n" = bd ] && [ "${1-}" = show ] && [ "${3-}" = --json ] && [ $# -eq 3 ]; then  # `bd show <id> --json`: responde o estado da bead (fixture $D/beads/<id>.*); sem fixture, uma bead COMUM de outro dono, sem rótulo de veredito
   b="$D/beads/$2"
+  [ "${BD_READONLY-}" = true ] && cat > /dev/null  # a leitura de estado não herda o stdin do COMANDO: se herdasse, comeria o texto do bd comment --stdin (o mutante leitura-herda-stdin)
   [ -e "$b.noise" ] && echo "[mysql] 2026/10/19 13:40:39 packets.go:58 read tcp 127.0.0.1:59514->127.0.0.1:52756: i/o timeout" >&2  # o aviso do Dolt vai ao STDERR; o stdout segue JSON limpo
   if [ -e "$b.rc" ]; then [ -e "$b.json" ] && cat "$b.json"; echo "fake-bd: show falhou" >&2; exit "$(cat "$b.rc")"; fi  # rc≠0 com um JSON válido no stdout: o rc é quem manda
   if [ -e "$b.sleep" ]; then sleep 37 & echo $! > "$D/read-sleep.pid"; wait; exit 0; fi

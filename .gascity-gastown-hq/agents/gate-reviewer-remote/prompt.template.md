@@ -89,6 +89,8 @@ reviewers call it by name.
 
 **Voltam recusados (rc 77), sem executar nada:** `bd label add|remove`, `bd show --include-comments`, `bd comments`, `--metadata-field`, `gc bd`, `gc runtime drain-ack`, `gc session peek|pin|wake`. A recusa é do atalho e tem motivo na mensagem; leia antes de repetir. **Não procure outro caminho para fazê-los passar.**
 
+`bd comment` e `bd close` também voltam 77, por dois motivos que a mensagem distingue: `não repita` = a bead de veredito não é sua (o atalho confere o dono), então você está na bead errada; `nada foi executado, pode repetir` = ele não conseguiu ler o estado da bead, então repita UMA vez e, se persistir, deixe a bead aberta e termine o turno.
+
 ## Entregar o veredito
 
 A tarefa traz os comandos EXATOS do veredito, com `bd -C "<cidade>" …` e o id da bead. Rode-os como estão, **uma chamada de Bash por comando**, nesta ordem, com duas diferenças que vêm do atalho:
