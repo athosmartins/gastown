@@ -56,7 +56,7 @@ Palavras só informativas (produção, deploy, tela, lead, cliente, terreno...) 
 | `label` | Como `shadow`, e a bead que o classificador manda ao nó **por causa de `node:ok`** é atribuída ao nó (`apply --basis label`). |
 | `auto` | Como `label`, e também a que se prova só pelo texto (`apply --basis any`). |
 
-O gancho só age quando o alvo é o pool `wa-worker` e o id é `wa-*`. Retorno: **0** atribuída ao nó (o despacho troca o alvo para `wa-worker-remote`, que tem braço próprio no `case` do spawn: **sem** `gc session new`, **sem** carimbar `gc.routed_to=wa-worker`); **1** nada foi escrito, segue no mini; **2** a escrita pode ter acontecido e não sei dizer (rc 13 ou estouro de prazo no meio): o Pilot solta a claim e **não despacha nessa varredura**, e a próxima varredura lê de novo.
+O gancho só age quando o alvo é o pool `wa-worker` e o id é `wa-*`. Retorno: **0** atribuída ao nó (o despacho troca o alvo para `wa-worker-remote`, que tem braço próprio no `case` do spawn: **sem** `gc session new`, **sem** carimbar `gc.routed_to=wa-worker`); **1** nada foi escrito, segue no mini; **2** a escrita pode ter acontecido e não sei dizer (rc 13 ou estouro de prazo no meio): o Pilot solta a claim e **não despacha nessa varredura**, e a próxima varredura lê de novo. No evento `pilot_sweep` isso aparece como `results.wa_node_unknown` e conta em `failed_other` (falha a olhar, não recusa de política).
 
 A sessão do nó é criada pelo **pool**, não pelo Pilot: é a receita da 1.6 (`bd update --assignee <alias>-1 --status in_progress --set-metadata gc.routed_to=<template>`). Um `gc session new` manual faria duas sessões e o `crew-session-dedup` mataria uma.
 
