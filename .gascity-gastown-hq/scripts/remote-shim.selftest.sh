@@ -318,6 +318,69 @@ EOF2
 kg reaped; ok $? "kill_group: grupo cujo filho já foi reapado não vira erro (ESRCH)"
 kg unreaped; ok $? "kill_group: grupo cujo filho SAIU e ainda não foi reapado não vira erro (macOS: EPERM — o estado real da corrida, que o teste antigo não exercia)"
 kg alive-eperm; ok $? "kill_group: EPERM com o filho ainda VIVO levanta (não engole 'não consegui matar')"
+echo "== trava de dono (ga-2hd02v.1.16): bd comment/close em bead de veredito só pelo dono (assignee == alias); estado que não consegui ler = recusa, nada executa"
+VL='"labels":["area:infra","type:quality-gate-verdict"]'
+bead() { printf '%s\n' "$2" > "$FB/beads/$1.json"; }  # bead ID 'JSON': o que o `bd show <id> --json` do falso responde (a leitura de estado do wrapper)
+reads() { [ -e "$FB/reads.log" ] || { echo 0; return; }; wc -l < "$FB/reads.log" | tr -d ' '; }
+lastread() { tail -1 "$FB/reads.log" | grep -qF -- "$1"; }
+bead ga-v1 "[{\"id\":\"ga-v1\",\"status\":\"in_progress\",\"assignee\":\"gastown.dog-1\",$VL}]"
+r=$(reads); allowed "bd comment em bead de veredito DO PRÓPRIO alias" bd comment ga-v1 'VERDICT: PASS'
+[ "$(reads)" = $((r+1)) ] && lastread "cwd=$CITY" && lastread "actor=gastown.dog-1" && lastread "ro=true/off" && lastread "argv=[show][ga-v1][--json]"; ok $? "  a leitura de estado é UM bd show --json no MESMO cwd e BEADS_ACTOR do comando, com BD_READONLY=true e BD_DOLT_AUTO_COMMIT=off"
+lastis "ro=UNSET/UNSET" && lastis "argv=[comment][ga-v1][VERDICT: PASS]"; ok $? "  e o COMANDO não leva BD_READONLY (a escrita é de verdade; o log de chamadas conta só comandos)"
+allowed "bd close em bead de veredito do próprio alias" bd close ga-v1 --reason 'veredito entregue'
+printf 'VERDICT: PASS' > "$T/stdin.txt"; STDIN_FILE="$T/stdin.txt" allowed "bd comment --stdin em bead de veredito do próprio alias" bd comment ga-v1 --stdin
+has "$T/out" "STDIN<VERDICT: PASS>"; ok $? "  o stdin chega inteiro ao COMANDO (a leitura de estado roda com stdin fechado e não o consome)"
+bead ga-v2 "[{\"id\":\"ga-v2\",\"status\":\"closed\",\"assignee\":\"gastown.dog-9\",$VL}]"
+denied "bd comment em bead de veredito de OUTRA sessão (o 'VERDICT: PASS' forjado)" "ga-v2 é bead de veredito" bd comment ga-v2 'VERDICT: PASS'
+has "$T/err" "não repita"; ok $? "  a mensagem diz que NÃO adianta repetir (a bead é de outro; ≠ leitura que falhou, que diz 'pode repetir')"
+STDIN_FILE="$T/stdin.txt" denied "bd comment --stdin em bead de veredito de outra sessão" "ga-v2 é bead de veredito" bd comment ga-v2 --stdin
+denied "bd close em bead de veredito de outra sessão" "ga-v2 é bead de veredito" bd close ga-v2 --reason x
+denied "bd close com a flag ANTES do id (o dono é conferido na bead certa)" "ga-v2 é bead de veredito" bd close --reason x ga-v2
+bead wa-v1 "[{\"id\":\"wa-v1\",\"assignee\":\"gastown.dog-9\",$VL}]"
+denied "bd -C <rig> comment em bead de veredito de outra sessão" "wa-v1 é bead de veredito" bd -C wa_rig comment wa-v1 oi
+lastread "cwd=$WA"; ok $? "  e a leitura de estado rodou no cwd do RIG, o mesmo do comando"
+bead ga-v3 "[{\"id\":\"ga-v3\",\"status\":\"closed\",$VL}]"
+denied "bead de veredito SEM dono (a chave assignee ausente: 55 de 60 beads fechadas medidas)" "ga-v3 é bead de veredito" bd comment ga-v3 'VERDICT: PASS'
+bead ga-v4 "[{\"id\":\"ga-v4\",\"assignee\":\"\",$VL}]"
+denied "bead de veredito com assignee vazio" "ga-v4 é bead de veredito" bd comment ga-v4 'VERDICT: PASS'
+bead ga-p1 '[{"id":"ga-p1","status":"in_progress","assignee":"gastown.dog-9","labels":["area:infra"]}]'
+allowed "bd comment em bead COMUM de outro dono passa como antes (o dog comenta e fecha a própria bead por aqui)" bd comment ga-p1 oi
+allowed "bd close em bead COMUM" bd close ga-p1 --reason ok
+bead ga-p2 '[{"id":"ga-p2","status":"open"}]'
+allowed "bead sem assignee e sem labels (chaves ausentes = 'não tem', não 'não consegui ler')" bd comment ga-p2 oi
+bead ga-p3 '[{"id":"ga-p3","assignee":"gastown.dog-9","labels":["type:quality-gate-verdict-x","Type:quality-gate-verdict","type:quality-gate-verdicts"]}]'
+allowed "rótulo parecido não é o rótulo (comparação exata)" bd comment ga-p3 oi
+unreadable() {  # unreadable "descrição" 'stdout bruto do bd show' → 77 "pode repetir" e nada executou (nem a escrita)
+  rm -f "$FB/beads/ga-u1.json"; printf '%s' "$2" > "$FB/beads/ga-u1.raw"
+  denied "$1" "nada foi executado, pode repetir" bd comment ga-u1 oi
+}
+unreadable "estado ilegível: stdout vazio" ''
+unreadable "estado ilegível: stdout que não é JSON" 'oi tudo bem'
+unreadable "estado ilegível: lista vazia (a bead não existe)" '[]'
+unreadable "estado ilegível: lista de 2 beads" '[{"id":"ga-u1"},{"id":"ga-u2"}]'
+unreadable "estado ilegível: objeto solto, não lista" '{"id":"ga-u1"}'
+unreadable "estado ilegível: item da lista que não é objeto" '["ga-u1"]'
+unreadable "estado ilegível: assignee null (o bd omite a chave, não escreve null)" '[{"id":"ga-u1","assignee":null,"labels":["type:quality-gate-verdict"]}]'
+unreadable "estado ilegível: assignee que não é texto" '[{"id":"ga-u1","assignee":["gastown.dog-1"],"labels":["type:quality-gate-verdict"]}]'
+unreadable "estado ilegível: labels null" '[{"id":"ga-u1","assignee":"gastown.dog-1","labels":null}]'
+unreadable "estado ilegível: labels com item que não é texto" '[{"id":"ga-u1","assignee":"gastown.dog-1","labels":[1,"type:quality-gate-verdict"]}]'
+unreadable "estado ilegível: labels texto em vez de lista" '[{"id":"ga-u1","assignee":"gastown.dog-1","labels":"type:quality-gate-verdict"}]'
+rm -f "$FB/beads/ga-u1.raw"
+bead ga-u2 '[{"id":"ga-u2","status":"open"}]'; printf 7 > "$FB/beads/ga-u2.rc"
+denied "bd show com rc≠0 mesmo com um JSON de bead comum no stdout (o rc manda)" "rc=7" bd comment ga-u2 oi
+rm -f "$FB/beads/ga-u2.rc"
+bead ga-n1 "[{\"id\":\"ga-n1\",\"assignee\":\"gastown.dog-1\",$VL}]"; : > "$FB/beads/ga-n1.noise"
+allowed "aviso do Dolt no stderr do bd show (stdout JSON limpo): só o stdout é lido" bd comment ga-n1 'VERDICT: PASS'
+bead ga-n2 "[{\"id\":\"ga-n2\",\"assignee\":\"gastown.dog-9\",$VL}]"; : > "$FB/beads/ga-n2.noise"
+denied "o mesmo aviso não faz a bead de outro passar" "ga-n2 é bead de veredito" bd comment ga-n2 'VERDICT: PASS'
+sed 's/"timeout_s": 120/"timeout_s": 2/' "$CONF" > "$T/conf-read-tmo.json"; : > "$FB/beads/ga-t1.sleep"; rm -f "$FB/read-sleep.pid"
+b=$(calls); t0=$(date +%s); CONF_OVERRIDE="$T/conf-read-tmo.json" call bd comment ga-t1 oi; t1=$(date +%s)
+[ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "passou do prazo" && has "$T/err" "pode repetir" && [ $((t1-t0)) -lt 20 ]; ok $? "bd show que não responde: estoura o prazo (timeout_s), 77 'pode repetir' e o comando NÃO rodou"
+gone "$FB/read-sleep.pid"; ok $? "  e a leitura pendurada é encerrada com o grupo (o neto 'sleep 37' não sobrevive)"
+rm -f "$FB/beads/ga-t1.sleep"
+has "$LOGF" "gastown.dog-1	ok	bd [-C <rig>] comment <id> <text>... +dono"; ok $? "o log de auditoria guarda a regra com '+dono'"
+grep -F "refused" "$LOGF" | grep -qF "ga-v2 é bead de veredito"; ok $? "  e a recusa por dono fica no log como 'refused', com o motivo"
+
 # harness: roda o serve() REAL do wrapper com UMA falha forçada em ponto escolhido (no ambiente de um sshd, como o wrap)
 cat > "$T/race.py" <<'EOF2'
 import importlib.util, os, signal, subprocess, sys, time
@@ -397,7 +460,7 @@ b=$(calls); harness termnokill "$REQ_OK"
 for _ in $(seq 1 200); do [ "$(calls)" -gt "$b" ] && break; sleep 0.1; done
 [ "$RC" = 143 ] && [ "$(calls)" = $((b+1)) ]; ok $? "SIGTERM com o filho criado: sai 143 mesmo se o kill do grupo levantar (e o filho que ficou vivo terminou a sua chamada)"
 lastlog "done killed sig=15 filho-nao-encerrado"; ok $? "  e o log diz 'filho-nao-encerrado', não 'filho-encerrado' (o handler não afirma o que não conseguiu)"
-rm -f "$FB/sleep.pid"; b=$(calls); harness termpopen "$(rq bd "$ID" close ga-1 --reason SLEEP)"
+rm -f "$FB/sleep.pid"; b=$(calls); harness termpopen "$(rq gc "$ID" session nudge gastown.mayor SLEEP)"  # (gc, não bd close: o close agora faz uma LEITURA de estado antes, que também é Popen e o init remendado a pegaria)
 [ "$RC" = 143 ] && [ "$(calls)" = $((b+1)) ]; ok $? "SIGTERM DENTRO do Popen (o filho já roda, o Popen ainda não devolveu o handle): sai 143 e o comando tinha mesmo começado"
 lastlog "done killed sig=15 filho-encerrado" && ! lastlog "sem-filho-registrado"; ok $? "  e o log diz 'filho-encerrado' (o sinal esperou o filho ser registrado e aí o encerrou), nunca 'sem-filho-registrado' com o comando rodando"
 gone "$FB/sleep.pid"; ok $? "  e o filho (o neto 'sleep 37') não sobrevive: antes o handler saía sem matar nada e o comando rodava até o fim com o cliente já longe"
@@ -408,7 +471,7 @@ b=$(calls); harness internal "$REQ_OK"
 [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && has "$T/err" "RECUSADO: erro interno RuntimeError"; ok $? "erro que o wrapper não previu ANTES do comando: 77 'erro interno' e o falso NÃO rodou"
 lastlog "refused"; ok $? "  e essa recusa também fica no log (antes só a recusa de Refused era auditada)"
 rm -f "$FB/sleep.pid"
-env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin SSH_CLIENT="203.0.113.9 5555 22" SSH_ORIGINAL_COMMAND="$(rq bd "$ID" close ga-1 --reason SLEEP)" python3 -I "$W" serve --config "$CONF" > "$T/out" 2> "$T/err" < /dev/null &
+env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin SSH_CLIENT="203.0.113.9 5555 22" SSH_ORIGINAL_COMMAND="$(rq gc "$ID" session nudge gastown.mayor SLEEP)" python3 -I "$W" serve --config "$CONF" > "$T/out" 2> "$T/err" < /dev/null &
 WPID=$!
 for _ in $(seq 1 300); do [ -s "$FB/sleep.pid" ] && break; sleep 0.2; done
 kill -TERM "$WPID"; wait "$WPID"; RC=$?
@@ -574,11 +637,11 @@ mutate 'return "filho-nao-encerrado"' 'return "filho-encerrado"'; ok $? "control
 withmutant harness termnokill "$REQ_OK"; lastlog "done killed sig=15 filho-encerrado" && ! lastlog "filho-nao-encerrado"; ok $? "  sem a separação o log afirma 'filho-encerrado' mesmo com o kill levantando (e a linha de desfecho existe: sem ela o 'não tem filho-nao-encerrado' passaria vazio)"
 mutate 'LOG_BAD.sub("?", f)[:200]' 're.sub(r"[\t\r\n]", " ", f)[:200]'; ok $? "controle: o log higieniza TODOS os campos (não só TAB/CR/LF, como antes)"
 withmutant call bd $'\x1b]0;evil\x07x'; ! logclean; ok $? "  sem isso o MESMO argumento com ESC/BEL chega cru ao log"
-mutate '    Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}),
+mutate '    Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}, owner_lock=True),
 ' ''; ok $? "controle: a regra 'bd comment <id> <texto>...' existe na RULES"
 b=$(calls); withmutant call bd comment ga-1 'SEGREDO-4711 texto do comentário'; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && ! grep -q 'SEGREDO-4711' "$LOGF"; ok $? "  sem a regra o MESMO pedido é recusado e o grep do log também passa: é o 'RODOU' (rc 0 + uma chamada) do caso do SEGREDO que prova o caminho, não o grep"
 mutate 'if _LAUNCH["on"]:' 'if False:'; ok $? "controle: o handler de sinal adia o sinal enquanto o Popen está em curso"
-rm -f "$FB/sleep.pid"; withmutant harness termpopen "$(rq bd "$ID" close ga-1 --reason SLEEP)"
+rm -f "$FB/sleep.pid"; withmutant harness termpopen "$(rq gc "$ID" session nudge gastown.mayor SLEEP)"
 lastlog "done killed sig=15 sem-filho-registrado"; ok $? "  sem o adiamento o MESMO caso volta a sair com 'sem-filho-registrado' (o comando RODANDO, o handler sem filho para matar)"
 [ -s "$FB/sleep.pid" ] && kill "$(cat "$FB/sleep.pid")" 2>/dev/null; rm -f "$FB/sleep.pid"  # (o neto que o mutante deixou vivo)
 mutate 'if rc == -signal.SIGKILL:' 'if True:'; ok $? "controle: o código do wait() depois do kill decide entre 'estourou' (morreu do NOSSO SIGKILL) e 'saiu sozinho antes do kill'"
