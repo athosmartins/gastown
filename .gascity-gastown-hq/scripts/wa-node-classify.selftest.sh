@@ -5,14 +5,17 @@
 #   Casos · Controle negativo · Como rodar
 #
 # CASOS: veredito node (prova no texto / etiqueta) · mini (etiqueta node:mini, epic, caminho que o filtro segura, teste só-no-Mac, telefone/CPF no texto, palavras de banco/credencial/host Mac)
-#   · palavras informativas NÃO bloqueiam · duras vencem node:ok · unknown (sem prova, JSON ilegível, campo de tipo estranho, texto/entrada grande, filtro/mac-only ausente, rsync que falha/não
-#   responde/lista tudo, canário errado, exceção inesperada) · caminho fora do formato não toca o disco · códigos de saída 0/10/11/2 · as regexes de telefone/CPF são as do hetzner-pii-scan.py.
-# CONTROLE NEGATIVO: cada mutante abaixo troca UMA linha do classificador numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria.
+#   · palavras informativas NÃO bloqueiam · duras vencem node:ok · unknown (sem prova, JSON ilegível, campo de tipo estranho, texto/entrada grande, filtro (ausente ou furado)/mac-only (ausente
+#   ou sem glob) ausente, rsync que falha/sai com rc 23/não responde/lista tudo, canário errado, exceção inesperada) · caminho fora do formato (.., absoluto, ~/, $VAR/) não toca o disco ·
+#   teto de 40 caminhos · códigos de saída 0/10/11/2 · as regexes de telefone/CPF são as do hetzner-pii-scan.py.
+# CONTROLE NEGATIVO: cada mutante abaixo troca UMA linha do classificador numa cópia e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria. Um mutante só vale se o
+#   ORIGINAL passa o mesmo caso no mesmo ambiente e se ele não morre por causa do ambiente (ver as 3 regras acima de mk_mutant); caso e mutante de rsync usam stubs que só o mutante separa do original.
 # COMO RODAR: bash scripts/wa-node-classify.selftest.sh   (macOS /bin/bash 3.2 e Linux). Pesado o bastante para ir ao nó: scripts/mbp-run.sh --repo hq scripts/wa-node-classify.selftest.sh
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLS_REAL="$HERE/wa-node-classify.py"
 PII="$HERE/hetzner-pii-scan.py"
+REAL_FILTER="$HERE/hetzner-rsync-filter.wa.txt"; REAL_MAC="$HERE/hetzner-mac-only.txt"   # um classificador que mora fora de scripts/ (os mutantes) acha o filtro por env, não por HERE
 T=$(mktemp -d "${TMPDIR:-/tmp}/wa-node-cls.XXXXXX")
 trap 'find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 fails=0; n=0
@@ -58,9 +61,19 @@ expect "mini: host Mac citado sem etiqueta" "$(DESC 'lib/x.py roda osascript; te
 expect "node:ok ignora a mole e DIZ que ignorou" "$(labels "$(DESC 'lib/x.py abre um sqlite; tests/test_x.py')" '["node:ok"]')" 0 'moles-ignoradas:banco-de-dados'
 expect "duro vence node:ok: caminho que o filtro segura" "$(labels "$WITHDB" '["node:ok"]')" 10 'caminho-fora-do-filtro:queue\.db'
 expect "duro vence node:ok: telefone no texto" "$(labels "$(DESC 'lib/x.py tests/test_x.py (31) 98876-5432')" '["node:ok"]')" 10 'dado-no-texto'
-expect "caminho com .. : fora do formato, não vai ao disco" "$(DESC 'lib/x.py e ../escape.py com tests/test_x.py')" 10 'caminho-fora-do-formato'
-expect "caminho absoluto: fora do formato" "$(DESC 'lib/x.py e /etc/zz_evil.py com tests/test_x.py')" 10 'caminho-fora-do-formato'
+expect "caminho com .. : fora do formato, não entra na lista que vai ao disco" "$(DESC 'lib/x.py e ../escape.py com tests/test_x.py')" 10 'caminho-fora-do-formato.*"paths": \["lib/x\.py", "tests/test_x\.py"\]'
+expect "caminho absoluto: fora do formato" "$(DESC 'lib/x.py e /etc/zz_evil.py com tests/test_x.py')" 10 'caminho-fora-do-formato.*"paths": \["lib/x\.py", "tests/test_x\.py"\]'
+expect "caminho com letra não-ASCII: fora do formato (SAFE_SEG)" "$(DESC 'lib/x.py tests/test_x.py e lib/ação.py')" 10 'caminho-fora-do-formato.*"paths": \["lib/x\.py", "tests/test_x\.py"\]'
+expect "~/caminho: host Mac, fora do formato" "$(DESC 'lib/x.py tests/test_x.py e ~/segredos/chave.json')" 10 'caminho-fora-do-formato'
+expect '$HOME/caminho: host Mac, fora do formato' "$(DESC 'lib/x.py tests/test_x.py e $HOME/dados/y.csv')" 10 'caminho-fora-do-formato'
+expect "extensão em MAIÚSCULA também passa pelo filtro" "$(DESC 'lib/x.py tests/test_x.py e DATA/Leads.CSV')" 10 'caminho-fora-do-filtro:DATA/Leads\.CSV'
+expect ".sqlite3 citado (o filtro segura)" "$(DESC 'lib/x.py tests/test_x.py e data/x.sqlite3')" 10 'caminho-fora-do-filtro:data/x\.sqlite3'
+P39=$(for i in $(seq 1 39); do printf 'lib/m%d.py ' "$i"; done)
+expect "node: exatamente 40 caminhos (39 de código + 1 teste) ainda valem" "$(DESC "${P39}tests/test_x.py")" 0 '"verdict": "node"'
+expect "mini: o 41º caminho estoura o teto" "$(DESC "${P39}lib/m40.py tests/test_x.py")" 10 'caminhos-demais'
 # ---- unknown
+expect "unknown: lib/x.py.bak não vira lib/x.py (a prova de 'código' seria de um arquivo que ninguém citou)" "$(DESC 'lib/x.py.bak e tests/test_x.py')" 11 '"paths": \["tests/test_x\.py"\]'
+expect "node: ponto final de frase não atrapalha o caminho" "$(DESC 'Ajustar lib/x.py. Depois rodar tests/test_x.py.')" 0 '"paths": \["lib/x.py", "tests/test_x.py"\]'
 expect "unknown: nada de código nem teste citado" "$NOPROOF" 11 'sem-prova-de-codigo-e-teste'
 expect "unknown: só código, sem teste" "$(DESC 'ajustar lib/x.py')" 11 'sem-prova'
 expect "unknown: JSON ilegível" 'isto nao e json' 11 'json-ilegivel'
@@ -85,17 +98,26 @@ unset WA_NODE_FILTER
 export WA_NODE_MAC_ONLY="$T/nao-existe.txt"
 expect "unknown: lista mac-only ausente (com caminhos citados)" "$GOOD" 11 'mac-only-ilegivel'
 expect "mac-only ausente não pesa quando a bead não cita caminho (node:ok)" "$(labels "$NOPROOF" '["node:ok"]')" 0 '"verdict": "node"'
+printf '# so comentario, nenhum glob\n' > "$T/macs-vazio.txt"; export WA_NODE_MAC_ONLY="$T/macs-vazio.txt"
+expect "unknown: lista mac-only SEM nenhum glob (truncada?) não vira 'nada é só-Mac'" "$GOOD" 11 'mac-only-vazio'
 unset WA_NODE_MAC_ONLY
 printf '# só comentário\ntests/test_launchd_*.py\n' > "$T/macs.txt"; export WA_NODE_MAC_ONLY="$T/macs.txt"
 expect "mini: teste que só roda no Mac" "$(DESC 'lib/x.py e tests/test_launchd_plist.py')" 10 'so-no-mac:tests/test_launchd_plist\.py'
 expect "node: lista mac-only que não casa não atrapalha" "$GOOD" 0 '"verdict": "node"'
 unset WA_NODE_MAC_ONLY
 stub() { printf '#!/bin/sh\n%s\n' "$2" > "$T/$1"; chmod +x "$T/$1"; }
+printf '+ */\n+ *.py\n- *.pyc\n' > "$T/filtro-furado.txt"   # tem "- *" como TEXTO (passa a checagem de substring) mas não nega o resto: só o canário de segredo pega
+export WA_NODE_FILTER="$T/filtro-furado.txt"
+expect "unknown: filtro furado ('- *.pyc' não é a negação final) deixa sair canário de segredo" "$GOOD" 11 'canario-errado'
+unset WA_NODE_FILTER
+# argv do rsync no classificador: $1=-a $2=-n $3=--out-format $4=--filter $5=<origem>/ $6=<destino>/ (o destino é SEMPRE vazio: quem "lista tudo" lista a origem, $5)
 stub rs-rc1 'exit 1'
 stub rs-mudo 'exit 0'
-stub rs-tudo 'cd "$6" && find . -type f | sed "s|^\./||"; exit 0'
+stub rs-tudo 'cd "$5" && find . -type f | sed "s|^\./||"; exit 0'
+stub rs-parcial 'printf "%s\n" lib/foo_parser.py tests/test_foo_parser.py tests/test_zz_wa_node_canary.py; exit 23'   # saída "boa" (canário de código + os arquivos do GOOD) com rc 23 (transferência parcial)
 stub rs-pendura 'sleep 6; exit 0'
 export WA_NODE_RSYNC="$T/rs-rc1";    expect "unknown: rsync sai com erro" "$GOOD" 11 'rsync-rc-1'
+export WA_NODE_RSYNC="$T/rs-parcial"; expect "unknown: rsync que lista o esperado mas sai com rc 23 — saída boa não salva rc != 0" "$GOOD" 11 'rsync-rc-23'
 export WA_NODE_RSYNC="$T/rs-mudo";   expect "unknown: rsync mudo (nenhum canário listado) — não vira 'nada sai'" "$GOOD" 11 'canario-errado'
 export WA_NODE_RSYNC="$T/rs-tudo";   expect "unknown: rsync que lista TUDO (canário de segredo saiu)" "$GOOD" 11 'canario-errado'
 export WA_NODE_RSYNC="$T/nao-existe-rsync"; expect "unknown: rsync inexistente" "$GOOD" 11 'rsync-sem-resposta'
@@ -104,7 +126,12 @@ unset WA_NODE_RSYNC WA_NODE_RSYNC_TIMEOUT
 export WA_NODE_RSYNC_TIMEOUT=abc; expect "prazo do rsync ilegível volta ao padrão (30) e não derruba" "$GOOD" 0 '"verdict": "node"'; unset WA_NODE_RSYNC_TIMEOUT
 
 # ---- o classificador não deixa resíduo e só aceita stdin
-mkdir -p "$T/tmpd"; run_tmp=$(printf '%s' "$(DESC 'lib/x.py e ../escape.py com tests/test_x.py')" | TMPDIR="$T/tmpd" "$PY" -I "$CLS_REAL" >/dev/null 2>&1; ls -A "$T/tmpd" | wc -l | tr -d ' ')
+tmp_residue() { # tmp_residue <classificador> -> nº de itens que sobraram num TMPDIR só dele (a bead cita caminhos, então o classificador cria a árvore temporária)
+  local d; d=$(mktemp -d "$T/tmpd.XXXXXX")
+  printf '%s' "$(DESC 'lib/x.py e ../escape.py com tests/test_x.py')" | WA_NODE_FILTER="$REAL_FILTER" WA_NODE_MAC_ONLY="$REAL_MAC" TMPDIR="$d" "$PY" -I "$1" >/dev/null 2>&1
+  ls -A "$d" | wc -l | tr -d ' '
+}
+run_tmp=$(tmp_residue "$CLS_REAL")
 [ "$run_tmp" = 0 ] && ok "sem resíduo no TMPDIR (a árvore temporária é apagada)" || bad "resíduo no TMPDIR: $run_tmp item(ns)"
 "$PY" -I "$CLS_REAL" extra </dev/null >/dev/null 2>&1; rc=$?; [ "$rc" = 2 ] && ok "argumento a mais: rc 2 (uso)" || bad "argumento a mais: rc=$rc (esperado 2)"
 # as regexes de telefone e CPF são as do hetzner-pii-scan.py (se uma mudar lá, o texto da bead passa a ser conferido por outra régua)
@@ -117,36 +144,71 @@ sys.exit(0 if (a.PH.pattern == b.PH.pattern and a.CPF.pattern == b.CPF.pattern) 
 EOF
 
 # ---- controle negativo: um mutante por linha; o caso designado tem de reprovar
-mutant() { # mutant <nome> <trecho original> <trecho novo> <json> <rc> <regex>
-  local name="$1" old="$2" new="$3" json="$4" rc="$5" rx="$6" M="$T/mut-$1.py"
-  "$PY" -I - "$CLS_REAL" "$M" "$old" "$new" <<'EOF' || { bad "mutante $name: o trecho original não existe (o classificador mudou? atualize o mutante)"; return; }
+# Três regras para um mutante valer (cada uma fecha um jeito de o "morreu" ser mentira; os três apareceram nesta bateria):
+#   1. o classificador ORIGINAL, no MESMO ambiente, passa o caso designado — senão o mutante "morre" qualquer que seja a mutação (vácuo);
+#   2. o ambiente é o do original: o mutante mora em $T, então o filtro e a lista mac-only reais são fixados por env — sem isso ele morria de `filtro-ilegivel`, não da mutação;
+#   3. morte por `filtro-ilegivel`/`mac-only-ilegivel` (a menos que o caso designado seja justamente esse) é morte pelo ambiente, e reprova.
+mk_mutant() { # mk_mutant <nome> <trecho original> <trecho novo> -> cria $T/mut-<nome>.py; rc 1 se o trecho original não existe
+  "$PY" -I - "$CLS_REAL" "$T/mut-$1.py" "$2" "$3" <<'EOF'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
 if sys.argv[3] not in src:
     sys.exit(1)
 open(sys.argv[2], "w", encoding="utf-8").write(src.replace(sys.argv[3], sys.argv[4], 1))
 EOF
-  CLS="$M"
-  if check "$json" "$rc" "$rx"; then bad "mutante $name SOBREVIVEU (o caso designado ainda passa)"; else ok "mutante $name morreu"; fi
+}
+mutant() { # mutant <nome> <trecho original> <trecho novo> <json> <rc> <regex> [VAR=valor do caso designado]
+  local name="$1" json="$4" rc="$5" rx="$6" envspec="${7:-}" M="$T/mut-$1.py"
+  mk_mutant "$name" "$2" "$3" || { bad "mutante $name: o trecho original não existe (o classificador mudou? atualize o mutante)"; return; }
+  export WA_NODE_FILTER="$REAL_FILTER" WA_NODE_MAC_ONLY="$REAL_MAC"
+  [ -n "$envspec" ] && export "$envspec"
   CLS="$CLS_REAL"
+  if ! check "$json" "$rc" "$rx"; then
+    bad "mutante $name VAZIO: o classificador ORIGINAL já reprova o caso designado (rc=$RC, esperado $rc; saída: $(printf '%s' "$OUT" | cut -c1-200))"
+  else
+    CLS="$M"
+    if check "$json" "$rc" "$rx"; then bad "mutante $name SOBREVIVEU (o caso designado ainda passa)"
+    elif printf '%s' "$OUT" | grep -q -E 'nao-consegui:(filtro|mac-only)-ilegivel' && ! printf '%s' "$rx" | grep -q 'ilegivel'; then
+      bad "mutante $name morreu PELO AMBIENTE, não pela mutação (rc=$RC; saída: $(printf '%s' "$OUT" | cut -c1-200))"
+    else ok "mutante $name morreu"; fi
+    CLS="$CLS_REAL"
+  fi
+  unset WA_NODE_FILTER WA_NODE_MAC_ONLY; [ -n "$envspec" ] && unset "${envspec%%=*}"
 }
 mutant sem-node-mini     '"node:mini" in labels'                       'False'                                  "$(labels "$GOOD" '["node:mini"]')" 10 'etiqueta-node:mini'
 mutant sem-epic          'b.get("issue_type") == "epic"'               'False'                                  "$(field "$GOOD" issue_type '"epic"')" 10 '"epic"'
 mutant sem-pii           'if has_pii(json.dumps'                       'if False and has_pii(json.dumps'        "$(DESC 'lib/x.py tests/test_x.py (31) 98876-5432')" 10 'dado-no-texto'
 mutant pii-sem-cauda     'len(set(d[-8:])) > 3'                        'len(set(d[-8:])) >= 0'                  "$(DESC 'lib/x.py tests/test_x.py +55 31 99999-9999')" 0 '"verdict": "node"'
 mutant filtro-ignorado   'if p not in sent:'                           'if False:'                              "$WITHDB" 10 'caminho-fora-do-filtro'
-mutant mac-ignorado      'elif any(fnmatch.fnmatchcase(p, g) for g in globs):' 'elif False:'                    "$(DESC 'lib/x.py e tests/test_launchd_plist.py')" 10 'so-no-mac'
-mutant sem-canario       'if CANARY_OK not in sent or any(c in sent for c in CANARY_NO):' 'if False:'          "$GOOD" 11 'canario-errado'
-mutant rc-ignorado       'if r.returncode != 0:'                       'if False:'                              "$GOOD" 11 'rsync-rc-1'
+mutant mac-ignorado      'elif any(fnmatch.fnmatchcase(p, g) for g in globs):' 'elif False:'                    "$(DESC 'lib/x.py e tests/test_launchd_plist.py')" 10 'so-no-mac' "WA_NODE_MAC_ONLY=$T/macs.txt"
+# o canário tem DUAS metades (o de código TEM de sair, os de segredo NÃO): um mutante por metade e um para as duas; cada um com o rsync que só ELE separa do original
+mutant sem-canario       'if CANARY_OK not in sent or any(c in sent for c in CANARY_NO):' 'if False:'          "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-mudo"
+mutant sem-canario-codigo 'CANARY_OK not in sent or any('              'False or any('                          "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-mudo"
+mutant sem-canario-segredo 'or any(c in sent for c in CANARY_NO):'    'or False:'                              "$GOOD" 11 'canario-errado' "WA_NODE_RSYNC=$T/rs-tudo"
+mutant rc-ignorado       'if r.returncode != 0:'                       'if False:'                              "$GOOD" 11 'rsync-rc-23' "WA_NODE_RSYNC=$T/rs-parcial"
 mutant sem-moles         'if soft and not override:'                   'if False:'                              "$(DESC 'lib/x.py abre um sqlite; tests/test_x.py')" 10 'moles:banco-de-dados'
 mutant label-ignorada    'override = "node:ok" in labels'              'override = False'                       "$(labels "$NOPROOF" '["node:ok"]')" 0 'label'
 mutant prova-frouxa      'if tests and code:'                          'if tests or True:'                      "$NOPROOF" 11 'sem-prova'
 mutant unreadable-node   'v, why, paths, tests, info = "unknown", ["nao-consegui:"' 'v, why, paths, tests, info = "node", ["nao-consegui:"' 'isto nao e json' 11 'json-ilegivel'
-mutant caminho-solto     'any(s in ("", ".", "..") for s in segs)'     'False'                                  "$(DESC 'lib/x.py e ../escape.py com tests/test_x.py')" 10 'caminho-fora-do-formato'
+# caminho fora do formato: as checagens explícitas ('/' inicial, '', '.', '..') são SUBSUMIDAS por SAFE_SEG (que recusa segmento vazio ou começado em ponto) — tirar só elas é mutante equivalente e não se lista.
+# Mata-se a condição inteira e, separado, só o SAFE_SEG (o caso de letra não-ASCII é o que só ele segura).
+mutant caminho-solto     'if p.startswith("/") or any(s in ("", ".", "..") for s in segs) or not all(SAFE_SEG.match(s) for s in segs):' 'if False:' "$(DESC 'lib/x.py e ../escape.py com tests/test_x.py')" 10 'caminho-fora-do-formato.*"paths": \["lib/x\.py", "tests/test_x\.py"\]'
+mutant sem-safe-seg      ' or not all(SAFE_SEG.match(s) for s in segs):' ':'                                  "$(DESC 'lib/x.py tests/test_x.py e lib/ação.py')" 10 'caminho-fora-do-formato.*"paths": \["lib/x\.py", "tests/test_x\.py"\]'
 mutant sem-teto-texto    'if len(text) > MAX_TEXT:'                    'if False:'                              "$(printf '{"id":"wa-b","title":"t","description":"lib/a.py tests/test_a.py %s"}' "$BIG")" 11 'texto-grande'
 mutant labels-frouxas    'if not isinstance(lab, list) or not all(isinstance(x, str) for x in lab):' 'if False:' "$(labels "$GOOD" '"node:ok"')" 11 'labels-ilegiveis'
 mutant abs-vira-mole     'norm(text.replace(REPO_ABS, ""))'            'norm(text)'                             "$(DESC 'ver /Users/athos/gt/whatsapp_automation/lib/foo.py e tests/test_foo.py')" 0 '"verdict": "node"'
 mutant sem-catch-all    'except Exception as e:'                      'except ZeroDivisionError as e:'         "$("$PY" -I -c 'print("["*200000)')" 11 'erro-inesperado'
+mutant teto-frouxo       'if len(out) >= MAX_PATHS:'                   'if len(out) > MAX_PATHS:'               "$(DESC "${P39}lib/m40.py tests/test_x.py")" 10 'caminhos-demais'
+mutant sufixo-vira-arquivo '(?![\w\-]|\.\w)'                           '(?![\w])'                               "$(DESC 'lib/x.py.bak e tests/test_x.py')" 11 '"paths": \["tests/test_x\.py"\]'
+mutant sem-maiuscula     ', re.IGNORECASE)'                            ')'                                      "$(DESC 'lib/x.py tests/test_x.py e DATA/Leads.CSV')" 10 'caminho-fora-do-filtro:DATA/Leads\.CSV'   # 1ª ocorrência = PATH_RE (HOME_RE vem depois)
+mutant sem-sqlite3       '|db|sqlite3?|xlsx|'                          '|db|sqlite|xlsx|'                       "$(DESC 'lib/x.py tests/test_x.py e data/x.sqlite3')" 10 'caminho-fora-do-filtro:data/x\.sqlite3'
+mutant sem-home          'if HOME_RE.search(text):'                    'if False:'                              "$(DESC 'lib/x.py tests/test_x.py e ~/segredos/chave.json')" 10 'caminho-fora-do-formato'
+mutant mac-vazio-vale    'if not globs:'                               'if False:'                              "$GOOD" 11 'mac-only-vazio' "WA_NODE_MAC_ONLY=$T/macs-vazio.txt"
+# o resíduo no TMPDIR: o mutante que não apaga a árvore tem de deixar item para trás (senão o teste de "sem resíduo" passaria mesmo sem a limpeza)
+if mk_mutant sem-limpeza 'shutil.rmtree(root, ignore_errors=True)' 'pass'; then
+  left=$(tmp_residue "$T/mut-sem-limpeza.py")
+  [ "${left:-0}" -ge 1 ] && ok "mutante sem-limpeza morreu" || bad "mutante sem-limpeza SOBREVIVEU (sem apagar a árvore o TMPDIR ficou com $left item(ns))"
+else bad "mutante sem-limpeza: o trecho original não existe (o classificador mudou? atualize o mutante)"; fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

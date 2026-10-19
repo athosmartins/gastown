@@ -13,8 +13,9 @@ TRÊS ESTADOS (sempre): node = li tudo e há prova de que é código + teste que
 COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado nela):
   1. entrada que não é um objeto de bead (JSON ilegível, sem id/título, texto grande demais)      -> unknown
   2. etiqueta `node:mini` (decisão humana) ou tipo epic                                           -> mini
-  3. DURAS (nem `node:ok` vence): (a) todo caminho citado na bead passa pelo filtro REAL do rsync (um `rsync -n` sobre uma árvore temporária com os caminhos citados + 3 canários;
-     canário errado = unknown) e pela lista mac-only, porque o nó simplesmente não tem o arquivo; caminho absoluto, `..` ou fora do formato; (b) a bead (todos os campos, metadata
+  3. DURAS (nem `node:ok` vence): (a) todo caminho de ARQUIVO citado na bead (forma dir/arq.ext, extensão da lista PATH_RE, maiúscula ou minúscula) passa pelo filtro REAL do rsync (um
+     `rsync -n` sobre uma árvore temporária com os caminhos citados + 3 canários; canário errado = unknown) e pela lista mac-only, porque o nó simplesmente não tem o arquivo; caminho
+     absoluto, `..`, `~/...`, `$VAR/...` ou fora do formato; mais de 40 caminhos; (b) a bead (todos os campos, metadata
      incluída) tem telefone ou CPF com a forma do hetzner-pii-scan.py, porque o TEXTO da bead viaja ao nó e dado de lead não pode ir junto                               -> mini
   4. MOLES (palavras que dizem "toca recurso vivo": banco real, credencial, host Mac): `node:ok` (decisão humana) as ignora e o motivo `moles-ignoradas` fica na resposta; sem
      `node:ok`                                                                                      -> mini
@@ -26,7 +27,8 @@ COMO DECIDE (a 1ª regra que casa vale; tudo é lido da bead, nada é gravado ne
 
 CÓDIGOS DE SAÍDA: 0 node · 10 mini · 11 unknown · 2 uso. A linha de stdout é um JSON: {"verdict","basis","reasons":[...],"paths":[...],"tests":[...],"info":[...]}.
 O QUE NÃO FAZ: não lê dado, não abre o nó, não toca o Dolt, não escreve na bead. Lê só stdin (o JSON do `bd show --json`), o filtro e a lista mac-only.
-LIMITES: é heurística de TEXTO sobre a bead; o texto pode omitir que o teste abre um banco. O resíduo cai no nó como teste vermelho e a bead volta ao mini pelo gate (custo, não vazamento:
+LIMITES: é heurística de TEXTO sobre a bead; o texto pode omitir que o teste abre um banco. NÃO são extraídos: pasta sem arquivo (`data/`), arquivo sem nome (`.env`), extensão fora da lista, nome com
+  sufixo (`x.py.bak` não vira `x.py`). Para esses a regra 3a não age; quem segura o dado é o filtro do rsync (o nó nunca o recebe) e, no caso de `.env`/`.db`, a palavra mole da regra 4. O resíduo cai no nó como teste vermelho e a bead volta ao mini pelo gate (custo, não vazamento:
   o dado não chega ao nó de qualquer jeito). A lista de palavras moles é deliberadamente larga (o vocabulário do WA é todo de lead/terreno): na dúvida a bead fica no mini, como hoje.
 """
 import fnmatch
@@ -52,7 +54,9 @@ MAX_IN = 1_000_000      # bytes de stdin
 MAX_TEXT = 200_000      # caracteres de texto da bead
 MAX_PATHS = 40
 CODE_EXT = ("py", "sh", "js", "mjs", "cjs", "ts", "css")   # as mesmas do bloco 3a do filtro; quem manda é o filtro, isto só decide o que é "arquivo de código" na prova positiva
-PATH_RE = re.compile(r"(?<![\w/.\-~$])((?:/?[\w.\-]+/)*[\w\-]+(?:\.[\w\-]+)*\.(?:py|sh|js|mjs|cjs|ts|css|json|jsonl|yaml|yml|md|html|sql|plist|txt|csv|db|sqlite|xlsx|parquet|toml|ini|cfg|log|pdf|env))(?![\w])")
+EXTS = "py|sh|js|mjs|cjs|ts|css|json|jsonl|yaml|yml|md|html|sql|plist|txt|csv|db|sqlite3?|xlsx|parquet|toml|ini|cfg|log|pdf|env"
+PATH_RE = re.compile(r"(?<![\w/.\-~$])((?:/?[\w.\-]+/)*[\w\-]+(?:\.[\w\-]+)*\.(?:" + EXTS + r"))(?![\w\-]|\.\w)", re.IGNORECASE)   # `x.py.bak`/`x.py-old` não viram `x.py`; ponto final de frase continua valendo
+HOME_RE = re.compile(r"(?<!\w)[~$][\w{}]*/(?:[\w.\-]+/)*[\w.\-]+\.(?:" + EXTS + r")(?![\w])", re.IGNORECASE)   # ~/x.json, $HOME/x.py: o nó não tem o home do Mac
 SAFE_SEG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,80}$")
 TEST_RE = re.compile(r"(^|/)tests?/|(^|/)test_[^/]*\.py$|_test\.py$|\.selftest\.sh$")
 REPO_ABS = "/Users/athos/gt/whatsapp_automation/"
@@ -130,6 +134,8 @@ def labels_of(b):
 def extract_paths(text):
     """(caminhos válidos em ordem, motivos duros). Caminho fora do formato seguro vira motivo duro: nunca vai ao disco."""
     seen, out, hard = set(), [], []
+    if HOME_RE.search(text):
+        hard.append("caminho-fora-do-formato")
     for m in PATH_RE.finditer(text):
         p = m.group(1)
         if p.startswith(REPO_ABS):
@@ -143,10 +149,10 @@ def extract_paths(text):
         if p.startswith("/") or any(s in ("", ".", "..") for s in segs) or not all(SAFE_SEG.match(s) for s in segs):
             hard.append("caminho-fora-do-formato")
             continue
-        out.append(p)
-        if len(out) >= MAX_PATHS:
+        if len(out) >= MAX_PATHS:   # o 41º caminho válido estoura o teto; exatamente 40 ainda vale
             hard.append("caminhos-demais")
             break
+        out.append(p)
     return out, hard
 
 
@@ -186,12 +192,16 @@ def sent_by_filter(paths):
 
 
 def mac_only_globs():
-    # ausente/ilegível -> Unreadable (sem a lista não sei o que tem de ficar no Mac); vazia (só comentários) é válida
+    # ausente/ilegível -> Unreadable (sem a lista não sei o que tem de ficar no Mac); existe mas sem NENHUM glob (truncada? só comentários?) -> Unreadable também: a lista real nunca é vazia,
+    # e "não sei" não pode ler como "nada é só-Mac"
     try:
         with open(MAC_ONLY, "r", encoding="utf-8") as fh:
-            return [l.strip() for l in fh if l.strip() and not l.lstrip().startswith("#")]
+            globs = [l.strip() for l in fh if l.strip() and not l.lstrip().startswith("#")]
     except OSError:
         raise Unreadable("mac-only-ilegivel")
+    if not globs:
+        raise Unreadable("mac-only-vazio")
+    return globs
 
 
 def has_pii(blob):
