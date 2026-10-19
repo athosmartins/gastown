@@ -26,7 +26,7 @@ O walk é o do `sg-python.sh`: o primeiro de `python3.13 … python3.10`, depois
 - **sumiu** (o interpretador respondeu e não tem o SDK, ou não há python ≥ 3.10): um `notify -p 4` com o comando de conserto (`<python> -m pip install --break-system-packages claude-agent-sdk`), repetido a cada 6 h enquanto durar. Um `brew upgrade` do python3.13 apaga o site-packages e traz o laço de volta.
 - **não consegui checar** (timeout de 60 s, saída ilegível, saída ≠ 0): nunca vira "sumiu". Só alarma depois de 3 rodadas seguidas, com texto próprio.
 - `notify` que falha **não** é gravado como enviado; a próxima rodada tenta de novo. Voltou o SDK: o estado de alarme é limpo, sem aviso.
-- Estado: `<cidade>/.gc/runtime/claude-security-janitor.state.json` (+ `.lock`). A saída da rodada é 1 enquanto o SDK estiver sumido ou não checável, então `launchctl print … | grep 'last exit'` mostra o problema sem abrir o log.
+- Estado: `<cidade>/.gc/runtime/claude-security-janitor.state.json` e a trava `claude-security-janitor.lock` na mesma pasta. A saída da rodada é 1 enquanto o SDK estiver sumido ou não checável, então `launchctl print … | grep 'last exit'` mostra o problema sem abrir o log.
 
 ## Instalar (Mayor, depois do merge)
 ```bash

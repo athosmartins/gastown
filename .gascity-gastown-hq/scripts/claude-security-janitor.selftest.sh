@@ -26,7 +26,7 @@ W="$(mktemp -d "${TMPDIR:-/tmp}/csj-selftest.XXXXXX")"
 trap 'chmod -R u+rwx "$W" 2>/dev/null; rm -rf "$W"' EXIT
 export PYTHONDONTWRITEBYTECODE=1
 export HOME="$W/home"
-SEC="$HOME/.claude/security"; TMP="$W/tmp"; RT="$W/rt"; STATE="$RT/state.json"
+SEC="$HOME/.claude/security"; TMP="$W/tmp"; RT="$W/rt"; STATE="$RT/state.json"; LOCK="$RT/lock"
 NCALLS="$W/notify.calls"; export STUB_NOTIFY_CALLS="$NCALLS"
 H=3600; D=86400; STALE=$((3*D)); PIPAGE=$((2*H))
 PASS=0; FAIL=0; OUT=""; RC=0
@@ -117,7 +117,7 @@ run_jan() {
     case "$1" in --) shift; args=("$@"); break ;; *) envs+=("$1"); shift ;; esac
   done
   OUT=$(env CLAUDE_SECURITY_JANITOR_DIR="$SEC" CLAUDE_SECURITY_JANITOR_TMPDIR="$TMP" \
-        CLAUDE_SECURITY_JANITOR_STATE="$STATE" CLAUDE_SECURITY_JANITOR_PS_BIN="$W/ps" \
+        CLAUDE_SECURITY_JANITOR_STATE="$STATE" CLAUDE_SECURITY_JANITOR_LOCK="$LOCK" CLAUDE_SECURITY_JANITOR_PS_BIN="$W/ps" \
         CLAUDE_SECURITY_JANITOR_NOTIFY_BIN="$W/notify" CLAUDE_SECURITY_JANITOR_PYTHONS="$W/py-present" \
         ${envs[@]+"${envs[@]}"} "$PY" "$JAN" ${args[@]+"${args[@]}"} 2>&1); RC=$?
 }
@@ -384,7 +384,7 @@ chk_rc 1 "bad STATE_MAX_AGE_SECS: INCOMPLETE, exit 1"
 chk_exists "$SEC/security_warnings_state_aaa.json" "bad limit: not guessed, nothing deleted"
 chk_gone "$TMP/pip-unpack-abc123" "bad limit: the other part still ran"
 fixture_mixed
-"$PY" -c 'import fcntl,os,sys,time; fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR); fcntl.flock(fd,2); open(sys.argv[2],"w").write("held"); time.sleep(120)' "$STATE.lock" "$W/held" &
+"$PY" -c 'import fcntl,os,sys,time; fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR); fcntl.flock(fd,2); open(sys.argv[2],"w").write("held"); time.sleep(120)' "$LOCK" "$W/held" &
 HOLDER=$!
 i=0; while [ ! -s "$W/held" ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
 [ -s "$W/held" ] || nope "lock holder never took the lock (test setup)"

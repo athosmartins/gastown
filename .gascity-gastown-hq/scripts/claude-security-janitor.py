@@ -67,7 +67,8 @@ CLAUDE_SECURITY_JANITOR_DIR (default /Users/athos/.claude/security), _TMPDIR (de
 _UNKNOWN_AFTER, _PYTHONS (space-separated names or paths, default
 "python3.13 python3.12 python3.11 python3.10 python3 python"), _MIN_PY ("3.10"), _PS_BIN (ps),
 _NOTIFY_BIN (~/.local/bin/notify), _PROBE_TIMEOUT_SECS (60), _STATE (alarm state, default
-<city>/.gc/runtime/claude-security-janitor.state.json), _ENABLED=0 (no-op), _DRY_RUN=1 or
+<city>/.gc/runtime/claude-security-janitor.state.json), _LOCK (single-instance lock, default
+<city>/.gc/runtime/claude-security-janitor.lock), _ENABLED=0 (no-op), _DRY_RUN=1 or
 --dry-run (report only: nothing deleted, nothing sent, no state written), _PROD=1 (see above).
 Test seams for the production sentinel: _REAL_DIR and _REAL_TMPDIR say which path counts as "the
 real one" (defaults: the constants above / getconf), so the selftest can declare a fixture real.
@@ -542,8 +543,10 @@ def main(argv):
     dry_all = "--dry-run" in argv or env("CLAUDE_SECURITY_JANITOR_DRY_RUN", "0") == "1"
     prod = env("CLAUDE_SECURITY_JANITOR_PROD", "0") == "1"
     city = env("GC_CITY_PATH", "/Users/athos/gt/.gascity-gastown-hq")
+    runtime = os.path.join(city, ".gc", "runtime")
+    lock_path = env("CLAUDE_SECURITY_JANITOR_LOCK", "") or os.path.join(runtime, "claude-security-janitor.lock")
     state_path = env("CLAUDE_SECURITY_JANITOR_STATE", "") or os.path.join(
-        city, ".gc", "runtime", "claude-security-janitor.state.json")
+        runtime, "claude-security-janitor.state.json")
 
     real_sec = env("CLAUDE_SECURITY_JANITOR_REAL_DIR", "") or REAL_SECURITY_DIR
     sec_dir = env("CLAUDE_SECURITY_JANITOR_DIR", "") or real_sec
@@ -557,9 +560,9 @@ def main(argv):
     sec_real_target = is_real_target(sec_dir, real_sec)
 
     try:
-        lock_fd, other = acquire_lock(state_path + ".lock")
+        lock_fd, other = acquire_lock(lock_path)
     except OSError as e:
-        log("cannot take the lock %s.lock: %s — nothing done" % (state_path, e))
+        log("cannot take the lock %s: %s — nothing done" % (lock_path, e))
         return 1
     if other:
         log("another run holds the lock: exiting")
