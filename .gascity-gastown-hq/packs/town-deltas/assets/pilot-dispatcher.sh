@@ -11773,6 +11773,55 @@ _pilot_node_first_shadow() {
   return 0
 }
 
+# ── ga-2hd02v.1.10: bead WA → nó Hetzner (wa-worker-remote). PADRÃO: DESLIGADO ─────────────────────────────
+# Regra do Athos (18/10): nenhum dado de lead/cliente no nó. Só vai ao nó a bead que scripts/wa-node-classify.py manda
+# para lá (código + teste sem banco real, nada que o filtro de dados do rsync segure); o resto segue no mini.
+# PILOT_WA_NODE_ROUTE = off|shadow|label|auto — qualquer outro valor (vazio, erro de digitação) é off.
+#   off     nada roda: a função volta antes de ler qualquer coisa; o despacho é o de sempre.
+#   shadow  classifica (wa-node-dispatch.sh check) e grava uma linha em $GC_CITY/.gc/wa-node-route.jsonl; NÃO muda o despacho.
+#   label   além da sombra, a bead que o classificador manda ao nó POR CAUSA da etiqueta humana node:ok vai ao nó (apply --basis label).
+#   auto    além disso, a que se prova só pelo texto da bead (apply --basis any).
+# Retorno 0 = a bead JÁ está atribuída ao wa-worker-remote (o chamador não faz o caminho do pool do mini); 1 = nada foi escrito,
+# a bead segue no mini; 2 = a escrita pode ter acontecido e não sei dizer (rc 13 do script, ou o prazo estourou no meio): o chamador
+# NÃO despacha esta varredura (carimbar wa-worker por cima de uma atribuição ao nó deixaria a bead nas duas filas) e tenta de novo na próxima.
+# Não cria sessão: o pool a cria (receita da ga-2hd02v.1.6); o slot do nó é 1.
+# vazio → n/a (o classificador sempre responde node/mini/unknown); falhou/ilegível antes de escrever (rc 10/11/12) → igual a mini: 1.
+# A leitura do slot e das sessões tem os três estados dentro do wa-node-dispatch.sh (ocupado ou "não sei" = não vai).
+_pilot_wa_node_decide() {
+  local _id="${1:-}" _store="${2:-}" _tgt="${3:-}" _mode="${PILOT_WA_NODE_ROUTE:-off}" _dir _out="" _rc=0 _basis=any
+  case "$_mode" in shadow|label|auto) ;; *) return 1 ;; esac
+  [ "$_tgt" = "wa-worker" ] || return 1
+  case "$_id" in wa-*) ;; *) return 1 ;; esac
+  _dir="${PILOT_WA_NODE_SCRIPTS:-$GC_CITY/scripts}"
+  if [ ! -x "$_dir/wa-node-dispatch.sh" ]; then
+    warn "wa-node: $_dir/wa-node-dispatch.sh não está executável — $_id segue no mini"
+    return 1
+  fi
+  [ "$_mode" = label ] && _basis=label
+  if [ "$_mode" = shadow ]; then
+    _out=$(timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" check "$_id" --store "$_store" 2>/dev/null) || _rc=$?
+  elif [ "${DRY_RUN:-0}" = "1" ]; then
+    _out=$(timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --store "$_store" --basis "$_basis" --dry-run 2>/dev/null) || _rc=$?
+  else
+    _out=$(timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --store "$_store" --basis "$_basis" 2>/dev/null) || _rc=$?
+  fi
+  mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
+  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_id" --arg m "$_mode" --argjson rc "$_rc" --arg o "$_out" \
+    '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,rc:$rc,out:$o}' >> "$GC_CITY/.gc/wa-node-route.jsonl" 2>/dev/null || true
+  [ "$_mode" = shadow ] && return 1
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    log "  ga-2hd02v.1.10: WOULD route $_id to the node (rc=$_rc, dry-run: nothing written)"
+    return 1
+  fi
+  case "$_rc" in
+    0) ;;
+    13|124|137|143) warn "wa-node: $_id — resultado da escrita desconhecido (rc=$_rc); não despacho esta varredura"; return 2 ;;
+    *) return 1 ;;
+  esac
+  log "  ga-2hd02v.1.10: $_id assigned to the node (wa-worker-remote); the pool creates the session"
+  return 0
+}
+
 # ── Dispatch helper ───────────────────────────────────────────────────────────
 # dispatch_one <story_json> <lane> <dispatch_tier>
 # Handles: claim, verify, builder routing, sling, bead transitions, logging, ntfy.
@@ -13580,6 +13629,20 @@ TASK
             return 1
           fi
         fi
+        # ── ga-2hd02v.1.10: Hetzner node, DEFAULT OFF (PILOT_WA_NODE_ROUTE, see _pilot_wa_node_decide) ──
+        # rc 0 = the bead is already assigned to wa-worker-remote-1 with gc.routed_to=wa-worker-remote: the spawn case below
+        # then has its own arm (no gc session new, no gc.routed_to=wa-worker). rc 1: nothing was written, the pool path runs.
+        # rc 2: the write may have landed and we can't tell — release our claim and stand down; the next sweep re-reads.
+        local _RP_NODE_RC=0
+        _pilot_wa_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_NODE_RC=$?
+        if [ "$_RP_NODE_RC" = 0 ]; then
+          _SLING_TARGET="wa-worker-remote"
+        elif [ "$_RP_NODE_RC" = 2 ]; then
+          bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+          bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+          DISPATCH_RESULT="wa_node_unknown"
+          return 1
+        fi
         : # pool: leave UNASSIGNED + open so RoutedPoolQuery finds it (claim happens worker-side)
         ;;
       *)
@@ -13696,6 +13759,12 @@ TASK
     # sessions with a running hook cycle. Set PILOT_SPAWN_WA_WORKER=0 to disable spawning
     # and revert to nudge-only (for debugging; bead stays unassigned+routed until manual start).
     case "$_SLING_TARGET" in
+      wa-worker-remote)
+        # ga-2hd02v.1.10: assigned and routed by wa-node-dispatch.sh. The POOL creates the session (the ga-2hd02v.1.6 recipe): a
+        # gc session new here would make two sessions and crew-session-dedup drops one. gc.routed_to is already wa-worker-remote;
+        # stamping wa-worker would send the bead to the mini's pool as well.
+        log "  ga-2hd02v.1.10: $STORY_ID → wa-worker-remote (node) — no spawn here, the pool creates the session"
+        ;;
       wa-worker*)
         # Set gc.routed_to so RoutedPoolQuery finds the unassigned bead AND the supervisor
         # scale_check counts it as pool demand (capped at max_active_sessions=4).
