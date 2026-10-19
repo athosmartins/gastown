@@ -229,6 +229,8 @@ chmod +x "$E2E/bin/gc"
 # $PATH would send that mail for real. Here "command not found" is the only outcome.
 . "$HERE/../selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/../selftest-sandbox-path.lib.sh" >&2; exit 2; }
 sandbox_path_init "$E2E" git jq || exit 2   # git: the archive repo; jq: row scrub; dolt is the stubbed dolt-target.sh, gc the stub above
+# ga-l6v576: a git that cannot read the archive's tree (STUB_GIT_BLIND=1: cat-file and ls-tree exit 128; every other call is the real git). "git could not say" must not read as "HEAD has no such file".
+printf '#!/bin/bash\ncase " $* " in *" cat-file "*|*" ls-tree "*) [ -n "${STUB_GIT_BLIND:-}" ] && { echo "fatal: unable to read tree (injected)" >&2; exit 128; } ;; esac\nexec %s "$@"\n' "$E2E/tools/git" > "$E2E/bin/git"; chmod +x "$E2E/bin/git"
 # ga-j2f5v5: the exporter now reads the free disk. The reading is PINNED here (100 GB) for every case that is not about the disk, so a host with a low disk (this one, often) does not skip the cases below;
 # the disk cases set E2E_DISK_MB / E2E_NOW per call. Exported, so the runs that do not go through run_export (default-archive case) get the same pin.
 export DISK_FREE_OVERRIDE_MB=102400
@@ -686,7 +688,7 @@ attempts_of() { grep -c "^READ $1 0 " "$E2E_READ_LOG" 2>/dev/null || true; }   #
 supp_env_reset() {
   local x
   unset STUB_READ_CAP STUB_PK GC_JSONL_SUPP_CHUNK_ROWS
-  for x in $SUPP_TABLES_ALL; do unset "STUB_ROWS_$x" "STUB_COUNT_$x" "STUB_LOSE_$x" "STUB_FLAKY_$x" "STUB_FAIL_$x" "STUB_GARBAGE_$x"; done
+  for x in $SUPP_TABLES_ALL; do unset "STUB_ROWS_$x" "STUB_COUNT_$x" "STUB_LOSE_$x" "STUB_FLAKY_$x" "STUB_FAIL_$x" "STUB_GARBAGE_$x"; done; unset STUB_GIT_BLIND
 }
 supp_env_reset
 
@@ -822,6 +824,26 @@ for garbage in doc empty; do
   esac
   supp_env_reset
 done
+
+# Case 5c — git cannot say whether the previous version of a short table exists (cat-file / ls-tree fail). The table must NOT be dropped from the snapshot on that guess: the DB is
+# discarded this run (nothing committed, HEAD keeps all 600 comments) and reported failed.
+fresh_archive supp-gitblind
+export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+GB_COMMITS=$(git -C "$ARCH" rev-list --count HEAD)
+export STUB_ROWS_comments=700 STUB_LOSE_comments=50 STUB_GIT_BLIND=1
+run_export 201 201
+[ "$(supp_head_rows comments)" = "600" ] \
+  && ok "git cannot read the tree: HEAD still holds the 600-row comments (the table was not dropped from the snapshot)" \
+  || bad "git cannot read the tree: HEAD holds $(supp_head_rows comments) comment rows, want 600 — a failed git read was taken for 'no previous version'"
+[ "$(git -C "$ARCH" rev-list --count HEAD)" = "$GB_COMMITS" ] \
+  && ok "git cannot read the tree: no commit was made for the DB" \
+  || bad "git cannot read the tree: a commit was made ($(git -C "$ARCH" rev-list --count HEAD) vs $GB_COMMITS)"
+case "$OUT" in
+  *"failed: wa"*) ok "git cannot read the tree: the run summary lists 'failed: wa'" ;;
+  *) bad "git cannot read the tree: the run summary does not name wa. Output: $OUT" ;;
+esac
+supp_env_reset
 
 # Case 6 — the THIRD state: the table's COUNT(*) is unreadable, so nobody can say whether the export is whole. Not discarded (a store whose count query is down must not freeze its archive),
 # never silent: named in the log, the summary, the nudge and the commit message — the same four places as the unverified issues export.

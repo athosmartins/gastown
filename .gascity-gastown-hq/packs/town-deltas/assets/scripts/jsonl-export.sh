@@ -1339,11 +1339,25 @@ read_table_pages() {
     return 0
 }
 
-# Puts the previous version of <db>/<table>.jsonl back in the working tree; a table with no previous version ends up with no file. Return 1 only when git cannot restore it.
+# Puts the previous version of <db>/<table>.jsonl back in the working tree; a table with no previous version ends up with no file. Return 1 when git cannot restore it, or cannot
+# say whether HEAD has one: the DB is staged as a whole, so deleting the file on a guess would commit the table's removal from the snapshot.
 keep_previous_table() {
-    local db="$1" table="$2" path="$1/$2.jsonl"
+    local db="$1" table="$2" path="$1/$2.jsonl" listed refs
 
-    if git -C "$ARCHIVE_REPO" cat-file -e "HEAD:$path" 2>/dev/null; then
+    # HEAD not born: the archive's first run, no ref at all, so there is no previous version to keep. A HEAD that does not resolve while refs exist is a broken repo, not a first run.
+    if ! git -C "$ARCHIVE_REPO" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+        # vazio → no refs, a first run; falhou/com refs → git cannot say, the tree is left alone and the caller discards the DB
+        if refs=$(git -C "$ARCHIVE_REPO" for-each-ref --count=1 2>/dev/null) && [ -z "$refs" ]; then
+            rm -f "$ARCHIVE_REPO/$path"
+            return 0
+        fi
+        return 1
+    fi
+    # vazio → HEAD has no such file (a table new to this DB); falhou → git cannot say, the tree is left alone and the caller discards the DB
+    if ! listed=$(git -C "$ARCHIVE_REPO" ls-tree --name-only HEAD -- "$path" 2>/dev/null); then
+        return 1
+    fi
+    if [ -n "$listed" ]; then
         git -C "$ARCHIVE_REPO" restore --source=HEAD --worktree -- "$path" >/dev/null 2>&1
     else
         rm -f "$ARCHIVE_REPO/$path"

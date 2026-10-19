@@ -310,8 +310,9 @@ ART="$(s3key_artifact "$STEM")"
 # comparador que travasse o upload pararia o RPO de 1 h por causa de uma checagem secundária (a primária é o gate de contagem do jsonl-export.sh).
 BASE_WHY=""
 s3_head "$(s3key_latest)" >/dev/null 2>&1; lrc=$?
-if [ $lrc -eq 2 ]; then BASE_WHY="S3 não respondeu ao head-object de latest.json"
-elif [ $lrc -eq 0 ]; then
+if [ $lrc -eq 1 ]; then :   # latest.json não existe: 1º run, régua none (s3_head: 0 existe, 1 não existe, 2 não deu para saber)
+elif [ $lrc -ne 0 ]; then BASE_WHY="S3 não respondeu ao head-object de latest.json (rc $lrc)"
+else
   if ! s3api get-object --bucket "$BUCKET" --key "$(s3key_latest)" "$WD/prev.latest.json" >/dev/null 2>&1; then BASE_WHY="latest.json existe e o S3 não o devolveu"
   else
     PREV_MKEY="$(jq -r '.manifest_key // empty' "$WD/prev.latest.json" 2>/dev/null)"
@@ -322,7 +323,7 @@ elif [ $lrc -eq 0 ]; then
 fi
 BASE_FLAG=""; BASE_VAL=""
 if [ -n "$BASE_WHY" ]; then BASE_FLAG=--baseline-unavailable; BASE_VAL="$BASE_WHY"; log "AVISO: sem régua: $BASE_WHY; a queda brusca de tabela NÃO foi checada neste snapshot"
-elif [ -s "$WD/prev.manifest.json" ]; then BASE_FLAG=--previous; BASE_VAL="$WD/prev.manifest.json"
+elif [ $lrc -eq 0 ]; then BASE_FLAG=--previous; BASE_VAL="$WD/prev.manifest.json"   # o S3 o devolveu: vazio ou ilegível o python diz `unavailable`, nunca `none`
 fi
 ACCEPT_FLAG=""; [ "${JHO_ACCEPT_DROP:-0}" = 1 ] && { ACCEPT_FLAG=--accept-drop; log "JHO_ACCEPT_DROP=1: queda brusca aceita por quem opera, só neste run"; }
 python3 -I "$PY" manifest --inspect "$WD/inspect.json" --built "$WD/files.json" --captured-epoch "$(now_epoch)" --head-epoch "$HEAD_EPOCH" \

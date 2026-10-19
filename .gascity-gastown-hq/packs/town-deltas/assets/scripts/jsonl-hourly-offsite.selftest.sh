@@ -310,6 +310,12 @@ write_comments hq 430; commit_all "430"
 NOW_OFF=2100; offsite
 eq "com latest.json de novo inteiro (o run anterior o republicou): a régua volta, baseline compared" "$RC:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:compared"
 
+write_comments hq 440; commit_all "440"
+python3 -I -c 'import sys;open(sys.argv[1],"w").close()' "$S/bucket/obj/$(jqf .manifest_key "$(LATEST)")"   # o S3 devolve o manifest anterior com 0 bytes
+NOW_OFF=2800; offsite
+eq "manifest anterior que o S3 devolve vazio: baseline unavailable (não 'none'), e o snapshot sobe" "$RC:${OUT%% key=*}:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:RESULT: ok new:unavailable"
+case "$(jqf .baseline.why "$(MANOF "$(ARTKEY)")")" in *ilegível*) ok "e o manifest guarda o motivo (manifest anterior ilegível)" ;; *) bad "manifest sem o motivo da régua: $(jqf .baseline.why "$(MANOF "$(ARTKEY)")")" ;; esac
+
 echo "-- 7. banco obrigatório ausente"; new_env nodb; REQ="hq,wa,fantasma"
 NOW_OFF=0; offsite
 eq "rc 1, latest.json não criado, nada subiu: bucket vazio, nenhum put" "$RC:$([ -e "$(LATEST)" ] && echo has || echo none):$(objs | wc -l | tr -d ' '):$(putlog | wc -l | tr -d ' ')" "1:none:0:0"
