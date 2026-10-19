@@ -5,16 +5,23 @@ Contents
   O que é · O que faz, em ordem · O que não faz · Códigos de saída · Modo de ensaio
 
 O QUE É
-  É o `gate_done_bin` do remote-shim-wrapper.py: o wrapper o executa quando a sessão remota roda `gate-done` (a regra da lista é a forma exata,
-  sem argumento), com a cidade como cwd e o ambiente montado do zero (BEADS_ACTOR = alias, mais a identidade que o servidor declarou e que casou
-  com o identity_pattern). Antes dele o wrapper recusava (rc 77, "gate_done_bin ausente") e o Mayor submetia à mão.
+  É o `gate_done_bin` do remote-shim-wrapper.py: o wrapper o executa quando a sessão remota roda `gate-done` (duas regras da lista, formas EXATAS: sem
+  argumento, e `gate-done <bead> <ref> <sha>`), com a cidade como cwd e o ambiente montado do zero (BEADS_ACTOR = alias, mais a identidade que o servidor
+  declarou e que casou com o identity_pattern). Antes dele o wrapper recusava (rc 77, "gate_done_bin ausente") e o Mayor submetia à mão.
+  A forma com argumentos (ga-2hd02v.1.18) existe porque `worker/<sessão>` fica preso na 1ª entrega da sessão (o gate reescreve o branch e o push seguinte é
+  não-fast-forward): a 2ª bead da sessão, e o conserto depois de uma reprovação, saem do ref que o dog diz, com o sha conferido.
 
 O QUE FAZ, EM ORDEM (passo que não consegue saber algo para sem escrever nada: "não sei" nunca vira "pode")
   1. Quem pede: alias = BEADS_ACTOR, sessão = GC_SESSION_NAME. Os dois precisam ter o formato esperado.
-  2. A bead: a ÚNICA bead in_progress atribuída ao alias na cidade. Nenhuma, ou mais de uma → recusa (nunca adivinha qual submeter).
-  3. O trabalho: a ponta de `worker/<sessão>` no espelho (<cidade>/.gc/hetzner-mirror/repos/gascity.git), onde o `git push` do servidor chegou.
+  2. A bead. Sem argumento: a ÚNICA bead in_progress atribuída ao alias na cidade; nenhuma, ou mais de uma → recusa (nunca adivinha qual submeter).
+     Com argumentos, a que o dog NOMEOU: (A) in_progress com assignee = alias, ou (B) a VOLTA DO GATE: sem assignee, `gate:needs-fix`, gc.routed_to = dog-remote
+     e a última entrega (o marcador MAIS NOVO com source-bead:<bead>, de qualquer status) é deste alias, por gate.submitted_by OU pela linha `author:` do marcador
+     (sem assignee o gate-done.md congela o CRIADOR em submitted_by; só o author guarda o alias). Sem marcador, leitura que falha ou ilegível → recusa.
+  3. O trabalho: a ponta de `worker/<sessão>` no espelho (<cidade>/.gc/hetzner-mirror/repos/gascity.git), onde o `git push` do servidor chegou. Com argumentos: a do
+     <ref> (check_ref: `worker/<sessão>` ou `worker/<sessão>-N`, casamento EXATO com GC_SESSION_NAME, ou `fix/<bead>[-<resumo>]` com o id da bead pedida; o `-N` é
+     recusado para sessão sem cauda, onde `<sessão>-N` pode ser OUTRA sessão), que tem de ser IGUAL ao <sha> (40 hex) que o dog diz, conferido ANTES do marcador.
      O nome `worker/<sessão>` não leva o id da bead e o gate extrai o id do nome do branch; por isso a submissão sai de um branch
-     `fix/<bead>-<resumo>` no MESMO sha, criado num worktree descartável do mini (sem checkout: o gate-done só lê objetos).
+     `fix/<bead>-<resumo>` no MESMO sha (o do próprio ref quando ele já é fix/…), criado num worktree descartável do mini (sem checkout: o gate-done só lê objetos).
   4. A submissão É o /gate-done: os blocos bash dos passos 1 a 4 de commands/gate-done.md são lidos DAQUI, a cada execução, e rodados juntos no worktree
      (push do branch, bead e rig, marcador, gate:queued, gate.submitted_by). Não há cópia deles neste arquivo: mudar o gate-done.md muda isto também.
      Se o arquivo mudar de forma (não achar exatamente um bloco bash por passo), nada é empurrado.
@@ -24,8 +31,10 @@ O QUE FAZ, EM ORDEM (passo que não consegue saber algo para sem escrever nada: 
   6. Recolhe o que esta execução criou (worktree, branch local, ref temporária) e imprime o sha submetido. Nenhum git daqui dispara gc/manutenção.
 
 O QUE NÃO FAZ
-  Não vê o HEAD do servidor: submete o que o ESPELHO tem em worker/<sessão> e imprime esse sha. Quem rodou o `gate-done` compara com `git rev-parse HEAD`
-  (se diferir, o `git push origin HEAD` não chegou ou veio depois: empurre e rode de novo; o gate junta marcadores do mesmo branch).
+  Não vê o HEAD do servidor: sem argumento submete o que o ESPELHO tem em worker/<sessão> e imprime esse sha, e quem rodou o `gate-done` compara com
+  `git rev-parse HEAD` (se diferir, o `git push origin HEAD` não chegou ou veio depois: empurre e rode de novo; o gate junta marcadores do mesmo branch). Com
+  argumentos o dog passa o sha e a divergência é recusada antes do marcador. Em nenhuma forma ele confere se o ref empurrado é filho do que o origin já tem:
+  isso é do passo 1 do gate-done.md (nunca força).
   Não roda a checagem "NEW READS NEED A FAILURE TEST" nem a auto-auditoria do diff (são do construtor, antes do push): o marcador registra
   `self_audit: … auto-auditoria do diff NÃO verificada aqui`, visível, não calado.
   Só o rig `gascity` (o único com worktree no servidor hoje); bead de outro rig não é suportada. Não força push: um branch fix/<bead>-… que já está no
