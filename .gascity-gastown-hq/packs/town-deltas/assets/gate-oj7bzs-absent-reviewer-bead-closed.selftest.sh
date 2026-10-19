@@ -219,10 +219,13 @@ echo "── 5. wait: absent + closed bead, but a same-name OPEN bead exists (re
 SESS_JSON="$SESS_ABSENT" CLOSED_OUT="$CLOSED_BEAD" OPEN_OUT="$OPEN_BEAD" run_decision "$NAME"
 if grep -q "^finalize_called:" "$WORK/dec.log"; then bad "requeued although a live incarnation of the name exists: $(tr '\n' ';' < "$WORK/dec.log")"; else ok "left in flight"; fi
 
-echo "── 6. two slots: one absent+closed, the other alive -> wait (ALL pending must be dead) ──"
+echo "── 6. two PRIMARY slots: one absent+closed, the other alive -> requeue NOW (ga-peb71d: the dead primary dooms the run) ──"
+# Until ga-peb71d this case waited ("ALL pending must be dead"). The Mayor's 02/10 decision reversed it: a confirmed-closed primary never
+# delivers, so the run can never reach REQUIRED_REVIEWERS and waiting for the sibling only delays the same re-queue. The stub's `bd show`
+# answers no labels, so both slots are primaries here; the E5-extra mirror images are in gate-peb71d-phase-c-primary-dead.selftest.sh.
 SESS_MIX='{"sessions":[{"session_name":"live-one","closed":false}]}'
 SESS_JSON="$SESS_MIX" CLOSED_OUT="$CLOSED_BEAD" OPEN_OUT='[]' run_decision "$NAME live-one"
-if grep -q "^finalize_called:" "$WORK/dec.log"; then bad "requeued with one reviewer still alive: $(tr '\n' ';' < "$WORK/dec.log")"; else ok "left in flight"; fi
+grep -q "^finalize_called:QUOTA_REQUEUE=1:REQUEUE_REASON=dead-reviewer" "$WORK/dec.log" && ok "re-queued on the first sweep although the other primary is alive" || bad "a confirmed-closed primary did not re-queue the run: $(tr '\n' ';' < "$WORK/dec.log")"
 
 echo "── 7. two slots, both dead (one absent+closed bead, one present closed=true) -> requeue ──"
 SESS_BOTH='{"sessions":[{"session_name":"gone-closed","closed":true}]}'

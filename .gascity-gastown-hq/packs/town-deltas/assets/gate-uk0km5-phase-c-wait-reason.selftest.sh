@@ -6,9 +6,12 @@
 #      metadata.gc.session_name still names a reviewer that is ABSENT from the
 #      roster with a CLOSED session bead is classified dead on the FIRST sweep
 #      (capture -> predicate, the two blocks run together, verbatim);
-#   2. a run whose OTHER slot's reviewer is listed in the roster -- here a
+#   2. a run whose live slot is a reviewer listed in the roster -- here a
 #      session the engine RE-CREATED under the same name -- keeps waiting, and
-#      says WHICH slot and WHICH reviewer holds it (it used to wait in silence);
+#      says WHICH slot and WHICH reviewer holds it (it used to wait in silence).
+#      Since ga-peb71d the slot that can hold the run is a PRIMARY (case 2b);
+#      the incident's own shape, a dead primary beside a live E5 extra, is
+#      re-queued at once (case 2);
 #   3. every other "keep waiting" path of gate_phase_c_all_pending_closed names
 #      its cause too: roster unreadable, verdict bead unreadable, capture
 #      unreadable (__UNKNOWN__), reviewer not nameable at all, session bead
@@ -30,8 +33,9 @@
 # capture falls back to nothing but .assignee -- see the mutation check in the
 # commit message); cases 2-3 are what this bead adds.
 #
-# Behavior is unchanged: every case that waited still waits, every case that
-# re-queued still re-queues. Only the log gains the reason.
+# ga-uk0km5 itself changed no decision, only the log. ga-peb71d later changed
+# one: a confirmed-closed PRIMARY re-queues the run whatever its sibling slot
+# does, so case 2 (the incident) now re-queues and case 2b is its mirror image.
 #
 # Strategy (this repo's SELFTEST-EXTRACT convention): extract the live blocks,
 # run them verbatim under the host's /bin/bash (3.2) with `set -euo pipefail`,
@@ -170,14 +174,25 @@ has_line "REACHED_END" && ok "block ran to the end" || bad "block aborted: $(dum
 has_line "^SESSION_IDS=$N1\$" && ok "capture fell back from the empty assignee to metadata.gc.session_name ($N1)" || bad "capture did not name the reviewer: $(dump)"
 requeued && ok "re-queued as dead-reviewer on the first sweep (elapsed 2616s << 3000s)" || bad "NOT re-queued: the dead reviewer was not classified: $(dump)"
 
-echo "── 2. THE INCIDENT: slot 1 dead + slot 2's name re-created and alive -> wait, and say which slot holds the run ──"
+echo "── 2. THE INCIDENT: slot 1 (primary) dead + slot 2 (E5 extra) re-created under its name and alive -> RE-QUEUE on the first sweep (ga-peb71d) ──"
+# Until ga-peb71d this shape waited the whole 3000 s for the live extra, and ga-uk0km5 only made that wait explainable. A confirmed-closed
+# PRIMARY never delivers, so the run can never reach its verdicts; the extra's fate (the E5 hook retires it) is not this check's business.
 VBS_JSON="[$VB1,$VB2]" VB_SHOW_1="$VB1" VB_SHOW_2="$VB2" SESS_JSON="$ROSTER_BOTH_ALIVE_N2" CLOSED_OUT="$CLOSED_BEAD1" OPEN_OUT="$OPEN_BEAD2" run_case
 has_line "REACHED_END" && ok "block ran to the end" || bad "block aborted: $(dump)"
 has_line "^SESSION_IDS=$N1 $N2\$" && ok "capture named both reviewers from metadata ($N1 $N2)" || bad "capture wrong: $(dump)"
-finalized && bad "finalized a run with a live reviewer in the roster: $(dump)" || ok "left in flight (the live reviewer is not confirmed dead)"
-has_line "^log:.*ga-5jn3qy's reviewer $N2 is in 'gc session list' with state 'active'.*ga-uk0km5" && ok "the wait names the holding slot (ga-5jn3qy), its reviewer ($N2) and the roster state ('active')" || bad "no reason naming the slot that holds the run: $(dump)"
-has_line "ga-e7yxde.*ga-uk0km5" && bad "slot 1 (classified dead) was blamed for the wait: $(dump)" || ok "slot 1, already classified dead, is not blamed"
+requeued && ok "re-queued as dead-reviewer on the first sweep (elapsed 2616s << 3000s) although slot 2's name is alive in the roster" || bad "the dead primary did not re-queue the run: $(dump)"
+has_line "^warn:.*PRIMARY verdict bead ga-e7yxde's reviewer $N1 is absent from 'gc session list' and its session bead is closed.*ga-peb71d" && ok "the warn names the dead PRIMARY slot (ga-e7yxde), its reviewer ($N1) and why it counts as dead" || bad "no reason naming the dead primary: $(dump)"
 has_line "^bdquery:.*status=closed" && ok "the absent slot 1 was looked up through its session bead (ga-oj7bzs)" || bad "no session-bead lookup for the absent reviewer: $(dump)"
+
+echo "── 2b. the MIRROR of the incident: slot 1 (primary) alive under a re-created name, slot 2 (E5 extra) dead -> wait, and say which slot holds the run ──"
+# A dead extra never re-queues the run (the E5 hook retires it), so what holds the run is the live PRIMARY; the wait still names its slot,
+# its reviewer and the roster state, the way ga-uk0km5 made it do for the extra before ga-peb71d.
+ROSTER_N1_ALIVE='{"sessions":[{"session_name":"'"$N1"'","id":"ga-99c4i4","state":"active","closed":false},{"session_name":"unrelated","closed":false}]}'
+VBS_JSON="[$VB1,$VB2]" VB_SHOW_1="$VB1" VB_SHOW_2="$VB2" SESS_JSON="$ROSTER_N1_ALIVE" CLOSED_OUT="$CLOSED_BEAD2" OPEN_OUT='[]' run_case
+has_line "REACHED_END" && ok "block ran to the end" || bad "block aborted: $(dump)"
+finalized && bad "finalized a run whose primary is alive in the roster (a dead extra must never re-queue it): $(dump)" || ok "left in flight (the dead extra only waits to be retired)"
+has_line "^log:.*ga-e7yxde's reviewer $N1 is in 'gc session list' with state 'active'.*ga-uk0km5" && ok "the wait names the holding slot (ga-e7yxde), its reviewer ($N1) and the roster state ('active')" || bad "no reason naming the slot that holds the run: $(dump)"
+has_line "ga-5jn3qy.*ga-uk0km5" && bad "the dead extra (ga-5jn3qy) was blamed for the wait: $(dump)" || ok "the dead extra is not blamed"
 
 echo "── 3. reviewer not nameable: assignee AND metadata.gc.session_name empty (bead read fine) -> wait, and say it is not 'unreadable' ──"
 VBS_JSON="[$VB1_EMPTY]" VB_SHOW_1="$VB1_EMPTY" VB_SHOW_2="$VB2" SESS_JSON="$ROSTER_NEITHER" CLOSED_OUT="$CLOSED_BEAD1" OPEN_OUT='[]' run_case
