@@ -128,6 +128,19 @@ fi
 unset _REA_LIB
 # SELFTEST-EXTRACT rea-lib-load: END
 
+# ga-2hd02v.1.9: revisor do gate no nó Hetzner (gate-reviewer-remote), nó primeiro e local só se o nó não puder. Mesmo idioma das libs
+# acima: lib ausente ou que não carrega = GATE_REMOTE_LIB_OK=0 = todo revisor abre local, exatamente como antes. A lib só define
+# funções (nenhum comando de topo que possa falhar sob `set -e`). A ESCOLHA fica atrás da flag $GC_CITY/.gc/gate-remote-reviewers.on:
+# sem o arquivo nada muda, mesmo com a lib carregada (ver gate-remote-reviewers.lib.sh e docs/runbooks/gate-reviewer-remote.md).
+# SELFTEST-EXTRACT remote-lib-load: BEGIN
+GATE_REMOTE_LIB_OK=0
+_GATE_REMOTE_LIB="${GC_CITY}/packs/town-deltas/assets/gate-remote-reviewers.lib.sh"
+if [ -r "$_GATE_REMOTE_LIB" ]; then
+  { source "$_GATE_REMOTE_LIB" 2>/dev/null && GATE_REMOTE_LIB_OK=1; } || true
+fi
+unset _GATE_REMOTE_LIB
+# SELFTEST-EXTRACT remote-lib-load: END
+
 # ga-0bjqix: canonical Dolt-server PID resolution (dolt.pid + basename+LISTEN
 # verification, never a bare process-table sort) for the ambient-CPU headroom
 # check below. Same source-fail-soft convention as the sibling libs above —
@@ -484,12 +497,20 @@ gate_review_nudge_message() {
 # REVIEWER_NUDGE_SENT só vira 1 numa aceitação — "enviei" e "tentei enviar" não são o mesmo estado.
 GATE_LAST_NUDGE_CHARS=0
 gate_deliver_review_task() {
-  local _slot="${1:-0}" _sid="${2:-}" _task="${3:-}" _idx="${4:-?}" _vb="${5:-}" _mode="${6:-send}" _msg
+  local _slot="${1:-0}" _sid="${2:-}" _task="${3:-}" _idx="${4:-?}" _vb="${5:-}" _mode="${6:-send}" _msg _ptr
   if [ "$_mode" = "retry" ] && [ "${REVIEWER_NUDGE_SENT[$_slot]:-0}" = "1" ]; then
     return 10
   fi
+  _ptr="${REVIEWER_POINTER_OK[$_slot]:-0}"
+  # ga-2hd02v.1.9: o revisor do nó NÃO lê o comentário embutido (o atalho do nó omite o corpo de comentário: `bd show --json` traz
+  # `comments_omitted` e `bd comments`/`--include-comments` voltam rc 77), então um ponteiro o deixaria sem tarefa. Slot remoto leva
+  # sempre a tarefa inteira no nudge. Vazio (slot que ninguém preencheu) → local, o comportamento de antes; o template do slot
+  # só vira "remoto" depois de o spawn no nó ter DADO sessão.
+  if [ "$_ptr" = "1" ] && [ "${REVIEWER_TEMPLATE[$_slot]:-}" = "${GATE_REMOTE_TEMPLATE:-gate-reviewer-remote}" ]; then
+    _ptr=0
+  fi
   # vazio → n/a (a função devolve sempre texto); falhou → a tarefa inteira, nunca uma mensagem vazia
-  _msg=$(gate_review_nudge_message "${REVIEWER_POINTER_OK[$_slot]:-0}" "$_task" "$_idx" "${REQUIRED_REVIEWERS:-?}" "${BRANCH:-}" "${BRANCH_SHA:-}" "$_vb") \
+  _msg=$(gate_review_nudge_message "$_ptr" "$_task" "$_idx" "${REQUIRED_REVIEWERS:-?}" "${BRANCH:-}" "${BRANCH_SHA:-}" "$_vb") \
     || _msg="$_task"
   GATE_LAST_NUDGE_CHARS=${#_msg}
   if gate_nudge "$_sid" "$_msg" --delivery queue 2>/dev/null; then
@@ -1242,19 +1263,52 @@ respawn_reviewer_slot() {
   local _idx="$1"
   local _rev=$(( _idx + 1 ))
   local _err_file="/tmp/gate-reviewer-respawn-err-$$.${_idx}"
-  local _json _new_sid _rs_rc _rs_emb_rc
-  _json=$(gate_bounded_spawn gc --city "$GC_CITY" session new gate-reviewer \
-    --no-attach \
-    --title "gate-reviewer-${_rev} (re-convened): $BRANCH" \
-    --json \
-    2>"$_err_file" || echo "{}")
-  rm -f "$_err_file" 2>/dev/null || true
-  _new_sid=$(echo "$_json" | jq -r '.session_id // empty' 2>/dev/null || echo "")
+  local _json="{}" _new_sid="" _rs_rc _rs_emb_rc _rs_tpl="gate-reviewer"
+  # ga-2hd02v.1.9: a slot whose reviewer ran on the node and died is replaced LOCALLY, never on the node again: whatever killed
+  # it (node down, node session lost, stuck boot) is the likeliest reason the verdict is late, and the local path is the one that
+  # always worked. A slot that was local is offered to the node like a fresh spawn (flag + room). One attempt on the node; any
+  # failure falls through to the local spawn below, which is the unchanged path.
+  if [ "${GATE_REMOTE_LIB_OK:-0}" = "1" ]; then
+    if [ "${REVIEWER_TEMPLATE[$_idx]:-}" = "${GATE_REMOTE_TEMPLATE:-gate-reviewer-remote}" ]; then
+      log "  Re-convene: slot ${_idx} ran on the node and died - replacement goes to the local reviewer (ga-2hd02v.1.9)."
+    else
+      gate_remote_pick_template || true
+      if [ "${GATE_REMOTE_PICK_KIND:-}" = "node" ]; then
+        log "  Re-convene: slot ${_idx}: ${GATE_REMOTE_PICK_WHY}"
+        _json=$(gate_bounded_spawn gc --city "$GC_CITY" session new "$GATE_REMOTE_TEMPLATE" \
+          --no-attach \
+          --title "gate-reviewer-${_rev} (re-convened): $BRANCH" \
+          --json \
+          2>"$_err_file" || echo "{}")
+        rm -f "$_err_file" 2>/dev/null || true
+        _new_sid=$(echo "$_json" | jq -r '.session_id // empty' 2>/dev/null || echo "")
+        if [ -n "$_new_sid" ]; then
+          _rs_tpl="$GATE_REMOTE_TEMPLATE"
+        else
+          warn "  Re-convene: node spawn for slot ${_idx} gave no session - falling back to the local reviewer (ga-2hd02v.1.9)."
+          _json="{}"
+        fi
+      elif [ "${GATE_REMOTE_PICK_KIND:-}" = "fallback" ]; then
+        log "  Re-convene: slot ${_idx}: ${GATE_REMOTE_PICK_WHY}"
+      fi
+    fi
+  fi
+  if [ -z "$_new_sid" ]; then
+    _json=$(gate_bounded_spawn gc --city "$GC_CITY" session new gate-reviewer \
+      --no-attach \
+      --title "gate-reviewer-${_rev} (re-convened): $BRANCH" \
+      --json \
+      2>"$_err_file" || echo "{}")
+    rm -f "$_err_file" 2>/dev/null || true
+    _new_sid=$(echo "$_json" | jq -r '.session_id // empty' 2>/dev/null || echo "")
+  fi
   if [ -z "$_new_sid" ]; then
     warn "  Re-convene: failed to spawn replacement reviewer for slot ${_idx} — slot stays dead; outer timeout is the backstop."
     return 1
   fi
   SESSION_IDS[$_idx]="$_new_sid"
+  # ga-2hd02v.1.9: record WHICH template this slot's current session is (only the node's value is ever read back).
+  REVIEWER_TEMPLATE[$_idx]="$_rs_tpl"
   # ga-g3m45n: a NEW session has had no nudge yet, and its pointer eligibility is decided below from THIS
   # re-assignment — nothing carries over from the dead session. (A stale NUDGE_SENT=1 would not stop the
   # `send` below, but it WOULD make a later ACK retry believe this session already holds a copy.)
@@ -19003,6 +19057,15 @@ REVIEWER_ACKED=()
 REVIEWER_TASK_EMBEDDED=()
 REVIEWER_POINTER_OK=()
 REVIEWER_NUDGE_SENT=()
+# ga-2hd02v.1.9: REVIEWER_TEMPLATE[k] = o template da sessão ATUAL do slot k, escrito SÓ quando o spawn no nó deu sessão
+# (gate-reviewer-remote). Slot que ninguém preencheu lê vazio = local, igual a antes. Quem lê: gate_deliver_review_task (slot
+# remoto leva a tarefa inteira no nudge, nunca ponteiro) e respawn_reviewer_slot (um revisor do nó que morreu é trocado por um local).
+REVIEWER_TEMPLATE=()
+# ga-2hd02v.1.9: the flag is ON and the lib that acts on it did not load: every reviewer opens LOCAL (nothing is decided from the
+# flag here), and nothing else in the log would say the node is not being used. Say it once per run (same shape as the E5 warning).
+if [ "${GATE_REMOTE_LIB_OK:-0}" != "1" ] && [ -r "${GATE_REMOTE_FLAG_FILE:-${GC_CITY:-}/.gc/gate-remote-reviewers.on}" ]; then
+  warn "Remote reviewers: the flag file exists but gate-remote-reviewers.lib.sh is NOT loaded - every reviewer of run ${GATE_RUN_ID:-?} opens LOCAL; the node is not being used although the flag is on (ga-2hd02v.1.9)."
+fi
 
 # ── ga-zl277: guaranteed reviewer-session cleanup on EVERY exit path ───────────
 # cleanup_reviewer_sessions() itself is now hoisted (before Phase C, ga-eqjo) so
@@ -19092,16 +19155,53 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
   # Stderr is captured to a temp file (not swallowed) so failures are visible.
   # NOTE: this loop runs at top-level script scope (not a function), so we do
   # NOT use `local` here — `local` outside a function errors to stderr.
-  _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}"
-  SESSION_JSON=$(gate_bounded_spawn gc --city "$GC_CITY" session new gate-reviewer \
-    --no-attach \
-    --title "gate-reviewer-$i: $BRANCH" \
-    --json \
-    2>"$_spawn_err_file" || echo "{}")
-  _spawn_err=$(capture_spawn_err_tail "$_spawn_err_file")
-  rm -f "$_spawn_err_file"
+# SELFTEST-EXTRACT reviewer-spawn-node-first: BEGIN
+  SESSION_JSON="{}"
+  SESSION_ID=""
+  _spawn_err=""
+  # ── ga-2hd02v.1.9: node first. With the flag $GC_CITY/.gc/gate-remote-reviewers.on present and the node reporting room, this
+  # reviewer is opened from gate-reviewer-remote (a session whose name carries -remote-, so the hybrid provider starts it on the
+  # Hetzner node). ONE attempt: any failure (node full by a race, host down, start refused, timeout) falls through to the local
+  # spawn below, unchanged, with its transient-retry loop. A node spawn that TIMED OUT has an unknown outcome - the session may
+  # exist - and the local spawn still follows: the cost of that doubt is one idle node session that ends by idle_timeout (10m)
+  # and holds a node slot until then, never a second reviewer for this slot (the slot only ever knows the session id returned by
+  # the spawn that succeeded). Flag off or lib absent: this block does nothing and the run is byte-for-byte what it was.
+  if [ "${GATE_REMOTE_LIB_OK:-0}" = "1" ]; then
+    gate_remote_pick_template || true
+    if [ "${GATE_REMOTE_PICK_KIND:-}" = "node" ]; then
+      log "  Reviewer $i: ${GATE_REMOTE_PICK_WHY}"
+      _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}.node"
+      SESSION_JSON=$(gate_bounded_spawn gc --city "$GC_CITY" session new "$GATE_REMOTE_TEMPLATE" \
+        --no-attach \
+        --title "gate-reviewer-$i: $BRANCH" \
+        --json \
+        2>"$_spawn_err_file" || echo "{}")
+      _spawn_err=$(capture_spawn_err_tail "$_spawn_err_file")
+      rm -f "$_spawn_err_file"
+      SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty' 2>/dev/null || echo "")
+      if [ -n "$SESSION_ID" ]; then
+        REVIEWER_TEMPLATE[$((i - 1))]="$GATE_REMOTE_TEMPLATE"
+      else
+        warn "  Reviewer $i: node spawn gave no session (spawn_err=${_spawn_err:-none}) - falling back to the local reviewer (ga-2hd02v.1.9)."
+        SESSION_JSON="{}"
+      fi
+    elif [ "${GATE_REMOTE_PICK_KIND:-}" = "fallback" ]; then
+      log "  Reviewer $i: ${GATE_REMOTE_PICK_WHY}"
+    fi
+  fi
+  if [ -z "$SESSION_ID" ]; then
+    _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}"
+    SESSION_JSON=$(gate_bounded_spawn gc --city "$GC_CITY" session new gate-reviewer \
+      --no-attach \
+      --title "gate-reviewer-$i: $BRANCH" \
+      --json \
+      2>"$_spawn_err_file" || echo "{}")
+    _spawn_err=$(capture_spawn_err_tail "$_spawn_err_file")
+    rm -f "$_spawn_err_file"
 
-  SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty')
+    SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.session_id // empty')
+  fi
+# SELFTEST-EXTRACT reviewer-spawn-node-first: END
 
   # ── ga-2u38b: short in-process retry BEFORE giving up on the run. The
   # rebase/push/stale-base-check/sizing/verdict-bead work above is already

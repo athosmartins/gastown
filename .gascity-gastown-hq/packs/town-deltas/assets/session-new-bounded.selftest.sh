@@ -206,7 +206,8 @@ wrapped() { grep -cE 'gate_bounded_spawn[[:space:]]+gc[[:space:]]+--city[[:space
 B_GATE="$(bare "$GATE")"; B_REF="$(bare "$REFINO")"
 eq "quality-gate-dispatcher: nenhuma chamada sem o teto" "${B_GATE:-none}" "none"
 eq "refino-gate-dispatcher: nenhuma chamada sem o teto" "${B_REF:-none}" "none"
-eq "quality-gate-dispatcher: 3 spawns de reviewer com teto (re-convocação, inicial, retry)" "$(wrapped "$GATE")" "3"
+# ga-2hd02v.1.9: +2 = o spawn do nó (gate-reviewer-remote) na re-convocação e no Step 7; os 3 locais seguem como estavam.
+eq "quality-gate-dispatcher: 5 spawns de reviewer com teto (re-convocação local+nó, inicial local+nó, retry)" "$(wrapped "$GATE")" "5"
 eq "refino-gate-dispatcher: 1 spawn de reviewer com teto" "$(wrapped "$REFINO")" "1"
 for f in "$GATE" "$REFINO"; do
   if grep -qF 'session-new-bounded.lib.sh' "$f"; then ok "$(basename "$f") carrega a lib"; else bad "$(basename "$f") não carrega session-new-bounded.lib.sh"; fi

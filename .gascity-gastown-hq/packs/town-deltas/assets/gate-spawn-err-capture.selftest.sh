@@ -187,7 +187,8 @@ HEAD300_COUNT=$(grep -c 'head -c 300' "$DISPATCHER" || true)
 eq "old 'head -c 300' truncation fully removed from both call sites" "${HEAD300_COUNT:-0}" "0"
 
 CALL_SITE_COUNT=$(grep -c 'capture_spawn_err_tail "\$_spawn_err_file"' "$DISPATCHER" || true)
-eq "capture_spawn_err_tail wired into exactly 2 call sites (initial spawn + retry loop)" "${CALL_SITE_COUNT:-0}" "2"
+# ga-2hd02v.1.9: +1 = the node-first spawn in Step 7 (the re-convene node spawn reads its stderr file itself, no tail helper).
+eq "capture_spawn_err_tail wired into exactly 3 call sites (node-first spawn + initial spawn + retry loop)" "${CALL_SITE_COUNT:-0}" "3"
 
 CUTOFF_LN=$(grep -n 'if \[ -n "\${GATE_DISPATCHER_LIB_ONLY:-}" \]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
 DEF_LN=$(grep -n '^capture_spawn_err_tail() {' "$DISPATCHER" | head -1 | cut -d: -f1)
