@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# hetzner-occupancy-watch.selftest.sh — hermético: gc e ssh são stubs; a cidade, o HOME e o /proc/stat são sintéticos; nada fala com o servidor nem com o mail de verdade. (ga-2hd02v.1.12)
+# hetzner-occupancy-watch.selftest.sh — hermético: gc e ssh são stubs; a cidade, o HOME, o arquivo do Pilot e o /proc/stat são sintéticos; nada fala com o servidor, o Pilot nem o mail de verdade. (ga-2hd02v.1.12)
 #
 # Contents
 #   Casos · Controle negativo · Como rodar
 #
 # CASOS (grupos, na ordem): cfg (configuração em vigor, plist, gramática do Python 3.9) · sess (sessões remotas: 3 estados, MBP fora) · cpu (/proc/stat por ssh: baseline, janela, recuo de contador,
-#   ssh que cai ou trava) · estado (ocupado / ocioso / desconhecido: a tabela inteira) · saida (JSONL, número por dia, arquivos corrompidos, --dry-run, instância única, falha de gravação, nada fora de .gc, nenhum mail).
+#   ssh que cai ou trava) · fila (arquivo do Pilot: ausente/velho/futuro/ilegível NÃO é zero; lojas) · estado (ocupado / ocioso / desconhecido: a tabela inteira) · alarme (sequência de 30 min, jitter, cooldown,
+#   mail que falha, modo foco, chave de ligar, vigia cego) · saida (JSONL, número por dia, arquivos corrompidos, --dry-run, instância única, crash e falha de gravação, nada fora de .gc).
 # CONTROLE NEGATIVO: cada mutante (um trecho literal do script trocado, que tem de existir UMA vez) TEM de reprovar o grupo que o pega; mutante que passa = teste que não pega o bug. Só roda sem argumento e com o script de verdade.
 #   Cada mutante roda em segundo plano com o PRÓPRIO diretório temporário e para no 1º caso que reprova (o resto do grupo não diz nada de novo): sem isso eram ~80 grupos inteiros em série, mais de 10 min.
 # COMO RODAR: hetzner-occupancy-watch.selftest.sh [grupo ...]   (sem argumento: todos os grupos e o controle negativo). HETZNER_OCC_UNDER_TEST=<script> roda a suíte contra outra cópia.
@@ -14,6 +15,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCH="${HETZNER_OCC_UNDER_TEST:-$HERE/hetzner-occupancy-watch.py}"
 PLIST="$HERE/com.gascity.hetzner-occupancy-watch.plist"
+FOCUS_LIB="$HERE/../packs/town-deltas/assets/scripts/gate-focus-lib.sh"
 [ -f "$WATCH" ] || { echo "FATAL: $WATCH não existe — não há o que testar" >&2; exit 2; }
 T=$(mktemp -d "${TMPDIR:-/tmp}/hocc-selftest.XXXXXX")
 trap 'kill $(jobs -p) 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
@@ -44,7 +46,7 @@ last_line() { tail -n 1 "$1" > "$T/last.json" 2>/dev/null; }
 # ---- stubs ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 cat > "$T/bin/gc" <<'EOF'
 #!/usr/bin/env bash
-# gc de mentira: `session list --json` devolve $STUB_GC_FILE (ou falha com $STUB_GC_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar); o resto (`mail send` inclusive: esta fatia não manda mail) é PROIBIDO (rc 99, marcado)
+# gc de mentira: `session list --json` devolve $STUB_GC_FILE (ou falha com $STUB_GC_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar); `mail send` grava o mail; o resto é PROIBIDO (rc 99, marcado)
 echo "gc $*" >> "$STUB_DIR/gc.calls"
 args=("$@")
 if [ "${args[0]:-}" = "--city" ]; then args=("${args[@]:2}"); fi
@@ -54,6 +56,16 @@ case "${args[0]:-} ${args[1]:-}" in
     if [ "${STUB_GC_RC:-0}" != 0 ]; then echo "gc: erro injetado" >&2; [ -n "${STUB_OUTFAIL:-}" ] && [ -n "${STUB_GC_FILE:-}" ] && cat "$STUB_GC_FILE"; exit "$STUB_GC_RC"; fi
     [ -n "${STUB_GC_FILE:-}" ] && cat "$STUB_GC_FILE"
     exit 0 ;;
+  "mail send")
+    c=$(( $(cat "$STUB_DIR/mail.count" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$STUB_DIR/mail.count"
+    to="${args[2]:-}"; subj=""; body=""; i=3
+    while [ $i -lt ${#args[@]} ]; do
+      case "${args[$i]}" in -s) subj="${args[$((i+1))]}"; i=$((i+2)) ;; -m) body="${args[$((i+1))]}"; i=$((i+2)) ;; *) i=$((i+1)) ;; esac
+    done
+    printf '%s' "$to" > "$STUB_DIR/mail.$c.to"; printf '%s' "$subj" > "$STUB_DIR/mail.$c.subj"; printf '%s' "$body" > "$STUB_DIR/mail.$c.body"
+    echo "${STUB_MAIL_RC:-0}" > "$STUB_DIR/mail.$c.rc"
+    [ -n "${STUB_STATE_FILE:-}" ] && [ -f "$STUB_STATE_FILE" ] && cp "$STUB_STATE_FILE" "$STUB_DIR/mail.$c.state"
+    exit "${STUB_MAIL_RC:-0}" ;;
   *) echo "FORBIDDEN gc $*" >> "$STUB_DIR/forbidden.calls"; exit 99 ;;
 esac
 EOF
@@ -66,7 +78,7 @@ if [ "${STUB_SSH_RC:-0}" != 0 ]; then echo "ssh: erro injetado" >&2; [ -n "${STU
 [ -n "${STUB_SSH_FILE:-}" ] && cat "$STUB_SSH_FILE"
 exit 0
 EOF
-for b in bd dolt; do   # o vigia NUNCA deve chamar bd nem dolt (só gc session list / ssh de leitura)
+for b in bd dolt notify; do   # o vigia NUNCA deve chamar bd, dolt nem notify (só gc session list / gc mail send / ssh de leitura)
   printf '#!/usr/bin/env bash\necho "FORBIDDEN %s $*" >> "$STUB_DIR/forbidden.calls"\nexit 99\n' "$b" > "$T/bin/$b"
 done
 chmod +x "$T/bin/"*
@@ -81,13 +93,13 @@ SJ_NONE='{"sessions":[{"id":"s1","session_name":"mayor","template":"mayor","stat
 SJ_REMOTE='{"sessions":[{"id":"s9","session_name":"dog-remote-gapxi4ls","template":"dog-remote","state":"active"}]}'
 sessions_are() { printf '%s' "$1" > "$T/sessions.json"; STUB_GC_FILE="$T/sessions.json"; }
 
-fresh() {   # cidade, HOME, stubs e relógio novos; sessões = nenhuma remota
+fresh() {   # cidade, HOME, stubs e relógio novos; sessões = nenhuma remota; fila = 3 itens do hq; foco desligado; chave .on posta (os casos de aviso a pressupõem)
   C="$T/city"; HM="$T/home"
   find "$C" "$HM" "$T/stub" "$T/tmp" -mindepth 1 -delete 2>/dev/null
-  mkdir -p "$C/.gc/logs" "$HM" "$T/stub" "$T/tmp"
+  mkdir -p "$C/.gc/logs" "$HM/.gc" "$T/stub" "$T/tmp"; : > "$C/.gc/hetzner-occupancy-alarm.on"
   NOW=${1:-$NOW0}; CB=0; CI=0; NCPU=16; RC=0; TENV=()
-  STUB_GC_RC=0; STUB_GC_SLEEP=""; STUB_SSH_RC=0; STUB_SSH_SLEEP=""; STUB_SSH_FILE=""; STUB_OUTFAIL=""
-  WOUT="$T/out.json"; WERR="$T/err"
+  STUB_GC_RC=0; STUB_GC_SLEEP=""; STUB_SSH_RC=0; STUB_SSH_SLEEP=""; STUB_MAIL_RC=0; STUB_SSH_FILE=""; STUB_OUTFAIL=""
+  PILOT_HQ=3; PILOT_WA=0; FOCUS=off; WOUT="$T/out.json"; WERR="$T/err"
   sessions_are "$SJ_NONE"
 }
 W() {   # W [VAR=valor ...] [-- args do vigia] : roda o vigia no ambiente do cenário. stdout → $WOUT, stderr → $WERR, rc → $RC
@@ -96,8 +108,8 @@ W() {   # W [VAR=valor ...] [-- args do vigia] : roda o vigia no ambiente do cen
   [ "${1:-}" = "--" ] && shift
   env -i HOME="$HM" PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$T/tmp" TZ="$TZNAME" \
     GC_CITY_PATH="$C" GC_BIN="$T/bin/gc" SSH_BIN="$T/bin/ssh" HETZNER_OCC_NOW="$NOW" \
-    STUB_DIR="$T/stub" STUB_GC_FILE="${STUB_GC_FILE:-}" STUB_GC_RC="${STUB_GC_RC:-0}" STUB_GC_SLEEP="${STUB_GC_SLEEP:-}" \
-    STUB_SSH_FILE="${STUB_SSH_FILE:-}" STUB_SSH_RC="${STUB_SSH_RC:-0}" STUB_SSH_SLEEP="${STUB_SSH_SLEEP:-}" STUB_OUTFAIL="${STUB_OUTFAIL:-}" \
+    STUB_DIR="$T/stub" STUB_STATE_FILE="$C/.gc/hetzner-occupancy.state.json" STUB_GC_FILE="${STUB_GC_FILE:-}" STUB_GC_RC="${STUB_GC_RC:-0}" STUB_GC_SLEEP="${STUB_GC_SLEEP:-}" \
+    STUB_SSH_FILE="${STUB_SSH_FILE:-}" STUB_SSH_RC="${STUB_SSH_RC:-0}" STUB_SSH_SLEEP="${STUB_SSH_SLEEP:-}" STUB_MAIL_RC="${STUB_MAIL_RC:-0}" STUB_OUTFAIL="${STUB_OUTFAIL:-}" \
     "${extra[@]+"${extra[@]}"}" python3 "$WATCH" "$@" >"$WOUT" 2>"$WERR"
   RC=$?
 }
@@ -112,11 +124,35 @@ rawstat() {   # rawstat <arquivo> <user> <nice> <system> <idle> <iowait> <irq> <
     local i=0; while [ "$i" -lt 16 ]; do echo "cpu$i 0 0 0 0 0 0 0 0 0 0"; i=$((i+1)); done
     echo "@@OCC-END@@"; } > "$1"
 }
-tick() {   # tick <segundos> <centinúcleos> : avança o relógio, "gasta" CPU nesse intervalo (contadores acumulados, 100 ticks/s por núcleo), e roda o vigia com --print (TENV = variáveis extras)
+pilot() {   # pilot <idade_s> <ttl> <n_hq> <n_wa> : grava o pilot-dispatchable.json como o Pilot grava (geração = NOW - idade)
+  python3 -I - "$HM/.gc/pilot-dispatchable.json" "$((NOW - $1))" "$2" "$3" "$4" <<'PY'
+import datetime, json, sys
+path, gen, ttl, n_hq, n_wa = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+items = [{"id": "ga-hq%d" % i, "title": "t", "type": "task", "rig": "", "priority": 2, "created_at": "2026-10-18T00:00:00Z", "assignee": "", "store": "hq"} for i in range(n_hq)]
+items += [{"id": "wa-x%d" % i, "title": "t", "type": "bug", "rig": "whatsapp_automation", "priority": 1, "created_at": "2026-10-18T00:00:00Z", "assignee": "", "store": "whatsapp_automation"} for i in range(n_wa)]
+json.dump({"generated_at": datetime.datetime.fromtimestamp(gen, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "ttl_seconds": ttl, "count": len(items), "items": items}, open(path, "w"))
+PY
+}
+focus_is() {   # focus_is on|off|stale|future|corrupt|missing : o gate-focus.state como o gate-focus-mode.sh grava (at = NOW)
+  local f="$C/.gc/gate-focus.state"
+  case "$1" in
+    on)      printf 'active=1\nat=%s\ndepth=20\n' "$NOW" > "$f" ;;
+    off)     printf 'active=0\nat=%s\ndepth=3\n' "$NOW" > "$f" ;;
+    stale)   printf 'active=1\nat=%s\n' "$((NOW - 9000))" > "$f" ;;
+    future)  printf 'active=1\nat=%s\n' "$((NOW + 600))" > "$f" ;;
+    corrupt) printf 'isto não é um estado\n' > "$f" ;;
+    missing) rm -f "$f" ;;
+  esac
+}
+tick() {   # tick <segundos> <centinúcleos> : avança o relógio, "gasta" CPU nesse intervalo (contadores acumulados, 100 ticks/s por núcleo), renova fila e foco, e roda o vigia com --print (TENV = variáveis extras)
   NOW=$((NOW + $1)); CB=$((CB + $2 * $1)); CI=$((CI + (NCPU * 100 - $2) * $1))
   statfile "$T/stat.txt" "$CB" "$CI" "$NCPU"; STUB_SSH_FILE="$T/stat.txt"
+  [ "$PILOT_HQ" != none ] && pilot 60 1800 "$PILOT_HQ" "$PILOT_WA"
+  focus_is "$FOCUS"
   W "${TENV[@]+"${TENV[@]}"}" -- --print
 }
+mails() { cat "$T/stub/mail.count" 2>/dev/null || echo 0; }
+mailfield() { cat "$T/stub/mail.$1.$2" 2>/dev/null; }
 reading() { jv "$WOUT" "$1"; }          # campo da leitura que o --print acabou de imprimir
 state_f() { jv "$C/.gc/hetzner-occupancy.state.json" "$1"; }
 
@@ -128,8 +164,13 @@ g_cfg() {
   eq "print-config sai 0" 0 "$RC"
   eq "intervalo padrão = 900 s" 900 "$(reading interval_s)"
   eq "régua padrão = 0.5 núcleo" 0.5 "$(reading busy_cores)"
-  W HETZNER_OCC_BUSY_CORES=1.5 -- --print-config
+  eq "loja elegível padrão = só hq" '["hq"]' "$(reading stores)"
+  eq "com a chave .on posta, o aviso está ligado" true "$(reading alarm)"
+  rm -f "$C/.gc/hetzner-occupancy-alarm.on"; W -- --print-config
+  eq "sem a chave .on o aviso está DESLIGADO (inerte por padrão)" false "$(reading alarm)"; : > "$C/.gc/hetzner-occupancy-alarm.on"
+  W HETZNER_OCC_BUSY_CORES=1.5 HETZNER_OCC_STORES=hq,whatsapp_automation -- --print-config
   eq "env muda a régua" 1.5 "$(reading busy_cores)"
+  eq "env muda as lojas" '["hq", "whatsapp_automation"]' "$(reading stores)"
   W HETZNER_SSH_HOST='-oProxyCommand=x' -- --print-config
   check "host ssh com cara de opção (-o...): recusado, e o ssh nem é chamado" "$([ "$RC" -ne 0 ] && [ ! -s "$T/stub/ssh.calls" ] && echo 1 || echo 0)"
   local interval; W -- --print-config; interval=$(reading interval_s)
@@ -146,9 +187,10 @@ checks = [
     ("StartInterval = intervalo do script", p.get("StartInterval") == interval),
     ("RunAtLoad (a 1ª leitura semeia o baseline logo)", p.get("RunAtLoad") is True),
     ("log de erro em .gc/logs", "/.gc/logs/hetzner-occupancy-watch" in str(p.get("StandardErrorPath", ""))),
-    ("PATH acha o gc e os utilitários do usuário", "/Users/athos/go/bin" in env.get("PATH", "") and "/Users/athos/.local/bin" in env.get("PATH", "")),
-    ("HOME (o ssh_config do usuário tem o alias do servidor)", env.get("HOME") == "/Users/athos"),
+    ("PATH acha o gc e os utilitários do usuário","/Users/athos/go/bin" in env.get("PATH", "") and "/Users/athos/.local/bin" in env.get("PATH", "")),
+    ("HOME (ssh_config e ~/.gc/pilot-dispatchable.json)", env.get("HOME") == "/Users/athos"),
     ("GC_CITY_PATH", env.get("GC_CITY_PATH") == "/Users/athos/gt/.gascity-gastown-hq"),
+    ("o plist NÃO mexe no aviso (quem liga é a chave .on)", "HETZNER_OCC_ALARM" not in env),
     ("prioridade baixa como os vigias novos", p.get("Nice") == 10 and p.get("LowPriorityIO") is True),
 ]
 for name, good in checks:
@@ -329,6 +371,33 @@ g_cpu() {
 }
 
 # ============================================================================================================================================================================
+g_fila() {
+  echo "--- fila: pilot-dispatchable.json (ausente/velho/futuro/ilegível ≠ 0)"
+  fresh; PILOT_HQ=3; PILOT_WA=2; tick 900 5
+  eq "3 do hq + 2 do wa: só o hq conta (a loja que o servidor pode pegar)" 3 "$(reading fila.n)"; eq "... lida" true "$(reading fila.lido)"
+  eq "... ids de amostra" '["ga-hq0", "ga-hq1", "ga-hq2"]' "$(reading fila.ids)"
+  W HETZNER_OCC_STORES=hq,whatsapp_automation -- --print; eq "HETZNER_OCC_STORES inclui outra loja" 5 "$(reading fila.n)"
+  fresh; PILOT_HQ=0; PILOT_WA=0; tick 900 5
+  eq "arquivo fresco com 0 itens: lido, n = 0 (fila vazia de verdade)" 0 "$(reading fila.n)"; eq "... lido" true "$(reading fila.lido)"
+  fresh; PILOT_HQ=0; PILOT_WA=2; tick 900 5
+  eq "só itens de outra loja: lido, n = 0 para o hq" 0 "$(reading fila.n)"
+  fresh; PILOT_HQ=none; tick 900 5
+  eq "arquivo ausente: NÃO lida" false "$(reading fila.lido)"; eq "... n = null (não 0)" null "$(reading fila.n)"; eq "... motivo" arquivo-ausente "$(reading fila.motivo)"
+  printf '{"generated_at": "2026-10' > "$HM/.gc/pilot-dispatchable.json"; W -- --print
+  eq "JSON cortado: NÃO lida" false "$(reading fila.lido)"; eq "... motivo" arquivo-ilegivel "$(reading fila.motivo)"
+  : > "$HM/.gc/pilot-dispatchable.json"; W -- --print; eq "arquivo vazio: NÃO lida" false "$(reading fila.lido)"
+  echo '[1,2]' > "$HM/.gc/pilot-dispatchable.json"; W -- --print; eq "JSON que não é objeto: NÃO lida" false "$(reading fila.lido)"; eq "... motivo" forma-desconhecida "$(reading fila.motivo)"
+  echo '{"generated_at":"2026-10-19T14:59:00Z","ttl_seconds":1800,"items":"x"}' > "$HM/.gc/pilot-dispatchable.json"; W -- --print; eq "items que não é lista: NÃO lida" false "$(reading fila.lido)"
+  echo '{"generated_at":"2026-10-19T14:59:00Z","ttl_seconds":1800,"items":[1]}' > "$HM/.gc/pilot-dispatchable.json"; W -- --print; eq "item que não é objeto: NÃO lida" false "$(reading fila.lido)"
+  echo '{"generated_at":"ontem","ttl_seconds":1800,"items":[]}' > "$HM/.gc/pilot-dispatchable.json"; W -- --print; eq "generated_at ilegível: NÃO lida" false "$(reading fila.lido)"
+  echo '{"generated_at":"2026-10-19T14:59:00Z","items":[]}' > "$HM/.gc/pilot-dispatchable.json"; W -- --print; eq "sem ttl_seconds: NÃO lida" false "$(reading fila.lido)"
+  pilot 1801 1800 3 0; W -- --print; eq "mais velho que o próprio ttl (1801 s > 1800): NÃO lida" false "$(reading fila.lido)"; eq "... motivo" velho "$(reading fila.motivo)"
+  pilot 1800 1800 3 0; W -- --print; eq "exatamente no ttl: ainda vale (só passa do ttl é velho, como no reconciler)" true "$(reading fila.lido)"
+  pilot -120 1800 3 0; W -- --print; eq "carimbado 2 min no futuro (relógio fora do lugar): NÃO lida" false "$(reading fila.lido)"; eq "... motivo" no-futuro "$(reading fila.motivo)"
+  pilot -30 1800 3 0; W -- --print; eq "30 s no futuro cabe na tolerância (60 s)" true "$(reading fila.lido)"
+}
+
+# ============================================================================================================================================================================
 g_estado() {
   echo "--- estado: tabela completa (sessões × CPU)"
   # (sessão, CPU) → estado. "?" = não lida. Cada linha prepara um cenário próprio.
@@ -344,6 +413,95 @@ g_estado() {
     esac
     eq "sessões=$sess CPU=$cpu → $want" "$want" "$(reading estado)"
   done
+}
+
+# ============================================================================================================================================================================
+idle_run() {   # idle_run <n> [segundos] : n leituras ociosas seguidas (a CPU baixa, a cada <segundos> = 900)
+  local k=0; while [ "$k" -lt "$1" ]; do tick "${2:-900}" 5; k=$((k+1)); done
+}
+g_alarme() {
+  echo "--- alarme: ocioso ≥ 30 min COM fila"
+  fresh; tick 900 5 >/dev/null     # semeia
+  eq "a 1ª leitura só semeia o baseline de CPU: não conta como leitura cega" 0 "$(reading cegas_seguidas)"
+  tick 900 5; eq "leitura ociosa 1: sem aviso" 0 "$(mails)"; eq "... seguidas" 1 "$(reading ociosas_seguidas)"
+  tick 900 5; eq "leitura ociosa 2 (15 min): sem aviso" 0 "$(mails)"; eq "... alarme.ocioso = nao" nao "$(reading alarme.ocioso)"
+  tick 900 5; eq "leitura ociosa 3 (30 min): 1 mail ao Mayor" 1 "$(mails)"; eq "... alarme.ocioso = enviado" enviado "$(reading alarme.ocioso)"
+  eq "... destinatário" mayor "$(mailfield 1 to)"
+  has "... assunto diz o estado do mundo" "Hetzner ocioso" "$(mailfield 1 subj)"; has "... assunto traz a fila" "3 bead(s)" "$(mailfield 1 subj)"
+  has "... corpo cita a sequência" "3 leituras seguidas" "$(mailfield 1 body)"; has "... corpo cita ids da fila" "ga-hq0" "$(mailfield 1 body)"
+  has "... corpo diz que o vigia não atribui nada" "não atribui" "$(mailfield 1 body)"; has "... corpo diz o foco" "foco do gate: desligado" "$(mailfield 1 body)"
+  has "... corpo avisa que a fila pode ter vetadas" "vetad" "$(mailfield 1 body)"
+  eq "... o cooldown já estava GRAVADO quando o mail saiu (se não der para gravar, o mail nem sai)" "$NOW" "$(jv "$T/stub/mail.1.state" alarme_ocioso_em)"
+  tick 900 5; eq "continua ocioso: cooldown (nada de mail repetido)" 1 "$(mails)"; eq "... alarme.ocioso = cooldown" cooldown "$(reading alarme.ocioso)"
+  idle_run 10; eq "10 leituras depois (2h30 após o aviso): ainda em cooldown" 1 "$(mails)"
+  tick 900 5; eq "3 h depois do aviso: o 2º aviso sai" 2 "$(mails)"
+
+  echo "--- alarme: tolerância do launchd (jitter) e leitura espaçada"
+  fresh; tick 890 5 >/dev/null; idle_run 3 890; eq "leituras a cada 890 s: o 3º ocioso (1780 s desde o 1º) já avisa (tolerância de 2 min)" 1 "$(mails)"
+  fresh; tick 800 5 >/dev/null; idle_run 3 800; eq "leituras a cada 800 s: o 3º ocioso (1600 s desde o 1º) AINDA não avisa" 0 "$(mails)"
+  idle_run 1 800;                                   eq "... o 4º (2400 s desde o 1º) avisa" 1 "$(mails)"
+
+  echo "--- alarme: sem fila / fila desconhecida / o resto interrompe a sequência"
+  fresh; PILOT_HQ=0; tick 900 5 >/dev/null; idle_run 5
+  eq "ocioso com fila VAZIA: nenhum aviso (ocioso certo é ocioso)" 0 "$(mails)"; eq "... alarme.ocioso = nao" nao "$(reading alarme.ocioso)"
+  fresh; PILOT_HQ=none; tick 900 5 >/dev/null; idle_run 3
+  eq "ocioso com fila ILEGÍVEL: nenhum aviso de ocioso (não sei se há fila)" 0 "$(mails)"; eq "... mas conta como leitura sem decisão" 3 "$(reading cegas_seguidas)"
+  fresh; tick 900 5 >/dev/null; idle_run 2; tick 900 200; idle_run 2
+  eq "ocioso, ocioso, OCUPADO, ocioso, ocioso: sem aviso (a sequência recomeçou)" 0 "$(mails)"; eq "... seguidas = 2" 2 "$(reading ociosas_seguidas)"
+  idle_run 1; eq "... o 3º ocioso depois do ocupado avisa" 1 "$(mails)"
+  fresh; tick 900 5 >/dev/null; idle_run 2; STUB_SSH_RC=255; tick 900 5; STUB_SSH_RC=0; idle_run 2
+  eq "ocioso, ocioso, DESCONHECIDO, ocioso, ocioso: sem aviso (desconhecido quebra a sequência)" 0 "$(mails)"
+  idle_run 1; eq "... o 3º ocioso seguido depois do desconhecido avisa" 1 "$(mails)"
+
+  echo "--- alarme: mail que falha não consome o cooldown"
+  fresh; tick 900 5 >/dev/null; idle_run 2; STUB_MAIL_RC=1; tick 900 5
+  eq "mail falhou: tentou 1 vez" 1 "$(mails)"; eq "... alarme.ocioso = falhou" falhou "$(reading alarme.ocioso)"; eq "... nada de cooldown gravado" null "$(state_f alarme_ocioso_em)"
+  STUB_MAIL_RC=0; tick 900 5
+  eq "próxima leitura tenta DE NOVO e passa" 2 "$(mails)"; eq "... enviado" enviado "$(reading alarme.ocioso)"
+  tick 900 5; eq "e agora sim o cooldown vale" 2 "$(mails)"
+
+  echo "--- alarme: modo foco do gate"
+  fresh; FOCUS=on; tick 900 5 >/dev/null; idle_run 3
+  eq "foco LIGADO + ocioso + fila: sem aviso (só conserto é despachado)" 0 "$(mails)"; eq "... alarme.ocioso = foco" foco "$(reading alarme.ocioso)"; eq "... a leitura registra o foco" ligado "$(reading foco)"
+  FOCUS=off; tick 900 5; eq "foco desligou: o aviso sai na hora (a sequência de ocioso foi contada)" 1 "$(mails)"
+  fresh; FOCUS=missing; tick 900 5 >/dev/null; idle_run 3
+  eq "foco ILEGÍVEL (arquivo ausente) é tratado como desligado: avisa" 1 "$(mails)"; eq "... a leitura diz desconhecido" desconhecido "$(reading foco)"
+  has "... e o mail diz que não sabe do foco" "foco do gate: desconhecido" "$(mailfield 1 body)"
+  # a regra de 3 estados do foco é a da gate-focus-lib.sh: a leitura do vigia tem de concordar com a da lib em cada estado
+  if [ -f "$FOCUS_LIB" ]; then
+    local mode lib want got
+    for mode in on off stale future corrupt missing; do
+      fresh; focus_is "$mode"; W -- --dry-run --print; got=$(reading foco)
+      lib=$(bash -c '. "$1"; GATE_FOCUS_STATE_FILE="$2" GATE_FOCUS_NOW="$3" gate_focus_active' _ "$FOCUS_LIB" "$C/.gc/gate-focus.state" "$NOW")
+      case "$lib" in 1) want=ligado ;; 0) want=desligado ;; *) want=desconhecido ;; esac
+      eq "foco '$mode': o vigia lê como a gate-focus-lib.sh ($lib)" "$want" "$got"
+    done
+  else
+    bad "gate-focus-lib.sh não achada em $FOCUS_LIB: sem ela não dá para provar que a leitura do foco concorda"
+  fi
+
+  echo "--- alarme: a chave .on liga o aviso (sem ela é só-medir, inerte)"
+  fresh; rm -f "$C/.gc/hetzner-occupancy-alarm.on"; tick 900 5 >/dev/null; idle_run 4
+  eq "sem a chave .on: nenhum mail" 0 "$(mails)"; eq "... alarme.ocioso = desligado" desligado "$(reading alarme.ocioso)"
+  check "... a medição continua gravando (5 leituras no JSONL)" "$([ "$(wc -l < "$C/.gc/hetzner-occupancy.jsonl" | tr -d ' ')" = 5 ] && echo 1 || echo 0)"
+  : > "$C/.gc/hetzner-occupancy-alarm.on"; tick 900 5; eq "pôs a chave: o aviso sai (a sequência continuou)" 1 "$(mails)"
+  fresh; tick 900 5 >/dev/null; idle_run 2; TENV=(HETZNER_OCC_ALARM=0); tick 900 5
+  eq "HETZNER_OCC_ALARM=0 desliga o aviso MESMO com a chave (3º ocioso, com fila)" 0 "$(mails)"; eq "... alarme.ocioso = desligado" desligado "$(reading alarme.ocioso)"
+  W HETZNER_OCC_ALARM=0 -- --print-config; eq "... e a configuração em vigor diz alarm = false" false "$(reading alarm)"
+
+  echo "--- alarme: vigia cego (não consigo medir)"
+  fresh; STUB_GC_RC=1; tick 900 5 >/dev/null; idle_run 3
+  eq "cego há 45 min (4 leituras): sem aviso ainda" 0 "$(mails)"
+  tick 900 5; eq "cego há 60 min (5 leituras): 1 mail" 1 "$(mails)"; eq "... alarme.cego = enviado" enviado "$(reading alarme.cego)"
+  has "... assunto" "CEGO" "$(mailfield 1 subj)"; has "... corpo diz por quê (motivo da sessão)" "gc-falhou" "$(mailfield 1 body)"; eq "... destinatário" mayor "$(mailfield 1 to)"
+  tick 900 5; eq "continua cego: cooldown, sem repetir" 1 "$(mails)"
+  fresh; STUB_GC_RC=1; tick 900 5 >/dev/null; idle_run 2; STUB_GC_RC=0; idle_run 1; eq "uma leitura que decide zera a contagem de cego" 0 "$(reading cegas_seguidas)"
+  STUB_GC_RC=1; idle_run 3; eq "cego, cego, cego depois de uma boa: não chega a 1 h" 0 "$(mails)"
+  fresh; STUB_GC_RC=1; tick 890 5 >/dev/null; idle_run 4 890; eq "cego, leituras a cada 890 s: o 5º (3560 s desde o 1º) já avisa (tolerância de 2 min)" 1 "$(mails)"
+  fresh; STUB_GC_RC=1; tick 800 5 >/dev/null; idle_run 4 800; eq "cego, leituras a cada 800 s: o 5º (3200 s) AINDA não avisa" 0 "$(mails)"
+  fresh; PILOT_HQ=none; tick 900 5 >/dev/null; idle_run 4
+  eq "ocioso + fila ilegível por 1 h também é cego" 1 "$(mails)"; has "... o corpo cita a fila" "fila" "$(mailfield 1 body)"
+  fresh; tick 900 5 >/dev/null; idle_run 6 ; eq "ocupado/ocioso decidíveis nunca avisam cego" 0 "$(reading cegas_seguidas)"
 }
 
 # ============================================================================================================================================================================
@@ -377,13 +535,13 @@ g_saida() {
   eq "... sem baseline, a CPU dessa leitura é desconhecida (não inventa)" false "$(reading cpu.lido)"
 
   echo "--- saida: --dry-run não grava nem avisa"
-  fresh; tick 900 5 >/dev/null; tick 900 5; tick 900 5
-  local before after; before=$(cksum "$C/.gc/"hetzner-occupancy* | sort)
-  NOW=$((NOW + 900)); CB=$((CB + 5 * 900)); CI=$((CI + (NCPU * 100 - 5) * 900)); statfile "$T/stat.txt" "$CB" "$CI" "$NCPU"; STUB_SSH_FILE="$T/stat.txt"
+  fresh; tick 900 5 >/dev/null; idle_run 2
+  local before after m0; before=$(cksum "$C/.gc/"hetzner-occupancy* | sort); m0=$(mails)
+  NOW=$((NOW + 900)); CB=$((CB + 5 * 900)); CI=$((CI + (NCPU * 100 - 5) * 900)); statfile "$T/stat.txt" "$CB" "$CI" "$NCPU"; STUB_SSH_FILE="$T/stat.txt"; pilot 60 1800 3 0; focus_is off
   W -- --dry-run --print
   after=$(cksum "$C/.gc/"hetzner-occupancy* | sort)
-  eq "dry-run: nenhum arquivo mudou" "$before" "$after"
-  eq "dry-run: a leitura sai no stdout" ocioso "$(reading estado)"; eq "dry-run: rc 0" 0 "$RC"
+  eq "dry-run: nenhum arquivo mudou" "$before" "$after"; eq "dry-run: nenhum mail" "$m0" "$(mails)"
+  eq "dry-run: a leitura sai no stdout" ocioso "$(reading estado)"; eq "dry-run: diz que ENVIARIA o aviso" enviaria "$(reading alarme.ocioso)"; eq "dry-run: rc 0" 0 "$RC"
 
   echo "--- saida: instância única"
   fresh; tick 900 5 >/dev/null
@@ -396,21 +554,24 @@ g_saida() {
   wait "$bg"
   eq "só a 1ª gravou (2 linhas no JSONL: a semente e a 1ª)" 2 "$(wc -l < "$C/.gc/hetzner-occupancy.jsonl" | tr -d ' ')"
 
-  echo "--- saida: crash e falha de gravação (traceback à vista, rc 3)"
+  echo "--- saida: crash e falha de gravação (traceback à vista, rc 3; o vigia não avisa ninguém: quem vê um vigia que cai é o DPW)"
   fresh; tick 900 5 >/dev/null
   W HETZNER_OCC_BUSY_CORES=nao-e-numero -- --print
   check "config inválida: sai com erro (rc != 0)" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"; has "... traceback à vista no stderr (não engolido)" "Traceback" "$(cat "$WERR")"
-  fresh; rmdir "$C/.gc/logs" "$C/.gc"; : > "$C/.gc"     # .gc virou ARQUIVO: nenhuma gravação é possível, para qualquer usuário (inclusive root)
+  check "... e nada sai por notify, bd, dolt nem mail (a chave .on está posta)" "$([ ! -s "$T/stub/forbidden.calls" ] && [ "$(mails)" = 0 ] && echo 1 || echo 0)"
+  fresh; rm -f "$C/.gc/hetzner-occupancy-alarm.on"; rmdir "$C/.gc/logs" "$C/.gc"; : > "$C/.gc"     # .gc virou ARQUIVO: nenhuma gravação é possível, para qualquer usuário (inclusive root)
   tick 900 5
   eq "não consegui gravar: rc 3" 3 "$RC"; has "... diz 'não consegui gravar'" "não consegui gravar" "$(cat "$WERR")"
+  check "... e nada sai por notify, bd, dolt nem mail" "$([ ! -s "$T/stub/forbidden.calls" ] && [ "$(mails)" = 0 ] && echo 1 || echo 0)"
 
-  echo "--- saida: só LÊ o mundo (nada de bd, dolt, mail, ou gc fora de session list)"
-  fresh; tick 900 5 >/dev/null; tick 900 5; tick 900 5
-  check "nenhuma chamada proibida (bd, dolt, mail send, outro subcomando do gc)" "$([ ! -s "$T/stub/forbidden.calls" ] && echo 1 || echo 0)"
-  eq "gc só chamado para 'session list --json'" 0 "$(grep '^gc ' "$T/stub/gc.calls" | grep -v -e ' session list --json$' | wc -l | tr -d ' ')"
+  echo "--- saida: só LÊ o mundo (nada de bd, dolt, ou gc fora de session list / mail send)"
+  fresh; tick 900 5 >/dev/null; idle_run 3
+  check "nenhuma chamada proibida (bd, dolt, outro subcomando do gc)" "$([ ! -s "$T/stub/forbidden.calls" ] && echo 1 || echo 0)"
+  eq "gc só chamado para 'session list --json' e 'mail send mayor'" 0 "$(grep '^gc ' "$T/stub/gc.calls" | grep -v -e ' session list --json$' -e ' mail send mayor ' | wc -l | tr -d ' ')"
   eq "gc sempre com --city explícito (não depende do cwd do launchd)" 0 "$(grep '^gc ' "$T/stub/gc.calls" | grep -v "^gc --city $C " | wc -l | tr -d ' ')"
-  eq "o que o vigia escreve em .gc (e nada além; os logs são do cenário)" "hetzner-occupancy-daily.json hetzner-occupancy.jsonl hetzner-occupancy.lock hetzner-occupancy.state.json" "$(ls "$C/.gc" | grep -v -e '^logs$' | tr '\n' ' ' | sed 's/ $//')"
-  eq "e nada no HOME" "" "$(ls -A "$HM" | tr '\n' ' ' | sed 's/ $//')"
+  eq "o que o vigia escreve em .gc (e nada além; gate-focus.state e logs são do cenário)" "hetzner-occupancy-daily.json hetzner-occupancy.jsonl hetzner-occupancy.lock hetzner-occupancy.state.json" "$(ls "$C/.gc" | grep -v -e '^gate-focus.state$' -e '^logs$' -e '^hetzner-occupancy-alarm.on$' | tr '\n' ' ' | sed 's/ $//')"
+  eq "e nada no HOME além do arquivo do Pilot que ele LÊ" ".gc" "$(ls -A "$HM" | tr '\n' ' ' | sed 's/ $//')"
+  eq "... e a pasta .gc do HOME só tem o arquivo do Pilot" "pilot-dispatchable.json" "$(ls -A "$HM/.gc" | tr '\n' ' ' | sed 's/ $//')"
 }
 
 # ============================================================================================================================================================================
@@ -502,6 +663,30 @@ g_mutantes() {
   mutante sessao-nao-prova-ocupado "estado" $'if (sess["lido"] and sess["ativas"]) or (cpu["lido"] and cores >= busy_cores):' $'if (cpu["lido"] and cores >= busy_cores):'
   mutante cpu-nao-prova-ocupado "estado" $'if (sess["lido"] and sess["ativas"]) or (cpu["lido"] and cores >= busy_cores):' $'if (sess["lido"] and sess["ativas"]):'
   mutante regua-sem-igual "estado cpu" $'(cpu["lido"] and cores >= busy_cores)' $'(cpu["lido"] and cores > busy_cores)'
+  mutante fila-ausente-vira-zero "fila" $'except FileNotFoundError:\n        r["motivo"] = "arquivo-ausente"\n        return r' $'except FileNotFoundError:\n        r.update(lido=True, n=0)\n        return r'
+  mutante fila-velha-vale "fila" $'elif now - gen > ttl:' $'elif False:'
+  mutante ttl-exato-ja-e-velho "fila" $'elif now - gen > ttl:' $'elif now - gen >= ttl:'
+  mutante fila-no-futuro-vale "fila" $'elif now - gen < -c.future_tol_s:' $'elif False:'
+  mutante fila-conta-todas-as-lojas "fila" $'if it["store"] in c.stores]' $'if True]'
+  mutante item-que-nao-e-objeto "fila" $'elif not all(isinstance(it, dict) and isinstance(it.get("store"), str) for it in items):' $'elif False:'
+  mutante fila-sem-ttl-vale "fila" $'elif isinstance(ttl, bool) or not isinstance(ttl, (int, float)):' $'elif False:'
+  mutante foco-velho-vale "alarme" $'if now - int(at) > c.focus_stale_s or int(at) > now + 60:' $'if False:'
+  mutante foco-ligado-nao-cala "alarme" $'"foco" if foco == "ligado" else None' $'None'
+  mutante foco-ilegivel-cala "alarme" $'"foco" if foco == "ligado" else None' $'"foco" if foco != "desligado" else None'
+  mutante ocioso-sem-tolerancia-do-launchd "alarme" $'now - ocio_desde >= c.idle_after_s - c.slack_s' $'now - ocio_desde >= c.idle_after_s'
+  mutante aviso-sem-fila "alarme" $'fila["lido"] and fila["n"] > 0 and' $'fila["lido"] and'
+  mutante fila-ilegivel-decide "alarme" $'decided = est == "ocupado" or (est == "ocioso" and fila["lido"])' $'decided = est != "desconhecido"'
+  mutante sem-cooldown "alarme" $'if last_at is not None and 0 <= now - last_at < cooldown_s:' $'if False:'
+  mutante mail-que-falha-gasta-o-cooldown "alarme" $'new_st[key], failed = old, True' $'failed = True'
+  mutante cooldown-nao-gravado "alarme" $'new_st[key] = now  # o cooldown' $'pass  # o cooldown'
+  mutante sequencia-de-ocioso-nao-zera "alarme" $'ocio = prev_ocio + 1 if est == "ocioso" else 0' $'ocio = prev_ocio + 1'
+  mutante ocioso-desde-sempre-agora "alarme" $'ocio_desde = (_int(st.get("ocioso_desde"), now) if prev_ocio > 0 else now) if est == "ocioso" else None' $'ocio_desde = now if est == "ocioso" else None'
+  mutante cego-sem-tolerancia-do-launchd "alarme" $'now - decidida_em >= c.blind_after_s - c.slack_s' $'now - decidida_em >= c.blind_after_s'
+  mutante cego-tolerancia-enorme "alarme" $'now - decidida_em >= c.blind_after_s - c.slack_s' $'now - decidida_em >= c.blind_after_s - 3000'
+  mutante 1a-leitura-conta-como-cega "alarme" $'cegas = 0 if decided else _int(st.get("cegas_seguidas"), 0) + (0 if warm else 1)' $'cegas = 0 if decided else _int(st.get("cegas_seguidas"), 0) + 1'
+  mutante chave-on-ignorada "cfg alarme" $'c.alarm = env.get("HETZNER_OCC_ALARM") != "0" and os.path.exists(c.alarm_key)' $'c.alarm = env.get("HETZNER_OCC_ALARM") != "0"'
+  mutante env-alarm-0-ignorado "alarme" $'c.alarm = env.get("HETZNER_OCC_ALARM") != "0" and os.path.exists(c.alarm_key)' $'c.alarm = os.path.exists(c.alarm_key)'
+  mutante mail-para-outro-destinatario "alarme" $'"mail", "send", "mayor", "-s", subj, "-m", body' $'"mail", "send", "deacon", "-s", subj, "-m", body'
   mutante diario-conta-desconhecido-na-taxa "saida" $'dec = day["ocupado"] + day["ocioso"]' $'dec = day["leituras"]'
   mutante diario-sem-decisao-vira-zero "saida" $'if dec else None' $'if dec else 0.0'
   mutante dia-em-utc "saida" $'time.strftime("%Y-%m-%d", time.localtime(now))' $'time.strftime("%Y-%m-%d", time.gmtime(now))'
@@ -509,13 +694,14 @@ g_mutantes() {
   mutante corrompido-nao-guarda-a-copia "saida" $'os.replace(path, dest)' $'pass'
   mutante sem-instancia-unica "saida" $'if not dry and take_lock(c.gc_dir) is None:' $'if False:'
   mutante lock-bloqueante "saida" $'fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)' $'fcntl.flock(fd, fcntl.LOCK_EX)'
-  mutante dry-run-grava "saida" $'    if not dry:\n        write_atomic(state_path' $'    if True:\n        write_atomic(state_path'
+  mutante dry-run-grava-e-avisa "saida" $'    if not dry:\n        for key, _old, _k, _s, _b in sends:' $'    if True:\n        for key, _old, _k, _s, _b in sends:'
   mutante falha-de-gravacao-sai-0 "saida" $'return e.rc' $'return 0'
   mutante crash-sem-traceback "saida" $'traceback.print_exc()' $'pass'
+  mutante crash-avisa-pelo-notify "saida" $'    except Exception:  # inclui configuração inválida: o traceback fica à vista no log do launchd\n        traceback.print_exc()' $'    except Exception:\n        traceback.print_exc(); subprocess.run(["notify", "caiu"])'
   mutantes_wait
 }
 
-GROUPS_ALL="cfg sess cpu estado saida"
+GROUPS_ALL="cfg sess cpu fila estado alarme saida"
 run_groups() { local g; for g in "$@"; do "g_$g"; done; }
 
 DEFAULT="$GROUPS_ALL mutantes"; [ -z "${HOCC_NO_MUTANTS:-}" ] || DEFAULT="$GROUPS_ALL"
