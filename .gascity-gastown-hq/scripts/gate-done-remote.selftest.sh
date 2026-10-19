@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # gate-done-remote.selftest.sh — prova hermética de scripts/gate-done-remote.py (ga-2hd02v.1.13): cidade, origin e espelho FALSOS em tmp, `bd`/`gc` falsos,
 # e o commands/gate-done.md DE VERDADE (a fonte única que o executável reaproveita: se ele mudar de forma, este teste quebra). Uma seção final roda a cadeia
-# pelo remote-shim-wrapper.py real (ambiente montado do zero, cwd = cidade) e outra mata 6 mutantes. Nada toca a cidade nem o origin de verdade.
+# pelo remote-shim-wrapper.py real (ambiente montado do zero, cwd = cidade) e outra mata 12 mutantes. Nada toca a cidade nem o origin de verdade.
+# ga-2hd02v.1.18: as seções 9 e 9b cobrem `gate-done <bead> <ref> <sha>` (2ª bead da sessão, sha conferido antes do marcador, refs que a sessão não pode submeter) e a volta do gate.
 # Uso: bash scripts/gate-done-remote.selftest.sh   (FAILFAST=1 para no 1º caso que reprova)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -49,7 +50,7 @@ if cmd == "show":
 if cmd == "create":
     if env("FAKE_BD_NOMARKER"): sys.exit(1)
     db["n"] += 1; mid = "ga-mk%d" % db["n"]
-    beads[mid] = {"id": mid, "title": a[1], "status": "open", "labels": multi("-l"), "description": flag("-d"), "metadata": {}, "issue_type": "chore"}
+    beads[mid] = {"id": mid, "title": a[1], "status": "open", "labels": multi("-l"), "description": flag("-d"), "metadata": {}, "issue_type": "chore", "created_at": "2026-10-19T20:00:%02dZ" % db["n"]}
     save(); print(json.dumps({"id": mid})); sys.exit(0)
 if cmd == "label" and a[1] == "add":
     beads[a[2]]["labels"].append(a[3]); save(); sys.exit(0)
@@ -306,6 +307,68 @@ ok $((RC != 0)) "fix/<bead>-<resumo>: sai 0"
 [ "$(origin_has "fix/ga-t2-meu-resumo")" = "$SHAF" ] && ! origin_has "$BR2" >/dev/null; ok $? "fix/<bead>-<resumo>: o origin leva o nome que o dog deu (não o do título)"
 git --git-dir="$ORIGIN" update-ref -d "refs/heads/fix/ga-t2-meu-resumo"; git --git-dir="$MIRROR" update-ref -d "refs/heads/fix/ga-t2-meu-resumo"; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR2" 2>/dev/null
 
+# ── 9b. volta do gate (caso B): sem assignee + gate:needs-fix + rota dog-remote; vale se a ÚLTIMA entrega foi deste alias ──────────────────────────────
+BRB="fix/ga-t2-volta-do-gate"
+seed_back() {  # seed_back AUTOR SUBMITTED_BY [STATUS] [ASSIGNEE] [LABELS,] [ROTA]: a ga-t2 volta do gate; marcador antigo MEU e o mais novo do AUTOR dado
+  reset_db; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BRB" 2>/dev/null
+  python3 -I - "$DB" "$ALIAS" "$1" "$2" "${3-open}" "${4-}" "${5-gate:needs-fix,gate:fix-attempt:1}" "${6-dog-remote}" <<'EOF'
+import json, sys
+p, me, author, by, status, assignee, labels, route = sys.argv[1:]
+d = json.load(open(p))
+d["beads"]["ga-t2"] = {"id": "ga-t2", "title": "Volta do gate", "status": status, "assignee": assignee, "issue_type": "bug", "created_by": "gastown.mayor",
+                       "labels": labels.split(",") if labels else [], "metadata": ({"gc.routed_to": route} if route else {})}
+def mk(i, ts, a, b):
+    d["beads"][i] = {"id": i, "title": "ready-for-gate: x", "status": "closed", "issue_type": "chore", "created_at": ts,
+                     "labels": ["type:quality-gate-marker", "source-bead:ga-t2", "gate-status:failed"],
+                     "description": "branch: x\nbead_id: ga-t2\nauthor: " + a + "\nbase_commit: y\n", "metadata": {"gate.submitted_by": b}}
+mk("ga-mkold", "2026-10-19T10:00:00Z", me, me)
+mk("ga-mknew", "2026-10-19T11:00:00Z", author, by)
+json.dump(d, open(p, "w"))
+EOF
+}
+back_refused() {  # back_refused DESCRIÇÃO FRAGMENTO: recusa 1, diz o motivo e nada foi escrito
+  ok $((RC != 1)) "$1: recusa 1"; has "$T/err" "$2"; ok $? "$1: diz o motivo ($2)"
+  [ "$(mut_count)" = 0 ] && ! origin_has "$BRB" >/dev/null; ok $? "$1: nada escrito"
+}
+mk_work volta.txt "$BRB"; SHAV=$NEWSHA
+for combo in "$ALIAS:$ALIAS" "gastown.mayor:$ALIAS" "$ALIAS:gastown.mayor"; do   # autor e submitted_by; o Mayor submeteu à mão (só submitted_by); 2ª volta (só author: submitted_by cai no criador)
+  seed_back "${combo%%:*}" "${combo##*:}"; run_exe_a -- ga-t2 "$BRB" "$SHAV"
+  ok $((RC != 0)) "volta do gate (autor=${combo%%:*}, submitted_by=${combo##*:}): sai 0"
+  [ "$(origin_has "$BRB")" = "$SHAV" ]; ok $? "volta do gate ($combo): o origin tem $BRB no sha dito"
+  [ "$(dbq '[.beads[] | select((.labels // []) | index("source-bead:ga-t2"))] | length')" = 3 ]; ok $? "volta do gate ($combo): UM marcador novo (3 com os 2 antigos)"
+  dbq '.beads["ga-mk1"].description' | grep -qF -- "author: $ALIAS"; ok $? "volta do gate ($combo): o marcador novo leva author: alias (a próxima volta ainda prova a autoria)"
+  has "$T/out" "bead solta: ga-t2"; ok $? "volta do gate ($combo): a bead foi solta"
+  [ "$(dbq '.beads["ga-t1"].assignee // ""')" = "$ALIAS" ]; ok $? "volta do gate ($combo): a ga-t1 não foi tocada"
+  git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BRB"
+done
+seed_back outro-dog outro-dog; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "volta do gate cuja ÚLTIMA entrega é de outro alias (a antiga é minha: vale a mais nova)" "não foi de $ALIAS"
+seed_back "$ALIAS" "$ALIAS"; python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); [d["beads"].pop(k) for k in ("ga-mkold","ga-mknew")]; json.dump(d,open(sys.argv[1],"w"))' "$DB"
+run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "volta do gate sem nenhum marcador (nunca entregue)" "nunca foi entregue"
+seed_back "$ALIAS" "$ALIAS"; run_exe_a FAKE_BD_FAIL=list -- ga-t2 "$BRB" "$SHAV"; back_refused "leitura dos marcadores que FALHA (não é 'sem marcador')" "não consegui ler os marcadores"
+seed_back "$ALIAS" "$ALIAS"; run_exe_a FAKE_BD_BADJSON=list -- ga-t2 "$BRB" "$SHAV"; back_refused "marcadores com JSON corrompido" "ilegível"
+seed_back "$ALIAS" "$ALIAS" open "" "gate:queued"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "sem gate:needs-fix (na fila do gate, não voltou)" "nem uma volta do gate"
+seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix" ""; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "sem rota dog-remote" "nem uma volta do gate"
+seed_back "$ALIAS" "$ALIAS" open "outro-dog"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "bead de outro alias, mesmo com gate:needs-fix" "nem uma volta do gate"
+seed_back "$ALIAS" "$ALIAS" closed; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "bead fechada" "nem uma volta do gate"
+# `worker/<sessão>-N` só é inequívoco se `<sessão>-N` NÃO for ele mesmo um nome de sessão. Premissa lida do IDENTITY_PATTERN do runbook (a linha que o wrapper de produção usa):
+# hoje só os nomes SEM cauda colidem; se alguém alargar o padrão, este caso quebra e manda rever BARE_ROLE_RE
+COLL=$(python3 -I - "$HQ/docs/runbooks/gc-session-ssh.md" <<'EOF'
+import re, sys
+rx = re.compile(re.search(r"^IDENTITY_PATTERN=(.*)$", open(sys.argv[1], encoding="utf-8").read(), re.M).group(1))
+roles = ["dog-remote", "gate-reviewer-remote", "wa-worker-remote"]
+names = ["remote-e2e-1"] + roles + [f"{r}-{t}" for r in roles for t in ("1", "12", "123", "abc", "gawisp1ryjj", "adhoc-0fc28155dd")]
+print(" ".join(x for x in names if rx.fullmatch(x) and any(rx.fullmatch(f"{x}-{n}") for n in ("1", "12", "123"))))
+EOF
+)
+eqs "$COLL" "dog-remote gate-reviewer-remote wa-worker-remote"; ok $? "ambiguidade do -N: só os nomes sem cauda colidem pelo IDENTITY_PATTERN do runbook (achei: '$COLL')"
+for x in $COLL; do
+  reset_db2; run_exe_a GC_SESSION_NAME="$x" -- ga-t2 "worker/$x-2" "$SHA"
+  ok $((RC != 1)) "sessão sem cauda '$x' com worker/$x-2: recusa 1"; has "$T/err" "branch principal de OUTRA sessão"; ok $? "'$x': diz que worker/$x-2 pode ser de OUTRA sessão"
+  [ "$(mut_count)" = 0 ]; ok $? "'$x': nada escrito"
+done
+reset_db2; run_exe_a GC_SESSION_NAME=dog-remote -- ga-t2 "fix/ga-t2-meu-resumo" "$SHA"
+! has "$T/err" "branch principal de OUTRA sessão"; ok $? "sessão sem cauda com fix/<bead>-<resumo>: a guarda do -N não se aplica (o ref leva o id da bead)"
+
 # ── 8. mutantes: cada guarda apagada tem de reprovar o caso que a prova ───────────────────────────────────────────────────────────────────────────
 mutant() {  # mutant NOME 'trecho' 'troca' CASO — CASO é uma função que devolve 0 se o comportamento BOM aparece
   cp -p "$CITY/scripts/gate-done-remote.py" "$T/exe.good"
@@ -332,6 +395,21 @@ mutant md-sem-checar-forma 'if cur is not None or sorted(blocks) != [1, 2, 3, 4]
 mutant branch-alheio-nao-recusado 'if os.path.exists(wt) or refs.stdout.strip():' 'if os.path.exists(wt):' case_leftover_branch
 mutant listar-branches-falho-vira-vazio 'if refs.returncode != 0:' 'if False:' case_list_fail
 mutant solta-sem-compare-and-swap '"--if-assignee", alias, ' '' case_cas
+# ga-2hd02v.1.18: as guardas da volta do gate e da ambiguidade do -N (cada caso devolve 0 quando o comportamento BOM aparece: recusa 1 e nada no origin)
+refused_back() { [ "$RC" = 1 ] && ! origin_has "$BRB" >/dev/null; }
+case_back_other_author() { seed_back outro-dog outro-dog; run_exe_a -- ga-t2 "$BRB" "$SHAV"; refused_back; }
+case_back_newest() { seed_back outro-dog outro-dog; run_exe_a -- ga-t2 "$BRB" "$SHAV"; refused_back; }
+case_back_no_label() { seed_back "$ALIAS" "$ALIAS" open "" "gate:queued"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; refused_back; }
+case_back_no_route() { seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix" ""; run_exe_a -- ga-t2 "$BRB" "$SHAV"; refused_back; }
+case_back_no_marker() { seed_back "$ALIAS" "$ALIAS"; python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); [d["beads"].pop(k) for k in ("ga-mkold","ga-mknew")]; json.dump(d,open(sys.argv[1],"w"))' "$DB"
+  run_exe_a -- ga-t2 "$BRB" "$SHAV"; refused_back; }
+case_bare_role() { reset_db2; run_exe_a GC_SESSION_NAME=dog-remote -- ga-t2 "worker/dog-remote-2" "$SHA"; has "$T/err" "branch principal de OUTRA sessão"; }
+mutant volta-sem-checar-autor 'if not delivered_by(last, alias):' 'if False:' case_back_other_author
+mutant volta-pega-o-marcador-mais-antigo 'return max(rows, key' 'return min(rows, key' case_back_newest
+mutant volta-sem-gate-needs-fix 'isinstance(labels, list) and FIX_LABEL in labels' 'isinstance(labels, list)' case_back_no_label
+mutant volta-sem-rota 'meta.get("gc.routed_to") == ROUTE)' 'True)' case_back_no_route
+mutant volta-sem-marcador-vira-pode 'raise Stop(f"{bid} nunca foi entregue ao gate (nenhum marcador source-bead:{bid}): não há volta do gate para submeter")' 'return {"description": "author: " + os.environ["BEADS_ACTOR"]}' case_back_no_marker
+mutant sufixo-N-ambiguo-sem-guarda 'and BARE_ROLE_RE.fullmatch(sess):' 'and False:' case_bare_role
 
 echo
 echo "$((n - fails))/$n ok, $fails falhas"
