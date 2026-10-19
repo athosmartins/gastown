@@ -11741,6 +11741,64 @@ _pilot_node_first_veto() {
   return 0
 }
 
+# ── ga-2hd02v.1.19: o priority yield protege a capacidade do MINI; a vaga do NÓ não serve à P0/P1 que espera ────────────────────────────────────────
+# Medido 19/10 16:35 (1ª varredura com PILOT_NODE_FIRST=on): "priority yield: 192 P2+ candidate(s) ceded this sweep to P0 wa-7rjyod (wa-worker 2/2)", dispatched=0, e o node-first-shadow.jsonl
+# sem linha nova. O yield (ga-5fn5p3) cede ANTES do gancho do nó, que por isso nunca rodava. Mas a P0 do WA espera uma vaga do wa-worker, e uma sessão dog-remote no Hetzner não toma essa vaga.
+# A regra: com PILOT_NODE_FIRST=on, a bead de dog do HQ (pool gastown.dog, da própria cidade, sem rótulo de veto) NÃO cede se o oráculo do nó diz `node` com vaga — segue ao despacho e o gancho
+# do nó (_pilot_node_first_dispatch) a leva ao nó. Três estados, e nenhum vira "vai ao nó" por acaso: o oráculo diz node (e traz effective inteiro > 0) = não cede · diz local, não sabe, não
+# respondeu ou respondeu incoerente = cede, como antes · e a bead isenta que o nó NÃO ficou com (sem alias livre, sessão que não abriu, aviso que falhou, 2ª consulta que já diz local) cede
+# NA HORA em vez de cair no mini — o mini é justamente o que o yield protege (ver o fim do bloco do nó em dispatch_one).
+# Uma consulta por varredura (o veredito não depende da bead; a consulta mede o nó e grava estado) e no máximo `effective` beads isentas por varredura: o resto cede sem escrever nada, que
+# é o que impede 190 beads de gastarem claim + prompt + consulta cada uma contra um nó já cheio. `shadow` consulta e REGISTRA (a linha do _pilot_node_first_shadow) mas continua cedendo;
+# `off`, valor que não existe e DRY_RUN também cedem (o DRY_RUN não consulta: a consulta mede o nó e grava estado). Não toca em _pilot_priority_yield_for nem na regra do bloco do yield.
+_PNY_ASKED=0            # 1 depois que o oráculo foi consultado NESTA varredura (mesmo sem resposta: só pergunta de novo na próxima)
+_PNY_VERDICT=""         # a resposta da varredura (cópia de _PNF_VERDICT): node | local | unknown; vazio = não respondeu
+_PNY_EFFECTIVE=""       # quantas sessões remotas o oráculo deixa ter agora (inteiro > 0 quando o veredito é node)
+_PNY_GRANTED=" "        # " id id ": as beads isentas desta varredura (a mesma bead passa duas vezes, antes e depois da claim, e conta uma)
+_PNY_GRANTED_N=0
+_PNY_EXEMPT_THIS=0      # saída para dispatch_one: 1 iff a bead que está sendo despachada foi isenta do yield (zerado a cada dispatch_one)
+
+# _pilot_priority_node_exempt <bead_id> <target> <is_rig_native 0|1> <labels_csv> — exit 0 iff a bead que cederia ao P0/P1 em espera vai ao NÓ em vez de ceder; 1 em tudo o mais, inclusive
+# em qualquer dúvida (= cede, como antes). Quem chama já decidiu que a bead cederia. Não escreve nada na bead: consulta o oráculo (uma vez por varredura) e deixa a linha dele no log.
+_pilot_priority_node_exempt() {
+  local _ne_id="${1:-}" _ne_target="${2:-}" _ne_native="${3:-}" _ne_labels="${4:-}"
+  # off / valor que não existe / DRY_RUN / sem id → cede (o DRY_RUN não consulta o nó)
+  case "${PILOT_NODE_FIRST:-off}" in on|shadow) ;; *) return 1 ;; esac
+  [ "${DRY_RUN:-0}" != "1" ] || return 1
+  [ -n "$_ne_id" ] || return 1
+  # só a bead de dog do HQ entra (a regra de _pilot_node_first_shadow); com rótulo de veto cede sem consultar
+  { [ "$_ne_target" = "gastown.dog" ] && [ "$_ne_native" = "0" ]; } || return 1
+  [ -z "$(_pilot_node_first_veto "$_ne_labels")" ] || return 1
+  if [ "$_PNY_ASKED" != "1" ]; then
+    _PNY_ASKED=1
+    _pilot_node_first_shadow "$_ne_id" "$_ne_target" "$_ne_native" "$_ne_labels" || true
+    _PNY_VERDICT="${_PNF_VERDICT:-}"; _PNY_EFFECTIVE="${_PNF_EFFECTIVE:-}"
+    # o veredito fica na cópia da varredura; _PNF_* volta a vazio para não vazar para a leitura de outra bead
+    _PNF_VERDICT=""
+    _PNF_EFFECTIVE=""
+  fi
+  # shadow só registra; vazio (a consulta não respondeu) ou qualquer coisa que não seja node → cede
+  [ "$PILOT_NODE_FIRST" = "on" ] || return 1
+  [ "$_PNY_VERDICT" = "node" ] || return 1
+  case "$_PNY_EFFECTIVE" in ''|*[!0-9]*|0*) return 1 ;; esac
+  case "$_PNY_GRANTED" in *" $_ne_id "*) return 0 ;; esac
+  [ "$_PNY_GRANTED_N" -lt "$_PNY_EFFECTIVE" ] || return 1
+  _PNY_GRANTED="$_PNY_GRANTED$_ne_id "; _PNY_GRANTED_N=$((_PNY_GRANTED_N + 1))
+  return 0
+}
+
+# _pilot_priority_node_exempt_pre <bead-json> — a mesma pergunta ANTES da claim (dispatch_lane), onde só se tem o JSON da bead. A cidade e o alvo final ainda não são conhecidos (dispatch_one os
+# resolve): uma bead que o laço sabe levar a um pool e não está presa a wa-worker/ps-worker é de dog, e a cidade vai como "do HQ" (0). Errar para mais custa UMA claim + soltura (dispatch_one repete a
+# pergunta com o alvo e a cidade de verdade e cede se não for dela), nunca um despacho ao mini. JSON que não se lê (id, rota ou rótulos) → cede.
+_pilot_priority_node_exempt_pre() {
+  local _b="${1:-}" _id _routed _labels
+  _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || return 1
+  _routed=$(printf '%s' "$_b" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null) || return 1
+  _labels=$(printf '%s' "$_b" | jq -r '(.labels // []) | join(",")' 2>/dev/null) || return 1
+  case "$_routed" in wa-worker|wa-worker-*|ps-worker|ps-worker-*) return 1 ;; esac
+  _pilot_priority_node_exempt "$_id" "gastown.dog" "0" "$_labels"
+}
+
 # _pilot_node_first_shadow <story_id> <sling_target> <is_rig_native> <labels_csv> — ga-2hd02v.1.11 (SOMBRA) e ga-2hd02v.1.14 (on).
 # Pergunta ao oráculo do nó (hetzner-capacity.py verdict) para onde esta bead iria e GRAVA a resposta em $PILOT_NODE_FIRST_LOG. Em `shadow` NUNCA muda o despacho. Em `on` ainda
 # não muda nada aqui: deixa o veredito em _PNF_VERDICT/_PNF_EFFECTIVE e é o dispatch_one quem leva a bead ao nó (_pilot_node_first_dispatch). Devolve 0 o que quer que aconteça
@@ -13204,13 +13262,21 @@ LIVESEC
   # every bead it could tell was pool-bound BEFORE the claim; what reaches here is the first sight of a bead (no gc.routed_to
   # yet) or a rig whose builder only the routing above could name. Only a POOL target cedes: a named crew adds no session.
   # See the "PRIORITY ACROSS RIGS" block above _pilot_pool_topup for the rule, the fail-open reading and the off switches.
-  local _PYS_TARGET
+  local _PYS_TARGET _PYS_NATIVE=0
   _PYS_TARGET=$(wa_worker_template "$BUILDER_TARGET")
+  [ "$STORY_BEAD_CITY" != "$GC_CITY" ] && _PYS_NATIVE=1
+  _PNY_EXEMPT_THIS=0
   if _pilot_priority_target_is_pool "$_PYS_TARGET" && _pilot_priority_yield_for "$STORY"; then
-    _pilot_priority_yield_say "$STORY_ID" "claim released before the prompt is built (target $_PYS_TARGET is a pool); stays story:approved, re-evaluated next sweep."
-    _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "$_PYS_TARGET"
-    DISPATCH_RESULT="priority_yield"
-    return 1
+    # ga-2hd02v.1.19: a bead de dog do HQ que o nó quer não cede — a vaga do nó não é a que a P0/P1 espera. Se o nó não ficar com ela, o fim do bloco do nó (abaixo) a faz ceder.
+    if _pilot_priority_node_exempt "$STORY_ID" "$_PYS_TARGET" "$_PYS_NATIVE" "$STORY_LABELS"; then
+      _PNY_EXEMPT_THIS=1
+      log "  ga-2hd02v.1.19: $STORY_ID P${_PY_CAND_CLASS:-?} NÃO cede a P${_PY_WAIT_PRIO:-?} ${_PY_WAIT_ID:-?} — o nó Hetzner tem vaga (effective=${_PNY_EFFECTIVE:-?}) e não é a vaga que ela espera; se o nó não ficar com a bead, ela cede."
+    else
+      _pilot_priority_yield_say "$STORY_ID" "claim released before the prompt is built (target $_PYS_TARGET is a pool); stays story:approved, re-evaluated next sweep."
+      _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "$_PYS_TARGET"
+      DISPATCH_RESULT="priority_yield"
+      return 1
+    fi
   fi
 
   # ── wa-root-worktree-isolation: rig-root → worktree directive (best-effort) ───
@@ -13679,6 +13745,16 @@ TASK
       DISPATCH_RESULT="node_rollback_unconfirmed"
       return 1
     fi
+  fi
+  # ── ga-2hd02v.1.19: isenta do priority yield SÓ enquanto o nó fica com a bead ──
+  # Aqui chega a bead que o yield mandaria ceder e que foi isenta porque o nó tinha vaga. Se o nó não ficou com ela (_PNF_RESULT != node: a 2ª consulta já disse local/unknown, sem alias livre,
+  # sessão que não abriu, aviso que falhou — nesses casos `mini` = nada ficou escrito), seguir seria abrir uma sessão no MINI para uma P2+ com uma P0/P1 esperando capacidade: exatamente o que o
+  # yield impede. Cede como o ramo pós-claim de cima: solta a claim, a bead segue story:approved e é reavaliada na próxima varredura. `stuck` já voltou acima (o claim fica para o TTL).
+  if [ "${_PNY_EXEMPT_THIS:-0}" = "1" ] && [ "${_PNF_RESULT:-}" != "node" ]; then
+    _pilot_priority_yield_say "$STORY_ID" "o nó não ficou com a bead (veredito=${_PNF_VERDICT:-nenhum} resultado=${_PNF_RESULT:-nenhum}); NÃO vai ao mini — claim solta, reavaliada na próxima varredura."
+    _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "$_PYS_TARGET"
+    DISPATCH_RESULT="priority_yield"
+    return 1
   fi
 
   # ── Dispatch via gc sling (HQ beads) or bd assign (rig-native beads) ─────────
@@ -14847,7 +14923,8 @@ dispatch_lane() {
     # Not a fault and not a capacity queue: it feeds PRIORITY_YIELDED, which the saturation predicate below counts, and
     # never NONQUEUE_FAILS. A bead whose pool cannot be told before the claim (a first-sight WA/PS bead) is decided in
     # dispatch_one(), once the builder is chosen. See the "PRIORITY ACROSS RIGS" block above _pilot_pool_topup.
-    if _pilot_priority_pool_bound_pre "$pick" && _pilot_priority_yield_for "$pick"; then
+    # ga-2hd02v.1.19: a bead de dog do HQ que o oráculo do nó quer (PILOT_NODE_FIRST=on, veredito node com vaga) não cede aqui — vai à claim, e dispatch_one repete a pergunta com o alvo e a cidade de verdade.
+    if _pilot_priority_pool_bound_pre "$pick" && _pilot_priority_yield_for "$pick" && ! _pilot_priority_node_exempt_pre "$pick"; then
       _pilot_priority_yield_say "$pick_id" "not claimed, no writes this sweep; stays story:approved and is re-evaluated every sweep."
       _pilot_sweep_note "$pick_id" 1 "priority_yield"
       PRIORITY_YIELDED=$((PRIORITY_YIELDED + 1))
