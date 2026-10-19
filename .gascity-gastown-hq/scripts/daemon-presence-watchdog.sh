@@ -98,7 +98,7 @@ _deliberately_disabled() {
 # system sleep, NOT to a hung daemon); 0 = legacy behaviour (flag regardless).
 DPW_WAKE_GRACE="${DPW_WAKE_GRACE:-1}"
 
-DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch}"
+DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch com.gascity.child-priority-janitor}"
 
 HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 
@@ -136,7 +136,8 @@ com.gascity.story-delivery|$HQ/.gc/logs/story-delivery.log|1500
 com.gascity.approved-state-reconciler|$HQ/.gc/logs/approved-state-reconciler.out|3000
 com.gascity.auto-rehome-janitor|$HQ/.gc/logs/auto-rehome-janitor.out|3000
 com.gascity.sling-task-janitor|$HQ/.gc/logs/sling-task-janitor.out|4500
-com.gascity.gate-marker-rehome-janitor|$HQ/.gc/logs/gate-marker-rehome-janitor.out|1600}"
+com.gascity.gate-marker-rehome-janitor|$HQ/.gc/logs/gate-marker-rehome-janitor.out|1600
+com.gascity.child-priority-janitor|$HQ/.gc/logs/child-priority-janitor.out|900}"
 
 # ── RECYCLER — memory-bounded restart of known-leaky Python dashboards ────────
 # Knobs (override via env or the launchd plist EnvironmentVariables):
@@ -1608,6 +1609,42 @@ GCSTUB20
     bad "refino-gate-dispatcher.sh does not mention $(basename "$_rg_file") — the watchdog would read a file nobody writes"
   fi
   unset _rg_lbl _rg_line _rg_file _rg_max _rg_disp
+
+  echo "Scenario 22c (ga-p7hymz.1): real default covers child-priority-janitor, and the heartbeat file is the one launchd writes"
+  # Mesma classe da 22b: a entrada só vale se (a) o rótulo está em DPW_HEARTBEAT com limite numérico, (b) está em
+  # DPW_CRITICAL (o laço só itera sobre ele) e (c) o arquivo que o watchdog lê é o StandardOutPath do plist — nome
+  # divergente = "arquivo ausente" para sempre, que `_log_age` trata como "sem veredito" (silêncio, nunca alarme).
+  # Quem não consegue ler o plist REPROVA (não passa em branco): ler vazio ou falhar nunca vira "ok".
+  _cp_lbl="com.gascity.child-priority-janitor"
+  _cp_line="$(printf '%s\n' "$_REAL_DEFAULT_HEARTBEAT" | awk -F'|' -v l="$_cp_lbl" '$1==l{print; exit}')"
+  _cp_file="$(printf '%s' "$_cp_line" | awk -F'|' '{print $2}')"
+  _cp_max="$(printf '%s' "$_cp_line" | awk -F'|' '{print $3}')"
+  _cp_plist="$(cd "$(dirname "$0")" && pwd)/$_cp_lbl.plist"
+  # vazio/ausente → _cp_int e _cp_out ficam vazios e as checagens abaixo REPROVAM; falhou/ilegível → idem (2>/dev/null só cala o erro, o valor vazio reprova)
+  _cp_int="$(sed -n 's|.*<key>StartInterval</key><integer>\([0-9][0-9]*\)</integer>.*|\1|p' "$_cp_plist" 2>/dev/null | head -1)"
+  _cp_out="$(awk '/<key>StandardOutPath<\/key>/{getline; gsub(/.*<string>|<\/string>.*/,""); print; exit}' "$_cp_plist" 2>/dev/null)"
+  if [ -n "$_cp_line" ]; then ok "DPW_HEARTBEAT default covers $_cp_lbl ($_cp_line)"; else bad "DPW_HEARTBEAT default MISSING an entry for $_cp_lbl"; fi
+  case "$_cp_max" in ''|*[!0-9]*) bad "$_cp_lbl heartbeat threshold is not numeric ([$_cp_max])" ;; *) ok "$_cp_lbl heartbeat threshold is numeric ($_cp_max s)" ;; esac
+  case " $_REAL_DEFAULT_CRITICAL " in
+    *" $_cp_lbl "*) ok "$_cp_lbl is also in DPW_CRITICAL (heartbeat entry is reachable)" ;;
+    *) bad "$_cp_lbl has a heartbeat entry but is NOT in DPW_CRITICAL (dead config)" ;;
+  esac
+  case "$_cp_int" in
+    ''|*[!0-9]*) bad "$_cp_lbl StartInterval unreadable from $_cp_plist ([$_cp_int]) — cannot prove the threshold" ;;
+    *)
+      # mais que 2x o StartInterval (um ciclo perdido não pode disparar kickstart) e ainda um limite que pega pendurão
+      if [ "${_cp_max:-0}" -gt $(( _cp_int * 2 )) ] 2>/dev/null && [ "${_cp_max:-99999}" -le 3000 ] 2>/dev/null; then
+        ok "$_cp_lbl threshold ${_cp_max}s is > 2x StartInterval (${_cp_int}s) and <= 3000 s"
+      else
+        bad "$_cp_lbl threshold ${_cp_max}s is not in (2x StartInterval ${_cp_int}s, 3000 s]"
+      fi ;;
+  esac
+  if [ -n "$_cp_out" ] && [ "$(basename "$_cp_out")" = "$(basename "$_cp_file")" ]; then
+    ok "plist StandardOutPath ($(basename "$_cp_out")) is the same file the watchdog reads"
+  else
+    bad "plist StandardOutPath ([$_cp_out]) does not match the heartbeat file ([$_cp_file]) — the watchdog would read a file launchd never writes"
+  fi
+  unset _cp_lbl _cp_line _cp_file _cp_max _cp_plist _cp_int _cp_out
 
   echo "Scenario 23 (ga-g92h): _exit_class distinguishes OOM-killed (137) from a real failure"
   # Provenance checks off (matches the imp17 block's own convention above) --

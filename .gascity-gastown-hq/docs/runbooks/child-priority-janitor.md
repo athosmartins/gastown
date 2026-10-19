@@ -52,7 +52,7 @@ cp scripts/com.gascity.child-priority-janitor.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.child-priority-janitor.plist
 ```
 
-Registrar no `daemon-presence-watchdog.sh`: o nome do job em `DPW_CRITICAL` e a linha `com.gascity.child-priority-janitor|$HQ/.gc/logs/child-priority-janitor.out|<segundos>` no mapa de heartbeat (o log é o batimento: o janitor escreve uma linha por sweep). Registrar **antes** de carregar acende CRITICAL; carregar sem registrar deixa o job morrer sem ninguém ver. Por isso os dois no mesmo passo. Intervalo de heartbeat sugerido: mais que 2× o `StartInterval` (≥ 600).
+Registrar no `daemon-presence-watchdog.sh`: o nome do job em `DPW_CRITICAL` e a linha `com.gascity.child-priority-janitor|$HQ/.gc/logs/child-priority-janitor.out|900` no mapa de heartbeat (o log é o batimento: o janitor escreve uma linha por sweep). Registrar **antes** de carregar acende CRITICAL; carregar sem registrar deixa o job morrer sem ninguém ver. Por isso os dois no mesmo passo. Intervalo de heartbeat sugerido: mais que 2× o `StartInterval` (≥ 600). Feito em 19/10 (ga-p7hymz.1): 900 s = 3× o `StartInterval` de 297 s; o cenário 22c do `daemon-presence-watchdog.sh --selftest` trava a entrada (rótulo em `DPW_CRITICAL`, limite > 2× o intervalo do plist, arquivo = `StandardOutPath` do plist).
 
 Para subir só em dry-run por um dia, ponha `CHILD_PRIORITY_JANITOR_DRY_RUN=1` no plist antes de carregar e tire depois de conferir o log.
 
