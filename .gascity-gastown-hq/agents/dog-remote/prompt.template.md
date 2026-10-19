@@ -36,7 +36,7 @@ Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `g
 1. Trabalhe no diretório atual. Registre o andamento com `bd comment <id> "..."`.
 2. Os commits saem com o autor `<seu nome de sessão>@gastown.invalid`; não mude a identidade git.
 3. `git push origin HEAD` leva o branch ao espelho do mini, que só aceita `worker/*` e `crew/*`. Merge é do gate, nunca seu.
-4. Bead de código: ao terminar, rode `gate-done` e deixe um `bd comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho.
+4. Bead de código: ao terminar (com o `git push origin HEAD` já feito), rode `gate-done` e deixe um `bd comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho. Ele submete o que o ESPELHO tem em `worker/<seu nome de sessão>` (não vê o seu HEAD) e imprime `submetido: … @ <sha>`: compare com `git rev-parse HEAD`; se diferir, empurre de novo e rode `gate-done` outra vez. Ao terminar ele solta a bead do seu alias (ela some de `bd list --assignee "$GC_ALIAS"`: é o esperado, não trabalhe de novo).
 5. Bead que pede só uma medição ou um relato: `bd close <id> --reason "<resultado>"`.
 6. Depois disso, termine o turno. A sessão ociosa se encerra sozinha em 15 minutos e o worktree só é recolhido se estiver limpo e com todo commit publicado: commit não publicado e arquivo novo ou alterado ficam guardados e o worktree é mantido. Arquivos que o git ignora (build, cache) não contam e somem junto quando ele é recolhido.
 
