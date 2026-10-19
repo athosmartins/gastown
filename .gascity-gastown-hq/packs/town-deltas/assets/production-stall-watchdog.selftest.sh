@@ -715,22 +715,27 @@ print('OK_GATE_LOOKUP_IS_LAZY_AND_BOUNDED')
 " "OK_GATE_LOOKUP_IS_LAZY_AND_BOUNDED"
 
 # --- 15q. what counts as "in the gate queue" ----------------------------------
-# Same active vocabulary as pilot-dispatcher's _beadid_has_active_gate_artifact and
-# inflight-reclaim-guard's list_gate_active_source_beads (marker: ready/claimed/queued/
-# dispatching/reviewing; run: running/claimed), plus the guard's fail-safe: a marker with no
-# gate-status label at all reads as active. needs-rebase / error and the terminal pairs
-# do not (the gate stepped back onto an external actor — not "waiting for review").
+# A MARKER counts with the active vocabulary of pilot-dispatcher's
+# _beadid_has_active_gate_artifact and inflight-reclaim-guard's list_gate_active_source_beads
+# (ready/claimed/queued/dispatching/reviewing/running), plus the guard's fail-safe: a marker
+# with no gate-status label at all reads as active. needs-rebase / error and the terminal
+# pairs do not (the gate stepped back onto an external actor — not "waiting for review").
+# A RUN has its own rule (_gate_artifact_active): active unless it carries a gate-status and
+# every one of them is terminal (superseded/aborted/passed/failed); a run with no gate-status
+# label at all reads as active too, same fail-safe as the marker; one live status among
+# terminal ones (a run caught mid-transition) keeps it active.
 run_test "_gate_active_source_beads: active marker/run states and a label-less marker count; needs-rebase, error and terminal ones do not" "
 $HARNESS
 $GATE_HARNESS
 mk = [marker('ga-a', 'queued'), marker('ga-b', 'needs-rebase'), marker('ga-c', 'reviewing'),
       marker('ga-d'), marker('ga-e', 'needs-rebase', 'superseded'), marker('ga-f', 'queued', 'dispatching'),
       marker('ga-g', 'ready'), marker('ga-h', 'claimed'), marker('ga-i', 'dispatching'), marker('ga-j', 'error')]
-rn = [gate_run('ga-k', 'running'), gate_run('ga-l', 'passed'), gate_run('ga-n', 'superseded'), gate_run('ga-o', 'claimed')]
+rn = [gate_run('ga-k', 'running'), gate_run('ga-l', 'passed'), gate_run('ga-n', 'superseded'), gate_run('ga-o', 'claimed'),
+      gate_run('ga-p'), gate_run('ga-q', 'aborted', 'failed'), gate_run('ga-r', 'running', 'passed')]
 m.sh = make_sh([], markers=mk, runs=rn)
 got = m._gate_active_source_beads()
 print('GOT=%r' % sorted(got))
-want = {'ga-a','ga-c','ga-d','ga-f','ga-g','ga-h','ga-i','ga-k','ga-o'}
+want = {'ga-a','ga-c','ga-d','ga-f','ga-g','ga-h','ga-i','ga-k','ga-o','ga-p','ga-r'}
 assert got == want, sorted(got ^ want)
 print('OK_GATE_ACTIVE_CLASSIFICATION')
 " "OK_GATE_ACTIVE_CLASSIFICATION"

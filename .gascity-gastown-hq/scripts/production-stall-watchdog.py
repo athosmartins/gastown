@@ -548,8 +548,8 @@ def stuck_execution(now=None):
 
     ga-z5311j: a stale bead waiting in the gate's review queue is not an execution stall
     either — it is the gate's turn. It is left out of the alarm and listed apart
-    ("aguardando revisão no gate"): in the reason when other beads do alarm, in the log
-    when none does. The gate is read lazily (only once a bead is already stale; one
+    ("aguardando revisão no gate"): in the log on every sweep that has one, and also in the
+    reason when other beads do alarm. The gate is read lazily (only once a bead is already stale; one
     marker query + one run query per sweep) and the answer has three outcomes —
     confirmed in the queue → listed apart; confirmed NOT in it (gate read, nothing
     names the bead) → a leftover gate:* label decides nothing and the bead still
@@ -594,7 +594,8 @@ def stuck_execution(now=None):
             # thing "gc session peek/kill" can act on) — owner is just who
             # created the bead, often a human with no session to peek/kill.
             # vazio (assignee e owner ausentes) → "?"; owner placeholder do HQ → "sem dono"
-            # (ga-z5311j), nunca o e-mail de teste como se fosse alguém
+            # (ga-z5311j), nunca o e-mail de teste como se fosse alguém; ilegível (valor que
+            # não é texto) → mostrado como veio, sem levantar
             assignee, owner = b.get("assignee"), b.get("owner")
             placeholder_owner = isinstance(owner, str) and owner in PLACEHOLDER_OWNERS
             if placeholder_owner:
