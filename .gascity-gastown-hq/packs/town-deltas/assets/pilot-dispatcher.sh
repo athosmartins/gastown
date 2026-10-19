@@ -5472,7 +5472,7 @@ fi
 # dolt-disk-floor-guard.sh (WARN/CRITICAL with its own cooldowns); this gate only holds the door.
 # `|| rc=$?`: the reader answers 1 for "no pause", and the dispatcher runs under set -e.
 # ga-2hd02v.1.20: _PILOT_NODE_ONLY=1 is the NODE-ONLY pass. Only this gate sets it (a CONFIRMED low disk + PILOT_NODE_FIRST=on, outside DRY_RUN); dispatch_lane, dispatch_one, the pool top-up,
-# the pause-clearing below and the Step 5 stall streak read it. Always 0 otherwise.
+# the pause-clearing below, the Step 5 stall streak and the cede-only streak check (_pilot_yield_stall_check) read it. Always 0 otherwise.
 _PILOT_NODE_ONLY=0
 _disk_floor_rc=0
 _pilot_disk_floor || _disk_floor_rc=$?
@@ -15128,6 +15128,9 @@ fi
 
 # ga-2lca0l (3): the cede-only streak Step 5 above deliberately ignores (a sweep that only ceded is "saturated") is its own alarm:
 # N sweeps with dispatched=0, free slots and cessions → the Mayor is mailed once, naming the P0/P1 and the pool's sessions.
-_pilot_yield_stall_check || true
+# ga-2hd02v.1.20: a NODE-ONLY pass (disk floor) is a paused sweep for the mini and PRIORITY_YIELDED is 0 in it by construction, so this check would read it as "a sweep that did not cede" and END a streak the pause only interrupted — before, such a sweep exited at the gate and never got here: the streak stays as it was, like Step 5's above.
+if [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then
+  _pilot_yield_stall_check || true
+fi
 
 log "=== Pilot sweep complete: dispatched=$DISPATCHED (small_slots=$SMALL_SLOTS big_slots=$BIG_SLOTS dolt_saturated_at_start=${PILOT_DOLT_SATURATED_AT_START:-0}) ==="
