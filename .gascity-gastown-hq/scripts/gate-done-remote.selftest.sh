@@ -245,6 +245,67 @@ has "$T/out" "Marker created: ga-mk1"; ok $? "pelo wrapper: o marcador foi criad
 grep -q "gate-done" "$T/shim.log" && grep -q "done	rc=0\|rc=0" "$T/shim.log"; ok $? "pelo wrapper: a auditoria registra a regra gate-done e rc=0"
 clean_after; ok $? "pelo wrapper: nada sobrou"; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR"
 
+# ── 9. `gate-done <bead> <ref> <sha>` (ga-2hd02v.1.18): a 2ª bead da sessão sai do ref que o dog diz, com o sha conferido ANTES do marcador ─────────────
+db_edit() {  # db_edit 'código python sobre d (o banco falso)'
+  python3 -I - "$DB" "$1" <<'EOF'
+import json, sys
+p, code = sys.argv[1:]
+d = json.load(open(p))
+exec(code)
+json.dump(d, open(p, "w"))
+EOF
+}
+run_exe_a() {  # run_exe_a [VAR=valor ...] -- arg... → RC, $T/out, $T/err: a forma com argumentos, no mesmo ambiente do run_exe
+  envs=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done; [ $# -gt 0 ] && shift
+  ( cd "$CITY" && env -i HOME="$T/home" USER=t LOGNAME=t LANG=en_US.UTF-8 PATH="$BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+      BEADS_ACTOR="$ALIAS" GC_ALIAS="$ALIAS" GC_SESSION_NAME="$SESS" GC_TEMPLATE=dog-remote ${envs[@]+"${envs[@]}"} \
+      "$CITY/scripts/gate-done-remote.py" "$@" ) > "$T/out" 2> "$T/err"; RC=$?
+}
+mk_work() {  # mk_work ARQUIVO REF [BASE] → NEWSHA: um commit novo (filho de BASE, padrão main), empurrado ao espelho em refs/heads/REF
+  G -C "$OUTER" checkout -q -b work-tmp "${3:-main}" && printf '%s\n' "$1" > "$CITY/$1" && G -C "$OUTER" add "city/$1" >/dev/null && G -C "$OUTER" commit -qm "feat: $1" \
+    && NEWSHA=$(git -C "$OUTER" rev-parse HEAD) && git -C "$OUTER" push -q -f "$MIRROR" "HEAD:refs/heads/$2"
+  r=$?; G -C "$OUTER" checkout -q main; git -C "$OUTER" branch -q -D work-tmp; return $r
+}
+BR2="fix/ga-t2-segunda-bead-da-sessao"
+reset_db2() {  # ga-t1 e ga-t2, as duas in_progress com o alias (a 2ª bead da mesma sessão); o origin sem o branch da ga-t2
+  reset_db; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR2" 2>/dev/null
+  db_edit 'd["beads"]["ga-t2"] = dict(d["beads"]["ga-t1"], id="ga-t2", title="Segunda bead da sessao")'
+}
+clean_after2() {  # clean_after2 BEAD BRANCH — nada do que a execução criou sobra
+  [ ! -e "$CITY/.gc/gate-done-remote/wt-$1" ] && ! git -C "$OUTER" show-ref -q --verify "refs/heads/$2" && [ -z "$(git -C "$OUTER" for-each-ref refs/gt-remote)" ] \
+    && [ "$(git -C "$OUTER" worktree list | wc -l | tr -d ' ')" = 1 ]
+}
+mk_work seg.txt "worker/$SESS-2"; SHAB=$NEWSHA
+reset_db2; run_exe_a -- ga-t2 "worker/$SESS-2" "$SHAB"
+ok $((RC != 0)) "2ª bead: gate-done ga-t2 worker/<sessão>-2 <sha> sai 0 (as duas beads do alias estão in_progress)"
+[ "$(origin_has "$BR2")" = "$SHAB" ]; ok $? "2ª bead: o origin tem $BR2 no sha de worker/<sessão>-2 (fix/<bead>-…, não worker/…)"
+[ "$(dbq '[.beads[] | select((.labels // []) | index("source-bead:ga-t2"))] | length')" = 1 ]; ok $? "2ª bead: UM marcador, o da ga-t2"
+[ -z "$(dbq '.beads["ga-t2"].assignee // ""')" ] && [ "$(dbq '.beads["ga-t2"].metadata | has("gc.routed_to")')" = false ]; ok $? "2ª bead: a ga-t2 foi solta"
+[ "$(dbq '.beads["ga-t1"].assignee // ""')" = "$ALIAS" ] && [ "$(dbq '.beads["ga-t1"].metadata | has("gc.routed_to")')" = true ]; ok $? "2ª bead: a ga-t1 (a 1ª) NÃO foi tocada"
+has "$T/out" "submetido: $BR2 @ $SHAB"; ok $? "2ª bead: a saída imprime o sha submetido"
+clean_after2 ga-t2 "$BR2"; ok $? "2ª bead: worktree, branch local e ref temporária foram recolhidos"
+reset_db2; run_exe_a -- ga-t2 "refs/heads/worker/$SESS-2" "$SHAB"
+ok $((RC != 0)) "ref escrito com refs/heads/: aceito, mesmo caminho"
+# sha que não é o do espelho: recusa ANTES do marcador, dizendo os dois
+reset_db2; run_exe_a -- ga-t2 "worker/$SESS-2" "$SHA"
+ok $((RC != 1)) "sha que não é o do espelho: recusa 1"; has "$T/err" "o espelho tem ${SHAB:0:12}"; ok $? "sha errado: diz o que o espelho tem"
+has "$T/err" "você disse ${SHA:0:12}"; ok $? "sha errado: diz o que o dog disse"
+[ "$(mut_count)" = 0 ] && ! origin_has "$BR2" >/dev/null; ok $? "sha errado: nada escrito (nem marcador, nem branch no origin)"
+# refs que a sessão não pode submeter: outra sessão (inclusive uma cujo nome COMEÇA com o da minha), sufixo que não é número, fix/ de outra bead, tag
+mk_work alheio.txt "worker/${SESS}4"; SHAX=$NEWSHA
+for bad in "worker/${SESS}4" "worker/$SESS-x" "worker/dog-remote-zzz999-2" "fix/ga-t1-de-outra-bead" "refs/heads/worker/${SESS}4" "refs/tags/x"; do
+  reset_db2; run_exe_a -- ga-t2 "$bad" "$SHAX"
+  ok $((RC != 1)) "ref $bad: recusa 1"; has "$T/err" "fora do que esta sessão pode submeter"; ok $? "ref $bad: diz que está fora do que a sessão pode submeter"
+  [ "$(mut_count)" = 0 ] && ! origin_has "$BR2" >/dev/null; ok $? "ref $bad: nada escrito"
+done
+git --git-dir="$MIRROR" update-ref -d "refs/heads/worker/${SESS}4"
+# o dog empurrou fix/<bead>-<resumo>: o branch do origin leva o NOME que ele deu, não o do título
+mk_work seg2.txt "fix/ga-t2-meu-resumo"; SHAF=$NEWSHA
+reset_db2; run_exe_a -- ga-t2 "fix/ga-t2-meu-resumo" "$SHAF"
+ok $((RC != 0)) "fix/<bead>-<resumo>: sai 0"
+[ "$(origin_has "fix/ga-t2-meu-resumo")" = "$SHAF" ] && ! origin_has "$BR2" >/dev/null; ok $? "fix/<bead>-<resumo>: o origin leva o nome que o dog deu (não o do título)"
+git --git-dir="$ORIGIN" update-ref -d "refs/heads/fix/ga-t2-meu-resumo"; git --git-dir="$MIRROR" update-ref -d "refs/heads/fix/ga-t2-meu-resumo"; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR2" 2>/dev/null
+
 # ── 8. mutantes: cada guarda apagada tem de reprovar o caso que a prova ───────────────────────────────────────────────────────────────────────────
 mutant() {  # mutant NOME 'trecho' 'troca' CASO — CASO é uma função que devolve 0 se o comportamento BOM aparece
   cp -p "$CITY/scripts/gate-done-remote.py" "$T/exe.good"
