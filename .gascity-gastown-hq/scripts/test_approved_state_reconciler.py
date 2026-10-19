@@ -4,15 +4,19 @@ _extra_alarm_suppress_reason()'s pilot:text-veto:* recognition (ga-qt0mj) and fo
 the pool-cap containment evidence the reconciler reads from the Pilot's own log
 (ga-9ekn2l — _pilot_cap_evidence / _alarm_capacity_wait).
 
-Hermetic: pure-function tests only, no Dolt/bd/network access.
+Hermetic: pure-function tests only, no Dolt/bd/network access. The pool probes' veto list
+(ga-d3b5yr) is pointed at a file that is not there unless a test asks for the real one, so no
+test depends on whether the machine it runs on has the city tree.
 
 Run: python3 -m pytest scripts/test_approved_state_reconciler.py -q
 """
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -66,7 +70,8 @@ def test_no_text_veto_label_still_alarms():
 
 def test_pilot_text_veto_does_not_match_unrelated_pilot_prefix():
     """_has_prefix requires an exact ':' boundary — pilot:text-vetoed (no colon
-    before 'ed') or an unrelated pilot:* label must NOT false-positive."""
+    before 'ed') or an unrelated pilot:* label must NOT false-positive. The TABLE only:
+    the pool probes' own startswith is a separate layer (the ga-d3b5yr tests below)."""
     assert asr._extra_alarm_suppress_reason(["pilot:dispatched"]) is None
     assert asr._extra_alarm_suppress_reason(["pilot:text-vetoed-typo"]) is None
 
@@ -1277,3 +1282,266 @@ def test_the_read_back_survives_a_bd_that_could_not_even_start(monkeypatch):
     monkeypatch.setattr(asr, "_bd_read_assignee", None)
     monkeypatch.setattr(asr, "_sh", lambda args, **_k: None)
     assert asr._read_assignee("/rig", "wa-1") is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ga-d3b5yr — a bead PARKED by a label the pool probes refuse is not "starving".
+#
+# Measured 19/10 03:50Z (mail ga-wisp-urnyd2, "nota #12"): "Pilot pausado 25/28 sweeps — 2 beads
+# esperando" named ga-hg8amk (needs-human-decision) and ga-x29cqt (blocked-reason:decision), both
+# correctly in the Athos's queue, neither waiting on the Pilot. Not 2 labels but a CLASS: 14 exact
+# labels and 1 prefix family that pool-probe-vetoes.sh makes the pool workers refuse were unknown
+# here, because _EXTRA_ALARM_SUPPRESS_PREFIXES is a hand copy of the dispatch path's vetoes (7th
+# drift: ga-eu2x, ga-1mqdz, ga-it3e8, ga-qt0mj, wa-4uh2w, ga-ulg9j, this one). The class is closed by
+# READING the file those vetoes live in. The expected sets below always come from that file's own
+# pool_veto_cfg (bash + jq) — never from the Python reader under test.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+POOL_PROBE_VETOES = Path(os.environ.get(
+    "POOL_PROBE_VETOES_UNDER_TEST",
+    str(MOD_PATH.parent.parent / "packs" / "town-deltas" / "assets" / "scripts" / "pool-probe-vetoes.sh")))
+
+
+def _pool_veto_cfg(mode):
+    """What pool-probe-vetoes.sh ITSELF answers (its own pool_veto_cfg, through bash + jq): the oracle
+    the Python reader is held to. Skipped — never passed — where bash or jq is missing."""
+    if shutil.which("bash") is None or shutil.which("jq") is None:
+        pytest.skip("bash and jq are needed to ask pool-probe-vetoes.sh what it vetoes")
+    out = subprocess.run(["bash", "-c", '. "$1"; pool_veto_cfg "$2"', "_", str(POOL_PROBE_VETOES), mode],
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def _prefix_sample(prefix):
+    """A label the probe's startswith(prefix) refuses: the prefix plus a typical suffix."""
+    return prefix + ("x" if prefix.endswith(":") else ":x")
+
+
+def _vetoes_file(tmp_path, **over):
+    """A well-formed pool-probe-vetoes.sh (12 exact labels, 3 prefixes in the union); a keyword
+    replaces one variable's JSON, None leaves that variable out."""
+    parts = {
+        "POOL_VETO_EXACT_DOG": json.dumps(["lab:%02d" % i for i in range(8)]),
+        "POOL_VETO_EXACT_WA": json.dumps(["lab:%02d" % i for i in range(4, 12)]),
+        "POOL_VETO_PREFIX_DOG": json.dumps(["pfx-one:", "pfx-two"]),
+        "POOL_VETO_PREFIX_WA": json.dumps(["pfx-two", "pfx-three:"]),
+    }
+    parts.update(over)
+    p = tmp_path / "pool-probe-vetoes.sh"
+    p.write_text("".join("%s='%s'\n" % (k, v) for k, v in parts.items() if v is not None))
+    return p
+
+
+def _point_reader_at(monkeypatch, path):
+    monkeypatch.setattr(asr, "_pool_probe_vetoes_path", lambda: str(path), raising=False)
+    monkeypatch.setattr(asr, "_POOL_PROBE_VETOES", None, raising=False)
+    monkeypatch.setattr(asr, "_POOL_PROBE_VETOES_WARNED", False, raising=False)
+
+
+@pytest.fixture
+def vetoes_lib(monkeypatch):
+    """The reader pointed at the real file, with no memo and no warning carried over."""
+    _point_reader_at(monkeypatch, POOL_PROBE_VETOES)
+
+
+@pytest.fixture
+def no_vetoes_lib(tmp_path, monkeypatch):
+    """The reader pointed at a file that is not there: 'could not tell'."""
+    _point_reader_at(monkeypatch, tmp_path / "gone.sh")
+
+
+@pytest.fixture(autouse=True)
+def _the_machines_veto_list_is_not_read(tmp_path, monkeypatch):
+    """Every test in this module starts with the reader pointed at a file that is not there. The tests written
+    for the hand table read the same on a machine with the city tree (where the real list ALSO refuses a label
+    like pilot:text-vetoed-typo, startswith being what the probes run) and on one without — which is how
+    test_pilot_text_veto_does_not_match_unrelated_pilot_prefix passed on the Hetzner server and failed on the
+    mini. A test that wants the derived layer asks for vetoes_lib (the real file) or builds its own."""
+    _point_reader_at(monkeypatch, tmp_path / "not-the-machines-pool-probe-vetoes.sh")
+
+
+@pytest.mark.parametrize("label", [
+    "needs-human-decision",      # ga-hg8amk — measured 19/10; the Pilot's startswith("needs-human") and both pools' exact veto
+    "blocked-reason:decision",   # ga-x29cqt — measured 19/10; the "Sua vez" park marker (the dog probe's prefix veto)
+    "blocked-reason:feasibility",
+    "blocked-reason:capacity",
+])
+def test_the_two_measured_parks_hold_even_when_the_probe_list_cannot_be_read(no_vetoes_lib, label):
+    """The cases that produced the false 'Pilot pausado' note do not depend on the derived list: they
+    stay recognised if pool-probe-vetoes.sh is moved, renamed or corrupt."""
+    assert asr._extra_alarm_suppress_reason(["story:approved", "ctx:ready", "exec:auto", label]) is not None
+
+
+@pytest.mark.parametrize("label", ["needs-human-decision", "needs-human-followup", "needs-human-priority"])
+def test_the_needs_human_family_is_one_human_gate_whatever_its_suffix(no_vetoes_lib, label):
+    """The Pilot vetoes startswith("needs-human"); bead_state, inflight-reclaim-guard and auto-refino
+    all read the "-" suffix family as ONE gate (needs-human-followup is a real label, ga-3lsy1)."""
+    reason = asr._extra_alarm_suppress_reason(["story:approved", label])
+    assert reason is not None and "needs-human" in reason, (label, reason)
+
+
+@pytest.mark.parametrize("label", ["needs-humanoid", "needs-humans", "blocked-reasoning", "ctx:ready", "exec:auto"])
+def test_a_look_alike_label_is_not_a_park(vetoes_lib, label):
+    """FALSIFICATION: the rules end at a real boundary (":" or "-"). A label that merely starts with the
+    same letters still alarms, so a buildable bead that starves is still reported."""
+    assert asr._extra_alarm_suppress_reason(["story:approved", label]) is None, label
+
+
+def test_every_label_the_pool_probes_refuse_is_a_non_buildable_signal_here(vetoes_lib):
+    """CLASS GUARD. A bead whose only mark is a label some pool probe refuses is never picked up by that
+    pool: it is parked, not starving. Held against pool-probe-vetoes.sh's OWN answer (pool_veto_cfg any),
+    so the next veto added there fails here instead of paging the Mayor weeks later."""
+    cfg = _pool_veto_cfg("any")
+    assert len(cfg["exact"]) >= 10 and len(cfg["prefix"]) >= 3, "the oracle is empty: %r" % (cfg,)
+    samples = list(cfg["exact"]) + [_prefix_sample(p) for p in cfg["prefix"]]
+    unknown = [s for s in samples if asr._extra_alarm_suppress_reason(["story:approved", s]) is None]
+    assert not unknown, ("%d label(s) pool-probe-vetoes.sh refuses would still alarm 'dispatch failing' "
+                         "here: %s" % (len(unknown), unknown))
+
+
+def test_the_pool_probe_reader_equals_pool_veto_cfg_any_exactly(vetoes_lib):
+    """DRIFT GUARD on the reader itself: what Python parses out of the file is what the file's own
+    function prints, label for label and prefix for prefix."""
+    cfg = _pool_veto_cfg("any")
+    got = asr._pool_probe_vetoes()
+    assert got is not None, "the reader could not read the real file"
+    exact, prefixes = got
+    assert set(exact) == set(cfg["exact"])
+    assert set(prefixes) == set(cfg["prefix"])
+
+
+def test_the_reason_names_the_file_so_the_log_line_says_why(vetoes_lib):
+    reason = asr._extra_alarm_suppress_reason(["story:approved", "story:unrefined"])
+    assert reason is not None and "pool-probe-vetoes.sh" in reason and "story:unrefined" in reason, reason
+
+
+def test_a_well_formed_file_is_read_label_for_label(tmp_path, monkeypatch):
+    """CONTROL for the corrupt-file cases below: the builder they all start from is itself readable."""
+    _point_reader_at(monkeypatch, _vetoes_file(tmp_path))
+    exact, prefixes = asr._pool_probe_vetoes()
+    assert exact == frozenset("lab:%02d" % i for i in range(12))
+    assert set(prefixes) == {"pfx-one:", "pfx-two", "pfx-three:"}
+    assert asr._extra_alarm_suppress_reason(["lab:03"]) is not None
+    assert asr._extra_alarm_suppress_reason(["pfx-one:anything"]) is not None
+    assert asr._extra_alarm_suppress_reason(["pfx-two-and-more"]) is not None   # the probe's startswith, verbatim
+    assert asr._extra_alarm_suppress_reason(["lab:99", "ctx:ready"]) is None
+
+
+def test_a_probe_veto_matches_the_label_it_names_not_one_that_merely_contains_it(tmp_path, monkeypatch):
+    """FALSIFICATION for the derived layer: the probes refuse an exact label as a whole and a prefix at the
+    START of the label (startswith). A label that only CONTAINS one is refused by no probe, so a bead carrying
+    it is buildable and must still alarm when it starves — a looser match would mute that alarm."""
+    _point_reader_at(monkeypatch, _vetoes_file(tmp_path))
+    assert asr._extra_alarm_suppress_reason(["story:approved", "x-pfx-one:abc"]) is None   # prefix in the middle
+    assert asr._extra_alarm_suppress_reason(["story:approved", "my-pfx-two"]) is None
+    assert asr._extra_alarm_suppress_reason(["story:approved", "lab:030"]) is None         # exact label, plus a tail
+    assert asr._extra_alarm_suppress_reason(["story:approved", "not-lab:03"]) is None      # ...or plus a head
+    assert asr._extra_alarm_suppress_reason(["story:approved", "pfx-one:abc"]) is not None  # control: at the start it IS refused
+
+
+@pytest.mark.parametrize("over", [
+    {"POOL_VETO_EXACT_DOG": None},                                   # a variable is gone (renamed / moved)
+    {"POOL_VETO_PREFIX_WA": None},
+    {"POOL_VETO_EXACT_WA": "[]"},                                    # an empty list must not read as 'no vetoes'
+    {"POOL_VETO_PREFIX_DOG": "[]"},
+    {"POOL_VETO_EXACT_DOG": "[\"lab:00\", "},                        # not JSON
+    {"POOL_VETO_EXACT_DOG": "{\"lab:00\": 1}"},                      # JSON, not a list
+    {"POOL_VETO_EXACT_DOG": "[1, 2]"},                               # a list, not of strings
+    {"POOL_VETO_PREFIX_DOG": "[\"\", \"pfx-two\"]"},                 # '' as a prefix would match EVERY label
+    {"POOL_VETO_PREFIX_WA": "[\"  \", \"pfx-two\"]"},                # whitespace likewise
+    {"POOL_VETO_EXACT_DOG": "[\"a\", \"lab:01\"]"},                  # a 1-letter token is not a label
+    {"POOL_VETO_EXACT_DOG": "[\"Lab Two\"]"},                        # not a label shape
+    {"POOL_VETO_EXACT_DOG": "[\"lab:00\"]", "POOL_VETO_EXACT_WA": "[\"lab:01\"]"},  # far fewer labels than the file has
+    {"POOL_VETO_PREFIX_DOG": "[\"pfx-one:\"]", "POOL_VETO_PREFIX_WA": "[\"pfx-one:\"]"},  # ...and far fewer prefixes
+    {"POOL_VETO_EXACT_DOG": json.dumps(["lab:%02d" % i for i in range(7)] + ["story:approved"])},  # vetoes the label EVERY candidate carries
+    {"POOL_VETO_PREFIX_WA": json.dumps(["pfx-two", "story:"])},      # ...or a prefix of it: either one would mute every alarm
+])
+def test_a_corrupt_or_empty_list_is_could_not_tell_never_everything_or_nothing(tmp_path, monkeypatch, over):
+    """The reader answers in three states. A file it cannot make sense of is 'could not tell' (None) —
+    not an empty list (which reads as 'nothing is vetoed') and above all not a list that mutes every
+    alarm. And a buildable bead must still alarm afterwards."""
+    _point_reader_at(monkeypatch, _vetoes_file(tmp_path, **over))
+    assert asr._pool_probe_vetoes() is None
+    assert asr._extra_alarm_suppress_reason(["story:approved", "ctx:ready", "exec:auto"]) is None
+
+
+@pytest.mark.parametrize("body", [
+    None,                                                            # the file is not there at all
+    "",
+    "# POOL_VETO_EXACT_DOG='[\"a-label\"]'\n",                        # only a comment
+])
+def test_an_unusable_list_is_logged_once_and_still_could_not_tell(tmp_path, monkeypatch, capsys, body):
+    """Fail-open is allowed to be an answer, not to be silent: with the list gone the derived labels go
+    back to alarming, and the only visible symptom would be those alarms. One line, naming the file,
+    once per process — and the answer stays None."""
+    p = tmp_path / "pool-probe-vetoes.sh"
+    if body is not None:
+        p.write_text(body)
+    _point_reader_at(monkeypatch, p)
+    assert asr._pool_probe_vetoes() is None
+    assert asr._pool_probe_vetoes() is None
+    assert asr._extra_alarm_suppress_reason(["story:approved", "story:unrefined"]) is None
+    out = capsys.readouterr().out
+    assert out.count("WARN ga-d3b5yr") == 1, out
+    assert str(p) in out, out
+
+
+def test_a_usable_list_logs_nothing(vetoes_lib, capsys):
+    assert asr._pool_probe_vetoes() is not None
+    assert "WARN ga-d3b5yr" not in capsys.readouterr().out
+
+
+def test_a_failed_read_is_not_memoized(tmp_path, monkeypatch):
+    """A list that was missing and then restored is picked up (the memo keeps only a usable answer)."""
+    _point_reader_at(monkeypatch, tmp_path / "pool-probe-vetoes.sh")
+    assert asr._pool_probe_vetoes() is None
+    _vetoes_file(tmp_path)
+    assert asr._pool_probe_vetoes() is not None
+
+
+def test_with_the_list_unreadable_only_the_derived_labels_go_back_to_alarming(no_vetoes_lib):
+    """Status quo ante, not a mute: the labels that live ONLY in the probe list alarm again, the explicit
+    rows (the measured parks) keep holding."""
+    assert asr._extra_alarm_suppress_reason(["story:approved", "story:unrefined"]) is None
+    assert asr._extra_alarm_suppress_reason(["story:approved", "blocked-reason:decision"]) is not None
+
+
+def test_a_label_that_merely_starts_like_a_probe_prefix_is_refused_by_the_probe_too(vetoes_lib):
+    """The derived layer applies the probes' own startswith, verbatim. pilot:text-vetoed-typo fails the hand
+    table's ':' boundary (test_pilot_text_veto_does_not_match_unrelated_pilot_prefix), yet pool-probe-vetoes.sh
+    refuses the prefix pilot:text-veto, so every pool probe skips such a bead: it is parked here too, because
+    that is what happens to it."""
+    assert asr._extra_alarm_suppress_reason(["story:approved", "pilot:text-vetoed-typo"]) is not None
+
+
+def test_a_variable_assigned_twice_is_could_not_tell(tmp_path, monkeypatch):
+    """Sourcing the file in bash makes the LAST assignment win, unless it sits in a branch that did not run.
+    A reader that took the first would answer from a list the shell no longer uses, so two assignments are
+    'could not tell', not a guess."""
+    p = _vetoes_file(tmp_path)
+    p.write_text(p.read_text() + "POOL_VETO_EXACT_DOG='[\"lab:00\"]'\n")
+    _point_reader_at(monkeypatch, p)
+    assert asr._pool_probe_vetoes() is None
+
+
+def test_a_file_that_is_not_text_is_could_not_tell_not_a_crash(tmp_path, monkeypatch):
+    """Undecodable bytes raise ValueError, not OSError; the daemon must survive them like any other bad file."""
+    p = tmp_path / "pool-probe-vetoes.sh"
+    p.write_bytes(b"\xff\xfe\x00POOL_VETO_EXACT_DOG=\xc3\x28\n")
+    _point_reader_at(monkeypatch, p)
+    assert asr._pool_probe_vetoes() is None
+    assert asr._extra_alarm_suppress_reason(["story:approved", "story:unrefined"]) is None
+
+
+def test_the_reader_looks_where_the_pilot_sources_the_list_from(monkeypatch):
+    """The path is derived exactly as pilot-dispatcher.sh derives its own (scripts/ beside the live Pilot), so
+    the reader cannot answer from a different copy than the one that gates dispatch. Held against the Pilot's
+    own text, so moving the lib there fails here instead of silently blinding this reader."""
+    monkeypatch.undo()   # the autouse fixture pointed the reader elsewhere; this test is about the real path function
+    assets = MOD_PATH.parent.parent / "packs" / "town-deltas" / "assets"
+    monkeypatch.setattr(asr, "_pilot_dispatcher_sh_path", lambda: str(assets / "pilot-dispatcher.sh"))
+    got = Path(asr._pool_probe_vetoes_path())
+    assert got == assets / "scripts" / "pool-probe-vetoes.sh"
+    assert got.is_file(), got
+    pilot_src = (assets / "pilot-dispatcher.sh").read_text(encoding="utf-8")
+    assert '/scripts/pool-probe-vetoes.sh"' in pilot_src, "the Pilot no longer sources the list from scripts/ beside itself"

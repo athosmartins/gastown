@@ -774,12 +774,134 @@ _EXTRA_ALARM_SUPPRESS_PREFIXES = (
 )
 
 
+# ── ga-d3b5yr: a bead PARKED for a person, and the labels the pool probes refuse ─────────────────────
+# Measured 19/10 03:50Z (mail ga-wisp-urnyd2, "nota #12"): "Pilot pausado 25/28 sweeps — 2 beads
+# esperando" named ga-hg8amk (needs-human-decision) and ga-x29cqt (blocked-reason:decision). Both sat in
+# the Athos's queue with athos.acao filled; neither waited on the Pilot, and the pause behind the note
+# (disk floor / RAM) had ended hours earlier. Neither label was known here: the table above matches
+# blocked: and blocked-on: but not blocked-reason:*, and _has_prefix("needs-human") stops at ":", so it
+# never reached the "-" family (needs-human-decision; needs-human-followup is a real label, ga-3lsy1).
+#
+# That is the 7th time this table trailed the dispatch path (ga-eu2x, ga-1mqdz, ga-it3e8, ga-qt0mj,
+# wa-4uh2w, ga-ulg9j, now this one) — and by far more than 2 labels. Replayed end to end against
+# pool-probe-vetoes.sh, the file every pool worker's probe takes its refusals from, 15 of the 32 labels
+# it lists raised "dispatch failing" here (14 exact labels and the blocked-reason: family; the other 17
+# were already caught by the table above, by _classify() or by a check in _process_store()). So two layers:
+#   1. _EXTRA_ALARM_SUPPRESS_FAMILIES — the two parks that produced this bug, written down. They hold
+#      even when layer 2 cannot be read, so the bead that raised the note stays quiet if
+#      pool-probe-vetoes.sh is moved or broken. Matched by park_labels.is_labeled (the base itself, or a
+#      ":"- or "-"-suffixed variant) — the rule bead_state.py and the other park readers already use.
+#   2. _pool_probe_vetoes() — every label ANY pool probe refuses, READ from pool-probe-vetoes.sh
+#      instead of copied a 7th time, so the next veto added there needs no edit here (the class guard in
+#      test_approved_state_reconciler.py fails if it ever does).
+# Layer 2 is the UNION of the pools (pool_veto_cfg any): a label only ONE pool refuses (blocked-reason:
+# is dog-only, delivery:pending-restart wa-only) also silences the alarm for a bead routed to the other
+# pool. Accepted: that touches only a bead carrying such a label AND routed to the pool that does not
+# refuse it, and every bead without one still alarms, so a failing dispatch path is still reported.
+_EXTRA_ALARM_SUPPRESS_FAMILIES = (
+    (park_labels.NEEDS_HUMAN_BARE_LABEL,
+     "needs-human[-*] (a person decides — the Pilot vetoes startswith(\"needs-human\") and both pool probes refuse "
+     "needs-human and needs-human-decision: parked, not starving, ga-d3b5yr)"),
+    ("blocked-reason",
+     "blocked-reason:* (parked on a blocker or a decision someone else owns — blocked-reason:decision is the Athos's "
+     "queue marker, and the dog probe refuses the prefix: parked, not starving, ga-d3b5yr)"),
+)
+
+_POOL_PROBE_VETOES = None  # memo for this process (one-shot per launchd tick): (exact, prefixes); None = not read yet
+_POOL_PROBE_VETOES_WARNED = False  # the "list unusable" line below is logged once per process
+_POOL_VETO_VARS = ("POOL_VETO_EXACT_DOG", "POOL_VETO_EXACT_WA", "POOL_VETO_PREFIX_DOG", "POOL_VETO_PREFIX_WA")
+_POOL_VETO_LABEL_RE = re.compile(r"[a-z0-9][a-z0-9._:-]+")  # what a label token looks like; '' or ' ' would match anything
+_POOL_VETO_MIN_EXACT = 10   # the file lists 26 exact labels and 6 prefixes (ga-d3b5yr); far fewer means a half-parsed list
+_POOL_VETO_MIN_PREFIX = 3
+
+
+def _pool_probe_vetoes_path():
+    """scripts/pool-probe-vetoes.sh beside the LIVE pilot-dispatcher.sh — the same sibling the Pilot sources
+    it from (its _GC_PPV_SIBLING), so this reader cannot answer from a different copy than the one that gates
+    dispatch."""
+    return os.path.join(os.path.dirname(_pilot_dispatcher_sh_path()), "scripts", "pool-probe-vetoes.sh")
+
+
+def _pool_probe_vetoes_unusable(why):
+    """Log (once per process) that the probes' veto list cannot be used, and answer None ("could not tell").
+    The answer stays fail-open — a label that lives only in the list alarms again, as before ga-d3b5yr — but
+    not quiet: without this line the only visible symptom would be those alarms, with nothing pointing at why."""
+    global _POOL_PROBE_VETOES_WARNED
+    if not _POOL_PROBE_VETOES_WARNED:
+        _POOL_PROBE_VETOES_WARNED = True
+        _log("WARN ga-d3b5yr: the pool probes' veto list (%s) is unusable: %s — every label that lives only in "
+             "it alarms 'dispatch failing' again until it is restored (needs-human[-*] and blocked-reason:* "
+             "still hold)" % (_pool_probe_vetoes_path(), why))
+    return None
+
+
+def _pool_probe_vetoes():
+    """(exact, prefixes) the pool probes refuse — the UNION of the dog and wa lists in pool-probe-vetoes.sh,
+    exactly what its pool_veto_cfg any prints — or None when the file cannot be read. Three states, never two:
+    a missing, renamed, truncated or corrupt file is "could not tell" (logged once, see
+    _pool_probe_vetoes_unusable), never an empty list that would read as "nothing is refused".
+
+    The file is bash, sourced by its other consumers; this reader parses its four JSON assignments instead of
+    running bash and jq, so the daemon needs neither. A format it does not recognise ends as None."""
+    global _POOL_PROBE_VETOES
+    if _POOL_PROBE_VETOES is not None:
+        return _POOL_PROBE_VETOES
+    try:
+        with open(_pool_probe_vetoes_path(), encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, ValueError) as exc:   # ValueError: bytes that are not UTF-8 text
+        return _pool_probe_vetoes_unusable("cannot read it (%s)" % type(exc).__name__)
+    lists = {}
+    for var in _POOL_VETO_VARS:
+        found = re.findall(r"^%s='([^'\n]*)'[ \t]*$" % var, text, re.MULTILINE)
+        if len(found) != 1:   # bash would let the LAST assignment win; two of them are ambiguous, not a guess
+            return _pool_probe_vetoes_unusable("%s='[...]' is assigned %d times, expected once" % (var, len(found)))
+        try:
+            items = json.loads(found[0])
+        except ValueError:
+            return _pool_probe_vetoes_unusable("%s is not JSON" % var)
+        if not (isinstance(items, list) and items
+                and all(isinstance(x, str) and _POOL_VETO_LABEL_RE.fullmatch(x) for x in items)):
+            return _pool_probe_vetoes_unusable("%s is not a non-empty list of label strings" % var)
+        lists[var] = items
+    exact = frozenset(lists["POOL_VETO_EXACT_DOG"]) | frozenset(lists["POOL_VETO_EXACT_WA"])
+    prefixes = tuple(sorted(set(lists["POOL_VETO_PREFIX_DOG"]) | set(lists["POOL_VETO_PREFIX_WA"])))
+    if len(exact) < _POOL_VETO_MIN_EXACT or len(prefixes) < _POOL_VETO_MIN_PREFIX:
+        return _pool_probe_vetoes_unusable(
+            "only %d exact label(s) and %d prefix(es) — far fewer than the file holds" % (len(exact), len(prefixes)))
+    # Every bead this reconciler alarms on carries story:approved. A list that refuses it (or a prefix of it)
+    # would silence EVERY alarm, which no probe list means to do: corrupt, not a veto.
+    if "story:approved" in exact or any("story:approved".startswith(p) for p in prefixes):
+        return _pool_probe_vetoes_unusable(
+            "it refuses story:approved, which every bead this check sees carries — that would mute every alarm")
+    _POOL_PROBE_VETOES = (exact, prefixes)
+    return _POOL_PROBE_VETOES
+
+
 def _extra_alarm_suppress_reason(labels):
-    """Return a human-readable reason if `labels` carries any of the explicit
-    non-buildable prefixes in _EXTRA_ALARM_SUPPRESS_PREFIXES, else None."""
+    """Return a human-readable reason if `labels` carries an explicit non-buildable signal, else None: a prefix
+    in _EXTRA_ALARM_SUPPRESS_PREFIXES, a family in _EXTRA_ALARM_SUPPRESS_FAMILIES, or (ga-d3b5yr) a label the
+    pool probes refuse, read from pool-probe-vetoes.sh. When that file cannot be read the third kind simply
+    does not apply and the answer is None, so a label that lives only there alarms again."""
     for prefix, reason in _EXTRA_ALARM_SUPPRESS_PREFIXES:
         if _has_prefix(labels, prefix):
             return reason
+    for base, reason in _EXTRA_ALARM_SUPPRESS_FAMILIES:
+        if park_labels.is_labeled(labels, base):
+            return reason
+    vetoes = _pool_probe_vetoes()
+    if vetoes is not None:
+        exact, prefixes = vetoes
+        for lab in sorted(labels):
+            if lab in exact:
+                rule = "exact label"
+            else:
+                hit = next((p for p in prefixes if lab.startswith(p)), None)
+                if hit is None:
+                    continue
+                rule = "prefix %s" % hit
+            return ("%s (%s in pool-probe-vetoes.sh: the pool probes refuse it, so no pool worker picks the bead "
+                    "up — parked, not starving, ga-d3b5yr)" % (lab, rule))
     return None
 
 
@@ -2479,6 +2601,7 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
         "This bead matched NONE of this reconciler's known non-buildable signals\n"
         "(blocked-on:*, waiting-on:*, depends-on:*, next-action:*, pool:refused:*,\n"
         "gate:{needs-fix,failed,queued,reviewing,needs-human}, exec:manual, ctx:thin,\n"
+        "needs-human[-*], blocked-reason:*, any label scripts/pool-probe-vetoes.sh refuses,\n"
         "pilot:held(-until:*), pilot:reclaim-count:N). It should have been\n"
         "dispatched within %dmin.\n\n"
         "INVESTIGAR:\n"
@@ -4729,6 +4852,12 @@ def _selftest():
                 i: a failed send is logged; j: prune + corrupt record; k: a direct
                 _process_store() call aggregates too; l: the reason classifier on the
                 REAL log shapes
+      (ga-d3b5yr-a..b) a bead PARKED by a label the pool probes refuse is not starving —
+                a: per bead (needs-human-decision / blocked-reason:decision / needs-human-
+                followup → no 'dispatch failing' mail); b: replay of the 19/10 "nota #12"
+                (a Pilot paused in 17 of 56 sweeps, the only two waiting beads parked for the
+                Athos → no 'Pilot pausado' note) plus its control (parked + one buildable
+                bead → the note counts and names ONLY the buildable one)
     """
     global _bd_approved, _bd_label_add, _bd_label_remove, _bd_comment
     global _do_notify, _do_mail_mayor, _read_pilot_log_lines, _bd_gate_markers, _sh
@@ -9106,6 +9235,91 @@ def _selftest():
             _bad("(ga-5bzrzu-l)", "real=%r unknown=%r fixtures=%r" % (_pcl, _pcl_unknown, _pcl_old))
     except NameError as _e:
         _bad("(ga-5bzrzu-l)", "missing: %s" % _e)
+
+    # ── ga-d3b5yr: a bead PARKED by a label the pool probes refuse is not "starving" ──
+    # Measured 19/10 03:50Z (mail ga-wisp-urnyd2, "nota #12"): "Pilot pausado 25/28 sweeps — 2 beads
+    # esperando" named ga-hg8amk (needs-human-decision) and ga-x29cqt (blocked-reason:decision), both
+    # correctly in the Athos's queue (athos.acao filled), neither waiting on the Pilot. The label set
+    # this reconciler knew was a hand copy of the dispatch path's vetoes; it now reads
+    # pool-probe-vetoes.sh (the unit-level class guard lives in test_approved_state_reconciler.py,
+    # held against that file's own pool_veto_cfg). These scenarios pin the two ends of the pipeline:
+    # the per-bead alarm and the pause-cause note that the measured mail really was.
+    print("\nScenario (ga-d3b5yr-a): story:approved + ctx:ready + exec:auto + ONE park label "
+          "(needs-human-decision / blocked-reason:decision / needs-human-followup), starving past "
+          "STARVE_MIN with a live Pilot → no 'dispatch failing' mail and no alarm state: the bead "
+          "is parked for a human, not starving")
+    _read_pilot_sweep_pause_state_file = _pause_off
+    _read_pilot_dispatchable_file = lambda: None
+    _read_pilot_log_lines = lambda: _pilot_recent()
+    for _d3_lbl in ("needs-human-decision", "blocked-reason:decision", "needs-human-followup"):
+        _d3_bid = "ga-d3b5yr-%s" % re.sub(r"[^a-z0-9]+", "-", _d3_lbl.lower()).strip("-")
+        _bd_approved = lambda root, _b=_d3_bid, _l=_d3_lbl: [
+            _make_bead(_b, labels=["story:approved", "ctx:ready", "exec:auto", _l])]
+        st = _reset()
+        st["first_seen_approved"][_d3_bid] = NOW - (_STARVE + 5) * 60
+        run_cycle(NOW, st)
+        if any(_d3_bid in subj for subj, _ in mail_calls) or _df_mails() or st.get("alarmed"):
+            _bad("(ga-d3b5yr-a: %s)" % _d3_lbl,
+                 "still alarmed: mails=%r alarmed=%r" % (
+                     [s for s, _ in mail_calls], list(st.get("alarmed", {}))))
+        else:
+            _ok("(ga-d3b5yr-a: %s): parked, not starving — no alarm" % _d3_lbl)
+
+    print("\nScenario (ga-d3b5yr-b): REPLAY of the 19/10 'nota #12' — the Pilot paused 17 of its last "
+          "56 sweeps, and the only two beads waiting are the ones parked for the Athos "
+          "(needs-human-decision, blocked-reason:decision) → NOT ONE 'Pilot pausado ... causa "
+          "comum' note, no per-bead mail, and neither id anywhere in a mail")
+    _d3b_labels = {"ga-d3b5yr-hg8amk": "needs-human-decision",
+                   "ga-d3b5yr-x29cqt": "blocked-reason:decision"}
+    _d3b_ages = {"ga-d3b5yr-hg8amk": 1700, "ga-d3b5yr-x29cqt": 1600}
+    _bd_approved = lambda root: [
+        _make_bead(b, labels=["story:approved", "ctx:ready", "exec:auto", l])
+        for b, l in _d3b_labels.items()]
+    _read_pilot_dispatchable_file = lambda: None
+    _read_pilot_log_lines = lambda: _pc_log(NOW, 56, 17)
+    st = _reset()
+    for _b, _age in _d3b_ages.items():
+        st["first_seen_approved"][_b] = NOW - _age * 60
+    run_cycle(NOW, st)
+    _d3b_leaks = [s for s, body in mail_calls if any(b in s or b in body for b in _d3b_labels)]
+    if _pc_mails() or _df_mails() or _d3b_leaks or st.get("pause_cause"):
+        _bad("(ga-d3b5yr-b)", "pause notes=%r per-bead=%r leaks=%r pause_cause=%r" % (
+             [s for s, _ in _pc_mails()], [s for s, _ in _df_mails()], _d3b_leaks,
+             st.get("pause_cause")))
+    else:
+        _ok("(ga-d3b5yr-b): 2 parked beads under a 17/56-paused Pilot → no cause note, no mail, "
+            "no pause_cause state")
+
+    print("\nScenario (ga-d3b5yr-b2): CONTROL for (b) — the same paused Pilot and the same two parked "
+          "beads, plus ONE plain buildable bead (story:approved + ctx:ready + exec:auto): the cause "
+          "note still goes out, counts 1 bead and names ONLY the buildable one (the fixture is "
+          "live, so (b) is not passing vacuously)")
+    _d3b_build = "ga-d3b5yr-build"
+    _bd_approved = lambda root: [
+        _make_bead(b, labels=["story:approved", "ctx:ready", "exec:auto", l])
+        for b, l in _d3b_labels.items()
+    ] + [_make_bead(_d3b_build, labels=["story:approved", "ctx:ready", "exec:auto"])]
+    st = _reset()
+    for _b, _age in _d3b_ages.items():
+        st["first_seen_approved"][_b] = NOW - _age * 60
+    st["first_seen_approved"][_d3b_build] = NOW - 1500 * 60
+    run_cycle(NOW, st)
+    _d3b2 = _pc_mails()
+    _d3b2_subj, _d3b2_body = (_d3b2[0] if _d3b2 else ("", ""))
+    _d3b2_problems = []
+    if len(_d3b2) != 1:
+        _d3b2_problems.append("want 1 cause note, got %d" % len(_d3b2))
+    if "1 bead(s)" not in _d3b2_subj:
+        _d3b2_problems.append("subject does not count exactly 1 bead: %r" % (_d3b2_subj,))
+    if _d3b_build not in _d3b2_body:
+        _d3b2_problems.append("the buildable bead is missing from the body")
+    for _b in _d3b_labels:
+        if _b in _d3b2_body or _b in _d3b2_subj:
+            _d3b2_problems.append("parked bead %s is named in the note" % _b)
+    if _d3b2_problems:
+        _bad("(ga-d3b5yr-b2)", "; ".join(_d3b2_problems))
+    else:
+        _ok("(ga-d3b5yr-b2): 1 buildable + 2 parked → ONE note, '1 bead(s)', only the buildable bead named")
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
