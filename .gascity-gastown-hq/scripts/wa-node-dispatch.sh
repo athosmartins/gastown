@@ -10,7 +10,7 @@
 #       --store DIR  pasta do store da bead (default: o que routes.jsonl diz para o prefixo do id)
 # SAÍDA: 0 feito (check: "roda no nó") · 10 fica no mini · 11 não consegui ler/decidir · 12 não elegível agora (bead já tem dono/rota, slot do nó ocupado) · 13 escrita não confirmada
 #   (desfeita) · 2 uso. Em dúvida o código é 10-13, nunca 0: o chamador que não entende um código trata como "fica no mini".
-# O QUE FAZ (apply): relê a bead → exige aberta, sem dono e sem rota → classifica (scripts/wa-node-classify.py, na MESMA leitura) → exige o slot do nó livre (nenhuma bead em andamento do alias
+# O QUE FAZ (apply): relê a bead → exige aberta, sem dono e sem rota → classifica (scripts/wa-node-classify.py, na MESMA leitura; o exit code só vale se o JSON concorda — falha, saída ilegível ou código e veredito que discordam = 11, nunca 0) → exige o slot do nó livre (nenhuma bead em andamento do alias
 #   e nenhuma sessão do template) → UMA escrita com comparação atômica (bd update --if-assignee '' --if-status open: quem chegou antes vence, rc 13 do bd) que atribui ao alias, põe
 #   em andamento e carimba gc.routed_to → relê e confere → comenta. Falha na conferência desfaz. `release` só mexe em bead que é do alias E da rota.
 # O QUE NÃO FAZ: não cria sessão. A receita provada na ga-2hd02v.1.6 (dog-remote) é "atribuir e deixar o pool criar"; `gc session new` à mão em template remoto roteado gera duas sessões e o
