@@ -38,12 +38,12 @@ VETO_LINE="$(grep -E '^PILOT_NODE_FIRST_VETO_LABELS="' "$DISPATCHER" | head -1)"
 PNY_INIT="$(grep -E '^_PNY_(ASKED|VERDICT|EFFECTIVE|GRANTED|GRANTED_N|EXEMPT_THIS)=' "$DISPATCHER")"
 GATE_SRC="$(region '^if \[ "\$_PILOT_QUOTA_STATE" = "limited" \]; then$' '^# ── ga-d0hz3: CROSS-STAGE admission gate')"
 CLEAR_SRC="$(region '^# ga-nq0jo: reaching here' '^# ── Step 0: TTL recovery')"
-TOPUP_SRC="$(region '^_pilot_priority_waiting_scan$' '^if \[ "\$SMALL_SLOTS" -eq "0" \] && \[ "\$BIG_SLOTS" -eq "0" \]; then$')"
+FUNC_TOPUP="$(fn_src _pilot_pool_topup)"
 STALL_SRC="$(region '^PILOT_STALL_STATE=' '^# ga-2lca0l \(3\)')"
 YSTALL_SRC="$(region '^# ga-2lca0l \(3\)' '^log "=== Pilot sweep complete')"
 { [ -n "$FUNC_EXEMPT" ] && [ -n "$FUNC_PRE" ] && [ -n "$FUNC_SHADOW" ] && [ -n "$FUNC_VETO" ] && [ -n "$FUNC_BOUND" ] && [ -n "$VETO_LINE" ] && [ -n "$PNY_INIT" ]; } \
   || { echo "FATAL: ga-2hd02v.1.19 não aplicada (funções ou linhas de configuração do nó não achadas em $DISPATCHER)" >&2; exit 2; }
-{ [ -n "$GATE_SRC" ] && [ -n "$CLEAR_SRC" ] && [ -n "$TOPUP_SRC" ] && [ -n "$STALL_SRC" ] && [ -n "$YSTALL_SRC" ]; } || { echo "FATAL: região do dispatcher não achada (gates / limpa-pausa / top-up / Step 5 / cessões consecutivas) em $DISPATCHER" >&2; exit 2; }
+{ [ -n "$GATE_SRC" ] && [ -n "$CLEAR_SRC" ] && [ -n "$FUNC_TOPUP" ] && [ -n "$STALL_SRC" ] && [ -n "$YSTALL_SRC" ]; } || { echo "FATAL: região ou função do dispatcher não achada (gates / limpa-pausa / _pilot_pool_topup / Step 5 / cessões consecutivas) em $DISPATCHER" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-diskfloor-nodeonly-selftest.XXXXXX")"
 trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
@@ -126,15 +126,19 @@ _pilot_write_sweep_pause_state() { echo "PAUSE_STATE $*" >> "$WORK/pause.calls";
 [ -z "${NODE_ONLY+x}" ] || _PILOT_NODE_ONLY="$NODE_ONLY"
 eval "$CLEAR_SRC"
 EOF
+# a FUNÇÃO real _pilot_pool_topup (a guarda mora nela, não no chamador: as duas chamadas ficam no topo do arquivo, como o selftest grande exige). Os espiões registram a primeira leitura que a função faria depois da guarda
+# (a contagem de sessões vivas, bd, gc) e a recusam (rc 1): fora da passada só-nó ela chega nelas e para aí, sem abrir nada.
 cat > "$WORK/topup-runner.sh" <<'EOF'
 set -euo pipefail
 log()  { echo "LOG $*"; }
 warn() { echo "WARN $*"; }
-_pilot_priority_waiting_scan() { :; }; _pilot_heal_hq_blind_routes() { :; }
-_pilot_pool_topup() { echo "TOPUP $*" >> "$WORK/topup.calls"; }
-PILOT_WA_WORKER_MAX=4; PILOT_PS_WORKER_MAX=2
+_pilot_live_session_count() { echo "LIVE $*" >> "$WORK/topup.calls"; return 1; }
+bd() { echo "bd $*" >> "$WORK/topup.calls"; return 1; }
+gc() { echo "gc $*" >> "$WORK/topup.calls"; return 1; }
 [ -z "${NODE_ONLY+x}" ] || _PILOT_NODE_ONLY="$NODE_ONLY"
-eval "$TOPUP_SRC"
+eval "$FUNC_TOPUP"
+_pilot_pool_topup wa-worker 4
+_pilot_pool_topup ps-worker 2
 EOF
 cat > "$WORK/stall-runner.sh" <<'EOF'
 set -euo pipefail
@@ -159,10 +163,16 @@ grep -q '^PAUSE_STATE 0 ' "$WORK/pause.calls" 2>/dev/null && ok "node_only=0 (co
 reset; env CLEAR_SRC="$CLEAR_SRC" WORK="$WORK" bash "$WORK/clear-runner.sh" >/dev/null 2>&1
 grep -q '^PAUSE_STATE 0 ' "$WORK/pause.calls" 2>/dev/null && ok "variável nunca definida: vale varredura normal (limpa)" || bad "sem _PILOT_NODE_ONLY a pausa não foi limpa"
 echo "── (2) top-up de pool: não abre sessão no mini na passada só-nó"
-reset; env TOPUP_SRC="$TOPUP_SRC" WORK="$WORK" NODE_ONLY=1 bash "$WORK/topup-runner.sh" >/dev/null 2>&1
-[ ! -s "$WORK/topup.calls" ] && ok "node_only=1: nenhum top-up (wa-worker/ps-worker abrem sessão no mini)" || bad "node_only=1 abriu top-up: $(tr '\n' ';' < "$WORK/topup.calls")"
-reset; env TOPUP_SRC="$TOPUP_SRC" WORK="$WORK" NODE_ONLY=0 bash "$WORK/topup-runner.sh" >/dev/null 2>&1
-[ "$(wc -l < "$WORK/topup.calls" 2>/dev/null | tr -d ' ')" = 2 ] && ok "node_only=0 (controle): os dois top-ups rodam como sempre" || bad "node_only=0 não rodou os dois top-ups — o harness não prova nada"
+# a linha de log vem junto da ausência de chamadas: um runner que morre antes de chamar a função também deixaria topup.calls vazio e passaria por "nenhum top-up"
+reset; TU_RC=0; TU_OUT=$(env FUNC_TOPUP="$FUNC_TOPUP" WORK="$WORK" NODE_ONLY=1 bash "$WORK/topup-runner.sh" 2>&1) || TU_RC=$?
+{ [ "$TU_RC" = 0 ] && [ ! -s "$WORK/topup.calls" ] && printf '%s' "$TU_OUT" | grep -q 'sem top-up de wa-worker' && printf '%s' "$TU_OUT" | grep -q 'sem top-up de ps-worker'; } \
+  && ok "node_only=1: a função sai na 1a guarda dos dois pools, sem ler nem abrir nada (wa-worker/ps-worker abrem sessão no mini)" || bad "node_only=1 não pulou o top-up (rc=$TU_RC; chamadas: $(tr '\n' ';' < "$WORK/topup.calls" 2>/dev/null); saída: $(printf '%s' "$TU_OUT" | head -c 300))"
+reset; TU_RC=0; TU_OUT=$(env FUNC_TOPUP="$FUNC_TOPUP" WORK="$WORK" NODE_ONLY=0 bash "$WORK/topup-runner.sh" 2>&1) || TU_RC=$?
+{ [ "$TU_RC" = 0 ] && [ "$(wc -l < "$WORK/topup.calls" 2>/dev/null | tr -d ' ')" = 2 ] && ! printf '%s' "$TU_OUT" | grep -q 'sem top-up de'; } \
+  && ok "node_only=0 (controle): a função passa da guarda nos dois pools e chega à leitura das sessões vivas — os espiões enxergam a chamada" || bad "node_only=0 não chegou à leitura das sessões vivas dos dois pools — o harness não prova nada (rc=$TU_RC)"
+reset; TU_RC=0; TU_OUT=$(env FUNC_TOPUP="$FUNC_TOPUP" WORK="$WORK" bash "$WORK/topup-runner.sh" 2>&1) || TU_RC=$?
+{ [ "$TU_RC" = 0 ] && [ "$(wc -l < "$WORK/topup.calls" 2>/dev/null | tr -d ' ')" = 2 ]; } \
+  && ok "variável nunca definida: vale varredura normal (o top-up segue)" || bad "sem _PILOT_NODE_ONLY o top-up foi pulado (rc=$TU_RC)"
 echo "── (2) Step 5: varredura só-nó com 0 despachos não conta no streak de estagnação nem o zera"
 st() { env STALL_SRC="$STALL_SRC" SANDBOX_PATH="$SANDBOX_PATH" WORK="$WORK" "$@" bash "$WORK/stall-runner.sh" >/dev/null 2>&1; [ -f "$STALL" ] && cat "$STALL" || echo nada; }
 reset; [ "$(st NODE_ONLY=0)" = 1 ] && ok "node_only=0, 0 despachos, vaga livre (controle): streak = 1" || bad "o controle do streak não contou"
@@ -234,6 +244,11 @@ L_SLING=$(grep -n 'Dispatch via gc sling (HQ beads)' "$DISPATCHER" | head -1 | c
 [ -n "$L_REL1" ] && [ -n "$L_REL2" ] && [ -n "$L_HOOK" ] && [ -n "$L_SLING" ] && [ "$L_REL1" -lt "$L_HOOK" ] && [ "$L_HOOK" -lt "$L_REL2" ] && [ "$L_REL2" -lt "$L_SLING" ] \
   && ok "dispatch_one: solta a claim da que o nó não quer ($L_REL1) → gancho do nó ($L_HOOK) → solta a que o nó não ficou ($L_REL2) → despacho ao mini ($L_SLING)" \
   || bad "as duas saídas da passada só-nó não estão na ordem esperada (rel1=$L_REL1 gancho=$L_HOOK rel2=$L_REL2 sling=$L_SLING)"
+# as duas chamadas do top-up ficam no topo do arquivo, sem `if` em volta: TOPUP-6 e ga-swnsg3-e do selftest grande reprovam se forem indentadas (a 1a versão desta fatia fez isso: 17 falhas contra as 14 do baseline)
+# vazio (linha não achada) → a asserção reprova; falhou/ilegível (dispatcher que o grep não lê) → o FATAL lá em cima, nunca um ok
+{ grep -qxF '_pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"' "$DISPATCHER" && grep -qxF '_pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"' "$DISPATCHER"; } \
+  && ok "as duas chamadas do top-up estão no topo do arquivo, sem if em volta (o que TOPUP-6 e ga-swnsg3-e do selftest grande exigem); a passada só-nó pula DENTRO da função" \
+  || bad "uma das chamadas do top-up saiu do topo do arquivo (indentada ou alterada): TOPUP-6 e ga-swnsg3-e do selftest grande reprovam — a guarda da passada só-nó mora dentro de _pilot_pool_topup"
 
 if [ -z "${DF_MUTANT:-}" ] && [ -z "${DF_NO_MUTANTS:-}" ]; then
   echo "── controle negativo: cada guarda desligada numa cópia do dispatcher tem que reprovar este arquivo"
@@ -254,7 +269,8 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "o gate liga a passada no DRY_RUN" '"on" ] && [ "${DRY_RUN:-0}" != "1" ]; then' '"on" ]; then'
   mutant "o gate liga a passada sem disco confirmado baixo" 'if [ "$_disk_floor_rc" -eq 0 ] && [ "${PILOT_NODE_FIRST:-off}" = "on" ]' 'if [ "${PILOT_NODE_FIRST:-off}" = "on" ]'
   mutant "o limpa-pausa roda na passada só-nó" $'if [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then\n  _pilot_write_sweep_pause_state 0 "" ""\nfi' '_pilot_write_sweep_pause_state 0 "" ""'
-  mutant "o top-up abre sessão na passada só-nó" $'if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then\n  log "ga-2hd02v.1.20: passada' $'if false; then\n  log "ga-2hd02v.1.20: passada'
+  mutant "o top-up abre sessão na passada só-nó" $'  if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then\n    log "  ga-2hd02v.1.20: passada' $'  if false; then\n    log "  ga-2hd02v.1.20: passada'
+  mutant "a guarda do top-up volta para um if em volta das chamadas (quebra TOPUP-6 e ga-swnsg3-e)" $'_pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"\n_pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"' $'if [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then\n  _pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"\n  _pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"\nfi'
   mutant "o streak de estagnação conta a passada só-nó" '[ "$DRY_RUN" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ] && [ "$DISPATCHED" -eq "0" ]' '[ "$DRY_RUN" != "1" ] && [ "$DISPATCHED" -eq "0" ]'
   mutant "o streak de estagnação é zerado pela passada só-nó" 'elif [ "$DRY_RUN" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ] && [ -f "$PILOT_STALL_STATE" ]; then' 'elif [ "$DRY_RUN" != "1" ] && [ -f "$PILOT_STALL_STATE" ]; then'
   mutant "o contador de cessões consecutivas é apagado pela passada só-nó" $'if [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then\n  _pilot_yield_stall_check || true\nfi' '_pilot_yield_stall_check || true'
