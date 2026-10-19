@@ -543,6 +543,51 @@ DPROBE="$TMP/pp-failclosed.sh" dprobe garbage POOL_PROBE_DISK_LIB="$GOOD_LIB"
 DPROBE=""
 reset_fix
 
+echo "== 12. ga-nyug12: no POOL_PROBE_LOG, no GC_CITY_PATH, no GC_CITY -> the log goes nowhere (it used to make ./.gc/logs in the directory the probe ran from)"
+# The log is best effort and the answer is decided before it is written, so a session with no city (a dog on the Hetzner server, a shell
+# outside the city) must get the same answer and leave no .gc tree behind in whatever directory it stands in. Every run starts in an EMPTY
+# directory, with the three variables removed by `env -u` (this selftest may itself be run from a city session that exports GC_CITY_PATH).
+# cprobe <dir> [VAR=val...] -> C_OUT C_RC C_ERR C_IDS; the VAR=val words come after the -u's, so they win.
+PROBE_ABS="$(cd "$(dirname "$PROBE")" && pwd)/$(basename "$PROBE")"   # absolute: cprobe leaves the selftest's own directory
+cprobe() {
+  local dir="$1"; shift
+  C_OUT="$(cd "$dir" && env -u POOL_PROBE_LOG -u GC_CITY_PATH -u GC_CITY BD_LOG="$TMP/city.log" BD_FIX="$FIX" PATH="$FAKE:$PATH" GC_SESSION_ORIGIN=ephemeral DISK_FREE_OVERRIDE_MB=3000 POOL_PROBE_DISK_LIB="$GOOD_LIB" "$@" sh "$PROBE_ABS" gastown.dog 2>"$TMP/city.err" </dev/null)"; C_RC=$?
+  C_ERR="$(cat "$TMP/city.err")"
+  C_IDS="$(printf '%s' "$C_OUT" | jq -r 'if type == "array" then map(.id) | join(",") else "?" end' 2>/dev/null)"; [ "$C_IDS" = "" ] && C_IDS="-"
+}
+reset_fix
+cat > "$FIX/tier1.json" <<'EOF'
+[
+ {"id":"st-old","issue_type":"bug","updated_at":"2026-01-01T00:00:00Z","labels":["story:approved"],"metadata":{"gc.routed_to":"gastown.dog"}},
+ {"id":"wf-new","issue_type":"task","updated_at":"2026-01-05T00:00:00Z","labels":["order-run:digest-generate"],"metadata":{"gc.routed_to":"gastown.dog","gc.kind":"workflow","gc.pool_demand":"order"}}
+]
+EOF
+# the two readings that make the probe write its log: low (the hold) and unreadable (the blind reading, which fails open)
+for pair in 3000:wf-new garbage:st-old; do
+  disk="${pair%%:*}"; want="${pair##*:}"; dir="$TMP/nocity-$disk"; mkdir -p "$dir"
+  dprobe "$disk"; ref="$D_OUT|$D_RC|$D_ERR"                     # the same run with a log to write to
+  cprobe "$dir" DISK_FREE_OVERRIDE_MB="$disk"
+  eq "no city, disk=$disk: the probe answers $want" "$C_IDS" "$want"
+  if [ "$C_OUT|$C_RC|$C_ERR" = "$ref" ]; then ok "no city, disk=$disk: stdout, exit code (=$C_RC) and stderr are the same as with a log to write to"
+  else bad "no city, disk=$disk: differs from the run with a log — [$C_OUT|$C_RC|$C_ERR] vs [$ref]"; fi
+  left="$(ls -A "$dir")"; eq "no city, disk=$disk: nothing was created in the directory the probe ran from" "${left:-nothing}" "nothing"
+done
+# Controls: with ANY of the three set, the line lands where it always did. (A "fix" that silenced the log for everybody — production has
+# GC_CITY_PATH and no POOL_PROBE_LOG — would pass the loop above.)
+ctl="$TMP/ctl"; mkdir -p "$ctl"
+for v in GC_CITY_PATH GC_CITY; do
+  city="$TMP/city-$v"; mkdir -p "$city"
+  cprobe "$ctl" "$v=$city"
+  grep -q 'held back 1 new story' "$city/.gc/logs/pool-probe.log" 2>/dev/null && ok "$v alone: the hold is on the record in \$$v/.gc/logs/pool-probe.log, as before" || bad "$v alone: no 'held back 1 new story' line in $city/.gc/logs/pool-probe.log"
+done
+city="$TMP/city-wins"; other="$TMP/city-loses"; mkdir -p "$city" "$other"
+cprobe "$ctl" GC_CITY_PATH="$city" GC_CITY="$other"
+if [ -s "$city/.gc/logs/pool-probe.log" ] && [ ! -e "$other/.gc" ]; then ok "both set: GC_CITY_PATH is the one that gets the line, as before"; else bad "both set: the line did not land only in GC_CITY_PATH's log"; fi
+city="$TMP/city-plog"; mkdir -p "$city"
+cprobe "$ctl" POOL_PROBE_LOG=/dev/null GC_CITY_PATH="$city"
+if [ ! -e "$city/.gc" ]; then ok "POOL_PROBE_LOG=/dev/null with a city set: nothing lands in the city's log (what the runbook's example relies on)"; else bad "POOL_PROBE_LOG=/dev/null did not keep the line out of the city's log"; fi
+reset_fix
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
