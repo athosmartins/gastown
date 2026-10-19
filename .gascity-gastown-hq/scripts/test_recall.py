@@ -593,6 +593,19 @@ class TestUpdateIndexIfStaleSelfHeals(_IndexDirCase):
             with self.assertRaises(rl.RecallIndexRebuildDeferred):
                 rl.update_index_if_stale(self._mixed_idx(last_check_at=0), force=True)
 
+    def test_a_deferred_rebuild_is_told_apart_from_a_rebuild_in_the_event_log(self):
+        """The verdict line is written before the guard is asked, so without a
+        second line a refused call and a rebuilt index look the same: one
+        'rebuild' event per recall call and nothing rebuilt."""
+        with mock.patch.object(rl, "build_full_index", side_effect=rl.RecallIndexRebuildDeferred("disk low")), \
+             mock.patch.object(rl, "save_index") as m_save:
+            with self.assertRaises(rl.RecallIndexRebuildDeferred):
+                rl.update_index_if_stale(self._mixed_idx(last_check_at=0), force=True)
+        m_save.assert_not_called()
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["rebuild_inconsistent_index", "rebuild_deferred"], events)
+        self.assertIn("disk low", events[1]["detail"])
+
 
 class TestIndexGenerations(_IndexDirCase):
     def _flaky_atomic_write(self, fail_at, on_call=None):
@@ -824,6 +837,27 @@ class TestIndexGenerations(_IndexDirCase):
         rl.save_index(_make_index(3, 2, 1.0))
         self.assertEqual(list(self.index_dir.rglob("*.tmp")), [])
 
+    def test_a_previous_generation_that_cannot_be_aged_leaves_a_trace_and_the_save_still_succeeds(self):
+        """Only 'already gone' is benign for the utime that starts the grace
+        period. Any other failure means the previous generation may be pruned
+        at once; CURRENT already moved, so the save is not failed, but the event
+        log must say so."""
+        import errno
+        rl.save_index(_make_index(3, 2, 1.0))
+        with mock.patch.object(rl.os, "utime", side_effect=PermissionError(errno.EPERM, "Operation not permitted")):
+            rl.save_index(_make_index(4, 2, 2.0))
+        self.assertEqual(len(rl.load_index().corpus), 4)
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["index_previous_generation_not_aged"], events)
+        self.assertIn("Operation not permitted", events[0]["detail"])
+
+    def test_a_previous_generation_that_is_already_gone_is_not_worth_a_trace(self):
+        rl.save_index(_make_index(3, 2, 1.0))
+        with mock.patch.object(rl.os, "utime", side_effect=FileNotFoundError("gone")):
+            rl.save_index(_make_index(4, 2, 2.0))
+        self.assertEqual(len(rl.load_index().corpus), 4)
+        self.assertEqual(self.events(), [])
+
 
 class TestConcurrentWriters(_IndexDirCase):
     """Two save_index() calls that really overlap (ga-m1sa2l, gate 1). The
@@ -1037,9 +1071,57 @@ class TestThrottleTimestampPersistence(_IndexDirCase):
         with mock.patch.object(rl, "GEN_PRUNE_GRACE_SECONDS", 0):
             rl.save_index(_make_index(4, 2, 2.0))
             rl.save_index(_make_index(5, 2, 3.0))  # prunes the generation `loaded` came from
-        rl.save_index_meta(loaded)  # must not raise, must not resurrect the old generation
+        messages = []
+        rl.save_index_meta(loaded, progress=messages.append)  # must not raise, must not resurrect the old generation
         self.assertEqual(len(rl.load_index().corpus), 5)
         self.assertEqual(len([p for p in self.index_dir.iterdir() if p.name.startswith("gen-")]), 1)
+        # the one benign failure stays quiet: a trace here would be noise on every concurrent save
+        self.assertEqual(messages, [])
+        self.assertEqual(self.events(), [])
+
+    def test_a_meta_write_that_fails_for_a_real_reason_is_not_silent(self):
+        """Only 'the generation is gone' is benign. Disk full, permissions, a
+        read-only fs or an I/O error leave the throttle timestamp unpersisted,
+        so every recall re-polls bd (Dolt is poll-sensitive) until a write
+        lands -- and that must not look the same as a write that worked."""
+        import errno
+        rl.save_index(_make_index(3, 2, 1.0))
+        loaded = rl.load_index()
+        failures = [PermissionError(errno.EACCES, "Permission denied"),
+                    OSError(errno.ENOSPC, "No space left on device"),
+                    OSError(errno.EROFS, "Read-only file system"),
+                    OSError(errno.EIO, "Input/output error")]
+        for failure in failures:
+            with self.subTest(failure=failure.strerror):
+                before = len(self.events())
+                messages = []
+                with mock.patch.object(rl, "_atomic_write", side_effect=failure):
+                    rl.save_index_meta(loaded, progress=messages.append)  # a timestamp is not worth failing a search over
+                self.assertTrue(any("staleness-check timestamp" in m and failure.strerror in m for m in messages), messages)
+                new_events = self.events()[before:]
+                self.assertEqual([e["event"] for e in new_events], ["index_meta_not_persisted"], new_events)
+                self.assertIn(failure.strerror, new_events[0]["detail"])
+                self.assertIn(loaded.gen_dir.name, new_events[0]["detail"])
+
+    def test_a_failed_meta_write_in_the_noop_check_reaches_the_caller_and_the_log(self):
+        """Through update_index_if_stale, the way recall hits it: the 'nothing
+        new' branch must hand its progress callback down, and the timestamp
+        really stays unpersisted on disk."""
+        import errno
+        import time
+        rl.save_index(_make_index(3, 2, 1.0))
+        on_disk_before = rl.load_index().meta["last_staleness_check_at"]
+        loaded = rl.load_index()
+        loaded.meta["last_staleness_check_at"] = 0
+        loaded.meta["last_build_at"] = time.time()  # young index: the age trigger must not fire
+        messages = []
+        with mock.patch.object(rl, "fetch_closed_meta", return_value=[]), \
+             mock.patch.object(rl, "_atomic_write", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            _, changed = rl.update_index_if_stale(loaded, force=False, progress=messages.append)
+        self.assertFalse(changed)
+        self.assertTrue(any("No space left on device" in m for m in messages), messages)
+        self.assertEqual([e["event"] for e in self.events()], ["index_meta_not_persisted"])
+        self.assertEqual(rl.load_index().meta["last_staleness_check_at"], on_disk_before)
 
 
 # ---------------------------------------------------------------------------

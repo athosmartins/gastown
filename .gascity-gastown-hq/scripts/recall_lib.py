@@ -692,8 +692,13 @@ def save_index(idx: RecallIndex) -> None:
     if previous is not None and previous != gen:
         try:
             os.utime(previous)  # start the previous generation's grace period NOW, not at its last write
-        except OSError:
+        except FileNotFoundError:
             pass  # already gone: nothing to protect
+        except OSError as e:
+            # could not start the grace period: the previous generation keeps its old mtime, so the prune below
+            # may remove it at once and a reader still on it takes its second look (_LAYOUT_MOVED). Never
+            # fatal -- CURRENT already moved -- but not silent either.
+            _log_index_event("index_previous_generation_not_aged", f"{previous.name}: {e}")
     _prune_generations(keep=gen)
 
 
@@ -720,27 +725,45 @@ def _discard_unpublished_generation(gen: Path) -> None:
     shutil.rmtree(gen, ignore_errors=True)
 
 
-def save_index_meta(idx: RecallIndex) -> None:
+def save_index_meta(idx: RecallIndex, progress=lambda msg: None) -> None:
     """Persist only index_meta.json -- what the 'nothing new' branch needs to
     move the throttle timestamp. Pre-ga-m1sa2l that branch re-saved the whole
     index (~240 MB) for one number, which also re-stamped a broken index as
     fresh. An index that never came from a generation on disk is published
-    whole instead (that is also the one-time migration off the flat layout)."""
+    whole instead (that is also the one-time migration off the flat layout).
+
+    Three outcomes for the meta write itself, none of which raises (the caller
+    already has its answer; a timestamp is not worth failing a search over).
+    The generation-less fallback above is not one of them: it is save_index(),
+    and its errors propagate as they always did:
+      * written -- the throttle holds for the next STALENESS_CHECK window;
+      * the generation is gone (FileNotFoundError: pruned by a newer save, the
+        only benign failure) -- silent, and not resurrected: the newer
+        generation carries its own timestamp;
+      * anything else (ENOSPC, EACCES, EROFS, EIO: the disk-full window this
+        index layout exists for) -- the timestamp is NOT persisted, so every
+        recall re-polls bd for both stores until a write lands. That is
+        visible on purpose: a progress line, plus an event-log line that
+        survives `recall -q`."""
     gen = idx.gen_dir
     if gen is None:
         save_index(idx)
         return
     try:
         _atomic_write(_index_files(gen)["meta"], lambda f: f.write(json.dumps(idx.meta, indent=2).encode()))
-    except OSError:
-        # falhou → keep the old timestamp (the next call simply re-checks); a
-        # generation pruned under us must not be resurrected or raise
-        pass
+    except FileNotFoundError:
+        pass  # generation pruned under us: nothing to write into, and it must not be recreated
+    except OSError as e:
+        progress(f"recall: could not persist the staleness-check timestamp ({e}) -- "
+                 "bd will be re-polled on every call until it can be written")
+        _log_index_event("index_meta_not_persisted", f"{gen.name}: {e}")
 
 
 def _prune_generations(keep: Path) -> None:
     """Best-effort tidy-up AFTER CURRENT moved: drop superseded generations
-    older than the grace period, orphaned unpublished ones (killed writers),
+    older than the grace period (a minimum, not a maximum: this only runs
+    inside a save, so a superseded generation stays on disk -- ~240 MB -- until
+    the first save after its grace period ends), orphaned unpublished ones (killed writers),
     the pre-generation flat files, and tmp files a killed writer left (by age:
     a live writer's tmp is seconds old). Touches only names this module
     creates; never `keep`, never whatever CURRENT names right now (another
@@ -921,9 +944,18 @@ def should_rebuild(meta: dict, new_real_count: int, now: float = None) -> bool:
 
 
 def _rebuild_from_scratch(reason: str, progress) -> "RecallIndex":
+    """`rebuild_inconsistent_index` records the verdict (this index cannot
+    answer) and is written before the disk guard is asked, so a rebuild that
+    dies half way still has its reason. It does NOT say a rebuild happened: when
+    the guard says not now, `rebuild_deferred` follows it, and that is what
+    tells a refused call from a rebuilt index in the event log."""
     progress(f"recall: index is inconsistent ({reason}) -- rebuilding from scratch")
     _log_index_event("rebuild_inconsistent_index", reason)
-    new_idx = build_full_index(progress=progress)
+    try:
+        new_idx = build_full_index(progress=progress)
+    except RecallIndexRebuildDeferred as e:
+        _log_index_event("rebuild_deferred", str(e))
+        raise
     save_index(new_idx)
     return new_idx
 
@@ -974,7 +1006,7 @@ def update_index_if_stale(idx: "RecallIndex", force: bool = False, progress=lamb
     meta["last_staleness_check_at"] = now
 
     if not force and not should_rebuild(meta, total_new_real, now=now):
-        save_index_meta(idx)  # persist the throttle timestamp even on a no-op check (meta only)
+        save_index_meta(idx, progress)  # persist the throttle timestamp even on a no-op check (meta only)
         return idx, False
 
     progress(f"recall: refreshing index (new_real_beads={total_new_real}) ...")
