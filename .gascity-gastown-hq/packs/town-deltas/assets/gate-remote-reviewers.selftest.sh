@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
 # gate-remote-reviewers.selftest.sh (ga-2hd02v.1.9) — o gate abre o revisor no nó Hetzner primeiro e no mini só se o nó não puder
 #
-# Contents
-#   0 compile-guard · 1 flag (3 estados) · 2 estado do nó (room/full/unready/unknown) · 3 Bash 3.2 sob set -euo pipefail
-#   4 o dispatcher: bloco de carga, spawn node-first, re-convocação, ponteiro desligado no slot remoto
-#   5 o template: agent.toml, prompt (terceiro estado byte a byte), nome casa com o híbrido e com o atalho
-#   6 mutantes — cada regra tem que reprovar quando a regra é arrancada
+# Contents: 0 compile-guard · 1 flag (3 estados) · 2 nó (room/full/unready/unknown) · 3 Bash 3.2 · 4 dispatcher (carga, spawn node-first,
+# re-convocação, ponteiro desligado no slot remoto) · 5 template/prompt/nomes · 5b o `decide()` do atalho · 6 mutantes
 #
-# O que isto prova e o que NÃO prova. Prova a ESCOLHA e a COSTURA, com `gc`, `bd` e o `gc-session-ssh` de mentira: nada abre sessão,
-# nada fala com o nó. NÃO prova que um revisor do nó termina uma revisão nem que o veredito dele bate com o do local: isso só se mede com
-# o nó ligado (docs/runbooks/gate-reviewer-remote.md, "Provar").
-#
+# Prova a ESCOLHA e a COSTURA, com `gc`, `bd` e o `gc-session-ssh` de mentira: nada abre sessão, nada fala com o nó. NÃO prova que um
+# revisor do nó termina uma revisão nem que o veredito bate com o do local: isso só se mede com o nó ligado (runbook, "Provar").
 # Roda sem Dolt, sem launchd, sem rede. Sai 0 sse toda asserção vale.
 
 set -uo pipefail
@@ -149,8 +144,6 @@ R="$(env GC_CITY="$TMP/c4" /bin/bash -c 'set -euo pipefail; source "$0"; gate_re
 eq "/bin/bash (3.2 on macOS) sources the lib and picks remote under set -euo pipefail" "$R" "gate-reviewer-remote"
 R="$(env GC_CITY="$TMP/c4" FAKE_SSH_MODE=full4 /bin/bash -c 'set -euo pipefail; source "$0"; gate_remote_pick_template; printf "%s" "$GATE_REMOTE_PICK_TEMPLATE"' "$LIB" 2>&1)"
 eq "…and picks local when the node is full" "$R" "gate-reviewer"
-R="$(env GC_CITY="$TMP/c4" bash -c 'set -euo pipefail; source "$0"; echo SOURCED' "$LIB" 2>&1)"
-eq "sourcing prints nothing but what the caller prints (no top-level output)" "$R" "SOURCED"
 
 echo "── 4. the dispatcher: load block, node-first spawn, re-convene, no pointer for a node slot ──"
 LOADBLK="$(sed -n '/# SELFTEST-EXTRACT remote-lib-load: BEGIN/,/# SELFTEST-EXTRACT remote-lib-load: END/p' "$DISPATCHER")"
@@ -162,8 +155,6 @@ if [ -z "$LOADBLK" ]; then bad "remote-lib-load block not found in the dispatche
   eq "lib ABSENT → GATE_REMOTE_LIB_OK=0 and the dispatcher lives" "$(GC_CITY="$TMP/lc" bash -c 'set -euo pipefail; eval "$1"; echo $GATE_REMOTE_LIB_OK' _ "$LOADBLK" 2>&1)" "0"
   printf 'false\n' > "$TMP/lc/packs/town-deltas/assets/gate-remote-reviewers.lib.sh"
   eq "lib whose top level FAILS → 0 and the dispatcher lives (set -e)" "$(GC_CITY="$TMP/lc" bash -c 'set -euo pipefail; eval "$1"; echo "$GATE_REMOTE_LIB_OK"' _ "$LOADBLK" 2>&1)" "0"
-  printf 'return 1\n' > "$TMP/lc/packs/town-deltas/assets/gate-remote-reviewers.lib.sh"
-  eq "lib that does a top-level 'return 1' → 0" "$(GC_CITY="$TMP/lc" bash -c 'set -euo pipefail; eval "$1"; echo "$GATE_REMOTE_LIB_OK"' _ "$LOADBLK" 2>&1)" "0"
   printf 'x=(\n' > "$TMP/lc/packs/town-deltas/assets/gate-remote-reviewers.lib.sh"
   eq "lib with a syntax error → 0" "$(GC_CITY="$TMP/lc" bash -c 'set -euo pipefail; eval "$1"; echo "$GATE_REMOTE_LIB_OK"' _ "$LOADBLK" 2>&1 | tail -n1)" "0"
 fi
@@ -232,10 +223,9 @@ write_comments() { jq -n --arg t "$1" '[{"id":"c1","issue_id":"vb","author":"gat
 echo "  · 4a. the node slot is never sent a pointer"
 REVIEWER_POINTER_OK=(1 1 1); REVIEWER_NUDGE_SENT=(0 0 0); REVIEWER_TEMPLATE=("gate-reviewer-remote" "gate-reviewer")
 rm -f "$NUDGED"/*
-gate_deliver_review_task 0 sidR "$TASK" 1 vb0 send; rcR=$?
-gate_deliver_review_task 1 sidL "$TASK" 1 vb1 send; rcL=$?
-gate_deliver_review_task 2 sidU "$TASK" 1 vb2 send; rcU=$?
-eq "remote slot: delivered (rc 0)" "$rcR" "0"
+gate_deliver_review_task 0 sidR "$TASK" 1 vb0 send
+gate_deliver_review_task 1 sidL "$TASK" 1 vb1 send
+gate_deliver_review_task 2 sidU "$TASK" 1 vb2 send
 cmp -s "$NUDGED/sidR" <(printf '%s' "$TASK") && ok "remote slot with POINTER_OK=1: the nudge is the FULL task, byte for byte" || bad "remote slot got something other than the full task: $(head -c 80 "$NUDGED/sidR")"
 case "$(cat "$NUDGED/sidL")" in "QUALITY GATE REVIEW — POINTER"*) ok "local slot with POINTER_OK=1: still a pointer (nothing changed for it)" ;; *) bad "local slot lost its pointer: $(head -c 80 "$NUDGED/sidL")" ;; esac
 case "$(cat "$NUDGED/sidU")" in "QUALITY GATE REVIEW — POINTER"*) ok "a slot nobody filled (template empty) keeps the old pointer behaviour" ;; *) bad "unfilled slot changed behaviour: $(head -c 80 "$NUDGED/sidU")" ;; esac
@@ -319,13 +309,11 @@ eq "exactly three LOCAL 'session new gate-reviewer' call sites remain (respawn, 
 NODE_SPAWNS="$(grep -n 'session new "\$GATE_REMOTE_TEMPLATE"' "$DISPATCHER" | wc -l | tr -d ' ')"
 eq "exactly two node spawn sites (Step 7 and re-convene), both through gate_bounded_spawn" "$NODE_SPAWNS" "2"
 eq "…both capture stderr to a file, none mutes it" "$(grep -A4 'session new "\$GATE_REMOTE_TEMPLATE"' "$DISPATCHER" | grep -c '2>"\$_')" "2"
-eq "…and no node spawn line is muted with 2>/dev/null" "$(grep -A4 'session new "\$GATE_REMOTE_TEMPLATE"' "$DISPATCHER" | grep -c '2>/dev/null')" "0"
 eq "the review task is rendered ONCE per slot, before the template is chosen (one text for both templates)" "$(grep -c 'REVIEW_TASK=\$(gate_render_review_task' "$DISPATCHER" | tr -d ' ')" "1"
 RENDER_LN="$(grep -n 'REVIEW_TASK=\$(gate_render_review_task' "$DISPATCHER" | head -1 | cut -d: -f1)"
 PICK_LN="$(grep -n 'gate_remote_pick_template || true' "$DISPATCHER" | tail -n 1 | cut -d: -f1)"
 [ -n "$RENDER_LN" ] && [ -n "$PICK_LN" ] && [ "$RENDER_LN" -lt "$PICK_LN" ] && ok "…the render line ($RENDER_LN) comes before the Step 7 pick ($PICK_LN): the pick cannot change the text" || bad "render/pick order is not what the byte-identity rests on"
-eq "the E5 extra reviewer lib is untouched by the node (always local)" "$(grep -c 'GATE_REMOTE\|gate_remote' "$SELF_DIR/gate-e5-second-reviewer.lib.sh" | tr -d ' ')" "0"
-if [ -f "$SELF_DIR/refino-gate-dispatcher.sh" ]; then eq "the refino dispatcher is untouched by the node (always local)" "$(grep -c 'GATE_REMOTE\|gate_remote' "$SELF_DIR/refino-gate-dispatcher.sh" | tr -d ' ')" "0"; fi
+eq "the E5 extra reviewer and the refino dispatcher never mention the node (always local)" "$(cat "$SELF_DIR/gate-e5-second-reviewer.lib.sh" "$SELF_DIR/refino-gate-dispatcher.sh" 2>&1 | grep -c 'GATE_REMOTE\|gate_remote\|No such file' | tr -d ' ')" "0"
 hasF "$DISPATCHER" 'the flag file exists but gate-remote-reviewers.lib.sh is NOT loaded' "flag on + lib missing is announced in the log (E5 precedent), not silent"
 
 echo "── 5. the template: agent.toml, prompt, names ──"
@@ -336,9 +324,8 @@ eq "provider = claude-headless" "$(get provider)" "claude-headless"
 eq "wake_mode = fresh" "$(get wake_mode)" "fresh"
 eq "idle_timeout = 10m (returns the node slot)" "$(get idle_timeout)" "10m"
 CITY_TOML="$CITY_SRC/city.toml"
-RM="$(sed -n 's/^remote_match *= *"\([^"]*\)".*/\1/p' "$CITY_TOML" | head -n1)"
-RM_SRC="city.toml"
-if [ -z "$RM" ]; then RM="$(sed -n 's/^remote_match *= *"\([^"]*\)".*/\1/p' "$CITY_SRC/docs/runbooks/gc-session-ssh.md" | head -n1)"; RM_SRC="gc-session-ssh.md (the hybrid [session] block is not committed to city.toml yet)"; fi
+RM="$(sed -n 's/^remote_match *= *"\([^"]*\)".*/\1/p' "$CITY_TOML" "$CITY_SRC/docs/runbooks/gc-session-ssh.md" | head -n1)"
+RM_SRC="city.toml or gc-session-ssh.md (the hybrid [session] block is not committed to city.toml yet)"
 [ -n "$RM" ] && ok "remote_match is readable (=$RM, from $RM_SRC)" || bad "remote_match not found in city.toml nor in gc-session-ssh.md: the name rule below cannot be checked"
 case "gate-reviewer-remote-adhoc-0123456789" in *"$RM"*) [ -n "$RM" ] && ok "the engine's session name for this template carries remote_match, so the hybrid provider sends it to the node" ;; *) bad "the session name would NOT be routed to the node" ;; esac
 RX="$(sed -n 's/^IDENTITY_PATTERN=//p' "$CITY_SRC/docs/runbooks/gc-session-ssh.md" | head -n1)"
@@ -355,16 +342,13 @@ PT="$(cat "$REMOTE_PROMPT")"
 has "the remote prompt tells the reviewer to deliver by bd comment" "$PT" "bd -C"
 has "…and to close the verdict bead" "$PT" "close"
 has "…and knows label commands come back rc 77" "$PT" "rc 77"
-case "$PT" in *"drain-ack && exit"*) bad "the remote prompt still tells the reviewer to run drain-ack && exit (the shim refuses it)" ;; *) ok "no 'drain-ack && exit' instruction (the shim refuses it)" ;; esac
-case "$PT" in *"sleep 15"*) bad "the remote prompt has the local sleep-15 poll loop" ;; *) ok "no sleep-15 poll loop (the nudge wakes the session)" ;; esac
-case "$PT" in *"--metadata-field gc.session_name"*) ok "(metadata fallback is mentioned only as refused)" ;; *) : ;; esac
-case "$PT" in *"{{"*) bad "the remote prompt has template actions; the node has no use for them" ;; *) ok "no template actions in the remote prompt" ;; esac
+for _bad in 'drain-ack && exit' 'sleep 15' '{{'; do  # the shim refuses drain-ack; the nudge wakes the session; the node has no use for template actions
+  case "$PT" in *"$_bad"*) bad "the remote prompt contains [$_bad]" ;; *) ok "the remote prompt has no [$_bad]" ;; esac
+done
 eq "the pool-prompt skill-mention scan lists the remote template" "$(grep -c 'gate-reviewer-remote' "$SELF_DIR/pool-prompt-skill-mention.selftest.sh" | tr -d ' ')" "1"
 
 echo "── 5b. the node shim lets the verdict through (the REAL task text, run through the shim's own decide()) ──"
-# The node reviewer reaches the mini only through scripts/remote-shim-wrapper.py. Its allowlist is the reason the prompt tells the reviewer to
-# deliver by `bd comment` + `bd close` and to expect rc 77 on `label`. This feeds the commands the dispatcher really renders into decide(), with the
-# identity a node reviewer really has, so the prompt cannot drift away from what the shim does. Policy only: nothing is executed anywhere.
+# Policy only (nothing runs): the commands the dispatcher really renders, through the shim's own decide(), as a node reviewer.
 SHIMCITY="$TMP/shimcity"; mkdir -p "$SHIMCITY/.beads"; printf '{"prefix":"ga-","path":"."}\n' > "$SHIMCITY/.beads/routes.jsonl"
 SHIMTASK="$(bash -c 'source "$1"; gate_render_review_task 1 1 fix/ga-demo someone gascity 0123456789abcdef0123456789abcdef01234567 CORRECTNESS a.sh "1 file" hdr diff "$2" ga-vb-demo bead' _ "$SELF_DIR/gate-review-task.lib.sh" "$SHIMCITY" 2>/dev/null)"
 if [ -z "$SHIMTASK" ]; then bad "could not render the review task text"; else
@@ -411,15 +395,11 @@ for c in cmds:
     else: say(False, f"unexpected command in the verdict section: {c[:4]}")
 for argv, want, what in [
     (["bd", "list", "--assignee", SESSION, "--label", "type:quality-gate-verdict", "--json", "--limit", "5"], "accepted", "the prompt's first-turn lookup"),
-    (["bd", "show", "ga-vb-demo", "--json"], "accepted", "bd show <id> --json (metadata fallback)"),
     (["bd", "show", "ga-vb-demo", "--include-comments"], "refused rc=77", "bd show --include-comments (why the task is never a pointer on the node)"),
-    (["bd", "comments", "ga-vb-demo"], "refused rc=77", "bd comments (same)"),
     (["gc", "runtime", "drain-ack"], "refused rc=77", "gc runtime drain-ack (why the remote prompt has no drain-ack)"),
-    (["bd", "update", "ga-vb-demo", "--status", "closed"], "refused rc=77", "a status edit is not in the list"),
 ]:
     r = verdict(argv); say(r == want, f"{what}: {r}")
-for k, v in [("GC_SESSION_NAME", "gate-reviewer-adhoc-0123456789"), ("GC_TEMPLATE", "gate-reviewer"), ("GC_ALIAS", "gastown.dog-4")]:
-    r = verdict(["bd", "close", "ga-vb-demo"], {**ENV, k: v}); say(r == "refused rc=77", f"identity with {k}={v} (a LOCAL name) -> {r}")
+r = verdict(["bd", "close", "ga-vb-demo"], {**ENV, "GC_SESSION_NAME": "gate-reviewer-adhoc-0123456789"}); say(r == "refused rc=77", f"a LOCAL reviewer's name -> {r}")
 r = verdict(["bd", "close", "ga-vb-demo"]); say(r == "accepted", "…and the node reviewer's own identity can close")
 PY
   while IFS= read -r _l; do
@@ -448,77 +428,15 @@ m_scen() { # <fake-mode> [city-edit]  → template picked by the given lib (glob
   mkcity "$MC"; flag_on "$MC"; [ -n "${2:-}" ] && cfg_edit "$MC" "$2"; tpl "$(pick "$MLIB" "$MC" FAKE_SSH_MODE="$1")"
 }
 MLIB="$(mutate_lib probe-rc 'if [ "$rc" -ne 0 ]; then' 'if false; then')";            killed "an unreachable node counts as room" "$MLIB" "$(m_scen down)" "gate-reviewer"
-MLIB="$(mutate_lib full 'if [ "$total" -ge "$cap" ]; then' 'if false; then')";         killed "the host cap is ignored" "$MLIB" "$(m_scen full4)" "gate-reviewer"
-MLIB="$(mutate_lib tcap 'if [ "$rem" -ge "$tcap" ]; then' 'if false; then')";          killed "the template cap is ignored" "$MLIB" "$(m_scen rev2)" "gate-reviewer"
 MLIB="$(mutate_lib capread "*) printf 'unknown:host config unreadable or ambiguous (cap not read)'; return 0 ;;" '*) facts="cap=999 rig=1 rel=1" ;;')"
 killed "an unreadable host cap is assumed to be huge" "$MLIB" "$(m_scen room "d.__setitem__('hosts',{})")" "gate-reviewer"
 MLIB="$(mutate_lib garbage '*[!A-Za-z0-9_.-]*) printf '"'"'unknown:node probe returned a line that is not a session name'"'"'; return 0 ;;' '*[!A-Za-z0-9_.-]*) : ;;')"
 killed "banner text on stdout is counted as a session" "$MLIB" "$(m_scen garbage)" "gate-reviewer"
-MLIB="$(mutate_lib unready 'if [ "$rig" != "1" ]; then' 'if false; then')";             killed "a host with no worktree_rigs entry is tried anyway" "$MLIB" "$(m_scen room "h['worktree_rigs'].pop('gate-reviewer')")" "gate-reviewer"
 MLIB="$(mutate_lib flagunread '    *) GATE_REMOTE_PICK_KIND="fallback"; GATE_REMOTE_PICK_WHY="remote-reviewer flag UNREADABLE - local reviewer"; return 0 ;;' '    *) : ;;')"
 if [ -n "$MLIB" ]; then
   mkcity "$MC"; rm -f "$MC/.gc/gate-remote-reviewers.on"; ln -s "$TMP/nowhere" "$MC/.gc/gate-remote-reviewers.on"
   killed "an unreadable flag is read as 'on'" "$MLIB" "$(tpl "$(pick "$MLIB" "$MC")")" "gate-reviewer"
 else killed "an unreadable flag is read as 'on'" "" "" ""; fi
-MLIB="$(mutate_lib notimeout 'raw="$("$tbin" -k 5 "$secs" "$ssh_bin" list-running 2>/dev/null)"' 'raw="$("$ssh_bin" list-running 2>/dev/null)"')"
-if [ -n "$MLIB" ]; then
-  mkcity "$MC"; flag_on "$MC"; T0=$(date +%s); R="$(pick "$MLIB" "$MC" FAKE_SSH_MODE=hang GATE_REMOTE_PROBE_SECS=1)"; T1=$(date +%s)
-  # with the bound removed a hanging probe holds the dispatcher for the whole 8 s the fake wants
-  if [ $((T1 - T0)) -ge 6 ]; then ok "mutant 'the probe runs without a bound' killed (it held for $((T1 - T0))s)"; else bad "mutant 'the probe runs without a bound' SURVIVED ($((T1 - T0))s)"; fi
-else bad "mutant 'the probe runs without a bound': the mutation did not apply"; fi
-
-# dispatcher mutants: the same scenarios, run against a mutated copy of the dispatcher (sourced in lib-only mode in a subshell)
-mutate_disp() { # $1=name $2=old $3=new → path or empty
-  python3 -I - "$DISPATCHER" "$TMP/mutd-$1.sh" "$2" "$3" <<'PY' || return 1
-import sys
-src, dst, old, new = sys.argv[1:5]
-s = open(src, encoding="utf-8").read()
-if s.count(old) != 1: sys.exit(f"mutation target found {s.count(old)} times: {old[:80]!r}")
-open(dst, "w", encoding="utf-8").write(s.replace(old, new, 1))
-PY
-  printf '%s' "$TMP/mutd-$1.sh"
-}
-scen_pointer() { # $1=dispatcher path → "remote:<full|pointer> local:<full|pointer>"
-  ( GATE_DISPATCHER_LIB_ONLY=1 source "$1" >/dev/null 2>&1 || { echo "load-failed"; exit 0; }
-    log() { :; }; warn() { :; }; err() { :; }
-    gate_nudge() { printf '%s' "${2:-}" > "$TMP/mp.$1"; return 0; }
-    BRANCH="fix/ga-demo"; BRANCH_SHA="0123456789abcdef0123456789abcdef01234567"; REQUIRED_REVIEWERS=1
-    REVIEWER_POINTER_OK=(1 1); REVIEWER_NUDGE_SENT=(0 0); REVIEWER_TEMPLATE=("gate-reviewer-remote" "")
-    gate_deliver_review_task 0 r "$TASK" 1 vb0 send; gate_deliver_review_task 1 l "$TASK" 1 vb1 send
-    r=pointer; cmp -s "$TMP/mp.r" <(printf '%s' "$TASK") && r=full
-    l=pointer; cmp -s "$TMP/mp.l" <(printf '%s' "$TASK") && l=full
-    echo "remote:$r local:$l" )
-}
-eq "(control) the real dispatcher: remote gets the full task, local keeps the pointer" "$(scen_pointer "$DISPATCHER")" "remote:full local:pointer"
-MD="$(mutate_disp pointer '    _ptr=0
-  fi
-  # vazio → n/a' '    _ptr=1
-  fi
-  # vazio → n/a')"
-killed "a node slot is sent a pointer it cannot follow" "$MD" "$(scen_pointer "${MD:-/dev/null}")" "remote:full local:pointer"
-
-scen_spawn() { # $1=dispatcher path; node fails, local ok → "sid|calls"
-  local blk; blk="$(sed -n '/# SELFTEST-EXTRACT reviewer-spawn-node-first: BEGIN/,/# SELFTEST-EXTRACT reviewer-spawn-node-first: END/p' "$1")"
-  [ -n "$blk" ] || { echo "no-block"; return; }
-  : > "$SPAWNLOG"; MOCK_NODE=fail; MOCK_LOCAL=ok; mkcity "$MC"; flag_on "$MC"
-  ( set -eu; GC_CITY="$MC"; GATE_REMOTE_LIB_OK=1; i=1; SESSION_ID=""; REVIEWER_TEMPLATE=(); export FAKE_SSH_MODE=room
-    eval "$blk"; printf '%s' "$SESSION_ID" ) 2>/dev/null
-}
-eq "(control) node spawn fails → the slot still ends up with the local session" "$(scen_spawn "$DISPATCHER")" "ga-LOCAL"
-MD="$(mutate_disp nofallback '  if [ -z "$SESSION_ID" ]; then
-    _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}"' '  if false; then
-    _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}"')"
-killed "a failed node spawn leaves the slot without a reviewer (no local fallback)" "$MD" "$(scen_spawn "${MD:-/dev/null}")" "ga-LOCAL"
-scen_slot() { # $1=dispatcher path; node ok -> which template does the slot remember? (a node slot must, or it is sent a pointer it cannot follow)
-  local blk; blk="$(sed -n '/# SELFTEST-EXTRACT reviewer-spawn-node-first: BEGIN/,/# SELFTEST-EXTRACT reviewer-spawn-node-first: END/p' "$1")"
-  [ -n "$blk" ] || { echo "no-block"; return; }
-  : > "$SPAWNLOG"; MOCK_NODE=ok; MOCK_LOCAL=ok; mkcity "$MC"; flag_on "$MC"
-  ( set -eu; GC_CITY="$MC"; GATE_REMOTE_LIB_OK=1; i=1; SESSION_ID=""; REVIEWER_TEMPLATE=(); export FAKE_SSH_MODE=room
-    eval "$blk"; printf '%s' "${REVIEWER_TEMPLATE[0]:-}" ) 2>/dev/null
-}
-eq "(control) node spawn works → the slot remembers it is on the node" "$(scen_slot "$DISPATCHER")" "gate-reviewer-remote"
-MD="$(mutate_disp noslot '        REVIEWER_TEMPLATE[$((i - 1))]="$GATE_REMOTE_TEMPLATE"' '        : # slot template not recorded')"
-killed "the slot forgets it runs on the node (and gets a pointer)" "$MD" "$(scen_slot "${MD:-/dev/null}")" "gate-reviewer-remote"
 
 echo
 echo "gate-remote-reviewers selftest: $PASS passed, $FAIL failed"

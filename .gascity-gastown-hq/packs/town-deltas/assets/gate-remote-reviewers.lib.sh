@@ -1,41 +1,22 @@
 #!/usr/bin/env bash
 # gate-remote-reviewers.lib.sh — qual revisor o gate abre: o do nó Hetzner primeiro, o local só se o nó não puder (ga-2hd02v.1.9)
 #
-# Contents
-#   O que é · Como o dispatcher usa · A flag · O estado do nó · Por que tudo cai no local · Contrato das funções · Selftest
+# Contents: O que é · A flag · O nó · gate_remote_flag_state · gate_remote_node_state · gate_remote_pick_template
 #
-# O QUE É. Escolhe, a cada revisor que o quality-gate-dispatcher vai abrir, entre o template `gate-reviewer` (roda no mini) e o
-# `gate-reviewer-remote` (a sessão tem `-remote-` no nome, o provider híbrido a manda ao nó Hetzner). A TAREFA é a mesma nos dois
-# (o dispatcher renderiza um texto só), então o que esta lib decide é ONDE o Claude roda, nunca O QUE ele revisa.
+# O QUE É. Escolhe, a cada revisor que o quality-gate-dispatcher vai abrir, entre `gate-reviewer` (mini) e `gate-reviewer-remote` (a
+# sessão tem `-remote-` no nome; o provider híbrido a manda ao nó). A TAREFA é a mesma: esta lib decide ONDE o Claude roda, nunca O QUE
+# revisa. Só ESCOLHE: não abre nada e só pergunta ao nó o `list-running`. Runbook: docs/runbooks/gate-reviewer-remote.md.
+# O dispatcher a carrega à prova de falha (lib ausente ou quebrada = tudo local) e chama `gate_remote_pick_template` SEM `$(...)` (o
+# log escreve em stdout e seria engolido), lendo GATE_REMOTE_PICK_TEMPLATE, GATE_REMOTE_PICK_KIND (inert = flag desligada | node |
+# fallback = flag ligada e o nó não serve) e GATE_REMOTE_PICK_WHY (uma linha de log).
 #
-# COMO O DISPATCHER USA. Carrega esta lib com o mesmo idioma à prova de falha das outras (`[ -r ] && { source …; } || true`): lib
-# ausente ou que não carrega = nenhuma função aqui = tudo local, igual a antes. Antes de cada `gc session new` chama
-# `gate_remote_pick_template` SEM `$(...)` (o log do dispatcher escreve em stdout e seria engolido) e lê as globais:
-#     GATE_REMOTE_PICK_TEMPLATE   gate-reviewer | gate-reviewer-remote
-#     GATE_REMOTE_PICK_KIND       inert (flag desligada: nada a dizer) | node (nó escolhido) | fallback (a flag está ligada e o nó não serve)
-#     GATE_REMOTE_PICK_WHY        uma linha, para o log
-#
-# A FLAG. $GC_CITY/.gc/gate-remote-reviewers.on (precedente: gate-e5-second-reviewer.on). O template nasce INERTE: sem o arquivo
-# o dispatcher nunca escolhe o nó. Criar o arquivo é o passo de ligar (docs/runbooks/gate-reviewer-remote.md), decisão do Mayor
-# depois do flip da 1.6 provado. Três estados: ligada / desligada / ilegível; só "ligada" chega a olhar o nó.
-#
-# O ESTADO DO NÓ. Três respostas, nunca duas: `room` (cabe), `full` (não cabe) e `unknown` (não deu para ver). `unknown` NÃO é
-# `room`: o gate fica no local, que é o caminho que sempre funcionou. A pergunta ao nó é o `list-running` do próprio provider
-# (lista de sessões do socket do provider; host fora do ar volta erro, nunca "vazio"), sob `timeout`. Cabe = (sessões vivas no nó
-# < `cap` do host em .gc/session-ssh.json) E (revisores remotos vivos < max_active_sessions do template). Os dois tetos são
-# LIDOS, nunca assumidos: um teto que não leu é `unknown`. Host sem `real_sessions_released_by` ou sem worktree_rigs["gate-reviewer"]
-# é `unready`: o start recusaria (exit 12/13), então nem tentamos abrir a sessão.
-#
-# POR QUE TUDO CAI NO LOCAL. Esta lib só ESCOLHE; ela não abre nada nem toca no nó além do `list-running`. Qualquer saída que ela
-# não entenda (linha com formato estranho, rc≠0, estouro de tempo, jq ausente, teto ilegível, `timeout` ausente) vira o
-# template local. O pior caso de um erro aqui é um revisor rodar onde sempre rodou, nunca um gate sem revisor.
-# Cada leitura abaixo diz, no comentário, o que faz quando vem VAZIO e o que faz quando FALHA/ILEGÍVEL (regra E12).
-#
-# Bash 3.2 (o /bin/bash do macOS): sem array associativo, sem ${v,,}, sem printf -v. Só funções e atribuições no topo: o dispatcher
-# roda sob `set -euo pipefail` e um comando de topo que falhe mataria o dispatcher calado. Toda função devolve 0 e comunica por
-# stdout/globais, salvo o predicado gate_remote_is_remote_template, que só se usa dentro de `if`.
-#
-# Selftest: packs/town-deltas/assets/gate-remote-reviewers.selftest.sh
+# A FLAG $GC_CITY/.gc/gate-remote-reviewers.on (precedente: gate-e5-second-reviewer.on); criá-la é o passo de ligar, decisão do Mayor
+# depois do flip da 1.6. Três estados: ligada / desligada / ilegível. O NÓ: `room`, `full`, `unready` (o start seria recusado) ou
+# `unknown` (não deu para ver), e `unknown` NÃO é `room`. Cabe = (vivas no nó < `cap` do host em .gc/session-ssh.json) E (remotos vivos
+# < max_active_sessions do template); os dois tetos são LIDOS. Saída não entendida (rc≠0, estouro, linha estranha, jq/`timeout`
+# ausente, teto ilegível) vira o template local: o pior erro é um revisor rodar onde sempre rodou, nunca um gate sem revisor. Cada
+# leitura diz o que faz quando vem VAZIA e quando FALHA (regra E12). Bash 3.2: só funções e atribuições no topo (o dispatcher roda sob
+# `set -euo pipefail`); toda função devolve 0 e comunica por stdout/globais.
 
 GATE_REMOTE_TEMPLATE="${GATE_REMOTE_TEMPLATE:-gate-reviewer-remote}"
 GATE_REMOTE_LOCAL_TEMPLATE="${GATE_REMOTE_LOCAL_TEMPLATE:-gate-reviewer}"
@@ -174,9 +155,4 @@ gate_remote_pick_template() {
       GATE_REMOTE_PICK_KIND="fallback"; GATE_REMOTE_PICK_WHY="unexpected node state - local reviewer" ;;
   esac
   return 0
-}
-
-# gate_remote_is_remote_template <nome> — 0 se <nome> é o template remoto, 1 se não (inclui vazio).
-gate_remote_is_remote_template() {
-  [ -n "${1:-}" ] && [ "${1:-}" = "$GATE_REMOTE_TEMPLATE" ]
 }

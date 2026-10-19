@@ -7,15 +7,11 @@
 
 > **Recuperação**: depois de compactar, limpar ou reiniciar, rode `gc prime --hook` (o atalho deixa passar) e refaça o passo 1 de "Como pegar a tarefa".
 
-<!-- ga-7nxfa1: never write a skill name with a leading slash anywhere in this file, not even in backticks.
-     Claude Code turns a slash token that names a real skill into a skill_mention attachment at boot, the
-     fresh worker runs that skill with no bead, and idles on a node slot. Checked by
-     pool-prompt-skill-mention.selftest.sh: run it after editing this file, nothing runs it for you. -->
+<!-- ga-7nxfa1: never write a skill name with a leading slash in this file, not even in backticks (it becomes a skill_mention
+     at boot and the fresh worker idles on a node slot). Run pool-prompt-skill-mention.selftest.sh after editing. -->
 
-<!-- ga-2hd02v.1.9: the block "Dimensão obrigatória: THE THIRD STATE" below is a VERBATIM copy of the one in
-     agents/gate-reviewer/prompt.template.md. It is the lens every reviewer applies whatever the assigned lens is, so the
-     node reviewer must not read a weaker version of it. gate-remote-reviewers.selftest.sh compares the two blocks byte
-     for byte: edit both, never one. -->
+<!-- ga-2hd02v.1.9: "Mandatory dimension: THE THIRD STATE" below is a VERBATIM copy of the one in agents/gate-reviewer/prompt.template.md;
+     gate-remote-reviewers.selftest.sh compares the two byte for byte: edit both, never one. -->
 
 ## Onde você está
 
@@ -107,23 +103,11 @@ Se `comment` ou `close` voltar com erro que não é rc 77, leia a mensagem, tent
 
 ## Somente leitura
 
-Você revisa; não modifica. Antes de revisar, capture uma linha de base:
-
-```bash
-git status --porcelain=v1 -z
-```
-
-Depois de revisar, rode o mesmo comando e confirme que nenhum arquivo foi modificado. Estado sujo que já existia não é responsabilidade sua, só o delta que você introduziu. Não faça commit nem push.
+Você revisa; não modifica. Capture `git status --porcelain=v1 -z` antes de revisar e rode de novo depois: nenhum arquivo pode ter mudado (estado sujo que já existia não é seu, só o delta que você introduziu). Não faça commit nem push.
 
 ## Verificação de caminho: diretório de trabalho ≠ raiz do git
 
-O diff que o dispatcher entregou na tarefa já é relativo à raiz do repositório: confie nele. Se você fizer uma verificação PRÓPRIA (um caminho existe, um symlink resolve, um arquivo é rastreado), a saída do `git` relativa ao diretório atual rotula caminhos errado: um arquivo rastreado em `.gascity-gastown-hq/foo` aparece como `foo` quando você está dentro de `.gascity-gastown-hq`, indistinguível de um arquivo `foo` da raiz. Antes de qualquer verificação assim, vá à raiz de verdade:
-
-```bash
-cd "$(git rev-parse --show-toplevel)"
-```
-
-Só então rode `git ls-files --full-name <caminho>`, com `<caminho>` como está no diff (já relativo à raiz). Os argumentos de caminho do git são resolvidos a partir do diretório atual: sem o `cd`, o comando não acha nada e isso é um falso negativo, não um erro (ga-grxrh).
+O diff da tarefa já é relativo à raiz do repositório: confie nele. Numa verificação PRÓPRIA (um caminho existe, um symlink resolve, um arquivo é rastreado), a saída do `git` relativa ao diretório atual rotula caminhos errado (`.gascity-gastown-hq/foo` aparece como `foo` lá dentro, igual a um `foo` da raiz). Antes, vá à raiz: `cd "$(git rev-parse --show-toplevel)"`, e só então `git ls-files --full-name <caminho>`, com o caminho como está no diff. Sem o `cd` o comando não acha nada, e isso é um falso negativo, não um erro (ga-grxrh).
 
 **O branch em revisão pode não estar neste worktree.** O worktree do nó nasce do espelho do mini e só tem o que foi publicado lá. A fonte da verdade da revisão é o diff do texto da tarefa. Se precisar de um arquivo inteiro, ou de um commit, que não está aqui, **diga isso no veredito** (o que você não conseguiu ver e por quê) em vez de supor o conteúdo: "não vi" não é "está certo".
 

@@ -128,10 +128,8 @@ fi
 unset _REA_LIB
 # SELFTEST-EXTRACT rea-lib-load: END
 
-# ga-2hd02v.1.9: revisor do gate no nó Hetzner (gate-reviewer-remote), nó primeiro e local só se o nó não puder. Mesmo idioma das libs
-# acima: lib ausente ou que não carrega = GATE_REMOTE_LIB_OK=0 = todo revisor abre local, exatamente como antes. A lib só define
-# funções (nenhum comando de topo que possa falhar sob `set -e`). A ESCOLHA fica atrás da flag $GC_CITY/.gc/gate-remote-reviewers.on:
-# sem o arquivo nada muda, mesmo com a lib carregada (ver gate-remote-reviewers.lib.sh e docs/runbooks/gate-reviewer-remote.md).
+# ga-2hd02v.1.9: revisor no nó Hetzner (gate-reviewer-remote), nó primeiro. Mesmo idioma das libs acima: lib ausente ou que não
+# carrega = GATE_REMOTE_LIB_OK=0 = todo revisor abre local, como antes. A ESCOLHA fica atrás da flag .gc/gate-remote-reviewers.on.
 # SELFTEST-EXTRACT remote-lib-load: BEGIN
 GATE_REMOTE_LIB_OK=0
 _GATE_REMOTE_LIB="${GC_CITY}/packs/town-deltas/assets/gate-remote-reviewers.lib.sh"
@@ -502,10 +500,8 @@ gate_deliver_review_task() {
     return 10
   fi
   _ptr="${REVIEWER_POINTER_OK[$_slot]:-0}"
-  # ga-2hd02v.1.9: o revisor do nó NÃO lê o comentário embutido (o atalho do nó omite o corpo de comentário: `bd show --json` traz
-  # `comments_omitted` e `bd comments`/`--include-comments` voltam rc 77), então um ponteiro o deixaria sem tarefa. Slot remoto leva
-  # sempre a tarefa inteira no nudge. Vazio (slot que ninguém preencheu) → local, o comportamento de antes; o template do slot
-  # só vira "remoto" depois de o spawn no nó ter DADO sessão.
+  # ga-2hd02v.1.9: o atalho do nó não devolve corpo de comentário, então um ponteiro deixaria o revisor do nó sem tarefa: slot
+  # remoto leva sempre a tarefa inteira. Template vazio (slot que ninguém preencheu) = local, como antes.
   if [ "$_ptr" = "1" ] && [ "${REVIEWER_TEMPLATE[$_slot]:-}" = "${GATE_REMOTE_TEMPLATE:-gate-reviewer-remote}" ]; then
     _ptr=0
   fi
@@ -1264,10 +1260,8 @@ respawn_reviewer_slot() {
   local _rev=$(( _idx + 1 ))
   local _err_file="/tmp/gate-reviewer-respawn-err-$$.${_idx}"
   local _json="{}" _new_sid="" _rs_rc _rs_emb_rc _rs_tpl="gate-reviewer"
-  # ga-2hd02v.1.9: a slot whose reviewer ran on the node and died is replaced LOCALLY, never on the node again: whatever killed
-  # it (node down, node session lost, stuck boot) is the likeliest reason the verdict is late, and the local path is the one that
-  # always worked. A slot that was local is offered to the node like a fresh spawn (flag + room). One attempt on the node; any
-  # failure falls through to the local spawn below, which is the unchanged path.
+  # ga-2hd02v.1.9: a slot whose reviewer died on the node is replaced LOCALLY (what killed it is the likeliest reason the verdict
+  # is late); a local slot is offered to the node like a fresh spawn. One node attempt; any failure falls to the unchanged local spawn.
   if [ "${GATE_REMOTE_LIB_OK:-0}" = "1" ]; then
     if [ "${REVIEWER_TEMPLATE[$_idx]:-}" = "${GATE_REMOTE_TEMPLATE:-gate-reviewer-remote}" ]; then
       log "  Re-convene: slot ${_idx} ran on the node and died - replacement goes to the local reviewer (ga-2hd02v.1.9)."
@@ -1307,7 +1301,7 @@ respawn_reviewer_slot() {
     return 1
   fi
   SESSION_IDS[$_idx]="$_new_sid"
-  # ga-2hd02v.1.9: record WHICH template this slot's current session is (only the node's value is ever read back).
+  # ga-2hd02v.1.9: which template this slot's session came from (only the node's value is read back).
   REVIEWER_TEMPLATE[$_idx]="$_rs_tpl"
   # ga-g3m45n: a NEW session has had no nudge yet, and its pointer eligibility is decided below from THIS
   # re-assignment — nothing carries over from the dead session. (A stale NUDGE_SENT=1 would not stop the
@@ -19057,12 +19051,9 @@ REVIEWER_ACKED=()
 REVIEWER_TASK_EMBEDDED=()
 REVIEWER_POINTER_OK=()
 REVIEWER_NUDGE_SENT=()
-# ga-2hd02v.1.9: REVIEWER_TEMPLATE[k] = o template da sessão ATUAL do slot k, escrito SÓ quando o spawn no nó deu sessão
-# (gate-reviewer-remote). Slot que ninguém preencheu lê vazio = local, igual a antes. Quem lê: gate_deliver_review_task (slot
-# remoto leva a tarefa inteira no nudge, nunca ponteiro) e respawn_reviewer_slot (um revisor do nó que morreu é trocado por um local).
+# ga-2hd02v.1.9: REVIEWER_TEMPLATE[k] = template da sessão ATUAL do slot k, escrito SÓ quando o spawn no nó deu sessão; vazio = local.
 REVIEWER_TEMPLATE=()
-# ga-2hd02v.1.9: the flag is ON and the lib that acts on it did not load: every reviewer opens LOCAL (nothing is decided from the
-# flag here), and nothing else in the log would say the node is not being used. Say it once per run (same shape as the E5 warning).
+# ga-2hd02v.1.9: flag ON but the lib did not load: every reviewer opens LOCAL and nothing else in the log says so. Say it once per run.
 if [ "${GATE_REMOTE_LIB_OK:-0}" != "1" ] && [ -r "${GATE_REMOTE_FLAG_FILE:-${GC_CITY:-}/.gc/gate-remote-reviewers.on}" ]; then
   warn "Remote reviewers: the flag file exists but gate-remote-reviewers.lib.sh is NOT loaded - every reviewer of run ${GATE_RUN_ID:-?} opens LOCAL; the node is not being used although the flag is on (ga-2hd02v.1.9)."
 fi
@@ -19159,13 +19150,10 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
   SESSION_JSON="{}"
   SESSION_ID=""
   _spawn_err=""
-  # ── ga-2hd02v.1.9: node first. With the flag $GC_CITY/.gc/gate-remote-reviewers.on present and the node reporting room, this
-  # reviewer is opened from gate-reviewer-remote (a session whose name carries -remote-, so the hybrid provider starts it on the
-  # Hetzner node). ONE attempt: any failure (node full by a race, host down, start refused, timeout) falls through to the local
-  # spawn below, unchanged, with its transient-retry loop. A node spawn that TIMED OUT has an unknown outcome - the session may
-  # exist - and the local spawn still follows: the cost of that doubt is one idle node session that ends by idle_timeout (10m)
-  # and holds a node slot until then, never a second reviewer for this slot (the slot only ever knows the session id returned by
-  # the spawn that succeeded). Flag off or lib absent: this block does nothing and the run is byte-for-byte what it was.
+  # ── ga-2hd02v.1.9: node first. Flag on + node has room: open this reviewer from gate-reviewer-remote (the -remote- name makes
+  # the hybrid provider start it on the node). ONE attempt: any failure falls to the local spawn below, unchanged. A node spawn
+  # that TIMED OUT has an unknown outcome: at worst one idle node session until idle_timeout (10m), never a second reviewer for
+  # this slot (it only knows the id returned by the spawn that succeeded). Flag off or lib absent: this block does nothing.
   if [ "${GATE_REMOTE_LIB_OK:-0}" = "1" ]; then
     gate_remote_pick_template || true
     if [ "${GATE_REMOTE_PICK_KIND:-}" = "node" ]; then
