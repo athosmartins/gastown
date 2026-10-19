@@ -6,7 +6,7 @@
 # Contents
 #   Grupos · Controle negativo · Variáveis · O que NÃO prova
 #
-# GRUPOS: unit — judge_tree (todo processo com folga tem de ser rebaixado, e ao menos um tinha folga), PAUSE/CLEAN/SWEEP rodados de verdade, pedido de start, identidade, padrões de segredo ·
+# GRUPOS: unit — host padrão do MBP sem MBP_PROOF_SSH (ga-bmmxka: Tailscale, LAN só com a porta 22 respondendo, saída ilegível = Tailscale, a variável vale como está), judge_tree (todo processo com folga tem de ser rebaixado, e ao menos um tinha folga), PAUSE/CLEAN/SWEEP rodados de verdade, pedido de start, identidade, padrões de segredo ·
 #   cli — argumento com cara de comando, sessão real, install sem --apply (nada conecta), plan contra o dry-run do provider (pula sem scripts/gc-session-ssh, p.ex. no nó Linux) ·
 #   install — instalação com o builder real: bundle conferido LÁ, run/ preservada, cliente + links + config, spool 0700, nada em ~/.claude nem ~/.ssh, config do wrapper diferente = não sobrescreve, transferência adulterada = reprova sem trocar, ssh fora / MBP não livre = 3 ·
 #   e2e — a prova inteira (a–e) contra o MBP falso, com modos de falha: cada prova reprova sozinha, o diálogo NUNCA é respondido, a sessão é parada em todo caminho, a pausa do Athos nunca é removida por nós, e o MBP volta ao que era (arquivos, ~/.claude.json, ~/.ssh, spool, bundle)
@@ -45,6 +45,8 @@ for root in sys.argv[1:]:
 print(h.hexdigest())' "$@"
 }
 py() { python3 -I -c 'import importlib.machinery as m,sys; M=m.SourceFileLoader("mp",sys.argv[1]).load_module(); '"$1" "$P"; }
+# sonda de host falsa (ga-bmmxka): rc 0 só para os hosts de HOSTPROBE_UP (separados por espaço) e registra "host porta" em HOSTPROBE_LOG; nada toca a rede
+mk_hostprobe() { printf '#!/bin/sh\n[ -z "${HOSTPROBE_LOG:-}" ] || echo "$1 $2" >> "$HOSTPROBE_LOG"\ncase " ${HOSTPROBE_UP:-} " in *" $1 "*) exit 0 ;; esac\nexit 1\n' > "$T/hostprobe"; chmod +x "$T/hostprobe"; }
 
 SRV="$T/srv"; MINI="$T/mini"; CITY="$T/city"; GOLD="$T/golden"; export SRV CITY FAKE_STATE="$T/state" T
 ROLE="$CITY/.gc/agents/dogs/gastown.dog-1"
@@ -456,6 +458,57 @@ put("#!/usr/bin/env python3\nrequest = {\"stdin_b64\": 1}\n"); r=run([U+"/sp"]);
 put([{"stdout_b64":b(SEC)}]); r=run([U+"/sp"]); assert [h[0] for h in r["hits"]]==[f+"#/0/stdout_b64"], r
 put({"stdout_b64":b(SEC)}); sk=json.dumps({"roots":[U+"/sp"],"globs":[],"secret_rx":M.SECRET_RX,"forbidden":M.FORBIDDEN,"skip":{f:[M.SECRET_RX[0]]}})
 r=json.loads(subprocess.run(["python3","-I","-",sk],input=M.SWEEP.encode(),capture_output=True).stdout.decode().strip().split("\n")[-1]); assert r["hits"]==[], r'; ok $? "unit: SWEEP — olha DENTRO do base64 do spool: segredo em stdin_b64/stdout_b64/stderr_b64 e no cmd (rs1 + base64 url-safe) é achado e dito em qual campo; campo que não decodifica, que não é texto, ou JSON cortado vira \"sem verificar\" (terceiro estado); arquivo que não é JSON não conta; o que não tem segredo continua limpo"; }
+
+  # ga-bmmxka: host padrão do MBP (sem MBP_PROOF_SSH) = o que o mbp-host.sh imprime, mas só QUANDO se vai conectar (resolve_ssh_target, chamada por main() em
+  # e2e e install --apply); falhou/ilegível = o nome do Tailscale; importar o módulo e rodar plan/install sem --apply não sonda nada. A sonda é um stub: nada toca a rede.
+  mk_hostprobe
+  c host-default && { MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro athoss-macbook-pro.local" MBP_PROOF_SSH= py '
+assert M.resolve_ssh_target() == "athos@athoss-macbook-pro", M.SSH_TARGET
+assert M.SSH_TARGET == "athos@athoss-macbook-pro", M.SSH_TARGET
+assert M.default_ssh_target() == "athos@athoss-macbook-pro"'; ok $? "unit: host padrão — sem MBP_PROOF_SSH (vazia vale como ausente) e com o Tailscale respondendo, o alvo é o nome do Tailscale, nunca o .local"; }
+  c host-lan && { MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" MBP_PROOF_SSH= py '
+assert M.resolve_ssh_target() == "athos@athoss-macbook-pro.local", M.SSH_TARGET
+assert M.SSH_TARGET == "athos@athoss-macbook-pro.local", M.SSH_TARGET'; ok $? "unit: host padrão — o Tailscale mudo e a LAN respondendo (evidência positiva): o alvo é o .local"; }
+  c host-none && { MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="" MBP_PROOF_SSH= py '
+assert M.resolve_ssh_target() == "athos@athoss-macbook-pro", M.SSH_TARGET
+assert M.SSH_TARGET == "athos@athoss-macbook-pro", M.SSH_TARGET'; ok $? "unit: host padrão — nenhum responde: volta ao nome do Tailscale (o padrão inerte, nunca a LAN)"; }
+  c host-import && { : > "$T/hostprobe.log"; MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" HOSTPROBE_LOG="$T/hostprobe.log" MBP_PROOF_SSH= py '
+assert M.SSH_TARGET == "athos@athoss-macbook-pro", M.SSH_TARGET
+assert open(M.os.environ["HOSTPROBE_LOG"]).read() == "", "importar o módulo sondou a rede"'; ok $? "unit: importar o módulo não sonda a rede — sem MBP_PROOF_SSH o alvo começa no Tailscale, mesmo com só a LAN respondendo"; }
+  c host-needs && { MBP_PROOF_SSH= py '
+import argparse as A
+N = A.Namespace
+assert M.needs_host(N(cmd="e2e")) is True
+assert M.needs_host(N(cmd="install", apply=True)) is True
+assert M.needs_host(N(cmd="install", apply=False)) is False
+assert M.needs_host(N(cmd="plan")) is False'; ok $? "unit: só e2e e install --apply precisam do host (conectam); plan e install sem --apply não"; }
+  # main() de verdade, com os comandos trocados por um registro do alvo que cada um enxergaria; a LAN é a única que responde, então "sondou" = ".local".
+  c host-main-offline && { : > "$T/hostprobe.log"; MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" HOSTPROBE_LOG="$T/hostprobe.log" MBP_PROOF_SSH= py '
+seen = []
+M.cmd_plan = lambda a: seen.append(("plan", M.SSH_TARGET)) or 0
+M.cmd_install = lambda a: seen.append(("install", M.SSH_TARGET)) or 0
+assert M.main(["plan"]) == 0 and M.main(["install"]) == 0
+assert seen == [("plan", "athos@athoss-macbook-pro"), ("install", "athos@athoss-macbook-pro")], seen
+assert open(M.os.environ["HOSTPROBE_LOG"]).read() == "", "plan/install sem --apply sondaram a rede"'; ok $? "unit: main() — plan e install sem --apply não sondam a rede (continuam \"sem conectar\") e enxergam o nome do Tailscale"; }
+  c host-main-apply && { : > "$T/hostprobe.log"; MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" HOSTPROBE_LOG="$T/hostprobe.log" MBP_PROOF_SSH= py '
+seen = []
+M.cmd_install = lambda a: seen.append(("install", M.SSH_TARGET)) or 0
+assert M.main(["install", "--apply"]) == 0
+assert seen == [("install", "athos@athoss-macbook-pro.local")], seen'; ok $? "unit: main() — install --apply resolve o host ANTES de conectar (só a LAN responde: o alvo é o .local)"; }
+  c host-main-e2e && { : > "$T/hostprobe.log"; MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" HOSTPROBE_LOG="$T/hostprobe.log" MBP_PROOF_SSH= py '
+seen = []
+class P:
+    def __init__(self, a): pass
+    def go(self): seen.append(("e2e", M.SSH_TARGET)); return 0
+M.Proof = P
+assert M.main(["e2e"]) == 0
+assert seen == [("e2e", "athos@athoss-macbook-pro.local")], seen'; ok $? "unit: main() — e2e resolve o host ANTES de conectar (só a LAN responde: o alvo é o .local)"; }
+  c host-junk && { MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="x;y" MBP_TS_HOST="x;y" MBP_PROOF_SSH= py '
+assert M.default_ssh_target() == M.TS_TARGET == "athos@athoss-macbook-pro", M.default_ssh_target()'; ok $? "unit: host padrão — saída do helper que não é user@host (ilegível) cai no nome do Tailscale, nunca vira alvo do ssh"; }
+  c host-explicit && { : > "$T/hostprobe.log"; MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" HOSTPROBE_LOG="$T/hostprobe.log" MBP_PROOF_SSH="u@alvo" py '
+assert M.SSH_TARGET == "u@alvo", M.SSH_TARGET
+assert M.resolve_ssh_target() == "u@alvo", M.SSH_TARGET
+assert open(M.os.environ["HOSTPROBE_LOG"]).read() == "", "MBP_PROOF_SSH definida foi sondada"'; ok $? "unit: host padrão — MBP_PROOF_SSH definida vale como está e nunca é sondada"; }
 }
 
 # ---------------------------------------------------------------- cli
@@ -467,12 +520,17 @@ g_cli() {
   c cli-session && { MBP_PROOF_SESSION=remote-mbp-1 proof e2e > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 2 ] && has "$T/err" "MBP_PROOF_SESSION inválido" && [ ! -e "$FAKE_STATE/provcalls" ]; ok $? "cli: nome de sessão REAL (remote-mbp-1) → recusado, só remote-test-remote-mbp-<n> (rc=$RC)"; }
   c cli-timeout && { proof e2e --timeout 1 > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 2 ] && has "$T/err" "--timeout vai de 5 a 3600"; ok $? "cli: --timeout fora da faixa → 2 (rc=$RC)"; }
   c cli-dry && { srv_skeleton; before=$(dsig "$SRV"); proof install > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 0 ] && has "$T/out" "[dry-run]" && [ ! -e "$FAKE_STATE/sshcalls" ] && [ "$(dsig "$SRV")" = "$before" ] && [ ! -e "$MINI/.gastown/remote-shim-mbp.json" ]; ok $? "cli: install sem --apply só mostra o plano — nenhum ssh, nada gravado no MBP nem no mini (rc=$RC)"; }
-  if c cli-plan; then
+  # ga-bmmxka: sem MBP_PROOF_SSH, install sem --apply também não sonda o host (só a LAN "responde" no stub: se sondasse, o plano mostraria o .local e o log não ficaria vazio)
+  c cli-dry-nosonda && { mk_hostprobe; : > "$T/cli-probe.log"; srv_skeleton; MBP_PROOF_SSH= MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" HOSTPROBE_LOG="$T/cli-probe.log" proof install > "$T/out" 2> "$T/err"; RC=$?; [ $RC = 0 ] && has "$T/out" "[dry-run]" && [ ! -s "$T/cli-probe.log" ] && [ ! -e "$FAKE_STATE/sshcalls" ]; ok $? "cli: install sem --apply e sem MBP_PROOF_SSH não sonda o host nem conecta (rc=$RC, sondas=$(wc -l < "$T/cli-probe.log" | tr -d ' '))"; }
+  if c cli-plan || c cli-plan-nosonda; then
     if [ -x "$HERE/gc-session-ssh" ]; then
       # o provider acha a cidade pelo GC_CITY do pedido e as regras de caminho são em ordem: o "MBP" não pode ficar debaixo de dirname(cidade) (no real é gt-remote ao lado de gt)
       PD="$T/plan"; mkdir -p "$PD/gt/city/.gc" "$PD/mbp"
-      GC_CITY_PATH="$PD/gt/city" MBP_PROOF_HOME="$PD/mbp" MBP_PROOF_PROV="$HERE/gc-session-ssh" proof plan > "$T/out" 2> "$T/err"; RC=$?
-      [ $RC = 0 ] && has "$T/out" "--settings $PD/mbp/gt-remote/bundle/city/settings.json" && has "$T/out" "would_refuse None" && ! has "$T/out" "PROBLEMA"; ok $? "cli: plan contra o dry-run do provider de verdade — o --settings do city vira o do bundle do MBP, o provider não recusaria, nada conecta (rc=$RC)"
+      c cli-plan && { GC_CITY_PATH="$PD/gt/city" MBP_PROOF_HOME="$PD/mbp" MBP_PROOF_PROV="$HERE/gc-session-ssh" proof plan > "$T/out" 2> "$T/err"; RC=$?
+        [ $RC = 0 ] && has "$T/out" "--settings $PD/mbp/gt-remote/bundle/city/settings.json" && has "$T/out" "would_refuse None" && ! has "$T/out" "PROBLEMA"; ok $? "cli: plan contra o dry-run do provider de verdade — o --settings do city vira o do bundle do MBP, o provider não recusaria, nada conecta (rc=$RC)"; }
+      # ga-bmmxka: o mesmo plan SEM MBP_PROOF_SSH não sonda o host: mostra o nome do Tailscale (e diz que não sondou), mesmo com só a LAN "respondendo" no stub
+      c cli-plan-nosonda && { mk_hostprobe; : > "$T/cli-probe.log"; GC_CITY_PATH="$PD/gt/city" MBP_PROOF_HOME="$PD/mbp" MBP_PROOF_PROV="$HERE/gc-session-ssh" MBP_PROOF_SSH= MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" HOSTPROBE_LOG="$T/cli-probe.log" proof plan > "$T/out" 2> "$T/err"; RC=$?
+        [ $RC = 0 ] && has "$T/out" '"ssh": "athos@athoss-macbook-pro",' && ! has "$T/out" "athoss-macbook-pro.local" && has "$T/out" "o plan não sonda a rede" && [ ! -s "$T/cli-probe.log" ]; ok $? "cli: plan sem MBP_PROOF_SSH não sonda a rede — mostra o nome do Tailscale e diz que não sondou (rc=$RC, sondas=$(wc -l < "$T/cli-probe.log" | tr -d ' '))"; }
     else skip "cli-plan: scripts/gc-session-ssh ausente (o filtro do nó Linux não leva script sem extensão)"; fi
   fi
 }
@@ -660,11 +718,25 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   }
   mutant() {  # mutant GRUPO CASOS DESCRIÇÃO OLD NEW
     group "$1" || return 0
-    local m="$T/mut.$RANDOM" r; mkdir -p "$m"
+    local m="$T/mut.$RANDOM" r; mkdir -p "$m"; ln -s "$HERE/mbp-host.sh" "$m/mbp-host.sh"   # (ga-bmmxka: o mbp-proof.py pergunta o host ao helper que fica ao lado dele)
     if ! mutate "$4" "$5" "$m/mbp-proof.py" 2> "$T/muterr"; then ok 1 "mutante '$3': $(cat "$T/muterr")"; return; fi
     r=$(MBPT_MUTANT=1 MBPT_T="$T" MBPT_ONLY="$1" MBPT_CASES="$2" MBPT_UNDER_TEST="$m/mbp-proof.py" bash "$0" 2>&1 | tail -1)
     case "$r" in "RESULT 0/0") ok 1 "mutante '$3': nenhum caso rodou ($r)";; "RESULT 0/"*) ok 1 "mutante '$3' NÃO foi pego ($r)";; "RESULT "*) ok 0 "mutante '$3' pego ($r)";; *) ok 1 "mutante '$3': execução sem resultado ($r)";; esac
   }
+  mutant unit host-junk "o alvo padrão aceita saída do helper sem validar" 'return out if p.returncode == 0 and re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9.-]+", out) else TS_TARGET' 'return out or TS_TARGET'
+  mutant unit host-junk "o fallback do alvo padrão volta ao .local" 'TS_TARGET = "athos@athoss-macbook-pro"' 'TS_TARGET = "athos@athoss-macbook-pro.local"'
+  mutant unit host-explicit "o import ignora MBP_PROOF_SSH definida" 'SSH_TARGET = os.environ.get("MBP_PROOF_SSH") or TS_TARGET' 'SSH_TARGET = TS_TARGET'
+  mutant unit host-explicit "resolve_ssh_target sonda mesmo com MBP_PROOF_SSH definida" '    if not os.environ.get("MBP_PROOF_SSH"):
+        SSH_TARGET = default_ssh_target()' '    if True:
+        SSH_TARGET = default_ssh_target()'
+  mutant unit host-import "importar o módulo sonda a rede (o que o WIP original fazia)" 'SSH_TARGET = os.environ.get("MBP_PROOF_SSH") or TS_TARGET' 'SSH_TARGET = os.environ.get("MBP_PROOF_SSH") or default_ssh_target()'
+  mutant unit host-needs,host-main-offline "plan e install sem --apply passam a resolver o host" 'return a.cmd == "e2e" or (a.cmd == "install" and bool(a.apply))' 'return True'
+  mutant unit host-needs,host-main-e2e "e2e deixa de resolver o host" 'return a.cmd == "e2e" or (a.cmd == "install" and bool(a.apply))' 'return a.cmd == "install" and bool(a.apply)'
+  mutant unit host-needs,host-main-apply "install --apply deixa de resolver o host" 'return a.cmd == "e2e" or (a.cmd == "install" and bool(a.apply))' 'return a.cmd == "e2e"'
+  mutant unit host-main-apply,host-main-e2e "main() não chama resolve_ssh_target" '    if needs_host(a):
+        resolve_ssh_target()' '    if False:
+        resolve_ssh_target()'
+  mutant cli cli-dry-nosonda,cli-plan-nosonda "plan e install sem --apply sondam o host na linha de comando" 'return a.cmd == "e2e" or (a.cmd == "install" and bool(a.apply))' 'return True'
   mutant unit judge-one "judge_tree aceita processo sem rebaixar" 'if (x["ni"] < 19 and y["ni"] < 19) or y["ni"] < x["ni"]:' 'if False:'
   mutant unit judge-up "judge_tree deixa a prioridade ser devolvida" 'if (x["ni"] < 19 and y["ni"] < 19) or y["ni"] < x["ni"]:' 'if x["ni"] < 19 and y["ni"] < 19:'
   mutant unit judge-room "judge_tree passa sem ninguém ter folga" '    if not room:' '    if False:'

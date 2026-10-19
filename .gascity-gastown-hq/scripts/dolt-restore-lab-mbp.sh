@@ -58,7 +58,11 @@ BUCKET="${LABMBP_BUCKET:-urblink-dolt-backups}"
 TMO=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)   # todo dolt/aws roda sob timeout: um dolt pendurado segurava a trava
 CALL_S="${LABMBP_CALL_S:-900}"; OBJ_MIN_S="${LABMBP_OBJ_MIN_S:-30}"   # teto por chamada; piso do teto de cada objeto do envio
 # o ssh do envio usa o MESMO host e as MESMAS opções do mbp-run.sh (a conexão mestre é reaproveitada)
-SSH="${MBP_SSH:-ssh}"; SSH_HOST="${MBP_HOST:-athos@athoss-macbook-pro.local}"
+# Host (ga-bmmxka): MBP_HOST do chamador vale como está; sem ele o padrão é o nome do Tailscale (a rota .local cai com a tela do MBP
+# travada) e main() decide, UMA vez antes do envio, se a LAN entra no lugar (mbp-host.sh) e exporta MBP_HOST para o mbp-run.sh concordar.
+# shellcheck source=mbp-host.sh
+. "$HERE/mbp-host.sh"
+SSH="${MBP_SSH:-ssh}"; SSH_HOST="${MBP_HOST:-$MBP_TS_HOST}"
 SSH_OPTS="${LABMBP_SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm/%C -o ControlPersist=60}"
 RTO="${LABMBP_RTO_S:-3600}"                  # orçamento restore+contagem; passou = SLOW. Chute até a 1ª medição (runbook).
 JOB_TIMEOUT="${LABMBP_JOB_TIMEOUT_S:-12600}" # teto do mbp-run para envio+restore+contagem (o slot dele envelhece em 4 h)
@@ -362,6 +366,9 @@ main() {
     shift
   done
   case "$DB" in ''|*[!A-Za-z0-9_]*) echo "--db invalido: $DB" >&2; exit 2 ;; esac
+  # vazio → sonda e escolhe (Tailscale, ou a LAN só se ela respondeu e o Tailscale não; nada respondeu/ilegível → Tailscale); definido → intocado.
+  # --dry-run não fala com o MBP: não sonda. O export faz o mbp-run.sh (filho) e o stream do envio falarem com o MESMO host.
+  if [ "$MODE" != dry ] && [ -z "${MBP_HOST:-}" ]; then MBP_HOST=$(mbp_default_host); export MBP_HOST; SSH_HOST=$MBP_HOST; fi
   [ "$MODE" != install ] || install_dolt
   if [ "$MODE" = check ]; then mbp_free && { log "MBP livre"; exit 0; }; log "MBP nao livre: $WHY"; exit 4; fi
 

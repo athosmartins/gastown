@@ -136,10 +136,10 @@ O teto é **por host e contado à parte do teto do mini**: a contagem é `tmux -
 
 **Rodar a prova ao vivo (só com o Athos fora e `mbp-run.sh --check` rc 0):** `scripts/mbp-proof.py plan` (mostra, sem conectar, o que seria feito e o `start` que o provider montaria), `scripts/mbp-proof.py install --apply` (bundle, cliente do atalho, spool e a config do wrapper no mini) (o `install --apply` precisa do builder da ga-w7qwl1.1.2, o de destino em `/Users/`, já na main: com o builder anterior ele recusa — `/Users/` sobrando — e o install sai 1; recusa com 3 se o MBP não está livre, se há sessão aberta no socket do provider ou se não consegue saber isso — um tmux que falha por outro motivo é "não sei", nunca "sem sessão"; a presença é lida UMA vez, no início: o envio e a troca da pasta, que levam minutos, não a releem, limite conhecido) e `scripts/mbp-proof.py e2e` (a, b, c, d, e; precisa do transporte por puxada da ga-w7qwl1.1.1 na main — sem ele para em 3, "o atalho não chega ao mini"; sai 0 só se TODAS passam; 3 = não consegui começar; 4 = o Athos voltou ao MBP, nada mais é medido e a sessão é parada). O `e2e` reconfere "o MBP segue livre" antes de cada etapa e para tudo se o Athos voltou (presença, pausa ou bandeira); MBP sem saúde ou fora do ar (rc 98) só avisa no log e segue, e o aviso NÃO entra na contagem final: quem protege o MBP é o vigia, que a prova (b) mede; a pausa do Athos (`~/gt-remote/PAUSE`) nunca é removida por ele (só a que leva a marca da própria rodada).
 
-**Config** (no mesmo `session-ssh.json` do servidor; o `ssh` é o `MAC_HOST` do `mbp-run.sh`):
+**Config** (no mesmo `session-ssh.json` do servidor; o `ssh` é o `MAC_HOST` do `mbp-run.sh`). **O `ssh` do host `mbp` é um valor FIXO da config — o provider não pergunta ao `scripts/mbp-host.sh` — então escreva o nome do Tailscale, não o `.local`:** com a tela do MBP travada a rota mDNS cai e o Tailscale responde (ga-bmmxka), justamente a noite em que a sessão remota precisa abrir.
 
 ```json
-"mbp": {"ssh": "athos@athoss-macbook-pro.local", "cap": 2,
+"mbp": {"ssh": "athos@athoss-macbook-pro", "cap": 2,
         "remote_root": "/Users/athos/gt-remote/bundle", "remote_home": "/Users/athos", "mini_home": "/Users/athos",
         "path_extra": ["/opt/homebrew/bin", "/Users/athos/.local/bin"],
         "session_env": {"path": ["/Users/athos/gt-remote/shim-bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"],

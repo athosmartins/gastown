@@ -83,12 +83,17 @@
 set -o pipefail
 
 CITY=${MBP_CITY:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}
-MAC_HOST=${MBP_HOST:-athos@athoss-macbook-pro.local}
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# Host do MBP (ga-bmmxka): MBP_HOST definido pelo chamador vale como está (nunca sondado). Ausente → vazio aqui; ensure_mac_host resolve
+# na PRIMEIRA vez que um caminho vai mesmo falar com o MBP (use_host mbp): a sonda custa até ~2 s com o MBP fora, e --host linux, o
+# offload desligado (rc 99) e os modos só-nó não pagam isso.
+# shellcheck source=mbp-host.sh
+. "$HERE/mbp-host.sh"
+MAC_HOST=${MBP_HOST:-}
 MBP_HOST=$MAC_HOST     # MBP_HOST é o host-ALVO da vez (use_host troca entre o MBP e o nó Linux); o MBP é o padrão de todos os modos que não são pytest
 FLAG="$CITY/.gc/mbp-offload.on"
 PAUSEFILE="$CITY/.gc/mbp-offload.pause"
 LOG="$CITY/.gc/logs/mbp-run.jsonl"
-HERE="$(cd "$(dirname "$0")" && pwd)"
 PRESENCE_LIB="$HERE/mbp-presence.sh"
 CONTROLE="$HERE/mbp-controle.sh"
 MIN_AVAIL_MB=${MBP_MIN_AVAIL_MB:-3072}
@@ -144,10 +149,15 @@ NODE_PERSIST_S=$(num_or "${HETZNER_SSH_PERSIST_S:-600}" 600)               # ssh
 SSH_OPTS_NODE="-o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm/%C -o ControlPersist=$NODE_PERSIST_S"
 HOSTKIND=mac; HOSTLOG=mbp; HNAME=MBP
 SHADOW_RUN=${MBP_RUN_SHADOW:-0}                                            # 1 = este processo é o lado de MBP de uma sombra (o log o marca)
+ensure_mac_host() { # vazio → MAC_HOST já definido (do chamador ou de uma resolução anterior): fica; falhou/ilegível → helper ausente ou saída vazia: o Tailscale
+  [ -n "$MAC_HOST" ] || MAC_HOST=$(mbp_default_host 2>/dev/null)
+  [ -n "$MAC_HOST" ] || MAC_HOST=${MBP_TS_HOST:-athos@athoss-macbook-pro}
+}
 use_host() { # linux | mbp
   case "$1" in
     linux) HOSTKIND=linux; HOSTLOG=hetzner; HNAME="nó Linux"; MBP_HOST=$NODE_HOST; SSH_OPTS=$SSH_OPTS_NODE ;;
-    *)     HOSTKIND=mac;   HOSTLOG=mbp;     HNAME=MBP;        MBP_HOST=$MAC_HOST;  SSH_OPTS=$SSH_OPTS_MAC ;;
+    *)     ensure_mac_host
+           HOSTKIND=mac;   HOSTLOG=mbp;     HNAME=MBP;        MBP_HOST=$MAC_HOST;  SSH_OPTS=$SSH_OPTS_MAC ;;
   esac
 }
 
@@ -933,7 +943,8 @@ seed_node() {
 # ---- seed / check -----------------------------------------------------------------------------------------------
 # --host linux fixa o nó nos modos que olham UM host (--check, --seed); sem --host, esses modos continuam sendo do MBP como sempre foram.
 case "$host_sel:$mode" in linux:remote_pause|linux:install_tools) say "--host linux não vale para --$(echo "$mode" | tr _ -): a pausa e as ferramentas são do MBP"; exit 97 ;; esac
-[ "$host_sel" = linux ] && use_host linux
+# Os modos que falam com o MBP sem passar por mac_gates/attempt_pytest resolvem o host aqui (os outros chamam use_host mbp no seu ponto).
+if [ "$host_sel" = linux ]; then use_host linux; else case "$mode" in check|seed|remote_pause|install_tools) use_host mbp ;; esac; fi
 if [ "$mode" = check ]; then
   preflight; rc=$?
   printf '%s\n' "${PF:-}"; echo "offload_flag=$([ -f "$FLAG" ] && echo on || echo off)"

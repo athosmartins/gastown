@@ -40,7 +40,7 @@ O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
            não existia). O branch worker/<rodada> no origin FICA (apagá-lo é decisão: --delete-branch).
 
 CÓDIGOS  0 tudo passou · 1 alguma prova reprovou, ou recusei instalar (config do wrapper alheia/ilegível, builder ou verify falhou) · 2 uso · 3 não consegui começar (pré-condição: MBP não livre, tmux aberto ou sem resposta) · 4 interrompida: o Athos voltou ao MBP (nada mais foi medido; a sessão é parada)
-CONFIGURAÇÃO (ambiente)  MBP_PROOF_SSH (athos@athoss-macbook-pro.local) · MBP_PROOF_HOME (/Users/athos: o home no MBP) · MBP_PROOF_SESSION (remote-test-remote-mbp-1) ·
+CONFIGURAÇÃO (ambiente)  MBP_PROOF_SSH (athos@athoss-macbook-pro, o nome do Tailscale; sem a variável, `e2e` e `install --apply` — só quem conecta — perguntam ao mbp-host.sh, que troca pela LAN .local só se ela responder e o Tailscale não; `plan` e `install` sem --apply não sondam a rede e mostram o nome do Tailscale) · MBP_PROOF_HOME (/Users/athos: o home no MBP) · MBP_PROOF_SESSION (remote-test-remote-mbp-1) ·
   MBP_PROOF_POLL (10: segundos entre olhadas) · MBP_PROOF_WATCH_CYCLE (5: o watch_s do provider) · MBP_PROOF_SHIM_WAIT (60: quanto esperar o atalho) · GC_SSH_BIN (o ssh, como no provider) · GC_CITY_PATH · só o selftest troca: MBP_PROOF_PROV, MBP_PROOF_PUMP,
   MBP_PROOF_PATHX, MBP_PROOF_SHIM_CLIENT, MBP_PROOF_BUILDER, MBP_PROOF_SESSION_PATH (o PATH explícito da sessão), MBP_PROOF_CLAUDE (o caminho absoluto do claude no MBP)
 """
@@ -61,7 +61,34 @@ import time
 HERE = os.path.dirname(os.path.realpath(__file__))
 CITY = os.environ.get("GC_CITY_PATH") or os.path.dirname(HERE)  # a cidade VIVA (bead, estado); o código pode vir de um worktree
 MHOME = os.environ.get("MBP_PROOF_HOME", "/Users/athos").rstrip("/")
-SSH_TARGET = os.environ.get("MBP_PROOF_SSH", "athos@athoss-macbook-pro.local")
+TS_TARGET = "athos@athoss-macbook-pro"  # o nome do Tailscale (a rota .local cai com a tela do MBP travada; ga-bmmxka)
+
+
+def default_ssh_target() -> str:
+    """Host do MBP quando MBP_PROOF_SSH não está definida: o que `mbp-host.sh` imprime (Tailscale, ou a LAN só se ela respondeu e o Tailscale não).
+    vazio → MBP_PROOF_SSH ausente: pergunta ao helper; falhou/ilegível (sem bash, rc≠0, saída que não é user@host, demora) → o nome do Tailscale."""
+    try:
+        p = subprocess.run(["bash", os.path.join(HERE, "mbp-host.sh")], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return TS_TARGET
+    out = p.stdout.strip()
+    return out if p.returncode == 0 and re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9.-]+", out) else TS_TARGET
+
+
+# Importar não conecta: sem MBP_PROOF_SSH o alvo COMEÇA no Tailscale, e só `resolve_ssh_target()` (chamada por main() nos comandos de `needs_host`) pergunta ao
+# mbp-host.sh. É o que mantém `plan` e `install` sem --apply "sem conectar", como o runbook e a saída do próprio plan dizem.
+SSH_TARGET = os.environ.get("MBP_PROOF_SSH") or TS_TARGET
+
+
+def resolve_ssh_target() -> str:
+    """Troca SSH_TARGET pelo veredito do mbp-host.sh quando MBP_PROOF_SSH não está definida (vazia vale como ausente); definida: vale como está e NUNCA é sondada.
+    Sonda a rede, então só roda para quem vai conectar (`needs_host`)."""
+    global SSH_TARGET
+    if not os.environ.get("MBP_PROOF_SSH"):
+        SSH_TARGET = default_ssh_target()
+    return SSH_TARGET
+
+
 SESSION = os.environ.get("MBP_PROOF_SESSION", "remote-test-remote-mbp-1")
 POLL = float(os.environ.get("MBP_PROOF_POLL", "10"))
 SHIM_WAIT = float(os.environ.get("MBP_PROOF_SHIM_WAIT", "60"))
@@ -1070,6 +1097,8 @@ def cmd_plan(a: argparse.Namespace) -> int:
     run = new_run()
     wd = f"{PROOFS}/{run}"
     print("== bloco do host `mbp` (session-ssh.json DESTA prova; a config viva só tem o servidor)")
+    if not os.environ.get("MBP_PROOF_SSH"):
+        print("(o `ssh` abaixo é o nome do Tailscale: o plan não sonda a rede; `install --apply` e `e2e` perguntam ao scripts/mbp-host.sh, que só troca pela LAN .local se ela responder e o Tailscale não)")
     print(json.dumps({"default_host": HOST, "hosts": {HOST: host_block()}}, indent=1))
     print("== config do wrapper no mini\n" + json.dumps(wrapper_config(), indent=1))
     print("== config do cliente do atalho no MBP (ao lado do script)\n" + json.dumps(client_config()))
@@ -1222,6 +1251,11 @@ def _arg(rx: str, what: str):
     return check
 
 
+def needs_host(a: argparse.Namespace) -> bool:
+    """Só `e2e` e `install --apply` falam com o MBP; `plan` e `install` sem --apply não conectam, então não resolvem (nem sondam) o host (ga-bmmxka)."""
+    return a.cmd == "e2e" or (a.cmd == "install" and bool(a.apply))
+
+
 def main(argv: list) -> int:
     ap = argparse.ArgumentParser(prog="mbp-proof", description=__doc__.split("\n")[1])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1242,6 +1276,8 @@ def main(argv: list) -> int:
         ap.error(f"MBP_PROOF_SESSION inválido: {SESSION!r} (remote-test-remote-mbp-<n>)")
     if a.cmd == "e2e" and not 5 <= a.timeout <= 3600:
         ap.error("--timeout vai de 5 a 3600")
+    if needs_host(a):
+        resolve_ssh_target()
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     return {"plan": cmd_plan, "install": cmd_install, "e2e": lambda x: Proof(x).go()}[a.cmd](a)
 
