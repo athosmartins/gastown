@@ -4311,8 +4311,9 @@ def _read_parent_id(bead_id, rig_root=None):
     obj = data[0] if isinstance(data, list) and data else data
     if not isinstance(obj, dict) or obj.get("id") != bead_id:
         return (False, None)
-    # `bd show` prints "parent": null for a bead with no parent (measured:
-    # ga-w7qwl1.1.8 → "ga-w7qwl1.1", a top-level bead → null)
+    # `bd show --json` OMITS the "parent" key for a bead with no parent (measured
+    # 19/10: ga-j1jo7c → key absent; ga-w7qwl1.1.8 → "ga-w7qwl1.1"); an explicit
+    # null is accepted too, and both mean "read, has no parent"
     parent = obj.get("parent")
     if parent is None or parent == "":
         return (True, None)
@@ -4353,7 +4354,10 @@ def compute_multi_assigned_assignees(beads, parent_reader=None, notes=None):
     alone — see session_owner_is_healthy()'s docstring for the mechanism.
 
     Cheap (a pass over already-fetched dicts; the only I/O is the optional
-    ancestor read above, off by default) — this doubles
+    ancestor read above — off when parent_reader is None, which is the default
+    of this function but NOT of run_cycle, which always passes _read_parent_id,
+    so in production it is on: at most _PARENT_READ_MAX_PER_CYCLE reads of up to
+    _PARENT_READ_TIMEOUT_SECS each, one read per missing bead) — this doubles
     as ga-zbrbt's proposed remedy #3 ("detecção barata... o sinal é barato de
     calcular"): run_cycle logs a warning whenever this returns non-empty, so
     a double-dispatch is visible at minute zero instead of at the stranding
@@ -4410,6 +4414,7 @@ def compute_multi_assigned_assignees(beads, parent_reader=None, notes=None):
 
     reads_left = [_PARENT_READ_MAX_PER_CYCLE]
     chain_cache = {}
+    read_memo = {}      # (bead id, rig_root) → answer of the reader, one read per bead per call
 
     def _parent_of(bid, rig_root):
         """(readable, parent_id|None) for one bead — see _read_parent_id()."""
@@ -4422,34 +4427,44 @@ def compute_multi_assigned_assignees(beads, parent_reader=None, notes=None):
             if p is None or p == "":
                 return (True, None)
             return (True, p) if isinstance(p, str) else (False, None)
+        if (bid, rig_root) in read_memo:
+            return read_memo[(bid, rig_root)]       # already asked this call: no 2nd read, no 2nd budget unit
         if parent_reader is None or reads_left[0] <= 0:
-            return (False, None)
+            return (False, None)                    # not memoized: nothing was asked
         reads_left[0] -= 1
         # vazio → o leitor devolve (True, None) = sem pai; falhou/ilegível → exceção ou
         # resposta fora de (bool, str|None) = (False, None), nunca "sem pai"
         try:
             res = parent_reader(bid, rig_root)
         except Exception:
-            return (False, None)
+            res = None
         if not (isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], bool)):
-            return (False, None)
-        if not res[0]:
-            return (False, None)
-        if res[1] is None or res[1] == "":
-            return (True, None)
-        return (True, res[1]) if isinstance(res[1], str) else (False, None)
+            ans = (False, None)
+        elif not res[0]:
+            ans = (False, None)
+        elif res[1] is None or res[1] == "":
+            ans = (True, None)
+        else:
+            ans = (True, res[1]) if isinstance(res[1], str) else (False, None)
+        read_memo[(bid, rig_root)] = ans
+        return ans
 
     def _chain(bid):
-        """(ancestors nearest-first, complete). complete=False: the walk hit an
-        unreadable link, a loop or the depth cap, so the list may be short."""
+        """(ancestors nearest-first, complete, loop). complete=False: the walk hit
+        an unreadable link, a loop or the depth cap, so the list may be short.
+        loop=True: the walk came back to a bead it had already passed — the parent
+        links are malformed (a bead cannot be its own ancestor)."""
         if bid in chain_cache:
             return chain_cache[bid]
         rig_root = (by_id.get(bid) or {}).get("rig_root")
-        ancestors, seen, cur, complete = [], {bid}, bid, True
+        ancestors, seen, cur, complete, loop = [], {bid}, bid, True, False
         for _ in range(_PARENT_WALK_MAX_DEPTH):
             readable, parent = _parent_of(cur, rig_root)
-            if not readable or (parent is not None and parent in seen):
+            if not readable:
                 complete = False
+                break
+            if parent is not None and parent in seen:
+                complete, loop = False, True
                 break
             if parent is None:
                 break
@@ -4458,14 +4473,20 @@ def compute_multi_assigned_assignees(beads, parent_reader=None, notes=None):
             cur = parent
         else:
             complete = False
-        chain_cache[bid] = (ancestors, complete)
+        chain_cache[bid] = (ancestors, complete, loop)
         return chain_cache[bid]
 
     def _related(x, y):
         """True: one is an ancestor of the other. False: both chains were read
         to the top and never meet. None: could not tell."""
-        anc_x, done_x = _chain(x)
-        anc_y, done_y = _chain(y)
+        anc_x, done_x, loop_x = _chain(x)
+        anc_y, done_y, loop_y = _chain(y)
+        # A parent loop is data that contradicts itself: inside it every bead is
+        # "an ancestor" of the others, so the membership test below would answer
+        # True for a pair nobody can vouch for. This check must come BEFORE it —
+        # a loop is "could not tell" (today's rule), never "related".
+        if loop_x or loop_y:
+            return None
         if y in anc_x or x in anc_y:
             return True
         return False if (done_x and done_y) else None
@@ -8236,13 +8257,54 @@ def _selftest():
               {"id": "wa-x1", "assignee": _hz_me, "parent": 7},
               {"id": "wa-x2", "assignee": _hz_me},
           ]) == ({_hz_me}, 1))
-    check("HZ-7: a parent loop (a→b→a) cannot hang the walk and is not read as a chain "
-          "→ flagged",
+    # HZ-7..7e: a parent LOOP is the third state ("could not tell"), never "related".
+    # Gate attempt 1 (ga-knu1la): the first HZ-7 added a parentless third bead, and
+    # the pair (l1,l3) alone forced the flag + the one WARN whatever the loop pair
+    # did — it passed with the loop handling deleted. Each case below holds ONLY the
+    # beads it names, so the verdict and the single WARN can come from nowhere else.
+    check("HZ-7: a parent loop (a→b→a), the ONLY two beads the builder holds → flagged "
+          "with exactly one 'could not read the parent link' WARN — not cleared as "
+          "'a mother and her own slice'",
           _hz_run([
               {"id": "wa-l1", "assignee": _hz_me, "parent": "wa-l2"},
               {"id": "wa-l2", "assignee": _hz_me, "parent": "wa-l1"},
-              {"id": "wa-l3", "assignee": _hz_me},
           ]) == ({_hz_me}, 1))
+    check("HZ-7a: a three-bead loop (a→b→c→a), all three held → flagged, one WARN "
+          "per assignee (every pair inside the loop is 'could not tell')",
+          _hz_run([
+              {"id": "wa-l1", "assignee": _hz_me, "parent": "wa-l2"},
+              {"id": "wa-l2", "assignee": _hz_me, "parent": "wa-l3"},
+              {"id": "wa-l3", "assignee": _hz_me, "parent": "wa-l1"},
+          ]) == ({_hz_me}, 1))
+    check("HZ-7f: a chain that runs INTO a loop (x→y→z→y), x and y held → flagged: "
+          "the neighbourhood of the loop is malformed data, x's parent being y does "
+          "not make the pair vouchable",
+          _hz_run([
+              {"id": "wa-x", "assignee": _hz_me, "parent": "wa-y"},
+              {"id": "wa-y", "assignee": _hz_me, "parent": "wa-z"},
+              {"id": "wa-z", "assignee": "", "parent": "wa-y"},
+          ]) == ({_hz_me}, 1))
+    check("HZ-7c (control — the failed SHA already caught this one): the self-parent (a→a) "
+          "beside a clean bead → flagged, one WARN",
+          _hz_run([
+              {"id": "wa-s1", "assignee": _hz_me, "parent": "wa-s1"},
+              {"id": "wa-s2", "assignee": _hz_me},
+          ]) == ({_hz_me}, 1))
+    check("HZ-7d (control — also holds on the failed SHA, the looping bead is not held): "
+          "the loop closes through a bead the READER fetched (the mid is not in the "
+          "snapshot and its parent points back at the slice) → flagged, one WARN",
+          _hz_run(_hz_gap, parent_reader=lambda bid, rig_root=None:
+                  (True, "ga-w7qwl1.1.8" if bid == "ga-w7qwl1.1" else None))
+          == ({_hz_me}, 1))
+    check("HZ-7e: a loop held by ANOTHER builder is flagged (the failed SHA cleared it) "
+          "and does not poison a healthy mother + slice — only the looping assignee "
+          "is flagged",
+          _hz_run([
+              {"id": "wa-m", "assignee": _hz_me},
+              {"id": "wa-m.1", "assignee": _hz_me, "parent": "wa-m"},
+              {"id": "wa-l1", "assignee": "wa-worker-adhoc-other", "parent": "wa-l2"},
+              {"id": "wa-l2", "assignee": "wa-worker-adhoc-other", "parent": "wa-l1"},
+          ]) == ({"wa-worker-adhoc-other"}, 1))
     _hz_deep = [{"id": f"wa-d{i}", "assignee": _hz_me if i in (0, 40) else "",
                  "parent": f"wa-d{i + 1}"} for i in range(40)]
     _hz_deep.append({"id": "wa-d40", "assignee": _hz_me})
@@ -8268,6 +8330,33 @@ def _selftest():
           len(_hz_calls) == _PARENT_READ_MAX_PER_CYCLE
           and len(_hz_flagged) == 10 - _PARENT_READ_MAX_PER_CYCLE,
           f"calls={len(_hz_calls)} flagged={len(_hz_flagged)}")
+    # HZ-8b: the same missing ancestor, reached from two different start beads, is
+    # read ONCE (gate attempt 1, low finding: it was re-read per start bead and the
+    # 6-read budget bled away on answers already in hand)
+    _hz_shared = [
+        {"id": "wa-top", "assignee": _hz_me},
+        {"id": "wa-x1", "assignee": _hz_me, "parent": "wa-mid"},
+        {"id": "wa-x2", "assignee": _hz_me, "parent": "wa-mid"},
+    ]   # wa-mid is NOT in the snapshot
+    _hz_calls.clear()
+
+    def _hz_reader_shared(bid, rig_root=None):
+        _hz_calls.append(bid)
+        return (True, "wa-top")
+
+    compute_multi_assigned_assignees(_hz_shared, parent_reader=_hz_reader_shared)
+    check("HZ-8b: one missing ancestor shared by two start beads is read once, not "
+          "once per start bead", _hz_calls == ["wa-mid"], repr(_hz_calls))
+    _hz_calls.clear()
+
+    def _hz_reader_shared_fail(bid, rig_root=None):
+        _hz_calls.append(bid)
+        return (False, None)
+
+    check("HZ-8c: a FAILED read of that shared ancestor is also asked once, and the "
+          "answer stays 'could not tell' (flagged + WARN), never 'no parent'",
+          _hz_run(_hz_shared, parent_reader=_hz_reader_shared_fail) == ({_hz_me}, 1)
+          and _hz_calls == ["wa-mid"], repr(_hz_calls))
     check("HZ-9: the old call shape still works (no reader, no notes) and the "
           "ZB-1 pair is flagged exactly as before",
           compute_multi_assigned_assignees([
