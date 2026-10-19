@@ -71,16 +71,27 @@ case "$id" in *[!A-Za-z0-9._-]*|'') die 2 "id de bead fora do formato" ;; esac
 
 B=$(bead_json "$store" "$id") || { jlog read "$id" 11 "bead-ilegivel"; die 11 "não consegui ler $id em $store — fica no mini"; }
 classify() { printf '%s' "$B" | "$PY" -I "$CLS"; }
+# classify_checked — deixa em $out e $rc um par COERENTE (terceiro estado, ga-9636op): 0 só com um JSON cujo veredito é node, 10 só com mini, 11 só com unknown. Classificador que caiu, foi morto, não
+# imprimiu, imprimiu o que não se lê, saiu com código fora de 0/10/11 ou cujo exit code e veredito discordam vira 11 ("não consegui decidir"), NUNCA 0. O código cru também não vaza: o chamador lê 2 como
+# "uso", 12 como "não elegível" e 13/124/137 como "a escrita pode ter acontecido", e aqui nada foi escrito ainda.
+classify_checked() {
+  local v
+  out=$(classify); rc=$?
+  v=$(printf '%s' "$out" | jq -r '.verdict // ""' 2>/dev/null) || v=""
+  case "$rc:$v" in 0:node|10:mini|11:unknown) return 0 ;; esac
+  jlog classify "$id" 11 "classificador-incoerente rc=$rc verdict=${v:-?}"
+  out='{"verdict":"unknown","basis":"","reasons":["classificador-incoerente"],"paths":[],"tests":[],"info":[]}'; rc=11
+}
 
 case "$cmd" in
 check)
-  out=$(classify); rc=$?
+  classify_checked
   printf '%s\n' "$out"; exit "$rc" ;;
 
 apply)
   st=$(printf '%s' "$B" | jq -r '.status // ""'); as=$(printf '%s' "$B" | jq -r '.assignee // ""'); rt=$(printf '%s' "$B" | jq -r '.metadata["gc.routed_to"] // ""')
   [ "$st" = open ] && [ -z "$as" ] && [ -z "$rt" ] || { jlog apply "$id" 12 "nao-elegivel status=$st assignee=$as rota=$rt"; die 12 "$id não está livre (status=$st assignee=${as:-—} rota=${rt:-—}) — não mexo"; }
-  out=$(classify); rc=$?
+  classify_checked
   if [ "$rc" != 0 ]; then jlog apply "$id" "$rc" "classificador:$(printf '%s' "$out" | jq -r '(.verdict // "?") + " " + ((.reasons // []) | join(","))' 2>/dev/null)"; say "veredito não é 'roda no nó' (rc=$rc): $out"; exit "$rc"; fi
   b=$(printf '%s' "$out" | jq -r '.basis // ""')
   if [ "$basis" = label ] && [ "$b" != label ]; then jlog apply "$id" 10 "base=$b, modo exige etiqueta"; die 10 "veredito node por '$b', e este modo só aceita a etiqueta node:ok — fica no mini"; fi
@@ -98,8 +109,13 @@ apply)
   [ "$w" = 0 ] || { jlog apply "$id" 13 "escrita-falhou rc=$w"; die 13 "bd update falhou (rc=$w) — nada garantido; confira $id"; }
   A=$(bead_json "$store" "$id") || A=""
   if [ "$(printf '%s' "$A" | jq -r '.assignee // ""' 2>/dev/null)" != "$ALIAS" ] || [ "$(printf '%s' "$A" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null)" != "$ROUTE" ] || [ "$(printf '%s' "$A" | jq -r '.status // ""' 2>/dev/null)" != in_progress ]; then
-    T "$BD" -C "$store" update "$id" --if-assignee "$ALIAS" --assignee "" --status open --unset-metadata gc.routed_to -q >/dev/null 2>&1 || say "ATENÇÃO: não consegui desfazer a atribuição de $id — confira à mão"
-    jlog apply "$id" 13 "conferencia-falhou-desfeito"; die 13 "não consegui confirmar a atribuição de $id — desfeita"
+    # o desfazer também é uma escrita que pode falhar, e o rc dele não diz o estado (a comparação atômica reprova, de propósito, quando a escrita nem pegou e a bead nunca foi nossa): relê, e o log e a
+    # mensagem só dizem "desfeita" se nada nosso sobrou (nem dono nem rota). Bead que não se consegue reler, ou que ainda é nossa, fica NAO-desfeito: a bead atribuída ao nó não pode parecer solta.
+    T "$BD" -C "$store" update "$id" --if-assignee "$ALIAS" --assignee "" --status open --unset-metadata gc.routed_to -q >/dev/null 2>&1
+    A=$(bead_json "$store" "$id") || A=""
+    u=NAO-desfeito
+    if [ -n "$A" ] && [ "$(printf '%s' "$A" | jq -r '.assignee // ""' 2>/dev/null)" != "$ALIAS" ] && [ "$(printf '%s' "$A" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null)" != "$ROUTE" ]; then u=desfeito; else say "ATENÇÃO: não consegui desfazer a atribuição de $id — confira à mão"; fi
+    jlog apply "$id" 13 "conferencia-falhou-$u"; [ "$u" = desfeito ] && die 13 "não consegui confirmar a atribuição de $id — desfeita"; die 13 "não consegui confirmar a atribuição de $id — NÃO desfeita: confira à mão"
   fi
   T "$BD" -C "$store" comment "$id" "nó (ga-2hd02v.1.10): atribuída a $ALIAS, rota $ROUTE — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O pool cria a sessão; sem gc session new à mão (a duplicata é derrubada pelo dedup). Ao fim da entrega: wa-node-dispatch.sh release $id." >/dev/null 2>&1 || say "aviso: comentário em $id não gravado"
   jlog apply "$id" 0 "despachada para $ALIAS ($b)"; say "$id → $ALIAS ($ROUTE), base=$b"; printf '%s\n' "$out"; exit 0 ;;
