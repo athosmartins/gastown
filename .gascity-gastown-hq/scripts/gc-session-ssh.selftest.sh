@@ -428,7 +428,8 @@ g_mbp() {
   m=$(wc -l < "$T/demote.log"); echo livre > "$T/pres.mode"; sleep 3
   ! grep -vE '^(renice -n 19 -p [0-9]+|taskpolicy -b -p [0-9]+)$' "$T/demote.log" | grep -q .; ok $? "mbp: ...e quando ele sai de novo nada sobe a prioridade (só há chamadas de rebaixamento)"
   pv is-running w-remote-m-6 </dev/null; [ "$(cat "$T/out")" = true ] && kill -0 "$pid" 2>/dev/null; ok $? "mbp: a sessão em curso NÃO é morta (termina o que estava fazendo)"
-  pv stop w-remote-m-6 </dev/null; sleep 2; ! pgrep -f 'PRESENCE_LIB_ONLY=1' >/dev/null; ok $? "mbp: o vigia termina junto com a sessão (nenhum sobrou)"
+  # vazio (pgrep rc 1) → passa; falhou/ilegível (rc 2/3) → FAIL, nunca "nenhum sobrou". Casa o caminho da biblioteca falsa, que é argumento do vigia e único por bateria ($T vem do mktemp): o 'PRESENCE_LIB_ONLY=1' de antes casava também o vigia de OUTRA bateria rodando em paralelo (revisor/dog no mini) e reprovava à toa (ga-3gaf8g)
+  pv stop w-remote-m-6 </dev/null; sleep 2; pgrep -f "$T/lib/presence.sh" >/dev/null; [ $? = 1 ]; ok $? "mbp: o vigia termina junto com a sessão (nenhum sobrou DESTA bateria; o de outra rodando em paralelo não conta)"
   : > "$T/demote.log"; rm -f "$T/wpid.out"; : > "$T/pres.pause"; echo livre > "$T/pres.mode"
   pv start w-remote-m-7 < <(req "sh -c 'echo \$\$ > $T/wpid.out; exec sleep 300'"); sleep 1; pid=$(cat "$T/wpid.out" 2>/dev/null)
   for i in $(seq 1 40); do grep -q "^taskpolicy -b -p $pid\$" "$T/demote.log" && break; sleep 0.25; done
