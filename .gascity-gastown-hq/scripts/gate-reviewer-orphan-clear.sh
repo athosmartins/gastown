@@ -33,16 +33,33 @@
 # while genuinely dead). Mirrors the proven MIN_AGE pattern from the sibling
 # adhoc-session-reaper.sh, which already does this correctly.
 #
+# ga-2hd02v.1.23: the ga-flfo floor protected `creating` but NOT `start-pending`,
+# and `start-pending` is where a session WAITS for the reconciler to wake it:
+# patrol_interval=120s x max_wakes_per_tick=2 (city.toml) makes that a queue of
+# 2-10 min (measured 481s on 19/10; the healthy sibling waited 279s). `gc session
+# peek` answers "gone" for a runtime that has not been created yet, exactly as for
+# a dead one, so at age>=360s the sweep closed a remote gate-reviewer 4s before the
+# controller started it. The close (a) made the engine release the verdict bead's
+# assignee and (b) left the task nudge in the closed bead's queue; the runtime came
+# up anyway, was adopted under a NEW bead with the same name and an empty queue,
+# and reviewed nothing for 56 min. So: start-pending has its own, much longer floor
+# (it is not a death signal, only a stuck-for-ages one), and the state is re-read
+# right before the close because the snapshot can be a minute old under load.
+#
 # TEMPORARY: remove this guard + its plist once gt-bewtm (headroom
 # drained-reviewer exclusion) is merged and deployed. Tracked: gt-bewtm.
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-# orphan_clear_decision <state> <age_secs|""> <min_age_secs> → echoes one of:
-#   keep_active | keep_creating | keep_young | keep_age_unknown | eligible
+# orphan_clear_decision <state> <age_secs|""> <min_age_secs> [<start_pending_min_age_secs>] → echoes one of:
+#   keep_active | keep_creating | keep_start_pending | keep_young | keep_age_unknown | eligible
 # Pure; no I/O. Encodes only the FAST, list-only skip rules — "eligible" means
 # the caller should proceed to the peek probe (which needs I/O and so is kept
 # out of this function to stay unit-testable without a live gc/tmux).
+# ga-2hd02v.1.23: state=start-pending is a session QUEUED for a wake (the reconciler starts at most
+# max_wakes_per_tick per patrol_interval), not a dead one — peek cannot tell them apart because neither
+# has a runtime. It is only eligible past start_pending_min_age (default 1500s = ~12 ticks); unset or
+# non-numeric → the default, never "no floor".
 # ga-flfo: state=creating means the session record exists but the runtime has
 # not appeared yet — this is NEVER a signal of death, regardless of age, so it
 # is excluded up front. The age floor (min_age) additionally protects any
@@ -50,7 +67,7 @@ set -uo pipefail
 # to answer a peek. Unknown age (created_at missing/unparseable) fails SAFE
 # (keep) — never reap on incomplete information.
 orphan_clear_decision() {
-  local state="$1" age="$2" min_age="$3"
+  local state="$1" age="$2" min_age="$3" sp_min_age="${4:-}"
   case "$state" in
     active) echo "keep_active"; return 0 ;;
   esac
@@ -63,6 +80,12 @@ orphan_clear_decision() {
   case "$min_age" in
     ''|*[!0-9]*) min_age=360 ;;
   esac
+  case "$sp_min_age" in
+    ''|*[!0-9]*) sp_min_age=1500 ;;
+  esac
+  if [ "$state" = "start-pending" ] && [ "$age" -lt "$sp_min_age" ]; then
+    echo "keep_start_pending"; return 0
+  fi
   if [ "$age" -lt "$min_age" ]; then
     echo "keep_young"; return 0
   fi
@@ -89,6 +112,36 @@ except Exception:
   echo $(( now - epoch ))
 }
 
+# orphan_clear_recheck_decision <snapshot_state> <current_state> → proceed | keep_moved | keep_unreadable
+# Pure. The last gate before `gc session close`: the sweep decides on a snapshot that can be a minute old
+# under load (19/10: age computed at 21:26:28, close at 21:27:25, the controller flipped the session to
+# creating at 21:27:21). Only a session whose state is STILL the snapshot's may be closed.
+# vazio (sessão sumiu da lista, ou a leitura falhou) → keep_unreadable: sem informação não se fecha.
+orphan_clear_recheck_decision() {
+  local snap="$1" cur="$2"
+  [ -z "$cur" ] && { echo "keep_unreadable"; return 0; }
+  if [ "$cur" = "$snap" ]; then echo "proceed"; else echo "keep_moved"; fi
+}
+
+# orphan_clear_current_state <sid> → the session's state in a FRESH `gc session list --json`.
+# vazio → a sessão não está mais na lista, OU o gc falhou, OU o JSON veio ilegível — o chamador trata os
+# três como "não fechar" (orphan_clear_recheck_decision); nunca devolve um estado inventado.
+orphan_clear_current_state() {
+  gc session list --json 2>/dev/null | python3 -c '
+import sys, json
+sid = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+sessions = d.get("sessions", d) if isinstance(d, dict) else d
+for s in sessions:
+    if str(s.get("id", "")) == sid:
+        print(str(s.get("state", "")))
+        break
+' "$1" 2>/dev/null
+}
+
 # Sourcing guard: a selftest sources this file to unit-test the pure helpers
 # above WITHOUT running a sweep. Mirrors adhoc-session-reaper.sh's
 # ADHOC_REAPER_SOURCE_ONLY convention.
@@ -103,10 +156,16 @@ now_epoch() { date +%s; }
 MIN_AGE_SECS="${GATE_REVIEWER_ORPHAN_CLEAR_MIN_AGE_SECS:-360}"
 case "$MIN_AGE_SECS" in ''|*[!0-9]*) MIN_AGE_SECS=360 ;; esac
 
+# ga-2hd02v.1.23: start-pending = waiting for a wake tick, see orphan_clear_decision. Non-numeric → default.
+START_PENDING_MIN_AGE_SECS="${GATE_REVIEWER_ORPHAN_CLEAR_START_PENDING_MIN_AGE_SECS:-1500}"
+case "$START_PENDING_MIN_AGE_SECS" in ''|*[!0-9]*) START_PENDING_MIN_AGE_SECS=1500 ;; esac
+
 checked=0
 cleared=0
 kept_young=0
 kept_creating=0
+kept_start_pending=0
+kept_recheck=0
 
 NOW_EPOCH=$(now_epoch)
 
@@ -117,10 +176,11 @@ NOW_EPOCH=$(now_epoch)
 while IFS=$'\t' read -r sid state created; do
   [ -z "$sid" ] && continue
   age=$(session_age_secs "$created" "$NOW_EPOCH")
-  decision=$(orphan_clear_decision "$state" "$age" "$MIN_AGE_SECS")
+  decision=$(orphan_clear_decision "$state" "$age" "$MIN_AGE_SECS" "$START_PENDING_MIN_AGE_SECS")
   case "$decision" in
     keep_active) continue ;;
     keep_creating) kept_creating=$((kept_creating + 1)); continue ;;
+    keep_start_pending) kept_start_pending=$((kept_start_pending + 1)); continue ;;
     keep_young) kept_young=$((kept_young + 1)); continue ;;
     keep_age_unknown) continue ;;
   esac
@@ -128,6 +188,15 @@ while IFS=$'\t' read -r sid state created; do
   checked=$((checked + 1))
   # peek is a pure read probe: exit 0 => alive (keep); non-zero => gone (close).
   if gc session peek "$sid" >/dev/null 2>&1; then
+    continue
+  fi
+  # ga-2hd02v.1.23: re-read right before the close — the snapshot above is as old as the slowest peek
+  # before this one. Moved on (e.g. start-pending → creating) or unreadable → keep.
+  cur_state=$(orphan_clear_current_state "$sid")
+  recheck=$(orphan_clear_recheck_decision "$state" "$cur_state")
+  if [ "$recheck" != "proceed" ]; then
+    kept_recheck=$((kept_recheck + 1))
+    echo "[$(ts)] kept gate-reviewer $sid ($recheck: snapshot state=$state, now=${cur_state:-unreadable})" >> "$LOG"
     continue
   fi
   if gc session close "$sid" >/dev/null 2>&1; then
@@ -152,7 +221,7 @@ for s in sessions:
     ]))
 ' 2>/dev/null)
 
-if [ "$cleared" -gt 0 ] || [ "$kept_young" -gt 0 ] || [ "$kept_creating" -gt 0 ]; then
-  echo "[$(ts)] sweep: checked=$checked cleared=$cleared kept_young=$kept_young kept_creating=$kept_creating min_age_secs=$MIN_AGE_SECS" >> "$LOG"
+if [ "$cleared" -gt 0 ] || [ "$kept_young" -gt 0 ] || [ "$kept_creating" -gt 0 ] || [ "$kept_start_pending" -gt 0 ] || [ "$kept_recheck" -gt 0 ]; then
+  echo "[$(ts)] sweep: checked=$checked cleared=$cleared kept_young=$kept_young kept_creating=$kept_creating kept_start_pending=$kept_start_pending kept_recheck=$kept_recheck min_age_secs=$MIN_AGE_SECS start_pending_min_age_secs=$START_PENDING_MIN_AGE_SECS" >> "$LOG"
 fi
 exit 0
