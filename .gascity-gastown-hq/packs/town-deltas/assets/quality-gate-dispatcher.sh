@@ -8824,6 +8824,8 @@ GATE_SHA_FAIL_CLASS="code"
 # textual-conflict downgrade below) where the reviewers already approved
 # this exact content and the ONLY outstanding work is a rebase — see that
 # site's own comment for why it is scoped narrower than "hold" in general.
+# ga-90pq1k: a second site sets it — failed_push_race, but only when git itself
+# reported the lost race (GATE_PUSH_REJECT_CLASS=race); see that site.
 GATE_NEEDS_REBASE_NOT_FIX="0"
 # SELFTEST-EXTRACT finalize-failclass-reset: BEGIN
 # ga-mcapdq: the comment above assumes a pre-set FAIL entering this function
@@ -9680,6 +9682,10 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           rm -f "$PUSH_ERR_FILE" 2>/dev/null || true
         fi
         PUSH_REJECT_CLASS=$(gate_push_reject_class "$PUSH_ERR_TXT") || PUSH_REJECT_CLASS="unknown"
+        # ga-90pq1k: PUSH_REJECT_CLASS is local to this function; the finalize block needs THIS attempt's class to tell a lost race
+        # (git said so) from a refusal nobody identified — both end as failed_push_race. Empty/unreadable capture → "unknown" (above),
+        # which is not "race": only a positive identification lifts the fix-attempt cap off the run.
+        GATE_PUSH_REJECT_CLASS="$PUSH_REJECT_CLASS"
         if [ "$PUSH_REJECT_CLASS" = "hook" ]; then
           GATE_PUSH_HOOK_DETAIL=$(gate_push_reject_detail "$PUSH_ERR_HEAD") || GATE_PUSH_HOOK_DETAIL=""
           err "  FF push read as REFUSED BY A HOOK (attempt $((MERGE_ATTEMPT+1))) — provisional until the same words repeat (ga-x4rbnt): ${GATE_PUSH_HOOK_DETAIL:-no hook output captured}"
@@ -9701,10 +9707,12 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     GATE_BEAD_CLOSED_LATE=0  # ga-5w2gpw (c): set by do_merge_ff's pre-push re-check ONLY when it saw a CLOSED bead
     GATE_PUSH_HOOK_DETAIL=""  # ga-x4rbnt: set by do_merge_ff ONLY when a hook refused the push (the hook's own words, for the feedback)
     GATE_PUSH_HOOK_PREV=""    # ga-x4rbnt: the hook's words from the PREVIOUS attempt, iff that attempt was also a hook refusal
+    GATE_PUSH_REJECT_CLASS="" # ga-90pq1k: set by do_merge_ff ONLY when a push was rejected (race|hook|unknown) — the LAST attempt's class
     while [ "$MERGE_ATTEMPT" -lt "$MAX_MERGE_RETRIES" ]; do
       MERGE_ATTEMPT=$((MERGE_ATTEMPT + 1))
       log "Merge attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES ..."
       GATE_PUSH_HOOK_DETAIL=""  # nothing from an earlier attempt may be read as this attempt's words
+      GATE_PUSH_REJECT_CLASS="" # same for the class: an attempt that never reached the push leaves it empty, never an earlier attempt's "race"
       if do_merge_ff; then
         break
       fi
@@ -9868,6 +9876,19 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         # keeps the existing cap-then-escalate path unchanged.
         GATE_NEEDS_REBASE_NOT_FIX=1
       fi
+      # ga-90pq1k (A2): a run whose push ended as a lost race is the same story as the conflict above — the reviewers approved
+      # this content and the only outstanding work is a re-run on today's main — and it used to spend a gate:fix-attempt slot,
+      # so a few unlucky runs on a busy main sent approved code to needs-human. ONLY a race git itself reported lifts the cap:
+      # the LAST attempt's class is "race" (a `! [rejected]` status line — non-fast-forward, fetch first, stale info).
+      # failed_push_race also ends a run whose push was refused for a reason nobody identified ("unknown" — empty or unreadable
+      # stderr) or by a hook seen once (class "hook", provisional): neither is evidence of a race, so they keep the cap — the
+      # cap is what bounds a refusal that never clears.
+      # GATE_PUSH_REJECT_CLASS vazio → a flag fica 0 (caminho com teto); unknown/hook → idem; só "race" → 1.
+      # SELFTEST-EXTRACT push-race-not-fix: BEGIN
+      if [ "$MERGE_RESULT" = "failed_push_race" ] && [ "${GATE_PUSH_REJECT_CLASS:-}" = "race" ]; then
+        GATE_NEEDS_REBASE_NOT_FIX=1
+      fi
+      # SELFTEST-EXTRACT push-race-not-fix: END
       if [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ]; then
         # ga-pfgnv: same diagnostic spirit as Step 10's ga-y9a1d check (a
         # human needs to know this is a content-mismatch, not a generic git
@@ -11429,7 +11450,7 @@ $(gate_render_reasons "$FAIL_REASONS")" 2>/dev/null || true
         fi
         bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (merge-mechanical, ga-39l9z2) — labeled gate:needs-rebase; NOT counted as a gate:fix-attempt, since the reviewers already approved this content (GATE_SHA_FAIL_CLASS=$GATE_SHA_FAIL_CLASS). Author $AUTHOR is a LIVE crew session, so this dispatcher acted to KEEP assignee + story:in-flight (ga-jyox) — verified post-write on the raw bead, not display: $_NR_KEEP_ASSIGNEE_OBS; $_NR_KEEP_INFLIGHT_OBS. Rebase onto current main and re-run /gate-done (no code changes needed)." 2>/dev/null || true
         nudge_author_with_fallback "$BEAD_ID" "$NOTIFY_AUTHOR" "$AUTHOR" \
-          "Gate merge-conflict for $BEAD_ID (branch $BRANCH) — your reviewed code is fine, but it needs a rebase onto current main. Your assignee was kept; rebase and re-run /gate-done." \
+          "Gate merge failed for $BEAD_ID (branch $BRANCH, ${MERGE_RESULT:-merge-time failure}) — your reviewed code is fine, but it needs a rebase onto current main. Your assignee was kept; rebase and re-run /gate-done." \
           "Gate needs-rebase live-crew nudge for $BEAD_ID (branch $BRANCH)" || true
       else
         # SELFTEST-EXTRACT ga-iqd7k1-nr-pool-return: BEGIN

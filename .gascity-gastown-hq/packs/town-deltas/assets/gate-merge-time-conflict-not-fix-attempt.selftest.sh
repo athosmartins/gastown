@@ -89,7 +89,9 @@ if [ -n "$CONFLICT_SET_LN" ]; then
     bad "GATE_NEEDS_REBASE_NOT_FIX=1 not found close enough after the failed_merge_time_conflict if (if=$CONFLICT_SET_LN set=$FLAG_SET_LN)"
   fi
   FLAG_TOTAL=$(grep -c '^        GATE_NEEDS_REBASE_NOT_FIX=1$' "$DISPATCHER" || true)
-  eq "GATE_NEEDS_REBASE_NOT_FIX=1 appears at exactly one call site (scope stayed narrow — not blanket-applied to every hold-class FAIL)" "${FLAG_TOTAL:-0}" "1"
+  # ga-90pq1k added the second site (a push race git itself reported); gate-push-race-not-fix-attempt.selftest.sh owns that one.
+  # Two is still narrow: one per recognized trigger, never blanket-applied to every hold-class FAIL.
+  eq "GATE_NEEDS_REBASE_NOT_FIX=1 appears at exactly two call sites (failed_merge_time_conflict, and failed_push_race only for a positively identified race, ga-90pq1k)" "${FLAG_TOTAL:-0}" "2"
 else
   bad "could not find the failed_merge_time_conflict-specific if-block — wiring missing/renamed"
 fi
