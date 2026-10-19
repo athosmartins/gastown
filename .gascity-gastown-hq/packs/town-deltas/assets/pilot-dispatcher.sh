@@ -11824,7 +11824,9 @@ _pilot_wa_node_decide() {
     '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,rc:$rc,out:$o}' >> "$GC_CITY/.gc/wa-node-route.jsonl" 2>/dev/null || true
   [ "$_mode" = shadow ] && return 1
   if [ "${DRY_RUN:-0}" = "1" ]; then
-    log "  ga-2hd02v.1.10: WOULD route $_id to the node (rc=$_rc, dry-run: nothing written)"
+    # só o rc 0 do `apply --dry-run` diz "iria ao nó"; 10/11/12 e o resto = não iria (ou o script não soube dizer), e o log não anuncia o que o script não disse
+    if [ "$_rc" = 0 ]; then log "  ga-2hd02v.1.10: WOULD route $_id to the node (dry-run: nothing written)"
+    else log "  ga-2hd02v.1.10: dry-run: $_id would NOT go to the node (wa-node-dispatch.sh rc=$_rc; nothing written)"; fi
     return 1
   fi
   case "$_rc" in
