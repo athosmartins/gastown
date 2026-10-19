@@ -199,6 +199,7 @@ go_cases() {
   grep -q 'docs/runbooks/mbp-offload.md' "$W/err" || bad "go: the refusal must name the runbook"
   grep -q '13312 MB floor' "$W/err" || bad "go: the refusal must show the Go floor, 13312 ($(cat "$W/err"))"
   grep -q 'rc 75' "$W/err" || bad "go: the refusal must say rc 75"
+  grep -q '97 is also a usage error' "$W/err" && grep -q '98 also a --push path that does not exist' "$W/err" || bad "go: the refusal must say that mbp-run 97 and 98 are not always 'MacBook unavailable' ($(cat "$W/err"))"
   grep -q "REFUSED what='go-test' free_mb=9000 min_mb=13312 class=go rc=75" "$HEAVY_GUARD_LOG" || bad "go: refusal not in the log with class=go ($(cat "$HEAVY_GUARD_LOG"))"
   local lbl
   for lbl in go-build go-vet go-install "go build ./cmd/gc" "Go-Test" "go test internal/mail" "go_test"; do
@@ -236,13 +237,18 @@ go test ./...'; do
     DISK_FREE_OVERRIDE_MB=9000 run --what step -- sh -c "$cmdline" >/dev/null 2>&1; rc=$?
     check "go: sh -c '$cmdline' is NOT a Go step (9000 passes the heavy floor)" "$( case "$cmdline" in "go version"|"go env GOPATH") echo 9 ;; *) echo 0 ;; esac )" "$rc"
   done
-  # `tr` cannot run (a fake one that fails): the label stays as typed and the command words are read as they are, so a Go step is
-  # STILL a Go step; and a non-Go step is still not one (the failure of the matcher's helper never decides the floor either way)
+  # `tr` cannot run (a fake one that fails): the matcher no longer uses it, so NOTHING may change — in particular the shapes glued to
+  # punctuation, which an earlier version (tr to split on ; & | ( ) ` " ') read as "not Go" when tr failed: "cd /tmp;go test" ran
+  # with 9000 MB free < 13312 (gate run ga-7dd84s). Each one must be refused AND must not run.
   mkdir -p "$W/trbin"; printf '#!/bin/sh\nexit 1\n' > "$W/trbin/tr"; chmod +x "$W/trbin/tr"
-  rm -f "$W/goran"
   PATH="$W/trbin:$PATH" DISK_FREE_OVERRIDE_MB=9000 run --check --what go-test 2>/dev/null; rc=$?;     check "go: with tr failing, a go-test label is still a Go step" 75 "$rc"
-  PATH="$W/trbin:$PATH" DISK_FREE_OVERRIDE_MB=9000 run --what x -- go test ./... 2>/dev/null; rc=$?;  check "go: with tr failing, a go test command is still a Go step" 75 "$rc"
-  [ ! -e "$W/goran" ] || bad "go: with tr failing the Go command RAN below the Go floor"
+  PATH="$W/trbin:$PATH" DISK_FREE_OVERRIDE_MB=9000 run --check --what Go-Test 2>/dev/null; rc=$?;     check "go: with tr failing, the label Go-Test (capitals) is still a Go step" 75 "$rc"
+  for cmdline in 'go test ./...' 'cd /tmp;go test ./...' '(go install ./...)' 'true|go vet ./...' 'cd /tmp && go build ./...' 'echo `go build ./...`' "echo 'go test ./...'"; do
+    rm -f "$W/goran"
+    PATH="$W/trbin:$PATH" DISK_FREE_OVERRIDE_MB=9000 run --what step -- sh -c "$cmdline" 2>/dev/null; rc=$?
+    check "go: with tr failing, sh -c '$cmdline' is still a Go step (75)" 75 "$rc"; [ ! -e "$W/goran" ] || bad "go: with tr failing, sh -c '$cmdline' RAN below the Go floor"
+  done
+  rm -f "$W/goran"
   PATH="$W/trbin:$PATH" DISK_FREE_OVERRIDE_MB=9000 run --check --what other 2>/dev/null; rc=$?;       check "go: with tr failing, a non-Go step keeps the heavy floor (9000 passes)" 0 "$rc"
   # the floor itself: exactly 13312 goes ahead, one MB under is refused, plenty runs the command and passes its rc through
   DISK_FREE_OVERRIDE_MB=13312 run --check --what go-test 2>/dev/null; rc=$?;   check "go: exactly the Go floor (13312) goes ahead" 0 "$rc"
@@ -397,17 +403,18 @@ mk_mutant "$REAL_LIB" "$M/lib-godef.sh" 's/DISK_GO_MIN_MB:-13312/DISK_GO_MIN_MB:
 gom() { # gom <file> <name> <sed-expr>
   mk_mutant "$REAL_GUARD" "$M/$1.sh" "$3" && { before=$FAIL; go_cases "$M/$1.sh" "$REAL_LIB" >/dev/null 2>&1; survive "$2"; }
 }
-gom g-go-nolabel  "guard: a Go label is not recognised"                       's#\^go\[- _\]#NOPE_NOPE#'
-gom g-go-case     "guard: the label is matched case-sensitively"               '/^  label="\$(printf/d'
-gom g-go-origlbl  "guard: a failing tr loses the label"                       's#|| label="\$orig"#|| label=""#'
+gom g-go-nolabel  "guard: a Go label is not recognised"                       's#\^\[Gg\]\[Oo\]\[- _\]#NOPE_NOPE#'
+gom g-go-case     "guard: the label verb is matched case-sensitively"          's#\[Tt\]\[Ee\]\[Ss\]\[Tt\]#test#'
+gom g-go-trfallb  "guard: the old tr split with its silent || fallback is back" 's#^  norm="\${norm//\[\$seps\]/ }"$#  norm="$(printf %s "$norm" | tr ";\&|()" " ")" || norm=" $* "#'
 gom g-go-nocmd    "guard: a Go command is not recognised"                     's#\[\[ \$norm =~ \$cre \]\] && return 0#:#'
-gom g-go-notr     "guard: the argument list is not split on ; & | ( ) quotes" '/^  norm="\$(printf/d'
+gom g-go-notr     "guard: the argument list is not split on ; & | ( ) quotes" '\#^  norm="\${norm//\[#d'
 gom g-go-noslash  "guard: a path before go is not a word boundary"            's#\[\[:space:\]/\]go#[[:space:]]go#'
-gom g-go-wordend  "guard: go-testdata counts as go-test"                      's#(test|build|vet|install)(\[^\[:alnum:\]\]|\$)#(test|build|vet|install)#'
+gom g-go-wordend  "guard: go-testdata counts as go-test"                      's#)(\[^\[:alnum:\]\]|\$)#)#'
 gom g-go-verbs    "guard: go version counts as a Go step"                     's#\[\[:space:\]\]+(test|build|vet|install)\[\[:space:\]\]#[[:space:]]+[a-z]+[[:space:]]#'
 gom g-go-nofloor  "guard: a Go step keeps the heavy floor"                    's#^  \[ "\$min" -ge "\$DISK_GO_MIN_MB" \] 2>/dev/null || min="\$DISK_GO_MIN_MB"$#  :#'
 gom g-go-lowers   "guard: --min-free-mb lowers the Go floor"                  's#\[ "\$min" -ge "\$DISK_GO_MIN_MB" \] 2>/dev/null || min="\$DISK_GO_MIN_MB"#[ "$min" -ne "$DISK_HEAVY_MIN_MB" ] 2>/dev/null || min="$DISK_GO_MIN_MB"#'
 gom g-go-nomsg    "guard: the Go refusal does not point at the MacBook"       's#scripts/mbp-run.sh --exec --go --push#scripts/other --push#'
+gom g-go-no98     "guard: the Go refusal does not warn that 97/98 are not 'MacBook down'" 's#98 also a --push path that does not exist#98 is down#'
 gom g-go-nolog    "guard: the Go refusal log has no class=go"                 's# class=go rc=75# rc=75#'
 gom g-go-no76     "guard: a lib without the Go floor is not refused"          's#^  if \[ -z "\${DISK_GO_MIN_MB:-}" \]; then$#  if false; then#'
 gom g-go-wrongrc  "guard: the Go refusal uses the run-local rc 97"            's#^      exit 75$#      exit 97#'

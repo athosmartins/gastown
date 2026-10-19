@@ -43,8 +43,10 @@
 #     "Go build ./cmd/gc"; "go-testdata" and "gopher-build" are not), or
 #   - `go <verb>` shows up as a word in the command itself, also inside `sh -c '…'` or `env K=V go test` (the argument
 #     list is read with ; & | ( ) ` " ' as spaces, so a quoted script is seen too).
-# A script that runs go INSIDE (bash scripts/x.sh) is not seen: label it --what go-test. A false match (an `echo go test`)
-# only applies the HIGHER floor, never the lower one. The class floor is a minimum: --min-free-mb can raise it for one call,
+# A script that runs go INSIDE (bash scripts/x.sh) is not seen: label it --what go-test. Also not seen: `go -C <dir> test`,
+# `go run`, `go generate` (cold builds too) and plural labels ("go-tests"). A false match (an `echo go test`, a
+# `git commit -m "fix go test"`) only applies the HIGHER floor, never the lower one; keep that text out of the command line
+# (put it in a script file) to get the 6 GB floor back. The matcher is pure bash: it has no outside command that could fail. The class floor is a minimum: --min-free-mb can raise it for one call,
 # never lower it. A lib that has no DISK_GO_MIN_MB (older than this guard) refuses a Go step with 76 instead of falling
 # back to the heavy floor. The refusal is rc 75 like any other, and its text sends the step to the MacBook:
 #   scripts/mbp-run.sh --exec --go --push go.mod --push go.sum --push internal --push cmd … -- sh -c 'cd in && go test ./...'
@@ -121,21 +123,21 @@ case "$HG_POLL" in ''|*[!0-9]*|0) HG_POLL=15 ;; esac
 [ "${#HG_POLL}" -le 9 ] || HG_POLL=15   # past int64 the cap below could not be compared: back to the default
 
 # hg_go_step <label> [command...] — rc 0 when the step is a Go toolchain build/test/vet/install (see "GO CLASS"), else rc 1.
-# String matching only: it reads no file and no disk; the one outside command is `tr`, and its failure is handled where it is called.
+# Pure bash on purpose: no outside command (an earlier version split the command with `tr`, and when that fork failed under
+# load a Go step glued to punctuation, "cd /tmp;go test", was read as NOT Go and got the cheaper 6 GB floor — the exact
+# mistake this class exists to stop). Nothing here reads a file or the disk, so there is no failed-to-read arm either.
 # vazio (no label, no command words) → rc 1, not a Go step; a wrong match can only be a false POSITIVE, which applies the
 # higher floor and never the lower one.
 hg_go_step() {
-  local label="${1:-}" orig norm lre cre
-  orig="$label"
+  local label="${1:-}" norm seps lre cre
   shift
-  # the label is typed by a person or an agent: "Go-Test" and "go-test" are the same step. falhou (tr cannot run) → the label
-  # stays as typed, which can only miss a capital letter, and the command words below are still read
-  label="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" || label="$orig"
-  lre='^go[- _](test|build|vet|install)([^[:alnum:]]|$)'
+  # the label is typed by a person or an agent: "Go-Test" and "go-test" are the same step, so each letter is a bracket class
+  lre='^[Gg][Oo][- _]([Tt][Ee][Ss][Tt]|[Bb][Uu][Ii][Ll][Dd]|[Vv][Ee][Tt]|[Ii][Nn][Ss][Tt][Aa][Ll][Ll])([^[:alnum:]]|$)'
   [[ $label =~ $lre ]] && return 0
   # ; & | ( ) ` " ' → spaces, then "go <verb>" as a word (a path before it counts: /opt/homebrew/bin/go test)
+  seps=$';&|()`"\''
   norm=" $* "
-  norm="$(printf '%s' "$norm" | tr ';&|()`"'"'" ' ')" || norm=" $* "
+  norm="${norm//[$seps]/ }"
   cre='[[:space:]/]go[[:space:]]+(test|build|vet|install)[[:space:]]'
   [[ $norm =~ $cre ]] && return 0
   return 1
@@ -227,7 +229,7 @@ case "$state" in
     ;;
   low)
     if [ "$go_class" = 1 ]; then
-      echo "heavy-guard: REFUSED '$what': ${free} MB free < ${min} MB floor for a Go build/test (ga-edkfip: a cold build of cmd/gc writes 4-10 GB of build cache; 19/10 one started just over the 6 GB heavy floor and left 2 GB, Dolt sat at the CRITICAL floor). Do NOT run it on this machine by another route. Run it on the MacBook: scripts/mbp-run.sh --exec --go --push go.mod --push go.sum --push internal --push cmd (more --push for examples, test, schemas, schemas_embed.go, docs, third_party if the tests need them) -- sh -c 'cd in && go test ./...' (recipe: docs/runbooks/mbp-offload.md, \"Go no MBP\"). If mbp-run answers 96..99 the MacBook is unavailable: wait and retry, do not come back here; if it stays unavailable, tell the Mayor. (rc 75)" >&2
+      echo "heavy-guard: REFUSED '$what': ${free} MB free < ${min} MB floor for a Go build/test (ga-edkfip: a cold build of cmd/gc writes 4-10 GB of build cache; 19/10 one started just over the 6 GB heavy floor and left 2 GB, Dolt sat at the CRITICAL floor). Do NOT run it on this machine by another route. Run it on the MacBook: scripts/mbp-run.sh --exec --go --push go.mod --push go.sum --push internal --push cmd (more --push for examples, test, schemas, schemas_embed.go, docs, third_party if the tests need them) -- sh -c 'cd in && go test ./...' (recipe: docs/runbooks/mbp-offload.md, \"Go no MBP\"). If mbp-run answers 96..99 the MacBook is unavailable: wait and retry, do not come back here; if it stays unavailable, tell the Mayor. But 97 is also a usage error (a missing command, --go with --check) and 98 also a --push path that does not exist: read the 'mbp-run:' line before you wait. If this step is not a Go build/test and only mentions go test in its text, keep that text out of the command line (a script file) to get the 6 GB floor. (rc 75)" >&2
       hg_log "REFUSED what='$what' free_mb=$free min_mb=$min class=go rc=75"
       exit 75
     fi
