@@ -25,6 +25,7 @@ BKT="s3://urblink-dolt-backups"
 
 mkdir -p "$T/scripts" "$T/bin" "$T/secret" "$T/home/gt-remote/lab/bin" "$T/tmp" "$T/s3/hq"
 cp "$ORCH_SRC" "$T/scripts/dolt-restore-lab-mbp.sh"; cp "$SIDE_SRC" "$T/scripts/dolt-restore-lab-mbp-side.sh"
+cp "$HERE/mbp-host.sh" "$T/scripts/mbp-host.sh"   # ga-bmmxka: o orquestrador inclui o helper do host (fica ao lado dele)
 printf 'AKIACANARYTESTKEY123\nCANARYsecretKEY0123456789abcdef/+xyz\nCANARYtoken0123456789ABCDEFGHIJKLMNOP==\n' > "$T/secret/canary.txt"
 # the S3 fixture: 5 files, one zero-size, one nested, one multipart (9 MiB = 2 parts of 8 MiB)
 python3 -I - "$T/s3/hq" <<'PY'
@@ -147,6 +148,14 @@ EOF
 cat > "$T/bin/notify" <<'EOF'
 #!/bin/bash
 echo "$*" >> "$FAKE_CAP/notify.log"
+EOF
+# ga-bmmxka: the host probe (mbp-host.sh) is a stub here, so no case depends on DNS, nc or the real MBP. HOSTPROBE_UP = hosts that "answer" (default: only
+# the Tailscale name); HOSTPROBE_LOG records every "host port" asked.
+cat > "$T/bin/hostprobe" <<'EOF'
+#!/bin/sh
+[ -z "${HOSTPROBE_LOG:-}" ] || echo "$1 $2" >> "$HOSTPROBE_LOG"
+case " ${HOSTPROBE_UP-athoss-macbook-pro} " in *" $1 "*) exit 0 ;; esac
+exit 1
 EOF
 # ssh: the "MBP" is this machine in a clean environment. Records argv and its own env; can drop mid-object or tamper with the copy
 # right before stream.done; after the command it looks for big files on the mini (the data must be a pipe, never a file).
@@ -320,10 +329,10 @@ reset() {
   mkdir -p "$T/state" "$T/cap" "$T/tmp" "$T/mbp" "$T/city/.gc/run" "$T/city/.gc/logs" "$T/city/.gc/runtime/packs/dolt"
   printf 'listener:\n  port: 4242\n' > "$T/city/.gc/runtime/packs/dolt/dolt-config.yaml"
 }
-# envrun [args] — FAKE_*/LABMBP_* come from the caller's environment prefix. MBP_SSH is the fake ssh unless the caller sets its own (the real-mbp-run section passes a probe stub). The mini HAS an AWS credential (the canary).
+# envrun [args] — FAKE_*/LABMBP_* come from the caller's environment prefix. MBP_HOST is fake@mbp unless the caller sets TEST_MBP_HOST (empty = the script picks the host itself, ga-bmmxka). MBP_SSH is the fake ssh unless the caller sets its own (the real-mbp-run section passes a probe stub). The mini HAS an AWS credential (the canary).
 envrun() {
   env LABMBP_CITY="$T/city" LABMBP_STATE="${STATE_OVERRIDE:-$T/state}" LABMBP_AWS="$T/bin/aws" LABMBP_DOLT="$T/bin/dolt" LABMBP_NOTIFY="$T/bin/notify" \
-      MBP_SSH="${MBP_SSH:-$T/bin/ssh}" MBP_HOST=fake@mbp LABMBP_SSH_OPTS="-o Fake=1" LABMBP_POLL_S=0.2 LABMBP_RETRY_S=0.2 LABMBP_NOW_HOUR="${LABMBP_NOW_HOUR:-0}" LABMBP_STREAM_S="${LABMBP_STREAM_S:-120}" \
+      MBP_SSH="${MBP_SSH:-$T/bin/ssh}" MBP_HOST="${TEST_MBP_HOST-fake@mbp}" MBP_HOST_PROBE="$T/bin/hostprobe" LABMBP_SSH_OPTS="-o Fake=1" LABMBP_POLL_S=0.2 LABMBP_RETRY_S=0.2 LABMBP_NOW_HOUR="${LABMBP_NOW_HOUR:-0}" LABMBP_STREAM_S="${LABMBP_STREAM_S:-120}" \
       AWS_ACCESS_KEY_ID="$(sed -n 1p "$T/secret/canary.txt")" AWS_SECRET_ACCESS_KEY="$(sed -n 2p "$T/secret/canary.txt")" AWS_SESSION_TOKEN="$(sed -n 3p "$T/secret/canary.txt")" \
       TMPDIR="$T/tmp" FAKE_CAP="$T/cap" FAKE_ROOT="$T" "${LABMBP_TEST_BASH:-bash}" "$T/scripts/dolt-restore-lab-mbp.sh" "$@"
 }
@@ -1028,6 +1037,27 @@ reset; SC_DOLT_RUN=other run --install-dolt
 check "$RC" 1 "dolt do MBP com versao diferente da do mini: FAIL"; has "$OUT" "o dolt do MBP e 9.9.9 e o do mini e 2.3.1" "diz as duas versoes"
 reset; FAKE_DOLT_VER_HANG=1 LABMBP_CALL_S=2 run --install-dolt
 check "$RC" 2 "versao do dolt do mini ilegivel: UNKNOWN"; has "$OUT" "nao consegui ler a versao do dolt do mini" "diz o que faltou"; check "$(execs)" 0 "e o MBP nao foi tocado"
+
+echo "-- host do MBP (ga-bmmxka): Tailscale por padrao, LAN so com evidencia; o mesmo host no envio e no mbp-run; MBP_HOST do chamador nunca e sondado"
+mbprun_hosts() { grep -h '^MBP_HOST=' "$T"/cap/mbprun.env.* 2>/dev/null | sort -u; }
+reset; TEST_MBP_HOST= HOSTPROBE_UP="athoss-macbook-pro athoss-macbook-pro.local" HOSTPROBE_LOG="$T/cap/probe.log" run
+check "$RC" 0 "sem MBP_HOST (os dois respondem): rc 0"
+has "$(cat "$T/cap/ssh.calls")" " athos@athoss-macbook-pro " "o envio fala com o nome do Tailscale"; hasnt "$(cat "$T/cap/ssh.calls")" "athoss-macbook-pro.local" "e nunca com o .local"
+check "$(mbprun_hosts)" "MBP_HOST=athos@athoss-macbook-pro" "o mbp-run (filho) recebe o MESMO host por MBP_HOST (sem sondar de novo)"
+reset; TEST_MBP_HOST= HOSTPROBE_UP="athoss-macbook-pro.local" run
+check "$RC" 0 "sem MBP_HOST, so a LAN responde: rc 0"
+has "$(cat "$T/cap/ssh.calls")" " athos@athoss-macbook-pro.local " "o envio vai a LAN (evidencia positiva, Tailscale mudo)"
+check "$(mbprun_hosts)" "MBP_HOST=athos@athoss-macbook-pro.local" "e o mbp-run recebe a LAN tambem"
+reset; TEST_MBP_HOST= HOSTPROBE_UP="" run
+check "$RC" 0 "sem MBP_HOST, nenhum responde: rc 0 (o fake ssh nao depende do host)"
+has "$(cat "$T/cap/ssh.calls")" " athos@athoss-macbook-pro " "o envio volta ao Tailscale (o padrao inerte)"; hasnt "$(cat "$T/cap/ssh.calls")" "athoss-macbook-pro.local" "nunca a LAN sem evidencia"
+check "$(mbprun_hosts)" "MBP_HOST=athos@athoss-macbook-pro" "e o mbp-run tambem"
+reset; HOSTPROBE_UP="athoss-macbook-pro.local" HOSTPROBE_LOG="$T/cap/probe.log" run
+check "$RC" 0 "MBP_HOST do chamador: rc 0"
+has "$(cat "$T/cap/ssh.calls")" " fake@mbp " "o envio usa o host do chamador"; check "$(mbprun_hosts)" "MBP_HOST=fake@mbp" "e o mbp-run tambem"
+check "$(calls probe.log)" 0 "MBP_HOST definido nunca e sondado"
+reset; TEST_MBP_HOST= HOSTPROBE_LOG="$T/cap/probe.log" run --dry-run
+check "$RC" 0 "--dry-run sem MBP_HOST: rc 0"; check "$(calls probe.log)" 0 "--dry-run nao fala com o MBP: nao sonda"
 
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"

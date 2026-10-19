@@ -24,6 +24,8 @@
 #   rodando de verdade sob bash com python/taskpolicy/renice falsos: prioridade na largada, rebaixamento no meio da execução quando o
 #   Athos volta ou pausa, sem atrasar o fim da execução nem deixar processo para trás. mbp-offload: modos do status, tarefas órfãs,
 #   JSON, total do dia (sob cada jq), pause/resume. gascity-mbp (mbp-controle.sh). MBP_SELFTEST_ONLY=presenca|chave roda só essa parte;
+#   HOST (ga-bmmxka; MBP_SELFTEST_ONLY=host roda só esta parte): sem MBP_HOST o ssh vai ao nome do Tailscale, nunca ao .local; a LAN só com a porta 22 dela respondendo
+#   e a do Tailscale muda; nada respondeu = Tailscale; MBP_HOST do chamador vale como está e nunca é sondado (a sonda é um stub: nada toca a rede).
 #   MBP_SELFTEST_SKIP=presenca pula a presença (a suíte antiga, sozinha, cabe nos 900 s do prod test do ga-9e2rjh).
 # NÓ LINUX (ga-zri39b; MBP_SELFTEST_ONLY=node roda só esta parte): a cadeia nó -> MBP -> local com os códigos 96..99 (nó fora, sem RAM, base/venv ausentes, slots cheios,
 #   ssh que cai no meio) e a bandeira própria do nó (independe do mbp-offload.on e da pausa do Athos) · o preflight do nó roda DE VERDADE contra um /proc falso
@@ -55,6 +57,7 @@ mkdir -p "$T/bin" "$T/fake" "$T/city/.gc/logs" "$T/wt/tests"
 cat > "$T/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 args="$*"
+[ -z "${STUB_ARGS_LOG:-}" ] || echo "$args" >> "$STUB_ARGS_LOG"   # ga-bmmxka: qual host o mbp-run escolheu
 # qual host é o destino: o nó Linux (hetzner-teste) ou o MBP. Cada caso liga a falha que quer por host (STUB_*_NODE / STUB_*_MBP).
 case "$args" in *hetzner-teste*) host=hetzner ;; *) host=mbp ;; esac
 if [ "${STUB_UNREACHABLE:-0}" = 1 ]; then exit 255; fi
@@ -341,6 +344,15 @@ REAL_RSYNC=$(PATH=/usr/bin:/bin:/opt/homebrew/bin command -v rsync)
 export REAL_RSYNC HETZNER_MAC_ONLY_LIST="$T/mac-only.txt" HETZNER_SHADOW_PCT=0 STUB_PROCDIR="$T/proc"
 unset MBP_MAX_SWAP_MB MBP_MAX_SWAP_GROWTH_MB MBP_SWAP_SAMPLE_S MBP_MAX_PRESSURE_LEVEL MBP_MIN_AVAIL_MB MBP_MIN_BATT MBP_MAX_SLOTS MBP_SLOT_MAX_AGE_S MBP_RUN_TIMEOUT_S MBP_HOST
 export PATH="$T/bin:$PATH" MBP_CITY="$T/city" MBP_SSH="$T/bin/ssh" MBP_RSYNC="$T/bin/rsync"
+# ga-bmmxka: sem MBP_HOST o mbp-run.sh sonda a porta 22 do MBP; aqui a sonda é um stub (HOSTPROBE_UP = hosts que "respondem"; por padrão só o
+# Tailscale), então nenhum caso depende de DNS, de nc nem do MBP de verdade.
+cat > "$T/bin/hostprobe" <<'EOF'
+#!/bin/sh
+[ -z "${HOSTPROBE_LOG:-}" ] || echo "$1 $2" >> "$HOSTPROBE_LOG"
+case " ${HOSTPROBE_UP-athoss-macbook-pro} " in *" $1 "*) exit 0 ;; esac
+exit 1
+EOF
+chmod +x "$T/bin/hostprobe"; export MBP_HOST_PROBE="$T/bin/hostprobe"
 export STUB_LOG="$T/stub.log" STUB_REAPED="$T/reaped" STUB_SWAPCNT="$T/swapcnt" FAKE="$T/fake" STUB_HOME="$T/home" STUB_SEEN="$T/seen-info" STUB_STATE_FILE="$T/presence.state"
 if [ -x /bin/bash ]; then export STUB_REMOTE_BASH=/bin/bash; else export STUB_REMOTE_BASH=bash; fi
 FLAG="$T/city/.gc/mbp-offload.on"
@@ -810,6 +822,32 @@ OKCFG="lib/changelog.d/a.json lib/silence.yml daemons/deploy_deps.json daemons/r
 HELDF="lib/leads_list.py lib/changelog.d/dump.json tests/fixtures/cpfs.json"; PASSF="lib/few.py lib/synthetic.py"
 LEAKS="$LEAKS processo_lookup/.pdpj_token.txt .netrc lib/.pgpass token.txt lib/api_token lib/access_token.json service_account.json secrets.json lib/app.keystore lib/token.pickle lib/GOOGLE_TOKEN.json lib/Secrets.YAML tests/fixtures/token.json tests/fixtures/.token tests/fixtures/secrets.yaml lib/dump.zip lib/leads.ndjson lib/notes.txt lib/shot.png run.log .runtime/s.json witness/s.json docs/mrv_artifacts/mrv_decisores.json lib.bak-1/a.py .gc-worktrees/wa-x/lib/a.py .worktrees/wa-y/lib/a.py"
 
+# Host do MBP (ga-bmmxka): sem MBP_HOST o padrão é o nome do Tailscale (a rota .local cai com a tela do MBP travada); a LAN só entra com a porta 22
+# dela respondendo e a do Tailscale muda; MBP_HOST do chamador vale como está e nunca é sondado. O stub do ssh grava os argumentos (STUB_ARGS_LOG).
+host_cases() {
+echo "--- host do MBP: Tailscale por padrão, LAN só com evidência (ga-bmmxka)"
+local al="$T/ssh-args" pl="$T/hostprobe.log" rc TSRE LANRE
+TSRE=' athos@athoss-macbook-pro( |$)'; LANRE=' athos@athoss-macbook-pro\.local( |$)'
+hostrun() { reset; : > "$al"; : > "$pl"; env "$@" STUB_ARGS_LOG="$al" HOSTPROBE_LOG="$pl" "$RUN" --remote-pause on >"$T/out" 2>"$T/err"; echo $?; }
+rc=$(hostrun HOSTPROBE_UP="athoss-macbook-pro athoss-macbook-pro.local"); expect "padrão, os dois respondem" 0 "$rc"
+has "…o ssh vai ao nome do Tailscale" "$al" "$TSRE"; hasnt "…e não ao .local" "$al" 'macbook-pro\.local'
+has "…e a sonda perguntou pela porta 22 do Tailscale" "$pl" '^athoss-macbook-pro 22$'
+rc=$(hostrun HOSTPROBE_UP="athoss-macbook-pro.local"); expect "só a LAN responde" 0 "$rc"
+has "…o ssh vai à LAN (evidência positiva)" "$al" "$LANRE"; hasnt "…e não ao Tailscale" "$al" "$TSRE"
+rc=$(hostrun HOSTPROBE_UP=""); expect "nenhum responde" 0 "$rc"
+has "…volta ao Tailscale (o padrão inerte, nunca a LAN)" "$al" "$TSRE"; hasnt "…e não ao .local" "$al" 'macbook-pro\.local'
+rc=$(hostrun HOSTPROBE_UP="athoss-macbook-pro.local" MBP_HOST=fake@mbp); expect "MBP_HOST do chamador" 0 "$rc"
+has "…vale como está" "$al" ' fake@mbp( |$)'; hasnt "…sem trocar por nenhum dos dois" "$al" 'athoss-macbook-pro'
+n=$((n+1)); if [ ! -s "$pl" ]; then echo "ok   …e nunca é sondado"; else echo "FAIL MBP_HOST do chamador foi sondado: $(cat "$pl")"; fails=$((fails+1)); fi
+# um modo de pytest (passa por use_host) agrega ao mesmo host
+reset; : > "$al"; date > "$FLAG"; rc=$(STUB_ARGS_LOG="$al" run -- tests/test_x.py); expect "pytest no MBP com o padrão" 0 "$rc"
+has "…fala com o nome do Tailscale" "$al" "$TSRE"; hasnt "…e não com o .local" "$al" 'macbook-pro\.local'
+# a sonda é preguiçosa: só quem vai falar com o MBP paga os ~2 s dela
+reset; xdist_on; date > "$FLAG"; date > "$NODEFLAG"; : > "$pl"; rc=$(HOSTPROBE_LOG="$pl" run -- tests/test_x.py); expect "pytest que roda no nó" 0 "$rc"
+n=$((n+1)); if [ ! -s "$pl" ]; then echo "ok   …não sonda o MBP (ele nem entra)"; else echo "FAIL rodou no nó e sondou o MBP: $(cat "$pl")"; fails=$((fails+1)); fi
+reset; rm -f "$FLAG" "$NODEFLAG"; : > "$pl"; rc=$(HOSTPROBE_LOG="$pl" run -- tests/test_x.py); expect "offload desligado" 99 "$rc"
+n=$((n+1)); if [ ! -s "$pl" ]; then echo "ok   …não sonda o MBP (a bandeira barra antes)"; else echo "FAIL offload desligado e sondou o MBP: $(cat "$pl")"; fails=$((fails+1)); fi
+}
 node_cases() {
 echo "--- nó Linux de testes (ga-zri39b)"
 local rc out f
@@ -1433,6 +1471,7 @@ if [ -n "${MBP_SELFTEST_ONLY:-}" ]; then
     presenca) presenca_cases; neg_presenca ;;
     chave) chave_cases ;;
     node) node_cases ;;
+    host) host_cases ;;
     semeadura) xdist_on; node_seed_cases ;;
     *) echo "MBP_SELFTEST_ONLY desconhecido: $MBP_SELFTEST_ONLY" >&2; exit 2 ;;
   esac
@@ -1641,6 +1680,7 @@ if [ "${MBP_SELFTEST_SKIP:-}" != presenca ]; then
   presenca_cases; neg_presenca
   chave_cases
 fi
+host_cases
 node_cases
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

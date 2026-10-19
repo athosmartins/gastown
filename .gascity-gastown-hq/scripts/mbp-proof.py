@@ -40,7 +40,7 @@ O QUE TOCA NO MBP (tudo sob ~/gt-remote, e só o que está aqui) E O QUE DESFAZ
            não existia). O branch worker/<rodada> no origin FICA (apagá-lo é decisão: --delete-branch).
 
 CÓDIGOS  0 tudo passou · 1 alguma prova reprovou, ou recusei instalar (config do wrapper alheia/ilegível, builder ou verify falhou) · 2 uso · 3 não consegui começar (pré-condição: MBP não livre, tmux aberto ou sem resposta) · 4 interrompida: o Athos voltou ao MBP (nada mais foi medido; a sessão é parada)
-CONFIGURAÇÃO (ambiente)  MBP_PROOF_SSH (athos@athoss-macbook-pro.local) · MBP_PROOF_HOME (/Users/athos: o home no MBP) · MBP_PROOF_SESSION (remote-test-remote-mbp-1) ·
+CONFIGURAÇÃO (ambiente)  MBP_PROOF_SSH (athos@athoss-macbook-pro, o nome do Tailscale; sem a variável, mbp-host.sh troca pela LAN .local só se ela responder e o Tailscale não) · MBP_PROOF_HOME (/Users/athos: o home no MBP) · MBP_PROOF_SESSION (remote-test-remote-mbp-1) ·
   MBP_PROOF_POLL (10: segundos entre olhadas) · MBP_PROOF_WATCH_CYCLE (5: o watch_s do provider) · MBP_PROOF_SHIM_WAIT (60: quanto esperar o atalho) · GC_SSH_BIN (o ssh, como no provider) · GC_CITY_PATH · só o selftest troca: MBP_PROOF_PROV, MBP_PROOF_PUMP,
   MBP_PROOF_PATHX, MBP_PROOF_SHIM_CLIENT, MBP_PROOF_BUILDER, MBP_PROOF_SESSION_PATH (o PATH explícito da sessão), MBP_PROOF_CLAUDE (o caminho absoluto do claude no MBP)
 """
@@ -61,7 +61,21 @@ import time
 HERE = os.path.dirname(os.path.realpath(__file__))
 CITY = os.environ.get("GC_CITY_PATH") or os.path.dirname(HERE)  # a cidade VIVA (bead, estado); o código pode vir de um worktree
 MHOME = os.environ.get("MBP_PROOF_HOME", "/Users/athos").rstrip("/")
-SSH_TARGET = os.environ.get("MBP_PROOF_SSH", "athos@athoss-macbook-pro.local")
+TS_TARGET = "athos@athoss-macbook-pro"  # o nome do Tailscale (a rota .local cai com a tela do MBP travada; ga-bmmxka)
+
+
+def default_ssh_target() -> str:
+    """Host do MBP quando MBP_PROOF_SSH não está definida: o que `mbp-host.sh` imprime (Tailscale, ou a LAN só se ela respondeu e o Tailscale não).
+    vazio → MBP_PROOF_SSH ausente: pergunta ao helper; falhou/ilegível (sem bash, rc≠0, saída que não é user@host, demora) → o nome do Tailscale."""
+    try:
+        p = subprocess.run(["bash", os.path.join(HERE, "mbp-host.sh")], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return TS_TARGET
+    out = p.stdout.strip()
+    return out if p.returncode == 0 and re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9.-]+", out) else TS_TARGET
+
+
+SSH_TARGET = os.environ.get("MBP_PROOF_SSH") or default_ssh_target()
 SESSION = os.environ.get("MBP_PROOF_SESSION", "remote-test-remote-mbp-1")
 POLL = float(os.environ.get("MBP_PROOF_POLL", "10"))
 SHIM_WAIT = float(os.environ.get("MBP_PROOF_SHIM_WAIT", "60"))

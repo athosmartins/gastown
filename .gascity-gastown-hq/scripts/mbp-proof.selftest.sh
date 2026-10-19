@@ -6,7 +6,7 @@
 # Contents
 #   Grupos · Controle negativo · Variáveis · O que NÃO prova
 #
-# GRUPOS: unit — judge_tree (todo processo com folga tem de ser rebaixado, e ao menos um tinha folga), PAUSE/CLEAN/SWEEP rodados de verdade, pedido de start, identidade, padrões de segredo ·
+# GRUPOS: unit — host padrão do MBP sem MBP_PROOF_SSH (ga-bmmxka: Tailscale, LAN só com a porta 22 respondendo, saída ilegível = Tailscale, a variável vale como está), judge_tree (todo processo com folga tem de ser rebaixado, e ao menos um tinha folga), PAUSE/CLEAN/SWEEP rodados de verdade, pedido de start, identidade, padrões de segredo ·
 #   cli — argumento com cara de comando, sessão real, install sem --apply (nada conecta), plan contra o dry-run do provider (pula sem scripts/gc-session-ssh, p.ex. no nó Linux) ·
 #   install — instalação com o builder real: bundle conferido LÁ, run/ preservada, cliente + links + config, spool 0700, nada em ~/.claude nem ~/.ssh, config do wrapper diferente = não sobrescreve, transferência adulterada = reprova sem trocar, ssh fora / MBP não livre = 3 ·
 #   e2e — a prova inteira (a–e) contra o MBP falso, com modos de falha: cada prova reprova sozinha, o diálogo NUNCA é respondido, a sessão é parada em todo caminho, a pausa do Athos nunca é removida por nós, e o MBP volta ao que era (arquivos, ~/.claude.json, ~/.ssh, spool, bundle)
@@ -456,6 +456,21 @@ put("#!/usr/bin/env python3\nrequest = {\"stdin_b64\": 1}\n"); r=run([U+"/sp"]);
 put([{"stdout_b64":b(SEC)}]); r=run([U+"/sp"]); assert [h[0] for h in r["hits"]]==[f+"#/0/stdout_b64"], r
 put({"stdout_b64":b(SEC)}); sk=json.dumps({"roots":[U+"/sp"],"globs":[],"secret_rx":M.SECRET_RX,"forbidden":M.FORBIDDEN,"skip":{f:[M.SECRET_RX[0]]}})
 r=json.loads(subprocess.run(["python3","-I","-",sk],input=M.SWEEP.encode(),capture_output=True).stdout.decode().strip().split("\n")[-1]); assert r["hits"]==[], r'; ok $? "unit: SWEEP — olha DENTRO do base64 do spool: segredo em stdin_b64/stdout_b64/stderr_b64 e no cmd (rs1 + base64 url-safe) é achado e dito em qual campo; campo que não decodifica, que não é texto, ou JSON cortado vira \"sem verificar\" (terceiro estado); arquivo que não é JSON não conta; o que não tem segredo continua limpo"; }
+
+  # ga-bmmxka: host padrão do MBP (sem MBP_PROOF_SSH) = o que o mbp-host.sh imprime; falhou/ilegível = o nome do Tailscale. A sonda é um stub: nada toca a rede.
+  printf '#!/bin/sh\n[ -z "${HOSTPROBE_LOG:-}" ] || echo "$1 $2" >> "$HOSTPROBE_LOG"\ncase " ${HOSTPROBE_UP:-} " in *" $1 "*) exit 0 ;; esac\nexit 1\n' > "$T/hostprobe"; chmod +x "$T/hostprobe"
+  c host-default && { MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro athoss-macbook-pro.local" MBP_PROOF_SSH= py '
+assert M.SSH_TARGET == "athos@athoss-macbook-pro", M.SSH_TARGET
+assert M.default_ssh_target() == "athos@athoss-macbook-pro"'; ok $? "unit: host padrão — sem MBP_PROOF_SSH (vazia vale como ausente) e com o Tailscale respondendo, o alvo é o nome do Tailscale, nunca o .local"; }
+  c host-lan && { MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" MBP_PROOF_SSH= py '
+assert M.SSH_TARGET == "athos@athoss-macbook-pro.local", M.SSH_TARGET'; ok $? "unit: host padrão — o Tailscale mudo e a LAN respondendo (evidência positiva): o alvo é o .local"; }
+  c host-none && { MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="" MBP_PROOF_SSH= py '
+assert M.SSH_TARGET == "athos@athoss-macbook-pro", M.SSH_TARGET'; ok $? "unit: host padrão — nenhum responde: volta ao nome do Tailscale (o padrão inerte, nunca a LAN)"; }
+  c host-junk && { MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="x;y" MBP_TS_HOST="x;y" MBP_PROOF_SSH= py '
+assert M.default_ssh_target() == M.TS_TARGET == "athos@athoss-macbook-pro", M.default_ssh_target()'; ok $? "unit: host padrão — saída do helper que não é user@host (ilegível) cai no nome do Tailscale, nunca vira alvo do ssh"; }
+  c host-explicit && { : > "$T/hostprobe.log"; MBP_HOST_PROBE="$T/hostprobe" HOSTPROBE_UP="athoss-macbook-pro.local" HOSTPROBE_LOG="$T/hostprobe.log" MBP_PROOF_SSH="u@alvo" py '
+assert M.SSH_TARGET == "u@alvo", M.SSH_TARGET
+assert open(M.os.environ["HOSTPROBE_LOG"]).read() == "", "MBP_PROOF_SSH definida foi sondada"'; ok $? "unit: host padrão — MBP_PROOF_SSH definida vale como está e nunca é sondada"; }
 }
 
 # ---------------------------------------------------------------- cli
@@ -660,11 +675,14 @@ open(sys.argv[4], "w").write(s.replace(old, new))' "$P" "$1" "$2" "$3"
   }
   mutant() {  # mutant GRUPO CASOS DESCRIÇÃO OLD NEW
     group "$1" || return 0
-    local m="$T/mut.$RANDOM" r; mkdir -p "$m"
+    local m="$T/mut.$RANDOM" r; mkdir -p "$m"; ln -s "$HERE/mbp-host.sh" "$m/mbp-host.sh"   # (ga-bmmxka: o mbp-proof.py pergunta o host ao helper que fica ao lado dele)
     if ! mutate "$4" "$5" "$m/mbp-proof.py" 2> "$T/muterr"; then ok 1 "mutante '$3': $(cat "$T/muterr")"; return; fi
     r=$(MBPT_MUTANT=1 MBPT_T="$T" MBPT_ONLY="$1" MBPT_CASES="$2" MBPT_UNDER_TEST="$m/mbp-proof.py" bash "$0" 2>&1 | tail -1)
     case "$r" in "RESULT 0/0") ok 1 "mutante '$3': nenhum caso rodou ($r)";; "RESULT 0/"*) ok 1 "mutante '$3' NÃO foi pego ($r)";; "RESULT "*) ok 0 "mutante '$3' pego ($r)";; *) ok 1 "mutante '$3': execução sem resultado ($r)";; esac
   }
+  mutant unit host-junk "o alvo padrão aceita saída do helper sem validar" 'return out if p.returncode == 0 and re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9.-]+", out) else TS_TARGET' 'return out or TS_TARGET'
+  mutant unit host-junk "o fallback do alvo padrão volta ao .local" 'TS_TARGET = "athos@athoss-macbook-pro"' 'TS_TARGET = "athos@athoss-macbook-pro.local"'
+  mutant unit host-explicit "MBP_PROOF_SSH definida deixa de valer" 'SSH_TARGET = os.environ.get("MBP_PROOF_SSH") or default_ssh_target()' 'SSH_TARGET = default_ssh_target()'
   mutant unit judge-one "judge_tree aceita processo sem rebaixar" 'if (x["ni"] < 19 and y["ni"] < 19) or y["ni"] < x["ni"]:' 'if False:'
   mutant unit judge-up "judge_tree deixa a prioridade ser devolvida" 'if (x["ni"] < 19 and y["ni"] < 19) or y["ni"] < x["ni"]:' 'if x["ni"] < 19 and y["ni"] < 19:'
   mutant unit judge-room "judge_tree passa sem ninguém ter folga" '    if not room:' '    if False:'
