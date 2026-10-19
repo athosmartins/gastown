@@ -9,7 +9,7 @@
 # CONTROLE NEGATIVO: cada mutante (um trecho literal do script trocado, que tem de existir UMA vez) TEM de reprovar o grupo que o pega; mutante que passa = teste que não pega o bug. Só roda sem argumento e com o script de verdade.
 #   Cada mutante roda em segundo plano com o PRÓPRIO diretório temporário e para no 1º caso que reprova (o resto do grupo não diz nada de novo): sem isso eram ~80 grupos inteiros em série, mais de 10 min.
 # COMO RODAR: hetzner-occupancy-watch.selftest.sh [grupo ...]   (sem argumento: todos os grupos e o controle negativo). HETZNER_OCC_UNDER_TEST=<script> roda a suíte contra outra cópia.
-#   HOCC_JOBS=N mutantes ao mesmo tempo (padrão 4; 1 = em série) · HOCC_NO_MUTANTS=1 pula o controle negativo (183 dos 236 casos, ~20 s no Linux). Tudo: ~80 s no Linux; no mini, sob carga, ~7 min (medido pelo gate em 19/10).
+#   HOCC_JOBS=N mutantes ao mesmo tempo (padrão 4; 1 = em série) · HOCC_NO_MUTANTS=1 pula o controle negativo (183 dos 237 casos, ~20 s no Linux). Tudo: ~80 s no Linux; no mini, sob carga, ~7 min (medido pelo gate em 19/10).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCH="${HETZNER_OCC_UNDER_TEST:-$HERE/hetzner-occupancy-watch.py}"
@@ -360,7 +360,7 @@ g_saida() {
   eq "uma linha por execução" 3 "$(wc -l < "$jl" | tr -d ' ')"
   last_line "$jl"
   eq "JSONL: estado da última" ocupado "$(jv "$T/last.json" estado)"; eq "JSONL: epoch" "$NOW" "$(jv "$T/last.json" epoch)"
-  check "JSONL: ts no fuso local (-0300)" "$([ "$(jv "$T/last.json" ts | tail -c 6)" = "-0300" ] && echo 1 || echo 0)"
+  eq "JSONL: ts = a hora LOCAL do epoch com o deslocamento (12:45 em SP; hora UTC com sufixo local não passa)" "2026-10-19T12:45:00-0300" "$(jv "$T/last.json" ts)"
 
   fresh "$(epoch_of 2026 10 19 23 20 0)"
   tick 900 5 >/dev/null; tick 900 5; tick 900 200; tick 900 5; STUB_SSH_RC=255; tick 900 5; tick 86400 5
@@ -518,6 +518,8 @@ g_mutantes() {
   mutante diario-sem-decisao-vira-zero "saida" $'if dec else None' $'if dec else 0.0'
   mutante dia-em-utc "saida" $'time.strftime("%Y-%m-%d", time.localtime(now))' $'time.strftime("%Y-%m-%d", time.gmtime(now))'
   mutante ts-em-utc "saida" $'"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))' $'"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.gmtime(now))'
+  # ts-em-utc sobreviveu no mini (Mayor, 19/10, 235/236): o caso só olhava o sufixo -0300. Se lá o %z de um gmtime sai com o deslocamento LOCAL, a hora em UTC passa com o sufixo certo; este mutante é essa forma, igual em qualquer sistema.
+  mutante ts-hora-utc-sufixo-local "saida" $'"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))' $'"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + time.strftime("%z", time.localtime(now))'
   mutante corrompido-nao-guarda-a-copia "saida" $'os.replace(path, dest)' $'pass'
   mutante sem-instancia-unica "saida" $'if not dry and take_lock(c.gc_dir) is None:' $'if False:'
   mutante lock-bloqueante "saida" $'fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)' $'fcntl.flock(fd, fcntl.LOCK_EX)'
