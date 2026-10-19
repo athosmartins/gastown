@@ -12,7 +12,7 @@ marcador de uma linha; `grep -n 'td:' <este arquivo>` lista os pontos de entrada
 - Guardadas por papel (TD_ROLE; agente sem TD_ROLE recebe tudo): mockup-s3 · graph-v2-formulas ·
   engine-window-patch · nudge-permission-dialog · research-only-channels ·
   next-action-mayor-waiting · assignee-when-building · claudemd-carryover ·
-  dolt-cleanup-hazards · e12-write-time-doctrine (GERADA por e12-crew-doctrine.sh a partir do e12_block_text; não edite o corpo à mão) ·
+  dolt-cleanup-hazards · e12-write-time-doctrine (título: Write-time doctrine — experiment E12 (ga-4q2zo5); GERADA por e12-crew-doctrine.sh a partir do e12_block_text; não edite o corpo à mão) ·
   witness-startup
 */ -}}
 {{/* td:core:intro */ -}}
