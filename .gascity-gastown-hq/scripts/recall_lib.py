@@ -27,8 +27,11 @@ location derived from GC_CITY_PATH (same convention as every other gc
 script — see e.g. scripts/gate-health-monitor.py) so `recall` gives the
 same shared index regardless of which worktree/cwd invokes it:
 
-    $GC_CITY_PATH/.gc/recall-index/    embeddings + bead metadata
+    $GC_CITY_PATH/.gc/recall-index/    embeddings + bead metadata, as immutable
+                                        generations (gen-*/ holding the 4 index
+                                        files) + a CURRENT pointer file (ga-m1sa2l)
     $GC_CITY_PATH/.gc/logs/recall-usage.jsonl   instrumentation (one line/call)
+    $GC_CITY_PATH/.gc/logs/recall-index-events.jsonl   why an index was rebuilt
     $GC_CITY_PATH/.gc/recall-venv/     the python env (sentence-transformers,
                                         tiktoken, numpy) recall.py runs under
 
@@ -42,6 +45,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -57,6 +62,18 @@ STORES = {"HQ": GC_CITY_PATH, "WA": WA_STORE_PATH}
 
 INDEX_DIR = Path(GC_CITY_PATH) / ".gc" / "recall-index"
 LOG_PATH = Path(GC_CITY_PATH) / ".gc" / "logs" / "recall-usage.jsonl"
+INDEX_EVENT_LOG = Path(GC_CITY_PATH) / ".gc" / "logs" / "recall-index-events.jsonl"
+
+CURRENT_POINTER = "CURRENT"                # names the published generation dir
+GEN_PRUNE_GRACE_SECONDS = 10 * 60          # a superseded generation outlives its
+                                            # replacement by at least this long
+                                            # (pruning runs on the next save), so a reader
+                                            # that resolved CURRENT just before the
+                                            # swap (loading takes seconds) still
+                                            # finds its files
+HEAVY_GUARD_TIMEOUT_S = 30
+_GEN_NAME_RE = re.compile(r"^gen-[0-9A-Za-z_-]+$")
+_FLAT_INDEX_FILES = ("corpus.json", "chunk_vecs.npy", "chunk_bead_idx.json", "index_meta.json")
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 120
@@ -199,7 +216,19 @@ def chunk_words(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
 # ---------------------------------------------------------------------------
 # Model loading (lazy — this is the expensive import/load)
 # ---------------------------------------------------------------------------
-class RecallModelUnavailableError(RuntimeError):
+class RecallUnavailableError(RuntimeError):
+    """recall could not search at all (CLI exit 3) -- as opposed to searching
+    and finding nothing (exit 0). Base of the two reasons below."""
+
+
+class RecallIndexRebuildDeferred(RecallUnavailableError):
+    """The on-disk index is unusable and has to be rebuilt from scratch, but
+    the disk guard (scripts/heavy-guard.sh, ga-vln2py) did not allow that
+    heavy step right now -- or could not be asked. Nothing was changed on
+    disk; run recall again once the disk has room."""
+
+
+class RecallModelUnavailableError(RecallUnavailableError):
     """The embedding model could not be loaded — cache miss under offline
     mode AND the one-time online fetch also failed. Raised instead of
     letting the raw huggingface_hub/transformers traceback surface, so
@@ -427,33 +456,113 @@ class RecallIndex:
         self.chunk_vecs = chunk_vecs        # np.ndarray (n_chunks, dim) float32
         self.chunk_bead_idx = chunk_bead_idx  # np.ndarray (n_chunks,) int -> corpus index
         self.meta = meta                    # dict of index metadata
+        self.gen_dir = None                 # generation dir it was loaded from / last saved to
+
+
+# The index is four files that only mean something TOGETHER (vector row i
+# belongs to bead chunk_bead_idx[i] of corpus). ga-m1sa2l: they used to be
+# replaced one by one in the shared dir, so a writer that stopped between two
+# replaces -- or two writers interleaving -- left new vectors next to an old
+# bead_idx (live: 98401 rows vs 97765 entries, corpus 6479 vs meta 6453) and
+# every `recall` crashed. Each _atomic_write is atomic; the SET was not.
+# Now a save writes a whole new immutable generation dir (gen-*/) and
+# publishes it with ONE atomic rename of the CURRENT pointer file, so a reader
+# sees the old index or the new one, never a blend, and two writers never
+# share a directory. A flat-layout index (pre-generations) is still read.
+def _index_files(base: Path) -> dict:
+    return {
+        "corpus": base / "corpus.json",
+        "vecs": base / "chunk_vecs.npy",
+        "bead_idx": base / "chunk_bead_idx.json",
+        "meta": base / "index_meta.json",
+    }
+
+
+def _read_current_pointer():
+    """-> (generation dir, problem). (None, None): no pointer published (first
+    run, or the flat layout); (dir, None): the published generation;
+    (None, "<why>"): a pointer exists but is unusable -- damage, not first run."""
+    pointer = INDEX_DIR / CURRENT_POINTER
+    try:
+        # vazio → problema "nome inválido" (índice corrompido, não 1ª execução); ausente → (None, None) 1ª execução/layout antigo; ilegível → problema (corrompido), nunca "sem índice"
+        name = pointer.read_text().strip()
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError) as e:
+        return None, f"CURRENT pointer unreadable ({e})"
+    if not _GEN_NAME_RE.match(name):
+        return None, f"CURRENT pointer holds an invalid generation name {name!r}"
+    gen = INDEX_DIR / name
+    if not gen.is_dir():
+        return None, f"CURRENT points to missing generation {name}"
+    return gen, None
 
 
 def _paths():
-    return {
-        "corpus": INDEX_DIR / "corpus.json",
-        "vecs": INDEX_DIR / "chunk_vecs.npy",
-        "bead_idx": INDEX_DIR / "chunk_bead_idx.json",
-        "meta": INDEX_DIR / "index_meta.json",
-    }
+    """Files of the index load_index() would read right now: the published
+    generation, else the legacy flat layout."""
+    gen, _ = _read_current_pointer()
+    return _index_files(gen if gen is not None else INDEX_DIR)
+
+
+def index_inconsistency(corpus, chunk_vecs, chunk_bead_idx, meta):
+    """Why these four parts cannot be one index, or None when they can.
+    Pure (no I/O). Persisted counts missing from meta are not held against an
+    index (older metas); counts that are there must match the arrays."""
+    import numpy as np
+    vecs_shape = getattr(chunk_vecs, "shape", None)
+    if vecs_shape is None or len(vecs_shape) != 2:
+        return f"chunk_vecs is not a 2-D matrix (shape={vecs_shape})"
+    n_vecs, n_bead_idx, n_corpus = vecs_shape[0], len(chunk_bead_idx), len(corpus)
+    if n_vecs != n_bead_idx:
+        return f"chunk_vecs has {n_vecs} rows but chunk_bead_idx has {n_bead_idx} entries"
+    if n_bead_idx:
+        lo, hi = int(np.min(chunk_bead_idx)), int(np.max(chunk_bead_idx))
+        if lo < 0 or hi >= n_corpus:
+            return f"chunk_bead_idx spans [{lo}, {hi}] but the corpus has {n_corpus} beads"
+    for key, actual in (("n_beads", n_corpus), ("n_chunks", n_bead_idx)):
+        recorded = (meta or {}).get(key)
+        if recorded is not None and recorded != actual:
+            return f"index_meta.{key}={recorded} but the files hold {actual}"
+    return None
+
+
+def _log_index_event(kind: str, detail: str) -> None:
+    """One JSON line saying why an index was thrown away. Best effort: a log
+    line must never be the reason recall fails."""
+    rec = {"ts": now_iso(), "event": kind, "detail": detail, "pid": os.getpid()}
+    try:
+        INDEX_EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(INDEX_EVENT_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
 
 
 def load_index(progress=lambda msg: None):
     """Returns a RecallIndex, or None if no index has been built yet OR the
-    on-disk index is corrupted/unreadable (ga-zy725: a disk-full mid-write
-    truncated chunk_vecs.npy — 640 of 12,647,040 elements missing — and
-    np.load raised on every subsequent call, with no self-heal; `recall
+    on-disk index is corrupted/unreadable/inconsistent (ga-zy725: a disk-full
+    mid-write truncated chunk_vecs.npy — 640 of 12,647,040 elements missing —
+    and np.load raised on every subsequent call, with no self-heal; `recall
     --rebuild` couldn't recover either, since this function ran, and raised,
     before the rebuild flag was ever consulted). Either way the caller
     (ensure_index) already knows how to recover from None: treat it as "no
     usable cache, build fresh from bd" — it doesn't need to know *why* the
-    cache was unusable, only that it was. save_index() below writes via
-    tmp+rename so a live process being killed mid-write can no longer
-    produce a truncated file in the first place; this is the complementary
-    half — self-heal from a corrupt file left behind by the OLD non-atomic
-    writer, or from any other on-disk damage."""
-    p = _paths()
+    cache was unusable, only that it was. save_index() below publishes whole
+    generations atomically so a live process being killed mid-write can no
+    longer produce a truncated or mixed index in the first place; this is
+    the complementary half — self-heal from damage left behind by the OLD
+    non-atomic writer, or from any other on-disk damage. Files that all
+    load but do not belong together (ga-m1sa2l: vector rows != bead_idx
+    entries) count as damage too: they used to load fine and crash later."""
+    gen, problem = _read_current_pointer()
+    if problem:
+        progress(f"recall: on-disk index is corrupted/unreadable ({problem}) -- rebuilding from scratch")
+        return None
+    p = _index_files(gen if gen is not None else INDEX_DIR)
     if not all(path.exists() for path in p.values()):
+        if gen is not None:  # published generations are written whole: a hole is damage
+            progress(f"recall: on-disk index is corrupted/unreadable (generation {gen.name} is missing files) -- rebuilding from scratch")
         return None
     import numpy as np
     try:
@@ -464,7 +573,14 @@ def load_index(progress=lambda msg: None):
     except (OSError, ValueError, EOFError, json.JSONDecodeError) as e:
         progress(f"recall: on-disk index is corrupted/unreadable ({e}) -- rebuilding from scratch")
         return None
-    return RecallIndex(corpus, vecs, bead_idx, meta)
+    why = index_inconsistency(corpus, vecs, bead_idx, meta)
+    if why:
+        progress(f"recall: on-disk index is inconsistent ({why}) -- rebuilding from scratch")
+        _log_index_event("inconsistent_index_on_load", why)
+        return None
+    idx = RecallIndex(corpus, vecs, bead_idx, meta)
+    idx.gen_dir = gen
+    return idx
 
 
 def _atomic_write(path: Path, write_fn) -> None:
@@ -487,14 +603,82 @@ def _atomic_write(path: Path, write_fn) -> None:
 
 
 def save_index(idx: RecallIndex) -> None:
+    """Publish `idx` as a NEW generation: write all four files into a private
+    gen-*/ dir, then move CURRENT to it with one atomic rename. Dying at any
+    point before that rename leaves the previous generation published and
+    untouched; the half-written dir is removed (or, if we were killed outright,
+    pruned later by age). Refuses an index whose parts do not belong together,
+    so a broken one can never be re-stamped as fresh (ga-m1sa2l)."""
     import numpy as np
+    why = index_inconsistency(idx.corpus, idx.chunk_vecs, idx.chunk_bead_idx, idx.meta)
+    if why:
+        raise ValueError(f"refusing to persist an inconsistent recall index: {why}")
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    p = _paths()
-    _atomic_write(p["corpus"], lambda f: f.write(json.dumps(idx.corpus).encode()))
-    _atomic_write(p["vecs"], lambda f: np.save(f, idx.chunk_vecs.astype(np.float32)))
-    bead_idx_list = idx.chunk_bead_idx.tolist() if hasattr(idx.chunk_bead_idx, "tolist") else list(idx.chunk_bead_idx)
-    _atomic_write(p["bead_idx"], lambda f: f.write(json.dumps(bead_idx_list).encode()))
-    _atomic_write(p["meta"], lambda f: f.write(json.dumps(idx.meta, indent=2).encode()))
+    previous, _ = _read_current_pointer()  # ausente/ilegível → None: nada a aposentar, só não há geração anterior
+    gen_name = "gen-%s-%d-%s" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid(), secrets.token_hex(4))
+    gen = INDEX_DIR / gen_name
+    gen.mkdir()
+    try:
+        p = _index_files(gen)
+        _atomic_write(p["corpus"], lambda f: f.write(json.dumps(idx.corpus).encode()))
+        _atomic_write(p["vecs"], lambda f: np.save(f, idx.chunk_vecs.astype(np.float32)))
+        bead_idx_list = idx.chunk_bead_idx.tolist() if hasattr(idx.chunk_bead_idx, "tolist") else list(idx.chunk_bead_idx)
+        _atomic_write(p["bead_idx"], lambda f: f.write(json.dumps(bead_idx_list).encode()))
+        _atomic_write(p["meta"], lambda f: f.write(json.dumps(idx.meta, indent=2).encode()))
+        _atomic_write(INDEX_DIR / CURRENT_POINTER, lambda f: f.write(gen_name.encode()))
+    except BaseException:
+        shutil.rmtree(gen, ignore_errors=True)
+        raise
+    idx.gen_dir = gen
+    if previous is not None and previous != gen:
+        try:
+            os.utime(previous)  # start the previous generation's grace period NOW, not at its last write
+        except OSError:
+            pass  # already gone: nothing to protect
+    _prune_generations(keep=gen)
+
+
+def save_index_meta(idx: RecallIndex) -> None:
+    """Persist only index_meta.json -- what the 'nothing new' branch needs to
+    move the throttle timestamp. Pre-ga-m1sa2l that branch re-saved the whole
+    index (~240 MB) for one number, which also re-stamped a broken index as
+    fresh. An index that never came from a generation on disk is published
+    whole instead (that is also the one-time migration off the flat layout)."""
+    gen = idx.gen_dir
+    if gen is None:
+        save_index(idx)
+        return
+    try:
+        _atomic_write(_index_files(gen)["meta"], lambda f: f.write(json.dumps(idx.meta, indent=2).encode()))
+    except OSError:
+        # falhou → keep the old timestamp (the next call simply re-checks); a
+        # generation pruned under us must not be resurrected or raise
+        pass
+
+
+def _prune_generations(keep: Path) -> None:
+    """Best-effort tidy-up AFTER CURRENT moved: drop superseded generations
+    older than the grace period, orphaned unpublished ones (killed writers),
+    and the pre-generation flat files. Touches only names this module creates;
+    never `keep`, never whatever CURRENT names right now (another writer may
+    have published after us). A failure here costs disk, never correctness."""
+    live, _ = _read_current_pointer()  # ausente/ilegível → None: só `keep` fica protegido
+    now = time.time()
+    try:
+        entries = list(INDEX_DIR.iterdir())  # vazio → nada a podar; falhou → pula a poda
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry == keep or entry == live:
+                continue
+            if entry.is_dir() and _GEN_NAME_RE.match(entry.name):
+                if now - entry.stat().st_mtime >= GEN_PRUNE_GRACE_SECONDS:
+                    shutil.rmtree(entry, ignore_errors=True)
+            elif entry.is_file() and entry.name.removesuffix(".tmp") in _FLAT_INDEX_FILES:
+                entry.unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
 # ---------------------------------------------------------------------------
@@ -510,13 +694,42 @@ def _chunks_for_corpus(corpus: list):
     return chunk_texts, chunk_idx
 
 
+def _require_heavy_step_allowed(what: str) -> None:
+    """A from-scratch build embeds every chunk and rewrites the whole index:
+    a heavy step in the sense of scripts/heavy-guard.sh (ga-vln2py, 17/10: heavy
+    steps run with the disk already low filled it and Dolt took ENOSPC). Ask
+    the guard; raise RecallIndexRebuildDeferred on anything but a clear yes
+    (rc 75 low disk, rc 76 cannot read the disk, any other rc, cannot run it)
+    -- under doubt the inert state is 'do not start'. A checkout without the
+    guard script has nobody to ask and proceeds."""
+    guard = Path(GC_CITY_PATH) / "scripts" / "heavy-guard.sh"
+    if not guard.exists():
+        return
+    try:
+        proc = subprocess.run([str(guard), "--check", "--what", what],
+                              capture_output=True, text=True, timeout=HEAVY_GUARD_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RecallIndexRebuildDeferred(
+            f"recall needs to rebuild its index from scratch ({what}) but could not ask the disk "
+            f"guard {guard} ({e}); nothing was changed -- try again later") from e
+    if proc.returncode != 0:
+        detail = (proc.stdout + proc.stderr).strip()[-400:]
+        raise RecallIndexRebuildDeferred(
+            f"recall needs to rebuild its index from scratch ({what}) but the disk guard did not "
+            f"allow it (rc {proc.returncode}): {detail}\nnothing was changed -- run recall again "
+            f"once the disk has room")
+
+
 def build_full_index(progress=lambda msg: None) -> "RecallIndex":
     """Cold-start build: fetch closed beads (both stores) within
     MAX_AGE_DAYS, telemetry-filter, fetch full text for survivors,
     chunk+embed. First-ever run only — subsequent invocations use
-    update_index_if_stale for cheap incremental refresh."""
+    update_index_if_stale for cheap incremental refresh. Also the self-heal
+    for an index that failed to load or turned out inconsistent; raises
+    RecallIndexRebuildDeferred when the disk guard says not now."""
     import numpy as np
 
+    _require_heavy_step_allowed("recall index rebuild (embed every chunk, rewrite the index)")
     model = load_model()
     cutoff = _cutoff_iso()
     corpus = []
@@ -600,12 +813,31 @@ def should_rebuild(meta: dict, new_real_count: int, now: float = None) -> bool:
     return age_triggered or count_triggered
 
 
+def _rebuild_from_scratch(reason: str, progress) -> "RecallIndex":
+    progress(f"recall: index is inconsistent ({reason}) -- rebuilding from scratch")
+    _log_index_event("rebuild_inconsistent_index", reason)
+    new_idx = build_full_index(progress=progress)
+    save_index(new_idx)
+    return new_idx
+
+
 def update_index_if_stale(idx: "RecallIndex", force: bool = False, progress=lambda msg: None):
     """Throttled staleness check + incremental update. Returns (idx,
     changed: bool). At most one bd round-trip per store per
     STALENESS_CHECK_MIN_INTERVAL_SECONDS city-wide, regardless of how often
     `recall` is invoked (Dolt is documented-sensitive to poll frequency in
-    this repo)."""
+    this repo).
+
+    First of all (ga-m1sa2l) the index must be one index: vectors, bead_idx,
+    corpus and meta that disagree used to crash prune_and_reindex -- or, on the
+    throttled early return below, hybrid_retrieve -- on every call. An index
+    that does not hold together is rebuilt from scratch instead, ignoring the
+    throttle (it cannot answer anything); a rebuild the disk guard defers
+    raises RecallIndexRebuildDeferred rather than returning the broken one."""
+    why = index_inconsistency(idx.corpus, idx.chunk_vecs, idx.chunk_bead_idx, idx.meta)
+    if why:
+        return _rebuild_from_scratch(why, progress), True
+
     now = time.time()
     meta = idx.meta
     last_check = meta.get("last_staleness_check_at", 0)
@@ -635,7 +867,7 @@ def update_index_if_stale(idx: "RecallIndex", force: bool = False, progress=lamb
     meta["last_staleness_check_at"] = now
 
     if not force and not should_rebuild(meta, total_new_real, now=now):
-        save_index(idx)  # persist the throttle timestamp even on a no-op check
+        save_index_meta(idx)  # persist the throttle timestamp even on a no-op check (meta only)
         return idx, False
 
     progress(f"recall: refreshing index (new_real_beads={total_new_real}) ...")

@@ -376,6 +376,477 @@ class TestIndexPersistenceAtomicity(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Index consistency + generation-atomic persistence (ga-m1sa2l).
+#
+# Live shape that made `recall` crash on every call (18/10): chunk_vecs.npy had
+# 98401 rows, chunk_bead_idx.json 97765 entries, corpus.json 6479 beads while
+# index_meta.json said 6453 -- four files from different generations, because
+# save_index() replaced them one by one (each replace atomic, the SET not) and
+# load_index() never compared them. The failure surfaced in prune_and_reindex
+# (IndexError) -- but hybrid_retrieve would have broken on the same index in
+# the throttled path that never reaches prune.
+# ---------------------------------------------------------------------------
+def _make_index(n_beads: int, chunks_per_bead: int, fill: float):
+    """Small consistent index. `fill` is the value of every vector, so a test
+    can tell which generation a loaded index came from."""
+    import numpy as np
+    corpus = [{"id": f"ga-{fill:g}-{i}", "store": "HQ", "title": "t", "description": "", "comments": [],
+               "close_reason": "", "closed_at": "2026-08-01T00:00:00Z", "issue_type": "bug",
+               "priority": 2, "_ntok_full": 1} for i in range(n_beads)]
+    bead_idx = np.repeat(np.arange(n_beads, dtype=np.int64), chunks_per_bead)
+    vecs = np.full((len(bead_idx), 4), fill, dtype=np.float32)
+    meta = {"schema_version": rl.SCHEMA_VERSION, "n_beads": n_beads, "n_chunks": len(bead_idx),
+            "last_build_at": 1000.0, "last_staleness_check_at": 1000.0,
+            "hwm_closed_at": {"HQ": "2026-08-01T00:00:00Z"}, "list_render_tokens": 10}
+    return rl.RecallIndex(corpus, vecs, bead_idx, meta)
+
+
+class TestIndexInconsistency(unittest.TestCase):
+    def _parts(self, idx):
+        return idx.corpus, idx.chunk_vecs, idx.chunk_bead_idx, idx.meta
+
+    def test_consistent_index_reports_nothing(self):
+        self.assertIsNone(rl.index_inconsistency(*self._parts(_make_index(3, 2, 1.0))))
+
+    def test_vecs_rows_vs_bead_idx_length_is_reported_with_both_numbers(self):
+        """The exact live failure: 98401 vector rows against 97765 bead_idx."""
+        import numpy as np
+        idx = _make_index(3, 2, 1.0)
+        idx.chunk_vecs = np.vstack([idx.chunk_vecs, np.ones((2, 4), dtype=np.float32)])  # 8 rows vs 6
+        why = rl.index_inconsistency(*self._parts(idx))
+        self.assertIsNotNone(why)
+        self.assertIn("8", why)
+        self.assertIn("6", why)
+
+    def test_bead_idx_pointing_past_the_corpus_is_reported(self):
+        idx = _make_index(3, 2, 1.0)
+        idx.corpus = idx.corpus[:2]  # bead_idx still references bead 2
+        self.assertIsNotNone(rl.index_inconsistency(*self._parts(idx)))
+
+    def test_negative_bead_idx_is_reported(self):
+        idx = _make_index(3, 2, 1.0)
+        idx.chunk_bead_idx[0] = -1  # numpy would silently wrap this to the last bead
+        self.assertIsNotNone(rl.index_inconsistency(*self._parts(idx)))
+
+    def test_meta_counts_disagreeing_with_the_arrays_are_reported(self):
+        """Live: corpus.json had 6479 beads while index_meta.json said 6453."""
+        idx = _make_index(3, 2, 1.0)
+        idx.meta["n_beads"] = 2
+        self.assertIn("n_beads", rl.index_inconsistency(*self._parts(idx)))
+        idx = _make_index(3, 2, 1.0)
+        idx.meta["n_chunks"] = 99
+        self.assertIn("n_chunks", rl.index_inconsistency(*self._parts(idx)))
+
+    def test_meta_without_counts_is_not_held_against_the_index(self):
+        idx = _make_index(3, 2, 1.0)
+        del idx.meta["n_beads"], idx.meta["n_chunks"]
+        self.assertIsNone(rl.index_inconsistency(*self._parts(idx)))
+
+    def test_vecs_that_are_not_a_matrix_are_reported(self):
+        import numpy as np
+        idx = _make_index(3, 2, 1.0)
+        idx.chunk_vecs = np.ones(6, dtype=np.float32)
+        self.assertIsNotNone(rl.index_inconsistency(*self._parts(idx)))
+
+    def test_empty_index_is_consistent(self):
+        self.assertIsNone(rl.index_inconsistency(*self._parts(_make_index(0, 1, 1.0))))
+
+
+class _IndexDirCase(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.index_dir = Path(self._tmpdir.name) / "recall-index"
+        self.event_log = Path(self._tmpdir.name) / "logs" / "recall-index-events.jsonl"
+        self._patchers = [mock.patch.object(rl, "INDEX_DIR", self.index_dir),
+                          mock.patch.object(rl, "INDEX_EVENT_LOG", self.event_log)]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        self._tmpdir.cleanup()
+
+    def events(self):
+        if not self.event_log.exists():
+            return []
+        return [json.loads(line) for line in self.event_log.read_text().splitlines() if line.strip()]
+
+    def assertSameIndex(self, a, b):
+        self.assertIsNotNone(a)
+        self.assertEqual(a.corpus, b.corpus)
+        self.assertEqual(a.chunk_vecs.tolist(), b.chunk_vecs.tolist())
+        self.assertEqual(a.chunk_bead_idx.tolist(), b.chunk_bead_idx.tolist())
+        self.assertEqual(a.meta, b.meta)
+
+
+class TestLoadIndexRejectsInconsistentFiles(_IndexDirCase):
+    def _write_flat_mixed_layout(self):
+        """Hand-built copy of the live failure, in the pre-generation flat
+        layout: new vectors and corpus next to an old bead_idx and meta."""
+        import numpy as np
+        old, new = _make_index(3, 2, 1.0), _make_index(4, 2, 2.0)
+        self.index_dir.mkdir(parents=True)
+        (self.index_dir / "corpus.json").write_text(json.dumps(new.corpus))
+        np.save(self.index_dir / "chunk_vecs.npy", new.chunk_vecs)
+        (self.index_dir / "chunk_bead_idx.json").write_text(json.dumps(old.chunk_bead_idx.tolist()))
+        (self.index_dir / "index_meta.json").write_text(json.dumps(old.meta))
+
+    def test_mixed_generations_load_as_none_with_a_reason(self):
+        self._write_flat_mixed_layout()
+        messages = []
+        idx = rl.load_index(progress=messages.append)
+        self.assertIsNone(idx)  # pre-fix: returned the mixed index and the next call crashed in prune
+        self.assertTrue(any("inconsistent" in m.lower() for m in messages), messages)
+
+    def test_the_rejection_leaves_a_line_in_the_event_log(self):
+        self._write_flat_mixed_layout()
+        rl.load_index()
+        events = self.events()
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["event"], "inconsistent_index_on_load")
+        self.assertIn("detail", events[0])
+
+    def test_a_valid_legacy_flat_layout_still_loads(self):
+        """Indexes written before generations existed must keep working."""
+        import numpy as np
+        idx = _make_index(3, 2, 1.0)
+        self.index_dir.mkdir(parents=True)
+        (self.index_dir / "corpus.json").write_text(json.dumps(idx.corpus))
+        np.save(self.index_dir / "chunk_vecs.npy", idx.chunk_vecs)
+        (self.index_dir / "chunk_bead_idx.json").write_text(json.dumps(idx.chunk_bead_idx.tolist()))
+        (self.index_dir / "index_meta.json").write_text(json.dumps(idx.meta))
+        self.assertSameIndex(rl.load_index(), idx)
+
+    def test_a_pointer_to_a_missing_generation_is_corruption_not_first_run(self):
+        self.index_dir.mkdir(parents=True)
+        (self.index_dir / "CURRENT").write_text("gen-does-not-exist")
+        messages = []
+        self.assertIsNone(rl.load_index(progress=messages.append))
+        self.assertTrue(messages, "a published pointer that leads nowhere must be reported, not treated as first run")
+
+    def test_a_pointer_with_a_hostile_name_is_never_followed(self):
+        self.index_dir.mkdir(parents=True)
+        (self.index_dir / "CURRENT").write_text("../../etc")
+        messages = []
+        self.assertIsNone(rl.load_index(progress=messages.append))
+        self.assertTrue(messages)
+
+
+class TestUpdateIndexIfStaleSelfHeals(_IndexDirCase):
+    def _mixed_idx(self, last_check_at):
+        """In-memory copy of the live shape: 8 vector rows for 6 bead_idx."""
+        import numpy as np
+        idx = _make_index(3, 2, 1.0)
+        idx.chunk_vecs = np.vstack([idx.chunk_vecs, np.ones((2, 4), dtype=np.float32)])
+        idx.meta["last_staleness_check_at"] = last_check_at
+        return idx
+
+    def test_inconsistent_index_is_rebuilt_not_pruned_into_an_indexerror(self):
+        fresh = _make_index(2, 2, 7.0)
+        with mock.patch.object(rl, "build_full_index", return_value=fresh) as m_build, \
+             mock.patch.object(rl, "save_index") as m_save, \
+             mock.patch.object(rl, "fetch_closed_meta", side_effect=AssertionError("must rebuild, not poll")):
+            new_idx, changed = rl.update_index_if_stale(self._mixed_idx(last_check_at=0), force=True)
+        m_build.assert_called_once()
+        m_save.assert_called_once_with(fresh)
+        self.assertIs(new_idx, fresh)
+        self.assertTrue(changed)
+
+    def test_inconsistent_index_is_rebuilt_even_inside_the_throttle_window(self):
+        """The throttled early-return used to hand the broken index straight to
+        hybrid_retrieve, which indexes sims (vector rows) by bead_idx."""
+        import time
+        fresh = _make_index(2, 2, 7.0)
+        with mock.patch.object(rl, "build_full_index", return_value=fresh) as m_build, \
+             mock.patch.object(rl, "save_index"):
+            new_idx, changed = rl.update_index_if_stale(self._mixed_idx(last_check_at=time.time()), force=False)
+        m_build.assert_called_once()
+        self.assertIs(new_idx, fresh)
+        self.assertTrue(changed)
+
+    def test_rebuild_reason_is_logged(self):
+        fresh = _make_index(2, 2, 7.0)
+        messages = []
+        with mock.patch.object(rl, "build_full_index", return_value=fresh), mock.patch.object(rl, "save_index"):
+            rl.update_index_if_stale(self._mixed_idx(last_check_at=0), force=True, progress=messages.append)
+        self.assertTrue(any("inconsistent" in m.lower() for m in messages), messages)
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["rebuild_inconsistent_index"], events)
+
+    def test_a_deferred_rebuild_propagates_instead_of_being_swallowed(self):
+        """If the disk guard defers the rebuild, the caller must hear it (exit
+        3, 'could not search'), never get the broken index back."""
+        with mock.patch.object(rl, "build_full_index", side_effect=rl.RecallIndexRebuildDeferred("disk low")), \
+             mock.patch.object(rl, "save_index"):
+            with self.assertRaises(rl.RecallIndexRebuildDeferred):
+                rl.update_index_if_stale(self._mixed_idx(last_check_at=0), force=True)
+
+
+class TestIndexGenerations(_IndexDirCase):
+    def _flaky_atomic_write(self, fail_at, on_call=None):
+        real = rl._atomic_write
+        state = {"n": 0}
+
+        def flaky(path, write_fn):
+            state["n"] += 1
+            if on_call:
+                on_call(state["n"])
+            if state["n"] == fail_at:
+                raise OSError("process killed mid-save (simulated)")
+            return real(path, write_fn)
+        return flaky
+
+    def test_round_trip(self):
+        idx = _make_index(3, 2, 1.0)
+        rl.save_index(idx)
+        self.assertSameIndex(rl.load_index(), idx)
+
+    def test_a_save_that_dies_at_any_file_leaves_the_previous_index_whole(self):
+        """The class behind the bug. Pre-fix, dying after the 2nd of the 4
+        replaces left new corpus+vecs next to the old bead_idx+meta."""
+        first = _make_index(3, 2, 1.0)
+        rl.save_index(first)
+        second = _make_index(5, 3, 2.0)  # different sizes, so any mixing is visible
+        for fail_at in (1, 2, 3, 4, 5):  # 4 data files + the CURRENT pointer
+            with mock.patch.object(rl, "_atomic_write", side_effect=self._flaky_atomic_write(fail_at)):
+                with self.assertRaises(OSError):
+                    rl.save_index(second)
+            self.assertSameIndex(rl.load_index(), first)
+            # A dead save must not leave an unpublished generation or tmp files behind.
+            gens = [p.name for p in self.index_dir.iterdir() if p.name.startswith("gen-")]
+            self.assertLessEqual(len(gens), 1, f"fail_at={fail_at}: orphan generation left behind: {gens}")
+            self.assertEqual(list(self.index_dir.rglob("*.tmp")), [], f"fail_at={fail_at}: tmp debris")
+
+    def test_a_reader_that_runs_in_the_middle_of_a_save_sees_a_whole_index(self):
+        """Concurrent reader/writer: whichever instant the reader picks, it
+        must get the old index or the new one, never a blend."""
+        first, second = _make_index(3, 2, 1.0), _make_index(5, 3, 2.0)
+        rl.save_index(first)
+        seen = []
+        flaky = self._flaky_atomic_write(fail_at=0, on_call=lambda n: seen.append(rl.load_index()))
+        with mock.patch.object(rl, "_atomic_write", side_effect=flaky):
+            rl.save_index(second)
+        self.assertGreaterEqual(len(seen), 4)
+        for mid in seen:
+            self.assertIsNotNone(mid, "a reader mid-save must not see corruption")
+            self.assertTrue(mid.corpus == first.corpus or mid.corpus == second.corpus)
+            self.assertSameIndex(mid, first if mid.corpus == first.corpus else second)
+        self.assertSameIndex(rl.load_index(), second)
+
+    def test_two_writers_never_share_a_directory(self):
+        a, b = _make_index(3, 2, 1.0), _make_index(4, 2, 2.0)
+        with mock.patch.object(rl, "GEN_PRUNE_GRACE_SECONDS", 10 ** 9):
+            rl.save_index(a)
+            gen_a = a.gen_dir
+            rl.save_index(b)
+        self.assertNotEqual(gen_a, b.gen_dir)
+        self.assertSameIndex(rl.load_index(), b)
+
+    def test_save_refuses_to_persist_an_inconsistent_index(self):
+        import numpy as np
+        good = _make_index(3, 2, 1.0)
+        rl.save_index(good)
+        bad = _make_index(3, 2, 2.0)
+        bad.chunk_vecs = np.vstack([bad.chunk_vecs, np.ones((2, 4), dtype=np.float32)])
+        with self.assertRaises(ValueError):
+            rl.save_index(bad)
+        self.assertSameIndex(rl.load_index(), good)
+
+    def test_old_generations_are_pruned_after_the_grace_period(self):
+        with mock.patch.object(rl, "GEN_PRUNE_GRACE_SECONDS", 0):
+            rl.save_index(_make_index(3, 2, 1.0))
+            rl.save_index(_make_index(4, 2, 2.0))
+            rl.save_index(_make_index(5, 2, 3.0))
+        gens = [p for p in self.index_dir.iterdir() if p.name.startswith("gen-")]
+        self.assertEqual(len(gens), 1, gens)
+
+    def test_the_previous_generation_survives_the_grace_period_for_slow_readers(self):
+        with mock.patch.object(rl, "GEN_PRUNE_GRACE_SECONDS", 3600):
+            rl.save_index(_make_index(3, 2, 1.0))
+            rl.save_index(_make_index(4, 2, 2.0))
+        gens = [p for p in self.index_dir.iterdir() if p.name.startswith("gen-")]
+        self.assertEqual(len(gens), 2, gens)
+
+    def test_first_save_after_the_flat_layout_migrates_and_removes_the_flat_files(self):
+        import numpy as np
+        old = _make_index(3, 2, 1.0)
+        self.index_dir.mkdir(parents=True)
+        (self.index_dir / "corpus.json").write_text(json.dumps(old.corpus))
+        np.save(self.index_dir / "chunk_vecs.npy", old.chunk_vecs)
+        (self.index_dir / "chunk_bead_idx.json").write_text(json.dumps(old.chunk_bead_idx.tolist()))
+        (self.index_dir / "index_meta.json").write_text(json.dumps(old.meta))
+        rl.save_index(_make_index(4, 2, 2.0))
+        flat = [n for n in ("corpus.json", "chunk_vecs.npy", "chunk_bead_idx.json", "index_meta.json")
+                if (self.index_dir / n).exists()]
+        self.assertEqual(flat, [])
+        self.assertEqual(len(rl.load_index().corpus), 4)
+
+    def test_pruning_never_touches_anything_outside_the_index_naming_scheme(self):
+        self.index_dir.mkdir(parents=True)
+        keepsake = self.index_dir / "keep-me.txt"
+        keepsake.write_text("not ours")
+        other_dir = self.index_dir / "notes"
+        other_dir.mkdir()
+        with mock.patch.object(rl, "GEN_PRUNE_GRACE_SECONDS", 0):
+            rl.save_index(_make_index(3, 2, 1.0))
+            rl.save_index(_make_index(4, 2, 2.0))
+        self.assertTrue(keepsake.exists())
+        self.assertTrue(other_dir.exists())
+
+    def test_pruning_never_removes_the_generation_current_names_even_if_it_is_not_ours(self):
+        """Two writers: the other one published after us and its generation is
+        old by mtime. Our prune must still leave whatever CURRENT names."""
+        import time
+        idx = _make_index(3, 2, 1.0)
+        rl.save_index(idx)
+        ancient = time.time() - 10 ** 6
+        os.utime(idx.gen_dir, (ancient, ancient))
+        with mock.patch.object(rl, "GEN_PRUNE_GRACE_SECONDS", 0):
+            rl._prune_generations(keep=self.index_dir / "gen-written-by-someone-else")
+        self.assertTrue(idx.gen_dir.is_dir())
+        self.assertSameIndex(rl.load_index(), idx)
+
+    def test_grace_period_runs_from_the_moment_of_supersession_not_from_the_last_write(self):
+        """A reader may have resolved CURRENT just before the swap. The old
+        generation's own mtime says nothing about that (it may be days old)."""
+        import time
+        a = _make_index(3, 2, 1.0)
+        rl.save_index(a)
+        ancient = time.time() - 10 ** 6
+        os.utime(a.gen_dir, (ancient, ancient))
+        rl.save_index(_make_index(4, 2, 2.0))  # default grace period
+        self.assertTrue(a.gen_dir.is_dir(), "superseded generation removed while a slow reader may still be loading it")
+
+    def test_no_tmp_debris_anywhere_in_the_tree(self):
+        rl.save_index(_make_index(3, 2, 1.0))
+        self.assertEqual(list(self.index_dir.rglob("*.tmp")), [])
+
+
+class TestThrottleTimestampPersistence(_IndexDirCase):
+    def test_a_no_change_check_rewrites_only_the_meta_not_the_whole_index(self):
+        """Pre-fix the 'nothing new' branch re-saved ~240 MB (and re-stamped a
+        broken index as fresh) just to move one timestamp."""
+        import time
+        idx = _make_index(3, 2, 1.0)
+        rl.save_index(idx)
+        loaded = rl.load_index()
+        gens_before = sorted(p.name for p in self.index_dir.iterdir() if p.name.startswith("gen-"))
+        vecs_path = rl._paths()["vecs"]
+        vecs_before = (vecs_path.read_bytes(), vecs_path.stat().st_mtime_ns)
+        loaded.meta["last_staleness_check_at"] = 0
+        loaded.meta["last_build_at"] = time.time()  # young index: the age trigger must not fire
+        with mock.patch.object(rl, "fetch_closed_meta", return_value=[]):
+            _, changed = rl.update_index_if_stale(loaded, force=False)
+        self.assertFalse(changed)
+        gens_after = sorted(p.name for p in self.index_dir.iterdir() if p.name.startswith("gen-"))
+        self.assertEqual(gens_after, gens_before, "a no-op check must not publish a new generation")
+        self.assertEqual((vecs_path.read_bytes(), vecs_path.stat().st_mtime_ns), vecs_before)
+        reloaded = rl.load_index()
+        self.assertGreater(reloaded.meta["last_staleness_check_at"], time.time() - 60)
+        self.assertEqual(reloaded.corpus, idx.corpus)
+
+    def test_an_index_that_was_never_loaded_from_disk_falls_back_to_a_full_save(self):
+        idx = _make_index(3, 2, 1.0)
+        self.assertIsNone(idx.gen_dir)
+        rl.save_index_meta(idx)
+        self.assertSameIndex(rl.load_index(), idx)
+
+    def test_meta_write_to_a_generation_that_was_pruned_meanwhile_is_a_silent_noop(self):
+        idx = _make_index(3, 2, 1.0)
+        rl.save_index(idx)
+        loaded = rl.load_index()
+        with mock.patch.object(rl, "GEN_PRUNE_GRACE_SECONDS", 0):
+            rl.save_index(_make_index(4, 2, 2.0))
+            rl.save_index(_make_index(5, 2, 3.0))  # prunes the generation `loaded` came from
+        rl.save_index_meta(loaded)  # must not raise, must not resurrect the old generation
+        self.assertEqual(len(rl.load_index().corpus), 5)
+        self.assertEqual(len([p for p in self.index_dir.iterdir() if p.name.startswith("gen-")]), 1)
+
+
+# ---------------------------------------------------------------------------
+# A from-scratch rebuild is a heavy step (embeds every chunk, writes the whole
+# index): it goes through scripts/heavy-guard.sh (ga-vln2py). Without this the
+# self-heal above would be an automatic route around the disk floor.
+# ---------------------------------------------------------------------------
+class _PastTheGuard(Exception):
+    pass
+
+
+class TestRebuildRespectsDiskGuard(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.city = Path(self._tmpdir.name)
+        (self.city / "scripts").mkdir()
+        self._p = mock.patch.object(rl, "GC_CITY_PATH", str(self.city))
+        self._p.start()
+        # build_full_index() asks the guard first; whatever is past it must be
+        # unreachable in the refusal tests and is replaced by a sentinel here.
+        self._model = mock.patch.object(rl, "load_model", side_effect=_PastTheGuard())
+        self.m_model = self._model.start()
+
+    def tearDown(self):
+        self._model.stop()
+        self._p.stop()
+        self._tmpdir.cleanup()
+
+    def _install_guard(self):
+        (self.city / "scripts" / "heavy-guard.sh").write_text("#!/bin/sh\nexit 0\n")
+
+    def _guard_says(self, rc, out=""):
+        return mock.patch.object(rl.subprocess, "run",
+                                 return_value=subprocess.CompletedProcess([], rc, stdout=out, stderr=""))
+
+    def test_a_refusal_defers_the_rebuild_before_any_work(self):
+        self._install_guard()
+        with self._guard_says(75, "heavy-guard: REFUSED ... 5461 MB free < 6144 MB floor"):
+            with self.assertRaises(rl.RecallIndexRebuildDeferred) as cm:
+                rl.build_full_index()
+        self.assertIn("5461", str(cm.exception))
+        self.m_model.assert_not_called()
+
+    def test_not_being_able_to_read_the_disk_is_also_a_refusal(self):
+        self._install_guard()
+        with self._guard_says(76, "heavy-guard: cannot read disk"):
+            with self.assertRaises(rl.RecallIndexRebuildDeferred):
+                rl.build_full_index()
+
+    def test_an_unexpected_exit_code_is_a_refusal_not_a_green_light(self):
+        self._install_guard()
+        with self._guard_says(127):
+            with self.assertRaises(rl.RecallIndexRebuildDeferred):
+                rl.build_full_index()
+
+    def test_a_guard_that_cannot_be_run_is_a_refusal(self):
+        self._install_guard()
+        for exc in (OSError("exec format error"), subprocess.TimeoutExpired("heavy-guard.sh", 30)):
+            with mock.patch.object(rl.subprocess, "run", side_effect=exc):
+                with self.assertRaises(rl.RecallIndexRebuildDeferred):
+                    rl.build_full_index()
+        self.m_model.assert_not_called()
+
+    def test_a_green_light_lets_the_rebuild_proceed(self):
+        self._install_guard()
+        with self._guard_says(0):
+            with self.assertRaises(_PastTheGuard):
+                rl.build_full_index()
+
+    def test_a_checkout_without_the_guard_script_is_not_blocked(self):
+        with self.assertRaises(_PastTheGuard):
+            rl.build_full_index()
+
+    def test_the_cli_reports_a_deferred_rebuild_as_could_not_search(self):
+        import io
+        import recall
+        err = io.StringIO()
+        with mock.patch.object(recall, "ensure_index", side_effect=rl.RecallIndexRebuildDeferred("disk low")), \
+             mock.patch.object(sys, "stderr", err):
+            rc = recall.main(["anything"])
+        self.assertEqual(rc, 3)
+        self.assertIn("disk low", err.getvalue())
+
+
+# ---------------------------------------------------------------------------
 # Staleness decision (pure logic)
 # ---------------------------------------------------------------------------
 class TestShouldRebuild(unittest.TestCase):

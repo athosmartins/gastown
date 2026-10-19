@@ -21,7 +21,8 @@ or via the `recall` wrapper on PATH, which does that for you.
 Exit codes — do not conflate these (wa-h9dc1): 0 = ran fine, including the
 legitimate "No matching closed beads found." outcome; 2 = CLI usage error
 (argparse, e.g. empty query); 3 = could NOT search at all (e.g. embedding
-model unavailable) — callers must treat this differently from "0 results".
+model unavailable, or the index needs a from-scratch rebuild that the disk
+guard deferred) — callers must treat this differently from "0 results".
 """
 from __future__ import annotations
 
@@ -91,10 +92,11 @@ def main(argv=None) -> int:
         results = rl.hybrid_retrieve(query, idx, model=model, k=args.k)
         for r in results:
             r["top_comments"] = rl.top_comments(r["bead"], query, model=model, n=2)
-    except rl.RecallModelUnavailableError as e:
+    except rl.RecallUnavailableError as e:
         # Distinct from "ran fine, 0 results" (exit 0) and from argparse's
         # usage-error convention (exit 2) — callers must not read this as
-        # "no matching beads" (wa-h9dc1).
+        # "no matching beads" (wa-h9dc1). Covers the model being unavailable
+        # and an index rebuild the disk guard deferred (ga-m1sa2l).
         print(f"recall: unavailable — could not search: {e}", file=sys.stderr)
         return 3
 
