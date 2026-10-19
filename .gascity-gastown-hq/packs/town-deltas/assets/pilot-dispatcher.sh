@@ -390,6 +390,13 @@ PILOT_SWAP_USED_OVERRIDE_MB="${PILOT_SWAP_USED_OVERRIDE_MB:-}"
 PILOT_SWAP_FREE_OVERRIDE_MB="${PILOT_SWAP_FREE_OVERRIDE_MB:-}"
 PILOT_DISK_FREE_OVERRIDE_MB="${PILOT_DISK_FREE_OVERRIDE_MB:-}"
 PILOT_KERN_PRESSURE_OVERRIDE="${PILOT_KERN_PRESSURE_OVERRIDE:-}"
+# ga-2hd02v.1.11: "nó primeiro" no MODO SOMBRA. off (padrão) | shadow. shadow só CONSULTA scripts/hetzner-capacity.py (veredito node|local|unknown) para cada bead de
+# dog do HQ e REGISTRA o que o Pilot faria; o despacho segue exatamente como sempre foi. Não existe valor "on": levar a bead ao nó (atribuir ao alias dog-remote-<n>,
+# abrir a sessão) é outra fatia (docs/runbooks/hetzner-capacity.md). Valor desconhecido = off, com aviso.
+PILOT_NODE_FIRST="${PILOT_NODE_FIRST:-off}"
+PILOT_NODE_FIRST_VETO_LABELS="${PILOT_NODE_FIRST_VETO_LABELS:-node:never needs:engine-window exec:manual}"
+PILOT_NODE_CAPACITY_BIN="${PILOT_NODE_CAPACITY_BIN:-$GC_CITY/scripts/hetzner-capacity.py}"
+PILOT_NODE_FIRST_LOG="${PILOT_NODE_FIRST_LOG:-$GC_CITY/.gc/logs/node-first-shadow.jsonl}"
 
 # ── ga-vln2py (P0, 17/10): DISK FLOOR — a HARD pause on NEW dispatch ──────────────────────────────
 # Free disk below DISK_NEW_WORK_MIN_MB (5120 = 5 GB, packs/town-deltas/assets/scripts/disk-headroom-lib.sh — the one
@@ -11723,6 +11730,49 @@ _e12_doctrine_block() {
   return 0
 }
 
+# _pilot_node_first_shadow <story_id> <sling_target> <is_rig_native> <labels_csv> — ga-2hd02v.1.11, MODO SOMBRA.
+# Pergunta ao oráculo do nó (hetzner-capacity.py verdict) para onde esta bead iria e GRAVA a resposta em $PILOT_NODE_FIRST_LOG; NUNCA muda o despacho: devolve 0 o que
+# quer que aconteça (consulta que falha, JSON ruim, log que não grava). Só a bead de dog do HQ entra (pool gastown.dog, bead da própria cidade) e só sem rótulo de veto.
+# Só "node" no JSON, com exit 0, conta como "iria ao nó"; qualquer outra coisa (mini, não sei, prazo, oráculo ausente) fica registrada como o que foi e NUNCA como "node".
+_pilot_node_first_shadow() {
+  local _nf_id="$1" _nf_target="$2" _nf_native="$3" _nf_labels="$4" _nf_out="" _nf_rc=0 _nf_v="" _nf_why="" _nf_l _nf_rec=""
+  case "$PILOT_NODE_FIRST" in
+    off) return 0 ;;
+    shadow) : ;;
+    *) warn "ga-2hd02v.1.11: PILOT_NODE_FIRST='$PILOT_NODE_FIRST' não existe (valores: off | shadow); tratado como off" >&2; return 0 ;;
+  esac
+  if [ "${DRY_RUN:-0}" = "1" ]; then log "  node-first (sombra): DRY_RUN — não consulto o nó (a consulta mede o nó e grava estado)"; return 0; fi
+  if [ "$_nf_target" != "gastown.dog" ] || [ "$_nf_native" != "0" ]; then return 0; fi
+  for _nf_l in $PILOT_NODE_FIRST_VETO_LABELS; do
+    case ",$_nf_labels," in *",$_nf_l,"*) _nf_v="local"; _nf_why="veto:$_nf_l" ;; esac
+  done
+  if [ -z "$_nf_v" ]; then
+    # vazio (sem stdout) → "unknown"; falhou (rc 1 = mini, 2 = não sei, 124 = prazo, outro = não rodou) → fica como o que foi, nunca "node"
+    _nf_out=$(timeout 40 python3 -I "$PILOT_NODE_CAPACITY_BIN" --json verdict 2>/dev/null </dev/null) || _nf_rc=$?
+    # vazio/ilegível (JSON ruim ou sem o campo) → "unknown"; "node" com rc != 0 é contradição → "unknown" (o exit code e o JSON têm que concordar)
+    _nf_v=$(printf '%s' "$_nf_out" | jq -r '.verdict // "unknown"' 2>/dev/null) || _nf_v="unknown"
+    _nf_why=$(printf '%s' "$_nf_out" | jq -r '.reason // ""' 2>/dev/null) || _nf_why=""
+    case "$_nf_v:$_nf_rc" in
+      node:0|local:1|unknown:2) : ;;
+      :*) _nf_why="oraculo_sem_resposta(rc=$_nf_rc)"; _nf_v="unknown" ;;
+      *) _nf_why="oraculo_incoerente(rc=$_nf_rc,verdict=$_nf_v)"; _nf_v="unknown" ;;
+    esac
+  fi
+  [ -n "$_nf_out" ] || _nf_out='{}'
+  _nf_rec=$(printf '%s' "$_nf_out" | jq -c --arg id "$_nf_id" --arg v "$_nf_v" --arg r "$_nf_why" --argjson ts "$(date +%s)" \
+    '(if type == "object" then . else {} end) + {story: $id, ts: $ts, shadow: true, verdict: $v, reason: $r}' 2>/dev/null) \
+    || _nf_rec=$(jq -cn --arg id "$_nf_id" --arg v "$_nf_v" --arg r "$_nf_why" --argjson ts "$(date +%s)" '{story: $id, ts: $ts, shadow: true, verdict: $v, reason: $r}')
+  mkdir -p "$(dirname "$PILOT_NODE_FIRST_LOG")" 2>/dev/null || true
+  printf '%s\n' "$_nf_rec" >> "$PILOT_NODE_FIRST_LOG" 2>/dev/null \
+    || warn "ga-2hd02v.1.11: não consegui gravar a decisão-sombra de $_nf_id em $PILOT_NODE_FIRST_LOG" >&2
+  case "$_nf_v" in
+    node) log "  node-first (sombra): $_nf_id IRIA ao nó (hoje vai ao mini: o despacho ao nó ainda não existe)" ;;
+    local) log "  node-first (sombra): $_nf_id ficaria no mini ($_nf_why)" ;;
+    *) log "  node-first (sombra): $_nf_id ficaria no mini — não sei se o nó pode ($_nf_why)" ;;
+  esac
+  return 0
+}
+
 # ── Dispatch helper ───────────────────────────────────────────────────────────
 # dispatch_one <story_json> <lane> <dispatch_tier>
 # Handles: claim, verify, builder routing, sling, bead transitions, logging, ntfy.
@@ -13171,6 +13221,8 @@ TASK
   # When STORY_BEAD_CITY == GC_CITY (HQ bead), use the standard gc sling path.
   local _IS_RIG_NATIVE=0
   [ "$STORY_BEAD_CITY" != "$GC_CITY" ] && _IS_RIG_NATIVE=1
+  # ga-2hd02v.1.11: só registra para onde iria (PILOT_NODE_FIRST=shadow); sem efeito no despacho, e `|| true` porque nada aqui pode derrubar a varredura.
+  _pilot_node_first_shadow "$STORY_ID" "$_SLING_TARGET" "$_IS_RIG_NATIVE" "$STORY_LABELS" || true
 
   # ── ga-88g2: pre-dispatch freshness re-check (candidate-to-dispatch TOCTOU) ───
   # The ga-zzrts verify above (~L3316) re-fetches immediately after the atomic
