@@ -96,6 +96,19 @@ denied "bd comment --stdin com texto" "flag fora da lista" bd comment ga-1 oi --
 denied "bd close --reason-file" "flag fora da lista" bd close ga-1 --reason-file /etc/passwd
 denied "bd close --force" "flag fora da lista" bd close ga-1 --force
 denied "bd close sem id" "faltam argumentos" bd close
+# ga-6auslu: o texto da tarefa do revisor (gate-review-task.lib.sh) manda 4 escritas na bead de veredito: label remove verdict:pending, label add verdict:PASS|FAIL,
+# comment, close. comment e close têm regra; `bd label` NÃO tem, DE PROPÓSITO: o bd não confere dono no `label add`, o dispatcher lê verdict:PASS ANTES de verdict:FAIL
+# (gate_collect_verdicts) e o resgate ga-7lz1 fecha bead ABERTA que já tem rótulo + revisor drenado — um `label add <bead alheia> verdict:PASS` vindo do nó aprovaria
+# código sem revisão. O veredito do nó vai por comment "VERDICT: …" + close (o dispatcher lê o comentário ancorado: ga-86l90a8 PASS, ga-w7pm55 FAIL). Alargar isto
+# exige checagem de dono no wrapper (decisão do Mayor), nunca um acerto de lista: por isso cada chave tem o seu caso, e a vizinhança também.
+for _lk in "remove verdict:pending" "add verdict:PASS" "add verdict:FAIL" "remove verdict:PASS" "add verdict:REQUEUED" "add verdict:TIMEOUT" "add verdict:ABORTED" \
+           "add gate:needs-fix" "add gate-status:passed" "add pilot:no-auto-dispatch" "add story:approved" "add type:quality-gate-verdict"; do
+  _lop="${_lk%% *}"; _lkey="${_lk#* }"
+  denied "rótulo do veredito: bd label $_lop <bead> $_lkey" "comando fora da lista" bd label "$_lop" ga-vb-1 "$_lkey"
+  denied "rótulo do veredito: bd -C . label $_lop <bead> $_lkey (a forma do texto da tarefa)" "comando fora da lista" bd -C . label "$_lop" ga-vb-1 "$_lkey"
+done
+denied "rótulo do veredito: bd label add com dois rótulos" "comando fora da lista" bd label add ga-vb-1 verdict:PASS verdict:FAIL
+denied "rótulo do veredito: bd label list" "comando fora da lista" bd label list ga-vb-1
 denied "id com ';'" "fora do formato" bd show 'ga-1;id'
 denied "id com \$()" "fora do formato" bd show 'ga-$(id)'
 denied "id de wisp com ';'" "fora do formato" bd show 'ga-wisp-1;id'

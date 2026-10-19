@@ -53,6 +53,9 @@ MUTANTS = [
     ("metadata-sem-lista", "w", "k.startswith(ALLOW_META) and ", "", r"set-metadata gc\.routed_to"),
     ("metadata-prefixo-largo", "w", 'ALLOW_META = ("athos.", "story.")', 'ALLOW_META = ("athos.", "story.", "gate.", "delivery.")', r"gate\.submitted_by"),
     ("metadata-sem-caixa", "w", "and k.startswith(ALLOW_META)", "and k.lower().startswith(ALLOW_META)", r"Story\.x"),
+    # ga-6auslu: o nó NÃO grava rótulo de veredito (forjaria PASS: o bd não confere dono no `label add`). Uma regra `bd label` — o alargamento óbvio — tem que reprovar o 1º caso por chave.
+    ("rotulo-do-veredito-passa", "w", '    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}),\n',
+     '    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}),\n    Rule("bd", ["label"], [("word", 1, 1), ("id", 1, 1), ("word", 1, 1)], {}),\n', r"rótulo do veredito: bd label remove"),
     ("identidade-sessao-solta", "w", '("GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME", "GC_TEMPLATE")', '("GC_ALIAS", "GC_AGENT")', r"GC_SESSION_NAME do Mayor"),
     ("session-id-atravessa", "w", '"GC_SESSION_NAME": _IDENT, "GC_TEMPLATE": _IDENT,', '"GC_SESSION_NAME": _IDENT, "GC_SESSION_ID": _IDENT, "GC_TEMPLATE": _IDENT,', r"GC_SESSION_ID não atravessa"),
     ("nudge-alvo-livre", "w", 'if r.words == ("session", "nudge") and not (cfg["nudge_re"] and cfg["nudge_re"].fullmatch(pos[0])):', "if False:", r"alvo fora do nudge_pattern"),

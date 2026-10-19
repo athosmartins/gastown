@@ -373,18 +373,27 @@ def say(ok, what): print(("OK  " if ok else "BAD ") + what)
 
 task = open(taskf, encoding="utf-8").read()
 sec = task.split("record your verdict with EXACTLY these bash commands:", 1)[1].split("Run those commands and then exit", 1)[0]
-lines, out, fail = sec.splitlines(), [], False
-for ln in lines:
-    if ln.startswith("# If FAIL"): fail = True; continue
-    if ln.startswith("# If PASS"): continue
-    out.append(ln[2:] if fail and ln.startswith("# ") else ln)
-toks = shlex.split("\n".join(out))
-cmds, cur = [], []
-for t in toks:
-    if t == "bd" and cur: cmds.append(cur); cur = []
-    cur.append(t)
-if cur: cmds.append(cur)
+def parse(sec):
+    out, fail = [], False
+    for ln in sec.splitlines():
+        if ln.startswith("# If FAIL"): fail = True; continue
+        if ln.startswith("# If PASS"): continue
+        out.append(ln[2:] if fail and ln.startswith("# ") else ln)
+    cmds, cur = [], []
+    for t in shlex.split("\n".join(out)):
+        if t == "bd" and cur: cmds.append(cur); cur = []
+        cur.append(t)
+    if cur: cmds.append(cur)
+    return cmds
+def label_keys(cmds):  # (operação chave) de cada `bd label` que o texto manda o revisor gravar: é o que o nó recusa
+    return sorted({f"{c[4]} {c[-1]}" for c in cmds if (c[3] if c[1] == "-C" else c[1]) == "label"})
+LOCKED = ["add verdict:FAIL", "add verdict:PASS", "remove verdict:pending"]
+cmds = parse(sec)
 say(len(cmds) == 7, f"found 7 verdict commands in the task text (2 labels + comment + close for PASS, label + comment + close for FAIL; got {len(cmds)})")
+# ga-6auslu: as 3 chaves de rótulo são recusadas no nó DE PROPÓSITO (um `label add` em bead alheia forja veredito: o bd não confere dono e o dispatcher lê PASS antes de FAIL).
+# Chave nova no texto = decisão nova (regra com checagem de dono no wrapper, ou a escrita passa para o lado do mini) ANTES de ligar os revisores do nó.
+say(label_keys(cmds) == LOCKED, f"the label keys the task tells the reviewer to write are exactly {LOCKED} (got {label_keys(cmds)}): a new key needs a decision before the node reviewers are turned on")
+say(label_keys(parse(sec + '\nbd -C "x" label add ga-vb-demo "gate:reviewed"\n')) != LOCKED, "control: a NEW label key appended to the task text IS seen by the lock above (the check can fail)")
 for c in cmds:
     kind = c[3] if c[1] == "-C" else c[1]
     sub = c[4] if kind == "label" else ""

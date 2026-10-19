@@ -1,5 +1,9 @@
 # Revisor do gate no nó Hetzner (gate-reviewer-remote) · runbook
 
+## Contents
+
+O que é · Desenho · Escritas do revisor × allowlist do atalho · Ligar · Provar · Diferenças conhecidas (revisor do nó × local) · Medido, inferido, não testado
+
 Bead ga-2hd02v.1.9 (filha da ga-2hd02v.1). Mayor, 19/10: construir e provar no nó com sessão de teste ou dry-run **já**; a ATIVAÇÃO viva (flag, config do host) só depois do flip da 1.6 provado. **A 1.6 estava aberta quando esta fatia terminou: tudo aqui está pronto e INERTE.**
 
 ## O que é
@@ -19,6 +23,26 @@ Peças: `agents/gate-reviewer-remote/` · `packs/town-deltas/assets/gate-remote-
 * **Veredito por `bd comment` + `bd close`.** `bd label add|remove` e `drain-ack` voltam rc 77; o prompt manda não repetir e entregar `VERDICT: PASS|FAIL …` no comentário, que o dispatcher já lê (ga-86l90a8, ga-w7pm55). O atalho NÃO foi alargado.
 * **Não mexe em** janitor, headroom do mini, 2º revisor E5 e `refino-gate-dispatcher` (locais). O `cleanup_reviewer_sessions` do fim da rodada fecha as remotas pelos ids.
 
+## Escritas do revisor × allowlist do atalho (ga-6auslu, pré-condição iii do degrau b da 1.6)
+
+Conferido por leitura de código, nada rodou contra produção. TUDO que um revisor do gate grava é o rodapé do texto da tarefa (`gate-review-task.lib.sh::_gate_review_task_verdict_bead`), na bead de veredito `<VB>`. O revisor NÃO grava metadata (`gate.*`/`gc.*`/`athos.*`), NÃO manda mail (os dois prompts proíbem) e o prompt do nó não manda nudge. A fórmula `mol-quality-gate-runner` é do runner, não do revisor.
+
+| Escrita do revisor | No atalho do nó | Como o veredito chega ao dispatcher |
+|---|---|---|
+| `bd comment <VB> "VERDICT: PASS\|FAIL …"` | coberta (`bd comment <id> <texto>`) | comentário ancorado `^VERDICT: PASS\|FAIL`: PASS ga-86l90a8, FAIL ga-w7pm55 (`gate_collect_verdicts`) |
+| `bd close <VB>` | coberta (`bd close <id>`) | a bead FECHA; só bead fechada conta pelo comentário (ver abaixo) |
+| `bd label remove <VB> verdict:pending` | **rc 77, de propósito** | dispensável: o dispatcher decide pelo comentário, o rótulo fica na bead fechada |
+| `bd label add <VB> verdict:PASS` | **rc 77, de propósito** | o comentário carrega o PASS |
+| `bd label add <VB> verdict:FAIL` | **rc 77, de propósito** | o comentário carrega o FAIL e o motivo |
+| `gc runtime drain-ack` (só no prompt LOCAL) | rc 77 | o nó sai pelo `idle_timeout` (10 min); não é escrita de dado |
+| metadata · mail · nudge | o revisor não escreve | — |
+
+**Por que o rótulo fica FORA da lista (não é "a allowlist ainda não foi alargada").** O `bd label add` não confere dono; o `bd close` confere (recusa quem não é o assignee, ga-9ophv2). O dispatcher lê `verdict:PASS` ANTES de `verdict:FAIL` (um PASS forjado vence o FAIL real) e o resgate ga-7lz1 fecha bead ABERTA que já tem rótulo e revisor drenado: um `label add <bead alheia> verdict:PASS` vindo do nó (ou de um revisor do nó induzido por texto dentro de um diff) aprovaria código sem revisão. Alargar a lista com as 2 formas exatas foi feito e REVERTIDO no mesmo dia (a revisão de segurança do commit achou isto). Travado por teste, por chave: `remote-shim.selftest.sh` (as 3 chaves + 9 vizinhas, nas 2 formas `bd …` e `bd -C … `), o mutante `rotulo-do-veredito-passa` em `remote-shim.mutants.py` (uma regra `bd label` reprova o 1º caso por chave) e `gate-remote-reviewers.selftest.sh` 5b (as chaves de rótulo do texto REAL da tarefa são exatamente as 3). Chave nova no texto da tarefa reprova até alguém decidir.
+
+**O lado do mini conta o veredito só por comentário?** Sim, para bead FECHADA sem rótulo `verdict:PASS|FAIL`: PASS ancorado → PASS, FAIL ancorado → rejeição real de código com o motivo ao builder (provado em `gate-no-verdict-infra-not-code-fail.selftest.sh`, 31/31, com mutantes que desligam cada resgate). **Bead ABERTA só com comentário NÃO conta:** o resgate ga-7lz1 exige rótulo + revisor drenado. Logo o `close` do revisor do nó é a escrita que carrega o veredito; ele só passa se o `BEADS_ACTOR` (o alias declarado pelo nó) for o assignee da bead de veredito (nome da sessão): **isto só se prova na sessão de teste do nó** (passo 2 de "Provar"). Close recusado = bead aberta = a rodada espera o orçamento de tempo e re-revisa (lento, seguro).
+
+**Resíduo conhecido, NÃO fechado nesta fatia:** `bd comment <id>` não confere de quem é a bead. Em bead de veredito FECHADA e SEM rótulo (revisor que morreu), um `VERDICT: PASS` ancorado escrito por OUTRA sessão do nó é lido como PASS, e o dispatcher olha o PASS antes do FAIL. Saídas (decisão do Mayor): checagem de dono no wrapper para `bd comment` em bead `type:quality-gate-verdict`, ou o dispatcher preferir FAIL quando houver os dois comentários ancorados.
+
 ## Ligar
 
 **Não antes do flip da 1.6 provado e do OK do Mayor.**
@@ -34,7 +58,7 @@ Peças: `agents/gate-reviewer-remote/` · `packs/town-deltas/assets/gate-remote-
    ```
 6. `touch "$GC_CITY/.gc/gate-remote-reviewers.on"` vale na próxima rodada. **Desligar:** `rm` da flag; rodadas em curso terminam onde estão.
 
-**São do Mayor:** ligar a flag e quando · editar `worktree_rigs` do host (passo 5) · alargar o atalho do nó para `bd label add verdict:*`/ler comentários (não feito; a allowlist é a fronteira de segurança) · o teto do template (2) e o transbordo (ga-2hd02v.1.11) · o critério de aceite das 3 revisões.
+**São do Mayor:** ligar a flag e quando · editar `worktree_rigs` do host (passo 5) · dar paridade de rótulo ao nó (não feito, e não é acerto de lista: ver "Escritas do revisor × allowlist do atalho", o `label add` forja veredito sem checagem de dono) ou ler comentários · o teto do template (2) e o transbordo (ga-2hd02v.1.11) · o critério de aceite das 3 revisões.
 
 ## Provar
 
