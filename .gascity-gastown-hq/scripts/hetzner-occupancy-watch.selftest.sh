@@ -9,7 +9,7 @@
 # CONTROLE NEGATIVO: cada mutante (um trecho literal do script trocado, que tem de existir UMA vez) TEM de reprovar o grupo que o pega; mutante que passa = teste que não pega o bug. Só roda sem argumento e com o script de verdade.
 #   Cada mutante roda em segundo plano com o PRÓPRIO diretório temporário e para no 1º caso que reprova (o resto do grupo não diz nada de novo): sem isso eram ~80 grupos inteiros em série, mais de 10 min.
 # COMO RODAR: hetzner-occupancy-watch.selftest.sh [grupo ...]   (sem argumento: todos os grupos e o controle negativo). HETZNER_OCC_UNDER_TEST=<script> roda a suíte contra outra cópia.
-#   HOCC_JOBS=N mutantes ao mesmo tempo (padrão 4; 1 = em série) · HOCC_NO_MUTANTS=1 pula o controle negativo.
+#   HOCC_JOBS=N mutantes ao mesmo tempo (padrão 4; 1 = em série) · HOCC_NO_MUTANTS=1 pula o controle negativo (183 dos 236 casos, ~20 s no Linux). Tudo: ~80 s no Linux; no mini, sob carga, ~7 min (medido pelo gate em 19/10).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCH="${HETZNER_OCC_UNDER_TEST:-$HERE/hetzner-occupancy-watch.py}"
@@ -18,6 +18,7 @@ PLIST="$HERE/com.gascity.hetzner-occupancy-watch.plist"
 T=$(mktemp -d "${TMPDIR:-/tmp}/hocc-selftest.XXXXXX")
 trap 'kill $(jobs -p) 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null' EXIT
 mkdir -p "$T/bin" "$T/stub" "$T/tmp" "$T/mut" "$T/m" "$T/mutres"
+PYC="$T/pycache"   # cache de bytecode do python que o W() sobe: fora do HOME falso, aquecido uma vez e dividido com os mutantes (a T deles muda; esta variável não)
 
 fails=0; n=0; QUIET=0
 ok()  { n=$((n+1)); [ "$QUIET" = 1 ] || echo "ok   $1"; }
@@ -69,6 +70,9 @@ EOF
 for b in bd dolt; do   # o vigia NUNCA deve chamar bd nem dolt (só gc session list / ssh de leitura)
   printf '#!/usr/bin/env bash\necho "FORBIDDEN %s $*" >> "$STUB_DIR/forbidden.calls"\nexit 99\n' "$b" > "$T/bin/$b"
 done
+# python3 de mentira (só o W() o vê: o PATH dele começa em $T/bin). O python do sistema do macOS (CLT 3.9) grava o bytecode em $HOME/Library/Caches/com.apple.python se o ambiente não manda parar; o do Linux não grava em HOME nenhum.
+# Foi por isso que a suíte passava no Linux e reprovava no mini (gate ga-ztz9yn, "e nada no HOME"): este reproduz o padrão do macOS em qualquer sistema, e o controle no fim do grupo saida prova que ele suja o HOME.
+printf '#!/usr/bin/env bash\n: "${PYTHONPYCACHEPREFIX=$HOME/Library/Caches/com.apple.python}"; export PYTHONPYCACHEPREFIX\nexec %q "$@"\n' "$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin sh -c 'command -v python3')" > "$T/bin/python3"
 chmod +x "$T/bin/"*
 
 # ---- ambiente do cenário -------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -94,7 +98,9 @@ W() {   # W [VAR=valor ...] [-- args do vigia] : roda o vigia no ambiente do cen
   local extra=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do extra+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
-  env -i HOME="$HM" PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$T/tmp" TZ="$TZNAME" \
+  # PYTHONDONTWRITEBYTECODE=1: o python NÃO grava bytecode em lugar nenhum, então o HOME falso fica vazio em qualquer python (o grupo saida confere). PYTHONPYCACHEPREFIX=$PYC: de onde ele LÊ o bytecode, aquecido uma vez no fim deste arquivo;
+  # sem isso cada rodada recompilaria a stdlib (medido no Linux com o python de mentira: 2x o tempo, ~3x a CPU).
+  env -i HOME="$HM" PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$PYC" PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$T/tmp" TZ="$TZNAME" \
     GC_CITY_PATH="$C" GC_BIN="$T/bin/gc" SSH_BIN="$T/bin/ssh" HETZNER_OCC_NOW="$NOW" \
     STUB_DIR="$T/stub" STUB_GC_FILE="${STUB_GC_FILE:-}" STUB_GC_RC="${STUB_GC_RC:-0}" STUB_GC_SLEEP="${STUB_GC_SLEEP:-}" \
     STUB_SSH_FILE="${STUB_SSH_FILE:-}" STUB_SSH_RC="${STUB_SSH_RC:-0}" STUB_SSH_SLEEP="${STUB_SSH_SLEEP:-}" STUB_OUTFAIL="${STUB_OUTFAIL:-}" \
@@ -334,7 +340,7 @@ g_estado() {
   # (sessão, CPU) → estado. "?" = não lida. Cada linha prepara um cenário próprio.
   local row sess cpu want
   for row in "1 baixa ocupado" "1 alta ocupado" "1 ? ocupado" "0 baixa ocioso" "0 alta ocupado" "0 ? desconhecido" "? baixa desconhecido" "? alta ocupado" "? ? desconhecido"; do
-    set -- $row; sess=$1; cpu=$2; want=$3
+    sess=${row%% *}; cpu=${row#* }; cpu=${cpu%% *}; want=${row##* }   # expansão de parâmetro: `set -- $row` globava o "?" contra os arquivos do cwd (um arquivo "x" lá e o grupo reprovava sem motivo); não é here-string porque no bash 3.2 ela vira arquivo temporário
     fresh; tick 900 5 >/dev/null
     case "$sess" in 1) sessions_are "$SJ_REMOTE" ;; 0) sessions_are "$SJ_NONE" ;; "?") STUB_GC_RC=1 ;; esac
     case "$cpu" in
@@ -410,7 +416,13 @@ g_saida() {
   eq "gc só chamado para 'session list --json'" 0 "$(grep '^gc ' "$T/stub/gc.calls" | grep -v -e ' session list --json$' | wc -l | tr -d ' ')"
   eq "gc sempre com --city explícito (não depende do cwd do launchd)" 0 "$(grep '^gc ' "$T/stub/gc.calls" | grep -v "^gc --city $C " | wc -l | tr -d ' ')"
   eq "o que o vigia escreve em .gc (e nada além; os logs são do cenário)" "hetzner-occupancy-daily.json hetzner-occupancy.jsonl hetzner-occupancy.lock hetzner-occupancy.state.json" "$(ls "$C/.gc" | grep -v -e '^logs$' | tr '\n' ' ' | sed 's/ $//')"
-  eq "e nada no HOME" "" "$(ls -A "$HM" | tr '\n' ' ' | sed 's/ $//')"
+  eq "e nada no HOME, nem o bytecode do python (o W() fixa como o python grava)" "" "$(ls -A "$HM" | tr '\n' ' ' | sed 's/ $//')"
+  # controle da conferência acima: o python de mentira TEM de sujar o HOME quando o ambiente não diz como gravar bytecode; se deixar de sujar, a conferência passa por vazio no Linux (o buraco do gate ga-ztz9yn)
+  fresh; env -i HOME="$HM" PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" python3 -c 'import json, re' >/dev/null 2>&1
+  check "controle: sem o ambiente do W(), o python de mentira escreve no HOME (a conferência acima não passa por vazio)" "$([ -n "$(ls -A "$HM")" ] && echo 1 || echo 0)"
+  # a variável vista de dentro do processo: o HOME vazio sozinho passaria só pelo cache fora dele (no Linux, sem a variável, ainda passa); a que o revisor do gate mediu no mini é esta
+  printf 'import os; print(os.environ.get("PYTHONDONTWRITEBYTECODE", ""))\n' > "$T/envprobe.py"; ( WATCH="$T/envprobe.py"; W -- )
+  eq "o W() entrega PYTHONDONTWRITEBYTECODE=1 ao python" 1 "$(cat "$WOUT")"
 }
 
 # ============================================================================================================================================================================
@@ -521,6 +533,7 @@ run_groups() { local g; for g in "$@"; do "g_$g"; done; }
 DEFAULT="$GROUPS_ALL mutantes"; [ -z "${HOCC_NO_MUTANTS:-}" ] || DEFAULT="$GROUPS_ALL"
 wanted="${*:-$DEFAULT}"
 for g in $wanted; do case " $GROUPS_ALL mutantes " in *" $g "*) ;; *) echo "grupo desconhecido: $g (grupos: $GROUPS_ALL mutantes)" >&2; exit 2 ;; esac; done
+fresh; W PYTHONDONTWRITEBYTECODE= -- --print-config   # aquece o cache de bytecode (ver o W()): vazio = esta rodada grava, em $PYC e não no HOME; as seguintes e os mutantes só leem
 run_groups $wanted
 
 echo ""
