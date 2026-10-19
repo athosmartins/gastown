@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que esta fatia é — e o que não é · Estado: o que está vivo · Como usar (comandos) · Os degraus e os limites (e por quê) · O veredito · Como ligar a sombra do Pilot · Como ler a sombra · Ligar e desligar o nó primeiro (`on`) · Subir os tetos fixos · O que falta para o "nó primeiro" de verdade · Medido, inferido, não testado · Limites
+• O que esta fatia é — e o que não é · Estado: o que está vivo · Como usar (comandos) · Os degraus e os limites (e por quê) · O veredito · Sessão ocupada × sessão viva (ga-2hd02v.1.22) · Como ligar a sombra do Pilot · Como ler a sombra · Ligar e desligar o nó primeiro (`on`) · Subir os tetos fixos · O que falta para o "nó primeiro" de verdade · Medido, inferido, não testado · Limites
 
 Bead ga-2hd02v.1.11 (fatia da ga-2hd02v.1; objetivo do Athos: o mini para de entrar em swap, o Hetzner pago trabalha 24/7). **Entrega duas peças, em duas fatias** (a ga-2hd02v.1.11 foi recusada 3x pelo teto de tamanho do gate): (1) `scripts/hetzner-capacity.py` — fatia A, ga-5yp4n1, **tem que estar no main antes desta** — que mede o nó e responde "quantas sessões ele aguenta agora" (um teto que sobe em degraus 1→3→6→10 só com evidência, e desce sozinho) e "esta bead vai ao nó ou fica no mini" (`verdict`); (2) o **modo sombra** do Pilot (`PILOT_NODE_FIRST=shadow`) — fatia B, ga-elvr8e, esta —, que consulta o veredito para cada bead de dog do HQ e **registra** o que faria, sem mudar o despacho.
 
@@ -60,10 +60,35 @@ A primeira condição que falha decide; **só `node` autoriza**.
 | 8 | leitura ilegível | NÃO SEI `reading_unreadable` |
 | 9 | vermelho | MINI `node_hot` |
 | 10 | sessões do nó ilegíveis | NÃO SEI `sessions_unreadable` |
-| 11 | sessões ≥ **min(degrau, cap do provider)** | MINI `node_full` |
+| 11 | sessões **ocupadas** ≥ **min(degrau, cap do provider)** | MINI `node_full` |
 | 12 | senão | **NÓ** `free_slot` |
 
 A condição 5 é o que impede ligar o envio cedo demais: uma bead entregue no nó sem `gate_done_bin` não chega ao gate (ga-2hd02v.1.13) e encalha até o `inflight-reclaim-guard` reclamá-la em 25 min.
+
+## Sessão ocupada × sessão viva (ga-2hd02v.1.22)
+
+**O sintoma (19/10):** desde que o nó primeiro foi ligado (15:25) o veredito era `local:node_full` (ativas 3–5, teto 3) e **nenhuma** bead foi ao nó — com as 3 `dog-remote` **ociosas**. O oráculo contava `list-running` (tmux vivas), não trabalho.
+
+**A regra agora.** Uma `dog-remote` conta **ocupada** só se há uma bead `in_progress` atribuída ao alias dela (`dog-remote-<n>`; o nome da sessão no nó, `dog-remote-<id>`, também vale). Sem bead, a sessão é **vaga livre**: o Pilot a reaproveita atribuindo a bead e acordando o alias. Para casar a tmux do nó com o alias o oráculo lê `gc session list --json` (`session_name` → `alias`) e `bd list --status in_progress --json`. A leitura expõe `sessions` (ocupadas, o que o veredito e a prova de carga leem), `sessions_total` (tmux vivas) e `sessions_idle` (vagas livres):
+
+```bash
+python3 -I scripts/hetzner-capacity.py --json read | jq '{sessions, sessions_total, sessions_idle, idle_why}'
+```
+
+| situação do nó | conta | veredito |
+|---|---|---|
+| 3 `dog-remote` vivas, nenhuma bead no alias | 0 ocupadas, 3 ociosas | **NÓ** `free_slot` (3 livres) |
+| 3 vivas, as 3 com bead `in_progress` no alias | 3 ocupadas | MINI `node_full` |
+| bead de outro dono (ex.: o próprio dog) ou sem dono | não conta | — |
+| sessão sem alias, que o `gc` não lista, ou cujo alias não é de pool (`dog-remote-<n>`): `gate-reviewer-*`, `wa-worker-*`, `dog-remote-adhoc-*` | **sempre ocupada** (não há bead-por-alias que prove que está parada) | como antes |
+| **`bd` ou `gc` falhou / estourou 15 s / devolveu lixo ou formato errado** | **todas ocupadas**, motivo em `idle_why` | MINI `node_full` (nunca enche o nó além do teto) |
+| `bd` devolveu `[]` (lido, vazio) | ninguém trabalha → vagas | NÓ |
+
+Os três estados valem para as duas leituras: **lido e vazio ≠ falhou**. Falhar nunca vira "ociosa": é o veredito de antes desta mudança. **Prazo:** o `gc session list` leva 10–21 s no mini carregado (load 44, medido em 19/10) e o `bd list` ~3 s; as duas leituras correm em paralelo (custo = a maior, 25 s o gc e 15 s o bd) para caber nos 40 s que o Pilot dá ao veredito, e só são refeitas a cada `refresh_s` (60 s). Estourar o prazo é "ilegível" → ocupadas → `node_full`: se o mini passar muito tempo acima disso, o oráculo volta ao comportamento antigo (seguro, mas sem efeito) — o sinal é `idle_why` com "prazo" no `hetzner-capacity.py --json verdict` (`detail` e `reading.idle_why`). A prova de carga que sobe o degrau também é de sessão **ocupada** — dog ocioso não prova que o nó aguentou o degrau.
+
+**O que este oráculo NÃO resolve sozinho — por que `idle_timeout = "15m"` não esvaziava o nó.** O `idle_timeout` do `agents/dog-remote/agent.toml` **funciona**: o engine mata a sessão ociosa (`session.idle_killed`, `sleep_reason=idle-timeout`, `state=asleep`). Mas o Pilot abre a `dog-remote` com `gc session new`, e a bead dela fica com `session_origin=manual`; no `compute_awake_set` (tag `engwin-20261011b`) toda sessão **manual** não fechada entra no conjunto desejado (`desired[...]="manual"`) — o reconciliador a **reacorda** em 1–9 min como um claude novo, sem bead. O ciclo mata/reacorda repete, e a sessão fica sempre viva e ociosa. O conserto do engine (sessão manual que dormiu por `idle-timeout` fica dormindo até acordo explícito) está em `docs/pending-engine-window/ga-2hd02v.1.22-manual-idle-timeout-stays-asleep.patch` (+ `.README.md`), para a **janela de engine**; sem build nem troca viva.
+
+Efeito prático até a janela: o oráculo já deixa de dizer `node_full`, mas o `_pilot_node_pick_alias` do Pilot só escolhe alias `new`/`asleep` (uma `dog-remote` acordada e ociosa continua bloqueando). Com o patch, a sessão que o `idle_timeout` mata **fica** `asleep` e o Pilot a acorda com a bead (já faz `gc session wake` em alias dormindo).
 
 ## Como ligar a sombra do Pilot
 

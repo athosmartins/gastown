@@ -21,12 +21,21 @@
 #     a ferramenta: state.json é posto de lado com alarme e `step` cura (rc 0), `status` erra com rc 3, config.json/session-ssh.json/remote-shim.json viram NÃO SEI (rc 2) e
 #     `pause` erra (rc 3) sem gravar · exceção inesperada: verdict → NÃO SEI `internal` (rc 2), outros → rc 3 (o traceback do Python sairia 1 = MINI) · ssh que não executa é
 #     NÃO SEI (ferramenta quebrada), não MINI (nó fora) · gate_done_bin relativo é MINI (o atalho recusa).
+#   sessão ocupada × ociosa (g_idle, ga-2hd02v.1.22): 3 dog-remote vivas SEM bead in_progress no alias = o nó TEM vaga (NÓ free_slot) · 3 COM bead = node_full · mistas contam
+#     só as com bead · a bead no nome da sessão também vale · bead de outro dono e a sem dono não contam · TERCEIRO ESTADO: bd ou gc que falha / devolve lixo / não-lista / vazio
+#     = todas as sessões contam OCUPADAS (node_full, com o motivo em idle_why), nunca "ociosas" · `[]` lido = ninguém trabalha = vaga · sessão sem alias, fora da lista do gc,
+#     gate-reviewer / wa-worker / dog-remote-adhoc contam ocupadas · a prova de carga do degrau é de sessão OCUPADA (dog ocioso não faz o teto subir) ·
+#     PRAZO: gc e bd correm em PARALELO (o custo é o maior prazo, não a soma: o gc leva 10-21 s no mini carregado e o Pilot dá 40 s ao veredito inteiro) · estourar o prazo
+#     de qualquer um é ilegível (ocupadas, motivo 'prazo') · HETZNER_CAPACITY_READ_TIMEOUT_S só encurta o prazo e o valor inválido cai no padrão.
 # CONTROLE NEGATIVO: ilegível contado como verde · sem prova de carga · degrau que pula · evidência que vale duas vezes · `present()` que engole erro · veredito sem o
 #   gate_done · cap ignorado · `>` no lugar de `>=` na vaga · sessões ilegíveis viram 0 · leitura velha autoriza · leitura sem `state` válida · leitura no futuro autoriza ·
 #   vermelho só com CPU E RAM · âmbar vira verde · `max` no lugar de `min` na CPU · estado ilegível recomeça · falha de ssh vira leitura ok · load5 `nan` aceito ·
 #   leitura "ok" de cor desconhecida autoriza · state.json não-UTF-8 / aninhado fundo / sem changed_why não tratados · config.json não-UTF-8 · config de fora aninhada ·
-#   sem catch-all · catch-all que sai 1 · ssh que não executa vira nó fora · gate_done_bin relativo aceito — cada um é aplicado numa cópia e a bateria TEM que falhar.
-# VARIÁVEIS: HC_UNDER_TEST (script a testar) · HC_PY (interpretador; padrão /usr/bin/python3 = o 3.9 do mini) · HC_NO_MUTANTS=1
+#   sem catch-all · catch-all que sai 1 · ssh que não executa vira nó fora · gate_done_bin relativo aceito · (ga-2hd02v.1.22) rc≠0 do gc/bd ignorado · leitura que falhou conta ociosa ·
+#   bead de qualquer dono / só a primeira bead / saída não-lista vira "ninguém trabalha" · sessão sem alias, gate-reviewer / wa-worker e dog-remote-adhoc contam ociosas ·
+#   bead no nome da sessão não vale · o veredito conta todas as vivas · sessão fantasma sem dog-remote · leituras em sequência · prazo estourado vira lista vazia ·
+#   prazo de teste que alonga o padrão · prazo inválido/<=0 vira quase zero — cada um é aplicado numa cópia e a bateria TEM que falhar.
+# VARIÁVEIS: HC_UNDER_TEST (script a testar) · HC_PY (interpretador; padrão /usr/bin/python3 = o 3.9 do mini) · HC_NO_MUTANTS=1 · HC_ONLY=<grupo> (só g_<grupo>: read, step, verdict, third, idle; sem mutantes)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${HC_UNDER_TEST:-$HERE/hetzner-capacity.py}"
@@ -59,8 +68,44 @@ cat > "$W/list-stub" <<'EOF'
 W="$(dirname "$0")"
 if [ -f "$W/list.rc" ] && [ "$(cat "$W/list.rc")" != 0 ]; then echo "provider: ssh falhou" >&2; exit "$(cat "$W/list.rc")"; fi
 i=0; while [ "$i" -lt "$(cat "$W/sessions" 2>/dev/null || echo 0)" ]; do echo "dog-remote-s$i"; i=$((i+1)); done
+[ -f "$W/list.extra" ] && cat "$W/list.extra"
+exit 0
 EOF
-chmod +x "$W/ssh-stub" "$W/list-stub"
+# `gc session list --json` (ga-2hd02v.1.22): a sessão dog-remote-s<i> do nó tem o alias dog-remote-<i+1>; gcl.skip = sessões que o gc NÃO lista; gcl.noalias = sessões sem alias; gcl.raw = a saída crua; gcl.sleep = segundos de demora
+cat > "$W/gcl-stub" <<'EOF'
+#!/bin/sh
+W="$(dirname "$0")"
+[ -f "$W/gcl.sleep" ] && sleep "$(cat "$W/gcl.sleep")"
+if [ -f "$W/gcl.rc" ] && [ "$(cat "$W/gcl.rc")" != 0 ]; then echo '{"sessions":[]}'; echo "gc: dolt fora" >&2; exit "$(cat "$W/gcl.rc")"; fi
+[ -f "$W/gcl.raw" ] && { cat "$W/gcl.raw"; exit 0; }
+printf '{"sessions":['
+i=0; sep=""
+while [ "$i" -lt "$(cat "$W/sessions" 2>/dev/null || echo 0)" ]; do
+  if ! grep -qx "dog-remote-s$i" "$W/gcl.skip" 2>/dev/null; then
+    a="dog-remote-$((i+1))"; grep -qx "dog-remote-s$i" "$W/gcl.noalias" 2>/dev/null && a=""
+    printf '%s{"session_name":"dog-remote-s%s","alias":"%s","template":"dog-remote","state":"active","closed":false}' "$sep" "$i" "$a"; sep=","
+  fi
+  i=$((i+1))
+done
+for x in $(cat "$W/list.extra" 2>/dev/null); do   # as sessões extras do nó (gate-reviewer, wa-worker, dog-remote-adhoc) o gc lista com alias = o próprio nome
+  printf '%s{"session_name":"%s","alias":"%s","template":"x","state":"active","closed":false}' "$sep" "$x" "$x"; sep=","
+done
+printf '%s{"session_name":"mayor","alias":"mayor","template":"mayor","state":"active","closed":false}]}\n' "$sep"
+EOF
+# `bd list --status in_progress --json`: busy = "all" (toda sessão do nó tem bead), "none" ou os números dos aliases que têm; sempre traz uma bead de OUTRO dono (ruído que não pode contar); bd.raw = a saída crua; bd.sleep = segundos de demora
+cat > "$W/bd-stub" <<'EOF'
+#!/bin/sh
+W="$(dirname "$0")"
+[ -f "$W/bd.sleep" ] && sleep "$(cat "$W/bd.sleep")"
+if [ -f "$W/bd.rc" ] && [ "$(cat "$W/bd.rc")" != 0 ]; then echo '[]'; echo "bd: dolt fora" >&2; exit "$(cat "$W/bd.rc")"; fi
+[ -f "$W/bd.raw" ] && { cat "$W/bd.raw"; exit 0; }
+n=$(cat "$W/sessions" 2>/dev/null || echo 0); b=$(cat "$W/busy" 2>/dev/null || echo all)
+if [ "$b" = all ]; then b=""; i=1; while [ "$i" -le "$n" ]; do b="$b $i"; i=$((i+1)); done; fi
+printf '['
+for k in $b; do [ "$b" = none ] && break; printf '{"id":"ga-b%s","status":"in_progress","assignee":"dog-remote-%s"},' "$k" "$k"; done
+printf '{"id":"ga-x","status":"in_progress","assignee":"gastown.dog-2"},{"id":"ga-y","status":"in_progress"}]\n'
+EOF
+chmod +x "$W/ssh-stub" "$W/list-stub" "$W/gcl-stub" "$W/bd-stub"
 
 node() {  # node IDLE_PCT LOAD5 MEM_AVAIL_PCT  → resposta do nó com 16 núcleos, 32 GB, entre os marcadores (e com ruído de .bashrc antes)
   local idle="$1" load="$2" mem="$3" d=$(( $1 * 10 ))
@@ -71,15 +116,18 @@ node() {  # node IDLE_PCT LOAD5 MEM_AVAIL_PCT  → resposta do nó com 16 núcle
     echo "@@CAP-END@@"; } > "$W/ssh.out"; rm -f "$W/ssh.rc"
 }
 sess() { echo "$1" > "$W/sessions"; rm -f "$W/list.rc"; }
+busy() { echo "$*" > "$W/busy"; }      # busy all | none | N N… (números dos aliases dog-remote-N com bead in_progress)
 mkcfg() {  # mkcfg CAP [released]
   printf '{"default_host":"hetzner","hosts":{"hetzner":{"ssh":"stub","cap":%s,"remote_root":"/r","remote_home":"/h"%s}}}\n' "$1" "${2-,\"real_sessions_released_by\":\"mayor teste\"}" > "$SSHJ"
 }
 mkshim() { printf '{"city":"/c","gate_done_bin":%s}\n' "${1-\"$GDB\"}" > "$SHIM"; }
-newcity() { D="$T/d.$((++nd))"; mkdir -p "$D"; mkcfg 10; mkshim; node 70 3 90; sess 3; rm -f "$W/ssh.calls" "$W/ssh.sleep" "$W/list.rc"; NOW=$T0; }
+RT=""      # RT=N → HETZNER_CAPACITY_READ_TIMEOUT_S=N (encurta o prazo das leituras de gc/bd); newcity zera
+newcity() { RT=""; D="$T/d.$((++nd))"; mkdir -p "$D"; mkcfg 10; mkshim; node 70 3 90; sess 3; busy all; rm -f "$W/ssh.calls" "$W/ssh.sleep" "$W/list.rc" "$W/list.extra" "$W"/gcl.* "$W"/bd.*; NOW=$T0; }
 nd=0
 hc() {  # hc ARGS → $OUT (stdout), $RC
   OUT=$(HETZNER_CAPACITY_DIR="$D" GC_SSH_CONFIG="$SSHJ" HETZNER_CAPACITY_SHIM_CONFIG="$SHIM" HETZNER_CAPACITY_NOW="$NOW" \
-        HETZNER_CAPACITY_SSH_CMD="[\"$W/ssh-stub\"]" HETZNER_CAPACITY_LIST_CMD="[\"$W/list-stub\"]" "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
+        HETZNER_CAPACITY_SSH_CMD="[\"$W/ssh-stub\"]" HETZNER_CAPACITY_LIST_CMD="[\"$W/list-stub\"]" \
+        HETZNER_CAPACITY_SESSIONS_CMD="[\"$W/gcl-stub\"]" HETZNER_CAPACITY_BEADS_CMD="[\"$W/bd-stub\"]" HETZNER_CAPACITY_READ_TIMEOUT_S="$RT" "$PY" -I "$P" "$@" 2>"$W/err"); RC=$?
 }
 at() { NOW=$((T0 + $1)); }
 jget() {  # jget CAMPO.PONTADO → valor do $OUT (JSON), texto simples; null/ausente → "null"
@@ -307,8 +355,75 @@ v=json.loads(b.getvalue()); print(rc1, v["verdict"], v["reason"], rc2)' "$P" 2>&
   check "remote-shim.json aninhado fundo demais: NÃO SEI shim_config, sem traceback" "2 shim_config 0" "$RC $(jget reason) $(grep -c Traceback "$W/err")"
 }
 
-if [ -n "${HC_MUTANT:-}" ]; then g_third; g_read; g_step; g_verdict; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
-g_read; g_step; g_verdict; g_third
+# ga-2hd02v.1.22: sessão VIVA não é sessão OCUPADA. dog-remote sem bead in_progress no alias é vaga; o que não dá para provar ocioso (bead ilegível, gc ilegível, sem alias, não é dog-remote) conta como ocupado.
+g_idle() {
+  idle_city() { newcity; sess 3; hc --json set-ceiling 3 --reason t; busy "$1"; at 70; }
+  idle_city none; hc --json verdict
+  check "ocioso: 3 sessões dog-remote vivas SEM bead → NÓ com vaga (rc 0), não nó cheio" "0 node free_slot" "$RC $(jget verdict) $(jget reason)"
+  check "ocioso: ocupadas 0 de teto 3 → 3 livres" "0 3" "$(jget active) $(jget free)"
+  check "ocioso: a leitura separa total, ocupadas e ociosas" "3 0 3" "$(jget reading.sessions_total) $(jget reading.sessions) $(jget reading.sessions_idle)"
+  busy all; at 140; hc --json verdict
+  check "ocupado: 3 sessões COM bead in_progress no alias → MINI node_full (rc 1)" "1 local node_full 3" "$RC $(jget verdict) $(jget reason) $(jget active)"
+  busy 2; at 210; hc --json verdict
+  check "misto: só dog-remote-2 tem bead → NÓ, 1 ocupada e 2 livres" "node 1 2" "$(jget verdict) $(jget active) $(jget free)"
+  busy 1 2; at 280; hc --json verdict
+  check "misto: duas com bead, uma ociosa → NÓ com 1 vaga (o teto é 3)" "node 2 1" "$(jget verdict) $(jget active) $(jget free)"
+  busy s0; at 350; hc --json verdict
+  check "bead atribuída ao NOME da sessão (não ao alias) também a torna ocupada" "node 1 2" "$(jget verdict) $(jget active) $(jget free)"
+  # a bead de OUTRO dono (e a sem dono) está em todas as respostas do stub: só o alias exato da sessão prova que ela trabalha
+  busy none; at 420; hc --json verdict
+  check "bead in_progress de outro dono não torna a sessão ocupada" "node 0" "$(jget verdict) $(jget active)"
+
+  # TERCEIRO ESTADO: bead ilegível NÃO é "sem bead". Falhou → a sessão conta como ocupada (nunca enche o nó além do teto)
+  idle_city none; echo 1 > "$W/bd.rc"; hc --json verdict
+  check "bd falhou: 3 sessões contam OCUPADAS → MINI node_full (nunca 'ociosas')" "1 local node_full 3" "$RC $(jget verdict) $(jget reason) $(jget active)"
+  check "bd falhou: o motivo fica na leitura (idle_why) e a total segue 3" "yes 3" "$([ -n "$(jget reading.idle_why)" ] && [ "$(jget reading.idle_why)" != null ] && echo yes || echo no) $(jget reading.sessions_total)"
+  rm -f "$W/bd.rc"
+  for raw in 'isto nao e json' '{"a":1}' '[1,2]' '[{"assignee":7}]' ''; do
+    idle_city none; printf '%s' "$raw" > "$W/bd.raw"; hc --json verdict
+    check "bd devolveu '$raw' (ilegível): MINI node_full, não NÓ" "local node_full" "$(jget verdict) $(jget reason)"
+  done
+  idle_city none; echo '[]' > "$W/bd.raw"; hc --json verdict
+  check "bd devolveu [] (lista lida e vazia): ninguém tem bead → NÓ" "node 0" "$(jget verdict) $(jget active)"
+  idle_city none; echo 1 > "$W/gcl.rc"; hc --json verdict
+  check "gc session list falhou: sem alias para casar com a bead → 3 ocupadas, MINI node_full" "local node_full 3" "$(jget verdict) $(jget reason) $(jget active)"
+  for raw in 'lixo' '{"sessions":"x"}' '[]' ''; do
+    idle_city none; printf '%s' "$raw" > "$W/gcl.raw"; hc --json verdict
+    check "gc session list devolveu '$raw' (ilegível): MINI node_full" "local node_full" "$(jget verdict) $(jget reason)"
+  done
+
+  # PRAZO e PARALELISMO: o gc leva 10-21 s no mini carregado e o Pilot dá 40 s ao veredito inteiro — as duas leituras correm juntas, e estourar o prazo é ilegível (ocupada)
+  idle_city none; echo 3 > "$W/gcl.sleep"; echo 3 > "$W/bd.sleep"; t0=$SECONDS; hc --json verdict; el=$((SECONDS - t0))
+  check "paralelo: gc e bd de 3 s cada, ociosas → NÓ" "node 0" "$(jget verdict) $(jget active)"
+  check "paralelo: as duas leituras custam o MAIOR prazo (~3 s), não a soma (6 s): levou ${el}s" "yes" "$([ "$el" -le 5 ] && echo yes || echo no)"
+  idle_city none; echo 4 > "$W/gcl.sleep"; RT=1; hc --json verdict
+  check "gc estourou o prazo: 3 ocupadas, MINI node_full (nunca 'ociosas')" "local node_full 3" "$(jget verdict) $(jget reason) $(jget active)"
+  check "gc estourou o prazo: o motivo diz 'prazo'" "yes" "$(case "$(jget reading.idle_why)" in *prazo*) echo yes;; *) echo no;; esac)"
+  idle_city none; echo 4 > "$W/bd.sleep"; RT=1; hc --json verdict
+  check "bd estourou o prazo: 3 ocupadas, MINI node_full (prazo não é 'ninguém trabalha')" "local node_full 3" "$(jget verdict) $(jget reason) $(jget active)"
+  rt() { HETZNER_CAPACITY_READ_TIMEOUT_S="$1" "$PY" -I -c 'import importlib.util,sys
+sp=importlib.util.spec_from_file_location("hc",sys.argv[1]); m=importlib.util.module_from_spec(sp); sp.loader.exec_module(m); print(m.read_timeout(15.0))' "$P"; }
+  check "HETZNER_CAPACITY_READ_TIMEOUT_S só ENCURTA (1→1, 30→15) e o inválido cai no padrão (abc, 0, -5, nan, inf, vazio → 15)" "1.0 15.0 15.0 15.0 15.0 15.0 15.0 15.0" \
+    "$(rt 1) $(rt 30) $(rt abc) $(rt 0) $(rt -5) $(rt nan) $(rt inf) $(rt '')"
+
+  # o que não dá para provar ocioso fica ocupado: sem alias, fora da lista do gc, outro papel (gate-reviewer, wa-worker), dog-remote-adhoc
+  idle_city none; echo dog-remote-s1 > "$W/gcl.skip"; hc --json verdict
+  check "sessão que o gc não lista (sem alias conhecido): conta OCUPADA" "node 1 2" "$(jget verdict) $(jget active) $(jget reading.sessions_idle)"
+  idle_city none; echo dog-remote-s2 > "$W/gcl.noalias"; hc --json verdict
+  check "sessão sem alias: conta OCUPADA" "node 1 2" "$(jget verdict) $(jget active) $(jget reading.sessions_idle)"
+  idle_city none; printf 'gate-reviewer-remote-adhoc-aaa\nwa-worker-remote-bbb\ndog-remote-adhoc-ccc\n' > "$W/list.extra"; hc --json verdict
+  check "gate-reviewer / wa-worker / dog-remote-adhoc no nó, MESMO listados no gc com alias: contam OCUPADOS (só alias de pool dog-remote-<n> prova ocioso)" "6 3 3 local node_full" "$(jget reading.sessions_total) $(jget reading.sessions) $(jget reading.sessions_idle) $(jget verdict) $(jget reason)"
+
+  # a prova de carga do degrau é de sessão OCUPADA: dog ocioso não prova que o nó aguentou o degrau
+  newcity; sess 3; busy none; node 70 3 90; series 0 2400 300
+  check "step: 3 sessões OCIOSAS não são prova de carga → não sobe do degrau 1" "1" "$(ceil)"
+  newcity; sess 3; busy all; node 70 3 90; series 0 2400 300
+  check "step: 3 sessões OCUPADAS são prova de carga → sobe para 3" "3" "$(ceil)"
+}
+
+if [ -n "${HC_MUTANT:-}" ]; then g_third; g_read; g_step; g_verdict; g_idle; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+if [ -n "${HC_ONLY:-}" ]; then "g_$HC_ONLY"; echo "── $((n - fails))/$n ok (só g_$HC_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
+g_read; g_step; g_verdict; g_third; g_idle
 
 [ -n "${HC_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -368,6 +483,23 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
         return 1'
   mutant "ssh que não executa vira nó fora" 'except (ConnectionError, subprocess.TimeoutExpired) as e:' 'except (ConnectionError, subprocess.TimeoutExpired, OSError) as e:'
   mutant "gate_done_bin relativo passa por executável" 'os.path.isabs(v) and os.path.isfile(v)' 'os.path.isfile(v)'
+  mutant "bd/gc com rc≠0 mas JSON válido: o rc é ignorado" 'if p.returncode != 0:
+        raise Unreadable(f"{what} saiu com' 'if False:
+        raise Unreadable(f"{what} saiu com'
+  mutant "leitura de bead/sessão que falhou conta como ociosa" 'return len(names), 0, f"não provei nenhuma sessão ociosa: {e}"' 'return others, len(dogs), ""'
+  mutant "bead de qualquer dono torna ocupada, em vez de a do alias" 'idle = [n for n in dogs if n in owners and not (owners[n] & working)]' 'idle = [n for n in dogs if n in owners and not working]'
+  mutant "bead de outro dono não conta (só a primeira bead vale)" 'return {b["assignee"] for b in rows if isinstance(b.get("assignee"), str) and b["assignee"]}' 'return {b["assignee"] for b in rows[:1] if isinstance(b.get("assignee"), str) and b["assignee"]}'
+  mutant "sessão sem alias conhecido conta ociosa" 'idle = [n for n in dogs if n in owners and not (owners[n] & working)]' 'idle = [n for n in dogs if not (owners.get(n, set()) & working)]'
+  mutant "gate-reviewer / wa-worker / dog-remote-adhoc com alias no gc contam ociosas (alias de pool não é exigido)" ' and POOL_DOG_ALIAS.fullmatch(x["alias"])}' ' and x["alias"]}'
+  mutant "dog-remote-adhoc-* vale como alias de pool (padrão frouxo)" 'POOL_DOG_ALIAS = re.compile(r"dog-remote-[0-9]+")' 'POOL_DOG_ALIAS = re.compile(r"dog-remote-.*")'
+  mutant "bead no NOME da sessão não a torna ocupada" 'return {x["session_name"]: {x["alias"], x["session_name"]} for x in rows' 'return {x["session_name"]: {x["alias"]} for x in rows'
+  mutant "saída do bd que não é lista de beads vira 'ninguém trabalha'" 'raise Unreadable("bd list in_progress: a saída não é uma lista de beads")' 'return set()'
+  mutant "o veredito conta TODAS as vivas (a leitura antiga)" 'return len(names) - len(idle), len(idle), ""' 'return len(names), len(idle), ""'
+  mutant "as duas leituras em sequência (a soma, não o maior)" '        f_owners, f_work = pool.submit(session_owners), pool.submit(busy_aliases)' '        f_owners = pool.submit(session_owners); f_owners.exception(); f_work = pool.submit(busy_aliases)'
+  mutant "leitura que estourou o prazo vira lista vazia (ninguém trabalha)" '        raise Unreadable(f"{what} estourou o prazo ({limit:g}s)")' '        return []'
+  mutant "o prazo do teste alonga o padrão" '    return min(v, default) if v > 0 else default' '    return v if v > 0 else default'
+  mutant "prazo inválido ou <= 0 vira prazo quase zero" '    return min(v, default) if v > 0 else default' '    return min(v, default) if v > 0 else 0.001'
+  mutant "sem dog-remote no nó, conta uma sessão fantasma" 'return others, 0, ""' 'return others + 1, 0, ""'
 }
 echo "── $((n - fails))/$n ok"
 [ "$fails" = 0 ]

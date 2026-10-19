@@ -2,7 +2,7 @@
 """hetzner-capacity.py — o teto de sessões do nó Hetzner por MEDIÇÃO e o veredito "nó ou mini". ga-2hd02v.1.11. Python 3.9+, só biblioteca padrão.
 
 Contents
-  Para que serve · Comandos · Os degraus · O veredito · Três estados · Arquivos · O que NÃO faz
+  Para que serve · Comandos · Os degraus · O veredito · Sessão ocupada × ociosa · Três estados · Arquivos · O que NÃO faz
 
 PARA QUE SERVE
   O mini vive em swap; o nó (16 núcleos, 32 GB, sem swap) fica ocioso. Esta ferramenta responde duas perguntas com número medido, nunca com chute:
@@ -32,7 +32,19 @@ O VEREDITO  (a primeira condição que falha decide; só `node` autoriza)
   pausa → MINI · config do provider ilegível → NÃO SEI · `real_sessions_released_by` ausente → MINI · config do atalho ilegível → NÃO SEI ·
   `gate_done_bin` nulo, relativo ou não executável → MINI (o atalho recusa caminho relativo; uma bead no nó sem como entregar ao gate encalha: ga-2hd02v.1.13) · sem nenhuma leitura, ou a última mais velha que
   `max_age_s` (ou carimbada mais de 60 s no futuro) → NÃO SEI · último ssh não conectou → MINI (nó fora) · leitura ilegível → NÃO SEI · vermelho → MINI (nó quente) · sessões do nó ilegíveis → NÃO SEI ·
-  sessões >= min(degrau, cap do provider) → MINI (nó cheio) · senão NÓ.
+  sessões OCUPADAS >= min(degrau, cap do provider) → MINI (nó cheio) · senão NÓ.
+
+SESSÃO OCUPADA × OCIOSA  (ga-2hd02v.1.22: o nó "cheio" de dogs parados)
+  O nó lista as tmux vivas; uma sessão viva NÃO é uma sessão trabalhando. Uma dog-remote conta OCUPADA só se há uma bead `in_progress` atribuída ao alias dela
+  (dog-remote-<n>; o nome da sessão no nó, dog-remote-<id>, também vale) — essa bead é o sinal de trabalho. Sem bead, a sessão é uma vaga LIVRE: o Pilot a reaproveita
+  (atribui a bead e acorda o alias). Para casar a tmux do nó com o alias lê-se `gc session list --json` (session_name → alias).
+  Conta sempre ocupada, sem prova em contrário: sessão que não é dog-remote-* (gate-reviewer, wa-worker), sessão cujo alias no gc não é de pool (`dog-remote-<n>`;
+  dog-remote-adhoc-* não tem bead-por-alias), sessão que o gc não lista ou lista sem alias (sem dono conhecido não dá para dizer que está parada).
+  Falhou/ilegível (gc ou bd com rc≠0, estourou o prazo, não é JSON, formato fora do esperado): TODAS as sessões do nó contam ocupadas e o motivo vai em `idle_why` —
+  nunca "ociosa por falta de leitura", para não lotar o nó (é o veredito de antes desta leitura). Lista vazia lida com sucesso é a ausência de bead (vaga livre), não falha.
+  Leituras: `sessions` = ocupadas (o que o veredito e a prova de carga do degrau usam), `sessions_total` = tmux vivas, `sessions_idle` = vagas livres.
+  Prazo: o `gc session list` leva 10-21 s no mini com load 44 (medido 19/10) e o `bd list` ~3 s; as duas leituras correm em PARALELO (custo = o maior prazo, não a soma),
+  com prazo de 25 s o gc e 15 s o bd, para caber nos 40 s que o Pilot dá ao veredito inteiro. A leitura é refeita no máximo a cada `refresh_s` (60 s). Estourou = ilegível = ocupadas.
 
 TRÊS ESTADOS
   Cada leitura do nó é ok / unreachable (ssh não conectou ou estourou o prazo) / unreadable (respondeu, mas faltou ou veio fora de faixa algum campo). Nenhuma
@@ -45,10 +57,12 @@ ARQUIVOS  (pasta de estado: $HETZNER_CAPACITY_DIR, senão <cidade>/.gc/hetzner-c
   state.json (degrau, desde quando, últimas leituras) · readings.jsonl (toda medição, para o antes×depois) · events.jsonl (mudança de degrau, pausa, alarme) ·
   config.json (opcional; chave desconhecida ou valor inválido = erro, não "usa o padrão") · pause.json · lock (um ciclo por vez; quem não pega o lock lê o cache).
   Lê também: $GC_SSH_CONFIG ou <cidade>/.gc/session-ssh.json (host, cap, liberação) e $HETZNER_CAPACITY_SHIM_CONFIG ou ~/.gastown/remote-shim.json (gate_done_bin).
-  Para os testes: HETZNER_CAPACITY_SSH_CMD e HETZNER_CAPACITY_LIST_CMD (lista JSON de argumentos) trocam o ssh e o list-running; HETZNER_CAPACITY_NOW (época) troca o relógio.
+  Para os testes: HETZNER_CAPACITY_SSH_CMD e HETZNER_CAPACITY_LIST_CMD (lista JSON de argumentos) trocam o ssh e o list-running; HETZNER_CAPACITY_SESSIONS_CMD e
+  HETZNER_CAPACITY_BEADS_CMD trocam o `gc session list --json` e o `bd list --status in_progress --json`; HETZNER_CAPACITY_READ_TIMEOUT_S ENCURTA o prazo dessas duas leituras
+  (25 s o gc, 15 s o bd; nunca alonga); HETZNER_CAPACITY_NOW (época) troca o relógio.
 
 O QUE NÃO FAZ
-  Não abre sessão, não atribui bead, não mexe em city.toml, agents/ nem session-ssh.json. O degrau é o teto de OPERAÇÃO; os tetos FIXOS (`cap` do host no provider
+  Não abre sessão, não encerra sessão, não atribui bead (só LÊ gc e bd), não mexe em city.toml, agents/ nem session-ssh.json. O degrau é o teto de OPERAÇÃO; os tetos FIXOS (`cap` do host no provider
   e `max_active_sessions` do dog-remote) continuam sendo o limite duro, e o veredito usa o MENOR dos dois. Quem leva a bead ao nó (atribuir ao alias dog-remote-<n> e
   abrir a sessão) é outra fatia: aqui só se diz se pode.
 """
@@ -58,12 +72,17 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 CITY = os.path.dirname(HERE)
+POOL_DOG_ALIAS = re.compile(r"dog-remote-[0-9]+")      # o alias do pool dog-remote: o Pilot atribui a bead a ele. dog-remote-adhoc-*, gate-reviewer-*, wa-worker-* não casam: não têm bead-por-alias
+READ_TIMEOUT_GC_S = 25       # `gc session list --json` leva 10-21 s no mini com load 44 (medido 19/10); estourou = ilegível = ocupada. As duas leituras correm em PARALELO: o custo é o da maior
+READ_TIMEOUT_BD_S = 15       # `bd list --status in_progress --json` leva ~3 s; ssh (2 leituras) + a maior das duas leituras cabe nos 40 s que o Pilot dá ao veredito inteiro
 
 DEFAULTS = {
     "host": "hetzner",                 # chave em session-ssh.json → hosts
@@ -281,8 +300,8 @@ def run_ssh(env: Env, cfg: dict, ssh_dest: str) -> str:
     return p.stdout.decode("utf-8", "replace")
 
 
-def count_sessions(env: Env, host: str) -> int:
-    """Sessões que o PROVIDER tem abertas no nó (o mesmo `list-running` do engine). Falha = Unreadable; saída vazia com rc 0 = zero."""
+def list_sessions(env: Env, host: str) -> list:
+    """Nomes das sessões que o PROVIDER tem abertas no nó (o mesmo `list-running` do engine). Falha = Unreadable; saída vazia com rc 0 = lista vazia."""
     cmd = json_env_cmd("HETZNER_CAPACITY_LIST_CMD", [sys.executable, "-I", os.path.join(HERE, "gc-session-ssh"), "list-running"])
     e = dict(os.environ, GC_SSH_HOST=host)
     try:
@@ -293,11 +312,83 @@ def count_sessions(env: Env, host: str) -> int:
         raise Unreadable(f"list-running não rodou ({ex})")
     if p.returncode != 0:
         raise Unreadable(f"list-running saiu com {p.returncode}: {p.stderr.decode('utf-8', 'replace').strip()[:120]}")
-    return len([l for l in p.stdout.decode("utf-8", "replace").splitlines() if l.strip()])
+    return [l.strip() for l in p.stdout.decode("utf-8", "replace").splitlines() if l.strip()]
+
+
+def read_timeout(default: float) -> float:
+    """O prazo de uma leitura de gc/bd: `default`, que HETZNER_CAPACITY_READ_TIMEOUT_S (só para os testes) pode ENCURTAR, nunca alongar nem desligar."""
+    # vazio (variável ausente) → o prazo padrão; ilegível (não é número, é <= 0, nan) → o prazo padrão também: a variável só encurta
+    try:
+        v = float(os.environ.get("HETZNER_CAPACITY_READ_TIMEOUT_S", ""))
+    except ValueError:
+        return default
+    return min(v, default) if v > 0 else default
+
+
+def read_json_cmd(name: str, default: list, what: str, timeout_s: float):
+    """Roda um comando de leitura (gc/bd) e devolve o JSON dele. Qualquer coisa que não seja um JSON lido = Unreadable (rc≠0, prazo, não executa, vazio, não é JSON)."""
+    cmd = json_env_cmd(name, default)
+    limit = read_timeout(timeout_s)
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=limit, stdin=subprocess.DEVNULL, cwd=CITY)
+    except subprocess.TimeoutExpired:
+        raise Unreadable(f"{what} estourou o prazo ({limit:g}s)")
+    except OSError as ex:
+        raise Unreadable(f"{what} não rodou ({ex})")
+    if p.returncode != 0:
+        raise Unreadable(f"{what} saiu com {p.returncode}: {p.stderr.decode('utf-8', 'replace').strip()[:120]}")
+    try:
+        return json.loads(p.stdout.decode("utf-8"))
+    except (ValueError, RecursionError):        # inclui saída vazia e bytes que não são UTF-8
+        raise Unreadable(f"{what}: a saída não é JSON")
+
+
+def busy_aliases() -> set:
+    """Os donos (assignee) das beads in_progress da cidade. Lista lida e vazia = conjunto vazio (ninguém trabalha); qualquer outra coisa que não seja uma lista de objetos = Unreadable."""
+    # vazio ([] lido) → conjunto vazio: ninguém tem bead, as dog-remote do nó são vaga; falhou/ilegível (rc≠0, prazo, não é JSON, não é lista de objetos) → Unreadable
+    rows = read_json_cmd("HETZNER_CAPACITY_BEADS_CMD", ["bd", "-C", CITY, "list", "--status", "in_progress", "--json", "--limit", "0"], "bd list in_progress", READ_TIMEOUT_BD_S)
+    if not isinstance(rows, list) or any(not isinstance(b, dict) or not isinstance(b.get("assignee", ""), (str, type(None))) for b in rows):
+        raise Unreadable("bd list in_progress: a saída não é uma lista de beads")
+    return {b["assignee"] for b in rows if isinstance(b.get("assignee"), str) and b["assignee"]}
+
+
+def session_owners() -> dict:
+    """session_name → {alias, session_name}: os nomes pelos quais uma bead in_progress pode estar com a sessão (a tmux do nó se chama dog-remote-<id>; o Pilot atribui ao ALIAS
+    dog-remote-<n>). Só entra sessão aberta com alias de POOL (dog-remote-<n>): sem alias, ou com alias de outro papel (dog-remote-adhoc-*, gate-reviewer-*), não há bead-por-alias
+    que prove que está parada, e quem não entra conta ocupada."""
+    # vazio (lista sem sessões) → ninguém entra, e toda dog-remote do nó fica sem dono conhecido = ocupada; falhou/ilegível (rc≠0, prazo, não é JSON, sem .sessions) → Unreadable
+    doc = read_json_cmd("HETZNER_CAPACITY_SESSIONS_CMD", ["gc", "--city", CITY, "session", "list", "--json"], "gc session list", READ_TIMEOUT_GC_S)
+    rows = doc.get("sessions") if isinstance(doc, dict) else None
+    if not isinstance(rows, list):
+        raise Unreadable("gc session list: sem a lista .sessions")
+    return {x["session_name"]: {x["alias"], x["session_name"]} for x in rows
+            if isinstance(x, dict) and x.get("closed") is not True and isinstance(x.get("session_name"), str) and isinstance(x.get("alias"), str) and POOL_DOG_ALIAS.fullmatch(x["alias"])}
+
+
+def split_sessions(names: list) -> tuple:
+    """(ocupadas, ociosas, porquê). Sessão VIVA não é sessão OCUPADA (ga-2hd02v.1.22): um dog-remote sem bead in_progress no alias dele é vaga, não lugar tomado.
+    Só se prova ociosa a sessão `dog-remote-*` com alias de pool (`dog-remote-<n>`) e SEM bead in_progress nesse alias; o resto (gate-reviewer, wa-worker, dog-remote-adhoc,
+    sem alias, fora da lista do gc) conta ocupado, como antes. As duas leituras (gc e bd) têm três estados: lida e vazia → ociosa · falhou/ilegível → TODAS as dog-remote contam ocupadas
+    (nunca enche o nó além do teto) e o motivo vai em `why`."""
+    dogs = [n for n in names if n.startswith("dog-remote-")]
+    others = len(names) - len(dogs)
+    if not dogs:
+        return others, 0, ""
+    # vazio (nenhuma bead in_progress, nenhuma sessão com alias) → as dog-remote sem dono conhecido contam ocupadas e as com dono sem bead contam ociosas;
+    # falhou/ilegível (qualquer das duas leituras) → TODAS as sessões do nó contam ocupadas (o inerte: o veredito fica como era antes desta leitura), com o motivo
+    # as duas leituras são independentes e lentas no mini: em paralelo o custo é o da maior, não a soma (o Pilot dá 40 s ao veredito inteiro)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_owners, f_work = pool.submit(session_owners), pool.submit(busy_aliases)
+        try:
+            owners, working = f_owners.result(), f_work.result()
+        except Unreadable as e:
+            return len(names), 0, f"não provei nenhuma sessão ociosa: {e}"
+    idle = [n for n in dogs if n in owners and not (owners[n] & working)]
+    return len(names) - len(idle), len(idle), ""
 
 
 def measure(env: Env, cfg: dict, ssh_dest: str, now: int) -> dict:
-    r = {"t": now, "state": "ok", "why": "", "sessions": None, "sessions_why": ""}
+    r = {"t": now, "state": "ok", "why": "", "sessions": None, "sessions_total": None, "sessions_idle": None, "idle_why": "", "sessions_why": ""}
     try:
         r.update(parse_node(between_markers(run_ssh(env, cfg, ssh_dest))))
     except (ConnectionError, subprocess.TimeoutExpired) as e:
@@ -308,7 +399,9 @@ def measure(env: Env, cfg: dict, ssh_dest: str, now: int) -> dict:
         r["sessions_why"] = "sem leitura do nó, não contei as sessões"
         return r
     try:
-        r["sessions"] = count_sessions(env, cfg["host"])
+        names = list_sessions(env, cfg["host"])
+        r["sessions_total"] = len(names)
+        r["sessions"], r["sessions_idle"], r["idle_why"] = split_sessions(names)      # `sessions` = OCUPADAS: é o que o veredito e a prova de carga leem
     except Unreadable as e:
         r["sessions_why"] = str(e)
     return r
@@ -456,6 +549,13 @@ def tick(env: Env, cfg: dict, now: int, ssh_dest: str, refresh: bool = True) -> 
 
 # ───────────────────────────────── o veredito ─────────────────────────────────
 
+def idle_note(r: dict) -> str:
+    """Texto curto para o detalhe do veredito: quantas vivas estão ociosas (vaga) e, se não deu para provar, por quê."""
+    if r.get("idle_why"):
+        return f" ({r['idle_why']})"
+    return f" (+{r['sessions_idle']} vivas ociosas, contam vaga)" if isinstance(r.get("sessions_idle"), int) and r["sessions_idle"] > 0 else ""
+
+
 def verdict(env: Env, cfg: dict, st: dict, now: int) -> dict:
     """{'verdict': node|local|unknown, 'reason': código, 'detail': texto, ...}. A primeira condição que falha decide; só `node` autoriza."""
     base = {"ceiling": st["ceiling"], "host_cap": None, "effective": None, "active": None, "free": None, "age_s": None, "reading": None}
@@ -487,7 +587,7 @@ def verdict(env: Env, cfg: dict, st: dict, now: int) -> dict:
     r = st["readings"][-1] if st["readings"] else None
     if r is None:
         return out("unknown", "no_reading", "ainda não há nenhuma leitura do nó")
-    base["age_s"], base["reading"] = now - r["t"], {k: r.get(k) for k in ("t", "state", "cpu_headroom_pct", "mem_avail_pct", "sessions", "why")}
+    base["age_s"], base["reading"] = now - r["t"], {k: r.get(k) for k in ("t", "state", "cpu_headroom_pct", "mem_avail_pct", "sessions", "sessions_total", "sessions_idle", "idle_why", "why")}
     if now - r["t"] > cfg["max_age_s"]:
         return out("unknown", "reading_stale", f"última leitura tem {now - r['t']}s (> {cfg['max_age_s']}s)")
     if now - r["t"] < -60:                    # leitura carimbada no futuro (o relógio voltou): idade negativa não é "recente"
@@ -505,8 +605,8 @@ def verdict(env: Env, cfg: dict, st: dict, now: int) -> dict:
         return out("unknown", "sessions_unreadable", f"não consegui contar as sessões do nó: {r.get('sessions_why')}")
     base["active"], base["free"] = r["sessions"], base["effective"] - r["sessions"]
     if r["sessions"] >= base["effective"]:
-        return out("local", "node_full", f"{r['sessions']} sessões no nó, teto {base['effective']} (degrau {st['ceiling']}, cap do provider {caps['cap']})")
-    return out("node", "free_slot", f"{r['sessions']} de {base['effective']} sessões; CPU livre {r['cpu_headroom_pct']}%, RAM {r['mem_avail_pct']}%")
+        return out("local", "node_full", f"{r['sessions']} sessões ocupadas no nó{idle_note(r)}, teto {base['effective']} (degrau {st['ceiling']}, cap do provider {caps['cap']})")
+    return out("node", "free_slot", f"{r['sessions']} de {base['effective']} sessões ocupadas{idle_note(r)}; CPU livre {r['cpu_headroom_pct']}%, RAM {r['mem_avail_pct']}%")
 
 
 # ───────────────────────────────── linha de comando ─────────────────────────────────
@@ -559,7 +659,7 @@ def main(argv=None) -> int:
             ssh_dest = host_caps(env, cfg["host"])["ssh"]
             r = measure(env, cfg, ssh_dest, now)
             r["color"] = color(r, cfg)
-            say(args, r, f"{r['state']} {r['color']} CPU livre={r.get('cpu_headroom_pct')}% RAM={r.get('mem_avail_pct')}% sessões={r.get('sessions')} {r['why']}".strip())
+            say(args, r, f"{r['state']} {r['color']} CPU livre={r.get('cpu_headroom_pct')}% RAM={r.get('mem_avail_pct')}% sessões={r.get('sessions')} ocupadas de {r.get('sessions_total')} {r['why']}".strip())
             return 0 if r["state"] == "ok" else 1
         if args.cmd == "status":
             st, _ = load_state(env, cfg, now, may_repair=False)
