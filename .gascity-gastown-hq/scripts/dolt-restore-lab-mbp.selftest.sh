@@ -1029,6 +1029,27 @@ check "$RC" 1 "dolt do MBP com versao diferente da do mini: FAIL"; has "$OUT" "o
 reset; FAKE_DOLT_VER_HANG=1 LABMBP_CALL_S=2 run --install-dolt
 check "$RC" 2 "versao do dolt do mini ilegivel: UNKNOWN"; has "$OUT" "nao consegui ler a versao do dolt do mini" "diz o que faltou"; check "$(execs)" 0 "e o MBP nao foi tocado"
 
+echo "-- plist: teto do envio (ga-2xud6v)"
+# o launchd roda o script com o ambiente do plist; sem LABMBP_STREAM_S la, vale o padrao do script (7200 s), folga de so 1,84x no 1o restore real (3907 s)
+PLIST_SRC="${LABMBP_PLIST_UNDER_TEST:-$HERE/../packs/town-deltas/assets/dolt-restore-lab-mbp.plist}"
+# vazio (variavel ausente) → imprime "ausente" e o teste reprova; falhou/ilegivel (arquivo ou plist invalido) → imprime "?" e o teste reprova
+PLIST_STREAM=$(python3 -I - "$PLIST_SRC" 2>/dev/null <<'PY'
+import plistlib, sys
+try:
+    env = plistlib.load(open(sys.argv[1], "rb"))["EnvironmentVariables"]
+except Exception:
+    print("?"); sys.exit(0)
+print(env.get("LABMBP_STREAM_S", "ausente"))
+PY
+) || PLIST_STREAM="?"
+check "$PLIST_STREAM" 9000 "plist: LABMBP_STREAM_S=9000 (o padrao de 7200 do script nao vale no launchd)"
+# vazio/falhou → "?" e o teste reprova (nao ha numero para comparar); o 300 e a folga que o orquestrador soma ao esperar o wrapper, lida do proprio script
+JOB_DEF=$(sed -n 's/^JOB_TIMEOUT="${LABMBP_JOB_TIMEOUT_S:-\([0-9][0-9]*\)}".*/\1/p' "$ORCH_SRC" | head -1); : "${JOB_DEF:=?}"
+WAIT_PAD=$(grep -o -e '--stream-wait-s "$(( STREAM_S + [0-9]* ))"' "$ORCH_SRC" | head -1 | grep -o '[0-9][0-9]*' | head -1); : "${WAIT_PAD:=?}"
+RESTORE_S=1300   # restore + contagem do 1o restore real (ga-3kmvyr); LABMBP_RTO_S (3600) e o orcamento de SLOW, nao o tempo tipico
+case "$PLIST_STREAM$JOB_DEF$WAIT_PAD" in *[!0-9]*) FIT="?";; *) FIT=$([ $(( PLIST_STREAM + WAIT_PAD + RESTORE_S )) -le "$JOB_DEF" ] && echo cabe || echo estoura);; esac
+check "$FIT" cabe "plist: envio ($PLIST_STREAM s) + espera ($WAIT_PAD s) + restore ($RESTORE_S s) cabe no teto do job ($JOB_DEF s)"
+
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

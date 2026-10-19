@@ -60,6 +60,14 @@
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
     <key>HOME</key>
     <string>/Users/athos</string>
+    <!-- ga-2xud6v: teto do envio mini→MBP, 9000 s (o padrão do script é 7200). O 1º restore real
+         (ga-3kmvyr, 19/10; runs/20261019T033303Z-30574) enviou 14,1 GB em 3907 s (média ~3,6 MB/s,
+         com o mini sob load alto: o gargalo é a CPU dele, não a rede): folga de só 1,84x sobre
+         7200 s, e uma noite de carga pior mataria o envio (veredito UNKNOWN). Conta com 9000 s: o
+         wrapper espera 9000 + 300 s e o restore levou 1291 s (~1300 s), 10600 s no total,
+         dentro do teto do job (12600 s). -->
+    <key>LABMBP_STREAM_S</key>
+    <string>9000</string>
   </dict>
 </dict>
 </plist>
