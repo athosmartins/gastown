@@ -6,14 +6,15 @@
 # chama scripts/wa-node-dispatch.sh; quem classifica e escreve é esse script (selftest próprio).
 #
 # O que este arquivo prova:
-#   A. comportamento da função extraída (palavra por palavra) do pilot-dispatcher.sh, contra um wa-node-dispatch.sh falso:
+#   A. comportamento da função extraída (palavra por palavra) do pilot-dispatcher.sh, contra um wa-node-dispatch.sh falso e um bd falso:
 #      off (e qualquer valor que não seja um dos 4 modos) não chama nada · shadow só chama `check` e nunca devolve 0 ·
 #      label/auto chamam `apply` com a base certa · só rc 0 vira "atribuída ao nó" · rc 13/124/137/143 e qualquer rc >= 128 (morto por sinal) = resultado desconhecido (2) ·
-#      alvo que não é wa-worker, id que não é wa-*, script ausente, dry-run → nada escrito.
+#      alvo que não é wa-worker, id que não é wa-*, script ausente, dry-run → nada escrito, e o log "WOULD route" só para o rc 0 ·
+#      (gate-fix 1, ga-9636op) a função LÊ a bead antes do script, em três estados: bead que já é do nó (dono ou rota wa-worker-remote*) = 2, ilegível = 2, lida e não é do nó = segue; qualquer rc do script.
 #   B. a fiação no despacho (grep no fonte): o ponto de chamada fica depois do guarda de posse e antes de "deixar sem dono"; o braço
 #      `wa-worker-remote)` do spawn vem antes de `wa-worker*)` e não faz `gc session new` nem carimba gc.routed_to=wa-worker; o rc 2 solta a
 #      claim e não despacha; a função só é chamada num lugar.
-#   C. mutantes: cada quebra abaixo tem de derrubar este selftest.
+#   C. mutantes: cada quebra abaixo tem de derrubar este selftest (29, a leitura da bead entre eles). Cada um roda o arquivo inteiro e para no 1º FAIL.
 #
 # Run:  bash packs/town-deltas/assets/pilot-dispatcher.wa-node-route.selftest.sh
 # Exit 0 iff tudo passa. Saída: linhas ok/FAIL, "N/N ok", "SELFTEST OK".
