@@ -41,6 +41,7 @@ if cmd == "list":
     if env("FAKE_BD_BADJSON") == "list": print("isto nao e json"); sys.exit(0)
     st, asg, labels = flag("--status"), flag("--assignee"), multi("--label") + multi("-l")
     rows = [b for b in beads.values() if (not st or b["status"] == st) and (asg is None or b.get("assignee", "") == asg) and all(l in b["labels"] for l in labels)]
+    if not st and "--all" not in a: rows = [b for b in rows if b["status"] != "closed"]  # como o bd de verdade: sem --all (e sem --status) as fechadas somem, e o gate FECHA os marcadores
     print(json.dumps(rows)); sys.exit(0)
 if cmd == "show":
     i = [x for x in a[1:] if not x.startswith("-")][0]
@@ -307,11 +308,11 @@ ok $((RC != 0)) "fix/<bead>-<resumo>: sai 0"
 [ "$(origin_has "fix/ga-t2-meu-resumo")" = "$SHAF" ] && ! origin_has "$BR2" >/dev/null; ok $? "fix/<bead>-<resumo>: o origin leva o nome que o dog deu (não o do título)"
 git --git-dir="$ORIGIN" update-ref -d "refs/heads/fix/ga-t2-meu-resumo"; git --git-dir="$MIRROR" update-ref -d "refs/heads/fix/ga-t2-meu-resumo"; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BR2" 2>/dev/null
 
-# ── 9b. volta do gate (caso B): sem assignee + gate:needs-fix + rota dog-remote; vale se a ÚLTIMA entrega foi deste alias ──────────────────────────────
+# ── 9b. volta do gate (caso B): sem assignee + gate:needs-fix + rota gastown.dog (a que o gate RESTAURA) ou dog-remote; vale se a ÚLTIMA entrega foi deste alias ──
 BRB="fix/ga-t2-volta-do-gate"
-seed_back() {  # seed_back AUTOR SUBMITTED_BY [STATUS] [ASSIGNEE] [LABELS,] [ROTA]: a ga-t2 volta do gate; marcador antigo MEU e o mais novo do AUTOR dado
+seed_back() {  # seed_back AUTOR SUBMITTED_BY [STATUS] [ASSIGNEE] [LABELS,] [ROTA]: a ga-t2 volta do gate COMO O GATE A DEIXA (rota gastown.dog, medida em ga-9636op, .1.12 e .1.18); marcador antigo MEU e o mais novo do AUTOR dado, os dois FECHADOS
   reset_db; git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BRB" 2>/dev/null
-  python3 -I - "$DB" "$ALIAS" "$1" "$2" "${3-open}" "${4-}" "${5-gate:needs-fix,gate:fix-attempt:1}" "${6-dog-remote}" <<'EOF'
+  python3 -I - "$DB" "$ALIAS" "$1" "$2" "${3-open}" "${4-}" "${5-gate:needs-fix,gate:fix-attempt:1}" "${6-gastown.dog}" <<'EOF'
 import json, sys
 p, me, author, by, status, assignee, labels, route = sys.argv[1:]
 d = json.load(open(p))
@@ -347,7 +348,12 @@ run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "volta do gate sem nenhum marcad
 seed_back "$ALIAS" "$ALIAS"; run_exe_a FAKE_BD_FAIL=list -- ga-t2 "$BRB" "$SHAV"; back_refused "leitura dos marcadores que FALHA (não é 'sem marcador')" "não consegui ler os marcadores"
 seed_back "$ALIAS" "$ALIAS"; run_exe_a FAKE_BD_BADJSON=list -- ga-t2 "$BRB" "$SHAV"; back_refused "marcadores com JSON corrompido" "ilegível"
 seed_back "$ALIAS" "$ALIAS" open "" "gate:queued"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "sem gate:needs-fix (na fila do gate, não voltou)" "nem uma volta do gate"
-seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix" ""; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "sem rota dog-remote" "nem uma volta do gate"
+seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix" ""; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "sem rota nenhuma (não sei de que pool é a bead)" "nem uma volta do gate"
+seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix" "wa-worker"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "rota de OUTRO pool (nem gastown.dog nem dog-remote), mesmo com a última entrega minha" "nem uma volta do gate"
+has "$T/err" "achei 'wa-worker'"; ok $? "rota de outro pool: a recusa diz a rota que achou"
+seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix" "dog-remote"; run_exe_a -- ga-t2 "$BRB" "$SHAV"   # a rota posta à mão (a descrição da ga-2hd02v.1.18) continua valendo
+ok $((RC != 0)) "volta do gate com a rota dog-remote: sai 0"; [ "$(origin_has "$BRB")" = "$SHAV" ]; ok $? "volta do gate com a rota dog-remote: o origin tem $BRB no sha dito"
+git --git-dir="$ORIGIN" update-ref -d "refs/heads/$BRB"
 seed_back "$ALIAS" "$ALIAS" open "outro-dog"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "bead de outro alias, mesmo com gate:needs-fix" "nem uma volta do gate"
 seed_back "$ALIAS" "$ALIAS" closed; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refused "bead fechada" "nem uma volta do gate"
 # `worker/<sessão>-N` só é inequívoco se `<sessão>-N` NÃO for ele mesmo um nome de sessão. Premissa lida do IDENTITY_PATTERN do runbook (a linha que o wrapper de produção usa):
@@ -407,7 +413,13 @@ case_bare_role() { reset_db2; run_exe_a GC_SESSION_NAME=dog-remote -- ga-t2 "wor
 mutant volta-sem-checar-autor 'if not delivered_by(last, alias):' 'if False:' case_back_other_author
 mutant volta-pega-o-marcador-mais-antigo 'return max(rows, key' 'return min(rows, key' case_back_newest
 mutant volta-sem-gate-needs-fix 'isinstance(labels, list) and FIX_LABEL in labels' 'isinstance(labels, list)' case_back_no_label
-mutant volta-sem-rota 'meta.get("gc.routed_to") == ROUTE)' 'True)' case_back_no_route
+mutant volta-sem-rota 'meta.get("gc.routed_to") in ROUTES)' 'True)' case_back_no_route
+# a forma REAL da volta (rota gastown.dog, marcadores fechados): o revisor do gate achou que o fixture só fabricava a rota dog-remote e que nada exercia o que a produção deixa
+case_back_real_shape() { seed_back "$ALIAS" "$ALIAS"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; [ "$RC" = 0 ] && [ "$(origin_has "$BRB")" = "$SHAV" ]; }
+case_back_other_route() { seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix" "wa-worker"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; refused_back; }
+mutant volta-so-aceita-dog-remote 'ROUTES = ("gastown.dog", "dog-remote")' 'ROUTES = ("dog-remote",)' case_back_real_shape
+mutant volta-sem-all-nos-marcadores '["list", "--all", "--label"' '["list", "--label"' case_back_real_shape
+mutant volta-aceita-rota-de-outro-pool 'meta.get("gc.routed_to") in ROUTES)' 'meta.get("gc.routed_to") is not None)' case_back_other_route
 mutant volta-sem-marcador-vira-pode 'raise Stop(f"{bid} nunca foi entregue ao gate (nenhum marcador source-bead:{bid}): não há volta do gate para submeter")' 'return {"description": "author: " + os.environ["BEADS_ACTOR"]}' case_back_no_marker
 mutant sufixo-N-ambiguo-sem-guarda 'and BARE_ROLE_RE.fullmatch(sess):' 'and False:' case_bare_role
 
