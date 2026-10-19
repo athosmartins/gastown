@@ -105,11 +105,11 @@ branch_pending() { local r=$1 b=$2 s o p; s=$("$GIT" -C "$r" rev-parse -q --veri
   [ "$s" != "$o" ] && [ "$s" != "$p" ]; }
 # origin_vs <repo> <branch> <sha>: o `publish` (sem force) entregaria <sha> em <branch>? Pergunta ao origin AGORA (ls-remote), não à última cópia do fetch: foi a cópia velha que escondeu a reescrita do gate (ga-jgxgn6).
 #   0 sim (o origin não tem a branch, ou a ponta dele é ancestral de <sha>) · 1 NÃO: imprime a ponta do origin (que <sha> não contém) · 2 não consegui conferir (origin mudo, prazo, resposta ilegível): nada impresso
-# vazio → o ls-remote deu certo e não trouxe a linha da branch = o origin não a tem (0); falhou/prazo/linha que não é sha/merge-base com erro → 2, nunca 0 nem 1: dúvida é "não sei" e quem chama decide
+# vazio → o ls-remote deu certo e não trouxe a linha da branch = o origin não a tem (0); falhou/prazo/awk que falha/linha que não é sha/merge-base com erro → 2, nunca 0 nem 1: dúvida é "não sei" e quem chama decide
 origin_vs() { local r=$1 b=$2 s=$3 url out t
   url=$("$GIT" -C "$r" config --get remote.origin.url) || return 2
   out=$(GIT_TERMINAL_PROMPT=0 tmo "${HETZNER_MIRROR_LSREMOTE_WAIT:-15}" "$GIT" -C "$r" ls-remote "$url" "refs/heads/$b" 2>/dev/null) || return 2
-  t=$(awk -v ref="refs/heads/$b" '$2 == ref { print $1 }' <<< "$out"); [ -n "$t" ] || return 0
+  t=$(awk -v ref="refs/heads/$b" '$2 == ref { print $1 }' <<< "$out") || return 2; [ -n "$t" ] || return 0   # o awk que FALHA é "não sei" (2), não "o origin não tem a branch" (0)
   [[ "$t" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || return 2
   "$GIT" -C "$r" cat-file -e "$t^{commit}" 2>/dev/null || { echo "$t"; return 1; }   # a história inteira de <sha> está aqui (o receive-pack confere a conectividade antes de qualquer hook): ponta que o espelho não tem NÃO é ancestral dele
   "$GIT" -C "$r" merge-base --is-ancestor "$t" "$s" 2>/dev/null; case $? in 0) return 0;; 1) echo "$t"; return 1;; *) return 2;; esac; }
