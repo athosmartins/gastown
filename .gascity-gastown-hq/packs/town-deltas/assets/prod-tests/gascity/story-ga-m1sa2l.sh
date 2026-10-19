@@ -32,7 +32,7 @@ log "Deployed recall_lib.py found: $RECALL_LIB"
 # ── 1. Structural: the fix is actually in the deployed file ────────────────
 for sym in "^def index_inconsistency(" "^def save_index_meta(" "^def _prune_generations(" \
            "^def _require_heavy_step_allowed(" "^class RecallIndexRebuildDeferred(" \
-           "^CURRENT_POINTER = "; do
+           "^def _discard_unpublished_generation(" "^CURRENT_POINTER = "; do
     grep -q "$sym" "$RECALL_LIB" || fail "'$sym' missing from deployed recall_lib.py -- ga-m1sa2l fix not deployed"
 done
 grep -q "^def _atomic_write(" "$RECALL_LIB" \
@@ -105,7 +105,28 @@ with tempfile.TemporaryDirectory() as td:
         (mixed / "index_meta.json").write_text(json.dumps(old.meta))
         checks.append(("mixed_generations_load_as_none_not_a_later_crash", rl.load_index() is None))
 
-failed = [name for name, ok in checks if not ok]
+    # two writers aimed at one path must not share a tmp file (gate 1): the second
+    # one starts, finishes and renames while the first is still writing
+    shared = td / "shared"
+    shared.mkdir()
+    target = shared / "x.json"
+
+    def inner(f):
+        f.write(b"INNER-INNER-INNER")
+
+    def outer(f):
+        f.write(b"OUT")
+        rl._atomic_write(target, inner)
+        f.write(b"ER")
+
+    try:
+        rl._atomic_write(target, outer)
+        two_writers_ok = target.read_bytes() == b"OUTER" and list(shared.glob("*.tmp")) == []
+    except OSError:
+        two_writers_ok = False
+    checks.append(("overlapping_writers_do_not_share_a_tmp_file", two_writers_ok))
+
+failed =[name for name, ok in checks if not ok]
 print("CHECKS_FAILED:" + ",".join(failed) if failed else "ALL_OK")
 PYEOF
 )
@@ -113,7 +134,7 @@ PYEOF
 if [[ "$RESULT" != "ALL_OK" ]]; then
     fail "behavioral check failed against the deployed module: $RESULT"
 fi
-log "killed save keeps the previous index whole; a mixed-generation index loads as None; no tmp debris ✓"
+log "killed save keeps the previous index whole; a mixed-generation index loads as None; overlapping writers do not share a tmp file; no tmp debris ✓"
 
 # ── 3. The LIVE index: usable, and the live CLI answers ────────────────────
 # Read-only probe first. If the live index does not load, say so and stop: a

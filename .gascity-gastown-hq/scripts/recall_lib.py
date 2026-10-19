@@ -74,6 +74,11 @@ GEN_PRUNE_GRACE_SECONDS = 10 * 60          # a superseded generation outlives it
 HEAVY_GUARD_TIMEOUT_S = 30
 _GEN_NAME_RE = re.compile(r"^gen-[0-9A-Za-z_-]+$")
 _FLAT_INDEX_FILES = ("corpus.json", "chunk_vecs.npy", "chunk_bead_idx.json", "index_meta.json")
+# Every name _atomic_write can leave behind: <name>.<pid>.<hex>.tmp (unique per
+# writer) and the fixed <name>.tmp older writers used.
+_TMP_NAME_RE = re.compile(
+    r"^(?:CURRENT|corpus\.json|chunk_vecs\.npy|chunk_bead_idx\.json|index_meta\.json)"
+    r"(?:\.[0-9]+\.[0-9a-f]{8})?\.tmp$")
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 120
@@ -467,8 +472,11 @@ class RecallIndex:
 # every `recall` crashed. Each _atomic_write is atomic; the SET was not.
 # Now a save writes a whole new immutable generation dir (gen-*/) and
 # publishes it with ONE atomic rename of the CURRENT pointer file, so a reader
-# sees the old index or the new one, never a blend, and two writers never
-# share a directory. A flat-layout index (pre-generations) is still read.
+# sees the old index or the new one, never a blend. Two writers share no
+# directory and no tmp file (every _atomic_write has its own tmp name): the
+# only thing they contend for is the CURRENT name, each swaps it with one
+# rename, the last one wins and both generations are whole. A flat-layout index
+# (pre-generations) is still read.
 def _index_files(base: Path) -> dict:
     return {
         "corpus": base / "corpus.json",
@@ -541,6 +549,9 @@ def _log_index_event(kind: str, detail: str) -> None:
         pass
 
 
+_LAYOUT_MOVED = object()  # _load_index_once: "a writer moved the files under me, look again"
+
+
 def load_index(progress=lambda msg: None):
     """Returns a RecallIndex, or None if no index has been built yet OR the
     on-disk index is corrupted/unreadable/inconsistent (ga-zy725: a disk-full
@@ -556,24 +567,56 @@ def load_index(progress=lambda msg: None):
     the complementary half — self-heal from damage left behind by the OLD
     non-atomic writer, or from any other on-disk damage. Files that all
     load but do not belong together (ga-m1sa2l: vector rows != bead_idx
-    entries) count as damage too: they used to load fine and crash later."""
+    entries) count as damage too: they used to load fine and crash later.
+    Every verdict that throws an index away leaves one line in the index event
+    log, so a rebuild under `recall -q` still has a recorded reason."""
+    result = _load_index_once(progress, may_retry=True)
+    if result is _LAYOUT_MOVED:
+        result = _load_index_once(progress, may_retry=False)
+    return result
+
+
+def _load_index_once(progress, may_retry: bool):
+    """One attempt of load_index(). With may_retry, a file that is missing or
+    that vanishes mid-read returns _LAYOUT_MOVED instead of a verdict: a writer
+    may have published a generation (and removed the flat files / an old
+    generation) between this reader resolving the pointer and touching the
+    files -- a transition, not damage, and the second look resolves the
+    pointer again. The second attempt treats the same symptom as what it is:
+    nothing on disk (first run, silent), or damage (logged)."""
     gen, problem = _read_current_pointer()
     if problem:
         progress(f"recall: on-disk index is corrupted/unreadable ({problem}) -- rebuilding from scratch")
+        _log_index_event("index_pointer_unusable", problem)
         return None
     p = _index_files(gen if gen is not None else INDEX_DIR)
-    if not all(path.exists() for path in p.values()):
+    present = [path.exists() for path in p.values()]
+    if not all(present):
+        if may_retry:
+            return _LAYOUT_MOVED
         if gen is not None:  # published generations are written whole: a hole is damage
             progress(f"recall: on-disk index is corrupted/unreadable (generation {gen.name} is missing files) -- rebuilding from scratch")
-        return None
+            _log_index_event("index_generation_incomplete", f"{gen.name} is missing files")
+        elif any(present):  # some flat files but not all: damage, not "no index yet"
+            progress("recall: on-disk index is corrupted/unreadable (flat index is missing files) -- rebuilding from scratch")
+            _log_index_event("index_flat_incomplete", "flat index is missing files: " + ", ".join(
+                path.name for path, here in zip(p.values(), present) if not here))
+        return None  # nothing on disk at all: first run, nothing was thrown away
     import numpy as np
     try:
         corpus = json.loads(p["corpus"].read_text())
         vecs = np.load(p["vecs"])
         bead_idx = np.array(json.loads(p["bead_idx"].read_text()), dtype=np.int64)
         meta = json.loads(p["meta"].read_text())
+    except FileNotFoundError as e:
+        if may_retry:
+            return _LAYOUT_MOVED
+        progress(f"recall: on-disk index is corrupted/unreadable ({e}) -- rebuilding from scratch")
+        _log_index_event("index_unreadable", str(e))
+        return None
     except (OSError, ValueError, EOFError, json.JSONDecodeError) as e:
         progress(f"recall: on-disk index is corrupted/unreadable ({e}) -- rebuilding from scratch")
+        _log_index_event("index_unreadable", str(e))
         return None
     why = index_inconsistency(corpus, vecs, bead_idx, meta)
     if why:
@@ -593,14 +636,24 @@ def _atomic_write(path: Path, write_fn) -> None:
     os.replace across filesystems silently falls back to non-atomic
     copy+delete on some platforms). On failure the partial tmp file is
     best-effort removed (never masking the original error) so a disk that's
-    still full doesn't also litter the index dir with dead .tmp files."""
-    tmp = path.with_name(path.name + ".tmp")
+    still full doesn't also litter the index dir with dead .tmp files.
+
+    The tmp name is unique per call (pid + random token). Two writers aimed at
+    the same path -- two `recall` processes publishing CURRENT, two staleness
+    checks rewriting index_meta.json -- must not share a tmp inode: with a
+    fixed name the second one truncates the first one's file under it, the
+    first rename then moves the second one's bytes into place and the second
+    rename dies with FileNotFoundError (ga-m1sa2l, gate 1)."""
+    tmp = path.with_name("%s.%d.%s.tmp" % (path.name, os.getpid(), secrets.token_hex(4)))
     try:
         with open(tmp, "wb") as f:
             write_fn(f)
         os.replace(tmp, path)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass  # best effort: stale tmp files are swept by age, and this must not replace the error being raised
         raise
 
 
@@ -609,8 +662,12 @@ def save_index(idx: RecallIndex) -> None:
     gen-*/ dir, then move CURRENT to it with one atomic rename. Dying at any
     point before that rename leaves the previous generation published and
     untouched; the half-written dir is removed (or, if we were killed outright,
-    pruned later by age). Refuses an index whose parts do not belong together,
-    so a broken one can never be re-stamped as fresh (ga-m1sa2l)."""
+    pruned later by age). A failure is never allowed to delete a generation
+    CURRENT names -- see _discard_unpublished_generation. Concurrent saves are
+    safe: each has its own generation dir and its own tmp files, the last
+    CURRENT rename wins, and either index is whole. Refuses an index whose
+    parts do not belong together, so a broken one can never be re-stamped as
+    fresh (ga-m1sa2l)."""
     import numpy as np
     why = index_inconsistency(idx.corpus, idx.chunk_vecs, idx.chunk_bead_idx, idx.meta)
     if why:
@@ -629,7 +686,7 @@ def save_index(idx: RecallIndex) -> None:
         _atomic_write(p["meta"], lambda f: f.write(json.dumps(idx.meta, indent=2).encode()))
         _atomic_write(INDEX_DIR / CURRENT_POINTER, lambda f: f.write(gen_name.encode()))
     except BaseException:
-        shutil.rmtree(gen, ignore_errors=True)
+        _discard_unpublished_generation(gen)
         raise
     idx.gen_dir = gen
     if previous is not None and previous != gen:
@@ -638,6 +695,29 @@ def save_index(idx: RecallIndex) -> None:
         except OSError:
             pass  # already gone: nothing to protect
     _prune_generations(keep=gen)
+
+
+def _discard_unpublished_generation(gen: Path) -> None:
+    """Clean up after a save that raised: remove the generation it was building,
+    unless that generation may be the published one. The error can land AFTER
+    the CURRENT rename took effect (an interrupt right behind os.replace), and
+    deleting a generation CURRENT names leaves CURRENT pointing at nothing --
+    the whole index lost (ga-m1sa2l, gate 1: decided != acted). So look first,
+    three answers: CURRENT names this generation -> keep it; CURRENT is absent
+    or names another one -> ours is not the published index, remove it (a dying
+    save must not keep a ~240 MB orphan on a disk that may be why it died);
+    CURRENT cannot be read -> cannot tell, keep it (the inert state;
+    _prune_generations removes unpublished generations by age)."""
+    try:
+        # ausente → nada publicado, a geração é órfã e pode sair; ilegível → não sei dizer, mantém (a poda por idade limpa depois)
+        named = (INDEX_DIR / CURRENT_POINTER).read_text().strip()
+    except FileNotFoundError:
+        named = None
+    except (OSError, ValueError):
+        return
+    if named == gen.name:
+        return
+    shutil.rmtree(gen, ignore_errors=True)
 
 
 def save_index_meta(idx: RecallIndex) -> None:
@@ -661,9 +741,11 @@ def save_index_meta(idx: RecallIndex) -> None:
 def _prune_generations(keep: Path) -> None:
     """Best-effort tidy-up AFTER CURRENT moved: drop superseded generations
     older than the grace period, orphaned unpublished ones (killed writers),
-    and the pre-generation flat files. Touches only names this module creates;
-    never `keep`, never whatever CURRENT names right now (another writer may
-    have published after us). A failure here costs disk, never correctness."""
+    the pre-generation flat files, and tmp files a killed writer left (by age:
+    a live writer's tmp is seconds old). Touches only names this module
+    creates; never `keep`, never whatever CURRENT names right now (another
+    writer may have published after us). A failure here costs disk, never
+    correctness."""
     live, _ = _read_current_pointer()  # ausente/ilegível → None: só `keep` fica protegido
     now = time.time()
     try:
@@ -678,6 +760,26 @@ def _prune_generations(keep: Path) -> None:
                 if now - entry.stat().st_mtime >= GEN_PRUNE_GRACE_SECONDS:
                     shutil.rmtree(entry, ignore_errors=True)
             elif entry.is_file() and entry.name.removesuffix(".tmp") in _FLAT_INDEX_FILES:
+                entry.unlink(missing_ok=True)
+        except OSError:
+            continue
+    for directory in (INDEX_DIR, keep, live):  # CURRENT's tmp lives in INDEX_DIR, the meta tmp inside the published generation
+        if directory is not None:
+            _sweep_stale_tmp(directory, now)
+
+
+def _sweep_stale_tmp(directory: Path, now: float) -> None:
+    """Remove tmp files (exactly the names _atomic_write creates) older than the
+    grace period. Unreadable directory or file -> skip it; debris costs a few
+    bytes, a wrong delete costs a writer its file."""
+    try:
+        entries = list(directory.iterdir())  # vazio → nada a varrer; falhou → pula
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if (entry.is_file() and _TMP_NAME_RE.match(entry.name)
+                    and now - entry.stat().st_mtime >= GEN_PRUNE_GRACE_SECONDS):
                 entry.unlink(missing_ok=True)
         except OSError:
             continue

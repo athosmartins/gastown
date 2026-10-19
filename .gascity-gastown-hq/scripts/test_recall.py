@@ -18,6 +18,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -362,8 +364,9 @@ class TestIndexPersistenceAtomicity(unittest.TestCase):
             rl._atomic_write(vecs_path, boom)
 
         self.assertEqual(vecs_path.read_bytes(), original_bytes, "original file must survive a failed write")
-        self.assertFalse(vecs_path.with_name(vecs_path.name + ".tmp").exists(),
-                          "failed tmp file must not be left behind")
+        # The tmp name is unique per call, so look for ANY tmp next to the target
+        # (checking one fixed name would pass even with debris on disk).
+        self.assertEqual(list(vecs_path.parent.glob("*.tmp")), [], "failed tmp file must not be left behind")
 
     def test_missing_index_files_return_none_not_corruption_path(self):
         """Baseline: a directory that simply has no index yet (first run)
@@ -642,7 +645,10 @@ class TestIndexGenerations(_IndexDirCase):
             self.assertSameIndex(mid, first if mid.corpus == first.corpus else second)
         self.assertSameIndex(rl.load_index(), second)
 
-    def test_two_writers_never_share_a_directory(self):
+    def test_consecutive_saves_get_different_generation_directories(self):
+        # Sequential on purpose: this only checks the naming. Writers that
+        # actually overlap are TestConcurrentWriters below (gate 1 of ga-m1sa2l
+        # found that the old name of this test claimed more than it ran).
         a, b = _make_index(3, 2, 1.0), _make_index(4, 2, 2.0)
         with mock.patch.object(rl, "GEN_PRUNE_GRACE_SECONDS", 10 ** 9):
             rl.save_index(a)
@@ -650,6 +656,94 @@ class TestIndexGenerations(_IndexDirCase):
             rl.save_index(b)
         self.assertNotEqual(gen_a, b.gen_dir)
         self.assertSameIndex(rl.load_index(), b)
+
+    def test_a_failure_right_behind_the_current_rename_does_not_delete_the_published_generation(self):
+        """The failure can land after the rename took effect (an interrupt
+        between os.replace returning and the writer leaving its try block).
+        Pre-fix, cleanup deleted the generation CURRENT had just been moved to
+        and the whole index was gone."""
+        first, second = _make_index(3, 2, 1.0), _make_index(5, 3, 2.0)
+        rl.save_index(first)
+        real = rl._atomic_write
+
+        def dies_after_publishing(path, write_fn):
+            real(path, write_fn)
+            if path.name == rl.CURRENT_POINTER:
+                raise OSError("interrupted right behind the CURRENT rename (simulated)")
+
+        with mock.patch.object(rl, "_atomic_write", side_effect=dies_after_publishing):
+            with self.assertRaises(OSError):
+                rl.save_index(second)
+        self.assertSameIndex(rl.load_index(), second)
+
+    def test_a_failed_first_save_leaves_no_orphan_generation(self):
+        with mock.patch.object(rl, "_atomic_write", side_effect=self._flaky_atomic_write(fail_at=3)):
+            with self.assertRaises(OSError):
+                rl.save_index(_make_index(3, 2, 1.0))
+        self.assertEqual([p.name for p in self.index_dir.iterdir()], [])
+
+    def test_a_failed_save_that_cannot_read_current_keeps_its_generation(self):
+        """Cannot tell whether the generation was published -> inert: keep it
+        (the age-based prune removes unpublished generations later). A CURRENT
+        that is a directory is unreadable as a file and also fails the rename."""
+        self.index_dir.mkdir(parents=True)
+        (self.index_dir / rl.CURRENT_POINTER).mkdir()
+        with self.assertRaises(OSError):
+            rl.save_index(_make_index(3, 2, 1.0))
+        gens = [p for p in self.index_dir.iterdir() if p.name.startswith("gen-")]
+        self.assertEqual(len(gens), 1, gens)
+
+    def test_two_atomic_writes_to_one_path_never_share_a_tmp_file(self):
+        """A second writer starts, finishes and renames while the first is still
+        writing. Pre-fix both used <name>.tmp: the second truncated the first's
+        file, the first's rename then failed with FileNotFoundError."""
+        target = self.index_dir / "x.json"
+        self.index_dir.mkdir(parents=True)
+
+        def inner(f):
+            f.write(b"INNER-INNER-INNER")
+
+        def outer(f):
+            f.write(b"OUT")
+            rl._atomic_write(target, inner)
+            f.write(b"ER")
+
+        rl._atomic_write(target, outer)
+        self.assertEqual(target.read_bytes(), b"OUTER")
+        self.assertEqual(list(self.index_dir.glob("*.tmp")), [])
+
+    def test_a_cleanup_that_fails_does_not_replace_the_error_being_raised(self):
+        target = self.index_dir / "x.bin"
+        self.index_dir.mkdir(parents=True)
+
+        def boom(f):
+            raise OSError("ENOSPC: disk full (simulated)")
+
+        with mock.patch.object(Path, "unlink", side_effect=PermissionError("cleanup refused")):
+            with self.assertRaises(OSError) as cm:
+                rl._atomic_write(target, boom)
+        self.assertNotIsInstance(cm.exception, PermissionError)
+        self.assertIn("ENOSPC", str(cm.exception))
+
+    def test_stale_tmp_files_are_swept_by_age_and_nothing_else(self):
+        idx = _make_index(3, 2, 1.0)
+        rl.save_index(idx)
+        old = time.time() - 10 ** 6
+        stale = [self.index_dir / "CURRENT.4242.deadbeef.tmp",
+                 self.index_dir / "CURRENT.tmp",
+                 idx.gen_dir / "index_meta.json.4242.deadbeef.tmp"]
+        young = self.index_dir / "CURRENT.4343.cafebabe.tmp"   # a writer that is alive right now
+        foreign = self.index_dir / "notes.tmp"                 # not a name this module creates
+        for path in stale + [young, foreign]:
+            path.write_text("x")
+        for path in stale + [foreign]:
+            os.utime(path, (old, old))
+        rl._prune_generations(keep=idx.gen_dir)
+        for path in stale:
+            self.assertFalse(path.exists(), f"stale tmp not swept: {path}")
+        self.assertTrue(young.exists(), "a live writer's tmp must survive the sweep")
+        self.assertTrue(foreign.exists(), "only names _atomic_write creates may be swept")
+        self.assertSameIndex(rl.load_index(), idx)
 
     def test_save_refuses_to_persist_an_inconsistent_index(self):
         import numpy as np
@@ -729,6 +823,182 @@ class TestIndexGenerations(_IndexDirCase):
     def test_no_tmp_debris_anywhere_in_the_tree(self):
         rl.save_index(_make_index(3, 2, 1.0))
         self.assertEqual(list(self.index_dir.rglob("*.tmp")), [])
+
+
+class TestConcurrentWriters(_IndexDirCase):
+    """Two save_index() calls that really overlap (ga-m1sa2l, gate 1). The
+    generation design only counts if it survives the interleaving that
+    produced the bug: both writers have written their pointer tmp, then both
+    rename. Pre-fix both shared CURRENT.tmp: the first rename published the
+    SECOND writer's name, the second rename raised FileNotFoundError, and that
+    writer's cleanup deleted the very generation CURRENT named."""
+
+    def _interleave_at_the_current_rename(self, a, b):
+        """Run save_index(a) / save_index(b) in two threads, each parked right
+        before its CURRENT rename until released. A is started first and has
+        written its pointer tmp before B even starts (a fixed order: with both
+        racing to the tmp write, one of the two orders happens to leave a valid
+        CURRENT even on the buggy code); A is released first, B once A is done.
+        -> {"a": exception or None, "b": exception or None}."""
+        real_replace = os.replace
+        arrived = threading.Semaphore(0)
+        gates = {"a": threading.Event(), "b": threading.Event()}
+        outcome = {}
+
+        def parked_replace(src, dst, *args, **kwargs):
+            if Path(dst).name == rl.CURRENT_POINTER:
+                arrived.release()
+                if not gates[threading.current_thread().name].wait(timeout=30):
+                    raise TimeoutError("test harness: writer was never released")
+            return real_replace(src, dst, *args, **kwargs)
+
+        def run(name, idx):
+            try:
+                rl.save_index(idx)
+                outcome[name] = None
+            except BaseException as e:  # noqa: BLE001 -- the test inspects it
+                outcome[name] = e
+
+        threads = {name: threading.Thread(target=run, args=(name, idx), name=name)
+                   for name, idx in (("a", a), ("b", b))}
+        with mock.patch.object(os, "replace", parked_replace):
+            for name in ("a", "b"):  # one at a time: B starts only once A is parked
+                threads[name].start()
+                self.assertTrue(arrived.acquire(timeout=30), f"writer {name} never reached the CURRENT rename")
+            gates["a"].set()
+            threads["a"].join(30)
+            gates["b"].set()
+            threads["b"].join(30)
+        for t in threads.values():
+            self.assertFalse(t.is_alive(), "writer thread hung")
+        return outcome
+
+    def test_two_overlapping_saves_leave_one_whole_index_published(self):
+        a, b = _make_index(3, 2, 1.0), _make_index(5, 3, 2.0)
+        outcome = self._interleave_at_the_current_rename(a, b)
+        self.assertEqual(outcome, {"a": None, "b": None}, "a save raised under concurrency")
+        published, problem = rl._read_current_pointer()
+        self.assertIsNone(problem, "CURRENT does not lead to a generation after both saves")
+        self.assertTrue(published.is_dir())
+        loaded = rl.load_index()
+        self.assertIsNotNone(loaded, "the index is gone after two concurrent saves")
+        self.assertSameIndex(loaded, a if loaded.corpus == a.corpus else b)
+
+    def test_no_save_reports_success_while_current_names_a_missing_generation(self):
+        """decided != acted: a save that returned normally must have left an
+        index behind, whatever the other writer did."""
+        outcome = self._interleave_at_the_current_rename(_make_index(3, 2, 1.0), _make_index(5, 3, 2.0))
+        returned_normally = [name for name, exc in outcome.items() if exc is None]
+        _, problem = rl._read_current_pointer()
+        if returned_normally:
+            self.assertIsNone(problem, f"{returned_normally} returned normally but CURRENT is broken: {problem}")
+
+    def test_overlapping_saves_leave_no_tmp_debris(self):
+        self._interleave_at_the_current_rename(_make_index(3, 2, 1.0), _make_index(5, 3, 2.0))
+        self.assertEqual(list(self.index_dir.rglob("*.tmp")), [])
+
+
+class TestLoadSurvivesTheLayoutChangingUnderIt(_IndexDirCase):
+    def _write_flat_layout(self, idx):
+        import numpy as np
+        self.index_dir.mkdir(parents=True)
+        (self.index_dir / "corpus.json").write_text(json.dumps(idx.corpus))
+        np.save(self.index_dir / "chunk_vecs.npy", idx.chunk_vecs)
+        (self.index_dir / "chunk_bead_idx.json").write_text(json.dumps(idx.chunk_bead_idx.tolist()))
+        (self.index_dir / "index_meta.json").write_text(json.dumps(idx.meta))
+
+    def test_a_reader_that_loses_the_flat_files_to_the_migration_looks_again(self):
+        """The first save after deploy moves the index from the flat layout to
+        a generation and removes the flat files. A reader that already saw
+        'no CURRENT' and is mid-read used to call that damage and rebuild."""
+        import numpy as np
+        self._write_flat_layout(_make_index(3, 2, 1.0))
+        new = _make_index(4, 2, 2.0)
+        real_load, calls = np.load, {"n": 0}
+
+        def migrate_then_load(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                rl.save_index(new)  # publishes the generation and removes the flat files
+            return real_load(*args, **kwargs)
+
+        messages = []
+        with mock.patch.object(np, "load", side_effect=migrate_then_load):
+            loaded = rl.load_index(progress=messages.append)
+        self.assertSameIndex(loaded, new)
+        self.assertEqual(messages, [], "a layout change is not damage")
+        self.assertEqual(self.events(), [])
+
+    def test_a_reader_whose_first_look_predates_the_publish_finds_the_generation(self):
+        """Same race one step earlier: the reader resolved the pointer BEFORE the
+        writer published (so it expects the flat files), and by the time it
+        checks them the migration has removed them."""
+        new = _make_index(4, 2, 2.0)
+        rl.save_index(new)  # published, no flat files left
+        real, calls = rl._read_current_pointer, {"n": 0}
+
+        def stale_first_look():
+            calls["n"] += 1
+            return (None, None) if calls["n"] == 1 else real()
+
+        messages = []
+        with mock.patch.object(rl, "_read_current_pointer", side_effect=stale_first_look):
+            loaded = rl.load_index(progress=messages.append)
+        self.assertSameIndex(loaded, new)
+        self.assertEqual(messages, [])
+        self.assertEqual(self.events(), [])
+
+    def test_a_file_that_stays_missing_is_damage_after_the_second_look(self):
+        import numpy as np
+        rl.save_index(_make_index(3, 2, 1.0))
+        messages = []
+        with mock.patch.object(np, "load", side_effect=FileNotFoundError("gone")):
+            self.assertIsNone(rl.load_index(progress=messages.append))
+        self.assertTrue(any("corrupt" in m.lower() for m in messages), messages)
+        self.assertEqual([e["event"] for e in self.events()], ["index_unreadable"])
+
+
+class TestEveryDiscardedIndexLeavesATrace(_IndexDirCase):
+    """_log_index_event is how a rebuild under `recall -q` still has a reason."""
+
+    def _kinds(self):
+        return [e["event"] for e in self.events()]
+
+    def test_a_first_run_is_not_a_discard_and_leaves_no_line(self):
+        self.assertIsNone(rl.load_index())
+        self.assertEqual(self.events(), [])
+
+    def test_a_pointer_that_leads_nowhere_is_logged(self):
+        self.index_dir.mkdir(parents=True)
+        (self.index_dir / "CURRENT").write_text("gen-does-not-exist")
+        self.assertIsNone(rl.load_index())  # default progress is silent, like -q
+        self.assertEqual(self._kinds(), ["index_pointer_unusable"])
+
+    def test_a_flat_index_with_only_some_of_its_files_is_damage_and_is_logged(self):
+        import numpy as np
+        idx = _make_index(3, 2, 1.0)
+        self.index_dir.mkdir(parents=True)
+        (self.index_dir / "corpus.json").write_text(json.dumps(idx.corpus))
+        np.save(self.index_dir / "chunk_vecs.npy", idx.chunk_vecs)
+        messages = []
+        self.assertIsNone(rl.load_index(progress=messages.append))
+        self.assertTrue(any("corrupt" in m.lower() for m in messages), messages)
+        self.assertEqual(self._kinds(), ["index_flat_incomplete"])
+        self.assertIn("chunk_bead_idx.json", self.events()[0]["detail"])
+
+    def test_a_generation_with_a_missing_file_is_logged(self):
+        idx = _make_index(3, 2, 1.0)
+        rl.save_index(idx)
+        (idx.gen_dir / "chunk_vecs.npy").unlink()
+        self.assertIsNone(rl.load_index())
+        self.assertEqual(self._kinds(), ["index_generation_incomplete"])
+
+    def test_an_unreadable_part_is_logged(self):
+        rl.save_index(_make_index(3, 2, 1.0))
+        vecs_path = rl._paths()["vecs"]
+        vecs_path.write_bytes(vecs_path.read_bytes()[:-8])
+        self.assertIsNone(rl.load_index())
+        self.assertEqual(self._kinds(), ["index_unreadable"])
 
 
 class TestThrottleTimestampPersistence(_IndexDirCase):
