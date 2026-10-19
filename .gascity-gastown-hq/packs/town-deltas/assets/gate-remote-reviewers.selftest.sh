@@ -361,6 +361,73 @@ case "$PT" in *"--metadata-field gc.session_name"*) ok "(metadata fallback is me
 case "$PT" in *"{{"*) bad "the remote prompt has template actions; the node has no use for them" ;; *) ok "no template actions in the remote prompt" ;; esac
 eq "the pool-prompt skill-mention scan lists the remote template" "$(grep -c 'gate-reviewer-remote' "$SELF_DIR/pool-prompt-skill-mention.selftest.sh" | tr -d ' ')" "1"
 
+echo "── 5b. the node shim lets the verdict through (the REAL task text, run through the shim's own decide()) ──"
+# The node reviewer reaches the mini only through scripts/remote-shim-wrapper.py. Its allowlist is the reason the prompt tells the reviewer to
+# deliver by `bd comment` + `bd close` and to expect rc 77 on `label`. This feeds the commands the dispatcher really renders into decide(), with the
+# identity a node reviewer really has, so the prompt cannot drift away from what the shim does. Policy only: nothing is executed anywhere.
+SHIMCITY="$TMP/shimcity"; mkdir -p "$SHIMCITY/.beads"; printf '{"prefix":"ga-","path":"."}\n' > "$SHIMCITY/.beads/routes.jsonl"
+SHIMTASK="$(bash -c 'source "$1"; gate_render_review_task 1 1 fix/ga-demo someone gascity 0123456789abcdef0123456789abcdef01234567 CORRECTNESS a.sh "1 file" hdr diff "$2" ga-vb-demo bead' _ "$SELF_DIR/gate-review-task.lib.sh" "$SHIMCITY" 2>/dev/null)"
+if [ -z "$SHIMTASK" ]; then bad "could not render the review task text"; else
+  printf '%s' "$SHIMTASK" > "$TMP/shim-task.txt"
+  python3 -I - "$CITY_SRC/scripts/remote-shim-wrapper.py" "$CITY_SRC/docs/runbooks/gc-session-ssh.md" "$SHIMCITY" "$TMP/shim-task.txt" "$TMP" <<'PY' > "$TMP/shim-check.out" 2>&1
+import importlib.util, json, os, re, shlex, sys
+wrapper, runbook, city, taskf, tmp = sys.argv[1:6]
+spec = importlib.util.spec_from_file_location("rsw", wrapper); rsw = importlib.util.module_from_spec(spec); spec.loader.exec_module(rsw)
+rx = re.search(r"^IDENTITY_PATTERN=(.*)$", open(runbook, encoding="utf-8").read(), re.M).group(1)
+cfgp = os.path.join(tmp, "shim-config.json")
+json.dump({"city": city, "identity_pattern": rx, "log": os.path.join(tmp, "shim.log"), "bin_dirs": ["/usr/bin"]}, open(cfgp, "w"))
+cfg = rsw.load_config(cfgp)
+SESSION = "gate-reviewer-remote-adhoc-0123456789"
+ENV = {"GC_ALIAS": SESSION, "GC_AGENT": "gate-reviewer-remote", "GC_SESSION_NAME": SESSION, "GC_TEMPLATE": "gate-reviewer-remote"}
+
+def verdict(argv, env=ENV):
+    try:
+        rsw.decide(cfg, "bd" if argv[0] == "bd" else argv[0], argv[1:], dict(env)); return "accepted"
+    except rsw.Refused as e:
+        return f"refused rc={e.rc}"
+def say(ok, what): print(("OK  " if ok else "BAD ") + what)
+
+task = open(taskf, encoding="utf-8").read()
+sec = task.split("record your verdict with EXACTLY these bash commands:", 1)[1].split("Run those commands and then exit", 1)[0]
+lines, out, fail = sec.splitlines(), [], False
+for ln in lines:
+    if ln.startswith("# If FAIL"): fail = True; continue
+    if ln.startswith("# If PASS"): continue
+    out.append(ln[2:] if fail and ln.startswith("# ") else ln)
+toks = shlex.split("\n".join(out))
+cmds, cur = [], []
+for t in toks:
+    if t == "bd" and cur: cmds.append(cur); cur = []
+    cur.append(t)
+if cur: cmds.append(cur)
+say(len(cmds) == 7, f"found 7 verdict commands in the task text (2 labels + comment + close for PASS, label + comment + close for FAIL; got {len(cmds)})")
+for c in cmds:
+    kind = c[3] if c[1] == "-C" else c[1]
+    sub = c[4] if kind == "label" else ""
+    r = verdict(c)
+    if kind == "label":   say(r == "refused rc=77", f"label {sub} {c[-1]} -> {r} (the prompt says: rc 77 is expected, do not retry)")
+    elif kind == "comment": say(r == "accepted", f"comment {c[5][:14]!r}… ({len(c[5])} chars, {c[5].count(chr(10))+1} lines) -> {r}")
+    elif kind == "close": say(r == "accepted", f"close -> {r}")
+    else: say(False, f"unexpected command in the verdict section: {c[:4]}")
+for argv, want, what in [
+    (["bd", "list", "--assignee", SESSION, "--label", "type:quality-gate-verdict", "--json", "--limit", "5"], "accepted", "the prompt's first-turn lookup"),
+    (["bd", "show", "ga-vb-demo", "--json"], "accepted", "bd show <id> --json (metadata fallback)"),
+    (["bd", "show", "ga-vb-demo", "--include-comments"], "refused rc=77", "bd show --include-comments (why the task is never a pointer on the node)"),
+    (["bd", "comments", "ga-vb-demo"], "refused rc=77", "bd comments (same)"),
+    (["gc", "runtime", "drain-ack"], "refused rc=77", "gc runtime drain-ack (why the remote prompt has no drain-ack)"),
+    (["bd", "update", "ga-vb-demo", "--status", "closed"], "refused rc=77", "a status edit is not in the list"),
+]:
+    r = verdict(argv); say(r == want, f"{what}: {r}")
+for k, v in [("GC_SESSION_NAME", "gate-reviewer-adhoc-0123456789"), ("GC_TEMPLATE", "gate-reviewer"), ("GC_ALIAS", "gastown.dog-4")]:
+    r = verdict(["bd", "close", "ga-vb-demo"], {**ENV, k: v}); say(r == "refused rc=77", f"identity with {k}={v} (a LOCAL name) -> {r}")
+r = verdict(["bd", "close", "ga-vb-demo"]); say(r == "accepted", "…and the node reviewer's own identity can close")
+PY
+  while IFS= read -r _l; do
+    case "$_l" in "OK  "*) ok "${_l#OK  }" ;; "BAD "*) bad "${_l#BAD }" ;; *) bad "shim check output: $_l" ;; esac
+  done < "$TMP/shim-check.out"
+  [ -s "$TMP/shim-check.out" ] || bad "the shim check printed nothing"
+fi
+
 echo "── 6. mutants: each rule must fail when it is removed ──"
 mutate_lib() { # $1=name $2=old $3=new → path of the mutated lib, or empty when 'old' is not in the lib (a mutation that mutated nothing proves nothing)
   python3 -I - "$LIB" "$TMP/mut-$1.lib.sh" "$2" "$3" <<'PY' || return 1

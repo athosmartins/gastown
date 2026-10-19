@@ -8,6 +8,7 @@
 • Fatia 6c: hooks no Linux, latência dos hooks gc e a sessão mínima de ponta a ponta (MEDIDO 17/10)
 • Fatia 6d: o que faltava antes da sessão REAL (ga-2hd02v.1.5.9, MEDIDO 18/10)
 • Fatia 7: o provider cria o worktree da sessão, nomes do engine e o template `dog-remote` (ga-2hd02v.1.7)
+• Fatia 9: revisores do gate no nó, `gate-reviewer-remote` (ga-2hd02v.1.9): ponteiro
 
 Bead ga-2hd02v.1.5 (decisão Q4 do Mayor: sessão remota só é liberada depois que existir um substituto do `gt tap guard cross-clone-block`), fatia **6a** (ga-2hd02v.1.5.1) de 3. Repartida de antemão na Epic Split Convention para caber no teto do gate (E11): 6b (.1.5.2) = skills com CPF/CNPJ fora + auditoria de segredo/dado; 6c (.1.5.3) = hooks `keep` no Linux, latência dos hooks gc, sessão ponta a ponta (entregue: ver "Fatia 6c" no fim). **Esta fatia não libera sessão real.** Ela entrega a trava; liberar é decisão explícita do Mayor. Fora desta fatia: usuário Unix por sessão (sem bead) e, do `remote-worker-bundle.md`, tudo além do que ela mediu (guarda, `ask`).
 
@@ -232,3 +233,7 @@ Decisão do Mayor (18/10, opção 1 da ga-2hd02v.1.6). **Nada disto está vivo**
 4. Atribuir uma bead real ao `dog-remote-1`, nudge, e provar: `gc prime` rodou, hooks gc ok, `bd`/`gc` pelo atalho, commit e push pelo espelho, `gate-done`.
 
 **Deriva medida em 18/10 (não é desta fatia).** O `hetzner-remote-git.sh` instalado no nó (15 677 B, de 15/10) é de uma revisão ANTERIOR à do repositório (17 055 B): faltam as correções posteriores do gate da fatia 4 (varredura `scan` mais estrita com `--diff-filter=d` e recusa de nome com quebra de linha, `wt-add` que recusa checkout incompleto, `status` por prefixos do clone). O contrato que o provider usa (`wt-add`/`wt-rm`, caminhos, `GT_REMOTE_GIT`) é o mesmo nas duas, então a fatia 7 funciona com a instalada; reinstalar é com quem cuida do nó (compartilhado com a ga-zri39b).
+
+## Fatia 9: revisores do gate no nó (ga-2hd02v.1.9)
+
+O template `gate-reviewer-remote` e a escolha "nó primeiro, local só no transbordo" estão construídos e **inertes** (sem a flag `.gc/gate-remote-reviewers.on` o gate roda como antes). Do lado do endurecimento, o que importa: o revisor do nó usa só o que o atalho deixa passar (entrega o veredito por `bd comment` + `bd close`; `bd label` e `gc runtime drain-ack` voltam rc 77 e o prompt manda não contornar), recebe a tarefa inteira no nudge porque o atalho não devolve corpo de comentário, e o `identity_pattern` vivo já aceita o nome da sessão. Ligar exige `"gate-reviewer": "gascity"` em `worktree_rigs` do host `hetzner` (config viva, decisão do Mayor, depois do flip da 1.6). Alargar o atalho para `bd label add verdict:*` ou para ler comentários NÃO foi feito e é decisão de segurança do Mayor. Tudo em `gate-reviewer-remote.md`.
