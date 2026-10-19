@@ -76,7 +76,7 @@
 #   2b. the ROOM PASS (ga-978f1y), the way out of a deadlock. Tier 2's gc is gated twice on a rewrite of EVERY pack: the window's lib wants free >= the largest pack + 2GiB (6.6GB with the 4.5GB pack), and
 #      compact_repo's disk_low wants all the packs + headroom (~10.3GB). The mini sits at 5-6GB free, so neither could ever pass: 48 runs deferred (bad_streak 48-49), 56 packs, 10GB,
 #      and the disk never went down. The room pass is what runs INSTEAD, only when the window is OPEN (00:00-04:59, a clock that can be read) and one of those two gates said no: `repack -a -d -l -f --cruft` over
-#      as many of the SMALLEST packs as the room holds, with every other pack — the largest above all, always — as --keep-pack, so the 4.5GB pack is never read or written and the pass needs only the picked packs' size free.
+#      as many of the SMALLEST packs as the room holds, with every other pack — the largest above all, always — as --keep-pack, so the 4.5GB pack is never REWRITTEN (S39 asserts its checksum is unchanged; git still opens its .idx to know what it holds) and the pass needs only the picked packs' size free.
 #      Packs with a .mtimes (cruft), a .keep, an .idx it cannot count or a size it cannot read are kept too. "Room" = free − Dolt's floor ((DOLT_DISK_FLOOR_CRITICAL_GB + 1) GiB) − headroom − a quarter of the loose
 #      bytes; the picked packs must fit in it, and so must the pass's cap. At least two packs are picked or the pass is not started (the log says why each run) — one pack alone gains nothing. Its cap is adaptive,
 #      like tier 2a's, per repo in the state (`room_kib`: the most KiB of packs a pass takes; starts at JAC_ROOM_START_KIB 256MiB, grows by doubling up to JAC_ROOM_MAX_KIB 1GiB after a pass that finished in under a
@@ -92,7 +92,7 @@
 #      Status: a watchdog stop is `aborted` — a failure (bad_status, exit 1, LOUD, the log says which reading tripped it), because it means this host did not have the room the pass thought it had. The cap halves and the pass
 #      waits JAC_ROOM_RETRY_S (2h, `room_cut_epoch` in the state) before the next, so a host that keeps tripping costs one stopped pass per interval, not one per run. A pass cut at its own cap (JAC_ROOM_TIMEOUT_S,
 #      40 min) is `timeout` (same shrink and wait); at the run's / the night window's end `deferred`, no shrink; a repack that ended non-zero `failed` (same wait); rc 0 `consolidated`. Like every other step it goes
-#      through run_step, so a stopped or failed pass has its temp files reclaimed by the LEAKS rules. Nothing here deletes history: --keep-pack never drops a pack, and the pass is a repack, not a prune.
+#      through run_step, so a stopped or failed pass has its temp files reclaimed by the LEAKS rules. Nothing here deletes REACHABLE history: --keep-pack never drops a pack and every reachable object stays. It is a repack, not a prune of history — but like the full gc and the tail pass it runs with `--cruft-expiration=2.weeks.ago`, so inside the packs it picked it does let go of UNREACHABLE objects older than two weeks.
 #      NOT VALIDATED ON THE REAL ARCHIVE: the thresholds are defaults, not measurements (swap noise of ±1.3GiB between runs was seen on 19/10, so 512MiB may false-trip — the log then says "swap in use grew" and the
 #      next pass is smaller). The first night's log is the evidence. Moving the archive off the mini (the Mayor's option b) was judged out of scope here.
 #   2. pack count >= JAC_PACKS_LIMIT (8): one full `git gc` to consolidate. Each batch pack
@@ -633,7 +633,8 @@ swap_used_kib() {
     bin="$SYSCTL"; [ -n "$bin" ] || bin="$(command -v sysctl 2>/dev/null)"
     [ -n "$bin" ] || { [ -x /usr/sbin/sysctl ] && bin=/usr/sbin/sysctl; }
     [ -n "$bin" ] && [ -x "$bin" ] || return 1
-    s="$(_bounded "$PS_TIMEOUT_S" "$bin" -n vm.swapusage 2>/dev/null | awk '{
+    # LC_ALL=C on both ends: under pt_BR sysctl prints "3303,06M" and awk would read "3303.06" as 3303 — the strict parse below would refuse every night (the pass inert, and quiet about why)
+    s="$(LC_ALL=C _bounded "$PS_TIMEOUT_S" "$bin" -n vm.swapusage 2>/dev/null | LC_ALL=C awk '{
         for (i = 1; i < NF; i++) if ($i == "used" && $(i + 1) == "=") {
           v = $(i + 2); u = substr(v, length(v)); n = substr(v, 1, length(v) - 1)
           if (n !~ /^[0-9]+(\.[0-9]+)?$/) exit 1
@@ -696,13 +697,23 @@ stop_step_at_exit() {
   fi
 }
 
-# watch_check — one look at free disk and swap. rc 0 = go on; rc 1 = stop the step, WATCH_WHY says why. Needs WATCH_FREE_MIN_KIB and WATCH_SWAP_BASE_KIB. A look that cannot read one of the two counts toward WATCH_BLIND_MAX
-# (a reading that comes back resets the count); the rest is a plain comparison.
+# watch_check — one look at free disk and swap. rc 0 = go on; rc 1 = stop the step, WATCH_WHY says why. Needs WATCH_FREE_MIN_KIB and WATCH_SWAP_BASE_KIB. A reading that IS there is judged even when the other one is not
+# (swap that already blew its budget must not wait for df to answer again). A look that cannot read one of the two counts toward WATCH_BLIND_MAX, and each such look is logged as it happens (a reading that
+# comes back resets the count); the rest is a plain comparison.
 watch_check() {
   local fr sw
   fr="$(watch_free_kib)"; sw="$(swap_used_kib)"
+  if is_uint "$fr" && [ "$fr" -lt "$WATCH_FREE_MIN_KIB" ]; then
+    WATCH_WHY="free disk fell to ${fr}KiB, below Dolt's floor + slack (${WATCH_FREE_MIN_KIB}KiB)"
+    return 1
+  fi
+  if is_uint "$sw" && [ "$sw" -gt $(( WATCH_SWAP_BASE_KIB + WATCH_SWAP_MAX_KIB )) ]; then
+    WATCH_WHY="swap in use grew to ${sw}KiB from ${WATCH_SWAP_BASE_KIB}KiB at the start (more than the ${WATCH_SWAP_MAX_KIB}KiB the pass may add; free disk is ${fr:-unreadable}${fr:+KiB})"
+    return 1
+  fi
   if ! { is_uint "$fr" && is_uint "$sw"; }; then
     WATCH_BLIND_N=$(( WATCH_BLIND_N + 1 ))
+    log "  watchdog: blind look $WATCH_BLIND_N of $WATCH_BLIND_MAX — free='${fr:-unreadable}' swap='${sw:-unreadable}' (a reading that is there was judged and is within its limit)"
     if [ "$WATCH_BLIND_N" -ge "$WATCH_BLIND_MAX" ]; then
       WATCH_WHY="free disk or swap could not be read in $WATCH_BLIND_N looks in a row (free='${fr:-unreadable}' swap='${sw:-unreadable}') — a watchdog that cannot see does not let the step go on"
       return 1
@@ -710,14 +721,6 @@ watch_check() {
     return 0
   fi
   WATCH_BLIND_N=0
-  if [ "$fr" -lt "$WATCH_FREE_MIN_KIB" ]; then
-    WATCH_WHY="free disk fell to ${fr}KiB, below Dolt's floor + slack (${WATCH_FREE_MIN_KIB}KiB)"
-    return 1
-  fi
-  if [ "$sw" -gt $(( WATCH_SWAP_BASE_KIB + WATCH_SWAP_MAX_KIB )) ]; then
-    WATCH_WHY="swap in use grew to ${sw}KiB from ${WATCH_SWAP_BASE_KIB}KiB at the start (more than the ${WATCH_SWAP_MAX_KIB}KiB the pass may add; free disk is ${fr}KiB)"
-    return 1
-  fi
   return 0
 }
 

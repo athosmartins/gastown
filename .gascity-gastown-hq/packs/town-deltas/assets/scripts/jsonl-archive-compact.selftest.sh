@@ -757,9 +757,13 @@ printf '%s\n' 'x alarm mail: sending now' 'x stale lock (owner gone, x)' 'x alar
 # the code does not write is worse than none: it stops the next reader from looking for the hole)
 header="$(sed -n '1,/^set -uo pipefail/p' "$SCRIPT" | sed 's/^#[ ]*//' | tr '\n' ' ' | tr -s ' ')"
 missing=""
+# the script's log lines are read ONCE into a variable and matched with case — never `grep 'log "' | grep -q`: under pipefail, grep -q leaves at its first
+# match, and when the writer is still going it dies of SIGPIPE (141), so a phrase that IS there read as "missing" (the log lines passed the 16KB pipe buffer)
+# a read that fails or comes back empty leaves $logs empty, so every phrase reports missing — it fails loudly, it never passes
+logs="$(grep 'log "' "$SCRIPT")"
 for m in 'alarm mail: sending now' 'alarm mailed to mayor' 'alarm mail TIMED OUT' 'delivery UNKNOWN' 'alarm mail FAILED' 'slot given back' 'could not be released' 'alarm due but NOT mailed' 'stale lock'; do
   case "$header" in *"$m"*) ;; *) missing="$missing [header lacks: $m]" ;; esac
-  grep 'log "' "$SCRIPT" | grep -qF -- "$m" || missing="$missing [no log line has: $m]"
+  case "$logs" in *"$m"*) ;; *) missing="$missing [no log line has: $m]" ;; esac
 done
 [ -z "$missing" ] && ok "(F) the header's alarm vocabulary is the code's: all 9 phrases it quotes are in the header AND on a log line" || bad "(F) header/code drift in the alarm log vocabulary:$missing"
 
@@ -2164,8 +2168,9 @@ case " \$* " in *" repack "*)
     swap)  printf '%s\n' "\${ROOM_SWAP_TO:-3000000}" > "$WORK/swap-used" ;;
     free)  printf '%s\n' "\${ROOM_FREE_TO:-1000}" > "$WORK/watch-free" ;;
     blind) rm -f "$WORK/swap-used" ;;
+    blindfree-swap) printf '%s\n' junk > "$WORK/watch-free"; printf '%s\n' "\${ROOM_SWAP_TO:-3000000}" > "$WORK/swap-used" ;;
   esac
-  case "\${ROOM_ACT:-}" in swap|free|blind|hang) sleep 60 & echo \$! > "$WORK/room-sleep.pid"; wait \$! ;; esac ;;
+  case "\${ROOM_ACT:-}" in swap|free|blind|blindfree-swap|hang) sleep 60 & echo \$! > "$WORK/room-sleep.pid"; wait \$! ;; esac ;;
 esac
 exec git "\$@"
 EOF
@@ -2268,6 +2273,16 @@ RH="$WORK/rh"; mkwin "$RH"; RH_PC="$(pack_count "$RH")"; rm -f "$WORK/state.json
 out="$(ROOM_ACT=blind rrun "$RH")"; rc=$?
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && sleeper_gone && [ "$(pack_count "$RH")" = "$RH_PC" ] && printf '%s' "$out" | grep -q 'could not be read'; } \
   && ok "H. swap unreadable for 3 samples in a row: stopped, aborted, the log says the readings were lost" || bad "H. blind watchdog handled wrong (rc=$rc status=$(last_status)): $out"
+# H2. ...but a reading that IS there is still judged while the other one is lost: free disk unreadable (the df side is flaky) AND swap blown past its budget → stopped on the first look for the SWAP,
+# not after three blind looks for "could not be read"; each blind look is in the log as it happens (it was silent until the third)
+RH2="$WORK/rh2"; mkwin "$RH2"; RH2_PC="$(pack_count "$RH2")"; rm -f "$WORK/state.json"
+out="$(RFREEFILE=1 ROOM_ACT=blindfree-swap rrun "$RH2")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && sleeper_gone && [ "$(pack_count "$RH2")" = "$RH2_PC" ] && printf '%s' "$out" | grep -q 'swap in use grew' && ! printf '%s' "$out" | grep -q 'could not be read in'; } \
+  && ok "H2. free disk unreadable while swap blows its budget: the readable swap is judged at once — stopped for the swap, not after three blind looks" || bad "H2. a lost free-disk reading hid a swap blow-up (rc=$rc status=$(last_status)): $out"
+rm -f "$WORK/state.json"   # the run above recorded a cut time; without this the next one would only back off
+out="$(RFREEFILE=1 ROOM_ACT=blind rrun "$RH2")"; rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'blind look 1 of 3' && printf '%s' "$out" | grep -q 'blind look 2 of 3' && printf '%s' "$out" | grep -q 'could not be read in 3 looks'; } \
+  && ok "H2. each blind look is logged (1 of 3, 2 of 3) before the third stops the pass" || bad "H2. blind looks not logged one by one (rc=$rc): $out"
 # K. growth: a cap that left a pack out while there was room, and a pass that used under a quarter of its budget, doubles
 RK="$WORK/rk"; mkwin "$RK"; rm -f "$WORK/state.json"
 out="$(JAC_ROOM_START_KIB=250 RAVAIL=100000 rrun "$RK")"; rc=$?
@@ -2318,9 +2333,15 @@ case "\${SYSCTL_MODE:-text}" in
   text) printf '%s\n' "\${SYSCTL_OUT:-}" ;;
   grow) if [ "\$n" -lt 2 ]; then echo "total = 8192.00M  used = 1000.00M  free = 7192.00M  (encrypted)"; else echo "total = 8192.00M  used = 3000.00M  free = 5192.00M  (encrypted)"; fi ;;
   fail) exit 1 ;;
+  locale) if [ "\${LC_ALL:-}" = C ]; then echo "total = 4096.00M  used = 3003.88M  free = 1092.12M  (encrypted)"; else echo "total = 4096,00M  used = 3003,88M  free = 1092,12M  (encrypted)"; fi ;;
 esac
 EOF
 chmod +x "$WORK/sysctl-fake"
+# the locale of the caller must not decide the reading: a sysctl that prints "3003,88M" unless it is run with LC_ALL=C (pt_BR does that) — the script has to ask for C itself
+RR="$WORK/rr-locale"; mkwin "$RR"; RR_PC="$(pack_count "$RR")"; rm -f "$WORK/state.json" "$WORK/sysctl-n"
+out="$(LC_ALL=pt_BR.UTF-8 RSYSCTL="$WORK/sysctl-fake" SYSCTL_MODE=locale rrun "$RR")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$RR")" -lt "$RR_PC" ] && [ -s "$WORK/room-args" ]; } \
+  && ok "R. the caller's locale (LC_ALL=pt_BR) does not decide the swap reading: the script asks sysctl for C itself, the room pass runs" || bad "R. a pt_BR caller makes the swap unreadable (rc=$rc status=$(last_status) packs=$(pack_count "$RR")): $out"
 for fmt_case in "M|total = 4096.00M  used = 3003.88M  free = 1092.12M  (encrypted)" "G|total = 4.00G  used = 2.50G  free = 1.50G  (encrypted)" "K|total = 4194304.00K  used = 3076096.00K  free = 1118208.00K  (encrypted)"; do
   RR_N="${fmt_case%%|*}"; RR_OUT="${fmt_case#*|}"; RR="$WORK/rr-ok-$RR_N"
   mkwin "$RR"; RR_PC="$(pack_count "$RR")"; rm -f "$WORK/state.json" "$WORK/sysctl-n"

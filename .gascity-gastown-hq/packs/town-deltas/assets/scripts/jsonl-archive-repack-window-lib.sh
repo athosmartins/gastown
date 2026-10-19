@@ -166,8 +166,8 @@ jaw_log() {
 }
 
 # jaw_repack_allowed <gitdir> [free_kib] [factor] — the whole rule. rc 0 = a whole-repo repack may start now; rc 1 = it may not. JAW_REASON says why either way (a variable: call this directly, not in $(...)).
-# JAW_IN_WINDOW says which side refused: 1 = the clock is inside the start window (a refusal is then about ROOM), 0 = it is not (or the clock/settings cannot be read). The compactor's partial pass (ga-978f1y)
-# is for the first case only; it never runs outside the window.
+# JAW_IN_WINDOW says which side refused: 1 = the clock is inside the start window (a refusal is then usually about ROOM — but jaw_resources_ok also refuses for an unreadable factor, an unmeasurable largest pack or an unreadable free disk, so it is only "the window is open"), 0 = it is not (or the clock/settings cannot be read). The compactor's partial pass (ga-978f1y) redoes its own reads and stands down when it cannot read one,
+# and it runs for the first case only — never outside the window.
 jaw_repack_allowed() {
   local gd="$1" free="${2:-}" factor="${3:-}"
   JAW_IN_WINDOW=0
