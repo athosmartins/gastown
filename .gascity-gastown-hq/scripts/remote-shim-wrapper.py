@@ -112,13 +112,19 @@ def v_kv(s: str) -> bool:
         and k.startswith(ALLOW_META) and len(val) <= 4000 and "\0" not in val
 
 
+def v_ref(s: str) -> bool:  # nome de branch do espelho (gate-done <bead> <ref> <sha>): a forma já exclui `:`/`@`/espaço; aqui saem também os que o git recusaria (o executável confere de novo)
+    return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", s) is not None and ".." not in s and "//" not in s and not s.endswith(("/", ".", ".lock"))
+
+
 def v_n(s: str) -> bool:  # --limit 0 é "tudo": varredura de beads inteiros não sai do mini
     return re.fullmatch(r"[1-9][0-9]{0,2}", s) is not None and int(s) <= 200
 
 
 VAL = {"id": _fm(ID), "ids": _fm(ID + "(?:," + ID + "){0,49}"), "word": _fm(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,79}"),
        "status": _fm(r"[a-z_]{1,20}(?:,[a-z_]{1,20}){0,5}"), "kv": v_kv, "text": v_text, "line": v_line, "n": v_n,
-       "delivery": _fm(r"wait-idle|queue")}
+       "delivery": _fm(r"wait-idle|queue"),
+       # gate-done <bead> <ref> <sha> (ga-2hd02v.1.18): o ref é nome de branch do espelho (começa por letra/dígito: nunca vira flag; sem `:` nem `@`); o sha é inteiro, 40 hex
+       "ref": v_ref, "sha": _fm(r"[0-9a-f]{40}")}
 _IDENT = r"[A-Za-z0-9][A-Za-z0-9._@/-]{0,95}"
 # única entrada de ambiente aceita do cliente (e o valor tem formato): o servidor declara QUEM é a sessão, nada que aponte caminho
 ENV_VAL = {"GC_AGENT": _IDENT, "GC_ALIAS": _IDENT, "GC_SESSION_NAME": _IDENT, "GC_TEMPLATE": _IDENT,
@@ -131,10 +137,11 @@ class F:  # uma flag: val = nome em VAL (ou None se não leva valor), rep = pode
 
 
 class Rule:
-    def __init__(self, tool, words, pos=(), flags=None, owner_lock=False):
+    def __init__(self, tool, words, pos=(), flags=None, owner_lock=False, hint=""):
         self.tool, self.words, self.pos, self.flags = tool, tuple(words), list(pos), dict(flags or {})
         self.short = {f.short: n for n, f in self.flags.items() if f.short}
         self.owner_lock = owner_lock  # escreve na bead <id>: em bead de veredito (VERDICT_LABEL) só passa para o dono (owner_gate); o serve() lê o estado antes
+        self.hint = f" (forma: {hint})" if hint else ""  # só entra na recusa por contagem de posicionais: a mensagem diz a forma inteira, não só o 1º grupo que faltou
 
     def label(self) -> str:  # a linha que o runbook mostra: gerada da regra, então não há duas verdades
         w = " ".join(shlex.quote(x) if " " in x else x for x in self.words)
@@ -184,13 +191,13 @@ class Rule:
         for gi, (val, lo, hi) in enumerate(self.pos):
             take = min(hi, len(pos) - p - sum(g[1] for g in self.pos[gi + 1:]))
             if take < lo:
-                raise Refused(f"faltam argumentos <{val}>")
+                raise Refused(f"faltam argumentos <{val}>{self.hint}")
             for tok in pos[p:p + take]:
                 if not VAL[val](tok):
                     raise Refused(f"argumento fora do formato <{val}>")
             p += take
         if p != len(pos):
-            raise Refused("argumento a mais")
+            raise Refused(f"argumento a mais{self.hint}")
         return out, pos
 
 
@@ -217,6 +224,8 @@ RULES = [
     Rule("gc", ["mail", "send"], [("word", 1, 1)], {"--subject": F("text", short="-s"), "--message": F("text", short="-m")}),
     Rule("gc", ["mail", "reply"], [("id", 1, 1)], {"--subject": F("text", short="-s"), "--message": F("text", short="-m")}),
     Rule("gc", ["session", "nudge"], [("word", 1, 1), ("line", 1, 50)], {"--delivery": F("delivery")}),
+    # a forma com argumentos vem ANTES da sem argumento: a recusa de 1 ou 2 argumentos (a 1ª regra que falha dá o motivo) diz a forma inteira. Sem argumento cai na regra de baixo
+    Rule("gate-done", [], [("id", 1, 1), ("ref", 1, 1), ("sha", 1, 1)], hint="gate-done <bead> <ref> <sha>, ou gate-done sem argumento"),
     Rule("gate-done", []),
 ]
 
