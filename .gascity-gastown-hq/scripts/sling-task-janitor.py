@@ -93,7 +93,11 @@ SESSION_LIST_BIN = os.environ.get("SLING_SESSION_LIST_BIN",
                                   "/Users/athos/gt/.gascity-gastown-hq/scripts/gc-session-list-cached.sh")
 
 # A sling stub title: "build story <id>", "fix bug <id>", "build <id>", "implement <id>".
-SLING_RE = re.compile(r"\b(?:build story|fix bug|build|fix|implement)\s+([a-z]{2,3}-[a-z0-9]+)", re.I)
+# ga-ol78tp: o <id> leva o sufixo de fatia inteiro (ga-zri39b.3, ga-2hd02v.1.5.3): o pai de um stub de
+# fatia é a FATIA, não o guarda-chuva (que por desenho fica pilot:no-auto-dispatch e em regra nunca está
+# story:in-flight). Só entra no sufixo ".<dígitos>"; um ponto de fim de frase ou uma extensão (".md")
+# não é fatia.
+SLING_RE = re.compile(r"\b(?:build story|fix bug|build|fix|implement)\s+([a-z]{2,3}-[a-z0-9]+(?:\.[0-9]+)*)", re.I)
 # A bead carrying any of these is TRACKED work, not an inert orphan stub — never touch.
 _ACTIVE_LABELS = {"story:in-flight", "story:approved", "story:done", "story:needs-approval"}
 # ga-0jcit: a stub the assignee explicitly refused (`pool:refused:<reason>`, per the dog
@@ -306,7 +310,10 @@ def _list_deferred_expired_slings(store, now):
     return out
 
 
-_BEADID_RE = re.compile(r"\b([a-z]{2,3}-[a-z0-9]{4,})\b")
+# ga-ol78tp: mesmo sufixo de fatia que o SLING_RE. O id que o marker aberto cita (branch:fix/ga-xxxxxx.3-slug)
+# tem de ser escrito na mesma gramática que o id do pai do stub; se um lado trunca e o outro não, o stub
+# de uma fatia no gate deixa de casar com o marker dela e, sem outra guarda que o segure, é fechado como órfão.
+_BEADID_RE = re.compile(r"\b([a-z]{2,3}-[a-z0-9]{4,}(?:\.[0-9]+)*)\b")
 
 
 def _gated_bead_ids():
@@ -1036,7 +1043,7 @@ def main():
 def _selftest():
     global _bd_list_open_fn, _bd_close_fn, _sessions_fn, _rigs_fn, _do_notify_fn, MAX_PER_SWEEP
     global _target_status_fn, _rig_name_map_fn, BD_BIN, GC_BIN, _deferred_slings_fn
-    global _gated_fn, SESSION_LIST_BIN
+    global _gated_fn, SESSION_LIST_BIN, BD_LIST_CACHED
     ok = [0]
     bad = [0]
     def _ok(m): ok[0] += 1; print("  ok  " + m)
@@ -1781,6 +1788,134 @@ print(json.dumps(found))
         _bad("BM12e: JSON sem 'sessions' virou 'ninguém vivo'", "got=%r" % (res["sem_chave"],))
     _ok("BM12f: 'sessions' que é objeto vazio, não lista → None") if res["objeto"] is None else \
         _bad("BM12f: 'sessions' sem forma de lista virou 'ninguém vivo'", "got=%r" % (res["objeto"],))
+
+    # ── ga-ol78tp: o id do pai preserva o sufixo de fatia ───────────────────────────────────────────
+    # 16/10: o janitor fechou os stubs ga-6un1ca, ga-988ks8 e ga-c79qtf ("build story ga-zri39b.3: …")
+    # citando 'ga-zri39b', o GUARDA-CHUVA: SLING_RE e _BEADID_RE paravam no ponto, e a decisão
+    # "parent NOT in active build" olhava o story:in-flight do guarda-chuva (em regra nunca in-flight)
+    # em vez do da fatia. Os cenários BN fixam o id da fatia onde ele decide: o extrator do título (BN1),
+    # o in-flight e o status do pai (BN2, BN3), o id que o marker aberto do gate cita (BN4, BN7) e o
+    # run_cycle de ponta a ponta (BN5: close_reason e status pedido ao bd show; BN6: fatia em build).
+    MAX_PER_SWEEP = 10
+    # Título real dos 3 stubs (bd show em 19/10), truncado como o bd o guarda.
+    REAL_STUB = ("build story ga-zri39b.3: Nó Linux de testes, fatia 3/4 — relatório diário "
+                 "(baterias por host, tempo, fallbacks, sombra, custo")
+
+    def _bn_decide(label, bead, want_close, want_in_why, inflight=(), live=(), statuses=None):
+        c, why = _should_close(bead, set(inflight), set(live), NOW, parent_status_by_id=statuses)
+        if c != want_close:
+            _bad("%s: %s em vez de %s" % (label, "fechou" if c else "manteve", "fechar" if want_close else "manter"), why)
+        elif want_in_why not in why:
+            _bad("%s: decidiu certo, mas o motivo não cita %r" % (label, want_in_why), why)
+        else:
+            _ok("%s: %s — motivo cita %r" % (label, "fecha" if c else "mantém", want_in_why))
+
+    def _bn_sweep(beads, statuses=None, gated=()):
+        """Um run_cycle de um store só, tudo por seam (gated=None deixa _gated_bead_ids() rodar de verdade).
+        -> ([(id, close_reason)] fechados, ids que o bd show de status dos pais recebeu)."""
+        global _rigs_fn, _bd_list_open_fn, _sessions_fn, _bd_close_fn, _do_notify_fn
+        global _target_status_fn, _gated_fn
+        closed_now, asked = [], []
+
+        def _status(targets_by_store):
+            for ids in targets_by_store.values():
+                asked.extend(sorted(ids))
+            return dict(statuses or {})
+        _rigs_fn = lambda: ["HQ"]
+        _bd_list_open_fn = lambda store: beads
+        _sessions_fn = lambda: set()
+        _gated_fn = None if gated is None else (lambda: set(gated))
+        _bd_close_fn = lambda store, bid, reason: (closed_now.append((bid, reason)) or True)
+        _do_notify_fn = lambda m, p: None
+        _target_status_fn = _status
+        try:
+            run_cycle(NOW)
+        finally:
+            _gated_fn = None
+            _target_status_fn = None
+        return closed_now, asked
+
+    print("Scenario BN1 (ga-ol78tp): _is_sling devolve o id COM o sufixo de fatia (.N e .N.M…); sem sufixo "
+          "segue igual, e ponto de fim de frase ou extensão de arquivo não viram sufixo")
+    for title, want in [
+        (REAL_STUB, "ga-zri39b.3"),
+        ("fix bug ga-2hd02v.1.5.3: fatia de fatia de fatia", "ga-2hd02v.1.5.3"),
+        ("build story ga-abc123.1.5: fatia de fatia", "ga-abc123.1.5"),
+        ("implement ga-abc123.2", "ga-abc123.2"),
+        ("build story ga-abc123: sem sufixo (controle)", "ga-abc123"),
+        ("fix bug ga-abc123.", "ga-abc123"),
+        ("fix ga-abc123.md muda o doc", "ga-abc123"),
+    ]:
+        got = _is_sling(mk("bn1", title))
+        _ok("BN1: %r → %s" % (title[:34], want)) if got == want else \
+            _bad("BN1: %r devolveu %r, esperado %r" % (title[:34], got, want))
+
+    print("Scenario BN2 (ga-ol78tp): a decisão olha a FATIA — fatia story:in-flight → KEEP citando o id com "
+          "sufixo; só o guarda-chuva in-flight NÃO segura o stub da fatia; sem sufixo segue igual")
+    _bn_decide("BN2a", mk("bn2a", "build story ga-abc123.3: x"), False, "parent ga-abc123.3 is story:in-flight",
+               inflight={"ga-abc123.3"})
+    _bn_decide("BN2b", mk("bn2b", "fix bug ga-abc123.1.5: x"), False, "parent ga-abc123.1.5 is story:in-flight",
+               inflight={"ga-abc123.1.5"})
+    _bn_decide("BN2c", mk("bn2c", "build story ga-abc123.3: x"), True, "parent ga-abc123.3 NOT in active build",
+               inflight={"ga-abc123"})
+    _bn_decide("BN2d", mk("bn2d", "build story ga-abc123: x"), False, "parent ga-abc123 is story:in-flight",
+               inflight={"ga-abc123"})
+
+    print("Scenario BN3 (ga-ol78tp): parent_closed olha o status da FATIA — fatia CONFIRMED CLOSED + assignee vivo "
+          "→ CLOSE citando a fatia; só o guarda-chuva fechado não fecha o stub da fatia que tem sessão viva")
+    _bn_decide("BN3a", mk("bn3a", "fix bug ga-abc123.3: x", assignee="dog-vivo"), True,
+               "parent ga-abc123.3 is CONFIRMED CLOSED", live={"dog-vivo"}, statuses={"ga-abc123.3": "closed"})
+    _bn_decide("BN3b", mk("bn3b", "fix bug ga-abc123.3: x", assignee="dog-vivo"), False,
+               "stub assignee 'dog-vivo' is a LIVE session", live={"dog-vivo"}, statuses={"ga-abc123": "closed"})
+
+    print("Scenario BN5 (ga-ol78tp): run_cycle ponta a ponta — o stub órfão de fatia fecha com o close_reason "
+          "citando o id COM o sufixo, e o bd show de status dos pais recebe a fatia, não o guarda-chuva")
+    closed5, asked5 = _bn_sweep([mk("bn5", REAL_STUB)])
+    reason5 = closed5[0][1] if closed5 else ""
+    if [c[0] for c in closed5] != ["bn5"]:
+        _bad("BN5: o stub órfão da fatia não fechou", "closed=%s" % (closed5,))
+    elif "'ga-zri39b.3'" not in reason5 or "'ga-zri39b'" in reason5:
+        _bad("BN5: o close_reason não cita a fatia com o sufixo", reason5)
+    elif asked5 != ["ga-zri39b.3"]:
+        _bad("BN5: o status do pai foi pedido para outro id", "asked=%s" % (asked5,))
+    else:
+        _ok("BN5: close_reason cita 'ga-zri39b.3' e o bd show pediu a fatia")
+
+    print("Scenario BN6 (ga-ol78tp): run_cycle ponta a ponta — fatia story:in-flight na lista → o stub dela "
+          "fica (antes: fechado como órfão porque o pai lido era o guarda-chuva)")
+    slice_bead = {"id": "ga-abc123.3", "title": "a fatia", "issue_type": "task", "status": "in_progress",
+                  "labels": ["story:in-flight"], "assignee": "", "updated_at": OLD}
+    closed6, _ = _bn_sweep([slice_bead, mk("bn6", "build story ga-abc123.3: x")])
+    _ok("BN6: stub da fatia story:in-flight fica aberto") if closed6 == [] else \
+        _bad("BN6: fechou o stub de uma fatia em build", "closed=%s" % (closed6,))
+
+    print("Scenario BN4/BN7 (ga-ol78tp): o id que o marker ABERTO do gate cita (branch:fix/<id>-slug) também "
+          "leva o sufixo — senão o stub da fatia, já lido com sufixo, deixa de casar com o seu marker")
+    bn_markers = [
+        {"labels": ["type:quality-gate-marker", "gate-status:ready", "branch:fix/ga-abc123.3-gate-x"]},
+        {"labels": ["type:quality-gate-marker", "branch:fix/ga-2hd02v.1.18-gate-done-ref-arg"]},
+        {"labels": ["type:quality-gate-marker", "branch:fix/ga-ol78tp-sling-janitor-sufixo-fatia"]},
+        {"labels": ["type:quality-gate-marker", "source-bead:ga-def456.2"]},
+    ]
+    bn_dir = tempfile.mkdtemp()
+    bn_stub = os.path.join(bn_dir, "fake-bd-list-cached.sh")
+    with open(bn_stub, "w") as f:
+        f.write("#!/bin/bash\ncat <<'JSON'\n%s\nJSON\n" % json.dumps(bn_markers))
+    saved_list_cached = BD_LIST_CACHED
+    BD_LIST_CACHED = bn_stub
+    try:
+        got_gated = _gated_bead_ids()
+        closed7, _ = _bn_sweep([mk("bn7", "fix bug ga-abc123.3: x")], gated=None)
+    finally:
+        BD_LIST_CACHED = saved_list_cached
+        shutil.rmtree(bn_dir, ignore_errors=True)
+    want_gated = {"ga-abc123.3", "ga-2hd02v.1.18", "ga-ol78tp", "ga-def456.2"}
+    if got_gated == want_gated:
+        _ok("BN4: ids dos markers abertos com o sufixo da fatia; palavras do slug não viram id")
+    else:
+        _bad("BN4: ids do marker aberto errados", "got=%s esperado=%s" % (sorted(got_gated), sorted(want_gated)))
+    _ok("BN7: stub da fatia com marker aberto da PRÓPRIA fatia fica aberto") if closed7 == [] else \
+        _bad("BN7: fechou o stub de uma fatia cujo marker está aberto no gate", "closed=%s" % (closed7,))
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
     sys.exit(1 if bad[0] else 0)
