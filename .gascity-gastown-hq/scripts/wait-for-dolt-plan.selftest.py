@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """wait-for-dolt-plan.selftest.py — hermético: plists e programas falsos numa pasta de mktemp, `plutil` de mentira, "cidade" de mentira com uma cópia do wait-for-dolt.sh de verdade.
-Não lê o ~/Library/LaunchAgents, não chama launchctl.
+Não lê o ~/Library/LaunchAgents, não chama launchctl. O único caso que usa a política e um plist REAIS usa os do REPO (o vigia de ocupação), copiados para a pasta de mktemp.
 
 Contents
   Casos · Controle negativo (mutantes) · Variáveis
@@ -11,7 +11,7 @@ CASOS: plano é SÓ LEITURA (checksum da pasta não muda) e a medição separa c
   wrap fica byte a byte igual, backup byte a byte do original, idempotente (2ª vez não embrulha de novo) · --revert devolve o original e é idempotente · RECUSAS (nada é escrito): divergência,
   wrapper ausente/não executável/com sintaxe ruim, wrap em KeepAlive, wrap sem chamada medida, label em 2 arquivos · plist symlink / com chave Program / que o plutil -lint recusa não são
   alterados · política ilegível, com decisão desconhecida ou label repetido = exit 3 · uso errado = exit 2 · --revert com plist ilegível (lista e sai 1) · wrapper embrulhado por OUTRO caminho ·
-  política × vivo (isento embrulhado, nao-medido que mede LÊ, wrap sem gatilho) · backup (falha de criação sem traceback; --backup-dir reaproveitado não sobrescreve) · sonda ao lado do wrapper.
+  política × vivo (isento embrulhado, nao-medido que mede LÊ, wrap sem gatilho) · backup (falha de criação sem traceback; --backup-dir reaproveitado não sobrescreve) · sonda ao lado do wrapper · a política REAL do repo isenta o vigia de ocupação (ga-2hd02v.1.17).
 CONTROLE NEGATIVO: cada guarda (marca `GUARD:` no script) é adulterada numa cópia e o caso que a cobre TEM que passar a falhar; mutante que não muda o arquivo também falha.
 VARIÁVEIS: WFDP_UNDER_TEST (script a testar) · WFDP_NO_MUTANTS=1
 """
@@ -377,6 +377,23 @@ def c_unreadable_refuses_apply():
     return rc == 1 and "(1) ==" in div and "plist(s) não lido(s) (garbage.plist)" in div and rc2 == 1 and "RECUSADO" in err2 and snap(d) == before
 
 
+def c_real_policy_hetzner_occupancy():
+    """ga-2hd02v.1.17: a política REAL do repo (não a BASE_POLICY de teste) isenta o vigia de ocupação. O plist é o do repo, copiado para uma pasta de mktemp. Sem a linha
+    isento o mesmo plano diz "NÃO CLASSIFICADO (fora da política)" para o job que o Mayor instalou. Os outros rótulos da política real não têm plist aqui: o exit é 1 nos dois casos, por isso o que vale é a saída."""
+    label = "com.gascity.hetzner-occupancy-watch"
+    pol, src = os.path.join(HERE, "wait-for-dolt.policy.tsv"), os.path.join(HERE, f"{label}.plist")
+    # vazio → arquivo existente e vazio cai no regex abaixo e reprova; falhou/ilegível → política ou plist ausente: reprova aqui, limpo, em vez de uma exceção do shutil.copy
+    if not (os.path.isfile(pol) and os.path.isfile(src)):
+        return False
+    d = f"{T}/la-real-hetzner"
+    os.makedirs(d)
+    shutil.copy(src, d)
+    out = run([], d, pol)[1]
+    # vazio → sem a seção ISENTOS, m é None e o caso reprova; falhou/ilegível → traceback ou saída sem o plano, m é None e reprova (timeout vira exceção, que a SUITE conta como FAIL); nunca "isento por falta de dado"
+    m = re.search(r"== ISENTOS \((\d+)\) ==\n(.*?)(?=\n== |\Z)", out, re.S)
+    return bool(m) and m.group(1) == "1" and m.group(2).startswith(f"{label} [") and f"NÃO CLASSIFICADO (fora da política): {label}" not in out
+
+
 SUITE = [
     (c_plan_readonly, "plano é só leitura; medição separa chamada de texto (b.sh = TALVEZ); script direto é lido; script citado e ausente = ILEGÍVEL; escopo; ilegível; plutil; contagens"),
     (c_apply_revert, "--apply exato + chaves/ordem + backup byte a byte + idempotente; --revert devolve o original e é idempotente"),
@@ -398,6 +415,7 @@ SUITE = [
     (c_unread_program, "programa (args[1] do interpretador) ausente com outro argumento legível → ILEGÍVEL, não NÃO ACHEI; argumento de dado ausente não conta"),
     (c_odd_plists, "plist com topo que não é dicionário / Label que não é texto → listado como ilegível, sem traceback, o resto do plano sai"),
     (c_unreadable_refuses_apply, "plist que não consegui ler é divergência: o plano sai 1 e --apply recusa sem escrever nada"),
+    (c_real_policy_hetzner_occupancy, "a política REAL do repo isenta o vigia de ocupação: o plist do repo cai em ISENTOS e não em NÃO CLASSIFICADO (ga-2hd02v.1.17)"),
 ]
 MUTANTS = [   # (nome, expressão sed, cenário)
     ("aplica-com-divergencia", "/GUARD:apply-refuses-divergence/ s/if div:/if False:/", c_refuse_divergence),
