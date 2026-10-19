@@ -112,7 +112,7 @@ def v_kv(s: str) -> bool:
         and k.startswith(ALLOW_META) and len(val) <= 4000 and "\0" not in val
 
 
-def v_ref(s: str) -> bool:  # nome de branch do espelho (gate-done <bead> <ref> <sha>): a forma já exclui `:`/`@`/espaço; aqui saem também os que o git recusaria (o executável confere de novo)
+def v_ref(s: str) -> bool:  # nome de branch do espelho (gate-done <bead> <ref> <sha>): a forma já exclui `:`/`@`/espaço; aqui saem também `..`, `//` e o final `/`, `.` ou `.lock` (só os casos comuns: o executável confere o resto com `git check-ref-format`)
     return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", s) is not None and ".." not in s and "//" not in s and not s.endswith(("/", ".", ".lock"))
 
 
