@@ -5471,7 +5471,7 @@ fi
 # above. No push per sweep: a sweep runs every few minutes and the alarm already belongs to
 # dolt-disk-floor-guard.sh (WARN/CRITICAL with its own cooldowns); this gate only holds the door.
 # `|| rc=$?`: the reader answers 1 for "no pause", and the dispatcher runs under set -e.
-# ga-2hd02v.1.20: _PILOT_NODE_ONLY=1 is the NODE-ONLY pass. Only this gate sets it (a CONFIRMED low disk + PILOT_NODE_FIRST=on, outside DRY_RUN); dispatch_lane, dispatch_one, the pool top-up,
+# ga-2hd02v.1.20: _PILOT_NODE_ONLY=1 is the NODE-ONLY pass. Only this gate sets it (a CONFIRMED low disk + PILOT_NODE_FIRST=on, outside DRY_RUN); dispatch_lane, dispatch_one, the pool top-up (inside _pilot_pool_topup, its first gate),
 # the pause-clearing below, the Step 5 stall streak and the cede-only streak check (_pilot_yield_stall_check) read it. Always 0 otherwise.
 _PILOT_NODE_ONLY=0
 _disk_floor_rc=0
@@ -10400,6 +10400,13 @@ _pilot_pool_topup() {
   local _pool="$1" _max="$2"
   local _live _global _pending _mig
 
+  # ga-2hd02v.1.20: the NODE-ONLY pass (disk floor) opens no pool session, and this is the first gate so nothing below is read or spawned. A pool session runs on the MINI, whose disk is what the pause protects.
+  # vazio (variável nunca definida) → varredura normal, o top-up segue; falhou/ilegível (qualquer valor que não seja 1) → idem. O pulo só acontece com o valor 1, que só o gate do disk floor grava (disco CONFIRMADO baixo + on, depois de zerar a variável): uma leitura que falhou nunca vira pulo.
+  if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
+    log "  ga-2hd02v.1.20: passada só-nó do disk floor — sem top-up de $_pool (abrir sessão de wa-worker/ps-worker gasta o disco do mini)."
+    return 0
+  fi
+
   # ga-swnsg3: skip entirely when Dolt was saturated at sweep start —
   # spawning a session is itself Dolt load (session-state writes), so
   # top-up must back off the same way normal dispatch already throttles on
@@ -10627,13 +10634,10 @@ _TOPUP_RIG_PATHS=$(printf '%s' "$_TOPUP_RIG_PATHS_JSON" | jq -r '.rigs[] | selec
 # ga-5fn5p3: who waits for capacity — asked ONCE, here, so the top-up below and the dispatch lanes later read the same answer.
 _pilot_priority_waiting_scan
 _pilot_heal_hq_blind_routes
-# ga-2hd02v.1.20: the NODE-ONLY pass (disk floor) opens no pool session — a wa-worker/ps-worker session runs on the MINI, whose disk is what the pause protects.
-if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
-  log "ga-2hd02v.1.20: passada só-nó do disk floor — sem pool top-up (abrir sessão de wa-worker/ps-worker gasta o disco do mini)."
-else
-  _pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
-  _pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
-fi
+# ga-2hd02v.1.20: no `if` around these two calls, on purpose. The big selftest (TOPUP-6, ga-swnsg3-e) requires them at the top level, every sweep, before both early exits;
+# the NODE-ONLY pass (disk floor) skips the top-up INSIDE the function, as its first gate: a wa-worker/ps-worker session runs on the MINI, whose disk is what the pause protects.
+_pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
+_pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
 
 if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
   # ga-8c1 AC5: even when backing off, surface the dispatch-queue depth so every
