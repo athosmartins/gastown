@@ -560,6 +560,10 @@ warn() { echo "WARN: $*" >&2; }
 _ts_to_epoch() { python3 -c 'import sys,datetime; print(int(datetime.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00")).timestamp()))' "$1"; }
 gc_json_or_unknown() { "$@"; }
 reviewer_session_confirmed_closed() { [ -f "$FIX/closed-$1" ] && echo 1 || echo 0; }
+# ga-peb71d: the hook also asks (a) whether a session is in the roster at all and (b) what its session bead says when it is absent. Present = a
+# listed-<name> file; bead state = the word in beadstate-<name>, and no file reads "notfound" (the bead is not created yet), as the real function does.
+reviewer_session_listed() { [ -f "$FIX/listed-$1" ] && echo 1 || echo 0; }
+reviewer_session_bead_state() { if [ -f "$FIX/beadstate-$1" ]; then cat "$FIX/beadstate-$1"; else echo notfound; fi; }
 assign_verdict_bead_verified() { echo "assign $1 $2" >> "$CALLS"; return 0; }
 gate_nudge() { echo "nudge $1" >> "$CALLS"; return 0; }
 gate_collect_verdicts() { echo "collect" >> "$CALLS"; }
@@ -777,6 +781,10 @@ retire_case() {
   if [ -n "$age" ] && [ "$age" -gt "$elapsed" ]; then bad "$label: IMPOSSIBLE FIXTURE — the extra is ${age}s old inside a run that is only ${elapsed}s old (an extra is created after its run starts)"; return; fi
   jq -n '[{id:"ga-newvb1",status:"open",labels:["e5-extra"]}]' > "$f/show-ga-newvb1.json"
   [ "$closed" = "1" ] && touch "$f/closed-gate-reviewer-adhoc-new1"
+  # 0/1 = the extra's session is PRESENT in the roster (alive / closed=true); 2/3/4 = ABSENT from it, and its session bead is closed / open /
+  # unreadable (ga-peb71d). The listed- marker is what makes 0/1 "present" for the hook's roster test; 2/3/4 leave it out.
+  case "$closed" in 0|1) touch "$f/listed-gate-reviewer-adhoc-new1" ;; esac
+  case "$closed" in 2) echo closed > "$f/beadstate-gate-reviewer-adhoc-new1" ;; 3) echo open > "$f/beadstate-gate-reviewer-adhoc-new1" ;; 4) echo unknown > "$f/beadstate-gate-reviewer-adhoc-new1" ;; esac
   local created=""; [ -n "$age" ] && created="$(iso_ago "$age")"
   local vbj="${EXTRA_OPEN/__CREATED__/$created}"
   local out pt
@@ -822,6 +830,13 @@ NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # the ordinary states (run timeout 1800s)
 retire_case "extra still young, run young, session alive" "" 0 300 0 1 1800 2100
 retire_case "extra session confirmed closed" "extra-session-closed" 0 300 1
+# ga-peb71d: an extra that died in a reboot is ABSENT from the roster with its session bead closed (the shape of run ga-jb52od's slot 2 minus
+# the re-created session): retired like a listed closed one. (That a dead extra never re-queues the run is the dispatcher's half, proved in
+# gate-peb71d-phase-c-primary-dead.selftest.sh; the cases here only watch the hook.) Open (a live incarnation of the name) and an unreadable
+# lookup keep it, because retiring is final; "not created yet" is the default of every case above (no bead state at all).
+retire_case "extra ABSENT from the roster, its session bead closed" "extra-session-closed" 0 300 2
+retire_case "extra ABSENT from the roster, a session bead of that name still open: kept" "" 0 300 3 1 1800 2100
+retire_case "extra ABSENT from the roster, the session bead lookup failed (unknown): kept" "" 0 300 4 1 1800 2100
 # gate attempt 2, blocking issue 1 — a FIRST-FAIL extra is born late (reviewer 1's FAIL arrives at, say, t=1000s) and must get its
 # OWN window (the run timeout, counted from its creation), not whatever is left of the shared run clock. Every state below is one a
 # real run produces: age <= elapsed, offset = elapsed - age is when reviewer 1 delivered.

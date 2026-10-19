@@ -843,6 +843,18 @@ gate_e5_phase_c_hook() {
       _sess_json=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
       if [ -n "$_sess_json" ] && [ "$(reviewer_session_confirmed_closed "$_extra_sid" "$_sess_json")" = "1" ]; then
         _why="extra-session-closed"
+      elif [ -n "$_sess_json" ] && declare -F reviewer_session_listed >/dev/null 2>&1 && declare -F reviewer_session_bead_state >/dev/null 2>&1 \
+           && [ "$(reviewer_session_listed "$_extra_sid" "$_sess_json")" != "1" ]; then
+        # ga-peb71d: a session that died in a reboot is ABSENT from the roster, not listed closed=true (ga-oj7bzs), so the test above never
+        # saw it and the dead extra stayed until its own clock ran out. Ask its session bead, as Phase C does for a primary: only `closed`
+        # retires it; open / notfound (not created yet) / unknown (the lookup failed) keep it, because retiring is final. The lookup window
+        # follows the run's age (+3h), 24h when the age is unreadable, as in the dispatcher's gate_phase_c_all_pending_closed.
+        local _hours=24
+        case "${PC_ELAPSED:-}" in ''|*[!0-9]*) : ;; *) _hours=$(( PC_ELAPSED / 3600 + 3 )) ;; esac
+        # vazio (notfound: no session bead of that name yet) → the extra is kept; falhou/ilegível (unknown) → the extra is kept; only closed retires
+        if [ "$(reviewer_session_bead_state "$_extra_sid" "$_hours")" = "closed" ]; then
+          _why="extra-session-closed"
+        fi
       fi
     fi
     if [ -n "$_why" ]; then
