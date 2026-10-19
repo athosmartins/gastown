@@ -387,6 +387,42 @@ chmod 755 "$H/file-history"
 { [ "$RC" -eq 1 ] && exists "$H/file-history/$A" && echo "$OUT" | grep -q "$A KEPT — cannot read it" && echo "$OUT" | grep -q 'INCOMPLETE'; } \
   && ok "listable but not stat-able file-history/: every entry kept and named, exit 1" || bad "unstatable entries: rc=$RC out='$OUT'"
 
+# The check AFTER rmtree is a read too (gate 3/3 finding on ga-mnznp8). rmtree runs with ignore_errors, so the
+# only evidence that the folder is gone is a look at the path afterwards — and os.path.lexists answers False
+# for "gone" AND for "could not look" (lstat fails with EACCES/EIO), so an unverified delete was logged as
+# DELETED, counted as freed and ended "pruned" (exit 0). Both scenarios stub rmtree so it deletes nothing.
+PRUNE_HOOK='
+import importlib.util, os, shutil, sys
+spec = importlib.util.spec_from_file_location("cht", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+root = os.path.join(os.environ["CLAUDE_HOME_TRIM_HOME"], "file-history")
+mode = sys.argv[2]
+def fake_rmtree(path, ignore_errors=False):
+    if mode == "unlookable":
+        os.chmod(root, 0)                 # the parent stops being searchable: lstat(child) now raises EACCES
+shutil.rmtree = fake_rmtree
+try:
+    rc = m.main()
+finally:
+    os.chmod(root, 0o755)
+sys.exit(rc)
+'
+# the folder is still there after rmtree (deleted nothing, no error to show for it) → DELETE PARTIAL, exit 1
+H="$T/f13"; mkdir -p "$H/file-history/$A" "$H/projects"; echo y > "$H/file-history/$A/f"
+old 10 "$H/file-history/$A/f" "$H/file-history/$A"
+HOUT="$(CLAUDE_HOME_TRIM_HOME="$H" CLAUDE_HOME_TRIM_GC_BIN="$T/fake-gc" FAKE_GC_OUT="$T/gc-empty.json" pyrun "$PRUNE_HOOK" still-there)"; HRC=$?
+{ [ "$HRC" -eq 1 ] && exists "$H/file-history/$A" && echo "$HOUT" | grep -q "$A DELETE PARTIAL" \
+  && ! echo "$HOUT" | grep -q 'file-history: DELETED' && echo "$HOUT" | grep -q 'deleted=0 failed=1'; } \
+  && ok "rmtree left the folder behind: DELETE PARTIAL, never DELETED, exit 1" || bad "rmtree no-op: rc=$HRC out='$HOUT'"
+# the path cannot be looked at after rmtree → neither "deleted" nor "still there": DELETE UNVERIFIED, nothing freed, exit 1
+H="$T/f14"; mkdir -p "$H/file-history/$A" "$H/projects"; echo y > "$H/file-history/$A/f"
+old 10 "$H/file-history/$A/f" "$H/file-history/$A"
+HOUT="$(CLAUDE_HOME_TRIM_HOME="$H" CLAUDE_HOME_TRIM_GC_BIN="$T/fake-gc" FAKE_GC_OUT="$T/gc-empty.json" pyrun "$PRUNE_HOOK" unlookable)"; HRC=$?
+{ [ "$HRC" -eq 1 ] && exists "$H/file-history/$A" && echo "$HOUT" | grep -q "$A DELETE UNVERIFIED" \
+  && ! echo "$HOUT" | grep -q 'file-history: DELETED' && echo "$HOUT" | grep -q 'deleted=0 failed=1' \
+  && echo "$HOUT" | grep -q 'freed≈0 MB' && echo "$HOUT" | grep -q 'INCOMPLETE'; } \
+  && ok "the path cannot be looked at after rmtree: DELETE UNVERIFIED, not DELETED, nothing freed, exit 1" \
+  || bad "unverifiable delete: rc=$HRC out='$HOUT'"
+
 # dry-run reports and deletes nothing
 H="$T/f6"; mkfh "$H"
 run_trim "$H" CLAUDE_HOME_TRIM_DRY_RUN=1 CLAUDE_CODE_SESSION_ID="$F"
@@ -398,6 +434,21 @@ H="$T/f7"; mkdir -p "$H"
 run_trim "$H"
 { [ "$RC" -eq 0 ] && echo "$OUT" | grep -q 'file-history: .* does not exist'; } \
   && ok "no file-history dir: nothing to prune, exit 0" || bad "missing file-history: rc=$RC out='$OUT'"
+echo "$OUT" | grep -q 'history.jsonl=absent file-history=absent' \
+  && ok "…and the measure line says absent, not 0MB" || bad "measure line for a missing file-history: '$OUT'"
+
+# file-history/ cannot be read at all → the prune skips (exit 1) and the measure line says unreadable, not 0MB
+H="$T/f15"; mkdir -p "$H/file-history"; chmod 000 "$H/file-history"
+run_trim "$H"
+chmod 755 "$H/file-history"
+{ [ "$RC" -eq 1 ] && echo "$OUT" | grep -q 'file-history=unreadable' && ! echo "$OUT" | grep -q 'file-history=0MB'; } \
+  && ok "unreadable file-history/: exit 1 and the measure line says unreadable, not 0MB" || bad "unreadable file-history measure: rc=$RC out='$OUT'"
+# a folder inside it cannot be walked → the figure is marked as a lower bound instead of passing as complete
+H="$T/f16"; mkdir -p "$H/file-history/$K/sub"; echo y > "$H/file-history/$K/sub/f"; chmod 000 "$H/file-history/$K/sub"
+run_trim "$H" CLAUDE_HOME_TRIM_DRY_RUN=1
+chmod 755 "$H/file-history/$K/sub"
+echo "$OUT" | grep -Eq 'file-history=[0-9]+MB\+\(1 entries unreadable\)' \
+  && ok "an unreadable folder inside file-history/: the measure line is marked as a lower bound" || bad "partial measure: rc=$RC out='$OUT'"
 
 # ── report-only files are never touched ────────────────────────────────────
 echo "-- report-only --"

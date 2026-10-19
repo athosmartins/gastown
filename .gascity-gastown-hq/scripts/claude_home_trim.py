@@ -39,6 +39,9 @@ the folder AND ends the part INCOMPLETE (exit 1), never "OK":
   session that is open but only talking, not editing, keeps its transcript fresh; this
   also protects a live session `gc session list` lists without a session_key — 3 of 20 on
   2026-10-18). A project dir that cannot be searched counts as "could not find out".
+After rmtree (which runs with ignore_errors) the path is looked at again, and that look has
+three states too: ENOENT = DELETED (only then is it counted as freed); still there = DELETE
+PARTIAL; any other error = DELETE UNVERIFIED. The last two end the part INCOMPLETE (exit 1).
 history.jsonl is only cut when it is a regular file, the cut point is a line break
 that really exists in the last KEEP bytes, the path still names the file we hold, and the
 file did not shrink under us.
@@ -63,8 +66,9 @@ point at a fixture cannot cut the real files.
 
 ## Exit code
 0 = every part ran (nothing to do counts; a home that does not exist counts). 1 = a part
-failed, lost lines, or had to be skipped or keep something because a thing it needs to be
-sure of could not be read (including the home itself, or a home that is not a directory);
+failed, lost lines, could not confirm a delete, or had to be skipped or keep something because
+a thing it needs to be sure of could not be read (including the home itself, or a home that is
+not a directory);
 the lines above say which.
 """
 import errno
@@ -325,16 +329,21 @@ def _raise(exc):
     raise exc
 
 
-def tree_bytes(path):
-    """Allocated bytes under path (best effort; only used for the freed figure)."""
-    # vazio → 0 bytes; falhou/ilegível → that entry counts 0: this is a measurement for the log, never an input to a keep/delete decision
+def tree_bytes(path, errors=None):
+    """Allocated bytes under path (best effort; only used for the freed figure and the measure
+    line). When `errors` is a list, every OSError met while walking is appended to it, so the
+    caller can tell "0 bytes" from "could not read"."""
+    # vazio → 0 bytes; falhou/ilegível → that entry counts 0 and, when the caller passed `errors`, is recorded there: this is a measurement for the log, never an input to a keep/delete decision
     total = 0
-    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+    for dirpath, dirnames, filenames in os.walk(
+        path, followlinks=False, onerror=errors.append if errors is not None else None
+    ):
         for name in filenames:
             try:
                 total += os.lstat(os.path.join(dirpath, name)).st_blocks * 512
-            except OSError:
-                pass
+            except OSError as exc:
+                if errors is not None:
+                    errors.append(exc)
     return total
 
 
@@ -459,13 +468,22 @@ def prune_file_history(home, min_age_secs, now, dry_run, gc_bin, self_sid):
             log("file-history: DRY-RUN would delete %s (%d MB, idle %d days)" % (name, mb(size), int(age) // 86400))
             continue
         shutil.rmtree(path, ignore_errors=True)
-        if os.path.lexists(path):
-            failed += 1
-            log("file-history: %s DELETE PARTIAL — the folder is still there after rmtree" % name)
-        else:
+        # rmtree ran with ignore_errors, so this look is the only evidence of the outcome. vazio → ENOENT: the folder is gone, DELETED and counted as freed; tem → still there: DELETE PARTIAL, failed; falhou/ilegível → any other error (EACCES/EIO) cannot show it is gone: DELETE UNVERIFIED, failed, nothing freed (os.path.lexists would answer "gone" here)
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
             deleted += 1
             freed += size
             log("file-history: DELETED %s (%d MB, idle %d days)" % (name, mb(size), int(age) // 86400))
+        except OSError as exc:
+            failed += 1
+            log(
+                "file-history: %s DELETE UNVERIFIED — cannot look at it after rmtree (%s), so it is "
+                "not reported as deleted" % (name, exc)
+            )
+        else:
+            failed += 1
+            log("file-history: %s DELETE PARTIAL — the folder is still there after rmtree" % name)
     if not dry_run:
         log("file-history: deleted=%d failed=%d kept-unsure=%d freed≈%d MB" % (deleted, failed, unsure, mb(freed)))
     if failed or unsure:
@@ -485,7 +503,19 @@ def report_sizes(home):
             parts.append("%s=absent" % rel)
         except OSError:
             parts.append("%s=unreadable" % rel)
-    parts.append("file-history=%dMB" % mb(tree_bytes(os.path.join(home, "file-history"))))
+    root = os.path.join(home, "file-history")
+    errs = []
+    # vazio → no file-history folder: "absent"; falhou/ilegível → the folder itself cannot be read: "unreadable"; a part of it cannot: the figure is marked as a lower bound
+    fh_mb = mb(tree_bytes(root, errs))
+    top = [e for e in errs if e.filename == root]
+    if top and isinstance(top[0], FileNotFoundError):
+        parts.append("file-history=absent")
+    elif top:
+        parts.append("file-history=unreadable")
+    elif errs:
+        parts.append("file-history=%dMB+(%d entries unreadable)" % (fh_mb, len(errs)))
+    else:
+        parts.append("file-history=%dMB" % fh_mb)
     log("measure (usage-analytics.jsonl and credit-cache-updater.log are report-only, not trimmed): " + " ".join(parts))
 
 
