@@ -1697,10 +1697,13 @@ print(json.dumps(found))
     print("Scenario BM7 (ga-2lr3a1, TERCEIRO ESTADO): a leitura das sessões FALHOU (None) → NÃO fecha, "
           "mesmo com todo o resto dizendo 'órfão'; e o sweep segue: o órfão da regra antiga continua "
           "sendo fechado")
+    # a7 (stub com assignee) só garante que as regras antigas seguem recebendo um set() vazio quando a
+    # leitura falha, sem TypeError; o destino dele é o comportamento histórico, não uma decisão.
     got = sweepBM([mkparent("ga-alvo7"), mkw("w7", "ga-alvo7"),
-                   mk("o7", "build story ga-parked7")], sessions=lambda: None)
+                   mk("o7", "build story ga-parked7"),
+                   mk("a7", "build story ga-parked7b", assignee="dog-x")], sessions=lambda: None)
     _ok("BM7: sessões ilegíveis → wrapper mantido (inerte sob dúvida), regra antiga intacta") \
-        if got == ["o7"] else _bad("BM7: terceiro estado mal tratado", "closed=%s" % got)
+        if ("w7" not in got and "o7" in got) else _bad("BM7: terceiro estado mal tratado", "closed=%s" % got)
 
     print("Scenario BM8 (ga-2lr3a1, controle negativo): o PRÓPRIO id do wrapper tem marker aberto no "
           "gate → intocado (ga-w5agg/ga-d2jil: fechar a fonte do marker faz o reaper dá-lo como 'merged')")
@@ -1715,11 +1718,14 @@ print(json.dumps(found))
         _ok("BM9: mantém wrapper que já foi iniciado")
 
     print("Scenario BM10 (ga-2lr3a1, controle negativo): created_at AUSENTE ou ilegível → idade "
-          "desconhecida → KEEP (idade que não sei ler nunca é 'passou do prazo')")
+          "desconhecida → KEEP (idade que não sei ler nunca é 'passou do prazo'); metadata que não "
+          "é dict → não sei se há sessão atrelada → KEEP")
+    w10c = mkw("w10c", "ga-alvo10")
+    w10c["metadata"] = "lixo"   # metadata que não é dict
     got = sweepBM([mkparent("ga-alvo10"), mkw("w10a", "ga-alvo10", created=None),
-                   mkw("w10b", "ga-alvo10", created="nao-e-data")])
-    _bad("BM10: fechou com idade desconhecida", "closed=%s" % got) if got else \
-        _ok("BM10: mantém wrapper com created_at ausente/ilegível")
+                   mkw("w10b", "ga-alvo10", created="nao-e-data"), w10c])
+    _bad("BM10: fechou sem poder ler a idade ou a metadata", "closed=%s" % got) if got else \
+        _ok("BM10: mantém wrapper com created_at ausente/ilegível e com metadata ilegível")
 
     print("Scenario BM11 (ga-2lr3a1, controle negativo): status in_progress sem assignee, wrapper "
           "com label de trabalho rastreado, e task que não é wrapper de sling → todos intocados")
@@ -1745,6 +1751,7 @@ print(json.dumps(found))
         "falha": _stub("falha.sh", "echo boom >&2\nexit 3\n"),
         "lixo": _stub("lixo.sh", "echo 'isto nao e json'\n"),
         "sem_chave": _stub("sem_chave.sh", "echo '{\"error\":\"x\"}'\n"),
+        "objeto": _stub("objeto.sh", "echo '{\"sessions\":{}}'\n"),
     }
     saved_session_bin = SESSION_LIST_BIN
     saved_sessions_fn = _sessions_fn
@@ -1772,6 +1779,8 @@ print(json.dumps(found))
         _bad("BM12d: saída ilegível virou conjunto", "got=%r" % (res["lixo"],))
     _ok("BM12e: JSON sem a lista 'sessions' → None") if res["sem_chave"] is None else \
         _bad("BM12e: JSON sem 'sessions' virou 'ninguém vivo'", "got=%r" % (res["sem_chave"],))
+    _ok("BM12f: 'sessions' que é objeto vazio, não lista → None") if res["objeto"] is None else \
+        _bad("BM12f: 'sessions' sem forma de lista virou 'ninguém vivo'", "got=%r" % (res["objeto"],))
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
     sys.exit(1 if bad[0] else 0)
