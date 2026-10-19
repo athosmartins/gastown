@@ -21,7 +21,7 @@ O QUE FAZ, EM ORDEM (passo que não consegue saber algo para sem escrever nada: 
   5. Só depois do marcador, e só se `gate.submitted_by` aparece nele: solta a bead (tira `gc.routed_to`, depois o assignee, que só sai se ainda for o
      alias). Sem isso o pool do dog-remote recria uma sessão fresca a cada idle_timeout (15 min) enquanto a bead seguir atribuída ao alias (achado do
      dog-4 em ga-2hd02v.1.6). O guarda do gate faz o mesmo ao claimar; aqui é antes, para a janela não existir.
-  6. Recolhe o que esta execução criou (worktree, branch local, ref temporária) e imprime o sha submetido.
+  6. Recolhe o que esta execução criou (worktree, branch local, ref temporária) e imprime o sha submetido. Nenhum git daqui dispara gc/manutenção.
 
 O QUE NÃO FAZ
   Não vê o HEAD do servidor: submete o que o ESPELHO tem em worker/<sessão> e imprime esse sha. Quem rodou o `gate-done` compara com `git rev-parse HEAD`
@@ -179,18 +179,21 @@ def submit(city: str, repo: str, alias: str, sess: str, bid: str, sha: str, mirr
     work = Path(city) / ".gc" / "gate-done-remote"
     work.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = open(work / f"{bid}.lock", "a")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        raise Stop(f"outra submissão de {bid} está em curso (trava {work / (bid + '.lock')})")
     wt, ref = str(work / f"wt-{bid}"), f"refs/gt-remote/{sess}"
-    # vazio (nada sobrou) → segue; resto de execução morta (pasta ou branch local) → Stop: não apago o que pode ser de outra mão
-    left = os.path.exists(wt) or run(["git", "-C", repo, "show-ref", "--verify", "-q", f"refs/heads/{branch}"]).returncode == 0
-    if left:
-        lock.close()
-        raise Stop(f"resto de uma submissão anterior ({wt} ou o branch local {branch}): recolha à mão antes (git worktree remove --force; git branch -D)")
-    made_wt = False
+    made_wt = made_ref = False
     try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise Stop(f"outra submissão de {bid} está em curso (trava {work / (bid + '.lock')})")
+        # vazio (nenhuma ref com esse nome) → segue; achou ref ou pasta sobrando → Stop (resto de execução morta, pode ser de outra mão: não apago);
+        # falhou (git rc != 0) → Stop: sem saber se há um branch alheio com o nome, não crio o meu
+        refs = run(["git", "-C", repo, "for-each-ref", "--format=%(refname)", f"refs/heads/{branch}"])
+        if refs.returncode != 0:
+            raise Stop(f"não consegui listar os branches locais (git rc={refs.returncode}: {refs.stderr.strip()[:100]})")
+        if os.path.exists(wt) or refs.stdout.strip():
+            raise Stop(f"resto de uma submissão anterior ({wt} ou o branch local {branch}): recolha à mão antes (git worktree remove --force; git branch -D)")
+        made_ref = True  # daqui em diante a ref temporária é desta execução (antes disso ela pode ser de quem segura a trava)
         r = run(["git", "-C", repo, "fetch", "-q", "--no-tags", "--no-write-fetch-head", mirror, f"+refs/heads/worker/{sess}:{ref}"], timeout=240)
         if r.returncode != 0:
             raise Stop(f"não consegui buscar worker/{sess} do espelho (git rc={r.returncode}: {r.stderr.strip()[:160]})")
@@ -217,7 +220,7 @@ def submit(city: str, repo: str, alias: str, sess: str, bid: str, sha: str, mirr
         return 0
     finally:  # recolhe só o que ESTA execução criou; falha aqui é aviso (o resultado já foi dito acima)
         steps = ([["git", "-C", repo, "worktree", "remove", "--force", wt], ["git", "-C", repo, "branch", "-D", branch]] if made_wt else []) \
-            + [["git", "-C", repo, "update-ref", "-d", ref]]
+            + ([["git", "-C", repo, "update-ref", "-d", ref]] if made_ref else [])
         for cmd in steps:
             r = run(cmd)
             if r.returncode != 0:
@@ -232,6 +235,8 @@ def main() -> int:
     alias, sess = os.environ.get("BEADS_ACTOR", ""), os.environ.get("GC_SESSION_NAME", "")
     if not ALIAS_RE.fullmatch(alias) or not SESS_RE.fullmatch(sess):
         raise Stop(f"BEADS_ACTOR={alias[:40]!r} / GC_SESSION_NAME={sess[:40]!r} fora do formato: sem saber quem pede não submeto", 2)
+    # nenhum git desta submissão (nem os do gate-done.md) dispara gc/manutenção no repositório compartilhado: o disco do mini vive no piso do heavy-guard (ga-vln2py)
+    os.environ.update({"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "gc.auto", "GIT_CONFIG_VALUE_0": "0", "GIT_CONFIG_KEY_1": "maintenance.auto", "GIT_CONFIG_VALUE_1": "false"})
     mirror = os.environ.get("GATE_DONE_REMOTE_MIRROR") or f"{city}/.gc/hetzner-mirror/repos/{RIG}.git"
     bead = one_bead(city, alias)
     bid = bead["id"]

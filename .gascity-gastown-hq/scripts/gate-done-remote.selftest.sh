@@ -75,7 +75,14 @@ a = sys.argv[1:]
 if "rig" in a and "list" in a: print(json.dumps({"rigs": [{"name": "gascity", "path": os.path.dirname(os.path.dirname(os.path.realpath(__file__))) + "/outer/city", "prefix": "ga"}]})); sys.exit(0)
 sys.stderr.write("fake gc: comando nao previsto: %s\n" % a); sys.exit(64)
 EOF
-chmod +x "$BIN/bd" "$BIN/gc"
+REAL_GIT=$(command -v git)
+cat > "$BIN/git" <<GITEOF
+#!/bin/sh
+echo "cfg=\${GIT_CONFIG_COUNT:-UNSET}" >> "$T/git.log"
+case " \$* " in *" \${FAKE_GIT_FAIL:-@@nenhum@@} "*) echo "fake git: \$FAKE_GIT_FAIL falhou" >&2; exit 128;; esac
+exec "$REAL_GIT" "\$@"
+GITEOF
+chmod +x "$BIN/bd" "$BIN/gc" "$BIN/git"
 
 # ── repositórios: origin (main), "~/gt" (outer, com a cidade dentro), espelho bare com worker/<sessão> ─────────────────────────────────────────────
 G() { git -c user.name=t -c user.email=t@t.invalid -c commit.gpgsign=false "$@"; }
@@ -141,6 +148,7 @@ has_desc "NAO verificada aqui"; ok $? "feliz: a auto-auditoria aparece como NÃO
 has "$T/out" "bead solta: ga-t1"; ok $? "feliz: a saída diz que soltou"
 has "$T/out" "submetido: $BR @ $SHA"; ok $? "feliz: a saída imprime o sha submetido"
 clean_after; ok $? "feliz: worktree, branch local e ref temporária foram recolhidos"
+[ -s "$T/git.log" ] && ! grep -qv '^cfg=2$' "$T/git.log"; ok $? "feliz: TODO git da submissão (exe e blocos do gate-done.md) leva gc.auto/maintenance.auto desligados"
 eqs "$FH_BEFORE" "$(ls -l "$OUTER/.git/FETCH_HEAD" 2>&1)"; ok $? "feliz: o FETCH_HEAD do repositório compartilhado não foi tocado"
 [ "$(git -C "$OUTER" rev-parse main)" = "$MAINSHA" ] && [ "$(git -C "$OUTER" branch --show-current)" = main ]; ok $? "feliz: a árvore principal (main) ficou onde estava"
 
@@ -163,6 +171,9 @@ reset_db; python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); d["bea
 run_exe; ok $((RC != 1)) "sem bead do alias: recusa 1"; has "$T/err" "nenhuma bead in_progress"; ok $? "sem bead: diz o motivo"; nothing_written; ok $? "sem bead: nada escrito"
 reset_db; python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); d["beads"]["ga-2"]=dict(d["beads"]["ga-t1"],id="ga-2"); json.dump(d,open(sys.argv[1],"w"))' "$DB"
 run_exe; ok $((RC != 1)) "duas beads do alias: recusa 1"; has "$T/err" "não adivinho"; ok $? "duas beads: diz que não adivinha"; nothing_written; ok $? "duas beads: nada escrito"
+reset_db; run_exe FAKE_GIT_FAIL=for-each-ref; ok $((RC != 1)) "git que FALHA ao listar branches locais: recusa 1"; has "$T/err" "não consegui listar os branches locais"; ok $? "listar falhou: 'não consegui', não 'nenhum resto'"; nothing_written; ok $? "listar falhou: nada escrito"
+reset_db; run_exe FAKE_GIT_FAIL=fetch; ok $((RC != 1)) "git fetch do espelho que falha: recusa 1"; has "$T/err" "não consegui buscar worker/"; ok $? "fetch falhou: diz o motivo"; nothing_written; ok $? "fetch falhou: nada escrito"; clean_after; ok $? "fetch falhou: nada sobrou"
+reset_db; run_exe FAKE_GIT_FAIL=worktree; ok $((RC != 1)) "git worktree add que falha: recusa 1"; has "$T/err" "não consegui criar o worktree"; ok $? "worktree falhou: diz o motivo"; nothing_written; ok $? "worktree falhou: nada escrito"; clean_after; ok $? "worktree falhou: a ref temporária foi recolhida"
 reset_db; run_exe FAKE_BD_FAIL=list; ok $((RC != 1)) "bd list que FALHA: recusa 1"; has "$T/err" "não consegui ler"; ok $? "bd falho: 'não consegui ler', não 'nenhuma bead'"; nothing_written; ok $? "bd falho: nada escrito"
 reset_db; run_exe FAKE_BD_BADJSON=list; ok $((RC != 1)) "bd list com JSON corrompido: recusa 1"; has "$T/err" "ilegível"; ok $? "JSON corrompido: diz 'ilegível'"; nothing_written; ok $? "JSON corrompido: nada escrito"
 reset_db; run_exe BEADS_ACTOR=; ok $((RC != 2)) "sem alias: recusa 2"; nothing_written; ok $? "sem alias: nada escrito"
@@ -251,12 +262,14 @@ case_fetch_head() { b=$(ls -l "$OUTER/.git/FETCH_HEAD" 2>&1); run_exe; eqs "$b" 
 case_md_shape() { python3 -I -c '
 import sys; p=sys.argv[1]; s=open(p).read(); i=s.index("## Step 3"); j=s.index("```bash", i); k=s.index("```", j + 8)
 open(p, "w").write(s[:j] + "```text" + s[j + 7:k] + "```" + s[k + 3:])' "$CITY/commands/gate-done.md"; run_exe; r=$RC; cp "$T/gate-done.md.orig" "$CITY/commands/gate-done.md"; [ "$r" = 2 ] && ! origin_has "$BR" >/dev/null; }
+case_list_fail() { run_exe FAKE_GIT_FAIL=for-each-ref; [ "$RC" = 1 ] && ! origin_has "$BR" >/dev/null; }
 case_leftover_branch() { G -C "$OUTER" branch "$BR" "$MAINSHA"; run_exe; k=0; has "$T/err" "resto de uma submissão anterior" && k=1; git -C "$OUTER" branch -q -D "$BR" 2>/dev/null; [ "$k" = 1 ]; }
 case_cas() { run_exe FAKE_BD_STEAL=1; [ "$(dbq '.beads["ga-t1"].assignee // ""')" = "outro-dono" ]; }
 mutant sem-checar-submitted_by 'if not who:' 'if False:' case_release_without_who
 mutant fetch-escreve-FETCH_HEAD '"--no-write-fetch-head", ' '' case_fetch_head
 mutant md-sem-checar-forma 'if cur is not None or sorted(blocks) != [1, 2, 3, 4] or any(len(v) != 1 for v in blocks.values()):' 'if False:' case_md_shape
-mutant branch-alheio-nao-recusado 'or run(["git", "-C", repo, "show-ref", "--verify", "-q", f"refs/heads/{branch}"]).returncode == 0' 'or False' case_leftover_branch
+mutant branch-alheio-nao-recusado 'if os.path.exists(wt) or refs.stdout.strip():' 'if os.path.exists(wt):' case_leftover_branch
+mutant listar-branches-falho-vira-vazio 'if refs.returncode != 0:' 'if False:' case_list_fail
 mutant solta-sem-compare-and-swap '"--if-assignee", alias, ' '' case_cas
 
 echo
