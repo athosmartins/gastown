@@ -10,6 +10,10 @@ COMO RODA
   `FAILFAST=1 WRAPPER_UNDER_TEST=<cópia> bash remote-shim.selftest.sh` (lado do mini) ou `SHIM_UNDER_TEST=<cópia> ... remote-shim-client.selftest.sh`
   (lado do servidor). O original nunca é tocado.
   Cada rodada sobe um sshd sem privilégio e leva minutos numa máquina carregada: o padrão é 2 em paralelo.
+  No Linux do servidor 4 casos do selftest reprovam por AMBIENTE com a guarda intacta ("pedido grande demais", "JSON aninhado fundo demais", "o log é 0600", "sem a separação"):
+  o 1º deles (linha ~209) para o FAILFAST antes de a rodada chegar nos casos que o mutante deveria reprovar, e a campanha inteira sai "OUTRO CASO". Nesse nó rode com
+  FAILFAST_IGNORE='pedido grande demais|JSON aninhado fundo demais|o log é 0600|sem a separação' python3 -I scripts/remote-shim.mutants.py --only NOME,NOME
+  (regex; o selftest não para nesses casos e o runner não os conta como "o primeiro que reprovou"; se SÓ eles reprovarem, o mutante SOBREVIVEU).
 
 O QUE CONTA COMO MORTO
   MORTO = o selftest saiu 1 E o primeiro caso que reprovou casa com `expect` (a guarda apagada é a que aquele caso exercita).
@@ -54,8 +58,29 @@ MUTANTS = [
     ("metadata-prefixo-largo", "w", 'ALLOW_META = ("athos.", "story.")', 'ALLOW_META = ("athos.", "story.", "gate.", "delivery.")', r"gate\.submitted_by"),
     ("metadata-sem-caixa", "w", "and k.startswith(ALLOW_META)", "and k.lower().startswith(ALLOW_META)", r"Story\.x"),
     # ga-6auslu: o nó NÃO grava rótulo de veredito (forjaria PASS: o bd não confere dono no `label add`). Uma regra `bd label` — o alargamento óbvio — tem que reprovar o 1º caso por chave.
-    ("rotulo-do-veredito-passa", "w", '    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}),\n',
-     '    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}),\n    Rule("bd", ["label"], [("word", 1, 1), ("id", 1, 1), ("word", 1, 1)], {}),\n', r"rótulo do veredito: bd label remove"),
+    ("rotulo-do-veredito-passa", "w", '    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}, owner_lock=True),\n',
+     '    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}, owner_lock=True),\n    Rule("bd", ["label"], [("word", 1, 1), ("id", 1, 1), ("word", 1, 1)], {}),\n', r"rótulo do veredito: bd label remove"),
+    # ga-2hd02v.1.16: a trava de DONO (bd comment/close em bead de veredito só pelo assignee == alias; estado que não li = recusa). Cada guarda dela, apagada, reprova o caso que a exercita.
+    ("dono-sem-checagem", "w", '            owner_gate(read_bead(exe, cwd, child, bead, cfg["timeout_s"]), bead, alias)\n',
+     '            read_bead(exe, cwd, child, bead, cfg["timeout_s"])\n', r"bd comment em bead de veredito de OUTRA sessão"),
+    ("trava-so-sem-comment", "w", '    Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}, owner_lock=True),\n',
+     '    Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}),\n', r"a leitura de estado é UM bd show|bd comment em bead de veredito de OUTRA sessão"),  # (a asserção da leitura vem antes do caso de recusa: sem a trava a regra nem lê)
+    ("trava-so-sem-stdin", "w", '    Rule("bd", ["comment"], [("id", 1, 1)], {"--stdin": F(req=True)}, owner_lock=True),\n',
+     '    Rule("bd", ["comment"], [("id", 1, 1)], {"--stdin": F(req=True)}),\n', r"bd comment --stdin em bead de veredito de outra sessão"),
+    ("trava-so-sem-close", "w", '    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}, owner_lock=True),\n',
+     '    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}),\n', r"bd close em bead de veredito de outra sessão"),
+    ("tipo-sempre-casa", "w", "if VERDICT_LABEL in labels and owner != alias:", "if owner != alias:", r"bd comment <id> palavras|bd comment em bead COMUM de outro dono"),  # bloquearia a entrega dos dogs (comentar/fechar a própria bead)
+    ("rotulo-por-substring", "w", "if VERDICT_LABEL in labels and owner != alias:", "if any(VERDICT_LABEL in x for x in labels) and owner != alias:", r"rótulo parecido não é o rótulo"),
+    ("assignee-vazio-passa", "w", "if VERDICT_LABEL in labels and owner != alias:", "if VERDICT_LABEL in labels and owner and owner != alias:", r"bead de veredito SEM dono"),
+    ("leitura-rc-ignorado", "w", "    if p.returncode != 0:\n", "    if False:\n", r"bd show com rc≠0"),
+    ("leitura-lista-vazia-passa", "w", "    if not (isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict)):\n", "    if False:\n", r"lista vazia"),
+    ("leitura-labels-torto-passa", "w", "    if not (isinstance(labels, list) and all(isinstance(x, str) for x in labels)):\n", "    if False:\n", r"labels null"),
+    ("leitura-assignee-torto-passa", "w", "if not isinstance(owner, str):", "if False:", r"assignee null"),
+    ("leitura-sem-readonly", "w", '    env = {**child, "BD_READONLY": "true", "BD_DOLT_AUTO_COMMIT": "off"}\n', "    env = dict(child)\n", r"bd comment <id> palavras|bd comment em bead de veredito DO PRÓPRIO alias"),  # (sem BD_READONLY a leitura cai no calls.log e o 1º bd comment conta 2 chamadas)
+    ("leitura-herda-stdin", "w", "stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,", "stdout=subprocess.PIPE,", r"o stdin chega ao comando|o stdin chega inteiro ao COMANDO"),  # (o caso do --stdin da lista, mais cedo, já reprova: a leitura herdada come o texto)
+    ("leitura-no-cwd-errado", "w", '[exe, "show", bead, "--json"], cwd=cwd,', '[exe, "show", bead, "--json"], cwd="/",', r"a leitura de estado é UM bd show"),
+    ("leitura-com-stderr-junto", "w", "stderr=subprocess.DEVNULL, ", "stderr=subprocess.STDOUT, ", r"aviso do Dolt no stderr"),
+    ("leitura-sem-prazo", "w", "timeout=min(timeout_s, OWNER_READ_S)", "timeout=None", r"bd show que não responde"),
     ("identidade-sessao-solta", "w", '("GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME", "GC_TEMPLATE")', '("GC_ALIAS", "GC_AGENT")', r"GC_SESSION_NAME do Mayor"),
     ("session-id-atravessa", "w", '"GC_SESSION_NAME": _IDENT, "GC_TEMPLATE": _IDENT,', '"GC_SESSION_NAME": _IDENT, "GC_SESSION_ID": _IDENT, "GC_TEMPLATE": _IDENT,', r"GC_SESSION_ID não atravessa"),
     ("nudge-alvo-livre", "w", 'if r.words == ("session", "nudge") and not (cfg["nudge_re"] and cfg["nudge_re"].fullmatch(pos[0])):', "if False:", r"alvo fora do nudge_pattern"),
@@ -161,7 +186,10 @@ def run_one(m, tmp: Path, timeout: int):
         return name, "ERRO", f"passou de {timeout}s"
     if p.returncode == 0:
         return name, "SOBREVIVEU", "o selftest passou com a guarda apagada"
-    first = next((ln for ln in out.splitlines() if ln.startswith("FAIL ")), None)
+    ignore = os.environ.get("FAILFAST_IGNORE")  # casos que reprovam por causa do AMBIENTE (ver a lib do selftest): não são "o primeiro caso que reprovou"
+    first = next((ln for ln in out.splitlines() if ln.startswith("FAIL ") and not (ignore and re.search(ignore, ln))), None)
+    if first is None and ignore and p.returncode == 1:
+        return name, "SOBREVIVEU", "só reprovaram os casos de ambiente ignorados (FAILFAST_IGNORE)"
     if p.returncode != 1 or first is None:
         return name, "ERRO", f"exit {p.returncode} sem linha FAIL: {out[-200:]!r}"
     return name, ("MORTO" if re.search(expect, first) else "OUTRO CASO"), first[:150]
