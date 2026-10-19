@@ -479,6 +479,145 @@ local_sha=$(get_sha HEAD)
 assert_block "Push touching both orphan trees blocked" run_hook "refs/heads/fix/ga-99999-both-orphans" "$local_sha" "refs/heads/fix/ga-99999-both-orphans" "0000000000000000000000000000000000000000"
 cleanup
 
+# --- ga-x4rbnt: the range the orphan-tree guard measures ---------------------
+# `git diff A..B` is a TREE diff of A against B. For an existing work branch the
+# hook measured remote_sha..local_sha, and a REBASE brings every commit main
+# gained since the fork into that diff: once main carried a scripts/ doc (it was
+# pushed with the bypass), each older branch the gate auto-rebased was refused for
+# a file it never touched. A work branch is now judged by its own delta against
+# the default branch -- merge-base(local, origin/<default>)..local -- and a push
+# to the default branch by what it adds to the remote's tip (remote..local).
+# Tests 31 and 33 fail on the hook before ga-x4rbnt; 32, 34 and 35 are controls
+# that must hold both before and after.
+
+assert_has() {
+  local test_name=$1 haystack=$2 needle=$3
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  PASS: $test_name"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $test_name (output lacks: $needle)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_lacks() {
+  local test_name=$1 haystack=$2 needle=$3
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "  FAIL: $test_name (output names: $needle)"
+    FAIL=$((FAIL + 1))
+  else
+    echo "  PASS: $test_name"
+    PASS=$((PASS + 1))
+  fi
+}
+
+# Test 31: an existing work branch rebased onto a main that gained a scripts/ doc
+# after the fork. The doc rides into the pushed tree via the rebase; the branch
+# itself touches nothing under scripts/ -- allowed.
+echo "Test 31: Existing work branch rebased onto a main that gained a scripts/ doc — allowed"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-rebased >/dev/null 2>&1
+echo "work" > work.txt
+git add work.txt && git commit -m "branch work" >/dev/null 2>&1
+remote_sha=$(get_sha HEAD)
+git checkout "$DEFAULT_BRANCH" >/dev/null 2>&1
+mkdir -p scripts
+echo "doc" > scripts/old-doc.md
+git add scripts/old-doc.md && git commit -m "main gains a scripts/ doc" >/dev/null 2>&1
+git update-ref "refs/remotes/origin/$DEFAULT_BRANCH" "$(get_sha HEAD)"
+git checkout fix/ga-99999-rebased >/dev/null 2>&1
+git rebase "$DEFAULT_BRANCH" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_pass "Rebased work branch not touching scripts/ allowed" run_hook "refs/heads/fix/ga-99999-rebased" "$local_sha" "refs/heads/fix/ga-99999-rebased" "$remote_sha"
+cleanup
+
+# Test 32: an existing (not rebased) work branch that gains scripts/zz.md --
+# blocked. Control: the guard still bites on a branch that already exists remotely.
+echo "Test 32: Existing work branch gaining scripts/zz.md — blocked"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-adds-scripts >/dev/null 2>&1
+echo "a" > a.txt
+git add a.txt && git commit -m "first push" >/dev/null 2>&1
+remote_sha=$(get_sha HEAD)
+mkdir -p scripts
+echo "zz" > scripts/zz.md
+git add scripts/zz.md && git commit -m "adds scripts/zz.md" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_block "Existing work branch adding scripts/zz.md blocked" run_hook "refs/heads/fix/ga-99999-adds-scripts" "$local_sha" "refs/heads/fix/ga-99999-adds-scripts" "$remote_sha"
+cleanup
+
+# Test 33: a REBASED work branch that itself adds scripts/zz.md, onto a main that
+# carries its own scripts/old-doc.md -- blocked, and the message names only the
+# file the BRANCH added (old-doc.md is main's, not the pusher's).
+echo "Test 33: Rebased work branch that adds scripts/zz.md — blocked, naming only its own file"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-rebased-adds >/dev/null 2>&1
+mkdir -p scripts
+echo "zz" > scripts/zz.md
+git add scripts/zz.md && git commit -m "branch adds scripts/zz.md" >/dev/null 2>&1
+remote_sha=$(get_sha HEAD)
+git checkout "$DEFAULT_BRANCH" >/dev/null 2>&1
+mkdir -p scripts
+echo "doc" > scripts/old-doc.md
+git add scripts/old-doc.md && git commit -m "main gains a scripts/ doc" >/dev/null 2>&1
+git update-ref "refs/remotes/origin/$DEFAULT_BRANCH" "$(get_sha HEAD)"
+git checkout fix/ga-99999-rebased-adds >/dev/null 2>&1
+git rebase "$DEFAULT_BRANCH" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+hook_rc=0
+hook_out=$(run_hook "refs/heads/fix/ga-99999-rebased-adds" "$local_sha" "refs/heads/fix/ga-99999-rebased-adds" "$remote_sha") || hook_rc=$?
+if [[ $hook_rc -ne 0 ]]; then
+  echo "  PASS: Rebased work branch adding scripts/zz.md blocked"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: Rebased work branch adding scripts/zz.md (expected block, got pass)"
+  FAIL=$((FAIL + 1))
+fi
+assert_has "the block names the branch's own file" "$hook_out" "scripts/zz.md"
+assert_lacks "the block does not name main's file" "$hook_out" "old-doc.md"
+cleanup
+
+# Test 34: a push to the DEFAULT branch is judged by remote..local, not by the
+# local tracking ref (stale here: a fetch has not happened). Main already carries
+# scripts/old-doc.md; the new commit is harmless -- allowed. Control against
+# applying the merge-base range to the default branch too.
+echo "Test 34: Default-branch push is judged by remote..local, not by a stale tracking ref — allowed"
+setup_repos
+cd "$TMPDIR/local"
+stale_sha=$(get_sha HEAD)
+mkdir -p scripts
+echo "doc" > scripts/old-doc.md
+git add scripts/old-doc.md && git commit -m "main gains a scripts/ doc" >/dev/null 2>&1
+remote_sha=$(get_sha HEAD)
+echo "more" >> file.txt
+git add file.txt && git commit -m "harmless follow-up" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+git update-ref "refs/remotes/origin/$DEFAULT_BRANCH" "$stale_sha"
+assert_pass "Default-branch push adding nothing under scripts/ allowed" run_hook "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
+cleanup
+
+# Test 35: no origin/<default> tracking ref, so no merge-base to judge by -- an
+# existing work branch falls back to remote..local, as before ga-x4rbnt (never
+# looser than the hook was).
+echo "Test 35: Existing work branch, no merge-base available — falls back to remote..local (blocked)"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b fix/ga-99999-no-base >/dev/null 2>&1
+echo "a" > a.txt
+git add a.txt && git commit -m "first push" >/dev/null 2>&1
+remote_sha=$(get_sha HEAD)
+mkdir -p scripts
+echo "zz" > scripts/zz.md
+git add scripts/zz.md && git commit -m "adds scripts/zz.md" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+git update-ref -d "refs/remotes/origin/$DEFAULT_BRANCH"
+assert_block "Fallback range still blocks scripts/zz.md" run_hook "refs/heads/fix/ga-99999-no-base" "$local_sha" "refs/heads/fix/ga-99999-no-base" "$remote_sha"
+cleanup
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [[ $FAIL -gt 0 ]]; then
