@@ -21,9 +21,10 @@
 # SAÍDA: `mbp_default_host` imprime UMA linha, user@host, sempre não vazia. Executado direto (`bash mbp-host.sh`) imprime o
 #   mesmo. Incluído (source), só define funções e MBP_TS_HOST / MBP_LAN_HOST.
 #
-# COMO É USADO: mbp-run.sh e dolt-restore-lab-mbp.sh incluem este arquivo e fazem `${MBP_HOST:-$(mbp_default_host)}`: MBP_HOST
-#   definido por quem chama NUNCA é sondado nem trocado. mbp-proof.py roda `bash mbp-host.sh` quando MBP_PROOF_SSH não está definido, mas só em `e2e` e `install --apply`
-#   (os que conectam); `plan` e `install` sem --apply não sondam e mostram o nome do Tailscale.
+# COMO É USADO: mbp-run.sh (ensure_mac_host) e dolt-restore-lab-mbp.sh (main) incluem este arquivo e só chamam mbp_default_host
+#   quando MBP_HOST não veio do chamador: MBP_HOST definido NUNCA é sondado nem trocado. mbp-proof.py roda `bash mbp-host.sh`
+#   quando MBP_PROOF_SSH não está definido, mas só em `e2e` e `install --apply` (os que conectam); `plan` e `install` sem
+#   --apply não sondam e mostram o nome do Tailscale.
 #   Selftests: MBP_HOST_PROBE=<comando> troca a sonda (recebe HOST PORTA; rc 0 = respondeu) e nada toca a rede.
 #
 # SEGURANÇA: só abre e fecha uma conexão TCP na porta 22 (nc -z); não autentica, não envia nada, não escreve arquivo. Compatível
