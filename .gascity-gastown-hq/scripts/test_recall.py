@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -485,8 +486,13 @@ class TestInstrumentation(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestUpdateIndexIfStaleThrottle(unittest.TestCase):
     def _idx(self, last_build_at, last_check_at):
+        # Relative to now, not a calendar date: prune_and_reindex() drops beads
+        # older than MAX_AGE_DAYS, so a hard-coded 2026-07-01 stopped surviving
+        # the refresh on 2026-09-29 and three tests below went red with no code
+        # change (the fixture bead was pruned, not the behavior under test).
+        recent = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         return rl.RecallIndex(
-            corpus=[{"id": "ga-1", "store": "HQ", "closed_at": "2026-07-01T00:00:00Z", "title": "x",
+            corpus=[{"id": "ga-1", "store": "HQ", "closed_at": recent, "title": "x",
                      "description": "", "comments": [], "close_reason": "", "issue_type": "bug",
                      "priority": 2, "_ntok_full": 10}],
             chunk_vecs=__import__("numpy").zeros((1, 384), dtype="float32"),
