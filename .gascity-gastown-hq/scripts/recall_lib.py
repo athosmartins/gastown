@@ -510,6 +510,8 @@ def index_inconsistency(corpus, chunk_vecs, chunk_bead_idx, meta):
     Pure (no I/O). Persisted counts missing from meta are not held against an
     index (older metas); counts that are there must match the arrays."""
     import numpy as np
+    if corpus is None or chunk_bead_idx is None:
+        return "corpus or chunk_bead_idx is missing"  # cannot tell is not consistent
     vecs_shape = getattr(chunk_vecs, "shape", None)
     if vecs_shape is None or len(vecs_shape) != 2:
         return f"chunk_vecs is not a 2-D matrix (shape={vecs_shape})"
@@ -699,12 +701,15 @@ def _require_heavy_step_allowed(what: str) -> None:
     a heavy step in the sense of scripts/heavy-guard.sh (ga-vln2py, 17/10: heavy
     steps run with the disk already low filled it and Dolt took ENOSPC). Ask
     the guard; raise RecallIndexRebuildDeferred on anything but a clear yes
-    (rc 75 low disk, rc 76 cannot read the disk, any other rc, cannot run it)
-    -- under doubt the inert state is 'do not start'. A checkout without the
-    guard script has nobody to ask and proceeds."""
+    (rc 75 low disk, rc 76 cannot read the disk, any other rc, cannot run it,
+    script not there) -- under doubt the inert state is 'do not start'. The
+    guard is tracked in the same scripts/ dir as this file, so its absence in a
+    city means a broken install, not a go-ahead."""
     guard = Path(GC_CITY_PATH) / "scripts" / "heavy-guard.sh"
     if not guard.exists():
-        return
+        raise RecallIndexRebuildDeferred(
+            f"recall needs to rebuild its index from scratch ({what}) but the disk guard {guard} "
+            f"is not there; nothing was changed -- restore scripts/heavy-guard.sh and run recall again")
     try:
         proc = subprocess.run([str(guard), "--check", "--what", what],
                               capture_output=True, text=True, timeout=HEAVY_GUARD_TIMEOUT_S)

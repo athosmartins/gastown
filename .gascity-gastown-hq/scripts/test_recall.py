@@ -451,6 +451,14 @@ class TestIndexInconsistency(unittest.TestCase):
     def test_empty_index_is_consistent(self):
         self.assertIsNone(rl.index_inconsistency(*self._parts(_make_index(0, 1, 1.0))))
 
+    def test_missing_parts_are_reported_not_raised(self):
+        """A part that is None is 'cannot tell', which is not 'consistent' and
+        must not surface as a TypeError out of len(None)."""
+        idx = _make_index(3, 2, 1.0)
+        self.assertIsNotNone(rl.index_inconsistency(idx.corpus, idx.chunk_vecs, None, idx.meta))
+        self.assertIsNotNone(rl.index_inconsistency(None, idx.chunk_vecs, idx.chunk_bead_idx, idx.meta))
+        self.assertIsNotNone(rl.index_inconsistency(idx.corpus, None, idx.chunk_bead_idx, idx.meta))
+
 
 class _IndexDirCase(unittest.TestCase):
     def setUp(self):
@@ -831,9 +839,13 @@ class TestRebuildRespectsDiskGuard(unittest.TestCase):
             with self.assertRaises(_PastTheGuard):
                 rl.build_full_index()
 
-    def test_a_checkout_without_the_guard_script_is_not_blocked(self):
-        with self.assertRaises(_PastTheGuard):
+    def test_a_missing_guard_script_is_a_refusal_not_a_green_light(self):
+        """heavy-guard.sh is tracked next to recall_lib.py, so in the city its
+        absence means a broken install -- 'cannot ask' must not read as 'allowed'."""
+        with self.assertRaises(rl.RecallIndexRebuildDeferred) as cm:
             rl.build_full_index()
+        self.assertIn("heavy-guard.sh", str(cm.exception))
+        self.m_model.assert_not_called()
 
     def test_the_cli_reports_a_deferred_rebuild_as_could_not_search(self):
         import io
