@@ -55,6 +55,8 @@ ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 SESS_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,60}")  # o formato que o `wt-add` aceita: é dele que vem o nome do branch worker/<sessão>
 BEAD_RE = re.compile(r"[a-z]{2,8}-[a-z0-9]{2,16}(?:\.[0-9]{1,4}){0,3}")  # o id que o passo 2 do gate-done.md extrai do nome do branch (se divergirem, ELE recusa)
 MARKER_RE = re.compile(r"^Marker created: (\S+)\s*$", re.M)
+SHA_RE = re.compile(r"[0-9a-f]{40}")  # o sha que o dog diz: inteiro, para a conferência com o espelho ser igualdade e não prefixo
+USAGE = "gate-done <bead> <ref> <sha>   (ou `gate-done` sem argumento: a ÚNICA bead in_progress do alias, de worker/<sessão>)"
 TIMEOUT_CMD = 120  # um bd/git que pendura não segura a submissão para sempre (o wrapper também corta tudo em timeout_s)
 SCRIPT_RAN = [False]  # vira True quando os blocos do gate-done.md começam: daí em diante um erro NÃO é "nada foi escrito" (marcador pode existir)
 
@@ -112,16 +114,40 @@ def one_bead(city: str, alias: str) -> dict:
     return rows[0]
 
 
-def mirror_sha(mirror: str, sess: str) -> str:
+def check_ref(raw: str, sess: str, bid: str) -> str:
+    """O branch do espelho que o dog pede para submeter, sem `refs/heads/`. Só vale o que é DESTA sessão (worker/<sessão> ou worker/<sessão>-N: casamento
+    EXATO, nunca prefixo, senão a sessão `x4` passaria por `x`) ou leva o id da bead pedida (fix/<bead> ou fix/<bead>-<resumo>). Qualquer outra coisa → Stop (nada foi lido
+    nem escrito). Função pura: a identidade vem do ambiente do atalho (GC_SESSION_NAME), nunca do que o dog escreve."""
+    name = raw[len("refs/heads/"):] if raw.startswith("refs/heads/") else raw
+    mine = re.fullmatch(rf"worker/{re.escape(sess)}(?:-[0-9]{{1,3}})?", name)
+    fixed = re.fullmatch(rf"fix/{re.escape(bid)}(?:-[A-Za-z0-9._-]{{1,80}})?", name)
+    if not (mine or fixed):
+        raise Stop(f"{raw[:80]!r} está fora do que esta sessão pode submeter (worker/{sess} ou worker/{sess}-N, ou fix/{bid} / fix/{bid}-<resumo>)")
+    if run(["git", "check-ref-format", f"refs/heads/{name}"]).returncode != 0:
+        raise Stop(f"{name!r} não é um nome de branch válido")
+    return name
+
+
+def named_bead(city: str, alias: str, bid: str) -> dict:
+    """A bead que o dog NOMEOU: vale se está in_progress com o assignee = alias. Ausente ou com leitura que falha/ilegível → Stop (bd_json), nunca 'pode'."""
+    bead = first(bd_json(city, ["show", bid, "--json"], f"a bead {bid}"))
+    if not isinstance(bead, dict) or bead.get("id") != bid:
+        raise Stop(f"a bead {bid}: resposta do bd com forma inesperada")
+    if bead.get("status") == "in_progress" and bead.get("assignee") == alias:
+        return bead
+    raise Stop(f"{bid} não é uma bead in_progress atribuída a {alias} (status={bead.get('status')!r}, assignee={bead.get('assignee')!r}): não submeto bead alheia")
+
+
+def mirror_sha(mirror: str, src: str) -> str:
     # vazio (a ref não existe, rc 1) → Stop "o push não chegou"; falhou/ilegível (espelho ausente, git que não leu) → Stop com o rc
     if not os.path.isdir(mirror):
         raise Stop(f"espelho {mirror} não existe neste mini")
-    r = run(["git", f"--git-dir={mirror}", "rev-parse", "--verify", "-q", f"refs/heads/worker/{sess}^{{commit}}"])
+    r = run(["git", f"--git-dir={mirror}", "rev-parse", "--verify", "-q", f"refs/heads/{src}^{{commit}}"])
     sha = r.stdout.strip()
     if r.returncode == 1 and not sha:
-        raise Stop(f"o espelho não tem worker/{sess}: o `git push origin HEAD` do servidor não chegou (ou a sessão é de outro rig; só {RIG})")
-    if r.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
-        raise Stop(f"não consegui ler worker/{sess} no espelho (git rc={r.returncode}: {r.stderr.strip()[:120]})")
+        raise Stop(f"o espelho não tem {src}: o `git push origin HEAD:refs/heads/{src}` do servidor não chegou (ou a sessão é de outro rig; só {RIG})")
+    if r.returncode != 0 or not SHA_RE.fullmatch(sha):
+        raise Stop(f"não consegui ler {src} no espelho (git rc={r.returncode}: {r.stderr.strip()[:120]})")
     return sha
 
 
@@ -175,7 +201,7 @@ def release(city: str, bead: str, alias: str, marker: str) -> None:
         print(f"bead solta: {bead} sem assignee e sem gc.routed_to", flush=True)
 
 
-def submit(city: str, repo: str, alias: str, sess: str, bid: str, sha: str, mirror: str, branch: str, script: str) -> int:
+def submit(city: str, repo: str, alias: str, sess: str, bid: str, sha: str, mirror: str, src: str, branch: str, script: str) -> int:
     work = Path(city) / ".gc" / "gate-done-remote"
     work.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = open(work / f"{bid}.lock", "a")
@@ -194,9 +220,9 @@ def submit(city: str, repo: str, alias: str, sess: str, bid: str, sha: str, mirr
         if os.path.exists(wt) or refs.stdout.strip():
             raise Stop(f"resto de uma submissão anterior ({wt} ou o branch local {branch}): recolha à mão antes (git worktree remove --force; git branch -D)")
         made_ref = True  # daqui em diante a ref temporária é desta execução (antes disso ela pode ser de quem segura a trava)
-        r = run(["git", "-C", repo, "fetch", "-q", "--no-tags", "--no-write-fetch-head", mirror, f"+refs/heads/worker/{sess}:{ref}"], timeout=240)
+        r = run(["git", "-C", repo, "fetch", "-q", "--no-tags", "--no-write-fetch-head", mirror, f"+refs/heads/{src}:{ref}"], timeout=240)
         if r.returncode != 0:
-            raise Stop(f"não consegui buscar worker/{sess} do espelho (git rc={r.returncode}: {r.stderr.strip()[:160]})")
+            raise Stop(f"não consegui buscar {src} do espelho (git rc={r.returncode}: {r.stderr.strip()[:160]})")
         r = run(["git", "-C", repo, "worktree", "add", "-q", "--no-checkout", "-b", branch, wt, sha], timeout=240)
         if r.returncode != 0:
             raise Stop(f"não consegui criar o worktree de {branch} em {sha[:12]} (git rc={r.returncode}: {r.stderr.strip()[:160]})")
@@ -205,7 +231,7 @@ def submit(city: str, repo: str, alias: str, sess: str, bid: str, sha: str, mirr
         if head != sha:  # o que vai ao gate tem de ser exatamente o que o espelho tinha
             raise Stop(f"o worktree ficou em {head[:12]!r}, não em {sha[:12]}")
         env = {**os.environ, "GC_CITY_PATH": city, "GC_ALIAS": os.environ.get("GC_ALIAS", alias), "GIT_TERMINAL_PROMPT": "0",
-               "SELF_AUDIT_SUMMARY": f"submetido pelo atalho remoto (gate-done-remote.py) em nome de {alias}, sessão {sess}, sha {sha[:12]}; auto-auditoria do diff NAO verificada aqui"}
+               "SELF_AUDIT_SUMMARY": f"submetido pelo atalho remoto (gate-done-remote.py) em nome de {alias}, sessão {sess}, ref {src}, sha {sha[:12]}; auto-auditoria do diff NAO verificada aqui"}
         SCRIPT_RAN[0] = True
         p = subprocess.run(["bash", "-c", script], cwd=wt, env=env, stdout=subprocess.PIPE, text=True, errors="replace")  # o stderr do script segue direto ao cliente
         print(p.stdout, end="", flush=True)
@@ -238,10 +264,22 @@ def main() -> int:
     # nenhum git desta submissão (nem os do gate-done.md) dispara gc/manutenção no repositório compartilhado: o disco do mini vive no piso do heavy-guard (ga-vln2py)
     os.environ.update({"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "gc.auto", "GIT_CONFIG_VALUE_0": "0", "GIT_CONFIG_KEY_1": "maintenance.auto", "GIT_CONFIG_VALUE_1": "false"})
     mirror = os.environ.get("GATE_DONE_REMOTE_MIRROR") or f"{city}/.gc/hetzner-mirror/repos/{RIG}.git"
-    bead = one_bead(city, alias)
+    args = sys.argv[1:]
+    want = None
+    if args:  # forma com argumentos: o dog diz a bead, o ref do espelho e o sha (ga-2hd02v.1.18); nada é lido antes de a forma e o ref passarem
+        if len(args) != 3 or not BEAD_RE.fullmatch(args[0]) or not SHA_RE.fullmatch(args[2]):
+            raise Stop(f"forma: {USAGE} (o sha inteiro, 40 hex: `git rev-parse HEAD`)", 2)
+        want = args[2]
+        src = check_ref(args[1], sess, args[0])
+        bead = named_bead(city, alias, args[0])
+    else:
+        bead = one_bead(city, alias)
+        src = f"worker/{sess}"
     bid = bead["id"]
-    sha = mirror_sha(mirror, sess)
-    branch = f"fix/{bid}-{slugify(bead.get('title', ''))}"
+    sha = mirror_sha(mirror, src)
+    if want is not None and sha != want:  # antes do marcador: o gate nunca recebe um sha que o dog não disse
+        raise Stop(f"o espelho tem {sha[:12]} em {src}, mas você disse {want[:12]}: o push não chegou ou veio depois; empurre de novo (git push origin HEAD:refs/heads/{src}) e repita. Nada foi submetido")
+    branch = src if src.startswith("fix/") else f"fix/{bid}-{slugify(bead.get('title', ''))}"  # o nome no origin SEMPRE leva o id da bead (o gate o extrai dele); worker/… não leva
     if run(["git", "check-ref-format", "--branch", branch]).returncode != 0:
         raise Stop(f"{branch!r} não é um nome de branch válido")
     script = gate_done_script(Path(city) / "commands" / "gate-done.md")
@@ -249,11 +287,11 @@ def main() -> int:
     top = run(["git", "-C", city, "rev-parse", "--show-toplevel"])
     if top.returncode != 0 or not top.stdout.strip():
         raise Stop(f"não achei o repositório da cidade (git rc={top.returncode}: {top.stderr.strip()[:100]})")
-    print(f"gate-done-remote: alias={alias} sessão={sess} bead={bid} worker/{sess}@{sha[:12]} → {branch}", flush=True)
+    print(f"gate-done-remote: alias={alias} sessão={sess} bead={bid} {src}@{sha[:12]} → {branch}", flush=True)
     if os.environ.get("GATE_DONE_REMOTE_DRY_RUN") == "1":
         print(f"ensaio: nada foi escrito (blocos do gate-done.md: {len(script.splitlines())} linhas)", flush=True)
         return 0
-    return submit(city, top.stdout.strip(), alias, sess, bid, sha, mirror, branch, script)
+    return submit(city, top.stdout.strip(), alias, sess, bid, sha, mirror, src, branch, script)
 
 
 if __name__ == "__main__":
