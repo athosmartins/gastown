@@ -14,8 +14,8 @@ O QUE É
 O QUE FAZ, EM ORDEM (passo que não consegue saber algo para sem escrever nada: "não sei" nunca vira "pode")
   1. Quem pede: alias = BEADS_ACTOR, sessão = GC_SESSION_NAME. Os dois precisam ter o formato esperado.
   2. A bead. Sem argumento: a ÚNICA bead in_progress atribuída ao alias na cidade; nenhuma, ou mais de uma → recusa (nunca adivinha qual submeter).
-     Com argumentos, a que o dog NOMEOU: (A) in_progress com assignee = alias, ou (B) a VOLTA DO GATE: sem assignee, `gate:needs-fix`, gc.routed_to = dog-remote
-     e a última entrega (o marcador MAIS NOVO com source-bead:<bead>, de qualquer status) é deste alias, por gate.submitted_by OU pela linha `author:` do marcador
+     Com argumentos, a que o dog NOMEOU: (A) in_progress com assignee = alias, ou (B) a VOLTA DO GATE: sem assignee, `gate:needs-fix`, gc.routed_to = gastown.dog
+     (a rota que o dispatcher RESTAURA ao reprovar; medida em 3 beads) ou dog-remote (posta à mão) e a última entrega (o marcador MAIS NOVO com source-bead:<bead>, de qualquer status) é deste alias, por gate.submitted_by OU pela linha `author:` do marcador
      (sem assignee o gate-done.md congela o CRIADOR em submitted_by; só o author guarda o alias). Sem marcador, leitura que falha ou ilegível → recusa.
   3. O trabalho: a ponta de `worker/<sessão>` no espelho (<cidade>/.gc/hetzner-mirror/repos/gascity.git), onde o `git push` do servidor chegou. Com argumentos: a do
      <ref> (check_ref: `worker/<sessão>` ou `worker/<sessão>-N`, casamento EXATO com GC_SESSION_NAME, ou `fix/<bead>[-<resumo>]` com o id da bead pedida; o `-N` é
@@ -67,7 +67,7 @@ MARKER_RE = re.compile(r"^Marker created: (\S+)\s*$", re.M)
 SHA_RE = re.compile(r"[0-9a-f]{40}")  # o sha que o dog diz: inteiro, para a conferência com o espelho ser igualdade e não prefixo
 USAGE = "gate-done <bead> <ref> <sha>   (ou `gate-done` sem argumento: a ÚNICA bead in_progress do alias, de worker/<sessão>)"
 FIX_LABEL = "gate:needs-fix"  # o que o dispatcher põe na bead-fonte quando o gate reprova: a "volta do gate"
-ROUTE = "dog-remote"  # gc.routed_to do pool remoto: só uma volta do gate roteada para ele pode ser submetida sem assignee
+ROUTES = ("gastown.dog", "dog-remote")  # gc.routed_to de uma volta do gate: gastown.dog é o que o dispatcher RESTAURA ao reprovar (gate_fail_restore_route → default_pool_route_for_rig; medido em ga-9636op, ga-2hd02v.1.12 e .1.18); dog-remote é a rota posta à mão. Quem prova que a bead é DESTE alias é a última entrega, não a rota
 BARE_ROLE_RE = re.compile(r"(?:dog|gate-reviewer|wa-worker)-remote")  # nome de sessão SEM cauda: pelo IDENTITY_PATTERN (gc-session-ssh.md) `<papel>-remote-<1-3 dígitos>` TAMBÉM é nome válido de sessão
 TIMEOUT_CMD = 120  # um bd/git que pendura não segura a submissão para sempre (o wrapper também corta tudo em timeout_s)
 SCRIPT_RAN = [False]  # vira True quando os blocos do gate-done.md começam: daí em diante um erro NÃO é "nada foi escrito" (marcador pode existir)
@@ -163,8 +163,8 @@ def delivered_by(marker: dict, alias: str) -> bool:
 
 
 def named_bead(city: str, alias: str, bid: str) -> dict:
-    """A bead que o dog NOMEOU. Vale em dois casos: (A) in_progress com assignee = alias; (B) volta do gate: sem assignee, `gate:needs-fix`, gc.routed_to = dog-remote e a
-    última entrega (marcador mais novo) é deste alias. Ausente, forma outra, ou leitura que falha/ilegível → Stop (bd_json), nunca 'pode'."""
+    """A bead que o dog NOMEOU. Vale em dois casos: (A) in_progress com assignee = alias; (B) volta do gate: sem assignee, `gate:needs-fix`, gc.routed_to = gastown.dog
+    (o que o gate restaura) ou dog-remote (à mão) e a última entrega (marcador mais novo) é deste alias. Ausente, forma outra, ou leitura que falha/ilegível → Stop (bd_json), nunca 'pode'."""
     bead = first(bd_json(city, ["show", bid, "--json"], f"a bead {bid}"))
     if not isinstance(bead, dict) or bead.get("id") != bid:
         raise Stop(f"a bead {bid}: resposta do bd com forma inesperada")
@@ -172,10 +172,10 @@ def named_bead(city: str, alias: str, bid: str) -> dict:
         return bead
     labels, meta = bead.get("labels"), bead.get("metadata")
     back = (bead.get("status") in ("open", "in_progress") and not bead.get("assignee") and isinstance(labels, list) and FIX_LABEL in labels
-            and isinstance(meta, dict) and meta.get("gc.routed_to") == ROUTE)
+            and isinstance(meta, dict) and meta.get("gc.routed_to") in ROUTES)  # rota ausente ou de outro pool → não é volta (nunca "sem rota" = "pode")
     if not back:
         raise Stop(f"{bid} não é uma bead in_progress atribuída a {alias} (status={bead.get('status')!r}, assignee={bead.get('assignee')!r}) nem uma volta do gate "
-                   f"(sem assignee, com {FIX_LABEL} e gc.routed_to={ROUTE}): não submeto bead alheia")
+                   f"(sem assignee, com {FIX_LABEL} e gc.routed_to em {'/'.join(ROUTES)}; achei {(meta.get('gc.routed_to') if isinstance(meta, dict) else None)!r}): não submeto bead alheia")
     last = last_delivery(city, bid)
     if not delivered_by(last, alias):
         who = (last.get("metadata") or {}).get("gate.submitted_by") if isinstance(last.get("metadata"), dict) else None
