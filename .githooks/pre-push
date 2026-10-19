@@ -131,12 +131,32 @@ while read local_ref local_sha remote_ref remote_sha; do
 
   if [[ "$local_sha" != "0000000000000000000000000000000000000000" ]] && \
      [[ "$GT_SKIP_ORPHAN_TREE_GUARD" != "1" ]]; then
-    if [[ "$remote_sha" != "0000000000000000000000000000000000000000" ]]; then
+    # The range the guard measures (ga-x4rbnt). `git diff A..B` is a TREE diff
+    # of A against B, so the range decides what the guard blames:
+    #   - a push that updates the default branch: what it adds to the remote's
+    #     tip, remote_sha..local_sha;
+    #   - any other push (a new branch, or a work branch the remote already
+    #     has): the branch's own delta against the default branch,
+    #     merge-base(local, origin/<default>)..local. remote_sha..local_sha is
+    #     wrong here: a rebase (the gate auto-rebases every branch it merges)
+    #     brings each commit main gained since the fork into that diff, so once
+    #     main carried a scripts/ doc every older branch was refused for a file
+    #     it never touched.
+    # With no merge-base to judge by (no origin/<default> ref, a shallow clone)
+    # an existing branch keeps remote_sha..local_sha, never looser than before;
+    # a new branch has nothing to fall back to and skips the guard (fail open,
+    # see check_orphan_path).
+    orphan_range=""
+    if [[ "$branch" == "$default_branch" ]] && \
+       [[ "$remote_sha" != "0000000000000000000000000000000000000000" ]]; then
       orphan_range="$remote_sha..$local_sha"
     else
-      orphan_range=""
       merge_base=$(git merge-base "$local_sha" "refs/remotes/origin/$default_branch" 2>/dev/null) && \
         orphan_range="$merge_base..$local_sha"
+      if [[ -z "$orphan_range" ]] && \
+         [[ "$remote_sha" != "0000000000000000000000000000000000000000" ]]; then
+        orphan_range="$remote_sha..$local_sha"
+      fi
     fi
     if [[ -n "$orphan_range" ]]; then
       check_orphan_path 'packs/town-deltas/' 'ga-47sl' \
