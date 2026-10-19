@@ -62,8 +62,13 @@ if cmd == "update":
         elif k == "--unset-metadata": unsets.append(v)
     rc = int(os.environ.get("STUB_UPDATE_RC", "0"))
     if rc: sys.exit(rc)
+    if unsets and os.environ.get("STUB_UNDO_RC"): sys.exit(int(os.environ["STUB_UNDO_RC"]))   # só o desfazer leva --unset-metadata
     if ifa is not None and (b.get("assignee") or "") != ifa: sys.exit(13)
     if ifs is not None and b.get("status") != ifs: sys.exit(13)
+    if os.environ.get("STUB_PARTIAL_UPDATE"):   # pegou só o dono (e a rota): o status não muda, a conferência reprova e a bead fica suja; o desfazer limpa dono e rota
+        b["assignee"] = sets.get("assignee", b.get("assignee"))
+        for u in unsets: b.get("metadata", {}).pop(u, None)
+        save(); sys.exit(0)
     if os.environ.get("STUB_NOOP_UPDATE"): sys.exit(0)
     b.update(sets)
     for u in unsets: b.get("metadata", {}).pop(u, None)
@@ -98,7 +103,7 @@ fresh() { # fresh [extra json mesclado na wa-t1]
   printf '{"wa-t1":{"id":"wa-t1","title":"t","status":"open","assignee":"","metadata":{}},"ga-x":{"id":"ga-x","title":"t","status":"open","assignee":"","metadata":{}}}' > "$STATE"
   if [ -n "${1:-}" ]; then jq -c --argjson m "$1" '."wa-t1" += $m' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; fi
   : > "$CALLS"; : > "$GCCALLS"; : > "$CITY/.gc/wa-node-route.jsonl"; echo '{"ok":true,"sessions":[]}' > "$SESS"; cls "$NODE_TEXT" 0
-  unset STUB_FAIL_SHOW STUB_SHOW_OTHER STUB_FAIL_LIST STUB_LIST_GARBAGE STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_FAIL_GC STUB_GC_SLEEP
+  unset STUB_FAIL_SHOW STUB_SHOW_OTHER STUB_FAIL_LIST STUB_LIST_GARBAGE STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_PARTIAL_UPDATE STUB_UNDO_RC STUB_FAIL_GC STUB_GC_SLEEP
 }
 SCRIPT="$REAL"; OUT=""; RC=0; MUT_NAME=""; MUT_M=""
 d() { OUT=$("$SCRIPT" "$@" 2>&1); RC=$?; }                       # roda e guarda saída + rc
@@ -135,6 +140,22 @@ fresh; cls "$UNK" 11;  d apply wa-t1; expect_rc "apply: unknown -> 11 sem escrit
 fresh; cls "$NODE_TEXT" 0; d apply wa-t1 --basis label; expect_rc "apply --basis label com veredito por texto -> 10 sem escrita" 10 w0
 fresh; cls "$NODE_LABEL" 0; d apply wa-t1 --basis label; expect_rc "apply --basis label com a etiqueta -> 0" 0
 fresh; cls "$NODE_TEXT" 0; d apply wa-t1 --basis any; expect_rc "apply --basis any com texto -> 0" 0
+# ---- apply/check: o exit code e o JSON do classificador têm que CONCORDAR (terceiro estado, ga-9636op). Classificador que caiu, foi morto, não imprimiu, imprimiu o que não se lê ou cujo exit
+#      code e veredito discordam NUNCA manda a bead ao nó: vira 11 ("não consegui decidir"), sem escrita. Um código cru do classificador (2, 12, 13, 124, 137) também não vaza: o chamador lê 2 como
+#      "uso", 12 como "não elegível" e 13/124/137 como "a escrita pode ter acontecido".
+fresh; cls "$MINI" 0;               d apply wa-t1; expect_rc "apply: classificador sai 0 mas o JSON diz mini -> 11 sem escrita" 11 w0
+fresh; cls "" 0;                    d apply wa-t1; expect_rc "apply: classificador sai 0 sem imprimir nada -> 11 sem escrita" 11 w0
+fresh; cls "not json" 0;            d apply wa-t1; expect_rc "apply: classificador sai 0 com saída que não é JSON -> 11 sem escrita" 11 w0
+fresh; cls '{"basis":"text"}' 0;    d apply wa-t1; expect_rc "apply: classificador sai 0 e o JSON não tem veredito -> 11 sem escrita" 11 w0
+fresh; cls "$NODE_TEXT" 10;         d apply wa-t1; expect_rc "apply: classificador sai 10 mas o JSON diz node -> 11 sem escrita" 11 w0
+fresh; cls "$NODE_TEXT" 1;          d apply wa-t1; expect_rc "apply: classificador cai (rc 1) deixando um JSON de node -> 11 sem escrita" 11 w0
+fresh; cls "" 137;                  d apply wa-t1; expect_rc "apply: classificador morto (rc 137) não vaza o 137 -> 11 sem escrita" 11 w0
+fresh; cls "$UNK" 2;                d apply wa-t1; expect_rc "apply: classificador com o código de uso (2) não vaza -> 11 sem escrita" 11 w0
+fresh; cls "$UNK" 12;               d apply wa-t1; expect_rc "apply: classificador com 12 não vaza como 'não elegível' -> 11 sem escrita" 11 w0
+fresh; cls "$MINI" 0;               d check wa-t1; expect_rc "check: classificador sai 0 mas o JSON diz mini -> 11" 11 w0
+fresh; cls "not json" 0;            d check wa-t1; expect_rc "check: classificador sai 0 com saída ilegível -> 11" 11 w0
+printf '%s' "$OUT" | jq -e '.verdict == "unknown"' >/dev/null 2>&1 && ok "check: a resposta incoerente continua sendo um JSON (unknown)" || bad "check: a resposta incoerente não é um JSON unknown ($OUT)"
+fresh; cls "$MINI" 0;               d apply wa-t1; [ "$(jq -r 'select(.event=="classify" or .event=="apply") | .event+":"+(.rc|tostring)' "$CITY/.gc/wa-node-route.jsonl" | tr '\n' ' ')" = "classify:11 apply:11 " ] && ok "apply: o classificador incoerente deixa o rastro no log (classify:11 e a decisão apply:11)" || bad "apply: log do incoerente: $(cat "$CITY/.gc/wa-node-route.jsonl")"
 # ---- apply: slot do nó
 fresh; jq -c '. + {"wa-busy":{"id":"wa-busy","status":"in_progress","assignee":"wa-worker-remote-1","metadata":{}}}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"
 d apply wa-t1; expect_rc "apply: slot ocupado por bead em andamento -> 12 sem escrita" 12 w0
@@ -161,6 +182,16 @@ fresh; export STUB_UPDATE_RC=13; d apply wa-t1; expect_rc "apply: corrida perdid
 fresh; export STUB_UPDATE_RC=1;  d apply wa-t1; expect_rc "apply: bd update falha -> 13" 13
 fresh; export STUB_NOOP_UPDATE=1; d apply wa-t1; expect_rc "apply: escrita que não pegou (conferência falha) -> 13" 13
 grep '|update|' "$CALLS" | tail -n 1 | grep -q -- '--if-assignee|wa-worker-remote-1|--assignee||' && ok "apply: conferência falha -> tenta desfazer (só se ainda for do alias)" || bad "apply: sem desfazer: $(grep '|update|' "$CALLS" | tail -n 1)"
+printf '%s' "$OUT" | grep -q 'desfeita' && ! printf '%s' "$OUT" | grep -q 'NÃO desfeita' && ok "apply: conferência falha e o desfazer pega -> a mensagem diz 'desfeita'" || bad "apply: mensagem do desfazer que pegou: $OUT"
+# a escrita que NEM PEGOU não deixa nada nosso: o desfazer reprova (comparação atômica) mas a bead está limpa, então "desfeita" é verdade (o rc do desfazer não diz o estado; reler diz)
+[ "$(jq -r 'select(.event=="apply") | .detail' "$CITY/.gc/wa-node-route.jsonl" | tail -n 1)" = "conferencia-falhou-desfeito" ] && ok "apply: escrita que nem pegou, bead limpa -> o log diz desfeito" || bad "apply: log da escrita que nem pegou: $(cat "$CITY/.gc/wa-node-route.jsonl")"
+# a escrita que pegou SÓ O DONO deixa a bead atribuída ao nó: o desfazer tem de limpar, e se ele falhar a mensagem e o log não podem anunciar "desfeito" (a bead ficaria atribuída ao nó e quem lê acreditaria que não)
+fresh; export STUB_PARTIAL_UPDATE=1; d apply wa-t1; expect_rc "apply: escrita que pegou só o dono, conferência falha, desfazer pega -> 13" 13
+[ -z "$(bead '."wa-t1".assignee')" ] && printf '%s' "$OUT" | grep -q 'desfeita' && ! printf '%s' "$OUT" | grep -q 'NÃO desfeita' && ok "apply: desfazer que pegou -> a bead volta sem dono e a mensagem diz 'desfeita'" || bad "apply: estado/mensagem do desfazer que pegou: $(jq -c '."wa-t1"' "$STATE") / $OUT"
+fresh; export STUB_PARTIAL_UPDATE=1 STUB_UNDO_RC=1; d apply wa-t1; expect_rc "apply: escrita que pegou só o dono E o desfazer também falha -> 13" 13
+[ "$(bead '."wa-t1".assignee')" = wa-worker-remote-1 ] && ok "apply: (confirmação do cenário) a bead ficou atribuída ao nó" || bad "apply: cenário errado, bead: $(jq -c '."wa-t1"' "$STATE")"
+printf '%s' "$OUT" | grep -q 'NÃO desfeita' && ok "apply: desfazer que falhou NÃO é anunciado como desfeito (mensagem)" || bad "apply: a mensagem mente sobre o desfazer: $OUT"
+[ "$(jq -r 'select(.event=="apply") | .detail' "$CITY/.gc/wa-node-route.jsonl" | tail -n 1)" = "conferencia-falhou-NAO-desfeito" ] && ok "apply: desfazer que falhou NÃO é anunciado como desfeito (log)" || bad "apply: o log mente sobre o desfazer: $(cat "$CITY/.gc/wa-node-route.jsonl")"
 # ---- leitura da bead e do store
 fresh; export STUB_FAIL_SHOW=1;  d apply wa-t1; expect_rc "bead ilegível -> 11 sem escrita" 11 w0
 fresh; export STUB_SHOW_OTHER=1; d apply wa-t1; expect_rc "show devolve outro id -> 11 sem escrita" 11 w0
@@ -222,7 +253,7 @@ mutant veredito-ignorado 'if [ "$rc" != 0 ]; then jlog apply' 'if false; then jl
 fresh; cls "$MINI" 10; d apply wa-t1; if [ "$RC" = 10 ] && ! wrote; then survived; else killed; fi
 mutant base-ignorada 'if [ "$basis" = label ] && [ "$b" != label ]; then' 'if false; then'
 fresh; cls "$NODE_TEXT" 0; d apply wa-t1 --basis label; if [ "$RC" = 10 ]; then survived; else killed; fi
-mutant sem-conferencia 'jlog apply "$id" 13 "conferencia-falhou-desfeito"; die 13 "não consegui confirmar a atribuição de $id — desfeita"' 'jlog apply "$id" 13 "conferencia-falhou-desfeito"'
+mutant sem-conferencia 'jlog apply "$id" 13 "conferencia-falhou-$u"; [ "$u" = desfeito ] && die 13 "não consegui confirmar a atribuição de $id — desfeita"; die 13 "não consegui confirmar a atribuição de $id — NÃO desfeita: confira à mão"' 'jlog apply "$id" 13 "conferencia-falhou-$u"'
 fresh; export STUB_NOOP_UPDATE=1; d apply wa-t1; if [ "$RC" = 13 ]; then survived; else killed; fi
 mutant corrida-vira-erro 'if [ "$w" = 13 ]; then jlog apply "$id" 12 "perdeu-a-corrida"; die 12' 'if [ "$w" = 99 ]; then jlog apply "$id" 12 "perdeu-a-corrida"; die 12'
 fresh; export STUB_UPDATE_RC=13; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
@@ -244,6 +275,12 @@ mutant sessao-prazo-geral 'sess=$(TS "$GC" session list' 'sess=$(T "$GC" session
 fresh; export STUB_GC_SLEEP=3; WA_NODE_TIMEOUT=2 WA_NODE_SESSION_TIMEOUT=15 d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
 mutant prazo-proprio-ilegivel 'case "$STMO" in '"''"'|*[!0-9]*) STMO=60 ;; esac' ':'
 fresh; export STUB_GC_SLEEP=3; WA_NODE_TIMEOUT=2 WA_NODE_SESSION_TIMEOUT=abc d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant coerencia-ignorada 'case "$rc:$v" in 0:node|10:mini|11:unknown) return 0 ;; esac' 'return 0'
+fresh; cls "$MINI" 0; d apply wa-t1; if [ "$RC" = 11 ] && ! wrote; then survived; else killed; fi
+mutant rc-cru-vaza '"info":[]}'"'"'; rc=11' '"info":[]}'"'"
+fresh; cls "" 137; d apply wa-t1; if [ "$RC" = 11 ] && ! wrote; then survived; else killed; fi
+mutant desfazer-mente 'u=NAO-desfeito' 'u=desfeito'
+fresh; export STUB_PARTIAL_UPDATE=1 STUB_UNDO_RC=1; d apply wa-t1; if printf '%s' "$OUT" | grep -q 'NÃO desfeita'; then survived; else killed; fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
