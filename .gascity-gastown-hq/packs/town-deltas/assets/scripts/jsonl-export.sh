@@ -1401,11 +1401,13 @@ read_keyed_pages() {
         [ -z "$literal" ] || where=" WHERE ($collist) > ($literal)"
         query="SELECT $sel FROM \`$db\`.\`$table\`$where ORDER BY $collist LIMIT $chunk"
         if ! dolt_sql -r json -q "$query" > "$out.p$n" 2> "$out.pe"; then
+            # third-state-waiver: o .err só junta o stderr do dolt para o texto do log; a falha já foi decidida pelo rc acima, e a linha de corte é lida do .pe, não daqui
             cat "$out.pe" >> "$out.err" 2>/dev/null || true
             # third-state-waiver: a falha já foi decidida pelo rc do dolt acima; este tail só monta o texto do log (vazio se o .err sumiu)
             echo "jsonl-export: reading $what failed (page $n; dolt exited non-zero): $(tail -c 300 "$out.err" | tr '\n' ' ')" >&2
             return 1
         fi
+        # third-state-waiver: o .err só junta o stderr do dolt para o texto do log; o veredito da página sai do jq e da linha de corte lida do .pe, não daqui
         cat "$out.pe" >> "$out.err" 2>/dev/null || true
         # vazio (a 0-byte page) → an error, not a table with no rows: Dolt prints {} for that
         if ! rows=$(jq -s -r 'if length == 0 then error("empty page") else ((.[0].rows // []) | length) end' "$out.p$n" 2>/dev/null); then
