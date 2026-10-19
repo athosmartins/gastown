@@ -10,11 +10,12 @@ PARA QUE SERVE
   (2) este trabalho vai para o nó ou fica no mini (`verdict`): nó primeiro, mini só no transbordo (nó cheio, quente, fora, ou ainda sem condição de receber).
 
 COMANDOS  (todos aceitam --json; --dir muda a pasta de estado)
-  verdict   mede se a última leitura passou de `refresh_s`, avalia os degraus e dá o veredito. exit 0 = NÓ, 1 = MINI (com o motivo), 2 = NÃO SEI.
+  verdict   mede se a última leitura passou de `refresh_s`, avalia os degraus e dá o veredito. exit 0 = NÓ, 1 = MINI (com o motivo), 2 = NÃO SEI
+            (inclui erro interno nosso: reason "internal"; um traceback do Python sairia 1, que aqui é MINI, por isso `main` pega tudo).
             Quem chama trata 1 e 2 do mesmo jeito (fica no mini); a diferença está no motivo, para o log.
-  step      o mesmo ciclo (mede se vencido, avalia, grava) sem dar veredito. Para um agendador. exit 0 se rodou, 3 se não conseguiu gravar/ler a configuração.
+  step      o mesmo ciclo (mede se vencido, avalia, grava) sem dar veredito. Para um agendador. exit 0 se rodou, 3 se não conseguiu gravar/ler a configuração (ou erro interno).
   status    só LÊ (sem ssh, sem gravar): degrau, leituras, o que falta para subir, tetos fixos (cap do provider) e as condições do veredito.
-  read      uma medição avulsa, nada é gravado. exit 0 lida, 1 não consegui.
+  read      uma medição avulsa, nada é gravado. exit 0 lida, 1 não consegui, 3 erro de configuração/estado ou interno.
   set-ceiling N --reason T   força um degrau (só os da lista), registrado em events.jsonl. O ciclo seguinte continua a partir dele.
   pause --reason T | resume  trava / destrava o envio ao nó na hora (vale no próximo veredito): é o botão do Mayor.
 
@@ -29,14 +30,16 @@ OS DEGRAUS
 
 O VEREDITO  (a primeira condição que falha decide; só `node` autoriza)
   pausa → MINI · config do provider ilegível → NÃO SEI · `real_sessions_released_by` ausente → MINI · config do atalho ilegível → NÃO SEI ·
-  `gate_done_bin` nulo ou não executável → MINI (uma bead no nó sem como entregar ao gate encalha: ga-2hd02v.1.13) · sem nenhuma leitura, ou a última mais velha que
+  `gate_done_bin` nulo, relativo ou não executável → MINI (o atalho recusa caminho relativo; uma bead no nó sem como entregar ao gate encalha: ga-2hd02v.1.13) · sem nenhuma leitura, ou a última mais velha que
   `max_age_s` (ou carimbada mais de 60 s no futuro) → NÃO SEI · último ssh não conectou → MINI (nó fora) · leitura ilegível → NÃO SEI · vermelho → MINI (nó quente) · sessões do nó ilegíveis → NÃO SEI ·
   sessões >= min(degrau, cap do provider) → MINI (nó cheio) · senão NÓ.
 
 TRÊS ESTADOS
   Cada leitura do nó é ok / unreachable (ssh não conectou ou estourou o prazo) / unreadable (respondeu, mas faltou ou veio fora de faixa algum campo). Nenhuma
-  das duas falhas vira "ocioso" nem "ocupado": a cor da leitura é `unknown`, o degrau fica, e o veredito não autoriza. Estado corrompido é posto de lado
-  (state.json.corrupt-<época>) e o degrau recomeça no MENOR; estado que existe mas não abre = erro, não "recomeça".
+  das duas falhas vira "ocioso" nem "ocupado": a cor da leitura é `unknown`, o degrau fica, e o veredito não autoriza. Estado corrompido (JSON ruim, bytes
+  não-UTF-8, aninhado fundo demais, campo faltando) é posto de lado (state.json.corrupt-<época>) e o degrau recomeça no MENOR; estado que existe mas não abre
+  = erro, não "recomeça". O mesmo vale para config.json: ilegível por qualquer motivo = erro (NÃO SEI no veredito), nunca o padrão.
+  Se o ssh nem executa (sem o binário, sem permissão) a leitura é `unreadable` (ferramenta quebrada), não `unreachable` (nó fora).
 
 ARQUIVOS  (pasta de estado: $HETZNER_CAPACITY_DIR, senão <cidade>/.gc/hetzner-capacity, cidade = pasta acima de scripts/)
   state.json (degrau, desde quando, últimas leituras) · readings.jsonl (toda medição, para o antes×depois) · events.jsonl (mudança de degrau, pausa, alarme) ·
@@ -112,18 +115,16 @@ def is_num(x) -> bool:
 
 def load_config(path: str) -> dict:
     cfg = dict(DEFAULTS)
-    # vazio (arquivo ausente) → os padrões; ilegível/JSON ruim/chave desconhecida/valor inválido → ConfigError (nada de padrão silencioso)
+    # vazio (arquivo ausente) → os padrões; ilegível/JSON ruim/bytes não-UTF-8 (UnicodeDecodeError é ValueError)/aninhado fundo demais/chave desconhecida/valor inválido → ConfigError (nada de padrão silencioso)
     try:
         with open(path, encoding="utf-8") as f:
-            raw = f.read()
+            user = json.load(f)
     except FileNotFoundError:
         return cfg
     except OSError as e:
         raise ConfigError(f"{path}: não abre ({e})")
-    try:
-        user = json.loads(raw)
-    except ValueError as e:
-        raise ConfigError(f"{path}: JSON inválido ({e})")
+    except (ValueError, RecursionError) as e:
+        raise ConfigError(f"{path}: JSON inválido ou não é UTF-8 ({e})")
     if not isinstance(user, dict):
         raise ConfigError(f"{path}: o topo tem que ser um objeto")
     for k in user:
@@ -186,7 +187,7 @@ def read_json(path: str, what: str) -> dict:
             v = json.load(f)
     except FileNotFoundError:
         raise ConfigError(f"{what}: {path} não existe")
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         raise ConfigError(f"{what}: {path} não abre/não é JSON ({e})")
     if not isinstance(v, dict):
         raise ConfigError(f"{what}: {path}: o topo tem que ser um objeto")
@@ -207,13 +208,13 @@ def host_caps(env: Env, host: str) -> dict:
 
 
 def gate_done_state(env: Env) -> str:
-    """'ok' | 'off' (nulo/vazio) | 'not-exec' (configurado mas não executável). Ilegível = ConfigError."""
+    """'ok' | 'off' (nulo/vazio) | 'not-exec' (configurado mas não executável, ou caminho relativo: o atalho recusa a config inteira). Ilegível = ConfigError."""
     v = read_json(env.shim_cfg, "config do atalho").get("gate_done_bin", None)
     if v is None or v == "":
         return "off"
     if not isinstance(v, str):
         raise ConfigError("config do atalho: gate_done_bin tem que ser texto ou null")
-    return "ok" if os.path.isfile(v) and os.access(v, os.X_OK) else "not-exec"
+    return "ok" if os.path.isabs(v) and os.path.isfile(v) and os.access(v, os.X_OK) else "not-exec"
 
 
 # ───────────────────────────────── medição ─────────────────────────────────
@@ -299,10 +300,10 @@ def measure(env: Env, cfg: dict, ssh_dest: str, now: int) -> dict:
     r = {"t": now, "state": "ok", "why": "", "sessions": None, "sessions_why": ""}
     try:
         r.update(parse_node(between_markers(run_ssh(env, cfg, ssh_dest))))
-    except (ConnectionError, subprocess.TimeoutExpired, OSError) as e:
+    except (ConnectionError, subprocess.TimeoutExpired) as e:
         r.update(state="unreachable", why=str(e) or type(e).__name__)
-    except Unreadable as e:
-        r.update(state="unreadable", why=str(e))
+    except (Unreadable, OSError) as e:          # OSError aqui = ssh que nem executa (sem o binário, sem permissão): ferramenta quebrada, não "nó fora"
+        r.update(state="unreadable", why=str(e) or type(e).__name__)
     if r["state"] != "ok":
         r["sessions_why"] = "sem leitura do nó, não contei as sessões"
         return r
@@ -395,7 +396,7 @@ def fresh_state(cfg: dict, now: int, why: str) -> dict:
 
 def valid_state(st) -> bool:
     return (isinstance(st, dict) and isinstance(st.get("ceiling"), int) and not isinstance(st["ceiling"], bool)
-            and isinstance(st.get("changed_at"), int) and isinstance(st.get("readings"), list)
+            and isinstance(st.get("changed_at"), int) and isinstance(st.get("changed_why"), str) and isinstance(st.get("readings"), list)
             and all(isinstance(r, dict) and isinstance(r.get("t"), int) and isinstance(r.get("state"), str) for r in st["readings"]))
 
 
@@ -403,14 +404,12 @@ def load_state(env: Env, cfg: dict, now: int, may_repair: bool):
     """(estado, alarmes). Ausente → começa no menor degrau. Corrompido → posto de lado (se pode gravar) e recomeça no menor, com alarme. Não abre → StateUnreadable."""
     try:
         with open(env.state, encoding="utf-8") as f:
-            raw = f.read()
+            st = json.load(f)
     except FileNotFoundError:
         return fresh_state(cfg, now, "primeira execução"), []
     except OSError as e:
         raise StateUnreadable(f"{env.state}: não abre ({e})")
-    try:
-        st = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):        # JSON ruim, bytes não-UTF-8 (UnicodeDecodeError é ValueError) ou aninhado fundo demais: o conteúdo está corrompido, igual
         st = None
     if valid_state(st):
         return st, []
@@ -484,7 +483,7 @@ def verdict(env: Env, cfg: dict, st: dict, now: int) -> dict:
         return out("unknown", "shim_config", str(e))
     if gd != "ok":
         return out("local", "gate_done_off" if gd == "off" else "gate_done_not_exec",
-                   "gate_done_bin do atalho " + ("está nulo" if gd == "off" else "não é um executável") + ": bead entregue no nó não chegaria ao gate (ga-2hd02v.1.13)")
+                   "gate_done_bin do atalho " + ("está nulo" if gd == "off" else "não é um executável de caminho absoluto") + ": bead entregue no nó não chegaria ao gate (ga-2hd02v.1.13)")
     r = st["readings"][-1] if st["readings"] else None
     if r is None:
         return out("unknown", "no_reading", "ainda não há nenhuma leitura do nó")
@@ -620,6 +619,12 @@ def main(argv=None) -> int:
             say(args, {"verdict": "unknown", "reason": "state", "detail": str(e)}, f"unknown state: {e}")
             return 2
         print(f"hetzner-capacity: {e}", file=sys.stderr)
+        return 3
+    except Exception as e:      # bug nosso: sem isto o Python sai com 1 (traceback), que aqui é o MINI conhecido. verdict → NÃO SEI (2); o resto → 3, nunca 0/1
+        if args.cmd == "verdict":
+            say(args, {"verdict": "unknown", "reason": "internal", "detail": f"{type(e).__name__}: {e}"}, f"unknown internal: {type(e).__name__}: {e}")
+            return 2
+        print(f"hetzner-capacity: erro interno: {type(e).__name__}: {e}", file=sys.stderr)
         return 3
 
 

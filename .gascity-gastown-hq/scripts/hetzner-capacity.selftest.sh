@@ -17,11 +17,15 @@
 #     config do atalho ausente · nó fora (MINI) × leitura ilegível (NÃO SEI) · quente (MINI) · amarelo ainda autoriza · leitura velha ou no futuro com lock ocupado · sessões ilegíveis ·
 #     pause.json que não dá para olhar não é "sem pausa" · exit 0/1/2.
 #   terceiro estado (g_third, ga-5yp4n1): load5 `nan`/`inf` é leitura ilegível (não some do min() nem vira CPU 0) · leitura "ok" no state.json com CPU/RAM não numérica
-#     ou ausente é NÃO SEI (rc 2, sem traceback), nunca NÓ.
+#     ou ausente é NÃO SEI (rc 2, sem traceback), nunca NÓ · (gate 1) arquivo que não se lê como JSON UTF-8 (bytes `\xff`, aninhado fundo demais, sem changed_why) não derruba
+#     a ferramenta: state.json é posto de lado com alarme e `step` cura (rc 0), `status` erra com rc 3, config.json/session-ssh.json/remote-shim.json viram NÃO SEI (rc 2) e
+#     `pause` erra (rc 3) sem gravar · exceção inesperada: verdict → NÃO SEI `internal` (rc 2), outros → rc 3 (o traceback do Python sairia 1 = MINI) · ssh que não executa é
+#     NÃO SEI (ferramenta quebrada), não MINI (nó fora) · gate_done_bin relativo é MINI (o atalho recusa).
 # CONTROLE NEGATIVO: ilegível contado como verde · sem prova de carga · degrau que pula · evidência que vale duas vezes · `present()` que engole erro · veredito sem o
 #   gate_done · cap ignorado · `>` no lugar de `>=` na vaga · sessões ilegíveis viram 0 · leitura velha autoriza · leitura sem `state` válida · leitura no futuro autoriza ·
 #   vermelho só com CPU E RAM · âmbar vira verde · `max` no lugar de `min` na CPU · estado ilegível recomeça · falha de ssh vira leitura ok · load5 `nan` aceito ·
-#   leitura "ok" de cor desconhecida autoriza — cada um é aplicado numa cópia e a bateria TEM que falhar.
+#   leitura "ok" de cor desconhecida autoriza · state.json não-UTF-8 / aninhado fundo / sem changed_why não tratados · config.json não-UTF-8 · config de fora aninhada ·
+#   sem catch-all · catch-all que sai 1 · ssh que não executa vira nó fora · gate_done_bin relativo aceito — cada um é aplicado numa cópia e a bateria TEM que falhar.
 # VARIÁVEIS: HC_UNDER_TEST (script a testar) · HC_PY (interpretador; padrão /usr/bin/python3 = o 3.9 do mini) · HC_NO_MUTANTS=1
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -265,9 +269,45 @@ g_third() {  # leitura que PARECE ok e não é (ga-5yp4n1): medição ilegível 
   printf '{"v":1,"ceiling":1,"changed_at":%s,"changed_why":"x","readings":[{"t":%s,"state":"ok","sessions":0}]}' "$T0" "$((T0 + 5))" > "$D/state.json"
   hc --json verdict
   check "veredito: leitura 'ok' sem CPU/RAM → NÃO SEI (rc 2), sem traceback" "2 reading_unreadable 0" "$RC $(jget reason) $(grep -c Traceback "$W/err")"
+  # gate 1 (ga-5yp4n1): arquivo que não se lê como JSON UTF-8 não pode derrubar a ferramenta — o crash sai com rc 1, o código do MINI conhecido
+  newcity; sess 0; hc --json step; printf '\xff\xfe{garbage' > "$D/state.json"; at 100; hc --json verdict
+  check "state.json com bytes não-UTF-8: posto de lado com alarme e o veredito sai (antes: traceback, rc 1 = MINI sem motivo)" "1 1 0 1" \
+    "$(ls "$D" | grep -c 'state.json.corrupt-') $(grep -c '"event": "alarm"' "$D/events.jsonl") $(grep -c Traceback "$W/err") $(printf '%s' "$OUT" | grep -c '"verdict"')"
+  printf '\xff' > "$D/state.json"; at 200; hc --json step; check "step com state.json não-UTF-8: rc 0 (cura sozinho; o contrato é 0 ou 3)" "0" "$RC"
+  printf '\xff' > "$D/state.json"; hc --json status; check "status com state.json não-UTF-8: erro rc 3 sem gravar, sem traceback" "3 0" "$RC $(grep -c Traceback "$W/err")"
+  "$PY" -c "print('['*200000)" > "$D/state.json"; at 300; hc --json step
+  check "state.json aninhado fundo demais (RecursionError, não é ValueError): posto de lado como o JSON ruim" "0 0" "$RC $(grep -c Traceback "$W/err")"
+  newcity; printf '{"v":1,"ceiling":1,"changed_at":%s,"readings":[]}' "$T0" > "$D/state.json"; at 400; hc --json step
+  check "state.json sem changed_why (o status indexa): é corrompido, não válido" "1" "$(ls "$D" | grep -c 'state.json.corrupt-')"
+  newcity; printf '{"steps":[1,3]}\xff' > "$D/config.json"; hc --json verdict
+  check "config.json com byte não-UTF-8: NÃO SEI (rc 2, motivo config), sem traceback" "2 config 0" "$RC $(jget reason) $(grep -c Traceback "$W/err")"
+  hc --json pause --reason x; check "config.json não-UTF-8: pause é erro (rc 3) e NÃO grava pause.json" "3 0" "$RC $(ls "$D" | grep -c '^pause.json')"
+  "$PY" -c "print('['*200000)" > "$D/config.json"; hc --json verdict; check "config.json aninhado fundo demais: NÃO SEI config" "2 config" "$RC $(jget reason)"
+  # rede de segurança: bug que ninguém previu no caminho do veredito. Sem ela o Python sai com 1 = MINI; com ela, NÃO SEI (2) / erro (3)
+  newcity
+  r=$(HETZNER_CAPACITY_DIR="$D" GC_SSH_CONFIG="$SSHJ" "$PY" -I -c 'import importlib.util,sys,json,io,contextlib
+spec=importlib.util.spec_from_file_location("hc",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+def boom(*a, **k): raise RuntimeError("bug futuro")
+m.tick=boom
+b=io.StringIO()
+with contextlib.redirect_stdout(b): rc1=m.main(["--json","verdict"])
+with contextlib.redirect_stderr(io.StringIO()): rc2=m.main(["--json","step"])
+v=json.loads(b.getvalue()); print(rc1, v["verdict"], v["reason"], rc2)' "$P" 2>&1 | tail -1)
+  check "exceção inesperada: verdict → NÃO SEI interno (rc 2), step → rc 3; nunca o rc 1 do MINI" "2 unknown internal 3" "$r"
+  # ssh que não executa é ferramenta quebrada (NÃO SEI), não "nó fora" (MINI node_down)
+  newcity; chmod -x "$W/ssh-stub"; hc --json verdict; r="$RC $(jget reason)"; chmod +x "$W/ssh-stub"
+  check "ssh sem permissão de execução (PermissionError): NÃO SEI reading_unreadable, não MINI node_down" "2 reading_unreadable" "$r"
+  # o atalho recusa a config inteira se gate_done_bin não for absoluto; o oráculo não pode autorizar o nó com um caminho que só existe a partir do cwd
+  newcity; sess 0; mkshim '"gate-done-bin"'; cd "$W" || return; hc --json verdict; cd "$OLDPWD" || return
+  check "gate_done_bin relativo (existe a partir do cwd): MINI gate_done_not_exec, não NÓ" "1 gate_done_not_exec" "$RC $(jget reason)"
+  # as configs de fora (provider, atalho) também vêm de arquivo: bytes não-UTF-8 ou aninhado fundo demais é NÃO SEI com o motivo certo, não traceback (rc 1 = MINI)
+  newcity; printf '\xff' > "$SSHJ"; hc --json verdict
+  check "session-ssh.json não-UTF-8: NÃO SEI provider_config, sem traceback" "2 provider_config 0" "$RC $(jget reason) $(grep -c Traceback "$W/err")"
+  newcity; "$PY" -c "print('['*200000)" > "$SHIM"; hc --json verdict
+  check "remote-shim.json aninhado fundo demais: NÃO SEI shim_config, sem traceback" "2 shim_config 0" "$RC $(jget reason) $(grep -c Traceback "$W/err")"
 }
 
-if [ -n "${HC_MUTANT:-}" ]; then g_read; g_step; g_verdict; g_third; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+if [ -n "${HC_MUTANT:-}" ]; then g_third; g_read; g_step; g_verdict; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 g_read; g_step; g_verdict; g_third
 
 [ -n "${HC_NO_MUTANTS:-}" ] || {
@@ -312,6 +352,22 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "falha de ssh vira leitura ok com zeros" 'r.update(state="unreachable", why=str(e) or type(e).__name__)' 'r.update(state="ok", cpu_headroom_pct=0.0, mem_avail_pct=100.0)'
   mutant "load5 nan/inf passa por válido" 'or not 0 <= load5 < float("inf"):' 'or load5 < 0:'
   mutant "leitura ok de cor desconhecida autoriza" 'if color(r, cfg) == "unknown":' 'if False:'
+  mutant "state.json não-UTF-8 derruba (só JSONDecodeError é pego)" '    except (ValueError, RecursionError):        # JSON ruim' '    except json.JSONDecodeError:        # JSON ruim'
+  mutant "state.json aninhado fundo demais derruba (RecursionError fora)" '    except (ValueError, RecursionError):        # JSON ruim' '    except ValueError:        # JSON ruim'
+  mutant "state.json sem changed_why passa por válido" ' and isinstance(st.get("changed_why"), str)' ''
+  mutant "config.json não-UTF-8 derruba (só JSONDecodeError é pego)" '    except (ValueError, RecursionError) as e:
+        raise ConfigError(f"{path}: JSON inválido ou não é UTF-8 ({e})")' '    except json.JSONDecodeError as e:
+        raise ConfigError(f"{path}: JSON inválido ou não é UTF-8 ({e})")'
+  mutant "config de fora aninhada fundo demais derruba (read_json sem RecursionError)" 'except (OSError, ValueError, RecursionError) as e:' 'except (OSError, ValueError) as e:'
+  mutant "sem o catch-all em main()" '    except Exception as e:      # bug nosso' '    except KeyboardInterrupt as e:      # bug nosso'
+  mutant "catch-all do verdict sai 1 (MINI) em vez de 2" '"detail": f"{type(e).__name__}: {e}"}, f"unknown internal: {type(e).__name__}: {e}")
+            return 2' '"detail": f"{type(e).__name__}: {e}"}, f"unknown internal: {type(e).__name__}: {e}")
+            return 1'
+  mutant "catch-all do step sai 1 (MINI) em vez de 3" 'erro interno: {type(e).__name__}: {e}", file=sys.stderr)
+        return 3' 'erro interno: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1'
+  mutant "ssh que não executa vira nó fora" 'except (ConnectionError, subprocess.TimeoutExpired) as e:' 'except (ConnectionError, subprocess.TimeoutExpired, OSError) as e:'
+  mutant "gate_done_bin relativo passa por executável" 'os.path.isabs(v) and os.path.isfile(v)' 'os.path.isfile(v)'
 }
 echo "── $((n - fails))/$n ok"
 [ "$fails" = 0 ]
