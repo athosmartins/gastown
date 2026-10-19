@@ -30,6 +30,10 @@
 #  10. (ga-3psuuo) The sling back-reference `bd show` runs against HQ: foreign-
 #      prefix ids (wa-/ps-/…) must never reach it (each one made Dolt full-scan
 #      `LOWER(title) LIKE` over the whole hq); routes-read failure → no filtering.
+#  11. (ga-hoifn5) A mother + her OWN slice held by one builder is not a double-
+#      dispatch (live session vouches); two unrelated beads still are; and when the
+#      parent link cannot be READ (bd fails / raises / garbled / empty) the pair keeps
+#      today's rule (flagged) with a WARN — "could not read" is never "no parent".
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -345,6 +349,69 @@ finally:
     m._HQ_ROUTES_PATH = _orig_routes
     import shutil
     shutil.rmtree(_tmp10, ignore_errors=True)
+
+# ── Scenario 11 (ga-hoifn5): compute_multi_assigned_assignees() clears a mother +
+# her own slice, keeps flagging unrelated beads, and a parent link that cannot be
+# read (the production reader _read_parent_id under a failing `bd show`) lands on
+# today's conservative rule with a WARN. The reader is driven through a stubbed
+# subprocess.run so every failure is injected, not assumed. ──
+print("Scenario 11 (ga-hoifn5): mother+slice not double-booked; unreadable parent link → still flagged + WARN")
+_ME = "wa-worker-adhoc-0e7c31de83"
+_mother = {"id": "wa-1d97lb.7", "assignee": _ME}
+_slice = {"id": "wa-1d97lb.7.8", "assignee": _ME, "parent": "wa-1d97lb.7"}
+_gap = [{"id": "ga-w7qwl1", "assignee": _ME},
+        {"id": "ga-w7qwl1.1.8", "assignee": _ME, "parent": "ga-w7qwl1.1"}]   # middle bead not in the snapshot
+
+def _with_bd_show(fake, fn):
+    prev = m.subprocess.run
+    m.subprocess.run = fake
+    try:
+        return fn()
+    finally:
+        m.subprocess.run = prev
+
+def _raise(*a, **k):
+    raise OSError("simulated bd crash")
+
+def _show_ok(cmd, capture_output=True, text=True, timeout=20):
+    bid = cmd[cmd.index("show") + 1]
+    return FakeResult(0, json.dumps([{"id": bid, "parent": {"ga-w7qwl1.1": "ga-w7qwl1"}.get(bid)}]))
+
+_notes = []
+if m.compute_multi_assigned_assignees([_mother, _slice], notes=_notes) == set() and len(_notes) == 1:
+    ok("a mother and her own slice held by one builder → NOT double-booked (live session vouches)")
+else:
+    bad("REGRESSION (ga-hoifn5): mother+slice still counted as a double-dispatch: %r" % (_notes,))
+
+if m.compute_multi_assigned_assignees([
+        {"id": "wa-aaaaa.1", "assignee": _ME, "parent": "wa-aaaaa"},
+        {"id": "wa-bbbbb.1", "assignee": _ME, "parent": "wa-bbbbb"}]) == {_ME}:
+    ok("two unrelated beads → still flagged (the original ga-zbrbt rule)")
+else:
+    bad("two unrelated beads were cleared")
+
+def _gap_run():
+    n = []
+    out = m.compute_multi_assigned_assignees(_gap, parent_reader=m._read_parent_id, notes=n)
+    return out, n
+
+out, n = _with_bd_show(_show_ok, _gap_run)
+if out == set():
+    ok("middle ancestor read through bd show → one chain → NOT flagged")
+else:
+    bad("good bd show read did not clear the chain: %r %r" % (out, n))
+
+for label, fake in (
+        ("bd show exits non-zero", lambda cmd, **k: FakeResult(1, "")),
+        ("bd show prints nothing", lambda cmd, **k: FakeResult(0, "")),
+        ("bd show prints garbage", lambda cmd, **k: FakeResult(0, "{not json")),
+        ("bd show answers about another bead", lambda cmd, **k: FakeResult(0, json.dumps([{"id": "wa-other", "parent": "ga-w7qwl1"}]))),
+        ("bd show crashes", _raise)):
+    out, n = _with_bd_show(fake, _gap_run)
+    if out == {_ME} and len(n) == 1 and n[0].startswith("WARN") and "could not read the parent link" in n[0]:
+        ok("%s → could not tell: flagged (today's rule) with a WARN, never read as 'no parent'" % label)
+    else:
+        bad("%s did not land on the inert state: flagged=%r notes=%r" % (label, out, n))
 
 print("")
 print("Results: %d passed, %d failed" % (PASS, FAIL))
