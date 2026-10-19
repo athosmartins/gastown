@@ -22,7 +22,9 @@ SUBCOMANDOS (stdout = JSON, rc 0 ok / 1 dump ilegível / 2 uso)
   inspect F.tar.gz                                      conta linhas por <db>/<tabela> LENDO o artefato; erro de parse vira entrada em "errors"
   count   F.jsonl                                       número de linhas de um dump (uma tabela)
   manifest --inspect I.json --built B.json --captured-epoch N --head-epoch N --head-sha S --key K [--require db,db]
-                                                        manifest do snapshot (verdict ok|broken) a partir do que foi lido do artefato
+           [--previous P.json | --baseline-unavailable MOTIVO] [--suspect-drop-pct 20 --suspect-min-rows 100] [--accept-drop]
+                                                        manifest do snapshot (verdict ok|suspect|broken) a partir do que foi lido do artefato; com o
+                                                        manifest anterior, tabela que caiu > 20% (e tinha >= 100 linhas) sem queda de issues = suspect
   retention --prefix P --now EPOCH [--keep-recent-h 48 --keep-daily-days 14 --floor 6 --protect STEM]  < chaves
                                                         chaves a apagar (só o formato exato de snapshot; stdin = lista de chaves)
 
@@ -327,8 +329,69 @@ def _iso(epoch):
     return datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def build_manifest(insp, built, meta, required_dbs):
-    """Junta o que foi LIDO do artefato (inspect) com o que foi gravado (build). verdict: ok | broken."""
+# Queda brusca de uma tabela contra o snapshot anterior (ga-l6v576). Em 18/10 o export do hq cortou `comments` em 10.112 linhas (79 x 128) contra as
+# 35.132 do dia 17 — uma queda de 71% — e o manifest saiu `verdict: ok`: inspect conta o que o artefato TEM, e um export cortado é um documento
+# bem formado. Só uma régua externa (o snapshot anterior) vê isso.
+# 20%: acima do que qualquer tabela oscila de uma hora para outra e muito abaixo do que um corte do Dolt faz. Comentário só cresce; `issues` do hq anda
+#   ~1% por hora; o corte medido tira 68-71% (11.776 de 36.930 linhas no run vivo de 19/10; 10.112 de 35.132 no snapshot de 18/10). Entre 2% e 68% há
+#   folga para os dois lados — e quem cai entre 20% e 68% já foi pego antes, pelo gate de contagem do próprio jsonl-export.sh.
+# 100 linhas: tabela pequena oscila em termos relativos sem significar nada (config 12 -> 8 é -33%); o corte do Dolt só acontece com a tabela grande.
+SUSPECT_DROP_PCT = 20
+SUSPECT_MIN_PREV_ROWS = 100
+
+
+def _baseline(prev, baseline_unavailable):
+    """(estado, contagens, motivo, chave) da régua. estado: none (1º run, não há anterior) | unavailable (há, mas não serve; `motivo` diz por quê) | compared.
+    vazio → none; ilegível/fora da forma/broken/suspect → unavailable. Nenhum dos dois vira "sem queda" em silêncio: o manifest guarda o estado."""
+    if baseline_unavailable:
+        return "unavailable", None, str(baseline_unavailable), None
+    if prev is None:
+        return "none", None, None, None
+    if not isinstance(prev, dict) or not isinstance(prev.get("databases"), dict):
+        return "unavailable", None, "manifest anterior fora da forma (sem `databases`)", None
+    if prev.get("verdict") != "ok":
+        return "unavailable", None, "manifest anterior com verdict %r não serve de régua" % (prev.get("verdict"),), None
+    key = prev.get("artifact", {}).get("key") if isinstance(prev.get("artifact"), dict) else None
+    return "compared", prev["databases"], None, key
+
+
+def _rows(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
+def sharp_drops(cur_dbs, prev_dbs, drop_pct, min_rows):
+    """Tabelas que caíram mais de drop_pct% contra o anterior, sem explicação. Devolve lista de textos, uma por tabela.
+    Só entra na conta o par (banco, tabela) com contagem inteira nos dois lados e >= min_rows no anterior: banco novo, tabela nova e anterior ilegível
+    são "não sei", e não sei não é queda. Explicação (só para tabela filha): o `issues` do MESMO banco caiu além do limite — filhos somem com o pai
+    (uma purga); o `issues` em si não tem quem o explique. Uma purga de verdade que coincida com um corte de filhos fica escondida: a defesa primária é o
+    gate de contagem por tabela do jsonl-export.sh, esta é a segunda."""
+    out = []
+
+    def dropped(cur, prev):
+        cur, prev = _rows(cur), _rows(prev)
+        if cur is None or prev is None or prev < min_rows:
+            return None
+        return (prev - cur) * 100 // prev if cur * 100 < prev * (100 - drop_pct) else None
+
+    for db in sorted(cur_dbs):
+        cur_tabs, prev_tabs = cur_dbs[db], prev_dbs.get(db)
+        if not isinstance(cur_tabs, dict) or not isinstance(prev_tabs, dict):
+            continue
+        parent_fell = dropped(cur_tabs.get("issues"), prev_tabs.get("issues")) is not None
+        for t in TABLES:
+            pct = dropped(cur_tabs.get(t), prev_tabs.get(t))
+            if pct is None or (t != "issues" and parent_fell):
+                continue
+            out.append("%s/%s: %d -> %d linhas (-%d%%) contra o snapshot anterior%s" % (
+                db, t, prev_tabs[t], cur_tabs[t], pct, "" if t == "issues" else ", sem queda correspondente em issues"))
+    return out
+
+
+def build_manifest(insp, built, meta, required_dbs, prev=None, baseline_unavailable=None,
+                   suspect_drop_pct=SUSPECT_DROP_PCT, suspect_min_rows=SUSPECT_MIN_PREV_ROWS, accept_drop=False):
+    """Junta o que foi LIDO do artefato (inspect) com o que foi gravado (build) e, com `prev` (o manifest do snapshot anterior), com o que havia antes.
+    verdict: ok | suspect | broken. broken = o artefato não descreve o que diz; suspect = o artefato é legível mas uma tabela caiu bruscamente contra o anterior
+    sem explicação (lista em `suspect`); accept_drop (decisão de quem opera, um run só) mantém `suspect` e `baseline.accepted` no manifest e o torna ok."""
     problems = []
     for e in insp.get("errors", []):
         problems.append("%s: %s" % (e["path"], e["error"]))
@@ -362,11 +425,24 @@ def build_manifest(insp, built, meta, required_dbs):
     rows = {f["path"]: f.get("rows") for f in insp.get("files", [])}
     files = [{"path": f["path"], "bytes": f["bytes"], "sha256": f["sha256"], "rows": rows.get(f["path"])}
              for f in built.get("files", [])]
+    state, prev_dbs, why, prev_key = _baseline(prev, baseline_unavailable)
+    suspect = sharp_drops(dbs, prev_dbs, suspect_drop_pct, suspect_min_rows) if state == "compared" else []
+    baseline = {"state": state}
+    if prev_key:
+        baseline["key"] = prev_key
+    if why:
+        baseline["why"] = why
+    if suspect and accept_drop:
+        baseline["accepted"] = True
+    verdict = "broken" if problems else ("suspect" if suspect and not accept_drop else "ok")
     return {
         "schema": 1,
         "kind": "jsonl-hourly-snapshot",
-        "verdict": "ok" if not problems else "broken",
+        "verdict": verdict,
         "problems": problems,
+        "suspect": suspect,
+        "baseline": baseline,
+        "suspect_rule": {"drop_pct": suspect_drop_pct, "min_prev_rows": suspect_min_rows},
         "captured_at": _iso(meta["captured_epoch"]),
         "data_as_of": _iso(meta["head_epoch"]),
         "source": {"archive_head": meta["head_sha"], "head_age_s": int(meta["captured_epoch"]) - int(meta["head_epoch"])},
@@ -385,7 +461,16 @@ def cmd_manifest(args):
     insp = json.load(open(args.inspect))
     built = json.load(open(args.built))
     meta = {"captured_epoch": args.captured_epoch, "head_epoch": args.head_epoch, "head_sha": args.head_sha, "key": args.key}
-    doc = build_manifest(insp, built, meta, [d for d in args.require.split(",") if d])
+    prev, unavailable = None, args.baseline_unavailable
+    if args.previous and not unavailable:
+        # falhou/ilegível/ausente → a régua não existe e o manifest DIZ isso (baseline.unavailable); um comparador que derruba o manifest pararia o RPO de 1 h
+        try:
+            with open(args.previous) as f:
+                prev = json.load(f)
+        except (OSError, ValueError) as e:
+            unavailable = "manifest anterior ilegível (%s: %s)" % (type(e).__name__, e)
+    doc = build_manifest(insp, built, meta, [d for d in args.require.split(",") if d], prev=prev, baseline_unavailable=unavailable,
+                         suspect_drop_pct=args.suspect_drop_pct, suspect_min_rows=args.suspect_min_rows, accept_drop=args.accept_drop)
     print(json.dumps(doc, sort_keys=True))
     return 0 if doc["verdict"] == "ok" else 1
 
@@ -449,6 +534,16 @@ def retention_deletes(keys, prefix, now, keep_recent_s, keep_daily_days, floor, 
     return out
 
 
+def _int_range(lo, hi):
+    def conv(s):
+        v = int(s)   # não-número: ValueError, que o argparse transforma em rc 2
+        if not lo <= v <= hi:
+            raise argparse.ArgumentTypeError("precisa estar entre %d e %d (recebi %d)" % (lo, hi, v))
+        return v
+    conv.__name__ = "inteiro"
+    return conv
+
+
 def _int_min(lo):
     def conv(s):
         v = int(s)   # não-número: ValueError, que o argparse transforma em rc 2
@@ -496,6 +591,11 @@ def main(argv=None):
     mf.add_argument("--head-sha", required=True)
     mf.add_argument("--key", required=True)
     mf.add_argument("--require", default="")
+    mf.add_argument("--previous", default="", help="manifest do snapshot anterior (o de latest.json); sem ele não há régua (baseline none)")
+    mf.add_argument("--baseline-unavailable", default="", metavar="MOTIVO", help="o anterior existe mas não deu para ler: o manifest diz, em vez de calar")
+    mf.add_argument("--suspect-drop-pct", type=_int_range(1, 99), default=SUSPECT_DROP_PCT, help="queda (%%) que torna uma tabela suspect")
+    mf.add_argument("--suspect-min-rows", type=_int_min(1), default=SUSPECT_MIN_PREV_ROWS, help="tabelas com menos linhas no anterior não entram na conta")
+    mf.add_argument("--accept-drop", action="store_true", help="aceita a queda (decisão de quem opera): verdict ok, `suspect` e baseline.accepted ficam no manifest")
     mf.set_defaults(fn=cmd_manifest)
     rt = sub.add_parser("retention")
     rt.add_argument("--prefix", required=True)

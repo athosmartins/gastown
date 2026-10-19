@@ -126,6 +126,54 @@ cp "$SCRIPT" "$E2E/scripts/jsonl-export.sh"
 cp "$HERE/jsonl-archive-repack-window-lib.sh" "$E2E/scripts/jsonl-archive-repack-window-lib.sh"   # ga-wkoij7: sourced by the exporter at start
 cp "$HERE/disk-headroom-lib.sh" "$E2E/scripts/disk-headroom-lib.sh"   # ga-j2f5v5: the one reader of the free disk, sourced by the exporter at start
 cat > "$E2E/scripts/dolt-target.sh" <<'STUB'
+# ga-l6v576: the five supplemental tables. The stub models what the live store did to hq.comments: ONE query that returns more than STUB_READ_CAP rows is cut — a
+# well-formed document, exit 0, "unexpected EOF" on stderr — while a query for a page that fits comes back whole. Per table <t>:
+#   STUB_ROWS_<t>   rows in the table (default 0)           STUB_COUNT_<t>  the COUNT(*) answer (default = the rows; ERR = unreadable)
+#   STUB_LOSE_<t>   the last N rows are never returned, however the table is read (a cut paging cannot cure)
+#   STUB_FLAKY_<t>  the first N reads of the table (from offset 0) come back 128 rows short, later ones whole
+#   STUB_FAIL_<t>   1 = a read prints part of the document and exits 1
+# STUB_READ_CAP is the most rows one query returns (0 = no cap). STUB_PK is the table's primary key (id | none | ERR). E2E_READ_LOG gets one "READ <t> <offset> <limit>" per read.
+re_supp_table='`wa`\.`?(comments|config|dependencies|labels|metadata)([^a-z_]|$)'
+stub_supp() {  # stub_supp <query> <table>
+  local q="$1" tbl="$2" var rows lose flaky seen vis from to lim off cap cut=0
+  var="STUB_ROWS_$tbl"; rows="${!var:-0}"
+  case "$q" in
+    "SELECT COUNT(*)"*)
+      var="STUB_COUNT_$tbl"; var="${!var:-$rows}"
+      [ "$var" = "ERR" ] && return 1
+      printf 'row_count\n%s\n' "$var"; return 0 ;;
+  esac
+  lim=""; off=0
+  [[ "$q" =~ LIMIT\ ([0-9]+) ]] && lim="${BASH_REMATCH[1]}"
+  [[ "$q" =~ OFFSET\ ([0-9]+) ]] && off="${BASH_REMATCH[1]}"
+  [ -z "${E2E_READ_LOG:-}" ] || printf 'READ %s %s %s\n' "$tbl" "$off" "${lim:-all}" >> "$E2E_READ_LOG"
+  var="STUB_LOSE_$tbl"; lose="${!var:-0}"
+  vis=$(( rows - lose )); [ "$vis" -ge 0 ] || vis=0
+  var="STUB_FLAKY_$tbl"; flaky="${!var:-0}"
+  if [ "$flaky" -gt 0 ] && [ -n "${E2E_FLAKY_DIR:-}" ]; then
+    if [ "$off" = "0" ]; then   # a new attempt starts at offset 0; the pages after it belong to the same attempt
+      seen=$(cat "$E2E_FLAKY_DIR/$tbl" 2>/dev/null || echo 0); seen=$((seen + 1)); printf '%s' "$seen" > "$E2E_FLAKY_DIR/$tbl"
+    fi
+    seen=$(cat "$E2E_FLAKY_DIR/$tbl" 2>/dev/null || echo 0)
+    if [ "$seen" -le "$flaky" ]; then vis=$(( vis - 128 )); [ "$vis" -ge 0 ] || vis=0; fi
+  fi
+  from="$off"; to="$vis"
+  [ -z "$lim" ] || { [ $(( off + lim )) -ge "$vis" ] || to=$(( off + lim )); }
+  [ "$from" -le "$to" ] || from="$to"
+  var="STUB_READ_CAP"; cap="${!var:-0}"
+  if [ "$cap" -gt 0 ] && [ $(( to - from )) -gt "$cap" ]; then to=$(( from + cap )); cut=1; fi
+  var="STUB_FAIL_$tbl"
+  if [ "${!var:-0}" = "1" ]; then
+    to=$(( from + 10 )); [ "$to" -le "$vis" ] || to="$vis"
+    jq -n -c --arg t "$tbl" --argjson a "$from" --argjson b "$to" '{rows: [range($a;$b) | {id: "\($t)-\(.)", body: "text \(.)"}]}'
+    echo "stub: connection reset by peer" >&2; return 1
+  fi
+  if [ "$to" -le "$from" ]; then printf '{}\n'; else
+    jq -n -c --arg t "$tbl" --argjson a "$from" --argjson b "$to" '{rows: [range($a;$b) | {id: "\($t)-\(.)", body: "text \(.)"}]}'
+  fi
+  [ "$cut" = "0" ] || echo "[mysql] 2026/10/19 01:21:48 packets.go:58 unexpected EOF" >&2
+  return 0
+}
 dolt_sql() {
   local q=""
   [ -z "${E2E_DOLT_CALLS:-}" ] || printf "call\n" >> "$E2E_DOLT_CALLS"   # ga-j2f5v5: a skipped tick must not ask Dolt anything
@@ -133,6 +181,16 @@ dolt_sql() {
     case "$1" in -q) q="$2"; shift ;; esac
     shift
   done
+  case "$q" in
+    *KEY_COLUMN_USAGE*)
+      case "${STUB_PK:-id}" in
+        ERR) return 1 ;;
+        none) printf 'COLUMN_NAME\n' ;;
+        *) printf 'COLUMN_NAME\n%s\n' "${STUB_PK:-id}" ;;
+      esac
+      return 0 ;;
+  esac
+  if [[ "$q" =~ $re_supp_table ]]; then stub_supp "$q" "${BASH_REMATCH[1]}"; return; fi
   case "$q" in
     "SHOW DATABASES") if [ "${STUB_NO_DBS:-0}" = "1" ]; then printf 'Database\n'; else printf 'Database\nwa\n'; fi ;;
     "SELECT COUNT(*)"*)
@@ -599,6 +657,198 @@ GC_JSONL_EXPORT_TMP_DIR="$E2E/scratch-is-a-file/sub" run_export 201 201
 [ "$(head_rows)" = "200" ] && [ "$(commits)" = "$BASE_COMMITS" ] && [ -z "$(stray_in "$ARCH")" ] \
   && ok "scratch dir not creatable: archive untouched (HEAD still 200 rows, no new commit, nothing written inside)" \
   || bad "scratch dir not creatable: head=$(head_rows) commits $BASE_COMMITS -> $(commits) stray=$(stray_in "$ARCH" | tr '\n' ' ')"
+
+# ── ga-l6v576: comments, config, dependencies, labels and metadata are read whole and checked against the source, like issues ──
+# They were exported with `dolt_sql ... > file 2>/dev/null || true`: no row count, no exit code, no stderr. Dolt cuts a read that runs past ~40 s — a well-formed document, exit 0, "unexpected EOF" on
+# stderr — and hq.comments (36.9k rows) came out at a multiple of 128 rows in 29 of 37 snapshots (live: 11,776 of 36,930); the gate on issues never looked at it, and the hourly manifest said `ok`.
+# The stub models that cut (STUB_READ_CAP), so what these cases pin is the cure — read the table in pages that fit — and the gate behind it: a table that still comes up short is never the snapshot.
+echo "=== ga-l6v576: a supplemental table cut short is never the snapshot ==="
+SUPP_TABLES_ALL="comments config dependencies labels metadata"
+# vazio → the table has no rows (0); falhou (file missing, not JSON) → prints "?", which no assertion below accepts
+supp_file_rows() { jq -s -r 'if length == 0 then 0 else ((.[0].rows // []) | length) end' "$ARCH/wa/$1.jsonl" 2>/dev/null || echo "?"; }
+# same three states for the table's blob in the archive's HEAD (no such blob → "?", never 0)
+supp_head_rows() {
+  local blob
+  blob=$(git -C "$ARCH" show "HEAD:wa/$1.jsonl" 2>/dev/null) || { echo "?"; return 0; }
+  printf '%s\n' "$blob" | jq -s -r 'if length == 0 then 0 else ((.[0].rows // []) | length) end' 2>/dev/null || echo "?"
+}
+export E2E_READ_LOG="$E2E/reads.log" E2E_FLAKY_DIR="$E2E/flaky" GC_JSONL_SUPP_EXPORT_RETRY_DELAY=0
+mkdir -p "$E2E_FLAKY_DIR"
+reset_reads() { : > "$E2E_READ_LOG"; rm -f "$E2E_FLAKY_DIR"/*; }   # the read log and the stub's flaky counters belong to one run
+attempts_of() { grep -c "^READ $1 0 " "$E2E_READ_LOG" 2>/dev/null || true; }   # reads of <table> that started at offset 0 = attempts at the whole table
+supp_env_reset() {
+  local x
+  unset STUB_READ_CAP STUB_PK GC_JSONL_SUPP_CHUNK_ROWS
+  for x in $SUPP_TABLES_ALL; do unset "STUB_ROWS_$x" "STUB_COUNT_$x" "STUB_LOSE_$x" "STUB_FLAKY_$x" "STUB_FAIL_$x"; done
+}
+supp_env_reset
+
+# Case 1 — the cause: no single read can return 384 rows (3 x 128), every table is bigger than that but config/metadata. The file must hold what the source holds.
+fresh_archive supp-paged
+export STUB_READ_CAP=384 GC_JSONL_SUPP_CHUNK_ROWS=100
+export STUB_ROWS_comments=1000 STUB_ROWS_labels=2500 STUB_ROWS_dependencies=500 STUB_ROWS_config=11 STUB_ROWS_metadata=2
+reset_reads
+run_export 200 200
+for t in $SUPP_TABLES_ALL; do
+  v="STUB_ROWS_$t"; want="${!v}"
+  [ "$(supp_file_rows "$t")" = "$want" ] && [ "$(supp_head_rows "$t")" = "$want" ] \
+    && ok "paged read: wa/$t.jsonl holds all $want rows of the source (file and archive HEAD)" \
+    || bad "paged read: wa/$t.jsonl holds $(supp_file_rows "$t") rows (HEAD $(supp_head_rows "$t")), want $want — one read is cut at 384 rows and the cut table became the snapshot"
+done
+case "$OUT" in
+  *"failed:"*|*"partial="*) bad "paged read: a table the paging reads whole is reported as failed: $OUT" ;;
+  *) ok "paged read: a complete export reports no failed table" ;;
+esac
+# vazio → the scratch dir holds nothing after a clean run; falhou (cannot list it) → the text is "?", never empty
+[ -z "$(ls -A "$(dirname "$ARCH")/.jsonl-export-tmp" 2>/dev/null || echo '?')" ] \
+  && ok "paged read: the pages are cleaned out of the scratch dir" \
+  || bad "paged read: the scratch dir keeps: $(ls -A "$(dirname "$ARCH")/.jsonl-export-tmp" | tr '\n' ' ')"
+supp_env_reset
+
+# Case 2 — the whole CLASS: a table that comes up 256 rows (2 x 128) short however it is read is NOT the snapshot — for each of the five. The previous version stays, the DB is reported
+# as failed with the table named, the retry is bounded, and the verified issues of the same run are still committed.
+for t in $SUPP_TABLES_ALL; do
+  fresh_archive "supp-short-$t"
+  export "STUB_ROWS_$t=600" GC_JSONL_SUPP_CHUNK_ROWS=100
+  run_export 200 200
+  [ "$(supp_file_rows "$t")" = "600" ] || bad "test setup invalid: the baseline $t holds $(supp_file_rows "$t") rows, want 600: $OUT"
+  BASE_COMMITS=$(commits)
+  export "STUB_LOSE_$t=256"
+  reset_reads
+  run_export 201 201
+  [ "$(supp_file_rows "$t")" = "600" ] && [ "$(supp_head_rows "$t")" = "600" ] \
+    && ok "short $t: the previous 600-row version stays (file and HEAD)" \
+    || bad "short $t: file holds $(supp_file_rows "$t") rows, HEAD $(supp_head_rows "$t"), want 600 — the table 256 rows short became the snapshot"
+  case "$OUT" in
+    *"export curto de wa.$t: "*"mantido o snapshot anterior"*) ok "short $t: logs 'export curto de wa.$t', previous kept" ;;
+    *) bad "short $t: no 'export curto de wa.$t ... mantido o snapshot anterior' line. Output: $OUT" ;;
+  esac
+  case "$OUT" in
+    *"failed: wa($t)"*) ok "short $t: the run summary lists 'failed: wa($t)'" ;;
+    *) bad "short $t: the run summary does not name the failed table 'wa($t)'. Output: $OUT" ;;
+  esac
+  grep -q "DOG_DONE:.*wa($t)" "$E2E/gc.log" \
+    && ok "short $t: the DOG_DONE nudge names wa($t)" \
+    || bad "short $t: DOG_DONE nudge does not name wa($t). gc log: $(cat "$E2E/gc.log")"
+  [ "$(head_rows)" = "201" ] && [ "$(commits)" = "$((BASE_COMMITS + 1))" ] \
+    && ok "short $t: the verified issues still commit (201 rows, one new commit)" \
+    || bad "short $t: issues head=$(head_rows) commits $BASE_COMMITS -> $(commits), want 201 rows and +1 commit — a short $t held the whole DB back"
+  git -C "$ARCH" log -1 --format=%s | grep -q "partial=wa($t)" \
+    && ok "short $t: the archive commit message records partial=wa($t)" \
+    || bad "short $t: commit message lacks partial=wa($t): $(git -C "$ARCH" log -1 --format=%s)"
+  n=$(attempts_of "$t")
+  [ "$n" -ge 2 ] && [ "$n" -le 5 ] \
+    && ok "short $t: read $n times — retried, and bounded" \
+    || bad "short $t: $n attempts at the whole table, want 2..5 (retried, not forever)"
+  [ -z "$(git -C "$ARCH" status --porcelain)" ] && [ "$RC" = "0" ] \
+    && ok "short $t: exit 0, archive working tree clean" \
+    || bad "short $t: rc=$RC, tree: $(git -C "$ARCH" status --porcelain | tr '\n' ' ')"
+  supp_env_reset
+done
+
+# Case 3 — no previous version to keep (the first run of a DB): the short table is not written at all, and not committed.
+fresh_archive supp-short-first
+export STUB_ROWS_comments=600 STUB_LOSE_comments=256 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+{ [ ! -e "$ARCH/wa/comments.jsonl" ] && ! git -C "$ARCH" cat-file -e HEAD:wa/comments.jsonl 2>/dev/null; } \
+  && ok "short, first run: a table with no previous version is left out — no truncated file in the working tree or HEAD" \
+  || bad "short, first run: wa/comments.jsonl exists (file: $(supp_file_rows comments) rows, HEAD: $(supp_head_rows comments))"
+[ "$(head_rows)" = "200" ] && case "$OUT" in *"failed: wa(comments)"*) true ;; *) false ;; esac \
+  && ok "short, first run: the issues commit, and wa(comments) is reported failed" \
+  || bad "short, first run: issues head=$(head_rows); output: $OUT"
+supp_env_reset
+
+# Case 4 — a transient cut heals on the retry: the first read of the table is 128 rows short, the second is whole. No failed table, the full table archived.
+fresh_archive supp-flaky
+export STUB_ROWS_comments=600 STUB_FLAKY_comments=1 GC_JSONL_SUPP_CHUNK_ROWS=100
+reset_reads
+run_export 200 200
+[ "$(supp_file_rows comments)" = "600" ] \
+  && ok "flaky read: the retry archives the whole table (600 rows)" \
+  || bad "flaky read: comments holds $(supp_file_rows comments) rows, want 600 — the first, cut read became the snapshot"
+[ "$(attempts_of comments)" = "2" ] \
+  && ok "flaky read: exactly one retry (2 attempts)" \
+  || bad "flaky read: $(attempts_of comments) attempts, want 2"
+case "$OUT" in
+  *"failed:"*|*"partial="*) bad "flaky read: a table the retry healed is reported as failed: $OUT" ;;
+  *) ok "flaky read: healed by the retry, nothing reported failed" ;;
+esac
+supp_env_reset
+
+# Case 5 — the read itself fails (exit 1 with part of the document on stdout): not a snapshot, and Dolt's own stderr reaches the log instead of /dev/null.
+fresh_archive supp-readfail
+export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+export STUB_FAIL_comments=1
+run_export 201 201
+[ "$(supp_file_rows comments)" = "600" ] && [ "$(supp_head_rows comments)" = "600" ] \
+  && ok "failing read: the previous 600-row version stays (the 10-row fragment is not archived)" \
+  || bad "failing read: comments holds $(supp_file_rows comments) rows (HEAD $(supp_head_rows comments)), want 600"
+case "$OUT" in
+  *"connection reset by peer"*) ok "failing read: Dolt's stderr is in the log (not swallowed)" ;;
+  *) bad "failing read: Dolt's stderr ('connection reset by peer') is nowhere in the output: $OUT" ;;
+esac
+case "$OUT" in
+  *"failed: wa(comments)"*) ok "failing read: the run summary lists 'failed: wa(comments)'" ;;
+  *) bad "failing read: the run summary does not name wa(comments). Output: $OUT" ;;
+esac
+supp_env_reset
+
+# Case 6 — the THIRD state: the table's COUNT(*) is unreadable, so nobody can say whether the export is whole. Not discarded (a store whose count query is down must not freeze its archive),
+# never silent: named in the log, the summary, the nudge and the commit message — the same four places as the unverified issues export.
+fresh_archive supp-unverified
+export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+export STUB_ROWS_comments=700 STUB_COUNT_comments=ERR
+run_export 201 201
+[ "$(supp_file_rows comments)" = "700" ] \
+  && ok "unreadable table count: the export is archived (700 rows), as documented for an unverifiable export" \
+  || bad "unreadable table count: comments holds $(supp_file_rows comments) rows, want 700"
+unverified_seen "unreadable table count (comments)"
+git -C "$ARCH" log -1 --format=%s | grep -q 'unverified=wa' \
+  && ok "unreadable table count: the archive commit message records unverified=wa" \
+  || bad "unreadable table count: commit message lacks unverified=wa: $(git -C "$ARCH" log -1 --format=%s)"
+case "$OUT" in
+  *"failed:"*) bad "unreadable table count: an unverifiable table is reported FAILED, not unverified: $OUT" ;;
+  *) ok "unreadable table count: reported unverified, not failed" ;;
+esac
+supp_env_reset
+
+# Case 7 — no usable primary key to page by. A small table is read in ONE query and still checked; a table too big for one query is the cut again, and then the gate keeps the previous version.
+fresh_archive supp-nopk
+export STUB_ROWS_comments=50 STUB_READ_CAP=384 STUB_PK=none
+reset_reads
+run_export 200 200
+[ "$(supp_file_rows comments)" = "50" ] && [ "$(attempts_of comments)" = "1" ] \
+  && ok "no primary key, small table: read whole in one query (50 rows, 1 attempt)" \
+  || bad "no primary key, small table: comments holds $(supp_file_rows comments) rows after $(attempts_of comments) attempts, want 50 after 1"
+supp_env_reset
+fresh_archive supp-pk-unreadable
+export STUB_ROWS_comments=50 STUB_READ_CAP=384 STUB_PK=ERR
+run_export 200 200
+[ "$(supp_file_rows comments)" = "50" ] \
+  && ok "primary key unreadable, small table: read whole in one query (50 rows)" \
+  || bad "primary key unreadable, small table: comments holds $(supp_file_rows comments) rows, want 50"
+supp_env_reset
+fresh_archive supp-nopk-big
+export STUB_ROWS_comments=700 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+export STUB_READ_CAP=384 STUB_PK=none
+run_export 201 201
+[ "$(supp_file_rows comments)" = "700" ] && case "$OUT" in *"failed: wa(comments)"*) true ;; *) false ;; esac \
+  && ok "no primary key, table too big for one query: the cut read is gated — previous 700 rows kept, wa(comments) failed" \
+  || bad "no primary key, big table: comments holds $(supp_file_rows comments) rows; output: $OUT"
+supp_env_reset
+
+# Case 8 — the verdict, alone. The read of a table is bracketed by two counts; rows deleted meanwhile lower the count AFTER the read, so a complete read is never short of the smaller of the two.
+v() { lib_call table_export_verdict "$@" 2>/dev/null || echo "?"; }   # falhou (function missing) → "?", which no expected answer is
+for spec in "344 600 600 short" "344 600 '' short" "344 '' 600 short" "598 600 598 complete" "600 600 600 complete" "0 0 0 complete" \
+            "600 '' '' unknown" "'' 600 600 unknown" "abc 600 600 unknown" "5 600 abc short"; do
+  eval "set -- $spec"; want="$4"
+  got=$(v "$1" "$2" "$3")
+  [ "$got" = "$want" ] && ok "table_export_verdict raw=$1 before='$2' after='$3' -> $want" || bad "table_export_verdict raw=$1 before='$2' after='$3' -> '$got', want $want"
+done
+unset -f v
 
 # ga-8z0hy7 — a commit that lands while jsonl-archive-compact.sh runs must not start git's background maintenance.
 # `git commit` runs `git maintenance run --auto --quiet --detach`; on git 2.54 that is a geometric repack which merges and deletes the loose-*.pack batch

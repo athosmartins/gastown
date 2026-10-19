@@ -108,6 +108,42 @@ jex_cadence_verdict() {
     return 0
 }
 
+# How does a supplemental table's export compare with its source? (ga-l6v576) Prints ONE of:
+#   short     a source count is readable AND the export has fewer rows than it;
+#   complete  a source count is readable AND the export has at least that many rows;
+#   unknown   no source count could be read (or the export's own count is not a number).
+# Three answers, like export_vs_source_verdict below, for the same reason: an unreadable count must never read as "complete". Pure (no Dolt, no globals but the
+# slack knob), so the selftest calls it in library mode.
+# The table is counted BEFORE and AFTER the read. Rows deleted while the read runs lower the count after it, so a whole read is never below the SMALLER of the two; comparing
+# with the larger one would call every busy table short. Whatever is added meanwhile only raises the export. There is no percentage slack on purpose: comments only grow, and a
+# cut that leaves the last 1% (a few hundred comments) is exactly the cut that goes unseen under the 1% the issues gate allows. A false "short" costs one retry, a miss costs the table.
+table_export_verdict() {
+    local raw="$1" before="$2" after="$3" source slack="${GC_JSONL_SUPP_SHORT_SLACK:-0}"
+
+    case "$raw" in ''|*[!0-9]*) echo unknown; return 0 ;; esac
+    case "$before" in ''|*[!0-9]*) before="" ;; esac
+    case "$after" in ''|*[!0-9]*) after="" ;; esac
+    case "$slack" in ''|*[!0-9]*) slack=0 ;; esac
+    if [ -z "$before" ] && [ -z "$after" ]; then
+        echo unknown
+        return 0
+    fi
+    if [ -z "$before" ]; then
+        source="$after"
+    elif [ -z "$after" ]; then
+        source="$before"
+    elif [ "$((10#$after))" -lt "$((10#$before))" ]; then
+        source="$after"
+    else
+        source="$before"
+    fi
+    if [ $(( 10#$raw + 10#$slack )) -lt "$((10#$source))" ]; then
+        echo short
+    else
+        echo complete
+    fi
+}
+
 # Library mode: `JSONL_EXPORT_LIB=1 source jsonl-export.sh` defines the pure
 # function above and returns before dolt-target.sh is sourced — no live Dolt
 # server, port resolution, or GC_CITY_PATH is ever required. Used by
@@ -146,6 +182,19 @@ MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-100}"
 # export is archived but reported as "unverified" (see the gate in the DB loop).
 SHORT_EXPORT_SLACK_PCT="${GC_JSONL_SHORT_EXPORT_SLACK_PCT:-1}"
 SHORT_EXPORT_MIN_SLACK="${GC_JSONL_SHORT_EXPORT_MIN_SLACK:-5}"
+# Supplemental tables (ga-l6v576): the five tables next to issues, each read in pages of SUPP_CHUNK_ROWS rows (Dolt cuts ONE read that runs past ~40 s: hq.comments came out at
+# 11,776 of 36,930 rows, exit 0), checked against its own COUNT(*), and tried at most SUPP_EXPORT_ATTEMPTS times before the previous version is kept. 2000 rows took 3-7 s on the
+# live hq, a margin of 5x under the cut; a retry cannot cure a cut that repeats, so the attempts stay few (the order's timeout is 840 s). GC_JSONL_SUPP_SHORT_SLACK (rows) is read
+# by table_export_verdict.
+SUPP_TABLES="comments config dependencies labels metadata"
+SUPP_CHUNK_ROWS="${GC_JSONL_SUPP_CHUNK_ROWS:-2000}"
+SUPP_EXPORT_ATTEMPTS="${GC_JSONL_SUPP_EXPORT_ATTEMPTS:-2}"
+SUPP_EXPORT_RETRY_DELAY="${GC_JSONL_SUPP_EXPORT_RETRY_DELAY:-3}"
+SUPP_MAX_PAGES=5000
+# These feed arithmetic and `sleep`: anything that is not a positive number (a delay may be 0) is the default.
+case "$SUPP_CHUNK_ROWS" in ''|*[!0-9]*|0|00*) SUPP_CHUNK_ROWS=2000 ;; esac
+case "$SUPP_EXPORT_ATTEMPTS" in ''|*[!0-9]*|0|00*) SUPP_EXPORT_ATTEMPTS=2 ;; esac
+case "$SUPP_EXPORT_RETRY_DELAY" in ''|*[!0-9]*) SUPP_EXPORT_RETRY_DELAY=3 ;; esac
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
 PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
@@ -1056,7 +1105,7 @@ if ! mkdir -p "$EXPORT_TMP_DIR"; then
     exit 1
 fi
 # vazio → nothing to sweep; falhou → warn and carry on (a leftover outside the archive costs disk, never a commit)
-if ! find "$EXPORT_TMP_DIR" -maxdepth 1 -type f -name 'issues.jsonl.tmp.*' -mmin +"$EXPORT_TMP_SWEEP_MIN" -delete; then
+if ! find "$EXPORT_TMP_DIR" -maxdepth 1 -type f -name '*.jsonl.tmp.*' -mmin +"$EXPORT_TMP_SWEEP_MIN" -delete; then
     echo "jsonl-export: could not sweep old scratch files in $EXPORT_TMP_DIR" >&2
 fi
 
@@ -1171,6 +1220,194 @@ unverified_commit_note() {
     fi
 }
 
+# The supplemental tables (comments, config, dependencies, labels, metadata) of a DB whose previous version was KEPT because this run could not read them whole
+# (ga-l6v576), as "db(comments,labels)" lines like FAILED_DBS. Filled by record_short_tables where the DB's export is staged; DB_SHORT_TABLES is the loop's own accumulator.
+PARTIAL_DBS=""
+DB_SHORT_TABLES=""
+
+# A DB with a kept table is reported as failed (the run did not export it whole) with the tables named, next to the verified issues that are still committed. Called where a DB's
+# export is staged, like record_unverified_db, so a DB discarded later in the loop is counted once.
+record_short_tables() {
+    if [ -n "$DB_SHORT_TABLES" ]; then
+        FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
+        FAILED_DBS="${FAILED_DBS}$DB($DB_SHORT_TABLES)
+"
+        PARTIAL_DBS="${PARTIAL_DBS}$DB($DB_SHORT_TABLES)
+"
+    fi
+}
+
+# " partial=wa(comments)" for an archive commit message (durable: the snapshot says which table kept its previous version); empty when every table was read whole.
+partial_commit_note() {
+    if [ -n "$PARTIAL_DBS" ]; then
+        printf ' partial=%s' "$(printf '%s' "$PARTIAL_DBS" | paste -sd, -)"
+    fi
+}
+
+# <db>.<table>'s own row count, unfiltered (ga-l6v576). vazio → never printed: an unreadable count is `return 1`, never a 0 that would read as "the table is empty".
+read_source_table_count() {
+    local db="$1" table="$2" output count
+
+    if ! output=$(dolt_sql -r csv -q "SELECT COUNT(*) AS row_count FROM \`$db\`.\`$table\`" 2>/dev/null); then
+        return 1
+    fi
+    count=$(printf '%s\n' "$output" | tail -n 1 | tr -d '\r')
+    case "$count" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$count"
+}
+
+# The ORDER BY list that pages <db>.<table> by its primary key, e.g. "`issue_id`, `label`"; prints an empty line when the table has no key.
+# vazio (no key) → the caller reads the table in ONE query, which the count check still gates; falhou/ilegível → return 1, and the caller does the same and says so.
+table_order_by() {
+    local db="$1" table="$2" output col list=""
+
+    if ! output=$(dolt_sql -r csv -q "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = '$db' AND TABLE_NAME = '$table' AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION" 2>/dev/null); then
+        return 1
+    fi
+    while IFS= read -r col; do
+        col=$(printf '%s' "$col" | tr -d '\r')
+        [ -n "$col" ] || continue
+        # A name that is not plain is never put into SQL.
+        case "$col" in *[!A-Za-z0-9_]*) return 1 ;; esac
+        list="${list:+$list, }\`$col\`"
+    done <<EOF
+$(printf '%s\n' "$output" | tail -n +2)
+EOF
+    printf '%s\n' "$list"
+}
+
+SUPP_RAW_ROWS=""
+
+# Reads <db>.<table> into the file <base> (ga-l6v576) and sets SUPP_RAW_ROWS to the rows that file holds (the sum of the pages' own counts: hq.comments is 363 MB, and a `jq -s`
+# over the joined file would hold all of it in memory). Scratch files are <base>.p<N> (the pages), <base>.rows and <base>.err (Dolt's stderr); the caller removes <base>.*.
+# One read that runs past ~40 s is cut by Dolt — a well-formed document, exit 0, "unexpected EOF" on stderr — so a table is read in pages of SUPP_CHUNK_ROWS rows ordered by its
+# primary key, each short enough to finish; a table with no key is read in one query. A single page is kept exactly as Dolt wrote it; several are joined in the same shape.
+# Return 0 → <base> holds a document; return 1 → the read failed (Dolt's exit code, or a page that is not a JSON document), Dolt's stderr is in the log, <base> is junk.
+# A page that comes back short ends the paging as if it were the last, so a cut page shows up as missing rows to the count check, not as a hang.
+read_table_pages() {
+    local db="$1" table="$2" order_by="$3" base="$4"
+    local offset=0 n=0 i rows query total=0
+
+    : > "$base.err"
+    SUPP_RAW_ROWS=""
+    while :; do
+        n=$((n + 1))
+        if [ -n "$order_by" ]; then
+            query="SELECT * FROM \`$db\`.\`$table\` ORDER BY $order_by LIMIT $SUPP_CHUNK_ROWS OFFSET $offset"
+        else
+            query="SELECT * FROM \`$db\`.\`$table\`"
+        fi
+        if ! dolt_sql -r json -q "$query" > "$base.p$n" 2>>"$base.err"; then
+            echo "jsonl-export: reading $db.$table failed (page $n; dolt exited non-zero): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
+            return 1
+        fi
+        # vazio (a 0-byte page) → an error, not a table with no rows: Dolt prints {} for that
+        if ! rows=$(jq -s -r 'if length == 0 then error("empty page") else ((.[0].rows // []) | length) end' "$base.p$n" 2>/dev/null); then
+            echo "jsonl-export: reading $db.$table returned an unreadable document (page $n): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
+            return 1
+        fi
+        total=$((total + rows))
+        if [ -z "$order_by" ] || [ "$rows" -lt "$SUPP_CHUNK_ROWS" ]; then
+            break
+        fi
+        if [ "$n" -ge "$SUPP_MAX_PAGES" ]; then
+            echo "jsonl-export: reading $db.$table needs more than $SUPP_MAX_PAGES pages of $SUPP_CHUNK_ROWS rows" >&2
+            return 1
+        fi
+        offset=$((offset + SUPP_CHUNK_ROWS))
+    done
+
+    if [ "$n" -eq 1 ]; then
+        mv -f "$base.p1" "$base" || return 1
+    else
+        : > "$base.rows"
+        i=1
+        while [ "$i" -le "$n" ]; do
+            jq -c '.rows[]?' "$base.p$i" >> "$base.rows" || return 1
+            i=$((i + 1))
+        done
+        # Dolt's own shape: {"rows": [row,row]}. The rows are one JSON line each, so the only newline paste leaves is its last.
+        { printf '{"rows": ['; paste -sd, - < "$base.rows" | tr -d '\n'; printf ']}\n'; } > "$base" || return 1
+    fi
+    SUPP_RAW_ROWS="$total"
+    return 0
+}
+
+# Puts the previous version of <db>/<table>.jsonl back in the working tree; a table with no previous version ends up with no file. Return 1 only when git cannot restore it.
+keep_previous_table() {
+    local db="$1" table="$2" path="$1/$2.jsonl"
+
+    if git -C "$ARCHIVE_REPO" cat-file -e "HEAD:$path" 2>/dev/null; then
+        git -C "$ARCHIVE_REPO" restore --source=HEAD --worktree -- "$path" >/dev/null 2>&1
+    else
+        rm -f "$ARCHIVE_REPO/$path"
+    fi
+}
+
+# Exports <db>.<table> into $DB_DIR/<table>.jsonl (ga-l6v576), checked against the table's own COUNT(*) read before and after the read. The export is built in the scratch dir
+# and moves into the archive only when it passes. Returns:
+#   0  whole: at least as many rows as the source has; it is now the file;
+#   3  the source count could not be read, so nobody can say: the export is the file, flagged unverified — not discarded, a store whose count query is down must not freeze its archive;
+#   1  not read whole in SUPP_EXPORT_ATTEMPTS tries (short, or the read failed): the file is NOT written and the previous version stays;
+#   2  the previous version could not be put back: the caller discards the DB.
+export_supplemental_table() {
+    local db="$1" table="$2"
+    local dest="$DB_DIR/$table.jsonl"
+    local base order_by before after verdict attempt=1 rc
+
+    # falhou (mktemp) → the table is not exported this run and its previous version stays
+    if ! base=$(mktemp "$EXPORT_TMP_DIR/$table.jsonl.tmp.XXXXXX"); then
+        echo "jsonl-export: cannot create the scratch file for $db.$table in $EXPORT_TMP_DIR" >&2
+        keep_previous_table "$db" "$table" || return 2
+        return 1
+    fi
+    # vazio (no key) / falhou (unreadable) → empty: one query, and the count check below still gates it
+    if ! order_by=$(table_order_by "$db" "$table"); then
+        echo "jsonl-export: primary key of $db.$table unreadable; reading the table in one query" >&2
+        order_by=""
+    fi
+    while :; do
+        # vazio → unreadable ("don't know", never 0): table_export_verdict reads it as the third state
+        before=$(read_source_table_count "$db" "$table" || true)
+        if read_table_pages "$db" "$table" "$order_by" "$base"; then
+            after=$(read_source_table_count "$db" "$table" || true)
+            verdict=$(table_export_verdict "$SUPP_RAW_ROWS" "$before" "$after")
+            case "$verdict" in
+                complete|unknown)
+                    if [ "$verdict" = unknown ]; then
+                        echo "jsonl-export: source count unavailable for $db.$table; export NOT verified against source (raw export: $SUPP_RAW_ROWS rows)" >&2
+                    fi
+                    rc=0
+                    [ "$verdict" = complete ] || rc=3
+                    if ! mv -f "$base" "$dest"; then
+                        rm -f "$base" "$base".*
+                        return 2
+                    fi
+                    rm -f "$base".*
+                    return "$rc"
+                    ;;
+                *)
+                    echo "jsonl-export: export curto de $db.$table: $SUPP_RAW_ROWS vs fonte ${before:-?}/${after:-?} (tentativa $attempt/$SUPP_EXPORT_ATTEMPTS): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
+                    ;;
+            esac
+        fi
+        if [ "$attempt" -ge "$SUPP_EXPORT_ATTEMPTS" ]; then
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep "$SUPP_EXPORT_RETRY_DELAY"
+    done
+
+    rm -f "$base" "$base".*
+    echo "jsonl-export: $db.$table fora do snapshot após $SUPP_EXPORT_ATTEMPTS tentativas, mantido o snapshot anterior" >&2
+    keep_previous_table "$db" "$table" || return 2
+    return 1
+}
+
 # Returns 0 to halt (growth spike, source unreadable, or a drop the source
 # confirms) and 1 when the drop is the EXPORT coming up short while the source
 # did not shrink. Return 1 does not mean the new file is a good snapshot — the
@@ -1219,6 +1456,7 @@ while IFS= read -r DB; do
     [ -z "$DB" ] && continue
     TOTAL_DBS=$((TOTAL_DBS + 1))
     DB_UNVERIFIED=0
+    DB_SHORT_TABLES=""
     if ! valid_database_identifier "$DB"; then
         FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
         FAILED_DBS="${FAILED_DBS}$DB
@@ -1273,10 +1511,38 @@ while IFS= read -r DB; do
     # is comparable with SOURCE_BEFORE (same SQL filter).
     RAW_EXPORT_COUNT=$(count_jsonl_rows < "$DB_DIR/issues.jsonl")
 
-    # Export supplemental tables (best-effort).
-    for TABLE in comments config dependencies labels metadata; do
-        dolt_sql -r json -q "SELECT * FROM \`$DB\`.\`$TABLE\`" > "$DB_DIR/$TABLE.jsonl" 2>/dev/null || true
+    # Export supplemental tables (ga-l6v576). Each one is read in pages and checked against its own COUNT(*), the way issues are above: a read that Dolt cut short is still a
+    # well-formed document with exit 0 (29 of 37 hq snapshots had comments.jsonl at a multiple of 128 rows). Per table:
+    #   whole       -> it is the file;
+    #   short/failed-> not written, the previous version stays, the DB is reported as failed with the table named (issues still commit);
+    #   unknown     -> the source count is unreadable: kept and flagged unverified, like issues;
+    #   unrestorable-> the DB is discarded like any other failed step.
+    SUPP_UNRESTORABLE=0
+    for TABLE in $SUPP_TABLES; do
+        SUPP_RC=0
+        export_supplemental_table "$DB" "$TABLE" || SUPP_RC=$?
+        case "$SUPP_RC" in
+            0)
+                ;;
+            3)
+                DB_UNVERIFIED=1
+                ;;
+            1)
+                DB_SHORT_TABLES="${DB_SHORT_TABLES:+$DB_SHORT_TABLES,}$TABLE"
+                ;;
+            *)
+                SUPP_UNRESTORABLE=1
+                break
+                ;;
+        esac
     done
+    if [ "$SUPP_UNRESTORABLE" -eq 1 ]; then
+        discard_failed_db_outputs "$DB"
+        FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
+        FAILED_DBS="${FAILED_DBS}$DB
+"
+        continue
+    fi
 
     # Step 2: Validate the exported JSON payload and optionally scrub it. Even
     # when SCRUB=false we still fail the DB on malformed JSON so corrupt live
@@ -1396,6 +1662,7 @@ while IFS= read -r DB; do
                 TOTAL_EXPORTED=$((TOTAL_EXPORTED + CURRENT_COUNT))
                 STAGE_PATHS+=("$DB" "$DB.jsonl")
                 record_unverified_db
+                record_short_tables
                 HALTED=1
                 HALT_DB="$DB"
                 HALT_PREV_COUNT="$PREV_COUNT"
@@ -1421,6 +1688,7 @@ while IFS= read -r DB; do
     TOTAL_EXPORTED=$((TOTAL_EXPORTED + CURRENT_COUNT))
     STAGE_PATHS+=("$DB" "$DB.jsonl")
     record_unverified_db
+    record_short_tables
 done <<EOF
 $DATABASES
 EOF
@@ -1444,7 +1712,7 @@ if [ "$HALTED" -eq 1 ]; then
     if ! git diff --cached --quiet 2>/dev/null; then
         EXPORTED_DBS=$((TOTAL_DBS - FAILED_DB_COUNT))
         commit_archive_snapshot \
-            "[HALT] backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED$(unverified_commit_note) (spike detected; push skipped)" \
+            "[HALT] backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED$(unverified_commit_note)$(partial_commit_note) (spike detected; push skipped)" \
             "HALT baseline" || {
             discard_staged_archive_outputs
             exit 1
@@ -1501,7 +1769,7 @@ fi
 
 EXPORTED_DBS=$((TOTAL_DBS - FAILED_DB_COUNT))
 commit_archive_snapshot \
-    "backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED$(unverified_commit_note)" \
+    "backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED$(unverified_commit_note)$(partial_commit_note)" \
     "archive snapshot" || {
     discard_staged_archive_outputs
     exit 1

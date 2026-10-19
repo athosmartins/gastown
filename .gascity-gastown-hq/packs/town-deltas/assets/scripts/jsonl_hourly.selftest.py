@@ -297,6 +297,122 @@ with tempfile.TemporaryDirectory(prefix="jhst.") as T:
                     "--head-sha", "b" * 40, "--key", "k", "--require", "hq,fantasma")
     check("manifest (CLI): banco obrigatório ausente => rc 1", rc == 1 and json.loads(so)["verdict"] == "broken", so)
 
+    # ── C3. queda brusca contra o snapshot anterior => suspect (ga-l6v576) ─────────────────────────────────────────
+    # 18/10: o export do hq cortou comments em 10.112 linhas (79 x 128) contra 35.132 do dia 17 e o manifest saiu `verdict: ok`. A queda não é
+    # perda: o export vinha truncado. O verdict agora olha o snapshot anterior (o apontado por latest.json).
+    print("-- C3. queda brusca contra o anterior => suspect")
+
+    def counts_of(base, **over):
+        """cópia de `base` (um inspect ou um manifest) com as contagens trocadas: over = {"hq": {"comments": 10112}}"""
+        d = json.loads(json.dumps(base))
+        for db_, tabs in over.items():
+            d["databases"].setdefault(db_, {}).update(tabs)
+        return d
+
+    def mf(prev, ins=None, **kw):
+        """build_manifest com o anterior; um TypeError (parâmetro que ainda não existe) vira FAIL do teste, não queda da suíte"""
+        try:
+            return jh.build_manifest(ins if ins is not None else insp, built, meta, ["hq", "wa"], prev=prev, **kw)
+        except Exception as e:  # noqa: BLE001
+            return {"verdict": "erro: %r" % e, "problems": [], "suspect": [], "baseline": {}}
+
+    prev_ok = counts_of(m, hq={"issues": 4000, "comments": 35132, "dependencies": 9000, "labels": 3000, "config": 12, "metadata": 4},
+                        wa={"issues": 300, "comments": 500, "dependencies": 100, "labels": 40, "config": 5, "metadata": 2})
+    cur_ins = counts_of(insp, hq={"issues": 4010, "comments": 35140, "dependencies": 9005, "labels": 3002, "config": 12, "metadata": 4},
+                        wa={"issues": 300, "comments": 500, "dependencies": 100, "labels": 40, "config": 5, "metadata": 2})
+    mg = mf(prev_ok, cur_ins)
+    check("suspect: tudo igual ou crescendo => ok, baseline compared", mg["verdict"] == "ok" and not mg.get("suspect")
+          and mg.get("baseline", {}).get("state") == "compared", json.dumps([mg["verdict"], mg.get("suspect"), mg.get("baseline")]))
+    trunc = counts_of(cur_ins, hq={"comments": 10112})
+    mt = mf(prev_ok, trunc)
+    check("suspect: hq/comments 35.132 -> 10.112 (o caso de 18/10) => suspect, NÃO ok", mt["verdict"] == "suspect", mt["verdict"])
+    check("suspect: o motivo NOMEIA banco, tabela e os dois números; `problems` (o que é broken) continua vazio",
+          any("hq/comments" in s and "35132" in s and "10112" in s for s in mt.get("suspect", [])) and not mt["problems"], json.dumps(mt.get("suspect")))
+    check("suspect: só a tabela que caiu é nomeada", len(mt.get("suspect", [])) == 1, json.dumps(mt.get("suspect")))
+    exact = counts_of(cur_ins, hq={"comments": 28106})   # 35132 * 80% = 28105,6: 28106 é uma queda de 19,99% (limite: > 20%)
+    over_ = counts_of(cur_ins, hq={"comments": 28105})   # 20,0006%
+    check("suspect: no limite (queda de 19,99%) => ok; um a menos (queda > 20%) => suspect",
+          mf(prev_ok, exact)["verdict"] == "ok" and mf(prev_ok, over_)["verdict"] == "suspect")
+    tiny_prev = counts_of(prev_ok, wa={"labels": 99})
+    check("suspect: tabela pequena no anterior (< 100 linhas) oscila à vontade: 99 -> 0 => ok; 100 -> 0 => suspect",
+          mf(tiny_prev, counts_of(cur_ins, wa={"labels": 0}))["verdict"] == "ok"
+          and mf(counts_of(prev_ok, wa={"labels": 100}), counts_of(cur_ins, wa={"labels": 0}))["verdict"] == "suspect")
+    # filhos somem junto com o pai: se `issues` do mesmo banco caiu tanto quanto, a queda das outras tabelas tem explicação (uma purga)
+    purge = counts_of(cur_ins, hq={"issues": 1500, "comments": 9000, "dependencies": 3000, "labels": 1000})
+    mp = mf(prev_ok, purge)
+    check("suspect: issues caiu junto (purga) => os filhos que caíram têm explicação, mas o `issues` em si segue suspect (ninguém o explica)",
+          mp["verdict"] == "suspect" and len(mp.get("suspect", [])) == 1 and "hq/issues" in mp["suspect"][0], json.dumps(mp.get("suspect")))
+    kids_only = counts_of(cur_ins, hq={"comments": 100, "labels": 5})
+    check("suspect: comments E labels caindo com issues estável => as duas tabelas são nomeadas",
+          len(mf(prev_ok, kids_only).get("suspect", [])) == 2)
+    no_hq = json.loads(json.dumps(prev_ok))
+    del no_hq["databases"]["hq"]
+    no_cm = json.loads(json.dumps(prev_ok))
+    del no_cm["databases"]["hq"]["comments"]
+    check("suspect: banco novo (sem anterior), tabela sem anterior e anterior ilegível NÃO entram na conta (não sei != caiu)",
+          mf(no_hq, trunc)["verdict"] == "ok" and mf(no_cm, trunc)["verdict"] == "ok"
+          and mf({"verdict": "ok", "databases": {"zz": {"issues": 10}}}, trunc)["verdict"] == "ok"
+          and mf({"verdict": "ok", "databases": {"hq": {"comments": "abc", "issues": None}}}, trunc)["verdict"] == "ok")
+    check("baseline: sem anterior (1º run) => ok, state none; nada de suspect", mf(None)["verdict"] == "ok" and mf(None)["baseline"].get("state") == "none")
+    mu = mf(None, baseline_unavailable="S3 não respondeu")
+    check("baseline: anterior que não deu para ler => ok MAS dito no manifest (state unavailable + motivo), nunca calado",
+          mu["verdict"] == "ok" and mu["baseline"].get("state") == "unavailable" and "S3 não respondeu" in mu["baseline"].get("why", ""), json.dumps(mu.get("baseline")))
+    check("baseline: anterior fora da forma (sem `databases`) => unavailable, nunca compared",
+          mf({"verdict": "ok"})["baseline"].get("state") == "unavailable" and mf([1, 2])["baseline"].get("state") == "unavailable")
+    prev_broken = json.loads(json.dumps(prev_ok))
+    prev_broken["verdict"] = "broken"
+    check("baseline: o anterior declarado broken/suspect não serve de régua => unavailable",
+          mf(prev_broken)["baseline"].get("state") == "unavailable")
+    miss_wa = json.loads(json.dumps(insp))
+    del miss_wa["databases"]["wa"]
+    miss_wa["files"] = [f for f in miss_wa["files"] if not f["path"].startswith("wa/")]
+    try:
+        mbk = jh.build_manifest(miss_wa, built, meta, ["hq", "wa"], prev=prev_ok)["verdict"]
+    except Exception as e:  # noqa: BLE001
+        mbk = "erro: %r" % e
+    check("broken vence suspect: banco obrigatório ausente E queda brusca => broken", mbk == "broken", mbk)
+    check("limiar por parâmetro: com --suspect-drop-pct 90 a queda de 71% passa", mf(prev_ok, trunc, suspect_drop_pct=90)["verdict"] == "ok")
+    check("limiar por parâmetro: piso de linhas 100000 deixa tudo passar", mf(prev_ok, trunc, suspect_min_rows=100000)["verdict"] == "ok")
+    ma = mf(prev_ok, trunc, accept_drop=True)
+    check("accept_drop: verdict ok, mas o manifest guarda o que foi aceito (`suspect` e baseline.accepted)",
+          ma["verdict"] == "ok" and len(ma.get("suspect", [])) == 1 and ma["baseline"].get("accepted") is True, json.dumps([ma["verdict"], ma.get("suspect"), ma["baseline"]]))
+    check("constantes: o limiar e o piso estão no módulo (20% e 100 linhas)", getattr(jh, "SUSPECT_DROP_PCT", None) == 20 and getattr(jh, "SUSPECT_MIN_PREV_ROWS", None) == 100)
+
+    def jget(so, *path):
+        """campo de uma saída JSON do CLI; saída que não é JSON (uso, traceback) lê como None e o check reprova"""
+        try:
+            d = json.loads(so)
+            for k in path:
+                d = d[k]
+            return d
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    # CLI: --previous / --baseline-unavailable / --suspect-* / --accept-drop
+    cur_f, prev_f, prev_bad_f = os.path.join(T, "ci.json"), os.path.join(T, "pm.json"), os.path.join(T, "pbad.json")
+    json.dump(trunc, open(cur_f, "w"))
+    json.dump(prev_ok, open(prev_f, "w"))
+    open(prev_bad_f, "w").write("{não é json")
+    cli = ["manifest", "--inspect", cur_f, "--built", bu_f, "--captured-epoch", "1000300", "--head-epoch", "1000000", "--head-sha", "b" * 40, "--key", "k", "--require", "hq,wa"]
+    rc, so, se = run(*cli, "--previous", prev_f)
+    check("manifest (CLI): --previous com queda brusca => rc 1 e verdict suspect", rc == 1 and jget(so, "verdict") == "suspect", "%s %s %s" % (rc, so[:200], se[:200]))
+    rc, so, _ = run(*cli)
+    check("manifest (CLI): sem --previous => rc 0, state none", rc == 0 and jget(so, "baseline", "state") == "none", so[:200])
+    rc, so, _ = run(*cli, "--previous", prev_bad_f)
+    check("manifest (CLI): --previous ilegível => rc 0 mas baseline unavailable (o comparador não derruba o manifest)",
+          rc == 0 and jget(so, "baseline", "state") == "unavailable", so[:300])
+    rc, so, _ = run(*cli, "--previous", os.path.join(T, "nao-existe.json"))
+    check("manifest (CLI): --previous apontando para arquivo que não existe => unavailable", rc == 0 and jget(so, "baseline", "state") == "unavailable", so[:300])
+    rc, so, _ = run(*cli, "--baseline-unavailable", "latest.json ilegível")
+    check("manifest (CLI): --baseline-unavailable MOTIVO => unavailable com o motivo",
+          rc == 0 and jget(so, "baseline") == {"state": "unavailable", "why": "latest.json ilegível"}, so[:300])
+    rc, so, _ = run(*cli, "--previous", prev_f, "--suspect-drop-pct", "90")
+    check("manifest (CLI): --suspect-drop-pct 90 => rc 0", rc == 0 and jget(so, "verdict") == "ok", so[:200])
+    rc, so, _ = run(*cli, "--previous", prev_f, "--accept-drop")
+    check("manifest (CLI): --accept-drop => rc 0, suspect guardado", rc == 0 and jget(so, "verdict") == "ok" and jget(so, "suspect"), so[:300])
+    rc, so, _ = run(*cli, "--previous", prev_f, "--suspect-drop-pct", "0")
+    check("manifest (CLI): --suspect-drop-pct 0 é recusado (rc 2): queda de 0% nunca é limiar", rc == 2, "%s %s" % (rc, so[:100]))
+
     # ── C2. bancos ignorados (o 1º upload real reprovou por causa de bench_hq_copy: config/metadata com 0 bytes) ──
     print("-- C2. bancos ignorados por padrão de nome")
     junk_members = (db_members("hq", [{"id": "hq-1"}, {"id": "hq-2"}]) + db_members("wa", [{"id": "wa-1"}])

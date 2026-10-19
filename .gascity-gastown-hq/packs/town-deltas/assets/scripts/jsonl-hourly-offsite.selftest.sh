@@ -251,6 +251,49 @@ printf '%s' "$(tbl wa-1)" > "$ARCH/wa/issues.jsonl"; commit_all "wa ok"
 NOW_OFF=3600; offsite
 eq "arquivo consertado: rc 0, latest.json avança, contador zera" "$RC:$(jqf .consecutive_not_ok "$ST"):$([ "$(jqf .snapshot_key "$LJ")" != "$GOOD_LATEST" ] && echo moved)" "0:0:moved"
 
+echo "-- 6b. queda brusca de uma tabela contra o snapshot anterior => suspect, nada sobe (ga-l6v576)"; new_env susp
+write_comments() { # db n — n comentários (a tabela que o export do hq cortou em 18/10)
+  python3 -I -c 'import json,sys;print(json.dumps({"rows":[{"id":"c%d" % i,"issue_id":"x-1","comment":"t"} for i in range(int(sys.argv[1]))]}),end="")' "$2" > "$ARCH/$1/comments.jsonl"
+}
+MANOF() { echo "$S/bucket/obj/${1%.tar.gz}.manifest.json"; }
+write_comments hq 400; commit_all "hq com 400 comentários"
+NOW_OFF=0; offsite
+eq "1º run (não há anterior): rc 0, ok new, baseline none" "$RC:${OUT%% key=*}:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:RESULT: ok new:none"
+GOOD_A="$(jqf .snapshot_key "$(LATEST)")"; PUTS_BEFORE="$(putlog | wc -l | tr -d ' ')"
+write_comments hq 128; commit_all "comments cortado em 128 (400 -> 128, -68%)"
+NOW_OFF=700; offsite
+eq "comments 400 -> 128: rc 1, RESULT: fail dizendo suspect, e NADA sobe (nenhum put novo)" "$RC:${OUT:0:12}:$(printf '%s' "$OUT" | grep -c 'suspect'):$(putlog | wc -l | tr -d ' ')" "1:RESULT: fail:1:$PUTS_BEFORE"
+eq "latest.json NÃO andou" "$(jqf .snapshot_key "$(LATEST)")" "$GOOD_A"
+grep -q 'suspeito: hq/comments: 400 -> 128' "$S/log/offsite.log" && ok "o log nomeia banco, tabela e os dois números" || bad "log sem 'suspeito: hq/comments: 400 -> 128': $(tail -4 "$S/log/offsite.log")"
+eq "estado: consecutive_not_ok 1 (um snapshot suspect conta como run sem snapshot novo)" "$(jqf .consecutive_not_ok "$ST")" 1
+write_comments hq 410; commit_all "comments voltou (410 >= 400)"
+NOW_OFF=1400; offsite
+eq "tabela de volta: rc 0, ok new, e o manifest diz que foi comparado contra o anterior bom" "$RC:${OUT%% key=*}:$(jqf '[.verdict, .baseline.state, .baseline.key] | join(",")' "$(MANOF "$(ARTKEY)")")" "0:RESULT: ok new:ok,compared,$GOOD_A"
+GOOD_B="$(jqf .snapshot_key "$(LATEST)")"
+write_comments hq 128; commit_all "purga de verdade (410 -> 128)"
+NOW_OFF=2100; JHO_SUSPECT_DROP_PCT=90 offsite
+eq "JHO_SUSPECT_DROP_PCT=90: a mesma queda de 69% passa (o limiar é do operador)" "$RC:${OUT%% key=*}" "0:RESULT: ok new"
+write_comments hq 400; commit_all "hq 400 de novo"; NOW_OFF=2800; offsite
+write_comments hq 100; commit_all "queda deliberada (400 -> 100)"
+NOW_OFF=3500; offsite
+eq "queda deliberada sem aceite: rc 1 suspect" "$RC:${OUT:0:12}" "1:RESULT: fail"
+NOW_OFF=4200; JHO_ACCEPT_DROP=1 offsite
+eq "JHO_ACCEPT_DROP=1 (um run, decisão de quem opera): rc 0, ok new, latest.json avança" "$RC:${OUT%% key=*}:$([ "$(jqf .snapshot_key "$(LATEST)")" = "$(ARTKEY)" ] && echo moved)" "0:RESULT: ok new:moved"
+eq "e o manifest guarda o que foi aceito (verdict ok, suspect nomeia hq/comments, baseline.accepted)" "$(jqf '[.verdict, (.suspect | length), .baseline.accepted] | join(",")' "$(MANOF "$(ARTKEY)")")" "ok,1,true"
+write_comments hq 101; commit_all "segue baixo"; NOW_OFF=4900; offsite
+eq "depois do aceite o anterior é o novo piso: o run seguinte (100 -> 101) é ok sem a variável" "$RC:${OUT%% key=*}" "0:RESULT: ok new"
+write_comments hq 50; commit_all "queda de 50%"
+NOW_OFF=5600; inject fail_get "snap/"
+offsite
+eq "manifest anterior que o S3 não devolveu: NÃO trava o RPO (rc 0, ok new) mas o manifest diz baseline unavailable" "$RC:${OUT%% key=*}:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:RESULT: ok new:unavailable"
+grep -q 'AVISO: sem régua' "$S/log/offsite.log" && ok "e o log avisa que a comparação não foi feita" || bad "log sem o aviso de régua ausente"
+clear_inject fail_get
+write_comments hq 20; commit_all "mais uma queda"
+NOW_OFF=6300; inject fail_get "latest.json"
+offsite
+eq "latest.json que existe mas o S3 não devolve: baseline unavailable, não 'sem anterior' (none é só do 1º run)" "$RC:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:unavailable"
+clear_inject fail_get
+
 echo "-- 7. banco obrigatório ausente"; new_env nodb; REQ="hq,wa,fantasma"
 NOW_OFF=0; offsite
 eq "rc 1, latest.json não criado, nada subiu: bucket vazio, nenhum put" "$RC:$([ -e "$(LATEST)" ] && echo has || echo none):$(objs | wc -l | tr -d ' '):$(putlog | wc -l | tr -d ' ')" "1:none:0:0"

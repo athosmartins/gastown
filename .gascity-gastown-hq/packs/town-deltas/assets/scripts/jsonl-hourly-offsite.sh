@@ -21,10 +21,17 @@
 #     ignorado) sem alguma das 6 tabelas ou banco obrigatório ausente => "broken": NADA sobe (75 MB/h de snapshot inutilizável é custo e ocuparia o piso da
 #     retenção), latest.json NÃO anda, os problemas vão para o log e o run sai 1. Um banco REAL quebrado também veta (fail-closed): o acoplamento é o preço de
 #     nunca anunciar como "latest" um snapshot que não restaura.
+#   - queda brusca (ga-l6v576): legível não é completo — um export cortado é um documento bem formado (18/10: hq/comments com 10.112 linhas contra 35.132 do dia
+#     17, manifest "ok"). O manifest é comparado com o do snapshot que latest.json aponta: tabela com >= 100 linhas no anterior que perdeu mais de 20% (e, se for
+#     filha, sem queda de `issues` no mesmo banco que a explique) => "suspect": trata-se como broken (nada sobe, latest.json não anda, conta para o alerta) e o log
+#     nomeia banco, tabela e os dois números. Queda de verdade (purga): UM run com JHO_ACCEPT_DROP=1 sobe o snapshot, o manifest guarda o que foi aceito e o
+#     seguinte já compara com ele. Limiares: JHO_SUSPECT_DROP_PCT (20) e JHO_SUSPECT_MIN_ROWS (100). Sem anterior (1º run) o manifest diz baseline `none`; com latest.json
+#     ou manifest anterior que o S3 não devolveu diz `unavailable` e o log avisa "sem régua" — o snapshot sobe mesmo assim (travar o upload por uma checagem secundária
+#     pararia o RPO). NÃO garante: a defesa primária é o gate de contagem por tabela do jsonl-export.sh; uma purga real que coincida com um corte de filhos fica escondida.
 #   - RPO real = intervalo entre runs do exporter + 60 min + duração do run: típico ~1h35, pior medido ~4h15 (runbook). `data_as_of` é quando o dado MUDOU (cidade ociosa o envelhece).
 #
 # ESTADOS (três, e o neutro é inerte): rc 0 = snapshot novo verificado, ou HEAD igual ao último verificado, objeto ainda no S3 e exporter vivo (só atualiza `checked_at`) ·
-#   rc 1 = falhou, ficou "broken" ou FONTE PARADA: o exporter não reescreve os bancos obrigatórios (mtime de <db>/issues.jsonl) há mais de JHO_STALE_SOURCE_S (6 h), ou escreve e não
+#   rc 1 = falhou, ficou "broken" ou "suspect" (queda brusca) ou FONTE PARADA: o exporter não reescreve os bancos obrigatórios (mtime de <db>/issues.jsonl) há mais de JHO_STALE_SOURCE_S (6 h), ou escreve e não
 #   comita (árvore adiante de um HEAD com mais de 6 h), ou isso não foi lido => conta para o alerta e, num run de HEAD igual, não bate o ponto (`checked_at` fica, o --status vira STALE); HEAD novo
 #   ainda sobe e move latest.json (um `checked_at` novo, uma vez), sem zerar a contagem. HEAD velho com a árvore igual NÃO é fonte parada: o exporter só comita quando o dado muda (7 intervalos > 6 h em 12 dias, até 10 h 22, com ele rodando) ·
 #   rc 2 = não deu para avaliar (sem aws/git/python3/jq, archive ilegível, pouco disco, estado ou lock sem como criar/gravar): nada foi tentado e conta como run sem snapshot ·
@@ -297,8 +304,31 @@ nice -n 15 "$TIMEOUT_BIN" "$BUILD_TIMEOUT" python3 -I "$PY" inspect "$WD/snap.ta
 irc=$?
 [ -s "$WD/inspect.json" ] || fail "inspect não produziu saída (rc=$irc): $(tail -c 300 "$WD/inspect.err" | tr '\n' ' ')"
 ART="$(s3key_artifact "$STEM")"
+# ── régua (ga-l6v576): o manifest do último snapshot que passou em tudo = latest.json -> manifest_key ─────────────────────────────────────
+# Três estados, e nenhum vira "sem queda" em silêncio: sem latest.json no S3 (404) = 1º run, `none`; latest.json que existe e não consegui ler, ou o
+# manifest que ele aponta, = `unavailable` (o manifest guarda o motivo e o log avisa); lido = `compared`. Sem régua o snapshot sobe igual: um
+# comparador que travasse o upload pararia o RPO de 1 h por causa de uma checagem secundária (a primária é o gate de contagem do jsonl-export.sh).
+BASE_WHY=""
+s3_head "$(s3key_latest)" >/dev/null 2>&1; lrc=$?
+if [ $lrc -eq 2 ]; then BASE_WHY="S3 não respondeu ao head-object de latest.json"
+elif [ $lrc -eq 0 ]; then
+  if ! s3api get-object --bucket "$BUCKET" --key "$(s3key_latest)" "$WD/prev.latest.json" >/dev/null 2>&1; then BASE_WHY="latest.json existe e o S3 não o devolveu"
+  else
+    PREV_MKEY="$(jq -r '.manifest_key // empty' "$WD/prev.latest.json" 2>/dev/null)"
+    if [ -z "$PREV_MKEY" ]; then BASE_WHY="latest.json sem manifest_key"
+    elif ! s3api get-object --bucket "$BUCKET" --key "$PREV_MKEY" "$WD/prev.manifest.json" >/dev/null 2>&1; then BASE_WHY="o S3 não devolveu o manifest anterior ($PREV_MKEY)"
+    fi
+  fi
+fi
+BASE_FLAG=""; BASE_VAL=""
+if [ -n "$BASE_WHY" ]; then BASE_FLAG=--baseline-unavailable; BASE_VAL="$BASE_WHY"; log "AVISO: sem régua: $BASE_WHY; a queda brusca de tabela NÃO foi checada neste snapshot"
+elif [ -s "$WD/prev.manifest.json" ]; then BASE_FLAG=--previous; BASE_VAL="$WD/prev.manifest.json"
+fi
+ACCEPT_FLAG=""; [ "${JHO_ACCEPT_DROP:-0}" = 1 ] && { ACCEPT_FLAG=--accept-drop; log "JHO_ACCEPT_DROP=1: queda brusca aceita por quem opera, só neste run"; }
 python3 -I "$PY" manifest --inspect "$WD/inspect.json" --built "$WD/files.json" --captured-epoch "$(now_epoch)" --head-epoch "$HEAD_EPOCH" \
-  --head-sha "$SHA" --key "$ART" --require "$REQUIRED_DBS" > "$WD/manifest.json" 2> "$WD/manifest.err"
+  --head-sha "$SHA" --key "$ART" --require "$REQUIRED_DBS" ${BASE_FLAG:+"$BASE_FLAG" "$BASE_VAL"} ${ACCEPT_FLAG:+"$ACCEPT_FLAG"} \
+  ${JHO_SUSPECT_DROP_PCT:+--suspect-drop-pct "$JHO_SUSPECT_DROP_PCT"} ${JHO_SUSPECT_MIN_ROWS:+--suspect-min-rows "$JHO_SUSPECT_MIN_ROWS"} \
+  > "$WD/manifest.json" 2> "$WD/manifest.err"
 mrc=$?
 [ -s "$WD/manifest.json" ] || fail "manifest não gerado: $(tail -c 300 "$WD/manifest.err" | tr '\n' ' ')"
 VERDICT="$(jq -r '.verdict' "$WD/manifest.json")"
@@ -308,6 +338,12 @@ sizes_match "$ART_BYTES" "$(wc -c < "$WD/snap.tar.gz" | tr -d ' ')" || fail "byt
 # retenção no lugar de um bom. Os problemas inteiros vão para o log (o alerta leva o começo); a próxima hora tenta de novo com o HEAD seguinte.
 if [ "$VERDICT" != ok ] || [ $mrc -ne 0 ]; then
   jq -r '.problems[]' "$WD/manifest.json" 2>/dev/null | while IFS= read -r pb; do log "problema: $pb"; done
+  jq -r '.suspect[]?' "$WD/manifest.json" 2>/dev/null | while IFS= read -r sp; do log "suspeito: $sp"; done
+  # suspect = legível, mas uma tabela caiu contra o anterior sem explicação (em 18/10 o hq/comments saiu com 71% a menos e o manifest dizia ok): é o mesmo
+  # veto do broken — NADA sobe, latest.json fica no último bom, conta para o alerta. Se a queda é de verdade (purga), quem opera roda UMA vez com JHO_ACCEPT_DROP=1.
+  if [ "$VERDICT" = suspect ]; then
+    fail "snapshot $STEM suspect ($(jq -r '.suspect | join("; ")' "$WD/manifest.json" | head -c 400)); NADA subiu, latest.json não andou; queda de verdade (purga)? rode uma vez com JHO_ACCEPT_DROP=1"
+  fi
   fail "snapshot $STEM broken ($(jq -r '.problems | join("; ")' "$WD/manifest.json" | head -c 400)); NADA subiu, latest.json não andou"
 fi
 
@@ -327,7 +363,7 @@ ZERO='.consecutive_not_ok = 0 | '; [ -z "$SRC_WHY" ] || ZERO=""   # fonte parada
 state_update "$ZERO"'.attempt_open = false | .last_success_at = $t | .last_success_sha = $s | .last_success_key = $k | .last_success_bytes = $b | .last_success_data_as_of = $a' \
   --arg t "$(iso_now)" --arg s "$SHA" --arg k "$ART" --argjson b "$ART_BYTES" --arg a "$(jq -r '.data_as_of' "$WD/manifest.json")" || log "AVISO: estado não gravado"
 DUR=$(( $(now_epoch) - START ))
-log "OK $STEM: $ART_BYTES bytes, $(jq -r '[.databases | to_entries[] | .value.issues] | add' "$WD/manifest.json") issues em $(jq -r '.databases | length' "$WD/manifest.json") bancos (ignorados: $(jq -r '.ignored_dbs | join(",") | if . == "" then "nenhum" else . end' "$WD/manifest.json")), ${DUR}s"
+log "OK $STEM: $ART_BYTES bytes, $(jq -r '[.databases | to_entries[] | .value.issues] | add' "$WD/manifest.json") issues em $(jq -r '.databases | length' "$WD/manifest.json") bancos (ignorados: $(jq -r '.ignored_dbs | join(",") | if . == "" then "nenhum" else . end' "$WD/manifest.json")), régua: $(jq -r '.baseline.state' "$WD/manifest.json"), ${DUR}s"
 
 # ── retenção (falha aqui é aviso: o snapshot novo já está seguro) ────────────────────────────────────
 # listagem que falhou OU veio ilegível => pula (nunca vira "0 chaves"); helper que falhou => pula, e não lê o delete.txt parcial dele.
