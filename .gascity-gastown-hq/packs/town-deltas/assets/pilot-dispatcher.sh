@@ -5471,6 +5471,9 @@ fi
 # above. No push per sweep: a sweep runs every few minutes and the alarm already belongs to
 # dolt-disk-floor-guard.sh (WARN/CRITICAL with its own cooldowns); this gate only holds the door.
 # `|| rc=$?`: the reader answers 1 for "no pause", and the dispatcher runs under set -e.
+# ga-2hd02v.1.20: _PILOT_NODE_ONLY=1 is the NODE-ONLY pass. Only this gate sets it (a CONFIRMED low disk + PILOT_NODE_FIRST=on, outside DRY_RUN); dispatch_lane, dispatch_one, the pool top-up,
+# the pause-clearing below and the Step 5 stall streak read it. Always 0 otherwise.
+_PILOT_NODE_ONLY=0
 _disk_floor_rc=0
 _pilot_disk_floor || _disk_floor_rc=$?
 # What the environment did to the gate (an off-spelling kept ON, DISK_HEADROOM_ENABLED=0, a floor other than 5120) is said BEFORE the
@@ -5478,7 +5481,14 @@ _pilot_disk_floor || _disk_floor_rc=$?
 if [ -n "$PILOT_DISK_FLOOR_NOTE" ]; then
   warn "Disk floor gate bent by the environment — ${PILOT_DISK_FLOOR_NOTE} (never in production; ga-nyug12)."
 fi
-if [ "$_disk_floor_rc" -eq 0 ]; then
+if [ "$_disk_floor_rc" -eq 0 ] && [ "${PILOT_NODE_FIRST:-off}" = "on" ] && [ "${DRY_RUN:-0}" != "1" ]; then
+  # ga-2hd02v.1.20 — vazio/falhou/ilegível: PILOT_NODE_FIRST vazio, com valor que não existe ou ilegível não é `on` → a pausa de sempre, logo abaixo; DRY_RUN (a passada consulta o nó e grava estado) → idem.
+  # O disco baixo é o do MINI: o worktree e o build do nó não o gastam. A varredura segue SÓ para o que vai ao nó; cota e RAM já saíram acima, drain e quiet hours saem abaixo e pausam tudo.
+  _PILOT_NODE_ONLY=1
+  warn "Disk floor (${PILOT_DISK_FLOOR_DETAIL}) — the MINI is paused (no builder, no pool top-up, no claim of a bead that is not going to the node), but PILOT_NODE_FIRST=on: this sweep still runs the NODE-ONLY pass (ga-2hd02v.1.20)."
+  _pilot_write_sweep_pause_state 1 "disk-floor" "Disk floor: ${PILOT_DISK_FLOOR_DETAIL}"
+  log "Disk floor: passada só-nó — só bead de dog do HQ com veredito node e vaga vai adiante; nada vai ao mini (ga-2hd02v.1.20)."
+elif [ "$_disk_floor_rc" -eq 0 ]; then
   warn "Disk floor (${PILOT_DISK_FLOOR_DETAIL}) — PAUSING all dispatch this sweep: a new builder on a disk this low is what filled it on 17/10 and took Dolt down (ENOSPC on the hq journal). Stories stay queued; dispatch resumes on its own once a later sweep reads the disk above the floor (ga-vln2py)."
   _pilot_write_sweep_pause_state 1 "disk-floor" "Disk floor: ${PILOT_DISK_FLOOR_DETAIL}"
   # The reason text inside the parens stays CONSTANT on purpose: approved-state-reconciler.py files an unknown
@@ -5587,7 +5597,10 @@ fi
 # sweep ago) cannot outlive its own TTL window in the reconciler's read and
 # suppress an alarm that is, right now, genuinely unexplained. Best-effort/
 # fail-open like every other call to this helper.
-_pilot_write_sweep_pause_state 0 "" ""
+# ga-2hd02v.1.20: the NODE-ONLY pass is still a paused sweep for the mini — keep the "disk-floor" pause the gate wrote instead of reporting "no pause" with the disk still low.
+if [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then
+  _pilot_write_sweep_pause_state 0 "" ""
+fi
 
 # ── Step 0: TTL recovery — release stale pilot:dispatching claims (ga-2azzj) ───
 # A pilot:dispatching label means a dispatch is (or was) in progress. We may only
@@ -10614,8 +10627,13 @@ _TOPUP_RIG_PATHS=$(printf '%s' "$_TOPUP_RIG_PATHS_JSON" | jq -r '.rigs[] | selec
 # ga-5fn5p3: who waits for capacity — asked ONCE, here, so the top-up below and the dispatch lanes later read the same answer.
 _pilot_priority_waiting_scan
 _pilot_heal_hq_blind_routes
-_pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
-_pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
+# ga-2hd02v.1.20: the NODE-ONLY pass (disk floor) opens no pool session — a wa-worker/ps-worker session runs on the MINI, whose disk is what the pause protects.
+if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
+  log "ga-2hd02v.1.20: passada só-nó do disk floor — sem pool top-up (abrir sessão de wa-worker/ps-worker gasta o disco do mini)."
+else
+  _pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"
+  _pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"
+fi
 
 if [ "$SMALL_SLOTS" -eq "0" ] && [ "$BIG_SLOTS" -eq "0" ]; then
   # ga-8c1 AC5: even when backing off, surface the dispatch-queue depth so every
@@ -11797,6 +11815,30 @@ _pilot_priority_node_exempt_pre() {
   _labels=$(printf '%s' "$_b" | jq -r '(.labels // []) | join(",")' 2>/dev/null) || return 1
   case "$_routed" in wa-worker|wa-worker-*|ps-worker|ps-worker-*) return 1 ;; esac
   _pilot_priority_node_exempt "$_id" "gastown.dog" "0" "$_labels"
+}
+
+# ── ga-2hd02v.1.20: a pausa por DISK FLOOR protege o disco do MINI; despachar ao nó não gasta disco do mini ──────────────────────────────────────────────────────────────────────────────────────────────
+# O Pilot pausava a varredura inteira por disk floor (33 de 53 varreduras em 19/10; o disco do mini oscila 3–6 GB por swap) e o nó ficava ocioso. Com PILOT_NODE_FIRST=on a varredura pausada por disk floor
+# faz a PASSADA SÓ-NÓ (_PILOT_NODE_ONLY=1, ligada no gate do disk floor): só bead de dog do HQ com veredito node e vaga vai adiante, e nada vai ao mini. Cota 5h e pressão de RAM ficam ANTES do gate (já
+# saíram); drain e quiet hours ficam DEPOIS e continuam pausando tudo. Fora do `on`, e no DRY_RUN, o gate pausa e sai como sempre. A pausa existe para NÃO escrever no disco que está baixo (17/10: ENOSPC no
+# journal do HQ): por isso a passada só-nó não faz claim+soltura de bead que não vai ao nó (ela é pulada ANTES da claim, sem escrita: _pilot_node_only_candidate_pre), não abre top-up de pool no mini e não
+# conta no streak de estagnação do Step 5. Em dúvida, pula: o estado inerte é "não despacha".
+
+# _pilot_node_only_candidate_pre <bead-json> — exit 0 iff a bead é, ANTES da claim, candidata do nó na passada só-nó: presa a gastown.dog (rota ou rig→dog, via _pilot_priority_pool_bound_pre) ou ainda sem
+# rota e sem story.rig com id do HQ (`ga-*`; o dispatch_one infere o rig gascity pelo prefixo, e outro prefixo é de outro store), e _pilot_priority_node_exempt_pre diz sim (veredito node com vaga, sem
+# veto, nunca wa-worker/ps-worker). 1 em tudo o mais, inclusive JSON que não se lê. A cidade e o alvo exatos são conferidos de novo depois da claim, no dispatch_one.
+_pilot_node_only_candidate_pre() {
+  local _b="${1:-}" _id _rig
+  # vazio (bead sem id) → não é candidata; falhou/ilegível (JSON que o jq não lê) → também não: nada é escrito
+  _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || return 1
+  [ -n "$_id" ] || return 1
+  # vazio (sem story.rig) → vale o prefixo do id logo abaixo; falhou/ilegível → não é candidata
+  _rig=$(printf '%s' "$_b" | jq -r '.metadata["story.rig"] // ""' 2>/dev/null) || return 1
+  if ! _pilot_priority_pool_bound_pre "$_b"; then
+    { [ -z "$_rig" ] || [ "$_rig" = "null" ]; } || return 1
+    case "$_id" in ga-*) ;; *) return 1 ;; esac
+  fi
+  _pilot_priority_node_exempt_pre "$_b"
 }
 
 # _pilot_node_first_shadow <story_id> <sling_target> <is_rig_native> <labels_csv> — ga-2hd02v.1.11 (SOMBRA) e ga-2hd02v.1.14 (on).
@@ -13266,7 +13308,19 @@ LIVESEC
   _PYS_TARGET=$(wa_worker_template "$BUILDER_TARGET")
   [ "$STORY_BEAD_CITY" != "$GC_CITY" ] && _PYS_NATIVE=1
   _PNY_EXEMPT_THIS=0
-  if _pilot_priority_target_is_pool "$_PYS_TARGET" && _pilot_priority_yield_for "$STORY"; then
+  if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
+    # ga-2hd02v.1.20 (disk floor): passada só-nó — só a bead de dog do HQ que o nó quer segue; qualquer outra solta a claim aqui. O 4º argumento do release NÃO é wa-worker/ps-worker de propósito: ele só
+    # carimba rota para esses alvos, e a pausa do disco não é espera de capacidade (carimbar mandaria a bead para a fila do pool).
+    if _pilot_priority_node_exempt "$STORY_ID" "$_PYS_TARGET" "$_PYS_NATIVE" "$STORY_LABELS"; then
+      _PNY_EXEMPT_THIS=1
+      log "  ga-2hd02v.1.20: $STORY_ID segue na passada só-nó do disk floor — o nó Hetzner tem vaga (effective=${_PNY_EFFECTIVE:-?}); se o nó não ficar com a bead, ela NÃO vai ao mini."
+    else
+      log "  ga-2hd02v.1.20: $STORY_ID fica para depois do disk floor — não é bead de dog do HQ que o nó queira agora (alvo $_PYS_TARGET); claim solta, nada vai ao mini."
+      _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "disk-floor-node-only"
+      DISPATCH_RESULT="disk_floor_node_only"
+      return 1
+    fi
+  elif _pilot_priority_target_is_pool "$_PYS_TARGET" && _pilot_priority_yield_for "$STORY"; then
     # ga-2hd02v.1.19: a bead de dog do HQ que o nó quer não cede — a vaga do nó não é a que a P0/P1 espera. Se o nó não ficar com ela, o fim do bloco do nó (abaixo) a faz ceder.
     if _pilot_priority_node_exempt "$STORY_ID" "$_PYS_TARGET" "$_PYS_NATIVE" "$STORY_LABELS"; then
       _PNY_EXEMPT_THIS=1
@@ -13751,9 +13805,16 @@ TASK
   # sessão que não abriu, aviso que falhou — nesses casos `mini` = nada ficou escrito), seguir seria abrir uma sessão no MINI para uma P2+ com uma P0/P1 esperando capacidade: exatamente o que o
   # yield impede. Cede como o ramo pós-claim de cima: solta a claim, a bead segue story:approved e é reavaliada na próxima varredura. `stuck` já voltou acima (o claim fica para o TTL).
   if [ "${_PNY_EXEMPT_THIS:-0}" = "1" ] && [ "${_PNF_RESULT:-}" != "node" ]; then
-    _pilot_priority_yield_say "$STORY_ID" "o nó não ficou com a bead (veredito=${_PNF_VERDICT:-nenhum} resultado=${_PNF_RESULT:-nenhum}); NÃO vai ao mini — claim solta, reavaliada na próxima varredura."
-    _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "$_PYS_TARGET"
-    DISPATCH_RESULT="priority_yield"
+    if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
+      # ga-2hd02v.1.20: passada só-nó do disk floor — o mini está pausado, então "o nó não ficou" é "nada a fazer agora" (sem rota carimbada e sem priority_yield: não há P0/P1 esperando capacidade)
+      log "  ga-2hd02v.1.20: $STORY_ID — o nó não ficou com a bead (veredito=${_PNF_VERDICT:-nenhum} resultado=${_PNF_RESULT:-nenhum}) e o disk floor pausa o mini: NÃO vai ao mini; claim solta, reavaliada na próxima varredura."
+      _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "disk-floor-node-only"
+      DISPATCH_RESULT="disk_floor_node_only"
+    else
+      _pilot_priority_yield_say "$STORY_ID" "o nó não ficou com a bead (veredito=${_PNF_VERDICT:-nenhum} resultado=${_PNF_RESULT:-nenhum}); NÃO vai ao mini — claim solta, reavaliada na próxima varredura."
+      _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "$_PYS_TARGET"
+      DISPATCH_RESULT="priority_yield"
+    fi
     return 1
   fi
 
@@ -14831,7 +14892,7 @@ _pilot_sweep_emit() {
       elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
       elif $o.r == "priority_yield" then "yielded_priority"
-      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow"]
+      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "hq_pool_store_blind", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow", "disk_floor_node_only"]
            | any(.[]; . == $o.r) then "refused_by_guard"
       elif $o.r == "" then "unclassified"
       else "failed_other" end;
@@ -14909,6 +14970,14 @@ dispatch_lane() {
     # builder-mutex defer, race) must not be re-picked (no infinite loop), and
     # DRY_RUN — which makes zero state changes — still advances through the pool.
     pool=$(echo "$pool" | jq --arg id "$pick_id" '[.[] | select(.id != $id)]' 2>/dev/null || echo "$pool")
+
+    # ── ga-2hd02v.1.20 (disk floor): na passada só-nó, o que NÃO é candidata do nó é pulado antes da claim, sem escrever nada ──
+    # A pausa por disk floor existe para não escrever no disco que está baixo: claim + soltura de bead que não vai ao nó seria exatamente esse desperdício. Não é falha nem espera de capacidade
+    # (classe benigna no pilot_sweep, não alimenta NONQUEUE_FAILS nem PRIORITY_YIELDED). Inerte fora da passada só-nó (_PILOT_NODE_ONLY=0).
+    if [ "${_PILOT_NODE_ONLY:-0}" = "1" ] && ! _pilot_node_only_candidate_pre "$pick"; then
+      _pilot_sweep_note "$pick_id" 1 "disk_floor_node_only"
+      continue
+    fi
 
     # ── ga-in9ebr AC2: skip a bead QUEUED behind a full worker pool BEFORE the claim ──
     # A candidate already committed to wa-worker/ps-worker (gc.routed_to, stamped by any
@@ -15129,7 +15198,8 @@ PILOT_STALL_ALERT_CAP="${PILOT_STALL_ALERT_CAP:-3}"
 # un-attempted) so a real stall on unrelated candidates is not masked; a saturated
 # sweep falls to the elif below and RESETS the streak. (_pool_saturated_sweep is computed above,
 # next to the summary lines, so this gate and the POOL-SATURATED log marker share one predicate.)
-if [ "$DRY_RUN" != "1" ] && [ "$DISPATCHED" -eq "0" ] && [ "$_pool_saturated_sweep" != "1" ] && { [ "$SMALL_SLOTS" -gt "0" ] || [ "$BIG_SLOTS" -gt "0" ]; }; then
+# ga-2hd02v.1.20: a NODE-ONLY pass (disk floor) is a paused sweep for the mini that happened to also look at the node: it neither counts toward this streak nor resets it — before, such a sweep exited at the gate and never got here.
+if [ "$DRY_RUN" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ] && [ "$DISPATCHED" -eq "0" ] && [ "$_pool_saturated_sweep" != "1" ] && { [ "$SMALL_SLOTS" -gt "0" ] || [ "$BIG_SLOTS" -gt "0" ]; }; then
   _stall_count=0
   [ -f "$PILOT_STALL_STATE" ] && _stall_count=$(cat "$PILOT_STALL_STATE" 2>/dev/null || echo "0")
   case "$_stall_count" in ''|*[!0-9]*) _stall_count=0 ;; esac
@@ -15139,7 +15209,7 @@ if [ "$DRY_RUN" != "1" ] && [ "$DISPATCHED" -eq "0" ] && [ "$_pool_saturated_swe
   if [ $((_stall_count % PILOT_STALL_ALERT_CAP)) -eq 0 ]; then
     notify -t "⚠️ Pilot estagnado" -p 4 "Pilot: ${_stall_count} varreduras consecutivas com vaga livre e 0 despachos (ga-y1m40). Ver pilot-dispatcher.log." || true
   fi
-elif [ "$DRY_RUN" != "1" ] && [ -f "$PILOT_STALL_STATE" ]; then
+elif [ "$DRY_RUN" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ] && [ -f "$PILOT_STALL_STATE" ]; then
   rm -f "$PILOT_STALL_STATE" 2>/dev/null || true
 fi
 
