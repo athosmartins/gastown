@@ -25,17 +25,29 @@ has() { grep -qF -- "$2" "$1" 2>/dev/null; }
 tmo() { perl -e 'alarm shift; exec @ARGV' "$@"; }  # ssh que "funciona demais" (restrict apagado) ficaria pendurado: teto de tempo
 
 CITY="$T/city"; WA="$T/wa_rig"; FB="$T/fakebin"; LOGF="$T/audit.log"; CONF="$T/conf.json"
-mkdir -p "$CITY/.beads" "$WA" "$FB" "$T/evil"
+mkdir -p "$CITY/.beads" "$WA" "$FB" "$FB/beads" "$T/evil"
 printf '{"prefix":"ga","path":"."}\n{"prefix":"wa","path":"../wa_rig"}\n' > "$CITY/.beads/routes.jsonl"
 printf 'touch "%s/PWNED-bashenv"\n' "$T" > "$T/planted.sh"
 printf 'open("%s/PWNED-pythonpath","w")\n' "$T" > "$T/evil/json.py"
 for tool in bd gc gatedone; do cat > "$FB/$tool" <<'EOF'
 #!/bin/bash
 D="$(cd "$(dirname "$0")" && pwd)"; n=$(basename "$0")
-{ printf '%s\tcwd=%s\tactor=%s\talias=%s\thook=%s/%s\tbashenv=%s\tld=%s\tcitypath=%s\tpypath=%s\targv=' "$n" "$PWD" "${BEADS_ACTOR-UNSET}" \
+# a leitura de estado que o atalho faz antes de bd comment/close (ga-2hd02v.1.16) roda com BD_READONLY=true, como o engine lê bead (internal/beads/database.go):
+# ela vai para reads.log, e calls.log segue sendo "uma linha por pedido" (o que `calls`, `allowed` e `lastis` contam são os COMANDOS)
+LOG="$D/calls.log"; [ "${BD_READONLY-}" = true ] && LOG="$D/reads.log"
+{ printf '%s\tcwd=%s\tactor=%s\talias=%s\thook=%s/%s\tbashenv=%s\tld=%s\tcitypath=%s\tpypath=%s\tro=%s/%s\targv=' "$n" "$PWD" "${BEADS_ACTOR-UNSET}" \
     "${GC_ALIAS-UNSET}" "${GC_MANAGED_SESSION_HOOK-UNSET}" "${GC_HOOK_EVENT_NAME-UNSET}" "${BASH_ENV-UNSET}" "${LD_PRELOAD-UNSET}" \
-    "${GC_CITY_PATH-UNSET}" "${PYTHONPATH-UNSET}"
-  for a in "$@"; do a=${a//$'\n'/\\n}; printf '[%s]' "$a"; done; printf '\n'; } >> "$D/calls.log"
+    "${GC_CITY_PATH-UNSET}" "${PYTHONPATH-UNSET}" "${BD_READONLY-UNSET}" "${BD_DOLT_AUTO_COMMIT-UNSET}"
+  for a in "$@"; do a=${a//$'\n'/\\n}; printf '[%s]' "$a"; done; printf '\n'; } >> "$LOG"
+if [ "$n" = bd ] && [ "${1-}" = show ] && [ "${3-}" = --json ] && [ $# -eq 3 ]; then  # `bd show <id> --json`: responde o estado da bead (fixture $D/beads/<id>.*); sem fixture, uma bead COMUM de outro dono, sem rótulo de veredito
+  b="$D/beads/$2"
+  [ -e "$b.noise" ] && echo "[mysql] 2026/10/19 13:40:39 packets.go:58 read tcp 127.0.0.1:59514->127.0.0.1:52756: i/o timeout" >&2  # o aviso do Dolt vai ao STDERR; o stdout segue JSON limpo
+  if [ -e "$b.rc" ]; then [ -e "$b.json" ] && cat "$b.json"; echo "fake-bd: show falhou" >&2; exit "$(cat "$b.rc")"; fi  # rc≠0 com um JSON válido no stdout: o rc é quem manda
+  if [ -e "$b.sleep" ]; then sleep 37 & echo $! > "$D/read-sleep.pid"; wait; exit 0; fi
+  if [ -e "$b.raw" ]; then cat "$b.raw"; exit 0; fi
+  if [ -e "$b.json" ]; then cat "$b.json"; exit 0; fi
+  printf '[{"id":"%s","title":"FAKE-bd-OUT","status":"in_progress","assignee":"dono-qualquer","labels":["area:infra"]}]\n' "$2"; exit 0
+fi
 echo "FAKE-$n-OUT"
 for a in "$@"; do case "$a" in --stdin) echo "STDIN<$(cat)>";; FAIL7) echo "fake-err" >&2; exit 7;; SLEEP) sleep 37 & echo $! > "$D/sleep.pid"; wait;; BREAKLOG) rm -f "$D/../audit.log"; mkdir "$D/../audit.log";; esac; done
 exit 0

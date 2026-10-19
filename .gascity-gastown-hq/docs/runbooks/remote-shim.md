@@ -43,9 +43,9 @@ mini: sshd ── authorized_keys: restrict,from=…,command="python3 -I remote-
 bd [-C <rig>] show <id> [--json]
 bd [-C <rig>] list [--json] [--status|-s <status>] [--assignee|-a <word>] [--label|-l <word>]... [--parent <id>] [--limit|-n <n>] [--id <ids>]
 bd [-C <rig>] update <id> [--json] --set-metadata <key=value>...
-bd [-C <rig>] comment <id> <text>...
-bd [-C <rig>] comment <id> --stdin
-bd [-C <rig>] close <id> [--json] [--reason|-r <text>]
+bd [-C <rig>] comment <id> <text>... +dono
+bd [-C <rig>] comment <id> --stdin +dono
+bd [-C <rig>] close <id> [--json] [--reason|-r <text>] +dono
 gc prime --hook
 gc prime --hook --hook-format codex
 gc handoff --auto

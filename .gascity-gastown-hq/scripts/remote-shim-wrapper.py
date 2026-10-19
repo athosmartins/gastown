@@ -26,6 +26,9 @@ LISTA PERMITIDA
   da regra, repetida, valor fora do formato, argumento a mais ou a menos → recusa. Sem `--flag=valor`. `bd -C <dir>` só vale para a cidade ou
   um rig da routes.jsonl (caminho real ou nome); sem routes.jsonl legível o `-C` é recusado. `bd update` só grava chaves ALLOW_META; o alvo
   de `gc session nudge` tem que casar com `nudge_pattern` (sem a chave na config, nudge não roda).
+  TRAVA DE DONO (`+dono` na lista; ga-2hd02v.1.16): `bd comment` e `bd close` leem a bead antes (`bd show <id> --json`, mesmo cwd e ambiente, BD_READONLY=true) e, se ela
+  tem o rótulo `type:quality-gate-verdict`, só passam quando o assignee é o alias declarado da sessão (o dispatcher lê o `VERDICT:` dos comentários dela, PASS antes de FAIL: uma sessão
+  do nó que comentasse na bead de um revisor morto forjaria o veredito). Bead sem esse rótulo passa como antes. Leitura que falhou ou veio fora da forma = recusa (77, "nada foi executado, pode repetir").
 
 POR QUE RECUSA EM VEZ DE ADAPTAR (está na lista / não está / não consegui saber — o último não vira "está")
   Config ilegível, routes.jsonl ilegível, log de auditoria que não grava, identidade fora do padrão, ferramenta que não achei → não executa.
@@ -128,9 +131,10 @@ class F:  # uma flag: val = nome em VAL (ou None se não leva valor), rep = pode
 
 
 class Rule:
-    def __init__(self, tool, words, pos=(), flags=None):
+    def __init__(self, tool, words, pos=(), flags=None, owner_lock=False):
         self.tool, self.words, self.pos, self.flags = tool, tuple(words), list(pos), dict(flags or {})
         self.short = {f.short: n for n, f in self.flags.items() if f.short}
+        self.owner_lock = owner_lock  # escreve na bead <id>: em bead de veredito (VERDICT_LABEL) só passa para o dono (owner_gate); o serve() lê o estado antes
 
     def label(self) -> str:  # a linha que o runbook mostra: gerada da regra, então não há duas verdades
         w = " ".join(shlex.quote(x) if " " in x else x for x in self.words)
@@ -140,7 +144,7 @@ class Rule:
         for n, f in self.flags.items():
             nm = n + (f"|{f.short}" if f.short else "") + (f" <{'key=value' if f.val == 'kv' else f.val}>" if f.val else "")
             s.append((nm if f.req else f"[{nm}]") + ("..." if f.rep else ""))
-        return " ".join(s)
+        return " ".join(s) + (" +dono" if self.owner_lock else "")
 
     def apply(self, args: list[str]) -> tuple[list[str], list[str]]:
         """Recebe o argv depois das palavras fixas; devolve (argumentos a executar na ORDEM do cliente, flags curtas viram longas; só os posicionais, na ordem) ou levanta Refused."""
@@ -197,9 +201,9 @@ RULES = [
                               "--label": F("word", rep=True, short="-l"), "--parent": F("id"), "--limit": F("n", short="-n"),
                               "--id": F("ids")}),
     Rule("bd", ["update"], [("id", 1, 1)], {**_J, "--set-metadata": F("kv", rep=True, req=True)}),
-    Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}),
-    Rule("bd", ["comment"], [("id", 1, 1)], {"--stdin": F(req=True)}),
-    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}),
+    Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}, owner_lock=True),
+    Rule("bd", ["comment"], [("id", 1, 1)], {"--stdin": F(req=True)}, owner_lock=True),
+    Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}, owner_lock=True),
     Rule("gc", ["prime", "--hook"]),
     Rule("gc", ["prime", "--hook", "--hook-format", "codex"]),
     Rule("gc", ["handoff", "--auto"]),
@@ -371,6 +375,54 @@ def end_children() -> str:  # encerra o grupo do filho e diz o que de fato acont
     return "filho-encerrado"
 
 
+VERDICT_LABEL = "type:quality-gate-verdict"  # a bead de veredito do revisor do gate: o dispatcher lê o `VERDICT:` dos comentários dela (PASS antes de FAIL), então quem escreve nela decide o merge
+OWNER_READ_S = 60  # teto da leitura de estado (min com timeout_s); o prazo do comando em si continua só do comando
+
+
+def read_bead(exe: str, cwd: str, child: dict, bead: str, timeout_s: float) -> dict:
+    """`bd show <id> --json` no MESMO cwd e ambiente do comando que vem depois → o dict da bead. Levanta Refused ("nada foi executado, pode repetir")
+    quando não consegui ler: não executou, rc≠0, prazo, stdout que não é uma lista de UMA bead. Lê SÓ o stdout (o Dolt joga `[mysql] … i/o timeout` no stderr com o JSON limpo).
+    Roda com BD_READONLY=true + BD_DOLT_AUTO_COMMIT=off (a convenção do engine para leitura: não auto-comita) e stdin fechado (o texto do `bd comment --stdin` é do COMANDO, não da leitura)."""
+    again = "nada foi executado, pode repetir"
+    env = {**child, "BD_READONLY": "true", "BD_DOLT_AUTO_COMMIT": "off"}
+    try:
+        p = subprocess.Popen([exe, "show", bead, "--json"], cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        raise Refused(f"não consegui ler o estado de {bead} (bd show não executou: {e.strerror}); {again}")
+    try:
+        out, _ = p.communicate(timeout=min(timeout_s, OWNER_READ_S))
+    except subprocess.TimeoutExpired:
+        kill_group(p)
+        p.communicate()  # reapa; com o grupo morto o pipe fecha
+        raise Refused(f"não consegui ler o estado de {bead} (bd show passou do prazo); {again}")
+    except BaseException:  # qualquer outra saída (sinal, erro interno): a leitura não pode sobreviver ao pedido
+        kill_group(p)
+        raise
+    if p.returncode != 0:
+        raise Refused(f"não consegui ler o estado de {bead} (bd show saiu com rc={p.returncode}); {again}")
+    try:
+        data = json.loads(out)
+    except ValueError:
+        raise Refused(f"não consegui ler o estado de {bead} (a resposta do bd show não é JSON); {again}")
+    if not (isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict)):
+        raise Refused(f"não consegui ler o estado de {bead} (a resposta do bd show não é uma lista de uma bead); {again}")
+    return data[0]
+
+
+def owner_gate(state: dict, bead: str, alias: str) -> None:
+    """A trava de DONO (ga-2hd02v.1.16): bd comment/close em bead de veredito só passa se o assignee for o alias declarado da sessão. Três estados:
+    tem (rótulo/dono lidos) · não tem (a chave AUSENTE: o bd a omite quando não há — 55 de 60 beads fechadas não têm `assignee`) · não consegui ler (tipo errado: nunca vira "não tem")."""
+    labels = state.get("labels", [])
+    if not (isinstance(labels, list) and all(isinstance(x, str) for x in labels)):
+        raise Refused(f"não consegui ler o estado de {bead} (labels fora do formato); nada foi executado, pode repetir")
+    owner = state.get("assignee", "")
+    if not isinstance(owner, str):  # null, número, lista: o bd não escreve isso; ler como "sem dono" liberaria o comando por um dado que não entendi
+        raise Refused(f"não consegui ler o estado de {bead} (assignee fora do formato); nada foi executado, pode repetir")
+    if VERDICT_LABEL in labels and owner != alias:  # (alias nunca é vazio: o decide() recusa sem ele; então "sem dono" também recusa)
+        raise Refused(f"{bead} é bead de veredito ({VERDICT_LABEL}) de {owner[:60]!r}, não de {alias[:60]!r}: bd comment/close nela só o dono faz; não repita")
+
+
 def serve(config: str) -> int:
     client = (os.environ.get("SSH_CLIENT", "").split() or ["?"])[0]
     client = client if re.fullmatch(r"[0-9A-Fa-f.:]{1,45}", client) else "?"
@@ -395,6 +447,9 @@ def serve(config: str) -> int:
         home, user = cfg["home"], pwd.getpwuid(os.getuid()).pw_name
         child = {"HOME": home, "USER": user, "LOGNAME": user, "LANG": "en_US.UTF-8",
                  "PATH": ":".join(cfg["bin_dirs"] + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]), "BEADS_ACTOR": alias, **env}
+        if rule.owner_lock:  # antes de gravar o `ok`: recusa por dono ou por leitura que falhou não executa nada, e fica no log como `refused`
+            bead = rule.apply(final[len(rule.words):])[1][0]  # o <id> (a 1ª posicional; `bd close --reason x <id>` tem flag antes dele em `final`)
+            owner_gate(read_bead(exe, cwd, child, bead, cfg["timeout_s"]), bead, alias)
         t0 = time.time()
         rid = hashlib.sha256(json.dumps([tool, argv]).encode()).hexdigest()[:12]  # a linha `ok` e a `done` do mesmo pedido levam o mesmo ts e esta hash: é assim que se pareiam
 
