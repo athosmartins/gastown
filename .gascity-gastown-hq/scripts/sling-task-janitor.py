@@ -48,6 +48,16 @@ such a molecule when ALL hold (conservative, fail-toward-KEEP — see _should_cl
     mean "no active build possible"; everything else (including a status this janitor
     doesn't recognize) defaults to KEEP.
 
+A sling wrapper that was NEVER CLAIMED (ga-2lr3a1) is closed by a separate rule, _should_close_unclaimed,
+evaluated only when the rules above said KEEP. All must hold: status exactly open; no assignee and no
+started_at; no active lifecycle label; its OWN id is not the source of an open gate marker; the live-session
+list was READ and no session is attached to it (metadata gc.session_name); created_at older than
+UNCLAIMED_MAX_AGE_MIN (default 60). The "parent is story:in-flight" and "parent has an open gate marker"
+guards do not apply to it: they protect a target in build, not an empty wrapper, and the Pilot's "LIVE wrapper
+already exists" skip (ga-cnvy1) was reading such a wrapper as a dispatch in progress (5-9 h with the target
+left without a builder). Third state: if the session list could not be read (_live_sessions() -> None) this
+rule stays inert for the sweep; the older rules keep receiving an empty set in that case, as before.
+
 CADENCE: MAX_PER_SWEEP=10 by default (orphans are inert; a higher cap clears backlog fast),
 shared across both sling-stub and molecule cleanup within one sweep.
 LAUNCHD: StartInterval=900, one-shot (no KeepAlive). See com.gascity.sling-task-janitor.plist.
@@ -72,6 +82,15 @@ DRY_RUN = os.environ.get("SLING_JANITOR_DRY_RUN", "0") == "1"
 MAX_PER_SWEEP = int(os.environ.get("SLING_MAX_PER_SWEEP", "10"))
 BD_TIMEOUT = int(os.environ.get("SLING_BD_TIMEOUT", "30"))
 MIN_AGE_MIN = int(os.environ.get("SLING_MIN_AGE_MIN", "60"))
+# ga-2lr3a1: prazo (min, contado de created_at) a partir do qual um wrapper NUNCA reivindicado deixa de
+# valer como "despacho em curso". Fica acima da janela em que o inflight-reclaim-guard solta a story por
+# stranded wait (~45 min medido em 07/10, comentário do Mayor na ga-2lr3a1): antes disso o wrapper pode
+# estar legitimamente esperando vaga de dog.
+UNCLAIMED_MAX_AGE_MIN = int(os.environ.get("SLING_UNCLAIMED_MAX_AGE_MIN", "60"))
+# Script que lista as sessões (shim Option C, fixa --city por dentro). Constante, e não literal na chamada,
+# para o selftest apontar um stub.
+SESSION_LIST_BIN = os.environ.get("SLING_SESSION_LIST_BIN",
+                                  "/Users/athos/gt/.gascity-gastown-hq/scripts/gc-session-list-cached.sh")
 
 # A sling stub title: "build story <id>", "fix bug <id>", "build <id>", "implement <id>".
 SLING_RE = re.compile(r"\b(?:build story|fix bug|build|fix|implement)\s+([a-z]{2,3}-[a-z0-9]+)", re.I)
@@ -325,21 +344,34 @@ def _gated_bead_ids():
 
 
 def _live_sessions():
+    """Identificadores das sessões vivas, em TRÊS estados (ga-2lr3a1):
+      • set com ids   — lista lida, essas estão vivas;
+      • set() vazio   — lista lida e ninguém está vivo (sabido);
+      • None          — NÃO consegui ler (gc falhou, saída ilegível, JSON sem a lista "sessions").
+    Colapsar o terceiro no segundo faz "não sei" valer como "ninguém vivo": quem fecha algo por
+    "sem sessão" precisa distinguir os dois (ver _should_close_unclaimed)."""
     if _sessions_fn is not None:
         return _sessions_fn()
-    r = _sh(["bash", "/Users/athos/gt/.gascity-gastown-hq/scripts/gc-session-list-cached.sh"], timeout=BD_TIMEOUT)  # Option C shim (pins --city internally)
+    # vazio ({"sessions": []}) → set() = lido, ninguém vivo; falhou/ilegível (rc≠0, sem JSON, sem a lista) → None = não sei
+    r = _sh(["bash", SESSION_LIST_BIN], timeout=BD_TIMEOUT)
+    if r is None or r.returncode != 0:
+        _log("WARN: session list failed (rc=%s) — live sessions UNKNOWN this sweep" % (r.returncode if r else "err"))
+        return None
     live = set()
-    if r and r.returncode == 0:
-        try:
-            for s in (json.loads(r.stdout).get("sessions") or []):
-                if s.get("closed") is True:
-                    continue
-                for k in ("session_name", "name", "alias", "id", "agent_name"):
-                    v = s.get(k)
-                    if v:
-                        live.add(v)
-        except Exception as e:
-            _log("WARN: session list parse: %r" % e)
+    try:
+        sessions = json.loads(r.stdout).get("sessions")
+        if not isinstance(sessions, list):
+            raise ValueError("no 'sessions' list in the output")
+        for s in sessions:
+            if s.get("closed") is True:
+                continue
+            for k in ("session_name", "name", "alias", "id", "agent_name"):
+                v = s.get(k)
+                if v:
+                    live.add(v)
+    except Exception as e:
+        _log("WARN: session list parse: %r — live sessions UNKNOWN this sweep" % e)
+        return None
     return live
 
 
@@ -444,6 +476,62 @@ def _should_close(bead, parent_inflight_ids, live, now, gated=frozenset(), paren
                        "dog-pool session remaining live after finishing this task is not evidence "
                        "the stub itself is still active work, age=%.0fmin" % (parent, asg, age))
     return True, ("orphan: parent %s NOT in active build, no live assignee, age=%.0fmin" % (parent, age))
+
+
+def _should_close_unclaimed(bead, sessions_known, live, now, gated=frozenset()):
+    """ga-2lr3a1 — wrapper de sling NUNCA reivindicado. -> (close: bool, why: str). Fail-toward-KEEP.
+
+    Roda só quando _should_close já disse KEEP. Em 07/10 ga-ghv1x7 e ga-nrnhz1 ficaram 5–9 h abertos, sem
+    assignee, e o skip "LIVE wrapper already exists" do Pilot (ga-cnvy1) os lia como despacho em curso: o
+    alvo ficava sem builder. As regras antigas seguram o wrapper enquanto o alvo está story:in-flight ou
+    tem marker aberto no gate e medem a idade por updated_at (qualquer toque a zera) — nenhuma olha se o
+    PRÓPRIO wrapper chegou a ser reivindicado. Um wrapper que nunca foi reivindicado não carrega trabalho
+    nenhum; o alvo, esse sim, pode estar em build ou no gate, e por isso essas guardas NÃO valem aqui.
+
+    Fecha só quando TUDO vale: é um wrapper de sling (_is_sling); status exatamente "open"; sem assignee
+    e sem started_at (nunca reivindicado, nem reivindicado e devolvido); sem label de trabalho rastreado;
+    o PRÓPRIO id não é fonte de marker aberto (ga-w5agg/ga-d2jil); as sessões FORAM lidas e nenhuma está
+    atrelada a ele (metadata gc.session_name); e created_at passou de UNCLAIMED_MAX_AGE_MIN.
+    Devolve why == "" quando o bead nem entra na regra (não é wrapper, não está open, ou já foi
+    reivindicado/iniciado)."""
+    bid = bead.get("id", "?")
+    parent = _is_sling(bead)
+    if not parent:
+        return False, ""
+    # vazio → sem status, não é "open", fora da regra (KEEP); falhou/ilegível → valor que não é o literal "open" idem
+    if str(bead.get("status") or "").lower() != "open":
+        return False, ""
+    # vazio → ninguém reivindicou (candidato); falhou/ilegível → qualquer valor preenchido conta como dono, KEEP
+    if bead.get("assignee"):
+        return False, ""
+    # vazio → nunca iniciado (candidato); falhou/ilegível → qualquer valor preenchido conta como já iniciado, KEEP
+    if bead.get("started_at"):
+        return False, ""
+    # vazio → sem label de trabalho rastreado (candidato); falhou/ilegível → n/a: _should_close já leu este mesmo campo antes e levantaria antes de chegar aqui
+    if _ACTIVE_LABELS & set(bead.get("labels") or []):
+        return False, "wrapper carries an active lifecycle label (tracked work)"
+    # vazio → nenhum marker aberto cita o wrapper (candidato); falhou/ilegível → _gated_bead_ids devolve set() quando a consulta falha, então vale como "vazio": nesse caso quem protege é a guarda de assignee/started_at acima (em regra um wrapper que virou fonte de marker passou por um builder)
+    if bid in gated:
+        return False, "wrapper's own id is the source of an OPEN gate marker — tracked work"
+    if not sessions_known:
+        return False, ("session list UNREADABLE this sweep (third state) — 'no session' is not proven, "
+                       "KEEP (inerte sob dúvida)")
+    md = bead.get("metadata")
+    # vazio → sem metadata/sem gc.session_name, nenhuma sessão atrelada (candidato); falhou/ilegível → metadata que não é dict: não sei se há sessão, KEEP
+    if md is not None and not isinstance(md, dict):
+        return False, "metadata unreadable — cannot tell whether a session is attached, KEEP"
+    attached = (md or {}).get("gc.session_name") or ""
+    if attached and attached in live:
+        return False, "session '%s' attached to the wrapper is LIVE" % attached
+    # vazio → sem created_at, idade desconhecida, KEEP; falhou/ilegível → data que _parse_ts não lê: idem, KEEP (nunca "passou do prazo")
+    created = _parse_ts(bead.get("created_at") or "")
+    if created is None:
+        return False, "created_at missing/unreadable — age unknown, treated as fresh"
+    age = (now - created) / 60.0
+    if age < UNCLAIMED_MAX_AGE_MIN:
+        return False, "within the deadline (age=%.0fmin < %d since creation)" % (age, UNCLAIMED_MAX_AGE_MIN)
+    return True, ("orphan: wrapper for %s NEVER claimed (open, no assignee, never started), no live session "
+                  "attached, age=%.0fmin >= %d since creation" % (parent, age, UNCLAIMED_MAX_AGE_MIN))
 
 
 def _should_close_molecule(bead, target_status, live, now, gated=frozenset()):
@@ -650,7 +738,15 @@ def run_cycle(now):
              "— using static fallback (HQ only)")
         _notify("gc rig list falhou/vazio — usando lista estatica de fallback (somente HQ)", 4)
         stores = [CITY]
-    live = _live_sessions()
+    live_raw = _live_sessions()
+    # ga-2lr3a1: None = a leitura das sessões FALHOU (não sei); set() = lida, ninguém vivo. Só a regra do
+    # wrapper nunca reivindicado distingue os dois. As regras antigas (stubs, moléculas, steps) seguem
+    # recebendo set() nos dois casos, como antes — esta mudança não as toca.
+    sessions_known = live_raw is not None
+    live = live_raw if sessions_known else set()
+    if not sessions_known:
+        _log("DEGRADED sling-janitor-sessions: session list unreadable — the never-claimed-wrapper rule "
+             "stays inert this sweep (other rules unchanged)")
     gated = _gated_bead_ids()  # bead-ids whose fix is in flight at the gate — never orphan
     # Build the set of bead ids that are story:in-flight across ALL stores (parents).
     store_beads = {}
@@ -848,9 +944,16 @@ def run_cycle(now):
             parent = _is_sling(b)
             if parent:
                 do_close, why = _should_close(b, inflight, live, now, gated, parent_statuses)
+                unclaimed = False
                 if not do_close:
-                    _log("  KEEP %s/%s: %s" % (os.path.basename(store), bid, why))
-                    continue
+                    # ga-2lr3a1: o KEEP acima pode ser só "o alvo está em build/no gate" — que não diz
+                    # nada sobre um wrapper que ninguém reivindicou. A regra nova olha o wrapper.
+                    unclaimed, uwhy = _should_close_unclaimed(b, sessions_known, live, now, gated)
+                    if not unclaimed:
+                        _log("  KEEP %s/%s: %s%s" % (os.path.basename(store), bid, why,
+                                                      ("; unclaimed-rule: " + uwhy) if uwhy else ""))
+                        continue
+                    do_close, why = True, uwhy
                 # ga-0bhon: era AQUI que os 798 WARN nasciam — o stub passava por
                 # todas as regras de órfão e só então batia no guard de bloqueio.
                 ok_to_try, blocked_why = _blocking_verdict(b, blocker_status)
@@ -859,7 +962,14 @@ def run_cycle(now):
                     continue
                 labels_b = set(b.get("labels") or [])
                 asg_b = b.get("assignee") or ""
-                if _is_refused(labels_b):
+                if unclaimed:
+                    reason = ("Orphan sling-task cleanup (sling-task-janitor, ga-2lr3a1): dispatch wrapper for "
+                              "'%s' was NEVER claimed — open, no assignee, never started, no live session "
+                              "attached, and past the %d-min deadline since creation. It carries no work, but "
+                              "the Pilot's 'LIVE wrapper already exists' skip (ga-cnvy1) reads it as a dispatch "
+                              "in progress and leaves the target without a builder. Closed; the parent's own "
+                              "state drives any future dispatch." % (parent, UNCLAIMED_MAX_AGE_MIN))
+                elif _is_refused(labels_b):
                     reason = ("Orphan sling-task cleanup (sling-task-janitor, ga-0jcit): stub for "
                               "'%s' carries an explicit pool:refused:* label — a terminal decision "
                               "by its assignee. Dog-pool sessions are long-lived, so the assignee "
@@ -926,6 +1036,7 @@ def main():
 def _selftest():
     global _bd_list_open_fn, _bd_close_fn, _sessions_fn, _rigs_fn, _do_notify_fn, MAX_PER_SWEEP
     global _target_status_fn, _rig_name_map_fn, BD_BIN, GC_BIN, _deferred_slings_fn
+    global _gated_fn, SESSION_LIST_BIN
     ok = [0]
     bad = [0]
     def _ok(m): ok[0] += 1; print("  ok  " + m)
@@ -1490,6 +1601,177 @@ print(json.dumps(found))
         _bad("BL: did not close the expired-deferred orphan", "closed=%s" % closed_idsBL)
     _target_status_fn = None
     _deferred_slings_fn = lambda store, now: []  # restore the hermetic default
+
+    # ── ga-2lr3a1: wrapper de sling NUNCA reivindicado ───────────────────────────────
+    # O caso de 07/10 (ga-ghv1x7, ga-nrnhz1: 5–9 h abertos, assignee nulo, sem sessão; alvos P0
+    # sem builder, o skip "LIVE wrapper already exists" do Pilot (ga-cnvy1) lendo-os como
+    # despacho em curso). As regras antigas seguram o wrapper enquanto o alvo está
+    # story:in-flight OU tem marker aberto no gate, e medem a idade por updated_at (qualquer
+    # toque a zera); nenhuma olha se o PRÓPRIO wrapper foi reivindicado. Um wrapper que
+    # NINGUÉM reivindicou não carrega trabalho nenhum — é o que os cenários BM abaixo fecham.
+    import tempfile
+    import shutil
+    MAX_PER_SWEEP = 10
+    CREATED_OLD = "2026-06-29T10:30:00Z"    # 90 min antes de NOW: passou do prazo (60)
+    CREATED_FRESH = "2026-06-29T11:45:00Z"  # 15 min antes de NOW: dentro do prazo
+    TOUCHED = "2026-06-29T11:55:00Z"        # updated_at de 5 min atrás (alguém mexeu no wrapper)
+
+    def mkw(bid, parent, created=CREATED_OLD, assignee="", status="open", md=None, started=None,
+            updated=None, labels=None, title=None):
+        w = {"id": bid, "title": title or ("fix bug %s: titulo do alvo" % parent),
+             "issue_type": "task", "status": status, "labels": labels or [],
+             "assignee": assignee, "updated_at": updated or created,
+             "metadata": dict({"gc.routed_to": "gastown.dog", "pilot.sling_for": parent}, **(md or {}))}
+        if created is not None:
+            w["created_at"] = created
+        if started:
+            w["started_at"] = started
+        return w
+
+    def mkparent(pid, inflight=True):
+        return {"id": pid, "title": "o alvo", "issue_type": "bug",
+                "status": "in_progress" if inflight else "open",
+                "labels": ["story:in-flight"] if inflight else [], "assignee": "", "updated_at": OLD}
+
+    def sweepBM(beads, sessions=lambda: set(), gated=()):
+        """Um run_cycle de um store só, tudo por seam. -> ids fechados, na ordem."""
+        global _rigs_fn, _bd_list_open_fn, _sessions_fn, _bd_close_fn, _do_notify_fn
+        global _target_status_fn, _gated_fn
+        closed_now = []
+        _rigs_fn = lambda: ["HQ"]
+        _bd_list_open_fn = lambda store: beads
+        _sessions_fn = sessions
+        _gated_fn = lambda: set(gated)
+        _bd_close_fn = lambda store, bid, reason: (closed_now.append(bid) or True)
+        _do_notify_fn = lambda m, p: None
+        _target_status_fn = lambda targets_by_store: {}   # status dos pais irresolvido em todo caso
+        try:
+            run_cycle(NOW)
+        finally:
+            _gated_fn = None
+            _target_status_fn = None
+        return closed_now
+
+    print("Scenario BM1 (ga-2lr3a1): wrapper NUNCA reivindicado (open, sem assignee, sem started_at), "
+          "90 min, sessões lidas e nenhuma atrelada, alvo AINDA story:in-flight → CLOSE (a regra "
+          "antiga o segura 'pelo alvo em build' e o Pilot segue pulando o alvo)")
+    got = sweepBM([mkparent("ga-alvo1"), mkw("w1", "ga-alvo1")])
+    _ok("BM1: fechou o wrapper nunca reivindicado apesar do alvo story:in-flight") if got == ["w1"] else \
+        _bad("BM1: wrapper nunca reivindicado ficou aberto", "closed=%s" % got)
+
+    print("Scenario BM2 (ga-2lr3a1): alvo com marker ABERTO no gate (needs-fix espera builder) e "
+          "wrapper nunca reivindicado → CLOSE (o marker é do alvo; o wrapper não carrega fix nenhum)")
+    got = sweepBM([mkparent("ga-alvo2", inflight=False), mkw("w2", "ga-alvo2")], gated={"ga-alvo2"})
+    _ok("BM2: fechou o wrapper órfão de um alvo com marker aberto") if got == ["w2"] else \
+        _bad("BM2: wrapper órfão de alvo gated ficou aberto", "closed=%s" % got)
+
+    print("Scenario BM3 (ga-2lr3a1): wrapper tocado há 5 min (updated_at fresco) mas criado há 90 min "
+          "e nunca reivindicado → CLOSE (o prazo conta da CRIAÇÃO, não do último toque)")
+    got = sweepBM([mkparent("ga-alvo3", inflight=False), mkw("w3", "ga-alvo3", updated=TOUCHED)])
+    _ok("BM3: prazo contado de created_at") if got == ["w3"] else \
+        _bad("BM3: um toque recente adiou o fechamento de um wrapper nunca reivindicado", "closed=%s" % got)
+
+    print("Scenario BM4 (ga-2lr3a1, controle): wrapper nunca reivindicado mas criado há 15 min → KEEP "
+          "(dentro do prazo: pode ser o despacho ATUAL esperando vaga de dog — erro do Mayor em 07/10)")
+    got = sweepBM([mkparent("ga-alvo4"), mkw("w4", "ga-alvo4", created=CREATED_FRESH)])
+    _bad("BM4: fechou um wrapper dentro do prazo", "closed=%s" % got) if got else \
+        _ok("BM4: mantém o wrapper dentro do prazo")
+
+    print("Scenario BM5 (ga-2lr3a1, controle negativo): wrapper REIVINDICADO (assignee) → intocado pela "
+          "regra nova, esteja o assignee vivo ou não")
+    got = sweepBM([mkparent("ga-alvo5"), mkw("w5", "ga-alvo5", assignee="dog-morto")])
+    _bad("BM5: fechou wrapper reivindicado (assignee morto)", "closed=%s" % got) if got else \
+        _ok("BM5: mantém wrapper reivindicado (assignee não vivo, alvo em build)")
+    got = sweepBM([mkparent("ga-alvo5b"), mkw("w5b", "ga-alvo5b", assignee="dog-vivo")],
+                  sessions=lambda: {"dog-vivo"})
+    _bad("BM5b: fechou wrapper reivindicado por sessão viva", "closed=%s" % got) if got else \
+        _ok("BM5b: mantém wrapper reivindicado por sessão viva")
+
+    print("Scenario BM6 (ga-2lr3a1, controle negativo): wrapper sem assignee mas com SESSÃO VIVA atrelada "
+          "(metadata gc.session_name) → intocado")
+    got = sweepBM([mkparent("ga-alvo6"), mkw("w6", "ga-alvo6", md={"gc.session_name": "dog-vivo"})],
+                  sessions=lambda: {"dog-vivo"})
+    _bad("BM6: fechou wrapper com sessão viva atrelada", "closed=%s" % got) if got else \
+        _ok("BM6: mantém wrapper com sessão viva atrelada")
+
+    print("Scenario BM7 (ga-2lr3a1, TERCEIRO ESTADO): a leitura das sessões FALHOU (None) → NÃO fecha, "
+          "mesmo com todo o resto dizendo 'órfão'; e o sweep segue: o órfão da regra antiga continua "
+          "sendo fechado")
+    got = sweepBM([mkparent("ga-alvo7"), mkw("w7", "ga-alvo7"),
+                   mk("o7", "build story ga-parked7")], sessions=lambda: None)
+    _ok("BM7: sessões ilegíveis → wrapper mantido (inerte sob dúvida), regra antiga intacta") \
+        if got == ["o7"] else _bad("BM7: terceiro estado mal tratado", "closed=%s" % got)
+
+    print("Scenario BM8 (ga-2lr3a1, controle negativo): o PRÓPRIO id do wrapper tem marker aberto no "
+          "gate → intocado (ga-w5agg/ga-d2jil: fechar a fonte do marker faz o reaper dá-lo como 'merged')")
+    got = sweepBM([mkparent("ga-alvo8"), mkw("w8", "ga-alvo8")], gated={"w8"})
+    _bad("BM8: fechou wrapper que é fonte de marker aberto", "closed=%s" % got) if got else \
+        _ok("BM8: mantém wrapper que é fonte de marker aberto")
+
+    print("Scenario BM9 (ga-2lr3a1, controle negativo): wrapper já INICIADO uma vez (started_at) e "
+          "devolvido sem assignee → não é 'nunca reivindicado' → intocado pela regra nova")
+    got = sweepBM([mkparent("ga-alvo9"), mkw("w9", "ga-alvo9", started="2026-06-29T10:31:00Z")])
+    _bad("BM9: fechou wrapper que já foi iniciado", "closed=%s" % got) if got else \
+        _ok("BM9: mantém wrapper que já foi iniciado")
+
+    print("Scenario BM10 (ga-2lr3a1, controle negativo): created_at AUSENTE ou ilegível → idade "
+          "desconhecida → KEEP (idade que não sei ler nunca é 'passou do prazo')")
+    got = sweepBM([mkparent("ga-alvo10"), mkw("w10a", "ga-alvo10", created=None),
+                   mkw("w10b", "ga-alvo10", created="nao-e-data")])
+    _bad("BM10: fechou com idade desconhecida", "closed=%s" % got) if got else \
+        _ok("BM10: mantém wrapper com created_at ausente/ilegível")
+
+    print("Scenario BM11 (ga-2lr3a1, controle negativo): status in_progress sem assignee, wrapper "
+          "com label de trabalho rastreado, e task que não é wrapper de sling → todos intocados")
+    got = sweepBM([mkparent("ga-alvo11"), mkw("w11a", "ga-alvo11", status="in_progress"),
+                   mkw("w11b", "ga-alvo11", labels=["story:approved"]),
+                   mkw("w11c", "ga-alvo11", title="Refatorar o dashboard de clientes")])
+    _bad("BM11: fechou o que não é wrapper nunca reivindicado", "closed=%s" % got) if got else \
+        _ok("BM11: mantém in_progress, label rastreada e task que não é wrapper")
+
+    print("Scenario BM12 (ga-2lr3a1): _live_sessions() tem TRÊS estados — lista cheia → o set dos "
+          "vivos; lista vazia → set() (sabido: ninguém vivo); falha/ilegível → None (não sei)")
+    stub_dir2 = tempfile.mkdtemp()
+
+    def _stub(name, body):
+        p = os.path.join(stub_dir2, name)
+        with open(p, "w") as f:
+            f.write(body)
+        return p
+    stubs = {
+        "cheia": _stub("cheia.sh", "echo '{\"sessions\":[{\"session_name\":\"dog-vivo\",\"closed\":false},"
+                                   "{\"session_name\":\"dog-fechado\",\"closed\":true}]}'\n"),
+        "vazia": _stub("vazia.sh", "echo '{\"sessions\":[]}'\n"),
+        "falha": _stub("falha.sh", "echo boom >&2\nexit 3\n"),
+        "lixo": _stub("lixo.sh", "echo 'isto nao e json'\n"),
+        "sem_chave": _stub("sem_chave.sh", "echo '{\"error\":\"x\"}'\n"),
+    }
+    saved_session_bin = SESSION_LIST_BIN
+    saved_sessions_fn = _sessions_fn
+    _sessions_fn = None
+    try:
+        res = {}
+        for k, p in stubs.items():
+            SESSION_LIST_BIN = p
+            res[k] = _live_sessions()
+    finally:
+        SESSION_LIST_BIN = saved_session_bin
+        _sessions_fn = saved_sessions_fn
+        shutil.rmtree(stub_dir2, ignore_errors=True)
+    if res["cheia"] == {"dog-vivo"}:
+        _ok("BM12a: lista cheia → só a sessão não fechada")
+    else:
+        _bad("BM12a: lista cheia lida errado", "got=%r" % (res["cheia"],))
+    if res["vazia"] == set():
+        _ok("BM12b: lista vazia → set() (lido: ninguém vivo)")
+    else:
+        _bad("BM12b: lista vazia lida errado", "got=%r" % (res["vazia"],))
+    _ok("BM12c: gc saiu com erro → None (não sei)") if res["falha"] is None else \
+        _bad("BM12c: falha da leitura virou conjunto (colapsa 'não sei' em 'ninguém vivo')", "got=%r" % (res["falha"],))
+    _ok("BM12d: saída que não é JSON → None") if res["lixo"] is None else \
+        _bad("BM12d: saída ilegível virou conjunto", "got=%r" % (res["lixo"],))
+    _ok("BM12e: JSON sem a lista 'sessions' → None") if res["sem_chave"] is None else \
+        _bad("BM12e: JSON sem 'sessions' virou 'ninguém vivo'", "got=%r" % (res["sem_chave"],))
 
     print("\n[sling-janitor selftest] %d passed, %d failed" % (ok[0], bad[0]))
     sys.exit(1 if bad[0] else 0)
