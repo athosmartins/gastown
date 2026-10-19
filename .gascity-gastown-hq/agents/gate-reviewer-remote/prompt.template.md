@@ -85,15 +85,15 @@ reviewers call it by name.
 
 ## O que o atalho deixa passar
 
-`bd show`, `bd list` (com `--status`, `--assignee`, `--label`, `--parent`, `--limit` até 200, `--id`), `bd update <id> --set-metadata` (só chaves `athos.*` e `story.*`), `bd comment` (até 20.000 caracteres), `bd close`, **`bd label remove <id> verdict:pending` e `bd label add <id> verdict:PASS` ou `verdict:FAIL` (só essas três chaves, sem flag)**, `bd -C <cidade> …` para esses mesmos comandos, `gc prime --hook`, `gc handoff --auto`, `gc mail check|inbox|read|peek|archive`, `gc session nudge`, e `gate-done`.
+`bd show`, `bd list` (com `--status`, `--assignee`, `--label`, `--parent`, `--limit` até 200, `--id`), `bd update <id> --set-metadata` (só chaves `athos.*` e `story.*`), `bd comment` (até 20.000 caracteres), `bd close`, `bd -C <cidade> …` para esses mesmos comandos, `gc prime --hook`, `gc handoff --auto`, `gc mail check|inbox|read|peek|archive`, `gc session nudge`, e `gate-done`.
 
-**Voltam recusados (rc 77), sem executar nada:** qualquer outro rótulo ou subcomando de `bd label` (por exemplo `verdict:REQUEUED`, `gate:*`), `bd show --include-comments`, `bd comments`, `--metadata-field`, `gc bd`, `gc runtime drain-ack`, `gc session peek|pin|wake`. A recusa é do atalho e tem motivo na mensagem; leia antes de repetir. **Não procure outro caminho para fazê-los passar.**
+**Voltam recusados (rc 77), sem executar nada:** `bd label add|remove`, `bd show --include-comments`, `bd comments`, `--metadata-field`, `gc bd`, `gc runtime drain-ack`, `gc session peek|pin|wake`. A recusa é do atalho e tem motivo na mensagem; leia antes de repetir. **Não procure outro caminho para fazê-los passar.**
 
 ## Entregar o veredito
 
-A tarefa traz os comandos EXATOS do veredito, com `bd -C "<cidade>" …` e o id da bead. Rode-os como estão, **uma chamada de Bash por comando**, nesta ordem (o atalho carrega os quatro, ga-6auslu):
+A tarefa traz os comandos EXATOS do veredito, com `bd -C "<cidade>" …` e o id da bead. Rode-os como estão, **uma chamada de Bash por comando**, nesta ordem, com duas diferenças que vêm do atalho:
 
-1. `bd -C … label remove … "verdict:pending"` e `bd -C … label add … "verdict:PASS"` (ou `verdict:FAIL`): rode cada um. Se um deles voltar com erro (rc 77 ou outro), leia a mensagem, **não repita às cegas e siga para o passo 2**: o rótulo é o canal principal, mas o dispatcher lê o veredito do comentário quando o rótulo não chegou; diga no comentário do passo 2 qual rótulo falhou.
+1. `bd -C … label remove … "verdict:pending"` e `bd -C … label add … "verdict:PASS"` (ou `verdict:FAIL`): rode cada um. **rc 77 é o esperado hoje**: o atalho recusa `label`. Não repita, não tente outro caminho, siga para o passo 2. Se um deles passar (o atalho foi alargado), melhor.
 2. `bd -C … comment … "VERDICT: PASS …"` (ou `"VERDICT: FAIL …"`): é o comentário que vale. Mantenha o formato da tarefa **exatamente**: a primeira linha é `VERDICT: PASS` ou `VERDICT: FAIL`, no começo da linha, depois `Summary:` / `Blocking issue N:` / `Non-blocking findings:` como a tarefa mostra. O dispatcher lê o veredito deste comentário quando o rótulo não chegou; um comentário fora desse formato é lido como veredito ausente. Um comentário só, não dois.
 3. `bd -C … close …`: fecha a bead de veredito, **só depois** do comentário ter voltado com sucesso.
 

@@ -24,8 +24,7 @@ LISTA PERMITIDA
   É a tabela RULES (`list` a imprime; o runbook carrega a mesma saída e o selftest confere as duas). Cada regra é uma forma EXATA: palavras
   fixas, flags nomeadas, valores validados; o argv executado é o do cliente, na ordem dele, só com a flag curta trocada pela longa. Flag fora
   da regra, repetida, valor fora do formato, argumento a mais ou a menos → recusa. Sem `--flag=valor`. `bd -C <dir>` só vale para a cidade ou
-  um rig da routes.jsonl (caminho real ou nome); sem routes.jsonl legível o `-C` é recusado. `bd update` só grava chaves ALLOW_META; `bd label` só as 3 chaves do
-  veredito do revisor do gate (remove verdict:pending; add verdict:PASS|verdict:FAIL), sem flag (ga-6auslu); o alvo
+  um rig da routes.jsonl (caminho real ou nome); sem routes.jsonl legível o `-C` é recusado. `bd update` só grava chaves ALLOW_META; o alvo
   de `gc session nudge` tem que casar com `nudge_pattern` (sem a chave na config, nudge não roda).
 
 POR QUE RECUSA EM VEZ DE ADAPTAR (está na lista / não está / não consegui saber — o último não vira "está")
@@ -116,9 +115,7 @@ def v_n(s: str) -> bool:  # --limit 0 é "tudo": varredura de beads inteiros nã
 
 VAL = {"id": _fm(ID), "ids": _fm(ID + "(?:," + ID + "){0,49}"), "word": _fm(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,79}"),
        "status": _fm(r"[a-z_]{1,20}(?:,[a-z_]{1,20}){0,5}"), "kv": v_kv, "text": v_text, "line": v_line, "n": v_n,
-       "delivery": _fm(r"wait-idle|queue"),
-       # ga-6auslu: as ÚNICAS chaves de rótulo que o revisor do gate grava na bead de veredito (gate-review-task.lib.sh); o nome do validador é o que `list` e o runbook mostram
-       "verdict:pending": _fm(r"verdict:pending"), "verdict:PASS|verdict:FAIL": _fm(r"verdict:(?:PASS|FAIL)")}
+       "delivery": _fm(r"wait-idle|queue")}
 _IDENT = r"[A-Za-z0-9][A-Za-z0-9._@/-]{0,95}"
 # única entrada de ambiente aceita do cliente (e o valor tem formato): o servidor declara QUEM é a sessão, nada que aponte caminho
 ENV_VAL = {"GC_AGENT": _IDENT, "GC_ALIAS": _IDENT, "GC_SESSION_NAME": _IDENT, "GC_TEMPLATE": _IDENT,
@@ -203,10 +200,6 @@ RULES = [
     Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}),
     Rule("bd", ["comment"], [("id", 1, 1)], {"--stdin": F(req=True)}),
     Rule("bd", ["close"], [("id", 1, 1)], {**_J, "--reason": F("text", short="-r")}),
-    # ga-6auslu: o revisor do gate no nó grava o veredito com `label remove verdict:pending`, `label add verdict:PASS|FAIL`, `comment` e `close` (o texto da tarefa, gate-review-task.lib.sh).
-    # Sem flag e com a chave exata: nenhum outro rótulo (gate:*, gate-status:*, pilot:*, story:*, verdict:REQUEUED…) passa. Como `comment` e `close`, agem em QUALQUER <id> (ver Limites do runbook).
-    Rule("bd", ["label", "remove"], [("id", 1, 1), ("verdict:pending", 1, 1)]),
-    Rule("bd", ["label", "add"], [("id", 1, 1), ("verdict:PASS|verdict:FAIL", 1, 1)]),
     Rule("gc", ["prime", "--hook"]),
     Rule("gc", ["prime", "--hook", "--hook-format", "codex"]),
     Rule("gc", ["handoff", "--auto"]),

@@ -36,13 +36,6 @@ printf 'texto vindo do stdin' > "$T/stdin.txt"; STDIN_FILE="$T/stdin.txt" allowe
 has "$T/out" "STDIN<texto vindo do stdin>"; ok $? "  o stdin chega ao comando"
 allowed "bd close --reason" bd close ga-1 --reason 'feito ok'; lastis "argv=[close][ga-1][--reason][feito ok]"; ok $? "  argv canônico"
 allowed "bd close -r --json" bd close wa-1.2.3 -r x --json
-# ga-6auslu: o revisor do gate no nó grava EXATAMENTE três chaves de rótulo na bead de veredito (gate-review-task.lib.sh); cada chave tem o seu caso aqui
-# (e o vizinho que não roda, na seção de recusa). O conjunto é travado também em gate-remote-reviewers.selftest.sh (5b), contra o texto REAL da tarefa.
-allowed "bd label remove <id> verdict:pending" bd label remove ga-vb1 verdict:pending; lastis "argv=[label][remove][ga-vb1][verdict:pending]"; ok $? "  argv canônico"
-allowed "bd label add <id> verdict:PASS" bd label add ga-vb1 verdict:PASS; lastis "argv=[label][add][ga-vb1][verdict:PASS]"; ok $? "  argv canônico"
-allowed "bd label add <id> verdict:FAIL" bd label add ga-vb1 verdict:FAIL; lastis "argv=[label][add][ga-vb1][verdict:FAIL]"; ok $? "  argv canônico"
-allowed "bd -C <cidade> label add com id de wisp (a forma literal do texto da tarefa)" bd -C "$CITY" label add ga-wisp-0a1b2 verdict:PASS
-lastis "cwd=$CITY" && lastis "argv=[label][add][ga-wisp-0a1b2][verdict:PASS]"; ok $? "  cwd=cidade e o -C não vai ao bd"
 allowed "gc mail check --inject" gc mail check --inject; lastis "argv=[mail][check][--inject]"; ok $? "  argv canônico"
 allowed "gc mail check" gc mail check
 allowed "gc mail inbox --json" gc mail inbox --json
@@ -103,31 +96,6 @@ denied "bd comment --stdin com texto" "flag fora da lista" bd comment ga-1 oi --
 denied "bd close --reason-file" "flag fora da lista" bd close ga-1 --reason-file /etc/passwd
 denied "bd close --force" "flag fora da lista" bd close ga-1 --force
 denied "bd close sem id" "faltam argumentos" bd close
-# ga-6auslu: os vizinhos de cada chave de rótulo. Só as três formas da seção anterior rodam; o resto do plano de controle de rótulos segue recusado
-denied "bd label add verdict:pending (o revisor só TIRA essa chave)" "fora do formato" bd label add ga-vb1 verdict:pending
-denied "bd label remove verdict:PASS (o revisor nunca retira um veredito)" "fora do formato" bd label remove ga-vb1 verdict:PASS
-denied "bd label remove verdict:FAIL" "fora do formato" bd label remove ga-vb1 verdict:FAIL
-for l in verdict:REQUEUED verdict:TIMEOUT verdict:ABORTED verdict:identity-unlinked verdict:assignee-degraded verdict:pass verdict:PASS2 verdict: \
-         gate:passed gate:needs-fix gate-status:error pilot:no-auto-dispatch story:approved delivery:pending-vm type:quality-gate-verdict; do
-  denied "bd label add $l (rótulo que o dispatcher/o plano de controle escreve, ou variação do verdict:PASS)" "fora do formato" bd label add ga-vb1 "$l"
-done
-denied "bd label add 'verdict:PASS ' (espaço no fim)" "fora do formato" bd label add ga-vb1 'verdict:PASS '
-denied "bd label add verdict:PASS com quebra de linha" "fora do formato" bd label add ga-vb1 $'verdict:PASS\nverdict:FAIL'
-denied "bd label add com 2 rótulos" "argumento a mais" bd label add ga-vb1 verdict:PASS verdict:FAIL
-denied "bd label add em 2 beads" "argumento a mais" bd label add ga-vb1 ga-vb2 verdict:PASS
-denied "bd label add sem rótulo" "faltam argumentos" bd label add ga-vb1
-denied "bd label add sem nada" "faltam argumentos" bd label add
-denied "bd label add com a ordem trocada (rótulo antes do id)" "fora do formato" bd label add verdict:PASS ga-vb1
-denied "bd label add -q" "flag fora da lista" bd label add ga-vb1 verdict:PASS -q
-denied "bd label add --json" "flag fora da lista" bd label add ga-vb1 verdict:PASS --json
-denied "bd label remove -q" "flag fora da lista" bd label remove ga-vb1 verdict:pending -q
-denied "bd label remove sem rótulo" "faltam argumentos" bd label remove ga-vb1
-denied "bd label add com id torto" "fora do formato" bd label add 'ga-1;id' verdict:PASS
-denied "bd label remove com id torto" "fora do formato" bd label remove 'ga-$(id)' verdict:pending
-denied "bd label list" "comando fora da lista" bd label list ga-vb1
-denied "bd label propagate" "comando fora da lista" bd label propagate ga-vb1 verdict:PASS
-denied "bd label (sem subcomando)" "comando fora da lista" bd label
-denied "bd -C fora das rotas label add" "não é a cidade nem um rig" bd -C /etc label add ga-vb1 verdict:PASS
 denied "id com ';'" "fora do formato" bd show 'ga-1;id'
 denied "id com \$()" "fora do formato" bd show 'ga-$(id)'
 denied "id de wisp com ';'" "fora do formato" bd show 'ga-wisp-1;id'
@@ -596,16 +564,6 @@ withmutant call bd $'\x1b]0;evil\x07x'; ! logclean; ok $? "  sem isso o MESMO ar
 mutate '    Rule("bd", ["comment"], [("id", 1, 1), ("text", 1, 50)], {}),
 ' ''; ok $? "controle: a regra 'bd comment <id> <texto>...' existe na RULES"
 b=$(calls); withmutant call bd comment ga-1 'SEGREDO-4711 texto do comentário'; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ] && ! grep -q 'SEGREDO-4711' "$LOGF"; ok $? "  sem a regra o MESMO pedido é recusado e o grep do log também passa: é o 'RODOU' (rc 0 + uma chamada) do caso do SEGREDO que prova o caminho, não o grep"
-mutate '    Rule("bd", ["label", "add"], [("id", 1, 1), ("verdict:PASS|verdict:FAIL", 1, 1)]),
-' ''; ok $? "controle: a regra 'bd label add <id> <verdict:PASS|verdict:FAIL>' existe na RULES (ga-6auslu)"
-b=$(calls); withmutant call bd label add ga-vb1 verdict:PASS; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ]; ok $? "  sem a regra o MESMO pedido é recusado"
-mutate '    Rule("bd", ["label", "remove"], [("id", 1, 1), ("verdict:pending", 1, 1)]),
-' ''; ok $? "controle: a regra 'bd label remove <id> <verdict:pending>' existe na RULES (ga-6auslu)"
-b=$(calls); withmutant call bd label remove ga-vb1 verdict:pending; [ "$RC" = 77 ] && [ "$(calls)" = "$b" ]; ok $? "  sem a regra o MESMO pedido é recusado"
-mutate '"verdict:PASS|verdict:FAIL": _fm(r"verdict:(?:PASS|FAIL)")' '"verdict:PASS|verdict:FAIL": lambda s: True'; ok $? "controle: o formato do rótulo de veredito do 'label add' existe (ga-6auslu)"
-b=$(calls); withmutant call bd label add ga-vb1 gate:passed; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "  sem ele 'gate:passed' passa a rodar (o caso de recusa acima de fato exercita o formato)"
-mutate '"verdict:pending": _fm(r"verdict:pending")' '"verdict:pending": lambda s: True'; ok $? "controle: o formato do rótulo do 'label remove' existe (ga-6auslu)"
-b=$(calls); withmutant call bd label remove ga-vb1 verdict:PASS; [ "$RC" = 0 ] && [ "$(calls)" = $((b+1)) ]; ok $? "  sem ele 'remove verdict:PASS' passa a rodar"
 mutate 'if _LAUNCH["on"]:' 'if False:'; ok $? "controle: o handler de sinal adia o sinal enquanto o Popen está em curso"
 rm -f "$FB/sleep.pid"; withmutant harness termpopen "$(rq bd "$ID" close ga-1 --reason SLEEP)"
 lastlog "done killed sig=15 sem-filho-registrado"; ok $? "  sem o adiamento o MESMO caso volta a sair com 'sem-filho-registrado' (o comando RODANDO, o handler sem filho para matar)"
