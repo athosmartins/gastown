@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""hetzner-occupancy-watch.py — o nó Hetzner pago está trabalhando? Uma leitura a cada 15 min e o número de ocupação por dia. (ga-2hd02v.1.12)
+"""hetzner-occupancy-watch.py — o nó Hetzner pago está trabalhando? Uma leitura a cada 15 min; aviso ao Mayor se ocioso com fila. (ga-2hd02v.1.12)
 
 Contents
-  Regra · Estado · Arquivos · Uso
+  Regra · Estado · Aviso · Arquivos · Uso
 
-REGRA (Athos, 14/10): "Hetzner pago trabalha sempre". O launchd do mini roda isto a cada 900 s (com.gascity.hetzner-occupancy-watch). Cada rodada faz DUAS
+REGRA (Athos, 14/10): "Hetzner pago trabalha sempre". O launchd do mini roda isto a cada 900 s (com.gascity.hetzner-occupancy-watch). Cada rodada faz TRÊS
 leituras, e cada uma tem três estados (leu / não consegui ler / vale X): "não consegui" nunca vira "ocioso" nem "ocupado".
   sessões  `gc session list --json`: sessões com `-remote-` no nome em state active/awake (as de `-remote-mbp-` são de outro host e não contam)
   CPU      `ssh hetzner-teste` lê o /proc/stat: núcleos ocupados NA JANELA desde a leitura anterior (uma rajada entre duas leituras aparece; um instante não vale)
+  fila     ~/.gc/pilot-dispatchable.json (o Pilot a grava a cada rodada): só as lojas elegíveis (hq), com idade e ttl conferidos
 ESTADO   ocupado = sessão remota ativa OU CPU >= régua (0,5 núcleo, HETZNER_OCC_BUSY_CORES): uma prova basta
          ocioso  = sessões e CPU lidas e as duas dizem ocioso
          desconhecido = o resto (inclui a 1ª leitura, que só semeia o baseline de CPU)
-         Este vigia só MEDE e grava em <cidade>/.gc: não manda mail, não avisa ninguém, não atribui nem despacha nada. O aviso ao Mayor é a fatia seguinte desta bead.
+AVISO    ao Mayor por `gc mail send` (não nudge: o nudge ao Mayor trava com a sessão anexada, ga-eldeu). Só avisa; não atribui nem despacha nada.
+  ocioso   ocioso há >= 30 min (3 leituras seguidas, 2 min de folga para o jitter do launchd) COM fila > 0; cooldown de 3 h; o mail que falha não gasta o cooldown
+  cego     nenhuma leitura decidiu há >= 1 h (sessões, CPU ou fila ilegíveis); cooldown de 6 h
+  foco     o foco do gate (gate-focus.state, mesma regra de 3 estados da gate-focus-lib.sh) liga: só conserto é despachado, então o aviso de ocioso se cala
+  chave    o aviso só sai com <cidade>/.gc/hetzner-occupancy-alarm.on presente (e sem HETZNER_OCC_ALARM=0): sem ela é o modo só-medir, INERTE de propósito (mede e grava, nunca manda mail)
 ARQUIVOS (só em <cidade>/.gc): hetzner-occupancy.jsonl (uma leitura por rodada) · hetzner-occupancy-daily.json (o número por dia: ocupado/ocioso/desconhecido e
-  ocupacao_pct = ocupado/(ocupado+ocioso), null se nenhuma leitura decidiu) · hetzner-occupancy.state.json (baseline de CPU) · hetzner-occupancy.lock.
+  ocupacao_pct = ocupado/(ocupado+ocioso), null se nenhuma leitura decidiu) · hetzner-occupancy.state.json (baseline de CPU e contadores) · hetzner-occupancy.lock.
   Arquivo corrompido não some: a cópia fica em <arquivo>.corrupt-<epoch>.
 USO      hetzner-occupancy-watch.py [--print] [--dry-run] [--print-config]
          exit 0 ok (inclui "outra instância rodando") · 1 crash (traceback no stderr) · 3 não consegui gravar
 """
 import argparse
+import calendar
 import errno
 import fcntl
 import json
@@ -34,6 +40,7 @@ from types import SimpleNamespace
 DEFAULT_CITY = "/Users/athos/gt/.gascity-gastown-hq"
 LIVE = frozenset({"active", "awake"})  # = bead_state.LIVE_SESSION_STATES
 DEAD = frozenset({"asleep", "drained", "closed", "archived", "quarantined", "failed-create"})  # = bead_state.DEAD_SESSION_STATES
+WARMUP = frozenset({"sem-leitura-anterior", "leitura-anterior-velha", "contador-recuou", "relogio-recuou"})  # a CPU só semeou o baseline: não é "cego"
 BEGIN, END = "@@OCC-BEGIN@@", "@@OCC-END@@"
 REMOTE_CMD = "echo %s; grep '^cpu' /proc/stat; echo %s" % (BEGIN, END)
 
@@ -52,26 +59,40 @@ def _num(env, key, default, cast, lo):
     return v
 
 
-def _names(env, key, default):
-    return [s.strip() for s in env.get(key, default).split(",") if s.strip()]
+def _names(env, key, default, allow_empty=False):
+    out = [s.strip() for s in env.get(key, default).split(",") if s.strip()]
+    if not out and not allow_empty:
+        raise ValueError("%s vazio" % key)
+    return out
 
 
 def load_config(env):
     city = env.get("GC_CITY_PATH") or DEFAULT_CITY
+    home = env.get("HOME") or os.path.expanduser("~")
     interval = _num(env, "HETZNER_OCC_INTERVAL_S", 900, int, 60)
     c = SimpleNamespace(
         city=city, gc_dir=os.path.join(city, ".gc"), interval_s=interval,
         busy_cores=_num(env, "HETZNER_OCC_BUSY_CORES", 0.5, float, 0.01),
-        other_hosts=_names(env, "HETZNER_OCC_OTHER_HOSTS", "mbp"),
+        stores=_names(env, "HETZNER_OCC_STORES", "hq"),
+        other_hosts=_names(env, "HETZNER_OCC_OTHER_HOSTS", "mbp", True),
         ssh_host=env.get("HETZNER_SSH_HOST", "hetzner-teste"),
-        min_window_s=120, max_window_s=3 * interval,
+        idle_after_s=_num(env, "HETZNER_OCC_IDLE_AFTER_S", 1800, int, 60),
+        blind_after_s=_num(env, "HETZNER_OCC_BLIND_AFTER_S", 3600, int, 60),
+        slack_s=120,  # o launchd não é relógio suíço: 3 leituras a 890 s ainda são "30 min"
+        idle_cooldown_s=_num(env, "HETZNER_OCC_IDLE_COOLDOWN_S", 10800, int, 0),
+        blind_cooldown_s=_num(env, "HETZNER_OCC_BLIND_COOLDOWN_S", 21600, int, 0),
+        min_window_s=120, max_window_s=3 * interval, future_tol_s=60,
         ssh_timeout_s=_num(env, "HETZNER_OCC_SSH_TIMEOUT_S", 30, int, 1),
         gc_timeout_s=_num(env, "HETZNER_OCC_GC_TIMEOUT_S", 60, int, 1),
+        focus_stale_s=_num(env, "GATE_FOCUS_STALE_S", 7200, int, 1),
+        pilot_file=env.get("HETZNER_OCC_PILOT_FILE") or os.path.join(home, ".gc", "pilot-dispatchable.json"),
         gc_bin=env.get("GC_BIN", "gc"), ssh_bin=env.get("SSH_BIN", "ssh"),
         now=_now(env),
     )
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]*", c.ssh_host):
         raise ValueError("HETZNER_SSH_HOST inválido: %r" % c.ssh_host)
+    c.alarm_key = os.path.join(c.gc_dir, "hetzner-occupancy-alarm.on")
+    c.alarm = env.get("HETZNER_OCC_ALARM") != "0" and os.path.exists(c.alarm_key)  # chave ilegível/ausente = desligado (o estado inerte)
     return c
 
 
@@ -309,7 +330,67 @@ def read_cpu(c, base, now):
     return cpu, now_b, cores
 
 
-# ---- estado e execução -------------------------------------------------------------------------------------------------------------------------------
+# ---- leitura 3: fila do Pilot e foco do gate ---------------------------------------------------------------------------------------------------------
+def _iso_epoch(s):
+    try:
+        return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return None
+
+
+def read_queue(c, now):
+    r = {"lido": False, "n": None, "ids": [], "motivo": None}
+    try:
+        with open(c.pilot_file, encoding="utf-8") as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        r["motivo"] = "arquivo-ausente"
+        return r
+    except (OSError, ValueError):
+        r["motivo"] = "arquivo-ilegivel"
+        return r
+    items = d.get("items") if isinstance(d, dict) else None
+    if not isinstance(items, list):
+        r["motivo"] = "forma-desconhecida"
+        return r
+    gen, ttl = _iso_epoch(d.get("generated_at")), d.get("ttl_seconds")
+    if gen is None:
+        r["motivo"] = "generated_at-ilegivel"
+    elif isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+        r["motivo"] = "sem-ttl"
+    elif now - gen > ttl:
+        r["motivo"] = "velho"  # só passa do ttl é velho (mesma conta do approved-state-reconciler)
+    elif now - gen < -c.future_tol_s:
+        r["motivo"] = "no-futuro"
+    elif not all(isinstance(it, dict) and isinstance(it.get("store"), str) for it in items):
+        r["motivo"] = "forma-desconhecida"
+    if r["motivo"]:
+        return r
+    elig = [str(it.get("id", "?")) for it in items if it["store"] in c.stores]
+    r.update(lido=True, n=len(elig), ids=elig[:5])
+    return r
+
+
+def read_focus(c, now):
+    """ligado / desligado / desconhecido: a mesma regra de gate_focus_active (gate-focus-lib.sh); desconhecido avisa como se estivesse desligado."""
+    kv = {}
+    try:
+        with open(os.path.join(c.gc_dir, "gate-focus.state"), encoding="utf-8") as f:
+            for ln in f:
+                k, sep, v = ln.rstrip("\n").partition("=")
+                if sep and k not in kv:
+                    kv[k] = v
+    except (OSError, ValueError):
+        return "desconhecido"
+    active, at = kv.get("active"), kv.get("at", "")
+    if active not in ("0", "1") or not re.fullmatch(r"[0-9]+", at):
+        return "desconhecido"
+    if now - int(at) > c.focus_stale_s or int(at) > now + 60:
+        return "desconhecido"
+    return "ligado" if active == "1" else "desligado"
+
+
+# ---- estado, sequências e aviso ----------------------------------------------------------------------------------------------------------------------
 def decide(sess, cpu, cores, busy_cores):
     if (sess["lido"] and sess["ativas"]) or (cpu["lido"] and cores >= busy_cores):
         return "ocupado"
@@ -318,10 +399,65 @@ def decide(sess, cpu, cores, busy_cores):
     return "desconhecido"
 
 
+def _int(v, default=None):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else default
+
+
+def _mins(s):
+    return int(round(s / 60.0))
+
+
+def idle_mail(c, rd, span):
+    fila, sess, cpu = rd["fila"], rd["sessoes"], rd["cpu"]
+    foco = rd["foco"] + (" (tratado como desligado)" if rd["foco"] == "desconhecido" else "")
+    subj = "Hetzner ocioso há %d min com %d bead(s) aprovada(s) na fila" % (_mins(span), fila["n"])
+    body = "\n".join([
+        "Estado do mundo: o nó Hetzner (%s) está OCIOSO há %d min (%d leituras seguidas, a cada %d min) e o Pilot tem %d bead(s) aprovada(s) esperando. "
+        "Regra do Athos (14/10): o Hetzner pago trabalha sempre." % (c.ssh_host, _mins(span), rd["ociosas_seguidas"], _mins(c.interval_s), fila["n"]),
+        "• sessões remotas ativas: %s · CPU: %s núcleo(s) ocupado(s) de %s na última janela de %s s (régua: %s)" % (sess["ativas"], cpu["nucleos"], cpu["ncpu"], cpu["janela_s"], c.busy_cores),
+        "• fila (até %d; primeiros ids): %s" % (fila["n"], ", ".join(fila["ids"])),
+        "• foco do gate: " + foco,
+        "A fila é lida do pilot-dispatchable.json ANTES dos vetos de pool e do freio de top-up: parte dela pode estar vetada, então o número é um teto, não uma promessa.",
+        "O vigia só mede e avisa: não atribui nem despacha nada. Próximo aviso deste tipo em no mínimo %d h. Voltar a só-medir: rm %s" % (c.idle_cooldown_s // 3600, c.alarm_key),
+    ])
+    return subj, body
+
+
+def blind_mail(c, rd, span):
+    sess, cpu, fila = rd["sessoes"], rd["cpu"], rd["fila"]
+    subj = "Hetzner: vigia de ocupação CEGO há %d min (não consigo medir)" % _mins(span)
+    body = "\n".join([
+        "Estado do mundo: há %d min (%d leituras) o vigia não consegue dizer se o nó Hetzner está ocioso ou ocupado. Enquanto isso NENHUM aviso de ocioso sai "
+        "(leitura que falha nunca vira \"ocioso\")." % (_mins(span), rd["cegas_seguidas"]),
+        "• sessões: %s · CPU: %s · fila: %s" % (sess["motivo"] or "ok", cpu["motivo"] or "ok", fila["motivo"] or "ok"),
+        "• detalhe: %s" % (_oneline(sess.get("detalhe", "") + " " + cpu.get("detalhe", ""), 200) or "-"),
+        "Conferir no mini: a lista de sessões do gc, o ssh %s e a idade do ~/.gc/pilot-dispatchable.json. Próximo aviso deste tipo em no mínimo %d h." % (c.ssh_host, c.blind_cooldown_s // 3600),
+    ])
+    return subj, body
+
+
+def send_mail(c, subj, body):
+    rc, _o, _e, why = run_cmd([c.gc_bin, "--city", c.city, "mail", "send", "mayor", "-s", subj, "-m", body], 45)
+    return why is None and rc == 0
+
+
+def _plan(c, due, last_at, cooldown_s, now, dry, silent=None):
+    if not due:
+        return "nao"
+    if not c.alarm:
+        return "desligado"
+    if silent:
+        return silent
+    if last_at is not None and 0 <= now - last_at < cooldown_s:
+        return "cooldown"
+    return "enviaria" if dry else "enviar"
+
+
 def run(args, env):
     c = load_config(env)
     if args.print_config:
-        keys = ("city", "interval_s", "busy_cores", "other_hosts", "ssh_host", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s")
+        keys = ("city", "interval_s", "busy_cores", "stores", "other_hosts", "ssh_host", "alarm", "alarm_key", "idle_after_s", "blind_after_s", "slack_s",
+                "idle_cooldown_s", "blind_cooldown_s", "min_window_s", "max_window_s", "ssh_timeout_s", "gc_timeout_s", "pilot_file")
         print(json.dumps({k: getattr(c, k) for k in keys}, ensure_ascii=False, indent=2))
         return 0
     now, dry = c.now, args.dry_run
@@ -333,15 +469,47 @@ def run(args, env):
 
     sess = read_sessions(c)
     cpu, new_base, cores = read_cpu(c, st.get("cpu"), now)
+    fila, foco = read_queue(c, now), read_focus(c, now)
     est = decide(sess, cpu, cores, c.busy_cores)
 
-    rd = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)), "epoch": now, "estado": est, "sessoes": sess, "cpu": cpu}
+    decided = est == "ocupado" or (est == "ocioso" and fila["lido"])
+    warm = est == "desconhecido" and sess["lido"] and cpu["motivo"] in WARMUP
+    prev_ocio = _int(st.get("ociosas_seguidas"), 0)
+    ocio = prev_ocio + 1 if est == "ocioso" else 0
+    ocio_desde = (_int(st.get("ocioso_desde"), now) if prev_ocio > 0 else now) if est == "ocioso" else None
+    cegas = 0 if decided else _int(st.get("cegas_seguidas"), 0) + (0 if warm else 1)
+    decidida_em = now if decided else _int(st.get("decidida_em"), now)  # sem nenhuma decidida ainda, conta desde a 1ª leitura
+
+    rd = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)), "epoch": now, "estado": est, "sessoes": sess, "cpu": cpu, "fila": fila, "foco": foco,
+          "ociosas_seguidas": ocio, "cegas_seguidas": cegas}
+    idle_due = est == "ocioso" and fila["lido"] and fila["n"] > 0 and now - ocio_desde >= c.idle_after_s - c.slack_s
+    blind_due = cegas > 0 and now - decidida_em >= c.blind_after_s - c.slack_s
+    last_idle, last_blind = _int(st.get("alarme_ocioso_em")), _int(st.get("alarme_cego_em"))
+    a_idle = _plan(c, idle_due, last_idle, c.idle_cooldown_s, now, dry, "foco" if foco == "ligado" else None)
+    a_blind = _plan(c, blind_due, last_blind, c.blind_cooldown_s, now, dry)
+    rd["alarme"] = {"ocioso": a_idle, "cego": a_blind}
     if dry:
         rd["dry_run"] = True
 
-    new_st = {"versao": 1, "cpu": new_base or (st.get("cpu") if _baseline_ok(st.get("cpu")) else None), "atualizado_em": now}
+    new_st = {"versao": 1, "cpu": new_base or (st.get("cpu") if _baseline_ok(st.get("cpu")) else None), "ociosas_seguidas": ocio, "ocioso_desde": ocio_desde,
+              "cegas_seguidas": cegas, "decidida_em": decidida_em, "alarme_ocioso_em": last_idle, "alarme_cego_em": last_blind, "atualizado_em": now}
+    sends = []  # (chave do estado, valor antigo, assunto, corpo)
+    if a_idle == "enviar":
+        sends.append(("alarme_ocioso_em", last_idle, ("ocioso",)) + idle_mail(c, rd, now - ocio_desde))
+    if a_blind == "enviar":
+        sends.append(("alarme_cego_em", last_blind, ("cego",)) + blind_mail(c, rd, now - decidida_em))
     if not dry:
+        for key, _old, _k, _s, _b in sends:
+            new_st[key] = now  # o cooldown é gravado ANTES do mail: se não der para gravar, o mail nem sai (nada de repetir a cada rodada)
         write_atomic(state_path, json.dumps(new_st, ensure_ascii=False, sort_keys=True, indent=1))
+        failed = False
+        for key, old, (kind,), subj, body in sends:
+            ok = send_mail(c, subj, body)
+            rd["alarme"][kind] = "enviado" if ok else "falhou"
+            if not ok:
+                new_st[key], failed = old, True  # mail que falha não gasta o cooldown: a próxima rodada tenta de novo
+        if failed:
+            write_atomic(state_path, json.dumps(new_st, ensure_ascii=False, sort_keys=True, indent=1))
         append_line(os.path.join(c.gc_dir, "hetzner-occupancy.jsonl"), json.dumps(rd, ensure_ascii=False, separators=(",", ":")))
         daily_path = os.path.join(c.gc_dir, "hetzner-occupancy-daily.json")
         daily = load_json(daily_path, lambda o: isinstance(o, dict) and isinstance(o.get("dias"), dict), now, dry) or {"dias": {}}
@@ -355,7 +523,8 @@ def run(args, env):
     if args.show:
         print(json.dumps(rd, ensure_ascii=False, indent=2))
     else:
-        print("%s estado=%s sessoes=%s cpu=%s" % (rd["ts"], est, sess["ativas"], cpu["nucleos"]))
+        print("%s estado=%s sessoes=%s cpu=%s fila=%s foco=%s ociosas=%d cegas=%d alarme=%s/%s" % (
+            rd["ts"], est, sess["ativas"], cpu["nucleos"], fila["n"], foco, ocio, cegas, rd["alarme"]["ocioso"], rd["alarme"]["cego"]))
     return 0
 
 
@@ -367,7 +536,7 @@ def main(argv):
             pass
     ap = argparse.ArgumentParser(description="vigia de ocupação do nó Hetzner (ga-2hd02v.1.12)")
     ap.add_argument("--print", dest="show", action="store_true", help="imprime a leitura (JSON) em vez do resumo de uma linha")
-    ap.add_argument("--dry-run", action="store_true", help="lê tudo e mostra o que faria; não grava nada")
+    ap.add_argument("--dry-run", action="store_true", help="lê tudo e mostra o que faria; não grava nada nem manda mail")
     ap.add_argument("--print-config", action="store_true", help="imprime a configuração em vigor e sai")
     args = ap.parse_args(argv)
     try:
