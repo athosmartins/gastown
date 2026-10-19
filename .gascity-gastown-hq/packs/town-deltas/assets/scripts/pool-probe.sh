@@ -58,7 +58,8 @@ mark() {
 # The city's own formula work still flows - it is what gets the city out of the hole: order molecules and their steps
 # (the stale-db cleanup: type molecule / step, gc.pool_demand, gc.step_ref - no gc.kind), gc.kind work, and tiers 2 and 3.
 # What counts as a story is ONE definition, DISK_HOLD_NEW_STORIES_JQ in the lib; a shape it does not recognise flows.
-# This is the one place where the answer deliberately differs from the engine's probe, and only while the disk is low:
+# This is one of the two places where the answer deliberately differs from the engine's probe (the other is the sling filter,
+# ga-b97dgq, below), and it differs only while the disk is low:
 # with the disk fine (or unreadable) stdout, the bd calls and the exit code are byte-for-byte the engine's.
 # `[]` from the hold is a real "nothing for you": drain, do not look for a story by another route.
 # The hold runs AFTER the engine's --limit=20 window (ga-nyug12): 20 stories older than a formula bead would fill the window,
@@ -131,6 +132,21 @@ drop_molecules_in_flight() {
   printf "%s" "$cands" | jq -c --arg ids "$keep_ids" '($ids | split("\n") | map(select(length > 0))) as $keep | [.[] | select(.id as $i | $keep | index($i) != null)]' 2>/dev/null
 }
 
+# Sling wisps whose story is already in live hands (ga-b97dgq): the filter is `drop_slings_for_taken_stories`, defined in
+# pool-probe-sling-lib.sh (its comment says what "in hand" means and the three states). It is applied to the candidates of
+# every tier BEFORE the oldest-pick: after it, a duplicate wisp that is the oldest would empty the answer while legitimate
+# work waits right behind it. This is the second deliberate difference from the engine's answer (the first is the disk floor).
+# vazio/falhou/ilegível (lib missing, or it does not source cleanly) -> the pass-through below stays: the tier answers exactly
+# as the engine's probe would, and a line in the pool-probe log says the filter is off. The lib is tried in a subshell first so a
+# corrupt copy cannot kill the probe.
+drop_slings_for_taken_stories() { cat; }
+sling_lib="${POOL_PROBE_SLING_LIB:-$(dirname "$0")/pool-probe-sling-lib.sh}"
+if [ -f "$sling_lib" ] && ( . "$sling_lib" ) >/dev/null 2>&1; then
+  . "$sling_lib"
+else
+  pp_log "sling filter lib missing or corrupt (lib=$sling_lib) - sling wisps are NOT filtered, tiers answer as the engine's probe would (ga-b97dgq)"
+fi
+
 # Print $1 and stop the whole probe when it holds a bead.
 found() {
   [ -n "$1" ] && [ "$1" != "[]" ] && printf "%s" "$1" && exit 0
@@ -192,20 +208,21 @@ if [ "$disk_state" = low ]; then
     pp_log "free disk under the floor but the hold could not be applied (lib or jq) - tier 1 answers nothing (ga-vln2py)"
   fi
 fi
+t1_kept=$(printf "%s" "$t1_kept" | drop_slings_for_taken_stories)   # ga-b97dgq: its own statement, so the line below stays the text work-order.registry.tsv matches
 r=$(printf "%s" "$t1_kept" | drop_molecules_in_flight | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null)
 found "$r"
 
 # Tier 2 (legacy): workflow beads that carry gc.run_target=<target> and no gc.routed_to.
 legacy_candidates=$(bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit=20 2>/dev/null) || mark 2
 t2_unrouted=$(printf "%s" "$legacy_candidates" | jq '[.[] | select((.metadata["gc.routed_to"] // "") == "")]' 2>/dev/null) || mark 2
-r=$(printf "%s" "$t2_unrouted" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null | jq -c '.[0:1]' 2>/dev/null)
+r=$(printf "%s" "$t2_unrouted" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null | drop_slings_for_taken_stories | jq -c '.[0:1]' 2>/dev/null)
 found "$r"
 
 # Tier 3 (legacy, ephemeral store): open, unassigned, no open blocking dependency. As in the engine, a
 # jq that fails leaves "[]" appended to whatever it printed.
 t3_raw=$(bd query --json 'ephemeral=true AND status=open AND assignee=none' --limit=0 2>/dev/null) || mark 3
 legacy_ephemeral_candidates=$(printf "%s" "$t3_raw" | jq --arg target "$target" '[.[] | select((.assignee // "") == "") | select(((.metadata["gc.routed_to"] // "") == $target) or (((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.run_target"] // "") == $target) and ((.metadata["gc.kind"] // "") == "workflow"))) | select(((.issue_type // .type // "") != "epic")) | select(([ (.dependencies // [])[] | select((.type // .dep_type // "") as $t | ($t == "blocks" or $t == "waits-for" or $t == "conditional-blocks")) | select((.status // .depends_on_status // "") != "closed") ] | length) == 0)] | sort_by(.created_at // "") | .[:20]' 2>/dev/null) || { mark 3; legacy_ephemeral_candidates="$legacy_ephemeral_candidates[]"; }
-r=$(printf "%s" "$legacy_ephemeral_candidates" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null | jq -c '.[0:1]' 2>/dev/null)
+r=$(printf "%s" "$legacy_ephemeral_candidates" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null | drop_slings_for_taken_stories | jq -c '.[0:1]' 2>/dev/null)
 found "$r"
 
 printf "[]"
