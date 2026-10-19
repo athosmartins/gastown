@@ -11,7 +11,7 @@
 # O QUE PROVA: (1) a cadeia de gates, EXECUTADA (a região verbatim do dispatcher, de cota até quiet hours, com os leitores falsos): disco baixo + on + fora do DRY_RUN segue em passada só-nó e grava a pausa
 #   "disk-floor" · off, shadow, valor que não existe, vazio e DRY_RUN pausam e saem como sempre · disco ok ou ilegível nunca liga a passada só-nó · cota e RAM pausam ANTES do disco, drain e quiet hours DEPOIS
 #   dele, e todos continuam saindo com disco baixo + on. (2) o limpa-pausa (ga-nq0jo) não roda na passada só-nó (o painel não pode ler "sem pausa" com o disco ainda baixo) · o top-up de pool não abre sessão
-#   no mini · a varredura só-nó que despachou 0 não conta no streak de estagnação do Step 5 (e não o zera) · a checagem de cessões consecutivas do priority yield (ga-2lca0l) não roda nela (PRIORITY_YIELDED é 0 e apagaria o contador). (3) a decisão pré-claim `_pilot_node_only_candidate_pre`: node com vaga → candidata; local, oráculo
+#   no mini · a varredura só-nó que despachou 0 não conta no streak de estagnação do Step 5 (e não o zera) · a checagem de cessões consecutivas do priority yield (ga-2lca0l) sai na 1a guarda dela nessa passada (PRIORITY_YIELDED é 0 e apagaria o contador). (3) a decisão pré-claim `_pilot_node_only_candidate_pre`: node com vaga → candidata; local, oráculo
 #   mudo, JSON ilegível, node sem effective, veto, wa-worker/ps-worker, bead de outro store ou de outro rig → NÃO (nada é escrito). (4) os pontos de chamada, na ordem: o que não é candidata é pulado antes da
 #   claim · a que o nó não fica solta a claim e nunca chega ao despacho ao mini.
 # COMO RODA: as funções e as regiões são extraídas VERBATIM do dispatcher (awk) e rodam em shells filhos sob `set -euo pipefail` com leitores falsos; `python3` é o oráculo falso do PATH do filho
@@ -40,10 +40,10 @@ GATE_SRC="$(region '^if \[ "\$_PILOT_QUOTA_STATE" = "limited" \]; then$' '^# ─
 CLEAR_SRC="$(region '^# ga-nq0jo: reaching here' '^# ── Step 0: TTL recovery')"
 FUNC_TOPUP="$(fn_src _pilot_pool_topup)"
 STALL_SRC="$(region '^PILOT_STALL_STATE=' '^# ga-2lca0l \(3\)')"
-YSTALL_SRC="$(region '^# ga-2lca0l \(3\)' '^log "=== Pilot sweep complete')"
+FUNC_YSTALL="$(fn_src _pilot_yield_stall_check)"
 { [ -n "$FUNC_EXEMPT" ] && [ -n "$FUNC_PRE" ] && [ -n "$FUNC_SHADOW" ] && [ -n "$FUNC_VETO" ] && [ -n "$FUNC_BOUND" ] && [ -n "$VETO_LINE" ] && [ -n "$PNY_INIT" ]; } \
   || { echo "FATAL: ga-2hd02v.1.19 não aplicada (funções ou linhas de configuração do nó não achadas em $DISPATCHER)" >&2; exit 2; }
-{ [ -n "$GATE_SRC" ] && [ -n "$CLEAR_SRC" ] && [ -n "$FUNC_TOPUP" ] && [ -n "$STALL_SRC" ] && [ -n "$YSTALL_SRC" ]; } || { echo "FATAL: região ou função do dispatcher não achada (gates / limpa-pausa / _pilot_pool_topup / Step 5 / cessões consecutivas) em $DISPATCHER" >&2; exit 2; }
+{ [ -n "$GATE_SRC" ] && [ -n "$CLEAR_SRC" ] && [ -n "$FUNC_TOPUP" ] && [ -n "$STALL_SRC" ] && [ -n "$FUNC_YSTALL" ]; } || { echo "FATAL: região ou função do dispatcher não achada (gates / limpa-pausa / _pilot_pool_topup / Step 5 / cessões consecutivas) em $DISPATCHER" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-diskfloor-nodeonly-selftest.XXXXXX")"
 trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
@@ -60,7 +60,7 @@ EOF
 chmod +x "$WORK/bin/python3"
 sandbox_path_init "$WORK" jq date timeout mkdir dirname cat rm || exit 2
 LINES="$WORK/lines.txt"; STALL="$WORK/city/.gc/pilot-dispatcher-stall.count"
-reset() { rm -f "$WORK"/oracle.out "$WORK"/oracle.rc "$WORK"/oracle.calls "$WORK"/pause.calls "$WORK"/topup.calls "$WORK"/ystall.calls "$LINES" "$STALL"; }
+reset() { rm -f "$WORK"/oracle.out "$WORK"/oracle.rc "$WORK"/oracle.calls "$WORK"/pause.calls "$WORK"/topup.calls "$WORK"/ystall.state "$LINES" "$STALL"; }
 oracle() { printf '%s' "$2" > "$WORK/oracle.out"; echo "$1" > "$WORK/oracle.rc"; }
 calls() { [ -f "$WORK/oracle.calls" ] && wc -l < "$WORK/oracle.calls" | tr -d ' ' || echo 0; }
 
@@ -148,12 +148,17 @@ GC_CITY="$WORK/city"; DRY_RUN=0; DISPATCHED="${ST_DISPATCHED:-0}"; SMALL_SLOTS=2
 [ -z "${NODE_ONLY+x}" ] || _PILOT_NODE_ONLY="$NODE_ONLY"
 eval "$STALL_SRC"
 EOF
-# a checagem de cessões consecutivas (ga-2lca0l) é falsa: só conta a chamada. vazio (variável nunca definida) → varredura normal, roda; falhou/ilegível (região que o awk não leu) → o FATAL lá em cima
+# a FUNÇÃO real _pilot_yield_stall_check (a guarda mora nela, não no chamador: a chamada fica no topo do arquivo, como I11 do selftest do priority yield exige), com um arquivo de estado semeado e os contadores de uma varredura
+# que NÃO cedeu (DISPATCHED=0, PRIORITY_YIELDED=0): fora da passada só-nó o ramo "não cedeu" APAGA o arquivo (é o que encerra uma sequência); na passada só-nó a função sai antes e o arquivo fica como estava.
+# vazio (variável nunca definida) → varredura normal, apaga; falhou/ilegível (função que o awk não leu) → o FATAL lá em cima
 cat > "$WORK/ystall-runner.sh" <<'EOF'
 set -euo pipefail
-_pilot_yield_stall_check() { echo x >> "$WORK/ystall.calls"; }
+warn() { echo "WARN $*"; }; notify() { echo "NOTIFY $*"; }
+DRY_RUN=0; DISPATCHED=0; PRIORITY_YIELDED=0; SMALL_SLOTS=2; BIG_SLOTS=0; _PY_WAIT_ID=""
+PILOT_YIELD_STALL_FILE="$WORK/ystall.state"
 [ -z "${NODE_ONLY+x}" ] || _PILOT_NODE_ONLY="$NODE_ONLY"
-eval "$YSTALL_SRC"
+eval "$FUNC_YSTALL"
+_pilot_yield_stall_check
 EOF
 echo "── (2) limpa-pausa (ga-nq0jo): a passada só-nó não escreve 'sem pausa' com o disco ainda baixo"
 reset; env CLEAR_SRC="$CLEAR_SRC" WORK="$WORK" NODE_ONLY=1 bash "$WORK/clear-runner.sh" >/dev/null 2>&1
@@ -180,12 +185,17 @@ reset; [ "$(st NODE_ONLY=1)" = nada ] && ok "node_only=1: o streak NÃO é criad
 reset; echo 2 > "$STALL"; [ "$(st NODE_ONLY=1)" = 2 ] && ok "node_only=1 com streak 2: continua 2 (nem conta, nem zera)" || bad "varredura só-nó mexeu num streak existente"
 reset; echo 2 > "$STALL"; [ "$(st NODE_ONLY=0 ST_DISPATCHED=1)" = nada ] && ok "node_only=0 com despacho (controle): o streak é zerado" || bad "o controle de zerar o streak não zerou"
 echo "── (2) cessões consecutivas do priority yield (ga-2lca0l): a passada só-nó não apaga o contador"
-reset; env YSTALL_SRC="$YSTALL_SRC" WORK="$WORK" NODE_ONLY=1 bash "$WORK/ystall-runner.sh" >/dev/null 2>&1
-[ ! -s "$WORK/ystall.calls" ] && ok "node_only=1: a checagem NÃO roda (PRIORITY_YIELDED é 0 na passada só-nó e ela apagaria o contador que a pausa só interrompeu)" || bad "node_only=1 chamou a checagem de cessões consecutivas"
-reset; env YSTALL_SRC="$YSTALL_SRC" WORK="$WORK" NODE_ONLY=0 bash "$WORK/ystall-runner.sh" >/dev/null 2>&1
-[ "$(wc -l < "$WORK/ystall.calls" 2>/dev/null | tr -d ' ')" = 1 ] && ok "node_only=0 (controle): a checagem roda uma vez, como sempre" || bad "node_only=0 não rodou a checagem — o harness não prova nada"
-reset; env YSTALL_SRC="$YSTALL_SRC" WORK="$WORK" bash "$WORK/ystall-runner.sh" >/dev/null 2>&1
-[ "$(wc -l < "$WORK/ystall.calls" 2>/dev/null | tr -d ' ')" = 1 ] && ok "variável nunca definida: vale varredura normal (a checagem roda)" || bad "sem _PILOT_NODE_ONLY a checagem não rodou"
+yst() { env FUNC_YSTALL="$FUNC_YSTALL" WORK="$WORK" "$@" bash "$WORK/ystall-runner.sh" >/dev/null 2>&1; }
+yseed() { printf '3\tga-x\t\n' > "$WORK/ystall.state"; }
+reset; yseed; YS_RC=0; yst NODE_ONLY=1 || YS_RC=$?
+{ [ "$YS_RC" = 0 ] && [ "$(cat "$WORK/ystall.state" 2>/dev/null)" = "$(printf '3\tga-x\t')" ]; } \
+  && ok "node_only=1: o contador de cessões consecutivas fica como estava (PRIORITY_YIELDED é 0 na passada só-nó e o ramo \"não cedeu\" o apagaria)" || bad "node_only=1 mexeu no contador de cessões consecutivas (rc=$YS_RC; arquivo: $(cat "$WORK/ystall.state" 2>/dev/null || echo APAGADO))"
+reset; yseed; YS_RC=0; yst NODE_ONLY=0 || YS_RC=$?
+{ [ "$YS_RC" = 0 ] && [ ! -e "$WORK/ystall.state" ]; } \
+  && ok "node_only=0 (controle): a varredura que não cedeu APAGA o contador, como sempre" || bad "node_only=0 não apagou o contador — o harness não prova nada (rc=$YS_RC)"
+reset; yseed; YS_RC=0; yst || YS_RC=$?
+{ [ "$YS_RC" = 0 ] && [ ! -e "$WORK/ystall.state" ]; } \
+  && ok "variável nunca definida: vale varredura normal (apaga, como o base)" || bad "sem _PILOT_NODE_ONLY o contador não foi apagado (rc=$YS_RC)"
 
 # ── (3) a decisão pré-claim: o que o nó quer, ANTES da claim ──────────────────────────────────────────────────────────────────────────────────────
 run_nc() {
@@ -246,9 +256,9 @@ L_SLING=$(grep -n 'Dispatch via gc sling (HQ beads)' "$DISPATCHER" | head -1 | c
   || bad "as duas saídas da passada só-nó não estão na ordem esperada (rel1=$L_REL1 gancho=$L_HOOK rel2=$L_REL2 sling=$L_SLING)"
 # as duas chamadas do top-up ficam no topo do arquivo, sem `if` em volta: TOPUP-6 e ga-swnsg3-e do selftest grande reprovam se forem indentadas (a 1a versão desta fatia fez isso: 17 falhas contra as 14 do baseline)
 # vazio (linha não achada) → a asserção reprova; falhou/ilegível (dispatcher que o grep não lê) → o FATAL lá em cima, nunca um ok
-{ grep -qxF '_pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"' "$DISPATCHER" && grep -qxF '_pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"' "$DISPATCHER"; } \
-  && ok "as duas chamadas do top-up estão no topo do arquivo, sem if em volta (o que TOPUP-6 e ga-swnsg3-e do selftest grande exigem); a passada só-nó pula DENTRO da função" \
-  || bad "uma das chamadas do top-up saiu do topo do arquivo (indentada ou alterada): TOPUP-6 e ga-swnsg3-e do selftest grande reprovam — a guarda da passada só-nó mora dentro de _pilot_pool_topup"
+{ grep -qxF '_pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"' "$DISPATCHER" && grep -qxF '_pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"' "$DISPATCHER" && grep -qxF '_pilot_yield_stall_check || true' "$DISPATCHER"; } \
+  && ok "as chamadas do top-up e da checagem de cessões consecutivas estão no topo do arquivo, sem if em volta (o que TOPUP-6 e ga-swnsg3-e do selftest grande e I11 do priority yield exigem); a passada só-nó pula DENTRO das funções" \
+  || bad "uma das chamadas (top-up ou checagem de cessões consecutivas) saiu do topo do arquivo (indentada ou alterada): TOPUP-6, ga-swnsg3-e e I11 reprovam — a guarda da passada só-nó mora dentro das funções"
 
 if [ -z "${DF_MUTANT:-}" ] && [ -z "${DF_NO_MUTANTS:-}" ]; then
   echo "── controle negativo: cada guarda desligada numa cópia do dispatcher tem que reprovar este arquivo"
@@ -273,7 +283,8 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "a guarda do top-up volta para um if em volta das chamadas (quebra TOPUP-6 e ga-swnsg3-e)" $'_pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"\n_pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"' $'if [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then\n  _pilot_pool_topup "wa-worker" "${PILOT_WA_WORKER_MAX:-4}"\n  _pilot_pool_topup "ps-worker" "${PILOT_PS_WORKER_MAX:-2}"\nfi'
   mutant "o streak de estagnação conta a passada só-nó" '[ "$DRY_RUN" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ] && [ "$DISPATCHED" -eq "0" ]' '[ "$DRY_RUN" != "1" ] && [ "$DISPATCHED" -eq "0" ]'
   mutant "o streak de estagnação é zerado pela passada só-nó" 'elif [ "$DRY_RUN" != "1" ] && [ "${_PILOT_NODE_ONLY:-0}" != "1" ] && [ -f "$PILOT_STALL_STATE" ]; then' 'elif [ "$DRY_RUN" != "1" ] && [ -f "$PILOT_STALL_STATE" ]; then'
-  mutant "o contador de cessões consecutivas é apagado pela passada só-nó" $'if [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then\n  _pilot_yield_stall_check || true\nfi' '_pilot_yield_stall_check || true'
+  mutant "o contador de cessões consecutivas é apagado pela passada só-nó" '    return 0   # ga-2hd02v.1.20: node-only pass leaves' '    :   # ga-2hd02v.1.20: node-only pass leaves'
+  mutant "a guarda da checagem de cessões consecutivas volta para um if em volta da chamada (quebra I11 do priority yield)" $'\n_pilot_yield_stall_check || true\n' $'\nif [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then\n  _pilot_yield_stall_check || true\nfi\n'
   mutant "o helper não pergunta ao nó" $'  _pilot_priority_node_exempt_pre "$_b"\n}' $'  return 0\n}'
   mutant "o helper aceita id de outro store" '    case "$_id" in ga-*) ;; *) return 1 ;; esac' '    :'
   mutant "o helper aceita bead de outro rig" '    { [ -z "$_rig" ] || [ "$_rig" = "null" ]; } || return 1' '    :'

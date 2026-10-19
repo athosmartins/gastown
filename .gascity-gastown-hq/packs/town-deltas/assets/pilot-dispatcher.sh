@@ -10339,6 +10339,11 @@ _pilot_priority_yield_release() {
 _pilot_yield_stall_check() {
   local _state="${PILOT_YIELD_STALL_FILE:-${GC_CITY:-/nonexistent}/.gc/priority-yield-stall.state}"
   local _need="${PILOT_YIELD_STALL_SWEEPS:-6}" _cnt=0 _wid="" _mailed="" _roster _list _subj _body _tmp _n
+  # ga-2hd02v.1.20: first gate. The NODE-ONLY pass (disk floor) neither extends nor ends the cede-only streak: it returns BEFORE anything below can `rm -f` the state file (PRIORITY_YIELDED is 0 in that pass by construction, which the "did not cede" branch below would read as the end of a streak).
+  # vazio (variável nunca definida) → varredura normal, a checagem roda; falhou/ilegível (qualquer valor que não seja 1) → idem. O retorno só acontece com o valor 1, que só o gate do disk floor grava (disco CONFIRMADO baixo + on, depois de zerar a variável): uma leitura que falhou nunca apaga nem mantém o contador por engano.
+  if [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
+    return 0   # ga-2hd02v.1.20: node-only pass leaves the cede-only streak as it is
+  fi
   case "$_need" in ''|*[!0-9]*|0) _need=6 ;; esac
   # A counter this sweep cannot read is "cannot tell", not a value: `[ abc -ne 0 ]` is an ERROR (rc 2), which the tests below would
   # take as "false" and count the sweep as dispatched=0. The streak ends instead — nothing is counted and nothing is mailed on it.
@@ -15219,9 +15224,7 @@ fi
 
 # ga-2lca0l (3): the cede-only streak Step 5 above deliberately ignores (a sweep that only ceded is "saturated") is its own alarm:
 # N sweeps with dispatched=0, free slots and cessions → the Mayor is mailed once, naming the P0/P1 and the pool's sessions.
-# ga-2hd02v.1.20: a NODE-ONLY pass (disk floor) is a paused sweep for the mini and PRIORITY_YIELDED is 0 in it by construction, so this check would read it as "a sweep that did not cede" and END a streak the pause only interrupted — before, such a sweep exited at the gate and never got here: the streak stays as it was, like Step 5's above.
-if [ "${_PILOT_NODE_ONLY:-0}" != "1" ]; then
-  _pilot_yield_stall_check || true
-fi
+# ga-2hd02v.1.20: no `if` around this call, on purpose (I11 of the priority-yield selftest requires it at the top level); the NODE-ONLY pass (disk floor) keeps the streak INSIDE the function, as its first gate. That pass is a paused sweep for the mini and PRIORITY_YIELDED is 0 in it by construction, so the check would read it as "a sweep that did not cede" and END a streak the pause only interrupted — before, such a sweep exited at the gate and never got here. The streak stays as it was, like Step 5's above.
+_pilot_yield_stall_check || true
 
 log "=== Pilot sweep complete: dispatched=$DISPATCHED (small_slots=$SMALL_SLOTS big_slots=$BIG_SLOTS dolt_saturated_at_start=${PILOT_DOLT_SATURATED_AT_START:-0}) ==="
