@@ -126,59 +126,150 @@ cp "$SCRIPT" "$E2E/scripts/jsonl-export.sh"
 cp "$HERE/jsonl-archive-repack-window-lib.sh" "$E2E/scripts/jsonl-archive-repack-window-lib.sh"   # ga-wkoij7: sourced by the exporter at start
 cp "$HERE/disk-headroom-lib.sh" "$E2E/scripts/disk-headroom-lib.sh"   # ga-j2f5v5: the one reader of the free disk, sourced by the exporter at start
 cat > "$E2E/scripts/dolt-target.sh" <<'STUB'
-# ga-l6v576: the five supplemental tables. The stub models what the live store did to hq.comments: ONE query that returns more than STUB_READ_CAP rows is cut — a
-# well-formed document, exit 0, "unexpected EOF" on stderr — while a query for a page that fits comes back whole. Per table <t>:
-#   STUB_ROWS_<t>   rows in the table (default 0)           STUB_COUNT_<t>  the COUNT(*) answer (default = the rows; ERR = unreadable)
-#   STUB_LOSE_<t>   the last N rows are never returned, however the table is read (a cut paging cannot cure)
-#   STUB_FLAKY_<t>  the first N reads of the table (from offset 0) come back 128 rows short, later ones whole
-#   STUB_FAIL_<t>   1 = a read prints part of the document and exits 1
-#   STUB_GARBAGE_<t> doc = a read prints a document cut off mid-way and exits 0 (the dolt that lies about its rc); empty = a read prints nothing and exits 0
-# STUB_READ_CAP is the most rows one query returns (0 = no cap). STUB_PK is the table's primary key (id | none | ERR). E2E_READ_LOG gets one "READ <t> <offset> <limit>" per read.
+# ga-l6v576: the five supplemental tables, modelled as LIVE tables. A table is a file of JSON rows in key order ($E2E_TABLE_DIR/<t>.rows), built from STUB_ROWS_<t> the first time a run
+# touches it (run_export clears the directory, so every run starts from a fresh table), and the stub answers the dialect the exporter speaks: COUNT(*), ORDER BY with LIMIT / OFFSET, and
+# keyset paging (WHERE (`a`, `b`) > ('x', 7)). The stub also models what the live store did to hq.comments: ONE query that returns more than STUB_READ_CAP rows is cut — a well-formed
+# document, exit 0, "unexpected EOF" on stderr. A read of ROWS is `SELECT *`; a read of KEYS selects the key columns only. Per table <t>:
+#   STUB_ROWS_<t>   rows in the table (default 0), ids "<t>-000000"...; with STUB_PK="id seq" three rows share an id and seq counts 0..2
+#   STUB_COUNT_<t>  the COUNT(*) answer (default = the rows the table holds now; ERR = unreadable)
+#   STUB_ODD_<t>    1 = the table also holds rows whose ids carry a quote, a backslash, a double quote, a space, a trailing space and non-ASCII letters (with 60 rows and pages of 7 each
+#                   of them is the last row of a page, so each becomes the cursor of the next)
+#   STUB_LOSE_<t>   the last N rows are never returned by a read of ROWS, however it is paged (a read of keys still sees them: the table has them, the export read is what loses them)
+#   STUB_FLAKY_<t>  the first N attempts at the table (reads of rows from the start) lose their last 128 rows, later ones are whole
+#   STUB_FAIL_<t>   1 = a read of rows prints part of the document and exits 1
+#   STUB_GARBAGE_<t> doc = a read of rows prints a document cut off mid-way and exits 0 (the dolt that lies about its rc); empty = it prints nothing and exits 0
+#   STUB_KEYS_FAIL_<t>  1 = a read of keys exits 1
+#   STUB_CHURN_<t>  <page>:<ins_behind>:<del_behind>:<ins_ahead>:<del_ahead> — ONCE per run, right after the <page>th page of rows is served, other writers change the live table: rows are
+#                   inserted / deleted behind the cursor (the first rows of the table) and ahead of it (its end)
+#   STUB_SKIP_<t>   <page>:<count> — in every attempt the <page>th page of rows comes back without <count> of its middle rows (a server that loses rows, the cursor moving on past them)
+#   STUB_DUP_<t>    <page> — the <page>th page of an attempt starts with the row the cursor stands on (a server that repeats a row)
+#   STUB_STUCK_<t>  1 = a keyset page ignores its cursor and answers from the start
+#   STUB_EMPTYCUT_<t>  <page>:<sig|quiet> — in every attempt the <page>th page of rows comes back as {} (with the cut's stderr line for sig): a cut that left nothing
+# STUB_READ_CAP is the most rows one query returns (0 = no cap). STUB_PK is the table's primary key (id | "id seq" | none | ERR). E2E_READ_LOG gets one
+# "READ <t> <rows|keys> <limit> <cursor>" per read (cursor: - from the start, off=N for an OFFSET, after=(...) for a keyset page).
 dolt_dies() { echo "stub: connection reset by peer" >&2; return 1; }   # a dolt that exits non-zero, with its reason on stderr
 re_supp_table='`wa`\.`?(comments|config|dependencies|labels|metadata)([^a-z_]|$)'
+re_supp_select='^SELECT (.*) FROM `wa`'
+re_supp_where='WHERE \((.*)\) > \((.*)\) ORDER BY'
+stub_var() { local v="$1"; printf '%s' "${!v:-${2:-}}"; }   # stub_var <name> [default] — the value of an env knob
+stub_table_file() {  # stub_table_file <t> — the live table's file, built on the first touch of the run
+  local t="$1" f="$E2E_TABLE_DIR/$1.rows" pk=single
+  if [ ! -f "$f" ]; then
+    mkdir -p "$E2E_TABLE_DIR"
+    case "${STUB_PK:-id}" in *" "*) pk=composite ;; esac
+    jq -n -c --arg q "'" --arg t "$t" --argjson n "$(stub_var "STUB_ROWS_$t" 0)" --arg odd "$(stub_var "STUB_ODD_$t" 0)" --arg pk "$pk" '
+      def pad: ("000000" + tostring)[-6:];
+      ( [range($n) | if $pk == "composite" then {id: "\($t)-\(((. / 3) | floor) | pad)", seq: (. % 3), body: "text \(.)"} else {id: "\($t)-\(. | pad)", body: "text \(.)"} end]
+        + (if $odd == "1" and $n >= 60 then
+             ["\($t)-000012\($q)q", "\($t)-000018\\b", "\($t)-000024\"d", "\($t)-000030 sp", "\($t)-000036 ", "\($t)-000042éñ"]
+             | map({id: ., body: "odd"} + (if $pk == "composite" then {seq: 0} else {} end))
+           else [] end) )
+      | sort_by([.id, (.seq // 0)]) | .[]' > "$f"
+  fi
+  printf '%s' "$f"
+}
+stub_literals() {  # stub_literals <sql literal list> — a JSON array of the values, or non-zero when the text is not a well-formed list of SQL literals (the way MySQL reads \\ and '')
+  printf '%s' "$1" | jq -R -c --arg q "'" '
+    . as $s
+    | [match("\($q)((?:[^\($q)\\\\]|\($q)\($q)|\\\\.)*)\($q)|(-?[0-9]+)"; "g")] as $m
+    | if ($m | map(.string) | join(", ")) != $s then error("not a literal list") else
+        $m | map(if (.string | startswith($q)) then (.captures[0].string | gsub("\($q)\($q)"; $q) | gsub("\\\\(?<c>.)"; "\(.c)")) else (.string | tonumber) end)
+      end'
+}
+stub_churn() {  # stub_churn <table file> <ins_behind> <del_behind> <ins_ahead> <del_ahead>
+  jq -s -c --argjson ib "$2" --argjson db "$3" --argjson ia "$4" --argjson da "$5" '
+    (if $da > 0 then .[0:(length - $da)] else . end) as $a
+    | (if $db > 0 then ($a[0:1] + $a[(1 + $db):]) else $a end) as $b
+    | $b[0] as $first | $b[-1] as $last
+    | ($b + [range($ib) | $first + {id: ($first.id + "-ins\(.)"), body: "inserted behind"}] + [range($ia) | $last + {id: ($last.id + "-ins\(.)"), body: "inserted ahead"}])
+    | sort_by([.id, (.seq // 0)]) | .[]' "$1" > "$1.new" && mv -f "$1.new" "$1"
+}
 stub_supp() {  # stub_supp <query> <table>
-  local q="$1" tbl="$2" var rows lose flaky seen vis from to lim off cap cut=0
-  var="STUB_ROWS_$tbl"; rows="${!var:-0}"
+  local q="$1" tbl="$2" tf var cnt sel kind after="null" wlits="" lim=0 off=0 cap lose flaky seen pg apg att stuck dup skip cut_page out cut doc pk="${STUB_PK:-id}" cur ib db ia da _
+  tf=$(stub_table_file "$tbl")
   case "$q" in
     "SELECT COUNT(*)"*)
-      var="STUB_COUNT_$tbl"; var="${!var:-$rows}"
-      [ "$var" = "ERR" ] && return 1
-      printf 'row_count\n%s\n' "$var"; return 0 ;;
+      cnt=$(stub_var "STUB_COUNT_$tbl")
+      [ "$cnt" = "ERR" ] && return 1
+      [ -n "$cnt" ] || cnt=$(wc -l < "$tf" | tr -d ' ')
+      printf 'row_count\n%s\n' "$cnt"; return 0 ;;
   esac
-  lim=""; off=0
+  case "$pk" in none|ERR|"") pk=id ;; esac
+  sel='*'; [[ "$q" =~ $re_supp_select ]] && sel="${BASH_REMATCH[1]}"
+  kind=rows; [ "$sel" = '*' ] || kind=keys
+  if [[ "$q" =~ $re_supp_where ]]; then
+    wlits="${BASH_REMATCH[2]}"
+    if ! after=$(stub_literals "$wlits" 2>/dev/null); then echo "stub: syntax error near the key literal: $wlits" >&2; return 1; fi
+  fi
   [[ "$q" =~ LIMIT\ ([0-9]+) ]] && lim="${BASH_REMATCH[1]}"
   [[ "$q" =~ OFFSET\ ([0-9]+) ]] && off="${BASH_REMATCH[1]}"
-  [ -z "${E2E_READ_LOG:-}" ] || printf 'READ %s %s %s\n' "$tbl" "$off" "${lim:-all}" >> "$E2E_READ_LOG"
-  var="STUB_LOSE_$tbl"; lose="${!var:-0}"
-  vis=$(( rows - lose )); [ "$vis" -ge 0 ] || vis=0
-  var="STUB_FLAKY_$tbl"; flaky="${!var:-0}"
-  if [ "$flaky" -gt 0 ] && [ -n "${E2E_FLAKY_DIR:-}" ]; then
-    if [ "$off" = "0" ]; then   # a new attempt starts at offset 0; the pages after it belong to the same attempt
-      seen=$(cat "$E2E_FLAKY_DIR/$tbl" 2>/dev/null || echo 0); seen=$((seen + 1)); printf '%s' "$seen" > "$E2E_FLAKY_DIR/$tbl"
+  cur="-"; [ "$after" = "null" ] || cur="after=($wlits)"; [ "$off" = "0" ] || cur="off=$off"
+  [ -z "${E2E_READ_LOG:-}" ] || printf 'READ %s %s %s %s\n' "$tbl" "$kind" "$([ "$lim" = 0 ] && echo all || echo "$lim")" "$cur" >> "$E2E_READ_LOG"
+
+  lose=$(stub_var "STUB_LOSE_$tbl" 0); cap=$(stub_var STUB_READ_CAP 0); stuck=false; dup=false; skip=0; cut_page=""
+  if [ "$kind" = "keys" ]; then
+    lose=0
+    [ "$(stub_var "STUB_KEYS_FAIL_$tbl" 0)" = "1" ] && { dolt_dies; return; }
+  else
+    # which page of the attempt, and which attempt, this is — an attempt starts at the first page (no cursor, no offset)
+    mkdir -p "$E2E_TABLE_DIR"
+    pg=$(( $(cat "$E2E_TABLE_DIR/$tbl.pages" 2>/dev/null || echo 0) + 1 )); printf '%s' "$pg" > "$E2E_TABLE_DIR/$tbl.pages"
+    if [ "$after" = "null" ] && [ "$off" = "0" ]; then
+      apg=1
+      flaky=$(stub_var "STUB_FLAKY_$tbl" 0)
+      if [ "$flaky" -gt 0 ] && [ -n "${E2E_FLAKY_DIR:-}" ]; then
+        seen=$(( $(cat "$E2E_FLAKY_DIR/$tbl" 2>/dev/null || echo 0) + 1 )); printf '%s' "$seen" > "$E2E_FLAKY_DIR/$tbl"
+        [ "$seen" -gt "$flaky" ] || lose=$(( lose + 128 ))
+      fi
+      printf '%s' "$lose" > "$E2E_TABLE_DIR/$tbl.attempt-lose"   # what this attempt loses, for its later pages
+    else
+      apg=$(( $(cat "$E2E_TABLE_DIR/$tbl.apage" 2>/dev/null || echo 0) + 1 ))
+      lose=$(cat "$E2E_TABLE_DIR/$tbl.attempt-lose" 2>/dev/null || echo "$lose")
     fi
-    seen=$(cat "$E2E_FLAKY_DIR/$tbl" 2>/dev/null || echo 0)
-    if [ "$seen" -le "$flaky" ]; then vis=$(( vis - 128 )); [ "$vis" -ge 0 ] || vis=0; fi
+    printf '%s' "$apg" > "$E2E_TABLE_DIR/$tbl.apage"
+    if [ "$(stub_var "STUB_FAIL_$tbl" 0)" = "1" ]; then
+      printf '{"rows":'; head -n 10 "$tf" | jq -s -c '.' | tr -d '\n'; printf '}'
+      dolt_dies; return
+    fi
+    case "$(stub_var "STUB_GARBAGE_$tbl")" in
+      doc) printf '{"rows":[{"id":"%s-0","bo' "$tbl"; return 0 ;;   # rc 0, but not a JSON document: the stream ended inside a string
+      empty) return 0 ;;                                            # rc 0, nothing on stdout
+    esac
+    cut_page=$(stub_var "STUB_EMPTYCUT_$tbl")
+    if [ -n "$cut_page" ] && [ "${cut_page%%:*}" = "$apg" ]; then
+      printf '{}\n'
+      [ "${cut_page#*:}" != "sig" ] || echo "[mysql] 2026/10/19 01:21:48 packets.go:58 unexpected EOF" >&2
+      return 0
+    fi
+    skip=$(stub_var "STUB_SKIP_$tbl"); if [ -n "$skip" ] && [ "${skip%%:*}" = "$apg" ]; then skip="${skip#*:}"; else skip=0; fi
   fi
-  from="$off"; to="$vis"
-  [ -z "$lim" ] || { [ $(( off + lim )) -ge "$vis" ] || to=$(( off + lim )); }
-  [ "$from" -le "$to" ] || from="$to"
-  var="STUB_READ_CAP"; cap="${!var:-0}"
-  if [ "$cap" -gt 0 ] && [ $(( to - from )) -gt "$cap" ]; then to=$(( from + cap )); cut=1; fi
-  var="STUB_FAIL_$tbl"
-  if [ "${!var:-0}" = "1" ]; then
-    to=$(( from + 10 )); [ "$to" -le "$vis" ] || to="$vis"
-    jq -n -c --arg t "$tbl" --argjson a "$from" --argjson b "$to" '{rows: [range($a;$b) | {id: "\($t)-\(.)", body: "text \(.)"}]}'
-    dolt_dies; return
+  [ "$kind" = "rows" ] && [ "$(stub_var "STUB_STUCK_$tbl" 0)" = "1" ] && stuck=true
+  dup=$(stub_var "STUB_DUP_$tbl"); if [ -n "$dup" ] && [ "${apg:-0}" -eq "$dup" ]; then dup=true; else dup=false; fi
+
+  out=$(jq -s -c --arg pk "$pk" --arg sel "$sel" --arg kind "$kind" --argjson after "$after" --argjson lim "$lim" --argjson off "$off" --argjson cap "$cap" --argjson lose "$lose" \
+        --argjson stuck "$stuck" --argjson dup "$dup" --argjson skip "$skip" '
+    ($pk | split(" ")) as $pks
+    | def k: . as $r | [$pks[] | $r[.]];
+    . as $all
+    | (if $kind == "keys" then $all else $all[0:([(length - $lose), 0] | max)] end) as $vis
+    | (if ($after != null) and ($stuck | not) then ($vis | map(select(k > $after))) elif $off > 0 then $vis[$off:] else $vis end) as $rest
+    | (if $lim > 0 then $rest[0:$lim] else $rest end) as $page
+    | (if $cap > 0 and ($page | length) > $cap then [$page[0:$cap], true] else [$page, false] end) as [$capped, $cut]
+    | (if $skip > 0 and ($capped | length) > ($skip + 2) then ($capped[0:1] + $capped[(1 + $skip):]) else $capped end) as $skipped
+    | (if $dup and ($after != null) then ([$all[] | select(k == $after)] + $skipped) else $skipped end) as $served
+    | (if $kind == "keys" then ($sel | gsub("`"; "") | split(", ")) as $cols | ($served | map(. as $r | reduce $cols[] as $c ({}; .[$c] = $r[$c]))) else $served end) as $final
+    | $cut, (if ($final | length) == 0 then {} else {rows: $final} end)' "$tf") || return 1
+  cut="${out%%$'\n'*}"; doc="${out#*$'\n'}"
+  printf '%s\n' "$doc"
+  [ "$cut" = "false" ] || echo "[mysql] 2026/10/19 01:21:48 packets.go:58 unexpected EOF" >&2
+  if [ "$kind" = "rows" ]; then   # other writers act on the live table once, after the N-th page of rows of the run
+    var=$(stub_var "STUB_CHURN_$tbl")
+    if [ -n "$var" ] && [ ! -e "$E2E_TABLE_DIR/$tbl.churned" ] && [ "${var%%:*}" = "$pg" ]; then
+      : > "$E2E_TABLE_DIR/$tbl.churned"
+      IFS=: read -r _ ib db ia da <<< "$var"
+      stub_churn "$tf" "$ib" "$db" "$ia" "$da"
+    fi
   fi
-  var="STUB_GARBAGE_$tbl"
-  case "${!var:-}" in
-    doc) printf '{"rows":[{"id":"%s-0","bo' "$tbl"; return 0 ;;   # rc 0, but not a JSON document: the stream ended inside a string
-    empty) return 0 ;;                                            # rc 0, nothing on stdout
-  esac
-  if [ "$to" -le "$from" ]; then printf '{}\n'; else
-    jq -n -c --arg t "$tbl" --argjson a "$from" --argjson b "$to" '{rows: [range($a;$b) | {id: "\($t)-\(.)", body: "text \(.)"}]}'
-  fi
-  [ "$cut" = "0" ] || echo "[mysql] 2026/10/19 01:21:48 packets.go:58 unexpected EOF" >&2
   return 0
 }
 dolt_sql() {
@@ -193,7 +284,7 @@ dolt_sql() {
       case "${STUB_PK:-id}" in
         ERR) return 1 ;;
         none) printf 'COLUMN_NAME\n' ;;
-        *) printf 'COLUMN_NAME\n%s\n' "${STUB_PK:-id}" ;;
+        *) printf 'COLUMN_NAME\n%s\n' "$(printf '%s' "${STUB_PK:-id}" | tr ' ' '\n')" ;;
       esac
       return 0 ;;
   esac
@@ -237,9 +328,11 @@ export DISK_FREE_OVERRIDE_MB=102400
 
 ARCH="$E2E/archive"
 OUT=""
+export E2E_TABLE_DIR="$E2E/tables"   # the stub's live supplemental tables (ga-l6v576): every run starts from fresh ones
 run_export() {  # run_export <export-rows> <source-count|ERR> [scrubbed-away-rows]
   : > "$E2E/gc.log"
   : > "$E2E/dolt-calls.log"
+  mkdir -p "$E2E_TABLE_DIR"; rm -f "$E2E_TABLE_DIR"/* "$E2E_TABLE_DIR"/.[!.]* 2>/dev/null
   OUT=$(
     E2E_GC_LOG="$E2E/gc.log" STUB_EXPORT_ROWS="$1" STUB_SOURCE_COUNT="$2" STUB_TEST_ROWS="${3:-0}" \
     DISK_FREE_OVERRIDE_MB="${E2E_DISK_MB:-102400}" JEX_NOW_EPOCH="${E2E_NOW:-}" E2E_DOLT_CALLS="$E2E/dolt-calls.log" \
@@ -479,8 +572,8 @@ fi
 # comment on the gate in jsonl-export.sh; these cases pin that behaviour too.)
 unverified_seen() {  # unverified_seen <label> — the run's outputs all name the don't-know
   case "$OUT" in
-    *"source count unavailable for wa"*"NOT verified against source"*)
-      ok "$1: logs 'source count unavailable for wa; export NOT verified against source'" ;;
+    *"unavailable for wa"*"NOT verified against source"*)
+      ok "$1: logs '... unavailable for wa...; export NOT verified against source'" ;;
     *) bad "$1: no 'NOT verified against source' log line — a don't-know that looks like success. Output: $OUT" ;;
   esac
   case "$OUT" in
@@ -684,11 +777,14 @@ supp_head_rows() {
 export E2E_READ_LOG="$E2E/reads.log" E2E_FLAKY_DIR="$E2E/flaky" GC_JSONL_SUPP_EXPORT_RETRY_DELAY=0
 mkdir -p "$E2E_FLAKY_DIR"
 reset_reads() { : > "$E2E_READ_LOG"; rm -f "$E2E_FLAKY_DIR"/*; }   # the read log and the stub's flaky counters belong to one run
-attempts_of() { grep -c "^READ $1 0 " "$E2E_READ_LOG" 2>/dev/null || true; }   # reads of <table> that started at offset 0 = attempts at the whole table
+attempts_of() { grep -Ec "^READ $1 rows [a-z0-9]+ (-|off=0)$" "$E2E_READ_LOG" 2>/dev/null || true; }   # reads of rows of <table> that started from the top, no cursor = attempts at the whole table
 supp_env_reset() {
   local x
-  unset STUB_READ_CAP STUB_PK GC_JSONL_SUPP_CHUNK_ROWS
-  for x in $SUPP_TABLES_ALL; do unset "STUB_ROWS_$x" "STUB_COUNT_$x" "STUB_LOSE_$x" "STUB_FLAKY_$x" "STUB_FAIL_$x" "STUB_GARBAGE_$x"; done; unset STUB_GIT_BLIND
+  unset STUB_READ_CAP STUB_PK GC_JSONL_SUPP_CHUNK_ROWS GC_JSONL_SUPP_KEY_CHUNK_ROWS
+  for x in $SUPP_TABLES_ALL; do
+    unset "STUB_ROWS_$x" "STUB_COUNT_$x" "STUB_LOSE_$x" "STUB_FLAKY_$x" "STUB_FAIL_$x" "STUB_GARBAGE_$x" "STUB_ODD_$x" "STUB_KEYS_FAIL_$x" "STUB_CHURN_$x" "STUB_SKIP_$x" "STUB_DUP_$x" "STUB_STUCK_$x" "STUB_EMPTYCUT_$x"
+  done
+  unset STUB_GIT_BLIND
 }
 supp_env_reset
 
@@ -845,12 +941,12 @@ case "$OUT" in
 esac
 supp_env_reset
 
-# Case 6 — the THIRD state: the table's COUNT(*) is unreadable, so nobody can say whether the export is whole. Not discarded (a store whose count query is down must not freeze its archive),
-# never silent: named in the log, the summary, the nudge and the commit message — the same four places as the unverified issues export.
+# Case 6 — the THIRD state, for a table with no key to page by: its COUNT(*) is the only check, and it is unreadable, so nobody can say whether the export is whole. Not discarded (a store
+# whose count query is down must not freeze its archive), never silent: named in the log, the summary, the nudge and the commit message — the same four places as the unverified issues export.
 fresh_archive supp-unverified
-export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+export STUB_ROWS_comments=600 STUB_PK=none
 run_export 200 200
-export STUB_ROWS_comments=700 STUB_COUNT_comments=ERR
+export STUB_ROWS_comments=700 STUB_COUNT_comments=ERR STUB_PK=none
 run_export 201 201
 [ "$(supp_file_rows comments)" = "700" ] \
   && ok "unreadable table count: the export is archived (700 rows), as documented for an unverifiable export" \
@@ -862,6 +958,21 @@ git -C "$ARCH" log -1 --format=%s | grep -q 'unverified=wa' \
 case "$OUT" in
   *"failed:"*) bad "unreadable table count: an unverifiable table is reported FAILED, not unverified: $OUT" ;;
   *) ok "unreadable table count: reported unverified, not failed" ;;
+esac
+supp_env_reset
+
+# Case 6b — a table WITH a key is judged by its keys, not by its count: a count query that is down changes nothing, and the export is verified, not flagged.
+fresh_archive supp-count-down-keyed
+export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+export STUB_ROWS_comments=700 STUB_COUNT_comments=ERR
+run_export 201 201
+[ "$(supp_file_rows comments)" = "700" ] \
+  && ok "keyed table, count query down: the 700-row export is archived" \
+  || bad "keyed table, count query down: comments holds $(supp_file_rows comments) rows, want 700"
+case "$OUT" in
+  *"unverified"*|*"failed:"*|*"NOT verified"*) bad "keyed table, count query down: the key check verified it, yet the run reports it: $OUT" ;;
+  *) ok "keyed table, count query down: verified by keys — not unverified, not failed" ;;
 esac
 supp_env_reset
 
@@ -900,6 +1011,306 @@ for spec in "344 600 600 short" "344 600 '' short" "344 '' 600 short" "598 600 5
   [ "$got" = "$want" ] && ok "table_export_verdict raw=$1 before='$2' after='$3' -> $want" || bad "table_export_verdict raw=$1 before='$2' after='$3' -> '$got', want $want"
 done
 unset -f v
+
+# ── ga-l6v576, attempt 2: a table read in pages is not a snapshot of a LIVE table ──
+# Attempt 1 paged with LIMIT/OFFSET and judged the read by its row count. Paging a live table by offset hands out duplicates (a row inserted behind the cursor moves every later row one
+# place down, so the next page serves one again) and skips (a row deleted behind it moves them up, so the next page steps over one), and the count of such a read can still equal the
+# source's: "complete". The read now pages by KEY (WHERE key > last) and is judged by keys: every row that was in the table before the read AND still is after it must be in the file.
+# The cases below change the table BETWEEN pages and then read the FILE: no key twice, no row that was there the whole time lost.
+echo "=== ga-l6v576: a table read in pages while other writers change it ==="
+# vazio → no key twice (0); falhou (the file is missing or not JSON) → "?", which no assertion below accepts
+supp_dup_keys() {  # supp_dup_keys <t> [jq key expression, default .id] — how many keys the file holds more than once
+  local keys
+  keys=$(jq -r ".rows[]? | ${2:-.id}" "$ARCH/wa/$1.jsonl" 2>/dev/null) || { echo "?"; return 0; }
+  printf '%s\n' "$keys" | LC_ALL=C sort | uniq -d | grep -c . || true
+}
+supp_missing() {  # supp_missing <t> <n> <gone> — how many of the ids <t>-000000..<n-1> that were never deleted are not in the file; <gone> is a jq test on the row's index (false = none deleted)
+  local have want
+  have=$(jq -r '.rows[]? | .id' "$ARCH/wa/$1.jsonl" 2>/dev/null) || { echo "?"; return 0; }
+  want=$(jq -n -r --arg t "$1" --argjson n "$2" "[range(\$n) | select((${3}) | not) | \"\\(\$t)-\\((\"000000\" + tostring)[-6:])\"] | .[]") || { echo "?"; return 0; }
+  comm -13 <(printf '%s\n' "$have" | LC_ALL=C sort -u) <(printf '%s\n' "$want" | LC_ALL=C sort -u) | grep -c . || true
+}
+no_failed_table() {  # no_failed_table <label> — the run reports no table as failed or partial
+  case "$OUT" in
+    *"failed:"*|*"partial="*) bad "$1: the run reports a failed table: $OUT" ;;
+    *) ok "$1: no table reported failed" ;;
+  esac
+}
+
+# Case 9 — rows inserted behind the cursor (net +4: 7 in, 3 out) and, the other way, rows deleted behind it (net -4: 3 in, 7 out), between the 3rd and the 4th page of ten. By offset the
+# first leaves 4 keys twice in the file, the second loses 4 rows that were in the table all along — and in both the file's row count equals the table's.
+for spec in "inserted 3:7:3:0:0 '. >= 1 and . <= 3'" "deleted 3:3:7:0:0 '. >= 1 and . <= 7'"; do
+  eval "set -- $spec"
+  fresh_archive "supp-churn-$1"
+  export STUB_ROWS_comments=1000 GC_JSONL_SUPP_CHUNK_ROWS=100 "STUB_CHURN_comments=$2"
+  reset_reads
+  run_export 200 200
+  [ "$(supp_dup_keys comments)" = "0" ] \
+    && ok "rows $1 behind the cursor: no id twice in comments.jsonl" \
+    || bad "rows $1 behind the cursor: $(supp_dup_keys comments) ids are in comments.jsonl more than once — the pages overlapped"
+  [ "$(supp_missing comments 1000 "$3")" = "0" ] \
+    && ok "rows $1 behind the cursor: every row that was in the table the whole time is in the file" \
+    || bad "rows $1 behind the cursor: $(supp_missing comments 1000 "$3") rows that were in the table the whole time are missing from the file — the pages skipped them"
+  [ "$(supp_file_rows comments)" = "1000" ] \
+    && ok "rows $1 behind the cursor: the file holds the 1000 rows the read went through" \
+    || bad "rows $1 behind the cursor: the file holds $(supp_file_rows comments) rows, want 1000"
+  no_failed_table "rows $1 behind the cursor"
+  [ "$(attempts_of comments)" = "1" ] \
+    && ok "rows $1 behind the cursor: read once, no retry" \
+    || bad "rows $1 behind the cursor: $(attempts_of comments) attempts at the table, want 1"
+  supp_env_reset
+done
+
+# Case 10 — the table loses its last 5 rows and gets 5 new ones at the front, after the 3rd page: the read holds 995 rows, the table 1000. A gate that compares COUNTS calls this read short
+# (995 < 1000) and throws a whole table away; by keys it is whole — the 995 rows that were in the table before and after are all in the file.
+fresh_archive supp-churn-ahead
+export STUB_ROWS_comments=1000 GC_JSONL_SUPP_CHUNK_ROWS=100 STUB_CHURN_comments=3:5:0:0:5
+reset_reads
+run_export 200 200
+[ "$(supp_file_rows comments)" = "995" ] && [ "$(supp_dup_keys comments)" = "0" ] && [ "$(supp_missing comments 995 false)" = "0" ] \
+  && ok "rows added behind the cursor, rows lost ahead of it: the 995 rows read are in the file once each" \
+  || bad "rows added behind, lost ahead: the file holds $(supp_file_rows comments) rows, $(supp_dup_keys comments) ids twice, $(supp_missing comments 995 false) stable ids missing"
+no_failed_table "rows added behind the cursor, rows lost ahead of it"
+supp_env_reset
+
+# Case 11 — a silent loss that the table's own growth hides. After page 3, 5 rows are added at the END of the table, and in every attempt page 5 comes back without 5 of its middle rows
+# (the cursor moves on past them). The file holds 1000 rows and the table 1000 before and 1005 after, so a COUNT gate calls it complete; the 5 rows that were in the table all along and
+# are not in the file are what the key gate sees. The previous version (900 rows) stays.
+fresh_archive supp-skip-masked
+export STUB_ROWS_comments=900 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+[ "$(supp_file_rows comments)" = "900" ] || bad "test setup invalid: the baseline comments holds $(supp_file_rows comments) rows, want 900: $OUT"
+export STUB_ROWS_comments=1000 STUB_CHURN_comments=3:0:0:5:0 STUB_SKIP_comments=5:5
+reset_reads
+run_export 201 201
+[ "$(supp_file_rows comments)" = "900" ] && [ "$(supp_head_rows comments)" = "900" ] \
+  && ok "5 rows lost in a page while the table grows by 5: the previous 900-row version stays (file and HEAD)" \
+  || bad "5 rows lost in a page while the table grows by 5: comments holds $(supp_file_rows comments) rows (HEAD $(supp_head_rows comments)), want 900 — a count that equals the table's passed a read that lost rows"
+case "$OUT" in
+  *"export curto de wa.comments: "*"(tentativa 1/2)"*) ok "5 rows lost in a page while the table grows by 5: logs 'export curto de wa.comments' (tentativa 1/2)" ;;
+  *) bad "5 rows lost in a page while the table grows by 5: no 'export curto de wa.comments ... (tentativa 1/2)' line. Output: $OUT" ;;
+esac
+case "$OUT" in
+  *"failed: wa(comments)"*) ok "5 rows lost in a page while the table grows by 5: the run summary lists 'failed: wa(comments)'" ;;
+  *) bad "5 rows lost in a page while the table grows by 5: the run summary does not name wa(comments). Output: $OUT" ;;
+esac
+supp_env_reset
+
+# Case 12 — the server hands out a row it already gave (the 3rd page of an attempt starts with the row the cursor stands on). Whatever the count says, a key twice in the
+# read is not a snapshot of the table: the read fails, the previous version stays, and the log names it.
+fresh_archive supp-dup
+export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+export STUB_ROWS_comments=700 STUB_DUP_comments=3
+run_export 201 201
+[ "$(supp_file_rows comments)" = "600" ] && [ "$(supp_head_rows comments)" = "600" ] \
+  && ok "a key served twice: the previous 600-row version stays (file and HEAD)" \
+  || bad "a key served twice: comments holds $(supp_file_rows comments) rows (HEAD $(supp_head_rows comments)), want 600 — the read with a repeated row became the snapshot"
+case "$OUT" in
+  *"more than once"*) ok "a key served twice: the log says a key came more than once" ;;
+  *) bad "a key served twice: no 'more than once' line in the output: $OUT" ;;
+esac
+case "$OUT" in
+  *"failed: wa(comments)"*) ok "a key served twice: the run summary lists 'failed: wa(comments)'" ;;
+  *) bad "a key served twice: the run summary does not name wa(comments). Output: $OUT" ;;
+esac
+supp_env_reset
+
+# Case 13 — a server that ignores the cursor answers every page from the start. The read must give up on the 2nd page, not walk 5000 pages of the same 100 rows.
+fresh_archive supp-stuck
+export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+export STUB_ROWS_comments=700 STUB_STUCK_comments=1
+reset_reads
+run_export 201 201
+[ "$(supp_file_rows comments)" = "600" ] && [ "$(supp_head_rows comments)" = "600" ] \
+  && ok "a cursor that does not advance: the previous 600-row version stays (file and HEAD)" \
+  || bad "a cursor that does not advance: comments holds $(supp_file_rows comments) rows (HEAD $(supp_head_rows comments)), want 600"
+case "$OUT" in
+  *"did not move past the cursor"*) ok "a cursor that does not advance: the log says the page did not move past the cursor" ;;
+  *) bad "a cursor that does not advance: no 'did not move past the cursor' line in the output: $OUT" ;;
+esac
+n=$(grep -c '^READ comments rows' "$E2E_READ_LOG" 2>/dev/null || true)
+[ "$n" -ge 2 ] && [ "$n" -le 6 ] \
+  && ok "a cursor that does not advance: given up after $n page reads (2 attempts), not walked to the page limit" \
+  || bad "a cursor that does not advance: $n page reads of comments, want 2..6"
+supp_env_reset
+
+# Case 14 — a page bigger than what one query can return (chunk 1000, the store cuts at 384): every page is cut, comes back with rows and the cut's stderr line, and the next page resumes
+# from the last key it got. Nothing is lost, and the cut alone does not fail the read.
+fresh_archive supp-cutpages
+export STUB_ROWS_comments=1000 STUB_READ_CAP=384 GC_JSONL_SUPP_CHUNK_ROWS=1000
+reset_reads
+run_export 200 200
+[ "$(supp_file_rows comments)" = "1000" ] && [ "$(supp_dup_keys comments)" = "0" ] && [ "$(supp_missing comments 1000 false)" = "0" ] \
+  && ok "pages cut by the store: the read resumes from the last key it got — all 1000 rows, once each" \
+  || bad "pages cut by the store: the file holds $(supp_file_rows comments) rows, $(supp_dup_keys comments) ids twice, $(supp_missing comments 1000 false) missing — want 1000, 0, 0"
+no_failed_table "pages cut by the store"
+supp_env_reset
+
+# Case 15 — a page that comes back EMPTY in the middle of the table. With the cut's stderr line it is the cut that left nothing: a failed read. Without one it looks like the end of the table,
+# and the keys that were in the table before and after the read, and are not in the file, say it was not.
+for mode in sig quiet; do
+  fresh_archive "supp-emptycut-$mode"
+  export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+  run_export 200 200
+  export STUB_ROWS_comments=700 "STUB_EMPTYCUT_comments=3:$mode"
+  run_export 201 201
+  [ "$(supp_file_rows comments)" = "600" ] && [ "$(supp_head_rows comments)" = "600" ] \
+    && ok "empty page in the middle ($mode): the previous 600-row version stays (file and HEAD)" \
+    || bad "empty page in the middle ($mode): comments holds $(supp_file_rows comments) rows (HEAD $(supp_head_rows comments)), want 600 — a table read to page 2 of 7 became the snapshot"
+  case "$OUT" in
+    *"failed: wa(comments)"*) ok "empty page in the middle ($mode): the run summary lists 'failed: wa(comments)'" ;;
+    *) bad "empty page in the middle ($mode): the run summary does not name wa(comments). Output: $OUT" ;;
+  esac
+  if [ "$mode" = sig ]; then
+    case "$OUT" in
+      *"came back empty"*"unexpected EOF"*) ok "empty page in the middle (sig): the log says the page came back empty and shows Dolt's line" ;;
+      *) bad "empty page in the middle (sig): no 'came back empty' line with Dolt's 'unexpected EOF'. Output: $OUT" ;;
+    esac
+  else
+    case "$OUT" in
+      *"export curto de wa.comments: "*) ok "empty page in the middle (quiet): the key check calls the export short" ;;
+      *) bad "empty page in the middle (quiet): no 'export curto de wa.comments' line. Output: $OUT" ;;
+    esac
+  fi
+  supp_env_reset
+done
+
+# Case 16 — keys that need care in a cursor: a quote, a backslash, a double quote, a space, a trailing space, non-ASCII letters. With pages of 7 each of them is the last row of a page, so the
+# next page is asked `WHERE (`id`) > ('<that key>')`; the stub reads the literal the way MySQL does and fails the query on a malformed one.
+fresh_archive supp-oddkeys
+export STUB_ROWS_comments=60 STUB_ODD_comments=1 GC_JSONL_SUPP_CHUNK_ROWS=7
+reset_reads
+run_export 200 200
+[ "$(supp_file_rows comments)" = "66" ] && [ "$(supp_dup_keys comments)" = "0" ] \
+  && ok "awkward keys as cursors: all 66 rows, once each" \
+  || bad "awkward keys as cursors: the file holds $(supp_file_rows comments) rows, $(supp_dup_keys comments) ids twice, want 66 and 0 (output: $OUT)"
+no_failed_table "awkward keys as cursors"
+[ "$(attempts_of comments)" = "1" ] \
+  && ok "awkward keys as cursors: read once" \
+  || bad "awkward keys as cursors: $(attempts_of comments) attempts, want 1"
+for lit in "'comments-000012''q'" "'comments-000018\\\\b'" "'comments-000024\"d'" "'comments-000030 sp'" "'comments-000036 '" "'comments-000042éñ'"; do
+  grep -qF "after=($lit)" "$E2E_READ_LOG" \
+    && ok "awkward keys as cursors: a page was asked after the literal $lit" \
+    || bad "awkward keys as cursors: no page asked after the literal $lit. Reads: $(grep -F 'after=' "$E2E_READ_LOG" | tr '\n' ' ')"
+done
+supp_env_reset
+
+# Case 17 — a primary key of two columns (id, seq): three rows share an id and pages of 7 end in the middle of such a group. The cursor is the row value, and compares like one.
+fresh_archive supp-composite
+export STUB_ROWS_comments=100 STUB_PK="id seq" GC_JSONL_SUPP_CHUNK_ROWS=7
+reset_reads
+run_export 200 200
+[ "$(supp_file_rows comments)" = "100" ] && [ "$(supp_dup_keys comments '[.id, .seq] | @json')" = "0" ] \
+  && ok "composite key: all 100 rows, each (id, seq) once" \
+  || bad "composite key: the file holds $(supp_file_rows comments) rows, $(supp_dup_keys comments '[.id, .seq] | @json') keys twice, want 100 and 0 (output: $OUT)"
+no_failed_table "composite key"
+grep -qE '^READ comments rows 7 after=\(.comments-[0-9]+., [0-9]+\)$' "$E2E_READ_LOG" \
+  && ok "composite key: a page was asked after a two-column cursor" \
+  || bad "composite key: no page asked after a (id, seq) cursor. Reads: $(grep -F 'READ comments rows' "$E2E_READ_LOG" | head -3 | tr '\n' ' ')"
+supp_env_reset
+
+# Case 18 — the page size is a plain decimal number whatever its spelling: 08 is eight (bash reads 08 in arithmetic as a bad octal), and the key sweeps use pages five times as big.
+fresh_archive supp-chunk08
+export STUB_ROWS_comments=100 GC_JSONL_SUPP_CHUNK_ROWS=08
+reset_reads
+run_export 200 200
+[ "$(supp_file_rows comments)" = "100" ] && [ "$(supp_dup_keys comments)" = "0" ] \
+  && ok "page size 08: read in pages of 8 — all 100 rows" \
+  || bad "page size 08: the file holds $(supp_file_rows comments) rows (output: $OUT)"
+grep -q '^READ comments rows 8 ' "$E2E_READ_LOG" && ! grep -q '^READ comments rows 08 ' "$E2E_READ_LOG" \
+  && ok "page size 08: pages of 8 rows" \
+  || bad "page size 08: no read of 8 rows. Reads: $(grep -F 'READ comments rows' "$E2E_READ_LOG" | head -3 | tr '\n' ' ')"
+grep -q '^READ comments keys 40 ' "$E2E_READ_LOG" \
+  && ok "page size 08: the key sweeps read 40 keys a page (5 x 8)" \
+  || bad "page size 08: no key sweep of 40 keys a page. Reads: $(grep -F 'READ comments keys' "$E2E_READ_LOG" | head -3 | tr '\n' ' ')"
+no_failed_table "page size 08"
+supp_env_reset
+
+# Case 19 — the key sweep itself fails (the 3rd state): nobody can say whether the rows read are the table's. For a table with a key that is "unverified" as the count was before: the export is
+# the file, never discarded, and named in the log, the summary, the nudge and the commit message.
+fresh_archive supp-keys-unreadable
+export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+run_export 200 200
+export STUB_ROWS_comments=700 STUB_KEYS_FAIL_comments=1
+run_export 201 201
+[ "$(supp_file_rows comments)" = "700" ] \
+  && ok "unreadable key sweep: the export is archived (700 rows), as documented for an unverifiable export" \
+  || bad "unreadable key sweep: comments holds $(supp_file_rows comments) rows, want 700"
+unverified_seen "unreadable key sweep (comments)"
+git -C "$ARCH" log -1 --format=%s | grep -q 'unverified=wa' \
+  && ok "unreadable key sweep: the archive commit message records unverified=wa" \
+  || bad "unreadable key sweep: commit message lacks unverified=wa: $(git -C "$ARCH" log -1 --format=%s)"
+case "$OUT" in
+  *"failed:"*) bad "unreadable key sweep: an unverifiable table is reported FAILED, not unverified: $OUT" ;;
+  *) ok "unreadable key sweep: reported unverified, not failed" ;;
+esac
+supp_env_reset
+
+# Case 20 — the helpers, alone. The cursor literal first: how a key is written into `WHERE (`id`) > (<here>)`. A key that cannot be written safely is not written at all (FAIL), and the read
+# stops there instead of building SQL out of it.
+Q="'"
+kl() { printf '%s' "$2" | lib_call key_tuple_literal "$1" 2>/dev/null || echo FAIL; }   # falhou (function missing, key unsafe) → FAIL, which no expected answer is
+NULKEY=$(jq -n -c '{id: ([97, 0, 98] | implode)}')
+for spec in \
+    "id|{\"id\":\"plain\"}|${Q}plain${Q}" \
+    "id|{\"id\":\"it${Q}s\"}|${Q}it${Q}${Q}s${Q}" \
+    "id|{\"id\":\"a\\\\b\"}|${Q}a\\\\b${Q}" \
+    "id|{\"id\":\"say \\\"x\\\" \"}|${Q}say \"x\" ${Q}" \
+    "id|{\"id\":\"é\"}|${Q}é${Q}" \
+    "id|{\"id\":42}|42" \
+    "id|{\"id\":-7}|-7" \
+    "id seq|{\"id\":\"x\",\"seq\":3}|${Q}x${Q}, 3" \
+    "issue_id label|{\"issue_id\":\"hq-1\",\"label\":\"it${Q}s\"}|${Q}hq-1${Q}, ${Q}it${Q}${Q}s${Q}" \
+    "id|{\"id\":null}|FAIL" \
+    "id|{\"id\":true}|FAIL" \
+    "id|{\"id\":1.5}|FAIL" \
+    "id|{\"id\":1234567890123456}|FAIL" \
+    "id|{\"other\":\"x\"}|FAIL" \
+    "id|${NULKEY}|FAIL" \
+    "id|not json|FAIL"; do
+  cols="${spec%%|*}"; rest="${spec#*|}"; row="${rest%|*}"; want="${rest##*|}"
+  got=$(kl "$cols" "$row")
+  [ "$got" = "$want" ] && ok "key_tuple_literal '$cols' $row -> $want" || bad "key_tuple_literal '$cols' $row -> '$got', want $want"
+done
+
+# The key verdict. Three files of keys (one JSON array per line): the table's keys BEFORE the read, AFTER it, and the keys the read returned. A key in both sweeps was in the table the whole
+# time, and the read must have it; keys deleted or inserted meanwhile are the writers' business. A spec is "before|after|export|answer", each list "a,b,c" (empty = a list with no keys,
+# - = no such file).
+kv_dir="$WORK/kv"; mkdir -p "$kv_dir"
+kv_file() {  # kv_file <path> <a,b,c|-> — one ["key"] line per key; "-" removes the file
+  local path="$1" list="$2" k
+  rm -f "$path"
+  [ "$list" = "-" ] && return 0
+  : > "$path"
+  [ -z "$list" ] && return 0
+  local IFS=,
+  for k in $list; do printf '["%s"]\n' "$k" >> "$path"; done
+}
+for spec in "a,b,c|a,b,c|a,b,c|complete" "a,b,c|a,b,c|a,c|short 1" "a,b,c|a,b,c|a,b|short 1" "a,b,c|a,b,c|c|short 2" \
+            "a,b,c|a,c,d|a,b,c|complete" "a,b,c|a,c,d|a,c|complete" "a,b,c|a,c,d|a,d|short 1" \
+            "a,b,c|a,b,c|a,b,c,d|complete" "a,b,c|a,b,c||short 3" \
+            "|||complete" "|a,b||complete" "a,b|||complete" "a,b|a,b||short 2" \
+            "-|a,b|a,b|unknown" "a,b|-|a,b|unknown" "a,b|a,b|-|unknown"; do
+  IFS='|' read -r kb ka ke want <<< "$spec"
+  kv_file "$kv_dir/b" "$kb"; kv_file "$kv_dir/a" "$ka"; kv_file "$kv_dir/e" "$ke"
+  got=$(lib_call table_keys_verdict "$kv_dir/b" "$kv_dir/a" "$kv_dir/e" 2>/dev/null || echo "?")
+  [ "$got" = "$want" ] && ok "table_keys_verdict before=[$kb] after=[$ka] export=[$ke] -> $want" || bad "table_keys_verdict before=[$kb] after=[$ka] export=[$ke] -> '$got', want $want"
+done
+# a key file that exists but cannot be read is not an empty one
+mkdir -p "$kv_dir/isdir"; kv_file "$kv_dir/a" "a"; kv_file "$kv_dir/e" "a"
+got=$(lib_call table_keys_verdict "$kv_dir/isdir" "$kv_dir/a" "$kv_dir/e" 2>/dev/null || echo "?")
+[ "$got" = "unknown" ] && ok "table_keys_verdict: a before-sweep file that cannot be read -> unknown" || bad "table_keys_verdict: unreadable before-sweep file -> '$got', want unknown"
+
+# The numbers the exporter reads from the environment feed arithmetic: a plain decimal whatever its spelling (08 is eight), the default for anything else.
+nw() { lib_call env_whole_number "$@" 2>/dev/null || echo "?"; }   # falhou (function missing) → "?"
+for spec in "2000|2000|1|2000" "08|2000|1|8" "007|2000|1|7" "100|2000|1|100" "|2000|1|2000" "abc|2000|1|2000" "-5|2000|1|2000" "5x|2000|1|2000" " 5|2000|1|2000" "0|2000|1|2000" "00|2000|1|2000" \
+            "0|3|0|0" "00|3|0|0" "3|3|0|3" "12345678901|2000|1|2000" "999999999|2000|1|999999999"; do
+  IFS='|' read -r v d m want <<< "$spec"
+  got=$(nw "$v" "$d" "$m")
+  [ "$got" = "$want" ] && ok "env_whole_number '$v' default $d min $m -> $want" || bad "env_whole_number '$v' default $d min $m -> '$got', want $want"
+done
 
 # ga-8z0hy7 — a commit that lands while jsonl-archive-compact.sh runs must not start git's background maintenance.
 # `git commit` runs `git maintenance run --auto --quiet --detach`; on git 2.54 that is a geometric repack which merges and deletes the loose-*.pack batch

@@ -403,6 +403,13 @@ with tempfile.TemporaryDirectory(prefix="jhst.") as T:
           rc == 0 and jget(so, "baseline", "state") == "unavailable", so[:300])
     rc, so, _ = run(*cli, "--previous", os.path.join(T, "nao-existe.json"))
     check("manifest (CLI): --previous apontando para arquivo que não existe => unavailable", rc == 0 and jget(so, "baseline", "state") == "unavailable", so[:300])
+    # `null` é JSON válido e carrega como None, o mesmo valor de "não há anterior" (state none). O arquivo existe, então é ilegível — nunca "none".
+    for label, body in (("null", "null"), ("null com quebra de linha", "null\n"), ("vazio", "")):
+        prev_null_f = os.path.join(T, "pnull.json")
+        open(prev_null_f, "w").write(body)
+        rc, so, _ = run(*cli, "--previous", prev_null_f)
+        check("manifest (CLI): --previous com %s => baseline unavailable (não none: o arquivo existe e não serve de régua)" % label,
+              rc == 0 and jget(so, "baseline", "state") == "unavailable" and "ilegível" in (jget(so, "baseline", "why") or ""), so[:300])
     rc, so, _ = run(*cli, "--baseline-unavailable", "latest.json ilegível")
     check("manifest (CLI): --baseline-unavailable MOTIVO => unavailable com o motivo",
           rc == 0 and jget(so, "baseline") == {"state": "unavailable", "why": "latest.json ilegível"}, so[:300])
@@ -412,6 +419,18 @@ with tempfile.TemporaryDirectory(prefix="jhst.") as T:
     check("manifest (CLI): --accept-drop => rc 0, suspect guardado", rc == 0 and jget(so, "verdict") == "ok" and jget(so, "suspect"), so[:300])
     rc, so, _ = run(*cli, "--previous", prev_f, "--suspect-drop-pct", "0")
     check("manifest (CLI): --suspect-drop-pct 0 é recusado (rc 2): queda de 0% nunca é limiar", rc == 2, "%s %s" % (rc, so[:100]))
+
+    # --partial: o `partial=` do commit do exporter (tabela que ficou com a versão do snapshot anterior). Legível e sem queda => verdict continua ok, mas o manifest DIZ.
+    mpar = mf(None, partial="wa(comments),hq(labels,config)")
+    check("partial: o manifest guarda a nota inteira e a lista db/tabela ordenada; o veredito não muda (ok)",
+          mpar["verdict"] == "ok" and mpar.get("partial") == {"note": "wa(comments),hq(labels,config)", "tables": ["hq/config", "hq/labels", "wa/comments"]}, json.dumps(mpar.get("partial")))
+    check("partial: sem nota, o manifest não ganha o campo (o ausente quer dizer 'nada ficou para trás')", "partial" not in mf(None) and "partial" not in mf(None, partial=""))
+    check("partial: nota fora da forma banco(tabela) fica inteira em `note` e `tables` vazio — nada se perde, nada é inventado",
+          mf(None, partial="lixo sem parênteses").get("partial") == {"note": "lixo sem parênteses", "tables": []})
+    rc, so, _ = run(*cli, "--partial", "hq(comments)")
+    check("manifest (CLI): --partial hq(comments) => rc 0 e partial.tables = [hq/comments]", rc == 0 and jget(so, "partial", "tables") == ["hq/comments"], so[:300])
+    rc, so, _ = run(*cli)
+    check("manifest (CLI): sem --partial => sem o campo", rc == 0 and jget(so, "verdict") == "ok" and "partial" not in json.loads(so), so[:200])
 
     # ── C2. bancos ignorados (o 1º upload real reprovou por causa de bench_hq_copy: config/metadata com 0 bytes) ──
     print("-- C2. bancos ignorados por padrão de nome")

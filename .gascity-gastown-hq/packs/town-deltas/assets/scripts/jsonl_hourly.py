@@ -22,9 +22,11 @@ SUBCOMANDOS (stdout = JSON, rc 0 ok / 1 dump ilegível / 2 uso)
   inspect F.tar.gz                                      conta linhas por <db>/<tabela> LENDO o artefato; erro de parse vira entrada em "errors"
   count   F.jsonl                                       número de linhas de um dump (uma tabela)
   manifest --inspect I.json --built B.json --captured-epoch N --head-epoch N --head-sha S --key K [--require db,db]
-           [--previous P.json | --baseline-unavailable MOTIVO] [--suspect-drop-pct 20 --suspect-min-rows 100] [--accept-drop]
+           [--previous P.json | --baseline-unavailable MOTIVO] [--suspect-drop-pct 20 --suspect-min-rows 100] [--accept-drop] [--partial NOTA]
                                                         manifest do snapshot (verdict ok|suspect|broken) a partir do que foi lido do artefato; com o
                                                         manifest anterior, tabela que caiu > 20% (e tinha >= 100 linhas) sem queda de issues = suspect
+                                                        --partial: o `partial=` do assunto do commit do exporter (tabelas que ficaram com a versão do snapshot anterior);
+                                                        vai para o manifest como `partial` {note, tables}, sem mudar o veredito (o contador é de quem chama)
   retention --prefix P --now EPOCH [--keep-recent-h 48 --keep-daily-days 14 --floor 6 --protect STEM]  < chaves
                                                         chaves a apagar (só o formato exato de snapshot; stdin = lista de chaves)
 
@@ -387,11 +389,25 @@ def sharp_drops(cur_dbs, prev_dbs, drop_pct, min_rows):
     return out
 
 
+PARTIAL_ENTRY_RE = re.compile(r"([^,()\s]+)\(([^()]*)\)")
+
+
+def partial_tables(note):
+    """`wa(comments),hq(labels,config)` (o `partial=` do assunto do commit do jsonl-export.sh) -> ['hq/config', 'hq/labels', 'wa/comments'].
+    Só lê a forma `banco(tabela[,tabela])`; o que não casa fica de fora da lista — o manifest guarda a nota inteira ao lado, então nada se perde."""
+    out = set()
+    for db, tabs in PARTIAL_ENTRY_RE.findall(note or ""):
+        out.update("%s/%s" % (db, t) for t in tabs.split(",") if t)
+    return sorted(out)
+
+
 def build_manifest(insp, built, meta, required_dbs, prev=None, baseline_unavailable=None,
-                   suspect_drop_pct=SUSPECT_DROP_PCT, suspect_min_rows=SUSPECT_MIN_PREV_ROWS, accept_drop=False):
+                   suspect_drop_pct=SUSPECT_DROP_PCT, suspect_min_rows=SUSPECT_MIN_PREV_ROWS, accept_drop=False, partial=""):
     """Junta o que foi LIDO do artefato (inspect) com o que foi gravado (build) e, com `prev` (o manifest do snapshot anterior), com o que havia antes.
     verdict: ok | suspect | broken. broken = o artefato não descreve o que diz; suspect = o artefato é legível mas uma tabela caiu bruscamente contra o anterior
-    sem explicação (lista em `suspect`); accept_drop (decisão de quem opera, um run só) mantém `suspect` e `baseline.accepted` no manifest e o torna ok."""
+    sem explicação (lista em `suspect`); accept_drop (decisão de quem opera, um run só) mantém `suspect` e `baseline.accepted` no manifest e o torna ok.
+    partial (a nota `partial=` do commit do exporter): tabelas cuja leitura inteira não fechou e que ficaram com a versão do snapshot anterior. Legíveis e
+    sem queda, portanto o veredito continua ok — o que muda é que o manifest DIZ (`partial`), para que o run seguinte conte quantas horas seguidas isso dura."""
     problems = []
     for e in insp.get("errors", []):
         problems.append("%s: %s" % (e["path"], e["error"]))
@@ -435,7 +451,7 @@ def build_manifest(insp, built, meta, required_dbs, prev=None, baseline_unavaila
     if suspect and accept_drop:
         baseline["accepted"] = True
     verdict = "broken" if problems else ("suspect" if suspect and not accept_drop else "ok")
-    return {
+    doc = {
         "schema": 1,
         "kind": "jsonl-hourly-snapshot",
         "verdict": verdict,
@@ -455,6 +471,9 @@ def build_manifest(insp, built, meta, required_dbs, prev=None, baseline_unavaila
         "ignore_patterns": built.get("ignore_patterns", []),
         "scope": "tabelas issues/comments/dependencies/labels/config/metadata como o jsonl-export.sh as arquiva (escrubbed: message, event, wisp, agent ficam de fora)",
     }
+    if partial:
+        doc["partial"] = {"note": partial, "tables": partial_tables(partial)}
+    return doc
 
 
 def cmd_manifest(args):
@@ -469,8 +488,14 @@ def cmd_manifest(args):
                 prev = json.load(f)
         except (OSError, ValueError) as e:
             unavailable = "manifest anterior ilegível (%s: %s)" % (type(e).__name__, e)
+        else:
+            # `null` é JSON válido e carrega como None — o mesmo valor que build_manifest lê como "não há anterior" (baseline none, o 1º run). Mas
+            # aqui o arquivo EXISTE e não diz nada: é ilegível, não ausente. Sem esta linha um latest.json `null` apagaria a régua em silêncio.
+            if prev is None:
+                unavailable = "manifest anterior ilegível (o documento é `null`)"
     doc = build_manifest(insp, built, meta, [d for d in args.require.split(",") if d], prev=prev, baseline_unavailable=unavailable,
-                         suspect_drop_pct=args.suspect_drop_pct, suspect_min_rows=args.suspect_min_rows, accept_drop=args.accept_drop)
+                         suspect_drop_pct=args.suspect_drop_pct, suspect_min_rows=args.suspect_min_rows, accept_drop=args.accept_drop,
+                         partial=args.partial)
     print(json.dumps(doc, sort_keys=True))
     return 0 if doc["verdict"] == "ok" else 1
 
@@ -595,6 +620,7 @@ def main(argv=None):
     mf.add_argument("--baseline-unavailable", default="", metavar="MOTIVO", help="o anterior existe mas não deu para ler: o manifest diz, em vez de calar")
     mf.add_argument("--suspect-drop-pct", type=_int_range(1, 99), default=SUSPECT_DROP_PCT, help="queda (%%) que torna uma tabela suspect")
     mf.add_argument("--suspect-min-rows", type=_int_min(1), default=SUSPECT_MIN_PREV_ROWS, help="tabelas com menos linhas no anterior não entram na conta")
+    mf.add_argument("--partial", default="", metavar="NOTA", help="o `partial=` do commit do exporter (banco(tabela),...): tabelas que ficaram com a versão do snapshot anterior; o manifest a registra")
     mf.add_argument("--accept-drop", action="store_true", help="aceita a queda (decisão de quem opera): verdict ok, `suspect` e baseline.accepted ficam no manifest")
     mf.set_defaults(fn=cmd_manifest)
     rt = sub.add_parser("retention")

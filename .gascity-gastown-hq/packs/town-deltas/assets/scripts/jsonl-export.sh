@@ -108,15 +108,90 @@ jex_cadence_verdict() {
     return 0
 }
 
-# How does a supplemental table's export compare with its source? (ga-l6v576) Prints ONE of:
+# A whole number from the environment, as a plain decimal (ga-l6v576). Prints <value> without its leading zeros when it is 1-9 digits and at least <min>; anything else — empty, a sign,
+# a space, letters, too many digits, below the minimum — prints <default>. The numbers feed arithmetic, where bash reads 08 as a bad octal: 10# makes it eight. Pure.
+env_whole_number() {
+    local value="$1" default="$2" min="$3"
+
+    case "$value" in ''|*[!0-9]*) printf '%s\n' "$default"; return 0 ;; esac
+    if [ "${#value}" -gt 9 ]; then
+        printf '%s\n' "$default"
+        return 0
+    fi
+    value=$((10#$value))
+    [ "$value" -ge "$min" ] || value="$default"
+    printf '%s\n' "$value"
+}
+
+# The cursor of a keyset page (ga-l6v576): reads ONE row as a JSON object on stdin and prints its key columns <cols> (space-separated plain names) as the SQL literals that go
+# into  WHERE (`id`, `seq`) > (<here>) , e.g. 'it''s', 3 . Strings are written the way MySQL reads them (' doubled, \ doubled, \n \r \t as escapes); a whole number of up to 15 digits is
+# written as it is. Anything else is NOT written: a null or missing column, a boolean, a fraction, a control character, a document that is not JSON. Return 1 with nothing printed then,
+# and the read stops instead of building SQL out of a key it cannot quote. Pure (jq only), so the selftest calls it in library mode.
+key_tuple_literal() {
+    local cols="$1"
+
+    jq -r --arg cols "$cols" --arg q "'" '
+        def lit:
+            if type == "string" then
+                explode
+                | map(if . == 39 then [39, 39]
+                      elif . == 92 then [92, 92]
+                      elif . == 10 then [92, 110]
+                      elif . == 13 then [92, 114]
+                      elif . == 9 then [92, 116]
+                      elif . < 32 or . == 127 then error("control character in a key")
+                      else [.] end)
+                | (add // []) | implode | $q + . + $q
+            elif type == "number" and . == floor and (tostring | test("^-?[0-9]{1,15}$")) then tostring
+            else error("key cannot be written") end;
+        . as $row
+        | if ($row | type) != "object" then error("not a row") else . end
+        | [($cols | split(" ") | .[]) as $c | ($row[$c] | lit)] | join(", ")' 2>/dev/null
+}
+
+# Did a read of a table in pages hold every row that was in the table the whole time? (ga-l6v576) Takes three files of KEYS, one JSON array per line: the table's keys read BEFORE the
+# rows (<before>), AFTER them (<after>), and the keys of the rows that came back (<export>). A key in <before> and <after> was in the table throughout, so the read must have it; a key
+# only one sweep has was inserted or deleted while the read ran, and that is the writers' business, not a loss. Prints ONE of:
+#   complete  every key that was there throughout is in the export (extra keys in the export are inserts the sweeps did not see);
+#   short N   N such keys are not;
+#   unknown   a file is missing or cannot be read — nobody can say (never "complete").
+# Unlike a count this sees what paging a live table does wrong: a row skipped is a missing key even when a row inserted meanwhile makes the counts equal. Pure (awk only), so the
+# selftest calls it in library mode.
+table_keys_verdict() {
+    local before="$1" after="$2" export_keys="$3" f missing
+
+    for f in "$before" "$after" "$export_keys"; do
+        if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+            echo unknown
+            return 0
+        fi
+    done
+    if ! missing=$(LC_ALL=C awk -v fb="$before" -v fa="$after" '
+        FILENAME == fb { b[$0] = 1; next }
+        FILENAME == fa { if ($0 in b) s[$0] = 1; next }
+        { e[$0] = 1 }
+        END { n = 0; for (k in s) if (!(k in e)) n++; print n }' "$before" "$after" "$export_keys" 2>/dev/null); then
+        echo unknown
+        return 0
+    fi
+    case "$missing" in
+        ''|*[!0-9]*) echo unknown ;;
+        0) echo complete ;;
+        *) echo "short $missing" ;;
+    esac
+}
+
+# How does a supplemental table's export compare with its source COUNT? (ga-l6v576) Used only for a table that cannot be paged by a key (it has none, or Dolt did not say); a keyed table
+# is judged by table_keys_verdict, because a count cannot see rows that a read of a live table served twice or skipped. Prints ONE of:
 #   short     a source count is readable AND the export has fewer rows than it;
 #   complete  a source count is readable AND the export has at least that many rows;
 #   unknown   no source count could be read (or the export's own count is not a number).
 # Three answers, like export_vs_source_verdict below, for the same reason: an unreadable count must never read as "complete". Pure (no Dolt, no globals but the
 # slack knob), so the selftest calls it in library mode.
 # The table is counted BEFORE and AFTER the read. Rows deleted while the read runs lower the count after it, so a whole read is never below the SMALLER of the two; comparing
-# with the larger one would call every busy table short. Whatever is added meanwhile only raises the export. There is no percentage slack on purpose: comments only grow, and a
-# cut that leaves the last 1% (a few hundred comments) is exactly the cut that goes unseen under the 1% the issues gate allows. A false "short" costs one retry, a miss costs the table.
+# with the larger one would call every busy table short. Whatever is added meanwhile only raises the export — and may hide rows the read lost, which is the blind spot of a count and
+# why a table with a key is not judged by it. There is no percentage slack on purpose: comments only grow, and a cut that leaves the last 1% (a few hundred comments) is exactly the
+# cut that goes unseen under the 1% the issues gate allows. A false "short" costs one retry, a miss costs the table.
 table_export_verdict() {
     local raw="$1" before="$2" after="$3" source slack="${GC_JSONL_SUPP_SHORT_SLACK:-0}"
 
@@ -182,19 +257,20 @@ MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-100}"
 # export is archived but reported as "unverified" (see the gate in the DB loop).
 SHORT_EXPORT_SLACK_PCT="${GC_JSONL_SHORT_EXPORT_SLACK_PCT:-1}"
 SHORT_EXPORT_MIN_SLACK="${GC_JSONL_SHORT_EXPORT_MIN_SLACK:-5}"
-# Supplemental tables (ga-l6v576): the five tables next to issues, each read in pages of SUPP_CHUNK_ROWS rows (Dolt cuts ONE read that runs past ~40 s: hq.comments came out at
-# 11,776 of 36,930 rows, exit 0), checked against its own COUNT(*), and tried at most SUPP_EXPORT_ATTEMPTS times before the previous version is kept. 2000 rows took 3-7 s on the
-# live hq, a margin of 5x under the cut; a retry cannot cure a cut that repeats, so the attempts stay few (the order's timeout is 840 s). GC_JSONL_SUPP_SHORT_SLACK (rows) is read
-# by table_export_verdict.
+# Supplemental tables (ga-l6v576): the five tables next to issues, each read in pages of SUPP_CHUNK_ROWS rows by KEY (WHERE key > last ORDER BY key LIMIT n; Dolt cuts ONE read that runs past
+# ~40 s: hq.comments came out at 11,776 of 36,930 rows, exit 0). A paged read of a live table is judged by its KEYS, not by a count: two sweeps of the table's keys, taken before and after
+# the rows, say which rows were there throughout, and the export must hold each of them (table_keys_verdict). The sweeps read SUPP_KEY_CHUNK_ROWS keys a page, a key being a fraction of a
+# row. A table is tried at most SUPP_EXPORT_ATTEMPTS times before its previous version is kept; 2000 rows took 3-7 s on the live hq, a margin of 5x under the cut, and a retry cannot cure
+# a cut that repeats, so the attempts stay few (the order's timeout is 840 s). A table with no usable key is read in ONE query and checked against its COUNT(*)
+# (GC_JSONL_SUPP_SHORT_SLACK rows, read by table_export_verdict). SUPP_CUT_SIGNATURE is what Dolt writes to stderr when it cuts a read.
 SUPP_TABLES="comments config dependencies labels metadata"
-SUPP_CHUNK_ROWS="${GC_JSONL_SUPP_CHUNK_ROWS:-2000}"
-SUPP_EXPORT_ATTEMPTS="${GC_JSONL_SUPP_EXPORT_ATTEMPTS:-2}"
-SUPP_EXPORT_RETRY_DELAY="${GC_JSONL_SUPP_EXPORT_RETRY_DELAY:-3}"
+# These feed arithmetic and `sleep`: a plain whole number in decimal (08 is eight), the default for anything else; only a delay may be 0.
+SUPP_CHUNK_ROWS=$(env_whole_number "${GC_JSONL_SUPP_CHUNK_ROWS:-2000}" 2000 1)
+SUPP_KEY_CHUNK_ROWS=$(env_whole_number "${GC_JSONL_SUPP_KEY_CHUNK_ROWS:-$((SUPP_CHUNK_ROWS * 5))}" $((SUPP_CHUNK_ROWS * 5)) 1)
+SUPP_EXPORT_ATTEMPTS=$(env_whole_number "${GC_JSONL_SUPP_EXPORT_ATTEMPTS:-2}" 2 1)
+SUPP_EXPORT_RETRY_DELAY=$(env_whole_number "${GC_JSONL_SUPP_EXPORT_RETRY_DELAY:-3}" 3 0)
 SUPP_MAX_PAGES=5000
-# These feed arithmetic and `sleep`: anything that is not a positive number (a delay may be 0) is the default.
-case "$SUPP_CHUNK_ROWS" in ''|*[!0-9]*|0|00*) SUPP_CHUNK_ROWS=2000 ;; esac
-case "$SUPP_EXPORT_ATTEMPTS" in ''|*[!0-9]*|0|00*) SUPP_EXPORT_ATTEMPTS=2 ;; esac
-case "$SUPP_EXPORT_RETRY_DELAY" in ''|*[!0-9]*) SUPP_EXPORT_RETRY_DELAY=3 ;; esac
+SUPP_CUT_SIGNATURE='unexpected EOF|packets\.go|bad connection|invalid connection|i/o timeout'
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
 PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
@@ -1260,9 +1336,9 @@ read_source_table_count() {
     printf '%s\n' "$count"
 }
 
-# The ORDER BY list that pages <db>.<table> by its primary key, e.g. "`issue_id`, `label`"; prints an empty line when the table has no key.
+# The primary key of <db>.<table> as its column names, space-separated ("id", "issue_id label"); prints an empty line when the table has no key (ga-l6v576).
 # vazio (no key) → the caller reads the table in ONE query, which the count check still gates; falhou/ilegível → return 1, and the caller does the same and says so.
-table_order_by() {
+table_key_columns() {
     local db="$1" table="$2" output col list=""
 
     if ! output=$(dolt_sql -r csv -q "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = '$db' AND TABLE_NAME = '$table' AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION" 2>/dev/null); then
@@ -1273,69 +1349,157 @@ table_order_by() {
         [ -n "$col" ] || continue
         # A name that is not plain is never put into SQL.
         case "$col" in *[!A-Za-z0-9_]*) return 1 ;; esac
-        list="${list:+$list, }\`$col\`"
-    done <<EOF
+        list="${list:+$list }$col"
+    done <<EOF2
 $(printf '%s\n' "$output" | tail -n +2)
-EOF
+EOF2
+    printf '%s\n' "$list"
+}
+
+# `a`, `b` — the key columns "a b" as SQL identifiers (they are plain names, see table_key_columns). `key` is a reserved word, hence the backticks.
+sql_column_list() {
+    local cols="$1" col list=""
+
+    for col in $cols; do
+        list="${list:+$list, }\`$col\`"
+    done
     printf '%s\n' "$list"
 }
 
 SUPP_RAW_ROWS=""
 
-# Reads <db>.<table> into the file <base> (ga-l6v576) and sets SUPP_RAW_ROWS to the rows that file holds (the sum of the pages' own counts: hq.comments is 363 MB, and a `jq -s`
-# over the joined file would hold all of it in memory). Scratch files are <base>.p<N> (the pages), <base>.rows and <base>.err (Dolt's stderr); the caller removes <base>.*.
-# One read that runs past ~40 s is cut by Dolt — a well-formed document, exit 0, "unexpected EOF" on stderr — so a table is read in pages of SUPP_CHUNK_ROWS rows ordered by its
-# primary key, each short enough to finish; a table with no key is read in one query. A single page is kept exactly as Dolt wrote it; several are joined in the same shape.
-# Return 0 → <base> holds a document; return 1 → the read failed (Dolt's exit code, or a page that is not a JSON document), Dolt's stderr is in the log, <base> is junk.
-# A page that comes back short ends the paging as if it were the last, so a cut page shows up as missing rows to the count check, not as a hang.
-read_table_pages() {
-    local db="$1" table="$2" order_by="$3" base="$4"
-    local offset=0 n=0 i rows query total=0
+# Reads <db>.<table> by KEY (ga-l6v576): pages of <chunk> rows, `SELECT <cols|*> FROM t [WHERE (<key>) > (<last key of the page before>)] ORDER BY <key> LIMIT <chunk>`. <kind> is
+# "rows" (whole rows into the document <out>, SUPP_RAW_ROWS = their count) or "keys" (the key columns only, into <out> itself as one JSON array per line). For rows the keys of what was
+# read are in <out>.keys. Scratch files are <out>.p<N> (pages), <out>.pe (one page's stderr), <out>.err (all of Dolt's stderr) and <out>.rows; the caller removes <out>.*.
+# Paging by key is not a snapshot either, but it fails in ways that can be told: a row inserted or deleted behind the cursor moves nothing, so no row is served twice or stepped over.
+# One read that runs past ~40 s is cut by Dolt — a well-formed document, exit 0, SUPP_CUT_SIGNATURE on stderr — so a page that comes back with rows and that line is kept and the next page
+# resumes from its last key. The paging stops on an EMPTY page only: a short page is not the end, it may be a cut. An empty page that carries the cut's line is the cut that left nothing:
+# a failed read. A single page is kept exactly as Dolt wrote it; several are joined in the same shape. Checked on the way: every page is a JSON document, the cursor moves on, and no key
+# comes twice (a server that repeats rows has not given a snapshot, whatever the counts say).
+# Return 0 → read; return 1 → the read failed (Dolt's exit code, an unreadable document, a cursor that cannot be written or does not move, a repeated key, an empty page after a cut), the
+# reason and Dolt's stderr are in the log, <out> is junk.
+read_keyed_pages() {
+    local db="$1" table="$2" cols="$3" kind="$4" chunk="$5" out="$6"
+    local what keys_file collist sel where query rows literal="" prev_literal="" n=0 kept=0 total=0 i dups
 
-    : > "$base.err"
-    SUPP_RAW_ROWS=""
+    collist=$(sql_column_list "$cols")
+    if [ "$kind" = rows ]; then
+        what="$db.$table"
+        keys_file="$out.keys"
+        sel='*'
+        SUPP_RAW_ROWS=""
+    else
+        what="the keys of $db.$table"
+        keys_file="$out"
+        sel="$collist"
+    fi
+    : > "$out.err"
+    : > "$keys_file" || return 1
     while :; do
         n=$((n + 1))
-        if [ -n "$order_by" ]; then
-            query="SELECT * FROM \`$db\`.\`$table\` ORDER BY $order_by LIMIT $SUPP_CHUNK_ROWS OFFSET $offset"
-        else
-            query="SELECT * FROM \`$db\`.\`$table\`"
-        fi
-        if ! dolt_sql -r json -q "$query" > "$base.p$n" 2>>"$base.err"; then
+        where=""
+        [ -z "$literal" ] || where=" WHERE ($collist) > ($literal)"
+        query="SELECT $sel FROM \`$db\`.\`$table\`$where ORDER BY $collist LIMIT $chunk"
+        if ! dolt_sql -r json -q "$query" > "$out.p$n" 2> "$out.pe"; then
+            cat "$out.pe" >> "$out.err" 2>/dev/null || true
             # third-state-waiver: a falha já foi decidida pelo rc do dolt acima; este tail só monta o texto do log (vazio se o .err sumiu)
-            echo "jsonl-export: reading $db.$table failed (page $n; dolt exited non-zero): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
+            echo "jsonl-export: reading $what failed (page $n; dolt exited non-zero): $(tail -c 300 "$out.err" | tr '\n' ' ')" >&2
             return 1
         fi
+        cat "$out.pe" >> "$out.err" 2>/dev/null || true
         # vazio (a 0-byte page) → an error, not a table with no rows: Dolt prints {} for that
-        if ! rows=$(jq -s -r 'if length == 0 then error("empty page") else ((.[0].rows // []) | length) end' "$base.p$n" 2>/dev/null); then
+        if ! rows=$(jq -s -r 'if length == 0 then error("empty page") else ((.[0].rows // []) | length) end' "$out.p$n" 2>/dev/null); then
             # third-state-waiver: a falha já foi decidida pelo status do jq acima; este tail só monta o texto do log (vazio se o .err sumiu)
-            echo "jsonl-export: reading $db.$table returned an unreadable document (page $n): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
+            echo "jsonl-export: reading $what returned an unreadable document (page $n): $(tail -c 300 "$out.err" | tr '\n' ' ')" >&2
             return 1
         fi
-        total=$((total + rows))
-        if [ -z "$order_by" ] || [ "$rows" -lt "$SUPP_CHUNK_ROWS" ]; then
+        if [ "$rows" -eq 0 ]; then
+            # vazio → the end of the table; a grep that cannot run reads as "no cut line", and the key check after the read still sees what the page should have held
+            if grep -Eq "$SUPP_CUT_SIGNATURE" "$out.pe" 2>/dev/null; then
+                # third-state-waiver: a falha já foi decidida pelo grep acima; este tail só monta o texto do log (vazio se o .err sumiu)
+                echo "jsonl-export: page $n of $what came back empty after the store cut the read: $(tail -c 300 "$out.err" | tr '\n' ' ')" >&2
+                return 1
+            fi
+            [ "$n" -eq 1 ] || rm -f "$out.p$n"
             break
         fi
-        if [ "$n" -ge "$SUPP_MAX_PAGES" ]; then
-            echo "jsonl-export: reading $db.$table needs more than $SUPP_MAX_PAGES pages of $SUPP_CHUNK_ROWS rows" >&2
+        kept=$((kept + 1))
+        total=$((total + rows))
+        # falhou → the page's keys, or the last row's cursor, cannot be made: the read stops (a key that cannot be quoted is never put into SQL)
+        if ! jq -c --arg cols "$cols" '($cols | split(" ")) as $cs | .rows[]? | . as $r | [$cs[] as $c | $r[$c]]' "$out.p$n" >> "$keys_file" 2>/dev/null; then
+            echo "jsonl-export: reading $what: the keys of page $n cannot be read" >&2
             return 1
         fi
-        offset=$((offset + SUPP_CHUNK_ROWS))
+        if ! literal=$(jq -c '.rows[-1]' "$out.p$n" 2>/dev/null | key_tuple_literal "$cols") || [ -z "$literal" ]; then
+            echo "jsonl-export: reading $what: the key of the last row of page $n cannot be written into the next query" >&2
+            return 1
+        fi
+        if [ "$literal" = "$prev_literal" ]; then
+            echo "jsonl-export: page $n of $what did not move past the cursor ($literal); the server ignores it or repeats the page" >&2
+            return 1
+        fi
+        prev_literal="$literal"
+        [ "$kind" = rows ] || rm -f "$out.p$n"
+        if [ "$n" -ge "$SUPP_MAX_PAGES" ]; then
+            echo "jsonl-export: reading $what needs more than $SUPP_MAX_PAGES pages of $chunk rows" >&2
+            return 1
+        fi
     done
 
-    if [ "$n" -eq 1 ]; then
-        mv -f "$base.p1" "$base" || return 1
+    # falhou (awk) → no answer: not "no key twice"
+    if ! dups=$(awk '($0 in seen) { d++ } { seen[$0] = 1 } END { print d + 0 }' "$keys_file" 2>/dev/null); then
+        echo "jsonl-export: reading $what: the keys read cannot be checked for repeats" >&2
+        return 1
+    fi
+    case "$dups" in
+        ''|*[!0-9]*)
+            echo "jsonl-export: reading $what: the keys read cannot be checked for repeats" >&2
+            return 1
+            ;;
+        0) ;;
+        *)
+            echo "jsonl-export: reading $what returned $dups keys more than once ($n pages): the server repeated rows, so the read is not a snapshot" >&2
+            return 1
+            ;;
+    esac
+    [ "$kind" = rows ] || return 0
+
+    if [ "$kept" -le 1 ]; then
+        mv -f "$out.p1" "$out" || return 1
     else
-        : > "$base.rows"
+        : > "$out.rows"
         i=1
-        while [ "$i" -le "$n" ]; do
-            jq -c '.rows[]?' "$base.p$i" >> "$base.rows" || return 1
+        while [ "$i" -le "$kept" ]; do
+            jq -c '.rows[]?' "$out.p$i" >> "$out.rows" || return 1
+            rm -f "$out.p$i"   # joined: the page is no longer needed, and the table's pages are a copy of the table
             i=$((i + 1))
         done
         # Dolt's own shape: {"rows": [row,row]}. The rows are one JSON line each, so the only newline paste leaves is its last.
-        { printf '{"rows": ['; paste -sd, - < "$base.rows" | tr -d '\n'; printf ']}\n'; } > "$base" || return 1
+        { printf '{"rows": ['; paste -sd, - < "$out.rows" | tr -d '\n'; printf ']}\n'; } > "$out" || return 1
     fi
     SUPP_RAW_ROWS="$total"
+    return 0
+}
+
+# Reads a table that has no key to page by, in ONE query, into the file <base> (ga-l6v576), and sets SUPP_RAW_ROWS to its row count. Scratch: <base>.err (Dolt's stderr).
+# Return 0 → read; return 1 → the read failed (Dolt's exit code, or not a JSON document), the reason is in the log, <base> is junk.
+read_table_once() {
+    local db="$1" table="$2" base="$3" rows
+
+    : > "$base.err"
+    SUPP_RAW_ROWS=""
+    if ! dolt_sql -r json -q "SELECT * FROM \`$db\`.\`$table\`" > "$base" 2>>"$base.err"; then
+        # third-state-waiver: a falha já foi decidida pelo rc do dolt acima; este tail só monta o texto do log (vazio se o .err sumiu)
+        echo "jsonl-export: reading $db.$table failed (dolt exited non-zero): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
+        return 1
+    fi
+    # vazio (a 0-byte document) → an error, not a table with no rows: Dolt prints {} for that
+    if ! rows=$(jq -s -r 'if length == 0 then error("empty document") else ((.[0].rows // []) | length) end' "$base" 2>/dev/null); then
+        # third-state-waiver: a falha já foi decidida pelo status do jq acima; este tail só monta o texto do log (vazio se o .err sumiu)
+        echo "jsonl-export: reading $db.$table returned an unreadable document: $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
+        return 1
+    fi
+    SUPP_RAW_ROWS="$rows"
     return 0
 }
 
@@ -1364,16 +1528,72 @@ keep_previous_table() {
     fi
 }
 
-# Exports <db>.<table> into $DB_DIR/<table>.jsonl (ga-l6v576), checked against the table's own COUNT(*) read before and after the read. The export is built in the scratch dir
-# and moves into the archive only when it passes. Returns:
-#   0  whole: at least as many rows as the source has; it is now the file;
-#   3  the source count could not be read, so nobody can say: the export is the file, flagged unverified — not discarded, a store whose count query is down must not freeze its archive;
+# One attempt at a table that has a key (ga-l6v576): its keys, its rows, its keys again, and the verdict of table_keys_verdict. Sets SUPP_VERDICT (complete | short | unknown | failed) and
+# SUPP_DETAIL (what the log says, without the "jsonl-export: " prefix). Return 1 only when the ROWS could not be read (SUPP_VERDICT=failed). A key sweep that cannot be read is not an
+# empty one: its file is removed, table_keys_verdict has nothing to compare with and answers "unknown".
+SUPP_VERDICT=""
+SUPP_DETAIL=""
+supp_attempt_keyed() {
+    local db="$1" table="$2" cols="$3" base="$4" verdict
+
+    SUPP_VERDICT=failed
+    SUPP_DETAIL=""
+    # falhou → no file for the sweep (never an empty one), so the verdict below is "unknown"
+    read_keyed_pages "$db" "$table" "$cols" keys "$SUPP_KEY_CHUNK_ROWS" "$base.kb" || rm -f "$base.kb"
+    read_keyed_pages "$db" "$table" "$cols" rows "$SUPP_CHUNK_ROWS" "$base" || return 1
+    read_keyed_pages "$db" "$table" "$cols" keys "$SUPP_KEY_CHUNK_ROWS" "$base.ka" || rm -f "$base.ka"
+    verdict=$(table_keys_verdict "$base.kb" "$base.ka" "$base.keys")
+    case "$verdict" in
+        complete)
+            SUPP_VERDICT=complete
+            ;;
+        short\ *)
+            SUPP_VERDICT=short
+            SUPP_DETAIL="export curto de $db.$table: $SUPP_RAW_ROWS linhas lidas, ${verdict#short } chaves que estavam na tabela do começo ao fim da leitura fora do export"
+            ;;
+        *)
+            SUPP_VERDICT=unknown
+            SUPP_DETAIL="key sweep unavailable for $db.$table; export NOT verified against source (raw export: $SUPP_RAW_ROWS rows)"
+            ;;
+    esac
+    return 0
+}
+
+# One attempt at a table that has NO key to page by: one query, bracketed by two COUNT(*)s, and the verdict of table_export_verdict. Same contract as supp_attempt_keyed.
+supp_attempt_counted() {
+    local db="$1" table="$2" base="$3" before after
+
+    SUPP_VERDICT=failed
+    SUPP_DETAIL=""
+    # vazio → unreadable ("don't know", never 0): table_export_verdict reads it as the third state
+    before=$(read_source_table_count "$db" "$table" || true)
+    read_table_once "$db" "$table" "$base" || return 1
+    after=$(read_source_table_count "$db" "$table" || true)
+    SUPP_VERDICT=$(table_export_verdict "$SUPP_RAW_ROWS" "$before" "$after")
+    case "$SUPP_VERDICT" in
+        complete)
+            ;;
+        short)
+            SUPP_DETAIL="export curto de $db.$table: $SUPP_RAW_ROWS vs fonte ${before:-?}/${after:-?}"
+            ;;
+        *)
+            SUPP_VERDICT=unknown
+            SUPP_DETAIL="source count unavailable for $db.$table; export NOT verified against source (raw export: $SUPP_RAW_ROWS rows)"
+            ;;
+    esac
+    return 0
+}
+
+# Exports <db>.<table> into $DB_DIR/<table>.jsonl (ga-l6v576). A table with a key is read by key and judged by its keys (supp_attempt_keyed); one without is read in one query and judged
+# by its COUNT(*) (supp_attempt_counted). The export is built in the scratch dir and moves into the archive only when it passes. Returns:
+#   0  whole: every row that was in the table throughout the read is in the file (a keyless table: at least as many rows as the source has); it is now the file;
+#   3  nobody can say (a key sweep or the count could not be read): the export is the file, flagged unverified — not discarded, a store whose sweep is down must not freeze its archive;
 #   1  not read whole in SUPP_EXPORT_ATTEMPTS tries (short, or the read failed): the file is NOT written and the previous version stays;
 #   2  the previous version could not be put back: the caller discards the DB.
 export_supplemental_table() {
     local db="$1" table="$2"
     local dest="$DB_DIR/$table.jsonl"
-    local base order_by before after verdict attempt=1 rc
+    local base cols attempt=1 rc
 
     # falhou (mktemp) → the table is not exported this run and its previous version stays
     if ! base=$(mktemp "$EXPORT_TMP_DIR/$table.jsonl.tmp.XXXXXX"); then
@@ -1382,36 +1602,35 @@ export_supplemental_table() {
         return 1
     fi
     # vazio (no key) / falhou (unreadable) → empty: one query, and the count check below still gates it
-    if ! order_by=$(table_order_by "$db" "$table"); then
+    if ! cols=$(table_key_columns "$db" "$table"); then
         echo "jsonl-export: primary key of $db.$table unreadable; reading the table in one query" >&2
-        order_by=""
+        cols=""
     fi
     while :; do
-        # vazio → unreadable ("don't know", never 0): table_export_verdict reads it as the third state
-        before=$(read_source_table_count "$db" "$table" || true)
-        if read_table_pages "$db" "$table" "$order_by" "$base"; then
-            after=$(read_source_table_count "$db" "$table" || true)
-            verdict=$(table_export_verdict "$SUPP_RAW_ROWS" "$before" "$after")
-            case "$verdict" in
-                complete|unknown)
-                    if [ "$verdict" = unknown ]; then
-                        echo "jsonl-export: source count unavailable for $db.$table; export NOT verified against source (raw export: $SUPP_RAW_ROWS rows)" >&2
-                    fi
-                    rc=0
-                    [ "$verdict" = complete ] || rc=3
-                    if ! mv -f "$base" "$dest"; then
-                        rm -f "$base" "$base".*
-                        return 2
-                    fi
-                    rm -f "$base".*
-                    return "$rc"
-                    ;;
-                *)
-                    # third-state-waiver: o export curto já foi decidido pelas três leituras de contagem acima; este tail só monta o texto do log (vazio se o .err sumiu)
-                    echo "jsonl-export: export curto de $db.$table: $SUPP_RAW_ROWS vs fonte ${before:-?}/${after:-?} (tentativa $attempt/$SUPP_EXPORT_ATTEMPTS): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
-                    ;;
-            esac
+        if [ -n "$cols" ]; then
+            supp_attempt_keyed "$db" "$table" "$cols" "$base" || true
+        else
+            supp_attempt_counted "$db" "$table" "$base" || true
         fi
+        case "$SUPP_VERDICT" in
+            complete|unknown)
+                if [ "$SUPP_VERDICT" = unknown ]; then
+                    echo "jsonl-export: $SUPP_DETAIL" >&2
+                fi
+                rc=0
+                [ "$SUPP_VERDICT" = complete ] || rc=3
+                if ! mv -f "$base" "$dest"; then
+                    rm -f "$base" "$base".*
+                    return 2
+                fi
+                rm -f "$base".*
+                return "$rc"
+                ;;
+            short)
+                # third-state-waiver: o export curto já foi decidido pelo veredito acima; este tail só monta o texto do log (vazio se o .err sumiu)
+                echo "jsonl-export: $SUPP_DETAIL (tentativa $attempt/$SUPP_EXPORT_ATTEMPTS): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
+                ;;
+        esac
         if [ "$attempt" -ge "$SUPP_EXPORT_ATTEMPTS" ]; then
             break
         fi
@@ -1528,11 +1747,12 @@ while IFS= read -r DB; do
     # is comparable with SOURCE_BEFORE (same SQL filter).
     RAW_EXPORT_COUNT=$(count_jsonl_rows < "$DB_DIR/issues.jsonl")
 
-    # Export supplemental tables (ga-l6v576). Each one is read in pages and checked against its own COUNT(*), the way issues are above: a read that Dolt cut short is still a
-    # well-formed document with exit 0 (29 of 37 hq snapshots had comments.jsonl at a multiple of 128 rows). Per table:
+    # Export supplemental tables (ga-l6v576). A table with a primary key is read in pages BY KEY and judged by keys: every key that was in the table before the read and still is after it
+    # must be in the file. A read that Dolt cut short is still a well-formed document with exit 0 (29 of 37 hq snapshots had comments.jsonl at a multiple of 128 rows), and a row count
+    # cannot tell a lost row from one the table gained meanwhile. A table with no key is read in one query and judged by its COUNT(*), the way issues are above. Per table:
     #   whole       -> it is the file;
     #   short/failed-> not written, the previous version stays, the DB is reported as failed with the table named (issues still commit);
-    #   unknown     -> the source count is unreadable: kept and flagged unverified, like issues;
+    #   unknown     -> the source (its keys, or its count) is unreadable: kept and flagged unverified, like issues;
     #   unrestorable-> the DB is discarded like any other failed step.
     SUPP_UNRESTORABLE=0
     for TABLE in $SUPP_TABLES; do

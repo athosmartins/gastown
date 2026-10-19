@@ -28,6 +28,11 @@
 #     seguinte já compara com ele. Limiares: JHO_SUSPECT_DROP_PCT (20) e JHO_SUSPECT_MIN_ROWS (100). Sem anterior (1º run) o manifest diz baseline `none`; com latest.json
 #     ou manifest anterior que o S3 não devolveu diz `unavailable` e o log avisa "sem régua" — o snapshot sobe mesmo assim (travar o upload por uma checagem secundária
 #     pararia o RPO). NÃO garante: a defesa primária é o gate de contagem por tabela do jsonl-export.sh; uma purga real que coincida com um corte de filhos fica escondida.
+#   - tabela que ficou para trás (ga-l6v576): o exporter lê as tabelas suplementares (comments, labels, ...) em páginas e só aceita a tabela se a leitura fechar; se não fecha,
+#     mantém a versão do snapshot anterior e escreve ` partial=banco(tabela)` no assunto do commit. É um snapshot LEGÍVEL e sem queda — o manifest diz ok — com uma tabela velha dentro.
+#     Este script lê esse `partial=` do HEAD, grava no manifest (`partial` {note, tables}) e em latest.json, e CONTA execuções seguidas com tabela atrasada (`consecutive_partial`
+#     no estado): JHO_ALERT_AFTER (2) seguidas => `notify` forçado, no máx. 1 a cada JHO_ALERT_EVERY_S, com contagem e alerta próprios (não gasta o limite do alerta de falha).
+#     Um HEAD limpo zera. NÃO veta o upload: as outras tabelas e os issues verificados continuam subindo (vetar pararia o RPO de tudo por causa de uma tabela).
 #   - RPO real = intervalo entre runs do exporter + 60 min + duração do run: típico ~1h35, pior medido ~4h15 (runbook). `data_as_of` é quando o dado MUDOU (cidade ociosa o envelhece).
 #
 # ESTADOS (três, e o neutro é inerte): rc 0 = snapshot novo verificado, ou HEAD igual ao último verificado, objeto ainda no S3 e exporter vivo (só atualiza `checked_at`) ·
@@ -136,6 +141,31 @@ register_not_ok() {
   fi
 }
 
+# Conta uma execução COM tabela atrasada (ou zera, se o HEAD veio limpo) e decide se avisa. $1 = nota `partial=` do HEAD ("" = limpo). Roda em todo run que termina com o
+# snapshot (novo ou o mesmo, já no S3) válido — o `partial` é propriedade do HEAD, e um HEAD parado com a tabela atrasada continua atrasando a cada hora que passa.
+register_partial() {
+  local note="$1" n last now arc
+  now="$(now_epoch)"
+  if [ -z "$note" ]; then
+    state_update '.consecutive_partial = 0 | .last_partial_note = ""' || log "AVISO: estado não gravado (o contador de tabela atrasada pode ficar sem zerar)"
+    return 0
+  fi
+  n="$(state_get '.consecutive_partial' 0)"; n=$((n + 1))
+  last="$(state_get '.last_partial_alert_epoch' 0)"
+  log "AVISO: o HEAD $SHA12 carrega tabela atrasada ($note): $n execução(ões) seguida(s)"
+  # contador que não grava não vira "1 seguida, sem alerta": sem como contar, avisa já (mesma regra do register_not_ok)
+  state_update '.consecutive_partial = $n | .last_partial_note = $p' --argjson n "$n" --arg p "$note" || { log "AVISO: não gravei o estado; sem contador de tabela atrasada, aviso já"; n=$ALERT_AFTER; }
+  if [ "$n" -ge "$ALERT_AFTER" ] && [ $((now - last)) -ge "$ALERT_EVERY_S" ]; then
+    notify_fail "$n execuções seguidas com tabela atrasada no snapshot horário ($note): o exporter não conseguiu ler a tabela inteira e manteve a versão anterior. O snapshot sobe, mas essa tabela não está sendo salva a cada hora."; arc=$?
+    if [ $arc -eq 0 ]; then
+      state_update '.last_partial_alert_epoch = $e' --argjson e "$now" || log "AVISO: alerta saiu mas last_partial_alert_epoch não gravou (repete no próximo run)"
+      log "alerta de tabela atrasada enviado (consecutive_partial=$n)"
+    else
+      log "AVISO: alerta de tabela atrasada NÃO entregue (rc=$arc); o próximo run tenta de novo"
+    fi
+  fi
+}
+
 s3key_artifact() { echo "$PREFIX/snap/$1.tar.gz"; }       # $1 = stem <stamp>-<sha12>
 s3key_manifest() { echo "$PREFIX/snap/$1.manifest.json"; }
 s3key_latest()   { echo "$PREFIX/latest.json"; }
@@ -203,7 +233,8 @@ now=int(sys.argv[3]); print(now-ep(sys.argv[1]), now-ep(sys.argv[2]))' "$checked
   check_age="${ages% *}"; asof_age="${ages#* }"
   [ "$check_age" -ge 0 ] || { echo "STATUS: UNKNOWN checked_at no futuro (${check_age}s)"; exit 2; }   # idade negativa não é "recente"
   if [ "$check_age" -le "$STATUS_MAX_CHECK_AGE_S" ]; then verdict=OK; rc=0; else verdict=STALE; rc=1; fi
-  echo "STATUS: $verdict checked_at=$checked (há ${check_age}s) data_as_of=$asof (há ${asof_age}s) snapshot=$(jq -r '.snapshot_key' "$tmp")"
+  # third-state-waiver: o veredito (OK/STALE) já saiu das datas acima; esta leitura só monta o texto da linha (vazio = latest.json sem `partial`, que é o normal)
+  echo "STATUS: $verdict checked_at=$checked (há ${check_age}s) data_as_of=$asof (há ${asof_age}s) snapshot=$(jq -r '.snapshot_key' "$tmp")$(jq -r 'if (.partial // "") != "" then " partial=" + .partial else "" end' "$tmp" 2>/dev/null)"
   exit $rc
 fi
 
@@ -247,6 +278,11 @@ git -C "$ARCHIVE" rev-parse --git-dir >/dev/null 2>&1 || unknown "archive não �
 SHA="$(git -C "$ARCHIVE" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || unknown "archive sem HEAD"
 HEAD_EPOCH="$(git -C "$ARCHIVE" log -1 --format=%ct "$SHA" 2>/dev/null)"
 case "$HEAD_EPOCH" in ""|*[!0-9]*) unknown "não li a data do HEAD $SHA" ;; esac
+# o assunto do commit do exporter termina em ` partial=banco(tabela),...` quando alguma tabela ficou com a versão anterior (ga-l6v576). vazio → sem `partial=` (HEAD limpo);
+# falhou → não sei, e não sei não é limpo: rc 2, nada foi tentado (como a data do HEAD logo acima, que sai do mesmo commit)
+HEAD_SUBJ="$(git -C "$ARCHIVE" log -1 --format=%s "$SHA" 2>/dev/null)" || unknown "não li o assunto do HEAD $SHA"
+PARTIAL_NOTE=""
+case "$HEAD_SUBJ" in *" partial="*) PARTIAL_NOTE="${HEAD_SUBJ##* partial=}"; PARTIAL_NOTE="${PARTIAL_NOTE%% *}" ;; esac
 FREE="$(df -Pk "$STATE_DIR" | awk 'NR==2 {print int($4/1024)}')"
 [ -n "$FREE" ] && [ "$FREE" -ge "$MIN_FREE_MB" ] || unknown "pouco disco em $STATE_DIR (${FREE:-?} MB < $MIN_FREE_MB MB)"
 
@@ -283,6 +319,7 @@ if [ "$LAST_SHA" = "$SHA" ] && [ -n "$LAST_KEY" ]; then
         && LSHA="$(python3 -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$WD/latest.new")" \
         && s3_put_verified "$(s3key_latest)" "$WD/latest.new" "$LSHA" application/json \
         && { state_update '.consecutive_not_ok = 0 | .attempt_open = false | .last_check_at = $t' --arg t "$(iso_now)" || log "AVISO: estado não gravado (o contador de falhas pode ficar sem zerar)"
+             register_partial "$PARTIAL_NOTE"
              log "HEAD $SHA12 já está no S3 ($LAST_STEM): ponto batido"; echo "RESULT: ok unchanged key=$LAST_KEY head_age_s=$HEAD_AGE"; exit 0; }
       log "não consegui reescrever latest.json; sigo para um snapshot novo"
     else
@@ -327,7 +364,7 @@ elif [ $lrc -eq 0 ]; then BASE_FLAG=--previous; BASE_VAL="$WD/prev.manifest.json
 fi
 ACCEPT_FLAG=""; [ "${JHO_ACCEPT_DROP:-0}" = 1 ] && { ACCEPT_FLAG=--accept-drop; log "JHO_ACCEPT_DROP=1: queda brusca aceita por quem opera, só neste run"; }
 python3 -I "$PY" manifest --inspect "$WD/inspect.json" --built "$WD/files.json" --captured-epoch "$(now_epoch)" --head-epoch "$HEAD_EPOCH" \
-  --head-sha "$SHA" --key "$ART" --require "$REQUIRED_DBS" ${BASE_FLAG:+"$BASE_FLAG" "$BASE_VAL"} ${ACCEPT_FLAG:+"$ACCEPT_FLAG"} \
+  --head-sha "$SHA" --key "$ART" --require "$REQUIRED_DBS" ${BASE_FLAG:+"$BASE_FLAG" "$BASE_VAL"} ${ACCEPT_FLAG:+"$ACCEPT_FLAG"} ${PARTIAL_NOTE:+--partial "$PARTIAL_NOTE"} \
   ${JHO_SUSPECT_DROP_PCT:+--suspect-drop-pct "$JHO_SUSPECT_DROP_PCT"} ${JHO_SUSPECT_MIN_ROWS:+--suspect-min-rows "$JHO_SUSPECT_MIN_ROWS"} \
   > "$WD/manifest.json" 2> "$WD/manifest.err"
 mrc=$?
@@ -355,8 +392,9 @@ MAN_SHA="$(python3 -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[
 s3_put_verified "$(s3key_manifest "$STEM")" "$WD/manifest.json" "$MAN_SHA" application/json || fail "upload do manifest não verificou"
 jq -n --arg key "$ART" --arg mkey "$(s3key_manifest "$STEM")" --arg sha "$ART_SHA" --argjson bytes "$ART_BYTES" \
       --arg asof "$(jq -r '.data_as_of' "$WD/manifest.json")" --arg cap "$(jq -r '.captured_at' "$WD/manifest.json")" \
-      --arg head "$SHA" --arg chk "$(iso_now)" --argjson db "$(jq -c '.databases | map_values(.issues)' "$WD/manifest.json")" \
-      '{schema:1, snapshot_key:$key, manifest_key:$mkey, sha256:$sha, bytes:$bytes, data_as_of:$asof, captured_at:$cap, checked_at:$chk, source_head:$head, issues_per_db:$db}' > "$WD/latest.json" \
+      --arg head "$SHA" --arg chk "$(iso_now)" --argjson db "$(jq -c '.databases | map_values(.issues)' "$WD/manifest.json")" --arg partial "$PARTIAL_NOTE" \
+      '{schema:1, snapshot_key:$key, manifest_key:$mkey, sha256:$sha, bytes:$bytes, data_as_of:$asof, captured_at:$cap, checked_at:$chk, source_head:$head, issues_per_db:$db}
+       + (if $partial == "" then {} else {partial:$partial} end)' > "$WD/latest.json" \
   || fail "não montei latest.json (jq falhou): nada foi publicado como ponteiro"
 LSHA="$(python3 -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$WD/latest.json")"
 s3_put_verified "$(s3key_latest)" "$WD/latest.json" "$LSHA" application/json || fail "upload de latest.json não verificou"
@@ -364,6 +402,7 @@ s3_put_verified "$(s3key_latest)" "$WD/latest.json" "$LSHA" application/json || 
 ZERO='.consecutive_not_ok = 0 | '; [ -z "$SRC_WHY" ] || ZERO=""   # fonte parada: o upload valeu, mas a contagem de não-ok não zera
 state_update "$ZERO"'.attempt_open = false | .last_success_at = $t | .last_success_sha = $s | .last_success_key = $k | .last_success_bytes = $b | .last_success_data_as_of = $a' \
   --arg t "$(iso_now)" --arg s "$SHA" --arg k "$ART" --argjson b "$ART_BYTES" --arg a "$(jq -r '.data_as_of' "$WD/manifest.json")" || log "AVISO: estado não gravado"
+register_partial "$PARTIAL_NOTE"
 DUR=$(( $(now_epoch) - START ))
 # third-state-waiver: o snapshot já subiu e latest.json já andou; esta linha só monta o texto do log, e o estado (régua) vem do manifest já validado acima
 log "OK $STEM: $ART_BYTES bytes, $(jq -r '[.databases | to_entries[] | .value.issues] | add' "$WD/manifest.json") issues em $(jq -r '.databases | length' "$WD/manifest.json") bancos (ignorados: $(jq -r '.ignored_dbs | join(",") | if . == "" then "nenhum" else . end' "$WD/manifest.json")), régua: $(jq -r '.baseline.state' "$WD/manifest.json"), ${DUR}s"

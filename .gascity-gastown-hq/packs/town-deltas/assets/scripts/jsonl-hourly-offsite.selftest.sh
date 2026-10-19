@@ -102,7 +102,7 @@ if [ "${NOTIFY_FORCE_PUSH:-}" != 1 ]; then [ "${NOTIFY_STRICT_EXIT:-}" = 1 ] && 
 echo "$*" >> "${NOTIFY_LOG%.log}.pushed"
 STUB
 chmod +x "$WORK/bin/notify"
-mkdir -p "$WORK/gitbin"; printf '#!/bin/bash\ncase " $* " in *" diff "*) [ -n "${GIT_FAIL_DIFF:-}" ] && exit 128 ;; esac\nexec %s "$@"\n' "$(command -v git)" > "$WORK/gitbin/git"; chmod +x "$WORK/gitbin/git"   # git que falha só no diff (GIT_FAIL_DIFF=1)
+mkdir -p "$WORK/gitbin"; printf '#!/bin/bash\ncase " $* " in *" diff "*) [ -n "${GIT_FAIL_DIFF:-}" ] && exit 128 ;; *" --format=%%s "*) [ -n "${GIT_FAIL_SUBJ:-}" ] && exit 128 ;; esac\nexec %s "$@"\n' "$(command -v git)" > "$WORK/gitbin/git"; chmod +x "$WORK/gitbin/git"   # git que falha só no diff (GIT_FAIL_DIFF=1) ou só na leitura do assunto do commit (GIT_FAIL_SUBJ=1)
 mkdir -p "$WORK/jqbin"; printf '#!/bin/bash\ncase " $* " in *.manifest_key*) [ -n "${JQ_FAIL_MKEY:-}" ] && { echo "jq: error: injected" >&2; exit 5; } ;; esac\nexec %s "$@"\n' "$(command -v jq)" > "$WORK/jqbin/jq"; chmod +x "$WORK/jqbin/jq"   # jq que falha só ao LER .manifest_key, não ao montá-lo no latest.json (JQ_FAIL_MKEY=1)
 # helper embrulhado (JHO_PY): repassa tudo ao real; WRAP=db_string estraga .databases do manifest, WRAP=retention_fail derruba o `retention`
 cat > "$WORK/bin/wrap.py" <<WRAP
@@ -316,6 +316,12 @@ NOW_OFF=2800; offsite
 eq "manifest anterior que o S3 devolve vazio: baseline unavailable (não 'none'), e o snapshot sobe" "$RC:${OUT%% key=*}:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:RESULT: ok new:unavailable"
 case "$(jqf .baseline.why "$(MANOF "$(ARTKEY)")")" in *ilegível*) ok "e o manifest guarda o motivo (manifest anterior ilegível)" ;; *) bad "manifest sem o motivo da régua: $(jqf .baseline.why "$(MANOF "$(ARTKEY)")")" ;; esac
 
+write_comments hq 450; commit_all "450"
+printf 'null\n' > "$S/bucket/obj/$(jqf .manifest_key "$(LATEST)")"   # o S3 devolve o manifest anterior como o documento JSON `null`: válido, vazio de conteúdo
+NOW_OFF=3500; offsite
+eq "manifest anterior que é o JSON null: baseline unavailable (não 'none'), e o snapshot sobe" "$RC:${OUT%% key=*}:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:RESULT: ok new:unavailable"
+case "$(jqf .baseline.why "$(MANOF "$(ARTKEY)")")" in *null*) ok "e o manifest guarda o motivo (o documento é null)" ;; *) bad "manifest sem o motivo da régua: $(jqf .baseline.why "$(MANOF "$(ARTKEY)")")" ;; esac
+
 echo "-- 7. banco obrigatório ausente"; new_env nodb; REQ="hq,wa,fantasma"
 NOW_OFF=0; offsite
 eq "rc 1, latest.json não criado, nada subiu: bucket vazio, nenhum put" "$RC:$([ -e "$(LATEST)" ] && echo has || echo none):$(objs | wc -l | tr -d ' '):$(putlog | wc -l | tr -d ' ')" "1:none:0:0"
@@ -440,6 +446,41 @@ new_env dead; broke; printf '{"consecutive_not_ok":0,"attempt_open":true}\n' > "
 eq "run anterior morto (timeout do order, kill, reboot) conta: com a falha de agora são 2 seguidas e o alerta sai" "$RC:$(pushed)" "1:1"
 NOW_OFF=900; offsite
 eq "a tentativa fechou: o run morto não é recontado" "$(grep -c 'run anterior não terminou' "$S/log/offsite.log")" 1
+
+echo "-- 11b. tabela atrasada: o exporter manteve a versão anterior de uma tabela (partial= no assunto do HEAD) e isso dura (ga-l6v576)"; new_env partial
+PST() { jqf "$1" "$ST"; }
+NOW_OFF=0; offsite
+eq "HEAD limpo: rc 0, ok new, manifest e latest.json sem partial, contador em 0" "$RC:${OUT%% key=*}:$(jqf 'has("partial")' "$(MANOF "$(ARTKEY)")"):$(jqf 'has("partial")' "$(LATEST)"):$(PST .consecutive_partial)" "0:RESULT: ok new:false:false:0"
+write_comments hq 400; commit_all "backup 2026-10-19T10:00:00Z: exported=2/2 records=403 partial=hq(comments)"
+NOW_OFF=900; offsite
+eq "1º HEAD com tabela atrasada: sobe (rc 0, ok new, verdict ok) e o manifest NOMEIA a tabela" "$RC:${OUT%% key=*}:$(jqf '[.verdict, .partial.note, (.partial.tables | join(","))] | join("|")' "$(MANOF "$(ARTKEY)")")" "0:RESULT: ok new:ok|hq(comments)|hq/comments"
+eq "latest.json também diz (é o que o --status e quem restaura leem)" "$(jqf .partial "$(LATEST)")" "hq(comments)"
+eq "contador de tabela atrasada: 1 seguida, sem alerta, e o contador de falha não anda" "$(PST .consecutive_partial):$(pushed):$(PST '.consecutive_not_ok // 0')" "1:0:0"
+offsite --status; case "$OUT" in "STATUS: OK "*" partial=hq(comments)"*) ok "--status mostra a tabela atrasada (rc $RC)" ;; *) bad "--status sem o partial: $OUT" ;; esac
+write_comments hq 405; commit_all "backup 2026-10-19T11:00:00Z: exported=2/2 records=408 partial=hq(comments)"
+NOW_OFF=1800; offsite
+eq "2º HEAD seguido com a tabela atrasada: contador 2, e o alerta chega ao telefone (push forçado)" "$RC:$(PST .consecutive_partial):$(pushed)" "0:2:1"
+case "$(cat "$S/notify.pushed" 2>/dev/null)" in *"tabela atrasada"*"hq(comments)"*) ok "o alerta nomeia a tabela" ;; *) bad "alerta sem a tabela: $(cat "$S/notify.pushed" 2>/dev/null)" ;; esac
+eq "o alerta de tabela atrasada tem relógio próprio (last_partial_alert_epoch), e não gasta o do alerta de falha" "$(PST '.last_partial_alert_epoch | type'):$(PST '.last_alert_epoch // "none"')" "number:none"
+NOW_OFF=2700; offsite
+eq "HEAD parado (ok unchanged) com a tabela ainda atrasada CONTA: 3 seguidas; dentro das 6 h não repete o alerta" "$RC:${OUT%% key=*}:$(PST .consecutive_partial):$(pushed)" "0:RESULT: ok unchanged:3:1"
+NOW_OFF=$((7 * 3600)); offsite
+eq "7 h depois, ainda atrasada: o alerta repete (limite de 1 a cada 6 h)" "$(PST .consecutive_partial):$(pushed)" "4:2"
+write_comments hq 410; commit_all "backup 2026-10-19T18:00:00Z: exported=2/2 records=413"
+NOW_OFF=$((7 * 3600 + 900)); offsite
+eq "HEAD limpo outra vez: o contador zera, o manifest e latest.json deixam de ter partial" "$RC:$(PST .consecutive_partial):$(jqf 'has("partial")' "$(MANOF "$(ARTKEY)")"):$(jqf 'has("partial")' "$(LATEST)")" "0:0:false:false"
+offsite --status; case "$OUT" in *partial=*) bad "--status ainda mostra partial depois de limpo: $OUT" ;; *) ok "--status volta a não dizer partial" ;; esac
+# o alerta tem que chegar; se não chega: AVISO, relógio intocado, o run seguinte tenta de novo
+new_env partial12; write_comments hq 400; commit_all "backup x: exported=2/2 records=403 partial=wa(comments),hq(labels)"
+NOW_OFF=0; offsite; write_comments hq 401; commit_all "backup y: exported=2/2 records=404 partial=wa(comments),hq(labels)"
+NOW_OFF=900; NOTIFY_RC=12 offsite
+eq "alerta de tabela atrasada que não foi entregue: AVISO, sem 'enviado', sem last_partial_alert_epoch" "$(grep -c 'alerta de tabela atrasada NÃO entregue' "$S/log/offsite.log"):$(grep -c 'alerta de tabela atrasada enviado' "$S/log/offsite.log"):$(PST '.last_partial_alert_epoch // "none"')" "1:0:none"
+eq "e o manifest lista as duas tabelas, de dois bancos, ordenadas" "$(jqf '.partial.tables | join(",")' "$(MANOF "$(ARTKEY)")")" "hq/labels,wa/comments"
+NOW_OFF=1800; offsite
+eq "o run seguinte (notify de volta) entrega" "$(pushed)" 1
+# o assunto do HEAD que não se lê não é HEAD limpo: rc 2, nada foi tentado, conta como run sem snapshot
+new_env partialsubj; NOW_OFF=0; GIT_FAIL_SUBJ=1 PATH="$WORK/gitbin:$PATH" offsite
+eq "git não lê o assunto do HEAD: rc 2, UNKNOWN no log, conta como run sem snapshot e nada sobe" "$RC:$(grep -c 'UNKNOWN: não li o assunto do HEAD' "$S/log/offsite.log"):$(PST .consecutive_not_ok):$(count_objs 'tar.gz')" "2:1:1:0"
 
 echo "-- 12. retenção"; new_env ret
 seed_stems() { python3 -I - "$S/bucket" "$T0" <<'PYEOF'
