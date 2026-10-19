@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <!-- ga-2hd02v.1.12. 900 s é constante de desenho, não só ajuste do launchd: a janela de CPU válida do script vai de 2 min a 3 intervalos
+       (HETZNER_OCC_INTERVAL_S tem de acompanhar este número). Instalar e conferir: docs/runbooks/hetzner-occupancy-watch.md. -->
+  <key>Label</key><string>com.gascity.hetzner-occupancy-watch</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/hetzner-occupancy-watch.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>LowPriorityIO</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/hetzner-occupancy-watch.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/hetzner-occupancy-watch.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict></plist>
