@@ -22,6 +22,9 @@
 #
 # THE ROOM FACTOR (3rd argument of jaw_repack_allowed, default JAW_PACK_FACTOR = 2): the exporter's detached geometric repack keeps the rule above (2 x). The compactor's consolidating gc passes 1 —
 # free >= the largest pack + 2GiB, the Mayor's rule for it (ga-wkoij7) — because it has a second, tighter guard of its own (disk_low: free >= ALL the packs + headroom) that decides the real room.
+# BOTH guards are sized on a repack that rewrites EVERY pack. On a 10GB archive whose largest pack is 4.5GB that is 6.6GB free, and the mini hovers at 5-6GB: the gc was refused 48 runs in a row while the disk
+# stayed full (ga-978f1y). A refusal INSIDE the window (JAW_IN_WINDOW=1) is therefore not the end of the night for the compactor: it then runs a smaller pass — `--keep-pack` on the largest — sized to the room
+# that is really there, under a watchdog on free disk and swap (its "tier 2b" in jsonl-archive-compact.sh). Nothing changes for the exporter, which still refuses.
 #
 # HOW LONG THE WINDOW LASTS (jaw_window_left_s): the seconds until JAW_END_H (06:00). The compactor gives its night gc that long (less a margin) instead of the 600s cap that killed it three runs in a
 # row on the 6.5GB archive; a clock that cannot be read, or a window that is already closed, is "no time", never "plenty".
@@ -36,6 +39,7 @@ JAW_PACK_FACTOR="${JAW_PACK_FACTOR:-2}"
 JAW_SWAP_KIB="${JAW_SWAP_KIB:-2097152}"
 JAW_LOG_MAX_LINES=2000
 JAW_REASON=""
+JAW_IN_WINDOW=0      # set by jaw_repack_allowed: 1 when the clock was inside the start window, whatever the room said
 
 _jaw_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
@@ -162,12 +166,16 @@ jaw_log() {
 }
 
 # jaw_repack_allowed <gitdir> [free_kib] [factor] — the whole rule. rc 0 = a whole-repo repack may start now; rc 1 = it may not. JAW_REASON says why either way (a variable: call this directly, not in $(...)).
+# JAW_IN_WINDOW says which side refused: 1 = the clock is inside the start window (a refusal is then about ROOM), 0 = it is not (or the clock/settings cannot be read). The compactor's partial pass (ga-978f1y)
+# is for the first case only; it never runs outside the window.
 jaw_repack_allowed() {
   local gd="$1" free="${2:-}" factor="${3:-}"
+  JAW_IN_WINDOW=0
   if ! jaw_window_open; then
     jaw_log 0 "repack NOT allowed: $JAW_REASON"
     return 1
   fi
+  JAW_IN_WINDOW=1
   if ! jaw_resources_ok "$gd" "$free" "$factor"; then
     jaw_log 1 "repack NOT allowed, INSIDE the window: $JAW_REASON; swap $(jaw_swap_used)"
     return 1

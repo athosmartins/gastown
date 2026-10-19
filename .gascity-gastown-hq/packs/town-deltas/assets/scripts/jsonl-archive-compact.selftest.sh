@@ -1324,8 +1324,8 @@ LS="$(lint_steps "$SCRIPT")"
 got_bare="$(printf '%s\n' "$LS" | grep '^BARE|' | cut -d'|' -f2 | sort -u | tr '\n' ',')"
 [ "$got_bare" = "count-objects," ] && ok "the only git run bare on the repo is the read-only count-objects (measure)" || bad "bare git subcommand(s) [$got_bare] — want only count-objects: a git that WRITES must go through run_step"
 got_steps="$(printf '%s\n' "$LS" | grep '^STEP|' | cut -d'|' -f2 | sed 's/ *--quiet.*$//' | tr '\n' ',')"
-want_steps="repack,maintenance run --task=loose-objects,prune-packed,-c gc.autoDetach=false gc,"      # file order: the tail pass (tier 2a) is defined above compact_repo
-[ "$got_steps" = "$want_steps" ] && ok "the steps that go through run_step are exactly the pinned four (tail repack, batch, prune-packed, gc)" || bad "steps differ from the pin — got [$got_steps] want [$want_steps]: read the new/removed step (does it write objects? then it can leak), then update the pin"
+want_steps="repack,repack,maintenance run --task=loose-objects,prune-packed,-c gc.autoDetach=false gc,"      # file order: the tail pass (tier 2a) and the room pass (tier 2b, ga-978f1y) are defined above compact_repo
+[ "$got_steps" = "$want_steps" ] && ok "the steps that go through run_step are exactly the pinned five (tail repack, room repack, batch, prune-packed, gc)" || bad "steps differ from the pin — got [$got_steps] want [$want_steps]: read the new/removed step (does it write objects? then it can leak), then update the pin"
 cp "$SCRIPT" "$WORK/steps-mutant.sh"
 printf '%s\n' 'x="$(git_arch 5 repack 2>&1)"' 'run_step "$t_left" repack --quiet' 'y="$("$GITBIN" gc)"' 'git --git-dir="$R_GITDIR" repack -d' >> "$WORK/steps-mutant.sh"
 MS="$(lint_steps "$WORK/steps-mutant.sh")"
@@ -2145,6 +2145,205 @@ WG1="$WORK/n6"; mkwin "$WG1"; WG2="$WORK/n7"; mkrepo "$WG2" 20; LG2="$(loose_cou
 out="$(T_DEADLINE=3 night_run "$WG1 $WG2")"; rc=$?
 { [ "$(pack_count "$WG1")" -le 2 ] && [ "$(loose_count "$WG2")" = "$LG2" ]; } \
   && ok "(G) the first repo's night gc ran (packs -> $(pack_count "$WG1")); the second repo got no night budget — its $LG2 loose objects wait for the next run" || bad "(G) deadline leaked into the next repo (packs1=$(pack_count "$WG1") loose2 $LG2 -> $(loose_count "$WG2")): $out"
+
+echo ""
+
+echo "=== S39: the ROOM PASS — when the gc cannot have all the room it asks for, a few packs at a time are consolidated with the LARGEST kept, under a watchdog on free disk AND swap (ga-978f1y) ==="
+# 19/10: the consolidating gc was deferred 48 runs in a row on the 10GB archive (56 packs). Two gates stacked, both sized on data a partial repack does not rewrite: the window lib asks for free >= the largest pack
+# (4.5GB) + 2GiB = 6.6GB, and disk_low then asks for ALL the packs; the mini hovers at 5-6GB free, so the gc never ran and the disk never recovered. The Mayor measured the other way out by hand — `repack -a -d
+# --keep-pack=<largest>` — and a floor watchdog killed it: swap grew 4096 -> 6144 MB (macOS keeps swap on this volume), free fell 5133 -> 2998 MB. So the new pass (a) takes only as many packs as the room over Dolt's floor
+# holds, never the largest, with lean pack parameters, (b) is WATCHED while it runs: free disk below the floor, swap growing past a budget, or either unreadable for several samples ends it, with everything under it, and (c)
+# backs off after a cut. The fixture: 5 packs of ~122KiB; T_CRIT=0 makes Dolt's floor exactly 1GiB (1048576KiB); free = floor + RAVAIL KiB, so RAVAIL is the room the pass may use (default 400: three packs fit, four do not).
+# The clock is 02h (inside the window). The fake git below logs every `repack` and can hang it after writing the readings the watchdog polls (JAC_SWAP_USED_FILE, JAC_WATCH_FREE_FILE are its seams).
+RFLOOR=1048576
+cat > "$WORK/git-room" <<EOF
+#!/bin/bash
+case " \$* " in *" repack "*)
+  printf '%s\n' "\$*" >> "$WORK/room-args"
+  case "\${ROOM_ACT:-}" in
+    swap)  printf '%s\n' "\${ROOM_SWAP_TO:-3000000}" > "$WORK/swap-used" ;;
+    free)  printf '%s\n' "\${ROOM_FREE_TO:-1000}" > "$WORK/watch-free" ;;
+    blind) rm -f "$WORK/swap-used" ;;
+  esac
+  case "\${ROOM_ACT:-}" in swap|free|blind|hang) sleep 60 & echo \$! > "$WORK/room-sleep.pid"; wait \$! ;; esac ;;
+esac
+exec git "\$@"
+EOF
+chmod +x "$WORK/git-room"
+rrun() {  # rrun <repo> — one run: 02h (RHOUR), 4-pack limit, floor 1GiB (RCRIT), no headroom, free = floor + RAVAIL (RFREE overrides), the swap seam at RSWAP0 (none = unreadable), a 0.2s watch with no slack
+  local avail="${RAVAIL:-400}"
+  rm -f "$WORK/room-args" "$WORK/room-sleep.pid"
+  printf '%s\n' "$(( RFLOOR + avail ))" > "$WORK/watch-free"
+  if [ "${RSWAP0:-1000}" = none ]; then rm -f "$WORK/swap-used"; else printf '%s\n' "${RSWAP0:-1000}" > "$WORK/swap-used"; fi
+  if [ "${RFREEFILE:-0}" = 1 ]; then export JAC_WATCH_FREE_FILE="$WORK/watch-free"; else unset JAC_WATCH_FREE_FILE; fi
+  if [ -n "${RSYSCTL:-}" ]; then export JAC_SYSCTL="$RSYSCTL"; unset JAC_SWAP_USED_FILE; else unset JAC_SYSCTL; export JAC_SWAP_USED_FILE="$WORK/swap-used"; fi      # RSYSCTL: read swap through a stand-in sysctl (the real parse), not the file seam
+  JAC_WATCH_INTERVAL_S="${RINTERVAL:-0.2}" JAC_WATCH_SLACK_KIB=0 JAC_ROOM_MIN_KIB="${RMIN:-1}" JAC_WATCH_KILL_GRACE_S=2 \
+  T_CRIT="${RCRIT:-0}" T_HEADROOM=0 T_HOUR="${RHOUR:-2}" T_PACKS=4 T_FREE="${RFREE:-$(( RFLOOR + avail ))}" T_GIT="$WORK/git-room" run_jac "$1"
+}
+biggest_pack() { ls -S "$1/.git/objects/pack/"*.pack | head -n 1; }
+sleeper_gone() { [ -s "$WORK/room-sleep.pid" ] && ! kill -0 "$(cat "$WORK/room-sleep.pid")" 2>/dev/null; }
+# The gc's own disk gate asks for all the packs + the headroom, and the fixture's packs are KiB while its free disk is 1GiB+ (the room pass needs the 1GiB floor to exist). So the roads where THAT gate says no go through
+# this stand-in for the read-only `git count-objects -v` of measure() (the one bare git; every other call passes through): the archive "weighs" 3GiB — more than the free disk — while the real files stay tiny.
+PACKSHIM="$WORK/packshim"; mkdir -p "$PACKSHIM"
+cat > "$PACKSHIM/git" <<EOF
+#!/bin/bash
+case " \$* " in *" count-objects "*) "$(command -v git)" "\$@" | awk '/^size-pack:/ { print "size-pack: 3145728"; next } { print }' ;; *) exec "$(command -v git)" "\$@" ;; esac
+EOF
+chmod +x "$PACKSHIM/git"
+# A. the window lib refuses INSIDE the window (free 1GiB+400KiB < the largest pack + 2GiB): until now `deferred`, every run. Now the pass takes what the room holds — 3 of the 4 non-largest packs — and keeps the largest as it is
+RA="$WORK/ra"; mkwin "$RA"; RA_PC="$(pack_count "$RA")"; RA_H="$(history "$RA")"; RA_BIG="$(biggest_pack "$RA")"; RA_SUM="$(shasum "$RA_BIG" | cut -d' ' -f1)"
+rm -f "$WORK/state.json" "$WORK/window.log"
+out="$(rrun "$RA")"; rc=$?
+{ [ "$RA_PC" -eq 5 ] && [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$RA")" -eq 3 ]; } \
+  && ok "A. lib refuses in the window, 400KiB of room over the floor: the room pass consolidates 3 packs into 1 (packs $RA_PC -> $(pack_count "$RA")), status consolidated, exit 0" \
+  || bad "A. room pass wrong (rc=$rc packs $RA_PC -> $(pack_count "$RA") status=$(last_status)): $out"
+{ [ -f "$RA_BIG" ] && [ "$(shasum "$RA_BIG" | cut -d' ' -f1)" = "$RA_SUM" ] && grep -q -- "--keep-pack=$(basename "$RA_BIG")" "$WORK/room-args"; } \
+  && ok "A. the largest pack is untouched (same file, same bytes) and is named in --keep-pack" || bad "A. the largest pack was not protected: $(cat "$WORK/room-args" 2>/dev/null)"
+{ [ "$(history "$RA")" = "$RA_H" ] && git --git-dir="$RA/.git" fsck --strict >/dev/null 2>&1; } && ok "A. history identical, fsck clean" || bad "A. history changed or fsck failed"
+{ grep -q -- ' -f ' "$WORK/room-args" && grep -q -- '--cruft' "$WORK/room-args" && grep -q -- ' -a -d -l ' "$WORK/room-args" && [ "$(grep -o 'pack.threads=[0-9]*' "$WORK/room-args" | tail -n 1)" = "pack.threads=1" ] \
+  && [ "$(grep -o 'pack.windowMemory=[0-9a-z]*' "$WORK/room-args" | tail -n 1)" = "pack.windowMemory=128m" ] && [ "$(grep -o 'pack.deltaCacheSize=[0-9a-z]*' "$WORK/room-args" | tail -n 1)" = "pack.deltaCacheSize=32m" ]; } \
+  && ok "A. the repack recomputes deltas (-f), writes a cruft pack, and the LAST pack.* settings are the lean ones (1 thread, windowMemory 128m, deltaCacheSize 32m)" || bad "A. repack command line wrong: $(cat "$WORK/room-args" 2>/dev/null)"
+{ grep -q 'INSIDE the window' "$WORK/window.log" 2>/dev/null && grep -q 'room pass' "$WORK/window.log" 2>/dev/null; } \
+  && ok "A. the window log has the lib's in-window refusal AND the room pass that followed it" || bad "A. window log: $(cat "$WORK/window.log" 2>/dev/null)"
+# B. the lib allows it (T_SWAP=0 takes the swap headroom out of its rule) but the gc's own disk gate — all the packs + the headroom, here 3GiB through the count-objects stand-in against 1GiB+400KiB free — does not: the same pass
+RB="$WORK/rb"; mkwin "$RB"; RB_BIG="$(biggest_pack "$RB")"; RB_SUM="$(shasum "$RB_BIG" | cut -d' ' -f1)"; rm -f "$WORK/state.json"
+out="$(PATH="$PACKSHIM:$PATH" T_SWAP=0 rrun "$RB")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$RB")" -eq 3 ] && [ "$(shasum "$RB_BIG" | cut -d' ' -f1)" = "$RB_SUM" ] && [ -s "$WORK/room-args" ]; } \
+  && ok "B. the lib says yes, the disk gate (all packs + headroom) says no: the SAME partial pass runs (packs 5 -> $(pack_count "$RB"), largest untouched)" || bad "B. disk-gate path wrong (rc=$rc packs=$(pack_count "$RB") status=$(last_status)): $out"
+# C. no room even for the two smallest packs (200KiB < ~244): nothing is repacked, and the answer is the OLD one for the road taken — deferred (lib refused) / skipped-low-disk (disk gate), both with their old words
+RC1="$WORK/rc1"; mkwin "$RC1"; RC1_PC="$(pack_count "$RC1")"; rm -f "$WORK/state.json"
+out="$(RAVAIL=200 rrun "$RC1")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RC1")" = "$RC1_PC" ] && printf '%s' "$out" | grep -q 'room pass not started' && printf '%s' "$out" | grep -q 'consolidating gc deferred'; } \
+  && ok "C. 200KiB of room: no repack, status deferred, the log says the room pass did not start and keeps the window's reason" || bad "C. no-room (lib road) wrong (rc=$rc status=$(last_status) packs=$(pack_count "$RC1")): $out"
+RC2="$WORK/rc2"; mkwin "$RC2"; rm -f "$WORK/state.json"
+out="$(PATH="$PACKSHIM:$PATH" T_SWAP=0 RAVAIL=200 rrun "$RC2")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ ! -e "$WORK/room-args" ] && printf '%s' "$out" | grep -q 'status=skipped-low-disk (gc)'; } \
+  && ok "C. same room, disk-gate road: no repack, status skipped-low-disk (exit 1), the old '(gc)' line" || bad "C. no-room (disk road) wrong (rc=$rc status=$(last_status)): $out"
+# D. every reading the pass depends on that cannot be read leaves it inert: swap, free disk, the Dolt floor setting
+RD="$WORK/rd"; mkwin "$RD"; RD_PC="$(pack_count "$RD")"; rm -f "$WORK/state.json"
+out="$(RSWAP0=none rrun "$RD")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RD")" = "$RD_PC" ] && printf '%s' "$out" | grep -q 'swap in use cannot be read'; } \
+  && ok "D. swap unreadable: no repack, the log says so" || bad "D. unreadable swap handled wrong (rc=$rc status=$(last_status)): $out"
+out="$(RFREE=notanumber rrun "$RD")"; rc=$?
+{ [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RD")" = "$RD_PC" ] && [ "$(last_status)" = "deferred" ]; } && ok "D. free disk unreadable: no repack" || bad "D. unreadable free handled wrong (rc=$rc status=$(last_status)): $out"
+out="$(RCRIT=abc rrun "$RD")"; rc=$?
+{ [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RD")" = "$RD_PC" ]; } && ok "D. a Dolt floor setting that is not a number: no repack (the floor cannot be shown)" || bad "D. unreadable floor handled wrong (rc=$rc status=$(last_status)): $out"
+out="$(PATH="$PACKSHIM:$PATH" T_SWAP=0 RCRIT=abc rrun "$RD")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RD")" = "$RD_PC" ]; } \
+  && ok "D. ...and on the disk-gate road the answer is the gate's old one when the floor cannot be shown: skipped-low-disk" || bad "D. gc with an unreadable floor wrong (rc=$rc status=$(last_status) packs=$(pack_count "$RD")): $out"
+# E. by day the pass does not exist: heavy maintenance is for the window (Athos 15/10) — deferred, and nothing in the window log
+RE="$WORK/re"; mkwin "$RE"; RE_PC="$(pack_count "$RE")"; rm -f "$WORK/state.json" "$WORK/window.log"
+out="$(RHOUR=12 rrun "$RE")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RE")" = "$RE_PC" ] && [ ! -e "$WORK/window.log" ]; } \
+  && ok "E. 12h: no room pass, packs unchanged, status deferred, window log untouched" || bad "E. noon handled wrong (rc=$rc status=$(last_status) packs=$(pack_count "$RE")): $out"
+# F. the Mayor's incident: swap grows while the pass runs → the watchdog stops it, with the process under it, well before the 60s the fake would hang; status aborted (loud), the cap is halved, the next try waits
+RF="$WORK/rf"; mkwin "$RF"; RF_PC="$(pack_count "$RF")"; RF_H="$(history "$RF")"; rm -f "$WORK/state.json"; T0="$(date +%s)"
+out="$(ROOM_ACT=swap rrun "$RF")"; rc=$?; took=$(( $(date +%s) - T0 ))
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && [ "$took" -lt 30 ] && sleeper_gone; } \
+  && ok "F. swap 1000 -> 3000000KiB during the pass: stopped by the watchdog in ${took}s (not 60), status aborted, exit 1, the hung process under it is gone" || bad "F. swap growth handled wrong (rc=$rc status=$(last_status) took=${took}s sleeper_gone=$(sleeper_gone && echo y || echo n)): $out"
+printf '%s' "$out" | grep -q 'WATCHDOG' && printf '%s' "$out" | grep -qi 'swap' && ok "F. the log names the watchdog and the swap" || bad "F. no watchdog line naming the swap: $out"
+{ [ "$(pack_count "$RF")" = "$RF_PC" ] && [ "$(history "$RF")" = "$RF_H" ] && git --git-dir="$RF/.git" fsck --strict >/dev/null 2>&1; } && ok "F. packs unchanged, history identical, fsck clean" || bad "F. the repo changed under an aborted pass"
+RF_RK="$(state_field "$RF" room_kib)"; RF_CUT="$(state_field "$RF" room_cut_epoch)"
+{ [ "$RF_RK" -ge 170 ] 2>/dev/null && [ "$RF_RK" -le 195 ] && [ "$RF_CUT" -ge "$T0" ] 2>/dev/null && [ "$(state_field "$RF" bad_streak)" = 1 ]; } \
+  && ok "F. state: the next pass carries half of what this one did (room_kib=$RF_RK of ~366), the cut time is recorded, bad_streak 1" || bad "F. state wrong: room_kib=$RF_RK room_cut_epoch=$RF_CUT bad_streak=$(state_field "$RF" bad_streak)"
+# I. ...and the next run does not try again at once (a pass the host cannot carry must not repeat every 30 minutes)
+out="$(rrun "$RF")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RF")" = "$RF_PC" ] && [ "$(last_status)" = "deferred" ] && printf '%s' "$out" | grep -q 'backing off'; } \
+  && ok "I. right after the cut: no repack, deferred, the log says it is backing off" || bad "I. no backoff after a cut (rc=$rc status=$(last_status) packs=$(pack_count "$RF")): $out"
+[ "$(state_field "$RF" room_kib)" = "$RF_RK" ] && [ "$(state_field "$RF" room_cut_epoch)" = "$RF_CUT" ] && ok "I. a run that did not try keeps the remembered cap and cut time" || bad "I. the backoff run changed the state (room_kib=$(state_field "$RF" room_kib) cut=$(state_field "$RF" room_cut_epoch))"
+# J. once the backoff has passed the pass runs again, at the smaller cap (it still takes the two smallest packs: a cap cannot go below what merges two), the cut time is cleared and the cap grows back
+jq --arg r "$RF" '.[$r].room_cut_epoch = ((now | floor) - 10000)' "$WORK/state.json" > "$WORK/state.new" && mv "$WORK/state.new" "$WORK/state.json"
+out="$(rrun "$RF")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$RF")" -lt "$RF_PC" ] && [ -s "$WORK/room-args" ] && [ "$(state_field "$RF" room_cut_epoch)" = 0 ]; } \
+  && ok "J. after the backoff the pass runs at the remembered cap and succeeds (packs $RF_PC -> $(pack_count "$RF")), the cut time is cleared" || bad "J. retry after the backoff wrong (rc=$rc status=$(last_status) packs=$(pack_count "$RF") cut=$(state_field "$RF" room_cut_epoch)): $out"
+{ printf '%s' "$out" | grep -qE "adaptive cap ${RF_RK}KiB" && [ "$(state_field "$RF" room_kib)" -gt "$RF_RK" ]; } \
+  && ok "J. the log shows the halved cap it ran at ($RF_RK KiB), and a clean pass that left a pack out for the cap grows it (now $(state_field "$RF" room_kib))" || bad "J. cap not shown or not grown (was $RF_RK, now $(state_field "$RF" room_kib)): $out"
+# G. free disk falls below the floor during the pass
+RG="$WORK/rg"; mkwin "$RG"; RG_PC="$(pack_count "$RG")"; rm -f "$WORK/state.json"
+out="$(RFREEFILE=1 ROOM_ACT=free rrun "$RG")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && sleeper_gone && [ "$(pack_count "$RG")" = "$RG_PC" ] && printf '%s' "$out" | grep -q 'free disk fell'; } \
+  && ok "G. free disk 1000KiB (< the 1GiB floor) during the pass: stopped, aborted, the log names the free disk" || bad "G. free-disk drop handled wrong (rc=$rc status=$(last_status)): $out"
+# H. the watchdog going BLIND is not "all clear": swap unreadable for 3 samples in a row ends the pass
+RH="$WORK/rh"; mkwin "$RH"; RH_PC="$(pack_count "$RH")"; rm -f "$WORK/state.json"
+out="$(ROOM_ACT=blind rrun "$RH")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && sleeper_gone && [ "$(pack_count "$RH")" = "$RH_PC" ] && printf '%s' "$out" | grep -q 'could not be read'; } \
+  && ok "H. swap unreadable for 3 samples in a row: stopped, aborted, the log says the readings were lost" || bad "H. blind watchdog handled wrong (rc=$rc status=$(last_status)): $out"
+# K. growth: a cap that left a pack out while there was room, and a pass that used under a quarter of its budget, doubles
+RK="$WORK/rk"; mkwin "$RK"; rm -f "$WORK/state.json"
+out="$(JAC_ROOM_START_KIB=250 RAVAIL=100000 rrun "$RK")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$RK")" -eq 4 ] && [ "$(state_field "$RK" room_kib)" = 500 ]; } \
+  && ok "K. start cap 250KiB, plenty of room: 2 packs merged (5 -> $(pack_count "$RK")), the fast pass doubles the cap to $(state_field "$RK" room_kib)" || bad "K. growth wrong (rc=$rc packs=$(pack_count "$RK") room_kib=$(state_field "$RK" room_kib) status=$(last_status)): $out"
+# L. the pass's OWN cap runs out → timeout (bad), the cap is halved, the next try waits. M. the RUN's budget runs out → deferred, nothing learned about the pass
+if [ -z "$(command -v timeout gtimeout 2>/dev/null)" ]; then skip "L/M: no timeout(1) on this host — the cap checks of the room pass did NOT run"; else
+RL="$WORK/rl"; mkwin "$RL"; RL_PC="$(pack_count "$RL")"; rm -f "$WORK/state.json"; T0="$(date +%s)"
+out="$(JAC_ROOM_TIMEOUT_S=2 ROOM_ACT=hang rrun "$RL")"; rc=$?; took=$(( $(date +%s) - T0 ))
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "timeout" ] && [ "$took" -ge 2 ] && [ "$took" -lt 30 ] && sleeper_gone && [ "$(pack_count "$RL")" = "$RL_PC" ]; } \
+  && ok "L. a pass that outlives its own 2s cap: killed, status timeout, exit 1 (${took}s)" || bad "L. own-cap timeout wrong (rc=$rc status=$(last_status) took=${took}s): $out"
+{ [ "$(state_field "$RL" room_kib)" -le 195 ] 2>/dev/null && [ "$(state_field "$RL" room_cut_epoch)" -ge "$T0" ] 2>/dev/null; } \
+  && ok "L. the cap is halved ($(state_field "$RL" room_kib)) and the cut time recorded" || bad "L. state after the timeout: room_kib=$(state_field "$RL" room_kib) cut=$(state_field "$RL" room_cut_epoch)"
+RM="$WORK/rm"; mkwin "$RM"; RM_PC="$(pack_count "$RM")"; rm -f "$WORK/state.json"
+out="$(T_DEADLINE=6 T_MIN_GC=1 JAC_ROOM_TIMEOUT_S=60 ROOM_ACT=hang rrun "$RM")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ] && sleeper_gone && [ "$(pack_count "$RM")" = "$RM_PC" ] && [ "$(state_field "$RM" room_kib)" = null ] && printf '%s' "$out" | grep -q 'cut by the run deadline'; } \
+  && ok "M. the run's budget (6s) ends the pass: killed, status deferred (not a failure), exit 0, the cap is NOT lowered" || bad "M. deadline cut wrong (rc=$rc status=$(last_status) room_kib=$(state_field "$RM" room_kib)): $out"
+fi
+# N. ONE REPACKER AT A TIME holds for this pass too
+RN="$WORK/rn"; mkwin "$RN"; RN_PC="$(pack_count "$RN")"; rm -f "$WORK/state.json"
+fg_start "$RN" repack -d -l --geometric=2 --quiet || bad "test setup: the stand-in repacker did not show up in ps"
+out="$(rrun "$RN")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "busy" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RN")" = "$RN_PC" ] && printf '%s' "$out" | grep -q "pid $FG_PID"; } \
+  && ok "N. a foreign repacker in the repo: the room pass does not start, status busy, the log names the process" || bad "N. foreign repacker handled wrong (rc=$rc status=$(last_status)): $out"
+fg_stop_all
+# O. a setting of the pass that is not a number: inert, and the log says which family
+RO="$WORK/ro"; mkwin "$RO"; RO_PC="$(pack_count "$RO")"; rm -f "$WORK/state.json"
+out="$(JAC_ROOM_START_KIB=abc rrun "$RO")"; rc=$?
+{ [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RO")" = "$RO_PC" ] && printf '%s' "$out" | grep -q 'JAC_ROOM_'; } \
+  && ok "O. JAC_ROOM_START_KIB=abc: no repack, the log names the JAC_ROOM_* settings" || bad "O. bad setting handled wrong (rc=$rc status=$(last_status)): $out"
+out="$(RINTERVAL=abc rrun "$RO")"; rc=$?
+{ [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RO")" = "$RO_PC" ]; } && ok "O. JAC_WATCH_INTERVAL_S=abc: no repack (an unwatched pass is never started)" || bad "O. bad watch setting handled wrong (rc=$rc status=$(last_status)): $out"
+# Q. enough room for the whole gc (all the packs + the headroom): it is the gc, as before, not a partial pass
+RQ="$WORK/rq"; mkwin "$RQ"; rm -f "$WORK/state.json"
+out="$(T_SWAP=0 RAVAIL=100000 rrun "$RQ")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$RQ")" -le 2 ] && [ ! -e "$WORK/room-args" ]; } \
+  && ok "Q. room for everything: the consolidating gc runs (packs 5 -> $(pack_count "$RQ")), the room pass is not involved" || bad "Q. ample room handled wrong (rc=$rc packs=$(pack_count "$RQ") status=$(last_status)): $out"
+# P. the settings are visible
+cfg="$("$SCRIPT" --print-config)"
+{ printf '%s' "$cfg" | grep -q 'room_start_kib=262144 room_max_kib=1048576 room_min_kib=65536 room_timeout_s=2400 room_retry_s=7200' \
+  && printf '%s' "$cfg" | grep -q 'watch_interval_s=10 watch_swap_max_kib=524288 watch_slack_kib=262144 watch_blind_max=3 watch_kill_grace_s=5'; } \
+  && ok "P. --print-config shows the room pass (start 256MiB, max 1GiB, min 64MiB, 40 min, retry 2h) and its watchdog (every 10s, swap +512MiB, slack 256MiB, 3 blind samples, 5s grace)" || bad "P. room/watch settings missing from --print-config"
+# R. the REAL swap reading: `sysctl -n vm.swapusage` in each unit macOS prints it in, through a stand-in sysctl (JAC_SYSCTL). A format the parse does not know is "cannot be read" — the pass is inert, never "0 swap used"
+cat > "$WORK/sysctl-fake" <<EOF
+#!/bin/bash
+n=\$(cat "$WORK/sysctl-n" 2>/dev/null); n=\${n:-0}; echo \$((n + 1)) > "$WORK/sysctl-n"
+case "\${SYSCTL_MODE:-text}" in
+  text) printf '%s\n' "\${SYSCTL_OUT:-}" ;;
+  grow) if [ "\$n" -lt 2 ]; then echo "total = 8192.00M  used = 1000.00M  free = 7192.00M  (encrypted)"; else echo "total = 8192.00M  used = 3000.00M  free = 5192.00M  (encrypted)"; fi ;;
+  fail) exit 1 ;;
+esac
+EOF
+chmod +x "$WORK/sysctl-fake"
+for fmt_case in "M|total = 4096.00M  used = 3003.88M  free = 1092.12M  (encrypted)" "G|total = 4.00G  used = 2.50G  free = 1.50G  (encrypted)" "K|total = 4194304.00K  used = 3076096.00K  free = 1118208.00K  (encrypted)"; do
+  RR_N="${fmt_case%%|*}"; RR_OUT="${fmt_case#*|}"; RR="$WORK/rr-ok-$RR_N"
+  mkwin "$RR"; RR_PC="$(pack_count "$RR")"; rm -f "$WORK/state.json" "$WORK/sysctl-n"
+  out="$(RSYSCTL="$WORK/sysctl-fake" SYSCTL_OUT="$RR_OUT" rrun "$RR")"; rc=$?
+  { [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(pack_count "$RR")" -lt "$RR_PC" ] && [ -s "$WORK/room-args" ]; } \
+    && ok "R. swap read through sysctl in ${RR_N} ('${RR_OUT#*used = }'): the room pass runs (packs $RR_PC -> $(pack_count "$RR"))" || bad "R. sysctl format ${RR_N} not read (rc=$rc status=$(last_status) packs=$(pack_count "$RR")): $out"
+done
+for bad_case in "unit|total = 4096.00T  used = 3.00T  free = 1.00T" "junk|vm.swapusage: unavailable" "empty|" "noused|total = 4096.00M  free = 1092.12M"; do
+  RR_N="${bad_case%%|*}"; RR_OUT="${bad_case#*|}"; RR="$WORK/rr-bad-$RR_N"
+  mkwin "$RR"; RR_PC="$(pack_count "$RR")"; rm -f "$WORK/state.json" "$WORK/sysctl-n"
+  out="$(RSYSCTL="$WORK/sysctl-fake" SYSCTL_OUT="$RR_OUT" rrun "$RR")"; rc=$?
+  { [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RR")" = "$RR_PC" ] && printf '%s' "$out" | grep -q 'swap in use cannot be read'; } \
+    && ok "R. sysctl answer '${RR_OUT:-<nothing>}' ($RR_N): swap is unreadable, the pass does not start" || bad "R. unreadable sysctl answer ($RR_N) handled wrong (rc=$rc status=$(last_status) packs=$(pack_count "$RR")): $out"
+done
+RR="$WORK/rr-fail"; mkwin "$RR"; RR_PC="$(pack_count "$RR")"; rm -f "$WORK/state.json" "$WORK/sysctl-n"
+out="$(RSYSCTL="$WORK/sysctl-fake" SYSCTL_MODE=fail rrun "$RR")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RR")" = "$RR_PC" ]; } && ok "R. a sysctl that fails: the pass does not start" || bad "R. failing sysctl handled wrong (rc=$rc status=$(last_status)): $out"
+# ...and the watchdog reads the SAME way: the first two answers say 1000M, then 3000M — the pass (a hung fake repack) is stopped by what the parse saw, not by a file
+RR="$WORK/rr-grow"; mkwin "$RR"; RR_PC="$(pack_count "$RR")"; rm -f "$WORK/state.json" "$WORK/sysctl-n"; T0="$(date +%s)"
+out="$(RSYSCTL="$WORK/sysctl-fake" SYSCTL_MODE=grow ROOM_ACT=hang rrun "$RR")"; rc=$?; took=$(( $(date +%s) - T0 ))
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && [ "$took" -lt 30 ] && sleeper_gone && [ "$(pack_count "$RR")" = "$RR_PC" ] && printf '%s' "$out" | grep -q 'swap in use grew'; } \
+  && ok "R. swap 1000M -> 3000M as sysctl prints it: the watchdog stops the pass in ${took}s, status aborted" || bad "R. watchdog on the sysctl reading wrong (rc=$rc status=$(last_status) took=${took}s): $out"
+unset JAC_WATCH_FREE_FILE JAC_SYSCTL JAC_SWAP_USED_FILE
 
 echo ""
 

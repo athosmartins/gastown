@@ -73,12 +73,34 @@
 #      cap (JAC_TAIL_LIMIT_KIB at the full cap), because a half-size pass holds about half the bytes and would otherwise never start, and so never grow back. A lowered cap can still leave NO two
 #      packs that fit (similar packs, each over half the cap): then the pass waits, with the reason in the log each run, and the cap is doubled once JAC_TAIL_RETRY_S (6h) has passed since the last cut
 #      (`tail_cut_epoch`) — a slow spell that has gone is retried, and a host that stays slow costs one cut per that interval from this retry, not one per run (at the floor itself a cut pass can only repeat, as said above).
+#   2b. the ROOM PASS (ga-978f1y), the way out of a deadlock. Tier 2's gc is gated twice on a rewrite of EVERY pack: the window's lib wants free >= the largest pack + 2GiB (6.6GB with the 4.5GB pack), and
+#      compact_repo's disk_low wants all the packs + headroom (~10.3GB). The mini sits at 5-6GB free, so neither could ever pass: 48 runs deferred (bad_streak 48-49), 56 packs, 10GB,
+#      and the disk never went down. The room pass is what runs INSTEAD, only when the window is OPEN (00:00-04:59, a clock that can be read) and one of those two gates said no: `repack -a -d -l -f --cruft` over
+#      as many of the SMALLEST packs as the room holds, with every other pack — the largest above all, always — as --keep-pack, so the 4.5GB pack is never read or written and the pass needs only the picked packs' size free.
+#      Packs with a .mtimes (cruft), a .keep, an .idx it cannot count or a size it cannot read are kept too. "Room" = free − Dolt's floor ((DOLT_DISK_FLOOR_CRITICAL_GB + 1) GiB) − headroom − a quarter of the loose
+#      bytes; the picked packs must fit in it, and so must the pass's cap. At least two packs are picked or the pass is not started (the log says why each run) — one pack alone gains nothing. Its cap is adaptive,
+#      like tier 2a's, per repo in the state (`room_kib`: the most KiB of packs a pass takes; starts at JAC_ROOM_START_KIB 256MiB, grows by doubling up to JAC_ROOM_MAX_KIB 1GiB after a pass that finished in under a
+#      quarter of its budget while the cap had left a pack out, halves down to JAC_ROOM_MIN_KIB 64MiB after a cut). The first two packs are taken within the room even above the cap, so a repo whose small packs are all
+#      big still moves. It never runs while loose bytes are over the loose limit (tier 1 first), while another git repacks the repo, or without budget (`deferred`).
+#      WHY IT IS WATCHED. The measured limit of the mini is not pack space, it is RAM→swap (Mayor, 19/10 08:57Z): a manual `repack -a -d --keep-pack=<largest>` with threads=2, windowMemory=256m, deltaCacheSize=128m at
+#      nice 10 grew swap 4096→6144MB, free disk fell 5133→2998MB — already inside Dolt's CRITICAL class — and a floor watchdog killed it after 28 min with a 224MB temp pack. macOS keeps its swap files on the same volume
+#      as the archive and Dolt, so swap growth IS disk loss, and a floor on free disk alone looks too late. So the pass runs smaller (threads 1, windowMemory 128m, deltaCacheSize 32m — JAC_ROOM_*) AND under a
+#      watchdog (run_step with WATCH_ON): every JAC_WATCH_INTERVAL_S (10s) it reads free disk and swap in use (`sysctl -n vm.swapusage`) and STOPS the step — TERM to the whole process tree, KILL for what is alive after
+#      JAC_WATCH_KILL_GRACE_S (5s) — when free disk falls below Dolt's floor + JAC_WATCH_SLACK_KIB (256MiB), when swap in use grows more than JAC_WATCH_SWAP_MAX_KIB (512MiB) past where it stood at the START of the
+#      pass, or when JAC_WATCH_BLIND_MAX (3) looks in a row could not read one of the two. Unreadable free disk, swap or floor BEFORE the start = the pass does not start (the usual THREE STATES rule: not knowing is
+#      not "fine"); an unusable JAC_ROOM_* / JAC_WATCH_* setting turns the pass OFF with the reason in the log, and the lib's old verdict stands (deferred / skipped-low-disk).
+#      Status: a watchdog stop is `aborted` — a failure (bad_status, exit 1, LOUD, the log says which reading tripped it), because it means this host did not have the room the pass thought it had. The cap halves and the pass
+#      waits JAC_ROOM_RETRY_S (2h, `room_cut_epoch` in the state) before the next, so a host that keeps tripping costs one stopped pass per interval, not one per run. A pass cut at its own cap (JAC_ROOM_TIMEOUT_S,
+#      40 min) is `timeout` (same shrink and wait); at the run's / the night window's end `deferred`, no shrink; a repack that ended non-zero `failed` (same wait); rc 0 `consolidated`. Like every other step it goes
+#      through run_step, so a stopped or failed pass has its temp files reclaimed by the LEAKS rules. Nothing here deletes history: --keep-pack never drops a pack, and the pass is a repack, not a prune.
+#      NOT VALIDATED ON THE REAL ARCHIVE: the thresholds are defaults, not measurements (swap noise of ±1.3GiB between runs was seen on 19/10, so 512MiB may false-trip — the log then says "swap in use grew" and the
+#      next pass is smaller). The first night's log is the evidence. Moving the archive off the mini (the Mayor's option b) was judged out of scope here.
 #   2. pack count >= JAC_PACKS_LIMIT (8): one full `git gc` to consolidate. Each batch pack
 #      carries its own first full copy of every big file (batches cannot delta against earlier
 #      packs); the gc re-deltas those against the whole history and merges the packs. The alarm judges
 #      the END state, so a gc that succeeds clears a failed tier 1 (it packs the loose objects too); a gc
 #      that did NOTHING (busy, or killed) never launders one: only a status that is not a failure on its own
-#      (bad_status: failed / stalled / timeout / unmeasured / skipped-low-disk) can be replaced by `busy` or
+#      (bad_status: failed / stalled / timeout / aborted / unmeasured / skipped-low-disk) can be replaced by `busy` or
 #      `deferred`. The gc gets the same budget rule as a batch: a kill at its OWN cap (600s) is `timeout`
 #      (the repo is too big for one gc), a kill at the end of the RUN's budget is `deferred` — the run that
 #      crosses the pack limit is by construction one whose tier 1 just spent part of the budget.
@@ -135,7 +157,7 @@
 # jaw_repack_allowed says so (jsonl-archive-repack-window-lib.sh: local hour in [0,5) AND free disk >= JAC_GC_PACK_FACTOR (1) x the largest pack + 2GiB — the Mayor's rule for this gc; the exporter's
 # detached repack keeps 2 x; a clock or a df that cannot be read = no; disk_low below still asks for ALL the packs + headroom): outside that
 # it is `deferred` and logged with the reason, like a gc without budget — never a failure by itself, and never silent, because the pack alarm still judges the END state (>= JAC_PACKS_ALARM
-# packs = BAD whatever the status). Tier 1 (loose-objects batches) and tier 2a (the tail repack, `--keep-pack` on the big packs) are NOT gated on purpose: they are bounded by objects and by
+# packs = BAD whatever the status). INSIDE the window, a gc that the room refuses — the lib's rule or disk_low — is not the end of it: the room pass (tier 2b, ga-978f1y) is tried in its place, the largest pack kept. Tier 1 (loose-objects batches) and tier 2a (the tail repack, `--keep-pack` on the big packs) are NOT gated on purpose: they are bounded by objects and by
 # pack.windowMemory, leave the big packs alone, and the loose backlog (~243MiB/h) has to be packed by day or the disk fills. A known cost of leaving tier 2a ungated: on 17/10 it
 # hit its own 600s cap at 13:13Z and 14:19Z (pack-objects paged out at ~1% CPU, 4.7GB of swap in use), so by day it can burn the cap and produce nothing; confining it to the
 # window would let the small packs pile up toward JAC_PACKS_ALARM instead — a trade-off left to the Mayor (ga-wkoij7), not decided here.
@@ -159,7 +181,7 @@
 # loose_kib; unknown = the run's own before/after alone), because a backlog emptied more slowly than
 # it refills shrinks a little every run and still grows — or >= JAC_PACKS_ALARM packs, or the run
 # ended with more git garbage files than it started with (LEAKS, rule 2), or the run
-# failed / could not measure / was skipped for low disk / stalled / timed out at the minimum
+# failed / could not measure / was skipped for low disk / stalled / was stopped by the room pass's watchdog (`aborted`) / timed out at the minimum
 # batch size or at gc's own cap. After
 # JAC_ALERT_AFTER (3) consecutive BAD runs of a repo one mail goes to the mayor, at most one per repo per
 # JAC_ALERT_EVERY_S (6h) — each repo keeps its own streak and its own last_alert_epoch, so two BAD repos can mail twice in
@@ -215,7 +237,7 @@
 # keys. Adding or removing one fails the selftest until someone has read the site and updated the pin:
 # four gate rounds each found one more discard that "the class sweep" had missed.
 # STRUCTURE (selftest S34): every place that RUNS a git step goes through run_step (LEAKS, rule 1), no git that writes runs any other way, and the set of steps is pinned the same way —
-# the gate reported the leak for the batch, and measured on this host's git the gc leaks the same way; the tail repack (tier 2a) is the fourth, a fifth would be one more thing that can be killed mid-write.
+# the gate reported the leak for the batch, and measured on this host's git the gc leaks the same way; the tail repack (tier 2a) is the fourth and the room pass (tier 2b, the only one run under the watchdog) the fifth — a sixth would be one more thing that can be killed mid-write.
 #
 # TEST: bash packs/town-deltas/assets/scripts/jsonl-archive-compact.selftest.sh
 set -uo pipefail
@@ -258,6 +280,22 @@ GC_TIMEOUT_S="${JAC_GC_TIMEOUT_S:-600}"              # per consolidating gc, out
 NIGHT_GC_MAX_S="${JAC_NIGHT_GC_MAX_S:-21600}"        # the most the gc may run INSIDE the repack window (the window is 6h); 0 = never longer than GC_TIMEOUT_S
 NIGHT_MARGIN_S="${JAC_NIGHT_MARGIN_S:-300}"          # ...stopped this long before the window closes, so the cleanup after a cut gc is done by 06:00
 GC_PACK_FACTOR="${JAC_GC_PACK_FACTOR:-1}"            # free disk for the gc must be >= this x the largest pack + 2GiB (the Mayor's rule, ga-wkoij7); the exporter's own repack uses the lib's default (2)
+# Tier 2b, the ROOM PASS (header, ga-978f1y): when the window is open but the disk has no room for the whole-repo gc, a smaller repack with the LARGEST pack kept. DEFAULTS CHOSEN WITHOUT A MEASUREMENT ON THE REAL ARCHIVE —
+# the first night's log (and the watchdog's lines in it) is the evidence to tune them by; every one is an env var for that.
+ROOM_START_KIB="${JAC_ROOM_START_KIB:-262144}"       # the first pass takes packs holding at most this much (256MiB: the 28 min the Mayor's manual run lasted wrote 224MB of temp pack before it was killed)
+ROOM_MAX_KIB="${JAC_ROOM_MAX_KIB:-1048576}"          # ...and the cap never grows past this (1GiB)
+ROOM_MIN_KIB="${JAC_ROOM_MIN_KIB:-65536}"            # ...nor shrinks below this after a cut (64MiB; a pass always takes the two smallest packs if the room holds them, whatever the cap)
+ROOM_TIMEOUT_S="${JAC_ROOM_TIMEOUT_S:-2400}"         # one room pass is cut at this (40 min), or at the night window's end / the run's budget, whichever is first
+ROOM_RETRY_S="${JAC_ROOM_RETRY_S:-7200}"             # after a pass was cut (watchdog or timeout) the next waits this long (2h)
+ROOM_THREADS="${JAC_ROOM_THREADS:-1}"                # pack.threads of the room pass (the by-day repacks use 2)
+ROOM_WINDOW_MEM="${JAC_ROOM_WINDOW_MEM:-128m}"       # pack.windowMemory (by day: 256m)
+ROOM_DELTA_CACHE="${JAC_ROOM_DELTA_CACHE:-32m}"      # pack.deltaCacheSize (by day: 64m)
+# The WATCHDOG over a room pass (header): polled while the step runs; ends it, with every process under it, when free disk falls below Dolt's floor + slack, when swap grows past a budget, or when either reading is lost.
+WATCH_INTERVAL_S="${JAC_WATCH_INTERVAL_S:-10}"       # seconds between two looks (a decimal is fine: sleep takes it)
+WATCH_SWAP_MAX_KIB="${JAC_WATCH_SWAP_MAX_KIB:-524288}"   # swap in use may grow this much (512MiB) above where it stood when the pass started. The Mayor's manual run grew it 2048MiB (4096 -> 6144) in 28 min
+WATCH_SLACK_KIB="${JAC_WATCH_SLACK_KIB:-262144}"     # free disk must stay this far (256MiB) ABOVE Dolt's floor: the watchdog looks every WATCH_INTERVAL_S, and a pass writes and swaps faster than that
+WATCH_BLIND_MAX="${JAC_WATCH_BLIND_MAX:-3}"          # this many looks in a row that could not read free disk or swap end the pass: a watchdog that cannot see is not a watchdog
+WATCH_KILL_GRACE_S="${JAC_WATCH_KILL_GRACE_S:-5}"    # TERM first, KILL for what is still alive after this long
 LOCK_GRACE_S=600                                     # a run that wrote its end time (night gc) is still alive this long after it
 DEADLINE_S="${JAC_DEADLINE_S:-780}"                  # whole run by day; the order's timeout is 21900s (a night gc lasts hours, see "THE NIGHT GC")
 DEADLINE_BASE="$DEADLINE_S"                          # night_gc_extend moves DEADLINE_S for the length of the gc and puts it back here
@@ -273,6 +311,7 @@ LSOF_TIMEOUT_S="${JAC_LSOF_TIMEOUT_S:-6}"            # one lsof look (measured 2
 RECLAIM_WAIT_S="${JAC_RECLAIM_WAIT_S:-1}"            # between the two looks: the writer may be a step that is still dying
 LSOF="${JAC_LSOF:-}"                                 # test seam; empty = the first lsof on PATH, else /usr/sbin/lsof
 PS="${JAC_PS:-}"                                     # test seam; empty = the first ps on PATH
+SYSCTL="${JAC_SYSCTL:-}"                             # test seam; empty = the first sysctl on PATH, else /usr/sbin/sysctl (where swap in use is read from, for the room pass's watchdog)
 PS_TIMEOUT_S="${JAC_PS_TIMEOUT_S:-4}"                # one process listing (ms in practice); other_repacker adds it to one lsof look (above), both before the gc's own budget is computed
 HEADROOM_KIB="${JAC_HEADROOM_KIB:-524288}"           # free space that must remain after the estimate
 ALERT_AFTER="${JAC_ALERT_AFTER:-3}"
@@ -308,6 +347,9 @@ list_timeout_s=$LIST_TIMEOUT_S lsof_timeout_s=$LSOF_TIMEOUT_S reclaim_wait_s=$RE
 alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S check_fresh_s=$CHECK_FRESH_S
 repack_window_start_h=$JAW_START_H repack_window_last_start_h=$JAW_LAST_START_H repack_window_end_h=$JAW_END_H repack_swap_headroom_kib=$JAW_SWAP_KIB repack_window_log=$JAW_LOG
 night_gc_max_s=$NIGHT_GC_MAX_S night_margin_s=$NIGHT_MARGIN_S gc_pack_factor=$GC_PACK_FACTOR
+room_start_kib=$ROOM_START_KIB room_max_kib=$ROOM_MAX_KIB room_min_kib=$ROOM_MIN_KIB room_timeout_s=$ROOM_TIMEOUT_S room_retry_s=$ROOM_RETRY_S
+room_threads=$ROOM_THREADS room_window_memory=$ROOM_WINDOW_MEM room_delta_cache=$ROOM_DELTA_CACHE
+watch_interval_s=$WATCH_INTERVAL_S watch_swap_max_kib=$WATCH_SWAP_MAX_KIB watch_slack_kib=$WATCH_SLACK_KIB watch_blind_max=$WATCH_BLIND_MAX watch_kill_grace_s=$WATCH_KILL_GRACE_S
 state=$STATE log=$LOG lock=$LOCK
 EOF
   exit 0   # benign[print-config]: --print-config only prints the effective configuration — no run happened, so there is no failure for this exit to hide
@@ -347,17 +389,18 @@ _bounded() {  # _bounded <seconds> <cmd...>
 # pack.* bounds are the same three values jsonl-export.sh's ensure_archive_pack_config sets
 # (ga-gtrc8n: unbounded pack-objects measured 3.2GB RSS on this repo, bounded 514MB). Passed with
 # -c so this script never writes the repo's config.
+R_PACK_EXTRA=()      # more `-c` settings for the NEXT git_arch, after the defaults below so that they win (git takes the last value): the room pass sets leaner pack.* here and empties it afterwards
 git_arch() {  # git_arch <seconds> <git args...>   — uses $R_GITDIR and the repo's current batch size $R_BATCH
   local t="$1"; shift
   _bounded "$t" "$GITBIN" --git-dir="$R_GITDIR" \
     -c pack.threads=2 -c pack.windowMemory=256m -c pack.deltaCacheSize=64m \
-    -c maintenance.loose-objects.batchSize="${R_BATCH:-$BATCH_OBJECTS}" "$@"
+    -c maintenance.loose-objects.batchSize="${R_BATCH:-$BATCH_OBJECTS}" ${R_PACK_EXTRA[@]+"${R_PACK_EXTRA[@]}"} "$@"
 }
 
 is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 # bad_status <status> — a status that is a failure on its own. A step that did NOTHING (gc busy, a step cut by the run
 # deadline) may only replace a status that is NOT one of these: the failure it carries is still true.
-bad_status() { case "$1" in failed|unmeasured|skipped-low-disk|stalled|timeout) return 0 ;; esac; return 1; }
+bad_status() { case "$1" in failed|unmeasured|skipped-low-disk|stalled|timeout|aborted) return 0 ;; esac; return 1; }
 # budget_for <cap_s> [floor_s] — sets t_left (what to give a step: its own cap, or what is left of the RUN when that is
 # smaller; lifted to the floor, default 1 — `timeout 0` means "no limit" — but NEVER above the step's own cap) and
 # by_deadline (1 = the RUN's budget, not the step's own cap, is the limit). A kill at t_left with by_deadline=1 is the budget
@@ -566,15 +609,165 @@ EOF
   return 0
 }
 
-STEP_OUT=""; STEP_RC=0
+# ── The WATCHDOG over a watched step (the room pass, tier 2b; header) ──
+# While a watched step runs, free disk and swap are read every WATCH_INTERVAL_S. The step is stopped — with every process under it — when free disk falls below Dolt's floor + slack, when swap in use grows more than
+# WATCH_SWAP_MAX_KIB past where it stood at the start, or when WATCH_BLIND_MAX looks in a row could not read one of the two (a watchdog that cannot see does not say "all clear"). Why swap and not free disk alone: macOS keeps
+# its swap files on the volume that holds the archive and Dolt, so swap growth IS free-disk loss, but it is the one that shows first and the one the 19/10 manual run (swap 4096 -> 6144MB, free 5133 -> 2998MB, killed
+# too late by a floor watchdog that looked only at the disk) died of.
+WATCH_ON=0; WATCH_FREE_MIN_KIB=0; WATCH_SWAP_BASE_KIB=0; WATCH_BLIND_N=0; WATCH_WHY=""; STEP_PID=""
+
+# dolt_floor_kib — Dolt's CRITICAL floor in KiB: the free disk the machine must keep, (DOLT_CRIT_GB + 1) GiB, because dolt-disk-floor-guard calls the disk critical at free whole GiB <= DOLT_CRIT_GB. rc 1 and nothing
+# printed when DOLT_CRIT_GB is not a whole number of at most 9 digits: the floor cannot be shown, and a step that needs it does not start.
+dolt_floor_kib() {
+  is_uint "$DOLT_CRIT_GB" && [ "${#DOLT_CRIT_GB}" -le 9 ] || return 1
+  echo $(( (10#$DOLT_CRIT_GB + 1) * 1048576 ))
+}
+
+# swap_used_kib — swap in use, in KiB. JAC_SWAP_USED_FILE (a file holding the KiB) is the test seam; otherwise `sysctl -n vm.swapusage` ("total = 4096.00M  used = 3003.88M  free = 1092.12M  (encrypted)", the same reading the
+# repack window's log carries), its unit K / M / G converted. rc 1 and nothing printed when it cannot be read: no sysctl, no answer, a unit or a value it does not know. Unreadable is never 0.
+swap_used_kib() {
+  local s bin
+  if [ -n "${JAC_SWAP_USED_FILE+x}" ]; then
+    s="$(cat "$JAC_SWAP_USED_FILE" 2>/dev/null | tr -d ' \n')"
+  else
+    bin="$SYSCTL"; [ -n "$bin" ] || bin="$(command -v sysctl 2>/dev/null)"
+    [ -n "$bin" ] || { [ -x /usr/sbin/sysctl ] && bin=/usr/sbin/sysctl; }
+    [ -n "$bin" ] && [ -x "$bin" ] || return 1
+    s="$(_bounded "$PS_TIMEOUT_S" "$bin" -n vm.swapusage 2>/dev/null | awk '{
+        for (i = 1; i < NF; i++) if ($i == "used" && $(i + 1) == "=") {
+          v = $(i + 2); u = substr(v, length(v)); n = substr(v, 1, length(v) - 1)
+          if (n !~ /^[0-9]+(\.[0-9]+)?$/) exit 1
+          if (u == "K") k = n; else if (u == "M") k = n * 1024; else if (u == "G") k = n * 1048576; else exit 1
+          printf "%d\n", k; exit
+        }
+        exit 1 }')" || return 1
+  fi
+  is_uint "$s" && [ "${#s}" -le 12 ] || return 1
+  echo "$s"
+}
+
+# watch_free_kib — free KiB on the archive's filesystem for the watchdog: JAC_WATCH_FREE_FILE (test seam: a file holding the KiB) if set, else free_kib. rc 1 when it is not a number.
+watch_free_kib() {
+  local f
+  if [ -n "${JAC_WATCH_FREE_FILE:-}" ]; then f="$(cat "$JAC_WATCH_FREE_FILE" 2>/dev/null | tr -d ' \n')"; else f="$(free_kib "$R_GITDIR")"; fi
+  is_uint "$f" && [ "${#f}" -le 12 ] || return 1
+  echo "$f"
+}
+
+# desc_pids <pid> — <pid> and every process under it, one pid per line (a walk over `ps -A -o pid=,ppid=`). rc 1 when the process table cannot be listed.
+desc_pids() {
+  local tbl
+  tbl="$(_bounded "$PS_TIMEOUT_S" ps -A -o pid=,ppid= 2>/dev/null)" || return 1
+  [ -n "$tbl" ] || return 1
+  printf '%s\n' "$tbl" | awk -v root="$1" '
+    { pid[NR] = $1; par[NR] = $2; n = NR }
+    END {
+      seen[root] = 1; out[1] = root; c = 1
+      for (i = 1; i <= c; i++) for (j = 1; j <= n; j++) if (par[j] == out[i] && !(pid[j] in seen)) { seen[pid[j]] = 1; out[++c] = pid[j] }
+      for (i = 1; i <= c; i++) print out[i]
+    }'
+}
+
+# step_kill <pid> — stop a watched step: TERM to it and everything under it (git removes its own temp pack on TERM), then WATCH_KILL_GRACE_S for them to go, then KILL for what is still alive. A process table that cannot be
+# listed stops only <pid> itself, and the log says so: the processes under it then run on until their own cap.
+step_kill() {
+  local root="$1" pids p alive ticks=0 max
+  if ! pids="$(desc_pids "$root")"; then
+    log "  WATCHDOG: the process table cannot be listed — only the step's own process ($root) is stopped; what runs under it may be left to its own cap"
+    pids="$root"
+  fi
+  for p in $pids; do kill -TERM "$p" 2>/dev/null; done
+  max=$(( 10#$WATCH_KILL_GRACE_S * 5 ))
+  while [ "$ticks" -lt "$max" ]; do
+    alive=0
+    for p in $pids; do if kill -0 "$p" 2>/dev/null; then alive=1; fi; done
+    if [ "$alive" -eq 0 ]; then break; fi
+    sleep 0.2
+    ticks=$(( ticks + 1 ))
+  done
+  for p in $pids; do if kill -0 "$p" 2>/dev/null; then kill -KILL "$p" 2>/dev/null; fi; done
+}
+
+# stop_step_at_exit — the first half of the EXIT trap: a watched step still running when this script ends (the order's timeout TERMs it, an interrupt, a fatal error) must not be left running unwatched.
+stop_step_at_exit() {
+  if [ -n "$STEP_PID" ] && kill -0 "$STEP_PID" 2>/dev/null; then
+    log "  the run is ending with its watched step (pid $STEP_PID) still running — stopping it and everything under it"
+    step_kill "$STEP_PID"
+  fi
+}
+
+# watch_check — one look at free disk and swap. rc 0 = go on; rc 1 = stop the step, WATCH_WHY says why. Needs WATCH_FREE_MIN_KIB and WATCH_SWAP_BASE_KIB. A look that cannot read one of the two counts toward WATCH_BLIND_MAX
+# (a reading that comes back resets the count); the rest is a plain comparison.
+watch_check() {
+  local fr sw
+  fr="$(watch_free_kib)"; sw="$(swap_used_kib)"
+  if ! { is_uint "$fr" && is_uint "$sw"; }; then
+    WATCH_BLIND_N=$(( WATCH_BLIND_N + 1 ))
+    if [ "$WATCH_BLIND_N" -ge "$WATCH_BLIND_MAX" ]; then
+      WATCH_WHY="free disk or swap could not be read in $WATCH_BLIND_N looks in a row (free='${fr:-unreadable}' swap='${sw:-unreadable}') — a watchdog that cannot see does not let the step go on"
+      return 1
+    fi
+    return 0
+  fi
+  WATCH_BLIND_N=0
+  if [ "$fr" -lt "$WATCH_FREE_MIN_KIB" ]; then
+    WATCH_WHY="free disk fell to ${fr}KiB, below Dolt's floor + slack (${WATCH_FREE_MIN_KIB}KiB)"
+    return 1
+  fi
+  if [ "$sw" -gt $(( WATCH_SWAP_BASE_KIB + WATCH_SWAP_MAX_KIB )) ]; then
+    WATCH_WHY="swap in use grew to ${sw}KiB from ${WATCH_SWAP_BASE_KIB}KiB at the start (more than the ${WATCH_SWAP_MAX_KIB}KiB the pass may add; free disk is ${fr}KiB)"
+    return 1
+  fi
+  return 0
+}
+
+# watch_loop <pid> — until the step's process <pid> is gone: wait, and every WATCH_INTERVAL_S look (watch_check). On a verdict: STEP_WATCH = why, a WATCHDOG line in the log, and step_kill. A whole-number interval is waited
+# one second at a time, so a step that ends early is not held for the rest of the interval; a decimal one (the selftest's) is waited in one piece.
+watch_loop() {
+  local pid="$1" tick every k=0
+  WATCH_BLIND_N=0
+  case "$WATCH_INTERVAL_S" in *.*) tick="$WATCH_INTERVAL_S"; every=1 ;; *) tick=1; every=$(( 10#$WATCH_INTERVAL_S )) ;; esac
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep "$tick"
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    k=$(( k + 1 ))
+    if [ "$k" -ge "$every" ]; then
+      k=0
+      if ! watch_check; then
+        STEP_WATCH="$WATCH_WHY"
+        log "  WATCHDOG: $WATCH_WHY — stopping the step and everything under it"
+        step_kill "$pid"
+        break
+      fi
+    fi
+  done
+}
+
+STEP_OUT=""; STEP_RC=0; STEP_WATCH=""
 # run_step <cap_s> <git args...> — THE way this script runs a git step that writes to the repo (a batch, prune-packed, gc); sets STEP_OUT (its output) and STEP_RC (its exit
 # status) and never fails itself. Lists the temp files before the step; after a step that did NOT end 0, whatever appeared during it is its leak (reclaim_leak). A step
 # that ended 0 is not suspected — but a leak it left anyway is still MEASURED at the end of the run (garbage growth, is_bad). Selftest S34 pins that every step goes through here.
+# With WATCH_ON=1 (the room pass) the step runs in the background, its output in a temp file, under watch_loop: STEP_WATCH is then the reason the watchdog stopped it ("" = it was not stopped by the watchdog).
 run_step() {
-  local cap="$1" before before_failed=0
+  local cap="$1" before before_failed=0 outf pid
   shift
+  STEP_WATCH=""
   before="$(list_tmp)" || before_failed=1
-  STEP_OUT="$(git_arch "$cap" "$@" 2>&1)"; STEP_RC=$?
+  if [ "$WATCH_ON" -eq 1 ]; then
+    if ! outf="$(mktemp "${TMPDIR:-/tmp}/jsonl-archive-compact-step.XXXXXX")"; then
+      STEP_OUT="could not make a temp file for the step's output under ${TMPDIR:-/tmp} — the watched step was not started"; STEP_RC=1
+      return 0
+    fi
+    git_arch "$cap" "$@" >"$outf" 2>&1 </dev/null &
+    pid=$!; STEP_PID="$pid"
+    watch_loop "$pid"
+    wait "$pid"; STEP_RC=$?
+    STEP_PID=""
+    STEP_OUT="$(cat "$outf")"
+    rm -f -- "$outf"
+  else
+    STEP_OUT="$(git_arch "$cap" "$@" 2>&1)"; STEP_RC=$?
+  fi
   if [ "$STEP_RC" -ne 0 ]; then reclaim_leak "$before_failed" "$before" "$*"; fi
   return 0
 }
@@ -627,7 +820,7 @@ load_state() {
   # before/after, the rule that suppresses the alarm). loose_kib may also be null: a run that could not measure records that.
   local bad_fields
   bad_fields="$(jq -r --arg r "$1" 'def badnum: (.value | type) != "number" or .value < 0 or .value != (.value | floor);
-      def bad: ((.key | IN("bad_streak","last_alert_epoch","batch_objects","tail_objects","tail_cut_epoch")) and badnum) or (.key == "loose_kib" and .value != null and badnum);
+      def bad: ((.key | IN("bad_streak","last_alert_epoch","batch_objects","tail_objects","tail_cut_epoch","room_kib","room_cut_epoch")) and badnum) or (.key == "loose_kib" and .value != null and badnum);
       (.[$r] // {}) | to_entries | map(select(bad)) | map(.key) | join(",")' <<<"$STATE_JSON" 2>/dev/null)" || bad_fields="?"
   if [ -n "$bad_fields" ]; then
     case "$ENTRY_LOGGED" in
@@ -636,7 +829,7 @@ load_state() {
          log "  state entry for $1: field(s) $bad_fields are not non-negative whole numbers (or could not be checked) — dropped, read as unset" ;;
     esac
     STATE_JSON="$(jq --arg r "$1" 'def badnum: (.value | type) != "number" or .value < 0 or .value != (.value | floor);
-        def bad: ((.key | IN("bad_streak","last_alert_epoch","batch_objects","tail_objects","tail_cut_epoch")) and badnum) or (.key == "loose_kib" and .value != null and badnum);
+        def bad: ((.key | IN("bad_streak","last_alert_epoch","batch_objects","tail_objects","tail_cut_epoch","room_kib","room_cut_epoch")) and badnum) or (.key == "loose_kib" and .value != null and badnum);
         .[$r] |= with_entries(select(bad | not))' <<<"$STATE_JSON" 2>/dev/null)" \
       || STATE_JSON="$(jq --arg r "$1" '.[$r] = {}' <<<"$(state_json)")"
   fi
@@ -708,12 +901,15 @@ write_state() {
   local repo="$1" state="$2" status="$3" streak="$4" last="$5" now="$6" new jrc
   new="$(jq --arg r "$repo" --arg st "$status" --argjson streak "$streak" --argjson last "$last" --argjson now "$now" \
         --arg lk "$M_LOOSE_KIB" --arg lc "$M_LOOSE_COUNT" --arg pk "$M_PACKS" --arg pks "$M_PACK_KIB" --arg g "${G_KIB:-}" --arg bo "${R_BATCH_SAVE:-}" --arg to "${R_TAIL_SAVE:-}" --arg tc "${R_TAIL_CUT_SAVE:-}" \
+        --arg rk "${R_ROOM_SAVE:-}" --arg rc "${R_ROOM_CUT_SAVE:-}" \
         --arg gf "$M_GARBAGE_COUNT" --arg gk "$M_GARBAGE_KIB" \
         'def n($x): (try ($x | tonumber) catch null);
          .[$r] = ((.[$r] // {}) + {last_run_epoch:$now, status:$st, loose_kib:n($lk), loose_objects:n($lc), packs:n($pk), pack_kib:n($pks), gitdir_kib:n($g), garbage_files:n($gf), garbage_kib:n($gk), bad_streak:$streak, last_alert_epoch:$last})
          | if n($bo) != null then .[$r].batch_objects = n($bo) else . end
          | if n($to) != null then .[$r].tail_objects = n($to) else . end
-         | if n($tc) != null then .[$r].tail_cut_epoch = n($tc) else . end' <<<"$state" 2>&1)"; jrc=$?
+         | if n($tc) != null then .[$r].tail_cut_epoch = n($tc) else . end
+         | if n($rk) != null then .[$r].room_kib = n($rk) else . end
+         | if n($rc) != null then .[$r].room_cut_epoch = n($rc) else . end' <<<"$state" 2>&1)"; jrc=$?
   if [ "$jrc" -ne 0 ] || ! jq -e 'type == "object"' <<<"$new" >/dev/null 2>&1; then
     log "  state update FAILED ($repo): jq rc=$jrc: $(printf '%s' "$new" | tail -n 2 | tr '\n' ' ' | cut -c1-200) — the bad-run streak cannot advance and no alarm mail can go out until the state can be written"
     return 1
@@ -992,10 +1188,194 @@ tail_pass() {
   else STATUS="failed"; log "  tail repack failed rc=$rc: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"; fi
 }
 
+# room_settings_ok — 0 when every JAC_ROOM_* and JAC_WATCH_* setting is usable; else 1 and ROOM_BAD names what is wrong. The lengths are capped so the arithmetic below cannot overflow; the pack.* memory sizes take git's own
+# suffixes (k, m, g); threads must be at least 1 (0 means "one per CPU" to git, the opposite of lean); the watch interval is a positive decimal (it is handed to sleep).
+room_settings_ok() {
+  ROOM_BAD=""
+  local k v
+  for k in ROOM_START_KIB ROOM_MAX_KIB ROOM_MIN_KIB ROOM_TIMEOUT_S ROOM_RETRY_S WATCH_SWAP_MAX_KIB WATCH_SLACK_KIB WATCH_BLIND_MAX WATCH_KILL_GRACE_S ROOM_THREADS; do
+    v="${!k}"
+    if ! { is_uint "$v" && [ "${#v}" -le 9 ]; }; then ROOM_BAD="$k='$v' is not a whole number of at most 9 digits"; return 1; fi
+    printf -v "$k" '%d' "$(( 10#$v ))"      # "0262144" would be octal to the arithmetic below
+  done
+  if [ "$ROOM_THREADS" -lt 1 ] || [ "$WATCH_BLIND_MAX" -lt 1 ] || [ "$ROOM_TIMEOUT_S" -lt 1 ]; then ROOM_BAD="ROOM_THREADS='$ROOM_THREADS', WATCH_BLIND_MAX='$WATCH_BLIND_MAX' and ROOM_TIMEOUT_S='$ROOM_TIMEOUT_S' must each be at least 1"; return 1; fi
+  case "$ROOM_WINDOW_MEM" in ''|*[!0-9kKmMgG]*|[kKmMgG]*) ROOM_BAD="ROOM_WINDOW_MEM='$ROOM_WINDOW_MEM' is not a size (digits and one of k, m, g)"; return 1 ;; esac
+  case "$ROOM_DELTA_CACHE" in ''|*[!0-9kKmMgG]*|[kKmMgG]*) ROOM_BAD="ROOM_DELTA_CACHE='$ROOM_DELTA_CACHE' is not a size (digits and one of k, m, g)"; return 1 ;; esac
+  case "$WATCH_INTERVAL_S" in
+    ''|*[!0-9.]*|.*|*.|*.*.*) ROOM_BAD="WATCH_INTERVAL_S='$WATCH_INTERVAL_S' is not a positive number of seconds"; return 1 ;;
+  esac
+  if [ "${#WATCH_INTERVAL_S}" -gt 6 ] || [ -z "${WATCH_INTERVAL_S//[0.]/}" ]; then ROOM_BAD="WATCH_INTERVAL_S='$WATCH_INTERVAL_S' is zero or too long"; return 1; fi
+  return 0
+}
+
+# room_plan <cap_kib> <avail_kib> — which packs the room pass would take, from the object store as it is now. Sets ROOM_PICK (pack file names), ROOM_KEEP (a --keep-pack=<name> for EVERY other pack, so the pass can touch nothing
+# else), ROOM_N, ROOM_KIB (bytes in the picked packs), ROOM_BIG (the largest eligible pack: ALWAYS kept, whatever the room — it is what makes the gc big), ROOM_TWO (1 = the second pack exceeded <cap_kib> and was taken because
+# a pass of one pack consolidates nothing and the room still holds two), ROOM_CAPPED (1 = a pack was left out only because of <cap_kib>: min(ROOM_MAX_KIB, <avail_kib>) would have taken it). Returns 1 when the pack
+# directory cannot be listed. A pack is kept, never picked, when it is a cruft pack (.mtimes), carries a .keep, has an index or a size that cannot be read. Smallest first by BYTES — the bytes are what the pass writes
+# and what its pack-objects holds in memory — while the total stays within <cap_kib>; the first two are taken while they fit <avail_kib>. <avail_kib> is the room over Dolt's floor: no pass bigger than it is planned.
+room_plan() {
+  local cap="$1" avail="$2" dir="$R_GITDIR/objects/pack" p b sz kib sorted hi total=0 n=0
+  local -a rows=()
+  ROOM_PICK=(); ROOM_KEEP=(); ROOM_N=0; ROOM_KIB=0; ROOM_CAPPED=0; ROOM_TWO=0; ROOM_BIG=""
+  # vazio → a directory without a .pack has nothing to consolidate (the loop sees only the literal pattern and skips it); falhou/ilegível → missing or not readable is "could not be listed" (return 1), never an empty list
+  [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ] || return 1
+  for p in "$dir"/*.pack; do
+    [ -e "$p" ] || continue
+    b="${p##*/}"
+    if [ -e "${p%.pack}.mtimes" ] || [ -e "${p%.pack}.keep" ] || ! pack_objects "$p" >/dev/null; then ROOM_KEEP+=("--keep-pack=$b"); continue; fi
+    # vazio/falhou/ilegível → no number is not a size: the pack is kept
+    sz="$(wc -c < "$p" 2>/dev/null | tr -d ' ')"
+    if ! is_uint "$sz"; then ROOM_KEEP+=("--keep-pack=$b"); continue; fi
+    rows+=("$sz|$b")
+  done
+  if [ "${#rows[@]}" -gt 0 ]; then
+    # vazio/falhou → a sort that printed nothing leaves nothing picked (ROOM_N 0, the pass does not run)
+    sorted="$(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1n -k2,2)"
+    ROOM_BIG="$(printf '%s\n' "$sorted" | tail -n 1)"; ROOM_BIG="${ROOM_BIG#*|}"
+    hi="$ROOM_MAX_KIB"; [ "$avail" -ge "$hi" ] || hi="$avail"
+    while IFS='|' read -r sz b; do
+      [ -n "$b" ] || continue
+      if [ "$b" = "$ROOM_BIG" ]; then ROOM_KEEP+=("--keep-pack=$b"); continue; fi
+      kib=$(( (sz + 1023) / 1024 ))
+      if [ $(( total + kib )) -le "$cap" ]; then
+        ROOM_PICK+=("$b"); total=$(( total + kib )); n=$(( n + 1 ))
+      elif [ "$n" -lt 2 ] && [ $(( total + kib )) -le "$avail" ]; then
+        ROOM_PICK+=("$b"); total=$(( total + kib )); n=$(( n + 1 )); ROOM_TWO=1
+      else
+        ROOM_KEEP+=("--keep-pack=$b")
+        if [ $(( total + kib )) -le "$hi" ]; then ROOM_CAPPED=1; fi
+      fi
+    done <<EOF
+$sorted
+EOF
+  fi
+  ROOM_N="$n"; ROOM_KIB="$total"
+}
+
+# room_pass <repo> — tier 2b (header, ga-978f1y): the window is open but the whole-repo gc cannot have the room it asks for (the repack window's rule, or compact_repo's disk gate, said no). A partial repack — only as many of
+# the SMALLEST packs as the room over Dolt's floor holds, the largest ALWAYS kept, lean pack.* settings — under the WATCHDOG (watch_loop). Returns 1 when it did not run for a reason that is INERT (a setting that is not a number, a
+# backoff in force, a reading it needs that cannot be read, no room for two packs, loose objects still waiting for tier 1): STATUS is untouched and the caller says what it said before this tier existed. Returns 0 when it
+# handled the outcome (STATUS is set): ran and finished, was stopped, was cut, found another repacker, or had no budget left. Needs a fresh `measure`, the repo's entry in STATE_JSON (load_state) and, from compact_repo, GC_CAP and GC_EXT_DONE.
+# Sets R_ROOM_SAVE / R_ROOM_CUT_SAVE when the state must remember a change (write_state). A pass that did NOTHING (busy, deferred) may only replace a status that is not a failure, like every pass before it.
+room_pass() {
+  local repo="$1" t_left by_deadline orc out rc b0 took fr floor avail cap now cut jrc swp0 swp1 next cap_s swp_txt
+  if ! room_settings_ok; then
+    log "  room pass is OFF: a JAC_ROOM_* / JAC_WATCH_* setting cannot be used ($ROOM_BAD) — nothing is consolidated by this tier until it is fixed"
+    return 1
+  fi
+  # vazio → nothing remembered (a first run): the configured start; falhou/ilegível → a remembered cap that cannot be read is not "never cut": the smallest, the cheap pass
+  R_ROOM="$(jq -r --arg r "$repo" '.[$r].room_kib // empty' <<<"$STATE_JSON" 2>/dev/null)"; jrc=$?
+  if [ "$jrc" -ne 0 ]; then R_ROOM="$ROOM_MIN_KIB"; log "  the remembered room-pass cap of $repo could not be read — the pass starts from the smallest cap (${ROOM_MIN_KIB}KiB)"
+  elif [ -z "$R_ROOM" ]; then R_ROOM="$ROOM_START_KIB"
+  elif is_uint "$R_ROOM" && [ "${#R_ROOM}" -le 9 ]; then
+    [ "$R_ROOM" -ge "$ROOM_MIN_KIB" ] || R_ROOM="$ROOM_MIN_KIB"
+    [ "$R_ROOM" -le "$ROOM_MAX_KIB" ] || R_ROOM="$ROOM_MAX_KIB"
+  else R_ROOM="$ROOM_MIN_KIB"; log "  the remembered room-pass cap of $repo is not a whole number — the pass starts from the smallest cap (${ROOM_MIN_KIB}KiB)"; fi
+  # BACKOFF: a pass that was cut (watchdog, own cap) or failed is not tried again at once — the host that could not carry it is no different 30 minutes later. vazio/0 → never cut; a time in the future (a clock that moved,
+  # a state edited by hand) starts the clock now and backs off
+  cut="$(jq -r --arg r "$repo" '.[$r].room_cut_epoch // empty' <<<"$STATE_JSON" 2>/dev/null)"; is_uint "$cut" || cut=""
+  now="$(date +%s)"
+  if [ -n "$cut" ] && [ "$cut" -gt 0 ]; then
+    if [ "$cut" -gt "$now" ]; then
+      R_ROOM_CUT_SAVE="$now"
+      log "  room pass: the last cut is dated in the future ($cut > $now) — the clock starts now; backing off ${ROOM_RETRY_S}s"
+      return 1
+    elif [ $(( now - cut )) -lt "$ROOM_RETRY_S" ]; then
+      log "  room pass: the last one was cut $(( now - cut ))s ago — backing off until ${ROOM_RETRY_S}s have passed (cap ${R_ROOM}KiB)"
+      return 1
+    fi
+  fi
+  # `repack -a` packs every reachable loose object too, which the pass's cap does not bound: tier 1 drains them first
+  if [ "$M_LOOSE_KIB" -ge "$LOOSE_LIMIT_KIB" ]; then
+    log "  room pass not started: $(fmt "$M_LOOSE_KIB") is still loose (limit $(fmt "$LOOSE_LIMIT_KIB")) — tier 1 drains that first; retried next run"
+    return 1
+  fi
+  # the room: what is free over Dolt's CRITICAL floor, less the headroom and the quarter of the loose bytes a repack -a packs too. Every reading must be a number — free disk, the floor and swap (the watchdog needs the
+  # swap at the start to know what "grew" means): the pass writes into the disk Dolt lives on and does not start blind
+  fr="$(free_kib "$repo")"
+  if ! is_uint "$fr"; then log "  room pass not started: free disk cannot be read (free='${fr:-nothing}') — cannot tell what room there is over Dolt's floor"; return 1; fi
+  if ! floor="$(dolt_floor_kib)"; then log "  room pass not started: Dolt's floor cannot be shown (dolt_critical_gb='$DOLT_CRIT_GB' is not a whole number) — cannot tell what room there is over it"; return 1; fi
+  swp0="$(swap_used_kib)"
+  if ! is_uint "$swp0"; then log "  room pass not started: swap in use cannot be read — the watchdog would have nothing to compare against, and the 19/10 run died of swap, not of pack space"; return 1; fi
+  avail=$(( fr - floor - HEADROOM_KIB - M_LOOSE_KIB / 4 )); [ "$avail" -ge 0 ] || avail=0
+  cap="$R_ROOM"; [ "$cap" -le "$avail" ] || cap="$avail"
+  if ! room_plan "$cap" "$avail"; then
+    log "  room pass not started: the pack directory of $repo could not be listed"
+    return 1
+  fi
+  if [ "$ROOM_N" -lt 2 ]; then
+    log "  room pass not started: $(fmt "$fr") free, Dolt's floor $(fmt "$floor") + headroom $(fmt "$HEADROOM_KIB") leave ${avail}KiB, and the smallest two packs (other than the largest, $ROOM_BIG) need more — a pass of fewer than two packs consolidates nothing (adaptive cap ${R_ROOM}KiB)"
+    return 1
+  fi
+  # ONE REPACKER AT A TIME (header): the same check, and the same answer, as before the gc and the tail pass
+  other_repacker "$repo"; orc=$?
+  if [ "$orc" -eq 1 ]; then
+    bad_status "$STATUS" || STATUS="busy"
+    log "  room pass not started: $OTHER_WHO is repacking $repo — two repackers at once make a pass fail with 'could not find pack' (ga-8z0hy7); retried next run"
+    return 0
+  elif [ "$orc" -ne 0 ]; then
+    bad_status "$STATUS" || STATUS="busy"
+    log "  room pass not started: cannot tell whether another git process is repacking $repo (no ps or lsof, one cut at its cap or failed, or a candidate lsof gave no directory for) — under doubt it waits; retried next run"
+    return 0
+  fi
+  # the pass runs for tens of minutes: the run's deadline is moved for it like the gc's (once — the disk gate's road has done it already)
+  if [ "$GC_EXT_DONE" -eq 0 ]; then night_gc_extend; GC_EXT_DONE=1; fi
+  if [ "$(remaining)" -lt "$MIN_GC_BUDGET_S" ]; then
+    bad_status "$STATUS" || STATUS="deferred"
+    log "repo=$repo room pass ($ROOM_N packs, $(fmt "$ROOM_KIB")) but only $(remaining)s of budget left — deferred to the next run"
+    return 0
+  fi
+  cap_s="$GC_CAP"; [ "$cap_s" -le "$ROOM_TIMEOUT_S" ] || cap_s="$ROOM_TIMEOUT_S"
+  budget_for "$cap_s"
+  swp_txt="$(( swp0 / 1024 ))MiB"
+  log "  room pass: the whole-repo gc cannot have its room (free $(fmt "$fr"), Dolt's floor $(fmt "$floor")) — consolidating $ROOM_N pack(s) ($(fmt "$ROOM_KIB"); adaptive cap ${R_ROOM}KiB, room over the floor ${avail}KiB) into one with the largest pack ($ROOM_BIG) kept untouched; ${ROOM_THREADS} thread, windowMemory $ROOM_WINDOW_MEM, deltaCacheSize $ROOM_DELTA_CACHE; swap in use now $swp_txt, the watchdog stops it above +$(( WATCH_SWAP_MAX_KIB / 1024 ))MiB or free disk under $(fmt $(( floor + WATCH_SLACK_KIB ))), at most ${t_left}s"
+  jaw_log 1 "room pass: $ROOM_N pack(s) $(fmt "$ROOM_KIB") of $repo, the largest kept; adaptive cap ${R_ROOM}KiB; free $(fmt "$fr"), swap $swp_txt"
+  R_PACK_EXTRA=(-c "pack.threads=$ROOM_THREADS" -c "pack.windowMemory=$ROOM_WINDOW_MEM" -c "pack.deltaCacheSize=$ROOM_DELTA_CACHE")
+  WATCH_ON=1; WATCH_FREE_MIN_KIB=$(( floor + WATCH_SLACK_KIB )); WATCH_SWAP_BASE_KIB="$swp0"
+  b0="$(date +%s)"
+  run_step "$t_left" repack --quiet -a -d -l -f --window="$TAIL_WINDOW" --depth="$TAIL_DEPTH" --cruft --cruft-expiration=2.weeks.ago ${ROOM_KEEP[@]+"${ROOM_KEEP[@]}"}; out="$STEP_OUT"; rc="$STEP_RC"
+  took=$(( $(date +%s) - b0 ))
+  WATCH_ON=0; WATCH_FREE_MIN_KIB=0; WATCH_SWAP_BASE_KIB=0; R_PACK_EXTRA=()
+  swp1="$(swap_used_kib)"
+  if is_uint "$swp1"; then swp_txt="swap $(( swp0 / 1024 ))MiB -> $(( swp1 / 1024 ))MiB"; else swp_txt="swap was $(( swp0 / 1024 ))MiB and cannot be read now"; fi
+  # the smaller cap a cut leaves behind: half of what the pass carried, never below ROOM_MIN_KIB or above the cap it ran at
+  next=$(( ROOM_KIB / 2 )); [ "$next" -ge "$ROOM_MIN_KIB" ] || next="$ROOM_MIN_KIB"; [ "$next" -le "$R_ROOM" ] || next="$R_ROOM"
+  if [ "$rc" -eq 0 ]; then
+    bad_status "$STATUS" || STATUS="consolidated"
+    R_ROOM_CUT_SAVE=0
+    log "  room pass done in ${took}s ($swp_txt): $ROOM_N pack(s) became one"
+    # tier 1's rule: a pass that used under a quarter of its budget while the cap kept a pack out that the room would have taken says the cap is tighter than the host needs
+    if [ "$ROOM_CAPPED" -eq 1 ] && [ $(( took * 4 )) -lt "$t_left" ]; then
+      next=$(( R_ROOM * 2 )); [ "$next" -le "$ROOM_MAX_KIB" ] || next="$ROOM_MAX_KIB"
+      if [ "$next" -gt "$R_ROOM" ]; then R_ROOM_SAVE="$next"; log "  room-pass cap ${R_ROOM}KiB -> ${next}KiB (the pass took ${took}s of its ${t_left}s and the cap left a pack out)"; fi
+    fi
+  elif [ -n "$STEP_WATCH" ]; then
+    # the watchdog ended it (log line written by watch_loop): LOUD, not deferred — the host showed it cannot carry a pass this size
+    STATUS="aborted"
+    R_ROOM_CUT_SAVE="$(date +%s)"
+    if [ "$next" -lt "$R_ROOM" ]; then R_ROOM_SAVE="$next"; fi
+    log "  room pass STOPPED by the watchdog after ${took}s ($swp_txt): $STEP_WATCH — the next pass carries at most ${next}KiB (half of this one's $(fmt "$ROOM_KIB"), never below ${ROOM_MIN_KIB}KiB), tried again after ${ROOM_RETRY_S}s"
+  elif [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
+    # it did NOTHING useful (a killed repack keeps no packed work — and leaves a tmp_pack, which run_step has just reclaimed or the garbage measurement will report): not evidence the pass is too big
+    bad_status "$STATUS" || STATUS="deferred"
+    log "  room pass was cut by the run deadline after ${t_left}s ($swp_txt) — the budget ended, not evidence the pass is too big (retried next run, same cap)"
+  elif [ "$rc" -eq 124 ]; then
+    STATUS="timeout"
+    R_ROOM_CUT_SAVE="$(date +%s)"
+    if [ "$next" -lt "$R_ROOM" ]; then R_ROOM_SAVE="$next"; fi
+    log "  room pass timed out after ${t_left}s (its own cap, $swp_txt) — it carried $ROOM_N pack(s), $(fmt "$ROOM_KIB"); the next one carries at most ${next}KiB, tried again after ${ROOM_RETRY_S}s"
+  else
+    STATUS="failed"
+    R_ROOM_CUT_SAVE="$(date +%s)"
+    log "  room pass failed rc=$rc after ${took}s ($swp_txt): $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ') — tried again after ${ROOM_RETRY_S}s"
+  fi
+  return 0
+}
+
 compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller handles is_bad via record
-  local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_unpacked prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed over before_gcount before_gkib window_ok
+  local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_unpacked prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed over before_gcount before_gkib window_ok in_window why
   R_GITDIR="$repo/.git"
-  STATUS="ok"; G_KIB=""; R_PROGRESS=0; R_BATCH_SAVE=""; R_TAIL_SAVE=""; R_TAIL_CUT_SAVE=""; R_GARBAGE_GREW=0; R_GARBAGE_BEFORE=""; R_LEAK_UNKNOWN=0
+  STATUS="ok"; G_KIB=""; R_PROGRESS=0; R_BATCH_SAVE=""; R_TAIL_SAVE=""; R_TAIL_CUT_SAVE=""; R_ROOM_SAVE=""; R_ROOM_CUT_SAVE=""; R_GARBAGE_GREW=0; R_GARBAGE_BEFORE=""; R_LEAK_UNKNOWN=0
   t0="$(date +%s)"
   load_state "$repo"
   saved="$(jq -r --arg r "$repo" '.[$r].batch_objects // empty' <<<"$STATE_JSON" 2>/dev/null)"
@@ -1119,17 +1499,24 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
     # WINDOW (header, ga-wkoij7): the gc rewrites every pack, so it starts only in the night window and with room for it. jaw_repack_allowed logs its own reason; free_kib is passed in
     # so JAC_FREE_KIB (the seam of every disk test here) stays the one source of free space; an empty answer is read again by the lib's own df, and empty twice is "cannot read" = no gc. Not allowed = it did NOTHING, so it
     # cannot turn a failed / stalled / timed-out / unmeasured / skipped tier 1 green — the same rule as a gc without budget.
-    GC_CAP="$GC_TIMEOUT_S"; window_ok=0
-    if jaw_repack_allowed "$R_GITDIR" "$(free_kib "$repo")" "$GC_PACK_FACTOR"; then window_ok=1; night_gc_extend; fi
+    # ROOM (header, tier 2b, ga-978f1y): both guards below are sized on a FULL rewrite — the largest pack, all the packs — and on the 19/10 archive (10GB, the largest pack 4.5GB, free 5-6GB on the mini) they said no 48 runs in
+    # a row, so the packs were never consolidated and the disk never recovered. When it is the ROOM that refused, INSIDE the window, the room pass (watched, the largest pack kept) takes what the room over Dolt's floor
+    # holds. It answers 1 when it did not run for an inert reason: the answer is then the one this tier gave before the room pass existed.
+    GC_CAP="$GC_TIMEOUT_S"; GC_EXT_DONE=0; window_ok=0; in_window=0; why=""
+    if jaw_repack_allowed "$R_GITDIR" "$(free_kib "$repo")" "$GC_PACK_FACTOR"; then window_ok=1; night_gc_extend; GC_EXT_DONE=1; else why="$JAW_REASON"; in_window="$JAW_IN_WINDOW"; fi
     if [ "$window_ok" -eq 0 ]; then
-      bad_status "$STATUS" || STATUS="deferred"
-      log "repo=$repo packs=$M_PACKS >= $PACKS_LIMIT but the repack window does not allow it now — consolidating gc deferred: $JAW_REASON (the pack alarm still judges the end state)"
+      if [ "$in_window" -ne 1 ] || ! room_pass "$repo"; then
+        bad_status "$STATUS" || STATUS="deferred"
+        log "repo=$repo packs=$M_PACKS >= $PACKS_LIMIT but the repack window does not allow it now — consolidating gc deferred: $why (the pack alarm still judges the end state)"
+      fi
     elif [ "$(remaining)" -lt "$MIN_GC_BUDGET_S" ]; then
       bad_status "$STATUS" || STATUS="deferred"
       log "repo=$repo packs=$M_PACKS >= $PACKS_LIMIT but only $(remaining)s of budget left — gc deferred to the next run"
     elif disk_low "$repo" "$need"; then
-      STATUS="skipped-low-disk"
-      log "repo=$repo status=skipped-low-disk (gc) free=$(fmt "$(free_kib "$repo")") need~$(fmt "$need") packs=$M_PACKS"
+      if ! room_pass "$repo"; then
+        STATUS="skipped-low-disk"
+        log "repo=$repo status=skipped-low-disk (gc) free=$(fmt "$(free_kib "$repo")") need~$(fmt "$need") packs=$M_PACKS"
+      fi
     else
       # ONE REPACKER AT A TIME (header): another git process repacking this repo — the background run an exporter commit spawned — deletes the loose-*.pack batch packs under a
       # running gc, which then dies at its cruft pass with "could not find pack". Found, or cannot tell: the gc is not started. Like a busy gc.pid it did NOTHING, so it cannot turn a
@@ -1273,7 +1660,7 @@ take_lock() {  # returns 0 holding the lock; every other outcome EXITS, as above
     lock_release || log "  ...and the lock itself could not be removed either ($LOCK) — remove it by hand"
     exit 1
   fi
-  trap release_at_exit EXIT
+  trap 'stop_step_at_exit; release_at_exit' EXIT      # a watched step (the room pass) still running when the run ends is stopped FIRST: it must not outlive the lock that says nobody is repacking
 }
 if [ "$MODE" = run ]; then
   command -v jq >/dev/null 2>&1 || { echo "jsonl-archive-compact: jq is required but not found in PATH" >&2; exit 1; }
