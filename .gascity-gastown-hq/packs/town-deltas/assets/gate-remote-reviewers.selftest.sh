@@ -341,7 +341,11 @@ eq "the remote prompt's THIRD STATE block is the local one, byte for byte (edit 
 PT="$(cat "$REMOTE_PROMPT")"
 has "the remote prompt tells the reviewer to deliver by bd comment" "$PT" "bd -C"
 has "…and to close the verdict bead" "$PT" "close"
-has "…and knows label commands come back rc 77" "$PT" "rc 77"
+has "…and knows what still comes back rc 77 (drain-ack, comment bodies)" "$PT" "rc 77"
+# ga-6auslu: the shim now carries the label keys, so the prompt must stop telling the reviewer that label is refused and not to bother
+for _stale in 'rc 77 é o esperado hoje' 'o atalho recusa `label`' 'Voltam recusados (rc 77), sem executar nada:** `bd label'; do
+  case "$PT" in *"$_stale"*) bad "the remote prompt still says label is refused [$_stale]" ;; *) ok "the remote prompt no longer says [$_stale]" ;; esac
+done
 for _bad in 'drain-ack && exit' 'sleep 15' '{{'; do  # the shim refuses drain-ack; the nudge wakes the session; the node has no use for template actions
   case "$PT" in *"$_bad"*) bad "the remote prompt contains [$_bad]" ;; *) ok "the remote prompt has no [$_bad]" ;; esac
 done
@@ -385,11 +389,15 @@ for t in toks:
     cur.append(t)
 if cur: cmds.append(cur)
 say(len(cmds) == 7, f"found 7 verdict commands in the task text (2 labels + comment + close for PASS, label + comment + close for FAIL; got {len(cmds)})")
+# ga-6auslu: ONE test per key the reviewer writes. The set of label keys the task prescribes is pinned: a new key in the task text must show up here
+# (and in the shim's RULES) on purpose, never by accident. The comment text is free; the label keys are not.
+KEYS = sorted({c[-1] for c in cmds if (c[3] if c[1] == "-C" else c[1]) == "label"})
+say(KEYS == ["verdict:FAIL", "verdict:PASS", "verdict:pending"], f"the label keys the task makes a reviewer write are exactly verdict:pending, verdict:PASS, verdict:FAIL (got {KEYS})")
 for c in cmds:
     kind = c[3] if c[1] == "-C" else c[1]
     sub = c[4] if kind == "label" else ""
     r = verdict(c)
-    if kind == "label":   say(r == "refused rc=77", f"label {sub} {c[-1]} -> {r} (the prompt says: rc 77 is expected, do not retry)")
+    if kind == "label":   say(r == "accepted", f"label {sub} {c[-1]} -> {r} (the shim carries exactly the label keys the task prescribes, ga-6auslu)")
     elif kind == "comment": say(r == "accepted", f"comment {c[5][:14]!r}… ({len(c[5])} chars, {c[5].count(chr(10))+1} lines) -> {r}")
     elif kind == "close": say(r == "accepted", f"close -> {r}")
     else: say(False, f"unexpected command in the verdict section: {c[:4]}")
@@ -397,6 +405,12 @@ for argv, want, what in [
     (["bd", "list", "--assignee", SESSION, "--label", "type:quality-gate-verdict", "--json", "--limit", "5"], "accepted", "the prompt's first-turn lookup"),
     (["bd", "show", "ga-vb-demo", "--include-comments"], "refused rc=77", "bd show --include-comments (why the task is never a pointer on the node)"),
     (["gc", "runtime", "drain-ack"], "refused rc=77", "gc runtime drain-ack (why the remote prompt has no drain-ack)"),
+    # ga-6auslu: the widening stops at the three keys: every other label on a verdict bead stays refused (the dispatcher owns these)
+    (["bd", "label", "add", "ga-vb-demo", "verdict:REQUEUED"], "refused rc=77", "label add verdict:REQUEUED (written by the dispatcher only)"),
+    (["bd", "label", "add", "ga-vb-demo", "verdict:pending"], "refused rc=77", "label add verdict:pending (the reviewer only removes it)"),
+    (["bd", "label", "remove", "ga-vb-demo", "verdict:PASS"], "refused rc=77", "label remove verdict:PASS (the reviewer never withdraws a verdict)"),
+    (["bd", "label", "add", "ga-vb-demo", "gate:passed"], "refused rc=77", "label add gate:passed (control plane)"),
+    (["bd", "label", "add", "ga-vb-demo", "verdict:PASS", "verdict:FAIL"], "refused rc=77", "two labels in one call"),
 ]:
     r = verdict(argv); say(r == want, f"{what}: {r}")
 r = verdict(["bd", "close", "ga-vb-demo"], {**ENV, "GC_SESSION_NAME": "gate-reviewer-adhoc-0123456789"}); say(r == "refused rc=77", f"a LOCAL reviewer's name -> {r}")

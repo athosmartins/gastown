@@ -16,7 +16,7 @@ Peças: `agents/gate-reviewer-remote/` · `packs/town-deltas/assets/gate-remote-
 * **Uma tentativa no nó**; falhou, voltou vazio ou estourou → a MESMA etapa abre o local. Um estouro tem desfecho desconhecido: no pior caso sobra uma sessão ociosa no nó até o `idle_timeout` (10 min). Nunca dois revisores para o mesmo slot.
 * **Slot que morreu no nó é substituído no LOCAL.** Slot que era local é oferecido ao nó como spawn novo.
 * **Tarefa idêntica, palavra por palavra** (um texto por slot, renderizado antes de escolher o template). O revisor do nó recebe sempre a tarefa INTEIRA no nudge, nunca o ponteiro: o atalho do nó não devolve corpo de comentário (`bd comments` e `--include-comments` voltam rc 77).
-* **Veredito por `bd comment` + `bd close`.** `bd label add|remove` e `drain-ack` voltam rc 77; o prompt manda não repetir e entregar `VERDICT: PASS|FAIL …` no comentário, que o dispatcher já lê (ga-86l90a8, ga-w7pm55). O atalho NÃO foi alargado.
+* **Veredito pelas 4 escritas da tarefa (ga-6auslu):** `label remove verdict:pending`, `label add verdict:PASS|FAIL`, `comment` (1ª linha `VERDICT: PASS|FAIL …`) e `close`. O atalho carrega as quatro; do rótulo, SÓ essas três chaves. `drain-ack` segue rc 77 (a sessão sai pelo `idle_timeout`). O dispatcher lê o rótulo primeiro e, sem ele, o comentário (ga-86l90a8, ga-w7pm55): um rótulo que falhe não perde o veredito. Tabela escrita → coberta: seção "Escritas do revisor × atalho".
 * **Não mexe em** janitor, headroom do mini, 2º revisor E5 e `refino-gate-dispatcher` (locais). O `cleanup_reviewer_sessions` do fim da rodada fecha as remotas pelos ids.
 
 ## Ligar
@@ -34,7 +34,7 @@ Peças: `agents/gate-reviewer-remote/` · `packs/town-deltas/assets/gate-remote-
    ```
 6. `touch "$GC_CITY/.gc/gate-remote-reviewers.on"` vale na próxima rodada. **Desligar:** `rm` da flag; rodadas em curso terminam onde estão.
 
-**São do Mayor:** ligar a flag e quando · editar `worktree_rigs` do host (passo 5) · alargar o atalho do nó para `bd label add verdict:*`/ler comentários (não feito; a allowlist é a fronteira de segurança) · o teto do template (2) e o transbordo (ga-2hd02v.1.11) · o critério de aceite das 3 revisões.
+**São do Mayor:** ligar a flag e quando · editar `worktree_rigs` do host (passo 5) · alargar o atalho do nó além das 3 chaves de rótulo do veredito, para ler comentários ou `drain-ack` (não feito; a allowlist é a fronteira de segurança) · o teto do template (2) e o transbordo (ga-2hd02v.1.11) · o critério de aceite das 3 revisões.
 
 ## Provar
 
@@ -48,7 +48,7 @@ Critério: **3 revisões reais concluídas no nó, cada uma com veredito igual a
      GATE_REMOTE_SSH_CONFIG="$D/ssh-ready.json" bash -c 'source "$0"; gate_remote_pick_template; echo "$GATE_REMOTE_PICK_TEMPLATE $GATE_REMOTE_PICK_KIND — $GATE_REMOTE_PICK_WHY"' "$W/packs/town-deltas/assets/gate-remote-reviewers.lib.sh"
    ```
    Contra o nó real: config viva → `gate-reviewer fallback — unready`; cópia que mapeia o rig → `gate-reviewer-remote node — node has room`.
-2. **Sessão de teste no nó (depois do passo 5, ANTES da flag).** `gc session new gate-reviewer-remote --no-attach --json`, bead de veredito de brinquedo atribuída ao nome da sessão e uma tarefa curta no nudge. Conferir: o `bd list --assignee` achou a bead; o `label` voltou rc 77 sem repetir; `VERDICT: …` entrou e a bead fechou; depois do `idle_timeout` a sessão sumiu do `scripts/gc-session-ssh list-running`.
+2. **Sessão de teste no nó (depois do passo 5, ANTES da flag).** `gc session new gate-reviewer-remote --no-attach --json`, bead de veredito de brinquedo atribuída ao nome da sessão e uma tarefa curta no nudge. Conferir: o `bd list --assignee` achou a bead; os dois `label` passaram (`verdict:pending` saiu, `verdict:PASS|FAIL` entrou); `VERDICT: …` entrou e a bead fechou (o `bd` recusa `close` de quem não é o assignee: o `GC_ALIAS` do nó tem de ser igual ao assignee da bead de veredito); depois do `idle_timeout` a sessão sumiu do `scripts/gc-session-ssh list-running`.
 3. **As 3 revisões reais (com a flag).** Por revisão: sha, tempo até o 1º turno e até o veredito, canal (rótulo ou só comentário), veredito e achados. Rodar **a mesma sha** pelo caminho local e comparar PASS/FAIL e, no FAIL, os bloqueios. Quem decide se 3 de 3 bastam é o Mayor.
 
 Log do dispatcher: `Reviewer N: node has room - remote reviewer first` (nó) · `Reviewer N: full|unready|unknown (…) - local reviewer` (motivo na linha) · `node spawn gave no session … falling back` · `Re-convene: slot N ran on the node and died` · `remote-reviewer flag UNREADABLE` · `flag file exists but … lib.sh is NOT loaded`. Depois de uma rodada `list-running` não deve listar `gate-reviewer-remote-*`.
@@ -57,13 +57,13 @@ Log do dispatcher: `Reviewer N: node has room - remote reviewer first` (nó) · 
 
 1. **Sem o overlay `pool-reviewer`** (o provider ignora `overlay_dir` e `env`): a diferença mais provável de mudar um veredito. O bloco "THE THIRD STATE" do prompt é idêntico ao do local (comparado no selftest).
 2. **Worktree do rig `gascity` vem do espelho:** o branch em revisão pode não estar lá (o prompt manda dizer no veredito).
-3. **Canal de volta só por comentário**, sem rótulo `verdict:*`; a 1ª linha tem de ser `VERDICT: PASS|FAIL`.
+3. **Canal de volta pelo rótulo E pelo comentário** (ga-6auslu); a 1ª linha do comentário tem de ser `VERDICT: PASS|FAIL`, que é o que vale se um rótulo falhar. Não volta o corpo de comentário ao nó (por isso a tarefa vai inteira no nudge).
 4. **Sem `drain-ack`:** a sessão ociosa fecha pelo `idle_timeout` de 10 min (local: 1 h) e segura uma vaga do nó até lá.
 5. **`start` mais lento:** o `wt-add` puxa o espelho (piso de 150 s) e segura o `flock` do host. **Não medido para este papel.**
 6. **1º turno de procura:** `bd list --assignee` pode voltar vazio com a bead certa (ga-mo7q); o prompt manda confirmar por `bd show <id> --json`.
 
 ## Medido, inferido, não testado
 
-**Medido (19/10, hermético):** o selftest cobre a escolha (flag em 3 estados; nó room/full/unready/unknown; sonda presa; config ruim; `/bin/bash` 3.2 sob `set -euo pipefail`), a costura no dispatcher (lib ausente/quebrada; spawn node-first em 11 desfechos; re-convocação; ponteiro desligado no slot do nó), o template (bloco THIRD STATE idêntico; nome casa com `remote_match` e `identity_pattern`), o `decide()` REAL do `remote-shim-wrapper.py` (aceita `comment`/`close` do texto real da tarefa; recusa `label`, `drain-ack`, `--include-comments`) e 4 mutantes da escolha (sonda com rc≠0 lida como room, teto ilegível lido como enorme, linha de banner contada como sessão, flag ilegível lida como ligada); os do dispatcher (ponteiro no slot do nó, bloco local, template do slot) foram conferidos à mão com `DISPATCHER_UNDER_TEST`. Os selftests vizinhos que contam pontos de spawn foram atualizados de propósito (`session-new-bounded` 3→5, `gate-spawn-err-capture` 2→3); o `pool-prompt-skill-mention` mantém as 10 falhas da main.
+**Medido (19/10, hermético):** o selftest cobre a escolha (flag em 3 estados; nó room/full/unready/unknown; sonda presa; config ruim; `/bin/bash` 3.2 sob `set -euo pipefail`), a costura no dispatcher (lib ausente/quebrada; spawn node-first em 11 desfechos; re-convocação; ponteiro desligado no slot do nó), o template (bloco THIRD STATE idêntico; nome casa com `remote_match` e `identity_pattern`), o `decide()` REAL do `remote-shim-wrapper.py` (aceita os 7 comandos de veredito do texto real da tarefa — as 3 chaves de rótulo, `comment` e `close`, ga-6auslu; recusa os rótulos vizinhos, `drain-ack`, `--include-comments`) e 4 mutantes da escolha (sonda com rc≠0 lida como room, teto ilegível lido como enorme, linha de banner contada como sessão, flag ilegível lida como ligada); os do dispatcher (ponteiro no slot do nó, bloco local, template do slot) foram conferidos à mão com `DISPATCHER_UNDER_TEST`. Os selftests vizinhos que contam pontos de spawn foram atualizados de propósito (`session-new-bounded` 3→5, `gate-spawn-err-capture` 2→3); o `pool-prompt-skill-mention` mantém as 10 falhas da main.
 
 **Inferido:** o engine só enxerga o template novo após recarregar a config; o `idle_timeout` recolhe a sessão ociosa do nó. **NÃO testado (só com a flag, depois da 1.6):** revisão de verdade no nó; tempo do `wt-add`; o `claude-headless` do nó abrindo o prompt; o resgate por comentário com texto real; a equivalência de veredito; o efeito da falta do overlay. A lib só olha o `list-running`: não vê CPU/memória do nó (a medição é a ga-2hd02v.1.11).

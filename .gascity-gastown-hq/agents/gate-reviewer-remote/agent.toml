@@ -12,8 +12,9 @@
 # curto devolve a vaga do nó. work_dir, overlay_dir e env NÃO viajam (o provider os ignora): o revisor do nó não tem o overlay
 # `pool-reviewer`, e a prova de equivalência de veredito (runbook) mede se isso muda o resultado.
 #
-# O atalho `bd` do nó não passa `bd label add|remove` nem `gc runtime drain-ack` (rc 77): o veredito volta por `bd comment` + `bd close`,
-# caminho que o dispatcher já aceita (ga-86l90a8 PASS, ga-w7pm55 FAIL). Alargar o atalho é decisão de segurança do Mayor, não feita.
+# O atalho `bd` do nó carrega as quatro escritas do veredito (ga-6auslu): `label remove verdict:pending`, `label add verdict:PASS|FAIL`, `comment` e `close`,
+# e SÓ essas três chaves de rótulo. `gc runtime drain-ack` segue recusado (rc 77): a sessão ociosa sai pelo idle_timeout. Sem o rótulo o dispatcher ainda lê
+# o veredito do comentário (ga-86l90a8 PASS, ga-w7pm55 FAIL), então um rótulo que falhe não perde o veredito. Alargar além disso é decisão do Mayor.
 idle_timeout = "10m"
 max_active_sessions = 2
 min_active_sessions = 0

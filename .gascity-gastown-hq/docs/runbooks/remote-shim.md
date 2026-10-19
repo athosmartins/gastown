@@ -46,6 +46,8 @@ bd [-C <rig>] update <id> [--json] --set-metadata <key=value>...
 bd [-C <rig>] comment <id> <text>...
 bd [-C <rig>] comment <id> --stdin
 bd [-C <rig>] close <id> [--json] [--reason|-r <text>]
+bd [-C <rig>] label remove <id> <verdict:pending>
+bd [-C <rig>] label add <id> <verdict:PASS|verdict:FAIL>
 gc prime --hook
 gc prime --hook --hook-format codex
 gc handoff --auto
@@ -78,6 +80,7 @@ Decisões que o Mayor pode reverter apagando UMA linha de `RULES` (e do bloco ac
 2. **`bd update` só escreve `--set-metadata`, e só chaves `athos.*` e `story.*`:** são as que fórmulas e agentes de worker escrevem (grep de 14/10); `gc.*`, `pilot.*`, `gate.*` e `delivery.*` são do plano de controle ou de daemons e o resto é desconhecido, então recusa (um prefixo novo é UM elemento de `ALLOW_META`). Sem `--status`, `--assignee`, `--unset-metadata`. `bd list` não varre (sem `--all`/`--limit 0`, `--limit` até 200); `bd --actor`, `--db` e outros flags globais não passam. Ver Pontos em aberto, item 1: isto bate no fecho de passo da fórmula de worker.
 3. **`gc mail`**: `check`/`inbox` só sem argumento (a caixa do próprio alias), sem `--all`/`--from`/`--all-recipients`/`delete`. **`read`, `peek`, `archive` e `reply` recebem um `<id>` e agem em QUALQUER mensagem que o servidor nomear, de qualquer caixa** (o gc não separa por dono): aceito pela decisão original, ver Pontos em aberto, item 4, e Limites.
 4. **`gc session nudge`** sem caractere de controle no texto (nudge é digitação no terminal do destino; com `\r` ele aprovaria um prompt de permissão; TAB também fica de fora, por autocompletar), só para alvos que casam com o `nudge_pattern` da config — **sem a chave, nudge não roda** — e `--delivery` só `queue`/`wait-idle`. O alvo é o PRIMEIRO argumento que não é flag (`--delivery <valor>` pode vir antes dele, como o `gc` aceita), e é esse que o `nudge_pattern` confere.
+5. **`bd label` (ga-6auslu, Mayor 19/10): só as três chaves que o revisor do gate no nó grava na bead de veredito.** O texto da tarefa (`gate-review-task.lib.sh`) manda `label remove <VB> verdict:pending`, `label add <VB> verdict:PASS` ou `verdict:FAIL`, `comment` e `close`; sem as duas primeiras o veredito do nó chegava só pelo comentário (o dispatcher o resgata, ga-86l90a8/ga-w7pm55, mas o resgate `ga-7lz1` de bead ABERTA e os leitores que só olham o rótulo ficavam cegos). Cada forma é EXATA: sem flag (nem `-q` nem `--json`), um só rótulo, o valor fixo; todo outro rótulo (`verdict:REQUEUED`/`identity-unlinked`/`assignee-degraded`, `gate:*`, `gate-status:*`, `pilot:*`, `story:*`, `delivery:*`) e qualquer outro subcomando de `bd label` seguem recusados. Como `comment` e `close`, as duas agem em QUALQUER `<id>` (ver Limites): rotular outro veredito não dá mais poder do que `comment` + `close` já dão. O conjunto de chaves é travado contra o texto REAL da tarefa em `gate-remote-reviewers.selftest.sh` (5b): chave nova no texto que não esteja aqui reprova. **Reverter = apagar as duas linhas de `RULES` (e do bloco acima).**
 
 ## Como instalar no mini (passos de quem decide — nada disto foi feito)
 
