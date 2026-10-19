@@ -2,7 +2,7 @@
 
 ## Contents
 
-• Onde você está · Como pegar a bead · O que o atalho deixa passar · Trabalhar e entregar · Conserto de uma branch que o gate já revisou · Sem bead · O que nunca fazer
+• Onde você está · Como pegar a bead · O que o atalho deixa passar · Trabalhar e entregar · Write-time doctrine — experiment E12 (ga-4q2zo5) · Conserto de uma branch que o gate já revisou · Sem bead · O que nunca fazer
 
 > **Recuperação**: depois de compactar, limpar ou reiniciar, rode `gc prime` (o atalho deixa passar).
 
@@ -39,6 +39,15 @@ Não existe sonda de pool aqui. `bd ready`, `bd query`, `bd update --claim` e `g
 4. Bead de código: ao terminar (com o `git push origin HEAD` já feito), rode `gate-done` e deixe um `bd comment <id> "entregue: <resumo>"`. **Não feche** a bead; o gate fecha. O skill de mesmo nome não existe nesta sessão: o que vale é o atalho. Ele submete o que o ESPELHO tem em `worker/<seu nome de sessão>` (não vê o seu HEAD) e imprime `submetido: … @ <sha>`: compare com `git rev-parse HEAD`; se diferir, empurre de novo e rode `gate-done` outra vez. Ao terminar ele solta a bead do seu alias (ela some de `bd list --assignee "$GC_ALIAS"`: é o esperado, não trabalhe de novo).
 5. Bead que pede só uma medição ou um relato: `bd close <id> --reason "<resultado>"`.
 6. Depois disso, termine o turno. A sessão ociosa se encerra sozinha em 15 minutos e o worktree só é recolhido se estiver limpo e com todo commit publicado: commit não publicado e arquivo novo ou alterado ficam guardados e o worktree é mantido. Arquivos que o git ignora (build, cache) não contam e somem junto quando ele é recolhido.
+
+{{/* e12-doctrine:begin — GENERATED from e12_block_text (assets/e12-arms.sh) by assets/e12-crew-doctrine.sh (ga-0nz1wi). Edit the text there, then run 'bash e12-crew-doctrine.sh write'. */}}
+## Write-time doctrine — experiment E12 (ga-4q2zo5)
+- Why: in last week's gate reviews, 38% of the blocking findings were one mistake — a read that can come back empty or fail was handled as if both meant the same thing.
+- Before you write each new read (database, file, API, command output, dict key), put one comment line right above it: `vazio → <what the code does>; falhou/ilegível → <what the code does>`
+- "Failed" has to land in the inert state (do nothing, keep the old value, raise an alarm) — never the same result as "empty", and never a destructive default. If you cannot fill in both halves, decide first, then write the read.
+- A read that has not answered yet is a third state too (it showed up twice in UI slices this week): while it is pending, draw "Carregando…" — never the empty verdict ("Nada por aqui ainda.") — and put a timeout on the request that lands in the error state, so a read that never answers cannot leave "nobody" on the screen for good.
+- Before you run the gate-done skill, re-read every comment in your own diff and ask "does the code next to it do exactly this?" A comment that promises more than the code does (32% of the findings) makes the next reader stop looking for the hole; fix the code or the comment.
+{{/* e12-doctrine:end */}}
 
 ## Conserto de uma branch que o gate já revisou
 
