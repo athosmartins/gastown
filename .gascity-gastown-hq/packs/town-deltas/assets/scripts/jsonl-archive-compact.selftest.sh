@@ -2343,6 +2343,29 @@ RR="$WORK/rr-grow"; mkwin "$RR"; RR_PC="$(pack_count "$RR")"; rm -f "$WORK/state
 out="$(RSYSCTL="$WORK/sysctl-fake" SYSCTL_MODE=grow ROOM_ACT=hang rrun "$RR")"; rc=$?; took=$(( $(date +%s) - T0 ))
 { [ "$rc" -eq 1 ] && [ "$(last_status)" = "aborted" ] && [ "$took" -lt 30 ] && sleeper_gone && [ "$(pack_count "$RR")" = "$RR_PC" ] && printf '%s' "$out" | grep -q 'swap in use grew'; } \
   && ok "R. swap 1000M -> 3000M as sysctl prints it: the watchdog stops the pass in ${took}s, status aborted" || bad "R. watchdog on the sysctl reading wrong (rc=$rc status=$(last_status) took=${took}s): $out"
+# S. a cut time dated in the FUTURE (a clock that moved, a state edited by hand) is not "never cut": the pass does not start, and the clock for the backoff starts now
+RS="$WORK/rs"; mkwin "$RS"; RS_PC="$(pack_count "$RS")"; T0="$(date +%s)"
+jq -n --arg r "$RS" '{($r): {room_kib: 183, room_cut_epoch: ((now | floor) + 100000)}}' > "$WORK/state.json"
+out="$(rrun "$RS")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RS")" = "$RS_PC" ] && [ "$(last_status)" = "deferred" ] && printf '%s' "$out" | grep -q 'dated in the future'; } \
+  && ok "S. a cut time in the future: no repack, deferred, the log says why" || bad "S. future-dated cut handled wrong (rc=$rc status=$(last_status) packs=$(pack_count "$RS")): $out"
+{ [ "$(state_field "$RS" room_cut_epoch)" -ge "$T0" ] && [ "$(state_field "$RS" room_cut_epoch)" -lt $(( T0 + 1000 )) ] && [ "$(state_field "$RS" room_kib)" = 183 ]; } 2>/dev/null \
+  && ok "S. ...and the cut time in the state is now (the backoff clock starts), the remembered cap is kept" || bad "S. state after a future-dated cut: room_cut_epoch=$(state_field "$RS" room_cut_epoch) room_kib=$(state_field "$RS" room_kib)"
+# T. U. the state of the pass cannot be READ (jq fails on it): that is not "never cut" and not "the cheap cap" — the pass is inert, with the reason in the log. A jq shim fails only the one read named
+mkdir -p "$WORK/jqshim-room"; REAL_JQ="$(command -v jq)"
+cat > "$WORK/jqshim-room/jq" <<EOF
+#!/bin/bash
+case "\$*" in *"\${JQ_FAIL_ON:-@@never@@}"*) echo "jq: forced failure (selftest)" >&2; exit 5 ;; esac
+exec "$REAL_JQ" "\$@"
+EOF
+chmod +x "$WORK/jqshim-room/jq"
+for rd_case in "T|room_kib // empty|cap" "U|room_cut_epoch // empty|cut time"; do
+  RD_N="${rd_case%%|*}"; RD_REST="${rd_case#*|}"; RD_ON="${RD_REST%%|*}"; RD_WHAT="${RD_REST#*|}"; RD="$WORK/rd-$RD_N"
+  mkwin "$RD"; RD_PC="$(pack_count "$RD")"; rm -f "$WORK/state.json"
+  out="$(PATH="$WORK/jqshim-room:$PATH" JQ_FAIL_ON="$RD_ON" rrun "$RD")"; rc=$?
+  { [ "$rc" -eq 0 ] && [ ! -e "$WORK/room-args" ] && [ "$(pack_count "$RD")" = "$RD_PC" ] && [ "$(last_status)" = "deferred" ] && printf '%s' "$out" | grep -q "remembered room-pass $RD_WHAT of .* could not be read"; } \
+    && ok "$RD_N. the remembered $RD_WHAT cannot be read: the pass does not start, deferred, the log names the read" || bad "$RD_N. unreadable $RD_WHAT handled wrong (rc=$rc status=$(last_status) packs=$(pack_count "$RD")): $out"
+done
 unset JAC_WATCH_FREE_FILE JAC_SYSCTL JAC_SWAP_USED_FILE
 
 echo ""

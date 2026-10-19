@@ -87,7 +87,7 @@
 #      as the archive and Dolt, so swap growth IS disk loss, and a floor on free disk alone looks too late. So the pass runs smaller (threads 1, windowMemory 128m, deltaCacheSize 32m — JAC_ROOM_*) AND under a
 #      watchdog (run_step with WATCH_ON): every JAC_WATCH_INTERVAL_S (10s) it reads free disk and swap in use (`sysctl -n vm.swapusage`) and STOPS the step — TERM to the whole process tree, KILL for what is alive after
 #      JAC_WATCH_KILL_GRACE_S (5s) — when free disk falls below Dolt's floor + JAC_WATCH_SLACK_KIB (256MiB), when swap in use grows more than JAC_WATCH_SWAP_MAX_KIB (512MiB) past where it stood at the START of the
-#      pass, or when JAC_WATCH_BLIND_MAX (3) looks in a row could not read one of the two. Unreadable free disk, swap or floor BEFORE the start = the pass does not start (the usual THREE STATES rule: not knowing is
+#      pass, or when JAC_WATCH_BLIND_MAX (3) looks in a row could not read one of the two. Unreadable free disk, swap or floor — or a remembered cap / cut time the state cannot give — BEFORE the start = the pass does not start (the usual THREE STATES rule: not knowing is
 #      not "fine"); an unusable JAC_ROOM_* / JAC_WATCH_* setting turns the pass OFF with the reason in the log, and the lib's old verdict stands (deferred / skipped-low-disk).
 #      Status: a watchdog stop is `aborted` — a failure (bad_status, exit 1, LOUD, the log says which reading tripped it), because it means this host did not have the room the pass thought it had. The cap halves and the pass
 #      waits JAC_ROOM_RETRY_S (2h, `room_cut_epoch` in the state) before the next, so a host that keeps tripping costs one stopped pass per interval, not one per run. A pass cut at its own cap (JAC_ROOM_TIMEOUT_S,
@@ -1263,9 +1263,9 @@ room_pass() {
     log "  room pass is OFF: a JAC_ROOM_* / JAC_WATCH_* setting cannot be used ($ROOM_BAD) — nothing is consolidated by this tier until it is fixed"
     return 1
   fi
-  # vazio → nothing remembered (a first run): the configured start; falhou/ilegível → a remembered cap that cannot be read is not "never cut": the smallest, the cheap pass
+  # vazio → nothing remembered (a first run): the configured start; falhou → a state that cannot be read says nothing about how the last pass went (cut? how small a cap?): the pass is not started, and the old verdict stands
   R_ROOM="$(jq -r --arg r "$repo" '.[$r].room_kib // empty' <<<"$STATE_JSON" 2>/dev/null)"; jrc=$?
-  if [ "$jrc" -ne 0 ]; then R_ROOM="$ROOM_MIN_KIB"; log "  the remembered room-pass cap of $repo could not be read — the pass starts from the smallest cap (${ROOM_MIN_KIB}KiB)"
+  if [ "$jrc" -ne 0 ]; then log "  room pass not started: the remembered room-pass cap of $repo could not be read — without it the pass cannot tell what the last one cost; retried next run"; return 1
   elif [ -z "$R_ROOM" ]; then R_ROOM="$ROOM_START_KIB"
   elif is_uint "$R_ROOM" && [ "${#R_ROOM}" -le 9 ]; then
     [ "$R_ROOM" -ge "$ROOM_MIN_KIB" ] || R_ROOM="$ROOM_MIN_KIB"
@@ -1273,7 +1273,9 @@ room_pass() {
   else R_ROOM="$ROOM_MIN_KIB"; log "  the remembered room-pass cap of $repo is not a whole number — the pass starts from the smallest cap (${ROOM_MIN_KIB}KiB)"; fi
   # BACKOFF: a pass that was cut (watchdog, own cap) or failed is not tried again at once — the host that could not carry it is no different 30 minutes later. vazio/0 → never cut; a time in the future (a clock that moved,
   # a state edited by hand) starts the clock now and backs off
-  cut="$(jq -r --arg r "$repo" '.[$r].room_cut_epoch // empty' <<<"$STATE_JSON" 2>/dev/null)"; is_uint "$cut" || cut=""
+  cut="$(jq -r --arg r "$repo" '.[$r].room_cut_epoch // empty' <<<"$STATE_JSON" 2>/dev/null)"; jrc=$?
+  if [ "$jrc" -ne 0 ]; then log "  room pass not started: the remembered room-pass cut time of $repo could not be read — a pass that may have been cut a moment ago is not repeated blind; retried next run"; return 1; fi
+  is_uint "$cut" || cut=""      # a field that is not a whole number was dropped by load_state, with its log line: "never cut", the same reading tail_cut_epoch gets
   now="$(date +%s)"
   if [ -n "$cut" ] && [ "$cut" -gt 0 ]; then
     if [ "$cut" -gt "$now" ]; then
