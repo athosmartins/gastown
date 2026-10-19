@@ -11942,7 +11942,7 @@ _pilot_node_first_dispatch() {
 #   label   além da sombra, a bead que o classificador manda ao nó POR CAUSA da etiqueta humana node:ok vai ao nó (apply --basis label).
 #   auto    além disso, a que se prova só pelo texto da bead (apply --basis any).
 # Retorno 0 = a bead JÁ está atribuída ao wa-worker-remote (o chamador não faz o caminho do pool do mini); 1 = nada foi escrito,
-# a bead segue no mini; 2 = a escrita pode ter acontecido e não sei dizer (rc 13 do script, ou o prazo estourou no meio): o chamador
+# a bead segue no mini; 2 = a escrita pode ter acontecido e não sei dizer (rc 13 do script, o prazo estourou no meio, ou o script morreu por sinal, rc >= 128): o chamador
 # NÃO despacha esta varredura (carimbar wa-worker por cima de uma atribuição ao nó deixaria a bead nas duas filas) e tenta de novo na próxima.
 # Não cria sessão: o pool a cria (receita da ga-2hd02v.1.6); o slot do nó é 1.
 # vazio → n/a (o classificador sempre responde node/mini/unknown); falhou/ilegível antes de escrever (rc 10/11/12) → igual a mini: 1.
@@ -11976,6 +11976,8 @@ _pilot_wa_node_decide() {
   case "$_rc" in
     0) ;;
     13|124|137|143) warn "wa-node: $_id — resultado da escrita desconhecido (rc=$_rc); não despacho esta varredura"; return 2 ;;
+    # morto por qualquer outro sinal (128+n: HUP 129, INT 130, QUIT 131, ABRT 134, SEGV 139, PIPE 141...) = o mesmo "não sei se já escreveu"; 125-127 (o timeout falhou, não deu para executar, não achou) e o resto: nada rodou
+    12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5]) warn "wa-node: $_id — o despachante morreu por sinal (rc=$_rc); a escrita pode ter acontecido; não despacho esta varredura"; return 2 ;;
     *) return 1 ;;
   esac
   log "  ga-2hd02v.1.10: $_id assigned to the node (wa-worker-remote); the pool creates the session"

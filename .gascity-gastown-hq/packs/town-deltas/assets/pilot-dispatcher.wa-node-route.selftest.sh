@@ -8,7 +8,7 @@
 # O que este arquivo prova:
 #   A. comportamento da função extraída (palavra por palavra) do pilot-dispatcher.sh, contra um wa-node-dispatch.sh falso:
 #      off (e qualquer valor que não seja um dos 4 modos) não chama nada · shadow só chama `check` e nunca devolve 0 ·
-#      label/auto chamam `apply` com a base certa · só rc 0 vira "atribuída ao nó" · rc 13/124/137/143 = resultado desconhecido (2) ·
+#      label/auto chamam `apply` com a base certa · só rc 0 vira "atribuída ao nó" · rc 13/124/137/143 e qualquer rc >= 128 (morto por sinal) = resultado desconhecido (2) ·
 #      alvo que não é wa-worker, id que não é wa-*, script ausente, dry-run → nada escrito.
 #   B. a fiação no despacho (grep no fonte): o ponto de chamada fica depois do guarda de posse e antes de "deixar sem dono"; o braço
 #      `wa-worker-remote)` do spawn vem antes de `wa-worker*)` e não faz `gc session new` nem carimba gc.routed_to=wa-worker; o rc 2 solta a
@@ -103,11 +103,15 @@ check "a linha gravada tem modo auto, rc 0 e a saída do script" bash -c "jq -e 
 
 # --- só o rc 0 é "foi para o nó"; escrita incerta é 2 ---
 for m in label auto; do
-  for c in 10 11 12 2 1 3 99; do
+  for c in 10 11 12 2 1 3 99 125 126 127; do
     r=$(decide $m $ID $ST wa-worker $c); [ "$r" = "rc=1" ] && ok "$m: rc $c do script → 1 (fica no mini; nada foi escrito)" || fail "$m rc=$c → $r"
   done
   for c in 13 124 137 143; do
     r=$(decide $m $ID $ST wa-worker $c); [ "$r" = "rc=2" ] && ok "$m: rc $c do script → 2 (a escrita pode ter acontecido: não despacha)" || fail "$m rc=$c → $r"
+  done
+  # morto por outro sinal (128+n) depois da escrita não pode parecer "nada foi escrito": a bead ficaria nas duas filas
+  for c in 128 129 130 131 134 139 141 255; do
+    r=$(decide $m $ID $ST wa-worker $c); [ "$r" = "rc=2" ] && ok "$m: rc $c do script (morto por sinal) → 2 (a escrita pode ter acontecido: não despacha)" || fail "$m rc=$c → $r"
   done
 done
 
@@ -184,6 +188,8 @@ open(p, "w", encoding="utf-8").write(s)
   mutate shadow-aplica    's = s.replace("\"$_dir/wa-node-dispatch.sh\" check \"$_id\"", "\"$_dir/wa-node-dispatch.sh\" apply \"$_id\" --basis any", 1)'
   mutate rc13-vira-mini   's = s.replace("13|124|137|143)", "124|137|143)", 1)'
   mutate timeout-vira-mini 's = s.replace("13|124|137|143)", "13)", 1)'
+  mutate sinal-vira-mini  's = s.replace("12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5])", "99999)", 1)'
+  mutate sinal-largo-demais 's = s.replace("12[89]|1[3-9][0-9]|", "12[5-9]|1[3-9][0-9]|", 1)'
   mutate qualquer-rc-vale 's = s.replace("    *) return 1 ;;\n  esac\n  log \"  ga-2hd02v.1.10: $_id assigned", "    *) ;;\n  esac\n  log \"  ga-2hd02v.1.10: $_id assigned", 1)'
   mutate sem-filtro-alvo  's = s.replace("  [ \"$_tgt\" = \"wa-worker\" ] || return 1\n", "", 1)'
   mutate sem-filtro-id    's = s.replace("  case \"$_id\" in wa-*) ;; *) return 1 ;; esac\n", "", 1)'
