@@ -17,13 +17,15 @@
 #   gui/$(id -u)/com.gascity.job-ram-probe-loop` com rc 113 e o plist ausente.
 # O QUE CONTA COMO NOITE  Só `rc=0`, volta que COMEÇOU antes das 04:00 E com no máximo JRL_BLIND_MAX s (600) CEGOS. O lote das 04:00 é o que a medição quer ver: um plist instalado às 04:30 gravaria
 #   40 min que não o cobrem, e uma noite em que o disco ficou baixo (ou ps/launchctl falharam, ou a máquina parou) tem `rc=0` igual à de leitura inteira, porque o probe só falha sem NENHUMA amostra.
-#   Por isso a noite é julgada pelo ARQUIVO, não pelo rc: `cego=Ns` = tempo sem leitura utilizável (tick `pulado`, `ps_ok`/`lc_ok` falso, buraco > 3 passos, e do 1º tick gravado até a 1ª leitura boa e da última leitura
-#   boa até o último tick gravado; o que falta entre o fim do arquivo e as 05:10 não entra: o probe só sai com rc=0 ao fim da janela). 600 s folgam o reseed de 17/10 (235 s + 46 s). Passou do limite → `parcial`, NÃO conta, o loop segue para a noite seguinte. `cego=tudo` = o arquivo não tem leitura
-#   utilizável; `cego=?` = não consegui ler o arquivo: os dois são `parcial` (não sei ≠ 0 s cego). Dia repetido conta uma vez. Linha SEM `cego=` é do loop anterior (a noite de 17/10, sem piso de disco)
+#   Por isso a noite é julgada pelo ARQUIVO contra a JANELA, não pelo rc: `cego=Ns` = tempo sem leitura utilizável (tick `pulado`, `ps_ok`/`lc_ok` falso, buraco > 3 passos, do 1º tick gravado até a 1ª leitura boa e da última
+#   leitura boa até o último tick gravado) MAIS as pontas, que o arquivo sozinho não mostra: do lote (04:00) até o 1º tick, se ele saiu depois das 04:00 (o loop pode ter começado cedo e o probe demorado), e do último tick
+#   até o fim da janela (05:10), se o arquivo para antes. O probe sai com rc=0 pelo RELÓGIO (passou das 05:10), não por ter amostrado até lá: uma máquina que dormiu ou um probe travado deixam rc=0 e um arquivo curto.
+#   Buraco ou ponta de até 3 passos (15 s) não entra: `Ns` é limite INFERIOR do tempo cego. 600 s folgam o reseed de 17/10 (235 s + 46 s). Passou do limite → `parcial`, NÃO conta, o loop segue para a noite seguinte.
+#   `cego=tudo` = o arquivo não tem leitura utilizável; `cego=?` = não consegui ler o arquivo ou calcular a janela: os dois são `parcial` (não sei ≠ 0 s cego). Dia repetido conta uma vez. Linha SEM `cego=` é do loop anterior (a noite de 17/10, sem piso de disco)
 #   e vale como estava. loop.log ausente/ilegível = 0 noites contadas (o mesmo que "não sei": segue medindo, e a data-limite segura o fim, nunca o contrário). O `fim:` diz quantas noites
 #   completas havia: a data-limite pode encerrar com menos de 4, e quem lê precisa ver isso sem reabrir o log.
 # VARIÁVEIS (só para teste): JRL_PROBE_CMD (comando do probe; sem espaços nos caminhos) · JRL_LAUNCHCTL · JRL_LABEL · JRL_AGENT_PLIST · JRL_DEADLINE (AAAAMMDDhhmm) · JRL_NIGHTS · JRL_RETRY_SLEEP (s) · JRL_BLIND_MAX (s cegos que ainda deixam a noite valer) ·
-#   JRL_NOW_FILE (arquivo com a hora AAAAMMDDhhmm, no lugar do relógio). Teste: `bash scripts/job-ram-probe-loop.selftest.sh`.
+#   JRL_NOW_FILE (arquivo com a hora AAAAMMDDhhmm, no lugar do relógio) · JRL_WINDOW_PY (o python que calcula a janela da noite; o teste põe `false`/`echo` para fazê-lo falhar). Teste: `bash scripts/job-ram-probe-loop.selftest.sh`.
 D=$(cd "$(dirname "$0")" && pwd)
 CITY="${GC_CITY_PATH:-$(cd "$D/.." && pwd)}"
 RUN="$CITY/.gc/job-ram-probe-run"
@@ -37,6 +39,7 @@ NIGHTS="${JRL_NIGHTS:-4}"
 RETRY="${JRL_RETRY_SLEEP:-300}"
 INTERVAL=5                                  # s entre amostras; o julgamento da noite (blind_secs) usa o mesmo passo
 BLIND_MAX="${JRL_BLIND_MAX:-600}"
+WPY="${JRL_WINDOW_PY:-python3}"
 
 mkdir -p "$RUN" || { echo "job-ram-probe-loop: não consegui criar $RUN" >&2; exit 1; }
 log() { echo "$(date +%FT%T) $*" >> "$LOG"; }
@@ -54,14 +57,30 @@ nights_done() {  # nº de dias distintos com `noite AAAAMMDD rc=0` e SEM `parcia
   awk '$2 == "noite" && $4 == "rc=0" && $5 != "parcial" && $3 ~ /^[0-9]+$/ {print $3}' "$LOG" 2>/dev/null | sort -u | wc -l | tr -d ' '
 }
 
-blind_secs() {  # $1 = arquivo da noite → segundos SEM leitura utilizável (ver "O QUE CONTA COMO NOITE"). vazio (nenhum tick cego) → 0; sem leitura boa nenhuma → "tudo"; falhou/ilegível/sem tick → "?"
+window_epochs() {  # $1 = AAAAMMDD → "R0 R1": epoch LOCAL de 04:00 (o lote das 04:00) e de 05:10 (o fim da janela) dessa noite. Python que falha ou saída que não são 2 epochs → rc 1 (o chamador faz cego=?; janela não se adivinha)
+  # vazio → rc 1 (0 campos); falhou/ilegível → rc 1 (o `||`, e o que não são 2 epochs): nos dois o chamador marca a noite `cego=?`, nunca a dá por coberta
+  w=$("$WPY" -I -c 'import sys, time
+d = sys.argv[1]
+e = lambda h, m: int(time.mktime((int(d[:4]), int(d[4:6]), int(d[6:]), h, m, 0, 0, 0, -1)))
+print(e(4, 0), e(5, 10))' "$1" 2>/dev/null) || return 1
+  set -- $w
+  [ $# -eq 2 ] && isnum "$1" && isnum "$2" || return 1
+  echo "$1 $2"
+}
+
+blind_secs() {  # $1 = arquivo da noite, $2 = AAAAMMDD da noite → segundos SEM leitura utilizável (ver "O QUE CONTA COMO NOITE"). vazio (nenhum tick cego) → 0; sem leitura boa nenhuma → "tudo"; falhou/ilegível/sem tick/sem janela → "?"
   [ -s "$1" ] || { echo "?"; return 1; }
-  b=$(awk -v iv="$INTERVAL" '
+  # vazio → "?" (sem janela não há com o que comparar as pontas); falhou/ilegível → "?" (a noite fica parcial: não sei ≠ 0 s cego)
+  w=$(window_epochs "$2") || { echo "?"; return 1; }
+  b=$(awk -v iv="$INTERVAL" -v r0="${w% *}" -v r1="${w#* }" '
     !/^\{"ts":[0-9]+/ { next }
     { match($0, /[0-9]+/); t = substr($0, RSTART, RLENGTH) + 0; if (!seen) { first = t; seen = 1 }; last = t }
     /"pulado"|"ps_ok":false|"lc_ok":false/ { next }
     { if (!good) { blind += t - first; good = 1 } else if (t - prev > 3 * iv) blind += t - prev - iv; prev = t }
-    END { if (!seen) exit 3; if (!good) { print "tudo"; exit 0 }; print int(blind + (last - prev)) }' "$1" 2>/dev/null) || { echo "?"; return 1; }
+    END { if (!seen) exit 3; if (!good) { print "tudo"; exit 0 }
+          if (first - r0 > 3 * iv) blind += first - r0             # o 1º tick saiu mais de 3 passos depois do lote das 04:00: o que veio antes dele não foi lido
+          if (r1 - last > 3 * iv) blind += r1 - last - iv          # o arquivo para antes do fim da janela: o resto da noite não foi lido
+          print int(blind + (last - prev)) }' "$1" 2>/dev/null) || { echo "?"; return 1; }
   [ "$b" = tudo ] || isnum "$b" || { echo "?"; return 1; }
   echo "$b"
 }
@@ -103,7 +122,7 @@ while :; do
   if [ "$rc" -ne 0 ]; then
     late=""
   else  # a noite é julgada pelo arquivo: rc=0 só diz que houve ao menos UMA amostra
-    b=$(blind_secs "$night")
+    b=$(blind_secs "$night" "$day")
     if isnum "$b"; then cego=" cego=${b}s"; [ "$b" -gt "$BLIND_MAX" ] && late=" parcial"; else cego=" cego=$b"; late=" parcial"; fi
   fi
   log "noite $day rc=$rc$late$cego"

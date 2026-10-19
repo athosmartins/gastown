@@ -8,8 +8,8 @@
 #   e termina na volta seguinte · volta que começa às 04:00 (e às 04:15) é `parcial` e NÃO conta · 03:59 conta · a noite que acabaria depois da data-limite não começa · 23/10 (a última permitida) é medida ·
 #   rc != 0 repete e zera na 1ª que passa · 6 falhas seguidas = exit 1 SEM bootout e SEM apagar o plist · hora ilegível = falha, nunca decisão · a noite é julgada pelo ARQUIVO que o probe deixou, não pelo rc:
 #   `cego=Ns` (ticks `pulado`, ps/launchctl falsos, buraco no tempo, pontas) até 600 s conta; acima, ou `tudo`, ou `?` (arquivo ausente/lixo) = `parcial`, não conta · plist que não saiu é dito no log.
-#   O stub do probe grava no --out a noite descrita na 3ª coluna da fila: segmentos `gN` (N leituras boas), `pN` (N ticks pulados por disco), `sN` (ps_ok falso), `cN` (lc_ok falso), `hN` (buraco de N s),
-#   passo de 5 s; `-` = não grava arquivo; `junk` = só lixo; sem 3ª coluna = `g5`.
+#   O stub do probe grava no --out a noite descrita na 3ª coluna da fila: segmentos `gN` (N leituras boas), `pN` (N ticks pulados por disco), `sN` (ps_ok falso), `cN` (lc_ok falso), `hN` (buraco de N s), `f` (leituras boas até as 05:10),
+#   passo de 5 s, o 1º tick às 03:30 ou na hora em que o loop chamou o probe se a janela já abriu (timestamps reais da noite do arquivo: o juiz compara o arquivo com a janela; uma noite inteira são 1200 ticks); `-` = não grava arquivo; `junk` = só lixo; sem 3ª coluna = `f`.
 # CONTROLE NEGATIVO: cada guarda é removida do script (sed numa cópia) e a suíte TEM que passar a falhar.
 # VARIÁVEIS: JRL_UNDER_TEST (script a testar) · JRL_NO_MUTANTS=1
 set -u
@@ -25,6 +25,8 @@ UID_=$(id -u)
 
 mkdir -p "$T/bin"
 printf '#!/bin/sh\necho "$@" >> "$JRL_T/lc.calls"\n' > "$T/bin/launchctl"; chmod +x "$T/bin/launchctl"
+# python de mentira para a janela (JRL_WINDOW_PY): 3 campos (os 2 primeiros são epochs) e 2 campos que não são número
+printf '#!/bin/sh\necho 1792218000 1792224600 extra\n' > "$T/bin/win3campos"; printf '#!/bin/sh\necho abc def\n' > "$T/bin/winabc"; chmod +x "$T/bin/win3campos" "$T/bin/winabc"
 cat > "$T/stub.sh" <<'EOF'
 #!/bin/sh
 # probe de mentira: anota os argumentos, tira a 1ª linha "RC HORA-DEPOIS [NOITE]" da fila, grava a noite no --out, adianta o relógio e sai com RC. Fila vazia = teste mal montado (exit 99, barulhento).
@@ -33,13 +35,20 @@ out=""; while [ $# -gt 0 ]; do [ "$1" = --out ] && out="$2"; shift; done
 line=$(head -1 "$JRL_T/queue" 2>/dev/null)
 [ -n "$line" ] || exit 99
 sed '1d' "$JRL_T/queue" > "$JRL_T/queue.n"; mv "$JRL_T/queue.n" "$JRL_T/queue"
+cur=$(cat "$JRL_T/now" 2>/dev/null)    # a hora em que o loop chamou o probe (o `now` só avança abaixo)
 set -- $line
 echo "$2" > "$JRL_T/now"
-case "${3:-g5}" in
+# a noite do arquivo (job-ram-probe-AAAAMMDD.jsonl) em epoch LOCAL, como o probe de verdade: o 1º tick sai às 03:30 (ou na hora da chamada, se a janela já abriu); a janela fecha às 05:10
+win=$(python3 -I -c 'import re, sys, time
+ep = lambda s, h, m: int(time.mktime((int(s[:4]), int(s[4:6]), int(s[6:8]), h, m, 0, 0, 0, -1)))
+d = re.search(r"(\d{8})[.]jsonl$", sys.argv[1]).group(1); c = sys.argv[2].strip()
+print(max(ep(d, 3, 30), ep(c, int(c[8:10]), int(c[10:12]))), ep(d, 5, 10))' "$out" "$cur") || exit 98
+case "${3:-f}" in
   -) ;;
   junk) printf 'lixo\n{"ts":"x"}\n' > "$out";;
-  *) awk -v spec="${3:-g5}" 'BEGIN { t = 1792218600; n = split(spec, a, ","); for (i = 1; i <= n; i++) { k = substr(a[i], 1, 1); c = substr(a[i], 2) + 0
+  *) awk -v spec="${3:-f}" -v t="${win% *}" -v t1="${win#* }" 'BEGIN { n = split(spec, a, ","); for (i = 1; i <= n; i++) { k = substr(a[i], 1, 1); c = substr(a[i], 2) + 0
        if (k == "h") { t += c; continue }
+       if (k == "f") { for (; t < t1; t += 5) printf "{\"ts\":%d,\"ps_ok\":true,\"lc_ok\":true,\"jobs\":{}}\n", t; continue }
        for (j = 0; j < c; j++) {
          if (k == "g") printf "{\"ts\":%d,\"ps_ok\":true,\"lc_ok\":true,\"jobs\":{}}\n", t
          else if (k == "p") printf "{\"ts\":%d,\"pulado\":\"disco\",\"disk_free_mb\":1499,\"piso_mb\":3072}\n", t
@@ -60,7 +69,7 @@ run() {
   [ "$3" = "-" ] || printf '%s\n' "$3" > "$d/now"      # "-" = nenhuma hora escrita (K aponta o relógio para um caminho ausente)
   printf '%s' "$4" > "$d/queue"
   JRL_T="$d" GC_CITY_PATH="$d/city" HOME="$d/home" JRL_PROBE_CMD="sh $T/stub.sh" JRL_LAUNCHCTL="$T/bin/launchctl" JRL_NOW_FILE="${NOWF:-$d/now}" JRL_RETRY_SLEEP=0 \
-    timeout 10 sh "$L" > "$d/out" 2>&1; echo $? > "$d/rc"
+    timeout 60 sh "$L" > "$d/out" 2>&1; echo $? > "$d/rc"   # 60 s só para não pendurar: o stub chama python a cada volta e, com load 70, cada python3 leva ~1 s
 }
 rc_of() { cat "$T/$1/rc"; }
 plist_gone() { [ ! -e "$T/$1/home/Library/LaunchAgents/$LABEL.plist" ]; }
@@ -75,10 +84,10 @@ N3="${N17}2026-10-20T05:10:01 noite 20261020 rc=0
 "  # 17 + 20 + 21 = 3 noites completas (a 20261018 rc=143 não entra); a 4ª é a de 22/10
 BOOT="bootout gui/$UID_/$LABEL"
 
-# night_case NOME SPEC SUFIXO conta|parcial DESCRIÇÃO: a volta de 22/10 grava SPEC; `conta` = vale como a 4ª noite (1 chamada do probe), `parcial` = não vale e a volta de 23/10 (g5) é a 4ª (2 chamadas)
+# night_case NOME SPEC SUFIXO conta|parcial DESCRIÇÃO: a volta de 22/10 grava SPEC; `conta` = vale como a 4ª noite (1 chamada do probe), `parcial` = não vale e a volta de 23/10 (noite inteira, `f`) é a 4ª (2 chamadas)
 night_case() {
   run "$1" "$N3" 202610220200 "0 202610220511 $2
-0 202610230511 g5
+0 202610230511 f
 "
   local l; l=$(logl "$1")
   if [ "$4" = conta ]; then
@@ -141,25 +150,45 @@ run_all() {
   run J "$N3" 202610220415 "0 202610220511
 0 202610230511
 "
-  [ "$(nl "$(calls J probe.calls)")" = 2 ] && logl J | grep -q 'noite 20261022 rc=0 parcial cego=0s$' && logl J | grep -q 'noite 20261023 rc=0 cego=0s$' && logl J | tail -1 | grep -q 'fim: 4 noites completas' && plist_gone J; ok $? "3 noites + volta parcial de 22/10: a missão NÃO acaba (parcial não é a 4ª); a de 23/10 é a 4ª e termina"
+  [ "$(nl "$(calls J probe.calls)")" = 2 ] && logl J | grep -q 'noite 20261022 rc=0 parcial cego=900s$' && logl J | grep -q 'noite 20261023 rc=0 cego=0s$' && logl J | tail -1 | grep -q 'fim: 4 noites completas' && plist_gone J; ok $? "3 noites + volta parcial de 22/10: a missão NÃO acaba (parcial não é a 4ª); a de 23/10 é a 4ª e termina"
   # I: 03:59 ainda cobre o lote das 04:00
   run I "$N3" 202610220359 "0 202610220511
 "
   logl I | grep -q 'noite 20261022 rc=0 cego=0s$' && plist_gone I; ok $? "volta que começa às 03:59 conta como noite completa"
-  # a noite é julgada pelo ARQUIVO: rc=0 só diz que houve ao menos uma amostra (ga-sh8t23.6, gate 1). 3 noites contadas + a de 22/10; a de 23/10 (g5) é a reserva que fecha a missão quando a de 22/10 não vale.
-  night_case M "g20,p47,g20" "cego=235s" conta "o dip de 235 s do reseed de 17/10 (disco < 3 GB, 47 ticks pulados) CONTA: cego=235s, a missão termina nesta volta"
-  night_case N "g20,p139,g20" "cego=695s" parcial "700 s de disco baixo: rc=0 mas 'parcial cego=695s', NÃO conta; a volta de 23/10 é a 4ª"
-  night_case O "g20,s130,g20" "cego=650s" parcial "ps que falhou por 650 s (ps_ok falso) é tempo cego: parcial, não conta"
-  night_case P "g20,c130,g20" "cego=650s" parcial "launchctl que falhou por 650 s (lc_ok falso) é tempo cego: parcial, não conta"
-  night_case Q "g20,h700,g20" "cego=700s" parcial "máquina parada 700 s (buraco no tempo, nenhum tick) é tempo cego: parcial, não conta"
+  # a noite é julgada pelo ARQUIVO: rc=0 só diz que houve ao menos uma amostra (ga-sh8t23.6, gate 1). 3 noites contadas + a de 22/10; a de 23/10 (`f`, noite inteira) é a reserva que fecha a missão quando a de 22/10 não vale.
+  night_case M "g20,p47,g20,f" "cego=235s" conta "o dip de 235 s do reseed de 17/10 (disco < 3 GB, 47 ticks pulados) CONTA: cego=235s, a missão termina nesta volta"
+  night_case N "g20,p139,g20,f" "cego=695s" parcial "700 s de disco baixo: rc=0 mas 'parcial cego=695s', NÃO conta; a volta de 23/10 é a 4ª"
+  night_case O "g20,s130,g20,f" "cego=650s" parcial "ps que falhou por 650 s (ps_ok falso) é tempo cego: parcial, não conta"
+  night_case P "g20,c130,g20,f" "cego=650s" parcial "launchctl que falhou por 650 s (lc_ok falso) é tempo cego: parcial, não conta"
+  night_case Q "g20,h700,g20,f" "cego=700s" parcial "máquina parada 700 s (buraco no tempo, nenhum tick) é tempo cego: parcial, não conta"
   night_case R "p50" "cego=tudo" parcial "arquivo só com ticks pulados (nenhuma leitura): 'cego=tudo parcial', nunca 0 s"
   night_case S "-" "cego=?" parcial "arquivo da noite ausente apesar do rc=0: 'cego=? parcial' (não sei ≠ 0 s cego)"
   night_case T "junk" "cego=?" parcial "arquivo só com lixo: 'cego=? parcial' (não sei ≠ 0 s cego)"
-  night_case U "g20,p130" "cego=650s" parcial "disco baixo até o fim da noite (cauda de 650 s): parcial"
-  night_case V "p130,g20" "cego=650s" parcial "disco baixo desde o começo (cabeça de 650 s): parcial"
-  night_case W "g20,p2,g20,p3,g20" "cego=15s" conta "2 ticks perdidos (≤ 3 passos) não contam; 3 contam 15 s: cego=15s, noite vale"
-  JRL_BLIND_MAX=595 night_case X1 "g20,p119,g20" "cego=595s" conta "fronteira: cego=595s com limite 595 AINDA conta"
-  JRL_BLIND_MAX=594 night_case X2 "g20,p119,g20" "cego=595s" parcial "fronteira: cego=595s com limite 594 NÃO conta"
+  night_case U "g1070,p130" "cego=650s" parcial "disco baixo até o fim da noite (cauda de 650 s): parcial"
+  night_case V "p130,g1070" "cego=650s" parcial "disco baixo desde o começo (cabeça de 650 s): parcial"
+  night_case W "g20,p2,g20,p3,g20,f" "cego=15s" conta "2 ticks perdidos (≤ 3 passos) não contam; 3 contam 15 s: cego=15s, noite vale"
+  JRL_BLIND_MAX=595 night_case X1 "g20,p119,g20,f" "cego=595s" conta "fronteira: cego=595s com limite 595 AINDA conta"
+  JRL_BLIND_MAX=594 night_case X2 "g20,p119,g20,f" "cego=595s" parcial "fronteira: cego=595s com limite 594 NÃO conta"
+  # as PONTAS da noite se conferem contra a JANELA (04:00 do lote, 05:10 do fim), não só contra o que o arquivo traz: arquivo curto ou de começo tardio tem rc=0 e zero buraco por dentro (gate 2, ga-sh8t23.6)
+  night_case E1 "g120" "cego=5400s" parcial "arquivo que PARA às 03:40 (120 ticks) com o probe saindo rc=0 às 05:11: a cauda de 5400 s até as 05:10 é tempo cego, 'parcial' (antes: 'cego=0s' e contava)"
+  night_case E2 "h4500,f" "cego=2700s" parcial "loop começou às 02:00 (não é 'tarde') mas o 1º tick só saiu às 04:45: a cabeça de 2700 s desde as 04:00 é cega, 'parcial' (antes: 'cego=0s' e contava)"
+  night_case E3 "h1830,f" "cego=30s" conta "1º tick às 04:00:30 (30 s depois do lote): 30 s cegos, dentro do orçamento, a noite vale"
+  night_case E3b "h1815,f" "cego=0s" conta "1º tick às 04:00:15 (3 passos depois do lote): folga de sempre, cego=0s (a cabeça tem a mesma tolerância do buraco e da cauda)"
+  night_case E3c "h1820,f" "cego=20s" conta "1º tick às 04:00:20 (4 passos depois do lote): passou da folga, 20 s cegos, dentro do orçamento, a noite vale"
+  night_case E4 "g1198" "cego=0s" conta "o último tick 15 s antes das 05:10 (3 passos) é a folga de sempre: cego=0s"
+  night_case E5 "g1197" "cego=15s" conta "o último tick 20 s antes das 05:10: 15 s cegos (fim - último tick - 1 passo)"
+  # a janela que não sei calcular não é janela coberta: não sei ≠ 0 s cego. O python falha na execução INTEIRA, então as duas voltas (22 e 23/10) ficam `cego=?` e a missão só acaba pela data-limite, com 3 noites
+  window_case() {  # window_case NOME PYTHON DESCRIÇÃO
+    JRL_WINDOW_PY="$2" run "$1" "$N3" 202610220200 "0 202610220511 f
+0 202610230511 f
+"
+    local l; l=$(logl "$1")
+    printf '%s\n' "$l" | grep -q 'noite 20261022 rc=0 parcial cego=?$' && printf '%s\n' "$l" | grep -q 'noite 20261023 rc=0 parcial cego=?$' && ! printf '%s\n' "$l" | grep -q 'fim: 4 noites' && printf '%s\n' "$l" | tail -1 | grep -q 'fim: a noite 20261024 acaba.*; 3 de 4 noites completas' && plist_gone "$1"
+    ok $? "$3"
+  }
+  window_case E6 false "não consegui calcular a janela da noite (o python falhou): as duas voltas saem 'rc=0 parcial cego=?', nenhuma conta e o fim vem da data-limite com 3 noites (nunca 0 s cego)"
+  window_case E7 "$T/bin/win3campos" "a janela veio com 3 campos (os 2 primeiros são epochs): não são 2 epochs, as duas voltas saem 'rc=0 parcial cego=?' e nenhuma conta"
+  window_case E8 "$T/bin/winabc" "a janela veio com 2 campos que não são número: as duas voltas saem 'rc=0 parcial cego=?' e nenhuma conta"
   # log novo: as noites no formato com cego= contam, as parcial não
   run Z "${N17}2026-10-20T05:10:01 noite 20261020 rc=0 cego=0s
 2026-10-21T05:10:02 noite 20261021 rc=0 parcial cego=700s
@@ -218,6 +247,15 @@ echo "== $((n-fails))/$n ok =="
   mutant "noite depois da data-limite não diz as noites" '/acaba (05:10) depois da data-limite/s/; \$n de \$NIGHTS noites completas//'
   mutant "limite de cegueira não numérico passa" 's/ && isnum "\$BLIND_MAX" ||/ ||/'
   mutant "plist que não saiu não é dito" 's/^  \[ ! -e "\$AGENT_PLIST" \] || log .*$/  :/'
+  mutant "cabeça tardia (1º tick depois das 04:00) não é cega" 's/blind += first - r0/blind += 0/'
+  mutant "folga da cabeça some (1º tick > 0 s depois das 04:00 já é cego)" 's/first - r0 > 3 \* iv/first - r0 > 0/'
+  mutant "cauda curta (arquivo para antes das 05:10) não é cega" 's/blind += r1 - last - iv/blind += 0/'
+  mutant "cauda sem descontar o passo" 's/blind += r1 - last - iv/blind += r1 - last/'
+  mutant "folga final de 3 passos some (> 0)" 's/r1 - last > 3 \* iv/r1 - last > 0/'
+  mutant "janela que falha vira 'sem cegueira nas pontas'" 's/^\(  w=\$(window_epochs "\$2")\) || { echo "?"; return 1; }$/\1 || w="0 9999999999"/'
+  mutant "janela com campo a mais passa" 's/\[ \$# -eq 2 \] && //'
+  mutant "janela que não é número passa" 's/ && isnum "\$1" && isnum "\$2" || return 1/ || return 1/'
+  mutant "a noite é julgada sem o dia (janela do dia errado)" 's/blind_secs "\$night" "\$day"/blind_secs "$night" 20200101/'
   echo "== mutantes: $((n-fails))/$n ok no total =="
 }
 [ "$fails" = 0 ]
