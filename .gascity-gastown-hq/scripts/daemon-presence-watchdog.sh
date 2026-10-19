@@ -98,7 +98,7 @@ _deliberately_disabled() {
 # system sleep, NOT to a hung daemon); 0 = legacy behaviour (flag regardless).
 DPW_WAKE_GRACE="${DPW_WAKE_GRACE:-1}"
 
-DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch com.gascity.child-priority-janitor}"
+DPW_CRITICAL="${DPW_CRITICAL:-com.gascity.pilot com.gascity.context-check-dispatcher com.gascity.quality-gate-dispatcher com.gascity.auto-refino-dispatcher com.gascity.refino-gate-dispatcher com.gascity.story-delivery com.gascity.supervisor com.gascity.supervisor-config-guard com.gascity.inflight-reclaim-guard com.gascity.gate-recovery-watchdog com.gascity.dolt-hang-watchdog com.gascity.production-stall-watchdog com.gascity.crew-hang-detector com.gascity.lifecycle-coherence-janitor com.gascity.crew-autopin-guard com.gascity.lifecycle-correctness-auditor com.gascity.throughput-stall-watchdog com.gascity.gate-throughput-stall-watchdog com.gascity.git-lock-hygiene com.gascity.crew-liveness-probe com.gascity.agent-stuck-escalation com.gascity.quorum-convergence-watchdog com.gascity.approved-state-reconciler com.gascity.auto-rehome-janitor com.gascity.sling-task-janitor com.gascity.gate-marker-rehome-janitor com.gascity.silent-ignorance-watch com.gascity.child-priority-janitor com.gascity.hetzner-occupancy-watch}"
 
 HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 
@@ -126,6 +126,10 @@ HQ="${DPW_HQ:-/Users/athos/gt/.gascity-gastown-hq}"
 # (verified: each logs before its ENABLED check can return) rather than adding a new
 # heartbeat-touch line to each script — ga-9wv5 closes the coverage gap named in the bug
 # (approved-state-reconciler + "the janitors") with a config-only change.
+#
+# ga-2hd02v.1.17 — hetzner-occupancy-watch: 2700 s = 3x o ciclo de 900 s do plist. Este job NÃO loga antes de tudo: o .out ganha UMA
+# linha no FIM de cada rodada que mede (hetzner-occupancy-watch.py `run`, o print do estado); lock ocupado e erro vão só para o
+# stderr (.err). Então o .out parado por 3 ciclos = nenhuma rodada fechou (o launchd não disparou, ou as rodadas falham ou travam).
 DPW_HEARTBEAT="${DPW_HEARTBEAT:-com.gascity.pilot|$HQ/.gc/logs/pilot-dispatcher.log|1500
 com.gascity.inflight-reclaim-guard|$HQ/.gc/logs/inflight-reclaim-guard-launchd.out|1500
 com.gascity.context-check-dispatcher|$HQ/.gc/logs/context-check-dispatcher.log|3000
@@ -137,7 +141,8 @@ com.gascity.approved-state-reconciler|$HQ/.gc/logs/approved-state-reconciler.out
 com.gascity.auto-rehome-janitor|$HQ/.gc/logs/auto-rehome-janitor.out|3000
 com.gascity.sling-task-janitor|$HQ/.gc/logs/sling-task-janitor.out|4500
 com.gascity.gate-marker-rehome-janitor|$HQ/.gc/logs/gate-marker-rehome-janitor.out|1600
-com.gascity.child-priority-janitor|$HQ/.gc/logs/child-priority-janitor.out|900}"
+com.gascity.child-priority-janitor|$HQ/.gc/logs/child-priority-janitor.out|900
+com.gascity.hetzner-occupancy-watch|$HQ/.gc/logs/hetzner-occupancy-watch.out|2700}"
 
 # ── RECYCLER — memory-bounded restart of known-leaky Python dashboards ────────
 # Knobs (override via env or the launchd plist EnvironmentVariables):

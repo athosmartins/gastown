@@ -97,7 +97,9 @@ sed "/^$LBL|/s/|900/|500/" "$DPW" > "$W/dpw-low.sh"
 expect_reprova "threshold 500 s (< 2x StartInterval)" "$W/dpw-low.sh" "$PLIST" "threshold"
 sed "/^$LBL|/s/|900/|3600/" "$DPW" > "$W/dpw-high.sh"
 expect_reprova "threshold 3600 s (> 3000 s)" "$W/dpw-high.sh" "$PLIST" "threshold"
-sed "s/ com\.gascity\.child-priority-janitor}\"/}\"/" "$DPW" > "$W/dpw-no-critical.sh"
+# Take the label out wherever it sits on the DPW_CRITICAL line (ga-2hd02v.1.17 appended another label after it: a mutation anchored
+# on the end of the line matched nothing, the file stayed intact and the case failed as "passed (rc 0)").
+sed '/^DPW_CRITICAL=/s/ com\.gascity\.child-priority-janitor\([ }]\)/\1/' "$DPW" > "$W/dpw-no-critical.sh"
 expect_reprova "label removed from DPW_CRITICAL" "$W/dpw-no-critical.sh" "$PLIST" "NOT in the DPW_CRITICAL"
 
 echo
