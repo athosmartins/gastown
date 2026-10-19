@@ -87,7 +87,7 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 
 - Guarda: `scripts/heavy-guard.sh --check --what teste; echo rc=$?` (0 com folga; `DISK_FREE_OVERRIDE_MB=3000` dá 75).
 - Recusas e bypass: `tail $GC_CITY_PATH/.gc/logs/heavy-guard.log` (`REFUSED ...` / `BYPASS ...`; uma linha `BYPASS` fora de selftest = um `export` esquecido).
-- Sonda do dog: `DISK_FREE_OVERRIDE_MB=3000 sh packs/town-deltas/assets/scripts/pool-probe.sh gastown.dog` (só história some; exit 0 e nada no stderr; o trabalho de fórmula do dog continua saindo). Leitura ilegível: `grep 'free disk unreadable' $GC_CITY_PATH/.gc/logs/pool-probe.log`.
+- Sonda do dog: `DISK_FREE_OVERRIDE_MB=3000 POOL_PROBE_LOG=/dev/null sh packs/town-deltas/assets/scripts/pool-probe.sh gastown.dog` (só história some; exit 0 e nada no stderr; o trabalho de fórmula do dog continua saindo). O `POOL_PROBE_LOG=/dev/null` é para a conferência não deixar uma linha "tier 1 held back" no `pool-probe.log` de produção, que pareceria disco baixo de verdade. Leitura ilegível: `grep 'free disk unreadable' $GC_CITY_PATH/.gc/logs/pool-probe.log`.
 - Baterias: `scripts/heavy-guard.selftest.sh`, `packs/town-deltas/assets/pool-probe-disk-floor.selftest.sh` e a seção 11 de `scripts/pool-probe.selftest.sh`.
 
 ## Limites conhecidos

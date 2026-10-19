@@ -74,7 +74,10 @@ disk_hold_jq=""
 
 pp_log() {
   # best effort: the answer is already decided and a full disk is exactly when this write fails
-  pp_f="${POOL_PROBE_LOG:-${GC_CITY_PATH:-${GC_CITY:-.}}/.gc/logs/pool-probe.log}"
+  pp_city="${GC_CITY_PATH:-${GC_CITY:-}}"
+  # no POOL_PROBE_LOG and no city: nowhere to log. The old "." fallback made ./.gc/logs in whatever directory the session stood in (ga-nyug12)
+  [ -n "${POOL_PROBE_LOG:-$pp_city}" ] || return 0
+  pp_f="${POOL_PROBE_LOG:-$pp_city/.gc/logs/pool-probe.log}"
   mkdir -p "$(dirname "$pp_f")" 2>/dev/null || return 0
   printf "%s pool-probe[%s]: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$target" "$*" >> "$pp_f" 2>/dev/null || true
 }
