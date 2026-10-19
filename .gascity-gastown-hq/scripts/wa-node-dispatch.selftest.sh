@@ -74,7 +74,7 @@ cat > "$T/gc" <<'SHEOF'
 #!/bin/sh
 echo "$*" >> "$STUB_GCCALLS"
 [ -z "${STUB_FAIL_GC:-}" ] || exit 1
-[ "$1 $2" = "session list" ] && { cat "$STUB_SESS"; exit 0; }
+[ "$1 $2" = "session list" ] && { sleep "${STUB_GC_SLEEP:-0}"; cat "$STUB_SESS"; exit 0; }
 exit 1
 SHEOF
 chmod +x "$T/bd" "$T/gc"
@@ -97,8 +97,8 @@ cls() { printf '%s' "$1" > "$CLSOUT"; printf '%s' "$2" > "$CLSRC"; }
 fresh() { # fresh [extra json mesclado na wa-t1]
   printf '{"wa-t1":{"id":"wa-t1","title":"t","status":"open","assignee":"","metadata":{}},"ga-x":{"id":"ga-x","title":"t","status":"open","assignee":"","metadata":{}}}' > "$STATE"
   if [ -n "${1:-}" ]; then jq -c --argjson m "$1" '."wa-t1" += $m' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; fi
-  : > "$CALLS"; : > "$GCCALLS"; : > "$CITY/.gc/wa-node-route.jsonl"; echo '[]' > "$SESS"; cls "$NODE_TEXT" 0
-  unset STUB_FAIL_SHOW STUB_SHOW_OTHER STUB_FAIL_LIST STUB_LIST_GARBAGE STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_FAIL_GC
+  : > "$CALLS"; : > "$GCCALLS"; : > "$CITY/.gc/wa-node-route.jsonl"; echo '{"ok":true,"sessions":[]}' > "$SESS"; cls "$NODE_TEXT" 0
+  unset STUB_FAIL_SHOW STUB_SHOW_OTHER STUB_FAIL_LIST STUB_LIST_GARBAGE STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_FAIL_GC STUB_GC_SLEEP
 }
 SCRIPT="$REAL"; OUT=""; RC=0; MUT_NAME=""; MUT_M=""
 d() { OUT=$("$SCRIPT" "$@" 2>&1); RC=$?; }                       # roda e guarda saída + rc
@@ -140,12 +140,20 @@ fresh; jq -c '. + {"wa-busy":{"id":"wa-busy","status":"in_progress","assignee":"
 d apply wa-t1; expect_rc "apply: slot ocupado por bead em andamento -> 12 sem escrita" 12 w0
 fresh; export STUB_FAIL_LIST=1;    d apply wa-t1; expect_rc "apply: leitura do slot falha -> 11 sem escrita" 11 w0
 fresh; export STUB_LIST_GARBAGE=1; d apply wa-t1; expect_rc "apply: leitura do slot que não é lista -> 11 sem escrita" 11 w0
-fresh; echo '[{"template":"wa-worker-remote","state":"active","alias":"wa-worker-remote-1"}]' > "$SESS"; d apply wa-t1; expect_rc "apply: sessão do template ativa -> 12 sem escrita" 12 w0
-fresh; echo '[{"template":"wa-worker-remote","state":"closed","alias":"wa-worker-remote-1"}]' > "$SESS"; d apply wa-t1; expect_rc "apply: sessão antiga já fechada não ocupa o slot -> 0" 0
-fresh; echo '[{"template":"wa-worker","state":"active","alias":"wa-worker-adhoc-1"}]' > "$SESS"; d apply wa-t1; expect_rc "apply: wa-worker do mini ativo não ocupa o slot do nó -> 0" 0
+fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote","state":"active","closed":false,"alias":"wa-worker-remote-1"}]}' > "$SESS"; d apply wa-t1; expect_rc "apply: sessão do template ativa -> 12 sem escrita" 12 w0
+fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote","state":"closed","alias":"wa-worker-remote-1"}]}' > "$SESS"; d apply wa-t1; expect_rc "apply: sessão antiga já fechada (estado) não ocupa o slot -> 0" 0
+fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker","state":"active","alias":"wa-worker-adhoc-1"}]}' > "$SESS"; d apply wa-t1; expect_rc "apply: wa-worker do mini ativo não ocupa o slot do nó -> 0" 0
 fresh; export STUB_FAIL_GC=1;      d apply wa-t1; expect_rc "apply: lista de sessões falha -> 11 sem escrita" 11 w0
 fresh; echo 'not json' > "$SESS";   d apply wa-t1; expect_rc "apply: lista de sessões ilegível -> 11 sem escrita" 11 w0
-fresh; echo '{"a":1}' > "$SESS";    d apply wa-t1; expect_rc "apply: lista de sessões que não é array -> 11 sem escrita" 11 w0
+fresh; echo '{"a":1}' > "$SESS";    d apply wa-t1; expect_rc "apply: resposta sem o campo sessions -> 11 sem escrita" 11 w0
+fresh; echo '{"ok":true,"sessions":null}' > "$SESS"; d apply wa-t1; expect_rc "apply: sessions que não é lista -> 11 sem escrita" 11 w0
+fresh; echo '[]' > "$SESS"; d apply wa-t1; expect_rc "apply: array solto (não é o formato do gc) -> 11 sem escrita" 11 w0
+fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote","state":"active","closed":true,"alias":"wa-worker-remote-1"}]}' > "$SESS"; d apply wa-t1; expect_rc "apply: sessão com closed=true não ocupa o slot -> 0" 0
+fresh; echo '{"ok":true,"sessions":[{"template":"gastown.dog","state":"start-pending","closed":false,"alias":"gastown.dog-5"},{"template":"wa-worker-remote","state":"start-pending","closed":false,"alias":"wa-worker-remote-1"}]}' > "$SESS"; d apply wa-t1; expect_rc "apply: sessão do nó ainda iniciando (start-pending) ocupa o slot -> 12 sem escrita" 12 w0
+# ---- prazo próprio da leitura de sessões (gc session list levou 14–22 s na mini carregada; o prazo geral é 20 s)
+fresh; export STUB_GC_SLEEP=3; WA_NODE_TIMEOUT=2 WA_NODE_SESSION_TIMEOUT=15 d apply wa-t1; expect_rc "apply: sessões lentas (3 s) cabem no prazo próprio mesmo com o geral em 2 s -> 0" 0
+fresh; export STUB_GC_SLEEP=3; WA_NODE_SESSION_TIMEOUT=1 d apply wa-t1; expect_rc "apply: sessões mais lentas que o prazo próprio -> 11 sem escrita" 11 w0
+fresh; export STUB_GC_SLEEP=3; WA_NODE_TIMEOUT=2 WA_NODE_SESSION_TIMEOUT=abc d apply wa-t1; expect_rc "apply: prazo próprio ilegível volta ao padrão (60 s), não ao geral -> 0" 0
 # ---- apply: dry-run, corrida, conferência
 fresh; d apply wa-t1 --dry-run; expect_rc "apply --dry-run -> 0 sem escrita" 0 w0
 [ "$(grep -c '|comment|' "$CALLS")" = 0 ] && ok "apply --dry-run: sem comentário" || bad "apply --dry-run comentou"
@@ -209,7 +217,7 @@ fresh; d apply wa-t1; if grep '|update|' "$CALLS" | head -n 1 | grep -q -- '--if
 mutant slot-ignorado 'case "$n" in 0) ;;' 'case "0" in 0) ;;'
 fresh; jq -c '. + {"wa-busy":{"id":"wa-busy","status":"in_progress","assignee":"wa-worker-remote-1","metadata":{}}}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
 mutant sessao-ignorada 'case "$live" in 0) ;;' 'case "0" in 0) ;;'
-fresh; echo '[{"template":"wa-worker-remote","state":"active","alias":"wa-worker-remote-1"}]' > "$SESS"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote","state":"active","alias":"wa-worker-remote-1"}]}' > "$SESS"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
 mutant veredito-ignorado 'if [ "$rc" != 0 ]; then jlog apply' 'if false; then jlog apply'
 fresh; cls "$MINI" 10; d apply wa-t1; if [ "$RC" = 10 ] && ! wrote; then survived; else killed; fi
 mutant base-ignorada 'if [ "$basis" = label ] && [ "$b" != label ]; then' 'if false; then'
@@ -227,7 +235,15 @@ fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.r
 mutant dry-run-escreve 'if [ "$dry" = 1 ]; then jlog apply' 'if [ "$dry" = 99 ]; then jlog apply'
 fresh; d apply wa-t1 --dry-run; if ! wrote; then survived; else killed; fi
 mutant sessao-viva-fechada 'select((.state // .State // "") | test("closed|stopped|archived|drained") | not)' 'select(true)'
-fresh; echo '[{"template":"wa-worker-remote","state":"closed","alias":"wa-worker-remote-1"}]' > "$SESS"; d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote","state":"closed","alias":"wa-worker-remote-1"}]}' > "$SESS"; d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant sessao-closed-flag 'select(.closed != true) | ' ''
+fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote","state":"active","closed":true,"alias":"wa-worker-remote-1"}]}' > "$SESS"; d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant sessoes-so-array 'if type=="object" and (.sessions|type)=="array" then [.sessions[] |' 'if type=="array" then [.[] |'
+fresh; d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant sessao-prazo-geral 'sess=$(TS "$GC" session list' 'sess=$(T "$GC" session list'
+fresh; export STUB_GC_SLEEP=3; WA_NODE_TIMEOUT=2 WA_NODE_SESSION_TIMEOUT=15 d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant prazo-proprio-ilegivel 'case "$STMO" in '"''"'|*[!0-9]*) STMO=60 ;; esac' ':'
+fresh; export STUB_GC_SLEEP=3; WA_NODE_TIMEOUT=2 WA_NODE_SESSION_TIMEOUT=abc d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

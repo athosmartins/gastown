@@ -15,7 +15,7 @@
 #   em andamento e carimba gc.routed_to → relê e confere → comenta. Falha na conferência desfaz. `release` só mexe em bead que é do alias E da rota.
 # O QUE NÃO FAZ: não cria sessão. A receita provada na ga-2hd02v.1.6 (dog-remote) é "atribuir e deixar o pool criar"; `gc session new` à mão em template remoto roteado gera duas sessões e o
 #   crew-session-dedup derruba uma. Não mexe no city.toml, no config do host nem no Pilot. Não escreve dado da bead em lugar nenhum além do comentário curto (id, veredito, motivos).
-# Env (teste): GC_CITY, WA_NODE_BD (bd), WA_NODE_GC (gc), WA_NODE_CLASSIFY, WA_NODE_PY, WA_NODE_ALIAS (wa-worker-remote-1), WA_NODE_ROUTE_TEMPLATE (wa-worker-remote), WA_NODE_LOG, WA_NODE_TIMEOUT (20 s).
+# Env (teste): GC_CITY, WA_NODE_BD (bd), WA_NODE_GC (gc), WA_NODE_CLASSIFY, WA_NODE_PY, WA_NODE_ALIAS (wa-worker-remote-1), WA_NODE_ROUTE_TEMPLATE (wa-worker-remote), WA_NODE_LOG, WA_NODE_TIMEOUT (20 s), WA_NODE_SESSION_TIMEOUT (60 s, só para `gc session list`).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CITY="${GC_CITY:-$(cd "$HERE/.." && pwd)}"
@@ -25,10 +25,14 @@ ALIAS="${WA_NODE_ALIAS:-wa-worker-remote-1}"; ROUTE="${WA_NODE_ROUTE_TEMPLATE:-w
 LOG="${WA_NODE_LOG:-$CITY/.gc/wa-node-route.jsonl}"
 TMO="${WA_NODE_TIMEOUT:-20}"
 case "$TMO" in ''|*[!0-9]*) TMO=20 ;; esac     # prazo ilegível volta ao padrão
+# `gc session list --json` levou 14–22 s na mini carregada (medido 19/10) — com o prazo de 20 s a leitura estourava e o despacho nunca passava; esta leitura tem prazo próprio
+STMO="${WA_NODE_SESSION_TIMEOUT:-60}"
+case "$STMO" in ''|*[!0-9]*) STMO=60 ;; esac
 
 say() { echo "wa-node-dispatch: $*" >&2; }
 die() { local rc="$1"; shift; say "$*"; exit "$rc"; }
 T() { if command -v timeout >/dev/null 2>&1; then timeout "$TMO" "$@"; else "$@"; fi; }
+TS() { if command -v timeout >/dev/null 2>&1; then timeout "$STMO" "$@"; else "$@"; fi; }
 jlog() { # jlog <evento> <bead> <rc> <detalhe> — uma linha por decisão; falha ao gravar o log nunca muda o resultado
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || return 0
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg ev "$1" --arg b "$2" --argjson rc "$3" --arg d "$4" '{ts:$ts,event:$ev,bead:$b,rc:$rc,detail:$d}' >> "$LOG" 2>/dev/null || true
@@ -84,8 +88,9 @@ apply)
   mine=$(T "$BD" -C "$store" list --status in_progress --assignee "$ALIAS" --json --limit 5 2>/dev/null) || { jlog apply "$id" 11 "slot-ilegivel"; die 11 "não consegui ler o slot do nó (bd list) — fica no mini"; }
   n=$(printf '%s' "$mine" | jq -r 'if type=="array" then length else "x" end' 2>/dev/null)
   case "$n" in 0) ;; ''|x|*[!0-9]*) jlog apply "$id" 11 "slot-ilegivel"; die 11 "leitura do slot do nó não é uma lista — fica no mini" ;; *) jlog apply "$id" 12 "slot-ocupado bead(s)=$n"; die 12 "slot do nó ocupado ($n bead(s) em andamento de $ALIAS)" ;; esac
-  sess=$(T "$GC" session list --json 2>/dev/null) || { jlog apply "$id" 11 "sessoes-ilegiveis"; die 11 "não consegui listar as sessões — fica no mini"; }
-  live=$(printf '%s' "$sess" | jq -r --arg t "$ROUTE" --arg a "$ALIAS" 'if type=="array" then [.[] | select(((.template // .Template // "") == $t) or ((.alias // .Alias // "") == $a)) | select((.state // .State // "") | test("closed|stopped|archived|drained") | not)] | length else "x" end' 2>/dev/null)
+  # gc session list --json devolve {"sessions":[…]} (medido 19/10), nunca o array solto: vazio → 0; falhou/ilegível/outro formato → "x" (11, fica no mini); sessão com closed=true ou estado final não conta
+  sess=$(TS "$GC" session list --json 2>/dev/null) || { jlog apply "$id" 11 "sessoes-ilegiveis"; die 11 "não consegui listar as sessões — fica no mini"; }
+  live=$(printf '%s' "$sess" | jq -r --arg t "$ROUTE" --arg a "$ALIAS" 'if type=="object" and (.sessions|type)=="array" then [.sessions[] | select(((.template // .Template // "") == $t) or ((.alias // .Alias // "") == $a)) | select(.closed != true) | select((.state // .State // "") | test("closed|stopped|archived|drained") | not)] | length else "x" end' 2>/dev/null)
   case "$live" in 0) ;; ''|x|*[!0-9]*) jlog apply "$id" 11 "sessoes-ilegiveis"; die 11 "lista de sessões ilegível — fica no mini" ;; *) jlog apply "$id" 12 "sessao-viva n=$live"; die 12 "já há $live sessão(ões) de $ROUTE/$ALIAS — slot do nó ocupado" ;; esac
   if [ "$dry" = 1 ]; then jlog apply "$id" 0 "dry-run: iria para $ALIAS ($b)"; say "dry-run: $id iria para $ALIAS (base=$b); nada foi escrito"; printf '%s\n' "$out"; exit 0; fi
   T "$BD" -C "$store" update "$id" --if-assignee "" --if-status open --assignee "$ALIAS" --status in_progress --set-metadata "gc.routed_to=$ROUTE" -q >/dev/null 2>&1; w=$?
