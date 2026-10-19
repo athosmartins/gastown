@@ -2,7 +2,7 @@
 
 ## Contents
 
-• O que é · Como ler o número · Avisar o Mayor · Instalar · Provar · Medido, inferido, não testado
+• O que é · Como ler o número · Avisar o Mayor (fatia 2) · Instalar (Mayor, depois do merge) · Provar · Medido, inferido, não testado
 
 Beads ga-2hd02v.1.12 (fatia 1) e ga-2hd02v.1.15 (fatia 2), filhas da ga-2hd02v.1. Regra do Athos (14/10): "Hetzner pago trabalha sempre". Cobre a **fatia 1 (MEDIR)** e a **fatia 2 (AVISAR o Mayor: nó ocioso com fila aprovada)**. **Mergeado ≠ vivo: nada aqui está instalado, e o aviso nasce DESLIGADO.**
 
