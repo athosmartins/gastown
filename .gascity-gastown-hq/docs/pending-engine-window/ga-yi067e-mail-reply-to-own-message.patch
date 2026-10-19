@@ -1,0 +1,529 @@
+diff --git a/cmd/gc/cmd_mail.go b/cmd/gc/cmd_mail.go
+index 89feac563..d97ccec28 100644
+--- a/cmd/gc/cmd_mail.go
++++ b/cmd/gc/cmd_mail.go
+@@ -1588,6 +1588,8 @@ func newMailReplyCmd(stdout, stderr io.Writer) *cobra.Command {
+ 		Use:   "reply <id> [-s subject] [-m body]",
+ 		Short: "Reply to a message",
+ 		Long: `Reply to a message. The reply is addressed to the original sender.
++If you sent the original yourself, the reply is a follow-up addressed to its
++recipient instead.
+ 
+ Inherits the thread ID from the original message for conversation tracking.
+ Use --notify to nudge the recipient after replying.
+diff --git a/docs/reference/cli.md b/docs/reference/cli.md
+index 9652247e5..0f6ea0300 100644
+--- a/docs/reference/cli.md
++++ b/docs/reference/cli.md
+@@ -1914,6 +1914,8 @@ gc mail read <id> [flags]
+ ## gc mail reply
+ 
+ Reply to a message. The reply is addressed to the original sender.
++If you sent the original yourself, the reply is a follow-up addressed to its
++recipient instead.
+ 
+ Inherits the thread ID from the original message for conversation tracking.
+ Use --notify to nudge the recipient after replying.
+diff --git a/internal/mail/beadmail/beadmail.go b/internal/mail/beadmail/beadmail.go
+index 9e041c3cd..74c9a8e9d 100644
+--- a/internal/mail/beadmail/beadmail.go
++++ b/internal/mail/beadmail/beadmail.go
+@@ -460,24 +460,14 @@ func (p *Provider) Check(recipient string) ([]mail.Message, error) {
+ 
+ // Reply creates a reply to an existing message. Inherits ThreadID from the
+ // original, sets ReplyTo to the original's ID. Reply is addressed to the
+-// original sender.
++// original sender, except when the replier IS the original sender: replying to
++// your own message is a follow-up in the same thread, so it goes to the
++// original's recipient (addressing it to the sender would mail yourself).
+ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
+ 	original, err := p.store.Get(id)
+ 	if err != nil {
+ 		return mail.Message{}, fmt.Errorf("beadmail reply: %w", err)
+ 	}
+-	toSessionID := strings.TrimSpace(original.Metadata[fromSessionIDMetadataKey])
+-	to := toSessionID
+-	if to == "" {
+-		to = strings.TrimSpace(original.From)
+-	}
+-	if to == "" {
+-		return mail.Message{}, fmt.Errorf("beadmail reply: original message %s has no sender to reply to", id)
+-	}
+-	toDisplay := strings.TrimSpace(original.Metadata[fromDisplayMetadataKey])
+-	if toDisplay == "" {
+-		toDisplay = strings.TrimSpace(original.From)
+-	}
+ 	from, metadata, err := p.resolveSenderRoute(from)
+ 	if err != nil {
+ 		return mail.Message{}, fmt.Errorf("beadmail reply: %w", err)
+@@ -485,11 +475,42 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
+ 	if metadata == nil {
+ 		metadata = make(map[string]string)
+ 	}
+-	if toSessionID != "" {
+-		metadata[toSessionIDMetadataKey] = toSessionID
+-	}
+-	if toDisplay != "" {
++
++	var to string
++	if replierIsOriginalSender(from, metadata, original) {
++		// A follow-up to your own message goes where the original went, with the
++		// same stable route the original was stored with.
++		to = strings.TrimSpace(original.Assignee)
++		if to == "" {
++			return mail.Message{}, fmt.Errorf("beadmail reply: original message %s was sent by the replier and has no recipient to follow up with", id)
++		}
++		if toSessionID := strings.TrimSpace(original.Metadata[toSessionIDMetadataKey]); toSessionID != "" {
++			metadata[toSessionIDMetadataKey] = toSessionID
++		}
++		toDisplay := strings.TrimSpace(original.Metadata[toDisplayMetadataKey])
++		if toDisplay == "" {
++			toDisplay = to
++		}
+ 		metadata[toDisplayMetadataKey] = toDisplay
++	} else {
++		toSessionID := strings.TrimSpace(original.Metadata[fromSessionIDMetadataKey])
++		to = toSessionID
++		if to == "" {
++			to = strings.TrimSpace(original.From)
++		}
++		if to == "" {
++			return mail.Message{}, fmt.Errorf("beadmail reply: original message %s has no sender to reply to", id)
++		}
++		toDisplay := strings.TrimSpace(original.Metadata[fromDisplayMetadataKey])
++		if toDisplay == "" {
++			toDisplay = strings.TrimSpace(original.From)
++		}
++		if toSessionID != "" {
++			metadata[toSessionIDMetadataKey] = toSessionID
++		}
++		if toDisplay != "" {
++			metadata[toDisplayMetadataKey] = toDisplay
++		}
+ 	}
+ 
+ 	threadID := extractLabel(original.Labels, "thread:")
+@@ -503,7 +524,7 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
+ 		Title:       deriveReplyTitle(subject, original.Title, body),
+ 		Description: body,
+ 		Type:        "message",
+-		Assignee:    to, // reply goes back to sender
++		Assignee:    to, // original sender, or the original's recipient on a reply to your own message
+ 		From:        from,
+ 		Labels:      labels,
+ 		Metadata:    metadata,
+@@ -515,6 +536,27 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
+ 	return beadToMessage(b), nil
+ }
+ 
++// replierIsOriginalSender reports whether the replier sent the original
++// message. from and route are the replier's identity as returned by
++// resolveSenderRoute. The same stable session ID matches, and so does the same
++// display address (the alias can change or be reused across sessions, the
++// address is what readers see as "from"). A side with no identity never
++// matches: two blank senders are not the same sender.
++func replierIsOriginalSender(from string, route map[string]string, original beads.Bead) bool {
++	// vazio → no identity on that side, never a match; falhou/ilegível → n/a, plain field reads that cannot fail
++	replierSession := strings.TrimSpace(route[fromSessionIDMetadataKey])
++	originalSession := strings.TrimSpace(original.Metadata[fromSessionIDMetadataKey])
++	if replierSession != "" && replierSession == originalSession {
++		return true
++	}
++	replierAddress := strings.TrimSpace(from)
++	originalAddress := strings.TrimSpace(original.Metadata[fromDisplayMetadataKey])
++	if originalAddress == "" {
++		originalAddress = strings.TrimSpace(original.From)
++	}
++	return replierAddress != "" && replierAddress == originalAddress
++}
++
+ // deriveReplyTitle returns a non-empty title for a reply message. Callers
+ // that go through bd create fail validation ("title is required") if the
+ // reply's title is empty, so this fallback chain always returns a usable
+diff --git a/internal/mail/beadmail/beadmail_test.go b/internal/mail/beadmail/beadmail_test.go
+index 37bc3f979..a3bf156e0 100644
+--- a/internal/mail/beadmail/beadmail_test.go
++++ b/internal/mail/beadmail/beadmail_test.go
+@@ -1362,6 +1362,254 @@ func TestReply(t *testing.T) {
+ 	}
+ }
+ 
++func createReplySession(t *testing.T, store beads.Store, alias, sessionName string) beads.Bead {
++	t.Helper()
++	b, err := store.Create(beads.Bead{
++		Type:   session.BeadType,
++		Labels: []string{session.LabelSession},
++		Metadata: map[string]string{
++			"alias":        alias,
++			"session_name": sessionName,
++		},
++	})
++	if err != nil {
++		t.Fatalf("Create session %q: %v", alias, err)
++	}
++	return b
++}
++
++// TestReplyToOwnMessageGoesToOriginalRecipient pins ga-yi067e: replying to a
++// message the replier sent must continue the thread to the person the original
++// was addressed to. Addressing it to the original sender made from == to.
++func TestReplyToOwnMessageGoesToOriginalRecipient(t *testing.T) {
++	store := beads.NewMemStore()
++	p := New(store)
++
++	sent, err := p.Send("alice", "bob", "Hello", "first message")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	reply, err := p.Reply(sent.ID, "alice", "", "follow-up")
++	if err != nil {
++		t.Fatalf("Reply: %v", err)
++	}
++	if reply.To != "bob" {
++		t.Errorf("Reply To = %q, want %q (original recipient)", reply.To, "bob")
++	}
++	if reply.From != "alice" {
++		t.Errorf("Reply From = %q, want %q", reply.From, "alice")
++	}
++	if reply.ThreadID != sent.ThreadID {
++		t.Errorf("Reply ThreadID = %q, want %q (inherited)", reply.ThreadID, sent.ThreadID)
++	}
++	if reply.ReplyTo != sent.ID {
++		t.Errorf("Reply ReplyTo = %q, want %q", reply.ReplyTo, sent.ID)
++	}
++	b, err := store.Get(reply.ID)
++	if err != nil {
++		t.Fatalf("Get reply: %v", err)
++	}
++	if b.Assignee != "bob" {
++		t.Errorf("reply bead Assignee = %q, want %q", b.Assignee, "bob")
++	}
++	aliceInbox, err := p.Inbox("alice")
++	if err != nil {
++		t.Fatalf("Inbox(alice): %v", err)
++	}
++	if len(aliceInbox) != 0 {
++		t.Errorf("Inbox(alice) = %#v, want empty: the follow-up must not land in the replier's own inbox", aliceInbox)
++	}
++	bobInbox, err := p.Inbox("bob")
++	if err != nil {
++		t.Fatalf("Inbox(bob): %v", err)
++	}
++	if len(bobInbox) != 2 {
++		t.Errorf("Inbox(bob) = %d messages, want original and follow-up", len(bobInbox))
++	}
++}
++
++// TestReplyToOwnMessageMatchesBySessionIDAcrossAliasRename covers the
++// from_session_id half of the match: the replier's display alias changed since
++// the original was sent, so only the stable session ID shows it is the same
++// sender.
++func TestReplyToOwnMessageMatchesBySessionIDAcrossAliasRename(t *testing.T) {
++	store := beads.NewMemStore()
++	p := New(store)
++
++	witness := createReplySession(t, store, "old-witness", "witness-gc-1")
++	original, err := p.Send("old-witness", "mayor", "Status", "first")
++	if err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++	if err := store.SetMetadataBatch(witness.ID, session.UpdatedAliasMetadata(witness.Metadata, "new-witness")); err != nil {
++		t.Fatalf("SetMetadataBatch(alias rename): %v", err)
++	}
++
++	reply, err := p.Reply(original.ID, "new-witness", "", "second")
++	if err != nil {
++		t.Fatalf("Reply: %v", err)
++	}
++	if reply.To != "mayor" {
++		t.Fatalf("Reply To = %q, want %q (original recipient)", reply.To, "mayor")
++	}
++	if reply.From != "new-witness" {
++		t.Fatalf("Reply From = %q, want %q", reply.From, "new-witness")
++	}
++}
++
++// TestReplyToOwnMessageMatchesByDisplayWhenOriginalHasNoSessionRoute covers the
++// resolved-from-route half of the match: the original was sent before the
++// sender had a session (so it carries no from_session_id), and the replier now
++// resolves to one. The display address is the only thing both sides share.
++func TestReplyToOwnMessageMatchesByDisplayWhenOriginalHasNoSessionRoute(t *testing.T) {
++	store := beads.NewMemStore()
++	p := New(store)
++
++	original, err := p.Send("witness", "mayor", "Status", "first")
++	if err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++	createReplySession(t, store, "witness", "witness-gc-1")
++
++	reply, err := p.Reply(original.ID, "witness", "", "second")
++	if err != nil {
++		t.Fatalf("Reply: %v", err)
++	}
++	if reply.To != "mayor" {
++		t.Fatalf("Reply To = %q, want %q (original recipient)", reply.To, "mayor")
++	}
++}
++
++// TestReplyToOwnReplyKeepsSessionRouteOfOriginalRecipient replies twice in a
++// row: the second reply answers the replier's own first reply, so it has to go
++// to the same person, carrying that person's stable session route.
++func TestReplyToOwnReplyKeepsSessionRouteOfOriginalRecipient(t *testing.T) {
++	store := beads.NewMemStore()
++	p := New(store)
++
++	alice := createReplySession(t, store, "alice", "alice-gc-1")
++	createReplySession(t, store, "bob", "bob-gc-1")
++
++	sent, err := p.Send("alice", "bob", "Hello", "first")
++	if err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++	first, err := p.Reply(sent.ID, "bob", "", "first reply")
++	if err != nil {
++		t.Fatalf("first Reply: %v", err)
++	}
++	if first.To != "alice" {
++		t.Fatalf("first Reply To = %q, want %q", first.To, "alice")
++	}
++
++	second, err := p.Reply(first.ID, "bob", "", "second reply")
++	if err != nil {
++		t.Fatalf("second Reply: %v", err)
++	}
++	if second.To != "alice" {
++		t.Fatalf("second Reply To = %q, want %q (the person bob already wrote to)", second.To, "alice")
++	}
++	if second.From != "bob" {
++		t.Fatalf("second Reply From = %q, want %q", second.From, "bob")
++	}
++	b, err := store.Get(second.ID)
++	if err != nil {
++		t.Fatalf("Get second reply: %v", err)
++	}
++	if b.Assignee != alice.ID {
++		t.Errorf("second reply Assignee = %q, want alice's stable session ID %q", b.Assignee, alice.ID)
++	}
++	if b.Metadata[toSessionIDMetadataKey] != alice.ID {
++		t.Errorf("second reply %s = %q, want %q", toSessionIDMetadataKey, b.Metadata[toSessionIDMetadataKey], alice.ID)
++	}
++	if b.Metadata[toDisplayMetadataKey] != "alice" {
++		t.Errorf("second reply %s = %q, want %q", toDisplayMetadataKey, b.Metadata[toDisplayMetadataKey], "alice")
++	}
++	aliceInbox, err := p.Inbox("alice")
++	if err != nil {
++		t.Fatalf("Inbox(alice): %v", err)
++	}
++	if len(aliceInbox) != 2 {
++		t.Errorf("Inbox(alice) = %d messages, want both replies from bob", len(aliceInbox))
++	}
++}
++
++// TestReplyToOwnMessageWithoutRecipientFailsLoudly: if the original has no
++// recipient there is nobody to follow up with, and sending to self is the bug
++// being fixed. The reply must fail and create nothing.
++func TestReplyToOwnMessageWithoutRecipientFailsLoudly(t *testing.T) {
++	store := beads.NewMemStore()
++	p := New(store)
++
++	original, err := store.Create(beads.Bead{
++		Title:       "Orphan",
++		Description: "no recipient",
++		Type:        "message",
++		From:        "alice",
++		Labels:      []string{"thread:thread-orphan"},
++	})
++	if err != nil {
++		t.Fatalf("Create original: %v", err)
++	}
++
++	_, err = p.Reply(original.ID, "alice", "", "follow-up")
++	if err == nil {
++		t.Fatal("Reply to own message with no recipient succeeded, want error")
++	}
++	if !strings.Contains(err.Error(), "no recipient") {
++		t.Errorf("Reply error = %q, want it to say the original has no recipient", err)
++	}
++	// Replies are ephemeral (wisp tier) and the original is not, so only a
++	// both-tiers read can see a reply that should not have been created.
++	messages, err := store.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth})
++	if err != nil {
++		t.Fatalf("List messages: %v", err)
++	}
++	if len(messages) != 1 {
++		t.Errorf("open messages = %d, want 1 (the original only; a failed reply must not create one)", len(messages))
++	}
++}
++
++// TestReplyToSelfAddressedMessageStaysSelfAddressed: a note the sender really
++// addressed to themselves is a self-thread on purpose, so its follow-up goes to
++// the same place instead of erroring.
++func TestReplyToSelfAddressedMessageStaysSelfAddressed(t *testing.T) {
++	store := beads.NewMemStore()
++	p := New(store)
++
++	note, err := p.Send("alice", "alice", "Note to self", "remember")
++	if err != nil {
++		t.Fatal(err)
++	}
++	reply, err := p.Reply(note.ID, "alice", "", "also remember")
++	if err != nil {
++		t.Fatalf("Reply: %v", err)
++	}
++	if reply.To != "alice" {
++		t.Errorf("Reply To = %q, want %q", reply.To, "alice")
++	}
++}
++
++// TestReplyFromOtherSenderStillGoesToOriginalSender is the control: when the
++// replier is not the original sender, nothing about the old routing changes.
++func TestReplyFromOtherSenderStillGoesToOriginalSender(t *testing.T) {
++	store := beads.NewMemStore()
++	p := New(store)
++
++	sent, err := p.Send("alice", "bob", "Hello", "first")
++	if err != nil {
++		t.Fatal(err)
++	}
++	reply, err := p.Reply(sent.ID, "carol", "", "cc'd in")
++	if err != nil {
++		t.Fatalf("Reply: %v", err)
++	}
++	if reply.To != "alice" {
++		t.Errorf("Reply To = %q, want %q (original sender)", reply.To, "alice")
++	}
++}
++
+ // TestReplyDerivesSubjectFromOriginal ensures an empty subject is replaced
+ // with "Re: <original-subject>", so underlying stores that require a
+ // non-empty title (e.g. BdStore → `bd create`) don't reject the reply.
+diff --git a/internal/mail/fake.go b/internal/mail/fake.go
+index e9520880d..9b8374625 100644
+--- a/internal/mail/fake.go
++++ b/internal/mail/fake.go
+@@ -234,6 +234,17 @@ func (f *Fake) Reply(id, from, subject, body string) (Message, error) {
+ 		return Message{}, fmt.Errorf("replying to %q: %w", id, ErrNotFound)
+ 	}
+ 
++	// Reply goes to the original sender; replying to your own message is a
++	// follow-up to its recipient instead (same rule as beadmail, ga-yi067e).
++	// vazio → a blank replier or sender never counts as "the same sender"; falhou/ilegível → n/a, plain field reads
++	to := original.msg.From
++	if from != "" && from == original.msg.From {
++		to = original.msg.To
++		if to == "" {
++			return Message{}, fmt.Errorf("replying to %q: original was sent by the replier and has no recipient to follow up with", id)
++		}
++	}
++
+ 	threadID := original.msg.ThreadID
+ 	if threadID == "" {
+ 		threadID = fakeThreadID()
+@@ -243,7 +254,7 @@ func (f *Fake) Reply(id, from, subject, body string) (Message, error) {
+ 	m := Message{
+ 		ID:        fmt.Sprintf("fake-%d", f.seq),
+ 		From:      from,
+-		To:        original.msg.From, // reply to sender
++		To:        to,
+ 		Subject:   subject,
+ 		Body:      body,
+ 		CreatedAt: time.Now(),
+diff --git a/internal/mail/fake_reply_test.go b/internal/mail/fake_reply_test.go
+new file mode 100644
+index 000000000..f3a3421b7
+--- /dev/null
++++ b/internal/mail/fake_reply_test.go
+@@ -0,0 +1,74 @@
++package mail_test
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/gastownhall/gascity/internal/mail"
++)
++
++// TestFakeReplyToOwnMessageGoesToOriginalRecipient mirrors the beadmail rule
++// (ga-yi067e) so tests that use the fake see the same addressing as production:
++// replying to a message you sent continues the thread to its recipient instead
++// of addressing the reply to yourself.
++func TestFakeReplyToOwnMessageGoesToOriginalRecipient(t *testing.T) {
++	f := mail.NewFake()
++	sent, err := f.Send("alice", "bob", "Hello", "first")
++	if err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++
++	reply, err := f.Reply(sent.ID, "alice", "RE: Hello", "follow-up")
++	if err != nil {
++		t.Fatalf("Reply: %v", err)
++	}
++	if reply.To != "bob" {
++		t.Errorf("Reply To = %q, want %q (original recipient)", reply.To, "bob")
++	}
++	if reply.From != "alice" {
++		t.Errorf("Reply From = %q, want %q", reply.From, "alice")
++	}
++	if reply.ThreadID != sent.ThreadID || reply.ReplyTo != sent.ID {
++		t.Errorf("Reply thread/reply-to = %q/%q, want %q/%q", reply.ThreadID, reply.ReplyTo, sent.ThreadID, sent.ID)
++	}
++}
++
++func TestFakeReplyToOtherSendersMessageStillGoesToSender(t *testing.T) {
++	f := mail.NewFake()
++	sent, err := f.Send("alice", "bob", "Hello", "first")
++	if err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++	reply, err := f.Reply(sent.ID, "bob", "RE: Hello", "reply")
++	if err != nil {
++		t.Fatalf("Reply: %v", err)
++	}
++	if reply.To != "alice" {
++		t.Errorf("Reply To = %q, want %q (original sender)", reply.To, "alice")
++	}
++}
++
++// TestFakeReplyToOwnMessageWithoutRecipientFails: nobody to follow up with, so
++// the reply errors instead of being sent to the replier.
++func TestFakeReplyToOwnMessageWithoutRecipientFails(t *testing.T) {
++	f := mail.NewFake()
++	sent, err := f.Send("alice", "", "Orphan", "no recipient")
++	if err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++
++	_, err = f.Reply(sent.ID, "alice", "RE: Orphan", "follow-up")
++	if err == nil {
++		t.Fatal("Reply to own message with no recipient succeeded, want error")
++	}
++	if !strings.Contains(err.Error(), "no recipient") {
++		t.Errorf("Reply error = %q, want it to say the original has no recipient", err)
++	}
++	thread, err := f.Thread(sent.ThreadID)
++	if err != nil {
++		t.Fatalf("Thread: %v", err)
++	}
++	if len(thread) != 1 {
++		t.Errorf("thread = %d messages, want 1 (a failed reply must not be recorded)", len(thread))
++	}
++}
+diff --git a/internal/mail/mail.go b/internal/mail/mail.go
+index 05a240e39..efe03b46a 100644
+--- a/internal/mail/mail.go
++++ b/internal/mail/mail.go
+@@ -108,7 +108,11 @@ type Provider interface {
+ 	Check(recipient string) ([]Message, error)
+ 
+ 	// Reply creates a reply to an existing message. Inherits ThreadID
+-	// from the original, sets ReplyTo to the original's ID.
++	// from the original, sets ReplyTo to the original's ID. The reply is
++	// addressed to the original sender; when from IS the original sender it
++	// is a follow-up addressed to the original's recipient instead (and
++	// fails if the original has none). Providers that delegate addressing to
++	// an external script (exec) leave that rule to the script.
+ 	Reply(id, from, subject, body string) (Message, error)
+ 
+ 	// Thread returns all messages sharing a thread ID, ordered by time.
