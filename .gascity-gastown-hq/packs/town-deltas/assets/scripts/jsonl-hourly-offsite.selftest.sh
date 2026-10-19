@@ -103,6 +103,7 @@ echo "$*" >> "${NOTIFY_LOG%.log}.pushed"
 STUB
 chmod +x "$WORK/bin/notify"
 mkdir -p "$WORK/gitbin"; printf '#!/bin/bash\ncase " $* " in *" diff "*) [ -n "${GIT_FAIL_DIFF:-}" ] && exit 128 ;; esac\nexec %s "$@"\n' "$(command -v git)" > "$WORK/gitbin/git"; chmod +x "$WORK/gitbin/git"   # git que falha só no diff (GIT_FAIL_DIFF=1)
+mkdir -p "$WORK/jqbin"; printf '#!/bin/bash\ncase " $* " in *.manifest_key*) [ -n "${JQ_FAIL_MKEY:-}" ] && { echo "jq: error: injected" >&2; exit 5; } ;; esac\nexec %s "$@"\n' "$(command -v jq)" > "$WORK/jqbin/jq"; chmod +x "$WORK/jqbin/jq"   # jq que falha só ao LER .manifest_key, não ao montá-lo no latest.json (JQ_FAIL_MKEY=1)
 # helper embrulhado (JHO_PY): repassa tudo ao real; WRAP=db_string estraga .databases do manifest, WRAP=retention_fail derruba o `retention`
 cat > "$WORK/bin/wrap.py" <<WRAP
 import json, os, subprocess, sys
@@ -293,6 +294,21 @@ NOW_OFF=6300; inject fail_get "latest.json"
 offsite
 eq "latest.json que existe mas o S3 não devolve: baseline unavailable, não 'sem anterior' (none é só do 1º run)" "$RC:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:unavailable"
 clear_inject fail_get
+
+echo "-- 6c. latest.json que não entrega a chave do manifest anterior => régua indisponível, snapshot sobe mesmo assim (ga-l6v576)"; new_env mkey
+write_comments hq 400; commit_all "hq com 400 comentários"
+NOW_OFF=0; offsite
+write_comments hq 410; commit_all "410"
+NOW_OFF=700; JQ_FAIL_MKEY=1 PATH="$WORK/jqbin:$PATH" offsite
+eq "jq falha ao ler manifest_key do latest.json: rc 0, ok new, baseline unavailable (não 'none')" "$RC:${OUT%% key=*}:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:RESULT: ok new:unavailable"
+grep -q 'AVISO: sem régua: .*manifest_key' "$S/log/offsite.log" && ok "e o log diz que a régua faltou por causa do manifest_key" || bad "log sem o aviso de manifest_key: $(tail -4 "$S/log/offsite.log")"
+write_comments hq 420; commit_all "420"
+jq 'del(.manifest_key)' "$(LATEST)" > "$S/l2.json" && cp "$S/l2.json" "$(LATEST)"
+NOW_OFF=1400; offsite
+eq "latest.json sem a chave manifest_key: rc 0, ok new, baseline unavailable" "$RC:${OUT%% key=*}:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:RESULT: ok new:unavailable"
+write_comments hq 430; commit_all "430"
+NOW_OFF=2100; offsite
+eq "com latest.json de novo inteiro (o run anterior o republicou): a régua volta, baseline compared" "$RC:$(jqf .baseline.state "$(MANOF "$(ARTKEY)")")" "0:compared"
 
 echo "-- 7. banco obrigatório ausente"; new_env nodb; REQ="hq,wa,fantasma"
 NOW_OFF=0; offsite

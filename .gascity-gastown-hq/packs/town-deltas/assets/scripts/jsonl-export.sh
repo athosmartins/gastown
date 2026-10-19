@@ -1302,11 +1302,13 @@ read_table_pages() {
             query="SELECT * FROM \`$db\`.\`$table\`"
         fi
         if ! dolt_sql -r json -q "$query" > "$base.p$n" 2>>"$base.err"; then
+            # third-state-waiver: a falha já foi decidida pelo rc do dolt acima; este tail só monta o texto do log (vazio se o .err sumiu)
             echo "jsonl-export: reading $db.$table failed (page $n; dolt exited non-zero): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
             return 1
         fi
         # vazio (a 0-byte page) → an error, not a table with no rows: Dolt prints {} for that
         if ! rows=$(jq -s -r 'if length == 0 then error("empty page") else ((.[0].rows // []) | length) end' "$base.p$n" 2>/dev/null); then
+            # third-state-waiver: a falha já foi decidida pelo status do jq acima; este tail só monta o texto do log (vazio se o .err sumiu)
             echo "jsonl-export: reading $db.$table returned an unreadable document (page $n): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
             return 1
         fi
@@ -1391,6 +1393,7 @@ export_supplemental_table() {
                     return "$rc"
                     ;;
                 *)
+                    # third-state-waiver: o export curto já foi decidido pelas três leituras de contagem acima; este tail só monta o texto do log (vazio se o .err sumiu)
                     echo "jsonl-export: export curto de $db.$table: $SUPP_RAW_ROWS vs fonte ${before:-?}/${after:-?} (tentativa $attempt/$SUPP_EXPORT_ATTEMPTS): $(tail -c 300 "$base.err" | tr '\n' ' ')" >&2
                     ;;
             esac

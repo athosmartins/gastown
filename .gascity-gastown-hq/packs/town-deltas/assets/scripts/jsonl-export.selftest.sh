@@ -132,7 +132,9 @@ cat > "$E2E/scripts/dolt-target.sh" <<'STUB'
 #   STUB_LOSE_<t>   the last N rows are never returned, however the table is read (a cut paging cannot cure)
 #   STUB_FLAKY_<t>  the first N reads of the table (from offset 0) come back 128 rows short, later ones whole
 #   STUB_FAIL_<t>   1 = a read prints part of the document and exits 1
+#   STUB_GARBAGE_<t> doc = a read prints a document cut off mid-way and exits 0 (the dolt that lies about its rc); empty = a read prints nothing and exits 0
 # STUB_READ_CAP is the most rows one query returns (0 = no cap). STUB_PK is the table's primary key (id | none | ERR). E2E_READ_LOG gets one "READ <t> <offset> <limit>" per read.
+dolt_dies() { echo "stub: connection reset by peer" >&2; return 1; }   # a dolt that exits non-zero, with its reason on stderr
 re_supp_table='`wa`\.`?(comments|config|dependencies|labels|metadata)([^a-z_]|$)'
 stub_supp() {  # stub_supp <query> <table>
   local q="$1" tbl="$2" var rows lose flaky seen vis from to lim off cap cut=0
@@ -166,8 +168,13 @@ stub_supp() {  # stub_supp <query> <table>
   if [ "${!var:-0}" = "1" ]; then
     to=$(( from + 10 )); [ "$to" -le "$vis" ] || to="$vis"
     jq -n -c --arg t "$tbl" --argjson a "$from" --argjson b "$to" '{rows: [range($a;$b) | {id: "\($t)-\(.)", body: "text \(.)"}]}'
-    echo "stub: connection reset by peer" >&2; return 1
+    dolt_dies; return
   fi
+  var="STUB_GARBAGE_$tbl"
+  case "${!var:-}" in
+    doc) printf '{"rows":[{"id":"%s-0","bo' "$tbl"; return 0 ;;   # rc 0, but not a JSON document: the stream ended inside a string
+    empty) return 0 ;;                                            # rc 0, nothing on stdout
+  esac
   if [ "$to" -le "$from" ]; then printf '{}\n'; else
     jq -n -c --arg t "$tbl" --argjson a "$from" --argjson b "$to" '{rows: [range($a;$b) | {id: "\($t)-\(.)", body: "text \(.)"}]}'
   fi
@@ -679,7 +686,7 @@ attempts_of() { grep -c "^READ $1 0 " "$E2E_READ_LOG" 2>/dev/null || true; }   #
 supp_env_reset() {
   local x
   unset STUB_READ_CAP STUB_PK GC_JSONL_SUPP_CHUNK_ROWS
-  for x in $SUPP_TABLES_ALL; do unset "STUB_ROWS_$x" "STUB_COUNT_$x" "STUB_LOSE_$x" "STUB_FLAKY_$x" "STUB_FAIL_$x"; done
+  for x in $SUPP_TABLES_ALL; do unset "STUB_ROWS_$x" "STUB_COUNT_$x" "STUB_LOSE_$x" "STUB_FLAKY_$x" "STUB_FAIL_$x" "STUB_GARBAGE_$x"; done
 }
 supp_env_reset
 
@@ -793,6 +800,28 @@ case "$OUT" in
   *) bad "failing read: the run summary does not name wa(comments). Output: $OUT" ;;
 esac
 supp_env_reset
+
+# Case 5b — dolt exits 0 but what it printed is not a JSON document (cut off mid-string, or nothing at all): the same as a failing read — the previous version stays, the run
+# is reported failed, and the log says the document was unreadable. An empty page is not "a table with no rows" (Dolt prints {} for that).
+for garbage in doc empty; do
+  fresh_archive "supp-garbage-$garbage"
+  export STUB_ROWS_comments=600 GC_JSONL_SUPP_CHUNK_ROWS=100
+  run_export 200 200
+  export "STUB_GARBAGE_comments=$garbage"
+  run_export 201 201
+  [ "$(supp_file_rows comments)" = "600" ] && [ "$(supp_head_rows comments)" = "600" ] \
+    && ok "unreadable document ($garbage, rc 0): the previous 600-row version stays" \
+    || bad "unreadable document ($garbage, rc 0): comments holds $(supp_file_rows comments) rows (HEAD $(supp_head_rows comments)), want 600"
+  case "$OUT" in
+    *"returned an unreadable document"*) ok "unreadable document ($garbage, rc 0): the log names the unreadable document" ;;
+    *) bad "unreadable document ($garbage, rc 0): the log does not say the document was unreadable: $OUT" ;;
+  esac
+  case "$OUT" in
+    *"failed: wa(comments)"*) ok "unreadable document ($garbage, rc 0): the run summary lists 'failed: wa(comments)'" ;;
+    *) bad "unreadable document ($garbage, rc 0): the run summary does not name wa(comments). Output: $OUT" ;;
+  esac
+  supp_env_reset
+done
 
 # Case 6 — the THIRD state: the table's COUNT(*) is unreadable, so nobody can say whether the export is whole. Not discarded (a store whose count query is down must not freeze its archive),
 # never silent: named in the log, the summary, the nudge and the commit message — the same four places as the unverified issues export.

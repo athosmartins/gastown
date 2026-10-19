@@ -315,7 +315,7 @@ elif [ $lrc -eq 0 ]; then
   if ! s3api get-object --bucket "$BUCKET" --key "$(s3key_latest)" "$WD/prev.latest.json" >/dev/null 2>&1; then BASE_WHY="latest.json existe e o S3 não o devolveu"
   else
     PREV_MKEY="$(jq -r '.manifest_key // empty' "$WD/prev.latest.json" 2>/dev/null)"
-    if [ -z "$PREV_MKEY" ]; then BASE_WHY="latest.json sem manifest_key"
+    if [ -z "$PREV_MKEY" ]; then BASE_WHY="latest.json sem manifest_key legível"   # jq falhou ou a chave não existe: os dois dão régua indisponível, nunca "sem anterior"
     elif ! s3api get-object --bucket "$BUCKET" --key "$PREV_MKEY" "$WD/prev.manifest.json" >/dev/null 2>&1; then BASE_WHY="o S3 não devolveu o manifest anterior ($PREV_MKEY)"
     fi
   fi
@@ -342,6 +342,7 @@ if [ "$VERDICT" != ok ] || [ $mrc -ne 0 ]; then
   # suspect = legível, mas uma tabela caiu contra o anterior sem explicação (em 18/10 o hq/comments saiu com 71% a menos e o manifest dizia ok): é o mesmo
   # veto do broken — NADA sobe, latest.json fica no último bom, conta para o alerta. Se a queda é de verdade (purga), quem opera roda UMA vez com JHO_ACCEPT_DROP=1.
   if [ "$VERDICT" = suspect ]; then
+    # third-state-waiver: o veredito suspect já foi decidido por jq -r .verdict acima; esta leitura só monta o texto do log (vazio no pior caso)
     fail "snapshot $STEM suspect ($(jq -r '.suspect | join("; ")' "$WD/manifest.json" | head -c 400)); NADA subiu, latest.json não andou; queda de verdade (purga)? rode uma vez com JHO_ACCEPT_DROP=1"
   fi
   fail "snapshot $STEM broken ($(jq -r '.problems | join("; ")' "$WD/manifest.json" | head -c 400)); NADA subiu, latest.json não andou"
@@ -363,6 +364,7 @@ ZERO='.consecutive_not_ok = 0 | '; [ -z "$SRC_WHY" ] || ZERO=""   # fonte parada
 state_update "$ZERO"'.attempt_open = false | .last_success_at = $t | .last_success_sha = $s | .last_success_key = $k | .last_success_bytes = $b | .last_success_data_as_of = $a' \
   --arg t "$(iso_now)" --arg s "$SHA" --arg k "$ART" --argjson b "$ART_BYTES" --arg a "$(jq -r '.data_as_of' "$WD/manifest.json")" || log "AVISO: estado não gravado"
 DUR=$(( $(now_epoch) - START ))
+# third-state-waiver: o snapshot já subiu e latest.json já andou; esta linha só monta o texto do log, e o estado (régua) vem do manifest já validado acima
 log "OK $STEM: $ART_BYTES bytes, $(jq -r '[.databases | to_entries[] | .value.issues] | add' "$WD/manifest.json") issues em $(jq -r '.databases | length' "$WD/manifest.json") bancos (ignorados: $(jq -r '.ignored_dbs | join(",") | if . == "" then "nenhum" else . end' "$WD/manifest.json")), régua: $(jq -r '.baseline.state' "$WD/manifest.json"), ${DUR}s"
 
 # ── retenção (falha aqui é aviso: o snapshot novo já está seguro) ────────────────────────────────────
