@@ -18,7 +18,9 @@ ok() {
   n=$((n+1))
   if [ "$1" = 0 ]; then echo "ok   $2"; return; fi
   echo "FAIL $2"; fails=$((fails+1)); [ -s "$T/err" ] && echo "     (último stderr: $(head -c 300 "$T/err" | tr '\n' ' '))"
-  if [ -n "${FAILFAST:-}" ]; then echo "FAILFAST: parei no 1º caso que reprovou ($n casos rodados)"; exit 1; fi  # para a campanha de mutantes: reprovar UM caso já mata o mutante
+  # FAILFAST_IGNORE (regex, opcional): casos que reprovam por causa do AMBIENTE (no Linux do servidor: "pedido grande demais", "JSON aninhado fundo demais", "o log é 0600", "sem a separação"),
+  # não do mutante, não param a campanha: sem isso o 1º FAIL de ambiente (linha ~209) mata toda rodada antes de ela chegar nos casos que o mutante deveria reprovar
+  if [ -n "${FAILFAST:-}" ] && ! { [ -n "${FAILFAST_IGNORE:-}" ] && printf '%s' "$2" | grep -qE -- "$FAILFAST_IGNORE"; }; then echo "FAILFAST: parei no 1º caso que reprovou ($n casos rodados)"; exit 1; fi  # para a campanha de mutantes: reprovar UM caso já mata o mutante
 }
 skip() { skipped=$((skipped+1)); echo "SKIP $1"; }
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
