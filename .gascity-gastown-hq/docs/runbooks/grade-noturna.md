@@ -6,6 +6,7 @@
 * O que a amostragem de RAM diz e o que NÃO diz
 * Medindo a pegada de RAM por job (`job-ram-probe.py`, ga-sh8t23.3)
 * Medição da noite de 17/10/2026 (noite 1 de 3) e o que ela decide
+* Coletor de RAM por job: sobrevive ao reboot e se encerra sozinho (ga-sh8t23.6)
 * Achados que a grade mostrou de graça
 * Limites · Como isto vira prova das fatias .2 e .3
 
@@ -82,7 +83,7 @@ Fonte: `.gc/ram-owner-samples.jsonl` (`ram-owner-sampler`, uma amostra a cada ~5
 
 ## Medindo a pegada de RAM por job (`job-ram-probe.py`, ga-sh8t23.3)
 
-O `ram-owner-sampler` agrupa por NOME DE PROCESSO a cada 5 min; a decisão de mover um horário precisa de **label do launchd → processo → pico de RSS**. `scripts/job-ram-probe.py` amostra de 5 em 5 s, soma o RSS da ÁRVORE de cada job (o processo que o launchd iniciou e os filhos; `launchctl list` dá label → PID, `ps` dá a árvore) e grava uma linha por amostra com swap, % livre e disco livre. Só lê o sistema; a única escrita é o arquivo de saída (teto de tamanho, piso de disco de 1 GB, instância única por arquivo).
+O `ram-owner-sampler` agrupa por NOME DE PROCESSO a cada 5 min; a decisão de mover um horário precisa de **label do launchd → processo → pico de RSS**. `scripts/job-ram-probe.py` amostra de 5 em 5 s, soma o RSS da ÁRVORE de cada job (o processo que o launchd iniciou e os filhos; `launchctl list` dá label → PID, `ps` dá a árvore) e grava uma linha por amostra com swap, % livre e disco livre. Só lê o sistema; a única escrita é o arquivo de saída (teto de tamanho, instância única por arquivo e DOIS pisos de disco: `--skip-free-gb N` não amostra abaixo de N GB, grava `pulado: disco` e segue; `--min-free-gb` (padrão 1 GB) PARA o probe).
 
 ```bash
 python3 -I $GC_CITY_PATH/scripts/job-ram-probe.py --start 03:30 --until 05:10 --out $GC_CITY_PATH/.gc/job-ram-probe-AAAAMMDD.jsonl   # uma noite (hora local)
@@ -92,12 +93,13 @@ bash scripts/job-ram-probe.selftest.sh                                          
 
 * O resumo traz: jobs da janela por pico da árvore (com o processo de maior RSS e quando), soma simultânea (`--big-mb`, padrão 150 MB = "de pico"), **saltos de swap** (`--swap-step`, 200 MB) com quem cresceu nos 60 s antes, quedas de disco (`--disk-step`, 300 MB) com os jobs rodando, e os persistentes (daemons KeepAlive) à parte.
 * **Buracos.** Duas amostras seguidas NO ARQUIVO não são necessariamente seguidas NO TEMPO (probe parado, máquina dormindo, e o resumo de várias noites junta 05:10 com 03:30 do dia seguinte: 22 h). O resumo só trata um par como adjacente se os dois pontos estão a no máximo `--max-gap` s (padrão: 3 x o passo mediano, 15 s para o passo de 5 s). Par mais distante NÃO vira salto de swap nem queda de disco; salto cuja janela de 60 s antes cruza um buraco sai "sem atribuição". O relatório conta e diz os buracos e quantos pares deixaram de ser avaliados. Com arquivos de mais de um dia os horários levam a data. A tabela de jobs mostra os `--top` maiores (padrão 40) e diz quantos ficaram de fora: use `--top 0` para ver todos (um job pequeno como o `drive-cleanup` não aparece no corte padrão, e linha ausente não quer dizer que o job não rodou).
+* **Disco baixo (`--skip-free-gb`, ga-sh8t23.6).** Abaixo do piso o probe grava `{"ts":…,"pulado":"disco","disk_free_mb":…}` a cada passo e volta a amostrar quando o disco volta; disco ilegível também pula (`disk_free_mb` null, não 0). O resumo conta essas linhas e diz de quando a quando (`AVISO: N amostra(s) NÃO tiradas por falta de disco livre`): nesse intervalo não há leitura, e um pico que caiu nele não aparece. `--ticks` conta só as amostras tiradas.
 * Três estados: `ps` ou `launchctl` que falham saem como `ps_ok:false`/`lc_ok:false` (RSS sem atribuição; **não** vira "nenhum job"), swap/% livre/disco que não li ficam `null` (não 0), linha ilegível é contada, arquivo vazio dá exit 3. Códigos: 0 · 2 uso (inclui `--ticks 0`, `--duration 0` e `--duration` junto de `--until`) · 3 não consegui ler/sem amostra (também: a gravação acabou sem nenhuma amostra) · 4 outra instância · 5 teto de tamanho · 6 disco abaixo do piso.
 * **Limites**: job que dura menos que 5 s pode passar entre duas amostras; processo que se desanexa do job sai da árvore; a soma de RSS conta página compartilhada uma vez por processo (superestima); RSS é o residente (o que já foi pro swap não aparece nele, por isso o salto de swap é lido à parte); a causa de um salto é INDÍCIO. Com a máquina saturada (load 90 após o boot de 17/10) uma amostra custou 1,4 s (mediana; `dt_ms` vem gravado), o que não é o passo de 5 s mas o aproxima: o resumo diz o passo mediano real.
 
 ## Medição da noite de 17/10/2026 (noite 1 de 3) e o que ela decide
 
-Probe de 03:30 a 05:10 (-03), 1176 amostras, passo mediano 5 s, custo mediano de uma amostra 835 ms (máx 4,3 s, máquina saturada pós-boot: load 58), **todas** com ps e launchctl lidos (0 sem atribuição). Arquivo: `.gc/job-ram-probe-20261017.jsonl`. **É uma noite**: a bead pede >= 3; as noites 18 e 19 serão gravadas pelo mesmo `.gc/job-ram-probe-run/loop.sh` e a conclusão abaixo vale até elas a contradizerem. **O loop original morreu às 05:26 de 17/10** (SIGTERM só no python; `loop.log`: `noite 20261018 rc=143`, seis minutos depois do `/gate-done` da sessão que o iniciou; a causa não foi confirmada, só a coincidência com o fim dela) e foi religado às 05:48 como job do launchd de execução única, `com.gascity.job-ram-probe-loop` (plist em `.gc/job-ram-probe-run/`, `RunAtLoad`, sem KeepAlive: `launchctl submit` reinicia o job a cada 10 s depois que ele sai, medido). Ele NÃO está em `~/Library/LaunchAgents`: não sobrevive a reboot ou logout, e a noite perdida aparece em `loop.log` (a ga-sh8t23.6 diz qual faltou). Estado: `launchctl list | grep job-ram-probe-loop`; parar: `launchctl bootout gui/$(id -u)/com.gascity.job-ram-probe-loop`. Enquanto roda, o próprio loop aparece nas amostras como um label persistente (alguns MB).
+Probe de 03:30 a 05:10 (-03), 1176 amostras, passo mediano 5 s, custo mediano de uma amostra 835 ms (máx 4,3 s, máquina saturada pós-boot: load 58), **todas** com ps e launchctl lidos (0 sem atribuição). Arquivo: `.gc/job-ram-probe-20261017.jsonl`. **É uma noite**: a bead pede >= 3. **As noites 18 e 19 NÃO foram gravadas** (medido em 19/10: só existe `job-ram-probe-20261017.jsonl`; `loop.log` tem 2 linhas). O loop original morreu às 05:26 de 17/10 (SIGTERM só no python; `loop.log`: `noite 20261018 rc=143`, seis minutos depois do `/gate-done` da sessão que o iniciou; a causa não foi confirmada, só a coincidência com o fim dela), e o religamento das 05:48 (job do launchd com o plist em `.gc/job-ram-probe-run/`, fora de `~/Library/LaunchAgents`) não sobrevive ao reboot: o mini reinicia toda noite às 23:41 (`last reboot`: 16, 17 e 18/10), então um processo lançado uma vez nunca chega à janela 03:30-05:10 do dia seguinte. A conclusão abaixo vale até as noites 20, 21 e 22/10 a contradizerem; quem as grava é o coletor da seção seguinte. Enquanto o probe roda, o próprio loop aparece nas amostras como um label persistente (alguns MB).
 
 | job das 04:00 | processo de maior RSS | pico da árvore | visto (duração) | decisão |
 |---|---|---|---|---|
@@ -112,7 +114,39 @@ Probe de 03:30 a 05:10 (-03), 1176 amostras, passo mediano 5 s, custo mediano de
 * **Quem tem pico de RAM na janela 03:50-04:50.** O limiar do probe (150 MB) não serve para esta pergunta: cada `gc` custa 150-200 MB e ele marca 60 dos 61 minutos. Com **>= 400 MB** ("de pico"), nas 706 amostras de 5 s entre 03:50 e 04:50: 41 minutos com ao menos 1 job de pico; **15 minutos em que 2 ou mais labels distintos passaram de 400 MB em algum instante do minuto**, e **11 amostras (em 7 minutos, todos entre 04:10 e 04:38) com 2 ou mais ao MESMO tempo**. Os donos são `city-health-sentinel` (`claude`, 560-880 MB, 17 minutos), `suavez-first-watch` (400-640 MB, 17 min) e `sv-age-refresh` (`build_street_view_age_layer`, até 960 MB, 04:10-04:25, 15 min); aparecem também `pilot` (799 MB às 04:31), `cadastro-dolt-coverage` (533), `lot-docs-index-daily` (442) e `lot-ficha-extra-projetos` (412). **Só o minuto 04:01 envolve um job das 04:00, e sem simultaneidade**: `city-health-sentinel` 881 MB às 04:01:03 (o `dolt-s3-backup` tinha 3 MB) e `dolt-s3-backup` 433 MB às 04:01:23 (o sentinel já tinha saído); nenhuma amostra tem os dois. Os dois maiores são jobs de intervalo (StartInterval): espalhar o relógio das 04:00 não os toca.
 * **Swap.** Três saltos de 200 MB ou mais na janela (04:24:37, 04:24:42, 04:33:53): indícios de `painel-visibilidade` (daemon), `city-health-sentinel` e `git pack-objects`; nenhum dos seis. No amostrador de 5 min houve +2,2 GB de swap em janelas entre 03:49 e 04:18 de 14, 15 e 16/10: ele não atribui, e sessões de worker estavam entre os maiores donos; esta noite o lote das 04:00 não mexeu no swap.
 * **Disco: aqui está o "disk critical".** Livre < 3 GB em duas janelas: **04:04:37-04:08:27 (235 s, mínimo 1499 MB)** e 04:23:10-04:23:56 (mínimo 2705 MB). A primeira é a fase `whatsapp_automation` do `dolt-s3-backup`: o log dele registra o reseed de 04:03:52 a 04:08:41 com "preciso ~4933MB (250%), livre 5535MB" (margem de ~600 MB antes do piso de 1 GB). A segunda coincide com o `sv-age-refresh` (indício, não prova: o probe mede o livre do volume, não escrita por job). O `dolt-disk-floor-guard` já estava abaixo do piso de 8 GB (livre 5 GB) e o reclaim dele às 04:03:50 não ganhou nada ("ZERO GAIN"). Mover os OUTROS cinco jobs não muda essa queda: ela é do próprio reseed (o reseed diário veio de ga-jz7gg).
-* **Conclusão desta noite:** nenhum horário muda por RAM. O que a medição aponta para o critério "disk critical zero por 7 dias" é o reseed diário da `whatsapp_automation` (e, depois dele, o `sv-age-refresh`), não o relógio das 04:00. Pendências: noites 18 e 19 (`--summary` sobre os 3 arquivos depois das 05:10 de 19/10) e a decisão sobre o reseed (bead à parte). O `claude-history-backup` fica fora da conta de "5 jobs" da bead: são 6.
+* **Conclusão desta noite:** nenhum horário muda por RAM. O que a medição aponta para o critério "disk critical zero por 7 dias" é o reseed diário da `whatsapp_automation` (e, depois dele, o `sv-age-refresh`), não o relógio das 04:00. Pendências: as noites 20, 21 e 22/10 (`--summary` sobre os 4 arquivos depois das 05:10 de 22/10; a ga-sh8t23.6 fecha com a tabela de 3 noites) e a decisão sobre o reseed (bead à parte). O `claude-history-backup` fica fora da conta de "5 jobs" da bead: são 6.
+
+## Coletor de RAM por job: sobrevive ao reboot e se encerra sozinho (ga-sh8t23.6)
+
+**Por que 3 noites e não 1.** O amostrador de 5 min viu +2,2 GB de swap nas janelas 04:00-04:18 de 14, 15 e 16/10 (3 de 3 noites); a única noite com o probe (17/10) deu +133 MB na mesma janela. A noite medida é a que NÃO reproduziu o sintoma, então "nenhum horário muda por RAM" com ela sozinha inverteria a evidência (decisão do Mayor em 19/10: opção 1, coletor que sobrevive ao reboot).
+
+**O que é.** `com.gascity.job-ram-probe-loop`: LaunchAgent em `~/Library/LaunchAgents` (`RunAtLoad`, **sem** `KeepAlive`) que roda `scripts/job-ram-probe-loop.sh`. A cópia versionada do plist está em `packs/town-deltas/assets/`. A cada boot o script recomeça sozinho, espera a janela e roda `job-ram-probe.py --start 03:30 --until 05:10 --interval 5 --max-mb 60 --min-free-gb 0.1 --skip-free-gb 3` (um arquivo `.gc/job-ram-probe-AAAAMMDD.jsonl` por noite). Cada volta é uma linha em `.gc/job-ram-probe-run/loop.log`: `<hora> noite AAAAMMDD rc=N [parcial]`.
+
+**Quando termina (as duas saídas apagam o plist, escrevem `fim: <motivo>` no loop.log e dão `launchctl bootout`):**
+
+* **4 noites completas** no `loop.log` (a de 17/10 + 3 novas). Conta só `rc=0` de uma volta que COMEÇOU antes das 04:00: o lote das 04:00 é o que a medição quer ver, e um plist instalado às 04:30 gravaria 40 min que não o cobrem. Essa volta fica `rc=0 parcial`, não conta, e o loop segue para a noite seguinte.
+* **Data-limite 23/10 05:30**, com ou sem as 4 noites: passou dela, ou a próxima noite acabaria (05:10) depois dela. É conferida a cada início, então, se o loop morrer antes, o 1º boot depois dela (o de 23/10 às 23:41, no pior caso) tira o agente. 6 falhas seguidas (`rc != 0`, retentativa a cada 5 min) fazem o script desistir SEM mexer no agente: o próximo boot tenta de novo.
+
+**Disco: o preço do piso de 3 GB.** Abaixo de 3 GB livres o coletor não amostra (grava `pulado: disco`). Na noite de 17/10 o reseed da `whatsapp_automation` levou o livre a **1499 MB entre 04:04:37 e 04:08:27**: se isso se repetir, o coletor fica cego esses ~4 minutos, DENTRO do lote das 04:00. O resumo diz quantas amostras foram puladas e de quando a quando; não leia "sem salto de swap" em 04:04-04:08 como "sem salto" se houver `AVISO: … NÃO tiradas por falta de disco livre` cobrindo esse intervalo. (A ga-sh8t23.5, que tratava o pico de disco do reseed, está fechada: se ele já não cai abaixo de 3 GB, não haverá puladas.)
+
+**Instalar (depois do merge) e provar que carregou:**
+
+```bash
+cp $GC_CITY_PATH/packs/town-deltas/assets/com.gascity.job-ram-probe-loop.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.job-ram-probe-loop.plist
+launchctl print gui/$(id -u)/com.gascity.job-ram-probe-loop | head -20      # rc 0 = carregado
+```
+
+**Ler (depois das 05:10 de 22/10) e provar a remoção:**
+
+```bash
+python3 -I $GC_CITY_PATH/scripts/job-ram-probe.py --summary $GC_CITY_PATH/.gc/job-ram-probe-2026*.jsonl --top 0
+cat $GC_CITY_PATH/.gc/job-ram-probe-run/loop.log                              # 'noite … rc=0' x4 e 'fim: …'
+launchctl print gui/$(id -u)/com.gascity.job-ram-probe-loop; echo rc=$?       # rc 113 = descarregado
+ls ~/Library/LaunchAgents/com.gascity.job-ram-probe-loop.plist                # 'No such file'
+```
+
+Parar antes da hora: `launchctl bootout gui/$(id -u)/com.gascity.job-ram-probe-loop && rm ~/Library/LaunchAgents/com.gascity.job-ram-probe-loop.plist`. Teste: `bash scripts/job-ram-probe-loop.selftest.sh` (hermético, com mutantes por guarda). O mecanismo de auto-remoção foi provado ao vivo em 19/10 com um rótulo descartável (`JRL_LABEL`, data-limite já vencida): `bootstrap` rc 0, o job rodou, apagou o próprio plist e deu `bootout`; `launchctl print` voltou 113.
 
 ## Achados que a grade mostrou de graça
 

@@ -26,8 +26,11 @@ BURACOS  Duas amostras SEGUIDAS NO ARQUIVO não são necessariamente seguidas no
   disco", e uma janela de 60 s que cruza um buraco NÃO atribui o salto a ninguém ("sem atribuição"); os buracos e os pares que deixaram de ser avaliados são CONTADOS e ditos no relatório.
 
 USO
-  job-ram-probe.py [--start HH:MM] [--until HH:MM | --duration S | --ticks N] [--interval S] [--out ARQ] [--max-mb N] [--min-free-gb N] [--check-every N] [--fixture-dir D]
+  job-ram-probe.py [--start HH:MM] [--until HH:MM | --duration S | --ticks N] [--interval S] [--out ARQ] [--max-mb N] [--min-free-gb N] [--skip-free-gb N] [--check-every N] [--fixture-dir D]
   job-ram-probe.py --summary ARQ... [--swap-step MB] [--big-mb MB] [--disk-step MB] [--max-gap S] [--top N]
+  --skip-free-gb N (ga-sh8t23.6): com menos de N GB livres o probe NÃO amostra e segue: grava `{"ts":…,"pulado":"disco","disk_free_mb":…}` a cada passo e volta a amostrar quando o disco volta (disco ilegível = pula também).
+  `--summary` conta essas linhas e diz de quando a quando: nesse intervalo não há leitura (um pico dentro dele NÃO aparece). `--min-free-gb` é o outro piso, mais baixo: abaixo dele o probe PARA (exit 6).
+  (`--ticks` conta só as amostras tiradas; sem `--until`/`--duration`, disco sempre baixo nunca termina.)
   Com --start espera até a hora (local); se já estiver dentro de [start, until] começa agora. Códigos: 0 · 2 uso errado · 3 não consegui ler/nenhuma amostra · 4 outra instância
   no mesmo arquivo · 5 arquivo passou do teto · 6 disco abaixo do piso. Gravação que não deixou nenhuma amostra também sai com 3 (nada gravado não é sucesso). A tabela do resumo mostra os
   `--top` maiores jobs (padrão 40; 0 = todos) e diz quantos ficaram de fora. Teste: `bash scripts/job-ram-probe.selftest.sh`.
@@ -198,10 +201,22 @@ def record(a):
         end = start + a.duration
     while time.time() < start:
         time.sleep(min(30.0, max(0.05, start - time.time())))
-    n = 0
+    n = skipped = lost = 0
+    skip_floor = a.skip_free_gb * 1024 ** 3
     with open(out, "a", encoding="utf-8") as f:
         while (end is None or time.time() < end) and (a.ticks is None or n < a.ticks):
             t0 = time.time()
+            # disco livre para amostrar: vazio não existe (a leitura sempre responde); falhou/ilegível (None) → pula, como abaixo do piso (sem saber o espaço, não amostro)
+            free_mb = disk_free_mb(outdir) if skip_floor else None
+            if skip_floor and (free_mb is None or free_mb * 1048576 < skip_floor):  # [guard:skip]
+                skipped += 1
+                try:
+                    f.write(json.dumps({"ts": int(t0), "pulado": "disco", "disk_free_mb": free_mb, "piso_mb": int(skip_floor / 1048576)}, separators=(",", ":")) + "\n")
+                    f.flush()
+                except OSError:  # nem a linha de aviso coube: contado e dito no fim; a lacuna aparece como buraco no resumo
+                    lost += 1
+                time.sleep(max(0.0, a.interval - (time.time() - t0)))
+                continue
             f.write(json.dumps(tick(n, a.fixture_dir, outdir), separators=(",", ":")) + "\n")
             f.flush()
             n += 1
@@ -213,6 +228,8 @@ def record(a):
                 return 6
             if not a.fixture_dir and not (a.ticks is not None and n >= a.ticks):
                 time.sleep(max(0.0, a.interval - (time.time() - t0)))
+    if skipped:
+        print(f"job-ram-probe: {skipped} amostra(s) puladas por disco livre abaixo de {a.skip_free_gb} GB ({lost} sem a linha 'pulado' no arquivo)", file=sys.stderr)
     if n == 0:  # a janela acabou antes da 1ª amostra (ex.: a máquina dormiu até depois do fim): arquivo vazio não é sucesso [guard:none-written]
         print(f"job-ram-probe: nenhuma amostra gravada em {out} (a janela acabou antes da primeira)", file=sys.stderr)
         return 3
@@ -220,8 +237,8 @@ def record(a):
 
 
 def load(paths):
-    """Amostras ordenadas e a contagem de linhas ilegíveis. Arquivo que não abre → OSError (exit 3); linha que não é JSON de amostra → contada em `bad`, nunca descartada em silêncio."""
-    recs, bad = [], 0
+    """Amostras ordenadas, a contagem de linhas ilegíveis e os instantes das linhas "pulado: disco". Arquivo que não abre → OSError (exit 3); linha que não é JSON de amostra → contada em `bad`, nunca descartada em silêncio."""
+    recs, bad, skipped = [], 0, []
     for p in paths:
         with open(p, encoding="utf-8") as f:
             for ln in f:
@@ -229,12 +246,15 @@ def load(paths):
                     continue
                 try:
                     r = json.loads(ln)
+                    if isinstance(r, dict) and isinstance(r.get("ts"), int) and r.get("pulado") == "disco":  # amostra NÃO tirada por falta de disco: não é amostra, nem lixo
+                        skipped.append(r["ts"])
+                        continue
                     if not (isinstance(r, dict) and isinstance(r.get("ts"), int) and isinstance(r.get("jobs"), dict)):
                         raise ValueError
                     recs.append(r)
                 except ValueError:
                     bad += 1  # [guard:bad]
-    return sorted(recs, key=lambda r: r["ts"]), bad
+    return sorted(recs, key=lambda r: r["ts"]), bad, sorted(skipped)
 
 
 def clock(ts):
@@ -292,7 +312,7 @@ def grew(recs, tss, b, limit):
     return sorted(gr, reverse=True)[:3]
 
 
-def summarize(recs, bad, swap_step, big_mb, disk_step, max_gap=None, top=40):
+def summarize(recs, bad, swap_step, big_mb, disk_step, max_gap=None, top=40, skipped=()):
     ok = [r for r in recs if r.get("ps_ok") and r.get("lc_ok")]
     no_ps = sum(1 for r in recs if not r.get("ps_ok"))
     no_lc = sum(1 for r in recs if not r.get("lc_ok"))
@@ -306,6 +326,8 @@ def summarize(recs, bad, swap_step, big_mb, disk_step, max_gap=None, top=40):
          f"custo da amostra: mediana {statistics.median(dts) if dts else 0:.0f} ms, máx {max(dts) if dts else 0} ms"]
     if no_ps or no_lc or bad:
         L.append(f"AVISO: {no_ps} amostras sem ps, {no_lc} sem launchctl (essas NÃO atribuem RAM a job), {bad} linhas ilegíveis: o que não li não está nas tabelas abaixo.")
+    if skipped:  # [guard:skipped]
+        L.append(f"AVISO: {len(skipped)} amostra(s) NÃO tiradas por falta de disco livre (de {at(skipped[0])} a {at(skipped[-1])}): nesse intervalo não há leitura de RAM nem de swap, e um pico que caiu nele NÃO aparece nas tabelas abaixo.")
     if holes:
         ha, hb = max(holes, key=lambda h: h[1]["ts"] - h[0]["ts"])
         L.append(f"AVISO: {len(holes)} buraco(s) entre amostras seguidas (passo > {limit:.0f} s), somando {dur(sum(y['ts'] - x['ts'] for x, y in holes))}; o maior: {dur(hb['ts'] - ha['ts'])}, de {at(ha['ts'])} a {at(hb['ts'])}. "
@@ -379,6 +401,7 @@ def main(argv=None):
     ap.add_argument("--max-mb", type=float, default=40.0)
     ap.add_argument("--check-every", type=int, default=12, help="amostras entre duas conferências do piso de disco")
     ap.add_argument("--min-free-gb", type=float, default=1.0)
+    ap.add_argument("--skip-free-gb", type=float, default=0.0, help="GB: com menos disco livre que isto NÃO amostra (grava só uma linha 'pulado: disco') e segue; 0 = desligado. --min-free-gb, ao contrário, PARA o probe")
     ap.add_argument("--fixture-dir")
     ap.add_argument("--swap-step", type=float, default=200.0)
     ap.add_argument("--big-mb", type=float, default=150.0)
@@ -391,19 +414,19 @@ def main(argv=None):
             print("job-ram-probe: uso errado (--max-gap > 0; --top >= 0)", file=sys.stderr)
             return 2
         try:
-            recs, bad = load(a.summary)
+            recs, bad, skipped = load(a.summary)
         except (OSError, ValueError) as e:  # ValueError: byte que não é UTF-8
             print(f"job-ram-probe: não consegui ler a entrada: {e}", file=sys.stderr)
             return 3
         if not recs:  # [guard:empty]
-            print(f"job-ram-probe: nenhuma amostra legível ({bad} linhas ilegíveis); sem relatório (não sei ≠ nada rodou)", file=sys.stderr)
+            print(f"job-ram-probe: nenhuma amostra legível ({bad} linhas ilegíveis, {len(skipped)} puladas por disco); sem relatório (não sei ≠ nada rodou)", file=sys.stderr)
             return 3
-        print(summarize(recs, bad, a.swap_step, a.big_mb, a.disk_step, a.max_gap, a.top))
+        print(summarize(recs, bad, a.swap_step, a.big_mb, a.disk_step, a.max_gap, a.top, skipped))
         return 0
     # --ticks 0 / --duration 0 gravariam nada e sairiam 0; --duration junto de --until deixava um calar o outro: os dois são uso errado [guard:usage]
-    if (a.interval < 1 or a.max_mb <= 0 or a.check_every < 1 or (a.duration is None and a.until is None and a.ticks is None)
+    if (a.interval < 1 or a.max_mb <= 0 or a.check_every < 1 or not 0 <= a.skip_free_gb < 1e9 or (a.duration is None and a.until is None and a.ticks is None)
             or (a.ticks is not None and a.ticks < 1) or (a.duration is not None and (a.duration <= 0 or a.until is not None))):
-        print("job-ram-probe: uso errado (--interval >= 1; --ticks >= 1; --duration > 0 e não junto de --until; informe --until, --duration ou --ticks; ou use --summary)", file=sys.stderr)
+        print("job-ram-probe: uso errado (--interval >= 1; 0 <= --skip-free-gb < 1e9; --ticks >= 1; --duration > 0 e não junto de --until; informe --until, --duration ou --ticks; ou use --summary)", file=sys.stderr)
         return 2
     return record(a)
 

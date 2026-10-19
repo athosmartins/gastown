@@ -182,11 +182,45 @@ def fake(path):
     calls[0] += 1
     return U(10**12, 0, 10**12 if calls[0] == 1 else 0)  # a 1ª conferência (início) passa; as seguintes, não
 m.shutil.disk_usage = fake
-a = argparse.Namespace(out=sys.argv[3], min_free_gb=1.0, start=None, until=None, duration=None, ticks=30, interval=1.0, max_mb=40.0, check_every=2, fixture_dir=sys.argv[2])
+a = argparse.Namespace(out=sys.argv[3], min_free_gb=1.0, start=None, until=None, duration=None, ticks=30, interval=1.0, max_mb=40.0, check_every=2, fixture_dir=sys.argv[2], skip_free_gb=0.0)
 rc = m.record(a); n = len(open(sys.argv[3]).read().splitlines())
 sys.exit(0 if (rc, n) == (6, 2) else 1)
 EOF
   ok $? "disco que cai DEPOIS do início: para com exit 6 na conferência seguinte (2 amostras de 30)"
+  # --- disco baixo: não amostra, ESCREVE "pulado" e segue (ga-sh8t23.6) ---
+  jrp --fixture-dir "$FX" --duration 2.5 --interval 1 --skip-free-gb 100000000 --out "$T/skip.jsonl" >/dev/null 2>"$T/e"; RC=$?
+  python3 -I - "$T/skip.jsonl" <<'EOF'
+import json, sys
+rs = [json.loads(l) for l in open(sys.argv[1])]
+sys.exit(0 if len(rs) >= 2 and all(r.get("pulado") == "disco" and isinstance(r.get("ts"), int) and isinstance(r.get("disk_free_mb"), int) and "jobs" not in r for r in rs) else 1)
+EOF
+  [ $? = 0 ] && [ "$RC" = 3 ] && grep -q 'amostra(s) puladas por disco livre abaixo de' "$T/e"; ok $? "disco abaixo do piso de amostragem: só linhas 'pulado: disco', nenhuma amostra, exit 3 (nada tirado não é sucesso) e diz quantas (rc=$RC)"
+  jrp --fixture-dir "$FX" --ticks 3 --interval 1 --skip-free-gb 0.000001 --out "$T/noskip.jsonl" >/dev/null 2>"$T/e"; RC=$?
+  [ "$RC" = 0 ] && [ "$(wc -l < "$T/noskip.jsonl" | tr -d " ")" = 3 ] && ! grep -q pulado "$T/noskip.jsonl"; ok $? "disco acima do piso de amostragem: 3 amostras e nenhuma linha 'pulado' (rc=$RC)"
+  python3 -I - "$P" "$FX" "$T/volta.jsonl" <<'EOF'
+import argparse, collections, importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("jrp", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+U = collections.namedtuple("U", "total used free"); calls = [0]
+def fake(path):
+    calls[0] += 1  # 1: conferência do início · 2: tick 1 (disco baixo) · 3: tick 2 (leitura FALHA) · 4 em diante: disco de volta
+    if calls[0] == 3: raise OSError("statvfs falhou")
+    return U(10**12, 0, 10**9 if calls[0] == 2 else 10**12)
+m.shutil.disk_usage = fake
+a = argparse.Namespace(out=sys.argv[3], min_free_gb=0.0, start=None, until=None, duration=None, ticks=2, interval=1.0, max_mb=40.0, check_every=99, fixture_dir=sys.argv[2], skip_free_gb=3.0)
+rc = m.record(a); rs = [json.loads(l) for l in open(sys.argv[3])]
+kinds = ["pulado" if "pulado" in r else "amostra" for r in rs]
+sys.exit(0 if rc == 0 and kinds == ["pulado", "pulado", "amostra", "amostra"] and rs[1]["disk_free_mb"] is None and rs[0]["disk_free_mb"] == 953 and rs[0]["piso_mb"] == 3072 else 1)
+EOF
+  ok $? "pula com disco baixo E com disco ilegível (disk_free_mb null, não 0), e volta a amostrar quando o disco volta (2 puladas, 2 amostras, exit 0)"
+  jrp --ticks 1 --skip-free-gb -1 --out "$T/x3.jsonl" >/dev/null 2>&1; RC=$?; [ "$RC" = 2 ] && [ ! -e "$T/x3.jsonl" ]; ok $? "--skip-free-gb negativo: exit 2 e nenhum arquivo (rc=$RC)"
+  jrp --ticks 1 --skip-free-gb nan --out "$T/x4.jsonl" >/dev/null 2>&1; RC=$?; [ "$RC" = 2 ] && [ ! -e "$T/x4.jsonl" ]; ok $? "--skip-free-gb nan: exit 2 (nan nunca pularia: o piso ficaria desligado em silêncio) (rc=$RC)"
+  jrp --ticks 1 --skip-free-gb inf --out "$T/x5.jsonl" >/dev/null 2>"$T/e"; RC=$?; [ "$RC" = 2 ] && [ ! -e "$T/x5.jsonl" ] && ! grep -q Traceback "$T/e"; ok $? "--skip-free-gb inf: exit 2 sem traceback (antes passava no teste de uso e estourava em int() no 1º pulo) (rc=$RC)"
+  # resumo: a linha "pulado" é contada e dita; não é amostra nem linha ilegível
+  { cat "$T/night.jsonl"; printf '{"ts":1704081620,"pulado":"disco","disk_free_mb":2100,"piso_mb":3072}\n{"ts":1704081625,"pulado":"disco","disk_free_mb":2050,"piso_mb":3072}\n{"ts":1704081630,"pulado":"disco","disk_free_mb":null,"piso_mb":3072}\n'; } > "$T/pulos.jsonl"
+  jrp --summary "$T/night.jsonl" > "$T/p0" 2>/dev/null; jrp --summary "$T/pulos.jsonl" > "$T/p" 2>"$T/e"; RC=$?  # a noite fabricada já traz 1 linha ilegível de propósito: as 3 'pulado' não podem somar a ela
+  [ "$RC" = 0 ] && sed -n 3p "$T/p" | grep -q '^AVISO: 3 amostra(s) NÃO tiradas por falta de disco livre (de 04:00:20 a 04:00:30)' && grep -q ', 1 linhas ilegíveis:' "$T/p" && [ "$(sed -n 1,2p "$T/p0")" = "$(sed -n 1,2p "$T/p")" ]; ok $? "resumo com 3 linhas 'pulado': dito com o intervalo; cabeçalho e contagem de ilegíveis iguais aos do arquivo sem elas (as 3 não são amostra nem lixo) (rc=$RC)"
+  printf '{"ts":1704081620,"pulado":"disco","disk_free_mb":2100,"piso_mb":3072}\n' > "$T/so-pulos.jsonl"; jrp --summary "$T/so-pulos.jsonl" >"$T/o" 2>"$T/e"; RC=$?
+  [ "$RC" = 3 ] && [ ! -s "$T/o" ] && grep -q '1 puladas por disco' "$T/e"; ok $? "arquivo só com linhas 'pulado': exit 3 sem relatório, e diz que foram puladas (não sei ≠ nada rodou) (rc=$RC)"
   (jrp --duration 20 --interval 1 --out "$T/lock.jsonl" >/dev/null 2>&1 &) ; sleep 3
   jrp --ticks 1 --interval 1 --out "$T/lock.jsonl" >/dev/null 2>"$T/e"; RC=$?; [ "$RC" = 4 ] && grep -q 'outra instância' "$T/e"; ok $? "segunda instância no mesmo arquivo: exit 4 (rc=$RC)"
   pkill -f "job-ram-probe.py --duration 20 --interval 1 --out $T/lock.jsonl" 2>/dev/null; sleep 1
@@ -201,7 +235,7 @@ EOF
   python3 -I - "$P" "$FX" "$T/nada.jsonl" "$T/nada.err" <<'EOF'
 import argparse, contextlib, importlib.util, sys
 spec = importlib.util.spec_from_file_location("jrp", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-a = argparse.Namespace(out=sys.argv[3], min_free_gb=1.0, start=None, until=None, duration=0.0, ticks=None, interval=1.0, max_mb=40.0, check_every=12, fixture_dir=sys.argv[2])
+a = argparse.Namespace(out=sys.argv[3], min_free_gb=1.0, start=None, until=None, duration=0.0, ticks=None, interval=1.0, max_mb=40.0, check_every=12, fixture_dir=sys.argv[2], skip_free_gb=0.0)
 with open(sys.argv[4], "w") as err, contextlib.redirect_stderr(err):
     rc = m.record(a)
 sys.exit(0 if (rc, open(sys.argv[3]).read()) == (3, "") and "nenhuma amostra gravada" in open(sys.argv[4]).read() else 1)
@@ -261,6 +295,12 @@ echo "== $((n-fails))/$n ok =="
   mutant "passo de 0 s (arquivo repetido) entra na mediana e zera o limite" 's/ for a, b in zip(recs, recs\[1:\]) if b\["ts"\] > a\["ts"\]\]/ for a, b in zip(recs, recs[1:])]/'
   mutant "tabela cortada em --top sem dizer" 's/^    if len(shown) < len(rows):  # \[guard:top\]/    if False:/'
   mutant "--ticks 0 / --duration 0 / --duration com --until passam" 's/^            or (a.ticks is not None and a.ticks < 1) or (a.duration is not None and (a.duration <= 0 or a.until is not None))):/            ):/'
+  mutant "disco baixo não pula (amostra assim mesmo)" 's/^            if skip_floor and (free_mb is None or free_mb \* 1048576 < skip_floor): .*$/            if False:/'
+  mutant "disco ilegível vira 'tem espaço'" 's/free_mb is None or free_mb \* 1048576 < skip_floor/free_mb is not None and free_mb * 1048576 < skip_floor/'
+  mutant "linha 'pulado' conta como linha ilegível" 's/^                    if isinstance(r, dict) and isinstance(r.get("ts"), int) and r.get("pulado") == "disco": .*$/                    if False:/'
+  mutant "resumo não diz as amostras puladas" 's/^    if skipped:  # \[guard:skipped\]$/    if False:/'
+  mutant "probe não diz quantas amostras pulou" 's/^    if skipped:$/    if False:/'
+  mutant "piso de amostragem nan/inf passa" 's/ or not 0 <= a.skip_free_gb < 1e9 or / or a.skip_free_gb < 0 or /'
   mutant "janela sem nenhuma amostra sai com 0" 's/^    if n == 0:  # a janela acabou .*$/    if False:/'
   echo "== mutantes: $((n-fails))/$n ok no total =="
 }
