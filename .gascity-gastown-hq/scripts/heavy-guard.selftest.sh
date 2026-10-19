@@ -55,6 +55,15 @@ lib_cases() {
   [ "$s" = low ]                     || bad "lib: no argument defaults to the new-work floor, 100 MB is low (got '$s')"
   s="$( DISK_NEW_WORK_MIN_MB=garbage DISK_HEAVY_MIN_MB= sh -c '. "$1"; echo "$DISK_NEW_WORK_MIN_MB/$DISK_HEAVY_MIN_MB"' _ "$lib" )"
   [ "$s" = "5120/6144" ]             || bad "lib: garbage in the floor env must fall back to 5120/6144 (got '$s')"
+  # the Go floor (ga-edkfip): 13312 by default, and the same rule as the other two floors for a bad value in the env
+  gf() { env "$@" sh -c '. "$1"; echo "$DISK_GO_MIN_MB"' _ "$lib"; }
+  [ "$(gf X=1)" = 13312 ]                                              || bad "lib: the default Go floor must be 13312 (got '$(gf X=1)')"
+  [ "$(gf DISK_GO_MIN_MB=20480)" = 20480 ]                             || bad "lib: DISK_GO_MIN_MB=20480 must be honoured (got '$(gf DISK_GO_MIN_MB=20480)')"
+  [ "$(gf DISK_GO_MIN_MB=garbage)" = 13312 ]                           || bad "lib: a Go floor that is not a number must fall back to 13312 (got '$(gf DISK_GO_MIN_MB=garbage)')"
+  [ "$(gf DISK_GO_MIN_MB=)" = 13312 ]                                  || bad "lib: an empty Go floor must fall back to 13312 (got '$(gf DISK_GO_MIN_MB=)')"
+  [ "$(gf DISK_GO_MIN_MB=99999999999999999999)" = 13312 ]              || bad "lib: a Go floor past int64 must fall back to 13312 (got '$(gf DISK_GO_MIN_MB=99999999999999999999)')"
+  [ "$(gf DISK_GO_MIN_MB=1234567890)" = 13312 ]                        || bad "lib: a Go floor of more than 9 digits must fall back to 13312 (got '$(gf DISK_GO_MIN_MB=1234567890)')"
+  [ "$(gf DISK_GO_MIN_MB=123456789)" = 123456789 ]                     || bad "lib: a 9-digit Go floor is still a floor (got '$(gf DISK_GO_MIN_MB=123456789)')"
   # the reader must not die under set -e when the state is not ok (callers run it inside $(...) with set -e on)
   s="$( DISK_FREE_OVERRIDE_MB=1 sh -ec '. "$1"; x=$(disk_headroom_state 5120); echo "alive:$x"' _ "$lib" )"
   [ "$s" = "alive:low" ]             || bad "lib: set -e safety (got '$s')"
@@ -174,6 +183,105 @@ EOF
   [ -s "$W/sleeps" ] && [ "$(sort -n "$W/sleeps" | tail -1)" -le 15 ] || bad "a huge HEAVY_GUARD_POLL_SECS must not lengthen the sleep step (longest: $(sort -n "$W/sleeps" | tail -1))"
 }
 
+# ── Go class cases (ga-edkfip): go_cases <guard> <lib> ───────────────────────────────────────────────────────
+# A Go build/test needs 13 GB, not 6: 19/10 a cold build of cmd/gc started just over the heavy floor and left 2 GB. The
+# readings used here sit BETWEEN the two floors (9000: ok for a heavy step, low for a Go step). A fake `go` on PATH marks
+# whether the command RAN, so "refused" is proved by the command not running, not only by the rc.
+go_cases() {
+  local g="$1" lib="$2" rc out
+  mkdir -p "$W/gobin"; printf '#!/bin/sh\ntouch "%s/goran"\necho "go $*"\nexit 9\n' "$W" > "$W/gobin/go"; chmod +x "$W/gobin/go"
+  run() { PATH="$W/gobin:$PATH" HEAVY_GUARD_LIB="$lib" "$g" "$@"; }
+  # refused: the label alone (--check has no command), every command shape, and the command does not run
+  : > "$HEAVY_GUARD_LOG"
+  DISK_FREE_OVERRIDE_MB=9000 run --check --what go-test 2>"$W/err"; rc=$?
+  check "go: --what go-test between the floors is refused with 75" 75 "$rc"
+  grep -q 'mbp-run.sh --exec --go' "$W/err" || bad "go: the refusal must point at 'mbp-run.sh --exec --go' ($(cat "$W/err"))"
+  grep -q 'docs/runbooks/mbp-offload.md' "$W/err" || bad "go: the refusal must name the runbook"
+  grep -q '13312 MB floor' "$W/err" || bad "go: the refusal must show the Go floor, 13312 ($(cat "$W/err"))"
+  grep -q 'rc 75' "$W/err" || bad "go: the refusal must say rc 75"
+  grep -q "REFUSED what='go-test' free_mb=9000 min_mb=13312 class=go rc=75" "$HEAVY_GUARD_LOG" || bad "go: refusal not in the log with class=go ($(cat "$HEAVY_GUARD_LOG"))"
+  local lbl
+  for lbl in go-build go-vet go-install "go build ./cmd/gc" "Go-Test" "go test internal/mail" "go_test"; do
+    DISK_FREE_OVERRIDE_MB=9000 run --check --what "$lbl" 2>/dev/null; rc=$?
+    check "go: the label '$lbl' is a Go step (75 between the floors)" 75 "$rc"
+  done
+  local cmdline
+  while IFS= read -r cmdline; do
+    rm -f "$W/goran"
+    # shellcheck disable=SC2086
+    DISK_FREE_OVERRIDE_MB=9000 run --what step -- $cmdline 2>/dev/null; rc=$?
+    check "go: the command '$cmdline' is a Go step (75 between the floors)" 75 "$rc"; [ ! -e "$W/goran" ] || bad "go: '$cmdline' RAN on a disk below the Go floor"
+  done <<'EOF'
+go test ./...
+go build ./cmd/gc
+go vet ./internal/mail/...
+go install ./cmd/gc
+env CGO_ENABLED=1 go test ./...
+/opt/homebrew/bin/go build ./...
+EOF
+  # inside a quoted script (sh -c), after ;, &&, |, ( and a backtick
+  for cmdline in 'cd /tmp && go test ./...' 'cd /tmp; go vet ./...' 'true | go build ./...' '(go install ./...)' 'echo `go build ./...`' "echo 'go test ./...'" 'FOO=1
+go test ./...'; do
+    rm -f "$W/goran"
+    DISK_FREE_OVERRIDE_MB=9000 run --what step -- sh -c "$cmdline" 2>/dev/null; rc=$?
+    check "go: sh -c '$(printf %s "$cmdline" | tr '\n' ' ')' is a Go step (75 between the floors)" 75 "$rc"; [ ! -e "$W/goran" ] || bad "go: sh -c '$cmdline' RAN on a disk below the Go floor"
+  done
+  # NOT Go steps: the heavy floor (6144) applies, so 9000 goes ahead and the command runs
+  for lbl in other go-testdata gopher-build "go" "ego-test" "cargo-test" "heavy step"; do
+    DISK_FREE_OVERRIDE_MB=9000 run --check --what "$lbl" 2>/dev/null; rc=$?
+    check "go: the label '$lbl' is NOT a Go step (6144 floor, 9000 passes)" 0 "$rc"
+  done
+  for cmdline in 'go version' 'go env GOPATH' 'echo cargo test mongo build' 'echo gotest' 'echo go-build' 'echo go tests' 'echo ego test'; do
+    rm -f "$W/goran"
+    DISK_FREE_OVERRIDE_MB=9000 run --what step -- sh -c "$cmdline" >/dev/null 2>&1; rc=$?
+    check "go: sh -c '$cmdline' is NOT a Go step (9000 passes the heavy floor)" "$( case "$cmdline" in "go version"|"go env GOPATH") echo 9 ;; *) echo 0 ;; esac )" "$rc"
+  done
+  # `tr` cannot run (a fake one that fails): the label stays as typed and the command words are read as they are, so a Go step is
+  # STILL a Go step; and a non-Go step is still not one (the failure of the matcher's helper never decides the floor either way)
+  mkdir -p "$W/trbin"; printf '#!/bin/sh\nexit 1\n' > "$W/trbin/tr"; chmod +x "$W/trbin/tr"
+  rm -f "$W/goran"
+  PATH="$W/trbin:$PATH" DISK_FREE_OVERRIDE_MB=9000 run --check --what go-test 2>/dev/null; rc=$?;     check "go: with tr failing, a go-test label is still a Go step" 75 "$rc"
+  PATH="$W/trbin:$PATH" DISK_FREE_OVERRIDE_MB=9000 run --what x -- go test ./... 2>/dev/null; rc=$?;  check "go: with tr failing, a go test command is still a Go step" 75 "$rc"
+  [ ! -e "$W/goran" ] || bad "go: with tr failing the Go command RAN below the Go floor"
+  PATH="$W/trbin:$PATH" DISK_FREE_OVERRIDE_MB=9000 run --check --what other 2>/dev/null; rc=$?;       check "go: with tr failing, a non-Go step keeps the heavy floor (9000 passes)" 0 "$rc"
+  # the floor itself: exactly 13312 goes ahead, one MB under is refused, plenty runs the command and passes its rc through
+  DISK_FREE_OVERRIDE_MB=13312 run --check --what go-test 2>/dev/null; rc=$?;   check "go: exactly the Go floor (13312) goes ahead" 0 "$rc"
+  DISK_FREE_OVERRIDE_MB=13311 run --check --what go-test 2>/dev/null; rc=$?;   check "go: one MB under the Go floor is refused" 75 "$rc"
+  rm -f "$W/goran"
+  DISK_FREE_OVERRIDE_MB=20000 run --what go-test -- go test ./... >/dev/null 2>&1; rc=$?
+  check "go: with plenty of disk the command runs and its rc comes through" 9 "$rc"; [ -e "$W/goran" ] || bad "go: the Go command did not run with plenty of disk"
+  # the class floor is a minimum: --min-free-mb can raise it for one call and never lower it
+  DISK_FREE_OVERRIDE_MB=9000 run --check --what go-test --min-free-mb 2000 2>"$W/err"; rc=$?
+  check "go: --min-free-mb 2000 cannot lower the Go floor" 75 "$rc"; grep -q '13312 MB floor' "$W/err" || bad "go: a lowered --min-free-mb must still show the 13312 floor ($(cat "$W/err"))"
+  DISK_FREE_OVERRIDE_MB=14000 run --check --what go-test --min-free-mb 15000 2>"$W/err"; rc=$?
+  check "go: --min-free-mb 15000 raises the Go floor" 75 "$rc"; grep -q '15000 MB floor' "$W/err" || bad "go: a raised --min-free-mb must show the 15000 floor ($(cat "$W/err"))"
+  DISK_FREE_OVERRIDE_MB=14000 run --check --what go-test --min-free-mb 13000 2>/dev/null; rc=$?
+  check "go: a --min-free-mb under the Go floor leaves 14000 above the Go floor: goes ahead" 0 "$rc"
+  # the env knob moves the Go floor, and nothing else
+  DISK_FREE_OVERRIDE_MB=9000 DISK_GO_MIN_MB=8000 run --check --what go-test 2>/dev/null; rc=$?;  check "go: DISK_GO_MIN_MB=8000 lets 9000 through for a Go step" 0 "$rc"
+  DISK_FREE_OVERRIDE_MB=9000 DISK_GO_MIN_MB=garbage run --check --what go-test 2>/dev/null; rc=$?;  check "go: a garbage DISK_GO_MIN_MB falls back to 13312 (refused)" 75 "$rc"
+  # a Go floor BELOW the heavy floor never makes a Go step easier than a heavy one: the larger of the two wins
+  DISK_FREE_OVERRIDE_MB=5000 DISK_GO_MIN_MB=1000 run --check --what go-test 2>/dev/null; rc=$?;  check "go: the larger of the Go and heavy floors applies (5000 < 6144)" 75 "$rc"
+  # no reading of the disk: a Go step is refused with 76 as any heavy step, and does not run
+  rm -f "$W/goran"
+  DISK_FREE_OVERRIDE_MB=x run --what step -- go test ./... 2>"$W/err"; rc=$?
+  check "go: an unreadable disk refuses a Go step with 76" 76 "$rc"; [ ! -e "$W/goran" ] || bad "go: ran with an unreadable disk"
+  # a lib that cannot give the Go floor (older than this guard) refuses a Go step with 76 and SAYS why; a non-Go step is unaffected
+  grep -v 'DISK_GO_MIN_MB' "$lib" > "$W/lib-nogo.sh"
+  rm -f "$W/goran"
+  HEAVY_GUARD_LIB="$W/lib-nogo.sh" DISK_FREE_OVERRIDE_MB=99999 "$g" --what step -- go test ./... 2>"$W/err"; rc=$?
+  check "go: a lib without DISK_GO_MIN_MB refuses a Go step with 76" 76 "$rc"; [ ! -e "$W/goran" ] || bad "go: ran on a lib without the Go floor"
+  grep -q 'DISK_GO_MIN_MB' "$W/err" || bad "go: the 76 for a lib without the Go floor must name DISK_GO_MIN_MB ($(cat "$W/err"))"
+  HEAVY_GUARD_LIB="$W/lib-nogo.sh" DISK_FREE_OVERRIDE_MB=99999 "$g" --check --what other 2>/dev/null; rc=$?
+  check "go: a lib without DISK_GO_MIN_MB still serves a non-Go step" 0 "$rc"
+  # a non-Go refusal is the old one, byte for byte where it counts: no MacBook recipe, no class tag in the log
+  : > "$HEAVY_GUARD_LOG"
+  DISK_FREE_OVERRIDE_MB=3000 run --check --what other 2>"$W/err"; rc=$?
+  check "go: a non-Go step at 3000 is refused as before" 75 "$rc"
+  ! grep -q 'mbp-run.sh --exec --go' "$W/err" || bad "go: a non-Go refusal must not send the step to the MacBook Go recipe"
+  grep -q "REFUSED what='other' free_mb=3000 min_mb=6144 rc=75" "$HEAVY_GUARD_LOG" || bad "go: a non-Go refusal keeps its old log line ($(cat "$HEAVY_GUARD_LOG"))"
+}
+
 # ── lookup cases (ga-g9ptej): the guard run from places that have NO packs/ next to it ───────────────────────
 # HEAVY_GUARD_LIB is never set here (lg unsets it): the lookup itself is what is under test. Each layout is a
 # copy of the guard under test, so a mutant of the guard goes through exactly the same places as the real one.
@@ -253,6 +361,7 @@ mk_mutant() { # mk_mutant <src> <dst> <sed-expr>  — fails the selftest if the 
 
 before=$FAIL; lib_cases "$REAL_LIB";                      [ "$FAIL" -eq "$before" ] || echo "(lib cases failed on the real lib)"
 before=$FAIL; guard_cases "$REAL_GUARD" "$REAL_LIB";      [ "$FAIL" -eq "$before" ] || echo "(guard cases failed on the real files)"
+before=$FAIL; go_cases "$REAL_GUARD" "$REAL_LIB";         [ "$FAIL" -eq "$before" ] || echo "(go cases failed on the real files)"
 before=$FAIL; lookup_cases "$REAL_GUARD";                 [ "$FAIL" -eq "$before" ] || echo "(lookup cases failed on the real guard)"
 
 # mutants: each must make at least one case fail
@@ -280,6 +389,28 @@ mk_mutant "$REAL_GUARD" "$M/g-nolog.sh" '/hg_log "REFUSED lib_unloadable/d' && {
 mk_mutant "$REAL_GUARD" "$M/g-reread.sh" 's/^\[ -n "\$free" \] || free="?"$/free="$(disk_free_mb 2>\/dev\/null)" || free="?"/' && { before=$FAIL; guard_cases "$M/g-reread.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: the refusal shows a second reading"; }
 mk_mutant "$REAL_GUARD" "$M/g-nonote.sh" '/goes ahead with the disk check bypassed/d' && { before=$FAIL; guard_cases "$M/g-nonote.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: a bypass is silent on stderr"; }
 mk_mutant "$REAL_GUARD" "$M/g-nobylog.sh" '/hg_log "BYPASS/d' && { before=$FAIL; guard_cases "$M/g-nobylog.sh" "$REAL_LIB" >/dev/null 2>&1; survive "guard: a bypass leaves no log line"; }
+
+# Go class mutants (ga-edkfip): each one removes or bends one rule of the class
+mk_mutant "$REAL_LIB" "$M/lib-gocap.sh" '/^\[ "\${#DISK_GO_MIN_MB}" -le 9 \]/d' && { before=$FAIL; lib_cases "$M/lib-gocap.sh" >/dev/null; survive "lib: no magnitude cap on the Go floor"; }
+mk_mutant "$REAL_LIB" "$M/lib-gogarb.sh" '/^case "\$DISK_GO_MIN_MB" in/d' && { before=$FAIL; lib_cases "$M/lib-gogarb.sh" >/dev/null; survive "lib: a Go floor that is not a number is kept"; }
+mk_mutant "$REAL_LIB" "$M/lib-godef.sh" 's/DISK_GO_MIN_MB:-13312/DISK_GO_MIN_MB:-6144/' && { before=$FAIL; lib_cases "$M/lib-godef.sh" >/dev/null; survive "lib: the default Go floor is the heavy one"; }
+gom() { # gom <file> <name> <sed-expr>
+  mk_mutant "$REAL_GUARD" "$M/$1.sh" "$3" && { before=$FAIL; go_cases "$M/$1.sh" "$REAL_LIB" >/dev/null 2>&1; survive "$2"; }
+}
+gom g-go-nolabel  "guard: a Go label is not recognised"                       's#\^go\[- _\]#NOPE_NOPE#'
+gom g-go-case     "guard: the label is matched case-sensitively"               '/^  label="\$(printf/d'
+gom g-go-origlbl  "guard: a failing tr loses the label"                       's#|| label="\$orig"#|| label=""#'
+gom g-go-nocmd    "guard: a Go command is not recognised"                     's#\[\[ \$norm =~ \$cre \]\] && return 0#:#'
+gom g-go-notr     "guard: the argument list is not split on ; & | ( ) quotes" '/^  norm="\$(printf/d'
+gom g-go-noslash  "guard: a path before go is not a word boundary"            's#\[\[:space:\]/\]go#[[:space:]]go#'
+gom g-go-wordend  "guard: go-testdata counts as go-test"                      's#(test|build|vet|install)(\[^\[:alnum:\]\]|\$)#(test|build|vet|install)#'
+gom g-go-verbs    "guard: go version counts as a Go step"                     's#\[\[:space:\]\]+(test|build|vet|install)\[\[:space:\]\]#[[:space:]]+[a-z]+[[:space:]]#'
+gom g-go-nofloor  "guard: a Go step keeps the heavy floor"                    's#^  \[ "\$min" -ge "\$DISK_GO_MIN_MB" \] 2>/dev/null || min="\$DISK_GO_MIN_MB"$#  :#'
+gom g-go-lowers   "guard: --min-free-mb lowers the Go floor"                  's#\[ "\$min" -ge "\$DISK_GO_MIN_MB" \] 2>/dev/null || min="\$DISK_GO_MIN_MB"#[ "$min" -ne "$DISK_HEAVY_MIN_MB" ] 2>/dev/null || min="$DISK_GO_MIN_MB"#'
+gom g-go-nomsg    "guard: the Go refusal does not point at the MacBook"       's#scripts/mbp-run.sh --exec --go --push#scripts/other --push#'
+gom g-go-nolog    "guard: the Go refusal log has no class=go"                 's# class=go rc=75# rc=75#'
+gom g-go-no76     "guard: a lib without the Go floor is not refused"          's#^  if \[ -z "\${DISK_GO_MIN_MB:-}" \]; then$#  if false; then#'
+gom g-go-wrongrc  "guard: the Go refusal uses the run-local rc 97"            's#^      exit 75$#      exit 97#'
 
 # lookup mutants (ga-g9ptej): each one removes or bends one rule of the lib lookup
 lkm() { # lkm <file> <name> <sed-expr>

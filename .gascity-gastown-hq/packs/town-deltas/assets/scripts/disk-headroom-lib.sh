@@ -4,7 +4,7 @@
 # are `sh`); no side effect at source time.
 #
 # ## Contents
-#   Why · The two floors · Three states · Seams
+#   Why · The three floors · Three states · Seams
 #
 # WHY. 17/10 12:40-12:56 the mini's disk went to ~0 while three agents were INSIDE heavy steps (a git repack,
 # a selftest copying hq.jsonl, `go build` + golangci-lint). Dolt got ENOSPC writing its journal and the whole
@@ -12,7 +12,7 @@
 # step with the disk at the end. This lib plus scripts/heavy-guard.sh is the piece that stops it; the pool probes
 # (ga-09hfgh) stop NEW work with it, and the Pilot sweep (ga-ydaslo) is a separate slice of ga-vln2py.
 #
-# THE TWO FLOORS (free MB on the volume that holds the swapfiles and the Dolt data):
+# THE THREE FLOORS (free MB on the volume that holds the swapfiles and the Dolt data):
 #   DISK_NEW_WORK_MIN_MB  5120 (5 GB)  the floor for STARTING new work, and the default floor of
 #                                      disk_headroom_state. Its readers are the pool probes (ga-09hfgh) and, in a
 #                                      separate slice of ga-vln2py, the Pilot sweep (ga-ydaslo); heavy-guard.sh passes its own.
@@ -20,6 +20,14 @@
 #                                      mutants, a copy of a database) does not start on this machine —
 #                                      scripts/heavy-guard.sh refuses or waits. Higher than the first on
 #                                      purpose: a step needs headroom to FINISH, dispatch only needs room to begin.
+#   DISK_GO_MIN_MB       13312 (13 GB) the floor for `go build/test/vet/install` (ga-edkfip). The 6 GB heavy floor is
+#                                      not enough for them: 19/10 06:03-06:09 a cold build of cmd/gc started at ~6 GB
+#                                      and took the disk to 2 GB (Dolt at the CRITICAL floor). A cold build/test of the
+#                                      engine writes 4-10 GB of build cache (measured), and dolt-disk-floor-guard
+#                                      goes CRITICAL at 3 GB: 10 + 3 = 13. heavy-guard.sh uses the LARGER of this and
+#                                      the heavy floor for a Go step, and its refusal sends the step to the MacBook
+#                                      (mbp-run.sh --exec --go). The mini had ~7 GB free on 19/10, so in practice this
+#                                      reads as "Go does not run on the mini" until someone frees space.
 #
 # THREE STATES, never two (the error-vs-empty family): disk_headroom_state prints
 #   ok       a reading, and it is at or above the floor (or the lib is switched off)
@@ -56,11 +64,14 @@ DISK_HOLD_NEW_STORIES_JQ='[ .[] | select( (((.issue_type // "") as $t | ["task",
 
 DISK_NEW_WORK_MIN_MB="${DISK_NEW_WORK_MIN_MB:-5120}"
 DISK_HEAVY_MIN_MB="${DISK_HEAVY_MIN_MB:-6144}"
+DISK_GO_MIN_MB="${DISK_GO_MIN_MB:-13312}"
 # empty / not a number / more than 9 digits -> the default (a floor must be a number `[ -lt ]` can compare)
 case "$DISK_NEW_WORK_MIN_MB" in ''|*[!0-9]*) DISK_NEW_WORK_MIN_MB=5120 ;; esac
 case "$DISK_HEAVY_MIN_MB" in ''|*[!0-9]*) DISK_HEAVY_MIN_MB=6144 ;; esac
+case "$DISK_GO_MIN_MB" in ''|*[!0-9]*) DISK_GO_MIN_MB=13312 ;; esac
 [ "${#DISK_NEW_WORK_MIN_MB}" -le 9 ] || DISK_NEW_WORK_MIN_MB=5120
 [ "${#DISK_HEAVY_MIN_MB}" -le 9 ] || DISK_HEAVY_MIN_MB=6144
+[ "${#DISK_GO_MIN_MB}" -le 9 ] || DISK_GO_MIN_MB=13312
 
 # disk_free_mb — free MB as an integer on stdout and rc 0; rc 1 and NO stdout when it cannot be read.
 disk_free_mb() {

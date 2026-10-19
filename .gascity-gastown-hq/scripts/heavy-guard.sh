@@ -2,7 +2,7 @@
 # heavy-guard.sh (ga-vln2py, P0) — keep a HEAVY step from starting on the mini while the disk is near the floor.
 #
 # ## Contents
-#   Why · Usage · Exit codes · What counts as heavy · Where it is wired · Lib lookup · Not covered
+#   Why · Usage · Exit codes · What counts as heavy · Go class · Where it is wired · Lib lookup · Not covered
 #
 # WHY. 17/10 12:40-12:56 three agent steps (a git repack, a selftest copying hq.jsonl, `go build` + golangci-lint of
 # the beads repo) ran with the disk already low and filled it: Dolt took ENOSPC writing its journal and the data
@@ -16,15 +16,17 @@
 #   heavy-guard.sh --check [--min-free-mb N] [--wait-secs S] [--what LABEL]
 #       same decision, no command: exit 0 = go ahead. For a script or a git hook that runs its own heavy part:
 #           "$GC_CITY_PATH/scripts/heavy-guard.sh" --check --what "golangci-lint" || exit $?
-#   N defaults to DISK_HEAVY_MIN_MB (6144 = 6 GB, see packs/town-deltas/assets/scripts/disk-headroom-lib.sh).
+#   N defaults to DISK_HEAVY_MIN_MB (6144 = 6 GB, see packs/town-deltas/assets/scripts/disk-headroom-lib.sh);
+#   for a Go build/test step (see "GO CLASS") the floor is DISK_GO_MIN_MB (13312 = 13 GB) instead.
 #
 # EXIT CODES (deliberately OUTSIDE mbp-run.sh's 96..99, which mean "run it locally" — a refusal here must never be
 # read as that):
 #   <command's own>  0..74, 77.. (propagated) when it ran
 #   75  LOW      the disk is below the floor and stayed there for the whole wait. NOT a failure of the step: do not
 #                run it here by another route. Send it to the Linux node when it can go there
-#                (scripts/mbp-run.sh --repo hq --dir <worktree> -- scripts/X.selftest.sh; a go build / lint can NOT
-#                go to the node today), or wait for the disk and try again; tell the Mayor if it stays low.
+#                (scripts/mbp-run.sh --repo hq --dir <worktree> -- scripts/X.selftest.sh), send a Go build/test to the
+#                MacBook (scripts/mbp-run.sh --exec --go ..., see "GO CLASS"; golangci-lint has no remote today), or
+#                wait for the disk and try again; tell the Mayor if it stays low.
 #   76  UNKNOWN  no usable reading of the disk. The step is refused too — fail CLOSED, because the command this
 #                guards fails by ENOSPC on the database — and the line says so.
 #   64  usage    bad flag / no command and no --check.
@@ -32,6 +34,22 @@
 # WHAT COUNTS AS HEAVY (anything that writes or holds hundreds of MB on this machine): go build / go test / go vet,
 # golangci-lint, a git repack / gc / maintenance, a selftest that builds fixtures of tens of MB or runs mutants,
 # a copy or export of a database. Short pytest runs and single-file edits are not heavy.
+#
+# GO CLASS (ga-edkfip). `go build`, `go test`, `go vet` and `go install` get their own, higher floor: DISK_GO_MIN_MB, 13312
+# (13 GB; the why and the arithmetic are in disk-headroom-lib.sh). 19/10 06:03-06:09 a cold build of cmd/gc started with the
+# disk just over the 6 GB heavy floor, wrote ~4 GB of build cache in 6 minutes and left 2 GB: Dolt sat at the CRITICAL floor
+# for two cycles until the build was killed by hand. A step is in the class when
+#   - its --what label starts with go, then "-", "_" or a space, then test|build|vet|install, capitals ignored ("go-test",
+#     "Go build ./cmd/gc"; "go-testdata" and "gopher-build" are not), or
+#   - `go <verb>` shows up as a word in the command itself, also inside `sh -c '…'` or `env K=V go test` (the argument
+#     list is read with ; & | ( ) ` " ' as spaces, so a quoted script is seen too).
+# A script that runs go INSIDE (bash scripts/x.sh) is not seen: label it --what go-test. A false match (an `echo go test`)
+# only applies the HIGHER floor, never the lower one. The class floor is a minimum: --min-free-mb can raise it for one call,
+# never lower it. A lib that has no DISK_GO_MIN_MB (older than this guard) refuses a Go step with 76 instead of falling
+# back to the heavy floor. The refusal is rc 75 like any other, and its text sends the step to the MacBook:
+#   scripts/mbp-run.sh --exec --go --push go.mod --push go.sum --push internal --push cmd … -- sh -c 'cd in && go test ./...'
+# (docs/runbooks/mbp-offload.md, "Go no MBP"). mbp-run rc 96..99 there means the MacBook is unavailable: wait, do not come back
+# here. Heavy-guard itself never runs anything remotely.
 #
 # WHERE IT IS WIRED. jsonl-archive-compact.selftest.sh (--check at the top); the doctrine paragraph in
 # packs/town-deltas/template-fragments/town-deltas.template.md and the HQ SELFTESTS text of the gate
@@ -102,6 +120,27 @@ HG_POLL="${HEAVY_GUARD_POLL_SECS:-15}"
 case "$HG_POLL" in ''|*[!0-9]*|0) HG_POLL=15 ;; esac
 [ "${#HG_POLL}" -le 9 ] || HG_POLL=15   # past int64 the cap below could not be compared: back to the default
 
+# hg_go_step <label> [command...] — rc 0 when the step is a Go toolchain build/test/vet/install (see "GO CLASS"), else rc 1.
+# String matching only: it reads no file and no disk; the one outside command is `tr`, and its failure is handled where it is called.
+# vazio (no label, no command words) → rc 1, not a Go step; a wrong match can only be a false POSITIVE, which applies the
+# higher floor and never the lower one.
+hg_go_step() {
+  local label="${1:-}" orig norm lre cre
+  orig="$label"
+  shift
+  # the label is typed by a person or an agent: "Go-Test" and "go-test" are the same step. falhou (tr cannot run) → the label
+  # stays as typed, which can only miss a capital letter, and the command words below are still read
+  label="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" || label="$orig"
+  lre='^go[- _](test|build|vet|install)([^[:alnum:]]|$)'
+  [[ $label =~ $lre ]] && return 0
+  # ; & | ( ) ` " ' → spaces, then "go <verb>" as a word (a path before it counts: /opt/homebrew/bin/go test)
+  norm=" $* "
+  norm="$(printf '%s' "$norm" | tr ';&|()`"'"'" ' ')" || norm=" $* "
+  cre='[[:space:]/]go[[:space:]]+(test|build|vet|install)[[:space:]]'
+  [[ $norm =~ $cre ]] && return 0
+  return 1
+}
+
 hg_log() {
   # best effort by design: the verdict was already reached, a full disk is exactly when this write fails
   mkdir -p "$(dirname "$HG_LOG")" 2>/dev/null || return 0
@@ -140,6 +179,21 @@ if [ "$mode" = run ] && [ $# -eq 0 ]; then
   exit 64
 fi
 
+go_class=0
+if hg_go_step "$what" "$@"; then
+  go_class=1
+  # vazio (the lib has no DISK_GO_MIN_MB: it is older than this guard) → the Go floor is unknown, so the step is refused (76),
+  # never decided on the looser heavy floor; falhou/ilegível → cannot happen (a variable read; the lib itself was loaded above)
+  if [ -z "${DISK_GO_MIN_MB:-}" ]; then
+    echo "heavy-guard: cannot decide '$what': a Go step needs DISK_GO_MIN_MB and $HG_LIB does not define it (the lib is older than this guard), so the step is refused (rc 76). Deploy fault: tell the Mayor." >&2
+    hg_log "REFUSED what='$what' go_floor_missing lib=$HG_LIB rc=76"
+    exit 76
+  fi
+  # the class floor is a MINIMUM: --min-free-mb may raise it for this call, never lower it. `[` has three outcomes; true keeps
+  # the caller's value, false (below the class floor) and "could not compare" (rc 2) both land on the class floor
+  [ "$min" -ge "$DISK_GO_MIN_MB" ] 2>/dev/null || min="$DISK_GO_MIN_MB"
+fi
+
 # vazio/falhou/ilegível → no clock, so no deadline can be made: do not wait at all (one reading, then the verdict)
 t0=$(date +%s 2>/dev/null)
 case "$t0" in ''|*[!0-9]*) t0=0; wait_s=0 ;; esac
@@ -172,6 +226,11 @@ case "$state" in
     exec "$@"
     ;;
   low)
+    if [ "$go_class" = 1 ]; then
+      echo "heavy-guard: REFUSED '$what': ${free} MB free < ${min} MB floor for a Go build/test (ga-edkfip: a cold build of cmd/gc writes 4-10 GB of build cache; 19/10 one started just over the 6 GB heavy floor and left 2 GB, Dolt sat at the CRITICAL floor). Do NOT run it on this machine by another route. Run it on the MacBook: scripts/mbp-run.sh --exec --go --push go.mod --push go.sum --push internal --push cmd (more --push for examples, test, schemas, schemas_embed.go, docs, third_party if the tests need them) -- sh -c 'cd in && go test ./...' (recipe: docs/runbooks/mbp-offload.md, \"Go no MBP\"). If mbp-run answers 96..99 the MacBook is unavailable: wait and retry, do not come back here; if it stays unavailable, tell the Mayor. (rc 75)" >&2
+      hg_log "REFUSED what='$what' free_mb=$free min_mb=$min class=go rc=75"
+      exit 75
+    fi
     echo "heavy-guard: REFUSED '$what': ${free} MB free < ${min} MB floor for heavy steps (ga-vln2py: 17/10 a step like this filled the disk and Dolt took ENOSPC). Do NOT run it on this machine by another route. Send it to the Linux node if it can go there (scripts/mbp-run.sh --repo hq --dir <worktree> -- scripts/X.selftest.sh), or wait for the disk and retry; if it stays low, tell the Mayor. (rc 75)" >&2
     hg_log "REFUSED what='$what' free_mb=$free min_mb=$min rc=75"
     exit 75

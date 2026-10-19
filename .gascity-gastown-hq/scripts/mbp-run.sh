@@ -15,6 +15,11 @@
 #        (REA/APK; o comando roda em ~/gt-remote/exec/<slot>; --push copia P para ./in/; --pull traz REL de volta;
 #         o scratch é APAGADO ao fim (capturas de REA nunca ficam) salvo --keep. Para redirecionar saída use
 #         `-- sh -c 'rea ... > out.json'`.)
+#   mbp-run.sh --exec --go [--push P]... [--env K=V]... -- <comando>      # go build/test/vet no MBP (ga-edkfip)
+#        (--go põe no comando as 3 variáveis de CGO que o build do engine (cmd/gc) exige no MBP: CGO_CPPFLAGS=-I…/icu4c/include,
+#         CGO_LDFLAGS=-L…/icu4c/lib e CGO_CXXFLAGS=-isystem …/MacOSX.sdk/usr/include/c++/v1 (o c++ das Command Line Tools do MBP não acha
+#         <cstddef> sozinho). Um --env do chamador com o mesmo nome VENCE. --go implica --exec. O --push P cai em ./in/<P> e o comando roda
+#         um nível acima: `-- sh -c 'cd in && go test ./internal/mail/...'`. Receita inteira: docs/runbooks/mbp-offload.md, "Go no MBP".)
 #   mbp-run.sh --seed wa|ps          # (re)semeia a árvore-base e o site-packages do MBP (com checagem de hash)
 #   mbp-run.sh --check               # imprime a saúde do MBP (preflight, com a presença do Athos e as tarefas em curso) e sai
 #   mbp-run.sh --remote-pause on|off # grava/remove ~/gt-remote/PAUSE no MBP (a chave "pausar até eu liberar"; quem chama é o mbp-offload.sh)
@@ -176,7 +181,7 @@ usage() { sed -n '2,/^[^#]/{/^#/p;}' "$0" | sed 's/^# \{0,1\}//' >&2; }   # só 
 
 repo=""; dir="$PWD"; mode=pytest; seed_repo=""
 pause_arg=""; host_sel=auto
-pushes=(); pulls=(); envs=(); keep=0; audit_dirs=()
+pushes=(); pulls=(); envs=(); keep=0; audit_dirs=(); golang=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --host) host_sel="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
@@ -191,6 +196,7 @@ while [ $# -gt 0 ]; do
     --push) pushes+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
     --pull) pulls+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
     --env) envs+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
+    --go) golang=1; shift ;;
     --keep) keep=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
@@ -199,6 +205,15 @@ while [ $# -gt 0 ]; do
 done
 
 case "$host_sel" in auto|linux|mbp) ;; *) say "uso: --host linux|mbp"; exit 97 ;; esac
+# --go (ga-edkfip): as 3 variáveis de CGO do build de Go no MBP (receita medida pelo dog-6 na ga-yi067e: sem as três o build do engine
+# cai em "icu headers" e depois em "<cstddef> not found"). Vão NA FRENTE de qualquer --env do chamador: no `env K=V K=V` o último vence,
+# então um --env CGO_LDFLAGS=… do chamador troca o valor daqui. --go sozinho (modo ainda pytest) vira --exec; com --seed/--check/… é uso errado.
+if [ "$golang" = 1 ]; then
+  [ "$mode" != pytest ] || mode=exec
+  [ "$mode" = exec ] || { say "--go só vale com --exec (é para um go build/test no MBP)"; exit 97; }
+  envs=("CGO_CPPFLAGS=-I/opt/homebrew/opt/icu4c/include" "CGO_LDFLAGS=-L/opt/homebrew/opt/icu4c/lib"
+        "CGO_CXXFLAGS=-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1" "${envs[@]+"${envs[@]}"}")
+fi
 # nomes na máquina remota: no MBP a base é gt-remote/whatsapp_automation e o venv gt-remote/venv; no nó Linux (montado pelo Mayor) são wa-base e venv-wa.
 # O nó tem wa e hq (hq-base, sem venv: "none" = não conferir); ps no nó Linux não existe (vazio → o chamador cai no MBP). O hq não existe no MBP (vazio → 97, roda local).
 base_of() { if [ "$HOSTKIND" = linux ]; then case "$1" in wa) echo wa-base ;; hq) echo hq-base ;; esac; else case "$1" in wa) echo whatsapp_automation ;; ps) echo property_scrapers ;; esac; fi; }

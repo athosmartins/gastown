@@ -1,7 +1,7 @@
 ## Contents
 
 - O que isto resolve
-- Os dois pisos
+- Os três pisos
 - Quem faz o quê (4 peças, entregues em fatias)
 - heavy-guard.sh: uso e códigos de saída
 - Trecho pronto para o pre-commit do repo beads
@@ -17,14 +17,17 @@
 
 A ga-vln2py foi recusada pelo gate no teto de tamanho (E11) e entregue em 4 fatias, uma branch e um marker cada. Este runbook cresce com elas: cada fatia acrescenta o que entrega (peças, interruptores, como conferir).
 
-## Os dois pisos
+## Os três pisos
 
 Uma fonte só: `packs/town-deltas/assets/scripts/disk-headroom-lib.sh` (MB livres no volume do swap e do Dolt).
 
 | Piso | Valor | Abaixo dele |
 |---|---|---|
 | `DISK_HEAVY_MIN_MB` | 6144 (6 GB) | passo pesado não começa nesta máquina (`heavy-guard.sh` recusa) |
+| `DISK_GO_MIN_MB` | 13312 (13 GB) | `go build/test/vet/install` não começa nesta máquina (ga-edkfip). O `heavy-guard.sh` usa o MAIOR entre este e o de passo pesado; a recusa manda o passo ao MBP (`mbp-run.sh --exec --go`, receita em `mbp-offload.md`, "Go no MBP") |
 | `DISK_NEW_WORK_MIN_MB` | 5120 (5 GB) | nada NOVO deve começar. Quem lê este piso: as sondas do pool (peça 3, ga-09hfgh) e, em outra fatia, o Pilot (ga-ydaslo); o `heavy-guard.sh` não lê (usa o seu) |
+
+O de Go (ga-edkfip) existe porque 6 GB não bastou: 19/10 06:03-06:09 um build frio de `cmd/gc` começou com o disco logo acima de 6 GB, escreveu ~4 GB de cache em 6 minutos e deixou 2 GB — o Dolt ficou no piso CRÍTICO por dois ciclos até alguém matar o build à mão. Um build/teste frio do engine escreve 4–10 GB (medido) e o `dolt-disk-floor-guard` vai a CRÍTICO com 3 GB: 10 + 3 = 13. Com ~7 GB livres (19/10) isso significa "Go não roda no mini": roda no MBP.
 
 O de passo pesado é mais alto de propósito: um passo precisa de folga para TERMINAR, o despacho só precisa de espaço para começar. Três estados, nunca dois: `ok`, `low`, `unknown` (df falhou ou não é número). O `heavy-guard.sh` falha FECHADO em `unknown` (o passo guardado falha por ENOSPC no banco). Quem decide sobre trabalho NOVO (fatias seguintes) deve falhar ABERTO e dizer isso no log: um soluço do df não pode parar a cidade.
 
@@ -47,9 +50,11 @@ heavy-guard.sh --check [--min-free-mb N] [--wait-secs S] [--what RÓTULO]
 | rc | Significa | O que fazer |
 |---|---|---|
 | (o do comando) | rodou | — |
-| 75 | disco abaixo do piso (6 GB), mesmo depois da espera | NÃO rode por outro caminho. Selftest do hq: `mbp-run.sh --repo hq` (nó Linux). `go build`/lint não vão ao nó hoje. Ou espere e tente de novo; se não voltar, avise o Mayor |
+| 75 | disco abaixo do piso (6 GB; 13 GB para um passo Go), mesmo depois da espera | NÃO rode por outro caminho. Selftest do hq: `mbp-run.sh --repo hq` (nó Linux). `go test/build/vet/install`: MBP, `mbp-run.sh --exec --go` (a mensagem da recusa traz o comando). `golangci-lint` não tem destino remoto hoje. Ou espere e tente de novo; se não voltar, avise o Mayor |
 | 76 | não consegui ler o disco (df falhou, leitura com mais de 9 dígitos, ou a lib não carregou: esta última também vai ao log) | o passo também é recusado; tente de novo; se persistir, avise o Mayor |
 | 64 | uso errado (inclui `--min-free-mb` ou `--wait-secs` com mais de 9 dígitos: acima do que `[ -lt ]` compara, um piso assim valeria "folga") | corrija a chamada |
+
+**Passo Go (ga-edkfip).** Conta como Go o passo cujo `--what` começa com `go` + `-`, `_` ou espaço + `test|build|vet|install` (maiúsculas não importam: `go-test`, `Go build ./cmd/gc`; `go-testdata` e `gopher-build` não são Go), ou cujo comando traz `go <verbo>` como palavra — também dentro de `sh -c '…'`, depois de `;`, `&&`, `|`, `(`, e atrás de `env K=V` ou de um caminho (`/opt/homebrew/bin/go test`). Um script que roda go por dentro (`bash scripts/x.sh`) NÃO é visto: rotule `--what go-test`. Falso positivo (um `echo go test`) só aplica o piso mais alto, nunca o mais baixo. `--min-free-mb` pode SUBIR o piso de uma chamada Go, nunca baixá-lo. Lib sem `DISK_GO_MIN_MB` (mais velha que o guarda) recusa o passo Go com 76 e diz por quê; ela não cai para o piso de 6 GB. O log da recusa leva `class=go`.
 
 75/76 ficam FORA da faixa 96..99 do `mbp-run.sh` ("rode local") de propósito: uma recusa nunca pode ser lida como licença para rodar aqui. Cada recusa vai (melhor esforço) para `$GC_CITY_PATH/.gc/logs/heavy-guard.log`.
 
@@ -82,7 +87,7 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 | `DISK_HEADROOM_ENABLED=0` | toda leitura da lib vira `ok` (guarda, sondas e Pilot). O guarda avisa no stderr ("NOTE: ... bypassed") e grava `BYPASS` no log quando deixa passar por este interruptor ou por `DISK_FREE_OVERRIDE_MB`; o Pilot deixa um WARN `Disk floor gate bent by the environment` a cada sweep | nunca em produção |
 | `PILOT_DISK_FLOOR_ENABLED` | só o texto `0` desliga o gate do Pilot; `1` liga; outro valor mantém ligado e é nomeado no log (`neither 0 nor 1`) | nunca `0` em produção |
 | `DISK_FREE_OVERRIDE_MB=<n>` | fixa a leitura (n = MB; não numérico = ilegível) | selftests |
-| `DISK_NEW_WORK_MIN_MB` / `DISK_HEAVY_MIN_MB` | ajusta os pisos (valor não numérico volta ao padrão). No Pilot, `DISK_NEW_WORK_MIN_MB` diferente de 5120 vira o WARN `bent by the environment` com o piso em vigor | só com decisão registrada |
+| `DISK_NEW_WORK_MIN_MB` / `DISK_HEAVY_MIN_MB` / `DISK_GO_MIN_MB` | ajusta os pisos (valor não numérico volta ao padrão). No Pilot, `DISK_NEW_WORK_MIN_MB` diferente de 5120 vira o WARN `bent by the environment` com o piso em vigor | só com decisão registrada |
 
 ## Como conferir que está vivo
 
@@ -96,7 +101,8 @@ Um commit recusado com 75 não é um commit falho: espere o disco ou rode o comm
 ## Limites conhecidos
 
 - O guarda só protege quem o chama. Hoje: o selftest do jsonl-archive, o fallback local das baterias (por doutrina) e o gate. O pre-commit do beads depende do trecho acima ser aplicado naquele repo.
-- `go build` e `golangci-lint` não têm destino remoto hoje; com disco baixo eles esperam.
+- `go test/build/vet/install` têm destino remoto: o MBP, por `mbp-run.sh --exec --go` (não o nó Linux: `--exec` roda só no MBP). Com o MBP fora (rc 96..99) o passo ESPERA, não volta ao mini. `golangci-lint` não tem destino remoto hoje; com disco baixo ele espera.
+- A detecção de passo Go olha o rótulo e a linha de comando, não o que um script faz por dentro; um build disparado por `make`, `bash x.sh` ou um hook só é guardado se quem chama rotular o passo `go-…`.
 - O parágrafo do gate sobre baterias do hq (`gate_hq_selftest_rules`) só sai com o nó ligado (`.gc/hetzner-node.on`); com o nó desligado o revisor não recebe a instrução do guarda por ali (o pool recebe pela seção `hq-selftest-node`, sempre).
 - Uma sessão que JÁ está dentro de um passo quando o disco cai não é interrompida por esta fatia.
 - A sonda longa `sh -c '…'` que o ENGINE renderiza no prompt do dog não passa pelo hold (só o `pool-probe.sh` passa; é ele que a doutrina manda usar desde a ga-witezg). O risco são as beads já roteadas ao dog (por qualquer caminho) enquanto ele usa a sonda longa.

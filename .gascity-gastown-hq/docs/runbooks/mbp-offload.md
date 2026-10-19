@@ -3,7 +3,7 @@
 ## Contents
 
 • Por quê e resultado medido (11/10/2026) · Como ligar e desligar · **Presença do Athos: o MBP é o notebook dele (ga-77c1qg)** · Como usar
-• Sessões de pool no MBP (ga-w7qwl1) · Revisor do gate (ga-xm1jfl) · **Atalho do pytest dos workers e crews (ga-fl2nek)** · **Nó Linux de testes (Hetzner, ga-zri39b)** · REA pesado: `rea-run.sh` · Host do MBP: Tailscale por padrão (ga-bmmxka) · Códigos de saída · O que mora no MBP (`~/gt-remote`) · Manutenção
+• Sessões de pool no MBP (ga-w7qwl1) · Revisor do gate (ga-xm1jfl) · **Atalho do pytest dos workers e crews (ga-fl2nek)** · **Nó Linux de testes (Hetzner, ga-zri39b)** · REA pesado: `rea-run.sh` · **Go no MBP (ga-edkfip)** · Host do MBP: Tailscale por padrão (ga-bmmxka) · Códigos de saída · O que mora no MBP (`~/gt-remote`) · Manutenção
 • Limites conhecidos
 
 ## Por quê e resultado medido (11/10/2026)
@@ -79,6 +79,8 @@ scripts/mbp-run.sh --repo wa --dir <worktree> -- tests/test_x.py tests/test_y.py
 # comando pesado (REA/APK): roda em ~/gt-remote/exec/<slot>, scratch apagado no fim
 scripts/mbp-run.sh --exec --push /caminho/app.asar --pull out.json:/scratch/ -- \
   sh -c 'rea analyze-javascript-application in/app.asar --integrity-policy record-and-continue --json > out.json'
+# go test/build/vet do engine (cmd/gc): no MBP, nunca no mini (ga-edkfip) — receita em "Go no MBP"
+scripts/mbp-run.sh --exec --go --push go.mod --push go.sum --push internal --push cmd -- sh -c 'cd in && go test ./internal/mail/...'
 scripts/mbp-run.sh --check       # saúde do MBP
 scripts/mbp-run.sh --seed wa|ps  # (re)semeia base + site-packages (com checagem de hash)
 ```
@@ -153,6 +155,22 @@ O `pytest` dirigido do worker e da crew passa a ir ao MBP sem o worker decidir n
 - **`--pull` conferido**: o `mbp-run.sh` só avisa quando o pull falha e sai com o rc do comando (0); por isso o wrapper compara o destino antes/depois por identidade (inode + ctime + tamanho — mtime não serve, o `rsync -a` copia o do MBP) e, se nada mudou, sai 93 com `reason` `pull-falhou` (rc do comando mantido se já era ≠ 0). Limite: pull de arquivo byte-idêntico que o rsync pulou lê como "não chegou"; apague o destino antigo antes de pedir de novo.
 - **Configuração numérica** (`REA_RUN_MIN_FREE_GB`, `_MAX_SWAP_MB`, `_WAIT_S`, `_TIMEOUT_S`, `_KILL_GRACE_S`, `_LOCK_ORPHAN_S`, `_REAP_WAIT_S`, `_NICE`, `--wait-s`): só decimal sem sinal, sem zero à esquerda, até 12 dígitos; `08`/`010` (octal na aritmética do bash) e valores que estourariam a conta GB→KB são 93, sem rodar. Dois `--push` com o mesmo nome também são recusados (94).
 `rea-run.sh --check` mostra disco, swap e outro `rea` e sai 0/92/93 (use antes de subir o Chrome do recon web). `--local` é obrigatório quando o comando fala com algo do mini, como o Chrome descartável em 127.0.0.1:$PORT. Se o ssh cair no meio, o rc 98 do `mbp-run.sh` faz o comando rodar de novo no mini (ele pode já ter rodado, em parte, no MBP): só comando de leitura/recon. Teste: `scripts/rea-run.selftest.sh` (hermético, com controle negativo por mutação).
+
+## Go no MBP (ga-edkfip)
+**Por quê.** 19/10 06:03–06:09 o `heavy-guard.sh` liberou um `go test` do engine com o disco logo acima do piso de 6 GB; o build frio de `cmd/gc` escreveu ~4 GB em 6 minutos, o disco foi a 2 GB e o Dolt ficou no piso CRÍTICO por dois ciclos (build morto à mão). Hoje o guarda recusa `go build/test/vet/install` no mini com menos de 13 GB livres (rc 75, `docs/runbooks/disk-trabalho-pesado.md`) e a mensagem da recusa traz o comando abaixo. O dog-6 (ga-yi067e) e o dog-4 (ga-m1sa2l) rodaram testes do engine assim, com sucesso.
+
+**Comando** (de dentro do worktree do engine; `--push P` cai em `~/gt-remote/exec/<slot>/in/P` e o comando roda UM nível acima de `in/`, por isso o `cd in`):
+```bash
+"$GC_CITY_PATH/scripts/mbp-run.sh" --exec --go \
+  --push go.mod --push go.sum --push internal --push cmd --push third_party \
+  --push examples --push test --push schemas --push schemas_embed.go --push docs \
+  -- sh -c 'cd in && go test ./internal/mail/... && go vet ./internal/mail/...'
+```
+Mande só o que o teste lê (cada `--push` é um rsync); `go.mod`, `go.sum`, `internal` e `cmd` são o mínimo. **Um `--push` de caminho que não existe sai com rc 98** (`push de X falhou`), o MESMO código de "MBP indisponível": confira que o caminho existe no worktree (`ls`) antes de concluir que o MBP caiu. Faltou `examples/` ou `test/`? O build reclama de pacote ou arquivo embutido ausente: acrescente o `--push`. O Go do MBP é 1.25.x com `GOTOOLCHAIN=auto`: se o `go.mod` pede uma versão maior, ele baixa a toolchain sozinho na primeira vez.
+
+**O que o `--go` faz** (e só isso): põe no comando as três variáveis de CGO que o build do engine exige no MBP — `CGO_CPPFLAGS=-I/opt/homebrew/opt/icu4c/include`, `CGO_LDFLAGS=-L/opt/homebrew/opt/icu4c/lib` e `CGO_CXXFLAGS=-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1` (o c++ das Command Line Tools do MBP não acha `<cstddef>` sozinho: os cabeçalhos só estão no SDK). Sem elas o build cai primeiro em "icu headers" e depois em `<cstddef>`; foram as rodadas 2 e 3 do dog-6. Um `--env CGO_LDFLAGS=…` seu com o mesmo nome VENCE o do `--go`. `--go` implica `--exec`; com `--check`/`--seed`/… dá rc 97. Não empurra código por você e não escolhe o pacote a testar.
+
+**Regras que valem para qualquer teste no MBP.** O rc do comando é o do teste (0..95); 96..99 = o MBP não pôde rodar (desligado, pausado, sem saúde, slots cheios): ESPERE e tente de novo, não rode `go test` no mini por outro caminho — o guarda existe por causa disso — e avise o Mayor se o MBP não volta. `--exec` não vai ao nó Linux. Prove o teste contra o HEAD anterior também (A/B), imprimindo o `sha256` dos arquivos testados, como o dog-6 fez, para que o resultado seja do código que virou patch.
 
 ## Host do MBP: Tailscale por padrão (ga-bmmxka)
 **Estado:** vale a partir do merge, nos scripts do repo (`mbp-run.sh`, `dolt-restore-lab-mbp.sh`, `mbp-proof.py`; neste último só `e2e` e `install --apply` sondam — `plan` e `install` sem `--apply` não conectam e mostram o nome do Tailscale; o `ssh` do host `mbp` na config do provider é fixo e fica fora disto, ver `gc-session-ssh.md`); nada muda no MBP, e `caffeinate` NÃO entra (o MBP não dormia). **Por quê:** com a tela do MBP travada a rota mDNS (`athoss-macbook-pro.local`) cai e o nome do Tailscale (`athoss-macbook-pro`) responde, então o padrão `.local` fazia o offload ver "MBP inalcançável" (98) com o MBP de pé. **Regra** (`scripts/mbp-host.sh`; `bash scripts/mbp-host.sh` imprime a escolha de agora): `MBP_HOST` (ou `MBP_PROOF_SSH` no mbp-proof) definido vale como está e nunca é sondado; sem ele, porta 22 do Tailscale respondeu → `athos@athoss-macbook-pro`; senão porta 22 do `.local` respondeu → `athos@athoss-macbook-pro.local`; senão (nenhum respondeu, `nc` ausente, sonda ilegível) → o Tailscale. Só evidência positiva troca o padrão; as duas sondas largam juntas, cada uma com relógio de `MBP_HOST_PROBE_S` (2 s), então um MBP desligado custa no máximo ~2 s a mais por chamada — e só de quem vai mesmo falar com o MBP: no `mbp-run.sh` a sonda é preguiçosa (corre em `use_host mbp`), então `--host linux`, um pytest que roda no nó e o offload desligado (99) não pagam. `MBP_TS_HOST` / `MBP_LAN_HOST` trocam os dois nomes. O remendo à mão no `~/.ssh/config` do mini (`Host athoss-macbook-pro.local` → `HostName athoss-macbook-pro`) fica redundante e pode ser removido pelo Athos; enquanto existir, ele também faz o ramo `.local` falar com o Tailscale.

@@ -551,6 +551,20 @@ reset; printf '#!/usr/bin/env bash\necho "FOO=$FOO"\n' > "$T/bin/fakecmd"; chmod
 STUB_RUNMODE=exec STUB_LOCKED=0 STUB_IDLE_S=30 "$RUN" --exec --env FOO=bar -- "$T/bin/fakecmd" >"$T/out" 2>"$T/err"; expect "exec em uso" 0 "$?"
 has "exec: --env chega ao comando" "$T/out" 'FOO=bar'; has "exec em uso: nice -n 19" "$STUB_LOG" '^NICE:-n 19$'; has "exec em uso: sob taskpolicy -b" "$STUB_LOG" 'TP:-b nice -n 19 '
 reset; STUB_RUNMODE=exec "$RUN" --exec -- "$T/bin/fakecmd" >"$T/out" 2>"$T/err"; has "exec livre: nice -n 10" "$STUB_LOG" '^NICE:-n 10$'
+# --go (ga-edkfip): as 3 variáveis de CGO do build de Go no MBP chegam ao comando sem o chamador copiá-las; um --env do chamador com o
+# mesmo nome VENCE; --go sozinho implica --exec; com outro modo é uso errado (97) e nada roda
+printf '#!/usr/bin/env bash\necho "CPP=$CGO_CPPFLAGS"\necho "LD=$CGO_LDFLAGS"\necho "CXX=$CGO_CXXFLAGS"\necho "FOO=$FOO"\n' > "$T/bin/gocmd"; chmod +x "$T/bin/gocmd"
+reset; STUB_RUNMODE=exec "$RUN" --exec --go -- "$T/bin/gocmd" >"$T/out" 2>"$T/err"; expect "exec --go" 0 "$?"
+has "--go: CGO_CPPFLAGS aponta o include do icu4c" "$T/out" '^CPP=-I/opt/homebrew/opt/icu4c/include$'
+has "--go: CGO_LDFLAGS aponta a lib do icu4c" "$T/out" '^LD=-L/opt/homebrew/opt/icu4c/lib$'
+has "--go: CGO_CXXFLAGS chega como UM valor com espaço (-isystem <SDK>/c++/v1)" "$T/out" '^CXX=-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX\.sdk/usr/include/c\+\+/v1$'
+reset; STUB_RUNMODE=exec "$RUN" --go -- "$T/bin/gocmd" >"$T/out" 2>"$T/err"; expect "--go sozinho implica --exec" 0 "$?"; has "--go sozinho: as variáveis chegaram" "$T/out" '^LD=-L/opt/homebrew/opt/icu4c/lib$'
+reset; STUB_RUNMODE=exec "$RUN" --exec --go --env CGO_LDFLAGS=-L/outro --env FOO=bar -- "$T/bin/gocmd" >"$T/out" 2>"$T/err"; expect "--go com --env do chamador" 0 "$?"
+has "--env do chamador com o mesmo nome VENCE o do --go" "$T/out" '^LD=-L/outro$'; has "--go mantém as outras duas" "$T/out" '^CPP=-I/opt/homebrew/opt/icu4c/include$'; has "--env de outro nome continua valendo" "$T/out" '^FOO=bar$'
+reset; STUB_RUNMODE=exec "$RUN" --exec -- "$T/bin/gocmd" >"$T/out" 2>"$T/err"; hasnt "sem --go as variáveis de CGO NÃO aparecem" "$T/out" '^(CPP|LD|CXX)=.'
+reset; "$RUN" --go --check >"$T/out" 2>"$T/err"; expect "--go com --check: 97 (uso errado)" 97 "$?"; has "--go com --check: a mensagem diz o porquê" "$T/err" '\-\-go só vale com \-\-exec'
+reset; "$RUN" --go --seed wa >"$T/out" 2>"$T/err"; expect "--go com --seed: 97" 97 "$?"; hasnt "--go com --seed: nada foi falado com o MBP" "$STUB_LOG" 'SEED|RSYNC|HOSTCALL'
+reset; "$RUN" --host linux --exec --go -- "$T/bin/gocmd" >"$T/out" 2>"$T/err"; expect "--host linux --exec --go: 97 (o nó não roda --exec)" 97 "$?"
 # erro de configuração dentro do MBP: sem o espelho, rc 97
 reset; rmdir "$T/home/gt-remote/mirror/wa-1"; rc=$(STUB_RUNMODE=exec runs -- tests/test_x.py); expect "espelho ausente: rc 97 (como antes)" 97 "$rc"; mkdir -p "$T/home/gt-remote/mirror/wa-1"
 
