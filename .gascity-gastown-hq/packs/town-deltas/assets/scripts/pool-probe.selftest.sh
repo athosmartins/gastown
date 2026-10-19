@@ -448,8 +448,68 @@ case "$D_ERR" in *"tier(s) 1 unreadable"*) ok "…and stderr says tier 1 was unr
 rm -f "$FIX/tier1.limit0.fail"; printf 'not json' > "$FIX/tier1.limit0.raw"; win 3000
 eq "refetch answers something that is not JSON: [] exit 3" "$D_OUT:$D_RC" "[]:3"
 rm -f "$FIX/tier1.limit0.raw"
+# ga-nyug12 (gate attempt 1): the COUNTS that decide the refetch are reads too. A `jq length` that cannot answer must never read as
+# "0 beads": it marks tier 1 unreadable, so a `[]` comes out as exit 3 ("this is not no work"), not as a quiet exit 0.
+# FAKEJQ hands everything to the real jq except the N-th call that is exactly `jq length`. On the refetch path the probe makes five:
+# 1 n_before, 2 n_after, 3 n_window (these three decide), 4 and 5 the refetch's own counts (log text only). The control below pins
+# that numbering, so a probe that adds or drops a count turns this block red instead of silently testing the wrong call.
+# JQ_FAIL_MODE=exit makes the chosen call fail (rc 5); JQ_FAIL_MODE=empty makes it answer NOTHING with rc 0.
+REAL_JQ="$(command -v jq)"; FAKEJQ="$TMP/fakejq"; mkdir -p "$FAKEJQ"
+cat > "$FAKEJQ/jq" <<'EOF'
+#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = length ]; then
+  n=$(cat "$JQ_COUNT" 2>/dev/null); n=$(( ${n:-0} + 1 )); printf '%s' "$n" > "$JQ_COUNT"
+  if [ "$n" = "${JQ_FAIL_LENGTH:-0}" ]; then [ "${JQ_FAIL_MODE:-exit}" = empty ] && exit 0; exit 5; fi
+fi
+exec "$REAL_JQ" "$@"
+EOF
+chmod +x "$FAKEJQ/jq"
+jq_count() { cat "$TMP/jq.count" 2>/dev/null || echo 0; }
+jqfail() { # <N: the bare `jq length` call that fails; 99 = none> -> a fresh `win 3000` with the wrapper in front of the real jq
+  rm -f "$TMP/jq.count"
+  # POOL_PROBE_DISK_LIB: a mutant script lives in $TMP, where the lib is not next to it - without this it would read the disk as
+  # "unknown", fail open and hand out a story, and die of THAT instead of the guard it dropped
+  win 3000 PATH="$FAKEJQ:$FAKE:$PATH" JQ_COUNT="$TMP/jq.count" JQ_FAIL_LENGTH="$1" JQ_FAIL_MODE="${JQ_FAIL_MODE:-exit}" REAL_JQ="$REAL_JQ" POOL_PROBE_DISK_LIB="$GOOD_LIB"
+}
+mk_window 20 1; jqfail 99
+eq "control: a jq wrapper that never fails changes nothing (the formula bead is handed out), and the probe makes the 5 bare 'jq length' calls counted below" "$D_IDS:$D_RC:$D_ERR|$(jq_count)" "mol-late:0:|5"
+mk_window 20 1; jqfail 1
+eq "n_before unreadable (full window, formula bead outside it): never a quiet drain - [] exit 3" "$D_OUT:$D_RC" "[]:3"
+case "$D_ERR" in *"tier(s) 1 unreadable"*) ok "…and stderr says tier 1 was unreadable" ;; *) bad "…stderr lacks 'tier(s) 1 unreadable': $D_ERR" ;; esac
+grep -q 'held back ? new story' "$TMP/pp.log" && ok "…and the log shows '?' for the count it could not read, not a made-up number" || bad "the log line for an unreadable count is not '?': $(cat "$TMP/pp.log")"
+mk_window 20 0; jqfail 2
+eq "n_after unreadable (nothing but stories): at worst one harmless extra refetch, but the tier stays marked - [] exit 3, not 0" "$D_OUT:$D_RC|$(t1_unlimited)" "[]:3|1"
+mk_window 20 1; jqfail 3
+eq "n_window unreadable: [] exit 3 and no refetch on a guess (before the guard this was [] exit 0 = drain while the formula bead waits)" "$D_OUT:$D_RC|$(t1_unlimited)" "[]:3|0"
+case "$D_ERR" in *"tier(s) 1 unreadable"*) ok "…and stderr says tier 1 was unreadable" ;; *) bad "…stderr lacks 'tier(s) 1 unreadable': $D_ERR" ;; esac
+mk_window 20 1; JQ_FAIL_MODE=empty jqfail 3
+eq "n_window answered NOTHING with rc 0 (not only a failing jq): the same [] exit 3" "$D_OUT:$D_RC" "[]:3"
+mk_window 20 1; jqfail 4
+eq "the refetch's counts are log text only: n_all unreadable still hands out the formula bead, silent on stderr" "$D_IDS:$D_RC:$D_ERR" "mol-late:0:"
+grep -q 'refetched without a limit: ? new story/stories held back, 1 left' "$TMP/pp.log" && ok "…and the log says '?' for what it could not count, and the 1 bead that is left" || bad "n_all log line wrong: $(cat "$TMP/pp.log")"
+mk_window 20 1; jqfail 5
+eq "n_all_held unreadable: the formula bead is still handed out" "$D_IDS:$D_RC:$D_ERR" "mol-late:0:"
+if grep -q 'held back, ? left' "$TMP/pp.log" && ! grep -q 'held back, 0 left' "$TMP/pp.log"; then ok "…and the log says '? left', never '0 left' for a list that has a bead"; else bad "n_all_held log line wrong: $(cat "$TMP/pp.log")"; fi
+# mutants of the guards: each drops ONE guard and must fail the way the bug did - the quiet drain, "[]" exit 0 - instead of the
+# correct "[]" exit 3. Any other answer (a story handed out, say) means the mutant died of something else, which proves nothing.
+guard_mutant() { # <name> <sed expr> <failing call> <stories> <formula 0|1> [fail mode: exit|empty]
+  sed "$2" "$PROBE" > "$TMP/pp-g-$1.sh"
+  cmp -s "$PROBE" "$TMP/pp-g-$1.sh" && { bad "guard mutant '$1' did not change the script"; return; }
+  mk_window "$4" "$5"
+  DPROBE="$TMP/pp-g-$1.sh" JQ_FAIL_MODE="${6:-exit}" jqfail "$3"
+  case "$D_OUT:$D_RC" in
+    "[]:0") ok "guard mutant '$1' is killed: it drains quietly ([] exit 0) where the real script says exit 3" ;;
+    "[]:3") bad "guard mutant '$1' SURVIVED (still [] exit 3)" ;;
+    *)      bad "guard mutant '$1' died of something else ($D_OUT exit $D_RC), not of the missing guard" ;;
+  esac
+}
+guard_mutant n_before-unmarked 's/^\(    n_before=.*\) || mark 1$/\1/' 1 20 1
+guard_mutant n_after-unmarked  's/^\(    n_after=.*\) || mark 1$/\1/' 2 20 0
+guard_mutant n_window-unmarked 's/^\(    n_window=.*\) || mark 1$/\1/' 3 20 1
+guard_mutant empty-answer-counts 's/^  \[ -n "\$pp_n" \] || return 1$/  :/' 3 20 1 empty
+rm -f "$TMP/jq.count"
 # mutants of the refetch: each must flip one of the answers above (a mutant that changes nothing is itself a failure)
-refetch_mutant() { # <name> <sed expr> <scenario: ok|fail> <want "ids:rc|calls" that the CORRECT script does NOT give>
+refetch_mutant() { # <name> <sed expr> <scenario: ok|veto|fail> <"ids:rc|calls" the CORRECT script gives; the mutant is killed when it gives anything else>
   sed "$2" "$PROBE" > "$TMP/pp-m-$1.sh"
   cmp -s "$PROBE" "$TMP/pp-m-$1.sh" && { bad "refetch mutant '$1' did not change the script"; return; }
   rm -f "$FIX/tier1.limit0.fail"
@@ -461,7 +521,7 @@ refetch_mutant() { # <name> <sed expr> <scenario: ok|fail> <want "ids:rc|calls" 
   DPROBE="$TMP/pp-m-$1.sh" win 3000 POOL_PROBE_DISK_LIB="$GOOD_LIB"
   [ "$D_IDS:$D_RC|$(t1_calls)" != "$4" ] && ok "refetch mutant '$1' is killed (answers $D_IDS:$D_RC after $(t1_calls) tier-1 call(s))" || bad "refetch mutant '$1' SURVIVED"
 }
-refetch_mutant never-refetches 's/-ge 20 \]; then$/-ge 99999 ]; then/' ok "mol-late:0|2"
+refetch_mutant never-refetches 's/-ge "\$t1_window" \]; then$/-ge 99999 ]; then/' ok "mol-late:0|2"
 refetch_mutant ignores-the-refetch 's/^        t1_kept="\$t1_all_held"$/        t1_kept="$t1_kept"/' ok "mol-late:0|2"
 refetch_mutant unreadable-refetch-is-nothing 's/^        mark 1; t1_kept="\[\]"$/        t1_kept="[]"/' fail "-:3|2"
 refetch_mutant refetches-after-a-veto 's/\[ "\${n_before:-0}" -gt 0 \] \&\& //' veto "-:0|1"

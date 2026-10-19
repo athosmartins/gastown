@@ -84,6 +84,20 @@ pp_log() {
 }
 [ "$disk_state" = unknown ] && pp_log "free disk unreadable (lib=$disk_lib) - fail-open, new stories not held back (ga-vln2py)"
 
+# The length of the JSON list in $1, on stdout. rc 1 and NOTHING on stdout when jq cannot say (it failed, or it answered nothing).
+# One definition for a count (ga-nyug12, gate attempt 1): a count that could not be read is not 0. A caller that DECIDES on a count
+# marks the tier unreadable (`n=$(pp_len "$x") || mark 1`); a caller that only prints it uses pp_minus, which shows "?".
+pp_len() {
+  pp_n=$(printf "%s" "$1" | jq length 2>/dev/null) || return 1
+  [ -n "$pp_n" ] || return 1
+  printf "%s" "$pp_n"
+}
+# $1 - $2 for a log line, "?" when either count is missing. Log text only: nothing decides on what this prints.
+pp_minus() {
+  [ -n "$1" ] && [ -n "$2" ] || { printf "?"; return 0; }
+  printf "%s" "$(( $1 - $2 ))"
+}
+
 # The veto filter every tier ends with (the engine's poolDemandLabelFilterJQ). The engine pastes the
 # same 655-byte program into all three tiers; it is one variable here. Prefix families (bd's
 # --exclude-label is exact, so these cannot be flags), an unexpired pilot hold, EPIC-titled beads.
@@ -134,31 +148,40 @@ t1_fetch() { # $1 = --limit: the engine asks for 20; the disk hold may ask again
     --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" \
     --exclude-label "gate:reviewing" --json --sort oldest --limit="$1" 2>/dev/null
 }
-t1_raw=$(t1_fetch 20) || mark 1
+# The engine asks for 20 in tier 1. The refetch test below compares the size of the answer with this SAME number: one definition.
+t1_window=20
+t1_raw=$(t1_fetch "$t1_window") || mark 1
 t1_kept=$(printf "%s" "$t1_raw" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null) || mark 1
 if [ "$disk_state" = low ]; then
   # vazio/falhou/ilegível (no hold text, or jq failed) -> tier 1 answers NOTHING (inert) and is marked unreadable, like any
   # tier that could not be read: if tiers 2 and 3 find nothing either, the exit-3 line on stderr says so. A hold that could
   # not be applied is never read as "no work" and never as "go ahead"
   if [ -n "$disk_hold_jq" ] && t1_held=$(printf "%s" "$t1_kept" | jq -c "$disk_hold_jq" 2>/dev/null); then
-    n_before=$(printf "%s" "$t1_kept" | jq length 2>/dev/null); n_after=$(printf "%s" "$t1_held" | jq length 2>/dev/null)
-    pp_log "free disk under the floor - tier 1 held back $(( ${n_before:-0} - ${n_after:-0} )) new story/stories (ga-vln2py)"
+    # The three counts below DECIDE the refetch, so all three are read the same way (gate attempt 1 caught the window size guarded
+    # and its two siblings not). A count that cannot be read stays EMPTY and the decision test reads it as 0; what tells it apart
+    # from a list that really has 0 beads is the mark: tier 1 is marked unreadable, so if tiers 2 and 3 find nothing either the
+    # exit-3 line says `[]` is not "no work". A list that is really empty counts 0 WITHOUT the mark.
+    # vazio -> 0, no mark; falhou/ilegível (jq cannot count it, or answers nothing) -> tier 1 marked, count empty = 0: the "-gt 0" fails, no refetch on a guess
+    n_before=$(pp_len "$t1_kept") || mark 1
+    # vazio -> 0, no mark; falhou/ilegível -> tier 1 marked, count empty = 0: the "-eq 0" holds, so at worst ONE harmless extra refetch (it re-applies veto and hold itself)
+    n_after=$(pp_len "$t1_held") || mark 1
+    # vazio -> 0, no mark; falhou/ilegível -> tier 1 marked, count empty = 0: the "-ge" fails, no refetch - and never the silent conclusion "the window was not full"
+    n_window=$(pp_len "$t1_raw") || mark 1
+    pp_log "free disk under the floor - tier 1 held back $(pp_minus "$n_before" "$n_after") new story/stories (ga-vln2py)"
     t1_kept="$t1_held"
-    # vazio/falhou/ilegível (the window size cannot be read) -> tier 1 is marked unreadable and counts as 0: no refetch, never a
-    # silent "the window was not full" (t1_raw already went through jq above, so this read failing means jq itself is gone)
-    n_window=$(printf "%s" "$t1_raw" | jq length 2>/dev/null) || mark 1
-    if [ "${n_before:-0}" -gt 0 ] && [ "${n_after:-0}" -eq 0 ] && [ "${n_window:-0}" -ge 20 ]; then
+    if [ "${n_before:-0}" -gt 0 ] && [ "${n_after:-0}" -eq 0 ] && [ "${n_window:-0}" -ge "$t1_window" ]; then
       # vazio/falhou/ilegível (bd failed, the answer is empty or not JSON, or the hold cannot read it) -> tier 1 is marked
       # unreadable and answers NOTHING (inert; exit 3 if tiers 2 and 3 find nothing either); a valid [] is a real "nothing"
       if t1_all=$(t1_fetch 0) \
         && t1_all_kept=$(printf "%s" "$t1_all" | jq -c --argjson now_ts "$(date +%s)" "$VETO_FILTER" 2>/dev/null) \
         && t1_all_held=$(printf "%s" "$t1_all_kept" | jq -c "$disk_hold_jq" 2>/dev/null) && [ -n "$t1_all_held" ]; then
-        n_all=$(printf "%s" "$t1_all_kept" | jq length 2>/dev/null); n_all_held=$(printf "%s" "$t1_all_held" | jq length 2>/dev/null)
-        pp_log "free disk under the floor, the --limit=20 window held nothing but new stories - tier 1 refetched without a limit: $(( ${n_all:-0} - ${n_all_held:-0} )) new story/stories held back, ${n_all_held:-0} left (ga-nyug12)"
+        # vazio/falhou/ilegível -> LOG TEXT ONLY (the list itself was read above and is what gets used): a count jq cannot give prints "?", never "0 left"
+        n_all=$(pp_len "$t1_all_kept"); n_all_held=$(pp_len "$t1_all_held")
+        pp_log "free disk under the floor, the --limit=$t1_window window held nothing but new stories - tier 1 refetched without a limit: $(pp_minus "$n_all" "$n_all_held") new story/stories held back, ${n_all_held:-?} left (ga-nyug12)"
         t1_kept="$t1_all_held"
       else
         mark 1; t1_kept="[]"
-        pp_log "free disk under the floor, the --limit=20 window held nothing but new stories and the unlimited refetch could not be read - tier 1 answers nothing (ga-nyug12)"
+        pp_log "free disk under the floor, the --limit=$t1_window window held nothing but new stories and the unlimited refetch could not be read - tier 1 answers nothing (ga-nyug12)"
       fi
     fi
   else

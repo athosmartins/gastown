@@ -58,6 +58,9 @@ FIXTURE='[{"id":"p1-bead","priority":1,"issue_type":"task","created_at":"2026-01
 printf '%s' "$FIXTURE" > "$WORK/fixture.json"
 FIX_FIXTURE='[{"id":"fix-1","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","labels":["gate:needs-fix"]},{"id":"live-2","priority":2,"issue_type":"task","created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","labels":["impacto:dano-ao-vivo"]},{"id":"plain-3","priority":3,"issue_type":"task","created_at":"2026-01-03T00:00:00Z","updated_at":"2026-01-03T00:00:00Z","labels":[]}]'
 printf '%s' "$FIX_FIXTURE" > "$WORK/fixture-fix.json"
+# seven fix-class beads and one ordinary: crosses the 5-id cut of the NOTE (ga-nyug12, gate attempt 1: it used to cut silently)
+jq -n -c '[range(1; 8) | {id: ("fx-" + tostring), priority: ., issue_type: "task", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", labels: ["gate:needs-fix"]}]
+  + [{id: "plain-9", priority: 9, issue_type: "task", created_at: "2026-01-09T00:00:00Z", updated_at: "2026-01-09T00:00:00Z", labels: []}]' > "$WORK/fixture-fix7.json"
 
 # run_block <block-file> <disk-env...> — OUT / ERR
 run_block() {
@@ -112,6 +115,11 @@ check_template() {
   [ "$OUT" = "[]" ] && ok "$label: fix-class beads + disk 3000 MB -> still [] (the hold has no exception)" || bad "$label: fix-class beads + low disk did not answer [] (stdout: ${OUT:0:160})"
   case "$ERR" in *"NOTE disk floor (Step 1b2)"*"fix-1"*"live-2"*"gc session nudge mayor"*) ok "$label: …with a NOTE naming the held fix/live-damage beads and the Mayor nudge" ;; *) bad "$label: fix-class beads held by the low disk left no NOTE on stderr: ${ERR:0:300}" ;; esac
   case "$ERR" in *plain-3*) bad "$label: the NOTE names a bead that is not fix-class: ${ERR:0:300}" ;; *) ok "$label: …and does not name the ordinary bead" ;; esac
+  case "$ERR" in *"more)"*) bad "$label: two held beads, yet the NOTE carries a '(+N more)' marker: ${ERR:0:300}" ;; *) ok "$label: …and a short list carries no '(+N more)' marker" ;; esac
+  run_block "$blk" DISK_FREE_OVERRIDE_MB=3000 WA_FIXTURE="$WORK/fixture-fix7.json"
+  case "$ERR" in *"held back fix-class bead(s): fx-1 fx-2 fx-3 fx-4 fx-5 (+2 more) - "*) ok "$label: seven held fix-class beads -> the NOTE names the first five and says '(+2 more)'" ;; *) bad "$label: the NOTE for seven held beads does not read 'fx-1 .. fx-5 (+2 more)': ${ERR:0:400}" ;; esac
+  case "$ERR" in *fx-6*|*fx-7*|*plain-9*) bad "$label: the NOTE names a sixth/seventh or an ordinary bead: ${ERR:0:400}" ;; *) ok "$label: …and stops at five (no fx-6/fx-7, no ordinary bead)" ;; esac
+  case "$ERR" in *'gc session nudge mayor "low disk holds fx-1 fx-2 fx-3 fx-4 fx-5 (+2 more)"'*) ok "$label: …and the Mayor nudge carries the same marker" ;; *) bad "$label: the Mayor nudge for seven held beads lacks the marker: ${ERR:0:400}" ;; esac
   run_block "$blk" DISK_FREE_OVERRIDE_MB=3000 WA_FIXTURE="$WORK/fixture-fix.json" GATE_FOCUS_ACTIVE_OVERRIDE=1
   case "$ERR" in *"NOTE disk floor (Step 1b2)"*"fix-1"*) ok "$label: focus mode on + low disk -> the same NOTE" ;; *) bad "$label: focus mode + low disk left no NOTE: ${ERR:0:300}" ;; esac
   run_block "$blk" DISK_FREE_OVERRIDE_MB=100000 WA_FIXTURE="$WORK/fixture-fix.json"; got="$(first_id)"
@@ -134,6 +142,7 @@ check_template() {
   fi
   # ga-nyug12 (item 5): the 1b3 line says nothing on an unknown disk; that is right only because 1b2 ran first in the same turn, and the comment above it must say so
   sect="$(awk '/^# Step 1b3/ { f = 1 } f && /^export GATE_FOCUS_PROBE=/ { exit } f' "$tpl")"
+  case "$sect" in *"nothing warns"*"accepted"*) ok "$label: the Step 1b3 comment owns the residual gap (1b2 fine, 1b3 read fails -> nothing warns; accepted, fail open)" ;; *) bad "$label: the Step 1b3 comment claims more than the code does: it must say a 1b3-only failed read warns nobody" ;; esac
   case "$sect" in *"silent on purpose"*"same turn"*) ok "$label: the Step 1b3 comment says why an unknown disk is silent there (on purpose; 1b2 warned in the same turn)" ;; *) bad "$label: the Step 1b3 comment does not explain the silence on an unknown disk" ;; esac
   grep -E '^export GATE_FOCUS_PROBE=.*export DISK_HEADROOM_PROBE="\$\(\. .*disk-headroom-lib\.sh" 2>/dev/null && disk_headroom_state\)"; \{\{ \.RoutedPoolQuery \}\}' "$tpl" >/dev/null \
     && ok "$label: Step 1b3 reads the disk BEFORE the query pipeline" || bad "$label: Step 1b3 does not export DISK_HEADROOM_PROBE ahead of the Go-rendered query"
@@ -147,6 +156,10 @@ check_template() {
   cmp -s "$blk" "$WORK/$pfx.mut-nonote.sh" && bad "$label: mutant 'the NOTE is dropped' did not change the block"
   run_block "$WORK/$pfx.mut-nonote.sh" DISK_FREE_OVERRIDE_MB=3000 WA_FIXTURE="$WORK/fixture-fix.json"
   case "$ERR" in *"NOTE disk floor"*) bad "$label: mutant 'the NOTE is dropped' SURVIVED" ;; *) ok "$label: mutant 'the NOTE is dropped' is caught (a held fix-class bead would be silent again)" ;; esac
+  sed 's/ + (if length > 5 then " (+\\(length - 5) more)" else "" end)//' "$blk" > "$WORK/$pfx.mut-nomore.sh"
+  cmp -s "$blk" "$WORK/$pfx.mut-nomore.sh" && bad "$label: mutant 'the +N marker is dropped' did not change the block"
+  run_block "$WORK/$pfx.mut-nomore.sh" DISK_FREE_OVERRIDE_MB=3000 WA_FIXTURE="$WORK/fixture-fix7.json"
+  case "$ERR" in *"(+2 more)"*) bad "$label: mutant 'the +N marker is dropped' SURVIVED" ;; *) ok "$label: mutant 'the +N marker is dropped' is caught (seven held beads would read as five again)" ;; esac
   sed 's/^  \*) echo "WARN disk floor (Step 1b2): the free disk could not be read.*$/  *) '"$pfx"'_CAND="[]" ;;/' "$blk" > "$WORK/$pfx.mut-closed.sh"
   cmp -s "$blk" "$WORK/$pfx.mut-closed.sh" && bad "$label: mutant 'unknown fails closed' did not change the block"
   run_block "$WORK/$pfx.mut-closed.sh" DISK_FREE_OVERRIDE_MB=garbage

@@ -176,7 +176,8 @@ case "$DISK_HEADROOM_PROBE" in
     # gate:fix-attempt:*, origem:auto-healer-notify, impacto:dano-ao-vivo) is held back too. Say so, so it is not lost silently:
     # the answer stays [] (drain), the Mayor is the one who can decide to run it on a low disk (ga-nyug12).
     # vazio/falhou/ilegível (jq fails or finds none) -> no NOTE; the hold below still answers [] (the NOTE is information only)
-    WA_FIX_HELD="$(printf '%s' "$WA_CAND" | jq -r '[.[] | select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo")) | .id] | .[:5] | join(" ")' 2>/dev/null)"
+    # More than 5 held: the NOTE names the first 5 and ends with "(+N more)", so a long list is never read as a short one
+    WA_FIX_HELD="$(printf '%s' "$WA_CAND" | jq -r '[.[] | select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo")) | .id] | (.[:5] | join(" ")) + (if length > 5 then " (+\(length - 5) more)" else "" end)' 2>/dev/null)"
     [ -n "$WA_FIX_HELD" ] && echo "NOTE disk floor (Step 1b2): the free disk is under the new-work floor and held back fix-class bead(s): $WA_FIX_HELD - the answer is still [] (drain). If one of them must run now, warn the Mayor: gc session nudge mayor \"low disk holds $WA_FIX_HELD\"" >&2
     [ -n "$WA_CAND" ] && WA_CAND="[]" ;;
   ok) ;;
@@ -225,7 +226,9 @@ printf '%s\n' "$WA_PICK"
 # pool-probe-next-action-family.selftest.sh.
 # Disk floor in this step (ga-vln2py, ga-nyug12): DISK_HEADROOM_PROBE=low makes the post-filter below answer []. An unknown
 # disk (the lib is missing, df is unreadable) is silent on purpose HERE: it passes the bead through and prints no WARN of its
-# own, because Step 1b2 ran first in the same turn, read the same lib and already warned ("the free disk could not be read").
+# own, because Step 1b2 ran first in the same turn and, if it could not read the disk either, already warned ("the free disk
+# could not be read"). This step reads the disk AGAIN, on its own: when 1b2 read it fine and THIS read fails (a df hiccup
+# between the two calls), nothing warns - accepted, fail open, and the cost is one new bead handed out in that turn.
 # The same goes for the fix-class NOTE of a held bead: 1b2 said it. Do not add a second WARN/NOTE in this step - 1b2 owns
 # the words, and a copy here would be one more text to keep in step with it.
 export GATE_FOCUS_PROBE="$(. "${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/gate-focus-lib.sh" 2>/dev/null && gate_focus_active)"; export DISK_HEADROOM_PROBE="$(. "${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/disk-headroom-lib.sh" 2>/dev/null && disk_headroom_state)"; {{ .RoutedPoolQuery }} | jq -c '[.[] | select((.labels // []) | map(select(. == "delivery:pending-restart")) | length == 0) | select(((.labels // []) | map(select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))) | length) == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | (if (env.GATE_FOCUS_PROBE // "") == "1" then map(select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo"))) else . end) | (if (env.DISK_HEADROOM_PROBE // "") == "low" then [] else . end)'
