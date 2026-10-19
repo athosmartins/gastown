@@ -26,6 +26,11 @@
 #   mbp (ga-w7qwl1) — host de presença (notebook que dorme): `presence_gate`/`sleeps`/`path_extra` validados na config; start só abre com a regra de
 #   presença livre (pausa, bandeira, slot_cap e vigia de prioridade), a política local do guarda de clone vale ANTES dela; list-running tolera host
 #   que dorme e mantém o registro de sessões; recusa clara do host limpa o registro; /Users/ de outro home recusa.
+#   gui (ga-w7qwl1.1.8) — o tmux do MBP nasce num LaunchAgent POR SESSÃO do domínio gráfico (launchd/claude falsos em $T/extra): o plist fica em <raiz>/run (nunca em ~/Library/LaunchAgents), o label tem o prefixo
+#   fixo, o tmux server nasce no domínio gráfico e o claude da sessão enxerga o login, o claude só roda `auth status` e o Keychain não é tocado; o stop faz bootout, apaga e PROVA a ausência (print rc 113; 112 = sem
+#   o domínio; rc 1 ou label ainda carregado = o stop FALHA e a sessão fica no registro); o start recusa (exit 1, com a causa, nada aberto/carregado/em run/, evento 'refused') sem sessão gráfica, com o claude
+#   deslogado, ilegível, contraditório, travado, com plutil/bootstrap/tmux do agente falhando; varre antes de criar o novo as órfãs do prefixo (só arquivos, só no domínio, carregada+arquivos), poupa a de sessão
+#   viva e o que não é nosso, e se não prova a ausência de uma órfã não cria o agente novo; teto, nome repetido, sessão que morre logo e a regra de presença vêm antes/limpam; config de gui_agent/gui_wait_s/gui_proof_s.
 #   prep (ga-2hd02v.1.5.9) — o start grava a identidade git POR worktree e a confiança da pasta em ~/.claude.json do host, e qualquer falha derruba o start sem abrir nada: espelho BARE (sem
 #   extensions.worktreeConfig: o core.bare sai do config compartilhado e o commit do worktree continua funcionando, autor = a sessão), modo 600 e o resto do arquivo preservados, idempotente, uma identidade por
 #   worktree; pasta ausente / comum, ~/.claude.json ausente / ilegível (intacto, byte a byte) / com forma estranha, config.worktree travado, identidade que o git não lê de volta → exit 1 com o motivo, nenhum
@@ -39,7 +44,7 @@
 #   erro de ssh, flock, "tmux sem acesso" tolerado como "sem servidor", o `has` que engole o erro do tmux, melhor esforço da sessão
 #   ausente, o stop que não confere que a sessão sumiu, e o portão (sem a liberação, liberação de qualquer tipo, nome de teste frouxo ou sem
 #   âncora, sem conferir o sha do guarda, sem rodar o --selfcheck, script do host que sai 0, guarda irmão ilegível), e a regra de presença do MBP (grupo mbp: guarda de /Users/, validação da config, recusa/pausa/slot_cap, vigia, PATH extra,
-#   registro de sessões do list-running); 99 mutantes no total (26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
+#   registro de sessões do list-running); 129 mutantes no total (30 do grupo gui: bootout/arquivos/prova de ausência do stop e da recusa, a varredura de órfãs e a ordem dela, o veredito do `auth status` (ilegível, rc, contraditório), plist fora de run/, label sem prefixo, KeepAlive, Aqua, validação da config; 26 do grupo wt: wt-add/wt-rm do provider, o guarda DEPOIS do wt-add, o recolhimento só do que não perde trabalho e os nomes do engine; 9 do ambiente limpo da sessão, grupo mbp: session_env, ZDOTDIR, PATH explícito e claude absoluto, ga-w7qwl1.1.5).
 #   Mais: contra um stub que só sai 0, quase tudo falha.
 # VARIÁVEIS: GCSSH_UNDER_TEST (script a testar) · GCSSH_ONLY (grupos separados por vírgula) · GCSSH_NO_MUTANTS=1
 set -u
@@ -49,7 +54,7 @@ for v in $(env | sed -n 's/^\(GC_[A-Za-z0-9_]*\)=.*/\1/p') TMUX TMUX_PANE GC_SSH
 T=$(cd "$(mktemp -d /tmp/gcs.XXXXXX)" && pwd -P)  # curto: o caminho do socket do tmux tem limite de ~100 caracteres
 SOCK="gct$$"
 export TMUX_TMPDIR="$T/tmux"; mkdir -p "$TMUX_TMPDIR" "$T/bin" "$T/home" "$T/remote/home" "$T/state"
-cleanup() { for s in "$SOCK" "${SOCK}b" "${SOCK}m"; do tmux -L "$s" kill-server 2>/dev/null; done; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
+cleanup() { for f in "$T"/lc/loaded/*.pid; do [ -e "$f" ] && kill -s TERM -- "-$(cat "$f")" 2>/dev/null; done; for s in "$SOCK" "${SOCK}b" "${SOCK}m"; do tmux -L "$s" kill-server 2>/dev/null; done; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
 trap cleanup EXIT
 fails=0; n=0
 ok() { n=$((n+1)); if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; fails=$((fails+1)); fi; }
@@ -308,7 +313,7 @@ cfgm() {  # cfgm [EXTRA-JSON-do-host-m]  → $T/cfg.json com a (padrão, sem reg
   jq -n --argjson extra "${1:-{\}}" --arg rr "$RR" --arg rh "$RH" --arg s "$SOCK" --arg chk "$T/bin/fake-check" --arg lib "$T/lib/presence.sh" --arg ex "$T/extra" --arg sb "$T/shim-bin" --arg cl "$T/claude" \
     '{default_host:"a", hosts:{a:{ssh:"fakehost",cap:3,remote_root:$rr,remote_home:$rh,socket:$s,mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false},
       m:({ssh:"fakembp",cap:2,remote_root:$rr,remote_home:$rh,socket:($s+"m"),mini_home:"/Users/test",presence_gate:true,sleeps:true,watch_s:1,
-         gate_cmd:[$chk],presence_lib:$lib,path_extra:[$ex],session_env:{path:[$sb,"/usr/bin","/bin"],claude:$cl},real_sessions_released_by:"selftest"}+$extra),
+         gate_cmd:[$chk],presence_lib:$lib,path_extra:[$ex],session_env:{path:[$sb,"/usr/bin","/bin"],claude:$cl},gui_agent:true,real_sessions_released_by:"selftest"}+$extra),
       h:{ssh:"fakehost",cap:1,remote_root:"/Users/athos/gt-remote/bundle",remote_home:"/Users/athos",socket:($s+"h"),mini_home:"/Users/test",real_sessions_released_by:"selftest",worktree_prepare:false}}}' > "$T/cfg.json"
 }
 setup_mbp() {
@@ -336,6 +341,75 @@ EOF
   printf 'presence_eval() { PR_MODE=$(cat "%s/pres.mode" 2>/dev/null || echo uso); PR_PAUSED=0; [ -e "%s/pres.pause" ] && PR_PAUSED=1; return 0; }\n' "$T" "$T" > "$T/lib/presence.sh"
   echo livre > "$T/pres.mode"; rm -f "$T/pres.pause"
   zdot_put "$T/shim-bin:/usr/bin:/bin"
+  setup_gui
+}
+# ---- o domínio gráfico falso (ga-w7qwl1.1.8): tudo em $T/extra, que é o path_extra do host m (vem ANTES do PATH do sistema) ----
+# launchctl: `print gui/<uid>` = a lista de serviços (rc 112 sem o domínio), `print gui/<uid>/<label>` (113 = ausente), `bootstrap` LANÇA o ProgramArguments do plist num grupo de processos próprio e com ambiente limpo
+# (como o launchd: sem PATH do usuário, FAKE_LAUNCHD=1 marca "nasceu no gui"; só o TMUX_TMPDIR passa, para o tmux de teste cair na pasta de teste), `bootout` mata o grupo e esquece o label.
+# lc.mode: stuck (bootout não remove), printfail (print do label dá rc 1: "não sei"), nogui (sem o domínio), bootfail (bootstrap falha).
+setup_gui() {
+  mkdir -p "$T/extra"; local py rt; py=$(command -v python3); rt=$(command -v tmux)
+  cat > "$T/extra/launchctl" <<'EOF'
+#!/bin/sh
+LC=@T@/lc; MODE=$(cat @T@/lc.mode 2>/dev/null)
+printf '%s\n' "launchctl $*" >> @T@/lc.log
+case "$1" in
+print)
+  case "$2" in
+    gui/*/*) [ "$MODE" != nogui ] || exit 112; [ "$MODE" != printfail ] || exit 1; [ -e "$LC/loaded/${2#gui/*/}" ] || exit 113; exit 0;;
+    gui/*) { [ "$MODE" != nogui ] && [ -d "$LC/gui" ]; } || { echo "Bad request." >&2; exit 112; }
+      printf 'gui/501 = {\n\ttype = login\n\tservices = {\n'
+      for f in "$LC"/loaded/*; do case "$f" in *.pid) continue;; esac; [ -e "$f" ] || continue; printf '\t\t%6s  0  \t%s\n' "$(cat "$f.pid" 2>/dev/null || echo -)" "$(basename "$f")"; done
+      printf '\t}\n\tdisabled services = {\n\t\t"com.gascity.remote-session.decoy" => disabled\n\t}\n}\n'; exit 0;;
+  esac;;
+bootstrap)
+  [ "$MODE" != bootfail ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
+  { [ "$MODE" != nogui ] && [ -d "$LC/gui" ]; } || exit 112
+  [ -f "$3" ] || { echo "Bootstrap failed: 2: No such file or directory" >&2; exit 2; }
+  json=$(@PY@ -c 'import plistlib,sys,json;print(json.dumps(plistlib.load(open(sys.argv[1],"rb"))))' "$3") || exit 133
+  label=$(printf '%s' "$json" | jq -r .Label); a1=$(printf '%s' "$json" | jq -r '.ProgramArguments[0]'); a2=$(printf '%s' "$json" | jq -r '.ProgramArguments[1]')
+  [ ! -e "$LC/loaded/$label" ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
+  mkdir -p "$LC/loaded"; echo "$3" > "$LC/loaded/$label"
+  if [ "$(printf '%s' "$json" | jq -r .RunAtLoad)" = true ]; then
+    env -i HOME="$HOME" PATH=/usr/bin:/bin TMUX_TMPDIR="$TMUX_TMPDIR" FAKE_LAUNCHD=1 @PY@ -c 'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' "$a1" "$a2" </dev/null >/dev/null 2>&1 &
+    echo $! > "$LC/loaded/$label.pid"
+  fi
+  exit 0;;
+bootout)
+  l=${2#gui/*/}; [ -e "$LC/loaded/$l" ] || exit 113
+  [ "$MODE" != stuck ] || exit 0
+  pid=$(cat "$LC/loaded/$l.pid" 2>/dev/null); [ -z "$pid" ] || kill -s TERM -- "-$pid" 2>/dev/null
+  rm -f "$LC/loaded/$l" "$LC/loaded/$l.pid"; exit 0;;
+esac
+exit 64
+EOF
+  cat > "$T/claude" <<'EOF'
+#!/bin/sh
+# claude falso: só entende `auth status`, e o login depende de ONDE roda (FAKE_LAUNCHD=1 = dentro do launchd gui), como o do MBP (medido 19/10: pelo ssh loggedIn false, no gui true)
+printf '%s FAKE_LAUNCHD=%s\n' "$*" "${FAKE_LAUNCHD:-0}" >> @T@/claude.log
+[ "$1 $2" = "auth status" ] || exit 64
+m=$(cat @T@/auth.mode 2>/dev/null); [ -n "$m" ] || m=in
+case "$m" in
+  in)      if [ "${FAKE_LAUNCHD:-}" = 1 ]; then printf '{\n  "loggedIn": true,\n  "authMethod": "claude.ai"\n}\n'; exit 0; else printf '{\n  "loggedIn": false\n}\n'; exit 1; fi;;
+  out)     printf '{\n  "loggedIn": false\n}\n'; exit 1;;
+  out0)    printf '{\n  "loggedIn": false\n}\n'; exit 0;;
+  truerc)  printf '{\n  "loggedIn": true\n}\n'; exit 1;;
+  garbage) echo banana; exit 0;;
+  both)    printf '"loggedIn": true\n"loggedIn": false\n'; exit 0;;
+  crash)   exit 2;;
+  hang)    exec sleep 60;;
+esac
+exit 0
+EOF
+  printf '#!/bin/sh\ncase " $* " in *" new-session "*) [ ! -e @T@/tmux.fail ] || { echo "create session failed: boom" >&2; exit 1; };; esac\nexec @RT@ "$@"\n' > "$T/extra/tmux"
+  printf '#!/bin/sh\n[ ! -e @T@/plutil.fail ] || { echo "plist: Invalid" >&2; exit 1; }\n[ -x /usr/bin/plutil ] || exit 0\nexec /usr/bin/plutil "$@"\n' > "$T/extra/plutil"
+  printf '#!/bin/sh\necho "security $*" >> @T@/security.log\nexit 1\n' > "$T/extra/security"
+  sed -i.bak -e "s|@T@|$T|g" -e "s|@PY@|$py|g" -e "s|@RT@|$rt|g" "$T/extra/launchctl" "$T/claude" "$T/extra/tmux" "$T/extra/plutil" "$T/extra/security"; rm -f "$T"/extra/*.bak "$T"/claude.bak
+  chmod +x "$T/extra/launchctl" "$T/claude" "$T/extra/tmux" "$T/extra/plutil" "$T/extra/security"; lcreset
+}
+lcreset() {  # o domínio gráfico existe e está vazio (agentes de antes são mortos); claude logado; nenhuma falha ligada
+  local f; for f in "$T"/lc/loaded/*.pid; do [ -e "$f" ] && kill -s TERM -- "-$(cat "$f")" 2>/dev/null; done
+  find "$T/lc" -mindepth 1 -delete 2>/dev/null; mkdir -p "$T/lc/gui" "$T/lc/loaded"; : > "$T/lc.log"; : > "$T/claude.log"; : > "$T/security.log"; echo in > "$T/auth.mode"; rm -f "$T/lc.mode" "$T/tmux.fail" "$T/plutil.fail"
 }
 zdot_put() {  # zdot_put PATH — os 4 arquivos que o remote-bundle-build.py --session-path instala em <raiz>/zdot (a linha do PATH é a que o provider confere)
   mkdir -p "$RR/zdot" "$T/shim-bin"; for f in .zshenv .zprofile .zshrc env.sh; do printf "export PATH='%s'\n" "$1" > "$RR/zdot/$f"; done
@@ -469,6 +543,118 @@ g_mbp() {
   pv start w-remote-m-1 < <(req cat); pv list-running w- </dev/null; [ $RC = 0 ] && has "$T/out" w-remote-m-1; ok $? "mbp: sem default_host o list-running ainda junta os hosts (rc=$RC $(head -c 120 "$T/err"))"
   pv stop w-remote-m-1 </dev/null
   cfg 3
+}
+
+# ---------- gui: o tmux do MBP nasce num LaunchAgent do domínio gráfico (ga-w7qwl1.1.8) — as 7 condições do Mayor (19/10) viram casos ----------
+nload() { ls "$T/lc/loaded" 2>/dev/null | grep -vc '\.pid$'; }  # quantos labels o launchd falso tem carregados
+nrun() { ls "$RR/run" 2>/dev/null | grep -c '^com\.gascity\.remote-session\.'; }  # quantos arquivos de agente sobram em <raiz>/run
+evt() { jq -e --arg e "$1" --arg s "$2" 'select(.event==$e and .session==$s)' "$T/state/m/events.jsonl" >/dev/null 2>&1; }
+lcline() { grep -n "$1" "$T/lc.log" | tail -1 | cut -d: -f1; }  # número da ÚLTIMA linha do log do launchctl que casa (vazio = nunca)
+gui_refuse() {  # gui_refuse DESCRIÇÃO FRAGMENTO-DO-ERRO [auth.mode [lc.mode [arquivo-de-falha]]] — start recusado: exit 1 com a causa, nada aberto, nada carregado, nada em run/, evento 'refused', Keychain intocado, claude só 'auth status' no gui
+  lcreset; [ -z "${3:-}" ] || echo "$3" > "$T/auth.mode"; [ -z "${4:-}" ] || echo "$4" > "$T/lc.mode"; [ -z "${5:-}" ] || : > "$T/$5"
+  mkdir -p "$T/state/m"; : > "$T/state/m/events.jsonl"; fresh
+  pv start w-remote-m-9 < <(req cat)
+  [ $RC = 1 ] && has "$T/err" "$2" && [ "$(count x "${SOCK}m")" = 0 ] && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ ! -e "$T/state/m/running/w-remote-m-9" ] && [ ! -s "$T/security.log" ] \
+    && ! grep -qv '^auth status FAKE_LAUNCHD=1$' "$T/claude.log" && jq -e 'select(.event=="refused" and .session=="w-remote-m-9" and (.reason|startswith("gui_agent:")))' "$T/state/m/events.jsonl" >/dev/null 2>&1
+  ok $? "gui: $1 → start recusado (exit 1) com a causa, nada aberto/carregado/em run/, evento 'refused' (rc=$RC $(head -c 140 "$T/err"))"
+}
+
+g_gui() {
+  setup_mbp; cfgm '{"gui_proof_s":2}'; mode livre; fresh; local L=com.gascity.remote-session. b p o bn i v k rc
+  mkdir -p "$T/state/m/running"; find "$T/state/m/running" -mindepth 1 -delete; : > "$T/state/m/events.jsonl"; : > "$T/state/m/session-ssh.log"  # o grupo mbp usa os mesmos nomes (w-remote-m-N): evento, registro e log dele não podem valer aqui
+  # --- dry-run: o desenho (1: plist em <raiz>/run · 2: label de prefixo fixo · 5: o único comando do claude é `auth status`) ---
+  pv --dry-run start w-remote-m-0 < <(req "claude --x")
+  [ $RC = 0 ] && [ "$(jq -r .gui_agent.label "$T/out")" = "${L}w-remote-m-0" ] && [ "$(jq -r .gui_agent.plist "$T/out")" = "$RR/run/${L}w-remote-m-0.plist" ]; ok $? "gui: o dry-run mostra o agente: label com o prefixo fixo e o plist em <raiz>/run (rc=$RC)"
+  ! grep -q 'LaunchAgents' "$T/out"; ok $? "gui: nada aponta para ~/Library/LaunchAgents (um agente que sobrevive a logout/reboot reabriria sessão sozinho)"
+  jq -r '.gui_agent.plist_xml[]' "$T/out" > "$T/plist.out"
+  grep -q '<key>RunAtLoad</key><true/>' "$T/plist.out" && grep -q '<key>KeepAlive</key><false/>' "$T/plist.out" && grep -q '<string>Aqua</string>' "$T/plist.out"; ok $? "gui: o plist roda ao carregar, NÃO se reergue sozinho (KeepAlive false) e só carrega na sessão Aqua"
+  [ "$(jq -r '.gui_agent.bootstrap | join(" ")' "$T/out")" = "launchctl bootstrap gui/<uid> $RR/run/${L}w-remote-m-0.plist" ]; ok $? "gui: o carregamento é um bootstrap no domínio gui/<uid> do plist que está em run/"
+  jq -r '.gui_agent.script[]' "$T/out" > "$T/agent.out"
+  [ "$(grep -cF "$T/claude" "$T/agent.out")" = 1 ] && grep -qF "$T/claude auth status " "$T/agent.out" && ! grep -qiE 'security|keychain|setup-token|add-generic|logout|auth login|api[_-]?key|token' "$T/agent.out"; ok $? "gui: o agente chama o claude uma vez, só para 'auth status', e não toca Keychain nem credencial (5)"
+  grep -qF "new-session -d -s w-remote-m-0" "$T/agent.out" && grep -qF "sh $RR/run/w-remote-m-0.sh" "$T/agent.out" && jq -r '.launcher[]' "$T/out" | grep -q 'taskpolicy -b -p'; ok $? "gui: a sessão que o agente abre é o MESMO lançador, com o vigia de prioridade (o agente não contorna a regra do MBP) (7)"
+  nossh; ok $? "gui: o dry-run não conecta"
+  pv --dry-run start w-1 < <(req "claude --x"); [ $RC = 0 ] && [ "$(jq -r .gui_agent "$T/out")" = null ]; ok $? "gui: host sem gui_agent (o servidor Linux) não ganha agente"
+  # --- start: o tmux nasce no domínio gráfico, o claude da sessão enxerga o login, nada fora de run/, Keychain intocado ---
+  lcreset; fresh; rm -f "$T/inside.out"
+  pv start w-remote-m-1 < <(req "sh -c '$T/claude auth status > $T/inside.out 2>&1; exec cat'"); ok $RC "gui: sessão gráfica + claude logado → o start abre (rc=$RC $(head -c 200 "$T/err"))"
+  for i in $(seq 1 20); do [ -s "$T/inside.out" ] && break; sleep 0.5; done
+  [ "$(count x "${SOCK}m")" = 1 ] && [ "$(tmux -L "${SOCK}m" show-environment -g FAKE_LAUNCHD 2>&1)" = FAKE_LAUNCHD=1 ]; ok $? "gui: o tmux server nasceu DENTRO do domínio gráfico (o ambiente dele é o do launchd, não o do ssh)"
+  grep -q '"loggedIn": true' "$T/inside.out" 2>/dev/null; ok $? "gui: o claude de dentro da sessão enxerga o login (o que pelo ssh sozinho dá false)"
+  [ -e "$T/lc/loaded/${L}w-remote-m-1" ] && [ -f "$RR/run/${L}w-remote-m-1.plist" ] && [ -f "$RR/run/${L}w-remote-m-1.agent.sh" ]; ok $? "gui: o agente está carregado e o plist e o script ficam em <raiz>/run"
+  grep -qx "launchctl bootstrap gui/$(id -u) $RR/run/${L}w-remote-m-1.plist" "$T/lc.log"; ok $? "gui: o bootstrap foi no domínio gui/<uid> com o plist de run/"
+  [ ! -e "$RH/Library/LaunchAgents" ] && [ -z "$(find "$T" -name "${L}*" -not -path "$T/lc/*" -not -path "$RR/run/*" 2>/dev/null)" ]; ok $? "gui: nada foi gravado em ~/Library/LaunchAgents nem fora de run/ (1)"
+  [ -s "$T/claude.log" ] && ! grep -qv '^auth status FAKE_LAUNCHD=1$' "$T/claude.log" && [ ! -s "$T/security.log" ]; ok $? "gui: o claude só rodou 'auth status', sempre dentro do domínio gráfico, e o Keychain não foi tocado (5)"
+  [ "$(cat "$RR/run/${L}w-remote-m-1.agent.res" 2>/dev/null)" = ok ] && ! grep -rqs authMethod "$RR/run" "$T/state" "$T/err"; ok $? "gui: a saída do 'auth status' (e-mail, organização) não é gravada em lugar nenhum: só o veredito 'ok'"
+  evt started w-remote-m-1; ok $? "gui: o start deixa a linha 'started' no events.jsonl"
+  # --- 3: o stop faz bootout, apaga e PROVA a ausência ---
+  : > "$T/lc.log"; pv stop w-remote-m-1 </dev/null; rc=$RC
+  b=$(lcline "^launchctl bootout .*${L}w-remote-m-1\$"); p=$(lcline "^launchctl print gui/[0-9]*/${L}w-remote-m-1\$")
+  [ $rc = 0 ] && [ -n "$b" ] && [ -n "$p" ] && [ "$p" -gt "$b" ]; ok $? "gui: o stop faz bootout e DEPOIS confere pelo launchctl print que o label sumiu (3) (rc=$rc bootout@${b:-nunca} print@${p:-nunca})"
+  [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ] && [ "$(count x "${SOCK}m")" = 0 ]; ok $? "gui: depois do stop não sobra agente carregado, plist, script nem veredito em run/ (3)"
+  evt stopped w-remote-m-1 && [ ! -e "$T/state/m/running/w-remote-m-1" ]; ok $? "gui: stop completo → linha 'stopped' e a sessão sai do registro"
+  pv start w-remote-m-1 < <(req cat); ok $RC "gui: depois do stop o mesmo nome abre de novo (o label foi liberado de verdade) (rc=$RC $(head -c 160 "$T/err"))"; pv stop w-remote-m-1 </dev/null
+  # --- 3: sem prova, o stop FALHA (e o registro da sessão fica): bootout que não removeu · launchctl print que não deu para ler ---
+  pv start w-remote-m-2 < <(req cat); echo stuck > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv stop w-remote-m-2 </dev/null
+  [ $RC = 1 ] && has "$T/err" 'a ausência NÃO foi provada' && [ -e "$T/lc/loaded/${L}w-remote-m-2" ] && [ -e "$T/state/m/running/w-remote-m-2" ] && ! evt stopped w-remote-m-2; ok $? "gui: bootout que não removeu o label → o stop FALHA ('ausência NÃO foi provada'), mantém o registro e não anuncia 'stopped' (3) (rc=$RC $(head -c 140 "$T/err"))"
+  rm -f "$T/lc.mode"; pv stop w-remote-m-2 </dev/null; [ $RC = 0 ] && [ "$(nload)" = 0 ] && evt stopped w-remote-m-2 && [ ! -e "$T/state/m/running/w-remote-m-2" ]; ok $? "gui: com o launchd de volta ao normal o mesmo stop termina e limpa (rc=$RC)"
+  pv start w-remote-m-2 < <(req cat); echo printfail > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv stop w-remote-m-2 </dev/null  # eventos zerados: o 'stopped' do mesmo nome, do caso acima, não pode valer aqui
+  [ $RC = 1 ] && has "$T/err" 'launchctl print rc=1' && [ -e "$T/state/m/running/w-remote-m-2" ] && ! evt stopped w-remote-m-2 && [ "$(nload)" = 0 ]; ok $? "gui: launchctl print que não deu para ler (rc 1) NÃO vale como ausência, mesmo com o label de fato removido: o stop falha (3) (rc=$RC $(head -c 140 "$T/err"))"
+  rm -f "$T/lc.mode"; pv stop w-remote-m-2 </dev/null; [ $RC = 0 ] && evt stopped w-remote-m-2; ok $? "gui: ...e lido de novo (113) o stop termina (rc=$RC)"
+  pv start w-remote-m-2 < <(req cat); echo nogui > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv stop w-remote-m-2 </dev/null
+  [ $RC = 0 ] && evt stopped w-remote-m-2; ok $? "gui: sem o domínio gui (print rc 112) nada vive nele: conta como ausência provada — decisão de projeto, o Mayor escreveu 113 (rc=$RC $(head -c 140 "$T/err"))"
+  # --- 6: sem sessão gráfica, ou com o claude deslogado/ilegível no domínio gráfico, o start RECUSA (exit != 0, com o motivo) ---
+  gui_refuse "sem sessão gráfica (o claude não alcançaria o Keychain)" 'não há sessão gráfica' "" nogui; ! grep -q ' bootstrap ' "$T/lc.log"; ok $? "gui: ...e sem sessão gráfica nada chegou a ser carregado"
+  gui_refuse "claude deslogado no domínio gráfico (loggedIn false, rc 1)" 'DESLOGADO' out
+  gui_refuse "claude deslogado no domínio gráfico (loggedIn false, rc 0)" 'DESLOGADO' out0
+  gui_refuse "auth status ilegível (rc 0 e sem loggedIn)" 'não consegui ler o login' garbage; ! grep -rqs banana "$T/err" "$T/state"; ok $? "gui: ...e a saída ilegível do claude não vai para a mensagem nem para o estado"
+  gui_refuse "auth status que quebra (rc 2, sem saída)" 'não consegui ler o login' crash
+  gui_refuse "loggedIn true com rc 1 (sinal em que não se confia)" 'não consegui ler o login' truerc
+  gui_refuse "true e false na mesma saída (contraditória)" 'não consegui ler o login' both
+  cfgm '{"gui_proof_s":2,"gui_wait_s":2}'; gui_refuse "auth status que trava" 'não respondeu em 2s' hang; cfgm '{"gui_proof_s":2}'
+  gui_refuse "plutil reprova o plist" 'plutil -lint' "" "" plutil.fail
+  gui_refuse "launchctl bootstrap que falha" 'launchctl bootstrap do agente' "" bootfail
+  gui_refuse "tmux do agente que não abre a sessão" 'o tmux do agente não abriu a sessão' "" "" tmux.fail; has "$T/err" boom; ok $? "gui: ...e a causa do tmux vem na mensagem"
+  lcreset; echo out > "$T/auth.mode"; echo stuck > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; pv start w-remote-m-9 < <(req cat)
+  [ $RC = 1 ] && has "$T/err" 'DESLOGADO' && has "$T/err" 'a ausência NÃO foi provada' && [ -e "$T/lc/loaded/${L}w-remote-m-9" ]; ok $? "gui: recusa cujo agente não se conseguiu remover diz as DUAS coisas (a causa e que o agente ficou) — nunca 'limpo' calado (rc=$RC)"
+  # --- 4: o start varre os agentes órfãos do prefixo ANTES de criar o novo (o w-remote-m-9 acima já é uma: só no domínio, sem arquivos) ---
+  rm -f "$T/lc.mode"; echo in > "$T/auth.mode"
+  pv start w-remote-m-2 < <(req cat); pv start w-remote-m-1 < <(req cat)
+  tmux -L "${SOCK}m" kill-session -t =w-remote-m-1  # a sessão some por fora: o agente fica carregado e os arquivos em run/ (o stop nunca rodou)
+  printf x > "$RR/run/${L}w-remote-m-5.plist"; printf x > "$RR/run/${L}w-remote-m-5.agent.sh"  # só arquivos (start que morreu no meio)
+  echo "$RR/run/${L}w-remote-m-6.plist" > "$T/lc/loaded/${L}w-remote-m-6"  # só no domínio (stop que apagou os arquivos mas não derrubou)
+  echo x > "$T/lc/loaded/com.apple.fake"; printf x > "$RR/run/outro.plist"; printf x > "$RR/run/${L}w-remote-m-7.plist.bak"  # NÃO são nossos: outro prefixo, outro nome, outro sufixo
+  [ -e "$T/lc/loaded/${L}w-remote-m-1" ] && [ -f "$RR/run/${L}w-remote-m-1.plist" ] && [ -f "$RR/run/${L}w-remote-m-1.agent.sh" ] && [ -f "$RR/run/${L}w-remote-m-5.plist" ] && [ -e "$T/lc/loaded/${L}w-remote-m-6" ] && [ -e "$T/lc/loaded/com.apple.fake" ]; ok $? "gui: precondição da varredura — as órfãs (1 carregada+arquivos, 5 só arquivos, 6 só no domínio) e o que não é nosso estão montados ANTES do start; sem isso os casos abaixo passariam no vazio"
+  : > "$T/lc.log"; pv start w-remote-m-3 < <(req cat); ok $RC "gui: start com órfãs pendentes abre (rc=$RC $(head -c 200 "$T/err"))"
+  [ ! -e "$T/lc/loaded/${L}w-remote-m-9" ]; ok $? "gui: a sobra da recusa acima (carregada, sem arquivos) também foi varrida, já pelo start seguinte (4)"
+  [ ! -e "$T/lc/loaded/${L}w-remote-m-1" ] && [ ! -e "$RR/run/${L}w-remote-m-1.plist" ] && [ ! -e "$RR/run/${L}w-remote-m-1.agent.sh" ] && [ ! -e "$RR/run/${L}w-remote-m-1.agent.res" ]; ok $? "gui: órfã de sessão que sumiu por fora (carregada + arquivos) é varrida (4)"
+  [ ! -e "$RR/run/${L}w-remote-m-5.plist" ] && [ ! -e "$RR/run/${L}w-remote-m-5.agent.sh" ]; ok $? "gui: órfã que só tem arquivos em run/ é varrida (4)"
+  [ ! -e "$T/lc/loaded/${L}w-remote-m-6" ]; ok $? "gui: órfã que só está carregada no domínio é varrida (4)"
+  [ -e "$T/lc/loaded/${L}w-remote-m-2" ] && [ -f "$RR/run/${L}w-remote-m-2.plist" ] && ! grep -q "^launchctl bootout .*${L}w-remote-m-2\$" "$T/lc.log"; ok $? "gui: o agente de uma sessão VIVA não é tocado pela varredura (4)"
+  [ -e "$T/lc/loaded/com.apple.fake" ] && [ -f "$RR/run/outro.plist" ] && [ -e "$RR/run/${L}w-remote-m-7.plist.bak" ] && ! grep -q 'decoy' "$T/lc.log"; ok $? "gui: o que não é do prefixo (ou não tem a forma de agente nosso) fica: a varredura não é faxina geral (4)"
+  o=$(lcline "^launchctl bootout .*${L}w-remote-m-1\$"); bn=$(lcline "^launchctl bootstrap .*${L}w-remote-m-3.plist\$")
+  [ -n "$o" ] && [ -n "$bn" ] && [ "$o" -lt "$bn" ]; ok $? "gui: a varredura vem ANTES de criar o agente novo (bootout@${o:-nunca} < bootstrap@${bn:-nunca}) (4)"
+  has "$T/state/m/session-ssh.log" "start w-remote-m-3: gui_agent: varreu o agente órfão ${L}w-remote-m-1" && has "$T/state/m/session-ssh.log" "gui_agent: varreu o agente órfão ${L}w-remote-m-5" && has "$T/state/m/session-ssh.log" "gui_agent: varreu o agente órfão ${L}w-remote-m-6"; ok $? "gui: cada órfã varrida fica no log do provider"
+  pv stop w-remote-m-2 </dev/null; pv stop w-remote-m-3 </dev/null; rm -f "$RR/run/outro.plist" "$RR/run/${L}w-remote-m-7.plist.bak"
+  lcreset; echo "$RR/run/${L}w-remote-m-6.plist" > "$T/lc/loaded/${L}w-remote-m-6"; echo stuck > "$T/lc.mode"; : > "$T/state/m/events.jsonl"; : > "$T/lc.log"
+  pv start w-remote-m-4 < <(req cat)
+  [ $RC = 1 ] && has "$T/err" 'a ausência NÃO foi provada' && ! grep -q "^launchctl bootstrap .*${L}w-remote-m-4" "$T/lc.log" && [ "$(count x "${SOCK}m")" = 0 ] && [ ! -e "$T/state/m/running/w-remote-m-4" ] && [ "$(nrun)" = 0 ] \
+    && jq -e 'select(.event=="refused" and .session=="w-remote-m-4" and (.reason|startswith("gui_agent:")))' "$T/state/m/events.jsonl" >/dev/null 2>&1; ok $? "gui: órfã que a varredura não consegue provar ausente → o start recusa e NÃO cria o agente novo (4) (rc=$RC $(head -c 140 "$T/err"))"
+  rm -f "$T/lc.mode"; pv start w-remote-m-4 < <(req cat); [ $RC = 0 ] && [ ! -e "$T/lc/loaded/${L}w-remote-m-6" ] && [ -e "$T/lc/loaded/${L}w-remote-m-4" ]; ok $? "gui: ...e com o launchd de volta ao normal o mesmo start varre a órfã e abre (rc=$RC)"
+  pv stop w-remote-m-4 </dev/null
+  # --- o resto do start: teto, nome repetido, sessão que morre logo, regra de presença antes de tudo (7) ---
+  lcreset; pv start w-remote-m-1 < <(req cat); pv start w-remote-m-2 < <(req cat); : > "$T/lc.log"
+  pv start w-remote-m-3 < <(req cat); [ $RC = 1 ] && has "$T/err" 'teto' && [ ! -s "$T/lc.log" ] && [ ! -e "$RR/run/${L}w-remote-m-3.plist" ]; ok $? "gui: host no teto → recusa antes de tocar no launchd (nenhum launchctl, nenhum arquivo) (rc=$RC)"
+  pv start w-remote-m-1 < <(req cat); [ $RC != 0 ] && ! grep -q '^launchctl bootstrap' "$T/lc.log" && [ "$(count x "${SOCK}m")" = 2 ]; ok $? "gui: nome que já existe → não cria um segundo agente para ele (rc=$RC)"
+  pv stop w-remote-m-1 </dev/null; pv stop w-remote-m-2 </dev/null
+  lcreset; pv start w-remote-m-9 < <(req "sh -c 'exit 3'"); [ $RC = 1 ] && has "$T/err" 'terminou logo após abrir' && [ "$(nload)" = 0 ] && [ "$(nrun)" = 0 ]; ok $? "gui: sessão que morre logo depois de abrir leva o agente junto, provado — não deixa órfão (rc=$RC $(head -c 140 "$T/err"))"
+  lcreset; mode uso; fresh; pv start w-remote-m-9 < <(req cat); [ $RC = 1 ] && has "$T/err" 'Athos está no MBP' && [ ! -s "$T/lc.log" ] && [ "$(nrun)" = 0 ] && nossh; ok $? "gui: Athos usando o MBP → o start recusa ANTES de tocar no launchd: a regra de presença vem primeiro e o agente não a contorna (7) (rc=$RC)"
+  mode livre
+  # --- config: gui_agent é decisão explícita; no notebook é obrigatória; o agente precisa do claude que confere o login ---
+  for v in '"true"' 1 null; do cfgm '{"gui_agent":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gui_agent'" && nossh; ok $? "gui: gui_agent=$v (não é true/false) recusa a config, sem ssh (rc=$RC)"; done
+  cfgm '{"gui_agent":false}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "'gui_agent' é obrigatório" && nossh; ok $? "gui: notebook (sleeps) sem gui_agent recusa a config — senão o tmux nasceria no ssh e a sessão, deslogada (rc=$RC)"
+  cfgm; jq '.hosts.a.gui_agent=true' "$T/cfg.json" > "$T/cfg.nd" && mv "$T/cfg.nd" "$T/cfg.json"; fresh; pv --dry-run start w-1 < <(req cat); [ $RC = 1 ] && has "$T/err" "session_env.claude" && nossh; ok $? "gui: gui_agent num host sem session_env.claude recusa a config (o agente não teria como conferir o login) (rc=$RC)"
+  for k in gui_wait_s gui_proof_s; do for v in 0 601 '"x"'; do cfgm '{"'$k'":'"$v"'}'; fresh; pv --dry-run start w-remote-m-0 < <(req cat); [ $RC = 1 ] && has "$T/err" "$k" && nossh; ok $? "gui: $k=$v recusa a config, sem ssh (rc=$RC)"; done; done
+  lcreset; cfg 3
 }
 
 g_gate() {  # a sessão REAL só abre com a liberação E o guarda conferido no host; a de teste abre sempre
@@ -705,7 +891,7 @@ PY
   cfg 3; install_host
 }
 
-all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; return 0; }
+all() { group proto && g_proto; group dry && g_dry; group live && g_live; group cap && g_cap; group down && g_down; group meta && g_meta; group conf && g_conf; group guard && g_guard; group terr && g_terr; group gate && g_gate; group prep && g_prep; group wt && g_wt; group mbp && g_mbp; group gui && g_gui; return 0; }
 
 if [ -n "${GCSSH_MUTANT:-}" ]; then all; echo "RESULT $fails/$n"; exit $((fails > 0)); fi
 all
@@ -818,9 +1004,40 @@ echo "== $((n-fails))/$n ok =="
   mutant wt "o desfazer não tira o branch novo" 's/\[ "\$wub" = "\$wum" \] \&\& git/false \&\& git/'
   mutant wt "o desfazer não chama o wt-rm" 's/^  GT_REMOTE_GIT=@GR@ @BIN@ wt-rm @RIG@ @NAME@ >\/dev\/null 2>\&1$/  :/'
   mutant wt "aviso do git em stderr é jogado fora (parte da árvore não lida vira 'limpo')" 's/status --porcelain 2>"\$wse"/status --porcelain 2>\/dev\/null/'
+  # gui (ga-w7qwl1.1.8): (3) o stop prova a ausência · (4) o start varre as órfãs · (6) recusa sem gui/deslogado/ilegível · (1)(2) onde e com que nome o agente nasce
+  mutant gui "stop sem bootout (o label continua carregado)" 's/^  launchctl bootout "gui\/\$U\/\$1" >\/dev\/null 2>&1$/  :/'
+  mutant gui "agent_down não apaga os arquivos do agente" 's/^  rm -f -- @RUN@\/"\$1"\.plist .*$/  :/'
+  mutant gui "agent_down não prova a ausência" 's/^  agent_gone "\$1" || return 1$/  :/'
+  mutant gui "prova de ausência aceita qualquer resposta (até 'ainda carregado')" 's/case \$gr in 113|112) return 0;; esac/case $gr in *) return 0;; esac/'
+  mutant gui "prova de ausência aceita 'não deu para ver' (rc 1)" 's/case \$gr in 113|112) return 0;; esac/case $gr in 113|112|1) return 0;; esac/'
+  mutant gui "domínio gui inexistente (rc 112) não vale como ausência" 's/case \$gr in 113|112) return 0;; esac/case $gr in 113) return 0;; esac/'
+  mutant gui "stop não chama o agent_down" 's/ + "agent_down " + q(gui_files(cfg, name)\["label"\]) + " || exit 1"/ + ":"/'
+  mutant gui "stop que não provou a ausência termina assim mesmo" 's/" || exit 1"$/" || true"/'
+  mutant gui "start sem varredura de órfãs" 's/^agent_sweep || exit 14$/:/'
+  mutant gui "varredura depois de criar o agente novo (apaga o próprio agente)" 's/\.replace("@AGENT0@", agent0)\.replace("@NEWSESS@", newsess)/.replace("@AGENT0@", "").replace("@NEWSESS@", newsess + agent0)/'
+  mutant gui "varredura apaga também o agente de sessão viva" '/grep -qxF -- "\${gl#@PFX@}" && continue/d'
+  mutant gui "varredura sem o filtro do prefixo (apaga o que não é nosso)" "s/grep -E '^@PFXRE@\[A-Za-z0-9_-\]+\\\$' | sort -u/grep -E '.' | sort -u/"
+  mutant gui "varredura só olha os arquivos de run/ (não o domínio)" "s/; printf '%s\\\\n' \"\\\$gd\" | awk -v p=@PFX@ 'index(\\\$NF,p)==1{print \\\$NF}'; }/; }/"
+  mutant gui "varredura só olha o domínio (não os arquivos de run/)" 's/{ ls @RUN@ 2>\/dev\/null | sed -n/{ : | sed -n/'
+  mutant gui "órfã que não se conseguiu remover não impede o start" 's/^    agent_down "\$gl" || return 1$/    agent_down "$gl" || true/'
+  mutant gui "recusa do start deixa o agente carregado" 's/rm -f @LAUNCH@; agent_down @LABEL@; exit 14; }/rm -f @LAUNCH@; exit 14; }/g'
+  mutant gui "start aceita qualquer veredito do agente" 's/^\[ "\$gv" = ok \] || {/true || {/'
+  mutant gui "login ilegível passa" 's/^if \[ "\$rc" -ne 0 \] || \[ "\$lt" -eq 0 \] || \[ "\$lf" -ge 1 \]; then say "ilegivel rc=\$rc"; exit 0; fi$/:/'
+  mutant gui "rc do auth status ignorado (true com rc 1 passa)" 's/if \[ "\$rc" -ne 0 \] || \[ "\$lt" -eq 0 \]/if [ "$lt" -eq 0 ]/'
+  mutant gui "true e false juntos na saída passam" 's/ || \[ "\$lf" -ge 1 \]; then say "ilegivel/; then say "ilegivel/'
+  mutant gui "plist em ~/Library/LaunchAgents" 's/^    base = f"{cfg.root}\/run\/{label}"$/    base = f"{cfg.home}\/Library\/LaunchAgents\/{label}"/'
+  mutant gui "label sem o prefixo fixo" 's/^    label = AGENT_PFX + name$/    label = name/'
+  mutant gui "agente que se reergue sozinho (KeepAlive true)" 's/<key>KeepAlive<\/key><false\/>/<key>KeepAlive<\/key><true\/>/'
+  mutant gui "agente que carrega fora da sessão gráfica (sem LimitLoadToSessionType)" '/<key>LimitLoadToSessionType<\/key>/d'
+  mutant gui "notebook sem gui_agent aceito" 's/^        if self.sleeps and not self.gui:$/        if False:/'
+  mutant gui "gui_agent fora de true/false aceito" 's/if "gui_agent" in h and not isinstance(h\["gui_agent"\], bool):/if False:/'
+  mutant gui "gui_agent sem o claude da session_env aceito" 's/if self.gui and not self.claude_bin:/if False:/'
+  mutant gui "sessão que morre logo depois de abrir deixa o agente" 's/\.replace("@ADOWN@", adown)/.replace("@ADOWN@", "")/'
+  mutant gui "recusa do domínio gráfico sem a linha 'refused'" 's/^        if rc == EX_GUI:$/        if False:/'
+  mutant gui "órfã varrida não vai para o log" 's/if ln.startswith("gui_agent: varreu"):/if False:/'
   echo "-- contra um stub que só sai 0 (a versão 'anterior' não tinha provider nenhum)"
   printf '#!/bin/sh\nexit 0\n' > "$T/stub"; chmod +x "$T/stub"
-  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
+  r=$(GCSSH_MUTANT=1 GCSSH_ONLY="proto,dry,cap,down,conf,guard,gate,prep,wt,gui" GCSSH_UNDER_TEST="$T/stub" bash "$0" 2>&1 | tail -1); echo "stub: $r"
   case "$r" in "RESULT 0/"*|"") ok 1 "stub deveria falhar quase tudo ($r)";; *) ok 0 "stub falha os casos novos ($r)";; esac
   echo "== final: $((n-fails))/$n ok =="
 }
