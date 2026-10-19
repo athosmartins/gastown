@@ -238,6 +238,91 @@ WTUNDO_SH = r"""wtundo() {
   return 0
 }
 """
+# ---------- o tmux do MBP nasce no domínio gráfico (ga-w7qwl1.1.8, decisão do Mayor 19/10) ----------
+# O login do claude está no Keychain da sessão gráfica do Athos: pelo ssh `claude auth status` dá loggedIn false, e dentro do launchd gui/<uid> dá true (medido 19/10 na ga-w7qwl1.1, opção A).
+# Então, num host com `gui_agent`, quem abre a sessão é um LaunchAgent POR SESSÃO: o start grava o plist em <remote_root>/run/ (NUNCA em ~/Library/LaunchAgents: não sobrevive a logout nem a reboot),
+# faz `launchctl bootstrap gui/<uid>`, e o agente confere o login DENTRO desse domínio e só então sobe o tmux do socket do provider. O agente existe só entre o start e o stop; o stop faz
+# bootout, apaga os arquivos e PROVA a ausência (`launchctl print` rc 113; 112 = o domínio gui nem existe, e nada vive num domínio que não existe): sem prova o stop FALHA, nunca "limpo".
+# O start varre antes de criar: agente do prefixo cuja sessão tmux não existe mais (stop que nunca rodou). Nenhuma credencial nova, nada no Keychain: o único comando do claude é `auth status`.
+EX_GUI = 15  # recusa do start pelo domínio gráfico (14 é do start ABANDONADO, ga-0k82lw: outro caso, outro rc): sem sessão gráfica, claude deslogado/ilegível, agente que não subiu ou que não se conseguiu remover
+AGENT_PFX = "com.gascity.remote-session."  # prefixo FIXO dos labels (o que a varredura reconhece como nosso); label = prefixo + nome da sessão
+GUI_WAIT_S = 20  # quanto o start espera o veredito do agente (o `claude auth status` levou 1 s na medição)
+GUI_PROOF_S = 5  # quantas tentativas (1 s) o stop dá ao launchd para o label sumir depois do bootout antes de dizer "ausência não provada"
+# Funções do host (sh): agent_gone = prova de ausência (três estados: provado / ainda carregado / não deu para ver — só o primeiro passa); agent_down = bootout + apaga + prova.
+GUI_FN = r"""U=$(id -u)
+agent_gone() {
+  gi=0
+  while :; do
+    launchctl print "gui/$U/$1" >/dev/null 2>&1; gr=$?
+    case $gr in 113|112) return 0;; esac
+    gi=$((gi+1)); [ "$gi" -lt @TRIES@ ] || { echo "agente $1: a ausência NÃO foi provada (launchctl print rc=$gr; 113 = ausente, 112 = sem o domínio gui)" >&2; return 1; }
+    sleep 1
+  done
+}
+agent_down() {
+  launchctl bootout "gui/$U/$1" >/dev/null 2>&1
+  rm -f -- @RUN@/"$1".plist @RUN@/"$1".agent.sh @RUN@/"$1".agent.res @RUN@/"$1".agent.res.tmp
+  agent_gone "$1" || return 1
+  [ ! -e @RUN@/"$1".plist ] || { echo "agente $1: o plist continua em @RUN@" >&2; return 1; }
+}
+"""
+# Varredura do start: label do prefixo (arquivo em run/ OU carregado no domínio) cuja sessão não está na lista do tmux ($s) é órfão e sai; sessão viva fica. Nome fora de [A-Za-z0-9_-] nunca é nosso.
+GUI_SWEEP = r"""agent_sweep() {
+  gd=$(launchctl print "gui/$U" 2>/dev/null) || { echo "host @HOST@: não há sessão gráfica (gui/$U) ou o launchctl não respondeu: sem ela o claude não alcança o Keychain e a sessão abriria deslogada (o Athos precisa estar logado no MBP)" >&2; return 1; }
+  for gl in $( { ls @RUN@ 2>/dev/null | sed -n -e 's/\.plist$//p' -e 's/\.agent\.sh$//p'; printf '%s\n' "$gd" | awk -v p=@PFX@ 'index($NF,p)==1{print $NF}'; } | grep -E '^@PFXRE@[A-Za-z0-9_-]+$' | sort -u ); do
+    printf '%s\n' "$s" | grep -qxF -- "${gl#@PFX@}" && continue
+    agent_down "$gl" || return 1
+    echo "gui_agent: varreu o agente órfão $gl" >&2
+  done
+}
+agent_sweep || exit 15
+"""
+# O que substitui o `tmux new-session` do start: grava agente + plist, confere o plist, carrega no gui/<uid> e espera o veredito. Qualquer recusa remove o agente (provando) e o lançador.
+GUI_START = r"""printf %s @AGB64@ | base64 -d >@AGSH@ && printf %s @PLB64@ | base64 -d >@PLIST@ || { rm -f @LAUNCH@; agent_down @LABEL@; exit 1; }
+{ ! command -v plutil >/dev/null 2>&1 || plutil -lint -s @PLIST@ >/dev/null 2>&1; } || { echo "o plist do agente @LABEL@ não passou no plutil -lint" >&2; rm -f @LAUNCH@; agent_down @LABEL@; exit 15; }
+rm -f @RES@ @RES@.tmp
+launchctl bootstrap "gui/$U" @PLIST@ || { echo "launchctl bootstrap do agente @LABEL@ falhou" >&2; rm -f @LAUNCH@; agent_down @LABEL@; exit 15; }
+gi=0; while [ ! -s @RES@ ] && [ "$gi" -lt @WAIT@ ]; do sleep 1; gi=$((gi+1)); done
+gv=$(cat @RES@ 2>/dev/null)
+case "$gv" in
+  ok) gm=;;
+  deslogado) gm="o claude está DESLOGADO no domínio gráfico do host (claude auth status → loggedIn false): faça o login na sessão gráfica do MBP";;
+  ilegivel*) gm="não consegui ler o login do claude no domínio gráfico (${gv#ilegivel })";;
+  tmux:*) gm="o tmux do agente não abriu a sessão (${gv#tmux: })";;
+  "") gm="o agente não respondeu em @WAIT@s";;
+  *) gm="resposta ilegível do agente";;
+esac
+[ "$gv" = ok ] || { echo "start recusado em @HOST@: $gm" >&2; rm -f @LAUNCH@; agent_down @LABEL@; exit 15; }"""
+# O agente (roda no launchd gui/<uid>, PATH próprio — o do launchd não tem o Homebrew do MBP): confere o login no PRÓPRIO domínio (três estados: logado / deslogado / ilegível — só "logado" segue; a saída
+# do claude, que tem e-mail e organização, nunca é gravada), abre a sessão, publica o veredito em @RES@ (troca atômica) e fica vivo enquanto a sessão existir. Só comando do claude: `auth status`.
+GUI_AGENT = r"""#!/bin/sh
+PATH="@PATHX@$HOME/.local/bin:$HOME/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"; export PATH
+res=@RES@
+say() { printf '%s\n' "$1" >"$res.tmp" && mv -f "$res.tmp" "$res"; }
+o=$(@CLAUDE@ auth status 2>&1 </dev/null); rc=$?
+lt=$(printf '%s\n' "$o" | grep -cE '"loggedIn"[[:space:]]*:[[:space:]]*true'); lf=$(printf '%s\n' "$o" | grep -cE '"loggedIn"[[:space:]]*:[[:space:]]*false')
+if [ "$lf" -ge 1 ] && [ "$lt" -eq 0 ]; then say deslogado; exit 0; fi
+if [ "$rc" -ne 0 ] || [ "$lt" -eq 0 ] || [ "$lf" -ge 1 ]; then say "ilegivel rc=$rc"; exit 0; fi
+e=$(tmux -L @SOCK@ new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" 2>&1) || { say "tmux: $(printf '%s' "$e" | head -n 1 | cut -c1-160)"; exit 0; }
+say ok
+while tmux -L @SOCK@ has-session -t @TGT@ 2>/dev/null; do sleep 2; done
+"""
+GUI_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>%(label)s</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>%(sh)s</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+</dict>
+</plist>
+"""
 # o ssh leva `sh -c '<RUNNER>'` (uma string, qualquer shell de login a entende) e o script vai pela entrada padrão: não há limite de
 # argv (o prompt tem dezenas de KB) e o script lê a entrada inteira ANTES de rodar, então comando nenhum dele a come.
 RUNNER = 'umask 077; f=$(mktemp) || exit 125; cat >"$f"; sh "$f" </dev/null; rc=$?; rm -f "$f"; exit $rc'
@@ -319,6 +404,15 @@ class Cfg:
         if self.sleeps and not self.gate:  # notebook sem a regra de presença abriria sessão com o Athos no teclado
             raise Fail(f"host {self.host}: 'sleeps' (notebook) exige presence_gate true")
         self.spath, self.claude_bin, self.zdot = self.session_env(h)
+        # gui_agent (ga-w7qwl1.1.8): o tmux da sessão nasce num LaunchAgent do domínio gráfico (o claude só alcança o login lá). Host que dorme (o MBP) EXIGE: sem ele a sessão abriria deslogada, em silêncio.
+        if "gui_agent" in h and not isinstance(h["gui_agent"], bool):
+            raise Fail(f"host {self.host}: 'gui_agent' tem que ser true ou false ({h['gui_agent']!r})")
+        self.gui = h.get("gui_agent", False)
+        if self.sleeps and not self.gui:
+            raise Fail(f"host {self.host}: 'gui_agent' é obrigatório num host que dorme (notebook): sem ele o tmux nasce no ssh e o claude da sessão fica deslogado (Keychain)")
+        if self.gui and not self.claude_bin:
+            raise Fail(f"host {self.host}: 'gui_agent' exige 'session_env.claude' (o agente confere o login com esse claude)")
+        self.gui_wait, self.gui_proof = self.num(h, "gui_wait_s", GUI_WAIT_S), self.num(h, "gui_proof_s", GUI_PROOF_S)
         self.plib = self.need(h, "presence_lib", PATH_RE, self.home + "/gt-remote/bin/mbp-presence.sh")
         self.gate_cmd = h.get("gate_cmd") or [os.path.join(self.city_guess, "scripts", "mbp-run.sh"), "--check"]
         if not isinstance(self.gate_cmd, list) or not all(isinstance(x, str) and x for x in self.gate_cmd):
@@ -503,6 +597,33 @@ class Mapper:
         for old, new in self.rules:
             s = re.sub(r"(?<![\w.-])" + re.escape(old) + r"(?![\w.-])", lambda _m, new=new: new, s)
         return s
+
+
+def subst(tmpl: str, vals: dict) -> str:
+    """Troca TODOS os @CHAVE@ de uma vez (uma passada só: um valor que contenha @OUTRA@ não é reescrito); chave sem valor = bug do chamador."""
+    return re.sub(r"@[A-Z0-9]+@", lambda m: vals[m.group(0)], tmpl)
+
+
+def gui_files(cfg: Cfg, name: str) -> dict:
+    """Os nomes do agente desta sessão: o label (prefixo fixo + nome) e os três arquivos em <remote_root>/run/ (fora de ~/Library/LaunchAgents)."""
+    label = AGENT_PFX + name
+    base = f"{cfg.root}/run/{label}"
+    return {"label": label, "plist": base + ".plist", "sh": base + ".agent.sh", "res": base + ".agent.res"}
+
+
+def gui_vals(cfg: Cfg) -> dict:
+    return {"@RUN@": q(cfg.root + "/run"), "@PFX@": q(AGENT_PFX), "@PFXRE@": AGENT_PFX.replace(".", "\\."), "@TRIES@": str(cfg.gui_proof), "@HOST@": q(cfg.host)}
+
+
+def gui_agent_sh(cfg: Cfg, name: str, p: dict, lpath: str) -> str:
+    return subst(GUI_AGENT, {"@PATHX@": "".join(d + ":" for d in cfg.path_extra), "@RES@": q(gui_files(cfg, name)["res"]), "@CLAUDE@": q(cfg.claude_bin),
+                             "@SOCK@": q(cfg.socket), "@NAME@": q(name), "@WORKDIR@": q(p["work_dir"]), "@LAUNCH@": q(lpath), "@TGT@": tgt(name)})
+
+
+def gui_plist(cfg: Cfg, name: str) -> str:
+    from xml.sax.saxutils import escape
+    g = gui_files(cfg, name)
+    return GUI_PLIST % {"label": escape(g["label"]), "sh": escape(g["sh"])}
 
 
 def plan_start(cfg: Cfg, name: str, req: dict) -> dict:
@@ -773,6 +894,8 @@ def op_start(cfg: Cfg, name: str, args: list, dry: bool) -> int:
                               prepare=({"git_user": name, "git_email": f"{name}@gastown.invalid", "trust_file": f"{cfg.home}/.claude.json", "work_dir": p["work_dir"]} if cfg.prepare else None),
                               gate=cfg.gate_cmd if cfg.gate else None, path_extra=cfg.path_extra,
                               session_env={"path": cfg.spath, "claude": cfg.claude_bin, "zdot": cfg.zdot} if cfg.spath else None,
+                              gui_agent=(dict(gui_files(cfg, name), bootstrap=["launchctl", "bootstrap", "gui/<uid>", gui_files(cfg, name)["plist"]], wait_s=cfg.gui_wait,
+                                              script=gui_agent_sh(cfg, name, p, lpath).split("\n"), plist_xml=gui_plist(cfg, name).split("\n")) if cfg.gui else None),
                               tmux=["tmux", "-L", cfg.socket, "new-session", "-d", "-s", name, "-c", p["work_dir"], f"sh {lpath}"],
                               ssh=ssh_argv(cfg)), indent=2, sort_keys=True))
         return 0
@@ -788,15 +911,23 @@ s=$(sessions) || exit 1
 @GATE0@printf '%s\\n' "$s" | grep -qxF -- @NAME@ && { echo "session @NAME@ already exists" >&2; exit 11; }
 n=$(printf '%s\\n' "$s" | grep -c .)
 [ "$n" -lt @CAP@ ] || { echo "host @HOST@ está no teto: $n de @CAP@ sessões" >&2; exit 10; }
-@WTADD@@GATE1@@PREP@@PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
+@AGENT0@@WTADD@@GATE1@@PREP@@PLIBCHECK@mkdir -p @RUN@ @WORKDIR@ && chmod 700 @RUN@ || exit 1
 rm -f @EXITF@; printf %s @B64@ | base64 -d >@LAUNCH@ || exit 1"""
-    open_body = """@WTTRAP@[ -r @LAUNCH@ ] || { echo "start de @NAME@ abandonado: o lançador do preparo não está mais lá" >&2; exit 14; }
+    open_body = """@WTTRAP@@AGENT1@[ -r @LAUNCH@ ] || { echo "start de @NAME@ abandonado: o lançador do preparo não está mais lá" >&2; exit 14; }
 [ ! -e @STOPF@ ] || { echo "start de @NAME@ abandonado: o stop chegou durante o preparo" >&2; rm -f @LAUNCH@; exit 14; }
-T new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" || { rm -f @LAUNCH@; exit 1; }
+@NEWSESS@
 sleep 1
-T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@; exit 1; }"""
+T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após abrir: $(cat @EXITF@ 2>/dev/null)" >&2; rm -f @LAUNCH@;@ADOWN@ exit 1; }"""
+    gv = {**gui_vals(cfg), "@NAME@": q(name), "@LAUNCH@": q(lpath), **{f"@{k.upper()}@": q(v) for k, v in gui_files(cfg, name).items()}}
+    gv.update({"@AGSH@": gv.pop("@SH@"), "@AGB64@": q(base64.b64encode(gui_agent_sh(cfg, name, p, lpath).encode()).decode()),
+               "@PLB64@": q(base64.b64encode(gui_plist(cfg, name).encode()).decode()), "@WAIT@": str(cfg.gui_wait)})
+    # 1ª chamada (preparo): as funções do agente + a varredura de órfãos (precisa do `$s`, a lista de sessões, e recusa cedo, antes da parte lenta, se não há sessão gráfica).
+    # 2ª chamada (abertura): as funções de novo (cada ssh é um script) + o agente no lugar do `new-session`; a recusa do agente chega aqui e desfaz o lançador, o agente e o worktree (trap).
+    agent0, agent1, newsess, adown = ((subst(GUI_FN + GUI_SWEEP, gv), subst(GUI_FN, gv), subst(GUI_START, gv), subst(" agent_down @LABEL@;", gv)) if cfg.gui else
+                                      ("", "", 'T new-session -d -s @NAME@ -c @WORKDIR@ "sh @LAUNCH@" || { rm -f @LAUNCH@; exit 1; }', ""))
     plib = f'[ -r {q(cfg.plib)} ] || {{ echo "host @HOST@: sem a biblioteca de presença ({cfg.plib}); rode mbp-offload.sh install-mbp" >&2; exit 12; }}\n' if cfg.gate else ""
-    prep_body = prep_body.replace("@PLIBCHECK@", plib).replace("@PREP@", prepare_script(cfg)).replace("@WTADD@", wtadd_sh(wt, name) if wt else "")
+    prep_body = prep_body.replace("@AGENT0@", agent0).replace("@PLIBCHECK@", plib).replace("@PREP@", prepare_script(cfg)).replace("@WTADD@", wtadd_sh(wt, name) if wt else "")
+    open_body = open_body.replace("@AGENT1@", agent1).replace("@NEWSESS@", newsess).replace("@ADOWN@", adown)
     open_body = open_body.replace("@WTTRAP@", wtclean_sh(wt, name) + "trap '[ \"$?\" -eq 0 ] || wtclean >&2' EXIT\n" if wt else "")  # a 2ª chamada que falha recolhe o worktree que a 1ª criou (wtclean mantém o que tiver trabalho)
     for k, v in {"@NAME@": q(name), "@CAP@": str(cap), "@HOST@": q(cfg.host), "@RUN@": q(run_dir), "@WORKDIR@": q(p["work_dir"]),
                  "@EXITF@": q(exitf), "@LAUNCH@": q(lpath), "@TGT@": tgt(name), "@STOPF@": q(f"{run_dir}/{name}.stop"),
@@ -819,9 +950,14 @@ T has-session -t @TGT@ 2>/dev/null || { echo "sessão @NAME@ terminou logo após
             lr_invalidate(cfg)  # depois do ssh do start
         if rc not in (0, EX_EXISTS):
             cfg.mark(name, False)
-    if rc in (EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP):
+    for ln in err.splitlines():  # agente órfão que este start varreu antes de criar o dele: fica no log, mesmo que o start seja recusado logo depois
+        if ln.startswith("gui_agent: varreu"):
+            cfg.log(f"start {name}: {ln}")
+    if rc in (EX_CAP, EX_EXISTS, EX_POLICY, EX_PREP, EX_GUI):
         if rc == EX_CAP:
             cfg.event("refused", name, reason="teto do host")
+        if rc == EX_GUI:
+            cfg.event("refused", name, reason="gui_agent: " + " ".join(err.split())[:200])
         if rc == EX_PREP:
             cfg.log(f"start {name} recusado: preparo do worktree falhou: {err[:300]}")
         raise Fail(err or f"start de {name} recusado em {cfg.host} (rc={rc}, sem mensagem)")
@@ -850,6 +986,8 @@ T kill-session -t @TGT@ 2>/dev/null
 if [ -n "$pids" ]; then kill -TERM $pids 2>/dev/null; sleep 1; kill -KILL $pids 2>/dev/null; fi
 rm -f @RUN@/@NAME@.sh @RUN@/@NAME@.exit
 has @NAME@; [ $? -eq 1 ] || { echo "sessão @NAME@ continua aberta depois do stop" >&2; exit 1; }""".replace("@TGT@", tgt(name)).replace("@PTGT@", ptgt(name)).replace("@RUN@", q(cfg.root + "/run")).replace("@NAME@", name)
+    if cfg.gui:  # a sessão já saiu (a conferência acima sai 1 se não): agora o agente — bootout, apaga e PROVA; sem prova o stop falha (o registro da sessão fica), nunca "limpo"
+        body += "\n" + subst(GUI_FN, gui_vals(cfg)) + "agent_down " + q(gui_files(cfg, name)["label"]) + " || exit 1"
     try:
         wt = managed_worktree(cfg, name)
     except Fail as e:  # stop: nome que não serve de nome de worktree (sessão aberta antes do mapa existir) nunca impede o stop: derruba a sessão e só não recolhe
