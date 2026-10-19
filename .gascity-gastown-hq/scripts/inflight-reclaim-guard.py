@@ -4278,9 +4278,69 @@ def reclaim_dead_dog_claims(exclude_session_ids=None, sessions=None,
     return reclaimed
 
 
-def compute_multi_assigned_assignees(beads):
+# ga-hoifn5: parent-chain walk used by compute_multi_assigned_assignees(). The
+# depth cap stops a malformed parent loop from spinning; the read cap keeps the
+# extra `bd show` hops (an ancestor that is not itself in-flight, so not in the
+# already-fetched snapshot) from turning a poll cycle into a scan.
+_PARENT_WALK_MAX_DEPTH = 16
+_PARENT_READ_MAX_PER_CYCLE = 6
+_PARENT_READ_TIMEOUT_SECS = 8
+
+
+def _read_parent_id(bead_id, rig_root=None):
+    """Read ONE bead's parent id straight from bd (ga-hoifn5).
+
+    Returns (readable, parent_id) — THREE states, never collapsed:
+      (True, "<id>")  the bead has a parent
+      (True, None)    the bead was read and has NO parent
+      (False, None)   could not tell (bd failed, timed out, empty or garbled
+                      output, or it answered about a different bead)
+    Callers treat the third state as "keep today's rule", never as "no parent".
+    """
+    cmd = ["bd"] + (["-C", rig_root] if rig_root else []) + ["show", bead_id, "--json"]
+    # vazio → (False, None), "não li o bead" não é "bead sem pai";
+    # falhou/ilegível → (False, None), a mesma resposta inerte
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=_PARENT_READ_TIMEOUT_SECS)
+        if r.returncode != 0 or not r.stdout.strip():
+            return (False, None)
+        data = json.loads(r.stdout)
+    except Exception:
+        return (False, None)
+    obj = data[0] if isinstance(data, list) and data else data
+    if not isinstance(obj, dict) or obj.get("id") != bead_id:
+        return (False, None)
+    # `bd show` prints "parent": null for a bead with no parent (measured:
+    # ga-w7qwl1.1.8 → "ga-w7qwl1.1", a top-level bead → null)
+    parent = obj.get("parent")
+    if parent is None or parent == "":
+        return (True, None)
+    if not isinstance(parent, str):
+        return (False, None)
+    return (True, parent)
+
+
+def compute_multi_assigned_assignees(beads, parent_reader=None, notes=None):
     """Return the set of assignee strings that own 2+ DISTINCT in-flight bead
     ids at once, from an already-fetched `beads` list (ga-zbrbt).
+
+    ga-hoifn5: a mother and her OWN slice (one bead is an ancestor of the other
+    through the parent links) held by the same builder is the normal shape of a
+    sliced program, not a double-dispatch — and it is exactly where a live
+    session should vouch. Three false reclaims in one night (wa-1d97lb.7.7,
+    wa-1d97lb.7.8, ga-w7qwl1.1.8) came from counting such a pair as ambiguous.
+    So an assignee is flagged only when its ids do NOT all lie on ONE ancestor
+    chain: every pair must be related (one an ancestor of the other). Two
+    siblings, or two unrelated beads, are still flagged — the session pulse
+    could belong to either. The parent link is read from each bead's own
+    `parent` field (bd list omits the key for a bead with no parent). An
+    ancestor missing from `beads` is read through `parent_reader`
+    (_read_parent_id in production, at most _PARENT_READ_MAX_PER_CYCLE reads a
+    cycle; None = snapshot only, no I/O). A link that cannot be read — no
+    reader, read failed, malformed value, loop, depth cap — is the third state:
+    the pair counts as unrelated, i.e. today's conservative rule, and a WARN
+    line saying why is appended to `notes` when a list is given.
 
     A session that is the CONCRETE assignee of two or more in-flight beads at
     the same time has an AMBIGUOUS last_active for both — its fresh activity
@@ -4292,7 +4352,8 @@ def compute_multi_assigned_assignees(beads):
     evidence (bead_update_age) instead of trusting session-level freshness
     alone — see session_owner_is_healthy()'s docstring for the mechanism.
 
-    Pure, cheap (one pass over already-fetched dicts, no I/O) — this doubles
+    Cheap (a pass over already-fetched dicts; the only I/O is the optional
+    ancestor read above, off by default) — this doubles
     as ga-zbrbt's proposed remedy #3 ("detecção barata... o sinal é barato de
     calcular"): run_cycle logs a warning whenever this returns non-empty, so
     a double-dispatch is visible at minute zero instead of at the stranding
@@ -4336,14 +4397,102 @@ def compute_multi_assigned_assignees(beads):
     on a session that was never actually double-booked.
     """
     counts = {}
+    by_id = {}
     for b in beads:
         a = b.get("assignee") or ""
         bid = b.get("id", "")
+        if bid:
+            by_id[bid] = b          # every bead is a parent-link source, epics included
         if (b.get("issue_type") or b.get("type") or "") == "epic":
             continue
         if a and bid and not is_coordinator(a) and a not in EPHEMERAL_POOL_ASSIGNEES:
             counts.setdefault(a, set()).add(bid)
-    return {a for a, ids in counts.items() if len(ids) > 1}
+
+    reads_left = [_PARENT_READ_MAX_PER_CYCLE]
+    chain_cache = {}
+
+    def _parent_of(bid, rig_root):
+        """(readable, parent_id|None) for one bead — see _read_parent_id()."""
+        b = by_id.get(bid)
+        if b is not None:
+            # vazio → sem pai (o bd list omite a chave: medido em ga-j1jo7c, sem
+            # "parent", vs ga-sh8t23.6, "parent": "ga-sh8t23");
+            # falhou/ilegível → (False, None), valor que não é texto não vira "sem pai"
+            p = b.get("parent")
+            if p is None or p == "":
+                return (True, None)
+            return (True, p) if isinstance(p, str) else (False, None)
+        if parent_reader is None or reads_left[0] <= 0:
+            return (False, None)
+        reads_left[0] -= 1
+        # vazio → o leitor devolve (True, None) = sem pai; falhou/ilegível → exceção ou
+        # resposta fora de (bool, str|None) = (False, None), nunca "sem pai"
+        try:
+            res = parent_reader(bid, rig_root)
+        except Exception:
+            return (False, None)
+        if not (isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], bool)):
+            return (False, None)
+        if not res[0]:
+            return (False, None)
+        if res[1] is None or res[1] == "":
+            return (True, None)
+        return (True, res[1]) if isinstance(res[1], str) else (False, None)
+
+    def _chain(bid):
+        """(ancestors nearest-first, complete). complete=False: the walk hit an
+        unreadable link, a loop or the depth cap, so the list may be short."""
+        if bid in chain_cache:
+            return chain_cache[bid]
+        rig_root = (by_id.get(bid) or {}).get("rig_root")
+        ancestors, seen, cur, complete = [], {bid}, bid, True
+        for _ in range(_PARENT_WALK_MAX_DEPTH):
+            readable, parent = _parent_of(cur, rig_root)
+            if not readable or (parent is not None and parent in seen):
+                complete = False
+                break
+            if parent is None:
+                break
+            ancestors.append(parent)
+            seen.add(parent)
+            cur = parent
+        else:
+            complete = False
+        chain_cache[bid] = (ancestors, complete)
+        return chain_cache[bid]
+
+    def _related(x, y):
+        """True: one is an ancestor of the other. False: both chains were read
+        to the top and never meet. None: could not tell."""
+        anc_x, done_x = _chain(x)
+        anc_y, done_y = _chain(y)
+        if y in anc_x or x in anc_y:
+            return True
+        return False if (done_x and done_y) else None
+
+    flagged = set()
+    for a, ids in sorted(counts.items()):
+        if len(ids) < 2:
+            continue
+        idl = sorted(ids)
+        verdicts = [((x, y), _related(x, y))
+                    for i, x in enumerate(idl) for y in idl[i + 1:]]
+        unrelated = [p for p, v in verdicts if v is False]
+        unknown = [p for p, v in verdicts if v is None]
+        if unrelated or unknown:
+            flagged.add(a)
+            if unknown and notes is not None:
+                notes.append(
+                    f"WARN assignee={a!r} holds {idl}: could not read the parent link for "
+                    f"{unknown} — keeping the double-booked rule (session liveness "
+                    f"alone does not vouch)" + ("" if not unrelated else
+                    f"; unrelated pair(s) also present: {unrelated}"))
+        elif notes is not None:
+            notes.append(
+                f"assignee={a!r} holds {idl}: all on ONE parent→child chain (a mother "
+                f"and her own slice), not a double-dispatch — session liveness vouches "
+                f"as for a single bead")
+    return flagged
 
 
 # ---------------------------------------------------------------------------
@@ -4382,7 +4531,13 @@ def run_cycle(state, escalated_alerted):
 
     # ga-zbrbt (duplo-despacho): cheap alarm (remedy #3) + the set Pass 1 uses
     # below to require per-bead evidence when a session is double-booked.
-    multi_assigned_assignees = compute_multi_assigned_assignees(beads)
+    # ga-hoifn5: a mother + her own slice held by one builder is not double-booked;
+    # the notes say why an assignee was cleared (or why a pair stayed flagged).
+    _multi_notes = []
+    multi_assigned_assignees = compute_multi_assigned_assignees(
+        beads, parent_reader=_read_parent_id, notes=_multi_notes)
+    for _n in _multi_notes:
+        print(f"[INFLIGHT-RECLAIM] ga-hoifn5: {_n}", flush=True)
     if multi_assigned_assignees:
         for _a in sorted(multi_assigned_assignees):
             _ids = sorted(b.get("id", "") for b in beads if (b.get("assignee") or "") == _a)
@@ -7977,6 +8132,219 @@ def _selftest():
               {"id": "wa-real1", "assignee": "thies-wa", "issue_type": "task"},
               {"id": "wa-real2", "assignee": "thies-wa", "issue_type": "bug"},
           ]) == {"thies-wa"})
+
+    # --- HZ-1..: ga-hoifn5 — a mother + her OWN slice held by one builder is
+    # one parent→child chain, not a double-dispatch. Measured 19/10: three false
+    # reclaims (wa-1d97lb.7.7, wa-1d97lb.7.8, ga-w7qwl1.1.8), the live builder
+    # holding the mother and her slice. Pair relation has THREE states
+    # (related / unrelated / could-not-tell); only "related" clears a pair.
+    _hz_me = "wa-worker-adhoc-0e7c31de83"
+    _hz_mother = {"id": "wa-1d97lb.7", "assignee": _hz_me, "issue_type": "feature"}
+    _hz_slice8 = {"id": "wa-1d97lb.7.8", "assignee": _hz_me, "issue_type": "task",
+                  "parent": "wa-1d97lb.7"}
+    _hz_slice7 = {"id": "wa-1d97lb.7.7", "assignee": _hz_me, "issue_type": "task",
+                  "parent": "wa-1d97lb.7"}
+    _hz_notes = []
+    check("HZ-1 (THE incident, 09:16Z log line): the builder holds the mother and her "
+          "own slice → NOT flagged, and a note says why",
+          compute_multi_assigned_assignees([_hz_mother, _hz_slice8], notes=_hz_notes) == set()
+          and len(_hz_notes) == 1 and "ONE parent→child chain" in _hz_notes[0]
+          and _hz_me in _hz_notes[0], repr(_hz_notes))
+    check("HZ-1b (same pair, bead order reversed) → NOT flagged",
+          compute_multi_assigned_assignees([_hz_slice8, _hz_mother]) == set())
+    check("HZ-2 (control — the 08:26Z shape): mother + TWO sibling slices → still "
+          "flagged: the two slices are unrelated to each other, so the session pulse "
+          "could belong to either",
+          compute_multi_assigned_assignees([_hz_mother, _hz_slice7, _hz_slice8]) == {_hz_me})
+    check("HZ-2b (control): two siblings alone → flagged",
+          compute_multi_assigned_assignees([_hz_slice7, _hz_slice8]) == {_hz_me})
+    check("HZ-3 (control): two unrelated beads, each with its own different parent → "
+          "flagged (the original ga-zbrbt double-dispatch, unchanged)",
+          compute_multi_assigned_assignees([
+              {"id": "wa-aaaaa.1", "assignee": _hz_me, "parent": "wa-aaaaa"},
+              {"id": "wa-bbbbb.1", "assignee": _hz_me, "parent": "wa-bbbbb"},
+          ]) == {_hz_me})
+    check("HZ-3b (control): a mother + her slice PLUS an unrelated third bead → "
+          "flagged (one related pair does not excuse the stranger)",
+          compute_multi_assigned_assignees([
+              _hz_mother, _hz_slice8, {"id": "wa-zzzzz", "assignee": _hz_me},
+          ]) == {_hz_me})
+    check("HZ-4: a three-level chain, all three held by the builder → NOT flagged",
+          compute_multi_assigned_assignees([
+              {"id": "ga-w7qwl1", "assignee": _hz_me},
+              {"id": "ga-w7qwl1.1", "assignee": _hz_me, "parent": "ga-w7qwl1"},
+              {"id": "ga-w7qwl1.1.8", "assignee": _hz_me, "parent": "ga-w7qwl1.1"},
+          ]) == set())
+    check("HZ-4b: the middle link is an in-flight bead nobody holds → still one chain "
+          "(grandmother + grandchild, middle taken from the snapshot) → NOT flagged",
+          compute_multi_assigned_assignees([
+              {"id": "ga-w7qwl1", "assignee": _hz_me},
+              {"id": "ga-w7qwl1.1", "assignee": "", "parent": "ga-w7qwl1"},
+              {"id": "ga-w7qwl1.1.8", "assignee": _hz_me, "parent": "ga-w7qwl1.1"},
+          ]) == set())
+
+    # --- the third state: a link that cannot be read keeps today's rule ---
+    _hz_gap = [
+        {"id": "ga-w7qwl1", "assignee": _hz_me},
+        {"id": "ga-w7qwl1.1.8", "assignee": _hz_me, "parent": "ga-w7qwl1.1"},
+    ]   # ga-w7qwl1.1 is NOT in the snapshot (closed / not in-flight)
+    _hz_calls = []
+    _hz_notes5 = []
+
+    def _hz_run(beads, **kw):
+        """(flagged, WARN-note-count, unrelated-only-note-count) — the verdict alone
+        cannot tell 'could not read' from 'read, and unrelated': both flag. The
+        WARN line is what separates them, so each third-state test pins it."""
+        n = []
+        out = compute_multi_assigned_assignees(beads, notes=n, **kw)
+        return out, sum(1 for x in n if x.startswith("WARN") and
+                        "could not read the parent link" in x)
+
+    def _hz_reader_ok(bid, rig_root=None):
+        _hz_calls.append((bid, rig_root))
+        return (True, {"ga-w7qwl1.1": "ga-w7qwl1"}.get(bid))
+
+    check("HZ-5: the middle ancestor is not in the snapshot and no reader is given → "
+          "could not tell → flagged (today's rule), note says the link was unreadable",
+          compute_multi_assigned_assignees(_hz_gap, notes=_hz_notes5) == {_hz_me}
+          and len(_hz_notes5) == 1 and _hz_notes5[0].startswith("WARN")
+          and "could not read the parent link" in _hz_notes5[0],
+          repr(_hz_notes5))
+    check("HZ-5b: same gap, the reader answers the missing hop → NOT flagged, and the "
+          "reader was asked about the missing bead only",
+          compute_multi_assigned_assignees(_hz_gap, parent_reader=_hz_reader_ok) == set()
+          and [c[0] for c in _hz_calls] == ["ga-w7qwl1.1"], repr(_hz_calls))
+    check("HZ-5c: same gap, the reader FAILS (False, None) → flagged — a failed read is "
+          "not 'no parent'",
+          _hz_run(_hz_gap, parent_reader=lambda bid, rig_root=None: (False, None))
+          == ({_hz_me}, 1))
+    check("HZ-5d: same gap, the reader says the missing bead has NO parent (True, None) "
+          "→ both chains complete and never meet → flagged as unrelated, and NO WARN "
+          "(the link WAS read)",
+          _hz_run(_hz_gap, parent_reader=lambda bid, rig_root=None: (True, None))
+          == ({_hz_me}, 0))
+    check("HZ-5e: a reader that RAISES is 'could not tell' → flagged, no exception "
+          "escapes (it must not abort the cycle nor clear the pair)",
+          _hz_run(_hz_gap, parent_reader=lambda b, r=None: 1 / 0) == ({_hz_me}, 1))
+    check("HZ-5f: a reader that answers outside (bool, str|None) → 'could not tell' → "
+          "flagged",
+          _hz_run(_hz_gap, parent_reader=lambda b, r=None: "ga-w7qwl1") == ({_hz_me}, 1)
+          and _hz_run(_hz_gap, parent_reader=lambda b, r=None: (True, 42)) == ({_hz_me}, 1))
+    check("HZ-6: a malformed parent value (a number) on one bead → unreadable → flagged, "
+          "never read as 'no parent'",
+          _hz_run([
+              {"id": "wa-x1", "assignee": _hz_me, "parent": 7},
+              {"id": "wa-x2", "assignee": _hz_me},
+          ]) == ({_hz_me}, 1))
+    check("HZ-7: a parent loop (a→b→a) cannot hang the walk and is not read as a chain "
+          "→ flagged",
+          _hz_run([
+              {"id": "wa-l1", "assignee": _hz_me, "parent": "wa-l2"},
+              {"id": "wa-l2", "assignee": _hz_me, "parent": "wa-l1"},
+              {"id": "wa-l3", "assignee": _hz_me},
+          ]) == ({_hz_me}, 1))
+    _hz_deep = [{"id": f"wa-d{i}", "assignee": _hz_me if i in (0, 40) else "",
+                 "parent": f"wa-d{i + 1}"} for i in range(40)]
+    _hz_deep.append({"id": "wa-d40", "assignee": _hz_me})
+    check("HZ-7b: a chain deeper than the walk cap is not claimed related → flagged "
+          "(wa-d0 and wa-d40 are 40 hops apart)",
+          _hz_run(_hz_deep) == ({_hz_me}, 1))
+    _hz_many = []
+    for _i in range(10):
+        _hz_many += [{"id": f"wa-top{_i}", "assignee": f"wa-worker-adhoc-m{_i}"},
+                     {"id": f"wa-leaf{_i}", "assignee": f"wa-worker-adhoc-m{_i}",
+                      "parent": f"wa-mid{_i}"}]
+    _hz_calls.clear()
+
+    def _hz_reader_mid(bid, rig_root=None):
+        _hz_calls.append(bid)
+        return (True, bid.replace("wa-mid", "wa-top"))   # every mid hangs under its top
+
+    _hz_flagged = compute_multi_assigned_assignees(_hz_many, parent_reader=_hz_reader_mid)
+    check("HZ-8: the extra-read budget holds — ten gaps in one cycle, a reader that "
+          f"answers every one: exactly {_PARENT_READ_MAX_PER_CYCLE} reads happen, "
+          f"{_PARENT_READ_MAX_PER_CYCLE} gaps clear and the other "
+          f"{10 - _PARENT_READ_MAX_PER_CYCLE} stay flagged (out of budget = could not tell)",
+          len(_hz_calls) == _PARENT_READ_MAX_PER_CYCLE
+          and len(_hz_flagged) == 10 - _PARENT_READ_MAX_PER_CYCLE,
+          f"calls={len(_hz_calls)} flagged={len(_hz_flagged)}")
+    check("HZ-9: the old call shape still works (no reader, no notes) and the "
+          "ZB-1 pair is flagged exactly as before",
+          compute_multi_assigned_assignees([
+              {"id": "wa-aaaaa", "assignee": _hz_me},
+              {"id": "wa-bbbbb", "assignee": _hz_me},
+          ]) == {_hz_me})
+    check("HZ-9b: coordinators and epics keep their exclusions with the new walk "
+          "(a mayor holding a mother + her slice, and an epic + her slice, flag nobody)",
+          compute_multi_assigned_assignees([
+              {"id": "ga-m1", "assignee": "mayor"},
+              {"id": "ga-m1.1", "assignee": "mayor", "parent": "ga-m1"},
+              {"id": "ga-e1", "assignee": "thies-wa", "issue_type": "epic"},
+              {"id": "ga-e1.1", "assignee": "thies-wa", "parent": "ga-e1"},
+          ]) == set())
+
+    # --- _read_parent_id(): the three states of one `bd show` read ---
+    _hz_orig_run = subprocess.run
+    _hz_seen_cmds = []
+
+    def _hz_stub(rc=0, out="", raise_exc=False):
+        def _run(cmd, **kw):
+            _hz_seen_cmds.append(list(cmd))
+            if raise_exc:
+                raise TimeoutError("simulated bd show timeout")
+            return _FakeGitResult(rc, out, "")
+        return _run
+
+    try:
+        subprocess.run = _hz_stub(out=json.dumps([{"id": "wa-s1", "parent": "wa-m1"}]))
+        check("HZ-10: _read_parent_id: bead with a parent → (True, parent)",
+              _read_parent_id("wa-s1") == (True, "wa-m1"))
+        subprocess.run = _hz_stub(out=json.dumps([{"id": "wa-m1", "parent": None}]))
+        check("HZ-10b: _read_parent_id: read OK, parent null → (True, None) 'has no parent'",
+              _read_parent_id("wa-m1") == (True, None))
+        subprocess.run = _hz_stub(out=json.dumps([{"id": "wa-m1"}]))
+        check("HZ-10c: _read_parent_id: read OK, parent key absent → (True, None)",
+              _read_parent_id("wa-m1") == (True, None))
+        subprocess.run = _hz_stub(rc=1, out="")
+        check("HZ-11: _read_parent_id: bd exits non-zero → (False, None), not 'no parent'",
+              _read_parent_id("wa-m1") == (False, None))
+        subprocess.run = _hz_stub(out="")
+        check("HZ-11b: _read_parent_id: empty output → (False, None)",
+              _read_parent_id("wa-m1") == (False, None))
+        subprocess.run = _hz_stub(out="not json {")
+        check("HZ-11c: _read_parent_id: garbled output → (False, None)",
+              _read_parent_id("wa-m1") == (False, None))
+        subprocess.run = _hz_stub(out="[]")
+        check("HZ-11d: _read_parent_id: empty list (bead not found) → (False, None)",
+              _read_parent_id("wa-m1") == (False, None))
+        subprocess.run = _hz_stub(out=json.dumps([{"id": "wa-OTHER", "parent": "wa-m9"}]))
+        check("HZ-11e: _read_parent_id: bd answered about a DIFFERENT bead → (False, None)",
+              _read_parent_id("wa-m1") == (False, None))
+        subprocess.run = _hz_stub(out=json.dumps([{"id": "wa-m1", "parent": 12}]))
+        check("HZ-11f: _read_parent_id: parent is not text → (False, None)",
+              _read_parent_id("wa-m1") == (False, None))
+        subprocess.run = _hz_stub(raise_exc=True)
+        check("HZ-11g: _read_parent_id: bd times out/raises → (False, None), never raises",
+              _read_parent_id("wa-m1") == (False, None))
+        _hz_seen_cmds.clear()
+        subprocess.run = _hz_stub(out=json.dumps([{"id": "wa-s1", "parent": "wa-m1"}]))
+        _read_parent_id("wa-s1", "/rigs/wa")
+        _read_parent_id("wa-s1")
+        check("HZ-12: _read_parent_id: a rig bead is read with `bd -C <rig>`, an HQ bead "
+              "without it",
+              _hz_seen_cmds == [["bd", "-C", "/rigs/wa", "show", "wa-s1", "--json"],
+                                ["bd", "show", "wa-s1", "--json"]], repr(_hz_seen_cmds))
+    finally:
+        subprocess.run = _hz_orig_run
+
+    import inspect as _hz_inspect
+    _hz_rc_src = _hz_inspect.getsource(run_cycle)
+    check("HZ-13 (drift guard, run_cycle itself is never invoked by this selftest): "
+          "run_cycle hands compute_multi_assigned_assignees the production reader "
+          "and a notes list, and prints the notes",
+          "compute_multi_assigned_assignees(\n        beads, parent_reader=_read_parent_id, "
+          "notes=_multi_notes)" in _hz_rc_src
+          and "for _n in _multi_notes:" in _hz_rc_src)
 
     # --- ZB-4..7: session_is_live() / concrete_adhoc_session_is_live() wiring ---
     _zb_live_fresh = [
