@@ -13,7 +13,8 @@
 #   1. confere a cadeia /, /usr, /usr/local, /usr/local/libexec, /usr/local/libexec/gascity: cada degrau do root, sem
 #      symlink, sem escrita de grupo/outros. Cria só os que faltam (root:wheel 0755); NUNCA altera um que já existe;
 #   2. copia o disk-snapshot-guard.sh que está ao lado deste instalador para /usr/local/libexec/gascity (root:wheel 0755),
-#      por arquivo temporário na pasta do root + rename, e confere a CÓPIA (bytes e, se pedido, sha256);
+#      por arquivo temporário PRIVADO (0700) na pasta do root, confere a CÓPIA (bytes e o sha256 do --expect-sha256) e só então
+#      abre para 0755 e faz o rename;
 #   3. troca só ProgramArguments[1] do /Library/LaunchDaemons/com.gascity.disk-snapshot-guard.plist para a cópia (as outras
 #      chaves ficam como estão), guardando o plist original ao lado da cópia; o plist volta a root:wheel 0644;
 #   4. launchctl bootout + bootstrap; se o bootstrap falhar, devolve o plist original e recarrega;
@@ -23,8 +24,10 @@
 #   /bin/bash scripts/install-disk-snapshot-guard-root.sh --check                      # sem sudo: só lê e diz o que está errado
 #   sudo /bin/bash scripts/install-disk-snapshot-guard-root.sh --expect-sha256 <hex>   # instala (uma vez)
 #   sudo /bin/bash scripts/install-disk-snapshot-guard-root.sh --check                 # confere depois, com o launchd
-#   --expect-sha256 <hex>: recusa se a cópia que ficou na pasta do root não tiver esse sha256 (use o do arquivo revisado:
-#   `shasum -a 256 scripts/disk-snapshot-guard.sh`). Com --check, compara a cópia instalada. Sem ele, o sha256 só é impresso.
+#   --expect-sha256 <hex>: OBRIGATÓRIO para instalar (sem ele: uso errado, rc 2, nada muda). É o `shasum -a 256
+#   scripts/disk-snapshot-guard.sh` do arquivo revisado: o root lê esse arquivo de uma pasta do athos e só instala o que tem este
+#   hash. A cópia nasce 0700 (só do root) e só vira 0755 depois de o hash dela conferir, para que um arquivo trocado no meio do
+#   caminho (por exemplo um symlink para algo do root) nunca fique legível por outro. Com --check é opcional e compara a cópia instalada.
 #
 # SAÍDAS: 0 instalado/seguro e confirmado · 1 recusou ou falhou (a mensagem diz se algo mudou ou foi revertido) ·
 #   2 uso errado, nada mudou · 3 NÃO deu para confirmar, ou o estado ficou incerto: confira à mão com o que foi impresso.
@@ -114,8 +117,8 @@ cleanup() {
 trap cleanup EXIT
 
 usage() {
-  say "uso: [sudo] /bin/bash $0 [--check] [--expect-sha256 <64 hex>]"
-  say "  sem argumento (com root): instala; --check: só lê e confere (não precisa de root, mas sem root o launchd não é lido)."
+  say "uso: sudo /bin/bash $0 --expect-sha256 <64 hex>       (instala; o hash é obrigatório)"
+  say "     /bin/bash $0 --check [--expect-sha256 <64 hex>]  (só lê e confere; sem root o launchd não é lido)"
 }
 
 # meta_of <caminho> → M_MODE (os 10 caracteres de `ls -l`) e M_UID numérico; rc 1 se não deu para ler.
@@ -403,13 +406,16 @@ do_install() {
   # --- 3. a cópia: temporário na pasta do root, conferido, rename ---
   tmp_copy="$PROG_DIR_REAL/.$GUARD_NAME.new.$$"
   TMP_FILES+=("$tmp_copy")
-  stage_copy "$SRC" "$tmp_copy" 0755 || die 1 "não consegui copiar $SRC para $PROG_DIR (ou a fonte mudou durante a cópia). O root não executa nada novo"
+  # a cópia nasce 0700 (só do root) e só vira 0755 depois de o sha256 dela conferir: se o arquivo do athos for trocado no meio
+  # do caminho por um symlink para algo do root, o que o root leu não fica legível por outro e o hash recusa
+  stage_copy "$SRC" "$tmp_copy" 0700 || die 1 "não consegui copiar $SRC para $PROG_DIR (ou a fonte mudou durante a cópia). O root não executa nada novo"
   if [ -n "$PIN" ]; then
     # vazio → n/a; falhou/ilegível → recusa: a cópia é a prova, e sem hash dela não há prova
     copy_sha=$(sha256_of "$tmp_copy") || die 1 "não consegui calcular o sha256 da cópia para conferir o --expect-sha256. O root não executa nada novo"
     [ "$copy_sha" = "$PIN" ] || die 1 "o sha256 da cópia ($copy_sha) difere do --expect-sha256 ($PIN). O root não executa nada novo"
   fi
   safe_node "$tmp_copy" - || die 1 "$WHY. O root não executa nada novo"
+  chmod 0755 "$tmp_copy" || die 1 "não consegui dar 0755 à cópia em $PROG_DIR. O root não executa nada novo"
   if [ -d "$PROG_FILE_REAL" ] && [ ! -L "$PROG_FILE_REAL" ]; then
     die 1 "$PROG_PATH é um diretório: não substituo. O root não executa nada novo"
   fi
@@ -486,6 +492,11 @@ if [ -n "$PIN" ]; then
     (*[!0-9a-f]*) die 2 "--expect-sha256 só aceita hexadecimais" ;;
   esac
   [ "${#PIN}" = "64" ] || die 2 "--expect-sha256 pede 64 hexadecimais (sha256), recebi ${#PIN}"
+fi
+# vazio → instalar sem hash é recusado (o root copia um arquivo de pasta do athos: sem hash não há prova do que entra); falhou → n/a, é teste de string
+if [ "$MODE" = "install" ] && [ -z "$PIN" ]; then
+  usage >&2
+  die 2 "instalar exige --expect-sha256 <64 hex> (o shasum -a 256 do $GUARD_NAME revisado): o root lê esse arquivo de uma pasta do athos e só instala o que tem esse hash. Nada foi alterado"
 fi
 
 # vazio → sem a pasta do instalador não há fonte para copiar, recusa; falhou/ilegível → idem
