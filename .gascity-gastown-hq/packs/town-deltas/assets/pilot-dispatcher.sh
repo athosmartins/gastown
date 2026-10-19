@@ -11782,16 +11782,30 @@ _pilot_node_first_shadow() {
 #   label   além da sombra, a bead que o classificador manda ao nó POR CAUSA da etiqueta humana node:ok vai ao nó (apply --basis label).
 #   auto    além disso, a que se prova só pelo texto da bead (apply --basis any).
 # Retorno 0 = a bead JÁ está atribuída ao wa-worker-remote (o chamador não faz o caminho do pool do mini); 1 = nada foi escrito,
-# a bead segue no mini; 2 = a escrita pode ter acontecido e não sei dizer (rc 13 do script, o prazo estourou no meio, ou o script morreu por sinal, rc >= 128): o chamador
-# NÃO despacha esta varredura (carimbar wa-worker por cima de uma atribuição ao nó deixaria a bead nas duas filas) e tenta de novo na próxima.
+# a bead segue no mini; 2 = SEGURA: o chamador NÃO despacha esta varredura (carimbar wa-worker por cima de uma atribuição ao nó deixaria a bead nas duas filas) e tenta de novo na próxima. Dois motivos:
+#   (a) a bead JÁ é do nó (dono ou rota wa-worker-remote*) ou o gancho não consegue relê-la. Lido ANTES de chamar o script e qualquer que seja o rc dele (ga-9636op, gate-fix 1): o apply sai 12 para a bead
+#       que já é do nó, e 12 lido como "nada escrito" carimbava gc.routed_to=wa-worker por cima da rota do nó e criava sessão do mini, uma varredura depois de uma escrita que pegou e não deu para confirmar;
+#   (b) a escrita pode ter acontecido e não sei dizer (rc 13 do script, o prazo estourou no meio, ou o script morreu por sinal, rc >= 128).
+# A leitura de (a) só roda em label/auto: em off a função volta antes de ler qualquer coisa e em shadow nada muda no despacho.
 # Não cria sessão: o pool a cria (receita da ga-2hd02v.1.6); o slot do nó é 1.
-# vazio → n/a (o classificador sempre responde node/mini/unknown); falhou/ilegível antes de escrever (rc 10/11/12) → igual a mini: 1.
+# vazio → n/a (o classificador sempre responde node/mini/unknown); falhou/ilegível antes de escrever (rc 10/11/12) → igual a mini: 1 (a bead já foi lida como "não é do nó"; a que é do nó não chega aqui).
 # A leitura do slot e das sessões tem os três estados dentro do wa-node-dispatch.sh (ocupado ou "não sei" = não vai).
 _pilot_wa_node_decide() {
-  local _id="${1:-}" _store="${2:-}" _tgt="${3:-}" _mode="${PILOT_WA_NODE_ROUTE:-off}" _dir _out="" _rc=0 _basis=any
+  local _id="${1:-}" _store="${2:-}" _tgt="${3:-}" _mode="${PILOT_WA_NODE_ROUTE:-off}" _dir _out="" _rc=0 _basis=any _bj="" _bo=""
   case "$_mode" in shadow|label|auto) ;; *) return 1 ;; esac
   [ "$_tgt" = "wa-worker" ] || return 1
   case "$_id" in wa-*) ;; *) return 1 ;; esac
+  if [ "$_mode" != shadow ]; then
+    # três estados, nunca dois: "é do nó" (dono ou rota wa-worker-remote*) / "lida e não é do nó" / "não consegui ler" (bd falhou, saída vazia ou que não é JSON, a bead de outro id). Só o segundo segue; o terceiro
+    # NÃO vira "livre" (o caminho do pool escreveria por cima de uma bead que talvez já seja do nó). Esta leitura é do gancho e não do $_cur_asg do despacho (leitura que falha lá vira vazio = "não é do nó").
+    _bj=$(timeout "${PILOT_WA_NODE_READ_TIMEOUT:-20}" bd -C "$_store" show "$_id" --json 2>/dev/null) || _bj=""
+    _bo=$(printf '%s' "$_bj" | jq -r --arg id "$_id" 'if type=="array" then .[0] else . end | select(type=="object" and .id == $id) | if (((.assignee // "") | startswith("wa-worker-remote")) or ((.metadata["gc.routed_to"] // "") | startswith("wa-worker-remote"))) then "node" else "other" end' 2>/dev/null) || _bo=""
+    case "$_bo" in
+      other) ;;
+      node) warn "wa-node: $_id já é do nó (dono ou rota wa-worker-remote*) — seguro: sem carimbo do mini e sem sessão do mini; a próxima varredura relê"; return 2 ;;
+      *) warn "wa-node: não consegui reler $_id — não sei se já é do nó; seguro: sem carimbo do mini e sem sessão do mini; a próxima varredura relê"; return 2 ;;
+    esac
+  fi
   _dir="${PILOT_WA_NODE_SCRIPTS:-$GC_CITY/scripts}"
   if [ ! -x "$_dir/wa-node-dispatch.sh" ]; then
     warn "wa-node: $_dir/wa-node-dispatch.sh não está executável — $_id segue no mini"
