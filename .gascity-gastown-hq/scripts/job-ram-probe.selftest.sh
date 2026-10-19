@@ -218,7 +218,14 @@ EOF
   # resumo: a linha "pulado" é contada e dita; não é amostra nem linha ilegível
   { cat "$T/night.jsonl"; printf '{"ts":1704081620,"pulado":"disco","disk_free_mb":2100,"piso_mb":3072}\n{"ts":1704081625,"pulado":"disco","disk_free_mb":2050,"piso_mb":3072}\n{"ts":1704081630,"pulado":"disco","disk_free_mb":null,"piso_mb":3072}\n'; } > "$T/pulos.jsonl"
   jrp --summary "$T/night.jsonl" > "$T/p0" 2>/dev/null; jrp --summary "$T/pulos.jsonl" > "$T/p" 2>"$T/e"; RC=$?  # a noite fabricada já traz 1 linha ilegível de propósito: as 3 'pulado' não podem somar a ela
-  [ "$RC" = 0 ] && sed -n 3p "$T/p" | grep -q '^AVISO: 3 amostra(s) NÃO tiradas por falta de disco livre (de 04:00:20 a 04:00:30)' && grep -q ', 1 linhas ilegíveis:' "$T/p" && [ "$(sed -n 1,2p "$T/p0")" = "$(sed -n 1,2p "$T/p")" ]; ok $? "resumo com 3 linhas 'pulado': dito com o intervalo; cabeçalho e contagem de ilegíveis iguais aos do arquivo sem elas (as 3 não são amostra nem lixo) (rc=$RC)"
+  [ "$RC" = 0 ] && sed -n 3p "$T/p" | grep -q '^AVISO: 3 amostra(s) NÃO tiradas por falta de disco livre, em 1 trecho(s): 04:00:20 a 04:00:30 (3) (entre parênteses' && grep -q ', 1 linhas ilegíveis:' "$T/p" && [ "$(sed -n 1,2p "$T/p0")" = "$(sed -n 1,2p "$T/p")" ]; ok $? "resumo com 3 linhas 'pulado': dito com o trecho e a contagem; cabeçalho e contagem de ilegíveis iguais aos do arquivo sem elas (as 3 não são amostra nem lixo) (rc=$RC)"
+  # trechos separados são ditos separados: um único "de a a b" sobre a noite toda esconderia o que foi lido entre eles; o excesso vira "e mais N"
+  { cat "$T/night.jsonl"; for t in 1704081620 1704081625 1704082200 1704082205; do printf '{"ts":%s,"pulado":"disco","disk_free_mb":2100,"piso_mb":3072}\n' $t; done; } > "$T/pulos2.jsonl"
+  jrp --summary "$T/pulos2.jsonl" > "$T/p2" 2>/dev/null; RC=$?
+  [ "$RC" = 0 ] && sed -n 3p "$T/p2" | grep -q '^AVISO: 4 amostra(s) NÃO tiradas por falta de disco livre, em 2 trecho(s): 04:00:20 a 04:00:25 (2), 04:10:00 a 04:10:05 (2) (entre'; ok $? "pulos em 2 momentos (10 min entre eles): 2 trechos ditos separados, cada um com a sua contagem, e não um 'de 04:00:20 a 04:10:05' (rc=$RC)"
+  { cat "$T/night.jsonl"; for i in 0 1 2 3 4 5 6 7; do printf '{"ts":%s,"pulado":"disco","disk_free_mb":2100,"piso_mb":3072}\n' $((1704081620 + 100 * i)); done; } > "$T/pulos8.jsonl"
+  jrp --summary "$T/pulos8.jsonl" > "$T/p8" 2>/dev/null; RC=$?
+  [ "$RC" = 0 ] && sed -n 3p "$T/p8" | grep -q 'em 8 trecho(s): .* e mais 2 (entre' && [ "$(sed -n 3p "$T/p8" | grep -o ' (1)' | wc -l | tr -d ' ')" = 6 ]; ok $? "8 trechos: os 6 primeiros listados e 'e mais 2' (a lista não cresce com a noite) (rc=$RC)"
   printf '{"ts":1704081620,"pulado":"disco","disk_free_mb":2100,"piso_mb":3072}\n' > "$T/so-pulos.jsonl"; jrp --summary "$T/so-pulos.jsonl" >"$T/o" 2>"$T/e"; RC=$?
   [ "$RC" = 3 ] && [ ! -s "$T/o" ] && grep -q '1 puladas por disco' "$T/e"; ok $? "arquivo só com linhas 'pulado': exit 3 sem relatório, e diz que foram puladas (não sei ≠ nada rodou) (rc=$RC)"
   (jrp --duration 20 --interval 1 --out "$T/lock.jsonl" >/dev/null 2>&1 &) ; sleep 3
@@ -298,7 +305,9 @@ echo "== $((n-fails))/$n ok =="
   mutant "disco baixo não pula (amostra assim mesmo)" 's/^            if skip_floor and (free_mb is None or free_mb \* 1048576 < skip_floor): .*$/            if False:/'
   mutant "disco ilegível vira 'tem espaço'" 's/free_mb is None or free_mb \* 1048576 < skip_floor/free_mb is not None and free_mb * 1048576 < skip_floor/'
   mutant "linha 'pulado' conta como linha ilegível" 's/^                    if isinstance(r, dict) and isinstance(r.get("ts"), int) and r.get("pulado") == "disco": .*$/                    if False:/'
-  mutant "resumo não diz as amostras puladas" 's/^    if skipped:  # \[guard:skipped\]$/    if False:/'
+  mutant "resumo não diz as amostras puladas" 's/^    if skipped:  # \[guard:skipped\].*$/    if False:/'
+  mutant "resumo junta trechos distantes num só" 's/t - runs\[-1\]\[1\] <= limit/True/'
+  mutant "resumo lista todos os trechos" 's/runs\[:SKIP_RUNS_SHOWN\]/runs/'
   mutant "probe não diz quantas amostras pulou" 's/^    if skipped:$/    if False:/'
   mutant "piso de amostragem nan/inf passa" 's/ or not 0 <= a.skip_free_gb < 1e9 or / or a.skip_free_gb < 0 or /'
   mutant "janela sem nenhuma amostra sai com 0" 's/^    if n == 0:  # a janela acabou .*$/    if False:/'

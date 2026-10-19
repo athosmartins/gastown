@@ -7,8 +7,9 @@
   agente carregado no login recomeça sozinho depois do boot. RunAtLoad=true e SEM KeepAlive: roda `scripts/job-ram-probe-loop.sh` uma vez por boot; o script não é reiniciado
   pelo launchd se sair (nem se desistir depois de 6 falhas), e o próximo boot tenta de novo.
 
-  Quando termina: 4 noites completas (a de 17/10 + 3 novas) OU a data-limite 23/10 05:30, o que vier primeiro. Nas duas o script apaga ESTE arquivo de ~/Library/LaunchAgents e dá
-  `launchctl bootout`. Nenhum agente de medição fica órfão. Pior caso (o loop morre antes): o 1º boot depois da data-limite (23/10 às 23:41) tira o agente.
+  Quando termina: 4 noites completas (a de 17/10 + 3 novas; noite com mais de 600 s sem leitura ou com início depois das 04:00 não conta) OU a data-limite 23/10 05:30, o que vier primeiro.
+  Nas duas o script apaga ESTE arquivo de ~/Library/LaunchAgents e dá `launchctl bootout`, e o `fim:` do loop.log diz quantas noites completas havia. Pior caso (o loop morre antes): o 1º boot
+  depois da data-limite (23/10 às 23:41) tira o agente; se o rm falhar, o loop.log diz `AVISO: não consegui apagar` e o próximo boot refaz o fim.
 
   Instalar (depois do merge; a cópia versionada fica aqui, a que o launchd lê é a de ~/Library/LaunchAgents):
     cp $GC_CITY_PATH/packs/town-deltas/assets/com.gascity.job-ram-probe-loop.plist ~/Library/LaunchAgents/

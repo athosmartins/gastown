@@ -29,7 +29,8 @@ USO
   job-ram-probe.py [--start HH:MM] [--until HH:MM | --duration S | --ticks N] [--interval S] [--out ARQ] [--max-mb N] [--min-free-gb N] [--skip-free-gb N] [--check-every N] [--fixture-dir D]
   job-ram-probe.py --summary ARQ... [--swap-step MB] [--big-mb MB] [--disk-step MB] [--max-gap S] [--top N]
   --skip-free-gb N (ga-sh8t23.6): com menos de N GB livres o probe NÃO amostra e segue: grava `{"ts":…,"pulado":"disco","disk_free_mb":…}` a cada passo e volta a amostrar quando o disco volta (disco ilegível = pula também).
-  `--summary` conta essas linhas e diz de quando a quando: nesse intervalo não há leitura (um pico dentro dele NÃO aparece). `--min-free-gb` é o outro piso, mais baixo: abaixo dele o probe PARA (exit 6).
+  `--summary` conta essas linhas e diz os TRECHOS (de quando a quando, quantas amostras em cada): neles não há leitura (um pico dentro deles NÃO aparece). `--min-free-gb` é o outro piso, mais baixo: abaixo dele
+  o probe PARA (exit 6), mas só o confere no início e depois de uma amostra TIRADA; com o disco já abaixo de --skip-free-gb o probe pula em vez de parar, e esse piso não chega a valer.
   (`--ticks` conta só as amostras tiradas; sem `--until`/`--duration`, disco sempre baixo nunca termina.)
   Com --start espera até a hora (local); se já estiver dentro de [start, until] começa agora. Códigos: 0 · 2 uso errado · 3 não consegui ler/nenhuma amostra · 4 outra instância
   no mesmo arquivo · 5 arquivo passou do teto · 6 disco abaixo do piso. Gravação que não deixou nenhuma amostra também sai com 3 (nada gravado não é sucesso). A tabela do resumo mostra os
@@ -61,6 +62,7 @@ PERSISTENT = 0.9  # visto em >= 90 % das amostras válidas = daemon (KeepAlive),
 LOOKBACK = 60     # s antes de um salto de swap em que se procura quem cresceu
 GROW_KB = 50 * 1024
 GAP_FACTOR = 3    # duas amostras só são "seguidas" se o passo entre elas for <= GAP_FACTOR x o passo mediano (ou --max-gap)
+SKIP_RUNS_SHOWN = 6  # trechos "pulado: disco" listados no AVISO do resumo; o resto vira "e mais N"
 
 
 def launchd_pids(fixture=None):
@@ -279,6 +281,19 @@ def gap_limit(recs, override):
     return GAP_FACTOR * statistics.median(pos) if pos else 0
 
 
+def skip_runs(skipped, limit):
+    """Instantes ordenados das linhas "pulado: disco" → trechos [primeiro, último, nº]. Dois instantes a mais de `limit` s um do outro são trechos distintos (o disco voltou e caiu de novo).
+    vazio → []; falhou → não há leitura que falhe aqui."""
+    runs = []
+    for t in skipped:
+        if runs and t - runs[-1][1] <= limit:
+            runs[-1][1] = t
+            runs[-1][2] += 1
+        else:
+            runs.append([t, t, 1])
+    return runs
+
+
 def moves(rs, key, sign, thr, limit):
     """Pares de leituras SEGUIDAS de `key` em `rs` (só amostras que têm a leitura) cuja variação, no sentido `sign` (+1 subiu, -1 caiu), chega a `thr`.
     Só vale par com os dois pontos a no máximo `limit` s: o mais distante é um buraco (probe parado, máquina dormindo, pausa entre noites), não um evento que alguém viu.
@@ -326,8 +341,11 @@ def summarize(recs, bad, swap_step, big_mb, disk_step, max_gap=None, top=40, ski
          f"custo da amostra: mediana {statistics.median(dts) if dts else 0:.0f} ms, máx {max(dts) if dts else 0} ms"]
     if no_ps or no_lc or bad:
         L.append(f"AVISO: {no_ps} amostras sem ps, {no_lc} sem launchctl (essas NÃO atribuem RAM a job), {bad} linhas ilegíveis: o que não li não está nas tabelas abaixo.")
-    if skipped:  # [guard:skipped]
-        L.append(f"AVISO: {len(skipped)} amostra(s) NÃO tiradas por falta de disco livre (de {at(skipped[0])} a {at(skipped[-1])}): nesse intervalo não há leitura de RAM nem de swap, e um pico que caiu nele NÃO aparece nas tabelas abaixo.")
+    if skipped:  # [guard:skipped] um trecho por vez: "de a a b" sobre a noite toda esconderia que o resto foi lido
+        runs = skip_runs(skipped, limit)
+        shown = ", ".join(f"{at(a)} a {at(b)} ({n})" for a, b, n in runs[:SKIP_RUNS_SHOWN])
+        more = f" e mais {len(runs) - SKIP_RUNS_SHOWN}" if len(runs) > SKIP_RUNS_SHOWN else ""
+        L.append(f"AVISO: {len(skipped)} amostra(s) NÃO tiradas por falta de disco livre, em {len(runs)} trecho(s): {shown}{more} (entre parênteses, quantas em cada). Nesses trechos não há leitura de RAM nem de swap, e um pico que caiu neles NÃO aparece nas tabelas abaixo.")
     if holes:
         ha, hb = max(holes, key=lambda h: h[1]["ts"] - h[0]["ts"])
         L.append(f"AVISO: {len(holes)} buraco(s) entre amostras seguidas (passo > {limit:.0f} s), somando {dur(sum(y['ts'] - x['ts'] for x, y in holes))}; o maior: {dur(hb['ts'] - ha['ts'])}, de {at(ha['ts'])} a {at(hb['ts'])}. "
