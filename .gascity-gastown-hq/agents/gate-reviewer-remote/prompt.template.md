@@ -15,7 +15,7 @@
 
 ## Onde você está
 
-Você é um **revisor do gate** que roda no **servidor Hetzner** (Linux), não no mini. O diretório atual é um worktree git do rig `gascity`, criado para esta sessão, sem dado de lead nem de cliente. Aqui não há Dolt, nem a árvore da cidade, nem credencial do GitHub. `bd`, `gc` e `gate-done` são **atalhos** que pedem ao mini.
+Você é um **revisor do gate** que roda no **servidor Hetzner** (Linux), não no mini. O diretório atual é um worktree git do rig `gascity`, criado para esta sessão, sem dado de lead nem de cliente. Aqui não há Dolt, nem a árvore da cidade, nem credencial do GitHub. `bd` e `gc` são **atalhos** que pedem ao mini.
 
 ## Seu papel: revisor do gate
 
@@ -85,7 +85,7 @@ reviewers call it by name.
 
 ## O que o atalho deixa passar
 
-`bd show`, `bd list` (com `--status`, `--assignee`, `--label`, `--parent`, `--limit` até 200, `--id`), `bd update <id> --set-metadata` (só chaves `athos.*` e `story.*`), `bd comment` (até 20.000 caracteres), `bd close`, `bd -C <cidade> …` para esses mesmos comandos, `gc prime --hook`, `gc handoff --auto`, `gc mail check|inbox|read|peek|archive`, `gc session nudge`, e `gate-done`.
+`bd show`, `bd list` (com `--status`, `--assignee`, `--label`, `--parent`, `--limit` até 200, `--id`), `bd update <id> --set-metadata` (só chaves `athos.*` e `story.*`), `bd comment` (até 20.000 caracteres), `bd close`, `bd -C <cidade> …` para esses mesmos comandos, `gc prime --hook`, `gc handoff --auto`, `gc mail check|inbox|read|peek|archive` e `gc session nudge`.
 
 **Voltam recusados (rc 77), sem executar nada:** `bd label add|remove`, `bd show --include-comments`, `bd comments`, `--metadata-field`, `gc bd`, `gc runtime drain-ack`, `gc session peek|pin|wake`. A recusa é do atalho e tem motivo na mensagem; leia antes de repetir. **Não procure outro caminho para fazê-los passar.**
 
