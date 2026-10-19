@@ -180,7 +180,20 @@ denied "ferramenta security" "comando fora da lista" security find-generic-passw
 denied "ferramenta sh" "comando fora da lista" sh -c id
 denied "ferramenta ssh" "comando fora da lista" ssh outro
 denied "gate-done com flag" "flag fora da lista" gate-done --bead ga-1
-denied "gate-done com argumento" "argumento a mais" gate-done ga-1
+GDSHA=$(printf 'a%.0s' $(seq 1 40))
+# gate-done <bead> <ref> <sha> (ga-2hd02v.1.18): a forma com 3 argumentos passa e chega ao executável na ORDEM do cliente; 1 ou 2 argumentos são recusados dizendo a FORMA inteira
+allowed "gate-done <bead> <ref> <sha>" gate-done ga-2hd02v.1.18 fix/ga-2hd02v.1.18-gate-done-ref-arg "$GDSHA"; lastis "gatedone	cwd=$CITY"; ok $? "  roda o gatedone da config, na cidade"
+allowed "gate-done <bead> refs/heads/worker/<sessão>-N <sha>" gate-done ga-1 refs/heads/worker/dog-remote-gawisp1ryjj-4 "$GDSHA"
+denied "gate-done com 1 argumento" "forma: gate-done <bead> <ref> <sha>" gate-done ga-1
+denied "gate-done com 2 argumentos (falta o sha)" "forma: gate-done <bead> <ref> <sha>" gate-done ga-1 worker/dog-remote-1-2
+denied "gate-done com 4 argumentos" "argumento a mais" gate-done ga-1 worker/dog-remote-1-2 "$GDSHA" extra
+denied "gate-done com sha curto (prefixo)" "fora do formato <sha>" gate-done ga-1 worker/dog-remote-1-2 "${GDSHA:0:12}"
+denied "gate-done com sha em maiúsculas" "fora do formato <sha>" gate-done ga-1 worker/dog-remote-1-2 "$(printf 'A%.0s' $(seq 1 40))"
+denied "gate-done com ref que o git recusaria (..)" "fora do formato <ref>" gate-done ga-1 worker/../x "$GDSHA"
+denied "gate-done com ref terminando em .lock" "fora do formato <ref>" gate-done ga-1 worker/x.lock "$GDSHA"
+denied "gate-done com ref com ':' (refspec)" "fora do formato <ref>" gate-done ga-1 worker/x:main "$GDSHA"
+denied "gate-done com ref que começa por '-' (flag)" "flag fora da lista" gate-done ga-1 --force "$GDSHA"
+denied "gate-done com id de bead fora do formato" "fora do formato <id>" gate-done 'ga 1' worker/dog-remote-1-2 "$GDSHA"
 # um `--` sem nada depois não é "forma EXATA": o executável receberia argc=1 argv=[--] (o gate-done é um script, não um cobra)
 denied "gate-done --" "sem nada depois" gate-done --
 denied "gc handoff --auto --" "sem nada depois" gc handoff --auto --

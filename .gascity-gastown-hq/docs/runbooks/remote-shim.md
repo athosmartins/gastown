@@ -59,6 +59,7 @@ gc mail archive <id>...
 gc mail send <word> [--subject|-s <text>] [--message|-m <text>]
 gc mail reply <id> [--subject|-s <text>] [--message|-m <text>]
 gc session nudge <word> <line>... [--delivery <delivery>]
+gate-done <id> <ref> <sha>
 gate-done
 env GC_AGENT
 env GC_ALIAS
