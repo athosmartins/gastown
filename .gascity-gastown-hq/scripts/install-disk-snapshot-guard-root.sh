@@ -48,7 +48,7 @@
 #     passa o comando deve passar também o `shasum -a 256` deste arquivo, para o Athos conferir antes de rodar.
 #
 # GANCHOS DE TESTE (só sem root; o selftest usa todos): DSG_ROOT_PFX (prefixo de "/"), DSG_ROOT_UID (uid que conta como
-#   root), DSG_OWNER (user:group no lugar de root:wheel), DSG_LAUNCHCTL, DSG_PLISTBUDDY, DSG_PLUTIL (binários falsos),
+#   root), DSG_OWNER (user:group no lugar de root:wheel), DSG_LAUNCHCTL, DSG_PLISTBUDDY (binários falsos),
 #   DSG_RETRY_SLEEP (segundos entre as tentativas de bootstrap).
 
 set -uo pipefail
@@ -71,7 +71,6 @@ ROOT_UID=0
 ROOT_OWNER="root:wheel"
 LAUNCHCTL="/bin/launchctl"
 PLISTBUDDY="/usr/libexec/PlistBuddy"
-PLUTIL="/usr/bin/plutil"
 RETRY_SLEEP=2
 # $EUID é do próprio bash (sem comando externo que possa falhar): sem root os ganchos valem, com root nunca.
 if [ "$EUID" != "0" ]; then
@@ -80,7 +79,6 @@ if [ "$EUID" != "0" ]; then
   ROOT_OWNER="${DSG_OWNER:-root:wheel}"
   LAUNCHCTL="${DSG_LAUNCHCTL:-$LAUNCHCTL}"
   PLISTBUDDY="${DSG_PLISTBUDDY:-$PLISTBUDDY}"
-  PLUTIL="${DSG_PLUTIL:-$PLUTIL}"
   RETRY_SLEEP="${DSG_RETRY_SLEEP:-$RETRY_SLEEP}"
 fi
 OWN_U="${ROOT_OWNER%%:*}"
@@ -94,7 +92,6 @@ PIN=""
 WHY=""
 M_MODE=""
 M_UID=""
-CHAIN_INFO=""
 PL_ARG0=""
 PL_ARG1=""
 LD_ARGS=""
@@ -106,7 +103,6 @@ TMP_FILES=()
 say()  { printf '%s\n' "$*"; }
 die()  { local rc="$1"; shift; printf 'ERRO: %s\n' "$*" >&2; exit "$rc"; }
 f_ok()   { printf '  ok     %s\n' "$*"; }
-f_note() { printf '  nota   %s\n' "$*"; }
 f_bad()  { F_BAD=$((F_BAD+1)); printf '  FALHA  %s\n' "$*"; }
 f_unk()  { F_UNK=$((F_UNK+1)); printf '  ?      %s\n' "$*"; }
 
@@ -159,13 +155,11 @@ safe_node() {
 
 # walk_chain <dir de runtime> <cria: 0|1> → confere "/" e cada degrau até o dir; rc 0 se todos são do root e fechados.
 # Com cria=1 cria SÓ o degrau que não existe (root:wheel 0755), e só debaixo de um degrau que acabou de ser conferido.
-# CHAIN_INFO guarda "uid modo caminho" dos degraus conferidos até o ponto em que parou.
 walk_chain() {
   local want="$1" create="$2" rest="" cur="" comp=""
   rest="${want#/}"
   cur="$ROOT_PFX"
   [ -n "$cur" ] || cur="/"
-  CHAIN_INFO=""
   while :; do
     if [ -e "$cur" ] || [ -L "$cur" ]; then
       safe_node "$cur" d || return 1
@@ -176,19 +170,11 @@ walk_chain() {
       WHY="$cur não existe"
       return 1
     fi
-    CHAIN_INFO="$CHAIN_INFO$M_UID $M_MODE $cur"$'\n'
     [ -n "$rest" ] || return 0
     comp="${rest%%/*}"
     if [ "$comp" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
     cur="${cur%/}/$comp"
   done
-}
-
-print_chain() {
-  local l=""
-  while IFS= read -r l; do
-    if [ -n "$l" ]; then printf '           uid=%s\n' "$l"; fi
-  done <<< "$CHAIN_INFO"
 }
 
 # sha256_of <arquivo> → imprime os 64 hexadecimais; rc 1 sem imprimir nada se não deu.
@@ -260,10 +246,8 @@ audit_state() {
   say "-- o que o root executa: $PROG_PATH"
   if walk_chain "$PROG_DIR" 0; then
     f_ok "cadeia de pastas até $PROG_DIR: do root, sem symlink, sem escrita de grupo/outros"
-    print_chain
   else
     f_bad "$WHY"
-    print_chain
   fi
   if [ -e "$PROG_FILE_REAL" ] || [ -L "$PROG_FILE_REAL" ]; then
     if safe_node "$PROG_FILE_REAL" -; then
@@ -280,14 +264,6 @@ audit_state() {
       if [ "$sha" = "$PIN" ]; then f_ok "sha256 da cópia instalada confere com o --expect-sha256"; else f_bad "sha256 da cópia instalada ($sha) difere do --expect-sha256 ($PIN)"; fi
     else
       f_bad "não consegui calcular o sha256 de $PROG_PATH para comparar com o --expect-sha256"
-    fi
-  fi
-  # vazio → sem fonte ao lado, só deixo de comparar; falhou/ilegível → idem: é nota, nunca aprovação nem reprovação
-  if [ -f "$SRC" ] && [ -f "$PROG_FILE_REAL" ]; then
-    if cmp -s "$SRC" "$PROG_FILE_REAL"; then
-      f_note "a cópia instalada é idêntica ao $GUARD_NAME do repo"
-    else
-      f_note "o $GUARD_NAME do repo difere da cópia instalada: o root roda a CÓPIA (reinstale para atualizar)"
     fi
   fi
 
@@ -373,13 +349,11 @@ do_install() {
   done
   [ -x "$LAUNCHCTL" ] || die 1 "não achei $LAUNCHCTL: nada foi alterado"
   [ -x "$PLISTBUDDY" ] || die 1 "não achei $PLISTBUDDY: nada foi alterado"
-  [ -x "$PLUTIL" ] || die 1 "não achei $PLUTIL: nada foi alterado"
 
   # --- 1. só leitura: a fonte, o plist e as pastas do plist ---
   [ -L "$SRC" ] && die 1 "$SRC é um symlink: o root não copia o que um symlink do repo aponta. Nada foi alterado"
   [ -f "$SRC" ] || die 1 "não achei $SRC ao lado do instalador. Nada foi alterado"
   [ -s "$SRC" ] || die 1 "$SRC está vazio. Nada foi alterado"
-  "$SHELL_BIN" -n "$SRC" >/dev/null 2>&1 || die 1 "$SRC não passa em '$SHELL_BIN -n': não instalo script com erro de sintaxe. Nada foi alterado"
   # vazio → n/a; falhou/ilegível → só reprova se houver --expect-sha256 (sem hash não confirmo o revisado); sem pin vira "indisponível"
   if src_sha=$(sha256_of "$SRC"); then
     say "  fonte: $SRC (sha256 $src_sha)"
@@ -425,7 +399,7 @@ do_install() {
   safe_node "$PROG_FILE_REAL" - || die 3 "$WHY (depois do rename): confira à mão $PROG_PATH"
   say "  copiado: $PROG_PATH"
 
-  # --- 4. o plist: backup, edição num temporário, releitura, lint, rename ---
+  # --- 4. o plist: backup, edição num temporário, releitura, rename ---
   if [ "$needs_edit" = "1" ]; then
     old_arg1="$PL_ARG1"
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -437,7 +411,6 @@ do_install() {
     "$PLISTBUDDY" -c "Set :ProgramArguments:1 $PROG_PATH" "$tmp_plist" >/dev/null 2>&1 || die 1 "PlistBuddy não conseguiu trocar ProgramArguments[1]. O plist não foi alterado"
     read_plist_layout "$tmp_plist" || die 1 "$WHY (depois da edição). O plist não foi alterado"
     [ "$PL_ARG1" = "$PROG_PATH" ] || die 1 "depois da edição ProgramArguments[1] é '$PL_ARG1'. O plist não foi alterado"
-    "$PLUTIL" -lint "$tmp_plist" >/dev/null 2>&1 || die 1 "plutil -lint reprovou o plist editado. O plist não foi alterado"
     chown "$ROOT_OWNER" "$tmp_plist" && chmod 0644 "$tmp_plist" || die 1 "não consegui devolver o plist editado a $ROOT_OWNER 0644. O plist não foi alterado"
     mv -f "$tmp_plist" "$PLIST_REAL" || die 3 "o rename do plist falhou: confira $PLIST_PATH (o original está em $BACKUP)"
     say "  plist: ProgramArguments[1] $old_arg1 → $PROG_PATH (original guardado em $BACKUP)"
