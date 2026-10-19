@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.claude-security-janitor</string>
+
+  <!-- Claude Security Janitor (2026-10-19, ga-j4r9o8).
+
+       PROBLEM: the official security-guidance plugin (2.0.14) cost the mini ~1.5 GB twice over:
+       (1) ~10,000 security_warnings_state_<session>.json|.lock files in ~/.claude/security (the plugin
+       only sweeps them after 30 days; ~55 MB/day), and (2) a reinstall loop that left pip-unpack-* dirs
+       in the user temp dir (381 dirs / 797 MB on 19/10) whenever its SDK probe timed out under load.
+
+       OPERATION per run: (a) delete state files older than 3 days; (b) delete pip-{unpack,metadata,
+       install,ephem-wheel-cache,build-tracker}-* dirs older than 2 h when no pip process is alive;
+       (c) ask the python that sg-python.sh picks whether claude_agent_sdk is still importable and, if
+       not, send ONE notify alarm (repeat every 6 h) with the repair command. Detection only: it never
+       installs anything.
+
+       LEFT ALONE: anything it cannot prove stale. A directory it cannot list, a ps that does not answer,
+       a probe that times out = nothing deleted / not read as "SDK missing" (exit 1, visible in the log
+       and in `launchctl print`). Symlinks and look-alike names are never touched.
+
+       KILL-SWITCH: CLAUDE_SECURITY_JANITOR_ENABLED=0 -> no-op. DRY-RUN: CLAUDE_SECURITY_JANITOR_DRY_RUN=1
+       (or `claude-security-janitor.py --dry-run` by hand: nothing deleted, nothing sent, no state written).
+       CLAUDE_SECURITY_JANITOR_PROD=1 below is what lets it act on the REAL ~/.claude/security and the real
+       user temp dir; without it those targets are only ever a dry run.
+       CADENCE: StartInterval=3593 (~1 h), far above the measured run (5.6 s wall on 19/10 at load 44,
+       dry run on the real directories); off the round hour to decorrelate from other hourly jobs.
+       No KeepAlive. Single instance (flock). Nice 10 + low-priority IO: the mini lives at load 40-60.
+
+       NOT LOADED BY MERGING THIS FILE. Mergeado != vivo: copy it to ~/Library/LaunchAgents and
+       `launchctl bootstrap` it; see docs/runbooks/claude-security-janitor.md. Run it with --dry-run first. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/claude-security-janitor.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>3593</integer>
+
+  <key>Nice</key><integer>10</integer>
+  <key>LowPriorityIO</key><true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/claude-security-janitor.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/claude-security-janitor.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+    <key>CLAUDE_SECURITY_JANITOR_ENABLED</key>
+    <string>1</string>
+    <key>CLAUDE_SECURITY_JANITOR_DRY_RUN</key>
+    <string>0</string>
+    <key>CLAUDE_SECURITY_JANITOR_PROD</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>
