@@ -1,0 +1,44 @@
+# gate-reviewer-remote — o revisor do gate que roda no servidor Hetzner (ga-2hd02v.1.9)
+#
+# Contents
+#   O que é · Por que 2 · Como a sessão nasce · Como o veredito volta · O que NÃO está aqui · Ligar
+#
+# O QUE É. O mesmo revisor do `gate-reviewer`, mas a sessão abre no nó: o nome da sessão carrega `-remote-`
+# (`gate-reviewer-remote-adhoc-<10>`), o `remote_match` do provider híbrido ([session] do city.toml) a manda
+# para o `gc-session-ssh`, e ela roda num worktree do rig `gascity` no servidor. A TAREFA é a mesma do local, byte a byte
+# (o dispatcher renderiza uma só e a entrega pelo nudge): mesma lente, mesmo diff, mesma regra de veredito. O que muda é
+# onde o Claude roda e o canal de volta. Quem escolhe entre os dois é o dispatcher (packs/town-deltas/assets/
+# gate-remote-reviewers.lib.sh): nó primeiro; local só se o nó estiver cheio, fora do ar ou ilegível, ou se abrir o
+# spawn no nó falhar. Runbook: docs/runbooks/gate-reviewer-remote.md.
+#
+# POR QUE max_active_sessions = 2. O nó tem teto de 4 sessões no total (`cap` do host em .gc/session-ssh.json) e o
+# dog-remote ocupa 1. O run de CÓDIGO usa 1 revisor (ga-5hdsr: o teto do local, 3, limita runs concorrentes, não revisores
+# por run), então 2 aqui = 2 runs ao mesmo tempo no nó, deixando 1 vaga de folga. Mais que isso o nó fica sem espaço para o
+# que não é gate; o excedente cai no local, que é o desenho. Não é singleton (max 1): o guarda crew-session-dedup trata
+# max_active_sessions=1 como sessão única e mataria o segundo `gc session new`.
+#
+# COMO A SESSÃO NASCE. O dispatcher abre com `gc session new gate-reviewer-remote --no-attach` (igual ao local) e atribui
+# a verdict bead ao nome da sessão. O start do provider cria o worktree (wt-add) SÓ para os papéis de `worktree_rigs`
+# do host: o host precisa de {"gate-reviewer": "gascity"} em .gc/session-ssh.json. Sem isso o start recusa (exit 13) e o
+# dispatcher cai no local — seguro, mas o nó nunca é usado. work_dir, overlay_dir e env abaixo NÃO viajam (o provider
+# ignora o work_dir do template; não copia overlay): o revisor do nó não tem o overlay `pool-reviewer` (menos contexto no
+# 1º turno), e a prova de equivalência de veredito (runbook) tem de medir se isso muda o resultado.
+#
+# COMO O VEREDITO VOLTA. O atalho `bd` do nó (remote-shim-wrapper) NÃO passa `bd label add|remove` nem `gc runtime
+# drain-ack`. O revisor do nó entrega com `bd comment <bead> "VERDICT: PASS|FAIL …"` e `bd close <bead>`, que passam.
+# O dispatcher já aceita esse caminho (ga-86l90a8 para PASS, ga-w7pm55 para FAIL: o comentário ancorado vale quando o
+# rótulo não chegou). Alargar o atalho para `bd label add verdict:*` é decisão de segurança do Mayor, não está feito.
+#
+# O QUE NÃO ESTÁ AQUI. Nada de pool: min_active_sessions = 0 e ninguém faz `gc hook` neste papel; a sessão só existe
+# porque o dispatcher a abriu para uma verdict bead. Sem sessão ociosa de pé: idle_timeout curto devolve a vaga do nó.
+#
+# LIGAR. Este template é INERTE: sem a flag $GC_CITY/.gc/gate-remote-reviewers.on o dispatcher nunca o escolhe. Passo de
+# ligar (só depois do flip da 1.6 provado, decisão do Mayor): docs/runbooks/gate-reviewer-remote.md, seção "Ligar".
+idle_timeout = "10m"
+max_active_sessions = 2
+min_active_sessions = 0
+model = "sonnet"
+provider = "claude-headless"
+work_dir = ".gc/agents/gate-reviewer-remote"
+scope = "city"
+wake_mode = "fresh"
