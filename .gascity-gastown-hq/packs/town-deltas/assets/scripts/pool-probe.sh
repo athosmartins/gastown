@@ -13,10 +13,11 @@
 # call to a file has no such combination: `sh <this file> gastown.dog`.
 #
 # Contract. The SAME probe: same bd calls (same flags, same order), same veto filter, same tiers, and
-# the same STDOUT in every case (one JSON array of at most one bead, or `[]`). It is read-only (bd
-# ready/list/query + jq): nothing in here removes anything. The proof is pool-probe.selftest.sh, which
-# runs the engine's own text (pool-probe.golden-1c.txt) and this file against the same fixtures and
-# compares stdout, the argv of every bd call and the exit code.
+# the same STDOUT in every case (one JSON array of at most one bead, or `[]`) - except the two deliberate
+# differences below (the disk floor, ga-vln2py; the sling filter, ga-b97dgq), each with its own selftest.
+# It is read-only (bd ready/list/query/show, gc session list, jq): nothing in here removes anything. The proof
+# is pool-probe.selftest.sh, which runs the engine's own text (pool-probe.golden-1c.txt) and this file against
+# the same fixtures and compares stdout, the argv of every bd call and the exit code.
 #
 # Where it deliberately differs from the engine's probe: the engine's probe answers `[]` with exit 0
 # and no word on stderr both for "nothing to pick up" and for "I could not tell" (bd failed, bd

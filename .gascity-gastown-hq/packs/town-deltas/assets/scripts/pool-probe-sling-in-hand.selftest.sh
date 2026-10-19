@@ -10,7 +10,7 @@
 #   free/dead (no assignee, closed, or an assignee the readable roster does not list) -> the wisp is kept, silently
 #   cannot tell (bd show failed, roster unreadable or empty with no live lease)      -> the wisp is kept and stderr says so
 # plus: the filter runs before the oldest-pick (a duplicate that is the oldest must not hide the next wisp), it covers
-# the ephemeral tier too, the roster is read once however many wisps there are, and a candidate without pilot.sling_for
+# the ephemeral tier too, the roster is read once per tier answer however many wisps it holds, and a candidate without pilot.sling_for
 # costs no bd show and no gc call, and a lib that is missing or corrupt leaves the engine's own answer (log line, silent
 # stderr). Three textual MUTANTS (filter not wired in the script; "cannot tell" read as "dead" and a live lease ignored, both
 # in pool-probe-sling-lib.sh) must each be caught.
