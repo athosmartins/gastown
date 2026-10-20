@@ -735,7 +735,7 @@ g_mutantes() {
   # o lock bloqueante prende a 2ª instância até a paciência do teste acabar (~30 s, ver await): sai cedo para esses 30 s correrem junto com os outros mutantes e não no fim
   mutante lock-bloqueante "saida" $'fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)' $'fcntl.flock(fd, fcntl.LOCK_EX)'
   mutante gc-falha-vira-zero "sess" $'r["detalhe"] = _oneline(err)\n        return r' $'r["detalhe"] = _oneline(err)\n        r.update(lido=True, ativas=0)\n        return r'
-  mutante rc-ignorado "sess cpu bead"$'return prefix + "-falhou" if (why or rc != 0) else None' $'return prefix + "-falhou" if why else None'
+  mutante rc-ignorado "sess cpu bead" $'return prefix + "-falhou" if (why or rc != 0) else None' $'return prefix + "-falhou" if why else None'
   mutante saida-vazia-vira-zero "sess" $'r["motivo"] = "json-ilegivel" if out.strip() else "saida-vazia"' $'r.update(lido=True, ativas=0)'
   mutante envelope-ok-falso-lido "sess" $'if isinstance(d, dict) and "ok" in d and d["ok"] is not True:' $'if False:'
   mutante sessao-do-mbp-conta "sess" $'elif "-remote-" not in "-%s-" % ident or (other and other.search(ident)):' $'elif "-remote-" not in "-%s-" % ident:'
