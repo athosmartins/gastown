@@ -11841,6 +11841,8 @@ _pilot_node_only_candidate_pre() {
   # vazio (bead sem id) → não é candidata; falhou/ilegível (JSON que o jq não lê) → também não: nada é escrito
   _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || return 1
   [ -n "$_id" ] || return 1
+  # ga-8okir7: a bead de WA (wa-*) segue o caminho do gancho do nó de WA, logo abaixo desta função; as regras de dog daqui a soltariam (o alvo dela é wa-worker)
+  case "$_id" in wa-*) _pilot_node_only_wa_pre "$_b" && return 0; return 1 ;; esac
   # vazio (sem story.rig) → vale o prefixo do id logo abaixo; falhou/ilegível → não é candidata
   _rig=$(printf '%s' "$_b" | jq -r '.metadata["story.rig"] // ""' 2>/dev/null) || return 1
   if ! _pilot_priority_pool_bound_pre "$_b"; then
@@ -11848,6 +11850,44 @@ _pilot_node_only_candidate_pre() {
     case "$_id" in ga-*) ;; *) return 1 ;; esac
   fi
   _pilot_priority_node_exempt_pre "$_b"
+}
+
+# ── ga-8okir7: a passada só-nó também leva ao nó a bead de WA que o gancho do nó de WA leva ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# Medido 20/10: com o mini no piso de disco o nó ficou ocioso (CPU 1–18% de 00:45 a 06:35) com trabalho de WA na fila, porque a passada só-nó da 1.20 só deixava passar bead de dog do HQ. O gancho que leva a bead de WA
+# ao wa-worker-remote já existe (_pilot_wa_node_decide, ga-2hd02v.1.10, PILOT_WA_NODE_ROUTE, padrão off): a passada passa a chegar até ele. A sessão wa-worker-remote roda no Hetzner (worktree e build lá); no mini
+# fica a escrita da bead. Fora de label|auto nada muda. Não há ps-worker remoto (nenhum agente de pool no nó para PS): a bead de ps-worker segue solta na passada.
+
+# _pilot_node_only_wa_route_on — exit 0 iff PILOT_WA_NODE_ROUTE move bead de verdade (label|auto) e a varredura não é DRY_RUN. shadow só registra; off, vazio e valor que não existe = não.
+_pilot_node_only_wa_route_on() {
+  case "${PILOT_WA_NODE_ROUTE:-off}" in label|auto) ;; *) return 1 ;; esac
+  [ "${DRY_RUN:-0}" != "1" ]
+}
+
+# _pilot_node_only_wa_pre <bead-json> — exit 0 iff a bead de WA é, ANTES da claim, candidata do nó na passada só-nó. Nenhuma escrita: o que se lê é o JSON da candidata (jq) e UMA sonda por candidata,
+# `wa-node-dispatch.sh apply --dry-run` (a conferência do apply de verdade: bead livre, filtro de dado de lead, slot do nó = 1, sessões; sai 0 só se IRIA ao nó). Sem a sonda, o slot do nó (1, ocupado por dezenas
+# de minutos) faria toda candidata de WA ser claimada e solta a cada varredura — 5 escritas no Dolt do mini por bead, o desperdício que a passada só-nó existe para não ter. A sonda leva de 1 a ~26 s (runbook do
+# nó de WA: 26 s com o slot livre, porque lista as sessões): daí o teto por varredura (PILOT_WA_NODE_ONLY_PROBES, padrão 6; valor ilegível volta ao padrão). A loja da bead é a que o routes.jsonl diz para o prefixo
+# (o padrão do script); o apply de verdade, em dispatch_one, usa a de $STORY_BEAD_CITY e reconfere tudo.
+# vazio (sem dono e sem rota; o bd omite chave vazia) → é o estado livre; falhou/ilegível (JSON que o jq não lê) → NÃO. Script ausente ou sonda que não sai 0 (10, 11, 12, 13, 124, 137...) → NÃO.
+_PNW_PROBES=0
+_pilot_node_only_wa_pre() {
+  local _b="${1:-}" _id _own _dir _mode="${PILOT_WA_NODE_ROUTE:-off}" _basis=any _cap="${PILOT_WA_NODE_ONLY_PROBES:-6}" _rc=0
+  _pilot_node_only_wa_route_on || return 1
+  _id=$(printf '%s' "$_b" | jq -r '.id // ""' 2>/dev/null) || return 1
+  [ "${_id#wa-}" != "$_id" ] || return 1
+  _own=$(printf '%s' "$_b" | jq -r '(.assignee // "") + (.metadata["gc.routed_to"] // "")' 2>/dev/null) || return 1
+  [ -z "$_own" ] || return 1
+  if [ "$_mode" = label ]; then
+    _basis=label
+    printf '%s' "$_b" | jq -e '(.labels // []) | index("node:ok")' >/dev/null 2>&1 || return 1
+  fi
+  case "$_cap" in ''|*[!0-9]*) _cap=6 ;; esac
+  [ "$_PNW_PROBES" -lt "$_cap" ] || return 1
+  _dir="${PILOT_WA_NODE_SCRIPTS:-$GC_CITY/scripts}"
+  [ -x "$_dir/wa-node-dispatch.sh" ] || return 1
+  _PNW_PROBES=$((_PNW_PROBES + 1))
+  timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --basis "$_basis" --dry-run >/dev/null 2>&1 || _rc=$?
+  [ "$_rc" = 0 ]
 }
 
 # _pilot_node_first_shadow <story_id> <sling_target> <is_rig_native> <labels_csv> — ga-2hd02v.1.11 (SOMBRA) e ga-2hd02v.1.14 (on).
@@ -13323,6 +13363,10 @@ LIVESEC
     if _pilot_priority_node_exempt "$STORY_ID" "$_PYS_TARGET" "$_PYS_NATIVE" "$STORY_LABELS"; then
       _PNY_EXEMPT_THIS=1
       log "  ga-2hd02v.1.20: $STORY_ID segue na passada só-nó do disk floor — o nó Hetzner tem vaga (effective=${_PNY_EFFECTIVE:-?}); se o nó não ficar com a bead, ela NÃO vai ao mini."
+    elif [ "$_PYS_NATIVE" = "1" ] && [ "$_PYS_TARGET" = "wa-worker" ] && _pilot_node_only_wa_route_on; then
+      # ga-8okir7: bead de WA (store do WA, pool wa-worker) com PILOT_WA_NODE_ROUTE=label|auto segue até o gancho do nó (_pilot_wa_node_decide, no braço do pool mais abaixo). Se o gancho não a levar ao nó, o braço
+      # solta a claim e sai com disk_floor_node_only: ela NÃO cai no pool do mini. ps-worker (não há ps-worker remoto), crew nomeada e bead do HQ com alvo wa-worker caem no else e soltam.
+      log "  ga-8okir7: $STORY_ID segue na passada só-nó do disk floor — alvo wa-worker e PILOT_WA_NODE_ROUTE=${PILOT_WA_NODE_ROUTE}; o gancho do nó decide e, se ele não a levar, ela NÃO vai ao mini."
     else
       log "  ga-2hd02v.1.20: $STORY_ID fica para depois do disk floor — não é bead de dog do HQ que o nó queira agora (alvo $_PYS_TARGET); claim solta, nada vai ao mini."
       _pilot_priority_yield_release "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET" "disk-floor-node-only"
@@ -13987,6 +14031,13 @@ TASK
           bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
           bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
           DISPATCH_RESULT="wa_node_unknown"
+          return 1
+        elif [ "${_PILOT_NODE_ONLY:-0}" = "1" ]; then
+          # ga-8okir7: passada só-nó do disk floor, rc 1 = o gancho não levou a bead ao nó e nada foi escrito. O mini está pausado: ela NÃO cai no caminho do pool do mini (carimbo gc.routed_to=wa-worker + gc session new).
+          log "  ga-8okir7: $STORY_ID — o gancho do nó não ficou com a bead (nada escrito) e o disk floor pausa o mini: NÃO vai ao mini; claim solta, reavaliada na próxima varredura."
+          bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+          bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+          DISPATCH_RESULT="disk_floor_node_only"
           return 1
         fi
         : # pool: leave UNASSIGNED + open so RoutedPoolQuery finds it (claim happens worker-side)

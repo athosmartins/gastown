@@ -246,7 +246,7 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   # as âncoras são ASCII de propósito (o python3 lê o argv no locale do shell e o arquivo em UTF-8: uma âncora com acento não casaria sob LC_ALL=C)
   mutant "a sonda não é dry-run" '--basis "$_basis" --dry-run >/dev/null' '--basis "$_basis" >/dev/null'
   mutant "a rota desligada deixa passar" $'  case "${PILOT_WA_NODE_ROUTE:-off}" in label|auto) ;; *) return 1 ;; esac\n  [ "${DRY_RUN:-0}" != "1" ]' $'  [ "${DRY_RUN:-0}" != "1" ]'
-  mutant "o DRY_RUN deixa passar" $'*) return 1 ;; esac\n  [ "${DRY_RUN:-0}" != "1" ]' $'*) return 1 ;; esac\n  :'
+  mutant "o DRY_RUN deixa passar" $'label|auto) ;; *) return 1 ;; esac\n  [ "${DRY_RUN:-0}" != "1" ]' $'label|auto) ;; *) return 1 ;; esac\n  :'
   mutant "a sonda vale com qualquer rc" '  [ "$_rc" = 0 ]' '  return 0'
   mutant "o teto de sondas não vale" '  [ "$_PNW_PROBES" -lt "$_cap" ] || return 1' '  :'
   mutant "label sem node:ok gasta a sonda" '    printf '"'"'%s'"'"' "$_b" | jq -e '"'"'(.labels // []) | index("node:ok")'"'"' >/dev/null 2>&1 || return 1' '    :'
