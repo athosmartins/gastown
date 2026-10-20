@@ -26,7 +26,10 @@ cat > "$BIN/bd" <<'EOF'
 import json, os, sys
 a = sys.argv[1:]; T = os.path.dirname(os.path.dirname(os.path.realpath(__file__))); db_path = T + "/db.json"; env = os.environ.get
 with open(T + "/bd.log", "a") as f: f.write(" ".join(a) + "\n")
-if a[:1] == ["-C"]: a = a[2:]
+with open(T + "/bd.cwd", "a") as f: f.write(os.getcwd() + " " + " ".join(x for x in a[:3] if not x.startswith("/")) + "\n")   # onde a chamada rodou (o cwd do `create` do marcador é o do worktree)
+if a[:1] == ["-C"]:
+    if os.path.realpath(a[1]) == os.path.realpath(T + "/rigs/property_scrapers"): db_path = T + "/db-ps.json"   # a loja do rig PS (ga-2hd02v.4); qualquer outro -C é a da cidade
+    a = a[2:]
 db = json.load(open(db_path)); beads = db["beads"]
 def save(): json.dump(db, open(db_path, "w"))
 def flag(name, default=None):
@@ -74,7 +77,9 @@ cat > "$BIN/gc" <<'EOF'
 #!/usr/bin/env python3
 import json, os, sys
 a = sys.argv[1:]
-if "rig" in a and "list" in a: print(json.dumps({"rigs": [{"name": "gascity", "path": os.path.dirname(os.path.dirname(os.path.realpath(__file__))) + "/outer/city", "prefix": "ga"}]})); sys.exit(0)
+if "rig" in a and "list" in a:
+    t = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    print(json.dumps({"rigs": [{"name": "gascity", "path": t + "/outer/city", "prefix": "ga"}, {"name": "property_scrapers", "path": t + "/rigs/property_scrapers", "prefix": "ps"}]})); sys.exit(0)
 sys.stderr.write("fake gc: comando nao previsto: %s\n" % a); sys.exit(64)
 EOF
 REAL_GIT=$(command -v git)
@@ -109,7 +114,8 @@ db, alias = sys.argv[1:]
 json.dump({"n": 0, "beads": {"ga-t1": {"id": "ga-t1", "title": "Remoto: teste do atalho", "status": "in_progress", "assignee": alias, "issue_type": "bug",
            "labels": ["story:approved"], "metadata": {"gc.routed_to": "dog-remote"}, "created_by": "gastown.mayor", "owner": "x@y"}}}, open(db, "w"))
 EOF
-  : > "$BDLOG"
+  rm -f "$T/db-ps.json"
+  : > "$BDLOG"; : > "$T/bd.cwd"
 }
 dbq() { jq -r "$1" "$DB"; }   # lê o banco falso com um programa jq
 run_exe() {  # run_exe [VAR=valor ...] → RC, $T/out, $T/err. Ambiente do zero, como o wrapper o monta; cwd = cidade
@@ -361,12 +367,12 @@ seed_back "$ALIAS" "$ALIAS" closed; run_exe_a -- ga-t2 "$BRB" "$SHAV"; back_refu
 COLL=$(python3 -I - "$HQ/docs/runbooks/gc-session-ssh.md" <<'EOF'
 import re, sys
 rx = re.compile(re.search(r"^IDENTITY_PATTERN=(.*)$", open(sys.argv[1], encoding="utf-8").read(), re.M).group(1))
-roles = ["dog-remote", "gate-reviewer-remote", "wa-worker-remote"]
+roles = ["dog-remote", "gate-reviewer-remote", "wa-worker-remote", "ps-worker-remote"]
 names = ["remote-e2e-1"] + roles + [f"{r}-{t}" for r in roles for t in ("1", "12", "123", "abc", "gawisp1ryjj", "adhoc-0fc28155dd")]
 print(" ".join(x for x in names if rx.fullmatch(x) and any(rx.fullmatch(f"{x}-{n}") for n in ("1", "12", "123"))))
 EOF
 )
-eqs "$COLL" "dog-remote gate-reviewer-remote wa-worker-remote"; ok $? "ambiguidade do -N: só os nomes sem cauda colidem pelo IDENTITY_PATTERN do runbook (achei: '$COLL')"
+eqs "$COLL" "dog-remote gate-reviewer-remote wa-worker-remote ps-worker-remote"; ok $? "ambiguidade do -N: só os nomes sem cauda colidem pelo IDENTITY_PATTERN do runbook (achei: '$COLL')"
 for x in $COLL; do
   reset_db2; run_exe_a GC_SESSION_NAME="$x" -- ga-t2 "worker/$x-2" "$SHA"
   ok $((RC != 1)) "sessão sem cauda '$x' com worker/$x-2: recusa 1"; has "$T/err" "branch principal de OUTRA sessão"; ok $? "'$x': diz que worker/$x-2 pode ser de OUTRA sessão"
@@ -374,6 +380,122 @@ for x in $COLL; do
 done
 reset_db2; run_exe_a GC_SESSION_NAME=dog-remote -- ga-t2 "fix/ga-t2-meu-resumo" "$SHA"
 ! has "$T/err" "branch principal de OUTRA sessão"; ok $? "sessão sem cauda com fix/<bead>-<resumo>: a guarda do -N não se aplica (o ref leva o id da bead)"
+
+
+# ── 10. outros rigs (ga-2hd02v.4): a tabela RIGS. Sessão ps-worker-remote-* submete bead ps-… da loja do rig property_scrapers, com o espelho property_scrapers.git e o worktree SOB o rig ────────
+PSORIGIN="$T/ps-origin.git"; PSRIG="$T/rigs/property_scrapers"; PSMIRROR="$CITY/.gc/hetzner-mirror/repos/property_scrapers.git"; PSDB="$T/db-ps.json"
+PSSESS="ps-worker-remote-abc123"; PSALIAS="ps-worker-remote-1"; PSBR="fix/ps-t1-ps-remoto-teste"; PSBR2="fix/ps-t2-segunda-do-ps"; PSW="$T/ps-work"
+mkdir -p "$T/rigs" "$CITY/.beads"
+printf '{"prefix":"ga","path":"."}\n{"prefix":"ps","path":"../../rigs/property_scrapers"}\n' > "$CITY/.beads/routes.jsonl"
+git init -q --bare -b main "$PSORIGIN"; git clone -q "$PSORIGIN" "$PSW" 2>/dev/null
+mkdir -p "$PSW/lib"; printf 'x = 1\n' > "$PSW/lib/x.py"; G -C "$PSW" add lib >/dev/null && G -C "$PSW" commit -qm "base" && G -C "$PSW" push -q origin HEAD:main 2>/dev/null
+# o rig como o de verdade: pasta-contêiner com `.git` → `.repo.git` (bare), com o refspec do origin
+mkdir -p "$PSRIG"; git clone -q --bare "$PSORIGIN" "$PSRIG/.repo.git"; printf 'gitdir: %s\n' "$PSRIG/.repo.git" > "$PSRIG/.git"
+git --git-dir="$PSRIG/.repo.git" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'; git --git-dir="$PSRIG/.repo.git" fetch -q origin 2>/dev/null
+git clone -q --bare "$PSORIGIN" "$PSMIRROR"
+ps_work() {  # ps_work ARQUIVO REF → NEWSHA: commit novo em cima de main, empurrado ao espelho do PS em refs/heads/REF
+  G -C "$PSW" checkout -q -b work-tmp main && printf 'v = 1\n' > "$PSW/lib/$1" && G -C "$PSW" add "lib/$1" >/dev/null && G -C "$PSW" commit -qm "feat(ps): $1" \
+    && NEWSHA=$(git -C "$PSW" rev-parse HEAD) && git -C "$PSW" push -q -f "$PSMIRROR" "HEAD:refs/heads/$2"
+  r=$?; G -C "$PSW" checkout -q main; git -C "$PSW" branch -q -D work-tmp; return $r
+}
+ps_work y.py "worker/$PSSESS"; PSSHA=$NEWSHA
+ps_work z.py "worker/$PSSESS-2"; PSSHA2=$NEWSHA
+reset_ps() {  # reset_ps: ps-t1 do alias PS na loja do rig (rota do nó); a loja da cidade com a ga-t1 do dog (para provar que uma não enxerga a outra)
+  reset_db; git --git-dir="$PSORIGIN" update-ref -d "refs/heads/$PSBR" 2>/dev/null; git --git-dir="$PSORIGIN" update-ref -d "refs/heads/$PSBR2" 2>/dev/null
+  python3 -I - "$PSDB" "$PSALIAS" <<'EOF'
+import json, sys
+p, alias = sys.argv[1:]
+json.dump({"n": 0, "beads": {"ps-t1": {"id": "ps-t1", "title": "PS remoto: teste", "status": "in_progress", "assignee": alias, "issue_type": "bug",
+           "labels": ["story:approved"], "metadata": {"gc.routed_to": "ps-worker-remote", "pilot.wa_node_alias": alias}, "created_by": "gastown.mayor", "owner": "x@y"}}}, open(p, "w"))
+EOF
+}
+psq() { jq -r "$1" "$PSDB"; }
+run_ps() {  # run_ps [VAR=valor ...] [-- arg...] → RC, $T/out, $T/err (sessão ps-worker-remote)
+  envs=(); while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done; [ $# -gt 0 ] && shift
+  ( cd "$CITY" && env -i HOME="$T/home" USER=t LOGNAME=t LANG=en_US.UTF-8 PATH="$BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+      BEADS_ACTOR="$PSALIAS" GC_ALIAS="$PSALIAS" GC_SESSION_NAME="$PSSESS" GC_TEMPLATE=ps-worker-remote ${envs[@]+"${envs[@]}"} \
+      "$CITY/scripts/gate-done-remote.py" "$@" ) > "$T/out" 2> "$T/err"; RC=$?
+}
+ps_origin_has() { git --git-dir="$PSORIGIN" rev-parse --verify -q "refs/heads/$1" 2>/dev/null; }
+ps_clean() {  # nada do que a execução criou sobra, nem no rig nem na cidade
+  [ ! -e "$PSRIG/.gc-worktrees/gate-done-remote/wt-ps-t1" ] && [ ! -e "$CITY/.gc/gate-done-remote/wt-ps-t1" ] && ! git --git-dir="$PSRIG/.repo.git" show-ref -q --verify "refs/heads/$PSBR" \
+    && [ -z "$(git --git-dir="$PSRIG/.repo.git" for-each-ref refs/gt-remote)" ] && [ "$(git -C "$PSRIG" worktree list | wc -l | tr -d ' ')" = 1 ]
+}
+ps_nothing() { [ "$(mut_count)" = 0 ] && ! ps_origin_has "$PSBR" >/dev/null && ! ps_origin_has "$PSBR2" >/dev/null; }
+# ensaio
+reset_ps; run_ps GATE_DONE_REMOTE_DRY_RUN=1
+ok $((RC != 0)) "PS ensaio: sai 0"; has "$T/out" "bead=ps-t1 worker/$PSSESS@${PSSHA:0:12} → $PSBR"; ok $? "PS ensaio: diz alias, bead (da loja do rig), sha e branch"
+ps_nothing; ok $? "PS ensaio: nada foi escrito nem empurrado"; [ ! -e "$PSRIG/.gc-worktrees/gate-done-remote" ]; ok $? "PS ensaio: nem a pasta de worktree do rig foi criada"
+# caminho feliz (forma sem argumento: a ÚNICA bead in_progress do alias NA LOJA DO RIG; a ga-t1 do dog na loja da cidade não conta)
+reset_ps; run_ps
+ok $((RC != 0)) "PS feliz: sai 0 (a ga-t1 do dog na loja da cidade não atrapalha: cada papel olha a loja do seu rig)"
+[ "$(ps_origin_has "$PSBR")" = "$PSSHA" ]; ok $? "PS feliz: o origin do PS tem $PSBR no sha do espelho do PS"
+! origin_has "$PSBR" >/dev/null; ok $? "PS feliz: o origin do HQ NÃO recebeu o branch do PS"
+has "$T/out" "Marker created: ga-mk1"; ok $? "PS feliz: o marcador foi criado (na loja da CIDADE, onde o gate o lê)"
+[ "$(dbq '.beads["ga-mk1"].metadata["gate.submitted_by"] // ""')" = "$PSALIAS" ]; ok $? "PS feliz: gate.submitted_by = alias do PS"
+[ "$(dbq '[.beads["ga-mk1"].labels[] | select(startswith("source-bead:") or startswith("bead-rig:") or startswith("branch:"))] | sort | join(",")')" = "bead-rig:property_scrapers,branch:$PSBR,source-bead:ps-t1" ]; ok $? "PS feliz: o marcador leva source-bead:ps-t1, bead-rig:property_scrapers e o branch"
+grep -qF "$PSRIG/.gc-worktrees/gate-done-remote/wt-ps-t1 -C create" "$T/bd.cwd"; ok $? "PS feliz: o marcador foi criado de DENTRO do worktree sob o caminho do rig ($PSRIG/.gc-worktrees/gate-done-remote)"
+dbq '.beads["ga-mk1"].description' | grep -qF -- "rig: property_scrapers"; ok $? "PS feliz: rig: property_scrapers na descrição (o worktree está SOB o caminho do rig, e o gate-done.md acha o rig por ele)"
+dbq '.beads["ga-mk1"].description' | grep -qF -- "bead_rig: property_scrapers"; ok $? "PS feliz: bead_rig: property_scrapers (a bead foi achada na loja do rig)"
+[ "$(psq '.beads["ps-t1"].labels | index("gate:queued") != null')" = true ]; ok $? "PS feliz: gate:queued na bead, NA LOJA DO RIG"
+[ -z "$(psq '.beads["ps-t1"].assignee // ""')" ] && [ "$(psq '.beads["ps-t1"].metadata | has("gc.routed_to")')" = false ] && [ "$(psq '.beads["ps-t1"].metadata | has("pilot.wa_node_alias")')" = false ]; ok $? "PS feliz: a bead foi SOLTA na loja do rig (sem assignee, sem rota e sem a marca do nó)"
+[ "$(dbq '.beads["ga-t1"].assignee // ""')" = "$ALIAS" ]; ok $? "PS feliz: a ga-t1 do dog (loja da cidade) NÃO foi tocada"
+has "$T/out" "bead solta: ps-t1"; ok $? "PS feliz: a saída diz que soltou"; has "$T/out" "submetido: $PSBR @ $PSSHA"; ok $? "PS feliz: a saída imprime o sha submetido"
+ps_clean; ok $? "PS feliz: worktree, branch local e ref temporária foram recolhidos (no rig e na cidade)"
+[ "$(git --git-dir="$PSRIG/.repo.git" rev-parse main)" = "$(git --git-dir="$PSORIGIN" rev-parse main)" ]; ok $? "PS feliz: o main do rig não mudou"
+# forma com argumentos (2ª bead da sessão) e prefixo
+reset_ps; python3 -I - "$PSDB" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1])); d["beads"]["ps-t2"] = dict(d["beads"]["ps-t1"], id="ps-t2", title="Segunda do PS"); json.dump(d, open(sys.argv[1], "w"))
+EOF
+run_ps -- ps-t2 "worker/$PSSESS-2" "$PSSHA2"
+ok $((RC != 0)) "PS 2ª bead: gate-done ps-t2 worker/<sessão>-2 <sha> sai 0"; [ "$(ps_origin_has "$PSBR2")" = "$PSSHA2" ]; ok $? "PS 2ª bead: o origin do PS tem $PSBR2 no sha dito"
+[ "$(psq '.beads["ps-t1"].assignee // ""')" = "$PSALIAS" ]; ok $? "PS 2ª bead: a ps-t1 (a outra) NÃO foi tocada"
+reset_ps; run_ps
+ok $((RC != 0)) "PS: forma sem argumento com duas beads do alias NA LOJA do rig recusa" || true
+reset_ps; python3 -I - "$PSDB" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1])); d["beads"]["ps-t2"] = dict(d["beads"]["ps-t1"], id="ps-t2"); json.dump(d, open(sys.argv[1], "w"))
+EOF
+run_ps; ok $((RC != 1)) "PS: duas beads do alias na loja do rig: recusa 1"; has "$T/err" "não adivinho"; ok $? "PS duas beads: diz que não adivinha"; ps_nothing; ok $? "PS duas beads: nada escrito"
+# nome de sessão que não é de nenhum papel (gate-reviewer-remote, nome de teste) vale como o HQ — o comportamento de antes da tabela
+mk_work unk.txt "worker/remote-e2e-1"; SHAU=$NEWSHA
+reset_ps; run_exe GC_SESSION_NAME=remote-e2e-1 GATE_DONE_REMOTE_DRY_RUN=1
+ok $((RC != 0)) "papel desconhecido (remote-e2e-1): sai 0 e trata como o rig do HQ"; has "$T/out" "bead=ga-t1 worker/remote-e2e-1@${SHAU:0:12}"; ok $? "papel desconhecido: a bead é a ga-t1 da loja da cidade"
+# o papel da sessão limita o rig: ps-worker-remote com bead ga-…, dog-remote com bead ps-…
+reset_ps; run_ps -- ga-t1 "worker/$PSSESS" "$PSSHA"; ok $((RC != 1)) "PS sessão com bead ga-…: recusa 1"; has "$T/err" "é de outro prefixo (ga)"; ok $? "PS sessão com bead ga-…: diz que é de outro prefixo"; ps_nothing; ok $? "PS sessão com bead ga-…: nada escrito"
+reset_ps; run_exe_a -- ps-t1 "worker/$SESS" "$SHA"; ok $((RC != 1)) "dog-remote com bead ps-…: recusa 1"; has "$T/err" "é de outro prefixo (ps)"; ok $? "dog-remote com bead ps-…: diz que é de outro prefixo"; ps_nothing; ok $? "dog-remote com bead ps-…: nada escrito"
+reset_ps; run_ps GC_SESSION_NAME=wa-worker-remote-abc123 GC_ALIAS=wa-worker-remote-1 BEADS_ACTOR=wa-worker-remote-1; ok $((RC != 1)) "wa-worker-remote: rig sem rota na routes.jsonl: recusa 1"; has "$T/err" "não achei a rota do prefixo 'wa'"; ok $? "wa-worker-remote sem rota: diz que não achou a rota"; ps_nothing; ok $? "wa-worker-remote sem rota: nada escrito"
+# volta do gate no PS: a rota restaurada pelo gate é ps-worker (a do pool do mini) ou ps-worker-remote; gastown.dog NÃO é rota de volta do PS
+seed_ps_back() {  # seed_ps_back ROTA: ps-t2 volta do gate (sem dono, gate:needs-fix) com marcador antigo MEU
+  reset_ps; python3 -I - "$PSDB" "$DB" "$PSALIAS" "$1" <<'EOF'
+import json, sys
+pp, hp, me, route = sys.argv[1:]
+d = json.load(open(pp)); d["beads"]["ps-t2"] = {"id": "ps-t2", "title": "Segunda do PS", "status": "open", "assignee": "", "issue_type": "bug", "created_by": "gastown.mayor",
+    "labels": ["gate:needs-fix", "gate:fix-attempt:1"], "metadata": ({"gc.routed_to": route} if route else {})}
+json.dump(d, open(pp, "w"))
+h = json.load(open(hp)); h["beads"]["ga-mkps"] = {"id": "ga-mkps", "title": "ready-for-gate: x", "status": "closed", "issue_type": "chore", "created_at": "2026-10-19T11:00:00Z",
+    "labels": ["type:quality-gate-marker", "source-bead:ps-t2", "gate-status:failed"], "description": "branch: x\nbead_id: ps-t2\nauthor: " + me + "\nbase_commit: y\n", "metadata": {"gate.submitted_by": me}}
+json.dump(h, open(hp, "w"))
+EOF
+}
+seed_ps_back ps-worker; run_ps -- ps-t2 "worker/$PSSESS-2" "$PSSHA2"
+ok $((RC != 0)) "PS volta do gate com a rota ps-worker (a que o gate restaura): sai 0"; [ "$(ps_origin_has "$PSBR2")" = "$PSSHA2" ]; ok $? "PS volta do gate: o origin do PS tem $PSBR2"
+has "$T/out" "bead solta: ps-t2"; ok $? "PS volta do gate: a bead foi solta"
+seed_ps_back ps-worker-remote; run_ps -- ps-t2 "worker/$PSSESS-2" "$PSSHA2"; ok $((RC != 0)) "PS volta do gate com a rota ps-worker-remote (à mão): sai 0"
+seed_ps_back gastown.dog; run_ps -- ps-t2 "worker/$PSSESS-2" "$PSSHA2"
+ok $((RC != 1)) "PS volta do gate com a rota gastown.dog (do HQ): recusa 1"; has "$T/err" "achei 'gastown.dog'"; ok $? "PS rota do HQ: a recusa diz a rota que achou"; ps_nothing; ok $? "PS rota do HQ: nada escrito"
+# a rota (routes.jsonl) e o espelho: ausente/ilegível/apontando para a pasta errada = recusa sem escrever
+reset_ps; cp "$CITY/.beads/routes.jsonl" "$T/routes.orig"
+printf '{"prefix":"ga","path":"."}\n' > "$CITY/.beads/routes.jsonl"; run_ps; ok $((RC != 1)) "PS routes.jsonl sem o prefixo ps: recusa 1"; has "$T/err" "não achei a rota do prefixo 'ps'"; ok $? "PS sem rota: diz o motivo"; ps_nothing; ok $? "PS sem rota: nada escrito"
+printf 'routes.jsonl corrupt: not json\n' > "$CITY/.beads/routes.jsonl"; run_ps; ok $((RC != 1)) "PS routes.jsonl ilegível: recusa 1 (não vira 'só a cidade')"; ps_nothing; ok $? "PS routes ilegível: nada escrito"
+rm -f "$CITY/.beads/routes.jsonl"; run_ps; ok $((RC != 1)) "PS routes.jsonl ausente: recusa 1"; ps_nothing; ok $? "PS routes ausente: nada escrito"
+mkdir -p "$T/rigs/outro-rig"; git init -q "$T/rigs/outro-rig"; printf '{"prefix":"ga","path":"."}\n{"prefix":"ps","path":"../../rigs/outro-rig"}\n' > "$CITY/.beads/routes.jsonl"
+run_ps; ok $((RC != 1)) "PS rota aponta para uma pasta que não é o rig property_scrapers: recusa 1"; has "$T/err" "não é a pasta do rig property_scrapers"; ok $? "PS pasta errada: diz o motivo"; ps_nothing; ok $? "PS pasta errada: nada escrito"
+cp "$T/routes.orig" "$CITY/.beads/routes.jsonl"
+mv "$PSMIRROR" "$T/psmirror.moved"; run_ps; ok $((RC != 1)) "PS sem o espelho property_scrapers.git: recusa 1"; has "$T/err" "não existe neste mini"; ok $? "PS sem espelho: diz o motivo"; ps_nothing; ok $? "PS sem espelho: nada escrito"
+mv "$T/psmirror.moved" "$PSMIRROR"
+reset_ps; run_ps GATE_DONE_REMOTE_MIRROR="$T/nao-existe.git" GATE_DONE_REMOTE_DRY_RUN=1; ok $((RC != 0)) "PS: GATE_DONE_REMOTE_MIRROR (variável de teste do HQ) NÃO desvia o espelho do PS"
 
 # ── 8. mutantes: cada guarda apagada tem de reprovar o caso que a prova ───────────────────────────────────────────────────────────────────────────
 mutant() {  # mutant NOME 'trecho' 'troca' CASO — CASO é uma função que devolve 0 se o comportamento BOM aparece
@@ -413,15 +535,40 @@ case_bare_role() { reset_db2; run_exe_a GC_SESSION_NAME=dog-remote -- ga-t2 "wor
 mutant volta-sem-checar-autor 'if not delivered_by(last, alias):' 'if False:' case_back_other_author
 mutant volta-pega-o-marcador-mais-antigo 'return max(rows, key' 'return min(rows, key' case_back_newest
 mutant volta-sem-gate-needs-fix 'isinstance(labels, list) and FIX_LABEL in labels' 'isinstance(labels, list)' case_back_no_label
-mutant volta-sem-rota 'meta.get("gc.routed_to") in ROUTES)' 'True)' case_back_no_route
+mutant volta-sem-rota 'meta.get("gc.routed_to") in routes)' 'True)' case_back_no_route
 # a forma REAL da volta (rota gastown.dog, marcadores fechados): o revisor do gate achou que o fixture só fabricava a rota dog-remote e que nada exercia o que a produção deixa
 case_back_real_shape() { seed_back "$ALIAS" "$ALIAS"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; [ "$RC" = 0 ] && [ "$(origin_has "$BRB")" = "$SHAV" ]; }
 case_back_other_route() { seed_back "$ALIAS" "$ALIAS" open "" "gate:needs-fix" "wa-worker"; run_exe_a -- ga-t2 "$BRB" "$SHAV"; refused_back; }
 mutant volta-so-aceita-dog-remote 'ROUTES = ("gastown.dog", "dog-remote")' 'ROUTES = ("dog-remote",)' case_back_real_shape
 mutant volta-sem-all-nos-marcadores '["list", "--all", "--label"' '["list", "--label"' case_back_real_shape
-mutant volta-aceita-rota-de-outro-pool 'meta.get("gc.routed_to") in ROUTES)' 'meta.get("gc.routed_to") is not None)' case_back_other_route
+mutant volta-aceita-rota-de-outro-pool 'meta.get("gc.routed_to") in routes)' 'meta.get("gc.routed_to") is not None)' case_back_other_route
 mutant volta-sem-marcador-vira-pode 'raise Stop(f"{bid} nunca foi entregue ao gate (nenhum marcador source-bead:{bid}): não há volta do gate para submeter")' 'return {"description": "author: " + os.environ["BEADS_ACTOR"]}' case_back_no_marker
 mutant sufixo-N-ambiguo-sem-guarda 'and BARE_ROLE_RE.fullmatch(sess):' 'and False:' case_bare_role
+
+# ga-2hd02v.4: os mutantes da tabela de rigs (cada um precisa do caso PS que o mata)
+case_ps_happy() { reset_ps; run_ps; [ "$RC" = 0 ] && [ "$(ps_origin_has "$PSBR")" = "$PSSHA" ] && [ -z "$(psq '.beads["ps-t1"].assignee // ""')" ]; }
+case_ps_rig_line() { reset_ps; run_ps; grep -qF "$PSRIG/.gc-worktrees/gate-done-remote/wt-ps-t1 -C create" "$T/bd.cwd"; }
+case_ps_prefix_guard() { reset_ps; run_exe_a -- ps-t1 "worker/$SESS" "$SHA"; [ "$RC" = 1 ] && has "$T/err" "é de outro prefixo (ps)" && ps_nothing; }
+case_ps_back() { seed_ps_back ps-worker; run_ps -- ps-t2 "worker/$PSSESS-2" "$PSSHA2"; [ "$RC" = 0 ]; }
+case_ps_back_hq_route() { seed_ps_back gastown.dog; run_ps -- ps-t2 "worker/$PSSESS-2" "$PSSHA2"; [ "$RC" = 1 ] && ps_nothing; }
+case_ps_wrong_dir() { mkdir -p "$T/rigs/outro-rig"; printf '{"prefix":"ga","path":"."}\n{"prefix":"ps","path":"../../rigs/outro-rig"}\n' > "$CITY/.beads/routes.jsonl"; reset_ps; run_ps; r=$RC; cp "$T/routes.orig" "$CITY/.beads/routes.jsonl"; [ "$r" = 1 ] && has "$T/err" "não é a pasta do rig property_scrapers" && ps_nothing; }
+case_ps_mirror_name() { reset_ps; run_ps; [ "$RC" = 0 ]; }
+case_ps_released_in_store() { reset_ps; run_ps; [ "$(psq '.beads["ps-t1"].metadata | has("gc.routed_to")')" = false ]; }
+case_ps_node_mark() { reset_ps; run_ps; [ "$(psq '.beads["ps-t1"].metadata | has("pilot.wa_node_alias")')" = false ]; }
+case_ps_no_routes() { reset_ps; printf '{"prefix":"ga","path":"."}\n' > "$CITY/.beads/routes.jsonl"; run_ps; r=$RC; e=0; has "$T/err" "não achei a rota do prefixo 'ps'" && e=1; cp "$T/routes.orig" "$CITY/.beads/routes.jsonl"; [ "$r" = 1 ] && [ "$e" = 1 ] && ps_nothing; }
+case_ps_unknown_prefix() { reset_ps; run_ps GC_SESSION_NAME=wa-worker-remote-abc123 GC_ALIAS=wa-worker-remote-1 BEADS_ACTOR=wa-worker-remote-1; [ "$RC" = 1 ] && ps_nothing; }
+case_unknown_role() { reset_ps; run_exe GC_SESSION_NAME=remote-e2e-1 GATE_DONE_REMOTE_DRY_RUN=1; [ "$RC" = 0 ] && has "$T/out" "bead=ga-t1 worker/remote-e2e-1@"; }
+mutant ps-loja-da-cidade        'bead = one_bead(ctx.store, alias)' 'bead = one_bead(city, alias)' case_ps_happy
+mutant ps-guarda-de-prefixo     'if bpfx != role_prefix:' 'if False:' case_ps_prefix_guard
+mutant ps-rotas-do-hq           'bead = named_bead(city, alias, args[0], ctx.store, ctx.rig.routes)' 'bead = named_bead(city, alias, args[0], ctx.store)' case_ps_back_hq_route
+mutant ps-rotas-do-ps           'bead = named_bead(city, alias, args[0], ctx.store, ctx.rig.routes)' 'bead = named_bead(city, alias, args[0], ctx.store, ROUTES)' case_ps_back
+mutant ps-worktree-fora-do-rig  'str(Path(path) / ".gc-worktrees" / "gate-done-remote"))' 'str(Path(city) / ".gc" / "gate-done-remote"))' case_ps_rig_line
+mutant ps-espelho-do-hq         'f"{city}/.gc/hetzner-mirror/repos/{rig.name}.git", str(Path(path)' 'f"{city}/.gc/hetzner-mirror/repos/gascity.git", str(Path(path)' case_ps_mirror_name
+mutant ps-solta-na-loja-errada  'release(city, bid, alias, found[0], ctx.store)' 'release(city, bid, alias, found[0])' case_ps_released_in_store
+mutant ps-nao-solta-a-marca-do-no '"--unset-metadata", "gc.routed_to", "--unset-metadata", "pilot.wa_node_alias", "-q"' '"--unset-metadata", "gc.routed_to", "-q"' case_ps_node_mark
+mutant ps-pasta-do-rig-nao-conferida 'if os.path.basename(path) != rig.name or not os.path.isdir(path):' 'if False:' case_ps_wrong_dir
+mutant ps-rota-ausente-vira-cidade 'raise Stop(f"não achei a rota do prefixo {prefix!r} em {city}/.beads/routes.jsonl ({type(e).__name__}): sem ela não sei em que loja a bead mora")' 'return Ctx(rig, city, city, f"{city}/.gc/hetzner-mirror/repos/{rig.name}.git", str(Path(city) / ".gc" / "gate-done-remote"))' case_ps_no_routes
+mutant ps-papel-desconhecido-vira-ps 'return next((p for p, r in RIGS.items() if m and r.role == m.group(1)), "ga")' 'return next((p for p, r in RIGS.items() if m and r.role == m.group(1)), "ps")' case_unknown_role
 
 echo
 echo "$((n - fails))/$n ok, $fails falhas"

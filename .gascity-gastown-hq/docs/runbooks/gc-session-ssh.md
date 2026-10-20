@@ -103,7 +103,7 @@ Decisão do Mayor (18/10, opção 1 da ga-2hd02v.1.6): o `start` do provider nã
 **Identidade do atalho `bd`/`gc`.** O `remote-shim-wrapper` exige que `GC_ALIAS`, `GC_AGENT`, `GC_SESSION_NAME` e `GC_TEMPLATE` casem **todos** com o `identity_pattern` da config dele (`~/.gastown/remote-shim.json` no mini). Para as sessões remotas de pool, o valor é este (o selftest do provider lê esta linha e a prova contra os nomes reais; o que está gravado ao vivo precisa ser igual a ela):
 
 ```text
-IDENTITY_PATTERN=^(remote-e2e-1|(dog|gate-reviewer|wa-worker)-remote(-([0-9]{1,3}|adhoc-[A-Za-z0-9]{10}|[A-Za-z0-9]{3,12}))?)$
+IDENTITY_PATTERN=^(remote-e2e-1|(dog|gate-reviewer|wa-worker|ps-worker)-remote(-([0-9]{1,3}|adhoc-[A-Za-z0-9]{10}|[A-Za-z0-9]{3,12}))?)$
 ```
 
 Casa com alias `dog-remote-1`, template `dog-remote`, sessão `dog-remote-gapxi4ls` ou `dog-remote-adhoc-…`; recusa `gastown.dog-4`, `dog-gapxi4ls`, `gastown.mayor` e as misturas (alias remoto com nome de sessão local).
