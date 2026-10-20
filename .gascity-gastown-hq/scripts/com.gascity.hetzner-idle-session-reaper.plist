@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <!-- ga-mu9k7m. PALIATIVO: sai quando o patch do engine da ga-2hd02v.1.22 entrar. 600 s: a sessão sem bead só fecha com relógio > 900 s e vista viva em 2 rodadas,
+       então o zumbi cai entre 15 e 25 min depois de ficar sem bead. Instalar, desligar e retirar: docs/runbooks/hetzner-idle-session-reaper.md. -->
+  <key>Label</key><string>com.gascity.hetzner-idle-session-reaper</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/hetzner-idle-session-reaper.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>LowPriorityIO</key><true/>
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/hetzner-idle-session-reaper.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/hetzner-idle-session-reaper.err</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key><string>/Users/athos</string>
+    <key>GC_CITY_PATH</key><string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict></plist>
