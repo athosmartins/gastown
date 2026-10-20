@@ -132,6 +132,7 @@ check "bd ilegível: estado intacto até o fim" "$before" "$(sum "$STATE")"
 new_world gcFalha
 sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
 seed ga-aaa 1 9
+before=$(sum "$STATE")
 echo 1 > "$FAKE/gc.list.rc"
 reap $T0
 check "gc list rc 1: não fecha" "" "$(closed)"
@@ -148,6 +149,7 @@ check "gc list com envelope de erro: não fecha" "" "$(closed)"
 echo '{"sessions":"nao-e-lista"}' > "$FAKE/sessions.json"
 reap $((T0+2400))
 check "gc list sem lista: não fecha" "" "$(closed)"
+check "gc ilegível: estado intacto até o fim" "$before" "$(sum "$STATE")"
 
 # 6. o arquivo .off desliga (com tudo pronto para fechar)
 new_world desligado
@@ -267,8 +269,12 @@ new_world corrompido
 sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
 echo '{"versao":1,"sessoes":' > "$STATE"
 reap $T0
+check "estado corrompido: sai 0" 0 "$RC"
 check "estado corrompido: não fecha" "" "$(closed)"
 check "estado corrompido: a cópia fica" 1 "$(ls "$CITY/.gc" | grep -c 'hetzner-idle-reaper.state.json.corrupt-')"
+reap $((T0+600))
+reap $((T0+1200))
+check "estado corrompido: recomeça do zero e fecha na 3ª leitura" "ga-aaa" "$(closed)"
 
 # 18. a sessão que sumiu da lista sai do estado (sem acumular lixo)
 new_world sumiu
@@ -276,6 +282,13 @@ seed ga-velha 1 9
 sessions "$(row ga-aaa dog-remote-1 dog-remote active)"
 reap $T0
 check "sumiu: a sessão que não está mais na lista sai do estado" 0 "$(grep -c -F 'ga-velha' "$STATE")"
+
+# 19. nenhuma sessão dos nossos templates: o bd nem é chamado (o Dolt fora do ar não atrapalha)
+new_world semNossa
+sessions "$(row ga-c1 crew-x crew active)"
+reap $T0
+check "sem sessão nossa: sai 0" 0 "$RC"
+check "sem sessão nossa: o bd não é chamado" ausente "$(sum "$FAKE/bd.calls")"
 
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

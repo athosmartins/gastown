@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <!-- ga-mu9k7m. PALIATIVO: sai quando o patch do engine da ga-2hd02v.1.22 entrar. 600 s: a sessão sem bead só fecha com relógio > 900 s e vista viva em 2 rodadas,
-       então o zumbi cai entre 15 e 25 min depois de ficar sem bead. Instalar, desligar e retirar: docs/runbooks/hetzner-idle-session-reaper.md. -->
+       então o zumbi cai na 3ª leitura sem bead (20 min depois da 1ª; a 1ª vem até 10 min depois de a bead sair). Instalar, desligar e retirar: docs/runbooks/hetzner-idle-session-reaper.md. -->
   <key>Label</key><string>com.gascity.hetzner-idle-session-reaper</string>
   <key>ProgramArguments</key><array>
     <string>/usr/bin/python3</string>
