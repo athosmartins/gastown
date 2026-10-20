@@ -63,7 +63,7 @@ Devolver é uma entrega correta, não uma falha.
 
 ## Sem bead
 
-Não invente trabalho e não fique em laço. Uma sessão sem bead ocupa o único slot do wa-worker remoto.
+Não invente trabalho e não fique em laço. Uma sessão sem bead ocupa um slot do wa-worker remoto (e do nó) sem produzir nada.
 
 ## O que nunca fazer
 
