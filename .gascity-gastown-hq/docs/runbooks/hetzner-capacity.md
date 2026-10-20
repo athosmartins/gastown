@@ -61,9 +61,13 @@ A primeira condição que falha decide; **só `node` autoriza**.
 | 9 | vermelho | MINI `node_hot` |
 | 10 | sessões do nó ilegíveis | NÃO SEI `sessions_unreadable` |
 | 11 | sessões **ocupadas** ≥ **min(degrau, cap do provider)** | MINI `node_full` |
-| 12 | senão | **NÓ** `free_slot` |
+| 12 | o gate do Claude (`hetzner-claude.py gate`) mediu o login do nó **ruim**: `blocked: logged-out`, `blocked: expired` ou `blocked: quota` (ga-2hd02v.7) | MINI `claude_blocked` |
+| 13 | o gate do Claude não soube dizer (comando que não executa, prazo, saída fora de 0/1, linha estranha ou vazia, `blocked: unreachable` ou `blocked: unknown`, pergunta que levantou exceção) | NÃO SEI `claude_unknown` |
+| 14 | senão (o gate disse `ok`: saída 0 e a linha exata) | **NÓ** `free_slot` |
 
 A condição 5 é o que impede ligar o envio cedo demais: uma bead entregue no nó sem `gate_done_bin` não chega ao gate (ga-2hd02v.1.13) e encalha até o `inflight-reclaim-guard` reclamá-la em 25 min.
+
+**As condições 12 e 13 (ga-2hd02v.7).** Em 20/10 o login do Claude do nó bateu o limite semanal (`resets Oct 22, 4pm (UTC)`) e o Pilot seguiu mandando bead ao nó: a sessão parou no modal do limite (uma dog-remote ficou 85 min parada), porque nada consultava o `hetzner-claude.py gate`. Agora o veredito pergunta ao gate **ao vivo**, em paralelo com a medição do nó (o custo é o da maior das duas, até 30 s; o Pilot dá 40 s ao veredito inteiro), e só `ok` vale NÓ: são três estados, não dois. Login medido ruim = MINI (a linha do gate, com o horário em que a cota renova, vai no detalhe); não saber = NÃO SEI, que **não é** `ok`. O Claude não grava nada aqui (nenhum `pause.json`): quando o gate volta a `ok`, o veredito seguinte volta sozinho a NÓ, e a pausa do Mayor (`pause.json`) continua só dele. Só o `verdict` pergunta (`status`, `read`, `step`, `pause` e `resume` não). O gate guarda o próprio cache (120 s): no máximo um ssh a cada 2 min e, de hora em hora, uma chamada de modelo (haiku, 1 turno); em `quota` ou `expired` ele repete a chamada a cada 15 min, ou na hora em que a cota renova. O gate mede o login **do próprio nó**: se a sessão do nó passar a usar outra credencial (o item 3 da ga-2hd02v.7, não entregue aqui), o gate tem que medir essa mesma credencial. **Não testado:** o gate real chamado pelo ambiente do launchd do Pilot (ele usa por padrão o alias ssh `hetzner-teste`; se esse ambiente não o resolve, o gate diz `blocked: unreachable`, o veredito vira NÃO SEI e o nó deixa de receber bead: falha para o lado seguro, mas pararia o "nó primeiro"; confira depois do merge com `hetzner-capacity.py --json verdict`) e o tempo do veredito inteiro sob carga real.
 
 ## Sessão ocupada × sessão viva (ga-2hd02v.1.22)
 
