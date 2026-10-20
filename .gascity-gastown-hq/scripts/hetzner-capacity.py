@@ -28,6 +28,8 @@ OS DEGRAUS
   Desce UM degrau com `down_reads` leituras seguidas vermelhas (CPU livre < `cpu_down_headroom_pct` OU RAM < `mem_down_avail_pct`). A faixa entre os
   limites é âmbar: mantém o degrau. Leitura que falhou não é vermelha: sem leitura, o degrau fica como está (e o veredito vira "não sei").
   CPU livre = o MENOR entre o ocioso de uma amostra de 2 s do /proc/stat e (1 - load5/núcleos): rajada curta e carga sustentada contam as duas.
+  FUNDO (ga-2hd02v.5, o lastro do nó): CPU em nice > 0 (2ª coluna do /proc/stat) cede a qualquer sessão (nice 0), então é folga da cidade. Com fundo >= BG_MIN_PCT (1%) da amostra, a folga é
+  ocioso + fundo e o load5 NÃO entra (ele conta os processos do fundo esperando CPU e daria "nó cheio" só de lastro); abaixo disso vale a regra de cima, sem mudança. `cpu_bg_pct` vai na leitura.
   O nó não tem swap: RAM acabando é morte de sessão, por isso a RAM pesa tanto quanto a CPU.
 
 O VEREDITO  (a primeira condição que falha decide; só `node` autoriza)
@@ -105,6 +107,7 @@ DEFAULTS = {
     "ssh_timeout_s": 25,
     "require_load_proof": True,
 }
+BG_MIN_PCT = 1.0             # a partir de tanto de CPU em nice > 0 na amostra, a folga é ocioso + fundo e o load5 deixa de valer (abaixo disso, a regra de sempre)
 MAX_READINGS = 500
 LOG_MAX_BYTES = 2_000_000
 BEGIN, END = "@@CAP-BEGIN@@", "@@CAP-END@@"
@@ -252,7 +255,7 @@ def cpu_times(line: str):
         n = [int(x) for x in f[1:9]]
     except ValueError:
         raise Unreadable(f"/proc/stat não numérico: {line[:60]!r}")
-    return sum(n), n[3] + n[4]            # total (user..steal), parado (idle + iowait)
+    return sum(n), n[3] + n[4], n[1]      # total (user..steal), parado (idle + iowait), em nice > 0 (a 2ª coluna)
 
 
 def parse_node(out: str) -> dict:
@@ -271,14 +274,19 @@ def parse_node(out: str) -> dict:
         mt, ma = int(kv["MemTotal"].split()[0]), int(kv["MemAvailable"].split()[0])
     except (ValueError, IndexError):
         raise Unreadable("ncpu, loadavg ou meminfo não numérico")
-    (t1, i1), (t2, i2) = cpu_times(kv["stat1"]), cpu_times(kv["stat2"])
-    dt, di = t2 - t1, i2 - i1
+    (t1, i1, n1), (t2, i2, n2) = cpu_times(kv["stat1"]), cpu_times(kv["stat2"])
+    dt, di, dn = t2 - t1, i2 - i1, n2 - n1
     # load5 nan/inf também é fora de faixa: `nan < 0` é falso e o min() abaixo largaria a carga sem avisar (a leitura saía verde); inf sairia como "ok" de CPU 0
-    if ncpu < 1 or mt <= 0 or not 0 <= ma <= mt or dt <= 0 or not 0 <= di <= dt or not 0 <= load5 < float("inf"):
-        raise Unreadable(f"valor fora de faixa (ncpu={ncpu} mem={ma}/{mt} dt={dt} di={di} load5={load5})")
-    idle_pct = 100.0 * di / dt
-    cpu_headroom = max(0.0, min(100.0, idle_pct, 100.0 * (1.0 - load5 / ncpu)))
-    return {"ncpu": ncpu, "cpu_idle_pct": round(idle_pct, 1), "load5": load5, "cpu_headroom_pct": round(cpu_headroom, 1),
+    if ncpu < 1 or mt <= 0 or not 0 <= ma <= mt or dt <= 0 or not 0 <= di <= dt or not 0 <= dn <= dt - di or not 0 <= load5 < float("inf"):
+        raise Unreadable(f"valor fora de faixa (ncpu={ncpu} mem={ma}/{mt} dt={dt} di={di} dn={dn} load5={load5})")
+    idle_pct, bg_pct = 100.0 * di / dt, 100.0 * dn / dt
+    if bg_pct >= BG_MIN_PCT:
+        # Fundo (nice > 0: o lastro do nó, ga-2hd02v.5) cede a qualquer sessão (nice 0), então é folga da cidade. O load5 não serve aqui: conta os processos do fundo que estão
+        # esperando CPU e daria ~núcleos com o nó "cheio" só de lastro. A folga é o ocioso + o fundo, medidos na mesma amostra; carga sustentada de sessões vira leituras seguidas.
+        cpu_headroom = max(0.0, min(100.0, idle_pct + bg_pct))
+    else:
+        cpu_headroom = max(0.0, min(100.0, idle_pct, 100.0 * (1.0 - load5 / ncpu)))
+    return {"ncpu": ncpu, "cpu_idle_pct": round(idle_pct, 1), "cpu_bg_pct": round(bg_pct, 1), "load5": load5, "cpu_headroom_pct": round(cpu_headroom, 1),
             "mem_avail_pct": round(100.0 * ma / mt, 1), "mem_avail_mb": ma // 1024}
 
 

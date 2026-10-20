@@ -37,7 +37,7 @@
 #   bead de qualquer dono / só a primeira bead / saída não-lista vira "ninguém trabalha" · sessão sem alias, gate-reviewer / wa-worker e dog-remote-adhoc contam ociosas ·
 #   bead no nome da sessão não vale · o veredito conta todas as vivas · sessão fantasma sem dog-remote · leituras em sequência · prazo estourado vira lista vazia ·
 #   prazo de teste que alonga o padrão · prazo inválido/<=0 vira quase zero · prova de carga que aceita leitura com idle_why com motivo / sem idle_why — cada um é aplicado numa cópia e a bateria TEM que falhar.
-# VARIÁVEIS: HC_UNDER_TEST (script a testar) · HC_PY (interpretador; padrão /usr/bin/python3 = o 3.9 do mini) · HC_NO_MUTANTS=1 · HC_ONLY=<grupo> (só g_<grupo>: read, step, verdict, third, idle; sem mutantes)
+# VARIÁVEIS: HC_UNDER_TEST (script a testar) · HC_PY (interpretador; padrão /usr/bin/python3 = o 3.9 do mini) · HC_NO_MUTANTS=1 · HC_ONLY=<grupo> (só g_<grupo>: read, step, verdict, third, idle, bg; sem mutantes)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${HC_UNDER_TEST:-$HERE/hetzner-capacity.py}"
@@ -118,6 +118,14 @@ node() {  # node IDLE_PCT LOAD5 MEM_AVAIL_PCT  → resposta do nó com 16 núcle
     echo "@@CAP-END@@"; } > "$W/ssh.out"; rm -f "$W/ssh.rc"
 }
 sess() { echo "$1" > "$W/sessions"; rm -f "$W/list.rc"; }
+node_bg() {  # node_bg USER NICE IDLE LOAD5 MEM_PCT — deltas em jiffies das duas amostras (USER+NICE+IDLE = 2000 = 16 núcleos x 125); a 2ª coluna do /proc/stat é o tempo em nice > 0
+  local u="$1" ni="$2" id="$3" load="$4" mem="$5"
+  { echo "@@CAP-BEGIN@@"; echo "ncpu=16"
+    echo "stat1=cpu  1000 1000 0 1000 0 0 0 0 0 0"; echo "stat2=cpu  $((1000 + u)) $((1000 + ni)) 0 $((1000 + id)) 0 0 0 0 0 0"
+    echo "load=0.5 $load 1.0 1/100 12345"
+    echo "MemTotal:       32000000 kB"; echo "MemAvailable:   $(( mem * 320000 )) kB"
+    echo "@@CAP-END@@"; } > "$W/ssh.out"; rm -f "$W/ssh.rc"
+}
 busy() { echo "$*" > "$W/busy"; }      # busy all | none | N N… (números dos aliases dog-remote-N com bead in_progress)
 mkcfg() {  # mkcfg CAP [released]
   printf '{"default_host":"hetzner","hosts":{"hetzner":{"ssh":"stub","cap":%s,"remote_root":"/r","remote_home":"/h"%s}}}\n' "$1" "${2-,\"real_sessions_released_by\":\"mayor teste\"}" > "$SSHJ"
@@ -445,9 +453,28 @@ sp=importlib.util.spec_from_file_location("hc",sys.argv[1]); m=importlib.util.mo
   done
 }
 
-if [ -n "${HC_MUTANT:-}" ]; then g_third; g_read; g_step; g_verdict; g_idle; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+g_bg() {  # trabalho em nice > 0 (o lastro do nó, ga-2hd02v.5) é FUNDO: cede a qualquer sessão (nice 0), então não consome a folga da cidade
+  newcity
+  node_bg 200 1700 100 18 90; hc --json read
+  check "bg: lastro 85% em nice 19 + sessões 10% + 5% parado, load5 18/16 → folga 90% (fundo cede), não 0%" "90.0 85.0 5.0" "$(jget cpu_headroom_pct) $(jget cpu_bg_pct) $(jget cpu_idle_pct)"
+  check "bg: a leitura com lastro rodando é verde (a cidade segue recebendo bead)" "ok green" "$(jget state) $(jget color)"
+  node_bg 1840 60 100 17 90; hc --json read
+  check "bg: sessões saturando o nó (92% em nice 0) com lastro de 3% → folga 8%, vermelho (fundo não esconde carga de verdade)" "8.0 red" "$(jget cpu_headroom_pct) $(jget color)"
+  node_bg 200 1700 100 18 15; hc --json read
+  check "bg: RAM 15% continua vermelha com o lastro rodando (o lastro não afrouxa a RAM)" "red" "$(jget color)"
+  node_bg 800 10 1190 12 90; hc --json read
+  check "bg: fundo abaixo de 1% (0,5%) → vale a regra de antes: min(ocioso 59,5; 1-load5/núcleos = 25) = 25" "25.0 0.5" "$(jget cpu_headroom_pct) $(jget cpu_bg_pct)"
+  node_bg 800 20 1180 12 90; hc --json read
+  check "bg: fundo em exatos 1,0% → a carga (load5 12) deixa de valer, que inclui o próprio fundo: folga = ocioso + fundo = 60" "60.0" "$(jget cpu_headroom_pct)"
+  node_bg 700 0 1300 12 90; hc --json read
+  check "bg: sem fundo nenhum → a leitura de antes, sem mudança (min(65; 25) = 25, cpu_bg_pct 0)" "25.0 0.0" "$(jget cpu_headroom_pct) $(jget cpu_bg_pct)"
+  node_bg 200 -5 1805 3 90; hc --json read
+  check "bg: contador nice que anda para trás (o total das amostras segue positivo) → unreadable e cor unknown, nunca folga" "unreadable unknown" "$(jget state) $(jget color)"
+}
+
+if [ -n "${HC_MUTANT:-}" ]; then g_bg; g_third; g_read; g_step; g_verdict; g_idle; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 if [ -n "${HC_ONLY:-}" ]; then "g_$HC_ONLY"; echo "── $((n - fails))/$n ok (só g_$HC_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_read; g_step; g_verdict; g_third; g_idle
+g_read; g_step; g_verdict; g_third; g_idle; g_bg
 
 [ -n "${HC_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -526,6 +553,10 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "sem dog-remote no nó, conta uma sessão fantasma" 'return others, 0, ""' 'return others + 1, 0, ""'
   mutant "a prova de carga aceita leitura com gc/bd não lidos (idle_why com motivo)" ' and r.get("idle_why") == "" and r["sessions"] >= cur' ' and r["sessions"] >= cur'
   mutant "a prova de carga aceita leitura sem idle_why (anterior à separação ocupada×ociosa)" 'r.get("idle_why") == ""' 'not r.get("idle_why")'
+  mutant "(ga-2hd02v.5) o fundo (nice > 0) não vira folga" 'cpu_headroom = max(0.0, min(100.0, idle_pct + bg_pct))' 'cpu_headroom = max(0.0, min(100.0, idle_pct))'
+  mutant "(ga-2hd02v.5) o load5 continua valendo com fundo (o lastro faria o nó parecer cheio)" '    if bg_pct >= BG_MIN_PCT:' '    if False:'
+  mutant "(ga-2hd02v.5) qualquer fundo, até 0%, desliga o load5" 'BG_MIN_PCT = 1.0 ' 'BG_MIN_PCT = 0.0 '
+  mutant "(ga-2hd02v.5) contador nice que anda para trás é aceito" ' or not 0 <= dn <= dt - di' ''
 }
 echo "── $((n - fails))/$n ok"
 [ "$fails" = 0 ]
