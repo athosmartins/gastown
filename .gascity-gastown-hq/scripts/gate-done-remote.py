@@ -12,16 +12,17 @@ O QUE É
   não-fast-forward): a 2ª bead da sessão, e o conserto depois de uma reprovação, saem do ref que o dog diz, com o sha conferido.
 
 O QUE FAZ, EM ORDEM (passo que não consegue saber algo para sem escrever nada: "não sei" nunca vira "pode")
-  1. Quem pede: alias = BEADS_ACTOR, sessão = GC_SESSION_NAME. Os dois precisam ter o formato esperado.
-  2. A bead. Sem argumento: a ÚNICA bead in_progress atribuída ao alias na cidade; nenhuma, ou mais de uma → recusa (nunca adivinha qual submeter).
-     Com argumentos, a que o dog NOMEOU: (A) in_progress com assignee = alias, ou (B) a VOLTA DO GATE: sem assignee, `gate:needs-fix`, gc.routed_to = gastown.dog
-     (a rota que o dispatcher RESTAURA ao reprovar; medida em 3 beads) ou dog-remote (posta à mão) e a última entrega (o marcador MAIS NOVO com source-bead:<bead>, de qualquer status) é deste alias, por gate.submitted_by OU pela linha `author:` do marcador
+  1. Quem pede: alias = BEADS_ACTOR, sessão = GC_SESSION_NAME. Os dois precisam ter o formato esperado E ser do mesmo papel (dog-remote, ps-worker-remote ou wa-worker-remote; nome sem papel vale como
+     dog-remote): o identity_pattern do atalho é global, então a mistura passaria por ele. O PAPEL da sessão escolhe o rig (tabela RIGS) e, com ele, a loja da bead, o repositório do worktree e o espelho.
+  2. A bead. Sem argumento: a ÚNICA bead in_progress atribuída ao alias na loja do rig dele (a cidade para o HQ); nenhuma, ou mais de uma → recusa (nunca adivinha qual submeter).
+     Com argumentos, a que o dog NOMEOU (o prefixo dela tem de ser o do rig do papel): (A) in_progress com assignee = alias, ou (B) a VOLTA DO GATE: sem assignee, `gate:needs-fix`, gc.routed_to = a rota do pool do rig
+     (gastown.dog no HQ, ps-worker, wa-worker: a que o dispatcher RESTAURA ao reprovar; medida em 3 beads do HQ) ou a do nó (posta à mão) e a última entrega (o marcador MAIS NOVO com source-bead:<bead>, de qualquer status) é deste alias, por gate.submitted_by OU pela linha `author:` do marcador
      (sem assignee o gate-done.md congela o CRIADOR em submitted_by; só o author guarda o alias). Sem marcador, leitura que falha ou ilegível → recusa.
-  3. O trabalho: a ponta de `worker/<sessão>` no espelho (<cidade>/.gc/hetzner-mirror/repos/gascity.git), onde o `git push` do servidor chegou. Com argumentos: a do
+  3. O trabalho: a ponta de `worker/<sessão>` no espelho do rig (<cidade>/.gc/hetzner-mirror/repos/<rig>.git; gascity para o HQ), onde o `git push` do servidor chegou. Com argumentos: a do
      <ref> (check_ref: `worker/<sessão>` ou `worker/<sessão>-N`, casamento EXATO com GC_SESSION_NAME, ou `fix/<bead>[-<resumo>]` com o id da bead pedida; o `-N` é
      recusado para sessão sem cauda, onde `<sessão>-N` pode ser OUTRA sessão), que tem de ser IGUAL ao <sha> (40 hex) que o dog diz, conferido ANTES do marcador.
      O nome `worker/<sessão>` não leva o id da bead e o gate extrai o id do nome do branch; por isso a submissão sai de um branch
-     `fix/<bead>-<resumo>` no MESMO sha (o do próprio ref quando ele já é fix/…), criado num worktree descartável do mini (sem checkout: o gate-done só lê objetos).
+     `fix/<bead>-<resumo>` no MESMO sha (o do próprio ref quando ele já é fix/…), criado num worktree descartável do mini, sob o caminho do rig (sem checkout: o gate-done só lê objetos).
   4. A submissão É o /gate-done: os blocos bash dos passos 1 a 4 de commands/gate-done.md são lidos DAQUI, a cada execução, e rodados juntos no worktree
      (push do branch, bead e rig, marcador, gate:queued, gate.submitted_by). Não há cópia deles neste arquivo: mudar o gate-done.md muda isto também.
      Se o arquivo mudar de forma (não achar exatamente um bloco bash por passo), nada é empurrado.
@@ -37,9 +38,9 @@ O QUE NÃO FAZ
   isso é do passo 1 do gate-done.md (nunca força).
   Não roda a checagem "NEW READS NEED A FAILURE TEST" nem a auto-auditoria do diff (são do construtor, antes do push): o marcador registra
   `self_audit: … auto-auditoria do diff NÃO verificada aqui`, visível, não calado.
-  Só os rigs da tabela RIGS (gascity, property_scrapers, whatsapp_automation; ga-2hd02v.4): o PREFIXO da bead decide a loja do bead, o repositório do worktree e o espelho, e o PAPEL da sessão
-  (dog-remote, ps-worker-remote, wa-worker-remote) decide de que rig ela pode submeter (alias e sessão de papéis diferentes, sessão de outro papel, ou prefixo fora da tabela → recusa; nome de sessão que não é de nenhum papel vale como
-  dog-remote, o comportamento de antes). O marcador do gate mora SEMPRE na loja da cidade; a bead, na do rig. Não força push: um branch fix/<bead>-… que já está no
+  Só os rigs da tabela RIGS (gascity, property_scrapers, whatsapp_automation; ga-2hd02v.4): o PAPEL da sessão
+  (dog-remote, ps-worker-remote, wa-worker-remote) decide o rig, e com ele a loja da bead, o repositório do worktree e o espelho; o PREFIXO da bead só é CONFERIDO contra o do rig do papel (alias e sessão de
+  papéis diferentes, bead de outro prefixo, ou prefixo fora da tabela → recusa; nome de sessão que não é de nenhum papel vale como dog-remote, o comportamento de antes). O marcador do gate mora SEMPRE na loja da cidade; a bead, na do rig. Não força push: um branch fix/<bead>-… que já está no
   origin e não é ancestral do novo sha (histórico reescrito) é recusado pelo próprio passo 1 do gate-done.md.
   Se uma execução morrer no meio (kill do wrapper), sobra o worktree/branch: a próxima recusa e diz o que recolher (nunca apaga o que não criou).
 
@@ -266,7 +267,7 @@ def release(city: str, bead: str, alias: str, marker: str, store: str = "") -> N
     try:
         # confere o EFEITO, não o rc: vazio → solta; falhou/ilegível → "?" = não sei, dito como aviso
         now = first(bd_json(store, ["show", bead, "--json"], f"a bead {bead}")) or {}
-        left = [k for k, v in (("assignee", now.get("assignee")), ("gc.routed_to", (now.get("metadata") or {}).get("gc.routed_to"))) if v]
+        left = [k for k, v in (("assignee", now.get("assignee")), ("gc.routed_to", (now.get("metadata") or {}).get("gc.routed_to")), ("pilot.wa_node_alias", (now.get("metadata") or {}).get("pilot.wa_node_alias"))) if v]
     except (Stop, AttributeError, TypeError):
         left = ["?"]
     if left:

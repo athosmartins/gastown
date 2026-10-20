@@ -65,7 +65,7 @@ if cmd == "update":
         k, v = kv.split("=", 1)
         if not (env("FAKE_BD_NO_SUBMITTED_BY") and k == "gate.submitted_by"): b["metadata"][k] = v
     for k in multi("--unset-metadata"):
-        b["metadata"].pop(k, None)
+        if not (env("FAKE_BD_KEEP_MARK") and k == "pilot.wa_node_alias"): b["metadata"].pop(k, None)
         if env("FAKE_BD_STEAL"): b["assignee"] = "outro-dono"
     if "-a" in a: b["assignee"] = flag("-a")
     save(); sys.exit(0)
@@ -443,6 +443,8 @@ dbq '.beads["ga-mk1"].description' | grep -qF -- "bead_rig: property_scrapers"; 
 has "$T/out" "bead solta: ps-t1"; ok $? "PS feliz: a saída diz que soltou"; has "$T/out" "submetido: $PSBR @ $PSSHA"; ok $? "PS feliz: a saída imprime o sha submetido"
 ps_clean; ok $? "PS feliz: worktree, branch local e ref temporária foram recolhidos (no rig e na cidade)"
 [ "$(git --git-dir="$PSRIG/.repo.git" rev-parse main)" = "$(git --git-dir="$PSORIGIN" rev-parse main)" ]; ok $? "PS feliz: o main do rig não mudou"
+# a soltura confere TAMBÉM a marca do nó: se o bd não a tirou, o aviso diz (a bead não fica "solta" por engano)
+reset_ps; run_ps FAKE_BD_KEEP_MARK=1; ok $((RC != 0)) "PS marca do nó que o bd não tirou: a submissão vale (sai 0)"; has "$T/out" "NÃO ficou solta (resta pilot.wa_node_alias"; ok $? "PS marca do nó que ficou: AVISO diz que a bead NÃO ficou solta e o que resta"
 # forma com argumentos (2ª bead da sessão) e prefixo
 reset_ps; python3 -I - "$PSDB" <<'EOF'
 import json, sys
@@ -561,6 +563,8 @@ case_ps_node_mark() { reset_ps; run_ps; [ "$(psq '.beads["ps-t1"].metadata | has
 case_ps_no_routes() { reset_ps; printf '{"prefix":"ga","path":"."}\n' > "$CITY/.beads/routes.jsonl"; run_ps; r=$RC; e=0; has "$T/err" "não achei a rota do prefixo 'ps'" && e=1; cp "$T/routes.orig" "$CITY/.beads/routes.jsonl"; [ "$r" = 1 ] && [ "$e" = 1 ] && ps_nothing; }
 case_ps_unknown_prefix() { reset_ps; run_ps GC_SESSION_NAME=wa-worker-remote-abc123 GC_ALIAS=wa-worker-remote-1 BEADS_ACTOR=wa-worker-remote-1; [ "$RC" = 1 ] && ps_nothing; }
 case_unknown_role() { reset_ps; run_exe GC_SESSION_NAME=remote-e2e-1 GATE_DONE_REMOTE_DRY_RUN=1; [ "$RC" = 0 ] && has "$T/out" "bead=ga-t1 worker/remote-e2e-1@"; }
+case_node_mark_left() { reset_ps; run_ps FAKE_BD_KEEP_MARK=1; has "$T/out" "NÃO ficou solta (resta pilot.wa_node_alias"; }
+mutant ps-solta-nao-le-a-marca '("pilot.wa_node_alias", (now.get("metadata") or {}).get("pilot.wa_node_alias"))' '("x", None)' case_node_mark_left
 case_mixed_identity() { reset_ps; run_ps GC_ALIAS="$ALIAS" BEADS_ACTOR="$ALIAS"; [ "$RC" = 2 ] && has "$T/err" "identidade mista" && ps_nothing; }
 mutant ps-identidade-mista-vale 'if rig_of_session(alias) != role_prefix:' 'if False:' case_mixed_identity
 mutant ps-loja-da-cidade        'bead = one_bead(ctx.store, alias)' 'bead = one_bead(city, alias)' case_ps_happy
