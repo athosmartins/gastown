@@ -307,6 +307,20 @@ fresh; sessions "[{\"template\":\"wa-worker-remote\",\"state\":\"closed\",\"alia
 fresh; sessions '[{"template":"wa-worker","state":"active","alias":"wa-worker-adhoc-1"}]'; pm apply wa-t1; expect_rc "slots: wa-worker do mini ativo não ocupa slot do nó -> 0" 0
 fresh; busyat 1; sessions "[$(live 2)]"; pm apply wa-t1; expect_rc "slots: -1 com bead (sessão ainda não subiu) e -2 com sessão viva -> 0" 0
 [ "$(who)" = wa-worker-remote-3 ] && ok "slots: pula o alias com bead E o alias com sessão" || bad "slots: foi para $(who)"
+# -- sessão DORMINDO (idle_timeout de 15 min: ela dorme SEM soltar o alias). Modo pilot: não conta como viva e o alias volta a ser escolhido (o Pilot a acorda). Modo pool: segue segurando o slot.
+asleep() { printf '{"template":"wa-worker-remote","state":"asleep","closed":false,"alias":"wa-worker-remote-%s"}' "$1"; }   # uma sessão dormindo do alias N
+fresh; sessions "[$(asleep 1)]"; SL=1 pm apply wa-t1; expect_rc "dormindo: 1 slot em modo pilot, a sessão do -1 dormindo -> 0 (o slot não queima na 1ª ociosidade)" 0
+[ "$(who)" = wa-worker-remote-1 ] && ok "dormindo: o alias da sessão dormindo é o escolhido (o Pilot a acorda)" || bad "dormindo: foi para $(who)"
+fresh; sessions "[$(asleep 1),$(asleep 2),$(asleep 3)]"; pm apply wa-t1; expect_rc "dormindo: 3 sessões dormindo não enchem os 3 slots -> 0" 0
+[ "$(who)" = wa-worker-remote-1 ] && ok "dormindo: com as 3 dormindo, vai ao 1º alias" || bad "dormindo: foi para $(who)"
+fresh; sessions "[$(live 1),$(asleep 2),$(live 3)]"; pm apply wa-t1; expect_rc "dormindo: 2 vivas + 1 dormindo em 3 slots -> 0" 0
+[ "$(who)" = wa-worker-remote-2 ] && ok "dormindo: o único alias reaproveitável é o da sessão dormindo (-2)" || bad "dormindo: foi para $(who)"
+fresh; sessions "[$(live 1),$(live 2),$(asleep 3)]"; SL=2 pm apply wa-t1; expect_rc "dormindo: 2 slots já com 2 vivas, a dormindo é o -3 que não existe -> 12" 12 w0
+fresh; sessions "[$(asleep 1)]"; d apply wa-t1; expect_rc "dormindo: modo POOL, a sessão dormindo segue segurando o slot -> 12 (o pool não muda)" 12 w0
+fresh; sessions "[$(asleep 1)]"; WA_NODE_SPAWN=pool WA_NODE_SLOTS=3 d apply wa-t1; expect_rc "dormindo: modo pool com WA_NODE_SLOTS=3 (forçado a 1): ainda 12" 12 w0
+fresh; sessions '[{"template":"wa-worker","state":"asleep","closed":false,"alias":"wa-worker-remote-1"}]'; SL=1 pm apply wa-t1; expect_rc "dormindo: sessão dormindo de OUTRO template com o alias do nó segue viva -> 12" 12 w0
+fresh; sessions '[{"template":"wa-worker-remote","state":"suspended","closed":false,"alias":"wa-worker-remote-1"}]'; SL=1 pm apply wa-t1; expect_rc "dormindo: estado que não conheço (suspended) conta como vivo -> 12" 12 w0
+fresh; sessions '[{"template":"wa-worker-remote","state":"Asleep","closed":false,"alias":"wa-worker-remote-1"}]'; SL=1 pm apply wa-t1; expect_rc "dormindo: 'Asleep' (outra grafia) não é o estado que conheço -> vivo -> 12" 12 w0
 # -- leituras ilegíveis: qualquer uma = 11, nunca livre
 fresh; STUB_FAIL_LIST_ALIAS=wa-worker-remote-2 pm apply wa-t1; expect_rc "slots: a leitura do -2 falha (o -1 estava livre) -> 11 sem escrita" 11 w0
 fresh; STUB_FAIL_LIST_ALIAS=wa-worker-remote-3 pm apply wa-t1; expect_rc "slots: a leitura do -3 falha -> 11 sem escrita" 11 w0
@@ -503,6 +517,16 @@ mutant release-pilot-sem-marca '[ -z "$rt" ] && [ "$mk" = "$as" ]; then shape=pi
 fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{"pilot.wa_node_alias":"wa-worker-remote-3"}}'; d release wa-t1; if [ "$RC" = 12 ] && ! wrote; then survived; else killed; fi
 mutant release-marca-sobra $'&& [ -z "$(printf \'%s\' "$A" | jq -r \'.metadata["pilot.wa_node_alias"] // ""\')" ]; } ||' '; } ||'
 fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{"pilot.wa_node_alias":"wa-worker-remote-2"}}'; export STUB_KEEP_META=1; d release wa-t1; if [ "$RC" = 13 ]; then survived; else killed; fi
+
+# ---- sessão dormindo (ga-2hd02v.3)
+mutant dormindo-viva 'select(($sp == "pilot" and ((.state // .State // "") == "asleep") and ((.template // .Template // "") == $t)) | not) | ' ''
+fresh; sessions "[$(asleep 1)]"; SL=1 pm apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant dormindo-no-pool '($sp == "pilot" and ((.state' '(((.state'
+fresh; sessions "[$(asleep 1)]"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant dormindo-qualquer-template ' and ((.template // .Template // "") == $t)) | not)' ') | not)'
+fresh; sessions '[{"template":"wa-worker","state":"asleep","closed":false,"alias":"wa-worker-remote-1"}]'; SL=1 pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant dormindo-qualquer-estado '((.state // .State // "") == "asleep") and' '((.state // .State // "") != "") and'
+fresh; sessions '[{"template":"wa-worker-remote","state":"suspended","closed":false,"alias":"wa-worker-remote-1"}]'; SL=1 pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }
