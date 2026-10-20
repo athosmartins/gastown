@@ -8,6 +8,9 @@
 #   · corrida perdida (bd rc 13) = 12 sem escrita · escrita sem conferência = desfeita (13) · slot do nó ocupado (bead ou sessão) = 12 · leitura de slot/sessão ilegível = 11 · base `label` exigida
 #   · dry-run não escreve · bead ilegível ou de outro id = 11 · prefixo sem store = 11 · nunca roda `gc session new` · release só solta bead do alias E da rota, e confere · cada decisão deixa uma linha de log
 #   · log que não grava não muda o resultado.
+#   N SLOTS (ga-2hd02v.3): WA_NODE_SPAWN=pilot com WA_NODE_SLOTS aliases · escolhe o 1º alias sem bead e sem sessão viva · todos ocupados = 12 · leitura de qualquer alias ilegível = 11 · só `pilot` consulta o oráculo de capacidade
+#   (local = 12; ausente, mudo, lento, incoerente ou sem `free` = 11; as beads atribuídas cuja sessão não subiu descontam da vaga) · a bead leva a marca pilot.wa_node_alias e NUNCA gc.routed_to · pool continua com 1 slot · N inválido = 1 ·
+#   release solta as duas formas e só de alias do nó.
 # CONTROLE NEGATIVO: cada mutante troca UMA linha numa cópia do script e o caso designado tem de reprovar; mutante que sobrevive reprova esta bateria.
 # COMO RODAR: bash scripts/wa-node-dispatch.selftest.sh   (macOS /bin/bash 3.2 e Linux; precisa de jq e python3)
 set -u
@@ -46,6 +49,7 @@ if cmd == "list":
     if os.environ.get("STUB_FAIL_LIST"): sys.exit(1)
     if os.environ.get("STUB_LIST_GARBAGE"): print("not a list"); sys.exit(0)
     o = {rest[i]: rest[i + 1] for i in range(len(rest) - 1) if rest[i].startswith("--")}
+    if os.environ.get("STUB_FAIL_LIST_ALIAS") and o.get("--assignee") == os.environ["STUB_FAIL_LIST_ALIAS"]: sys.exit(1)   # a leitura de UM alias falha, as outras respondem
     print(json.dumps([b for b in st.values() if isinstance(b, dict) and b.get("assignee") == o.get("--assignee") and b.get("status") == o.get("--status")])); sys.exit(0)
 if cmd == "comment":
     st[rest[0]].setdefault("comments", []).append(rest[1]); save(); sys.exit(0)
@@ -59,7 +63,9 @@ if cmd == "update":
         elif k == "--if-status": ifs = v
         elif k == "--assignee": sets["assignee"] = v
         elif k == "--status": sets["status"] = v
-        elif k == "--set-metadata": kk, vv = v.split("=", 1); b.setdefault("metadata", {})[kk] = vv
+        elif k == "--set-metadata":
+            kk, vv = v.split("=", 1)
+            if not os.environ.get("STUB_DROP_META"): b.setdefault("metadata", {})[kk] = vv   # DROP_META: a escrita pega o dono e o status e PERDE a marca/rota
         elif k == "--unset-metadata": unsets.append(v)
     rc = int(os.environ.get("STUB_UPDATE_RC", "0"))
     if rc: sys.exit(rc)
@@ -73,7 +79,8 @@ if cmd == "update":
         save(); sys.exit(land)
     if os.environ.get("STUB_NOOP_UPDATE"): sys.exit(0)
     b.update(sets)
-    for u in unsets: b.get("metadata", {}).pop(u, None)
+    if not os.environ.get("STUB_KEEP_META"):   # KEEP_META: o dono sai e a marca/rota FICA
+        for u in unsets: b.get("metadata", {}).pop(u, None)
     save(); sys.exit(land)
 sys.exit(1)
 PYEOF
@@ -85,6 +92,14 @@ echo "$*" >> "$STUB_GCCALLS"
 exit 1
 SHEOF
 chmod +x "$T/bd" "$T/gc"
+# o oráculo-stub é chamado como `python3 -I <script> --json verdict` (como o real): grava a chamada, dorme se pedido e devolve a saída e o código escolhidos
+cat > "$T/cap.py" <<'PYEOF'
+import os, sys, time
+open(os.environ["STUB_CAP_CALLS"], "a").write(" ".join(sys.argv[1:]) + "\n")
+time.sleep(float(os.environ.get("STUB_CAP_SLEEP", "0")))
+sys.stdout.write(open(os.environ["STUB_CAP_OUT"]).read())
+sys.exit(int(open(os.environ["STUB_CAP_RC"]).read().strip()))
+PYEOF
 # o classificador-stub é chamado como `python3 -I <script>` (como o real): ignora a bead e devolve o veredito escolhido
 cat > "$T/cls.py" <<'PYEOF'
 import os, sys
@@ -93,19 +108,25 @@ sys.stdout.write(open(os.environ["STUB_CLSOUT"]).read())
 sys.exit(int(open(os.environ["STUB_CLSRC"]).read().strip()))
 PYEOF
 
-export STUB_CALLS="$CALLS" STUB_STATE="$STATE" STUB_GCCALLS="$GCCALLS" STUB_SESS="$SESS" STUB_CLSOUT="$CLSOUT" STUB_CLSRC="$CLSRC"
+CAPOUT="$T/cap.json"; CAPRC="$T/cap.rc"; CAPCALLS="$T/cap.calls"
+export STUB_CALLS="$CALLS" STUB_STATE="$STATE" STUB_GCCALLS="$GCCALLS" STUB_SESS="$SESS" STUB_CLSOUT="$CLSOUT" STUB_CLSRC="$CLSRC" STUB_CAP_OUT="$CAPOUT" STUB_CAP_RC="$CAPRC" STUB_CAP_CALLS="$CAPCALLS"
 export GC_CITY="$CITY" WA_NODE_BD="$T/bd" WA_NODE_GC="$T/gc" WA_NODE_CLASSIFY="$T/cls.py" WA_NODE_LOG="$CITY/.gc/wa-node-route.jsonl" WA_NODE_TIMEOUT=20
+export WA_NODE_CAPACITY="$T/cap.py"; unset WA_NODE_SPAWN WA_NODE_SLOTS WA_NODE_ALIAS WA_NODE_ALIAS_PREFIX WA_NODE_CAPACITY_TIMEOUT   # o ambiente de quem roda não vaza para a bateria
 
 NODE_TEXT='{"verdict":"node","basis":"text","reasons":["prova-no-texto:1-teste(s)+1-codigo"],"paths":[],"tests":[],"info":[]}'
 NODE_LABEL='{"verdict":"node","basis":"label","reasons":["etiqueta-node:ok"],"paths":[],"tests":[],"info":[]}'
 MINI='{"verdict":"mini","basis":"","reasons":["caminho-fora-do-filtro:queue.db"],"paths":[],"tests":[],"info":[]}'
 UNK='{"verdict":"unknown","basis":"","reasons":["sem-prova-de-codigo-e-teste"],"paths":[],"tests":[],"info":[]}'
 cls() { printf '%s' "$1" > "$CLSOUT"; printf '%s' "$2" > "$CLSRC"; }
+CAP_OK='{"verdict":"node","reason":"free_slot","effective":3,"active":0,"free":3}'
+CAP_LOCAL='{"verdict":"local","reason":"node_full","effective":3,"active":3,"free":0}'
+cap() { printf '%s' "$1" > "$CAPOUT"; printf '%s' "$2" > "$CAPRC"; }
 fresh() { # fresh [extra json mesclado na wa-t1]
   printf '{"wa-t1":{"id":"wa-t1","title":"t","status":"open","assignee":"","metadata":{}},"ga-x":{"id":"ga-x","title":"t","status":"open","assignee":"","metadata":{}}}' > "$STATE"
   if [ -n "${1:-}" ]; then jq -c --argjson m "$1" '."wa-t1" += $m' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; fi
   : > "$CALLS"; : > "$GCCALLS"; : > "$CITY/.gc/wa-node-route.jsonl"; echo '{"ok":true,"sessions":[]}' > "$SESS"; cls "$NODE_TEXT" 0
-  unset STUB_FAIL_SHOW STUB_SHOW_OTHER STUB_FAIL_LIST STUB_LIST_GARBAGE STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_PARTIAL_UPDATE STUB_UNDO_RC STUB_FAIL_GC STUB_GC_SLEEP STUB_LAND_RC STUB_FAIL_SHOW_AFTER_UPDATE
+  cap "$CAP_OK" 0; : > "$CAPCALLS"
+  unset STUB_FAIL_SHOW STUB_SHOW_OTHER STUB_FAIL_LIST STUB_LIST_GARBAGE STUB_UPDATE_RC STUB_NOOP_UPDATE STUB_PARTIAL_UPDATE STUB_UNDO_RC STUB_FAIL_GC STUB_GC_SLEEP STUB_LAND_RC STUB_FAIL_SHOW_AFTER_UPDATE STUB_FAIL_LIST_ALIAS STUB_CAP_SLEEP STUB_DROP_META STUB_KEEP_META
 }
 SCRIPT="$REAL"; OUT=""; RC=0; MUT_NAME=""; MUT_M=""
 d() { OUT=$("$SCRIPT" "$@" 2>&1); RC=$?; }                       # roda e guarda saída + rc
@@ -129,7 +150,7 @@ expect_rc "apply: bead livre + node -> 0" 0
 [ "$(grep -c '|update|' "$CALLS")" = 1 ] && ok "apply: UMA escrita (update)" || bad "apply: $(grep -c '|update|' "$CALLS") escritas"
 grep '|update|' "$CALLS" | head -n 1 | grep -q -- '--if-assignee||--if-status|open|' && ok "apply: a escrita compara antes de escrever (--if-assignee '' --if-status open)" || bad "apply: escrita sem comparação atômica: $(grep '|update|' "$CALLS" | head -n 1)"
 [ "$(bead '."wa-t1".comments | length')" = 1 ] && ok "apply: deixa 1 comentário na bead" || bad "apply: comentários: $(bead '."wa-t1".comments')"
-grep -q 'session|new' "$GCCALLS" && bad "apply: rodou gc session new (a duplicata que o dedup derruba)" || ok "apply: não roda gc session new"
+grep -q 'session new' "$GCCALLS" && bad "apply: rodou gc session new (a duplicata que o dedup derruba)" || ok "apply: não roda gc session new"
 [ "$(jq -r '.event+":"+(.rc|tostring)' "$CITY/.gc/wa-node-route.jsonl" | tail -n 1)" = "apply:0" ] && ok "apply: grava a decisão no log" || bad "apply: log: $(cat "$CITY/.gc/wa-node-route.jsonl")"
 # ---- apply: bead não elegível
 fresh '{"assignee":"mila-wa"}';                   d apply wa-t1; expect_rc "apply: bead com dono -> 12 sem escrita" 12 w0
@@ -242,6 +263,136 @@ fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.r
 fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.routed_to":"wa-worker-remote"}}'; export STUB_UPDATE_RC=1; d release wa-t1; expect_rc "release: bd update falha -> 13" 13
 fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.routed_to":"wa-worker-remote"}}'; export STUB_NOOP_UPDATE=1; d release wa-t1; expect_rc "release: escrita que não pegou -> 13" 13
 
+# ---- N slots (ga-2hd02v.3): WA_NODE_SPAWN=pilot com WA_NODE_SLOTS aliases wa-worker-remote-1..N. O Pilot abre a sessão do alias (receita provada do dog-remote); a bead leva o dono e a marca
+#      pilot.wa_node_alias, SEM gc.routed_to (a rota faria o pool abrir uma 2ª sessão). Em `pool` (padrão) nada muda: 1 slot, rota, o pool cria a sessão.
+pm() { WA_NODE_SPAWN=pilot WA_NODE_SLOTS="${SL:-3}" d "$@"; }                  # roda no modo pilot com SL slots (3 se não dito)
+busyat() { jq -c --arg a "wa-worker-remote-$1" '. + {("wa-busy-"+$a):{"id":("wa-busy-"+$a),"status":"in_progress","assignee":$a,"metadata":{}}}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; }   # uma bead em andamento do alias N
+sessions() { printf '{"ok":true,"sessions":%s}' "$1" > "$SESS"; }                                              # sessions '<array json>'
+live() { printf '{"template":"wa-worker-remote","state":"active","closed":false,"alias":"wa-worker-remote-%s"}' "$1"; }   # uma sessão viva do alias N
+who() { bead '."wa-t1".assignee'; }
+mark() { bead '."wa-t1".metadata["pilot.wa_node_alias"] // "vazio"'; }
+rota() { bead '."wa-t1".metadata["gc.routed_to"] // "vazio"'; }
+ncap() { wc -l < "$CAPCALLS" | tr -d ' '; }                                   # quantas vezes o oráculo foi chamado
+
+# -- caminho feliz e a escolha do alias
+fresh; pm apply wa-t1
+expect_rc "slots: bead livre, 3 slots, oráculo diz node -> 0" 0
+[ "$(who)" = wa-worker-remote-1 ] && [ "$(bead '."wa-t1".status')" = in_progress ] && ok "slots: sem nada ocupado, o 1º alias é o -1" || bad "slots: estado: $(jq -c '."wa-t1"' "$STATE")"
+[ "$(mark)" = wa-worker-remote-1 ] && [ "$(rota)" = vazio ] && ok "slots: a bead leva a marca do alias e NÃO leva gc.routed_to" || bad "slots: marca=$(mark) rota=$(rota)"
+[ "$(grep -c '|update|' "$CALLS")" = 1 ] && ok "slots: UMA escrita" || bad "slots: $(grep -c '|update|' "$CALLS") escritas"
+grep '|update|' "$CALLS" | head -n 1 | grep -q -- '--if-assignee||--if-status|open|' && ok "slots: a escrita continua com comparação atômica" || bad "slots: escrita sem comparação: $(grep '|update|' "$CALLS" | head -n 1)"
+grep -q 'session new' "$GCCALLS" && bad "slots: o despachante rodou gc session new (quem abre a sessão é o Pilot)" || ok "slots: o despachante não roda gc session new"
+[ "$(bead '."wa-t1".comments[0]' | grep -c 'O Pilot abre a sessão')" = 1 ] && ok "slots: o comentário diz que o Pilot abre a sessão" || bad "slots: comentário: $(bead '."wa-t1".comments')"
+[ "$(ncap)" = 1 ] && grep -q -- '--json verdict' "$CAPCALLS" && ok "slots: consultou o oráculo uma vez (--json verdict)" || bad "slots: chamadas ao oráculo: $(cat "$CAPCALLS")"
+fresh; busyat 1; pm apply wa-t1; expect_rc "slots: alias -1 ocupado -> 0" 0
+[ "$(who)" = wa-worker-remote-2 ] && ok "slots: -1 ocupado, vai para o -2" || bad "slots: foi para $(who)"
+fresh; busyat 1; busyat 2; pm apply wa-t1; expect_rc "slots: -1 e -2 ocupados -> 0" 0
+[ "$(who)" = wa-worker-remote-3 ] && ok "slots: -1 e -2 ocupados, vai para o -3" || bad "slots: foi para $(who)"
+fresh; busyat 1; busyat 3; pm apply wa-t1; expect_rc "slots: -1 e -3 ocupados -> 0" 0
+[ "$(who)" = wa-worker-remote-2 ] && ok "slots: buraco no meio: vai para o -2" || bad "slots: foi para $(who)"
+fresh; busyat 1; busyat 2; busyat 3; pm apply wa-t1; expect_rc "slots: os 3 aliases ocupados -> 12 sem escrita" 12 w0
+printf '%s' "$OUT" | grep -q 'estão ocupados' && ok "slots: a mensagem diz que os slots estão ocupados" || bad "slots: mensagem: $OUT"
+[ "$(ncap)" = 0 ] && ok "slots: com tudo ocupado o oráculo nem é consultado (a leitura lenta vem por último)" || bad "slots: consultou o oráculo à toa"
+fresh; busyat 1; busyat 2; SL=2 pm apply wa-t1; expect_rc "slots: 2 slots, os 2 ocupados -> 12 (o -3 não existe)" 12 w0
+fresh; busyat 1; SL=1 pm apply wa-t1; expect_rc "slots: 1 slot em modo pilot, o -1 ocupado -> 12" 12 w0
+# -- sessões vivas
+fresh; sessions "[$(live 1)]"; pm apply wa-t1; expect_rc "slots: -1 sem bead mas com sessão viva -> 0" 0
+[ "$(who)" = wa-worker-remote-2 ] && ok "slots: sessão viva sem bead (ociosa) não é reaproveitada: vai para o -2" || bad "slots: foi para $(who)"
+fresh; sessions "[$(live 1),$(live 2),$(live 3)]"; pm apply wa-t1; expect_rc "slots: 3 sessões vivas = os 3 slots -> 12 sem escrita" 12 w0
+fresh; sessions '[{"template":"wa-worker-remote","state":"active","closed":false,"alias":""},{"template":"wa-worker-remote","state":"active","closed":false,"alias":""},{"template":"wa-worker-remote","state":"active","closed":false}]'
+pm apply wa-t1; expect_rc "slots: 3 sessões do template SEM alias também enchem os 3 slots -> 12 sem escrita" 12 w0
+fresh; sessions "[$(live 1),$(live 2)]"; SL=2 pm apply wa-t1; expect_rc "slots: 2 slots com as 2 sessões vivas -> 12 sem escrita" 12 w0
+fresh; sessions "[{\"template\":\"wa-worker-remote\",\"state\":\"closed\",\"alias\":\"wa-worker-remote-1\"},$(live 2)]"; pm apply wa-t1; expect_rc "slots: sessão fechada não conta -> 0" 0
+[ "$(who)" = wa-worker-remote-1 ] && ok "slots: o alias da sessão fechada volta a ser o 1º livre" || bad "slots: foi para $(who)"
+fresh; sessions '[{"template":"wa-worker","state":"active","alias":"wa-worker-adhoc-1"}]'; pm apply wa-t1; expect_rc "slots: wa-worker do mini ativo não ocupa slot do nó -> 0" 0
+fresh; busyat 1; sessions "[$(live 2)]"; pm apply wa-t1; expect_rc "slots: -1 com bead (sessão ainda não subiu) e -2 com sessão viva -> 0" 0
+[ "$(who)" = wa-worker-remote-3 ] && ok "slots: pula o alias com bead E o alias com sessão" || bad "slots: foi para $(who)"
+# -- leituras ilegíveis: qualquer uma = 11, nunca livre
+fresh; STUB_FAIL_LIST_ALIAS=wa-worker-remote-2 pm apply wa-t1; expect_rc "slots: a leitura do -2 falha (o -1 estava livre) -> 11 sem escrita" 11 w0
+fresh; STUB_FAIL_LIST_ALIAS=wa-worker-remote-3 pm apply wa-t1; expect_rc "slots: a leitura do -3 falha -> 11 sem escrita" 11 w0
+fresh; export STUB_FAIL_LIST=1; pm apply wa-t1; expect_rc "slots: toda leitura de bead falha -> 11 sem escrita" 11 w0
+fresh; export STUB_FAIL_GC=1; pm apply wa-t1; expect_rc "slots: lista de sessões falha -> 11 sem escrita" 11 w0
+fresh; echo '{"a":1}' > "$SESS"; pm apply wa-t1; expect_rc "slots: lista de sessões sem o campo sessions -> 11 sem escrita" 11 w0
+# -- o oráculo de capacidade (só em modo pilot)
+fresh; cap "$CAP_LOCAL" 1; pm apply wa-t1; expect_rc "oráculo: local (rc 1) -> 12 sem escrita" 12 w0
+printf '%s' "$OUT" | grep -q 'node_full' && ok "oráculo: a mensagem leva o motivo do oráculo" || bad "oráculo: mensagem: $OUT"
+fresh; cap '{"verdict":"unknown","reason":"stale"}' 2; pm apply wa-t1; expect_rc "oráculo: não sei (rc 2) -> 11 sem escrita" 11 w0
+fresh; cap "$CAP_OK" 1; pm apply wa-t1; expect_rc "oráculo: JSON node mas rc 1 (incoerente) -> 11 sem escrita" 11 w0
+fresh; cap "$CAP_LOCAL" 0; pm apply wa-t1; expect_rc "oráculo: JSON local mas rc 0 (incoerente) -> 11 sem escrita" 11 w0
+fresh; cap "$CAP_OK" 3; pm apply wa-t1; expect_rc "oráculo: rc 3 (erro do oráculo) -> 11 sem escrita" 11 w0
+fresh; cap 'not json' 0; pm apply wa-t1; expect_rc "oráculo: saída que não é JSON -> 11 sem escrita" 11 w0
+fresh; cap '' 0; pm apply wa-t1; expect_rc "oráculo: sem saída -> 11 sem escrita" 11 w0
+fresh; cap '{"reason":"x"}' 0; pm apply wa-t1; expect_rc "oráculo: JSON sem veredito -> 11 sem escrita" 11 w0
+fresh; cap '{"verdict":"node","reason":"free_slot"}' 0; pm apply wa-t1; expect_rc "oráculo: node sem o campo free -> 11 sem escrita" 11 w0
+fresh; cap '{"verdict":"node","free":0}' 0; pm apply wa-t1; expect_rc "oráculo: node com free 0 (contradição) -> 11 sem escrita" 11 w0
+fresh; cap '{"verdict":"node","free":"2"}' 0; pm apply wa-t1; expect_rc "oráculo: free como texto -> 11 sem escrita" 11 w0
+fresh; cap '{"verdict":"node","free":1.5}' 0; pm apply wa-t1; expect_rc "oráculo: free fracionário -> 11 sem escrita" 11 w0
+fresh; cap '{"verdict":"node","free":-1}' 0; pm apply wa-t1; expect_rc "oráculo: free negativo -> 11 sem escrita" 11 w0
+fresh; WA_NODE_CAPACITY="$T/nao-existe.py" pm apply wa-t1; expect_rc "oráculo: arquivo ausente -> 11 sem escrita" 11 w0
+fresh; export STUB_CAP_SLEEP=3; WA_NODE_CAPACITY_TIMEOUT=1 pm apply wa-t1; expect_rc "oráculo: mais lento que o prazo -> 11 sem escrita" 11 w0
+fresh; export STUB_CAP_SLEEP=2; WA_NODE_CAPACITY_TIMEOUT=abc pm apply wa-t1; expect_rc "oráculo: prazo ilegível volta ao padrão (45 s) -> 0" 0
+# vagas: o oráculo só vê sessões vivas; a bead atribuída cuja sessão ainda não subiu desconta
+fresh; cap '{"verdict":"node","free":1}' 0; busyat 1; pm apply wa-t1; expect_rc "oráculo: 1 vaga, mas o -1 já foi atribuído e a sessão não subiu -> 12 sem escrita" 12 w0
+printf '%s' "$OUT" | grep -q 'esperam a sessão subir' && ok "oráculo: a mensagem explica o desconto" || bad "oráculo: mensagem: $OUT"
+fresh; cap '{"verdict":"node","free":1}' 0; busyat 1; sessions "[$(live 1)]"; pm apply wa-t1; expect_rc "oráculo: 1 vaga, o -1 já tem sessão viva (o oráculo a viu) -> 0" 0
+[ "$(who)" = wa-worker-remote-2 ] && ok "oráculo: sessão viva já contada pelo oráculo não desconta de novo" || bad "oráculo: foi para $(who)"
+fresh; cap '{"verdict":"node","free":2}' 0; busyat 1; pm apply wa-t1; expect_rc "oráculo: 2 vagas e 1 pendente -> 0" 0
+fresh; cap '{"verdict":"node","free":2}' 0; busyat 1; busyat 2; pm apply wa-t1; expect_rc "oráculo: 2 vagas e 2 pendentes -> 12 sem escrita" 12 w0
+# dry-run em modo pilot: mede, escolhe, não escreve
+fresh; pm apply wa-t1 --dry-run; expect_rc "slots: --dry-run -> 0 sem escrita" 0 w0
+printf '%s' "$OUT" | grep -q 'iria para wa-worker-remote-1' && ok "slots: o dry-run diz para qual alias iria" || bad "slots: dry-run: $OUT"
+fresh; cap "$CAP_LOCAL" 1; pm apply wa-t1 --dry-run; expect_rc "slots: --dry-run com o oráculo dizendo local -> 12" 12 w0
+# -- modo pool (padrão) não muda: 1 slot, rota, sem oráculo
+fresh; WA_NODE_SLOTS=3 d apply wa-t1; expect_rc "pool com WA_NODE_SLOTS=3 -> 0" 0
+[ "$(who)" = wa-worker-remote-1 ] && [ "$(rota)" = wa-worker-remote ] && [ "$(mark)" = vazio ] && ok "pool: continua alias -1 com a rota e SEM a marca do Pilot" || bad "pool: estado: $(jq -c '."wa-t1"' "$STATE")"
+fresh; busyat 1; WA_NODE_SLOTS=3 d apply wa-t1; expect_rc "pool com 3 slots pedidos e o -1 ocupado -> 12 (em pool o N vale 1)" 12 w0
+fresh; sessions "[$(live 1)]"; WA_NODE_SLOTS=3 d apply wa-t1; expect_rc "pool com 3 slots pedidos e sessão viva -> 12" 12 w0
+fresh; cap "$CAP_LOCAL" 1; d apply wa-t1; expect_rc "pool não consulta o oráculo (ele diria local) -> 0" 0
+[ "$(ncap)" = 0 ] && ok "pool: nenhuma chamada ao oráculo" || bad "pool: chamou o oráculo $(ncap) vez(es)"
+fresh; busyat 1; WA_NODE_SPAWN=xx WA_NODE_SLOTS=3 d apply wa-t1; expect_rc "modo desconhecido (xx) = pool, 1 slot -> 12" 12 w0
+fresh; busyat 1; WA_NODE_SPAWN= WA_NODE_SLOTS=3 d apply wa-t1; expect_rc "modo vazio = pool, 1 slot -> 12" 12 w0
+# -- N inválido volta a 1 (nunca mais slots por engano)
+for sl in 0 abc 10 99 -1 '' 1.5 ' 2'; do
+  fresh; busyat 1; WA_NODE_SPAWN=pilot WA_NODE_SLOTS="$sl" d apply wa-t1; expect_rc "slots: WA_NODE_SLOTS='$sl' vale 1 -> com o -1 ocupado, 12 sem escrita" 12 w0
+done
+fresh; WA_NODE_SPAWN=pilot WA_NODE_SLOTS=9 d apply wa-t1; expect_rc "slots: 9 é o teto permitido -> 0" 0
+fresh; cap '{"verdict":"node","free":9}' 0; for i in 1 2 3 4 5 6 7 8; do busyat "$i"; done; WA_NODE_SPAWN=pilot WA_NODE_SLOTS=9 d apply wa-t1; expect_rc "slots: 8 ocupados de 9 -> 0" 0
+[ "$(who)" = wa-worker-remote-9 ] && ok "slots: o 9º alias é o -9" || bad "slots: foi para $(who)"
+# -- alias único de teste e prefixo
+fresh; WA_NODE_SPAWN=pilot WA_NODE_SLOTS=3 WA_NODE_ALIAS=zz-1 d apply wa-t1; expect_rc "WA_NODE_ALIAS único ganha de SLOTS -> 0" 0
+[ "$(who)" = zz-1 ] && ok "WA_NODE_ALIAS único: a bead vai para ele" || bad "WA_NODE_ALIAS: foi para $(who)"
+fresh; WA_NODE_SPAWN=pilot WA_NODE_ALIAS_PREFIX=zz- d apply wa-t1; expect_rc "WA_NODE_ALIAS_PREFIX troca o prefixo -> 0" 0
+[ "$(who)" = zz-1 ] && ok "prefixo trocado: o alias é zz-1" || bad "prefixo: foi para $(who)"
+# -- a conferência e o desfazer em modo pilot usam a MARCA (não a rota)
+fresh; export STUB_NOOP_UPDATE=1; pm apply wa-t1; expect_rc "pilot: escrita que não pegou -> 13" 13
+fresh; export STUB_PARTIAL_UPDATE=1; pm apply wa-t1; expect_rc "pilot: escrita que pegou só o dono (e a marca), conferência falha, desfazer pega -> 13" 13
+grep '|update|' "$CALLS" | tail -n 1 | grep -q -- '--if-assignee|wa-worker-remote-1|--assignee||--status|open|--unset-metadata|pilot.wa_node_alias|' && ok "pilot: o desfazer é guardado pelo alias e tira a MARCA" || bad "pilot: desfazer: $(grep '|update|' "$CALLS" | tail -n 1)"
+[ -z "$(who)" ] && [ "$(mark)" = vazio ] && printf '%s' "$OUT" | grep -q 'desfeita' && ! printf '%s' "$OUT" | grep -q 'NÃO desfeita' && ok "pilot: desfazer que pegou -> bead sem dono e sem marca, a mensagem diz 'desfeita'" || bad "pilot: estado/mensagem: $(jq -c '."wa-t1"' "$STATE") $OUT"
+fresh; export STUB_PARTIAL_UPDATE=1 STUB_UNDO_RC=1; pm apply wa-t1; expect_rc "pilot: o desfazer também falha -> 13" 13
+printf '%s' "$OUT" | grep -q 'NÃO desfeita' && [ "$(who)" = wa-worker-remote-1 ] && ok "pilot: desfazer que falhou NÃO é anunciado como desfeito (a bead ficou do nó)" || bad "pilot: $OUT / $(jq -c '."wa-t1"' "$STATE")"
+fresh; export STUB_LAND_RC=124; pm apply wa-t1; expect_rc "pilot: escrita gravou e o bd saiu 124 (resposta perdida) -> 0 (a releitura confere)" 0
+fresh; export STUB_UPDATE_RC=13; pm apply wa-t1; expect_rc "pilot: corrida perdida (bd rc 13) -> 12" 12
+# -- release: as duas formas, de qualquer alias do nó
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{"pilot.wa_node_alias":"wa-worker-remote-2"}}'
+d release wa-t1; expect_rc "release: forma pilot (dono -2 + marca do -2, sem rota) -> 0" 0
+[ -z "$(who)" ] && [ "$(mark)" = vazio ] && [ "$(rota)" = vazio ] && ok "release: forma pilot: dono e marca soltos" || bad "release: estado: $(jq -c '."wa-t1"' "$STATE")"
+grep '|update|' "$CALLS" | head -n 1 | grep -q -- '--if-assignee|wa-worker-remote-2|' && ok "release: forma pilot: a soltura é guardada pelo dono real (-2)" || bad "release: escrita: $(grep '|update|' "$CALLS" | head -n 1)"
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-3","metadata":{"gc.routed_to":"wa-worker-remote"}}'; d release wa-t1; expect_rc "release: forma pool de um alias -3 -> 0" 0
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{"pilot.wa_node_alias":"wa-worker-remote-3"}}'; d release wa-t1; expect_rc "release: marca de OUTRO alias -> 12 sem escrita" 12 w0
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{}}'; d release wa-t1; expect_rc "release: alias do nó mas sem marca nem rota (atribuída à mão) -> 12 sem escrita" 12 w0
+fresh '{"status":"in_progress","assignee":"mila-wa","metadata":{"pilot.wa_node_alias":"mila-wa"}}'; d release wa-t1; expect_rc "release: marca igual ao dono mas o dono não é do nó -> 12 sem escrita" 12 w0
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{"pilot.wa_node_alias":"wa-worker-remote-2","gc.routed_to":"wa-worker-remote"}}'; d release wa-t1; expect_rc "release: marca E rota juntas (estado estranho) -> 12 sem escrita" 12 w0
+fresh '{"status":"in_progress","assignee":"other-3","metadata":{"gc.routed_to":"wa-worker-remote"}}'; d release wa-t1; expect_rc "release: dono que não é alias do nó, com a rota do nó -> 12 sem escrita" 12 w0
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{"pilot.wa_node_alias":"wa-worker-remote-2"}}'; export STUB_NOOP_UPDATE=1; d release wa-t1; expect_rc "release: forma pilot, escrita que não pegou -> 13" 13
+
+# -- a escrita que pegou o dono e o status mas PERDEU a marca (pilot) ou a rota (pool) não é sucesso: a conferência reprova e o desfazer limpa tudo
+fresh; export STUB_DROP_META=1; pm apply wa-t1; expect_rc "pilot: escrita que pegou o dono mas perdeu a marca -> 13" 13
+[ -z "$(who)" ] && [ "$(bead '."wa-t1".status')" = open ] && printf '%s' "$OUT" | grep -q 'desfeita' && ok "pilot: ...o desfazer solta a bead (sem dono, aberta) e a mensagem diz 'desfeita'" || bad "pilot: depois da marca perdida: $(jq -c '."wa-t1"' "$STATE") / $OUT"
+fresh; export STUB_DROP_META=1; d apply wa-t1; expect_rc "pool: escrita que pegou o dono mas perdeu a rota -> 13" 13
+# -- release que deixa a marca (ou a rota) para trás não é "solta"
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{"pilot.wa_node_alias":"wa-worker-remote-2"}}'; export STUB_KEEP_META=1; d release wa-t1; expect_rc "release: forma pilot, o dono saiu mas a marca ficou -> 13" 13
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.routed_to":"wa-worker-remote"}}'; export STUB_KEEP_META=1; d release wa-t1; expect_rc "release: forma pool, o dono saiu mas a rota ficou -> 13" 13
+
 # ---- 1 caso de ponta a ponta com o classificador REAL (mesma bead que o selftest dele manda ao nó)
 fresh; unset WA_NODE_CLASSIFY
 jq -c '."wa-t1" += {"description":"Em lib/foo_parser.py a funcao quebra com string vazia. Teste em tests/test_foo_parser.py."}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"
@@ -272,10 +423,10 @@ mutant sem-elegibilidade '[ "$st" = open ] && [ -z "$as" ] && [ -z "$rt" ] ||' '
 fresh '{"assignee":"mila-wa"}'; d apply wa-t1; if [ "$RC" = 12 ] && ! wrote; then survived; else killed; fi
 mutant sem-comparacao '--if-assignee "" --if-status open ' ''
 fresh; d apply wa-t1; if grep '|update|' "$CALLS" | head -n 1 | grep -q -- '--if-assignee||--if-status|open|'; then survived; else killed; fi
-mutant slot-ignorado 'case "$n" in 0) ;;' 'case "0" in 0) ;;'
+mutant slot-ignorado '*) busy_a="$busy_a $A"; busy_n=$((busy_n+n)) ;; esac' '*) free_a="$free_a $A" ;; esac'
 fresh; jq -c '. + {"wa-busy":{"id":"wa-busy","status":"in_progress","assignee":"wa-worker-remote-1","metadata":{}}}' "$STATE" > "$STATE.n" && mv "$STATE.n" "$STATE"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
-mutant sessao-ignorada 'case "$live" in 0) ;;' 'case "0" in 0) ;;'
-fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote","state":"active","alias":"wa-worker-remote-1"}]}' > "$SESS"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant sessao-ignorada 'if [ "$live" -ge "$SLOTS" ]; then jlog apply' 'if false; then jlog apply'
+fresh; echo '{"ok":true,"sessions":[{"template":"wa-worker-remote","state":"active"}]}' > "$SESS"; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
 mutant veredito-ignorado 'if [ "$rc" != 0 ]; then jlog apply' 'if false; then jlog apply'
 fresh; cls "$MINI" 10; d apply wa-t1; if [ "$RC" = 10 ] && ! wrote; then survived; else killed; fi
 mutant base-ignorada 'if [ "$basis" = label ] && [ "$b" != label ]; then' 'if false; then'
@@ -286,7 +437,7 @@ mutant corrida-vira-erro 'if [ "$w" = 13 ]; then jlog apply "$id" 12 "perdeu-a-c
 fresh; export STUB_UPDATE_RC=13; d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
 mutant outro-id 'select(type=="object" and .id == $id)' 'select(type=="object")'
 fresh; export STUB_SHOW_OTHER=1; d apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
-mutant release-qualquer '[ "$as" = "$ALIAS" ] && [ "$rt" = "$ROUTE" ] ||' 'true ||'
+mutant release-qualquer 'case "$as" in "$ALIAS"|"$PREFIX"[1-9]) mine_alias=1 ;; *) mine_alias=0 ;; esac' 'mine_alias=1'
 fresh '{"status":"in_progress","assignee":"mila-wa","metadata":{"gc.routed_to":"wa-worker-remote"}}'; d release wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
 mutant release-sem-conferencia 'jlog release "$id" 13 "conferencia-falhou"; die 13 "não consegui confirmar que $id foi solta — confira à mão"' 'true'
 fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.routed_to":"wa-worker-remote"}}'; export STUB_NOOP_UPDATE=1; d release wa-t1; if [ "$RC" = 13 ]; then survived; else killed; fi
@@ -308,6 +459,50 @@ mutant rc-cru-vaza '"info":[]}'"'"'; rc=11' '"info":[]}'"'"
 fresh; cls "" 137; d apply wa-t1; if [ "$RC" = 11 ] && ! wrote; then survived; else killed; fi
 mutant desfazer-mente 'u=NAO-desfeito' 'u=desfeito'
 fresh; export STUB_PARTIAL_UPDATE=1 STUB_UNDO_RC=1; d apply wa-t1; if printf '%s' "$OUT" | grep -q 'NÃO desfeita'; then survived; else killed; fi
+
+# ---- N slots (ga-2hd02v.3): mutantes. Cada um desliga UMA defesa do script e o caso designado tem de falhar.
+mutant oraculo-ignorado '      0:node) ;;' '      *) ;;'
+fresh; cap '{"verdict":"local","reason":"node_full","free":2}' 1; pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant oraculo-incoerente '      *) jlog apply "$id" 11 "oraculo-ilegivel rc=$crc verdict=${cv:-?}"; die 11 "o oráculo de capacidade não respondeu de forma coerente (rc=$crc, veredito=${cv:-?}) — fica no mini" ;;' '      *) ;;'
+fresh; cap '{"verdict":"node","free":3}' 3; pm apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant oraculo-sem-free 'case "$cfree" in '"''"'|*[!0-9]*|0) jlog apply "$id" 11 "oraculo-sem-free"' 'case "7" in '"''"'|*[!0-9]*|0) jlog apply "$id" 11 "oraculo-sem-free"'
+fresh; cap '{"verdict":"node","reason":"free_slot"}' 0; pm apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant oraculo-free-texto '(.free | select(type=="number")) // empty' '.free // empty'
+fresh; cap '{"verdict":"node","free":"2"}' 0; pm apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant pendentes-ignorados 'if [ $((cfree - pend)) -lt 1 ]; then' 'if [ "$cfree" -lt 1 ]; then'
+fresh; cap '{"verdict":"node","free":1}' 0; busyat 1; pm apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant pendentes-vivos-descontam $'for A in $busy_a; do printf \'%s\\n\' "$live_al" | grep -qxF -- "$A" ||' 'for A in $busy_a; do false ||'
+fresh; cap '{"verdict":"node","free":1}' 0; busyat 1; sessions "[$(live 1)]"; pm apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant alias-vivo-ignorado $'for A in $free_a; do printf \'%s\\n\' "$live_al" | grep -qxF -- "$A" ||' 'for A in $free_a; do false ||'
+fresh; sessions "[$(live 1)]"; pm apply wa-t1; if [ "$(who)" = wa-worker-remote-2 ]; then survived; else killed; fi
+mutant todos-ocupados 'if [ -z "$free_a" ]; then' 'if false; then'
+fresh; busyat 1; busyat 2; busyat 3; pm apply wa-t1; if [ "$RC" = 12 ] && printf '%s' "$OUT" | grep -q 'estão ocupados'; then survived; else killed; fi
+mutant lista-do-slot-ilegivel 'case "$n" in 0) free_a="$free_a $A" ;; '"''"'|x|*[!0-9]*) jlog apply "$id" 11 "slot-ilegivel"; die 11 "leitura do slot do nó não é uma lista — fica no mini" ;;' 'case "$n" in 0) free_a="$free_a $A" ;; '"''"'|x|*[!0-9]*) ;;'
+fresh; export STUB_LIST_GARBAGE=1; pm apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant slots-ignorados '[ "$SPAWN" = pilot ] || SLOTS=1' ':'
+fresh; busyat 1; WA_NODE_SLOTS=3 d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant slot-tampa 'case "$SLOTS" in [1-9]) ;; *) SLOTS=1 ;; esac' 'case "$SLOTS" in *) ;; esac'
+fresh; busyat 1; WA_NODE_SPAWN=pilot WA_NODE_SLOTS=10 d apply wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant marca-sem-rota 'wmeta="pilot.wa_node_alias=$PICK"; umeta="pilot.wa_node_alias"' 'wmeta="gc.routed_to=$ROUTE"; umeta="gc.routed_to"'
+fresh; pm apply wa-t1; if [ "$RC" = 0 ] && [ "$(rota)" = vazio ] && [ "$(mark)" = wa-worker-remote-1 ]; then survived; else killed; fi
+mutant desfazer-pilot-marca 'wmeta="pilot.wa_node_alias=$PICK"; umeta="pilot.wa_node_alias"' 'wmeta="pilot.wa_node_alias=$PICK"; umeta="gc.routed_to"'
+fresh; export STUB_PARTIAL_UPDATE=1; pm apply wa-t1; if [ "$(mark)" = vazio ] && ! printf '%s' "$OUT" | grep -q 'NÃO desfeita'; then survived; else killed; fi
+mutant marca-nao-conferida $'if [ "$SPAWN" = pilot ]; then m=$(printf \'%s\' "$j" | jq -r \'.metadata["pilot.wa_node_alias"] // ""\' 2>/dev/null); [ "$m" = "$PICK" ]; else' 'if [ "$SPAWN" = pilot ]; then true; else'
+fresh; export STUB_DROP_META=1; pm apply wa-t1; if [ "$RC" = 13 ]; then survived; else killed; fi
+mutant oraculo-consultado-no-pool $'  if [ "$SPAWN" = pilot ]; then\n    # teto do nó' $'  if true; then\n    # teto do nó'
+fresh; cap "$CAP_LOCAL" 1; d apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant oraculo-sem-prazo 'TC() { if command -v timeout >/dev/null 2>&1; then timeout "$CTMO" "$@"; else "$@"; fi; }' 'TC() { "$@"; }'
+fresh; export STUB_CAP_SLEEP=3; WA_NODE_CAPACITY_TIMEOUT=1 pm apply wa-t1; if [ "$RC" = 11 ]; then survived; else killed; fi
+mutant prazo-oraculo-ilegivel 'case "$CTMO" in '"''"'|*[!0-9]*) CTMO=45 ;; esac' ':'
+fresh; export STUB_CAP_SLEEP=2; WA_NODE_CAPACITY_TIMEOUT=abc pm apply wa-t1; if [ "$RC" = 0 ]; then survived; else killed; fi
+mutant release-qualquer-dono 'case "$as" in "$ALIAS"|"$PREFIX"[1-9]) mine_alias=1 ;; *) mine_alias=0 ;; esac' 'mine_alias=1'
+fresh '{"status":"in_progress","assignee":"other-3","metadata":{"gc.routed_to":"wa-worker-remote"}}'; d release wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant release-rota-qualquer '[ "$rt" = "$ROUTE" ] && [ -z "$mk" ]; then shape=pool' '[ -n "$rt" ] && [ -z "$mk" ]; then shape=pool'
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-1","metadata":{"gc.routed_to":"wa-worker"}}'; d release wa-t1; if [ "$RC" = 12 ]; then survived; else killed; fi
+mutant release-pilot-sem-marca '[ -z "$rt" ] && [ "$mk" = "$as" ]; then shape=pilot' '[ -z "$rt" ]; then shape=pilot'
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{"pilot.wa_node_alias":"wa-worker-remote-3"}}'; d release wa-t1; if [ "$RC" = 12 ] && ! wrote; then survived; else killed; fi
+mutant release-marca-sobra $'&& [ -z "$(printf \'%s\' "$A" | jq -r \'.metadata["pilot.wa_node_alias"] // ""\')" ]; } ||' '; } ||'
+fresh '{"status":"in_progress","assignee":"wa-worker-remote-2","metadata":{"pilot.wa_node_alias":"wa-worker-remote-2"}}'; export STUB_KEEP_META=1; d release wa-t1; if [ "$RC" = 13 ]; then survived; else killed; fi
 
 echo "---"; echo "$((n-fails))/$n ok"
 [ $fails -eq 0 ] && echo "SELFTEST OK" || { echo "SELFTEST FALHOU ($fails)"; exit 1; }

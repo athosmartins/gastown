@@ -16,15 +16,31 @@
 #   e nenhuma sessão do template) → UMA escrita com comparação atômica (bd update --if-assignee '' --if-status open: quem chegou antes vence, rc 13 do bd) que atribui ao alias, põe
 #   em andamento e carimba gc.routed_to → relê e confere → comenta. Falha na conferência desfaz. A escrita que o bd diz ter falhado (rc ≠ 0 e ≠ 13) cai na MESMA releitura: o rc de um update que não respondeu não diz o estado.
 #   `release` só mexe em bead que é do alias E da rota.
-# O QUE NÃO FAZ: não cria sessão. A receita provada na ga-2hd02v.1.6 (dog-remote) é "atribuir e deixar o pool criar"; `gc session new` à mão em template remoto roteado gera duas sessões e o
+# O QUE NÃO FAZ: não cria sessão (quem abre a sessão do alias é o pool, em WA_NODE_SPAWN=pool, ou o Pilot, em =pilot: ver abaixo). `gc session new` à mão em template remoto ROTEADO gera duas sessões e o
 #   crew-session-dedup derruba uma. Não mexe no city.toml, no config do host nem no Pilot. Não escreve dado da bead em lugar nenhum além do comentário curto (id, veredito, motivos).
-# Env (teste): GC_CITY, WA_NODE_BD (bd), WA_NODE_GC (gc), WA_NODE_CLASSIFY, WA_NODE_PY, WA_NODE_ALIAS (wa-worker-remote-1), WA_NODE_ROUTE_TEMPLATE (wa-worker-remote), WA_NODE_LOG, WA_NODE_TIMEOUT (20 s), WA_NODE_SESSION_TIMEOUT (60 s, só para `gc session list`).
+# N SLOTS (ga-2hd02v.3): WA_NODE_SPAWN=pool (PADRÃO, o desenho da 1.10: 1 slot, alias wa-worker-remote-1, gc.routed_to=wa-worker-remote, o pool cria a sessão — NUNCA provado para bead da loja do WA) ou =pilot
+#   (o Pilot abre `gc session new wa-worker-remote --alias <alias>` como faz com o dog-remote, receita PROVADA; a bead leva só o dono e a marca `pilot.wa_node_alias`, SEM gc.routed_to, senão o pool abriria
+#   uma 2ª sessão). Só `pilot` tem mais de 1 slot: WA_NODE_SLOTS (1..9, padrão 1) aliases wa-worker-remote-1..N; em `pool` o N vale 1 (o alias da sessão do pool não é nomeável). Em `pilot` o apply escolhe o 1º alias
+#   sem bead em andamento e sem sessão viva e CONSULTA o oráculo de capacidade (hetzner-capacity.py verdict): só `node` com vaga livre (descontadas as beads já atribuídas cuja sessão ainda não subiu) deixa passar.
+# Env: WA_NODE_SPAWN (pool|pilot, padrão pool; outro valor = pool), WA_NODE_SLOTS (1..9, padrão 1; vazio ou ilegível = 1), WA_NODE_ALIAS_PREFIX (wa-worker-remote-), WA_NODE_CAPACITY (hetzner-capacity.py), WA_NODE_CAPACITY_TIMEOUT (45 s).
+# Env (teste): GC_CITY, WA_NODE_BD (bd), WA_NODE_GC (gc), WA_NODE_CLASSIFY, WA_NODE_PY, WA_NODE_ALIAS (alias único: ganha de SLOTS e do prefixo; padrão <prefixo>1), WA_NODE_ROUTE_TEMPLATE (wa-worker-remote), WA_NODE_LOG, WA_NODE_TIMEOUT (20 s), WA_NODE_SESSION_TIMEOUT (60 s, só para `gc session list`).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CITY="${GC_CITY:-$(cd "$HERE/.." && pwd)}"
 BD="${WA_NODE_BD:-bd}"; GC="${WA_NODE_GC:-gc}"; PY="${WA_NODE_PY:-python3}"
 CLS="${WA_NODE_CLASSIFY:-$HERE/wa-node-classify.py}"
-ALIAS="${WA_NODE_ALIAS:-wa-worker-remote-1}"; ROUTE="${WA_NODE_ROUTE_TEMPLATE:-wa-worker-remote}"
+PREFIX="${WA_NODE_ALIAS_PREFIX:-wa-worker-remote-}"; ROUTE="${WA_NODE_ROUTE_TEMPLATE:-wa-worker-remote}"
+# modo de abrir a sessão e número de slots (ga-2hd02v.3). vazio → pool e 1 slot (o desenho da 1.10); ilegível (valor desconhecido, não-número, 0, 10+) → o mesmo: NUNCA mais slots por engano.
+# Em `pool` o alias da sessão não é nomeável (o pool dá o nome), então só há 1 slot, e é o que um alias único de teste (WA_NODE_ALIAS) também força.
+SPAWN="${WA_NODE_SPAWN:-pool}"; case "$SPAWN" in pool|pilot) ;; *) SPAWN=pool ;; esac
+SLOTS="${WA_NODE_SLOTS:-1}"; case "$SLOTS" in [1-9]) ;; *) SLOTS=1 ;; esac
+[ "$SPAWN" = pilot ] || SLOTS=1
+ALIASES=""; k=1
+if [ -n "${WA_NODE_ALIAS:-}" ]; then ALIASES="$WA_NODE_ALIAS"; SLOTS=1; else while [ "$k" -le "$SLOTS" ]; do ALIASES="$ALIASES ${PREFIX}$k"; k=$((k+1)); done; ALIASES="${ALIASES# }"; fi
+ALIAS="${ALIASES%% *}"   # o 1º: o único em pool, o de mensagem quando só há um
+CAP="${WA_NODE_CAPACITY:-$HERE/hetzner-capacity.py}"
+CTMO="${WA_NODE_CAPACITY_TIMEOUT:-45}"
+case "$CTMO" in ''|*[!0-9]*) CTMO=45 ;; esac   # o oráculo mede o nó por ssh (o Pilot dá 40 s ao veredito inteiro); prazo ilegível volta ao padrão
 LOG="${WA_NODE_LOG:-$CITY/.gc/wa-node-route.jsonl}"
 TMO="${WA_NODE_TIMEOUT:-20}"
 case "$TMO" in ''|*[!0-9]*) TMO=20 ;; esac     # prazo ilegível volta ao padrão
@@ -36,6 +52,7 @@ say() { echo "wa-node-dispatch: $*" >&2; }
 die() { local rc="$1"; shift; say "$*"; exit "$rc"; }
 T() { if command -v timeout >/dev/null 2>&1; then timeout "$TMO" "$@"; else "$@"; fi; }
 TS() { if command -v timeout >/dev/null 2>&1; then timeout "$STMO" "$@"; else "$@"; fi; }
+TC() { if command -v timeout >/dev/null 2>&1; then timeout "$CTMO" "$@"; else "$@"; fi; }
 jlog() { # jlog <evento> <bead> <rc> <detalhe> — uma linha por decisão; falha ao gravar o log nunca muda o resultado
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || return 0
   jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg ev "$1" --arg b "$2" --argjson rc "$3" --arg d "$4" '{ts:$ts,event:$ev,bead:$b,rc:$rc,detail:$d}' >> "$LOG" 2>/dev/null || true
@@ -98,44 +115,99 @@ apply)
   if [ "$rc" != 0 ]; then jlog apply "$id" "$rc" "classificador:$(printf '%s' "$out" | jq -r '(.verdict // "?") + " " + ((.reasons // []) | join(","))' 2>/dev/null)"; say "veredito não é 'roda no nó' (rc=$rc): $out"; exit "$rc"; fi
   b=$(printf '%s' "$out" | jq -r '.basis // ""')
   if [ "$basis" = label ] && [ "$b" != label ]; then jlog apply "$id" 10 "base=$b, modo exige etiqueta"; die 10 "veredito node por '$b', e este modo só aceita a etiqueta node:ok — fica no mini"; fi
-  # slot do nó (1 sessão): vazio → livre; falhou/ilegível → não sei, então ocupado (nunca livre por engano)
-  mine=$(T "$BD" -C "$store" list --status in_progress --assignee "$ALIAS" --json --limit 5 2>/dev/null) || { jlog apply "$id" 11 "slot-ilegivel"; die 11 "não consegui ler o slot do nó (bd list) — fica no mini"; }
-  n=$(printf '%s' "$mine" | jq -r 'if type=="array" then length else "x" end' 2>/dev/null)
-  case "$n" in 0) ;; ''|x|*[!0-9]*) jlog apply "$id" 11 "slot-ilegivel"; die 11 "leitura do slot do nó não é uma lista — fica no mini" ;; *) jlog apply "$id" 12 "slot-ocupado bead(s)=$n"; die 12 "slot do nó ocupado ($n bead(s) em andamento de $ALIAS)" ;; esac
-  # gc session list --json devolve {"sessions":[…]} (medido 19/10), nunca o array solto: vazio → 0; falhou/ilegível/outro formato → "x" (11, fica no mini); sessão com closed=true ou estado final não conta
+  # slots do nó: por alias candidato, as beads em andamento dele. vazio → alias sem bead (livre); falhou/ilegível → não sei: o conjunto todo vira 11, NUNCA livre por engano; com bead → ocupado
+  free_a=""; busy_a=""; busy_n=0
+  for A in $ALIASES; do
+    mine=$(T "$BD" -C "$store" list --status in_progress --assignee "$A" --json --limit 5 2>/dev/null) || { jlog apply "$id" 11 "slot-ilegivel"; die 11 "não consegui ler o slot do nó (bd list) — fica no mini"; }
+    n=$(printf '%s' "$mine" | jq -r 'if type=="array" then length else "x" end' 2>/dev/null)
+    case "$n" in 0) free_a="$free_a $A" ;; ''|x|*[!0-9]*) jlog apply "$id" 11 "slot-ilegivel"; die 11 "leitura do slot do nó não é uma lista — fica no mini" ;; *) busy_a="$busy_a $A"; busy_n=$((busy_n+n)) ;; esac
+  done
+  if [ -z "$free_a" ]; then
+    [ "$SLOTS" = 1 ] && { jlog apply "$id" 12 "slot-ocupado bead(s)=$busy_n"; die 12 "slot do nó ocupado ($busy_n bead(s) em andamento de $ALIAS)"; }
+    jlog apply "$id" 12 "slot-ocupado bead(s)=$busy_n aliases=${busy_a# }"; die 12 "os $SLOTS slots do nó estão ocupados ($busy_n bead(s) em andamento de${busy_a})"
+  fi
+  # gc session list --json devolve {"sessions":[…]} (medido 19/10), nunca o array solto: vazio → lista [] (0 vivas); falhou/ilegível/outro formato → "x" (11, fica no mini); sessão com closed=true ou estado final não conta.
+  # Conta as vivas do template OU com alias candidato e guarda o alias de cada uma (sessão do pool sem alias entra na conta com alias vazio).
   sess=$(TS "$GC" session list --json 2>/dev/null) || { jlog apply "$id" 11 "sessoes-ilegiveis"; die 11 "não consegui listar as sessões — fica no mini"; }
-  live=$(printf '%s' "$sess" | jq -r --arg t "$ROUTE" --arg a "$ALIAS" 'if type=="object" and (.sessions|type)=="array" then [.sessions[] | select(((.template // .Template // "") == $t) or ((.alias // .Alias // "") == $a)) | select(.closed != true) | select((.state // .State // "") | test("closed|stopped|archived|drained") | not)] | length else "x" end' 2>/dev/null)
-  case "$live" in 0) ;; ''|x|*[!0-9]*) jlog apply "$id" 11 "sessoes-ilegiveis"; die 11 "lista de sessões ilegível — fica no mini" ;; *) jlog apply "$id" 12 "sessao-viva n=$live"; die 12 "já há $live sessão(ões) de $ROUTE/$ALIAS — slot do nó ocupado" ;; esac
-  if [ "$dry" = 1 ]; then jlog apply "$id" 0 "dry-run: iria para $ALIAS ($b)"; say "dry-run: $id iria para $ALIAS (base=$b); nada foi escrito"; printf '%s\n' "$out"; exit 0; fi
-  T "$BD" -C "$store" update "$id" --if-assignee "" --if-status open --assignee "$ALIAS" --status in_progress --set-metadata "gc.routed_to=$ROUTE" -q >/dev/null 2>&1; w=$?
+  al_json=$(printf '%s\n' $ALIASES | jq -R . 2>/dev/null | jq -sc . 2>/dev/null) || al_json=""   # vazio/ilegível → "" e o jq abaixo falha: "x" (11)
+  live_json=$(printf '%s' "$sess" | jq -c --arg t "$ROUTE" --argjson al "$al_json" 'if type=="object" and (.sessions|type)=="array" then [.sessions[] | select(((.template // .Template // "") == $t) or ((.alias // .Alias // "") as $x | $al | any(. == $x))) | select(.closed != true) | select((.state // .State // "") | test("closed|stopped|archived|drained") | not) | (.alias // .Alias // "")] else "x" end' 2>/dev/null)
+  live=$(printf '%s' "$live_json" | jq -r 'if type=="array" then length else "x" end' 2>/dev/null)
+  case "$live" in ''|x|*[!0-9]*) jlog apply "$id" 11 "sessoes-ilegiveis"; die 11 "lista de sessões ilegível — fica no mini" ;; esac
+  if [ "$live" -ge "$SLOTS" ]; then jlog apply "$id" 12 "sessao-viva n=$live"; die 12 "já há $live sessão(ões) de $ROUTE/${ALIASES// /,} — slot do nó ocupado"; fi
+  live_al=$(printf '%s' "$live_json" | jq -r '.[]' 2>/dev/null) || live_al=""   # lista vazia lida → nenhum alias vivo; o formato já foi provado acima
+  # o 1º alias sem bead que também não tem sessão viva. Sessão viva sem bead (ociosa até o idle_timeout) NÃO é reaproveitada: o worker nasce `fresh` e o alias dela ainda não está livre.
+  PICK=""
+  for A in $free_a; do printf '%s\n' "$live_al" | grep -qxF -- "$A" || { PICK="$A"; break; }; done
+  [ -n "$PICK" ] || { jlog apply "$id" 12 "slot-sem-alias-livre"; die 12 "todo alias sem bead em andamento ($free_a ) ainda tem sessão viva — sem slot livre agora"; }
+  if [ "$SPAWN" = pilot ]; then
+    # teto do nó (ga-2hd02v.3): o oráculo diz se cabe mais uma sessão (degrau × cap do provider × CPU/RAM medidos). Beads já atribuídas cuja sessão ainda não subiu o oráculo não vê: descontam da vaga dele.
+    # vazio (sem saída) / falhou / ilegível (arquivo ausente, rc fora de 0/1, prazo, JSON ruim, rc e veredito que discordam, `free` que não é inteiro ≥ 1 num `node`) → 11, NUNCA node por engano; local (rc 1) → 12.
+    pend=0; for A in $busy_a; do printf '%s\n' "$live_al" | grep -qxF -- "$A" || pend=$((pend+1)); done
+    [ -f "$CAP" ] || { jlog apply "$id" 11 "oraculo-ausente"; die 11 "o oráculo de capacidade $CAP não existe — fica no mini"; }
+    cout=$(TC "$PY" -I "$CAP" --json verdict 2>/dev/null </dev/null); crc=$?
+    cv=$(printf '%s' "$cout" | jq -r '.verdict // ""' 2>/dev/null) || cv=""
+    case "$crc:$cv" in
+      0:node) ;;
+      1:local) cwhy=$(printf '%s' "$cout" | jq -r '.reason // ""' 2>/dev/null) || cwhy=""; jlog apply "$id" 12 "oraculo-local:$cwhy"; die 12 "o oráculo de capacidade diz que o nó não recebe agora (${cwhy:-sem motivo}) — fica no mini" ;;
+      *) jlog apply "$id" 11 "oraculo-ilegivel rc=$crc verdict=${cv:-?}"; die 11 "o oráculo de capacidade não respondeu de forma coerente (rc=$crc, veredito=${cv:-?}) — fica no mini" ;;
+    esac
+    cfree=$(printf '%s' "$cout" | jq -r '(.free | select(type=="number")) // empty' 2>/dev/null) || cfree=""   # só número vale: texto ("2"), nulo ou ausente → vazio → 11
+    case "$cfree" in ''|*[!0-9]*|0) jlog apply "$id" 11 "oraculo-sem-free"; die 11 "o oráculo disse node sem um número de vagas livres (>= 1) — fica no mini" ;; esac
+    if [ $((cfree - pend)) -lt 1 ]; then jlog apply "$id" 12 "oraculo-sem-vaga free=$cfree pendentes=$pend"; die 12 "o oráculo vê $cfree vaga(s) livre(s) e $pend bead(s) já atribuída(s) esperam a sessão subir — sem vaga agora"; fi
+  fi
+  if [ "$dry" = 1 ]; then jlog apply "$id" 0 "dry-run: iria para $PICK ($b)"; say "dry-run: $id iria para $PICK (base=$b); nada foi escrito"; printf '%s\n' "$out"; exit 0; fi
+  # o que a escrita carimba: pool → a rota (o pool cria a sessão); pilot → só a marca (o Pilot abre a sessão do alias; a rota abriria uma 2ª)
+  if [ "$SPAWN" = pilot ]; then wmeta="pilot.wa_node_alias=$PICK"; umeta="pilot.wa_node_alias"; else wmeta="gc.routed_to=$ROUTE"; umeta="gc.routed_to"; fi
+  # a bead é "nossa" se o dono é o alias e o carimbo do modo está lá; pool: dono OU rota; pilot: dono OU marca. (a conferência abaixo usa o conjunto, o desfazer usa o "nada nosso")
+  mine_ok() { # mine_ok <json da bead> — 0 se dono=PICK, status in_progress e o carimbo do modo bate
+    local j="$1" m
+    [ "$(printf '%s' "$j" | jq -r '.assignee // ""' 2>/dev/null)" = "$PICK" ] || return 1
+    [ "$(printf '%s' "$j" | jq -r '.status // ""' 2>/dev/null)" = in_progress ] || return 1
+    if [ "$SPAWN" = pilot ]; then m=$(printf '%s' "$j" | jq -r '.metadata["pilot.wa_node_alias"] // ""' 2>/dev/null); [ "$m" = "$PICK" ]; else m=$(printf '%s' "$j" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null); [ "$m" = "$ROUTE" ]; fi
+  }
+  nada_nosso() { # nada_nosso <json da bead> — 0 se não sobrou dono nem carimbo do modo
+    local j="$1" m
+    [ -n "$j" ] || return 1
+    [ "$(printf '%s' "$j" | jq -r '.assignee // ""' 2>/dev/null)" != "$PICK" ] || return 1
+    if [ "$SPAWN" = pilot ]; then m=$(printf '%s' "$j" | jq -r '.metadata["pilot.wa_node_alias"] // ""' 2>/dev/null); [ "$m" != "$PICK" ]; else m=$(printf '%s' "$j" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null); [ "$m" != "$ROUTE" ]; fi
+  }
+  T "$BD" -C "$store" update "$id" --if-assignee "" --if-status open --assignee "$PICK" --status in_progress --set-metadata "$wmeta" -q >/dev/null 2>&1; w=$?
   if [ "$w" = 13 ]; then jlog apply "$id" 12 "perdeu-a-corrida"; die 12 "$id mudou entre a leitura e a escrita (bd rc 13) — não mexo"; fi
   # w ≠ 0 e ≠ 13 (prazo estourado, processo morto, bd fora): o rc de um update que não respondeu NÃO diz o estado, o servidor pode ter gravado (ga-9636op, gate-fix 1). Quem diz é a releitura, a MESMA conferência de
   # baixo: confere = a escrita pegou e só a resposta se perdeu (segue como sucesso); algo nosso = desfaz; nada nosso = 13 "nada garantido", porque uma escrita morta por prazo ainda pode entrar e só uma releitura posterior resolve.
   A=$(bead_json "$store" "$id") || A=""
-  if [ "$(printf '%s' "$A" | jq -r '.assignee // ""' 2>/dev/null)" != "$ALIAS" ] || [ "$(printf '%s' "$A" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null)" != "$ROUTE" ] || [ "$(printf '%s' "$A" | jq -r '.status // ""' 2>/dev/null)" != in_progress ]; then
+  if ! mine_ok "$A"; then
     # o desfazer também é uma escrita que pode falhar, e o rc dele não diz o estado (a comparação atômica reprova, de propósito, quando a escrita nem pegou e a bead nunca foi nossa): relê, e o log e a
     # mensagem só dizem "desfeita" se nada nosso sobrou (nem dono nem rota). Bead que não se consegue reler, ou que ainda é nossa, fica NAO-desfeito: a bead atribuída ao nó não pode parecer solta.
-    T "$BD" -C "$store" update "$id" --if-assignee "$ALIAS" --assignee "" --status open --unset-metadata gc.routed_to -q >/dev/null 2>&1
+    T "$BD" -C "$store" update "$id" --if-assignee "$PICK" --assignee "" --status open --unset-metadata "$umeta" -q >/dev/null 2>&1
     A=$(bead_json "$store" "$id") || A=""
     u=NAO-desfeito
-    if [ -n "$A" ] && [ "$(printf '%s' "$A" | jq -r '.assignee // ""' 2>/dev/null)" != "$ALIAS" ] && [ "$(printf '%s' "$A" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null)" != "$ROUTE" ]; then u=desfeito; else say "ATENÇÃO: não consegui desfazer a atribuição de $id — confira à mão"; fi
+    if nada_nosso "$A"; then u=desfeito; else say "ATENÇÃO: não consegui desfazer a atribuição de $id — confira à mão"; fi
     if [ "$w" != 0 ]; then   # o bd disse que a escrita falhou: "nada nosso" na releitura não prova que ela não vai entrar, então a mensagem e o log NÃO dizem "desfeita"
       [ "$u" = desfeito ] && { jlog apply "$id" 13 "escrita-falhou-sem-nada-nosso rc=$w"; die 13 "bd update falhou (rc=$w) e a releitura não mostra nada nosso em $id — uma escrita que estourou o prazo pode ainda entrar: nada garantido (o Pilot segura a bead e relê)"; }
       jlog apply "$id" 13 "escrita-falhou-NAO-desfeito rc=$w"; die 13 "bd update falhou (rc=$w) e não consegui confirmar nem desfazer a atribuição de $id — NÃO desfeita: confira à mão"
     fi
     jlog apply "$id" 13 "conferencia-falhou-$u"; [ "$u" = desfeito ] && die 13 "não consegui confirmar a atribuição de $id — desfeita"; die 13 "não consegui confirmar a atribuição de $id — NÃO desfeita: confira à mão"
   fi
-  T "$BD" -C "$store" comment "$id" "nó (ga-2hd02v.1.10): atribuída a $ALIAS, rota $ROUTE — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O pool cria a sessão; sem gc session new à mão (a duplicata é derrubada pelo dedup). Ao fim da entrega: wa-node-dispatch.sh release $id." >/dev/null 2>&1 || say "aviso: comentário em $id não gravado"
+  if [ "$SPAWN" = pilot ]; then who="atribuída a $PICK (marca pilot.wa_node_alias, sem rota) — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O Pilot abre a sessão do alias; sem gc session new à mão."
+  else who="atribuída a $PICK, rota $ROUTE — veredito node (base $b: $(printf '%s' "$out" | jq -r '(.reasons // []) | join(", ")')). O pool cria a sessão; sem gc session new à mão (a duplicata é derrubada pelo dedup)."; fi
+  T "$BD" -C "$store" comment "$id" "nó (ga-2hd02v.1.10): $who Ao fim da entrega: wa-node-dispatch.sh release $id." >/dev/null 2>&1 || say "aviso: comentário em $id não gravado"
   wn=""; [ "$w" = 0 ] || wn=" [bd update rc=$w, a releitura confere]"   # o rc do bd mentiu (resposta perdida): fica no log
-  jlog apply "$id" 0 "despachada para $ALIAS ($b)$wn"; say "$id → $ALIAS ($ROUTE), base=$b$wn"; printf '%s\n' "$out"; exit 0 ;;
+  jlog apply "$id" 0 "despachada para $PICK ($b)$wn"; say "$id → $PICK ($([ "$SPAWN" = pilot ] && echo sessão-do-pilot || echo "$ROUTE")), base=$b$wn"; printf '%s\n' "$out"; exit 0 ;;
 
 release)
-  as=$(printf '%s' "$B" | jq -r '.assignee // ""'); rt=$(printf '%s' "$B" | jq -r '.metadata["gc.routed_to"] // ""')
-  [ "$as" = "$ALIAS" ] && [ "$rt" = "$ROUTE" ] || { jlog release "$id" 12 "nao-e-do-no assignee=$as rota=$rt"; die 12 "$id não é do $ALIAS com a rota $ROUTE (assignee=${as:-—} rota=${rt:-—}) — não solto"; }
-  T "$BD" -C "$store" update "$id" --if-assignee "$ALIAS" --assignee "" --unset-metadata gc.routed_to -q >/dev/null 2>&1 || { jlog release "$id" 13 "escrita-falhou"; die 13 "bd update falhou ao soltar $id — nada garantido (um update morto por prazo pode ter gravado); confira"; }
+  as=$(printf '%s' "$B" | jq -r '.assignee // ""'); rt=$(printf '%s' "$B" | jq -r '.metadata["gc.routed_to"] // ""'); mk=$(printf '%s' "$B" | jq -r '.metadata["pilot.wa_node_alias"] // ""')
+  # só solta bead que é de um alias do nó (o do teste, ou <prefixo>1..9 — vale também para o alias de um N maior que o de hoje, a bead não fica presa se o N baixar) E do carimbo do modo em que foi atribuída:
+  # pool → a rota; pilot → a marca com o próprio alias e sem rota. Dono de outra pessoa, rota de outro pool ou marca de outro alias → 12, sem escrita.
+  case "$as" in "$ALIAS"|"$PREFIX"[1-9]) mine_alias=1 ;; *) mine_alias=0 ;; esac
+  shape=""
+  if [ "$mine_alias" = 1 ] && [ "$rt" = "$ROUTE" ] && [ -z "$mk" ]; then shape=pool; elif [ "$mine_alias" = 1 ] && [ -z "$rt" ] && [ "$mk" = "$as" ]; then shape=pilot; fi
+  [ -n "$shape" ] || { jlog release "$id" 12 "nao-e-do-no assignee=$as rota=$rt marca=$mk"; die 12 "$id não é de um alias do nó ($PREFIX*) com a rota $ROUTE ou a marca do Pilot (assignee=${as:-—} rota=${rt:-—} marca=${mk:-—}) — não solto"; }
+  if [ "$shape" = pilot ]; then ukey="pilot.wa_node_alias"; else ukey="gc.routed_to"; fi
+  T "$BD" -C "$store" update "$id" --if-assignee "$as" --assignee "" --unset-metadata "$ukey" -q >/dev/null 2>&1 || { jlog release "$id" 13 "escrita-falhou"; die 13 "bd update falhou ao soltar $id — nada garantido (um update morto por prazo pode ter gravado); confira"; }
   A=$(bead_json "$store" "$id") || A=""
-  { [ -n "$A" ] && [ -z "$(printf '%s' "$A" | jq -r '.assignee // ""')" ] && [ -z "$(printf '%s' "$A" | jq -r '.metadata["gc.routed_to"] // ""')" ]; } || { jlog release "$id" 13 "conferencia-falhou"; die 13 "não consegui confirmar que $id foi solta — confira à mão"; }
-  T "$BD" -C "$store" comment "$id" "nó (ga-2hd02v.1.10): dono $ALIAS e rota $ROUTE soltos após a entrega (evita sessão nova a cada 15 min até o merge)." >/dev/null 2>&1 || true
+  { [ -n "$A" ] && [ -z "$(printf '%s' "$A" | jq -r '.assignee // ""')" ] && [ -z "$(printf '%s' "$A" | jq -r '.metadata["gc.routed_to"] // ""')" ] && [ -z "$(printf '%s' "$A" | jq -r '.metadata["pilot.wa_node_alias"] // ""')" ]; } || { jlog release "$id" 13 "conferencia-falhou"; die 13 "não consegui confirmar que $id foi solta — confira à mão"; }
+  T "$BD" -C "$store" comment "$id" "nó (ga-2hd02v.1.10): dono $as e $([ "$shape" = pilot ] && echo "marca $ukey" || echo "rota $ROUTE") soltos após a entrega (evita sessão nova a cada 15 min até o merge)." >/dev/null 2>&1 || true
   jlog release "$id" 0 "solta"; say "$id solta"; exit 0 ;;
 
 *) die 2 "comando desconhecido: $cmd (check|apply|release)" ;;
