@@ -265,8 +265,10 @@ def release(city: str, bead: str, alias: str, marker: str, store: str = "") -> N
     a = run(["bd", "-C", store, "update", bead, "--unset-metadata", "gc.routed_to", "--unset-metadata", "pilot.wa_node_alias", "-q"])  # a rota primeiro (e a marca pilot.wa_node_alias do modo em que o Pilot abre a sessão e não grava rota — ga-2hd02v.3; tirar chave que não existe não falha, medido com o bd real): sem elas nenhuma sonda reclama a bead
     b = run(["bd", "-C", store, "update", bead, "--if-assignee", alias, "-a", "", "-q"])  # só sai se AINDA for o alias: outro dono não é tirado
     try:
-        # confere o EFEITO, não o rc: vazio → solta; falhou/ilegível → "?" = não sei, dito como aviso
-        now = first(bd_json(store, ["show", bead, "--json"], f"a bead {bead}")) or {}
+        # confere o EFEITO, não o rc: lida e sem dono/rota/marca → solta; falhou/ilegível OU lista vazia/outra bead (o bd não devolveu a bead) → "?" = não sei, dito como aviso — nunca "solta"
+        now = first(bd_json(store, ["show", bead, "--json"], f"a bead {bead}"))
+        if not isinstance(now, dict) or now.get("id") != bead:
+            raise Stop(f"o bd não devolveu a bead {bead} ao reler")
         left = [k for k, v in (("assignee", now.get("assignee")), ("gc.routed_to", (now.get("metadata") or {}).get("gc.routed_to")), ("pilot.wa_node_alias", (now.get("metadata") or {}).get("pilot.wa_node_alias"))) if v]
     except (Stop, AttributeError, TypeError):
         left = ["?"]

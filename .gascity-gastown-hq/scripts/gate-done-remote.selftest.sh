@@ -50,6 +50,8 @@ if cmd == "show":
     i = [x for x in a[1:] if not x.startswith("-")][0]
     if i not in beads: sys.stderr.write("not found\n"); sys.exit(1)
     if env("FAKE_BD_BADJSON") == "show:" + i: print("{nao e json"); sys.exit(0)
+    if env("FAKE_BD_SHOW_EMPTY_AFTER_UPDATE") == i and any((" update " + i + " ") in (" " + l) for l in open(T + "/bd.log")): print("[]"); sys.exit(0)   # a releitura depois da soltura volta vazia
+    if env("FAKE_BD_SHOW_OTHER_AFTER_UPDATE") == i and any((" update " + i + " ") in (" " + l) for l in open(T + "/bd.log")): print(json.dumps([{"id": "ps-outra", "status": "in_progress", "labels": [], "metadata": {}}])); sys.exit(0)   # a releitura devolve OUTRA bead (sem dono nem rota)
     print(json.dumps([beads[i]]) if "--json" in a else i); sys.exit(0)
 if cmd == "create":
     if env("FAKE_BD_NOMARKER"): sys.exit(1)
@@ -443,6 +445,9 @@ dbq '.beads["ga-mk1"].description' | grep -qF -- "bead_rig: property_scrapers"; 
 has "$T/out" "bead solta: ps-t1"; ok $? "PS feliz: a saída diz que soltou"; has "$T/out" "submetido: $PSBR @ $PSSHA"; ok $? "PS feliz: a saída imprime o sha submetido"
 ps_clean; ok $? "PS feliz: worktree, branch local e ref temporária foram recolhidos (no rig e na cidade)"
 [ "$(git --git-dir="$PSRIG/.repo.git" rev-parse main)" = "$(git --git-dir="$PSORIGIN" rev-parse main)" ]; ok $? "PS feliz: o main do rig não mudou"
+# leitura vazia do bd depois da soltura: NÃO é sucesso (não digo 'bead solta' sem ter lido a bead)
+reset_ps; run_ps FAKE_BD_SHOW_EMPTY_AFTER_UPDATE=ps-t1; ok $((RC != 0)) "PS releitura vazia do bd: a submissão vale (sai 0)"; has "$T/out" "NÃO ficou solta (resta ?"; ok $? "PS releitura vazia: AVISO 'NÃO ficou solta (resta ?', e NÃO 'bead solta'"; ! has "$T/out" "bead solta: ps-t1"; ok $? "PS releitura vazia: não diz 'bead solta'"
+reset_ps; run_ps FAKE_BD_SHOW_OTHER_AFTER_UPDATE=ps-t1; ok $((RC != 0)) "PS releitura devolve OUTRA bead: a submissão vale (sai 0)"; has "$T/out" "NÃO ficou solta (resta ?"; ok $? "PS releitura de outra bead: AVISO, não 'solta' (uma bead sem dono nem rota que não é a minha não prova nada)"
 # a soltura confere TAMBÉM a marca do nó: se o bd não a tirou, o aviso diz (a bead não fica "solta" por engano)
 reset_ps; run_ps FAKE_BD_KEEP_MARK=1; ok $((RC != 0)) "PS marca do nó que o bd não tirou: a submissão vale (sai 0)"; has "$T/out" "NÃO ficou solta (resta pilot.wa_node_alias"; ok $? "PS marca do nó que ficou: AVISO diz que a bead NÃO ficou solta e o que resta"
 # forma com argumentos (2ª bead da sessão) e prefixo
@@ -563,6 +568,10 @@ case_ps_node_mark() { reset_ps; run_ps; [ "$(psq '.beads["ps-t1"].metadata | has
 case_ps_no_routes() { reset_ps; printf '{"prefix":"ga","path":"."}\n' > "$CITY/.beads/routes.jsonl"; run_ps; r=$RC; e=0; has "$T/err" "não achei a rota do prefixo 'ps'" && e=1; cp "$T/routes.orig" "$CITY/.beads/routes.jsonl"; [ "$r" = 1 ] && [ "$e" = 1 ] && ps_nothing; }
 case_ps_unknown_prefix() { reset_ps; run_ps GC_SESSION_NAME=wa-worker-remote-abc123 GC_ALIAS=wa-worker-remote-1 BEADS_ACTOR=wa-worker-remote-1; [ "$RC" = 1 ] && ps_nothing; }
 case_unknown_role() { reset_ps; run_exe GC_SESSION_NAME=remote-e2e-1 GATE_DONE_REMOTE_DRY_RUN=1; [ "$RC" = 0 ] && has "$T/out" "bead=ga-t1 worker/remote-e2e-1@"; }
+case_release_empty_read() { reset_ps; run_ps FAKE_BD_SHOW_EMPTY_AFTER_UPDATE=ps-t1; has "$T/out" "NÃO ficou solta (resta ?" && ! has "$T/out" "bead solta: ps-t1"; }
+mutant ps-releitura-vazia-vira-solta 'if not isinstance(now, dict) or now.get("id") != bead:' 'if False:' case_release_other_bead
+case_release_other_bead() { reset_ps; run_ps FAKE_BD_SHOW_OTHER_AFTER_UPDATE=ps-t1; has "$T/out" "NÃO ficou solta (resta ?" && ! has "$T/out" "bead solta: ps-t1"; }
+mutant ps-releitura-vazia-volta-a-or-vazio 'if not isinstance(now, dict) or now.get("id") != bead:' $'now = now or {}\n        if False:' case_release_empty_read
 case_node_mark_left() { reset_ps; run_ps FAKE_BD_KEEP_MARK=1; has "$T/out" "NÃO ficou solta (resta pilot.wa_node_alias"; }
 mutant ps-solta-nao-le-a-marca '("pilot.wa_node_alias", (now.get("metadata") or {}).get("pilot.wa_node_alias"))' '("x", None)' case_node_mark_left
 case_mixed_identity() { reset_ps; run_ps GC_ALIAS="$ALIAS" BEADS_ACTOR="$ALIAS"; [ "$RC" = 2 ] && has "$T/err" "identidade mista" && ps_nothing; }
