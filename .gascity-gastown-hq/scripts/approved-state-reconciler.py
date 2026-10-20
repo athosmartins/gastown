@@ -259,6 +259,15 @@ _PILOT_SWEEP_RE = re.compile(r"Pilot sweep complete:")
 # HISTORY across many sweeps, that function checks only the latest one.
 _PILOT_SWEEP_PAUSED_RE = re.compile(
     r"Pilot sweep complete: dispatched=0 \((?:paused|deferred):")
+# ga-oa0fe1: the disk-floor NODE-ONLY pass (pilot-dispatcher.sh, ga-2hd02v.1.20) pauses the MINI for the whole sweep
+# but the sweep runs on for the node and ends in a NORMAL "Pilot sweep complete: dispatched=N (small_slots=...)" line,
+# which _PILOT_SWEEP_PAUSED_RE does not match: the history counted it as a healthy sweep (20/10: "Pilot pausado 1/15"
+# while the mini got nothing since 10:00). The two lines below are logged earlier in that same sweep: the pass itself,
+# and the reading (PILOT_DISK_FLOOR_DETAIL) in the WARN that precedes it (also in the full pause, "paused: disk floor").
+_PILOT_NODE_ONLY_RE = re.compile(r"Disk floor: passada só-nó")
+_PILOT_DISK_READING_RE = re.compile(r"Disk floor \(disk_free=(\d+)MB floor=(\d+)MB\)")
+_NODE_ONLY_PAUSE_REASON = "disk floor (passada só-nó)"   # stable on purpose: the MB flip from sweep to sweep
+_DISK_PAUSE_REASONS = ("disk floor", _NODE_ONLY_PAUSE_REASON)   # the full pause files itself under its own text
 # _PILOT_SWEEP_SLOTS_RE (ga-2yyez case 3 "lane x pool"): extracts small_slots/
 # big_slots from a NORMAL (non-paused/non-deferred) sweep-complete line.
 #
@@ -1098,7 +1107,7 @@ def _is_pilot_alive(now):
     return False
 
 
-def _pilot_sweep_pause_history(now, age_min):
+def _pilot_sweep_pause_history(now, age_min, node_bead=False):
     """Count how many of the Pilot's logged sweep-completions, within this bead's
     own wait window (min(age_min, PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN) minutes back
     from `now`), were a deliberate whole-sweep pause/yield (quota-limited/ram-
@@ -1128,18 +1137,27 @@ def _pilot_sweep_pause_history(now, age_min):
     correctly by earlier cycles. Reading "dispatch path failing" against the
     bead's full age as if it were 100% unexplained overstates the problem.
     """
-    records = _pilot_sweep_pause_read()
-    if records is None:
-        return None, None
-    paused, total, _by_reason = _pilot_sweep_pause_window(records, now, age_min)
+    paused, total, _by_reason, _reading = _pilot_sweep_pause_detail(now, age_min, node_bead)
     return paused, total
 
 
+def _pilot_sweep_pause_detail(now, age_min, node_bead=False):
+    """_pilot_sweep_pause_history() plus what the alarm text needs (ga-oa0fe1): (paused, total,
+    {reason: n}, reading) — `reading` is (free_mb, floor_mb) of the newest disk-floor sweep that
+    logged one, or None. (None, None, None, None) when unmeasurable, for the same reasons."""
+    records = _pilot_sweep_pause_read()
+    if records is None:
+        return None, None, None, None
+    paused, total, by_reason = _pilot_sweep_pause_window(records, now, age_min, node_bead)
+    return paused, total, by_reason, records[2]
+
+
 def _pilot_sweep_pause_read():
-    """Read the Pilot log ONCE and reduce it to (oldest_epoch, sweeps) — `oldest_epoch` is the
-    oldest timestamp on ANY line (the completeness check needs the tail's own reach, not just
+    """Read the Pilot log ONCE and reduce it to (oldest_epoch, sweeps, reading) — `oldest_epoch` is
+    the oldest timestamp on ANY line (the completeness check needs the tail's own reach, not just
     the sweep lines'), `sweeps` is [(epoch, pause_reason_or_None)] for every datable sweep-
-    complete line. None if the log is missing/unreadable/empty.
+    complete line (a disk-floor NODE-ONLY pass is a pause too, ga-oa0fe1), `reading` the newest
+    disk reading of a disk-floor sweep or None. None if the log is missing/unreadable/empty.
 
     Split out of _pilot_sweep_pause_history (ga-5bzrzu) so one cycle can answer the window
     question for MANY beads from one read of a ~20000-line tail, instead of re-scanning it per
@@ -1152,25 +1170,56 @@ def _pilot_sweep_pause_read():
         return None
     oldest_epoch = None
     sweeps = []
+    reading = None          # (free_mb, floor_mb) of the newest sweep that paused for the disk and logged the numbers
+    node_only = False       # the sweep being read logged "Disk floor: passada só-nó" (ga-oa0fe1)
+    sweep_reading = None    # the disk reading that same sweep logged
     for line in lines:
         epoch = _ts_epoch(line)
         if epoch is None:
             continue
         if oldest_epoch is None or epoch < oldest_epoch:
             oldest_epoch = epoch
+        if _PILOT_SWEEP_START_RE.search(line):
+            # A sweep that started and never completed leaves its flags behind: they must not turn the NEXT one into a pause.
+            node_only, sweep_reading = False, None
+            continue
+        m_read = _PILOT_DISK_READING_RE.search(line)
+        if m_read:
+            sweep_reading = (int(m_read.group(1)), int(m_read.group(2)))
+            continue
+        if _PILOT_NODE_ONLY_RE.search(line):
+            node_only = True
+            continue
         if not _PILOT_SWEEP_RE.search(line):
             continue
-        sweeps.append((epoch, _pilot_pause_reason(line)
-                       if _PILOT_SWEEP_PAUSED_RE.search(line) else None))
-    return oldest_epoch, sweeps
+        if _PILOT_SWEEP_PAUSED_RE.search(line):
+            reason = _pilot_pause_reason(line)
+        elif node_only:
+            reason = _NODE_ONLY_PAUSE_REASON
+        else:
+            reason = None
+        if reason in _DISK_PAUSE_REASONS and sweep_reading is not None:
+            reading = sweep_reading
+        sweeps.append((epoch, reason))
+        node_only, sweep_reading = False, None
+    return oldest_epoch, sweeps, reading
 
 
-def _pilot_sweep_pause_window(records, now, age_min):
+def _is_node_bead(labels):
+    """True iff the bead carries the label that sends it to the Hetzner node (node:ok, the opt-in
+    pilot-dispatcher.sh's node-only pass reads for a WA bead). The mini's disk floor does not explain
+    ITS wait, so the node-only sweeps are not counted for it (ga-oa0fe1). Everything else — no label,
+    labels that could not be read — is not the node's: that is the direction the pause note already took."""
+    return "node:ok" in (labels or ())
+
+
+def _pilot_sweep_pause_window(records, now, age_min, node_bead=False):
     """(paused, total, {reason: n}) over the sweeps inside this bead's wait window
     (min(age_min, PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN) minutes back from `now`), or
     (None, None, None) if unmeasurable — the tail does not reach back the whole window, or no
-    sweep falls inside it (see _pilot_sweep_pause_history for why those are NOT zero)."""
-    oldest_epoch, sweeps = records
+    sweep falls inside it (see _pilot_sweep_pause_history for why those are NOT zero).
+    node_bead (ga-oa0fe1): the bead is the node's own — a node-only sweep is a normal sweep for it."""
+    oldest_epoch, sweeps, _reading = records
     cutoff = now - min(age_min, PILOT_SWEEP_HISTORY_MAX_WINDOW_MIN) * 60
     if oldest_epoch is None or oldest_epoch > cutoff:
         return None, None, None   # tail doesn't reach back the full window — unmeasurable
@@ -1180,6 +1229,8 @@ def _pilot_sweep_pause_window(records, now, age_min):
         if epoch < cutoff:
             continue
         total += 1
+        if node_bead and reason == _NODE_ONLY_PAUSE_REASON:
+            reason = None
         if reason is not None:
             paused += 1
             by_reason[reason] = by_reason.get(reason, 0) + 1
@@ -1217,12 +1268,25 @@ def _pilot_pause_reason(line):
     return text[:40] or "motivo não lido"
 
 
-def _pilot_sweep_pause_body_line(paused, total):
+def _disk_wait(by_reason, reading):
+    """(n, text) for the mini's disk (ga-oa0fe1): n = paused sweeps of the window that were the disk
+    floor (the full pause or the node-only pass), text = 'esperando o disco do mini: X MB < Y MB' —
+    or (0, None) when none. No reading in the log is SAID, never filled in with a number."""
+    n = sum((by_reason or {}).get(r, 0) for r in _DISK_PAUSE_REASONS)
+    if n <= 0:
+        return 0, None
+    if reading is None:
+        return n, "esperando o disco do mini (leitura do disco indisponível no pilot-dispatcher.log)"
+    return n, "esperando o disco do mini: %d MB < %d MB" % reading
+
+
+def _pilot_sweep_pause_body_line(paused, total, by_reason=None, reading=None):
     """Format a 'Pilot pausado em N dos últimos M sweeps' context line for the
     starving alarm's body (ga-tma6wc) — mirrors _gate_queue_body_line()'s
     convention (gate_queue_backlog.py) of ALWAYS rendering something, NEVER
     silently omitting a dimension the alarm checked, even when the measurement
-    itself failed or came back a clean zero."""
+    itself failed or came back a clean zero. by_reason/reading (ga-oa0fe1) add
+    the mini's disk when some of those sweeps were the disk floor."""
     if paused is None or total is None:
         return ("Pilot sweep-pause history: NÃO MEDIDO (pilot-dispatcher.log "
                 "indisponível, ou o tail lido não cobre toda a janela de espera "
@@ -1232,11 +1296,16 @@ def _pilot_sweep_pause_body_line(paused, total):
         return ("Pilot sweep-pause history: 0 dos últimos %d sweeps logados "
                 "durante a espera deste bead foram pausados deliberadamente — o "
                 "atraso acima não é explicado por pausa do Pilot." % total)
-    return ("Pilot sweep-pause history: %d dos últimos %d sweeps logados durante "
+    line = ("Pilot sweep-pause history: %d dos últimos %d sweeps logados durante "
             "a espera deste bead foram pausados deliberadamente (RAM pressure, "
-            "cota 5h, quiet-hours ou cross-stage-yield — ver pilot-dispatcher.log) "
+            "cota 5h, quiet-hours, disk floor ou cross-stage-yield — ver pilot-dispatcher.log) "
             "— parte do atraso acima é despacho pausado de propósito, não "
             "necessariamente falha de despacho." % (paused, total))
+    disk_n, disk_text = _disk_wait(by_reason, reading)
+    if disk_text:
+        line += (" %d desses foram o disk floor (a passada só-nó conta: o mini abaixo do piso não recebe "
+                 "despacho por desenho, só o que vai ao nó anda) — %s." % (disk_n, disk_text))
+    return line
 
 
 def _pilot_still_held_reason(labels, now):
@@ -2430,14 +2499,17 @@ def _alarm_starving(rig_root, bead, age_min, now, state, gate_depth=None, gate_t
     # _pilot_sweep_pause_history()'s docstring for why this is a HISTORY signal,
     # distinct from the sweep_pause_reason suppression already checked upstream
     # in _process_store() before this function is ever called.
-    pause_n, pause_m = _pilot_sweep_pause_history(now, age_min)
-    pause_line = _pilot_sweep_pause_body_line(pause_n, pause_m)
+    pause_n, pause_m, pause_by, pause_reading = _pilot_sweep_pause_detail(
+        now, age_min, _is_node_bead(_get_labels(bead)))
+    pause_line = _pilot_sweep_pause_body_line(pause_n, pause_m, pause_by, pause_reading)
     # Subject stays terse (a notification/inbox-preview surface) — only add the
     # suffix when there's an actual nonzero count to report; "0/M" or "NÃO
     # MEDIDO" in a one-line subject would be noise, unlike in the always-explicit
-    # body line above.
-    pause_subject_suffix = (" (Pilot pausado %d/%d sweeps recentes)" % (pause_n, pause_m)
-                             if pause_n else "")
+    # body line above. The mini's disk goes in only when it is most of the paused sweeps (ga-oa0fe1).
+    disk_n, disk_text = _disk_wait(pause_by, pause_reading)
+    pause_subject_suffix = (" (Pilot pausado %d/%d sweeps recentes%s)" % (
+        pause_n, pause_m, "; " + disk_text if disk_text and disk_n * 2 > pause_n else "")
+        if pause_n else "")
 
     # AC4: repeats are a known-issue heartbeat, not a fresh incident — tag the
     # subject distinctly (filterable/collapsible) and demote notify priority so
@@ -2800,15 +2872,16 @@ class _PauseAggregator(object):
         self._read = False
         self.items = {}
 
-    def attribute(self, age_min):
+    def attribute(self, age_min, node_bead=False):
         """(paused, total, {reason: n}) if the pause is the common cause of a bead that has
-        waited `age_min`, else None (unmeasurable, too few sweeps, or below the bar)."""
+        waited `age_min`, else None (unmeasurable, too few sweeps, or below the bar).
+        node_bead (ga-oa0fe1): the node's own bead — the node-only sweeps are not a pause for it."""
         if not self._read:
             self._records = _pilot_sweep_pause_read()
             self._read = True
         if self._records is None:
             return None
-        paused, total, by_reason = _pilot_sweep_pause_window(self._records, self.now, age_min)
+        paused, total, by_reason = _pilot_sweep_pause_window(self._records, self.now, age_min, node_bead)
         if paused is None or paused <= 0 or total < PAUSE_COMMON_MIN_SWEEPS:
             return None
         if paused * 100 < PAUSE_COMMON_MIN_PCT * total:   # integer math: 14/56 is exactly 25%
@@ -2876,10 +2949,15 @@ class _PauseAggregator(object):
             "logados (%d%%) durante a espera da bead mais antiga (%s, %dmin). Motivos: %s." % (
                 head["paused"], head["total"], 100 * head["paused"] // head["total"],
                 head["id"], int(head["age_min"]), reasons),
+        ]
+        disk_n, disk_text = _disk_wait(head["by_reason"], self._records[2] if self._records else None)
+        if disk_text:
+            lines.append("Disco: %d desses sweeps foram o disk floor (a passada só-nó conta: o mini abaixo do "
+                         "piso não recebe despacho por desenho, só o que vai ao nó anda) — %s." % (disk_n, disk_text))
+        lines.append(
             "Beads: %d, cada uma medida na PRÓPRIA janela de espera (só entra quem teve ≥%d%% dos "
             "sweeps pausados, com no mínimo %d sweeps logados). As %d mais antigas:" % (
-                len(beads), PAUSE_COMMON_MIN_PCT, PAUSE_COMMON_MIN_SWEEPS, PAUSE_NOTE_OLDEST_N),
-        ]
+                len(beads), PAUSE_COMMON_MIN_PCT, PAUSE_COMMON_MIN_SWEEPS, PAUSE_NOTE_OLDEST_N))
         for i, b in enumerate(beads[:PAUSE_NOTE_OLDEST_N], 1):
             lines.append("  %d. %s — %dmin — pausado %d/%d — %s" % (
                 i, b["id"], int(b["age_min"]), b["paused"], b["total"], b["title"]))
@@ -2890,14 +2968,17 @@ class _PauseAggregator(object):
             "Nota #%d para esta causa." % ordinal,
             "",
             "O QUE É: sweep pausado é um ciclo em que o Pilot não despacha NADA (pressão de RAM, "
-            "cota 5h, quiet hours, drain window ou yield cross-stage). Estas beads passaram por "
+            "cota 5h, quiet hours, drain window, disk floor ou yield cross-stage); a passada só-nó do "
+            "disk floor conta porque nada vai ao mini, só o que vai ao nó. Estas beads passaram por "
             "todos os filtros de supressão do reconciliador e seguem sem despachar (a idade de "
             "cada uma está na lista); antes desta nota cada uma mandava o próprio alarme "
             "'dispatch failing' com a MESMA causa. Backoff desta nota: 1h/4h/12h.",
             "LIMITE: o Pilot também rodou sweeps normais nesta janela — a pausa explica PARTE da "
             "espera, não prova que nenhuma bead tenha, além dela, uma falha de despacho própria. "
             "Se a pausa cair abaixo de %d%% dos sweeps, cada bead que seguir parada volta a "
-            "alarmar sozinha ('dispatch failing')." % PAUSE_COMMON_MIN_PCT,
+            "alarmar sozinha ('dispatch failing'). A bead com o label node:ok (a que o nó leva) não "
+            "entra na conta da passada só-nó e alarma por conta própria; o reconciliador não sabe, "
+            "bead a bead, se o nó tem vaga para uma dog do HQ sem esse label." % PAUSE_COMMON_MIN_PCT,
             "",
             "CONFERIR (só se a espera parecer longa demais):",
             "1. cat %s — a pausa está ativa agora? qual motivo?" % PILOT_SWEEP_PAUSE_STATE_FILE,
@@ -4309,7 +4390,7 @@ def _process_store(rig_root, now, state, pilot_alive, built_ids, blocked_ids,
         # Fold it into the per-cause note instead of mailing it alone. Unmeasurable or below the
         # bar → None → the per-bead alarm below, exactly as before. Not counted in `alarmed`
         # and no per-bead alarm state: this is deliberately not an alarm about a failure.
-        pause_attr = pause_agg.attribute(starve_age_min)
+        pause_attr = pause_agg.attribute(starve_age_min, _is_node_bead(labels))
         if pause_attr is not None:
             _log("  %s: daemon-age=%.0fmin, the Pilot paused %d of the last %d sweeps of this "
                  "wait — common cause, folded into the pause-cause note (no per-bead alarm)" % (
@@ -9245,6 +9326,132 @@ def _selftest():
             _bad("(ga-5bzrzu-l)", "real=%r unknown=%r fixtures=%r" % (_pcl, _pcl_unknown, _pcl_old))
     except NameError as _e:
         _bad("(ga-5bzrzu-l)", "missing: %s" % _e)
+
+    # ── ga-oa0fe1: the disk-floor NODE-ONLY pass is a pause of the MINI, and the alarm said "dispatch failing" ──
+    # 20/10 10:3x: "buildable bead wa-ekvjuo.1 STILL starving 519min (Pilot pausado 1/15 sweeps recentes)" while every
+    # sweep since 10:00 was the node-only pass (the mini receives nothing by design). That pass ends with a NORMAL
+    # "Pilot sweep complete: dispatched=N (small_slots=...)" line, so it counted as a healthy sweep. The fixture lines
+    # are the emission shapes in pilot-dispatcher.sh (sweep start, the WARN that carries PILOT_DISK_FLOOR_DETAIL, the
+    # "passada só-nó" line, the normal complete line). The live pilot-dispatcher.log is mini-only: not read from here.
+    def _oa_sweep(epoch, kind="normal", free_mb=4700):
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(epoch))
+        if kind == "ram":
+            return [_pc_line(epoch, "ram")]
+        out = ["%s [pilot-dispatcher] === Pilot sweep start (DRY_RUN=0) ===" % ts]
+        if kind in ("node", "node-noreading", "node-unfinished"):
+            if kind == "node":
+                out.append("%s [pilot-dispatcher] WARN: Disk floor (disk_free=%dMB floor=5120MB) — the MINI is paused "
+                           "(no builder, no pool top-up, no claim of a bead that is not going to the node), but "
+                           "PILOT_NODE_FIRST=on: this sweep still runs the NODE-ONLY pass (ga-2hd02v.1.20)." % (ts, free_mb))
+            out.append("%s [pilot-dispatcher] Disk floor: passada só-nó — só bead de dog do HQ com veredito node e "
+                       "vaga vai adiante; nada vai ao mini (ga-2hd02v.1.20)." % ts)
+        if kind != "node-unfinished":
+            out.append("%s [pilot-dispatcher] === Pilot sweep complete: dispatched=0 (small_slots=2 big_slots=1 "
+                       "dolt_saturated_at_start=0) ===" % ts)
+        return out
+
+    def _oa_log(t, kinds, free_mb=4700):
+        """The Pilot log as read at epoch `t`: a normal ANCHOR sweep 1500min back (outside every window, proves the tail
+        reaches back), then one sweep per entry of `kinds` spread over the last 500min (the last one 100s before `t`)."""
+        lines = [_pc_line(t - 1500 * 60)]
+        for i, k in enumerate(kinds):
+            lines += _oa_sweep(t - 500 * 60 + (500 * 60 - 100) * i / max(len(kinds) - 1, 1), k, free_mb)
+        return lines
+
+    _OA_AGE = 519.0
+    _OA_DISK = "disk floor (passada só-nó)"
+
+    print("\nScenario (ga-oa0fe1-a): the node-only pass counts as a pause (reason 'disk floor') inside the bead's wait "
+          "window — the 20/10 repro (14 node-only sweeps + 1 RAM pause, bead waiting 519min) reads 15/15, not 1/15")
+    _read_pilot_log_lines = lambda: _oa_log(NOW, ["ram"] + ["node"] * 14)
+    try:
+        _oa_a = _pilot_sweep_pause_history(NOW, _OA_AGE)
+        _oa_a_by = (_pilot_sweep_pause_window(_pilot_sweep_pause_read(), NOW, _OA_AGE)[2] or {})
+    except Exception as _e:
+        _oa_a, _oa_a_by = None, {}
+        _bad("(ga-oa0fe1-a)", "raised %r" % (_e,))
+    if _oa_a == (15, 15) and _oa_a_by.get(_OA_DISK) == 14 and _oa_a_by.get("pressão de RAM") == 1:
+        _ok("(ga-oa0fe1-a): 15/15 paused — 14 'disk floor (passada só-nó)' + 1 'pressão de RAM'")
+    elif _oa_a is not None:
+        _bad("(ga-oa0fe1-a)", "history=%r by_reason=%r, want (15, 15) with 14 %r + 1 RAM" % (_oa_a, _oa_a_by, _OA_DISK))
+
+    print("\nScenario (ga-oa0fe1-b): END-TO-END — 3 starving beads that are not the node's, same log: ONE common-cause note "
+          "that says the MINI's disk is the wait (reading and floor in MB, the node-only pass named) and ZERO per-bead "
+          "'dispatch failing' mails")
+    _read_pilot_sweep_pause_state_file = _pause_off
+    _oa_ids = ["wa-oa0fe1-1", "wa-oa0fe1-2", "wa-oa0fe1-3"]
+    st = _pc_setup(_oa_ids, {"wa-oa0fe1-1": 519, "wa-oa0fe1-2": 505, "wa-oa0fe1-3": 490})
+    _read_pilot_log_lines = lambda: _oa_log(NOW, ["ram"] + ["node"] * 14)
+    run_cycle(NOW, st)
+    _oa_b = _pc_mails()
+    _oa_b_subj, _oa_b_body = (_oa_b[0] if _oa_b else ("", ""))
+    _oa_b_problems = []
+    if len(_oa_b) != 1:
+        _oa_b_problems.append("want 1 cause note, got %d (subjects=%r)" % (len(_oa_b), [s for s, _ in mail_calls]))
+    if _df_mails():
+        _oa_b_problems.append("%d per-bead 'dispatch failing' mails still went out" % len(_df_mails()))
+    for _need in ("esperando o disco do mini: 4700 MB < 5120", "passada só-nó"):
+        if _need not in _oa_b_body:
+            _oa_b_problems.append("body lacks %r" % _need)
+    if "15/15" not in _oa_b_subj:
+        _oa_b_problems.append("subject lacks 15/15: %r" % _oa_b_subj)
+    if not _oa_b_problems:
+        _ok("(ga-oa0fe1-b): one cause note (15/15), 'esperando o disco do mini: 4700 MB < 5120' in the body, 0 per-bead mails")
+    else:
+        _bad("(ga-oa0fe1-b)", "; ".join(_oa_b_problems))
+
+    print("\nScenario (ga-oa0fe1-c): a bead the NODE takes (label node:ok) is not explained by the mini's disk — the node-only "
+          "sweeps do not count for it (1/15, as before) and it keeps its own 'dispatch failing' alarm")
+    _read_pilot_log_lines = lambda: _oa_log(NOW, ["ram"] + ["node"] * 14)
+    try:
+        _oa_c = _pilot_sweep_pause_history(NOW, _OA_AGE, node_bead=True)
+    except Exception as _e:
+        _oa_c = "raised %r" % (_e,)
+    _bd_approved = lambda root: [_make_bead("wa-oa0fe1-n", labels=["story:approved", "node:ok"], title="Node bead")]
+    _read_pilot_dispatchable_file = lambda: None
+    st = _reset()
+    st["first_seen_approved"]["wa-oa0fe1-n"] = NOW - 519 * 60
+    run_cycle(NOW, st)
+    _oa_c_mails = [s for s, _ in mail_calls if "wa-oa0fe1-n" in s and "dispatch failing" in s]
+    if _oa_c == (1, 15) and len(_oa_c_mails) == 1 and not _pc_mails():
+        _ok("(ga-oa0fe1-c): node:ok bead — 1/15, its own 'dispatch failing' alarm, no cause note")
+    else:
+        _bad("(ga-oa0fe1-c)", "history=%r per-bead=%r cause=%d" % (_oa_c, _oa_c_mails, len(_pc_mails())))
+
+    print("\nScenario (ga-oa0fe1-d): falsification — (1) a 'passada só-nó' line of a sweep that never completed does not turn "
+          "the NEXT normal sweep into a pause; (2) a node-only sweep with no disk reading still counts, but the text says "
+          "the reading is unavailable and invents no number")
+    _read_pilot_log_lines = lambda: _oa_log(NOW, ["node-unfinished"] + ["normal"] * 12)
+    _oa_d1 = _pilot_sweep_pause_history(NOW, _OA_AGE)
+    _read_pilot_log_lines = lambda: _oa_log(NOW, ["node-noreading"] * 12)
+    try:
+        _oa_rec = _pilot_sweep_pause_read()
+        _oa_d2 = _pilot_sweep_pause_window(_oa_rec, NOW, _OA_AGE)
+        _oa_d2_body = _pilot_sweep_pause_body_line(_oa_d2[0], _oa_d2[1], _oa_d2[2], _oa_rec[2])
+    except Exception as _e:
+        _oa_d2, _oa_d2_body = None, "raised %r" % (_e,)
+    if (_oa_d1 == (0, 12) and _oa_d2 is not None and _oa_d2[:2] == (12, 12)
+            and "disco do mini" in _oa_d2_body and "indisponível" in _oa_d2_body
+            and "4700" not in _oa_d2_body and "MB <" not in _oa_d2_body):
+        _ok("(ga-oa0fe1-d): unfinished sweep leaks nothing (0/12); no-reading sweeps 12/12 and the text says "
+            "'indisponível', no made-up MB")
+    else:
+        _bad("(ga-oa0fe1-d)", "unfinished=%r noreading=%r body=%r" % (_oa_d1, _oa_d2, _oa_d2_body))
+
+    print("\nScenario (ga-oa0fe1-e): below the common-cause bar (3 of 20 sweeps) the per-bead alarm still fires and its "
+          "subject and body name the mini's disk with the numbers")
+    _read_pilot_log_lines = lambda: _oa_log(NOW, ["normal"] * 17 + ["node"] * 3)
+    _bd_approved = lambda root: [_make_bead("wa-oa0fe1-e", labels=["story:approved"], title="Below the bar")]
+    st = _reset()
+    st["first_seen_approved"]["wa-oa0fe1-e"] = NOW - 519 * 60
+    run_cycle(NOW, st)
+    _oa_e = [(s, b) for s, b in mail_calls if "wa-oa0fe1-e" in s and "dispatch failing" in s]
+    if (len(_oa_e) == 1 and "Pilot pausado 3/20 sweeps recentes" in _oa_e[0][0]
+            and "esperando o disco do mini: 4700 MB < 5120" in _oa_e[0][0]
+            and "esperando o disco do mini: 4700 MB < 5120" in _oa_e[0][1]):
+        _ok("(ga-oa0fe1-e): per-bead alarm keeps 3/20 and names 'esperando o disco do mini: 4700 MB < 5120' in subject and body")
+    else:
+        _bad("(ga-oa0fe1-e)", "mails=%r" % (_oa_e,))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
