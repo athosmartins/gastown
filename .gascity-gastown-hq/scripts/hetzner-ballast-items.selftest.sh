@@ -19,8 +19,19 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ITEMS="${HBI_ITEMS_DIR:-$HERE/hetzner-ballast-items}"
 PY="${HBI_PY:-/usr/bin/python3}"
 T=$(cd "$(mktemp -d /tmp/hbi.XXXXXX)" && pwd -P)
-cleanup() { pkill -f "$T/" 2>/dev/null; sleep 0.2; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
+# killtree CAMINHO — mata, pelo GRUPO de processos, tudo que leva CAMINHO na linha de comando. O item de brinquedo roda em sessão própria e tem filhos (`sleep 300`) que NÃO levam o caminho:
+# `pkill -f` só os pega se o caminho aparecer, e o resto fica órfão (ppid 1) no mini/nó depois do teste (incidente de 20/10: 22 órfãos por rodada). O grupo do próprio teste é poupado.
+killtree() {
+  local g self; self=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+  for g in $(ps -axo pgid=,command= 2>/dev/null | awk -v p="$1" 'index($0, p) { print $1 }' | sort -u); do
+    case "$g" in ''|*[!0-9]*) continue ;; esac
+    [ "$g" -gt 1 ] && [ "$g" != "$self" ] && kill -KILL -- "-$g" 2>/dev/null
+  done
+  return 0
+}
+cleanup() { killtree "$T/"; pkill -f "$T/" 2>/dev/null; sleep 0.2; chmod -R u+rwX "$T" 2>/dev/null; find "$T" -mindepth 1 -delete 2>/dev/null; rmdir "$T" 2>/dev/null; }
 trap cleanup EXIT
+trap 'exit 143' TERM INT HUP   # sem isto um TERM/INT (TaskStop, ctrl-c) pula o EXIT e deixa processos órfãos
 fails=0; n=0
 ok() {  # no modo mutante, a primeira falha encerra (só interessa se a bateria reprova)
   n=$((n+1))
@@ -52,7 +63,7 @@ newrig() {  # repo-fonte com a árvore do hq de mentira + o repo bare que o stub
   N=$((${N:-0}+1)); BH="$T/bh$N"; GR="$T/gr$N"; SRC="$T/src$N"; RD="$T/rd$N"; mkdir -p "$BH" "$GR/gascity" "$RD"
   git init -q "$SRC"; local c="$SRC/.gascity-gastown-hq"
   mkst "$c/scripts/a.selftest.sh" 0; mkst "$c/scripts/b.selftest.sh" 1; mkst "$c/scripts/mac.selftest.sh" 1
-  mkst "$c/scripts/env.selftest.sh" 97; mkst "$c/scripts/slow.selftest.sh" 0 'sleep 30'; mkst "$c/packs/town-deltas/assets/c.selftest.sh" 0
+  mkst "$c/scripts/env.selftest.sh" 97; mkst "$c/scripts/slow.selftest.sh" 0 'sleep 8'; mkst "$c/packs/town-deltas/assets/c.selftest.sh" 0
   printf '# só-macOS\nscripts/mac.selftest.sh\n' > "$c/scripts/hetzner-mac-only.hq.txt"
   git -C "$SRC" add -A && git -C "$SRC" commit -q -m um && git clone -q --bare "$SRC" "$GR/gascity/repo.git" 2>/dev/null
   git -C "$GR/gascity/repo.git" update-ref refs/remotes/origin/main "$(git -C "$SRC" rev-parse HEAD)"
