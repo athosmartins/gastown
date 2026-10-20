@@ -14,12 +14,18 @@
 #   B. a fiação no despacho (grep no fonte): o ponto de chamada fica depois do guarda de posse e antes de "deixar sem dono"; o braço
 #      `wa-worker-remote)` do spawn vem antes de `wa-worker*)` e não faz `gc session new` nem carimba gc.routed_to=wa-worker; o rc 2 solta a
 #      claim e não despacha; a função só é chamada num lugar.
-#   C. mutantes: cada quebra abaixo tem de derrubar este selftest (29, a leitura da bead entre eles). Cada um roda o arquivo inteiro e para no 1º FAIL.
+#   C. mutantes: cada quebra abaixo tem de derrubar este selftest (30, a leitura da bead e o modo pool entre eles). Cada um roda o arquivo inteiro e para no 1º FAIL;
+#      rodam em paralelo (--jobs N, padrão 4; o mbp-run.sh repassa argumento, não ambiente).
+#   O MODO `pilot` do gancho (PILOT_WA_NODE_SPAWN=pilot: N slots, abrir/acordar a sessão, desfazer, orçamento de spawn) é provado em pilot-dispatcher.wa-node-spawn.selftest.sh;
+#   aqui só se prova que o padrão (`pool`) é o da 1.10 e que o gancho repassa o modo ao script.
 #
-# Run:  bash packs/town-deltas/assets/pilot-dispatcher.wa-node-route.selftest.sh
+# Run:  bash packs/town-deltas/assets/pilot-dispatcher.wa-node-route.selftest.sh [--jobs N]
 # Exit 0 iff tudo passa. Saída: linhas ok/FAIL, "N/N ok", "SELFTEST OK".
 
 set -uo pipefail
+
+if [ "${1:-}" = "--jobs" ]; then WA_NODE_ROUTE_ST_JOBS="${2:-4}"; fi
+case "${WA_NODE_ROUTE_ST_JOBS:-4}" in [1-9]|[1-9][0-9]) ;; *) echo "FATAL: --jobs quer um número de 1 a 99 (veio '${WA_NODE_ROUTE_ST_JOBS}')" >&2; exit 2 ;; esac
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SELF_DIR="$(dirname "$SELF")"
@@ -36,8 +42,16 @@ check() { # check <descrição> <comando…>  — passa se o comando sai 0
 }
 
 [ -f "$DISPATCHER" ] || { echo "FATAL: $DISPATCHER não existe" >&2; exit 2; }
-FN="$(awk '/^_pilot_wa_node_decide\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+fn_of() { awk -v n="$1" '$0 ~ "^"n"\\(\\)"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
+FN="$(fn_of _pilot_wa_node_decide)"
 [ -n "$FN" ] || { echo "FATAL: _pilot_wa_node_decide() não está em $DISPATCHER" >&2; exit 2; }
+# o gancho chama o modo (pool|pilot), a releitura, a abertura da sessão, o desfazer e o orçamento de spawn lento: as REAIS, extraídas do mesmo arquivo (nada de dublê do código sob teste)
+FNS="$FN"
+for _f in _pilot_wa_node_spawn_mode _pilot_wa_node_read _pilot_wa_node_open _pilot_wa_node_settle _pilot_node_remote_open _pilot_node_remote_rollback _pilot_slow_spawn_budget_spent _pilot_note_spawn_timing gc_json_or_unknown; do
+  _b="$(fn_of "$_f")"
+  [ -n "$_b" ] || { echo "FATAL: $_f() não está em $DISPATCHER" >&2; exit 2; }
+  FNS="$FNS"$'\n'"$_b"
+done
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/wa-node-route.XXXXXX")" || exit 2
 trap 'rm -rf "$T"' EXIT
@@ -68,7 +82,14 @@ printf '%s\n' "$*" >> "${FAKE_BD_LOG:-/dev/null}"
 exit 0
 EOF
 chmod +x "$T/bin/bd"
-export PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bdcalls"
+cat > "$T/bin/gc" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FAKE_GC_LOG:-/dev/null}"
+echo "gc falso: o modo pool não chama o gc" >&2
+exit 64
+EOF
+chmod +x "$T/bin/gc"
+export PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bdcalls" FAKE_GC_LOG="$T/gccalls"
 # bead <arquivo> <status> <assignee> <rota> [id] — grava o JSON da bead falsa (o formato de `bd show --json`: um array com um objeto)
 bead() {
   jq -cn --arg id "${5:-$ID}" --arg s "$2" --arg a "$3" --arg r "$4" '[{id:$id,status:$s,assignee:$a,metadata:(if $r=="" then {} else {"gc.routed_to":$r} end)}]' > "$1"
@@ -80,13 +101,13 @@ export FAKE_BEAD="$T/bead.free.json"     # padrão: bead livre (nada do nó); os
 # decide <modo|-> <id> <store> <alvo> [rc] [dry]  → imprime o rc da função; deixa FAKE_LOG, FAKE_BD_LOG e o jsonl em $T
 decide() {
   local mode="$1" id="$2" store="$3" tgt="$4" rc="${5:-0}" dry="${6:-0}"
-  : > "$T/calls"; : > "$T/bdcalls"; : > "$T/err"; rm -f "$T/city/.gc/wa-node-route.jsonl"
+  : > "$T/calls"; : > "$T/bdcalls"; : > "$T/gccalls"; : > "$T/err"; rm -f "$T/city/.gc/wa-node-route.jsonl"
   if [ "$mode" = "-" ]; then
     env -u PILOT_WA_NODE_ROUTE GC_CITY="$T/city" PILOT_WA_NODE_SCRIPTS="${SCRIPTS_DIR:-$T/scripts}" FAKE_LOG="$T/calls" FAKE_RC="$rc" DRY_RUN="$dry" \
-      bash -c "$PRELUDE"$'\n'"$FN"$'\n''_pilot_wa_node_decide "$@"; echo "rc=$?"' _ "$id" "$store" "$tgt" 2>"$T/err" | tail -1
+      bash -c "$PRELUDE"$'\n'"$FNS"$'\n''_pilot_wa_node_decide "$@"; echo "rc=$?"' _ "$id" "$store" "$tgt" 2>"$T/err" | tail -1
   else
     PILOT_WA_NODE_ROUTE="$mode" GC_CITY="$T/city" PILOT_WA_NODE_SCRIPTS="${SCRIPTS_DIR:-$T/scripts}" FAKE_LOG="$T/calls" FAKE_RC="$rc" DRY_RUN="$dry" \
-      bash -c "$PRELUDE"$'\n'"$FN"$'\n''_pilot_wa_node_decide "$@"; echo "rc=$?"' _ "$id" "$store" "$tgt" 2>"$T/err" | tail -1
+      bash -c "$PRELUDE"$'\n'"$FNS"$'\n''_pilot_wa_node_decide "$@"; echo "rc=$?"' _ "$id" "$store" "$tgt" 2>"$T/err" | tail -1
   fi
 }
 calls() { cat "$T/calls"; }
@@ -123,6 +144,8 @@ r=$(decide auto $ID $ST wa-worker 0)
 [ "$r" = "rc=0" ] && ok "auto com rc 0: foi para o nó" || fail "auto rc=0 → $r"
 calls | grep -q "^apply $ID --store $ST --basis any\$" && ok "auto chama 'apply … --basis any'" || fail "auto args: $(calls)"
 check "a linha gravada tem modo auto, rc 0 e a saída do script" bash -c "jq -e 'select(.mode==\"auto\" and .rc==0 and .out==\"fake\")' '$T/city/.gc/wa-node-route.jsonl'"
+check "a linha gravada diz o modo de abrir a sessão (pool) e 1 slot" bash -c "jq -e 'select(.spawn==\"pool\" and .slots==1)' '$T/city/.gc/wa-node-route.jsonl'"
+[ ! -s "$T/gccalls" ] && ok "modo pool: o gancho não chama o gc (quem abre a sessão é o pool)" || fail "modo pool chamou o gc: $(cat "$T/gccalls")"
 
 # --- só o rc 0 é "foi para o nó"; escrita incerta é 2 ---
 for m in label auto; do
@@ -250,7 +273,8 @@ bash -n "$DISPATCHER" && ok "bash -n do pilot-dispatcher.sh" || fail "bash -n do
 if [ -z "${WA_NODE_ROUTE_SELFTEST_FILE:-}" ]; then
   echo
   echo "=== C. mutantes (cada um tem de derrubar o selftest) ==="
-  mutate() { # mutate <nome> <python: s = ...>
+  JOBS="${WA_NODE_ROUTE_ST_JOBS:-4}"; MUT_NAMES=""
+  mutate() { # mutate <nome> <python: s = ...> — aplica na hora, roda em segundo plano (no máximo $JOBS juntos); o veredito sai no fim, em ordem
     local n="$1" code="$2"
     cp "$DISPATCHER" "$T/mut.$n.sh"
     MUT_FILE="$T/mut.$n.sh" python3 -I -c '
@@ -262,7 +286,9 @@ o = s
 assert s != o, "mutante não mudou nada"
 open(p, "w", encoding="utf-8").write(s)
 ' || { fail "mutante $n: não consegui aplicar"; return; }
-    if WA_NODE_ROUTE_SELFTEST_FILE="$T/mut.$n.sh" bash "$SELF" >/dev/null 2>&1; then fail "mutante $n SOBREVIVEU"; else ok "mutante $n morto"; fi
+    while [ "$(jobs -r | wc -l | tr -d ' ')" -ge "$JOBS" ]; do sleep 0.2; done
+    ( if WA_NODE_ROUTE_SELFTEST_FILE="$T/mut.$n.sh" bash "$SELF" >/dev/null 2>&1; then echo SOBREVIVEU; else echo morto; fi > "$T/res.$n" ) &
+    MUT_NAMES="$MUT_NAMES $n"
   }
   mutate padrao-auto      's = s.replace("PILOT_WA_NODE_ROUTE:-off", "PILOT_WA_NODE_ROUTE:-auto", 1)'
   mutate modo-livre       's = s.replace("case \"$_mode\" in shadow|label|auto) ;; *) return 1 ;; esac", "case \"$_mode\" in shadow|label|auto) ;; *) ;; esac", 1)'
@@ -272,7 +298,7 @@ open(p, "w", encoding="utf-8").write(s)
   mutate timeout-vira-mini 's = s.replace("13|124|137|143)", "13)", 1)'
   mutate sinal-vira-mini  's = s.replace("12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5])", "99999)", 1)'
   mutate sinal-largo-demais 's = s.replace("12[89]|1[3-9][0-9]|", "12[5-9]|1[3-9][0-9]|", 1)'
-  mutate qualquer-rc-vale 's = s.replace("    *) return 1 ;;\n  esac\n  log \"  ga-2hd02v.1.10: $_id assigned", "    *) ;;\n  esac\n  log \"  ga-2hd02v.1.10: $_id assigned", 1)'
+  mutate qualquer-rc-vale 's = s.replace("    *) return 1 ;;\n  esac\n  if [ \"$_PWN_SPAWN\" = pilot ]; then", "    *) ;;\n  esac\n  if [ \"$_PWN_SPAWN\" = pilot ]; then", 1)'
   mutate sem-filtro-alvo  's = s.replace("  [ \"$_tgt\" = \"wa-worker\" ] || return 1\n", "", 1)'
   mutate sem-filtro-id    's = s.replace("  case \"$_id\" in wa-*) ;; *) return 1 ;; esac\n", "", 1)'
   mutate label-vira-any   's = s.replace("  [ \"$_mode\" = label ] && _basis=label\n", "", 1)'
@@ -290,10 +316,17 @@ open(p, "w", encoding="utf-8").write(s)
   mutate outro-id-vale    's = s.replace("select(type==\"object\" and .id == $id)", "select(type==\"object\")", 1)'
   mutate sem-script       's = s.replace("  if [ ! -x \"$_dir/wa-node-dispatch.sh\" ]; then", "  if false; then", 1)'
   mutate braco-fora-de-ordem 's = s.replace("      wa-worker-remote)\n", "      wa-worker-remoteX)\n", 1)'
-  mutate braco-cria-sessao 's = s.replace("no spawn here, the pool creates the session\"\n", "no spawn here, the pool creates the session\"\n        gc --city \"$GC_CITY\" session new wa-worker-remote --no-attach\n", 1)'
-  mutate braco-carimba-rota 's = s.replace("no spawn here, the pool creates the session\"\n", "no spawn here, the pool creates the session\"\n        bd -C \"$STORY_BEAD_CITY\" update \"$STORY_ID\" --set-metadata \"gc.routed_to=wa-worker\" -q\n", 1)'
+  mutate braco-cria-sessao 's = s.replace("the hook already opened it)\"\n", "the hook already opened it)\"\n        gc --city \"$GC_CITY\" session new wa-worker-remote --no-attach\n", 1)'
+  mutate braco-carimba-rota 's = s.replace("the hook already opened it)\"\n", "the hook already opened it)\"\n        bd -C \"$STORY_BEAD_CITY\" update \"$STORY_ID\" --set-metadata \"gc.routed_to=wa-worker\" -q\n", 1)'
+  # o modo pool tem de ser o do script de sempre: sem a sessão do gancho e sem desfazer (o arquivo irmão ...wa-node-spawn.selftest.sh prova o modo pilot)
+  mutate pool-abre-sessao 's = s.replace("  if [ \"$_PWN_SPAWN\" = pilot ]; then\n    # o apply só escreveu", "  if true; then\n    # o apply só escreveu", 1)'
   mutate rc2-nao-solta    's = s.replace("elif [ \"$_RP_NODE_RC\" = 2 ]; then", "elif false; then", 1)'
   mutate chamada-antes-do-guarda 'a = s.index("        # ── ga-2hd02v.1.10: Hetzner node, DEFAULT OFF"); b = s.index("        : # pool: leave UNASSIGNED"); blk = s[a:b]; s = s[:a] + s[b:]; k = s.index("        if [ \"${PILOT_OWNERSHIP_GUARD:-1}\" = \"1\" ]; then", s.index("      wa-worker*|ps-worker*)")); s = s[:k] + blk + s[k:]'
+  wait
+  for n in $MUT_NAMES; do
+    if [ "$(cat "$T/res.$n" 2>/dev/null)" = morto ]; then ok "mutante $n morto"; else fail "mutante $n SOBREVIVEU"; fi
+  done
+  echo "  ($(echo $MUT_NAMES | wc -w | tr -d ' ') mutantes)"
 fi
 
 echo

@@ -12005,7 +12005,7 @@ _pilot_node_only_wa_route_on() {
 }
 
 # _pilot_node_only_wa_pre <bead-json> — exit 0 iff a bead de WA é, ANTES da claim, candidata do nó na passada só-nó. Nenhuma escrita: o que se lê é o JSON da candidata (jq) e UMA sonda por candidata,
-# `wa-node-dispatch.sh apply --dry-run` (a conferência do apply de verdade: bead livre, filtro de dado de lead, slot do nó = 1, sessões; sai 0 só se IRIA ao nó). Sem a sonda, o slot do nó (1, ocupado por dezenas
+# `wa-node-dispatch.sh apply --dry-run` (a conferência do apply de verdade: bead livre, filtro de dado de lead, slots do nó (1, ou N em PILOT_WA_NODE_SPAWN=pilot), sessões; sai 0 só se IRIA ao nó). Sem a sonda, o slot do nó (cheio, ocupado por dezenas
 # de minutos) faria toda candidata de WA ser claimada e solta a cada varredura — 5 escritas no Dolt do mini por bead, o desperdício que a passada só-nó existe para não ter. A sonda leva de 1 a ~26 s (runbook do
 # nó de WA: 26 s com o slot livre, porque lista as sessões): daí o teto por varredura (PILOT_WA_NODE_ONLY_PROBES, padrão 6; valor ilegível volta ao padrão). A loja da bead é a que o routes.jsonl diz para o prefixo
 # (o padrão do script); o apply de verdade, em dispatch_one, usa a de $STORY_BEAD_CITY e reconfere tudo.
@@ -12027,7 +12027,8 @@ _pilot_node_only_wa_pre() {
   _dir="${PILOT_WA_NODE_SCRIPTS:-$GC_CITY/scripts}"
   [ -x "$_dir/wa-node-dispatch.sh" ] || return 1
   _PNW_PROBES=$((_PNW_PROBES + 1))
-  timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --dry-run --basis "$_basis" >/dev/null 2>&1 || _rc=$?
+  # modo e N de slots iguais aos do apply de verdade (ga-2hd02v.3): vazio → o script assume pool e 1 slot; ilegível → o script cai no mesmo pool/1 (a sonda nunca acha vaga que o apply não acharia)
+  WA_NODE_SPAWN="${PILOT_WA_NODE_SPAWN:-}" WA_NODE_SLOTS="${PILOT_WA_NODE_SLOTS:-}" timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --dry-run --basis "$_basis" >/dev/null 2>&1 || _rc=$?
   [ "$_rc" = 0 ]
 }
 
@@ -12237,7 +12238,10 @@ _pilot_node_first_dispatch() {
 #       que já é do nó, e 12 lido como "nada escrito" carimbava gc.routed_to=wa-worker por cima da rota do nó e criava sessão do mini, uma varredura depois de uma escrita que pegou e não deu para confirmar;
 #   (b) a escrita pode ter acontecido e não sei dizer (rc 13 do script, o prazo estourou no meio, ou o script morreu por sinal, rc >= 128).
 # A leitura de (a) só roda em label/auto: em off a função volta antes de ler qualquer coisa e em shadow nada muda no despacho.
-# Não cria sessão: o pool a cria (receita da ga-2hd02v.1.6); o slot do nó é 1.
+# Dois modos de abrir a sessão (PILOT_WA_NODE_SPAWN, ver _pilot_wa_node_spawn_mode):
+#   pool   (padrão, o da 1.10 byte a byte) o gancho NÃO cria sessão: o pool a cria (receita da ga-2hd02v.1.6); o slot do nó é 1.
+#   pilot  (ga-2hd02v.3) o gancho abre a sessão do alias que o script escolheu (_pilot_wa_node_open: a receita que o dog-remote provou) e o N de slots vem de PILOT_WA_NODE_SLOTS; o script consulta o oráculo de
+#          capacidade antes de escrever. Qualquer falha de abrir a sessão desfaz a escrita e a bead segue no mini.
 # vazio → n/a (o classificador sempre responde node/mini/unknown); falhou/ilegível antes de escrever (rc 10/11/12) → igual a mini: 1 (a bead já foi lida como "não é do nó"; a que é do nó não chega aqui).
 # A leitura do slot e das sessões tem os três estados dentro do wa-node-dispatch.sh (ocupado ou "não sei" = não vai).
 _pilot_wa_node_decide() {
@@ -12262,16 +12266,22 @@ _pilot_wa_node_decide() {
     return 1
   fi
   [ "$_mode" = label ] && _basis=label
+  _pilot_wa_node_spawn_mode
   if [ "$_mode" = shadow ]; then
     _out=$(timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" check "$_id" --store "$_store" 2>/dev/null) || _rc=$?
   elif [ "${DRY_RUN:-0}" = "1" ]; then
-    _out=$(timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --store "$_store" --basis "$_basis" --dry-run 2>/dev/null) || _rc=$?
+    _out=$(WA_NODE_SPAWN="$_PWN_SPAWN" WA_NODE_SLOTS="$_PWN_SLOTS" timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --store "$_store" --basis "$_basis" --dry-run 2>/dev/null) || _rc=$?
   else
-    _out=$(timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --store "$_store" --basis "$_basis" 2>/dev/null) || _rc=$?
+    # modo pilot: a sessão lenta deste sweep já gastou o orçamento de spawn → nem escreve (o apply grava a bead; sem poder abrir a sessão seria só um desfazer a mais). Nada escrito → 1 (segue no mini).
+    if [ "$_PWN_SPAWN" = pilot ] && _pilot_slow_spawn_budget_spent; then
+      log "  ga-2hd02v.3: $_id fica no mini — uma sessão lenta já gastou o orçamento de spawn deste sweep (uma por sweep); nada escrito"
+      return 1
+    fi
+    _out=$(WA_NODE_SPAWN="$_PWN_SPAWN" WA_NODE_SLOTS="$_PWN_SLOTS" timeout "${PILOT_WA_NODE_TIMEOUT:-90}" "$_dir/wa-node-dispatch.sh" apply "$_id" --store "$_store" --basis "$_basis" 2>/dev/null) || _rc=$?
   fi
   mkdir -p "$GC_CITY/.gc" 2>/dev/null || true
-  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_id" --arg m "$_mode" --argjson rc "$_rc" --arg o "$_out" \
-    '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,rc:$rc,out:$o}' >> "$GC_CITY/.gc/wa-node-route.jsonl" 2>/dev/null || true
+  jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg b "$_id" --arg m "$_mode" --argjson rc "$_rc" --arg o "$_out" --arg sp "$_PWN_SPAWN" --argjson sl "$_PWN_SLOTS" \
+    '{ts:$ts,event:"pilot-node-route",bead:$b,mode:$m,rc:$rc,out:$o,spawn:$sp,slots:$sl}' >> "$GC_CITY/.gc/wa-node-route.jsonl" 2>/dev/null || true
   [ "$_mode" = shadow ] && return 1
   if [ "${DRY_RUN:-0}" = "1" ]; then
     # só o rc 0 do `apply --dry-run` diz "iria ao nó"; 10/11/12 e o resto = não iria (ou o script não soube dizer), e o log não anuncia o que o script não disse
@@ -12281,12 +12291,162 @@ _pilot_wa_node_decide() {
   fi
   case "$_rc" in
     0) ;;
-    13|124|137|143) warn "wa-node: $_id — resultado da escrita desconhecido (rc=$_rc); não despacho esta varredura"; return 2 ;;
+    13|124|137|143) warn "wa-node: $_id — resultado da escrita desconhecido (rc=$_rc); não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; return 2 ;;
     # morto por qualquer outro sinal (128+n: HUP 129, INT 130, QUIT 131, ABRT 134, SEGV 139, PIPE 141...) = o mesmo "não sei se já escreveu"; 125-127 (o timeout falhou, não deu para executar, não achou) e o resto: nada rodou
-    12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5]) warn "wa-node: $_id — o despachante morreu por sinal (rc=$_rc); a escrita pode ter acontecido; não despacho esta varredura"; return 2 ;;
+    12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5]) warn "wa-node: $_id — o despachante morreu por sinal (rc=$_rc); a escrita pode ter acontecido; não despacho esta varredura"; _pilot_wa_node_settle "$_id" "$_store"; return 2 ;;
     *) return 1 ;;
   esac
+  if [ "$_PWN_SPAWN" = pilot ]; then
+    # o apply só escreveu (dono + marca); a sessão do alias é do gancho: 0 aberta e avisada · 1 desfeito e confirmado (segue no mini) · 2 segura
+    _pilot_wa_node_open "$_id" "$_store"
+    return $?
+  fi
   log "  ga-2hd02v.1.10: $_id assigned to the node (wa-worker-remote); the pool creates the session"
+  return 0
+}
+
+# ── ga-2hd02v.3: o nó de WA em N slots — a sessão aberta pelo PILOT (PILOT_WA_NODE_SPAWN=pilot) ──────────────────────────────
+# O `apply` do modo pilot só ESCREVE: dono = wa-worker-remote-<k> e a marca pilot.wa_node_alias = o mesmo alias (SEM gc.routed_to: o pool não a vê e não abre uma 2ª sessão; o crew-session-dedup mataria uma das duas).
+# Quem abre a sessão desse alias é o gancho, com a receita que o dog-remote já provou em produção (_pilot_node_first_dispatch): ler as sessões → `session new --alias` (ou `session wake` se o alias dorme)
+# → `session nudge`; qualquer falha DESFAZ a escrita e a bead segue no mini. As peças de abrir e de desfazer não sabem de WA (template, alias, bead, loja, título e a CHAVE da marca entram por argumento):
+# a bead de PS pelo nó usa as mesmas.
+
+# _pilot_wa_node_spawn_mode — lê PILOT_WA_NODE_SPAWN e PILOT_WA_NODE_SLOTS e deixa o resultado em _PWN_SPAWN (pool|pilot) e _PWN_SLOTS (1..9). Roda no shell de quem chama (nunca por $(...)).
+# vazio (variável ausente ou vazia) → pool com 1 slot, o desenho da 1.10 byte a byte; falhou/ilegível (qualquer valor que não seja exatamente "pilot"; SLOTS que não seja UM dígito de 1 a 9: 0, 10, "3 ", -1, 2.5) → pool / 1,
+# o estado inerte: erro de digitação nunca vira "mais sessões". O script wa-node-dispatch.sh lê as mesmas variáveis com a mesma regra, e o Pilot só confia no que ELE decidiu.
+_pilot_wa_node_spawn_mode() {
+  _PWN_SPAWN=pool; _PWN_SLOTS=1
+  [ "${PILOT_WA_NODE_SPAWN:-}" = pilot ] || return 0
+  _PWN_SPAWN=pilot
+  case "${PILOT_WA_NODE_SLOTS:-1}" in [1-9]) _PWN_SLOTS="${PILOT_WA_NODE_SLOTS:-1}" ;; esac
+  return 0
+}
+
+# _pilot_wa_node_read <id> <loja> — lê a bead e deixa _PWR_STATUS, _PWR_ALIAS (o dono), _PWR_MARK (pilot.wa_node_alias) e _PWR_TITLE (sem CR, LF e "|"). Devolve 0, ou 1 se não leu.
+# vazio (dono ou marca ausentes: o bd omite a chave vazia) → string vazia, que é o estado livre; falhou/ilegível (bd falhou, saída vazia ou que o jq não lê, bead de OUTRO id, sem status em texto) → 1 e _PWR_* vazios:
+# quem chama NÃO trata como "livre".
+_pilot_wa_node_read() {
+  local _rd_id="${1:-}" _rd_store="${2:-}" _rd_json="" _rd_rec=""
+  _PWR_STATUS=""; _PWR_ALIAS=""; _PWR_MARK=""; _PWR_TITLE=""
+  _rd_json=$(timeout "${PILOT_WA_NODE_READ_TIMEOUT:-20}" bd -C "$_rd_store" show "$_rd_id" --json 2>/dev/null) || return 1
+  _rd_rec=$(printf '%s' "$_rd_json" | jq -r --arg id "$_rd_id" 'if type == "array" then .[0] else . end | select(type == "object" and .id == $id and (.status | type == "string")) | [.status, (.assignee // ""), (.metadata["pilot.wa_node_alias"] // ""), ((.title // "") | gsub("[\r\n|]"; " "))] | join("|")' 2>/dev/null) || return 1
+  [ -n "$_rd_rec" ] || return 1
+  IFS='|' read -r _PWR_STATUS _PWR_ALIAS _PWR_MARK _PWR_TITLE <<EOF_PWR
+$_rd_rec
+EOF_PWR
+  return 0
+}
+
+# _pilot_node_remote_rollback <alias> <id> <loja> <sessao_tocada 0|1> <chave_da_marca> — desfaz o despacho ao nó: fecha a sessão (se chegou a tocar nela), solta a bead e CONFIRMA lendo. Devolve 0 SÓ quando a releitura
+# mostra a bead livre (sem dono, sem a marca, open); 1 quando não dá para confirmar (a bead pode ainda estar com o alias, com outro dono, ou ilegível).
+# Mesma ordem do dog (_pilot_node_first_rollback): 1º a sessão, depois a bead — uma sessão viva com a bead solta a acharia pelo GC_ALIAS e o mini a construiria também. A soltura é UMA escrita guardada
+# (--if-assignee <alias>: nunca pisa em quem pegou a bead depois; rc 1 e rc 13 caem os dois na releitura, que decide) e põe o status de volta a open (o `release` do script NÃO faz isso: só limpa dono e marca).
+# vazio (sem sessão tocada) → pula o close; falhou (o close que falha) → avisa alto e solta a bead mesmo assim: ela nunca fica presa no nó. Releitura vazia/ilegível/sem status → 1 (NÃO confirmado).
+_pilot_node_remote_rollback() {
+  local _rb_alias="$1" _rb_id="$2" _rb_store="$3" _rb_sess="${4:-0}" _rb_key="$5" _rb_json="" _rb_rec="" _rb_asg="" _rb_st="" _rb_mk=""
+  if [ "$_rb_sess" = "1" ]; then
+    timeout 20 gc --city "$GC_CITY" session close "$_rb_alias" >/dev/null 2>&1 \
+      || warn "ga-2hd02v.3: não consegui fechar a sessão $_rb_alias ao desfazer o despacho de $_rb_id (esperado se ela nem chegou a nascer) — solto a bead mesmo assim: ela nunca fica presa no nó"
+  fi
+  timeout 15 bd -C "$_rb_store" update "$_rb_id" --if-assignee "$_rb_alias" --assignee "" --status open --unset-metadata "$_rb_key" -q >/dev/null 2>&1 || true
+  _rb_json=$(timeout 15 bd -C "$_rb_store" show "$_rb_id" --json 2>/dev/null) || _rb_json=""
+  _rb_rec=$(printf '%s' "$_rb_json" | jq -r --arg id "$_rb_id" --arg k "$_rb_key" 'if type == "array" then .[0] else . end | select(type == "object" and .id == $id and (.status | type == "string")) | "\(.assignee // "")|\(.status)|\(.metadata[$k] // "")"' 2>/dev/null) || _rb_rec=""
+  if [ -z "$_rb_rec" ]; then
+    warn "ga-2hd02v.3: não consegui ler $_rb_id para confirmar o desfazer do despacho ao nó (alias $_rb_alias) — NÃO mando a bead ao mini; o claim fica para o TTL"
+    return 1
+  fi
+  _rb_asg="${_rb_rec%%|*}"; _rb_rec="${_rb_rec#*|}"; _rb_st="${_rb_rec%%|*}"; _rb_mk="${_rb_rec#*|}"
+  if [ -z "$_rb_asg" ] && [ "$_rb_st" = open ] && [ -z "$_rb_mk" ]; then return 0; fi
+  warn "ga-2hd02v.3: o desfazer do despacho de $_rb_id ao nó (alias $_rb_alias) não se confirmou — a bead está com assignee='${_rb_asg:-}' status='$_rb_st' marca='${_rb_mk:-}'; NÃO mando ao mini (podia ser construída duas vezes); o claim fica para o TTL"
+  return 1
+}
+
+# _pilot_node_remote_open <template> <alias> <id> <loja> <titulo> <chave_da_marca> — abre (ou acorda) a sessão <template> com o alias a que a bead JÁ foi atribuída e a avisa. Devolve 0 = sessão aberta e avisada ·
+# 1 = falhou, o despacho foi desfeito e CONFIRMADO (bead livre e open: segue no mini) · 2 = SEGURA (o desfazer não se confirmou: a bead pode estar com o alias; NÃO a mande ao mini).
+# Uma sessão lenta (prazo ou >= PILOT_SLOW_SPAWN_SECS) gasta o orçamento de spawn do sweep (_pilot_note_spawn_timing, que tem de rodar no shell de quem chama).
+# vazio (nenhuma sessão viva tem o alias) → `session new`; só sessões do <template> dormindo → `session wake` (o idle_timeout põe a sessão para dormir SEM soltar o alias); falhou/ilegível (lista que não leu, sem o array
+# .sessions, alias ocupado por sessão viva ou de outro template, jq que falha) → NÃO abre: desfaz. O que conta como viva é o que o script conta (nem closed, nem closed|stopped|archived|drained): os dois têm de concordar,
+# senão o script escolheria para sempre um alias que o gancho recusa.
+_pilot_node_remote_open() {
+  local _ro_tpl="$1" _ro_alias="$2" _ro_id="$3" _ro_store="$4" _ro_title="$5" _ro_key="$6" _ro_sj="" _ro_st="" _ro_rc=0 _ro_t0=0 _ro_step="" _ro_sess=0 _ro_msg=""
+  _ro_sj=$(gc_json_or_unknown timeout 20 gc --city "$GC_CITY" session list --json) || _ro_sj=""
+  if ! printf '%s' "$_ro_sj" | jq -e '.sessions | type == "array"' >/dev/null 2>&1; then
+    _ro_step="não consegui ler a lista de sessões"
+  else
+    _ro_st=$(printf '%s' "$_ro_sj" | jq -r --arg a "$_ro_alias" --arg t "$_ro_tpl" '
+      [.sessions[] | select(type == "object" and .closed != true and .alias == $a) | select((.state // "") | test("closed|stopped|archived|drained") | not)] as $h
+      | if ($h | length) == 0 then "new"
+        elif ($h | all(.template == $t and .state == "asleep")) then "asleep"
+        else "busy" end' 2>/dev/null) || _ro_st=""
+    case "$_ro_st" in
+      new|asleep) ;;
+      busy) _ro_step="o alias já tem uma sessão viva (ou de outro template)" ;;
+      *) _ro_step="não consegui decidir entre abrir e acordar a sessão" ;;
+    esac
+  fi
+  if [ -z "$_ro_step" ]; then
+    _ro_sess=1; _ro_rc=0; _ro_t0=$SECONDS
+    if [ "$_ro_st" = asleep ]; then
+      timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session wake "$_ro_alias" >/dev/null 2>&1 || _ro_rc=$?
+    else
+      timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session new "$_ro_tpl" --alias "$_ro_alias" --no-attach \
+        --title-hint "build $_ro_id: $_ro_title" >/dev/null 2>&1 || _ro_rc=$?
+    fi
+    _pilot_note_spawn_timing "$_ro_rc" "$_ro_t0"
+    if [ "$_ro_rc" -ne 0 ]; then
+      _ro_step="a sessão ($_ro_st) não abriu (rc=$_ro_rc)"
+      if [ "$_ro_rc" = "124" ]; then _ro_step="$_ro_step — estourou o prazo: ela pode ter nascido"; fi
+    fi
+  fi
+  if [ -z "$_ro_step" ]; then
+    _ro_msg="Bead nova para você: $_ro_id — $_ro_title. Ela já está atribuída ao seu alias (GC_ALIAS=$_ro_alias): ache com 'bd list --status in_progress --assignee \"\$GC_ALIAS\" --json --limit 5' e siga o seu protocolo."
+    _ro_rc=0
+    timeout 15 gc --city "$GC_CITY" session nudge "$_ro_alias" "$_ro_msg" >/dev/null 2>&1 || _ro_rc=$?
+    [ "$_ro_rc" -eq 0 ] || _ro_step="o aviso falhou (rc=$_ro_rc)"
+  fi
+  if [ -n "$_ro_step" ]; then
+    warn "ga-2hd02v.3: nó ($_ro_tpl): $_ro_id → $_ro_alias: $_ro_step — desfaço a escrita e a bead segue no mini"
+    if _pilot_node_remote_rollback "$_ro_alias" "$_ro_id" "$_ro_store" "$_ro_sess" "$_ro_key"; then return 1; fi
+    return 2
+  fi
+  log "  ga-2hd02v.3: $_ro_id foi ao nó — alias $_ro_alias (sessão $_ro_st), avisada"
+  return 0
+}
+
+# _pilot_wa_node_open <id> <loja> — modo pilot, logo depois do apply que devolveu 0. Relê a bead para saber QUAL alias o script escolheu e abre a sessão dele. Mesmo contrato do decide: 0 aberta e avisada ·
+# 1 desfeito e confirmado (segue no mini) · 2 segura.
+# vazio (dono ou marca vazios) → 2 sem escrever; falhou/ilegível (bead que não leu, dono que não é wa-worker-remote-1..9, marca diferente do dono, status que não é in_progress) → 2 SEM escrever: não é o que o apply
+# escreve, e desfazer por cima de uma bead que outro mexeu pisaria nele; a próxima varredura relê.
+_pilot_wa_node_open() {
+  local _wo_id="${1:-}" _wo_store="${2:-}" _wo_rc=0
+  if ! _pilot_wa_node_read "$_wo_id" "$_wo_store"; then
+    warn "wa-node: não consegui reler $_wo_id depois do apply — não sei a qual alias abrir a sessão; seguro: sem sessão e sem desfazer; a próxima varredura relê"
+    return 2
+  fi
+  case "$_PWR_ALIAS" in
+    wa-worker-remote-[1-9]) ;;
+    *) warn "wa-node: $_wo_id depois do apply está com dono '${_PWR_ALIAS:-}' (esperava wa-worker-remote-<1-9>) — seguro: sem sessão e sem desfazer; a próxima varredura relê"; return 2 ;;
+  esac
+  if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then
+    warn "wa-node: $_wo_id depois do apply está com marca '${_PWR_MARK:-}' e status '$_PWR_STATUS' (esperava marca=$_PWR_ALIAS e in_progress) — seguro: sem sessão e sem desfazer; a próxima varredura relê"
+    return 2
+  fi
+  _pilot_node_remote_open wa-worker-remote "$_PWR_ALIAS" "$_wo_id" "$_wo_store" "$_PWR_TITLE" pilot.wa_node_alias || _wo_rc=$?
+  return "$_wo_rc"
+}
+
+# _pilot_wa_node_settle <id> <loja> — SÓ no modo pilot, depois de um rc incerto do apply (13, prazo, sinal). A escrita pode ter pegado e então NINGUÉM abriria a sessão (no modo pool o pool a abre sozinho, pela rota; aqui a
+# marca não é rota): a bead ficaria dona de um alias sem sessão e toda varredura a seguraria como "já é do nó". Desfaz SÓ o que tem a cara do que o apply escreve (in_progress, dono wa-worker-remote-<1-9>, marca igual ao dono).
+# vazio (bead livre: a escrita não pegou) → não escreve nada; falhou/ilegível (a bead não leu) → não escreve nada (não sei o que há lá); dono, marca ou status de outro jeito → não toca (é de outro). Em modo pool não faz nada
+# (o 2 do decide continua valendo como sempre). Quem chama devolve 2 (segura) de qualquer jeito: desfazer só tira o impasse da próxima varredura, e o rollback não confirmado só avisa.
+_pilot_wa_node_settle() {
+  local _se_id="${1:-}" _se_store="${2:-}"
+  [ "$_PWN_SPAWN" = pilot ] || return 0
+  _pilot_wa_node_read "$_se_id" "$_se_store" || return 0
+  case "$_PWR_ALIAS" in wa-worker-remote-[1-9]) ;; *) return 0 ;; esac
+  if [ "$_PWR_MARK" != "$_PWR_ALIAS" ] || [ "$_PWR_STATUS" != in_progress ]; then return 0; fi
+  warn "wa-node: $_se_id ficou com o alias $_PWR_ALIAS depois de um apply incerto e sem sessão — desfaço (a próxima varredura tenta de novo)"
+  _pilot_node_remote_rollback "$_PWR_ALIAS" "$_se_id" "$_se_store" 0 pilot.wa_node_alias || true
   return 0
 }
 
@@ -14161,8 +14321,9 @@ TASK
           fi
         fi
         # ── ga-2hd02v.1.10: Hetzner node, DEFAULT OFF (PILOT_WA_NODE_ROUTE, see _pilot_wa_node_decide) ──
-        # rc 0 = the bead is already assigned to wa-worker-remote-1 with gc.routed_to=wa-worker-remote: the spawn case below
-        # then has its own arm (no gc session new, no gc.routed_to=wa-worker). rc 1: nothing was written, the pool path runs.
+        # rc 0 = the bead is already assigned to the node. Mode pool (default): to wa-worker-remote-1 with gc.routed_to=wa-worker-remote; mode pilot
+        # (PILOT_WA_NODE_SPAWN=pilot, ga-2hd02v.3): to wa-worker-remote-<k> with the marker pilot.wa_node_alias and the hook has already opened and nudged the
+        # session. Either way the spawn case below has its own arm (no gc session new, no gc.routed_to=wa-worker). rc 1: nothing was left written, the pool path runs.
         # rc 2: the write may have landed and we can't tell — release our claim and stand down; the next sweep re-reads.
         local _RP_NODE_RC=0
         _pilot_wa_node_decide "$STORY_ID" "$STORY_BEAD_CITY" "$_SLING_TARGET" || _RP_NODE_RC=$?
@@ -14298,10 +14459,10 @@ TASK
     # and revert to nudge-only (for debugging; bead stays unassigned+routed until manual start).
     case "$_SLING_TARGET" in
       wa-worker-remote)
-        # ga-2hd02v.1.10: assigned and routed by wa-node-dispatch.sh. The POOL creates the session (the ga-2hd02v.1.6 recipe): a
-        # gc session new here would make two sessions and crew-session-dedup drops one. gc.routed_to is already wa-worker-remote;
-        # stamping wa-worker would send the bead to the mini's pool as well.
-        log "  ga-2hd02v.1.10: $STORY_ID → wa-worker-remote (node) — no spawn here, the pool creates the session"
+        # ga-2hd02v.1.10: assigned (and, in pool mode, routed) by wa-node-dispatch.sh. In pool mode the POOL creates the session (the
+        # ga-2hd02v.1.6 recipe); in pilot mode _pilot_wa_node_open already did. A gc session new HERE would make two sessions and
+        # crew-session-dedup drops one. Stamping wa-worker would send the bead to the mini's pool as well.
+        log "  ga-2hd02v.1.10: $STORY_ID → wa-worker-remote (node) — no spawn here (the pool creates the session; in pilot mode the hook already opened it)"
         ;;
       wa-worker*)
         # Set gc.routed_to so RoutedPoolQuery finds the unassigned bead AND the supervisor
