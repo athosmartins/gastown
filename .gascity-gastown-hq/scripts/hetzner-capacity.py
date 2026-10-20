@@ -2,7 +2,7 @@
 """hetzner-capacity.py — o teto de sessões do nó Hetzner por MEDIÇÃO e o veredito "nó ou mini". ga-2hd02v.1.11. Python 3.9+, só biblioteca padrão.
 
 Contents
-  Para que serve · Comandos · Os degraus · O veredito · Sessão ocupada × ociosa · Três estados · Arquivos · O que NÃO faz
+  Para que serve · Comandos · Os degraus · Meta: encher o nó · O veredito · Sessão ocupada × ociosa · Três estados · Arquivos · O que NÃO faz
 
 PARA QUE SERVE
   O mini vive em swap; o nó (16 núcleos, 32 GB, sem swap) fica ocioso. Esta ferramenta responde duas perguntas com número medido, nunca com chute:
@@ -14,6 +14,9 @@ COMANDOS  (todos aceitam --json; --dir muda a pasta de estado)
             (inclui erro interno nosso: reason "internal"; um traceback do Python sairia 1, que aqui é MINI, por isso `main` pega tudo).
             Quem chama trata 1 e 2 do mesmo jeito (fica no mini); a diferença está no motivo, para o log.
   step      o mesmo ciclo (mede se vencido, avalia, grava) sem dar veredito. Para um agendador. exit 0 se rodou, 3 se não conseguiu gravar/ler a configuração (ou erro interno).
+            O agendador (com.gascity.hetzner-capacity-step, a cada 180 s) é o relógio das leituras: o degrau não pode depender de o Pilot pedir veredito (ga-2hd02v.2).
+  hourly    só LÊ readings.jsonl: CPU OCUPADA (100 - ocioso) média por hora cheia UTC das últimas --hours (24) horas completas. exit 0 = toda hora tem leitura e média >= --min-pct (85),
+            1 = alguma hora abaixo ou SEM leitura (hora sem leitura não prova nada: não é 0% nem é OK), 3 = não consegui ler o arquivo. É a consulta da prova ao vivo da meta.
   status    só LÊ (sem ssh, sem gravar): degrau, leituras, o que falta para subir, tetos fixos (cap do provider) e as condições do veredito.
   read      uma medição avulsa, nada é gravado. exit 0 lida, 1 não consegui, 3 erro de configuração/estado ou interno.
   set-ceiling N --reason T   força um degrau (só os da lista), registrado em events.jsonl. O ciclo seguinte continua a partir dele.
@@ -25,10 +28,19 @@ OS DEGRAUS
   o degrau atual com carga; `require_load_proof=false` dispensa). Só vale como prova a leitura em que o gc e o bd foram LIDOS (`idle_why` vazio): leitura em que um deles
   falhou ou estourou o prazo não prova nada (nem veta: as outras leituras da janela seguem valendo), e a gravada antes da separação ocupada×ociosa também não.
   Leitura que falhou NÃO é verde: atrasa a subida, nunca a adianta.
-  Desce UM degrau com `down_reads` leituras seguidas vermelhas (CPU livre < `cpu_down_headroom_pct` OU RAM < `mem_down_avail_pct`). A faixa entre os
-  limites é âmbar: mantém o degrau. Leitura que falhou não é vermelha: sem leitura, o degrau fica como está (e o veredito vira "não sei").
+  Desce UM degrau com `down_reads` leituras seguidas com a RAM < `mem_down_avail_pct`. A CPU cheia NÃO derruba o degrau (ga-2hd02v.2, ver "Meta"); `cpu_lowers_ceiling=true` devolve a
+  regra antiga (CPU livre < `cpu_down_headroom_pct` também desce). A faixa entre os limites é âmbar: mantém o degrau. Leitura que falhou não é vermelha: sem leitura, o degrau
+  fica como está (e o veredito vira "não sei").
   CPU livre = o MENOR entre o ocioso de uma amostra de 2 s do /proc/stat e (1 - load5/núcleos): rajada curta e carga sustentada contam as duas.
-  O nó não tem swap: RAM acabando é morte de sessão, por isso a RAM pesa tanto quanto a CPU.
+  O nó não tem swap: RAM acabando é morte de sessão, por isso a RAM é o limite duro do degrau.
+
+META: ENCHER O NÓ  (ga-2hd02v.2: o Athos quer o nó SEMPRE ocupado, por quem for; "o que não pode é ficar menos de 100%")
+  (1) Relógio próprio: as leituras vêm do `step` agendado (a cada 180 s), não da varredura do Pilot (25-40 min, ~2 leituras por janela: o degrau nunca subia).
+  (2) Verde = sobra para mais uma sessão: CPU livre >= `cpu_up_headroom_pct` (10: ~1,6 núcleo dos 16; era 35, que cortava a cidade em ~65% do nó) e RAM >= `mem_up_avail_pct`.
+      A janela é de `up_window_s` (480 s) com `up_min_reads` (3) leituras: a escada 1→3→6→10 sobe em ~27 min com carga, não em horas.
+  (3) O degrau só desce por RAM. A CPU ocupada por quem NÃO é sessão da cidade (o Traço BIM do Athos) não o derruba: o veredito do momento diz `node_hot` (CPU livre < `cpu_down_headroom_pct`,
+      3) e a bead NOVA vai ao mini enquanto durar, mas o degrau fica e, na leitura seguinte à saída da carga (<= 3 min), o veredito volta a ser `node` com as vagas todas.
+  Não distingue quem usa a CPU (sessão da cidade × externo): a cidade não derruba o degrau por CPU, e a CPU quente barra a bead nova no veredito do momento.
 
 O VEREDITO  (a primeira condição que falha decide; só `node` autoriza)
   pausa → MINI · config do provider ilegível → NÃO SEI · `real_sessions_released_by` ausente → MINI · config do atalho ilegível → NÃO SEI ·
@@ -93,17 +105,18 @@ READ_TIMEOUT_BD_S = 15       # `bd list --status in_progress --json` leva ~3 s; 
 DEFAULTS = {
     "host": "hetzner",                 # chave em session-ssh.json → hosts
     "steps": [1, 3, 6, 10],
-    "cpu_up_headroom_pct": 35.0,
-    "cpu_down_headroom_pct": 10.0,
+    "cpu_up_headroom_pct": 10.0,       # verde = sobra para mais uma sessão (~1,6 núcleo dos 16). Era 35: a cidade nunca levava o nó acima de ~65% (ga-2hd02v.2)
+    "cpu_down_headroom_pct": 3.0,       # abaixo disto o veredito do momento é `node_hot` (a bead nova vai ao mini). Só derruba o degrau com cpu_lowers_ceiling
     "mem_up_avail_pct": 40.0,
     "mem_down_avail_pct": 20.0,
-    "up_window_s": 1800,
-    "up_min_reads": 6,
+    "up_window_s": 480,                # com o `step` a cada 180 s cabem 3 leituras: ~9 min por degrau. Era 1800 s e 6 leituras, sobre o ritmo do Pilot (~2 por janela)
+    "up_min_reads": 3,
     "down_reads": 2,
     "refresh_s": 60,                   # a leitura é refeita no máximo a cada tanto (o Pilot pode chamar o veredito a cada varredura)
     "max_age_s": 900,                  # leitura mais velha que isto não autoriza nada
     "ssh_timeout_s": 25,
     "require_load_proof": True,
+    "cpu_lowers_ceiling": False,       # False: só a RAM desce o degrau (o nó não tem swap). True: a regra antiga, CPU livre < cpu_down_headroom_pct também desce
 }
 MAX_READINGS = 500
 LOG_MAX_BYTES = 2_000_000
@@ -172,8 +185,9 @@ def load_config(path: str) -> dict:
         raise ConfigError(f"{path}: max_age_s ({cfg['max_age_s']}) tem que ser MAIOR que refresh_s ({cfg['refresh_s']}), senão toda leitura fica velha antes de ser refeita")
     if not isinstance(cfg["host"], str) or not cfg["host"]:
         raise ConfigError(f"{path}: host tem que ser texto não vazio")
-    if not isinstance(cfg["require_load_proof"], bool):
-        raise ConfigError(f"{path}: require_load_proof tem que ser true/false")
+    for k in ("require_load_proof", "cpu_lowers_ceiling"):
+        if not isinstance(cfg[k], bool):
+            raise ConfigError(f"{path}: {k} tem que ser true/false")
     return cfg
 
 
@@ -427,6 +441,15 @@ def color(r: dict, cfg: dict) -> str:
 
 # ───────────────────────────────── os degraus ─────────────────────────────────
 
+def lowers_ceiling(r: dict, cfg: dict) -> bool:
+    """A leitura conta para DESCER o degrau? (ga-2hd02v.2) Só a RAM abaixo de `mem_down_avail_pct` (o nó não tem swap). A CPU cheia não: quem a ocupa pode não ser sessão da
+    cidade (o Traço BIM do Athos), a meta é o nó cheio, e a CPU quente já barra a bead NOVA no veredito do momento (node_hot). `cpu_lowers_ceiling=true` devolve a regra antiga."""
+    # vazio/falhou/ilegível (leitura que não é ok, ou sem CPU/RAM numéricas) → cor `unknown` → não desce: sem leitura o degrau fica como está
+    if color(r, cfg) != "red":
+        return False
+    return cfg["cpu_lowers_ceiling"] or r["mem_avail_pct"] < cfg["mem_down_avail_pct"]
+
+
 def decide(st: dict, cfg: dict, now: int) -> dict:
     """{'action': up|down|hold, 'to': degrau, 'why': texto, 'unmet': [o que falta para subir]}. Pura: só olha o estado, a política e a hora."""
     steps, cur, reads = cfg["steps"], st["ceiling"], st["readings"]
@@ -435,10 +458,10 @@ def decide(st: dict, cfg: dict, now: int) -> dict:
     i = steps.index(cur)
     since = [r for r in reads if r["t"] > st["changed_at"]]      # evidência do degrau ATUAL: a leitura que provocou a mudança não vale duas vezes
     last = since[-cfg["down_reads"]:]
-    if i > 0 and len(last) >= cfg["down_reads"] and all(color(r, cfg) == "red" for r in last):
+    if i > 0 and len(last) >= cfg["down_reads"] and all(lowers_ceiling(r, cfg) for r in last):
         r = last[-1]
         return {"action": "down", "to": steps[i - 1], "unmet": [],
-                "why": f"{cfg['down_reads']} leituras seguidas vermelhas (CPU livre {r.get('cpu_headroom_pct')}%, RAM {r.get('mem_avail_pct')}%)"}
+                "why": f"{cfg['down_reads']} leituras seguidas vermelhas (CPU livre {r.get('cpu_headroom_pct')}%, RAM {r.get('mem_avail_pct')}%)" + ("" if cfg["cpu_lowers_ceiling"] else ": a RAM derruba o degrau")}
     if i == len(steps) - 1:
         return {"action": "hold", "to": cur, "why": "já no último degrau", "unmet": []}
     unmet = []
@@ -617,6 +640,72 @@ def verdict(env: Env, cfg: dict, st: dict, now: int) -> dict:
     return out("node", "free_slot", f"{r['sessions']} de {base['effective']} sessões ocupadas{idle_note(r)}; CPU livre {r['cpu_headroom_pct']}%, RAM {r['mem_avail_pct']}%")
 
 
+# ───────────────────────────────── CPU por hora (a prova ao vivo da meta) ─────────────────────────────────
+
+def read_readings(path: str) -> tuple:
+    """(leituras, linhas ruins) de um readings.jsonl. Linha que não é objeto JSON com `t` inteiro é contada e pulada: não vira leitura nem zero."""
+    # vazio (arquivo ausente) → ([], 0): nada medido ainda; falhou/ilegível (existe e não abre) → OSError sobe e o comando erra com rc 3, nunca "sem leitura"
+    try:
+        f = open(path, encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return [], 0
+    out, bad = [], 0
+    with f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                o = json.loads(line)
+            except (ValueError, RecursionError):
+                bad += 1
+                continue
+            if isinstance(o, dict) and isinstance(o.get("t"), int) and not isinstance(o["t"], bool):
+                out.append(o)
+            else:
+                bad += 1
+    return out, bad
+
+
+def hourly(env: Env, now: int, hours: int, min_pct: float) -> dict:
+    """CPU OCUPADA (100 - ocioso da amostra de 2 s) por hora cheia UTC, nas últimas `hours` horas COMPLETAS (a hora corrente, parcial, não entra).
+    Hora sem nenhuma leitura ok é `sem_leitura` (não prova nada: nem 0% nem OK); leitura que falhou (nó fora, ilegível) conta em `falhas` e fica fora da média."""
+    rows, bad = [], 0
+    for p in (env.readings + ".1", env.readings):         # o rotacionado primeiro; arquivo ausente = nada
+        got, b = read_readings(p)
+        rows += got
+        bad += b
+    cur = now // 3600
+    busy = {h: [] for h in range(cur - hours, cur)}         # a CPU ocupada de cada leitura ok, por hora
+    fails = {h: 0 for h in busy}
+    for r in rows:
+        h = r["t"] // 3600
+        if h not in busy:
+            continue
+        idle = r.get("cpu_idle_pct")
+        if r.get("state") == "ok" and is_num(idle) and 0 <= idle <= 100:
+            busy[h].append(100.0 - idle)
+        else:
+            fails[h] += 1
+    out = []
+    for h, v in busy.items():
+        mean = sum(v) / len(v) if v else None
+        out.append({"hour": time.strftime("%Y-%m-%dT%HZ", time.gmtime(h * 3600)), "ok": len(v), "falhas": fails[h],
+                    "media": None if mean is None else round(mean, 1), "min": round(min(v), 1) if v else None, "max": round(max(v), 1) if v else None,
+                    "status": "sem_leitura" if mean is None else ("abaixo" if mean < min_pct else "ok")})
+    return {"min_pct": min_pct, "hours": out, "bad_lines": bad, "all_ok": all(x["status"] == "ok" for x in out)}
+
+
+def hourly_text(res: dict) -> str:
+    lines = []
+    for x in res["hours"]:
+        s = f"{x['hour']}  {x['ok']:3d} leituras  " + (f"CPU ocupada média {x['media']}% (mín {x['min']}, máx {x['max']})" if x["ok"] else "SEM LEITURA")
+        s += f"  +{x['falhas']} falhas" if x["falhas"] else ""
+        s += f"  ABAIXO de {res['min_pct']:g}%" if x["status"] == "abaixo" else ""
+        lines.append(s)
+    lines.append(("tudo >= " + f"{res['min_pct']:g}%" if res["all_ok"] else "NÃO provado: há hora abaixo de " + f"{res['min_pct']:g}%" + " ou sem leitura") + (f" ({res['bad_lines']} linhas ruins puladas)" if res["bad_lines"] else ""))
+    return "\n".join(lines)
+
+
 # ───────────────────────────────── linha de comando ─────────────────────────────────
 
 def say(args, obj: dict, text: str) -> None:
@@ -638,6 +727,9 @@ def main(argv=None) -> int:
     sc.add_argument("--reason", required=True)
     pz = sub.add_parser("pause", parents=[common])
     pz.add_argument("--reason", required=True)
+    hp = sub.add_parser("hourly", parents=[common])
+    hp.add_argument("--hours", type=int, default=24)
+    hp.add_argument("--min-pct", type=float, default=85.0)
     args = ap.parse_args(argv)
     env = Env(args.dir)
     try:
@@ -681,6 +773,13 @@ def main(argv=None) -> int:
                    "last": dict(last, color=color(last, cfg)) if last else None, "next": d, "provider": caps, "paused": present(env.pause)}
             say(args, obj, f"degrau {st['ceiling']} há {obj['since_s']}s ({st['changed_why']}); {obj['reads']} leituras; próximo: {d['action']} — {d['why']}; provider {caps}")
             return 0
+        if args.cmd == "hourly":
+            if not 1 <= args.hours <= 720 or not 0 <= args.min_pct <= 100:      # nan também cai aqui (toda comparação com nan é falsa)
+                print(f"hourly: --hours tem que estar em 1..720 e --min-pct em 0..100 (veio {args.hours} e {args.min_pct})", file=sys.stderr)
+                return 3
+            res = hourly(env, now, args.hours, args.min_pct)
+            say(args, res, hourly_text(res))
+            return 0 if res["all_ok"] else 1
         if args.cmd == "set-ceiling":
             if args.n not in cfg["steps"]:
                 print(f"{args.n} não é um degrau ({cfg['steps']})", file=sys.stderr)

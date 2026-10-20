@@ -29,6 +29,13 @@
 #     (sem idle_why) NÃO provam carga — nem vetam: uma leitura que falhou no meio de leituras ocupadas lidas ainda deixa subir ·
 #     PRAZO: gc e bd correm em PARALELO (o custo é o maior prazo, não a soma: o gc leva 10-21 s no mini carregado e o Pilot dá 40 s ao veredito inteiro) · estourar o prazo
 #     de qualquer um é ilegível (ocupadas, motivo 'prazo') · HETZNER_CAPACITY_READ_TIMEOUT_S só encurta o prazo e o valor inválido cai no padrão.
+#   encher o nó (g_fill, ga-2hd02v.2; sem config.json = os padrões de verdade — os outros grupos fixam a política ANTIGA no config.json da cidade de teste, em `LEGACY`, para provar o
+#     mecanismo com números explícitos): padrões (10% livre para subir, 3% = quente, janela de 480 s com 3 leituras, só a RAM desce) · a escada sobe 1→3→6→10 em 27 min no ritmo do job
+#     (180 s) e o relógio curto NÃO dispensa a prova de carga · 12,5% livre é verde, 6% âmbar, 2% vermelho · veredito autoriza com 4% livre e barra com 2% · CPU em 2% livre por 10 leituras
+#     (carga externa) NÃO derruba o degrau, o veredito é node_hot enquanto dura e volta a NÓ com as vagas todas na leitura seguinte · a RAM < 20% desce com 2 leituras seguidas (falha no
+#     meio quebra a sequência) · cpu_lowers_ceiling=true devolve a regra antiga e valor que não é bool é NÃO SEI · o plist agenda `step` a cada 180 s e o ciclo cabe em refresh_s / max_age_s.
+#   CPU por hora (g_hourly, ga-2hd02v.2): média = 100 - ocioso por hora cheia UTC, só as horas COMPLETAS · hora sem leitura é sem_leitura (rc 1), nunca 0% nem ok · leitura que falhou fica
+#     fora da média e entra em falhas · linha ruim é contada e pulada · lê o readings.jsonl.1 · arquivo que não abre é erro (rc 3), não "sem leitura" · --hours / --min-pct inválidos = rc 3.
 # CONTROLE NEGATIVO: ilegível contado como verde · sem prova de carga · degrau que pula · evidência que vale duas vezes · `present()` que engole erro · veredito sem o
 #   gate_done · cap ignorado · `>` no lugar de `>=` na vaga · sessões ilegíveis viram 0 · leitura velha autoriza · leitura sem `state` válida · leitura no futuro autoriza ·
 #   vermelho só com CPU E RAM · âmbar vira verde · `max` no lugar de `min` na CPU · estado ilegível recomeça · falha de ssh vira leitura ok · load5 `nan` aceito ·
@@ -37,7 +44,10 @@
 #   bead de qualquer dono / só a primeira bead / saída não-lista vira "ninguém trabalha" · sessão sem alias, gate-reviewer / wa-worker e dog-remote-adhoc contam ociosas ·
 #   bead no nome da sessão não vale · o veredito conta todas as vivas · sessão fantasma sem dog-remote · leituras em sequência · prazo estourado vira lista vazia ·
 #   prazo de teste que alonga o padrão · prazo inválido/<=0 vira quase zero · prova de carga que aceita leitura com idle_why com motivo / sem idle_why — cada um é aplicado numa cópia e a bateria TEM que falhar.
-# VARIÁVEIS: HC_UNDER_TEST (script a testar) · HC_PY (interpretador; padrão /usr/bin/python3 = o 3.9 do mini) · HC_NO_MUTANTS=1 · HC_ONLY=<grupo> (só g_<grupo>: read, step, verdict, third, idle; sem mutantes)
+#   (ga-2hd02v.2) a CPU cheia derruba o degrau · decide() volta à regra antiga · a RAM não derruba · leitura que falhou/âmbar desce · padrões de volta (35%, 1800 s, 10%, cpu_lowers_ceiling) ·
+#   bool não validado · hourly: hora sem leitura como ok, falha na média, hora parcial, arquivo que não abre como vazio, linha ruim que derruba, linha sem t, --min-pct ignorado, rc 0 sempre, .1 não lido.
+# VARIÁVEIS: HC_UNDER_TEST (script a testar) · HC_PY (interpretador; padrão /usr/bin/python3 = o 3.9 do mini) · HC_NO_MUTANTS=1 · HC_ONLY=<grupo> (só g_<grupo>: read, step, verdict, third, idle, fill, hourly; sem mutantes)
+#   HC_MGROUPS (uso interno do `mutant`: quais grupos a cópia mutada roda; vazio = todos)
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 P="${HC_UNDER_TEST:-$HERE/hetzner-capacity.py}"
@@ -124,7 +134,12 @@ mkcfg() {  # mkcfg CAP [released]
 }
 mkshim() { printf '{"city":"/c","gate_done_bin":%s}\n' "${1-\"$GDB\"}" > "$SHIM"; }
 RT=""      # RT=N → HETZNER_CAPACITY_READ_TIMEOUT_S=N (encurta o prazo das leituras de gc/bd); newcity zera
-newcity() { RT=""; D="$T/d.$((++nd))"; mkdir -p "$D"; mkcfg 10; mkshim; node 70 3 90; sess 3; busy all; rm -f "$W/ssh.calls" "$W/ssh.sleep" "$W/list.rc" "$W/list.extra" "$W"/gcl.* "$W"/bd.*; NOW=$T0; }
+# A política ANTIGA (ga-2hd02v.1.11: verde com 35% livre, 6 leituras em 1800 s, CPU também desce o degrau) fica FIXADA no config.json da cidade de teste: os grupos de mecanismo
+# (g_read, g_step, g_verdict, g_third, g_idle) provam o ciclo, o veredito e o terceiro estado com números explícitos, não com os padrões. Os padrões da meta de encher o nó
+# (ga-2hd02v.2) são do g_fill / g_hourly, que usam `fillcity` (sem config.json).
+LEGACY='"cpu_up_headroom_pct":35,"cpu_down_headroom_pct":10,"up_window_s":1800,"up_min_reads":6,"cpu_lowers_ceiling":true'
+newcity() { RT=""; D="$T/d.$((++nd))"; mkdir -p "$D"; printf '{%s}\n' "$LEGACY" > "$D/config.json"; mkcfg 10; mkshim; node 70 3 90; sess 3; busy all; rm -f "$W/ssh.calls" "$W/ssh.sleep" "$W/list.rc" "$W/list.extra" "$W"/gcl.* "$W"/bd.*; NOW=$T0; }
+fillcity() { newcity; rm -f "$D/config.json"; }
 nd=0
 hc() {  # hc ARGS → $OUT (stdout), $RC
   OUT=$(HETZNER_CAPACITY_DIR="$D" GC_SSH_CONFIG="$SSHJ" HETZNER_CAPACITY_SHIM_CONFIG="$SHIM" HETZNER_CAPACITY_NOW="$NOW" \
@@ -192,7 +207,7 @@ g_step() {
   newcity; sess 0; node 70 3 90; series 0 2400 300
   check "step: nó verde mas NUNCA com sessões >= degrau → não sobe (prova de carga)" "1" "$(ceil)"
   hc --json status; check "status: diz que falta a prova de carga" "1" "$(printf '%s' "$OUT" | grep -c 'prova de carga')"
-  printf '{"require_load_proof":false}' > "$D/config.json"; at 2700; hc --json step
+  printf '{"require_load_proof":false,%s}' "$LEGACY" > "$D/config.json"; at 2700; hc --json step
   check "step: require_load_proof=false dispensa a prova" "3" "$(jget ceiling)"
 
   newcity; sess 1; node 70 3 90; series 0 600 300; node 70 3 30; at 900; hc --json step
@@ -445,9 +460,118 @@ sp=importlib.util.spec_from_file_location("hc",sys.argv[1]); m=importlib.util.mo
   done
 }
 
-if [ -n "${HC_MUTANT:-}" ]; then g_third; g_read; g_step; g_verdict; g_idle; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
+# ga-2hd02v.2: a meta de ENCHER O NÓ, com os padrões de verdade (fillcity = sem config.json). O Athos: "o que não pode é ficar menos do que 100% ocupado".
+g_fill() {
+  r=$("$PY" -I -c 'import importlib.util,sys
+sp=importlib.util.spec_from_file_location("hc",sys.argv[1]); m=importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+d=m.DEFAULTS; print(d["cpu_up_headroom_pct"], d["cpu_down_headroom_pct"], d["up_window_s"], d["up_min_reads"], d["down_reads"], d["cpu_lowers_ceiling"])' "$P" 2>&1 | tail -1)
+  check "padrões: verde com 10% de CPU livre, quente abaixo de 3%, janela de 480 s com 3 leituras, 2 leituras para descer, só a RAM desce o degrau" "10.0 3.0 480 3 2 False" "$r"
+
+  # (1)+(2) a escada sobe em MINUTOS com o ritmo do job (180 s), não em horas: 1 → 3 → 6 → 10 em 27 min
+  fillcity; sess 1; node 70 3 90; busy all; series 0 360 180
+  check "encher: 360 s (2 leituras contadas) ainda no degrau 1" "1" "$(ceil)"
+  at 540; hc --json step; check "encher: 540 s, 3 leituras verdes em 480 s e 1 sessão ocupada → sobe para 3 (antes: 30 min e 6 leituras, que o ritmo do Pilot nunca dava)" "3" "$(jget ceiling)"
+  sess 3; series 720 900 180; check "encher: 360 s depois do 3 ainda é 3 (não pula)" "3" "$(ceil)"
+  at 1080; hc --json step; check "encher: 1080 s, 3 → 6" "6" "$(jget ceiling)"
+  sess 6; series 1260 1440 180; check "encher: 360 s depois do 6 ainda é 6" "6" "$(ceil)"
+  at 1620; hc --json step; check "encher: 1620 s (27 min) → 10" "10" "$(jget ceiling)"
+  newcity; rm -f "$D/config.json"; sess 3; busy none; node 70 3 90; series 0 1800 180
+  check "encher: o relógio mais curto NÃO dispensa a prova de carga (3 sessões ociosas, 30 min verdes → fica no 1)" "1" "$(ceil)"
+
+  # (2) verde = sobra para mais uma sessão: 12,5% de CPU livre (nó a ~87% de uso) sobe; 35% livre era exigir o nó a 65%
+  fillcity; node 85 14 90; hc --json read
+  check "cor: CPU livre 12,5% é VERDE (cabe mais uma sessão); com o limite antigo de 35% era âmbar" "12.5 green" "$(jget cpu_headroom_pct) $(jget color)"
+  node 85 15 90; hc --json read; check "cor: CPU livre 6,2% é âmbar (entre 3 e 10: segura o degrau, o nó ainda recebe)" "amber" "$(jget color)"
+  node 2 3 90; hc --json read; check "cor: CPU livre 2% é vermelho (nó saturado)" "red" "$(jget color)"
+  fillcity; sess 0; node 4 3 90; at 10; hc --json verdict
+  check "veredito: CPU livre 4% (nó a 96%) ainda é NÓ — quente é abaixo de 3%" "0 node" "$RC $(jget verdict)"
+  node 2 3 90; at 100; hc --json verdict; check "veredito: CPU livre 2% → MINI node_hot" "1 node_hot" "$RC $(jget reason)"
+
+  # (3) CPU ocupada por quem NÃO é sessão da cidade (o Traço BIM) não derruba o degrau; quando a carga sai, o veredito volta ao NÓ na leitura seguinte, com as vagas todas
+  fillcity; sess 0; hc --json set-ceiling 6 --reason t; node 2 40 90; series 180 1800 180
+  check "externa: 10 leituras com CPU em 2% livre (load5 40/16) NÃO derrubam o degrau 6" "6" "$(ceil)"
+  at 1800; hc --json verdict; check "externa: enquanto dura, o veredito do momento é MINI node_hot (bead nova não vai a nó saturado)" "1 local node_hot" "$RC $(jget verdict) $(jget reason)"
+  node 70 3 90; at 1980; hc --json verdict
+  check "externa: a carga saiu → NÓ na leitura seguinte (<= 3 min), com as 6 vagas: o degrau não caiu, não há subida de horas a refazer" "0 node 6" "$RC $(jget verdict) $(jget free)"
+  # controle: a RAM continua sendo o limite duro. 2 leituras com RAM < 20% descem o degrau, uma só não, e leitura que falhou no meio não conta
+  fillcity; sess 0; hc --json set-ceiling 6 --reason t; node 70 3 15; at 180; hc --json step
+  check "RAM 15%: UMA leitura vermelha não desce" "6" "$(jget ceiling)"
+  at 360; hc --json step; check "RAM 15%: 2 leituras seguidas descem 6 → 3 (o nó não tem swap)" "3" "$(jget ceiling)"
+  fillcity; sess 0; hc --json set-ceiling 6 --reason t; node 70 3 15; at 180; hc --json step; echo 255 > "$W/ssh.rc"; at 240; hc --json step; node 70 3 15; at 300; hc --json step
+  check "RAM 15%, FALHOU, RAM 15%: falha não é vermelha e quebra a sequência → não desce" "6" "$(jget ceiling)"
+  fillcity; sess 0; hc --json set-ceiling 6 --reason t; node 2 3 15; at 180; hc --json step; at 360; hc --json step
+  check "CPU E RAM vermelhas: a RAM desce" "3" "$(jget ceiling)"
+  # a regra antiga continua à mão do Mayor: cpu_lowers_ceiling=true
+  fillcity; sess 0; printf '{"cpu_lowers_ceiling":true}' > "$D/config.json"; hc --json set-ceiling 6 --reason t; node 2 3 90; at 180; hc --json step; at 360; hc --json step
+  check "cpu_lowers_ceiling=true devolve a regra antiga: 2 leituras com CPU 2% livre descem o degrau" "3" "$(jget ceiling)"
+  printf '{"cpu_lowers_ceiling":"sim"}' > "$D/config.json"; hc --json verdict
+  check "config: cpu_lowers_ceiling que não é true/false → NÃO SEI config (rc 2), não 'verdadeiro'" "2 config" "$RC $(jget reason)"
+
+  # (1) o relógio é do job: o plist agenda `step` a cada 180 s e a leitura de um ciclo perdido ainda vale
+  PL="$HERE/com.gascity.hetzner-capacity-step.plist"
+  r=$("$PY" -I -c 'import plistlib,sys
+try: d=plistlib.load(open(sys.argv[1],"rb"))
+except Exception as e: print("ilegivel", type(e).__name__); sys.exit(0)
+a=d.get("ProgramArguments") or []
+print(d.get("Label"), d.get("StartInterval"), a[-1] if a else None, bool(len(a) > 1 and a[-2].endswith("/scripts/hetzner-capacity.py")), (d.get("EnvironmentVariables") or {}).get("GC_CITY_PATH"))' "$PL" 2>&1 | tail -1)
+  check "job: o plist agenda hetzner-capacity.py step a cada 180 s (o relógio da leitura é do job, não do Pilot)" "com.gascity.hetzner-capacity-step 180 step True /Users/athos/gt/.gascity-gastown-hq" "$r"
+  r=$("$PY" -I -c 'import importlib.util,plistlib,sys
+sp=importlib.util.spec_from_file_location("hc",sys.argv[1]); m=importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+try: iv=plistlib.load(open(sys.argv[2],"rb")).get("StartInterval")
+except Exception as e: print("ilegivel", type(e).__name__); sys.exit(0)
+d=m.DEFAULTS; print(isinstance(iv, int) and d["refresh_s"] <= iv and d["max_age_s"] >= 3 * iv and d["up_window_s"] >= 2 * iv and d["up_window_s"] >= d["up_min_reads"] * iv // 2)' "$P" "$PL" 2>&1 | tail -1)
+  check "job: todo ciclo mede (refresh_s <= 180), um ciclo perdido não envelhece a leitura (max_age_s >= 3 x 180) e a janela cabe 3 leituras" "True" "$r"
+}
+
+# ga-2hd02v.2: a consulta da prova ao vivo. Hora SEM leitura não é 0% nem OK; leitura que falhou fica fora da média; linha ruim é contada e pulada.
+g_hourly() {
+  rd() {  # rd HORA SEG IDLE [STATE] → uma linha em readings.jsonl (HORA = horas depois de T0; SEG = segundos dentro da hora)
+    printf '{"t":%s,"state":"%s","cpu_idle_pct":%s,"mem_avail_pct":90.0,"sessions":0}\n' "$((T0 + $1 * 3600 + $2))" "${4:-ok}" "$3" >> "${RDF:-$D/readings.jsonl}"
+  }
+  hj() { printf '%s' "$OUT" | "$PY" -I -c 'import sys,json
+d=json.load(sys.stdin); print(" ".join(h["status"] for h in d["hours"]), d["all_ok"], d["bad_lines"])'; }
+  hf() { printf '%s' "$OUT" | "$PY" -I -c 'import sys,json
+h=json.load(sys.stdin)["hours"][int(sys.argv[1])]; print(h["media"], h["ok"], h["falhas"], h["status"])' "$1"; }
+  RDF=""; newcity; for h in 0 1 2; do rd $h 100 10; rd $h 1000 12; rd $h 2000 8; done
+  at $((3 * 3600 + 100)); hc --json hourly --hours 3
+  check "hourly: 3 horas completas com ~90% de CPU ocupada → rc 0, todas ok" "0 ok ok ok True 0" "$RC $(hj)"
+  check "hourly: a média é 100 - ocioso (10, 12, 8 → 90.0, 3 leituras)" "90.0 3 0 ok" "$(hf 0)"
+  hc hourly --hours 3; check "hourly: sem --json imprime uma linha por hora e o veredito" "4 1" "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ') $(printf '%s' "$OUT" | grep -c 'tudo >= 85%')"
+  check "hourly: não grava nada nem chama o ssh" "0" "$(calls)"
+  rd 1 3000 60; rd 1 3100 60; rd 1 3200 60; hc --json hourly --hours 3
+  check "hourly: a hora 1 puxada para baixo (média ~65%) → rc 1, abaixo" "1 ok abaixo ok False 0" "$RC $(hj)"
+  hc hourly --hours 3; check "hourly: o texto aponta a hora ABAIXO de 85%" "1" "$(printf '%s' "$OUT" | grep -c 'ABAIXO de 85%')"
+  hc --json hourly --hours 3 --min-pct 60; check "hourly: --min-pct 60 → a mesma hora passa" "0 True" "$RC $(hj | cut -d' ' -f4)"
+
+  RDF=""; newcity; for h in 0 1; do rd $h 100 10; rd $h 1000 10; done
+  at $((3 * 3600 + 100)); hc --json hourly --hours 3
+  check "hourly: hora SEM leitura (a 2) é sem_leitura, não 0% e não ok → rc 1" "1 ok ok sem_leitura False" "$RC $(hj | cut -d' ' -f1-4)"
+  RDF=""; newcity; hc --json hourly --hours 2; at 7300; hc --json hourly --hours 2
+  check "hourly: sem readings.jsonl nenhum → todas sem_leitura, rc 1 (nem erro nem 'tudo certo')" "1 sem_leitura sem_leitura False" "$RC $(hj | cut -d' ' -f1-3)"
+
+  RDF=""; newcity; for h in 0 1; do rd $h 100 10; rd $h 1000 10; done
+  rd 0 2000 0 unreachable; rd 0 2100 0 unreadable; rd 0 2200 100 ok
+  at $((2 * 3600 + 100)); hc --json hourly --hours 2
+  check "hourly: leitura que falhou (cpu_idle 0 no registro) fica FORA da média e entra em falhas; a ok com 100% ocioso entra (90, 90, 0 → 60.0)" "60.0 3 2 abaixo" "$(hf 0)"
+  RDF=""; newcity; for h in 0 1; do rd $h 100 10; rd $h 1000 10; done
+  printf 'isto não é json\n{"t":"x"}\n{"state":"ok"}\n\n' >> "$D/readings.jsonl"; at $((2 * 3600 + 100)); hc --json hourly --hours 2
+  check "hourly: linha que não é JSON / sem t inteiro é CONTADA (3) e pulada; as boas seguem valendo" "0 ok ok True 3" "$RC $(hj)"
+
+  # o arquivo rotacionado (.1) também conta; a hora corrente (parcial) não entra
+  RDF="$T/rot.jsonl"; rm -f "$RDF"; newcity; RDF="$D/readings.jsonl.1"; rd 0 100 10; rd 0 1000 10; RDF="$D/readings.jsonl"; rd 1 100 10; rd 1 1000 10; rd 2 100 100; rd 2 200 100
+  at $((2 * 3600 + 3000)); hc --json hourly --hours 2
+  check "hourly: lê o readings.jsonl.1 e deixa de fora a hora corrente (a 2, 0% ocupada): 2 horas, ambas ok" "0 ok ok True 0" "$RC $(hj)"
+
+  RDF=""; newcity; rd 0 100 10; at 4000; chmod 000 "$D/readings.jsonl"; hc --json hourly --hours 1; r="$RC $(grep -c Traceback "$W/err")"; chmod 600 "$D/readings.jsonl"
+  check "hourly: readings.jsonl que existe e não abre → erro rc 3, sem traceback (NÃO 'sem leitura')" "3 0" "$r"
+  newcity; at 4000; hc --json hourly --hours 0; r="$RC"; hc --json hourly --hours 721; r="$r $RC"; hc --json hourly --min-pct 101; r="$r $RC"; hc --json hourly --min-pct nan; r="$r $RC"
+  check "hourly: --hours fora de 1..720 e --min-pct fora de 0..100 (ou nan) → rc 3" "3 3 3 3" "$r"
+  RDF=""
+}
+
+if [ -n "${HC_MUTANT:-}" ]; then for g in ${HC_MGROUPS:-third read step verdict idle fill hourly}; do "g_$g"; done; echo "RESULT $fails/$n"; [ "$fails" = 0 ]; exit $?; fi
 if [ -n "${HC_ONLY:-}" ]; then "g_$HC_ONLY"; echo "── $((n - fails))/$n ok (só g_$HC_ONLY)"; [ "$fails" = 0 ]; exit $?; fi
-g_read; g_step; g_verdict; g_third; g_idle
+g_fill; g_hourly; g_read; g_step; g_verdict; g_third; g_idle
 
 [ -n "${HC_NO_MUTANTS:-}" ] || {
   echo "── controle negativo: cada mutante tem que reprovar a bateria ──"
@@ -459,7 +583,7 @@ s=open(sys.argv[1],encoding="utf-8").read()
 if s.count(sys.argv[2])!=1: sys.exit(3)
 open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))' "$P" "$2" "$3" "$m"
     if [ $? -ne 0 ]; then ok 1 "mutante '$1': a âncora não casa exatamente 1 vez (o script mudou?)"; return; fi
-    local r; r=$(HC_MUTANT=1 HC_UNDER_TEST="$m" bash "$0" 2>&1 | tail -1)
+    local r; r=$(HC_MUTANT=1 HC_MGROUPS="${MG:-}" HC_UNDER_TEST="$m" bash "$0" 2>&1 | tail -1)      # MG=grupos: o mutante da lógica nova só roda os grupos que o pegam
     case "$r" in "RESULT 0/"*) ok 1 "mutante '$1' NÃO foi pego ($r)";; "RESULT "*) ok 0 "mutante '$1' pego ($r)";; *) ok 1 "mutante '$1': sem resultado ($r)";; esac
   }
   mutant "leitura que falhou conta como verde" 'if r.get("state") != "ok" or not is_num(r.get("cpu_headroom_pct")) or not is_num(r.get("mem_avail_pct")):
@@ -526,6 +650,33 @@ open(sys.argv[4],"w",encoding="utf-8").write(s.replace(sys.argv[2],sys.argv[3]))
   mutant "sem dog-remote no nó, conta uma sessão fantasma" 'return others, 0, ""' 'return others + 1, 0, ""'
   mutant "a prova de carga aceita leitura com gc/bd não lidos (idle_why com motivo)" ' and r.get("idle_why") == "" and r["sessions"] >= cur' ' and r["sessions"] >= cur'
   mutant "a prova de carga aceita leitura sem idle_why (anterior à separação ocupada×ociosa)" 'r.get("idle_why") == ""' 'not r.get("idle_why")'
+  # ga-2hd02v.2 (encher o nó): cada mutante da lógica nova só roda os grupos que o pegam (MG)
+  MG=fill mutant "a CPU cheia derruba o degrau (a regra antiga)" 'return cfg["cpu_lowers_ceiling"] or r["mem_avail_pct"] < cfg["mem_down_avail_pct"]' 'return True'
+  MG=fill mutant "decide() volta a descer por qualquer leitura vermelha" 'all(lowers_ceiling(r, cfg) for r in last)' 'all(color(r, cfg) == "red" for r in last)'
+  MG=fill mutant "a RAM não derruba mais o degrau" 'return cfg["cpu_lowers_ceiling"] or r["mem_avail_pct"] < cfg["mem_down_avail_pct"]' 'return cfg["cpu_lowers_ceiling"]'
+  MG=fill mutant "leitura que falhou ou âmbar também desce o degrau" '    if color(r, cfg) != "red":
+        return False' '    if color(r, cfg) == "green":
+        return False'
+  MG=fill mutant "o padrão de CPU livre para subir volta a 35%" '"cpu_up_headroom_pct": 10.0,' '"cpu_up_headroom_pct": 35.0,'
+  MG=fill mutant "a janela de subida volta a 1800 s" '"up_window_s": 480,' '"up_window_s": 1800,'
+  MG=fill mutant "o limite de nó quente volta a 10%" '"cpu_down_headroom_pct": 3.0,' '"cpu_down_headroom_pct": 9.0,'
+  MG=fill mutant "a CPU passa a derrubar o degrau por padrão" '"cpu_lowers_ceiling": False,' '"cpu_lowers_ceiling": True,'
+  MG=fill mutant "cpu_lowers_ceiling que não é bool é aceito" 'for k in ("require_load_proof", "cpu_lowers_ceiling"):' 'for k in ("require_load_proof",):'
+  MG=hourly mutant "hora sem leitura conta como ok" '"status": "sem_leitura" if mean is None else ("abaixo" if mean < min_pct else "ok")}' '"status": "ok" if mean is None else ("abaixo" if mean < min_pct else "ok")}'
+  MG=hourly mutant "leitura que falhou entra na média" '        if r.get("state") == "ok" and is_num(idle) and 0 <= idle <= 100:' '        if is_num(idle) and 0 <= idle <= 100:'
+  MG=hourly mutant "a hora corrente (parcial) entra" 'busy = {h: [] for h in range(cur - hours, cur)}' 'busy = {h: [] for h in range(cur - hours + 1, cur + 1)}'
+  MG=hourly mutant "arquivo que existe e não abre vira sem leitura" '    except FileNotFoundError:
+        return [], 0' '    except OSError:
+        return [], 0'
+  MG=hourly mutant "linha que não é JSON derruba a consulta" '            except (ValueError, RecursionError):
+                bad += 1
+                continue' '            except KeyboardInterrupt:
+                bad += 1
+                continue'
+  MG=hourly mutant "linha sem t inteiro vira leitura" 'if isinstance(o, dict) and isinstance(o.get("t"), int) and not isinstance(o["t"], bool):' 'if isinstance(o, dict):'
+  MG=hourly mutant "--min-pct é ignorado" '"abaixo" if mean < min_pct else "ok"' '"abaixo" if mean < 85.0 else "ok"'
+  MG=hourly mutant "exit 0 com hora abaixo ou sem leitura" 'return 0 if res["all_ok"] else 1' 'return 0'
+  MG=hourly mutant "o arquivo rotacionado (.1) não é lido" 'for p in (env.readings + ".1", env.readings):' 'for p in (env.readings,):'
 }
 echo "── $((n - fails))/$n ok"
 [ "$fails" = 0 ]
