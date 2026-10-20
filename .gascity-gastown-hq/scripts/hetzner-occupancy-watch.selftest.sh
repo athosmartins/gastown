@@ -81,7 +81,17 @@ if [ "${STUB_SSH_RC:-0}" != 0 ]; then echo "ssh: erro injetado" >&2; [ -n "${STU
 [ -n "${STUB_SSH_FILE:-}" ] && cat "$STUB_SSH_FILE"
 exit 0
 EOF
-for b in bd dolt notify; do   # o vigia NUNCA deve chamar bd, dolt nem notify (só gc session list / gc mail send / ssh de leitura)
+cat > "$T/bin/bd" <<'EOF'
+#!/usr/bin/env bash
+# bd de mentira: a ÚNICA forma permitida é a leitura de quem segura bead (`-C <cidade> list --status in_progress --json --limit 0`): devolve $STUB_BD_FILE (ou falha com $STUB_BD_RC; com $STUB_OUTFAIL imprime o JSON COMPLETO antes de falhar; com $STUB_BD_SLEEP trava esses segundos); qualquer outra forma é PROIBIDA (rc 99, marcada)
+echo "bd $*" >> "$STUB_DIR/bd.calls"
+if [ "$#" -ne 8 ] || [ "$1" != "-C" ] || [ "$3 $4 $5 $6 $7 $8" != "list --status in_progress --json --limit 0" ]; then echo "FORBIDDEN bd $*" >> "$STUB_DIR/forbidden.calls"; exit 99; fi
+[ -n "${STUB_BD_SLEEP:-}" ] && sleep "$STUB_BD_SLEEP"
+if [ "${STUB_BD_RC:-0}" != 0 ]; then echo "bd: erro injetado" >&2; [ -n "${STUB_OUTFAIL:-}" ] && [ -n "${STUB_BD_FILE:-}" ] && cat "$STUB_BD_FILE"; exit "$STUB_BD_RC"; fi
+[ -n "${STUB_BD_FILE:-}" ] && cat "$STUB_BD_FILE"
+exit 0
+EOF
+for b in dolt notify; do   # o vigia NUNCA deve chamar dolt nem notify; o bd só na forma acima (uma leitura, nunca uma escrita)
   printf '#!/usr/bin/env bash\necho "FORBIDDEN %s $*" >> "$STUB_DIR/forbidden.calls"\nexit 99\n' "$b" > "$T/bin/$b"
 done
 # python3 de mentira (só o W() o vê: o PATH dele começa em $T/bin). O python do sistema do macOS (CLT 3.9) grava o bytecode em $HOME/Library/Caches/com.apple.python se o ambiente não manda parar; o do Linux não grava em HOME nenhum.
@@ -99,16 +109,20 @@ NCPU=16
 
 SJ_NONE='{"sessions":[{"id":"s1","session_name":"mayor","template":"mayor","state":"active"},{"id":"s2","session_name":"gastown.dog-1","template":"gastown.dog","state":"active"},{"id":"s3","session_name":"dog-remote-velha","template":"dog-remote","state":"asleep"}]}'
 SJ_REMOTE='{"sessions":[{"id":"s9","session_name":"dog-remote-gapxi4ls","template":"dog-remote","state":"active"}]}'
+BJ_REMOTE='[{"id":"ga-b1","status":"in_progress","assignee":"dog-remote-gapxi4ls"},{"id":"ga-x","status":"in_progress","assignee":"gastown.dog-2"},{"id":"ga-y","status":"in_progress"}]'   # a bead da SJ_REMOTE (no nome da sessão) + ruído: bead de outro dono e bead sem dono
+# o 20/10 (Mayor): 2 dog-remote vivas e paradas, as beads delas (ga-z5311j, ga-xpswpd.1) já fechadas; o gc as lista com alias de pool
+SJ_ZOMBIES='{"sessions":[{"id":"z1","session_name":"dog-remote-gawispdiod4","alias":"dog-remote-2","template":"dog-remote","state":"active","closed":false},{"id":"z2","session_name":"dog-remote-gawispnjwl1","alias":"dog-remote-1","template":"dog-remote","state":"awake","closed":false}]}'
 sessions_are() { printf '%s' "$1" > "$T/sessions.json"; STUB_GC_FILE="$T/sessions.json"; }
+beads_are() { printf '%s' "$1" > "$T/beads.json"; STUB_BD_FILE="$T/beads.json"; }   # o que o `bd list --status in_progress --json` devolve
 
 fresh() {   # cidade, HOME, stubs e relógio novos; sessões = nenhuma remota; fila = 3 itens do hq; foco desligado; chave .on posta (os casos de aviso a pressupõem)
   C="$T/city"; HM="$T/home"
   find "$C" "$HM" "$T/stub" "$T/tmp" -mindepth 1 -delete 2>/dev/null
   mkdir -p "$C/.gc/logs" "$HM/.gc" "$T/stub" "$T/tmp"; : > "$C/.gc/hetzner-occupancy-alarm.on"
   NOW=${1:-$NOW0}; CB=0; CI=0; NCPU=16; RC=0; TENV=()
-  STUB_GC_RC=0; STUB_GC_SLEEP=""; STUB_SSH_RC=0; STUB_SSH_SLEEP=""; STUB_MAIL_RC=0; STUB_SSH_FILE=""; STUB_OUTFAIL=""
+  STUB_GC_RC=0; STUB_GC_SLEEP=""; STUB_SSH_RC=0; STUB_SSH_SLEEP=""; STUB_MAIL_RC=0; STUB_SSH_FILE=""; STUB_OUTFAIL=""; STUB_BD_RC=0; STUB_BD_SLEEP=""
   PILOT_HQ=3; PILOT_WA=0; FOCUS=off; WOUT="$T/out.json"; WERR="$T/err"
-  sessions_are "$SJ_NONE"
+  sessions_are "$SJ_NONE"; beads_are "$BJ_REMOTE"
 }
 W() {   # W [VAR=valor ...] [-- args do vigia] : roda o vigia no ambiente do cenário. stdout → $WOUT, stderr → $WERR, rc → $RC
   local extra=()
@@ -117,7 +131,8 @@ W() {   # W [VAR=valor ...] [-- args do vigia] : roda o vigia no ambiente do cen
   # PYTHONDONTWRITEBYTECODE=1: o python NÃO grava bytecode em lugar nenhum, então o HOME falso fica vazio em qualquer python (o grupo saida confere). PYTHONPYCACHEPREFIX=$PYC: de onde ele LÊ o bytecode, aquecido uma vez no fim deste arquivo;
   # sem isso cada rodada recompilaria a stdlib (medido no Linux com o python de mentira: 2x o tempo, ~3x a CPU).
   env -i HOME="$HM" PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$PYC" PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$T/tmp" TZ="$TZNAME" \
-    GC_CITY_PATH="$C" GC_BIN="$T/bin/gc" SSH_BIN="$T/bin/ssh" HETZNER_OCC_NOW="$NOW" \
+    GC_CITY_PATH="$C" GC_BIN="$T/bin/gc" BD_BIN="$T/bin/bd" SSH_BIN="$T/bin/ssh" HETZNER_OCC_NOW="$NOW" \
+    STUB_BD_FILE="${STUB_BD_FILE:-}" STUB_BD_RC="${STUB_BD_RC:-0}" STUB_BD_SLEEP="${STUB_BD_SLEEP:-}" \
     STUB_DIR="$T/stub" STUB_STATE_FILE="$C/.gc/hetzner-occupancy.state.json" STUB_GC_FILE="${STUB_GC_FILE:-}" STUB_GC_RC="${STUB_GC_RC:-0}" STUB_GC_SLEEP="${STUB_GC_SLEEP:-}" \
     STUB_SSH_FILE="${STUB_SSH_FILE:-}" STUB_SSH_RC="${STUB_SSH_RC:-0}" STUB_SSH_SLEEP="${STUB_SSH_SLEEP:-}" STUB_MAIL_RC="${STUB_MAIL_RC:-0}" STUB_OUTFAIL="${STUB_OUTFAIL:-}" \
     "${extra[@]+"${extra[@]}"}" python3 "$WATCH" "$@" >"$WOUT" 2>"$WERR"
@@ -220,11 +235,12 @@ g_sess() {
   fresh; tick 900 5 >/dev/null     # semeia o baseline de CPU: dali em diante a CPU é lida e baixa
   sessions_are "$SJ_REMOTE"; tick 900 5
   eq "1 sessão remota ativa: lida" true "$(reading sessoes.lido)"; eq "1 sessão remota ativa: conta 1" 1 "$(reading sessoes.ativas)"
-  eq "1 sessão remota ativa + CPU baixa = ocupado" ocupado "$(reading estado)"
+  eq "1 sessão remota ativa COM bead (o fresh dá a da SJ_REMOTE) + CPU baixa = ocupado" ocupado "$(reading estado)"
+  eq "... e ela conta como ocupada" 1 "$(reading sessoes.ocupadas)"
   eq "nomes das sessões vão na leitura" '["dog-remote-gapxi4ls"]' "$(reading sessoes.nomes)"
 
   fresh; sessions_are "$SJ_REMOTE"; tick 900 5
-  eq "sessão remota ativa prova ocupado mesmo SEM leitura de CPU (1ª leitura, sem baseline)" ocupado "$(reading estado)"
+  eq "sessão remota ativa com bead prova ocupado mesmo SEM leitura de CPU (1ª leitura, sem baseline)" ocupado "$(reading estado)"
 
   fresh; tick 900 5 >/dev/null; tick 900 5
   eq "nenhuma remota (só a local gastown.dog-1 e uma remota dormindo): lido" true "$(reading sessoes.lido)"; eq "... conta 0" 0 "$(reading sessoes.ativas)"
@@ -260,8 +276,10 @@ g_sess() {
   eq "sessões do MBP (-remote-mbp-...) NÃO contam como ocupação do Hetzner" 0 "$(reading sessoes.ativas)"; eq "... logo ocioso" ocioso "$(reading estado)"
   sessions_are '{"sessions":[{"session_name":"dog-remote-aaa","state":"awake"},{"session_name":"dog-remote-bbb","state":"active","closed":true},{"session_name":"dog-remote-ccc","state":"drained"},{"session_name":"dog-remote-adhoc-0fc28155dd","state":"active"},{"name":"wa-worker-remote-9","state":"active"}]}'; tick 900 5
   eq "awake conta, closed não, drained não, adhoc conta, só 'name' também serve" 3 "$(reading sessoes.ativas)"
-  sessions_are '{"sessions":[{"session_name":"dog-remote-aaa","state":"active"},"lixo"]}'; tick 900 5
-  eq "entrada ilegível MAS há sessão ativa provada: lida, ocupado" ocupado "$(reading estado)"
+  sessions_are '{"sessions":[{"session_name":"dog-remote-aaa","state":"active"},"lixo"]}'; beads_are '[{"id":"ga-b9","status":"in_progress","assignee":"dog-remote-aaa"}]'; tick 900 5
+  eq "entrada ilegível MAS há sessão com bead provada: lida, ocupado" ocupado "$(reading estado)"
+  beads_are '[]'; tick 900 5
+  eq "entrada ilegível e nenhuma sessão com bead provada: NÃO lida (a ilegível pode ser a que trabalha)" false "$(reading sessoes.lido)"; eq "... motivo" entrada-ilegivel "$(reading sessoes.motivo)"; eq "... estado desconhecido, nunca ocioso" desconhecido "$(reading estado)"
   sessions_are '{"sessions":["lixo"]}'; tick 900 5
   eq "entrada que não é objeto, sem prova de sessão ativa: NÃO lida" false "$(reading sessoes.lido)"; eq "... motivo" entrada-ilegivel "$(reading sessoes.motivo)"
   sessions_are '{"sessions":[{"session_name":"dog-remote-aaa","state":"start-pending"}]}'; tick 900 5
@@ -298,6 +316,63 @@ print("same" if (set(a.LIVE_SESSION_STATES), set(a.DEAD_SESSION_STATES)) == (set
 }
 
 # ============================================================================================================================================================================
+g_bead() {
+  echo "--- bead: sessão VIVA não é sessão OCUPADA (ga-l9q18u): só conta a que segura bead in_progress no alias ou no nome"
+  # a leitura real de 20/10 (Mayor): 2 dog-remote vivas, as beads delas fechadas, CPU 1,6 % (0,26 núcleo de 16). Antes: 'ocupado' (26 de 26 leituras do dia); agora: ocioso
+  fresh; tick 900 5 >/dev/null; sessions_are "$SJ_ZOMBIES"; beads_are '[{"id":"ga-x","status":"in_progress","assignee":"gastown.dog-2"}]'; tick 900 26
+  eq "20/10: 2 dog-remote vivas, nenhuma bead in_progress delas, CPU 1,6 % = OCIOSO" ocioso "$(reading estado)"
+  eq "... as 2 estão vivas" 2 "$(reading sessoes.ativas)"; eq "... nenhuma segura bead" 0 "$(reading sessoes.ocupadas)"; eq "... lida" true "$(reading sessoes.lido)"; eq "... CPU 1,6 %" 1.6 "$(reading cpu.pct)"
+  beads_are '[{"id":"ga-b1","status":"in_progress","assignee":"dog-remote-2"}]'; tick 900 26
+  eq "bead in_progress no ALIAS de uma delas: ocupado" ocupado "$(reading estado)"; eq "... só essa conta (1 de 2)" 1 "$(reading sessoes.ocupadas)"; eq "... qual" '["dog-remote-gawispdiod4"]' "$(reading sessoes.nomes_ocupadas)"
+  beads_are '[{"id":"ga-b1","status":"in_progress","assignee":"dog-remote-gawispnjwl1"}]'; tick 900 26
+  eq "bead no NOME da sessão (não no alias): ocupado" ocupado "$(reading estado)"; eq "... qual" '["dog-remote-gawispnjwl1"]' "$(reading sessoes.nomes_ocupadas)"
+  beads_are '[{"id":"ga-x","status":"in_progress","assignee":"gastown.dog-2"},{"id":"ga-y","status":"in_progress"},{"id":"ga-z","status":"in_progress","assignee":null},{"id":"ga-w","status":"in_progress","assignee":""}]'; tick 900 26
+  eq "beads de outro dono, sem dono, com dono null e com dono vazio não contam: ocioso" ocioso "$(reading estado)"
+  beads_are '[{"id":"ga-b1","status":"in_progress","assignee":"dog-remote-2"}]'; tick 900 200
+  eq "bead + CPU alta: ocupado" ocupado "$(reading estado)"
+  fresh; sessions_are "$SJ_ZOMBIES"; beads_are '[]'; tick 900 5 >/dev/null
+  eq "1ª leitura (sem baseline de CPU), sessões vivas sem bead: DESCONHECIDO (a CPU ainda não foi lida; nunca ocupado só por estar viva)" desconhecido "$(reading estado)"
+  eq "... e é a semente do baseline, não leitura cega" 0 "$(reading cegas_seguidas)"
+
+  echo "--- bead: o bd falhou ou veio ilegível = não sei quem trabalha (nunca ocioso, nunca ocupado pela sessão)"
+  fresh; sessions_are "$SJ_ZOMBIES"; tick 900 5 >/dev/null; STUB_BD_RC=1; tick 900 5
+  eq "bd falhou + sessões vivas + CPU baixa = DESCONHECIDO" desconhecido "$(reading estado)"; eq "... sessoes.lido false" false "$(reading sessoes.lido)"; eq "... motivo" bd-falhou "$(reading sessoes.motivo)"
+  eq "... ocupadas = null (não 0)" null "$(reading sessoes.ocupadas)"; eq "... mas as vivas continuam contadas (o gc leu)" 2 "$(reading sessoes.ativas)"; has "... o stderr do bd vai no detalhe" "erro injetado" "$(reading sessoes.detalhe)"
+  eq "... e não é leitura de aquecimento: conta como cega" 1 "$(reading cegas_seguidas)"
+  tick 900 200; eq "bd falhou + CPU alta = ocupado (a CPU prova)" ocupado "$(reading estado)"
+  STUB_OUTFAIL=1; beads_are '[{"id":"ga-b1","status":"in_progress","assignee":"dog-remote-2"}]'; tick 900 5
+  eq "bd sai com erro MAS já imprimiu a lista completa: NÃO lida (o rc sozinho recusa)" desconhecido "$(reading estado)"; eq "... motivo" bd-falhou "$(reading sessoes.motivo)"; STUB_OUTFAIL=""; STUB_BD_RC=0
+  beads_are 'isto não é json'; tick 900 5
+  eq "bd com saída que não é JSON: NÃO lida" desconhecido "$(reading estado)"; eq "... motivo" json-ilegivel "$(reading sessoes.motivo)"
+  beads_are ''; tick 900 5
+  eq "bd com saída vazia e rc 0: NÃO lida (vazio não é 'ninguém segura bead')" desconhecido "$(reading estado)"; eq "... motivo" saida-vazia "$(reading sessoes.motivo)"
+  beads_are '{"issues":[]}'; tick 900 5; eq "bd com JSON que não é lista: NÃO lida" forma-desconhecida "$(reading sessoes.motivo)"
+  beads_are 'null'; tick 900 5; eq "bd com JSON null: NÃO lida" forma-desconhecida "$(reading sessoes.motivo)"
+  beads_are '["lixo"]'; tick 900 5; eq "bd com item que não é objeto: NÃO lida" forma-desconhecida "$(reading sessoes.motivo)"
+  beads_are '[{"id":"ga-1","assignee":7}]'; tick 900 5; eq "bd com assignee que não é texto: NÃO lida" forma-desconhecida "$(reading sessoes.motivo)"
+  beads_are '[]'; tick 900 5; eq "bd com lista vazia de verdade: lida, ninguém segura bead = ocioso" ocioso "$(reading estado)"
+  beads_are '[{"id":"ga-b1","status":"in_progress","assignee":"dog-remote-2"}]'; STUB_BD_SLEEP=6; TENV=(HETZNER_OCC_BD_TIMEOUT_S=1); tick 900 5
+  eq "bd que trava: NÃO lida" desconhecido "$(reading estado)"; eq "... motivo" bd-timeout "$(reading sessoes.motivo)"; STUB_BD_SLEEP=""; TENV=()
+  fresh; sessions_are "$SJ_ZOMBIES"; tick 900 5 >/dev/null; rm -f "$T/stub/bd.calls"; STUB_BD_RC=1; STUB_GC_RC=1; tick 900 5
+  eq "gc E bd falharam: o motivo é o do gc (o bd nem é chamado depois que o gc falha)" gc-falhou "$(reading sessoes.motivo)"; eq "... bd não chamado" 0 "$(cat "$T/stub/bd.calls" 2>/dev/null | wc -l | tr -d ' ')"
+
+  echo "--- bead: sem sessão viva o bd nem é chamado (e o Dolt fora não atrapalha); forma exata da chamada"
+  fresh; tick 900 5 >/dev/null; STUB_BD_RC=1; tick 900 5
+  eq "nenhuma sessão remota viva: o bd NÃO é chamado" 0 "$(cat "$T/stub/bd.calls" 2>/dev/null | wc -l | tr -d ' ')"; eq "... e o bd fora do ar não atrapalha: ocioso" ocioso "$(reading estado)"; eq "... ocupadas = 0" 0 "$(reading sessoes.ocupadas)"
+  fresh; sessions_are "$SJ_ZOMBIES"; tick 900 5 >/dev/null
+  eq "bd: uma chamada por leitura, na forma exata (-C da cidade, só in_progress, --json, --limit 0: sem o limite o bd corta em 50)" "bd -C $C list --status in_progress --json --limit 0" "$(cat "$T/stub/bd.calls")"
+  fresh; W HETZNER_OCC_BD_TIMEOUT_S=45 -- --print-config; eq "HETZNER_OCC_BD_TIMEOUT_S muda o prazo do bd" 45 "$(reading bd_timeout_s)"
+
+  echo "--- bead: sessão sem nome nem alias, e o que prova ocupado ao lado dela"
+  fresh; tick 900 5 >/dev/null; sessions_are '{"sessions":[{"template":"dog-remote","state":"active"}]}'; beads_are '[]'; tick 900 5
+  eq "sessão viva sem session_name, alias nem name (só template): não dá para casar com bead, NÃO lida" false "$(reading sessoes.lido)"; eq "... motivo" sessao-sem-dono "$(reading sessoes.motivo)"; eq "... desconhecido, nunca ocioso" desconhecido "$(reading estado)"
+  sessions_are '{"sessions":[{"template":"dog-remote","state":"active"},{"session_name":"dog-remote-aaa","alias":"dog-remote-4","state":"active"}]}'; beads_are '[{"id":"ga-b9","status":"in_progress","assignee":"dog-remote-4"}]'; tick 900 5
+  eq "... mas uma sessão com bead provada ao lado basta: ocupado" ocupado "$(reading estado)"; eq "... 2 vivas, 1 ocupada" "2/1" "$(reading sessoes.ativas)/$(reading sessoes.ocupadas)"
+  sessions_are '{"sessions":[{"template":"dog-remote","state":"active"},{"session_name":"dog-remote-aaa","alias":"dog-remote-4","state":"active"}]}'; beads_are '[]'; tick 900 5
+  eq "... e sem bead nenhuma, a sem nome mantém tudo desconhecido (a outra seria ociosa)" desconhecido "$(reading estado)"
+}
+
+# ============================================================================================================================================================================
 g_cpu() {
   echo "--- cpu: /proc/stat por ssh (baseline, janela, contador, ssh)"
   fresh; tick 900 5
@@ -322,7 +397,7 @@ g_cpu() {
   STUB_SSH_RC=0; tick 900 5
   eq "ssh voltou: a janela cobre o buraco (1800 s) e a leitura é válida" 1800 "$(reading cpu.janela_s)"; eq "... lida" true "$(reading cpu.lido)"
   sessions_are "$SJ_REMOTE"; STUB_SSH_RC=255; tick 900 5
-  eq "ssh caiu + sessão remota ativa = ocupado (a sessão prova)" ocupado "$(reading estado)"
+  eq "ssh caiu + sessão remota ativa com bead = ocupado (a sessão prova)" ocupado "$(reading estado)"
 
   fresh; tick 900 5 >/dev/null
   printf 'Permission denied (publickey).\n' > "$T/junk.txt"; STUB_SSH_FILE="$T/junk.txt"; W -- --print
@@ -415,12 +490,12 @@ g_fila() {
 # ============================================================================================================================================================================
 g_estado() {
   echo "--- estado: tabela completa (sessões × CPU)"
-  # (sessão, CPU) → estado. "?" = não lida. Cada linha prepara um cenário próprio.
+  # (sessão, CPU) → estado. "?" = não lida. Sessão: 1 = viva COM bead · s = viva SEM bead (o 20/10) · b = viva, mas o bd não leu · 0 = nenhuma viva. Cada linha prepara um cenário próprio.
   local row sess cpu want
-  for row in "1 baixa ocupado" "1 alta ocupado" "1 ? ocupado" "0 baixa ocioso" "0 alta ocupado" "0 ? desconhecido" "? baixa desconhecido" "? alta ocupado" "? ? desconhecido"; do
+  for row in "1 baixa ocupado" "1 alta ocupado" "1 ? ocupado" "s baixa ocioso" "s alta ocupado" "s ? desconhecido" "b baixa desconhecido" "b alta ocupado" "b ? desconhecido" "0 baixa ocioso" "0 alta ocupado" "0 ? desconhecido" "? baixa desconhecido" "? alta ocupado" "? ? desconhecido"; do
     sess=${row%% *}; cpu=${row#* }; cpu=${cpu%% *}; want=${row##* }   # expansão de parâmetro: `set -- $row` globava o "?" contra os arquivos do cwd (um arquivo "x" lá e o grupo reprovava sem motivo); não é here-string porque no bash 3.2 ela vira arquivo temporário
     fresh; tick 900 5 >/dev/null
-    case "$sess" in 1) sessions_are "$SJ_REMOTE" ;; 0) sessions_are "$SJ_NONE" ;; "?") STUB_GC_RC=1 ;; esac
+    case "$sess" in 1) sessions_are "$SJ_REMOTE" ;; s) sessions_are "$SJ_REMOTE"; beads_are '[]' ;; b) sessions_are "$SJ_REMOTE"; STUB_BD_RC=1 ;; 0) sessions_are "$SJ_NONE" ;; "?") STUB_GC_RC=1 ;; esac
     case "$cpu" in
       baixa) tick 900 5 ;;
       alta)  tick 900 200 ;;
@@ -450,6 +525,13 @@ g_alarme() {
   tick 900 5; eq "continua ocioso: cooldown (nada de mail repetido)" 1 "$(mails)"; eq "... alarme.ocioso = cooldown" cooldown "$(reading alarme.ocioso)"
   idle_run 10; eq "10 leituras depois (2h30 após o aviso): ainda em cooldown" 1 "$(mails)"
   tick 900 5; eq "3 h depois do aviso: o 2º aviso sai" 2 "$(mails)"
+
+  echo "--- alarme: sessão viva sem bead NÃO cala o aviso (o 20/10: 2 dog-remote paradas, 26 de 26 leituras 'ocupado', o aviso nunca saiu)"
+  fresh; sessions_are "$SJ_ZOMBIES"; beads_are '[]'; tick 900 5 >/dev/null; idle_run 3
+  eq "2 sessões vivas sem bead + CPU baixa + fila: ocioso há 30 min = 1 mail" 1 "$(mails)"
+  has "... o corpo diz quantas estão vivas" "vivas: 2" "$(mailfield 1 body)"; has "... e quantas seguram bead" "segurando bead: 0" "$(mailfield 1 body)"
+  fresh; sessions_are "$SJ_ZOMBIES"; beads_are '[{"id":"ga-b1","status":"in_progress","assignee":"dog-remote-2"}]'; tick 900 5 >/dev/null; idle_run 3
+  eq "as mesmas 2 vivas, uma COM bead: ocupado, nenhum aviso" 0 "$(mails)"
 
   echo "--- alarme: tolerância do launchd (jitter) e leitura espaçada"
   fresh; tick 890 5 >/dev/null; idle_run 3 890; eq "leituras a cada 890 s: o 3º ocioso (1780 s desde o 1º) já avisa (tolerância de 2 min)" 1 "$(mails)"
@@ -527,6 +609,7 @@ g_saida() {
   eq "uma linha por execução" 3 "$(wc -l < "$jl" | tr -d ' ')"
   last_line "$jl"
   eq "JSONL: estado da última" ocupado "$(jv "$T/last.json" estado)"; eq "JSONL: epoch" "$NOW" "$(jv "$T/last.json" epoch)"
+  eq "JSONL: a leitura diz a regra que a produziu (2 = ocupado é sessão COM bead; leitura sem o campo é da regra 1, em que sessão viva bastava)" 2 "$(jv "$T/last.json" regra)"; eq "JSONL: sessoes.ocupadas (nenhuma sessão viva)" 0 "$(jv "$T/last.json" sessoes.ocupadas)"
   eq "JSONL: ts = a hora LOCAL do epoch com o deslocamento (12:45 em SP; hora UTC com sufixo local não passa)" "2026-10-19T12:45:00-0300" "$(jv "$T/last.json" ts)"
 
   fresh "$(epoch_of 2026 10 19 23 20 0)"
@@ -537,6 +620,8 @@ g_saida() {
   eq "dia 20 (virou a meia-noite): 1 ocupado" 1 "$(jv "$d" dias.2026-10-20.ocupado)"; eq "dia 20: 1 ocioso" 1 "$(jv "$d" dias.2026-10-20.ocioso)"; eq "dia 20: 1 desconhecido" 1 "$(jv "$d" dias.2026-10-20.desconhecido)"
   eq "dia 20: ocupação 50.0%" 50.0 "$(jv "$d" dias.2026-10-20.ocupacao_pct)"
   eq "dia 21: só desconhecido → ocupação null (nunca 0%, nunca 100%)" null "$(jv "$d" dias.2026-10-21.ocupacao_pct)"; eq "dia 21: 1 leitura" 1 "$(jv "$d" dias.2026-10-21.leituras)"
+  fresh "$(epoch_of 2026 10 20 3 0 0)"; sessions_are "$SJ_ZOMBIES"; beads_are '[]'; tick 900 5 >/dev/null; idle_run 3
+  eq "o número do dia (20/10): 2 zumbis vivos + CPU baixa = 3 ocioso, 0 ocupado, 0.0 % (antes: 100 %)" "3/0/0.0" "$(jv "$d" dias.2026-10-20.ocioso)/$(jv "$d" dias.2026-10-20.ocupado)/$(jv "$d" dias.2026-10-20.ocupacao_pct)"
 
   echo "--- saida: arquivos corrompidos não somem em silêncio"
   fresh; tick 900 5 >/dev/null; printf 'lixo{' > "$C/.gc/hetzner-occupancy-daily.json"; tick 900 5
@@ -583,9 +668,10 @@ g_saida() {
   eq "não consegui gravar: rc 3" 3 "$RC"; has "... diz 'não consegui gravar'" "não consegui gravar" "$(cat "$WERR")"
   check "... e nada sai por notify, bd, dolt nem mail" "$([ ! -s "$T/stub/forbidden.calls" ] && [ "$(mails)" = 0 ] && echo 1 || echo 0)"
 
-  echo "--- saida: só LÊ o mundo (nada de bd, dolt, ou gc fora de session list / mail send)"
-  fresh; tick 900 5 >/dev/null; idle_run 3
-  check "nenhuma chamada proibida (bd, dolt, outro subcomando do gc)" "$([ ! -s "$T/stub/forbidden.calls" ] && echo 1 || echo 0)"
+  echo "--- saida: só LÊ o mundo (do bd, só a lista de in_progress; nada de dolt nem notify, nem outro subcomando do gc)"
+  fresh; sessions_are "$SJ_ZOMBIES"; beads_are '[]'; tick 900 5 >/dev/null; idle_run 3
+  check "nenhuma chamada proibida (bd fora da leitura de in_progress, dolt, notify, outro subcomando do gc)" "$([ ! -s "$T/stub/forbidden.calls" ] && echo 1 || echo 0)"
+  check "... o bd foi mesmo chamado (há sessão viva) e sempre na forma da leitura" "$([ -s "$T/stub/bd.calls" ] && [ "$(grep -v -c "^bd -C $C list --status in_progress --json --limit 0$" "$T/stub/bd.calls")" = 0 ] && echo 1 || echo 0)"
   eq "gc só chamado para 'session list --json' e 'mail send mayor'" 0 "$(grep '^gc ' "$T/stub/gc.calls" | grep -v -e ' session list --json$' -e ' mail send mayor ' | wc -l | tr -d ' ')"
   eq "gc sempre com --city explícito (não depende do cwd do launchd)" 0 "$(grep '^gc ' "$T/stub/gc.calls" | grep -v "^gc --city $C " | wc -l | tr -d ' ')"
   eq "o que o vigia escreve em .gc (e nada além; gate-focus.state e logs são do cenário)" "hetzner-occupancy-daily.json hetzner-occupancy.jsonl hetzner-occupancy.lock hetzner-occupancy.state.json" "$(ls "$C/.gc" | grep -v -e '^gate-focus.state$' -e '^logs$' -e '^hetzner-occupancy-alarm.on$' | tr '\n' ' ' | sed 's/ $//')"
@@ -649,14 +735,14 @@ g_mutantes() {
   # o lock bloqueante prende a 2ª instância até a paciência do teste acabar (~30 s, ver await): sai cedo para esses 30 s correrem junto com os outros mutantes e não no fim
   mutante lock-bloqueante "saida" $'fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)' $'fcntl.flock(fd, fcntl.LOCK_EX)'
   mutante gc-falha-vira-zero "sess" $'r["detalhe"] = _oneline(err)\n        return r' $'r["detalhe"] = _oneline(err)\n        r.update(lido=True, ativas=0)\n        return r'
-  mutante rc-ignorado "sess cpu" $'return prefix + "-falhou" if (why or rc != 0) else None' $'return prefix + "-falhou" if why else None'
+  mutante rc-ignorado "sess cpu bead"$'return prefix + "-falhou" if (why or rc != 0) else None' $'return prefix + "-falhou" if why else None'
   mutante saida-vazia-vira-zero "sess" $'r["motivo"] = "json-ilegivel" if out.strip() else "saida-vazia"' $'r.update(lido=True, ativas=0)'
   mutante envelope-ok-falso-lido "sess" $'if isinstance(d, dict) and "ok" in d and d["ok"] is not True:' $'if False:'
   mutante sessao-do-mbp-conta "sess" $'elif "-remote-" not in "-%s-" % ident or (other and other.search(ident)):' $'elif "-remote-" not in "-%s-" % ident:'
   mutante sessao-closed-conta "sess" $'        elif s.get("closed"):\n            continue' $'        elif False:\n            continue'
   mutante estado-fora-do-vocabulario-ignorado "sess" $'bad_state += 1  #' $'pass  #'
   mutante entrada-ilegivel-ignorada "sess" $'bad_entry += 1' $'pass'
-  mutante ilegivel-anula-sessao-ativa "sess" $'if active:  # uma sessão ativa provada basta' $'if active and not (bad_entry or bad_state):  # uma sessão ativa provada basta'
+  mutante ilegivel-anula-sessao-ativa "sess" $'if mine:  # uma sessão que segura bead provada basta' $'if mine and not (bad_entry or bad_state):  # uma sessão que segura bead provada basta'
   mutante awake-nao-conta "sess" $'LIVE = frozenset({"active", "awake"})' $'LIVE = frozenset({"active"})'
   mutante drained-vira-ilegivel "sess" $'"asleep", "drained", "closed"' $'"asleep", "closed"'
   mutante vocabulario-deriva-do-bead-state "sess" $'"quarantined", "failed-create"})' $'"quarantined", "failed-create", "paused"})'
@@ -688,8 +774,8 @@ g_mutantes() {
   mutante ssh-sem-timeout "cpu" $'rc, out, err, why = run_cmd(argv, c.ssh_timeout_s)' $'rc, out, err, why = run_cmd(argv, 600)'
   mutante host-ssh-sem-validacao "cfg" $'if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]*", c.ssh_host):' $'if False:'
   mutante ocioso-com-uma-leitura-so "estado" $'if sess["lido"] and cpu["lido"]:' $'if sess["lido"] or cpu["lido"]:'
-  mutante sessao-nao-prova-ocupado "estado" $'if (sess["lido"] and sess["ativas"]) or (cpu["lido"] and cores >= busy_cores):' $'if (cpu["lido"] and cores >= busy_cores):'
-  mutante cpu-nao-prova-ocupado "estado" $'if (sess["lido"] and sess["ativas"]) or (cpu["lido"] and cores >= busy_cores):' $'if (sess["lido"] and sess["ativas"]):'
+  mutante sessao-nao-prova-ocupado "estado" $'if (sess["lido"] and sess["ocupadas"]) or (cpu["lido"] and cores >= busy_cores):' $'if (cpu["lido"] and cores >= busy_cores):'
+  mutante cpu-nao-prova-ocupado "estado" $'if (sess["lido"] and sess["ocupadas"]) or (cpu["lido"] and cores >= busy_cores):' $'if (sess["lido"] and sess["ocupadas"]):'
   mutante regua-sem-igual "estado cpu" $'(cpu["lido"] and cores >= busy_cores)' $'(cpu["lido"] and cores > busy_cores)'
   mutante fila-ausente-vira-zero "fila" $'except FileNotFoundError:\n        r["motivo"] = "arquivo-ausente"\n        return r' $'except FileNotFoundError:\n        r.update(lido=True, n=0)\n        return r'
   mutante fila-velha-vale "fila" $'elif now - gen > ttl:' $'elif False:'
@@ -727,10 +813,23 @@ g_mutantes() {
   mutante falha-de-gravacao-sai-0 "saida" $'return e.rc' $'return 0'
   mutante crash-sem-traceback "saida" $'traceback.print_exc()' $'pass'
   mutante crash-avisa-pelo-notify "saida" $'    except Exception:  # inclui configuração inválida: o traceback fica à vista no log do launchd\n        traceback.print_exc()' $'    except Exception:\n        traceback.print_exc(); subprocess.run(["notify", "caiu"])'
+  # ga-l9q18u: sessão viva não é sessão ocupada
+  mutante sessao-viva-sem-bead-prova-ocupado "bead estado alarme saida" $'if (sess["lido"] and sess["ocupadas"]) or (cpu["lido"] and cores >= busy_cores):' $'if (sess["lido"] and sess["ativas"]) or (cpu["lido"] and cores >= busy_cores):'
+  mutante bd-falhou-vira-ninguem-segura "bead" $'    if motivo:\n        return None, motivo, _oneline(err)' $'    if motivo:\n        return set(), None, None'
+  mutante bd-sem-limit-0 "bead" $'"--json", "--limit", "0"], c.bd_timeout_s)' $'"--json"], c.bd_timeout_s)'
+  mutante bd-sem-timeout "bead" $'"--limit", "0"], c.bd_timeout_s)' $'"--limit", "0"], 600)'
+  mutante bd-chamado-sem-sessao-viva "bead" $'    if not active:\n        if bad_entry or bad_state:' $'    if False:\n        if bad_entry or bad_state:'
+  mutante sem-dono-vira-lida "bead" $'    elif any(not owners for _i, owners in live):' $'    elif False:'
+  mutante alias-nao-casa "bead" $'for k in ("session_name", "name", "alias")' $'for k in ("session_name", "name")'
+  mutante session-name-nao-casa "bead" $'for k in ("session_name", "name", "alias")' $'for k in ("name", "alias")'
+  mutante assignee-que-nao-e-texto-vale "bead" $'(b.get("assignee") is None or isinstance(b["assignee"], str))' $'True'
+  mutante lista-do-bd-ilegivel-vale "bead" $'    if not isinstance(lst, list) or not all(' $'    if False and not all('
+  mutante detalhe-do-bd-some "bead" $'r["motivo"], r["detalhe"] = why, detail' $'r["motivo"] = why'
+  mutante regra-nao-gravada "saida" $'"epoch": now, "regra": RULE, ' $'"epoch": now, '
   mutantes_wait
 }
 
-GROUPS_ALL="cfg sess cpu fila estado alarme saida"
+GROUPS_ALL="cfg sess bead cpu fila estado alarme saida"
 run_groups() { local g; for g in "$@"; do "g_$g"; done; }
 
 DEFAULT="$GROUPS_ALL mutantes"; [ -z "${HOCC_NO_MUTANTS:-}" ] || DEFAULT="$GROUPS_ALL"
