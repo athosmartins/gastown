@@ -130,12 +130,15 @@ apply)
   # Conta as vivas do template OU com alias candidato e guarda o alias de cada uma (sessão do pool sem alias entra na conta com alias vazio).
   sess=$(TS "$GC" session list --json 2>/dev/null) || { jlog apply "$id" 11 "sessoes-ilegiveis"; die 11 "não consegui listar as sessões — fica no mini"; }
   al_json=$(printf '%s\n' $ALIASES | jq -R . 2>/dev/null | jq -sc . 2>/dev/null) || al_json=""   # vazio/ilegível → "" e o jq abaixo falha: "x" (11)
-  live_json=$(printf '%s' "$sess" | jq -c --arg t "$ROUTE" --argjson al "$al_json" 'if type=="object" and (.sessions|type)=="array" then [.sessions[] | select(((.template // .Template // "") == $t) or ((.alias // .Alias // "") as $x | $al | any(. == $x))) | select(.closed != true) | select((.state // .State // "") | test("closed|stopped|archived|drained") | not) | (.alias // .Alias // "")] else "x" end' 2>/dev/null)
+  # ga-2hd02v.3: no modo pilot a sessão DORMINDO (state asleep) do template do nó não conta como viva e o alias dela pode ser escolhido: o idle_timeout (15 min) a põe para dormir SEM soltar o alias, e sem isto todo slot
+  # queimava na 1ª ociosidade e o nó ficava cheio de sessões que não gastam nada. O Pilot a ACORDA (session wake), como faz com o dog-remote. Sessão dormindo de OUTRO template, ou em estado que não conheço, segue viva.
+  # No modo pool nada muda (uma sessão dormindo ainda segura o slot: o pool é quem a trata).
+  live_json=$(printf '%s' "$sess" | jq -c --arg t "$ROUTE" --arg sp "$SPAWN" --argjson al "$al_json" 'if type=="object" and (.sessions|type)=="array" then [.sessions[] | select(((.template // .Template // "") == $t) or ((.alias // .Alias // "") as $x | $al | any(. == $x))) | select(.closed != true) | select((.state // .State // "") | test("closed|stopped|archived|drained") | not) | select(($sp == "pilot" and ((.state // .State // "") == "asleep") and ((.template // .Template // "") == $t)) | not) | (.alias // .Alias // "")] else "x" end' 2>/dev/null)
   live=$(printf '%s' "$live_json" | jq -r 'if type=="array" then length else "x" end' 2>/dev/null)
   case "$live" in ''|x|*[!0-9]*) jlog apply "$id" 11 "sessoes-ilegiveis"; die 11 "lista de sessões ilegível — fica no mini" ;; esac
   if [ "$live" -ge "$SLOTS" ]; then jlog apply "$id" 12 "sessao-viva n=$live"; die 12 "já há $live sessão(ões) de $ROUTE/${ALIASES// /,} — slot do nó ocupado"; fi
   live_al=$(printf '%s' "$live_json" | jq -r '.[]' 2>/dev/null) || live_al=""   # lista vazia lida → nenhum alias vivo; o formato já foi provado acima
-  # o 1º alias sem bead que também não tem sessão viva. Sessão viva sem bead (ociosa até o idle_timeout) NÃO é reaproveitada: o worker nasce `fresh` e o alias dela ainda não está livre.
+  # o 1º alias sem bead que também não tem sessão viva. Sessão viva (ativa ou subindo) sem bead NÃO é reaproveitada: o alias dela ainda não está livre. No modo pilot a que dorme é reaproveitada (o Pilot a acorda, ver acima).
   PICK=""
   for A in $free_a; do printf '%s\n' "$live_al" | grep -qxF -- "$A" || { PICK="$A"; break; }; done
   [ -n "$PICK" ] || { jlog apply "$id" 12 "slot-sem-alias-livre"; die 12 "todo alias sem bead em andamento ($free_a ) ainda tem sessão viva — sem slot livre agora"; }
