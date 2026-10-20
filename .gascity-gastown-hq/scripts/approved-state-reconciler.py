@@ -9413,7 +9413,8 @@ def _selftest():
     st["first_seen_approved"]["wa-oa0fe1-n"] = NOW - 519 * 60
     run_cycle(NOW, st)
     _oa_c_mails = [s for s, _ in mail_calls if "wa-oa0fe1-n" in s and "dispatch failing" in s]
-    if _oa_c == (1, 15) and len(_oa_c_mails) == 1 and not _pc_mails():
+    if (_oa_c == (1, 15) and len(_oa_c_mails) == 1 and "Pilot pausado 1/15 sweeps recentes)" in _oa_c_mails[0]
+            and not _pc_mails()):
         _ok("(ga-oa0fe1-c): node:ok bead — 1/15, its own 'dispatch failing' alarm, no cause note")
     else:
         _bad("(ga-oa0fe1-c)", "history=%r per-bead=%r cause=%d" % (_oa_c, _oa_c_mails, len(_pc_mails())))
@@ -9452,6 +9453,35 @@ def _selftest():
         _ok("(ga-oa0fe1-e): per-bead alarm keeps 3/20 and names 'esperando o disco do mini: 4700 MB < 5120' in subject and body")
     else:
         _bad("(ga-oa0fe1-e)", "mails=%r" % (_oa_e,))
+
+    print("\nScenario (ga-oa0fe1-f): the FULL disk pause ('paused: disk floor', with its own reading) is the mini's disk "
+          "too; and when the disk is only a MINORITY of the paused sweeps (1 of 4) the subject stays on the count and "
+          "only the body names the disk")
+    _oa_full = [_pc_line(NOW - 1500 * 60)] + _oa_sweep(NOW - 400 * 60) + [
+        "%s [pilot-dispatcher] WARN: Disk floor (disk_free=3900MB floor=5120MB) — PAUSING all dispatch this sweep"
+        % time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - 300 * 60)),
+        "%s [pilot-dispatcher] === Pilot sweep complete: dispatched=0 (paused: disk floor) ==="
+        % time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(NOW - 300 * 60))] + _oa_sweep(NOW - 100)
+    _read_pilot_log_lines = lambda: _oa_full
+    try:
+        _oa_f_rec = _pilot_sweep_pause_read()
+        _oa_f_win = _pilot_sweep_pause_window(_oa_f_rec, NOW, _OA_AGE)
+        _oa_f_text = _disk_wait(_oa_f_win[2], _oa_f_rec[2])[1]
+    except Exception as _e:
+        _oa_f_win, _oa_f_text = None, "raised %r" % (_e,)
+    _read_pilot_log_lines = lambda: _oa_log(NOW, ["normal"] * 16 + ["ram"] * 3 + ["node"])
+    _bd_approved = lambda root: [_make_bead("wa-oa0fe1-f", labels=["story:approved"], title="Disk is a minority")]
+    st = _reset()
+    st["first_seen_approved"]["wa-oa0fe1-f"] = NOW - 519 * 60
+    run_cycle(NOW, st)
+    _oa_f = [(s, b) for s, b in mail_calls if "wa-oa0fe1-f" in s and "dispatch failing" in s]
+    if (_oa_f_win is not None and _oa_f_win[2] == {"disk floor": 1} and _oa_f_text == "esperando o disco do mini: 3900 MB < 5120 MB"
+            and len(_oa_f) == 1 and "Pilot pausado 4/20 sweeps recentes)" in _oa_f[0][0]
+            and "esperando o disco do mini" not in _oa_f[0][0] and "esperando o disco do mini: 4700 MB < 5120 MB" in _oa_f[0][1]):
+        _ok("(ga-oa0fe1-f): full disk pause counted with its reading (3900 MB); disk minority (1 of 4) — subject stays "
+            "'4/20', body names the disk")
+    else:
+        _bad("(ga-oa0fe1-f)", "window=%r text=%r mails=%r" % (_oa_f_win, _oa_f_text, _oa_f))
 
     # ── result ────────────────────────────────────────────────────────────────
     print("\n[reconciler selftest] %d passed, %d failed" % (ok_count[0], fail_count[0]))
